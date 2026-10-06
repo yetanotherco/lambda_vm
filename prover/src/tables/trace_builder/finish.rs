@@ -12,6 +12,7 @@
 use super::*;
 
 /// What a statement reads off a build before any of its tables exists.
+#[derive(Clone)]
 pub(crate) struct RestHeader {
     /// How many tables each counted chip makes ([`Traces::table_counts`] of the
     /// tables the plan builds).
@@ -24,9 +25,6 @@ pub(crate) struct RestHeader {
 
 impl RestHeader {
     /// [`Traces::runtime_page_ranges`] of the tables the plan builds.
-    // Read by the tests now and by the streamed finish once it lays the rest
-    // out from the header.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn runtime_page_ranges(&self) -> Vec<crate::RuntimePageRange> {
         runtime_page_ranges_of(&self.page_configs)
     }
@@ -754,9 +752,6 @@ impl<'a> FinishPlan<'a> {
     }
 
     /// What a statement reads off the build, before any table is built.
-    // Read by the tests now and by the streamed finish once it lays the rest
-    // out from the header.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn header(&self) -> &RestHeader {
         &self.header
     }
@@ -1379,3 +1374,894 @@ impl<'a> FinishPlan<'a> {
         Ok(traces)
     }
 }
+
+type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
+
+/// A table of the rest, not yet built: building it is calling this.
+type Job<'a> = Box<dyn FnOnce() -> Result<Table, Error> + Send + 'a>;
+
+/// A one-row-an-op family's cut generator: (ops, rows, form) → table.
+type CutGenerator<'a, T> =
+    std::sync::Arc<dyn Fn(&[T], usize, TraceForm) -> Table + Send + Sync + 'a>;
+
+/// A wave's slot: a unit's AIR position and, for a table, its number among
+/// the rest's tables, its family and its job.
+type WaveSlot<'a> = (usize, Option<(usize, usize, Job<'a>)>);
+
+/// One table of the rest, in AIR order ([`FinishPlan::units`]).
+pub(super) enum Unit<'a> {
+    /// A streamed chunk's slot of a family ([`FAMILIES`]): its table went out
+    /// with the windows.
+    Streamed { family: usize },
+    /// A table to build: its family ([`FAMILIES`]), an estimate of its rows and
+    /// the job that builds it.
+    Build {
+        family: usize,
+        rows: usize,
+        job: Job<'a>,
+    },
+}
+
+/// What the streamed finish hands on, in AIR order ([`FinishPlan::emit_streamed`]):
+/// the table at AIR `position`, or `None` for a streamed chunk's slot.
+pub(crate) struct Emitted {
+    pub(crate) position: usize,
+    pub(crate) table: Option<Table>,
+}
+
+/// The rest's families in AIR order (`VmAirs::air_refs`), each with its
+/// columns at eight bytes a cell: what a family's first table is estimated
+/// at, before one of them has been built.
+const FAMILIES: [(&str, usize); 27] = [
+    ("BITWISE", bitwise::cols::NUM_COLUMNS),
+    ("DECODE", decode::cols::NUM_COLUMNS),
+    ("KECCAK_RC", keccak_rc::cols::NUM_COLUMNS),
+    ("REGISTER", register::cols::NUM_COLUMNS),
+    ("HALT", halt::cols::NUM_COLUMNS),
+    ("COMMIT", commit::cols::NUM_COLUMNS),
+    ("KECCAK", keccak::cols::NUM_COLUMNS),
+    ("KECCAK_RND", keccak_rnd::cols::NUM_COLUMNS),
+    ("ECSM", ecsm::cols::NUM_COLUMNS),
+    ("ECDAS", ecdas::cols::NUM_COLUMNS),
+    ("HINT", hint::cols::NUM_COLUMNS),
+    ("BLAKE3", blake3::cols::NUM_COLUMNS),
+    ("CPU", cpu::cols::NUM_COLUMNS),
+    ("LT", lt::cols::NUM_COLUMNS),
+    ("SHIFT", shift::cols::NUM_COLUMNS),
+    ("MEMW", memw::cols::NUM_COLUMNS),
+    ("MEMW_A", memw_aligned::cols::NUM_COLUMNS),
+    ("LOAD", load::cols::NUM_COLUMNS),
+    ("MUL", mul::cols::NUM_COLUMNS),
+    ("DVRM", dvrm::cols::NUM_COLUMNS),
+    ("BRANCH", branch::cols::NUM_COLUMNS),
+    ("PAGE", page::cols::NUM_COLUMNS),
+    ("MEMW_R", memw_register::cols::NUM_COLUMNS),
+    ("EQ", eq::cols::NUM_COLUMNS),
+    ("BYTEWISE", bytewise::cols::NUM_COLUMNS),
+    ("STORE", store::cols::NUM_COLUMNS),
+    ("CPU32", cpu32::cols::NUM_COLUMNS),
+];
+
+/// [`FAMILIES`]' index of a family.
+fn family(name: &str) -> usize {
+    FAMILIES
+        .iter()
+        .position(|&(f, _)| f == name)
+        .unwrap_or(usize::MAX)
+}
+
+/// The bytes a table's main trace takes: packed, or eight a cell.
+fn table_bytes(table: &Table) -> usize {
+    table.narrow_main().map_or_else(
+        || table.main_table.width * table.main_table.height * std::mem::size_of::<u64>(),
+        |packed| packed.data().len(),
+    )
+}
+
+/// The rows a table of `n` ops is padded to, as most generators pad it: an
+/// estimate only.
+fn rows_of(n: usize) -> usize {
+    n.next_power_of_two().max(4)
+}
+
+/// A chunked list's units ([`chunk_and_generate_skipping`]'s and
+/// [`chunk_and_generate_segmented`]'s tables, in their order): `skip` slots
+/// streamed ahead, then a job a chunk of `max` ops (`chunk(start, end)`), an
+/// empty list making one empty table unless `optional`.
+#[allow(clippy::too_many_arguments)]
+fn chunked_units<'a>(
+    family: usize,
+    len: usize,
+    max: usize,
+    skip: usize,
+    tails: bool,
+    optional: bool,
+    chunk: impl Fn(usize, usize) -> Job<'a>,
+) -> Result<Vec<Unit<'a>>, Error> {
+    let max = max.max(1);
+    let ranges: Vec<(usize, usize)> = (0..len.div_ceil(max))
+        .map(|k| (k * max, ((k + 1) * max).min(len)))
+        .collect();
+    let (placeholders, ranges) = if skip == 0 {
+        let ranges = if len == 0 && !optional {
+            vec![(0, 0)]
+        } else {
+            ranges
+        };
+        (0, ranges)
+    } else if tails {
+        (skip, ranges)
+    } else {
+        if skip > ranges.len() {
+            return Err(Error::Prover(format!(
+                "{skip} chunks were streamed but the run has {} of this table",
+                ranges.len()
+            )));
+        }
+        (skip, ranges[skip..].to_vec())
+    };
+    let mut units: Vec<Unit<'a>> = (0..placeholders)
+        .map(|_| Unit::Streamed { family })
+        .collect();
+    units.extend(ranges.into_iter().map(|(start, end)| Unit::Build {
+        family,
+        rows: rows_of(end - start),
+        job: chunk(start, end),
+    }));
+    Ok(units)
+}
+
+/// A one-row-an-op family's units ([`cut_tables`]'s tables): none without
+/// ops, one table when the whole is no taller than `rows`, else its cuts of
+/// `rows` rows; or, without cuts (`rows` 0), the whole table wide
+/// (`whole`), as the finish builds it to be split later.
+fn cut_units<'a, T: Clone + Send + Sync + 'a>(
+    family: usize,
+    ops: &std::sync::Arc<BlockVec<T>>,
+    rows: usize,
+    pack: bool,
+    form: TraceForm,
+    generate: CutGenerator<'a, T>,
+    whole: impl FnOnce(std::sync::Arc<BlockVec<T>>) -> Job<'a>,
+) -> Result<Vec<Unit<'a>>, Error> {
+    let n = ops.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if rows == 0 {
+        return Ok(vec![Unit::Build {
+            family,
+            rows: rows_of(n),
+            job: whole(std::sync::Arc::clone(ops)),
+        }]);
+    }
+    if !rows.is_power_of_two() {
+        return Err(Error::Prover(format!(
+            "tables cut at {rows} rows: a power of two is needed"
+        )));
+    }
+    let total = rows_of(n);
+    if total <= rows {
+        let ops = std::sync::Arc::clone(ops);
+        return Ok(vec![Unit::Build {
+            family,
+            rows: total,
+            job: Box::new(move || Ok(packed_if(pack, generate(&ops.whole(), total, form)))),
+        }]);
+    }
+    Ok((0..total / rows)
+        .map(|k| {
+            let ops = std::sync::Arc::clone(ops);
+            let generate = std::sync::Arc::clone(&generate);
+            let (first, end) = ((k * rows).min(n), ((k + 1) * rows).min(n));
+            Unit::Build {
+                family,
+                rows,
+                job: Box::new(move || {
+                    Ok(packed_if(
+                        pack,
+                        generate(&ops.range(first, end), rows, form),
+                    ))
+                }) as Job<'a>,
+            }
+        })
+        .collect())
+}
+
+/// `job` if `n > 0`: one table, or none ([`generate_optional`]'s tables).
+fn optional_unit<'a>(family: usize, n: usize, job: impl FnOnce() -> Job<'a>) -> Vec<Unit<'a>> {
+    if n == 0 {
+        return Vec::new();
+    }
+    vec![Unit::Build {
+        family,
+        rows: rows_of(n),
+        job: job(),
+    }]
+}
+
+impl<'a> FinishPlan<'a> {
+    /// Phase 5 as units: every table the header counted (and BITWISE, DECODE,
+    /// KECCAK_RC, REGISTER and HALT), in AIR order, each a job that builds it
+    /// as [`Self::emit_all`] does, or a streamed chunk's slot. A family's list
+    /// is held by its jobs alone and goes with the last of them. Refused unless
+    /// the units are the tables the header counted.
+    pub(super) fn units(self) -> Result<Vec<Unit<'a>>, Error> {
+        use std::sync::Arc;
+        let Self {
+            memory_state,
+            register_init,
+            decode_trace,
+            decode_pc_to_row,
+            max_rows,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+            l2g_memory_bookend,
+            skip,
+            cpu_ops,
+            memw_ops,
+            memw_aligned_ops,
+            memw_register_rows,
+            load_ops,
+            lt,
+            shift_ops,
+            branch_ops,
+            mul_ops,
+            dvrm_ops,
+            commit_ops,
+            keccak_ops,
+            blake3_ops,
+            blake3_absorb_ops,
+            eq_ops,
+            bytewise_ops,
+            store_ops,
+            cpu32_ops,
+            ecsm_ops,
+            ecdas_ops,
+            hint_ops,
+            bitwise_histogram,
+            num_padding_rows,
+            halt_timestamp,
+            halt_next_pc,
+            register_final_state,
+            header,
+        } = self;
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            return Err(Error::Prover(
+                "the streamed finish holds its tables in memory".into(),
+            ));
+        }
+        let pack = skip.pack;
+        #[cfg(feature = "disk-spill")]
+        let gpack = pack && skip.gpack && storage_mode != StorageMode::Disk;
+        #[cfg(not(feature = "disk-spill"))]
+        let gpack = pack && skip.gpack;
+        let form = if gpack {
+            TraceForm::Narrow
+        } else {
+            TraceForm::Wide
+        };
+        let tails = skip.tails;
+        let mut units: Vec<Unit<'a>> = Vec::new();
+        let cpu_ops = Arc::new(cpu_ops);
+
+        // BITWISE, DECODE, KECCAK_RC, REGISTER, HALT.
+        units.push(Unit::Build {
+            family: family("BITWISE"),
+            rows: bitwise::NUM_ROWS,
+            job: Box::new(move || {
+                let mut bitwise = bitwise::generate_bitwise_trace();
+                bitwise_histogram.fill_multiplicities(&mut bitwise);
+                Ok(packed_if(pack, bitwise))
+            }),
+        });
+        {
+            let cpu_ops = Arc::clone(&cpu_ops);
+            units.push(Unit::Build {
+                family: family("DECODE"),
+                rows: decode_trace.num_rows(),
+                job: Box::new(move || {
+                    let mut decode = decode_trace;
+                    let mut lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
+                    lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
+                    decode::update_multiplicities(&mut decode, decode_pc_to_row, &lookups);
+                    Ok(packed_if(pack, decode))
+                }),
+            });
+        }
+        let num_keccak = keccak_ops.len();
+        units.push(Unit::Build {
+            family: family("KECCAK_RC"),
+            rows: 64,
+            job: Box::new(move || {
+                let mut keccak_rc = keccak_rc::generate_keccak_rc_trace();
+                keccak_rc::update_multiplicities(&mut keccak_rc, num_keccak);
+                Ok(packed_if(pack, keccak_rc))
+            }),
+        });
+        units.push(Unit::Build {
+            family: family("REGISTER"),
+            rows: 64,
+            job: Box::new(move || {
+                Ok(packed_if(
+                    pack,
+                    register::generate_register_trace(&register_final_state, register_init),
+                ))
+            }),
+        });
+        units.push(Unit::Build {
+            family: family("HALT"),
+            rows: 4,
+            job: Box::new(move || {
+                Ok(packed_if(
+                    pack,
+                    halt::generate_halt_trace(halt_timestamp, halt_next_pc),
+                ))
+            }),
+        });
+
+        // COMMIT, KECCAK, KECCAK_RND, ECSM, ECDAS, HINT, BLAKE3.
+        let commit_ops = Arc::new(commit_ops);
+        units.extend(optional_unit(family("COMMIT"), commit_ops.len(), || {
+            Box::new(move || {
+                Ok(packed_if(
+                    pack,
+                    commit::generate_commit_trace_as(&commit_ops.whole(), form),
+                ))
+            })
+        }));
+        let keccak_ops = Arc::new(keccak_ops);
+        units.extend(cut_units(
+            family("KECCAK"),
+            &keccak_ops,
+            skip.keccak_rows,
+            pack,
+            form,
+            Arc::new(keccak::generate_keccak_rows_as),
+            |ops| Box::new(move || Ok(keccak::generate_keccak_trace(&ops.whole()))),
+        )?);
+        units.extend(keccak_rnd_units(&keccak_ops, &skip, pack, form)?);
+        drop(keccak_ops);
+        let ecsm_ops = Arc::new(ecsm_ops);
+        units.extend(cut_units(
+            family("ECSM"),
+            &ecsm_ops,
+            skip.ecsm_rows,
+            pack,
+            form,
+            Arc::new(ecsm::generate_ecsm_rows_as),
+            |ops| Box::new(move || Ok(ecsm::generate_ecsm_trace(&ops.whole()))),
+        )?);
+        drop(ecsm_ops);
+        let ecdas_ops = Arc::new(ecdas_ops);
+        units.extend(cut_units(
+            family("ECDAS"),
+            &ecdas_ops,
+            skip.ecdas_rows,
+            pack,
+            form,
+            Arc::new(|rows: &[ecdas::CompactEcdasOp], num_rows, form| {
+                ecdas::generate_ecdas_rows_of(rows, num_rows, form, ecdas::widen)
+            }),
+            |ops| {
+                Box::new(move || {
+                    let rows = ops.whole();
+                    let num_rows = rows_of(rows.len());
+                    Ok(ecdas::generate_ecdas_rows_of(
+                        &rows,
+                        num_rows,
+                        TraceForm::Wide,
+                        ecdas::widen,
+                    ))
+                })
+            },
+        )?);
+        drop(ecdas_ops);
+        let hint_ops = Arc::new(hint_ops);
+        units.extend(optional_unit(family("HINT"), hint_ops.len(), || {
+            Box::new(move || {
+                Ok(packed_if(
+                    pack,
+                    hint::generate_hint_trace_as(&hint_ops.whole(), form),
+                ))
+            })
+        }));
+        // BLAKE3 is a table of the proof only when it has ops (`VmAirs`'
+        // `include_blake3` from the counts), whatever the build makes of it
+        // otherwise. Read off the ops, so a miscounted header is refused below.
+        let num_blake3 = blake3_ops.len() + blake3_absorb_ops.len();
+        if num_blake3 > 0 {
+            let rows = rows_of(num_blake3);
+            units.push(Unit::Build {
+                family: family("BLAKE3"),
+                rows,
+                job: Box::new(move || {
+                    Ok(packed_if(
+                        pack,
+                        blake3::generate_blake3_trace(
+                            &blake3_ops.whole(),
+                            &blake3_absorb_ops.whole(),
+                        ),
+                    ))
+                }),
+            });
+        }
+
+        // CPU … CPU32.
+        units.extend(chunked_units(
+            family("CPU"),
+            cpu_ops.len(),
+            max_rows.cpu,
+            skip.cpu,
+            tails,
+            false,
+            |start, end| {
+                let ops = Arc::clone(&cpu_ops);
+                Box::new(move || {
+                    Ok(packed_if(
+                        pack,
+                        cpu::generate_cpu_trace_as(&ops[start..end], form),
+                    ))
+                })
+            },
+        )?);
+        drop(cpu_ops);
+        let lt = Arc::new(lt);
+        units.extend(chunked_units(
+            family("LT"),
+            lt.segments().len(),
+            max_rows.lt,
+            skip.lt,
+            tails,
+            true,
+            |start, end| {
+                let lt = Arc::clone(&lt);
+                Box::new(move || {
+                    Ok(packed_if(
+                        pack,
+                        lt::generate_lt_trace_as(&lt.segments().range(start, end), form),
+                    ))
+                })
+            },
+        )?);
+        drop(lt);
+        units.extend(segmented_units(
+            family("SHIFT"),
+            shift_ops,
+            max_rows.shift,
+            skip.shift,
+            tails,
+            move |ops: &[ShiftOperation]| {
+                packed_if(pack, shift::generate_shift_trace_as(ops, form))
+            },
+        )?);
+        units.extend(vec_units(
+            family("MEMW"),
+            memw_ops,
+            max_rows.memw,
+            skip.memw,
+            tails,
+            true,
+            move |ops: &[MemwOperation]| packed_if(pack, memw::generate_memw_trace_as(ops, form)),
+        )?);
+        units.extend(vec_units(
+            family("MEMW_A"),
+            memw_aligned_ops,
+            max_rows.memw_aligned,
+            skip.memw_aligned,
+            tails,
+            true,
+            move |ops: &[memw_aligned::AlignedRow]| {
+                packed_if(
+                    pack,
+                    memw_aligned::generate_memw_aligned_trace_as(ops, form),
+                )
+            },
+        )?);
+        units.extend(vec_units(
+            family("LOAD"),
+            load_ops,
+            max_rows.load,
+            skip.load,
+            tails,
+            true,
+            move |ops: &[LoadOperation]| packed_if(pack, load::generate_load_trace_as(ops, form)),
+        )?);
+        units.extend(segmented_units(
+            family("MUL"),
+            mul_ops,
+            max_rows.mul,
+            0,
+            false,
+            move |ops: &[(MulOperation, bool)]| {
+                packed_if(pack, mul::generate_mul_trace_as(ops, form))
+            },
+        )?);
+        units.extend(segmented_units(
+            family("DVRM"),
+            dvrm_ops,
+            max_rows.dvrm,
+            0,
+            false,
+            move |ops: &[(DvrmOperation, bool)]| {
+                packed_if(pack, dvrm::generate_dvrm_trace_as(ops, form))
+            },
+        )?);
+        units.extend(segmented_units(
+            family("BRANCH"),
+            branch_ops,
+            max_rows.branch,
+            0,
+            false,
+            move |ops: &[BranchOperation]| {
+                packed_if(pack, branch::generate_branch_trace_as(ops, form))
+            },
+        )?);
+        // PAGE: one a config, from the memory state.
+        let page_configs = Arc::new(header.page_configs.clone());
+        units.extend((0..page_configs.len()).map(|k| {
+            let configs = Arc::clone(&page_configs);
+            Unit::Build {
+                family: family("PAGE"),
+                rows: page::DEFAULT_PAGE_SIZE,
+                job: Box::new(move || {
+                    Ok(packed_if(
+                        pack,
+                        page_trace(&configs[k], memory_state, l2g_memory_bookend),
+                    ))
+                }) as Job<'a>,
+            }
+        }));
+        units.extend(vec_units(
+            family("MEMW_R"),
+            memw_register_rows,
+            max_rows.memw_register,
+            skip.memw_register,
+            tails,
+            false,
+            move |ops: &[RegRow]| {
+                packed_if(
+                    pack,
+                    memw_register::generate_memw_register_trace_from_rows_as(ops, form),
+                )
+            },
+        )?);
+        units.extend(segmented_units(
+            family("EQ"),
+            eq_ops,
+            max_rows.eq,
+            0,
+            false,
+            move |ops: &[eq::EqOperation]| packed_if(pack, eq::generate_eq_trace_as(ops, form)),
+        )?);
+        units.extend(segmented_units(
+            family("BYTEWISE"),
+            bytewise_ops,
+            max_rows.bytewise,
+            0,
+            false,
+            move |ops: &[bytewise::BytewiseOperation]| {
+                packed_if(pack, bytewise::generate_bytewise_trace_as(ops, form))
+            },
+        )?);
+        units.extend(segmented_units(
+            family("STORE"),
+            store_ops,
+            max_rows.store,
+            skip.store,
+            tails,
+            move |ops: &[store::StoreOperation]| {
+                packed_if(pack, store::generate_store_trace_as(ops, form))
+            },
+        )?);
+        units.extend(segmented_units(
+            family("CPU32"),
+            cpu32_ops,
+            max_rows.cpu32,
+            0,
+            false,
+            move |ops: &[cpu32::Cpu32Operation]| {
+                packed_if(pack, cpu32::generate_cpu32_trace_as(ops, form))
+            },
+        )?);
+
+        // The units are the tables the header counted, or the build is refused.
+        check_units(&units, &header.table_counts)?;
+        Ok(units)
+    }
+}
+
+/// A family's units from a list held whole ([`chunk_and_generate_skipping`]).
+#[allow(clippy::too_many_arguments)]
+fn vec_units<'a, T: Send + Sync + 'a>(
+    family: usize,
+    ops: Vec<T>,
+    max: usize,
+    skip: usize,
+    tails: bool,
+    optional: bool,
+    generate: impl Fn(&[T]) -> Table + Send + Sync + 'a,
+) -> Result<Vec<Unit<'a>>, Error> {
+    let len = ops.len();
+    let ops = std::sync::Arc::new(ops);
+    let generate = std::sync::Arc::new(generate);
+    chunked_units(family, len, max, skip, tails, optional, |start, end| {
+        let ops = std::sync::Arc::clone(&ops);
+        let generate = std::sync::Arc::clone(&generate);
+        Box::new(move || Ok(generate(&ops[start..end])))
+    })
+}
+
+/// A family's units from a list in blocks ([`chunk_and_generate_segmented`]
+/// over its blocks); an empty list makes no table.
+fn segmented_units<'a, T: Clone + Send + Sync + 'a>(
+    family: usize,
+    ops: BlockVec<T>,
+    max: usize,
+    skip: usize,
+    tails: bool,
+    generate: impl Fn(&[T]) -> Table + Send + Sync + 'a,
+) -> Result<Vec<Unit<'a>>, Error> {
+    let len = ops.len();
+    let ops = std::sync::Arc::new(ops);
+    let generate = std::sync::Arc::new(generate);
+    chunked_units(family, len, max, skip, tails, true, |start, end| {
+        let ops = std::sync::Arc::clone(&ops);
+        let generate = std::sync::Arc::clone(&generate);
+        Box::new(move || Ok(generate(&ops.segments().range(start, end))))
+    })
+}
+
+/// KECCAK_RND's units ([`keccak_rnd_chunks`]' tables, or the whole table wide
+/// without chunks): a chunk's round ops are derived from the KECCAK ops that
+/// reach it as the chunk is built.
+fn keccak_rnd_units<'a>(
+    keccak_ops: &std::sync::Arc<BlockVec<KeccakOperation>>,
+    skip: &StreamSkip,
+    pack: bool,
+    form: TraceForm,
+) -> Result<Vec<Unit<'a>>, Error> {
+    let f = family("KECCAK_RND");
+    let n = keccak_ops.len();
+    let rounds = |ops: &[KeccakOperation]| -> Vec<KeccakRoundOperation> {
+        ops.iter()
+            .map(|op| KeccakRoundOperation {
+                timestamp: op.timestamp,
+                input: op.input,
+                output: op.output,
+            })
+            .collect()
+    };
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let rows = skip.keccak_rnd_rows;
+    let streamed = skip.keccak_rnd;
+    let total = (n * 24).next_power_of_two().max(4);
+    if rows == 0 {
+        let ops = std::sync::Arc::clone(keccak_ops);
+        return Ok(vec![Unit::Build {
+            family: f,
+            rows: total,
+            job: Box::new(move || Ok(keccak_rnd::generate_keccak_rnd_trace(&rounds(&ops.whole())))),
+        }]);
+    }
+    if total <= rows {
+        if streamed > 0 {
+            return Err(Error::Prover(format!(
+                "{streamed} KECCAK_RND chunks were streamed but the table is one of {total} rows"
+            )));
+        }
+        let ops = std::sync::Arc::clone(keccak_ops);
+        return Ok(vec![Unit::Build {
+            family: f,
+            rows: total,
+            job: Box::new(move || {
+                Ok(packed_if(
+                    pack,
+                    keccak_rnd::generate_keccak_rnd_rows_as(&rounds(&ops.whole()), 0, total, form),
+                ))
+            }),
+        }]);
+    }
+    let chunks = total / rows;
+    if streamed > chunks {
+        return Err(Error::Prover(format!(
+            "{streamed} KECCAK_RND chunks were streamed but the run has {chunks}"
+        )));
+    }
+    Ok((0..chunks)
+        .map(|c| {
+            if c < streamed {
+                return Unit::Streamed { family: f };
+            }
+            let ops = std::sync::Arc::clone(keccak_ops);
+            let (first, end) = keccak_rnd_op_range(c, rows, n);
+            Unit::Build {
+                family: f,
+                rows,
+                job: Box::new(move || {
+                    Ok(packed_if(
+                        pack,
+                        keccak_rnd::generate_keccak_rnd_rows_as(
+                            &rounds(&ops.range(first, end)),
+                            c * rows - first * 24,
+                            rows,
+                            form,
+                        ),
+                    ))
+                }) as Job<'a>,
+            }
+        })
+        .collect())
+}
+
+/// The units' tables, family by family, against the header's counts: the same,
+/// or an error ([`FinishPlan::emit_all`]'s refusal). HALT and the four fixed
+/// tables are one each.
+fn check_units(units: &[Unit<'_>], counts: &crate::TableCounts) -> Result<(), Error> {
+    let mut made = [0usize; FAMILIES.len()];
+    for unit in units {
+        let (Unit::Build { family, .. } | Unit::Streamed { family }) = unit;
+        if let Some(n) = made.get_mut(*family) {
+            *n += 1;
+        }
+    }
+    let of = |name: &str| made[family(name)];
+    let units_counts = crate::TableCounts {
+        cpu: of("CPU"),
+        lt: of("LT"),
+        memw: of("MEMW"),
+        memw_aligned: of("MEMW_A"),
+        load: of("LOAD"),
+        mul: of("MUL"),
+        dvrm: of("DVRM"),
+        shift: of("SHIFT"),
+        branch: of("BRANCH"),
+        memw_register: of("MEMW_R"),
+        eq: of("EQ"),
+        bytewise: of("BYTEWISE"),
+        store: of("STORE"),
+        cpu32: of("CPU32"),
+        keccak: of("KECCAK"),
+        keccak_rnd: of("KECCAK_RND"),
+        ecsm: of("ECSM"),
+        ecdas: of("ECDAS"),
+        hint: of("HINT"),
+        commit: of("COMMIT"),
+        blake3: of("BLAKE3"),
+    };
+    let fixed = ["BITWISE", "DECODE", "KECCAK_RC", "REGISTER", "HALT"];
+    if counts_of(&units_counts) != counts_of(counts) || fixed.iter().any(|f| of(f) != 1) {
+        return Err(Error::Prover(format!(
+            "the streamed finish would build {units_counts:?}, its plan counted {counts:?}"
+        )));
+    }
+    Ok(())
+}
+
+impl<'a> FinishPlan<'a> {
+    /// Phase 5 streamed: the units ([`Self::units`]) built in waves and handed
+    /// to `send` in AIR order, from this thread. A wave is the units in order
+    /// up to half the gate's budget of estimated bytes, built in parallel; the
+    /// gate holds each table's bytes from before it is built until the packer
+    /// places it ([`gate::ByteGate`]), so at most one wave and the tables not
+    /// yet placed are in memory. A table is estimated at its family's measured
+    /// bytes a row once one of the family has been built, at eight bytes a
+    /// cell before. A job's error, or `send`'s, stops the gate and is returned.
+    pub(super) fn emit_streamed(
+        self,
+        gate: &gate::ByteGate,
+        send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        emit_streamed_units(self.units(), gate, send)
+    }
+}
+
+/// [`FinishPlan::emit_streamed`] over `units`: an error stops the gate, so it
+/// reaches every waiter, and is returned.
+fn emit_streamed_units(
+    units: Result<Vec<Unit<'_>>, Error>,
+    gate: &gate::ByteGate,
+    send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let result = emit_units(units, gate, send);
+    if let Err(e) = &result {
+        gate.stop(&format!("the finish stopped: {e:?}"));
+    }
+    result
+}
+
+/// [`emit_streamed_units`]' loop.
+fn emit_units(
+    units: Result<Vec<Unit<'_>>, Error>,
+    gate: &gate::ByteGate,
+    send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let wave_bytes = (gate.budget() / 2).max(1);
+    // Bytes a row each family's tables took, once one was built.
+    let mut per_row: [Option<f64>; FAMILIES.len()] = [None; FAMILIES.len()];
+    let estimate = |per_row: &[Option<f64>; FAMILIES.len()], family: usize, rows: usize| {
+        let wide = FAMILIES.get(family).map_or(1, |&(_, columns)| columns) * 8;
+        let a_row = per_row
+            .get(family)
+            .copied()
+            .flatten()
+            .unwrap_or(wide as f64);
+        (a_row * rows as f64).ceil() as usize
+    };
+    let mut units = units?.into_iter().enumerate().peekable();
+    let mut next_table = 0usize;
+    while units.peek().is_some() {
+        // The wave: units in order until one does not fit; its first table
+        // waits for its bytes (the lowest not yet placed always goes).
+        let mut wave: Vec<WaveSlot<'_>> = Vec::new();
+        let mut bytes = 0usize;
+        let mut tables = 0usize;
+        while let Some((_, unit)) = units.peek() {
+            if let Unit::Build { family, rows, .. } = unit {
+                let est = estimate(&per_row, *family, *rows);
+                if tables == 0 {
+                    gate.acquire(next_table, est)?;
+                } else if bytes.saturating_add(est) > wave_bytes
+                    || !gate.try_acquire(next_table, est)?
+                {
+                    break;
+                }
+                bytes = bytes.saturating_add(est);
+                tables += 1;
+            }
+            let Some((position, unit)) = units.next() else {
+                break;
+            };
+            match unit {
+                Unit::Streamed { .. } => wave.push((position, None)),
+                Unit::Build { family, job, .. } => {
+                    wave.push((position, Some((next_table, family, job))));
+                    next_table += 1;
+                }
+            }
+        }
+        // Built in parallel; no worker waits on the gate or on `send`.
+        let (slots, jobs): (Vec<_>, Vec<_>) = wave
+            .into_iter()
+            .map(|(position, build)| match build {
+                Some((table, family, job)) => ((position, Some((table, family))), Some(job)),
+                None => ((position, None), None),
+            })
+            .unzip();
+        let jobs: Vec<Job<'_>> = jobs.into_iter().flatten().collect();
+        #[cfg(feature = "parallel")]
+        let built: Vec<Result<Table, Error>> = jobs.into_par_iter().map(|job| job()).collect();
+        #[cfg(not(feature = "parallel"))]
+        let built: Vec<Result<Table, Error>> = jobs.into_iter().map(|job| job()).collect();
+        let mut built = built.into_iter();
+        for (position, build) in slots {
+            let table = match build {
+                None => None,
+                Some((number, family)) => {
+                    let table = built.next().ok_or_else(|| {
+                        Error::Prover("the streamed finish lost a table of its wave".into())
+                    })??;
+                    let bytes = table_bytes(&table);
+                    gate.resize(number, bytes);
+                    if table.main_table.height > 0
+                        && let Some(slot) = per_row.get_mut(family)
+                    {
+                        *slot = Some(bytes as f64 / table.main_table.height as f64);
+                    }
+                    Some(table)
+                }
+            };
+            send(Emitted { position, table })?;
+        }
+        build_stamps::mark("p5 wave");
+    }
+    build_stamps::mark("p5 end");
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "stream_tests.rs"]
+mod stream_tests;

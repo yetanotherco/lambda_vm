@@ -101,6 +101,7 @@ fn small_block_cut(
         // The rest laid out in waves of 1 MiB: several at a test's size.
         finish_keccak_rnd_chunks: true,
         finish_cuts: true,
+        finish_stream: true,
         rest_layout_bytes: Some(1 << 20),
         pack_finished: true,
         gpack: true,
@@ -557,6 +558,7 @@ fn dense_block_with(
             // The rest laid out in waves of 1 MiB: several at a test's size.
             finish_keccak_rnd_chunks: true,
             finish_cuts: true,
+            finish_stream: true,
             rest_layout_bytes: Some(1 << 20),
             pack_finished: true,
             gpack: true,

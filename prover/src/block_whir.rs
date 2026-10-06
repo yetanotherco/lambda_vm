@@ -346,6 +346,16 @@ pub struct BlockOptions {
     /// the rest's layout transposes them into fresh pages (+4.7 GiB VmRSS, BIG
     /// 660).
     pub finish_cuts: bool,
+    /// With windows, the pipelined layout and the finish's cuts: the finish
+    /// streams the rest ([`WindowedTraceBuilder::finish_streamed`]): its tables
+    /// built in waves in AIR order under a byte gate of
+    /// [`Self::rest_layout_bytes`] (generated and not yet placed), each family's
+    /// ops freed with its last table, the layout taking each table as it comes
+    /// and the packer placing it, so the rest's first groups commit while the
+    /// finish still builds the later ones. The tables, their order and the
+    /// groups are the same. Production: on unless `LAMBDA_VM_BLOCK_FINISH_STREAM=0`
+    /// (the A arm: every table built at once, then laid out).
+    pub finish_stream: bool,
     /// With windows: `Some(bytes)` lays the rest of the run out in AIR order,
     /// in waves of at most `bytes` of rows (a larger table is a wave of its
     /// own), each wave in parallel; `None` lays every table out at once. A
@@ -704,6 +714,7 @@ impl BlockOptions {
             memlog: memlog::from_env(),
             finish_keccak_rnd_chunks: true,
             finish_cuts: finish_plan_from_env(),
+            finish_stream: finish_stream_from_env(),
             rest_layout_bytes: Some(BLOCK_REST_LAYOUT_BYTES),
             pack_finished: true,
             gpack: gpack_from_env(),
@@ -722,6 +733,12 @@ pub(crate) fn gpack_from_env() -> bool {
 /// value, on unless `0`.
 pub(crate) fn finish_plan_from_env() -> bool {
     !std::env::var("LAMBDA_VM_BLOCK_FINISH_PLAN").is_ok_and(|v| v.trim() == "0")
+}
+
+/// `LAMBDA_VM_BLOCK_FINISH_STREAM`: [`BlockOptions::finish_stream`]'s
+/// production value, on unless `0`.
+pub(crate) fn finish_stream_from_env() -> bool {
+    !std::env::var("LAMBDA_VM_BLOCK_FINISH_STREAM").is_ok_and(|v| v.trim() == "0")
 }
 
 /// `LAMBDA_VM_BLOCK_COMPACT_LT=0`: the LT ops derived from the MEMW ops the
@@ -2375,6 +2392,66 @@ type BuilderReport = (f64, f64, usize, WindowStamps, Vec<(String, f64)>);
 enum Built {
     Job(Box<ChunkJob>),
     Rest(Box<Traces>),
+    /// The rest streamed ([`BlockOptions::finish_stream`]).
+    Stream(Box<RestStream>),
+}
+
+/// The rest as the finish streams it: the header (what the statement reads,
+/// and the run's AIRs) and, in AIR order, each table or streamed chunk's slot.
+struct RestStream {
+    header: crate::tables::trace_builder::RestHeader,
+    tables: std::sync::mpsc::Receiver<crate::tables::trace_builder::Emitted>,
+}
+
+/// The rest as the layout thread receives it.
+enum RestIn {
+    Whole(Box<Traces>),
+    Stream(Box<RestStream>),
+}
+
+/// The rest's tables as they stream in, checked against the run's AIRs: each
+/// the next AIR in order, a streamed chunk's slot or a table of that AIR's
+/// width, and every AIR reached. A table's height is checked where it is laid
+/// out ([`layout_of`]).
+struct RestOrder {
+    widths: Vec<usize>,
+    next: usize,
+}
+
+impl RestOrder {
+    fn admit(&mut self, position: usize, width: Option<usize>) -> Result<(), Error> {
+        if position != self.next {
+            return Err(Error::Prover(format!(
+                "the rest's table {position} came where table {} was due",
+                self.next
+            )));
+        }
+        let want = *self.widths.get(position).ok_or_else(|| {
+            Error::Prover(format!(
+                "the rest's table {position} is past the run's {} tables",
+                self.widths.len()
+            ))
+        })?;
+        if let Some(width) = width
+            && width != want
+        {
+            return Err(Error::Prover(format!(
+                "the rest's table {position}: {width} columns, its AIR declares {want}"
+            )));
+        }
+        self.next += 1;
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<(), Error> {
+        if self.next != self.widths.len() {
+            return Err(Error::Prover(format!(
+                "table {} of the rest was never laid out",
+                self.next
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// A table before the run's AIR order exists: a streamed chunk, or a table of
@@ -2559,6 +2636,11 @@ fn stream_inline<'a>(
                 shapes.push((table, index, shape));
                 packer.place(Key::Streamed(table, index), shape, laid)?;
             }
+            Built::Stream(_) => {
+                return Err(Error::Prover(
+                    "a streamed rest needs the pipelined layout".into(),
+                ));
+            }
             Built::Rest(traces) => {
                 let placed_at = packer.start.elapsed().as_secs_f64();
                 let ahead_most = usize::from(!shapes.is_empty());
@@ -2665,10 +2747,12 @@ impl Drop for ClosePermits<'_> {
 /// arrival order all the same, so a waiting phase A holds back only the
 /// packing; this thread hands them out and, once the run is built, lays out
 /// the rest of it (`rest`) while the last chunks are packed. With
-/// `pack_rest`, `rest` sends the rest's tables to the packer as they are laid
-/// out, and it packs them after the chunks, in AIR order. Their channel is
-/// unbounded: the rest is already in memory, and a full channel would park
-/// the rayon threads phase A's commits need.
+/// `pack_rest`, or a streamed rest, `rest` sends the rest's tables to the
+/// packer as they are laid out, and it packs them after the chunks, in AIR
+/// order, giving each table's bytes back to `gate` as it places it (a
+/// streamed rest's byte gate, stopped when the packer stops). Their channel is
+/// unbounded: the rest is already in memory, or held under the gate, and a
+/// full channel would park the rayon threads phase A's commits need.
 #[allow(clippy::too_many_arguments)]
 fn stream_pipelined<'a, R>(
     brx: std::sync::mpsc::Receiver<Built>,
@@ -2677,7 +2761,8 @@ fn stream_pipelined<'a, R>(
     workers: usize,
     ahead: Option<usize>,
     pack_rest: bool,
-    rest: impl FnOnce(Box<Traces>, Option<std::sync::mpsc::Sender<RestDone<'a>>>) -> Result<R, Error>,
+    gate: Option<&'a crate::tables::trace_builder::gate::ByteGate>,
+    rest: impl FnOnce(RestIn, Option<std::sync::mpsc::Sender<RestDone<'a>>>) -> Result<R, Error>,
 ) -> Result<(StreamLaid<'a>, R), Error> {
     type Done<'a> = (usize, f64, Result<LaidChunk<'a>, Error>);
     let permits = ahead.map(|k| Permits::new(k + 1));
@@ -2722,9 +2807,11 @@ fn stream_pipelined<'a, R>(
         drop(jrx);
         drop(dtx);
         let (rtx, rrx) = std::sync::mpsc::channel::<RestDone<'a>>();
-        let rtx = pack_rest.then_some(rtx);
         let placer = scope.spawn(move || -> Result<StreamLaid<'a>, Error> {
             let _close = ClosePermits(permits);
+            let _stop = gate.map(|gate| {
+                crate::tables::trace_builder::gate::StopGate(gate, "the packer stopped")
+            });
             let mut pending = std::collections::BTreeMap::new();
             let mut next = 0usize;
             let mut shapes = Vec::new();
@@ -2758,6 +2845,9 @@ fn stream_pipelined<'a, R>(
                     let (i, shape, table) = laid?;
                     placed.push((i, shape));
                     packer.place(Key::Air(i), shape, table)?;
+                    if let Some(gate) = gate {
+                        gate.release(next);
+                    }
                     next += 1;
                 }
             }
@@ -2786,14 +2876,20 @@ fn stream_pipelined<'a, R>(
                     handed += 1;
                 }
                 Built::Rest(built) => {
-                    traces = Some(built);
+                    traces = Some(RestIn::Whole(built));
+                    break;
+                }
+                Built::Stream(stream) => {
+                    traces = Some(RestIn::Stream(stream));
                     break;
                 }
             }
         }
         drop(jtx);
         let rest = match traces {
-            Some(traces) => Some(rest(traces, rtx)),
+            // A streamed rest is always placed as it is laid out.
+            Some(traces @ RestIn::Stream(_)) => Some(rest(traces, Some(rtx))),
+            Some(traces) => Some(rest(traces, pack_rest.then_some(rtx))),
             None => {
                 drop(rtx);
                 None
@@ -3039,6 +3135,133 @@ fn lay_out_rest<'a>(
     })
 }
 
+/// The rest as the finish streams it ([`RestStream`]): each table laid out
+/// narrow as it comes (wide ones through [`table_of`]) and sent to the packer
+/// in AIR order (`sink`), every table checked against the run's AIRs built
+/// from the header ([`RestOrder`]). The prepared columns are left for after
+/// the packing, as on the pipelined path.
+#[allow(clippy::too_many_arguments)]
+fn lay_out_rest_streamed<'a>(
+    stream: Box<RestStream>,
+    program: &Elf,
+    opts: &ProofOptions,
+    run_airs: &'a std::sync::OnceLock<VmAirs>,
+    start: Instant,
+    sink: Option<std::sync::mpsc::Sender<RestDone<'a>>>,
+    ledger: Option<&memlog::Ledger>,
+) -> Result<RestLaid<'a>, Error> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let sink =
+        sink.ok_or_else(|| Error::Prover("a streamed rest needs the packer's sink".into()))?;
+    let at = || start.elapsed().as_secs_f64();
+    let mut marks = vec![("rest received", at())];
+    let RestStream { header, tables } = *stream;
+    validate_block_counts(&header.table_counts)?;
+    let runtime_page_ranges = header.runtime_page_ranges();
+    let num_private_input_pages = header
+        .page_configs
+        .iter()
+        .filter(|c| c.is_private_input)
+        .count();
+    let airs = run_airs.get_or_init(|| {
+        VmAirs::new(
+            program,
+            opts,
+            false,
+            &header.page_configs,
+            &header.table_counts,
+            None,
+            true,
+            None,
+            None,
+            None,
+        )
+    });
+    marks.push(("airs", at()));
+    let refs = airs.air_refs();
+    let mut order = RestOrder {
+        widths: refs.iter().map(|air| air.trace_layout().0).collect(),
+        next: 0,
+    };
+    let mut timed: Vec<(usize, f64)> = Vec::new();
+    let mut laid_at: Vec<(usize, f64)> = Vec::new();
+    let (mut narrow_tables, mut narrow_bytes) = (0usize, 0usize);
+    let mut k = 0usize;
+    for crate::tables::trace_builder::Emitted { position, table } in tables {
+        order.admit(position, table.as_ref().map(|t| t.main_table.width))?;
+        let Some(mut trace) = table else {
+            continue;
+        };
+        if k == 0 {
+            marks.push(("rest first received", at()));
+        }
+        let t = Instant::now();
+        let shape = (
+            trace.main_table.width,
+            trace.main_table.height.trailing_zeros() as usize,
+        );
+        let rows = memlog::rows_bytes(&trace);
+        let laid = if let Some(packed) = trace.narrow_main() {
+            narrow_tables += 1;
+            narrow_bytes += packed.data().len();
+            table_of_narrow(refs[position], &mut trace, shape)
+        } else {
+            table_of(refs[position], &mut trace, shape, true)
+        };
+        let secs = t.elapsed().as_secs_f64();
+        timed.push((position, secs));
+        laid_at.push((position, at()));
+        if let (Some(ledger), Ok(table)) = (ledger, &laid) {
+            ledger.rest.fetch_sub(rows, Relaxed);
+            ledger
+                .rest_laid
+                .fetch_add(memlog::table_bytes(table), Relaxed);
+        }
+        // A packer that stopped has its own error to report.
+        let _ = sink.send((k, secs, laid.map(|table| (position, shape, table))));
+        k += 1;
+    }
+    order.finish()?;
+    marks.push(("rest laid out", at()));
+    if let Some(ledger) = ledger {
+        ledger.line("rest laid out");
+    }
+    let busy = timed.iter().map(|&(_, secs)| secs).sum();
+    let first = timed.first().map(|&(i, _)| i);
+    let mut slowest_of = timed.clone();
+    slowest_of.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut slowest: Vec<(String, f64)> = slowest_of
+        .iter()
+        .take(5)
+        .map(|&(i, secs)| (refs[i].name().to_string(), secs))
+        .collect();
+    if let Some(&(i, secs)) = first.and_then(|f| timed.iter().find(|&&(i, _)| i == f)) {
+        slowest.push((format!("first in AIR order: {}", refs[i].name()), secs));
+    }
+    let crate::tables::trace_builder::RestHeader {
+        table_counts,
+        page_configs,
+        public_output_bytes,
+        ..
+    } = header;
+    Ok(RestLaid {
+        table_counts,
+        runtime_page_ranges,
+        num_private_input_pages,
+        public_output: public_output_bytes,
+        airs,
+        page_configs,
+        refs,
+        prepared: None,
+        tables: Vec::new(),
+        marks,
+        slowest,
+        busy,
+        packed_rest: (narrow_tables, narrow_bytes),
+        laid_at,
+    })
+}
+
 /// `items` in order, cut into consecutive waves of at most `budget` bytes
 /// (`bytes` of an item); a wave holds at least one item.
 pub(crate) fn waves<T>(items: Vec<T>, budget: usize, bytes: impl Fn(&T) -> usize) -> Vec<Vec<T>> {
@@ -3175,6 +3398,12 @@ fn prove_streamed(
         }
     };
 
+    // The streamed finish's byte gate: the rest's tables generated and not yet
+    // placed ([`BlockOptions::finish_stream`]).
+    let rest_gate = crate::tables::trace_builder::gate::ByteGate::new(
+        options.rest_layout_bytes.unwrap_or(usize::MAX),
+    );
+    let rest_gate = &rest_gate;
     crate::with_whir_hash!(|H| {
         let (block, built, laid, executed) = std::thread::scope(|scope| {
             use std::sync::atomic::Ordering::Relaxed;
@@ -3363,6 +3592,63 @@ fn prove_streamed(
                         }),
                     ));
                 }
+                // The rest streamed: the header to the layout thread first,
+                // then each table as its wave is built, under the byte gate.
+                let streams = options.finish_stream
+                    && options.layout_workers > 0
+                    && options.finish_cuts
+                    && (options.stream_keccak_rnd
+                        || (options.finish_keccak_rnd_chunks && options.keccak_rnd_rows_log2 >= 5))
+                    && !deviations.omit_first_keccak_rnd;
+                if streams {
+                    let emitted = builder.finish_streamed(&last, rest_gate, |header| {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        btx.send(Built::Stream(Box::new(RestStream {
+                            header,
+                            tables: rx,
+                        })))
+                        .map_err(|_| Error::Prover("the layout thread stopped".into()))?;
+                        Ok(Box::new(
+                            move |emitted: crate::tables::trace_builder::Emitted| {
+                                if let (Some(ledger), Some(table)) = (ledger, &emitted.table) {
+                                    ledger.rest.fetch_add(memlog::rows_bytes(table), Relaxed);
+                                }
+                                tx.send(emitted).map_err(|_| {
+                                    Error::Prover(
+                                        "the layout thread stopped taking the rest".into(),
+                                    )
+                                })
+                            },
+                        ))
+                    });
+                    if let Some(ledger) = ledger {
+                        crate::tables::trace_builder::build_stamps::set_hook(None);
+                        ledger.builder.store(0, Relaxed);
+                        ledger.walk.store(0, Relaxed);
+                        ledger.image.store(0, Relaxed);
+                    }
+                    emitted?;
+                    let g = |b: usize| b as f64 / (1u64 << 30) as f64;
+                    eprintln!(
+                        "BLOCK REST STREAM: the rest built in waves under a {:.2} GiB gate, held at most \
+                         {:.2} GiB (built and not yet placed)",
+                        g(rest_gate.budget()),
+                        g(rest_gate.most()),
+                    );
+                    let finish_marks = crate::tables::trace_builder::build_stamps::take();
+                    let finished = start.elapsed().as_secs_f64();
+                    if let Some(ledger) = ledger {
+                        ledger.line("finish done");
+                        ledger.logs.fetch_sub(memlog::logs_bytes(&last), Relaxed);
+                    }
+                    return Ok((
+                        windows_done,
+                        finished,
+                        streamed,
+                        window_stamps,
+                        finish_marks,
+                    ));
+                }
                 let built_rest = builder.finish(&last);
                 if let Some(ledger) = ledger {
                     crate::tables::trace_builder::build_stamps::set_hook(None);
@@ -3434,8 +3720,8 @@ fn prove_streamed(
                 // Off the inline path, the prepared columns wait until the
                 // groups are sent.
                 let inline = options.layout_workers == 0;
-                let rest_of = |traces, sink| {
-                    lay_out_rest(
+                let rest_of = |rest: RestIn, sink| match rest {
+                    RestIn::Whole(traces) => lay_out_rest(
                         traces,
                         program,
                         opts,
@@ -3446,11 +3732,14 @@ fn prove_streamed(
                         sink,
                         options.rest_layout_bytes,
                         ledger,
-                    )
+                    ),
+                    RestIn::Stream(stream) => {
+                        lay_out_rest_streamed(stream, program, opts, run_airs, start, sink, ledger)
+                    }
                 };
                 let (streamed, rest) = if inline {
                     let (streamed, traces) = stream_inline(brx, stream_airs, packer)?;
-                    (streamed, rest_of(traces, None)?)
+                    (streamed, rest_of(RestIn::Whole(traces), None)?)
                 } else {
                     stream_pipelined(
                         brx,
@@ -3459,6 +3748,7 @@ fn prove_streamed(
                         options.layout_workers,
                         options.layout_ahead,
                         options.pack_rest_as_laid_out,
+                        Some(rest_gate),
                         rest_of,
                     )?
                 };
@@ -4502,5 +4792,71 @@ mod spill_policy_tests {
         assert!(parse_hand_off(Some(" on ")));
         assert!(!parse_hand_off(Some("off")));
         assert!(!parse_hand_off(Some(" off ")));
+    }
+}
+
+#[cfg(test)]
+mod rest_order_tests {
+    use super::RestOrder;
+
+    fn order() -> RestOrder {
+        RestOrder {
+            widths: vec![21, 6, 38, 38, 17],
+            next: 0,
+        }
+    }
+
+    /// Every AIR in order, streamed slots among them: accepted.
+    #[test]
+    fn the_rest_in_air_order_is_taken() {
+        let mut o = order();
+        for (position, width) in [
+            (0, Some(21)),
+            (1, Some(6)),
+            (2, None),
+            (3, Some(38)),
+            (4, Some(17)),
+        ] {
+            o.admit(position, width).expect("in order");
+        }
+        o.finish().expect("every AIR reached");
+    }
+
+    /// A table out of order, of another AIR's width, past the AIRs, or a
+    /// stream that stops short: refused, as an error.
+    #[test]
+    fn a_table_out_of_order_wrong_or_missing_is_refused() {
+        let mut o = order();
+        o.admit(0, Some(21)).expect("0");
+        let err = o.admit(2, Some(38)).expect_err("1 is due");
+        assert!(
+            format!("{err:?}").contains("came where table 1 was due"),
+            "{err:?}"
+        );
+        let mut o = order();
+        let err = o.admit(0, Some(6)).expect_err("BITWISE is 21 wide");
+        assert!(
+            format!("{err:?}").contains("6 columns, its AIR declares 21"),
+            "{err:?}"
+        );
+        let mut o = order();
+        for (position, width) in [(0, Some(21)), (1, Some(6)), (2, None)] {
+            o.admit(position, width).expect("in order");
+        }
+        let err = o.finish().expect_err("two AIRs never came");
+        assert!(
+            format!("{err:?}").contains("table 3 of the rest was never laid out"),
+            "{err:?}"
+        );
+        let mut o = RestOrder {
+            widths: vec![21],
+            next: 0,
+        };
+        o.admit(0, Some(21)).expect("0");
+        let err = o.admit(1, Some(6)).expect_err("past the AIRs");
+        assert!(
+            format!("{err:?}").contains("past the run's 1 tables"),
+            "{err:?}"
+        );
     }
 }

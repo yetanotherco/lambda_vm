@@ -162,6 +162,23 @@ pub struct WindowedTraceBuilder<'a> {
     gpack: bool,
 }
 
+/// What the table phase of a windowed build starts from
+/// ([`WindowedTraceBuilder::finish`]): the run's lists, the state the walk
+/// left, and what the windows streamed and counted.
+struct Finishing<'a> {
+    ops: CollectedOps,
+    image: HashMap<u64, u8>,
+    memory_state: MemoryState,
+    register_init: Vec<u32>,
+    decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+    artifacts: DecodeArtifacts,
+    register_state: RegisterState,
+    max_rows: crate::tables::MaxRowsConfig,
+    private_input: &'a [u8],
+    skip: StreamSkip,
+    pre: PreCounted,
+}
+
 /// Where a windowed build spent its time, seconds summed over the windows:
 /// the walk, the routing (with the window's bookkeeping), and handing the
 /// streamed chunks out (`finish` is timed by its caller).
@@ -464,7 +481,98 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// Collects the run's last window and builds every table the windows did
     /// not stream. The streamed chunks' slots hold empty placeholders;
     /// [`Traces::insert_streamed`] puts the chunks back.
-    pub fn finish(mut self, logs: &[Log]) -> Result<Traces, Error> {
+    pub fn finish(self, logs: &[Log]) -> Result<Traces, Error> {
+        let Finishing {
+            ops,
+            image,
+            memory_state,
+            register_init,
+            decode_trace,
+            artifacts,
+            register_state,
+            max_rows,
+            private_input,
+            skip,
+            pre,
+        } = self.finishing(logs)?;
+        build_traces(
+            ops,
+            Some(&image),
+            &memory_state,
+            &register_init,
+            decode_trace,
+            &artifacts.decode_pc_to_row,
+            register_state,
+            &max_rows,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+            private_input,
+            true,
+            false,
+            &skip,
+            Some(pre),
+        )
+    }
+
+    /// [`Self::finish`] streamed: the run's last window collected and the
+    /// table phase planned, `on_header` given the header (what a statement is
+    /// read from) before any table is built, then every table the windows did
+    /// not stream, and every streamed chunk's slot, handed to the sink it
+    /// returns in AIR order, under `gate` ([`super::finish::FinishPlan::emit_streamed`]).
+    pub(crate) fn finish_streamed<'s>(
+        self,
+        logs: &[Log],
+        gate: &super::gate::ByteGate,
+        on_header: impl FnOnce(
+            super::RestHeader,
+        ) -> Result<
+            Box<dyn FnMut(super::Emitted) -> Result<(), Error> + 's>,
+            Error,
+        >,
+    ) -> Result<(), Error> {
+        let Finishing {
+            ops,
+            image,
+            memory_state,
+            register_init,
+            decode_trace,
+            artifacts,
+            register_state,
+            max_rows,
+            private_input,
+            skip,
+            pre,
+        } = self.finishing(logs)?;
+        let plan = super::finish::FinishPlan::new(
+            ops,
+            Some(&image),
+            &memory_state,
+            &register_init,
+            decode_trace,
+            &artifacts.decode_pc_to_row,
+            register_state,
+            &max_rows,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+            private_input,
+            true,
+            false,
+            &skip,
+            Some(pre),
+        )?;
+        let mut send = match on_header(plan.header().clone()) {
+            Ok(send) => send,
+            Err(e) => {
+                gate.stop("the header found no taker");
+                return Err(e);
+            }
+        };
+        plan.emit_streamed(gate, &mut *send)
+    }
+
+    /// The run's last window collected and walked, and the run's lists
+    /// assembled: what the table phase starts from.
+    fn finishing(mut self, logs: &[Log]) -> Result<Finishing<'a>, Error> {
         // The last window may halt: it is walked here, not by the `Walker`.
         let cpu_ops = match &self.decode {
             Some(table) => super::collect_cpu_ops_from_table(logs, table, self.cycles)?,
@@ -578,23 +686,19 @@ impl<'a> WindowedTraceBuilder<'a> {
                 (ops, decode_trace, skip, pre)
             }
         };
-        build_traces(
+        Ok(Finishing {
             ops,
-            Some(&image),
-            &memory_state,
-            &register_init,
+            image,
+            memory_state,
+            register_init,
             decode_trace,
-            &artifacts.decode_pc_to_row,
+            artifacts,
             register_state,
-            &max_rows,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
+            max_rows,
             private_input,
-            true,
-            false,
-            &skip,
-            Some(pre),
-        )
+            skip,
+            pre,
+        })
     }
 
     /// The builder in its two halves, to run on two threads: the [`Walker`]

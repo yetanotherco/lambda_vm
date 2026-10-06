@@ -78,10 +78,12 @@ mod finish;
 mod finish_oracle;
 #[cfg(test)]
 mod finish_tests;
+pub(crate) mod gate;
 #[cfg(test)]
 mod lean_walk_tests;
 mod windowed;
 use blocks::{BlockVec, block_len};
+pub(crate) use finish::{Emitted, RestHeader};
 pub use windowed::{
     Accumulator, ChunkJob, StreamTable, StreamedChunk, WalkedWindow, Walker, WindowStamps,
     WindowedTraceBuilder,
