@@ -32,7 +32,8 @@
 //! columns, and the output tokens carry exactly that combination.
 //!
 //! The round constants are scaled by `IS_REAL`, so an all-zero padding row
-//! satisfies every constraint and emits no bus token.
+//! satisfies every constraint and emits no bus token; an output multiplicity
+//! on a padding row is rejected.
 
 use stark::config::Commitment;
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
@@ -149,10 +150,11 @@ impl OutForm {
         self.value_columns() + CELLS_PER_AUX_COLUMN * AUX_COLUMNS
     }
 
-    /// Constraints: `IS_REAL` booleanity, two per S-box, and under
-    /// [`OutForm::Columns`] one per `OUT` lane.
+    /// Constraints: `IS_REAL` booleanity, one per output multiplicity (zero
+    /// unless the row is real), two per S-box, and under [`OutForm::Columns`]
+    /// one per `OUT` lane.
     pub const fn num_constraints(self) -> usize {
-        let mut n = 1;
+        let mut n = 1 + CELLS;
         let mut r = 0;
         while r < NUM_ROUNDS {
             n += 2 * sboxed_lanes(r);
@@ -314,8 +316,17 @@ impl ConstraintSet<F, E> for P1W16SocketConstraints {
         let width = form.num_columns();
         let is_real = b.main(0, cols::IS_REAL);
         let one = b.one();
-        b.emit_base(0, is_real.clone() * (one - is_real.clone()));
-        let mut idx = 1;
+        let not_real = one - is_real.clone();
+        b.emit_base(0, is_real.clone() * not_real.clone());
+        // An output is offered only by a real row. A padding row reads nothing
+        // (its `IN` is free) and computes the permutation without round
+        // constants, so a write from one would put a prover-chosen value in
+        // memory. The program builder never emits one; this makes it
+        // unprovable rather than merely unemitted.
+        for k in 0..CELLS {
+            b.emit_base(1 + k, b.main(0, cols::MULT0 + k) * not_real.clone());
+        }
+        let mut idx = 1 + CELLS;
 
         let mut state: Vec<Affine> = (0..STATE_FELTS)
             .map(|i| Affine::column(width, cols::IN0 + i))
