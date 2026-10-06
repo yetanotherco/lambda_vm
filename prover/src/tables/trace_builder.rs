@@ -76,12 +76,14 @@ use crate::finish_sink::{self, FinishSink, FinishedKind};
 use crate::paged_mem::{ImageSource, PagedMem};
 
 mod compact_branch;
+mod compact_bytewise;
 mod compact_eq;
 mod delta;
 #[cfg(test)]
 mod lean_walk_tests;
 mod windowed;
 use compact_branch::CompactBranch;
+use compact_bytewise::CompactBytewise;
 use compact_eq::CompactEq;
 pub use windowed::{
     Accumulator, ChunkJob, RegenBuilder, StreamTable, StreamedChunk, WalkedWindow, Walker,
@@ -3935,7 +3937,8 @@ struct CollectedOps {
     // Auxiliary ALU / memory / CPU32 dispatch chips (driven by the CPU ALU/MEMORY dispatch).
     /// Delta-coded ([`CompactEq`]).
     eq_ops: CompactEq,
-    bytewise_ops: Vec<bytewise::BytewiseOperation>,
+    /// Delta-coded ([`CompactBytewise`]).
+    bytewise_ops: CompactBytewise,
     store_ops: Vec<store::StoreOperation>,
     cpu32_ops: Vec<cpu32::Cpu32Operation>,
     // EC scalar-multiplication accelerator chips.
@@ -4577,7 +4580,8 @@ struct RoutedSegments {
     dvrm_filter: Vec<(DvrmOperation, bool)>,
     /// Delta-coded ([`CompactEq`]).
     eq_ops: CompactEq,
-    bytewise_ops: Vec<bytewise::BytewiseOperation>,
+    /// Delta-coded ([`CompactBytewise`]).
+    bytewise_ops: CompactBytewise,
     store_ops: Vec<store::StoreOperation>,
     shift_cpu32: Vec<ShiftOperation>,
     mul_cpu32: Vec<(MulOperation, bool)>,
@@ -4596,7 +4600,7 @@ impl RoutedSegments {
             + vec_heap_bytes(&self.mul_filter)
             + vec_heap_bytes(&self.dvrm_filter)
             + self.eq_ops.heap_bytes()
-            + vec_heap_bytes(&self.bytewise_ops)
+            + self.bytewise_ops.heap_bytes()
             + vec_heap_bytes(&self.store_ops)
             + vec_heap_bytes(&self.shift_cpu32)
             + vec_heap_bytes(&self.mul_cpu32)
@@ -4615,7 +4619,7 @@ impl RoutedSegments {
             ("mul_filter", vec_heap_bytes(&self.mul_filter)),
             ("dvrm_filter", vec_heap_bytes(&self.dvrm_filter)),
             ("eq", self.eq_ops.heap_bytes()),
-            ("bytewise", vec_heap_bytes(&self.bytewise_ops)),
+            ("bytewise", self.bytewise_ops.heap_bytes()),
             ("store", vec_heap_bytes(&self.store_ops)),
             ("shift_cpu32", vec_heap_bytes(&self.shift_cpu32)),
             ("mul_cpu32", vec_heap_bytes(&self.mul_cpu32)),
@@ -4639,7 +4643,8 @@ impl RoutedSegments {
         self.dvrm_filter.extend(other.dvrm_filter);
         self.eq_ops
             .extend(&other.eq_ops.range(0, other.eq_ops.len()));
-        self.bytewise_ops.extend(other.bytewise_ops);
+        self.bytewise_ops
+            .extend(&other.bytewise_ops.range(0, other.bytewise_ops.len()));
         self.store_ops.extend(other.store_ops);
         self.shift_cpu32.extend(other.shift_cpu32);
         self.mul_cpu32.extend(other.mul_cpu32);
@@ -4791,7 +4796,7 @@ fn route_ops_into(
                 segments.eq_ops.push(&route_eq(op));
             }
             if f.is_and() || f.is_or() || f.is_xor() {
-                segments.bytewise_ops.push(route_bytewise(op));
+                segments.bytewise_ops.push(&route_bytewise(op));
             }
         }
         if f.is_store() {
@@ -4932,7 +4937,7 @@ fn route_from_cpu_segments(
         mul_filter,
         dvrm_filter,
         eq_ops: CompactEq::from_ops(&eq_ops),
-        bytewise_ops,
+        bytewise_ops: CompactBytewise::from_ops(&bytewise_ops),
         store_ops,
         shift_cpu32,
         mul_cpu32,
@@ -5256,9 +5261,10 @@ fn build_traces<I: ImageSource + Sync>(
             h.add_ops(&shift::collect_bitwise_from_shift(slice))
         }));
     }
-    for slice in bytewise_ops.chunks(1 << 20) {
+    for k in 0..bytewise_ops.len().div_ceil(1 << 20) {
+        let bytewise_ops = &bytewise_ops;
         collectors.push(Box::new(move |h| {
-            for op in slice {
+            for op in bytewise_ops.range(k << 20, (k + 1) << 20) {
                 h.add_ops(&op.collect_bitwise_ops());
             }
         }));
@@ -5596,10 +5602,13 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_bytewises = || {
-        chunk_and_generate_optional::<bytewise::BytewiseOperation>(
-            &bytewise_ops,
+        chunk_and_generate_segmented(
+            &bytewise_ops.segments(),
             max_rows.bytewise,
-            |ops| bytewise::generate_bytewise_trace_as(ops, form),
+            0,
+            false,
+            true,
+            |ops: &[bytewise::BytewiseOperation]| bytewise::generate_bytewise_trace_as(ops, form),
             to(FinishedKind::Bytewise),
             #[cfg(feature = "disk-spill")]
             storage_mode,
