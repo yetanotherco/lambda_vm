@@ -11,6 +11,8 @@
 //! to 0 and `op = 1`. The `R·P` term in the λ, xR, and yR relations is gated with `μ`, so it
 //! vanishes on padding rows (μ=0) and all relations hold with zero carries.
 
+use std::borrow::Cow;
+
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
@@ -104,10 +106,39 @@ pub fn generate_ecdas_trace_as(
     ops: &[EcdasOperation],
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let n = ops.len();
-    let num_rows = n.next_power_of_two().max(4);
+    generate_ecdas_rows_as(ops, ops.len().next_power_of_two().max(4), form)
+}
+
+/// A ECDAS table of `num_rows` rows in `form`: `ops` (at most `num_rows`, a row
+/// each, one double/add step a row), then the padding rows. A row reads its own op alone and
+/// the padding rows are constants, so rows `[k·R, (k+1)·R)` of the whole padded
+/// table are this over the ops in that range with `num_rows = R`: the block's
+/// cut of the whole table, built on its own.
+pub fn generate_ecdas_rows_as(
+    ops: &[EcdasOperation],
+    num_rows: usize,
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_ecdas_rows_of(ops, num_rows, form, borrowed)
+}
+
+/// An op read as itself.
+fn borrowed(op: &EcdasOperation) -> Cow<'_, EcdasOperation> {
+    Cow::Borrowed(op)
+}
+
+/// [`generate_ecdas_rows_as`] over rows held in another form, each read as
+/// its op by `op` (a [`CompactEcdasOp`] widened back) as its row is filled.
+pub(crate) fn generate_ecdas_rows_of<R: Sync>(
+    rows: &[R],
+    num_rows: usize,
+    form: TraceForm,
+    op: impl for<'r> Fn(&'r R) -> Cow<'r, EcdasOperation> + Sync,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let n = rows.len();
     generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
-        for (row_idx, op) in ops.iter().enumerate() {
+        for (row_idx, row) in rows.iter().enumerate() {
+            let op = op(row);
             let s = &op.step;
 
             table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
@@ -141,6 +172,133 @@ pub fn generate_ecdas_trace_as(
             table.set_byte(row_idx, cols::OP, 1);
         }
     })
+}
+
+/// The carry offsets of `c0`, `c1` and `c2`, in that order.
+const CARRY_OFFSETS: [i64; 3] = [CARRY_OFFSET_LAMBDA, CARRY_OFFSET_XR, CARRY_OFFSET_YR];
+
+/// An ECDAS row as a builder keeps it until its table is built. Its carries —
+/// `c0`, `c1`, `c2`, three `[i64; 64]`, 1.5 KB of a 1.87 KB row — are held as
+/// their offset 16-bit values, the range the trace checks them in: ≈ 0.72 KB a
+/// row. A row any of whose carries does not fit keeps all three as they are,
+/// so a row widens back to exactly the op it was made from whatever the input
+/// ([`Self::to_op`]); the release build has no range assert to rely on.
+#[derive(Clone, Debug)]
+pub(crate) struct CompactEcdasOp {
+    timestamp: u64,
+    x_a: [u8; 32],
+    y_a: [u8; 32],
+    x_g: [u8; 32],
+    y_g: [u8; 32],
+    round: u8,
+    op: u8,
+    next_op: u8,
+    lambda: [u8; 32],
+    x_r: [u8; 32],
+    y_r: [u8; 32],
+    q0: [u8; 33],
+    q1: [u8; 33],
+    q2: [u8; 33],
+    carries: Carries,
+}
+
+/// A row's carries, `c0`, `c1`, `c2` in that order. The common row is held
+/// inline; boxing it would cost an allocation a row, the rare one is boxed.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug)]
+enum Carries {
+    /// Each carry plus its array's offset ([`CARRY_OFFSETS`]), every one in
+    /// `0..2^16`.
+    Offset([[u16; 64]; 3]),
+    /// As they are: some carry's offset value is outside `0..2^16`.
+    Raw(Box<[[i64; 64]; 3]>),
+}
+
+impl CompactEcdasOp {
+    /// `op`, its carries offset when they all fit 16 bits.
+    pub(crate) fn from_op(op: &EcdasOperation) -> Self {
+        let s = &op.step;
+        let raw = [s.c0, s.c1, s.c2];
+        let mut offset = [[0u16; 64]; 3];
+        let mut fits = true;
+        for ((carries, packed), base) in raw.iter().zip(&mut offset).zip(CARRY_OFFSETS) {
+            for (&c, slot) in carries.iter().zip(packed.iter_mut()) {
+                match c.checked_add(base).and_then(|v| u16::try_from(v).ok()) {
+                    Some(v) => *slot = v,
+                    None => fits = false,
+                }
+            }
+        }
+        Self {
+            timestamp: op.timestamp,
+            x_a: s.x_a,
+            y_a: s.y_a,
+            x_g: s.x_g,
+            y_g: s.y_g,
+            round: s.round,
+            op: s.op,
+            next_op: s.next_op,
+            lambda: s.lambda,
+            x_r: s.x_r,
+            y_r: s.y_r,
+            q0: s.q0,
+            q1: s.q1,
+            q2: s.q2,
+            carries: if fits {
+                Carries::Offset(offset)
+            } else {
+                Carries::Raw(Box::new(raw))
+            },
+        }
+    }
+
+    /// The op this row was made from, exactly.
+    pub(crate) fn to_op(&self) -> EcdasOperation {
+        let [c0, c1, c2] = match &self.carries {
+            Carries::Offset(offset) => {
+                let mut raw = [[0i64; 64]; 3];
+                for ((carries, packed), base) in raw.iter_mut().zip(offset).zip(CARRY_OFFSETS) {
+                    for (c, &v) in carries.iter_mut().zip(packed) {
+                        *c = i64::from(v) - base;
+                    }
+                }
+                raw
+            }
+            Carries::Raw(raw) => **raw,
+        };
+        EcdasOperation {
+            timestamp: self.timestamp,
+            step: EcdasStep {
+                x_a: self.x_a,
+                y_a: self.y_a,
+                x_g: self.x_g,
+                y_g: self.y_g,
+                round: self.round,
+                op: self.op,
+                next_op: self.next_op,
+                lambda: self.lambda,
+                x_r: self.x_r,
+                y_r: self.y_r,
+                q0: self.q0,
+                q1: self.q1,
+                q2: self.q2,
+                c0,
+                c1,
+                c2,
+            },
+        }
+    }
+
+    /// Whether the row keeps its carries as they are.
+    #[cfg(test)]
+    pub(crate) fn is_raw(&self) -> bool {
+        matches!(self.carries, Carries::Raw(_))
+    }
+}
+
+/// A [`CompactEcdasOp`] read as its op.
+pub(crate) fn widen(row: &CompactEcdasOp) -> Cow<'_, EcdasOperation> {
+    Cow::Owned(row.to_op())
 }
 
 // =========================================================================
@@ -453,6 +611,129 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcdasConstraints {
             let c_last = b.main(0, c_base + 63);
             b.emit_base(idx, c_last); // ColIsZero c_63
             idx += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    /// A step whose every field differs from its neighbours', with these carries.
+    fn op(i: u64, c: [[i64; 64]; 3]) -> EcdasOperation {
+        let bytes = |f: u64| -> [u8; 32] {
+            std::array::from_fn(|b| ((i + 1) * 31 + f * 7 + b as u64) as u8)
+        };
+        let wide = |f: u64| -> [u8; 33] {
+            std::array::from_fn(|b| ((i + 3) * 17 + f * 5 + b as u64) as u8)
+        };
+        EcdasOperation {
+            timestamp: 4 * i + 3,
+            step: EcdasStep {
+                x_a: bytes(1),
+                y_a: bytes(2),
+                x_g: bytes(3),
+                y_g: bytes(4),
+                round: (i % 256) as u8,
+                op: (i % 2) as u8,
+                next_op: ((i + 1) % 2) as u8,
+                lambda: bytes(5),
+                x_r: bytes(6),
+                y_r: bytes(7),
+                q0: wide(8),
+                q1: wide(9),
+                q2: wide(10),
+                c0: c[0],
+                c1: c[1],
+                c2: c[2],
+            },
+        }
+    }
+
+    /// Carries at and around each array's 16-bit bounds, and far outside them;
+    /// `out` puts one carry of array `k` outside its range.
+    fn ops() -> Vec<(EcdasOperation, bool)> {
+        let mut ops = Vec::new();
+        for (i, base) in CARRY_OFFSETS.iter().enumerate() {
+            let low = -base;
+            let high = (1 << 16) - 1 - base;
+            let fit: [[i64; 64]; 3] = std::array::from_fn(|k| {
+                std::array::from_fn(|j| {
+                    let b = CARRY_OFFSETS[k];
+                    match j % 4 {
+                        0 => -b,
+                        1 => (1 << 16) - 1 - b,
+                        2 => (j as i64 * 37) % 200 - 100,
+                        _ => 0,
+                    }
+                })
+            });
+            ops.push((op(i as u64, fit), false));
+            for (n, bad) in [low - 1, high + 1, i64::MIN, i64::MAX, -(1 << 40)]
+                .into_iter()
+                .enumerate()
+            {
+                let mut c = fit;
+                c[i][(n * 13) % 64] = bad;
+                ops.push((op((10 + 10 * i + n) as u64, c), true));
+            }
+        }
+        ops
+    }
+
+    fn same(a: &EcdasOperation, b: &EcdasOperation) -> bool {
+        format!("{a:?}") == format!("{b:?}")
+    }
+
+    /// Every row widens back to exactly the op it was made from: carries at
+    /// both ends of their 16-bit range held offset, and a row with any carry
+    /// outside it (by one, or at either end of i64) held as it is.
+    #[test]
+    fn a_compact_row_widens_to_the_op_it_was_made_from() {
+        for (op, out) in ops() {
+            let row = CompactEcdasOp::from_op(&op);
+            assert_eq!(row.is_raw(), out, "{op:?}");
+            assert!(same(&row.to_op(), &op), "{op:?}");
+        }
+        // The compact row is well under half the op.
+        assert!(
+            std::mem::size_of::<CompactEcdasOp>() * 5 < std::mem::size_of::<EcdasOperation>() * 2,
+            "{} vs {}",
+            std::mem::size_of::<CompactEcdasOp>(),
+            std::mem::size_of::<EcdasOperation>()
+        );
+    }
+
+    fn words(t: &TraceTable<GoldilocksField, GoldilocksExtension>) -> Vec<u64> {
+        match t.narrow_main() {
+            Some(p) => (0..p.cols()).flat_map(|c| p.column(c)).collect(),
+            None => {
+                let m = &t.main_table;
+                (0..m.width)
+                    .flat_map(|c| (0..m.height).map(move |r| *m.get(r, c).value()))
+                    .collect()
+            }
+        }
+    }
+
+    /// A table built from compact rows, each widened as its row is filled, is
+    /// the table of the ops, wide and packed, the fallback rows included.
+    #[test]
+    fn a_table_of_compact_rows_is_the_table_of_the_ops() {
+        // The generator's debug checks reject a carry outside its range, so the
+        // fallback rows are built only without them.
+        let wide: Vec<EcdasOperation> = ops()
+            .into_iter()
+            .filter(|(_, out)| !out || !cfg!(debug_assertions))
+            .map(|(op, _)| op)
+            .collect();
+        let compact: Vec<CompactEcdasOp> = wide.iter().map(CompactEcdasOp::from_op).collect();
+        for form in [TraceForm::Wide, TraceForm::Narrow, TraceForm::Narrow] {
+            for rows in [wide.len().next_power_of_two(), 64] {
+                let want = generate_ecdas_rows_as(&wide, rows, form);
+                let got = generate_ecdas_rows_of(&compact, rows, form, widen);
+                assert_eq!(words(&got), words(&want), "{form:?} {rows}");
+            }
         }
     }
 }
