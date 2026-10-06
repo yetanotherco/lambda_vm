@@ -2797,13 +2797,16 @@ fn the_block_tree_composes_to_a_top_node() {
     // before the run's clock, as the base harness does.
     let base_opts = crate::tests::noepoch_block_tests::noepoch_harness_options();
     cfg.base = base_opts.format.base;
-    if crate::hash_pin::base_of(&base_opts.format) == crate::hash_pin::BaseHash::P1 {
-        println!(
-            "BASE HASH: p1 (format {:?}, cap {}) · statement tag {}",
-            cfg.base.hash,
-            cfg.base.arity4_cap,
-            String::from_utf8_lossy(&crate::hash_pin::statement_tag(&base_opts.format))
-        );
+    let p1 = crate::hash_pin::base_of(&base_opts.format) == crate::hash_pin::BaseHash::P1;
+    println!(
+        "BASE HASH: {} (format {:?}, cap {}) · statement tag {} · cost model {:#x}",
+        if p1 { "p1" } else { "rpx" },
+        cfg.base.hash,
+        cfg.base.arity4_cap,
+        String::from_utf8_lossy(&crate::hash_pin::statement_tag(&base_opts.format)),
+        super::block_plan::CostModel::for_base(&cfg.base).id
+    );
+    if p1 {
         crate::hash_pin::warm_base_statics(&base_opts);
     }
     let run = super::block_tree::prove_block_tree(
@@ -2832,6 +2835,15 @@ fn the_block_tree_composes_to_a_top_node() {
             .unwrap_or_else(|e| panic!("NOEPOCH_SHAPE_OUT {path}: {e}"));
         println!("   BLOCK SHAPE written to {path}");
     }
+    // Off the run's clock: the top proof's size, and the plan's partition.
+    println!(
+        "   BLOCK TOP PROOF: {} B · {} leaves · cost model {:#x}",
+        rkyv::to_bytes::<rkyv::rancor::Error>(&top_proof.proof)
+            .map(|b| b.len())
+            .unwrap_or(0),
+        rb.plan.partition().num_leaves(),
+        rb.plan.cost_model()
+    );
     // `LAMBDA_VM_ALLOC_PURGE=tree` (or `all`): the tree's freed pages back to
     // the OS before the verifier derives its programs (after the whole run's
     // stopwatch).
