@@ -298,8 +298,10 @@ pub type SpillWanted = dyn Fn(u64, u64, u64) -> bool + Send + Sync;
 /// group's packed tables as the group is installed: past the first
 /// [`SPILL_RESIDENT_GROUPS`] groups, a table the policy wants out and the
 /// store's writer queue has room for goes to `store`, so the committer never
-/// waits on the writers. Phase B reads them back in group order, ahead of
-/// their upload, and lets each group's go after its opening.
+/// waits on the writers; any other is parked, and one hand-off
+/// ([`Self::hand_off`]) may move parked tables to `store` later in phase A.
+/// Phase B reads them back in group order, ahead of their upload, and lets
+/// each group's go after its opening.
 #[derive(Clone)]
 pub struct BlockSpill {
     pub store: Arc<SpillStore>,
@@ -313,6 +315,80 @@ pub struct BlockSpill {
     cells: Arc<std::sync::atomic::AtomicU64>,
     /// The read-back's report ([`Prefetch::report`]), once phase B has run.
     pub prefetch: Arc<std::sync::Mutex<Option<String>>>,
+    /// Every table parked past the first [`SPILL_RESIDENT_GROUPS`] groups, in
+    /// the order it was parked: group order. `parked_more` wakes a hand-off
+    /// waiting for the next one, or for phase A's end (`closed`).
+    parked: Arc<std::sync::Mutex<Vec<Arc<Parked>>>>,
+    parked_more: Arc<std::sync::Condvar>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+    /// The hand-off ([`Self::hand_off`]): its thread while it runs, then its
+    /// report.
+    hand_off: Arc<std::sync::Mutex<HandOff>>,
+    /// Set while a hand-off runs: the committer parks what it would spill, so
+    /// the store keeps one producer and the committer never waits on it.
+    handing: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A committed table's packed columns parked by the spill: held here until a
+/// hand-off ([`BlockSpill::hand_off`]) moves them to the store, and read back
+/// from whichever holds them before the group's upload (`restore_group`).
+struct Parked {
+    len: u64,
+    state: std::sync::Mutex<ParkedState>,
+}
+
+enum ParkedState {
+    Resident(multilinear::narrow::NarrowColumns),
+    Spilled(SpilledMain),
+    /// Taken and not put back (a store that refused its bytes' shape): phase B
+    /// refuses the table.
+    Lost,
+}
+
+impl Parked {
+    /// The store's handle, once handed off.
+    fn handle(&self) -> Option<SpilledMain> {
+        match &*self.state.lock().unwrap_or_else(|e| e.into_inner()) {
+            ParkedState::Spilled(handle) => Some(handle.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Where a committed table's packed columns are while phase A holds them out
+/// of the table: in the store, or parked.
+#[derive(Clone)]
+enum Out {
+    Spilled(SpilledMain),
+    Parked(Arc<Parked>),
+}
+
+impl Out {
+    /// The store's handle, when the columns are there.
+    fn handle(&self) -> Option<SpilledMain> {
+        match self {
+            Self::Spilled(handle) => Some(handle.clone()),
+            Self::Parked(parked) => parked.handle(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct HandOff {
+    thread: Option<std::thread::JoinHandle<HandOffReport>>,
+    report: Option<HandOffReport>,
+    /// Phase A is over: no hand-off starts after it.
+    closed: bool,
+}
+
+/// What a hand-off did: the bytes it was asked for and handed, the tables, its
+/// seconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HandOffReport {
+    pub asked: u64,
+    pub handed: u64,
+    pub tables: usize,
+    pub secs: f64,
 }
 
 impl BlockSpill {
@@ -324,7 +400,146 @@ impl BlockSpill {
             kept: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cells: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prefetch: Arc::new(std::sync::Mutex::new(None)),
+            parked: Arc::new(std::sync::Mutex::new(Vec::new())),
+            parked_more: Arc::new(std::sync::Condvar::new()),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hand_off: Arc::new(std::sync::Mutex::new(HandOff::default())),
+            handing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Hands the parked tables to the store, oldest first, until `need` bytes
+    /// have gone or phase A ends, through the store's own hand-off
+    /// ([`SpillStore::spill`]): the tables parked by then, and those parked
+    /// after, as they come (while it runs the committer parks what it would
+    /// have spilled). It runs on a thread of its own, so the caller does not
+    /// wait on the writers, and phase A's end joins it. Once only, and never
+    /// after phase A's end: `false` then (or when the thread cannot start).
+    pub fn hand_off(&self, need: u64, mem: Option<Arc<BlockMem>>) -> bool {
+        let mut hand_off = self.hand_off.lock().unwrap_or_else(|e| e.into_inner());
+        if hand_off.closed || hand_off.thread.is_some() || hand_off.report.is_some() {
+            return false;
+        }
+        let (parked, parked_more, closed, store, handing) = (
+            Arc::clone(&self.parked),
+            Arc::clone(&self.parked_more),
+            Arc::clone(&self.closed),
+            Arc::clone(&self.store),
+            Arc::clone(&self.handing),
+        );
+        handing.store(true, std::sync::atomic::Ordering::SeqCst);
+        let thread = std::thread::Builder::new()
+            .name("block-hand-off".to_string())
+            .spawn(move || {
+                let started = Instant::now();
+                let mut report = HandOffReport {
+                    asked: need,
+                    ..HandOffReport::default()
+                };
+                let mut next = 0usize;
+                while report.handed < need {
+                    // The next parked table, waiting for one while phase A runs.
+                    let slot = {
+                        let mut list = parked.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if let Some(slot) = list.get(next) {
+                                break Some(Arc::clone(slot));
+                            }
+                            if closed.load(std::sync::atomic::Ordering::SeqCst) {
+                                break None;
+                            }
+                            list = parked_more
+                                .wait_timeout(list, std::time::Duration::from_millis(100))
+                                .unwrap_or_else(|e| e.into_inner())
+                                .0;
+                        }
+                    };
+                    let Some(slot) = slot else {
+                        break;
+                    };
+                    next += 1;
+                    let taken = std::mem::replace(
+                        &mut *slot.state.lock().unwrap_or_else(|e| e.into_inner()),
+                        ParkedState::Lost,
+                    );
+                    let packed = match taken {
+                        ParkedState::Resident(packed) => packed,
+                        other => {
+                            *slot.state.lock().unwrap_or_else(|e| e.into_inner()) = other;
+                            continue;
+                        }
+                    };
+                    // A shape the store refuses stays `Lost`: phase B refuses it.
+                    let Some(main) = to_store(packed) else {
+                        break;
+                    };
+                    let mut state = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+                    match store.spill(main) {
+                        Ok(handle) => {
+                            *state = ParkedState::Spilled(handle);
+                            report.handed += slot.len;
+                            report.tables += 1;
+                            if let Some(mem) = &mem {
+                                mem.held_narrow.fetch_sub(slot.len as usize, Relaxed);
+                                mem.spilled.fetch_add(slot.len as usize, Relaxed);
+                            }
+                        }
+                        // The store failed: what is left stays parked.
+                        Err(main) => {
+                            if let Some(packed) = from_store(main) {
+                                *state = ParkedState::Resident(packed);
+                            }
+                            break;
+                        }
+                    }
+                }
+                handing.store(false, std::sync::atomic::Ordering::SeqCst);
+                report.secs = started.elapsed().as_secs_f64();
+                report
+            });
+        match thread {
+            Ok(thread) => {
+                hand_off.thread = Some(thread);
+                true
+            }
+            Err(_) => {
+                self.handing
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                false
+            }
+        }
+    }
+
+    /// Phase A's end: joins a running hand-off, and none starts after this.
+    fn close_hand_off(&self) {
+        let thread = {
+            let mut hand_off = self.hand_off.lock().unwrap_or_else(|e| e.into_inner());
+            hand_off.closed = true;
+            hand_off.thread.take()
+        };
+        {
+            let _list = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.parked_more.notify_all();
+        }
+        if let Some(thread) = thread {
+            let report = thread
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            self.hand_off
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .report = Some(report);
+        }
+    }
+
+    /// What the hand-off did, once phase A's end joined it; `None` when none
+    /// ran.
+    pub fn hand_off_report(&self) -> Option<HandOffReport> {
+        self.hand_off
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .report
     }
 
     /// Whether `len` more bytes fit the writers' queue now. The committer is
@@ -352,16 +567,19 @@ fn from_store(main: NarrowMain) -> Option<multilinear::narrow::NarrowColumns> {
 }
 
 /// Considers group `g`'s narrow tables for the spill, `first` being the
-/// first's index; each spilled table's slot goes in `spilled`. A table the
-/// policy keeps, the queue has no room for, or the store refuses (it has
-/// failed) stays held. Every table counts toward the cells committed, and
-/// every kept one toward the bytes kept.
+/// first's index; where each table taken out of its group went goes in `out`.
+/// The first [`SPILL_RESIDENT_GROUPS`] groups keep theirs in place. Past them,
+/// a table the policy wants out, while no hand-off runs, and that the store's
+/// writer queue has room for goes to `store`; any other is parked
+/// ([`Parked`]): on the host until a hand-off moves it. Every table counts
+/// toward the cells committed, and every one not spilled toward the bytes
+/// kept.
 fn spill_group<F, E>(
     spill: &BlockSpill,
     g: usize,
     first: usize,
     tables: &mut [CommittedTable<'_, F, E>],
-    spilled: &mut [Option<SpilledMain>],
+    out: &mut [Option<Out>],
     mem: Option<&BlockMem>,
 ) -> Result<(), MlError>
 where
@@ -370,16 +588,13 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    for (k, (table, slot)) in tables.iter_mut().zip(spilled.iter_mut()).enumerate() {
+    for (k, (table, slot)) in tables.iter_mut().zip(out.iter_mut()).enumerate() {
         let table_cells = (table.num_committed_columns() as u64) << table.num_vars();
         let cells = spill.cells.fetch_add(table_cells, Relaxed) + table_cells;
         let Some(len) = table.narrow().map(|packed| packed.data().len()) else {
             continue;
         };
-        if g < SPILL_RESIDENT_GROUPS
-            || !(spill.wanted)(spill.kept.load(Relaxed), cells, len as u64)
-            || !spill.has_room(len as u64)
-        {
+        if g < SPILL_RESIDENT_GROUPS {
             spill.kept.fetch_add(len as u64, Relaxed);
             continue;
         }
@@ -387,36 +602,50 @@ where
             table: first + k,
             reason: "its packed parts did not move to the store and back",
         };
-        let main = table
-            .take_narrow_for_spill()
-            .and_then(to_store)
-            .ok_or_else(failed)?;
-        match spill.store.spill(main) {
-            Ok(handle) => {
-                if let Some(mem) = mem {
-                    mem.held_narrow.fetch_sub(len, Relaxed);
-                    mem.spilled.fetch_add(len, Relaxed);
+        let packed = table.take_narrow_for_spill().ok_or_else(failed)?;
+        let spill_now = (spill.wanted)(spill.kept.load(Relaxed), cells, len as u64)
+            && !spill.handing.load(std::sync::atomic::Ordering::SeqCst)
+            && spill.has_room(len as u64);
+        let packed = if spill_now {
+            match spill.store.spill(to_store(packed).ok_or_else(failed)?) {
+                Ok(handle) => {
+                    if let Some(mem) = mem {
+                        mem.held_narrow.fetch_sub(len, Relaxed);
+                        mem.spilled.fetch_add(len, Relaxed);
+                    }
+                    *slot = Some(Out::Spilled(handle));
+                    continue;
                 }
-                *slot = Some(handle);
+                Err(main) => from_store(main).ok_or_else(failed)?,
             }
-            Err(main) => {
-                if !from_store(main).is_some_and(|packed| table.restore_narrow(packed)) {
-                    return Err(failed());
-                }
-                spill.kept.fetch_add(len as u64, Relaxed);
-            }
-        }
+        } else {
+            packed
+        };
+        let parked = Arc::new(Parked {
+            len: len as u64,
+            state: std::sync::Mutex::new(ParkedState::Resident(packed)),
+        });
+        spill
+            .parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::clone(&parked));
+        spill.parked_more.notify_all();
+        *slot = Some(Out::Parked(parked));
+        spill.kept.fetch_add(len as u64, Relaxed);
     }
     Ok(())
 }
 
-/// Brings `tables`' spilled columns back before their upload, `first` being
-/// the first's index: from the read-back ahead when it has them, or read
-/// here. Refused when a read fails or does not match what was written.
+/// Brings `tables`' columns back before their upload, `first` being the
+/// first's index: a parked table's from the host, or from the store when a
+/// hand-off moved them; a spilled table's from the read-back ahead when it
+/// has them, or read here. Refused when a read fails or does not match what
+/// was written.
 fn restore_group<F, E>(
     first: usize,
     tables: &mut [CommittedTable<'_, F, E>],
-    spilled: &mut [Option<SpilledMain>],
+    out: &mut [Option<Out>],
     prefetch: Option<&Prefetch>,
     mem: Option<&BlockMem>,
 ) -> Result<(), MlError>
@@ -426,11 +655,34 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    for (k, (table, slot)) in tables.iter_mut().zip(spilled.iter_mut()).enumerate() {
-        let Some(handle) = slot.take() else {
+    for (k, (table, slot)) in tables.iter_mut().zip(out.iter_mut()).enumerate() {
+        let Some(taken) = slot.take() else {
             continue;
         };
         let index = first + k;
+        let handle = match taken {
+            Out::Spilled(handle) => handle,
+            Out::Parked(parked) => {
+                let state = std::mem::replace(
+                    &mut *parked.state.lock().unwrap_or_else(|e| e.into_inner()),
+                    ParkedState::Lost,
+                );
+                match state {
+                    ParkedState::Resident(packed) => {
+                        if !table.restore_narrow(packed) {
+                            return Err(MlError::SpillFailed {
+                                table: index,
+                                reason: "the parked columns do not have the table's shape",
+                            });
+                        }
+                        continue;
+                    }
+                    ParkedState::Spilled(handle) => handle,
+                    // The table stays out, and the group's check refuses it.
+                    ParkedState::Lost => continue,
+                }
+            }
+        };
         let read = match prefetch.and_then(|p| p.take(ReadPhase::Fused, index)) {
             Some(read) => read,
             None => handle.into_narrow(),
@@ -690,7 +942,8 @@ where
     mem: Option<Arc<BlockMem>>,
     /// The spill, when one is on, and each table's slot in it.
     spill: Option<BlockSpill>,
-    spilled: Vec<Option<SpilledMain>>,
+    /// Each table taken out of its group in phase A: spilled, or parked.
+    spilled: Vec<Option<Out>>,
 }
 
 impl<'a, F, E> BlockCommitted<'a, F, E>
@@ -796,7 +1049,7 @@ where
         spill: Option<BlockSpill>,
     ) -> Result<Self, MlError> {
         let mut tables = Vec::new();
-        let mut spilled: Vec<Option<SpilledMain>> = Vec::new();
+        let mut spilled: Vec<Option<Out>> = Vec::new();
         let mut sizes = Vec::new();
         let mut retired_groups = Vec::new();
         let mut roots = Vec::new();
@@ -1062,6 +1315,11 @@ where
                 spill.as_ref(),
             )?;
         }
+        // Phase A's end: a hand-off still writing is joined, and none starts
+        // after this, so phase B's read-back plans every handle.
+        if let Some(spill) = &spill {
+            spill.close_hand_off();
+        }
         Ok(Self {
             tables,
             sizes,
@@ -1104,13 +1362,14 @@ where
             .any(|packed| packed.fault_width_map())
     }
 
-    /// A test's fault: the first spilled table's slot lost, so its columns
-    /// never come back. Returns whether a spilled table was there to lose.
+    /// A test's fault: the slot of the first table whose columns are in the
+    /// store (spilled, or parked and handed off) lost, so its columns never
+    /// come back. Returns whether such a table was there to lose.
     #[doc(hidden)]
     pub fn fault_lose_spilled_slot(&mut self) -> bool {
         self.spilled
             .iter_mut()
-            .find(|slot| slot.is_some())
+            .find(|slot| slot.as_ref().and_then(Out::handle).is_some())
             .map(Option::take)
             .is_some()
     }
@@ -1124,8 +1383,8 @@ where
         #[cfg(any(test, feature = "test-utils"))]
         if let Some(spill) = &self.spill {
             spill.store.flush();
-            if let Some(handle) = self.spilled.iter().flatten().next() {
-                return spill.store.corrupt_on_disk(handle, 0).unwrap_or(false);
+            if let Some(handle) = self.spilled.iter().flatten().find_map(Out::handle) {
+                return spill.store.corrupt_on_disk(&handle, 0).unwrap_or(false);
             }
         }
         false
@@ -1283,7 +1542,7 @@ impl Packing {
 fn install_and_spill<F, E>(
     packed: Packing,
     tables: &mut [CommittedTable<'_, F, E>],
-    spilled: &mut [Option<SpilledMain>],
+    spilled: &mut [Option<Out>],
     stamps: &mut [GroupStamps],
     sizes: &[usize],
     mem: Option<&BlockMem>,
@@ -1599,7 +1858,11 @@ where
         let reads: Vec<(ReadPhase, usize, SpilledMain)> = spilled
             .iter()
             .enumerate()
-            .filter_map(|(t, slot)| slot.clone().map(|handle| (ReadPhase::Fused, t, handle)))
+            .filter_map(|(t, slot)| {
+                slot.as_ref()
+                    .and_then(Out::handle)
+                    .map(|handle| (ReadPhase::Fused, t, handle))
+            })
             .collect();
         let widest = starts
             .iter()
@@ -1608,6 +1871,7 @@ where
                 spilled[start..start + size]
                     .iter()
                     .flatten()
+                    .filter_map(Out::handle)
                     .map(|handle| handle.len() as u64)
                     .sum::<u64>()
             })

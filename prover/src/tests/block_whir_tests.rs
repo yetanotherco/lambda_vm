@@ -823,6 +823,102 @@ fn a_spilled_table_that_does_not_come_back_is_refused() {
     );
 }
 
+/// ★ Parked tables handed to the store at the walk's end move no byte: with a
+/// budget the block fits in, every table past the first two groups is parked
+/// on the host; the hand-off (here every parked one, whatever the forecast)
+/// moves them to the store before the finish, phase B reads each back once,
+/// and the proof verifies with the same partition, its bytes equal to the
+/// held run's under the deterministic grind.
+#[test]
+fn parked_tables_handed_off_at_the_walk_prove_the_same_bytes() {
+    use crate::block_whir::BlockSpillPolicy;
+
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let proved = |spill: BlockSpillPolicy, hand_off_all: bool| {
+        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+        o.spill = spill;
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                hand_off_all,
+                ..Deviations::default()
+            },
+        )
+        .expect("prove");
+        assert!(
+            verify(&proof, &elf, &format),
+            "{spill:?} hand-off {hand_off_all}"
+        );
+        (proof, stamps)
+    };
+    let (held, _) = proved(BlockSpillPolicy::Off, false);
+    let (parked, parked_stamps) = proved(BlockSpillPolicy::Budget(1 << 40), false);
+    assert_eq!(
+        parked_stamps
+            .spill_stats
+            .expect("the store's counters")
+            .slots,
+        0,
+        "parked and never handed off"
+    );
+    let (handed, stamps) = proved(BlockSpillPolicy::Budget(1 << 40), true);
+    let stats = stamps.spill_stats.expect("the store's counters");
+    assert!(stats.slots > 0, "nothing handed off: {stats}");
+    assert_eq!(stats.mismatches, 0, "{stats}");
+    assert_eq!(
+        stats.reads + stats.memory_reads,
+        stats.slots,
+        "each slot read back once: {stats}"
+    );
+    let line = stamps.spill.expect("the spill's line");
+    assert!(line.contains("hand-off at the walk's end"), "{line}");
+    assert_eq!(held.groups, parked.groups, "the partition");
+    assert_eq!(held.groups, handed.groups, "the partition");
+    if crypto::grinding::deterministic() {
+        let bytes = |p: &BlockWhirProof| {
+            rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                .expect("serialize")
+                .to_vec()
+        };
+        assert_eq!(bytes(&held), bytes(&parked), "the proof, parked");
+        assert_eq!(bytes(&held), bytes(&handed), "the proof, handed off");
+    }
+}
+
+/// A table the hand-off moved to the store whose columns never come back is
+/// refused when phase B reaches its group: a prover error naming the table.
+#[test]
+fn a_handed_off_table_that_does_not_come_back_is_refused() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.spill = crate::block_whir::BlockSpillPolicy::Budget(1 << 40);
+    let refused = prove_block_whir_with(
+        &elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        &format,
+        &o,
+        &Deviations {
+            hand_off_all: true,
+            spilled_slot_lost: true,
+            ..Deviations::default()
+        },
+    );
+    let Err(crate::Error::Prover(why)) = refused else {
+        panic!("a handed-off table that never came back was proved over");
+    };
+    assert!(
+        why.contains("SpillFailed") && why.contains("still spilled"),
+        "{why}"
+    );
+}
+
 /// A table the finish packed is laid out narrow only if its preprocessed
 /// columns are the program's, word for word: one word changed in a packed
 /// table's first preprocessed column and the layout refuses it.
