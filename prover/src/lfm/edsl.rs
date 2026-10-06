@@ -172,9 +172,10 @@ impl SpongeVar {
 /// sibling IS the digest's width — when the algebraic path lands this stride
 /// follows the width rather than the literal". This is that.
 pub fn digest_words(b: &LfmBuilder) -> u32 {
-    match b.wrap_hash() {
-        WrapHash::Algebraic => 1,
-        _ => 2,
+    if b.wrap_hash().one_cell_digest() {
+        1
+    } else {
+        2
     }
 }
 
@@ -563,9 +564,38 @@ pub enum WrapHash {
     /// because the incumbent hashes are byte-oriented. On this arm the
     /// serialisation is deleted at the call site rather than reimplemented.
     Algebraic,
+    /// ZisK's Poseidon1 at width 16 (`super::p1w16_emit`): a one-cell digest
+    /// like [`WrapHash::Algebraic`]'s, but its own leaf (rate 12), 4-ary trees,
+    /// sponge transcript and width-8 grinding. The configuration of a level-0
+    /// program that verifies a Poseidon1 base proof; its hash rows are
+    /// `Instr::Hash16`.
+    Poseidon1,
 }
 
 impl WrapHash {
+    /// Whether a digest is ONE cell of four field elements (every algebraic
+    /// configuration) rather than a byte digest's two words.
+    pub const fn one_cell_digest(self) -> bool {
+        matches!(self, WrapHash::Algebraic | WrapHash::Poseidon1)
+    }
+
+    /// Children per Merkle node.
+    pub const fn arity(self) -> usize {
+        match self {
+            WrapHash::Poseidon1 => 4,
+            _ => 2,
+        }
+    }
+
+    /// Path hints one opening of a tree with `nbits` index bits walks: one per
+    /// binary level, or [`super::p1w16_emit::path_hints`] at arity 4.
+    pub const fn path_hints(self, nbits: usize) -> usize {
+        match self {
+            WrapHash::Poseidon1 => super::p1w16_emit::path_hints(nbits),
+            _ => nbits,
+        }
+    }
+
     /// ★ The wrap hash that matches the host's commitment configuration.
     ///
     /// **Any wrap program that AUTHENTICATES a host proof must hash the way the
@@ -596,8 +626,23 @@ impl WrapHash {
             stark::config::CommitmentHash::Rpo256
             | stark::config::CommitmentHash::Rpx256
             | stark::config::CommitmentHash::Poseidon => WrapHash::Algebraic,
-            // No recursion verifies a Poseidon1 proof yet (`p1/*` stage P3).
+            // The pin is never Poseidon1: a Poseidon1 BASE is a format, and the
+            // programs that verify one take [`WrapHash::for_base`].
             stark::config::CommitmentHash::Poseidon1 => WrapHash::Algebraic,
+        }
+    }
+
+    /// The wrap hash of a program that verifies a base proof committed under
+    /// `base`: [`WrapHash::Poseidon1`] for ZisK's Poseidon1, else the pin's
+    /// ([`Self::production`]) — the block path refuses any other base before a
+    /// program is emitted (`block_whir::checked_base`). A verifier constant
+    /// from the caller's format, never from the environment or the proof, so
+    /// every program emitted under it, and every id above, is a function of
+    /// `base` (I-P1C §9.4).
+    pub fn for_base(base: &stark::proof::options::BaseFormat) -> Self {
+        match base.hash {
+            stark::config::CommitmentHash::Poseidon1 => WrapHash::Poseidon1,
+            _ => Self::production(),
         }
     }
 
@@ -627,7 +672,7 @@ impl WrapHash {
         match self {
             WrapHash::Keccak => Some(ByteWrapHash::Keccak),
             WrapHash::Blake3 => Some(ByteWrapHash::Blake3),
-            WrapHash::Algebraic => None,
+            WrapHash::Algebraic | WrapHash::Poseidon1 => None,
         }
     }
 
@@ -638,6 +683,9 @@ impl WrapHash {
     /// nowhere else: a leaf absorbs 136 bytes per keccak permutation against 64
     /// per BLAKE3 compression.
     pub fn leaf_hash(self, b: &mut LfmBuilder, values: &[Felt]) -> WrapDigest {
+        if self == WrapHash::Poseidon1 {
+            return super::p1w16_emit::leaf_hash(b, values);
+        }
         match self.byte_hash() {
             None => Self::algebraic_leaf_hash(b, values),
             Some(h) => {
@@ -698,6 +746,18 @@ impl WrapHash {
             return WrapDigest::from_cell(zero_cell);
         }
 
+        if b.p1w16_census().is_some() {
+            // Census geometry: a rate-12 block is three words, one width-16
+            // permutation (stand-in row; the capacity chaining is not emitted).
+            let mut digest = zero_cell;
+            for block in cells.chunks(3) {
+                let w = |i: usize| block.get(i).copied().unwrap_or(zero_cell);
+                digest = b.permute([w(0), w(1), w(2)])[0];
+            }
+            let _ = cap;
+            return WrapDigest::from_cell(digest);
+        }
+
         let mut digest = zero_cell;
         for block in cells.chunks(2) {
             let rate0 = block[0];
@@ -753,7 +813,13 @@ impl WrapHash {
         bits: &[Bit],
         siblings: &[WrapDigest],
     ) -> WrapDigest {
+        if self == WrapHash::Poseidon1 {
+            return super::p1w16_emit::walk4(b, leaf, bits, siblings);
+        }
         assert_eq!(bits.len(), siblings.len(), "one sibling per level");
+        if let (Some(arena), None) = (b.p1w16_census(), self.byte_hash()) {
+            return p1w16_census_walk(b, arena, leaf, bits, siblings);
+        }
         let mut current = leaf;
         for (bit, sibling) in bits.iter().zip(siblings) {
             // ★ EVERY cell of the digest swaps on the SAME bit — a loop rather
@@ -801,7 +867,28 @@ impl WrapHash {
             "leaf counts are shape and must be a power of two; production would \
              pad by repeating the last leaf and no caller here needs that"
         );
+        if self == WrapHash::Poseidon1 {
+            return super::p1w16_emit::tree_root4(b, leaves);
+        }
         let mut level = leaves.to_vec();
+        if b.p1w16_census().is_some() && self.byte_hash().is_none() {
+            // Census geometry: 4-ary nodes (one stand-in row each); an odd
+            // height leaves one binary level at the top.
+            while level.len() > 1 {
+                level = if level.len().is_multiple_of(4) {
+                    level
+                        .chunks_exact(4)
+                        .map(|q| WrapDigest::from_cell(b.permute([q[0][0], q[1][0], q[2][0]])[0]))
+                        .collect()
+                } else {
+                    level
+                        .chunks_exact(2)
+                        .map(|pair| self.hash_pair(b, pair[0], pair[1]))
+                        .collect()
+                };
+            }
+            return level[0];
+        }
         while level.len() > 1 {
             level = level
                 .chunks_exact(2)
@@ -810,6 +897,39 @@ impl WrapHash {
         }
         level[0]
     }
+}
+
+/// ⚠ CENSUS ONLY ([`LfmBuilder::with_p1w16_census`]): a 4-ary Merkle walk.
+///
+/// Per two index bits `(b0, b1)`: the current node and the level-0 sibling are
+/// placed by one `Select` on `b0`; that pair and the two level-1 siblings are
+/// placed by two `Select`s on `b1`; one width-16 node hashes the four
+/// (stand-in `permute` row over three of the cells). A 4-ary level carries
+/// THREE sibling digests where two binary levels carry two: the given
+/// `siblings[2k]`, `siblings[2k+1]` and one more hinted word. An odd walk
+/// ends with one binary level.
+fn p1w16_census_walk(
+    b: &mut LfmBuilder,
+    arena: super::instr::ArenaId,
+    leaf: WrapDigest,
+    bits: &[Bit],
+    siblings: &[WrapDigest],
+) -> WrapDigest {
+    let mut current = leaf[0];
+    let mut k = 0;
+    while k + 1 < bits.len() {
+        let extra = b.hint_word(arena, 0);
+        let (x0, x1) = b.select(bits[k], current, siblings[k][0]);
+        let (y0, _y2) = b.select(bits[k + 1], x0, siblings[k + 1][0]);
+        let (y1, _y3) = b.select(bits[k + 1], x1, extra);
+        current = b.permute([y0, y1, _y2])[0];
+        k += 2;
+    }
+    if k < bits.len() {
+        let (l, r) = b.select(bits[k], current, siblings[k][0]);
+        current = b.compress(l.as_digest(), r.as_digest()).as_cell();
+    }
+    WrapDigest::from_cell(current)
 }
 
 /// Bytes in a commitment / Merkle node.

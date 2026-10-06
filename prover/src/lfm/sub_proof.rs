@@ -231,7 +231,7 @@ impl SubProofShape {
     /// Permutations the committed matrices' cap checks cost, once per
     /// sub-proof: `2^c − 1` parents per group (nothing uncapped).
     pub fn cap_permutations(&self) -> usize {
-        self.groups().len() * super::merkle_cap::cap_root_permutations(self.trace_cap)
+        self.groups().len() * super::merkle_cap::cap_root_permutations(1 << self.trace_cap, 2)
     }
 
     /// Checked invariants of a shape, so a caller cannot assemble one whose
@@ -353,12 +353,13 @@ impl GroupCommitment {
         arena: super::instr::ArenaId,
         base: u32,
         c: usize,
+        depth: usize,
     ) -> u32 {
         if c == 0 {
             return base;
         }
         let (cap, next) =
-            super::merkle_cap::hint_and_authenticate(b, arena, base, c, &self.root_lanes);
+            super::merkle_cap::hint_and_authenticate(b, arena, base, c, depth, &self.root_lanes);
         self.cap = Some(cap);
         next
     }
@@ -893,7 +894,7 @@ pub fn emit_sub_proof_with_bits(
     if let Some(caps) = caps {
         let mut at = 0u32;
         for c in &mut commitments {
-            at = c.hint_cap(b, caps, at, shape.trace_cap);
+            at = c.hint_cap(b, caps, at, shape.trace_cap, shape.merkle_depth);
         }
         assert_eq!(at as usize, cap_words, "the caps arena is filled exactly");
     }

@@ -185,6 +185,61 @@ pub trait LfmHasher {
         let _ = (mode, state);
         Ok(())
     }
+
+    /// Whether this hasher's socket takes width-16 rows (`Instr::Hash16`).
+    ///
+    /// Only [`HasherKind::Poseidon1W16`]'s does; every twelve-felt socket refuses
+    /// one here, so a width-16 row under the wrong hasher is an executor error
+    /// with a reason rather than a witness no AIR accepts.
+    fn admits_width16(&self) -> Result<(), &'static str> {
+        Err(
+            "this hasher's LFM_HASH socket is twelve felts wide; a width-16 row needs HasherKind::Poseidon1W16",
+        )
+    }
+}
+
+/// [`HasherKind::Poseidon1W16`]'s answers to the twelve-felt contract: none it
+/// can prove. The width-16 socket has no twelve-felt mode, so [`LfmHasher::admits`]
+/// refuses every one.
+///
+/// ✗ The hashing methods are unreachable by construction, and they panic rather
+/// than return: every value they could return would be a hash no AIR proves (the
+/// socket review's A2), as `Blake3Permutation::permute` does for its missing
+/// mode. The executor checks `admits` before it hashes a row, the twelve-felt
+/// trace filler runs only for programs without `Hash16` rows (`trace.rs`), and
+/// the host transcripts are built over the block hasher, never over this one.
+/// Every derived hashing method (`compress`, `transcript`, `leaf` and their
+/// `_out` forms) goes through [`LfmHasher::permute`], so that one refusal
+/// covers the contract. The IVs stay the zero constant: they are not hashes,
+/// and the executor reads `mode_iv` to build the state `admits` then refuses.
+pub struct Poseidon1W16Narrow;
+
+impl Poseidon1W16Narrow {
+    #[cold]
+    fn no_twelve_felt_mode() -> ! {
+        panic!(
+            "the width-16 Poseidon1 socket has no twelve-felt hash: emit Instr::Hash16 \
+             rows (admits refuses every twelve-felt mode)"
+        )
+    }
+}
+
+impl LfmHasher for Poseidon1W16Narrow {
+    fn permute(&self, _state: [FE; HASH_STATE_FELTS]) -> [FE; HASH_STATE_FELTS] {
+        Self::no_twelve_felt_mode()
+    }
+
+    fn compress_iv(&self) -> LfmWord {
+        core::array::from_fn(|_| FE::zero())
+    }
+
+    fn admits(&self, _mode: HashMode, _state: &[FE; HASH_STATE_FELTS]) -> Result<(), &'static str> {
+        Err("the width-16 Poseidon1 socket has no twelve-felt mode; emit Instr::Hash16 rows")
+    }
+
+    fn admits_width16(&self) -> Result<(), &'static str> {
+        Ok(())
+    }
 }
 
 /// A placeholder permutation: one round of `x ↦ (x + rc)³` followed by the
@@ -283,6 +338,11 @@ pub enum HasherKind {
     /// linear. Cheaper on the host and narrower in the AIR than [`Self::Rpo`],
     /// at a weaker provenance — miden publishes no known-answer table for it.
     Rpx = 4,
+    /// ZisK's Poseidon1 at width 16 (`crypto::hash::poseidon1_w16`) behind
+    /// the width-16 socket ([`super::p1w16_socket`]): four cells in, four out,
+    /// one mode, `Instr::Hash16` rows only. The recursion's verifier of
+    /// Poseidon1 base proofs (P3) proves under it; nothing else does.
+    Poseidon1W16 = 5,
 }
 
 impl HasherKind {
@@ -304,6 +364,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.permute(state),
             HasherKind::Rpo => super::rpo::Rpo256.permute(state),
             HasherKind::Rpx => super::rpx::Rpx256.permute(state),
+            HasherKind::Poseidon1W16 => Poseidon1W16Narrow.permute(state),
         }
     }
 
@@ -314,6 +375,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.compress_iv(),
             HasherKind::Rpo => super::rpo::Rpo256.compress_iv(),
             HasherKind::Rpx => super::rpx::Rpx256.compress_iv(),
+            HasherKind::Poseidon1W16 => Poseidon1W16Narrow.compress_iv(),
         }
     }
 
@@ -330,6 +392,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.transcript_iv(),
             HasherKind::Rpo => super::rpo::Rpo256.transcript_iv(),
             HasherKind::Rpx => super::rpx::Rpx256.transcript_iv(),
+            HasherKind::Poseidon1W16 => Poseidon1W16Narrow.transcript_iv(),
         }
     }
 
@@ -341,6 +404,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.leaf_iv(),
             HasherKind::Rpo => super::rpo::Rpo256.leaf_iv(),
             HasherKind::Rpx => super::rpx::Rpx256.leaf_iv(),
+            HasherKind::Poseidon1W16 => Poseidon1W16Narrow.leaf_iv(),
         }
     }
 
@@ -353,6 +417,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.compress(a, b),
             HasherKind::Rpo => super::rpo::Rpo256.compress(a, b),
             HasherKind::Rpx => super::rpx::Rpx256.compress(a, b),
+            HasherKind::Poseidon1W16 => Poseidon1W16Narrow.compress(a, b),
         }
     }
 
@@ -366,6 +431,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.compress_out(a, b),
             HasherKind::Rpo => super::rpo::Rpo256.compress_out(a, b),
             HasherKind::Rpx => super::rpx::Rpx256.compress_out(a, b),
+            HasherKind::Poseidon1W16 => Poseidon1W16Narrow.compress_out(a, b),
         }
     }
 
@@ -381,6 +447,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.transcript_out(a, b),
             HasherKind::Rpo => super::rpo::Rpo256.transcript_out(a, b),
             HasherKind::Rpx => super::rpx::Rpx256.transcript_out(a, b),
+            HasherKind::Poseidon1W16 => Poseidon1W16Narrow.transcript_out(a, b),
         }
     }
 
@@ -391,6 +458,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.transcript(a, b),
             HasherKind::Rpo => super::rpo::Rpo256.transcript(a, b),
             HasherKind::Rpx => super::rpx::Rpx256.transcript(a, b),
+            HasherKind::Poseidon1W16 => Poseidon1W16Narrow.transcript(a, b),
         }
     }
 
@@ -405,6 +473,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.leaf_out(acc, felts),
             HasherKind::Rpo => super::rpo::Rpo256.leaf_out(acc, felts),
             HasherKind::Rpx => super::rpx::Rpx256.leaf_out(acc, felts),
+            HasherKind::Poseidon1W16 => Poseidon1W16Narrow.leaf_out(acc, felts),
         }
     }
 
@@ -415,6 +484,7 @@ impl LfmHasher for HasherKind {
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.leaf(acc, felts),
             HasherKind::Rpo => super::rpo::Rpo256.leaf(acc, felts),
             HasherKind::Rpx => super::rpx::Rpx256.leaf(acc, felts),
+            HasherKind::Poseidon1W16 => Poseidon1W16Narrow.leaf(acc, felts),
         }
     }
 
@@ -425,6 +495,16 @@ impl LfmHasher for HasherKind {
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.admits(mode, state),
             HasherKind::Rpo => super::rpo::Rpo256.admits(mode, state),
             HasherKind::Rpx => super::rpx::Rpx256.admits(mode, state),
+            HasherKind::Poseidon1W16 => Poseidon1W16Narrow.admits(mode, state),
+        }
+    }
+
+    fn admits_width16(&self) -> Result<(), &'static str> {
+        match self {
+            HasherKind::Poseidon1W16 => Poseidon1W16Narrow.admits_width16(),
+            _ => Err(
+                "this hasher's LFM_HASH socket is twelve felts wide; a width-16 row needs HasherKind::Poseidon1W16",
+            ),
         }
     }
 }

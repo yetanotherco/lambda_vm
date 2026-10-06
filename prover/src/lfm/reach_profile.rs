@@ -205,7 +205,7 @@ pub fn profile(program: &LfmProgram) -> ReachProfile {
             hd = hd.max(hash_depth[w as usize]);
             id = id.max(instr_depth[w as usize]);
         }
-        let is_hash = matches!(instr, Instr::Hash { .. });
+        let is_hash = matches!(instr, Instr::Hash { .. } | Instr::Hash16(_));
         if is_hash {
             hash_rows += 1;
             hd += 1;

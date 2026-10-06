@@ -122,6 +122,14 @@ pub struct HashRow {
     pub outs: [FE; HASH_STATE_FELTS],
 }
 
+/// One width-16 `LFM_HASH` row (`Instr::Hash16`): the sixteen lanes read and
+/// the sixteen the permutation returns.
+#[derive(Debug, Clone)]
+pub struct Hash16Row {
+    pub ins: [FE; 16],
+    pub outs: [FE; 16],
+}
+
 /// One `LFM_KECCAK` row. The 400 byte columns are derived from these two
 /// states; the tag is the row ordinal (`layout::keccak::tag_for_row`), so it is
 /// not recorded here — it is program data, not witness.
@@ -147,6 +155,9 @@ pub struct LfmRecords {
     pub select: Vec<SelectRow>,
     pub bitdec: Vec<BitDecRow>,
     pub hash: Vec<HashRow>,
+    /// The `LFM_HASH` rows of a width-16 program (`LfmProgram::hash16`); such a
+    /// program's `hash` is empty, and every other program's `hash16` is.
+    pub hash16: Vec<Hash16Row>,
     pub keccak: Vec<KeccakRow>,
     /// One `LFM_BLAKE3` row. Values only, like every other record: the chip's
     /// addresses and multiplicities are preprocessed program data.
@@ -171,14 +182,20 @@ impl LfmRecords {
     /// Growing these by `push` instead re-allocated and copied every one of them
     /// ~log2(rows) times per proof — a few hundred MB of memcpy and ~20 large
     /// `mremap`s under the process allocator, on every concurrent worker at once.
-    fn with_capacity(groups: &LfmColumnGroups) -> Self {
+    fn with_capacity(groups: &LfmColumnGroups, hash16: bool) -> Self {
+        let (narrow, wide) = if hash16 {
+            (0, groups.hash.real_rows)
+        } else {
+            (groups.hash.real_rows, 0)
+        };
         LfmRecords {
             num_consts: 0,
             balu: Vec::with_capacity(groups.balu.real_rows),
             xalu: Vec::with_capacity(groups.xalu.real_rows),
             select: Vec::with_capacity(groups.select.real_rows),
             bitdec: Vec::with_capacity(groups.bitdec.real_rows),
-            hash: Vec::with_capacity(groups.hash.real_rows),
+            hash: Vec::with_capacity(narrow),
+            hash16: Vec::with_capacity(wide),
             keccak: Vec::with_capacity(groups.keccak.real_rows),
             blake3: Vec::with_capacity(groups.blake3.real_rows),
             lanes: Vec::with_capacity(groups.lanes.real_rows),
@@ -210,7 +227,7 @@ impl LfmRecords {
     /// The caller must also call this ONLY on the success path. It is invoked at
     /// exactly one place for that reason: any `?` before it drops zero-length
     /// vectors, which frees the buffer without reading a slot.
-    unsafe fn commit_slots(&mut self, groups: &LfmColumnGroups) {
+    unsafe fn commit_slots(&mut self, groups: &LfmColumnGroups, hash16: bool) {
         // A `set_len` past the capacity would be the one way to turn the
         // reasoning above into unsoundness, so it is checked rather than
         // reasoned about, in every build.
@@ -224,17 +241,37 @@ impl LfmRecords {
             )+};
         }
         commit!(
-            balu, xalu, select, bitdec, hash, keccak, blake3, lanes, hint, public
+            balu, xalu, select, bitdec, keccak, blake3, lanes, hint, public
         );
+        // `LFM_HASH`'s rows are one vector or the other, by the program's width.
+        let rows = groups.hash.real_rows;
+        if hash16 {
+            assert!(
+                self.hash16.capacity() >= rows,
+                "record slots for hash16 were not reserved"
+            );
+            unsafe { self.hash16.set_len(rows) };
+        } else {
+            assert!(
+                self.hash.capacity() >= rows,
+                "record slots for hash were not reserved"
+            );
+            unsafe { self.hash.set_len(rows) };
+        }
     }
 
     /// Bytes the record vectors hold once filled — what `setup` first-touches.
-    fn bytes(groups: &LfmColumnGroups) -> usize {
+    fn bytes(groups: &LfmColumnGroups, hash16: bool) -> usize {
+        let hash_row = if hash16 {
+            size_of::<Hash16Row>()
+        } else {
+            size_of::<HashRow>()
+        };
         groups.balu.real_rows * size_of::<BaluRow>()
             + groups.xalu.real_rows * size_of::<XaluRow>()
             + groups.select.real_rows * size_of::<SelectRow>()
             + groups.bitdec.real_rows * size_of::<BitDecRow>()
-            + groups.hash.real_rows * size_of::<HashRow>()
+            + groups.hash.real_rows * hash_row
             + groups.keccak.real_rows * size_of::<KeccakRow>()
             + groups.blake3.real_rows * size_of::<Blake3Values>()
             + (groups.lanes.real_rows + groups.hint.real_rows + groups.public.real_rows)
@@ -516,6 +553,40 @@ fn hash_apply(
     Ok(())
 }
 
+/// A width-16 row's read-only half: the four input words, permuted.
+fn hash16_compute(
+    memory: &WriteOnceMemory,
+    hasher: &impl LfmHasher,
+    ins: &[Addr; 4],
+) -> Result<Hash16Row, LfmExecError> {
+    hasher
+        .admits_width16()
+        .map_err(LfmExecError::HasherRejected)?;
+    let mut state = [FE::zero(); 16];
+    for (cell, chunk) in ins.iter().zip(state.chunks_exact_mut(4)) {
+        chunk.copy_from_slice(&memory.read(*cell)?);
+    }
+    Ok(Hash16Row {
+        ins: state,
+        outs: crypto::hash::poseidon1_w16::permute(state),
+    })
+}
+
+/// A width-16 row's write half: all four output words. One nobody reads is
+/// written all the same (its multiplicity is zero), as `Instr::writes_into`
+/// lists it.
+fn hash16_apply(
+    memory: &mut WriteOnceMemory,
+    outs: &[Addr; 4],
+    row: &Hash16Row,
+) -> Result<(), LfmExecError> {
+    for (cell, chunk) in outs.iter().zip(row.outs.chunks_exact(4)) {
+        let w: LfmWord = core::array::from_fn(|i| chunk[i]);
+        memory.write(*cell, w)?;
+    }
+    Ok(())
+}
+
 /// One instruction, against the machine — the body the serial loop always had,
 /// lifted out so the level schedule runs the SAME arms rather than a second copy
 /// of them.
@@ -704,6 +775,11 @@ fn step(
                 let row = hash_compute(&m.memory, hasher, *mode, ins)?;
                 hash_apply(&mut m.memory, *mode, outs, &row)?;
                 sink.put(&mut records.hash, row);
+            }
+            Instr::Hash16(h) => {
+                let row = hash16_compute(&m.memory, hasher, &h.ins)?;
+                hash16_apply(&mut m.memory, &h.outs, &row)?;
+                sink.put(&mut records.hash16, row);
             }
             Instr::KeccakF(op) => {
                 use super::layout::keccak as k;
@@ -1053,6 +1129,17 @@ pub fn default_schedule() -> Schedule {
 /// The executor must then fail with [`LfmExecError::ReadBeforeWrite`], at the
 /// same address, on every run — see [`super::exec_schedule::build_merged`]. A
 /// gate that still passed with the level boundary removed would not be a gate.
+/// [`execute`] on the serial schedule, whatever `LFM_EXEC_PARALLEL` says — the
+/// reference the level schedule is compared against.
+#[cfg(test)]
+pub fn execute_serial(
+    program: &LfmProgram,
+    arenas: &[Vec<LfmWord>],
+    hasher: &(impl LfmHasher + Sync),
+) -> Result<LfmExecution, LfmExecError> {
+    execute_inner(program, arenas, hasher, Schedule::Serial, 1)
+}
+
 #[cfg(test)]
 pub fn execute_with_merged_levels(
     program: &LfmProgram,
@@ -1123,10 +1210,10 @@ fn execute_inner(
         memory: WriteOnceMemory::new(program.num_addrs as usize),
         arenas: arenas.iter().map(Vec::as_slice).collect(),
     };
-    let mut records = LfmRecords::with_capacity(&program.groups);
+    let mut records = LfmRecords::with_capacity(&program.groups, program.hash16());
     let mut public_words = Vec::with_capacity(program.groups.public.real_rows);
     split.setup = t.elapsed().as_secs_f64();
-    split.record_bytes = LfmRecords::bytes(&program.groups);
+    split.record_bytes = LfmRecords::bytes(&program.groups, program.hash16());
 
     match &levels {
         None => {
@@ -1166,7 +1253,7 @@ fn execute_inner(
             // after the `?` so a failed walk never reaches it; the public
             // words' capacity covers the rows set (checked above).
             unsafe {
-                records.commit_slots(&program.groups);
+                records.commit_slots(&program.groups, program.hash16());
                 public_words.set_len(program.groups.public.real_rows);
             }
         }
@@ -1192,7 +1279,7 @@ fn execute_inner(
             records.xalu.len(),
             records.select.len(),
             records.bitdec.len(),
-            records.hash.len(),
+            records.hash.len() + records.hash16.len(),
             records.keccak.len(),
             records.blake3.len(),
             records.lanes.len(),
@@ -1327,10 +1414,10 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
             memory: WriteOnceMemory::new(program.num_addrs as usize),
             arenas: vec![&[]; schema.len()],
         };
-        let records = LfmRecords::with_capacity(&program.groups);
+        let records = LfmRecords::with_capacity(&program.groups, program.hash16());
         let public_words = Vec::with_capacity(program.groups.public.real_rows);
         split.setup = t.elapsed().as_secs_f64();
-        split.record_bytes = LfmRecords::bytes(&program.groups);
+        split.record_bytes = LfmRecords::bytes(&program.groups, program.hash16());
         let mut streamed = Self {
             program,
             hasher,
@@ -1428,7 +1515,8 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         // written — `LfmRecords::commit_slots`'s condition, as in `execute`;
         // and the public words' capacity covers the rows set (checked above).
         unsafe {
-            self.records.commit_slots(&self.program.groups);
+            self.records
+                .commit_slots(&self.program.groups, self.program.hash16());
             self.public_words
                 .set_len(self.program.groups.public.real_rows);
         }
@@ -1485,7 +1573,7 @@ fn run_levels(
     // One buffer, reused by every level, so a 2,237-level program allocates once
     // rather than 2,237 times. It grows to the widest level and stays there:
     // ~3.4 MiB on a wrap, ~4.8 MiB on a node.
-    let mut computed: Vec<Result<HashRow, LfmExecError>> = Vec::new();
+    let mut computed: Vec<Result<HashOut, LfmExecError>> = Vec::new();
     // A wave's share of a level, when `keep` filters: the same order, a subset.
     let (mut kept_rows, mut kept_others): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
     let mut ran = 0usize;
@@ -1542,15 +1630,23 @@ fn run_levels(
                 Err(e) => return Err(e.clone()),
             };
             let instr = &program.instrs[levels.instr_of_row(row)];
-            let Instr::Hash { mode, outs, .. } = instr else {
-                return Err(LfmExecError::Internal(
-                    "the schedule listed a non-hash instruction as a hash row",
-                ));
-            };
-            hash_apply(&mut m.memory, *mode, outs, row_value)?;
             // The hash chip's row goes through the same slot write as every
             // other chip's: the vector's length is zero until `commit_slots`.
-            Sink::Slot(row).put(&mut records.hash, row_value.clone());
+            match (instr, row_value) {
+                (Instr::Hash { mode, outs, .. }, HashOut::Narrow(r)) => {
+                    hash_apply(&mut m.memory, *mode, outs, r)?;
+                    Sink::Slot(row).put(&mut records.hash, r.clone());
+                }
+                (Instr::Hash16(h), HashOut::Wide(r)) => {
+                    hash16_apply(&mut m.memory, &h.outs, r)?;
+                    Sink::Slot(row).put(&mut records.hash16, (**r).clone());
+                }
+                _ => {
+                    return Err(LfmExecError::Internal(
+                        "the schedule listed a non-hash instruction as a hash row",
+                    ));
+                }
+            }
         }
         split.apply += t.elapsed().as_secs_f64();
 
@@ -1583,14 +1679,26 @@ fn run_levels(
     Ok(ran)
 }
 
+/// A level's computed hash row: a twelve-felt one, or a width-16 one (boxed,
+/// so the twelve-felt level buffer keeps its size).
+enum HashOut {
+    Narrow(HashRow),
+    Wide(Box<Hash16Row>),
+}
+
 /// One hash instruction's read-only half, dispatched from a program index.
 fn hash_one(
     memory: &WriteOnceMemory,
     hasher: &impl LfmHasher,
     instr: &Instr,
-) -> Result<HashRow, LfmExecError> {
+) -> Result<HashOut, LfmExecError> {
     match instr {
-        Instr::Hash { mode, ins, .. } => hash_compute(memory, hasher, *mode, ins),
+        Instr::Hash { mode, ins, .. } => {
+            hash_compute(memory, hasher, *mode, ins).map(HashOut::Narrow)
+        }
+        Instr::Hash16(h) => {
+            hash16_compute(memory, hasher, &h.ins).map(|r| HashOut::Wide(Box::new(r)))
+        }
         _ => Err(LfmExecError::Internal(
             "the schedule listed a non-hash instruction as a hash row",
         )),
@@ -1610,7 +1718,7 @@ fn compute_level(
     program: &LfmProgram,
     levels: &LevelSchedule,
     rows: &[u32],
-    out: &mut Vec<Result<HashRow, LfmExecError>>,
+    out: &mut Vec<Result<HashOut, LfmExecError>>,
 ) {
     use rayon::prelude::*;
 
@@ -1630,7 +1738,7 @@ fn compute_level(
     program: &LfmProgram,
     levels: &LevelSchedule,
     rows: &[u32],
-    out: &mut Vec<Result<HashRow, LfmExecError>>,
+    out: &mut Vec<Result<HashOut, LfmExecError>>,
 ) {
     out.clear();
     out.extend(
@@ -1665,6 +1773,7 @@ pub fn locate_addr(program: &LfmProgram, addr: u64) -> String {
                 .chain(halves.iter().flatten().map(|(a, _)| a.0))
                 .collect(),
             Instr::Hash { outs, .. } => outs.iter().map(|a| a.0).collect(),
+            Instr::Hash16(h) => h.outs.iter().map(|a| a.0).collect(),
             Instr::Unpack { outs, .. } => outs.iter().map(|a| a.0).collect(),
             Instr::Pack { out, .. } => vec![out.0],
             _ => Vec::new(),

@@ -320,7 +320,7 @@ impl FriShape {
     /// sub-proof: `2^c − 1` parents per capped layer.
     pub fn cap_permutations(self) -> usize {
         (0..self.num_committed())
-            .map(|i| super::merkle_cap::cap_root_permutations(self.layer_cap(i)))
+            .map(|i| super::merkle_cap::cap_root_permutations(1 << self.layer_cap(i), 2))
             .sum()
     }
 
@@ -543,12 +543,19 @@ impl LayerCommitment {
     /// authenticate it against the root lanes, once per tree (see
     /// [`super::sub_proof::GroupCommitment::hint_cap`]). Returns the next free
     /// word; `c = 0` hints nothing.
-    pub fn hint_cap(&mut self, b: &mut LfmBuilder, arena: ArenaId, base: u32, c: usize) -> u32 {
+    pub fn hint_cap(
+        &mut self,
+        b: &mut LfmBuilder,
+        arena: ArenaId,
+        base: u32,
+        c: usize,
+        depth: usize,
+    ) -> u32 {
         if c == 0 {
             return base;
         }
         let (cap, next) =
-            super::merkle_cap::hint_and_authenticate(b, arena, base, c, &self.root_lanes);
+            super::merkle_cap::hint_and_authenticate(b, arena, base, c, depth, &self.root_lanes);
         self.cap = Some(cap);
         next
     }
@@ -593,7 +600,7 @@ pub fn hint_layer_caps(
     );
     let mut at = 0u32;
     for (i, layer) in layers.iter_mut().enumerate() {
-        at = layer.hint_cap(b, arena, at, shape.layer_cap(i));
+        at = layer.hint_cap(b, arena, at, shape.layer_cap(i), shape.layer_depth(i));
     }
     assert_eq!(
         at as usize,
