@@ -205,6 +205,60 @@ fn the_p1_statement_tag_is_bound() {
     );
 }
 
+/// ★ The statement the Poseidon1 leaf absorbs call by call
+/// (`block_statement_calls`) is `absorb_block`'s own: the calls concatenate to
+/// the RPX leaf's one run (`block_statement_bytes`), and `P1Transcript` fed
+/// them lands where `absorb_block` leaves it.
+#[test]
+fn the_statement_calls_are_absorb_blocks_own() {
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+    use crypto::fiat_shamir::p1_transcript::P1Transcript;
+    let elf = asm_elf_bytes("sub");
+    let p1 = many_groups(BaseFormat::P1_WHIR);
+    let proof = prove(&elf, &p1, 0);
+    let opts = ProofOptions::default_test_options();
+    let statement = proof.statement();
+    let config = block_whir::block_frame(statement, &elf, &opts, &p1)
+        .expect("the frame")
+        .config;
+    let tag = block_statement_tag(&p1.zf.base);
+    let calls = block_whir::block_statement_calls(statement, &tag, &elf, &config)
+        .expect("byte strings only");
+    let bytes = block_whir::block_statement_bytes(
+        statement,
+        &tag,
+        &crate::statement::elf_digest(&elf),
+        &config,
+    );
+    assert!(calls.len() > 10, "{} calls", calls.len());
+    assert_eq!(calls.concat(), bytes, "the calls are the run, cut");
+    let mut direct = P1Transcript::new();
+    block_whir::absorb_block(
+        &mut direct,
+        &tag,
+        &elf,
+        statement.public_output,
+        statement.table_counts,
+        statement.num_private_input_pages,
+        statement.runtime_page_ranges,
+        statement.table_num_vars,
+        &config,
+        statement.groups,
+    );
+    let mut replay = P1Transcript::new();
+    for call in &calls {
+        replay.append_bytes(call);
+    }
+    assert_eq!(replay.state(), direct.state(), "call for call");
+    let mut merged = P1Transcript::new();
+    merged.append_bytes(&bytes);
+    assert_ne!(
+        merged.state(),
+        direct.state(),
+        "one run is another stream under Poseidon1: the calls are load-bearing"
+    );
+}
+
 /// ★ No environment read decides the base: the block's prove, verify and
 /// plan sites dispatch through `with_block_hash!` on the format alone, whose
 /// Poseidon1 arm and base check read no environment and never consult the WHIR

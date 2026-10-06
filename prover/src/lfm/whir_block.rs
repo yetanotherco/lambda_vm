@@ -67,13 +67,28 @@ use super::whir_epoch::{
 };
 use super::whir_stacked::{StackedPolyWires, stacked_verify_cost};
 use super::whir_table::{TableProofWires, TableShape, table_verify_cost};
-use super::whir_transcript::WhirTranscript;
+use super::whir_transcript::{SpongeEntry, WhirTranscript};
 use super::word::{LfmWord, base_word};
 
 /// The leaf-load cap in permutations: today's wrap LFM_HASH shape, 2^18 + 2^15
 /// rows, less the headroom wrap 2 runs at (D-NOEPOCH §12.2, the STARK block's
 /// cap too).
 pub const LEAF_PERMS_CAP: usize = 279_000;
+
+/// The leaf-load cap under a Poseidon1 base, in socket (`Hash16`) rows: RPX's
+/// partition carried over (D-WHIR-P1 D8a), `LEAF_PERMS_CAP` scaled by a P1
+/// group's ≈ 40 k socket rows against RPX's 62.8 k permutations. Isolates the
+/// hash: the median's leaves keep four groups, 1×'s three.
+pub const LEAF_P1_CAP: usize = 178_000;
+
+/// The leaf cap a block's base takes: [`LEAF_P1_CAP`] under Poseidon1, else
+/// [`LEAF_PERMS_CAP`].
+pub fn leaf_cap_for(base: &stark::proof::options::BaseFormat) -> usize {
+    match base.hash {
+        stark::config::CommitmentHash::Poseidon1 => LEAF_P1_CAP,
+        _ => LEAF_PERMS_CAP,
+    }
+}
 
 /// The leaf that subtracts the COMMIT-bus target.
 pub const CARRIER: usize = 0;
@@ -267,6 +282,15 @@ impl PlannedPrepared {
 pub struct WhirBlockPlan {
     frame: BlockFrame,
     statement_bytes: Vec<u8>,
+    /// The statement's `append_bytes` calls, under a Poseidon1 base (whose
+    /// sponge binds each call's length); empty under RPX, whose byte sponge
+    /// absorbs [`Self::statement_bytes`] as one run.
+    statement_calls: Vec<Vec<u8>>,
+    /// The leaves' wrap hash: the base's ([`WrapHash::for_base`]). The nodes
+    /// stay on the production hash (D-WHIR-P1 P3a).
+    ///
+    /// [`WrapHash::for_base`]: super::edsl::WrapHash::for_base
+    wrap_hash: super::edsl::WrapHash,
     public_output: Vec<u8>,
     /// The statement's groups: AIR indices in each group's order.
     groups: Vec<Vec<usize>>,
@@ -341,13 +365,13 @@ impl WhirBlockPlan {
             num_leaves,
             fan_in,
             prepared_roots,
-            LEAF_PERMS_CAP,
+            leaf_cap_for(&format.zf.base),
         )
     }
 
     /// [`Self::derive_with`] under a leaf cap of `leaf_cap` permutations
     /// ([`leaf_partition`]); everything but the tests' refusals runs at
-    /// [`LEAF_PERMS_CAP`].
+    /// [`leaf_cap_for`] the base.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn derive_capped(
         elf_bytes: &[u8],
@@ -362,30 +386,35 @@ impl WhirBlockPlan {
         if fan_in < 2 {
             return Err(format!("a fan-in of {fan_in} closes no tree"));
         }
-        // The machine replays the algebraic transcript: it verifies a block
-        // proved over RPX, and nothing else. A Poseidon1 base's leaf is
-        // D-WHIR-P1's S5.
-        if format.zf.base != stark::proof::options::BaseFormat::RPX {
-            return Err(format!(
-                "the block's recursion verifies a block proved over RPX, not the base {:?}",
-                format.zf.base
-            ));
-        }
-        if crate::whir_hash_knob::selected() != crate::whir_hash_knob::Setting::Rpx {
-            return Err(
-                "the block's recursion verifies a block proved over RPX; set LAMBDA_VM_WHIR_HASH=rpx"
-                    .to_string(),
-            );
+        // The machine replays the base's transcript: RPX's algebraic one, or
+        // under a Poseidon1 base ZisK's sponge. An RPX base's block hash is
+        // still the knob's until S7, and the machine replays only its RPX arm.
+        let base = &format.zf.base;
+        let wrap_hash = super::edsl::WrapHash::for_base(base);
+        match crate::block_whir::checked_base(base).map_err(|e| format!("{e:?}"))? {
+            crate::block_whir::BlockHash::Binary => {
+                if crate::whir_hash_knob::selected() != crate::whir_hash_knob::Setting::Rpx {
+                    return Err("the block's recursion verifies a block proved over RPX; set \
+                         LAMBDA_VM_WHIR_HASH=rpx"
+                        .to_string());
+                }
+            }
+            crate::block_whir::BlockHash::Poseidon1 => {}
         }
         let frame = block_frame(statement, elf_bytes, proof_options, format)
             .map_err(|e| format!("statement: {e:?}"))?;
         let elf_digest = crate::statement::elf_digest(elf_bytes);
-        let statement_bytes = block_statement_bytes(
-            statement,
-            &crate::block_whir::block_statement_tag(&format.zf.base),
-            &elf_digest,
-            &frame.config,
-        );
+        let tag = crate::block_whir::block_statement_tag(base);
+        let statement_bytes = block_statement_bytes(statement, &tag, &elf_digest, &frame.config);
+        let statement_calls = match wrap_hash {
+            super::edsl::WrapHash::Poseidon1 => crate::block_whir::block_statement_calls(
+                statement,
+                &tag,
+                elf_bytes,
+                &frame.config,
+            )?,
+            _ => Vec::new(),
+        };
         let groups: Vec<Vec<usize>> = statement
             .groups
             .iter()
@@ -430,11 +459,8 @@ impl WhirBlockPlan {
                 .map_err(|e| format!("prepared group {group}: {e:?}"))?;
             let roots = match prepared_roots {
                 Some(roots) => roots[index].1.clone(),
-                None => crate::with_whir_hash!(|H| {
-                    commit_group::<H>(stack, config)
-                        .map_err(|e| format!("prepared group {group}: {e:?}"))?
-                        .roots
-                }),
+                None => commit_prepared(stack, config, base)
+                    .map_err(|e| format!("prepared group {group}: {e:?}"))?,
             };
             if roots.len() != layout.num_polys() {
                 return Err(format!(
@@ -452,13 +478,18 @@ impl WhirBlockPlan {
             });
         }
 
-        // Each group's cost: its tables' legs, its opening, its prepared ones.
+        // Each group's cost: its tables' legs, its opening, its prepared ones —
+        // in socket rows under Poseidon1.
         let refs = frame.airs.air_refs();
+        let arity = wrap_hash.arity();
         let mut costs = Vec::with_capacity(groups.len());
         for (g, list) in groups.iter().enumerate() {
             let owned = Shapes::build(&refs, &frame.shapes, list)?;
             let shapes = owned.table_shapes();
-            let entry = fresh_schedule().entry();
+            let entry = match wrap_hash {
+                super::edsl::WrapHash::Poseidon1 => SpongeEntry::fresh_for(wrap_hash),
+                _ => fresh_schedule().entry(),
+            };
             let tables: usize = match batched_cap(config) {
                 None => shapes
                     .iter()
@@ -472,7 +503,7 @@ impl WhirBlockPlan {
             let group_shapes: Vec<(usize, usize)> = list.iter().map(|&t| frame.shapes[t]).collect();
             let (_, group_of) = group_columns(&group_shapes);
             let layout = &frame.stack_layouts[g];
-            let chain = ChainShape::new(config, layout.n_stack());
+            let chain = ChainShape::new_at(config, layout.n_stack(), arity);
             let opening = stacked_verify_cost(layout, &group_of, &chain, entry).perms();
             let prepared_perms: usize = prepared
                 .iter()
@@ -484,7 +515,7 @@ impl WhirBlockPlan {
                         .enumerate()
                         .flat_map(|(k, &(_, _, n))| std::iter::repeat_n(k, n))
                         .collect();
-                    let chain = ChainShape::new(config, p.layout.n_stack());
+                    let chain = ChainShape::new_at(config, p.layout.n_stack(), arity);
                     stacked_verify_cost(&p.layout, &group_of, &chain, entry).perms()
                 })
                 .sum();
@@ -496,6 +527,8 @@ impl WhirBlockPlan {
         Ok(Self {
             frame,
             statement_bytes,
+            statement_calls,
+            wrap_hash,
             public_output: statement.public_output.to_vec(),
             groups,
             prepared,
@@ -510,9 +543,26 @@ impl WhirBlockPlan {
         &self.partition
     }
 
-    /// Each group's in-guest cost, in permutations.
+    /// Each group's in-guest cost, in permutations (socket rows under a
+    /// Poseidon1 base).
     pub fn costs(&self) -> &[usize] {
         &self.costs
+    }
+
+    /// The leaves' wrap hash: the base's.
+    pub fn wrap_hash(&self) -> super::edsl::WrapHash {
+        self.wrap_hash
+    }
+
+    /// A leaf's builder: the base's wrap hash.
+    fn leaf_builder(&self) -> LfmBuilder {
+        LfmBuilder::new().with_wrap_hash(self.wrap_hash)
+    }
+
+    /// The chain shape of a stack of `n_stack` variables, at the base's tree
+    /// arity.
+    pub fn chain_shape(&self, n_stack: usize) -> ChainShape {
+        ChainShape::new_at(&self.frame.config, n_stack, self.wrap_hash.arity())
     }
 
     pub fn carrier(&self) -> usize {
@@ -548,7 +598,7 @@ impl WhirBlockPlan {
         if k >= self.partition.num_leaves() {
             return Err(format!("no leaf {k}"));
         }
-        let mut b = builder();
+        let mut b = self.leaf_builder();
         emit_block_leaf(&mut b, self, k)?;
         finish(b)
     }
@@ -833,12 +883,13 @@ pub(crate) fn map_in_windows<T: Sync, R: Send>(
     Ok(done)
 }
 
-/// A tree program's artifacts, under the block hasher.
+/// A tree program's artifacts, under the block hasher — the width-16 socket's
+/// for a leaf with `Hash16` rows ([`LfmProgram::hasher`]).
 pub fn artifacts_of(program: &LfmProgram, wrap_opts: &crate::ProofOptions) -> LfmArtifacts {
     super::program_census::build_artifacts_counted(
         program,
         wrap_opts,
-        crate::hash_pin::BLOCK_HASHER,
+        program.hasher(crate::hash_pin::BLOCK_HASHER),
     )
 }
 
@@ -888,10 +939,32 @@ pub fn verify_block_tree(
     statement: BlockStatement<'_>,
     top: &super::proof::LfmProof,
 ) -> Result<(), String> {
+    verify_block_tree_based(
+        elf_bytes,
+        &stark::proof::options::BaseFormat::RPX,
+        statement,
+        top,
+    )
+}
+
+/// [`verify_block_tree`] of a block proved over `base`: the production format
+/// with its base hash the verifier's own constant, never read from the proof
+/// (D-WHIR-P1 D7). Every other preset is [`verify_block_tree`]'s.
+pub fn verify_block_tree_based(
+    elf_bytes: &[u8],
+    base: &stark::proof::options::BaseFormat,
+    statement: BlockStatement<'_>,
+    top: &super::proof::LfmProof,
+) -> Result<(), String> {
+    let production = BlockFormat::production();
+    let format = BlockFormat {
+        zf: production.zf.with_base(*base),
+        ..production
+    };
     verify_block_tree_with(
         elf_bytes,
         &super::proof::block_base_options(),
-        &BlockFormat::production(),
+        &format,
         statement,
         None,
         BLOCK_FAN_IN,
@@ -1120,8 +1193,16 @@ fn emit_front(
             cell
         })
         .collect();
-    let mut transcript = WhirTranscript::new();
-    transcript.absorb_const_bytes(&plan.statement_bytes);
+    let mut transcript = WhirTranscript::for_builder(b);
+    match plan.wrap_hash {
+        // ZisK's sponge binds each call's length: the statement call by call.
+        super::edsl::WrapHash::Poseidon1 => {
+            for call in &plan.statement_calls {
+                transcript.absorb_const_bytes(call);
+            }
+        }
+        _ => transcript.absorb_const_bytes(&plan.statement_bytes),
+    }
     let derived: Vec<LfmWord> = plan
         .prepared
         .iter()
@@ -1147,7 +1228,7 @@ fn emit_front(
 /// draw — what a test compares against the host's transcript.
 #[cfg(test)]
 pub(crate) fn front_program(plan: &WhirBlockPlan, g: usize) -> LfmProgram {
-    let mut b = builder();
+    let mut b = plan.leaf_builder();
     let arena = b.declare_arena(0);
     let mut at = 0u32;
     let front = emit_front(&mut b, plan, arena, &mut at);
@@ -1194,7 +1275,7 @@ pub(crate) fn leaf_program_with(
     k: usize,
     checks: LeafChecks,
 ) -> Result<LfmProgram, String> {
-    let mut b = builder();
+    let mut b = plan.leaf_builder();
     emit_leaf(&mut b, plan, k, checks)?;
     finish(b)
 }
@@ -1314,7 +1395,7 @@ fn emit_leaf(
 
         // The group's opening, against its own carried roots.
         let layout = &frame.stack_layouts[g];
-        let chain = ChainShape::new(config, layout.n_stack());
+        let chain = plan.chain_shape(layout.n_stack());
         let held = hint_group_chains_shaped(b, arena, &mut at, layout.num_polys(), &chain);
         let openings: Vec<_> = held
             .storage
@@ -1351,7 +1432,7 @@ fn emit_leaf(
         // Its prepared stack, against the derived roots: each table's block at
         // that table's point.
         for p in plan.prepared.iter().filter(|p| p.group == g) {
-            let shape = ChainShape::new(config, p.layout.n_stack());
+            let shape = plan.chain_shape(p.layout.n_stack());
             let held = hint_group_chains_shaped(b, arena, &mut at, p.layout.num_polys(), &shape);
             let roots: Vec<Cell> = p
                 .roots
@@ -1538,12 +1619,12 @@ pub fn group_arena_words(
         }
     }
     let layout = &frame.stack_layouts[g];
-    let chain = ChainShape::new(&frame.config, layout.n_stack());
+    let chain = plan.chain_shape(layout.n_stack());
     push_chains(&mut words, opening, layout.num_polys(), &chain)?;
     let mut planned = plan.prepared.iter().filter(|p| p.group == g);
     match (planned.next(), prepared) {
         (Some(p), Some(opening)) => {
-            let shape = ChainShape::new(&frame.config, p.layout.n_stack());
+            let shape = plan.chain_shape(p.layout.n_stack());
             push_chains(&mut words, opening, p.layout.num_polys(), &shape)?;
         }
         (Some(_), None) => return Err("the proof is short of prepared openings".to_string()),
@@ -1578,4 +1659,15 @@ fn push_chains(
         }
     }
     Ok(())
+}
+
+/// A prepared stack's roots, committed under the base's hash.
+fn commit_prepared(
+    stack: crate::block_whir::GroupStack,
+    config: &multilinear::whir_chain::ChainConfig,
+    base: &stark::proof::options::BaseFormat,
+) -> Result<Vec<Commitment>, crate::Error> {
+    crate::with_block_hash!(*base, |H| {
+        Ok(commit_group::<H>(stack, config)?.roots)
+    })
 }
