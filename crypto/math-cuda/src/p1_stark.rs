@@ -143,8 +143,8 @@ pub(crate) fn launch_leaves_cols_ptr(
     rows_per_leaf: usize,
     leaves: sys::CUdeviceptr,
 ) -> Result<()> {
-    assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
-    assert!(num_rows >= 2 && num_rows.is_power_of_two());
+    ensure!(rows_per_leaf == 1 || rows_per_leaf == 2);
+    ensure!(num_rows >= 2 && num_rows.is_power_of_two());
     let k = kernels()?;
     let log_num_rows = num_rows.trailing_zeros() as u64;
     let (kernel, threads) = if rows_per_leaf == 2 {
@@ -176,8 +176,8 @@ pub(crate) fn launch_leaves_cols(
     rows_per_leaf: usize,
     leaves: &mut CudaViewMut<'_, u8>,
 ) -> Result<()> {
-    assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
-    assert!(num_rows >= 2 && num_rows.is_power_of_two());
+    ensure!(rows_per_leaf == 1 || rows_per_leaf == 2);
+    ensure!(num_rows >= 2 && num_rows.is_power_of_two());
     let k = kernels()?;
     let log_num_rows = num_rows.trailing_zeros() as u64;
     let (kernel, threads) = if rows_per_leaf == 2 {
@@ -212,9 +212,9 @@ pub(crate) fn launch_leaves_row_major(
     rows_per_leaf: usize,
     leaves: &mut CudaViewMut<'_, u8>,
 ) -> Result<()> {
-    assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
-    assert!(num_rows >= 2 && num_rows.is_power_of_two());
-    assert!(
+    ensure!(rows_per_leaf == 1 || rows_per_leaf == 2);
+    ensure!(num_rows >= 2 && num_rows.is_power_of_two());
+    ensure!(
         col_start < col_end && col_end <= m,
         "column range in bounds"
     );
@@ -277,7 +277,7 @@ pub fn build_inner_tree_levels(
 ) -> Result<()> {
     let k = kernels()?;
     let total = tree_nodes(leaves_len) as u64;
-    assert!(
+    ensure!(
         nodes_dev.len() as u64 >= total * 32,
         "p1 tree: a node buffer of {} bytes holds no {leaves_len}-leaf tree",
         nodes_dev.len()
@@ -322,9 +322,9 @@ pub fn build_inner_tree_levels(
 /// Parity harness: the full tree over `hashed_leaves` (32 bytes each), as the
 /// host node buffer.
 pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
-    assert!(hashed_leaves.len().is_multiple_of(32));
+    ensure!(hashed_leaves.len().is_multiple_of(32));
     let leaves_len = hashed_leaves.len() / 32;
-    assert!(leaves_len >= 1);
+    ensure!(leaves_len >= 1);
     let total = tree_nodes(leaves_len);
     let be = backend()?;
     let stream = be.next_stream();
@@ -353,12 +353,12 @@ pub fn build_comp_poly_tree_from_slabs_dev_rpl(
     lde_size: usize,
     rows_per_leaf: usize,
 ) -> Result<crate::lde::GpuMerkleTree> {
-    assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
+    ensure!(rows_per_leaf == 1 || rows_per_leaf == 2);
     #[cfg(feature = "test-faults")]
     crate::faults::check_sticky(&crate::faults::FAULT_COMP_TREE_STICKY)?;
-    assert!(m > 0);
-    assert!(lde_size.is_power_of_two() && lde_size >= 2);
-    assert_eq!(buf.len(), 3 * m * lde_size, "slab buffer shape");
+    ensure!(m > 0);
+    ensure!(lde_size.is_power_of_two() && lde_size >= 2);
+    ensure_eq!(buf.len(), 3 * m * lde_size, "slab buffer shape");
     let num_leaves = lde_size / rows_per_leaf;
     let total = tree_nodes(num_leaves);
     // SAFETY: the leaf kernel writes the leaves, the level walk the rest.
@@ -396,17 +396,17 @@ pub fn build_comp_poly_tree_from_evals_ext3_keep_rpl(
 ) -> Result<crate::lde::GpuMerkleTree> {
     #[cfg(feature = "test-faults")]
     crate::faults::check_sticky(&crate::faults::FAULT_COMP_TREE_STICKY)?;
-    assert!(!parts_interleaved.is_empty());
+    ensure!(!parts_interleaved.is_empty());
     let m = parts_interleaved.len();
     let lde_size = parts_interleaved[0].len() / 3;
     for p in parts_interleaved {
-        assert_eq!(
+        ensure_eq!(
             p.len(),
             3 * lde_size,
             "ext3 buffer length must be 3 * lde_size"
         );
     }
-    assert!(lde_size.is_power_of_two() && lde_size >= 2);
+    ensure!(lde_size.is_power_of_two() && lde_size >= 2);
     let be = backend()?;
     let stream = be.next_stream();
     let staging_slot = be.pinned_staging();
@@ -425,9 +425,9 @@ pub fn build_comp_poly_tree_from_evals_ext3_keep_rpl(
 /// Parity harness: a FRI layer tree over an interleaved ext3 eval vector,
 /// `group` values a leaf (2 = the pair layer), as the host node buffer.
 pub fn build_fri_tree_from_evals_ext3(evals: &[u64], group: usize) -> Result<Vec<u8>> {
-    assert!(evals.len().is_multiple_of(3 * group));
+    ensure!(evals.len().is_multiple_of(3 * group));
     let num_leaves = evals.len() / (3 * group);
-    assert!(num_leaves >= 1);
+    ensure!(num_leaves >= 1);
     let total = tree_nodes(num_leaves);
     let be = backend()?;
     let stream = be.next_stream();
@@ -459,7 +459,7 @@ pub fn leaves_cols(
     num_rows: usize,
     rows_per_leaf: usize,
 ) -> Result<Vec<u8>> {
-    assert_eq!(columns.len(), num_cols * num_rows);
+    ensure_eq!(columns.len(), num_cols * num_rows);
     let be = backend()?;
     let stream = be.next_stream();
     let cols_dev = stream.clone_htod(columns)?;
@@ -496,12 +496,12 @@ pub fn gather_paths_dev(
     if nq == 0 {
         return Ok(Vec::new());
     }
-    assert!(
+    ensure!(
         positions.iter().all(|&p| (p as usize) < leaves_len),
         "p1 gather_paths_dev: leaf position >= leaves_len"
     );
     let total = tree_nodes(leaves_len);
-    assert!(
+    ensure!(
         nodes_dev.len() >= total * 32,
         "p1 gather: node buffer too short"
     );

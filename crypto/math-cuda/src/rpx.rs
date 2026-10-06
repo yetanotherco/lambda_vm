@@ -80,20 +80,20 @@ pub fn leaves_base(
     num_rows: usize,
     rows_per_leaf: usize,
 ) -> Result<Vec<u8>> {
-    assert!(num_rows.is_power_of_two());
-    assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
-    assert!(
+    ensure!(num_rows.is_power_of_two());
+    ensure!(rows_per_leaf == 1 || rows_per_leaf == 2);
+    ensure!(
         num_rows >= 2,
         "num_rows must be at least 2 for bit-reversed GPU leaf hashing"
     );
-    assert!(
+    ensure!(
         col_stride >= num_rows,
         "col_stride must be >= num_rows to keep per-column reads in-bounds"
     );
     let total = num_cols
         .checked_mul(col_stride)
         .expect("num_cols * col_stride overflows usize");
-    assert!(columns.len() >= total);
+    ensure!(columns.len() >= total);
     let be = backend()?;
     let stream = be.next_stream();
     let cols_dev = stream.clone_htod(&columns[..total])?;
@@ -126,13 +126,13 @@ pub fn leaves_ext3(
     num_rows: usize,
     rows_per_leaf: usize,
 ) -> Result<Vec<u8>> {
-    assert!(num_rows.is_power_of_two());
-    assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
-    assert!(
+    ensure!(num_rows.is_power_of_two());
+    ensure!(rows_per_leaf == 1 || rows_per_leaf == 2);
+    ensure!(
         num_rows >= 2,
         "num_rows must be at least 2 for bit-reversed GPU leaf hashing"
     );
-    assert!(
+    ensure!(
         col_stride >= num_rows,
         "col_stride must be >= num_rows to keep per-column reads in-bounds"
     );
@@ -140,7 +140,7 @@ pub fn leaves_ext3(
         .checked_mul(3)
         .and_then(|v| v.checked_mul(col_stride))
         .expect("num_cols * 3 * col_stride overflows usize");
-    assert!(columns.len() >= total);
+    ensure!(columns.len() >= total);
     let be = backend()?;
     let stream = be.next_stream();
     let cols_dev = stream.clone_htod(&columns[..total])?;
@@ -310,16 +310,16 @@ fn leaves_row_major_row_pair_inner(
     num_rows: usize,
     ranged: bool,
 ) -> Result<Vec<u8>> {
-    assert!(num_rows.is_power_of_two());
-    assert!(num_rows >= 2, "num_rows must be at least 2");
-    assert!(
+    ensure!(num_rows.is_power_of_two());
+    ensure!(num_rows >= 2, "num_rows must be at least 2");
+    ensure!(
         col_start < col_end && col_end <= m,
         "column range in bounds"
     );
     let total = num_rows
         .checked_mul(m)
         .expect("num_rows * m overflows usize");
-    assert!(data.len() >= total);
+    ensure!(data.len() >= total);
 
     let be = backend()?;
     let stream = be.next_stream();
@@ -712,10 +712,10 @@ pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
 /// [`build_merkle_tree_on_device`] under an explicit [`TreeWalk`] (the parity
 /// tests build every tree both ways in one process).
 pub fn build_merkle_tree_on_device_with(hashed_leaves: &[u8], walk: TreeWalk) -> Result<Vec<u8>> {
-    assert!(hashed_leaves.len().is_multiple_of(32));
+    ensure!(hashed_leaves.len().is_multiple_of(32));
     let leaves_len = hashed_leaves.len() / 32;
-    assert!(leaves_len >= 2, "tree needs at least two leaves");
-    assert!(
+    ensure!(leaves_len >= 2, "tree needs at least two leaves");
+    ensure!(
         leaves_len.is_power_of_two(),
         "leaves_len must be a power of two"
     );
@@ -765,7 +765,7 @@ pub fn build_comp_poly_tree_from_slabs_dev_rpl(
     lde_size: usize,
     rows_per_leaf: usize,
 ) -> Result<crate::lde::GpuMerkleTree> {
-    assert!(
+    ensure!(
         rows_per_leaf == 1 || rows_per_leaf == 2,
         "rows_per_leaf must be 1 or 2"
     );
@@ -773,9 +773,9 @@ pub fn build_comp_poly_tree_from_slabs_dev_rpl(
     // arms one counter and must reach it under whichever hash the build pins.
     #[cfg(feature = "test-faults")]
     crate::faults::check_sticky(&crate::faults::FAULT_COMP_TREE_STICKY)?;
-    assert!(m > 0);
-    assert!(lde_size.is_power_of_two() && lde_size >= 2);
-    assert_eq!(buf.len(), 3 * m * lde_size, "slab buffer shape");
+    ensure!(m > 0);
+    ensure!(lde_size.is_power_of_two() && lde_size >= 2);
+    ensure_eq!(buf.len(), 3 * m * lde_size, "slab buffer shape");
     let num_leaves = lde_size / rows_per_leaf;
     let tight_total_nodes = 2 * num_leaves - 1;
     let be = backend()?;
@@ -834,19 +834,19 @@ pub fn build_comp_poly_tree_from_evals_ext3_keep_rpl(
 ) -> Result<crate::lde::GpuMerkleTree> {
     #[cfg(feature = "test-faults")]
     crate::faults::check_sticky(&crate::faults::FAULT_COMP_TREE_STICKY)?;
-    assert!(!parts_interleaved.is_empty());
+    ensure!(!parts_interleaved.is_empty());
     let m = parts_interleaved.len();
     let ext3_elems = parts_interleaved[0].len() / 3;
-    assert_eq!(
+    ensure_eq!(
         parts_interleaved[0].len(),
         3 * ext3_elems,
         "ext3 buffer length must be 3 * lde_size"
     );
     for p in parts_interleaved.iter() {
-        assert_eq!(p.len(), 3 * ext3_elems);
+        ensure_eq!(p.len(), 3 * ext3_elems);
     }
     let lde_size = ext3_elems;
-    assert!(lde_size.is_power_of_two() && lde_size >= 2);
+    ensure!(lde_size.is_power_of_two() && lde_size >= 2);
 
     let be = backend()?;
     let stream = be.next_stream();
@@ -882,13 +882,13 @@ pub fn build_comp_poly_tree_from_evals_ext3_keep_rpl(
 /// through [`crate::fri::FriCommitState::fold_and_commit_layer`], which
 /// dispatches to the same two kernels.
 pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
-    assert!(
+    ensure!(
         evals.len().is_multiple_of(6),
         "evals must hold whole pair-leaves"
     );
     let num_evals = evals.len() / 3;
     let num_leaves = num_evals / 2;
-    assert!(num_leaves.is_power_of_two() && num_leaves >= 2);
+    ensure!(num_leaves.is_power_of_two() && num_leaves >= 2);
     let tight_total_nodes = 2 * num_leaves - 1;
 
     let be = backend()?;
@@ -1215,7 +1215,7 @@ pub fn permute_chain_bench(variant: u32, n: usize, k: u64, iters: usize) -> Resu
 /// Parity harness: `[mul_limb(a, b), sqr_limb(a), goldilocks::mul(a, b)]`
 /// per pair, computed by the device PTX.
 pub fn limb_probe(a: &[u64], b: &[u64]) -> Result<Vec<[u64; 3]>> {
-    assert_eq!(
+    ensure_eq!(
         a.len(),
         b.len(),
         "limb_probe: operand vectors differ in length"
@@ -1285,7 +1285,7 @@ fn random_tree_dev(
 /// warm-up — launch gaps included, as in a tree walk. A tail kernel runs every
 /// level from `n_pairs` up to the root.
 pub fn level_bench(kind: LevelKernel, n_pairs: u64, iters: usize) -> Result<f64> {
-    assert!(
+    ensure!(
         n_pairs.is_power_of_two(),
         "level_bench: n_pairs must be a power of two"
     );
@@ -1338,7 +1338,7 @@ pub fn level_bench(kind: LevelKernel, n_pairs: u64, iters: usize) -> Result<f64>
 /// under `walk`, `iters` walks back to back after an excluded warm-up (the
 /// leaves stay in place, so every walk is the same work).
 pub fn tree_bench(leaves_len: usize, walk: TreeWalk, iters: usize) -> Result<f64> {
-    assert!(leaves_len.is_power_of_two() && leaves_len >= 2);
+    ensure!(leaves_len.is_power_of_two() && leaves_len >= 2);
     let be = backend()?;
     let stream = be.next_stream();
     let mut nodes = random_tree_dev(&stream, leaves_len, leaves_len as u64)?;

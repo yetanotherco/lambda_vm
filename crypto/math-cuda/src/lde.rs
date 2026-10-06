@@ -1416,7 +1416,8 @@ pub(crate) fn launch_row_major_leaves(
                 log_num_rows,
                 leaves_out,
             ),
-            (DeviceHash::Poseidon1, _) => unreachable!("Poseidon1 leaves launched above"),
+            // Launched above (`p1_stark::launch_leaves_row_major`).
+            (DeviceHash::Poseidon1, _) => Err(crate::invalid_value()),
             (DeviceHash::Rpo256 | DeviceHash::Poseidon, _) => {
                 unimplemented!("{hash:?} device commit not yet ported (row-major row-pair leaves)")
             }
@@ -1436,7 +1437,8 @@ pub(crate) fn launch_row_major_leaves(
             &be.rpx_leaves_base_row_major_row_range,
             crate::rpx::rpx_launch_cfg(num_rows),
         ),
-        DeviceHash::Poseidon1 => unreachable!("Poseidon1 leaves launched above"),
+        // Launched above (`p1_stark::launch_leaves_row_major`).
+        DeviceHash::Poseidon1 => return Err(crate::invalid_value()),
         DeviceHash::Rpo256 | DeviceHash::Poseidon => {
             unimplemented!("{hash:?} device commit not yet ported (row-major one-row leaves)")
         }

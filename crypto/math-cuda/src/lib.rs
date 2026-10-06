@@ -5,6 +5,28 @@
 //! Everything else (`ntt`, element-wise arith) is either internal to those
 //! pipelines or used by the parity test suite.
 
+/// A launcher's precondition, refused as an error rather than a panic: the
+/// caller handed a shape the kernel does not take, which is
+/// `CUDA_ERROR_INVALID_VALUE` (the callers map a device error to a refusal or
+/// a host fallback). The message is the check's documentation; it is not
+/// evaluated.
+macro_rules! ensure {
+    ($cond:expr $(, $($msg:tt)+)?) => {
+        if !$cond {
+            return Err($crate::invalid_value());
+        }
+    };
+}
+
+/// [`ensure!`] for an equality.
+macro_rules! ensure_eq {
+    ($left:expr, $right:expr $(, $($msg:tt)+)?) => {
+        if $left != $right {
+            return Err($crate::invalid_value());
+        }
+    };
+}
+
 pub mod argue_probe;
 pub mod barycentric;
 pub mod blake3;
@@ -44,6 +66,11 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use crate::device::{Backend, backend};
 
 pub type Result<T> = std::result::Result<T, cudarc::driver::DriverError>;
+
+/// The error a refused launcher precondition returns ([`ensure!`]).
+pub(crate) fn invalid_value() -> cudarc::driver::DriverError {
+    cudarc::driver::DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE)
+}
 
 /// Which hash family a device tree build launches.
 ///
