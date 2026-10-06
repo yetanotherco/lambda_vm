@@ -24,7 +24,7 @@ use math::field::goldilocks::GoldilocksField as F;
 use multilinear::mle::Mle;
 use multilinear::whir::{self, Domain};
 use multilinear::whir_commit::{CodewordCommitment, verify_opening};
-use multilinear::whir_hash::{DeviceHashKey, KeccakWhir, RpxWhir, WhirHash};
+use multilinear::whir_hash::{DeviceHashKey, KeccakWhir, P1Whir, RpxWhir, WhirHash};
 
 type FE = FieldElement<F>;
 
@@ -162,4 +162,28 @@ fn the_device_dispatch_really_selects_the_kernel_family() {
         keccak, rpx,
         "the two kernel families produced identical trees, so the key is not being read"
     );
+}
+
+/// ★ The same under ZisK's Poseidon1: the tagged coset leaves and the 4-ary
+/// tree in the host's arity-4 layout, at every shape (odd and even depths).
+#[test]
+fn device_commit_matches_the_host_pipeline_under_p1() {
+    every_shape::<P1Whir>();
+}
+
+/// ★★ Poseidon1 is a family of its own on the device: its tree is the arity-4
+/// layout (fewer nodes than the binary heap) and its root is neither binary
+/// hash's.
+#[test]
+fn the_p1_dispatch_builds_its_own_arity_4_tree() {
+    let f = poly(12, 7);
+    let raw: Vec<u64> = f.evals().iter().map(|v| *v.value()).collect();
+    let (_, rpx) = math_cuda::whir::commit_codeword_to_host(&raw, 2, 4, device_key::<RpxWhir>())
+        .expect("device commit (needs a GPU)");
+    let (_, p1) = math_cuda::whir::commit_codeword_to_host(&raw, 2, 4, device_key::<P1Whir>())
+        .expect("device commit (needs a GPU)");
+    let leaves = 1usize << (12 + 2 - 4);
+    assert_eq!(rpx.len(), 32 * (2 * leaves - 1));
+    assert_eq!(p1.len(), 32 * math_cuda::p1_stark::tree_nodes(leaves));
+    assert_ne!(rpx[..32], p1[..32], "the roots");
 }

@@ -89,14 +89,12 @@ impl DeviceHashKey {
         }
     }
 
-    /// Whether the WHIR device paths (`crate::gpu`'s commits, paths, caps,
-    /// kept tops and re-hashes) run this key's kernels. `false` declines the
-    /// device before any launch, so the commitment is built and opened on the
-    /// host: Poseidon1's WHIR arms come with D-WHIR-P1's stage S2.
-    pub const fn has_whir_device_arm(self) -> bool {
+    /// Children per node of a tree this key's kernels build: 4 under
+    /// Poseidon1, 2 under the others.
+    pub const fn arity(self) -> usize {
         match self {
-            Self::Keccak256 | Self::Rpx256 => true,
-            Self::Poseidon1 => false,
+            Self::Keccak256 | Self::Rpx256 => 2,
+            Self::Poseidon1 => 4,
         }
     }
 

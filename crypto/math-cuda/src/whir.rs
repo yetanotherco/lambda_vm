@@ -846,6 +846,54 @@ mod fold_transient_tests {
 
 use crate::merkle::{build_inner_tree_levels, keccak_launch_cfg};
 
+/// The coset-leaf kernel `hash` runs over a base or ext3 codeword, with its
+/// launch geometry for `num_leaves` leaves. A key with no WHIR kernels is a
+/// refused launch, never another hash's kernel under its name.
+fn coset_leaf_kernel(
+    be: &crate::device::Backend,
+    hash: crate::DeviceHash,
+    base: bool,
+    num_leaves: u64,
+) -> Result<(&cudarc::driver::CudaFunction, LaunchConfig)> {
+    let kernel = match (hash, base) {
+        (crate::DeviceHash::Keccak256, true) => &be.keccak256_leaves_base_coset,
+        (crate::DeviceHash::Keccak256, false) => &be.keccak256_leaves_ext3_coset,
+        (crate::DeviceHash::Rpx256, true) => &be.rpx_leaves_base_coset,
+        (crate::DeviceHash::Rpx256, false) => &be.rpx_leaves_ext3_coset,
+        (crate::DeviceHash::Poseidon1, base) => {
+            let k = crate::p1_stark::kernels()?;
+            let kernel = if base {
+                &k.leaves_base_coset
+            } else {
+                &k.leaves_ext3_coset
+            };
+            return Ok((kernel, crate::p1_stark::launch_cfg(num_leaves)));
+        }
+        (
+            crate::DeviceHash::Blake3 | crate::DeviceHash::Rpo256 | crate::DeviceHash::Poseidon,
+            _,
+        ) => return Err(crate::invalid_value()),
+    };
+    Ok((kernel, keccak_launch_cfg(num_leaves)))
+}
+
+/// The authentication paths of `positions` against a resident tree under
+/// `hash`: `depth` siblings a path in the binary heap, three a level under
+/// Poseidon1's arity-4 layout (`crate::p1_stark::gather_paths_dev`).
+fn gather_paths(
+    hash: crate::DeviceHash,
+    nodes: &CudaSlice<u8>,
+    num_leaves: usize,
+    positions: &[u32],
+    stream: &Arc<CudaStream>,
+) -> Result<Vec<u8>> {
+    if hash.arity() == crate::p1_stark::ARITY {
+        crate::p1_stark::gather_paths_dev(nodes, num_leaves, positions, stream)
+    } else {
+        crate::merkle::gather_merkle_paths_dev(nodes, num_leaves, positions, stream)
+    }
+}
+
 /// A codeword the device holds, base-field or ext3.
 ///
 /// The commit leaves one here and the chain folds it here: it is the biggest
@@ -925,7 +973,8 @@ impl DeviceCodeword {
     ///
     /// A leaf is the `2^log_folding` coset that folds onto one position, and
     /// the layout is the host's: `2*num_leaves - 1` nodes of 32 bytes, root
-    /// first.
+    /// first — or, under [`crate::DeviceHash::Poseidon1`], the host's arity-4
+    /// layout ([`crate::tree_nodes`] nodes, the leaves last).
     fn build_tree(
         &self,
         log_folding: usize,
@@ -934,12 +983,12 @@ impl DeviceCodeword {
         let num_leaves = self.elements >> log_folding;
         assert!(num_leaves >= 2, "tree needs at least two leaves");
         let be = backend()?;
-        let total_nodes = 2 * num_leaves - 1;
+        let total_nodes = crate::tree_nodes(hash, num_leaves);
         // SAFETY: every byte is written before it is read — the leaves by the
         // kernel below, the inner nodes by the level loop after it.
         let mut nodes =
             unsafe { crate::device::alloc_or_trim::<u8>(&self.stream, total_nodes * 32) }?;
-        let leaves_offset = (num_leaves - 1) * 32;
+        let leaves_offset = crate::leaves_offset(hash, num_leaves) * 32;
         // ★ THE ONE BRANCH THIS CHANGE ADDS. A matching layer means the leaf
         // pass is a device-to-device copy instead of a hash of every element;
         // the inner levels below are built either way, so `build_tree` still
@@ -956,15 +1005,7 @@ impl DeviceCodeword {
                 // label the result. `hash` is the key the caller's `WhirHash`
                 // supplied, so a tree labelled RPX was hashed by RPX's kernels or
                 // was not built here at all.
-                let kernel = match (hash, self.base) {
-                    (crate::DeviceHash::Keccak256, true) => &be.keccak256_leaves_base_coset,
-                    (crate::DeviceHash::Keccak256, false) => &be.keccak256_leaves_ext3_coset,
-                    (crate::DeviceHash::Rpx256, true) => &be.rpx_leaves_base_coset,
-                    (crate::DeviceHash::Rpx256, false) => &be.rpx_leaves_ext3_coset,
-                    (other, _) => {
-                        unimplemented!("no WHIR kernels for {} ({other:?})", other.name())
-                    }
-                };
+                let (kernel, cfg) = coset_leaf_kernel(be, hash, self.base, num_leaves_u64)?;
                 unsafe {
                     self.stream
                         .launch_builder(kernel)
@@ -972,7 +1013,7 @@ impl DeviceCodeword {
                         .arg(&num_leaves_u64)
                         .arg(&block)
                         .arg(&mut leaves)
-                        .launch(keccak_launch_cfg(num_leaves_u64))?;
+                        .launch(cfg)?;
                 }
             }
             // The borrow of `nodes` ends at the brace above, which is what lets
@@ -1083,7 +1124,9 @@ impl DeviceCodeword {
         if held.as_ref().is_some_and(|kept| kept.whole) {
             return Some(nodes);
         }
-        let bytes = tree_bytes(num_leaves.trailing_zeros() as usize);
+        // `tree_bytes` for a binary tree; the arity-4 layout's own count
+        // under Poseidon1.
+        let bytes = (crate::tree_nodes(hash, num_leaves) * 32) as u64;
         RETAIN_BYTES_ASKED.fetch_add(bytes, Ordering::Relaxed);
         let kept = match KeptNodes::promise(nodes, bytes, &self.room) {
             Ok(kept) => kept,
@@ -1269,7 +1312,13 @@ impl DeviceCodeword {
         {
             // The budget would not take the whole tree: keep its leaf layer, as
             // without the switch (a no-op when a layer is already held).
-            self.capture_leaves(&nodes, (num_leaves - 1) * 32, num_leaves, log_folding, hash);
+            self.capture_leaves(
+                &nodes,
+                crate::leaves_offset(hash, num_leaves) * 32,
+                num_leaves,
+                log_folding,
+                hash,
+            );
         }
         Ok(out)
     }
@@ -1353,7 +1402,8 @@ impl DeviceCodeword {
     /// The first `nodes` nodes of the tree in the host layout (root first):
     /// its top levels, which is what a prover that lets the codeword go keeps
     /// to answer the paths later. `nodes` must be `2^(t+1) − 1` for some level
-    /// `t` of the tree.
+    /// `t` of the tree — under Poseidon1, the arity-4 layout's top `t` levels
+    /// ([`crate::p1_stark::top_levels_nodes`]); anything else is refused.
     pub fn top_nodes_to_host(
         &self,
         log_folding: usize,
@@ -1361,10 +1411,18 @@ impl DeviceCodeword {
         nodes: usize,
     ) -> Result<Vec<u8>> {
         self.with_tree(log_folding, hash, |tree, num_leaves| {
-            assert!(
-                (nodes + 1).is_power_of_two() && nodes < 2 * num_leaves,
-                "{nodes} nodes are not whole top levels of a tree of {num_leaves} leaves"
-            );
+            if hash.arity() == crate::p1_stark::ARITY {
+                let levels = crate::p1_stark::level_sizes(num_leaves).len();
+                ensure!(
+                    (1..=levels).any(|t| crate::p1_stark::top_levels_nodes(num_leaves, t) == nodes),
+                    "not whole top levels of an arity-4 tree"
+                );
+            } else {
+                assert!(
+                    (nodes + 1).is_power_of_two() && nodes < 2 * num_leaves,
+                    "{nodes} nodes are not whole top levels of a tree of {num_leaves} leaves"
+                );
+            }
             let out = self.stream.clone_dtoh(&tree.slice(0..nodes * 32))?;
             self.stream.synchronize()?;
             Ok(out)
@@ -1385,7 +1443,7 @@ impl DeviceCodeword {
         hash: crate::DeviceHash,
     ) -> Result<Vec<u8>> {
         self.with_tree(log_folding, hash, |nodes, num_leaves| {
-            crate::merkle::gather_merkle_paths_dev(nodes, num_leaves, positions, &self.stream)
+            gather_paths(hash, nodes, num_leaves, positions, &self.stream)
         })
     }
 
@@ -1406,14 +1464,25 @@ impl DeviceCodeword {
         hash: crate::DeviceHash,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         self.with_tree(log_folding, hash, |nodes, num_leaves| {
-            assert!(
-                num_leaves.is_power_of_two() && cap_height <= num_leaves.trailing_zeros() as usize,
-                "a cap of height {cap_height} does not fit a tree of {num_leaves} leaves"
-            );
-            let paths =
-                crate::merkle::gather_merkle_paths_dev(nodes, num_leaves, positions, &self.stream)?;
-            let start = ((1usize << cap_height) - 1) * 32;
-            let end = ((2usize << cap_height) - 1) * 32;
+            let (start, end) = if hash.arity() == crate::p1_stark::ARITY {
+                // The real nodes of the 4-ary level `cap_height` below the root.
+                let sizes = crate::p1_stark::level_sizes(num_leaves);
+                ensure!(cap_height < sizes.len(), "a cap taller than the tree");
+                let level = sizes.len() - 1 - cap_height;
+                let at = crate::p1_stark::level_offsets(&sizes)[level];
+                (at * 32, (at + sizes[level]) * 32)
+            } else {
+                assert!(
+                    num_leaves.is_power_of_two()
+                        && cap_height <= num_leaves.trailing_zeros() as usize,
+                    "a cap of height {cap_height} does not fit a tree of {num_leaves} leaves"
+                );
+                (
+                    ((1usize << cap_height) - 1) * 32,
+                    ((2usize << cap_height) - 1) * 32,
+                )
+            };
+            let paths = gather_paths(hash, nodes, num_leaves, positions, &self.stream)?;
             let cap = self.stream.clone_dtoh(&nodes.slice(start..end))?;
             self.stream.synchronize()?;
             Ok((paths, cap))
@@ -1477,8 +1546,15 @@ impl DeviceCodeword {
     ) -> Result<Vec<u8>> {
         assert!(!blocks.is_empty(), "a round opens at least one block");
         let num_leaves = self.elements >> log_folding;
-        let span = 1u64 << dropped;
-        let real = blocks.len() << dropped;
+        // `dropped` counts the tree's own levels: a block is `2^dropped`
+        // leaves, or `4^dropped` under Poseidon1 (whose nodes, `dropped`
+        // 4-ary levels up, are then the blocks' roots in the arity-4 layout).
+        let span = if hash.arity() == crate::p1_stark::ARITY {
+            1u64 << (2 * dropped)
+        } else {
+            1u64 << dropped
+        };
+        let real = blocks.len() * span as usize;
         let leaves = real.next_power_of_two().max(2);
         let mut indices: Vec<u64> = blocks
             .iter()
@@ -1511,22 +1587,14 @@ impl DeviceCodeword {
                 .arg(&mut gathered)
                 .launch(LaunchConfig::for_num_elems((leaves as u64 * block) as u32))?;
         }
-        let total_nodes = 2 * leaves - 1;
+        let total_nodes = crate::tree_nodes(hash, leaves);
         // SAFETY: every byte is written before it is read — the leaves by the
         // kernel below, the inner nodes by the level loop after it.
         let mut nodes = unsafe { alloc_or_trim::<u8>(&self.stream, total_nodes * 32) }?;
-        let leaves_offset = (leaves - 1) * 32;
+        let leaves_offset = crate::leaves_offset(hash, leaves) * 32;
         {
             let mut out = nodes.slice_mut(leaves_offset..leaves_offset + leaves * 32);
-            let kernel = match (hash, self.base) {
-                (crate::DeviceHash::Keccak256, true) => &be.keccak256_leaves_base_coset,
-                (crate::DeviceHash::Keccak256, false) => &be.keccak256_leaves_ext3_coset,
-                (crate::DeviceHash::Rpx256, true) => &be.rpx_leaves_base_coset,
-                (crate::DeviceHash::Rpx256, false) => &be.rpx_leaves_ext3_coset,
-                (other, _) => {
-                    unimplemented!("no WHIR kernels for {} ({other:?})", other.name())
-                }
-            };
+            let (kernel, cfg) = coset_leaf_kernel(be, hash, self.base, leaves_u64)?;
             unsafe {
                 self.stream
                     .launch_builder(kernel)
@@ -1534,7 +1602,7 @@ impl DeviceCodeword {
                     .arg(&leaves_u64)
                     .arg(&block)
                     .arg(&mut out)
-                    .launch(keccak_launch_cfg(leaves_u64))?;
+                    .launch(cfg)?;
             }
         }
         build_inner_tree_levels(self.stream.as_ref(), be, &mut nodes, leaves, hash)?;
@@ -2267,29 +2335,24 @@ pub fn commit_codeword_ext3(
     let stream = be.next_stream();
     let values = stream.clone_htod(codeword)?;
 
-    let total_nodes = 2 * num_leaves - 1;
+    let total_nodes = crate::tree_nodes(hash, num_leaves);
     // SAFETY: every byte is written before it is read — the leaves by the
     // kernel below, the inner nodes by the level loop after it.
     let mut nodes = unsafe { alloc_or_trim::<u8>(&stream, total_nodes * 32) }?;
     {
-        let leaves_offset = (num_leaves - 1) * 32;
+        let leaves_offset = crate::leaves_offset(hash, num_leaves) * 32;
         let mut leaves = nodes.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
         let num_leaves_u64 = num_leaves as u64;
         let block = 1u64 << log_folding;
+        let (kernel, cfg) = coset_leaf_kernel(be, hash, false, num_leaves_u64)?;
         unsafe {
             stream
-                .launch_builder(match hash {
-                    crate::DeviceHash::Keccak256 => &be.keccak256_leaves_ext3_coset,
-                    crate::DeviceHash::Rpx256 => &be.rpx_leaves_ext3_coset,
-                    other => {
-                        unimplemented!("no WHIR kernels for {} ({other:?})", other.name())
-                    }
-                })
+                .launch_builder(kernel)
                 .arg(&values)
                 .arg(&num_leaves_u64)
                 .arg(&block)
                 .arg(&mut leaves)
-                .launch(keccak_launch_cfg(num_leaves_u64))?;
+                .launch(cfg)?;
         }
     }
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes, num_leaves, hash)?;
