@@ -1087,11 +1087,21 @@ impl KeptRest {
         }
     }
 
-    /// Each list's (name, heap bytes, largest single allocation).
+    /// Each list's (name, heap bytes, largest single allocation). ECSM's
+    /// counts the steps' buffer each op's witness owns as well.
     fn sizes(&self) -> [(&'static str, usize, usize); 9] {
         fn of<T>(name: &'static str, list: &BlockVec<T>) -> (&'static str, usize, usize) {
             (name, list.heap_bytes(), list.largest_bytes())
         }
+        let ecsm = {
+            let (name, bytes, largest) = of("ecsm", &self.ecsm_ops);
+            let (steps, most) = self
+                .ecsm_ops
+                .iter()
+                .map(super::ecsm::EcsmOperation::steps_heap_bytes)
+                .fold((0, 0), |(sum, most), b| (sum + b, most.max(b)));
+            (name, bytes + steps, largest.max(most))
+        };
         [
             of("bitwise", &self.bitwise_ops),
             of("commit", &self.commit_ops),
@@ -1099,7 +1109,7 @@ impl KeptRest {
             of("blake3", &self.blake3_ops),
             of("blake3_absorb", &self.blake3_absorb_ops),
             of("cpu32", &self.cpu32_ops),
-            of("ecsm", &self.ecsm_ops),
+            ecsm,
             of("ecdas", &self.ecdas_ops),
             of("hint", &self.hint_ops),
         ]
@@ -1739,5 +1749,39 @@ mod block_tests {
             super::ECDAS_BLOCK_ROWS,
             1usize << crate::block_whir::BLOCK_ECDAS_ROWS_LOG2
         );
+    }
+
+    /// The kept ECSM ops' size counts the steps' buffer each witness owns, so
+    /// the memory log names it.
+    #[test]
+    fn the_kept_ecsm_size_counts_the_witness_steps() {
+        let mut gx = [
+            0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87,
+            0x0B, 0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B,
+            0x16, 0xF8, 0x17, 0x98,
+        ];
+        gx.reverse();
+        let mut k = [0u8; 32];
+        k[..8].copy_from_slice(&1_000_003u64.to_le_bytes());
+        let witness = ::ecsm::compute_witness(&k, &gx).expect("a valid scalar and point");
+        let mut rest = super::KeptRest::new(&crate::tables::MaxRowsConfig::default());
+        let op = crate::tables::ecsm::EcsmOperation {
+            timestamp: 7,
+            addr_xg: 0x2000,
+            addr_k: 0x3000,
+            addr_xr: 0x1000,
+            witness,
+        };
+        let kept = op.clone();
+        let steps = kept.witness.steps.capacity() * std::mem::size_of::<::ecsm::EcdasStep>();
+        assert!(steps > 0);
+        rest.ecsm_ops.push(kept);
+        let mut bare = op;
+        bare.witness.steps = Vec::new();
+        rest.ecsm_ops.push(bare);
+        let (name, bytes, largest) = rest.sizes()[6];
+        assert_eq!(name, "ecsm");
+        assert_eq!(bytes, rest.ecsm_ops.heap_bytes() + steps);
+        assert_eq!(largest, rest.ecsm_ops.largest_bytes().max(steps));
     }
 }

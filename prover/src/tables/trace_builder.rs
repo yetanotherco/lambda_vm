@@ -899,6 +899,11 @@ impl WalkOutputs {
             + vec_heap_bytes(&self.blake3_absorb_ops)
             + vec_heap_bytes(&self.cpu32_ops)
             + vec_heap_bytes(&self.ecsm_ops)
+            + self
+                .ecsm_ops
+                .iter()
+                .map(ecsm::EcsmOperation::steps_heap_bytes)
+                .sum::<usize>()
             + vec_heap_bytes(&self.ecdas_ops)
             + vec_heap_bytes(&self.hint_ops)
     }
