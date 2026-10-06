@@ -108,6 +108,7 @@ fn key<H: WhirHash>() -> DeviceHash {
     match H::DEVICE {
         DeviceHashKey::Keccak256 => DeviceHash::Keccak256,
         DeviceHashKey::Rpx256 => DeviceHash::Rpx256,
+        DeviceHashKey::Poseidon1 => DeviceHash::Poseidon1,
     }
 }
 

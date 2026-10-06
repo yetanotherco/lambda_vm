@@ -1904,6 +1904,9 @@ where
     if std::any::TypeId::of::<F>() != std::any::TypeId::of::<Ext3>() {
         return None;
     }
+    if !hash.has_whir_device_arm() {
+        return None;
+    }
     if codeword.len() < COMMIT_THRESHOLD || codeword.len() >> log_folding < 2 {
         return None;
     }
@@ -5173,6 +5176,9 @@ where
     if std::any::TypeId::of::<F>() != std::any::TypeId::of::<GoldilocksField>() {
         return None;
     }
+    if !hash.has_whir_device_arm() {
+        return None;
+    }
     if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
         return None;
     }
@@ -5230,6 +5236,9 @@ pub(crate) fn commit_resident(
     transient: bool,
     hash: crate::whir_hash::DeviceHashKey,
 ) -> Option<(DeviceCodeword, [u8; 32])> {
+    if !hash.has_whir_device_arm() {
+        return None;
+    }
     if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
         return None;
     }
@@ -5436,6 +5445,9 @@ impl DeviceCodeword {
         log_folding: usize,
         hash: crate::whir_hash::DeviceHashKey,
     ) -> Option<[u8; 32]> {
+        if !hash.has_whir_device_arm() {
+            return None;
+        }
         let root = self.0.commit(log_folding, hash.into_math_cuda()).ok()?;
         COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
         Some(root)
@@ -5455,6 +5467,9 @@ impl DeviceCodeword {
         nodes: usize,
         hash: crate::whir_hash::DeviceHashKey,
     ) -> Option<Vec<[u8; 32]>> {
+        if !hash.has_whir_device_arm() {
+            return None;
+        }
         let bytes = self
             .0
             .top_nodes_to_host(log_folding, hash.into_math_cuda(), nodes)
@@ -5469,6 +5484,9 @@ impl DeviceCodeword {
         indices: &[usize],
         hash: crate::whir_hash::DeviceHashKey,
     ) -> Option<Vec<Vec<[u8; 32]>>> {
+        if !hash.has_whir_device_arm() {
+            return None;
+        }
         let leaves = self.0.elements() >> log_folding;
         if indices.iter().any(|index| *index >= leaves) {
             return None;
@@ -5494,6 +5512,9 @@ impl DeviceCodeword {
         cap_height: usize,
         hash: crate::whir_hash::DeviceHashKey,
     ) -> Option<PathsAndCap> {
+        if !hash.has_whir_device_arm() {
+            return None;
+        }
         let leaves = self.0.elements() >> log_folding;
         let depth = leaves.trailing_zeros() as usize;
         if indices.iter().any(|index| *index >= leaves) || cap_height > depth {
@@ -5549,6 +5570,9 @@ impl DeviceCodeword {
         dropped: usize,
         hash: crate::whir_hash::DeviceHashKey,
     ) -> Option<Vec<[u8; 32]>> {
+        if !hash.has_whir_device_arm() {
+            return None;
+        }
         let blocks: Vec<u64> = blocks.iter().map(|block| *block as u64).collect();
         let bytes = self
             .0
