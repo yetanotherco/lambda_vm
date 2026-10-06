@@ -98,7 +98,9 @@ impl Want {
     /// The shape alone: rows, column widths and bytes. Always checked, so a
     /// deposit can never be widened into a buffer of another size.
     fn same_shape(&self, packed: &NarrowColumns) -> bool {
-        self.rows == packed.rows() && self.widths == packed.widths() && self.len == packed.data().len()
+        self.rows == packed.rows()
+            && self.widths == packed.widths()
+            && self.len == packed.data().len()
     }
 }
 
