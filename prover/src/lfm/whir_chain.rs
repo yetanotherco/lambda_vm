@@ -167,10 +167,19 @@ pub struct ChainShape {
     pub caps: Vec<usize>,
     /// Which nonces a round's arena words carry (P2): the config's own.
     pub nonces: NonceLayout,
+    /// Children per Merkle node: 2, or 4 for a Poseidon1 base's trees, whose
+    /// caps then count 4-ary levels (`ChainConfig::tree_caps_at`).
+    pub arity: usize,
 }
 
 impl ChainShape {
     pub fn new(config: &ChainConfig, num_vars: usize) -> Self {
+        Self::new_at(config, num_vars, 2)
+    }
+
+    /// [`Self::new`] over trees of `arity` children per node: the hash's
+    /// arity, as the host's prover and verifier take it.
+    pub fn new_at(config: &ChainConfig, num_vars: usize, arity: usize) -> Self {
         let schedule = config.schedule(num_vars);
         let mut domain_log = Vec::with_capacity(schedule.len());
         let mut d = num_vars + config.log_blowup;
@@ -178,7 +187,7 @@ impl ChainShape {
             domain_log.push(d);
             d -= k;
         }
-        let caps = config.tree_caps(num_vars);
+        let caps = config.tree_caps_at(num_vars, arity);
         debug_assert_eq!(caps.len(), schedule.len(), "one cap height per tree");
         Self {
             schedule,
@@ -192,6 +201,7 @@ impl ChainShape {
                 config.grind.query as usize,
             ),
             nonces: config.format.nonces,
+            arity,
         }
     }
 
@@ -239,7 +249,55 @@ impl ChainShape {
 
     /// Siblings on a path to round `r`'s current tree's cap.
     pub fn current_path(&self, r: usize) -> usize {
-        self.current_depth(r) - self.caps[r]
+        self.path_words(self.current_depth(r), self.caps[r])
+    }
+
+    /// Sibling words one opening's path to a height-`c` cap carries in a tree
+    /// of `depth` index bits: `depth − c` at arity 2, three a walked 4-ary
+    /// level and one at an uncapped odd top at arity 4
+    /// ([`super::merkle_cap::path_hints`]).
+    pub fn path_words(&self, depth: usize, c: usize) -> usize {
+        if self.arity == 4 {
+            super::merkle_cap::path_hints(depth, c, 4)
+        } else {
+            depth - c
+        }
+    }
+
+    /// Words a height-`c` cap of a tree of `depth` index bits occupies: `2^c`
+    /// at arity 2, its real nodes at arity 4
+    /// ([`super::merkle_cap::cap_nodes`]); none uncapped.
+    pub fn cap_words(&self, depth: usize, c: usize) -> usize {
+        match (c, self.arity) {
+            (0, _) => 0,
+            (_, 4) => super::merkle_cap::cap_nodes(depth, c, 4),
+            _ => 1usize << c,
+        }
+    }
+
+    /// Permutations one opening of `felts` felts costs against a height-`c`
+    /// cap of a tree of `depth` index bits: the leaf's blocks and a node a
+    /// walked level (`Hash16` rows at arity 4: rate-12 blocks, 4-ary levels).
+    pub fn opening_perms(&self, felts: usize, depth: usize, c: usize) -> usize {
+        if self.arity == 4 {
+            felts.div_ceil(super::p1w16_emit::RATE_FELTS)
+                + super::merkle_cap::path_permutations(depth, c, 4)
+        } else {
+            verify_opening_perms_capped(felts, depth, c)
+        }
+    }
+
+    /// Permutations a height-`c` cap of a tree of `depth` index bits costs up
+    /// to its root, once a tree.
+    pub fn cap_perms(&self, depth: usize, c: usize) -> usize {
+        match (c, self.arity) {
+            (0, _) => 0,
+            (_, 4) => super::merkle_cap::cap_root_permutations(
+                super::merkle_cap::cap_nodes(depth, c, 4),
+                4,
+            ),
+            _ => cap_check_perms(c),
+        }
     }
 
     /// The successor tree's cap height at round `r`.
@@ -272,14 +330,10 @@ impl ChainShape {
 pub fn chain_opening_perms(shape: &ChainShape) -> usize {
     let mut per_query = 0;
     for r in 0..shape.rounds() {
-        per_query += verify_opening_perms_capped(
-            shape.current_felts(r),
-            shape.current_depth(r),
-            shape.caps[r],
-        );
+        per_query +=
+            shape.opening_perms(shape.current_felts(r), shape.current_depth(r), shape.caps[r]);
         if let Some(depth) = shape.next_depth(r) {
-            per_query +=
-                verify_opening_perms_capped(3 << shape.schedule[r + 1], depth, shape.caps[r + 1]);
+            per_query += shape.opening_perms(3 << shape.schedule[r + 1], depth, shape.caps[r + 1]);
         }
     }
     shape.num_queries * per_query + chain_cap_perms(shape)
@@ -289,7 +343,9 @@ pub fn chain_opening_perms(shape: &ChainShape) -> usize {
 /// to its root once, `2^c − 1` parents. Zero at the default. Part of
 /// [`chain_opening_perms`], stated apart so the per-tree term is visible.
 pub fn chain_cap_perms(shape: &ChainShape) -> usize {
-    shape.caps.iter().map(|&c| cap_check_perms(c)).sum()
+    (0..shape.rounds())
+        .map(|r| shape.cap_perms(shape.current_depth(r), shape.caps[r]))
+        .sum()
 }
 
 /// INSTRUCTIONS one chain's query phase costs: per round, per query, the two
@@ -397,6 +453,11 @@ const fn grind_fixed(bits: usize) -> usize {
 /// terms it comes from so a config that grinds in only one place still reads
 /// correctly.
 pub fn chain_grind_perms(shape: &ChainShape) -> usize {
+    if shape.arity == 4 {
+        // The width-8 grind is ALU instructions, not socket rows; the
+        // `state()` it reads is in the schedule.
+        return 0;
+    }
     let (folding, ood, query) = shape.grind;
     let rounds = shape.rounds();
     let checks = rounds * usize::from(folding > 0)
@@ -456,7 +517,7 @@ pub fn chain_sponge(shape: &ChainShape, sponge: &mut SpongeSchedule) {
         }
         match shape.next_depth(r) {
             Some(_) => {
-                sponge.absorb(super::whir_transcript::DIGEST_FELTS);
+                sponge.absorb_root();
                 sponge.draw_ext();
                 sponge.absorb(COORDINATES_PER_EXT);
                 sponge.grind(ood);
@@ -477,18 +538,17 @@ pub fn chain_sponge(shape: &ChainShape, sponge: &mut SpongeSchedule) {
 /// INSTRUCTIONS the schedule costs: the `Pack`s that build each hash's words
 /// and the `Unpack` a squeeze spends reading its digest.
 pub fn chain_schedule_rows(shape: &ChainShape, entry: SpongeEntry) -> usize {
-    chain_hash_schedule(shape, entry)
-        .iter()
-        .map(|hash| hash.rows())
-        .sum()
+    let mut sponge = SpongeSchedule::new(entry);
+    chain_sponge(shape, &mut sponge);
+    sponge.rows()
 }
 
-/// PERMUTATIONS the schedule costs: one per rate-8 block of every hash.
+/// PERMUTATIONS the schedule costs: one per rate-8 block of every hash (a
+/// `Hash16` row per Poseidon1 permutation).
 pub fn chain_schedule_perms(shape: &ChainShape, entry: SpongeEntry) -> usize {
-    chain_hash_schedule(shape, entry)
-        .iter()
-        .map(|hash| hash.perms())
-        .sum()
+    let mut sponge = SpongeSchedule::new(entry);
+    chain_sponge(shape, &mut sponge);
+    sponge.perms()
 }
 
 /// ★ INSTRUCTIONS one chain costs, whole: the shape half and the schedule half.
@@ -579,7 +639,14 @@ pub fn emit_verify_weighted(
     let mut alphas: Vec<Ext> = Vec::with_capacity(shape.num_vars);
     // Tree 0: its cap (when it has one) is authenticated against the root
     // here, once; every later tree where its root is absorbed.
-    let mut current_tree = tree_auth(b, shape.caps[0], rounds[0].current_cap, root_lanes);
+    let mut current_tree = tree_auth(
+        b,
+        shape,
+        shape.current_depth(0),
+        shape.caps[0],
+        rounds[0].current_cap,
+        root_lanes,
+    );
     let mut current_domain = domain.clone();
     // Each out-of-domain claim: its batching weight, its point, and how many
     // variables were bound when it entered.
@@ -617,7 +684,7 @@ pub fn emit_verify_weighted(
         let next_tree = match (round.next_root, round.ood_value, shape.next_depth(r)) {
             (Some(next_root), Some(y0), Some(_)) => {
                 let lanes = b.unpack(next_root);
-                transcript.absorb_felts(b, &lanes);
+                transcript.absorb_root_lanes(b, &lanes);
 
                 let z0 = transcript.sample_ext(b);
 
@@ -641,7 +708,14 @@ pub fn emit_verify_weighted(
                 ood.push((gamma, ood_point, bound));
 
                 emit_spent_grind(b, transcript, grind_query, round.nonces.query);
-                Some(tree_auth(b, shape.caps[r + 1], round.next_cap, &lanes))
+                Some(tree_auth(
+                    b,
+                    shape,
+                    shape.current_depth(r + 1),
+                    shape.caps[r + 1],
+                    round.next_cap,
+                    &lanes,
+                ))
             }
             (None, None, None) => {
                 assert!(round.next_cap.is_empty(), "the last round has no successor");
@@ -712,6 +786,8 @@ fn emit_spent_grind(
 /// tree's [`CapCells`] are made.
 fn tree_auth(
     b: &mut LfmBuilder,
+    shape: &ChainShape,
+    depth: usize,
     cap_height: usize,
     cap: &[WrapDigest],
     root_lanes: &[Felt; 4],
@@ -719,6 +795,18 @@ fn tree_auth(
     if cap_height == 0 {
         assert!(cap.is_empty(), "an uncapped tree carries no cap wires");
         TreeAuth::Root(*root_lanes)
+    } else if shape.arity == 4 {
+        assert_eq!(
+            cap.len(),
+            shape.cap_words(depth, cap_height),
+            "a 4-ary cap is its level's real nodes"
+        );
+        TreeAuth::Cap(CapCells::authenticate_at(
+            b,
+            cap,
+            cap_height,
+            std::slice::from_ref(root_lanes),
+        ))
     } else {
         assert_eq!(cap.len(), 1usize << cap_height, "a cap is 2^c digests");
         TreeAuth::Cap(CapCells::authenticate(
@@ -973,7 +1061,7 @@ impl RoundStorage {
             // W1: tree 0's cap, right after round 0's nonces (the words the
             // owner path carried after its siblings).
             let current_cap: Vec<WrapDigest> = if r == 0 {
-                (0..cap_words(shape.caps[0]))
+                (0..shape.cap_words(shape.current_depth(0), shape.caps[0]))
                     .map(|_| WrapDigest::from_cell(next_word(b, &mut at)))
                     .collect()
             } else {
@@ -1014,10 +1102,11 @@ impl RoundStorage {
                     let nr = next_word(b, &mut at);
                     let ov = next_word(b, &mut at).as_ext();
                     // W1: the successor's cap, after its root and ood value.
-                    let next_cap: Vec<WrapDigest> = (0..cap_words(shape.caps[r + 1]))
+                    let next_cap: Vec<WrapDigest> = (0..shape
+                        .cap_words(next_depth, shape.caps[r + 1]))
                         .map(|_| WrapDigest::from_cell(next_word(b, &mut at)))
                         .collect();
-                    let next_depth = next_depth - shape.caps[r + 1];
+                    let next_depth = shape.path_words(next_depth, shape.caps[r + 1]);
                     let next_block = 1usize << shape.schedule[r + 1];
                     let next: Vec<(Vec<Ext>, Vec<WrapDigest>)> = (0..shape.num_queries)
                         .map(|_| {
@@ -1133,22 +1222,17 @@ pub fn round_words(shape: &ChainShape, r: usize) -> u32 {
     n += (shape.num_queries * (block + depth)) as u32;
     if r == 0 {
         // W1: tree 0's cap words.
-        n += cap_words(shape.caps[0]) as u32;
+        n += shape.cap_words(shape.current_depth(0), shape.caps[0]) as u32;
     }
     if let Some(next_depth) = shape.next_depth(r) {
         // The successor root, its out-of-domain value, its cap, and per query
         // its block and path.
-        n += 2 + cap_words(shape.caps[r + 1]) as u32;
+        let c = shape.caps[r + 1];
+        n += 2 + shape.cap_words(next_depth, c) as u32;
         let next_block = 1usize << shape.schedule[r + 1];
-        n += (shape.num_queries * (next_block + next_depth - shape.caps[r + 1])) as u32;
+        n += (shape.num_queries * (next_block + shape.path_words(next_depth, c))) as u32;
     }
     n
-}
-
-/// Words a tree's cap occupies in the arena: `2^c` one-word digests, none at
-/// `c = 0` (an uncapped tree is checked against its root).
-fn cap_words(cap: usize) -> usize {
-    if cap == 0 { 0 } else { 1usize << cap }
 }
 
 /// One chain's round wires, in the order [`RoundStorage::hint`] reads them.
@@ -1179,33 +1263,65 @@ pub fn push_round_words(
         }
         // W1: round 0 owns tree 0, whose cap rides at the end of its first
         // current path; it goes to the arena here and the path goes without it.
-        let current_cap = if r == 0 { cap_words(shape.caps[0]) } else { 0 };
-        push_openings(words, round, true, current_cap);
-        if shape.next_depth(r).is_some() {
+        let current = PathSide {
+            depth: shape.current_depth(r),
+            cap: shape.caps[r],
+            owner: r == 0,
+        };
+        push_openings(words, shape, round, true, current);
+        if let Some(next_depth) = shape.next_depth(r) {
             words.push(commitment_to_digest(
                 round.next_root.as_ref().expect("a successor root"),
             ));
             words.push(ext_word(
                 round.ood_value.as_ref().expect("an out-of-domain value"),
             ));
-            push_openings(words, round, false, cap_words(shape.caps[r + 1]));
+            let next = PathSide {
+                depth: next_depth,
+                cap: shape.caps[r + 1],
+                owner: true,
+            };
+            push_openings(words, shape, round, false, next);
         }
     }
 }
 
+/// One side's tree, as its openings' paths are laid out: its index bits, its
+/// cap height, and whether its first opening is the tree's owner (carries the
+/// cap after its siblings, W1).
+#[derive(Clone, Copy)]
+struct PathSide {
+    depth: usize,
+    cap: usize,
+    owner: bool,
+}
+
 /// One round's query openings, current or successor, block then path.
 ///
-/// `owner_cap` is the number of cap words the side's FIRST opening carries at
+/// The side's FIRST opening, when it is the owner, carries the cap's words at
 /// the end of its path (the owner-path encoding, W1): they are written first,
-/// ahead of every block, and the path is written without them. Zero at the
+/// ahead of every block, and the path is written without them. No cap at the
 /// default. A malformed path is not repaired here: its words are written as
 /// they are, and the arena's length (a verifier constant) refuses it.
+///
+/// At arity 4 each path keeps the proof's child order and an uncapped
+/// odd-depth top keeps only its partner ([`super::merkle_cap::child_path_to_cap`]).
 fn push_openings(
     words: &mut Vec<LfmWord>,
+    shape: &ChainShape,
     round: &ChainRound<GoldilocksField, GoldilocksExtension>,
     current: bool,
-    owner_cap: usize,
+    tree: PathSide,
 ) {
+    let owner_cap = if tree.owner {
+        shape.cap_words(tree.depth, tree.cap)
+    } else {
+        0
+    };
+    if shape.arity == 4 {
+        push_openings4(words, round, current, tree);
+        return;
+    }
     fn side<V>(
         words: &mut Vec<LfmWord>,
         openings: &[multilinear::whir_commit::CosetOpening<V>],
@@ -1250,6 +1366,70 @@ fn push_openings(
         RoundOpenings::Extension(p) => {
             let openings = if current { &p.current } else { &p.next };
             side(words, openings, owner_cap, ext_word);
+        }
+    }
+}
+
+/// [`push_openings`] at arity 4: the owner's cap, then per opening its block
+/// and its path in child order, cut to the cap.
+fn push_openings4(
+    words: &mut Vec<LfmWord>,
+    round: &ChainRound<GoldilocksField, GoldilocksExtension>,
+    current: bool,
+    tree: PathSide,
+) {
+    fn side<V>(
+        words: &mut Vec<LfmWord>,
+        openings: &[multilinear::whir_commit::CosetOpening<V>],
+        tree: PathSide,
+        value_word: impl Fn(&math::field::element::FieldElement<V>) -> LfmWord,
+    ) where
+        V: math::field::traits::IsField,
+    {
+        let laid: Vec<(Vec<_>, Option<Vec<_>>)> = openings
+            .iter()
+            .enumerate()
+            .map(|(i, o)| {
+                let path = &o.proof.merkle_path;
+                super::merkle_cap::child_path_to_cap(
+                    path,
+                    tree.depth,
+                    tree.cap,
+                    4,
+                    tree.owner && i == 0,
+                )
+                // A path of another shape goes in as it is: the arena's length
+                // refuses it.
+                .unwrap_or_else(|_| (path.clone(), None))
+            })
+            .collect();
+        if let Some((_, Some(cap))) = laid.first() {
+            for node in cap {
+                words.push(commitment_to_digest(node));
+            }
+        }
+        for (opening, (path, _)) in openings.iter().zip(&laid) {
+            for v in &opening.values {
+                words.push(value_word(v));
+            }
+            for node in path {
+                words.push(commitment_to_digest(node));
+            }
+        }
+    }
+    match &round.openings {
+        RoundOpenings::Base(p) => {
+            if current {
+                side(words, &p.current, tree, |v| {
+                    [*v, FE::zero(), FE::zero(), FE::zero()]
+                });
+            } else {
+                side(words, &p.next, tree, ext_word);
+            }
+        }
+        RoundOpenings::Extension(p) => {
+            let openings = if current { &p.current } else { &p.next };
+            side(words, openings, tree, ext_word);
         }
     }
 }
