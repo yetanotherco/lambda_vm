@@ -363,7 +363,14 @@ impl WhirBlockPlan {
             return Err(format!("a fan-in of {fan_in} closes no tree"));
         }
         // The machine replays the algebraic transcript: it verifies a block
-        // proved over RPX, and nothing else.
+        // proved over RPX, and nothing else. A Poseidon1 base's leaf is
+        // D-WHIR-P1's S5.
+        if format.zf.base != stark::proof::options::BaseFormat::RPX {
+            return Err(format!(
+                "the block's recursion verifies a block proved over RPX, not the base {:?}",
+                format.zf.base
+            ));
+        }
         if crate::whir_hash_knob::selected() != crate::whir_hash_knob::Setting::Rpx {
             return Err(
                 "the block's recursion verifies a block proved over RPX; set LAMBDA_VM_WHIR_HASH=rpx"
@@ -373,7 +380,12 @@ impl WhirBlockPlan {
         let frame = block_frame(statement, elf_bytes, proof_options, format)
             .map_err(|e| format!("statement: {e:?}"))?;
         let elf_digest = crate::statement::elf_digest(elf_bytes);
-        let statement_bytes = block_statement_bytes(statement, &elf_digest, &frame.config);
+        let statement_bytes = block_statement_bytes(
+            statement,
+            &crate::block_whir::block_statement_tag(&format.zf.base),
+            &elf_digest,
+            &frame.config,
+        );
         let groups: Vec<Vec<usize>> = statement
             .groups
             .iter()

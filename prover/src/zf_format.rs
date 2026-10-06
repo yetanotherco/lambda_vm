@@ -56,7 +56,9 @@ use std::sync::OnceLock;
 use multilinear::whir_chain::{
     ChainConfig, ChainFormat, FirstFold, GrindBits, NonceLayout, StackVars, WhirFolds,
 };
-use stark::proof::options::{CapPolicy, FriMode, OneRowMode, ProofFormat, ProofOptions};
+use stark::proof::options::{
+    BaseFormat, CapPolicy, FriMode, OneRowMode, ProofFormat, ProofOptions,
+};
 
 /// The knob names, in banner order.
 pub const ENV_CAP: &str = "LAMBDA_VM_ZF_CAP";
@@ -113,6 +115,12 @@ pub struct ZfFormat {
     pub whir_grind: WhirGrind,
     /// How many bits each of those grinds spends.
     pub whir_grind_bits: u8,
+    /// The WHIR block's base hash and its arity-4 cap ([`BaseFormat`]):
+    /// [`BaseFormat::RPX`] = today. No knob sets it: a caller that proves or
+    /// verifies Poseidon1 says so in the format it passes
+    /// ([`Self::with_base`]). The block path dispatches on it and the LFM
+    /// proofs never read it.
+    pub base: BaseFormat,
 }
 
 /// Where the WHIR base chains grind (P2), and so which nonces their rounds
@@ -224,6 +232,7 @@ impl ZfFormat {
         whir_stack: DEFAULT_WHIR_STACK,
         whir_grind: WhirGrind::Query,
         whir_grind_bits: PRODUCTION_WHIR_GRIND_BITS,
+        base: BaseFormat::RPX,
     };
 
     /// The legacy format: every lever off. What all eight knobs at their
@@ -238,7 +247,13 @@ impl ZfFormat {
         whir_stack: StackVars::LEGACY,
         whir_grind: WhirGrind::All,
         whir_grind_bits: LEGACY_WHIR_GRIND_BITS,
+        base: BaseFormat::RPX,
     };
+
+    /// This format with `base` as the WHIR block's base hash.
+    pub const fn with_base(self, base: BaseFormat) -> Self {
+        Self { base, ..self }
+    }
 
     /// True when every lever is off: the format proves exactly what the
     /// prover proved before any lever existed.
@@ -251,6 +266,7 @@ impl ZfFormat {
             && self.whir_stack == StackVars::LEGACY
             && self.whir_grind == WhirGrind::All
             && self.whir_grind_bits == LEGACY_WHIR_GRIND_BITS
+            && self.base == BaseFormat::RPX
     }
 
     /// The grind bits the WHIR chains run at: [`WhirGrind`]'s placement with
@@ -389,7 +405,10 @@ impl ZfFormat {
             self.whir_stack.get(),
             self.whir_grind,
             self.whir_grind_bits
-        )
+        ) + &match self.base {
+            BaseFormat::RPX => String::new(),
+            base => format!(" base={:?}/c{}", base.hash, base.arity4_cap),
+        }
     }
 
     /// `ZF WHIR SCHEDULES: whir_folds=… n=20:[…] … n=<stack>:[…]` — the fold
@@ -435,9 +454,8 @@ impl ZfFormat {
             // caller until its wiring lands (D-BATCH B-4b), so a knob here could
             // only make those callers refuse.
             argue: multilinear::whir_chain::ArgueFormat::PerTable,
-            // No base-hash field yet (D-WHIR-P1 S3): every production tree is
-            // binary, and this is read at arity 4 only.
-            arity4_cap: multilinear::whir_chain::CapPolicy::Off,
+            // Read at arity 4 only, so RPX's `Off` moves nothing.
+            arity4_cap: self.base.arity4_cap,
         }
     }
 
@@ -579,6 +597,7 @@ mod tests {
                 whir_stack: StackVars::new(27).unwrap(),
                 whir_grind: WhirGrind::Query,
                 whir_grind_bits: 18,
+                base: BaseFormat::RPX,
             }
         );
         assert_eq!(
@@ -818,6 +837,7 @@ mod tests {
             whir_stack: StackVars::new(26).unwrap(),
             whir_grind: WhirGrind::All,
             whir_grind_bits: 18,
+            base: BaseFormat::RPX,
         };
         assert_eq!(
             f.banner(),
