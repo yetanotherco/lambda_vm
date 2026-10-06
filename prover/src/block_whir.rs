@@ -1880,6 +1880,10 @@ pub(crate) struct Deviations {
     /// list ([`regen::ShadowRun::spawn`]): a regeneration bug, which the shadow
     /// must report and the proof must not see.
     pub regen_drop_one_op: Option<StreamTable>,
+    /// Phase B takes the groups in this order, given their count, instead of
+    /// the prove's own ([`multilinear_block::block_prove_in_order`]): every
+    /// order proves the same bytes.
+    pub phase_b_order: Option<fn(usize) -> Vec<usize>>,
 }
 
 /// A prepared stack committed wrongly, tables by AIR index.
@@ -4070,9 +4074,15 @@ fn prove_streamed(
             Some(f) => f,
             None => &identity,
         };
+        // Phase B's order: the groups in group order, unless a test asks for
+        // another.
+        let order: Vec<usize> = match deviations.phase_b_order {
+            Some(order) => order(laid.groups.len()),
+            None => (0..laid.groups.len()).collect(),
+        };
         let phase_b_start = Instant::now();
         let (proof, argues, prepared_openings, groups) =
-            multilinear_block::block_prove_on_forks_observed::<_, _, _, H>(
+            multilinear_block::block_prove_in_order::<_, _, _, H>(
                 block,
                 &config,
                 &mut transcript,
@@ -4081,6 +4091,7 @@ fn prove_streamed(
                 fork_of,
                 &deviations.argue,
                 on_group,
+                &order,
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
