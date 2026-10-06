@@ -1395,6 +1395,226 @@ fn p1_node_program_census() {
     }
 }
 
+/// A block's shape from a list of `AIR-name rows` lines (one per instance, any
+/// order; reconstructed from a box run's census and table walk), over `elf`: the
+/// table counts by kind, the ELF's pages, the private-input pages and the
+/// runtime ranges from the PAGE names, the lengths in the AIR order.
+fn shape_from_instances(
+    elf: &executor::elf::Elf,
+    lines: &str,
+    public_output_len: usize,
+) -> BlockShape {
+    use std::collections::BTreeMap;
+    let rows: BTreeMap<String, usize> = lines
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let (name, r) = l.trim().rsplit_once(' ').expect("`name rows`");
+            (name.to_string(), r.parse().expect("rows"))
+        })
+        .collect();
+    let count = |kind: &str| {
+        rows.keys()
+            .filter(|n| n.split('[').next() == Some(kind) && n.contains('['))
+            .count()
+    };
+    let counts = crate::TableCounts {
+        cpu: count("CPU"),
+        lt: count("LT"),
+        memw: count("MEMW"),
+        memw_aligned: count("MEMW_A"),
+        load: count("LOAD"),
+        mul: count("MUL"),
+        dvrm: count("DVRM"),
+        shift: count("SHIFT"),
+        branch: count("BRANCH"),
+        memw_register: count("MEMW_R"),
+        eq: count("EQ"),
+        bytewise: count("BYTEWISE"),
+        store: count("STORE"),
+        cpu32: count("CPU32"),
+        keccak: count("KECCAK"),
+        keccak_rnd: count("KECCAK_RND"),
+        ecsm: count("ECSM"),
+        ecdas: count("ECDAS"),
+        hint: count("HINT"),
+        commit: count("COMMIT"),
+        blake3: count("BLAKE3"),
+    };
+    let elf_pages: std::collections::BTreeSet<u64> =
+        crate::tables::trace_builder::Traces::page_configs_from_elf(elf)
+            .iter()
+            .map(|c| c.page_base)
+            .collect();
+    let private: std::collections::BTreeSet<u64> = crate::tables::page::private_input_page_bases(
+        crate::tables::page::max_private_input_pages(),
+    )
+    .collect();
+    let page = crate::tables::page::DEFAULT_PAGE_SIZE as u64;
+    let mut runtime: Vec<u64> = Vec::new();
+    let mut num_private = 0;
+    for name in rows.keys().filter(|n| n.starts_with("PAGE:")) {
+        let base =
+            u64::from_str_radix(name.trim_start_matches("PAGE:0x"), 16).expect("a page base");
+        if private.contains(&base) {
+            num_private += 1;
+        } else if !elf_pages.contains(&base) {
+            runtime.push(base);
+        }
+    }
+    runtime.sort_unstable();
+    let mut ranges: Vec<crate::RuntimePageRange> = Vec::new();
+    for base in runtime {
+        match ranges.last_mut() {
+            Some(r) if r.base.checked_add(r.count * page) == Some(base) => r.count += 1,
+            _ => ranges.push(crate::RuntimePageRange { base, count: 1 }),
+        }
+    }
+    let n = counts.total().expect("fits")
+        + crate::FIXED_TABLE_COUNT
+        + rows.keys().filter(|n| n.starts_with("PAGE:")).count();
+    let mut shape = BlockShape {
+        table_counts: counts,
+        runtime_page_ranges: ranges,
+        num_private_input_pages: num_private,
+        public_output_len,
+        trace_lengths: vec![32; n],
+    };
+    let opts = super::proof::block_base_options();
+    let configs =
+        super::block_plan::check_shape(elf, &opts, &shape).expect("the reconstructed shape checks");
+    let airs = crate::VmAirs::new(
+        elf,
+        &opts,
+        false,
+        &configs,
+        &shape.table_counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+    );
+    let names: Vec<String> = airs
+        .air_refs()
+        .iter()
+        .map(|a| a.name().to_string())
+        .collect();
+    assert_eq!(names.len(), n, "one AIR per instance");
+    shape.trace_lengths = names
+        .iter()
+        .map(|a| *rows.get(a).unwrap_or_else(|| panic!("no rows for {a}")))
+        .collect();
+    shape
+}
+
+/// ★ One table per socket leaf, sized (laptop instrument, emission only, no
+/// proof): a real block's shape (`P3_SHAPE`, `AIR-name rows` lines from a box
+/// run; `P3_ELF`, its ELF) under a P1 base at cap 1, partitioned at each leaf
+/// cap in `P3_CAPS` (comma-separated; 162000 is today's). Per cap: the leaves,
+/// their socket tables (one, or split by `HashChunking`), Σ instructions, Σ
+/// cells (main + aux), Σ the FAST cost law, and Σ the node legs a parent pays
+/// for its children's tables; and the no-split rule at that cap (each split
+/// socket table one padded table: its cells and legs).
+#[test]
+#[ignore = "laptop instrument: P3_SHAPE, P3_ELF, P3_CAPS; emission only, one leaf at a time"]
+fn p1_one_table_per_leaf_sizing() {
+    use super::airs::{ChipSet, LfmAirs, NUM_LFM_CHIPS, lfm_chip_census_with_hasher};
+    use stark::proof::options::{BaseFormat, CapPolicy};
+    let read = |var: &str| std::env::var(var).unwrap_or_else(|_| panic!("{var} must be set"));
+    let elf_bytes = std::fs::read(read("P3_ELF")).expect("P3_ELF reads");
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("load the ELF");
+    let lines = std::fs::read_to_string(read("P3_SHAPE")).expect("P3_SHAPE reads");
+    let caps: Vec<usize> = read("P3_CAPS")
+        .split(',')
+        .map(|c| c.trim().parse().expect("a cap"))
+        .collect();
+    let shape = shape_from_instances(&elf, &lines, 4);
+    let base = BaseFormat {
+        arity4_cap: CapPolicy::Fixed(1),
+        ..BaseFormat::P1
+    };
+    let opts = super::proof::block_base_options_for(base);
+    let wrap = super::proof::aggregation_wrap_options();
+    let mut plan = BlockTreePlan::derive(&elf_bytes, &opts, &shape).expect("the plan derives");
+    let law = |instrs: usize, cells: u64| 0.059 + 421e-9 * instrs as f64 + 5.63e-9 * cells as f64;
+    let hash = super::airs::LFM_CHIP_NAMES[super::airs::HASH_SLOT];
+    let total: usize = plan.costs().iter().sum();
+    println!(
+        "ONE TABLE: {} instances · Σ {total} perms (closed form) · caps {caps:?}",
+        shape.trace_lengths.len()
+    );
+    for cap in caps {
+        let partition = plan.partition_at_cap(cap).expect("the rule partitions");
+        plan = plan.with_partition(partition);
+        let leaves = plan.partition().num_leaves();
+        let (mut instrs, mut cells, mut cost, mut legs) = (0usize, 0u64, 0.0f64, 0usize);
+        let (mut split, mut cells_ns, mut cost_ns, mut legs_ns) = (0usize, 0u64, 0.0f64, 0usize);
+        let mut heights = std::collections::BTreeMap::<String, usize>::new();
+        for k in 0..leaves {
+            let program = plan.leaf_program(k).expect("the leaf emits");
+            let hasher = program.hasher(crate::hash_pin::BLOCK_HASHER);
+            let (main, aux) = super::airs::lfm_cell_counts_with_hasher(&program, hasher);
+            let census = lfm_chip_census_with_hasher(&program, hasher);
+            let airs = LfmAirs::new_with_hasher(
+                &[[0u8; 32]; NUM_LFM_CHIPS],
+                &wrap,
+                1,
+                hasher,
+                ChipSet::for_program_with_hasher(&program, hasher),
+            );
+            let refs = airs.air_refs();
+            let leg = |name: &str, rows: u64| -> usize {
+                let air = refs
+                    .iter()
+                    .find(|a| a.name() == name)
+                    .expect("the chip's AIR");
+                let (v, _) =
+                    super::epoch_verify::TableVerifyShape::derive(*air, rows.max(1) as usize)
+                        .expect("the child table's shape derives");
+                super::epoch_verify::table_permutations_for(&v, WrapHash::production())
+            };
+            let chunks: Vec<_> = census.iter().filter(|c| c.name == hash).collect();
+            let leaf_legs: usize = census.iter().map(|c| leg(c.name, c.rows)).sum();
+            let n = program.instrs.len();
+            instrs += n;
+            cells += main + aux;
+            cost += law(n, main + aux);
+            legs += leaf_legs;
+            let label = chunks
+                .iter()
+                .map(|c| c.rows.to_string())
+                .collect::<Vec<_>>()
+                .join("+");
+            *heights.entry(label).or_default() += 1;
+            // The no-split rule: the socket table one padded table.
+            let real: u64 = chunks.iter().map(|c| c.real_rows).sum();
+            let padded: u64 = chunks.iter().map(|c| c.rows).sum();
+            let one = real.next_power_of_two();
+            let width = (chunks[0].main_cols + chunks[0].aux_cols) as u64;
+            let ns_cells = main + aux + (one - padded) * width;
+            if chunks.len() > 1 {
+                split += 1;
+            }
+            cells_ns += ns_cells;
+            cost_ns += law(n, ns_cells);
+            legs_ns += leaf_legs - chunks.iter().map(|c| leg(c.name, c.rows)).sum::<usize>()
+                + leg(hash, one);
+        }
+        let l1 = leaves.div_ceil(super::block_plan::BLOCK_FAN_IN);
+        println!(
+            "ONE TABLE cap {cap}: {leaves} leaves ({l1} level-1 nodes) · socket tables {heights:?} ({split} split) · Σ {instrs} \
+             instructions · Σ {cells} cells · law Σ {cost:.2} s · node legs Σ {legs} perms"
+        );
+        println!(
+            "ONE TABLE cap {cap} no-split: Σ {cells_ns} cells (+{}) · law Σ {cost_ns:.2} s (+{:.2}) · node legs Σ {legs_ns} perms ({:+})",
+            cells_ns - cells,
+            cost_ns - cost,
+            legs_ns as i64 - legs as i64
+        );
+    }
+}
+
 /// [`pinned_spread_plan`]'s options.
 fn pinned_spread_plan_options() -> crate::ProofOptions {
     let pair = crate::zf_format::ZfFormat {

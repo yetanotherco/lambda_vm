@@ -713,6 +713,14 @@ impl BlockTreePlan {
         self.partition = partition;
         self
     }
+
+    /// The rule's partition of these instances under another leaf cap — an
+    /// instrument's, test-only.
+    #[cfg(test)]
+    pub(crate) fn partition_at_cap(&self, cap: usize) -> Result<BlockPartition, String> {
+        let names: Vec<&str> = self.instances.iter().map(|i| i.name.as_str()).collect();
+        partition_for(&names, &self.costs(), cap)
+    }
 }
 
 /// The block tree's fan-in: children per interior node. Four: the record
