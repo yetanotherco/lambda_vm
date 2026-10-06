@@ -5061,6 +5061,12 @@ fn collect_all_ops(
     }
 }
 
+/// `generate`'s result; `generate` is dropped as it returns, with the lists
+/// it owns.
+fn run<T>(generate: impl FnOnce() -> T) -> T {
+    generate()
+}
+
 /// Phases 3-5: From routed ops, produce all traces and assemble `Traces`.
 ///
 /// `initial_image` controls PAGE table generation: `Some(image)` generates real
@@ -5394,7 +5400,7 @@ fn build_traces<I: ImageSource + Sync>(
     {
         base.add_ops(uncounted_iw);
         memw_register::collect_bitwise_from_memw_register(uncounted_reg, &mut base);
-        for f in &collectors {
+        for f in collectors {
             f(&mut base);
         }
     }
@@ -5453,7 +5459,10 @@ fn build_traces<I: ImageSource + Sync>(
 
     // Each build below reads disjoint op lists and writes its own table, so
     // they all run in one rayon scope. Disk-spill stays sequential: its
-    // generate→spill order keeps trace memory bounded.
+    // generate→spill order keeps trace memory bounded. A build that is the
+    // only reader of its lists owns them (a `move` closure, run once by
+    // `run`), so each list is freed as its family's tables are made instead
+    // of when the last family's are.
     let cpu_ops_ref = &cpu_ops;
     let gen_cpus = || {
         chunk_and_generate_skipping(
@@ -5468,7 +5477,7 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
-    let gen_memws = || {
+    let gen_memws = move || {
         chunk_and_generate_skipping(
             &memw_ops,
             max_rows.memw,
@@ -5481,7 +5490,7 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
-    let gen_memw_aligneds = || {
+    let gen_memw_aligneds = move || {
         chunk_and_generate_skipping(
             &memw_aligned_ops,
             max_rows.memw_aligned,
@@ -5494,7 +5503,7 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
-    let gen_memw_registers = || {
+    let gen_memw_registers = move || {
         // Direct-to-column fill from compact RegRows — the register fast path never
         // materializes a `Vec<MemwOperation>`.
         chunk_and_generate_skipping(
@@ -5509,7 +5518,7 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
-    let gen_loads = || {
+    let gen_loads = move || {
         chunk_and_generate_skipping(
             &load_ops,
             max_rows.load,
@@ -5552,7 +5561,7 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
-    let gen_shifts = || {
+    let gen_shifts = move || {
         chunk_and_generate_skipping(
             &shift_ops,
             max_rows.shift,
@@ -5565,7 +5574,7 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
-    let gen_muls = || {
+    let gen_muls = move || {
         chunk_and_generate_optional(
             &mul_ops,
             max_rows.mul,
@@ -5575,7 +5584,7 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
-    let gen_dvrms = || {
+    let gen_dvrms = move || {
         chunk_and_generate_optional(
             &dvrm_ops,
             max_rows.dvrm,
@@ -5585,7 +5594,7 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
-    let gen_branches = || {
+    let gen_branches = move || {
         chunk_and_generate_segmented(
             &branch_ops.segments(),
             max_rows.branch,
@@ -5600,7 +5609,7 @@ fn build_traces<I: ImageSource + Sync>(
     };
     // Auxiliary ALU / memory / CPU32 dispatch chips, each filtered out of the CPU
     // ops above.
-    let gen_eqs = || {
+    let gen_eqs = move || {
         chunk_and_generate_segmented(
             &eq_ops.segments(),
             max_rows.eq,
@@ -5613,7 +5622,7 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
-    let gen_bytewises = || {
+    let gen_bytewises = move || {
         chunk_and_generate_segmented(
             &bytewise_ops.segments(),
             max_rows.bytewise,
@@ -5626,7 +5635,7 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
-    let gen_stores = || {
+    let gen_stores = move || {
         chunk_and_generate_skipping(
             &store_ops,
             max_rows.store,
@@ -5639,7 +5648,7 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
-    let gen_cpu32s = || {
+    let gen_cpu32s = move || {
         chunk_and_generate_optional::<cpu32::Cpu32Operation>(
             &cpu32_ops,
             max_rows.cpu32,
@@ -5649,7 +5658,7 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
-    let gen_bitwise = || {
+    let gen_bitwise = move || {
         let mut bitwise = bitwise::generate_bitwise_trace();
         // Fill the MU columns (11..=20) from the accumulated histogram.
         bitwise_histogram.fill_multiplicities(&mut bitwise);
@@ -5665,7 +5674,7 @@ fn build_traces<I: ImageSource + Sync>(
         decode::count_rows(&mut decode, rows.chain(padding));
         decode
     };
-    let gen_commits = || {
+    let gen_commits = move || {
         generate_optional(
             &commit_ops,
             |ops| commit::generate_commit_trace_as(ops, form),
@@ -5763,7 +5772,7 @@ fn build_traces<I: ImageSource + Sync>(
         }
     };
     let num_blake3_ops = blake3_ops.len() + blake3_absorb_ops.len();
-    let gen_blake3 = || blake3::generate_blake3_trace(&blake3_ops, &blake3_absorb_ops);
+    let gen_blake3 = move || blake3::generate_blake3_trace(&blake3_ops, &blake3_absorb_ops);
     let gen_keccak_rc = || {
         let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
         keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
@@ -5778,11 +5787,12 @@ fn build_traces<I: ImageSource + Sync>(
         }
         _ => (Vec::new(), Vec::new()),
     };
-    let gen_register = || register::generate_register_trace(&register_final_state, register_init);
+    let gen_register =
+        move || register::generate_register_trace(&register_final_state, register_init);
     let gen_halt = || halt::generate_halt_trace(halt_timestamp, halt_next_pc);
     // ECSM accelerator traces. A program that does not use ECSM carries no ECSM
     // and no ECDAS table at all — not a padded one.
-    let gen_ecsms = || {
+    let gen_ecsms = move || {
         if max_rows.ecsm == super::ECSM_UNCHUNKED {
             generate_optional(
                 &ecsm_ops,
@@ -5813,7 +5823,7 @@ fn build_traces<I: ImageSource + Sync>(
             ecdas::widen,
         )
     };
-    let gen_ecdases = || {
+    let gen_ecdases = move || {
         if max_rows.ecdas == super::ECDAS_UNCHUNKED {
             generate_optional(
                 &ecdas_ops,
@@ -5836,7 +5846,7 @@ fn build_traces<I: ImageSource + Sync>(
         }
     };
     // HINT table. Absent entirely for programs that make no hint ecalls.
-    let gen_hints = || {
+    let gen_hints = move || {
         generate_optional(
             &hint_ops,
             |ops| hint::generate_hint_trace_as(ops, form),
@@ -5872,7 +5882,7 @@ fn build_traces<I: ImageSource + Sync>(
                 ($slot:ident, $gen:ident) => {{
                     let slot = &mut $slot;
                     s.spawn(move |_| {
-                        *slot = Some($gen());
+                        *slot = Some(run($gen));
                         finish_mark(concat!("p5 ", stringify!($gen)));
                     });
                 }};
@@ -5907,33 +5917,33 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(hints_slot, gen_hints);
         });
     } else {
-        cpus_slot = Some(gen_cpus());
-        memws_slot = Some(gen_memws());
-        memw_aligneds_slot = Some(gen_memw_aligneds());
-        memw_registers_slot = Some(gen_memw_registers());
-        loads_slot = Some(gen_loads());
-        lts_slot = Some(gen_lts());
-        shifts_slot = Some(gen_shifts());
-        muls_slot = Some(gen_muls());
-        dvrms_slot = Some(gen_dvrms());
-        branches_slot = Some(gen_branches());
-        bitwise_slot = Some(gen_bitwise());
-        decode_slot = Some(gen_decode());
-        commits_slot = Some(gen_commits());
-        keccaks_slot = Some(gen_keccaks());
-        keccak_rnds_slot = Some(gen_keccak_rnds());
-        keccak_rc_slot = Some(gen_keccak_rc());
-        blake3_slot = Some(gen_blake3());
-        pages_slot = Some(gen_pages());
-        register_slot = Some(gen_register());
-        halt_slot = Some(gen_halt());
-        eqs_slot = Some(gen_eqs());
-        bytewises_slot = Some(gen_bytewises());
-        stores_slot = Some(gen_stores());
-        cpu32s_slot = Some(gen_cpu32s());
-        ecsms_slot = Some(gen_ecsms());
-        ecdases_slot = Some(gen_ecdases());
-        hints_slot = Some(gen_hints());
+        cpus_slot = Some(run(gen_cpus));
+        memws_slot = Some(run(gen_memws));
+        memw_aligneds_slot = Some(run(gen_memw_aligneds));
+        memw_registers_slot = Some(run(gen_memw_registers));
+        loads_slot = Some(run(gen_loads));
+        lts_slot = Some(run(gen_lts));
+        shifts_slot = Some(run(gen_shifts));
+        muls_slot = Some(run(gen_muls));
+        dvrms_slot = Some(run(gen_dvrms));
+        branches_slot = Some(run(gen_branches));
+        bitwise_slot = Some(run(gen_bitwise));
+        decode_slot = Some(run(gen_decode));
+        commits_slot = Some(run(gen_commits));
+        keccaks_slot = Some(run(gen_keccaks));
+        keccak_rnds_slot = Some(run(gen_keccak_rnds));
+        keccak_rc_slot = Some(run(gen_keccak_rc));
+        blake3_slot = Some(run(gen_blake3));
+        pages_slot = Some(run(gen_pages));
+        register_slot = Some(run(gen_register));
+        halt_slot = Some(run(gen_halt));
+        eqs_slot = Some(run(gen_eqs));
+        bytewises_slot = Some(run(gen_bytewises));
+        stores_slot = Some(run(gen_stores));
+        cpu32s_slot = Some(run(gen_cpu32s));
+        ecsms_slot = Some(run(gen_ecsms));
+        ecdases_slot = Some(run(gen_ecdases));
+        hints_slot = Some(run(gen_hints));
     }
 
     finish_mark("p5 done");
