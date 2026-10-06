@@ -435,6 +435,9 @@ impl ZfFormat {
             // caller until its wiring lands (D-BATCH B-4b), so a knob here could
             // only make those callers refuse.
             argue: multilinear::whir_chain::ArgueFormat::PerTable,
+            // No base-hash field yet (D-WHIR-P1 S3): every production tree is
+            // binary, and this is read at arity 4 only.
+            arity4_cap: multilinear::whir_chain::CapPolicy::Off,
         }
     }
 
@@ -1369,6 +1372,7 @@ mod tests {
                 stack: StackVars::new(27).unwrap(),
                 nonces: NonceLayout::Three,
                 argue: multilinear::whir_chain::ArgueFormat::PerTable,
+                arity4_cap: CapPolicy::Off,
             },
         };
         let opt_out = parse(&[(ENV_WHIR_GRIND, "all"), (ENV_WHIR_GRIND_BITS, "20")]).unwrap();

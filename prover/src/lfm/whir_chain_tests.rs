@@ -1969,6 +1969,7 @@ fn the_production_default_chain_is_first6_under_the_auto_cap() {
             stack: multilinear::whir_chain::StackVars::new(27).expect("27"),
             nonces: NonceLayout::Spent,
             argue: multilinear::whir_chain::ArgueFormat::PerTable,
+            arity4_cap: CapPolicy::Off,
         },
         ..config(114, 0)
     };
@@ -2010,6 +2011,7 @@ fn the_grind_bits_opt_out_chain_keeps_its_pins() {
             stack: multilinear::whir_chain::StackVars::new(27).expect("27"),
             nonces: NonceLayout::Spent,
             argue: multilinear::whir_chain::ArgueFormat::PerTable,
+            arity4_cap: CapPolicy::Off,
         },
         ..config(112, 0)
     };
@@ -2044,6 +2046,7 @@ fn the_grind_opt_out_chain_keeps_the_pins_from_before_p2() {
             stack: multilinear::whir_chain::StackVars::new(27).expect("27"),
             nonces: NonceLayout::Three,
             argue: multilinear::whir_chain::ArgueFormat::PerTable,
+            arity4_cap: CapPolicy::Off,
         },
         ..config(112, 20)
     };
