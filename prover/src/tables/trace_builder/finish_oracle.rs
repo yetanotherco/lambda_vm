@@ -256,12 +256,10 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             }));
         }
         let bytewise_slice = p4_slice_len(P4Source::Bytewise, mul_chunk, dvrm_chunk);
-        for slice in bytewise_ops
-            .parts()
-            .flat_map(|part| part.chunks(bytewise_slice))
-        {
+        for k in 0..bytewise_ops.len().div_ceil(bytewise_slice.max(1)) {
+            let bytewise_ops = &bytewise_ops;
             collectors.push(Box::new(move |h| {
-                for op in slice {
+                for op in bytewise_ops.range(k * bytewise_slice, (k + 1) * bytewise_slice) {
                     h.add_ops(&op.collect_bitwise_ops());
                 }
             }));
@@ -348,8 +346,10 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
                 }
             }),
             Box::new(|h| {
-                for op in bytewise_ops.iter() {
-                    h.add_ops(&op.collect_bitwise_ops());
+                for k in 0..bytewise_ops.len().div_ceil(1 << 20) {
+                    for op in bytewise_ops.range(k << 20, (k + 1) << 20) {
+                        h.add_ops(&op.collect_bitwise_ops());
+                    }
                 }
             }),
             Box::new(|h| {

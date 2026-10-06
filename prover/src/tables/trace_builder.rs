@@ -74,6 +74,7 @@ use crate::paged_mem::{ImageSource, PagedMem};
 
 mod blocks;
 mod compact_branch;
+mod compact_bytewise;
 mod compact_eq;
 mod delta;
 mod finish;
@@ -87,6 +88,7 @@ mod lean_walk_tests;
 mod windowed;
 use blocks::{BlockVec, block_len};
 use compact_branch::CompactBranch;
+use compact_bytewise::CompactBytewise;
 use compact_eq::CompactEq;
 pub(crate) use finish::{Emitted, RestHeader};
 pub use windowed::{
@@ -3941,7 +3943,8 @@ struct CollectedOps {
     // Auxiliary ALU / memory / CPU32 dispatch chips (driven by the CPU ALU/MEMORY dispatch).
     /// Delta-coded ([`CompactEq`]).
     eq_ops: CompactEq,
-    bytewise_ops: BlockVec<bytewise::BytewiseOperation>,
+    /// Delta-coded ([`CompactBytewise`]).
+    bytewise_ops: CompactBytewise,
     store_ops: BlockVec<store::StoreOperation>,
     cpu32_ops: BlockVec<cpu32::Cpu32Operation>,
     // EC scalar-multiplication accelerator chips. ECDAS's rows held compact
@@ -4790,7 +4793,8 @@ struct RoutedBlocks {
     dvrm_filter: BlockVec<(DvrmOperation, bool)>,
     /// Delta-coded ([`CompactEq`]).
     eq_ops: CompactEq,
-    bytewise_ops: BlockVec<bytewise::BytewiseOperation>,
+    /// Delta-coded ([`CompactBytewise`]).
+    bytewise_ops: CompactBytewise,
     store_ops: BlockVec<store::StoreOperation>,
     shift_cpu32: BlockVec<ShiftOperation>,
     mul_cpu32: BlockVec<(MulOperation, bool)>,
@@ -4813,7 +4817,7 @@ impl RoutedBlocks {
             mul_filter: list(m.mul),
             dvrm_filter: list(m.dvrm),
             eq_ops: CompactEq::default(),
-            bytewise_ops: list(m.bytewise),
+            bytewise_ops: CompactBytewise::default(),
             store_ops: list(m.store),
             shift_cpu32: list(m.shift),
             mul_cpu32: list(m.mul),
@@ -4832,7 +4836,7 @@ impl RoutedBlocks {
         self.mul_filter.extend(other.mul_filter);
         self.dvrm_filter.extend(other.dvrm_filter);
         self.eq_ops.extend(&other.eq_ops);
-        self.bytewise_ops.extend(other.bytewise_ops);
+        self.bytewise_ops.extend(&other.bytewise_ops);
         self.store_ops.extend(other.store_ops);
         self.shift_cpu32.extend(other.shift_cpu32);
         self.mul_cpu32.extend(other.mul_cpu32);
@@ -4858,7 +4862,11 @@ impl RoutedBlocks {
             of("mul_filter", &self.mul_filter),
             of("dvrm_filter", &self.dvrm_filter),
             ("eq", self.eq_ops.heap_bytes(), self.eq_ops.largest_bytes()),
-            of("bytewise", &self.bytewise_ops),
+            (
+                "bytewise",
+                self.bytewise_ops.heap_bytes(),
+                self.bytewise_ops.largest_bytes(),
+            ),
             of("store", &self.store_ops),
             of("shift_cpu32", &self.shift_cpu32),
             of("mul_cpu32", &self.mul_cpu32),
@@ -5197,7 +5205,7 @@ fn collect_all_ops(
         blake3_ops: BlockVec::from_vec(blake3_ops),
         blake3_absorb_ops: BlockVec::from_vec(blake3_absorb_ops),
         eq_ops: CompactEq::from_ops(&eq_ops),
-        bytewise_ops: BlockVec::from_vec(bytewise_ops),
+        bytewise_ops: CompactBytewise::from_ops(&bytewise_ops),
         store_ops: BlockVec::from_vec(store_ops),
         cpu32_ops: BlockVec::from_vec(cpu32_ops),
         ecsm_ops: BlockVec::from_vec(ecsm_ops),
