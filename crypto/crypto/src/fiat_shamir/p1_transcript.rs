@@ -309,6 +309,53 @@ mod tests {
         }
     }
 
+    /// The width-8 grind credits its bits (REV-P1-B): `is_valid_nonce` under
+    /// the P1 digest is exactly "lane 0 of W8(inner ‖ nonce ‖ 0³), canonical,
+    /// below 2^(64 − g)", the inner digest binds the seed and the factor, and
+    /// the pass rate over nonces is 2^−g.
+    #[test]
+    fn the_width8_grind_credits_its_bits() {
+        use crate::grinding::is_valid_nonce;
+        use crate::hash::rpx::commitment_to_digest;
+        use digest::Digest;
+
+        let seed: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(37) ^ 0x5a);
+        let g = 6u8;
+        // The definition, recomputed from the permutation.
+        let inner: [u8; 32] = {
+            let mut d = P1GrindDigest::new();
+            Digest::update(&mut d, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xed]);
+            Digest::update(&mut d, seed);
+            Digest::update(&mut d, [g]);
+            d.finalize().into()
+        };
+        let lane0 = |nonce: u64| {
+            let i = commitment_to_digest(&inner);
+            let mut s = [Fp::zero(); poseidon1_w8::STATE_FELTS];
+            s[..4].copy_from_slice(&i);
+            s[4] = Fp::from(nonce);
+            GoldilocksField::canonical(poseidon1_w8::permute(s)[0].value())
+        };
+        let n = 1u64 << 14;
+        let mut passes = 0u64;
+        for nonce in 0..n {
+            let ok = is_valid_nonce::<P1GrindDigest>(&seed, nonce, g);
+            assert_eq!(ok, lane0(nonce) < 1u64 << (64 - g), "nonce {nonce}");
+            passes += u64::from(ok);
+        }
+        // Binomial(2^14, 2^-6): mean 256, sd ≈ 15.9; ±6 sd.
+        assert!((160..=352).contains(&passes), "{passes} passes of {n}");
+        // The inner digest binds the seed: one flipped seed bit moves the
+        // passing set.
+        let mut other = seed;
+        other[31] ^= 1;
+        assert!(
+            (0..1024u64).any(|k| is_valid_nonce::<P1GrindDigest>(&other, k, g)
+                != is_valid_nonce::<P1GrindDigest>(&seed, k, g)),
+            "the seed moves the passing set"
+        );
+    }
+
     #[test]
     fn the_configuration_names_its_grind_digest() {
         assert_eq!(
