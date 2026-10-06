@@ -73,7 +73,7 @@ use multilinear::whir::Domain;
 use crate::tables::types::{FE, GoldilocksField};
 
 use super::builder::{Bit, Ext, LfmBuilder};
-use super::edsl::{pow_bits, pow_bits_windowed};
+use super::edsl::{pow_bits, pow_bits_alu, pow_bits_windowed};
 use super::word::{LfmWord, base_word};
 
 /// INSTRUCTIONS [`emit_fold_coset`] emits for a block of `block` values over
@@ -537,9 +537,12 @@ pub fn emit_fold_coset_lean(
     let factors: Vec<FE> = (0..index_bits.len())
         .map(|i| generator_inv.pow(1u64 << i))
         .collect();
-    let mut x_inv = match pow_windows() {
-        0 => pow_bits(b, index_bits, &factors, FE::one()),
-        windows => pow_bits_windowed(b, index_bits, &factors, windows),
+    // A Poseidon1 leaf's `Select` table binds its leaves (I-WHIR-P1 §S5.4): its
+    // point reads the bits through the base ALU instead.
+    let mut x_inv = match (b.wrap_hash(), pow_windows()) {
+        (super::edsl::WrapHash::Poseidon1, _) => pow_bits_alu(b, index_bits, &factors),
+        (_, 0) => pow_bits(b, index_bits, &factors, FE::one()),
+        (_, windows) => pow_bits_windowed(b, index_bits, &factors, windows),
     };
     let half = prepared.half.as_ext();
 

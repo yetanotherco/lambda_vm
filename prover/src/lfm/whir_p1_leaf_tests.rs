@@ -608,3 +608,34 @@ fn a_tampered_p1_chain_cannot_execute() {
         }
     }
 }
+
+/// The fold point read through the base ALU (`edsl::pow_bits_alu`, the P1
+/// leaf's) is `pow_bits`' value at every index, with no `Select`.
+#[test]
+fn the_alu_point_is_pow_bits() {
+    let factors: Vec<FE> = (0..12).map(|i| felt(9, i)).collect();
+    for index in [0u64, 1, 2, 5, 0x5a5, 0xfff] {
+        let mut b = p1_builder();
+        let a = b.declare_arena(1);
+        let idx = b.hint_felt(a, 0);
+        let bits = b.bit_dec(idx, factors.len());
+        let alu = edsl::pow_bits_alu(&mut b, &bits, &factors);
+        let reference = edsl::pow_bits(&mut b, &bits, &factors, FE::one());
+        b.public(alu.as_cell());
+        b.public(reference.as_cell());
+        let got = run(b, &[vec![base_word(FE::from(index))]]).expect("executes");
+        let want = (0..factors.len())
+            .filter(|i| index >> i & 1 == 1)
+            .fold(FE::one(), |acc, i| acc * factors[i]);
+        assert_eq!((got[0], got[4]), (want, want), "index {index:#x}");
+    }
+    let mut b = p1_builder();
+    let a = b.declare_arena(1);
+    let idx = b.hint_felt(a, 0);
+    let bits = b.bit_dec(idx, factors.len());
+    let alu = edsl::pow_bits_alu(&mut b, &bits, &factors);
+    b.public(alu.as_cell());
+    let program = compile(b.finish());
+    let rows = super::whir_chain::ChipRows::of(&program);
+    assert_eq!((rows.select, rows.balu), (0, 2 * factors.len() - 1));
+}

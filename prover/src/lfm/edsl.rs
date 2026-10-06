@@ -1034,6 +1034,28 @@ pub fn pow_bits_windowed(b: &mut LfmBuilder, bits: &[Bit], factors: &[FE], windo
     acc.unwrap_or_else(|| b.felt_const(FE::one()))
 }
 
+/// [`pow_bits`] at a scale of one with no `Select`: each bit's factor is
+/// `1 + b·(f − 1)` (one `MulAdd`, the bit a boolean cell of the index's
+/// `BitDec`), multiplied in (one `Mul`; the first factor starts the
+/// accumulator). Two base-ALU rows a bit, less one, against one `Select` and
+/// one `Mul`: the form for a program whose `Select` table binds and whose base
+/// ALU does not (the Poseidon1 leaf's, I-WHIR-P1 §S5.4). The same value: the
+/// bit is 0 or 1.
+pub fn pow_bits_alu(b: &mut LfmBuilder, bits: &[Bit], factors: &[FE]) -> Felt {
+    assert_eq!(bits.len(), factors.len());
+    let mut acc: Option<Felt> = None;
+    for (bit, factor) in bits.iter().zip(factors) {
+        let one = b.felt_const(FE::one());
+        let step = b.felt_const(*factor - FE::one());
+        let chosen = b.mul_add(Felt(bit.addr()), step, one);
+        acc = Some(match acc {
+            None => chosen,
+            Some(acc) => b.mul(acc, chosen),
+        });
+    }
+    acc.unwrap_or_else(|| b.felt_const(FE::one()))
+}
+
 /// `Σ_i coeffs[i]·α^i` over ext, coeffs given low-to-high (base cells are
 /// valid ext operands). One `MulAdd` per coefficient — the Horner shape.
 pub fn horner_ext(b: &mut LfmBuilder, alpha: Ext, coeffs_low_to_high: &[Ext]) -> Ext {
