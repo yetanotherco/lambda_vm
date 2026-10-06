@@ -61,13 +61,13 @@ use super::registry::LfmArtifacts;
 use super::whir_chain::ChainShape;
 use super::whir_epoch::{
     BITWISE_NAME, DECODE_NAME, GroupWires, KECCAK_RC_NAME, PreprocessedPlan, PreprocessedRoute,
-    REGISTER_NAME, TableWires, emit_expected, emit_group_walk, emit_roots_block, emit_table_walk,
-    fresh_schedule, group_columns, hint_group_chains_shaped, hint_table_wires_shaped,
-    push_table_words, table_words,
+    REGISTER_NAME, TableWires, emit_expected, emit_group_walk, emit_table_walk, fresh_schedule,
+    group_columns, hint_group_chains_shaped, hint_table_wires_shaped, push_table_words,
+    table_words,
 };
-use super::whir_stacked::{StackedPolyWires, stacked_verify_cost};
+use super::whir_stacked::{StackedOod, StackedPolyWires, stacked_verify_cost_ood};
 use super::whir_table::{TableProofWires, TableShape, table_verify_cost};
-use super::whir_transcript::WhirTranscript;
+use super::whir_transcript::{DIGEST_FELTS, SpongeSchedule, WhirTranscript};
 use super::word::{LfmWord, base_word};
 
 /// The leaf-load cap in permutations: today's wrap LFM_HASH shape, 2^18 + 2^15
@@ -461,7 +461,8 @@ impl WhirBlockPlan {
             let (_, group_of) = group_columns(&group_shapes);
             let layout = &frame.stack_layouts[g];
             let chain = ChainShape::new(config, layout.n_stack());
-            let opening = stacked_verify_cost(layout, &group_of, &chain, entry).perms();
+            let opening = stacked_verify_cost_ood(layout, &group_of, &chain, entry, true).perms()
+                + commit_ood_sponge(layout.num_polys()).perms();
             let prepared_perms: usize = prepared
                 .iter()
                 .filter(|p| p.group == g)
@@ -473,7 +474,7 @@ impl WhirBlockPlan {
                         .flat_map(|(k, &(_, _, n))| std::iter::repeat_n(k, n))
                         .collect();
                     let chain = ChainShape::new(config, p.layout.n_stack());
-                    stacked_verify_cost(&p.layout, &group_of, &chain, entry).perms()
+                    stacked_verify_cost_ood(&p.layout, &group_of, &chain, entry, false).perms()
                 })
                 .sum();
             costs.push(tables + opening + prepared_perms);
@@ -937,6 +938,9 @@ fn route_of(
 /// draws, the challenges and the state digest.
 struct Front {
     carried: Vec<Cell>,
+    /// Every carried polynomial's commit-time out-of-domain answer, in root
+    /// order (hinted).
+    answers: Vec<Ext>,
     transcript: WhirTranscript,
     z: Ext,
     alpha: Ext,
@@ -944,9 +948,10 @@ struct Front {
     state: Cell,
 }
 
-/// The front every leaf replays: every group's roots (hinted), the statement
-/// (constants), the roots block with the derived prepared roots, `z, α, β`,
-/// and the state digest (which does not advance the transcript).
+/// The front every leaf replays: every group's roots and every commit-time
+/// answer (hinted), the statement (constants), the roots block with the
+/// derived prepared roots, the answers (`absorb_roots_answers_and_challenge`),
+/// `z, α, β`, and the state digest (which does not advance the transcript).
 fn emit_front(
     b: &mut LfmBuilder,
     plan: &WhirBlockPlan,
@@ -966,6 +971,13 @@ fn emit_front(
             cell
         })
         .collect();
+    let answers: Vec<Ext> = (0..num_roots)
+        .map(|_| {
+            let wire = b.hint_word(arena, *at).as_ext();
+            *at += 1;
+            wire
+        })
+        .collect();
     let mut transcript = WhirTranscript::new();
     transcript.absorb_const_bytes(&plan.statement_bytes);
     let derived: Vec<LfmWord> = plan
@@ -977,10 +989,25 @@ fn emit_front(
                 .map(super::algebraic_commit::commitment_to_digest)
         })
         .collect();
-    let (z, alpha, beta) = emit_roots_block(b, &mut transcript, &carried, &derived);
+    // The roots block with the answers between the roots and the draws: the
+    // shared `emit_roots_block` is the epochs', which have none.
+    for root in &carried {
+        transcript.absorb_digest(b, *root);
+    }
+    for word in &derived {
+        let root = b.digest_const(*word);
+        transcript.absorb_digest(b, root.as_cell());
+    }
+    for answer in &answers {
+        transcript.absorb_ext(b, *answer);
+    }
+    let z = transcript.sample_ext(b);
+    let alpha = transcript.sample_ext(b);
+    let beta = transcript.sample_ext(b);
     let state = transcript.state(b);
     Front {
         carried,
+        answers,
         transcript,
         z,
         alpha,
@@ -989,8 +1016,56 @@ fn emit_front(
     }
 }
 
-/// The front alone, publishing `z, α, β` and then group `g`'s fork's first
-/// draw — what a test compares against the host's transcript.
+/// ★ `multilinear_block::commit_ood_point`, emitted: group `g`'s own
+/// transcript — the prefix as program constants, then its roots — one draw,
+/// the domain check, and the point's powers over the stack
+/// (`whir_chain::ood_point`). One squaring chain serves both, as the chain's
+/// successor rounds do.
+fn emit_commit_ood_point(
+    b: &mut LfmBuilder,
+    g: usize,
+    layout: &StackedLayout,
+    roots: &[Cell],
+    log_blowup: usize,
+    one: Ext,
+) -> Vec<Ext> {
+    let mut transcript = WhirTranscript::new();
+    transcript.absorb_const_bytes(&stark::multilinear_block::commit_ood_prefix(
+        g,
+        layout.n_stack(),
+        layout.num_polys(),
+    ));
+    for root in roots {
+        transcript.absorb_digest(b, *root);
+    }
+    let z0 = transcript.sample_ext(b);
+    let depth = layout.n_stack() + log_blowup;
+    let mut powers = Vec::with_capacity(depth + 1);
+    powers.push(z0);
+    for j in 0..depth {
+        let squared = b.emul(powers[j], powers[j]);
+        powers.push(squared);
+    }
+    super::whir_chain::emit_require_out_of_domain(b, powers[depth], one);
+    powers.truncate(layout.n_stack());
+    powers
+}
+
+/// What [`emit_commit_ood_point`]'s sponge costs: the prefix's seven felts and
+/// the group's roots into a fresh sponge, and one extension draw.
+fn commit_ood_sponge(polys: usize) -> SpongeSchedule {
+    let mut schedule = fresh_schedule();
+    schedule.absorb(stark::multilinear_block::commit_ood_prefix(0, 0, 0).len() / 8);
+    for _ in 0..polys {
+        schedule.absorb(DIGEST_FELTS);
+    }
+    schedule.draw_ext();
+    schedule
+}
+
+/// The front alone, publishing `z, α, β`, then group `g`'s fork's first draw
+/// and its commit-time out-of-domain point — what a test compares against the
+/// host's transcript.
 #[cfg(test)]
 pub(crate) fn front_program(plan: &WhirBlockPlan, g: usize) -> LfmProgram {
     let mut b = builder();
@@ -1004,6 +1079,18 @@ pub(crate) fn front_program(plan: &WhirBlockPlan, g: usize) -> LfmProgram {
     fork.absorb_const_bytes(&(g as u64).to_le_bytes());
     let first = fork.sample_ext(&mut b);
     b.public(first.as_cell());
+    let layout = &plan.frame.stack_layouts[g];
+    let root_at = plan.root_start(g);
+    let one = b.ext_const(&FEE::one());
+    let point = emit_commit_ood_point(
+        &mut b,
+        g,
+        layout,
+        &front.carried[root_at..root_at + layout.num_polys()],
+        plan.frame.config.log_blowup,
+        one,
+    );
+    b.public(point[0].as_cell());
     b.set_arena_len(arena, at);
     compile(b.finish())
 }
@@ -1018,12 +1105,16 @@ pub struct LeafChecks {
     pub(crate) prepared: bool,
     /// Whether the carrier subtracts the COMMIT-bus target.
     pub(crate) target: bool,
+    /// Whether each group's chains carry its commit-time answers (they are
+    /// hinted and absorbed either way, so the arena and `z` do not move).
+    pub(crate) commit_ood: bool,
 }
 
 impl LeafChecks {
     pub const ALL: Self = Self {
         prepared: true,
         target: true,
+        commit_ood: true,
     };
 }
 
@@ -1061,12 +1152,14 @@ fn emit_leaf(
     // ---- 1. the front.
     let Front {
         carried,
+        answers,
         transcript,
         z,
         alpha,
         beta,
         state,
     } = emit_front(b, plan, arena, &mut at);
+    let one = b.ext_const(&FEE::one());
 
     // ---- 2. the leaf's groups, each on its fork.
     let mut outputs: Vec<(Ext, Ext)> = Vec::new();
@@ -1174,6 +1267,14 @@ fn emit_leaf(
             .map(|(chain, (current, next))| chain.wires(current, next))
             .collect();
         let root_at = plan.root_start(g);
+        let ood_point = emit_commit_ood_point(
+            b,
+            g,
+            layout,
+            &carried[root_at..root_at + layout.num_polys()],
+            config.log_blowup,
+            one,
+        );
         let polys: Vec<StackedPolyWires<'_>> = (0..held.finals.len())
             .map(|poly| StackedPolyWires {
                 rounds: &rounds[poly],
@@ -1189,6 +1290,10 @@ fn emit_leaf(
                 polys: &polys,
                 shape: &chain,
                 domain: &frame.domains[g],
+                ood: checks.commit_ood.then_some(StackedOod {
+                    point: &ood_point,
+                    values: &answers[root_at..root_at + layout.num_polys()],
+                }),
             }],
             &[tables.len()],
             &walk,
@@ -1318,16 +1423,28 @@ pub fn block_leaf_arena(
             prepared,
         )?);
     }
-    Ok(leaf_arena(&proof.proof.roots, groups))
+    if proof.commit_ood.len() != proof.proof.roots.len() {
+        return Err(format!(
+            "the proof carries {} commit-time answers for {} roots",
+            proof.commit_ood.len(),
+            proof.proof.roots.len()
+        ));
+    }
+    Ok(leaf_arena(&proof.proof.roots, &proof.commit_ood, groups))
 }
 
-/// A leaf's arena from the block's roots and its groups' words
-/// ([`group_arena_words`]), in the leaf's group order.
-pub fn leaf_arena(roots: &[Commitment], groups: Vec<Vec<LfmWord>>) -> Vec<Vec<LfmWord>> {
+/// A leaf's arena from the block's roots, its commit-time answers and its
+/// groups' words ([`group_arena_words`]), in the leaf's group order.
+pub fn leaf_arena(
+    roots: &[Commitment],
+    answers: &[FEE],
+    groups: Vec<Vec<LfmWord>>,
+) -> Vec<Vec<LfmWord>> {
     let mut words: Vec<LfmWord> = roots
         .iter()
         .map(super::algebraic_commit::commitment_to_digest)
         .collect();
+    words.extend(answers.iter().map(super::word::ext_word));
     for group in groups {
         words.extend(group);
     }

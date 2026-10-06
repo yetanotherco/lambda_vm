@@ -470,6 +470,7 @@ pub fn emit_whir_leg(b: &mut LfmBuilder, child: &WhirChild<'_>, a: &WhirLegArena
             polys: &group_wires[group],
             shape: &group_shapes[group],
             domain: &plan.plan.group_domains[group],
+            ood: None,
         })
         .collect();
     // ★ Under policy B the main stack holds each table's columns PAST its

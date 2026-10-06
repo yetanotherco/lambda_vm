@@ -1048,6 +1048,7 @@ pub fn whir_global_program(
             polys: &group_wires[group],
             shape: &group_shapes[group],
             domain: &plan.group_domains[group],
+            ood: None,
         })
         .collect();
     emit_group_walk(&mut b, &mut transcript, &groups, &plan.sizes, &walk);

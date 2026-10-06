@@ -311,6 +311,49 @@ pub fn emit_stacked_verify(
     shape: &ChainShape,
     domain: &Domain<GoldilocksField>,
 ) -> Ext {
+    emit_stacked_verify_ood(
+        b, transcript, layout, polys, points, values, None, shape, domain,
+    )
+}
+
+/// A commitment's commit-time out-of-domain claims as wires
+/// (`stacked_eval::CommitOod`): the point's powers over the whole stack
+/// (`whir_chain::ood_point`) and one answer per stacked polynomial.
+#[derive(Clone, Copy)]
+pub struct StackedOod<'a> {
+    pub point: &'a [Ext],
+    pub values: &'a [Ext],
+}
+
+/// ★ `stacked_eval::verify_ood`, emitted: [`emit_stacked_verify`], then — with
+/// `ood` — one more draw after the column claims' batching challenge, `γ`;
+/// each polynomial's claim gains `γ·y_i` and its weight
+/// `γ·eq(ood_point, at)` over the whole stack. `None` is
+/// [`emit_stacked_verify`], row for row.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_stacked_verify_ood(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    layout: &StackedLayout,
+    polys: &[StackedPolyWires<'_>],
+    points: &[&[Ext]],
+    values: &[Ext],
+    ood: Option<StackedOod<'_>>,
+    shape: &ChainShape,
+    domain: &Domain<GoldilocksField>,
+) -> Ext {
+    if let Some(ood) = &ood {
+        assert_eq!(
+            ood.values.len(),
+            layout.num_polys(),
+            "one commit-time answer per stacked polynomial"
+        );
+        assert_eq!(
+            ood.point.len(),
+            layout.n_stack(),
+            "the commit-time point spans the stack"
+        );
+    }
     assert_eq!(
         values.len(),
         layout.placements().len(),
@@ -337,6 +380,7 @@ pub fn emit_stacked_verify(
     }
     let gamma = transcript.sample_ext(b);
     let weights = emit_challenge_powers(b, gamma, values.len());
+    let ood = ood.map(|ood| (ood, transcript.sample_ext(b)));
 
     let claims: Vec<ColumnClaim<'_>> = (0..values.len())
         .map(|column| ColumnClaim {
@@ -347,7 +391,10 @@ pub fn emit_stacked_verify(
 
     for (i, poly) in polys.iter().enumerate() {
         let root_lanes = b.unpack(poly.root);
-        let claimed = emit_claimed(b, layout, i, values, &weights);
+        let mut claimed = emit_claimed(b, layout, i, values, &weights);
+        if let Some((ood, ood_gamma)) = &ood {
+            claimed = b.emul_add(*ood_gamma, ood.values[i], claimed);
+        }
         emit_verify_weighted(
             b,
             transcript,
@@ -357,7 +404,16 @@ pub fn emit_stacked_verify(
             claimed,
             shape,
             domain,
-            |b, at| emit_weight_at(b, layout, i, &claims, at),
+            |b, at| {
+                let weight = emit_weight_at(b, layout, i, &claims, at);
+                match &ood {
+                    Some((ood, ood_gamma)) => {
+                        let eq = emit_eq_eval(b, ood.point, at);
+                        b.emul_add(*ood_gamma, eq, weight)
+                    }
+                    None => weight,
+                }
+            },
         );
     }
 
@@ -468,6 +524,19 @@ pub fn stacked_verify_cost(
     shape: &ChainShape,
     entry: SpongeEntry,
 ) -> StackedCost {
+    stacked_verify_cost_ood(layout, group_of, shape, entry, false)
+}
+
+/// [`stacked_verify_cost`] for [`emit_stacked_verify_ood`]: with `ood`, one
+/// more draw (a `Pack`), and per polynomial the claim's `MulAdd`, the
+/// whole-stack `eq` and the weight's `MulAdd`.
+pub fn stacked_verify_cost_ood(
+    layout: &StackedLayout,
+    group_of: &[usize],
+    shape: &ChainShape,
+    entry: SpongeEntry,
+    ood: bool,
+) -> StackedCost {
     let columns = layout.placements().len();
     let polys = layout.num_polys();
 
@@ -478,11 +547,18 @@ pub fn stacked_verify_cost(
         schedule.absorb(COORDINATES_PER_EXT);
     }
     schedule.draw_ext();
+    if ood {
+        ops += sample_ext_rows();
+        schedule.draw_ext();
+    }
 
     for poly in 0..polys {
         ops += 1;
         ops += columns_of(layout, poly).len();
         ops += weight_at_rows(layout, poly, group_of);
+        if ood {
+            ops += 2 + eq_eval_rows_again(layout.n_stack());
+        }
         ops += chain_shape_rows(shape);
         chain_sponge(shape, &mut schedule);
     }

@@ -13,7 +13,7 @@ use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::transcript_hash::RpxTranscriptHash;
 use multilinear::mle::Mle;
 use multilinear::stacked_eval::{
-    Claimed, StackedCommitment, StackedProof, WeightShare, weight_table,
+    Claimed, CommitOod, StackedCommitment, StackedProof, WeightShare, weight_table,
 };
 use multilinear::stacking::StackedLayout;
 use multilinear::whir::Domain;
@@ -32,8 +32,8 @@ use super::whir_chain::{
 };
 use super::whir_chain_tests::{Recording, chain_program, const_rows, hint_rows, perm_rows};
 use super::whir_stacked::{
-    ColumnClaim, StackedPolyWires, emit_stacked_verify, emit_weight_at, stacked_verify_cost,
-    weight_at_consts, weight_at_rows,
+    ColumnClaim, StackedOod, StackedPolyWires, emit_stacked_verify_ood, emit_weight_at,
+    stacked_verify_cost, stacked_verify_cost_ood, weight_at_consts, weight_at_rows,
 };
 use super::whir_transcript::{SpongeEntry, SpongeHash, WhirTranscript};
 use super::word::{LfmWord, ext_word, word_as_ext};
@@ -380,6 +380,10 @@ struct Fixture {
     /// The hashes the host's own transcript performed, reconstructed from the
     /// calls a real `stacked_eval::verify` made.
     host_hashes: Vec<SpongeHash>,
+    /// The commit-time out-of-domain claims the chains carry (I-WOOD): the
+    /// point's powers over the stack and one answer per polynomial; `None` for
+    /// the plain leg.
+    ood: Option<(Vec<FEE>, Vec<FEE>)>,
 }
 
 /// Commits, proves and verifies one group on the host, keeping the verifier's
@@ -389,6 +393,12 @@ struct Fixture {
 /// machine replays that hash and no other, so a fixture on the default
 /// transcript would be a fixture of a different protocol.
 fn fixture(group: &Group) -> Fixture {
+    fixture_with(group, false)
+}
+
+/// [`fixture`], with the chains carrying commit-time out-of-domain answers
+/// (`stacked_eval::prove_mapped_ood` / `verify_ood`) when `ood`.
+fn fixture_with(group: &Group, ood: bool) -> Fixture {
     let config = group_config(group);
     let layout = StackedLayout::build(&group.heights, group.n_stack).expect("the layout packs");
     let columns: Vec<Mle<F>> = group
@@ -435,25 +445,39 @@ fn fixture(group: &Group) -> Fixture {
     let stacked = StackedCommitment::<F, RpxWhir>::commit(layout.clone(), &borrowed, None, &config)
         .expect("the group commits");
     let roots = stacked.roots();
+    let z0 = fee(0x00d_ca11);
+    let answers = if ood {
+        multilinear::stacked_eval::ood_answers::<F, E, _>(&layout, &borrowed, None, &z0)
+            .expect("the answers")
+            .0
+    } else {
+        Vec::new()
+    };
+    let commit_ood = ood.then_some(CommitOod {
+        z0: &z0,
+        values: &answers,
+    });
     let mut proving = HostTranscript::new(&[]);
-    let proof = multilinear::stacked_eval::prove::<F, E, _, RpxWhir, _>(
+    let proof = multilinear::stacked_eval::prove_mapped_ood::<F, E, _, RpxWhir, _>(
         &stacked,
         &borrowed,
         None,
         &Claimed::PerColumn(&per_column),
         &values,
+        commit_ood,
         &config,
         &mut proving,
     )
     .expect("the group proves");
 
     let mut recorded = Recording::new();
-    multilinear::stacked_eval::verify::<F, E, _, RpxWhir>(
+    multilinear::stacked_eval::verify_ood::<F, E, _, RpxWhir>(
         &proof,
         stacked.layout(),
         &roots,
         &Claimed::PerColumn(&per_column),
         &values,
+        commit_ood,
         stacked.domain(),
         &config,
         &mut recorded,
@@ -467,7 +491,7 @@ fn fixture(group: &Group) -> Fixture {
     let polys = layout.num_polys();
     assert_eq!(
         recorded.sampled.len(),
-        1 + polys * (shape.num_vars + 2 * (shape.rounds() - 1)),
+        1 + usize::from(ood) + polys * (shape.num_vars + 2 * (shape.rounds() - 1)),
         "{}: extension draws are gamma, then one a sumcheck round plus z0 and gamma on each \
          round with a successor, in each of the {polys} chains",
         group.name
@@ -486,6 +510,12 @@ fn fixture(group: &Group) -> Fixture {
         shape,
         gamma: recorded.sampled[0],
         host_hashes,
+        ood: ood.then(|| {
+            (
+                multilinear::whir_chain::ood_point(&z0, group.n_stack),
+                answers.clone(),
+            )
+        }),
     }
 }
 
@@ -495,6 +525,8 @@ struct Arena {
     group_at: Vec<u32>,
     values_at: u32,
     poly_at: Vec<u32>,
+    /// Where the commit-time point's powers start, then the answers.
+    ood_at: u32,
     total: u32,
 }
 
@@ -514,10 +546,15 @@ impl Arena {
             // The root, the final value, then the chain's rounds.
             at += 2 + RoundStorage::words(&fixture.shape);
         }
+        let ood_at = at;
+        if let Some((point, answers)) = &fixture.ood {
+            at += (point.len() + answers.len()) as u32;
+        }
         Self {
             group_at,
             values_at,
             poly_at,
+            ood_at,
             total: at,
         }
     }
@@ -581,13 +618,22 @@ fn stacked_program(fixture: &Fixture) -> LfmProgram {
         .map(|&g| points[g].as_slice())
         .collect();
 
-    let gamma = emit_stacked_verify(
+    let ood: Option<(Vec<Ext>, Vec<Ext>)> = fixture.ood.as_ref().map(|(point, answers)| {
+        let mut hinted = (0..(point.len() + answers.len()) as u32)
+            .map(|i| b.hint_word(arena, at.ood_at + i).as_ext())
+            .collect::<Vec<_>>();
+        let answers = hinted.split_off(point.len());
+        (hinted, answers)
+    });
+    let gamma = emit_stacked_verify_ood(
         &mut b,
         &mut transcript,
         &fixture.layout,
         &polys,
         &claimed_at,
         &values,
+        ood.as_ref()
+            .map(|(point, values)| StackedOod { point, values }),
         &fixture.shape,
         &fixture.domain,
     );
@@ -609,6 +655,9 @@ fn stacked_arena(fixture: &Fixture) -> Vec<LfmWord> {
         words.push(fixture.root_words[poly]);
         words.push(ext_word(&chain.final_value));
         push_round_words(&mut words, &fixture.shape, chain);
+    }
+    if let Some((point, answers)) = &fixture.ood {
+        words.extend(point.iter().chain(answers).map(ext_word));
     }
     words
 }
@@ -1119,4 +1168,75 @@ fn the_marginal_the_routing_rule_charges_is_the_one_the_stack_bills() {
         widest + 1
     );
     assert_eq!(spilled.n_stack(), stack.get());
+}
+
+/// ★ The leg with commit-time out-of-domain answers (I-WOOD): it executes on a
+/// proof `stacked_eval::verify_ood` accepts and draws the host's batching
+/// challenge; its schedule is the host transcript's, hash for hash; and its rows
+/// and permutations are `stacked_verify_cost_ood`'s. A false answer has no
+/// execution.
+#[test]
+fn the_stacked_verify_with_commit_answers_matches_the_host() {
+    for group in groups() {
+        let fixture = fixture_with(&group, true);
+        let program = stacked_program(&fixture);
+        let arena = stacked_arena(&fixture);
+        let exec = execute(
+            &program,
+            std::slice::from_ref(&arena),
+            &crate::hash_pin::BLOCK_HASHER,
+        )
+        .unwrap_or_else(|e| panic!("{}: the host's proof must execute: {e:?}", fixture.name));
+        let gamma = word_as_ext(&exec.public_words[0].1).expect("a published challenge");
+        assert_eq!(
+            gamma, fixture.gamma,
+            "{}: the batching challenge",
+            fixture.name
+        );
+
+        let cost = stacked_verify_cost_ood(
+            &fixture.layout,
+            &fixture.group_of,
+            &fixture.shape,
+            SpongeEntry::fresh(),
+            true,
+        );
+        assert_eq!(
+            cost.schedule().hashes(),
+            fixture.host_hashes.as_slice(),
+            "{}: the threaded schedule",
+            fixture.name
+        );
+        let at = Arena::new(&fixture);
+        let measured = program.instrs.len() - const_rows(&program) - plumbing(&at);
+        assert_eq!(measured, cost.operations(), "{}: rows", fixture.name);
+        assert_eq!(
+            perm_rows(&program),
+            cost.perms(),
+            "{}: permutations",
+            fixture.name
+        );
+        assert!(
+            cost.operations()
+                > stacked_verify_cost(
+                    &fixture.layout,
+                    &fixture.group_of,
+                    &fixture.shape,
+                    SpongeEntry::fresh()
+                )
+                .operations(),
+            "{}: the answers cost rows",
+            fixture.name
+        );
+
+        let mut false_answer = arena;
+        let last = false_answer.len() - 1;
+        let wrong = word_as_ext(&false_answer[last]).expect("an answer") + FEE::one();
+        false_answer[last] = ext_word(&wrong);
+        assert!(
+            execute(&program, &[false_answer], &crate::hash_pin::BLOCK_HASHER).is_err(),
+            "{}: a false answer executes",
+            fixture.name
+        );
+    }
 }

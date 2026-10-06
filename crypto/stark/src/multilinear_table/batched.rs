@@ -212,6 +212,11 @@ pub struct VerifierChecks {
     pub reduce_shape: bool,
     /// The preprocessed columns at `r_{<n_T}`.
     pub preprocessed: bool,
+    /// Each group's commit-time out-of-domain answers batched into its chains
+    /// (`multilinear_block::commit_ood_point`). Off, they are still absorbed
+    /// before `(z, α, β)` but bind nothing — the mutation a test turns off to
+    /// show the batching is what refuses a false answer.
+    pub commit_ood: bool,
 }
 
 impl VerifierChecks {
@@ -221,6 +226,7 @@ impl VerifierChecks {
         balance: true,
         reduce_shape: true,
         preprocessed: true,
+        commit_ood: true,
     };
 }
 

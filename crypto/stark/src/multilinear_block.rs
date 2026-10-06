@@ -8,11 +8,14 @@
 //! 1. **Phase A (commit).** Group by group: the columns go up, the stack is
 //!    committed, the roots are taken, and the codewords go — only the top of
 //!    each tree stays, on the host ([`RetiredStack`]). No card holds a block's
-//!    codewords, and every root must exist before the first challenge.
+//!    codewords, and every root must exist before the first challenge. Each
+//!    group then answers its commit-time out-of-domain point
+//!    ([`commit_ood_point`], W-10) from its columns, still on the card.
 //! 2. **The roots block.** Every root, in group order, into the transcript;
-//!    then `(z, α, β)` once, shared by every table of the block
-//!    ([`absorb_roots_and_challenge`], the same function every other proof
-//!    uses). The transcript's state after the draw is the block's `S_post`.
+//!    then every commit-time answer; then `(z, α, β)` once, shared by every
+//!    table of the block ([`absorb_roots_answers_and_challenge`]). The
+//!    transcript's state after the draw is the block's `S_post`. Each group's
+//!    opening batches its answers into its chains (`stacked_eval::CommitOod`).
 //! 3. **Phase B (prove), per group `g`, on the fork `S_post ‖ g`.** The group's
 //!    columns go up again; each of its tables is argued (today's
 //!    [`prove`]) — or, under [`ArgueFormat::Batched`], the group's tables are
@@ -68,7 +71,10 @@ use multilinear::{
     Error as MlError,
     mle::Mle,
     narrow::ColumnOf,
-    stacked_eval::{self, Claimed, ColumnsAt, RetiredStack, StackedCommitment, StackedProof},
+    stacked_eval::{
+        self, Claimed, ColumnsAt, CommitOod, OodCounts, RetiredStack, StackedCommitment,
+        StackedProof,
+    },
     stacking::StackedLayout,
     whir::Domain,
     whir_chain::{ArgueFormat, ChainConfig, StackVars},
@@ -80,7 +86,7 @@ use crate::narrow::NarrowMain;
 use crate::spill::{Prefetch, ReadPhase, SpillStore, SpilledMain};
 
 use crate::multilinear_table::{
-    CommittedTable, MultiProof, TableProof, TableStatement, absorb_roots_and_challenge,
+    CommittedTable, MultiProof, TableProof, TableStatement, absorb_roots_answers_and_challenge,
     batched::{self, BatchedArgue, ProverFaults, VerifierChecks, Where},
     check_preprocessed, contribution, global_layout, prove, verify,
 };
@@ -170,6 +176,101 @@ pub struct GroupStamps {
     pub packed_tables: usize,
     pub packed_cells: usize,
     pub packed_bytes: usize,
+    /// Phase A: the group's commit-time out-of-domain answers
+    /// ([`commit_ood_point`]) — the seconds on the committer's thread, and how
+    /// many columns the card evaluated in place and the host did.
+    pub ood: f64,
+    pub ood_counts: OodCounts,
+}
+
+/// The label that opens a group's commit-time out-of-domain transcript
+/// ([`commit_ood_point`]). 32 bytes, so the prefix ends on a felt boundary.
+pub const COMMIT_OOD_LABEL: &[u8; 32] = b"LAMBDAVM_WHIR_BLOCK_COMMIT_OOD_1";
+
+/// The bytes a group's commit-time out-of-domain transcript opens with, in
+/// ONE append: [`COMMIT_OOD_LABEL`], then the group's index, its stack's
+/// variables and its polynomial count, each a little-endian `u64` — 56 bytes,
+/// seven whole felts. The in-guest leaf absorbs the same bytes as program
+/// constants, and the roots that follow are runtime felts, which must start on
+/// a felt boundary (`WhirTranscript::absorb_felts`).
+pub fn commit_ood_prefix(group: usize, n_stack: usize, polys: usize) -> Vec<u8> {
+    let mut bytes = COMMIT_OOD_LABEL.to_vec();
+    for word in [group, n_stack, polys] {
+        bytes.extend_from_slice(&(word as u64).to_le_bytes());
+    }
+    bytes
+}
+
+/// ★★ WHERE GROUP `g`'s COMMIT-TIME OUT-OF-DOMAIN POINT COMES FROM — the only
+/// place, called by phase A (through the [`OodSource`] its caller hands it) and
+/// by the verifier.
+///
+/// # Why there is a point at all (W-10)
+///
+/// Every chain of the block starts with round 0's sumcheck on its committed
+/// word, and the word's first out-of-domain sample used to be its
+/// successor's, after `(z, α, β)`. Until then nothing binds a committed word
+/// to ONE codeword of its Johnson list, and the block-wide bus balance is one
+/// equation over every chain — so its bad event unioned over the product of
+/// every chain's list. An answer `y_i = F_i(ood_point(z0_g))` given before
+/// `(z, α, β)` names one list member per word, except with
+/// `C(L,2)·(2^n − 1)/|F|` per word (I-WOOD §2).
+///
+/// # Why the group's own transcript
+///
+/// `z0_g` must come after the group's roots and before `(z, α, β)`. A fresh
+/// transcript over the group's index, its stack's shape and its roots gives
+/// that the moment the group's commit ends, while its columns are still on the
+/// card — phase A answers there, at the cost of one evaluation, instead of a
+/// second pass over every column after phase A. The bad event is a property of
+/// one word and its code, both fixed by this input; the main transcript binds
+/// the statement, every root and every answer before `(z, α, β)`.
+///
+/// ⚠ Pending the judge's ruling (I-WOOD §2.2). The other form — one `z0` drawn
+/// from the main transcript after the roots — replaces this function's body
+/// and moves the answers after phase A; every caller stays as it is.
+pub fn commit_ood_point<E, T>(
+    group: usize,
+    layout: &StackedLayout,
+    roots: &[Commitment],
+    log_blowup: usize,
+) -> Result<FieldElement<E>, MlError>
+where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
+{
+    if roots.len() != layout.num_polys() {
+        return Err(MlError::QueryCountMismatch {
+            expected: layout.num_polys(),
+            got: roots.len(),
+        });
+    }
+    let mut transcript = T::default();
+    transcript.append_bytes(&commit_ood_prefix(
+        group,
+        layout.n_stack(),
+        layout.num_polys(),
+    ));
+    for root in roots {
+        transcript.append_bytes(root);
+    }
+    let z0: FieldElement<E> = transcript.sample_field_element();
+    multilinear::whir_chain::require_out_of_domain_of_size(&z0, layout.n_stack() + log_blowup)?;
+    Ok(z0)
+}
+
+/// What phase A asks for a group's commit-time out-of-domain point: the
+/// group's index, its layout and its roots in, [`commit_ood_point`] out. A
+/// closure so phase A needs no transcript type of its own.
+pub type OodSource<'s, E> =
+    &'s (dyn Fn(usize, &StackedLayout, &[Commitment]) -> Result<FieldElement<E>, MlError> + Sync);
+
+/// Phase A's commit-time out-of-domain claims: each group's point, and every
+/// carried polynomial's answer in root order.
+#[derive(Clone, Debug)]
+pub struct CommittedOod<E: IsField> {
+    pub points: Vec<FieldElement<E>>,
+    pub answers: Vec<FieldElement<E>>,
 }
 
 /// How a block holds its committed columns between phase A and phase B.
@@ -665,11 +766,16 @@ impl Default for ArgueDeviation {
 /// batched argue), the groups' batched argues (one per group under the batched
 /// argue, none under the per-table one), the prepared openings in the
 /// `prepared` list's order, and every group's stamps.
+///
+/// The last element is every carried polynomial's commit-time out-of-domain
+/// answer, in root order ([`commit_ood_point`]); empty only when phase A ran
+/// without them (an A/B arm no verifier accepts).
 pub type BlockProved<F, E> = (
     MultiProof<F, E>,
     Vec<BatchedArgue<E>>,
     Vec<StackedProof<F, E>>,
     Vec<GroupStamps>,
+    Vec<FieldElement<E>>,
 );
 
 /// The block after phase A: every table, the groups' roots and the tops of
@@ -691,6 +797,11 @@ where
     /// The spill, when one is on, and each table's slot in it.
     spill: Option<BlockSpill>,
     spilled: Vec<Option<SpilledMain>>,
+    /// The groups' commit-time out-of-domain claims, when phase A answered.
+    ood: Option<CommittedOod<E>>,
+    /// A test's fault ([`Self::fault_commit_ood_unbound`]): the answers ride
+    /// the transcript and the proof, and no chain carries them.
+    ood_unbound: bool,
 }
 
 impl<'a, F, E> BlockCommitted<'a, F, E>
@@ -705,6 +816,11 @@ where
     ///
     /// `sizes` must be [`block_groups`]'s over the same shapes and the
     /// config's stack cap, or the verifier rebuilds other stacks.
+    ///
+    /// `ood` is where each group's commit-time out-of-domain point comes from
+    /// ([`commit_ood_point`]); each group answers it as its commit ends.
+    /// `None` answers nothing — an A/B arm whose proofs no verifier accepts.
+    #[allow(clippy::too_many_arguments)]
     pub fn commit<H: WhirHash>(
         tables: Vec<CommittedTable<'a, F, E>>,
         sizes: &[usize],
@@ -712,6 +828,7 @@ where
         drop_levels: usize,
         narrow: Narrowing,
         upload_ahead: bool,
+        ood: Option<OodSource<'_, E>>,
     ) -> Result<Self, MlError> {
         if sizes.iter().sum::<usize>() != tables.len() {
             return Err(MlError::QueryCountMismatch {
@@ -724,7 +841,15 @@ where
             .iter()
             .map(|&size| tables.by_ref().take(size).collect::<Vec<_>>())
             .collect::<Vec<_>>();
-        Self::commit_streamed::<H>(groups, sizes, config, drop_levels, narrow, upload_ahead)
+        Self::commit_streamed::<H>(
+            groups,
+            sizes,
+            config,
+            drop_levels,
+            narrow,
+            upload_ahead,
+            ood,
+        )
     }
 
     /// [`Self::commit`] over groups handed over one at a time, in group order —
@@ -732,6 +857,7 @@ where
     /// the earlier. Each group's wait for its tables is stamped (`wait_a`). A
     /// producer that stops early leaves fewer groups than `sizes` names, which
     /// is refused.
+    #[allow(clippy::too_many_arguments)]
     pub fn commit_streamed<H: WhirHash>(
         groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
         sizes: &[usize],
@@ -739,6 +865,7 @@ where
         drop_levels: usize,
         narrow: Narrowing,
         upload_ahead: bool,
+        ood: Option<OodSource<'_, E>>,
     ) -> Result<Self, MlError> {
         let block = Self::commit_groups::<H>(
             groups.into_iter().take(sizes.len()),
@@ -746,6 +873,7 @@ where
             drop_levels,
             narrow,
             upload_ahead,
+            ood,
         )?;
         if block.sizes != sizes {
             return Err(MlError::QueryCountMismatch {
@@ -772,6 +900,7 @@ where
         drop_levels: usize,
         narrow: Narrowing,
         upload_ahead: bool,
+        ood: Option<OodSource<'_, E>>,
     ) -> Result<Self, MlError> {
         Self::commit_groups_logged::<H>(
             groups,
@@ -781,11 +910,13 @@ where
             upload_ahead,
             None,
             None,
+            ood,
         )
     }
 
     /// [`Self::commit_groups`], counting where the columns are in `mem` (a
     /// memory log, through phase B too) as they move. The commits are the same.
+    #[allow(clippy::too_many_arguments)]
     pub fn commit_groups_logged<H: WhirHash>(
         groups: impl IntoIterator<Item = Vec<CommittedTable<'a, F, E>>>,
         config: &ChainConfig,
@@ -794,6 +925,7 @@ where
         upload_ahead: bool,
         mem: Option<Arc<BlockMem>>,
         spill: Option<BlockSpill>,
+        ood: Option<OodSource<'_, E>>,
     ) -> Result<Self, MlError> {
         let mut tables = Vec::new();
         let mut spilled: Vec<Option<SpilledMain>> = Vec::new();
@@ -801,6 +933,8 @@ where
         let mut retired_groups = Vec::new();
         let mut roots = Vec::new();
         let mut stamps = Vec::new();
+        let mut ood_points = Vec::new();
+        let mut ood_answers = Vec::new();
         let mut incoming = groups.into_iter();
         let started = Instant::now();
         // The previous group's pack on the card, running beside this group's
@@ -876,6 +1010,7 @@ where
                 });
             }
             sizes.push(size);
+            let group_index = sizes.len() - 1;
             if !upload_ahead && let Some(packed) = packing.take() {
                 install_and_spill(
                     packed,
@@ -909,13 +1044,14 @@ where
                         let signal = move || {
                             let _ = room_tx.send(());
                         };
-                        let committed = commit_and_retire::<F, H, _>(
+                        let committed = commit_and_retire::<F, E, H, _>(
                             layout,
                             columns,
                             resident,
                             config,
                             drop_levels,
                             &signal,
+                            ood.map(|source| (group_index, source)),
                         );
                         (committed, Instant::now())
                     });
@@ -967,16 +1103,23 @@ where
                 ahead = next;
                 committed
             } else {
-                commit_and_retire::<F, H, _>(
+                commit_and_retire::<F, E, H, _>(
                     layout,
                     &columns,
                     resident,
                     config,
                     drop_levels,
                     &|| {},
+                    ood.map(|source| (group_index, source)),
                 )
             };
-            let (group_roots, retired, commit, retire) = committed?;
+            let (group_roots, retired, commit, retire, answered) = committed?;
+            if let Some(answered) = answered {
+                stamp.ood = answered.secs;
+                stamp.ood_counts = answered.counts;
+                ood_points.push(answered.point);
+                ood_answers.extend(answered.answers);
+            }
             drop(columns);
             drop(handles);
             roots.extend(group_roots);
@@ -1071,6 +1214,11 @@ where
             mem,
             spill,
             spilled,
+            ood: ood.map(|_| CommittedOod {
+                points: ood_points,
+                answers: ood_answers,
+            }),
+            ood_unbound: false,
         })
     }
 
@@ -1102,6 +1250,22 @@ where
             .iter_mut()
             .filter_map(|table| table.narrow_mut())
             .any(|packed| packed.fault_width_map())
+    }
+
+    /// A test's fault: the first commit-time answer made false, and every
+    /// group's answers left out of its chains — a prover whose answers bind
+    /// nothing, which only a verifier that does not batch them accepts
+    /// (`VerifierChecks::commit_ood`). Returns whether there was an answer.
+    #[doc(hidden)]
+    pub fn fault_commit_ood_unbound(&mut self) -> bool {
+        match &mut self.ood {
+            Some(ood) if !ood.answers.is_empty() => {
+                ood.answers[0] += FieldElement::<E>::one();
+                self.ood_unbound = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// A test's fault: the first spilled table's slot lost, so its columns
@@ -1155,19 +1319,46 @@ where
 /// A group committed and retired: its roots, its retired stack, and the
 /// commit's and the retire's seconds. `on_room` as
 /// [`StackedCommitment::commit_signalled`].
-fn commit_and_retire<F, H, C>(
+/// One group's commit-time out-of-domain answers, as phase A gave them.
+struct Answered<E: IsField> {
+    point: FieldElement<E>,
+    answers: Vec<FieldElement<E>>,
+    counts: OodCounts,
+    secs: f64,
+}
+
+/// What [`commit_and_retire`] returns: the roots, the retired stack, the
+/// commit's and the retire's seconds, and the answers when it gave them.
+type CommittedGroup<F, E> = (
+    Vec<Commitment>,
+    RetiredStack<F>,
+    f64,
+    f64,
+    Option<Answered<E>>,
+);
+
+/// Commits a group, retires its codewords, and — with `ood` — answers its
+/// commit-time out-of-domain point from its columns while they are still where
+/// the commit read them (on the card, in place, when `resident` holds them):
+/// after the retire, so the codewords' room is back, and before the store goes
+/// to the packer.
+#[allow(clippy::too_many_arguments)]
+fn commit_and_retire<F, E, H, C>(
     layout: StackedLayout,
     columns: &[&C],
     resident: Option<(&multilinear::gpu::ResidentColumns, usize)>,
     config: &ChainConfig,
     drop_levels: usize,
     on_room: &dyn Fn(),
-) -> Result<(Vec<Commitment>, RetiredStack<F>, f64, f64), MlError>
+    ood: Option<(usize, OodSource<'_, E>)>,
+) -> Result<CommittedGroup<F, E>, MlError>
 where
-    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
     H: WhirHash,
     C: multilinear::narrow::HostColumn<F>,
     FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: Send + Sync,
 {
     let t = Instant::now();
     let stacked = StackedCommitment::<F, H>::commit_signalled(
@@ -1181,7 +1372,27 @@ where
     let commit = t.elapsed().as_secs_f64();
     let t = Instant::now();
     let retired = stacked.retire(drop_levels, config)?;
-    Ok((roots, retired, commit, t.elapsed().as_secs_f64()))
+    let retire = t.elapsed().as_secs_f64();
+    let answered = match ood {
+        Some((group, source)) => {
+            let t = Instant::now();
+            let point = source(group, retired.layout(), &roots)?;
+            let (answers, counts) = stacked_eval::ood_answers::<F, E, C>(
+                retired.layout(),
+                columns,
+                resident.map(|(store, first)| (store, ColumnsAt::From(first))),
+                &point,
+            )?;
+            Some(Answered {
+                point,
+                answers,
+                counts,
+                secs: t.elapsed().as_secs_f64(),
+            })
+        }
+        None => None,
+    };
+    Ok((roots, retired, commit, retire, answered))
 }
 
 /// What a packer hands back: one packed table or none per table of its group,
@@ -1434,7 +1645,7 @@ where
     if config.format.argue != ArgueFormat::PerTable {
         return Err(MlError::ArgueFormatMismatch);
     }
-    let (proof, _, _, stamps) = block_prove_on_forks::<F, E, T, H>(
+    let (proof, _, _, stamps, _) = block_prove_on_forks::<F, E, T, H>(
         committed,
         config,
         transcript,
@@ -1494,6 +1705,9 @@ pub struct GroupOpened<'a, F: IsField, E: IsField> {
     pub group: usize,
     /// Every group's root, as the proof carries them.
     pub roots: &'a [Commitment],
+    /// Every carried polynomial's commit-time out-of-domain answer, in root
+    /// order, as the proof carries them (empty under the A/B arm without).
+    pub commit_ood: &'a [FieldElement<E>],
     /// The group's batched argue (the batched format), or `None`.
     pub argue: Option<&'a BatchedArgue<E>>,
     /// The group's tables' proofs, in table order (the per-table format;
@@ -1539,6 +1753,8 @@ where
         mem,
         spill,
         mut spilled,
+        ood,
+        ood_unbound,
     } = committed;
     let starts: Vec<usize> = sizes
         .iter()
@@ -1556,7 +1772,18 @@ where
         tables[t].num_committed_columns()
     })?;
     let derived: Vec<Commitment> = prepared.iter().flat_map(|p| p.commitment.roots()).collect();
-    let (z, alpha, beta) = absorb_roots_and_challenge::<E, T>(transcript, &roots, &derived);
+    let answers: &[FieldElement<E>] = ood.as_ref().map_or(&[], |ood| &ood.answers);
+    let (z, alpha, beta) =
+        absorb_roots_answers_and_challenge::<E, T>(transcript, &roots, &derived, answers);
+    // Where each group's roots, and so its answers, start.
+    let root_starts: Vec<usize> = groups
+        .iter()
+        .scan(0usize, |at, retired| {
+            let start = *at;
+            *at += retired.layout().num_polys();
+            Some(start)
+        })
+        .collect();
 
     let mut table_proofs = Vec::with_capacity(tables.len());
     let mut argues = Vec::new();
@@ -1712,12 +1939,17 @@ where
         stamps[g].encode = t.elapsed().as_secs_f64();
         stamps[g].open_room = multilinear::gpu::ledger_reserved().saturating_sub(before_revive);
         let t = Instant::now();
-        openings.push(stacked_eval::prove::<F, E, T, H, _>(
+        let group_ood = ood.as_ref().filter(|_| !ood_unbound).map(|ood| CommitOod {
+            z0: &ood.points[g],
+            values: &ood.answers[root_starts[g]..root_starts[g] + stacked.layout().num_polys()],
+        });
+        openings.push(stacked_eval::prove_mapped_ood::<F, E, T, H, _>(
             &stacked,
             &columns,
-            store.as_ref().map(|store| (&**store, 0)),
+            store.as_ref().map(|store| (&**store, ColumnsAt::From(0))),
             &Claimed::PerColumn(&points),
             &values,
+            group_ood,
             config,
             &mut fork,
         )?);
@@ -1777,6 +2009,7 @@ where
             on_group(GroupOpened {
                 group: g,
                 roots: &roots,
+                commit_ood: answers,
                 argue: argues[argues_before..].first(),
                 tables: &table_proofs[tables_before..],
                 opening,
@@ -1825,6 +2058,7 @@ where
         argues,
         prepared_openings,
         stamps,
+        ood.map(|ood| ood.answers).unwrap_or_default(),
     ))
 }
 
@@ -1838,6 +2072,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub fn block_verify<F, E, T, H>(
     proof: &MultiProof<F, E>,
+    commit_ood: &[FieldElement<E>],
     prepared_openings: &[StackedProof<F, E>],
     prepared: &[BlockPreparedCheck<'_, F>],
     statements: &[TableStatement<'_, F, E>],
@@ -1856,10 +2091,12 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
-        + Clone,
+        + Clone
+        + Default,
 {
     block_verify_with::<F, E, T, H>(
         proof,
+        commit_ood,
         &[],
         prepared_openings,
         prepared,
@@ -1885,10 +2122,17 @@ where
 /// checks and the bus balance are switched by `checks`. Both are mutations: a
 /// test shows each check is what refuses its forgery. Production passes
 /// `false` and [`VerifierChecks::ALL`].
+///
+/// `commit_ood` is every carried polynomial's commit-time out-of-domain
+/// answer, in root order: one per root, absorbed after the roots and before
+/// `(z, α, β)`, and each batched into its chain against the group's point
+/// ([`commit_ood_point`]). A proof without them is refused: there is no
+/// format without them (W-10).
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn block_verify_with<F, E, T, H>(
     proof: &MultiProof<F, E>,
+    commit_ood: &[FieldElement<E>],
     argues: &[BatchedArgue<E>],
     prepared_openings: &[StackedProof<F, E>],
     prepared: &[BlockPreparedCheck<'_, F>],
@@ -1910,7 +2154,8 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
-        + Clone,
+        + Clone
+        + Default,
 {
     // The format is the verifier's config's, never the proof's: that format's
     // messages present in full, the other's absent.
@@ -1938,6 +2183,13 @@ where
         return Err(MlError::QueryCountMismatch {
             expected: polys,
             got: proof.roots.len(),
+        });
+    }
+    // One commit-time answer per carried root: none missing, none extra.
+    if commit_ood.len() != proof.roots.len() {
+        return Err(MlError::QueryCountMismatch {
+            expected: proof.roots.len(),
+            got: commit_ood.len(),
         });
     }
     if proof.preprocessed.is_some() {
@@ -1987,7 +2239,8 @@ where
         .iter()
         .flat_map(|p| p.roots.iter().copied())
         .collect();
-    let (z, alpha, beta) = absorb_roots_and_challenge::<E, T>(transcript, &proof.roots, &derived);
+    let (z, alpha, beta) =
+        absorb_roots_answers_and_challenge::<E, T>(transcript, &proof.roots, &derived, commit_ood);
 
     let mut balance = FieldElement::<E>::zero();
     let mut statement_at = 0usize;
@@ -2053,12 +2306,19 @@ where
             }
         }
         let roots = &proof.roots[root_at..root_at + layout.num_polys()];
-        stacked_eval::verify::<F, E, T, H>(
+        // The group's point, from its own roots and the verifier's layout.
+        let z0 = commit_ood_point::<E, T>(g, layout, roots, config.log_blowup)?;
+        let ood = checks.commit_ood.then_some(CommitOod {
+            z0: &z0,
+            values: &commit_ood[root_at..root_at + layout.num_polys()],
+        });
+        stacked_eval::verify_ood::<F, E, T, H>(
             opening,
             layout,
             roots,
             &Claimed::PerColumn(&points),
             &values,
+            ood,
             domain,
             config,
             &mut fork,
@@ -2099,6 +2359,49 @@ where
         return Err(MlError::BusImbalance);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod commit_ood_point_tests {
+    use super::{commit_ood_point, commit_ood_prefix};
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use math::field::{element::FieldElement, goldilocks::GoldilocksField as F};
+    use multilinear::stacking::StackedLayout;
+
+    type T = DefaultTranscript<F>;
+
+    /// The prefix ends on a felt boundary, so the roots after it are whole
+    /// felts in the in-guest replay (`WhirTranscript::absorb_felts`).
+    #[test]
+    fn the_prefix_is_seven_whole_felts() {
+        assert_eq!(commit_ood_prefix(3, 27, 3).len(), 56);
+        assert_eq!(commit_ood_prefix(usize::MAX, 0, 1).len() % 8, 0);
+    }
+
+    /// The point is a function of the group's index, its shape and every one
+    /// of its roots — and of nothing else.
+    #[test]
+    fn the_point_moves_with_the_group_its_shape_and_each_root() {
+        let layout = StackedLayout::build(&[4, 4, 4], 5).unwrap();
+        assert_eq!(layout.num_polys(), 2);
+        let roots = [[7u8; 32], [9u8; 32]];
+        let at = |g: usize, layout: &StackedLayout, roots: &[[u8; 32]]| -> FieldElement<F> {
+            commit_ood_point::<F, T>(g, layout, roots, 2).unwrap()
+        };
+        let base = at(0, &layout, &roots);
+        assert_eq!(base, at(0, &layout, &roots), "deterministic");
+        assert_ne!(base, at(1, &layout, &roots), "the group's index");
+        let wider = StackedLayout::build(&[4, 4, 4, 4, 4], 6).unwrap();
+        assert_eq!(wider.num_polys(), 2);
+        assert_ne!(at(0, &wider, &roots), base, "the stack's variables");
+        let mut moved = roots;
+        moved[1][31] ^= 1;
+        assert_ne!(base, at(0, &layout, &moved), "the last root");
+        assert!(
+            commit_ood_point::<F, T>(0, &layout, &roots[..1], 2).is_err(),
+            "a root per polynomial"
+        );
+    }
 }
 
 #[cfg(test)]

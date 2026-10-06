@@ -104,6 +104,7 @@ fn small_block_cut(
         pack_finished: true,
         gpack: true,
         spill: crate::block_whir::BlockSpillPolicy::Off,
+        commit_ood: true,
     };
     cut(&mut options);
     let proof = prove_block_whir(&elf, &[], &opts, format, &options)
@@ -187,6 +188,7 @@ fn the_groups_phase_b_hands_over_build_every_leafs_arena() {
             seen.lock().expect("lock").push(GroupMsg {
                 group: opened.group,
                 roots: opened.roots.to_vec(),
+                commit_ood: opened.commit_ood.to_vec(),
                 tables: opened.tables.to_vec(),
                 argue: opened.argue.cloned(),
                 opening: opened.opening.clone(),
@@ -232,6 +234,7 @@ fn the_groups_phase_b_hands_over_build_every_leafs_arena() {
         for k in 0..plan.partition().num_leaves() {
             let streamed = leaf_arena(
                 &seen[0].roots,
+                &seen[0].commit_ood,
                 plan.partition()
                     .leaf(k)
                     .iter()
@@ -368,8 +371,9 @@ fn whir_block_leaves_execute_and_close_the_bus() {
 }
 
 /// The leaves' front draws the host verifier's challenges: `z, α, β` after the
-/// statement and every root (the groups' and the derived prepared ones), and a
-/// group fork's first draw after the group's index.
+/// statement, every root (the groups' and the derived prepared ones) and every
+/// commit-time answer, a group fork's first draw after the group's index, and
+/// the group's commit-time out-of-domain point from its own roots.
 #[test]
 #[ignore = "executes a block leaf's front over a small block proof; box tier"]
 fn the_block_front_draws_the_hosts_challenges() {
@@ -385,6 +389,7 @@ fn the_block_front_draws_the_hosts_challenges() {
         .roots
         .iter()
         .map(super::algebraic_commit::commitment_to_digest)
+        .chain(proof.commit_ood.iter().map(super::word::ext_word))
         .collect();
     let words: Vec<LfmWord> = execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER)
         .expect("the front executes")
@@ -413,19 +418,37 @@ fn the_block_front_draws_the_hosts_challenges() {
             &frame.config,
             &proof.groups,
         );
-        stark::multilinear_table::absorb_roots::<FEE_FIELD, _>(
+        stark::multilinear_table::absorb_roots_and_answers::<FEE_FIELD, _>(
             &mut t,
             &proof.proof.roots,
             &derived,
+            &proof.commit_ood,
         );
         let mut drawn: Vec<FEE> = (0..3).map(|_| t.sample_field_element()).collect();
         let mut fork = t.clone();
         fork.append_bytes(&(g as u64).to_le_bytes());
         drawn.push(fork.sample_field_element());
+        let layout = &frame.stack_layouts[g];
+        let first: usize = frame.stack_layouts[..g]
+            .iter()
+            .map(multilinear::stacking::StackedLayout::num_polys)
+            .sum();
+        drawn.push(
+            stark::multilinear_block::commit_ood_point::<FEE_FIELD, T>(
+                g,
+                layout,
+                &proof.proof.roots[first..first + layout.num_polys()],
+                frame.config.log_blowup,
+            )
+            .expect("the group's point"),
+        );
         drawn
     });
     let machine: Vec<FEE> = words.iter().map(ext_of).collect();
-    assert_eq!(machine, host, "z, α, β and the fork's first draw");
+    assert_eq!(
+        machine, host,
+        "z, α, β, the fork's first draw and the group's commit-time point"
+    );
 }
 
 /// ★ A leaf refuses a tampered witness — a group root, a table's argument, a
@@ -445,6 +468,14 @@ fn a_block_leaf_refuses_a_tampered_witness() {
         run_leaf(&plan, &root, 0, LeafChecks::ALL).is_err(),
         "a tampered group root"
     );
+    for at in [0, proof.commit_ood.len() - 1] {
+        let mut answer = proof.clone();
+        answer.commit_ood[at] += FEE::one();
+        assert!(
+            run_leaf(&plan, &answer, 0, LeafChecks::ALL).is_err(),
+            "a tampered commit-time answer ({at})"
+        );
+    }
 
     let mut table = proof.clone();
     table.proof.tables[0].bus_output.0 += FEE::one();
@@ -512,6 +543,32 @@ fn a_zero_denominator_has_no_satisfying_assignment() {
     );
 }
 
+/// ★ The leaf batches the commit-time answers into its chains, and that is
+/// what refuses a false one: a prover whose first answer is false and whose
+/// chains carry no answer is refused by the leaf, and executes on a leaf that
+/// absorbs the answers without batching them (the mutation) — the host's
+/// `the_commit_time_batching_binds_the_answers`, in the machine.
+#[test]
+#[ignore = "proves the dense fixture under RPX and executes its leaf; box tier"]
+fn a_block_leaf_batches_the_commit_time_answers() {
+    let format = dense_format();
+    let (elf, unbound, _) = dense_block_with(&block_whir::Deviations {
+        commit_ood_unbound: true,
+        ..Default::default()
+    });
+    let plan = plan_of(&elf, &unbound, &format, Some(1));
+    assert!(
+        run_leaf(&plan, &unbound, 0, LeafChecks::ALL).is_err(),
+        "answers that bind nothing are refused"
+    );
+    let without = LeafChecks {
+        commit_ood: false,
+        ..LeafChecks::ALL
+    };
+    run_leaf(&plan, &unbound, 0, without)
+        .expect("without the batching the false answer executes, so the batching refuses it");
+}
+
 /// The production format with three polynomials a group: the dense fixture's
 /// pages share groups with tables of their height.
 fn dense_format() -> BlockFormat {
@@ -559,6 +616,7 @@ fn dense_block_with(
             pack_finished: true,
             gpack: true,
             spill: crate::block_whir::BlockSpillPolicy::Off,
+            commit_ood: true,
         },
         deviations,
         &|_, r| *roots.lock().expect("lock") = r.to_vec(),

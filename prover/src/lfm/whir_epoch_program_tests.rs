@@ -1251,6 +1251,7 @@ fn walk_program(
             polys: &polys[group],
             shape: &chain_shapes[group],
             domain: &domains[group],
+            ood: None,
         })
         .collect();
     let gammas = if stage == WalkStage::Groups {

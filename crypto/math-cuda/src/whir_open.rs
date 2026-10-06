@@ -357,6 +357,9 @@ pub struct LeanRound0 {
     data: Arc<CudaSlice<u64>>,
     /// Whether `data` is a staging buffer this opening allocated.
     staged: bool,
+    /// The overlay's row in `shares` (past every column's), or
+    /// `WHIR_LEAN_NO_OVERLAY` (`u32::MAX`) when there is none.
+    overlay: u32,
     /// The challenges bound so far, three limbs each.
     bound: Vec<u64>,
     t_dev: CudaSlice<u64>,
@@ -375,8 +378,32 @@ impl LeanRound0 {
         num_vars: usize,
         message: LeanMessage<'_>,
     ) -> Result<Option<Self>> {
+        Self::new_with_overlay(shares, None, eq, num_vars, message)
+    }
+
+    /// [`new`](Self::new) with an OVERLAY: one more weight term over the
+    /// whole stack, gaps included — `scale · eq(p, x)` at every position, on
+    /// top of the column holding it (a commit-time out-of-domain claim,
+    /// I-WOOD). It must sit at offset 0 and span all `num_vars`; its `eq`
+    /// halves live in `eq` like a column's. `Ok(None)` for one that does not.
+    pub fn new_with_overlay(
+        shares: &[LeanShare],
+        overlay: Option<LeanShare>,
+        eq: &[u64],
+        num_vars: usize,
+        message: LeanMessage<'_>,
+    ) -> Result<Option<Self>> {
         let len = 1usize << num_vars;
-        if shares.is_empty() || shares.len() >= LEAN_MAX_SHARES || eq.is_empty() {
+        if shares.is_empty() || shares.len() + 1 >= LEAN_MAX_SHARES || eq.is_empty() {
+            return Ok(None);
+        }
+        if let Some(over) = &overlay
+            && (over.stack_offset != 0
+                || over.num_vars != num_vars
+                || over.lo_bits > over.num_vars
+                || (over.hi_at + (len >> over.lo_bits)) * 3 > eq.len()
+                || (over.lo_at + (1usize << over.lo_bits)) * 3 > eq.len())
+        {
             return Ok(None);
         }
         let mut end = 0usize;
@@ -447,6 +474,25 @@ impl LeanRound0 {
             starts.push(share.stack_offset as u64);
             ends.push((share.stack_offset + (1usize << share.num_vars)) as u64);
         }
+        // The overlay rides past the columns' rows, out of the column map.
+        let overlay_row = match &overlay {
+            Some(over) => {
+                let row = (rows.len() / 9) as u32;
+                rows.extend_from_slice(&[
+                    0,
+                    0,
+                    over.lo_bits as u64,
+                    over.hi_at as u64,
+                    over.lo_at as u64,
+                    over.scale[0],
+                    over.scale[1],
+                    over.scale[2],
+                    0,
+                ]);
+                row
+            }
+            None => u32::MAX,
+        };
         let shares_dev = crate::device::htod_or_trim(&stream, &rows)?;
         let eq_dev = crate::device::htod_or_trim(&stream, eq)?;
         let starts_dev = crate::device::htod_or_trim(&stream, &starts)?;
@@ -486,6 +532,7 @@ impl LeanRound0 {
             eq: eq_dev,
             data,
             staged,
+            overlay: overlay_row,
             bound: Vec::new(),
             t_dev,
             t_host: Vec::new(),
@@ -575,6 +622,7 @@ impl LeanRound0 {
                 .arg(&eqc)
                 .arg(&self.t_dev)
                 .arg(&num_t_arg)
+                .arg(&self.overlay)
                 .arg(&mut self.partials)
                 .launch(LaunchConfig {
                     grid_dim: (grid.max(1), 1, 1),
@@ -630,6 +678,7 @@ impl LeanRound0 {
                 .arg(&n_arg)
                 .arg(&bound_arg)
                 .arg(&eqfull)
+                .arg(&self.overlay)
                 .arg(&mut weight)
                 .arg(&mut message)
                 .launch(LaunchConfig {

@@ -199,7 +199,10 @@ std::vector<uint64_t> eq_table(const std::vector<Fe3> &z) {
     return out;
 }
 
-void lean_rounds_equal_the_materialised_opening() {
+// `overlay`: one more weight term `scale·eq(p, x)` over the whole stack, gaps
+// included (a commit-time out-of-domain claim, I-WOOD), as a row past the
+// shares that the column map never names.
+void lean_rounds_equal_the_materialised_opening(bool overlay) {
     const uint32_t n = 11;
     const uint64_t len = 1ull << n;
     // A stack of mixed heights, aligned to their sizes, with gaps: a table of
@@ -240,6 +243,14 @@ void lean_rounds_equal_the_materialised_opening() {
             w[s.offset + r] = ext3::mul(s.scale, eq_at(s.point, r));
         }
     }
+    std::vector<Fe3> ood_point;
+    for (uint32_t i = 0; i < n; ++i) ood_point.push_back(random_ext());
+    Fe3 ood_scale = random_ext();
+    if (overlay) {
+        for (uint64_t x = 0; x < len; ++x) {
+            w[x] = ext3::add(w[x], ext3::mul(ood_scale, eq_at(ood_point, x)));
+        }
+    }
 
     // ── the lean opening's inputs ──
     std::vector<uint64_t> eqbuf, rows, starts, ends;
@@ -257,6 +268,20 @@ void lean_rounds_equal_the_materialised_opening() {
         starts.push_back(s.offset);
         ends.push_back(s.offset + (1ull << s.num_vars));
     }
+    uint32_t over = WHIR_LEAN_NO_OVERLAY;
+    if (overlay) {
+        uint32_t lo_bits = n / 2;
+        std::vector<Fe3> hi(ood_point.begin(), ood_point.end() - lo_bits);
+        std::vector<Fe3> lo(ood_point.end() - lo_bits, ood_point.end());
+        uint64_t hi_at = eqbuf.size() / 3;
+        for (uint64_t v : eq_table(hi)) eqbuf.push_back(v);
+        uint64_t lo_at = eqbuf.size() / 3;
+        for (uint64_t v : eq_table(lo)) eqbuf.push_back(v);
+        uint64_t row[WHIR_LEAN_SHARE_WORDS] = {0, 0, lo_bits, hi_at, lo_at,
+                                               ood_scale.a, ood_scale.b, ood_scale.c, 0};
+        over = rows.size() / WHIR_LEAN_SHARE_WORDS;
+        rows.insert(rows.end(), row, row + WHIR_LEAN_SHARE_WORDS);
+    }
     std::vector<uint16_t> colmap(len);
     CUDA_HOST_SINGLE_THREAD();
     whir_lean_colmap(colmap.data(), len, starts.data(), ends.data(), shares.size());
@@ -271,7 +296,7 @@ void lean_rounds_equal_the_materialised_opening() {
     for (uint64_t x = 0; x < len; ++x) {
         Fe3 wv;
         uint64_t fv;
-        whir_lean_value(colmap.data(), rows.data(), eqbuf.data(), data.data(), x, wv, fv);
+        whir_lean_value(colmap.data(), rows.data(), eqbuf.data(), data.data(), x, over, wv, fv);
         values_ok &= same_value(wv, w[x]) && goldilocks::canonical(fv) ==
                                                  goldilocks::canonical(f[x].a);
     }
@@ -301,7 +326,7 @@ void lean_rounds_equal_the_materialised_opening() {
         Fe3 got[WHIR_LEAN_MAX_T] = {ext3::zero(), ext3::zero(), ext3::zero(), ext3::zero()};
         for (uint64_t rest = 0; rest < (1ull << (n - s)); ++rest) {
             whir_lean_round_at(colmap.data(), rows.data(), eqbuf.data(), data.data(), n, s,
-                               eqc.data(), t, 2, rest, got);
+                               eqc.data(), t, 2, rest, over, got);
         }
         char what[96];
         snprintf(what, sizeof what, "round %u: the evaluation at node 1", s);
@@ -331,34 +356,38 @@ void lean_rounds_equal_the_materialised_opening() {
     for (uint64_t y = 0; y < width; ++y) {
         Fe3 wy, fy;
         whir_lean_materialize_at(colmap.data(), rows.data(), eqbuf.data(), data.data(), n, 6,
-                                 eqfull.data(), y, wy, fy);
+                                 eqfull.data(), y, over, wy, fy);
         tables_ok &= same_value(wy, w[y]) && same_value(fy, f[y]);
     }
     check(tables_ok, "the materialised tables after six rounds");
 
-    // A control: a column whose scale moves moves the first round.
-    rows[5] = goldilocks::add(rows[5], 1);
+    // A control: a column whose scale moves moves the first round (the
+    // overlay's scale, when there is one: the overlay is read too).
+    size_t moved_at = overlay ? (size_t)over * WHIR_LEAN_SHARE_WORDS + 5 : 5;
+    rows[moved_at] = goldilocks::add(rows[moved_at], 1);
     std::vector<uint64_t> eqc = eq_table({});
     Fe3 moved[WHIR_LEAN_MAX_T] = {ext3::zero(), ext3::zero(), ext3::zero(), ext3::zero()};
     Fe3 base_line[WHIR_LEAN_MAX_T] = {ext3::zero(), ext3::zero(), ext3::zero(), ext3::zero()};
     for (uint64_t rest = 0; rest < (1ull << (n - 1)); ++rest) {
         whir_lean_round_at(colmap.data(), rows.data(), eqbuf.data(), data.data(), n, 1,
-                           eqc.data(), t, 2, rest, moved);
+                           eqc.data(), t, 2, rest, over, moved);
     }
-    rows[5] = goldilocks::sub(rows[5], 1);
+    rows[moved_at] = goldilocks::sub(rows[moved_at], 1);
     for (uint64_t rest = 0; rest < (1ull << (n - 1)); ++rest) {
         whir_lean_round_at(colmap.data(), rows.data(), eqbuf.data(), data.data(), n, 1,
-                           eqc.data(), t, 2, rest, base_line);
+                           eqc.data(), t, 2, rest, over, base_line);
     }
     check(!same_value(moved[1], base_line[1]), "control: a share's scale moves the round");
-    printf("lean first rounds: 6 rounds and the bound tables equal the materialised opening\n");
+    printf("lean first rounds%s: 6 rounds and the bound tables equal the materialised opening\n",
+           overlay ? " with an overlay" : "");
 }
 
 }  // namespace
 
 int main() {
     fused_fold_is_raw_identical();
-    lean_rounds_equal_the_materialised_opening();
+    lean_rounds_equal_the_materialised_opening(false);
+    lean_rounds_equal_the_materialised_opening(true);
     if (failures) {
         printf("whir host KAT: %d FAILURE(S)\n", failures);
         return 1;

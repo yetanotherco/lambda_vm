@@ -99,8 +99,18 @@ where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
     E: IsField + Send + Sync + 'static,
 {
+    require_out_of_domain_of_size(z0, domain.log_size())
+}
+
+/// [`require_out_of_domain`] against the subgroup of `2^log_size` points,
+/// named by its size alone — for a caller that checks a point before any
+/// domain exists (a block's commit-time out-of-domain point).
+pub fn require_out_of_domain_of_size<E: IsField>(
+    z0: &FieldElement<E>,
+    log_size: usize,
+) -> Result<(), Error> {
     let mut power = z0.clone();
-    for _ in 0..domain.log_size() {
+    for _ in 0..log_size {
         power = power.square();
     }
     if power == FieldElement::<E>::one() {
@@ -969,23 +979,39 @@ where
     /// `on_device` says whether the codeword being opened is on one. When it
     /// is, the host building the tables is a fallback and is counted
     /// ([`crate::gpu::open_host_fallbacks`]); when it is not, it is the path.
+    ///
+    /// `overlay` is a term `scale·eq(point, ·)` over the WHOLE stack, gaps
+    /// included, on top of the shares: a commit-time out-of-domain claim
+    /// batched into the chain's first claim ([`prove_shared_ood`]). The shares
+    /// tile disjoint ranges and the overlay covers all of them, so it is added
+    /// rather than written.
     fn from_shares(
         f: &Stacked<'_, F>,
         shares: &[crate::stacked_eval::WeightShare<'_, E>],
+        overlay: Option<(&[FieldElement<E>], &FieldElement<E>)>,
         n_stack: usize,
         on_device: bool,
     ) -> Result<Self, Error> {
-        if let Some(device) = crate::gpu::open_shared(f, shares, n_stack, &Self::program()?) {
+        if let Some(device) =
+            crate::gpu::open_shared(f, shares, overlay, n_stack, &Self::program()?)
+        {
             return Ok(Self::Device(device));
         }
         if on_device {
             crate::gpu::note_open_host_fallback(n_stack);
         }
         // Only here does a stacked polynomial have to exist on the host.
-        Self::new(
-            &f.assemble()?,
-            crate::stacked_eval::weight_table(shares, n_stack)?,
-        )
+        let mut weight = crate::stacked_eval::weight_table(shares, n_stack)?;
+        if let Some((point, scale)) = overlay {
+            if point.len() != n_stack {
+                return Err(Error::VariableCountMismatch {
+                    expected: n_stack,
+                    got: point.len(),
+                });
+            }
+            weight = batch_weight(&weight, &eq_mle(point)?, scale)?;
+        }
+        Self::new(&f.assemble()?, weight)
     }
 
     fn num_vars(&self) -> usize {
@@ -1105,8 +1131,46 @@ where
     T: IsTranscript<E>,
     H: WhirHash,
 {
-    let factors =
-        Factors::<F, E>::from_shares(f, shares, n_stack, commitment.codeword().device().is_some())?;
+    prove_shared_ood::<F, E, T, H>(
+        f, shares, None, n_stack, commitment, domain, config, transcript,
+    )
+}
+
+/// [`prove_shared`] with a commit-time out-of-domain claim batched into the
+/// first claim: the weight is the shares plus `scale·eq(point, ·)` over the
+/// whole stack, so the chain proves `Σ_x (w(x) + scale·eq(point, x))·f(x)`,
+/// which is the column claims plus `scale·f(point)`.
+///
+/// This is the successor rounds' out-of-domain step (`C_{r+1} = C_r' +
+/// gamma_r·y0_r`, module header) applied to the committed word itself, before
+/// its first sumcheck: the answer was given before any challenge the claims
+/// depend on, so the word is pinned to one codeword by then (I-WOOD §2).
+#[allow(clippy::too_many_arguments)]
+pub fn prove_shared_ood<F, E, T, H>(
+    f: &Stacked<'_, F>,
+    shares: &[crate::stacked_eval::WeightShare<'_, E>],
+    overlay: Option<(&[FieldElement<E>], &FieldElement<E>)>,
+    n_stack: usize,
+    commitment: &CodewordCommitment<F, H>,
+    domain: &Domain<F>,
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<ChainProof<F, E>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    let factors = Factors::<F, E>::from_shares(
+        f,
+        shares,
+        overlay,
+        n_stack,
+        commitment.codeword().device().is_some(),
+    )?;
     prove_with_factors::<F, E, T, H>(
         f.num_vars(),
         factors,
@@ -3050,5 +3114,421 @@ mod tests {
             &mut verifier,
         )
         .unwrap();
+    }
+}
+
+/// REV-LPCS-B's equivocation (`thoughts/zf/review/REV-LPCS-B.md`), and the
+/// commit-time out-of-domain answer that closes it (I-WOOD).
+///
+/// One committed word `f` near two codewords `u` and `u'`: without an answer
+/// the chain accepts `f(z) = u(z)` AND `f(z) = u'(z)` against the same root.
+/// With the block's order — root, `z0`, the answer `y0`, then the claim point
+/// `z` and the batched claim `v + γ·y0` under `eq(z) + γ·eq(ood_point(z0))` —
+/// the answer names one of them before `z` exists, and the other is never
+/// accepted.
+#[cfg(test)]
+mod commit_ood_binding {
+    use super::*;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use math::field::goldilocks::GoldilocksField as F;
+
+    use crate::whir_hash::KeccakWhir as H;
+
+    type FE = FieldElement<F>;
+    type T = DefaultTranscript<F>;
+
+    fn rev(i: usize, width: usize) -> usize {
+        if width == 0 {
+            return 0;
+        }
+        i.reverse_bits() >> (usize::BITS as usize - width)
+    }
+
+    /// Monomial coefficients -> hypercube values (the inverse of
+    /// `monomial_coefficients`).
+    fn evals_from_monomials(c: &[FE]) -> Vec<FE> {
+        let mut v = c.to_vec();
+        let n = v.len();
+        let mut stride = 1;
+        while stride < n {
+            for chunk in v.chunks_mut(2 * stride) {
+                let (lo, hi) = chunk.split_at_mut(stride);
+                for (h, l) in hi.iter_mut().zip(lo.iter()) {
+                    *h = &*h + l;
+                }
+            }
+            stride *= 2;
+        }
+        v
+    }
+
+    /// The multilinear whose `lift_coefficients` is `lift`.
+    fn mle_from_lift(lift: &[FE], num_vars: usize) -> Mle<F> {
+        let mono: Vec<FE> = (0..lift.len()).map(|j| lift[rev(j, num_vars)]).collect();
+        Mle::new(evals_from_monomials(&mono)).unwrap()
+    }
+
+    fn pseudo(num_vars: usize, seed: u64) -> Mle<F> {
+        Mle::new(
+            (0..(1u64 << num_vars))
+                .map(|i| {
+                    FE::from(
+                        i.wrapping_add(seed)
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                            >> 13,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    /// The honest chain over `u` under `weight`, except that every round-0
+    /// opening is read from `open` (the committed word) instead of the
+    /// codeword `fold_from` it folds. Everything after round 0 is honest for
+    /// `u`.
+    #[allow(clippy::too_many_arguments)]
+    fn prove_equivocating(
+        u: &Mle<F>,
+        weight: Mle<F>,
+        open: &CodewordCommitment<F, H>,
+        fold_from: &CodewordCommitment<F, H>,
+        domain: &Domain<F>,
+        config: &ChainConfig,
+        transcript: &mut T,
+    ) -> Result<ChainProof<F, F>, Error> {
+        let mut factors = Factors::<F, F>::new(u, weight)?;
+        let schedule = config.schedule(u.num_vars());
+        let caps = config.tree_caps(u.num_vars());
+        let mut current = Current::<F, F, H>::Base(fold_from);
+        let mut current_domain = domain.clone();
+        let mut rounds = Vec::new();
+        let mut final_value = FE::zero();
+        for (r, &k) in schedule.iter().enumerate() {
+            let mut nonces = RoundNonces {
+                folding: grind::<F, T, H>(transcript, config.grind.folding)?,
+                ..RoundNonces::default()
+            };
+            let (sumcheck_rounds, alphas) = factors.rounds(k, transcript)?;
+            let (folded, folded_domain) = match &current {
+                Current::Base(held) => {
+                    fold_held::<F, F, F>(held.codeword(), &current_domain, &alphas)?
+                }
+                Current::Extension(held) => {
+                    fold_held::<F, F, F>(held.codeword(), &current_domain, &alphas)?
+                }
+            };
+            let next = match schedule.get(r + 1) {
+                Some(&next_k) => {
+                    let next = commit_folded::<F, H>(folded, next_k)?;
+                    transcript.append_bytes(&next.root());
+                    Some(next)
+                }
+                None => {
+                    final_value = first_value::<F>(&folded)?;
+                    transcript.append_field_element(&final_value);
+                    None
+                }
+            };
+            let next_root = next.as_ref().map(|c| c.root());
+            let ood_value = if next.is_some() {
+                let z0: FE = transcript.sample_field_element();
+                require_out_of_domain::<F, F>(&z0, &folded_domain)?;
+                let point = ood_point(&z0, factors.num_vars());
+                let y0 = factors.evaluate_message(&point)?;
+                transcript.append_field_element(&y0);
+                nonces.ood = grind::<F, T, H>(transcript, config.grind.ood)?;
+                let gamma: FE = transcript.sample_field_element();
+                factors.add_scaled_eq(&point, &gamma)?;
+                Some(y0)
+            } else {
+                None
+            };
+            nonces.query = grind::<F, T, H>(transcript, config.grind.query)?;
+            let round_config = RoundConfig {
+                num_queries: config.num_queries,
+                log_folding: k,
+            };
+            let round_caps = RoundCaps {
+                current: caps[r],
+                current_owner: r == 0,
+                next: caps.get(r + 1).copied().unwrap_or(0),
+            };
+            // ★ round 0 opens the COMMITTED word, not the codeword it folded.
+            let opened: &CodewordCommitment<F, H> = match &current {
+                Current::Base(_) => open,
+                Current::Extension(held) => held,
+            };
+            let proof = match &next {
+                Some(next) => {
+                    whir_round::prove(opened, next, &round_config, round_caps, transcript)?
+                }
+                None => {
+                    final_openings::<F, F, T, H>(opened, &round_config, round_caps, transcript)?
+                }
+            };
+            let openings = if r == 0 {
+                RoundOpenings::Base(proof)
+            } else {
+                RoundOpenings::Extension(proof)
+            };
+            rounds.push(ChainRound {
+                sumcheck: sumcheck_rounds,
+                next_root,
+                ood_value,
+                nonces,
+                openings,
+            });
+            if let Some(next) = next {
+                current = Current::Extension(next);
+            }
+            current_domain = folded_domain;
+        }
+        Ok(ChainProof {
+            rounds,
+            final_value,
+        })
+    }
+
+    struct Equivocation {
+        num_vars: usize,
+        cfg: ChainConfig,
+        domain: Domain<F>,
+        u: Mle<F>,
+        u2: Mle<F>,
+        c_f: CodewordCommitment<F, H>,
+        c_u: CodewordCommitment<F, H>,
+        c_u2: CodewordCommitment<F, H>,
+        /// Block agreement of `f` with `u` and with `u'`.
+        agree: (f64, f64),
+    }
+
+    /// One root, two distinct codewords `u` and `u'` whose fold blocks agree
+    /// on a quarter of the domain, and a word `f` that takes each remaining
+    /// block from `u` or `u'` alternately: ≈ 0.375 from both, so both are in
+    /// its Johnson list and neither is within the unique decoding radius.
+    fn equivocation() -> Equivocation {
+        let num_vars = 8usize;
+        let k = 2usize;
+        let cfg = ChainConfig {
+            log_blowup: 2,
+            log_folding: k,
+            num_queries: 3,
+            grind: GrindBits::default(),
+            format: ChainFormat::DEFAULT,
+        };
+        let domain = Domain::<F>::new(num_vars + cfg.log_blowup).unwrap();
+        let n = domain.size();
+        let block = 1usize << k;
+        let leaves = n / block;
+        let g = *domain.generator();
+
+        // P(Y) = Π_{j<m} (Y − g^{j·B}), m = 2^{n−k} − 1, so D(X) = c·P(X^B)
+        // has degree 2^n − B < 2^n and vanishes on blocks 0..m.
+        let m = (1usize << (num_vars - k)) - 1;
+        let mut p: Vec<FE> = vec![FE::one()];
+        for j in 0..m {
+            let y = g.pow((j * block) as u64);
+            let mut q = vec![FE::zero(); p.len() + 1];
+            for (i, c) in p.iter().enumerate() {
+                q[i + 1] = &q[i + 1] + c;
+                q[i] = &q[i] - &(c * &y);
+            }
+            p = q;
+        }
+        let c = FE::from(0x1234_5678_9abcu64);
+        let mut d_lift = vec![FE::zero(); 1 << num_vars];
+        for (i, coeff) in p.iter().enumerate() {
+            d_lift[i * block] = coeff * &c;
+        }
+        let d = mle_from_lift(&d_lift, num_vars);
+        assert_eq!(lift_coefficients(&d), d_lift, "the lift round-trips");
+
+        let u = pseudo(num_vars, 7);
+        let u2 = Mle::new(
+            u.evals()
+                .iter()
+                .zip(d.evals())
+                .map(|(a, b)| a + b)
+                .collect(),
+        )
+        .unwrap();
+        let cw_u = encode::<F, F>(&lift_coefficients(&u), &domain).unwrap();
+        let cw_u2 = encode::<F, F>(&lift_coefficients(&u2), &domain).unwrap();
+
+        let agree_block =
+            |j: usize| (0..block).all(|t| cw_u[j + t * leaves] == cw_u2[j + t * leaves]);
+        let common: Vec<usize> = (0..leaves).filter(|&j| agree_block(j)).collect();
+        assert_eq!(common, (0..m).collect::<Vec<_>>());
+
+        let mut f_cw = cw_u.clone();
+        let (mut from_u, mut from_u2) = (0usize, 0usize);
+        for j in m..leaves {
+            if (j - m) % 2 == 1 {
+                for t in 0..block {
+                    f_cw[j + t * leaves] = cw_u2[j + t * leaves];
+                }
+                from_u2 += 1;
+            } else {
+                from_u += 1;
+            }
+        }
+        let agree = (
+            (m + from_u) as f64 / leaves as f64,
+            (m + from_u2) as f64 / leaves as f64,
+        );
+        assert!(agree.0 > 0.6 && agree.1 > 0.6);
+        Equivocation {
+            num_vars,
+            cfg,
+            domain,
+            u,
+            u2,
+            c_f: CodewordCommitment::<F, H>::from_codeword(f_cw, k).unwrap(),
+            c_u: CodewordCommitment::<F, H>::from_codeword(cw_u, k).unwrap(),
+            c_u2: CodewordCommitment::<F, H>::from_codeword(cw_u2, k).unwrap(),
+            agree,
+        }
+    }
+
+    /// The control: the gap as REV-LPCS-B measured it. With no answer, one
+    /// root accepts two different values at one fixed point.
+    #[test]
+    fn without_an_answer_one_root_accepts_two_values_at_one_point() {
+        let e = equivocation();
+        let root = e.c_f.root();
+        let z: Vec<FE> = (0..e.num_vars)
+            .map(|i| FE::from(1001 + 17 * i as u64))
+            .collect();
+        let (y_u, y_u2) = (e.u.evaluate(&z).unwrap(), e.u2.evaluate(&z).unwrap());
+        assert_ne!(y_u, y_u2, "two different claims at one point");
+        let (mut ok_u, mut ok_u2) = (0u64, 0u64);
+        for s in 0..400u64 {
+            let label = format!("wood-gap-{s}");
+            for (target, fold_from, claim, ok) in [
+                (&e.u, &e.c_u, &y_u, &mut ok_u),
+                (&e.u2, &e.c_u2, &y_u2, &mut ok_u2),
+            ] {
+                let proof = prove_equivocating(
+                    target,
+                    eq_mle(&z).unwrap(),
+                    &e.c_f,
+                    fold_from,
+                    &e.domain,
+                    &e.cfg,
+                    &mut T::new(label.as_bytes()),
+                )
+                .unwrap();
+                *ok += verify::<F, F, _, H>(
+                    &proof,
+                    &root,
+                    &z,
+                    *claim,
+                    &e.domain,
+                    &e.cfg,
+                    &mut T::new(label.as_bytes()),
+                )
+                .is_ok() as u64;
+            }
+        }
+        println!(
+            "no answer: accepted f(z) = u(z) {ok_u}/400 (expect {:.3}), f(z) = u'(z) {ok_u2}/400 \
+             (expect {:.3})",
+            e.agree.0.powi(3),
+            e.agree.1.powi(3)
+        );
+        assert!(
+            ok_u > 0 && ok_u2 > 0,
+            "the gap: both values verify against one root"
+        );
+    }
+
+    /// ★ The fix: the answer `y0` is given after the root and before the claim
+    /// point. Whichever codeword it names, the other one's claim is never
+    /// accepted — under the same prefix or any other — while the named one's
+    /// still is, at the rate its agreement with `f` gives.
+    #[test]
+    fn a_commit_time_answer_lets_one_root_answer_for_one_codeword_only() {
+        let e = equivocation();
+        let root = e.c_f.root();
+        let words = [(&e.u, &e.c_u), (&e.u2, &e.c_u2)];
+        // accepted[named][claimed]
+        let mut accepted = [[0u64; 2]; 2];
+        let mut both = 0u64;
+        let trials = 400u64;
+        for s in 0..trials {
+            let label = format!("wood-ood-{s}");
+            let mut prefix = T::new(label.as_bytes());
+            prefix.append_bytes(&root);
+            let z0: FE = prefix.sample_field_element();
+            require_out_of_domain::<F, F>(&z0, &e.domain).unwrap();
+            let p = ood_point(&z0, e.num_vars);
+            assert_ne!(
+                e.u.evaluate(&p).unwrap(),
+                e.u2.evaluate(&p).unwrap(),
+                "the two codewords differ out of domain"
+            );
+            for (named, (named_word, _)) in words.iter().enumerate() {
+                // The answer names one codeword; the claim point comes after.
+                let y0 = named_word.evaluate(&p).unwrap();
+                let mut after = prefix.clone();
+                after.append_field_element(&y0);
+                let z: Vec<FE> = (0..e.num_vars)
+                    .map(|_| after.sample_field_element())
+                    .collect();
+                let mut accepted_here = 0;
+                for (claimed, (word, fold_from)) in words.iter().enumerate() {
+                    let v = word.evaluate(&z).unwrap();
+                    let mut transcript = after.clone();
+                    transcript.append_field_element(&v);
+                    let gamma: FE = transcript.sample_field_element();
+                    let verifier_start = transcript.clone();
+                    let weight =
+                        batch_weight(&eq_mle(&z).unwrap(), &eq_mle(&p).unwrap(), &gamma).unwrap();
+                    let proof = prove_equivocating(
+                        word,
+                        weight,
+                        &e.c_f,
+                        fold_from,
+                        &e.domain,
+                        &e.cfg,
+                        &mut transcript,
+                    )
+                    .unwrap();
+                    let ok = verify_weighted::<F, F, _, _, H>(
+                        &proof,
+                        &root,
+                        |at: &[FE]| Ok(eq_eval(&z, at)? + &gamma * eq_eval(&p, at)?),
+                        &v + &gamma * &y0,
+                        e.num_vars,
+                        &e.domain,
+                        &e.cfg,
+                        &mut verifier_start.clone(),
+                    )
+                    .is_ok();
+                    accepted[named][claimed] += ok as u64;
+                    accepted_here += ok as usize;
+                }
+                both += (accepted_here == 2) as u64;
+            }
+        }
+        println!(
+            "answer u(z0): u {} / u' {}; answer u'(z0): u {} / u' {} (of {trials}); both under \
+             one prefix {both}; expect ≈ {:.3} / {:.3} for the named codeword",
+            accepted[0][0],
+            accepted[0][1],
+            accepted[1][0],
+            accepted[1][1],
+            e.agree.0.powi(3),
+            e.agree.1.powi(3)
+        );
+        assert_eq!(accepted[0][1], 0, "answered u(z0), u'(z) was accepted");
+        assert_eq!(accepted[1][0], 0, "answered u'(z0), u(z) was accepted");
+        assert_eq!(both, 0, "one prefix answered for both codewords");
+        assert!(
+            accepted[0][0] > 0 && accepted[1][1] > 0,
+            "the named codeword still opens (the test is not vacuous)"
+        );
     }
 }

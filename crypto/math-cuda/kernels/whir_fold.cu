@@ -293,9 +293,17 @@ extern "C" __global__ void whir_fold_k_ext3(const uint64_t *__restrict__ in, uin
 // its scale (three limbs), then one spare. `eq(z, row) = hi[row >> lo_bits] ·
 // lo[row & (2^lo_bits − 1)]`: the two halves of the point's table, each a few
 // kilobytes, instead of the table.
+//
+// An OVERLAY is one more row past the shares, at stack offset 0 over all `n`
+// variables: `w(x) += scale_o · eq(p, x)` at EVERY position, the gaps between
+// columns included — a commit-time out-of-domain claim batched into the
+// chain's first claim (I-WOOD). The shares tile disjoint ranges and the
+// overlay covers all of them, so it is added on top rather than given a slot
+// in the column map. `WHIR_LEAN_NO_OVERLAY` when there is none.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #define WHIR_LEAN_NONE 0xFFFFu
+#define WHIR_LEAN_NO_OVERLAY 0xFFFFFFFFu
 #define WHIR_LEAN_SHARE_WORDS 9
 #define WHIR_LEAN_MAX_T 4
 
@@ -323,27 +331,40 @@ extern "C" __global__ void whir_lean_colmap(uint16_t *__restrict__ colmap, uint6
     }
 }
 
-// `(w(x), f(x))` from the shares.
-__device__ __forceinline__ void whir_lean_value(const uint16_t *__restrict__ colmap,
-                                                const uint64_t *__restrict__ shares,
-                                                const uint64_t *__restrict__ eqbuf,
-                                                const uint64_t *__restrict__ data, uint64_t x,
-                                                Fe3 &w, uint64_t &f) {
-    uint16_t id = colmap[x];
-    if (id == WHIR_LEAN_NONE) {
-        w = ext3::zero();
-        f = 0;
-        return;
-    }
-    const uint64_t *share = shares + (uint64_t)id * WHIR_LEAN_SHARE_WORDS;
-    uint64_t row = x - share[0];
-    f = data[share[1] + row];
+// `scale · eq(z, row)` for one share row, `row` counted from its offset.
+__device__ __forceinline__ Fe3 whir_lean_share_weight(const uint64_t *__restrict__ share,
+                                                      const uint64_t *__restrict__ eqbuf,
+                                                      uint64_t row) {
     uint64_t lo_bits = share[2];
     uint64_t hi_at = (share[3] + (row >> lo_bits)) * 3;
     uint64_t lo_at = (share[4] + (row & ((1ull << lo_bits) - 1))) * 3;
     Fe3 eq = ext3::mul(ext3::make(eqbuf[hi_at], eqbuf[hi_at + 1], eqbuf[hi_at + 2]),
                        ext3::make(eqbuf[lo_at], eqbuf[lo_at + 1], eqbuf[lo_at + 2]));
-    w = ext3::mul(ext3::make(share[5], share[6], share[7]), eq);
+    return ext3::mul(ext3::make(share[5], share[6], share[7]), eq);
+}
+
+// `(w(x), f(x))` from the shares, plus the overlay row's weight when
+// `overlay` names one.
+__device__ __forceinline__ void whir_lean_value(const uint16_t *__restrict__ colmap,
+                                                const uint64_t *__restrict__ shares,
+                                                const uint64_t *__restrict__ eqbuf,
+                                                const uint64_t *__restrict__ data, uint64_t x,
+                                                uint32_t overlay, Fe3 &w, uint64_t &f) {
+    uint16_t id = colmap[x];
+    if (id == WHIR_LEAN_NONE) {
+        w = ext3::zero();
+        f = 0;
+    } else {
+        const uint64_t *share = shares + (uint64_t)id * WHIR_LEAN_SHARE_WORDS;
+        uint64_t row = x - share[0];
+        f = data[share[1] + row];
+        w = whir_lean_share_weight(share, eqbuf, row);
+    }
+    if (overlay != WHIR_LEAN_NO_OVERLAY) {
+        // Offset 0 over the whole stack: the row is the position.
+        w = ext3::add(
+            w, whir_lean_share_weight(shares + (uint64_t)overlay * WHIR_LEAN_SHARE_WORDS, eqbuf, x));
+    }
 }
 
 // One rest-position's share of round `s` (1-based) over `n` variables: the
@@ -356,7 +377,7 @@ __device__ void whir_lean_round_at(const uint16_t *__restrict__ colmap,
                                    const uint64_t *__restrict__ data, uint32_t n, uint32_t s,
                                    const uint64_t *__restrict__ eqc,
                                    const uint64_t *__restrict__ d_t, uint32_t num_t,
-                                   uint64_t rest, Fe3 *acc) {
+                                   uint64_t rest, uint32_t overlay, Fe3 *acc) {
     uint32_t below = n - s;  // bits under the round's variable
     uint64_t half = 1ull << below;
     Fe3 w_lo = ext3::zero(), w_hi = ext3::zero(), f_lo = ext3::zero(), f_hi = ext3::zero();
@@ -366,10 +387,10 @@ __device__ void whir_lean_round_at(const uint16_t *__restrict__ colmap,
         uint64_t x_lo = (p << (below + 1)) | rest;
         Fe3 w;
         uint64_t f;
-        whir_lean_value(colmap, shares, eqbuf, data, x_lo, w, f);
+        whir_lean_value(colmap, shares, eqbuf, data, x_lo, overlay, w, f);
         w_lo = ext3::add(w_lo, ext3::mul(c, w));
         f_lo = ext3::add(f_lo, ext3::mul_base(c, f));
-        whir_lean_value(colmap, shares, eqbuf, data, x_lo | half, w, f);
+        whir_lean_value(colmap, shares, eqbuf, data, x_lo | half, overlay, w, f);
         w_hi = ext3::add(w_hi, ext3::mul(c, w));
         f_hi = ext3::add(f_hi, ext3::mul_base(c, f));
     }
@@ -390,14 +411,15 @@ extern "C" __global__ void whir_lean_round(const uint16_t *__restrict__ colmap,
                                            const uint64_t *__restrict__ data, uint32_t n,
                                            uint32_t s, const uint64_t *__restrict__ eqc,
                                            const uint64_t *__restrict__ d_t, uint32_t num_t,
-                                           uint64_t *__restrict__ d_partials) {
+                                           uint32_t overlay, uint64_t *__restrict__ d_partials) {
     Fe3 acc[WHIR_LEAN_MAX_T];
     for (uint32_t ti = 0; ti < num_t; ++ti) acc[ti] = ext3::zero();
     uint64_t rests = 1ull << (n - s);
     uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
     for (uint64_t rest = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; rest < rests;
          rest += stride) {
-        whir_lean_round_at(colmap, shares, eqbuf, data, n, s, eqc, d_t, num_t, rest, acc);
+        whir_lean_round_at(colmap, shares, eqbuf, data, n, s, eqc, d_t, num_t, rest, overlay,
+                           acc);
     }
     extern __shared__ uint64_t shared[];
     for (uint32_t ti = 0; ti < num_t; ++ti) {
@@ -437,7 +459,7 @@ __device__ void whir_lean_materialize_at(const uint16_t *__restrict__ colmap,
                                          const uint64_t *__restrict__ eqbuf,
                                          const uint64_t *__restrict__ data, uint32_t n,
                                          uint32_t bound, const uint64_t *__restrict__ eqfull,
-                                         uint64_t y, Fe3 &w_out, Fe3 &f_out) {
+                                         uint64_t y, uint32_t overlay, Fe3 &w_out, Fe3 &f_out) {
     uint32_t below = n - bound;
     Fe3 w_acc = ext3::zero(), f_acc = ext3::zero();
     uint64_t prefixes = 1ull << bound;
@@ -445,7 +467,7 @@ __device__ void whir_lean_materialize_at(const uint16_t *__restrict__ colmap,
         Fe3 c = ext3::make(eqfull[p * 3], eqfull[p * 3 + 1], eqfull[p * 3 + 2]);
         Fe3 w;
         uint64_t f;
-        whir_lean_value(colmap, shares, eqbuf, data, (p << below) | y, w, f);
+        whir_lean_value(colmap, shares, eqbuf, data, (p << below) | y, overlay, w, f);
         w_acc = ext3::add(w_acc, ext3::mul(c, w));
         f_acc = ext3::add(f_acc, ext3::mul_base(c, f));
     }
@@ -459,13 +481,14 @@ extern "C" __global__ void whir_lean_materialize(const uint16_t *__restrict__ co
                                                  const uint64_t *__restrict__ data, uint32_t n,
                                                  uint32_t bound,
                                                  const uint64_t *__restrict__ eqfull,
+                                                 uint32_t overlay,
                                                  uint64_t *__restrict__ out_w,
                                                  uint64_t *__restrict__ out_f) {
     uint64_t len = 1ull << (n - bound);
     uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
     for (uint64_t y = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; y < len; y += stride) {
         Fe3 w, f;
-        whir_lean_materialize_at(colmap, shares, eqbuf, data, n, bound, eqfull, y, w, f);
+        whir_lean_materialize_at(colmap, shares, eqbuf, data, n, bound, eqfull, y, overlay, w, f);
         out_w[y * 3] = w.a;
         out_w[y * 3 + 1] = w.b;
         out_w[y * 3 + 2] = w.c;

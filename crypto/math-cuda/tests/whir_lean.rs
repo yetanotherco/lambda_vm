@@ -157,6 +157,14 @@ fn nodes() -> Vec<u64> {
 /// Six rounds both ways at the same challenges, then the bound tables and the
 /// message at a point.
 fn lean_matches_materialised(s: &Stack, resident: bool) {
+    lean_matches_materialised_with(s, resident, false);
+}
+
+/// The same, with `overlay`: a weight term `scale·eq(p, ·)` over the whole
+/// stack, gaps included (a commit-time out-of-domain claim, I-WOOD) — added to
+/// the materialised session by `add_scaled_eq` before its first round, and
+/// read by the lean rounds as the row past the columns'.
+fn lean_matches_materialised_with(s: &Stack, resident: bool, overlay: bool) {
     let parts: Vec<(&[u64], usize)> = s
         .columns
         .iter()
@@ -187,6 +195,34 @@ fn lean_matches_materialised(s: &Stack, resident: bool) {
         OpeningSession::from_shares_and_parts(&s.raw_shares, len, &parts)
     }
     .unwrap_or_else(|e| panic!("materialised session (needs a GPU): {e:?}"));
+    let mut eq = s.eq.clone();
+    let lean_overlay = overlay.then(|| {
+        let mut rng = Rng(0xD00D);
+        let point: Vec<FE3> = (0..s.n).map(|_| rng.ext()).collect();
+        let scale = rng.ext();
+        let raw: Vec<u64> = point.iter().flat_map(limbs).collect();
+        session
+            .add_scaled_eq(&raw, &limbs(&scale))
+            .expect("the materialised overlay");
+        let lo_bits = s.n / 2;
+        let (hi, lo) = point.split_at(s.n - lo_bits);
+        let hi_at = eq.len() / 3;
+        for value in multilinear::eq::eq_evals(hi) {
+            eq.extend_from_slice(&limbs(&value));
+        }
+        let lo_at = eq.len() / 3;
+        for value in multilinear::eq::eq_evals(lo) {
+            eq.extend_from_slice(&limbs(&value));
+        }
+        LeanShare {
+            stack_offset: 0,
+            num_vars: s.n,
+            lo_bits,
+            hi_at,
+            lo_at,
+            scale: limbs(&scale),
+        }
+    });
     let message = if resident {
         LeanMessage::Resident {
             store: store.as_ref().expect("the card took the columns"),
@@ -195,7 +231,7 @@ fn lean_matches_materialised(s: &Stack, resident: bool) {
     } else {
         LeanMessage::Parts(&parts)
     };
-    let mut lean = LeanRound0::new(&s.lean, &s.eq, s.n, message)
+    let mut lean = LeanRound0::new_with_overlay(&s.lean, lean_overlay, &eq, s.n, message)
         .expect("device")
         .expect("the lean opening takes this stack");
 
@@ -215,8 +251,9 @@ fn lean_matches_materialised(s: &Stack, resident: bool) {
         assert_eq!(
             canonical(&got),
             canonical(&want),
-            "round {round} ({}): the evaluations differ",
-            if resident { "resident" } else { "parts" }
+            "round {round} ({}{}): the evaluations differ",
+            if resident { "resident" } else { "parts" },
+            if overlay { ", overlay" } else { "" }
         );
         let alpha = limbs(&rng.ext());
         rounds.fold(&alpha).expect("fold");
@@ -257,6 +294,18 @@ fn the_lean_rounds_match_the_materialised_session_from_host_parts() {
 fn the_lean_rounds_match_the_materialised_session_from_resident_columns() {
     let _device = device();
     lean_matches_materialised(&stack(15, 0x77), true);
+}
+
+#[test]
+fn the_lean_rounds_with_an_overlay_match_the_materialised_session_from_host_parts() {
+    let _device = device();
+    lean_matches_materialised_with(&stack(14, 0x52), false, true);
+}
+
+#[test]
+fn the_lean_rounds_with_an_overlay_match_the_materialised_session_from_resident_columns() {
+    let _device = device();
+    lean_matches_materialised_with(&stack(15, 0x78), true, true);
 }
 
 /// ★ The accounting the lean path exists for. At 2^22 the materialised

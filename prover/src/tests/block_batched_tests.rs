@@ -72,6 +72,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         pack_finished: true,
         gpack: true,
         spill: crate::block_whir::BlockSpillPolicy::Off,
+        commit_ood: true,
     }
 }
 
@@ -698,4 +699,95 @@ fn the_card_argues_the_hosts_bytes() {
         }
         assert!(host.0 == card.0, "{name}: the card's bytes differ");
     }
+}
+
+/// W-10's fix on the block (I-WOOD): every carried polynomial answers a
+/// commit-time out-of-domain point, one answer a root, and the verifier
+/// refuses a proof whose answers are false, missing, extra or reordered — or
+/// absent, as the A/B arm without them proves.
+#[test]
+fn the_commit_time_answers_ride_the_block_and_tampers_are_refused() {
+    let elf = asm_elf_bytes("test_keccak");
+    let format = many_groups(BATCHED);
+    let o = options(MaxRowsConfig::small(), 3);
+    let honest = prove(&elf, &format, &o);
+    assert!(
+        honest.groups.len() >= 2,
+        "the stack spreads the program over groups"
+    );
+    assert_eq!(
+        honest.commit_ood.len(),
+        honest.proof.roots.len(),
+        "one answer a carried root"
+    );
+    assert!(verify(&honest, &elf, &format), "the honest block verifies");
+
+    let tampered = |edit: &dyn Fn(&mut Vec<FieldElement<E>>)| {
+        let mut proof = honest.clone();
+        edit(&mut proof.commit_ood);
+        verify(&proof, &elf, &format)
+    };
+    assert!(
+        !tampered(&|a| a[0] += FieldElement::<E>::one()),
+        "a false answer"
+    );
+    let last = honest.commit_ood.len() - 1;
+    assert!(
+        !tampered(&|a| a[last] += FieldElement::<E>::one()),
+        "a false last answer"
+    );
+    assert!(
+        !tampered(&|a| {
+            a.pop();
+        }),
+        "an answer missing"
+    );
+    assert!(
+        !tampered(&|a| a.push(FieldElement::<E>::one())),
+        "an answer too many"
+    );
+    assert!(!tampered(&|a| a.clear()), "no answers");
+    assert_ne!(honest.commit_ood[0], honest.commit_ood[1]);
+    assert!(
+        !tampered(&|a| a.swap(0, 1)),
+        "two answers of one group swapped"
+    );
+    assert_ne!(honest.commit_ood[0], honest.commit_ood[last]);
+    assert!(
+        !tampered(&|a| a.swap(0, last)),
+        "answers of two groups swapped"
+    );
+
+    // The A/B arm: today's transcript under the V1 tag, no answers.
+    let mut without = o.clone();
+    without.commit_ood = false;
+    let old = prove(&elf, &format, &without);
+    assert!(old.commit_ood.is_empty(), "the arm answers nothing");
+    assert!(!verify(&old, &elf, &format), "the verifier refuses the arm");
+}
+
+/// ★ The batching is load-bearing: a prover whose first answer is false and
+/// whose chains carry no answer is refused by the verifier, and admitted by
+/// one that absorbs the answers without batching them into the chains (the
+/// mutation) — so the batching is what binds an answer to its word.
+#[test]
+fn the_commit_time_batching_binds_the_answers() {
+    let elf = asm_elf_bytes("test_keccak");
+    let format = many_groups(BATCHED);
+    let o = options(MaxRowsConfig::small(), 3);
+    let unbound = prove_with(
+        &elf,
+        &format,
+        &o,
+        &Deviations {
+            commit_ood_unbound: true,
+            ..Default::default()
+        },
+    );
+    assert!(!verify(&unbound, &elf, &format));
+    let inert = VerifierChecks {
+        commit_ood: false,
+        ..VerifierChecks::ALL
+    };
+    assert!(verify_with(&unbound, &elf, &format, false, inert));
 }

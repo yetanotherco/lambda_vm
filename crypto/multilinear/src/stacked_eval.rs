@@ -616,6 +616,127 @@ fn claimed<E: IsField>(
     )
 }
 
+/// The overlay a [`CommitOod`] puts on every chain of one commitment: its
+/// point over the whole stack and the batching challenge, drawn here — after
+/// the column claims' challenge, on both sides. `None` draws nothing.
+fn ood_overlay<E, T>(
+    ood: Option<&CommitOod<'_, E>>,
+    n_stack: usize,
+    transcript: &mut T,
+) -> Option<(Vec<FieldElement<E>>, FieldElement<E>)>
+where
+    E: IsField + 'static,
+    T: IsTranscript<E>,
+{
+    ood.map(|ood| {
+        let gamma = transcript.sample_field_element();
+        (whir_chain::ood_point(ood.z0, n_stack), gamma)
+    })
+}
+
+/// Where [`ood_answers`] found its column values: how many columns the card
+/// evaluated in place and how many the host did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OodCounts {
+    pub on_card: usize,
+    pub on_host: usize,
+}
+
+/// ★ The commit-time out-of-domain answers ([`CommitOod`]): `F_i(ood_point(z0))`
+/// for every stacked polynomial `i` of `layout`, from the columns where they
+/// lie — on the card in place when `resident` holds them, on the host
+/// otherwise.
+///
+/// A stack is zero outside its placements, so this is [`weight_at`]'s closed
+/// form turned around: with `p = ood_point(z0, n_stack)`,
+/// `F_i(p) = Σ_{c ∈ i} eq(corner_c, p_high)·column_c(p_low)`, where a column
+/// of `h` variables reads the last `h` coordinates of `p` and its corner the
+/// first `n_stack − h`. Columns of one height share their point, so a run of
+/// them that sits contiguously in the store is one device call.
+pub fn ood_answers<F, E, C>(
+    layout: &StackedLayout,
+    columns: &[&C],
+    resident: Option<(&crate::gpu::ResidentColumns, ColumnsAt<'_>)>,
+    z0: &FieldElement<E>,
+) -> Result<(Vec<FieldElement<E>>, OodCounts), Error>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<E>: Send + Sync,
+    C: HostColumn<F>,
+{
+    let placements = layout.placements();
+    if columns.len() != placements.len() {
+        return Err(Error::QueryCountMismatch {
+            expected: placements.len(),
+            got: columns.len(),
+        });
+    }
+    let n = layout.n_stack();
+    let point = whir_chain::ood_point(z0, n);
+    let low = |place: &Placement| &point[n - place.num_vars..];
+    let mut values: Vec<Option<FieldElement<E>>> = vec![None; placements.len()];
+    let mut counts = OodCounts::default();
+    if let Some((store, at)) = resident {
+        let mut c = 0usize;
+        while c < placements.len() {
+            let height = placements[c].num_vars;
+            let first = at.store_column(c);
+            let mut end = c + 1;
+            while end < placements.len()
+                && placements[end].num_vars == height
+                && at.store_column(end) == first + (end - c)
+            {
+                end += 1;
+            }
+            if let Some(run) =
+                crate::gpu::evaluate_resident_run(store, first, end - c, low(&placements[c]))
+            {
+                counts.on_card += run.len();
+                for (slot, value) in values[c..end].iter_mut().zip(run) {
+                    *slot = Some(value);
+                }
+            }
+            c = end;
+        }
+    }
+    let missing: Vec<usize> = (0..placements.len())
+        .filter(|&c| values[c].is_none())
+        .collect();
+    counts.on_host = missing.len();
+    let one = |&c: &usize| -> Result<(usize, FieldElement<E>), Error> {
+        Ok((c, columns[c].host().evaluate_in(low(&placements[c]))?))
+    };
+    #[cfg(feature = "parallel")]
+    let host: Vec<(usize, FieldElement<E>)> =
+        missing.par_iter().map(one).collect::<Result<_, _>>()?;
+    #[cfg(not(feature = "parallel"))]
+    let host: Vec<(usize, FieldElement<E>)> = missing.iter().map(one).collect::<Result<_, _>>()?;
+    for (c, value) in host {
+        values[c] = Some(value);
+    }
+    let mut answers = vec![FieldElement::<E>::zero(); layout.num_polys()];
+    for (place, value) in placements.iter().zip(values) {
+        let value = value.ok_or(Error::UnknownPolynomial {
+            index: place.poly,
+            len: layout.num_polys(),
+        })?;
+        let corner: Vec<FieldElement<E>> = place
+            .prefix_bits()
+            .into_iter()
+            .map(|b| {
+                if b {
+                    FieldElement::<E>::one()
+                } else {
+                    FieldElement::<E>::zero()
+                }
+            })
+            .collect();
+        answers[place.poly] += eq_eval(&corner, &point[..corner.len()])? * value;
+    }
+    Ok((answers, counts))
+}
+
 /// Proves that every column takes its claimed value at the shared `point`.
 ///
 /// The claims are absorbed before the batching challenge, so the prover cannot
@@ -669,6 +790,52 @@ where
     H: WhirHash,
     C: HostColumn<F>,
 {
+    prove_mapped_ood::<F, E, T, H, C>(
+        stacked, columns, resident, point, values, None, config, transcript,
+    )
+}
+
+/// A commitment's commit-time out-of-domain claims: every stacked polynomial
+/// `i` answered `F_i(ood_point(z0))` before any challenge its column claims
+/// depend on (I-WOOD).
+///
+/// The answers were absorbed by the caller's transcript where they were given
+/// — before the challenges, which is the whole point — so they are NOT
+/// absorbed again here. What happens here is the batching: after the column
+/// claims' challenge one more, `gamma`, and each polynomial's chain proves its
+/// column claims plus `gamma·y_i` under the weight plus
+/// `gamma·eq(ood_point(z0), ·)` over the whole stack.
+#[derive(Clone, Copy, Debug)]
+pub struct CommitOod<'a, E: IsField> {
+    /// The point, as the univariate value [`whir_chain::ood_point`] lifts.
+    pub z0: &'a FieldElement<E>,
+    /// One answer per stacked polynomial, in commitment order.
+    pub values: &'a [FieldElement<E>],
+}
+
+/// [`prove_mapped`] with the commitment's commit-time out-of-domain claims
+/// batched into each chain's first claim ([`CommitOod`]). `None` is
+/// [`prove_mapped`], byte for byte.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_mapped_ood<F, E, T, H, C>(
+    stacked: &StackedCommitment<F, H>,
+    columns: &[&C],
+    resident: Option<(&crate::gpu::ResidentColumns, ColumnsAt<'_>)>,
+    point: &Claimed<'_, E>,
+    values: &[FieldElement<E>],
+    ood: Option<CommitOod<'_, E>>,
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<StackedProof<F, E>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    H: WhirHash,
+    C: HostColumn<F>,
+{
     if let Some((_, ColumnsAt::Map(map))) = resident
         && map.len() != columns.len()
     {
@@ -684,10 +851,19 @@ where
             got: values.len(),
         });
     }
+    if let Some(ood) = &ood
+        && ood.values.len() != stacked.commitments.len()
+    {
+        return Err(Error::QueryCountMismatch {
+            expected: stacked.commitments.len(),
+            got: ood.values.len(),
+        });
+    }
     for value in values {
         transcript.append_field_element(value);
     }
     let weights = challenge_powers(&transcript.sample_field_element(), values.len());
+    let overlay = ood_overlay(ood.as_ref(), layout.n_stack(), transcript);
 
     // ★ THE GROUP'S TURN, TAKEN BACK for as long as its openings run — one at a
     // time, so one turn covers them all — and given back when they end. A
@@ -725,9 +901,10 @@ where
         };
         // The weight goes down as its shares: a device writes them into its own
         // buffer, and the host materializes the table only if none does.
-        polys.push(whir_chain::prove_shared::<F, E, T, H>(
+        polys.push(whir_chain::prove_shared_ood::<F, E, T, H>(
             &poly,
             &weight_shares(layout, i, point, &weights)?,
+            overlay.as_ref().map(|(at, gamma)| (at.as_slice(), gamma)),
             layout.n_stack(),
             commitment,
             &stacked.domain,
@@ -762,6 +939,44 @@ where
     T: IsTranscript<E>,
     H: WhirHash,
 {
+    verify_ood::<F, E, T, H>(
+        proof, layout, roots, point, values, None, domain, config, transcript,
+    )
+}
+
+/// [`verify`] with the commitment's commit-time out-of-domain claims
+/// ([`CommitOod`]): after the column claims' challenge, `gamma`; each chain's
+/// claim gains `gamma·y_i` and its weight `gamma·eq(ood_point(z0), ·)`, which
+/// is evaluated in closed form at the chain's final point. `None` is
+/// [`verify`], byte for byte.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_ood<F, E, T, H>(
+    proof: &StackedProof<F, E>,
+    layout: &StackedLayout,
+    roots: &[Commitment],
+    point: &Claimed<'_, E>,
+    values: &[FieldElement<E>],
+    ood: Option<CommitOod<'_, E>>,
+    domain: &Domain<F>,
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<(), Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    if let Some(ood) = &ood
+        && ood.values.len() != layout.num_polys()
+    {
+        return Err(Error::QueryCountMismatch {
+            expected: layout.num_polys(),
+            got: ood.values.len(),
+        });
+    }
     if values.len() != layout.placements().len() {
         return Err(Error::QueryCountMismatch {
             expected: layout.placements().len(),
@@ -778,13 +993,25 @@ where
         transcript.append_field_element(value);
     }
     let weights = challenge_powers(&transcript.sample_field_element(), values.len());
+    let overlay = ood_overlay(ood.as_ref(), layout.n_stack(), transcript);
 
     for (i, (eval_proof, root)) in proof.polys.iter().zip(roots).enumerate() {
+        let mut claim = claimed(layout, i, values, &weights)?;
+        if let (Some((_, gamma)), Some(ood)) = (&overlay, &ood) {
+            claim += gamma * &ood.values[i];
+        }
+        let overlay = &overlay;
         whir_chain::verify_weighted::<F, E, T, _, H>(
             eval_proof,
             root,
-            |at: &[FieldElement<E>]| weight_at(layout, i, point, &weights, at),
-            claimed(layout, i, values, &weights)?,
+            |at: &[FieldElement<E>]| {
+                let mut w = weight_at(layout, i, point, &weights, at)?;
+                if let Some((ood_at, gamma)) = overlay {
+                    w += gamma * eq_eval(ood_at, at)?;
+                }
+                Ok(w)
+            },
+            claim,
             layout.n_stack(),
             domain,
             config,
@@ -1499,5 +1726,173 @@ mod tests {
             )
             .is_err()
         );
+    }
+}
+
+/// The commit-time out-of-domain claims on a stack (I-WOOD): the answers are
+/// the stack's values out of domain, and a chain carrying them refuses a false
+/// one.
+#[cfg(test)]
+mod commit_ood_tests {
+    use super::*;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use math::field::goldilocks::GoldilocksField as F;
+
+    use crate::{
+        whir_chain::{ChainFormat, GrindBits},
+        whir_hash::KeccakWhir,
+    };
+
+    type FE = FieldElement<F>;
+
+    fn config() -> ChainConfig {
+        ChainConfig {
+            log_blowup: 2,
+            log_folding: 2,
+            num_queries: 3,
+            grind: GrindBits::default(),
+            format: ChainFormat::DEFAULT,
+        }
+    }
+
+    /// Mixed heights with gaps between them: four polynomials of six
+    /// variables, the first two with holes the stacking leaves zero.
+    fn stack() -> (StackedLayout, Vec<Mle<F>>) {
+        let heights = [3usize, 5, 4, 2, 6, 5];
+        let layout = StackedLayout::build(&heights, 6).unwrap();
+        let columns = heights
+            .iter()
+            .enumerate()
+            .map(|(i, &m)| {
+                Mle::new(
+                    (0..(1u64 << m))
+                        .map(|r| {
+                            FE::from(
+                                r.wrapping_add(31 * i as u64 + 5)
+                                    .wrapping_mul(6364136223846793005)
+                                    >> 9,
+                            )
+                        })
+                        .collect(),
+                )
+                .unwrap()
+            })
+            .collect();
+        (layout, columns)
+    }
+
+    /// Stacked polynomial `poly` as one table, zero where no column sits.
+    fn assembled(layout: &StackedLayout, columns: &[Mle<F>], poly: usize) -> Mle<F> {
+        let mut evals = vec![FE::zero(); 1 << layout.n_stack()];
+        for (place, column) in layout.placements().iter().zip(columns) {
+            if place.poly == poly {
+                evals[place.offset..place.offset + column.len()].clone_from_slice(column.evals());
+            }
+        }
+        Mle::new(evals).unwrap()
+    }
+
+    #[test]
+    fn the_answers_are_the_stacks_values_out_of_domain() {
+        let (layout, columns) = stack();
+        assert_eq!(layout.num_polys(), 4, "the stack this test means");
+        let z0 = FE::from(0xdead_beef_1234u64);
+        let (answers, counts) =
+            ood_answers::<F, F, _>(&layout, &crate::stacking::borrow(&columns), None, &z0).unwrap();
+        assert_eq!(
+            counts,
+            OodCounts {
+                on_card: 0,
+                on_host: columns.len()
+            }
+        );
+        let point = whir_chain::ood_point(&z0, layout.n_stack());
+        for (poly, answer) in answers.iter().enumerate() {
+            assert_eq!(
+                assembled(&layout, &columns, poly).evaluate(&point).unwrap(),
+                *answer,
+                "polynomial {poly}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stack_answers_for_its_commit_and_refuses_a_false_answer() {
+        let (layout, columns) = stack();
+        let borrowed = crate::stacking::borrow(&columns);
+        let stacked =
+            StackedCommitment::<F, KeccakWhir>::commit(layout, &borrowed, None, &config()).unwrap();
+        let roots = stacked.roots();
+        let points: Vec<Vec<FE>> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                (0..c.num_vars())
+                    .map(|j| FE::from(97 + 13 * i as u64 + j as u64))
+                    .collect()
+            })
+            .collect();
+        let values: Vec<FE> = columns
+            .iter()
+            .zip(&points)
+            .map(|(c, p)| c.evaluate(p).unwrap())
+            .collect();
+        let z0 = FE::from(0x0005_eed0_f00d_u64);
+        let (answers, _) = ood_answers::<F, F, _>(stacked.layout(), &borrowed, None, &z0).unwrap();
+        let transcript = || DefaultTranscript::<F>::new(b"commit-ood");
+        let proof = prove_mapped_ood::<F, F, _, KeccakWhir, _>(
+            &stacked,
+            &borrowed,
+            None,
+            &Claimed::PerColumn(&points),
+            &values,
+            Some(CommitOod {
+                z0: &z0,
+                values: &answers,
+            }),
+            &config(),
+            &mut transcript(),
+        )
+        .unwrap();
+        let check = |ood: Option<CommitOod<'_, F>>| {
+            verify_ood::<F, F, _, KeccakWhir>(
+                &proof,
+                stacked.layout(),
+                &roots,
+                &Claimed::PerColumn(&points),
+                &values,
+                ood,
+                stacked.domain(),
+                &config(),
+                &mut transcript(),
+            )
+        };
+        let with = |values: &[FE]| check(Some(CommitOod { z0: &z0, values }));
+        assert!(with(&answers).is_ok(), "the honest answers verify");
+
+        let mut wrong = answers.clone();
+        wrong[1] += FE::one();
+        assert!(with(&wrong).is_err(), "a false answer");
+        let mut swapped = answers.clone();
+        swapped.swap(0, 2);
+        assert_ne!(answers[0], answers[2]);
+        assert!(with(&swapped).is_err(), "two answers swapped");
+        assert!(
+            with(&answers[..answers.len() - 1]).is_err(),
+            "an answer missing"
+        );
+        let mut extra = answers.clone();
+        extra.push(FE::one());
+        assert!(with(&extra).is_err(), "an answer too many");
+        let other_z0 = &z0 + FE::one();
+        assert!(
+            check(Some(CommitOod {
+                z0: &other_z0,
+                values: &answers,
+            }))
+            .is_err(),
+            "the answers at another point"
+        );
+        assert!(check(None).is_err(), "a verifier that drops the batching");
     }
 }

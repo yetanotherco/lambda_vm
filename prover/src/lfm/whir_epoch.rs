@@ -1224,6 +1224,9 @@ pub struct GroupWires<'a> {
     pub polys: &'a [StackedPolyWires<'a>],
     pub shape: &'a ChainShape,
     pub domain: &'a Domain<GoldilocksField>,
+    /// The commitment's commit-time out-of-domain claims (the no-epoch WHIR
+    /// block's, W-10); `None` everywhere else.
+    pub ood: Option<super::whir_stacked::StackedOod<'a>>,
 }
 
 /// ★ The commitment-group walk, emitted: `multi_verify`'s second loop
@@ -1258,13 +1261,14 @@ pub fn emit_group_walk(
     let mut gammas = Vec::with_capacity(groups.len());
     for (group, &size) in groups.iter().zip(sizes) {
         let width: usize = walk.widths[statement_at..statement_at + size].iter().sum();
-        gammas.push(emit_stacked_verify(
+        gammas.push(super::whir_stacked::emit_stacked_verify_ood(
             b,
             transcript,
             group.layout,
             group.polys,
             &points[column_at..column_at + width],
             &walk.values[column_at..column_at + width],
+            group.ood,
             group.shape,
             group.domain,
         ));
@@ -1827,6 +1831,7 @@ pub(crate) fn emit_epoch_leg(
             polys: &group_wires[group],
             shape: &group_shapes[group],
             domain: &plan.group_domains[group],
+            ood: None,
         })
         .collect();
     emit_group_walk(b, &mut transcript, &groups, &plan.sizes, &walk);

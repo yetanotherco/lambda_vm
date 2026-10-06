@@ -2658,6 +2658,66 @@ where
     None
 }
 
+/// Store columns `first..first + width`, each at `point` (base columns, an
+/// ext3 point), evaluated where they lie: the commit-time out-of-domain
+/// answers' device half (`stacked_eval::ood_answers`). `None` when the store
+/// does not hold them as one run spanning `point`, when the run is too small
+/// to be worth the launches, or when the card refuses: the caller evaluates
+/// them on the host.
+#[cfg(feature = "cuda")]
+pub(crate) fn evaluate_resident_run<E>(
+    store: &ResidentColumns,
+    first: usize,
+    width: usize,
+    point: &[math::field::element::FieldElement<E>],
+) -> Option<Vec<math::field::element::FieldElement<E>>>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use std::any::TypeId;
+
+    if TypeId::of::<E>() != TypeId::of::<Ext3>() || point.is_empty() || width == 0 {
+        return None;
+    }
+    let rows = 1usize << point.len();
+    if !store.0.is_run(first, width)
+        || store.0.span(first).1 != rows
+        || rows.saturating_mul(width) < EVALUATE_THRESHOLD
+    {
+        return None;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_MLE_EVAL").is_some()) {
+        return None;
+    }
+    let raw_point = raw_point(point)?;
+    let values = math_cuda::sumcheck::evaluate_many_base(
+        math_cuda::columns::Columns::Device {
+            store: &store.0,
+            first,
+            width,
+        },
+        &raw_point,
+    )
+    .ok()?;
+    EVALUATE_CALLS.fetch_add(values.len() as u64, Ordering::Relaxed);
+    Some(values.iter().map(|v| ext3_from_raw::<E>(v)).collect())
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn evaluate_resident_run<E>(
+    _store: &ResidentColumns,
+    _first: usize,
+    _width: usize,
+    _point: &[math::field::element::FieldElement<E>],
+) -> Option<Vec<math::field::element::FieldElement<E>>>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    None
+}
+
 /// A multilinear's value at `point`, bound variable by variable on device.
 ///
 /// `evals` may be base-field or ext3; the point is always ext3, which is what
@@ -4921,10 +4981,19 @@ impl OpeningFactors {
 /// The same with the weight written on device from its shares: a stacked
 /// polynomial's weight is as wide as the polynomial, and sending it would cost
 /// more than the rounds that read it.
+///
+/// `overlay`, `scale·eq(point, ·)` over the whole stack, is added on top of
+/// the shares (`whir_chain::prove_shared_ood`): the lean rounds read it as one
+/// more row past the columns', and a materialised session adds it with
+/// `add_scaled_eq` before any round.
 #[cfg(feature = "cuda")]
 pub(crate) fn open_shared<F, E>(
     message: &crate::whir_chain::Stacked<'_, F>,
     shares: &[crate::stacked_eval::WeightShare<'_, E>],
+    overlay: Option<(
+        &[math::field::element::FieldElement<E>],
+        &math::field::element::FieldElement<E>,
+    )>,
     n_stack: usize,
     program: &crate::program::Program<E>,
 ) -> Option<OpeningFactors>
@@ -4960,6 +5029,15 @@ where
             ))
         })
         .collect::<Option<_>>()?;
+    let overlay: Option<(Vec<u64>, [u64; 3])> = match overlay {
+        Some((point, scale)) => {
+            if point.len() != n_stack {
+                return None;
+            }
+            Some((raw_point(point)?, ext3_raw(scale)?))
+        }
+        None => None,
+    };
 
     // SAFETY: `F == GoldilocksField`, a transparent wrapper over `u64`.
     let raw = |table: &crate::mle::Mle<F>| unsafe {
@@ -4990,7 +5068,7 @@ where
     // before, before any challenge is drawn.
     let rounds = lean_rounds().min(n_stack);
     if rounds > 0
-        && let Some(lean) = lean_opening(&shares, n_stack, message, &host_parts)
+        && let Some(lean) = lean_opening(&shares, overlay.as_ref(), n_stack, message, &host_parts)
     {
         OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
         LEAN_OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -5011,6 +5089,10 @@ where
         }
     }
     .ok()?;
+    // Before any round, so the session's first evaluations already carry it.
+    if let Some((point, scale)) = &overlay {
+        session.add_scaled_eq(point, scale).ok()?;
+    }
     OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
     Some(OpeningFactors {
         state: OpeningState::Session(session),
@@ -5049,6 +5131,7 @@ fn materialize_state(
 #[cfg(feature = "cuda")]
 fn lean_opening<F>(
     shares: &[(usize, Vec<u64>, [u64; 3])],
+    overlay: Option<&(Vec<u64>, [u64; 3])>,
     n_stack: usize,
     message: &crate::whir_chain::Stacked<'_, F>,
     host_parts: &[(&[u64], usize)],
@@ -5099,6 +5182,32 @@ where
             scale: *scale,
         });
     }
+    // The overlay's halves, after the columns': a point over the whole stack.
+    let lean_overlay = match overlay {
+        Some((point, scale)) => {
+            let coordinates: Vec<FieldElement<Ext3>> =
+                point.chunks_exact(3).map(ext3_from_raw::<Ext3>).collect();
+            let lo_bits = n_stack / 2;
+            let (hi, lo) = coordinates.split_at(n_stack - lo_bits);
+            let hi_at = eq.len() / 3;
+            for value in crate::eq::eq_evals(hi) {
+                eq.extend_from_slice(&ext3_raw(&value)?);
+            }
+            let lo_at = eq.len() / 3;
+            for value in crate::eq::eq_evals(lo) {
+                eq.extend_from_slice(&ext3_raw(&value)?);
+            }
+            Some(math_cuda::whir_open::LeanShare {
+                stack_offset: 0,
+                num_vars: n_stack,
+                lo_bits,
+                hi_at,
+                lo_at,
+                scale: *scale,
+            })
+        }
+        None => None,
+    };
     let source = match &message.resident {
         Some((store, parts)) => math_cuda::whir_open::LeanMessage::Resident {
             store: &store.0,
@@ -5106,15 +5215,25 @@ where
         },
         None => math_cuda::whir_open::LeanMessage::Parts(host_parts),
     };
-    math_cuda::whir_open::LeanRound0::new(&lean_shares, &eq, n_stack, source)
-        .ok()
-        .flatten()
+    math_cuda::whir_open::LeanRound0::new_with_overlay(
+        &lean_shares,
+        lean_overlay,
+        &eq,
+        n_stack,
+        source,
+    )
+    .ok()
+    .flatten()
 }
 
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn open_shared<F, E>(
     _message: &crate::whir_chain::Stacked<'_, F>,
     _shares: &[crate::stacked_eval::WeightShare<'_, E>],
+    _overlay: Option<(
+        &[math::field::element::FieldElement<E>],
+        &math::field::element::FieldElement<E>,
+    )>,
     _n_stack: usize,
     _program: &crate::program::Program<E>,
 ) -> Option<OpeningFactors>

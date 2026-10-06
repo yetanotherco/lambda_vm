@@ -354,7 +354,16 @@ pub(crate) const MULTILINEAR_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_STATEMENT_V2";
 /// multilinear statement, proved in groups on forks of one transcript. Distinct
 /// from [`MULTILINEAR_TAG`] so a block proof is never read as a monolithic one.
 #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-pub(crate) const MULTILINEAR_BLOCK_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V1";
+/// V2: the block's carried polynomials answer a commit-time out-of-domain
+/// point before `(z, α, β)` (W-10, `block_whir`'s `commit_ood`). The only tag a
+/// block verifier accepts.
+pub(crate) const MULTILINEAR_BLOCK_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V2";
+
+/// V1, the block statement before the commit-time answers: absorbed only by a
+/// prover whose [`crate::block_whir::BlockOptions::commit_ood`] is off (an A/B
+/// arm), and refused by every verifier. The same length as V2, so the
+/// statement's padding is the same.
+pub(crate) const MULTILINEAR_BLOCK_TAG_NO_OOD: &[u8] = b"LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V1";
 
 /// Continuation domain tags. Distinct from the monolithic `DOMAIN_TAG` so a
 /// monolithic proof and a continuation proof can never share a transcript prefix.

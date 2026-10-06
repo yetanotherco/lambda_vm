@@ -31,7 +31,7 @@ use math::field::element::FieldElement;
 use multilinear::mle::Mle;
 use multilinear::whir_chain::{ArgueFormat, ChainConfig};
 use rayon::prelude::*;
-use stark::multilinear_block::{self, BlockCommitted, GroupStamps, block_groups};
+use stark::multilinear_block::{self, BlockCommitted, GroupStamps, OodSource, block_groups};
 use stark::multilinear_table::{
     BatchedArgue, CommittedTable, MultiProof, TableLayout, TableStatement, batched::VerifierChecks,
 };
@@ -42,7 +42,7 @@ use std::time::Instant;
 use crate::multilinear_prove::{
     absorb_tagged, chain_config_under, layout_of, preprocessed_mles, shapes_of, stacks,
 };
-use crate::statement::{self, MULTILINEAR_BLOCK_TAG};
+use crate::statement::{self, MULTILINEAR_BLOCK_TAG, MULTILINEAR_BLOCK_TAG_NO_OOD};
 use crate::tables::gpack::{self, TraceForm};
 use crate::tables::trace_builder::{
     ChunkJob, StreamTable, Traces, WindowStamps, WindowedTraceBuilder,
@@ -319,6 +319,14 @@ pub struct BlockOptions {
     /// Production: [`spill_from_env`] (`LAMBDA_VM_BLOCK_SPILL`), `auto` unless
     /// set.
     pub spill: BlockSpillPolicy,
+    /// Each group answers its commit-time out-of-domain point as its commit
+    /// ends, and the answers ride the proof
+    /// ([`multilinear_block::commit_ood_point`], W-10). ★ Not a prover's free
+    /// choice like the rest: off proves today's transcript under the V1
+    /// statement tag, which no verifier accepts. Off exists only for the A/B
+    /// that prices the fix. Production: on unless
+    /// `LAMBDA_VM_BLOCK_COMMIT_OOD=0`.
+    pub commit_ood: bool,
 }
 
 /// When a block spills its held tables ([`BlockOptions::spill`]): the policy
@@ -592,7 +600,34 @@ impl BlockOptions {
             pack_finished: true,
             gpack: gpack_from_env(),
             spill: spill_from_env(),
+            commit_ood: commit_ood_from_env(),
         }
+    }
+}
+
+/// `LAMBDA_VM_BLOCK_COMMIT_OOD`: [`BlockOptions::commit_ood`]'s production
+/// value, on unless `0`.
+pub(crate) fn commit_ood_from_env() -> bool {
+    !std::env::var("LAMBDA_VM_BLOCK_COMMIT_OOD").is_ok_and(|v| v.trim() == "0")
+}
+
+/// Each group's commit-time out-of-domain point under the WHIR hash's
+/// transcript ([`multilinear_block::commit_ood_point`]): what phase A hands its
+/// committer. The verifier draws the same point through the same function,
+/// under the transcript type it verifies with.
+fn ood_source<H: multilinear::whir_hash::WhirHash>(
+    log_blowup: usize,
+) -> impl Fn(
+    usize,
+    &multilinear::stacking::StackedLayout,
+    &[multilinear::whir_commit::Commitment],
+) -> Result<FieldElement<E>, multilinear::Error>
++ Sync {
+    move |group, layout, roots| {
+        multilinear_block::commit_ood_point::<
+            E,
+            DefaultTranscript<E, <H as multilinear::whir_hash::WhirHash>::Transcript>,
+        >(group, layout, roots, log_blowup)
     }
 }
 
@@ -741,6 +776,11 @@ pub struct BlockWhirProof {
     /// order, and `proof.tables` is empty; under [`ArgueFormat::PerTable`],
     /// empty. Which one a verifier reads is its format's, never the proof's.
     pub argues: Vec<BatchedArgue<E>>,
+    /// Every carried polynomial's commit-time out-of-domain answer, in root
+    /// order ([`multilinear_block::commit_ood_point`]): absorbed after the
+    /// roots and before `(z, α, β)`, each batched into its chain. The verifier
+    /// refuses a proof without one per root (W-10).
+    pub commit_ood: Vec<FieldElement<E>>,
 }
 
 /// Where a block's prove spent its time, for the readout. Seconds.
@@ -831,6 +871,22 @@ impl BlockStamps {
             self.cells as f64 / 1e9,
             tree as f64 / (1u64 << 30) as f64,
         );
+        // The commit-time out-of-domain answers (W-10): one per chain, each
+        // group's on the committer's thread as its commit ends.
+        let (on_card, on_host) = self.groups.iter().fold((0, 0), |(c, h), g| {
+            (c + g.ood_counts.on_card, h + g.ood_counts.on_host)
+        });
+        if on_card + on_host == 0 {
+            out.push_str(
+                "BLOCK COMMIT OOD: off (LAMBDA_VM_BLOCK_COMMIT_OOD=0: the A/B arm, which no verifier accepts)\n",
+            );
+        } else {
+            out.push_str(&format!(
+                "BLOCK COMMIT OOD: answers {polys} · columns on card {on_card} · on host {on_host} · seconds {:.3} (max group {:.3})\n",
+                sum(|g| g.ood),
+                self.groups.iter().map(|g| g.ood).fold(0.0, f64::max),
+            ));
+        }
         for (g, s) in self.groups.iter().enumerate() {
             out.push_str(&format!(
                 "BLOCK GROUP {g}: tables {} · polys {} · cells {:.1} M || A wait {:.3} upload {:.3} paid {:.3} commit {:.3} retire {:.3} from@{:.2} done@{:.2} || B upload {:.3} argue {:.3} encode {:.3} open {:.3}\n",
@@ -842,7 +898,7 @@ impl BlockStamps {
                 s.upload_paid,
                 s.commit,
                 s.retire,
-                s.committed_at - s.commit - s.retire,
+                s.committed_at - s.commit - s.retire - s.ood,
                 s.committed_at,
                 s.upload_b,
                 s.argue,
@@ -1158,9 +1214,47 @@ pub(crate) fn absorb_block(
     config: &multilinear::whir_chain::ChainConfig,
     groups: &[Vec<u32>],
 ) {
-    absorb_tagged(
+    absorb_block_tagged(
         t,
         MULTILINEAR_BLOCK_TAG,
+        elf_bytes,
+        public_output,
+        table_counts,
+        num_private_input_pages,
+        runtime_page_ranges,
+        table_num_vars,
+        config,
+        groups,
+    );
+}
+
+/// The statement tag a prover absorbs: V2 with the commit-time answers, V1
+/// without — the A/B arm no verifier accepts ([`BlockOptions::commit_ood`]).
+fn block_tag(commit_ood: bool) -> &'static [u8] {
+    if commit_ood {
+        MULTILINEAR_BLOCK_TAG
+    } else {
+        MULTILINEAR_BLOCK_TAG_NO_OOD
+    }
+}
+
+/// [`absorb_block`] under `tag` ([`block_tag`]).
+#[allow(clippy::too_many_arguments)]
+fn absorb_block_tagged(
+    t: &mut impl IsTranscript<E>,
+    tag: &[u8],
+    elf_bytes: &[u8],
+    public_output: &[u8],
+    table_counts: &TableCounts,
+    num_private_input_pages: usize,
+    runtime_page_ranges: &[RuntimePageRange],
+    table_num_vars: &[u8],
+    config: &multilinear::whir_chain::ChainConfig,
+    groups: &[Vec<u32>],
+) {
+    absorb_tagged(
+        t,
+        tag,
         "block",
         &statement::elf_digest(elf_bytes),
         public_output,
@@ -1691,6 +1785,10 @@ pub(crate) struct Deviations {
     /// ([`BlockCommitted::fault_lose_spilled_slot`]), so its columns never
     /// come back.
     pub spilled_slot_lost: bool,
+    /// Between the phases, the first commit-time answer made false and every
+    /// answer left out of the chains
+    /// ([`BlockCommitted::fault_commit_ood_unbound`]).
+    pub commit_ood_unbound: bool,
 }
 
 /// A prepared stack committed wrongly, tables by AIR index.
@@ -2001,8 +2099,9 @@ pub(crate) fn prove_traces(
     let proof = crate::with_whir_hash!(|H| {
         let mut transcript =
             DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
-        absorb_block(
+        absorb_block_tagged(
             &mut transcript,
+            block_tag(options.commit_ood),
             elf_bytes,
             &public_output,
             &table_counts,
@@ -2013,6 +2112,7 @@ pub(crate) fn prove_traces(
             &groups,
         );
         let t = Instant::now();
+        let source = ood_source::<H>(config.log_blowup);
         let (block, produced) = std::thread::scope(|scope| {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let producer = scope.spawn(move || -> Result<f64, Error> {
@@ -2037,6 +2137,7 @@ pub(crate) fn prove_traces(
                 options.drop_levels,
                 options.narrow,
                 options.upload_ahead,
+                options.commit_ood.then_some(&source as OodSource<'_, E>),
             );
             (block, producer.join())
         });
@@ -2047,6 +2148,9 @@ pub(crate) fn prove_traces(
         let mut block = block.map_err(|e| Error::Prover(format!("{e:?}")))?;
         if deviations.narrow_width_map && !block.fault_narrow_width_map() {
             return Err(Error::Prover("no narrow table to break".into()));
+        }
+        if deviations.commit_ood_unbound && !block.fault_commit_ood_unbound() {
+            return Err(Error::Prover("no commit-time answer to falsify".into()));
         }
         stamps.prep += produced;
         stamps.phase_a = t.elapsed().as_secs_f64();
@@ -2086,7 +2190,7 @@ pub(crate) fn prove_traces(
             Some(f) => f,
             None => &identity,
         };
-        let (proof, argues, prepared_openings, groups) =
+        let (proof, argues, prepared_openings, groups, commit_ood) =
             multilinear_block::block_prove_on_forks::<_, _, _, H>(
                 block,
                 &config,
@@ -2110,7 +2214,7 @@ pub(crate) fn prove_traces(
             widens_after.1 - widens_before.1,
         );
         stamps.groups = groups;
-        (proof, argues, prepared_openings)
+        (proof, argues, prepared_openings, commit_ood)
     });
 
     Ok(BlockWhirProof {
@@ -2123,6 +2227,7 @@ pub(crate) fn prove_traces(
         groups,
         prepared: proof.2,
         argues: proof.1,
+        commit_ood: proof.3,
     })
 }
 
@@ -3000,6 +3105,7 @@ fn prove_streamed(
     };
 
     crate::with_whir_hash!(|H| {
+        let source = ood_source::<H>(commit_config.log_blowup);
         let (block, built, laid, executed) = std::thread::scope(|scope| {
             use std::sync::atomic::Ordering::Relaxed;
             // The executor, a window at a time, two windows ahead of the walk.
@@ -3379,6 +3485,7 @@ fn prove_streamed(
                 options.upload_ahead,
                 ledger.map(|ledger| ledger.block.clone()),
                 spill.clone(),
+                options.commit_ood.then_some(&source as OodSource<'_, E>),
             );
             (block, builder.join(), layout.join(), executor.join())
         });
@@ -3395,6 +3502,9 @@ fn prove_streamed(
         let mut block = block.map_err(|e| Error::Prover(format!("{e:?}")))?;
         if deviations.narrow_width_map && !block.fault_narrow_width_map() {
             return Err(Error::Prover("no narrow table to break".into()));
+        }
+        if deviations.commit_ood_unbound && !block.fault_commit_ood_unbound() {
+            return Err(Error::Prover("no commit-time answer to falsify".into()));
         }
         if deviations.spilled_byte && !block.fault_spilled_byte() {
             return Err(Error::Prover("no spilled table to break".into()));
@@ -3426,8 +3536,9 @@ fn prove_streamed(
         let table_num_vars: Vec<u8> = laid.shapes.iter().map(|&(_, n)| n as u8).collect();
         let mut transcript =
             DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
-        absorb_block(
+        absorb_block_tagged(
             &mut transcript,
+            block_tag(options.commit_ood),
             elf_bytes,
             &laid.public_output,
             &laid.table_counts,
@@ -3478,7 +3589,7 @@ fn prove_streamed(
             Some(f) => f,
             None => &identity,
         };
-        let (proof, argues, prepared_openings, groups) =
+        let (proof, argues, prepared_openings, groups, commit_ood) =
             multilinear_block::block_prove_on_forks_observed::<_, _, _, H>(
                 block,
                 &config,
@@ -3571,6 +3682,7 @@ fn prove_streamed(
             groups: laid.groups,
             prepared: prepared_openings,
             argues,
+            commit_ood,
         })
     })
 }
@@ -3927,7 +4039,12 @@ pub(crate) fn verify_block_whir_with(
         // What the tables owe: the COMMIT bus's counterparty, at the block's
         // challenges — replayed on a fork through the roots block itself.
         let mut probe = transcript.clone();
-        stark::multilinear_table::absorb_roots::<E, _>(&mut probe, &proof.proof.roots, &derived);
+        stark::multilinear_table::absorb_roots_and_answers::<E, _>(
+            &mut probe,
+            &proof.proof.roots,
+            &derived,
+            &proof.commit_ood,
+        );
         let z: FieldElement<E> = probe.sample_field_element();
         let alpha: FieldElement<E> = probe.sample_field_element();
         let Some(owed) = crate::compute_commit_bus_offset(&proof.public_output, 0, &z, &alpha)
@@ -3936,6 +4053,7 @@ pub(crate) fn verify_block_whir_with(
         };
         multilinear_block::block_verify_with::<_, _, _, H>(
             &proof.proof,
+            &proof.commit_ood,
             &proof.argues,
             &proof.prepared,
             &checks,

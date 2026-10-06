@@ -921,6 +921,50 @@ where
     )
 }
 
+/// [`absorb_roots_and_challenge`] for a block whose carried polynomials
+/// answered a commit-time out-of-domain point (W-10): the roots, then the
+/// answers, then the three challenges — so `(z, α, β)` come after every
+/// committed word is pinned to one codeword. The block prover and verifier and
+/// every replay call this; an empty `answers` is
+/// [`absorb_roots_and_challenge`] exactly.
+pub fn absorb_roots_answers_and_challenge<E, T>(
+    transcript: &mut T,
+    carried: &[Commitment],
+    derived: &[Commitment],
+    answers: &[FieldElement<E>],
+) -> (FieldElement<E>, FieldElement<E>, FieldElement<E>)
+where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
+    absorb_roots_and_answers::<E, T>(transcript, carried, derived, answers);
+    (
+        transcript.sample_field_element(),
+        transcript.sample_field_element(),
+        transcript.sample_field_element(),
+    )
+}
+
+/// The half of [`absorb_roots_answers_and_challenge`] a REPLAY needs — the
+/// roots, then the commit-time answers — for the same reason [`absorb_roots`]
+/// is split out: a replay draws only what it consumes. ⛔ A block replay that
+/// calls [`absorb_roots`] alone draws `z` before the answers, at challenges no
+/// table was argued at.
+pub fn absorb_roots_and_answers<E, T>(
+    transcript: &mut T,
+    carried: &[Commitment],
+    derived: &[Commitment],
+    answers: &[FieldElement<E>],
+) where
+    E: IsField + 'static,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
+    absorb_roots::<E, T>(transcript, carried, derived);
+    for answer in answers {
+        transcript.append_field_element(answer);
+    }
+}
+
 /// The half of the roots block that can DRIFT: which roots, in which order.
 ///
 /// Split out because a replay needs this half and not the other. The order is a
