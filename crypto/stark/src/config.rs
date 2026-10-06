@@ -157,6 +157,10 @@ pub enum CommitmentHash {
     /// eprint 2026/306 and 2026/1692). Present so the comparison has its priced
     /// reference and its control, never as a candidate.
     Poseidon,
+    /// ZisK's Poseidon1 instance (Goldilocks, width 16, rate 12; `crypto::hash::
+    /// poseidon1_stark`): ZisK's leaf hash and ARITY-4 trees. ⚠ An exploration
+    /// configuration (branch `p1/*`), not a candidate for landing.
+    Poseidon1,
 }
 
 /// The hash behind [`Commitment`], [`BatchedMerkleTree`] and
