@@ -3001,6 +3001,26 @@ fn verify_reason(
         Ok(frame) => frame,
         Err(e) => return format!("block_frame: {e:?}"),
     };
+    let cells: u128 = frame
+        .shapes
+        .iter()
+        .map(|&(width, num_vars)| (width as u128) << num_vars)
+        .sum();
+    println!(
+        "BLOCK VERIFY SHAPE: {} groups (largest {} tables) · {} tables · num_vars {}..={} · {} cells (2^{:.2}) · {} stacked polys",
+        frame.sizes.len(),
+        frame.sizes.iter().max().copied().unwrap_or(0),
+        frame.shapes.len(),
+        frame.shapes.iter().map(|s| s.1).min().unwrap_or(0),
+        frame.shapes.iter().map(|s| s.1).max().unwrap_or(0),
+        cells,
+        (cells as f64).log2(),
+        frame
+            .stack_layouts
+            .iter()
+            .map(|l| l.num_polys())
+            .sum::<usize>(),
+    );
     let air_refs = frame.airs.air_refs();
     let layouts: Vec<TableLayout<'_, F, E>> = match air_refs
         .iter()

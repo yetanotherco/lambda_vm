@@ -2311,7 +2311,10 @@ where
                     .zip(group_settled)
                 {
                     let (output, reduced) =
-                        verify(table, *statement, &z, &alpha, &beta, &mut fork, settled)?;
+                        verify(table, *statement, &z, &alpha, &beta, &mut fork, settled)
+                            .inspect_err(|e| {
+                                eprintln!("BLOCK VERIFY STEP: group {g} of {} (size {size}, first table {statement_at}) · per-table argue · {e:?}", sizes.len())
+                            })?;
                     balance += contribution(&output).ok_or(MlError::BusImbalance)?;
                     for _ in 0..statement.slot_of.len() {
                         points.push(reduced.point.clone());
@@ -2332,7 +2335,10 @@ where
                     &beta,
                     &mut fork,
                     checks,
-                )?;
+                )
+                .inspect_err(|e| {
+                    eprintln!("BLOCK VERIFY STEP: group {g} of {} (size {size}, first table {statement_at}, cells {}) · batched argue · {e:?}", sizes.len(), group_statements.iter().map(|s| s.slot_of.len() << s.num_vars).sum::<usize>())
+                })?;
                 for output in &argue.bus_outputs {
                     balance += contribution(output).ok_or(MlError::BusImbalance)?;
                 }
@@ -2340,7 +2346,9 @@ where
                     group_statements.iter().zip(reduced).zip(group_settled)
                 {
                     if checks.preprocessed {
-                        check_preprocessed(*statement, &reduced, settled)?;
+                        check_preprocessed(*statement, &reduced, settled).inspect_err(|e| {
+                            eprintln!("BLOCK VERIFY STEP: group {g} of {} (size {size}, first table {statement_at}) · preprocessed · {e:?}", sizes.len())
+                        })?;
                     }
                     for _ in 0..statement.slot_of.len() {
                         points.push(reduced.point.clone());
@@ -2359,7 +2367,10 @@ where
             domain,
             config,
             &mut fork,
-        )?;
+        )
+        .inspect_err(|e| {
+            eprintln!("BLOCK VERIFY STEP: group {g} of {} (size {size}, first table {statement_at}, polys {}, roots at {root_at}) · stacked opening · {e:?}", sizes.len(), layout.num_polys())
+        })?;
         // The group's prepared stack, on this fork: the derived commitment must
         // take the values each table settled on, at that table's point.
         if let Some(k) = prepared
@@ -2387,12 +2398,19 @@ where
                 p.domain,
                 config,
                 &mut fork,
-            )?;
+            )
+            .inspect_err(|e| {
+                eprintln!("BLOCK VERIFY STEP: group {g} of {} (size {size}, first table {statement_at}) · prepared opening {k} · {e:?}", sizes.len())
+            })?;
         }
         statement_at += size;
         root_at += layout.num_polys();
     }
     if checks.balance && balance != *expected {
+        eprintln!(
+            "BLOCK VERIFY STEP: all {} groups · bus balance · balance {balance:?} expected {expected:?}",
+            sizes.len()
+        );
         return Err(MlError::BusImbalance);
     }
     Ok(())
