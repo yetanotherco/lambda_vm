@@ -31,6 +31,9 @@ use super::program_budget::{Permit, ProgramBudget};
 /// budget (none without one): what a slot holds and a prover takes.
 pub(super) type Taken = (LfmProgram, LfmArtifacts, Option<Permit>);
 
+/// A program as it is emitted: with its admission, under a budget.
+pub(super) type Emitted = (LfmProgram, Option<Permit>);
+
 /// One program and its artifacts, once its builder has put them.
 #[derive(Default)]
 struct Slot {
@@ -252,10 +255,11 @@ impl Pipe {
     /// [`DEFERRED_LEAF_EMITTERS`] streaming threads as the budget admits them,
     /// and each node program is admitted before its emission. A permit travels
     /// in the slot and is dropped with its program by the prover.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn run_builder(
         &self,
         plan: &BlockTreePlan,
-        leaf_programs: Vec<(LfmProgram, Option<Permit>)>,
+        leaf_programs: Vec<Emitted>,
         wrap_opts: &crate::ProofOptions,
         emit_threads: usize,
         emit_window: usize,
@@ -287,7 +291,7 @@ impl Pipe {
     fn build(
         &self,
         plan: &BlockTreePlan,
-        leaf_programs: Vec<(LfmProgram, Option<Permit>)>,
+        leaf_programs: Vec<Emitted>,
         wrap_opts: &crate::ProofOptions,
         emit_threads: usize,
         emit_window: usize,
@@ -374,33 +378,25 @@ impl Pipe {
             plan.node_program(kids, top)
         };
         // A node's program, admitted first under a budget.
-        let admitted_node = |order: usize,
-                             kids: &[DerivedChild],
-                             top: bool|
-         -> Result<(LfmProgram, Option<Permit>), String> {
-            match &budget {
-                Some(b) => {
-                    let mut permit = b.budget.acquire(order, node_estimate())?;
-                    let program = emit_node(kids, top)?;
-                    let bytes = held_bytes(&program);
-                    node_seen.fetch_max(bytes, Ordering::SeqCst);
-                    permit.emitted(bytes);
-                    Ok((program, Some(permit)))
+        let admitted_node =
+            |order: usize, kids: &[DerivedChild], top: bool| -> Result<Emitted, String> {
+                match &budget {
+                    Some(b) => {
+                        let mut permit = b.budget.acquire(order, node_estimate())?;
+                        let program = emit_node(kids, top)?;
+                        let bytes = held_bytes(&program);
+                        node_seen.fetch_max(bytes, Ordering::SeqCst);
+                        permit.emitted(bytes);
+                        Ok((program, Some(permit)))
+                    }
+                    None => Ok((emit_node(kids, top)?, None)),
                 }
-                None => Ok((emit_node(kids, top)?, None)),
-            }
-        };
+            };
         let leaf_channel = if budget.is_some() { n } else { emit_window };
-        let (leaf_tx, leaf_rx) = std::sync::mpsc::sync_channel::<
-            Result<(LfmProgram, Option<Permit>), String>,
-        >(leaf_channel.max(1));
+        let (leaf_tx, leaf_rx) =
+            std::sync::mpsc::sync_channel::<Result<Emitted, String>>(leaf_channel.max(1));
         let (job_tx, job_rx) = std::sync::mpsc::channel::<(usize, usize, Vec<DerivedChild>)>();
-        type Done = (
-            usize,
-            usize,
-            Result<(LfmProgram, Option<Permit>), String>,
-            f64,
-        );
+        type Done = (usize, usize, Result<Emitted, String>, f64);
         let (done_tx, done_rx) = std::sync::mpsc::channel::<Done>();
         let job_rx = Mutex::new(job_rx);
         let (leaves_at, level_at, emit) = std::thread::scope(|scope| {
@@ -414,7 +410,7 @@ impl Pipe {
                         let (b, emit_leaf_on_pool, held_bytes) =
                             (b, &emit_leaf_on_pool, &held_bytes);
                         scope.spawn(move || {
-                            let emit = |k: usize| -> Result<(LfmProgram, Option<Permit>), String> {
+                            let emit = |k: usize| -> Result<Emitted, String> {
                                 let estimate = b.leaf_estimates.get(k).copied().unwrap_or(0);
                                 let mut permit = b.budget.acquire(k, estimate)?;
                                 let program = emit_leaf_on_pool(k)?;
@@ -476,7 +472,7 @@ impl Pipe {
                 .iter()
                 .map(|l| Grouper::new(l.arities.clone()))
                 .collect();
-            let mut ready: Vec<Vec<Option<Result<(LfmProgram, Option<Permit>), String>>>> = levels
+            let mut ready: Vec<Vec<Option<Result<Emitted, String>>>> = levels
                 .iter()
                 .map(|l| (0..l.arities.len()).map(|_| None).collect())
                 .collect();
@@ -503,8 +499,7 @@ impl Pipe {
             for (lv, arities) in levels.iter().enumerate() {
                 let top = lv + 1 == levels.len();
                 let nodes = arities.arities.len();
-                let mut programs: Vec<Option<(LfmProgram, Option<Permit>)>> =
-                    (0..nodes).map(|_| None).collect();
+                let mut programs: Vec<Option<Emitted>> = (0..nodes).map(|_| None).collect();
                 if node_emit_early {
                     if !groupers[lv].is_complete() {
                         return Err(format!(
