@@ -122,6 +122,8 @@ pub mod shift_tests;
 #[cfg(test)]
 pub mod p1_stark_tests;
 #[cfg(test)]
+pub mod rev_p1_b_tests;
+#[cfg(test)]
 pub mod skip_empty_tables_tests;
 #[cfg(test)]
 pub mod statement_alignment_tests;

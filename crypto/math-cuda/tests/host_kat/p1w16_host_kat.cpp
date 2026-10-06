@@ -360,36 +360,59 @@ static void run_stark_kernels() {
               "p1s gather with a wrong shape misses", V);
     }
 
-    // Leaves: each geometry equals the ZisK leaf of the felts it reads.
+    // Leaves: each geometry equals the STARK leaf (ZisK's chain with the width
+    // tag [n, DOMAIN_LEAF, 0, 0] in the first capacity, host oracle
+    // `poseidon1_stark::linear_hash`) of the felts it reads, and differs from
+    // ZisK's untagged leaf of the same felts (the measurement kernels).
     {
         const uint64_t num_cols = 7, num_rows = 8, log_rows = 3, stride = 11;
         uint64_t m[7 * 11];
         zk_felts(0x7015, 7 * 11, m);
         uint8_t got[8 * 32];
-        uint64_t want[8 * 4];
+        uint64_t want[8 * 4], untagged[8 * 4];
         CUDA_HOST_FOR_EACH_THREAD(t, num_rows)
         p1s_leaves_cols_row(m, stride, num_cols, num_rows, log_rows, got);
         CUDA_HOST_FOR_EACH_THREAD(t, num_rows)
-        p1w16_zleaves_rows_v2(m, stride, num_cols, num_rows, log_rows, want);
-        bool ok = true;
+        p1w16_zleaves_rows_v2(m, stride, num_cols, num_rows, log_rows, untagged);
+        for (uint64_t r = 0; r < num_rows; ++r) {
+            const uint64_t br = __brevll(r) >> (64 - log_rows);
+            p1w16::zisk_leaf<2, true>(
+                num_cols, [&](uint64_t c) { return m[c * stride + br]; }, want + 4 * r);
+        }
+        bool ok = true, apart = true;
         for (uint64_t r = 0; r < num_rows; ++r) {
             uint64_t d[4];
             node_felts(got + 32 * r, d);
             ok &= std::memcmp(d, want + 4 * r, 32) == 0;
+            apart &= std::memcmp(d, untagged + 4 * r, 32) != 0;
         }
         check(ok, "p1s column-major row leaves", V);
+        check(apart, "p1s row leaves carry the width tag (!= ZisK's untagged leaf)", V);
 
         CUDA_HOST_FOR_EACH_THREAD(t, num_rows / 2)
         p1s_leaves_cols_pair(m, stride, num_cols, num_rows, log_rows, got);
         CUDA_HOST_FOR_EACH_THREAD(t, num_rows / 2)
-        p1w16_zleaves_row_pair_v2(m, stride, num_cols, num_rows, log_rows, want);
+        p1w16_zleaves_row_pair_v2(m, stride, num_cols, num_rows, log_rows, untagged);
+        for (uint64_t j = 0; j < num_rows / 2; ++j) {
+            const uint64_t br0 = __brevll(2 * j) >> (64 - log_rows);
+            const uint64_t br1 = __brevll(2 * j + 1) >> (64 - log_rows);
+            p1w16::zisk_leaf<2, true>(
+                2 * num_cols,
+                [&](uint64_t i) {
+                    return i < num_cols ? m[i * stride + br0] : m[(i - num_cols) * stride + br1];
+                },
+                want + 4 * j);
+        }
         ok = true;
+        apart = true;
         for (uint64_t j = 0; j < num_rows / 2; ++j) {
             uint64_t d[4];
             node_felts(got + 32 * j, d);
             ok &= std::memcmp(d, want + 4 * j, 32) == 0;
+            apart &= std::memcmp(d, untagged + 4 * j, 32) != 0;
         }
         check(ok, "p1s column-major row-pair leaves", V);
+        check(apart, "p1s row-pair leaves carry the width tag (!= ZisK's untagged leaf)", V);
 
         // The same matrix row-major (stride `num_cols`): the row-pair and
         // one-row kernels over the whole row equal the column-major ones,
@@ -425,7 +448,30 @@ static void run_stark_kernels() {
         check(std::memcmp(got, got2, 8 * 32) != 0, "p1s row-major range end moves the leaf", V);
     }
 
-    // FRI group leaves: leaf `j` is the ZisK leaf of its `3·group` contiguous felts.
+    // The width-tagged leaf against the Rust oracle's pinned digests
+    // (`poseidon1_stark::tests::TAGGED_LEAF`: `linear_hash(felts(SEED_LEAF, n))`).
+    {
+        static const uint64_t TAGGED_N[2] = {12, 25};
+        static const uint64_t TAGGED[2][4] = {
+            {4458286375898503949ull, 6509762154028324312ull, 350313438890380232ull,
+             5326189538293941466ull},
+            {14038525980236200321ull, 10177624454212016161ull, 9232529760025479834ull,
+             85431238162842744ull},
+        };
+        uint64_t felts[32];
+        for (int k = 0; k < 2; ++k) {
+            zk_felts(ZK_SEED_LEAF, TAGGED_N[k], felts);
+            uint64_t d[4];
+            p1w16::zisk_leaf<2, true>(TAGGED_N[k], [&](uint64_t i) { return felts[i]; }, d);
+            char what[64];
+            std::snprintf(what, sizeof(what), "tagged leaf of %llu felts (Rust pin)",
+                          (unsigned long long)TAGGED_N[k]);
+            check(std::memcmp(d, TAGGED[k], 32) == 0, what, V);
+        }
+    }
+
+    // FRI group leaves: leaf `j` is the STARK (width-tagged) leaf of its
+    // `3·group` contiguous felts.
     {
         uint64_t ev[4 * 8 * 3];
         zk_felts(0xf41, 4 * 8 * 3, ev);
@@ -437,8 +483,8 @@ static void run_stark_kernels() {
             bool ok = true;
             for (uint64_t j = 0; j < num_leaves; ++j) {
                 uint64_t want[4], d[4];
-                CUDA_HOST_FOR_EACH_THREAD(t, 1)
-                p1w16_zleaves_base_coset_v2(ev + j * group * 3, 1, 3 * group, want);
+                const uint64_t *leaf = ev + j * group * 3;
+                p1w16::zisk_leaf<2, true>(3 * group, [&](uint64_t i) { return leaf[i]; }, want);
                 node_felts(got + 32 * j, d);
                 ok &= std::memcmp(d, want, 32) == 0;
             }

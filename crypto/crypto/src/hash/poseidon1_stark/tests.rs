@@ -57,7 +57,7 @@ fn the_width_8_permutation_is_zisks() {
 fn the_leaf_hash_is_zisks() {
     for (len, expected) in LINEAR_HASH.iter() {
         assert_eq!(
-            canon(&linear_hash(&felts(SEED_LEAF, *len))),
+            canon(&zisk_linear_hash(&felts(SEED_LEAF, *len))),
             expected.to_vec(),
             "len {len}"
         );
@@ -126,7 +126,7 @@ fn the_paths_are_zisks_and_verify() {
         .chunks_exact(PATH_WIDTH)
         .map(<[Fp]>::to_vec)
         .collect();
-    let leaves: Vec<Digest> = rows.iter().map(|r| linear_hash(r)).collect();
+    let leaves: Vec<Digest> = rows.iter().map(|r| zisk_linear_hash(r)).collect();
     let tree = Merkle4::new(&leaves).expect("non-empty");
     assert_eq!(canon(&tree.root()), PATH_ROOT.to_vec());
     let root = tree.root();
@@ -235,3 +235,69 @@ fn the_grinding_hash_is_zisks() {
     assert!(grinding_ok(&ch, &Fp::from(0u64), 0));
     assert!(!grinding_ok(&ch, &Fp::from(GRIND_SMALLEST_NONCE), 64));
 }
+
+/// The width tag (REV-P1-JUDGE §3.4): the leaf hash is ZisK's chain with the
+/// first block's capacity `[len, LEAF_DOMAIN, 0, 0]`, computed here from the bare
+/// permutation, and it differs from ZisK's untagged hash at every width. Pinned
+/// at two widths.
+#[test]
+fn the_leaf_hash_carries_the_width_tag() {
+    for len in [1usize, 5, 11, 12, 13, 24, 25, 36, 41] {
+        let x = felts(SEED_LEAF ^ 0x7a6, len);
+        let mut state = [Fp::zero(); WIDTH];
+        state[RATE] = Fp::from(len as u64);
+        state[RATE + 1] = Fp::from(LEAF_DOMAIN);
+        for (k, block) in x.chunks(RATE).enumerate() {
+            if k > 0 {
+                let carry = [state[0], state[1], state[2], state[3]];
+                state[RATE..].copy_from_slice(&carry);
+            }
+            state[..RATE].fill(Fp::zero());
+            state[..block.len()].copy_from_slice(block);
+            state = permute(state);
+        }
+        let want = [state[0], state[1], state[2], state[3]];
+        assert_eq!(linear_hash(&x), want, "len {len}");
+        assert_ne!(
+            linear_hash(&x),
+            zisk_linear_hash(&x),
+            "len {len}: the tag moves it"
+        );
+    }
+    assert_eq!(
+        linear_hash(&[]),
+        [Fp::zero(); DIGEST_FELTS],
+        "an empty leaf never permutes"
+    );
+    assert_eq!(LEAF_DOMAIN, u64::from(u32::from_le_bytes(*b"P1WL")));
+    for (len, want) in TAGGED_LEAF {
+        assert_eq!(
+            canon(&linear_hash(&felts(SEED_LEAF, len))),
+            want.to_vec(),
+            "len {len}"
+        );
+    }
+}
+
+/// [`the_leaf_hash_carries_the_width_tag`]'s pinned digests over
+/// `felts(SEED_LEAF, len)`.
+const TAGGED_LEAF: [(usize, [u64; 4]); 2] = [
+    (
+        12,
+        [
+            4458286375898503949,
+            6509762154028324312,
+            350313438890380232,
+            5326189538293941466,
+        ],
+    ),
+    (
+        25,
+        [
+            14038525980236200321,
+            10177624454212016161,
+            9232529760025479834,
+            85431238162842744,
+        ],
+    ),
+];

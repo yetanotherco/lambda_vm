@@ -10,7 +10,7 @@
 //!
 //! | seam | encoding |
 //! |---|---|
-//! | leaf | the elements' base felts in order (`element_felts`), then `linear_hash` |
+//! | leaf | the elements' base felts in order (`element_felts`), then `linear_hash` (ZisK's chain with the width tag `[len, LEAF_DOMAIN, 0, 0]` as the first capacity) |
 //! | node | four felts as 32 canonical big-endian bytes (`digest_to_commitment`) |
 //! | padding child | the zero digest, i.e. 32 zero bytes |
 //! | `append_bytes(b)` | `len(b)`, then `b` as 8-byte big-endian felts, the last zero-padded |

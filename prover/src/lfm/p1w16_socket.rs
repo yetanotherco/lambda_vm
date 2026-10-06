@@ -9,7 +9,7 @@
 //! | construction | input cells | output cells read |
 //! |---|---|---|
 //! | 4-ary node (`compress4`) | the four children | cell 0 (the digest) |
-//! | leaf block (`linear_hash`) | three rate cells + the carried digest (zero first) | cell 0 |
+//! | leaf block (`linear_hash`) | three rate cells + the carried digest (the width tag `[len, LEAF_DOMAIN, 0, 0]` first) | cell 0 |
 //! | transcript update | three rate cells + the previous state's cell 0 | all four (every lane is squeezed) |
 //!
 //! So the socket has ONE mode: a row reads four cells, permutes all sixteen

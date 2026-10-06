@@ -222,7 +222,20 @@ pub fn base_of_hash(hash: stark::config::CommitmentHash) -> BaseHash {
 /// this, so a format naming another hash is a typed refusal there.
 pub fn checked_base(format: &stark::proof::options::ProofFormat) -> Result<BaseHash, String> {
     match format.base.hash {
-        stark::config::CommitmentHash::Poseidon1 => Ok(BaseHash::P1),
+        stark::config::CommitmentHash::Poseidon1 => {
+            // The statement tag names the cap height (`p1_statement_tag`); a
+            // height the arity-4 trees clamp would name a height no tree has
+            // (REV-P1-JUDGE F2).
+            if let stark::proof::options::CapPolicy::Fixed(c) = format.base.arity4_cap
+                && usize::from(c) > MAX_P1_CAP_HEIGHT
+            {
+                return Err(format!(
+                    "a Poseidon1 base caps its 4-ary trees at height {MAX_P1_CAP_HEIGHT} at most, \
+                     got Fixed({c})"
+                ));
+            }
+            Ok(BaseHash::P1)
+        }
         h if h == BLOCK_COMMITMENT_HASH => Ok(BaseHash::Rpx),
         h => Err(format!(
             "the block path has no base configuration for the format's hash {h:?} \
@@ -414,17 +427,26 @@ pub fn statement_tag(format: &stark::proof::options::ProofFormat) -> Vec<u8> {
     }
 }
 
-/// The P1 statement tag at cap `cap` ([`BlockHash::statement_tag`]). A test
-/// can build the RPX tag in its place (`p1_tag_omitted_for_test`) to show the
-/// tag is checked.
+/// The tallest 4-ary cap a Poseidon1 base may name: the trees clamp any
+/// taller one (`StarkCaps::tree_cap_height`), so [`checked_base`] refuses it.
+pub const MAX_P1_CAP_HEIGHT: usize = crypto::merkle_tree::cap::MAX_CAP_HEIGHT / 2;
+
+/// The P1 statement tag at cap `cap` ([`BlockHash::statement_tag`]): the
+/// effective policy, `C0` uncapped (`Off` and `Fixed(0)`), `C<h>` at a fixed
+/// height and `Cauto` under `Auto` (whose heights follow each tree's depth and
+/// query count), so no two policies share a tag (REV-P1-JUDGE F2). A test can
+/// build the RPX tag in its place (`p1_tag_omitted_for_test`) to show the tag
+/// is checked.
 pub fn p1_statement_tag(cap: stark::proof::options::CapPolicy) -> Vec<u8> {
+    use stark::proof::options::CapPolicy;
     #[cfg(test)]
     if P1_TAG_OMITTED.load(std::sync::atomic::Ordering::Relaxed) {
         return crate::statement::DOMAIN_TAG.to_vec();
     }
     let height = match cap {
-        stark::proof::options::CapPolicy::Fixed(c) => c,
-        _ => 0,
+        CapPolicy::Off | CapPolicy::Fixed(0) => "0".to_string(),
+        CapPolicy::Fixed(c) => c.to_string(),
+        CapPolicy::Auto => "auto".to_string(),
     };
     let mut tag = crate::statement::DOMAIN_TAG.to_vec();
     tag.extend_from_slice(format!("/P1W16/C{height}").as_bytes());

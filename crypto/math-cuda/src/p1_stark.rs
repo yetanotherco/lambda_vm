@@ -20,8 +20,10 @@
 //!
 //! # Leaves
 //!
-//! ZisK's leaf hash (`poseidon1_stark::linear_hash`) over the felt sequence
-//! the host leaf hashes, in the read patterns of [`crate::rpx`]'s kernels.
+//! The STARK's leaf hash (`poseidon1_stark::linear_hash`: ZisK's chain with the
+//! width tag `[len, LEAF_DOMAIN, 0, 0]` as the first capacity) over the felt
+//! sequence the host leaf hashes, in the read patterns of [`crate::rpx`]'s
+//! kernels.
 
 use std::sync::{Arc, OnceLock};
 

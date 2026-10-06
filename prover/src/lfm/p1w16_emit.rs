@@ -7,7 +7,7 @@
 //!
 //! | here | host |
 //! |---|---|
-//! | [`leaf_hash`] | `poseidon1_stark::linear_hash` |
+//! | [`leaf_hash`] | `poseidon1_stark::linear_hash` (ZisK's chain with the width tag) |
 //! | [`node4`], [`walk4`], [`tree_root4`] | `poseidon1_w16::compress4`, `Merkle4` (zero-digest padding) |
 //! | [`P1SpongeVar`] | `poseidon1_stark::Transcript` under `p1_commit::P1Transcript`'s encodings |
 //! | [`w8_permute`] | `poseidon1_w8::permute` (the grinding permutation) |
@@ -84,13 +84,18 @@ fn rate_cells(b: &mut LfmBuilder, lanes: &[Lane]) -> [Cell; 3] {
     })
 }
 
-/// ZisK's leaf hash over `felts`: blocks of twelve (the last zero-filled), the
-/// capacity the zero cell for the first block and the previous output's cell 0
-/// for every later one; the digest is the last output's cell 0. No felts hash
-/// to the zero digest, as on the host.
+/// The P1 leaf hash over `felts` (`poseidon1_stark::linear_hash`): blocks of
+/// twelve (the last zero-filled), the capacity the width tag
+/// `[len, LEAF_DOMAIN, 0, 0]` (a program constant: the leaf's width is program
+/// shape) for the first block and the previous output's cell 0 for every later
+/// one; the digest is the last output's cell 0. No felts hash to the zero
+/// digest, as on the host.
 pub fn leaf_hash(b: &mut LfmBuilder, felts: &[Felt]) -> WrapDigest {
-    let zero = zero_cell(b);
-    let mut carry = zero;
+    if felts.is_empty() {
+        return WrapDigest::from_cell(zero_cell(b));
+    }
+    let tag = crypto::hash::poseidon1_stark::leaf_capacity(felts.len());
+    let mut carry = b.digest_const(tag).as_cell();
     for block in felts.chunks(RATE_FELTS) {
         let lanes: Vec<Lane> = block.iter().map(|f| Lane::Var(*f)).collect();
         let [c0, c1, c2] = rate_cells(b, &lanes);

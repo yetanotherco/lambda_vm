@@ -211,6 +211,8 @@ mod preprocessed_tests;
 #[cfg(test)]
 mod program_shape_tests;
 #[cfg(test)]
+mod rp1a_review_tests;
+#[cfg(test)]
 mod whir_air_tests;
 #[cfg(test)]
 mod whir_bus_tests;

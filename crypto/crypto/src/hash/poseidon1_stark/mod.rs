@@ -9,16 +9,20 @@
 //! | primitive | construction |
 //! |---|---|
 //! | permutation | [`super::poseidon1_w16::permute`]: Goldilocks, `x^7`, `R_F = 8`, `R_P = 22`, Grain constants, Plonky3's small circulant MDS |
-//! | leaf | [`linear_hash`]: rate 12; the first block sees a zero capacity, every later block sees the previous output's lanes `0..4` there |
+//! | leaf | [`linear_hash`]: rate 12; the first block's capacity is the width tag [`leaf_capacity`] `[len, LEAF_DOMAIN, 0, 0]`, every later block sees the previous output's lanes `0..4` there. ZisK's own leaf has a zero first capacity ([`zisk_linear_hash`], the KATs' reference) |
 //! | node | [`super::poseidon1_w16::compress4`]: the four child digests in child order, permuted, truncated to lanes `0..4` |
 //! | tree | arity 4; a level whose length is not a multiple of 4 is padded with zero digests ([`Merkle4`]) |
 //! | transcript | [`Transcript`]: an overwrite sponge, rate 12, the previous state's lanes `0..4` as capacity, every lane squeezed |
 //! | grinding | [`grinding_lane0`]: the WIDTH-8 permutation of `[c0, c1, c2, nonce, 0, 0, 0, 0]`, lane 0 below `2^(64 − bits)` |
 //!
-//! None of these carries a length, padding flag or domain tag: a leaf of `n`
-//! felts and the same leaf with trailing zeros up to the next multiple of 12 hash
-//! alike, and a node and a 12-felt leaf share one input shape. Both are sound
-//! only because the verifier fixes every leaf's width and every tree's depth.
+//! The leaf is the one place this instance departs from ZisK's: its first block's
+//! capacity carries the leaf's width and a leaf domain (the review's width tag,
+//! REV-P1-JUDGE §3.4), as RPX's leaf capacity does. So a leaf binds its own
+//! width: a leaf of `n` felts and the same leaf zero-padded hash apart, and a
+//! 12-felt leaf is not a node whose fourth child is zero. It costs no
+//! permutation (the first block's capacity lanes are otherwise zero). The node
+//! and the transcript carry no tag: the verifier fixes every tree's depth and
+//! every absorb schedule.
 
 #[cfg(test)]
 mod tests;
@@ -36,14 +40,44 @@ const RATE: usize = poseidon1_w16::RATE_FELTS;
 /// Felts of one Merkle path level: the three siblings, in child order.
 pub const SIBLING_FELTS: usize = (ARITY - 1) * DIGEST_FELTS;
 
-/// ZisK's leaf hash (`linear_hash_seq` at width 16).
+/// The leaf domain a leaf's first-block capacity carries: `"P1WL"`
+/// ([`poseidon1_w16::DOMAIN_LEAF`]), distinct from RPX's.
+pub const LEAF_DOMAIN: u64 = poseidon1_w16::DOMAIN_LEAF;
+
+/// ★ The width tag: the first block's capacity of a leaf of `num_felts` felts,
+/// `[num_felts, LEAF_DOMAIN, 0, 0]`. It mirrors RPX's `leaf_capacity` with the
+/// whole length rather than its residue, so two leaf widths never share a
+/// first block.
+pub fn leaf_capacity(num_felts: usize) -> Digest {
+    [
+        Fp::from(num_felts as u64),
+        Fp::from(LEAF_DOMAIN),
+        Fp::zero(),
+        Fp::zero(),
+    ]
+}
+
+/// The leaf hash: ZisK's (`linear_hash_seq` at width 16) with the width tag.
 ///
 /// Each block of up to 12 felts overwrites the rate (zero-filled past its end);
-/// the capacity is zero for the first block and the previous output's digest
-/// lanes `0..4` for every later one. The digest is lanes `0..4` of the last
-/// output. An empty input hashes to the zero digest, as ZisK's does.
+/// the capacity is [`leaf_capacity`] for the first block and the previous
+/// output's digest lanes `0..4` for every later one. The digest is lanes `0..4`
+/// of the last output. An empty input never permutes and hashes to the zero
+/// digest.
 pub fn linear_hash(felts: &[Fp]) -> Digest {
+    linear_hash_from(felts, leaf_capacity(felts.len()))
+}
+
+/// ZisK's own leaf hash: [`linear_hash`] with a zero first capacity. The
+/// reference ZisK's known-answer vectors pin; no commitment uses it.
+pub fn zisk_linear_hash(felts: &[Fp]) -> Digest {
+    linear_hash_from(felts, [Fp::zero(); DIGEST_FELTS])
+}
+
+/// The rate-12 chain with `first` as the first block's capacity.
+fn linear_hash_from(felts: &[Fp], first: Digest) -> Digest {
     let mut state = [Fp::zero(); WIDTH];
+    state[RATE..].copy_from_slice(&first);
     for (k, block) in felts.chunks(RATE).enumerate() {
         if k > 0 {
             let carry = [state[0], state[1], state[2], state[3]];

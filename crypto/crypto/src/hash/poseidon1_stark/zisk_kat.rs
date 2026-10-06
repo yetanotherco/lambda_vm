@@ -253,7 +253,7 @@ pub const PERM8: [([u64; 8], [u64; 8]); 4] = [
     ),
 ];
 
-/// Seed of the leaf inputs: `linear_hash(felts(SEED_LEAF, len))`.
+/// Seed of the leaf inputs: `zisk_linear_hash(felts(SEED_LEAF, len))`.
 pub const SEED_LEAF: u64 = 0x1eaf;
 /// `(len, digest)`: the width-16 linear hash (ZisK's leaf hash).
 pub const LINEAR_HASH: [(usize, [u64; 4]); 15] = [

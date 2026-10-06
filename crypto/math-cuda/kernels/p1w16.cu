@@ -417,16 +417,23 @@ __device__ __forceinline__ void compress4(const uint64_t *children, uint64_t out
     for (int i = 0; i < DIGEST; ++i) out[i] = s[i];
 }
 
-// ZisK's leaf hash (`linear_hash_seq` at width 16; host oracle
-// `crypto::hash::poseidon1_stark::linear_hash`): each block of up to 12 felts
-// overwrites lanes 0..12, zero-filled past its end; the capacity lanes 12..16
-// are zero for the first block and the previous output's lanes 0..4 for every
-// later one. No length, flag or domain. An empty leaf never permutes.
-template <int V, typename Load>
+// ZisK's leaf hash (`linear_hash_seq` at width 16): each block of up to 12
+// felts overwrites lanes 0..12, zero-filled past its end; the capacity lanes
+// 12..16 are the previous output's lanes 0..4 for every block after the first.
+// The first block's capacity is zero under TAG = false (ZisK's own leaf, host
+// oracle `poseidon1_stark::zisk_linear_hash`: the measurement kernels) and the
+// width tag [num_felts, DOMAIN_LEAF, 0, 0] under TAG = true (the STARK's leaf,
+// host oracle `poseidon1_stark::linear_hash`: the production `p1s_*` kernels).
+// An empty leaf never permutes.
+template <int V, bool TAG, typename Load>
 __device__ __forceinline__ void zisk_leaf(uint64_t num_felts, Load load, uint64_t digest[DIGEST]) {
     uint64_t s[WIDTH];
 #pragma unroll
     for (int i = 0; i < WIDTH; ++i) s[i] = 0;
+    if (TAG) {
+        s[CAP_PAD_LANE] = num_felts;
+        s[CAP_DOMAIN_LANE] = DOMAIN_LEAF;
+    }
     uint64_t t = 0;
 #pragma unroll 1
     for (; t + RATE <= num_felts; t += RATE) {
@@ -731,7 +738,7 @@ extern "C" __global__ void p1w16_zleaves_base_coset_v2(const uint64_t *__restric
     uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_leaves) return;
     uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<2>(
+    p1w16::zisk_leaf<2, false>(
         block, [&](uint64_t i) { return codeword[tid + i * num_leaves]; }, d);
 #pragma unroll
     for (int i = 0; i < p1w16::DIGEST; ++i) out[tid * p1w16::DIGEST + i] = d[i];
@@ -743,7 +750,7 @@ extern "C" __global__ void p1w16_zleaves_ext3_coset_v2(const uint64_t *__restric
     uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_leaves) return;
     uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<2>(
+    p1w16::zisk_leaf<2, false>(
         3 * block,
         [&](uint64_t i) { return codeword[(tid + (i / 3) * num_leaves) * 3 + i % 3]; }, d);
 #pragma unroll
@@ -763,7 +770,7 @@ extern "C" __global__ void p1w16_zleaves_rows_v2(const uint64_t *__restrict__ co
     if (tid >= num_rows) return;
     const uint64_t br = __brevll(tid) >> (64 - log_num_rows);
     uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<2>(
+    p1w16::zisk_leaf<2, false>(
         num_cols, [&](uint64_t c) { return columns[c * col_stride + br]; }, d);
 #pragma unroll
     for (int i = 0; i < p1w16::DIGEST; ++i) out[tid * p1w16::DIGEST + i] = d[i];
@@ -780,7 +787,7 @@ extern "C" __global__ void p1w16_zleaves_row_pair_v2(const uint64_t *__restrict_
     const uint64_t br0 = __brevll(2 * tid) >> (64 - log_num_rows);
     const uint64_t br1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
     uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<2>(
+    p1w16::zisk_leaf<2, false>(
         2 * num_cols,
         [&](uint64_t i) {
             return i < num_cols ? columns[i * col_stride + br0]
@@ -928,7 +935,7 @@ extern "C" __global__ void p1s_leaves_cols_row(const uint64_t *__restrict__ cols
     if (tid >= num_rows) return;
     const uint64_t br = __brevll(tid) >> (64 - log_num_rows);
     uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<2>(
+    p1w16::zisk_leaf<2, true>(
         num_cols, [&](uint64_t c) { return cols[c * col_stride + br]; }, d);
     p1s::store_be(d, out + tid * 32);
 }
@@ -945,7 +952,7 @@ extern "C" __global__ void p1s_leaves_cols_pair(const uint64_t *__restrict__ col
     const uint64_t br0 = __brevll(2 * tid) >> (64 - log_num_rows);
     const uint64_t br1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
     uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<2>(
+    p1w16::zisk_leaf<2, true>(
         2 * num_cols,
         [&](uint64_t i) {
             return i < num_cols ? cols[i * col_stride + br0] : cols[(i - num_cols) * col_stride + br1];
@@ -967,7 +974,7 @@ extern "C" __global__ void p1s_leaves_rm_pair(const uint64_t *__restrict__ data,
     const uint64_t *row1 = data + (__brevll(2 * tid + 1) >> (64 - log_num_rows)) * m + col_start;
     const uint64_t w = col_end - col_start;
     uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<2>(
+    p1w16::zisk_leaf<2, true>(
         2 * w, [&](uint64_t i) { return i < w ? row0[i] : row1[i - w]; }, d);
     p1s::store_be(d, out + tid * 32);
 }
@@ -982,7 +989,7 @@ extern "C" __global__ void p1s_leaves_rm_row(const uint64_t *__restrict__ data, 
     if (tid >= num_rows) return;
     const uint64_t *row = data + (__brevll(tid) >> (64 - log_num_rows)) * m + col_start;
     uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<2>(
+    p1w16::zisk_leaf<2, true>(
         col_end - col_start, [&](uint64_t i) { return row[i]; }, d);
     p1s::store_be(d, out + tid * 32);
 }
@@ -997,7 +1004,7 @@ extern "C" __global__ void p1s_fri_group_leaves(const uint64_t *__restrict__ eva
     if (tid >= num_leaves) return;
     const uint64_t *g = evals + tid * group * 3;
     uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<2>(
+    p1w16::zisk_leaf<2, true>(
         3 * group, [&](uint64_t i) { return g[i]; }, d);
     p1s::store_be(d, out + tid * 32);
 }

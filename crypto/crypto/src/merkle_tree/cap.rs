@@ -252,6 +252,18 @@ pub fn verify_merkle_path_to_cap_from_leaf_hash<B: IsMerkleTreeBackend>(
             return false;
         };
         let walked = tree_levels(depth, 4) - c;
+        // An uncapped odd-depth tree's top group is two real children and two
+        // padding nodes, and the walk reaches it: those two siblings are the
+        // padding, never proof data (the in-guest walk supplies them as
+        // constants; REV-P1-JUDGE F4). A capped tree's top is in its cap.
+        if c == 0 && depth % 2 == 1 && siblings.len() == 3 * walked && walked > 0 {
+            let Some(pad) = B::padding_node() else {
+                return false;
+            };
+            if siblings[3 * walked - 2] != pad || siblings[3 * walked - 1] != pad {
+                return false;
+            }
+        }
         return index >> depth == 0
             && siblings.len() == 3 * walked
             && verify_merkle_path_from_leaf_hash::<B>(

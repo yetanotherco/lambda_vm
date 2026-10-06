@@ -215,7 +215,7 @@ fn the_device_zisk_coset_leaves_match_the_host() {
             }
             assert_eq!(
                 got[4 * j as usize..4 * j as usize + 4],
-                canon(&zisk::linear_hash(&fp(&felts)))[..],
+                canon(&zisk::zisk_linear_hash(&fp(&felts)))[..],
                 "block {block} ext3 {ext3} leaf {j}"
             );
         }
@@ -247,7 +247,7 @@ fn the_device_zisk_row_leaves_match_the_host() {
             };
             assert_eq!(
                 got[4 * j as usize..4 * j as usize + 4],
-                canon(&zisk::linear_hash(&fp(&felts)))[..],
+                canon(&zisk::zisk_linear_hash(&fp(&felts)))[..],
                 "cols {num_cols} pair {pair} leaf {j}"
             );
         }

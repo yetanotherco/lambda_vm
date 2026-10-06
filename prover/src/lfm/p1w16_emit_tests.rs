@@ -37,7 +37,7 @@ fn hinted_felts(b: &mut LfmBuilder, n: usize) -> Vec<Felt> {
 }
 
 #[test]
-fn the_leaf_hash_is_zisks_linear_hash() {
+fn the_leaf_hash_is_the_tagged_linear_hash() {
     for n in [0usize, 1, 4, 11, 12, 13, 24, 25, 36, 41] {
         let values: Vec<FE> = (0..n).map(|i| felt(n as u64, i)).collect();
         let mut b = LfmBuilder::new();
