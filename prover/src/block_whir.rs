@@ -23,7 +23,6 @@
 //! ★ #1010's epoch pipeline is untouched: this is a separate entry point with a
 //! statement tag of its own ([`statement::MULTILINEAR_BLOCK_TAG`]).
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
@@ -2208,8 +2207,7 @@ pub(crate) fn prove_traces(
             .collect()
     };
     let proof = crate::with_whir_hash!(|H| {
-        let mut transcript =
-            DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
+        let mut transcript = <H as multilinear::whir_hash::WhirHash>::sponge();
         absorb_block(
             &mut transcript,
             elf_bytes,
@@ -4220,8 +4218,7 @@ fn prove_streamed(
             ));
         }
         let table_num_vars: Vec<u8> = laid.shapes.iter().map(|&(_, n)| n as u8).collect();
-        let mut transcript =
-            DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
+        let mut transcript = <H as multilinear::whir_hash::WhirHash>::sponge();
         absorb_block(
             &mut transcript,
             elf_bytes,
@@ -4887,8 +4884,7 @@ pub(crate) fn verify_block_whir_with(
     let prepared_columns = prepared_tables(airs, page_configs, format)?;
 
     Ok(crate::with_whir_hash!(|H| {
-        let mut transcript =
-            DefaultTranscript::<E, <H as multilinear::whir_hash::WhirHash>::Transcript>::new(&[]);
+        let mut transcript = <H as multilinear::whir_hash::WhirHash>::sponge();
         absorb_block(
             &mut transcript,
             elf_bytes,

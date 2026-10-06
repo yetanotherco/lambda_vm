@@ -43,6 +43,7 @@ fn device_key<H: WhirHash>() -> math_cuda::DeviceHash {
     match H::DEVICE {
         DeviceHashKey::Keccak256 => math_cuda::DeviceHash::Keccak256,
         DeviceHashKey::Rpx256 => math_cuda::DeviceHash::Rpx256,
+        DeviceHashKey::Poseidon1 => math_cuda::DeviceHash::Poseidon1,
     }
 }
 
