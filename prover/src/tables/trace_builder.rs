@@ -75,9 +75,12 @@ use crate::Error;
 use crate::finish_sink::{self, FinishSink, FinishedKind};
 use crate::paged_mem::{ImageSource, PagedMem};
 
+mod compact_branch;
+mod delta;
 #[cfg(test)]
 mod lean_walk_tests;
 mod windowed;
+use compact_branch::CompactBranch;
 pub use windowed::{
     Accumulator, ChunkJob, RegenBuilder, StreamTable, StreamedChunk, WalkedWindow, Walker,
     WindowStamps, WindowedTraceBuilder,
@@ -3919,7 +3922,8 @@ struct CollectedOps {
     lt_ops: Vec<LtOperation>,
     shift_ops: Vec<ShiftOperation>,
     bitwise_ops: Vec<BitwiseOperation>,
-    branch_ops: Vec<BranchOperation>,
+    /// Delta-coded ([`CompactBranch`]).
+    branch_ops: CompactBranch,
     mul_ops: Vec<(MulOperation, bool)>,
     dvrm_ops: Vec<(DvrmOperation, bool)>,
     commit_ops: Vec<CommitOperation>,
@@ -4564,7 +4568,8 @@ fn chunk_and_generate_segmented<T: Clone + Sync>(
 /// whole-run routing gives (the windowed builder).
 #[derive(Default)]
 struct RoutedSegments {
-    branch_ops: Vec<BranchOperation>,
+    /// Delta-coded ([`CompactBranch`]).
+    branch_ops: CompactBranch,
     mul_filter: Vec<(MulOperation, bool)>,
     dvrm_filter: Vec<(DvrmOperation, bool)>,
     eq_ops: Vec<eq::EqOperation>,
@@ -4583,7 +4588,7 @@ struct RoutedSegments {
 impl RoutedSegments {
     /// The bytes its segments take on the heap.
     fn heap_bytes(&self) -> usize {
-        vec_heap_bytes(&self.branch_ops)
+        self.branch_ops.heap_bytes()
             + vec_heap_bytes(&self.mul_filter)
             + vec_heap_bytes(&self.dvrm_filter)
             + vec_heap_bytes(&self.eq_ops)
@@ -4602,7 +4607,7 @@ impl RoutedSegments {
     /// [`Self::heap_bytes`] segment by segment, each named `segments {name}`.
     fn heap_parts(&self) -> Vec<(String, usize)> {
         [
-            ("branch", vec_heap_bytes(&self.branch_ops)),
+            ("branch", self.branch_ops.heap_bytes()),
             ("mul_filter", vec_heap_bytes(&self.mul_filter)),
             ("dvrm_filter", vec_heap_bytes(&self.dvrm_filter)),
             ("eq", vec_heap_bytes(&self.eq_ops)),
@@ -4624,7 +4629,8 @@ impl RoutedSegments {
 
     /// Appends a later window's segments, segment by segment.
     fn append(&mut self, other: Self) {
-        self.branch_ops.extend(other.branch_ops);
+        self.branch_ops
+            .extend(&other.branch_ops.range(0, other.branch_ops.len()));
         self.mul_filter.extend(other.mul_filter);
         self.dvrm_filter.extend(other.dvrm_filter);
         self.eq_ops.extend(other.eq_ops);
@@ -4767,7 +4773,7 @@ fn route_ops_into(
         op.count_bitwise_into(histogram);
         let f = &op.decode.fields;
         if op.branch_cond() {
-            segments.branch_ops.push(route_branch(op));
+            segments.branch_ops.push(&route_branch(op));
         }
         if !f.word_instr {
             if f.is_mul() {
@@ -4917,7 +4923,7 @@ fn route_from_cpu_segments(
     let mul_dvrm_cpu32 = mul_of(&dvrm_cpu32);
 
     RoutedSegments {
-        branch_ops,
+        branch_ops: CompactBranch::from_ops(&branch_ops),
         mul_filter,
         dvrm_filter,
         eq_ops,
@@ -5232,9 +5238,12 @@ fn build_traces<I: ImageSource + Sync>(
             h.add_ops(&collect_bitwise_from_dvrm(slice, dvrm_chunk))
         }));
     }
-    for slice in branch_ops.chunks(1 << 20) {
+    for k in 0..branch_ops.len().div_ceil(1 << 20) {
+        let branch_ops = &branch_ops;
         collectors.push(Box::new(move |h| {
-            h.add_ops(&collect_bitwise_from_branch(slice))
+            h.add_ops(&collect_bitwise_from_branch(
+                &branch_ops.range(k << 20, (k + 1) << 20),
+            ))
         }));
     }
     for slice in shift_ops.chunks(1 << 20) {
@@ -5553,9 +5562,12 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_branches = || {
-        chunk_and_generate_optional(
-            &branch_ops,
+        chunk_and_generate_segmented(
+            &branch_ops.segments(),
             max_rows.branch,
+            0,
+            false,
+            true,
             |ops| branch::generate_branch_trace_as(ops, form),
             to(FinishedKind::Branch),
             #[cfg(feature = "disk-spill")]
