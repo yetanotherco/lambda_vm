@@ -9,6 +9,7 @@
 #   4. GPU error-path / CPU fallback     (make test-cuda-fallback)
 #   5. prover/stark/crypto/ecsm suite    (make test-prover-cuda) — CPU CI's prover tests on GPU
 #   6. comprehensive all-instructions    (make test-prover-comprehensive-cuda)
+#   7. no-epoch base, RPX and Poseidon1  (make test-noepoch-cuda)
 #
 # Runs on the rented Vast box from the gpu-tests.yml merge-queue workflow. All groups
 # run even if one fails (so the log shows every failure); the script exits non-zero if ANY
@@ -62,6 +63,7 @@ run test-cuda-d1                    # Group 3: num_parts==1 (DECODE) device DEEP
 run test-cuda-fallback              # Group 4: GPU error -> CPU fallback still verifies
 run test-prover-cuda                # Group 5: prover/stark/crypto/ecsm suite on the GPU path
 run test-prover-comprehensive-cuda  # Group 6: comprehensive all-instructions prove on GPU
+run test-noepoch-cuda               # Group 7: no-epoch base under both hashes, P1 refusals
 
 if [ "$fail" -ne 0 ]; then
     log "FAILED — one or more GPU test groups failed"

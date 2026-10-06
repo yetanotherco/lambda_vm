@@ -221,6 +221,9 @@ jobs:
       - name: RPX host-KAT (permutation, leaf sponge, parent, leaf and tree kernels)
         run: make test-rpx-host-kat
 
+      - name: Poseidon1 W16 host-KAT (permutation, tagged and ZisK leaves, 4-ary node, grind)
+        run: make test-p1w16-host-kat
+
       - name: Column-major LDE engine host-KAT (NTT passes, coset LDE)
         run: make test-ntt-cm-host-kat
 

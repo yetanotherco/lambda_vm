@@ -4,7 +4,7 @@ clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
 test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-blake3-host-kat test-rpx-host-kat test-p1w16-host-kat test-ntt-cm-host-kat test-whir-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
-test-prover-cuda test-prover-comprehensive-cuda \
+test-prover-cuda test-prover-comprehensive-cuda test-noepoch-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
 ethrex-real-block-cache ethrex-real-block-converter-cache print-real-block-fixture \
@@ -675,11 +675,12 @@ test-rpx-host-kat:
 	    -o target/host_kat/rpx_simt_host_kat $(HOST_KAT_DIR)/rpx_simt_host_kat.cpp
 	./target/host_kat/rpx_simt_host_kat
 
-# Known-answer tests for the Poseidon1 width-16 MEASUREMENT kernels
-# (`p1w16.cu`, D-HASH stage 1), run on the HOST through the same shim: the
-# permutation, the rate-12 coset leaves (base and ext3), the 4-ary node and the
-# grind, at both multiply variants, against the vectors the host reference and
-# Plonky3 agree on. Nothing on a proving path uses these kernels.
+# Known-answer tests for the Poseidon1 width-16 kernels (`p1w16.cu`), run on
+# the HOST through the same shim: the permutation, the rate-12 coset leaves
+# (base and ext3), the 4-ary node and the grind, at both multiply variants,
+# against the vectors the host reference and Plonky3 agree on. The P1 base's
+# commit kernels (`p1s_*`, the width-tagged leaves) are checked against the
+# host's tagged leaf; the measurement kernels against ZisK's untagged one.
 test-p1w16-host-kat:
 	@mkdir -p target/host_kat
 	$(CXX) $(HOST_KAT_CXXFLAGS) \
@@ -754,6 +755,19 @@ test-blake3-absorb-fv:
 test-cuda-integration:
 	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features cuda \
 	    --test cuda_path_integration -- --ignored --nocapture --test-threads=1
+
+# The no-epoch block base end to end under both base hashes (requires NVIDIA
+# GPU + nvcc): add.elf proved and verified under RPX and under Poseidon1, each
+# under `Retain` and `RecomputeLdeDevice` with equal bytes; then a P1 proof verified
+# under its own format, refused under RPX's and by a dispatch fixed to the
+# other arm, refused under RPX's statement tag, and refused with a byte flipped
+# in a path, a root, the nonce or a cap node. About 16 s of proving on an
+# RTX 5090 (RYZEN 009: 5.4 s and 10.5 s).
+test-noepoch-cuda:
+	$(GPU_TEST_TIMEOUT) cargo test -p lambda-vm-prover --release --features cuda --lib -- \
+	    --ignored --exact --nocapture --test-threads=1 \
+	    tests::noepoch_block_tests::noepoch_same_bytes_add \
+	    tests::noepoch_block_tests::noepoch_p1_proof_is_refused_by_rpx_and_when_tampered
 
 # num_parts==1 (DECODE) device DEEP/FRI coverage (requires NVIDIA GPU + nvcc).
 # No fixture crosses the default LDE threshold (1<<14) for a num_parts==1 table,
