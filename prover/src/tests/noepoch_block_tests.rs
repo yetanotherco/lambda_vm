@@ -304,8 +304,24 @@ fn noepoch_p1_proof_is_refused_by_rpx_and_when_tampered() {
         "the RPX verifier accepted a P1 proof"
     );
     let idx = build.air_index(&opts, "CPU[0]");
+    // Under a P1 cap (`LAMBDA_VM_P1_CAP`, default 4-ary height 4) query 0's
+    // path carries the cap after its kept siblings and every other path is
+    // the kept siblings alone.
+    let main_path = |q: usize| {
+        proof.proof.proofs[idx].deep_poly_openings[q]
+            .main_trace_polys
+            .proof
+            .merkle_path
+            .len()
+    };
+    println!(
+        "NOEPOCH P1 CAP: {} · CPU[0] main paths: query 0 {} nodes, query 1 {} nodes",
+        crate::hash_pin::p1_cap(),
+        main_path(0),
+        main_path(1)
+    );
     type Tamper = fn(&mut VmProof, usize);
-    let tampers: [(&str, Tamper); 4] = [
+    let tampers: [(&str, Tamper); 6] = [
         ("main-trace path node", |p, i| {
             p.proof.proofs[i].deep_poly_openings[0]
                 .main_trace_polys
@@ -321,6 +337,25 @@ fn noepoch_p1_proof_is_refused_by_rpx_and_when_tampered() {
         ("nonce", |p, i| {
             p.proof.proofs[i].nonce = p.proof.proofs[i].nonce.map(|n| n ^ 1)
         }),
+        (
+            "main-trace owner path's last node (a cap node when capped)",
+            |p, i| {
+                let path = &mut p.proof.proofs[i].deep_poly_openings[0]
+                    .main_trace_polys
+                    .proof
+                    .merkle_path;
+                let last = path.len() - 1;
+                path[last][7] ^= 1
+            },
+        ),
+        (
+            "FRI owner path's last node (a cap node when capped)",
+            |p, i| {
+                let path = &mut p.proof.proofs[i].query_list[0].layers_auth_paths[0].merkle_path;
+                let last = path.len() - 1;
+                path[last][9] ^= 1
+            },
+        ),
     ];
     for (what, tamper) in tampers {
         let mut bad = proof.clone();
