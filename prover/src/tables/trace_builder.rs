@@ -73,6 +73,7 @@ use crate::Error;
 use crate::paged_mem::{ImageSource, PagedMem};
 
 mod blocks;
+mod clock;
 mod compact_branch;
 mod compact_bytewise;
 mod compact_eq;
@@ -466,6 +467,10 @@ fn collect_cpu_ops_into(
     first: usize,
     cpu_ops: &mut Vec<CpuOperation>,
 ) -> Result<(), Error> {
+    clock::check_clock(
+        clock::window_max_timestamp(first, logs.len()),
+        "the run's walk",
+    )?;
     // Timestamps start at 4 (not 0) to ensure old_timestamp < timestamp holds
     // for the first access to any register/memory location. The +4 stride reserves
     // per-cycle slots for M1/M3/M5 register accesses and the inline PC read.
@@ -599,6 +604,10 @@ fn collect_cpu_ops_from_table(
     table: &DecodeTable,
     first: usize,
 ) -> Result<Vec<CpuOperation>, Error> {
+    clock::check_clock(
+        clock::window_max_timestamp(first, logs.len()),
+        "the run's walk",
+    )?;
     let mut cpu_ops = Vec::with_capacity(logs.len());
     for (i, log) in logs.iter().enumerate() {
         // As `collect_cpu_ops_into`.
