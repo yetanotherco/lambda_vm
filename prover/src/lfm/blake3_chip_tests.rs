@@ -697,7 +697,7 @@ fn the_merkle_constructions_agree_with_the_host_under_both_hashes() {
                 // This helper is a BYTE-hash host mirror; the algebraic arm's
                 // parent is `compress` over two four-felt digests and is
                 // mirrored in `algebraic_commit` instead.
-                WrapHash::Algebraic => unreachable!("byte-hash host mirror"),
+                WrapHash::Algebraic | WrapHash::Poseidon1 => unreachable!("byte-hash host mirror"),
             }
         };
         let host_root = host_parent(

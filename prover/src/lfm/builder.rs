@@ -123,6 +123,10 @@ pub struct LfmBuilder {
     /// R1c instruments), so a grep for the pinned hash in `lfm/` returns
     /// exactly the deliberate exceptions.
     wrap_hash: WrapHash,
+    /// D-HASH stage-0 census geometry (tests only; `None` everywhere else):
+    /// the arena the width-16 walk's third sibling is hinted from. See
+    /// [`LfmBuilder::with_p1w16_census`].
+    p1w16_census: Option<ArenaId>,
 }
 
 impl LfmBuilder {
@@ -149,6 +153,30 @@ impl LfmBuilder {
     /// The byte hash this program's commitment layer runs.
     pub fn wrap_hash(&self) -> WrapHash {
         self.wrap_hash
+    }
+
+    /// ⚠ CENSUS ONLY — the emitted program is NOT executable. Emit the
+    /// algebraic constructions in a Poseidon1 width-16 geometry (rate-12
+    /// leaves and transcript, 4-ary Merkle walks and cap roots) so the
+    /// program's per-chip rows are the ones that geometry would cost
+    /// (D-HASH stage 0). The socket is still 12 felts wide, so each width-16
+    /// hash is emitted as ONE stand-in `permute` row over three of its cells:
+    /// the row counts are exact, the values are not. Test-only by
+    /// construction: nothing outside `cfg(test)` can set it.
+    #[cfg(test)]
+    pub fn with_p1w16_census(mut self) -> Self {
+        assert!(
+            self.instrs.is_empty(),
+            "the census geometry is program shape and must be chosen before emission"
+        );
+        let arena = self.declare_arena(1);
+        self.p1w16_census = Some(arena);
+        self
+    }
+
+    /// The census geometry's sibling arena, when the census geometry is on.
+    pub fn p1w16_census(&self) -> Option<ArenaId> {
+        self.p1w16_census
     }
 
     fn alloc(&mut self) -> Addr {
@@ -419,6 +447,24 @@ impl LfmBuilder {
             outs,
             mults: [0, 0, 0],
         });
+        outs.map(Cell)
+    }
+
+    /// One width-16 Poseidon1 permutation (`Instr::Hash16`): four cells in,
+    /// all sixteen lanes permuted, four cells out. A program that emits one
+    /// emits no twelve-felt hash row (the admission validator), and proves
+    /// under `HasherKind::Poseidon1W16`.
+    pub fn hash16(&mut self, ins: [Cell; 4]) -> [Cell; 4] {
+        for c in &ins {
+            self.read(c.0);
+        }
+        let outs = [self.alloc(), self.alloc(), self.alloc(), self.alloc()];
+        self.instrs
+            .push(Instr::Hash16(Box::new(super::instr::Hash16Operands {
+                ins: ins.map(|c| c.0),
+                outs,
+                mults: [0; 4],
+            })));
         outs.map(Cell)
     }
 

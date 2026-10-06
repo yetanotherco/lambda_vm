@@ -49,6 +49,10 @@ pub mod layout;
 pub mod lde;
 pub mod logup;
 pub mod merkle_cap;
+pub mod p1_commit;
+pub mod p1w16_chip;
+pub mod p1w16_emit;
+pub mod p1w16_socket;
 pub mod per_table_aggregator;
 pub mod poseidon;
 pub mod preprocessed;
@@ -191,6 +195,18 @@ mod one_row_guest_tests;
 #[cfg(test)]
 mod one_row_tests;
 #[cfg(test)]
+mod p1w16_census_tests;
+#[cfg(test)]
+mod p1w16_chip_tests;
+#[cfg(test)]
+mod p1w16_emit_tests;
+#[cfg(test)]
+mod p1w16_machine_tests;
+#[cfg(test)]
+mod p1w16_proof_tests;
+#[cfg(test)]
+mod p1w16_socket_tests;
+#[cfg(test)]
 mod per_table_aggregator_tests;
 #[cfg(test)]
 mod per_table_census_tests;
@@ -200,6 +216,8 @@ mod poseidon_chip_tests;
 mod preprocessed_tests;
 #[cfg(test)]
 mod program_shape_tests;
+#[cfg(test)]
+mod rp1a_review_tests;
 #[cfg(test)]
 mod whir_air_tests;
 #[cfg(test)]

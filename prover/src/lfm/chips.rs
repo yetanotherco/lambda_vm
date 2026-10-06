@@ -832,6 +832,7 @@ pub mod hash {
             HasherKind::Blake3 => crate::lfm::blake3_socket::cols::NUM_COLUMNS,
             HasherKind::Rpo => rpo_cols::NUM_COLUMNS,
             HasherKind::Rpx => rpx_cols::NUM_COLUMNS,
+            HasherKind::Poseidon1W16 => crate::lfm::p1w16_socket::SOCKET_FORM.num_columns(),
         }
     }
 
@@ -848,6 +849,13 @@ pub mod hash {
     /// Callers must thread the same `kind` they build the AIR's width and
     /// constraints with; `LfmAirs::new_with_hasher` is the one place that does.
     pub fn bus_interactions(kind: HasherKind) -> Vec<BusInteraction> {
+        // The width-16 socket has its own tuple contract: four cells in, four
+        // out (`p1w16_socket::bus_interactions`).
+        if kind == HasherKind::Poseidon1W16 {
+            return crate::lfm::p1w16_socket::bus_interactions(
+                crate::lfm::p1w16_socket::SOCKET_FORM,
+            );
+        }
         let mut interactions = lfm_mem_interactions();
         if kind == HasherKind::Blake3 {
             interactions.extend(crate::lfm::blake3_socket::bitwise_interactions());
@@ -961,6 +969,9 @@ pub mod hash {
             HasherKind::Blake3 => crate::lfm::blake3_socket::UNREAD_IDX,
             HasherKind::Rpo => rpo_cols::NUM_CONSTRAINTS - NUM_UNREAD_INPUT_PINS,
             HasherKind::Rpx => rpx_cols::NUM_CONSTRAINTS - NUM_UNREAD_INPUT_PINS,
+            // The width-16 socket reads every input cell on every row, so it
+            // has no unread-input pins; this index is past its constraints.
+            HasherKind::Poseidon1W16 => crate::lfm::p1w16_socket::SOCKET_FORM.num_constraints(),
         }
     }
 
@@ -1062,6 +1073,7 @@ pub mod hash {
                 HasherKind::Blake3 => crate::lfm::blake3_socket::NUM_CONSTRAINTS,
                 HasherKind::Rpo => rpo_cols::NUM_CONSTRAINTS,
                 HasherKind::Rpx => rpx_cols::NUM_CONSTRAINTS,
+                HasherKind::Poseidon1W16 => crate::lfm::p1w16_socket::SOCKET_FORM.num_constraints(),
             }
         }
     }
@@ -1088,6 +1100,12 @@ pub mod hash {
                 HasherKind::Blake3 => crate::lfm::blake3_socket::eval(b),
                 HasherKind::Rpo => Self::eval_rpo(b),
                 HasherKind::Rpx => Self::eval_rpx(b),
+                // The width-16 socket lives in its own module, beside its
+                // layout, its bus contract and its row filler.
+                HasherKind::Poseidon1W16 => crate::lfm::p1w16_socket::P1W16SocketConstraints {
+                    form: crate::lfm::p1w16_socket::SOCKET_FORM,
+                }
+                .eval(b),
             }
         }
     }

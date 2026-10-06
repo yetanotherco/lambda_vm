@@ -367,6 +367,10 @@ pub(super) fn fill_hash_row(
         HasherKind::Blake3 => blake3_socket::fill_socket_witness(out),
         HasherKind::Rpo => fill_rpo_witness(out),
         HasherKind::Rpx => fill_rpx_witness(out),
+        // No twelve-felt row exists under the width-16 socket: the executor's
+        // `admits` refuses one, so its program's `hash` records are empty and
+        // `LFM_HASH` fills from `hash16` instead (`build_traces_walked`).
+        HasherKind::Poseidon1W16 => {}
     }
 }
 
@@ -529,12 +533,20 @@ pub(super) fn build_traces_walked(
             chunk.as_ref().unwrap_or(&g.hash),
             hash::num_columns(hasher),
             |row, out| {
-                fill_hash_row(
-                    hasher,
-                    &records.hash[base + row],
-                    hash_modes[base + row],
-                    out,
-                )
+                if program.hash16() {
+                    super::p1w16_socket::fill_row(
+                        super::p1w16_socket::SOCKET_FORM,
+                        records.hash16[base + row].ins,
+                        out,
+                    );
+                } else {
+                    fill_hash_row(
+                        hasher,
+                        &records.hash[base + row],
+                        hash_modes[base + row],
+                        out,
+                    )
+                }
             },
         )
     };
