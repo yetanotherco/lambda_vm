@@ -589,6 +589,17 @@ fn hand_off_need(hwm: u64, cycles: u64, target: u64) -> u64 {
     forecast.saturating_sub(target / den * num)
 }
 
+/// `LAMBDA_VM_BLOCK_HAND_OFF`: `auto` (and unset) decides the hand-off at the
+/// walk's end ([`hand_off_need`]); `off` never hands off (the parked tables
+/// stay on the host, as `auto` kept them). Anything else is `auto`.
+fn hand_off_from_env() -> bool {
+    parse_hand_off(std::env::var("LAMBDA_VM_BLOCK_HAND_OFF").ok().as_deref())
+}
+
+fn parse_hand_off(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("off")
+}
+
 /// The policy's choice for one committed table of `bytes` packed bytes:
 /// `kept` the committed packed bytes kept so far, `cells` the main cells
 /// committed so far (this table's included), `host` the host's bytes
@@ -3213,7 +3224,9 @@ fn prove_streamed(
                 // The walk is done and the block's size known: when the
                 // finish's forecast passes the pressure share, the parked
                 // tables go to the store now, before its hump builds.
-                if let Some(spill) = &walk_spill {
+                if let Some(spill) = walk_spill.as_ref().filter(|_| {
+                    deviations.hand_off_all || hand_off_from_env()
+                }) {
                     let hwm = HostReading::now().hwm;
                     let cycles = (window_stamps.windows as u64).saturating_mul(window as u64);
                     let need = if deviations.hand_off_all {
@@ -4093,7 +4106,7 @@ pub(crate) fn verify_block_whir_with(
 mod spill_policy_tests {
     use super::{
         BlockSpillPolicy, CgroupValue, HostReading, cgroup_memory, hand_off_need, memory_short,
-        parse_spill_policy, spill_reserve_bytes, spill_target_from, spill_wanted,
+        parse_hand_off, parse_spill_policy, spill_reserve_bytes, spill_target_from, spill_wanted,
     };
 
     const GIB: u64 = 1 << 30;
@@ -4344,5 +4357,16 @@ mod spill_policy_tests {
         assert_eq!(hand_off_need(gib(85.19), windows(584), u64::MAX), 0);
         let small = spill_target_from(None, Some(64 * GIB));
         assert!(hand_off_need(gib(40.0), windows(285), small) > 0);
+    }
+
+    /// `LAMBDA_VM_BLOCK_HAND_OFF`: unset, `auto` or anything else decides at
+    /// the walk's end; `off` never hands off.
+    #[test]
+    fn the_hand_off_knob_reads_off_only() {
+        assert!(parse_hand_off(None));
+        assert!(parse_hand_off(Some("auto")));
+        assert!(parse_hand_off(Some(" on ")));
+        assert!(!parse_hand_off(Some("off")));
+        assert!(!parse_hand_off(Some(" off ")));
     }
 }
