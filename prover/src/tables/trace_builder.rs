@@ -76,11 +76,13 @@ use crate::finish_sink::{self, FinishSink, FinishedKind};
 use crate::paged_mem::{ImageSource, PagedMem};
 
 mod compact_branch;
+mod compact_eq;
 mod delta;
 #[cfg(test)]
 mod lean_walk_tests;
 mod windowed;
 use compact_branch::CompactBranch;
+use compact_eq::CompactEq;
 pub use windowed::{
     Accumulator, ChunkJob, RegenBuilder, StreamTable, StreamedChunk, WalkedWindow, Walker,
     WindowStamps, WindowedTraceBuilder,
@@ -3931,7 +3933,8 @@ struct CollectedOps {
     blake3_ops: Vec<Blake3Operation>,
     blake3_absorb_ops: Vec<blake3::Blake3AbsorbOperation>,
     // Auxiliary ALU / memory / CPU32 dispatch chips (driven by the CPU ALU/MEMORY dispatch).
-    eq_ops: Vec<eq::EqOperation>,
+    /// Delta-coded ([`CompactEq`]).
+    eq_ops: CompactEq,
     bytewise_ops: Vec<bytewise::BytewiseOperation>,
     store_ops: Vec<store::StoreOperation>,
     cpu32_ops: Vec<cpu32::Cpu32Operation>,
@@ -4572,7 +4575,8 @@ struct RoutedSegments {
     branch_ops: CompactBranch,
     mul_filter: Vec<(MulOperation, bool)>,
     dvrm_filter: Vec<(DvrmOperation, bool)>,
-    eq_ops: Vec<eq::EqOperation>,
+    /// Delta-coded ([`CompactEq`]).
+    eq_ops: CompactEq,
     bytewise_ops: Vec<bytewise::BytewiseOperation>,
     store_ops: Vec<store::StoreOperation>,
     shift_cpu32: Vec<ShiftOperation>,
@@ -4591,7 +4595,7 @@ impl RoutedSegments {
         self.branch_ops.heap_bytes()
             + vec_heap_bytes(&self.mul_filter)
             + vec_heap_bytes(&self.dvrm_filter)
-            + vec_heap_bytes(&self.eq_ops)
+            + self.eq_ops.heap_bytes()
             + vec_heap_bytes(&self.bytewise_ops)
             + vec_heap_bytes(&self.store_ops)
             + vec_heap_bytes(&self.shift_cpu32)
@@ -4610,7 +4614,7 @@ impl RoutedSegments {
             ("branch", self.branch_ops.heap_bytes()),
             ("mul_filter", vec_heap_bytes(&self.mul_filter)),
             ("dvrm_filter", vec_heap_bytes(&self.dvrm_filter)),
-            ("eq", vec_heap_bytes(&self.eq_ops)),
+            ("eq", self.eq_ops.heap_bytes()),
             ("bytewise", vec_heap_bytes(&self.bytewise_ops)),
             ("store", vec_heap_bytes(&self.store_ops)),
             ("shift_cpu32", vec_heap_bytes(&self.shift_cpu32)),
@@ -4633,7 +4637,8 @@ impl RoutedSegments {
             .extend(&other.branch_ops.range(0, other.branch_ops.len()));
         self.mul_filter.extend(other.mul_filter);
         self.dvrm_filter.extend(other.dvrm_filter);
-        self.eq_ops.extend(other.eq_ops);
+        self.eq_ops
+            .extend(&other.eq_ops.range(0, other.eq_ops.len()));
         self.bytewise_ops.extend(other.bytewise_ops);
         self.store_ops.extend(other.store_ops);
         self.shift_cpu32.extend(other.shift_cpu32);
@@ -4783,7 +4788,7 @@ fn route_ops_into(
                 segments.dvrm_filter.push(route_dvrm(op));
             }
             if f.is_eq() {
-                segments.eq_ops.push(route_eq(op));
+                segments.eq_ops.push(&route_eq(op));
             }
             if f.is_and() || f.is_or() || f.is_xor() {
                 segments.bytewise_ops.push(route_bytewise(op));
@@ -4926,7 +4931,7 @@ fn route_from_cpu_segments(
         branch_ops: CompactBranch::from_ops(&branch_ops),
         mul_filter,
         dvrm_filter,
-        eq_ops,
+        eq_ops: CompactEq::from_ops(&eq_ops),
         bytewise_ops,
         store_ops,
         shift_cpu32,
@@ -5258,9 +5263,10 @@ fn build_traces<I: ImageSource + Sync>(
             }
         }));
     }
-    for slice in eq_ops.chunks(1 << 20) {
+    for k in 0..eq_ops.len().div_ceil(1 << 20) {
+        let eq_ops = &eq_ops;
         collectors.push(Box::new(move |h| {
-            for op in slice {
+            for op in eq_ops.range(k << 20, (k + 1) << 20) {
                 h.add_ops(&op.collect_bitwise_ops());
             }
         }));
@@ -5577,10 +5583,13 @@ fn build_traces<I: ImageSource + Sync>(
     // Auxiliary ALU / memory / CPU32 dispatch chips, each filtered out of the CPU
     // ops above.
     let gen_eqs = || {
-        chunk_and_generate_optional::<eq::EqOperation>(
-            &eq_ops,
+        chunk_and_generate_segmented(
+            &eq_ops.segments(),
             max_rows.eq,
-            |ops| eq::generate_eq_trace_as(ops, form),
+            0,
+            false,
+            true,
+            |ops: &[eq::EqOperation]| eq::generate_eq_trace_as(ops, form),
             to(FinishedKind::Eq),
             #[cfg(feature = "disk-spill")]
             storage_mode,
