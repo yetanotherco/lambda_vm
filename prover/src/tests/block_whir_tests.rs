@@ -67,6 +67,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         pack_finished: true,
         gpack: true,
         spill: crate::block_whir::BlockSpillPolicy::Off,
+        regen: None,
     }
 }
 
@@ -1223,6 +1224,149 @@ fn a_streamed_block_with_dropped_ops_proves_and_verifies() {
             format!("{:?}", kept.table_counts)
         );
         assert!(verify(&proof, &elf, &format));
+    }
+}
+
+/// A streamed prove with the shadow regenerator: its proof, its stamps.
+fn shadowed(
+    elf: &[u8],
+    format: &BlockFormat,
+    o: &BlockOptions,
+    deviations: &Deviations,
+) -> (BlockWhirProof, block_whir::BlockStamps) {
+    let mut o = o.clone();
+    o.regen = Some(block_whir::regen::RegenMode::Shadow);
+    prove_block_whir_with(
+        elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        format,
+        &o,
+        deviations,
+    )
+    .expect("prove")
+}
+
+/// ★ The shadow regenerator (D-WHIR-NODISK N1) rebuilds every streamed chunk
+/// from a fresh execution of the run and moves no byte: phase A records a
+/// recipe per streamed chunk, each digested as it was committed; phase B
+/// regenerates every one with no mismatch, failure or miss, and plans them in
+/// group order and rest first; the proof has the partition of the prove
+/// without the shadow, verifies, and its bytes are equal under the
+/// deterministic grind. Inline and on three layout threads, the streamed ops
+/// kept and dropped.
+#[test]
+fn the_shadow_regenerates_every_streamed_chunk_and_moves_no_byte() {
+    let format = many_groups();
+    for name in ["test_keccak_multi"] {
+        let elf = asm_elf_bytes(name);
+        for (workers, drop_ops) in [(0, false), (3, true)] {
+            let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+            o.layout_workers = workers;
+            o.drop_streamed_ops = drop_ops;
+            o.regen = Some(block_whir::regen::RegenMode::Off);
+            let (plain, plain_stamps) = prove_block_whir_with(
+                &elf,
+                &[],
+                &ProofOptions::default_test_options(),
+                &format,
+                &o,
+                &Deviations::default(),
+            )
+            .expect("prove");
+            assert!(plain_stamps.regen.is_none(), "off records nothing");
+            let (proof, stamps) = shadowed(&elf, &format, &o, &Deviations::default());
+            let at = format!("{name}, {workers} layout threads, ops dropped {drop_ops}");
+            let r = stamps.regen.as_ref().expect("the shadow's readout");
+            let lines = r.lines.join("\n");
+            let streamed = stamps.streamed.1;
+            assert!(streamed > 0, "{at}: nothing streamed");
+            assert_eq!(r.recipes, streamed, "{at}: a recipe a chunk\n{lines}");
+            assert_eq!(r.digested, streamed, "{at}: every recipe digested\n{lines}");
+            assert_eq!(r.stray, 0, "{at}\n{lines}");
+            assert_eq!(r.regenerated, streamed, "{at}: every chunk\n{lines}");
+            assert_eq!(
+                (r.mismatches, r.failed, r.missing),
+                (0, 0, 0),
+                "{at}\n{lines}"
+            );
+            assert_eq!(r.error, None, "{at}\n{lines}");
+            assert!(r.would_wait_rest_first.is_some(), "{at}\n{lines}");
+            assert!(
+                lines.contains("BLOCK REGEN plan (rest first)")
+                    && lines.contains("BLOCK REGEN plan (group order)"),
+                "{lines}"
+            );
+            assert_eq!(proof.groups, plain.groups, "{at}: the partition");
+            assert!(verify(&proof, &elf, &format), "{at}");
+            if crypto::grinding::deterministic() {
+                let bytes = |p: &BlockWhirProof| {
+                    rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                        .expect("serialize")
+                        .to_vec()
+                };
+                assert_eq!(bytes(&plain), bytes(&proof), "{at}: the proof");
+            }
+        }
+    }
+}
+
+/// ★ The shadow's check is load-bearing: a regenerator whose slicer drops the
+/// first CPU op (or MEMW_R row) rebuilds a chunk that is not the one
+/// committed, which the shadow reports as a mismatch — never a panic, and
+/// never a proof over it: the proof still verifies, and the rest-first plan
+/// has no would-wait to give.
+#[test]
+fn a_wrong_regeneration_is_reported_never_proved() {
+    use crate::tables::trace_builder::StreamTable;
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let o = streamed(MaxRowsConfig::small(), 5, 3);
+    for table in [StreamTable::Cpu, StreamTable::MemwRegister] {
+        let (proof, stamps) = shadowed(
+            &elf,
+            &format,
+            &o,
+            &Deviations {
+                regen_drop_one_op: Some(table),
+                ..Deviations::default()
+            },
+        );
+        let r = stamps.regen.expect("the shadow's readout");
+        let lines = r.lines.join("\n");
+        assert!(r.mismatches > 0, "{table:?}: no mismatch\n{lines}");
+        assert!(
+            lines.contains(&format!("BLOCK REGEN MISMATCH {table:?}[0]")),
+            "{lines}"
+        );
+        assert_eq!(r.would_wait_rest_first, None, "{lines}");
+        assert!(verify(&proof, &elf, &format), "{table:?}");
+    }
+}
+
+/// The shadow runs only where the regenerator rebuilds every streamed chunk:
+/// with KECCAK_RND's chunks streamed, or the MEMW-derived LT ops, or the
+/// chunks generated 64-bit, nothing is recorded and the prove is as without
+/// it.
+#[test]
+fn the_shadow_stays_off_where_it_cannot_rebuild_the_chunks() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let base = streamed(MaxRowsConfig::small(), 5, 3);
+    let mut keccak_rnd = base.clone();
+    keccak_rnd.stream_keccak_rnd = true;
+    let mut memw_lt = base.clone();
+    memw_lt.stream_memw_lt = true;
+    let mut wide = base.clone();
+    wide.gpack = false;
+    for (what, o) in [
+        ("KECCAK_RND", keccak_rnd),
+        ("MEMW-derived LT", memw_lt),
+        ("64-bit", wide),
+    ] {
+        let (proof, stamps) = shadowed(&elf, &format, &o, &Deviations::default());
+        assert!(stamps.regen.is_none(), "{what}: recorded");
+        assert!(verify(&proof, &elf, &format), "{what}");
     }
 }
 

@@ -54,6 +54,7 @@ use crate::{
 };
 
 mod memlog;
+pub mod regen;
 
 /// How many stacked polynomials a group may take. A format constant: both sides
 /// derive the groups from it ([`block_groups`]). Three is today's heaviest
@@ -384,6 +385,11 @@ pub struct BlockOptions {
     /// Production: [`spill_from_env`] (`LAMBDA_VM_BLOCK_SPILL`), `auto` unless
     /// set.
     pub spill: BlockSpillPolicy,
+    /// What phase B does with the streamed chunks ([`regen::RegenMode`]):
+    /// `None` reads `LAMBDA_VM_BLOCK_REGEN` when the prove starts (production;
+    /// a value it does not know refuses the prove), `Some` is a test's. The
+    /// proof's bytes are the same under every mode.
+    pub regen: Option<regen::RegenMode>,
 }
 
 /// When a block spills its held tables ([`BlockOptions::spill`]): the policy
@@ -719,6 +725,7 @@ impl BlockOptions {
             pack_finished: true,
             gpack: gpack_from_env(),
             spill: spill_from_env(),
+            regen: None,
         }
     }
 }
@@ -953,6 +960,10 @@ pub struct BlockStamps {
     pub spill: Option<String>,
     /// With [`BlockOptions::spill`]: the store's counters after phase B.
     pub spill_stats: Option<stark::spill::SpillStats>,
+    /// With [`BlockOptions::regen`] set to regenerate: what the regenerator
+    /// did, and its `BLOCK REGEN` lines (printed as phase B ends, not in
+    /// [`Self::report`]).
+    pub regen: Option<regen::RegenStamps>,
 }
 
 /// A streamed build's layout, for the readout ([`BlockStamps::layout`]).
@@ -1865,6 +1876,10 @@ pub(crate) struct Deviations {
     /// At the walk's end, every parked table handed to the store, whatever the
     /// forecast ([`hand_off_need`]).
     pub hand_off_all: bool,
+    /// The shadow regenerator's slicer drops the first op of this table's
+    /// list ([`regen::ShadowRun::spawn`]): a regeneration bug, which the shadow
+    /// must report and the proof must not see.
+    pub regen_drop_one_op: Option<StreamTable>,
 }
 
 /// A prepared stack committed wrongly, tables by AIR index.
@@ -2560,10 +2575,13 @@ type Packed = (Vec<Vec<Key>>, Vec<f64>, f64);
 /// A streamed chunk laid out: its table, its index, its shape and the table.
 type LaidChunk<'a> = (StreamTable, usize, (usize, usize), CommittedTable<'a, F, E>);
 
+/// One streamed chunk generated and laid out; a regeneration recorder takes
+/// the digest of its packed columns, as committed.
 fn lay_out_chunk<'a>(
     airs: &'a StreamAirs,
     job: ChunkJob,
     ledger: Option<&memlog::Ledger>,
+    recorder: Option<&regen::Recorder>,
 ) -> Result<LaidChunk<'a>, Error> {
     use std::sync::atomic::Ordering::Relaxed;
     // A memory log: the job leaves the queue as its ops, then its trace.
@@ -2574,6 +2592,9 @@ fn lay_out_chunk<'a>(
         ops
     });
     let mut chunk = job.generate_as(airs.form);
+    if let (Some(recorder), Some(packed)) = (recorder, chunk.trace.narrow_main()) {
+        recorder.packed(chunk.table, chunk.index, packed);
+    }
     let rows = ledger.map_or(0, |ledger| {
         let rows = memlog::rows_bytes(&chunk.trace);
         ledger.laying.fetch_add(rows, Relaxed);
@@ -2623,6 +2644,7 @@ fn stream_inline<'a>(
     brx: std::sync::mpsc::Receiver<Built>,
     airs: &'a StreamAirs,
     mut packer: Packer<'a>,
+    recorder: Option<&regen::Recorder>,
 ) -> Result<(StreamLaid<'a>, Box<Traces>), Error> {
     let mut shapes = Vec::new();
     let mut chunks = 0.0;
@@ -2631,7 +2653,7 @@ fn stream_inline<'a>(
         match item {
             Built::Job(job) => {
                 let t = Instant::now();
-                let (table, index, shape, laid) = lay_out_chunk(airs, *job, ledger)?;
+                let (table, index, shape, laid) = lay_out_chunk(airs, *job, ledger, recorder)?;
                 chunks += t.elapsed().as_secs_f64();
                 shapes.push((table, index, shape));
                 packer.place(Key::Streamed(table, index), shape, laid)?;
@@ -2762,6 +2784,7 @@ fn stream_pipelined<'a, R>(
     ahead: Option<usize>,
     pack_rest: bool,
     gate: Option<&'a crate::tables::trace_builder::gate::ByteGate>,
+    recorder: Option<&regen::Recorder>,
     rest: impl FnOnce(RestIn, Option<std::sync::mpsc::Sender<RestDone<'a>>>) -> Result<R, Error>,
 ) -> Result<(StreamLaid<'a>, R), Error> {
     type Done<'a> = (usize, f64, Result<LaidChunk<'a>, Error>);
@@ -2795,7 +2818,7 @@ fn stream_pipelined<'a, R>(
                         return;
                     };
                     let t = Instant::now();
-                    let laid = lay_out_chunk(airs, *job, ledger);
+                    let laid = lay_out_chunk(airs, *job, ledger, recorder);
                     if dtx.send((seq, t.elapsed().as_secs_f64(), laid)).is_err() {
                         return;
                     }
@@ -3296,6 +3319,8 @@ struct Laid {
     prepared: Vec<PreparedColumns>,
     busy: f64,
     layout: LayoutStamps,
+    /// Each streamed chunk's table and index, and its AIR index.
+    streamed_air: Vec<(StreamTable, usize, usize)>,
 }
 
 /// The block's proof with the build streamed into phase A: a builder thread
@@ -3330,6 +3355,18 @@ fn prove_streamed(
     // A new block: no memory pressure seen yet (`alloc_purge`).
     crate::alloc_purge::clear_memory_pressure();
     let stream_airs = StreamAirs::new(opts, stream_form);
+    // Regeneration (`BlockOptions::regen`): the shadow's recorder, when phase A
+    // can feed it — its chunks generated packed, and none of KECCAK_RND's or
+    // of the MEMW-derived LT ops streamed (chunks no regenerator cuts).
+    let regen_mode = match options.regen {
+        Some(mode) => mode,
+        None => regen::regen_mode()?,
+    };
+    let shadow_recorder = regen::shadow_recorder(
+        regen_mode,
+        stream_form == TraceForm::Narrow && !options.stream_keccak_rnd && !options.stream_memw_lt,
+    );
+    let recorder = shadow_recorder.as_ref();
     let run_airs: std::sync::OnceLock<VmAirs> = std::sync::OnceLock::new();
     // Phase A's commits read the blowup, the fold schedule and the format of
     // the config and nothing else; the full config (its query count reads every
@@ -3522,7 +3559,17 @@ fn prove_streamed(
                             if let Some(ledger) = ledger {
                                 ledger.walked.fetch_sub(walked.heap_bytes(), Relaxed);
                             }
-                            for job in accumulator.absorb(walked) {
+                            // A recorder notes each chunk before it goes, so the
+                            // layout's digest finds its recipe.
+                            let jobs = match recorder {
+                                Some(recorder) => {
+                                    let (jobs, added) = accumulator.absorb_counted(walked);
+                                    recorder.window(added, &jobs);
+                                    jobs
+                                }
+                                None => accumulator.absorb(walked),
+                            };
+                            for job in jobs {
                                 streamed += 1;
                                 if let Some(ledger) = ledger {
                                     ledger.jobs.fetch_add(job.op_bytes(), Relaxed);
@@ -3738,7 +3785,7 @@ fn prove_streamed(
                     }
                 };
                 let (streamed, rest) = if inline {
-                    let (streamed, traces) = stream_inline(brx, stream_airs, packer)?;
+                    let (streamed, traces) = stream_inline(brx, stream_airs, packer, recorder)?;
                     (streamed, rest_of(RestIn::Whole(traces), None)?)
                 } else {
                     stream_pipelined(
@@ -3749,6 +3796,7 @@ fn prove_streamed(
                         options.layout_ahead,
                         options.pack_rest_as_laid_out,
                         Some(rest_gate),
+                        recorder,
                         rest_of,
                     )?
                 };
@@ -3783,11 +3831,13 @@ fn prove_streamed(
                     .map(|(i, air)| (air.name().to_string(), i))
                     .collect();
                 let mut shapes: Vec<Option<(usize, usize)>> = vec![None; refs.len()];
+                let mut streamed_air = Vec::with_capacity(streamed_shapes.len());
                 for &(table, index, shape) in &streamed_shapes {
                     let at = *names.get(&stream_name(table, index)).ok_or_else(|| {
                         Error::Prover(format!("no AIR for {}", stream_name(table, index)))
                     })?;
                     shapes[at] = Some(shape);
+                    streamed_air.push((table, index, at));
                 }
                 // The tables the windows did not stream, packed in AIR order
                 // after every streamed chunk (or already, as they were laid
@@ -3883,6 +3933,7 @@ fn prove_streamed(
                         rest_tables,
                         gpack: (false, [0; 4]),
                     },
+                    streamed_air,
                 })
             });
 
@@ -3937,6 +3988,20 @@ fn prove_streamed(
         // here), or as `LAMBDA_VM_ALLOC_PURGE` names it.
         note_pressure_past(HostReading::now().bytes(), target);
         crate::alloc_purge::purge_point("phase-a");
+        // The shadow regenerator starts here, beside the rest of the prove; it
+        // drops nothing, and any exit of the prove stops and joins it.
+        let shadow_recipes = shadow_recorder.map(regen::Recorder::finish);
+        let shadow = shadow_recipes.as_ref().map(|(recipes, _)| {
+            regen::ShadowRun::spawn(
+                elf_bytes.to_vec(),
+                private_inputs.to_vec(),
+                options.max_rows.clone(),
+                window,
+                recipes.clone(),
+                stream_form,
+                deviations.regen_drop_one_op,
+            )
+        });
         stamps.tables = laid.shapes.len();
         stamps.cells = laid.shapes.iter().map(|&(w, n)| w << n).sum();
 
@@ -4005,6 +4070,7 @@ fn prove_streamed(
             Some(f) => f,
             None => &identity,
         };
+        let phase_b_start = Instant::now();
         let (proof, argues, prepared_openings, groups) =
             multilinear_block::block_prove_on_forks_observed::<_, _, _, H>(
                 block,
@@ -4018,6 +4084,54 @@ fn prove_streamed(
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
+        if let (Some(shadow), Some((recipes, stray))) = (shadow, &shadow_recipes) {
+            let prove_offset = phase_b_start
+                .saturating_duration_since(shadow.started())
+                .as_secs_f64();
+            let waited = Instant::now();
+            let report = shadow.join();
+            let joined = waited.elapsed().as_secs_f64();
+            let group_of_air: std::collections::HashMap<u32, usize> = laid
+                .groups
+                .iter()
+                .enumerate()
+                .flat_map(|(g, tables)| tables.iter().map(move |&t| (t, g)))
+                .collect();
+            let air_of: std::collections::HashMap<(StreamTable, usize), usize> = laid
+                .streamed_air
+                .iter()
+                .map(|&(table, index, air)| ((table, index), air))
+                .collect();
+            let streamed_cells: u64 = laid
+                .streamed_air
+                .iter()
+                .map(|&(_, _, air)| {
+                    let (w, n) = laid.shapes[air];
+                    (w as u64) << n
+                })
+                .sum();
+            let spans: Vec<(f64, f64)> = groups.iter().map(|g| (g.start_b, g.end_b)).collect();
+            let readout = regen::shadow_readout(
+                recipes,
+                *stray,
+                &report,
+                &|table, index| {
+                    air_of
+                        .get(&(table, index))
+                        .and_then(|&air| group_of_air.get(&(air as u32)).copied())
+                },
+                laid.streamed_air.len(),
+                streamed_cells,
+                &spans,
+                stamps.phase_b,
+                prove_offset,
+                joined,
+            );
+            for line in &readout.lines {
+                eprintln!("{line}");
+            }
+            stamps.regen = Some(readout);
+        }
         if let Some(spill) = &spill {
             let read_back = spill
                 .prefetch

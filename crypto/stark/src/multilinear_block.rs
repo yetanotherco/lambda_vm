@@ -134,6 +134,10 @@ pub struct GroupStamps {
     pub argue: f64,
     pub encode: f64,
     pub open: f64,
+    /// Phase B: when the group's turn began and ended, seconds since phase B
+    /// began (its columns back, up, argued, opened and let go).
+    pub start_b: f64,
+    pub end_b: f64,
     /// Host bytes kept of the group's trees between the phases.
     pub tree_bytes: usize,
     /// The device ledger's peak promise through the group's argue — the
@@ -1840,6 +1844,7 @@ where
     prepared_shape(&entries, &starts, tables.len(), &|t| {
         tables[t].num_committed_columns()
     })?;
+    let entered = Instant::now();
     let derived: Vec<Commitment> = prepared.iter().flat_map(|p| p.commitment.roots()).collect();
     let (z, alpha, beta) = absorb_roots_and_challenge::<E, T>(transcript, &roots, &derived);
 
@@ -1880,6 +1885,7 @@ where
         (!reads.is_empty()).then(|| Prefetch::start(reads, 2 * widest.max(1)))
     });
     for (g, (retired, &size)) in groups.into_iter().zip(&sizes).enumerate() {
+        stamps[g].start_b = entered.elapsed().as_secs_f64();
         let mut fork = group_fork::<E, T>(transcript, fork_of(g));
         let tables_before = table_proofs.len();
         let argues_before = argues.len();
@@ -2093,6 +2099,7 @@ where
             mem.tree_tops.fetch_sub(tree_tops, Relaxed);
             mem.mark(&format!("phase B group {g} end"));
         }
+        stamps[g].end_b = entered.elapsed().as_secs_f64();
         at += size;
     }
     // The tables go with this function: a memory log stops holding them.

@@ -202,7 +202,11 @@ fn the_regenerator_rebuilds_the_handed_out_chunks() {
         let phase_a = handed_out_digests(&program, &logs, &max_rows, 5);
         handed += phase_a.len();
         let by_key: BTreeMap<Key, [u64; 2]> = phase_a.iter().copied().collect();
-        assert_eq!(by_key.len(), phase_a.len(), "{name}: a chunk handed out twice");
+        assert_eq!(
+            by_key.len(),
+            phase_a.len(),
+            "{name}: a chunk handed out twice"
+        );
         let mut last = [None; 9];
         for &(t, i) in by_key.keys() {
             last[t] = Some(last[t].map_or(i, |l: usize| l.max(i)));

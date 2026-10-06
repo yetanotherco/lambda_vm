@@ -106,6 +106,7 @@ fn small_block_cut(
         pack_finished: true,
         gpack: true,
         spill: crate::block_whir::BlockSpillPolicy::Off,
+        regen: None,
     };
     cut(&mut options);
     let proof = prove_block_whir(&elf, &[], &opts, format, &options)
@@ -563,6 +564,7 @@ fn dense_block_with(
             pack_finished: true,
             gpack: true,
             spill: crate::block_whir::BlockSpillPolicy::Off,
+            regen: None,
         },
         deviations,
         &|_, r| *roots.lock().expect("lock") = r.to_vec(),
