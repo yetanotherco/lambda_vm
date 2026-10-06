@@ -192,6 +192,95 @@ fn the_twelve_felt_contract_hands_out_no_hash_under_the_socket() {
     }
 }
 
+/// A2's reachability, driven: every production entry point that hashes a
+/// twelve-felt row with a program's hasher, handed a twelve-felt row of each
+/// mode under the width-16 socket, refuses it as a TYPED error and never reaches
+/// the refusing `permute` (a panic here fails the test).
+///
+/// - The executor, under all three schedules: `hash_compute` reads `mode_iv`
+///   (the zero IV), then `admits` refuses before any hashing method runs.
+/// - The trace filler over twelve-felt records (an RPX execution's) handed the
+///   socket's hasher: its socket arm fills no witness and hashes nothing.
+///
+/// The other callers of the twelve-felt contract are not production entry
+/// points with a program's hasher: the host block transcript is pinned to
+/// `BLOCK_HASHER` at compile time (`hash_pin`), and `fixture`'s host sponge and
+/// tree serve the fixture programs and the suites only.
+#[test]
+fn no_production_entry_point_reaches_the_twelve_felt_hash_under_the_socket() {
+    use super::executor::execute;
+    use super::trace::build_traces_with_hasher;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let programs: Vec<(&str, LfmProgram)> = vec![
+        ("compress", {
+            let mut b = LfmBuilder::new();
+            let a = b.digest_const(word(1));
+            let c = b.digest_const(word(2));
+            let d = b.compress(a, c);
+            b.public(d.as_cell());
+            compile(b.finish())
+        }),
+        ("transcript", {
+            let mut b = LfmBuilder::new();
+            let a = b.digest_const(word(3));
+            let c = b.digest_const(word(4));
+            let d = b.transcript_step(a, c);
+            b.public(d.as_cell());
+            compile(b.finish())
+        }),
+        ("leaf", {
+            let mut b = LfmBuilder::new();
+            let a = b.digest_const(word(5));
+            let f = b.digest_const(word(6)).as_cell();
+            let d = b.leaf(a, f);
+            b.public(d.as_cell());
+            compile(b.finish())
+        }),
+        ("permute", {
+            let mut b = LfmBuilder::new();
+            let s: [Cell; 3] =
+                core::array::from_fn(|k| b.digest_const(word(7 + k as u64)).as_cell());
+            let out = b.permute(s);
+            b.public(out[0]);
+            compile(b.finish())
+        }),
+    ];
+    let socket = HasherKind::Poseidon1W16;
+    for (mode, program) in &programs {
+        assert!(!program.hash16(), "{mode}: a twelve-felt program");
+        type Entry = fn(&LfmProgram, HasherKind) -> Result<(), LfmExecError>;
+        let entries: [(&str, Entry); 3] = [
+            ("execute (the default schedule)", |p, h| {
+                execute(p, &[], &h).map(|_| ())
+            }),
+            ("execute_serial", |p, h| {
+                execute_serial(p, &[], &h).map(|_| ())
+            }),
+            ("execute_with_merged_levels", |p, h| {
+                execute_with_merged_levels(p, &[], &h, 1, 2).map(|_| ())
+            }),
+        ];
+        for (entry, run) in entries {
+            let got = catch_unwind(AssertUnwindSafe(|| run(program, socket)));
+            assert!(
+                matches!(got, Ok(Err(LfmExecError::HasherRejected(_)))),
+                "{entry} on a {mode} row under the socket: {:?}",
+                got.map_err(|_| "panicked")
+            );
+        }
+        // The trace filler: twelve-felt records, the socket's hasher.
+        let exec = execute_serial(program, &[], &HasherKind::Rpx).expect("executes under RPX");
+        let filled = catch_unwind(AssertUnwindSafe(|| {
+            build_traces_with_hasher(program, &exec.records, socket);
+        }));
+        assert!(
+            filled.is_ok(),
+            "the trace filler hashed a {mode} row under the socket"
+        );
+    }
+}
+
 #[test]
 fn a_program_mixing_the_two_widths_is_not_admitted() {
     let mut b = LfmBuilder::new();

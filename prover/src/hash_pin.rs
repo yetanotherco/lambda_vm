@@ -160,6 +160,15 @@ pub type BlockVerifier<Field, FieldExtension, PI> =
 /// production stays correct.
 pub const BLOCK_HASHER: crate::lfm::hash::HasherKind = crate::lfm::hash::HasherKind::Rpx;
 
+// The host block transcript (`block_transcript`) hashes twelve-felt steps with
+// `BLOCK_HASHER`; the width-16 socket has no twelve-felt hash (its contract
+// refuses), so it can never be the block hasher. A width-16 program takes the
+// socket from its own instructions (`LfmProgram::hasher`), never from here.
+const _: () = assert!(
+    !matches!(BLOCK_HASHER, crate::lfm::hash::HasherKind::Poseidon1W16),
+    "the block hasher hashes twelve-felt transcript steps; the width-16 socket has none"
+);
+
 /// The [`CommitmentHash`] the block path's roots may be called by.
 ///
 /// ★ Read this rather than `stark::config::COMMITMENT_HASH`. That const names
