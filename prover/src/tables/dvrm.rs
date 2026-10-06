@@ -22,7 +22,8 @@
 //! - `sign_n`, `sign_d`, `sign_q`, `sign_r`: Bit - sign bits
 //!
 //! ## Bus Interactions
-//! - Sender: IS_HALF (×20: n, d, r, n_sub_r, q; ×2: μ_q, μ_r bounds)
+//! - Sender: IS_HALF (×20: n, d, r, n_sub_r, q)
+//! - Sender: ARE_BYTES (×2: μ_q, μ_r bounds)
 //! - Sender: MSB16 (×3 for sign extraction: n, d, r)
 //! - Sender: ALU (×3, on the unified bus: ×1 LT-flavored for `|r| < |d|`,
 //!   ×2 MUL-flavored for `n - r = d * q` lo/hi)
@@ -274,11 +275,11 @@ impl DvrmOperation {
 // =========================================================================
 
 /// Largest per-row multiplicity: `μ_q` and `μ_r` are each range-checked to a
-/// halfword (`IS_HALF[μ]`, weighted by μ), so a row holds at most this many
+/// byte (`IS_BYTE[μ]`, weighted by μ), so a row holds at most this many
 /// lookups of each kind. The bound is what makes `μ_q + μ_r = 0` imply
 /// `μ_q = μ_r = 0`: without it a `μ_q = 1, μ_r = −1` row receives a quotient
 /// lookup while sending none of its checks (forged `n = q·d + r`).
-pub const MU_MAX: u64 = (1 << 16) - 1;
+pub const MU_MAX: u64 = (1 << 8) - 1;
 
 /// Deduplicates DVRM operations into trace rows: `(n, d, signed) -> (μ_q, μ_r)`,
 /// splitting an op over several rows when a count exceeds [`MU_MAX`]. Shared by
@@ -384,7 +385,7 @@ pub fn generate_dvrm_trace(
 ///
 /// The DVRM table:
 /// - **Sends** IS_HALF lookups for n, d, q, r, n_sub_r range checks (×20)
-///   and for the μ_q/μ_r multiplicity bounds (×2)
+/// - **Sends** ARE_BYTES[μ_q, 0] and ARE_BYTES[μ_r, 0] to bound the multiplicities
 /// - **Sends** MSB16 lookups for sign extraction (×3: n, d, r)
 /// - **Sends** LT lookup for |r| < |d| (×1)
 /// - **Sends** MUL lookups for n_sub_r = d * q verification (×2: lo and hi)
@@ -394,24 +395,27 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::new();
 
     // -------------------------------------------------------------------------
-    // IS_HALF[μ_q] | μ_q,  IS_HALF[μ_r] | μ_r.
+    // ARE_BYTES[μ_q, 0] | μ_q,  ARE_BYTES[μ_r, 0] | μ_r.
     // Every check below fires with μ_q + μ_r, so the multiplicities themselves
     // must be bounded and non-negative. Otherwise μ_q = 1, μ_r = −1 receives a
     // quotient lookup with all checks off (forged quotient),
     // and an honest μ_r = 1 copy of the row cancels the stray −1. Each μ is sent
     // with itself as multiplicity: `k` rows holding an out-of-range value `v`
-    // put weight `k·v ≠ 0` on a tuple IS_HALF has no row for, while padding
+    // put weight `k·v ≠ 0` on a byte tuple ARE_BYTES has no row for, while padding
     // (μ = 0) contributes nothing, so an empty instance still matches an absent
     // one. See `MU_MAX`.
     // -------------------------------------------------------------------------
     for col in [cols::MU_Q, cols::MU_R] {
         interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
+            BusId::AreBytes,
             Multiplicity::Column(col),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
+            vec![
+                BusValue::Packed {
+                    start_column: col,
+                    packing: Packing::Direct,
+                },
+                BusValue::constant(0),
+            ],
         ));
     }
 

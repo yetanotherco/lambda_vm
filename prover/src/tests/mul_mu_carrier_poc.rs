@@ -160,11 +160,13 @@ fn prove_and_verify(rows: &[Vec<FE>], extra_half: Option<u64>) -> bool {
     let alu: u64 = BusId::Alu.into();
     let half: u64 = BusId::IsHalfword.into();
     let b20: u64 = BusId::IsB20.into();
+    let byte: u64 = BusId::AreBytes.into();
 
     let net = mul_net(rows);
     let mut cpu = Vec::new();
     let mut range = Vec::new();
     let mut range20 = Vec::new();
+    let mut arebytes = Vec::new();
     for ((bus, tuple), m) in &net {
         if *m == FE::zero() {
             continue;
@@ -179,6 +181,9 @@ fn prove_and_verify(rows: &[Vec<FE>], extra_half: Option<u64>) -> bool {
             }
         } else if *bus == b20 && tuple[0] < B20 {
             range20.push((tuple.clone(), *m));
+        } else if *bus == byte && tuple[0] < 256 {
+            // μ bound: ARE_BYTES[μ, 0]; a real byte table has rows only for [0,256).
+            arebytes.push((tuple.clone(), *m));
         }
     }
     let mut carrier = Vec::new();
@@ -195,12 +200,14 @@ fn prove_and_verify(rows: &[Vec<FE>], extra_half: Option<u64>) -> bool {
     let mut cpu_trace = mock_trace(&cpu, 7);
     let mut range_trace = mock_trace(&range, 1);
     let mut range20_trace = mock_trace(&range20, 1);
+    let mut arebytes_trace = mock_trace(&arebytes, 2);
     let mut carrier_trace = mock_trace(&carrier, 1);
 
     let mul_air = create_mul_air(&opts);
     let cpu_air = mock(&opts, BusId::Alu, 7, true);
     let range_air = mock(&opts, BusId::IsHalfword, 1, false);
     let range20_air = mock(&opts, BusId::IsB20, 1, false);
+    let arebytes_air = mock(&opts, BusId::AreBytes, 2, false);
     let carrier_air = mock(&opts, BusId::IsHalfword, 1, true);
 
     let pairs: Vec<(
@@ -212,11 +219,18 @@ fn prove_and_verify(rows: &[Vec<FE>], extra_half: Option<u64>) -> bool {
         (&mul_air, &mut mul_trace, &()),
         (&range_air, &mut range_trace, &()),
         (&range20_air, &mut range20_trace, &()),
+        (&arebytes_air, &mut arebytes_trace, &()),
         (&carrier_air, &mut carrier_trace, &()),
     ];
     let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
-    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        vec![&cpu_air, &mul_air, &range_air, &range20_air, &carrier_air];
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
+        &cpu_air,
+        &mul_air,
+        &range_air,
+        &range20_air,
+        &arebytes_air,
+        &carrier_air,
+    ];
     Verifier::multi_verify(
         &airs,
         &proof,
@@ -233,16 +247,25 @@ fn control_honest_mul_verifies() {
     assert!(prove_and_verify(&[row], None));
 }
 
-/// The forgery leaves exactly a `−1` at value `p−1` on IS_HALFWORD, and nowhere
-/// else out of range — so a single carrier `+1` at `p−1` is all it would need.
+/// The twin's `μ_hi = −1` bound now lands on ARE_BYTES, not IS_HALFWORD: it
+/// leaves a `−1` at `ARE_BYTES[p−1]` (out of byte range, no receiver), which is
+/// why an IS_HALFWORD carrier cannot cancel it. The IS_HALFWORD bus carries no
+/// out-of-range residue from the bound.
 #[test]
-fn forgery_leaves_only_minus_one_at_p_minus_1() {
+fn forgery_bound_residue_is_on_are_bytes() {
     let half: u64 = BusId::IsHalfword.into();
+    let byte: u64 = BusId::AreBytes.into();
     let net = mul_net(&forged_mul_rows());
+
+    // The μ bound's out-of-range residue is on ARE_BYTES[p−1] with weight −1.
+    assert_eq!(
+        net.get(&(byte, vec![minus_one(), 0])).copied(),
+        Some(-FE::one())
+    );
+    // No out-of-range IS_HALFWORD send comes from the μ bound any more.
     for ((bus, tuple), m) in &net {
-        if *bus == half && tuple[0] >= HALF && *m != FE::zero() {
-            assert_eq!(tuple[0], minus_one());
-            assert_eq!(*m, -FE::one());
+        if *bus == half && tuple[0] == minus_one() {
+            assert_eq!(*m, FE::zero(), "no μ-bound residue on IS_HALFWORD");
         }
     }
 }
@@ -253,16 +276,15 @@ fn forgery_without_carrier_is_rejected() {
     assert!(!prove_and_verify(&forged_mul_rows(), None));
 }
 
-/// The decisive case: does a carrier that supplies `+1` at `p−1` let the
-/// `μ_hi = −1` product forgery through the weighted-by-μ bound?
+/// Regression: the μ bound now lives on ARE_BYTES, a bus the `lo`/`hi` limb
+/// range checks (IS_HALFWORD) never touch. So an IS_HALFWORD carrier at `p−1`
+/// can no longer cancel the twin's `μ_hi = −1` bound send (it lands on
+/// ARE_BYTES[p−1], out of byte range, with no receiver). The forgery is
+/// rejected even WITH the carrier.
 #[test]
-fn forgery_with_carrier_at_p_minus_1() {
-    let verified = prove_and_verify(&forged_mul_rows(), Some(minus_one()));
-    // Asserting the observed behaviour so the harness is not vacuous; the point
-    // of the test is the printed verdict, interpreted in the module docs.
-    println!("MUL forgery with p-1 carrier verified = {verified}");
+fn is_halfword_carrier_no_longer_defeats_byte_bound() {
     assert!(
-        verified,
-        "if this fails the weighted-by-μ bound resisted the carrier"
+        !prove_and_verify(&forged_mul_rows(), Some(minus_one())),
+        "ARE_BYTES bound must resist an IS_HALFWORD carrier"
     );
 }

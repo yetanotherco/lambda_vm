@@ -172,6 +172,7 @@ fn prove_and_verify(lt_rows: &[Row], cpu: &[Vec<u64>], victim: &[u64]) -> bool {
     let opts = ProofOptions::default_test_options();
     let half_id: u64 = BusId::IsHalfword.into();
     let msb_id: u64 = BusId::Msb16.into();
+    let byte_id: u64 = BusId::AreBytes.into();
 
     let mut net = lt_net(lt_rows);
     for &v in victim {
@@ -190,6 +191,13 @@ fn prove_and_verify(lt_rows: &[Row], cpu: &[Vec<u64>], victim: &[u64]) -> bool {
             (t, m)
         })
         .collect();
+    // ARE_BYTES receiver (the μ bound sends ARE_BYTES[μ, 0]); a real byte table
+    // has rows only for [0, 256), so an out-of-range value has no receiver.
+    let arebytes: Vec<(Vec<u64>, FE)> = net
+        .iter()
+        .filter(|((bus, t), m)| *bus == byte_id && t[0] < 256 && **m != FE::zero())
+        .map(|((_, t), m)| (t.clone(), *m))
+        .collect();
     let cpu_rows: Vec<(Vec<u64>, FE)> = cpu.iter().map(|t| (t.clone(), FE::one())).collect();
     let victim_rows: Vec<(Vec<u64>, FE)> = victim.iter().map(|&v| (vec![v], FE::one())).collect();
 
@@ -203,12 +211,14 @@ fn prove_and_verify(lt_rows: &[Row], cpu: &[Vec<u64>], victim: &[u64]) -> bool {
     let mut victim_trace = lookup_trace(&victim_rows, 1);
     let mut range_trace = lookup_trace(&range, 1);
     let mut msb16_trace = lookup_trace(&msb16, 2);
+    let mut arebytes_trace = lookup_trace(&arebytes, 2);
 
     let lt_air = create_lt_air(&opts);
     let cpu_air = lookup_air(&opts, BusId::Alu, 7, true);
     let victim_air = lookup_air(&opts, BusId::IsHalfword, 1, true);
     let range_air = lookup_air(&opts, BusId::IsHalfword, 1, false);
     let msb16_air = lookup_air(&opts, BusId::Msb16, 2, false);
+    let arebytes_air = lookup_air(&opts, BusId::AreBytes, 2, false);
 
     let pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
@@ -220,10 +230,17 @@ fn prove_and_verify(lt_rows: &[Row], cpu: &[Vec<u64>], victim: &[u64]) -> bool {
         (&lt_air, &mut lt_trace, &()),
         (&range_air, &mut range_trace, &()),
         (&msb16_air, &mut msb16_trace, &()),
+        (&arebytes_air, &mut arebytes_trace, &()),
     ];
     let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
-    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        vec![&cpu_air, &victim_air, &lt_air, &range_air, &msb16_air];
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
+        &cpu_air,
+        &victim_air,
+        &lt_air,
+        &range_air,
+        &msb16_air,
+        &arebytes_air,
+    ];
     Verifier::multi_verify(
         &airs,
         &proof,
@@ -235,6 +252,21 @@ fn prove_and_verify(lt_rows: &[Row], cpu: &[Vec<u64>], victim: &[u64]) -> bool {
 /// The honest LT row's out, as the CPU would receive it.
 fn honest_out(op: &LtOperation) -> u64 {
     honest_row(op)[cols::OUT].canonical_u64()
+}
+
+/// A *real, constraint-satisfying* LT row whose `sub_0 = p−1` — the non-canonical
+/// split `(p−1, 1)` of `sub_lo = 0xFFFF`. `carry_0` reads only `sub_0 + 2^16·sub_1`
+/// (lt.rs:410), so every LtConstraint holds, yet its IS_HALFWORD send carries the
+/// out-of-range value `p−1` with multiplicity +1. This is the carrier that cancels
+/// a twin's `IS_HALF[μ=p−1]` bound send — no mock, no other table needed.
+fn p_minus_1_carrier() -> (LtOperation, Row) {
+    let op = LtOperation::new(0xFFFF, 0, false);
+    let mut row = honest_row(&op);
+    assert_eq!(row[cols::LHS_SUB_RHS_0], FE::from(0xFFFFu64));
+    assert_eq!(row[cols::LHS_SUB_RHS_1], FE::zero());
+    row[cols::LHS_SUB_RHS_0] = -FE::one(); // p−1
+    row[cols::LHS_SUB_RHS_1] = FE::one(); //  (p−1) + 2^16 = 0xFFFF, carry unchanged
+    (op, row)
 }
 
 /// Positive control: honest LT rows answering the CPU verify. Without this, a
@@ -303,4 +335,41 @@ fn regression_negative_mu_twin_cannot_forge_5_lt_3() {
     let carrier = LtOperation::new(HALF, 0, false);
     let rows = [a, twin_row(&carrier, HALF), honest_row(&carrier)];
     assert!(!prove_and_verify(&rows, &[alu_tuple(&op, 1)], &[]));
+}
+
+/// Regression: the in-table carrier that defeated the OLD `IS_HALF[μ]` bound no
+/// longer works now that the μ bound is on ARE_BYTES.
+///
+/// The four-row forgery of `5 < 3 = 1`:
+/// - A: the attacked `5<3` row forced to `lt=1` (high diff word 2^32, `sub_3=2^16`).
+/// - T: a `μ=−1` twin of `2^16 < 0` with `sub_0=2^16`, absorbing A's `IS_HALF[2^16]`.
+/// - D: the honest `2^16 < 0` row, cancelling T on the ALU bus.
+/// - C: a carrier (`sub_0=p−1`) that used to cancel T's bound send on IS_HALF.
+///
+/// With the bound on ARE_BYTES, T's `μ=p−1` send lands on `ARE_BYTES[p−1]` (out
+/// of byte range, no receiver) and C's `IS_HALF[p−1]` is now itself uncancelled:
+/// both buses reject. A limb (IS_HALF) carrier can no longer reach the bound.
+#[test]
+fn are_bytes_bound_resists_in_table_carrier() {
+    let op_a = LtOperation::new(5, 3, false);
+    let mut a = honest_row(&op_a);
+    a[cols::LT] = FE::one();
+    a[cols::OUT] = FE::one();
+    a[cols::LHS_SUB_RHS_2] = FE::zero();
+    a[cols::LHS_SUB_RHS_3] = FE::from(1u64 << 16);
+
+    let carrier = LtOperation::new(1 << 16, 0, false);
+    let t = twin_row(&carrier, 1 << 16);
+    let d = honest_row(&carrier);
+
+    let (op_c, c) = p_minus_1_carrier();
+
+    let rows = [a, t, d, c];
+    let cpu = [alu_tuple(&op_a, 1), alu_tuple(&op_c, honest_out(&op_c))];
+    let verified = prove_and_verify(&rows, &cpu, &[]);
+    println!("LT 5<3=1 with in-table p-1 carrier verified = {verified}");
+    assert!(
+        !verified,
+        "carrier no longer defeats the ARE_BYTES-bus bound"
+    );
 }

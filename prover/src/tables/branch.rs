@@ -150,12 +150,12 @@ impl BranchOperation {
     }
 }
 
-/// Largest per-row multiplicity: `μ` is range-checked to a halfword
-/// (`IS_HALF[μ]`, weighted by μ), so a row holds at most this many lookups. The
+/// Largest per-row multiplicity: `μ` is range-checked to a byte
+/// (`IS_BYTE[μ]`, weighted by μ), so a row holds at most this many lookups. The
 /// bound keeps μ non-negative: without it a `μ = −1` twin of an honest row
 /// cancels it on the BRANCH bus while *receiving* its range lookups, absorbing
 /// another row's out-of-range limb (same bug as LT).
-pub const MU_MAX: u64 = (1 << 16) - 1;
+pub const MU_MAX: u64 = (1 << 8) - 1;
 
 /// Deduplicates BRANCH operations into trace rows: `(pc, offset, register,
 /// jalr) -> μ`, splitting an op over several rows when its count exceeds
@@ -246,7 +246,7 @@ pub fn generate_branch_trace(
 /// - **Sends** BYTE_ALU[AND] lookup for LSB masking
 ///   (next_pc_low[0] = unmasked_low_byte & 254)
 /// - **Sends** IS_HALFWORD lookups for next_pc_high[0..3] range checks and for
-///   the μ multiplicity bound
+///   (next_pc_high limbs); ARE_BYTES for the μ multiplicity bound
 /// - **Receives** BRANCH lookups from CPU table
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
@@ -307,20 +307,23 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             }],
         ),
-        // IS_HALF[μ] | μ. Every lookup here fires with μ, so μ itself must be
+        // ARE_BYTES[μ, 0] | μ. Every lookup here fires with μ, so μ itself must be
         // bounded and non-negative. Otherwise a μ = −1 twin of an honest row
         // cancels it on the BRANCH bus while *receiving* its range lookups and
         // absorbs an out-of-range IS_HALFWORD sent by any row (same as LT). Sent
         // with itself as multiplicity: `k` rows holding an out-of-range `v` put
-        // weight `k·v ≠ 0` on a tuple IS_HALF has no row for, while padding
+        // weight `k·v ≠ 0` on a byte tuple ARE_BYTES has no row for, while padding
         // (μ = 0) contributes nothing. See `MU_MAX`.
         BusInteraction::sender(
-            BusId::IsHalfword,
+            BusId::AreBytes,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
-                start_column: cols::MU,
-                packing: Packing::Direct,
-            }],
+            vec![
+                BusValue::Packed {
+                    start_column: cols::MU,
+                    packing: Packing::Direct,
+                },
+                BusValue::constant(0),
+            ],
         ),
         // BRANCH[next_pc; pc, offset, register, JALR] (receiver)
         // Signature: [next_pc (DWordWL), pc (DWordWL), offset (DWordWL), register (DWordWL), JALR (Bit)]

@@ -168,6 +168,11 @@ fn prove_and_verify(rows: &[Row], victim: Option<u64>) -> bool {
         if *m == FE::zero() {
             continue;
         }
+        // A real byte table has rows only for [0, 256); the μ bound sends
+        // ARE_BYTES[μ, 0], so an out-of-range μ (p−1) has no receiver.
+        if *bus == BusId::AreBytes as u64 && tuple[0] >= 256 {
+            continue;
+        }
         if *bus == half_id && tuple[0] >= HALF {
             continue;
         }

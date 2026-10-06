@@ -1732,15 +1732,11 @@ pub(crate) fn collect_bitwise_from_lt(
         ));
     }
 
-    // IS_HALF[μ] | μ: each row sends its own μ, μ times (padding sends nothing),
+    // IS_BYTE[μ] | μ: each row sends its own μ, μ times (padding sends nothing),
     // over exactly the rows `generate_lt_trace` builds for each chunk.
     for chunk in lt_ops.chunks(max_rows_lt) {
         for (_, mu) in lt::dedup_lt_rows(chunk) {
-            let op = BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (mu & 0xFF) as u8,
-                ((mu >> 8) & 0xFF) as u8,
-            );
+            let op = BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, mu as u8);
             bitwise_ops.extend(std::iter::repeat_n(op, mu as usize));
         }
     }
@@ -1755,7 +1751,7 @@ pub(crate) fn collect_bitwise_from_lt(
 /// and IS_B20 lookups for carry range checks.
 ///
 /// IS_HALF and IS_B20 are emitted once per raw op. The per-row lookups (MSB16
-/// and the IS_HALF[μ_lo]/IS_HALF[μ_hi] multiplicity bounds) are counted over the
+/// and the IS_BYTE[μ_lo]/IS_BYTE[μ_hi] multiplicity bounds) are counted over the
 /// rows of each `max_rows_mul` chunk, mirroring `chunk_and_generate_optional` —
 /// a unique signed op that spans two instances is sent twice and must be tallied
 /// twice.
@@ -1816,21 +1812,15 @@ pub(crate) fn collect_bitwise_from_mul(
     }
 
     // Per-row lookups, over exactly the rows `generate_mul_trace` builds for each
-    // `max_rows_mul` chunk (`chunk_and_generate_optional`): IS_HALF[μ_lo] and
-    // IS_HALF[μ_hi] are sent μ_lo / μ_hi times (so padding rows send nothing), and
+    // `max_rows_mul` chunk (`chunk_and_generate_optional`): IS_BYTE[μ_lo] and
+    // IS_BYTE[μ_hi] are sent μ_lo / μ_hi times (so padding rows send nothing), and
     // MSB16 fires once per row whose sign flag is set — a unique signed op spanning two
     // instances, or split over two rows by `mul::MU_MAX`, is sent once per row.
-    let halfword = |v: u64| {
-        BitwiseOperation::halfword(
-            BitwiseOperationType::IsHalf,
-            (v & 0xFF) as u8,
-            ((v >> 8) & 0xFF) as u8,
-        )
-    };
+    let mu_byte = |v: u64| BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, v as u8);
     for chunk in mul_ops.chunks(max_rows_mul) {
         for (op, mu) in &mul::dedup_mul_rows(chunk) {
             for m in [mu.mu_lo, mu.mu_hi] {
-                bitwise_ops.extend(std::iter::repeat_n(halfword(m), m as usize));
+                bitwise_ops.extend(std::iter::repeat_n(mu_byte(m), m as usize));
             }
             if op.lhs_signed {
                 let lhs_3 = ((op.lhs >> 48) & 0xFFFF) as u16;
@@ -1864,7 +1854,7 @@ pub(crate) fn collect_bitwise_from_mul(
 /// are collected here alongside the constraint-level ones.
 ///
 /// IS_HALF and ZERO (C8/C20) are emitted once per raw op. MSB16, the
-/// NEG-template ZERO lookups (C3/C5) and the IS_HALF[μ_q]/IS_HALF[μ_r]
+/// NEG-template ZERO lookups (C3/C5) and the IS_BYTE[μ_q]/IS_BYTE[μ_r]
 /// multiplicity bounds are counted over the rows of each `max_rows_dvrm` chunk,
 /// mirroring `chunk_and_generate_optional`.
 ///
@@ -1954,22 +1944,16 @@ pub(crate) fn collect_bitwise_from_dvrm(
     }
 
     // Per-row lookups, over exactly the rows `generate_dvrm_trace` builds for each
-    // `max_rows_dvrm` chunk (`chunk_and_generate_optional`): IS_HALF[μ_q] and
-    // IS_HALF[μ_r] sent μ_q / μ_r times (padding rows send nothing); MSB16 (Column(SIGNED))
+    // `max_rows_dvrm` chunk (`chunk_and_generate_optional`): IS_BYTE[μ_q] and
+    // IS_BYTE[μ_r] sent μ_q / μ_r times (padding rows send nothing); MSB16 (Column(SIGNED))
     // and the NEG-template ZERO lookups (Column(SIGN_R)/Column(SIGN_D)) once per
     // row whose bit is set. An op split over two rows by `dvrm::MU_MAX` sends
     // them once per row.
-    let halfword = |v: u64| {
-        BitwiseOperation::halfword(
-            BitwiseOperationType::IsHalf,
-            (v & 0xFF) as u8,
-            ((v >> 8) & 0xFF) as u8,
-        )
-    };
+    let mu_byte = |v: u64| BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, v as u8);
     for chunk in dvrm_ops.chunks(max_rows_dvrm) {
         for (op, mu) in &dvrm::dedup_dvrm_rows(chunk) {
             for m in [mu.mu_q, mu.mu_r] {
-                bitwise_ops.extend(std::iter::repeat_n(halfword(m), m as usize));
+                bitwise_ops.extend(std::iter::repeat_n(mu_byte(m), m as usize));
             }
 
             if op.signed {
@@ -2100,15 +2084,11 @@ pub(crate) fn collect_bitwise_from_branch(
         ));
     }
 
-    // IS_HALF[μ] | μ: each row sends its own μ, μ times (padding sends nothing),
+    // IS_BYTE[μ] | μ: each row sends its own μ, μ times (padding sends nothing),
     // over exactly the rows `generate_branch_trace` builds for each chunk.
     for chunk in branch_ops.chunks(max_rows_branch) {
         for (_, mu) in branch::dedup_branch_rows(chunk) {
-            let op = BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (mu & 0xFF) as u8,
-                ((mu >> 8) & 0xFF) as u8,
-            );
+            let op = BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, mu as u8);
             bitwise_ops.extend(std::iter::repeat_n(op, mu as usize));
         }
     }

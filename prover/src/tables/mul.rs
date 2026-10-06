@@ -25,8 +25,8 @@
 //!
 //! ## Bus Interactions
 //! - Sender: MSB16 (×2 for sign extraction)
-//! - Sender: IS_HALF (×16 for lhs/rhs input and lo/hi output range checks,
-//!   ×2 for the μ_lo/μ_hi multiplicity bounds)
+//! - Sender: IS_HALF (×16 for lhs/rhs input and lo/hi output range checks)
+//! - Sender: ARE_BYTES (×2 for the μ_lo/μ_hi multiplicity bounds)
 //! - Sender: IS_B20 (×4 for carry range checks)
 //! - Receiver: ALU (×2 for lo and hi results — every MUL lookup, CPU
 //!   MUL/MULH dispatch and dvrm's internal `d*q` consistency)
@@ -283,11 +283,11 @@ impl MulOperation {
 // =========================================================================
 
 /// Largest per-row multiplicity: `μ_lo` and `μ_hi` are each range-checked to a
-/// halfword (`IS_HALF[μ]`, weighted by μ), so a row holds at most this many
+/// byte (`IS_BYTE[μ]`, weighted by μ), so a row holds at most this many
 /// lookups of each kind. The bound is what makes `μ_lo + μ_hi = 0` imply
 /// `μ_lo = μ_hi = 0`: without it a `μ_lo = 1, μ_hi = −1` row receives a lookup
 /// while sending none of its range checks.
-pub const MU_MAX: u64 = (1 << 16) - 1;
+pub const MU_MAX: u64 = (1 << 8) - 1;
 
 /// Deduplicates MUL operations into trace rows: `(lhs, lhs_signed, rhs,
 /// rhs_signed) -> (μ_lo, μ_hi)`, splitting an op over several rows when a count
@@ -386,7 +386,7 @@ pub fn generate_mul_trace(
 /// The MUL table:
 /// - **Sends** MSB16 lookups for sign bit extraction (×2)
 /// - **Sends** IS_HALF lookups for lhs/rhs input and lo/hi output range checks (×16)
-///   and for the μ_lo/μ_hi multiplicity bounds (×2)
+/// - **Sends** ARE_BYTES[μ_lo, 0] and ARE_BYTES[μ_hi, 0] to bound the multiplicities
 /// - **Sends** IS_B20 lookups for carry range checks (×4)
 /// - **Receives** MUL lookups from CPU table (×2: lo and hi)
 pub fn bus_interactions() -> Vec<BusInteraction> {
@@ -428,24 +428,27 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // IS_HALF[μ_lo] | μ_lo,  IS_HALF[μ_hi] | μ_hi.
+    // ARE_BYTES[μ_lo, 0] | μ_lo,  ARE_BYTES[μ_hi, 0] | μ_hi.
     // Every check below fires with μ_lo + μ_hi, so the multiplicities themselves
     // must be bounded and non-negative. Otherwise μ_lo = 1, μ_hi = −1 receives a
     // `lo` lookup with all range checks off (forged product),
     // and an honest μ_hi = 1 copy of the row cancels the stray −1. Each μ is sent
     // with itself as multiplicity: `k` rows holding an out-of-range value `v`
-    // put weight `k·v ≠ 0` on a tuple IS_HALF has no row for, while padding
+    // put weight `k·v ≠ 0` on a byte tuple ARE_BYTES has no row for, while padding
     // (μ = 0) contributes nothing, so an empty instance still matches an absent
     // one. See `MU_MAX`.
     // -------------------------------------------------------------------------
     for col in [cols::MU_LO, cols::MU_HI] {
         interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
+            BusId::AreBytes,
             Multiplicity::Column(col),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
+            vec![
+                BusValue::Packed {
+                    start_column: col,
+                    packing: Packing::Direct,
+                },
+                BusValue::constant(0),
+            ],
         ));
     }
 
