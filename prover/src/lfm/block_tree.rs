@@ -132,9 +132,17 @@ pub fn posture_line() -> String {
 
 // ================================ the knobs ===============================
 
-/// Threads for the ELF constants beside the base by default: FAST 393 measured
-/// the harvest −1.87 s and the whole −1.80 s at four, the base +0.02 s.
+/// Threads of the pool beside the base by default: FAST 393 measured the
+/// harvest −1.87 s and the whole −1.80 s at four, the base +0.02 s, with the ELF
+/// constants on it.
 const ELF_BESIDE_THREADS: usize = 4;
+
+/// Threads of the ELF constants' own pool by default (`NOEPOCH_ELF_CONSTS`).
+/// On the four of the pool beside the base, one page at a time, they took
+/// 12.9 s against P1's 12.2 s 1× base: the harvest waited 3.7 s and every leaf
+/// program came late (RYZEN 011). Eight, with the pages at once, are sized to
+/// finish inside that base.
+const ELF_CONSTS_THREADS: usize = 8;
 
 /// How the tree's programs come ahead (`NOEPOCH_TREE_AHEAD`). Unset or `pipe`,
 /// the default (FAST 451: recursion −2.56 s): the leaf programs are emitted
@@ -185,10 +193,17 @@ pub enum LateMode {
 /// Every knob the whole block reads, once.
 #[derive(Clone, Debug)]
 pub struct BlockTreeConfig {
-    /// `NOEPOCH_ELF_BESIDE=<threads>`: threads for the ELF constants beside the
-    /// base, unset meaning [`ELF_BESIDE_THREADS`]; `0` (`None`) computes them
-    /// inline in the harvest.
+    /// `NOEPOCH_ELF_BESIDE=<threads>`: threads of the pool beside the base that
+    /// takes the ELF constants and emits the leaf programs, unset meaning
+    /// [`ELF_BESIDE_THREADS`]; `0` (`None`) computes the constants inline in the
+    /// harvest.
     pub elf_beside: Option<usize>,
+    /// `NOEPOCH_ELF_CONSTS=<threads>`: beside the base, the ELF constants are
+    /// computed on a host-only pool of their own with that many threads, DECODE
+    /// and the data pages at once, unset meaning [`ELF_CONSTS_THREADS`]; `0`
+    /// (`None`) computes them on the pool beside the base, one page at a time,
+    /// before it emits.
+    pub elf_consts: Option<usize>,
     /// `NOEPOCH_TREE_AHEAD`: `0` (`None`), `1` or `pipe` (the default). Needs
     /// the ELF constants beside the base.
     pub tree_ahead: Option<AheadMode>,
@@ -248,6 +263,7 @@ impl BlockTreeConfig {
         let var = |name: &str| std::env::var(name).ok();
         Ok(Self {
             elf_beside: parse_elf_beside(var("NOEPOCH_ELF_BESIDE").as_deref())?,
+            elf_consts: parse_elf_consts(var("NOEPOCH_ELF_CONSTS").as_deref())?,
             tree_ahead: parse_tree_ahead(var("NOEPOCH_TREE_AHEAD").as_deref())?,
             emit_threads: parse_emit_pool(var("NOEPOCH_EMIT_POOL").as_deref())?,
             emit_window: parse_emit_window(var("NOEPOCH_TREE_EMIT_WINDOW").as_deref())?,
@@ -269,6 +285,16 @@ fn parse_elf_beside(v: Option<&str>) -> Result<Option<usize>, String> {
             .parse::<usize>()
             .map_err(|_| format!("NOEPOCH_ELF_BESIDE must be a thread count, got `{v}`"))?,
         _ => ELF_BESIDE_THREADS,
+    };
+    Ok(Some(threads).filter(|&t| t > 0))
+}
+
+fn parse_elf_consts(v: Option<&str>) -> Result<Option<usize>, String> {
+    let threads = match v {
+        Some(v) if !v.is_empty() => v
+            .parse::<usize>()
+            .map_err(|_| format!("NOEPOCH_ELF_CONSTS must be a thread count, got `{v}`"))?,
+        _ => ELF_CONSTS_THREADS,
     };
     Ok(Some(threads).filter(|&t| t > 0))
 }
@@ -1294,9 +1320,14 @@ pub fn prove_block_tree(
 
     // ---- the ELF constants beside the base (`NOEPOCH_ELF_BESIDE=<threads>`, four
     // by default): the plan's ELF-only input (DECODE's root, recomputed on the
-    // host) computed on a pool of its own while the base proves, joined by the
-    // harvest. `NOEPOCH_ELF_BESIDE=0`: the harvest computes it inline.
+    // host) computed off the provers' pool while the base proves, joined by the
+    // harvest. `NOEPOCH_ELF_BESIDE=0`: the harvest computes it inline. Beside the
+    // base they take a pool of their own (`NOEPOCH_ELF_CONSTS=<threads>`, eight by
+    // default), so the leaf programs, which need them, are not held behind a
+    // narrow one-page-at-a-time compute; `NOEPOCH_ELF_CONSTS=0` computes them on
+    // the pool beside the base, as before.
     let elf_beside = cfg.elf_beside;
+    let elf_consts = cfg.elf_consts;
     // `NOEPOCH_TREE_AHEAD` (the pipeline by default): the same pool then emits the
     // leaf programs (with `1`, every tree program and its artifacts, on the host)
     // from the shape the base hands out before its prove, and the levels prove
@@ -1335,7 +1366,16 @@ pub fn prove_block_tree(
                     return None;
                 }
             };
-            let consts = pool.install(|| ElfConstants::compute(&elf, &opts));
+            let consts = match elf_consts {
+                Some(own) => rayon::ThreadPoolBuilder::new()
+                    .num_threads(own)
+                    .thread_name(|i| format!("elf-consts-{i}"))
+                    .start_handler(|_| super::commit::mark_thread_host_only())
+                    .build()
+                    .map_err(|e| format!("the ELF constants' pool builds: {e}"))
+                    .and_then(|own| own.install(|| ElfConstants::compute_parallel(&elf, &opts))),
+                None => pool.install(|| ElfConstants::compute(&elf, &opts)),
+            };
             let secs = t.elapsed().as_secs_f64();
             let mut job = None;
             let mut late_line = None;
@@ -1518,9 +1558,14 @@ pub fn prove_block_tree(
                 .recv()
                 .map_err(|_| "the ELF constants thread stopped".to_string())?;
             sink.line(&format!(
-                "   ELF constants beside the base: {secs:.2}s on {} thread(s), joined after the base, \
-                 waited {:.2}s (counted in the harvest)",
-                elf_beside.unwrap_or(0),
+                "   ELF constants beside the base: {secs:.2}s on {} thread(s) ({}), joined after the \
+                 base, waited {:.2}s (counted in the harvest)",
+                elf_consts.or(elf_beside).unwrap_or(0),
+                if elf_consts.is_some() {
+                    "their own pool, the pages at once"
+                } else {
+                    "the pool beside the base, a page at a time"
+                },
                 tj.elapsed().as_secs_f64()
             ));
             if let Some((shape, derived, secs, done_at)) = ahead {
@@ -2089,6 +2134,12 @@ mod tests {
         assert_eq!(parse_elf_beside(Some("0")), Ok(None));
         assert_eq!(parse_elf_beside(Some("2")), Ok(Some(2)));
         assert!(parse_elf_beside(Some("four")).is_err());
+
+        assert_eq!(parse_elf_consts(None), Ok(Some(ELF_CONSTS_THREADS)));
+        assert_eq!(parse_elf_consts(Some("")), Ok(Some(ELF_CONSTS_THREADS)));
+        assert_eq!(parse_elf_consts(Some("0")), Ok(None));
+        assert_eq!(parse_elf_consts(Some("12")), Ok(Some(12)));
+        assert!(parse_elf_consts(Some("eight")).is_err());
 
         assert_eq!(parse_tree_ahead(None), Ok(Some(AheadMode::Pipe)));
         assert_eq!(parse_tree_ahead(Some("pipe")), Ok(Some(AheadMode::Pipe)));

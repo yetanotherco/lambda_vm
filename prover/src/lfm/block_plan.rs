@@ -178,8 +178,10 @@ pub struct PlannedInstance {
 /// DECODE's and the ELF data pages' preprocessed roots, recomputed on the host
 /// from the ELF (never a prover's or a device's copy, and never the
 /// process-wide record of one) — so a caller can compute them before the
-/// block's shape exists. Constructed only by [`Self::compute`], and tied to the
-/// ELF digest and the options it was computed under.
+/// block's shape exists. Constructed only by [`Self::compute`] (or
+/// [`Self::compute_parallel`]), and tied to the ELF digest and the options it
+/// was computed under.
+#[derive(Debug, PartialEq, Eq)]
 pub struct ElfConstants {
     elf_digest: [u8; 32],
     /// The options, as their `Debug` rendering: every field the roots depend on.
@@ -192,21 +194,38 @@ pub struct ElfConstants {
 impl ElfConstants {
     /// Compute the constants for `elf_bytes` under `opts`.
     pub fn compute(elf_bytes: &[u8], opts: &crate::ProofOptions) -> Result<Self, String> {
+        Self::compute_with(elf_bytes, opts, false)
+    }
+
+    /// [`Self::compute`] with DECODE's root and every data page's computed at
+    /// once on the caller's pool, the pages kept in ELF order: the same
+    /// constants. The block ELF's twelve 2^18-row pages are most of the work and
+    /// [`Self::compute`] commits them one at a time, so a wider pool barely
+    /// shortens it.
+    pub fn compute_parallel(elf_bytes: &[u8], opts: &crate::ProofOptions) -> Result<Self, String> {
+        Self::compute_with(elf_bytes, opts, true)
+    }
+
+    fn compute_with(
+        elf_bytes: &[u8],
+        opts: &crate::ProofOptions,
+        parallel: bool,
+    ) -> Result<Self, String> {
         let elf = executor::elf::Elf::load(elf_bytes).map_err(|e| format!("ELF: {e}"))?;
-        let decode = crate::tables::decode::commitment_from_elf(&elf, opts)
-            .map_err(|e| format!("DECODE commitment: {e:?}"))?;
-        let pages = crate::tables::trace_builder::Traces::page_configs_from_elf(&elf)
-            .iter()
-            .filter(|c| c.init_values.is_some() && !c.is_private_input)
-            .map(|c| {
-                let root = crate::tables::page::compute_precomputed_commitment_with(
-                    c,
-                    opts,
-                    stark::leaf_layout::LeafLayout::RowPair,
-                );
-                (c.page_base, root)
-            })
-            .collect();
+        let configs = crate::tables::trace_builder::Traces::page_configs_from_elf(&elf);
+        let decode = || {
+            crate::tables::decode::commitment_from_elf(&elf, opts)
+                .map_err(|e| format!("DECODE commitment: {e:?}"))
+        };
+        #[cfg(feature = "parallel")]
+        let (decode, pages) = if parallel {
+            let (decode, pages) = rayon::join(decode, || data_page_roots(&configs, opts, true));
+            (decode?, pages)
+        } else {
+            (decode()?, data_page_roots(&configs, opts, false))
+        };
+        #[cfg(not(feature = "parallel"))]
+        let (decode, pages) = (decode()?, data_page_roots(&configs, opts, parallel));
         Ok(Self {
             elf_digest: crate::statement::elf_digest(elf_bytes),
             opts: format!("{opts:?}"),
@@ -214,6 +233,35 @@ impl ElfConstants {
             pages,
         })
     }
+}
+
+/// `(page base, row-pair root)` of each ELF data page among `configs` (those
+/// with data, not private input), in their order; `parallel` commits them at
+/// once on the caller's pool.
+fn data_page_roots(
+    configs: &[crate::tables::page::PageConfig],
+    opts: &crate::ProofOptions,
+    parallel: bool,
+) -> Vec<(u64, Commitment)> {
+    let data: Vec<_> = configs
+        .iter()
+        .filter(|c| c.init_values.is_some() && !c.is_private_input)
+        .collect();
+    let page = |c: &&crate::tables::page::PageConfig| {
+        let root = crate::tables::page::compute_precomputed_commitment_with(
+            c,
+            opts,
+            stark::leaf_layout::LeafLayout::RowPair,
+        );
+        (c.page_base, root)
+    };
+    #[cfg(feature = "parallel")]
+    if parallel {
+        use rayon::prelude::*;
+        return data.par_iter().map(page).collect();
+    }
+    let _ = parallel;
+    data.iter().map(page).collect()
 }
 
 /// Every program of a block's tree, derived from the trusted ELF, the options
@@ -1181,5 +1229,47 @@ mod tests {
             }
         });
         assert_eq!(failed, Err("item 9".to_string()));
+    }
+
+    /// The data pages' roots committed at once are the ones committed a page at
+    /// a time, in the same order, at any pool width; a zero page or a private
+    /// input page has no root here.
+    #[test]
+    fn the_data_page_roots_at_once_are_the_page_at_a_time_ones() {
+        use crate::tables::page::PageConfig;
+        let opts = crate::recursion::Preset::Blowup4.options();
+        let bytes = |seed: u8, n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+                .collect()
+        };
+        let configs = vec![
+            PageConfig::with_data(0x0, bytes(1, 4096)),
+            PageConfig::zero_init(0x40000),
+            PageConfig::with_data(0x80000, bytes(2, 300)),
+            PageConfig::with_private_input(0xff000000, bytes(4, 64)),
+            PageConfig::with_data(0xc0000, bytes(3, 70_000)),
+        ];
+        let serial = data_page_roots(&configs, &opts, false);
+        assert_eq!(
+            serial.iter().map(|(base, _)| *base).collect::<Vec<_>>(),
+            vec![0x0, 0x80000, 0xc0000],
+            "the data pages, in order"
+        );
+        assert!(
+            serial[0].1 != serial[1].1 && serial[1].1 != serial[2].1,
+            "each page its own root"
+        );
+        for threads in [1, 3, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("a pool");
+            assert_eq!(
+                pool.install(|| data_page_roots(&configs, &opts, true)),
+                serial,
+                "{threads} thread(s)"
+            );
+        }
     }
 }
