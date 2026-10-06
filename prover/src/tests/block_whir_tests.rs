@@ -1370,6 +1370,63 @@ fn the_shadow_stays_off_where_it_cannot_rebuild_the_chunks() {
     }
 }
 
+/// ★ Phase B's order moves no byte (D-WHIR-NODISK §2.3): each group proves on
+/// its own fork `S_post ‖ g`, so taking the groups reversed, odd ones first, or
+/// a group's spilled columns read back out of group order, proves the bytes of
+/// group order under the deterministic grind, with the same partition, and
+/// verifies; an order that is not a permutation of the groups is refused.
+#[test]
+fn phase_b_in_any_order_proves_the_same_bytes() {
+    use crate::block_whir::BlockSpillPolicy;
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let proved = |order: Option<fn(usize) -> Vec<usize>>, spill: BlockSpillPolicy| {
+        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+        o.spill = spill;
+        prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                phase_b_order: order,
+                ..Deviations::default()
+            },
+        )
+        .map(|(proof, _)| proof)
+    };
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let in_order = proved(None, BlockSpillPolicy::Off).expect("prove");
+    assert!(in_order.groups.len() > 3, "{} groups", in_order.groups.len());
+    let reversed: fn(usize) -> Vec<usize> = |n| (0..n).rev().collect();
+    let odd_first: fn(usize) -> Vec<usize> = |n| (1..n).step_by(2).chain((0..n).step_by(2)).collect();
+    for (what, order, spill) in [
+        ("reversed", reversed, BlockSpillPolicy::Off),
+        ("odd first", odd_first, BlockSpillPolicy::Off),
+        ("reversed, spilled", reversed, BlockSpillPolicy::Always),
+    ] {
+        let proof = proved(Some(order), spill).expect("prove");
+        assert_eq!(proof.groups, in_order.groups, "{what}: the partition");
+        assert!(verify(&proof, &elf, &format), "{what}");
+        if crypto::grinding::deterministic() {
+            assert_eq!(bytes(&proof), bytes(&in_order), "{what}: the proof");
+        }
+    }
+    let twice: fn(usize) -> Vec<usize> = |n| std::iter::repeat_n(0, n).collect();
+    let short: fn(usize) -> Vec<usize> = |n| (1..n).collect();
+    for (what, order) in [("a group twice", twice), ("a group left out", short)] {
+        assert!(
+            proved(Some(order), BlockSpillPolicy::Off).is_err(),
+            "{what}: proved"
+        );
+    }
+}
+
 /// The streamed chunks laid out on three threads, and the rest of the run
 /// packed as it is laid out, are packed in the inline order all the same: the
 /// same groups and table counts as laid out on one thread, and the proofs
