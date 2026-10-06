@@ -3392,6 +3392,18 @@ fn the_block_tree_composes_to_a_top_node() {
         rb.plan.partition().num_leaves(),
         rb.plan.cost_model()
     );
+    // The base's main-trace roots in AIR order, as one digest: two runs that
+    // build the same traces (under `LAMBDA_VM_FIXED_TRACE_HASH=1`) print the
+    // same one, whatever their grinding.
+    let mut roots = blake3::Hasher::new();
+    for root in &rb.main_roots {
+        roots.update(root);
+    }
+    println!(
+        "   BLOCK MAIN ROOTS: {} ({} roots)",
+        &roots.finalize().to_hex()[..32],
+        rb.main_roots.len()
+    );
     // `LAMBDA_VM_ALLOC_PURGE=tree` (or `all`): the tree's freed pages back to
     // the OS before the verifier derives its programs (after the whole run's
     // stopwatch).
