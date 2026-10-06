@@ -82,6 +82,38 @@ pub struct ProofOptions {
     pub format: ProofFormat,
 }
 
+/// A base proof's commitment geometry: which hash commits it and, for an
+/// arity-4 hash, the height of its Merkle caps in 4-ary levels (the binary cap
+/// policies price binary trees only). The WHIR block path dispatches on it
+/// (`prover::block_whir`): a verifier-side constant from the caller, never
+/// read from a proof or the environment, never serialized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BaseFormat {
+    pub hash: crate::config::CommitmentHash,
+    pub arity4_cap: CapPolicy,
+}
+
+impl BaseFormat {
+    /// RPX256 over binary trees (the format's binary cap applies): today.
+    pub const RPX: Self = Self {
+        hash: crate::config::CommitmentHash::Rpx256,
+        arity4_cap: CapPolicy::Off,
+    };
+
+    /// ZisK's Poseidon1 over 4-ary trees, the WHIR block's: caps at 4-ary
+    /// height 2 (D-WHIR-P1 D2, tag `C2`).
+    pub const P1_WHIR: Self = Self {
+        hash: crate::config::CommitmentHash::Poseidon1,
+        arity4_cap: CapPolicy::Fixed(2),
+    };
+}
+
+impl Default for BaseFormat {
+    fn default() -> Self {
+        Self::RPX
+    }
+}
+
 /// The proof-format levers of a univariate STARK proof. Grouped so a literal
 /// `ProofOptions` names the format in one line (`format: ProofFormat::DEFAULT`)
 /// and a lever added later touches this struct only.

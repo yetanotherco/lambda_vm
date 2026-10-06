@@ -51,6 +51,8 @@ use crate::zf_format::ZfFormat;
 use crate::{
     Error, FIXED_TABLE_COUNT, MaxRowsConfig, ProofOptions, RuntimePageRange, TableCounts, VmAirs,
 };
+use stark::config::CommitmentHash;
+use stark::proof::options::{BaseFormat, CapPolicy};
 
 mod memlog;
 pub mod regen;
@@ -228,6 +230,74 @@ fn check_group_count(groups: usize, max_groups: usize) -> Result<(), Error> {
         )));
     }
     Ok(())
+}
+
+/// Which WHIR configuration a block format's base names
+/// ([`checked_base`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockHash {
+    /// A binary hash: the process's WHIR hash, keccak or RPX
+    /// ([`crate::with_whir_hash`]), as before the base was a format field.
+    Binary,
+    /// ZisK's Poseidon1 ([`multilinear::whir_hash::P1Whir`]).
+    Poseidon1,
+}
+
+/// The tallest 4-ary cap a Poseidon1 base may name: the trees clamp a taller
+/// one (`multilinear::whir_commit::tree_cap_height`), so [`checked_base`]
+/// refuses it rather than let the tag name a height no tree has.
+pub const MAX_P1_CAP_HEIGHT: usize = crypto::merkle_tree::cap::MAX_CAP_HEIGHT / 2;
+
+/// The configuration `base` names, or a typed refusal: RPX (today) or
+/// Poseidon1, whose cap must be one its trees run at.
+pub fn checked_base(base: &BaseFormat) -> Result<BlockHash, Error> {
+    match base.hash {
+        CommitmentHash::Rpx256 => Ok(BlockHash::Binary),
+        CommitmentHash::Poseidon1 => match base.arity4_cap {
+            CapPolicy::Fixed(c) if c as usize > MAX_P1_CAP_HEIGHT => Err(Error::Prover(format!(
+                "a Poseidon1 base capped at 4-ary height {c}: its trees clamp the cap at \
+                 {MAX_P1_CAP_HEIGHT}"
+            ))),
+            _ => Ok(BlockHash::Poseidon1),
+        },
+        other => Err(Error::Prover(format!(
+            "a block's base hash is RPX or Poseidon1, not {other:?}"
+        ))),
+    }
+}
+
+/// The block statement's leading tag under `base`: RPX keeps
+/// [`MULTILINEAR_BLOCK_TAG`] byte for byte; Poseidon1 absorbs
+/// `LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V1/P1W16/C<h>`, the effective cap:
+/// `C0` uncapped (`Off` and `Fixed(0)`), `C<h>` at a fixed height and `Cauto`
+/// under `Auto`, so no two geometries share a tag (REV-P1-JUDGE F2). Domain
+/// separation only: the dispatch is what keeps the bases apart.
+pub fn block_statement_tag(base: &BaseFormat) -> Vec<u8> {
+    #[cfg(test)]
+    if P1_TAG_OMITTED.with(std::cell::Cell::get) {
+        return MULTILINEAR_BLOCK_TAG.to_vec();
+    }
+    match base.hash {
+        CommitmentHash::Poseidon1 => {
+            let height = match base.arity4_cap {
+                CapPolicy::Off | CapPolicy::Fixed(0) => "0".to_string(),
+                CapPolicy::Fixed(c) => c.to_string(),
+                CapPolicy::Auto => "auto".to_string(),
+            };
+            let mut tag = MULTILINEAR_BLOCK_TAG.to_vec();
+            tag.extend_from_slice(format!("/P1W16/C{height}").as_bytes());
+            tag
+        }
+        _ => MULTILINEAR_BLOCK_TAG.to_vec(),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test only: on this thread, a Poseidon1 statement takes RPX's tag (the
+    /// tag's mutation). Thread-local, so a test that sets it moves no other
+    /// test's statement.
+    pub(crate) static P1_TAG_OMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl BlockFormat {
@@ -1330,6 +1400,7 @@ pub(crate) fn check_chunked_heights(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn absorb_block(
     t: &mut impl IsTranscript<E>,
+    tag: &[u8],
     elf_bytes: &[u8],
     public_output: &[u8],
     table_counts: &TableCounts,
@@ -1341,7 +1412,7 @@ pub(crate) fn absorb_block(
 ) {
     absorb_tagged(
         t,
-        MULTILINEAR_BLOCK_TAG,
+        tag,
         "block",
         &statement::elf_digest(elf_bytes),
         public_output,
@@ -2197,10 +2268,12 @@ pub(crate) fn prove_traces(
             })
             .collect()
     };
-    let proof = crate::with_whir_hash!(|H| {
+    let tag = block_statement_tag(&format.zf.base);
+    let proof = crate::with_block_hash!(format.zf.base, |H| {
         let mut transcript = <H as multilinear::whir_hash::WhirHash>::sponge();
         absorb_block(
             &mut transcript,
+            &tag,
             elf_bytes,
             &public_output,
             &table_counts,
@@ -3500,7 +3573,8 @@ fn prove_streamed(
         options.rest_layout_bytes.unwrap_or(usize::MAX),
     );
     let rest_gate = &rest_gate;
-    crate::with_whir_hash!(|H| {
+    let tag = block_statement_tag(&format.zf.base);
+    crate::with_block_hash!(format.zf.base, |H| {
         let (block, built, laid, executed) = std::thread::scope(|scope| {
             use std::sync::atomic::Ordering::Relaxed;
             // The executor, a window at a time, two windows ahead of the walk.
@@ -4127,6 +4201,7 @@ fn prove_streamed(
         let mut transcript = <H as multilinear::whir_hash::WhirHash>::sponge();
         absorb_block(
             &mut transcript,
+            &tag,
             elf_bytes,
             &laid.public_output,
             &laid.table_counts,
@@ -4424,11 +4499,12 @@ fn prove_streamed(
 /// test can hold the two to the same transcript.
 pub(crate) fn block_statement_bytes(
     statement: BlockStatement<'_>,
+    tag: &[u8],
     elf_digest: &[u8; 32],
     config: &multilinear::whir_chain::ChainConfig,
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(MULTILINEAR_BLOCK_TAG);
+    bytes.extend_from_slice(tag);
     bytes.extend_from_slice(elf_digest);
     bytes.extend_from_slice(&(statement.public_output.len() as u64).to_le_bytes());
     bytes.extend_from_slice(statement.public_output);
@@ -4732,10 +4808,12 @@ pub(crate) fn verify_block_whir_with(
     let statements: Vec<TableStatement<'_, F, E>> = order.iter().map(|&i| statements[i]).collect();
     let prepared_columns = prepared_tables(airs, page_configs, format)?;
 
-    Ok(crate::with_whir_hash!(|H| {
+    let tag = block_statement_tag(&format.zf.base);
+    Ok(crate::with_block_hash!(format.zf.base, |H| {
         let mut transcript = <H as multilinear::whir_hash::WhirHash>::sponge();
         absorb_block(
             &mut transcript,
+            &tag,
             elf_bytes,
             &proof.public_output,
             &proof.table_counts,
