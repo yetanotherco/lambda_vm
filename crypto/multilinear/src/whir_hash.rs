@@ -39,11 +39,16 @@
 //! and it is total in both directions with the pairing asserted at compile time,
 //! so the two enums cannot drift apart or be cross-wired.
 
+use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+use crypto::fiat_shamir::is_transcript::IsTranscript;
+use crypto::fiat_shamir::p1_transcript::{P1Transcript, P1TranscriptHash};
 use crypto::fiat_shamir::transcript_hash::{
-    KeccakTranscriptHash, RpxTranscriptHash, TranscriptHash,
+    HasTranscriptHash, KeccakTranscriptHash, RpxTranscriptHash, TranscriptHash,
 };
+use crypto::merkle_tree::backends::p1::P1BatchBackend;
 use crypto::merkle_tree::backends::types::{BatchKeccak256Backend, BatchRpx256Backend};
 use crypto::merkle_tree::traits::IsMerkleTreeBackend;
+use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::{element::FieldElement, traits::IsField};
 use math::traits::AsBytes;
 
@@ -65,6 +70,8 @@ pub enum DeviceHashKey {
     Keccak256,
     /// RPX256 (XHash12) at both layers.
     Rpx256,
+    /// ZisK's Poseidon1 (width 16, rate 12): the tagged leaf and 4-ary nodes.
+    Poseidon1,
 }
 
 impl DeviceHashKey {
@@ -78,6 +85,18 @@ impl DeviceHashKey {
         match self {
             Self::Keccak256 => math_cuda::DeviceHash::Keccak256,
             Self::Rpx256 => math_cuda::DeviceHash::Rpx256,
+            Self::Poseidon1 => math_cuda::DeviceHash::Poseidon1,
+        }
+    }
+
+    /// Whether the WHIR device paths (`crate::gpu`'s commits, paths, caps,
+    /// kept tops and re-hashes) run this key's kernels. `false` declines the
+    /// device before any launch, so the commitment is built and opened on the
+    /// host: Poseidon1's WHIR arms come with D-WHIR-P1's stage S2.
+    pub const fn has_whir_device_arm(self) -> bool {
+        match self {
+            Self::Keccak256 | Self::Rpx256 => true,
+            Self::Poseidon1 => false,
         }
     }
 
@@ -86,6 +105,7 @@ impl DeviceHashKey {
         match self {
             Self::Keccak256 => "keccak256",
             Self::Rpx256 => "rpx256",
+            Self::Poseidon1 => "poseidon1-w16",
         }
     }
 }
@@ -102,6 +122,10 @@ const _: () = {
         math_cuda::DeviceHash::Keccak256
     ));
     assert!(paired(DeviceHashKey::Rpx256, math_cuda::DeviceHash::Rpx256));
+    assert!(paired(
+        DeviceHashKey::Poseidon1,
+        math_cuda::DeviceHash::Poseidon1
+    ));
 };
 
 /// ★ One WHIR hash configuration.
@@ -132,6 +156,18 @@ pub trait WhirHash: Copy + Clone + Default + Send + Sync + 'static {
     where
         F: IsField + 'static,
         FieldElement<F>: AsBytes + Sync + Send;
+
+    /// The block's Fiat–Shamir sponge over the cubic extension (the only
+    /// challenge field the block uses): the transcript a block proof's prover
+    /// and verifier start from ([`Self::sponge`]). Its configuration is
+    /// `Self::Transcript`, so a sponge of another hash cannot be named here.
+    type Sponge: IsTranscript<Degree3GoldilocksExtensionField>
+        + HasTranscriptHash<Hash = Self::Transcript>
+        + Clone
+        + Send;
+
+    /// A fresh sponge: what a block proof's statement is absorbed into.
+    fn sponge() -> Self::Sponge;
 }
 
 /// The keccak-256 configuration — the default everywhere on this path, and
@@ -151,6 +187,12 @@ impl WhirHash for KeccakWhir {
     where
         F: IsField + 'static,
         FieldElement<F>: AsBytes + Sync + Send;
+
+    type Sponge = DefaultTranscript<Degree3GoldilocksExtensionField, KeccakTranscriptHash>;
+
+    fn sponge() -> Self::Sponge {
+        DefaultTranscript::new(&[])
+    }
 }
 
 /// ★ The RPX256 configuration — the algebraic hash, and the only reason this
@@ -177,6 +219,54 @@ impl WhirHash for RpxWhir {
     where
         F: IsField + 'static,
         FieldElement<F>: AsBytes + Sync + Send;
+
+    /// `DefaultTranscript::new(&[])`: the transcript the block has always
+    /// started from under RPX, byte for byte.
+    type Sponge = DefaultTranscript<Degree3GoldilocksExtensionField, RpxTranscriptHash>;
+
+    fn sponge() -> Self::Sponge {
+        DefaultTranscript::new(&[])
+    }
+}
+
+/// ★ ZisK's Poseidon1 configuration (D-WHIR-P1 §2.1): the tagged
+/// `linear_hash` leaf over a fold block's felts, 4-ary trees with zero
+/// padding, ZisK's field sponge ([`P1Transcript`]) and the width-8 grind.
+///
+/// Its trees have four children per node (`Backend::ARITY = 4`): a path
+/// carries three siblings per 4-ary level, and its caps count 4-ary levels
+/// (`ChainFormat::arity4_cap`). Opt-in; RPX stays the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct P1Whir;
+
+impl WhirHash for P1Whir {
+    const NAME: &'static str = "poseidon1-w16";
+
+    const DEVICE: DeviceHashKey = DeviceHashKey::Poseidon1;
+
+    type Transcript = P1TranscriptHash;
+
+    type Backend<F>
+        = P1BatchBackend<F>
+    where
+        F: IsField + 'static,
+        FieldElement<F>: AsBytes + Sync + Send;
+
+    type Sponge = P1Transcript;
+
+    fn sponge() -> Self::Sponge {
+        P1Transcript::new()
+    }
+}
+
+/// Children per node of `H`'s trees over `F` (2, or 4 under [`P1Whir`]).
+pub fn arity<F, H>() -> usize
+where
+    F: IsField + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    H: WhirHash,
+{
+    <H::Backend<F> as IsMerkleTreeBackend>::ARITY
 }
 
 /// ✓ Both configurations are INHABITED at the fields the prover actually
@@ -199,6 +289,7 @@ const _: fn() = || {
 
     assert_usable::<KeccakWhir>();
     assert_usable::<RpxWhir>();
+    assert_usable::<P1Whir>();
 };
 
 /// ✓ Each configuration's transcript is ITS OWN, not the other's.
@@ -215,6 +306,9 @@ const _: fn() = || {
     );
     assert_same::<RpxTranscriptHash>(
         core::marker::PhantomData::<(RpxTranscriptHash, <RpxWhir as WhirHash>::Transcript)>,
+    );
+    assert_same::<P1TranscriptHash>(
+        core::marker::PhantomData::<(P1TranscriptHash, <P1Whir as WhirHash>::Transcript)>,
     );
 };
 
@@ -241,4 +335,5 @@ const _: () = {
     }
     assert!(same(KeccakWhir::NAME, KeccakWhir::DEVICE.name()));
     assert!(same(RpxWhir::NAME, RpxWhir::DEVICE.name()));
+    assert!(same(P1Whir::NAME, P1Whir::DEVICE.name()));
 };
