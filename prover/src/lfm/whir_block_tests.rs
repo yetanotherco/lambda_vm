@@ -2712,6 +2712,40 @@ fn the_whir_block_tree_on_a_real_block() {
         t.elapsed().as_secs_f64()
     );
     verdict.expect("the block's verifier accepts the top");
+
+    // Off the clock, on an RPX run: the Poseidon1 plan over the same statement
+    // (its groups do not depend on the base), so a P1 arm's leaf count is
+    // registered before the A/B that reads it.
+    if format.zf.base == stark::proof::options::BaseFormat::RPX {
+        let p1 = BlockFormat {
+            zf: format
+                .zf
+                .with_base(stark::proof::options::BaseFormat::P1_WHIR),
+            ..format
+        };
+        let plan =
+            super::whir_block::WhirBlockPlan::derive(&elf, &opts, &p1, proof.statement(), leaves)
+                .expect("the P1 plan derives over the statement");
+        let (loads, front) = plan.chip_loads();
+        let leaf_max = |f: fn(&super::whir_chain::ChipRows) -> usize| {
+            plan.partition()
+                .leaves()
+                .iter()
+                .map(|l| f(&front) + l.iter().map(|&g| f(&loads[g])).sum::<usize>())
+                .max()
+                .unwrap_or(0)
+        };
+        println!(
+            "W3 P1 PLAN: {} groups · {} leaves · {} prepared · leaf max socket {} · Select {} · base ALU {} · words {}",
+            plan.num_groups(),
+            plan.partition().num_leaves(),
+            plan.prepared().len(),
+            leaf_max(|r| r.hash),
+            leaf_max(|r| r.select),
+            leaf_max(|r| r.balu),
+            leaf_max(|r| r.hint),
+        );
+    }
 }
 
 // ========================= the batched argue (N-4) ========================
