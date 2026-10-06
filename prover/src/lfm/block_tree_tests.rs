@@ -1193,6 +1193,7 @@ fn p1_leaf_census_at_production_heights() {
         let wrap = WrapHash::for_base(&base);
         let front = front_hash_rows(&plan, wrap);
         let (mut rows, mut legs, mut instances, mut other) = (0usize, 0usize, 0usize, 0usize);
+        let mut law = 0.0f64;
         for k in 0..plan.partition().num_leaves() {
             let program = plan.leaf_program(k).expect("the leaf emits");
             let leaf: &[usize] = plan.partition().leaf(k);
@@ -1220,6 +1221,17 @@ fn p1_leaf_census_at_production_heights() {
                 .map(|(g, c)| format!("{g} {}×{}", c.real_rows, c.width))
                 .collect();
             println!("CENSUS {name} leaf {k} groups: {}", groups.join(" · "));
+            let (main, aux) = super::airs::lfm_cell_counts_with_hasher(
+                &program,
+                program.hasher(crate::hash_pin::BLOCK_HASHER),
+            );
+            let instrs = program.instrs.len();
+            println!(
+                "CENSUS {name} leaf {k} cost: {instrs} instructions · cells main {main} + aux {aux} · \
+                 law {:.2} s (0.059 + 421 ns/instr + 5.63 ns/cell, FAST)",
+                0.059 + 421e-9 * instrs as f64 + 5.63e-9 * (main + aux) as f64
+            );
+            law += 0.059 + 421e-9 * instrs as f64 + 5.63e-9 * (main + aux) as f64;
             rows += hash;
             legs += leg;
             instances += leaf.len();
@@ -1230,7 +1242,7 @@ fn p1_leaf_census_at_production_heights() {
         println!(
             "CENSUS {name}: {leaves} leaves · {instances} instances · hash rows {rows} · front \
              {front}/leaf · legs {legs} · fork mean {:.1}/instance · other rows {other} · cost \
-             model {:#x} (Σ costs {})",
+             model {:#x} (Σ costs {}) · law Σ {law:.2} s",
             forks as f64 / instances as f64,
             plan.cost_model(),
             plan.costs().iter().sum::<usize>()
