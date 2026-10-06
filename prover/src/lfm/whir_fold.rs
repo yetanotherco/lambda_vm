@@ -73,7 +73,7 @@ use multilinear::whir::Domain;
 use crate::tables::types::{FE, GoldilocksField};
 
 use super::builder::{Bit, Ext, LfmBuilder};
-use super::edsl::pow_bits;
+use super::edsl::{pow_bits, pow_bits_windowed};
 use super::word::{LfmWord, base_word};
 
 /// INSTRUCTIONS [`emit_fold_coset`] emits for a block of `block` values over
@@ -405,6 +405,69 @@ pub fn with_fold_emission<R>(emission: FoldEmission, f: impl FnOnce() -> R) -> R
     f()
 }
 
+/// ★ `LFM_WHIR_POW_WINDOW=1` reads the lean fold's point `x₀⁻¹` through
+/// [`POW_WINDOWS`] 2-bit windows ([`pow_bits_windowed`], I-PADLEAF §7.2): no
+/// identity multiply and a 4-way `Select` mux a window. That moves three
+/// `LFM_BALU` rows a fold into two `LFM_SELECT` rows (two and one below four
+/// index bits), which takes a #1014 4-group leaf's `LFM_BALU` from 282,768 rows
+/// to 256,776, under 2^18, while its `LFM_SELECT` stays under 2^19. Unset or `0`
+/// keeps [`pow_bits`]: today's programs and ids.
+///
+/// Read once per process at program EMISSION, as [`CLASSIC_FOLD_ENV`] is: it moves
+/// the programs that verify a WHIR proof (and their ids), never a proof format,
+/// and both settings compute the same field value. The verifier derives the
+/// leaf programs under its own setting. A test picks either with
+/// [`with_pow_windows`].
+pub const POW_WINDOW_ENV: &str = "LFM_WHIR_POW_WINDOW";
+
+/// Bit pairs the windowed point muxes: two. A third would pay its Select from
+/// the `LFM_SELECT` headroom for no `LFM_BALU` step left to clear.
+pub const POW_WINDOWS: usize = 2;
+
+std::thread_local! {
+    static POW_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`POW_WINDOW_ENV`]'s reading of a raw value: [`POW_WINDOWS`] when on, else `0`.
+pub fn pow_windows_from_setting(raw: Option<&str>) -> usize {
+    if super::airs::env_switch(POW_WINDOW_ENV, raw).unwrap_or(false) {
+        POW_WINDOWS
+    } else {
+        0
+    }
+}
+
+/// The windows the lean fold's point reads in force on this thread: a
+/// [`with_pow_windows`] override if one is open, else the process's
+/// [`POW_WINDOW_ENV`] setting (read once, named on stderr).
+pub fn pow_windows() -> usize {
+    POW_OVERRIDE.with(|o| o.get()).unwrap_or_else(|| {
+        static PROCESS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *PROCESS.get_or_init(|| {
+            let windows = pow_windows_from_setting(std::env::var(POW_WINDOW_ENV).ok().as_deref());
+            super::airs::announce(&if windows == 0 {
+                "WHIR FOLD POINT: one Select and one Mul a bit (the default)".to_string()
+            } else {
+                format!("WHIR FOLD POINT: {windows} 2-bit windows ({POW_WINDOW_ENV}=1)")
+            });
+            windows
+        })
+    })
+}
+
+/// Run `f` with `windows` in force on this thread. Restored on return and on
+/// unwind.
+pub fn with_pow_windows<R>(windows: usize, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            POW_OVERRIDE.with(|o| o.set(self.0));
+        }
+    }
+    let _restore = Restore(POW_OVERRIDE.with(|o| o.replace(Some(windows))));
+    f()
+}
+
 /// A round's folding challenges as the lean fold consumes them: `½·α` per level,
 /// computed ONCE per round rather than once per query, plus the half itself.
 pub struct LeanAlphas {
@@ -474,7 +537,10 @@ pub fn emit_fold_coset_lean(
     let factors: Vec<FE> = (0..index_bits.len())
         .map(|i| generator_inv.pow(1u64 << i))
         .collect();
-    let mut x_inv = pow_bits(b, index_bits, &factors, FE::one());
+    let mut x_inv = match pow_windows() {
+        0 => pow_bits(b, index_bits, &factors, FE::one()),
+        windows => pow_bits_windowed(b, index_bits, &factors, windows),
+    };
     let half = prepared.half.as_ext();
 
     let mut current: Vec<Ext> = values.to_vec();
@@ -524,11 +590,29 @@ pub fn emit_fold_coset_lean(
 /// `2·index_bits` for the point, three rows an output slot (`block − 1` of them
 /// across the levels), one `u` a level and one squaring a level after the first.
 pub const fn fold_coset_rows_lean(block: usize, index_bits: usize) -> usize {
+    fold_coset_rows_lean_windowed(block, index_bits, 0)
+}
+
+/// [`fold_coset_rows_lean`] with the point read through `windows` 2-bit
+/// windows ([`POW_WINDOW_ENV`]): `2·index_bits − 1` rows for the point when it
+/// has a bit ([`pow_bits_windowed`]), whatever the windows.
+pub const fn fold_coset_rows_lean_windowed(
+    block: usize,
+    index_bits: usize,
+    windows: usize,
+) -> usize {
     if block <= 1 {
         return 0;
     }
     let levels = block.trailing_zeros() as usize;
-    2 * index_bits + 3 * (block - 1) + 2 * levels - 1
+    let point = if windows == 0 {
+        2 * index_bits
+    } else if index_bits == 0 {
+        0
+    } else {
+        2 * index_bits - 1
+    };
+    point + 3 * (block - 1) + 2 * levels - 1
 }
 
 /// Rows [`prepare_lean_alphas`] emits for a round of `levels` levels: one
@@ -541,7 +625,7 @@ pub const fn lean_prepare_rows(levels: usize) -> usize {
 pub fn fold_rows_for(block: usize, index_bits: usize) -> usize {
     match FoldEmission::current() {
         FoldEmission::Classic => fold_coset_rows(block, index_bits),
-        FoldEmission::Lean => fold_coset_rows_lean(block, index_bits),
+        FoldEmission::Lean => fold_coset_rows_lean_windowed(block, index_bits, pow_windows()),
     }
 }
 
@@ -555,6 +639,18 @@ pub fn fold_coset_constants_lean(
     levels: usize,
     index_bits: usize,
 ) -> Vec<LfmWord> {
+    fold_coset_constants_lean_windowed(domain, levels, index_bits, 0)
+}
+
+/// [`fold_coset_constants_lean`] with the point read through `windows` 2-bit
+/// windows ([`POW_WINDOW_ENV`]): each window also interns its factors' product,
+/// `g^(−(2^i + 2^(i+1)))` for the pair at bit `i`.
+pub fn fold_coset_constants_lean_windowed(
+    domain: &Domain<GoldilocksField>,
+    levels: usize,
+    index_bits: usize,
+    windows: usize,
+) -> Vec<LfmWord> {
     if levels == 0 {
         return Vec::new();
     }
@@ -567,6 +663,9 @@ pub fn fold_coset_constants_lean(
     let mut exponents = vec![0u128];
     for i in 0..index_bits {
         exponents.push((1u128 << i) % n);
+    }
+    for w in 0..windows.min(index_bits / 2) {
+        exponents.push(((1u128 << (2 * w)) + (1u128 << (2 * w + 1))) % n);
     }
     for s in 1..block / 2 {
         exponents.push((s * (n / block)) % n);
@@ -594,7 +693,9 @@ pub fn fold_constants_for(
 ) -> Vec<LfmWord> {
     match FoldEmission::current() {
         FoldEmission::Classic => fold_coset_constants(domain, levels, index_bits),
-        FoldEmission::Lean => fold_coset_constants_lean(domain, levels, index_bits),
+        FoldEmission::Lean => {
+            fold_coset_constants_lean_windowed(domain, levels, index_bits, pow_windows())
+        }
     }
 }
 

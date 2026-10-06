@@ -2845,3 +2845,44 @@ fn grind_bits_chain_census() {
         }
     }
 }
+
+/// ★ I-PADLEAF §7.2: the production chain with the lean fold's point read
+/// through 2-bit windows (`LFM_WHIR_POW_WINDOW=1`) EMITS its closed form — one
+/// row a fold fewer than the default's, the same permutations, every arena word
+/// hinted once. `#[ignore]`d like its siblings: a production-shape program.
+#[test]
+#[ignore = "builds a production-shape chain program; run with -- --ignored"]
+fn the_production_chain_emits_its_closed_form_with_a_windowed_point() {
+    use super::whir_fold::{POW_WINDOWS, with_pow_windows};
+    let production = crate::multilinear_prove::chain_config_under(
+        &crate::zf_format::ZfFormat::DEFAULT,
+        &[(1, 25)],
+    );
+    let shape = ChainShape::new(&production, 25);
+    let entry = SpongeEntry::fresh();
+    let folds = shape.num_queries * shape.rounds();
+    let (rows, perms) = with_pow_windows(0, || {
+        (chain_rows(&shape, entry), chain_perms(&shape, entry))
+    });
+    with_pow_windows(POW_WINDOWS, || {
+        let program = chain_program(&shape);
+        let measured = program.instrs.len() - const_rows(&program) - chain_plumbing(&shape);
+        assert_eq!(measured, chain_rows(&shape, entry), "windowed: rows");
+        assert_eq!(
+            measured + folds,
+            rows,
+            "one row a fold fewer than the default"
+        );
+        assert_eq!(perm_rows(&program), perms, "windowed: permutations");
+        assert_eq!(chain_perms(&shape, entry), perms);
+        assert_eq!(
+            hint_rows(&program),
+            Layout::new(&shape).total as usize,
+            "windowed: every arena word hinted once"
+        );
+        println!(
+            "PRODUCTION chain S=25 windowed point: {measured} rows against {rows} by default \
+             ({folds} folds); {perms} permutations"
+        );
+    });
+}

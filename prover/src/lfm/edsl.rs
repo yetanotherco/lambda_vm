@@ -865,6 +865,53 @@ pub fn pow_bits(b: &mut LfmBuilder, bits: &[Bit], factors: &[FE], scale: FE) -> 
     acc
 }
 
+/// [`pow_bits`] at a scale of one, in fewer `LFM_BALU` rows (I-PADLEAF §7.2).
+///
+/// - The accumulator starts at the first factor read, not at a constant one: no
+///   identity multiply.
+/// - Each of the first `windows` bit pairs `(b₀, b₁)` with factors `(f₀, f₁)`
+///   reads its factor through a 4-way mux over the program constants
+///   `{1, f₀, f₁, f₀·f₁}`: `select(b₀, 1, f₀)`, `select(b₀, f₁, f₀·f₁)`, then
+///   `select(b₁, ·, ·)`. That is three `Select` rows and at most one `Mul` a pair,
+///   where [`pow_bits`] pays two of each.
+/// - The remaining bits are [`pow_bits`]' one `Select` and one `Mul` each.
+///
+/// The same value as `pow_bits(b, bits, factors, FE::one())`: a `Select` returns
+/// one of its two arms, picked by a boolean bit. With `w` windows fitting the
+/// bits (`min(windows, bits / 2)`), it pays `w` more `Select` rows and `w + 1`
+/// fewer `Mul` rows: `2·bits − 1` rows (none for no bits) against `2·bits`.
+pub fn pow_bits_windowed(b: &mut LfmBuilder, bits: &[Bit], factors: &[FE], windows: usize) -> Felt {
+    assert_eq!(bits.len(), factors.len());
+    let times = |b: &mut LfmBuilder, acc: Option<Felt>, v: Felt| match acc {
+        None => v,
+        Some(acc) => b.mul(acc, v),
+    };
+    let mut acc: Option<Felt> = None;
+    let mut at = 0usize;
+    for _ in 0..windows {
+        if at + 1 >= bits.len() {
+            break;
+        }
+        let (f0, f1) = (factors[at], factors[at + 1]);
+        let one = b.felt_const(FE::one());
+        let c0 = b.felt_const(f0);
+        let c1 = b.felt_const(f1);
+        let c01 = b.felt_const(f0 * f1);
+        let (low, _) = b.select(bits[at], one.as_cell(), c0.as_cell());
+        let (high, _) = b.select(bits[at], c1.as_cell(), c01.as_cell());
+        let (chosen, _) = b.select(bits[at + 1], low, high);
+        acc = Some(times(b, acc, Felt(chosen.0)));
+        at += 2;
+    }
+    for (bit, factor) in bits[at..].iter().zip(&factors[at..]) {
+        let one = b.felt_const(FE::one());
+        let f = b.felt_const(*factor);
+        let (chosen, _) = b.select(*bit, one.as_cell(), f.as_cell());
+        acc = Some(times(b, acc, Felt(chosen.0)));
+    }
+    acc.unwrap_or_else(|| b.felt_const(FE::one()))
+}
+
 /// `Σ_i coeffs[i]·α^i` over ext, coeffs given low-to-high (base cells are
 /// valid ext operands). One `MulAdd` per coefficient — the Horner shape.
 pub fn horner_ext(b: &mut LfmBuilder, alpha: Ext, coeffs_low_to_high: &[Ext]) -> Ext {

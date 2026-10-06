@@ -519,3 +519,138 @@ fn the_fold_default_is_lean_and_the_opt_out_is_classic() {
 fn a_malformed_fold_setting_stops_the_run() {
     let _ = super::whir_fold::FoldEmission::from_setting(Some("lean"));
 }
+
+// ============================================================================
+// The lean fold's point through 2-bit windows (I-PADLEAF §7.2)
+// ============================================================================
+
+/// ★ The windowed point keeps the lean fold whole: at every shape the default
+/// is pinned at, the fold emits its windowed closed form (rows and interned
+/// constants, by count and by value) and computes the host's fold, at the
+/// lowest, highest and in-between indices.
+#[test]
+fn the_windowed_lean_fold_emits_its_closed_form_and_computes_the_hosts_fold() {
+    use super::whir_fold::{
+        POW_WINDOWS, fold_coset_constants_lean_windowed, fold_coset_rows_lean_windowed,
+        with_pow_windows,
+    };
+    for &(log_domain, levels, index_bits) in SHAPES {
+        let block = 1usize << levels;
+        let domain = Domain::<F>::new(log_domain).expect("a domain");
+        let program = with_pow_windows(POW_WINDOWS, || {
+            lean_fold_program(log_domain, levels, index_bits)
+        });
+        let measured = program.instrs.len()
+            - fold_plumbing(block, levels)
+            - const_rows(&program)
+            - lean_prepare_rows(levels);
+        assert_eq!(
+            measured,
+            fold_coset_rows_lean_windowed(block, index_bits, POW_WINDOWS),
+            "a windowed lean block of {block} on 2^{log_domain} at {index_bits} index bits"
+        );
+        assert_eq!(
+            measured + 1,
+            fold_coset_rows_lean(block, index_bits),
+            "the windows save one row a fold"
+        );
+        let named = fold_coset_constants_lean_windowed(&domain, levels, index_bits, POW_WINDOWS);
+        let interned: Vec<LfmWord> = program
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                super::instr::Instr::Const { value, .. } => Some(*value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(named.len(), interned.len(), "a windowed block of {block}");
+        assert!(
+            named.iter().all(|w| interned.contains(w)),
+            "a windowed block of {block}: named, not interned"
+        );
+        let alphas: Vec<FEE> = (0..levels).map(|i| fee(0x3141 + i as u64)).collect();
+        let values: Vec<FEE> = (0..block).map(|i| fee(0x2718 + i as u64)).collect();
+        let words: Vec<LfmWord> = values.iter().map(ext_word).collect();
+        for index in [0usize, 1, 2, 3, 5, (1 << index_bits) - 1] {
+            let want = fold_coset::<F, E, E>(&values, &domain, index, &alphas).expect("host");
+            let exec = execute(
+                &program,
+                &[fold_arena(&words, &alphas, index)],
+                &crate::hash_pin::BLOCK_HASHER,
+            )
+            .expect("the windowed lean fold executes");
+            assert_eq!(
+                word_as_ext(&exec.public_words[0].1).expect("a value"),
+                want,
+                "windowed block {block} on 2^{log_domain}, index {index}"
+            );
+        }
+    }
+}
+
+/// The windowed point's row mix, the census delta I-PADLEAF §7.2 sizes the
+/// lever with: against the default, a fold pays three fewer `LFM_BALU` rows and
+/// two more `LFM_SELECT` rows at four or more index bits, two and one at two or
+/// three, and nothing else moves.
+#[test]
+fn the_windowed_point_moves_balu_rows_into_select() {
+    use super::instr::Instr;
+    use super::whir_fold::{POW_WINDOWS, with_pow_windows};
+    let mix = |program: &LfmProgram| -> (i64, i64, usize) {
+        let balu = program
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, Instr::BaseAlu { .. }))
+            .count() as i64;
+        let select = program
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, Instr::Select { .. }))
+            .count() as i64;
+        let rest = program.instrs.len() - balu as usize - select as usize - const_rows(program);
+        (balu, select, rest)
+    };
+    for (index_bits, d_balu, d_select) in
+        [(23, -3, 2), (11, -3, 2), (4, -3, 2), (3, -2, 1), (2, -2, 1)]
+    {
+        let levels = 4;
+        let log_domain = index_bits + levels;
+        let (b0, s0, r0) = mix(&with_pow_windows(0, || {
+            lean_fold_program(log_domain, levels, index_bits)
+        }));
+        let (b1, s1, r1) = mix(&with_pow_windows(POW_WINDOWS, || {
+            lean_fold_program(log_domain, levels, index_bits)
+        }));
+        assert_eq!(
+            (b1 - b0, s1 - s0, r1),
+            (d_balu, d_select, r0),
+            "at {index_bits} index bits"
+        );
+    }
+}
+
+/// The default reads the point a bit at a time; `LFM_WHIR_POW_WINDOW=1` selects
+/// the windows, and a test's override is scoped to its closure.
+#[test]
+fn the_fold_point_defaults_to_a_bit_at_a_time() {
+    use super::whir_fold::{
+        POW_WINDOW_ENV, POW_WINDOWS, pow_windows, pow_windows_from_setting, with_pow_windows,
+    };
+    assert_eq!(POW_WINDOW_ENV, "LFM_WHIR_POW_WINDOW");
+    assert_eq!(pow_windows_from_setting(None), 0);
+    assert_eq!(pow_windows_from_setting(Some("0")), 0);
+    assert_eq!(pow_windows_from_setting(Some("1")), POW_WINDOWS);
+    let outside = pow_windows();
+    for windows in [0, POW_WINDOWS] {
+        assert_eq!(with_pow_windows(windows, pow_windows), windows);
+    }
+    assert_eq!(pow_windows(), outside, "the override is scoped");
+}
+
+/// A typo stops the run rather than emitting the default under the windows'
+/// name.
+#[test]
+#[should_panic(expected = "must be 0 or 1")]
+fn a_malformed_point_setting_stops_the_run() {
+    let _ = super::whir_fold::pow_windows_from_setting(Some("2"));
+}
