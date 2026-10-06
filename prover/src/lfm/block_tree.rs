@@ -1292,6 +1292,9 @@ pub fn prove_block_tree(
     ));
 
     let whole = HostSampler::start();
+    // `LAMBDA_VM_ALLOC_WATERMARK`: freed pages back to the OS inside a phase,
+    // only where the host is short (`alloc_purge`).
+    let watermark = crate::alloc_purge::start_watermark(crate::block::spill_target_bytes());
     let t_all = Instant::now();
 
     // ---- the ELF constants beside the base (`NOEPOCH_ELF_BESIDE=<threads>`, four
@@ -1955,6 +1958,9 @@ pub fn prove_block_tree(
     sink.line(&format!(
         "★★★ WHOLE RUN: host peak {peak:.3} GiB at t={at:.1}, {total:.1}s total"
     ));
+    if let Some(w) = watermark {
+        sink.line(&w.finish());
+    }
 
     Ok(BlockTreeRun {
         shape,
