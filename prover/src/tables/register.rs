@@ -459,7 +459,7 @@ fn commit_register_columns(
     // commitment the prover recomputes and compares against, so building it with
     // a different hash than the path commits under fails at prove time with
     // `PrecomputedCommitmentMismatch` — which is exactly how it was found.
-    crate::lfm::commit::commit_lde_columns_with(&lde_columns, layout)
+    crate::lfm::commit::commit_lde_columns_for(&lde_columns, layout, options)
 }
 
 /// Returns the preprocessed commitment for the REGISTER table.

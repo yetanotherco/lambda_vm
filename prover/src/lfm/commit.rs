@@ -101,13 +101,21 @@ pub fn commit_lde_columns_with(lde_columns: &[Vec<FE>], layout: LeafLayout) -> C
     // the production tables whose roots `lfm_program_id` names, so the hash that
     // BUILDS them and the hash the program identity CLAIMS have to be the same
     // one — `registry.rs` records that as the condition under which this read
-    // moves, and the pin is what moved it. Under the P1 base hash
-    // (`hash_pin::base_hash`) they are the base proof's preprocessed roots under
-    // ZisK's Poseidon1 instead.
-    match crate::hash_pin::base_hash() {
-        crate::hash_pin::BaseHash::Rpx => {
-            commit_lde_columns_under::<crate::hash_pin::BlockStarkHash>(lde_columns, layout)
-        }
+    // moves, and the pin is what moved it. A base table under another base
+    // format commits through [`commit_lde_columns_for`].
+    commit_lde_columns_under::<crate::hash_pin::BlockStarkHash>(lde_columns, layout)
+}
+
+/// [`commit_lde_columns_with`] under the base configuration `options` names
+/// (`format.base`, [`crate::hash_pin::base_of`]): a base table's
+/// preprocessed root, which a Poseidon1 base commits under ZisK's Poseidon1.
+pub fn commit_lde_columns_for(
+    lde_columns: &[Vec<FE>],
+    layout: LeafLayout,
+    options: &ProofOptions,
+) -> Commitment {
+    match crate::hash_pin::base_of(&options.format) {
+        crate::hash_pin::BaseHash::Rpx => commit_lde_columns_with(lde_columns, layout),
         crate::hash_pin::BaseHash::P1 => {
             commit_lde_columns_under::<crate::lfm::p1_commit::P1StarkHash>(lde_columns, layout)
         }
@@ -137,7 +145,7 @@ pub fn commit_columns_with(
     options: &ProofOptions,
     layout: LeafLayout,
 ) -> Commitment {
-    commit_lde_columns_with(&lde_columns(columns, options), layout)
+    commit_lde_columns_for(&lde_columns(columns, options), layout, options)
 }
 
 /// A [`ColumnGroup`]'s data, column-major (the commit pipeline's input shape).
@@ -328,7 +336,7 @@ pub(super) fn commit_group_device_or_host_in(
         } else {
             super::derive_gate::admit(set.total())
         };
-        let committed = match crate::hash_pin::base_hash() {
+        let committed = match crate::hash_pin::base_of(&options.format) {
             crate::hash_pin::BaseHash::Rpx => commit_group_device_under::<
                 crate::hash_pin::BlockStarkHash,
             >(label, group, options, layout),
@@ -380,7 +388,11 @@ pub fn commit_group_host_with(
     layout: LeafLayout,
 ) -> Commitment {
     HOST_GROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    commit_lde_columns_with(&lde_columns(&group_columns(group), options), layout)
+    commit_lde_columns_for(
+        &lde_columns(&group_columns(group), options),
+        layout,
+        options,
+    )
 }
 
 /// Whether [`commit_group_device_or_host_with`] would send a `rows × width`

@@ -6222,7 +6222,7 @@ pub trait IsStarkProver<
         // layer's from the fold layout (a group tree under a fold schedule),
         // so a capped `fri = dp` or one-row proof caps the trees it committed.
         let caps = crate::merkle_caps::StarkCaps::from_layout_arity(
-            crate::config::effective_cap_policy::<H>(air.options().format.merkle_cap),
+            crate::config::effective_cap_policy::<H>(&air.options().format),
             number_of_queries,
             domain_size.trailing_zeros() as usize,
             &fri_layout,
@@ -7658,9 +7658,7 @@ pub trait IsStarkProver<
                         // The trace trees' cap height (`StarkCaps`): Round 4
                         // reads the cap off the kept levels, so they reach it.
                         let cap_height = crate::merkle_caps::StarkCaps::tree_cap_height(
-                            crate::config::effective_cap_policy::<H>(
-                                air.options().format.merkle_cap,
-                            ),
+                            crate::config::effective_cap_policy::<H>(&air.options().format),
                             air.options().fri_number_of_queries,
                             tree.leaves_len.trailing_zeros() as usize,
                             H::ARITY,

@@ -108,6 +108,42 @@ pub struct ProofFormat {
     /// each `AirWithBuses` picks by [`crate::lookup::logup_arity`]). `Pair` =
     /// today: two per column.
     pub logup: LogUpPolicy,
+    /// The base proof's commitment hash and its arity-4 cap ([`BaseFormat`]).
+    /// [`BaseFormat::RPX`] = today. A verifier constant like every field here:
+    /// the block prover and verifier dispatch on it, never on the proof or the
+    /// environment.
+    pub base: BaseFormat,
+}
+
+/// The base proof's commitment geometry: which hash commits it and, for an
+/// arity-4 hash, the height of its Merkle caps in 4-ary levels (the format's
+/// `merkle_cap` prices binary caps only). A configuration whose
+/// `StarkHash::COMMITMENT_HASH` is not `hash` is not this format; the block
+/// path maps `hash` to its configuration and refuses any other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BaseFormat {
+    pub hash: crate::config::CommitmentHash,
+    pub arity4_cap: CapPolicy,
+}
+
+impl BaseFormat {
+    /// RPX256 over binary trees (the format's `merkle_cap` applies): today.
+    pub const RPX: Self = Self {
+        hash: crate::config::CommitmentHash::Rpx256,
+        arity4_cap: CapPolicy::Off,
+    };
+
+    /// ZisK's Poseidon1 over 4-ary trees, capped at 4-ary height 4 (I-P1C §8).
+    pub const P1: Self = Self {
+        hash: crate::config::CommitmentHash::Poseidon1,
+        arity4_cap: CapPolicy::Fixed(4),
+    };
+}
+
+impl Default for BaseFormat {
+    fn default() -> Self {
+        Self::RPX
+    }
 }
 
 impl ProofFormat {
@@ -128,6 +164,7 @@ impl ProofFormat {
         one_row: OneRowMode::Off,
         fri_schedule_override: None,
         logup: LogUpPolicy::Pair,
+        base: BaseFormat::RPX,
     };
 
     /// True when this is this crate's default format, [`Self::LEGACY`]
@@ -144,6 +181,7 @@ impl ProofFormat {
             && self.one_row == OneRowMode::Off
             && self.fri_schedule_override.is_none()
             && self.logup == LogUpPolicy::Pair
+            && self.base == BaseFormat::RPX
     }
 }
 

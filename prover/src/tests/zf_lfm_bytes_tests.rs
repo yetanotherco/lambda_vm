@@ -46,6 +46,7 @@ fn formats() -> [(&'static str, ProofFormat); 4] {
         one_row: OneRowMode::Off,
         fri_schedule_override: None,
         logup: LogUpPolicy::Pair,
+        base: stark::proof::options::BaseFormat::RPX,
     };
     let production = ProofFormat {
         merkle_cap: crypto::merkle_tree::cap::CapPolicy::Auto,
@@ -53,6 +54,7 @@ fn formats() -> [(&'static str, ProofFormat); 4] {
         one_row: OneRowMode::Auto,
         fri_schedule_override: None,
         logup: LogUpPolicy::Pair,
+        base: stark::proof::options::BaseFormat::RPX,
     };
     assert_eq!(
         production,

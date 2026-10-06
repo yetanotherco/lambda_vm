@@ -25,10 +25,36 @@ use crate::test_utils::asm_elf_bytes;
 /// The block's format (`ZfFormat::DEFAULT` over blowup 4) with no grinding, so
 /// two proves of one set of traces can be compared byte for byte.
 fn bytes_options() -> ProofOptions {
-    let base = GoldilocksCubicProofOptions::with_params(4, 128, 0).expect("options");
-    let opts = crate::zf_format::ZfFormat::DEFAULT.options(base);
+    bytes_options_for(stark::proof::options::BaseFormat::RPX)
+}
+
+/// [`bytes_options`] with the base format `base` (RPX, or ZisK's Poseidon1).
+fn bytes_options_for(base: stark::proof::options::BaseFormat) -> ProofOptions {
+    let options = GoldilocksCubicProofOptions::with_params(4, 128, 0).expect("options");
+    let mut opts = crate::zf_format::ZfFormat::DEFAULT.options(options);
+    opts.format.base = base;
     assert_eq!(opts.grinding_factor, 0, "no nonce search");
     opts
+}
+
+/// The base formats every same-bytes test proves, both in one process: the
+/// base is the caller's format, so nothing forces a process to one hash.
+fn test_bases() -> [(&'static str, stark::proof::options::BaseFormat); 2] {
+    use stark::proof::options::BaseFormat;
+    [("rpx", BaseFormat::RPX), ("p1", BaseFormat::P1)]
+}
+
+/// The P1 base at 4-ary cap height `c` (0: uncapped).
+fn p1_at(c: u8) -> stark::proof::options::BaseFormat {
+    use stark::proof::options::{BaseFormat, CapPolicy};
+    BaseFormat {
+        arity4_cap: if c == 0 {
+            CapPolicy::Off
+        } else {
+            CapPolicy::Fixed(c)
+        },
+        ..BaseFormat::P1
+    }
 }
 
 /// One build of a program's traces, proved as many times as a test needs.
@@ -148,7 +174,18 @@ fn proof_bytes(proof: &VmProof) -> Vec<u8> {
 /// recommit must have run.
 fn same_bytes_under_both_modes(name: &str, max_rows: &MaxRowsConfig) {
     let build = OneBuild::new(name, max_rows);
-    let opts = bytes_options();
+    for (base_name, base) in test_bases() {
+        same_bytes_under_both_modes_at(&build, &format!("{name} {base_name}"), base);
+    }
+}
+
+/// [`same_bytes_under_both_modes`] for one base format.
+fn same_bytes_under_both_modes_at(
+    build: &OneBuild,
+    name: &str,
+    base: stark::proof::options::BaseFormat,
+) {
+    let opts = bytes_options_for(base);
     let retained = build
         .prove(&opts, ResidencyMode::Retain, false)
         .expect("prove under Retain");
@@ -218,8 +255,11 @@ fn noepoch_same_bytes_all_instructions_small_chunks() {
 #[ignore = "proves a VM program at blowup 4; GPU box gate (cuda)"]
 fn noepoch_refuses_a_trace_that_moved() {
     let build = OneBuild::new("fib_iterative_160k", &MaxRowsConfig::default());
-    let opts = bytes_options();
-    for table in ["CPU[0]", "BITWISE"] {
+    for ((base_name, base), table) in test_bases()
+        .into_iter()
+        .flat_map(|b| ["CPU[0]", "BITWISE"].map(move |t| (b, t)))
+    {
+        let opts = bytes_options_for(base);
         let idx = build.air_index(&opts, table);
         stark::residency_mode::test_hooks::perturb_before_recommit(idx);
         let out = build.prove(&opts, ResidencyMode::RecomputeLdeDevice, true);
@@ -235,7 +275,9 @@ fn noepoch_refuses_a_trace_that_moved() {
             Err(e) => panic!("{table}: wrong refusal: {e:?}"),
             Ok(_) => panic!("{table}: a trace that moved was proved"),
         }
-        println!("NOEPOCH NEGATIVE {table} (index {idx}): refused, RecomputedCommitmentMismatch");
+        println!(
+            "NOEPOCH NEGATIVE {base_name} {table} (index {idx}): refused, RecomputedCommitmentMismatch"
+        );
     }
 }
 
@@ -249,35 +291,39 @@ fn noepoch_same_bytes_fib_160k() {
 }
 
 // =========================================================================
-// ZisK's Poseidon1 as the base hash (`p1/*` exploration, P2): run under
-// `LAMBDA_VM_BASE_HASH=p1`, by the box gate. The tests above also run there
-// unchanged, proving and verifying under P1.
+// ZisK's Poseidon1 as the base hash (`p1/*` exploration): the base is the
+// options' format (`format.base`), so these prove both hashes in one process.
 // =========================================================================
 
-#[cfg(feature = "cuda")]
-fn require_p1_base() {
-    assert_eq!(
-        crate::hash_pin::base_hash(),
-        crate::hash_pin::BaseHash::P1,
-        "run under {}=p1",
-        crate::hash_pin::BASE_HASH_ENV
-    );
+/// fib_iterative_160k's same bytes under P1 at 4-ary cap heights off, 2 and 4
+/// (the kept tops keep each cap's level; the device reads each cap).
+#[test]
+#[ignore = "proves a VM program six times at blowup 4; GPU box gate (cuda)"]
+fn noepoch_p1_same_bytes_fib_160k_at_every_cap() {
+    let build = OneBuild::new("fib_iterative_160k", &MaxRowsConfig::default());
+    for c in [0u8, 2, 4] {
+        same_bytes_under_both_modes_at(&build, &format!("fib_iterative_160k p1 c{c}"), p1_at(c));
+    }
 }
 
 /// ★ A P1 block proof (grinding on, so the device grind runs) verifies under
-/// its own configuration and is refused by the RPX one — the base hash is a
-/// verifier constant and the two configurations do not agree by accident —
-/// and a flipped byte in a main-trace path, an FRI path, the main root or the
-/// nonce is refused.
+/// its own format; it and an RPX proof are each refused under the other's
+/// format, and by a dispatch fixed to the other arm (§9.5 mutation 1); a P1
+/// proof under RPX's statement tag is refused by the P1 verifier and accepted
+/// only by one that also drops the tag (§9.5 mutation 2: the tag is checked);
+/// and a flipped byte in a main-trace path, an FRI path, the main root, the
+/// nonce or a cap node is refused.
 #[cfg(feature = "cuda")]
 #[test]
-#[ignore = "proves a VM program at blowup 4 under LAMBDA_VM_BASE_HASH=p1; GPU box gate (cuda)"]
+#[ignore = "proves a VM program at blowup 4 three times; GPU box gate (cuda)"]
 fn noepoch_p1_proof_is_refused_by_rpx_and_when_tampered() {
     use crate::hash_pin::BaseHash;
-    require_p1_base();
+    use stark::proof::options::BaseFormat;
     let build = OneBuild::new("fib_iterative_160k", &MaxRowsConfig::default());
     let base = GoldilocksCubicProofOptions::with_params(4, 128, 12).expect("options");
-    let opts = crate::zf_format::ZfFormat::DEFAULT.options(base);
+    let rpx_opts = crate::zf_format::ZfFormat::DEFAULT.options(base.clone());
+    let opts = crate::zf_format::ZfFormat::P1.options(base);
+    assert_eq!(opts.format.base, BaseFormat::P1);
     crate::hash_pin::warm_base_statics(&opts);
     crypto::grinding::reset_gpu_grind_calls();
     let proof = build
@@ -292,16 +338,57 @@ fn noepoch_p1_proof_is_refused_by_rpx_and_when_tampered() {
         0,
         "an RPX grind ran"
     );
-    let verify = |p: &VmProof, base: BaseHash| {
+    let rpx_proof = build
+        .prove(&rpx_opts, ResidencyMode::RecomputeLdeDevice, true)
+        .expect("RPX prove, same process");
+    let under = |p: &VmProof, o: &ProofOptions, base: BaseHash| {
         matches!(
-            crate::block::verify_block_under(p, &build.elf_bytes, &opts, base),
+            crate::block::verify_block_under(p, &build.elf_bytes, o, base),
             Ok(true)
         )
     };
-    assert!(verify(&proof, BaseHash::P1), "the P1 proof must verify");
+    assert!(build.verifies(&proof, &opts), "the P1 proof must verify");
     assert!(
-        !verify(&proof, BaseHash::Rpx),
-        "the RPX verifier accepted a P1 proof"
+        build.verifies(&rpx_proof, &rpx_opts),
+        "the RPX proof must verify"
+    );
+    assert!(
+        !build.verifies(&proof, &rpx_opts),
+        "the RPX format accepted a P1 proof"
+    );
+    assert!(
+        !build.verifies(&rpx_proof, &opts),
+        "the P1 format accepted an RPX proof"
+    );
+    // Mutation 1: a dispatch fixed to one arm accepts nothing of the other.
+    assert!(
+        !under(&proof, &opts, BaseHash::Rpx),
+        "a dispatch fixed to RPX accepted P1"
+    );
+    assert!(
+        !under(&rpx_proof, &rpx_opts, BaseHash::P1),
+        "a dispatch fixed to P1 accepted RPX"
+    );
+    println!(
+        "NOEPOCH P1 CROSS: P1 and RPX proofs, one process, each refused by the other's format and arm"
+    );
+    // Mutation 2: a P1 proof made under RPX's statement tag.
+    crate::hash_pin::P1_TAG_OMITTED.store(true, Ordering::SeqCst);
+    let untagged = build
+        .prove(&opts, ResidencyMode::RecomputeLdeDevice, true)
+        .expect("P1 prove without its tag");
+    let accepted_without_tag = build.verifies(&untagged, &opts);
+    crate::hash_pin::P1_TAG_OMITTED.store(false, Ordering::SeqCst);
+    assert!(
+        accepted_without_tag,
+        "a verifier that also drops the tag accepts it"
+    );
+    assert!(
+        !build.verifies(&untagged, &opts),
+        "the P1 verifier accepted a proof without its tag"
+    );
+    println!(
+        "NOEPOCH P1 TAG: a P1 proof under RPX's statement tag is refused (accepted only without the tag)"
     );
     let idx = build.air_index(&opts, "CPU[0]");
     // Under a P1 cap (`LAMBDA_VM_P1_CAP`, default 4-ary height 4) query 0's
@@ -316,7 +403,7 @@ fn noepoch_p1_proof_is_refused_by_rpx_and_when_tampered() {
     };
     println!(
         "NOEPOCH P1 CAP: {} · CPU[0] main paths: query 0 {} nodes, query 1 {} nodes",
-        crate::hash_pin::p1_cap(),
+        opts.format.base.arity4_cap,
         main_path(0),
         main_path(1)
     );
@@ -360,13 +447,39 @@ fn noepoch_p1_proof_is_refused_by_rpx_and_when_tampered() {
     for (what, tamper) in tampers {
         let mut bad = proof.clone();
         tamper(&mut bad, idx);
-        assert!(!verify(&bad, BaseHash::P1), "a tampered {what} verified");
+        assert!(!build.verifies(&bad, &opts), "a tampered {what} verified");
         println!("NOEPOCH P1 NEGATIVE {what} (CPU[0], index {idx}): refused");
     }
     println!(
         "NOEPOCH P1: fib_iterative_160k verifies under P1, refused under RPX; {} P1 device grinds",
         crypto::grinding::gpu_grind_calls_p1()
     );
+}
+
+/// The harness's options: the block's (`block_base_options`), with the base
+/// format its test environment names. `NOEPOCH_BASE` = `rpx` (unset) or `p1`;
+/// `NOEPOCH_P1_CAP` = `off` or a 4-ary height (unset: 4); `NOEPOCH_P1_NO_TAG=1`
+/// proves and verifies P1 under RPX's statement tag (the pre-tag bytes). Test
+/// code: the library reads no such variable.
+fn noepoch_harness_options() -> ProofOptions {
+    let mut opts = crate::lfm::proof::block_base_options();
+    let base = std::env::var("NOEPOCH_BASE").unwrap_or_else(|_| "rpx".to_string());
+    match base.as_str() {
+        "rpx" => {}
+        "p1" => {
+            let cap = std::env::var("NOEPOCH_P1_CAP").unwrap_or_else(|_| "4".to_string());
+            let c: u8 = match cap.as_str() {
+                "off" | "0" => 0,
+                h => h.parse().expect("NOEPOCH_P1_CAP: off or a height"),
+            };
+            opts.format.base = p1_at(c);
+            if std::env::var("NOEPOCH_P1_NO_TAG").is_ok_and(|v| v == "1") {
+                crate::hash_pin::P1_TAG_OMITTED.store(true, Ordering::SeqCst);
+            }
+        }
+        other => panic!("NOEPOCH_BASE={other:?}: rpx or p1"),
+    }
+    opts
 }
 
 /// Peak resident set of this process, from `/proc/self/status` (Linux).
@@ -395,17 +508,36 @@ fn noepoch_block_prove_and_verify() {
     let input_path = std::env::var("NOEPOCH_INPUT").expect("NOEPOCH_INPUT=<private input>");
     let elf_bytes = std::fs::read(&elf_path).expect("read NOEPOCH_ELF");
     let input = std::fs::read(&input_path).expect("read NOEPOCH_INPUT");
-    let opts = crate::lfm::proof::block_base_options();
+    let opts = noepoch_harness_options();
+    let base = crate::hash_pin::base_of(&opts.format);
     println!(
         "NOEPOCH BLOCK: {elf_path} ({} B), input {input_path} ({} B), blowup {} / {} queries / \
-         grinding {} · base hash {:?}",
+         grinding {} · base hash {base:?}",
         elf_bytes.len(),
         input.len(),
         opts.blowup_factor,
         opts.fri_number_of_queries,
         opts.grinding_factor,
-        crate::hash_pin::base_hash(),
     );
+    // The arm lines the box readouts key on (the base is the harness's format).
+    println!(
+        "BASE HASH: {} (format {:?}, cap {})",
+        match base {
+            crate::hash_pin::BaseHash::Rpx => "rpx",
+            crate::hash_pin::BaseHash::P1 => "p1",
+        },
+        opts.format.base.hash,
+        opts.format.base.arity4_cap
+    );
+    if base == crate::hash_pin::BaseHash::P1 {
+        println!(
+            "P1 CAP: {} (4-ary levels; the harness format) · statement tag {}",
+            opts.format.base.arity4_cap,
+            String::from_utf8_lossy(&crate::hash_pin::p1_statement_tag(
+                opts.format.base.arity4_cap
+            ))
+        );
+    }
     // Before the clock: under the P1 base hash the static preprocessed roots
     // are computed once here (the RPX arm reads them as constants).
     crate::hash_pin::warm_base_statics(&opts);

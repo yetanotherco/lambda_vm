@@ -591,7 +591,7 @@ fn commit_preprocessed_columns(
     // the hash that path commits under — on a branch that pins an algebraic
     // hash, a root left on the alias would be the one BLAKE3 artifact in an RPO
     // proof, and it would fail as a root nothing reconstructs.
-    crate::lfm::commit::commit_lde_columns_with(&lde_columns, layout)
+    crate::lfm::commit::commit_lde_columns_for(&lde_columns, layout, options)
 }
 
 /// Commitment over the OFFSET column **alone** — the preprocessed anchor for
@@ -633,7 +633,7 @@ pub fn compute_offset_only_commitment_with(
 /// have program-dependent INIT columns and no static entry; compute their
 /// commitments with [`compute_precomputed_commitment`] directly.
 pub fn zero_init_preprocessed_commitment(options: &ProofOptions) -> Commitment {
-    if crate::hash_pin::base_hash() == crate::hash_pin::BaseHash::P1 {
+    if crate::hash_pin::base_of(&options.format) == crate::hash_pin::BaseHash::P1 {
         return crate::hash_pin::p1_static_root("zero page", options, LeafLayout::RowPair, || {
             compute_precomputed_commitment(&PageConfig::zero_init(0), options)
         });
@@ -661,7 +661,7 @@ pub fn zero_init_preprocessed_commitment(options: &ProofOptions) -> Commitment {
 /// `blowup_factor` covers every private page in the system — and the same value
 /// serves GLOBAL_MEMORY, whose OFFSET column is identical.
 pub fn private_page_preprocessed_commitment(options: &ProofOptions) -> Commitment {
-    if crate::hash_pin::base_hash() == crate::hash_pin::BaseHash::P1 {
+    if crate::hash_pin::base_of(&options.format) == crate::hash_pin::BaseHash::P1 {
         return crate::hash_pin::p1_static_root(
             "private page",
             options,
@@ -694,15 +694,22 @@ pub fn zero_init_preprocessed_commitment_for(
 ) -> Option<Commitment> {
     match layout {
         LeafLayout::RowPair => Some(zero_init_preprocessed_commitment(options)),
-        LeafLayout::Row if crate::hash_pin::base_hash() == crate::hash_pin::BaseHash::P1 => Some(
-            crate::hash_pin::p1_static_root("zero page", options, LeafLayout::Row, || {
-                compute_precomputed_commitment_with(
-                    &PageConfig::zero_init(0),
-                    options,
-                    LeafLayout::Row,
-                )
-            }),
-        ),
+        LeafLayout::Row
+            if crate::hash_pin::base_of(&options.format) == crate::hash_pin::BaseHash::P1 =>
+        {
+            Some(crate::hash_pin::p1_static_root(
+                "zero page",
+                options,
+                LeafLayout::Row,
+                || {
+                    compute_precomputed_commitment_with(
+                        &PageConfig::zero_init(0),
+                        options,
+                        LeafLayout::Row,
+                    )
+                },
+            ))
+        }
         LeafLayout::Row => (options.coset_offset == 3)
             .then(|| static_zero_page_commitment_one_row(options.blowup_factor))
             .flatten(),
@@ -717,11 +724,16 @@ pub fn private_page_preprocessed_commitment_for(
 ) -> Option<Commitment> {
     match layout {
         LeafLayout::RowPair => Some(private_page_preprocessed_commitment(options)),
-        LeafLayout::Row if crate::hash_pin::base_hash() == crate::hash_pin::BaseHash::P1 => Some(
-            crate::hash_pin::p1_static_root("private page", options, LeafLayout::Row, || {
-                compute_offset_only_commitment_with(options, LeafLayout::Row)
-            }),
-        ),
+        LeafLayout::Row
+            if crate::hash_pin::base_of(&options.format) == crate::hash_pin::BaseHash::P1 =>
+        {
+            Some(crate::hash_pin::p1_static_root(
+                "private page",
+                options,
+                LeafLayout::Row,
+                || compute_offset_only_commitment_with(options, LeafLayout::Row),
+            ))
+        }
         LeafLayout::Row => (options.coset_offset == 3)
             .then(|| static_private_page_commitment_one_row(options.blowup_factor))
             .flatten(),
@@ -845,6 +857,8 @@ struct DataPageKey {
     blowup: u8,
     coset_offset: u64,
     layout: LeafLayout,
+    /// The base hash the root is under: one process may prove both.
+    hash: stark::config::CommitmentHash,
 }
 
 impl DataPageKey {
@@ -860,6 +874,7 @@ impl DataPageKey {
             blowup: options.blowup_factor,
             coset_offset: options.coset_offset,
             layout,
+            hash: options.format.base.hash,
         }
     }
 }

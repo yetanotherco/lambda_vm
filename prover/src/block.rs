@@ -25,7 +25,7 @@ use stark::prover::IsStarkProver;
 use stark::residency_mode::ResidencyMode;
 
 use crate::finish_sink::{self, FinishSink, FinishedTable};
-use crate::statement::{StatementKind, absorb_statement};
+use crate::statement::StatementKind;
 use crate::tables::MaxRowsConfig;
 use crate::tables::gpack::{self, TraceForm};
 use crate::tables::register;
@@ -138,8 +138,8 @@ pub fn verify_block(
     )
 }
 
-/// [`verify_block`] under the base configuration `base` rather than this
-/// process's ([`crate::hash_pin::base_hash`]): a proof made under one base hash
+/// [`verify_block`] under the base configuration `base` rather than the
+/// options' format (`format.base`): a proof made under one base hash
 /// must be refused by the other's verifier.
 #[cfg(all(test, feature = "cuda"))]
 pub(crate) fn verify_block_under(
@@ -303,8 +303,7 @@ fn prove_block_with_observed(
     residency: ResidencyMode,
     on_shape: &mut dyn FnMut(&crate::lfm::block_plan::BlockShape),
 ) -> Result<(VmProof, BlockTimes), Error> {
-    crate::hash_pin::check_knobs().map_err(Error::Prover)?;
-    match crate::hash_pin::base_hash() {
+    match crate::hash_pin::checked_base(&opts.format).map_err(Error::Prover)? {
         crate::hash_pin::BaseHash::Rpx => prove_block_under::<crate::hash_pin::RpxBlock>(
             elf_bytes,
             private_input,
@@ -2682,7 +2681,7 @@ fn build_streamed<C: crate::hash_pin::BlockHash>(
 /// Prints the instance census and hands `on_shape` the proof's shape before
 /// proving.
 ///
-/// Under this process's base hash ([`crate::hash_pin::base_hash`]); RPX
+/// Under the base hash `opts.format.base` names; RPX
 /// precommits only, the only kind a caller outside phase A has.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_block_traces(
@@ -2696,7 +2695,7 @@ pub fn prove_block_traces(
     times: &mut BlockTimes,
     on_shape: &mut dyn FnMut(&crate::lfm::block_plan::BlockShape),
 ) -> Result<VmProof, Error> {
-    match crate::hash_pin::base_hash() {
+    match crate::hash_pin::checked_base(&opts.format).map_err(Error::Prover)? {
         crate::hash_pin::BaseHash::Rpx => prove_block_traces_with::<crate::hash_pin::RpxBlock>(
             elf_bytes,
             program,
@@ -2766,10 +2765,11 @@ fn prove_block_traces_with<C: crate::hash_pin::BlockHash>(
         .filter(|c| c.is_private_input)
         .count();
     let mut transcript = C::transcript(&[]);
-    absorb_statement(
+    crate::statement::absorb_statement_with_digest_and_tag(
         &mut transcript,
+        &C::statement_tag(&opts.format),
         StatementKind::Monolithic,
-        elf_bytes,
+        &crate::statement::elf_digest(elf_bytes),
         &traces.public_output_bytes,
         &table_counts,
         num_private_input_pages,

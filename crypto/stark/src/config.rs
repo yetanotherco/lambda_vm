@@ -127,7 +127,7 @@ where
 /// compile time, so a variant added here without one is a build error naming
 /// the gap, and the bridge cannot cross-pair two hashes. A twin whose kernels
 /// are not yet ported is legal: its dispatch arms abort loudly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommitmentHash {
     /// Keccak-256 at both the leaf and the parent layer.
     Keccak256,
@@ -277,31 +277,22 @@ pub trait StarkHash: Send + Sync + 'static {
 
     /// Children per Merkle node in both families (`IsMerkleTreeBackend::ARITY`;
     /// a configuration states it once, and its backends must agree). At 4 the
-    /// format's binary cap policy does not apply: the trees take
-    /// [`Self::arity4_cap`] instead.
+    /// format's binary cap policy does not apply: the trees take the format's
+    /// `base.arity4_cap` instead ([`effective_cap_policy`]).
     const ARITY: usize = 2;
-
-    /// The cap policy of an arity-4 configuration's trees, heights in 4-ary
-    /// levels (`crypto::merkle_tree::cap`'s arity-4 shape). The format's
-    /// `merkle_cap` prices binary caps, so an arity-4 configuration states its
-    /// own. A verifier constant of the configuration, never read from a proof.
-    /// Unused at arity 2.
-    fn arity4_cap() -> crypto::merkle_tree::cap::CapPolicy {
-        crypto::merkle_tree::cap::CapPolicy::Off
-    }
 }
 
-/// The cap policy a configuration actually runs: the format's at arity 2, the
-/// configuration's own [`StarkHash::arity4_cap`] at arity 4 (heights in 4-ary
-/// levels). A verifier constant, derived from the configuration and never
-/// from the proof.
+/// The cap policy a configuration actually runs under `format`: the format's
+/// `merkle_cap` at arity 2, its `base.arity4_cap` at arity 4 (heights in 4-ary
+/// levels). A verifier constant, from the verifier's format and never from the
+/// proof.
 pub fn effective_cap_policy<H: StarkHash>(
-    policy: crypto::merkle_tree::cap::CapPolicy,
+    format: &crate::proof::options::ProofFormat,
 ) -> crypto::merkle_tree::cap::CapPolicy {
     if H::ARITY == 2 {
-        policy
+        format.merkle_cap
     } else {
-        H::arity4_cap()
+        format.base.arity4_cap
     }
 }
 

@@ -171,157 +171,63 @@ pub const BLOCK_COMMITMENT_HASH: stark::config::CommitmentHash =
     <BlockStarkHash as stark::config::StarkHash>::COMMITMENT_HASH;
 
 // =========================================================================
-// The base-hash knob (`p1/*` exploration branch)
+// The base format (`p1/*` exploration branch)
 // =========================================================================
 
-/// Which hash the block path's BASE proof commits under in this process: the
-/// pin above ([`BaseHash::Rpx`], the default), or ZisK's Poseidon1
-/// ([`BaseHash::P1`]: `lfm::p1_commit`, 4-ary trees, ZisK's transcript and
-/// width-8 grind). Read once from [`BASE_HASH_ENV`] by the prover AND the host
-/// verifier of one binary — a verifier-side constant, never a field of the
-/// proof — so the two arms of an A/B are one binary.
+/// Which hash the block path's BASE proof commits under: the pin above
+/// ([`BaseHash::Rpx`], the default), or ZisK's Poseidon1 ([`BaseHash::P1`]:
+/// `lfm::p1_commit`, 4-ary trees, ZisK's transcript and width-8 grind).
 ///
-/// ⚠ Exploration only. The recursion still verifies RPX proofs, so a P1 base
-/// proof is proved and host-verified, never wrapped; the epoch and LFM paths
-/// refuse to run under P1 ([`require_rpx_base`]).
+/// It is the verifier's format, never the proof's and never the
+/// environment's: [`base_of`] reads it from the `ProofOptions` the caller
+/// passes (`format.base`), and the block prover, the host verifier and the
+/// preprocessed roots all take it from there. The recursion still verifies
+/// RPX proofs, so a P1 base proof is proved and host-verified, never wrapped;
+/// the epoch and LFM provers refuse a P1 format ([`require_rpx_base`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaseHash {
-    /// [`BlockStarkHash`] under [`BlockTranscript`]: every proof's bytes as
-    /// they are without the knob.
+    /// [`BlockStarkHash`] under [`BlockTranscript`]: `BaseFormat::RPX`, today.
     Rpx,
     /// [`crate::lfm::p1_commit::P1StarkHash`] under
-    /// [`crate::lfm::p1_commit::P1Transcript`].
+    /// [`crate::lfm::p1_commit::P1Transcript`]: `BaseFormat::P1`.
     P1,
 }
 
-/// `rpx` (or unset) | `p1`. Any other value aborts, naming these: a typo read
-/// as the default would make one arm of an A/B the other.
-pub const BASE_HASH_ENV: &str = "LAMBDA_VM_BASE_HASH";
+/// The base configuration `format` names: [`BaseHash::P1`] for a Poseidon1
+/// base, else the pin. What the preprocessed roots and the statics follow;
+/// the prove and verify entries check the name first ([`checked_base`]).
+pub fn base_of(format: &stark::proof::options::ProofFormat) -> BaseHash {
+    match format.base.hash {
+        stark::config::CommitmentHash::Poseidon1 => BaseHash::P1,
+        _ => BaseHash::Rpx,
+    }
+}
 
-/// The value of [`BASE_HASH_ENV`] as a [`BaseHash`]; `None` is unset.
-pub fn parse_base_hash(value: Option<&str>) -> Result<BaseHash, String> {
-    match value.map(|v| v.trim().to_ascii_lowercase()) {
-        None => Ok(BaseHash::Rpx),
-        Some(v) if v == "rpx" => Ok(BaseHash::Rpx),
-        Some(v) if v == "p1" => Ok(BaseHash::P1),
-        Some(v) => Err(format!(
-            "{BASE_HASH_ENV}={v:?}: expected `rpx` (the default) or `p1`"
+/// [`base_of`], refusing a base hash the block path has no configuration for
+/// (the pin's or Poseidon1 only). The block prover and verifier entries call
+/// this, so a format naming another hash is a typed refusal there.
+pub fn checked_base(format: &stark::proof::options::ProofFormat) -> Result<BaseHash, String> {
+    match format.base.hash {
+        stark::config::CommitmentHash::Poseidon1 => Ok(BaseHash::P1),
+        h if h == BLOCK_COMMITMENT_HASH => Ok(BaseHash::Rpx),
+        h => Err(format!(
+            "the block path has no base configuration for the format's hash {h:?} \
+             (expected {BLOCK_COMMITMENT_HASH:?} or Poseidon1)"
         )),
     }
 }
 
-/// ★ This process's base hash, read once. Prints one line on the first read
-/// (the default included), so a log names its arm.
-#[cfg(not(target_os = "zkvm"))]
-pub fn base_hash() -> BaseHash {
-    static BASE: std::sync::OnceLock<BaseHash> = std::sync::OnceLock::new();
-    *BASE.get_or_init(|| {
-        let raw = std::env::var(BASE_HASH_ENV).ok();
-        let base = parse_base_hash(raw.as_deref()).unwrap_or_else(|e| {
-            eprintln!("BASE HASH: {e}");
-            std::process::abort()
-        });
-        eprintln!(
-            "BASE HASH: {} ({})",
-            match base {
-                BaseHash::Rpx => "rpx — RPX256, binary trees",
-                BaseHash::P1 => "p1 — ZisK's Poseidon1, 4-ary trees, width-8 grind",
-            },
-            raw.map_or("the default".to_string(), |v| format!(
-                "{BASE_HASH_ENV}={v}"
-            ))
-        );
-        base
-    })
-}
-
-/// The recursion guest verifies RPX base proofs only.
-#[cfg(target_os = "zkvm")]
-pub fn base_hash() -> BaseHash {
-    BaseHash::Rpx
-}
-
-/// `LAMBDA_VM_P1_CAP`: the Merkle cap height of every P1 tree, in 4-ary
-/// levels (`crypto::merkle_tree::cap`'s arity-4 shape): `off` or `0`, or
-/// `1..=8`; unset is [`P1_CAP_DEFAULT`]. Anything else aborts, naming these
-/// (a typo read as the default would make one arm of an A/B the other).
-pub const P1_CAP_ENV: &str = "LAMBDA_VM_P1_CAP";
-
-/// The P1 trees' default cap: 4-ary height 4 (binary height 8), the height
-/// that minimises the proof's bytes at 110 queries (I-P1C §5).
-pub const P1_CAP_DEFAULT: stark::proof::options::CapPolicy =
-    stark::proof::options::CapPolicy::Fixed(4);
-
-/// The value of [`P1_CAP_ENV`] as a cap policy; `None` is unset.
-pub fn parse_p1_cap(value: Option<&str>) -> Result<stark::proof::options::CapPolicy, String> {
-    use stark::proof::options::CapPolicy;
-    let Some(v) = value.map(|v| v.trim().to_ascii_lowercase()) else {
-        return Ok(P1_CAP_DEFAULT);
-    };
-    match v.as_str() {
-        "off" | "0" => Ok(CapPolicy::Off),
-        _ => match v.parse::<u8>() {
-            Ok(c @ 1..=8) => Ok(CapPolicy::Fixed(c)),
-            _ => Err(format!(
-                "{P1_CAP_ENV}={v:?}: expected `off`, `0` or a 4-ary height `1`..=`8` \
-                 (unset: 4)"
-            )),
-        },
-    }
-}
-
-/// ★ This process's P1 cap policy ([`P1_CAP_ENV`]), read once by the prover
-/// and the host verifier alike: a verifier constant of the P1 configuration
-/// (`P1StarkHash::arity4_cap`), never a field of the proof. Prints one line on
-/// the first read.
-#[cfg(not(target_os = "zkvm"))]
-pub fn p1_cap() -> stark::proof::options::CapPolicy {
-    static CAP: std::sync::OnceLock<stark::proof::options::CapPolicy> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        let raw = std::env::var(P1_CAP_ENV).ok();
-        let cap = parse_p1_cap(raw.as_deref()).unwrap_or_else(|e| {
-            eprintln!("P1 CAP: {e}");
-            std::process::abort()
-        });
-        eprintln!(
-            "P1 CAP: {cap} (4-ary levels; {})",
-            raw.map_or("the default".to_string(), |v| format!("{P1_CAP_ENV}={v}"))
-        );
-        cap
-    })
-}
-
-/// The recursion guest verifies no P1 proof.
-#[cfg(target_os = "zkvm")]
-pub fn p1_cap() -> stark::proof::options::CapPolicy {
-    P1_CAP_DEFAULT
-}
-
-/// The base-hash knobs ([`BASE_HASH_ENV`], [`P1_CAP_ENV`]) as this process
-/// has them, checked without reading them into the process: `Err` names a
-/// value [`base_hash`] or [`p1_cap`] would abort on. The block prover and
-/// verifier entries call it first, so a bad knob is a typed refusal there.
-#[cfg(not(target_os = "zkvm"))]
-pub fn check_knobs() -> Result<(), String> {
-    parse_base_hash(std::env::var(BASE_HASH_ENV).ok().as_deref())?;
-    parse_p1_cap(std::env::var(P1_CAP_ENV).ok().as_deref())?;
-    Ok(())
-}
-
-/// The recursion guest reads no knob.
-#[cfg(target_os = "zkvm")]
-pub fn check_knobs() -> Result<(), String> {
-    Ok(())
-}
-
-/// Refuse a path that has no P1 arm (the epoch pipeline, the LFM recursion)
-/// under [`BaseHash::P1`], rather than letting it mix RPX proofs with P1
-/// preprocessed roots. The error names the path; the caller types it.
-pub fn require_rpx_base(path: &str) -> Result<(), String> {
-    match base_hash() {
+/// Refuse a path that has no P1 arm (the epoch pipeline, the monolithic and
+/// LFM provers) under a P1 format, rather than letting it mix RPX proofs with
+/// P1 preprocessed roots. The error names the path; the caller types it.
+pub fn require_rpx_base(
+    path: &str,
+    options: &stark::proof::options::ProofOptions,
+) -> Result<(), String> {
+    match base_of(&options.format) {
         BaseHash::Rpx => Ok(()),
         BaseHash::P1 => Err(format!(
-            "{path} has no Poseidon1 arm: unset {BASE_HASH_ENV} (it is p1)"
+            "{path} has no Poseidon1 arm: its options' format names a Poseidon1 base"
         )),
     }
 }
@@ -367,7 +273,7 @@ pub fn p1_static_root(
 /// before the clock starts, so the P1 arm's prove pays what the RPX arm's
 /// pays for them: nothing.
 pub fn warm_base_statics(options: &stark::proof::options::ProofOptions) {
-    if base_hash() != BaseHash::P1 {
+    if base_of(&options.format) != BaseHash::P1 {
         return;
     }
     use stark::leaf_layout::LeafLayout;
@@ -419,7 +325,8 @@ pub fn warm_base_statics(options: &stark::proof::options::ProofOptions) {
 /// A base-proof configuration: the commitment configuration and the
 /// Fiat–Shamir transcript object, named together so the two cannot be mixed
 /// (the module header's half-flip). The block prover and the host verifier are
-/// generic over it; [`base_hash`] picks the instance once, at their entries.
+/// generic over it; [`checked_base`] picks the instance once, at their entries,
+/// from the options' format.
 pub trait BlockHash: Send + Sync + 'static {
     /// The commitment configuration.
     type H: stark::config::StarkHash;
@@ -429,10 +336,13 @@ pub trait BlockHash: Send + Sync + 'static {
             crate::tables::types::GoldilocksField,
         > + Clone
         + Send;
-    /// The knob value this configuration answers to.
+    /// The base this configuration answers to.
     const BASE: BaseHash;
     /// A fresh transcript over `seed`.
     fn transcript(seed: &[u8]) -> Self::Transcript;
+    /// The monolithic statement's leading domain tag under `format`: it names
+    /// the commitment geometry the statement is about (I-P1C §9.2).
+    fn statement_tag(format: &stark::proof::options::ProofFormat) -> Vec<u8>;
 }
 
 /// The pin: [`BlockStarkHash`] under [`BlockTranscript`].
@@ -444,6 +354,10 @@ impl BlockHash for RpxBlock {
     const BASE: BaseHash = BaseHash::Rpx;
     fn transcript(seed: &[u8]) -> BlockTranscript {
         block_transcript(seed)
+    }
+    /// Today's tag, byte for byte: RPX statements do not move.
+    fn statement_tag(_: &stark::proof::options::ProofFormat) -> Vec<u8> {
+        crate::statement::DOMAIN_TAG.to_vec()
     }
 }
 
@@ -457,7 +371,36 @@ impl BlockHash for P1Block {
     fn transcript(seed: &[u8]) -> Self::Transcript {
         crate::lfm::p1_commit::P1Transcript::with_seed(seed)
     }
+    /// `LAMBDAVM_STARK_STATEMENT_V5/P1W16/C<h>`: the hash and its 4-ary cap
+    /// height (`C0` uncapped).
+    fn statement_tag(format: &stark::proof::options::ProofFormat) -> Vec<u8> {
+        p1_statement_tag(format.base.arity4_cap)
+    }
 }
+
+/// The P1 statement tag at cap `cap` ([`BlockHash::statement_tag`]). A test
+/// can build the RPX tag in its place (`p1_tag_omitted_for_test`) to show the
+/// tag is checked.
+pub fn p1_statement_tag(cap: stark::proof::options::CapPolicy) -> Vec<u8> {
+    #[cfg(test)]
+    if P1_TAG_OMITTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return crate::statement::DOMAIN_TAG.to_vec();
+    }
+    let height = match cap {
+        stark::proof::options::CapPolicy::Fixed(c) => c,
+        _ => 0,
+    };
+    let mut tag = crate::statement::DOMAIN_TAG.to_vec();
+    tag.extend_from_slice(format!("/P1W16/C{height}").as_bytes());
+    tag
+}
+
+/// Test only: P1 statements take RPX's tag while set (a mutation of the tag,
+/// and the reproduction of the pre-tag P1 bytes). Process-global: a test that
+/// sets it runs in its own process.
+#[cfg(test)]
+pub static P1_TAG_OMITTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The prover at configuration `C`.
 pub type BlockProverOf<C, Field, FieldExtension, PI> =
@@ -471,36 +414,104 @@ pub type BlockVerifierOf<C, Field, FieldExtension, PI> =
 mod tests {
     use super::*;
 
-    /// The P1 cap knob's spellings: unset is the default height 4, `off`/`0`
-    /// uncapped, `1..=8` a height; anything else is refused.
+    /// The format names the configuration: RPX's base is the pin, a
+    /// Poseidon1 base is P1, any other hash is refused at the entries.
     #[test]
-    fn the_p1_cap_knob_accepts_off_and_heights_only() {
-        use stark::proof::options::CapPolicy;
-        assert_eq!(parse_p1_cap(None), Ok(CapPolicy::Fixed(4)));
-        assert_eq!(parse_p1_cap(Some("off")), Ok(CapPolicy::Off));
-        assert_eq!(parse_p1_cap(Some(" 0 ")), Ok(CapPolicy::Off));
-        assert_eq!(parse_p1_cap(Some("3")), Ok(CapPolicy::Fixed(3)));
-        assert_eq!(parse_p1_cap(Some("8")), Ok(CapPolicy::Fixed(8)));
-        for bad in ["9", "auto", "-1", "4x", ""] {
-            assert!(parse_p1_cap(Some(bad)).is_err(), "{bad:?}");
-        }
+    fn the_base_format_names_the_configuration() {
+        use stark::proof::options::{BaseFormat, ProofFormat};
+        let with = |base| ProofFormat {
+            base,
+            ..ProofFormat::LEGACY
+        };
+        assert_eq!(base_of(&ProofFormat::LEGACY), BaseHash::Rpx);
+        assert_eq!(checked_base(&ProofFormat::LEGACY), Ok(BaseHash::Rpx));
+        assert_eq!(base_of(&with(BaseFormat::P1)), BaseHash::P1);
+        assert_eq!(checked_base(&with(BaseFormat::P1)), Ok(BaseHash::P1));
+        let keccak = with(BaseFormat {
+            hash: stark::config::CommitmentHash::Keccak256,
+            ..BaseFormat::RPX
+        });
+        assert!(checked_base(&keccak).is_err());
+        let opts = |format| stark::proof::options::ProofOptions {
+            format,
+            ..stark::proof::options::ProofOptions::default_test_options()
+        };
+        assert!(require_rpx_base("x", &opts(ProofFormat::LEGACY)).is_ok());
+        assert!(require_rpx_base("x", &opts(with(BaseFormat::P1))).is_err());
     }
 
-    /// The knob's spellings: unset and `rpx` are the pin, `p1` the exploration
-    /// arm, anything else is refused (never read as the default).
+    /// RPX's statement tag is today's byte for byte; P1's names the hash and
+    /// its cap height, so the two never share a statement prefix.
     #[test]
-    fn the_base_hash_knob_accepts_its_two_spellings_only() {
-        assert_eq!(parse_base_hash(None), Ok(BaseHash::Rpx));
-        assert_eq!(parse_base_hash(Some("rpx")), Ok(BaseHash::Rpx));
-        assert_eq!(parse_base_hash(Some(" RPX ")), Ok(BaseHash::Rpx));
-        assert_eq!(parse_base_hash(Some("p1")), Ok(BaseHash::P1));
-        assert_eq!(parse_base_hash(Some("P1")), Ok(BaseHash::P1));
-        for bad in ["", "poseidon", "p2", "1", "rpx256"] {
-            assert!(
-                parse_base_hash(Some(bad)).is_err(),
-                "{bad:?} must be refused"
-            );
+    fn the_statement_tags_name_the_base() {
+        use stark::proof::options::{BaseFormat, CapPolicy, ProofFormat};
+        let p1 = |cap| ProofFormat {
+            base: BaseFormat {
+                arity4_cap: cap,
+                ..BaseFormat::P1
+            },
+            ..ProofFormat::LEGACY
+        };
+        assert_eq!(
+            RpxBlock::statement_tag(&ProofFormat::LEGACY),
+            b"LAMBDAVM_STARK_STATEMENT_V5".to_vec()
+        );
+        assert_eq!(
+            P1Block::statement_tag(&p1(CapPolicy::Fixed(4))),
+            b"LAMBDAVM_STARK_STATEMENT_V5/P1W16/C4".to_vec()
+        );
+        assert_eq!(
+            P1Block::statement_tag(&p1(CapPolicy::Off)),
+            b"LAMBDAVM_STARK_STATEMENT_V5/P1W16/C0".to_vec()
+        );
+    }
+
+    /// ★ No environment read decides the base: the library's sources name
+    /// neither former knob, and `hash_pin` reads no environment at all. The
+    /// base comes from the caller's `ProofOptions` (I-P1C §9.3).
+    #[test]
+    fn no_environment_read_decides_the_base() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("readable source tree") {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n != "tests") {
+                        walk(&path, out);
+                    }
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && !path.to_string_lossy().ends_with("_tests.rs")
+                {
+                    out.push(path);
+                }
+            }
         }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        assert!(
+            files.len() > 50,
+            "the walk found the library ({} files)",
+            files.len()
+        );
+        let knobs = [
+            concat!("LAMBDA_VM_", "BASE_HASH"),
+            concat!("LAMBDA_VM_", "P1_CAP"),
+        ];
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("readable source");
+            for knob in knobs {
+                assert!(!text.contains(knob), "{} names {knob}", file.display());
+            }
+        }
+        let pin = std::fs::read_to_string(src.join("hash_pin.rs")).expect("hash_pin.rs");
+        let library = pin
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("the library half");
+        assert!(
+            !library.contains("std::env"),
+            "hash_pin reads the environment"
+        );
     }
 
     /// ✓ The RPX configuration IS the pin: same commitment configuration, same

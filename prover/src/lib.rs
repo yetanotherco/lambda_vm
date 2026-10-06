@@ -64,7 +64,7 @@ use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
 use stark::verifier::IsStarkVerifier;
 
-use crate::statement::{StatementKind, absorb_statement, absorb_statement_with_digest};
+use crate::statement::{StatementKind, absorb_statement};
 pub use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise;
 use crate::tables::decode;
@@ -1659,7 +1659,8 @@ pub fn prove_with_options_and_inputs(
     max_rows: &MaxRowsConfig,
 ) -> Result<VmProof, Error> {
     // The block prover (`block::prove_block`) is the one with a Poseidon1 arm.
-    crate::hash_pin::require_rpx_base("prove_with_options_and_inputs").map_err(Error::Prover)?;
+    crate::hash_pin::require_rpx_base("prove_with_options_and_inputs", proof_options)
+        .map_err(Error::Prover)?;
     #[cfg(feature = "instruments")]
     let total_start = std::time::Instant::now();
     #[cfg(feature = "instruments")]
@@ -1912,7 +1913,6 @@ pub(crate) fn verify_prepared_shaped(
     page_commitments: Option<&[(u64, Commitment)]>,
     shape: AcceleratorShape,
 ) -> Result<bool, Error> {
-    crate::hash_pin::check_knobs().map_err(Error::Prover)?;
     verify_prepared_shaped_under(
         vm_proof,
         program,
@@ -1921,7 +1921,7 @@ pub(crate) fn verify_prepared_shaped(
         decode_commitment,
         page_commitments,
         shape,
-        crate::hash_pin::base_hash(),
+        crate::hash_pin::checked_base(&proof_options.format).map_err(Error::Prover)?,
     )
 }
 
@@ -1987,7 +1987,7 @@ fn verify_proof_parts(
         decode_commitment,
         page_commitments,
         shape,
-        crate::hash_pin::base_hash(),
+        crate::hash_pin::checked_base(&proof_options.format).map_err(Error::Prover)?,
     )
 }
 
@@ -2079,10 +2079,11 @@ fn verify_proof_parts_under(
     // actual bus total in the proof, and multi_verify will reject.
     let air_refs = airs.air_refs();
 
-    // The base configuration is the caller's (this process's,
-    // [`hash_pin::base_hash`], on every production path): a verifier-side
-    // constant, never read from the proof.
+    // The base configuration is the caller's (its options' `format.base`,
+    // `hash_pin::checked_base`): a verifier-side constant, never read from the
+    // proof or the environment.
     let statement = MonolithicStatement {
+        format: &proof_options.format,
         elf_digest,
         public_output,
         table_counts,
@@ -2102,6 +2103,8 @@ fn verify_proof_parts_under(
 
 /// What a monolithic proof's transcript absorbs before its first commitment.
 struct MonolithicStatement<'a> {
+    /// The verifier's format: its base names the statement's tag.
+    format: &'a stark::proof::options::ProofFormat,
     elf_digest: &'a [u8; 32],
     public_output: &'a [u8],
     table_counts: &'a TableCounts,
@@ -2122,8 +2125,9 @@ fn verify_monolithic_under<C: crate::hash_pin::BlockHash>(
     // field makes this diverge from the prover's transcript state, so every
     // derived challenge differs and verification rejects.
     let mut transcript = C::transcript(&[]);
-    absorb_statement_with_digest(
+    crate::statement::absorb_statement_with_digest_and_tag(
         &mut transcript,
+        &C::statement_tag(statement.format),
         StatementKind::Monolithic,
         statement.elf_digest,
         statement.public_output,

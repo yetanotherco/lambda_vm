@@ -104,6 +104,34 @@ pub(crate) fn absorb_statement_with_digest(
         StatementKind::Monolithic => DOMAIN_TAG,
         StatementKind::ContinuationEpoch { .. } => CONTINUATION_EPOCH_TAG,
     };
+    absorb_statement_with_digest_and_tag(
+        t,
+        domain_tag,
+        kind,
+        elf_digest,
+        public_output,
+        table_counts,
+        num_private_input_pages,
+        runtime_page_ranges,
+        fri_final_poly_log_degree,
+    )
+}
+
+/// [`absorb_statement_with_digest`] under an explicit leading domain tag: the
+/// block path's, which names the base proof's commitment geometry
+/// (`hash_pin::BlockHash::statement_tag`; RPX's is [`DOMAIN_TAG`] itself).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn absorb_statement_with_digest_and_tag(
+    t: &mut impl IsTranscript<E>,
+    domain_tag: &[u8],
+    kind: StatementKind,
+    elf_digest: &[u8; 32],
+    public_output: &[u8],
+    table_counts: &TableCounts,
+    num_private_input_pages: usize,
+    runtime_page_ranges: &[RuntimePageRange],
+    fri_final_poly_log_degree: u8,
+) {
     t.append_bytes(domain_tag);
 
     // ELF: fixed 32-byte digest — no length prefix needed.

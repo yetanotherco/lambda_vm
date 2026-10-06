@@ -61,7 +61,7 @@ use multilinear::whir_chain::{
     ChainConfig, ChainFormat, FirstFold, GrindBits, NonceLayout, StackVars, WhirFolds,
 };
 use stark::proof::options::{
-    CapPolicy, FriMode, LogUpPolicy, OneRowMode, ProofFormat, ProofOptions,
+    BaseFormat, CapPolicy, FriMode, LogUpPolicy, OneRowMode, ProofFormat, ProofOptions,
 };
 
 /// The knob names, in banner order.
@@ -105,6 +105,11 @@ pub struct ZfFormat {
     /// LogUp interactions per aux term column, on the STARK base tables only
     /// ([`Self::base_proof_format`]); the LFM chips keep pairs.
     pub logup: LogUpPolicy,
+    /// The base proof's commitment hash and its arity-4 cap
+    /// ([`BaseFormat`]), on the STARK base tables only; the LFM proofs keep
+    /// RPX. No knob sets it: a caller that proves or verifies Poseidon1 says
+    /// so in the format it passes ([`Self::P1`]).
+    pub base: BaseFormat,
 }
 
 /// Where the WHIR base chains grind (P2), and so which nonces their rounds
@@ -225,6 +230,14 @@ impl ZfFormat {
         whir_stack: DEFAULT_WHIR_STACK,
         whir_grind: WhirGrind::Query,
         logup: LogUpPolicy::K4,
+        base: BaseFormat::RPX,
+    };
+
+    /// [`Self::DEFAULT`] with ZisK's Poseidon1 as the base hash, its trees
+    /// capped at 4-ary height 4 ([`BaseFormat::P1`]). Not a default anywhere.
+    pub const P1: Self = Self {
+        base: BaseFormat::P1,
+        ..Self::DEFAULT
     };
 
     /// The legacy format: every lever off. What all eight knobs at their
@@ -239,6 +252,7 @@ impl ZfFormat {
         whir_stack: StackVars::LEGACY,
         whir_grind: WhirGrind::All,
         logup: LogUpPolicy::Pair,
+        base: BaseFormat::RPX,
     };
 
     /// True when every lever is off: the format proves exactly what the
@@ -252,6 +266,7 @@ impl ZfFormat {
             && self.whir_stack == StackVars::LEGACY
             && self.whir_grind == WhirGrind::All
             && self.logup == LogUpPolicy::Pair
+            && self.base == BaseFormat::RPX
     }
 
     /// Parse the eight knobs through `lookup` (the process environment in
@@ -389,7 +404,10 @@ impl ZfFormat {
             self.whir_stack.get(),
             self.whir_grind,
             self.logup
-        )
+        ) + &match self.base {
+            BaseFormat::RPX => String::new(),
+            base => format!(" base={:?}/c{}", base.hash, base.arity4_cap),
+        }
     }
 
     /// `ZF WHIR SCHEDULES: whir_folds=… n=20:[…] … n=<stack>:[…]` — the fold
@@ -421,6 +439,8 @@ impl ZfFormat {
             // A test hook only; no knob sets it.
             fri_schedule_override: None,
             logup: LogUpPolicy::Pair,
+            // The LFM proofs' own commitments stay RPX.
+            base: BaseFormat::RPX,
         }
     }
 
@@ -429,6 +449,7 @@ impl ZfFormat {
     pub fn base_proof_format(&self) -> ProofFormat {
         ProofFormat {
             logup: self.logup,
+            base: self.base,
             ..self.proof_format()
         }
     }
@@ -572,6 +593,7 @@ mod tests {
                 whir_stack: StackVars::new(27).unwrap(),
                 whir_grind: WhirGrind::Query,
                 logup: LogUpPolicy::K4,
+                base: BaseFormat::RPX,
             }
         );
         assert_eq!(
@@ -803,6 +825,7 @@ mod tests {
             whir_stack: StackVars::new(26).unwrap(),
             whir_grind: WhirGrind::All,
             logup: LogUpPolicy::K4,
+            base: BaseFormat::RPX,
         };
         assert_eq!(
             f.banner(),

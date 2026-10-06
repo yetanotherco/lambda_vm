@@ -437,7 +437,7 @@ pub fn compute_precomputed_commitment_with(
     // commitment the prover recomputes and compares against, so building it with
     // a different hash than the path commits under fails at prove time with
     // `PrecomputedCommitmentMismatch` — which is exactly how it was found.
-    crate::lfm::commit::commit_lde_columns_with(&lde_columns, layout)
+    crate::lfm::commit::commit_lde_columns_for(&lde_columns, layout, options)
 }
 
 /// DECODE's commitment source for both leaf layouts: the row-pair root

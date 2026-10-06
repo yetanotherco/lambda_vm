@@ -298,12 +298,6 @@ impl StarkHash for P1StarkHash {
     const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Poseidon1;
 
     const ARITY: usize = 4;
-
-    /// This process's P1 cap ([`crate::hash_pin::p1_cap`], default 4-ary
-    /// height 4).
-    fn arity4_cap() -> stark::proof::options::CapPolicy {
-        crate::hash_pin::p1_cap()
-    }
 }
 
 // The configuration's arity is its backends'.

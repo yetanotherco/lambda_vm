@@ -1,8 +1,7 @@
 //! STARK round trips under ZisK's Poseidon1 configuration (`P1StarkHash`:
 //! arity-4 trees, ZisK's leaf hash, width-8 grinding), on the host, and the
 //! tamper checks that make the verifier's new path walk load-bearing; the
-//! arity-4 Merkle caps at fixed heights ([`P1At`]), whatever this process's
-//! `LAMBDA_VM_P1_CAP` says.
+//! arity-4 Merkle caps at fixed heights, set by the format's `base`.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
@@ -21,50 +20,59 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{GenericVerifier, IsStarkVerifier};
 
-use math::field::traits::IsField;
-use math::traits::AsBytes;
-use stark::config::{CommitmentHash, StarkHash};
-use stark::proof::options::CapPolicy;
+use stark::config::StarkHash;
+use stark::proof::options::{BaseFormat, CapPolicy};
 
-use crate::lfm::p1_commit::{
-    P1BatchBackend, P1PairBackend, P1StarkHash, P1Transcript, P1TranscriptHash,
-};
-
-/// `P1StarkHash` with its arity-4 cap fixed at 4-ary height `C` (0: uncapped).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct P1At<const C: u8>;
-
-impl<const C: u8> StarkHash for P1At<C> {
-    type Batched<Fd>
-        = P1BatchBackend<Fd>
-    where
-        Fd: IsField + 'static,
-        FieldElement<Fd>: AsBytes + Sync + Send;
-
-    type Pair<Fd>
-        = P1PairBackend<Fd>
-    where
-        Fd: IsField + 'static,
-        FieldElement<Fd>: AsBytes + Sync + Send;
-
-    type Transcript = P1TranscriptHash;
-
-    const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Poseidon1;
-
-    const ARITY: usize = 4;
-
-    fn arity4_cap() -> CapPolicy {
-        if C == 0 {
-            CapPolicy::Off
-        } else {
-            CapPolicy::Fixed(C)
-        }
-    }
-}
+use crate::lfm::p1_commit::{P1StarkHash, P1Transcript};
 
 type F = GoldilocksField;
 type E = Degree3GoldilocksExtensionField;
 type Felt = FieldElement<F>;
+
+/// `format` with its base the P1 base at 4-ary cap height `c` (0: uncapped).
+fn at(c: u8, format: ProofFormat) -> ProofFormat {
+    ProofFormat {
+        base: BaseFormat {
+            arity4_cap: if c == 0 {
+                CapPolicy::Off
+            } else {
+                CapPolicy::Fixed(c)
+            },
+            ..BaseFormat::P1
+        },
+        ..format
+    }
+}
+
+/// [`prove_logup_under`] under P1 with the options' format at cap height `c`.
+fn prove_logup_at(
+    c: u8,
+    rows: usize,
+    o: &ProofOptions,
+) -> (
+    LogReadOnlyRAP<F, E>,
+    StarkProof<F, E, LogReadOnlyPublicInputs<F>>,
+) {
+    let o = ProofOptions {
+        format: at(c, o.format),
+        ..o.clone()
+    };
+    prove_logup_under::<P1StarkHash>(rows, &o)
+}
+
+/// The P1 verifier of a logup proof whose format's cap height is `c`: the
+/// verifier's own AIR, at its own format.
+fn verify_logup_at(
+    c: u8,
+    o: &ProofOptions,
+    proof: &StarkProof<F, E, LogReadOnlyPublicInputs<F>>,
+) -> bool {
+    let o = ProofOptions {
+        format: at(c, o.format),
+        ..o.clone()
+    };
+    verify_logup_under::<P1StarkHash>(&LogReadOnlyRAP::<F, E>::new(&o), proof)
+}
 
 fn options(blowup: u8, queries: usize, grinding: u8, format: ProofFormat) -> ProofOptions {
     ProofOptions {
@@ -203,28 +211,25 @@ fn path_nodes(proof: &StarkProof<F, E, LogReadOnlyPublicInputs<F>>) -> usize {
     trace + fri
 }
 
-/// A logup proof under `P1At<C>` at every format, verified by `P1At<C>` and
-/// refused by the verifiers of the neighbouring heights.
-fn capped_round_trip<const C: u8, const LO: u8, const HI: u8>() {
+/// A logup proof at cap height `c` under every format, verified at `c` and
+/// refused by the verifiers of the neighbouring heights `lo` and `hi`.
+fn capped_round_trip(c: u8, lo: u8, hi: u8) {
     for (name, format) in formats() {
         for rows in [128usize, 256] {
             let o = options(4, 30, 0, format);
-            let (air, proof) = prove_logup_under::<P1At<C>>(rows, &o);
+            let (_, proof) = prove_logup_at(c, rows, &o);
+            assert!(verify_logup_at(c, &o, &proof), "{name} rows {rows} c {c}");
             assert!(
-                verify_logup_under::<P1At<C>>(&air, &proof),
-                "{name} rows {rows} c {C}"
-            );
-            assert!(
-                !verify_logup_under::<P1At<LO>>(&air, &proof),
-                "{name} rows {rows} c {C} by {LO}"
+                !verify_logup_at(lo, &o, &proof),
+                "{name} rows {rows} c {c} by {lo}"
             );
             // A height at or past every tree's levels clamps to them: the
             // next height up is the same format there.
             let trace_levels = (rows.trailing_zeros() as usize + 1).div_ceil(2);
-            if (C as usize) < trace_levels {
+            if (c as usize) < trace_levels {
                 assert!(
-                    !verify_logup_under::<P1At<HI>>(&air, &proof),
-                    "{name} rows {rows} c {C} by {HI}"
+                    !verify_logup_at(hi, &o, &proof),
+                    "{name} rows {rows} c {c} by {hi}"
                 );
             }
         }
@@ -257,15 +262,19 @@ fn the_formats_binary_cap_policy_does_not_reach_arity_4() {
         ..ProofFormat::LEGACY
     };
     // No grinding: the proofs must draw the same queries.
-    let (air, a) = prove_logup_under::<P1At<0>>(128, &options(4, 30, 0, auto));
-    let (_, b) = prove_logup_under::<P1At<0>>(128, &options(4, 30, 0, ProofFormat::LEGACY));
-    assert!(verify_logup_under::<P1At<0>>(&air, &a));
+    let (oa, ol) = (
+        options(4, 30, 0, auto),
+        options(4, 30, 0, ProofFormat::LEGACY),
+    );
+    let (_, a) = prove_logup_at(0, 128, &oa);
+    let (_, b) = prove_logup_at(0, 128, &ol);
+    assert!(verify_logup_at(0, &oa, &a));
     assert_eq!(
         a.deep_poly_openings[0].main_trace_polys.proof.merkle_path,
         b.deep_poly_openings[0].main_trace_polys.proof.merkle_path
     );
-    let (_, a) = prove_logup_under::<P1At<2>>(128, &options(4, 30, 0, auto));
-    let (_, b) = prove_logup_under::<P1At<2>>(128, &options(4, 30, 0, ProofFormat::LEGACY));
+    let (_, a) = prove_logup_at(2, 128, &oa);
+    let (_, b) = prove_logup_at(2, 128, &ol);
     assert_eq!(
         a.deep_poly_openings[1].main_trace_polys.proof.merkle_path,
         b.deep_poly_openings[1].main_trace_polys.proof.merkle_path
@@ -276,10 +285,10 @@ fn the_formats_binary_cap_policy_does_not_reach_arity_4() {
 fn p1_caps_round_trip_at_every_height_and_bind_their_height() {
     // 128 and 256 rows at blowup 4: trace trees of 256 and 512 row-pair leaves
     // (binary depths 8 and 9, four and five 4-ary levels), FRI layers below.
-    capped_round_trip::<1, 0, 2>();
-    capped_round_trip::<2, 1, 3>();
-    capped_round_trip::<3, 2, 4>();
-    capped_round_trip::<4, 3, 5>();
+    capped_round_trip(1, 0, 2);
+    capped_round_trip(2, 1, 3);
+    capped_round_trip(3, 2, 4);
+    capped_round_trip(4, 3, 5);
 }
 
 #[test]
@@ -288,9 +297,9 @@ fn a_cap_shortens_the_paths_by_its_height() {
     // the last a two-node group. Uncapped: 15 siblings an opening; at height
     // 2: 9 kept, and query 0 carries the 2·4 = 8 cap nodes.
     let o = options(4, 30, 0, ProofFormat::LEGACY);
-    let (air, open) = prove_logup_under::<P1At<0>>(256, &o);
-    let (_, capped) = prove_logup_under::<P1At<2>>(256, &o);
-    assert!(verify_logup_under::<P1At<2>>(&air, &capped));
+    let (_, open) = prove_logup_at(0, 256, &o);
+    let (_, capped) = prove_logup_at(2, 256, &o);
+    assert!(verify_logup_at(2, &o, &capped));
     let main = |p: &StarkProof<F, E, LogReadOnlyPublicInputs<F>>, q: usize| {
         p.deep_poly_openings[q]
             .main_trace_polys
@@ -314,10 +323,9 @@ fn a_cap_shortens_the_paths_by_its_height() {
 #[test]
 fn a_tampered_capped_p1_proof_is_rejected() {
     let o = options(4, 30, 0, ProofFormat::LEGACY);
-    let (air, proof) = prove_logup_under::<P1At<2>>(256, &o);
-    assert!(verify_logup_under::<P1At<2>>(&air, &proof));
-    let ok =
-        |p: &StarkProof<F, E, LogReadOnlyPublicInputs<F>>| verify_logup_under::<P1At<2>>(&air, p);
+    let (_, proof) = prove_logup_at(2, 256, &o);
+    assert!(verify_logup_at(2, &o, &proof));
+    let ok = |p: &StarkProof<F, E, LogReadOnlyPublicInputs<F>>| verify_logup_at(2, &o, p);
     // A cap node on the owner path (query 0's main opening: 9 siblings, then
     // the 8 cap nodes), of the main, aux and composition trees.
     for at in [9usize, 12, 16] {
@@ -378,10 +386,12 @@ fn a_tampered_capped_p1_proof_is_rejected() {
 #[test]
 fn a_tampered_p1_proof_is_rejected() {
     let o = options(4, 9, 4, ProofFormat::LEGACY);
-    let (air, proof) = prove_logup_under::<P1At<0>>(128, &o);
-    let verify_logup = |air: &LogReadOnlyRAP<F, E>,
+    let (air, proof) = prove_logup_at(0, 128, &o);
+    // The verifier's own AIR at the proof's format (the prover's `air` is the
+    // same), at cap height 0.
+    let verify_logup = |_: &LogReadOnlyRAP<F, E>,
                         p: &StarkProof<F, E, LogReadOnlyPublicInputs<F>>| {
-        verify_logup_under::<P1At<0>>(air, p)
+        verify_logup_at(0, &o, p)
     };
     assert!(verify_logup(&air, &proof));
     // 128 rows at blowup 4: 512 LDE rows in 256 row-pair leaves, four 4-ary
