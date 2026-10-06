@@ -498,12 +498,18 @@ pub fn emit_table_verification(
     if let Some(caps) = arenas.caps {
         let mut at = 0u32;
         for c in &mut commitments {
-            at = c.hint_cap(b, caps, at, shape.sub.trace_cap);
+            at = c.hint_cap(b, caps, at, shape.sub.trace_cap, shape.sub.merkle_depth);
         }
         assert_eq!(at as usize, shape.sub.cap_words(digest_words));
         let mut fri_at = at;
         for (i, layer) in fri.layers.iter_mut().enumerate() {
-            fri_at = layer.hint_cap(b, caps, fri_at, shape.fri.layer_cap(i));
+            fri_at = layer.hint_cap(
+                b,
+                caps,
+                fri_at,
+                shape.fri.layer_cap(i),
+                shape.fri.layer_depth(i),
+            );
         }
         assert_eq!(
             fri_at as usize,
@@ -780,6 +786,9 @@ pub fn blocks_for(felts: usize, hash: WrapHash) -> usize {
         // on an exact multiple. Written as its own arm rather than merged, so
         // the equality stays a checked property instead of an assumption.
         WrapHash::Algebraic => felts.div_ceil(super::rpo::RATE_FELTS).max(1),
+        // ZisK's leaf absorbs twelve felts a permutation, and an empty leaf
+        // never permutes (`super::p1w16_emit::leaf_hash`).
+        WrapHash::Poseidon1 => felts.div_ceil(super::p1w16_emit::RATE_FELTS),
     }
 }
 
