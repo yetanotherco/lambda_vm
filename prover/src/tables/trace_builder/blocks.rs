@@ -69,6 +69,10 @@ impl<T> BlockVec<T> {
         self.len
     }
 
+    pub(super) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Appends `x`: into the last block while it has room (growing it, up to
     /// the block length, as a `Vec` grows), else into a new block allocated
     /// whole. Nothing already held moves once its block is full.
@@ -286,7 +290,7 @@ mod tests {
         let front = all.take_front(8);
         assert_eq!(front, (0..8).collect::<Vec<u32>>());
         let mut taken = front;
-        while all.len() > 0 {
+        while !all.is_empty() {
             taken.extend(all.take_front(5));
         }
         assert_eq!(taken, (0..79).collect::<Vec<u32>>());

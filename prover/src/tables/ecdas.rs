@@ -104,8 +104,30 @@ pub fn generate_ecdas_trace_as(
     ops: &[EcdasOperation],
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_ecdas_rows_as(ops, ops.len().next_power_of_two().max(4), form)
+}
+
+/// Whether [`generate_ecdas_rows_as`] in `form` writes its rows packed, with no
+/// 64-bit table on the way: in [`TraceForm::Narrow`] once an earlier ECDAS
+/// trace of this process left its widths (`tables::gpack`).
+pub(crate) fn rows_written_packed(form: TraceForm) -> bool {
+    matches!(
+        super::gpack::Plan::new(form, &WIDTHS, cols::NUM_COLUMNS),
+        super::gpack::Plan::Write(_)
+    )
+}
+
+/// A ECDAS table of `num_rows` rows in `form`: `ops` (at most `num_rows`, a row
+/// each, one double/add step a row), then the padding rows. A row reads its own op alone and
+/// the padding rows are constants, so rows `[k·R, (k+1)·R)` of the whole padded
+/// table are this over the ops in that range with `num_rows = R`: the block's
+/// cut of the whole table, built on its own.
+pub fn generate_ecdas_rows_as(
+    ops: &[EcdasOperation],
+    num_rows: usize,
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = ops.len();
-    let num_rows = n.next_power_of_two().max(4);
     generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
         for (row_idx, op) in ops.iter().enumerate() {
             let s = &op.step;
