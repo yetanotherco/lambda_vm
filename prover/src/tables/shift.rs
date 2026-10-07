@@ -726,14 +726,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 /// Total number of SHIFT transition constraints.
-pub const NUM_SHIFT_CONSTRAINTS: usize = 21;
+pub const NUM_SHIFT_CONSTRAINTS: usize = 22;
 
 // =========================================================================
 // Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
 //
 // One body against the generic `ConstraintBuilder` serves the compiled prover
-// folder, the verifier folder and IR capture. Constraint indices 0..21.
+// folder, the verifier folder and IR capture. Constraint indices 0..22.
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
@@ -910,6 +910,18 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for ShiftConstraints {
         let mu = b.main(0, cols::MU);
         let one = b.one();
         b.emit_base(20, mu.clone() * (one - mu));
+
+        // idx 21: UnsignedIsNotNegative — (1 - signed) * is_negative. On a signed
+        // row `is_negative` is pinned to the real MSB via the MSB16 bus (multiplicity
+        // `signed`); on an unsigned row nothing constrains it, yet `shifted_half`
+        // fills with `extension = 65535 * is_negative` without gating on `signed`.
+        // So an unsigned right shift (SRL) could set `is_negative = 1` and forge a
+        // sign-filled result (e.g. `srl 0, 16 = 0xFFFF_0000_0000_0000`). This pins
+        // it to 0 when `signed = 0`.
+        let signed = b.main(0, cols::SIGNED);
+        let is_negative = b.main(0, cols::IS_NEGATIVE);
+        let one = b.one();
+        b.emit_base(21, (one - signed) * is_negative);
     }
 }
 

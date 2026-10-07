@@ -37,8 +37,8 @@ fn test_shift_air_wires_in_chip_constraints() {
         bus_interactions(),
     );
     assert_eq!(in_chip, NUM_SHIFT_CONSTRAINTS);
-    // 19 + ZbsIsBit + MuIsBit.
-    assert_eq!(NUM_SHIFT_CONSTRAINTS, 21);
+    // 19 + ZbsIsBit + MuIsBit + UnsignedIsNotNegative.
+    assert_eq!(NUM_SHIFT_CONSTRAINTS, 22);
 }
 
 // =========================================================================
@@ -207,6 +207,58 @@ mod zbs_mu_bit_regression {
         assert!(
             !validate_busless(&air, &trace),
             "μ = 2 must be rejected by IS_BIT[μ]"
+        );
+    }
+}
+
+// Separate preexisting bug (NOT a multiplicity bug, not fixed by this PR):
+// Soundness regression: `is_negative` must be 0 on unsigned rows. It is pinned
+// to the real MSB via the MSB16 bus only when `signed = 1` (multiplicity
+// `signed`), but `shifted_half` fills with `extension = 65535·is_negative`
+// without gating on `signed`, so an unsigned right shift (SRL) could set
+// `is_negative = 1` and sign-fill the result. Closed by idx 21
+// `(1 − signed)·is_negative = 0`.
+mod is_negative_unsigned_poc {
+    use crate::tables::shift::{ShiftConstraints, ShiftOperation, cols, generate_shift_trace};
+    use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
+    use crate::test_utils::{busless_air, validate_busless};
+
+    type Trace = stark::trace::TraceTable<GoldilocksField, GoldilocksExtension>;
+
+    /// `srl 0, 16` (unsigned right shift, direction = right, signed = false).
+    /// Honest result is 0; forged `is_negative = 1` sign-fills the top limb.
+    fn srl_0_by_16() -> Trace {
+        // new(value, shift_amount, direction=right, signed, word_instr)
+        let op = ShiftOperation::new(0, 16, true, false, false);
+        generate_shift_trace(std::slice::from_ref(&op))
+    }
+
+    #[test]
+    fn honest_srl_is_zero_and_valid() {
+        let t = srl_0_by_16();
+        let air = busless_air(cols::NUM_COLUMNS, ShiftConstraints);
+        assert!(validate_busless(&air, &t), "honest SRL must validate");
+        assert_eq!(*t.main_table.get(0, cols::IS_NEGATIVE), FE::zero());
+        assert_eq!(*t.main_table.get(0, cols::OUT_0), FE::zero());
+        assert_eq!(*t.main_table.get(0, cols::OUT_1), FE::zero());
+    }
+
+    /// Regression: the same unsigned row with `is_negative = 1` and the
+    /// sign-filled output (`srl 0, 16 = 0xFFFF_0000_0000_0000`) is now rejected
+    /// by `(1 − signed)·is_negative = 0`.
+    #[test]
+    fn unsigned_srl_forged_sign_extension_is_rejected() {
+        let mut t = srl_0_by_16();
+        assert_eq!(*t.main_table.get(0, cols::SIGNED), FE::zero());
+        // Flip the aux bit and set the sign-filled output it implies
+        // (top 16-bit limb = extension = 0xFFFF): out = 0xFFFF_0000_0000_0000.
+        t.main_table.set(0, cols::IS_NEGATIVE, FE::one());
+        t.main_table.set(0, cols::OUT_1, FE::from(0xFFFF_0000u64));
+
+        let air = busless_air(cols::NUM_COLUMNS, ShiftConstraints);
+        assert!(
+            !validate_busless(&air, &t),
+            "unsigned SRL with is_negative=1 must be rejected by UnsignedIsNotNegative"
         );
     }
 }
