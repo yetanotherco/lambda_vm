@@ -1518,11 +1518,26 @@ fn live_regeneration_proves_the_same_bytes() {
         .unwrap_or_else(|e| panic!("{what}: {e:?}"));
         let r = stamps.regen.expect("live regeneration's readout");
         let lines = r.lines.join("\n");
-        assert_eq!(r.dropped, streamed, "{what}: every chunk dropped\n{lines}");
-        assert_eq!(r.regenerated, streamed, "{what}: every chunk back\n{lines}");
+        // Every streamed chunk, and KECCAK_RND's and LT's tables of the rest
+        // (N3, one class a group), dropped and back.
+        assert!(r.rest_dropped > 0, "{what}: no rest table dropped\n{lines}");
+        assert_eq!(
+            r.dropped,
+            streamed + r.rest_dropped,
+            "{what}: every chunk dropped\n{lines}"
+        );
+        assert_eq!(
+            r.regenerated, r.dropped,
+            "{what}: every table back\n{lines}"
+        );
+        assert_eq!(
+            r.rest_regenerated, r.rest_dropped,
+            "{what}: the rest back\n{lines}"
+        );
         assert_eq!((r.mismatches, r.failed), (0, 0), "{what}\n{lines}");
         assert_eq!(r.error, None, "{what}\n{lines}");
-        assert!(lines.contains("groups rebuilt, taken last"), "{lines}");
+        assert!(lines.contains("groups rebuilt ("), "{lines}");
+        assert!(lines.contains("BLOCK REGEN rest: "), "{lines}");
         if policy == BlockSpillPolicy::Off {
             assert!(stamps.spill_stats.is_none(), "{what}: a store opened");
             assert!(
@@ -1740,6 +1755,119 @@ fn live_regeneration_refuses_what_it_did_not_rebuild() {
                 Deviations {
                     regen_faults: faults,
                     phase_b_order: order,
+                    ..Deviations::default()
+                },
+            );
+            let _ = tx.send(out.map(|_| ()).map_err(|e| format!("{e:?}")));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(600))
+            .unwrap_or_else(|_| panic!("{what}: the prove hung"));
+        match got {
+            Err(e) => assert!(e.contains(why), "{what}: refused for another reason: {e}"),
+            Ok(()) => panic!("{what}: proved"),
+        }
+    }
+}
+
+/// ★ Windows of one byte (N3): each admits only its frontier, so a phase-B
+/// order or a group that takes a class out of its rank order cannot complete.
+/// With every streamed chunk and every KECCAK_RND and LT table dropped, the
+/// interleaved order proves the same bytes, within a bound on the time.
+#[test]
+fn one_byte_windows_take_each_class_in_its_order() {
+    use crate::block_whir::BlockSpillPolicy;
+    use crate::block_whir::regen::RegenMode;
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let (plain, _) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Off,
+        BlockSpillPolicy::Off,
+        Deviations::default(),
+    )
+    .expect("prove");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let out = regenerated(
+            &elf,
+            &format,
+            RegenMode::Always,
+            BlockSpillPolicy::Off,
+            Deviations {
+                regen_windows: Some((1, 1)),
+                ..Deviations::default()
+            },
+        );
+        let _ = tx.send(out.map_err(|e| format!("{e:?}")));
+    });
+    let (proof, stamps) = rx
+        .recv_timeout(std::time::Duration::from_secs(600))
+        .expect("the prove did not hang")
+        .expect("prove");
+    let r = stamps.regen.expect("live regeneration's readout");
+    let lines = r.lines.join("\n");
+    assert!(r.rest_dropped > 0 && r.dropped > r.rest_dropped, "{lines}");
+    assert_eq!(r.regenerated, r.dropped, "{lines}");
+    assert_eq!(proof.groups, plain.groups);
+    if crypto::grinding::deterministic() {
+        let bytes = |p: &BlockWhirProof| {
+            rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                .expect("serialize")
+                .to_vec()
+        };
+        assert_eq!(bytes(&proof), bytes(&plain), "the proof");
+    }
+}
+
+/// ★ The rest's regenerator refuses what it did not build again (N3): a
+/// deposit of other columns, a generator that dies, a table never built — each
+/// at the rest's first dropped table — refuse the prove before any of that
+/// table's device work, never prove over it, and never hang.
+#[test]
+fn the_rest_regenerator_refuses_what_it_did_not_rebuild() {
+    use crate::block_whir::BlockSpillPolicy;
+    use crate::block_whir::regen::{LiveFaults, RegenMode};
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let cases: [(&str, LiveFaults, &str); 3] = [
+        (
+            "a bent rest deposit",
+            LiveFaults {
+                bend_rank: Some(0),
+                ..LiveFaults::default()
+            },
+            "not the ones dropped",
+        ),
+        (
+            "a rest generator that dies",
+            LiveFaults {
+                generator_panics_at_rank: Some(0),
+                ..LiveFaults::default()
+            },
+            "did not bring its columns back",
+        ),
+        (
+            "a rest table never built",
+            LiveFaults {
+                skip_rank: Some(0),
+                ..LiveFaults::default()
+            },
+            "did not bring its columns back",
+        ),
+    ];
+    for (what, faults, why) in cases {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let elf = elf.clone();
+        std::thread::spawn(move || {
+            let out = regenerated(
+                &elf,
+                &format,
+                RegenMode::Always,
+                BlockSpillPolicy::Off,
+                Deviations {
+                    rest_faults: faults,
                     ..Deviations::default()
                 },
             );

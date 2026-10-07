@@ -31,7 +31,7 @@ use stark::regen::{RegenError, RegenProducer, RegenSlot, RegenWindow};
 
 use crate::Error;
 use crate::tables::gpack::TraceForm;
-use crate::tables::trace_builder::{ChunkJob, RegenBuilder, StreamTable};
+use crate::tables::trace_builder::{ChunkJob, RegenBuilder, RegenFamily, RestRegen, StreamTable};
 
 const GIB: f64 = (1u64 << 30) as f64;
 
@@ -284,6 +284,14 @@ pub(crate) fn pacer_line(policy: AheadPolicy, report: Option<&PacerReport>) -> S
     }
 }
 
+/// `LAMBDA_VM_BLOCK_REGEN_REST_AHEAD_GIB` (default 4): the bytes the rest's
+/// regenerator (N3) may hold deposited ahead of the groups that take them. Under
+/// phase B's interleaved order it supplies only its share of phase B's pace, so
+/// a small window suffices (D-WHIR-NODISK § N3.2).
+pub(crate) fn rest_ahead_bytes() -> u64 {
+    gib_knob("LAMBDA_VM_BLOCK_REGEN_REST_AHEAD_GIB", 4.0)
+}
+
 /// `LAMBDA_VM_BLOCK_REGEN_RESERVE_GIB` (default 10, #1013's): the host bytes
 /// `auto` reserves for the regenerator in phase B once regeneration is armed —
 /// its walk state, windows, jobs and generators' outputs, and the columns
@@ -460,6 +468,10 @@ struct Recorded {
     /// Digests for a chunk with no recipe, and chunks of a table no recipe
     /// can hold.
     stray: usize,
+    /// The rest's tables phase B can build again (N3), by their place among
+    /// the rest's laid-out tables, and the block index of the rest's first.
+    rest: std::collections::HashMap<usize, (RegenFamily, usize)>,
+    rest_base: Option<usize>,
 }
 
 impl Recorder {
@@ -470,6 +482,39 @@ impl Recorder {
             digests,
             ..Self::default()
         }
+    }
+
+    /// The `k`-th table of the rest laid out is `family`'s `j`-th
+    /// (`KECCAK_RND[j]`, `LT[j]`): phase B can build it again.
+    pub(crate) fn rest_tag(&self, k: usize, family: RegenFamily, j: usize) {
+        self.lock().rest.insert(k, (family, j));
+    }
+
+    /// The rest's tables start at block index `base` (every streamed chunk
+    /// placed before them).
+    pub(crate) fn set_rest_base(&self, base: usize) {
+        self.lock().rest_base = Some(base);
+    }
+
+    /// The rest table phase B can build again at block index `t`.
+    pub(crate) fn rest_at(&self, t: usize) -> Option<(RegenFamily, usize)> {
+        let recorded = self.lock();
+        let k = t.checked_sub(recorded.rest_base?)?;
+        recorded.rest.get(&k).copied()
+    }
+
+    /// Each rest table phase B can build again, by family and index: its
+    /// block index.
+    pub(crate) fn rest_blocks(&self) -> std::collections::HashMap<(RegenFamily, usize), usize> {
+        let recorded = self.lock();
+        let Some(base) = recorded.rest_base else {
+            return std::collections::HashMap::new();
+        };
+        recorded
+            .rest
+            .iter()
+            .map(|(&k, &key)| (key, base + k))
+            .collect()
     }
 
     /// Whether the layout's threads digest each chunk ([`Self::packed`]).
@@ -1884,6 +1929,295 @@ impl Drop for LiveRun {
     }
 }
 
+/// What the rest's regenerator did ([`RestRun`]).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RestReport {
+    pub(crate) dropped: usize,
+    pub(crate) deposited: usize,
+    pub(crate) mismatches: usize,
+    /// Deposits refused because the window had closed.
+    pub(crate) closed: usize,
+    pub(crate) failures: Vec<String>,
+    /// Tables built again, by family (KECCAK_RND, LT).
+    pub(crate) built: [usize; 2],
+    pub(crate) bytes: u64,
+    pub(crate) first_ready: Option<f64>,
+    pub(crate) last_ready: Option<f64>,
+    pub(crate) wall: f64,
+    /// The generators' thread CPU summed (Linux only).
+    pub(crate) cpu: Option<f64>,
+    pub(crate) generators: usize,
+    pub(crate) error: Option<String>,
+}
+
+impl RestReport {
+    /// The `BLOCK REGEN rest` line.
+    pub(crate) fn line(&self) -> String {
+        let secs = |s: Option<f64>| s.map_or("n/a".to_string(), |s| format!("{s:.1}"));
+        format!(
+            "BLOCK REGEN rest: {} of {} dropped tables deposited · {} mismatches · {} failed · {} \
+             refused (window closed) · KECCAK_RND {} · LT {} built again · {:.2} GiB packed · \
+             ready from {} s to {} s · wall {:.2} s · {} generators CPU {} s{}",
+            self.deposited,
+            self.dropped,
+            self.mismatches,
+            self.failures.len(),
+            self.closed,
+            self.built[0],
+            self.built[1],
+            self.bytes as f64 / GIB,
+            secs(self.first_ready),
+            secs(self.last_ready),
+            self.wall,
+            self.generators,
+            secs(self.cpu),
+            self.error
+                .as_ref()
+                .map_or(String::new(), |e| format!(" · stopped: {e}")),
+        )
+    }
+}
+
+/// One table the rest's regenerator builds: its place among the rest's
+/// dropped tables, its rank (block index), its slot and its job.
+type RestWork = (u64, u64, RegenSlot, crate::tables::trace_builder::RegenJob);
+
+/// The rest's regenerator (D-WHIR-NODISK N3) on threads of its own, for the
+/// phase B beside it: KECCAK_RND's and LT's dropped tables built again from the
+/// lists the finish kept ([`RestRegen`]), on `generators` threads taking them in
+/// rank order, each deposited into its slot (digest-checked: another table
+/// fails its slot). A family's list goes once its jobs have run. Dropped — the
+/// prove returned, refused or unwound — it closes the window and joins.
+pub(crate) struct RestRun {
+    window: Arc<RegenWindow>,
+    handle: Option<std::thread::JoinHandle<RestReport>>,
+    dropped: usize,
+    spawn_error: Option<String>,
+}
+
+impl RestRun {
+    /// The regenerator over `regen`, depositing `dropped` (each a rank, the
+    /// block index `blocks` gives a family's table, and its slot) into
+    /// `window`; `producer` holds the window's slots open until it ends.
+    /// `faults` name a table by its place among the dropped ones, in rank
+    /// order.
+    pub(crate) fn spawn(
+        mut regen: RestRegen,
+        blocks: std::collections::HashMap<(RegenFamily, usize), usize>,
+        window: Arc<RegenWindow>,
+        producer: RegenProducer,
+        dropped: Vec<(u64, RegenSlot)>,
+        generators: usize,
+        faults: LiveFaults,
+    ) -> Self {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let count = dropped.len();
+        let started = Instant::now();
+        let spawned = std::thread::Builder::new()
+            .name("regen-rest".to_string())
+            .spawn(move || {
+                let mut slots: std::collections::HashMap<u64, RegenSlot> =
+                    dropped.into_iter().collect();
+                let mut report = RestReport {
+                    dropped: count,
+                    generators,
+                    ..RestReport::default()
+                };
+                // The work, in rank order: each family in AIR order, each table
+                // in the family's order (the rest's block indices ascend so).
+                let mut work: Vec<RestWork> = Vec::new();
+                let mut built = [0usize; 2];
+                for (f, family) in RegenFamily::ALL.into_iter().enumerate() {
+                    let jobs = match regen.take(family) {
+                        Ok(jobs) => jobs,
+                        Err(e) => {
+                            report.error = Some(format!("{e:?}"));
+                            break;
+                        }
+                    };
+                    for (j, job) in jobs.into_iter().enumerate() {
+                        let Some(job) = job else { continue };
+                        let Some(slot) = blocks
+                            .get(&(family, j))
+                            .and_then(|&t| slots.remove(&(t as u64)).map(|slot| (t as u64, slot)))
+                        else {
+                            continue;
+                        };
+                        built[f] += 1;
+                        work.push((0, slot.0, slot.1, job));
+                    }
+                }
+                work.sort_by_key(|(_, _, slot, _)| slot.order_key());
+                for (k, item) in work.iter_mut().enumerate() {
+                    item.0 = k as u64;
+                }
+                // A dropped table no job builds is failed now, as is every one
+                // after a stop.
+                for (rank, slot) in slots.drain() {
+                    let why = format!("rest table {rank} has no job to build it again");
+                    slot.fail(&why);
+                    report.failures.push(why);
+                }
+                if let Some(why) = report.error.clone() {
+                    for (_, _, slot, _) in &work {
+                        slot.fail(&why);
+                    }
+                    drop(producer);
+                    report.wall = started.elapsed().as_secs_f64();
+                    return report;
+                }
+                report.built = built;
+                let queue = Mutex::new(std::collections::VecDeque::from(work));
+                let deposited = AtomicUsize::new(0);
+                let mismatches = AtomicUsize::new(0);
+                let closed = AtomicUsize::new(0);
+                let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+                let ready: Mutex<(Option<f64>, Option<f64>, u64)> = Mutex::new((None, None, 0));
+                let cpu: Mutex<Option<f64>> = Mutex::new(Some(0.0));
+                std::thread::scope(|scope| {
+                    for _ in 0..generators.max(1) {
+                        scope.spawn(|| {
+                            let cpu0 = thread_cpu_secs();
+                            loop {
+                                // FIFO: ranks go out in order, so the window's
+                                // frontier is always a table some thread builds.
+                                let next =
+                                    queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+                                let Some((k, rank, slot, job)) = next else {
+                                    break;
+                                };
+                                let fail = |why: String| {
+                                    slot.fail(&why);
+                                    failures.lock().unwrap_or_else(|e| e.into_inner()).push(why);
+                                };
+                                if faults.skip_rank == Some(k) {
+                                    fail(format!("rest table {rank}: skipped (a test's fault)"));
+                                    continue;
+                                }
+                                let built = catch_unwind(AssertUnwindSafe(|| {
+                                    if faults.generator_panics_at_rank == Some(k) {
+                                        panic!(
+                                            "a test's fault: the rest's generator panics at {rank}"
+                                        );
+                                    }
+                                    job()
+                                }));
+                                let mut table = match built {
+                                    Ok(Ok(table)) => table,
+                                    Ok(Err(e)) => {
+                                        fail(format!("rest table {rank}: {e:?}"));
+                                        continue;
+                                    }
+                                    Err(_) => {
+                                        fail(format!("rest table {rank}: its generator panicked"));
+                                        continue;
+                                    }
+                                };
+                                let Some(packed) = table.take_narrow_main() else {
+                                    fail(format!(
+                                        "rest table {rank}: built without packed columns"
+                                    ));
+                                    continue;
+                                };
+                                let packed = if faults.bend_rank == Some(k) {
+                                    bend(packed)
+                                } else {
+                                    packed
+                                };
+                                let bytes = packed.data().len() as u64;
+                                match slot.deposit(packed) {
+                                    Ok(()) => {
+                                        deposited.fetch_add(1, Ordering::Relaxed);
+                                        let at = started.elapsed().as_secs_f64();
+                                        let mut r = ready.lock().unwrap_or_else(|e| e.into_inner());
+                                        r.0 = Some(r.0.map_or(at, |a| a.min(at)));
+                                        r.1 = Some(r.1.map_or(at, |a| a.max(at)));
+                                        r.2 += bytes;
+                                    }
+                                    Err(RegenError::Mismatch) => {
+                                        mismatches.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(RegenError::Closed(_)) => {
+                                        closed.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(e) => {
+                                        failures
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .push(format!("rest table {rank}: {e}"));
+                                    }
+                                }
+                            }
+                            let spent = cpu_since(cpu0);
+                            let mut total = cpu.lock().unwrap_or_else(|e| e.into_inner());
+                            *total = total.zip(spent).map(|(a, b)| a + b);
+                        });
+                    }
+                });
+                drop(producer);
+                report.deposited = deposited.into_inner();
+                report.mismatches = mismatches.into_inner();
+                report.closed = closed.into_inner();
+                report
+                    .failures
+                    .extend(failures.into_inner().unwrap_or_else(|e| e.into_inner()));
+                let (first, last, bytes) = ready.into_inner().unwrap_or_else(|e| e.into_inner());
+                report.first_ready = first;
+                report.last_ready = last;
+                report.bytes = bytes;
+                report.cpu = cpu.into_inner().unwrap_or_else(|e| e.into_inner());
+                report.wall = started.elapsed().as_secs_f64();
+                report
+            });
+        let (handle, spawn_error) = match spawned {
+            Ok(handle) => (Some(handle), None),
+            // The closure went with the failed spawn, its producer with it:
+            // every slot has failed.
+            Err(e) => (
+                None,
+                Some(format!("the rest's regenerator did not start: {e}")),
+            ),
+        };
+        Self {
+            window,
+            handle,
+            dropped: count,
+            spawn_error,
+        }
+    }
+
+    /// Its report once the prove is done (the window closed first, so it
+    /// returns).
+    pub(crate) fn join(mut self) -> RestReport {
+        self.window.close("the block's prove ended");
+        match self.handle.take() {
+            Some(handle) => handle.join().unwrap_or_else(|_| RestReport {
+                dropped: self.dropped,
+                error: Some("the rest's regenerator panicked".to_string()),
+                ..RestReport::default()
+            }),
+            None => RestReport {
+                dropped: self.dropped,
+                error: Some(
+                    self.spawn_error
+                        .take()
+                        .unwrap_or_else(|| "the rest's regenerator did not start".to_string()),
+                ),
+                ..RestReport::default()
+            },
+        }
+    }
+}
+
+impl Drop for RestRun {
+    fn drop(&mut self) {
+        self.window.close("the block's prove ended");
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// The `BLOCK REGEN dropped` line: what phase A dropped, of `recipes` streamed
 /// chunks.
 pub(crate) fn dropped_line(
@@ -1998,6 +2332,10 @@ pub struct RegenStamps {
     /// wanted off the host.
     pub armed_by: Option<&'static str>,
     pub wanted: u64,
+    /// Of `dropped` and `regenerated`, the rest's tables (N3: KECCAK_RND's and
+    /// LT's, built again from the kept lists).
+    pub rest_dropped: usize,
+    pub rest_regenerated: usize,
     /// The `BLOCK REGEN` lines.
     pub lines: Vec<String>,
 }
