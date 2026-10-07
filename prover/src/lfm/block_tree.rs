@@ -1461,7 +1461,11 @@ pub fn prove_block_tree(
     let program_budget = match (cfg.program_budget, emit_window, tree_ahead) {
         (super::program_budget::BudgetSetting::Off, _, _) | (_, Some(_), _) => None,
         (setting, None, Some(AheadMode::Pipe)) => Some(super::program_budget::ProgramBudget::new(
-            super::program_budget::Room::of(setting, crate::block::spill_target_bytes()),
+            super::program_budget::Room::of(
+                setting,
+                crate::block::spill_target_bytes(),
+                super::program_budget::share_from_env()?,
+            ),
         )),
         (_, None, _) => None,
     };
