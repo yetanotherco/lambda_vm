@@ -259,6 +259,33 @@ fn the_statement_calls_are_absorb_blocks_own() {
     );
 }
 
+/// The WHIR configuration `base` dispatches to, by its type's name.
+fn dispatched(base: BaseFormat) -> Result<&'static str, crate::Error> {
+    Ok(crate::with_block_hash!(base, |H| { std::any::type_name::<H>() }))
+}
+
+/// ★ The dispatch itself, whatever the process's knob says: an RPX base binds
+/// `RpxWhir` and a Poseidon1 base `P1Whir`. Where the knob is unset (its
+/// default keccak, as in CI) or keccak, an RPX arm still reading it would bind
+/// `KeccakWhir` here — the behaviour the source test below can only infer.
+#[test]
+fn the_base_alone_binds_the_block_hash() {
+    println!("the process's WHIR hash knob: {:?}", std::env::var(crate::whir_hash_knob::ENV));
+    assert_eq!(
+        dispatched(BaseFormat::RPX).expect("RPX dispatches"),
+        std::any::type_name::<multilinear::whir_hash::RpxWhir>()
+    );
+    assert_eq!(
+        dispatched(BaseFormat::P1_WHIR).expect("Poseidon1 dispatches"),
+        std::any::type_name::<multilinear::whir_hash::P1Whir>()
+    );
+    let keccak = BaseFormat {
+        hash: CommitmentHash::Keccak256,
+        ..BaseFormat::RPX
+    };
+    assert!(dispatched(keccak).is_err(), "a keccak base is refused");
+}
+
 /// ★ No environment read decides the base: the block's prove, verify and
 /// plan sites dispatch through `with_block_hash!` on the format alone, whose
 /// arms — RPX's and Poseidon1's — and base check read no environment and never
