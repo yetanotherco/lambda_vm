@@ -58,7 +58,7 @@ use super::builder::{Cell, Ext, LfmBuilder};
 use super::compiler::{LfmProgram, compile};
 use super::per_table_aggregator::DerivedChild;
 use super::registry::LfmArtifacts;
-use super::whir_chain::{ChainShape, ChipRows, RoundStorage, chain_select_balu};
+use super::whir_chain::{ChainShape, ChipRows};
 use super::whir_epoch::{
     BITWISE_NAME, DECODE_NAME, GroupWires, KECCAK_RC_NAME, PreprocessedPlan, PreprocessedRoute,
     REGISTER_NAME, TableWires, emit_expected, emit_group_walk, emit_roots_block, emit_table_walk,
@@ -75,25 +75,38 @@ use super::word::{LfmWord, base_word};
 /// cap too).
 pub const LEAF_PERMS_CAP: usize = 279_000;
 
-/// The leaf-load cap under a Poseidon1 base, in socket (`Hash16`) rows: RPX's
-/// leaf count held — four full groups (≈ 38.6 k rows each) a leaf, 23 leaves at
-/// the median and 3 at 1×, inside one 2^18 hash table (D-WHIR-P1 D8a's 178 k).
-/// The recursion's time is the leaves' and the tree's count, not their cells:
-/// at 2^17 (three groups a leaf) the median's 30 leaves cost +5.4 s against
-/// RPX's 23 (RYZEN 056: ≈ 1.24 s fixed a leaf, five more nodes and a level;
-/// I-WHIR-P1 §S5.8, the lead's ruling 10-07).
-pub const LEAF_P1_CAP: usize = 178_000;
+/// The leaf-load cap under a Poseidon1 base, in socket (`Hash16`) rows: one
+/// 2^18 table, all of it — seven full groups a leaf, 13 leaves at the median
+/// (I-WHIR-P1 §S6b). The recursion's time is the card's: the leaves prove one
+/// at a time, each ≈ 0.28 s plus ≈ 0.0122 s a million padded cells outside the
+/// socket (RYZEN 062), so fewer, fuller leaves win where RPX's leaf count (four
+/// groups a leaf, S6) padded `Select`, base ALU and words to 2^20 for half of
+/// them.
+pub const LEAF_P1_CAP: usize = 1 << 18;
 
-/// The padded heights a Poseidon1 leaf keeps its chips under: the
-/// [`LEAF_P1_CAP`] socket rows (one 2^18 table) and 2^20 rows of `Select`,
-/// base ALU and hinted words — four groups' heights, and a prepared group's
-/// with three full ones (I-WHIR-P1 §S6). The partition admits no leaf past any
-/// of them ([`leaf_partition_rows`]), so no chip doubles silently.
+/// The padded heights a Poseidon1 leaf keeps every chip under: the
+/// [`LEAF_P1_CAP`] socket rows, 2^20 rows of `Select`, base ALU, lanes and
+/// hinted words, 2^21 of extension ALU (seven full groups' heights,
+/// I-WHIR-P1 §S6b), and the small chips at heights no leaf of the median
+/// reaches. The constants' bound is loose by construction — a leaf's distinct
+/// constants (≈ 1.1 k at six groups) are far fewer than its parts' sum
+/// (≈ 3.6 k), which is what the partition can add up — so its height sits
+/// where that sum does not bind before the socket. The publishes are the leaf
+/// layout's, the same in every leaf and no group's, so nothing the partition
+/// places moves them: unbounded. No accelerator: a WHIR leaf has none. The
+/// partition admits no leaf past any of them ([`leaf_partition_rows`]), so no
+/// chip doubles silently.
 pub const P1_LEAF_HEIGHTS: ChipRows = ChipRows {
     hash: LEAF_P1_CAP,
     select: 1 << 20,
     balu: 1 << 20,
+    xalu: 1 << 21,
+    lanes: 1 << 20,
     hint: 1 << 20,
+    bitdec: 1 << 15,
+    consts: 1 << 13,
+    public: usize::MAX,
+    accel: 0,
 };
 
 /// The leaf cap a block's base takes: [`LEAF_P1_CAP`] under Poseidon1, else
@@ -271,113 +284,179 @@ pub fn leaf_partition(
 /// ★ The Poseidon1 leaf partition: no leaf past any chip's padded height
 /// (`heights`, each less the per-leaf `front`), over the fewest leaves that
 /// admit one. The groups go heaviest first by their binding share (the largest
-/// of their chips' rows over each chip's room), each onto the admitting leaf
-/// with the least binding share so far (ties: the lower leaf); a group no leaf
-/// admits adds a leaf and the placement restarts. Refuses a group that no leaf
-/// can hold. Pure: every emitter derives the same partition from the same rows.
+/// of their chips' rows over each chip's room). At each leaf count from the
+/// rows' lower bound up, two placements: the balancing one (each group onto
+/// the admitting leaf with the least binding share so far, ties the lower
+/// leaf), then first fit (each onto the lowest admitting leaf), which packs
+/// the heavy groups together where balancing would spread them over one leaf
+/// more than the rows need; neither admitting every group, one leaf more.
+/// Refuses a group that no leaf can hold, and a front past a height. Pure:
+/// every emitter derives the same partition from the same rows.
 pub fn leaf_partition_rows(
     loads: &[ChipRows],
     front: ChipRows,
     heights: ChipRows,
 ) -> Result<BlockPartition, String> {
-    let chips = |r: &ChipRows| [r.hash, r.select, r.balu, r.hint];
-    const NAMES: [&str; 4] = ["socket", "Select", "base-ALU", "hint"];
-    let room: Vec<usize> = chips(&heights)
-        .iter()
-        .zip(chips(&front))
-        .map(|(h, f)| h.saturating_sub(f))
-        .collect();
-    if room.contains(&0) {
+    const N: usize = ChipRows::NAMES.len();
+    let (h, f) = (heights.to_array(), front.to_array());
+    if (0..N).any(|c| f[c] > h[c]) {
         return Err(format!(
-            "the leaf front {front:?} fills a chip of {heights:?}"
+            "the leaf front {front:?} is past a chip of {heights:?}"
         ));
     }
-    for (g, load) in loads.iter().enumerate() {
-        for (c, &rows) in chips(load).iter().enumerate() {
-            if rows > room[c] {
+    let room: [usize; N] = core::array::from_fn(|c| h[c] - f[c]);
+    let rows: Vec<[usize; N]> = loads.iter().map(|l| l.to_array()).collect();
+    for (g, load) in rows.iter().enumerate() {
+        for c in 0..N {
+            if load[c] > room[c] {
                 return Err(format!(
-                    "group {g} spends {rows} {} rows — a leaf takes at most {}",
-                    NAMES[c], room[c]
+                    "group {g} spends {} {} rows — a leaf takes at most {}",
+                    load[c],
+                    ChipRows::NAMES[c],
+                    room[c]
                 ));
             }
         }
     }
     // A share in 2^-32 units of each chip's room; the binding one is the max.
-    let share = |rows: &[usize; 4]| -> u64 {
-        rows.iter()
-            .zip(&room)
-            .map(|(&r, &m)| ((r as u128) << 32).div_ceil(m as u128) as u64)
+    // A chip with no room has no rows to share (refused above).
+    let share = |r: &[usize; N]| -> u64 {
+        (0..N)
+            .filter(|&c| room[c] > 0)
+            .map(|c| ((r[c] as u128) << 32).div_ceil(room[c] as u128) as u64)
             .max()
             .unwrap_or(0)
     };
-    let weights: Vec<u64> = loads.iter().map(|l| share(&chips(l))).collect();
+    let weights: Vec<u64> = rows.iter().map(share).collect();
     let mut order: Vec<usize> = (0..loads.len()).collect();
     order.sort_by_key(|&g| (std::cmp::Reverse(weights[g]), g));
-    let mut k = (0..4)
-        .map(|c| {
-            loads
-                .iter()
-                .map(|l| chips(l)[c])
-                .sum::<usize>()
-                .div_ceil(room[c])
-        })
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    'leaves: while k <= loads.len().max(1) {
+    let place = |k: usize, first_fit: bool| -> Option<Vec<Vec<usize>>> {
         let mut leaves: Vec<Vec<usize>> = vec![Vec::new(); k];
-        let mut sums = vec![[0usize; 4]; k];
+        let mut sums = vec![[0usize; N]; k];
         for &g in &order {
-            let add = chips(&loads[g]);
-            let fits = |s: &[usize; 4]| (0..4).all(|c| s[c] + add[c] <= room[c]);
-            let Some(leaf) = (0..k)
-                .filter(|&l| fits(&sums[l]))
-                .min_by_key(|&l| (share(&sums[l]), l))
-            else {
-                k += 1;
-                continue 'leaves;
+            let add = &rows[g];
+            let fits = |s: &[usize; N]| (0..N).all(|c| s[c] + add[c] <= room[c]);
+            let mut open = (0..k).filter(|&l| fits(&sums[l]));
+            let leaf = if first_fit {
+                open.next()?
+            } else {
+                open.min_by_key(|&l| (share(&sums[l]), l))?
             };
             leaves[leaf].push(g);
-            for c in 0..4 {
+            for c in 0..N {
                 sums[leaf][c] += add[c];
             }
         }
-        // A leaf left empty (more leaves than the placement needed) is dropped.
-        leaves.retain(|l| !l.is_empty());
-        return BlockPartition::new(leaves, loads.len());
+        Some(leaves)
+    };
+    let mut k = (0..N)
+        .filter(|&c| room[c] > 0)
+        .map(|c| rows.iter().map(|r| r[c]).sum::<usize>().div_ceil(room[c]))
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    while k <= loads.len().max(1) {
+        if let Some(mut leaves) = place(k, false).or_else(|| place(k, true)) {
+            // A leaf left empty (more leaves than the placement needed) is
+            // dropped.
+            leaves.retain(|l| !l.is_empty());
+            return BlockPartition::new(leaves, loads.len());
+        }
+        k += 1;
     }
     Err("no partition admits every group".to_string())
 }
 
-/// What every Poseidon1 leaf spends before its groups: the statement call by
-/// call, every root absorbed, `z, α, β` drawn and the state read (socket
-/// rows), and the carried roots hinted (words).
-fn front_rows(
-    statement_calls: &[Vec<u8>],
-    layouts: &[StackedLayout],
-    prepared: &[PlannedPrepared],
-) -> ChipRows {
-    let mut sponge = super::whir_transcript::SpongeSchedule::new(SpongeEntry::fresh_for(
-        super::edsl::WrapHash::Poseidon1,
-    ));
-    for call in statement_calls {
-        sponge.absorb(1 + call.len().div_ceil(8));
+/// The workers [`chip_loads_by_emission`] emits on at most.
+const PROBE_WORKERS: usize = 16;
+
+/// ★ Each group's rows in every chip, and the per-leaf front's, measured by
+/// emission — exact by construction, whatever the walk, the opening or the
+/// fold emit (a closed form would be a second derivation to drift). Group `g`
+/// is emitted alone as a leaf: its rows are the instructions between the front
+/// and the tail (its walk, opening, prepared stack and bus shares), plus the
+/// one `eadd` that joins its shares to a leaf's running sum. The front's are a
+/// carrier leaf of no group's (the front, the COMMIT-bus target and the
+/// publishes), less that one `eadd`. The builder emits each group on its own
+/// fork and interns nothing but constants, so a leaf's rows are the front's
+/// plus its groups' — exactly the carrier's, a non-carrier's less the target's
+/// — and its distinct constants at most that sum. Each probe's front is held
+/// to the others'. On plain threads: a prover derives beside phase B's pool.
+pub(crate) fn chip_loads_by_emission(
+    plan: &WhirBlockPlan,
+) -> Result<(Vec<ChipRows>, ChipRows), String> {
+    let probe = |groups: &[usize], carrier: bool| -> Result<[ChipRows; 3], String> {
+        let mut b = plan.leaf_builder();
+        let mut marks = LeafMarks::default();
+        emit_leaf_over(
+            &mut b,
+            plan,
+            groups,
+            carrier,
+            LeafChecks::ALL,
+            Some(&mut marks),
+        )?;
+        let instrs = b.instrs();
+        Ok([
+            ChipRows::of_instrs(&instrs[..marks.front]),
+            ChipRows::of_instrs(&instrs[marks.front..marks.shares]),
+            ChipRows::of_instrs(&instrs[marks.shares..]),
+        ])
+    };
+    let n = plan.groups.len();
+    let [front, _, tail] = probe(&[], true)?;
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |p| p.get())
+        .min(PROBE_WORKERS)
+        .min(n)
+        .max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let measured: Vec<(usize, Result<[ChipRows; 3], String>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut out = Vec::new();
+                    loop {
+                        let g = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if g >= n {
+                            return out;
+                        }
+                        out.push((g, probe(&[g], false)));
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+    let mut loads = vec![None; n];
+    for (g, parts) in measured {
+        let [probe_front, rows, _] = parts?;
+        if probe_front != front {
+            return Err(format!(
+                "group {g}'s probe leaf has another front: {probe_front:?} against {front:?}"
+            ));
+        }
+        loads[g] = Some(ChipRows {
+            xalu: rows.xalu + 1,
+            ..rows
+        });
     }
-    let carried: usize = layouts.iter().map(StackedLayout::num_polys).sum();
-    let derived: usize = prepared.iter().map(|p| p.roots.len()).sum();
-    for _ in 0..carried + derived {
-        sponge.absorb_root();
-    }
-    for _ in 0..3 {
-        sponge.draw_ext();
-    }
-    ChipRows {
-        // The state's flushed copy: one more.
-        hash: sponge.perms() + 1,
-        select: 0,
-        balu: 0,
-        hint: carried,
-    }
+    let loads = loads
+        .into_iter()
+        .enumerate()
+        .map(|(g, l)| l.ok_or_else(|| format!("group {g}'s probe never ran")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let front = front.plus(tail);
+    Ok((
+        loads,
+        ChipRows {
+            xalu: front.xalu.saturating_sub(1),
+            ..front
+        },
+    ))
 }
 
 // ================================= the plan ===============================
@@ -609,13 +688,11 @@ impl WhirBlockPlan {
         }
 
         // Each group's cost: its tables' legs, its opening, its prepared ones —
-        // in socket rows under Poseidon1, where each group's rows in every
-        // bounded chip are kept too.
+        // in socket rows under Poseidon1.
         let refs = frame.airs.air_refs();
         let arity = wrap_hash.arity();
         let p1 = wrap_hash == super::edsl::WrapHash::Poseidon1;
         let mut costs = Vec::with_capacity(groups.len());
-        let mut loads: Vec<ChipRows> = Vec::new();
         for (g, list) in groups.iter().enumerate() {
             let owned = Shapes::build(&refs, &frame.shapes, list)?;
             let shapes = owned.table_shapes();
@@ -652,51 +729,18 @@ impl WhirBlockPlan {
                     stacked_verify_cost(&p.layout, &group_of, &chain, entry).perms()
                 })
                 .sum();
-            let cost = tables + opening + prepared_perms;
-            costs.push(cost);
-            if p1 {
-                // Select and base ALU: the chains' (tables spend neither);
-                // words: the group's arena, exactly; socket rows: the cost, and
-                // two for the fork entering where the fresh sponge did not.
-                let chains = |layout: &StackedLayout| {
-                    let shape = ChainShape::new_at(config, layout.n_stack(), arity);
-                    let rows = chain_select_balu(&shape, wrap_hash).scale(layout.num_polys());
-                    let words = layout.num_polys() * (1 + RoundStorage::words(&shape) as usize);
-                    ChipRows {
-                        hint: words,
-                        ..rows
-                    }
-                };
-                let table_words: usize = match batched_cap(config) {
-                    None => shapes.iter().map(super::whir_epoch::table_words).sum(),
-                    Some(cap) => super::whir_batch::batched_words(&shapes, &owned.argue_plan(cap)),
-                };
-                let mut load = chains(layout);
-                load.hint += table_words;
-                load.hash = cost + 2;
-                for p in prepared.iter().filter(|p| p.group == g) {
-                    load = load.plus(chains(&p.layout));
-                }
-                loads.push(load);
-            }
+            costs.push(tables + opening + prepared_perms);
         }
         drop(refs);
-        let front = if p1 {
-            front_rows(&statement_calls, &frame.stack_layouts, &prepared)
-        } else {
-            ChipRows::default()
-        };
-        let partition = if p1 && num_leaves.is_none() {
-            let heights = ChipRows {
-                hash: leaf_cap,
-                ..P1_LEAF_HEIGHTS
-            };
-            leaf_partition_rows(&loads, front, heights)?
+        let id = crate::statement::elf_digest(&statement_bytes);
+        // RPX's partition by cost; Poseidon1's after its rows are measured,
+        // over a plan whose partition the measuring never reads.
+        let partition = if p1 {
+            partition_groups(&costs, 1)
         } else {
             leaf_partition(&costs, num_leaves, leaf_cap)?
         };
-        let id = crate::statement::elf_digest(&statement_bytes);
-        Ok(Self {
+        let mut plan = Self {
             frame,
             statement_bytes,
             statement_calls,
@@ -705,12 +749,28 @@ impl WhirBlockPlan {
             groups,
             prepared,
             costs,
-            loads,
-            front,
+            loads: Vec::new(),
+            front: ChipRows::default(),
             partition,
             fan_in,
             id,
-        })
+        };
+        // Under Poseidon1, every chip's rows by group, emitted; the partition
+        // bounds them all (a fixed leaf count, the tests', bounds none).
+        if p1 {
+            (plan.loads, plan.front) = chip_loads_by_emission(&plan)?;
+            plan.partition = match num_leaves {
+                None => {
+                    let heights = ChipRows {
+                        hash: leaf_cap,
+                        ..P1_LEAF_HEIGHTS
+                    };
+                    leaf_partition_rows(&plan.loads, plan.front, heights)?
+                }
+                Some(_) => leaf_partition(&plan.costs, num_leaves, leaf_cap)?,
+            };
+        }
+        Ok(plan)
     }
 
     pub fn partition(&self) -> &BlockPartition {
@@ -1324,6 +1384,29 @@ fn emit_leaf(
     k: usize,
     checks: LeafChecks,
 ) -> Result<(), String> {
+    emit_leaf_over(b, plan, plan.partition.leaf(k), k == CARRIER, checks, None)
+}
+
+/// Where a leaf's parts end among its instructions: the front, and its
+/// groups' walks with their bus shares; the rest is the carrier's target and
+/// the publishes ([`chip_loads_by_emission`]).
+#[derive(Default)]
+struct LeafMarks {
+    front: usize,
+    shares: usize,
+}
+
+/// A leaf over `groups`, the carrier when `carrier`: [`emit_leaf`]'s body, which
+/// [`chip_loads_by_emission`] also runs over one group or none, marking where
+/// the parts end.
+fn emit_leaf_over(
+    b: &mut LfmBuilder,
+    plan: &WhirBlockPlan,
+    groups: &[usize],
+    carrier: bool,
+    checks: LeafChecks,
+    mut marks: Option<&mut LeafMarks>,
+) -> Result<(), String> {
     let frame = &plan.frame;
     let config = &frame.config;
     let refs = frame.airs.air_refs();
@@ -1340,10 +1423,13 @@ fn emit_leaf(
         beta,
         state,
     } = emit_front(b, plan, arena, &mut at);
+    if let Some(m) = marks.as_deref_mut() {
+        m.front = b.instrs().len();
+    }
 
     // ---- 2. the leaf's groups, each on its fork.
     let mut outputs: Vec<(Ext, Ext)> = Vec::new();
-    for &g in plan.partition.leaf(k) {
+    for &g in groups {
         let tables = &plan.groups[g];
         let owned = Shapes::build(&refs, &frame.shapes, tables)?;
         let shapes = owned.table_shapes();
@@ -1526,8 +1612,11 @@ fn emit_leaf(
             Some(running) => b.eadd(running, share),
         });
     }
+    if let Some(m) = marks {
+        m.shares = b.instrs().len();
+    }
     let mut sum = sum.unwrap_or_else(|| b.ext_const(&FEE::zero()));
-    if k == CARRIER && checks.target {
+    if carrier && checks.target {
         let target = emit_expected(b, &plan.public_output, 0, z, alpha);
         sum = b.esub(sum, target);
     }

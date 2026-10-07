@@ -368,13 +368,52 @@ fn whir_p1_leaf_census() {
     }
 }
 
+/// A leaf's emitted rows against the plan's: every chip but the constants
+/// exactly on the carrier, and on any other leaf less one vector — the COMMIT
+/// bus target's rows, the same for every such leaf (`target` keeps the first);
+/// the constants (interned) at most the plan's.
+fn assert_planned(
+    label: &str,
+    carrier: bool,
+    emitted: ChipRows,
+    planned: ChipRows,
+    target: &mut Option<ChipRows>,
+) {
+    assert!(
+        emitted.consts <= planned.consts,
+        "{label}: {} constants against the plan's {}",
+        emitted.consts,
+        planned.consts
+    );
+    let (e, p) = (
+        ChipRows {
+            consts: 0,
+            ..emitted
+        },
+        ChipRows {
+            consts: 0,
+            ..planned
+        },
+    );
+    if carrier {
+        assert_eq!(e, p, "{label}: the carrier's rows are the plan's");
+        return;
+    }
+    assert!(e.under(p), "{label}: {e:?} past the plan's {p:?}");
+    let (ea, pa) = (e.to_array(), p.to_array());
+    let gap = ChipRows::from_array(core::array::from_fn(|c| pa[c] - ea[c]));
+    match target {
+        None => *target = Some(gap),
+        Some(t) => assert_eq!(*t, gap, "{label}: a leaf less another target"),
+    }
+}
+
 /// ★ Every group of the median mix as a one-group Poseidon1 leaf, against the
-/// plan's rows for it — the lead's acceptance criterion (10-06): the rows the
-/// partition admits leaves by ARE the emitted ones, for every group shape the
-/// mix has, both prepared kinds included (DECODE's stack in group 0, the ELF
-/// pages' genesis), with no fallback: Select, base ALU and words exactly (the
-/// words from the arena counts alone), socket rows at most the plan's and
-/// within 64 of it. Then every leaf the plan builds, emitted, stays under
+/// plan's rows for it — the lead's acceptance criterion (10-06; every chip
+/// since S6b): the rows the partition admits leaves by ARE the emitted ones,
+/// for every group shape the mix has, both prepared kinds included (DECODE's
+/// stack in group 0, the ELF pages' genesis), with no fallback
+/// ([`assert_planned`]). Then every leaf the plan builds, emitted, stays under
 /// every padded height.
 ///
 /// Both prepared kinds need a real guest (a small one's pages are not dense
@@ -392,27 +431,37 @@ fn whir_p1_group_census() {
         None => crate::test_utils::asm_elf_bytes("poc_rodata_commit"),
     };
     let opts = super::proof::block_base_options();
-    let production = BlockFormat::production();
-    let format = BlockFormat {
-        zf: production.zf.with_base(BaseFormat::P1_WHIR),
-        max_groups: 1024,
-        ..production
-    };
+    let format = p1_format();
     let owned = median_statement(&elf_bytes, &opts, &format);
-    let plan = WhirBlockPlan::derive_with(
-        &elf_bytes,
-        &opts,
-        &format,
-        owned.view(),
-        None,
-        super::whir_block::BLOCK_FAN_IN,
-        None,
-    )
-    .expect("the plan derives");
+    let derive = || {
+        WhirBlockPlan::derive_with(
+            &elf_bytes,
+            &opts,
+            &format,
+            owned.view(),
+            None,
+            super::whir_block::BLOCK_FAN_IN,
+            None,
+        )
+        .expect("the plan derives")
+    };
+    let started = std::time::Instant::now();
+    let plan = derive();
+    println!(
+        "CENSUS PLAN DERIVED in {:.2} s (every group emitted once)",
+        started.elapsed().as_secs_f64()
+    );
+    let started = std::time::Instant::now();
+    let again = super::whir_block::chip_loads_by_emission(&plan).expect("the probe");
+    println!(
+        "CENSUS PROBE: {} groups measured in {:.2} s",
+        plan.num_groups(),
+        started.elapsed().as_secs_f64()
+    );
     let n = plan.num_groups();
-    let costs = plan.costs().to_vec();
     let prepared: Vec<usize> = plan.prepared().iter().map(|p| p.group).collect();
     let (loads, front) = plan.chip_loads();
+    assert_eq!((loads.to_vec(), front), again, "the probe is deterministic");
     let (loads, front) = (loads.to_vec(), front);
     if real.is_some() {
         assert!(
@@ -420,106 +469,67 @@ fn whir_p1_group_census() {
             "a real guest's mix has both prepared kinds, got groups {prepared:?}"
         );
     }
-    let plan = plan.with_partition(
+    let singles = plan.with_partition(
         BlockPartition::new((0..n).map(|g| vec![g]).collect(), n).expect("one group a leaf"),
     );
-    let mut max: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
-    // Group 0 (the fixed tables at the instrument's placeholder heights and
-    // the accelerators) does not emit here; the real block's leaf census does.
-    for (g, &cost) in costs.iter().enumerate() {
-        let program = plan.leaf_program(g).expect("the leaf emits");
-        let mut rows: BTreeMap<&'static str, usize> = BTreeMap::new();
-        for instr in &program.instrs {
-            let k = match kind(instr) {
-                k if k.starts_with("BALU") => "BALU",
-                k => k,
-            };
-            *rows.entry(k).or_default() += 1;
-        }
-        let get = |k: &str| rows.get(k).copied().unwrap_or(0);
-        let planned = loads[g].plus(front);
-        assert_eq!(
-            (get("SELECT"), get("BALU"), get("HINT")),
-            (planned.select, planned.balu, planned.hint),
-            "group {g} (prepared {}): Select, base ALU and words are the plan's",
-            prepared.contains(&g)
-        );
-        assert!(
-            get("HASH16") <= planned.hash && get("HASH16") + 64 >= planned.hash,
-            "group {g}: socket rows {} against the plan's {}",
-            get("HASH16"),
-            planned.hash
+    let mut target = None;
+    let mut max = ChipRows::default();
+    for (g, &load) in loads.iter().enumerate() {
+        let emitted = ChipRows::of(&singles.leaf_program(g).expect("the leaf emits"));
+        assert_planned(
+            &format!("group {g} (prepared {})", prepared.contains(&g)),
+            g == CARRIER,
+            emitted,
+            front.plus(load),
+            &mut target,
         );
         println!(
-            "CENSUS GROUP {g}: tables {} · prepared {} · cost {cost} · HASH16 {} · SELECT {} · HINT {} · BALU {} · XALU {}",
+            "CENSUS GROUP {g}: tables {} · prepared {} · cost {} · {load:?}",
             owned.groups[g].len(),
             prepared.contains(&g),
-            get("HASH16"),
-            get("SELECT"),
-            get("HINT"),
-            get("BALU"),
-            get("XALU"),
+            singles.costs()[g],
         );
-        for k in ["HASH16", "SELECT", "HINT", "BALU", "XALU"] {
-            let e = max.entry(k).or_insert((0, 0));
-            if get(k) > e.0 {
-                *e = (get(k), g);
-            }
-        }
+        let (m, l) = (max.to_array(), load.to_array());
+        max = ChipRows::from_array(core::array::from_fn(|c| m[c].max(l[c])));
     }
     println!("CENSUS GROUP MAX: {max:?}");
+    println!("CENSUS FRONT: {front:?} · a non-carrier leaf less {target:?}");
 
     // The plan at the production cap: every leaf, against its chips' heights.
-    let plan = WhirBlockPlan::derive_with(
-        &elf_bytes,
-        &opts,
-        &format,
-        owned.view(),
-        None,
-        super::whir_block::BLOCK_FAN_IN,
-        None,
-    )
-    .expect("the plan derives");
+    let plan = derive();
+    let mut target = None;
     for k in 0..plan.partition().num_leaves() {
-        let program = plan.leaf_program(k).expect("the leaf emits");
-        let mut rows: BTreeMap<&'static str, usize> = BTreeMap::new();
-        for instr in &program.instrs {
-            let kk = match kind(instr) {
-                kk if kk.starts_with("BALU") => "BALU",
-                kk => kk,
-            };
-            *rows.entry(kk).or_default() += 1;
-        }
-        let get = |kk: &str| rows.get(kk).copied().unwrap_or(0);
-        let over: Vec<&str> = [
-            ("HASH16", P1_LEAF_HEIGHTS.hash),
-            ("SELECT", P1_LEAF_HEIGHTS.select),
-            ("HINT", P1_LEAF_HEIGHTS.hint),
-            ("BALU", P1_LEAF_HEIGHTS.balu),
-        ]
-        .iter()
-        .filter(|(kk, h)| get(kk) > *h)
-        .map(|(kk, _)| *kk)
-        .collect();
-        println!(
-            "CENSUS PLAN LEAF {k}: groups {:?} · HASH16 {} · SELECT {} · HINT {} · BALU {} · over {over:?}",
-            plan.partition().leaf(k),
-            get("HASH16"),
-            get("SELECT"),
-            get("HINT"),
-            get("BALU"),
+        let leaf = plan.partition().leaf(k);
+        let emitted = ChipRows::of(&plan.leaf_program(k).expect("the leaf emits"));
+        let planned = leaf.iter().fold(front, |acc, &g| acc.plus(loads[g]));
+        assert_planned(
+            &format!("leaf {k}"),
+            k == CARRIER,
+            emitted,
+            planned,
+            &mut target,
         );
+        println!("CENSUS PLAN LEAF {k}: groups {leaf:?} · {emitted:?}");
         assert!(
-            over.is_empty(),
-            "leaf {k} is past a chip's height: {over:?}"
+            emitted.under(P1_LEAF_HEIGHTS),
+            "leaf {k} is past a chip's height: {emitted:?}"
         );
     }
 }
 
 // ======================== the leaves' chip heights ========================
 
-use super::whir_block::{P1_LEAF_HEIGHTS, leaf_partition_rows};
+use super::whir_block::{CARRIER, P1_LEAF_HEIGHTS, leaf_partition_rows};
 use super::whir_chain::ChipRows;
+
+fn p1_format() -> BlockFormat {
+    let production = BlockFormat::production();
+    BlockFormat {
+        zf: production.zf.with_base(BaseFormat::P1_WHIR),
+        max_groups: 1024,
+        ..production
+    }
+}
 
 fn rows(hash: usize, select: usize, balu: usize, hint: usize) -> ChipRows {
     ChipRows {
@@ -527,51 +537,92 @@ fn rows(hash: usize, select: usize, balu: usize, hint: usize) -> ChipRows {
         select,
         balu,
         hint,
+        ..ChipRows::default()
     }
 }
 
-/// The census's shapes (median mix, an ethrex ELF): a full group, a prepared
-/// one (DECODE's stack, the ELF pages' genesis).
+/// The census's shapes (median mix, an ethrex ELF; `whir_p1_group_census`): a
+/// full group, a full one heavy in the extension ALU (KECCAK_RND's tables), a
+/// prepared one (the ELF pages' genesis), and the front.
 const FULL: ChipRows = ChipRows {
-    hash: 38_646,
+    hash: 35_744,
     select: 139_878,
     balu: 142_236,
+    xalu: 193_562,
+    lanes: 129_555,
+    hint: 135_333,
+    bitdec: 2_415,
+    consts: 527,
+    public: 0,
+    accel: 0,
+};
+const HEAVY: ChipRows = ChipRows {
+    hash: 38_358,
+    xalu: 321_505,
+    lanes: 147_538,
     hint: 140_290,
+    consts: 519,
+    ..FULL
 };
 const PREPARED: ChipRows = ChipRows {
-    hash: 48_656,
+    hash: 48_367,
     select: 172_938,
     balu: 180_090,
+    xalu: 350_252,
+    lanes: 190_294,
     hint: 185_114,
+    bitdec: 3_105,
+    consts: 706,
+    public: 0,
+    accel: 0,
+};
+const FRONT: ChipRows = ChipRows {
+    hash: 287,
+    select: 0,
+    balu: 0,
+    xalu: 17,
+    lanes: 544,
+    hint: 237,
+    bitdec: 0,
+    consts: 554,
+    public: 5,
+    accel: 0,
 };
 
 fn sums(loads: &[ChipRows], leaf: &[usize], front: ChipRows) -> ChipRows {
     leaf.iter().fold(front, |acc, &g| acc.plus(loads[g]))
 }
 
-fn under(r: ChipRows, h: ChipRows) -> bool {
-    r.hash <= h.hash && r.select <= h.select && r.balu <= h.balu && r.hint <= h.hint
-}
-
-/// ★ The partition admits no leaf past a chip's height, whichever chip binds:
-/// groups light in the socket but heavy in `Select` (or hints) are split
-/// where a socket-only partition would double that chip silently. Four full
-/// groups share a leaf, a fifth does not (the socket cap holds RPX's leaf
-/// count). Every group is placed once, over no more leaves than the rows need,
-/// and a group no leaf holds is refused.
+/// ★ The partition admits no leaf past any chip's height, whichever chip
+/// binds: groups light in the socket but heavy in `Select`, base ALU, hints,
+/// lanes, bit decompositions or extension ALU are split where a partition
+/// blind to that chip would double it silently. Seven full groups share a
+/// leaf, an eighth does not (one 2^18 socket table); six heavy ones do, a
+/// seventh not. Every group is placed once, over no more leaves than the rows
+/// need, and a group no leaf holds is refused.
 #[test]
 fn the_p1_partition_keeps_every_chip_under_its_height() {
-    let front = rows(300, 0, 0, 240);
-    let small = rows(9_000, 60_000, 40_000, 50_000);
+    let front = FRONT;
+    let small = ChipRows {
+        xalu: 90_000,
+        lanes: 50_000,
+        ..rows(9_000, 60_000, 40_000, 50_000)
+    };
     for loads in [
         vec![PREPARED, FULL, FULL],
-        vec![PREPARED, FULL, FULL, FULL, FULL, FULL, PREPARED, small],
-        [vec![PREPARED; 2], vec![FULL; 77], vec![small]].concat(),
+        vec![PREPARED, FULL, HEAVY, FULL, HEAVY, FULL, PREPARED, small],
+        [
+            vec![PREPARED; 2],
+            vec![HEAVY; 8],
+            vec![FULL; 68],
+            vec![small],
+        ]
+        .concat(),
     ] {
         let partition = leaf_partition_rows(&loads, front, P1_LEAF_HEIGHTS).expect("partitions");
         for leaf in partition.leaves() {
             assert!(
-                under(sums(&loads, leaf, front), P1_LEAF_HEIGHTS),
+                sums(&loads, leaf, front).under(P1_LEAF_HEIGHTS),
                 "leaf {leaf:?} of {} groups is past a height",
                 loads.len()
             );
@@ -585,87 +636,109 @@ fn the_p1_partition_keeps_every_chip_under_its_height() {
             leaf_partition_rows(&loads, front, P1_LEAF_HEIGHTS).expect("again")
         );
     }
-    // Four full groups share a leaf, and so do a prepared one and three full;
-    // a fifth full group does not fit the socket cap. The 1× block's nine
-    // groups close in three leaves, the median's ninety in RPX's twenty-three.
-    let p = leaf_partition_rows(&[FULL; 4], front, P1_LEAF_HEIGHTS).expect("fits");
-    assert_eq!(p.num_leaves(), 1, "four full groups are one leaf");
-    let p =
-        leaf_partition_rows(&[PREPARED, FULL, FULL, FULL], front, P1_LEAF_HEIGHTS).expect("fits");
-    assert_eq!(p.num_leaves(), 1, "a prepared group and three full ones");
-    let p = leaf_partition_rows(&[FULL; 5], front, P1_LEAF_HEIGHTS).expect("fits");
-    assert_eq!(
-        p.num_leaves(),
-        2,
-        "a fifth full group is past the socket cap"
-    );
+    let leaves = |loads: &[ChipRows]| {
+        leaf_partition_rows(loads, front, P1_LEAF_HEIGHTS)
+            .expect("fits")
+            .num_leaves()
+    };
+    assert_eq!(leaves(&[FULL; 7]), 1, "seven full groups are one leaf");
+    assert_eq!(leaves(&[FULL; 8]), 2, "an eighth is past the socket");
+    assert_eq!(leaves(&[HEAVY; 6]), 1, "six heavy groups are one leaf");
+    assert_eq!(leaves(&[HEAVY; 7]), 2, "a seventh is past the socket");
+    // The 1× block's nine groups close in two leaves; the median's ninety in
+    // thirteen, the socket's lower bound — where balancing alone puts the two
+    // prepared groups on two leaves of five full ones and takes fourteen,
+    // first fit packs them on one with four.
     let nine = [vec![FULL; 7], vec![PREPARED; 2]].concat();
-    let p = leaf_partition_rows(&nine, front, P1_LEAF_HEIGHTS).expect("fits");
-    assert_eq!(p.num_leaves(), 3, "the 1× block's nine groups");
-    let ninety = [vec![FULL; 88], vec![PREPARED; 2]].concat();
-    let p = leaf_partition_rows(&ninety, front, P1_LEAF_HEIGHTS).expect("fits");
-    assert_eq!(
-        p.num_leaves(),
-        23,
-        "the median's ninety groups, RPX's leaf count"
-    );
-    // Select binds, or the hints: groups light in the socket are split.
+    assert_eq!(leaves(&nine), 2, "the 1× block's nine groups");
+    let ninety = [vec![PREPARED; 2], vec![FULL; 88]].concat();
+    assert_eq!(leaves(&ninety), 13, "the median's ninety groups");
+    // Any one chip binds: groups light in the socket are split.
     for heavy in [
         rows(10_000, 600_000, 10_000, 10_000),
+        rows(10_000, 10_000, 600_000, 10_000),
         rows(10_000, 10_000, 10_000, 600_000),
+        ChipRows {
+            lanes: 600_000,
+            ..rows(10_000, 10_000, 10_000, 10_000)
+        },
+        ChipRows {
+            xalu: 1_100_000,
+            ..rows(10_000, 10_000, 10_000, 10_000)
+        },
+        ChipRows {
+            bitdec: 17_000,
+            ..rows(10_000, 10_000, 10_000, 10_000)
+        },
+        ChipRows {
+            consts: 4_200,
+            ..rows(10_000, 10_000, 10_000, 10_000)
+        },
     ] {
         let p = leaf_partition_rows(&[heavy, heavy], front, P1_LEAF_HEIGHTS).expect("fits");
         assert_eq!(
             p.num_leaves(),
             2,
-            "{heavy:?} twice is past 2^20: split, not doubled"
+            "{heavy:?} twice is past a height: split, not doubled"
         );
     }
-    // Four groups that fit the socket cap (160 k) but not Select (1.2 M): the
-    // partition splits them; with its chip check off — the socket-only
-    // partition RPX keeps — they share a leaf whose Select crosses 2^20.
-    let selecty = rows(40_000, 300_000, 100_000, 100_000);
-    let set = [selecty; 4];
+    // ★ Four groups that fit every chip S6 bounded (socket, Select, base ALU,
+    // words) but not the extension ALU (2.8 M): the partition splits them; with
+    // the XALU bound off — S6's partition — they share a leaf whose XALU
+    // crosses 2^21 (arm C on RYZEN 062 padded seven groups' to 2^21 unbounded).
+    let xaluy = ChipRows {
+        xalu: 700_000,
+        ..rows(40_000, 150_000, 150_000, 150_000)
+    };
+    let set = [xaluy; 4];
     let p = leaf_partition_rows(&set, front, P1_LEAF_HEIGHTS).expect("fits");
-    assert_eq!(p.num_leaves(), 2, "split by Select");
+    assert_eq!(p.num_leaves(), 2, "split by the extension ALU");
     for leaf in p.leaves() {
-        assert!(under(sums(&set, leaf, front), P1_LEAF_HEIGHTS));
+        assert!(sums(&set, leaf, front).under(P1_LEAF_HEIGHTS));
     }
-    let costs: Vec<usize> = set.iter().map(|r| r.hash).collect();
-    let socket_only =
-        super::whir_block::leaf_partition(&costs, None, P1_LEAF_HEIGHTS.hash - front.hash)
-            .expect("the socket-only partition");
+    let unbounded = ChipRows {
+        xalu: usize::MAX / 2,
+        ..P1_LEAF_HEIGHTS
+    };
+    let blind = leaf_partition_rows(&set, front, unbounded).expect("the XALU-blind partition");
     assert!(
-        socket_only
+        blind
             .leaves()
             .iter()
-            .any(|leaf| sums(&set, leaf, front).select > P1_LEAF_HEIGHTS.select),
-        "the check is what keeps Select under 2^20: {:?}",
-        socket_only.leaves()
+            .any(|leaf| sums(&set, leaf, front).xalu > P1_LEAF_HEIGHTS.xalu),
+        "the XALU bound is what keeps it under 2^21: {:?}",
+        blind.leaves()
     );
-    // Refusals: a group past a height, a front that fills a chip.
+    // Refusals: a group past a height, an accelerator row (a WHIR leaf has
+    // none), a front past a height.
     let huge = rows(1_000, 1_200_000, 0, 0);
     assert!(leaf_partition_rows(&[FULL, huge], front, P1_LEAF_HEIGHTS).is_err());
+    let accel = ChipRows { accel: 1, ..FULL };
+    assert!(leaf_partition_rows(&[FULL, accel], front, P1_LEAF_HEIGHTS).is_err());
     assert!(leaf_partition_rows(&[FULL], rows(0, 1 << 20, 0, 0), P1_LEAF_HEIGHTS).is_err());
+    assert!(
+        leaf_partition_rows(
+            &[FULL],
+            ChipRows {
+                xalu: (1 << 21) + 1,
+                ..front
+            },
+            P1_LEAF_HEIGHTS
+        )
+        .is_err()
+    );
 }
 
-/// ★ The heights hold on the median mix, as emitted (the lead's condition on
-/// child order, 10-06): the plan's per-group rows are the emitted ones (a
-/// group's Select and base ALU are its chains', its words its arena's), a leaf
-/// of four full groups stays under 2^20 `Select`, hint and base-ALU rows and
-/// the socket cap (one 2^18 table), and so does every leaf the plan builds. A
-/// change that grows a group's rows past four a leaf fails here, and the
-/// partition then takes another leaf rather than a doubled chip.
+/// ★ The heights hold on the median mix, as emitted: the plan's rows are the
+/// emitted ones ([`assert_planned`]: groups 0 (prepared, the carrier) and 1
+/// (heavy) alone, and a leaf of seven heavy groups — past the socket and the
+/// extension ALU, a leaf the partition never builds, its rows still the sum),
+/// and every leaf the plan builds stays under every chip's height.
 #[test]
 fn the_p1_leaves_stay_under_their_heights_on_the_median_mix() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
     let opts = super::proof::block_base_options();
-    let production = BlockFormat::production();
-    let format = BlockFormat {
-        zf: production.zf.with_base(BaseFormat::P1_WHIR),
-        max_groups: 1024,
-        ..production
-    };
+    let format = p1_format();
     let owned = median_statement(&elf_bytes, &opts, &format);
     let plan = WhirBlockPlan::derive_with(
         &elf_bytes,
@@ -683,64 +756,78 @@ fn the_p1_leaves_stay_under_their_heights_on_the_median_mix() {
     // Every leaf the plan built, by its rows.
     for leaf in plan.partition().leaves() {
         assert!(
-            under(sums(&loads, leaf, front), P1_LEAF_HEIGHTS),
+            sums(&loads, leaf, front).under(P1_LEAF_HEIGHTS),
             "leaf {leaf:?}"
         );
     }
-    // The rows are the emitted ones: groups 1 (full) and 0 (prepared) alone.
-    let partition = BlockPartition::new(
-        [
-            vec![vec![0], vec![1], vec![2, 3, 4, 5]],
-            vec![(6..n).collect()],
-        ]
-        .concat(),
-        n,
-    )
-    .expect("covers once");
-    let probe = plan.with_partition(partition);
-    for (k, list) in [vec![0usize], vec![1]].iter().enumerate() {
+    // The rows are the emitted ones.
+    let lists = [vec![0usize], vec![1], (2..9).collect(), (9..n).collect()];
+    let probe = plan.with_partition(BlockPartition::new(lists.to_vec(), n).expect("covers once"));
+    let mut target = None;
+    for (k, list) in lists.iter().enumerate().take(3) {
         let emitted = ChipRows::of(&probe.leaf_program(k).expect("the leaf emits"));
-        let planned = sums(&loads, list, front);
-        assert_eq!(
-            (emitted.select, emitted.balu, emitted.hint),
-            (planned.select, planned.balu, planned.hint),
-            "group {list:?}: Select, base ALU and words are the plan's"
+        assert_planned(
+            &format!("groups {list:?}"),
+            k == CARRIER,
+            emitted,
+            sums(&loads, list, front),
+            &mut target,
         );
-        assert!(
-            emitted.hash <= planned.hash && emitted.hash + 64 >= planned.hash,
-            "group {list:?}: socket rows {} against the plan's {}",
-            emitted.hash,
-            planned.hash
-        );
+        if k == 2 {
+            println!("P1 SEVEN HEAVY GROUPS: {emitted:?} against {P1_LEAF_HEIGHTS:?}");
+            assert!(
+                !emitted.under(P1_LEAF_HEIGHTS),
+                "seven heavy groups: {emitted:?}"
+            );
+        }
     }
-    // Four full groups, emitted.
-    let four = ChipRows::of(&probe.leaf_program(2).expect("the leaf emits"));
-    println!("P1 FOUR FULL GROUPS: {four:?} against {P1_LEAF_HEIGHTS:?}");
-    assert!(under(four, P1_LEAF_HEIGHTS), "four full groups: {four:?}");
 }
 
-/// ★ The S6 census (instrument, `--exact`; `CENSUS_ELF` for a real guest): the
-/// median mix's leaves under each candidate partition — RPX's, P1 at S6's
-/// [`LEAF_P1_CAP`](super::whir_block::LEAF_P1_CAP) (four groups a leaf), at S5's
-/// 2^17 (three), and at a 2^18 room (all the socket table holds) — every leaf
-/// emitted: its padded chip heights, its cells, the tree above it, and 056's
-/// time model (a leaf ≈ 1.24 s + 0.0121 s a million cells; I-WHIR-P1 §S5.8).
-/// Prints `S6 …` lines; asserts S6's leaves under every bounded height.
+/// The LFM chip a [`ChipRows`] field counts, by [`ChipRows::NAMES`] order.
+const CHIP_NAMES: [&str; 10] = [
+    "LFM_HASH",
+    "LFM_SELECT",
+    "LFM_BALU",
+    "LFM_XALU",
+    "LFM_LANES",
+    "LFM_HINT",
+    "LFM_BITDEC",
+    "LFM_CONST",
+    "LFM_PUBLIC",
+    "",
+];
+
+/// RYZEN 062's card model of a leaf (I-WHIR-P1 §S6.4): ≈ 0.28 s plus
+/// ≈ 0.0122 s a million padded cells outside the socket.
+fn card_seconds(non_hash_cells: u64) -> f64 {
+    0.28 + 0.0122 * non_hash_cells as f64 / 1e6
+}
+
+/// ★ The S6b census (instrument, `--exact`; `CENSUS_ELF` for a real guest):
+/// the median mix's leaves under RPX's partition, S6's (178 k socket rows, four
+/// groups a leaf) and S6b's (every chip bounded) — every leaf emitted: its
+/// padded chip heights, its cells (all, and outside the socket), the tree above
+/// it, and 062's card model summed over the leaves (L0 is card-serial). Then
+/// the 1× block's shape, nine groups (seven full, both prepared) of the same
+/// mix, under S6 and S6b, by the plan's rows and the chips' widths. Prints
+/// `S6b …` lines; asserts S6b's leaves under every height.
 #[test]
 #[ignore = "instrument: run alone with --exact (CENSUS_ELF for a real guest)"]
-fn whir_s6_arm_census() {
+fn whir_s6b_census() {
     let elf_bytes = match std::env::var("CENSUS_ELF") {
         Ok(path) => std::fs::read(path).expect("read CENSUS_ELF"),
         Err(_) => crate::test_utils::asm_elf_bytes("poc_rodata_commit"),
     };
     let opts = super::proof::block_base_options();
     let production = BlockFormat::production();
-    let arms: [(&str, BaseFormat, Option<usize>); 4] = [
+    let arms: [(&str, BaseFormat, Option<usize>); 3] = [
         ("RPX", BaseFormat::RPX, None),
-        ("P1-S6", BaseFormat::P1_WHIR, None),
-        ("P1-S5-2^17", BaseFormat::P1_WHIR, Some(1 << 17)),
-        ("P1-2^18", BaseFormat::P1_WHIR, Some(262_000)),
+        ("P1-S6 (178 k)", BaseFormat::P1_WHIR, Some(178_000)),
+        ("P1-S6b", BaseFormat::P1_WHIR, None),
     ];
+    // Each chip's columns a row (main + aux), from the leaves' census.
+    let mut widths: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut s6b: Option<(Vec<ChipRows>, ChipRows, Vec<usize>)> = None;
     for (name, base, cap) in arms {
         let format = BlockFormat {
             zf: production.zf.with_base(base),
@@ -748,6 +835,7 @@ fn whir_s6_arm_census() {
             ..production
         };
         let owned = median_statement(&elf_bytes, &opts, &format);
+        let started = std::time::Instant::now();
         let plan = WhirBlockPlan::derive_capped(
             &elf_bytes,
             &opts,
@@ -759,11 +847,13 @@ fn whir_s6_arm_census() {
             cap.unwrap_or_else(|| super::whir_block::leaf_cap_for(&format.zf.base)),
         )
         .expect("the plan derives");
+        let derived = started.elapsed().as_secs_f64();
         let levels = plan.levels();
         let nodes: usize = levels.iter().map(|l| l.arities.len()).sum();
         let mut max: BTreeMap<&'static str, u64> = BTreeMap::new();
-        let (mut cells_sum, mut model, mut cells_max) = (0u64, 0f64, 0u64);
+        let (mut cells_sum, mut non_hash_sum, mut card) = (0u64, 0u64, 0f64);
         let mut groups_max = 0usize;
+        let started = std::time::Instant::now();
         for k in 0..plan.partition().num_leaves() {
             let program = plan.leaf_program(k).expect("the leaf emits");
             let chips = super::airs::lfm_chip_census_with_hasher(
@@ -771,33 +861,86 @@ fn whir_s6_arm_census() {
                 program.hasher(crate::hash_pin::BLOCK_HASHER),
             );
             let cells: u64 = chips.iter().map(|c| c.main_cells() + c.aux_cells()).sum();
+            let hash: u64 = chips
+                .iter()
+                .filter(|c| c.name == "LFM_HASH")
+                .map(|c| c.main_cells() + c.aux_cells())
+                .sum();
             for c in &chips {
                 let e = max.entry(c.name).or_default();
                 *e = (*e).max(c.rows);
+                if c.rows > 0 {
+                    widths.insert(c.name, (c.main_cols + c.aux_cols) as u64);
+                }
             }
             if base == BaseFormat::P1_WHIR && cap.is_none() {
                 let rows = ChipRows::of(&program);
                 assert!(
-                    under(rows, P1_LEAF_HEIGHTS),
-                    "S6 leaf {k} past a bounded height: {rows:?}"
+                    rows.under(P1_LEAF_HEIGHTS),
+                    "S6b leaf {k} past a bounded height: {rows:?}"
                 );
             }
             cells_sum += cells;
-            cells_max = cells_max.max(cells);
+            non_hash_sum += cells - hash;
+            card += card_seconds(cells - hash);
             groups_max = groups_max.max(plan.partition().leaf(k).len());
-            model += 1.24 + 0.0121 * cells as f64 / 1e6;
         }
         println!(
-            "S6 {name}: {} groups · {} leaves (≤ {groups_max} groups) · {nodes} nodes over {} node levels · leaf cells Σ {:.1} M, max {:.1} M · model Σ leaf time {model:.1} s · padded max {}",
+            "S6b {name}: {} groups · {} leaves (≤ {groups_max} groups) · {nodes} nodes over {} node levels · leaf cells Σ {:.1} M, outside the socket Σ {:.1} M · card model Σ {card:.2} s · plan derived {derived:.2} s, leaves emitted {:.2} s · padded max {}",
             plan.num_groups(),
             plan.partition().num_leaves(),
             levels.len(),
             cells_sum as f64 / 1e6,
-            cells_max as f64 / 1e6,
+            non_hash_sum as f64 / 1e6,
+            started.elapsed().as_secs_f64(),
             max.iter()
                 .map(|(n, r)| format!("{n}={r}"))
                 .collect::<Vec<_>>()
                 .join(" ")
+        );
+        if base == BaseFormat::P1_WHIR && cap.is_none() {
+            let (loads, front) = plan.chip_loads();
+            let prepared = plan.prepared().iter().map(|p| p.group).collect();
+            s6b = Some((loads.to_vec(), front, prepared));
+        }
+    }
+    println!("S6b CHIP WIDTHS: {widths:?}");
+
+    // The 1× shape: nine groups of the mix — both prepared and seven full —
+    // under S6's heights and S6b's, by the plan's rows.
+    let (loads, front, prepared) = s6b.expect("the S6b arm ran");
+    let full: Vec<usize> = (0..loads.len())
+        .filter(|g| !prepared.contains(g))
+        .take(7)
+        .collect();
+    let nine: Vec<ChipRows> = prepared.iter().chain(&full).map(|&g| loads[g]).collect();
+    let leaf_cells = |r: ChipRows| -> u64 {
+        r.to_array()
+            .iter()
+            .zip(CHIP_NAMES)
+            .filter(|&(&rows, name)| rows > 0 && !name.is_empty() && name != "LFM_HASH")
+            .map(|(&rows, name)| {
+                rows.next_power_of_two() as u64 * widths.get(name).copied().unwrap_or(0)
+            })
+            .sum::<u64>()
+            + 65_536 * widths.get("LFM_RANGE").copied().unwrap_or(0)
+    };
+    for (name, hash) in [("P1-S6 (178 k)", 178_000), ("P1-S6b", P1_LEAF_HEIGHTS.hash)] {
+        let heights = ChipRows {
+            hash,
+            ..P1_LEAF_HEIGHTS
+        };
+        let p = leaf_partition_rows(&nine, front, heights).expect("the nine partition");
+        let leaves: Vec<ChipRows> = p.leaves().iter().map(|l| sums(&nine, l, front)).collect();
+        let card: f64 = leaves.iter().map(|&r| card_seconds(leaf_cells(r))).sum();
+        println!(
+            "S6b X1-SHAPE {name}: {} leaves {:?} · outside the socket {:?} M · card model Σ {card:.2} s",
+            p.num_leaves(),
+            p.leaves(),
+            leaves
+                .iter()
+                .map(|&r| format!("{:.1}", leaf_cells(r) as f64 / 1e6))
+                .collect::<Vec<_>>(),
         );
     }
 }

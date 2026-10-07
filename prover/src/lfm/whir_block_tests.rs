@@ -2557,7 +2557,7 @@ fn the_whir_block_tree_on_a_real_block() {
                 .unwrap_or(0)
         };
         println!(
-            "W3 P1 PLAN: {} groups · {} leaves · {} prepared · leaf max socket {} · Select {} · base ALU {} · words {}",
+            "W3 P1 PLAN: {} groups · {} leaves · {} prepared · leaf max socket {} · Select {} · base ALU {} · words {} · ext ALU {} · lanes {} · bit-dec {} · const {}",
             plan.num_groups(),
             plan.partition().num_leaves(),
             plan.prepared().len(),
@@ -2565,6 +2565,10 @@ fn the_whir_block_tree_on_a_real_block() {
             leaf_max(|r| r.select),
             leaf_max(|r| r.balu),
             leaf_max(|r| r.hint),
+            leaf_max(|r| r.xalu),
+            leaf_max(|r| r.lanes),
+            leaf_max(|r| r.bitdec),
+            leaf_max(|r| r.consts),
         );
     }
 }
