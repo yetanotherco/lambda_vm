@@ -763,13 +763,13 @@ mod keccak_tests {
         use stark::constraints::builder::ConstraintSet;
         assert_eq!(
             keccak::KeccakConstraints.meta().len(),
-            51,
-            "KECCAK core: 25 ADD pairs + no-overflow"
+            52,
+            "KECCAK core: 25 ADD pairs + no-overflow + MuIsBit"
         );
         assert_eq!(
             keccak_rnd::KeccakRndConstraints.meta().len(),
-            140,
-            "KECCAK_RND: 20 IS_BIT(μ; Cxz_right_bit) + 20 θ + 100 ρ inline shift identities"
+            141,
+            "KECCAK_RND: 20 IS_BIT(μ; Cxz_right_bit) + 20 θ + 100 ρ inline shift identities + MuIsBit"
         );
     }
 }

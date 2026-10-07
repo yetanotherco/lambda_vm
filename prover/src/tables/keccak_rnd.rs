@@ -918,5 +918,15 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakRndConstraint
                 }
             }
         }
+
+        // MuIsBit — μ·(1−μ). Every other constraint and bus send is weighted by
+        // μ, so μ = 2, 7 or −1 is indistinguishable from μ = 1 at the constraint
+        // level, while on the bus a μ = −1 row inverts a range check and can hold
+        // a non-canonical (out-of-range) shift byte — the carrier mechanism.
+        // KECCAK_RND does not deduplicate (one row per round, μ ∈ {0,1}), so the
+        // bit constraint is honest and forbids μ = −1, closing the carrier.
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        b.emit_base(idx, mu.clone() * (one - mu));
     }
 }
