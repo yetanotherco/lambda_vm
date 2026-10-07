@@ -1617,6 +1617,80 @@ fn live_regeneration_proves_the_same_bytes() {
     }
 }
 
+/// The production default's spill, no disk (N4b), is `off` beside live
+/// regeneration (no store, the dropped line says so) and `auto` without it (a
+/// target of 0 spills every table it can): either way the same bytes.
+#[test]
+fn no_disk_is_off_beside_live_regeneration_and_auto_without_it() {
+    use crate::block_whir::BlockSpillPolicy;
+    use crate::block_whir::regen::RegenMode;
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let (plain, _) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Off,
+        BlockSpillPolicy::Off,
+        Deviations::default(),
+    )
+    .expect("prove");
+    let (live, stamps) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Always,
+        BlockSpillPolicy::NoDisk,
+        Deviations::default(),
+    )
+    .expect("prove");
+    let r = stamps.regen.expect("live regeneration's readout");
+    let lines = r.lines.join("\n");
+    assert!(r.dropped > 0 && r.regenerated == r.dropped, "{lines}");
+    assert!(lines.contains("(no disk)"), "{lines}");
+    assert!(stamps.spill_stats.is_none(), "a store opened");
+    assert!(
+        stamps
+            .spill
+            .as_deref()
+            .is_some_and(|l| l.starts_with("off") && l.contains("no store")),
+        "{:?}",
+        stamps.spill
+    );
+    let (spilled, stamps) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Off,
+        BlockSpillPolicy::NoDisk,
+        Deviations {
+            spill_target: Some(0),
+            ..Deviations::default()
+        },
+    )
+    .expect("prove");
+    assert!(stamps.regen.is_none());
+    let stats = stamps.spill_stats.expect("auto's store");
+    assert!(stats.slots > 0, "auto spilled nothing: {stats}");
+    assert!(
+        stamps
+            .spill
+            .as_deref()
+            .is_some_and(|l| l.starts_with("auto")),
+        "{:?}",
+        stamps.spill
+    );
+    for (what, proof) in [("live", &live), ("spilled", &spilled)] {
+        assert_eq!(proof.groups, plain.groups, "{what}: the partition");
+        assert!(verify(proof, &elf, &format), "{what}");
+        if crypto::grinding::deterministic() {
+            assert_eq!(bytes(proof), bytes(&plain), "{what}: the proof");
+        }
+    }
+}
+
 /// ★ Live regeneration never proves over columns it did not rebuild, and never
 /// hangs: a deposit one bit off is refused at its slot before any device work
 /// ("not the ones dropped"); with the digest off, the kept tree top refuses it
