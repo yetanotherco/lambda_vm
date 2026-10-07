@@ -219,6 +219,8 @@ mod program_shape_tests;
 #[cfg(test)]
 mod rp1a_review_tests;
 #[cfg(test)]
+mod rp1wa_review_tests;
+#[cfg(test)]
 mod whir_air_tests;
 #[cfg(test)]
 mod whir_batch_tests;
