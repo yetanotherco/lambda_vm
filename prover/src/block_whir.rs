@@ -386,9 +386,11 @@ pub struct BlockOptions {
     /// set.
     pub spill: BlockSpillPolicy,
     /// What phase B does with the streamed chunks ([`regen::RegenMode`]):
-    /// `None` reads `LAMBDA_VM_BLOCK_REGEN` when the prove starts (production;
-    /// a value it does not know refuses the prove), `Some` is a test's. The
-    /// proof's bytes are the same under every mode.
+    /// `None` reads `LAMBDA_VM_BLOCK_REGEN` when the prove starts (unset:
+    /// `off`; a value it does not know refuses the prove), `Some` is chosen.
+    /// Production: [`regen::production_regen`], `auto` when that knob and
+    /// `LAMBDA_VM_BLOCK_SPILL` are both unset. The proof's bytes are the same
+    /// under every mode.
     pub regen: Option<regen::RegenMode>,
 }
 
@@ -725,7 +727,7 @@ impl BlockOptions {
             pack_finished: true,
             gpack: gpack_from_env(),
             spill: spill_from_env(),
-            regen: None,
+            regen: regen::production_regen(),
         }
     }
 }
@@ -3375,6 +3377,14 @@ fn prove_streamed(
         Some(mode) => mode,
         None => regen::regen_mode()?,
     };
+    eprintln!(
+        "{}",
+        regen::regen_mode_line(
+            regen_mode,
+            std::env::var("LAMBDA_VM_BLOCK_REGEN").ok().as_deref(),
+            std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref(),
+        )
+    );
     let regen_recorder = regen::recorder(
         regen_mode,
         stream_form == TraceForm::Narrow && !options.stream_keccak_rnd && !options.stream_memw_lt,
