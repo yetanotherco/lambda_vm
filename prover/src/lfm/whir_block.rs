@@ -75,23 +75,25 @@ use super::word::{LfmWord, base_word};
 /// cap too).
 pub const LEAF_PERMS_CAP: usize = 279_000;
 
-/// The leaf-load cap under a Poseidon1 base, in socket (`Hash16`) rows: one
-/// 2^17 hash table a leaf, three full groups (≈ 38.6 k rows each) at the
-/// median and at 1×. D8a's 178 k (RPX's partition carried over) put four
-/// groups in a leaf, whose SELECT and HINT cross 2^19 while 146 k hash rows
-/// still pad to 2^18 (I-WHIR-P1 §S5.3; the lead's ruling 10-06).
-pub const LEAF_P1_CAP: usize = 1 << 17;
+/// The leaf-load cap under a Poseidon1 base, in socket (`Hash16`) rows: RPX's
+/// leaf count held — four full groups (≈ 38.6 k rows each) a leaf, 23 leaves at
+/// the median and 3 at 1×, inside one 2^18 hash table (D-WHIR-P1 D8a's 178 k).
+/// The recursion's time is the leaves' and the tree's count, not their cells:
+/// at 2^17 (three groups a leaf) the median's 30 leaves cost +5.4 s against
+/// RPX's 23 (RYZEN 056: ≈ 1.24 s fixed a leaf, five more nodes and a level;
+/// I-WHIR-P1 §S5.8, the lead's ruling 10-07).
+pub const LEAF_P1_CAP: usize = 178_000;
 
-/// The padded heights a Poseidon1 leaf keeps its chips under: one
-/// [`LEAF_P1_CAP`] socket table and 2^19 rows of `Select`, base ALU and hinted
-/// words — three full groups' heights at the median (I-WHIR-P1 §S5.3). The
-/// partition admits no leaf past any of them ([`leaf_partition_rows`]), so no
-/// chip doubles silently.
+/// The padded heights a Poseidon1 leaf keeps its chips under: the
+/// [`LEAF_P1_CAP`] socket rows (one 2^18 table) and 2^20 rows of `Select`,
+/// base ALU and hinted words — four groups' heights, and a prepared group's
+/// with three full ones (I-WHIR-P1 §S6). The partition admits no leaf past any
+/// of them ([`leaf_partition_rows`]), so no chip doubles silently.
 pub const P1_LEAF_HEIGHTS: ChipRows = ChipRows {
     hash: LEAF_P1_CAP,
-    select: 1 << 19,
-    balu: 1 << 19,
-    hint: 1 << 19,
+    select: 1 << 20,
+    balu: 1 << 20,
+    hint: 1 << 20,
 };
 
 /// The leaf cap a block's base takes: [`LEAF_P1_CAP`] under Poseidon1, else
