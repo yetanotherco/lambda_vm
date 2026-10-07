@@ -77,6 +77,9 @@ impl WhirTreeSink for StderrSink {
 /// too, and a verifier configured otherwise refuses (completeness, never
 /// soundness). The measurement-only `LAMBDA_VM_BASE_SPLIT` is not posture, and
 /// the allocator's never-purge posture is compiled into the binary.
+/// `LFM_PRECOMPUTED_TREE_CACHE_CAP`'s posture follows the host target
+/// ([`posture_tree_cache_cap`]): the table's 64 from a 64 GiB target up, 16
+/// below it.
 pub const POSTURE: &[(&str, &str)] = &[
     ("TABLE_PARALLELISM", "4"),
     ("LAMBDA_VM_MAX_ROWS_LOG2", "21"),
@@ -88,11 +91,42 @@ pub const POSTURE: &[(&str, &str)] = &[
     ("LAMBDA_VM_GRIND_GRID", "1024"),
 ];
 
+/// The precomputed-tree cache's knob, whose posture follows the host target.
+pub const POSTURE_TREE_CACHE_KNOB: &str = "LFM_PRECOMPUTED_TREE_CACHE_CAP";
+
+/// The host target (GiB, [`block_whir::spill_target_bytes`]) from which the
+/// posture keeps [`POSTURE`]'s 64 precomputed-tree cache entries.
+pub const POSTURE_TREE_CACHE_FULL_TARGET_GIB: u64 = 64;
+
+/// `LFM_PRECOMPUTED_TREE_CACHE_CAP`'s posture for a host `target` in bytes:
+/// 64 entries (≈ 100 MiB each, ≈ 6.2 GiB once full) from a
+/// [`POSTURE_TREE_CACHE_FULL_TARGET_GIB`] target up, 16 below it, where the
+/// ≈ 4.7 GiB they free count for more than the hits they lose. A miss only
+/// rebuilds the tree: the cache's key is the root, so nothing a proof commits
+/// to moves (#1013's rule, 49c4bb512).
+pub fn posture_tree_cache_cap(target: u64) -> &'static str {
+    if target >= POSTURE_TREE_CACHE_FULL_TARGET_GIB << 30 {
+        "64"
+    } else {
+        "16"
+    }
+}
+
 /// The `BLOCK POSTURE:` line: each posture knob as the process has it — equal
 /// to the posture, unset, or another value.
 pub fn posture_line() -> String {
     let words: Vec<String> = POSTURE
         .iter()
+        .map(|&(name, want)| {
+            if name == POSTURE_TREE_CACHE_KNOB {
+                (
+                    name,
+                    posture_tree_cache_cap(block_whir::spill_target_bytes()),
+                )
+            } else {
+                (name, want)
+            }
+        })
         .map(|(name, want)| match std::env::var(name) {
             Ok(v) if v == *want => format!("{name}={v}"),
             Ok(v) => format!("{name}={v} (≠ posture {want})"),

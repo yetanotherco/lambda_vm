@@ -490,23 +490,43 @@ fn main() -> ExitCode {
 }
 
 /// What the posture does in an environment: the knobs it sets (each posture
-/// knob the environment leaves unset) and the ones the environment already
-/// sets.
+/// knob the environment leaves unset), the ones the environment already sets,
+/// and notes on the knobs it set to something other than the table's value.
 struct PosturePlan {
     set: Vec<(&'static str, &'static str)>,
     env: Vec<String>,
+    notes: Vec<String>,
 }
 
-fn posture_plan(env: impl Fn(&str) -> Option<String>) -> PosturePlan {
+/// The posture against the environment `env` and the host `target` (bytes):
+/// the precomputed-tree cache's cap follows the target
+/// ([`prover::lfm::whir_block_tree::posture_tree_cache_cap`]).
+fn posture_plan(env: impl Fn(&str) -> Option<String>, target: impl Fn() -> u64) -> PosturePlan {
+    use prover::lfm::whir_block_tree::{POSTURE, POSTURE_TREE_CACHE_KNOB, posture_tree_cache_cap};
     let mut plan = PosturePlan {
         set: Vec::new(),
         env: Vec::new(),
+        notes: Vec::new(),
     };
-    for &(name, value) in prover::lfm::whir_block_tree::POSTURE {
-        match env(name) {
-            Some(v) => plan.env.push(format!("{name}={v}")),
-            None => plan.set.push((name, value)),
+    for &(name, value) in POSTURE {
+        if let Some(v) = env(name) {
+            plan.env.push(format!("{name}={v}"));
+            continue;
         }
+        if name == POSTURE_TREE_CACHE_KNOB {
+            let target = target();
+            let cap = posture_tree_cache_cap(target);
+            if cap != value {
+                plan.notes.push(format!(
+                    "BLOCK POSTURE: {name}={cap}, not {value}: the host target is {:.1} GiB \
+                     (LAMBDA_VM_BLOCK_SPILL_TARGET_GIB, else the cgroup or MemTotal less 10 GiB)",
+                    target as f64 / (1u64 << 30) as f64
+                ));
+            }
+            plan.set.push((name, cap));
+            continue;
+        }
+        plan.set.push((name, value));
     }
     plan
 }
@@ -520,7 +540,10 @@ fn posture_plan(env: impl Fn(&str) -> Option<String>) -> PosturePlan {
 ///
 /// Sets environment variables: no other thread may exist.
 unsafe fn apply_posture() -> Vec<String> {
-    let plan = posture_plan(|name| std::env::var(name).ok());
+    let plan = posture_plan(
+        |name| std::env::var(name).ok(),
+        prover::block_whir::spill_target_bytes,
+    );
     for (name, value) in &plan.set {
         // SAFETY: the caller's: no other thread exists.
         unsafe { std::env::set_var(name, value) };
@@ -537,11 +560,13 @@ unsafe fn apply_posture() -> Vec<String> {
             w.join(" ")
         }
     };
-    vec![format!(
+    let mut lines = vec![format!(
         "BLOCK POSTURE SET: {} · from the environment: {} · jemalloc: {decay}",
         words(plan.set.iter().map(|(n, v)| format!("{n}={v}")).collect()),
         words(plan.env),
-    )]
+    )];
+    lines.extend(plan.notes);
+    lines
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1677,12 +1702,35 @@ mod tests {
     #[test]
     fn the_posture_sets_only_unset_knobs() {
         use prover::lfm::whir_block_tree::POSTURE;
-        let all = posture_plan(|_| None);
+        let roomy = || 110u64 << 30;
+        let all = posture_plan(|_| None, roomy);
         assert_eq!(all.set, POSTURE.to_vec());
-        assert!(all.env.is_empty());
-        let mine = posture_plan(|n| (n == "TABLE_PARALLELISM").then(|| "8".to_string()));
+        assert!(all.env.is_empty() && all.notes.is_empty());
+        let mine = posture_plan(
+            |n| (n == "TABLE_PARALLELISM").then(|| "8".to_string()),
+            roomy,
+        );
         assert!(mine.set.iter().all(|(n, _)| *n != "TABLE_PARALLELISM"));
         assert_eq!(mine.env, vec!["TABLE_PARALLELISM=8".to_string()]);
+    }
+
+    /// The precomputed-tree cache's posture follows the host target: 64
+    /// entries from a 64 GiB target up, 16 below it (with a note), and a value
+    /// the environment sets is left alone.
+    #[test]
+    fn the_tree_cache_posture_follows_the_host_target() {
+        use prover::lfm::whir_block_tree::POSTURE_TREE_CACHE_KNOB as CAP;
+        let none = |_: &str| None;
+        let cap = |plan: &PosturePlan| plan.set.iter().find(|(n, _)| *n == CAP).map(|(_, v)| *v);
+        let big = posture_plan(none, || 64u64 << 30);
+        assert_eq!(cap(&big), Some("64"));
+        assert!(big.notes.is_empty());
+        let small = posture_plan(none, || 38u64 << 30);
+        assert_eq!(cap(&small), Some("16"));
+        assert_eq!(small.notes.len(), 1, "the note says why");
+        let set = posture_plan(|n| (n == CAP).then(|| "32".to_string()), || 38u64 << 30);
+        assert_eq!(cap(&set), None, "the environment's value stays");
+        assert_eq!(set.env, vec![format!("{CAP}=32")]);
     }
 
     /// The binary runs the allocator posture it compiles in: jemalloc never
