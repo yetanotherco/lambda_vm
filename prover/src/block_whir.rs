@@ -1878,6 +1878,12 @@ pub(crate) struct Deviations {
     /// At the walk's end, every parked table handed to the store, whatever the
     /// forecast ([`hand_off_need`]).
     pub hand_off_all: bool,
+    /// No hand-off at the walk's end, whatever the knob (a test that arms
+    /// live regeneration on a decision's pressure alone).
+    pub no_hand_off: bool,
+    /// The host under pressure from the start, as a decision's reading past
+    /// the purge's share would note it (a host with no `/proc` reads none).
+    pub pressure: bool,
     /// The shadow regenerator's slicer drops the first op of this table's
     /// list ([`regen::ShadowRun::spawn`]): a regeneration bug, which the shadow
     /// must report and the proof must not see.
@@ -1890,6 +1896,9 @@ pub(crate) struct Deviations {
     /// dies or deposits wrong columns, which phase B must refuse, never prove
     /// over.
     pub regen_faults: regen::LiveFaults,
+    /// `auto`'s arming floor in bytes, instead of the knob's
+    /// ([`regen::regen_arm_floor_bytes`]).
+    pub regen_arm_floor: Option<u64>,
     /// `auto`'s target for the host, in bytes, instead of the machine's
     /// ([`spill_target_bytes`]): 0 makes the policy want every table out.
     pub spill_target: Option<u64>,
@@ -3395,6 +3404,10 @@ fn prove_streamed(
     // the host (`always`: every one). The streamed chunks are placed first, in
     // hand-out order, so the table at block index `t` is the `t`-th chunk
     // handed out when there was one.
+    // `auto` arms on pressure (the policy's host readings set this) or once
+    // the bytes it wanted off the host reach the floor (N4a′); until then a
+    // table it wants out takes the spill's path.
+    let pressure = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(deviations.pressure));
     let live_regen = regen_recorder
         .as_ref()
         .filter(|_| regen_mode.live())
@@ -3404,6 +3417,12 @@ fn prove_streamed(
                 std::sync::Arc::new(move |t| recorder.chunk_at(t).map(|_| t as u64)),
                 regen::ahead_policy().initial(),
                 regen_mode == regen::RegenMode::Always,
+            )
+            .with_arming(
+                deviations
+                    .regen_arm_floor
+                    .unwrap_or_else(regen::regen_arm_floor_bytes),
+                std::sync::Arc::clone(&pressure),
             )
         });
     let run_airs: std::sync::OnceLock<VmAirs> = std::sync::OnceLock::new();
@@ -3456,6 +3475,7 @@ fn prove_streamed(
         let host_most = std::sync::Arc::clone(&host_most);
         let armed = live_regen.clone();
         let reserve = regen::regen_reserve_bytes();
+        let pressure = std::sync::Arc::clone(&pressure);
         std::sync::Arc::new(move |kept, cells, bytes| {
             let reading = HostReading::now();
             {
@@ -3464,7 +3484,9 @@ fn prove_streamed(
                     *most = Some(reading);
                 }
             }
-            note_pressure_past(reading.bytes(), target);
+            if note_pressure_past(reading.bytes(), target) {
+                pressure.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             let extra = if armed.as_ref().is_some_and(|r| r.is_armed()) {
                 reserve
             } else {
@@ -3669,7 +3691,7 @@ fn prove_streamed(
                 // finish's forecast passes the pressure share, the parked
                 // tables go to the store now, before its hump builds.
                 if let Some(spill) = walk_spill.as_ref().filter(|_| {
-                    deviations.hand_off_all || hand_off_from_env()
+                    deviations.hand_off_all || (hand_off_from_env() && !deviations.no_hand_off)
                 }) {
                     let hwm = HostReading::now().hwm;
                     let cycles = (window_stamps.windows as u64).saturating_mul(window as u64);
@@ -4259,6 +4281,8 @@ fn prove_streamed(
                 mismatches: report.as_ref().map_or(0, |r| r.mismatches),
                 failed: report.as_ref().map_or(0, |r| r.failures.len() + r.skipped),
                 error: report.as_ref().and_then(|r| r.error.clone()),
+                armed_by: drops.armed_why,
+                wanted: drops.wanted,
                 lines,
                 ..regen::RegenStamps::default()
             });

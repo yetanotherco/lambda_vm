@@ -463,7 +463,7 @@ impl BlockSpill {
     /// the store; with no store, nothing else leaves.
     pub fn hand_off(&self, need: u64, mem: Option<Arc<BlockMem>>) -> bool {
         if let Some(regen) = &self.regen {
-            regen.arm();
+            regen.arm_because("the hand-off's forecast");
         }
         let Some(store) = self.store.clone() else {
             return self.regen.is_some();
@@ -636,12 +636,36 @@ pub struct BlockRegen {
     always: bool,
     started: Instant,
     inner: Arc<std::sync::Mutex<RegenState>>,
+    /// The arming rule ([`arms_at`]): the bytes the policy may want off the
+    /// host before `auto` arms without pressure, and the pressure flag the
+    /// policy's host readings set.
+    arm_floor: u64,
+    pressure: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Why `auto` regeneration arms on a table the policy wants off the host
+/// (N4a′): real pressure (a host reading past the purge's share of the target)
+/// at any size, or the bytes wanted off so far reaching `floor` (a large
+/// projected spill). `None`: the table takes the spill's path. Rebuilding beats
+/// spilling only when the dropped pages come back to the host, which they do
+/// under pressure; without it a small spill costs less than a rebuild.
+pub fn arms_at(pressure: bool, wanted: u64, floor: u64) -> Option<&'static str> {
+    if pressure {
+        Some("pressure")
+    } else if wanted >= floor {
+        Some("the projected spill")
+    } else {
+        None
+    }
 }
 
 #[derive(Default)]
 struct RegenState {
-    /// When it armed, seconds after it was made.
+    /// When it armed, seconds after it was made, and why.
     armed: Option<f64>,
+    armed_why: Option<&'static str>,
+    /// Packed bytes of the tables the policy wanted off the host.
+    wanted: u64,
     /// The window's first producer, kept for the regenerator.
     producer: Option<RegenProducer>,
     /// Parked droppable tables, for drop-back at arming.
@@ -667,11 +691,17 @@ struct DropJob {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DropReport {
     pub armed: Option<f64>,
+    /// Why it armed ([`arms_at`], or the hand-off's forecast).
+    pub armed_why: Option<&'static str>,
     pub tables: usize,
     pub bytes: u64,
     pub back_tables: usize,
     pub back_bytes: u64,
     pub refused_late: usize,
+    /// The packed bytes the policy wanted off the host, and the floor past
+    /// which `auto` arms without pressure.
+    pub wanted: u64,
+    pub arm_floor: u64,
 }
 
 impl BlockRegen {
@@ -730,7 +760,33 @@ impl BlockRegen {
             always,
             started: Instant::now(),
             inner,
+            arm_floor: 0,
+            pressure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// `auto` arms only on `pressure` (set by the policy's host readings) or
+    /// once the bytes the policy wanted off the host reach `floor`
+    /// ([`arms_at`]); until then a table it wants out takes the spill's path.
+    /// Without it (a floor of 0) the first table wanted out arms it.
+    pub fn with_arming(mut self, floor: u64, pressure: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.arm_floor = floor;
+        self.pressure = pressure;
+        self
+    }
+
+    /// The policy wants a table of `len` packed bytes off the host: counted,
+    /// and `auto` arms when [`arms_at`] says so. Returns whether it is armed.
+    fn want(&self, len: u64) -> bool {
+        let mut state = self.lock();
+        state.wanted += len;
+        if state.armed.is_none() {
+            let pressure = self.pressure.load(std::sync::atomic::Ordering::Relaxed);
+            if let Some(why) = arms_at(pressure, state.wanted, self.arm_floor) {
+                self.arm_locked(&mut state, why);
+            }
+        }
+        state.armed.is_some()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RegenState> {
@@ -760,15 +816,25 @@ impl BlockRegen {
     /// Arm: from now on every droppable table is dropped, and every parked one
     /// is dropped back, in rank order. Returns whether this call armed.
     pub fn arm(&self) -> bool {
+        self.arm_because("asked")
+    }
+
+    /// [`Self::arm`], saying why.
+    pub fn arm_because(&self, why: &'static str) -> bool {
         let mut state = self.lock();
+        self.arm_locked(&mut state, why)
+    }
+
+    fn arm_locked(&self, state: &mut RegenState, why: &'static str) -> bool {
         if state.armed.is_some() {
             return false;
         }
         state.armed = Some(self.started.elapsed().as_secs_f64());
+        state.armed_why = Some(why);
         let mut candidates = std::mem::take(&mut state.candidates);
         candidates.sort_by_key(|p| p.rank);
         for parked in candidates {
-            Self::queue(&state, parked, true);
+            Self::queue(state, parked, true);
         }
         true
     }
@@ -813,11 +879,14 @@ impl BlockRegen {
         let back = state.dropped.iter().filter(|d| d.3);
         DropReport {
             armed: state.armed,
+            armed_why: state.armed_why,
             tables: state.dropped.len(),
             bytes: state.dropped.iter().map(|d| d.2).sum(),
             back_tables: back.clone().count(),
             back_bytes: back.map(|d| d.2).sum(),
             refused_late: state.refused_late,
+            wanted: state.wanted,
+            arm_floor: self.arm_floor,
         }
     }
 
@@ -927,24 +996,35 @@ where
             reason: "its packed parts did not move to the store and back",
         };
         let packed = table.take_narrow_for_spill().ok_or_else(failed)?;
+        // The policy's choice; with live regeneration every table it wants out
+        // counts toward `auto`'s arming ([`arms_at`]).
+        let wanted = |regen: Option<&BlockRegen>| {
+            let wanted = (spill.wanted)(spill.kept.load(Relaxed), cells, len as u64);
+            if let (true, Some(regen)) = (wanted, regen) {
+                regen.want(len as u64);
+            }
+            wanted
+        };
+        let mut wanted_here = None;
         if let (Some(regen), Some(_)) = (&spill.regen, rank) {
-            let parked = Arc::new(Parked {
-                len: len as u64,
-                rank,
-                state: std::sync::Mutex::new(ParkedState::Resident(packed)),
-            });
-            *slot = Some(Out::Parked(Arc::clone(&parked)));
-            if !regen.always() && (spill.wanted)(spill.kept.load(Relaxed), cells, len as u64) {
-                regen.arm();
+            let want = !regen.always() && wanted(Some(regen));
+            if regen.always() || regen.is_armed() {
+                let parked = Arc::new(Parked {
+                    len: len as u64,
+                    rank,
+                    state: std::sync::Mutex::new(ParkedState::Resident(packed)),
+                });
+                *slot = Some(Out::Parked(Arc::clone(&parked)));
+                regen.parked(parked);
+                continue;
             }
-            if !regen.always() && !regen.is_armed() {
-                spill.kept.fetch_add(len as u64, Relaxed);
-            }
-            regen.parked(parked);
-            continue;
+            // Not armed (N4a′): a table the policy wants out takes the spill's
+            // path below; any other stays, a drop-back candidate for arming.
+            wanted_here = Some(want);
         }
+        let want = wanted_here.unwrap_or_else(|| wanted(spill.regen.as_ref()));
         let spill_now = spill.store.is_some()
-            && (spill.wanted)(spill.kept.load(Relaxed), cells, len as u64)
+            && want
             && !spill.handing.load(std::sync::atomic::Ordering::SeqCst)
             && spill.has_room(len as u64);
         let packed = match (&spill.store, spill_now) {
@@ -961,6 +1041,19 @@ where
             },
             _ => packed,
         };
+        // A table phase B could rebuild that stays (not armed, not spilled):
+        // a drop-back candidate for when `auto` arms.
+        if let (Some(regen), Some(_)) = (&spill.regen, rank) {
+            let parked = Arc::new(Parked {
+                len: len as u64,
+                rank,
+                state: std::sync::Mutex::new(ParkedState::Resident(packed)),
+            });
+            *slot = Some(Out::Parked(Arc::clone(&parked)));
+            spill.kept.fetch_add(len as u64, Relaxed);
+            regen.parked(parked);
+            continue;
+        }
         let parked = Arc::new(Parked {
             len: len as u64,
             rank: None,
@@ -2921,6 +3014,36 @@ mod spill_tests {
         let back = from_store(main).expect("converts back");
         assert_eq!(back.data().as_ptr(), at, "back");
         assert_eq!(back, copy);
+    }
+
+    /// N4a′'s arming rule at its boundary: under the floor nothing arms, at
+    /// the floor the projected spill does, and pressure arms at any size; a
+    /// floor of 0 arms on the first table wanted out (N4a).
+    #[test]
+    fn auto_arms_on_pressure_or_at_the_floor() {
+        use super::arms_at;
+        const GIB: u64 = 1 << 30;
+        let floor = 32 * GIB;
+        assert_eq!(arms_at(false, 32 * GIB - GIB / 10, floor), None, "31.9 GiB");
+        assert_eq!(arms_at(false, 32 * GIB - 1, floor), None);
+        assert_eq!(
+            arms_at(false, 32 * GIB, floor),
+            Some("the projected spill"),
+            "32 GiB"
+        );
+        assert_eq!(arms_at(false, 40 * GIB, floor), Some("the projected spill"));
+        assert_eq!(
+            arms_at(true, 0, floor),
+            Some("pressure"),
+            "pressure at any size"
+        );
+        assert_eq!(arms_at(true, 64 * GIB, floor), Some("pressure"));
+        assert_eq!(
+            arms_at(false, 0, 0),
+            Some("the projected spill"),
+            "floor 0: N4a"
+        );
+        assert_eq!(arms_at(false, 0, u64::MAX), None);
     }
 
     /// The rebuilt groups go last, each set in group order; nothing rebuilt is

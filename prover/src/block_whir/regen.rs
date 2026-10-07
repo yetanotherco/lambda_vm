@@ -292,6 +292,17 @@ pub(crate) fn regen_reserve_bytes() -> u64 {
     gib_knob("LAMBDA_VM_BLOCK_REGEN_RESERVE_GIB", 10.0)
 }
 
+/// `LAMBDA_VM_BLOCK_REGEN_ARM_GIB` (default 32, N4a′): the packed bytes the
+/// policy may want off the host before `auto` regeneration arms without
+/// pressure ([`stark::multilinear_block::arms_at`]); until then a table it
+/// wants out takes the spill's path. Under pressure it arms at any size; `0`
+/// arms on the first table wanted out (N4a). RYZEN 069: the median wanted 19.1
+/// GiB out in all and gained nothing from a rebuild; p90 passes 32 GiB at
+/// ≈ 72 s.
+pub(crate) fn regen_arm_floor_bytes() -> u64 {
+    gib_knob("LAMBDA_VM_BLOCK_REGEN_ARM_GIB", 32.0)
+}
+
 fn gib_knob(var: &str, default: f64) -> u64 {
     let gib = std::env::var(var)
         .ok()
@@ -1888,13 +1899,17 @@ pub(crate) fn dropped_line(
     };
     format!(
         "BLOCK REGEN dropped: {mode:?}{} · {} chunks {:.2} GiB (drop-back {} chunks {:.2} GiB) · \
-         {armed} · {recipes} recipes · {} refused (no longer on the host)",
+         {armed} · {recipes} recipes · {} refused (no longer on the host) · armed by {} · wanted \
+         off the host {:.2} GiB, arming floor {:.2} GiB",
         if no_disk { " (no disk)" } else { "" },
         report.tables,
         report.bytes as f64 / GIB,
         report.back_tables,
         report.back_bytes as f64 / GIB,
         report.refused_late,
+        report.armed_why.unwrap_or("nothing"),
+        report.wanted as f64 / GIB,
+        report.arm_floor as f64 / GIB,
     )
 }
 
@@ -1979,6 +1994,10 @@ pub struct RegenStamps {
     pub error: Option<String>,
     /// Would-wait under the rest-first plan, when it is known.
     pub would_wait_rest_first: Option<f64>,
+    /// Why `auto` armed, when it did (N4a′), and the packed bytes the policy
+    /// wanted off the host.
+    pub armed_by: Option<&'static str>,
+    pub wanted: u64,
     /// The `BLOCK REGEN` lines.
     pub lines: Vec<String>,
 }

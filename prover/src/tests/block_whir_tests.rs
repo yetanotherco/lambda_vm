@@ -1564,6 +1564,101 @@ fn live_regeneration_proves_the_same_bytes() {
     }
 }
 
+/// ★ N4a′'s arming at its boundary, on a whole prove. A budget of 0 makes the
+/// policy want every committed table off the host; with no pressure (the
+/// machine's own target, which the test's few GiB stay far under) `auto` arms
+/// only once the bytes wanted out reach the floor:
+/// - a floor past them all never arms: every table wanted out takes today's
+///   path, the store, and nothing is dropped;
+/// - a floor of exactly their total arms on the last table wanted out (one
+///   byte more does not), and a floor of 0 on the first (N4a);
+/// - pressure arms at any floor: a decision's (the hand-off off), or the
+///   walk's-end hand-off's at a target of 0.
+///
+/// Every arm proves regeneration off's bytes under the deterministic grind.
+#[test]
+fn auto_arms_at_its_floor_or_on_pressure() {
+    use crate::block_whir::BlockSpillPolicy;
+    use crate::block_whir::regen::RegenMode;
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let (plain, _) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Off,
+        BlockSpillPolicy::Off,
+        Deviations::default(),
+    )
+    .expect("prove");
+    let run = |floor: u64, target: Option<u64>, pressure: bool| {
+        let (proof, stamps) = regenerated(
+            &elf,
+            &format,
+            RegenMode::Auto,
+            BlockSpillPolicy::Budget(0),
+            Deviations {
+                regen_arm_floor: Some(floor),
+                spill_target: target,
+                no_hand_off: pressure,
+                pressure,
+                ..Deviations::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("floor {floor}: {e:?}"));
+        assert_eq!(proof.groups, plain.groups, "floor {floor}: the partition");
+        if crypto::grinding::deterministic() {
+            assert!(
+                bytes(&proof) == bytes(&plain),
+                "floor {floor}: the proof differs"
+            );
+        }
+        let r = stamps.regen.expect("live regeneration's readout");
+        (r, stamps.spill_stats.map_or(0, |s| s.slots))
+    };
+    // Never armed: every table wanted out goes to the store.
+    let (r, slots) = run(u64::MAX, None, false);
+    let lines = r.lines.join("\n");
+    assert_eq!((r.dropped, r.armed_by), (0, None), "{lines}");
+    assert!(slots > 0, "nothing spilled\n{lines}");
+    let total = r.wanted;
+    assert!(total > 0, "{lines}");
+    // One byte over the total: still never armed.
+    let (r, _) = run(total + 1, None, false);
+    assert_eq!((r.dropped, r.armed_by), (0, None), "{}", r.lines.join("\n"));
+    // Exactly the total: armed by the projected spill, on the last table.
+    let (r, _) = run(total, None, false);
+    let lines = r.lines.join("\n");
+    assert_eq!(r.armed_by, Some("the projected spill"), "{lines}");
+    assert_eq!(r.regenerated, r.dropped, "{lines}");
+    // A floor of 0 arms on the first table wanted out (N4a): it drops more.
+    let (r0, _) = run(0, None, false);
+    assert_eq!(r0.armed_by, Some("the projected spill"));
+    assert!(
+        r0.dropped > 0 && r0.dropped >= r.dropped,
+        "{}",
+        r0.lines.join("\n")
+    );
+    // Pressure arms whatever the floor: noted by a decision's reading (here
+    // from the start, the walk's-end hand-off off), and at the hand-off (a
+    // target of 0 forecasts past it).
+    let (r, _) = run(u64::MAX, None, true);
+    let lines = r.lines.join("\n");
+    assert_eq!(r.armed_by, Some("pressure"), "{lines}");
+    assert!(r.dropped > 0 && r.regenerated == r.dropped, "{lines}");
+    let (r, _) = run(u64::MAX, Some(0), false);
+    let lines = r.lines.join("\n");
+    assert!(
+        matches!(r.armed_by, Some("pressure" | "the hand-off's forecast")),
+        "{lines}"
+    );
+    assert!(r.dropped > 0 && r.regenerated == r.dropped, "{lines}");
+}
+
 /// ★ Live regeneration never proves over columns it did not rebuild, and never
 /// hangs: a deposit one bit off is refused at its slot before any device work
 /// ("not the ones dropped"); with the digest off, the kept tree top refuses it
