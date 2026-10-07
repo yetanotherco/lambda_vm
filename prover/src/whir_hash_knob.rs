@@ -129,16 +129,20 @@ macro_rules! with_whir_hash {
 }
 
 /// ★ Run `$body` with `$h` bound to the WHIR configuration a block format's
-/// base names ([`crate::block_whir::checked_base`]): RPX → the binary arm the
-/// process's [`with_whir_hash`] selects (keccak or RPX, exactly as before the
-/// base was a format field); Poseidon1 → `P1Whir`, from the format alone,
-/// with no environment read. Any other base returns its typed refusal from the
-/// enclosing function, whose error type takes `crate::Error`.
+/// base names ([`crate::block_whir::checked_base`]): RPX → `RpxWhir`,
+/// Poseidon1 → `P1Whir`, from the format alone — the block path reads no
+/// environment for its hash, so [`selected`] (and its default, keccak) never
+/// reaches a block proof (D-WHIR-P1 S7). Any other base returns its typed
+/// refusal from the enclosing function, whose error type takes `crate::Error`.
 #[macro_export]
 macro_rules! with_block_hash {
     ($base:expr, |$h:ident| $body:block) => {
         match $crate::block_whir::checked_base(&$base)? {
-            $crate::block_whir::BlockHash::Binary => $crate::with_whir_hash!(|$h| $body),
+            $crate::block_whir::BlockHash::Rpx => {
+                #[allow(non_camel_case_types)]
+                type $h = multilinear::whir_hash::RpxWhir;
+                $body
+            }
             $crate::block_whir::BlockHash::Poseidon1 => {
                 #[allow(non_camel_case_types)]
                 type $h = multilinear::whir_hash::P1Whir;

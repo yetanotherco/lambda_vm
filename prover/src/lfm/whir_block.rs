@@ -597,22 +597,11 @@ impl WhirBlockPlan {
             return Err(format!("a fan-in of {fan_in} closes no tree"));
         }
         // The machine replays the base's transcript: RPX's algebraic one, or
-        // under a Poseidon1 base ZisK's sponge. An RPX base's block hash is
-        // still the knob's until S7, and the machine replays only its RPX arm.
+        // under a Poseidon1 base ZisK's sponge — the format's hash, which the
+        // base proof was made under too (`with_block_hash!` reads no knob).
         let base = &format.zf.base;
         let wrap_hash = super::edsl::WrapHash::for_base(base);
-        match crate::block_whir::checked_base(base).map_err(|e| format!("{e:?}"))? {
-            crate::block_whir::BlockHash::Binary => {
-                if crate::whir_hash_knob::selected() != crate::whir_hash_knob::Setting::Rpx {
-                    return Err(
-                        "the block's recursion verifies a block proved over RPX; set \
-                         LAMBDA_VM_WHIR_HASH=rpx"
-                            .to_string(),
-                    );
-                }
-            }
-            crate::block_whir::BlockHash::Poseidon1 => {}
-        }
+        crate::block_whir::checked_base(base).map_err(|e| format!("{e:?}"))?;
         let frame = block_frame(statement, elf_bytes, proof_options, format)
             .map_err(|e| format!("statement: {e:?}"))?;
         let elf_digest = crate::statement::elf_digest(elf_bytes);

@@ -106,7 +106,7 @@ fn the_statement_tag_names_the_bases_geometry() {
 /// The base check: RPX and Poseidon1 at a cap its trees run, and nothing else.
 #[test]
 fn checked_base_refuses_what_no_block_proves() {
-    assert_eq!(checked_base(&BaseFormat::RPX).ok(), Some(BlockHash::Binary));
+    assert_eq!(checked_base(&BaseFormat::RPX).ok(), Some(BlockHash::Rpx));
     assert_eq!(
         checked_base(&BaseFormat::P1_WHIR).ok(),
         Some(BlockHash::Poseidon1)
@@ -261,8 +261,9 @@ fn the_statement_calls_are_absorb_blocks_own() {
 
 /// ★ No environment read decides the base: the block's prove, verify and
 /// plan sites dispatch through `with_block_hash!` on the format alone, whose
-/// Poseidon1 arm and base check read no environment and never consult the WHIR
-/// hash knob (the knob still picks the binary arm, until D-WHIR-P1 S7).
+/// arms — RPX's and Poseidon1's — and base check read no environment and never
+/// consult the WHIR hash knob, and the plan reads no knob either
+/// (D-WHIR-P1 S7: `LAMBDA_VM_WHIR_HASH` left the block path).
 #[test]
 fn no_environment_read_decides_the_base() {
     let block = include_str!("../block_whir.rs");
@@ -282,18 +283,30 @@ fn no_environment_read_decides_the_base() {
     let tag = &block[block.find("pub fn block_statement_tag").expect("the tag")..];
     let tag = &tag[..tag.find("\n}\n").expect("its end")];
     let knob = include_str!("../whir_hash_knob.rs");
-    let arm = &knob[knob
+    let arms = &knob[knob
         .find("macro_rules! with_block_hash")
         .expect("the macro")..];
-    let arm = &arm[arm.find("BlockHash::Poseidon1").expect("the P1 arm")..];
-    let arm = &arm[..arm.find("\n}\n").expect("its end")];
+    let arms = &arms[arms.find("match $crate::block_whir").expect("the match")..];
+    let arms = &arms[..arms.find("\n}\n").expect("its end")];
+    assert!(arms.contains("BlockHash::Rpx") && arms.contains("BlockHash::Poseidon1"));
     for (name, source) in [
         ("checked_base", check),
         ("the tag", tag),
-        ("the P1 arm", arm),
+        ("the macro's arms", arms),
     ] {
-        for read in ["std::env", "env::var", "selected()", "whir_hash_knob"] {
+        for read in [
+            "std::env",
+            "env::var",
+            "selected()",
+            "whir_hash_knob",
+            "with_whir_hash",
+        ] {
             assert!(!source.contains(read), "{name} names {read}");
         }
+    }
+    // The plan reads other knobs (`LFM_WHIR_SHARE_INVERSE`), never the hash's.
+    let plan = include_str!("../lfm/whir_block.rs");
+    for read in ["whir_hash_knob", "with_whir_hash", "LAMBDA_VM_WHIR_HASH"] {
+        assert!(!plan.contains(read), "the block plan names {read}");
     }
 }

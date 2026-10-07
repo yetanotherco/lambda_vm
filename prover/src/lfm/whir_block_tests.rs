@@ -406,7 +406,9 @@ fn the_block_front_draws_the_hosts_challenges() {
         .iter()
         .flat_map(|p| p.roots.iter().copied())
         .collect();
-    let host: Vec<FEE> = crate::with_whir_hash!(|H| {
+    // RPX: the base `small_format` names, whatever the process's knob.
+    let host: Vec<FEE> = {
+        type H = multilinear::whir_hash::RpxWhir;
         type T = DefaultTranscript<FEE_FIELD, <H as multilinear::whir_hash::WhirHash>::Transcript>;
         let mut t = T::new(&[]);
         block_whir::absorb_block(
@@ -431,7 +433,7 @@ fn the_block_front_draws_the_hosts_challenges() {
         fork.append_bytes(&(g as u64).to_le_bytes());
         drawn.push(fork.sample_field_element());
         drawn
-    });
+    };
     let machine: Vec<FEE> = words.iter().map(ext_of).collect();
     assert_eq!(machine, host, "z, α, β and the fork's first draw");
 }
