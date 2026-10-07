@@ -519,6 +519,7 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// read from) before any table is built, then every table the windows did
     /// not stream, and every streamed chunk's slot, handed to the sink it
     /// returns in AIR order, under `gate` ([`super::finish::FinishPlan::emit_streamed`]).
+    #[cfg(test)]
     pub(crate) fn finish_streamed<'s>(
         self,
         logs: &[Log],
@@ -530,6 +531,24 @@ impl<'a> WindowedTraceBuilder<'a> {
             Error,
         >,
     ) -> Result<(), Error> {
+        self.finish_streamed_keeping(logs, gate, false, on_header)
+            .map(|_| ())
+    }
+
+    /// [`Self::finish_streamed`], and with `keep` what phase B needs to build
+    /// KECCAK_RND's and LT's tables again ([`super::RestRegen`]).
+    pub(crate) fn finish_streamed_keeping<'s>(
+        self,
+        logs: &[Log],
+        gate: &super::gate::ByteGate,
+        keep: bool,
+        on_header: impl FnOnce(
+            super::RestHeader,
+        ) -> Result<
+            Box<dyn FnMut(super::Emitted) -> Result<(), Error> + 's>,
+            Error,
+        >,
+    ) -> Result<Option<super::RestRegen>, Error> {
         let Finishing {
             ops,
             image,
@@ -567,7 +586,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 return Err(e);
             }
         };
-        plan.emit_streamed(gate, &mut *send)
+        plan.emit_streamed_keeping(gate, &mut *send, keep)
     }
 
     /// The run's last window collected and walked, and the run's lists

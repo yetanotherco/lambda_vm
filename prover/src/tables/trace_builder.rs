@@ -91,7 +91,7 @@ use blocks::{BlockVec, block_len};
 use compact_branch::CompactBranch;
 use compact_bytewise::CompactBytewise;
 use compact_eq::CompactEq;
-pub(crate) use finish::{Emitted, RestHeader};
+pub(crate) use finish::{Emitted, RegenFamily, RegenJob, RestHeader, RestRegen};
 pub use windowed::{
     Accumulator, ChunkJob, RegenBuilder, StreamTable, StreamedChunk, WalkedWindow, Walker,
     WindowStamps, WindowedTraceBuilder,

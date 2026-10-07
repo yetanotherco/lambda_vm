@@ -346,8 +346,8 @@ pub struct BlockSpill {
 /// group's upload (`restore_group`).
 struct Parked {
     len: u64,
-    /// Its rank when phase B can rebuild it ([`BlockRegen`]).
-    rank: Option<u64>,
+    /// Its class and rank when phase B can rebuild it ([`BlockRegen`]).
+    rank: Option<(usize, u64)>,
     state: std::sync::Mutex<ParkedState>,
 }
 
@@ -396,11 +396,13 @@ impl Out {
         }
     }
 
-    /// The regeneration slot, when the columns were dropped.
-    fn dropped(&self) -> Option<RegenSlot> {
+    /// The class the columns were dropped in, when they were.
+    fn dropped_class(&self) -> Option<usize> {
         match self {
             Self::Spilled(_) => None,
-            Self::Parked(parked) => parked.dropped(),
+            Self::Parked(parked) => parked
+                .dropped()
+                .and_then(|_| parked.rank.map(|(class, _)| class)),
         }
     }
 }
@@ -631,8 +633,10 @@ impl BlockSpill {
 /// block that never arms drops nothing.
 #[derive(Clone)]
 pub struct BlockRegen {
-    droppable: Arc<dyn Fn(usize) -> Option<u64> + Send + Sync>,
-    window: Arc<RegenWindow>,
+    droppable: Arc<dyn Fn(usize) -> Option<(usize, u64)> + Send + Sync>,
+    /// One window a class: each class's regenerator deposits, and phase B
+    /// takes, in that class's rank order.
+    windows: Vec<Arc<RegenWindow>>,
     always: bool,
     started: Instant,
     inner: Arc<std::sync::Mutex<RegenState>>,
@@ -642,15 +646,15 @@ pub struct BlockRegen {
 struct RegenState {
     /// When it armed, seconds after it was made.
     armed: Option<f64>,
-    /// The window's first producer, kept for the regenerator.
-    producer: Option<RegenProducer>,
+    /// Each window's first producer, kept for its regenerator.
+    producers: Vec<Option<RegenProducer>>,
     /// Parked droppable tables, for drop-back at arming.
     candidates: Vec<Arc<Parked>>,
     tx: Option<std::sync::mpsc::Sender<DropJob>>,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// Every drop, in the order made: its rank, its slot, its bytes and
-    /// whether drop-back made it.
-    dropped: Vec<(u64, RegenSlot, u64, bool)>,
+    /// Every drop, in the order made: its class and rank, its slot, its bytes
+    /// and whether drop-back made it.
+    dropped: Vec<((usize, u64), RegenSlot, u64, bool)>,
     /// Drops that found their table gone from the host (handed to the store).
     refused_late: usize,
     /// A memory log, which counts each drop out of the held bytes.
@@ -672,24 +676,42 @@ pub struct DropReport {
     pub back_tables: usize,
     pub back_bytes: u64,
     pub refused_late: usize,
+    /// By class: the tables and bytes dropped.
+    pub by_class: Vec<(usize, u64)>,
+}
+
+/// One class's regeneration for phase B ([`BlockRegen::into_plan`]): its
+/// window, its dropped tables' ranks and slots in the window's order, and the
+/// window's first producer for its regenerator.
+pub struct ClassPlan {
+    pub window: Arc<RegenWindow>,
+    pub dropped: Vec<(u64, RegenSlot)>,
+    pub producer: Option<RegenProducer>,
 }
 
 impl BlockRegen {
-    /// Live regeneration over `droppable`, its slots paced by a window of
-    /// `ahead` bytes ([`RegenWindow::new`]). Its drop thread starts here; phase
-    /// A's end joins it.
+    /// Live regeneration over `droppable` (a table's class and rank, when
+    /// phase B can rebuild it), a class's slots paced by a window of its
+    /// `aheads` bytes ([`RegenWindow::new`]). Its drop thread starts here;
+    /// phase A's end joins it.
     pub fn new(
-        droppable: Arc<dyn Fn(usize) -> Option<u64> + Send + Sync>,
-        ahead: u64,
+        droppable: Arc<dyn Fn(usize) -> Option<(usize, u64)> + Send + Sync>,
+        aheads: &[u64],
         always: bool,
     ) -> Self {
-        let (window, producer) = RegenWindow::new(ahead);
+        let (windows, producers): (Vec<_>, Vec<_>) = aheads
+            .iter()
+            .map(|&ahead| {
+                let (window, producer) = RegenWindow::new(ahead);
+                (window, Some(producer))
+            })
+            .unzip();
         let inner = Arc::new(std::sync::Mutex::new(RegenState {
-            producer: Some(producer),
+            producers,
             ..RegenState::default()
         }));
         let (tx, rx) = std::sync::mpsc::channel::<DropJob>();
-        let (window_in, inner_in) = (Arc::clone(&window), Arc::clone(&inner));
+        let (windows_in, inner_in) = (windows.clone(), Arc::clone(&inner));
         let thread = std::thread::Builder::new()
             .name("block-regen-drop".to_string())
             .spawn(move || {
@@ -700,8 +722,9 @@ impl BlockRegen {
                         .unwrap_or_else(|e| e.into_inner())
                         .mem
                         .clone();
-                    let dropped = rank.and_then(|rank| {
-                        drop_parked(&window_in, &job.parked, rank, mem.as_deref())
+                    let dropped = rank.and_then(|(class, rank)| {
+                        let window = windows_in.get(class)?;
+                        drop_parked(window, &job.parked, rank, mem.as_deref())
                     });
                     let mut state = inner_in.lock().unwrap_or_else(|e| e.into_inner());
                     match (dropped, rank) {
@@ -726,7 +749,7 @@ impl BlockRegen {
         }
         Self {
             droppable,
-            window,
+            windows,
             always,
             started: Instant::now(),
             inner,
@@ -737,14 +760,15 @@ impl BlockRegen {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The rank of the table at block index `index`, when it may be dropped.
-    pub fn rank_of(&self, index: usize) -> Option<u64> {
-        (self.droppable)(index)
+    /// The class and rank of the table at block index `index`, when it may
+    /// be dropped (a class with no window may not).
+    pub fn rank_of(&self, index: usize) -> Option<(usize, u64)> {
+        (self.droppable)(index).filter(|&(class, _)| class < self.windows.len())
     }
 
-    /// The window the dropped tables' slots are in.
-    pub fn window(&self) -> &Arc<RegenWindow> {
-        &self.window
+    /// Each class's window, the dropped tables' slots in it.
+    pub fn windows(&self) -> &[Arc<RegenWindow>] {
+        &self.windows
     }
 
     /// Whether it armed.
@@ -811,6 +835,13 @@ impl BlockRegen {
     pub fn report(&self) -> DropReport {
         let state = self.lock();
         let back = state.dropped.iter().filter(|d| d.3);
+        let mut by_class = vec![(0usize, 0u64); self.windows.len()];
+        for ((class, _), _, bytes, _) in &state.dropped {
+            if let Some(c) = by_class.get_mut(*class) {
+                c.0 += 1;
+                c.1 += bytes;
+            }
+        }
         DropReport {
             armed: state.armed,
             tables: state.dropped.len(),
@@ -818,25 +849,38 @@ impl BlockRegen {
             back_tables: back.clone().count(),
             back_bytes: back.map(|d| d.2).sum(),
             refused_late: state.refused_late,
+            by_class,
         }
     }
 
-    /// Phase B's regeneration: every dropped table's rank and slot, in the
-    /// window's order, and the window's first producer for the regenerator.
-    /// `None` when nothing was dropped (the producer goes with it).
-    pub fn into_plan(self) -> Option<(Vec<(u64, RegenSlot)>, RegenProducer)> {
+    /// Phase B's regeneration, a class each ([`ClassPlan`]): a class that
+    /// dropped nothing has no dropped tables and no producer (it went with
+    /// the plan, so its window's slots, none, need no regenerator).
+    pub fn into_plan(self) -> Vec<ClassPlan> {
         let mut state = self.lock();
-        let producer = state.producer.take();
-        let mut dropped: Vec<(u64, RegenSlot)> = state
-            .dropped
+        let producers = std::mem::take(&mut state.producers);
+        let mut plans: Vec<ClassPlan> = self
+            .windows
             .iter()
-            .map(|(rank, slot, _, _)| (*rank, slot.clone()))
+            .zip(producers)
+            .map(|(window, producer)| ClassPlan {
+                window: Arc::clone(window),
+                dropped: Vec::new(),
+                producer,
+            })
             .collect();
-        if dropped.is_empty() {
-            return None;
+        for ((class, rank), slot, _, _) in &state.dropped {
+            if let Some(plan) = plans.get_mut(*class) {
+                plan.dropped.push((*rank, slot.clone()));
+            }
         }
-        dropped.sort_by_key(|(_, slot)| slot.order_key());
-        Some((dropped, producer?))
+        for plan in &mut plans {
+            plan.dropped.sort_by_key(|(_, slot)| slot.order_key());
+            if plan.dropped.is_empty() {
+                plan.producer = None;
+            }
+        }
+        plans
     }
 }
 
@@ -911,13 +955,21 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
+    // A group's tables drop in one class only ([`drop_one_class`]).
+    let mut ranks: Vec<Option<(usize, u64)>> = (0..tables.len())
+        .map(|k| {
+            tables[k].narrow()?;
+            spill.regen.as_ref()?.rank_of(first + k)
+        })
+        .collect();
+    drop_one_class(&mut ranks);
     for (k, (table, slot)) in tables.iter_mut().zip(out.iter_mut()).enumerate() {
         let table_cells = (table.num_committed_columns() as u64) << table.num_vars();
         let cells = spill.cells.fetch_add(table_cells, Relaxed) + table_cells;
         let Some(len) = table.narrow().map(|packed| packed.data().len()) else {
             continue;
         };
-        let rank = spill.regen.as_ref().and_then(|r| r.rank_of(first + k));
+        let rank = ranks[k];
         if g < SPILL_RESIDENT_GROUPS && rank.is_none() {
             spill.kept.fetch_add(len as u64, Relaxed);
             continue;
@@ -1723,20 +1775,22 @@ where
         &self.stamps
     }
 
-    /// By group, whether it holds a table whose columns were dropped for
-    /// phase B to rebuild ([`BlockRegen`]): the groups [`rebuilt_last`] puts
-    /// last.
-    pub fn rebuilt_groups(&self) -> Vec<bool> {
+    /// By group, the class of the tables it dropped for phase B to rebuild
+    /// ([`BlockRegen`]), or `None`: what [`interleaved_order`] orders by.
+    /// Refused with the first group that dropped tables of two classes
+    /// ([`one_class`]): phase B could not take it in both classes' orders.
+    pub fn rebuilt_classes(&self) -> Result<Vec<Option<usize>>, usize> {
         let mut at = 0usize;
         self.sizes
             .iter()
-            .map(|&size| {
-                let rebuilt = self.spilled[at..at + size]
+            .enumerate()
+            .map(|(g, &size)| {
+                let classes = self.spilled[at..at + size]
                     .iter()
                     .flatten()
-                    .any(|out| out.dropped().is_some());
+                    .map(Out::dropped_class);
                 at += size;
-                rebuilt
+                one_class(classes).ok_or(g)
             })
             .collect()
     }
@@ -2226,6 +2280,76 @@ pub fn rebuilt_last(rebuilt: &[bool]) -> Vec<usize> {
         .filter(|&g| !rebuilt[g])
         .chain((0..rebuilt.len()).filter(|&g| rebuilt[g]))
         .collect()
+}
+
+/// The ranks of a group's tables that drop, `ranks` holding each table's rank
+/// in its class (`None` for one no regenerator rebuilds): those of the class of
+/// its first droppable table only. Phase B takes each class's groups in that
+/// class's rank order, and a group of two classes would have to come last in
+/// one and first in the other; the other class's tables in it stay.
+fn drop_one_class(ranks: &mut [Option<(usize, u64)>]) {
+    let class = ranks.iter().flatten().next().map(|&(class, _)| class);
+    for rank in ranks {
+        if rank.is_some_and(|(c, _)| Some(c) != class) {
+            *rank = None;
+        }
+    }
+}
+
+/// The one class among a group's tables' dropped classes (`None` for a table
+/// not dropped), `Some(None)` when none dropped, `None` when two classes did.
+fn one_class(classes: impl IntoIterator<Item = Option<usize>>) -> Option<Option<usize>> {
+    let mut one = None;
+    for class in classes.into_iter().flatten() {
+        match one {
+            Some(c) if c != class => return None,
+            _ => one = Some(class),
+        }
+    }
+    Some(one)
+}
+
+/// Phase B's order with two classes rebuilt (D-WHIR-NODISK N3): the groups
+/// with nothing dropped first, in group order (they need no regenerator, and
+/// give every regenerator a head start); then the rebuilt groups, each class
+/// in group order (its rank order), the classes interleaved so each class's
+/// share of the `weights` taken so far stays at its share of the whole. Each
+/// regenerator then has to keep up with only its share of phase B's pace. With
+/// one class it is [`rebuilt_last`].
+pub fn interleaved_order(classes: &[Option<usize>], weights: &[u64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..classes.len())
+        .filter(|&g| classes[g].is_none())
+        .collect();
+    let n = classes.iter().flatten().max().map_or(0, |&c| c + 1);
+    let lists: Vec<Vec<usize>> = (0..n)
+        .map(|c| {
+            (0..classes.len())
+                .filter(|&g| classes[g] == Some(c))
+                .collect()
+        })
+        .collect();
+    let weight = |g: usize| weights.get(g).copied().unwrap_or(0).max(1) as u128;
+    let totals: Vec<u128> = lists
+        .iter()
+        .map(|l| l.iter().map(|&g| weight(g)).sum())
+        .collect();
+    let mut next = vec![0usize; n];
+    let mut taken = vec![0u128; n];
+    while (0..n).any(|c| next[c] < lists[c].len()) {
+        // The class furthest behind its share: taken_c / total_c the least
+        // (compared without division), ties to the lower class.
+        let Some(c) = (0..n)
+            .filter(|&c| next[c] < lists[c].len())
+            .min_by(|&a, &b| (taken[a] * totals[b]).cmp(&(taken[b] * totals[a])))
+        else {
+            break;
+        };
+        let g = lists[c][next[c]];
+        next[c] += 1;
+        taken[c] += weight(g);
+        order.push(g);
+    }
+    order
 }
 
 /// A group's tables, mutably, and another group's (`next`), each a contiguous
@@ -2921,6 +3045,85 @@ mod spill_tests {
         let back = from_store(main).expect("converts back");
         assert_eq!(back.data().as_ptr(), at, "back");
         assert_eq!(back, copy);
+    }
+
+    /// Two classes rebuilt (N3): the plain groups first, then each class in
+    /// group order, interleaved by its share of the weights; one class is
+    /// `rebuilt_last`.
+    #[test]
+    fn interleaved_classes_keep_their_share_and_their_order() {
+        use super::interleaved_order;
+        let classes = [None, Some(0), Some(0), Some(1), None, Some(1), Some(0)];
+        assert_eq!(
+            interleaved_order(&classes, &[1; 7]),
+            vec![0, 4, 1, 3, 2, 5, 6]
+        );
+        // A heavy rest group waits until the streamed class has caught up.
+        assert_eq!(
+            interleaved_order(&[Some(0), Some(0), Some(1), Some(0)], &[1, 1, 3, 1]),
+            vec![0, 2, 1, 3]
+        );
+        // One class: the groups with nothing dropped, then it (rebuilt_last).
+        let one = [true, true, false, true, false];
+        let as_classes: Vec<Option<usize>> = one.iter().map(|&r| r.then_some(0)).collect();
+        assert_eq!(
+            interleaved_order(&as_classes, &[5; 5]),
+            super::rebuilt_last(&one)
+        );
+        assert_eq!(interleaved_order(&[None; 3], &[]), vec![0, 1, 2]);
+        // Any mix: a permutation, the plain groups first, each class ascending.
+        let mut seed = 0x9e37_79b9_u64;
+        for _ in 0..200 {
+            let n = 1 + (seed % 40) as usize;
+            let classes: Vec<Option<usize>> = (0..n)
+                .map(|i| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    match (seed >> 33) % 3 {
+                        0 => None,
+                        c => Some(c as usize - 1),
+                    }
+                    .filter(|_| i < n)
+                })
+                .collect();
+            let weights: Vec<u64> = (0..n).map(|i| 1 + (i as u64 * 7919) % 13).collect();
+            let order = interleaved_order(&classes, &weights);
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..n).collect::<Vec<_>>());
+            let plain = classes.iter().filter(|c| c.is_none()).count();
+            assert!(order[..plain].iter().all(|&g| classes[g].is_none()));
+            for c in 0..2 {
+                let seq: Vec<usize> = order
+                    .iter()
+                    .copied()
+                    .filter(|&g| classes[g] == Some(c))
+                    .collect();
+                assert!(seq.windows(2).all(|w| w[0] < w[1]), "class {c} ascending");
+            }
+        }
+    }
+
+    /// One class a group (N3): a group's tables drop in the class of its first
+    /// droppable one only, and phase B refuses a group that dropped two.
+    #[test]
+    fn a_group_drops_in_the_class_of_its_first_droppable_table() {
+        use super::{drop_one_class, one_class};
+        let mut ranks = [None, Some((0, 7)), Some((1, 0)), Some((0, 8)), Some((1, 1))];
+        drop_one_class(&mut ranks);
+        assert_eq!(ranks, [None, Some((0, 7)), None, Some((0, 8)), None]);
+        let mut ranks = [Some((1, 3)), None, Some((0, 9)), Some((1, 4))];
+        drop_one_class(&mut ranks);
+        assert_eq!(ranks, [Some((1, 3)), None, None, Some((1, 4))]);
+        let mut ranks = [None, None];
+        drop_one_class(&mut ranks);
+        assert_eq!(ranks, [None, None]);
+
+        assert_eq!(one_class([None, Some(1), None, Some(1)]), Some(Some(1)));
+        assert_eq!(one_class([None, None]), Some(None));
+        assert_eq!(one_class([]), Some(None));
+        assert_eq!(one_class([Some(0), None, Some(1)]), None);
     }
 
     /// The rebuilt groups go last, each set in group order; nothing rebuilt is
