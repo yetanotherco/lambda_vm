@@ -2917,21 +2917,35 @@ fn prove_block_traces_with<C: crate::hash_pin::BlockHash>(
         let (mut packed, mut wide, mut n_packed) = (0usize, 0usize, 0usize);
         let (mut spilled, mut spilled_resident, mut n_spilled) = (0usize, 0usize, 0usize);
         let (mut dropped, mut n_dropped) = (0usize, 0usize);
-        for (_, trace, _) in &pairs {
+        // By family (the AIR's name before any `:`): packed, spilled, 8 B/cell
+        // and dropped, each (instances, bytes).
+        let mut families: std::collections::BTreeMap<String, [(usize, usize); 4]> =
+            std::collections::BTreeMap::new();
+        for (air, trace, _) in &pairs {
+            let family = air.name().split(':').next().unwrap_or("").to_string();
+            let f = families.entry(family).or_default();
             if let Some(narrow) = trace.narrow_main() {
                 packed += narrow.data().len();
                 n_packed += 1;
+                f[0].0 += 1;
+                f[0].1 += narrow.data().len();
             } else if let Some(slot) = trace.spilled_main() {
                 spilled += slot.len();
                 if slot.is_resident() {
                     spilled_resident += slot.len();
                 }
                 n_spilled += 1;
+                f[1].0 += 1;
+                f[1].1 += slot.len();
             } else if let Some(slot) = trace.regen_main() {
                 dropped += slot.len();
                 n_dropped += 1;
+                f[3].0 += 1;
+                f[3].1 += slot.len();
             } else {
                 wide += wide_bytes(trace);
+                f[2].0 += 1;
+                f[2].1 += wide_bytes(trace);
             }
         }
         let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
@@ -2953,17 +2967,56 @@ fn prove_block_traces_with<C: crate::hash_pin::BlockHash>(
                 String::new()
             },
         );
+        // The resident and moved bytes by family, heaviest resident first (a
+        // measurement: what a regenerator of more classes would take off).
+        let mut by: Vec<(&String, &[(usize, usize); 4])> = families.iter().collect();
+        by.sort_by_key(|(_, f)| std::cmp::Reverse(f[0].1 + f[2].1));
+        let words: Vec<String> = by
+            .iter()
+            .map(|(name, f)| {
+                let part = |label: &str, (n, b): (usize, usize)| {
+                    (n > 0).then(|| format!("{label} {n} {:.3}", b as f64 / (1u64 << 30) as f64))
+                };
+                let parts: Vec<String> = [
+                    part("packed", f[0]),
+                    part("8B", f[2]),
+                    part("spilled", f[1]),
+                    part("dropped", f[3]),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                format!("{name} {}", parts.join(" "))
+            })
+            .collect();
+        eprintln!(
+            "BLOCK MEM traces by family (instances GiB): {}",
+            words.join(" | ")
+        );
         // The traces' bytes in the heap.
         let traces_held = packed + spilled_resident + wide;
         // What else the heap holds as the prove starts: the precommits (the
         // streamed and phase-A-committed instances'), the precomputed-tree
         // cache, and what no gauge names (the AIRs just built included).
         let mut held = [0usize; 4];
-        for (_, pre) in &precommits {
+        let mut tops: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for (name, pre) in &precommits {
             for (h, b) in held.iter_mut().zip(pre.host_bytes()) {
                 *h += b;
             }
+            *tops
+                .entry(name.split(':').next().unwrap_or("").to_string())
+                .or_default() += pre.host_bytes()[1];
         }
+        let mut tops: Vec<(String, usize)> = tops.into_iter().filter(|(_, b)| *b > 0).collect();
+        tops.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+        eprintln!(
+            "BLOCK MEM kept tops by family (GiB): {}",
+            tops.iter()
+                .map(|(n, b)| format!("{n} {:.3}", *b as f64 / (1u64 << 30) as f64))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        );
         let cache = stark::prover::precomputed_tree_cache_bytes_inserted() as usize;
         let g = |b: usize| b as f64 / (1u64 << 30) as f64;
         eprintln!(

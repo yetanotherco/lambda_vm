@@ -649,6 +649,14 @@ impl BlockTreePlan {
         let mut kept = Vec::new();
         let hold = keep || derive_holds_levels();
         let leaves: Vec<usize> = (0..self.partition.num_leaves()).collect();
+        // The verifier's derive (`keep` off) marks each level (a measurement).
+        let t_derive = Instant::now();
+        let mark = |what: String| {
+            if !keep {
+                verify_mark(&what, t_derive);
+            }
+        };
+        mark(format!("start ({} leaves)", leaves.len()));
         let mut level = derive_level(
             &leaves,
             |&k| self.leaf_program(k),
@@ -658,6 +666,7 @@ impl BlockTreePlan {
             hold,
             &mut phases,
         )?;
+        mark(format!("level 0 done ({} programs)", level.len()));
         let levels = self.levels();
         for (lv, arities) in levels.iter().enumerate() {
             let top = lv + 1 == levels.len();
@@ -693,6 +702,7 @@ impl BlockTreePlan {
                 hold || top,
                 &mut phases,
             )?;
+            mark(format!("level {} done ({} programs)", lv + 1, level.len()));
         }
         if level.len() != 1 {
             return Err(format!("the tree closes to {} nodes", level.len()));
@@ -1173,6 +1183,36 @@ pub(crate) fn verify_block_tree_under(
     .map(|(id, _)| id)
 }
 
+/// `LAMBDA_VM_BLOCK_MEMLOG=1` in the block verifier: one `BLOCK VERIFY` line
+/// at a mark — seconds since `t0`, VmRSS and jemalloc's bytes now, and the
+/// highest VmRSS reading since the last mark with its live and held bytes
+/// ([`crate::alloc_purge::peak_window`], sampled every 0.5 s by a watermark
+/// monitor that cannot fire: its target is unreachable). A measurement.
+fn verify_mark(what: &str, t0: Instant) {
+    if !std::env::var("LAMBDA_VM_BLOCK_MEMLOG").is_ok_and(|v| v.trim() == "1") {
+        return;
+    }
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let now = match (
+        crate::lfm::program_budget::resident_bytes(),
+        crate::alloc_purge::stats(),
+    ) {
+        (Some(rss), Some(st)) => format!(
+            "VmRSS {:.2} GiB · jemalloc allocated {:.2} · active {:.2} · resident {:.2}",
+            gib(rss),
+            gib(st.allocated as u64),
+            gib(st.active as u64),
+            gib(st.resident as u64)
+        ),
+        _ => "unread".to_string(),
+    };
+    let peak = crate::alloc_purge::peak_window().unwrap_or_else(|| "none".to_string());
+    eprintln!(
+        "BLOCK VERIFY {what}: {:.2}s · now {now} · peak since the last mark: {peak}",
+        t0.elapsed().as_secs_f64()
+    );
+}
+
 fn verify_under(
     elf_bytes: &[u8],
     opts: &crate::ProofOptions,
@@ -1183,6 +1223,14 @@ fn verify_under(
     top: &super::proof::LfmProof,
 ) -> Result<(Commitment, VerifyTimes), String> {
     let mut times = VerifyTimes::default();
+    // The measurement's sampler (`verify_mark`): never fires, the target being
+    // unreachable.
+    let _sampler = std::env::var("LAMBDA_VM_BLOCK_MEMLOG")
+        .is_ok_and(|v| v.trim() == "1")
+        .then(|| crate::alloc_purge::start_watermark(u64::MAX))
+        .flatten();
+    let t_verify = Instant::now();
+    verify_mark("begin", t_verify);
     let computed;
     let consts = match consts {
         Some(consts) => consts,
@@ -1193,11 +1241,14 @@ fn verify_under(
             &computed
         }
     };
+    verify_mark("constants done", t_verify);
     let t = Instant::now();
     let plan = BlockTreePlan::derive_with(elf_bytes, opts, shape, consts)?;
     times.plan = t.elapsed().as_secs_f64();
+    verify_mark("plan done", t_verify);
     let (artifacts, levels) = plan.derive_top_timed(wrap_opts)?;
     times.levels = levels;
+    verify_mark("derive done", t_verify);
     let t = Instant::now();
     if !super::proof::verify_against_artifacts(&artifacts, &top.proof, &top.public_words, wrap_opts)
     {
@@ -1207,6 +1258,7 @@ fn verify_under(
         return Err("the top proof does not claim this ELF's id and this output".to_string());
     }
     times.check = t.elapsed().as_secs_f64();
+    verify_mark("check done", t_verify);
     Ok((artifacts.program_id, times))
 }
 
