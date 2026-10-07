@@ -1577,6 +1577,9 @@ pub fn prove_whir_block_tree(
         options.drop_streamed_ops
     ));
 
+    // `LAMBDA_VM_ALLOC_WATERMARK`: freed pages back to the OS inside a phase,
+    // only where the host is short (`alloc_purge`).
+    let watermark = crate::alloc_purge::start_watermark(block_whir::spill_target_bytes());
     let t0 = std::time::Instant::now();
     // The wall clock at the prove's start, to place a box's memory samples.
     sink.line(&format!(
@@ -2057,6 +2060,9 @@ pub fn prove_whir_block_tree(
         whole - base,
         whole - readouts
     ));
+    if let Some(w) = watermark {
+        sink.line(&w.finish());
+    }
     if proofs.is_empty() {
         return Err("the tree has no top".to_string());
     }
