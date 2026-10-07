@@ -98,6 +98,38 @@ pub fn parse_setting(value: Option<&str>) -> Result<BudgetSetting, String> {
     }
 }
 
+/// `auto`'s room line as a share of the host target: programs come in by room
+/// only while the host stays under this share, so the room a purge returns
+/// (the allocator's watermark, at [`crate::alloc_purge::WATERMARK_SHARE`] of
+/// the target) is not spent again on programs held ahead. Above the line,
+/// admissions run by the [`AHEAD`] rule alone. At the p90 block on a 48 GiB
+/// emulated host the budget, its room line at the target, turned what the
+/// watermark returned into held programs: level 1's live heap 42–46 GiB
+/// against 30–32 without the watermark (RYZEN 050, I-MEMFIT §6.5).
+pub const ROOM_SHARE: f64 = 0.75;
+
+/// [`ROOM_SHARE`]'s knob: a share in (0, 1]; `1.0` puts the line at the
+/// target (the budget before the share).
+pub const ROOM_SHARE_ENV: &str = "LAMBDA_VM_TREE_PROGRAM_BUDGET_SHARE";
+
+/// [`ROOM_SHARE_ENV`], parsed.
+pub fn share_from_env() -> Result<f64, String> {
+    parse_share(std::env::var(ROOM_SHARE_ENV).ok().as_deref())
+}
+
+/// A value of [`ROOM_SHARE_ENV`]: unset or empty is [`ROOM_SHARE`]; nonsense
+/// is an error.
+pub fn parse_share(value: Option<&str>) -> Result<f64, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(ROOM_SHARE),
+        Some(v) => v
+            .parse::<f64>()
+            .ok()
+            .filter(|s| s.is_finite() && *s > 0.0 && *s <= 1.0)
+            .ok_or_else(|| format!("{ROOM_SHARE_ENV} must be a share in (0, 1], got `{v}`")),
+    }
+}
+
 /// What counts as room.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Room {
@@ -106,15 +138,19 @@ pub enum Room {
     /// The admitted programs alive hold at most this many bytes.
     Bytes(u64),
     /// The process's resident bytes, plus the programs admitted and not yet
-    /// emitted, plus the new one, stay at or under `target`.
-    Host { target: u64 },
+    /// emitted, plus the new one, stay at or under `line`: the host target
+    /// times the room share ([`ROOM_SHARE`]).
+    Host { line: u64 },
 }
 
 impl Room {
-    /// The room a setting gives against the host `target`.
-    pub fn of(setting: BudgetSetting, target: u64) -> Self {
+    /// The room a setting gives against the host `target`, `auto`'s line at
+    /// `share` of it.
+    pub fn of(setting: BudgetSetting, target: u64, share: f64) -> Self {
         match setting {
-            BudgetSetting::Auto => Room::Host { target },
+            BudgetSetting::Auto => Room::Host {
+                line: (target as f64 * share) as u64,
+            },
             BudgetSetting::Off => Room::Unbounded,
             BudgetSetting::Bytes(bytes) => Room::Bytes(bytes),
         }
@@ -239,8 +275,8 @@ impl ProgramBudget {
         let room = match self.room {
             Room::Unbounded => true,
             Room::Bytes(limit) => st.held + bytes <= limit,
-            Room::Host { target } => {
-                (self.reading)().is_none_or(|rss| rss + st.unemitted + bytes <= target)
+            Room::Host { line } => {
+                (self.reading)().is_none_or(|rss| rss + st.unemitted + bytes <= line)
             }
         };
         if room {
@@ -347,15 +383,15 @@ impl ProgramBudget {
         match self.room {
             Room::Unbounded => "off (every program where it was)".to_string(),
             Room::Bytes(b) => format!("{:.2} GiB of programs", gib(b)),
-            Room::Host { target } => match (self.reading)() {
+            Room::Host { line } => match (self.reading)() {
                 Some(rss) => format!(
-                    "auto: VmRSS ({:.2} GiB now) against the target {:.2} GiB",
+                    "auto: VmRSS ({:.2} GiB now) against the room line {:.2} GiB",
                     gib(rss),
-                    gib(target)
+                    gib(line)
                 ),
                 None => format!(
-                    "auto: no VmRSS reading (target {:.2} GiB): room is never short",
-                    gib(target)
+                    "auto: no VmRSS reading (room line {:.2} GiB): room is never short",
+                    gib(line)
                 ),
             },
         }
@@ -483,10 +519,13 @@ mod tests {
         assert!(parse_setting(Some("-1")).is_err());
         assert!(parse_setting(Some("lots")).is_err());
         assert_eq!(
-            Room::of(BudgetSetting::Auto, 54 * GIB),
-            Room::Host { target: 54 * GIB }
+            Room::of(BudgetSetting::Auto, 54 * GIB, 1.0),
+            Room::Host { line: 54 * GIB }
         );
-        assert_eq!(Room::of(BudgetSetting::Off, 54 * GIB), Room::Unbounded);
+        assert_eq!(
+            Room::of(BudgetSetting::Off, 54 * GIB, 0.75),
+            Room::Unbounded
+        );
     }
 
     /// A fake host: its resident bytes are the budget's held bytes plus a
@@ -495,6 +534,60 @@ mod tests {
         let rss = Arc::new(AtomicU64::new(rest));
         let r = rss.clone();
         (rss, Box::new(move || Some(r.load(Ordering::SeqCst))))
+    }
+
+    #[test]
+    fn the_share_knob_reads_a_share_and_refuses_nonsense() {
+        assert_eq!(parse_share(None), Ok(ROOM_SHARE));
+        assert_eq!(parse_share(Some(" ")), Ok(ROOM_SHARE));
+        assert_eq!(parse_share(Some("1.0")), Ok(1.0));
+        assert_eq!(parse_share(Some("0.5")), Ok(0.5));
+        for bad in ["0", "1.5", "-0.2", "most"] {
+            assert!(parse_share(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// `auto`'s room line sits at the share of the target: a program comes
+    /// in by room exactly up to the line, and past it only by the AHEAD rule.
+    /// Share 1.0 is the line at the target, the budget before the share.
+    #[test]
+    fn auto_admits_by_room_exactly_up_to_the_share_line() {
+        let target = 100 * GIB;
+        let room = Room::of(BudgetSetting::Auto, target, 0.75);
+        assert_eq!(room, Room::Host { line: 75 * GIB });
+        assert_eq!(
+            Room::of(BudgetSetting::Auto, target, 1.0),
+            Room::Host { line: target },
+            "share 1.0: the line at the target"
+        );
+        let b = ProgramBudget::with_reading(room, 1, Box::new(|| Some(74 * GIB)));
+        let p0 = b.try_acquire(0, 0).expect("74 ≤ 75");
+        let p1 = b
+            .try_acquire(1, GIB)
+            .expect("74 + 1 = 75: on the line, by room");
+        assert!(
+            b.try_acquire(2, 1).is_none(),
+            "74 + 1 (not yet emitted) + 1 byte > 75, and two untaken below: AHEAD-only"
+        );
+        p0.claim();
+        p1.claim();
+        assert!(
+            b.try_acquire(2, 1).is_some(),
+            "past the line, the next to be taken still comes in"
+        );
+        assert!(b.summary().contains("2 by room, 1 among the next 1"));
+        // The same host and program against the line at the target: room.
+        let full = ProgramBudget::with_reading(
+            Room::of(BudgetSetting::Auto, target, 1.0),
+            1,
+            Box::new(|| Some(74 * GIB)),
+        );
+        let _q0 = full.try_acquire(0, 0).expect("room");
+        let _q1 = full.try_acquire(1, GIB).expect("room");
+        assert!(
+            full.try_acquire(2, 1).is_some(),
+            "75 GiB + 1 byte ≤ 100: room"
+        );
     }
 
     fn bytes_budget(limit: u64, ahead: usize) -> Arc<ProgramBudget> {
@@ -551,7 +644,7 @@ mod tests {
     #[test]
     fn auto_counts_the_resident_set_and_the_programs_not_yet_emitted() {
         let (rss, reading) = host(40 * MIB);
-        let b = ProgramBudget::with_reading(Room::Host { target: 100 * MIB }, 1, reading);
+        let b = ProgramBudget::with_reading(Room::Host { line: 100 * MIB }, 1, reading);
         let mut p0 = b.try_acquire(0, 30 * MIB).expect("40 + 30 ≤ 100");
         assert!(
             b.try_acquire(1, 31 * MIB).is_none(),
@@ -563,7 +656,7 @@ mod tests {
         assert!(b.try_acquire(1, 31 * MIB).is_none(), "70 + 31 > 100");
         let p1 = b.try_acquire(1, 30 * MIB).expect("70 + 30 ≤ 100");
         drop((p0, p1));
-        let none = ProgramBudget::with_reading(Room::Host { target: 0 }, 1, Box::new(|| None));
+        let none = ProgramBudget::with_reading(Room::Host { line: 0 }, 1, Box::new(|| None));
         assert!(
             none.try_acquire(0, GIB).is_some(),
             "no reading: room never short"
