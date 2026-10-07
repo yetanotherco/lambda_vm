@@ -73,9 +73,9 @@ impl WhirTreeSink for StderrSink {
 /// suite env sets that change behaviour or performance, at its values (ULTRA's
 /// and BIG's W3 env). The CLI sets each one the environment leaves unset, and
 /// the harness never does: its arms rely on unset meaning the library default.
-/// `LAMBDA_VM_WHIR_HASH` is a format knob, so the CLI's `verify-block` sets it
-/// too, and a verifier configured otherwise refuses (completeness, never
-/// soundness). The measurement-only `LAMBDA_VM_BASE_SPLIT` is not posture, and
+/// The base hash is not posture: it is the format's (`BlockFormat.zf.base`,
+/// the CLI's `--base-hash`), and `LAMBDA_VM_WHIR_HASH` is not read on the
+/// block path. The measurement-only `LAMBDA_VM_BASE_SPLIT` is not posture, and
 /// the allocator's never-purge posture is compiled into the binary.
 /// `LFM_PRECOMPUTED_TREE_CACHE_CAP`'s posture follows the host target
 /// ([`posture_tree_cache_cap`]): the table's 64 from a 64 GiB target up, 16
@@ -84,7 +84,6 @@ pub const POSTURE: &[(&str, &str)] = &[
     ("TABLE_PARALLELISM", "4"),
     ("LAMBDA_VM_MAX_ROWS_LOG2", "21"),
     ("LFM_WHIR_RETENTION", "1"),
-    ("LAMBDA_VM_WHIR_HASH", "rpx"),
     ("LFM_PRECOMPUTED_TREE_CACHE_CAP", "64"),
     ("LFM_EXEC_PARALLEL", "1"),
     ("LAMBDA_VM_GRIND_SCAN_FACTOR", "8"),
@@ -134,6 +133,18 @@ pub fn posture_line() -> String {
         })
         .collect();
     format!("BLOCK POSTURE: {}", words.join(" · "))
+}
+
+/// The `BLOCK BASE:` line: the base hash and 4-ary cap the format names, the
+/// block path's only source for its hash (`LAMBDA_VM_WHIR_HASH` is not read
+/// there, D-WHIR-P1 S7).
+pub fn base_line(base: &stark::proof::options::BaseFormat) -> String {
+    format!(
+        "BLOCK BASE: {:?} · 4-ary cap {:?} · the format's ({} is not read on the block path)",
+        base.hash,
+        base.arity4_cap,
+        crate::whir_hash_knob::ENV
+    )
 }
 
 /// Phase A's two knobs beside the finish, as the run read them:
@@ -1606,6 +1617,7 @@ pub fn prove_whir_block_tree(
     );
     let (argue, format, options) = (cfg.argue, cfg.format, &cfg.options);
     sink.line(&posture_line());
+    sink.line(&base_line(&format.zf.base));
     sink.line(&format!("W3 ARGUE: {argue:?}"));
     sink.line(&format!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead));
     sink.line(&finish_idle_line());
@@ -2253,11 +2265,22 @@ pub fn verify_whir_block_tree_proof(
     elf_bytes: &[u8],
     proof: &WhirBlockTreeProof,
 ) -> Result<(), String> {
+    verify_whir_block_tree_proof_based(elf_bytes, &stark::proof::options::BaseFormat::RPX, proof)
+}
+
+/// [`verify_whir_block_tree_proof`] of a block proved over `base`: the
+/// verifier's own constant (the CLI's `--base-hash`), never read from the
+/// file; a proof made over the other base derives another top and is refused.
+pub fn verify_whir_block_tree_proof_based(
+    elf_bytes: &[u8],
+    base: &stark::proof::options::BaseFormat,
+    proof: &WhirBlockTreeProof,
+) -> Result<(), String> {
     let top = LfmProof {
         proof: proof.top_proof.clone(),
         public_words: proof.top_public_words.clone(),
     };
-    super::whir_block::verify_block_tree(elf_bytes, proof.statement(), &top)
+    super::whir_block::verify_block_tree_based(elf_bytes, base, proof.statement(), &top)
 }
 
 #[cfg(test)]
@@ -2277,7 +2300,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} missing or out of order in `{line}`"));
             at += found + name.len();
         }
-        assert!(POSTURE.contains(&("LAMBDA_VM_WHIR_HASH", "rpx")));
+        assert!(
+            POSTURE
+                .iter()
+                .all(|(name, _)| *name != crate::whir_hash_knob::ENV),
+            "the base hash is the format's, not posture"
+        );
     }
 
     /// A synthetic statement and an empty top proof.
