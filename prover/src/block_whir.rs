@@ -233,12 +233,12 @@ fn check_group_count(groups: usize, max_groups: usize) -> Result<(), Error> {
 }
 
 /// Which WHIR configuration a block format's base names
-/// ([`checked_base`]).
+/// ([`checked_base`]): the format's alone. The process's
+/// `LAMBDA_VM_WHIR_HASH` is not read on the block path (D-WHIR-P1 S7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockHash {
-    /// A binary hash: the process's WHIR hash, keccak or RPX
-    /// ([`crate::with_whir_hash`]), as before the base was a format field.
-    Binary,
+    /// RPX256 ([`multilinear::whir_hash::RpxWhir`]), the production base.
+    Rpx,
     /// ZisK's Poseidon1 ([`multilinear::whir_hash::P1Whir`]).
     Poseidon1,
 }
@@ -248,11 +248,11 @@ pub enum BlockHash {
 /// refuses it rather than let the tag name a height no tree has.
 pub const MAX_P1_CAP_HEIGHT: usize = crypto::merkle_tree::cap::MAX_CAP_HEIGHT / 2;
 
-/// The configuration `base` names, or a typed refusal: RPX (today) or
-/// Poseidon1, whose cap must be one its trees run at.
+/// The configuration `base` names, or a typed refusal: RPX or Poseidon1,
+/// whose cap must be one its trees run at.
 pub fn checked_base(base: &BaseFormat) -> Result<BlockHash, Error> {
     match base.hash {
-        CommitmentHash::Rpx256 => Ok(BlockHash::Binary),
+        CommitmentHash::Rpx256 => Ok(BlockHash::Rpx),
         CommitmentHash::Poseidon1 => match base.arity4_cap {
             CapPolicy::Fixed(c) if c as usize > MAX_P1_CAP_HEIGHT => Err(Error::Prover(format!(
                 "a Poseidon1 base capped at 4-ary height {c}: its trees clamp the cap at \
