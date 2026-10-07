@@ -73,8 +73,9 @@ fn test_trace_dword_split() {
 }
 
 #[test]
-fn test_multiplicity_aggregation() {
-    // Same op three times + one distinct → 2 unique rows, padded to 4.
+fn test_no_dedup_one_row_per_op() {
+    // No deduplication: each op gets its own row with μ = 1 (μ is kept a bit so
+    // MuIsBit can pin it). Three identical ops + one distinct → 4 rows.
     let ops = vec![
         EqOperation::new(5, 5, false),
         EqOperation::new(9, 8, false),
@@ -84,15 +85,15 @@ fn test_multiplicity_aggregation() {
     let trace = generate_eq_trace(&ops);
     assert_eq!(trace.main_table.height, 4);
 
-    let mut found = false;
+    let mut fives = 0;
     for row_idx in 0..4 {
         let row = trace.main_table.get_row(row_idx);
+        assert_eq!(row[cols::MU], FE::from(1u64), "every real row has μ = 1");
         if row[cols::A_0] == FE::from(5u64) && row[cols::B_0] == FE::from(5u64) {
-            assert_eq!(row[cols::MU], FE::from(3u64));
-            found = true;
+            fives += 1;
         }
     }
-    assert!(found, "expected the (5,5) row with multiplicity 3");
+    assert_eq!(fives, 3, "the three (5,5) ops each get their own row");
 }
 
 #[test]

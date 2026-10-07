@@ -70,8 +70,8 @@ fn test_multiplicity_aggregation() {
 #[test]
 fn test_bus_interactions_shape() {
     let interactions = bus_interactions();
-    // 8 BYTE_ALU senders + 1 ALU receiver.
-    assert_eq!(interactions.len(), 9);
+    // 8 BYTE_ALU senders + 1 ARE_BYTES[μ] sender + 1 ALU receiver.
+    assert_eq!(interactions.len(), 10);
 
     let byte_alu_senders = interactions
         .iter()

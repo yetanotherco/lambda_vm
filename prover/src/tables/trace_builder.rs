@@ -3335,6 +3335,7 @@ fn build_traces<I: ImageSource + Sync>(
     let branch_chunk = max_rows.branch;
     let mul_chunk = max_rows.mul;
     let dvrm_chunk = max_rows.dvrm;
+    let bytewise_chunk = max_rows.bytewise;
     // Every source except the two dominant ones (the in-walk lookups and MEMW_R, which are
     // split into row-ranges in the parallel path below) stays a single whole-source collector.
     let mut collectors: Vec<Collector> = vec![
@@ -3346,6 +3347,16 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| {
             for op in &bytewise_ops {
                 h.add_ops(&op.collect_bitwise_ops());
+            }
+            // IS_BYTE[μ] | μ: each dedup row sends its own μ, μ times (padding
+            // sends nothing), over exactly the rows `generate_bytewise_trace`
+            // builds for each chunk. Mirrors the LT/MUL/DVRM/BRANCH bound.
+            for chunk in bytewise_ops.chunks(bytewise_chunk) {
+                for (_, mu) in bytewise::dedup_bytewise_rows(chunk) {
+                    let op =
+                        BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, mu as u8);
+                    h.add_ops(&std::iter::repeat_n(op, mu as usize).collect::<Vec<_>>());
+                }
             }
         }),
         Box::new(|h| {
