@@ -4463,6 +4463,13 @@ fn prove_streamed(
                 in_class(1),
                 offset.map_or("n/a".to_string(), |s| format!("{s:.2} s")),
             ));
+            let spans: Vec<(f64, f64)> = groups.iter().map(|g| (g.start_b, g.end_b)).collect();
+            lines.push(regen::order_taken_line(
+                &order,
+                &classes,
+                &group_cells,
+                &spans,
+            ));
             for line in &lines {
                 eprintln!("{line}");
             }
@@ -4484,6 +4491,8 @@ fn prove_streamed(
                 rest_regenerated: rest_report.as_ref().map_or(0, |r| r.deposited),
                 armed_by: drops.armed_why,
                 wanted: drops.wanted,
+                held: drops.held,
+                phase_b_order: order.clone(),
                 lines,
                 ..regen::RegenStamps::default()
             });
