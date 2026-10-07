@@ -100,7 +100,7 @@ provide these below.
 
 #render_constraint_table(alignedchip, config, groups: "assumptions")
 
-#render_constraint_table(alignedchip, config)
+#render_constraint_table(alignedchip, config, groups: ("consistency", "memory", "output"))
 
 == Padding
 The table can be padded to the next power of two with the following value assignments:

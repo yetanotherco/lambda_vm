@@ -182,6 +182,16 @@ tag = "IS_BIT"
 input = ["word_instr"]
 ref = "shift:c:word_instr"
 
+[[constraints.input]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+
+[[constraints.input]]
+kind = "template"
+tag = "IS_BIT"
+input = ["zbs"]
+
 [[constraint_groups]]
 name = "left_flag"
 

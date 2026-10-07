@@ -277,6 +277,11 @@ cond = "μ"
 name = "output"
 
 [[constraints.output]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+
+[[constraints.output]]
 kind = "interaction"
 tag = "SHA256ROUND"
 input = ["timestamp", ["arr", ["cast", "a", "Word"], ["cast", "b", "Word"], ["cast", "c", "Word"], "d", ["cast", "e", "Word"], ["cast", "f", "Word"], ["cast", "g", "Word"], "h"], "index"]

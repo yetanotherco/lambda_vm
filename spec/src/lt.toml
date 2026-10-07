@@ -84,7 +84,7 @@ def = ["idx", "carry", 1]
 
 [[variables.multiplicity]]
 name = "μ"
-type = "Bit"
+type = "Byte"
 desc = ""
 pad = 0
 
@@ -100,6 +100,11 @@ ref = "lt:a:range_rhs"
 [[constraint_groups]]
 name = "range"
 desc = "Range-check the inputs"
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BYTE"
+input = ["μ"]
 
 [[constraints.range]]
 kind = "interaction"

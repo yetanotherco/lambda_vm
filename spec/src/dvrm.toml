@@ -171,13 +171,13 @@ def = ["+", "μ_q", "μ_r"]
 
 [[variables.multiplicity]]
 name = "μ_q"
-type = "BaseField"
+type = "Byte"
 desc = ""
 pad = 0
 
 [[variables.multiplicity]]
 name = "μ_r"
-type = "BaseField"
+type = "Byte"
 desc = ""
 pad = 0
 
@@ -186,6 +186,16 @@ pad = 0
 
 [[constraint_groups]]
 name = "range"
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BYTE"
+input = ["μ_q"]
+
+[[constraints.range]]
+kind = "template"
+tag = "IS_BYTE"
+input = ["μ_r"]
 
 [[constraints.range]]
 kind = "interaction"

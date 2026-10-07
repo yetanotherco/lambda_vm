@@ -111,13 +111,13 @@ def = ["+", "μ_lo", "μ_hi"]
 
 [[variables.multiplicity]]
 name = "μ_lo"
-type = "BaseField"
+type = "Byte"
 desc = ""
 pad = 0
 
 [[variables.multiplicity]]
 name = "μ_hi"
-type = "BaseField"
+type = "Byte"
 desc = ""
 pad = 0
 
@@ -125,6 +125,16 @@ pad = 0
 
 [[constraint_groups]]
 name = "def"
+
+[[constraints.def]]
+kind = "template"
+tag = "IS_BYTE"
+input = ["μ_lo"]
+
+[[constraints.def]]
+kind = "template"
+tag = "IS_BYTE"
+input = ["μ_hi"]
 
 [[constraints.def]]
 kind = "template"
