@@ -664,3 +664,39 @@ fn an_internal_node_never_opens_as_a_leaf() {
         }
     }
 }
+
+/// REV-P1W-A: a P1 chain verifies under its own arity-4 cap only. Proved at
+/// `Fixed(2)` (the WHIR block's C2) over trees of odd and even depth, it is
+/// refused under every other cap policy that yields another geometry and under
+/// the binary hashes; `Off` and `Fixed(0)` are one geometry (the tag renders
+/// both `C0`) and cross-verify, as they must.
+#[test]
+fn rp1wa_a_p1_chain_verifies_under_its_own_cap_only() {
+    for (num_vars, log_folding) in [(7usize, 2usize), (8, 3), (9, 2)] {
+        let c2 = config(log_folding, 5, CapPolicy::Fixed(2));
+        let chain = prove_chain::<P1Whir>(num_vars, &c2, 17);
+        check::<P1Whir>(&chain, &chain.proof, &c2).unwrap();
+        for other in [
+            CapPolicy::Off,
+            CapPolicy::Fixed(0),
+            CapPolicy::Fixed(1),
+            CapPolicy::Fixed(3),
+            CapPolicy::Auto,
+        ] {
+            let cfg = config(log_folding, 5, other);
+            if cfg.tree_caps_at(num_vars, 4) == c2.tree_caps_at(num_vars, 4) {
+                continue;
+            }
+            assert!(
+                check::<P1Whir>(&chain, &chain.proof, &cfg).is_err(),
+                "n {num_vars} k {log_folding}: a C2 proof verified under {other:?}"
+            );
+        }
+        assert!(check::<RpxWhir>(&chain, &chain.proof, &c2).is_err());
+        assert!(check::<KeccakWhir>(&chain, &chain.proof, &c2).is_err());
+        let off = config(log_folding, 5, CapPolicy::Off);
+        let uncapped = prove_chain::<P1Whir>(num_vars, &off, 18);
+        check::<P1Whir>(&uncapped, &uncapped.proof, &config(log_folding, 5, CapPolicy::Fixed(0)))
+            .unwrap();
+    }
+}
