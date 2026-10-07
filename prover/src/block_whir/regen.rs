@@ -158,13 +158,16 @@ fn resident() -> Option<(u64, u64)> {
 /// How often the pacer reads the host.
 const PACE: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// What the pacer set the window to.
+/// What the pacer set the window to, and how often it moved it each way (an
+/// oscillating window is a finding even when phase B never waits).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct PacerReport {
     pub(crate) first: Option<u64>,
     pub(crate) most: u64,
     pub(crate) last: u64,
     pub(crate) readings: usize,
+    pub(crate) grew: usize,
+    pub(crate) shrank: usize,
 }
 
 /// The adaptive window's pacer: until `window` closes, every [`PACE`] it sets
@@ -174,7 +177,13 @@ fn pace(window: &RegenWindow) -> PacerReport {
     while !window.is_closed() {
         if let Some((hwm, rss)) = resident() {
             let ahead = adaptive_ahead(hwm, rss, window.parked());
-            if ahead != window.ahead() {
+            let now = window.ahead();
+            if ahead != now {
+                if ahead > now {
+                    report.grew += 1;
+                } else {
+                    report.shrank += 1;
+                }
                 window.set_ahead(ahead);
             }
             report.first.get_or_insert(ahead);
@@ -196,14 +205,17 @@ pub(crate) fn pacer_line(policy: AheadPolicy, report: Option<&PacerReport>) -> S
         ),
         (AheadPolicy::Adaptive, Some(r)) if r.readings > 0 => format!(
             "BLOCK REGEN window pacer: adaptive (VmHWM − (VmRSS − parked) − {:.0} GiB, in [{:.0}, \
-             {:.0}] GiB) · first {:.2} GiB · most {:.2} GiB · last {:.2} GiB · {} readings",
+             {:.0}] GiB) · first {:.2} GiB · most {:.2} GiB · last {:.2} GiB · {} readings · grew {} \
+             times · shrank {} times",
             AHEAD_MARGIN as f64 / GIB,
             AHEAD_FLOOR as f64 / GIB,
             AHEAD_CAP as f64 / GIB,
             r.first.unwrap_or(0) as f64 / GIB,
             r.most as f64 / GIB,
             r.last as f64 / GIB,
-            r.readings
+            r.readings,
+            r.grew,
+            r.shrank
         ),
         (AheadPolicy::Adaptive, _) => format!(
             "BLOCK REGEN window pacer: adaptive, no readings (no /proc/self/status) · {:.2} GiB",
@@ -1996,10 +2008,15 @@ mod tests {
             most: 16 * G,
             last: 16 * G,
             readings: 9,
+            grew: 3,
+            shrank: 1,
         };
         let line = pacer_line(AheadPolicy::Adaptive, Some(&r));
         assert!(
-            line.contains("first 4.00 GiB · most 16.00 GiB · last 16.00 GiB · 9 readings"),
+            line.contains(
+                "first 4.00 GiB · most 16.00 GiB · last 16.00 GiB · 9 readings · grew 3 times · \
+                 shrank 1 times"
+            ),
             "{line}"
         );
     }
