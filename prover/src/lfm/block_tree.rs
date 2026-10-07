@@ -128,6 +128,26 @@ pub fn posture_tree_cache_cap(target: u64) -> &'static str {
     }
 }
 
+/// The block verifier's derive window (`LAMBDA_VM_BLOCK_DERIVE_BUILDS`,
+/// [`super::block_plan`]): its posture follows the host target
+/// ([`posture_derive_builds`]).
+pub const POSTURE_DERIVE_BUILDS_KNOB: &str = "LAMBDA_VM_BLOCK_DERIVE_BUILDS";
+
+/// The host target (GiB) from which the posture leaves the derive window unset
+/// (each tree level derived in one window).
+pub const POSTURE_DERIVE_FULL_TARGET_GIB: u64 = 64;
+
+/// `LAMBDA_VM_BLOCK_DERIVE_BUILDS`' posture for a host `target` in bytes:
+/// unset (the whole level at once) from a [`POSTURE_DERIVE_FULL_TARGET_GIB`]
+/// target up, 16 below it. At the p90 block on a 32 GiB emulated host the
+/// verifier peaked at 37.99 GiB with the whole level, 23.27 at 16, for +5.17 s
+/// of a 63.23 s verify (RYZEN 070c, I-MEMFIT §6.25). Scheduling only: every
+/// artifact is a pure function of its program, so the verifier's decision
+/// does not depend on it.
+pub fn posture_derive_builds(target: u64) -> Option<&'static str> {
+    (target < POSTURE_DERIVE_FULL_TARGET_GIB << 30).then_some("16")
+}
+
 /// The posture's VRAM budget: 24000 MB is the 32 GiB card's.
 pub const POSTURE_VRAM_KNOB: &str = "LAMBDA_VM_VRAM_BUDGET_MB";
 
