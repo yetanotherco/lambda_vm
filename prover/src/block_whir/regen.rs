@@ -78,11 +78,12 @@ pub(crate) fn production_regen() -> Option<RegenMode> {
 }
 
 /// The production default, the knobs coupled as #1013's 1a9853790: both unset,
-/// regeneration is `auto` (whenever `auto` arms, the streamed chunks are
-/// rebuilt in phase B instead of written; the spill tier stays for the rest).
-/// A knob that is set keeps the meaning it had: a set `regen` is read when the
-/// prove starts (`None`, so a value it does not know refuses the prove), and an
-/// unset `regen` beside a set `spill` is `off`, as before.
+/// regeneration is `auto` and the spill `off` ([`super::production_spill`]): no
+/// disk, whenever `auto` arms the tables phase B can build again (the streamed
+/// chunks, KECCAK_RND's and LT's) are dropped and rebuilt in phase B, and the
+/// rest stays. A knob that is set keeps the meaning it had: a set `regen` is
+/// read when the prove starts (`None`, so a value it does not know refuses the
+/// prove), and an unset `regen` beside a set `spill` is `off`, as before.
 pub(crate) fn production_regen_from(regen: Option<&str>, spill: Option<&str>) -> Option<RegenMode> {
     match (regen, spill) {
         (Some(_), _) => None,
@@ -91,17 +92,24 @@ pub(crate) fn production_regen_from(regen: Option<&str>, spill: Option<&str>) ->
     }
 }
 
-/// The `BLOCK REGEN mode` line: the mode a prove runs and the two knobs as
-/// set (the production default is `auto` when both are unset).
-pub(crate) fn regen_mode_line(mode: RegenMode, regen: Option<&str>, spill: Option<&str>) -> String {
+/// The `BLOCK REGEN mode` line: the mode a prove runs, the two knobs as set
+/// (the production default is `auto` with the spill `off` when both are
+/// unset), and `no disk` when live regeneration runs with the spill off.
+pub(crate) fn regen_mode_line(
+    mode: RegenMode,
+    no_disk: bool,
+    regen: Option<&str>,
+    spill: Option<&str>,
+) -> String {
     let knob = |name: &str, value: Option<&str>| match value {
         Some(v) => format!("{name}={}", v.trim()),
         None => format!("{name} unset"),
     };
     format!(
-        "BLOCK REGEN mode: {mode:?} · {} · {}",
+        "BLOCK REGEN mode: {mode:?} · {} · {}{}",
         knob("LAMBDA_VM_BLOCK_REGEN", regen),
-        knob("LAMBDA_VM_BLOCK_SPILL", spill)
+        knob("LAMBDA_VM_BLOCK_SPILL", spill),
+        if no_disk { " · no disk" } else { "" }
     )
 }
 
@@ -2370,11 +2378,12 @@ mod tests {
         assert_eq!(parse_regen_mode(None).unwrap(), RegenMode::Off);
         assert!(parse_regen_mode(Some("bogus")).is_err());
         assert_eq!(
-            regen_mode_line(RegenMode::Auto, None, None),
-            "BLOCK REGEN mode: Auto · LAMBDA_VM_BLOCK_REGEN unset · LAMBDA_VM_BLOCK_SPILL unset"
+            regen_mode_line(RegenMode::Auto, true, None, None),
+            "BLOCK REGEN mode: Auto · LAMBDA_VM_BLOCK_REGEN unset · LAMBDA_VM_BLOCK_SPILL unset \
+             · no disk"
         );
         assert_eq!(
-            regen_mode_line(RegenMode::Off, Some(" off "), Some("auto")),
+            regen_mode_line(RegenMode::Off, false, Some(" off "), Some("auto")),
             "BLOCK REGEN mode: Off · LAMBDA_VM_BLOCK_REGEN=off · LAMBDA_VM_BLOCK_SPILL=auto"
         );
     }
