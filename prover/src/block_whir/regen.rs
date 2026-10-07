@@ -61,10 +61,48 @@ impl RegenMode {
     }
 }
 
-/// [`RegenMode`] from `LAMBDA_VM_BLOCK_REGEN`; any other value is refused (an
-/// error, never a panic).
+/// [`RegenMode`] from `LAMBDA_VM_BLOCK_REGEN` alone (unset: `off`); any other
+/// value is refused (an error, never a panic). The production default couples
+/// it to the spill knob ([`production_regen`]).
 pub(crate) fn regen_mode() -> Result<RegenMode, Error> {
     parse_regen_mode(std::env::var("LAMBDA_VM_BLOCK_REGEN").ok().as_deref())
+}
+
+/// [`crate::block_whir::BlockOptions::production`]'s regeneration
+/// ([`production_regen_from`] of the two knobs).
+pub(crate) fn production_regen() -> Option<RegenMode> {
+    production_regen_from(
+        std::env::var("LAMBDA_VM_BLOCK_REGEN").ok().as_deref(),
+        std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref(),
+    )
+}
+
+/// The production default, the knobs coupled as #1013's 1a9853790: both unset,
+/// regeneration is `auto` (whenever `auto` arms, the streamed chunks are
+/// rebuilt in phase B instead of written; the spill tier stays for the rest).
+/// A knob that is set keeps the meaning it had: a set `regen` is read when the
+/// prove starts (`None`, so a value it does not know refuses the prove), and an
+/// unset `regen` beside a set `spill` is `off`, as before.
+pub(crate) fn production_regen_from(regen: Option<&str>, spill: Option<&str>) -> Option<RegenMode> {
+    match (regen, spill) {
+        (Some(_), _) => None,
+        (None, None) => Some(RegenMode::Auto),
+        (None, Some(_)) => Some(RegenMode::Off),
+    }
+}
+
+/// The `BLOCK REGEN mode` line: the mode a prove runs and the two knobs as
+/// set (the production default is `auto` when both are unset).
+pub(crate) fn regen_mode_line(mode: RegenMode, regen: Option<&str>, spill: Option<&str>) -> String {
+    let knob = |name: &str, value: Option<&str>| match value {
+        Some(v) => format!("{name}={}", v.trim()),
+        None => format!("{name} unset"),
+    };
+    format!(
+        "BLOCK REGEN mode: {mode:?} · {} · {}",
+        knob("LAMBDA_VM_BLOCK_REGEN", regen),
+        knob("LAMBDA_VM_BLOCK_SPILL", spill)
+    )
 }
 
 /// [`regen_mode`] from the knob's `value`.
@@ -2386,6 +2424,41 @@ mod tests {
         assert!(
             order_taken_line(&[0, 1], &[None, None], &[1, 1], &[(0.0, 1.0), (1.0, 2.0)])
                 .ends_with("[-, -, -, -, -, -, -, -, -, -] against - overall · P2")
+        );
+    }
+
+    /// ★ The production default with the knobs coupled (N4a): both unset →
+    /// `auto` (the spill tier stays `auto`); a set regen is read when the
+    /// prove starts, whatever the spill; an unset regen beside a set spill is
+    /// `off`, as before.
+    #[test]
+    fn the_production_regen_is_auto_unless_a_knob_is_set() {
+        assert_eq!(production_regen_from(None, None), Some(RegenMode::Auto));
+        for spill in ["auto", "off", "always", "2.5"] {
+            assert_eq!(
+                production_regen_from(None, Some(spill)),
+                Some(RegenMode::Off),
+                "{spill}"
+            );
+        }
+        for regen in ["off", "shadow", "auto", "always", "bogus"] {
+            assert_eq!(production_regen_from(Some(regen), None), None, "{regen}");
+            assert_eq!(
+                production_regen_from(Some(regen), Some("auto")),
+                None,
+                "{regen}"
+            );
+        }
+        // A set regen parses as it did; unset, alone, it is off.
+        assert_eq!(parse_regen_mode(None).unwrap(), RegenMode::Off);
+        assert!(parse_regen_mode(Some("bogus")).is_err());
+        assert_eq!(
+            regen_mode_line(RegenMode::Auto, None, None),
+            "BLOCK REGEN mode: Auto · LAMBDA_VM_BLOCK_REGEN unset · LAMBDA_VM_BLOCK_SPILL unset"
+        );
+        assert_eq!(
+            regen_mode_line(RegenMode::Off, Some(" off "), Some("auto")),
+            "BLOCK REGEN mode: Off · LAMBDA_VM_BLOCK_REGEN=off · LAMBDA_VM_BLOCK_SPILL=auto"
         );
     }
 
