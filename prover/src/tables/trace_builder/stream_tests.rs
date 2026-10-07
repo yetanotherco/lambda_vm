@@ -210,6 +210,122 @@ fn streamed(
     (header.expect("the header came first"), out, most)
 }
 
+/// [`streamed`] with the lists KECCAK_RND's and LT's tables are built from
+/// kept (`keep`), and what was kept.
+fn streamed_keeping(
+    builder: WindowedTraceBuilder<'_>,
+    last: &[Log],
+    keep: bool,
+) -> (Vec<Emitted>, Option<super::RestRegen>) {
+    let gate = ByteGate::new(usize::MAX);
+    let mut out = Vec::new();
+    let mut placed = 0usize;
+    let regen = builder
+        .finish_streamed_keeping(last, &gate, keep, |_| {
+            Ok(Box::new(|emitted: Emitted| {
+                if emitted.table.is_some() {
+                    gate.release(placed);
+                    placed += 1;
+                }
+                out.push(emitted);
+                Ok(())
+            }))
+        })
+        .expect("the streamed finish");
+    (out, regen)
+}
+
+/// The AIR positions of a build's KECCAK_RND tables and of its LT tables
+/// (`air_order`'s layout).
+fn regen_ranges(t: &Traces) -> [std::ops::Range<usize>; 2] {
+    let kr = 5 + t.commits.len() + t.keccaks.len();
+    let kr_end = kr + t.keccak_rnds.len();
+    let blake3 = usize::from(t.table_counts().blake3 == 1);
+    let lt = kr_end + t.ecsms.len() + t.ecdases.len() + t.hints.len() + blake3 + t.cpus.len();
+    [kr..kr_end, lt..lt + t.lts.len()]
+}
+
+/// ★ N3: what phase B builds again — KECCAK_RND's and LT's tables, from the
+/// lists the streamed finish kept ([`super::RestRegen`]) — is what the finish
+/// handed on, word for word and packed byte for byte, for every table of the
+/// two families, in every windowed configuration; a streamed chunk's slot
+/// stays a slot; a family is taken once; nothing is kept unless asked.
+#[test]
+fn the_kept_lists_build_the_finishs_keccak_rnd_and_lt_tables_again() {
+    use super::RegenFamily;
+    let mut rebuilt = [0usize; 2];
+    for max_rows in [MaxRowsConfig::small(), MaxRowsConfig::uniform(4)] {
+        for name in [
+            "test_keccak_multi",
+            "all_instructions_64",
+            "test_ecsm_multi",
+        ] {
+            let (program, logs) = run(name);
+            for window in [7, 1000] {
+                for (config, configure) in &configs() {
+                    let what = format!("{name} window {window} {config}");
+                    let (builder, last) =
+                        pushed(&program, &logs, &max_rows, window, configure.as_ref());
+                    let whole = builder.finish(last).expect("the monolithic finish");
+                    let ranges = regen_ranges(&whole);
+                    let (builder, last) =
+                        pushed(&program, &logs, &max_rows, window, configure.as_ref());
+                    let (got, regen) = streamed_keeping(builder, last, true);
+                    let mut regen = regen.expect("the lists kept");
+                    for (f, (family, range)) in RegenFamily::ALL.into_iter().zip(ranges).enumerate()
+                    {
+                        let jobs = regen.take(family).expect("the family's jobs");
+                        assert_eq!(jobs.len(), range.len(), "{what}: {family:?}'s tables");
+                        for (j, job) in jobs.into_iter().enumerate() {
+                            let at = range.start + j;
+                            match (job, &got[at].table) {
+                                (None, None) => {}
+                                (Some(job), Some(table)) => {
+                                    let again = job().expect("the job builds again");
+                                    assert_eq!(
+                                        shape_and_words(&again),
+                                        shape_and_words(table),
+                                        "{what}: {family:?}[{j}]"
+                                    );
+                                    assert_eq!(
+                                        again
+                                            .narrow_main()
+                                            .map(|p| (p.widths().to_vec(), p.data().to_vec())),
+                                        table
+                                            .narrow_main()
+                                            .map(|p| (p.widths().to_vec(), p.data().to_vec())),
+                                        "{what}: {family:?}[{j}] packed"
+                                    );
+                                    rebuilt[f] += 1;
+                                }
+                                (job, table) => panic!(
+                                    "{what}: {family:?}[{j}] a job {} against a table {}",
+                                    job.is_some(),
+                                    table.is_some()
+                                ),
+                            }
+                        }
+                        assert!(
+                            regen.take(family).is_err(),
+                            "{what}: {family:?} taken twice"
+                        );
+                    }
+                    let (builder, last) =
+                        pushed(&program, &logs, &max_rows, window, configure.as_ref());
+                    assert!(
+                        streamed_keeping(builder, last, false).1.is_none(),
+                        "{what}: kept unasked"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        rebuilt.iter().all(|&n| n > 0),
+        "both families rebuilt: {rebuilt:?}"
+    );
+}
+
 /// Every windowed configuration, chunked small and at four rows, windows of 7
 /// and 1000 cycles, budgets of one byte, 2 GiB and none: the streamed finish
 /// hands on, in AIR order, the monolithic finish's tables word for word and
