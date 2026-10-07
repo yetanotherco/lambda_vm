@@ -2184,13 +2184,15 @@ pub(crate) fn dropped_line(
     };
     format!(
         "BLOCK REGEN dropped: {mode:?}{} · {} chunks {:.2} GiB (drop-back {} chunks {:.2} GiB) · \
-         {armed} · {recipes} recipes · {} refused (no longer on the host)",
+         {armed} · {recipes} recipes · {} refused (no longer on the host) · {} held (their group \
+         dropped another class)",
         if no_disk { " (no disk)" } else { "" },
         report.tables,
         report.bytes as f64 / GIB,
         report.back_tables,
         report.back_bytes as f64 / GIB,
         report.refused_late,
+        report.held,
     )
 }
 
@@ -2279,13 +2281,113 @@ pub struct RegenStamps {
     /// LT's, built again from the kept lists).
     pub rest_dropped: usize,
     pub rest_regenerated: usize,
+    /// Tables phase B could rebuild kept on the host because their group
+    /// dropped the other class (N3's one class a group).
+    pub held: usize,
+    /// The groups in the order phase B took them.
+    pub phase_b_order: Vec<usize>,
     /// The `BLOCK REGEN` lines.
     pub lines: Vec<String>,
+}
+
+/// The `BLOCK REGEN phase B order taken` line (N3): the order phase B took,
+/// run-length by each group's rebuilt class (`P` nothing rebuilt, `S` the
+/// streamed chunks, `R` the rest), and the rest's share of the rebuilt groups'
+/// `cells` started by each tenth of phase B (`spans`: each group's start and
+/// end, seconds), against its share of them all, the plan's.
+pub(crate) fn order_taken_line(
+    order: &[usize],
+    classes: &[Option<usize>],
+    cells: &[u64],
+    spans: &[(f64, f64)],
+) -> String {
+    let class = |g: usize| classes.get(g).copied().flatten();
+    let mut runs: Vec<(char, usize)> = Vec::new();
+    for &g in order {
+        let c = match class(g) {
+            None => 'P',
+            Some(0) => 'S',
+            Some(_) => 'R',
+        };
+        match runs.last_mut() {
+            Some((last, n)) if *last == c => *n += 1,
+            _ => runs.push((c, 1)),
+        }
+    }
+    let cells_of = |g: usize| cells.get(g).copied().unwrap_or(0) as f64;
+    let (mut rest_all, mut rebuilt_all) = (0.0, 0.0);
+    for &g in order {
+        if let Some(c) = class(g) {
+            rebuilt_all += cells_of(g);
+            if c > 0 {
+                rest_all += cells_of(g);
+            }
+        }
+    }
+    let share = |rest: f64, all: f64| {
+        if all > 0.0 {
+            format!("{:.2}", rest / all)
+        } else {
+            "-".to_string()
+        }
+    };
+    let begin = spans.iter().map(|s| s.0).fold(f64::INFINITY, f64::min);
+    let end = spans.iter().map(|s| s.1).fold(f64::NEG_INFINITY, f64::max);
+    let tenths: Vec<String> = (1..=10)
+        .map(|k| {
+            let by = begin + (end - begin) * k as f64 / 10.0;
+            let (mut rest, mut all) = (0.0, 0.0);
+            for &g in order {
+                if class(g).is_some() && spans.get(g).is_some_and(|s| s.0 <= by) {
+                    all += cells_of(g);
+                    if class(g) > Some(0) {
+                        rest += cells_of(g);
+                    }
+                }
+            }
+            share(rest, all)
+        })
+        .collect();
+    format!(
+        "BLOCK REGEN phase B order taken: rest share of the rebuilt cells started by each tenth \
+         of phase B [{}] against {} overall · {}",
+        tenths.join(", "),
+        share(rest_all, rebuilt_all),
+        runs.iter()
+            .map(|(c, n)| format!("{c}{n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The order line (N3): the classes in the order taken, run-length, and
+    /// the rest's share of the rebuilt cells started by each tenth of phase B.
+    #[test]
+    fn the_order_line_reads_the_rest_share_over_phase_b() {
+        // Groups 0 and 1 streamed, 2 and 3 rest, 4 plain; phase B takes the
+        // plain one, then S R S R, each a second long.
+        let classes = [Some(0), Some(0), Some(1), Some(1), None];
+        let cells = [10, 10, 30, 30, 5];
+        let order = [4, 0, 2, 1, 3];
+        let mut spans = [(0.0, 0.0); 5];
+        for (p, &g) in order.iter().enumerate() {
+            spans[g] = (p as f64, p as f64 + 1.0);
+        }
+        assert_eq!(
+            order_taken_line(&order, &classes, &cells, &spans),
+            "BLOCK REGEN phase B order taken: rest share of the rebuilt cells started by each tenth \
+             of phase B [-, 0.00, 0.00, 0.75, 0.75, 0.60, 0.60, 0.75, 0.75, 0.75] against 0.75 overall \
+             · P1 S1 R1 S1 R1"
+        );
+        assert!(
+            order_taken_line(&[0, 1], &[None, None], &[1, 1], &[(0.0, 1.0), (1.0, 2.0)])
+                .ends_with("[-, -, -, -, -, -, -, -, -, -] against - overall · P2")
+        );
+    }
 
     /// `LAMBDA_VM_BLOCK_REGEN`: `off` (and unset), `shadow`, `auto`, `always`;
     /// anything else is refused (an error, not a panic).
