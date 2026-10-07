@@ -1438,122 +1438,128 @@ fn push_openings4(
 }
 
 // =============================================================================
-// A chain's rows by chip — what a Poseidon1 leaf's partition bounds
+// A program's rows by chip — what a Poseidon1 leaf's partition bounds
 // =============================================================================
 
-/// Rows one leaf part spends in the chips whose padded heights a Poseidon1
-/// leaf's partition bounds ([`super::whir_block::leaf_partition_rows`]): the
-/// socket (`Hash16`), `Select`, the base ALU and the hinted words.
+/// Rows a leaf part spends in each chip of the LFM machine, one a chip's
+/// instruction (`exec_schedule`'s census holds a program's chips to its
+/// instruction counts), so a leaf's padded heights follow from its sum: what a
+/// Poseidon1 leaf's partition bounds ([`super::whir_block::leaf_partition_rows`]).
+/// `LFM_RANGE` is the one chip no instruction opens — a fixed table, the same in
+/// every leaf. `consts` counts distinct constants (the builder interns them), so
+/// a leaf's is at most its parts' sum.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChipRows {
+    /// The socket (`Hash` or `Hash16`).
     pub hash: usize,
     pub select: usize,
     pub balu: usize,
+    pub xalu: usize,
+    /// `Pack` and `Unpack`.
+    pub lanes: usize,
+    /// The hinted words.
     pub hint: usize,
+    pub bitdec: usize,
+    pub consts: usize,
+    pub public: usize,
+    /// `KeccakF` and `Blake3`: none in a WHIR leaf.
+    pub accel: usize,
 }
 
 impl ChipRows {
-    pub fn plus(self, other: Self) -> Self {
+    /// The chips' names, in [`Self::to_array`]'s order.
+    pub const NAMES: [&'static str; 10] = [
+        "socket",
+        "Select",
+        "base-ALU",
+        "ext-ALU",
+        "lanes",
+        "hint",
+        "bit-dec",
+        "const",
+        "public",
+        "accelerator",
+    ];
+
+    pub fn to_array(self) -> [usize; 10] {
+        [
+            self.hash,
+            self.select,
+            self.balu,
+            self.xalu,
+            self.lanes,
+            self.hint,
+            self.bitdec,
+            self.consts,
+            self.public,
+            self.accel,
+        ]
+    }
+
+    pub fn from_array(a: [usize; 10]) -> Self {
+        let [
+            hash,
+            select,
+            balu,
+            xalu,
+            lanes,
+            hint,
+            bitdec,
+            consts,
+            public,
+            accel,
+        ] = a;
         Self {
-            hash: self.hash + other.hash,
-            select: self.select + other.select,
-            balu: self.balu + other.balu,
-            hint: self.hint + other.hint,
+            hash,
+            select,
+            balu,
+            xalu,
+            lanes,
+            hint,
+            bitdec,
+            consts,
+            public,
+            accel,
         }
     }
 
-    pub fn scale(self, n: usize) -> Self {
-        Self {
-            hash: self.hash * n,
-            select: self.select * n,
-            balu: self.balu * n,
-            hint: self.hint * n,
+    pub fn plus(self, other: Self) -> Self {
+        let (a, b) = (self.to_array(), other.to_array());
+        Self::from_array(core::array::from_fn(|c| a[c] + b[c]))
+    }
+
+    /// Whether every chip's rows are at most `heights`'.
+    pub fn under(self, heights: Self) -> bool {
+        self.to_array()
+            .iter()
+            .zip(heights.to_array())
+            .all(|(&r, h)| r <= h)
+    }
+
+    /// The rows by chip of some emitted instructions.
+    pub fn of_instrs(instrs: &[super::instr::Instr]) -> Self {
+        use super::instr::Instr;
+        let mut rows = Self::default();
+        for instr in instrs {
+            let chip = match instr {
+                Instr::Hash { .. } | Instr::Hash16(_) => &mut rows.hash,
+                Instr::Select { .. } => &mut rows.select,
+                Instr::BaseAlu { .. } => &mut rows.balu,
+                Instr::ExtAlu { .. } => &mut rows.xalu,
+                Instr::Pack { .. } | Instr::Unpack { .. } => &mut rows.lanes,
+                Instr::Hint { .. } => &mut rows.hint,
+                Instr::BitDec { .. } => &mut rows.bitdec,
+                Instr::Const { .. } => &mut rows.consts,
+                Instr::Public { .. } => &mut rows.public,
+                Instr::KeccakF(_) | Instr::Blake3(_) => &mut rows.accel,
+            };
+            *chip += 1;
         }
+        rows
     }
 
     /// The rows by chip of a compiled program.
     pub fn of(program: &super::compiler::LfmProgram) -> Self {
-        use super::instr::Instr;
-        let mut rows = Self::default();
-        for instr in &program.instrs {
-            match instr {
-                Instr::Hash { .. } | Instr::Hash16(_) => rows.hash += 1,
-                Instr::Select { .. } => rows.select += 1,
-                Instr::BaseAlu { .. } => rows.balu += 1,
-                Instr::Hint { .. } => rows.hint += 1,
-                _ => {}
-            }
-        }
-        rows
+        Self::of_instrs(&program.instrs)
     }
-}
-
-/// ★ One chain's `Select` and base-ALU rows, measured by emitting it once under
-/// `hash` (cached per shape): exact by construction, whatever the fold's form,
-/// the walk's or the grind's — a closed form here would be a second
-/// derivation to drift. Its socket rows and words are not taken from here:
-/// they depend on the transcript the chain enters with and on the arena the
-/// leaf lays out, which the plan counts itself.
-///
-/// The emission is a chain over a hinted point with the `eq` weight; a stacked
-/// opening's weight (`whir_stacked::emit_weight_at`) is extension arithmetic,
-/// so it spends neither chip (`whir_p1_census_tests` holds a group's rows to
-/// the sum of its chains').
-pub fn chain_select_balu(shape: &ChainShape, hash: super::edsl::WrapHash) -> ChipRows {
-    type Cache = Vec<(ChainShape, super::edsl::WrapHash, ChipRows)>;
-    static CACHE: std::sync::Mutex<Cache> = std::sync::Mutex::new(Vec::new());
-    if let Ok(cache) = CACHE.lock()
-        && let Some((_, _, rows)) = cache.iter().find(|(s, h, _)| s == shape && *h == hash)
-    {
-        return *rows;
-    }
-    let program = chain_program_under(shape, hash);
-    let all = ChipRows::of(&program);
-    let rows = ChipRows {
-        hash: 0,
-        select: all.select,
-        balu: all.balu,
-        hint: 0,
-    };
-    if let Ok(mut cache) = CACHE.lock() {
-        cache.push((shape.clone(), hash, rows));
-    }
-    rows
-}
-
-/// One chain's verify as a standalone program under `hash`: `z`, `y`, the root
-/// and the final value hinted, then the rounds' wires, then
-/// [`emit_verify_weighted`] with the `eq` weight.
-pub fn chain_program_under(
-    shape: &ChainShape,
-    hash: super::edsl::WrapHash,
-) -> super::compiler::LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(hash);
-    let prefix = (shape.num_vars + 3) as u32;
-    let arena = b.declare_arena(prefix + RoundStorage::words(shape));
-    let mut transcript = WhirTranscript::for_builder(&mut b);
-    let z: Vec<Ext> = (0..shape.num_vars)
-        .map(|i| b.hint_word(arena, i as u32).as_ext())
-        .collect();
-    let y = b.hint_word(arena, shape.num_vars as u32).as_ext();
-    let root = b.hint_word(arena, shape.num_vars as u32 + 1);
-    let root_lanes = b.unpack(root);
-    let final_value = b.hint_word(arena, shape.num_vars as u32 + 2).as_ext();
-    let storage = RoundStorage::hint(&mut b, arena, prefix, shape);
-    let (current, next) = storage.openings();
-    let wires = storage.wires(&current, &next);
-    let domain = Domain::<GoldilocksField>::new(shape.domain_log[0])
-        .expect("a chain's first domain is a valid domain");
-    emit_verify_weighted(
-        &mut b,
-        &mut transcript,
-        &wires,
-        &root_lanes,
-        final_value,
-        y,
-        shape,
-        &domain,
-        |b, alphas| emit_eq_eval(b, &z, alphas),
-    );
-    super::compiler::compile(b.finish())
 }
