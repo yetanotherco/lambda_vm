@@ -80,11 +80,136 @@ pub(crate) fn parse_regen_mode(value: Option<&str>) -> Result<RegenMode, Error> 
     }
 }
 
-/// `LAMBDA_VM_BLOCK_REGEN_AHEAD_GIB` (default 4, as the spill read-back's
-/// window): the bytes the regenerator may hold deposited ahead of the groups
-/// that take them, counted from the window's frontier.
-pub(crate) fn regen_ahead_bytes() -> u64 {
-    gib_knob("LAMBDA_VM_BLOCK_REGEN_AHEAD_GIB", 4.0)
+/// The regenerator's window: the bytes it may hold deposited ahead of the
+/// groups that take them, counted from the window's frontier.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum AheadPolicy {
+    /// `LAMBDA_VM_BLOCK_REGEN_AHEAD_GIB`: these bytes, the whole prove.
+    Fixed(u64),
+    /// Unset: [`adaptive_ahead`], read by a pacer beside the regenerator.
+    Adaptive,
+}
+
+impl AheadPolicy {
+    /// The window before the pacer's first reading.
+    pub(crate) fn initial(self) -> u64 {
+        match self {
+            AheadPolicy::Fixed(bytes) => bytes,
+            AheadPolicy::Adaptive => AHEAD_FLOOR,
+        }
+    }
+}
+
+/// The adaptive window's floor: the window it replaced (the spill read-back's).
+pub(crate) const AHEAD_FLOOR: u64 = 4 << 30;
+/// Its cap: the smallest window with which phase B's takers did not wait at
+/// T200 (RYZEN 052: 0.0 s at 16 and 32 GiB, 3.02 s at 4).
+pub(crate) const AHEAD_CAP: u64 = 16 << 30;
+/// What it leaves below the run's peak.
+pub(crate) const AHEAD_MARGIN: u64 = 4 << 30;
+
+/// [`AheadPolicy`] from `LAMBDA_VM_BLOCK_REGEN_AHEAD_GIB`.
+pub(crate) fn ahead_policy() -> AheadPolicy {
+    ahead_policy_from(
+        std::env::var("LAMBDA_VM_BLOCK_REGEN_AHEAD_GIB")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`ahead_policy`] from the knob's `value`: a size in GiB fixes the window;
+/// unset or unreadable, it is adaptive.
+pub(crate) fn ahead_policy_from(value: Option<&str>) -> AheadPolicy {
+    value
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|g| g.is_finite() && *g >= 0.0)
+        .map_or(AheadPolicy::Adaptive, |g| {
+            AheadPolicy::Fixed((g * GIB) as u64)
+        })
+}
+
+/// The adaptive window: what the run's peak resident set `hwm` leaves above
+/// its resident set now (`rss`, the window's own `parked` deposits left out),
+/// less [`AHEAD_MARGIN`], clamped to [[`AHEAD_FLOOR`], [`AHEAD_CAP`]]. Above
+/// the floor the window holds only memory the run has already reached, so it
+/// never raises the run's peak; phase A sets that peak, and phase B holds far
+/// less (RYZEN 049 at T200: 72.5 GiB against 15–21).
+pub(crate) fn adaptive_ahead(hwm: u64, rss: u64, parked: u64) -> u64 {
+    let base = rss.saturating_sub(parked);
+    hwm.saturating_sub(base)
+        .saturating_sub(AHEAD_MARGIN)
+        .clamp(AHEAD_FLOOR, AHEAD_CAP)
+}
+
+/// The process's peak and current resident sets (`VmHWM`, `VmRSS`), where
+/// `/proc/self/status` gives them.
+fn resident() -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kib = |key: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .map(|k| k << 10)
+    };
+    Some((kib("VmHWM:")?, kib("VmRSS:")?))
+}
+
+/// How often the pacer reads the host.
+const PACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// What the pacer set the window to.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct PacerReport {
+    pub(crate) first: Option<u64>,
+    pub(crate) most: u64,
+    pub(crate) last: u64,
+    pub(crate) readings: usize,
+}
+
+/// The adaptive window's pacer: until `window` closes, every [`PACE`] it sets
+/// the window to [`adaptive_ahead`] of the process's resident sets.
+fn pace(window: &RegenWindow) -> PacerReport {
+    let mut report = PacerReport::default();
+    while !window.is_closed() {
+        if let Some((hwm, rss)) = resident() {
+            let ahead = adaptive_ahead(hwm, rss, window.parked());
+            if ahead != window.ahead() {
+                window.set_ahead(ahead);
+            }
+            report.first.get_or_insert(ahead);
+            report.most = report.most.max(ahead);
+            report.last = ahead;
+            report.readings += 1;
+        }
+        std::thread::sleep(PACE);
+    }
+    report
+}
+
+/// The `BLOCK REGEN window pacer` line.
+pub(crate) fn pacer_line(policy: AheadPolicy, report: Option<&PacerReport>) -> String {
+    match (policy, report) {
+        (AheadPolicy::Fixed(bytes), _) => format!(
+            "BLOCK REGEN window pacer: fixed {:.2} GiB (LAMBDA_VM_BLOCK_REGEN_AHEAD_GIB)",
+            bytes as f64 / GIB
+        ),
+        (AheadPolicy::Adaptive, Some(r)) if r.readings > 0 => format!(
+            "BLOCK REGEN window pacer: adaptive (VmHWM − (VmRSS − parked) − {:.0} GiB, in [{:.0}, \
+             {:.0}] GiB) · first {:.2} GiB · most {:.2} GiB · last {:.2} GiB · {} readings",
+            AHEAD_MARGIN as f64 / GIB,
+            AHEAD_FLOOR as f64 / GIB,
+            AHEAD_CAP as f64 / GIB,
+            r.first.unwrap_or(0) as f64 / GIB,
+            r.most as f64 / GIB,
+            r.last as f64 / GIB,
+            r.readings
+        ),
+        (AheadPolicy::Adaptive, _) => format!(
+            "BLOCK REGEN window pacer: adaptive, no readings (no /proc/self/status) · {:.2} GiB",
+            AHEAD_FLOOR as f64 / GIB
+        ),
+    }
 }
 
 /// `LAMBDA_VM_BLOCK_REGEN_RESERVE_GIB` (default 10, #1013's): the host bytes
@@ -1085,6 +1210,8 @@ pub(crate) struct LiveReport {
     pub(crate) generators: usize,
     pub(crate) error: Option<String>,
     pub(crate) state_bytes: usize,
+    /// The `BLOCK REGEN window pacer` line, once the run is joined.
+    pub(crate) pacer: Option<String>,
 }
 
 impl LiveReport {
@@ -1532,6 +1659,9 @@ fn bend(packed: multilinear::narrow::NarrowColumns) -> multilinear::narrow::Narr
 pub(crate) struct LiveRun {
     window: Arc<RegenWindow>,
     handle: Option<std::thread::JoinHandle<LiveReport>>,
+    /// The adaptive window's pacer ([`AheadPolicy::Adaptive`]).
+    pacer: Option<std::thread::JoinHandle<PacerReport>>,
+    policy: AheadPolicy,
     started: Instant,
     dropped: usize,
     spawn_error: Option<String>,
@@ -1541,9 +1671,9 @@ impl LiveRun {
     /// [`run_live`] over the run of `elf_bytes` on `private_input`, executed
     /// `window_cycles` at a time (phase A's windows), its chunks cut at
     /// `max_rows` and generated in `form` (phase A's), on [`regen_generators`]
-    /// generators, depositing `dropped` into `window`; its times are from now.
-    /// A regenerator that cannot start drops `producer`, so every slot fails
-    /// at once.
+    /// generators, depositing `dropped` into `window`, which `policy` sizes;
+    /// its times are from now. A regenerator that cannot start drops
+    /// `producer`, so every slot fails at once.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         elf_bytes: Vec<u8>,
@@ -1555,8 +1685,19 @@ impl LiveRun {
         dropped: Vec<(StreamKey, RegenSlot)>,
         form: TraceForm,
         faults: LiveFaults,
+        policy: AheadPolicy,
     ) -> Self {
         let started = Instant::now();
+        window.set_ahead(policy.initial());
+        let pacer = (policy == AheadPolicy::Adaptive)
+            .then(|| {
+                let window = Arc::clone(&window);
+                std::thread::Builder::new()
+                    .name("regen-pacer".to_string())
+                    .spawn(move || pace(&window))
+                    .ok()
+            })
+            .flatten();
         let count = dropped.len();
         let window_in = Arc::clone(&window);
         let spawned = std::thread::Builder::new()
@@ -1609,6 +1750,8 @@ impl LiveRun {
         Self {
             window,
             handle,
+            pacer,
+            policy,
             started,
             dropped: count,
             spawn_error,
@@ -1630,7 +1773,7 @@ impl LiveRun {
             error: Some(error),
             ..LiveReport::default()
         };
-        match self.handle.take() {
+        let mut report = match self.handle.take() {
             Some(handle) => handle
                 .join()
                 .unwrap_or_else(|_| failed("the regenerator panicked".to_string())),
@@ -1639,7 +1782,10 @@ impl LiveRun {
                     .take()
                     .unwrap_or_else(|| "the regenerator did not start".to_string()),
             ),
-        }
+        };
+        let paced = self.pacer.take().and_then(|pacer| pacer.join().ok());
+        report.pacer = Some(pacer_line(self.policy, paced.as_ref()));
+        report
     }
 }
 
@@ -1648,6 +1794,9 @@ impl Drop for LiveRun {
         self.window.close("the block's prove ended");
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
+        }
+        if let Some(pacer) = self.pacer.take() {
+            let _ = pacer.join();
         }
     }
 }
@@ -1780,6 +1929,79 @@ mod tests {
         }
         assert!(!RegenMode::Off.live() && !RegenMode::Shadow.live());
         assert!(RegenMode::Auto.live() && RegenMode::Always.live());
+    }
+
+    /// ★ The adaptive window: what the peak leaves above the resident set (the
+    /// window's own deposits left out), less 4 GiB, in [4, 16] GiB.
+    #[test]
+    fn the_adaptive_window_is_clamped_to_its_bounds() {
+        const G: u64 = 1 << 30;
+        // Phase B at T200 (RYZEN 049): a 72.5 GiB peak over ≈ 15 GiB: the cap.
+        assert_eq!(adaptive_ahead(72 * G + G / 2, 15 * G, 0), AHEAD_CAP);
+        // p90 with no disk (RYZEN 044): a 66 GiB peak over ≈ 56: in between.
+        assert_eq!(adaptive_ahead(66 * G, 56 * G, 0), 6 * G);
+        // The window's own deposits are left out: the same window.
+        assert_eq!(adaptive_ahead(66 * G, 59 * G, 3 * G), 6 * G);
+        // No room above the resident set, or above the peak: the floor.
+        assert_eq!(adaptive_ahead(60 * G, 58 * G, 0), AHEAD_FLOOR);
+        assert_eq!(adaptive_ahead(60 * G, 61 * G, 0), AHEAD_FLOOR);
+        assert_eq!(adaptive_ahead(0, 0, 0), AHEAD_FLOOR);
+        // Exactly at either bound.
+        assert_eq!(adaptive_ahead(30 * G, 22 * G, 0), AHEAD_FLOOR);
+        assert_eq!(adaptive_ahead(30 * G, 10 * G, 0), AHEAD_CAP);
+        assert_eq!(adaptive_ahead(u64::MAX, 0, u64::MAX), AHEAD_CAP);
+    }
+
+    /// Above the floor, the window and the resident set without it never
+    /// pass the peak less the margin: the window holds only memory the run has
+    /// already reached.
+    #[test]
+    fn the_adaptive_window_never_passes_the_peak() {
+        const G: u64 = 1 << 30;
+        for hwm in (0..=120).step_by(3).map(|g| g * G) {
+            for rss in (0..=120).step_by(5).map(|g| g * G) {
+                for parked in [0, G, 3 * G, 16 * G] {
+                    let ahead = adaptive_ahead(hwm, rss, parked);
+                    assert!((AHEAD_FLOOR..=AHEAD_CAP).contains(&ahead));
+                    if ahead > AHEAD_FLOOR {
+                        let base = rss.saturating_sub(parked);
+                        assert!(base + ahead + AHEAD_MARGIN <= hwm, "{hwm} {rss} {parked}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// `LAMBDA_VM_BLOCK_REGEN_AHEAD_GIB` fixes the window (RYZEN 052's arms);
+    /// unset or unreadable, it is adaptive, from the floor.
+    #[test]
+    fn the_window_knob_overrides_the_adaptive_window() {
+        const G: u64 = 1 << 30;
+        assert_eq!(ahead_policy_from(Some("04")), AheadPolicy::Fixed(4 * G));
+        assert_eq!(ahead_policy_from(Some(" 32 ")), AheadPolicy::Fixed(32 * G));
+        assert_eq!(ahead_policy_from(Some("0.5")), AheadPolicy::Fixed(G / 2));
+        assert_eq!(ahead_policy_from(None), AheadPolicy::Adaptive);
+        for bad in ["", "x", "-1", "nan", "inf"] {
+            assert_eq!(
+                ahead_policy_from(Some(bad)),
+                AheadPolicy::Adaptive,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(AheadPolicy::Fixed(16 * G).initial(), 16 * G);
+        assert_eq!(AheadPolicy::Adaptive.initial(), AHEAD_FLOOR);
+        assert!(pacer_line(AheadPolicy::Fixed(16 * G), None).contains("fixed 16.00 GiB"));
+        let r = PacerReport {
+            first: Some(4 * G),
+            most: 16 * G,
+            last: 16 * G,
+            readings: 9,
+        };
+        let line = pacer_line(AheadPolicy::Adaptive, Some(&r));
+        assert!(
+            line.contains("first 4.00 GiB · most 16.00 GiB · last 16.00 GiB · 9 readings"),
+            "{line}"
+        );
     }
 
     /// A chunk's first op in the windows: lists of 3, 3, 9 and 14 ops after

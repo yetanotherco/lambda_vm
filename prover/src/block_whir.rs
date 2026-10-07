@@ -3392,7 +3392,7 @@ fn prove_streamed(
             let recorder = std::sync::Arc::clone(recorder);
             multilinear_block::BlockRegen::new(
                 std::sync::Arc::new(move |t| recorder.chunk_at(t).map(|_| t as u64)),
-                regen::regen_ahead_bytes(),
+                regen::ahead_policy().initial(),
                 regen_mode == regen::RegenMode::Always,
             )
         });
@@ -4101,6 +4101,7 @@ fn prove_streamed(
                             keyed,
                             stream_form,
                             deviations.regen_faults,
+                            regen::ahead_policy(),
                         ))
                     }
                     None => None,
@@ -4224,6 +4225,7 @@ fn prove_streamed(
             let report = run.map(regen::LiveRun::join);
             if let Some(report) = &report {
                 lines.push(report.line());
+                lines.extend(report.pacer.clone());
                 for failure in report.failures.iter().take(20) {
                     lines.push(format!("BLOCK REGEN FAILED {failure}"));
                 }

@@ -15,7 +15,10 @@
 //!   regenerator runs at most a window ahead of the groups that take them, in
 //!   rank order, and its generators may finish out of order inside it: the
 //!   window is reserved from the frontier, so later ranks can never fill it
-//!   while the rank a taker waits on cannot deposit (R-REGEN R1).
+//!   while the rank a taker waits on cannot deposit (R-REGEN R1). A pacer may
+//!   resize the window as it runs ([`RegenWindow::set_ahead`]): a larger one
+//!   admits the depositors it held, a smaller one holds the next deposits and
+//!   never one already in.
 //! - A deposit is checked against the shape and the digest taken when the
 //!   table was dropped ([`digest_of`], the spill store's own digest of the same
 //!   parts); another table fails its slot, and the prove refuses that table
@@ -34,7 +37,7 @@
 //! tables into it.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -200,7 +203,9 @@ impl Shared {
 pub struct RegenWindow {
     shared: Mutex<Shared>,
     changed: Condvar,
-    ahead: u64,
+    /// The bytes reserved from the frontier, and the most it has been.
+    ahead: AtomicU64,
+    most_ahead: AtomicU64,
     /// The lock-free halves of a waiting slot's readiness: the window closed,
     /// and every producer gone.
     closed: AtomicBool,
@@ -223,7 +228,8 @@ impl RegenWindow {
                 ..Shared::default()
             }),
             changed: Condvar::new(),
-            ahead,
+            ahead: AtomicU64::new(ahead),
+            most_ahead: AtomicU64::new(ahead),
             closed: AtomicBool::new(false),
             gone: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-utils"))]
@@ -273,6 +279,29 @@ impl RegenWindow {
         }
     }
 
+    /// The bytes reserved from the frontier now.
+    pub fn ahead(&self) -> u64 {
+        self.ahead.load(Ordering::Acquire)
+    }
+
+    /// Reserve `ahead` bytes from the frontier from now on (a pacer's
+    /// reading): a larger window admits the depositors it held at once; a
+    /// smaller one holds the next deposits, never one already in. Set under
+    /// the window's lock, so a depositor that has just been refused cannot
+    /// miss the wake-up.
+    pub fn set_ahead(&self, ahead: u64) {
+        let shared = lock(&self.shared);
+        self.ahead.store(ahead, Ordering::Release);
+        self.most_ahead.fetch_max(ahead, Ordering::AcqRel);
+        drop(shared);
+        self.changed.notify_all();
+    }
+
+    /// Bytes deposited and not yet taken.
+    pub fn parked(&self) -> u64 {
+        lock(&self.shared).parked
+    }
+
     /// Close: every slot not deposited fails with `why`, every waiter and
     /// every depositor returns. The first reason stays.
     pub fn close(&self, why: &str) {
@@ -309,7 +338,8 @@ impl RegenWindow {
         let shared = lock(&self.shared);
         format!(
             "{} slots · {} deposited · {} taken · {} mismatches · {} never deposited · window \
-             {:.2} GiB, high-water {:.2} GiB · depositors waited {:.2} s · takers waited {:.2} s",
+             {:.2} GiB, high-water {:.2} GiB · depositors waited {:.2} s · takers waited {:.2} s · \
+             window most {:.2} GiB",
             shared.slots.len(),
             shared.deposits,
             shared.taken,
@@ -319,10 +349,11 @@ impl RegenWindow {
                 .iter()
                 .filter(|s| matches!(s.state, SlotState::Waiting))
                 .count(),
-            self.ahead as f64 / GIB,
+            self.ahead() as f64 / GIB,
             shared.high_water as f64 / GIB,
             shared.deposit_wait_ns as f64 / 1e9,
             shared.take_wait_ns as f64 / 1e9,
+            self.most_ahead.load(Ordering::Acquire) as f64 / GIB,
         )
     }
 }
@@ -456,7 +487,7 @@ impl RegenSlot {
             if !matches!(shared.slots[self.id].state, SlotState::Waiting) {
                 return Err(RegenError::Failed("settled while it waited".to_string()));
             }
-            if shared.admits(key, window.ahead) {
+            if shared.admits(key, window.ahead()) {
                 break;
             }
             shared = window
@@ -713,6 +744,60 @@ mod tests {
         let (small, _p) = RegenWindow::new(1);
         let big = packed(1000, 3);
         small.slot(&big, 0).deposit(big).unwrap();
+    }
+
+    /// A larger window admits the depositor a smaller one held, at once; made
+    /// smaller again it holds the next deposit, and keeps what is in.
+    #[test]
+    fn a_resized_window_admits_and_holds() {
+        let t: Vec<NarrowColumns> = (1..=3).map(|seed| packed(64, seed)).collect();
+        let one = t[0].data().len() as u64;
+        let (window, _producer) = RegenWindow::new(one);
+        let slots: Vec<RegenSlot> = (0..3).map(|r| window.slot(&t[r], r as u64)).collect();
+        slots[0].deposit(t[0].clone()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (slot, columns, tx1) = (slots[1].clone(), t[1].clone(), tx.clone());
+        let held = std::thread::spawn(move || {
+            let out = slot.deposit(columns);
+            tx1.send(1).unwrap();
+            out
+        });
+        let quiet = Duration::from_millis(200);
+        assert!(rx.recv_timeout(quiet).is_err(), "deposited past the window");
+        window.set_ahead(3 * one);
+        assert_eq!(window.ahead(), 3 * one);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(1),
+            "admitted once larger"
+        );
+        held.join().unwrap().unwrap();
+        assert_eq!(window.parked(), 2 * one);
+        window.set_ahead(one);
+        let (slot, columns) = (slots[2].clone(), t[2].clone());
+        let next = std::thread::spawn(move || {
+            let out = slot.deposit(columns);
+            tx.send(2).unwrap();
+            out
+        });
+        assert!(
+            rx.recv_timeout(quiet).is_err(),
+            "deposited past the smaller window"
+        );
+        assert_eq!(window.parked(), 2 * one, "what was in stays");
+        assert_eq!(slots[0].take().unwrap(), t[0]);
+        assert_eq!(slots[1].take().unwrap(), t[1]);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(2),
+            "the frontier goes"
+        );
+        next.join().unwrap().unwrap();
+        assert!(
+            window
+                .report()
+                .ends_with(&format!("window most {:.2} GiB", 3.0 * one as f64 / GIB))
+        );
     }
 
     /// The window stays a bound for a regenerator that deposits in rank order
