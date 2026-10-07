@@ -158,6 +158,26 @@ fn resident() -> Option<(u64, u64)> {
 /// How often the pacer reads the host.
 const PACE: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// The least the pacer moves the window by. A smaller move is the window's own
+/// churn, not the host's: a chunk taken or deposited (≈ 0.1 GiB at p90), whose
+/// pages the allocator keeps (RYZEN 057 at p90 with no step: 109 shrinks and 28
+/// grows in 455 readings).
+pub(crate) const PACE_STEP: u64 = 1 << 30;
+
+/// The pacer's next window from the current one (`now`, whole steps) and the
+/// reading (`reading`, [`adaptive_ahead`]): the reading rounded down to whole
+/// steps, taken only once the reading is a step or more away from the window
+/// either way. So the window stays under a step above the reading (the run's
+/// peak less [`AHEAD_MARGIN`] is still never passed, a step to spare), and a
+/// reading that churns inside a step of it moves nothing.
+pub(crate) fn paced_ahead(now: u64, reading: u64) -> u64 {
+    if now >= reading.saturating_add(PACE_STEP) || now.saturating_add(PACE_STEP) <= reading {
+        reading / PACE_STEP * PACE_STEP
+    } else {
+        now
+    }
+}
+
 /// What the pacer set the window to, and how often it moved it each way (an
 /// oscillating window is a finding even when phase B never waits).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -170,14 +190,15 @@ pub(crate) struct PacerReport {
     pub(crate) shrank: usize,
 }
 
-/// The adaptive window's pacer: until `window` closes, every [`PACE`] it sets
-/// the window to [`adaptive_ahead`] of the process's resident sets.
+/// The adaptive window's pacer: until `window` closes, every [`PACE`] it
+/// moves the window to [`adaptive_ahead`] of the process's resident sets, in
+/// [`paced_ahead`]'s steps.
 fn pace(window: &RegenWindow) -> PacerReport {
     let mut report = PacerReport::default();
     while !window.is_closed() {
         if let Some((hwm, rss)) = resident() {
-            let ahead = adaptive_ahead(hwm, rss, window.parked());
             let now = window.ahead();
+            let ahead = paced_ahead(now, adaptive_ahead(hwm, rss, window.parked()));
             if ahead != now {
                 if ahead > now {
                     report.grew += 1;
@@ -205,11 +226,12 @@ pub(crate) fn pacer_line(policy: AheadPolicy, report: Option<&PacerReport>) -> S
         ),
         (AheadPolicy::Adaptive, Some(r)) if r.readings > 0 => format!(
             "BLOCK REGEN window pacer: adaptive (VmHWM − (VmRSS − parked) − {:.0} GiB, in [{:.0}, \
-             {:.0}] GiB) · first {:.2} GiB · most {:.2} GiB · last {:.2} GiB · {} readings · grew {} \
+             {:.0}] GiB, steps of {:.0} GiB) · first {:.2} GiB · most {:.2} GiB · last {:.2} GiB · {} readings · grew {} \
              times · shrank {} times",
             AHEAD_MARGIN as f64 / GIB,
             AHEAD_FLOOR as f64 / GIB,
             AHEAD_CAP as f64 / GIB,
+            PACE_STEP as f64 / GIB,
             r.first.unwrap_or(0) as f64 / GIB,
             r.most as f64 / GIB,
             r.last as f64 / GIB,
@@ -1982,6 +2004,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The pacer moves the window in whole steps, and only once the reading is
+    /// a step away: a reading that churns inside a step (a chunk taken or
+    /// deposited) moves nothing, even across a whole GiB; a drift moves it a
+    /// step at a time; the window never stands a step or more above the reading.
+    #[test]
+    fn the_pacer_steps_past_the_window_churn() {
+        const G: u64 = 1 << 30;
+        assert_eq!(paced_ahead(4 * G, 16 * G), 16 * G);
+        assert_eq!(paced_ahead(16 * G, 4 * G), 4 * G);
+        assert_eq!(paced_ahead(6 * G, 6 * G + G / 2), 6 * G, "inside a step up");
+        assert_eq!(
+            paced_ahead(6 * G, 6 * G - G / 2),
+            6 * G,
+            "inside a step down"
+        );
+        assert_eq!(paced_ahead(6 * G, 5 * G), 5 * G, "a step down");
+        assert_eq!(paced_ahead(6 * G, 7 * G + G / 3), 7 * G, "a step up, whole");
+        // Churn of ± 0.3 GiB around 6.5 and around 6.0 GiB (across a whole
+        // GiB): one or two moves up from 4 GiB, then none.
+        for centre in [6 * G + G / 2, 6 * G] {
+            let mut now = 4 * G;
+            let mut moves = 0;
+            for k in 0..400u64 {
+                let reading = centre + (k % 7) * G / 10 - 3 * G / 10;
+                let next = paced_ahead(now, reading);
+                moves += usize::from(next != now);
+                now = next;
+                assert!(now < reading + PACE_STEP, "{now} over {reading}");
+            }
+            assert!((1..=2).contains(&moves), "{moves} moves around {centre}");
+        }
+        // A drift from 16 to 4 GiB in steps of 0.1 GiB: twelve moves down.
+        let (mut now, mut shrank) = (16 * G, 0);
+        for k in 0..=120u64 {
+            let reading = (16 * G).saturating_sub(k * G / 10).max(4 * G);
+            let next = paced_ahead(now, reading);
+            shrank += usize::from(next < now);
+            assert!(next <= now);
+            now = next;
+            assert!(now < reading + PACE_STEP);
+        }
+        assert_eq!((now, shrank), (4 * G, 12));
     }
 
     /// `LAMBDA_VM_BLOCK_REGEN_AHEAD_GIB` fixes the window (RYZEN 052's arms);
