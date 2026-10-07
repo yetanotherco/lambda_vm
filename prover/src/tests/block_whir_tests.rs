@@ -1538,6 +1538,17 @@ fn live_regeneration_proves_the_same_bytes() {
         assert_eq!(r.error, None, "{what}\n{lines}");
         assert!(lines.contains("groups rebuilt ("), "{lines}");
         assert!(lines.contains("BLOCK REGEN rest: "), "{lines}");
+        assert!(
+            lines.contains("BLOCK REGEN phase B order taken: "),
+            "{lines}"
+        );
+        // The interleaved order is not group order: the bytes below hold only
+        // because each group proves on its own fork (`S_post ‖ g`).
+        assert_ne!(
+            r.phase_b_order,
+            (0..proof.groups.len()).collect::<Vec<_>>(),
+            "{what}: group order"
+        );
         if policy == BlockSpillPolicy::Off {
             assert!(stamps.spill_stats.is_none(), "{what}: a store opened");
             assert!(
@@ -1789,6 +1800,11 @@ fn one_byte_windows_take_each_class_in_its_order() {
     let lines = r.lines.join("\n");
     assert!(r.rest_dropped > 0 && r.dropped > r.rest_dropped, "{lines}");
     assert_eq!(r.regenerated, r.dropped, "{lines}");
+    assert_ne!(
+        r.phase_b_order,
+        (0..proof.groups.len()).collect::<Vec<_>>(),
+        "the interleaved order is group order"
+    );
     assert_eq!(proof.groups, plain.groups);
     if crypto::grinding::deterministic() {
         let bytes = |p: &BlockWhirProof| {
@@ -1796,7 +1812,68 @@ fn one_byte_windows_take_each_class_in_its_order() {
                 .expect("serialize")
                 .to_vec()
         };
-        assert_eq!(bytes(&proof), bytes(&plain), "the proof");
+        assert!(bytes(&proof) == bytes(&plain), "the proof differs");
+    }
+}
+
+/// ★ One class a group (N3): with groups of 2^24-cell polynomials the block
+/// is one group, holding every streamed chunk and every KECCAK_RND and LT table
+/// of the rest. Under `always` it drops the streamed class only, the class of
+/// its first droppable table, and holds the rest's tables in place (phase B
+/// could not take one group in both classes' orders); the proof is the bytes
+/// regeneration off proves, and verifies. A group that dropped both classes is
+/// refused before phase B, never proved and never left to hang.
+#[test]
+fn a_mixed_boundary_group_drops_one_class_only() {
+    use crate::block_whir::BlockSpillPolicy;
+    use crate::block_whir::regen::RegenMode;
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let mut format = many_groups();
+    format.zf.whir_stack = StackVars::new(24).expect("a valid stack");
+    let (plain, plain_stamps) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Off,
+        BlockSpillPolicy::Off,
+        Deviations::default(),
+    )
+    .expect("prove");
+    let streamed = plain_stamps.streamed.1;
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let elf = elf.clone();
+        std::thread::spawn(move || {
+            let out = regenerated(
+                &elf,
+                &format,
+                RegenMode::Always,
+                BlockSpillPolicy::Off,
+                Deviations::default(),
+            );
+            let _ = tx.send(out.map_err(|e| format!("{e:?}")));
+        });
+    }
+    let (proof, stamps) = rx
+        .recv_timeout(std::time::Duration::from_secs(600))
+        .expect("the prove did not hang")
+        .expect("a mixed group is proved, one class dropped");
+    let r = stamps.regen.expect("live regeneration's readout");
+    let lines = r.lines.join("\n");
+    assert_eq!(proof.groups.len(), 1, "one group: {:?}", proof.groups);
+    assert_eq!(r.dropped, streamed, "the streamed class dropped\n{lines}");
+    assert_eq!(r.rest_dropped, 0, "no rest table dropped\n{lines}");
+    assert!(r.held > 0, "the rest's tables held\n{lines}");
+    assert_eq!(r.regenerated, r.dropped, "{lines}");
+    assert!(lines.contains(&format!("{} held", r.held)), "{lines}");
+    assert_eq!(proof.groups, plain.groups);
+    assert!(verify(&proof, &elf, &format));
+    if crypto::grinding::deterministic() {
+        let bytes = |p: &BlockWhirProof| {
+            rkyv::to_bytes::<rkyv::rancor::Error>(p)
+                .expect("serialize")
+                .to_vec()
+        };
+        assert!(bytes(&proof) == bytes(&plain), "the proof differs");
     }
 }
 

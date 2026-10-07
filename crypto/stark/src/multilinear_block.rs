@@ -657,6 +657,9 @@ struct RegenState {
     dropped: Vec<((usize, u64), RegenSlot, u64, bool)>,
     /// Drops that found their table gone from the host (handed to the store).
     refused_late: usize,
+    /// Tables phase B could rebuild that stay, their group dropping another
+    /// class ([`drop_one_class`]).
+    held: usize,
     /// A memory log, which counts each drop out of the held bytes.
     mem: Option<Arc<BlockMem>>,
 }
@@ -678,6 +681,9 @@ pub struct DropReport {
     pub refused_late: usize,
     /// By class: the tables and bytes dropped.
     pub by_class: Vec<(usize, u64)>,
+    /// Tables phase B could rebuild kept on the host because their group
+    /// dropped another class ([`drop_one_class`]).
+    pub held: usize,
 }
 
 /// One class's regeneration for phase B ([`BlockRegen::into_plan`]): its
@@ -832,6 +838,11 @@ impl BlockRegen {
     }
 
     /// What it dropped.
+    /// Counts `n` tables kept because their group dropped another class.
+    fn held(&self, n: usize) {
+        self.lock().held += n;
+    }
+
     pub fn report(&self) -> DropReport {
         let state = self.lock();
         let back = state.dropped.iter().filter(|d| d.3);
@@ -850,6 +861,7 @@ impl BlockRegen {
             back_bytes: back.map(|d| d.2).sum(),
             refused_late: state.refused_late,
             by_class,
+            held: state.held,
         }
     }
 
@@ -962,7 +974,14 @@ where
             spill.regen.as_ref()?.rank_of(first + k)
         })
         .collect();
+    let droppable = ranks.iter().flatten().count();
     drop_one_class(&mut ranks);
+    if let Some(regen) = &spill.regen {
+        let held = droppable - ranks.iter().flatten().count();
+        if held > 0 {
+            regen.held(held);
+        }
+    }
     for (k, (table, slot)) in tables.iter_mut().zip(out.iter_mut()).enumerate() {
         let table_cells = (table.num_committed_columns() as u64) << table.num_vars();
         let cells = spill.cells.fetch_add(table_cells, Relaxed) + table_cells;
