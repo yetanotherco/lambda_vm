@@ -272,8 +272,10 @@ pub fn purge_after_level(level: usize, target: u64, say: &dyn Fn(&str)) -> Optio
 /// `LAMBDA_VM_ALLOC_WATERMARK`: a monitor beside the whole block that purges
 /// every arena when the block's memory is short ([`note_memory_pressure`]),
 /// the process's resident set has reached [`WATERMARK_SHARE`] of the host
-/// target, and the allocator holds at least [`WATERMARK_MIN_FREED`] of freed
-/// pages (resident − allocated), at most once per [`WATERMARK_SPACING`].
+/// target, and the allocator holds at least [`WATERMARK_MIN_PURGEABLE`] a
+/// purge can return ([`purgeable`]), at most once per [`WATERMARK_SPACING`]
+/// after a fire that returned [`WATERMARK_MIN_RETURNED`] and once per
+/// [`WATERMARK_RETRY`] after one that returned less ([`watermark_spacing`]).
 /// `auto` (unset or empty, the default) runs it; `off` does not. It reaches the
 /// pages a phase frees and does not reuse *inside* the phase, which no
 /// boundary point can: at the p90 block on a 48 GiB emulated host the binding
@@ -287,22 +289,33 @@ pub const WATERMARK_ENV: &str = "LAMBDA_VM_ALLOC_WATERMARK";
 /// [`LEVEL_PURGE_SHARE`]).
 pub const WATERMARK_SHARE: f64 = LEVEL_PURGE_SHARE;
 
-/// The least freed-and-held bytes worth a purge.
-pub const WATERMARK_MIN_FREED: u64 = 4 << 30;
+/// The least purgeable bytes ([`purgeable`]) worth a purge.
+pub const WATERMARK_MIN_PURGEABLE: u64 = 4 << 30;
 
 /// How often the monitor reads the host.
 const WATERMARK_TICK: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// The least time between two fires.
+/// The least time between a fire that returned [`WATERMARK_MIN_RETURNED`] and
+/// the next.
 pub const WATERMARK_SPACING: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// A fire that returned at least this starts the full [`WATERMARK_SPACING`].
+pub const WATERMARK_MIN_RETURNED: u64 = 1 << 30;
+
+/// The least time between a fire that returned less than
+/// [`WATERMARK_MIN_RETURNED`] and the next: it does not hold the next fire
+/// back for the full spacing, but the monitor cannot spin purges that find
+/// little, each of which takes every arena's lock.
+pub const WATERMARK_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The highest-VmRSS reading the watermark monitor took since the window was
-/// last read ([`peak_window`]): VmRSS, jemalloc's allocated and resident
-/// bytes, and the seconds since the monitor started.
+/// last read ([`peak_window`]): VmRSS, jemalloc's allocated, active and
+/// resident bytes, and the seconds since the monitor started.
 #[derive(Clone, Copy, Debug, Default)]
 struct PeakSample {
     rss: u64,
     allocated: u64,
+    active: u64,
     resident: u64,
     at: f64,
 }
@@ -312,17 +325,21 @@ static PEAK: std::sync::Mutex<Option<PeakSample>> = std::sync::Mutex::new(None);
 /// The window's highest-VmRSS reading in words, and a new window; `None`
 /// without a running monitor (or before its first reading). A phase's
 /// `ALLOC PEAK` line: its live heap (allocated) against what the allocator holds
-/// (resident) at its highest VmRSS, read every [`WATERMARK_TICK`].
+/// (resident) at its highest VmRSS, read every [`WATERMARK_TICK`], and of
+/// that, what a purge could return (resident − active, [`purgeable`]).
 pub fn peak_window() -> Option<String> {
     let sample = PEAK.lock().unwrap_or_else(|e| e.into_inner()).take()?;
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     Some(format!(
-        "VmRSS {:.2} GiB at {:.1}s · jemalloc allocated {:.2} · resident {:.2} (resident − allocated {:.2})",
+        "VmRSS {:.2} GiB at {:.1}s · jemalloc allocated {:.2} · resident {:.2} (resident − allocated {:.2}) · \
+         active {:.2} (purgeable {:.2})",
         gib(sample.rss),
         sample.at,
         gib(sample.allocated),
         gib(sample.resident),
-        gib(sample.resident.saturating_sub(sample.allocated))
+        gib(sample.resident.saturating_sub(sample.allocated)),
+        gib(sample.active),
+        gib(sample.resident.saturating_sub(sample.active))
     ))
 }
 
@@ -342,20 +359,48 @@ pub fn parse_watermark(value: Option<&str>) -> Result<WatermarkSetting, String> 
     }
 }
 
+/// What a purge can return: jemalloc's resident bytes less its active ones,
+/// that is its dirty pages (and metadata). The gap to `allocated` also counts
+/// the free space inside active pages, which a purge cannot return: at the
+/// median on a 32 GiB emulated host a fire read that gap at ≥ 4 GiB and
+/// returned nothing (VmRSS 25.52 → 25.50 GiB), and its spacing held the next
+/// fire past level 1's peak (RYZEN 058b, I-MEMFIT §6.13).
+fn purgeable(stats: &AllocStats) -> u64 {
+    stats.resident.saturating_sub(stats.active) as u64
+}
+
+/// What a purge returned: jemalloc's resident bytes before less after
+/// (nothing when they grew while it ran).
+fn returned(purge: &Purge) -> u64 {
+    purge.resident_before.saturating_sub(purge.resident_after) as u64
+}
+
+/// The least time after a fire that `returned` these bytes before the next:
+/// [`WATERMARK_SPACING`] from [`WATERMARK_MIN_RETURNED`] up, else
+/// [`WATERMARK_RETRY`].
+fn watermark_spacing(returned: u64) -> std::time::Duration {
+    if returned >= WATERMARK_MIN_RETURNED {
+        WATERMARK_SPACING
+    } else {
+        WATERMARK_RETRY
+    }
+}
+
 /// Whether the watermark fires now: memory pressure, the resident set at or
-/// over the share of `target`, enough freed pages held, and the spacing since
-/// the last fire. No reading: no fire.
+/// over the share of `target`, enough purgeable bytes, and the spacing since
+/// the last fire (`last`: the time since it and the bytes it returned). No
+/// reading: no fire.
 fn watermark_fires(
     pressure: bool,
     resident: Option<u64>,
-    freed: Option<u64>,
+    purgeable: Option<u64>,
     target: u64,
-    since_last: Option<std::time::Duration>,
+    last: Option<(std::time::Duration, u64)>,
 ) -> bool {
     pressure
         && resident.is_some_and(|r| r as f64 >= WATERMARK_SHARE * target as f64)
-        && freed.is_some_and(|f| f >= WATERMARK_MIN_FREED)
-        && since_last.is_none_or(|s| s >= WATERMARK_SPACING)
+        && purgeable.is_some_and(|p| p >= WATERMARK_MIN_PURGEABLE)
+        && last.is_none_or(|(since, returned)| since >= watermark_spacing(returned))
 }
 
 /// The running watermark monitor ([`start_watermark`]); stopped and joined by
@@ -406,7 +451,8 @@ fn watch(
 ) -> (usize, f64) {
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     let t0 = std::time::Instant::now();
-    let (mut fires, mut secs, mut last) = (0usize, 0.0f64, None::<std::time::Instant>);
+    // The last fire: when, and the bytes it returned.
+    let (mut fires, mut secs, mut last) = (0usize, 0.0f64, None::<(std::time::Instant, u64)>);
     let mut stopped = stop.0.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         stopped = stop
@@ -425,6 +471,7 @@ fn watch(
                 *peak = Some(PeakSample {
                     rss,
                     allocated: st.allocated as u64,
+                    active: st.active as u64,
                     resident: st.resident as u64,
                     at: t0.elapsed().as_secs_f64(),
                 });
@@ -434,26 +481,31 @@ fn watch(
         if !purges || !pressure {
             continue;
         }
-        let freed = stats.map(|s| s.resident.saturating_sub(s.allocated) as u64);
-        if !watermark_fires(pressure, resident, freed, target, last.map(|l| l.elapsed())) {
+        let can = stats.as_ref().map(purgeable);
+        let since = last.map(|(at, r)| (at.elapsed(), r));
+        if !watermark_fires(pressure, resident, can, target, since) {
             continue;
         }
         let Some(purge) = purge_with(hooks) else {
             continue;
         };
         let after = crate::lfm::program_budget::resident_bytes();
+        let back = returned(&purge);
         fires += 1;
         secs += purge.secs;
-        last = Some(std::time::Instant::now());
+        last = Some((std::time::Instant::now(), back));
         eprintln!(
             "ALLOC WATERMARK fire #{fires} at {:.1}s: VmRSS {:.2} → {} GiB · jemalloc resident {:.2} \
-             → {:.2} GiB · {:.3}s",
+             → {:.2} GiB · {:.3}s · purgeable {:.2} GiB, returned {:.2} · next ≥ {}s",
             t0.elapsed().as_secs_f64(),
             gib(resident.unwrap_or(0)),
             after.map_or("unread".to_string(), |a| format!("{:.2}", gib(a))),
             gib(purge.resident_before as u64),
             gib(purge.resident_after as u64),
-            purge.secs
+            purge.secs,
+            gib(can.unwrap_or(0)),
+            gib(back),
+            watermark_spacing(back).as_secs()
         );
     }
 }
@@ -473,10 +525,13 @@ impl Watermark {
         }
         format!(
             "ALLOC WATERMARK end: {fires} fire(s), Σ {secs:.2}s (auto: memory pressure, VmRSS ≥ \
-             {WATERMARK_SHARE:.2} × {:.2} GiB, ≥ {} GiB freed, ≥ {}s apart)",
+             {WATERMARK_SHARE:.2} × {:.2} GiB, ≥ {} GiB purgeable, ≥ {}s after a fire that returned \
+             ≥ {} GiB, else ≥ {}s)",
             self.target as f64 / (1u64 << 30) as f64,
-            WATERMARK_MIN_FREED >> 30,
-            WATERMARK_SPACING.as_secs()
+            WATERMARK_MIN_PURGEABLE >> 30,
+            WATERMARK_SPACING.as_secs(),
+            WATERMARK_MIN_RETURNED >> 30,
+            WATERMARK_RETRY.as_secs()
         )
     }
 }
@@ -608,7 +663,7 @@ mod tests {
     }
 
     /// The watermark fires only under memory pressure, with the host at the
-    /// share of its target, enough freed pages held and the spacing kept.
+    /// share of its target, enough purgeable bytes and the spacing kept.
     #[test]
     fn the_watermark_fires_only_under_pressure_on_a_full_host() {
         const G: u64 = 1 << 30;
@@ -626,7 +681,7 @@ mod tests {
             Some(99 * G),
             Some(9 * G),
             target,
-            Some(s(5))
+            Some((s(5), 2 * G))
         ));
         assert!(
             !watermark_fires(false, Some(99 * G), Some(9 * G), target, None),
@@ -638,11 +693,7 @@ mod tests {
         );
         assert!(
             !watermark_fires(true, Some(99 * G), Some(3 * G), target, None),
-            "too little freed"
-        );
-        assert!(
-            !watermark_fires(true, Some(99 * G), Some(9 * G), target, Some(s(4))),
-            "too soon"
+            "too little purgeable"
         );
         assert!(
             !watermark_fires(true, None, Some(9 * G), target, None),
@@ -652,6 +703,120 @@ mod tests {
             !watermark_fires(true, Some(99 * G), None, target, None),
             "no stats"
         );
+    }
+
+    /// The trigger reads what a purge can return, resident − active, not the
+    /// gap to allocated, which also counts free space inside active pages
+    /// (RYZEN 058b: a fire on that gap returned nothing).
+    #[test]
+    fn the_watermark_reads_purgeable_bytes_not_the_gap_to_allocated() {
+        const G: usize = 1 << 30;
+        let fragmented = AllocStats {
+            allocated: 20 * G,
+            active: 26 * G,
+            resident: 27 * G,
+            ..AllocStats::default()
+        };
+        assert_eq!(purgeable(&fragmented), G as u64);
+        assert!(
+            !watermark_fires(
+                true,
+                Some(30 << 30),
+                Some(purgeable(&fragmented)),
+                22 << 30,
+                None
+            ),
+            "7 GiB over allocated, but 1 GiB purgeable: no fire"
+        );
+        let dirty = AllocStats {
+            active: 22 * G,
+            ..fragmented
+        };
+        assert_eq!(purgeable(&dirty), 5 * G as u64);
+        assert!(watermark_fires(
+            true,
+            Some(30 << 30),
+            Some(purgeable(&dirty)),
+            22 << 30,
+            None
+        ));
+        let grown = Purge {
+            secs: 0.7,
+            resident_before: 26 * G,
+            resident_after: 27 * G,
+        };
+        assert_eq!(returned(&grown), 0, "resident grew while it ran");
+    }
+
+    /// A fire that returned at least a GiB holds the next for the full
+    /// spacing.
+    #[test]
+    fn a_fire_that_returned_a_gib_holds_the_next_for_the_spacing() {
+        const G: u64 = 1 << 30;
+        let ms = std::time::Duration::from_millis;
+        let fires = |since, back| {
+            watermark_fires(
+                true,
+                Some(99 * G),
+                Some(9 * G),
+                100 * G,
+                Some((since, back)),
+            )
+        };
+        assert_eq!(watermark_spacing(WATERMARK_MIN_RETURNED), WATERMARK_SPACING);
+        assert!(!fires(ms(1000), G), "1 s after a fire that returned 1 GiB");
+        assert!(
+            !fires(ms(4900), 3 * G),
+            "4.9 s after one that returned 3 GiB"
+        );
+        assert!(fires(ms(5000), 3 * G));
+    }
+
+    /// A fire that returned less than a GiB does not hold the next for the
+    /// full spacing: one second on, the next may fire.
+    #[test]
+    fn a_fire_that_returned_little_lets_the_next_come_after_a_second() {
+        const G: u64 = 1 << 30;
+        let ms = std::time::Duration::from_millis;
+        let fires = |since, back| {
+            watermark_fires(
+                true,
+                Some(99 * G),
+                Some(9 * G),
+                100 * G,
+                Some((since, back)),
+            )
+        };
+        assert_eq!(watermark_spacing(G - 1), WATERMARK_RETRY);
+        assert!(fires(ms(1000), 0), "1 s after a fire that returned nothing");
+        assert!(
+            fires(ms(1500), G - 1),
+            "1.5 s after one that returned just under 1 GiB"
+        );
+    }
+
+    /// A fire that returned nothing cannot fire again within a second: purges
+    /// that find little do not spin, each taking every arena's lock.
+    #[test]
+    fn a_fire_that_returned_nothing_cannot_fire_again_within_a_second() {
+        const G: u64 = 1 << 30;
+        let ms = std::time::Duration::from_millis;
+        let fires = |since, back| {
+            watermark_fires(
+                true,
+                Some(99 * G),
+                Some(9 * G),
+                100 * G,
+                Some((since, back)),
+            )
+        };
+        assert!(WATERMARK_RETRY >= std::time::Duration::from_secs(1));
+        for since in [0, 1, 500, 999] {
+            assert!(
+                !fires(ms(since), 0),
+                "{since} ms after a fire that returned nothing"
+            );
+        }
     }
 
     /// A started monitor samples (a peak window to read), stops, and reports
