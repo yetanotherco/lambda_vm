@@ -1591,7 +1591,17 @@ impl<'a> FinishPlan<'a> {
     /// as [`Self::emit_all`] does, or a streamed chunk's slot. A family's list
     /// is held by its jobs alone and goes with the last of them. Refused unless
     /// the units are the tables the header counted.
+    #[cfg(test)]
     pub(super) fn units(self) -> Result<Vec<Unit<'a>>, Error> {
+        self.units_keeping(false).map(|(units, _)| units)
+    }
+
+    /// [`Self::units`], and with `keep` the lists KECCAK_RND's and LT's units
+    /// read, kept for phase B to build those tables again ([`RestRegen`]).
+    pub(super) fn units_keeping(
+        self,
+        keep: bool,
+    ) -> Result<(Vec<Unit<'a>>, Option<RestRegen>), Error> {
         use std::sync::Arc;
         let Self {
             memory_state,
@@ -1649,6 +1659,14 @@ impl<'a> FinishPlan<'a> {
         };
         let tails = skip.tails;
         let mut units: Vec<Unit<'a>> = Vec::new();
+        let mut regen = keep.then_some(RestRegen {
+            keccak_ops: None,
+            lt: None,
+            skip,
+            lt_rows: max_rows.lt,
+            pack,
+            form,
+        });
         let cpu_ops = Arc::new(cpu_ops);
 
         // BITWISE, DECODE, KECCAK_RC, REGISTER, HALT.
@@ -1727,6 +1745,9 @@ impl<'a> FinishPlan<'a> {
             |ops| Box::new(move || Ok(keccak::generate_keccak_trace(&ops.whole()))),
         )?);
         units.extend(keccak_rnd_units(&keccak_ops, &skip, pack, form)?);
+        if let Some(regen) = regen.as_mut() {
+            regen.keccak_ops = Some(Arc::clone(&keccak_ops));
+        }
         drop(keccak_ops);
         let ecsm_ops = Arc::new(ecsm_ops);
         units.extend(cut_units(
@@ -1813,23 +1834,10 @@ impl<'a> FinishPlan<'a> {
         )?);
         drop(cpu_ops);
         let lt = Arc::new(lt);
-        units.extend(chunked_units(
-            family("LT"),
-            lt.segments().len(),
-            max_rows.lt,
-            skip.lt,
-            tails,
-            true,
-            |start, end| {
-                let lt = Arc::clone(&lt);
-                Box::new(move || {
-                    Ok(packed_if(
-                        pack,
-                        lt::generate_lt_trace_as(&lt.segments().range(start, end), form),
-                    ))
-                })
-            },
-        )?);
+        units.extend(lt_units(&lt, max_rows.lt, &skip, pack, form)?);
+        if let Some(regen) = regen.as_mut() {
+            regen.lt = Some(Arc::clone(&lt));
+        }
         drop(lt);
         units.extend(segmented_units(
             family("SHIFT"),
@@ -1973,7 +1981,113 @@ impl<'a> FinishPlan<'a> {
 
         // The units are the tables the header counted, or the build is refused.
         check_units(&units, &header.table_counts)?;
-        Ok(units)
+        Ok((units, regen))
+    }
+}
+
+/// LT's units: a streamed chunk's slot for each chunk the windows handed out,
+/// then the list's cuts of `rows` rows.
+fn lt_units<'a>(
+    lt: &std::sync::Arc<LtLists>,
+    rows: usize,
+    skip: &StreamSkip,
+    pack: bool,
+    form: TraceForm,
+) -> Result<Vec<Unit<'a>>, Error> {
+    chunked_units(
+        family("LT"),
+        lt.segments().len(),
+        rows,
+        skip.lt,
+        skip.tails,
+        true,
+        |start, end| {
+            let lt = std::sync::Arc::clone(lt);
+            Box::new(move || {
+                Ok(packed_if(
+                    pack,
+                    lt::generate_lt_trace_as(&lt.segments().range(start, end), form),
+                ))
+            })
+        },
+    )
+}
+
+/// The rest's families phase B builds again from lists kept for it (D-WHIR-NODISK
+/// N3): their tables are dropped after their group's commit, as the streamed
+/// chunks are. KECCAK_RND and LT are ≈ 82 % of the rest's packed bytes at 200
+/// Mgas, against lists a fraction of that; the other families stay on the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum RegenFamily {
+    KeccakRnd,
+    Lt,
+}
+
+impl RegenFamily {
+    /// Both, in AIR order.
+    pub(crate) const ALL: [Self; 2] = [Self::KeccakRnd, Self::Lt];
+
+    /// Its AIRs' name before the index.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::KeccakRnd => "KECCAK_RND",
+            Self::Lt => "LT",
+        }
+    }
+
+    /// The family and the index of a table's AIR name (`KECCAK_RND[3]`, `LT[0]`).
+    pub(crate) fn of_air(name: &str) -> Option<(Self, usize)> {
+        let (base, index) = name.strip_suffix(']')?.split_once('[')?;
+        let family = Self::ALL.into_iter().find(|f| f.name() == base)?;
+        Some((family, index.parse().ok()?))
+    }
+}
+
+/// A table [`RestRegen`] builds again: building it is calling this.
+pub(crate) type RegenJob = Box<dyn FnOnce() -> Result<Table, Error> + Send + 'static>;
+
+/// What phase B needs to build KECCAK_RND's and LT's tables again
+/// ([`RegenFamily`]): their lists, kept past the finish, and the cut the
+/// finish made them with. The jobs are the finish's own, so their tables are
+/// the finish's.
+pub(crate) struct RestRegen {
+    keccak_ops: Option<std::sync::Arc<BlockVec<KeccakOperation>>>,
+    lt: Option<std::sync::Arc<LtLists>>,
+    skip: StreamSkip,
+    lt_rows: usize,
+    pack: bool,
+    form: TraceForm,
+}
+
+impl RestRegen {
+    /// `family`'s tables in the family's AIR order: a streamed chunk's slot
+    /// (`None`) or the job that builds the table again. The family's list goes
+    /// with the jobs: once each has run or been dropped it is freed, and a
+    /// second take of the family is refused.
+    pub(crate) fn take(&mut self, family: RegenFamily) -> Result<Vec<Option<RegenJob>>, Error> {
+        let units: Vec<Unit<'static>> = match family {
+            RegenFamily::KeccakRnd => {
+                let ops = self
+                    .keccak_ops
+                    .take()
+                    .ok_or_else(|| Error::Prover("KECCAK_RND's ops were taken already".into()))?;
+                keccak_rnd_units(&ops, &self.skip, self.pack, self.form)?
+            }
+            RegenFamily::Lt => {
+                let lt = self
+                    .lt
+                    .take()
+                    .ok_or_else(|| Error::Prover("LT's lists were taken already".into()))?;
+                lt_units(&lt, self.lt_rows, &self.skip, self.pack, self.form)?
+            }
+        };
+        Ok(units
+            .into_iter()
+            .map(|unit| match unit {
+                Unit::Streamed { .. } => None,
+                Unit::Build { job, .. } => Some(job),
+            })
+            .collect())
     }
 }
 
@@ -2182,12 +2296,29 @@ impl<'a> FinishPlan<'a> {
     /// yet placed are in memory. A table is estimated at its family's measured
     /// bytes a row once one of the family has been built, at eight bytes a
     /// cell before. A job's error, or `send`'s, stops the gate and is returned.
+    #[cfg(test)]
     pub(super) fn emit_streamed(
         self,
         gate: &gate::ByteGate,
         send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
     ) -> Result<(), Error> {
         emit_streamed_units(self.units(), gate, send)
+    }
+
+    /// [`Self::emit_streamed`], and with `keep` what phase B needs to build
+    /// KECCAK_RND's and LT's tables again ([`RestRegen`]).
+    pub(super) fn emit_streamed_keeping(
+        self,
+        gate: &gate::ByteGate,
+        send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
+        keep: bool,
+    ) -> Result<Option<RestRegen>, Error> {
+        let (units, regen) = match self.units_keeping(keep) {
+            Ok((units, regen)) => (Ok(units), regen),
+            Err(e) => (Err(e), None),
+        };
+        emit_streamed_units(units, gate, send)?;
+        Ok(regen)
     }
 }
 
