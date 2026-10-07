@@ -56,7 +56,6 @@ fn test_pi_virtual_matches_rotate() {
     }
 }
 
-// Soundness gap (unfixed): KECCAK_RND's `μ` is not bit-constrained. Every
 // Soundness regression: μ must be a bit. Every other constraint is `μ · identity`
 // (or `μ · x·(1−x)`), so μ = 2, 7 or −1 used to be indistinguishable from μ = 1 at
 // the constraint level, while on the bus μ weights (and with −1 inverts) every
@@ -64,7 +63,11 @@ fn test_pi_virtual_matches_rotate() {
 // bytes are not pinned, see `are_bytes_carrier_poc`). The chip does not
 // deduplicate, so `MuIsBit` (μ·(1−μ)=0) is the right fix (like SHIFT/LOAD): it
 // forbids μ = −1 and closes the carrier.
-mod mu_unconstrained_poc {
+//
+// DEFENSIVE: this is a constraint-presence regression (μ ∉ {0,1} is rejected), not
+// an end-to-end forgery; the carrier was confirmed structurally (bytes not pinned,
+// see `are_bytes_carrier_poc`), not demonstrated.
+mod mu_bit_regression {
     use crate::tables::keccak_rnd::{
         KeccakRndConstraints, KeccakRoundOperation, cols, generate_keccak_rnd_trace,
     };

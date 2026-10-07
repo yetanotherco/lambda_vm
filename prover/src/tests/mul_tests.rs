@@ -270,7 +270,7 @@ fn test_bus_interactions_count() {
     // - 8x IS_HALF senders for outputs (lo[0..4], hi[0..4])
     // - 4x IS_B20 senders (carry[0..4] virtual range checks)
     // - 2x ALU receivers (lo, hi)
-    // - 2x IS_HALF senders bounding the multiplicities (μ_lo, μ_hi)
+    // - 2x ARE_BYTES senders bounding the multiplicities (μ_lo, μ_hi)
     // Total: 2 + 8 + 8 + 4 + 2 + 2 = 26
     assert_eq!(interactions.len(), 26, "Expected 26 bus interactions");
 }
@@ -424,7 +424,7 @@ fn msb16_bitwise_multiplicity_matches_per_instance_sends() {
 // IS_HALF-range-checked weighted by itself, and trace generation splits a
 // row whose count would exceed `MU_MAX`.
 
-/// Presence: each multiplicity is IS_HALF-checked weighted by itself, so an
+/// Presence: each multiplicity is ARE_BYTES-checked weighted by itself, so an
 /// out-of-range value `v` always lands on the bus with weight `v ≠ 0`.
 #[test]
 fn test_mul_bounds_its_multiplicities() {

@@ -9,8 +9,10 @@
 //! all while still receiving one `a` lookup: its result was free. The stray `−1`
 //! on the `b` tuple was cancelled by an honest copy of the row with
 //! `μ_a = 0, μ_b = +1`, whose checks fire once and pass. Both forgeries below
-//! verified against `main` (ffc4ac19). The fix range-checks each μ to a halfword
-//! (`IS_HALF[μ]`, weighted by μ), so `μ_b = −1` has no receiver.
+//! verified against `main` (ffc4ac19). The fix range-checks each μ to a byte on
+//! the ARE_BYTES bus (`ARE_BYTES[μ, 0]`, weighted by μ) — a bus the limb checks
+//! (IS_HALFWORD) never use — so `μ_b = −1` lands at `ARE_BYTES[p−1, 0]` with no
+//! receiver.
 //!
 //! **SHIFT.** The five HWSL senders fire with `1 − zbs`, and on a μ = 0 padding
 //! row nothing pinned `zbs`: `zbs = 2` made that −1, so the padding row provided
@@ -234,11 +236,11 @@ fn craft_proof(s: &Scenario, forge: Forge) -> Result<VmProof, stark::prover::Pro
 fn bounds_column(interactions: &[BusInteraction], col: usize) -> bool {
     interactions.iter().any(|i| {
         i.is_sender
-            && i.bus_id == BusId::IsHalfword as u64
+            && i.bus_id == BusId::AreBytes as u64
             && matches!(i.multiplicity, Multiplicity::Column(m) if m == col)
             && matches!(
-                i.values.as_slice(),
-                [BusValue::Packed { start_column, packing: Packing::Direct }] if *start_column == col
+                i.values.first(),
+                Some(BusValue::Packed { start_column, packing: Packing::Direct }) if *start_column == col
             )
     })
 }
@@ -260,8 +262,8 @@ fn bump_bitwise(traces: &mut Traces, mu_col: usize, half: u64, delta: FE) {
 ///   `μ_a = 0, μ_b = 1`.
 ///
 /// Returns the row-B copy's index so the caller can rebalance flag-gated sends.
-/// If the chip range-checks its μ columns, also rebalances those IS_HALF sends
-/// wherever a BITWISE row exists (`−1` has none — that is the fix).
+/// If the chip range-checks its μ columns (ARE_BYTES[μ, 0]), also rebalances
+/// those sends wherever a BITWISE row exists (`p−1` has none — that is the fix).
 fn forge_two_rows(
     traces: &mut Traces,
     table: fn(&mut Traces) -> &mut TraceTable<Base, Ext>,
@@ -291,9 +293,10 @@ fn forge_two_rows(
     t.set_main(a, mu_b, FE::zero() - FE::one());
 
     if bounded {
-        // IS_HALF[μ] | μ sends: B's μ_b 0 -> 1 adds IS_HALF[1] once. A's μ_b
-        // 0 -> −1 adds IS_HALF[p−1] with weight −1, which has no BITWISE row.
-        bump_bitwise(traces, bw_cols::MU_IS_HALF, 1, FE::one());
+        // ARE_BYTES[μ, 0] | μ sends: B's μ_b 0 -> 1 adds ARE_BYTES[1, 0] once; A's
+        // μ_b 0 -> −1 adds ARE_BYTES[p−1, 0] with weight −1, which has no BITWISE
+        // row (that out-of-range send is what rejects the forgery).
+        bump_bitwise(traces, bw_cols::MU_ARE_BYTES, 1, FE::one());
     }
     b
 }
@@ -534,6 +537,7 @@ fn forge_lt_rows(traces: &mut Traces, s: &Scenario) {
     let (old, new) = (lt_net(&before), lt_net(&after));
     let half_id: u64 = BusId::IsHalfword.into();
     let msb_id: u64 = BusId::Msb16.into();
+    let byte_id: u64 = BusId::AreBytes.into();
     let keys: std::collections::HashSet<_> = old.keys().chain(new.keys()).cloned().collect();
     for (bus, tuple) in keys {
         let delta = new
@@ -553,6 +557,10 @@ fn forge_lt_rows(traces: &mut Traces, s: &Scenario) {
         } else if bus == msb_id {
             assert_eq!(tuple[1], v >> 15, "MSB16 sends stay honest");
             bump_bitwise(traces, bw_cols::MU_MSB16, v, delta);
+        } else if bus == byte_id {
+            // LT's only ARE_BYTES send is the μ bound (`ARE_BYTES[μ, 0]`).
+            assert_eq!(tuple[1], 0, "the μ bound sends ARE_BYTES[μ, 0]");
+            bump_bitwise(traces, bw_cols::MU_ARE_BYTES, v, delta);
         }
     }
 }

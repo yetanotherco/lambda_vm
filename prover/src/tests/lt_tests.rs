@@ -169,7 +169,7 @@ fn test_bus_interactions_count() {
     // MSB16 x2 + IS_HALFWORD x6 (lhs_sub_rhs x4 + lhs[1] + rhs[1])
     // + ALU receiver x1 (every LT lookup goes through the unified ALU bus
     // — CPU SLT/BLT/BGE dispatch and the internal memw/dvrm
-    // timestamp / |r|<|d| checks) + IS_HALFWORD x1 bounding μ = 10.
+    // timestamp / |r|<|d| checks) + ARE_BYTES x1 bounding μ = 10.
     assert_eq!(interactions.len(), 10);
 }
 
@@ -236,11 +236,11 @@ fn test_lt_rejects_forged_out() {
 // Soundness regression: μ is a bounded, non-negative multiplicity. Every LT
 // lookup fires with μ, so a free μ = −1 twin of an honest row received range
 // lookups instead of sending them and absorbed another row's out-of-range limb
-// (`lt_multiplicity_poc`, `multiplicity_forgery_poc`). μ is now IS_HALF-checked
-// weighted by itself, and trace generation splits a row whose count would
-// exceed `MU_MAX`.
+// (`lt_multiplicity_poc`, `multiplicity_forgery_poc`). μ is now range-checked on
+// ARE_BYTES (`ARE_BYTES[μ, 0]`, weighted by μ), and trace generation splits a row
+// whose count would exceed `MU_MAX`.
 
-/// Presence: μ is IS_HALF-checked weighted by itself, so an out-of-range value
+/// Presence: μ is ARE_BYTES-checked weighted by itself, so an out-of-range value
 /// `v` always lands on the bus with weight `v ≠ 0`.
 #[test]
 fn test_lt_bounds_its_multiplicity() {

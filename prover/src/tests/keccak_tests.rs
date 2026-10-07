@@ -5,6 +5,9 @@
 // constraint level while on the bus a μ = −1 row inverts a range check (carrier).
 // KECCAK does not deduplicate (one row per hash, μ ∈ {0,1}), so `MuIsBit`
 // (μ·(1−μ)=0) is the right fix and forbids μ = −1.
+//
+// DEFENSIVE: this is a constraint-presence regression (μ ∉ {0,1} is rejected), not
+// an end-to-end forgery. The carrier was confirmed structurally, not demonstrated.
 
 use crate::tables::keccak::{KeccakConstraints, KeccakOperation, cols, generate_keccak_trace};
 use crate::tables::types::FE;

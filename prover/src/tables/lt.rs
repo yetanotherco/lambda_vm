@@ -22,8 +22,7 @@
 //!
 //! ## Bus Interactions
 //! - Sender: MSB16 (×2 for lhs_msb, rhs_msb)
-//! - Sender: IS_HALFWORD (×6: ×4 for lhs_sub_rhs, ×1 for lhs[1], ×1 for rhs[1];
-//!   )
+//! - Sender: IS_HALFWORD (×6: ×4 for lhs_sub_rhs, ×1 for lhs[1], ×1 for rhs[1])
 //! - Sender: ARE_BYTES (×1 for the μ multiplicity bound)
 //! - Receiver: ALU (all less-than lookups — CPU SLT/BLT/BGE dispatch and the
 //!   internal `memw`/`memw_aligned`/`dvrm` timestamp / |r|<|d| checks)

@@ -311,7 +311,7 @@ fn test_bus_interactions_count() {
     // - 2x MUL senders (n_sub_r = d*q lo + hi)
     // - 6x ZERO senders (C3×2 NEG r, C5×2 NEG d, C8 overflow, C17 div_by_zero)
     // - 2x DVRM receivers (quotient, remainder)
-    // - 2x IS_HALF senders bounding the multiplicities (μ_q, μ_r)
+    // - 2x ARE_BYTES senders bounding the multiplicities (μ_q, μ_r)
     // Total: 8 + 12 + 3 + 1 + 2 + 6 + 2 + 2 = 36
     assert_eq!(interactions.len(), 36, "Expected 36 bus interactions");
 }
@@ -559,11 +559,11 @@ fn neg_template_zero_lookups_dedup_per_chip_instance() {
 
 // Soundness regression: μ_q/μ_r are bounded, non-negative multiplicities.
 // Every DVRM check fires with μ_q + μ_r, so a free μ_r = −1 next to μ_q = 1
-// switched them all off (`multiplicity_forgery_poc`). Each μ is now IS_HALF-checked
+// switched them all off (`multiplicity_forgery_poc`). Each μ is now ARE_BYTES-checked
 // weighted by itself, and trace generation splits a row whose count would
 // exceed `MU_MAX`.
 
-/// Presence: each multiplicity is IS_HALF-checked weighted by itself, so an
+/// Presence: each multiplicity is ARE_BYTES-checked weighted by itself, so an
 /// out-of-range value `v` always lands on the bus with weight `v ≠ 0`.
 #[test]
 fn test_dvrm_bounds_its_multiplicities() {
