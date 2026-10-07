@@ -41,6 +41,11 @@ pad = 0
 name = "output"
 
 [[constraints.output]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+
+[[constraints.output]]
 kind = "interaction"
 tag = "ECALL"
 input = ["timestamp", ["cast", ["-", ["^", 2, 64], 2], "DWordWL"]]

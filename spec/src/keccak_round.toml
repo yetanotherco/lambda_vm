@@ -169,6 +169,11 @@ desc = ""
 name = "io"
 
 [[constraints.io]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+
+[[constraints.io]]
 kind = "interaction"
 tag = "KECCAK"
 input = ["timestamp", "round", "start"]
