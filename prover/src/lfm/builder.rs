@@ -155,6 +155,12 @@ impl LfmBuilder {
         self.wrap_hash
     }
 
+    /// The instructions emitted so far, in program order: what a part of the
+    /// program spends by chip is the slice it emitted.
+    pub fn instrs(&self) -> &[Instr] {
+        &self.instrs
+    }
+
     /// ⚠ CENSUS ONLY — the emitted program is NOT executable. Emit the
     /// algebraic constructions in a Poseidon1 width-16 geometry (rate-12
     /// leaves and transcript, 4-ary Merkle walks and cap roots) so the
