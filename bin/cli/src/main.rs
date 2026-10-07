@@ -524,8 +524,8 @@ fn posture_plan(
     target: impl Fn() -> u64,
 ) -> PosturePlan {
     use prover::lfm::block_tree::{
-        POSTURE, POSTURE_TREE_CACHE_KNOB, POSTURE_VRAM_KNOB, POSTURE_VRAM_MIN_GIB,
-        posture_tree_cache_cap,
+        POSTURE, POSTURE_DERIVE_BUILDS_KNOB, POSTURE_TREE_CACHE_KNOB, POSTURE_VRAM_KNOB,
+        POSTURE_VRAM_MIN_GIB, posture_derive_builds, posture_tree_cache_cap,
     };
     let mut plan = PosturePlan {
         set: Vec::new(),
@@ -565,6 +565,22 @@ fn posture_plan(
             continue;
         }
         plan.set.push((name, value));
+    }
+    // The verifier's derive window: set only below its target, else left to
+    // the library (the whole level at once).
+    match env(POSTURE_DERIVE_BUILDS_KNOB) {
+        Some(v) => plan.env.push(format!("{POSTURE_DERIVE_BUILDS_KNOB}={v}")),
+        None => {
+            let target = target();
+            if let Some(window) = posture_derive_builds(target) {
+                plan.notes.push(format!(
+                    "BLOCK POSTURE: {POSTURE_DERIVE_BUILDS_KNOB}={window}: the host target is {:.1} \
+                     GiB, so the block verifier derives a tree level {window} programs at a time",
+                    target as f64 / (1u64 << 30) as f64
+                ));
+                plan.set.push((POSTURE_DERIVE_BUILDS_KNOB, window));
+            }
+        }
     }
     plan
 }
@@ -1810,7 +1826,11 @@ mod tests {
         assert!(big.notes.is_empty());
         let small = posture_plan(none, || Some(31.84), || 54u64 << 30);
         assert_eq!(cap(&small), Some("16"));
-        assert_eq!(small.notes.len(), 1, "the note says why");
+        assert_eq!(
+            small.notes.iter().filter(|n| n.contains(CAP)).count(),
+            1,
+            "the note says why"
+        );
         let set = posture_plan(
             |n| (n == CAP).then(|| "32".to_string()),
             || Some(31.84),
@@ -1818,6 +1838,34 @@ mod tests {
         );
         assert_eq!(cap(&set), None, "the environment's value stays");
         assert_eq!(set.env, vec![format!("{CAP}=32")]);
+    }
+
+    /// The block verifier's derive window follows the host target: left unset
+    /// (the whole level) from a 64 GiB target up, 16 below it with a note, and
+    /// a value the environment sets is left alone.
+    #[test]
+    fn the_derive_window_posture_follows_the_host_target() {
+        use prover::lfm::block_tree::POSTURE_DERIVE_BUILDS_KNOB as WIN;
+        let none = |_: &str| None;
+        let window = |plan: &PosturePlan| plan.set.iter().find(|(n, _)| *n == WIN).map(|(_, v)| *v);
+        let noted = |plan: &PosturePlan| plan.notes.iter().filter(|n| n.contains(WIN)).count();
+        for gib in [64u64, 110] {
+            let big = posture_plan(none, || Some(31.84), || gib << 30);
+            assert_eq!(window(&big), None, "{gib} GiB: the whole level");
+            assert_eq!(noted(&big), 0, "{gib} GiB");
+        }
+        for gib in [54u64, 38, 22] {
+            let small = posture_plan(none, || Some(31.84), || gib << 30);
+            assert_eq!(window(&small), Some("16"), "{gib} GiB");
+            assert_eq!(noted(&small), 1, "{gib} GiB: the note says why");
+        }
+        let set = posture_plan(
+            |n| (n == WIN).then(|| "8".to_string()),
+            || Some(31.84),
+            || 22u64 << 30,
+        );
+        assert_eq!(window(&set), None, "the environment's value stays");
+        assert!(set.env.contains(&format!("{WIN}=8")));
     }
 
     /// The binary runs the allocator posture it compiles in: jemalloc never
