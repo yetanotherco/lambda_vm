@@ -1269,17 +1269,20 @@ fn a_stopped_node_builder_fails_every_empty_slot() {
 /// [`build_levels`] over a toy tree whose programs are their texts (`L3` a
 /// leaf, `N(..)` / `T(..)` a node over its children's): each node's build
 /// sleeps longer the earlier it is in its level, so on a pool the level's
-/// nodes finish in reverse. Returns every slot's content and the order the
-/// builds finished in.
+/// nodes finish in reverse; each finish (`finishers` at once) takes 20 ms.
+/// Returns every slot's content, the order the builds finished in and the
+/// most finishes that ran at once.
 #[allow(clippy::type_complexity)]
 fn toy_tree(
     leaves: usize,
     arities: &[Vec<usize>],
     threads: Option<usize>,
     fail_at: Option<(usize, usize)>,
+    finishers: usize,
 ) -> (
     Vec<Vec<Option<Result<String, String>>>>,
     Vec<(usize, usize)>,
+    usize,
 ) {
     use super::per_table_aggregator::Level;
     let shape: Vec<Level> = arities
@@ -1297,6 +1300,10 @@ fn toy_tree(
         .map(|l| l.arities.iter().map(|_| Published::new()).collect())
         .collect();
     let finished = std::sync::Mutex::new(Vec::new());
+    let (in_flight, most) = (
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+    );
     let pool = threads.map(|n| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
@@ -1312,8 +1319,10 @@ fn toy_tree(
         |node: &String| node,
         |_, _| Ok(()),
         |lv, j, kids: &[&String], top, ()| {
+            // 10 ms a place: wide enough that a busy test host (another test
+            // building real artifacts beside it) cannot reorder the emissions.
             let late = shape[lv].arities.len() - j;
-            std::thread::sleep(std::time::Duration::from_millis(4 * late as u64));
+            std::thread::sleep(std::time::Duration::from_millis(10 * late as u64));
             finished.lock().expect("the log").push((lv, j));
             if fail_at == Some((lv, j)) {
                 return Err(format!("node ({lv}, {j}) does not build"));
@@ -1324,14 +1333,21 @@ fn toy_tree(
         },
         // The finish is where a node takes the card: never on a rayon worker.
         // Its program is already published when it starts.
-        |lv, j, program: String| match rayon::current_thread_index() {
-            None if programs[lv][j].0.get() == Some(&Ok(program.clone())) => Ok(program),
-            None => Err(format!(
-                "node ({lv}, {j}) finished before its program was published"
-            )),
-            Some(w) => Err(format!("node ({lv}, {j}) finished on rayon worker {w}")),
+        |lv, j, program: String| {
+            use std::sync::atomic::Ordering::SeqCst;
+            most.fetch_max(in_flight.fetch_add(1, SeqCst) + 1, SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            in_flight.fetch_sub(1, SeqCst);
+            match rayon::current_thread_index() {
+                None if programs[lv][j].0.get() == Some(&Ok(program.clone())) => Ok(program),
+                None => Err(format!(
+                    "node ({lv}, {j}) finished before its program was published"
+                )),
+                Some(w) => Err(format!("node ({lv}, {j}) finished on rayon worker {w}")),
+            }
         },
         pool.as_ref(),
+        finishers,
     );
     // Every slot's program is published too, and agrees with its node (the
     // error included).
@@ -1349,7 +1365,11 @@ fn toy_tree(
         .iter()
         .map(|level| level.iter().map(|s| s.0.get().cloned()).collect())
         .collect();
-    (got, finished.into_inner().expect("the log"))
+    (
+        got,
+        finished.into_inner().expect("the log"),
+        most.into_inner(),
+    )
 }
 
 /// The median's tree shape: 23 leaves at fan-in 3.
@@ -1392,7 +1412,7 @@ fn the_node_pipe_builds_the_serial_builders_nodes_in_any_completion_order() {
     let arities = median_arities();
     let want = toy_want(23, &arities);
     for threads in [None, Some(2), Some(3), Some(4)] {
-        let (got, finished) = toy_tree(23, &arities, threads, None);
+        let (got, finished, _) = toy_tree(23, &arities, threads, None, 1);
         assert_eq!(got, want, "{threads:?} threads");
         let level0: Vec<usize> = finished
             .iter()
@@ -1415,7 +1435,7 @@ fn a_failing_node_build_fails_every_node_above_it() {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let arities = vec![vec![3, 3, 3, 3, 3, 3, 3, 2], vec![3, 3, 2], vec![3]];
-        let _ = tx.send(toy_tree(23, &arities, Some(3), Some((0, 2))).0);
+        let _ = tx.send(toy_tree(23, &arities, Some(3), Some((0, 2)), 1).0);
     });
     let got = rx
         .recv_timeout(std::time::Duration::from_secs(20))
@@ -1431,6 +1451,115 @@ fn a_failing_node_build_fails_every_node_above_it() {
                 "slot ({lv}, {j}) above a failed build: {slot:?}"
             );
         }
+    }
+}
+
+/// ★ With `finishers` above 1 the nodes' finishes (where a node waits for the
+/// card and builds its artifacts) run at once on plain threads of their own,
+/// never on a rayon worker, each after its program is published, and the tree
+/// is the one-finisher tree: the median's shape, pools of 2 and 4, 1 / 2 / 4
+/// finishers. One finisher never overlaps two finishes; more do.
+#[test]
+fn node_finishers_finish_at_once_off_rayon_and_build_the_same_tree() {
+    let arities = median_arities();
+    let want = toy_want(23, &arities);
+    for threads in [Some(2), Some(4)] {
+        for finishers in [1, 2, 4] {
+            let (got, _, most) = toy_tree(23, &arities, threads, None, finishers);
+            assert_eq!(got, want, "{threads:?} threads, {finishers} finishers");
+            if finishers == 1 {
+                assert_eq!(most, 1, "{threads:?} threads: one finisher overlapped");
+            } else {
+                assert!(
+                    most >= 2,
+                    "{threads:?} threads, {finishers} finishers: never two finishes at once"
+                );
+            }
+        }
+    }
+}
+
+/// A tiny real program, one per toy node: its arena's length (and so its
+/// columns and its id) follows `seed`.
+fn tiny_node_program(seed: usize) -> super::compiler::LfmProgram {
+    let mut b =
+        super::builder::LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let n = 2 + seed % 7;
+    let arena = b.declare_arena(n as u32);
+    let mut acc = b.hint_felt(arena, 0);
+    for i in 1..n {
+        let x = b.hint_felt(arena, i as u32);
+        acc = b.add(acc, x);
+    }
+    b.public(acc.as_cell());
+    let program = super::compiler::compile(b.finish());
+    super::validator::validate(&program).expect("a tiny node program is admissible");
+    program
+}
+
+/// ★ Bytes and ids do not depend on the finishers: a toy tree whose nodes are
+/// tiny real programs (one per node, from its children's texts), each finish
+/// building the node's real artifacts ([`artifacts_of`]); 1, 2 and 4 finishers
+/// build equal artifacts (program ids, roots and heights) for every node.
+#[test]
+fn node_finishers_build_the_same_artifacts() {
+    use super::per_table_aggregator::Level;
+    let shape: Vec<Level> = [vec![3, 3, 3], vec![3]]
+        .into_iter()
+        .map(|arities| Level { arities })
+        .collect();
+    let leaf_text: Vec<String> = (0..9).map(|k| format!("L{k}")).collect();
+    let wrap = aggregation_wrap_options();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .expect("a pool");
+    let run = |finishers: usize| -> Vec<Vec<super::registry::LfmArtifacts>> {
+        let node_slots = || -> Vec<Vec<Published<(String, super::registry::LfmArtifacts)>>> {
+            shape
+                .iter()
+                .map(|l| l.arities.iter().map(|_| Published::new()).collect())
+                .collect()
+        };
+        let slots = node_slots();
+        let programs: Vec<Vec<Published<String>>> = shape
+            .iter()
+            .map(|l| l.arities.iter().map(|_| Published::new()).collect())
+            .collect();
+        build_levels(
+            &shape,
+            &|i: usize| -> Result<&String, String> { Ok(&leaf_text[i]) },
+            leaf_text.len(),
+            &programs,
+            &slots,
+            |node: &(String, super::registry::LfmArtifacts)| &node.0,
+            |_, _| Ok(()),
+            |_, j, kids: &[&String], top, ()| {
+                let kids: Vec<&str> = kids.iter().map(|k| k.as_str()).collect();
+                let text = format!("{}({})", if top { "T" } else { "N" }, kids.join(","));
+                let program = tiny_node_program(text.len() + j);
+                Ok((text.clone(), (text, program)))
+            },
+            |_, _, (text, program): (String, super::compiler::LfmProgram)| {
+                Ok((text, artifacts_of(&program, &wrap)))
+            },
+            Some(&pool),
+            finishers,
+        );
+        slots
+            .iter()
+            .map(|level| {
+                level
+                    .iter()
+                    .map(|s| s.wait().expect("a node").1.clone())
+                    .collect()
+            })
+            .collect()
+    };
+    let one = run(1);
+    assert_eq!(one.iter().map(Vec::len).collect::<Vec<_>>(), vec![3, 1]);
+    for finishers in [2, 4] {
+        assert_eq!(run(finishers), one, "{finishers} finishers");
     }
 }
 
@@ -1511,6 +1640,7 @@ fn toy_tree_over_published_leaves(
                 },
                 |_, _, program: String| Ok(program),
                 pool.as_ref(),
+                1,
             );
         });
         let got: Vec<Vec<Option<Result<String, String>>>> = slots
@@ -1686,6 +1816,7 @@ fn toy_budget_tree(
     threads: Option<usize>,
     room: super::program_budget::Room,
     ahead: usize,
+    finishers: usize,
 ) -> Option<(
     Vec<Vec<Option<Result<String, String>>>>,
     usize,
@@ -1781,6 +1912,7 @@ fn toy_budget_tree(
                     },
                     |_, _, text: String| Ok(text),
                     pool.as_ref(),
+                    finishers,
                 )
             });
             std::thread::scope(|scope| {
@@ -1846,7 +1978,8 @@ fn toy_budget_tree(
 /// ★ No room at all (a one-byte budget; every program comes in among the next
 /// `ahead` the provers will take): the tree still completes with the same
 /// nodes, serially and on pools of 1 to 4 threads, ahead 1 and
-/// [`super::program_budget::AHEAD`]. The leaves' artifacts go out before the
+/// [`super::program_budget::AHEAD`], with 1 node finisher and 4. The leaves'
+/// artifacts go out before the
 /// first missing program; holding them across it (or provers that never claim)
 /// deadlocks, which the bounded run turns into a failure. With room, every leaf
 /// comes in at once and the artifacts go out together, as before the budget.
@@ -1854,10 +1987,20 @@ fn toy_budget_tree(
 fn a_one_byte_budget_cannot_deadlock_the_w3_tree() {
     use super::program_budget::{AHEAD, Room};
     let want = toy_want(23, &median_arities());
-    for threads in [None, Some(1), Some(2), Some(4)] {
+    for (threads, finishers) in [
+        (None, 1),
+        (Some(1), 1),
+        (Some(2), 1),
+        (Some(4), 1),
+        (Some(4), 4),
+    ] {
         for ahead in [1, AHEAD] {
-            let (got, upto, from, summary, kept) = toy_budget_tree(threads, Room::Bytes(1), ahead)
-                .unwrap_or_else(|| panic!("{threads:?} threads, ahead {ahead}: the tree hung"));
+            let (got, upto, from, summary, kept) =
+                toy_budget_tree(threads, Room::Bytes(1), ahead, finishers).unwrap_or_else(|| {
+                    panic!(
+                        "{threads:?} threads, {finishers} finishers, ahead {ahead}: the tree hung"
+                    )
+                });
             assert_eq!(got, want, "{threads:?} threads, ahead {ahead}");
             assert_eq!(kept, 0, "{threads:?} threads: programs never let go");
             assert_eq!(upto, ahead, "{threads:?} threads: leaves in at once");
@@ -1875,7 +2018,7 @@ fn a_one_byte_budget_cannot_deadlock_the_w3_tree() {
         }
     }
     let (got, upto, from, summary, kept) =
-        toy_budget_tree(Some(4), Room::Unbounded, AHEAD).expect("the roomy tree hung");
+        toy_budget_tree(Some(4), Room::Unbounded, AHEAD, 1).expect("the roomy tree hung");
     assert_eq!(got, want);
     assert_eq!(kept, 0, "programs never let go");
     assert_eq!(
@@ -1963,6 +2106,7 @@ fn split_slot_flow(workers: usize) -> Vec<Vec<FlowStamps>> {
                     Ok((format!("A{lv}.{j}"), ms()))
                 },
                 Some(&pool),
+                1,
             )
         });
         prove_dataflow(

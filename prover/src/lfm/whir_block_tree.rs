@@ -160,6 +160,11 @@ pub struct WhirTreeConfig {
     /// level proving as its own nodes arrive; or (0, the control) one after
     /// another on one thread, level 1 waiting for the whole tree's builds.
     pub node_pipe: Option<usize>,
+    /// `W3_NODE_FINISHERS=<k>` (default 1): with the node pipe, each node's
+    /// artifacts built on one of k plain threads as its program arrives, so k
+    /// builds wait for the card at once; 1 builds them one after another on the
+    /// builder's thread (I-WFULL §8).
+    pub node_finishers: usize,
     /// `W3_DATAFLOW=0|1` (default 1): each node proves as soon as its own
     /// children are proved, or (0, the control) once its whole level below is.
     pub dataflow: bool,
@@ -297,6 +302,7 @@ impl WhirTreeConfig {
             format,
             options,
             node_pipe,
+            node_finishers: count_knob("W3_NODE_FINISHERS")?.unwrap_or(1).max(1),
             dataflow: count_knob("W3_DATAFLOW")?.is_none_or(|v| v != 0),
             stream_top: count_knob("W3_STREAM_TOP")?.is_none_or(|v| v != 0),
             exec_early: count_knob("W3_EXEC_EARLY")?.is_none_or(|v| v != 0),
@@ -654,14 +660,17 @@ pub(crate) fn publish_each<I, T>(
 /// proofs, so the whole tree can be built while the leaves prove.
 ///
 /// With `pool`, as many plain threads as the pool has take a level's nodes in
-/// order, each admitting its node there and emitting it on the pool, and this
-/// thread finishes each as its emission ends and publishes it into ITS OWN
-/// slot, whatever order they finish in; without, admitted, emitted and finished
+/// order, each admitting its node there and emitting it on the pool, and each
+/// node is finished as its emission ends and published into ITS OWN slot,
+/// whatever order they finish in: on this thread, or with `finishers` above 1
+/// on that many plain threads of their own, so that many finishes wait for the
+/// card at once (one by one, each waited ≈ 1.7 s behind a leaf's prove for a
+/// 0.15 s hold, I-WFULL §8.1). Without `pool`, admitted, emitted and finished
 /// one after another here. An admission never waits on a rayon worker, nor
-/// ahead of a finish another node's prover needs. `finish` always runs on this
-/// thread, never on a rayon worker: a worker that waits inside rayon while it
-/// holds the card runs queued jobs meanwhile, and a sibling that takes the card
-/// is a second hold on one thread (BIG 569). A node's program is published as
+/// ahead of a finish another node's prover needs. `finish` never runs on a
+/// rayon worker: a worker that waits inside rayon while it holds the card runs
+/// queued jobs meanwhile, and a sibling that takes the card is a second hold
+/// on one thread (BIG 569). A node's program is published as
 /// its emission ends, before its finish starts and whatever the other nodes'
 /// finishes are waiting for. A build that fails leaves its error in its slots,
 /// and every slot still empty when this returns or unwinds gets one
@@ -676,8 +685,9 @@ pub(crate) fn build_levels<'l, C: Sync, A: Send, E: Send + Sync, P: Send, N: Sen
     shape_of: impl Fn(&N) -> &C + Sync,
     admit: impl Fn(usize, usize) -> Result<A, String> + Sync,
     emit: impl Fn(usize, usize, &[&C], bool, A) -> Result<(E, P), String> + Sync,
-    finish: impl Fn(usize, usize, P) -> Result<N, String>,
+    finish: impl Fn(usize, usize, P) -> Result<N, String> + Sync,
     pool: Option<&rayon::ThreadPool>,
+    finishers: usize,
 ) {
     let _fail_programs = FailUnpublished(programs);
     let _fail = FailUnpublished(slots);
@@ -744,6 +754,20 @@ pub(crate) fn build_levels<'l, C: Sync, A: Send, E: Send + Sync, P: Send, N: Sen
         match pool {
             Some(pool) => {
                 let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<P, String>)>();
+                // Shared by the finishers (one take at a time, released before
+                // the finish).
+                let rx = std::sync::Mutex::new(rx);
+                // Each node finished as its program arrives: on this thread,
+                // or on `finishers` plain threads of their own.
+                let finishes = || {
+                    while let Ok((j, rest)) = rx
+                        .lock()
+                        .map_err(|_| ())
+                        .and_then(|r| r.recv().map_err(|_| ()))
+                    {
+                        let _ = slots[lv][j].0.set(rest.and_then(|p| finish(lv, j, p)));
+                    }
+                };
                 let next = std::sync::atomic::AtomicUsize::new(0);
                 std::thread::scope(|scope| {
                     for _ in 0..pool.current_num_threads().max(1) {
@@ -766,10 +790,12 @@ pub(crate) fn build_levels<'l, C: Sync, A: Send, E: Send + Sync, P: Send, N: Sen
                         });
                     }
                     drop(tx);
-                    // This thread, not a pool worker, finishes each node as
-                    // its program arrives.
-                    for (j, rest) in rx {
-                        let _ = slots[lv][j].0.set(rest.and_then(|p| finish(lv, j, p)));
+                    if finishers <= 1 {
+                        finishes();
+                    } else {
+                        for _ in 0..finishers {
+                            scope.spawn(finishes);
+                        }
                     }
                 });
             }
@@ -809,6 +835,7 @@ pub(crate) fn build_nodes(
     words: usize,
     t_tree: std::time::Instant,
     pool: Option<&rayon::ThreadPool>,
+    finishers: usize,
     budget: Option<&TreeBudget>,
 ) {
     type Emitted = (NodeProgram, (std::sync::Arc<Admitted>, f64));
@@ -864,6 +891,7 @@ pub(crate) fn build_nodes(
             })
         },
         pool,
+        finishers,
     );
 }
 
@@ -1128,6 +1156,7 @@ pub(crate) fn prove_tree_pipelined(
     leaves_each: bool,
     early: Option<EarlyLeaf>,
     node_pipe: Option<&rayon::ThreadPool>,
+    node_finishers: usize,
     dataflow: bool,
     stream_top: Option<&std::sync::OnceLock<bool>>,
     exec_early: bool,
@@ -1204,7 +1233,17 @@ pub(crate) fn prove_tree_pipelined(
         // 2. the nodes' programs and artifacts, into their slots.
         let builder = outer.spawn(|| {
             build_nodes(
-                plan, &shape, &built, &programs, &slots, &wrap, words, t_tree, node_pipe, budget,
+                plan,
+                &shape,
+                &built,
+                &programs,
+                &slots,
+                &wrap,
+                words,
+                t_tree,
+                node_pipe,
+                node_finishers,
+                budget,
             )
         });
         let each_from = std::thread::scope(|scope| {
@@ -1887,6 +1926,7 @@ pub fn prove_whir_block_tree(
         cfg.leaves_each,
         early,
         node_pipe.as_ref(),
+        cfg.node_finishers,
         dataflow,
         stream_top.then_some(&top_streamed),
         exec_early,
@@ -2017,8 +2057,9 @@ pub fn prove_whir_block_tree(
         "W3 NODE PIPE: {}",
         match &node_pipe {
             Some(pool) => format!(
-                "on ({} builder threads; each level proves as its own nodes arrive)",
-                pool.current_num_threads()
+                "on ({} builder threads; each level proves as its own nodes arrive) · node artifacts on {} finisher thread(s)",
+                pool.current_num_threads(),
+                cfg.node_finishers
             ),
             None => "off (one builder thread; level 1 waits for the whole tree)".to_string(),
         }
@@ -2316,6 +2357,7 @@ mod tests {
             format: BlockFormat::production(),
             options: BlockOptions::production(),
             node_pipe: Some(4),
+            node_finishers: 1,
             dataflow: true,
             stream_top: true,
             exec_early: true,
