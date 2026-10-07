@@ -294,15 +294,17 @@ pub fn precomputed_tree_cache_stats() -> (usize, u64, u64, u64) {
 /// `OnceLock` read from the environment; a test that could only reach it through
 /// that would exercise the UNBOUNDED path and pass whatever the eviction did —
 /// a check that cannot fail.
+/// Returns the keys it evicted.
 fn precomputed_tree_insert_capped(
     map: &mut PrecomputedTreeMap,
     root: PrecomputedTreeKey,
     tree: Arc<dyn std::any::Any + Send + Sync>,
     cap: Option<usize>,
-) {
+) -> Vec<PrecomputedTreeKey> {
     let tick = PRECOMPUTED_TREE_TICK.fetch_add(1, Ordering::Relaxed);
     map.insert(root, (tick, tree));
-    let Some(cap) = cap else { return };
+    let mut evicted = Vec::new();
+    let Some(cap) = cap else { return evicted };
     while map.len() > cap {
         // The cap is tens of entries, so this scan is cheaper than maintaining
         // an order. `expect` is unreachable: the loop condition implies len > 0.
@@ -312,8 +314,10 @@ fn precomputed_tree_insert_capped(
             .map(|(k, _)| *k)
             .expect("a map with len > cap >= 1 is non-empty");
         map.remove(&lru);
+        evicted.push(lru);
         PRECOMPUTED_TREE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
     }
+    evicted
 }
 
 /// ★★ HOW MANY DISTINCT SHAPES THE TWO PROCESS-GLOBAL CACHES HOLD.
@@ -367,6 +371,22 @@ pub fn precomputed_tree_cache_entries() -> usize {
 static PRECOMPUTED_TREE_HITS: AtomicU64 = AtomicU64::new(0);
 static PRECOMPUTED_TREE_MISSES: AtomicU64 = AtomicU64::new(0);
 
+/// The node bytes of each tree the cache holds now, by key: inserts add, the
+/// cap's evictions remove ([`precomputed_tree_cache_live_bytes`]).
+fn precomputed_tree_live() -> &'static Mutex<std::collections::HashMap<PrecomputedTreeKey, u64>> {
+    static LIVE: OnceLock<Mutex<std::collections::HashMap<PrecomputedTreeKey, u64>>> =
+        OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The node bytes the precomputed-tree cache holds now (a measurement).
+pub fn precomputed_tree_cache_live_bytes() -> u64 {
+    precomputed_tree_live()
+        .lock()
+        .map(|m| m.values().sum())
+        .unwrap_or(0)
+}
+
 /// `(hits, misses)` on the precomputed-tree cache since the process started.
 pub fn precomputed_tree_cache_hit_miss() -> (u64, u64) {
     (
@@ -409,12 +429,18 @@ pub(crate) fn precomputed_tree_cache_put<B: IsMerkleTreeBackend + 'static>(
     rows_per_leaf: usize,
     tree: Arc<MerkleTree<B>>,
 ) {
-    precomputed_tree_insert_capped(
+    let bytes = std::mem::size_of_val(tree.nodes()) as u64;
+    let evicted = precomputed_tree_insert_capped(
         &mut precomputed_tree_cache().lock().unwrap(),
         (root, rows_per_leaf),
         tree as Arc<dyn std::any::Any + Send + Sync>,
         precomputed_tree_cache_cap(),
     );
+    let mut live = precomputed_tree_live().lock().unwrap();
+    for key in evicted {
+        live.remove(&key);
+    }
+    live.insert((root, rows_per_leaf), bytes);
 }
 
 /// A container for the results of the first round of the STARK Prove protocol.

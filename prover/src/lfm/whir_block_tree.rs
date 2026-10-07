@@ -503,6 +503,21 @@ pub(crate) struct ProgramTimes {
     pub(crate) split: Option<(f64, f64, f64, f64)>,
 }
 
+/// One `ALLOC PEAK <phase>` line, when the watermark monitor runs: the phase's
+/// highest VmRSS reading with jemalloc's allocated (live) and resident bytes
+/// at it ([`crate::alloc_purge::peak_window`]), and the precomputed-tree
+/// cache's live bytes now. Under the pipelined tree a level's window runs from
+/// the line before to its last proof, so it overlaps the level above.
+fn alloc_peak_line(say: &dyn Fn(&str), phase: &str) {
+    if let Some(peak) = crate::alloc_purge::peak_window() {
+        say(&format!(
+            "ALLOC PEAK {phase}: {peak} · tree cache live {:.2} GiB ({} entries)",
+            stark::prover::precomputed_tree_cache_live_bytes() as f64 / (1u64 << 30) as f64,
+            stark::prover::precomputed_tree_cache_entries()
+        ));
+    }
+}
+
 /// The split of the prove that just ran on this thread.
 pub(crate) fn prove_split_now() -> Option<(f64, f64, f64, f64)> {
     take_prove_split().map(|s| (s.execute, s.fill, s.multi_prove, s.permit_wait))
@@ -1385,6 +1400,9 @@ pub(crate) fn prove_tree_pipelined(
                 // The level's last program: its freed pages back to the OS
                 // before the levels above go on, where the host is short.
                 let left = remaining[at.lv].fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                if left == 1 {
+                    alloc_peak_line(say, &format!("level-{}", at.lv));
+                }
                 if left == 1 && at.lv + 1 < remaining.len() {
                     crate::alloc_purge::purge_after_level(at.lv, target, say);
                 }
@@ -1765,6 +1783,7 @@ pub fn prove_whir_block_tree(
     });
     let (proof, stamps) = proved.map_err(|e| format!("the block proves: {e}"))?;
     let base = t0.elapsed().as_secs_f64();
+    alloc_peak_line(&|l: &str| sink.line(l), "base");
     // The base's freed pages back to the OS before the tree allocates: when
     // the block found its memory short, or as `LAMBDA_VM_ALLOC_PURGE` names it
     // (`alloc_purge`).
