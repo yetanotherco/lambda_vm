@@ -155,6 +155,13 @@ impl BranchOperation {
 /// bound keeps μ non-negative: without it a `μ = −1` twin of an honest row
 /// cancels it on the BRANCH bus while *receiving* its range lookups, absorbing
 /// another row's out-of-range limb (same bug as LT).
+///
+/// The bound rides the ARE_BYTES bus, which the limb range checks
+/// (IS_HALFWORD) never use. That is what closes it: an IS_HALFWORD-bus
+/// bound could be cancelled by a non-canonical limb `(p−1, b+1)` (same
+/// packed value, passes every constraint) sending `IS_HALFWORD[p−1]`;
+/// on ARE_BYTES no limb can reach the `p−1` tuple, so a `μ = −1` row's
+/// bound send has no receiver and the whole proof is rejected.
 pub const MU_MAX: u64 = (1 << 8) - 1;
 
 /// Deduplicates BRANCH operations into trace rows: `(pc, offset, register,

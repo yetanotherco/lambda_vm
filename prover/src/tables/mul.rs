@@ -287,6 +287,13 @@ impl MulOperation {
 /// lookups of each kind. The bound is what makes `μ_lo + μ_hi = 0` imply
 /// `μ_lo = μ_hi = 0`: without it a `μ_lo = 1, μ_hi = −1` row receives a lookup
 /// while sending none of its range checks.
+///
+/// The bound rides the ARE_BYTES bus, which the limb range checks
+/// (IS_HALFWORD) never use. That is what closes it: an IS_HALFWORD-bus
+/// bound could be cancelled by a non-canonical limb `(p−1, b+1)` (same
+/// packed value, passes every constraint) sending `IS_HALFWORD[p−1]`;
+/// on ARE_BYTES no limb can reach the `p−1` tuple, so a `μ = −1` row's
+/// bound send has no receiver and the whole proof is rejected.
 pub const MU_MAX: u64 = (1 << 8) - 1;
 
 /// Deduplicates MUL operations into trace rows: `(lhs, lhs_signed, rhs,
