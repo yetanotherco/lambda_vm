@@ -488,6 +488,20 @@ fn leaf_estimates(plan: &BlockTreePlan, first: &LfmProgram) -> Vec<u64> {
         .collect()
 }
 
+/// One `ALLOC PEAK <phase>` line, when the watermark monitor runs: the phase's
+/// highest VmRSS reading with jemalloc's allocated (live) and resident bytes
+/// at it ([`crate::alloc_purge::peak_window`]), and the precomputed-tree
+/// cache's live bytes now.
+fn alloc_peak_line(sink: &dyn BlockTreeSink, phase: &str) {
+    if let Some(peak) = crate::alloc_purge::peak_window() {
+        sink.line(&format!(
+            "ALLOC PEAK {phase}: {peak} · tree cache live {:.2} GiB ({} entries)",
+            stark::prover::precomputed_tree_cache_live_bytes() as f64 / (1u64 << 30) as f64,
+            stark::prover::precomputed_tree_cache_entries()
+        ));
+    }
+}
+
 /// [`late_trigger`]'s settle rule: the heap's live bytes have made no new low
 /// by [`LATE_LOW_STEP`] for this long (spill on: phase B holds only its
 /// read-back window, so the live bytes stop falling long before the programs'
@@ -1295,6 +1309,7 @@ pub(super) fn compose_block_tree_with(
             if top { " (the top)" } else { "" }
         ));
         walls.push(wall);
+        alloc_peak_line(sink, &format!("level-{}", lv + 1));
         // `LAMBDA_VM_TREE_LEVEL_PURGE`: the level's freed pages back to the OS
         // before the next level, only where the host is short.
         if !top {
@@ -1725,6 +1740,7 @@ pub fn prove_block_tree(
         pct(base_peak)
     ));
 
+    alloc_peak_line(&*sink, "base");
     // The base's freed pages back to the OS before the tree allocates: under
     // memory pressure by default, or as `LAMBDA_VM_ALLOC_PURGE` names it
     // (counted in the whole run, in no phase's wall).
@@ -1972,6 +1988,7 @@ pub fn prove_block_tree(
         "   BLOCK LEVEL 0: {k} leaves in {level0:.2}s · host peak {l0_peak:.3} GiB{}",
         pct(l0_peak)
     ));
+    alloc_peak_line(&*sink, "level-0");
     crate::alloc_purge::purge_after_level(0, crate::block::spill_target_bytes(), &|l: &str| {
         sink.line(l)
     });

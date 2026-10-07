@@ -296,6 +296,36 @@ const WATERMARK_TICK: std::time::Duration = std::time::Duration::from_millis(500
 /// The least time between two fires.
 pub const WATERMARK_SPACING: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The highest-VmRSS reading the watermark monitor took since the window was
+/// last read ([`peak_window`]): VmRSS, jemalloc's allocated and resident
+/// bytes, and the seconds since the monitor started.
+#[derive(Clone, Copy, Debug, Default)]
+struct PeakSample {
+    rss: u64,
+    allocated: u64,
+    resident: u64,
+    at: f64,
+}
+
+static PEAK: std::sync::Mutex<Option<PeakSample>> = std::sync::Mutex::new(None);
+
+/// The window's highest-VmRSS reading in words, and a new window; `None`
+/// without a running monitor (or before its first reading). A phase's
+/// `ALLOC PEAK` line: its live heap (allocated) against what the allocator holds
+/// (resident) at its highest VmRSS, read every [`WATERMARK_TICK`].
+pub fn peak_window() -> Option<String> {
+    let sample = PEAK.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    Some(format!(
+        "VmRSS {:.2} GiB at {:.1}s · jemalloc allocated {:.2} · resident {:.2} (resident − allocated {:.2})",
+        gib(sample.rss),
+        sample.at,
+        gib(sample.allocated),
+        gib(sample.resident),
+        gib(sample.resident.saturating_sub(sample.allocated))
+    ))
+}
+
 /// What [`WATERMARK_ENV`] says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatermarkSetting {
@@ -334,31 +364,35 @@ pub struct Watermark {
     stop: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     handle: Option<std::thread::JoinHandle<(usize, f64)>>,
     target: u64,
+    purges: bool,
 }
 
-/// Starts the watermark monitor against the host `target` (bytes), unless
-/// [`WATERMARK_ENV`] says `off` (or is nonsense, which it prints) or the build
-/// cannot read the allocator.
+/// Starts the watermark monitor against the host `target` (bytes), unless the
+/// build cannot read the allocator. Under [`WATERMARK_ENV`] `off` (or
+/// nonsense, which it prints) it only samples, for the `ALLOC PEAK` lines
+/// ([`peak_window`]), and never purges.
 pub fn start_watermark(target: u64) -> Option<Watermark> {
-    match parse_watermark(std::env::var(WATERMARK_ENV).ok().as_deref()) {
-        Ok(WatermarkSetting::Auto) => {}
-        Ok(WatermarkSetting::Off) => return None,
+    let purges = match parse_watermark(std::env::var(WATERMARK_ENV).ok().as_deref()) {
+        Ok(WatermarkSetting::Auto) => true,
+        Ok(WatermarkSetting::Off) => false,
         Err(why) => {
-            eprintln!("ALLOC WATERMARK: {why}; not started");
-            return None;
+            eprintln!("ALLOC WATERMARK: {why}; sampling only");
+            false
         }
-    }
+    };
     let hooks = hooks()?;
+    *PEAK.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let stop = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let flag = stop.clone();
     let handle = std::thread::Builder::new()
         .name("alloc-watermark".to_string())
-        .spawn(move || watch(hooks, target, &flag))
+        .spawn(move || watch(hooks, target, purges, &flag))
         .ok()?;
     Some(Watermark {
         stop,
         handle: Some(handle),
         target,
+        purges,
     })
 }
 
@@ -367,6 +401,7 @@ pub fn start_watermark(target: u64) -> Option<Watermark> {
 fn watch(
     hooks: AllocatorHooks,
     target: u64,
+    purges: bool,
     stop: &(std::sync::Mutex<bool>, std::sync::Condvar),
 ) -> (usize, f64) {
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
@@ -382,12 +417,24 @@ fn watch(
         if *stopped {
             return (fires, secs);
         }
+        let resident = crate::lfm::program_budget::resident_bytes();
+        let stats = (hooks.stats)();
+        if let (Some(rss), Some(st)) = (resident, stats) {
+            let mut peak = PEAK.lock().unwrap_or_else(|e| e.into_inner());
+            if peak.is_none_or(|p| rss > p.rss) {
+                *peak = Some(PeakSample {
+                    rss,
+                    allocated: st.allocated as u64,
+                    resident: st.resident as u64,
+                    at: t0.elapsed().as_secs_f64(),
+                });
+            }
+        }
         let pressure = PRESSURE.load(std::sync::atomic::Ordering::Relaxed);
-        if !pressure {
+        if !purges || !pressure {
             continue;
         }
-        let resident = crate::lfm::program_budget::resident_bytes();
-        let freed = (hooks.stats)().map(|s| s.resident.saturating_sub(s.allocated) as u64);
+        let freed = stats.map(|s| s.resident.saturating_sub(s.allocated) as u64);
         if !watermark_fires(pressure, resident, freed, target, last.map(|l| l.elapsed())) {
             continue;
         }
@@ -421,6 +468,9 @@ impl Watermark {
     /// Stops the monitor and says what it did: the `ALLOC WATERMARK end` line.
     pub fn finish(mut self) -> String {
         let (fires, secs) = self.stop().unwrap_or((0, 0.0));
+        if !self.purges {
+            return "ALLOC WATERMARK end: off (sampling only), 0 fire(s)".to_string();
+        }
         format!(
             "ALLOC WATERMARK end: {fires} fire(s), Σ {secs:.2}s (auto: memory pressure, VmRSS ≥ \
              {WATERMARK_SHARE:.2} × {:.2} GiB, ≥ {} GiB freed, ≥ {}s apart)",
@@ -604,13 +654,20 @@ mod tests {
         );
     }
 
-    /// `off` starts no monitor; a started one stops and reports its fires.
+    /// A started monitor samples (a peak window to read), stops, and reports
+    /// its fires.
     #[test]
     fn the_watermark_monitor_starts_and_stops() {
         if std::env::var_os(WATERMARK_ENV).is_some() {
             return;
         }
         let w = start_watermark(u64::MAX).expect("the test build reads its jemalloc");
+        std::thread::sleep(WATERMARK_TICK * 3);
+        // The window needs a VmRSS reading (Linux's /proc); elsewhere it stays empty.
+        if crate::lfm::program_budget::resident_bytes().is_some() {
+            let peak = peak_window().expect("a reading after three ticks");
+            assert!(peak.contains("jemalloc allocated"), "{peak}");
+        }
         let line = w.finish();
         assert!(line.starts_with("ALLOC WATERMARK end: 0 fire(s)"), "{line}");
     }
