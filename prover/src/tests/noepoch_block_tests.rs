@@ -913,12 +913,14 @@ fn deep_batching_bits(rows: usize, l: usize, blowup: usize) -> f64 {
 /// ★ Every chunked table keeps its DEEP batching phase above the block's
 /// minimum of record at its cap, whatever height a prover declares under it:
 /// the batch size `L` (composition parts + main and aux columns + next-row
-/// openings) is read from the AIR the verifier builds, and the bits at the cap
-/// are pinned to the campaign calculator's (`danyblock/bits.out`: KECCAK
-/// 129.213 at 2^18, KECCAK_RND 129.429 at 2^16, ECSM 129.488 at 2^17, ECDAS
-/// 129.907 at 2^17). The minimum of record is the query phase (110 queries,
-/// 20 bits of grinding: 128.946), which no table height moves; one doubling
-/// past each cap falls under it, so each cap is the largest that keeps it.
+/// openings) is read from the AIR the verifier builds under the block's
+/// format (LogUp k4 since 4fc4b7b12), and the bits at the cap are pinned to the
+/// campaign calculator's (`danyblock/bits.out`: KECCAK 129.292 at 2^18,
+/// KECCAK_RND 129.626 at 2^16, ECSM 129.721 at 2^17, ECDAS 130.112 at 2^17).
+/// The minimum of record is the query phase (110 queries, 20 bits of grinding:
+/// 128.946), which no table height moves. Each table's largest holding height
+/// is pinned too, exactly (it keeps the minimum, one doubling past it does
+/// not), and each cap sits at or under it.
 #[test]
 fn every_chunked_table_keeps_its_batching_bits_at_its_cap() {
     let opts = crate::lfm::proof::block_base_options();
@@ -935,43 +937,50 @@ fn every_chunked_table_keeps_its_batching_bits_at_its_cap() {
         (query_bits - 128.946).abs() < 1e-3,
         "query phase {query_bits}"
     );
-    let airs: [(&str, crate::test_utils::VmAir, usize, usize, f64); 4] = [
+    // (table, AIR, cap, L, bits at the cap, largest height that keeps the minimum)
+    let airs: [(&str, crate::test_utils::VmAir, usize, usize, f64, usize); 4] = [
         (
             "KECCAK",
             Box::new(crate::test_utils::create_keccak_air(&opts)),
             crate::BLOCK_KECCAK_MAX_ROWS,
-            581,
-            129.213,
+            550,
+            129.292,
+            1 << 18,
         ),
         (
             "KECCAK_RND",
             Box::new(crate::test_utils::create_keccak_rnd_air(&opts)),
             crate::BLOCK_KECCAK_RND_MAX_ROWS,
-            1999,
-            129.429,
+            1743,
+            129.626,
+            1 << 16,
         ),
         (
             "ECSM",
             Box::new(crate::test_utils::create_ecsm_air(&opts)),
             crate::BLOCK_ECSM_MAX_ROWS,
-            960,
-            129.488,
+            817,
+            129.721,
+            1 << 17,
         ),
         (
             "ECDAS",
             Box::new(crate::test_utils::create_ecdas_air(&opts)),
             crate::BLOCK_ECDAS_MAX_ROWS,
-            718,
-            129.907,
+            623,
+            130.112,
+            // Under k4 ECDAS has one spare doubling: 2^18 keeps 129.112 bits.
+            // Raising its cap is a separate gated lever (it moves the chunking
+            // and the proof shape), not part of keeping this check current.
+            1 << 18,
         ),
     ];
-    for (name, air, cap, pinned_l, pinned_bits) in airs {
+    for (name, air, cap, pinned_l, pinned_bits, largest) in airs {
         let (main, aux) = air.trace_layout();
         let parts = air.composition_poly_degree_bound(cap) / cap;
         let l = parts + main + aux + air.trace_ood_next_row_columns().len();
         assert_eq!(l, pinned_l, "{name}: the DEEP batch size moved");
         let at_cap = deep_batching_bits(cap, l, blowup);
-        let past_cap = deep_batching_bits(2 * cap, l, blowup);
         assert!(
             (at_cap - pinned_bits).abs() < 1e-3,
             "{name}: {at_cap:.3} bits at its cap, the calculator reads {pinned_bits}"
@@ -981,14 +990,25 @@ fn every_chunked_table_keeps_its_batching_bits_at_its_cap() {
             "{name}: {at_cap:.3} bits at its cap, under the minimum of record"
         );
         assert!(
-            past_cap < query_bits,
-            "{name}: {past_cap:.3} bits at twice its cap; a larger cap would do"
+            cap <= largest,
+            "{name}: its cap 2^{} is past its largest holding height 2^{}",
+            cap.trailing_zeros(),
+            largest.trailing_zeros()
+        );
+        let at_largest = deep_batching_bits(largest, l, blowup);
+        let past_largest = deep_batching_bits(2 * largest, l, blowup);
+        assert!(
+            at_largest >= query_bits && past_largest < query_bits,
+            "{name}: 2^{} is not its largest holding height ({at_largest:.3} bits there, \
+             {past_largest:.3} at twice it, against {query_bits:.3})",
+            largest.trailing_zeros()
         );
         println!(
-            "BLOCK CAP BITS {name}: L {l}, 2^{} rows {at_cap:.3} bits, 2^{} {past_cap:.3} \
-             (minimum of record {query_bits:.3})",
+            "BLOCK CAP BITS {name}: L {l}, cap 2^{} rows {at_cap:.3} bits; largest holding 2^{} \
+             ({at_largest:.3}), 2^{} {past_largest:.3} (minimum of record {query_bits:.3})",
             cap.trailing_zeros(),
-            cap.trailing_zeros() + 1
+            largest.trailing_zeros(),
+            largest.trailing_zeros() + 1
         );
     }
 }
