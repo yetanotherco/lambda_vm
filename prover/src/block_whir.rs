@@ -1888,6 +1888,15 @@ pub(crate) struct Deviations {
     /// dies or deposits wrong columns, which phase B must refuse, never prove
     /// over.
     pub regen_faults: regen::LiveFaults,
+    /// The rest's regenerator's faults (N3, [`regen::RestRun`]): as
+    /// [`Self::regen_faults`], a table named by its place among the rest's
+    /// dropped tables.
+    pub rest_faults: regen::LiveFaults,
+    /// Both regeneration windows fixed, in bytes (the streamed chunks', the
+    /// rest's), instead of the knobs: a window of one byte admits only its
+    /// frontier, so a phase-B order that takes a class out of its rank order
+    /// cannot complete.
+    pub regen_windows: Option<(u64, u64)>,
     /// `auto`'s target for the host, in bytes, instead of the machine's
     /// ([`spill_target_bytes`]): 0 makes the policy want every table out.
     pub spill_target: Option<u64>,
@@ -2412,7 +2421,14 @@ fn stream_name(table: StreamTable, index: usize) -> String {
 /// were all collected and when the run was built (seconds since the prove
 /// started), how many chunks it handed out, the windows' stamps and `finish`'s
 /// phase marks.
-type BuilderReport = (f64, f64, usize, WindowStamps, Vec<(String, f64)>);
+type BuilderReport = (
+    f64,
+    f64,
+    usize,
+    WindowStamps,
+    Vec<(String, f64)>,
+    Option<crate::tables::trace_builder::RestRegen>,
+);
 
 /// What the builder thread hands the layout thread.
 enum Built {
@@ -2871,7 +2887,11 @@ fn stream_pipelined<'a, R>(
                 )));
             }
             let placed_at = packer.start.elapsed().as_secs_f64();
-            // The rest's tables, after every chunk, in AIR order.
+            // The rest's tables, after every chunk, in AIR order: the first at
+            // the block index after the last chunk's.
+            if let Some(recorder) = recorder {
+                recorder.set_rest_base(shapes.len());
+            }
             let mut placed = Vec::new();
             let mut waiting = std::collections::BTreeMap::new();
             let mut next = 0usize;
@@ -3185,6 +3205,7 @@ fn lay_out_rest_streamed<'a>(
     start: Instant,
     sink: Option<std::sync::mpsc::Sender<RestDone<'a>>>,
     ledger: Option<&memlog::Ledger>,
+    recorder: Option<&regen::Recorder>,
 ) -> Result<RestLaid<'a>, Error> {
     use std::sync::atomic::Ordering::Relaxed;
     let sink =
@@ -3240,6 +3261,14 @@ fn lay_out_rest_streamed<'a>(
         let laid = if let Some(packed) = trace.narrow_main() {
             narrow_tables += 1;
             narrow_bytes += packed.data().len();
+            // A table phase B can build again from the kept lists (N3): its
+            // place among the rest's, before the packer places it.
+            if let (Some(recorder), Some((family, j))) = (
+                recorder,
+                crate::tables::trace_builder::RegenFamily::of_air(refs[position].name()),
+            ) {
+                recorder.rest_tag(k, family, j);
+            }
             table_of_narrow(refs[position], &mut trace, shape)
         } else {
             table_of(refs[position], &mut trace, shape, true)
@@ -3381,6 +3410,9 @@ fn prove_streamed(
     )
     .map(std::sync::Arc::new);
     let recorder = regen_recorder.as_deref();
+    // Live regeneration's recorder: the rest's tables it can build again are
+    // tagged as they are laid out (N3).
+    let live_recorder = recorder.filter(|_| regen_mode.live());
     // Live regeneration: phase A drops the streamed chunks the policy moves off
     // the host (`always`: every one). The streamed chunks are placed first, in
     // hand-out order, so the table at block index `t` is the `t`-th chunk
@@ -3390,9 +3422,19 @@ fn prove_streamed(
         .filter(|_| regen_mode.live())
         .map(|recorder| {
             let recorder = std::sync::Arc::clone(recorder);
+            // Class 0: the streamed chunks (the replay); class 1: KECCAK_RND's
+            // and LT's tables of the rest (the kept lists, N3).
             multilinear_block::BlockRegen::new(
-                std::sync::Arc::new(move |t| recorder.chunk_at(t).map(|_| t as u64)),
-                regen::ahead_policy().initial(),
+                std::sync::Arc::new(move |t| {
+                    recorder
+                        .chunk_at(t)
+                        .map(|_| (0, t as u64))
+                        .or_else(|| recorder.rest_at(t).map(|_| (1, t as u64)))
+                }),
+                &match deviations.regen_windows {
+                    Some((streamed, rest)) => [streamed, rest],
+                    None => [regen::ahead_policy().initial(), regen::rest_ahead_bytes()],
+                },
                 regen_mode == regen::RegenMode::Always,
             )
         });
@@ -3709,7 +3751,8 @@ fn prove_streamed(
                         || (options.finish_keccak_rnd_chunks && options.keccak_rnd_rows_log2 >= 5))
                     && !deviations.omit_first_keccak_rnd;
                 if streams {
-                    let emitted = builder.finish_streamed(&last, rest_gate, |header| {
+                    let keep = live_recorder.is_some();
+                    let emitted = builder.finish_streamed_keeping(&last, rest_gate, keep, |header| {
                         let (tx, rx) = std::sync::mpsc::channel();
                         btx.send(Built::Stream(Box::new(RestStream {
                             header,
@@ -3735,7 +3778,7 @@ fn prove_streamed(
                         ledger.walk.store(0, Relaxed);
                         ledger.image.store(0, Relaxed);
                     }
-                    emitted?;
+                    let rest_regen = emitted?;
                     let g = |b: usize| b as f64 / (1u64 << 30) as f64;
                     eprintln!(
                         "BLOCK REST STREAM: the rest built in waves under a {:.2} GiB gate, held at most \
@@ -3755,6 +3798,7 @@ fn prove_streamed(
                         streamed,
                         window_stamps,
                         finish_marks,
+                        rest_regen,
                     ));
                 }
                 let built_rest = builder.finish(&last);
@@ -3800,6 +3844,7 @@ fn prove_streamed(
                     streamed,
                     window_stamps,
                     finish_marks,
+                    None,
                 ))
             });
 
@@ -3841,9 +3886,16 @@ fn prove_streamed(
                         options.rest_layout_bytes,
                         ledger,
                     ),
-                    RestIn::Stream(stream) => {
-                        lay_out_rest_streamed(stream, program, opts, run_airs, start, sink, ledger)
-                    }
+                    RestIn::Stream(stream) => lay_out_rest_streamed(
+                        stream,
+                        program,
+                        opts,
+                        run_airs,
+                        start,
+                        sink,
+                        ledger,
+                        live_recorder,
+                    ),
                 };
                 let (streamed, rest) = if inline {
                     let (streamed, traces) = stream_inline(brx, stream_airs, packer, recorder)?;
@@ -4019,7 +4071,7 @@ fn prove_streamed(
             executed.map_err(|_| Error::Prover("the block's executor panicked".into()))??;
         // A thread's error names the cause; a commit that ran out of groups only
         // says that it did.
-        let (windows_done, finished, streamed, window_stamps, finish_marks) =
+        let (windows_done, finished, streamed, window_stamps, finish_marks, rest_regen) =
             built.map_err(|_| Error::Prover("the block's builder panicked".into()))??;
         stamps.windows = window_stamps;
         stamps.build_marks = finish_marks;
@@ -4069,11 +4121,44 @@ fn prove_streamed(
         // Live regeneration: what phase A dropped, rebuilt beside phase B in
         // rank order. A dropped table is the chunk its rank names (the chunks
         // are placed first, in hand-out order), or the prove stops here.
+        let mut rest_regen = rest_regen;
         let live = match (block.regen().cloned(), &regen_recorder) {
             (Some(live_regen), Some(recorder)) => {
                 let drops = live_regen.report();
-                let window_of = std::sync::Arc::clone(live_regen.window());
-                let run = match live_regen.into_plan() {
+                let windows = live_regen.windows().to_vec();
+                let window_of = std::sync::Arc::clone(&windows[0]);
+                let mut plans = live_regen.into_plan().into_iter();
+                let streamed_plan = plans.next();
+                let rest_plan = plans.next();
+                // The rest's dropped tables (N3), built again from the lists the
+                // finish kept; with none dropped, the lists go now.
+                let rest_run = match rest_plan {
+                    Some(plan) if !plan.dropped.is_empty() => {
+                        let regen = rest_regen.take().ok_or_else(|| {
+                            Error::Prover(
+                                "rest tables were dropped but the finish kept no lists".into(),
+                            )
+                        })?;
+                        let producer = plan.producer.ok_or_else(|| {
+                            Error::Prover("the rest's window has no producer".into())
+                        })?;
+                        Some(regen::RestRun::spawn(
+                            regen,
+                            recorder.rest_blocks(),
+                            std::sync::Arc::clone(&plan.window),
+                            producer,
+                            plan.dropped,
+                            regen::regen_generators(),
+                            deviations.rest_faults,
+                        ))
+                    }
+                    _ => None,
+                };
+                drop(rest_regen.take());
+                let run = match streamed_plan
+                    .filter(|plan| !plan.dropped.is_empty())
+                    .and_then(|plan| plan.producer.map(|producer| (plan.dropped, producer)))
+                {
                     Some((dropped, producer)) => {
                         let mut keyed = Vec::with_capacity(dropped.len());
                         for (rank, slot) in dropped {
@@ -4101,19 +4186,27 @@ fn prove_streamed(
                             keyed,
                             stream_form,
                             deviations.regen_faults,
-                            regen::ahead_policy(),
+                            deviations
+                                .regen_windows
+                                .map_or_else(regen::ahead_policy, |(streamed, _)| {
+                                    regen::AheadPolicy::Fixed(streamed)
+                                }),
                         ))
                     }
                     None => None,
                 };
-                Some((drops, window_of, run))
+                Some((drops, window_of, run, windows.get(1).cloned(), rest_run))
             }
             _ => None,
         };
-        // Phase B's order: the groups phase B rebuilds last (rest first), so
-        // the regenerator has the others' phase B as a head start; the group
-        // order when nothing was dropped.
-        let rebuilt = block.rebuilt_groups();
+        drop(rest_regen);
+        // Each group's rebuilt class, which phase B's order follows (below);
+        // all `None`, and the group order, when nothing was dropped.
+        let classes = block.rebuilt_classes().map_err(|g| {
+            Error::Prover(format!(
+                "group {g} dropped tables of two classes for phase B to rebuild"
+            ))
+        })?;
         stamps.tables = laid.shapes.len();
         stamps.cells = laid.shapes.iter().map(|&(w, n)| w << n).sum();
 
@@ -4182,22 +4275,42 @@ fn prove_streamed(
             Some(f) => f,
             None => &identity,
         };
+        // Phase B's order (N3): the groups with nothing dropped first, then the
+        // rebuilt streamed and rest groups interleaved by their cells, so each
+        // regenerator keeps up with only its share of phase B's pace.
+        let group_cells: Vec<u64> = {
+            let mut at = 0usize;
+            laid.groups
+                .iter()
+                .map(|group| {
+                    let cells = laid.shapes[at..at + group.len()]
+                        .iter()
+                        .map(|&(w, n)| (w as u64) << n)
+                        .sum();
+                    at += group.len();
+                    cells
+                })
+                .collect()
+        };
         let order: Vec<usize> = match deviations.phase_b_order {
             Some(order) => order(laid.groups.len()),
-            None => multilinear_block::rebuilt_last(&rebuilt),
+            None => multilinear_block::interleaved_order(&classes, &group_cells),
         };
-        // The regenerator deposits in rank order, the rebuilt groups' order: an
-        // order that takes them otherwise could wait on a deposit its window
-        // does not admit yet, so it is refused rather than run.
-        let taken: Vec<usize> = order
-            .iter()
-            .copied()
-            .filter(|&g| rebuilt.get(g).copied().unwrap_or(false))
-            .collect();
-        if taken.windows(2).any(|w| w[0] > w[1]) {
-            return Err(Error::Prover(
-                "phase B must take the rebuilt groups in group order".into(),
-            ));
+        // Each class's regenerator deposits in its rank order, its groups'
+        // order: an order that takes a class's groups otherwise could wait on a
+        // deposit its window does not admit yet, so it is refused rather than
+        // run.
+        for class in 0..2usize {
+            let taken: Vec<usize> = order
+                .iter()
+                .copied()
+                .filter(|&g| classes.get(g).copied().flatten() == Some(class))
+                .collect();
+            if taken.windows(2).any(|w| w[0] > w[1]) {
+                return Err(Error::Prover(
+                    "phase B must take each class's rebuilt groups in group order".into(),
+                ));
+            }
         }
         let phase_b_start = Instant::now();
         let (proof, argues, prepared_openings, groups) =
@@ -4214,9 +4327,10 @@ fn prove_streamed(
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
-        if let Some((drops, window_of, run)) = live {
+        if let Some((drops, window_of, run, rest_window, rest_run)) = live {
             let recipes = recorder.map_or(0, |r| r.recipes().0.len());
             let mut lines = vec![regen::dropped_line(regen_mode, no_disk, &drops, recipes)];
+            let rest_report = rest_run.map(regen::RestRun::join);
             let offset = run.as_ref().map(|run| {
                 phase_b_start
                     .saturating_duration_since(run.started())
@@ -4231,11 +4345,29 @@ fn prove_streamed(
                 }
             }
             lines.push(format!("BLOCK REGEN window: {}", window_of.report()));
+            if let Some(report) = &rest_report {
+                lines.push(report.line());
+                for failure in report.failures.iter().take(20) {
+                    lines.push(format!("BLOCK REGEN REST FAILED {failure}"));
+                }
+            }
+            if let (Some(window), Some((tables, bytes))) = (&rest_window, drops.by_class.get(1))
+                && *tables > 0
+            {
+                lines.push(format!(
+                    "BLOCK REGEN rest window: {} · {tables} tables {:.2} GiB dropped",
+                    window.report(),
+                    *bytes as f64 / (1u64 << 30) as f64
+                ));
+            }
+            let in_class = |c: usize| classes.iter().filter(|&&k| k == Some(c)).count();
             lines.push(format!(
-                "BLOCK REGEN phase B order: {} of {} groups rebuilt, taken last · phase B began {} \
-                 after the regenerator",
-                rebuilt.iter().filter(|&&r| r).count(),
-                rebuilt.len(),
+                "BLOCK REGEN phase B order: {} of {} groups rebuilt ({} streamed, {} rest), \
+                 interleaved after the others · phase B began {} after the regenerator",
+                classes.iter().filter(|c| c.is_some()).count(),
+                classes.len(),
+                in_class(0),
+                in_class(1),
                 offset.map_or("n/a".to_string(), |s| format!("{s:.2} s")),
             ));
             for line in &lines {
@@ -4245,10 +4377,18 @@ fn prove_streamed(
                 recipes,
                 dropped: drops.tables,
                 dropped_bytes: drops.bytes,
-                regenerated: report.as_ref().map_or(0, |r| r.deposited),
-                mismatches: report.as_ref().map_or(0, |r| r.mismatches),
-                failed: report.as_ref().map_or(0, |r| r.failures.len() + r.skipped),
-                error: report.as_ref().and_then(|r| r.error.clone()),
+                regenerated: report.as_ref().map_or(0, |r| r.deposited)
+                    + rest_report.as_ref().map_or(0, |r| r.deposited),
+                mismatches: report.as_ref().map_or(0, |r| r.mismatches)
+                    + rest_report.as_ref().map_or(0, |r| r.mismatches),
+                failed: report.as_ref().map_or(0, |r| r.failures.len() + r.skipped)
+                    + rest_report.as_ref().map_or(0, |r| r.failures.len()),
+                error: report
+                    .as_ref()
+                    .and_then(|r| r.error.clone())
+                    .or_else(|| rest_report.as_ref().and_then(|r| r.error.clone())),
+                rest_dropped: drops.by_class.get(1).map_or(0, |c| c.0),
+                rest_regenerated: rest_report.as_ref().map_or(0, |r| r.deposited),
                 lines,
                 ..regen::RegenStamps::default()
             });
