@@ -1066,6 +1066,185 @@ fn the_whir_block_tree_verifies_split_keccak_and_ecsm() {
     }
 }
 
+/// The verifier's derive windows: at most `n` items at once, every item once,
+/// in order, and the first error stops the level.
+#[test]
+fn a_derive_window_holds_its_bound_and_its_order() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let items: Vec<usize> = (0..23).collect();
+    for window in [None, Some(1), Some(2), Some(5), Some(64)] {
+        let inside = AtomicUsize::new(0);
+        let most = AtomicUsize::new(0);
+        let done = super::whir_block::map_in_windows(&items, window, |&i| {
+            let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            inside.fetch_sub(1, Ordering::SeqCst);
+            Ok(i * 3)
+        })
+        .expect("no item fails");
+        assert_eq!(done, items.iter().map(|i| i * 3).collect::<Vec<_>>());
+        if let Some(n) = window {
+            assert!(most.load(Ordering::SeqCst) <= n, "window {n}");
+        }
+    }
+    let failed = super::whir_block::map_in_windows(&items, Some(4), |&i| {
+        if i == 9 {
+            Err(format!("item {i}"))
+        } else {
+            Ok(i)
+        }
+    });
+    assert_eq!(failed, Err("item 9".to_string()));
+}
+
+/// The derive's knobs read a positive window and `level`, and refuse nonsense
+/// with an error, not a panic.
+#[test]
+fn the_derive_knobs_read_their_values_and_refuse_nonsense() {
+    use super::whir_block::{parse_derive_builds, parse_derive_hold};
+    assert_eq!(parse_derive_builds(None), Ok(None));
+    assert_eq!(parse_derive_builds(Some(" ")), Ok(None));
+    assert_eq!(parse_derive_builds(Some("8")), Ok(Some(8)));
+    for bad in ["0", "-1", "eight"] {
+        assert!(parse_derive_builds(Some(bad)).is_err(), "{bad}");
+    }
+    assert_eq!(parse_derive_hold(None), Ok(false));
+    assert_eq!(parse_derive_hold(Some("level")), Ok(true));
+    assert!(parse_derive_hold(Some("all")).is_err());
+}
+
+/// ★ The verifier's lean derive ([`WhirBlockPlan::derive_top_in`]: each
+/// program and its artifacts dropped once its child's shape is derived, the
+/// leaves in windows) derives the held derive's top ([`WhirBlockPlan::
+/// programs`]) byte for byte, at a window of 1, of 8 and the whole level, over
+/// a tree with a node level below the top.
+#[test]
+#[ignore = "proves a small block's base; box tier"]
+fn the_lean_derive_is_the_held_derives_top_at_every_window() {
+    let format = small_format();
+    let (elf, proof) = small_block("test_commit_4", &format);
+    let opts = ProofOptions::default_test_options();
+    let wrap = aggregation_wrap_options();
+    let groups = plan_of(&elf, &proof, &format, None).num_groups();
+    let leaves = groups.min(5);
+    assert!(
+        leaves >= 3,
+        "{groups} groups: too few for a node level below the top"
+    );
+    let plan = WhirBlockPlan::derive_with(
+        &elf,
+        &opts,
+        &format,
+        proof.statement(),
+        Some(leaves),
+        2,
+        None,
+    )
+    .expect("the plan derives");
+    assert!(plan.levels().len() >= 2, "a node level below the top");
+    let mut held = plan.programs(&wrap).expect("the held derive");
+    let held_top = held
+        .levels
+        .pop()
+        .and_then(|mut level| level.pop())
+        .expect("a top")
+        .artifacts;
+    for window in [Some(1), Some(8), None] {
+        let lean = plan.derive_top_in(&wrap, window).expect("the lean derive");
+        assert_eq!(
+            lean, held_top,
+            "window {window:?}: the lean top is the held top"
+        );
+    }
+    println!(
+        "LEAN DERIVE IDENTITY: {leaves} leaves, {} node levels, the top equal at windows 1, 8 and the whole level",
+        plan.levels().len()
+    );
+}
+
+/// ★ Under the lean derive the verifier still refuses: a plan with one leaf
+/// over a tampered prepared root derives another top, against which the
+/// honest top proof does not verify (the leaf case), and a top proof with one
+/// published word changed is refused by the block's verifier (the node case),
+/// at every window; the honest top verifies at every window.
+#[test]
+#[ignore = "proves block leaves and nodes over a small block; box tier"]
+fn the_lean_derive_still_refuses_a_tampered_leaf_and_node() {
+    super::device_permit::arm(1);
+    let format = small_format();
+    let (elf, proof) = small_block("test_commit_4", &format);
+    let opts = ProofOptions::default_test_options();
+    let wrap = aggregation_wrap_options();
+    let plan = plan_of(&elf, &proof, &format, Some(2));
+    let (top, _) = compose(&plan, &proof, "LEAN").expect("the honest tree proves");
+    let mut roots: Vec<block_whir::PreparedRoots> = plan
+        .prepared()
+        .iter()
+        .map(|p| (p.group, p.roots.clone()))
+        .collect();
+    roots[0].1[0][0] ^= 1;
+    let bad = WhirBlockPlan::derive_with(
+        &elf,
+        &opts,
+        &format,
+        proof.statement(),
+        Some(2),
+        BLOCK_FAN_IN,
+        Some(&roots),
+    )
+    .expect("a plan over a tampered root");
+    for window in [Some(1), Some(8), None] {
+        let honest = plan.derive_top_in(&wrap, window).expect("the honest top");
+        assert!(
+            super::proof::verify_against_artifacts(&honest, &top.proof, &top.public_words, &wrap),
+            "window {window:?}: the honest top verifies"
+        );
+        let other = bad
+            .derive_top_in(&wrap, window)
+            .expect("the tampered plan's top");
+        assert_ne!(other.program_id, honest.program_id, "window {window:?}");
+        assert!(
+            !super::proof::verify_against_artifacts(&other, &top.proof, &top.public_words, &wrap),
+            "window {window:?}: the honest top does not verify against a tampered leaf's tree"
+        );
+    }
+    let mut words = top.public_words.clone();
+    words[0].1[0] += FE::from(1u64);
+    let node = LfmProof {
+        proof: top.proof.clone(),
+        public_words: words,
+    };
+    assert!(
+        verify_block_tree_under(
+            &elf,
+            &opts,
+            &format,
+            proof.statement(),
+            Some(2),
+            BLOCK_FAN_IN,
+            &wrap,
+            &node,
+        )
+        .is_err(),
+        "a top proof with one published word changed is refused"
+    );
+    assert!(
+        verify_block_tree_under(
+            &elf,
+            &opts,
+            &format,
+            proof.statement(),
+            Some(2),
+            BLOCK_FAN_IN,
+            &wrap,
+            &top,
+        )
+        .is_ok(),
+        "the honest top is accepted by the block's verifier"
+    );
+}
+
 /// ★ The tree over a small block proves to a top, and the block's verifier —
 /// which derives the top program from the ELF and the statement, never from
 /// the proof — accepts it.

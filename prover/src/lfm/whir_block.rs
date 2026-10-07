@@ -626,15 +626,84 @@ impl WhirBlockPlan {
         }
     }
 
-    /// The top program's artifacts, with no proof ([`Self::programs`]).
+    /// The top program's artifacts, with no proof: [`Self::derive_top_in`]
+    /// with the leaves built in windows of `LAMBDA_VM_BLOCK_DERIVE_BUILDS`
+    /// ([`derive_builds_bound`]), or under `LAMBDA_VM_BLOCK_DERIVE_HOLD=level`
+    /// (the A/B control, [`derive_holds_levels`]) every program of the tree
+    /// held to the end ([`Self::programs`]), as the verifier did before.
     pub fn derive_top(&self, wrap_opts: &crate::ProofOptions) -> Result<LfmArtifacts, String> {
-        let mut programs = self.programs(wrap_opts)?;
-        let top = programs
-            .levels
-            .pop()
-            .and_then(|mut level| level.pop())
-            .ok_or("no top")?;
-        Ok(top.artifacts)
+        if derive_holds_levels()? {
+            let mut programs = self.programs(wrap_opts)?;
+            let top = programs
+                .levels
+                .pop()
+                .and_then(|mut level| level.pop())
+                .ok_or("no top")?;
+            return Ok(top.artifacts);
+        }
+        self.derive_top_in(wrap_opts, derive_builds_bound()?)
+    }
+
+    /// The top program's artifacts, derived as a verifier needs them: the
+    /// programs of [`Self::programs`], built in the same order, but each leaf
+    /// and node keeps only its child's shape ([`DerivedChild`], what the node
+    /// above is emitted over): its program and artifacts are dropped as soon
+    /// as that shape is derived, and only the top's artifacts are kept. The
+    /// leaves are built in windows of `window` (the whole level at once when
+    /// `None`), each window in parallel; the nodes one at a time. Holding
+    /// every level ([`Self::programs`]) took the p90 block's verifier to
+    /// 41.17 GiB live (RYZEN 071, I-MEMFIT §6.24). Scheduling and retention
+    /// only: every artifact is a pure function of its program and the
+    /// options, so the top is [`Self::programs`]' top.
+    pub fn derive_top_in(
+        &self,
+        wrap_opts: &crate::ProofOptions,
+        window: Option<usize>,
+    ) -> Result<LfmArtifacts, String> {
+        let words = self.child_layout().total();
+        let derive = |program: LfmProgram| -> Result<DerivedChild, String> {
+            let artifacts = artifacts_of(&program, wrap_opts);
+            DerivedChild::from_artifacts(&artifacts, wrap_opts, words)
+        };
+        let leaves: Vec<usize> = (0..self.partition.num_leaves()).collect();
+        let mut below = map_in_windows(&leaves, window, |&k| derive(self.leaf_program(k)?))?;
+        let shape = self.levels();
+        for (lv, arities) in shape.iter().enumerate() {
+            let top = lv + 1 == shape.len();
+            let mut at = 0usize;
+            let mut next = Vec::with_capacity(arities.arities.len());
+            for &a in &arities.arities {
+                let kids: Vec<&DerivedChild> = below
+                    .get(at..at + a)
+                    .ok_or_else(|| format!("level {}: arities overrun the children", lv + 1))?
+                    .iter()
+                    .collect();
+                let program = self.node_program(&kids, top)?;
+                if top {
+                    if arities.arities.len() != 1 {
+                        return Err(format!(
+                            "the tree closes to {:?} nodes",
+                            Some(arities.arities.len())
+                        ));
+                    }
+                    let artifacts = artifacts_of(&program, wrap_opts);
+                    // The top's shape too, as [`Self::programs`] derives it: the
+                    // same refusals.
+                    DerivedChild::from_artifacts(&artifacts, wrap_opts, words)?;
+                    if at + a != below.len() {
+                        return Err(format!("level {}: arities leave children over", lv + 1));
+                    }
+                    return Ok(artifacts);
+                }
+                next.push(derive(program)?);
+                at += a;
+            }
+            if at != below.len() {
+                return Err(format!("level {}: arities leave children over", lv + 1));
+            }
+            below = next;
+        }
+        Err("no top".to_string())
     }
 
     /// Replace the partition — another tree, test-only: what a prover may emit
@@ -677,6 +746,79 @@ pub fn id_words(id: &[u8; 32]) -> [LfmWord; 2] {
         [halves[0], halves[1], halves[2], halves[3]],
         [halves[4], halves[5], halves[6], halves[7]],
     ]
+}
+
+/// `LAMBDA_VM_BLOCK_DERIVE_BUILDS=<n>`: the block verifier builds a tree's
+/// leaves in windows of `n` ([`WhirBlockPlan::derive_top`]), each window in
+/// parallel; unset, the whole level is one window: #1013's knob of the same
+/// name, on the WHIR tree. Scheduling only: every
+/// artifact is a pure function of its program and the options, so the derived
+/// top does not depend on it. A value that is not a positive integer is an
+/// error.
+pub fn derive_builds_bound() -> Result<Option<usize>, String> {
+    parse_derive_builds(std::env::var(DERIVE_BUILDS_ENV).ok().as_deref())
+}
+
+/// [`derive_builds_bound`]'s knob.
+pub const DERIVE_BUILDS_ENV: &str = "LAMBDA_VM_BLOCK_DERIVE_BUILDS";
+
+/// `LAMBDA_VM_BLOCK_DERIVE_HOLD=level`: [`WhirBlockPlan::derive_top`] holds
+/// every program and its artifacts to the end ([`WhirBlockPlan::programs`]),
+/// as the verifier did before (the A/B control; #1013's knob of the same
+/// name). Unset or empty, each is dropped once its child's shape is derived.
+/// Any other value is an error.
+pub fn derive_holds_levels() -> Result<bool, String> {
+    parse_derive_hold(std::env::var(DERIVE_HOLD_ENV).ok().as_deref())
+}
+
+/// [`derive_holds_levels`]' knob.
+pub const DERIVE_HOLD_ENV: &str = "LAMBDA_VM_BLOCK_DERIVE_HOLD";
+
+/// A value of [`DERIVE_HOLD_ENV`].
+pub fn parse_derive_hold(value: Option<&str>) -> Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(false),
+        Some("level") => Ok(true),
+        Some(v) => Err(format!("{DERIVE_HOLD_ENV} must be `level`, got `{v}`")),
+    }
+}
+
+/// A value of [`DERIVE_BUILDS_ENV`]: unset or empty is the whole level.
+pub fn parse_derive_builds(value: Option<&str>) -> Result<Option<usize>, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|&n| n >= 1)
+            .map(Some)
+            .ok_or_else(|| format!("{DERIVE_BUILDS_ENV} must be a positive integer, got `{v}`")),
+    }
+}
+
+/// `f` over `items` in order, in windows of `window` (all of them at once when
+/// `None`), each window in parallel where there is a pool; the first error
+/// stops it. At most `window` items are in `f` at once.
+pub(crate) fn map_in_windows<T: Sync, R: Send>(
+    items: &[T],
+    window: Option<usize>,
+    f: impl Fn(&T) -> Result<R, String> + Sync + Send,
+) -> Result<Vec<R>, String> {
+    let mut done = Vec::with_capacity(items.len());
+    for part in items.chunks(window.unwrap_or(items.len()).max(1)) {
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            done.extend(
+                part.par_iter()
+                    .map(&f)
+                    .collect::<Result<Vec<_>, String>>()?,
+            );
+        }
+        #[cfg(not(feature = "parallel"))]
+        done.extend(part.iter().map(&f).collect::<Result<Vec<_>, String>>()?);
+    }
+    Ok(done)
 }
 
 /// A tree program's artifacts, under the block hasher.
