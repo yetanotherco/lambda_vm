@@ -1267,10 +1267,11 @@ fn a_stopped_node_builder_fails_every_empty_slot() {
 }
 
 /// [`build_levels`] over a toy tree whose programs are their texts (`L3` a
-/// leaf, `N(..)` / `T(..)` a node over its children's): each node's build
-/// sleeps longer the earlier it is in its level, so on a pool the level's
-/// nodes finish in reverse. Returns every slot's content and the order the
-/// builds finished in.
+/// leaf, `N(..)` / `T(..)` a node over its children's). On a pool, a level's
+/// node 0 ends its build only once node 1 has ended its own (two emitter
+/// threads take them at once), so the level's builds finish out of order
+/// whatever the host's load: a wait decides it, not a sleep. Returns every
+/// slot's content and the order the builds finished in.
 #[allow(clippy::type_complexity)]
 fn toy_tree(
     leaves: usize,
@@ -1297,6 +1298,14 @@ fn toy_tree(
         .map(|l| l.arities.iter().map(|_| Published::new()).collect())
         .collect();
     let finished = std::sync::Mutex::new(Vec::new());
+    // Which builds have ended, level by level, for node 0 to wait on node 1.
+    let ended = std::sync::Mutex::new(
+        shape
+            .iter()
+            .map(|l| vec![false; l.arities.len()])
+            .collect::<Vec<_>>(),
+    );
+    let changed = std::sync::Condvar::new();
     let pool = threads.map(|n| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
@@ -1312,9 +1321,21 @@ fn toy_tree(
         |node: &String| node,
         |_, _| Ok(()),
         |lv, j, kids: &[&String], top, ()| {
-            let late = shape[lv].arities.len() - j;
-            std::thread::sleep(std::time::Duration::from_millis(4 * late as u64));
+            // Bounded, so a scheduler that never runs node 1 beside node 0
+            // fails the order assertion instead of hanging the test.
+            if threads.is_some() && j == 0 && shape[lv].arities.len() > 1 {
+                let t = std::time::Instant::now();
+                let mut done = ended.lock().expect("the ends");
+                while !done[lv][1] && t.elapsed() < std::time::Duration::from_secs(10) {
+                    done = changed
+                        .wait_timeout(done, std::time::Duration::from_millis(50))
+                        .expect("the ends")
+                        .0;
+                }
+            }
             finished.lock().expect("the log").push((lv, j));
+            ended.lock().expect("the ends")[lv][j] = true;
+            changed.notify_all();
             if fail_at == Some((lv, j)) {
                 return Err(format!("node ({lv}, {j}) does not build"));
             }
