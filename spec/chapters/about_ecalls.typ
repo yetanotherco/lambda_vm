@@ -26,7 +26,7 @@ where `A0`-`A7` are symbolic names for the registers `x10`-`x17`
 We provide a list of supported ECALL numbers.
 Negative numbers (represented as 2s complement 64-bit numbers), are used for our own custom accelerators/extensions.
 
-/ 64: `write` (@commit)
+/ 64: `write` (@copy)
 / 93: `exit` (@halt)
 / -1: `SHA256` (@sha256)
 / -2: `KECCAK` (@keccak)
@@ -35,3 +35,20 @@ Negative numbers (represented as 2s complement 64-bit numbers), are used for our
 / -20: `FEXT_LOAD` (@fext)
 / -21: `FEXT_FMA` (@fext)
 / -22: `FEXT_ZERO` (@fext)
+/ -30: `memcpy`/`memmove` (@copy)
+/ -31: `memset` (@copy)
+
+== Committing to values
+
+In order to make a claim about a public value to the verifier, a guest program can _commit_ to it.
+In this VM, this is achieved by writing to `stdout`, with a write syscall to file descriptor 1.
+Values are committed by letting the verifier initialize and finalize the global memory argument
+(see @memory and @streaming), with the claimed commitments in its own domain separated part of memory,
+with domain separator value 2.#footnote[
+  In order to make sure the verifier can properly finalize the committed values, the last epoch can "bring forward"
+  all commitments from earlier epochs, similar to padded values, in the `L2G` table.
+  Then the contribution of the commitments only consists of the tuples `(2, address, last_epoch_index, value)`, which is entirely known to the verifier.
+]
+In doing this, we enforce that all values being committed match the claimed commitment.
+The verifier should additionally check that register 254 contains the total number of bytes committed.
+The technical details on how the copy to memory domain 2 is achieved can be found in @copy, where `write` is implemented.

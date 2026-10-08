@@ -118,11 +118,11 @@ tag = "ECALL"
 kind = "interaction"
 input = ["Word", "DWordWL"]
 
-# CNB[timestamp, index, address, count]
+# COPY_NEXT[timestamp, src, dst, count, is_set, is_write]
 [[signatures]]
-tag = "CNB"
+tag = "COPY_NEXT"
 kind = "interaction"
-input = ["Word", "BaseField", "DWordWL", "DWordWL"]
+input = ["Word", "DWordWL", "DWordWL", "DWordWL", "Bit", "Bit"]
 
 # BYTE_ALU[res; selector, X, Y]
 [[signatures]]
@@ -164,6 +164,13 @@ tag = "IS_HALF"
 kind = "interaction"
 input = ["Half"]
 
+# IS_WHH[X]
+[[signatures]]
+tag = "IS_WHH"
+kind = "template"
+input = ["DWordWHH"]
+cond = "BaseField"
+
 # IS_B20[X]
 [[signatures]]
 tag = "IS_B20"
@@ -175,13 +182,6 @@ input = ["B20"]
 tag = "IS_WH"
 kind = "interaction"
 input = ["Word", "Half"]
-
-# IS_WHH[X, Y]
-[[signatures]]
-tag = "IS_WHH"
-kind = "template"
-input = ["DWordWHH"]
-cond = "BaseField"
 
 # HWSL[res; X, shift]
 [[signatures]]
