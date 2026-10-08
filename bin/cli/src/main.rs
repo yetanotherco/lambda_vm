@@ -51,13 +51,74 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // "_rjem_malloc_conf")]`, its `src/lib.rs`). None of that is compiler-checked.
 // `prover/tests/jemalloc_conf.rs` reads both options back out of jemalloc, but
 // it carries its own copy of this block and reads its own process — it pins the
-// pattern, not this export. Deleting the lines below turns nothing red.
+// pattern. This binary's own unit tests read this export back
+// (`the_binary_runs_its_never_purge_posture`): deleting the lines below turns
+// that test red.
 const NEVER_PURGE: &[u8] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
 
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "_rjem_malloc_conf")]
 pub static malloc_conf: Option<&'static core::ffi::c_char> =
     Some(unsafe { &*(NEVER_PURGE.as_ptr() as *const core::ffi::c_char) });
+
+/// This binary's jemalloc, as the prover asks it (`prover::alloc_purge`): its
+/// statistics, and a purge of every arena's dirty pages. Installed at the top
+/// of `main`, so the block's purge points (`LAMBDA_VM_ALLOC_PURGE`, `auto` by
+/// default), its memory ledger and the tree's late leaf emission run here as
+/// they do in the prover's own tests.
+mod allocator {
+    use prover::alloc_purge::{AllocStats, AllocatorHooks};
+
+    pub const HOOKS: AllocatorHooks = AllocatorHooks { stats, purge_all };
+
+    /// jemalloc's statistics, the epoch turned first (they are cached until
+    /// it turns).
+    fn stats() -> Option<AllocStats> {
+        use tikv_jemalloc_ctl::{epoch, stats};
+        epoch::advance().ok()?;
+        Some(AllocStats {
+            allocated: stats::allocated::read().ok()?,
+            active: stats::active::read().ok()?,
+            resident: stats::resident::read().ok()?,
+            mapped: stats::mapped::read().ok()?,
+            retained: stats::retained::read().ok()?,
+        })
+    }
+
+    /// `arena.<MALLCTL_ARENAS_ALL>.purge` (4096, jemalloc's "every arena"
+    /// index): a control that neither reads nor writes, so every pointer is
+    /// null.
+    fn purge_all() -> bool {
+        // SAFETY: the name is NUL-terminated, and a control that takes no
+        // value is called with null old and new pointers and zero lengths, as
+        // jemalloc's `NEITHER_READ_NOR_WRITE` requires.
+        let rc = unsafe {
+            tikv_jemalloc_sys::mallctl(
+                c"arena.4096.purge".as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            eprintln!("ALLOC PURGE: arena.4096.purge returned {rc}");
+        }
+        rc == 0
+    }
+
+    /// The running `opt.dirty_decay_ms` and `opt.muzzy_decay_ms`: `-1` is the
+    /// never-purge posture this binary compiles in.
+    pub fn decay_ms() -> Option<(isize, isize)> {
+        // SAFETY: both names are NUL-terminated `ssize_t` options.
+        unsafe {
+            Some((
+                tikv_jemalloc_ctl::raw::read(b"opt.dirty_decay_ms\0").ok()?,
+                tikv_jemalloc_ctl::raw::read(b"opt.muzzy_decay_ms\0").ok()?,
+            ))
+        }
+    }
+}
 
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::instruction::execution::{Accelerator, SyscallNumbers};
@@ -233,6 +294,14 @@ enum Commands {
         #[arg(long)]
         continuations: bool,
 
+        /// Prove with the multilinear backend (WHIR) instead of FRI.
+        ///
+        /// A different proof format: verify it with `verify --whir`. The
+        /// multilinear path derives its own rate and query count from the
+        /// trace, so `--blowup` does not apply to it.
+        #[arg(long, conflicts_with = "continuations")]
+        whir: bool,
+
         /// Continuation epoch size as log2(cycles); e.g. 20 means 1,048,576 cycles.
         #[arg(
             long,
@@ -265,6 +334,56 @@ enum Commands {
         /// Verify a continuation proof bundle (produced by `prove --continuations`)
         #[arg(long)]
         continuations: bool,
+
+        /// Verify a multilinear proof (produced by `prove --whir`)
+        #[arg(long, conflicts_with = "continuations")]
+        whir: bool,
+    },
+
+    /// Prove a whole block as a recursion tree, base to top node
+    ///
+    /// The block's no-epoch base proof, the leaves that verify it, the
+    /// interior and the top node: one proof a consumer verifies with
+    /// `verify-block` against the ELF. Needs a `--features cuda` build. The
+    /// production posture (table parallelism, the VRAM budget, gate packing,
+    /// the tree's sibling counts, ...) is set for every knob the environment
+    /// leaves unset; the `BLOCK POSTURE` lines on stderr say which.
+    ProveBlock {
+        /// Path to the guest ELF
+        #[arg(value_parser, value_hint = ValueHint::FilePath)]
+        elf: PathBuf,
+
+        /// The block's private input (the guest reads it with `get_private_input()`)
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        input: Option<PathBuf>,
+
+        /// Output path for the block proof
+        #[arg(short, long, value_hint = ValueHint::FilePath)]
+        output: PathBuf,
+
+        /// Print the whole run's wall (base to top node)
+        #[arg(long)]
+        time: bool,
+
+        /// Print blake3 digests of the base proof's and the top proof's bytes
+        /// (the base digest is taken inside the run's clock: not for timing)
+        #[arg(long)]
+        digest: bool,
+    },
+
+    /// Verify a block proof produced by `prove-block`
+    VerifyBlock {
+        /// Path to the block proof
+        #[arg(value_parser, value_hint = ValueHint::FilePath)]
+        proof: PathBuf,
+
+        /// Path to the guest ELF the block ran (trusted)
+        #[arg(value_parser, value_hint = ValueHint::FilePath)]
+        elf: PathBuf,
+
+        /// Print verification time
+        #[arg(long)]
+        time: bool,
     },
 
     /// Count main-trace and aux-trace field elements without proving
@@ -281,7 +400,18 @@ enum Commands {
 
 fn main() -> ExitCode {
     env_logger::init();
+    prover::alloc_purge::install(allocator::HOOKS);
     let cli = Cli::parse();
+    // Still single-threaded here: clap and env_logger spawn nothing.
+    if matches!(
+        cli.command,
+        Commands::ProveBlock { .. } | Commands::VerifyBlock { .. }
+    ) {
+        // SAFETY: no thread but this one exists yet.
+        for line in unsafe { apply_posture() } {
+            eprintln!("{line}");
+        }
+    }
 
     match cli.command {
         Commands::Execute {
@@ -313,6 +443,7 @@ fn main() -> ExitCode {
             elements,
             continuations,
             epoch_size_log2,
+            whir,
         } => {
             if continuations {
                 cmd_prove_continuation(
@@ -324,6 +455,8 @@ fn main() -> ExitCode {
                     time,
                     cycles,
                 )
+            } else if whir {
+                cmd_prove_whir(elf, output, private_input, blowup, time)
             } else {
                 cmd_prove(elf, output, private_input, blowup, time, cycles, elements)
             }
@@ -334,14 +467,327 @@ fn main() -> ExitCode {
             blowup,
             time,
             continuations,
+            whir,
         } => {
             if continuations {
                 cmd_verify_continuation(proof, elf, blowup, time)
+            } else if whir {
+                cmd_verify_whir(proof, elf, blowup, time)
             } else {
                 cmd_verify(proof, elf, blowup, time)
             }
         }
+        Commands::ProveBlock {
+            elf,
+            input,
+            output,
+            time,
+            digest,
+        } => cmd_prove_block(elf, input, output, time, digest),
+        Commands::VerifyBlock { proof, elf, time } => cmd_verify_block(proof, elf, time),
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
+    }
+}
+
+/// Device 0's memory in GiB, as `nvidia-smi` reports it: a subprocess, so
+/// nothing in this process starts a thread (the CUDA driver's `cuInit` would).
+fn card_gib() -> Option<f64> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args([
+            "--id=0",
+            "--query-gpu=memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mib: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    Some(mib / 1024.0)
+}
+
+/// What the posture does in an environment: the knobs it sets (each posture
+/// knob the environment leaves unset), the ones the environment already sets,
+/// and a note per knob it leaves to the library default — the VRAM budget on a
+/// card under [`prover::lfm::block_tree::POSTURE_VRAM_MIN_GIB`] (the posture's
+/// 24000 MB is the 32 GiB card's), or when no card reports.
+struct PosturePlan {
+    set: Vec<(&'static str, &'static str)>,
+    env: Vec<String>,
+    notes: Vec<String>,
+}
+
+fn posture_plan(
+    env: impl Fn(&str) -> Option<String>,
+    card: impl Fn() -> Option<f64>,
+    target: impl Fn() -> u64,
+) -> PosturePlan {
+    use prover::lfm::block_tree::{
+        POSTURE, POSTURE_DERIVE_BUILDS_KNOB, POSTURE_TREE_CACHE_KNOB, POSTURE_VRAM_KNOB,
+        POSTURE_VRAM_MIN_GIB, posture_derive_builds, posture_tree_cache_cap,
+    };
+    let mut plan = PosturePlan {
+        set: Vec::new(),
+        env: Vec::new(),
+        notes: Vec::new(),
+    };
+    for &(name, value) in POSTURE {
+        if let Some(v) = env(name) {
+            plan.env.push(format!("{name}={v}"));
+            continue;
+        }
+        if name == POSTURE_VRAM_KNOB {
+            match card() {
+                Some(gib) if gib >= POSTURE_VRAM_MIN_GIB => {}
+                card => {
+                    plan.notes.push(format!(
+                        "BLOCK POSTURE: {name} left to the library default (80 % of the card): the \
+                         card reports {}, and the posture's {value} MB is the 32 GiB card's; set \
+                         {name} for this card",
+                        card.map_or("nothing".to_string(), |g| format!("{g:.2} GiB"))
+                    ));
+                    continue;
+                }
+            }
+        }
+        if name == POSTURE_TREE_CACHE_KNOB {
+            let target = target();
+            let cap = posture_tree_cache_cap(target);
+            if cap != value {
+                plan.notes.push(format!(
+                    "BLOCK POSTURE: {name}={cap}, not {value}: the host target is {:.1} GiB \
+                     (LAMBDA_VM_BLOCK_SPILL_TARGET_GIB, else the cgroup or MemTotal less 10 GiB)",
+                    target as f64 / (1u64 << 30) as f64
+                ));
+            }
+            plan.set.push((name, cap));
+            continue;
+        }
+        plan.set.push((name, value));
+    }
+    // The verifier's derive window: set only below its target, else left to
+    // the library (the whole level at once).
+    match env(POSTURE_DERIVE_BUILDS_KNOB) {
+        Some(v) => plan.env.push(format!("{POSTURE_DERIVE_BUILDS_KNOB}={v}")),
+        None => {
+            let target = target();
+            if let Some(window) = posture_derive_builds(target) {
+                plan.notes.push(format!(
+                    "BLOCK POSTURE: {POSTURE_DERIVE_BUILDS_KNOB}={window}: the host target is {:.1} \
+                     GiB, so the block verifier derives a tree level {window} programs at a time",
+                    target as f64 / (1u64 << 30) as f64
+                ));
+                plan.set.push((POSTURE_DERIVE_BUILDS_KNOB, window));
+            }
+        }
+    }
+    plan
+}
+
+/// The block's production posture ([`prover::lfm::block_tree::POSTURE`]),
+/// set for every knob the environment leaves unset ([`posture_plan`]).
+/// Returns the lines that say what it set and what it left.
+///
+/// # Safety
+///
+/// Sets environment variables: no other thread may exist.
+unsafe fn apply_posture() -> Vec<String> {
+    let plan = posture_plan(
+        |name| std::env::var(name).ok(),
+        card_gib,
+        prover::block::spill_target_bytes,
+    );
+    for (name, value) in &plan.set {
+        // SAFETY: the caller's: no other thread exists.
+        unsafe { std::env::set_var(name, value) };
+    }
+    let decay = match allocator::decay_ms() {
+        Some((-1, -1)) => "never purge (dirty -1, muzzy -1)".to_string(),
+        Some((d, m)) => format!("dirty_decay_ms {d}, muzzy_decay_ms {m} (_RJEM_MALLOC_CONF)"),
+        None => "unread".to_string(),
+    };
+    let words = |w: Vec<String>| {
+        if w.is_empty() {
+            "none".to_string()
+        } else {
+            w.join(" ")
+        }
+    };
+    let mut lines = vec![format!(
+        "BLOCK POSTURE SET: {} · from the environment: {} · jemalloc: {decay}",
+        words(plan.set.iter().map(|(n, v)| format!("{n}={v}")).collect()),
+        words(plan.env),
+    )];
+    lines.extend(plan.notes);
+    lines
+}
+
+/// `prove-block`'s sink: the driver's lines to stderr, and with `--digest`
+/// the base proof's digest, taken as it proves.
+struct CliSink {
+    digest: bool,
+    base_digest: std::sync::Mutex<Option<String>>,
+}
+
+impl prover::lfm::block_tree::BlockTreeSink for CliSink {
+    fn write(&self, text: &str) {
+        eprint!("{text}");
+    }
+
+    fn base_proved(&self, proof: &VmProof) {
+        if !self.digest {
+            return;
+        }
+        let line = match rkyv::to_bytes::<rkyv::rancor::Error>(proof) {
+            Ok(bytes) => format!(
+                "BLOCK BASE DIGEST: {} (blake3 of the {} base proof bytes)",
+                &blake3::hash(&bytes).to_hex()[..32],
+                bytes.len()
+            ),
+            Err(e) => format!("BLOCK BASE DIGEST: none ({e})"),
+        };
+        *self.base_digest.lock().unwrap_or_else(|e| e.into_inner()) = Some(line);
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn cmd_prove_block(
+    elf_path: PathBuf,
+    input_path: Option<PathBuf>,
+    output_path: PathBuf,
+    time: bool,
+    digest: bool,
+) -> ExitCode {
+    use prover::lfm::block_tree::{BlockTreeConfig, BlockTreeProof, prove_block_tree};
+
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let input = match read_private_input(input_path.as_ref()) {
+        Ok(input) => input,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cfg = match BlockTreeConfig::from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let sink = std::sync::Arc::new(CliSink {
+        digest,
+        base_digest: std::sync::Mutex::new(None),
+    });
+    let run = match prove_block_tree(&elf_data, &input, &cfg, sink.clone()) {
+        Ok(run) => run,
+        Err(e) => {
+            eprintln!("Block proof failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let top_digest =
+        digest.then(
+            || match rkyv::to_bytes::<rkyv::rancor::Error>(&run.top_proof.proof) {
+                Ok(bytes) => format!(
+                    "BLOCK TOP DIGEST: {} (blake3 of the top proof's {} bytes)",
+                    &blake3::hash(&bytes).to_hex()[..32],
+                    bytes.len()
+                ),
+                Err(e) => format!("BLOCK TOP DIGEST: none ({e})"),
+            },
+        );
+    let whole = run.times.whole;
+    let top_id = hex(&run.top_program_id);
+    let output_hex = hex(&run.public_output);
+    let file = BlockTreeProof::stark(run.shape, run.public_output, run.top_proof);
+    let bytes = match file.to_bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("Failed to serialize the block proof: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = std::fs::write(&output_path, &bytes) {
+        eprintln!("Failed to write {output_path:?}: {e}");
+        return ExitCode::FAILURE;
+    }
+    eprintln!(
+        "Block proof written to {output_path:?} ({} bytes)",
+        bytes.len()
+    );
+    println!("Top program id: {top_id}");
+    println!("Output: {output_hex}");
+    if let Some(line) = sink
+        .base_digest
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        println!("{line}");
+    }
+    if let Some(line) = top_digest {
+        println!("{line}");
+    }
+    if time {
+        println!("Proving time: {whole:.3}s");
+    }
+    ExitCode::SUCCESS
+}
+
+fn cmd_verify_block(proof_path: PathBuf, elf_path: PathBuf, time: bool) -> ExitCode {
+    use prover::lfm::block_tree::{BlockTreeProof, verify_block_tree_proof};
+
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let bytes = match read_aligned_file(&proof_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to read proof file: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let proof = match BlockTreeProof::from_bytes(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to read the block proof: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    drop(bytes);
+    eprintln!("Verifying block proof...");
+    let start = Instant::now();
+    let result = verify_block_tree_proof(&elf_data, &proof);
+    let verify_elapsed = start.elapsed();
+    match result {
+        Ok(top_id) => {
+            eprintln!("Verification succeeded!");
+            println!("Top program id: {}", hex(&top_id));
+            println!("Output: {}", hex(&proof.public_output));
+            if time {
+                println!("Verification time: {:.3}s", verify_elapsed.as_secs_f64());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("Verification failed: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -461,7 +907,7 @@ fn cmd_execute(
     // below (the flamegraph path drives execution inside the executor and does
     // not expose per-log data). `None` means "not counted", so the accel lines
     // are omitted rather than printed as misleading zeros.
-    let mut accel_counts: Option<(u64, u64)> = None;
+    let mut accel_counts: Option<(u64, u64, u64)> = None;
 
     let cycle_count = if let Some(ref output_path) = flamegraph.path {
         // Shared execute+flamegraph path (executor::flamegraph) instead of
@@ -528,6 +974,7 @@ fn cmd_execute(
 
         let mut cycle_count: u64 = 0;
         let mut keccak_calls: u64 = 0;
+        let mut blake3_calls: u64 = 0;
         let mut ecsm_calls: u64 = 0;
         // Reused per chunk: `(current_pc, a7)` for logs whose a7 matches an
         // accelerator syscall number. This is a cheap superset — a non-ECALL
@@ -560,6 +1007,7 @@ fn cmd_execute(
             for (pc, a7) in accel_candidates.drain(..) {
                 match accelerator_of(executor.instructions.get(pc), a7) {
                     Some(Accelerator::Keccak) => keccak_calls += 1,
+                    Some(Accelerator::Blake3) => blake3_calls += 1,
                     Some(Accelerator::Ecsm) => ecsm_calls += 1,
                     None => {}
                 }
@@ -575,15 +1023,16 @@ fn cmd_execute(
         }
 
         if cycles {
-            accel_counts = Some((keccak_calls, ecsm_calls));
+            accel_counts = Some((keccak_calls, blake3_calls, ecsm_calls));
         }
         cycle_count
     };
 
     if cycles {
         println!("Cycles: {}", cycle_count);
-        if let Some((keccak_calls, ecsm_calls)) = accel_counts {
+        if let Some((keccak_calls, blake3_calls, ecsm_calls)) = accel_counts {
             println!("Keccak calls: {}", keccak_calls);
+            println!("Blake3 calls: {}", blake3_calls);
             println!("Ecsm calls: {}", ecsm_calls);
         }
     }
@@ -760,6 +1209,159 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) ->
         }
     };
     let result = prover::verify_with_options(&proof, &elf_data, &opts, None, None);
+    let verify_elapsed = start.elapsed();
+    let result = match result {
+        Ok(valid) => valid,
+        Err(e) => {
+            eprintln!("Verification error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if result {
+        eprintln!("Verification succeeded!");
+        if time {
+            println!("Verification time: {:.3}s", verify_elapsed.as_secs_f64());
+        }
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("Verification failed! Ensure --blowup matches the value used for proving.");
+        ExitCode::FAILURE
+    }
+}
+
+/// `prove --whir`: the multilinear backend.
+///
+/// Same executor, same traces, same AIRs as [`cmd_prove`]; each table is argued
+/// in one sumcheck against a WHIR commitment instead of a composition
+/// polynomial committed by FRI. The proof is a different type, so `verify`
+/// needs `--whir` too.
+///
+/// `blowup` reaches the AIRs (it sets the preprocessed commitments) but not the
+/// multilinear argument, which derives its own rate and query count from the
+/// tallest stacked polynomial in the proof.
+fn cmd_prove_whir(
+    elf_path: PathBuf,
+    output_path: PathBuf,
+    private_input_path: Option<PathBuf>,
+    blowup: u8,
+    time: bool,
+) -> ExitCode {
+    eprintln!("Reading ELF file...");
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let private_inputs = match read_private_input(private_input_path.as_ref()) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let opts = match GoldilocksCubicProofOptions::with_blowup(blowup) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("Invalid proof options: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!("Generating proof (multilinear/WHIR)...");
+    let start = Instant::now();
+    let proof = prover::multilinear_prove::prove_with_options_and_inputs(
+        &elf_data,
+        &private_inputs,
+        &opts,
+        &Default::default(),
+    );
+    let prove_elapsed = start.elapsed();
+    let proof = match proof {
+        Ok(proof) => proof,
+        Err(e) => {
+            eprintln!("Proof generation failed: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!("Writing proof...");
+    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&proof) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to serialize proof: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let file = match File::create(&output_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to create output file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = BufWriter::new(file).write_all(&bytes) {
+        eprintln!("Failed to write proof: {}", e);
+        return ExitCode::FAILURE;
+    }
+
+    eprintln!("Proof written to {:?}", output_path);
+    println!("Tables: {}", proof.proof.tables.len());
+    println!("Commitments: {}", proof.proof.roots.len());
+    if time {
+        println!("Proving time: {:.3}s", prove_elapsed.as_secs_f64());
+    }
+    ExitCode::SUCCESS
+}
+
+/// `verify --whir`: the counterpart of [`cmd_prove_whir`].
+fn cmd_verify_whir(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) -> ExitCode {
+    eprintln!("Reading ELF file...");
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!("Reading proof...");
+    let proof_bytes = match read_aligned_file(&proof_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to read proof file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let proof = match rkyv::from_bytes::<
+        prover::multilinear_prove::MultilinearVmProof,
+        rkyv::rancor::Error,
+    >(&proof_bytes)
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to deserialize proof: {e}");
+            eprintln!("(a proof produced without `--whir` needs `verify` without it)");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let opts = match GoldilocksCubicProofOptions::with_blowup(blowup) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("Invalid proof options: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!("Verifying proof (multilinear/WHIR)...");
+    let start = Instant::now();
+    let result = prover::multilinear_prove::verify_with_options(&proof, &elf_data, &opts);
     let verify_elapsed = start.elapsed();
     let result = match result {
         Ok(valid) => valid,
@@ -1139,6 +1741,169 @@ mod tests {
         assert!(help.contains("--epoch-size-log2 <N>"));
         assert!(!help.contains("--num-epochs"));
         assert!(!help.contains("--epoch-size <"));
+    }
+
+    /// `prove-block` takes the ELF, an optional input and a required output;
+    /// `verify-block` the proof and the ELF.
+    #[test]
+    fn the_block_commands_take_their_arguments() {
+        let ok = |args: &[&str]| Cli::command().try_get_matches_from(args).is_ok();
+        assert!(ok(&[
+            "cli",
+            "prove-block",
+            "guest.elf",
+            "-o",
+            "block.proof"
+        ]));
+        assert!(ok(&[
+            "cli",
+            "prove-block",
+            "guest.elf",
+            "--input",
+            "block.bin",
+            "-o",
+            "block.proof",
+            "--time",
+            "--digest"
+        ]));
+        assert!(
+            !ok(&["cli", "prove-block", "guest.elf"]),
+            "an output is required"
+        );
+        assert!(ok(&[
+            "cli",
+            "verify-block",
+            "block.proof",
+            "guest.elf",
+            "--time"
+        ]));
+        assert!(
+            !ok(&["cli", "verify-block", "block.proof"]),
+            "the ELF is required"
+        );
+    }
+
+    /// The posture sets exactly the knobs the environment leaves unset, and
+    /// the VRAM budget only on a card of at least 31 GiB.
+    #[test]
+    fn the_posture_sets_only_unset_knobs_and_the_budget_only_on_a_big_card() {
+        use prover::lfm::block_tree::{POSTURE, POSTURE_VRAM_KNOB};
+        let none = |_: &str| None;
+        let roomy = || 110u64 << 30;
+        let all = posture_plan(none, || Some(31.84), roomy);
+        assert_eq!(all.set, POSTURE.to_vec(), "every knob, on a 5090");
+        assert!(all.env.is_empty() && all.notes.is_empty());
+
+        for card in [Some(23.99), None] {
+            let small = posture_plan(none, || card, roomy);
+            assert!(
+                small.set.iter().all(|(n, _)| *n != POSTURE_VRAM_KNOB),
+                "{card:?}: no budget"
+            );
+            assert_eq!(small.set.len(), POSTURE.len() - 1, "{card:?}");
+            assert_eq!(small.notes.len(), 1, "{card:?}: the budget says why");
+        }
+
+        let mine = posture_plan(
+            |n| (n == "TABLE_PARALLELISM").then(|| "4".to_string()),
+            || Some(31.84),
+            roomy,
+        );
+        assert!(mine.set.iter().all(|(n, _)| *n != "TABLE_PARALLELISM"));
+        assert_eq!(mine.env, vec!["TABLE_PARALLELISM=4".to_string()]);
+    }
+
+    /// The precomputed-tree cache's posture follows the host target: 64
+    /// entries from a 64 GiB target up, 16 below it (with a note), and a value
+    /// the environment sets is left alone.
+    #[test]
+    fn the_tree_cache_posture_follows_the_host_target() {
+        use prover::lfm::block_tree::POSTURE_TREE_CACHE_KNOB as CAP;
+        let none = |_: &str| None;
+        let cap = |plan: &PosturePlan| plan.set.iter().find(|(n, _)| *n == CAP).map(|(_, v)| *v);
+        let big = posture_plan(none, || Some(31.84), || 64u64 << 30);
+        assert_eq!(cap(&big), Some("64"));
+        assert!(big.notes.is_empty());
+        let small = posture_plan(none, || Some(31.84), || 54u64 << 30);
+        assert_eq!(cap(&small), Some("16"));
+        assert_eq!(
+            small.notes.iter().filter(|n| n.contains(CAP)).count(),
+            1,
+            "the note says why"
+        );
+        let set = posture_plan(
+            |n| (n == CAP).then(|| "32".to_string()),
+            || Some(31.84),
+            || 54u64 << 30,
+        );
+        assert_eq!(cap(&set), None, "the environment's value stays");
+        assert_eq!(set.env, vec![format!("{CAP}=32")]);
+    }
+
+    /// The block verifier's derive window follows the host target: left unset
+    /// (the whole level) from a 64 GiB target up, 16 below it with a note, and
+    /// a value the environment sets is left alone.
+    #[test]
+    fn the_derive_window_posture_follows_the_host_target() {
+        use prover::lfm::block_tree::POSTURE_DERIVE_BUILDS_KNOB as WIN;
+        let none = |_: &str| None;
+        let window = |plan: &PosturePlan| plan.set.iter().find(|(n, _)| *n == WIN).map(|(_, v)| *v);
+        let noted = |plan: &PosturePlan| plan.notes.iter().filter(|n| n.contains(WIN)).count();
+        for gib in [64u64, 110] {
+            let big = posture_plan(none, || Some(31.84), || gib << 30);
+            assert_eq!(window(&big), None, "{gib} GiB: the whole level");
+            assert_eq!(noted(&big), 0, "{gib} GiB");
+        }
+        for gib in [54u64, 38, 22] {
+            let small = posture_plan(none, || Some(31.84), || gib << 30);
+            assert_eq!(window(&small), Some("16"), "{gib} GiB");
+            assert_eq!(noted(&small), 1, "{gib} GiB: the note says why");
+        }
+        let set = posture_plan(
+            |n| (n == WIN).then(|| "8".to_string()),
+            || Some(31.84),
+            || 22u64 << 30,
+        );
+        assert_eq!(window(&set), None, "the environment's value stays");
+        assert!(set.env.contains(&format!("{WIN}=8")));
+    }
+
+    /// The binary runs the allocator posture it compiles in: jemalloc never
+    /// purges (`opt.dirty_decay_ms` and `opt.muzzy_decay_ms` are -1), unless
+    /// `_RJEM_MALLOC_CONF` says otherwise. Deleting the `malloc_conf` export
+    /// turns this red.
+    #[test]
+    fn the_binary_runs_its_never_purge_posture() {
+        if std::env::var_os("_RJEM_MALLOC_CONF").is_some() {
+            println!("_RJEM_MALLOC_CONF is set: the compiled posture is overridden, not read");
+            return;
+        }
+        assert_eq!(allocator::decay_ms(), Some((-1, -1)));
+    }
+
+    /// The hooks the binary installs reach its jemalloc: the prover reads the
+    /// statistics through them, and the purge hands back the pages 512 freed
+    /// buffers of 1 MiB left behind (under the never-purge posture they stay
+    /// resident until then).
+    #[test]
+    fn the_installed_hooks_read_and_purge_this_binarys_jemalloc() {
+        prover::alloc_purge::install(allocator::HOOKS);
+        let resident = || {
+            prover::alloc_purge::stats()
+                .expect("the prover reads the installed hooks")
+                .resident
+        };
+        let buffers: Vec<Vec<u8>> = (0..512).map(|_| vec![1u8; 1 << 20]).collect();
+        drop(buffers);
+        let retained = resident();
+        assert!((allocator::HOOKS.purge_all)(), "the purge runs");
+        let purged = resident();
+        assert!(
+            retained >= purged + (256 << 20),
+            "resident {} → {} MiB: the purge returned less than half of 512 MiB freed",
+            retained >> 20,
+            purged >> 20
+        );
     }
 
     #[test]

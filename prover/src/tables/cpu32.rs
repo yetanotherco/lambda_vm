@@ -20,6 +20,7 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op,
     packed_decode_shrunk,
@@ -195,61 +196,65 @@ impl Cpu32Operation {
 pub fn generate_cpu32_trace(
     operations: &[Cpu32Operation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_cpu32_trace_as(operations, TraceForm::Wide)
+}
+
+/// The widths CPU32 traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_cpu32_trace`] in `form` (`tables::gpack`).
+pub fn generate_cpu32_trace_as(
+    operations: &[Cpu32Operation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, op) in operations.iter().enumerate() {
+            let aux = op.compute_aux();
 
-    for (row_idx, op) in operations.iter().enumerate() {
-        let aux = op.compute_aux();
+            // Inputs
+            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+            table.set_dword_wl(row_idx, cols::PC_0, op.pc);
 
-        // Inputs
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
-        table.set_dword_wl(row_idx, cols::PC_0, op.pc);
+            // rv1 as DWordWHH: [Half, Half, Word]
+            table.set_byte(row_idx, cols::RS1, op.rs1);
+            table.set_bool(row_idx, cols::READ_REGISTER1, op.read_register1);
+            table.set_dword_whh(row_idx, cols::RV1_0, op.rv1);
+            table.set_bool(row_idx, cols::RV1_SIGN, aux.rv1_sign);
+            table.set_dword_wl(row_idx, cols::ARG1_0, aux.arg1);
 
-        // rv1 as DWordWHH: [Half, Half, Word]
-        table.set_byte(row_idx, cols::RS1, op.rs1);
-        table.set_bool(row_idx, cols::READ_REGISTER1, op.read_register1);
-        table.set_dword_whh(row_idx, cols::RV1_0, op.rv1);
-        table.set_bool(row_idx, cols::RV1_SIGN, aux.rv1_sign);
-        table.set_dword_wl(row_idx, cols::ARG1_0, aux.arg1);
+            // rv2 as DWordWHH
+            table.set_byte(row_idx, cols::RS2, op.rs2);
+            table.set_bool(row_idx, cols::READ_REGISTER2, op.read_register2);
+            table.set_dword_whh(row_idx, cols::RV2_0, op.rv2);
+            table.set_bool(row_idx, cols::RV2_SIGN, aux.rv2_sign);
+            table.set_dword_wl(row_idx, cols::IMM_0, op.imm);
+            table.set_dword_wl(row_idx, cols::ARG2_0, aux.arg2);
 
-        // rv2 as DWordWHH
-        table.set_byte(row_idx, cols::RS2, op.rs2);
-        table.set_bool(row_idx, cols::READ_REGISTER2, op.read_register2);
-        table.set_dword_whh(row_idx, cols::RV2_0, op.rv2);
-        table.set_bool(row_idx, cols::RV2_SIGN, aux.rv2_sign);
-        table.set_dword_wl(row_idx, cols::IMM_0, op.imm);
-        table.set_dword_wl(row_idx, cols::ARG2_0, aux.arg2);
+            // res as DWordHL: 4 halves
+            table.set_dword_hl(row_idx, cols::RES_0, op.res);
+            table.set_bool(row_idx, cols::RES_SIGN, aux.res_sign);
 
-        // res as DWordHL: 4 halves
-        table.set_dword_hl(row_idx, cols::RES_0, op.res);
-        table.set_bool(row_idx, cols::RES_SIGN, aux.res_sign);
+            // rd write
+            table.set_byte(row_idx, cols::RD, op.rd);
+            table.set_bool(row_idx, cols::WRITE_REGISTER, op.write_register);
+            table.set_dword_wl(row_idx, cols::RVD_0, aux.rvd);
 
-        // rd write
-        table.set_byte(row_idx, cols::RD, op.rd);
-        table.set_bool(row_idx, cols::WRITE_REGISTER, op.write_register);
-        table.set_dword_wl(row_idx, cols::RVD_0, aux.rvd);
+            // ALU control
+            table.set_bool(row_idx, cols::ALU, op.alu);
+            table.set_byte(row_idx, cols::ALU_FLAGS, op.alu_flags);
+            table.set_bool(row_idx, cols::ADD, op.add);
+            table.set_bool(row_idx, cols::SUB, op.sub);
+            table.set_byte(
+                row_idx,
+                cols::HALF_INSTRUCTION_LENGTH,
+                op.half_instruction_length,
+            );
+            table.set_bool(row_idx, cols::SIGNED, aux.signed);
 
-        // ALU control
-        table.set_bool(row_idx, cols::ALU, op.alu);
-        table.set_byte(row_idx, cols::ALU_FLAGS, op.alu_flags);
-        table.set_bool(row_idx, cols::ADD, op.add);
-        table.set_bool(row_idx, cols::SUB, op.sub);
-        table.set_byte(
-            row_idx,
-            cols::HALF_INSTRUCTION_LENGTH,
-            op.half_instruction_length,
-        );
-        table.set_bool(row_idx, cols::SIGNED, aux.signed);
-
-        table.set_fe(row_idx, cols::MU, FE::one());
-    }
-
-    trace
+            table.set_fe(row_idx, cols::MU, FE::one());
+        }
+    })
 }
 
 // =========================================================================

@@ -1,0 +1,25 @@
+==========================================================================
+LAYER 2 -- socket KATs
+==========================================================================
+  vectors                     : 20 (10 inputs x 2 round counts)
+  framing controls evaluated  : 254
+  framing degrees of freedom  : 14
+    swap_a_b             discriminated by 16 vector-instances
+    tag_changed          discriminated by 20 vector-instances
+    tag_omitted          discriminated by 20 vector-instances
+    truncate_high_half   discriminated by 20 vector-instances
+    flags_parent         discriminated by 20 vector-instances
+    flags_no_root        discriminated by 20 vector-instances
+    block_len_64         discriminated by 20 vector-instances
+    block_len_32         discriminated by 20 vector-instances
+    counter_one          discriminated by 20 vector-instances
+    cv_zero              discriminated by 20 vector-instances
+    lanes_big_endian     discriminated by 12 vector-instances
+    tag_slot_moved       discriminated by 20 vector-instances
+    msg_perm_swapped     discriminated by 16 vector-instances
+    rounds_6_not_7       discriminated by 10 vector-instances
+  [PASS] cross-check PASS: 20 peer vectors reproduced exactly (spec fields agree too)
+
+  wrote /Users/maurofab/workspace/lambda_vm/thoughts/shared/lfm-real-hash/gate-oracle/socket_kats.json
+--------------------------------------------------------------------------
+LAYER 2: PASS

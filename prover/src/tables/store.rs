@@ -24,6 +24,7 @@ use stark::trace::TraceTable;
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 use crate::constraints::templates::emit_is_bit;
 
@@ -95,25 +96,29 @@ impl StoreOperation {
 pub fn generate_store_trace(
     operations: &[StoreOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_store_trace_as(operations, TraceForm::Wide)
+}
+
+/// The widths STORE traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_store_trace`] in `form` (`tables::gpack`).
+pub fn generate_store_trace_as(
+    operations: &[StoreOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
-
-    for (row_idx, op) in operations.iter().enumerate() {
-        table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
-        table.set_bool(row_idx, cols::WRITE2, op.write2);
-        table.set_bool(row_idx, cols::WRITE4, op.write4);
-        table.set_bool(row_idx, cols::WRITE8, op.write8);
-        table.set_dword_bl(row_idx, cols::VALUE[0], op.value);
-        table.set_fe(row_idx, cols::MU, FE::one());
-    }
-
-    trace
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, op) in operations.iter().enumerate() {
+            table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
+            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+            table.set_bool(row_idx, cols::WRITE2, op.write2);
+            table.set_bool(row_idx, cols::WRITE4, op.write4);
+            table.set_bool(row_idx, cols::WRITE8, op.write8);
+            table.set_dword_bl(row_idx, cols::VALUE[0], op.value);
+            table.set_fe(row_idx, cols::MU, FE::one());
+        }
+    })
 }
 
 // =========================================================================

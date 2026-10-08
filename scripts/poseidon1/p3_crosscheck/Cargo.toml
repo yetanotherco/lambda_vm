@@ -1,0 +1,12 @@
+[package]
+name = "p3-crosscheck"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+p3-goldilocks = { path = "/Users/maurofab/workspace/Plonky3/goldilocks" }
+p3-poseidon1 = { path = "/Users/maurofab/workspace/Plonky3/poseidon1" }
+p3-symmetric = { path = "/Users/maurofab/workspace/Plonky3/symmetric" }
+p3-field = { path = "/Users/maurofab/workspace/Plonky3/field" }
+
+[workspace]

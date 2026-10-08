@@ -29,8 +29,9 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use std::collections::HashMap;
+use super::trace_hash::{OpMap, trace_hash_state};
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
 
 // =========================================================================
@@ -159,21 +160,88 @@ impl LtOperation {
 pub fn generate_lt_trace(
     operations: &[LtOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_lt_trace_segments(&[operations])
+}
+
+/// [`generate_lt_trace`] in `form` (`tables::gpack`).
+pub fn generate_lt_trace_as(
+    operations: &[LtOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_lt_trace_segments_as(&[operations], form)
+}
+
+/// [`generate_lt_trace`] over `segments`, the operations one after another: a
+/// chunk handed out as the window parts it lies in.
+pub(crate) fn generate_lt_trace_segments(
+    segments: &[&[LtOperation]],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_lt_trace_segments_as(segments, TraceForm::Wide)
+}
+
+/// The widths LT traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_lt_trace_segments`] in `form` (`tables::gpack`).
+pub(crate) fn generate_lt_trace_segments_as(
+    segments: &[&[LtOperation]],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let unique_ops = deduplicate(segments.iter().flat_map(|s| s.iter()));
+    let num_rows = unique_ops.len().next_power_of_two().max(4);
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |t| {
+        fill_lt_rows(t, &unique_ops)
+    })
+}
+
+/// [`generate_lt_trace`], packed (`stark::narrow`) as it is built, a block of
+/// [`PACKED_BLOCK_ROWS`] rows at a time: the same words in the same order,
+/// and never the whole 64-bit table. `None` where a trace cannot be held
+/// packed (`TraceTable::from_narrow_main`).
+pub fn generate_lt_trace_packed(
+    operations: &[LtOperation],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let unique_ops = deduplicate(operations);
+    let num_rows = unique_ops.len().next_power_of_two().max(4);
+    let mut builder = stark::narrow::NarrowBuilder::new(num_rows, cols::NUM_COLUMNS);
+    for part in unique_ops.chunks(PACKED_BLOCK_ROWS) {
+        let mut block = stark::table::Table::new(
+            crate::tables::types::zeroed_fe_vec(part.len() * cols::NUM_COLUMNS),
+            cols::NUM_COLUMNS,
+        );
+        fill_lt_rows(&mut block, part);
+        builder.push_rows(crate::tables::types::fe_words(block.row_major_data()));
+    }
+    let narrow = builder.finish();
+    WIDTHS.learn(narrow.widths());
+    TraceTable::from_narrow_main(narrow, 1)
+}
+
+/// Whether LT traces were built packed in this process, so G-pack can write
+/// the next one packed directly (`tables::gpack`).
+pub(crate) fn widths_known() -> bool {
+    WIDTHS.known(cols::NUM_COLUMNS)
+}
+
+/// Rows per block of [`generate_lt_trace_packed`].
+const PACKED_BLOCK_ROWS: usize = 1 << 12;
+
+/// The distinct operations with their multiplicities, in the map's order (one
+/// hash state per process, `tables::trace_hash`, so the order is a function of
+/// `operations`).
+fn deduplicate<'a>(
+    operations: impl IntoIterator<Item = &'a LtOperation>,
+) -> Vec<(LtOperation, u64)> {
     // Deduplicate operations: (lhs, rhs, signed) -> multiplicity
-    let mut op_map: HashMap<LtOperation, u64> = HashMap::new();
+    let mut op_map: OpMap<LtOperation, u64> = OpMap::with_hasher(trace_hash_state());
     for op in operations {
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
+    op_map.into_iter().collect()
+}
 
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
-    let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
-
+/// Rows `0..unique_ops.len()` of a zeroed LT table.
+fn fill_lt_rows<T: VmTable>(table: &mut T, unique_ops: &[(LtOperation, u64)]) {
     for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
         // Store input columns
         table.set_dword_hhw(row_idx, cols::LHS_0, op.lhs);
@@ -204,8 +272,6 @@ pub fn generate_lt_trace(
         // All LT lookups go through the unified ALU bus → single multiplicity.
         table.set_u64(row_idx, cols::MU, *multiplicity);
     }
-
-    trace
 }
 
 // =========================================================================

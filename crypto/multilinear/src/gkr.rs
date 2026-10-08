@@ -1,0 +1,781 @@
+//! LogUp as a tree of fractions: `p₁/q₁ + p₂/q₂ = (p₁q₂ + p₂q₁)/(q₁q₂)`, added
+//! pairwise up a binary tree with GKR proving each layer against the one below.
+//! Only the input layer is ever committed.
+//!
+//! Proves the sum is whatever the output claims. Checking that the output
+//! numerator is zero — the bus balance — is the caller's.
+
+use crypto::fiat_shamir::is_transcript::IsTranscript;
+use math::field::{element::FieldElement, traits::IsField};
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
+use crate::{
+    Error,
+    eq::{eq_eval, eq_mle},
+    mle::Mle,
+    poly::SumcheckPolynomial,
+    program::{Builder, Program},
+    sumcheck::{self, SumcheckProof},
+};
+
+/// One level of the tree: numerators and denominators over the same cube.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FractionLayer<F: IsField> {
+    pub p: Mle<F>,
+    pub q: Mle<F>,
+}
+
+impl<F: IsField + 'static> FractionLayer<F> {
+    pub fn new(p: Mle<F>, q: Mle<F>) -> Result<Self, Error> {
+        if p.num_vars() != q.num_vars() {
+            return Err(Error::VariableCountMismatch {
+                expected: p.num_vars(),
+                got: q.num_vars(),
+            });
+        }
+        Ok(Self { p, q })
+    }
+
+    pub fn num_vars(&self) -> usize {
+        self.p.num_vars()
+    }
+
+    /// Adds the two halves pointwise, giving the layer one level up.
+    pub fn fold(&self) -> Result<Self, Error>
+    where
+        FieldElement<F>: Send + Sync,
+    {
+        if self.num_vars() == 0 {
+            return Err(Error::NoVariablesLeft);
+        }
+        let half = self.p.len() / 2;
+        let (p_lo, p_hi) = self.p.evals().split_at(half);
+        let (q_lo, q_hi) = self.q.evals().split_at(half);
+
+        // Every index folds on its own, and building the tree is a pass over
+        // the input layer at every level, so this is worth the pool.
+        let both = |i: usize| {
+            (
+                &p_lo[i] * &q_hi[i] + &p_hi[i] * &q_lo[i],
+                &q_lo[i] * &q_hi[i],
+            )
+        };
+        #[cfg(feature = "parallel")]
+        let (next_p, next_q): (Vec<_>, Vec<_>) = if half >= crate::SERIAL_BELOW {
+            (0..half).into_par_iter().map(both).unzip()
+        } else {
+            (0..half).map(both).unzip()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let (next_p, next_q): (Vec<_>, Vec<_>) = (0..half).map(both).unzip();
+
+        Self::new(Mle::new(next_p)?, Mle::new(next_q)?)
+    }
+}
+
+/// The whole tree, from the input layer down to the single output fraction.
+///
+/// `layers[0]` is the output (zero variables); the last entry is the input.
+#[derive(Debug)]
+pub struct FractionTree<F: IsField> {
+    /// Empty when the tree lives on a device, which holds every layer.
+    layers: Vec<FractionLayer<F>>,
+    device: Option<crate::gpu::DeviceTree>,
+    num_layers: usize,
+    output: (FieldElement<F>, FieldElement<F>),
+}
+
+impl<F: IsField + 'static> FractionTree<F> {
+    /// Builds every layer by repeated folding.
+    ///
+    /// On a device the layers stay there: the tree is the biggest thing a
+    /// table's argument holds, and GKR reads every level of it.
+    pub fn build(input: FractionLayer<F>) -> Result<Self, Error>
+    where
+        FieldElement<F>: Send + Sync,
+    {
+        if let Some(device) = crate::gpu::build_tree(&input.p, &input.q) {
+            return Self::from_device(device);
+        }
+
+        let mut layers = vec![input];
+        while layers.last().expect("non-empty").num_vars() > 0 {
+            let next = layers.last().expect("non-empty").fold()?;
+            layers.push(next);
+        }
+        layers.reverse();
+        let top = &layers[0];
+        let output = (top.p.evals()[0].clone(), top.q.evals()[0].clone());
+        let num_layers = layers.len();
+        Ok(Self {
+            layers,
+            device: None,
+            num_layers,
+            output,
+        })
+    }
+
+    /// A tree a device already holds, layers and all.
+    pub fn from_device(device: crate::gpu::DeviceTree) -> Result<Self, Error> {
+        let num_layers = device.num_layers();
+        let output = device.output()?;
+        Ok(Self {
+            layers: Vec::new(),
+            device: Some(device),
+            num_layers,
+            output,
+        })
+    }
+
+    /// The output fraction `(p, q)`. The bus balances when `p` is zero.
+    pub fn output(&self) -> (FieldElement<F>, FieldElement<F>) {
+        self.output.clone()
+    }
+
+    pub fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    /// The layer, for a tree that kept them here.
+    pub fn layer(&self, i: usize) -> &FractionLayer<F> {
+        &self.layers[i]
+    }
+
+    /// The device holding every layer, when one does.
+    pub fn device(&self) -> Option<&crate::gpu::DeviceTree> {
+        self.device.as_ref()
+    }
+
+    pub fn input_layer(&self) -> &FractionLayer<F> {
+        self.layers.last().expect("non-empty")
+    }
+
+    /// The levels near the output, back here — `prefix[i]` is layer `i`.
+    ///
+    /// Empty for a tree that already lives here. One download brings the whole
+    /// prefix: the levels above the deepest of them are its folds, and the
+    /// deepest is a few kilobytes.
+    fn host_prefix(&self) -> Vec<FractionLayer<F>>
+    where
+        FieldElement<F>: Send + Sync,
+    {
+        let Some(device) = self.device.as_ref() else {
+            return Vec::new();
+        };
+        // Never the input layer: a tree that dropped it writes it again for its
+        // own sumcheck, and it is the one level too big to walk here.
+        let deepest = HOST_LAYER_VARS.min(self.num_layers.saturating_sub(2));
+        let Some((p, q)) = device.layer_to_host::<F>(deepest) else {
+            return Vec::new();
+        };
+        let Ok(layer) = FractionLayer::new(p, q) else {
+            return Vec::new();
+        };
+        if layer.num_vars() != deepest {
+            return Vec::new();
+        }
+        let mut prefix = vec![layer];
+        while prefix.last().expect("non-empty").num_vars() > 0 {
+            let Ok(next) = prefix.last().expect("non-empty").fold() else {
+                return Vec::new();
+            };
+            prefix.push(next);
+        }
+        prefix.reverse();
+        prefix
+    }
+}
+
+/// The deepest level that comes here whole: the one whose halves are already
+/// a cube of [`crate::HOST_CUBE_DIRECT`], so its sumcheck never goes to a device.
+const HOST_LAYER_VARS: usize = crate::HOST_CUBE_DIRECT.trailing_zeros() as usize + 1;
+
+/// The layer relation: `Σ_x eq(r,x)·[p_lo·q_hi + p_hi·q_lo + λ·q_lo·q_hi]`,
+/// which equals `p_out(r) + λ·q_out(r)` when the layer really is the fold.
+struct LayerRelation<F: IsField> {
+    /// `[eq, p_lo, p_hi, q_lo, q_hi]`.
+    polys: Vec<Mle<F>>,
+    lambda: FieldElement<F>,
+    /// The same rule as straight-line code, for the device path. `None` for a
+    /// relation that is here on purpose — a level the tree handed over, or the
+    /// tail of one — so the dispatch does not send it back.
+    program: Option<Program<F>>,
+}
+
+impl<F: IsField + 'static> LayerRelation<F> {
+    const EQ: usize = 0;
+    const P_LO: usize = 1;
+    const P_HI: usize = 2;
+    const Q_LO: usize = 3;
+    const Q_HI: usize = 4;
+
+    fn new(
+        next: &FractionLayer<F>,
+        r: &[FieldElement<F>],
+        lambda: FieldElement<F>,
+        dispatchable: bool,
+    ) -> Result<Self, Error> {
+        let half = next.p.len() / 2;
+        let split = |m: &Mle<F>| -> Result<(Mle<F>, Mle<F>), Error> {
+            Ok((
+                Mle::new(m.evals()[..half].to_vec())?,
+                Mle::new(m.evals()[half..].to_vec())?,
+            ))
+        };
+        let (p_lo, p_hi) = split(&next.p)?;
+        let (q_lo, q_hi) = split(&next.q)?;
+        Ok(Self {
+            polys: vec![eq_mle(r)?, p_lo, p_hi, q_lo, q_hi],
+            program: dispatchable
+                .then(|| Self::program_for(&lambda))
+                .transpose()?,
+            lambda,
+        })
+    }
+
+    /// The same relation over factors a device already folded: the weight and
+    /// the four halves as its last round left them.
+    fn from_factors(polys: Vec<Mle<F>>, lambda: FieldElement<F>) -> Result<Self, Error> {
+        if polys.len() != 5 {
+            return Err(Error::VariableCountMismatch {
+                expected: 5,
+                got: polys.len(),
+            });
+        }
+        Ok(Self {
+            polys,
+            program: None,
+            lambda,
+        })
+    }
+
+    /// `eq·(p_lo·q_hi + p_hi·q_lo + lambda·q_lo·q_hi)`, the same expression
+    /// [`combine`](SumcheckPolynomial::combine) evaluates.
+    fn program_for(lambda: &FieldElement<F>) -> Result<Program<F>, Error> {
+        let mut b = Builder::<F>::new();
+        let eq = b.var(Self::EQ);
+        let p_lo = b.var(Self::P_LO);
+        let p_hi = b.var(Self::P_HI);
+        let q_lo = b.var(Self::Q_LO);
+        let q_hi = b.var(Self::Q_HI);
+        let first = b.mul(p_lo, q_hi);
+        let second = b.mul(p_hi, q_lo);
+        let numerator = b.add(first, second);
+        let denominator = b.mul(q_lo, q_hi);
+        let weighted = b.fixed(lambda.clone());
+        let scaled = b.mul(weighted, denominator);
+        let sum = b.add(numerator, scaled);
+        let root = b.mul(eq, sum);
+        b.finish(root)
+    }
+}
+
+/// `eq` times a product of two layer values.
+const LAYER_DEGREE: usize = 3;
+
+impl<F: IsField + 'static> SumcheckPolynomial<F> for LayerRelation<F> {
+    fn num_vars(&self) -> usize {
+        self.polys[Self::EQ].num_vars()
+    }
+
+    fn degree(&self) -> usize {
+        LAYER_DEGREE
+    }
+
+    fn polys(&self) -> &[Mle<F>] {
+        &self.polys
+    }
+
+    fn combine(&self, v: &[FieldElement<F>]) -> FieldElement<F> {
+        let numerator = &v[Self::P_LO] * &v[Self::Q_HI] + &v[Self::P_HI] * &v[Self::Q_LO];
+        let denominator = &v[Self::Q_LO] * &v[Self::Q_HI];
+        &v[Self::EQ] * (numerator + &self.lambda * denominator)
+    }
+
+    fn fix_first_variable(&mut self, r: &FieldElement<F>) -> Result<(), Error> {
+        for p in &mut self.polys {
+            p.fix_first_variable_in_place(r)?;
+        }
+        Ok(())
+    }
+
+    fn program(&self) -> Option<&Program<F>> {
+        self.program.as_ref()
+    }
+
+    /// The layer relation is four multiplications written out, not a program
+    /// the host walks — so its rounds are worth taking back much earlier.
+    fn host_cube(&self) -> usize {
+        crate::HOST_CUBE_DIRECT
+    }
+
+    fn accept_folded(&mut self, polys: Vec<Mle<F>>) -> Result<(), Error> {
+        if polys.len() != self.polys.len() {
+            return Err(Error::VariableCountMismatch {
+                expected: self.polys.len(),
+                got: polys.len(),
+            });
+        }
+        self.polys = polys;
+        Ok(())
+    }
+}
+
+/// One layer's transcript: the sumcheck plus the four values it reduces to.
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[serde(bound = "")]
+pub struct LayerProof<F: IsField> {
+    pub sumcheck: SumcheckProof<F>,
+    pub p_lo: FieldElement<F>,
+    pub p_hi: FieldElement<F>,
+    pub q_lo: FieldElement<F>,
+    pub q_hi: FieldElement<F>,
+}
+
+/// A proof for the whole tree, output layer first.
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[serde(bound = "")]
+pub struct GkrProof<F: IsField> {
+    pub layers: Vec<LayerProof<F>>,
+}
+
+/// What the verifier is left holding about the **input** layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GkrClaim<F: IsField> {
+    pub point: Vec<FieldElement<F>>,
+    pub p: FieldElement<F>,
+    pub q: FieldElement<F>,
+}
+
+/// What proving leaves the caller holding.
+///
+/// The claim is the same one [`verify`] arrives at: the prover needs it to
+/// discharge the input layer, which is where the trace is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GkrOutput<F: IsField> {
+    pub proof: GkrProof<F>,
+    pub claim: GkrClaim<F>,
+}
+
+/// `(1 − c)·lo + c·hi` — the multilinear interpolation that turns the two
+/// restricted claims back into one claim on the fuller layer.
+fn combine_halves<F: IsField>(
+    lo: &FieldElement<F>,
+    hi: &FieldElement<F>,
+    c: &FieldElement<F>,
+) -> FieldElement<F> {
+    lo + c * &(hi - lo)
+}
+
+/// Proves the tree, from the output fraction down to the input layer.
+pub fn prove<F, T>(tree: &FractionTree<F>, transcript: &mut T) -> Result<GkrOutput<F>, Error>
+where
+    F: IsField + 'static,
+    T: IsTranscript<F>,
+{
+    let mut layers = Vec::with_capacity(tree.num_layers().saturating_sub(1));
+    // The output layer has no variables, so the first claim sits at the empty
+    // point and needs no challenge.
+    let mut point: Vec<FieldElement<F>> = Vec::new();
+    let (mut p_claim, mut q_claim) = tree.output();
+    // The levels near the output, fetched once. Their rounds are over cubes a
+    // core walks in microseconds, and a device pays a launch for each.
+    let prefix = tree.host_prefix();
+
+    for i in 0..tree.num_layers() - 1 {
+        let lambda: FieldElement<F> = transcript.sample_field_element();
+
+        // What the device ran of this layer, and the relation it left behind.
+        // A tree the device holds proves its layer where it lies — the halves
+        // are the sumcheck's factors in place — until the cube reaches the
+        // crossover, and hands the factors over from there.
+        let (mut rounds, mut z, mut relation) = match prefix.get(i + 1) {
+            Some(here) => (
+                Vec::new(),
+                Vec::new(),
+                LayerRelation::new(here, &point, lambda, false)?,
+            ),
+            None => match tree.device() {
+                Some(device) => {
+                    let program = LayerRelation::program_for(&lambda)?;
+                    let attempt = device.prove_layer(
+                        i + 1,
+                        &point,
+                        &program,
+                        LAYER_DEGREE,
+                        crate::HOST_CUBE_DIRECT,
+                        |sent| {
+                            for value in sent {
+                                transcript.append_field_element(value);
+                            }
+                            transcript.sample_field_element()
+                        },
+                    );
+                    let Some(outcome) = attempt else {
+                        return Err(Error::DeviceFailed {
+                            stage: "layer sumcheck",
+                        });
+                    };
+                    let (rounds, z, factors) = outcome?;
+                    (rounds, z, LayerRelation::from_factors(factors, lambda)?)
+                }
+                None => (
+                    Vec::new(),
+                    Vec::new(),
+                    LayerRelation::new(tree.layer(i + 1), &point, lambda, true)?,
+                ),
+            },
+        };
+
+        // The tail, however much of it is left: all of it for a level that came
+        // here whole, none for one the device ran out.
+        let left = relation.num_vars();
+        let (tail, tail_z) = sumcheck::prove_rounds(&mut relation, left, transcript)?;
+        rounds.extend(tail);
+        z.extend(tail_z);
+        let sumcheck = SumcheckProof { rounds };
+
+        // The four restricted values the verifier needs to close the round are
+        // what the sumcheck's own factors have become: binding every variable
+        // to `z` is the evaluation at `z`. Evaluating the halves again would be
+        // a second pass over the layer, and the layers are the biggest thing
+        // the fraction tree holds.
+        let bound = |slot: usize| -> Result<FieldElement<F>, Error> {
+            relation.polys()[slot]
+                .as_constant()
+                .cloned()
+                .ok_or(Error::NoVariablesLeft)
+        };
+        let p_lo = bound(LayerRelation::<F>::P_LO)?;
+        let p_hi = bound(LayerRelation::<F>::P_HI)?;
+        let q_lo = bound(LayerRelation::<F>::Q_LO)?;
+        let q_hi = bound(LayerRelation::<F>::Q_HI)?;
+
+        for v in [&p_lo, &p_hi, &q_lo, &q_hi] {
+            transcript.append_field_element(v);
+        }
+        let c = transcript.sample_field_element();
+
+        // Next layer's claim lives at (c, z).
+        p_claim = combine_halves(&p_lo, &p_hi, &c);
+        q_claim = combine_halves(&q_lo, &q_hi, &c);
+        point = std::iter::once(c).chain(z).collect();
+
+        layers.push(LayerProof {
+            sumcheck,
+            p_lo,
+            p_hi,
+            q_lo,
+            q_hi,
+        });
+    }
+
+    Ok(GkrOutput {
+        proof: GkrProof { layers },
+        claim: GkrClaim {
+            point,
+            p: p_claim,
+            q: q_claim,
+        },
+    })
+}
+
+/// Verifies the tree against a claimed output fraction.
+pub fn verify<F, T>(
+    proof: &GkrProof<F>,
+    output: (FieldElement<F>, FieldElement<F>),
+    transcript: &mut T,
+) -> Result<GkrClaim<F>, Error>
+where
+    F: IsField + 'static,
+    T: IsTranscript<F>,
+{
+    let (mut p_claim, mut q_claim) = output;
+    let mut point: Vec<FieldElement<F>> = Vec::new();
+
+    for (i, layer) in proof.layers.iter().enumerate() {
+        let lambda = transcript.sample_field_element();
+        let claimed_sum = &p_claim + &lambda * &q_claim;
+
+        let claim = sumcheck::verify(&layer.sumcheck, claimed_sum, point.len(), 3, transcript)?;
+
+        // The sumcheck's residual must be the layer relation at that point.
+        let eq_at = eq_eval(&point, &claim.point)?;
+        let numerator = &layer.p_lo * &layer.q_hi + &layer.p_hi * &layer.q_lo;
+        let denominator = &layer.q_lo * &layer.q_hi;
+        let expected = eq_at * (numerator + &lambda * denominator);
+        if expected != claim.expected_evaluation {
+            return Err(Error::LayerRelationMismatch { layer: i });
+        }
+
+        for v in [&layer.p_lo, &layer.p_hi, &layer.q_lo, &layer.q_hi] {
+            transcript.append_field_element(v);
+        }
+        let c = transcript.sample_field_element();
+
+        p_claim = combine_halves(&layer.p_lo, &layer.p_hi, &c);
+        q_claim = combine_halves(&layer.q_lo, &layer.q_hi, &c);
+        point = std::iter::once(c).chain(claim.point).collect();
+    }
+
+    Ok(GkrClaim {
+        point,
+        p: p_claim,
+        q: q_claim,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use math::field::goldilocks::GoldilocksField as F;
+
+    type FE = FieldElement<F>;
+
+    fn transcript() -> DefaultTranscript<F> {
+        DefaultTranscript::<F>::new(b"gkr-test")
+    }
+
+    fn mle(vals: &[u64]) -> Mle<F> {
+        Mle::new(vals.iter().map(|v| FE::from(*v)).collect()).unwrap()
+    }
+
+    fn layer(p: &[u64], q: &[u64]) -> FractionLayer<F> {
+        FractionLayer::new(mle(p), mle(q)).unwrap()
+    }
+
+    /// Σ pᵢ/qᵢ computed directly, for comparison against the tree.
+    fn direct_sum(p: &[u64], q: &[u64]) -> FE {
+        p.iter().zip(q).fold(FE::zero(), |acc, (pi, qi)| {
+            acc + FE::from(*pi) * FE::from(*qi).inv().unwrap()
+        })
+    }
+
+    /// A LogUp-shaped input layer: `mult / (alpha - fingerprint)`, with the
+    /// sends and receives arranged to cancel.
+    fn balanced_logup_layer(num_vars: usize) -> FractionLayer<F> {
+        let size = 1usize << num_vars;
+        let alpha = FE::from(0x9E37_79B9u64);
+        let mut p = Vec::with_capacity(size);
+        let mut q = Vec::with_capacity(size);
+        for i in 0..size {
+            // Each fingerprint appears once as a send (+1) and once as a
+            // receive (−1), so the whole bus balances.
+            let fingerprint = FE::from((i as u64 / 2) * 7 + 5);
+            let sign = if i % 2 == 0 { FE::one() } else { -FE::one() };
+            p.push(sign);
+            q.push(alpha - fingerprint);
+        }
+        FractionLayer::new(Mle::new(p).unwrap(), Mle::new(q).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn folding_adds_the_two_halves() {
+        let l = layer(&[1, 2, 3, 4], &[5, 6, 7, 8]);
+        let folded = l.fold().unwrap();
+        assert_eq!(folded.num_vars(), 1);
+
+        // Variable 0 is the most significant bit, so index i pairs with i + 2.
+        let p = [1u64, 2, 3, 4];
+        let q = [5u64, 6, 7, 8];
+        for (i, (a, b)) in [(0usize, 2usize), (1, 3)].iter().enumerate() {
+            let expected = FE::from(p[*a]) * FE::from(q[*a]).inv().unwrap()
+                + FE::from(p[*b]) * FE::from(q[*b]).inv().unwrap();
+            let got = folded.p.evals()[i] * folded.q.evals()[i].inv().unwrap();
+            assert_eq!(expected, got, "pair ({a}, {b})");
+        }
+    }
+
+    #[test]
+    fn the_tree_output_is_the_sum_of_every_input_fraction() {
+        let p = [3u64, 1, 4, 1, 5, 9, 2, 6];
+        let q = [2u64, 7, 1, 8, 2, 8, 1, 8];
+        let tree = FractionTree::build(layer(&p, &q)).unwrap();
+
+        let (out_p, out_q) = tree.output();
+        assert_eq!(out_p * out_q.inv().unwrap(), direct_sum(&p, &q));
+    }
+
+    #[test]
+    fn layer_count_is_one_per_variable_plus_the_output() {
+        let tree = FractionTree::build(balanced_logup_layer(4)).unwrap();
+        assert_eq!(tree.num_layers(), 5);
+        assert_eq!(tree.layer(0).num_vars(), 0);
+        assert_eq!(tree.input_layer().num_vars(), 4);
+    }
+
+    #[test]
+    fn a_balanced_bus_has_a_zero_numerator() {
+        let tree = FractionTree::build(balanced_logup_layer(4)).unwrap();
+        let (p, q) = tree.output();
+        assert_eq!(p, FE::zero());
+        assert_ne!(q, FE::zero(), "denominators must not vanish");
+    }
+
+    #[test]
+    fn an_unbalanced_bus_does_not() {
+        let mut input = balanced_logup_layer(4);
+        // Drop one receive: the bus no longer cancels.
+        let mut p = input.p.evals().to_vec();
+        p[3] = FE::zero();
+        input = FractionLayer::new(Mle::new(p).unwrap(), input.q).unwrap();
+
+        let tree = FractionTree::build(input).unwrap();
+        assert_ne!(tree.output().0, FE::zero());
+    }
+
+    #[test]
+    fn prove_and_verify_round_trip() {
+        let tree = FractionTree::build(balanced_logup_layer(5)).unwrap();
+        let output = tree.output();
+
+        let proof = prove(&tree, &mut transcript()).unwrap().proof;
+        assert_eq!(proof.layers.len(), tree.num_layers() - 1);
+
+        let claim = verify(&proof, output, &mut transcript()).unwrap();
+
+        // The residual claim must be the input layer at the final point.
+        let input = tree.input_layer();
+        assert_eq!(claim.point.len(), input.num_vars());
+        assert_eq!(input.p.evaluate(&claim.point).unwrap(), claim.p);
+        assert_eq!(input.q.evaluate(&claim.point).unwrap(), claim.q);
+    }
+
+    #[test]
+    fn round_trips_on_an_unbalanced_bus_too() {
+        // GKR proves the sum is whatever it is; deciding that it is zero is the
+        // caller's check on the output numerator, not part of this protocol.
+        let mut p = balanced_logup_layer(4).p.evals().to_vec();
+        p[3] = FE::from(9);
+        let input = FractionLayer::new(Mle::new(p).unwrap(), balanced_logup_layer(4).q).unwrap();
+        let tree = FractionTree::build(input).unwrap();
+
+        let proof = prove(&tree, &mut transcript()).unwrap().proof;
+        let claim = verify(&proof, tree.output(), &mut transcript()).unwrap();
+        assert_eq!(
+            tree.input_layer().p.evaluate(&claim.point).unwrap(),
+            claim.p
+        );
+    }
+
+    #[test]
+    fn the_prover_arrives_at_the_claim_the_verifier_does() {
+        // The prover has to discharge the input-layer claim against the trace,
+        // so it needs the same claim the verifier ends up holding.
+        let tree = FractionTree::build(balanced_logup_layer(3)).unwrap();
+        let out = prove(&tree, &mut transcript()).unwrap();
+        let claim = verify(&out.proof, tree.output(), &mut transcript()).unwrap();
+        assert_eq!(out.claim, claim);
+
+        // And it is the input layer's value at that point.
+        let input = tree.input_layer();
+        assert_eq!(claim.p, input.p.evaluate(&claim.point).unwrap());
+        assert_eq!(claim.q, input.q.evaluate(&claim.point).unwrap());
+    }
+
+    #[test]
+    fn a_wrong_output_claim_is_rejected() {
+        let tree = FractionTree::build(balanced_logup_layer(4)).unwrap();
+        let (p, q) = tree.output();
+        let proof = prove(&tree, &mut transcript()).unwrap().proof;
+
+        assert!(verify(&proof, (p + FE::one(), q), &mut transcript()).is_err());
+    }
+
+    #[test]
+    fn a_tampered_half_value_is_rejected() {
+        let tree = FractionTree::build(balanced_logup_layer(4)).unwrap();
+        let output = tree.output();
+        let mut proof = prove(&tree, &mut transcript()).unwrap().proof;
+
+        proof.layers[1].q_lo += FE::one();
+        let err = verify(&proof, output, &mut transcript()).unwrap_err();
+        assert!(matches!(err, Error::LayerRelationMismatch { layer: 1 }));
+    }
+
+    #[test]
+    fn a_tampered_sumcheck_round_is_rejected() {
+        let tree = FractionTree::build(balanced_logup_layer(4)).unwrap();
+        let output = tree.output();
+        let mut proof = prove(&tree, &mut transcript()).unwrap().proof;
+
+        proof.layers[2].sumcheck.rounds[0].evaluations[0] += FE::one();
+        assert!(verify(&proof, output, &mut transcript()).is_err());
+    }
+
+    #[test]
+    fn a_proof_replayed_under_another_transcript_is_rejected() {
+        let tree = FractionTree::build(balanced_logup_layer(4)).unwrap();
+        let output = tree.output();
+        let proof = prove(&tree, &mut transcript()).unwrap().proof;
+
+        verify(&proof, output, &mut transcript()).unwrap();
+        let mut other = DefaultTranscript::<F>::new(b"another-statement");
+        assert!(verify(&proof, output, &mut other).is_err());
+    }
+
+    #[test]
+    fn a_layer_carries_on_from_its_own_folded_factors() {
+        // What the crossover relies on: a relation rebuilt from the factors a
+        // few rounds left behind is the same relation. On a device those
+        // factors are read back off the layer; here the check is that picking
+        // them up mid-sumcheck changes nothing the verifier sees.
+        let tree = FractionTree::build(balanced_logup_layer(6)).unwrap();
+        let lambda = FE::from(7);
+        let layer = tree.layer(4);
+
+        let whole = {
+            let mut relation = LayerRelation::new(layer, &[FE::from(3)], lambda, true).unwrap();
+            let vars = relation.num_vars();
+            sumcheck::prove_rounds(&mut relation, vars, &mut transcript()).unwrap()
+        };
+
+        let mut relation = LayerRelation::new(layer, &[FE::from(3)], lambda, true).unwrap();
+        let mut t = transcript();
+        let (mut rounds, mut z) = sumcheck::prove_rounds(&mut relation, 1, &mut t).unwrap();
+        let mut carried = LayerRelation::from_factors(relation.polys().to_vec(), lambda).unwrap();
+        let left = carried.num_vars();
+        let (tail, tail_z) = sumcheck::prove_rounds(&mut carried, left, &mut t).unwrap();
+        rounds.extend(tail);
+        z.extend(tail_z);
+
+        assert_eq!(whole, (rounds, z));
+    }
+
+    #[test]
+    fn a_single_fraction_needs_no_layers() {
+        let tree = FractionTree::build(layer(&[7], &[3])).unwrap();
+        assert_eq!(tree.num_layers(), 1);
+
+        let proof = prove(&tree, &mut transcript()).unwrap().proof;
+        assert!(proof.layers.is_empty());
+
+        let claim = verify(&proof, tree.output(), &mut transcript()).unwrap();
+        assert!(claim.point.is_empty());
+        assert_eq!(claim.p, FE::from(7));
+        assert_eq!(claim.q, FE::from(3));
+    }
+}

@@ -1,0 +1,296 @@
+[workspace]
+
+[package]
+name = "blake3-absorb-bench"
+version = "0.1.0"
+edition = "2024"
+
+# A guest microbenchmark for the BLAKE3 chained-absorb ecall. Exactly one arm
+# feature, one length feature and one iteration-count feature select the
+# binary's shape; every (arm, length, N) triple gets its own [[bin]] name so
+# parallel builds never share an output path. Standalone [workspace] on purpose
+# (like bench_vs/lambda/recursion) so root-level feature unification can never
+# turn two arms on.
+
+[features]
+# Arms. See src/main.rs for the 2x2 (alignment x absorb-compiled-in) design.
+arm_none = []
+arm_keccak = []
+arm_b3old = []
+arm_b3oldun = []
+arm_b3single = ["absorb_path"]
+arm_b3absorb = ["absorb_path"]
+# Compiles the guest bulk-absorb arm of `Blake3Chain::update` in. Held apart
+# from the arm features so the two "old path" arms can be built with it OFF and
+# the difference attributed. `crypto/blake3-absorb` implies `blake3-6round`.
+absorb_path = ["crypto/blake3-absorb"]
+# Message lengths
+len64 = []
+len256 = []
+len1024 = []
+len4096 = []
+# Iteration counts: two builds per (arm, length), differenced.
+n1000 = []
+n2000 = []
+
+[[bin]]
+name = "b3bench-none-64-n1000"
+path = "src/main.rs"
+required-features = ["arm_none", "len64", "n1000"]
+
+[[bin]]
+name = "b3bench-none-64-n2000"
+path = "src/main.rs"
+required-features = ["arm_none", "len64", "n2000"]
+
+[[bin]]
+name = "b3bench-none-256-n1000"
+path = "src/main.rs"
+required-features = ["arm_none", "len256", "n1000"]
+
+[[bin]]
+name = "b3bench-none-256-n2000"
+path = "src/main.rs"
+required-features = ["arm_none", "len256", "n2000"]
+
+[[bin]]
+name = "b3bench-none-1024-n1000"
+path = "src/main.rs"
+required-features = ["arm_none", "len1024", "n1000"]
+
+[[bin]]
+name = "b3bench-none-1024-n2000"
+path = "src/main.rs"
+required-features = ["arm_none", "len1024", "n2000"]
+
+[[bin]]
+name = "b3bench-none-4096-n1000"
+path = "src/main.rs"
+required-features = ["arm_none", "len4096", "n1000"]
+
+[[bin]]
+name = "b3bench-none-4096-n2000"
+path = "src/main.rs"
+required-features = ["arm_none", "len4096", "n2000"]
+
+[[bin]]
+name = "b3bench-keccak-64-n1000"
+path = "src/main.rs"
+required-features = ["arm_keccak", "len64", "n1000"]
+
+[[bin]]
+name = "b3bench-keccak-64-n2000"
+path = "src/main.rs"
+required-features = ["arm_keccak", "len64", "n2000"]
+
+[[bin]]
+name = "b3bench-keccak-256-n1000"
+path = "src/main.rs"
+required-features = ["arm_keccak", "len256", "n1000"]
+
+[[bin]]
+name = "b3bench-keccak-256-n2000"
+path = "src/main.rs"
+required-features = ["arm_keccak", "len256", "n2000"]
+
+[[bin]]
+name = "b3bench-keccak-1024-n1000"
+path = "src/main.rs"
+required-features = ["arm_keccak", "len1024", "n1000"]
+
+[[bin]]
+name = "b3bench-keccak-1024-n2000"
+path = "src/main.rs"
+required-features = ["arm_keccak", "len1024", "n2000"]
+
+[[bin]]
+name = "b3bench-keccak-4096-n1000"
+path = "src/main.rs"
+required-features = ["arm_keccak", "len4096", "n1000"]
+
+[[bin]]
+name = "b3bench-keccak-4096-n2000"
+path = "src/main.rs"
+required-features = ["arm_keccak", "len4096", "n2000"]
+
+[[bin]]
+name = "b3bench-b3old-64-n1000"
+path = "src/main.rs"
+required-features = ["arm_b3old", "len64", "n1000"]
+
+[[bin]]
+name = "b3bench-b3old-64-n2000"
+path = "src/main.rs"
+required-features = ["arm_b3old", "len64", "n2000"]
+
+[[bin]]
+name = "b3bench-b3old-256-n1000"
+path = "src/main.rs"
+required-features = ["arm_b3old", "len256", "n1000"]
+
+[[bin]]
+name = "b3bench-b3old-256-n2000"
+path = "src/main.rs"
+required-features = ["arm_b3old", "len256", "n2000"]
+
+[[bin]]
+name = "b3bench-b3old-1024-n1000"
+path = "src/main.rs"
+required-features = ["arm_b3old", "len1024", "n1000"]
+
+[[bin]]
+name = "b3bench-b3old-1024-n2000"
+path = "src/main.rs"
+required-features = ["arm_b3old", "len1024", "n2000"]
+
+[[bin]]
+name = "b3bench-b3old-4096-n1000"
+path = "src/main.rs"
+required-features = ["arm_b3old", "len4096", "n1000"]
+
+[[bin]]
+name = "b3bench-b3old-4096-n2000"
+path = "src/main.rs"
+required-features = ["arm_b3old", "len4096", "n2000"]
+
+[[bin]]
+name = "b3bench-b3oldun-64-n1000"
+path = "src/main.rs"
+required-features = ["arm_b3oldun", "len64", "n1000"]
+
+[[bin]]
+name = "b3bench-b3oldun-64-n2000"
+path = "src/main.rs"
+required-features = ["arm_b3oldun", "len64", "n2000"]
+
+[[bin]]
+name = "b3bench-b3oldun-256-n1000"
+path = "src/main.rs"
+required-features = ["arm_b3oldun", "len256", "n1000"]
+
+[[bin]]
+name = "b3bench-b3oldun-256-n2000"
+path = "src/main.rs"
+required-features = ["arm_b3oldun", "len256", "n2000"]
+
+[[bin]]
+name = "b3bench-b3oldun-1024-n1000"
+path = "src/main.rs"
+required-features = ["arm_b3oldun", "len1024", "n1000"]
+
+[[bin]]
+name = "b3bench-b3oldun-1024-n2000"
+path = "src/main.rs"
+required-features = ["arm_b3oldun", "len1024", "n2000"]
+
+[[bin]]
+name = "b3bench-b3oldun-4096-n1000"
+path = "src/main.rs"
+required-features = ["arm_b3oldun", "len4096", "n1000"]
+
+[[bin]]
+name = "b3bench-b3oldun-4096-n2000"
+path = "src/main.rs"
+required-features = ["arm_b3oldun", "len4096", "n2000"]
+
+[[bin]]
+name = "b3bench-b3single-64-n1000"
+path = "src/main.rs"
+required-features = ["arm_b3single", "len64", "n1000", "absorb_path"]
+
+[[bin]]
+name = "b3bench-b3single-64-n2000"
+path = "src/main.rs"
+required-features = ["arm_b3single", "len64", "n2000", "absorb_path"]
+
+[[bin]]
+name = "b3bench-b3single-256-n1000"
+path = "src/main.rs"
+required-features = ["arm_b3single", "len256", "n1000", "absorb_path"]
+
+[[bin]]
+name = "b3bench-b3single-256-n2000"
+path = "src/main.rs"
+required-features = ["arm_b3single", "len256", "n2000", "absorb_path"]
+
+[[bin]]
+name = "b3bench-b3single-1024-n1000"
+path = "src/main.rs"
+required-features = ["arm_b3single", "len1024", "n1000", "absorb_path"]
+
+[[bin]]
+name = "b3bench-b3single-1024-n2000"
+path = "src/main.rs"
+required-features = ["arm_b3single", "len1024", "n2000", "absorb_path"]
+
+[[bin]]
+name = "b3bench-b3single-4096-n1000"
+path = "src/main.rs"
+required-features = ["arm_b3single", "len4096", "n1000", "absorb_path"]
+
+[[bin]]
+name = "b3bench-b3single-4096-n2000"
+path = "src/main.rs"
+required-features = ["arm_b3single", "len4096", "n2000", "absorb_path"]
+
+[[bin]]
+name = "b3bench-b3absorb-64-n1000"
+path = "src/main.rs"
+required-features = ["arm_b3absorb", "len64", "n1000", "absorb_path"]
+
+[[bin]]
+name = "b3bench-b3absorb-64-n2000"
+path = "src/main.rs"
+required-features = ["arm_b3absorb", "len64", "n2000", "absorb_path"]
+
+[[bin]]
+name = "b3bench-b3absorb-256-n1000"
+path = "src/main.rs"
+required-features = ["arm_b3absorb", "len256", "n1000", "absorb_path"]
+
+[[bin]]
+name = "b3bench-b3absorb-256-n2000"
+path = "src/main.rs"
+required-features = ["arm_b3absorb", "len256", "n2000", "absorb_path"]
+
+[[bin]]
+name = "b3bench-b3absorb-1024-n1000"
+path = "src/main.rs"
+required-features = ["arm_b3absorb", "len1024", "n1000", "absorb_path"]
+
+[[bin]]
+name = "b3bench-b3absorb-1024-n2000"
+path = "src/main.rs"
+required-features = ["arm_b3absorb", "len1024", "n2000", "absorb_path"]
+
+[[bin]]
+name = "b3bench-b3absorb-4096-n1000"
+path = "src/main.rs"
+required-features = ["arm_b3absorb", "len4096", "n1000", "absorb_path"]
+
+[[bin]]
+name = "b3bench-b3absorb-4096-n2000"
+path = "src/main.rs"
+required-features = ["arm_b3absorb", "len4096", "n2000", "absorb_path"]
+
+[dependencies]
+lambda-vm-syscalls = { path = "../../../syscalls" }
+# NOTE: crypto's own `alloc` feature is NOT enabled. It is stale on this tree —
+# it turns on `use math::traits::Serializable` in merkle_tree/proof.rs, and
+# `math::traits` has no `Serializable`, so `crypto` with `alloc` does not
+# compile at all. Nothing in the workspace enables it either (`prover` takes
+# crypto's default `["asm", "std"]`), so `["std", ...]` here is the same feature
+# shape the host prover builds, minus `asm` (sha3's asm backend is x86/aarch64).
+# `crypto` is `#[macro_use] extern crate alloc` unconditionally, so alloc is
+# available regardless; the feature only gates that one broken import.
+#
+# `blake3-absorb` is NOT listed here: it arrives via this crate's `absorb_path`
+# feature, which only the two absorb-capable arms require.
+crypto = { path = "../../../crypto/crypto", default-features = false, features = [
+    "std",
+    "blake3-6round",
+] }
+digest = "0.10.7"
+
+[profile.release]
+debug = 2

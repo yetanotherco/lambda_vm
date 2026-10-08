@@ -79,6 +79,44 @@ cargo run -p cli --release -- verify <PROOF> <PROGRAM.elf> [flags]
 Returns exit code `0` on successful verification, `1` on failure. `--blowup` must
 match the value used during proving.
 
+### Prove a block
+
+Prove a whole block as a recursion tree: the block's base proof, the leaves that verify it, the interior and the
+top node. A consumer verifies the one top proof against the ELF with `verify-block`. Needs a CUDA build
+(`cargo build --release -p cli --features cuda`).
+
+```sh
+cli prove-block <PROGRAM.elf> --input <BLOCK.bin> -o block.proof [--time] [--digest]
+```
+
+| Flag | Description |
+|---|---|
+| `--input <FILE>` | The block's private input (the guest reads it with `get_private_input()`). |
+| `-o, --output <FILE>` | Output path for the block proof. Required. |
+| `--time` | Print the whole run's wall, base to top node. |
+| `--digest` | Print blake3 digests of the base proof's and the top proof's bytes (the base digest is taken inside the run's clock, so not on a timing run). |
+
+stdout carries the top program id, the public output and the requested numbers; the run's progress lines go to
+stderr.
+
+The command runs the production posture: every knob in `POSTURE` (`prover/src/lfm/block_tree.rs`) that the
+environment leaves unset is set to its posture value. These are the table parallelism, the VRAM budget, gate
+packing, the row cap, the tree cache cap, the executor schedule and the tree's sibling counts.
+The VRAM budget (24000 MB, a 32 GiB card's) is set only when `nvidia-smi` reports a card of at least 31 GiB; on
+any other card, set `LAMBDA_VM_VRAM_BUDGET_MB` yourself. The `BLOCK POSTURE` lines on stderr say what was set and
+what came from the environment. The binary compiles in jemalloc's never-purge posture and returns freed pages to
+the OS at phase boundaries once memory is short (`LAMBDA_VM_ALLOC_PURGE`, `auto` by default).
+
+### Verify a block
+
+```sh
+cli verify-block <block.proof> <PROGRAM.elf> [--time]
+```
+
+Derives the block's recursion plan and top program from the ELF and the proof's claimed shape under the block
+presets, verifies the top proof against that program, and checks it claims the ELF's id and the output. Prints
+the top program id and the public output. Returns exit code `0` on success, `1` on failure.
+
 ### Count Elements
 
 Build traces and print main-trace and aux-trace field element counts **without** running the proof step. Useful for sizing.

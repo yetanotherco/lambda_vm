@@ -124,6 +124,67 @@ pub(crate) fn split_interactions(num_interactions: usize) -> (usize, usize) {
     }
 }
 
+/// [`split_interactions`] for `arity` interactions per committed column:
+/// `(num_committed_groups, absorbed_count)` with `⌈N/k⌉ − 1` groups of `k`
+/// consecutive interactions and the last `1..=k` absorbed into the
+/// accumulated constraint (`(0, 0)` for no interactions). At `arity == 2` it
+/// IS [`split_interactions`].
+pub(crate) fn split_interactions_k(num_interactions: usize, arity: usize) -> (usize, usize) {
+    assert!(arity >= 2, "a LogUp arity is at least 2, got {arity}");
+    if arity == 2 {
+        return split_interactions(num_interactions);
+    }
+    if num_interactions == 0 {
+        return (0, 0);
+    }
+    let groups = num_interactions.div_ceil(arity) - 1;
+    (groups, num_interactions - groups * arity)
+}
+
+/// The degree of the LogUp constraints of an `arity` layout over
+/// `num_interactions`: `arity + 1` per committed group, `1 + absorbed` for the
+/// accumulator (0 with no interactions).
+pub(crate) fn logup_degree_k(num_interactions: usize, arity: usize) -> usize {
+    if num_interactions == 0 {
+        return 0;
+    }
+    let (groups, absorbed) = split_interactions_k(num_interactions, arity);
+    let acc = 1 + absorbed;
+    if groups > 0 { acc.max(arity + 1) } else { acc }
+}
+
+/// The LogUp arity a table with `num_interactions` bus interactions and
+/// base-constraint degree `base_degree` commits under `policy` at `blowup`.
+///
+/// Of the arities the policy allows, the one that commits the fewest extension
+/// columns: `⌈N/k⌉` aux columns (term columns plus the accumulator) plus
+/// `d − 1` composition parts, `d = max(base_degree, LogUp degree)`. Only
+/// arities whose AIR degree fits the blowup are eligible: the quotient of a
+/// degree-`d` AIR has degree `(d − 1)·n − d`, which the `blowup·n` LDE coset
+/// determines iff `d ≤ blowup + 1`. Ties go to the smaller arity, so the rule
+/// never commits more columns than pairs, and `Pair` (or any table where
+/// wider groups do not pay) keeps today's layout.
+///
+/// A pure function of public shape data: the prover and the verifier build
+/// the same layout from the same AIR and options.
+pub fn logup_arity(
+    num_interactions: usize,
+    base_degree: usize,
+    blowup: usize,
+    policy: crate::proof::options::LogUpPolicy,
+) -> usize {
+    let degree = |k: usize| base_degree.max(logup_degree_k(num_interactions, k));
+    let cost = |k: usize| num_interactions.div_ceil(k) + degree(k).saturating_sub(1).max(1);
+    let mut best = 2;
+    for &k in policy.arities() {
+        let fits = k <= blowup && degree(k) <= blowup + 1;
+        if k != 2 && fits && cost(k) < cost(best) {
+            best = k;
+        }
+    }
+    best
+}
+
 // =============================================================================
 // Bus Types
 // =============================================================================
@@ -540,6 +601,18 @@ pub enum LinearTerm {
     Constant(i64),
 }
 
+impl LinearTerm {
+    /// The main column this term reads, if it reads one.
+    pub(crate) fn columns_read(&self, out: &mut Vec<usize>) {
+        match self {
+            LinearTerm::Column { column, .. } | LinearTerm::ColumnUnsigned { column, .. } => {
+                out.push(*column)
+            }
+            LinearTerm::Constant(_) => {}
+        }
+    }
+}
+
 /// A value that contributes to the bus fingerprint.
 ///
 /// A `BusValue` produces 1, 2, or 4 bus elements for the fingerprint depending
@@ -691,6 +764,21 @@ impl BusValue {
     ///
     /// # Returns
     /// Vector of combined bus elements (length = num_bus_elements())
+    /// The main columns this value reads, appended to `out`.
+    pub(crate) fn columns_read(&self, out: &mut Vec<usize>) {
+        match self {
+            BusValue::Packed {
+                start_column,
+                packing,
+            } => out.extend(*start_column..*start_column + packing.num_columns()),
+            BusValue::Linear(terms) => {
+                for term in terms {
+                    term.columns_read(out);
+                }
+            }
+        }
+    }
+
     pub fn combine_from<E: IsField, F: Fn(usize) -> FieldElement<E>>(
         &self,
         get_column: F,
@@ -810,6 +898,107 @@ impl BusValue {
 /// table's base-field transition constraints, and the framework appends the
 /// LogUp constraints (generated from [`Self::logup`]) after them. One body
 /// serves the compiled prover folder, the verifier folder, and IR capture.
+/// A preprocessed table's commitment, computed when someone asks for it.
+///
+/// The univariate path compares it against the proof's root and so always
+/// does; the multilinear one has no separate root and checks the claimed
+/// openings against [`precomputed_columns`] instead, so on that path nobody
+/// ever asks. On a real program the ones that are not compiled-in constants —
+/// the ELF's data pages and its instruction table — are an LDE and a Merkle
+/// tree each, and there are two dozen of them.
+///
+/// [`precomputed_columns`]: crate::traits::AIR::precomputed_columns
+///
+/// # One root per leaf layout (S2)
+///
+/// The root depends on the trace trees' leaf layout
+/// ([`crate::leaf_layout::LeafLayout`]), so a commitment carries a separate,
+/// separately cached source for the one-row layout. [`get`](Self::get) is
+/// today's (row-pair) root, unchanged; [`get_for`](Self::get_for) serves
+/// either and returns `None` for a layout this commitment has no source for
+/// (the prover then refuses and the verifier rejects; never a silent recompute).
+#[derive(Clone)]
+pub struct LazyCommitment {
+    value: std::sync::Arc<std::sync::OnceLock<crate::config::Commitment>>,
+    #[allow(clippy::type_complexity)]
+    build: std::sync::Arc<dyn Fn() -> crate::config::Commitment + Send + Sync>,
+    /// The one-row root: `None` = no source (every constructor but
+    /// [`with_one_row`](Self::with_one_row)).
+    #[allow(clippy::type_complexity)]
+    one_row: Option<(
+        std::sync::Arc<std::sync::OnceLock<Option<crate::config::Commitment>>>,
+        std::sync::Arc<dyn Fn() -> Option<crate::config::Commitment> + Send + Sync>,
+    )>,
+}
+
+impl std::fmt::Debug for LazyCommitment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyCommitment")
+            .field("computed", &self.value.get().is_some())
+            .field("one_row_source", &self.one_row.is_some())
+            .finish()
+    }
+}
+
+impl LazyCommitment {
+    /// One that is already known — a compiled-in constant, or a caller's.
+    pub fn ready(value: crate::config::Commitment) -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(value);
+        Self {
+            value: std::sync::Arc::new(cell),
+            build: std::sync::Arc::new(|| [0u8; 32]),
+            one_row: None,
+        }
+    }
+
+    /// One that costs something, computed on the first [`get`](Self::get) and
+    /// shared by every clone of the AIR from then on.
+    pub fn deferred(build: impl Fn() -> crate::config::Commitment + Send + Sync + 'static) -> Self {
+        Self {
+            value: std::sync::Arc::new(std::sync::OnceLock::new()),
+            build: std::sync::Arc::new(build),
+            one_row: None,
+        }
+    }
+
+    /// This commitment plus a source for the ONE-ROW layout's root, computed
+    /// on the first [`get_for`](Self::get_for)`(Row)` and cached like the
+    /// row-pair one. The source returns `None` when it has no root for that
+    /// layout (e.g. a static table with no one-row entry): a hard miss, never
+    /// a fallback to the row-pair root.
+    pub fn with_one_row(
+        mut self,
+        build: impl Fn() -> Option<crate::config::Commitment> + Send + Sync + 'static,
+    ) -> Self {
+        self.one_row = Some((
+            std::sync::Arc::new(std::sync::OnceLock::new()),
+            std::sync::Arc::new(build),
+        ));
+        self
+    }
+
+    /// Today's (row-pair) root.
+    pub fn get(&self) -> crate::config::Commitment {
+        *self.value.get_or_init(|| (self.build)())
+    }
+
+    /// The root under `layout`; `None` when this commitment has no source for
+    /// it.
+    pub fn get_for(
+        &self,
+        layout: crate::leaf_layout::LeafLayout,
+    ) -> Option<crate::config::Commitment> {
+        match layout {
+            crate::leaf_layout::LeafLayout::RowPair => Some(self.get()),
+            crate::leaf_layout::LeafLayout::Row => {
+                let (cell, build) = self.one_row.as_ref()?;
+                *cell.get_or_init(|| build())
+            }
+        }
+    }
+}
+
 pub struct AirWithBuses<
     F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
     E: IsField + Send + Sync,
@@ -838,12 +1027,27 @@ pub struct AirWithBuses<
     /// program (16-25K nodes on the big tables) per epoch/shard instance.
     constraint_program:
         std::sync::OnceLock<std::sync::Arc<crate::constraint_ir::ConstraintProgram<F, E>>>,
+    /// A build-time program supplied via [`Self::with_precaptured`], if any.
+    ///
+    /// Kept separate from `constraint_program` rather than pre-filling that
+    /// `OnceLock`: `precaptured_constraint_program()` must answer "was one
+    /// SUPPLIED", not "has one been materialized by any means". Sharing the
+    /// cell would make a capture triggered by an earlier prover call look like
+    /// a build-time artifact.
+    precaptured_program: Option<crate::constraint_ir::ConstraintProgram<F, E>>,
     auxiliary_trace_build_data: AuxiliaryTraceBuildData,
     boundary_constraint_builder: PhantomData<(B, PI)>,
-    /// Commitment to precomputed columns (if this is a preprocessed table)
-    preprocessed_commitment: Option<crate::config::Commitment>,
+    /// Commitment to precomputed columns (if this is a preprocessed table),
+    /// computed on demand — see [`LazyCommitment`].
+    preprocessed_commitment: Option<LazyCommitment>,
     /// Number of precomputed columns (columns 0..n are precomputed, rest are multiplicities)
     num_precomputed_cols: Option<usize>,
+    /// Builds the precomputed columns on demand. Only the multilinear path asks
+    /// for them, and only on the verifying side, so they are generated rather
+    /// than carried — BITWISE's are 2^20 rows.
+    #[allow(clippy::type_complexity)]
+    precomputed_columns:
+        Option<std::sync::Arc<dyn Fn() -> Vec<Vec<FieldElement<F>>> + Send + Sync>>,
     /// Optional name for debug output (per-table bus sum tracking)
     name: Option<String>,
     /// Maximum number of bus elements across all interactions.
@@ -874,10 +1078,12 @@ impl<
             meta: self.meta.clone(),
             num_base: self.num_base,
             constraint_program: self.constraint_program.clone(),
+            precaptured_program: self.precaptured_program.clone(),
             auxiliary_trace_build_data: self.auxiliary_trace_build_data.clone(),
             boundary_constraint_builder: PhantomData,
-            preprocessed_commitment: self.preprocessed_commitment,
+            preprocessed_commitment: self.preprocessed_commitment.clone(),
             num_precomputed_cols: self.num_precomputed_cols,
+            precomputed_columns: self.precomputed_columns.clone(),
             name: self.name.clone(),
             max_bus_elements: self.max_bus_elements,
         }
@@ -895,14 +1101,22 @@ impl<
     /// Creates an AirWithBuses with LogUp-specific transition constraints.
     /// If no boundary constraints are needed, use `NullBoundaryConstraintBuilder` as B and () as PI.
     ///
-    /// Auxiliary column layout (with interaction batching + absorption):
-    /// - Columns 0..num_committed_pairs-1: Committed term columns (batched pairs)
-    /// - Last column: Accumulated column (running sum + 1-2 absorbed interactions)
+    /// Auxiliary column layout (with interaction batching + absorption), for
+    /// the arity `k` the options' LogUp policy picks ([`logup_arity`]; 2
+    /// under today's `Pair`):
+    /// - Columns 0..num_committed_groups-1: Committed term columns (groups of k)
+    /// - Last column: Accumulated column (running sum + 1..=k absorbed interactions)
     ///
-    /// The last 1-2 interactions are "absorbed" into the accumulated constraint
-    /// by clearing denominators, eliminating one committed term column per table.
+    /// The last 1..=k interactions are "absorbed" into the accumulated
+    /// constraint by clearing denominators, eliminating one committed term
+    /// column per table.
     ///
-    /// Total aux columns = ⌈N/2⌉ where N is the number of interactions.
+    /// Total aux columns = ⌈N/k⌉ where N is the number of interactions.
+    ///
+    /// # Panics
+    ///
+    /// If the picked arity's AIR degree exceeds `blowup + 1` (a configuration
+    /// error the rule excludes by construction; never reachable from a proof).
     pub fn new(
         num_main_columns: usize,
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
@@ -913,7 +1127,22 @@ impl<
         // Base-field (table) constraints come from the constraint set; LogUp
         // (extension) constraints are appended by the framework from the layout.
         let num_interactions = auxiliary_trace_build_data.interactions.len();
-        let logup = LogUpLayout::from_interactions(auxiliary_trace_build_data.interactions.clone());
+        let arity = logup_arity(
+            num_interactions,
+            constraint_set.max_degree(),
+            proof_options.blowup_factor as usize,
+            proof_options.format.logup,
+        );
+        let logup = LogUpLayout::with_arity(auxiliary_trace_build_data.interactions.clone(), arity);
+        assert!(
+            arity == 2
+                || constraint_set.max_degree().max(logup_max_degree(&logup))
+                    <= proof_options.blowup_factor as usize + 1,
+            "LogUp arity {arity} needs degree {} but blowup {} admits at most {}",
+            logup_max_degree(&logup),
+            proof_options.blowup_factor,
+            proof_options.blowup_factor as usize + 1
+        );
         let num_term_columns = logup.num_term_columns;
 
         // meta = constraint_set base-prefix meta + appended LogUp ext meta,
@@ -927,7 +1156,7 @@ impl<
         emit_logup_constraints::<F, E, _>(&mut logup_mb, &logup, num_base);
         meta.extend(logup_mb.into_meta());
 
-        // Layout: num_committed_pairs term columns + 1 accumulated = ⌈N/2⌉
+        // Layout: num_committed_groups term columns + 1 accumulated = ⌈N/k⌉
         let num_aux_columns = if num_interactions > 0 {
             num_term_columns + 1
         } else {
@@ -960,10 +1189,12 @@ impl<
             meta,
             num_base,
             constraint_program: std::sync::OnceLock::new(),
+            precaptured_program: None,
             auxiliary_trace_build_data,
             boundary_constraint_builder: PhantomData,
             preprocessed_commitment: None,
             num_precomputed_cols: None,
+            precomputed_columns: None,
             name: None,
             max_bus_elements,
         }
@@ -986,13 +1217,101 @@ impl<
     ///     .with_preprocessed(bitwise::preprocessed_commitment(), bitwise::NUM_PRECOMPUTED_COLS);
     /// ```
     pub fn with_preprocessed(
-        mut self,
+        self,
         commitment: crate::config::Commitment,
+        num_precomputed_cols: usize,
+    ) -> Self {
+        self.with_lazy_preprocessed(LazyCommitment::ready(commitment), num_precomputed_cols)
+    }
+
+    /// The same for a commitment nobody may end up needing.
+    pub fn with_lazy_preprocessed(
+        mut self,
+        commitment: LazyCommitment,
         num_precomputed_cols: usize,
     ) -> Self {
         self.preprocessed_commitment = Some(commitment);
         self.num_precomputed_cols = Some(num_precomputed_cols);
         self
+    }
+
+    /// Give this AIR's preprocessed commitment a ONE-ROW (S2) root: `root` is
+    /// what [`AIR::precomputed_commitment_for`](crate::traits::AIR::precomputed_commitment_for)
+    /// returns for [`LeafLayout::Row`](crate::leaf_layout::LeafLayout::Row)
+    /// (`None` = a hard miss). A no-op on an AIR that is not preprocessed.
+    pub fn with_one_row_commitment(mut self, root: Option<crate::config::Commitment>) -> Self {
+        if let Some(c) = self.preprocessed_commitment.take() {
+            self.preprocessed_commitment = Some(c.with_one_row(move || root));
+        }
+        self
+    }
+
+    /// Supply a constraint program captured at BUILD time, so this AIR never
+    /// has to capture one.
+    ///
+    /// This is the guest-safe half of the constraint-program story: with a
+    /// program supplied, both [`AIR::constraint_program`] and
+    /// [`AIR::precaptured_constraint_program`] hand it back without running the
+    /// hash-consing capture, which is what makes a constraint program usable on
+    /// a verify/recursion path at all.
+    ///
+    /// The caller is responsible for the program actually being this AIR's.
+    /// [`ConstraintArtifact::validate_against`] rejects the shape-level
+    /// mismatches (wrong table, stale widths, changed exemptions); it cannot
+    /// detect an edit that changes a constraint's arithmetic without changing
+    /// any shape, which is what the build-time drift test is for.
+    ///
+    /// [`ConstraintArtifact::validate_against`]:
+    ///     crate::constraint_ir::ConstraintArtifact::validate_against
+    pub fn with_precaptured(
+        mut self,
+        program: crate::constraint_ir::ConstraintProgram<F, E>,
+    ) -> Self {
+        assert_eq!(
+            program.roots.len(),
+            self.meta.len(),
+            "pre-captured program has {} roots but this AIR has {} transition constraints",
+            program.roots.len(),
+            self.meta.len()
+        );
+        assert_eq!(
+            program.num_base, self.num_base,
+            "pre-captured program declares num_base {} but this AIR has {}",
+            program.num_base, self.num_base
+        );
+        self.precaptured_program = Some(program);
+        self
+    }
+
+    /// The same, plus a generator for the columns themselves.
+    ///
+    /// Needed by the multilinear path, which checks the claimed openings of the
+    /// precomputed columns instead of comparing a commitment. Without it that
+    /// path cannot tell a real preprocessed table from a forged one.
+    pub fn with_preprocessed_columns(
+        self,
+        commitment: crate::config::Commitment,
+        num_precomputed_cols: usize,
+        columns: std::sync::Arc<dyn Fn() -> Vec<Vec<FieldElement<F>>> + Send + Sync>,
+    ) -> Self {
+        self.with_lazy_preprocessed_columns(
+            LazyCommitment::ready(commitment),
+            num_precomputed_cols,
+            columns,
+        )
+    }
+
+    /// The same with the commitment deferred: the multilinear path checks the
+    /// columns and never forces it.
+    pub fn with_lazy_preprocessed_columns(
+        self,
+        commitment: LazyCommitment,
+        num_precomputed_cols: usize,
+        columns: std::sync::Arc<dyn Fn() -> Vec<Vec<FieldElement<F>>> + Send + Sync>,
+    ) -> Self {
+        let mut air = self.with_lazy_preprocessed(commitment, num_precomputed_cols);
+        air.precomputed_columns = Some(columns);
+        air
     }
 
     /// Set a debug name for this AIR (for per-table bus sum tracking).
@@ -1060,15 +1379,21 @@ where
         self.max_bus_elements
     }
 
-    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
-        // Only the per-table MAX degree is consumed. Base constraints declare it
-        // once via `ConstraintSet::max_degree()`; the framework's LogUp
-        // constraints contribute their own known max (batched terms degree 3,
-        // accumulator `1 + absorbed`).
-        let max_degree = self
-            .constraint_set
+    fn bus_interactions(&self) -> &[BusInteraction] {
+        &self.auxiliary_trace_build_data.interactions
+    }
+
+    fn max_constraint_degree(&self) -> usize {
+        // Base constraints declare their max once via `ConstraintSet::max_degree()`;
+        // the framework's LogUp constraints contribute their own known max
+        // (committed groups `arity + 1`, accumulator `1 + absorbed`).
+        self.constraint_set
             .max_degree()
-            .max(logup_max_degree(&self.logup));
+            .max(logup_max_degree(&self.logup))
+    }
+
+    fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        let max_degree = self.max_constraint_degree();
         // The composition polynomial is the constraint QUOTIENT H = Σ βᵢ·Cᵢ/Zᵢ. Its degree is
         // deg(Cᵢ) − deg(Zᵢ) = (max_degree−1)·N − max_degree + eᵢ, so with the end-exemptions
         // eᵢ < max_degree (the max-degree LogUp constraints have eᵢ = 0) it fits in
@@ -1124,9 +1449,15 @@ where
     fn constraint_program(
         &self,
     ) -> &crate::constraint_ir::ConstraintProgram<Self::Field, Self::FieldExtension> {
-        // Lazily captured once (prover/GPU/tests only — the verify path never
-        // calls this). Runs the table set AND the LogUp emission through one
-        // CaptureBuilder, matching the folder emission order/indexing exactly.
+        // A build-time program, if one was supplied, short-circuits capture
+        // entirely.
+        if let Some(prog) = &self.precaptured_program {
+            return prog;
+        }
+        // Otherwise lazily captured once (prover/GPU/tests only — the verify
+        // path never calls this). Runs the table set AND the LogUp emission
+        // through one CaptureBuilder, matching the folder emission
+        // order/indexing exactly.
         self.constraint_program
             .get_or_init(|| {
                 let mut cb = crate::constraints::builder::CaptureBuilder::<F, E>::new();
@@ -1136,6 +1467,14 @@ where
                 std::sync::Arc::new(prog)
             })
             .as_ref()
+    }
+
+    fn precaptured_constraint_program(
+        &self,
+    ) -> Option<&crate::constraint_ir::ConstraintProgram<Self::Field, Self::FieldExtension>> {
+        // Deliberately NOT `constraint_program.get()`: only a program supplied
+        // at build time counts, never one a prover run happened to capture.
+        self.precaptured_program.as_ref()
     }
 
     fn build_auxiliary_trace(
@@ -1169,18 +1508,18 @@ where
         #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]
         let resident_main = trace.main_trace_dev.clone();
 
-        // Split interactions: committed pairs get term columns, last 1-2 are absorbed (virtual)
-        let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
+        // Split interactions: committed groups get term columns, the last
+        // 1..=arity are absorbed (virtual).
+        let num_committed_groups = self.logup.num_committed_groups;
 
-        // Compute committed term columns (batched pairs only).
+        // Compute committed term columns (committed groups only).
         // With `parallel`: when `trace_len > LOGUP_CHUNK_SIZE` the chunk-internal
-        // parallelism inside each pair already saturates Rayon, so iterate pairs
+        // parallelism inside each group already saturates Rayon, so iterate groups
         // sequentially to keep cache locality. When `trace_len <= LOGUP_CHUNK_SIZE`
-        // each pair yields a single chunk, so parallelize across pairs to recover
-        // the throughput the per-pair dispatch used to provide for small-trace
+        // each group yields a single chunk, so parallelize across groups to recover
+        // the throughput the per-group dispatch used to provide for small-trace
         // tables with many interactions.
-        // Without `parallel`: sequential over pairs, sequential over rows.
-        let interactions = &self.auxiliary_trace_build_data.interactions;
+        // Without `parallel`: sequential over groups, sequential over rows.
 
         // GPU-resident aux build (Goldilocks + ext3, not disk-spill, not
         // debug-checks): build the aux columns on device and keep them resident
@@ -1189,14 +1528,17 @@ where
         #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]
         if trace.resident_aux_ok()
             && let Some(ra) = crate::logup_gpu::try_build_aux_resident_gpu::<F, E>(
-                interactions,
+                _table_name,
+                &self.logup,
                 trace.num_main_columns,
                 || {
                     main_cols_cell
                         .get_or_init(|| trace.columns_main())
                         .as_slice()
                 },
-                resident_main.as_ref().map(|r| (r.buf.as_ref(), r.rows)),
+                resident_main
+                    .as_ref()
+                    .map(|r| (r.buf.as_ref(), r.rows, r.ready.as_deref())),
                 trace_len,
                 challenges,
             )
@@ -1214,7 +1556,7 @@ where
         // columns on device, byte identical, and falls back to the CPU build.
         #[cfg(feature = "cuda")]
         let gpu_term_cols = crate::logup_gpu::try_build_term_columns_gpu::<F, E>(
-            interactions,
+            &self.logup,
             main_segment_cols,
             trace_len,
             challenges,
@@ -1226,9 +1568,10 @@ where
         let (committed_columns, virtual_column) = match gpu_term_cols {
             Some(cols) => cols,
             None => {
-                let build_pair = |i: usize| {
+                let build_group = |j: usize| {
+                    let group: Vec<&BusInteraction> = self.logup.group(j).iter().collect();
                     compute_logup_term_column(
-                        &[&interactions[i * 2], &interactions[i * 2 + 1]],
+                        &group,
                         main_segment_cols,
                         trace_len,
                         challenges,
@@ -1239,38 +1582,26 @@ where
                 #[cfg(feature = "parallel")]
                 let committed_columns: Vec<Vec<FieldElement<E>>> = if trace_len <= LOGUP_CHUNK_SIZE
                 {
-                    (0..num_committed_pairs)
+                    (0..num_committed_groups)
                         .into_par_iter()
-                        .map(build_pair)
+                        .map(build_group)
                         .collect()
                 } else {
-                    (0..num_committed_pairs).map(build_pair).collect()
+                    (0..num_committed_groups).map(build_group).collect()
                 };
                 #[cfg(not(feature = "parallel"))]
                 let committed_columns: Vec<Vec<FieldElement<E>>> =
-                    (0..num_committed_pairs).map(build_pair).collect();
+                    (0..num_committed_groups).map(build_group).collect();
 
                 // Virtual column for absorbed interactions (NOT written to trace).
-                let virtual_column = if absorbed_count == 2 {
-                    compute_logup_term_column(
-                        &[
-                            &interactions[num_interactions - 2],
-                            &interactions[num_interactions - 1],
-                        ],
-                        main_segment_cols,
-                        trace_len,
-                        challenges,
-                        _table_name,
-                    )
-                } else {
-                    compute_logup_term_column(
-                        &[&interactions[num_interactions - 1]],
-                        main_segment_cols,
-                        trace_len,
-                        challenges,
-                        _table_name,
-                    )
-                };
+                let absorbed: Vec<&BusInteraction> = self.logup.absorbed().iter().collect();
+                let virtual_column = compute_logup_term_column(
+                    &absorbed,
+                    main_segment_cols,
+                    trace_len,
+                    challenges,
+                    _table_name,
+                );
                 (committed_columns, virtual_column)
             }
         };
@@ -1295,7 +1626,7 @@ where
         // Build accumulated from all columns (committed + virtual)
         let mut all_columns = committed_columns;
         all_columns.push(virtual_column);
-        let acc_col_idx = num_committed_pairs; // accumulated column in trace follows committed columns
+        let acc_col_idx = num_committed_groups; // accumulated column in trace follows committed columns
         let table_contribution =
             build_accumulated_column_from_terms(acc_col_idx, &all_columns, trace);
 
@@ -1353,7 +1684,29 @@ where
     }
 
     fn precomputed_commitment(&self) -> crate::config::Commitment {
-        self.preprocessed_commitment.unwrap_or([0u8; 32])
+        self.preprocessed_commitment
+            .as_ref()
+            .map(LazyCommitment::get)
+            .unwrap_or([0u8; 32])
+    }
+
+    fn precomputed_commitment_for(
+        &self,
+        layout: crate::leaf_layout::LeafLayout,
+    ) -> Option<crate::config::Commitment> {
+        match &self.preprocessed_commitment {
+            Some(c) => c.get_for(layout),
+            // Not preprocessed: the row-pair answer is the trait's zero root
+            // (never compared); there is no one-row root to give.
+            None => (!layout.is_one_row()).then_some([0u8; 32]),
+        }
+    }
+
+    fn precomputed_columns(&self) -> Vec<Vec<FieldElement<F>>> {
+        self.precomputed_columns
+            .as_ref()
+            .map(|build| build())
+            .unwrap_or_default()
     }
 }
 
@@ -1411,10 +1764,25 @@ pub enum Multiplicity {
 }
 
 impl Multiplicity {
+    /// The main columns this expression reads, appended to `out`.
+    pub(crate) fn columns_read(&self, out: &mut Vec<usize>) {
+        match self {
+            Multiplicity::One => {}
+            Multiplicity::Column(col) | Multiplicity::Negated(col) => out.push(*col),
+            Multiplicity::Sum(a, b) | Multiplicity::Diff(a, b) => out.extend([*a, *b]),
+            Multiplicity::Sum3(a, b, c) => out.extend([*a, *b, *c]),
+            Multiplicity::Linear(terms) => {
+                for term in terms {
+                    term.columns_read(out);
+                }
+            }
+        }
+    }
+
     /// Evaluate the multiplicity expression to a field element. `get_col(i)`
     /// must return the value of main column `i` at the row being evaluated.
     #[inline]
-    fn evaluate_with<F, G>(&self, get_col: G) -> FieldElement<F>
+    pub(crate) fn evaluate_with<F, G>(&self, get_col: G) -> FieldElement<F>
     where
         F: IsField,
         G: Fn(usize) -> FieldElement<F>,
@@ -1490,6 +1858,23 @@ pub struct BusInteraction {
 }
 
 impl BusInteraction {
+    /// The main columns this interaction reads — its multiplicity's and its
+    /// values' — sorted and deduplicated.
+    ///
+    /// Everything here is affine in the columns, so a column nobody reads has
+    /// coefficient zero: this is what a caller recovering that affine form has
+    /// to look at, and the rest of the table is not worth asking about.
+    pub fn columns_read(&self) -> Vec<usize> {
+        let mut columns = Vec::new();
+        self.multiplicity.columns_read(&mut columns);
+        for value in &self.values {
+            value.columns_read(&mut columns);
+        }
+        columns.sort_unstable();
+        columns.dedup();
+        columns
+    }
+
     /// Creates a new table interaction.
     ///
     /// # Arguments
@@ -1640,14 +2025,15 @@ where
 {
 }
 
-/// Compute a LogUp term column for one or two interactions sharing the result
+/// Compute a LogUp term column for the interactions sharing the result
 /// column. For each row, returns the sum Σₖ signₖ·mₖ[row] / fpₖ[row] where the
-/// loop runs over `interactions` (must be length 1 or 2).
+/// loop runs over `interactions` (at least one: a committed group or the
+/// absorbed set of its layout's arity).
 ///
 /// Single-interaction case yields the per-interaction quotient (used for the
 /// absorbed virtual column when only one interaction remains, and by the
-/// debug-checks per-interaction breakdown). Two-interaction case yields the
-/// batched sum that backs a committed term column. Both share a single chunked
+/// debug-checks per-interaction breakdown). The multi-interaction case yields
+/// the batched sum that backs a committed term column. Both share a single chunked
 /// implementation with one batch inversion per chunk for cache locality.
 ///
 /// Debug-checks bus tracker is invoked only when `interactions.len() == 1`,
@@ -1667,9 +2053,8 @@ where
     E: IsField + Send + Sync,
 {
     assert!(
-        matches!(interactions.len(), 1 | 2),
-        "compute_logup_term_column expects 1 or 2 interactions, got {}",
-        interactions.len()
+        !interactions.is_empty(),
+        "compute_logup_term_column expects at least one interaction"
     );
 
     let z = &challenges[0];
@@ -1913,57 +2298,68 @@ use crate::constraints::builder::ConstraintBuilder;
 
 /// Config describing an [`AirWithBuses`] table's LogUp layout, exactly as
 /// computed by [`AirWithBuses::new`] from the interaction list (via
-/// `split_interactions`). This is the plain-data source for the LogUp
+/// `split_interactions_k`). This is the plain-data source for the LogUp
 /// constraints: [`emit_logup_constraints`] reads it to generate every LogUp
 /// constraint (its metadata is derived from that same emission).
 #[derive(Clone)]
 pub struct LogUpLayout {
     /// All interactions, in the order they were registered. The first
-    /// `2 * num_committed_pairs` are the committed (batched) pairs; the last
-    /// 1–2 are absorbed into the accumulated constraint.
+    /// `arity * num_committed_groups` are the committed groups (group `j` =
+    /// interactions `arity·j .. arity·j + arity`); the last `1..=arity` are
+    /// absorbed into the accumulated constraint.
     pub interactions: Vec<BusInteraction>,
-    /// Number of committed batched pairs (each gets one aux term column).
-    pub num_committed_pairs: usize,
-    /// Number of committed term columns (`= num_committed_pairs`).
+    /// Interactions per committed term column (2 = today's batched pairs).
+    pub arity: usize,
+    /// Number of committed groups (each gets one aux term column).
+    pub num_committed_groups: usize,
+    /// Number of committed term columns (`= num_committed_groups`).
     pub num_term_columns: usize,
     /// Index of the accumulated column (`= num_term_columns`).
     pub acc_column_idx: usize,
 }
 
 impl LogUpLayout {
-    /// Derive the LogUp layout from an interaction list, mirroring the split
-    /// [`AirWithBuses::new`] performs.
+    /// Today's pair layout ([`Self::with_arity`] at arity 2).
     pub fn from_interactions(interactions: Vec<BusInteraction>) -> Self {
-        let num_interactions = interactions.len();
-        let (num_committed_pairs, _absorbed_count) = split_interactions(num_interactions);
-        let num_term_columns = num_committed_pairs;
+        Self::with_arity(interactions, 2)
+    }
+
+    /// The layout committing `arity` interactions per term column, mirroring
+    /// the split [`AirWithBuses::new`] performs.
+    pub fn with_arity(interactions: Vec<BusInteraction>, arity: usize) -> Self {
+        let (num_committed_groups, _absorbed_count) =
+            split_interactions_k(interactions.len(), arity);
+        let num_term_columns = num_committed_groups;
         Self {
             interactions,
-            num_committed_pairs,
+            arity,
+            num_committed_groups,
             num_term_columns,
             acc_column_idx: num_term_columns,
         }
     }
 
-    /// The absorbed interactions (last 1–2), folded into the accumulated
-    /// constraint. Empty when there are no interactions.
-    fn absorbed(&self) -> &[BusInteraction] {
+    /// Committed group `j`'s interactions (backs term column `j`).
+    pub fn group(&self, j: usize) -> &[BusInteraction] {
+        &self.interactions[j * self.arity..(j + 1) * self.arity]
+    }
+
+    /// The absorbed interactions (last `1..=arity`), folded into the
+    /// accumulated constraint. Empty when there are no interactions.
+    pub fn absorbed(&self) -> &[BusInteraction] {
         let n = self.interactions.len();
-        if n == 0 {
-            return &[];
-        }
-        let (_, absorbed_count) = split_interactions(n);
+        let (_, absorbed_count) = split_interactions_k(n, self.arity);
         &self.interactions[n - absorbed_count..]
     }
 
     /// Number of LogUp transition constraints this layout produces:
-    /// one per committed pair (batched term) plus one accumulated constraint
-    /// when there is at least one interaction.
+    /// one per committed group plus one accumulated constraint when there is
+    /// at least one interaction.
     pub fn num_constraints(&self) -> usize {
         if self.interactions.is_empty() {
             0
         } else {
-            self.num_committed_pairs + 1
+            self.num_committed_groups + 1
         }
     }
 }
@@ -2187,6 +2583,7 @@ where
     E: IsField,
     B: ConstraintBuilder<F, E>,
 {
+    debug_assert_eq!(layout.arity, 2, "the batched term is the pair layout's");
     let interaction_a = &layout.interactions[pair_idx * 2];
     let interaction_b = &layout.interactions[pair_idx * 2 + 1];
     let term_column_idx = pair_idx;
@@ -2235,6 +2632,10 @@ where
     E: IsField,
     B: ConstraintBuilder<F, E>,
 {
+    debug_assert_eq!(
+        layout.arity, 2,
+        "the 1-2 absorbed accumulator is the pair layout's"
+    );
     let acc_curr = b.aux(0, layout.acc_column_idx);
     let acc_next = b.aux(1, layout.acc_column_idx);
 
@@ -2280,27 +2681,146 @@ where
     b.emit_ext(idx, root);
 }
 
+/// A sum of LogUp fractions `Σ sᵢ·mᵢ / fᵢ` with its denominators cleared, as
+/// `num / den`. A lone interaction keeps its signed multiplicity as a
+/// base-field numerator.
+enum Fraction<X, XE> {
+    Leaf { num: X, den: XE },
+    Node { num: XE, den: XE },
+}
+
+/// The fraction `sign·m / f` of one interaction, on the current row.
+fn emit_fraction<F, E, B>(b: &B, interaction: &BusInteraction) -> Fraction<B::Expr, B::ExprE>
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    let m = emit_multiplicity::<F, E, B>(b, &interaction.multiplicity, 0);
+    let den = emit_fingerprint::<F, E, B>(b, interaction, 0);
+    // is_sender is a compile-time bool: a base negation, never a multiply.
+    let num = if interaction.is_sender { m } else { -m };
+    Fraction::Leaf { num, den }
+}
+
+/// `a + b` with the denominators cleared: `(n_a·d_b + n_b·d_a) / (d_a·d_b)`.
+fn add_fractions<X, XE>(a: Fraction<X, XE>, b: Fraction<X, XE>) -> Fraction<X, XE>
+where
+    X: crate::constraints::builder::ExprOps<XE>,
+    XE: crate::constraints::builder::ExtExprOps,
+{
+    match (a, b) {
+        (Fraction::Leaf { num: na, den: da }, Fraction::Leaf { num: nb, den: db }) => {
+            Fraction::Node {
+                num: na * db.clone() + nb * da.clone(),
+                den: da * db,
+            }
+        }
+        (Fraction::Leaf { num: na, den: da }, Fraction::Node { num: nb, den: db })
+        | (Fraction::Node { num: nb, den: db }, Fraction::Leaf { num: na, den: da }) => {
+            Fraction::Node {
+                num: na * db.clone() + nb * da.clone(),
+                den: db * da,
+            }
+        }
+        (Fraction::Node { num: na, den: da }, Fraction::Node { num: nb, den: db }) => {
+            Fraction::Node {
+                num: na * db.clone() + nb * da.clone(),
+                den: da * db,
+            }
+        }
+    }
+}
+
+/// `Σ sᵢ·mᵢ / fᵢ` over `interactions` (at least one) as one fraction, summed
+/// as a balanced tree: four interactions cost 6 ext×ext multiplies with the
+/// constraint's own, against 8 for prefix/suffix co-products.
+fn emit_fraction_sum<F, E, B>(b: &B, interactions: &[BusInteraction]) -> Fraction<B::Expr, B::ExprE>
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    match interactions {
+        [] => unreachable!("a LogUp fraction sum has at least one interaction"),
+        [one] => emit_fraction::<F, E, B>(b, one),
+        _ => {
+            let (lo, hi) = interactions.split_at(interactions.len() / 2);
+            add_fractions(
+                emit_fraction_sum::<F, E, B>(b, lo),
+                emit_fraction_sum::<F, E, B>(b, hi),
+            )
+        }
+    }
+}
+
+/// `lhs = Σ sᵢ·mᵢ / fᵢ` with the denominators cleared: `lhs·Π f − Σ sᵢ·mᵢ·Π_{l≠i} f`.
+fn cleared_identity<X, XE>(lhs: XE, sum: Fraction<X, XE>) -> XE
+where
+    X: crate::constraints::builder::ExprOps<XE>,
+    XE: crate::constraints::builder::ExtExprOps,
+{
+    match sum {
+        // The tower only implements base − ext (base operand LEFT), so
+        // `lhs·f − num` is written `−(num − lhs·f)`.
+        Fraction::Leaf { num, den } => -(num - lhs * den),
+        Fraction::Node { num, den } => lhs * den - num,
+    }
+}
+
+/// Emit committed group `group_idx`'s constraint for an arity-`k ≥ 3` layout:
+/// `c·Π_{i∈G} fᵢ − Σ_{i∈G} sᵢ·mᵢ·Π_{l∈G, l≠i} f_l` (degree `k + 1`), which on
+/// rows where every `fᵢ ≠ 0` says `c = Σ_{i∈G} sᵢ·mᵢ / fᵢ`. The pair layout
+/// keeps [`emit_logup_batched_term`], node for node.
+fn emit_logup_group<F, E, B>(b: &mut B, layout: &LogUpLayout, group_idx: usize, idx: usize)
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    let c = b.aux(0, group_idx);
+    let sum = emit_fraction_sum::<F, E, B>(b, layout.group(group_idx));
+    b.emit_ext(idx, cleared_identity(c, sum));
+}
+
+/// The accumulated constraint of an arity-`k ≥ 3` layout, absorbing the last
+/// `r ∈ 1..=k` interactions: `(acc' − acc − Σ terms + L/N)·Π_A f − Σ_A sᵢ·mᵢ·Π_{l≠i} f`
+/// (degree `1 + r`). Every operand but `acc'` reads the current row, as in
+/// [`emit_logup_accumulated`].
+fn emit_logup_accumulated_k<F, E, B>(b: &mut B, layout: &LogUpLayout, idx: usize)
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    let acc_curr = b.aux(0, layout.acc_column_idx);
+    let acc_next = b.aux(1, layout.acc_column_idx);
+    let mut delta = acc_next - acc_curr;
+    for i in 0..layout.num_term_columns {
+        delta = delta - b.aux(0, i);
+    }
+    delta = delta + b.table_offset();
+    let sum = emit_fraction_sum::<F, E, B>(b, layout.absorbed());
+    b.emit_ext(idx, cleared_identity(delta, sum));
+}
+
 /// The maximum degree among a layout's framework-generated LogUp constraints:
-/// batched committed terms are degree 3, the accumulator is `1 + absorbed`.
-/// Zero when there are no interactions. Folded into
-/// `composition_poly_degree_bound` alongside the base constraints' max_degree.
+/// committed groups are degree `arity + 1` (3 for the batched pairs), the
+/// accumulator is `1 + absorbed`. Zero when there are no interactions. Folded
+/// into `composition_poly_degree_bound` alongside the base constraints'
+/// max_degree.
 pub fn logup_max_degree(layout: &LogUpLayout) -> usize {
-    if layout.interactions.is_empty() {
-        return 0;
-    }
-    // Accumulated constraint: 1 + number of absorbed interactions.
-    let mut m = 1 + layout.absorbed().len();
-    // Batched committed terms (if any) are degree 3.
-    if layout.num_committed_pairs > 0 {
-        m = m.max(3);
-    }
-    m
+    logup_degree_k(layout.interactions.len(), layout.arity)
 }
 
 /// Emit every LogUp transition constraint for `layout` through the builder,
 /// starting at absolute constraint index `idx_base` (the table's base-constraint
-/// count). Committed batched terms come first (one per committed pair), then the
-/// single accumulated constraint. Emits nothing when there are no interactions.
+/// count). Committed groups come first (one per term column), then the single
+/// accumulated constraint. Emits nothing when there are no interactions.
+///
+/// The pair layout (arity 2) emits through [`emit_logup_batched_term`] and
+/// [`emit_logup_accumulated`] exactly as before arities existed, so its
+/// captured program, its compiled-kernel key and its proofs are unchanged.
 pub fn emit_logup_constraints<F, E, B>(b: &mut B, layout: &LogUpLayout, idx_base: usize)
 where
     F: IsField,
@@ -2311,11 +2831,19 @@ where
         return;
     }
     let mut idx = idx_base;
-    for pair_idx in 0..layout.num_committed_pairs {
-        emit_logup_batched_term::<F, E, B>(b, layout, pair_idx, idx);
-        idx += 1;
+    if layout.arity == 2 {
+        for pair_idx in 0..layout.num_committed_groups {
+            emit_logup_batched_term::<F, E, B>(b, layout, pair_idx, idx);
+            idx += 1;
+        }
+        emit_logup_accumulated::<F, E, B>(b, layout, idx);
+    } else {
+        for group_idx in 0..layout.num_committed_groups {
+            emit_logup_group::<F, E, B>(b, layout, group_idx, idx);
+            idx += 1;
+        }
+        emit_logup_accumulated_k::<F, E, B>(b, layout, idx);
     }
-    emit_logup_accumulated::<F, E, B>(b, layout, idx);
 }
 
 /// Run an [`AirWithBuses`] table's transition constraints through the
@@ -2481,12 +3009,12 @@ mod logup_single_source_tests {
         for i in 0..n_rows {
             let mut row_sum = Fp3::zero();
             for col in &term_columns {
-                row_sum = row_sum + &col[i];
+                row_sum += col[i];
             }
             let acc_i = *trace.get_aux(i, acc_col_idx);
             let acc_next = *trace.get_aux((i + 1) % n_rows, acc_col_idx);
-            let lhs = (acc_next - acc_i) * &n_fe;
-            let rhs = row_sum * &n_fe - &l;
+            let lhs = (acc_next - acc_i) * n_fe;
+            let rhs = row_sum * n_fe - l;
             assert_eq!(lhs, rhs, "forward circular recurrence broken at row {i}");
         }
     }
@@ -2533,8 +3061,8 @@ mod logup_single_source_tests {
             "[{label}] emitted constraint indices are not exactly 0..{n}: {emitted:?}"
         );
         for &(idx, measured) in &degrees {
-            let expected_degree = if idx < layout.num_committed_pairs {
-                3
+            let expected_degree = if idx < layout.num_committed_groups {
+                layout.arity + 1
             } else {
                 1 + layout.absorbed().len()
             };
@@ -2659,7 +3187,7 @@ mod logup_single_source_tests {
         //   idx 1: accumulated, 1 absorbed (interaction 2), degree 2.
         let interactions = vec![direct_sender(7), column_receiver(11), direct_sender(13)];
         let layout = LogUpLayout::from_interactions(interactions);
-        assert_eq!(layout.num_committed_pairs, 1);
+        assert_eq!(layout.num_committed_groups, 1);
         assert_eq!(layout.absorbed().len(), 1, "must exercise 1-absorbed");
         check_layout("one_absorbed", &layout, 8);
     }
@@ -2676,7 +3204,7 @@ mod logup_single_source_tests {
             column_receiver(17),
         ];
         let layout = LogUpLayout::from_interactions(interactions);
-        assert_eq!(layout.num_committed_pairs, 1);
+        assert_eq!(layout.num_committed_groups, 1);
         assert_eq!(layout.absorbed().len(), 2, "must exercise 2-absorbed");
         check_layout("two_absorbed", &layout, 8);
     }
@@ -2687,7 +3215,7 @@ mod logup_single_source_tests {
         // accumulated constraint alone, degree 3, no batched term.
         let interactions = vec![direct_sender(7), column_receiver(11)];
         let layout = LogUpLayout::from_interactions(interactions);
-        assert_eq!(layout.num_committed_pairs, 0);
+        assert_eq!(layout.num_committed_groups, 0);
         assert_eq!(layout.num_constraints(), 1);
         check_layout("two_absorbed_only", &layout, 8);
     }
@@ -2750,7 +3278,7 @@ mod logup_single_source_tests {
             column_receiver(17),
         ];
         let layout = LogUpLayout::from_interactions(interactions);
-        assert_eq!(layout.num_committed_pairs, 2, "must exercise >= 2 pairs");
+        assert_eq!(layout.num_committed_groups, 2, "must exercise >= 2 pairs");
         assert_eq!(layout.absorbed().len(), 2);
         assert_eq!(layout.num_constraints(), 3); // 2 batched terms + accumulated
         check_layout("two_committed_pairs", &layout, 8);
@@ -2796,8 +3324,284 @@ mod logup_single_source_tests {
             zero_padded(7, true),
         ];
         let layout = LogUpLayout::from_interactions(interactions);
-        assert_eq!(layout.num_committed_pairs, 1);
+        assert_eq!(layout.num_committed_groups, 1);
         assert_eq!(layout.absorbed().len(), 1);
         check_layout("linear_zero_skip", &layout, 8);
+    }
+
+    // ---------------------------------------------------------------------
+    // Wider arities (`LogUpPolicy::{K3, K4, Best}`)
+    // ---------------------------------------------------------------------
+
+    /// `n` interactions, each on its own columns: interaction `i` reads its
+    /// multiplicity from main column `2i` and its value from `2i + 1`, so a
+    /// perturbed main column touches exactly one interaction. Senders and
+    /// receivers alternate.
+    fn distinct_interactions(n: usize) -> Vec<BusInteraction> {
+        (0..n)
+            .map(|i| {
+                let values = vec![BusValue::column(2 * i + 1)];
+                let m = Multiplicity::Column(2 * i);
+                if i % 2 == 0 {
+                    BusInteraction::sender(3 + i as u64, m, values)
+                } else {
+                    BusInteraction::receiver(3 + i as u64, m, values)
+                }
+            })
+            .collect()
+    }
+
+    /// The split rule at arity 2 IS today's `split_interactions`; at arity
+    /// `k` it is `⌈N/k⌉ − 1` groups with the last `1..=k` absorbed.
+    #[test]
+    fn split_interactions_k_is_the_pair_split_at_two() {
+        for n in 0..200 {
+            assert_eq!(split_interactions_k(n, 2), split_interactions(n), "N={n}");
+        }
+        for (n, k, want) in [
+            (0, 4, (0, 0)),
+            (1, 4, (0, 1)),
+            (4, 4, (0, 4)),
+            (5, 4, (1, 1)),
+            (8, 4, (1, 4)),
+            (20, 4, (4, 4)),
+            (1031, 4, (257, 3)),
+            (579, 4, (144, 3)),
+            (12, 3, (3, 3)),
+            (13, 3, (4, 1)),
+        ] {
+            assert_eq!(split_interactions_k(n, k), want, "N={n} k={k}");
+        }
+    }
+
+    /// ★ Every wider layout's constraints agree three ways (prover folder,
+    /// captured program, verifier folder), on every absorbed count, with the
+    /// measured degree `k + 1` per group and `1 + r` for the accumulator.
+    #[test]
+    fn wide_layouts_agree_three_ways() {
+        for k in [3usize, 4] {
+            for n in 1..=(3 * k + 3) {
+                let layout = LogUpLayout::with_arity(distinct_interactions(n), k);
+                assert_eq!(layout.arity, k);
+                assert_eq!(layout.num_term_columns + 1, n.div_ceil(k), "N={n} k={k}");
+                assert!((1..=k).contains(&layout.absorbed().len()));
+                check_layout(&format!("k{k}_n{n}"), &layout, 2 * n);
+            }
+        }
+    }
+
+    /// One honest row of a layout: main values, the committed term cells,
+    /// `acc`, and the `acc'` that satisfies the accumulator, under random
+    /// challenges. Returns the frame's two steps' main and aux rows.
+    #[derive(Clone)]
+    struct HonestRow {
+        main: Vec<Fp>,
+        aux: Vec<Fp3>,
+        aux_next: Vec<Fp3>,
+        rap: Vec<Fp3>,
+        alpha_powers: Vec<Fp3>,
+        offset: Fp3,
+    }
+
+    fn honest_row(layout: &LogUpLayout, rng: &mut SplitMix64) -> HonestRow {
+        let n = layout.interactions.len();
+        let main: Vec<Fp> = (0..2 * n).map(|_| Fp::from(rng.next_u64())).collect();
+        let rap = vec![rand_fp3(rng), rand_fp3(rng)];
+        let alpha_powers: Vec<Fp3> = (0..4).map(|_| rand_fp3(rng)).collect();
+        let offset = rand_fp3(rng);
+        // s·m / f for one interaction: f = z − bus − v·α.
+        let frac = |it: &BusInteraction| -> Fp3 {
+            let i = match it.multiplicity {
+                Multiplicity::Column(c) => c / 2,
+                _ => unreachable!(),
+            };
+            let v = main[2 * i + 1].to_extension::<Ext3>();
+            let f = rap[0] - Fp3::from(it.bus_id) - v * alpha_powers[1];
+            let m = main[2 * i].to_extension::<Ext3>();
+            let t = m * f.inv().unwrap();
+            if it.is_sender { t } else { -t }
+        };
+        let sum = |its: &[BusInteraction]| its.iter().map(&frac).fold(Fp3::zero(), |a, b| a + b);
+        let terms: Vec<Fp3> = (0..layout.num_committed_groups)
+            .map(|j| sum(layout.group(j)))
+            .collect();
+        let acc = rand_fp3(rng);
+        let acc_next =
+            acc + terms.iter().fold(Fp3::zero(), |a, b| a + *b) - offset + sum(layout.absorbed());
+        let mut aux = terms.clone();
+        aux.push(acc);
+        let mut aux_next: Vec<Fp3> = (0..terms.len()).map(|_| rand_fp3(rng)).collect();
+        aux_next.push(acc_next);
+        HonestRow {
+            main,
+            aux,
+            aux_next,
+            rap,
+            alpha_powers,
+            offset,
+        }
+    }
+
+    /// The layout's constraint values on one row (prover folder).
+    fn constraint_values(layout: &LogUpLayout, row: &HonestRow) -> Vec<Fp3> {
+        let n_main = row.main.len();
+        let frame = Frame::<Gl, Ext3>::new(vec![
+            TableView::new(vec![row.main.clone()], vec![row.aux.clone()]),
+            TableView::new(vec![vec![Fp::zero(); n_main]], vec![row.aux_next.clone()]),
+        ]);
+        let ctx = TransitionEvaluationContext::new_prover(
+            frame.as_row_frame(),
+            &row.rap,
+            &row.alpha_powers,
+            &row.offset,
+        );
+        let mut base = vec![];
+        let mut ext = vec![Fp3::zero(); layout.num_constraints()];
+        let mut folder = ProverEvalFolder::new(&ctx, &mut base, &mut ext);
+        emit_logup_constraints(&mut folder, layout, 0);
+        folder.assert_all_emitted();
+        ext
+    }
+
+    /// Which constraint holds interaction `i`: its group, or the accumulator.
+    fn constraint_of(layout: &LogUpLayout, i: usize) -> usize {
+        (i / layout.arity).min(layout.num_committed_groups)
+    }
+
+    /// ★ T0b: on honest term values every group constraint and the
+    /// accumulator vanish; one perturbed term cell, multiplicity or
+    /// fingerprint operand makes exactly the constraints that read it
+    /// non-zero (a term cell is also read by the accumulator).
+    #[test]
+    fn honest_wide_rows_vanish_and_each_perturbation_is_caught() {
+        for (k, n) in [
+            (3usize, 7usize),
+            (3, 12),
+            (4, 12),
+            (4, 13),
+            (4, 14),
+            (4, 15),
+            (4, 4),
+        ] {
+            let layout = LogUpLayout::with_arity(distinct_interactions(n), k);
+            let acc_idx = layout.num_committed_groups;
+            for trial in 0..20u64 {
+                let mut rng =
+                    SplitMix64::new(0x5EED ^ ((k as u64) << 8) ^ ((n as u64) << 16) ^ trial);
+                let row = honest_row(&layout, &mut rng);
+                let values = constraint_values(&layout, &row);
+                assert!(
+                    values.iter().all(|v| *v == Fp3::zero()),
+                    "k={k} N={n}: an honest row violates {values:?}"
+                );
+                let nonzero = |vals: &[Fp3]| -> Vec<usize> {
+                    (0..vals.len())
+                        .filter(|&c| vals[c] != Fp3::zero())
+                        .collect()
+                };
+                // One committed term cell.
+                for j in 0..layout.num_committed_groups {
+                    let mut bad = row.clone();
+                    bad.aux[j] += Fp3::one();
+                    assert_eq!(
+                        nonzero(&constraint_values(&layout, &bad)),
+                        vec![j, acc_idx],
+                        "k={k} N={n}: term cell {j}"
+                    );
+                }
+                for i in 0..n {
+                    // One multiplicity, then one fingerprint operand.
+                    for col in [2 * i, 2 * i + 1] {
+                        let mut bad = row.clone();
+                        bad.main[col] += Fp::one();
+                        assert_eq!(
+                            nonzero(&constraint_values(&layout, &bad)),
+                            vec![constraint_of(&layout, i)],
+                            "k={k} N={n}: interaction {i}, main column {col}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// ★ T0f: the per-table rule, pinned on the production shapes (N
+    /// interactions, base degree 3) at blowup 4. Ties keep the smaller arity.
+    #[test]
+    fn logup_arity_policy_table() {
+        use crate::proof::options::LogUpPolicy::{Best, K3, K4, Pair};
+        // (label, N, pair, k3, k4, best)
+        for (label, n, want) in [
+            ("KECCAK_RND", 1031, [2, 3, 4, 4]),
+            ("ECSM", 579, [2, 3, 4, 4]),
+            ("ECDAS", 388, [2, 3, 4, 4]),
+            ("KECCAK", 134, [2, 3, 4, 4]),
+            ("HALT", 36, [2, 3, 4, 4]),
+            ("DVRM", 34, [2, 3, 4, 4]),
+            ("HINT", 27, [2, 3, 4, 4]),
+            ("MEMW", 26, [2, 3, 4, 4]),
+            ("MUL", 24, [2, 3, 4, 4]),
+            ("CPU32", 23, [2, 3, 4, 4]),
+            ("CPU / MEMW_A", 20, [2, 3, 4, 4]),
+            ("SHIFT / COMMIT", 18, [2, 3, 4, 3]),
+            ("STORE / BITWISE", 10, [2, 2, 2, 2]),
+            ("LT / BYTEWISE", 9, [2, 3, 2, 3]),
+            ("MEMW_R", 7, [2, 2, 2, 2]),
+            ("BRANCH / EQ", 6, [2, 2, 2, 2]),
+            ("LOAD", 5, [2, 2, 2, 2]),
+            ("PAGE", 3, [2, 2, 2, 2]),
+            ("DECODE", 2, [2, 2, 2, 2]),
+            ("one", 1, [2, 2, 2, 2]),
+            ("none", 0, [2, 2, 2, 2]),
+        ] {
+            for (policy, want) in [Pair, K3, K4, Best].into_iter().zip(want) {
+                assert_eq!(logup_arity(n, 3, 4, policy), want, "{label} N={n} {policy}");
+            }
+        }
+        // The cells the D-LOGUP table quotes: aux + parts per policy.
+        let shape = |n: usize, policy| {
+            let k = logup_arity(n, 3, 4, policy);
+            let layout = LogUpLayout::with_arity(distinct_interactions(n), k);
+            (
+                layout.num_term_columns + 1,
+                3.max(logup_max_degree(&layout)) - 1,
+            )
+        };
+        assert_eq!(shape(1031, Pair), (516, 2));
+        assert_eq!(shape(1031, K3), (344, 3));
+        assert_eq!(shape(1031, K4), (258, 4));
+        assert_eq!(shape(20, K4), (5, 4));
+        assert_eq!(shape(20, K3), (7, 3));
+        assert_eq!(shape(579, K4), (145, 4));
+        assert_eq!(shape(388, K4), (97, 4));
+        assert_eq!(shape(134, K4), (34, 4));
+    }
+
+    /// The rule never leaves the degree budget, never picks an arity its
+    /// policy does not allow, and never commits more than pairs; at blowup 2
+    /// every policy is the pair layout.
+    #[test]
+    fn logup_arity_respects_the_degree_budget() {
+        use crate::proof::options::LogUpPolicy::{Best, K3, K4, Pair};
+        for blowup in [2usize, 4, 8, 16] {
+            for base in 1..=3 {
+                for n in 0..300 {
+                    for policy in [Pair, K3, K4, Best] {
+                        let k = logup_arity(n, base, blowup, policy);
+                        assert!(policy.arities().contains(&k), "{policy} picked {k}");
+                        let degree = |k| base.max(logup_degree_k(n, k));
+                        let cost = |k| n.div_ceil(k) + degree(k).saturating_sub(1).max(1);
+                        assert!(cost(k) <= cost(2), "N={n} base={base} {policy}");
+                        if k != 2 {
+                            assert!(k <= blowup && degree(k) <= blowup + 1);
+                            assert!(cost(k) < cost(2), "a tie keeps pairs");
+                        }
+                        if blowup == 2 || policy == Pair {
+                            assert_eq!(k, 2, "N={n} base={base} blowup={blowup} {policy}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

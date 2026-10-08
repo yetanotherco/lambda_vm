@@ -24,6 +24,8 @@
 //! JALR bit (the memory-width bits are 0), so `mem_flags ∈ {0,1} = JALR` and the
 //! `mem_flags` column is used directly as `JALR` wherever it is gated by `BRANCH`.
 
+use super::decode::DecodeTable;
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, DecodeEntry, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::Error;
 use executor::vm::{
@@ -150,55 +152,71 @@ pub mod cols {
 
 /// A single CPU cycle to be added to the trace.
 ///
-/// Holds the decoded instruction (`DecodeEntry`) plus the runtime values needed
-/// to fill a row: register values, the multiplexed `arg2`, the ALU result, and
-/// the branch decision. For `word_instr` rows all operational values are 0 (the
-/// row is a pure CPU32 delegate).
+/// Holds the DECODE row of the decoded instruction plus the runtime values
+/// needed to fill a row: register values, the ALU result, the next pc. Read
+/// through a [`CpuOp`] ([`DecodeTable::op`]), which pairs it with its
+/// [`DecodeEntry`]. For `word_instr` rows all operational values are 0 (the row
+/// is a pure CPU32 delegate).
 #[derive(Debug, Clone, Default)]
 pub struct CpuOperation {
-    /// Static decode information (shared with the DECODE table).
-    pub decode: DecodeEntry,
+    /// The row of its instruction in the DECODE table ([`DecodeTable::row`]).
+    pub decode_row: u32,
     /// Timestamp for memory argument coordination.
     pub timestamp: u64,
     /// Next program counter.
     pub next_pc: u64,
     /// Value to write back to rd.
     pub rvd: u64,
-    /// Value of register rs1.
+    /// Value of register rs1 (for an ECALL, a7: the syscall number).
     pub rv1: u64,
     /// Value of register rs2.
     pub rv2: u64,
-    /// Multiplexed second ALU argument.
-    pub arg2: u64,
     /// ALU result (or memory address for LOAD/STORE).
     pub res: u64,
-    /// Whether the branch/jump is taken.
-    pub branch_cond: bool,
-
-    /// Whether this ECALL is a Commit syscall.
-    pub ecall_commit: bool,
-    /// For Commit ECALLs: buffer address from x11.
-    pub commit_buf_addr: u64,
-    /// For Commit ECALLs: byte count from x12.
-    pub commit_count: u64,
-    /// Whether this ECALL is a KeccakPermute syscall.
-    pub ecall_keccak: bool,
-    /// For KeccakPermute ECALLs: state address from x10.
-    pub keccak_state_addr: u64,
-
-    /// Whether this ECALL is an ECSM (elliptic-curve scalar multiply) syscall
-    pub ecall_ecsm: bool,
-
-    /// Whether this ECALL is a non-constraining Hint syscall. The hint operand
-    /// addresses (x10/x11/x12) are recovered from the register state in the trace
-    /// builder, exactly like ECSM.
-    pub ecall_hint: bool,
+    /// An ECALL's operands from its log: `[x11, x12]` for COMMIT (buffer
+    /// address, byte count), `[x10, 0]` for KECCAK and BLAKE3 (state address),
+    /// zero otherwise. ECSM, HINT and BLAKE3 absorb read theirs from the
+    /// register state in the trace builder.
+    ///
+    /// The rest of what a row needs (the decode, `arg2`, the branch decision,
+    /// the ECALL's syscall) is a function of these fields: [`CpuOp`]'s methods,
+    /// so the op stays 72 bytes (the walk materializes one per cycle).
+    pub ecall_args: [u64; 2],
 }
+
+// The walk materializes one per cycle: keep it at 72 bytes.
+const _: () = assert!(std::mem::size_of::<CpuOperation>() == 72);
 
 impl CpuOperation {
     /// Creates a new CPU operation with defaults.
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// A [`CpuOperation`] with its [`DecodeEntry`] ([`DecodeTable::op`]): what
+/// every reader of a CPU op works from. Derefs to the op.
+#[derive(Debug, Clone, Copy)]
+pub struct CpuOp<'a> {
+    /// Static decode information (the op's DECODE row).
+    pub decode: &'a DecodeEntry,
+    op: &'a CpuOperation,
+}
+
+impl std::ops::Deref for CpuOp<'_> {
+    type Target = CpuOperation;
+
+    #[inline]
+    fn deref(&self) -> &CpuOperation {
+        self.op
+    }
+}
+
+impl<'a> CpuOp<'a> {
+    /// `op` read with `decode`, the entry of its DECODE row.
+    #[inline]
+    pub fn new(decode: &'a DecodeEntry, op: &'a CpuOperation) -> Self {
+        Self { decode, op }
     }
 
     // ------- convenience accessors -------
@@ -220,28 +238,198 @@ impl CpuOperation {
         self.decode.fields.mem_flags & 1 == 1
     }
 
-    /// Creates a CpuOperation from an executor Log and a DecodeEntry.
-    pub fn from_log(log: &Log, timestamp: u64, decode: DecodeEntry) -> Self {
+    /// Multiplexed second ALU argument (CPU-A1, `cpu.toml`): `imm` under
+    /// MEMORY, `rv2` under BRANCH (JAL/JALR read no rs2), `rv2 + imm` otherwise
+    /// (≤ 1 nonzero by decode A2); 0 on a word delegate row.
+    #[inline]
+    pub fn arg2(&self) -> u64 {
+        let f = &self.decode.fields;
+        if f.word_instr {
+            0
+        } else if f.memory {
+            self.decode.imm
+        } else if f.branch {
+            self.rv2
+        } else {
+            self.rv2.wrapping_add(self.decode.imm)
+        }
+    }
+
+    /// Whether the branch/jump is taken: JAL/JALR always, a conditional branch
+    /// by the EQ/LT comparison (with invert) in `alu_flags`; never off BRANCH
+    /// or on a word delegate row.
+    #[inline]
+    pub fn branch_cond(&self) -> bool {
+        let f = &self.decode.fields;
+        !f.word_instr
+            && f.branch
+            && (self.jalr() || CpuOperation::branch_taken(f, self.rv1, self.rv2))
+    }
+
+    /// Whether this is an ECALL of syscall `number` (`rv1` is a7 on an ECALL).
+    #[inline]
+    fn ecall_of(&self, number: u64) -> bool {
+        self.decode.fields.ecall && self.rv1 == number
+    }
+
+    /// Whether this ECALL is a Commit syscall.
+    #[inline]
+    pub fn ecall_commit(&self) -> bool {
+        self.ecall_of(SyscallNumbers::Commit as u64)
+    }
+
+    /// For Commit ECALLs: buffer address from x11.
+    #[inline]
+    pub fn commit_buf_addr(&self) -> u64 {
+        if self.ecall_commit() {
+            self.ecall_args[0]
+        } else {
+            0
+        }
+    }
+
+    /// For Commit ECALLs: byte count from x12.
+    #[inline]
+    pub fn commit_count(&self) -> u64 {
+        if self.ecall_commit() {
+            self.ecall_args[1]
+        } else {
+            0
+        }
+    }
+
+    /// Whether this ECALL is a KeccakPermute syscall.
+    #[inline]
+    pub fn ecall_keccak(&self) -> bool {
+        self.ecall_of(executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER)
+    }
+
+    /// For KeccakPermute ECALLs: state address from x10.
+    #[inline]
+    pub fn keccak_state_addr(&self) -> u64 {
+        if self.ecall_keccak() {
+            self.ecall_args[0]
+        } else {
+            0
+        }
+    }
+
+    /// Whether this ECALL is a Blake3Compress syscall.
+    #[inline]
+    pub fn ecall_blake3(&self) -> bool {
+        self.ecall_of(executor::vm::instruction::execution::BLAKE3_SYSCALL_NUMBER)
+    }
+
+    /// For Blake3Compress ECALLs: state address from x10.
+    #[inline]
+    pub fn blake3_state_addr(&self) -> u64 {
+        if self.ecall_blake3() {
+            self.ecall_args[0]
+        } else {
+            0
+        }
+    }
+
+    /// Whether this ECALL is a Blake3Absorb (chained-absorb) syscall. Its four
+    /// operands (x10..x13) are recovered from the register state in the trace
+    /// builder, exactly like ECSM and HINT.
+    #[inline]
+    pub fn ecall_blake3_absorb(&self) -> bool {
+        self.ecall_of(executor::vm::instruction::execution::BLAKE3_ABSORB_SYSCALL_NUMBER)
+    }
+
+    /// Whether this ECALL is an ECSM (elliptic-curve scalar multiply) syscall.
+    #[inline]
+    pub fn ecall_ecsm(&self) -> bool {
+        self.ecall_of(executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER)
+    }
+
+    /// Whether this ECALL is a non-constraining Hint syscall. The hint operand
+    /// addresses (x10/x11/x12) are recovered from the register state in the
+    /// trace builder, exactly like ECSM.
+    #[inline]
+    pub fn ecall_hint(&self) -> bool {
+        self.ecall_of(executor::vm::instruction::execution::HINT_SYSCALL_NUMBER)
+    }
+
+    /// Collects the BITWISE-table range-check lookups generated by this row, so
+    /// the BITWISE table can account for the matching multiplicities:
+    /// 3 `ARE_BYTES` (rs1/rs2, rd/half_instruction_length, alu_flags/mem_flags) and
+    /// 4 `IS_HALF` (the four halves of `res`).
+    pub fn collect_bitwise_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
+        let mut ops = Vec::with_capacity(7);
+        self.for_each_bitwise_op(|op| ops.push(op));
+        ops
+    }
+
+    /// [`Self::collect_bitwise_ops`]'s lookups counted into `histogram`, with no
+    /// list built.
+    #[inline]
+    pub(crate) fn count_bitwise_into(&self, histogram: &mut super::bitwise::BitwiseHistogram) {
+        self.for_each_bitwise_op(|op| histogram.bump(op));
+    }
+
+    /// Each of [`Self::collect_bitwise_ops`]'s lookups, in its order.
+    #[inline]
+    fn for_each_bitwise_op(&self, mut emit: impl FnMut(super::bitwise::BitwiseOperation)) {
+        use super::bitwise::{BitwiseOperation, BitwiseOperationType};
+        let f = self.decode.fields;
+
+        // Must mirror the trace columns exactly. On word delegate rows the CPU
+        // zeroes rs1/rs2/rd/alu_flags/mem_flags and res (half_instruction_length stays);
+        // CPU32 emits its own range checks for the real decoded values.
+        let word = f.word_instr;
+        let z = |v: u8| if word { 0 } else { v };
+        let res = if word { 0 } else { self.res };
+
+        emit(BitwiseOperation::byte_op(
+            BitwiseOperationType::AreBytes,
+            z(f.rs1),
+            z(f.rs2),
+        ));
+        emit(BitwiseOperation::byte_op(
+            BitwiseOperationType::AreBytes,
+            z(f.rd),
+            f.half_instruction_length,
+        ));
+        emit(BitwiseOperation::byte_op(
+            BitwiseOperationType::AreBytes,
+            z(f.alu_flags),
+            z(f.mem_flags),
+        ));
+
+        for i in 0..4 {
+            let half = ((res >> (i * 16)) & 0xFFFF) as u16;
+            emit(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                (half >> 8) as u8,
+            ));
+        }
+    }
+}
+
+impl CpuOperation {
+    /// Creates a CpuOperation from an executor Log and its instruction's
+    /// DecodeEntry, the entry of DECODE row `decode_row`.
+    pub fn from_log(log: &Log, timestamp: u64, decode: &DecodeEntry, decode_row: u32) -> Self {
         let f = decode.fields;
         // Real byte length: the column stores half.
         let instruction_length = 2 * f.half_instruction_length as u64;
 
-        // ECALL syscall classification (rv1 = a7 = syscall number).
-        let ecall_commit = f.ecall && log.src1_val == SyscallNumbers::Commit as u64;
-        let (commit_buf_addr, commit_count) = if ecall_commit {
-            (log.src2_val, log.dst_val)
+        // An ECALL's operands from the log (rv1 = a7 = syscall number): COMMIT's
+        // buffer and count, KECCAK's and BLAKE3's state address.
+        let ecall_args = if !f.ecall {
+            [0, 0]
+        } else if log.src1_val == SyscallNumbers::Commit as u64 {
+            [log.src2_val, log.dst_val]
+        } else if log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER
+            || log.src1_val == executor::vm::instruction::execution::BLAKE3_SYSCALL_NUMBER
+        {
+            [log.src2_val, 0]
         } else {
-            (0, 0)
+            [0, 0]
         };
-        let ecall_keccak =
-            f.ecall && log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
-        let keccak_state_addr = if ecall_keccak { log.src2_val } else { 0 };
-        // The ECSM operand addresses (x10/x11/x12) are recovered from the register state
-        // in the trace builder.
-        let ecall_ecsm =
-            f.ecall && log.src1_val == executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
-        let ecall_hint =
-            f.ecall && log.src1_val == executor::vm::instruction::execution::HINT_SYSCALL_NUMBER;
 
         // Word instructions are fully handled by CPU32; the main CPU row is a
         // delegate that only advances the PC and sends the CPU32 lookup. We still
@@ -254,12 +442,8 @@ impl CpuOperation {
                 rv1: log.src1_val,
                 rv2: if f.read_register2 { log.src2_val } else { 0 },
                 rvd: log.dst_val,
-                ecall_commit,
-                commit_buf_addr,
-                commit_count,
-                ecall_keccak,
-                keccak_state_addr,
-                decode,
+                ecall_args,
+                decode_row,
                 timestamp,
                 ..Default::default()
             };
@@ -345,22 +529,14 @@ impl CpuOperation {
         };
 
         Self {
-            decode,
+            decode_row,
             timestamp,
             next_pc,
             rvd,
             rv1,
             rv2,
-            arg2,
             res,
-            branch_cond,
-            ecall_commit,
-            commit_buf_addr,
-            commit_count,
-            ecall_keccak,
-            keccak_state_addr,
-            ecall_ecsm,
-            ecall_hint,
+            ecall_args,
         }
     }
 
@@ -383,78 +559,60 @@ impl CpuOperation {
         };
         cmp ^ invert
     }
-
-    /// Creates a CpuOperation from Log and Instruction (convenience).
-    pub fn from_log_and_instruction(log: &Log, timestamp: u64, instruction: Instruction) -> Self {
-        let decode = DecodeEntry::from_instruction(log.current_pc, instruction, 4);
-        Self::from_log(log, timestamp, decode)
-    }
-
-    /// Collects the BITWISE-table range-check lookups generated by this row, so
-    /// the BITWISE table can account for the matching multiplicities:
-    /// 3 `ARE_BYTES` (rs1/rs2, rd/half_instruction_length, alu_flags/mem_flags) and
-    /// 4 `IS_HALF` (the four halves of `res`).
-    pub fn collect_bitwise_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
-        use super::bitwise::{BitwiseOperation, BitwiseOperationType};
-        let f = self.decode.fields;
-        let mut ops = Vec::with_capacity(7);
-
-        // Must mirror the trace columns exactly. On word delegate rows the CPU
-        // zeroes rs1/rs2/rd/alu_flags/mem_flags and res (half_instruction_length stays);
-        // CPU32 emits its own range checks for the real decoded values.
-        let word = f.word_instr;
-        let z = |v: u8| if word { 0 } else { v };
-        let res = if word { 0 } else { self.res };
-
-        ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::AreBytes,
-            z(f.rs1),
-            z(f.rs2),
-        ));
-        ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::AreBytes,
-            z(f.rd),
-            f.half_instruction_length,
-        ));
-        ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::AreBytes,
-            z(f.alu_flags),
-            z(f.mem_flags),
-        ));
-
-        for i in 0..4 {
-            let half = ((res >> (i * 16)) & 0xFFFF) as u16;
-            ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (half & 0xFF) as u8,
-                (half >> 8) as u8,
-            ));
-        }
-
-        ops
-    }
 }
 
 // =========================================================================
 // Trace generation
 // =========================================================================
 
-/// Generates the CPU trace table from a list of operations.
+/// Generates the CPU trace table from a list of operations, each read with
+/// its entry of `decode`.
 ///
 /// Each operation becomes one row; the table is padded to the next power of 2.
 pub fn generate_cpu_trace(
     operations: &[CpuOperation],
+    decode: &DecodeTable,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let n = operations.len();
-    let num_rows = n.next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_cpu_trace_as(operations, decode, TraceForm::Wide)
+}
 
-    for (row_idx, op) in operations.iter().enumerate() {
+/// [`generate_cpu_trace`] in `form` (`tables::gpack`).
+pub fn generate_cpu_trace_as(
+    operations: &[CpuOperation],
+    decode: &DecodeTable,
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_cpu_trace_segments_as(&[operations], decode, form)
+}
+
+/// The widths CPU traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_cpu_trace_as`] over `segments`, the operations one after
+/// another: a chunk handed out as the window parts it lies in.
+pub(crate) fn generate_cpu_trace_segments_as(
+    segments: &[&[CpuOperation]],
+    decode: &DecodeTable,
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let n: usize = segments.iter().map(|s| s.len()).sum();
+    let num_rows = n.next_power_of_two().max(4);
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |t| {
+        fill_cpu_rows(t, segments, decode, num_rows)
+    })
+}
+
+/// Every row of a zeroed CPU table of `num_rows` rows: `segments`' operations,
+/// then the padding.
+fn fill_cpu_rows<T: VmTable>(
+    table: &mut T,
+    segments: &[&[CpuOperation]],
+    decode: &DecodeTable,
+    num_rows: usize,
+) {
+    let n: usize = segments.iter().map(|s| s.len()).sum();
+    for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
+        let op = decode.op(op);
         let f = &op.decode.fields;
         let word = f.word_instr;
 
@@ -500,7 +658,7 @@ pub fn generate_cpu_trace(
         let (imm, rvd, rv1, rv2, arg2, res) = if word {
             (0, 0, 0, 0, 0, 0)
         } else {
-            (op.decode.imm, op.rvd, op.rv1, op.rv2, op.arg2, op.res)
+            (op.decode.imm, op.rvd, op.rv1, op.rv2, op.arg2(), op.res)
         };
 
         table.set_dword_wl(row_idx, cols::IMM_0, imm);
@@ -533,7 +691,7 @@ pub fn generate_cpu_trace(
         // res as DWordHL (4 × 16-bit halves).
         table.set_dword_hl(row_idx, cols::RES_0, res);
 
-        table.set_bool(row_idx, cols::BRANCH_COND, op.branch_cond);
+        table.set_bool(row_idx, cols::BRANCH_COND, op.branch_cond());
 
         // Inline-PC coordination columns.
         let pc_double_read = !word && f.read_register1 && f.rs1 == 255;
@@ -551,15 +709,36 @@ pub fn generate_cpu_trace(
     // halting ECALL). pc_double_read and prev_pc_timestamp_borrow stay 0, giving
     // prev_ts = timestamp - 3. The first padding read (timestamp = last_ts + 4) then
     // lands on last_ts + 1, where the HALT chip's emit_pc deposited pc = 1.
-    let last_ts = operations.last().map(|op| op.timestamp).unwrap_or(0);
+    let last_ts = segments
+        .iter()
+        .rev()
+        .find_map(|s| s.last())
+        .map(|op| op.timestamp)
+        .unwrap_or(0);
     for row_idx in n..num_rows {
         let j = (row_idx - n + 1) as u64;
         table.set_u64(row_idx, cols::TIMESTAMP, last_ts + 4 * j);
         table.set_u64(row_idx, cols::PC_0, CPU_PADDING_PC);
         table.set_u64(row_idx, cols::NEXT_PC_0, CPU_PADDING_PC);
     }
+}
 
-    trace
+/// The CPU ops of `logs` (timestamps from 4, the run's cadence) read against
+/// `decode`.
+fn ops_from_logs(logs: &[Log], decode: &DecodeTable) -> Result<Vec<CpuOperation>, Error> {
+    let mut operations = Vec::with_capacity(logs.len());
+    for (i, log) in logs.iter().enumerate() {
+        let row = decode
+            .row(log.current_pc)
+            .ok_or(Error::MissingInstruction(log.current_pc))?;
+        operations.push(CpuOperation::from_log(
+            log,
+            (i as u64) * 4 + 4,
+            decode.entry(row),
+            row,
+        ));
+    }
+    Ok(operations)
 }
 
 /// Generates the CPU trace table directly from executor logs.
@@ -567,25 +746,18 @@ pub fn generate_cpu_trace_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
 ) -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, Error> {
-    let mut operations = Vec::with_capacity(logs.len());
-    for (i, log) in logs.iter().enumerate() {
-        let instruction = *instructions
-            .get(&log.current_pc)
-            .ok_or(Error::MissingInstruction(log.current_pc))?;
-        operations.push(CpuOperation::from_log_and_instruction(
-            log,
-            (i as u64) * 4 + 4,
-            instruction,
-        ));
-    }
-    Ok(generate_cpu_trace(&operations))
+    let decode = DecodeTable::from_instructions(instructions);
+    Ok(generate_cpu_trace(&ops_from_logs(logs, &decode)?, &decode))
 }
 
 /// Collects all BITWISE lookups generated by these CPU operations.
-pub fn collect_bitwise_ops(operations: &[CpuOperation]) -> Vec<super::bitwise::BitwiseOperation> {
+pub fn collect_bitwise_ops(
+    operations: &[CpuOperation],
+    decode: &DecodeTable,
+) -> Vec<super::bitwise::BitwiseOperation> {
     operations
         .iter()
-        .flat_map(|op| op.collect_bitwise_ops())
+        .flat_map(|op| decode.op(op).collect_bitwise_ops())
         .collect()
 }
 
@@ -594,18 +766,8 @@ pub fn collect_bitwise_ops_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
 ) -> Result<Vec<super::bitwise::BitwiseOperation>, Error> {
-    let mut operations = Vec::with_capacity(logs.len());
-    for (i, log) in logs.iter().enumerate() {
-        let instruction = *instructions
-            .get(&log.current_pc)
-            .ok_or(Error::MissingInstruction(log.current_pc))?;
-        operations.push(CpuOperation::from_log_and_instruction(
-            log,
-            (i as u64) * 4 + 4,
-            instruction,
-        ));
-    }
-    Ok(collect_bitwise_ops(&operations))
+    let decode = DecodeTable::from_instructions(instructions);
+    Ok(collect_bitwise_ops(&ops_from_logs(logs, &decode)?, &decode))
 }
 
 // =========================================================================

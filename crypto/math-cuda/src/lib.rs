@@ -5,20 +5,57 @@
 //! Everything else (`ntt`, element-wise arith) is either internal to those
 //! pipelines or used by the parity test suite.
 
+/// A launcher's precondition, refused as an error rather than a panic: the
+/// caller handed a shape the kernel does not take, which is
+/// `CUDA_ERROR_INVALID_VALUE` (the callers map a device error to a refusal or
+/// a host fallback). The message is the check's documentation; it is not
+/// evaluated.
+macro_rules! ensure {
+    ($cond:expr $(, $($msg:tt)+)?) => {
+        if !$cond {
+            return Err($crate::invalid_value());
+        }
+    };
+}
+
+/// [`ensure!`] for an equality.
+macro_rules! ensure_eq {
+    ($left:expr, $right:expr $(, $($msg:tt)+)?) => {
+        if $left != $right {
+            return Err($crate::invalid_value());
+        }
+    };
+}
+
+pub mod argue_probe;
 pub mod barycentric;
+pub mod blake3;
+pub mod columns;
+pub mod constraint_compiled_keys;
 pub mod constraint_interp;
 pub mod deep;
+pub mod deep_inv;
 pub mod device;
 #[cfg(feature = "test-faults")]
 pub mod faults;
 pub mod fri;
+pub mod gkr;
 pub mod grinding;
 pub mod inverse;
 pub mod lde;
+pub mod lde_cm;
 pub mod logup;
 pub mod merkle;
+pub mod narrow;
 pub mod ntt;
 pub mod nvtx;
+pub mod p1_stark;
+pub mod p1w16;
+pub mod rpx;
+pub mod rpx_paths;
+pub mod sumcheck;
+pub mod whir;
+pub mod whir_open;
 
 // Re-exported for downstream crates so they can refer to CUDA primitive
 // types without depending on cudarc directly.
@@ -29,6 +66,95 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use crate::device::{Backend, backend};
 
 pub type Result<T> = std::result::Result<T, cudarc::driver::DriverError>;
+
+/// The error a refused launcher precondition returns ([`ensure!`]).
+pub(crate) fn invalid_value() -> cudarc::driver::DriverError {
+    cudarc::driver::DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE)
+}
+
+/// Which hash family a device tree build launches.
+///
+/// The fused LDE+commit pipelines ([`lde`]), the composition-poly tree
+/// builders ([`merkle`] / [`blake3`]) and the FRI layer commits ([`fri`])
+/// each exist kernel-for-kernel in both BYTE families; this enum is the
+/// dispatch key callers pass down. It deliberately carries no round counts or
+/// parameters: within one build each family is a single concrete hash
+/// (keccak-256, or `Blake3Chain` at the compiled round count), exactly as on
+/// the host.
+///
+/// ★ Of the three ALGEBRAIC keys, [`DeviceHash::Rpx256`] is ported
+/// ([`rpx`]); RPO256 and Poseidon name hashes whose device kernels are not.
+/// Every dispatch site in this crate carries an arm for the unported keys that
+/// aborts with `unimplemented!` naming the hash — never an arm that launches a
+/// byte-hash kernel in its place. The keys exist ahead of their kernels so the
+/// host side (`stark::config::DeviceTreeBackend`) can name every commitment
+/// hash under `cuda`: a tree labelled RPO is then built by RPO kernels or not
+/// built at all. Porting a family means replacing those arms with launches,
+/// and the set of arms is the checklist.
+///
+/// ★ **Why the key travels with the request at all.** On the host a Merkle
+/// backend both NAMES a hash and computes it, so a tree cannot wear a name its
+/// own code did not produce. On the device the backend only names it — the
+/// kernels hash — so without a key travelling alongside, a tree labelled RPX
+/// could be built by keccak's kernels and nothing would notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeviceHash {
+    /// Keccak-256 leaves and parents.
+    Keccak256,
+    /// `Blake3Chain` leaves and parents at the compiled round count.
+    Blake3,
+    /// RPO256 leaves and parents. No device kernels yet: every dispatch site
+    /// aborts loudly on this key.
+    Rpo256,
+    /// RPX256 (XHash12) leaves and parents — [`rpx`]'s kernels, the
+    /// algebraic family's first device port.
+    Rpx256,
+    /// ⚠ Poseidon-original — UNSHIPPABLE on the host side too; present so the
+    /// key set mirrors `CommitmentHash` one-to-one. No device kernels.
+    Poseidon,
+    /// ZisK's Poseidon1 instance (width 16, rate 12, arity-4 trees) — the
+    /// `p1/*` exploration branch. Kernels in [`p1w16`]; a dispatch site not yet
+    /// wired aborts loudly on this key.
+    Poseidon1,
+}
+
+impl DeviceHash {
+    /// The name a tree built under this key may be called by.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Keccak256 => "keccak256",
+            Self::Blake3 => "blake3-chain",
+            Self::Rpo256 => "rpo256",
+            Self::Rpx256 => "rpx256",
+            Self::Poseidon => "poseidon-goldilocks",
+            Self::Poseidon1 => "poseidon1-w16",
+        }
+    }
+
+    /// Children per Merkle node: 4 under ZisK's Poseidon1 (its trees are
+    /// 4-ary, [`p1_stark`]), 2 under every other key.
+    pub const fn arity(self) -> usize {
+        match self {
+            Self::Poseidon1 => p1_stark::ARITY,
+            Self::Keccak256 | Self::Blake3 | Self::Rpo256 | Self::Rpx256 | Self::Poseidon => 2,
+        }
+    }
+}
+
+/// Stored nodes of a device tree over `leaves` leaves under `hash`: the binary
+/// heap's `2·leaves − 1`, or the arity-4 layout's count ([`p1_stark::tree_nodes`]).
+pub fn tree_nodes(hash: DeviceHash, leaves: usize) -> usize {
+    match hash.arity() {
+        2 => 2 * leaves - 1,
+        _ => p1_stark::tree_nodes(leaves),
+    }
+}
+
+/// Where the leaves start in that node buffer, in nodes: both layouts store
+/// the leaves last.
+pub fn leaves_offset(hash: DeviceHash, leaves: usize) -> usize {
+    tree_nodes(hash, leaves) - leaves
+}
 
 /// Toolchain sanity: plain wrapping u64 vector add. Not a field op.
 pub fn vector_add_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
