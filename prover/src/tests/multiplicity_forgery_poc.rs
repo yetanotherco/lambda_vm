@@ -588,19 +588,20 @@ fn assert_honest_verifies(s: &Scenario) {
     assert!(verifier_accepts(s, &proof), "honest proof must verify");
 }
 
-/// Did a crafted proof get accepted? A prover refusal also counts as rejected.
+/// Did a crafted proof get accepted by the verifier? The prover must succeed: a
+/// prover refusal is not a verifier rejection (a malicious prover skips the
+/// honest prover's checks), so an `Err` here means the test cannot conclude the
+/// forgery is blocked and must fail loudly rather than pass silently.
 fn crafted_accepted(s: &Scenario, forge: Forge) -> bool {
-    match craft_proof(s, forge) {
-        Ok(proof) => {
-            assert_eq!(
-                u64_output(&proof),
-                s.forged,
-                "public output must be the forged value"
-            );
-            verifier_accepts(s, &proof)
-        }
-        Err(_) => false,
-    }
+    let proof = craft_proof(s, forge).expect(
+        "prover must build the crafted proof; a prover refusal is not a verifier rejection",
+    );
+    assert_eq!(
+        u64_output(&proof),
+        s.forged,
+        "public output must be the forged value"
+    );
+    verifier_accepts(s, &proof)
 }
 
 #[test]
