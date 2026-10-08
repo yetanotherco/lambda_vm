@@ -507,5 +507,14 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
         let carry_1 = (addr_hi + carry_0 - ptr_hi) * inv_2_32;
         let mu = b.main(0, cols::MU);
         b.emit_base(50, mu * carry_1);
+
+        // idx 51: MuIsBit — μ·(1−μ). Every other constraint and bus send is
+        // weighted by μ, so μ ≠ 0 is indistinguishable from μ = 1 at the
+        // constraint level, while on the bus a μ = −1 row inverts a range check
+        // (carrier). KECCAK does not deduplicate (one row per hash, μ ∈ {0,1}),
+        // so the bit constraint is honest and forbids μ = −1.
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        b.emit_base(51, mu.clone() * (one - mu));
     }
 }

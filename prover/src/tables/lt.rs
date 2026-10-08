@@ -23,6 +23,7 @@
 //! ## Bus Interactions
 //! - Sender: MSB16 (×2 for lhs_msb, rhs_msb)
 //! - Sender: IS_HALFWORD (×6: ×4 for lhs_sub_rhs, ×1 for lhs[1], ×1 for rhs[1])
+//! - Sender: ARE_BYTES (×1 for the μ multiplicity bound)
 //! - Receiver: ALU (all less-than lookups — CPU SLT/BLT/BGE dispatch and the
 //!   internal `memw`/`memw_aligned`/`dvrm` timestamp / |r|<|d| checks)
 
@@ -152,20 +153,50 @@ impl LtOperation {
     }
 }
 
-/// Generates the LT trace table from a list of operations.
+/// Largest per-row multiplicity: `μ` is range-checked to a byte
+/// (`IS_BYTE[μ]`, weighted by μ), so a row holds at most this many lookups. The
+/// bound is what keeps μ non-negative: without it a `μ = −1` twin of an honest
+/// row cancels it on the ALU bus while *receiving* its range lookups, which
+/// absorbs another row's out-of-range limb (a forged `5 < 3 = 1` verified).
 ///
-/// Duplicate operations (same lhs, rhs, signed) are merged into a single row
-/// with their multiplicities summed. The table is then padded to the next power of 2.
-pub fn generate_lt_trace(
-    operations: &[LtOperation],
-) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    // Deduplicate operations: (lhs, rhs, signed) -> multiplicity
+/// The bound rides the ARE_BYTES bus, which the limb range checks
+/// (IS_HALFWORD) never use. That is what closes it: an IS_HALFWORD-bus
+/// bound could be cancelled by a non-canonical limb `(p−1, b+1)` (same
+/// packed value, passes every constraint) sending `IS_HALFWORD[p−1]`;
+/// on ARE_BYTES no limb can reach the `p−1` tuple, so a `μ = −1` row's
+/// bound send has no receiver and the whole proof is rejected.
+pub const MU_MAX: u64 = (1 << 8) - 1;
+
+/// Deduplicates LT operations into trace rows: `(lhs, rhs, signed, invert) -> μ`,
+/// splitting an op over several rows when its count exceeds [`MU_MAX`]. Shared
+/// by trace generation and the BITWISE collector so the per-row lookups they
+/// count cannot drift apart.
+pub fn dedup_lt_rows(operations: &[LtOperation]) -> Vec<(LtOperation, u64)> {
     let mut op_map: HashMap<LtOperation, u64> = HashMap::new();
     for op in operations {
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
 
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let mut rows = Vec::with_capacity(op_map.len());
+    for (op, mut left) in op_map {
+        while left > 0 {
+            let mu = left.min(MU_MAX);
+            left -= mu;
+            rows.push((op.clone(), mu));
+        }
+    }
+    rows
+}
+
+/// Generates the LT trace table from a list of operations.
+///
+/// Duplicate operations (same lhs, rhs, signed, invert) are merged into a single
+/// row with their multiplicities summed (see [`dedup_lt_rows`]). The table is
+/// then padded to the next power of 2.
+pub fn generate_lt_trace(
+    operations: &[LtOperation],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let unique_ops = dedup_lt_rows(operations);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
@@ -305,6 +336,25 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::RHS_1,
                 packing: Packing::Direct,
             }],
+        ),
+        // ARE_BYTES[μ, 0] | μ. Every lookup here fires with μ, so μ itself must be
+        // bounded and non-negative. Otherwise a μ = −1 twin of an honest row
+        // cancels it on the ALU bus while *receiving* its range lookups, with
+        // `sub_0` free up to 2^32: it absorbs an out-of-range IS_HALFWORD sent
+        // by any row, another LT row included (forged `5 < 3 = 1`). Sent with
+        // itself as multiplicity: `k` rows holding an out-of-range `v` put
+        // weight `k·v ≠ 0` on a byte tuple ARE_BYTES has no row for, while padding
+        // (μ = 0) contributes nothing. See `MU_MAX`.
+        BusInteraction::sender(
+            BusId::AreBytes,
+            Multiplicity::Column(cols::MU),
+            vec![
+                BusValue::Packed {
+                    start_column: cols::MU,
+                    packing: Packing::Direct,
+                },
+                BusValue::constant(0),
+            ],
         ),
         // ALU[lhs, rhs, opsel(LT) + 32*signed + 64*invert] -> out  (receiver).
         // Every LT lookup arrives here: the CPU dispatches SLT/BLT/BGE on the

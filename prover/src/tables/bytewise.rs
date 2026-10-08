@@ -92,11 +92,16 @@ impl BytewiseOperation {
 
 /// Generates the BYTEWISE trace from a list of operations.
 ///
-/// Duplicate operations are merged with summed multiplicities, then padded to
-/// the next power of two (minimum 4).
-pub fn generate_bytewise_trace(
-    operations: &[BytewiseOperation],
-) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+/// Largest per-row multiplicity: `μ` is range-checked to a byte on the ARE_BYTES
+/// bus (`IS_BYTE[μ]`, weighted by μ), so a row holds at most this many lookups.
+/// The bound keeps μ non-negative: without it a `μ = −1` row inverts its byte
+/// range checks and can hold an out-of-range byte (carrier). See [`dedup_bytewise_rows`].
+pub const MU_MAX: u64 = (1 << 8) - 1;
+
+/// Deduplicates BYTEWISE operations into trace rows: `op -> μ`, splitting an op
+/// over several rows when its count exceeds [`MU_MAX`]. Shared by trace
+/// generation and the BITWISE collector so the per-row lookups cannot drift.
+pub fn dedup_bytewise_rows(operations: &[BytewiseOperation]) -> Vec<(BytewiseOperation, u64)> {
     use std::collections::HashMap;
 
     let mut op_map: HashMap<BytewiseOperation, u64> = HashMap::new();
@@ -104,7 +109,23 @@ pub fn generate_bytewise_trace(
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
 
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let mut rows = Vec::with_capacity(op_map.len());
+    for (op, mut left) in op_map {
+        while left > 0 {
+            let mu = left.min(MU_MAX);
+            left -= mu;
+            rows.push((op.clone(), mu));
+        }
+    }
+    rows
+}
+
+/// Duplicate operations are merged with summed multiplicities (split at
+/// [`MU_MAX`]), then padded to the next power of two (minimum 4).
+pub fn generate_bytewise_trace(
+    operations: &[BytewiseOperation],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let unique_ops = dedup_bytewise_rows(operations);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
@@ -132,6 +153,7 @@ pub fn generate_bytewise_trace(
 
 /// All bus interactions for the BYTEWISE table:
 /// - **Sends** `BYTE_ALU[op, a[i], b[i]] -> res[i]` for each of the 8 bytes.
+/// - **Sends** `ARE_BYTES[μ, 0]` to bound the multiplicity.
 /// - **Receives** `ALU[a, b, op] -> res` (operands packed DWordBL -> 2 words).
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(9);
@@ -160,6 +182,22 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ],
         ));
     }
+
+    // ARE_BYTES[μ, 0] | μ. Bounds μ to a byte and keeps it non-negative: the eight
+    // BYTE_ALU sends above are weighted by μ, so a free μ = −1 would invert them
+    // and let the row hold an out-of-range byte. The bound rides ARE_BYTES with
+    // value = weight = μ, so a μ = −1 row lands at `(p−1, 0)` with no receiver.
+    interactions.push(BusInteraction::sender(
+        BusId::AreBytes,
+        Multiplicity::Column(cols::MU),
+        vec![
+            BusValue::Packed {
+                start_column: cols::MU,
+                packing: Packing::Direct,
+            },
+            BusValue::constant(0),
+        ],
+    ));
 
     // ALU[a, b, op] -> res (receiver). a/b/res are DWordBL (8 bytes) packed
     // into 2 words each, matching the CPU's DWordWL operands.

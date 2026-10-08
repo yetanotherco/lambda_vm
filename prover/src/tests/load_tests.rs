@@ -61,3 +61,76 @@ fn test_sign_bit_extraction() {
     let op4 = LoadOperation::new(0, 0, 4, true, [0, 0, 0, 0x80, 0, 0, 0, 0]);
     assert!(op4.compute_sign_bit());
 }
+
+// =========================================================================
+// Soundness regression: μ is bit-constrained (MuIsBit, idx 13).
+//
+// Before MuIsBit, idx 5 pinned μ = 1 only when a read2/4/8 flag was set, so a
+// byte-load row's μ was free. A μ = −1 / μ = 1 pair of LBU rows with the same
+// `res[0]` cancels on MEMORY/MEMW but nets `MSB8[res[0]] → 0` minus `→ 1`,
+// which cancels a real LB row's forged `sign_bit = 1`: `lb 0x05` answered
+// `0xFFFF_FFFF_FFFF_FF05` and verified end to end
+// (`multiplicity_forgery_poc::load_negative_mu_sign_extension_forgery_is_rejected`).
+// =========================================================================
+
+mod mu_bit_regression {
+    use crate::tables::load::{LoadConstraints, LoadOperation, cols, generate_load_trace};
+    use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
+    use crate::test_utils::{busless_air, validate_busless};
+
+    type Trace = stark::trace::TraceTable<GoldilocksField, GoldilocksExtension>;
+
+    /// Row 0: the real `lb` of 0x05 with the forged sign extension. Rows 1/2:
+    /// the cancelling `μ = −1 / μ = 1` byte-load pair.
+    fn forged_lb() -> (Trace, Trace) {
+        let op = LoadOperation::new(0x1000, 100, 1, true, [0x05, 0, 0, 0, 0, 0, 0, 0]);
+        let honest = generate_load_trace(std::slice::from_ref(&op));
+        let mut forged = honest.clone();
+        let t = &mut forged.main_table;
+        assert_eq!(*t.get(0, cols::SIGN_BIT), FE::zero());
+        for &c in &cols::RES[1..] {
+            t.set(0, c, FE::from(0xFFu64));
+        }
+        t.set(0, cols::SIGN_BIT, FE::one());
+        for (row, mu, sign_bit) in [(1, -FE::one(), FE::one()), (2, FE::one(), FE::zero())] {
+            t.set(row, cols::RES[0], FE::from(0x05u64));
+            t.set(row, cols::MU, mu);
+            t.set(row, cols::SIGN_BIT, sign_bit);
+        }
+        (honest, forged)
+    }
+
+    #[test]
+    fn negative_mu_byte_load_pair_is_rejected() {
+        let (honest, forged) = forged_lb();
+        let air = busless_air(cols::NUM_COLUMNS, LoadConstraints);
+        assert!(validate_busless(&air, &honest), "honest trace must pass");
+        assert!(
+            !validate_busless(&air, &forged),
+            "μ = −1 must be rejected by IS_BIT[μ]"
+        );
+    }
+
+    /// Every other in-chip constraint holds on the forged rows: only MuIsBit
+    /// stands between the trace and a forged sign extension.
+    #[test]
+    fn forged_rows_differ_from_valid_only_in_mu() {
+        let (_, mut forged) = forged_lb();
+        forged.main_table.set(1, cols::MU, FE::zero());
+        forged.main_table.set(2, cols::MU, FE::zero());
+        let air = busless_air(cols::NUM_COLUMNS, LoadConstraints);
+        assert!(validate_busless(&air, &forged));
+    }
+
+    #[test]
+    fn mu_two_byte_load_row_is_rejected() {
+        let op = LoadOperation::new(0x1000, 100, 1, false, [0x42, 0, 0, 0, 0, 0, 0, 0]);
+        let mut trace = generate_load_trace(std::slice::from_ref(&op));
+        trace.main_table.set(0, cols::MU, FE::from(2u64));
+        let air = busless_air(cols::NUM_COLUMNS, LoadConstraints);
+        assert!(
+            !validate_busless(&air, &trace),
+            "μ = 2 must be rejected by IS_BIT[μ]"
+        );
+    }
+}

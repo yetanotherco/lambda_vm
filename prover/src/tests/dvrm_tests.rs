@@ -311,8 +311,9 @@ fn test_bus_interactions_count() {
     // - 2x MUL senders (n_sub_r = d*q lo + hi)
     // - 6x ZERO senders (C3×2 NEG r, C5×2 NEG d, C8 overflow, C17 div_by_zero)
     // - 2x DVRM receivers (quotient, remainder)
-    // Total: 8 + 12 + 3 + 1 + 2 + 6 + 2 = 34
-    assert_eq!(interactions.len(), 34, "Expected 34 bus interactions");
+    // - 2x ARE_BYTES senders bounding the multiplicities (μ_q, μ_r)
+    // Total: 8 + 12 + 3 + 1 + 2 + 6 + 2 + 2 = 36
+    assert_eq!(interactions.len(), 36, "Expected 36 bus interactions");
 }
 
 #[test]
@@ -554,4 +555,143 @@ fn neg_template_zero_lookups_dedup_per_chip_instance() {
         "per-instance dedup of NEG-template ZERO lookups regressed: \
          {two_instances} (2 instances) must exceed {one_instance} (1 instance)"
     );
+}
+
+// Soundness regression: μ_q/μ_r are bounded, non-negative multiplicities.
+// Every DVRM check fires with μ_q + μ_r, so a free μ_r = −1 next to μ_q = 1
+// switched them all off (`multiplicity_forgery_poc`). Each μ is now ARE_BYTES-checked
+// weighted by itself, and trace generation splits a row whose count would
+// exceed `MU_MAX`.
+
+/// Presence: each multiplicity is ARE_BYTES-checked weighted by itself, so an
+/// out-of-range value `v` always lands on the bus with weight `v ≠ 0`.
+#[test]
+fn test_dvrm_bounds_its_multiplicities() {
+    use crate::tables::types::BusId;
+    use stark::lookup::{BusValue, Multiplicity, Packing};
+    for col in [cols::MU_Q, cols::MU_R] {
+        assert!(
+            bus_interactions().iter().any(|i| i.is_sender
+                && i.bus_id == BusId::AreBytes as u64
+                && matches!(i.multiplicity, Multiplicity::Column(m) if m == col)
+                && matches!(i.values.first(),
+                    Some(BusValue::Packed { start_column, packing: Packing::Direct }) if *start_column == col)),
+            "DVRM must IS_BYTE-check multiplicity column {col} weighted by itself"
+        );
+    }
+}
+
+/// Splitting: a count above `MU_MAX` spreads over rows within the bound that
+/// preserve both totals; exactly `MU_MAX` still fits one row.
+#[test]
+fn test_dedup_dvrm_rows_splits_counts_above_mu_max() {
+    use crate::tables::dvrm::{MU_MAX, dedup_dvrm_rows};
+    let op = DvrmOperation::new(7, 2, UNSIGNED);
+    let ops: Vec<_> = std::iter::repeat_n((op.clone(), true), MU_MAX as usize + 5)
+        .chain(std::iter::repeat_n((op.clone(), false), 3))
+        .collect();
+    let mut rows: Vec<(u64, u64)> = dedup_dvrm_rows(&ops)
+        .iter()
+        .map(|(_, m)| (m.mu_q, m.mu_r))
+        .collect();
+    rows.sort();
+    assert_eq!(rows, vec![(0, 5), (3, MU_MAX)]);
+
+    let ops: Vec<_> = std::iter::repeat_n((op, false), MU_MAX as usize).collect();
+    assert_eq!(dedup_dvrm_rows(&ops).len(), 1);
+    assert!(dedup_dvrm_rows(&[]).is_empty());
+}
+
+/// Consistency: the BITWISE collector tallies exactly the per-row lookups the
+/// generated DVRM instances send — IS_HALF[μ_q], IS_HALF[μ_r] weighted by μ
+/// (padding sends nothing), MSB16 ×3 per SIGNED row and the NEG-template ZERO ×2 per
+/// SIGN_R / SIGN_D row — across small instances and for a row split by `MU_MAX`.
+#[test]
+fn test_dvrm_per_row_lookups_match_collector() {
+    use crate::tables::bitwise::BitwiseOperationType;
+    use crate::tables::dvrm::MU_MAX;
+    use crate::tables::trace_builder::collect_bitwise_from_dvrm;
+    use std::collections::HashMap;
+
+    let half = |h: u64| ((h & 0xFF) as u8, ((h >> 8) & 0xFF) as u8);
+    let distinct = [
+        DvrmOperation::new(7, 2, UNSIGNED),
+        DvrmOperation::new((-7i64) as u64, 2, SIGNED),
+        DvrmOperation::new(100, (-3i64) as u64, SIGNED),
+    ];
+    let small: Vec<_> = distinct
+        .iter()
+        .cycle()
+        .take(11)
+        .enumerate()
+        .map(|(i, op)| (op.clone(), i % 2 == 0))
+        .collect();
+    let split: Vec<_> = std::iter::repeat_n((distinct[1].clone(), false), MU_MAX as usize + 2)
+        .chain(distinct.iter().map(|op| (op.clone(), true)))
+        .collect();
+
+    for (ops, chunk) in [(small, 4usize), (split, 1 << 19)] {
+        let collected = collect_bitwise_from_dvrm(&ops, chunk);
+        let count = |ty| collected.iter().filter(|b| b.lookup_type == ty).count();
+
+        let mut is_half: HashMap<(u8, u8), i64> = HashMap::new();
+        for b in collected
+            .iter()
+            .filter(|b| b.lookup_type == BitwiseOperationType::IsHalf)
+        {
+            *is_half.entry((b.x, b.y)).or_default() += 1;
+        }
+        for (op, _) in &ops {
+            let r = op.compute_remainder();
+            for word in [op.n, op.d, r, op.n.wrapping_sub(r), op.compute_quotient()] {
+                for shift in [0, 16, 32, 48] {
+                    *is_half.entry(half(word >> shift & 0xFFFF)).or_default() -= 1;
+                }
+            }
+        }
+
+        // The μ bounds moved to ARE_BYTES, so IS_HALF must now be exactly the limbs.
+        is_half.retain(|_, n| *n != 0);
+        assert!(
+            is_half.is_empty(),
+            "IS_HALF must match exactly the limb range checks"
+        );
+
+        // μ bounds: ARE_BYTES[μ_q, 0] and ARE_BYTES[μ_r, 0], weighted by μ.
+        let mut arebytes: HashMap<u8, i64> = HashMap::new();
+        for b in collected
+            .iter()
+            .filter(|b| b.lookup_type == BitwiseOperationType::AreBytes)
+        {
+            assert_eq!(b.y, 0, "μ bounds send ARE_BYTES[μ, 0]");
+            *arebytes.entry(b.x).or_default() += 1;
+        }
+        let mut expected: HashMap<u8, i64> = HashMap::new();
+        let (mut msb16, mut neg_zero) = (0usize, 0usize);
+        for c in ops.chunks(chunk) {
+            let t = generate_dvrm_trace(c);
+            for r in 0..t.num_rows() {
+                for col in [cols::MU_Q, cols::MU_R] {
+                    let mu = t.get_main(r, col).to_raw();
+                    *expected.entry(mu as u8).or_default() += mu as i64;
+                }
+                msb16 += 3 * t.get_main(r, cols::SIGNED).to_raw() as usize;
+                neg_zero += 2 * t.get_main(r, cols::SIGN_R).to_raw() as usize;
+                neg_zero += 2 * t.get_main(r, cols::SIGN_D).to_raw() as usize;
+            }
+        }
+        arebytes.retain(|_, n| *n != 0);
+        expected.retain(|_, n| *n != 0);
+        assert_eq!(
+            arebytes, expected,
+            "ARE_BYTES[μ] tally must match the trace rows"
+        );
+        assert_eq!(count(BitwiseOperationType::Msb16), msb16, "MSB16 tally");
+        // ZERO = C8 + C20 per raw op, plus the per-row NEG-template sends.
+        assert_eq!(
+            count(BitwiseOperationType::Zero),
+            2 * ops.len() + neg_zero,
+            "ZERO tally"
+        );
+    }
 }

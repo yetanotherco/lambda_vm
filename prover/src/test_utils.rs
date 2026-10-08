@@ -237,7 +237,13 @@ pub fn asm_elf_bytes(name: &str) -> Vec<u8> {
         .join("asm")
         .join(format!("{}.elf", name));
 
-    std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read ELF: {}", path.display()))
+    std::fs::read(&path).unwrap_or_else(|_| {
+        panic!(
+            "Failed to read ELF: {} — the .elf artifacts are gitignored; run \
+             `make compile-programs-asm` first",
+            path.display()
+        )
+    })
 }
 
 /// Helper to run an ELF from the program_artifacts directory.

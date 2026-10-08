@@ -476,10 +476,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // =========================================================================
 //
 // One body against the generic `ConstraintBuilder` serves the compiled prover
-// folder, the verifier folder and IR capture. Constraint indices 0..13:
+// folder, the verifier folder and IR capture. Constraint indices 0..14:
 //   0..4: FlagIsBit(SIGNED, READ2, READ4, READ8)   4: WidthSumIsBit
 //   5: ReadImpliesMu                                6..10: ExtensionHigh(4..8)
 //   10..12: ExtensionMid(2..4)                      12: ExtensionLow
+//   13: MuIsBit
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
@@ -575,5 +576,15 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for LoadConstraints {
         let expected = Self::extended(b);
         let one = b.one();
         b.emit_base(12, (one - read2 - read4 - read8) * (res_1 - expected));
+
+        // idx 13: MuIsBit — μ * (1 - μ). LOAD never deduplicates (one row per
+        // op), and idx 5 only pins μ = 1 when a read2/4/8 flag is set. On a byte
+        // load a free μ = −1 turns every lookup into a provider: a −1/+1 pair of
+        // LBU rows with the same `res[0]` cancels on MEMORY/MEMW (neither carries
+        // `sign_bit`) but nets `MSB8[res[0]] → ¬sign_bit` minus `→ sign_bit`,
+        // which cancels a real LB row's forged sign bit (`lb 0x05 = 0xFF..05`
+        // verified).
+        let root = Self::flag_is_bit(b, cols::MU);
+        b.emit_base(13, root);
     }
 }
