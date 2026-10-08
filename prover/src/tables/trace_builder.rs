@@ -3351,7 +3351,9 @@ fn build_traces<I: ImageSource + Sync>(
             // IS_BYTE[μ] | μ: each dedup row sends its own μ, μ times (padding
             // sends nothing), over exactly the rows `generate_bytewise_trace`
             // builds for each chunk. Mirrors the LT/MUL/DVRM/BRANCH bound.
-            for chunk in bytewise_ops.chunks(bytewise_chunk) {
+            // `.max(1)`: `chunks(0)` panics, and `bytewise_chunk` is an
+            // externally supplied row cap that could be 0.
+            for chunk in bytewise_ops.chunks(bytewise_chunk.max(1)) {
                 for (_, mu) in bytewise::dedup_bytewise_rows(chunk) {
                     let op =
                         BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, mu as u8);
