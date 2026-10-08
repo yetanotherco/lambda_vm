@@ -413,32 +413,59 @@ fn a_streamed_block_uploading_ahead_proves_and_verifies() {
     }
 }
 
-/// The streamed build held narrow: each group packed as it is committed during
-/// the collect — every table but the ones the finish built packed, which are
-/// held narrow from the start — and the proof verifies.
+/// The streamed build held narrow: every table packed exactly once — by its
+/// group as the group is committed during the collect, by the finish (the
+/// rest's tables, held narrow from the start), or, under G-pack, by its
+/// generator (each streamed chunk written packed and laid out narrow, so its
+/// group's commit finds it packed) — with G-pack off and on, and the proof
+/// verifies.
 #[test]
 fn a_streamed_block_held_narrow_proves_and_verifies() {
     let elf = asm_elf_bytes("all_instructions_64");
     let format = many_groups();
-    let mut o = streamed(MaxRowsConfig::small(), 16, 3);
-    o.narrow = stark::multilinear_block::Narrowing::Host;
-    let (proof, stamps) = prove_block_whir_with(
-        &elf,
-        &[],
-        &ProofOptions::default_test_options(),
-        &format,
-        &o,
-        &Deviations::default(),
-    )
-    .expect("prove");
-    assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
-    assert!(o.pack_finished && stamps.layout.packed_rest.0 > 0);
-    assert_eq!(
-        stamps.groups.iter().map(|g| g.packed_tables).sum::<usize>() + stamps.layout.packed_rest.0,
-        stamps.tables
-    );
-    assert!(stamps.report().contains("BLOCK NARROW: Host"));
-    assert!(verify(&proof, &elf, &format));
+    for gpack in [false, true] {
+        let mut o = streamed(MaxRowsConfig::small(), 16, 3);
+        o.narrow = stark::multilinear_block::Narrowing::Host;
+        o.gpack = gpack;
+        let (proof, stamps) = prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations::default(),
+        )
+        .expect("prove");
+        assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
+        assert!(o.pack_finished && stamps.layout.packed_rest.0 > 0);
+        // The chunks G-pack wrote packed: every streamed chunk, counted by this
+        // block (`BlockStamps::streamed`). G-pack's own counts, the BLOCK GPACK
+        // line's, are the process's and split the chunks and the finish's
+        // tables by whether a kind's width hint was there yet, so they bound
+        // the chunks from above and no more. A `debug-checks` build writes
+        // every trace wide (`gpack::Plan`).
+        let chunks = stamps.streamed.1;
+        assert!(chunks > 0, "the build streamed");
+        let written = if gpack && !cfg!(feature = "debug-checks") {
+            assert!(
+                stamps.layout.gpack.0 && stamps.layout.gpack.1.iter().sum::<usize>() >= chunks,
+                "G-pack built every streamed chunk: {:?}",
+                stamps.layout.gpack
+            );
+            chunks
+        } else {
+            0
+        };
+        assert_eq!(
+            stamps.groups.iter().map(|g| g.packed_tables).sum::<usize>()
+                + stamps.layout.packed_rest.0
+                + written,
+            stamps.tables,
+            "gpack {gpack}: every table packed exactly once"
+        );
+        assert!(stamps.report().contains("BLOCK NARROW: Host"));
+        assert!(verify(&proof, &elf, &format), "gpack {gpack}");
+    }
 }
 
 /// The memory log (`BlockOptions::memlog`) moves no byte of the proof — the
