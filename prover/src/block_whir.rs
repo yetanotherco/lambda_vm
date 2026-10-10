@@ -889,6 +889,27 @@ pub(crate) fn narrow_from_env() -> Option<multilinear_block::Narrowing> {
     }
 }
 
+/// `BLOCK_WHIR_WINDOW_LOG2=20|21`: the real-block tests' choice of
+/// [`BlockOptions::window_log2`], production's [`BLOCK_WINDOW_LOG2`] or #1013's
+/// one CPU chunk (2^21 cycles). The tables are the same either way, but the
+/// chunks leave in another order across tables, so the groups (statement
+/// data) differ: it is not the production setting. `None` leaves the
+/// production one; anything else is refused.
+pub(crate) fn window_log2_from_env() -> Option<usize> {
+    parse_window_log2(std::env::var("BLOCK_WHIR_WINDOW_LOG2").ok().as_deref())
+        .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`window_log2_from_env`]'s reading of the knob's `value`.
+fn parse_window_log2(value: Option<&str>) -> Result<Option<usize>, String> {
+    match value.map(str::trim) {
+        None => Ok(None),
+        Some("20") => Ok(Some(20)),
+        Some("21") => Ok(Some(21)),
+        Some(other) => Err(format!("BLOCK_WHIR_WINDOW_LOG2={other}: 20 or 21")),
+    }
+}
+
 /// `BLOCK_WHIR_UPLOAD_AHEAD=0|1`: the real-block tests' choice of
 /// [`BlockOptions::upload_ahead`]; `None` leaves the production one.
 pub(crate) fn upload_ahead_from_env() -> Option<bool> {
@@ -5577,7 +5598,20 @@ mod rest_order_tests {
 
 #[cfg(test)]
 mod producer_report_tests {
-    use super::{BlockStamps, ProducerStamps, StreamTable};
+    use super::{BLOCK_WINDOW_LOG2, BlockStamps, ProducerStamps, StreamTable, parse_window_log2};
+
+    /// The window knob takes production's 2^20 and #1013's 2^21, unset is
+    /// production's, and anything else is refused.
+    #[test]
+    fn the_window_knob_takes_20_or_21() {
+        assert_eq!(BLOCK_WINDOW_LOG2, 20);
+        assert_eq!(parse_window_log2(None), Ok(None));
+        assert_eq!(parse_window_log2(Some("20")), Ok(Some(20)));
+        assert_eq!(parse_window_log2(Some(" 21 ")), Ok(Some(21)));
+        for bad in ["", "19", "22", "2^21", "x"] {
+            assert!(parse_window_log2(Some(bad)).is_err(), "{bad:?}");
+        }
+    }
 
     /// The readout's two producer lines: what each thread waited on, and the
     /// hand-out table by table, only the tables that handed a chunk out (the

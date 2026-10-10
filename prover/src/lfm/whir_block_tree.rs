@@ -316,6 +316,12 @@ impl WhirTreeConfig {
         // `BLOCK_WHIR_KECCAK_LOG2=k`, `BLOCK_WHIR_ECSM_LOG2=k`: force a KECCAK or
         // ECSM split (production 2^18 / 2^17).
         block_whir::chunk_cuts_from_env(&mut options);
+        // `BLOCK_WHIR_WINDOW_LOG2=20|21` (production 20): the streamed prove's
+        // window, 2^21 being #1013's one CPU chunk (other groups, the same
+        // tables).
+        if let Some(log2) = block_whir::window_log2_from_env() {
+            options.window_log2 = Some(log2);
+        }
         // `BLOCK_WHIR_UPLOAD_AHEAD=0|1` (production 1): phase A puts each group's
         // columns on the card beside the previous group's commit.
         if let Some(ahead) = block_whir::upload_ahead_from_env() {
