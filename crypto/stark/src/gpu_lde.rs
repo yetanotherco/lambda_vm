@@ -1475,25 +1475,6 @@ where
     Some((tree, handle, lde_out))
 }
 
-/// Convert a GPU-built full node buffer (`(2*leaves - 1) * 32` bytes, inner
-/// nodes first, root at offset 0, leaves at the tail) into a host
-/// [`MerkleTree`], the exact layout `from_precomputed_nodes` expects.
-fn tree_from_node_bytes<B>(nodes: Vec<u8>) -> Option<MerkleTree<B>>
-where
-    B: DeviceTreeBackend,
-{
-    debug_assert_eq!(nodes.len() % 32, 0);
-    let nodes: Vec<[u8; 32]> = nodes
-        .chunks_exact(32)
-        .map(|c| {
-            let mut n = [0u8; 32];
-            n.copy_from_slice(c);
-            n
-        })
-        .collect();
-    MerkleTree::<B>::from_precomputed_nodes(nodes)
-}
-
 /// Preprocessed-table variant of [`try_expand_leaf_and_tree_row_major_keep`]:
 /// one row-major GPU LDE of ALL columns plus TWO subset Merkle trees — the
 /// precomputed columns `[0, split_col)` and the multiplicity columns
@@ -1590,7 +1571,10 @@ where
     };
 
     let pre_tree = match pre_nodes {
-        Some(nodes) => Some(tree_from_node_bytes::<B>(nodes)?),
+        // A GPU-built full node buffer (`2*leaves - 1` nodes, inner nodes
+        // first, root at index 0, leaves at the tail): the exact layout
+        // `from_precomputed_nodes` expects.
+        Some(nodes) => Some(MerkleTree::<B>::from_precomputed_nodes(nodes)?),
         None => None,
     };
     // Mult tree resident in the handle: the host tree is root only and R4
