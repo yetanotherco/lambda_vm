@@ -219,6 +219,10 @@ CU
   # run A end to end on the probe: the exact nsys flags with GPU metrics, the export, the summary tool
   rm -f "$W/probe/nsysprobe.nsys-rep" "$W/probe/nsysprobe.sqlite"
   nsys_flags "$W/probe/nsysprobe"
+  if ! env -i "${RUN_ENV[@]}" timeout 300 "${NSYS_FLAGS[@]}" "$W/probe/probe" > "$W/probe/nsys-osrt.log" 2>&1; then
+    NSYS_OSRT=0; nsys_flags "$W/probe/nsysprobe"
+    chk WARN "nsys: the OS-runtime trace flags failed on the probe (see $W/probe/nsys-osrt.log): run A traces CUDA only"
+  fi
   if env -i "${RUN_ENV[@]}" timeout 300 "${NSYS_FLAGS[@]}" "$W/probe/probe" > "$W/probe/nsys.log" 2>&1 \
      && env -i "${RUN_ENV[@]}" timeout 300 "$NSYS" export --type=sqlite --force-overwrite=true --output="$W/probe/nsysprobe.sqlite" "$W/probe/nsysprobe.nsys-rep" >> "$W/probe/nsys.log" 2>&1; then
     : > "$W/probe/empty.log"
@@ -293,9 +297,12 @@ posture() {  # posture w|s P|R bench|median → the knob words (I-COMP's posture
   fi
 }
 SAFE_VRAM="LAMBDA_VM_VRAM_BUDGET_MB=16000 LAMBDA_VM_MEMPOOL_RELEASE_MB=0"
+NSYS_OSRT=1
 nsys_flags() {  # nsys_flags OUT-PREFIX → NSYS_FLAGS: run A's exact flags (the preflight probe uses these too)
-  NSYS_FLAGS=("$NSYS" profile -t cuda,osrt --sample=none --cpuctxsw=none --cuda-memory-usage=false --osrt-threshold=10000
-              "$GM_FLAG=$GPU" --gpu-metrics-frequency=2000 --stats=false --force-overwrite=true -o "$1")
+  if [ "$NSYS_OSRT" = 1 ]; then NSYS_FLAGS=("$NSYS" profile -t cuda,osrt --osrt-threshold=10000)
+  else NSYS_FLAGS=("$NSYS" profile -t cuda); fi
+  NSYS_FLAGS+=(--sample=none --cpuctxsw=none --cuda-memory-usage=false "$GM_FLAG=$GPU" --gpu-metrics-frequency=2000
+               --stats=false --force-overwrite=true -o "$1")
 }
 ncu_flags() {  # ncu_flags KERNEL SKIP COUNT REPORT → NCU_FLAGS: run B's exact flags (the preflight probe uses these too)
   NCU_FLAGS=(--target-processes all --kernel-name-base function --kernel-name "regex:^${1}\$" --launch-skip "$2" --launch-count "$3")
@@ -419,10 +426,10 @@ facts() {
   {
     echo "prof4: script sha256 $(sha256sum "$SCRIPT" | cut -c1-16)… from ${PROF4_REV:-?} · mode $MODE · started $STAMP · deadline $DEADLINE_MIN min"
     echo "pins: W $W_SHA ($W_BRANCH, arms BLOCK_WHIR_BASE=p1w|rpx) · S $S_SHA ($S_BRANCH, NOEPOCH_BASE=p1 cap 1)"
-    echo "gpu $GPU: $(gpu_q name) · cc $(gpu_q compute_cap) · $(gpu_q memory.total) MiB · driver $(gpu_q driver_version) · power limit $(gpu_q power.limit) W · max SM $(gpu_q clocks.max.sm) MHz"
-    echo "tools: nvcc $("$NVCC" --version | grep -oE 'release [0-9.]+' | head -1) · nsys $("$NSYS" --version 2>&1 | grep -oE '20[0-9.]+' | head -1) ($GM_FLAG, 2 kHz) · ncu $("$NCU" --version 2>&1 | grep -oE '20[0-9.]+' | head -1) (--clock-control base, kill $NCU_KILL)"
-    echo "host: $(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo) · $(nproc) threads · MemTotal $(awk '/^MemTotal:/ {printf "%.1f", $2 / 1048576}' /proc/meminfo) GiB · $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-?}")"
-    echo "binaries: w $(sha256sum "${BIN_w:-/dev/null}" | cut -c1-16)… s $(sha256sum "${BIN_s:-/dev/null}" | cut -c1-16)… (cargo test --release -p lambda-vm-prover --features cuda --lib, CUDARC_NVCC_ARCH=${CC_ARCH:-?})"
+    [ -z "$NVSMI" ] || echo "gpu $GPU: $(gpu_q name) · cc $(gpu_q compute_cap) · $(gpu_q memory.total) MiB · driver $(gpu_q driver_version) · power limit $(gpu_q power.limit) W · max SM $(gpu_q clocks.max.sm) MHz"
+    echo "tools: nvcc $("${NVCC:-false}" --version 2>/dev/null | grep -oE 'release [0-9.]+' | head -1) · nsys $("${NSYS:-false}" --version 2>&1 | grep -oE '20[0-9.]+' | head -1) ($GM_FLAG 2 kHz, osrt $NSYS_OSRT) · ncu $("${NCU:-false}" --version 2>&1 | grep -oE '20[0-9.]+' | head -1) (--clock-control base, kill $NCU_KILL)"
+    echo "host: $(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo 2>/dev/null) · $(nproc) threads · MemTotal $(awk '/^MemTotal:/ {printf "%.1f", $2 / 1048576}' /proc/meminfo 2>/dev/null) GiB · $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-?}")"
+    echo "binaries: w $(sha256sum "${BIN_w:-/dev/null}" 2>/dev/null | cut -c1-16)… s $(sha256sum "${BIN_s:-/dev/null}" 2>/dev/null | cut -c1-16)… (cargo test --release -p lambda-vm-prover --features cuda --lib, CUDARC_NVCC_ARCH=${CC_ARCH:-?})"
     echo "fixtures: $ELF_NAME, $BENCH_NAME, $MED_NAME (sha256-checked)"
     echo "run A: $RUNA_OK of $RUNA_N captures verified and summarised · run B: $RUNB_OK of $RUNB_N ncu passes summarised · $(( ($(date +%s) - T_START) / 60 )) min"
   } > "$SEND/facts.txt"
@@ -477,6 +484,9 @@ if [ "$MODE" = full ]; then
 else
   runa a3-w-p1-median w P median
   [ ! -f "$SEND/plan-w.tsv" ] || { head -6 "$SEND/plan-w.tsv" > "$SEND/plan-w.tsv.q" && mv "$SEND/plan-w.tsv.q" "$SEND/plan-w.tsv"; }
+fi
+if [ "$DRY" = 1 ]; then
+  for k in w s; do printf 'pass\tkernel\tlaunch_skip\tlaunch_count\tgrid\tblock\n%s01\tp1w16_zleaves_base_coset_v2\t3\t1\t65536x1x1\t128x1x1\n%s02\tgkr_round_gruen\t1200\t1\t2048x1x1\t256x1x1\n' "$k" "$k" > "$SEND/plan-$k.tsv"; done
 fi
 runb w
 [ "$MODE" = quick ] || runb s
