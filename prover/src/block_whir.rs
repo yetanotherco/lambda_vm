@@ -1016,6 +1016,8 @@ pub struct BlockStamps {
     /// prove started), when each group closed, the seconds the packer waited
     /// on phase A and the seconds laying out chunks, summed over threads.
     pub layout: LayoutStamps,
+    /// A streamed build's producer: what each of its threads waited on.
+    pub producer: ProducerStamps,
     /// How phase A held the committed columns, and the narrow tables phase B
     /// widened on the host, `(tables, cells)`: a device path widens on the
     /// card.
@@ -1057,6 +1059,62 @@ pub struct LayoutStamps {
     /// G-pack ([`BlockOptions::gpack`]): whether it was on, and its counts
     /// (`tables::gpack::counts`) at phase A's end.
     pub gpack: (bool, [usize; 4]),
+}
+
+/// What a streamed build's producer threads waited on, seconds summed over
+/// the windows (the workers' summed over the workers), for the readout
+/// ([`BlockStamps::producer`]): the executor sending a window to the walk, the
+/// walker waiting for a window and sending it on, the accumulator waiting for
+/// a walked window and sending a chunk to the layout, the layout handing a
+/// chunk to its workers, and the workers waiting for a permit and for a chunk.
+/// A measurement; it changes nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProducerStamps {
+    pub executor_send: f64,
+    pub walker_recv: f64,
+    pub walker_send: f64,
+    pub accumulator_recv: f64,
+    pub accumulator_send: f64,
+    pub layout_send: f64,
+    pub worker_permit: f64,
+    pub worker_recv: f64,
+}
+
+/// [`ProducerStamps`] as the threads add to them, in nanoseconds.
+#[derive(Default)]
+struct ProducerWaits {
+    executor_send: std::sync::atomic::AtomicU64,
+    walker_recv: std::sync::atomic::AtomicU64,
+    walker_send: std::sync::atomic::AtomicU64,
+    accumulator_recv: std::sync::atomic::AtomicU64,
+    accumulator_send: std::sync::atomic::AtomicU64,
+    layout_send: std::sync::atomic::AtomicU64,
+    worker_permit: std::sync::atomic::AtomicU64,
+    worker_recv: std::sync::atomic::AtomicU64,
+}
+
+impl ProducerWaits {
+    /// Adds the time since `since` to `wait`.
+    fn add(wait: &std::sync::atomic::AtomicU64, since: Instant) {
+        let nanos = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        wait.fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn stamps(&self) -> ProducerStamps {
+        let s = |wait: &std::sync::atomic::AtomicU64| {
+            wait.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9
+        };
+        ProducerStamps {
+            executor_send: s(&self.executor_send),
+            walker_recv: s(&self.walker_recv),
+            walker_send: s(&self.walker_send),
+            accumulator_recv: s(&self.accumulator_recv),
+            accumulator_send: s(&self.accumulator_send),
+            layout_send: s(&self.layout_send),
+            worker_permit: s(&self.worker_permit),
+            worker_recv: s(&self.worker_recv),
+        }
+    }
 }
 
 impl BlockStamps {
@@ -1112,6 +1170,41 @@ impl BlockStamps {
                 self.windows.route,
                 self.windows.generate,
                 self.build - self.streamed.0,
+            ));
+            let p = &self.producer;
+            out.push_str(&format!(
+                "BLOCK PRODUCER: executor send-blocked {:.2}s · walker recv-wait {:.2}s send-blocked {:.2}s · accumulator recv-wait {:.2}s send-blocked {:.2}s · layout hand-on blocked {:.2}s · workers permit-wait {:.2}s recv-wait {:.2}s (summed)\n",
+                p.executor_send,
+                p.walker_recv,
+                p.walker_send,
+                p.accumulator_recv,
+                p.accumulator_send,
+                p.layout_send,
+                p.worker_permit,
+                p.worker_recv,
+            ));
+            let h = &self.windows.handout;
+            let tables: Vec<String> = StreamTable::ALL
+                .iter()
+                .filter(|t| h.chunks[t.position()] > 0)
+                .map(|&t| {
+                    let i = t.position();
+                    format!(
+                        "{} {:.2} · {:.2} · {} · {:.1} M",
+                        stream_base(t),
+                        h.take[i],
+                        h.count[i],
+                        h.chunks[i],
+                        h.copied[i] as f64 / 1e6,
+                    )
+                })
+                .collect();
+            out.push_str(&format!(
+                "BLOCK HANDOUT: take {:.2}s · count {:.2}s · copied {:.1} M ops || per table (take s · count s · chunks · copied ops): {}\n",
+                h.take.iter().sum::<f64>(),
+                h.count.iter().sum::<f64>(),
+                h.copied.iter().sum::<usize>() as f64 / 1e6,
+                tables.join(" | "),
             ));
             let l = &self.layout;
             let marks: Vec<String> = l
@@ -2474,7 +2567,12 @@ impl StreamAirs {
 
 /// The name the run's AIR set gives chunk `index` of a streamed table.
 fn stream_name(table: StreamTable, index: usize) -> String {
-    let base = match table {
+    format!("{}[{index}]", stream_base(table))
+}
+
+/// A streamed table's AIR name, without the chunk's index.
+fn stream_base(table: StreamTable) -> &'static str {
+    match table {
         StreamTable::Cpu => "CPU",
         StreamTable::MemwRegister => "MEMW_R",
         StreamTable::MemwAligned => "MEMW_A",
@@ -2484,8 +2582,7 @@ fn stream_name(table: StreamTable, index: usize) -> String {
         StreamTable::Shift => "SHIFT",
         StreamTable::Store => "STORE",
         StreamTable::KeccakRnd => "KECCAK_RND",
-    };
-    format!("{base}[{index}]")
+    }
 }
 
 /// What the builder thread reports when the run is built: when its windows
@@ -2885,6 +2982,7 @@ fn stream_pipelined<'a, R>(
     pack_rest: bool,
     gate: Option<&'a crate::tables::trace_builder::gate::ByteGate>,
     recorder: Option<&regen::Recorder>,
+    waits: Option<&ProducerWaits>,
     rest: impl FnOnce(RestIn, Option<std::sync::mpsc::Sender<RestDone<'a>>>) -> Result<R, Error>,
 ) -> Result<(StreamLaid<'a>, R), Error> {
     type Done<'a> = (usize, f64, Result<LaidChunk<'a>, Error>);
@@ -2900,17 +2998,25 @@ fn stream_pipelined<'a, R>(
             let dtx = dtx.clone();
             scope.spawn(move || {
                 loop {
+                    let t = Instant::now();
                     if let Some(permits) = permits
                         && !permits.take()
                     {
                         return;
                     }
+                    if let Some(waits) = waits {
+                        ProducerWaits::add(&waits.worker_permit, t);
+                    }
                     // The lock is held for the receive alone. A poisoned lock
                     // means a sibling panicked, which the scope reports.
+                    let t = Instant::now();
                     let next = match jrx.lock() {
                         Ok(jobs) => jobs.recv(),
                         Err(_) => Err(std::sync::mpsc::RecvError),
                     };
+                    if let Some(waits) = waits {
+                        ProducerWaits::add(&waits.worker_recv, t);
+                    }
                     let Ok((seq, job)) = next else {
                         if let Some(permits) = permits {
                             permits.give();
@@ -2997,8 +3103,12 @@ fn stream_pipelined<'a, R>(
         for item in brx {
             match item {
                 Built::Job(job) => {
+                    let t = Instant::now();
                     if jtx.send((handed, job)).is_err() {
                         break;
+                    }
+                    if let Some(waits) = waits {
+                        ProducerWaits::add(&waits.layout_send, t);
                     }
                     handed += 1;
                 }
@@ -3615,6 +3725,8 @@ fn prove_streamed(
         options.rest_layout_bytes.unwrap_or(usize::MAX),
     );
     let rest_gate = &rest_gate;
+    let waits = ProducerWaits::default();
+    let waits = &waits;
     let tag = block_statement_tag(&format.zf.base);
     crate::with_block_hash!(format.zf.base, |H| {
         let (block, built, laid, executed) = std::thread::scope(|scope| {
@@ -3640,9 +3752,11 @@ fn prove_streamed(
                             .exec
                             .store(executor.memory().heap_bytes() + bytes, Relaxed);
                     }
+                    let t = Instant::now();
                     if ltx.send(logs).is_err() {
                         break;
                     }
+                    ProducerWaits::add(&waits.executor_send, t);
                 }
                 let executed = start.elapsed().as_secs_f64();
                 drop(executor);
@@ -3712,7 +3826,12 @@ fn prove_streamed(
                             // is `finish`'s, and it is the last only once the
                             // executor stops.
                             let mut held: Option<Vec<executor::vm::logs::Log>> = None;
-                            for logs in lrx {
+                            loop {
+                                let t = Instant::now();
+                                let Ok(logs) = lrx.recv() else {
+                                    break;
+                                };
+                                ProducerWaits::add(&waits.walker_recv, t);
                                 if let Some(w) = held.replace(logs) {
                                     let walked = walker.walk(&w)?;
                                     if let Some(ledger) = ledger {
@@ -3721,16 +3840,23 @@ fn prove_streamed(
                                         ledger.walked.fetch_add(walked.heap_bytes(), Relaxed);
                                     }
                                     drop(w);
+                                    let t = Instant::now();
                                     if wtx.send(walked).is_err() {
                                         break;
                                     }
+                                    ProducerWaits::add(&waits.walker_send, t);
                                 }
                             }
                             held.ok_or_else(|| {
                                 Error::Execution("the run executed no cycle".to_string())
                             })
                         });
-                        for walked in wrx {
+                        loop {
+                            let t = Instant::now();
+                            let Ok(walked) = wrx.recv() else {
+                                break;
+                            };
+                            ProducerWaits::add(&waits.accumulator_recv, t);
                             if let Some(ledger) = ledger {
                                 ledger.walked.fetch_sub(walked.heap_bytes(), Relaxed);
                             }
@@ -3749,9 +3875,11 @@ fn prove_streamed(
                                 if let Some(ledger) = ledger {
                                     ledger.jobs.fetch_add(job.op_bytes(), Relaxed);
                                 }
+                                let t = Instant::now();
                                 if btx.send(Built::Job(Box::new(job))).is_err() {
                                     return Err(Error::Prover("the layout thread stopped".into()));
                                 }
+                                ProducerWaits::add(&waits.accumulator_send, t);
                             }
                             if let Some(ledger) = ledger {
                                 ledger.builder.store(accumulator.held_bytes(), Relaxed);
@@ -3982,6 +4110,7 @@ fn prove_streamed(
                         options.pack_rest_as_laid_out,
                         Some(rest_gate),
                         recorder,
+                        Some(waits),
                         rest_of,
                     )?
                 };
@@ -4147,6 +4276,7 @@ fn prove_streamed(
             built.map_err(|_| Error::Prover("the block's builder panicked".into()))??;
         stamps.windows = window_stamps;
         stamps.build_marks = finish_marks;
+        stamps.producer = waits.stamps();
         let laid =
             laid.map_err(|_| Error::Prover("the block's layout thread panicked".into()))??;
         let mut block = block.map_err(|e| Error::Prover(format!("{e:?}")))?;

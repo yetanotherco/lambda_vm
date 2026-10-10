@@ -109,6 +109,11 @@ impl StreamTable {
         StreamTable::Store,
         StreamTable::KeccakRnd,
     ];
+
+    /// Its place in [`Self::ALL`].
+    pub fn position(self) -> usize {
+        self as usize
+    }
 }
 
 /// One full chunk of a streamed table: chunk `index` of that table, the same
@@ -188,6 +193,33 @@ pub struct WindowStamps {
     pub walk: f64,
     pub route: f64,
     pub generate: f64,
+    /// `generate` table by table, under
+    /// [`WindowedTraceBuilder::drop_streamed_ops`].
+    pub handout: HandoutStamps,
+}
+
+/// The hand-out under [`WindowedTraceBuilder::drop_streamed_ops`], per streamed
+/// table in [`StreamTable::ALL`] order, summed over the windows: the seconds
+/// taking each chunk's ops out of the tail (`take`: a copy, unless a window's
+/// list is the chunk and moves out whole) and counting what the table phase
+/// reads from them (`count`), the chunks handed out and the ops `take` copied.
+/// A measurement; the chunks are the same.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HandoutStamps {
+    pub take: [f64; 9],
+    pub count: [f64; 9],
+    pub chunks: [usize; 9],
+    pub copied: [usize; 9],
+}
+
+impl HandoutStamps {
+    fn note(&mut self, table: StreamTable, take: f64, count: f64, copied: usize) {
+        let i = table.position();
+        self.take[i] += take;
+        self.count[i] += count;
+        self.chunks[i] += 1;
+        self.copied[i] += copied;
+    }
 }
 
 impl<'a> WindowedTraceBuilder<'a> {
@@ -750,6 +782,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 counted: &mut self.counted,
                 route_secs: &mut self.stamps.route,
                 handout_secs: &mut self.stamps.generate,
+                handout: &mut self.stamps.handout,
             },
         )
     }
@@ -829,6 +862,7 @@ pub struct Accumulator<'b> {
     counted: &'b mut PreCounted,
     route_secs: &'b mut f64,
     handout_secs: &'b mut f64,
+    handout: &'b mut HandoutStamps,
 }
 
 impl Accumulator<'_> {
@@ -930,6 +964,7 @@ impl Accumulator<'_> {
                 self.segments,
                 self.emitted,
                 self.counted,
+                self.handout,
             );
             *self.handout_secs += t.elapsed().as_secs_f64();
             jobs
@@ -1111,10 +1146,16 @@ impl<T: Clone> Tail<T> {
     /// The first `n` ops (at most `len`). A part that is exactly the chunk
     /// moves out whole; a part the chunk uses up is freed.
     fn take(&mut self, n: usize) -> Vec<T> {
+        self.take_counted(n).0
+    }
+
+    /// [`Self::take`], and how many of the ops it copied (none when a part
+    /// moved out whole).
+    fn take_counted(&mut self, n: usize) -> (Vec<T>, usize) {
         let n = n.min(self.len);
         self.len -= n;
         if self.start == 0 && self.parts.front().is_some_and(|part| part.len() == n) {
-            return self.parts.pop_front().unwrap_or_default();
+            return (self.parts.pop_front().unwrap_or_default(), 0);
         }
         let mut out = Vec::with_capacity(n);
         while out.len() < n {
@@ -1131,7 +1172,8 @@ impl<T: Clone> Tail<T> {
                 self.start += want;
             }
         }
-        out
+        let copied = out.len();
+        (out, copied)
     }
 
     /// (ops not handed out, ops the parts hold).
@@ -1422,7 +1464,9 @@ impl Kept {
 
 /// [`chunk_jobs`] under [`WindowedTraceBuilder::drop_streamed_ops`]: every full
 /// chunk taken out of the tails, and what the table phase reads from its ops
-/// counted as it leaves (`counted`, and DECODE in `kept`).
+/// counted as it leaves (`counted`, and DECODE in `kept`), each timed into
+/// `stamps`.
+#[allow(clippy::too_many_arguments)]
 fn tail_jobs(
     m: &crate::tables::MaxRowsConfig,
     stream_memw_lt: bool,
@@ -1431,7 +1475,9 @@ fn tail_jobs(
     segments: &mut RoutedBlocks,
     e: &mut StreamSkip,
     counted: &mut PreCounted,
+    stamps: &mut HandoutStamps,
 ) -> Vec<ChunkJob> {
+    use std::time::Instant;
     let mut jobs = Vec::new();
     macro_rules! take_chunks {
         ($table:expr, $variant:ident, $tail:expr, $max:expr, $done:expr) => {
@@ -1440,8 +1486,12 @@ fn tail_jobs(
         ($table:expr, $variant:ident, $tail:expr, $max:expr, $done:expr, |$ops:ident| $count:block) => {{
             let max = $max;
             while $tail.len >= max {
-                let $ops = $tail.take(max);
+                let t = Instant::now();
+                let ($ops, copied) = $tail.take_counted(max);
+                let taken = t.elapsed().as_secs_f64();
+                let t = Instant::now();
                 $count
+                stamps.note($table, taken, t.elapsed().as_secs_f64(), copied);
                 jobs.push(ChunkJob {
                     table: $table,
                     index: $done,
@@ -1519,12 +1569,20 @@ fn tail_jobs(
         let keccak = &kept.rest.keccak_ops;
         while (e.keccak_rnd + 1) * rows <= keccak.len() * 24 {
             let index = e.keccak_rnd;
+            let t = Instant::now();
             let (first, end) = super::keccak_rnd_op_range(index, rows, keccak.len());
+            let ops = keccak.range(first, end).into_owned();
+            stamps.note(
+                StreamTable::KeccakRnd,
+                t.elapsed().as_secs_f64(),
+                0.0,
+                ops.len(),
+            );
             jobs.push(ChunkJob {
                 table: StreamTable::KeccakRnd,
                 index,
                 ops: ChunkOps::KeccakRnd {
-                    ops: keccak.range(first, end).into_owned(),
+                    ops,
                     skip: index * rows - first * 24,
                     rows,
                 },
@@ -1532,13 +1590,18 @@ fn tail_jobs(
             e.keccak_rnd += 1;
         }
     }
-    // STORE's ops are a routing segment: its own tail, a chunk a block.
+    // STORE's ops are a routing segment: its own tail, a chunk a block (its
+    // copies are not counted).
     let store = &mut segments.store_ops;
     while store.len() >= m.store {
+        let t = Instant::now();
         let ops: Vec<store::StoreOperation> = store.take_front(m.store);
+        let taken = t.elapsed().as_secs_f64();
+        let t = Instant::now();
         for op in &ops {
             counted.histogram.add_ops(&op.collect_bitwise_ops());
         }
+        stamps.note(StreamTable::Store, taken, t.elapsed().as_secs_f64(), 0);
         jobs.push(ChunkJob {
             table: StreamTable::Store,
             index: e.store,

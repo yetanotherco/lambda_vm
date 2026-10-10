@@ -891,6 +891,59 @@ fn dropping_the_streamed_ops_holds_less_than_a_chunk_per_table() {
     );
 }
 
+/// The hand-out's stamps count every chunk it handed out, table by table, and
+/// the ops it copied: a CPU chunk whose window lists are each exactly a chunk
+/// moves out whole (none copied); one cut out of windows of 7 cycles is copied
+/// op for op. The tables are the same either way.
+#[test]
+fn the_handout_stamps_count_each_tables_chunks_and_copies() {
+    let max_rows = MaxRowsConfig::small();
+    let (program, logs) = run("bench_32k");
+    let reference = whole(&program, &logs, &max_rows);
+    for (window, cpu_copied_per_chunk) in [(max_rows.cpu, 0), (7, max_rows.cpu)] {
+        let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows)
+            .expect("the builder")
+            .drop_streamed_ops()
+            .expect("before any window");
+        let body = logs.len() - 1;
+        let cut = body - body % window;
+        let mut chunks = Vec::new();
+        let mut handed = [0usize; 9];
+        for w in logs[..cut].chunks(window) {
+            let (mut walker, mut accumulator) = builder.split();
+            let walked = walker.walk(w).expect("a window");
+            for job in accumulator.absorb(walked) {
+                handed[job.table.position()] += 1;
+                chunks.push(job.generate());
+            }
+        }
+        let stamps = builder.stamps().handout;
+        let streamed = builder.streamed();
+        let mut traces = builder.finish(&logs[cut..]).expect("the last window");
+        traces
+            .insert_streamed(chunks)
+            .expect("every chunk has a placeholder");
+        same_traces(&reference, &traces);
+        assert_eq!(stamps.chunks, handed, "window {window}: chunks per table");
+        assert_eq!(stamps.chunks[StreamTable::Cpu.position()], streamed.cpu);
+        assert!(
+            streamed.cpu > 10,
+            "window {window}: {} CPU chunks",
+            streamed.cpu
+        );
+        assert_eq!(
+            stamps.copied[StreamTable::Cpu.position()],
+            streamed.cpu * cpu_copied_per_chunk,
+            "window {window}: CPU ops copied"
+        );
+        let timed: f64 = stamps.take.iter().chain(&stamps.count).sum();
+        assert!(timed > 0.0, "window {window}: nothing timed");
+    }
+    for (i, table) in StreamTable::ALL.iter().enumerate() {
+        assert_eq!(table.position(), i);
+    }
+}
+
 /// The option is set before the first window, or refused.
 #[test]
 fn dropping_the_streamed_ops_is_refused_after_a_window() {
