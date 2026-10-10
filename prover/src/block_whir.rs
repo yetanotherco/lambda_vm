@@ -3518,6 +3518,10 @@ fn prove_streamed(
     let early_owned: std::sync::Mutex<Option<regen::EarlyStart>> = std::sync::Mutex::new(None);
     let early_slot = &early_owned;
     let (early_feed, early_recorder) = (live_regen.clone(), regen_recorder.clone());
+    // Opened when phase B starts: until then an early start's windows hold
+    // only what the host's room allows (N4c).
+    let early_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let early_gate_in = std::sync::Arc::clone(&early_gate);
     let run_airs: std::sync::OnceLock<VmAirs> = std::sync::OnceLock::new();
     // Phase A's commits read the blowup, the fold schedule and the format of
     // the config and nothing else; the full config (its query count reads every
@@ -3899,6 +3903,10 @@ fn prove_streamed(
                                 },
                                 regen::regen_generators(),
                                 deviations.rest_faults,
+                                std::sync::Arc::clone(&early_gate_in),
+                                deviations
+                                    .regen_windows
+                                    .map_or_else(regen::rest_ahead_bytes, |(_, rest)| rest),
                             );
                             *early_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(early);
                             None
@@ -4255,7 +4263,10 @@ fn prove_streamed(
         // The regenerators started at the finish's end, when they did (N4c).
         let early = early_owned.lock().unwrap_or_else(|e| e.into_inner()).take();
         let early_started = early.as_ref().map(regen::EarlyStart::started);
-        let early_runs = early.map(regen::EarlyStart::join);
+        let (early_runs, early_pacer) = match early.map(regen::EarlyStart::join) {
+            Some((runs, pacer)) => (Some(runs), pacer),
+            None => (None, None),
+        };
         let early_streamed_waited = early_runs.as_ref().map(|e| e.streamed_waited);
         let mut rest_regen = rest_regen;
         let live = match (block.regen().cloned(), &regen_recorder) {
@@ -4373,6 +4384,7 @@ fn prove_streamed(
                                         .map_or_else(regen::ahead_policy, |(streamed, _)| {
                                             regen::AheadPolicy::Fixed(streamed)
                                         }),
+                                    None,
                                 ))
                             }
                             None => None,
@@ -4498,6 +4510,8 @@ fn prove_streamed(
                 ));
             }
         }
+        // Phase B starts: an early start's windows go to their phase-B sizes.
+        early_gate.store(true, std::sync::atomic::Ordering::Release);
         let phase_b_start = Instant::now();
         let (proof, argues, prepared_openings, groups) =
             multilinear_block::block_prove_in_order::<_, _, _, H>(
@@ -4532,7 +4546,12 @@ fn prove_streamed(
             }
             let head_start =
                 early_started.map(|t| phase_b_start.saturating_duration_since(t).as_secs_f64());
-            lines.push(regen::head_start_line(head_start, early_streamed_waited));
+            let early_pace = early_pacer.and_then(|pacer| pacer.join().ok());
+            lines.push(regen::head_start_line(
+                head_start,
+                early_streamed_waited,
+                early_pace,
+            ));
             lines.push(format!("BLOCK REGEN window: {}", window_of.report()));
             if let Some(report) = &rest_report {
                 lines.push(report.line());

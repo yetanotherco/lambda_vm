@@ -239,8 +239,13 @@ pub(crate) struct PacerReport {
 /// The adaptive window's pacer: until `window` closes, every [`PACE`] it
 /// moves the window to [`adaptive_ahead`] of the process's resident sets, in
 /// [`paced_ahead`]'s steps.
-fn pace(window: &RegenWindow) -> PacerReport {
+fn pace(window: &RegenWindow, gate: Option<&AtomicBool>) -> PacerReport {
     let mut report = PacerReport::default();
+    // Started before phase A's end (N4c): the early pacer sizes the window
+    // until phase B starts; this one paces from then.
+    while gate.is_some_and(|gate| !gate.load(Ordering::Acquire)) && !window.is_closed() {
+        std::thread::sleep(PACE);
+    }
     while !window.is_closed() {
         if let Some((hwm, rss)) = resident() {
             let now = window.ahead();
@@ -1853,15 +1858,20 @@ impl LiveRun {
         form: TraceForm,
         faults: LiveFaults,
         policy: AheadPolicy,
+        gate: Option<Arc<AtomicBool>>,
     ) -> Self {
         let started = Instant::now();
-        window.set_ahead(policy.initial());
+        // Before phase B (a `gate` not yet open) the early pacer sizes the
+        // window ([`EarlyStart`]).
+        if gate.is_none() {
+            window.set_ahead(policy.initial());
+        }
         let pacer = (policy == AheadPolicy::Adaptive)
             .then(|| {
                 let window = Arc::clone(&window);
                 std::thread::Builder::new()
                     .name("regen-pacer".to_string())
-                    .spawn(move || pace(&window))
+                    .spawn(move || pace(&window, gate.as_deref()))
                     .ok()
             })
             .flatten();
@@ -2381,14 +2391,90 @@ impl Drop for RestRun {
 /// The `BLOCK REGEN head start` line (N4c): how long before phase B the
 /// regenerators started (at the finish's end), and how long the streamed
 /// chunks' fates kept the streamed one waiting; or none.
-pub(crate) fn head_start_line(head_start: Option<f64>, streamed_waited: Option<f64>) -> String {
+pub(crate) fn head_start_line(
+    head_start: Option<f64>,
+    streamed_waited: Option<f64>,
+    pace: Option<EarlyPace>,
+) -> String {
     match head_start {
         Some(secs) => format!(
             "BLOCK REGEN head start: {secs:.2} s before phase B (both regenerators started at the \
-             finish's end) · streamed chunks' fates awaited {:.2} s",
-            streamed_waited.unwrap_or(0.0)
+             finish's end) · streamed chunks' fates awaited {:.2} s · windows sized by the host's \
+             room until phase B: most {:.2} GiB streamed, {:.2} GiB rest, {} readings",
+            streamed_waited.unwrap_or(0.0),
+            pace.map_or(0, |p| p.most_streamed) as f64 / GIB,
+            pace.map_or(0, |p| p.most_rest) as f64 / GIB,
+            pace.map_or(0, |p| p.readings),
         ),
         None => "BLOCK REGEN head start: none (the regenerators started with phase B)".to_string(),
+    }
+}
+
+/// The windows' sizes before phase B (N4c), from the process's resident sets
+/// and the bytes both windows hold deposited (`parked`): the room under the
+/// run's peak less [`AHEAD_MARGIN`], as N2b's pacer reads it but with no
+/// floor, split four to one between the streamed chunks' window and the
+/// rest's, each at most its size in phase B (`streamed_cap`, `rest_cap`). So
+/// filling the windows ahead of phase B never lifts the run's peak; with no
+/// room each window admits only its frontier.
+pub(crate) fn early_aheads(
+    hwm: u64,
+    rss: u64,
+    parked: u64,
+    streamed_cap: u64,
+    rest_cap: u64,
+) -> (u64, u64) {
+    let room = hwm
+        .saturating_sub(rss.saturating_sub(parked))
+        .saturating_sub(AHEAD_MARGIN);
+    let streamed = (room / 5 * 4).min(streamed_cap);
+    let rest = room.saturating_sub(streamed).min(rest_cap);
+    (streamed, rest)
+}
+
+/// What the early pacer saw ([`EarlyStart`]): its readings and the most each
+/// window was given before phase B.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct EarlyPace {
+    pub(crate) readings: usize,
+    pub(crate) most_streamed: u64,
+    pub(crate) most_rest: u64,
+}
+
+/// Until phase B starts (`gate`) or the windows close: every [`PACE`] each
+/// window takes [`early_aheads`]'s size (at most `streamed_cap`, `rest_cap`),
+/// moved in whole [`PACE_STEP`]s ([`paced_ahead`]); with no reading (no
+/// `/proc`) they stay at their frontier. When phase B starts, each takes the
+/// size it starts phase B with (`streamed_open`, `rest_cap`), and the
+/// streamed one its own pacer.
+fn early_pace(
+    streamed: &RegenWindow,
+    rest: &RegenWindow,
+    gate: &AtomicBool,
+    (streamed_cap, streamed_open, rest_cap): (u64, u64, u64),
+) -> EarlyPace {
+    let mut report = EarlyPace::default();
+    loop {
+        if gate.load(Ordering::Acquire) {
+            streamed.set_ahead(streamed_open);
+            rest.set_ahead(rest_cap);
+            return report;
+        }
+        if streamed.is_closed() && rest.is_closed() {
+            return report;
+        }
+        if let Some((hwm, rss)) = resident() {
+            let parked = streamed.parked() + rest.parked();
+            let (s, r) = early_aheads(hwm, rss, parked, streamed_cap, rest_cap);
+            let s = paced_ahead(streamed.ahead(), s).min(streamed_cap);
+            let r = paced_ahead(rest.ahead(), r).min(rest_cap);
+            streamed.set_ahead(s);
+            rest.set_ahead(r);
+            report.readings += 1;
+            report.most_streamed = report.most_streamed.max(s);
+            report.most_rest = report.most_rest.max(r);
+        }
+        std::thread::sleep(PACE);
     }
 }
 
@@ -2428,9 +2514,13 @@ pub(crate) struct EarlyStart {
     thread: Option<std::thread::JoinHandle<EarlyRuns>>,
     windows: Vec<Arc<RegenWindow>>,
     started: Instant,
+    /// The early pacer: both windows sized by the host's room until phase B
+    /// opens `gate` ([`early_pace`]).
+    pacer: Option<std::thread::JoinHandle<EarlyPace>>,
 }
 
 impl EarlyStart {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         feed: stark::multilinear_block::BlockRegen,
         recorder: Arc<Recorder>,
@@ -2438,10 +2528,42 @@ impl EarlyStart {
         live: LiveArgs,
         generators: usize,
         rest_faults: LiveFaults,
+        gate: Arc<AtomicBool>,
+        rest_cap: u64,
     ) -> Self {
         let started = Instant::now();
         let windows = feed.windows().to_vec();
         let windows_in = windows.clone();
+        // Before phase B the windows hold only what the host's room allows:
+        // nothing ahead of each frontier until the early pacer's first
+        // reading, at most their phase-B sizes after.
+        let streamed_cap = match live.policy {
+            AheadPolicy::Fixed(bytes) => bytes,
+            AheadPolicy::Adaptive => AHEAD_CAP,
+        };
+        let streamed_open = live.policy.initial();
+        for window in &windows {
+            window.set_ahead(0);
+        }
+        let pacer = match (windows.first(), windows.get(1)) {
+            (Some(streamed), Some(rest)) => {
+                let (streamed, rest, gate) =
+                    (Arc::clone(streamed), Arc::clone(rest), Arc::clone(&gate));
+                std::thread::Builder::new()
+                    .name("regen-early-pacer".to_string())
+                    .spawn(move || {
+                        early_pace(
+                            &streamed,
+                            &rest,
+                            &gate,
+                            (streamed_cap, streamed_open, rest_cap),
+                        )
+                    })
+                    .ok()
+            }
+            _ => None,
+        };
+        let live_gate = Arc::clone(&gate);
         let thread = std::thread::Builder::new()
             .name("regen-early".to_string())
             .spawn(move || {
@@ -2512,6 +2634,7 @@ impl EarlyStart {
                                 live.form,
                                 live.faults,
                                 live.policy,
+                                Some(live_gate),
                             ));
                         }
                         None => {
@@ -2527,6 +2650,7 @@ impl EarlyStart {
                 thread: Some(thread),
                 windows,
                 started,
+                pacer,
             },
             // No thread: the closure, its runs and the producers it would
             // have taken went with it; phase B finds no producer and refuses.
@@ -2534,6 +2658,7 @@ impl EarlyStart {
                 thread: None,
                 windows,
                 started,
+                pacer,
             },
         }
     }
@@ -2544,9 +2669,11 @@ impl EarlyStart {
     }
 
     /// The runs it started, once it has (phase B's start: every streamed
-    /// chunk's fate is known by phase A's end).
-    pub(crate) fn join(mut self) -> EarlyRuns {
-        match self.thread.take() {
+    /// chunk's fate is known by phase A's end), and the early pacer, which
+    /// ends once phase B opens the gate.
+    pub(crate) fn join(mut self) -> (EarlyRuns, Option<std::thread::JoinHandle<EarlyPace>>) {
+        let pacer = self.pacer.take();
+        let runs = match self.thread.take() {
             Some(thread) => thread.join().unwrap_or_else(|_| EarlyRuns {
                 error: Some("the early regeneration thread panicked".to_string()),
                 ..EarlyRuns::default()
@@ -2555,7 +2682,8 @@ impl EarlyStart {
                 error: Some("the early regeneration thread did not start".to_string()),
                 ..EarlyRuns::default()
             },
-        }
+        };
+        (runs, pacer)
     }
 }
 
@@ -2567,6 +2695,13 @@ impl Drop for EarlyStart {
             }
             // Its runs close their windows and join as they drop.
             let _ = thread.join();
+        }
+        // The early pacer ends once the windows are closed.
+        if let Some(pacer) = self.pacer.take() {
+            for window in &self.windows {
+                window.close("the block's prove ended before phase B");
+            }
+            let _ = pacer.join();
         }
     }
 }
@@ -2839,14 +2974,43 @@ mod tests {
         assert!(parse_early(Some("yes")));
         assert!(!parse_early(Some("0")));
         assert!(!parse_early(Some(" 0 ")));
+        let pace = EarlyPace {
+            readings: 14,
+            most_streamed: 2 << 30,
+            most_rest: 1 << 29,
+        };
         assert_eq!(
-            head_start_line(Some(3.4), Some(0.02)),
+            head_start_line(Some(3.4), Some(0.02), Some(pace)),
             "BLOCK REGEN head start: 3.40 s before phase B (both regenerators started at the \
-             finish's end) · streamed chunks' fates awaited 0.02 s"
+             finish's end) · streamed chunks' fates awaited 0.02 s · windows sized by the host's \
+             room until phase B: most 2.00 GiB streamed, 0.50 GiB rest, 14 readings"
         );
         assert_eq!(
-            head_start_line(None, None),
+            head_start_line(None, None, None),
             "BLOCK REGEN head start: none (the regenerators started with phase B)"
+        );
+        // Before phase B the windows hold only the room under the peak less
+        // the margin, four to one, each capped at its phase-B size.
+        const G: u64 = 1 << 30;
+        let room = 6 * G; // 70 − 60 − 4
+        assert_eq!(
+            early_aheads(70 * G, 60 * G, 0, 16 * G, 4 * G),
+            (room / 5 * 4, room - room / 5 * 4)
+        );
+        assert_eq!(
+            early_aheads(70 * G, 66 * G, 0, 16 * G, 4 * G),
+            (0, 0),
+            "no room"
+        );
+        assert_eq!(
+            early_aheads(70 * G, 69 * G, 3 * G, 16 * G, 4 * G),
+            (0, 0),
+            "room 0 with 3 parked"
+        );
+        assert_eq!(
+            early_aheads(100 * G, 50 * G, 0, 16 * G, 4 * G),
+            (16 * G, 4 * G),
+            "capped"
         );
     }
 
