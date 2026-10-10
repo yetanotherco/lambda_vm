@@ -3745,14 +3745,27 @@ pub(crate) fn gather_proofs_dev(
         "gather_proofs_dev: position exceeds u32 range"
     );
     let positions_u32: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
-    let bytes = math_cuda::merkle::gather_merkle_paths_dev(
-        &tree.nodes,
-        tree.leaves_len,
-        &positions_u32,
-        stream,
-    )
-    .ok()?;
-    let depth = tree.leaves_len.trailing_zeros() as usize;
+    // A path is `depth` nodes: one sibling per binary level, or three per
+    // 4-ary level (`MerkleTree::get_proof_by_pos` at arity 4).
+    let (bytes, depth) = if tree.arity == math_cuda::p1_stark::ARITY {
+        let bytes = math_cuda::p1_stark::gather_paths_dev(
+            &tree.nodes,
+            tree.leaves_len,
+            &positions_u32,
+            stream,
+        )
+        .ok()?;
+        (bytes, 3 * math_cuda::p1_stark::depth(tree.leaves_len))
+    } else {
+        let bytes = math_cuda::merkle::gather_merkle_paths_dev(
+            &tree.nodes,
+            tree.leaves_len,
+            &positions_u32,
+            stream,
+        )
+        .ok()?;
+        (bytes, tree.leaves_len.trailing_zeros() as usize)
+    };
     debug_assert_eq!(bytes.len(), positions.len() * depth * 32);
     let mut proofs = Vec::with_capacity(positions.len());
     for q in 0..positions.len() {
@@ -3788,6 +3801,45 @@ pub(crate) fn read_cap_dev(
             "device tree has {} leaves, not a power of two",
             tree.leaves_len
         ));
+    }
+    // A 4-ary tree (top-down level layout, `math_cuda::p1_stark`): the real
+    // nodes of the level `cap_height` 4-ary levels below the root, the last
+    // level of the node buffer's top `cap_height + 1` levels.
+    if tree.arity == math_cuda::p1_stark::ARITY {
+        let sizes = math_cuda::p1_stark::level_sizes(tree.leaves_len);
+        let depth4 = sizes.len() - 1;
+        if cap_height > depth4 {
+            return Err(format!(
+                "cap height {cap_height} exceeds the arity-4 device tree's {depth4} levels"
+            ));
+        }
+        let prefix = math_cuda::p1_stark::top_levels_nodes(tree.leaves_len, cap_height + 1);
+        if tree.nodes.len() < prefix * 32 {
+            return Err(format!(
+                "device node buffer of {} bytes is too short for a height-{cap_height} cap",
+                tree.nodes.len()
+            ));
+        }
+        // The cap level is the prefix's tail: copy just its bytes, on the
+        // stream the tree's openings were gathered on.
+        let len = sizes[depth4 - cap_height];
+        let bytes = stream
+            .clone_dtoh(&tree.nodes.slice((prefix - len) * 32..prefix * 32))
+            .map_err(|e| format!("cudarc: {e:?}"))?;
+        stream.synchronize().map_err(|e| format!("cudarc: {e:?}"))?;
+        let cap: Vec<Commitment> = bytes
+            .chunks_exact(32)
+            .map(|c| {
+                let mut node: Commitment = [0u8; 32];
+                node.copy_from_slice(c);
+                node
+            })
+            .collect();
+        GPU_CAP_READ_CALLS.fetch_add(1, Ordering::Relaxed);
+        return Ok(cap);
+    }
+    if tree.arity != 2 {
+        return Err(format!("a cap of an arity-{} device tree", tree.arity));
     }
     let depth = tree.leaves_len.trailing_zeros() as usize;
     if cap_height > depth {
