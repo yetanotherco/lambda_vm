@@ -179,6 +179,130 @@ const _: () = assert!(
 pub const BLOCK_COMMITMENT_HASH: stark::config::CommitmentHash =
     <BlockStarkHash as stark::config::StarkHash>::COMMITMENT_HASH;
 
+// ============================================================================
+// ★★★ THE BLOCK'S PROOF FAMILY (D-P3B §2.1)
+// ============================================================================
+
+/// ★★★ Everything a block's recursion proves and verifies with, named ONCE: the
+/// LFM proofs' commitment configuration and their transcript, the tag every
+/// LFM statement names them by, the wrap hash a node's in-guest legs replay
+/// them with, the socket the tree programs' hash rows run on, and the WHIR
+/// base the leaves verify.
+///
+/// A compile-time choice, not a run-time one: there is ONE family per build
+/// ([`BlockFamily`]), so no proof of the block path is ever made or checked
+/// under a mix, and the move to BLAKE3 is a `Blake3Family` and a flip of that
+/// alias, which the compiler follows to every site (D-P3B §2.9). Nothing here
+/// reads the environment, a format field or a proof.
+pub trait ProofFamily: Send + Sync + 'static {
+    /// The LFM proofs' STARK commitment configuration.
+    type Stark: stark::config::StarkHash;
+    /// The LFM proofs' Fiat–Shamir transcript OBJECT (see the module header
+    /// for why it is named apart from [`Self::Stark`]).
+    type Transcript: crypto::fiat_shamir::is_transcript::IsStarkTranscript<
+            crate::tables::types::GoldilocksExtension,
+            crate::tables::types::GoldilocksField,
+        > + Clone
+        + Send;
+    /// The family's name in every LFM statement: absorbed as one
+    /// `append_bytes` call BEFORE the statement (`statement::absorb_lfm_statement_for`),
+    /// so a statement names the proof family it was made under. `None` is the
+    /// legacy pin, whose statements stay today's bytes.
+    const STATEMENT_TAG: Option<&'static [u8]>;
+    /// The in-guest wrap hash a program verifying this family's proofs runs.
+    const WRAP: crate::lfm::edsl::WrapHash;
+    /// The machine's hash chip under that wrap hash.
+    const SOCKET: crate::lfm::hash::HasherKind;
+    /// A fresh transcript over `seed` (absorbed as its first `append_bytes`).
+    fn transcript(seed: &[u8]) -> Self::Transcript;
+}
+
+/// The legacy pin as a family: [`BlockStarkHash`] on [`BlockTranscript`], no
+/// statement tag — today's LFM proofs byte for byte. The LFM users off the
+/// WHIR block path (continuation, the epoch tree, the registry and the probes)
+/// stay here until the cleanup commit (D-P3B §2.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyFamily;
+
+impl ProofFamily for LegacyFamily {
+    type Stark = BlockStarkHash;
+    type Transcript = BlockTranscript;
+    const STATEMENT_TAG: Option<&'static [u8]> = None;
+    const WRAP: crate::lfm::edsl::WrapHash = crate::lfm::edsl::WrapHash::production();
+    const SOCKET: crate::lfm::hash::HasherKind = BLOCK_HASHER;
+    fn transcript(seed: &[u8]) -> Self::Transcript {
+        block_transcript(seed)
+    }
+}
+
+/// ZisK's Poseidon1 end to end: 4-ary trees capped at
+/// [`crate::lfm::p1_commit::P1_STARK_CAP`], ZisK's sponge, width-8 grinding,
+/// and the width-16 socket in the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct P1Family;
+
+impl ProofFamily for P1Family {
+    type Stark = crate::lfm::p1_commit::P1StarkHash;
+    type Transcript = crate::lfm::p1_commit::P1Transcript;
+    const STATEMENT_TAG: Option<&'static [u8]> = Some(P1_LFM_STATEMENT_TAG);
+    const WRAP: crate::lfm::edsl::WrapHash = crate::lfm::edsl::WrapHash::Poseidon1;
+    const SOCKET: crate::lfm::hash::HasherKind = crate::lfm::hash::HasherKind::Poseidon1W16;
+    fn transcript(seed: &[u8]) -> Self::Transcript {
+        crate::lfm::p1_commit::P1Transcript::with_seed(seed)
+    }
+}
+
+/// [`P1Family`]'s statement tag (D-P3B §9, shared with #1013): the family and
+/// its cap height, `C` + [`crate::lfm::p1_commit::P1_STARK_CAP`].
+pub const P1_LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT/P1W16/C2";
+
+// The tag's cap digit is the configuration's.
+const _: () = assert!(
+    P1_LFM_STATEMENT_TAG[P1_LFM_STATEMENT_TAG.len() - 1]
+        == b'0' + crate::lfm::p1_commit::P1_STARK_CAP
+);
+
+/// ★★★ THE SWITCH: the proof family of the no-epoch WHIR block's recursion.
+pub type BlockFamily = P1Family;
+
+/// The root of a static preprocessed table (`table`: `bitwise`, `keccak_rc`)
+/// under a commitment configuration OTHER than the legacy pin's, whose roots
+/// are blessed constants (the module header's regenerations): computed by
+/// `compute` once per process for each (hash, blowup, coset, leaf layout) and
+/// reused. The cap of an arity-4 configuration does not enter: it moves path
+/// nodes, never a root.
+pub fn static_root_under<S: stark::config::StarkHash>(
+    table: &'static str,
+    options: &stark::proof::options::ProofOptions,
+    layout: stark::leaf_layout::LeafLayout,
+    compute: impl FnOnce() -> stark::config::Commitment,
+) -> stark::config::Commitment {
+    type Key = (&'static str, u8, u8, u64, usize);
+    static ROOTS: std::sync::Mutex<Vec<(Key, stark::config::Commitment)>> =
+        std::sync::Mutex::new(Vec::new());
+    let key: Key = (
+        table,
+        S::COMMITMENT_HASH as u8,
+        options.blowup_factor,
+        options.coset_offset,
+        layout.rows_per_leaf(),
+    );
+    let cached = |roots: &[(Key, stark::config::Commitment)]| {
+        roots.iter().find(|(k, _)| *k == key).map(|(_, r)| *r)
+    };
+    if let Some(root) = cached(&ROOTS.lock().unwrap_or_else(|e| e.into_inner())) {
+        return root;
+    }
+    // Computed outside the lock: a second thread may compute the same root
+    // meanwhile, and both get the same value.
+    let root = compute();
+    let mut roots = ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+    if cached(&roots).is_none() {
+        roots.push((key, root));
+    }
+    root
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +331,43 @@ mod tests {
         assert!(
             !named.is_empty(),
             "a commitment configuration must name its Fiat-Shamir hash"
+        );
+    }
+
+    /// The families are coherent: each one's transcript object hashes with
+    /// its configuration's Fiat–Shamir hash, the legacy family is the pin, and
+    /// only a non-legacy family tags its statements.
+    #[test]
+    fn each_family_names_one_hash() {
+        use crypto::fiat_shamir::is_transcript::IsTranscript;
+        use crypto::fiat_shamir::transcript_hash::TranscriptHash;
+
+        assert_eq!(
+            <<LegacyFamily as ProofFamily>::Stark as StarkHash>::COMMITMENT_HASH,
+            BLOCK_COMMITMENT_HASH
+        );
+        assert_eq!(LegacyFamily::STATEMENT_TAG, None);
+        assert_eq!(
+            <<P1Family as ProofFamily>::Stark as StarkHash>::COMMITMENT_HASH,
+            stark::config::CommitmentHash::Poseidon1
+        );
+        assert_eq!(
+            <<<P1Family as ProofFamily>::Stark as StarkHash>::Transcript as TranscriptHash>::NAME,
+            "poseidon1-w16"
+        );
+        assert_eq!(
+            P1Family::STATEMENT_TAG,
+            Some(&b"LAMBDAVM_LFM_STATEMENT/P1W16/C2"[..])
+        );
+        assert_eq!(P1Family::WRAP, crate::lfm::edsl::WrapHash::Poseidon1);
+        assert_eq!(P1Family::SOCKET, crate::lfm::hash::HasherKind::Poseidon1W16);
+        // The P1 transcript object is ZisK's sponge seeded like the legacy
+        // one (the seed is its first `append_bytes`).
+        let mut t = crate::lfm::p1_commit::P1Transcript::new();
+        <_ as IsTranscript<E>>::append_bytes(&mut t, b"seed");
+        assert_eq!(
+            <_ as IsTranscript<E>>::state(&P1Family::transcript(b"seed")),
+            <_ as IsTranscript<E>>::state(&t)
         );
     }
 
