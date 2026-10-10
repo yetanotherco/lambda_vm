@@ -85,12 +85,15 @@ pub struct LoadOperation {
     /// Whether to sign-extend (true) or zero-extend (false)
     pub signed: bool,
     /// Result bytes (8 bytes, extended)
-    pub res: [u64; 8],
+    pub res: [u8; 8],
 }
+
+// The walk keeps one per load: keep it at 32 bytes.
+const _: () = assert!(std::mem::size_of::<LoadOperation>() == 32);
 
 impl LoadOperation {
     /// Create a new LOAD operation.
-    pub fn new(base_address: u64, timestamp: u64, width: u8, signed: bool, res: [u64; 8]) -> Self {
+    pub fn new(base_address: u64, timestamp: u64, width: u8, signed: bool, res: [u8; 8]) -> Self {
         Self {
             base_address,
             timestamp,
@@ -182,7 +185,7 @@ impl LoadOperation {
             _ => return None,
         };
 
-        let input_byte = self.res[byte_idx] as u8;
+        let input_byte = self.res[byte_idx];
         Some(BitwiseOperation::single_byte(
             BitwiseOperationType::Msb8,
             input_byte,
@@ -223,7 +226,7 @@ pub fn generate_load_trace_as(
 
             // Output: res[8]
             for i in 0..8 {
-                table.set_u64(row_idx, cols::RES[i], op.res[i]);
+                table.set_u64(row_idx, cols::RES[i], u64::from(op.res[i]));
             }
 
             // Auxiliary: sign_bit

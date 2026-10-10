@@ -414,9 +414,9 @@ pub fn collect_load_ops_from_logs(
             let loaded_value = log.dst_val;
 
             // Extract individual bytes from loaded value
-            let mut res_bytes = [0u64; 8];
+            let mut res_bytes = [0u8; 8];
             for (j, byte) in res_bytes.iter_mut().take(byte_count).enumerate() {
-                *byte = (loaded_value >> (j * 8)) & 0xFF;
+                *byte = (loaded_value >> (j * 8)) as u8;
             }
 
             // Sign/zero extend the upper bytes
