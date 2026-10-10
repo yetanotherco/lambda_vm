@@ -70,7 +70,7 @@ use super::super::gpack::TraceForm;
 use super::super::types::{GoldilocksExtension, GoldilocksField};
 use super::{
     BlockVec, CollectedOps, DecodeArtifacts, MemoryState, MemwBuckets, PreCounted, RegisterState,
-    RoutedBlocks, StreamSkip, Traces, WalkLean, WalkOutputs, bitwise, block_len,
+    RoutedBlocks, StreamSkip, Traces, WalkLean, WalkOutputs, WalkSizes, bitwise, block_len,
     build_initial_image, build_traces, collect_halt_ops, collect_ops_from_cpu_into, route_ops,
     route_ops_one_pass,
 };
@@ -166,6 +166,9 @@ pub struct WindowedTraceBuilder<'a> {
     gpack: bool,
     /// The cycles the walker collects and walks at a time ([`walk_batch`]).
     walk_batch: usize,
+    /// The last walked window's list lengths, to size the next window's lists
+    /// ([`walk_sized`]).
+    walk_sizes: WalkSizes,
 }
 
 /// What the table phase of a windowed build starts from
@@ -267,6 +270,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             pack_finished: false,
             gpack: false,
             walk_batch: walk_batch(),
+            walk_sizes: WalkSizes::default(),
         })
     }
 
@@ -767,6 +771,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 decode: &self.artifacts.decode,
                 lookups: !self.lean.lookups,
                 batch: self.walk_batch,
+                sizes: &mut self.walk_sizes,
                 memory_state: &mut self.memory_state,
                 register_state: &mut self.register_state,
                 cycles: &mut self.cycles,
@@ -812,6 +817,8 @@ pub struct Walker<'b> {
     lookups: bool,
     /// The cycles collected and walked at a time (`0`: the whole window).
     batch: usize,
+    /// The last window's list lengths ([`walk_sized`]).
+    sizes: &'b mut WalkSizes,
     memory_state: &'b mut MemoryState,
     register_state: &'b mut RegisterState,
     cycles: &'b mut usize,
@@ -829,7 +836,11 @@ impl Walker<'_> {
         let t = std::time::Instant::now();
         let mut cpu_ops = Vec::with_capacity(logs.len());
         // Without `lookups`, the accumulator counts them (`absorb`).
-        let mut walk = WalkOutputs::for_walk(logs.len(), self.lookups);
+        let mut walk = if walk_sized() {
+            WalkOutputs::for_walk_sized(logs.len(), self.lookups, self.sizes)
+        } else {
+            WalkOutputs::for_walk(logs.len(), self.lookups)
+        };
         // The walk is a left fold over the CPU ops: walking each batch right
         // after collecting it gives the window's lists, with the batch's ops
         // still in cache instead of read back from the whole window's list.
@@ -850,6 +861,7 @@ impl Walker<'_> {
             );
         }
         *self.cycles += logs.len();
+        *self.sizes = WalkSizes::of(&walk, logs.len());
         *self.walk_secs += t.elapsed().as_secs_f64();
         *self.windows += 1;
         Ok(WalkedWindow { cpu_ops, walk })
@@ -1226,6 +1238,14 @@ impl<T> Segments<T> {
 fn route_fused() -> bool {
     static FUSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FUSED.get_or_init(|| !std::env::var("LAMBDA_VM_ROUTE_FUSED").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// Whether the walker sizes a window's streamed lists from the last window's
+/// lengths (unset or `1`) or from fixed per-cycle guesses, growing them as it
+/// goes (`LAMBDA_VM_WALK_SIZED=0`). Read once. The lists are the same.
+fn walk_sized() -> bool {
+    static SIZED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SIZED.get_or_init(|| !std::env::var("LAMBDA_VM_WALK_SIZED").is_ok_and(|v| v.trim() == "0"))
 }
 
 /// The cycles the walker collects and walks at a time (`LAMBDA_VM_WALK_BATCH`,
