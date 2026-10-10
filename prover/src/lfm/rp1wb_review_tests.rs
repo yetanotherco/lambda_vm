@@ -186,6 +186,7 @@ fn swap_openings(proof: &mut ChainProof<F, E>, r: usize, current: bool) -> bool 
         (RoundOpenings::Base(p), false) => side(&mut p.next),
         (RoundOpenings::Extension(p), true) => side(&mut p.current),
         (RoundOpenings::Extension(p), false) => side(&mut p.next),
+        (RoundOpenings::BaseGrouped(_), _) => unreachable!("a per-polynomial chain"),
     }
 }
 

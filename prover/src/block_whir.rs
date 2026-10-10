@@ -28,7 +28,7 @@ use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use multilinear::mle::Mle;
-use multilinear::whir_chain::{ArgueFormat, ChainConfig};
+use multilinear::whir_chain::{ArgueFormat, ChainConfig, GroupFold};
 use rayon::prelude::*;
 use stark::multilinear_block::{self, BlockCommitted, GroupStamps, block_groups};
 use stark::multilinear_table::{
@@ -132,8 +132,9 @@ pub const BLOCK_ECSM_MAX_VARS: usize = 17;
 /// The tallest table a block statement may state, in variables: a verifier
 /// constant ([`check_table_heights`]). A group stacks at `want.min(cap).max(tallest)`
 /// variables, so one taller table would make its chain taller than the 2^27
-/// stack and take its fold phase below the chains' 130.393 bits (127.39 at a
-/// 2^30 table). Honest tables are at most 2^21 rows.
+/// stack and take its fold phase below the chains' conjectured (Johnson)
+/// 130.393 bits — 128.393 under [`GroupFold::Indexed`] — (127.39 at a 2^30
+/// table). Honest tables are at most 2^21 rows.
 pub const BLOCK_MAX_TABLE_VARS: usize = 27;
 
 const _: () = assert!(BLOCK_KECCAK_RND_ROWS_LOG2 <= BLOCK_KECCAK_RND_MAX_VARS);
@@ -212,6 +213,11 @@ pub struct BlockFormat {
     /// ([`ArgueFormat::Batched`], D-BATCH's format on the block). The proof
     /// carries the other format's messages in [`BlockWhirProof::argues`].
     pub argue: ArgueFormat,
+    /// How each group's stacked polynomials are opened: one chain each
+    /// ([`GroupFold::PerPoly`], production), or one chain per run of at most
+    /// four ([`GroupFold::Indexed`], D-ONECHAIN; W-14). A caller constant like
+    /// the rest of the format, bound into the statement through the fold word.
+    pub group: GroupFold,
 }
 
 /// The most groups a block statement may declare. The block has 9; the bound
@@ -306,14 +312,16 @@ impl BlockFormat {
             max_groups: BLOCK_MAX_GROUPS,
             prepared: true,
             argue: ArgueFormat::BATCHED,
+            group: GroupFold::PerPoly,
         }
     }
 
     /// The chain's config over `shapes`: the WHIR format's, with this format's
-    /// argue. Every side of a block builds its config here.
+    /// argue and group fold. Every side of a block builds its config here.
     pub fn chain_config(&self, shapes: &[(usize, usize)]) -> ChainConfig {
         let mut config = chain_config_under(&self.zf, shapes);
         config.format.argue = self.argue;
+        config.format.group = self.group;
         config
     }
 }

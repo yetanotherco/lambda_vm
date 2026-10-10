@@ -143,6 +143,31 @@ pub struct RoundProof<C: IsField, N: IsField> {
     pub next: Vec<CosetOpening<N>>,
 }
 
+/// The openings round 0 of a grouped chain sends (D-ONECHAIN §2.4): the run's
+/// `P'` round-0 trees opened at ONE position set.
+///
+/// Query-major: `current[i]` holds query `i`'s block of every tree, in tree
+/// order, so the shape a verifier checks — `P'` blocks a query, none for an
+/// absent slot — is the shape of each entry. Tree `p`'s cap rides
+/// `current[0][p]`, its first opening in proof order.
+#[derive(
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[serde(bound = "")]
+pub struct GroupedRoundProof<C: IsField, N: IsField> {
+    /// Per query: one block per round-0 tree, in tree order.
+    pub current: Vec<Vec<CosetOpening<C>>>,
+    /// Per query: the successor block holding the folded value. Empty when
+    /// round 0 is the last round.
+    pub next: Vec<CosetOpening<N>>,
+}
+
 /// Draws the query positions. Both sides run this on the same transcript.
 ///
 /// Positions index the *folded* codeword, which is also the block index of the
@@ -301,6 +326,328 @@ where
     }
 
     Ok(next_check)
+}
+
+/// Produces round 0's openings in a grouped chain: every round-0 tree opened
+/// at ONE position set, drawn once, and the successor at the same positions'
+/// leaves — or no successor block when round 0 is the last round.
+///
+/// Each tree is owned by this round (round 0), so each carries its cap on its
+/// first opening, `current[0][p]`.
+pub fn prove_grouped<C, N, T, H>(
+    current: &[&CodewordCommitment<C, H>],
+    next: Option<&CodewordCommitment<N, H>>,
+    config: &RoundConfig,
+    caps: RoundCaps,
+    transcript: &mut T,
+) -> Result<GroupedRoundProof<C, N>, Error>
+where
+    C: IsField + 'static,
+    N: IsField + 'static,
+    FieldElement<C>: AsBytes + Sync + Send,
+    FieldElement<N>: AsBytes + Sync + Send,
+    T: IsTranscript<N>,
+    H: WhirHash,
+{
+    let first = current.first().ok_or(Error::GroupedShape(
+        crate::whir_chain::GroupedShape::RunWidth { polys: 0 },
+    ))?;
+    let __wq_sample = crate::whir_split::mark();
+    let queries = sample_queries(transcript, config.num_queries, first.num_leaves());
+    let leaves: Vec<usize> = match next {
+        Some(next) => queries
+            .iter()
+            .map(|q| leaf_and_slot(*q, next.num_leaves()).0)
+            .collect(),
+        None => Vec::new(),
+    };
+    crate::whir_split::add(&crate::whir_split::QUERY_SAMPLE, __wq_sample);
+
+    let mut rows: Vec<Vec<CosetOpening<C>>> = (0..queries.len())
+        .map(|_| Vec::with_capacity(current.len()))
+        .collect();
+    for tree in current {
+        let opened = tree.open_many_capped(&queries, caps.current, caps.current_owner)?;
+        for (row, opening) in rows.iter_mut().zip(opened) {
+            row.push(opening);
+        }
+    }
+    let next = match next {
+        Some(next) => next.open_many_capped(&leaves, caps.next, true)?,
+        None => Vec::new(),
+    };
+    Ok(GroupedRoundProof {
+        current: rows,
+        next,
+    })
+}
+
+/// Where a grouped round 0's folds must land: the committed successor, or,
+/// when round 0 is the chain's last round, the constant the prover sent.
+#[derive(Debug)]
+pub enum GroupedEnd<'a, N: IsField> {
+    Successor {
+        root: &'a Commitment,
+        /// Leaves in the successor's tree.
+        num_leaves: usize,
+        cap_height: usize,
+    },
+    Final(&'a FieldElement<N>),
+}
+
+// By hand: a derive would ask `N: Copy`, and the variants hold references.
+impl<N: IsField> Clone for GroupedEnd<'_, N> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<N: IsField> Copy for GroupedEnd<'_, N> {}
+
+/// The shape a grouped round 0's openings must have, checked whole before any
+/// of them is indexed, zipped or hashed (REV-B2-JUDGE B1-2): `queries` queries,
+/// each exactly `trees` blocks of exactly `block` values, and `successors`
+/// successor blocks (one a query, or none on a final round).
+fn check_grouped_shape<C: IsField, N: IsField>(
+    proof: &GroupedRoundProof<C, N>,
+    trees: usize,
+    block: usize,
+    queries: usize,
+    successors: usize,
+) -> Result<(), Error> {
+    use crate::whir_chain::GroupedShape;
+    if proof.current.len() != queries {
+        return Err(Error::GroupedShape(GroupedShape::Queries {
+            expected: queries,
+            got: proof.current.len(),
+        }));
+    }
+    if proof.next.len() != successors {
+        return Err(Error::GroupedShape(GroupedShape::SuccessorBlocks {
+            expected: successors,
+            got: proof.next.len(),
+        }));
+    }
+    for (query, blocks) in proof.current.iter().enumerate() {
+        if blocks.len() != trees {
+            return Err(Error::GroupedShape(GroupedShape::BlocksPerQuery {
+                query,
+                expected: trees,
+                got: blocks.len(),
+            }));
+        }
+        for (tree, opening) in blocks.iter().enumerate() {
+            if opening.values.len() != block {
+                return Err(Error::GroupedShape(GroupedShape::BlockWidth {
+                    query,
+                    tree,
+                    expected: block,
+                    got: opening.values.len(),
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The coefficients a grouped round 0 combines its trees' blocks with:
+/// `eq(ρ, p)` for each tree `p` ([`crate::whir_chain::eq_index`]). Only the
+/// `trees` present slots: an absent slot is zero and has no block.
+pub(crate) fn combine_weights<N: IsField>(
+    rho: &[FieldElement<N>],
+    trees: usize,
+) -> Vec<FieldElement<N>> {
+    #[cfg(test)]
+    if crate::whir_chain::grouped_faults::get()
+        == crate::whir_chain::grouped_faults::Fault::SwapRhoInCombine
+    {
+        let swapped: Vec<FieldElement<N>> = rho.iter().rev().cloned().collect();
+        return (0..trees)
+            .map(|p| crate::whir_chain::eq_index(&swapped, p))
+            .collect();
+    }
+    (0..trees)
+        .map(|p| crate::whir_chain::eq_index(rho, p))
+        .collect()
+}
+
+/// `Σ_p eqs[p]·block_p`, value by value: the one `2^k0` block a grouped round
+/// 0 folds. The base values are lifted here, and only from the blocks the
+/// trees authenticate. Widths were checked before ([`check_grouped_shape`]).
+pub(crate) fn combine_blocks<C, N>(
+    blocks: &[CosetOpening<C>],
+    eqs: &[FieldElement<N>],
+) -> Vec<FieldElement<N>>
+where
+    C: IsField + IsSubFieldOf<N>,
+    N: IsField,
+{
+    let width = blocks.first().map_or(0, |b| b.values.len());
+    (0..width)
+        .map(|t| {
+            blocks
+                .iter()
+                .zip(eqs)
+                .fold(FieldElement::<N>::zero(), |acc, (block, eq)| {
+                    acc + &block.values[t] * eq
+                })
+        })
+        .collect()
+}
+
+/// Checks round 0 of a grouped chain against its `P'` round-0 trees.
+///
+/// Re-derives ONE position set from the transcript; at each position every
+/// tree's block must open against that tree's own root, and the blocks'
+/// combination `Σ_p eq(ρ, p)·block_p`, folded by the data challenges, must be
+/// the successor's value there (or the final constant). Returns the
+/// successor tree's authenticated check, `None` on a final round.
+///
+/// ⚠ ORDER. The whole shape is checked before any opening is indexed or any
+/// cap is read ([`check_grouped_shape`]), so a short or padded proof is
+/// refused by name and never panics or zips.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_grouped<'a, F, E, T, H>(
+    proof: &'a GroupedRoundProof<F, E>,
+    trees: &[TreeCheck<'a>],
+    end: GroupedEnd<'a, E>,
+    domain: &Domain<F>,
+    alphas: &[FieldElement<E>],
+    rho: &[FieldElement<E>],
+    config: &RoundConfig,
+    transcript: &mut T,
+) -> Result<Option<CappedRoot<'a, Commitment>>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    use crate::whir_chain::{GroupedShape, MAX_INDEX_POLYS, index_vars};
+    if !(2..=MAX_INDEX_POLYS).contains(&trees.len()) {
+        return Err(Error::GroupedShape(GroupedShape::RunWidth {
+            polys: trees.len(),
+        }));
+    }
+    if alphas.len() != config.log_folding {
+        return Err(Error::VariableCountMismatch {
+            expected: config.log_folding,
+            got: alphas.len(),
+        });
+    }
+    if rho.len() != index_vars(trees.len()) {
+        return Err(Error::VariableCountMismatch {
+            expected: index_vars(trees.len()),
+            got: rho.len(),
+        });
+    }
+    let successors = match end {
+        GroupedEnd::Successor { .. } => config.num_queries,
+        GroupedEnd::Final(_) => 0,
+    };
+    check_grouped_shape(
+        proof,
+        trees.len(),
+        1usize << config.log_folding,
+        config.num_queries,
+        successors,
+    )?;
+
+    let num_leaves = domain.size() >> config.log_folding;
+    let current_depth = num_leaves.trailing_zeros() as usize;
+    let next_tree = match end {
+        GroupedEnd::Successor {
+            num_leaves,
+            root,
+            cap_height,
+        } => {
+            if !num_leaves.is_power_of_two() {
+                return Err(Error::NotPowerOfTwo(num_leaves));
+            }
+            Some((root, num_leaves, cap_height))
+        }
+        GroupedEnd::Final(_) => None,
+    };
+
+    // Every tree's check, built once from its first opening — after the shape
+    // guard above, so index 0 exists. With no queries nothing is opened, as in
+    // [`verify`].
+    let Some(first) = proof.current.first() else {
+        return match next_tree {
+            Some((_, _, cap_height)) if cap_height != 0 => Err(Error::CapRejected),
+            Some((root, num_leaves, _)) => Ok(Some(CappedRoot::uncapped(
+                root,
+                num_leaves.trailing_zeros() as usize,
+            ))),
+            None => Ok(None),
+        };
+    };
+    let mut checks = Vec::with_capacity(trees.len());
+    for (tree, opening) in trees.iter().zip(first) {
+        checks.push(tree.open::<F, H>(current_depth, opening)?);
+    }
+    let next_check = match (next_tree, proof.next.first()) {
+        (Some((root, num_leaves, cap_height)), Some(opening)) => Some(
+            TreeCheck::Owner { root, cap_height }
+                .open::<E, H>(num_leaves.trailing_zeros() as usize, opening)?,
+        ),
+        _ => None,
+    };
+
+    let queries = sample_queries(transcript, config.num_queries, num_leaves);
+    let eqs = combine_weights(rho, trees.len());
+
+    for (i, (&q, blocks)) in queries.iter().zip(&proof.current).enumerate() {
+        // One position for every tree: the oracle read is the run's tuple at
+        // block `q`, each component against its own root.
+        for (opening, (check, first_siblings)) in blocks.iter().zip(&checks) {
+            let siblings = if i == 0 {
+                *first_siblings
+            } else {
+                opening.proof.merkle_path.as_slice()
+            };
+            if !verify_opening_capped::<F, H>(check, q, opening, siblings) {
+                return Err(Error::OpeningRejected { query: i });
+            }
+        }
+        let folded = fold_coset::<F, E, E>(&combine_blocks(blocks, &eqs), domain, q, alphas)?;
+        match (end, &next_check) {
+            (GroupedEnd::Final(value), _) => {
+                if folded != *value {
+                    return Err(Error::FoldInconsistent { query: i });
+                }
+            }
+            (GroupedEnd::Successor { num_leaves, .. }, Some((check, next_first))) => {
+                let nxt = &proof.next[i];
+                let siblings = if i == 0 {
+                    *next_first
+                } else {
+                    nxt.proof.merkle_path.as_slice()
+                };
+                let (leaf, slot) = leaf_and_slot(q, num_leaves);
+                if !verify_opening_capped::<E, H>(check, leaf, nxt, siblings) {
+                    return Err(Error::OpeningRejected { query: i });
+                }
+                let claimed = nxt.values.get(slot).ok_or(Error::QueryOutOfRange {
+                    index: slot,
+                    bound: nxt.values.len(),
+                })?;
+                if folded != *claimed {
+                    return Err(Error::FoldInconsistent { query: i });
+                }
+            }
+            (GroupedEnd::Successor { .. }, None) => {
+                return Err(Error::GroupedShape(GroupedShape::SuccessorBlocks {
+                    expected: config.num_queries,
+                    got: proof.next.len(),
+                }));
+            }
+        }
+    }
+
+    Ok(next_check.map(|(check, _)| check))
 }
 
 #[cfg(test)]

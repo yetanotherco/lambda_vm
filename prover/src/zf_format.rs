@@ -75,6 +75,22 @@ pub const ENV_WHIR_GRIND_BITS: &str = "LAMBDA_VM_ZF_WHIR_GRIND_BITS";
 /// `uniform4` after it.
 pub const PRODUCTION_WHIR_LOG_FOLDING: usize = 4;
 
+/// The WHIR chains' `log2` inverse rate, as production configures it
+/// (`multilinear_prove::chain_config_under`): blowup 4.
+pub const PRODUCTION_WHIR_LOG_BLOWUP: usize = 2;
+
+// A grouped chain (D-ONECHAIN) is today's chain at `n + m` variables over
+// `H_{n+m+lb}`, which exists only within the field's two-adicity: at the widest
+// stack, the production blowup and the widest index, it must (REV-B2-B A-1).
+// `multilinear::stacked_eval` refuses any other config at run time.
+const _: () = assert!(
+    multilinear::whir_chain::StackVars::WIDEST
+        + PRODUCTION_WHIR_LOG_BLOWUP
+        + multilinear::whir_chain::MAX_INDEX_VARS
+        <= <math::field::goldilocks::GoldilocksField as math::field::traits::IsFFTField>::TWO_ADICITY
+            as usize
+);
+
 /// The WHIR chains' proof-of-work bits at the default, wherever [`WhirGrind`]
 /// places them. The query count subtracts the query grind's bits from what the
 /// queries must buy (`multilinear::query_count::num_queries`), so 18 bits run
@@ -87,9 +103,10 @@ pub const LEGACY_WHIR_GRIND_BITS: u8 = 20;
 
 /// The grind bits `LAMBDA_VM_ZF_WHIR_GRIND_BITS` accepts. 18 trades two grind
 /// bits for two queries (Q 112 → 114 at every production height from 15 to 27
-/// variables), and every phase keeps at least the proven minimum it has at 20:
-/// the binding phase is the unground fold at 27 variables (130.393), which
-/// neither the query grind nor Q reaches; the query phases move 130.926 →
+/// variables), and every phase keeps at least the conjectured (Johnson-regime)
+/// minimum it has at 20: the binding phase is the unground fold at 27 variables
+/// (130.393 per polynomial; 128.393 under `GroupFold::Indexed`, D-ONECHAIN),
+/// which neither the query grind nor Q reaches; the query phases move 130.926 →
 /// 130.907. Not below 18: each bit given up costs every chain the recursion
 /// verifies a query (on the block, every block leaf's in-guest openings).
 /// Widening this list is a format decision, not a parser one.
@@ -221,8 +238,9 @@ impl ZfFormat {
     /// proof. `LAMBDA_VM_ZF_WHIR_STACK=25` is the stack's rollback and
     /// `LAMBDA_VM_ZF_WHIR_GRIND=all` the grind's. `whir_grind_bits=18` grinds
     /// two bits fewer and buys them back with two queries (Q 112 → 114): the
-    /// proven minimum stays 130.393 bits, at the unground fold (WHIR block base
-    /// −0.90 s, FAST 320). `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20` is its rollback.
+    /// conjectured (Johnson) minimum stays 130.393 bits per polynomial (128.393
+    /// under `GroupFold::Indexed`), at the unground fold (WHIR block base −0.90
+    /// s, FAST 320). `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20` is its rollback.
     pub const DEFAULT: Self = Self {
         cap: CapPolicy::Auto,
         whir_cap: CapPolicy::Auto,
@@ -460,6 +478,9 @@ impl ZfFormat {
             // Read at arity 4 only, so a binary chain (keccak, RPX) moves
             // nothing.
             arity4_cap: self.base.arity4_cap,
+            // The block's own constant (`BlockFormat::group`), set where the
+            // block builds its config: every other path opens per polynomial.
+            group: multilinear::whir_chain::GroupFold::PerPoly,
         }
     }
 
@@ -1409,6 +1430,7 @@ mod tests {
                 nonces: NonceLayout::Three,
                 argue: multilinear::whir_chain::ArgueFormat::PerTable,
                 arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
+                group: multilinear::whir_chain::GroupFold::PerPoly,
             },
         };
         let opt_out = parse(&[(ENV_WHIR_GRIND, "all"), (ENV_WHIR_GRIND_BITS, "20")]).unwrap();

@@ -129,7 +129,7 @@ pub fn chain_config_under(format: &crate::zf_format::ZfFormat, shapes: &[Shape])
     // the default 18 bits it is two above `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20`'s,
     // to buy back the bits.
     let config = ChainConfig::with_security_folds(
-        2,
+        crate::zf_format::PRODUCTION_WHIR_LOG_BLOWUP,
         crate::zf_format::PRODUCTION_WHIR_LOG_FOLDING,
         format.whir_folds,
         tallest,

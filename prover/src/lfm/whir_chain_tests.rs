@@ -568,6 +568,7 @@ fn a_tampered_chain_cannot_execute() {
     match &mut forged.rounds[0].openings {
         RoundOpenings::Base(p) => p.current[0].proof.merkle_path[0][0] ^= 1,
         RoundOpenings::Extension(p) => p.current[0].proof.merkle_path[0][0] ^= 1,
+        RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
     }
     sites.push(("a Merkle sibling", forged));
 
@@ -1641,6 +1642,7 @@ fn a_tampered_capped_chain_cannot_execute() {
         match &mut forged.rounds[0].openings {
             RoundOpenings::Base(p) => p.current[0].proof.merkle_path[depth0 - 3 + j][9] ^= 1,
             RoundOpenings::Extension(_) => unreachable!("round 0 is base"),
+            RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
         }
         sites.push((format!("tree-0 cap node {j} ({name})"), forged));
     }
@@ -1652,6 +1654,7 @@ fn a_tampered_capped_chain_cannot_execute() {
             path[last][0] ^= 1;
         }
         RoundOpenings::Extension(_) => unreachable!("round 0 is base"),
+        RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
     }
     sites.push(("tree-1 cap node 3".to_string(), forged));
 
@@ -1847,6 +1850,7 @@ fn a_tampered_first_fold_chain_cannot_execute() {
             p.current[0].values[63] += FE::one();
         }
         RoundOpenings::Extension(_) => panic!("round 0 is base"),
+        RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
     }
     sites.push(("the last value of a 64-wide base block", forged));
 
@@ -1854,6 +1858,7 @@ fn a_tampered_first_fold_chain_cannot_execute() {
     match &mut forged.rounds[0].openings {
         RoundOpenings::Base(p) => p.current[0].proof.merkle_path[0][0] ^= 1,
         RoundOpenings::Extension(_) => panic!("round 0 is base"),
+        RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
     }
     sites.push(("a round-0 Merkle sibling", forged));
 
@@ -1861,6 +1866,7 @@ fn a_tampered_first_fold_chain_cannot_execute() {
     match &mut forged.rounds[0].openings {
         RoundOpenings::Base(p) => p.next[0].values[0] += FEE::one(),
         RoundOpenings::Extension(_) => panic!("round 0 is base"),
+        RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
     }
     sites.push((
         "the successor block round 0 checks its fold against",
@@ -1988,6 +1994,7 @@ fn the_production_default_chain_is_first6_under_the_auto_cap() {
             nonces: NonceLayout::Spent,
             argue: multilinear::whir_chain::ArgueFormat::PerTable,
             arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
+            group: multilinear::whir_chain::GroupFold::PerPoly,
         },
         ..config(114, 0)
     };
@@ -2030,6 +2037,7 @@ fn the_grind_bits_opt_out_chain_keeps_its_pins() {
             nonces: NonceLayout::Spent,
             argue: multilinear::whir_chain::ArgueFormat::PerTable,
             arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
+            group: multilinear::whir_chain::GroupFold::PerPoly,
         },
         ..config(112, 0)
     };
@@ -2065,6 +2073,7 @@ fn the_grind_opt_out_chain_keeps_the_pins_from_before_p2() {
             nonces: NonceLayout::Three,
             argue: multilinear::whir_chain::ArgueFormat::PerTable,
             arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
+            group: multilinear::whir_chain::GroupFold::PerPoly,
         },
         ..config(112, 20)
     };
@@ -2371,6 +2380,7 @@ fn a_tampered_chain_cannot_execute_under_either_fold() {
     match &mut forged.rounds[0].openings {
         RoundOpenings::Base(p) => p.current[0].proof.merkle_path[0][0] ^= 1,
         RoundOpenings::Extension(p) => p.current[0].proof.merkle_path[0][0] ^= 1,
+        RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
     }
     sites.push(("a Merkle sibling", forged));
     for fold in FOLDS {

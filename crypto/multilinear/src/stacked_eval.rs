@@ -43,10 +43,55 @@ use crate::{
     narrow::HostColumn,
     stacking::{Placement, StackedLayout},
     whir::Domain,
-    whir_chain::{self, ChainConfig, ChainProof},
+    whir_chain::{
+        self, ChainConfig, ChainProof, GroupFold, GroupedShape, MAX_INDEX_POLYS,
+        check_index_domain, eq_index, index_vars,
+    },
     whir_commit::{CodewordCommitment, Commitment},
     whir_hash::WhirHash,
 };
+
+/// The chains a stack of `num_polys` polynomials is opened by, each a range of
+/// its polynomials: one each under [`GroupFold::PerPoly`]; under
+/// [`GroupFold::Indexed`], consecutive runs of [`MAX_INDEX_POLYS`], the
+/// remainder last (38 → nine runs of 4 and one of 2).
+///
+/// ★ THE ONE SPLIT (REV-B2-JUDGE B1-1). A pure function of the verifier's own
+/// layout and config, so the prover, the host verifier (groups and prepared
+/// stacks alike) and the recursion's plan and emitter all cut the same chains,
+/// and no chain binds more than `MAX_INDEX_VARS` index variables however wide
+/// a statement makes a group: a single table stated at 2^27 rows stacks into
+/// one polynomial per column (REV-B2-A §3), and a refusal would make that
+/// honest block unprovable where the per-polynomial format proves it.
+pub fn index_chains(num_polys: usize, group: GroupFold) -> Vec<std::ops::Range<usize>> {
+    let run = match group {
+        GroupFold::PerPoly => 1,
+        GroupFold::Indexed => MAX_INDEX_POLYS,
+    };
+    (0..num_polys)
+        .step_by(run)
+        .map(|start| start..(start + run).min(num_polys))
+        .collect()
+}
+
+/// [`index_chains`] for `layout` under `config`, each grouped run's virtual
+/// domain checked to exist ([`check_index_domain`]): what both sides run
+/// before anything is opened or read.
+fn layout_chains<F: IsFFTField>(
+    layout: &StackedLayout,
+    config: &ChainConfig,
+) -> Result<Vec<std::ops::Range<usize>>, Error> {
+    let chains = index_chains(layout.num_polys(), config.format.group);
+    for run in chains.iter().filter(|run| run.len() >= 2) {
+        check_index_domain(
+            layout.n_stack(),
+            index_vars(run.len()),
+            config.log_blowup,
+            F::TWO_ADICITY as usize,
+        )?;
+    }
+    Ok(chains)
+}
 
 /// The stacked polynomials, committed. Base-field, like the trace they hold.
 pub struct StackedCommitment<F: IsFFTField + IsPrimeField + 'static, H: WhirHash>
@@ -506,7 +551,8 @@ where
     }
 }
 
-/// One weighted, chained evaluation proof per stacked polynomial.
+/// One weighted, chained evaluation proof per chain: per stacked polynomial,
+/// or per run of them under [`GroupFold::Indexed`] ([`index_chains`]).
 #[derive(
     Clone,
     Debug,
@@ -665,6 +711,61 @@ fn weight_at<E: IsField>(
     Ok(total)
 }
 
+/// A grouped chain's weight at its `n + m` challenges in binding order
+/// (`k0` data, `m` index, the rest): `Σ_p eq(ρ, p)·weight_at_p` with each
+/// polynomial's weight read at the `n` data challenges, `at[..k0] ‖
+/// at[k0+m..]` (REV-B2-JUDGE B1-3). The index sits after the column
+/// selectors' first `k0` bits, so a selector longer than `k0` straddles it,
+/// and only the data challenges reach `weight_at`.
+#[allow(clippy::too_many_arguments)]
+fn grouped_weight_at<E: IsField>(
+    layout: &StackedLayout,
+    run: std::ops::Range<usize>,
+    k0: usize,
+    points: &Claimed<'_, E>,
+    weights: &[FieldElement<E>],
+    at: &[FieldElement<E>],
+) -> Result<FieldElement<E>, Error> {
+    let m = index_vars(run.len());
+    if at.len() != layout.n_stack() + m || k0 > layout.n_stack() {
+        return Err(Error::VariableCountMismatch {
+            expected: layout.n_stack() + m,
+            got: at.len(),
+        });
+    }
+    let (head, rest) = at.split_at(k0);
+    let (rho, tail) = rest.split_at(m);
+    let data: Vec<FieldElement<E>> = head.iter().chain(tail).cloned().collect();
+    #[cfg(test)]
+    let fault = whir_chain::grouped_faults::get();
+    #[cfg(test)]
+    let swapped: Vec<FieldElement<E>> = rho.iter().rev().cloned().collect();
+    #[cfg(test)]
+    let rho: &[FieldElement<E>] = if fault == whir_chain::grouped_faults::Fault::SwapRhoInWeight {
+        &swapped
+    } else {
+        rho
+    };
+    let mut total = FieldElement::<E>::zero();
+    for (p, poly) in run.clone().enumerate() {
+        let eq = eq_index(rho, p);
+        #[cfg(test)]
+        let eq = if fault == whir_chain::grouped_faults::Fault::DropIndexFactor {
+            FieldElement::<E>::one()
+        } else {
+            eq
+        };
+        total += eq * weight_at(layout, poly, points, weights, &data)?;
+    }
+    #[cfg(test)]
+    if fault == whir_chain::grouped_faults::Fault::AbsentSlotWeightOne {
+        for p in run.len()..(1usize << m) {
+            total += eq_index(rho, p);
+        }
+    }
+    Ok(total)
+}
+
 /// The claimed sum for one stacked polynomial: its columns' values, batched.
 fn claimed<E: IsField>(
     layout: &StackedLayout,
@@ -764,35 +865,56 @@ where
         ),
         Room::Own | Room::Held(_) => None,
     };
-    let mut polys = Vec::with_capacity(stacked.commitments.len());
-    for (i, commitment) in stacked.commitments.iter().enumerate() {
-        // The polynomial is its columns at their offsets, handed over as they
-        // are — see `StackedCommitment::commit`.
-        let poly = whir_chain::Stacked {
-            parts: layout
-                .parts_of(i)
-                .into_iter()
-                .map(|(column, offset)| (columns[column] as &dyn HostColumn<F>, offset))
-                .collect(),
-            resident: resident.map(|(store, at)| {
-                (
-                    store,
-                    layout
-                        .parts_of(i)
-                        .into_iter()
-                        .map(|(column, offset)| (at.store_column(column), offset))
-                        .collect(),
-                )
-            }),
-            num_vars: layout.n_stack(),
-        };
-        // The weight goes down as its shares: a device writes them into its own
-        // buffer, and the host materializes the table only if none does.
-        polys.push(whir_chain::prove_shared::<F, E, T, H>(
-            &poly,
-            &weight_shares(layout, i, point, &weights)?,
+    // The polynomial is its columns at their offsets, handed over as they
+    // are — see `StackedCommitment::commit`.
+    let poly_of = |i: usize| whir_chain::Stacked {
+        parts: layout
+            .parts_of(i)
+            .into_iter()
+            .map(|(column, offset)| (columns[column] as &dyn HostColumn<F>, offset))
+            .collect(),
+        resident: resident.map(|(store, at)| {
+            (
+                store,
+                layout
+                    .parts_of(i)
+                    .into_iter()
+                    .map(|(column, offset)| (at.store_column(column), offset))
+                    .collect(),
+            )
+        }),
+        num_vars: layout.n_stack(),
+    };
+    let chains = layout_chains::<F>(layout, config)?;
+    let mut polys = Vec::with_capacity(chains.len());
+    for run in chains {
+        if run.len() == 1 {
+            let i = run.start;
+            // The weight goes down as its shares: a device writes them into its
+            // own buffer, and the host materializes the table only if none does.
+            polys.push(whir_chain::prove_shared::<F, E, T, H>(
+                &poly_of(i),
+                &weight_shares(layout, i, point, &weights)?,
+                layout.n_stack(),
+                &stacked.commitments[i],
+                &stacked.domain,
+                config,
+                transcript,
+            )?);
+            continue;
+        }
+        let sources: Vec<whir_chain::Stacked<'_, F>> = run.clone().map(&poly_of).collect();
+        let shares = run
+            .clone()
+            .map(|i| weight_shares(layout, i, point, &weights))
+            .collect::<Result<Vec<_>, Error>>()?;
+        let commitments: Vec<&CodewordCommitment<F, H>> =
+            run.map(|i| &stacked.commitments[i]).collect();
+        polys.push(whir_chain::prove_grouped_shared::<F, E, T, H>(
+            &sources,
+            &shares,
             layout.n_stack(),
-            commitment,
+            &commitments,
             &stacked.domain,
             config,
             transcript,
@@ -831,29 +953,75 @@ where
             got: values.len(),
         });
     }
-    if proof.polys.len() != layout.num_polys() || roots.len() != layout.num_polys() {
+    // One root per polynomial, and — before anything is absorbed — one chain
+    // per run of the verifier's own split, never the proof's count.
+    let chains = layout_chains::<F>(layout, config)?;
+    if roots.len() != layout.num_polys()
+        || (config.format.group == GroupFold::PerPoly && proof.polys.len() != layout.num_polys())
+    {
         return Err(Error::QueryCountMismatch {
             expected: layout.num_polys(),
             got: proof.polys.len().min(roots.len()),
         });
     }
+    if proof.polys.len() != chains.len() {
+        return Err(Error::GroupedShape(GroupedShape::ChainCount {
+            expected: chains.len(),
+            got: proof.polys.len(),
+        }));
+    }
     for value in values {
         transcript.append_field_element(value);
     }
     let weights = challenge_powers(&transcript.sample_field_element(), values.len());
+    // A shape refusal keeps its name; any other is the column's.
+    let rejected = |column: usize| {
+        move |e: Error| match e {
+            Error::GroupedShape(_) => e,
+            _ => Error::ColumnOpeningRejected { column },
+        }
+    };
 
-    for (i, (eval_proof, root)) in proof.polys.iter().zip(roots).enumerate() {
-        whir_chain::verify_weighted::<F, E, T, _, H>(
+    for (eval_proof, run) in proof.polys.iter().zip(chains) {
+        if run.len() == 1 {
+            let i = run.start;
+            whir_chain::verify_weighted::<F, E, T, _, H>(
+                eval_proof,
+                &roots[i],
+                |at: &[FieldElement<E>]| weight_at(layout, i, point, &weights, at),
+                claimed(layout, i, values, &weights)?,
+                layout.n_stack(),
+                domain,
+                config,
+                transcript,
+            )
+            .map_err(rejected(i))?;
+            continue;
+        }
+        // The run's claim is its polynomials' claims summed: one γ for the
+        // whole group, its powers indexed by the group's columns, so no two
+        // polynomials share an exponent (D-ONECHAIN §3.2, Lemma A).
+        let mut claim = FieldElement::<E>::zero();
+        for i in run.clone() {
+            claim += claimed(layout, i, values, &weights)?;
+        }
+        let k0 = config
+            .schedule(layout.n_stack())
+            .first()
+            .copied()
+            .unwrap_or(0);
+        let column = run.start;
+        whir_chain::verify_grouped::<F, E, T, _, H>(
             eval_proof,
-            root,
-            |at: &[FieldElement<E>]| weight_at(layout, i, point, &weights, at),
-            claimed(layout, i, values, &weights)?,
+            &roots[run.clone()],
+            |at: &[FieldElement<E>]| grouped_weight_at(layout, run, k0, point, &weights, at),
+            claim,
             layout.n_stack(),
             domain,
             config,
             transcript,
         )
-        .map_err(|_| Error::ColumnOpeningRejected { column: i })?;
+        .map_err(rejected(column))?;
     }
 
     Ok(())

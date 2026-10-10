@@ -374,6 +374,7 @@ fn the_identity_line_moves_when_an_opened_value_moves() {
         RoundOpenings::Extension(p) => {
             p.current[0].values[0] += FieldElement::<Ext>::one();
         }
+        RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
     }
 
     assert_ne!(

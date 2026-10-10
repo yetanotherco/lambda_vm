@@ -35,6 +35,8 @@ mod whir_cap_tests;
 pub mod whir_chain;
 pub mod whir_commit;
 pub mod whir_eval;
+#[cfg(test)]
+mod whir_group_tests;
 pub mod whir_hash;
 #[cfg(test)]
 mod whir_p1_tests;
@@ -179,4 +181,9 @@ pub enum Error {
     /// one the verifier derives from the statement.
     #[error("the batched argue's {part} does not have the shape the statement implies")]
     ArgueShapeMismatch { part: &'static str },
+    /// A grouped opening ([`whir_chain::GroupFold::Indexed`]) is not the shape
+    /// the verifier derives from its own layout and config: refused by name
+    /// before anything is indexed.
+    #[error("the grouped opening's shape is not the derived one: {0:?}")]
+    GroupedShape(whir_chain::GroupedShape),
 }

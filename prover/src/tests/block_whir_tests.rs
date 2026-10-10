@@ -22,6 +22,7 @@ fn one_group() -> BlockFormat {
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
         argue: ArgueFormat::PerTable,
+        group: multilinear::whir_chain::GroupFold::PerPoly,
     }
 }
 
@@ -36,6 +37,7 @@ fn many_groups() -> BlockFormat {
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
         argue: ArgueFormat::PerTable,
+        group: multilinear::whir_chain::GroupFold::PerPoly,
     }
 }
 

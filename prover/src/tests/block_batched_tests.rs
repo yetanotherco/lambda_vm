@@ -26,6 +26,7 @@ fn one_group(argue: ArgueFormat) -> BlockFormat {
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
         argue,
+        group: multilinear::whir_chain::GroupFold::PerPoly,
     }
 }
 
@@ -40,6 +41,7 @@ fn many_groups(argue: ArgueFormat) -> BlockFormat {
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
         argue,
+        group: multilinear::whir_chain::GroupFold::PerPoly,
     }
 }
 
@@ -649,6 +651,7 @@ fn the_card_argues_the_hosts_bytes() {
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
         argue: BATCHED,
+        group: multilinear::whir_chain::GroupFold::PerPoly,
     };
     for name in ["all_instructions_64", "test_keccak", "test_ecsm"] {
         let (program, elf, mut traces) = fixed_traces(name, &MaxRowsConfig::default(), 16);

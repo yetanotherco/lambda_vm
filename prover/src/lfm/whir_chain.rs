@@ -1370,6 +1370,9 @@ fn push_openings(
             let openings = if current { &p.current } else { &p.next };
             side(words, openings, owner_cap, ext_word);
         }
+        // A grouped round 0 (D-ONECHAIN) has no in-guest leg yet (its stage
+        // B2): nothing is written, and the arena's length refuses the chain.
+        RoundOpenings::BaseGrouped(_) => {}
     }
 }
 
@@ -1434,6 +1437,8 @@ fn push_openings4(
             let openings = if current { &p.current } else { &p.next };
             side(words, openings, tree, ext_word);
         }
+        // See `push_openings`: no in-guest leg yet.
+        RoundOpenings::BaseGrouped(_) => {}
     }
 }
 
