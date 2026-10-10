@@ -164,6 +164,8 @@ pub struct WindowedTraceBuilder<'a> {
     pack_finished: bool,
     /// [`Self::generate_packed`].
     gpack: bool,
+    /// The cycles the walker collects and walks at a time ([`walk_batch`]).
+    walk_batch: usize,
 }
 
 /// What the table phase of a windowed build starts from
@@ -264,6 +266,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             finish_cut_rows: (0, 0, 0),
             pack_finished: false,
             gpack: false,
+            walk_batch: walk_batch(),
         })
     }
 
@@ -274,6 +277,14 @@ impl<'a> WindowedTraceBuilder<'a> {
         assert_eq!(self.cycles, 0, "walk_lean after a window was walked");
         self.memory_state.lean = lean.memory;
         self.lean = lean;
+        self
+    }
+
+    /// Walk `n` cycles at a time (`0`: the whole window's CPU ops, then the
+    /// walk), whatever `LAMBDA_VM_WALK_BATCH` says (the lists are the same).
+    #[cfg(test)]
+    pub(crate) fn walk_batch(mut self, n: usize) -> Self {
+        self.walk_batch = n;
         self
     }
 
@@ -755,6 +766,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             Walker {
                 decode: &self.artifacts.decode,
                 lookups: !self.lean.lookups,
+                batch: self.walk_batch,
                 memory_state: &mut self.memory_state,
                 register_state: &mut self.register_state,
                 cycles: &mut self.cycles,
@@ -798,6 +810,8 @@ pub struct Walker<'b> {
     decode: &'b DecodeTable,
     /// List the in-walk lookups (`false` under [`WalkLean::lookups`]).
     lookups: bool,
+    /// The cycles collected and walked at a time (`0`: the whole window).
+    batch: usize,
     memory_state: &'b mut MemoryState,
     register_state: &'b mut RegisterState,
     cycles: &'b mut usize,
@@ -813,18 +827,29 @@ impl Walker<'_> {
             return Err(Error::HaltInNonFinalEpoch);
         }
         let t = std::time::Instant::now();
-        let cpu_ops = super::collect_cpu_ops_from(logs, self.decode, *self.cycles)?;
-        *self.cycles += logs.len();
+        let mut cpu_ops = Vec::with_capacity(logs.len());
         // Without `lookups`, the accumulator counts them (`absorb`).
-        let mut walk = WalkOutputs::for_walk(cpu_ops.len(), self.lookups);
-        collect_ops_from_cpu_into(
-            &cpu_ops,
-            self.decode,
-            self.memory_state,
-            self.register_state,
-            &mut walk,
-            self.lookups,
-        );
+        let mut walk = WalkOutputs::for_walk(logs.len(), self.lookups);
+        // The walk is a left fold over the CPU ops: walking each batch right
+        // after collecting it gives the window's lists, with the batch's ops
+        // still in cache instead of read back from the whole window's list.
+        let batch = match self.batch {
+            0 => logs.len().max(1),
+            n => n,
+        };
+        for part in logs.chunks(batch) {
+            let from = cpu_ops.len();
+            super::collect_cpu_ops_into(part, self.decode, *self.cycles + from, &mut cpu_ops)?;
+            collect_ops_from_cpu_into(
+                &cpu_ops[from..],
+                self.decode,
+                self.memory_state,
+                self.register_state,
+                &mut walk,
+                self.lookups,
+            );
+        }
+        *self.cycles += logs.len();
         *self.walk_secs += t.elapsed().as_secs_f64();
         *self.windows += 1;
         Ok(WalkedWindow { cpu_ops, walk })
@@ -1178,6 +1203,19 @@ impl<T> Segments<T> {
     fn op_bytes(&self) -> usize {
         self.len() * std::mem::size_of::<T>()
     }
+}
+
+/// The cycles the walker collects and walks at a time (`LAMBDA_VM_WALK_BATCH`,
+/// default 2048; `0` collects the whole window's CPU ops, then walks them).
+/// Read once. The lists are the same.
+fn walk_batch() -> usize {
+    static BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BATCH.get_or_init(|| {
+        std::env::var("LAMBDA_VM_WALK_BATCH")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(2048)
+    })
 }
 
 /// Whether the hand-out copies each chunk's ops out of the window parts
