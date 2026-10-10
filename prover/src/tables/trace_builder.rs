@@ -5012,6 +5012,82 @@ fn route_ops_one_pass(
     )
 }
 
+/// [`route_ops_one_pass`] appended to the run's `segments` in place (no
+/// window's segments to copy in), with each CPU op's BITWISE lookups counted
+/// into `histogram` in the same pass ([`CpuOp::count_bitwise_into`]): the same
+/// segments `segments.append(route_ops_one_pass(..))` gives, and the same
+/// counts. CPU32's dispatch goes through lists of the window's own (few ops),
+/// and the DVRM-implied LT and MUL ops are derived from the window's part of
+/// each DVRM segment.
+fn route_ops_into(
+    cpu_ops: &[CpuOperation],
+    decode: &DecodeTable,
+    cpu32_ops: &[cpu32::Cpu32Operation],
+    segments: &mut RoutedBlocks,
+    histogram: &mut bitwise::BitwiseHistogram,
+) {
+    let dvrm_before = segments.dvrm_filter.len();
+    for op in cpu_ops {
+        let op = decode.op(op);
+        op.count_bitwise_into(histogram);
+        let f = &op.decode.fields;
+        if op.branch_cond() {
+            segments
+                .branch_ops
+                .extend(std::slice::from_ref(&route_branch(op)));
+        }
+        if !f.word_instr {
+            if f.is_mul() {
+                segments.mul_filter.push(route_mul(op));
+            }
+            if f.is_divrem() {
+                segments.dvrm_filter.push(route_dvrm(op));
+            }
+            if f.is_eq() {
+                segments.eq_ops.extend(std::slice::from_ref(&route_eq(op)));
+            }
+            if f.is_and() || f.is_or() || f.is_xor() {
+                segments
+                    .bytewise_ops
+                    .extend(std::slice::from_ref(&route_bytewise(op)));
+            }
+        }
+        if f.is_store() {
+            segments.store_ops.push(route_store(op));
+        }
+    }
+    // As `route_from_cpu_segments`, over this window's part of each list.
+    let (mut shift_cpu32, mut mul_cpu32, mut dvrm_cpu32) = (Vec::new(), Vec::new(), Vec::new());
+    for c in cpu32_ops {
+        cpu32_chip_op(c, &mut shift_cpu32, &mut mul_cpu32, &mut dvrm_cpu32);
+        segments.bitwise_cpu32.extend(collect_cpu32_bitwise(c));
+    }
+    let dvrm_lt = |dvrm: &[(DvrmOperation, bool)], out: &mut BlockVec<LtOperation>| {
+        out.extend(
+            dvrm.iter()
+                .map(|(op, _wants_remainder)| LtOperation::new(op.abs_r(), op.abs_d(), false)),
+        )
+    };
+    let dvrm_mul = |dvrm: &[(DvrmOperation, bool)], out: &mut BlockVec<(MulOperation, bool)>| {
+        for (op, _wants_remainder) in dvrm {
+            let mul_op = MulOperation::new(op.d, op.signed, op.compute_quotient(), op.sign_q());
+            out.push((mul_op.clone(), false)); // C13: lo (muldiv_selector=0)
+            out.push((mul_op, true)); // C14: hi (muldiv_selector=1)
+        }
+    };
+    let dvrm_filter = segments
+        .dvrm_filter
+        .range(dvrm_before, segments.dvrm_filter.len());
+    dvrm_lt(&dvrm_filter, &mut segments.lt_dvrm_filter);
+    dvrm_lt(&dvrm_cpu32, &mut segments.lt_dvrm_cpu32);
+    dvrm_mul(&dvrm_filter, &mut segments.mul_dvrm_filter);
+    dvrm_mul(&dvrm_cpu32, &mut segments.mul_dvrm_cpu32);
+    drop(dvrm_filter);
+    segments.shift_cpu32.extend(shift_cpu32);
+    segments.mul_cpu32.extend(mul_cpu32);
+    segments.dvrm_cpu32.extend(dvrm_cpu32);
+}
+
 // [`route_ops`]'s op for each segment it filters out of the CPU ops.
 fn route_branch(op: CpuOp<'_>) -> BranchOperation {
     BranchOperation::new(
