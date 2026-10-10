@@ -1691,12 +1691,12 @@ fn no_disk_is_off_beside_live_regeneration_and_auto_without_it() {
     }
 }
 
-/// ★ Both regenerators start at the finish's end (N4c), before phase A has
-/// committed its last groups: the rest's regenerator takes each table's fate
-/// as phase A decides it. With each of the rest's drops held back (so the
-/// regenerator meets tables not yet decided), every dropped table is still
-/// rebuilt and deposited, and the proof is regeneration off's bytes; started
-/// with phase B instead (the knob off), the same.
+/// ★ The streamed chunks' regenerator starts at the finish's end (N4c), from
+/// each chunk's fate as phase A decided it; the rest's starts with phase B.
+/// Every dropped table is rebuilt and deposited, and the proof is
+/// regeneration off's bytes; started with phase B instead (the knob off), the
+/// same. (A fate decided after the regenerator asks is
+/// `stark::multilinear_block`'s `a_regenerator_started_early_waits_for_each_tables_fate`.)
 #[test]
 fn regenerators_started_at_the_finishs_end_prove_the_same_bytes() {
     use crate::block_whir::BlockSpillPolicy;
@@ -1724,7 +1724,6 @@ fn regenerators_started_at_the_finishs_end_prove_the_same_bytes() {
             BlockSpillPolicy::Off,
             Deviations {
                 regen_early: Some(early),
-                rest_drop_delay: Some(std::time::Duration::from_millis(150)),
                 ..Deviations::default()
             },
         )
@@ -1735,20 +1734,6 @@ fn regenerators_started_at_the_finishs_end_prove_the_same_bytes() {
         assert!(r.rest_dropped > 0 && r.dropped > r.rest_dropped, "{lines}");
         assert_eq!(r.regenerated, r.dropped, "{lines}");
         assert_eq!((r.mismatches, r.failed), (0, 0), "{lines}");
-        if early {
-            // The rest's regenerator asked for some table before phase A had
-            // decided it, and waited.
-            let late = lines
-                .split("started before phase A's end: ")
-                .nth(1)
-                .and_then(|t| t.split(' ').next())
-                .and_then(|n| n.parse::<usize>().ok())
-                .unwrap_or(0);
-            assert!(
-                late > 0,
-                "no table decided after the regenerator asked\n{lines}"
-            );
-        }
         assert_eq!(proof.groups, plain.groups, "early {early}: the partition");
         assert!(verify(&proof, &elf, &format), "early {early}");
         if crypto::grinding::deterministic() {
@@ -1760,10 +1745,10 @@ fn regenerators_started_at_the_finishs_end_prove_the_same_bytes() {
     }
 }
 
-/// N4c's liveness: phase A ends in an error right after the finish, with both
-/// regenerators started and the rest's waiting on tables not yet decided. The
-/// prove returns the error (their windows closed, their threads joined) and
-/// never hangs.
+/// N4c's liveness: phase A ends in an error right after the finish, with the
+/// streamed chunks' regenerator started and waiting on chunks not yet
+/// decided. The prove returns the error (its window closed, its thread
+/// joined) and never hangs.
 #[test]
 fn an_early_regenerator_never_hangs_a_failed_phase_a() {
     use crate::block_whir::BlockSpillPolicy;
@@ -1779,7 +1764,7 @@ fn an_early_regenerator_never_hangs_a_failed_phase_a() {
             BlockSpillPolicy::Off,
             Deviations {
                 regen_early: Some(true),
-                rest_drop_delay: Some(std::time::Duration::from_millis(400)),
+                streamed_drop_delay: Some(std::time::Duration::from_millis(400)),
                 abort_after_finish: true,
                 ..Deviations::default()
             },

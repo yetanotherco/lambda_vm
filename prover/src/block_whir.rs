@@ -2023,15 +2023,17 @@ pub(crate) struct Deviations {
     /// frontier, so a phase-B order that takes a class out of its rank order
     /// cannot complete.
     pub regen_windows: Option<(u64, u64)>,
-    /// Whether live regeneration may start its regenerators at the finish's
-    /// end ([`regen::EarlyStart`]), instead of the knob
+    /// Whether live regeneration may start the streamed chunks' regenerator
+    /// at the finish's end ([`regen::EarlyStart`]), instead of the knob
     /// ([`regen::early_start`]).
     pub regen_early: Option<bool>,
-    /// A pause before each drop of the rest's tables, so a regenerator started
-    /// early meets tables whose fate phase A has not decided yet.
-    pub rest_drop_delay: Option<std::time::Duration>,
+    /// A pause before each drop of a streamed chunk, so the streamed
+    /// chunks' regenerator started early meets chunks whose fate phase A has
+    /// not decided yet.
+    pub streamed_drop_delay: Option<std::time::Duration>,
     /// The builder fails right after the finish (and after any early start):
-    /// phase A ends in an error with the regenerators running.
+    /// phase A ends in an error with the streamed chunks' regenerator
+    /// running.
     pub abort_after_finish: bool,
     /// `auto`'s target for the host, in bytes, instead of the machine's
     /// ([`spill_target_bytes`]): 0 makes the policy want every table out.
@@ -3049,11 +3051,6 @@ fn stream_pipelined<'a, R>(
                     "table {next} of the rest was never laid out"
                 )));
             }
-            // Every rest table is tagged now: a regenerator started before
-            // phase A's end stops waiting for tags (N4c).
-            if let Some(recorder) = recorder {
-                recorder.set_rest_done();
-            }
             Ok(StreamLaid {
                 packer,
                 shapes,
@@ -3580,11 +3577,12 @@ fn prove_streamed(
                 regen_mode == regen::RegenMode::Always,
             )
         });
-    if let (Some(regen), Some(pause)) = (&live_regen, deviations.rest_drop_delay) {
-        regen.delay_drops(1, pause);
+    if let (Some(regen), Some(pause)) = (&live_regen, deviations.streamed_drop_delay) {
+        regen.delay_drops(0, pause);
     }
-    // The regenerators started at the finish's end, when they are (N4c); phase
-    // B takes them, and an error before then closes their windows and joins.
+    // The streamed chunks' regenerator started at the finish's end, when it is
+    // (N4c); phase B takes it, and an error before then closes its window and
+    // joins.
     let early_on = deviations.regen_early.unwrap_or_else(regen::early_start);
     let early_owned: std::sync::Mutex<Option<regen::EarlyStart>> = std::sync::Mutex::new(None);
     let early_slot = &early_owned;
@@ -3951,40 +3949,32 @@ fn prove_streamed(
                     }
                     let rest_regen = emitted?;
                     // The finish's end: when live regeneration has armed (or
-                    // drops every table), both regenerators start now, not at
-                    // phase B (N4c); the rest's lists go with them.
-                    let rest_regen = match (rest_regen, &early_feed, &early_recorder) {
-                        (Some(rest_regen), Some(feed), Some(recorder))
-                            if early_on && feed.drops_all_from_now() =>
-                        {
-                            let early = regen::EarlyStart::spawn(
-                                feed.clone(),
-                                std::sync::Arc::clone(recorder),
-                                rest_regen,
-                                regen::LiveArgs {
-                                    elf_bytes: elf_bytes.to_vec(),
-                                    private_input: private_inputs.to_vec(),
-                                    max_rows: options.max_rows.clone(),
-                                    window_cycles: window,
-                                    form: stream_form,
-                                    faults: deviations.regen_faults,
-                                    policy: deviations.regen_windows.map_or_else(
-                                        regen::ahead_policy,
-                                        |(streamed, _)| regen::AheadPolicy::Fixed(streamed),
-                                    ),
-                                },
-                                regen::regen_generators(),
-                                deviations.rest_faults,
-                                std::sync::Arc::clone(&early_gate_in),
-                                deviations
-                                    .regen_windows
-                                    .map_or_else(regen::rest_ahead_bytes, |(_, rest)| rest),
-                            );
-                            *early_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(early);
-                            None
-                        }
-                        (rest_regen, ..) => rest_regen,
-                    };
+                    // drops every table), the streamed chunks' regenerator
+                    // starts now, not at phase B (N4c); the rest's starts with
+                    // phase B, from its final drops.
+                    if let (Some(feed), Some(recorder)) = (&early_feed, &early_recorder)
+                        && early_on
+                        && feed.drops_all_from_now()
+                    {
+                        let early = regen::EarlyStart::spawn(
+                            feed.clone(),
+                            std::sync::Arc::clone(recorder),
+                            regen::LiveArgs {
+                                elf_bytes: elf_bytes.to_vec(),
+                                private_input: private_inputs.to_vec(),
+                                max_rows: options.max_rows.clone(),
+                                window_cycles: window,
+                                form: stream_form,
+                                faults: deviations.regen_faults,
+                                policy: deviations.regen_windows.map_or_else(
+                                    regen::ahead_policy,
+                                    |(streamed, _)| regen::AheadPolicy::Fixed(streamed),
+                                ),
+                            },
+                            std::sync::Arc::clone(&early_gate_in),
+                        );
+                        *early_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(early);
+                    }
                     if deviations.abort_after_finish {
                         return Err(Error::Prover(
                             "a test's abort right after the finish".into(),
@@ -4332,7 +4322,8 @@ fn prove_streamed(
         // Live regeneration: what phase A dropped, rebuilt beside phase B in
         // rank order. A dropped table is the chunk its rank names (the chunks
         // are placed first, in hand-out order), or the prove stops here.
-        // The regenerators started at the finish's end, when they did (N4c).
+        // The streamed chunks' regenerator started at the finish's end, when it
+        // did (N4c).
         let early = early_owned.lock().unwrap_or_else(|e| e.into_inner()).take();
         let early_started = early.as_ref().map(regen::EarlyStart::started);
         let (early_runs, early_pacer) = match early.map(regen::EarlyStart::join) {
@@ -4349,7 +4340,32 @@ fn prove_streamed(
                 let mut plans = live_regen.into_plan().into_iter();
                 let streamed_plan = plans.next();
                 let rest_plan = plans.next();
-                let (run, rest_run) = match early_runs {
+                // The rest's dropped tables (N3), built again from the lists the
+                // finish kept; with none dropped, the lists go now.
+                let rest_run = match rest_plan {
+                    Some(plan) if !plan.dropped.is_empty() => {
+                        let regen = rest_regen.take().ok_or_else(|| {
+                            Error::Prover(
+                                "rest tables were dropped but the finish kept no lists".into(),
+                            )
+                        })?;
+                        let producer = plan.producer.ok_or_else(|| {
+                            Error::Prover("the rest's window has no producer".into())
+                        })?;
+                        Some(regen::RestRun::spawn(
+                            regen,
+                            recorder.rest_blocks(),
+                            std::sync::Arc::clone(&plan.window),
+                            producer,
+                            plan.dropped,
+                            regen::regen_generators(),
+                            deviations.rest_faults,
+                        ))
+                    }
+                    _ => None,
+                };
+                drop(rest_regen.take());
+                let run = match early_runs {
                     Some(early) => {
                         if let Some(why) = early.error {
                             return Err(Error::Prover(format!("early regeneration: {why}")));
@@ -4379,92 +4395,50 @@ fn prove_streamed(
                                 )));
                             }
                         }
-                        if rest_plan
-                            .as_ref()
-                            .is_some_and(|plan| !plan.dropped.is_empty())
-                            && early.rest.is_none()
-                        {
-                            return Err(Error::Prover(
-                                "rest tables were dropped but no regenerator took them".into(),
-                            ));
+                        early.live
+                    }
+                    None => match streamed_plan
+                        .filter(|plan| !plan.dropped.is_empty())
+                        .and_then(|plan| plan.producer.map(|producer| (plan.dropped, producer)))
+                    {
+                        Some((dropped, producer)) => {
+                            let mut keyed = Vec::with_capacity(dropped.len());
+                            for (rank, slot) in dropped {
+                                let key = recorder
+                                    .chunk_at(rank as usize)
+                                    .filter(|key| {
+                                        laid.streamed_air
+                                            .get(rank as usize)
+                                            .is_some_and(|&(t, i, _)| (t, i) == *key)
+                                    })
+                                    .ok_or_else(|| {
+                                        Error::Prover(format!(
+                                            "dropped table {rank} is not the chunk its rank names"
+                                        ))
+                                    })?;
+                                keyed.push((key, slot));
+                            }
+                            Some(regen::LiveRun::spawn(
+                                elf_bytes.to_vec(),
+                                private_inputs.to_vec(),
+                                options.max_rows.clone(),
+                                window,
+                                std::sync::Arc::clone(&window_of),
+                                producer,
+                                keyed,
+                                stream_form,
+                                deviations.regen_faults,
+                                deviations
+                                    .regen_windows
+                                    .map_or_else(regen::ahead_policy, |(streamed, _)| {
+                                        regen::AheadPolicy::Fixed(streamed)
+                                    }),
+                                None,
+                            ))
                         }
-                        drop(rest_regen.take());
-                        (early.live, early.rest)
-                    }
-                    None => {
-                        // The rest's dropped tables (N3), built again from the lists the
-                        // finish kept; with none dropped, the lists go now.
-                        let rest_run = match rest_plan {
-                            Some(plan) if !plan.dropped.is_empty() => {
-                                let regen = rest_regen.take().ok_or_else(|| {
-                                    Error::Prover(
-                                        "rest tables were dropped but the finish kept no lists"
-                                            .into(),
-                                    )
-                                })?;
-                                let producer = plan.producer.ok_or_else(|| {
-                                    Error::Prover("the rest's window has no producer".into())
-                                })?;
-                                Some(regen::RestRun::spawn(
-                                    regen,
-                                    regen::RestSource::Planned {
-                                        blocks: recorder.rest_blocks(),
-                                        dropped: plan.dropped,
-                                    },
-                                    std::sync::Arc::clone(&plan.window),
-                                    producer,
-                                    regen::regen_generators(),
-                                    deviations.rest_faults,
-                                ))
-                            }
-                            _ => None,
-                        };
-                        drop(rest_regen.take());
-                        let run = match streamed_plan
-                            .filter(|plan| !plan.dropped.is_empty())
-                            .and_then(|plan| plan.producer.map(|producer| (plan.dropped, producer)))
-                        {
-                            Some((dropped, producer)) => {
-                                let mut keyed = Vec::with_capacity(dropped.len());
-                                for (rank, slot) in dropped {
-                                    let key = recorder
-                                        .chunk_at(rank as usize)
-                                        .filter(|key| {
-                                            laid.streamed_air
-                                                .get(rank as usize)
-                                                .is_some_and(|&(t, i, _)| (t, i) == *key)
-                                        })
-                                        .ok_or_else(|| {
-                                            Error::Prover(format!(
-                                                "dropped table {rank} is not the chunk its rank names"
-                                            ))
-                                        })?;
-                                    keyed.push((key, slot));
-                                }
-                                Some(regen::LiveRun::spawn(
-                                    elf_bytes.to_vec(),
-                                    private_inputs.to_vec(),
-                                    options.max_rows.clone(),
-                                    window,
-                                    std::sync::Arc::clone(&window_of),
-                                    producer,
-                                    keyed,
-                                    stream_form,
-                                    deviations.regen_faults,
-                                    deviations
-                                        .regen_windows
-                                        .map_or_else(regen::ahead_policy, |(streamed, _)| {
-                                            regen::AheadPolicy::Fixed(streamed)
-                                        }),
-                                    None,
-                                ))
-                            }
-                            None => None,
-                        };
-                        (run, rest_run)
-                    }
+                        None => None,
+                    },
                 };
-
                 Some((drops, window_of, run, windows.get(1).cloned(), rest_run))
             }
             _ => None,
