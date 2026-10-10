@@ -101,7 +101,8 @@ find_tool() {  # find_tool NAME → path or empty: PATH, then CUDA_HOME/bin, /us
     [ -n "$d" ] && [ -x "$d/bin/$n" ] && { echo "$d/bin/$n"; return; }
   done
   p="$(ls -d /opt/nvidia/nsight-*/*/bin/"$n" /opt/nvidia/nsight-*/bin/"$n" /usr/local/cuda*/bin/"$n" 2>/dev/null | sort -V | tail -1 || true)"
-  [ -n "$p" ] && echo "$p"
+  [ -z "$p" ] || echo "$p"
+  return 0
 }
 NVSMI="$(find_tool nvidia-smi)"; NVCC="$(find_tool nvcc)"; NSYS="$(find_tool nsys)"; NCU="$(find_tool ncu)"
 CARGO_BIN="$(dirname "$(command -v cargo 2>/dev/null || echo "$HOME/.cargo/bin/cargo")")"
