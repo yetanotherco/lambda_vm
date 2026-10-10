@@ -25,10 +25,10 @@ impl Rng {
 }
 
 /// The decode table answers exactly the pcs the instruction map holds, each
-/// with the decode `from_log_and_instruction` makes: across runs with gaps,
-/// misaligned pcs and a run that ends at the top of the address space.
+/// at its DECODE row with the decode the DECODE trace makes: across runs with
+/// gaps, misaligned pcs and a run that ends at the top of the address space.
 #[test]
-fn the_decode_table_holds_exactly_the_maps_pcs() {
+fn the_decode_table_holds_exactly_the_maps_pcs_at_their_decode_rows() {
     // nop · addi x1, x0, 10 · add x3, x1, x2 · ecall
     let words = [0x0000_0013u32, 0x00a0_0093, 0x0020_81b3, 0x0000_0073];
     let mut map = U64HashMap::default();
@@ -39,14 +39,19 @@ fn the_decode_table_holds_exactly_the_maps_pcs() {
         }
     }
     let table = DecodeTable::from_instructions(&map);
-    assert_eq!(table.runs.len(), 3, "three runs of consecutive pcs");
+    let (_, pc_to_row) = decode::generate_decode_trace(&map);
     for (&pc, &instruction) in map.iter() {
+        let row = table
+            .row(pc)
+            .unwrap_or_else(|| panic!("pc {pc:#x} has no row"));
+        assert_eq!(row as usize, pc_to_row[&pc], "pc {pc:#x}: the DECODE row");
         assert_eq!(
-            table.get(pc),
-            Some(&DecodeEntry::from_instruction(pc, instruction, 4)),
+            table.entry(row),
+            &decode::DecodeEntry::from_instruction(pc, instruction, 4),
             "pc {pc:#x}"
         );
     }
+    assert_eq!(table.padding_row(), pc_to_row[&cpu::CPU_PADDING_PC]);
     for pc in [
         0,
         0xffc,
@@ -58,7 +63,7 @@ fn the_decode_table_holds_exactly_the_maps_pcs() {
         u64::MAX - 1,
         u64::MAX,
     ] {
-        assert!(table.get(pc).is_none(), "pc {pc:#x} is not in the map");
+        assert!(table.row(pc).is_none(), "pc {pc:#x} is not in the map");
     }
 }
 
@@ -189,6 +194,10 @@ fn the_walk_lean_knob_names_its_parts() {
         WalkLean::parse("decode,memory,lookups,route"),
         Some(WalkLean::ALL)
     );
+    // The decode is always read from the table: `decode` is accepted, alone
+    // it is none of the parts.
+    assert_eq!(WalkLean::parse("memory,lookups,route"), Some(WalkLean::ALL));
+    assert_eq!(WalkLean::parse("decode"), Some(WalkLean::NONE));
     assert_eq!(
         WalkLean::parse("memory, route"),
         Some(WalkLean {
@@ -232,7 +241,7 @@ fn the_counted_lookups_are_the_listed_ones() {
             .expect("the program runs")
             .logs;
         let artifacts = DecodeArtifacts::from_elf(&program).expect("the decode artifacts");
-        let cpu_ops = collect_cpu_ops(&logs, &artifacts.instructions).expect("the CPU ops");
+        let cpu_ops = collect_cpu_ops(&logs, &artifacts.decode).expect("the CPU ops");
         let image = build_initial_image(&program, &[]);
         let register_init = register::register_init_from_entry_point(program.entry_point);
         let walk = |lookups: bool| {
@@ -242,6 +251,7 @@ fn the_counted_lookups_are_the_listed_ones() {
             let mut out = WalkOutputs::for_walk(cpu_ops.len(), lookups);
             collect_ops_from_cpu_into(
                 &cpu_ops,
+                &artifacts.decode,
                 &mut memory_state,
                 &mut register_state,
                 &mut out,
@@ -264,7 +274,7 @@ fn the_counted_lookups_are_the_listed_ones() {
         let mut counted = bitwise::BitwiseHistogram::new();
         cpu_ops
             .iter()
-            .for_each(|op| op.count_bitwise_into(&mut counted));
+            .for_each(|op| artifacts.decode.op(op).count_bitwise_into(&mut counted));
         let cpu_only = multiplicities(&counted);
         lean.load_ops
             .iter()
@@ -301,7 +311,7 @@ fn the_one_pass_routing_is_the_routing() {
             .expect("the program runs")
             .logs;
         let artifacts = DecodeArtifacts::from_elf(&program).expect("the decode artifacts");
-        let cpu_ops = collect_cpu_ops(&logs, &artifacts.instructions).expect("the CPU ops");
+        let cpu_ops = collect_cpu_ops(&logs, &artifacts.decode).expect("the CPU ops");
         let image = build_initial_image(&program, &[]);
         let register_init = register::register_init_from_entry_point(program.entry_point);
         let mut memory_state = MemoryState::from_image(&image);
@@ -309,6 +319,7 @@ fn the_one_pass_routing_is_the_routing() {
         let mut walk = WalkOutputs::with_capacity(cpu_ops.len());
         collect_ops_from_cpu_into(
             &cpu_ops,
+            &artifacts.decode,
             &mut memory_state,
             &mut register_state,
             &mut walk,
@@ -338,8 +349,12 @@ fn the_one_pass_routing_is_the_routing() {
             )
         };
         assert_eq!(
-            show(route_ops(&cpu_ops, &walk.cpu32_ops)),
-            show(route_ops_one_pass(&cpu_ops, &walk.cpu32_ops)),
+            show(route_ops(&cpu_ops, &artifacts.decode, &walk.cpu32_ops)),
+            show(route_ops_one_pass(
+                &cpu_ops,
+                &artifacts.decode,
+                &walk.cpu32_ops
+            )),
             "{name}"
         );
     }

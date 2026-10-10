@@ -116,12 +116,10 @@ mod tests {
     }
 
     /// The walk refuses a window whose last cycle's timestamp would reach 2^32,
-    /// on both collectors, and takes the window that ends one cycle before.
+    /// and takes the window that ends one cycle before.
     #[test]
     fn the_walk_refuses_the_window_that_crosses_2_32() {
-        use super::super::{
-            DecodeArtifacts, DecodeTable, Elf, collect_cpu_ops_from, collect_cpu_ops_from_table,
-        };
+        use super::super::{DecodeArtifacts, Elf, collect_cpu_ops_from};
         use crate::test_utils::asm_elf_bytes;
         use executor::vm::execution::Executor;
 
@@ -132,21 +130,14 @@ mod tests {
             .expect("the program runs")
             .logs;
         let artifacts = DecodeArtifacts::from_elf(&program).expect("the decode artifacts");
-        let table = DecodeTable::from_instructions(&artifacts.instructions);
         let n = logs.len();
         // The last cycle at 2^30 − 2: timestamp 2^32 − 4.
         let fits = (1usize << 30) - 1 - n;
-        let ops = collect_cpu_ops_from(&logs, &artifacts.instructions, fits).expect("it fits");
-        assert_eq!(ops.last().map(|op| op.timestamp), Some(CLOCK_LIMIT - 4));
-        let ops = collect_cpu_ops_from_table(&logs, &table, fits).expect("it fits");
+        let ops = collect_cpu_ops_from(&logs, &artifacts.decode, fits).expect("it fits");
         assert_eq!(ops.last().map(|op| op.timestamp), Some(CLOCK_LIMIT - 4));
         // One cycle later: the last cycle's timestamp is 2^32.
         assert!(matches!(
-            collect_cpu_ops_from(&logs, &artifacts.instructions, fits + 1),
-            Err(Error::ClockPastLimit(_))
-        ));
-        assert!(matches!(
-            collect_cpu_ops_from_table(&logs, &table, fits + 1),
+            collect_cpu_ops_from(&logs, &artifacts.decode, fits + 1),
             Err(Error::ClockPastLimit(_))
         ));
     }
@@ -173,11 +164,11 @@ mod tests {
         assert!(padding > 0, "the program's {n} cycles leave padding rows");
         // The halting cycle at 2^30 − 2: the walk takes every window.
         let first = (1usize << 30) - 1 - n;
-        let ops = collect_cpu_ops_from(&logs, &artifacts.instructions, first).expect("it fits");
+        let ops = collect_cpu_ops_from(&logs, &artifacts.decode, first).expect("it fits");
         let halt = ops.last().expect("ops").timestamp;
         assert_eq!(halt, CLOCK_LIMIT - 4);
         // The trace's last padded row writes the PC at the final PC token.
-        let trace = cpu::generate_cpu_trace(&ops);
+        let trace = cpu::generate_cpu_trace(&ops, &artifacts.decode);
         assert_eq!(trace.num_rows(), n + padding);
         let last_row = *trace
             .get_main(trace.num_rows() - 1, cpu::cols::TIMESTAMP)

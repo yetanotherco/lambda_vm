@@ -4,18 +4,29 @@
 //! rvd, branch decision, word-instruction delegation), `generate_cpu_trace`
 //! (column layout, padding, word-row masking), and `collect_bitwise_ops`.
 
-use crate::tables::cpu::{CPU_PADDING_PC, CpuOperation, cols, generate_cpu_trace};
+use crate::tables::cpu::{CPU_PADDING_PC, CpuOp, CpuOperation, cols, generate_cpu_trace};
+use crate::tables::decode::DecodeTable;
 use crate::tables::types::DecodeEntry;
 
 use executor::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
+    memory::U64HashMap,
 };
 
 const PC: u64 = 0x1000;
 
+/// A CPU op and the decode it is read with.
+struct Held(DecodeEntry, CpuOperation);
+
+impl Held {
+    fn op(&self) -> CpuOp<'_> {
+        CpuOp::new(&self.0, &self.1)
+    }
+}
+
 /// Build a CpuOperation from an instruction + register values.
-fn op_of(instr: Instruction, src1: u64, src2: u64, dst: u64, next_pc: u64) -> CpuOperation {
+fn op_of(instr: Instruction, src1: u64, src2: u64, dst: u64, next_pc: u64) -> Held {
     let decode = DecodeEntry::from_instruction(PC, instr, 4);
     let log = Log {
         current_pc: PC,
@@ -24,7 +35,8 @@ fn op_of(instr: Instruction, src1: u64, src2: u64, dst: u64, next_pc: u64) -> Cp
         src2_val: src2,
         dst_val: dst,
     };
-    CpuOperation::from_log(&log, 4, decode)
+    let op = CpuOperation::from_log(&log, 4, &decode, 0);
+    Held(decode, op)
 }
 
 // =========================================================================
@@ -33,7 +45,7 @@ fn op_of(instr: Instruction, src1: u64, src2: u64, dst: u64, next_pc: u64) -> Cp
 
 #[test]
 fn test_from_log_add_reg_reg() {
-    let op = op_of(
+    let held = op_of(
         Instruction::Arith {
             dst: 3,
             src1: 1,
@@ -45,6 +57,7 @@ fn test_from_log_add_reg_reg() {
         30,
         PC + 4,
     );
+    let op = held.op();
     assert_eq!(op.rv1, 10);
     assert_eq!(op.rv2, 20);
     assert_eq!(op.arg2(), 20, "reg-reg: arg2 = rv2 (imm = 0)");
@@ -56,7 +69,7 @@ fn test_from_log_add_reg_reg() {
 
 #[test]
 fn test_from_log_addi() {
-    let op = op_of(
+    let held = op_of(
         Instruction::ArithImm {
             dst: 3,
             src: 1,
@@ -68,6 +81,7 @@ fn test_from_log_addi() {
         15,
         PC + 4,
     );
+    let op = held.op();
     assert_eq!(op.arg2(), 5, "reg-imm: arg2 = imm (rv2 = 0)");
     assert_eq!(op.res, 15);
     assert_eq!(op.rvd, 15);
@@ -75,7 +89,7 @@ fn test_from_log_addi() {
 
 #[test]
 fn test_from_log_sub() {
-    let op = op_of(
+    let held = op_of(
         Instruction::Arith {
             dst: 3,
             src1: 1,
@@ -87,13 +101,14 @@ fn test_from_log_sub() {
         10,
         PC + 4,
     );
+    let op = held.op();
     assert_eq!(op.res, 10, "res = rv1 - arg2");
     assert_eq!(op.rvd, 10);
 }
 
 #[test]
 fn test_from_log_beq_taken() {
-    let op = op_of(
+    let held = op_of(
         Instruction::Branch {
             src1: 1,
             src2: 2,
@@ -105,6 +120,7 @@ fn test_from_log_beq_taken() {
         0,
         PC + 8,
     );
+    let op = held.op();
     assert!(op.branch_cond(), "BEQ with equal operands is taken");
     assert_eq!(op.arg2(), 5, "conditional branch: arg2 = rv2");
     assert_eq!(op.res, 1, "EQ result on the ALU bus is 1 when taken");
@@ -113,7 +129,7 @@ fn test_from_log_beq_taken() {
 
 #[test]
 fn test_from_log_beq_not_taken() {
-    let op = op_of(
+    let held = op_of(
         Instruction::Branch {
             src1: 1,
             src2: 2,
@@ -125,6 +141,7 @@ fn test_from_log_beq_not_taken() {
         0,
         PC + 4,
     );
+    let op = held.op();
     assert!(!op.branch_cond());
     assert_eq!(op.res, 0);
     assert_eq!(
@@ -136,7 +153,7 @@ fn test_from_log_beq_not_taken() {
 
 #[test]
 fn test_from_log_bne_taken() {
-    let op = op_of(
+    let held = op_of(
         Instruction::Branch {
             src1: 1,
             src2: 2,
@@ -148,6 +165,7 @@ fn test_from_log_bne_taken() {
         0,
         PC + 8,
     );
+    let op = held.op();
     assert!(
         op.branch_cond(),
         "BNE with differing operands is taken (invert)"
@@ -157,7 +175,7 @@ fn test_from_log_bne_taken() {
 
 #[test]
 fn test_from_log_load() {
-    let op = op_of(
+    let held = op_of(
         Instruction::Load {
             dst: 3,
             offset: 4,
@@ -169,13 +187,14 @@ fn test_from_log_load() {
         0xDEAD,
         PC + 4,
     );
+    let op = held.op();
     assert_eq!(op.res, 0x104, "load address = rv1 + imm");
     assert_eq!(op.rvd, 0xDEAD, "load rvd = the loaded value");
 }
 
 #[test]
 fn test_from_log_store() {
-    let op = op_of(
+    let held = op_of(
         Instruction::Store {
             src: 2,
             offset: 8,
@@ -187,6 +206,7 @@ fn test_from_log_store() {
         0,
         PC + 4,
     );
+    let op = held.op();
     assert_eq!(op.res, 0x108, "store address = rv1 + imm");
     assert_eq!(op.rv2, 0xAB, "store value comes from rs2");
     assert_eq!(op.rvd, 0, "store writes nothing back to rd");
@@ -194,7 +214,7 @@ fn test_from_log_store() {
 
 #[test]
 fn test_from_log_word_carries_real_register_values() {
-    let op = op_of(
+    let held = op_of(
         Instruction::ArithW {
             dst: 3,
             src1: 1,
@@ -206,6 +226,7 @@ fn test_from_log_word_carries_real_register_values() {
         30,
         PC + 4,
     );
+    let op = held.op();
     assert!(op.decode.fields.word_instr);
     // The delegate CpuOperation carries the real values for CPU32/register ops.
     assert_eq!(op.rv1, 10);
@@ -219,10 +240,15 @@ fn test_from_log_word_carries_real_register_values() {
 // generate_cpu_trace
 // =========================================================================
 
-fn ops4(instr: Instruction) -> Vec<CpuOperation> {
-    (0..4)
+fn ops4(instr: Instruction) -> (Vec<CpuOperation>, DecodeTable) {
+    let mut instructions = U64HashMap::default();
+    for i in 0..4 {
+        instructions.insert(PC + i * 4, instr);
+    }
+    let decode = DecodeTable::from_instructions(&instructions);
+    let ops = (0..4)
         .map(|i| {
-            let decode = DecodeEntry::from_instruction(PC + i * 4, instr, 4);
+            let row = decode.row(PC + i * 4).expect("an instruction");
             let log = Log {
                 current_pc: PC + i * 4,
                 next_pc: PC + i * 4 + 4,
@@ -230,20 +256,21 @@ fn ops4(instr: Instruction) -> Vec<CpuOperation> {
                 src2_val: 20,
                 dst_val: 30,
             };
-            CpuOperation::from_log(&log, i * 4 + 4, decode)
+            CpuOperation::from_log(&log, i * 4 + 4, decode.entry(row), row)
         })
-        .collect()
+        .collect();
+    (ops, decode)
 }
 
 #[test]
 fn test_trace_width_and_real_row() {
-    let ops = ops4(Instruction::Arith {
+    let (ops, decode) = ops4(Instruction::Arith {
         dst: 3,
         src1: 1,
         src2: 2,
         op: ArithOp::Add,
     });
-    let trace = generate_cpu_trace(&ops);
+    let trace = generate_cpu_trace(&ops, &decode);
     assert_eq!(trace.main_table.width, cols::NUM_COLUMNS);
     assert_eq!(cols::NUM_COLUMNS, 38);
     assert_eq!(trace.main_table.height, 4);
@@ -256,16 +283,14 @@ fn test_trace_width_and_real_row() {
 #[test]
 fn test_trace_padding_row() {
     // One real op → padded to 4 rows; rows 1..4 are padding.
-    let ops = vec![
-        ops4(Instruction::Arith {
-            dst: 3,
-            src1: 1,
-            src2: 2,
-            op: ArithOp::Add,
-        })
-        .remove(0),
-    ];
-    let trace = generate_cpu_trace(&ops);
+    let (mut ops, decode) = ops4(Instruction::Arith {
+        dst: 3,
+        src1: 1,
+        src2: 2,
+        op: ArithOp::Add,
+    });
+    ops.truncate(1);
+    let trace = generate_cpu_trace(&ops, &decode);
     let pad = trace.main_table.get_row(1);
     assert_eq!(
         pad[cols::PC_0],
@@ -283,13 +308,13 @@ fn test_trace_padding_row() {
 
 #[test]
 fn test_trace_word_row_columns_masked() {
-    let ops = ops4(Instruction::ArithW {
+    let (ops, decode) = ops4(Instruction::ArithW {
         dst: 3,
         src1: 1,
         src2: 2,
         op: ArithOp::Add,
     });
-    let trace = generate_cpu_trace(&ops);
+    let trace = generate_cpu_trace(&ops, &decode);
     let row = trace.main_table.get_row(0);
     // Delegate row: word_instr set, but all operational columns masked to 0.
     assert_eq!(row[cols::WORD_INSTR], 1u64.into());
@@ -311,7 +336,7 @@ fn test_trace_word_row_columns_masked() {
 #[test]
 fn test_collect_bitwise_ops_shape() {
     use crate::tables::bitwise::BitwiseOperationType;
-    let op = op_of(
+    let held = op_of(
         Instruction::Arith {
             dst: 3,
             src1: 1,
@@ -323,6 +348,7 @@ fn test_collect_bitwise_ops_shape() {
         30,
         PC + 4,
     );
+    let op = held.op();
     let ops = op.collect_bitwise_ops();
     assert_eq!(ops.len(), 7, "3 ARE_BYTES + 4 IS_HALF");
     assert!(
@@ -342,7 +368,7 @@ fn test_collect_bitwise_ops_shape() {
 
 #[test]
 fn test_collect_bitwise_ops_word_row_zeroed() {
-    let op = op_of(
+    let held = op_of(
         Instruction::ArithW {
             dst: 3,
             src1: 1,
@@ -354,6 +380,7 @@ fn test_collect_bitwise_ops_word_row_zeroed() {
         30,
         PC + 4,
     );
+    let op = held.op();
     let ops = op.collect_bitwise_ops();
     // On a word delegate row the CPU zeroes rs1/rs2/rd/alu_flags/mem_flags/res,
     // but half_instruction_length stays (it is set unconditionally in the trace).

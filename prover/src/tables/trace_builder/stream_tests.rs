@@ -608,7 +608,7 @@ fn a_miscounted_header_is_refused_by_the_stream() {
             &memory_state,
             &register_init,
             artifacts.decode_trace.clone(),
-            &artifacts.decode_pc_to_row,
+            &artifacts.decode,
             register_state,
             &max_rows,
             #[cfg(feature = "disk-spill")]

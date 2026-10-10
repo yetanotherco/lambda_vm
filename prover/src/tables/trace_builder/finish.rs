@@ -129,7 +129,7 @@ pub(super) struct FinishPlan<'a> {
     memory_state: &'a MemoryState,
     register_init: &'a [u32],
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
-    decode_pc_to_row: &'a decode::PcToRow,
+    decode_table: &'a DecodeTable,
     max_rows: &'a crate::tables::MaxRowsConfig,
     #[cfg(feature = "disk-spill")]
     storage_mode: StorageMode,
@@ -176,7 +176,7 @@ impl<'a> FinishPlan<'a> {
         memory_state: &'a MemoryState,
         register_init: &'a [u32],
         decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
-        decode_pc_to_row: &'a decode::PcToRow,
+        decode_table: &'a DecodeTable,
         mut register_state: RegisterState,
         max_rows: &'a crate::tables::MaxRowsConfig,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
@@ -621,7 +621,7 @@ impl<'a> FinishPlan<'a> {
             let (halt_timestamp, halt_next_pc) = cpu_ops
                 .iter()
                 .rev()
-                .find(|op| op.decode.fields.ecall)
+                .find(|op| decode_table.entry(op.decode_row).fields.ecall)
                 .map(|op| (op.timestamp, op.next_pc))
                 .or(streamed_last_ecall)
                 .ok_or(Error::MissingHaltEcall)?;
@@ -715,7 +715,7 @@ impl<'a> FinishPlan<'a> {
             memory_state,
             register_init,
             decode_trace,
-            decode_pc_to_row,
+            decode_table,
             max_rows,
             #[cfg(feature = "disk-spill")]
             storage_mode,
@@ -776,7 +776,7 @@ impl<'a> FinishPlan<'a> {
             memory_state,
             register_init,
             decode_trace,
-            decode_pc_to_row,
+            decode_table,
             max_rows,
             #[cfg(feature = "disk-spill")]
             storage_mode,
@@ -842,7 +842,9 @@ impl<'a> FinishPlan<'a> {
                 skip.cpu,
                 skip.tails,
                 false,
-                packed_by(pack, |ops| cpu::generate_cpu_trace_as(ops, form)),
+                packed_by(pack, |ops| {
+                    cpu::generate_cpu_trace_as(ops, decode_table, form)
+                }),
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
             )
@@ -1022,9 +1024,9 @@ impl<'a> FinishPlan<'a> {
         // independently.
         let gen_decode = move || {
             let mut decode = decode_trace;
-            let mut decode_lookups: Vec<u64> = cpu_ops_ref.iter().map(|op| op.decode.pc).collect();
-            decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
-            decode::update_multiplicities(&mut decode, decode_pc_to_row, &decode_lookups);
+            let rows = cpu_ops_ref.iter().map(|op| op.decode_row as usize);
+            let padding = std::iter::repeat_n(decode_table.padding_row(), num_padding_rows);
+            decode::count_rows(&mut decode, rows.chain(padding));
             packed_if(pack, decode)
         };
         let gen_commits = || {
@@ -1607,7 +1609,7 @@ impl<'a> FinishPlan<'a> {
             memory_state,
             register_init,
             decode_trace,
-            decode_pc_to_row,
+            decode_table,
             max_rows,
             #[cfg(feature = "disk-spill")]
             storage_mode,
@@ -1686,9 +1688,9 @@ impl<'a> FinishPlan<'a> {
                 rows: decode_trace.num_rows(),
                 job: Box::new(move || {
                     let mut decode = decode_trace;
-                    let mut lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
-                    lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
-                    decode::update_multiplicities(&mut decode, decode_pc_to_row, &lookups);
+                    let rows = cpu_ops.iter().map(|op| op.decode_row as usize);
+                    let padding = std::iter::repeat_n(decode_table.padding_row(), num_padding_rows);
+                    decode::count_rows(&mut decode, rows.chain(padding));
                     Ok(packed_if(pack, decode))
                 }),
             });
@@ -1827,7 +1829,7 @@ impl<'a> FinishPlan<'a> {
                 Box::new(move || {
                     Ok(packed_if(
                         pack,
-                        cpu::generate_cpu_trace_as(&ops[start..end], form),
+                        cpu::generate_cpu_trace_as(&ops[start..end], decode_table, form),
                     ))
                 })
             },

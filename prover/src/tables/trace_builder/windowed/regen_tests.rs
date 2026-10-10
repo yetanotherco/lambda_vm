@@ -77,14 +77,27 @@ fn the_regeneration_walk_is_the_walk_on_its_streamed_lists() {
             let mut cycles = 0;
             for (k, part) in logs.chunks(window).enumerate() {
                 let mut cpu_ops = Vec::new();
-                collect_cpu_ops_into(part, &artifacts.instructions, cycles, &mut cpu_ops)
+                collect_cpu_ops_into(part, &artifacts.decode, cycles, &mut cpu_ops)
                     .expect("the CPU ops");
                 cycles += part.len();
                 let [(full_mem, full_reg), (lite_mem, lite_reg)] = &mut states;
                 let mut full = WalkOutputs::for_walk(cpu_ops.len(), false);
-                collect_ops_from_cpu_into(&cpu_ops, full_mem, full_reg, &mut full, false);
+                collect_ops_from_cpu_into(
+                    &cpu_ops,
+                    &artifacts.decode,
+                    full_mem,
+                    full_reg,
+                    &mut full,
+                    false,
+                );
                 let mut lite = WalkOutputs::for_walk(cpu_ops.len(), false);
-                collect_streamed_ops_from_cpu_into(&cpu_ops, lite_mem, lite_reg, &mut lite);
+                collect_streamed_ops_from_cpu_into(
+                    &cpu_ops,
+                    &artifacts.decode,
+                    lite_mem,
+                    lite_reg,
+                    &mut lite,
+                );
                 assert_eq!(
                     streamed_lists(&cpu_ops, &full),
                     streamed_lists(&cpu_ops, &lite),

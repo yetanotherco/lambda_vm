@@ -47,7 +47,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     memory_state: &MemoryState,
     register_init: &[u32],
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
-    decode_pc_to_row: &decode::PcToRow,
+    decode_table: &DecodeTable,
     mut register_state: RegisterState,
     max_rows: &crate::tables::MaxRowsConfig,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
@@ -499,7 +499,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         let (halt_timestamp, halt_next_pc) = cpu_ops
             .iter()
             .rev()
-            .find(|op| op.decode.fields.ecall)
+            .find(|op| decode_table.entry(op.decode_row).fields.ecall)
             .map(|op| (op.timestamp, op.next_pc))
             .or(streamed_last_ecall)
             .ok_or(Error::MissingHaltEcall)?;
@@ -541,7 +541,9 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             skip.cpu,
             skip.tails,
             false,
-            packed_by(pack, |ops| cpu::generate_cpu_trace_as(ops, form)),
+            packed_by(pack, |ops| {
+                cpu::generate_cpu_trace_as(ops, decode_table, form)
+            }),
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -721,9 +723,9 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     // independently.
     let gen_decode = move || {
         let mut decode = decode_trace;
-        let mut decode_lookups: Vec<u64> = cpu_ops_ref.iter().map(|op| op.decode.pc).collect();
-        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
-        decode::update_multiplicities(&mut decode, decode_pc_to_row, &decode_lookups);
+        let rows = cpu_ops_ref.iter().map(|op| op.decode_row as usize);
+        let padding = std::iter::repeat_n(decode_table.padding_row(), num_padding_rows);
+        decode::count_rows(&mut decode, rows.chain(padding));
         packed_if(pack, decode)
     };
     let gen_commits = || {
