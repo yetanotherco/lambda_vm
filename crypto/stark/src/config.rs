@@ -1,7 +1,10 @@
+use crypto::fiat_shamir::p1_transcript::P1TranscriptHash;
 use crypto::fiat_shamir::transcript_hash::{
     Blake3TranscriptHash, KeccakTranscriptHash, TranscriptHash,
 };
+use crypto::merkle_tree::backends::p1::{P1BatchBackend, P1PairBackend};
 use crypto::merkle_tree::backends::types::{BatchBlake3Backend, PairBlake3Backend};
+use crypto::merkle_tree::cap::CapPolicy;
 use crypto::merkle_tree::{
     backends::types::{BatchKeccak256Backend, PairKeccak256Backend},
     merkle::MerkleTree,
@@ -110,6 +113,18 @@ where
     Self: IsMerkleTreeBackend<Node = Commitment>,
 {
     const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Blake3;
+}
+impl<F> DeviceTreeBackend for P1BatchBackend<F>
+where
+    Self: IsMerkleTreeBackend<Node = Commitment>,
+{
+    const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Poseidon1;
+}
+impl<F> DeviceTreeBackend for P1PairBackend<F>
+where
+    Self: IsMerkleTreeBackend<Node = Commitment>,
+{
+    const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Poseidon1;
 }
 
 /// The hash every commitment this crate produces is built with.
@@ -274,6 +289,32 @@ pub trait StarkHash: Send + Sync + 'static {
     /// What both Merkle families hash with. The name a proof's roots may be
     /// called by.
     const COMMITMENT_HASH: CommitmentHash;
+
+    /// Children per Merkle node in both families (`IsMerkleTreeBackend::ARITY`;
+    /// a configuration states it once, and its backends must agree). At 4 the
+    /// format's binary cap policy does not apply: the trees take
+    /// [`Self::ARITY4_CAP`] instead ([`effective_cap_policy`]).
+    const ARITY: usize = 2;
+
+    /// The cap policy of an arity-4 configuration's trees, heights in 4-ary
+    /// levels (`crypto::merkle_tree::cap`'s arity-4 shape). The format's
+    /// `merkle_cap` prices binary caps, so an arity-4 configuration states its
+    /// own: a verifier constant of the configuration, never read from a proof
+    /// or the environment. Unused at arity 2.
+    const ARITY4_CAP: CapPolicy = CapPolicy::Off;
+}
+
+/// The cap policy a configuration actually runs: the format's `merkle_cap`
+/// (`format_cap`) at arity 2, the configuration's own
+/// [`StarkHash::ARITY4_CAP`] at arity 4 (heights in 4-ary levels). A verifier
+/// constant, from the configuration and the verifier's format, never from the
+/// proof.
+pub fn effective_cap_policy<H: StarkHash>(format_cap: CapPolicy) -> CapPolicy {
+    if H::ARITY == 2 {
+        format_cap
+    } else {
+        H::ARITY4_CAP
+    }
 }
 
 /// The digest a configuration grinds over: its transcript's hash, because the
@@ -394,6 +435,70 @@ const _: fn() = || {
     );
 };
 
+/// ZisK's Poseidon1 (Goldilocks, width 16, rate 12) as a STARK commitment
+/// configuration: the tagged leaf hash and 4-ary trees padded with zero
+/// digests (`crypto::merkle_tree::backends::p1`), ZisK's transcript sponge and
+/// its width-8 grinding (`crypto::fiat_shamir::p1_transcript`), every tree
+/// capped at 4-ary height `CAP` (`0`: uncapped).
+///
+/// The cap is part of the configuration's type, so a prover and a verifier
+/// that name the same configuration agree on it by construction, and no
+/// format field, environment variable or proof byte can move it. Callers name
+/// one instance (the prover crate's `lfm::p1_commit::P1StarkHash`); the others
+/// exist for the cap census and the tests that bind each height.
+///
+/// The transcript object is still the caller's: prove and verify with
+/// `crypto::fiat_shamir::p1_transcript::P1Transcript`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct P1StarkHashCapped<const CAP: u8>;
+
+impl<const CAP: u8> StarkHash for P1StarkHashCapped<CAP> {
+    type Batched<F>
+        = P1BatchBackend<F>
+    where
+        F: IsField + 'static,
+        FieldElement<F>: AsBytes + Sync + Send;
+
+    type Pair<F>
+        = P1PairBackend<F>
+    where
+        F: IsField + 'static,
+        FieldElement<F>: AsBytes + Sync + Send;
+
+    type Transcript = P1TranscriptHash;
+
+    const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Poseidon1;
+
+    const ARITY: usize = 4;
+
+    const ARITY4_CAP: CapPolicy = CapPolicy::Fixed(CAP);
+}
+
+/// The Poseidon1 configuration's arity is its backends', at both fields the
+/// prover commits over, and its members name its own hash as their device key.
+const _: () = {
+    type P1 = P1StarkHashCapped<0>;
+    assert!(<P1BatchBackend<GoldilocksField> as IsMerkleTreeBackend>::ARITY == P1::ARITY);
+    assert!(<P1PairBackend<GoldilocksField> as IsMerkleTreeBackend>::ARITY == P1::ARITY);
+    assert!(
+        <P1BatchBackend<math::field::extensions_goldilocks::Degree3GoldilocksExtensionField> as IsMerkleTreeBackend>::ARITY
+            == P1::ARITY
+    );
+    assert!(
+        <P1PairBackend<math::field::extensions_goldilocks::Degree3GoldilocksExtensionField> as IsMerkleTreeBackend>::ARITY
+            == P1::ARITY
+    );
+    assert!(
+        <<P1 as StarkHash>::Batched<GoldilocksField> as DeviceTreeBackend>::COMMITMENT_HASH as u8
+            == CommitmentHash::Poseidon1 as u8
+    );
+    assert!(
+        <<P1 as StarkHash>::Pair<GoldilocksField> as DeviceTreeBackend>::COMMITMENT_HASH as u8
+            == CommitmentHash::Poseidon1 as u8
+    );
+    assert!(matches!(P1::COMMITMENT_HASH, CommitmentHash::Poseidon1));
+};
+
 /// The device marker's tie-in: each configuration's members carry the
 /// constant that names the configuration's own hash, which is what makes the
 /// [`DeviceTreeBackend`] impls above true statements rather than decoration —
@@ -477,6 +582,12 @@ const _: fn() = || {
         core::marker::PhantomData::<(
             KeccakTranscriptHash,
             <KeccakStarkHash as StarkHash>::Transcript,
+        )>,
+    );
+    assert_same::<P1TranscriptHash>(
+        core::marker::PhantomData::<(
+            P1TranscriptHash,
+            <P1StarkHashCapped<0> as StarkHash>::Transcript,
         )>,
     );
 };
