@@ -577,6 +577,7 @@ mod tests {
                 program_id: &id,
                 num_public_words: layout.total(),
                 fri_final_poly_log_degree: 1,
+                statement_tag: None,
                 tables: Vec::new(),
             })
             .collect();

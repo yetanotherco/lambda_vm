@@ -155,12 +155,19 @@ impl TableVerifyShape {
 
     fn check_caps(&self) {
         assert_eq!(
+            self.sub.arity,
+            self.fri.arity(),
+            "the trace trees and the FRI layer trees are one configuration's"
+        );
+        assert_eq!(
             self.sub.trace_cap,
-            self.fri
-                .format
-                .merkle_cap
-                .height(self.num_queries, self.sub.merkle_depth),
-            "the trace trees' cap is the format's, at their depth and query count"
+            stark::merkle_caps::StarkCaps::tree_cap_height(
+                self.fri.trees.cap_policy(self.fri.format.merkle_cap),
+                self.num_queries,
+                self.sub.merkle_depth,
+                self.sub.arity,
+            ),
+            "the trace trees' cap is the configuration's, at their depth and query count"
         );
     }
 
@@ -176,6 +183,18 @@ impl TableVerifyShape {
     pub fn derive(
         air: &super::epoch::DynVmAir<'_>,
         trace_length: usize,
+    ) -> Result<(Self, Analysis), String> {
+        Self::derive_with(air, trace_length, stark::config::TreeGeometry::BINARY)
+    }
+
+    /// [`Self::derive`] for a sub-proof committed under a configuration of
+    /// `trees` (its arity and arity-4 cap, `TreeGeometry::of::<H>()`): the
+    /// tree heights and path shapes that configuration's prover lays out, and
+    /// the host's `StarkCaps` under it as the cross-check.
+    pub fn derive_with(
+        air: &super::epoch::DynVmAir<'_>,
+        trace_length: usize,
+        trees: stark::config::TreeGeometry,
     ) -> Result<(Self, Analysis), String> {
         use stark::verifier::IsStarkVerifier;
         if !trace_length.is_power_of_two() {
@@ -237,10 +256,13 @@ impl TableVerifyShape {
             merkle_depth,
             log2_lde_length,
             coset_offset: FE::from(opts.coset_offset),
-            trace_cap: opts
-                .format
-                .merkle_cap
-                .height(opts.fri_number_of_queries, merkle_depth),
+            trace_cap: stark::merkle_caps::StarkCaps::tree_cap_height(
+                trees.cap_policy(opts.format.merkle_cap),
+                opts.fri_number_of_queries,
+                merkle_depth,
+                trees.arity,
+            ),
+            arity: trees.arity,
             layout: leaf_layout,
         };
         let has_aux_trace = air.has_aux_trace();
@@ -250,7 +272,7 @@ impl TableVerifyShape {
                 num_composition_parts: num_parts,
                 boundary: boundary_terms(has_aux_trace, num_total_cols),
             },
-            fri: FriShape::for_layout(opts, log2_lde_length, leaf_layout),
+            fri: FriShape::for_layout(opts, log2_lde_length, leaf_layout).with_trees(trees),
             main_width,
             num_alpha_powers: if has_aux_trace {
                 artifact.shape.max_bus_elements as usize
@@ -263,10 +285,11 @@ impl TableVerifyShape {
 
         // The cap heights: these shapes' against the host's own `StarkCaps`, so
         // the two sides derive every tree's height and depth from one function.
-        let host = stark::merkle_caps::StarkCaps::for_options(
+        let host = stark::merkle_caps::StarkCaps::for_options_with(
             opts,
             log2_lde_length as usize,
             leaf_layout.is_one_row(),
+            trees,
         )
         .map_err(|e| format!("a format the host does not lay out: {e:?}"))?;
         let fri_agrees = host.fri.len() == shape.fri.num_committed()
@@ -758,7 +781,7 @@ pub fn query_permutations_at_rate(shape: &TableVerifyShape, rate_felts: usize) -
     let groups = shape.sub.groups().len();
     let per_query = leaf_permutations_at_rate(&shape.sub, rate_felts)
         + fri_leaf_permutations_at_rate(&shape.fri, rate_felts)
-        + groups * shape.sub.path_len()
+        + groups * shape.sub.path_permutations()
         + shape.fri.path_steps_per_query();
     shape.num_queries * per_query
 }
@@ -811,8 +834,10 @@ pub fn query_permutations_for(shape: &TableVerifyShape, hash: WrapHash) -> usize
         .sum();
     // Per committed layer: a pair leaf (six felts), or a `2^d`-value group.
     let fri_leaves = shape.fri.leaf_permutations_per_query(hash);
-    let per_query =
-        leaves + fri_leaves + groups * shape.sub.path_len() + shape.fri.path_steps_per_query();
+    let per_query = leaves
+        + fri_leaves
+        + groups * shape.sub.path_permutations()
+        + shape.fri.path_steps_per_query();
     shape.num_queries * per_query
 }
 
@@ -844,7 +869,7 @@ pub fn table_permutations_for(shape: &TableVerifyShape, hash: WrapHash) -> usize
 pub fn query_permutations(shape: &TableVerifyShape) -> usize {
     let groups = shape.sub.groups().len();
     let per_query = leaf_permutations(&shape.sub)
-        + groups * shape.sub.path_len()
+        + groups * shape.sub.path_permutations()
         + shape.fri.permutations_per_query();
     shape.num_queries * per_query
 }

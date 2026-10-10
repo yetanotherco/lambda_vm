@@ -868,6 +868,7 @@ fn the_emitted_permutation_count_meets_the_pinned_prediction() {
             coset_offset: 3,
             num_queries: queries,
             format: stark::proof::options::ProofFormat::DEFAULT,
+            trees: stark::config::TreeGeometry::BINARY,
         };
         shape.check();
         let per = marginal_fri(shape);

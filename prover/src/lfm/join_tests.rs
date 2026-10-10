@@ -160,6 +160,7 @@ pub(super) fn build_host_sub_proof(
         coset_offset: FE::from(air.options().coset_offset),
         trace_cap,
         layout: leaf_layout,
+        arity: 2,
     };
     // Query 0 of a capped tree is its owner: its path carries the cap after
     // the `D − c` siblings. The query arena takes the siblings, the caps
@@ -640,6 +641,7 @@ fn shape_for(
         coset_offset: FE::from(3u64),
         trace_cap: 0,
         layout: stark::leaf_layout::LeafLayout::RowPair,
+        arity: 2,
     }
 }
 
@@ -1931,6 +1933,7 @@ fn the_fold_layout_is_right_off_productions_constants() {
             coset_offset: 3,
             num_queries: 1,
             format: ProofFormat::DEFAULT,
+            trees: stark::config::TreeGeometry::BINARY,
         };
         shape.check();
         let got = (
@@ -1982,6 +1985,7 @@ fn the_fri_sizing_prediction() {
             coset_offset: 3,
             num_queries: queries,
             format: ProofFormat::DEFAULT,
+            trees: stark::config::TreeGeometry::BINARY,
         };
         shape.check();
         println!(
