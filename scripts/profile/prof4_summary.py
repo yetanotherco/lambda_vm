@@ -436,6 +436,17 @@ def num(v):
         return None
 
 
+# ncu picks a unit per value (a short launch reads "us", a long one "ms"): durations go to ms, frequencies to GHz
+UNIT = {"ns": 1e-6, "nsecond": 1e-6, "us": 1e-3, "usecond": 1e-3, "ms": 1.0, "msecond": 1.0, "s": 1e3, "second": 1e3,
+        "Ghz": 1.0, "GHz": 1.0, "Mhz": 1e-3, "MHz": 1e-3, "hz": 1e-9, "Hz": 1e-9}
+
+
+def scaled(v, unit, name):
+    if v is None or name not in ("Duration", "SM Frequency", "gpu__time_duration.sum"):
+        return v
+    return v * UNIT.get(unit.strip(), 1.0)
+
+
 def cmd_ncu(a):
     by = defaultdict(dict)
     meta = {}
@@ -445,7 +456,7 @@ def cmd_ncu(a):
             if i is None:
                 continue
             meta.setdefault(i, (r.get("Kernel Name", "?"), r.get("Grid Size", "?").replace(" ", ""), r.get("Block Size", "?").replace(" ", "")))
-            v = num(r.get("Metric Value", ""))
+            v = scaled(num(r.get("Metric Value", "")), r.get("Metric Unit", ""), r.get("Metric Name", ""))
             if v is not None:
                 by[i][(r.get("Section Name", ""), r.get("Metric Name", ""))] = v
     rows = []
@@ -462,8 +473,8 @@ def cmd_ncu(a):
         sm, dram, l2 = vals[2], vals[4], vals[5]
         if sm is None:
             bound = "-"
-        elif sm >= 80:
-            bound = "compute roof"
+        elif sm >= 80 or (top_pipe[1] or 0) >= 80:
+            bound = f"compute roof ({top_pipe[0]} pipe)" if (top_pipe[1] or 0) >= 80 else "compute roof"
         elif max(dram or 0, l2 or 0) >= 80:
             bound = "memory roof"
         elif max(sm, dram or 0, l2 or 0) < 60:
@@ -583,11 +594,14 @@ def cmd_selftest(_):
                         ("Command line profiler metrics", "smsp__average_warps_issue_stalled_math_pipe_throttle_per_issue_active.ratio", "4.26"),
                         ("Command line profiler metrics", "dram__bytes_read.sum", "n/a")]:
             w.writerow(["0", "p1w16_zleaves_base_coset_v2", "(128, 1, 1)", "(65536, 1, 1)", s, n, "", v])
+        w.writerow(["1", "gkr_round_gruen", "(256, 1, 1)", "(512, 1, 1)", "GPU Speed Of Light Throughput", "Duration", "us", "866.27"])
+        w.writerow(["1", "gkr_round_gruen", "(256, 1, 1)", "(512, 1, 1)", "GPU Speed Of Light Throughput", "SM Frequency", "Mhz", "2010"])
     cmd_ncu(argparse.Namespace(csv=f"{t}/ncu.csv", pass_="w01", out=f"{t}/ncu.tsv"))
     with open(f"{t}/ncu.tsv") as f:
         nr = list(csv.DictReader(f, delimiter="\t"))
     ok.append(("ncu: duration, SM %, top pipe fmaheavy, top stall math_pipe_throttle, compute roof", nr and nr[0]["duration_ms"] == "188.86"
-               and nr[0]["top_pipe"] == "fmaheavy" and nr[0]["top_stall"] == "math_pipe_throttle" and nr[0]["bound"] == "compute roof"))
+               and nr[0]["top_pipe"] == "fmaheavy" and nr[0]["top_stall"] == "math_pipe_throttle" and nr[0]["bound"] == "compute roof (fmaheavy pipe)"))
+    ok.append(("ncu units: 866.27 us reads 0.87 ms, 2010 MHz reads 2.01 GHz", len(nr) == 2 and nr[1]["duration_ms"] == "0.87" and nr[1]["sm_ghz"] == "2.01"))
     bad = [n for n, good in ok if not good]
     for n, good in ok:
         print(f"  {'ok ' if good else 'BAD'} {n}")
