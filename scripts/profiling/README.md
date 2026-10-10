@@ -126,6 +126,7 @@ Useful prover knobs for A/B experiments (pre-existing, see plan §11):
 | var | effect |
 |---|---|
 | `LAMBDA_VM_NO_GPU_GRIND=1` | force the round-4 proof-of-work nonce search onto the CPU (presence-based, like `LAMBDA_VM_NO_GPU_LOGUP`). The production escape hatch if the device search ever misbehaves; also the way to A/B the grind on its own. Below grinding factor 12 the GPU path declines regardless, so wrap and recursion proves (factor 1) never use it |
+| `LAMBDA_VM_LDE_LEGACY=1` | send every device LDE back to the legacy per-level pipeline (row-major commits: one butterfly level per launch plus the in-place transpose; batched entry points: the per-level batched kernels; the WHIR commit's encoding: `lift_spread` plus the tiled NTT and its cached twiddle table) instead of the column-major engine (`math_cuda::lde_cm`). Same values, roots and proofs; the escape hatch and the way to A/B the engine. The process prints `[gpu] LDE: …` once, naming the pipeline it ran |
 
 Residency and diagnostic knobs:
 

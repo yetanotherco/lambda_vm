@@ -1,0 +1,33 @@
+[package]
+name = "multilinear"
+description = "Multilinear extensions, sumcheck and zerocheck over the Boolean hypercube"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+# Same feature set as `stark`: the proofs this crate produces have to serialize
+# in the same format the univariate ones do.
+math = { path = "../math", features = [
+    "std",
+    "lambdaworks-serde-binary",
+    "rkyv",
+] }
+crypto = { path = "../crypto", features = ["std", "serde", "rkyv"] }
+thiserror = "1.0.38"
+serde = { version = "1.0", features = ["derive"] }
+# pointer_width_64: proof-format pointer width — see prover/Cargo.toml.
+rkyv = { version = "0.8.10", default-features = false, features = [
+    "alloc",
+    "bytecheck",
+    "aligned",
+    "pointer_width_64",
+] }
+rayon = { version = "1.8.0", optional = true }
+# The device path for committing and folding — only linked when `cuda` is on.
+math-cuda = { path = "../math-cuda", optional = true }
+
+[features]
+parallel = ["dep:rayon", "math/parallel", "crypto/parallel"]
+# The device path: the grind through `crypto`, the kernels through `math-cuda`.
+cuda = ["crypto/cuda", "dep:math-cuda"]

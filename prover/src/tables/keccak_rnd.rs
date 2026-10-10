@@ -37,6 +37,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 
 // =========================================================================
@@ -247,189 +248,247 @@ pub fn generate_keccak_rnd_trace(
     ops: &[KeccakRoundOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n_rows = (ops.len() * 24).next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(n_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_keccak_rnd_rows(ops, 0, n_rows)
+}
 
-    for (op_idx, op) in ops.iter().enumerate() {
-        // Execute round-by-round, tracking the state
-        let mut state = op.input;
+/// Rows `skip..skip + rows` of the table [`generate_keccak_rnd_trace`] builds
+/// from `ops` — the same rows, zero past the ops' last — as a table of `rows`
+/// rows. Each op's 24 rows depend on that op alone, so a slice of the table is
+/// the slice's ops generated with their row offset: a KECCAK_RND chunk can be
+/// built from the ops that reach it, before the run's last op exists.
+pub fn generate_keccak_rnd_rows(
+    ops: &[KeccakRoundOperation],
+    skip: usize,
+    rows: usize,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_keccak_rnd_rows_as(ops, skip, rows, TraceForm::Wide)
+}
 
-        for round in 0..24 {
-            let row_idx = op_idx * 24 + round;
+/// The widths KECCAK_RND traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
 
-            // Timestamp & round
-            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
-            table.set_u64(row_idx, cols::ROUND, round as u64);
+/// Whether [`generate_keccak_rnd_rows_as`] in `form` writes its rows packed,
+/// with no 64-bit table on the way: in [`TraceForm::Narrow`] once an earlier
+/// KECCAK_RND trace of this process left its widths (`tables::gpack`).
+pub(crate) fn rows_written_packed(form: TraceForm) -> bool {
+    matches!(
+        super::gpack::Plan::new(form, &WIDTHS, cols::NUM_COLUMNS),
+        super::gpack::Plan::Write(_)
+    )
+}
 
-            // start = current state as bytes
-            for x in 0..5 {
-                for y in 0..5 {
-                    let lane = state[x + 5 * y];
-                    table.set_dword_bl(row_idx, cols::start(x, y, 0), lane);
-                }
-            }
-
-            // === θ (theta) ===
-            // Column parities: C[x] = XOR of all 5 lanes in column x
-            // Computed as a chain: Cxz[x][0] = start[x,0] XOR start[x,1]
-            //                      Cxz[x][k] = Cxz[x][k-1] XOR start[x,k+1]
-            let mut c_bytes = [[0u8; 8]; 5]; // C[x][byte] = final parity
-            let mut cxz = [[[0u8; 8]; 4]; 5]; // Cxz[x][stage][byte]
-            for x in 0..5 {
-                // Stage 0: XOR(start[x,0], start[x,1])
-                for b in 0..8 {
-                    let v0 = byte_of(state[x], b);
-                    let v1 = byte_of(state[x + 5], b);
-                    cxz[x][0][b] = v0 ^ v1;
-                }
-                table.set_bytes(row_idx, cols::cxz(x, 0, 0), &cxz[x][0]);
-
-                // Stages 1..3: XOR(Cxz[x][k-1], start[x, k+1])
-                for stage in 1..4 {
-                    let y = stage + 1;
-                    for b in 0..8 {
-                        let prev = cxz[x][stage - 1][b];
-                        let sv = byte_of(state[x + 5 * y], b);
-                        cxz[x][stage][b] = prev ^ sv;
-                    }
-                    table.set_bytes(row_idx, cols::cxz(x, stage, 0), &cxz[x][stage]);
-                }
-                c_bytes[x] = cxz[x][3];
-            }
-
-            // Rotate C left by 1 bit using HWSL decomposition.
-            // HWSL shifts each halfword (u16) independently. For shift=1, the
-            // carry is a single bit (top bit of the halfword); we store it in
-            // one column per halfword (Cxz_right[x][hw], spec d75944ee).
-            //   rotated_Cxz[z] = Cxz_left[z] + (1 - z%2) * Cxz_right[(z/2 - 1) mod 4]
-            let mut cxz_left_bytes = [[0u8; 8]; 5];
-            let mut cxz_right_bits = [[0u8; 4]; 5];
-            let mut rotated_c = [[0u8; 8]; 5];
-            for x in 0..5 {
-                for hw in 0..4 {
-                    let lo = c_bytes[x][hw * 2] as u16;
-                    let hi = c_bytes[x][hw * 2 + 1] as u16;
-                    let halfword = lo | (hi << 8);
-                    let (shifted, carry) = hwsl(halfword, 1);
-                    cxz_left_bytes[x][hw * 2] = (shifted & 0xFF) as u8;
-                    cxz_left_bytes[x][hw * 2 + 1] = (shifted >> 8) as u8;
-                    // For shift=1, carry ∈ {0, 1}.
-                    cxz_right_bits[x][hw] = carry as u8;
-                }
-                table.set_bytes(row_idx, cols::cxz_left(x, 0), &cxz_left_bytes[x]);
-                table.set_bytes(row_idx, cols::cxz_right_bit(x, 0), &cxz_right_bits[x]);
-
-                // Reconstruct: left[b] + (1 - b%2) * right[(b/2 + 3) mod 4]
-                for b in 0..8 {
-                    let right_contribution = match cols::cxz_right_bit_for_byte(b) {
-                        Some(hw) => cxz_right_bits[x][hw],
-                        None => 0,
-                    };
-                    rotated_c[x][b] = cxz_left_bytes[x][b].wrapping_add(right_contribution);
-                }
-            }
-
-            // D[x] = C[(x-1)%5] XOR rotated_C[(x+1)%5]
-            let mut d_bytes = [[0u8; 8]; 5];
-            for x in 0..5 {
-                for b in 0..8 {
-                    let val = c_bytes[(x + 4) % 5][b] ^ rotated_c[(x + 1) % 5][b];
-                    d_bytes[x][b] = val;
-                }
-                table.set_bytes(row_idx, cols::dxz(x, 0), &d_bytes[x]);
-            }
-
-            // theta[x][y] = start[x][y] XOR D[x]
-            let mut theta_lanes = [0u64; 25];
-            for x in 0..5 {
-                for y in 0..5 {
-                    let lane = state[x + 5 * y];
-                    let mut d_lane = 0u64;
-                    for b in 0..8 {
-                        d_lane |= (d_bytes[x][b] as u64) << (b * 8);
-                    }
-                    theta_lanes[x + 5 * y] = lane ^ d_lane;
-                    table.set_dword_bl(row_idx, cols::theta(x, y, 0), theta_lanes[x + 5 * y]);
-                }
-            }
-
-            // === ρ (rho) ===
-            // For each lane, rotate theta[x][y] by KECCAK_RHO[x][y] bits.
-            // Decompose rotation as: rnc (nibble, 0..15) + 16*rbc[0] + 32*rbc[1].
-            // rnc and rbc are inlined as compile-time constants per spec
-            // [[variables.constant]]; only HWSL outputs are stored in the trace.
-            for x in 0..5 {
-                for y in 0..5 {
-                    let rho_offset = KECCAK_RHO[x][y] as usize;
-                    let rnc_val = (rho_offset % 16) as u8;
-                    let theta_lane = theta_lanes[x + 5 * y];
-                    let mut rot_left_bytes = [0u8; 8];
-                    let mut rot_right_bytes = [0u8; 8];
-                    for hw in 0..4 {
-                        let halfword = ((theta_lane >> (hw * 16)) & 0xFFFF) as u16;
-                        let (shifted, carry) = hwsl(halfword, rnc_val);
-                        rot_left_bytes[hw * 2] = (shifted & 0xFF) as u8;
-                        rot_left_bytes[hw * 2 + 1] = (shifted >> 8) as u8;
-                        rot_right_bytes[hw * 2] = (carry & 0xFF) as u8;
-                        rot_right_bytes[hw * 2 + 1] = (carry >> 8) as u8;
-                    }
-                    table.set_bytes(row_idx, cols::rot_left(x, y, 0), &rot_left_bytes);
-                    table.set_bytes(row_idx, cols::rot_right(x, y, 0), &rot_right_bytes);
-                }
-            }
-
-            // === π (pi) ===
-            // pi[x][y] = rho[(x+3y)%5][x] where rho is the rotated theta.
-            // pi is a spec [[variables.virtual]] — not stored as trace columns.
-            // It's reconstructed inline in chi bus interactions as
-            //   pi[x][y][z] = rot_left[sx,sy,l_byte] + rot_right[sx,sy,r_byte]
-            // with (sx, sy) = ((x+3y)%5, x) and (l_byte, r_byte) resolved from
-            // the compile-time rbc constant. pi_lanes is still computed here
-            // for the chi step below.
-            let mut pi_lanes = [0u64; 25];
-            for x in 0..5 {
-                for y in 0..5 {
-                    let rotated = theta_lanes[x + 5 * y].rotate_left(KECCAK_RHO[x][y]);
-                    let dst_x = y;
-                    let dst_y = (2 * x + 3 * y) % 5;
-                    pi_lanes[dst_x + 5 * dst_y] = rotated;
-                }
-            }
-
-            // === χ (chi) ===
-            let mut chi_lanes = [0u64; 25];
-            for x in 0..5 {
-                for y in 0..5 {
-                    let not_next = !pi_lanes[(x + 1) % 5 + 5 * y];
-                    let next2 = pi_lanes[(x + 2) % 5 + 5 * y];
-                    let and_val = not_next & next2;
-                    chi_lanes[x + 5 * y] = pi_lanes[x + 5 * y] ^ and_val;
-                    table.set_dword_bl(row_idx, cols::chi_ands(x, y, 0), and_val);
-                    table.set_dword_bl(row_idx, cols::chi(x, y, 0), chi_lanes[x + 5 * y]);
-                }
-            }
-
-            // === ι (iota) ===
-            let rc_val = KECCAK_RC[round];
-            let iota_lane = chi_lanes[0] ^ rc_val;
-            table.set_dword_bl(row_idx, cols::rc(0), rc_val);
-            table.set_dword_bl(row_idx, cols::iota(0), iota_lane);
-
-            // Update state for next round
-            chi_lanes[0] = iota_lane;
-            state = chi_lanes;
-
-            // mu = 1 (real row)
-            table.set_fe(row_idx, cols::MU, FE::one());
-        }
-    }
-
+/// [`generate_keccak_rnd_rows`] in `form` (`tables::gpack`).
+pub fn generate_keccak_rnd_rows_as(
+    ops: &[KeccakRoundOperation],
+    skip: usize,
+    rows: usize,
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     // Padding rows have mu=0 and all zeros (default)
-    trace
+    generate_main!(form, &WIDTHS, rows, cols::NUM_COLUMNS, |table| {
+        for (op_idx, op) in ops.iter().enumerate() {
+            let first = op_idx * 24;
+            if first + 24 <= skip || first >= skip + rows {
+                continue;
+            }
+            if first >= skip && first + 24 <= skip + rows {
+                fill_op(table, op, first - skip);
+            } else {
+                // An op the slice cuts: its 24 rows on the side, the part in
+                // range copied over.
+                let mut scratch = TraceTable::<GoldilocksField, GoldilocksExtension>::new_main(
+                    crate::tables::types::zeroed_fe_vec(24 * cols::NUM_COLUMNS),
+                    cols::NUM_COLUMNS,
+                    1,
+                );
+                fill_op(&mut scratch.main_table, op, 0);
+                for round in 0..24 {
+                    let row = first + round;
+                    if row >= skip && row < skip + rows {
+                        for col in 0..cols::NUM_COLUMNS {
+                            table.set_fe(row - skip, col, *scratch.main_table.get(round, col));
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// One op's 24 rows, from row `first_row` on.
+#[allow(clippy::needless_range_loop)]
+fn fill_op<T: VmTable>(table: &mut T, op: &KeccakRoundOperation, first_row: usize) {
+    // Execute round-by-round, tracking the state
+    let mut state = op.input;
+
+    for round in 0..24 {
+        let row_idx = first_row + round;
+
+        // Timestamp & round
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+        table.set_u64(row_idx, cols::ROUND, round as u64);
+
+        // start = current state as bytes
+        for x in 0..5 {
+            for y in 0..5 {
+                let lane = state[x + 5 * y];
+                table.set_dword_bl(row_idx, cols::start(x, y, 0), lane);
+            }
+        }
+
+        // === θ (theta) ===
+        // Column parities: C[x] = XOR of all 5 lanes in column x
+        // Computed as a chain: Cxz[x][0] = start[x,0] XOR start[x,1]
+        //                      Cxz[x][k] = Cxz[x][k-1] XOR start[x,k+1]
+        let mut c_bytes = [[0u8; 8]; 5]; // C[x][byte] = final parity
+        let mut cxz = [[[0u8; 8]; 4]; 5]; // Cxz[x][stage][byte]
+        for x in 0..5 {
+            // Stage 0: XOR(start[x,0], start[x,1])
+            for b in 0..8 {
+                let v0 = byte_of(state[x], b);
+                let v1 = byte_of(state[x + 5], b);
+                cxz[x][0][b] = v0 ^ v1;
+            }
+            table.set_bytes(row_idx, cols::cxz(x, 0, 0), &cxz[x][0]);
+
+            // Stages 1..3: XOR(Cxz[x][k-1], start[x, k+1])
+            for stage in 1..4 {
+                let y = stage + 1;
+                for b in 0..8 {
+                    let prev = cxz[x][stage - 1][b];
+                    let sv = byte_of(state[x + 5 * y], b);
+                    cxz[x][stage][b] = prev ^ sv;
+                }
+                table.set_bytes(row_idx, cols::cxz(x, stage, 0), &cxz[x][stage]);
+            }
+            c_bytes[x] = cxz[x][3];
+        }
+
+        // Rotate C left by 1 bit using HWSL decomposition.
+        // HWSL shifts each halfword (u16) independently. For shift=1, the
+        // carry is a single bit (top bit of the halfword); we store it in
+        // one column per halfword (Cxz_right[x][hw], spec d75944ee).
+        //   rotated_Cxz[z] = Cxz_left[z] + (1 - z%2) * Cxz_right[(z/2 - 1) mod 4]
+        let mut cxz_left_bytes = [[0u8; 8]; 5];
+        let mut cxz_right_bits = [[0u8; 4]; 5];
+        let mut rotated_c = [[0u8; 8]; 5];
+        for x in 0..5 {
+            for hw in 0..4 {
+                let lo = c_bytes[x][hw * 2] as u16;
+                let hi = c_bytes[x][hw * 2 + 1] as u16;
+                let halfword = lo | (hi << 8);
+                let (shifted, carry) = hwsl(halfword, 1);
+                cxz_left_bytes[x][hw * 2] = (shifted & 0xFF) as u8;
+                cxz_left_bytes[x][hw * 2 + 1] = (shifted >> 8) as u8;
+                // For shift=1, carry ∈ {0, 1}.
+                cxz_right_bits[x][hw] = carry as u8;
+            }
+            table.set_bytes(row_idx, cols::cxz_left(x, 0), &cxz_left_bytes[x]);
+            table.set_bytes(row_idx, cols::cxz_right_bit(x, 0), &cxz_right_bits[x]);
+
+            // Reconstruct: left[b] + (1 - b%2) * right[(b/2 + 3) mod 4]
+            for b in 0..8 {
+                let right_contribution = match cols::cxz_right_bit_for_byte(b) {
+                    Some(hw) => cxz_right_bits[x][hw],
+                    None => 0,
+                };
+                rotated_c[x][b] = cxz_left_bytes[x][b].wrapping_add(right_contribution);
+            }
+        }
+
+        // D[x] = C[(x-1)%5] XOR rotated_C[(x+1)%5]
+        let mut d_bytes = [[0u8; 8]; 5];
+        for x in 0..5 {
+            for b in 0..8 {
+                let val = c_bytes[(x + 4) % 5][b] ^ rotated_c[(x + 1) % 5][b];
+                d_bytes[x][b] = val;
+            }
+            table.set_bytes(row_idx, cols::dxz(x, 0), &d_bytes[x]);
+        }
+
+        // theta[x][y] = start[x][y] XOR D[x]
+        let mut theta_lanes = [0u64; 25];
+        for x in 0..5 {
+            for y in 0..5 {
+                let lane = state[x + 5 * y];
+                let mut d_lane = 0u64;
+                for b in 0..8 {
+                    d_lane |= (d_bytes[x][b] as u64) << (b * 8);
+                }
+                theta_lanes[x + 5 * y] = lane ^ d_lane;
+                table.set_dword_bl(row_idx, cols::theta(x, y, 0), theta_lanes[x + 5 * y]);
+            }
+        }
+
+        // === ρ (rho) ===
+        // For each lane, rotate theta[x][y] by KECCAK_RHO[x][y] bits.
+        // Decompose rotation as: rnc (nibble, 0..15) + 16*rbc[0] + 32*rbc[1].
+        // rnc and rbc are inlined as compile-time constants per spec
+        // [[variables.constant]]; only HWSL outputs are stored in the trace.
+        for x in 0..5 {
+            for y in 0..5 {
+                let rho_offset = KECCAK_RHO[x][y] as usize;
+                let rnc_val = (rho_offset % 16) as u8;
+                let theta_lane = theta_lanes[x + 5 * y];
+                let mut rot_left_bytes = [0u8; 8];
+                let mut rot_right_bytes = [0u8; 8];
+                for hw in 0..4 {
+                    let halfword = ((theta_lane >> (hw * 16)) & 0xFFFF) as u16;
+                    let (shifted, carry) = hwsl(halfword, rnc_val);
+                    rot_left_bytes[hw * 2] = (shifted & 0xFF) as u8;
+                    rot_left_bytes[hw * 2 + 1] = (shifted >> 8) as u8;
+                    rot_right_bytes[hw * 2] = (carry & 0xFF) as u8;
+                    rot_right_bytes[hw * 2 + 1] = (carry >> 8) as u8;
+                }
+                table.set_bytes(row_idx, cols::rot_left(x, y, 0), &rot_left_bytes);
+                table.set_bytes(row_idx, cols::rot_right(x, y, 0), &rot_right_bytes);
+            }
+        }
+
+        // === π (pi) ===
+        // pi[x][y] = rho[(x+3y)%5][x] where rho is the rotated theta.
+        // pi is a spec [[variables.virtual]] — not stored as trace columns.
+        // It's reconstructed inline in chi bus interactions as
+        //   pi[x][y][z] = rot_left[sx,sy,l_byte] + rot_right[sx,sy,r_byte]
+        // with (sx, sy) = ((x+3y)%5, x) and (l_byte, r_byte) resolved from
+        // the compile-time rbc constant. pi_lanes is still computed here
+        // for the chi step below.
+        let mut pi_lanes = [0u64; 25];
+        for x in 0..5 {
+            for y in 0..5 {
+                let rotated = theta_lanes[x + 5 * y].rotate_left(KECCAK_RHO[x][y]);
+                let dst_x = y;
+                let dst_y = (2 * x + 3 * y) % 5;
+                pi_lanes[dst_x + 5 * dst_y] = rotated;
+            }
+        }
+
+        // === χ (chi) ===
+        let mut chi_lanes = [0u64; 25];
+        for x in 0..5 {
+            for y in 0..5 {
+                let not_next = !pi_lanes[(x + 1) % 5 + 5 * y];
+                let next2 = pi_lanes[(x + 2) % 5 + 5 * y];
+                let and_val = not_next & next2;
+                chi_lanes[x + 5 * y] = pi_lanes[x + 5 * y] ^ and_val;
+                table.set_dword_bl(row_idx, cols::chi_ands(x, y, 0), and_val);
+                table.set_dword_bl(row_idx, cols::chi(x, y, 0), chi_lanes[x + 5 * y]);
+            }
+        }
+
+        // === ι (iota) ===
+        let rc_val = KECCAK_RC[round];
+        let iota_lane = chi_lanes[0] ^ rc_val;
+        table.set_dword_bl(row_idx, cols::rc(0), rc_val);
+        table.set_dword_bl(row_idx, cols::iota(0), iota_lane);
+
+        // Update state for next round
+        chi_lanes[0] = iota_lane;
+        state = chi_lanes;
+
+        // mu = 1 (real row)
+        table.set_fe(row_idx, cols::MU, FE::one());
+    }
 }
 
 // =========================================================================

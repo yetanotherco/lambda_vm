@@ -29,8 +29,9 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use std::collections::HashMap;
+use super::trace_hash::{OpMap, trace_hash_state};
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
 
 // =========================================================================
@@ -159,53 +160,57 @@ impl LtOperation {
 pub fn generate_lt_trace(
     operations: &[LtOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_lt_trace_as(operations, TraceForm::Wide)
+}
+
+/// The widths LT traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_lt_trace`] in `form` (`tables::gpack`).
+pub fn generate_lt_trace_as(
+    operations: &[LtOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     // Deduplicate operations: (lhs, rhs, signed) -> multiplicity
-    let mut op_map: HashMap<LtOperation, u64> = HashMap::new();
+    let mut op_map: OpMap<LtOperation, u64> = OpMap::with_hasher(trace_hash_state());
     for op in operations {
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
+            // Store input columns
+            table.set_dword_hhw(row_idx, cols::LHS_0, op.lhs);
+            table.set_dword_hhw(row_idx, cols::RHS_0, op.rhs);
+            table.set_bool(row_idx, cols::SIGNED, op.signed);
 
-    for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
-        // Store input columns
-        table.set_dword_hhw(row_idx, cols::LHS_0, op.lhs);
-        table.set_dword_hhw(row_idx, cols::RHS_0, op.rhs);
-        table.set_bool(row_idx, cols::SIGNED, op.signed);
+            // Compute lt result
+            let lt = op.compute_lt();
+            table.set_bool(row_idx, cols::LT, lt);
 
-        // Compute lt result
-        let lt = op.compute_lt();
-        table.set_bool(row_idx, cols::LT, lt);
+            // Compute lhs_sub_rhs = lhs - rhs (wrapping)
+            // Note: We compute this as a 64-bit wrapping subtraction
+            let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
 
-        // Compute lhs_sub_rhs = lhs - rhs (wrapping)
-        // Note: We compute this as a 64-bit wrapping subtraction
-        let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
+            // Store lhs_sub_rhs as DWordHL: [Half, Half, Half, Half]
+            table.set_dword_hl(row_idx, cols::LHS_SUB_RHS_0, lhs_sub_rhs);
 
-        // Store lhs_sub_rhs as DWordHL: [Half, Half, Half, Half]
-        table.set_dword_hl(row_idx, cols::LHS_SUB_RHS_0, lhs_sub_rhs);
+            // Compute MSBs (bit 63 of each value)
+            let lhs_msb = (op.lhs >> 63) & 1;
+            let rhs_msb = (op.rhs >> 63) & 1;
+            table.set_u64(row_idx, cols::LHS_MSB, lhs_msb);
+            table.set_u64(row_idx, cols::RHS_MSB, rhs_msb);
 
-        // Compute MSBs (bit 63 of each value)
-        let lhs_msb = (op.lhs >> 63) & 1;
-        let rhs_msb = (op.rhs >> 63) & 1;
-        table.set_u64(row_idx, cols::LHS_MSB, lhs_msb);
-        table.set_u64(row_idx, cols::RHS_MSB, rhs_msb);
+            // ALU-bus fields: invert + the inverted output.
+            table.set_bool(row_idx, cols::INVERT, op.invert);
+            table.set_bool(row_idx, cols::OUT, op.compute_out());
 
-        // ALU-bus fields: invert + the inverted output.
-        table.set_bool(row_idx, cols::INVERT, op.invert);
-        table.set_bool(row_idx, cols::OUT, op.compute_out());
-
-        // All LT lookups go through the unified ALU bus → single multiplicity.
-        table.set_u64(row_idx, cols::MU, *multiplicity);
-    }
-
-    trace
+            // All LT lookups go through the unified ALU bus → single multiplicity.
+            table.set_u64(row_idx, cols::MU, *multiplicity);
+        }
+    })
 }
 
 // =========================================================================

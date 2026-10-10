@@ -1183,6 +1183,13 @@ fn test_count_recursion_hashes() {
     // keccak_permute census (guest cost) measured for the standard <preset> proof;
     // `perms` here matches it when this test verifies that same proof (it is the
     // env-configurable dump, so a different workload legitimately differs).
+    //
+    // ⚠ These three numbers were measured BEFORE the per-table lineage merged:
+    // the statement encoding gained seven counts and the accelerator tables stop
+    // being always-on, so the proof this verifies is not the one they were taken
+    // from and a mismatch here is expected rather than a defect. The note below
+    // is a print, not a gate, which is why the merge does not redden this test —
+    // re-measure them on the merged tip before treating any of them as a pin.
     let census = match preset.name() {
         "min" => Some(3_595u64),
         "blowup2" => Some(448_737),

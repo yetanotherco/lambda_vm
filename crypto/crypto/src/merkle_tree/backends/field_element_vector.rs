@@ -1,7 +1,7 @@
 use core::marker::PhantomData;
 
 use crate::hash::poseidon::Poseidon;
-use crate::merkle_tree::traits::IsMerkleTreeBackend;
+use crate::merkle_tree::traits::{IsLeafHasher, IsMerkleTreeBackend, IsStreamingLeafBackend};
 use alloc::vec::Vec;
 use digest::{Digest, Output};
 use math::{
@@ -9,6 +9,8 @@ use math::{
     traits::AsBytes,
 };
 
+#[cfg(target_arch = "riscv64")]
+use crate::hash::blake3::chain::{Blake3Chain, blake3_parent};
 #[cfg(target_arch = "riscv64")]
 use crate::hash::platform_keccak::PlatformKeccak256;
 #[cfg(target_arch = "riscv64")]
@@ -87,6 +89,28 @@ fn hash_new_parent_bytes<D: Digest + 'static, const NUM_BYTES: usize>(
         let l: &[u8; 32] = left[..].try_into().unwrap();
         let r: &[u8; 32] = right[..].try_into().unwrap();
         let hash = lambda_vm_syscalls::keccak::keccak256_pair(l, r);
+        let mut result = [0u8; NUM_BYTES];
+        result.copy_from_slice(&hash);
+        return result;
+    }
+
+    // The BLAKE3 twin of the branch above, and it is the same trade: a 64-byte
+    // parent is ONE compression (P2), so the sponge around it is pure plumbing.
+    // In-guest that plumbing measured ~55% of a 64-byte hash — ~556 cycles for
+    // ~248 of compression — and a Merkle parent is the shape every FRI query
+    // path step is made of.
+    //
+    // Keyed on the CONCRETE digest, exactly like keccak's: `Blake3Chain` is the
+    // type `BatchBlake3Backend`/`PairBlake3Backend` instantiate, so no other
+    // digest can fall into this branch. `blake3_parent` goes through
+    // `chain.rs`'s single `compress_block` dispatch, so this is the accelerator
+    // ecall on a guest that has it and the software path otherwise — one
+    // framing, not a second transcription.
+    #[cfg(target_arch = "riscv64")]
+    if NUM_BYTES == 32 && TypeId::of::<D>() == TypeId::of::<Blake3Chain>() {
+        let l: &[u8; 32] = left[..].try_into().unwrap();
+        let r: &[u8; 32] = right[..].try_into().unwrap();
+        let hash = blake3_parent(l, r);
         let mut result = [0u8; NUM_BYTES];
         result.copy_from_slice(&hash);
         return result;
@@ -206,6 +230,153 @@ where
 
     fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
         hash_new_parent_bytes::<D, NUM_BYTES>(left, right)
+    }
+}
+
+/// Exposes the streaming leaf routes to callers that reach this backend through
+/// a commitment configuration rather than by name. Both bodies go through
+/// [`hash_streamed`], which is where the absorbed byte layout is defined, so
+/// they agree with `hash_data` by construction.
+impl<F, D: Digest + Send + 'static, const NUM_BYTES: usize> IsStreamingLeafBackend<F>
+    for FieldElementVectorBackend<F, D, NUM_BYTES>
+where
+    F: IsField,
+    FieldElement<F>: AsBytes,
+    [u8; NUM_BYTES]: From<Output<D>>,
+    Vec<FieldElement<F>>: Sync + Send,
+{
+    fn hash_bytes(data: &[u8]) -> [u8; NUM_BYTES] {
+        hash_streamed::<D, NUM_BYTES>(|sink| sink(data))
+    }
+
+    fn hash_data_from_slices(a: &[FieldElement<F>], b: &[FieldElement<F>]) -> [u8; NUM_BYTES] {
+        // A size threshold below which this streams straight through was tried
+        // and MEASURED NEUTRAL-TO-WORSE (963.56M vs 963.28M cycles on a blowup8
+        // verify, with `verify_fri` unmoved to the cycle). The 6.9M `verify_fri`
+        // rise that this change costs is NOT the staging buffer — gating the
+        // buffer away does not recover it — so it is not worth a branch here.
+        // Do not re-add one without a measurement.
+        hash_streamed::<D, NUM_BYTES>(|sink| {
+            let mut stage = LeafStage::new();
+            for element in a.iter().chain(b.iter()) {
+                element.stream_bytes(&mut |bytes| stage.push(bytes, sink));
+            }
+            stage.flush(sink);
+        })
+    }
+
+    type LeafHasher = DigestLeafHasher<F, D, NUM_BYTES>;
+
+    fn leaf_hasher() -> Self::LeafHasher {
+        DigestLeafHasher {
+            hasher: D::new(),
+            phantom: PhantomData,
+        }
+    }
+}
+
+/// [`IsLeafHasher`] over the same digest the one-shot routes use.
+///
+/// The split-invariance the trait demands is inherited rather than argued:
+/// `hash_streamed` opens a fresh `D`, feeds it every element's `stream_bytes`
+/// and finalizes, with no length prefix, padding or framing of its own — so
+/// absorbing the same elements across several `update` calls presents `D` with
+/// the identical byte stream. There is no place for a split to show.
+///
+/// This is a PROVER-side construct: the guest verifier authenticates leaves it
+/// receives whole, through `hash_data_from_slices`. That is why this does not
+/// carry `hash_streamed`'s riscv64 syscall-sponge fast path — it would be dead
+/// code on the only target that has it.
+pub struct DigestLeafHasher<F, D: Digest, const NUM_BYTES: usize> {
+    hasher: D,
+    /// `fn() -> F` rather than `F`: the field is a type-level label here, never a
+    /// value, and the function-pointer form is unconditionally `Send`/`Sync`. The
+    /// bare `PhantomData<F>` would make every leaf hasher's thread-safety hinge on
+    /// a marker type nobody ever moves.
+    phantom: PhantomData<fn() -> F>,
+}
+
+impl<F, D: Digest, const NUM_BYTES: usize> IsLeafHasher<F> for DigestLeafHasher<F, D, NUM_BYTES>
+where
+    F: IsField,
+    FieldElement<F>: AsBytes,
+    [u8; NUM_BYTES]: From<Output<D>>,
+{
+    type Node = [u8; NUM_BYTES];
+
+    fn update(&mut self, data: &[FieldElement<F>]) {
+        for element in data {
+            element.stream_bytes(&mut |bytes| self.hasher.update(bytes));
+        }
+    }
+
+    fn finalize(self) -> [u8; NUM_BYTES] {
+        let mut result = [0u8; NUM_BYTES];
+        result.copy_from_slice(&self.hasher.finalize());
+        result
+    }
+}
+
+/// Bytes of the leaf staging buffer. A multiple of the BLAKE3 block so a full
+/// flush is a whole number of blocks, and large enough that the run reaching the
+/// hasher is worth batching — 16 blocks.
+const LEAF_STAGE_BYTES: usize = 1024;
+
+/// Coalesces a leaf's field elements into large aligned runs before they reach
+/// the hasher.
+///
+/// ★ Why this exists. A leaf arrives one field element at a time — eight bytes
+/// per `stream_bytes` call — so the hasher only ever saw eight bytes at a time,
+/// and `Blake3Chain`'s bulk-absorb path (which needs more than one block in hand
+/// to batch anything) could never engage. The leaf therefore paid one ecall and
+/// one 112-byte marshal per 64 bytes, which is the cost the absorb ecall exists
+/// to remove and, measured, the dominant term in a real in-guest verify.
+///
+/// The staging buffer is `align(8)` because the accelerator reads the message as
+/// doublewords and declines an unaligned slice — an unaligned buffer here would
+/// silently give back the per-block path with no diagnostic.
+///
+/// **This cannot change any digest.** The same bytes reach the hasher in the
+/// same order; only the call boundaries move, and `Blake3Chain::update` is
+/// split-invariant by construction (`streaming_splits_agree_with_one_shot`
+/// checks every split of every length through two blocks). It is also hash-
+/// agnostic: keccak's sponge is equally split-invariant and simply sees fewer,
+/// larger `update` calls.
+#[repr(align(8))]
+struct LeafStage {
+    buf: [u8; LEAF_STAGE_BYTES],
+    len: usize,
+}
+
+impl LeafStage {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: [0u8; LEAF_STAGE_BYTES],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, mut bytes: &[u8], sink: &mut dyn FnMut(&[u8])) {
+        while !bytes.is_empty() {
+            if self.len == LEAF_STAGE_BYTES {
+                sink(&self.buf[..LEAF_STAGE_BYTES]);
+                self.len = 0;
+            }
+            let take = (LEAF_STAGE_BYTES - self.len).min(bytes.len());
+            self.buf[self.len..self.len + take].copy_from_slice(&bytes[..take]);
+            self.len += take;
+            bytes = &bytes[take..];
+        }
+    }
+
+    #[inline]
+    fn flush(&mut self, sink: &mut dyn FnMut(&[u8])) {
+        if self.len > 0 {
+            sink(&self.buf[..self.len]);
+            self.len = 0;
+        }
     }
 }
 
