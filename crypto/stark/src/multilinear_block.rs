@@ -931,19 +931,6 @@ impl BlockRegen {
         }
     }
 
-    /// Class `class`'s drops so far, in the window's order.
-    pub fn dropped_of(&self, class: usize) -> Vec<(u64, RegenSlot)> {
-        let state = self.lock();
-        let mut dropped: Vec<(u64, RegenSlot)> = state
-            .dropped
-            .iter()
-            .filter(|((c, _), ..)| *c == class)
-            .map(|((_, rank), slot, ..)| (*rank, slot.clone()))
-            .collect();
-        dropped.sort_by_key(|(_, slot)| slot.order_key());
-        dropped
-    }
-
     /// Whether phase A's end has closed the decisions.
     pub fn decisions_closed(&self) -> bool {
         self.lock().decisions_closed
