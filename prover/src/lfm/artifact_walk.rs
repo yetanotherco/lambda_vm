@@ -300,6 +300,42 @@ impl<'p> BuildPlan<'p> {
         self.hash_chunks.iter().skip(1).collect()
     }
 
+    /// A walk that commits nothing: every root a distinct placeholder derived
+    /// from `seed`. Test-only, for the instruments that count a tree's rows and
+    /// never prove it: a program's heights and every count derived from its
+    /// artifacts are independent of the roots' values.
+    #[cfg(test)]
+    pub(super) fn placeholder_walk(&self, seed: u64) -> Walked {
+        let mut next = 0u64;
+        let mut roots = |n: usize| -> Vec<Option<Commitment>> {
+            (0..n)
+                .map(|_| {
+                    next += 1;
+                    let mut r = [0x5Au8; 32];
+                    r[..8].copy_from_slice(&seed.to_le_bytes());
+                    r[8..16].copy_from_slice(&next.to_le_bytes());
+                    Some(r)
+                })
+                .collect()
+        };
+        let (slots, blake3, tail) = (
+            self.groups().len(),
+            self.blake3_rows.len(),
+            self.tail().len(),
+        );
+        let row_pair = LayoutRoots {
+            slots: roots(slots),
+            blake3: roots(blake3),
+            tail: roots(tail),
+        };
+        let one_row = self.one_row.then(|| LayoutRoots {
+            slots: roots(slots),
+            blake3: roots(blake3),
+            tail: roots(tail),
+        });
+        Walked { row_pair, one_row }
+    }
+
     pub(super) fn walk(&self, options: &ProofOptions, pass: Pass) -> Walked {
         use stark::leaf_layout::LeafLayout::{Row, RowPair};
         let groups = self.groups();

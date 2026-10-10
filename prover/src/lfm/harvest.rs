@@ -640,6 +640,11 @@ impl TableLegs {
 pub(crate) struct HarvestedChild {
     pub(crate) artifacts: super::registry::LfmArtifacts,
     pub(crate) opts: crate::ProofOptions,
+    /// The LFM statement tag the child was proved under (its configuration's),
+    /// which a node emitted from the proof-read shape replays first (the
+    /// tests' nodes; production derives its nodes from the artifacts).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) statement_tag: Vec<u8>,
     pub(crate) public_words: Vec<(u32, LfmWord)>,
     pub(crate) tables: Vec<HostTable>,
     pub(crate) legs: Vec<TableLegs>,
@@ -652,10 +657,8 @@ pub(crate) struct HarvestedChild {
     pub(crate) z_alpha: (FEE, FEE),
 }
 
-/// [`harvest_child`], after verifying the proof against its artifacts, and the
-/// seconds that verify cost: a child read from a proof production would reject
-/// describes nothing, so a refusal is an error. Under the legacy pin;
-/// [`harvest_child_verified_under`] names the configuration.
+/// [`harvest_child_verified_under`] at the legacy pin (the legacy tests').
+#[cfg(test)]
 pub(crate) fn harvest_child_verified(
     artifacts: super::registry::LfmArtifacts,
     opts: crate::ProofOptions,
@@ -664,7 +667,10 @@ pub(crate) fn harvest_child_verified(
     harvest_child_verified_under::<crate::hash_pin::Legacy>(artifacts, opts, proved)
 }
 
-/// [`harvest_child_verified`] for a child committed under the configuration `C`.
+/// [`harvest_child_under`], after verifying the proof against its artifacts
+/// under the configuration `C`, and the seconds that verify cost: a child read
+/// from a proof production would reject describes nothing, so a refusal is an
+/// error.
 pub(crate) fn harvest_child_verified_under<C: crate::hash_pin::BlockHash>(
     artifacts: super::registry::LfmArtifacts,
     opts: crate::ProofOptions,
@@ -688,19 +694,10 @@ pub(crate) fn harvest_child_verified_under<C: crate::hash_pin::BlockHash>(
 
 /// A child proof read without its verify, for a caller that verifies the same
 /// proof elsewhere and fails the run on a refusal before it reports anything
-/// (the block tree's children, verified beside the timed path). Under the
-/// legacy pin; [`harvest_child_under`] names the configuration.
-pub(crate) fn harvest_child(
-    artifacts: super::registry::LfmArtifacts,
-    opts: crate::ProofOptions,
-    proved: &super::proof::LfmProof,
-) -> Result<HarvestedChild, String> {
-    harvest_child_under::<crate::hash_pin::Legacy>(artifacts, opts, proved)
-}
-
-/// [`harvest_child`] for a child committed under the configuration `C`: its
-/// transcript and LFM statement tag, its verifier's replay, and each query's
-/// leaf index for the arity-4 paths (`build_table_legs_at`).
+/// (the block tree's children, verified beside the timed path), committed
+/// under the configuration `C`: its transcript and LFM statement tag, its
+/// verifier's replay, and each query's leaf index for the arity-4 paths
+/// (`build_table_legs_at`).
 pub(crate) fn harvest_child_under<C: crate::hash_pin::BlockHash>(
     artifacts: super::registry::LfmArtifacts,
     opts: crate::ProofOptions,
@@ -777,6 +774,7 @@ pub(crate) fn harvest_child_under<C: crate::hash_pin::BlockHash>(
         .collect::<Result<Vec<_>, String>>()?;
 
     Ok(HarvestedChild {
+        statement_tag: C::lfm_statement_tag(&opts.format),
         artifacts,
         opts,
         public_words: proved.public_words.clone(),

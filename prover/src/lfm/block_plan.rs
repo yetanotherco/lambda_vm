@@ -569,8 +569,28 @@ impl BlockTreePlan {
 
     /// The node over `children`, the top when `top`, emitted and validated.
     pub fn node_program(&self, children: &[DerivedChild], top: bool) -> Result<LfmProgram, String> {
+        self.node_program_with(builder(), children, top)
+    }
+
+    /// [`Self::node_program`] under the wrap hash `wrap` — the census's
+    /// baseline, the legacy pin's nodes (test-only).
+    #[cfg(test)]
+    pub(crate) fn node_program_under(
+        &self,
+        wrap: super::edsl::WrapHash,
+        children: &[DerivedChild],
+        top: bool,
+    ) -> Result<LfmProgram, String> {
+        self.node_program_with(LfmBuilder::new().with_wrap_hash(wrap), children, top)
+    }
+
+    fn node_program_with(
+        &self,
+        mut b: LfmBuilder,
+        children: &[DerivedChild],
+        top: bool,
+    ) -> Result<LfmProgram, String> {
         let shapes: Vec<_> = children.iter().map(DerivedChild::shape).collect();
-        let mut b = builder();
         super::block_node::emit_block_node(
             &mut b,
             &BlockNodeInputs {
@@ -836,9 +856,10 @@ fn partition_for(names: &[&str], costs: &[usize], cap: usize) -> Result<BlockPar
     }
 }
 
-/// A node's builder: nodes verify LFM proofs, which the pin commits.
+/// A node's builder: nodes verify the block's LFM proofs, which the block pin
+/// commits.
 fn builder() -> LfmBuilder {
-    LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy())
+    LfmBuilder::new().with_wrap_hash(crate::hash_pin::BLOCK_WRAP)
 }
 
 /// A leaf's builder: a leaf verifies base sub-proofs, committed under `base`.
@@ -852,13 +873,14 @@ fn finish(b: LfmBuilder) -> Result<LfmProgram, String> {
     Ok(program)
 }
 
-/// A tree program's artifacts, under the block hasher (the width-16 socket's
-/// for a program with `Hash16` rows, [`LfmProgram::hasher`]).
+/// A tree program's artifacts, under the block's socket
+/// ([`crate::hash_pin::BLOCK_SOCKET`]). A program with 12-felt hash rows under
+/// it is refused when it executes (the socket admits none).
 pub fn artifacts_of(program: &LfmProgram, wrap_opts: &crate::ProofOptions) -> LfmArtifacts {
     super::program_census::build_artifacts_counted(
         program,
         wrap_opts,
-        program.hasher(crate::hash_pin::LEGACY_HASHER),
+        program.hasher(crate::hash_pin::BLOCK_SOCKET),
     )
 }
 
@@ -1065,8 +1087,8 @@ pub fn top_claims(plan: &BlockTreePlan, words: &[(u32, LfmWord)], public_output:
 /// ★ The no-epoch block's verifier, over its tree's top proof: derive the plan
 /// ([`BlockTreePlan::derive`]) and the top program
 /// ([`BlockTreePlan::derive_top`]) under the block presets — the base
-/// under [`super::proof::block_base_options`], the tree under
-/// [`super::proof::aggregation_wrap_options`], verifier constants, never a
+/// under [`super::proof::block_tree_base_options`], the tree under
+/// [`super::proof::block_tree_options`], verifier constants, never a
 /// caller's or a prover's — verify `top` against that program, and check that it
 /// publishes the ELF's attestation id and `public_output`. Returns the id of the
 /// top program the proof verified against.
@@ -1075,20 +1097,19 @@ pub fn top_claims(plan: &BlockTreePlan, words: &[(u32, LfmWord)], public_output:
 /// the verifier's environment is part of the derived identity: a verifier
 /// configured otherwise than the prover derives another top and refuses
 /// (completeness, never soundness).
+///
+/// ★ Both presets stamp the block pin's hash too ([`crate::hash_pin::Block`]):
+/// the leaves verify the base and the nodes their children under it, every
+/// artifact is committed under it, and the top proof is checked under it. The
+/// verifier names one hash and takes none, so a tree whose base and recursion
+/// hash differently derives another top and is refused.
 pub fn verify_block_tree(
     elf_bytes: &[u8],
     shape: &BlockShape,
     public_output: &[u8],
     top: &super::proof::LfmProof,
 ) -> Result<Commitment, String> {
-    verify_block_tree_for(
-        stark::proof::options::BaseFormat::RPX,
-        elf_bytes,
-        None,
-        shape,
-        public_output,
-        top,
-    )
+    verify_block_tree_timed(elf_bytes, None, shape, public_output, top).map(|(id, _)| id)
 }
 
 /// [`verify_block_tree`] over ELF constants computed ahead
@@ -1103,35 +1124,12 @@ pub fn verify_block_tree_with(
     public_output: &[u8],
     top: &super::proof::LfmProof,
 ) -> Result<Commitment, String> {
-    verify_block_tree_for(
-        stark::proof::options::BaseFormat::RPX,
-        elf_bytes,
-        Some(consts),
-        shape,
-        public_output,
-        top,
-    )
+    verify_block_tree_timed(elf_bytes, Some(consts), shape, public_output, top).map(|(id, _)| id)
 }
 
-/// [`verify_block_tree`] for a block whose base proof is committed under
-/// `base` — the verifier's own format constant, never the proof's: the plan,
-/// every leaf (verifying the base under [`super::edsl::WrapHash::for_base`]),
-/// so the top program and its id, are derived under it. A top proof of a tree
-/// over another base derives another top and is refused.
-pub fn verify_block_tree_for(
-    base: stark::proof::options::BaseFormat,
-    elf_bytes: &[u8],
-    consts: Option<&ElfConstants>,
-    shape: &BlockShape,
-    public_output: &[u8],
-    top: &super::proof::LfmProof,
-) -> Result<Commitment, String> {
-    verify_block_tree_timed(base, elf_bytes, consts, shape, public_output, top).map(|(id, _)| id)
-}
-
-/// [`verify_block_tree_for`], and its stopwatch.
+/// [`verify_block_tree`] (over constants computed ahead when given), and its
+/// stopwatch.
 pub(crate) fn verify_block_tree_timed(
-    base: stark::proof::options::BaseFormat,
     elf_bytes: &[u8],
     consts: Option<&ElfConstants>,
     shape: &BlockShape,
@@ -1140,8 +1138,8 @@ pub(crate) fn verify_block_tree_timed(
 ) -> Result<(Commitment, VerifyTimes), String> {
     verify_under(
         elf_bytes,
-        &super::proof::block_base_options_for(base),
-        &super::proof::aggregation_wrap_options(),
+        &super::proof::block_tree_base_options(),
+        &super::proof::block_tree_options(),
         consts,
         shape,
         public_output,
@@ -1182,6 +1180,14 @@ fn verify_under(
     public_output: &[u8],
     top: &super::proof::LfmProof,
 ) -> Result<(Commitment, VerifyTimes), String> {
+    // One system: the base and the recursion both under the block pin's hash.
+    for o in [opts, wrap_opts] {
+        if crate::hash_pin::checked_base(&o.format)?
+            != <crate::hash_pin::Block as crate::hash_pin::BlockHash>::BASE
+        {
+            return Err("the block verifier derives under the block pin's hash alone".to_string());
+        }
+    }
     let mut times = VerifyTimes::default();
     let computed;
     let consts = match consts {
@@ -1199,8 +1205,12 @@ fn verify_under(
     let (artifacts, levels) = plan.derive_top_timed(wrap_opts)?;
     times.levels = levels;
     let t = Instant::now();
-    if !super::proof::verify_against_artifacts(&artifacts, &top.proof, &top.public_words, wrap_opts)
-    {
+    if !super::proof::verify_against_artifacts_under::<crate::hash_pin::Block>(
+        &artifacts,
+        &top.proof,
+        &top.public_words,
+        wrap_opts,
+    ) {
         return Err("the top proof does not verify against the derived top program".to_string());
     }
     if !top_claims(&plan, &top.public_words, public_output) {

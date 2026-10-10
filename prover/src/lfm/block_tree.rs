@@ -331,13 +331,6 @@ pub struct BlockTreeConfig {
     pub siblings_l0: usize,
     /// `LFM_TREE_SIBLINGS` (or `LFM_TREE_K`): node proofs at once.
     pub siblings: usize,
-    /// The base proof's format ([`super::proof::block_base_options_for`]):
-    /// RPX, today's, unless the caller names another. No knob sets it — the
-    /// library reads the base from no environment variable; a harness or a
-    /// CLI flag maps its own spelling into it. The leaves verify the base
-    /// under it ([`super::edsl::WrapHash::for_base`]) and the block verifier
-    /// must be given the same one ([`super::block_plan::verify_block_tree_for`]).
-    pub base: stark::proof::options::BaseFormat,
     /// `LAMBDA_VM_TREE_PROGRAM_BUDGET`: how many bytes of tree programs may
     /// exist ahead of their provers ([`super::program_budget`]); `auto` (the
     /// default) against the spill target, in the pipeline mode without an
@@ -363,7 +356,6 @@ impl BlockTreeConfig {
             forced_leaves: parse_leaves(var("NOEPOCH_LEAVES").as_deref())?,
             siblings_l0: super::tree_run::tree_siblings_l0()?,
             siblings: super::tree_run::tree_siblings()?,
-            base: stark::proof::options::BaseFormat::RPX,
             program_budget: super::program_budget::setting_from_env()?,
         })
     }
@@ -1133,26 +1125,32 @@ pub(crate) fn prove_program_with(
         super::program_census::build_artifacts_counted(
             program,
             opts,
-            program.hasher(crate::hash_pin::LEGACY_HASHER),
+            program.hasher(crate::hash_pin::BLOCK_SOCKET),
         )
     });
     let t_artifacts = t.elapsed().as_secs_f64();
     let t = Instant::now();
-    let proved = super::proof::lfm_prove(program, &artifacts, arenas, opts)
-        .map_err(|e| format!("{label} must prove: {e:?}"))?;
+    let proved =
+        super::proof::lfm_prove_under::<crate::hash_pin::Block>(program, &artifacts, arenas, opts)
+            .map_err(|e| format!("{label} must prove: {e:?}"))?;
     let t_prove = t.elapsed().as_secs_f64();
     if let Some(split) = super::tree_run::prove_split_text(label) {
         sink.write(&split);
     }
     let t = Instant::now();
     let (child, verified) = if verify_inline {
-        let (child, t_verify) =
-            super::harvest::harvest_child_verified(artifacts, opts.clone(), &proved)
-                .map_err(|e| format!("{label}: {e}"))?;
+        let (child, t_verify) = super::harvest::harvest_child_verified_under::<
+            crate::hash_pin::Block,
+        >(artifacts, opts.clone(), &proved)
+        .map_err(|e| format!("{label}: {e}"))?;
         (child, format!("verify {t_verify:.2}"))
     } else {
-        let child = super::harvest::harvest_child(artifacts, opts.clone(), &proved)
-            .map_err(|e| format!("{label}: {e}"))?;
+        let child = super::harvest::harvest_child_under::<crate::hash_pin::Block>(
+            artifacts,
+            opts.clone(),
+            &proved,
+        )
+        .map_err(|e| format!("{label}: {e}"))?;
         (child, "verified beside".to_string())
     };
     sink.line(&format!(
@@ -1184,7 +1182,7 @@ impl BesideVerifies {
         opts: crate::ProofOptions,
     ) {
         let handle = std::thread::spawn(move || {
-            super::proof::verify_against_artifacts(
+            super::proof::verify_against_artifacts_under::<crate::hash_pin::Block>(
                 &artifacts,
                 &proof.proof,
                 &proof.public_words,
@@ -1425,8 +1423,9 @@ pub fn prove_block_tree(
         ));
     }
     let elf_bytes: Arc<[u8]> = Arc::from(elf_bytes);
-    let inner = super::proof::block_base_options_for(cfg.base);
-    let wrap_opts = super::proof::aggregation_wrap_options();
+    // The block pin's base and recursion ([`crate::hash_pin::Block`]).
+    let inner = super::proof::block_tree_base_options();
+    let wrap_opts = super::proof::block_tree_options();
     let ceiling = cgroup_limit_gib();
     let pct = |g: f64| match &ceiling {
         Ok(c) => format!(" ({:.1}% of {c:.2})", 100.0 * g / c),
@@ -1462,7 +1461,7 @@ pub fn prove_block_tree(
     // compute; `NOEPOCH_ELF_CONSTS=0`, and RPX by default, compute them on the
     // pool beside the base, as before.
     let elf_beside = cfg.elf_beside;
-    let elf_consts = cfg.elf_consts.threads_for(&cfg.base);
+    let elf_consts = cfg.elf_consts.threads_for(&inner.format.base);
     #[cfg(test)]
     let forced_ahead = cfg.forced_leaves;
     // `NOEPOCH_TREE_AHEAD` (the pipeline by default): the same pool then emits the
@@ -1562,7 +1561,7 @@ pub fn prove_block_tree(
                                     super::registry::build_artifacts_with_hasher(
                                         program,
                                         &wrap,
-                                        program.hasher(crate::hash_pin::LEGACY_HASHER),
+                                        program.hasher(crate::hash_pin::BLOCK_SOCKET),
                                     )
                                 })?;
                                 (Arc::new(Pipe::filled(tree)), phases)
@@ -2123,7 +2122,7 @@ pub fn prove_block_tree(
     // only through program identity, so this is where a tree over any other
     // partition is refused. Production's whole verifier, which derives the plan
     // itself, is [`super::block_plan::verify_block_tree`].
-    if !super::proof::verify_against_artifacts(
+    if !super::proof::verify_against_artifacts_under::<crate::hash_pin::Block>(
         &top.artifacts,
         &top_proof.proof,
         &top_proof.public_words,

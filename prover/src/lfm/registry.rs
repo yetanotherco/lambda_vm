@@ -497,6 +497,22 @@ pub fn build_artifacts_with_hasher(
     plan.assemble(options, hasher, committed)
 }
 
+/// [`build_artifacts_with_hasher`] with placeholder roots (distinct values
+/// from `seed`) and nothing committed: the program's heights, chunks, chip set
+/// and hasher as a build would give them. Test-only, for the instruments that
+/// derive a tree's programs to count them (`DerivedChild::from_artifacts`).
+#[cfg(test)]
+pub(crate) fn placeholder_artifacts(
+    program: &LfmProgram,
+    options: &ProofOptions,
+    hasher: HasherKind,
+    seed: u64,
+) -> LfmArtifacts {
+    let plan = BuildPlan::new(program, options);
+    let walked = plan.placeholder_walk(seed);
+    plan.assemble(options, hasher, walked)
+}
+
 /// [`build_artifacts_with_hasher`] with its DEVICE commits inside a section:
 /// `enter_device` is called once, before the first device commit, and what it
 /// returns is held until the last one is made.

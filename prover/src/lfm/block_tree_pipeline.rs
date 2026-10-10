@@ -325,7 +325,7 @@ impl Pipe {
             let artifacts = super::program_census::build_artifacts_counted(
                 program,
                 wrap_opts,
-                program.hasher(crate::hash_pin::LEGACY_HASHER),
+                program.hasher(crate::hash_pin::BLOCK_SOCKET),
             );
             let derived = DerivedChild::from_artifacts(&artifacts, wrap_opts, words)?;
             build_secs += t.elapsed().as_secs_f64();

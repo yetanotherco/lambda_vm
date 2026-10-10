@@ -458,30 +458,24 @@ fn noepoch_p1_proof_is_refused_by_rpx_and_when_tampered() {
     );
 }
 
-/// The harness's options: the block's (`block_base_options`), with the base
-/// format its test environment names. `NOEPOCH_BASE` = `rpx` (unset) or `p1`;
-/// `NOEPOCH_P1_CAP` = `off` or a 4-ary height (unset: 4); `NOEPOCH_P1_NO_TAG=1`
-/// proves and verifies P1 under RPX's statement tag (the pre-tag bytes). Test
-/// code: the library reads no such variable.
+/// The harness's options: the block's (`block_tree_base_options`), under the
+/// block pin — the base and the recursion one hash, chosen by no variable.
+/// `NOEPOCH_LFM_CAP=<h>` (test builds only) sets the 4-ary cap of the block's
+/// LFM proofs (`c_L`) for the box's census arms, in the place of
+/// `hash_pin::BLOCK_LFM_CAP`. The former `NOEPOCH_BASE` / `NOEPOCH_P1_CAP` words
+/// are refused: the block has no other base.
 pub(crate) fn noepoch_harness_options() -> ProofOptions {
-    let mut opts = crate::lfm::proof::block_base_options();
-    let base = std::env::var("NOEPOCH_BASE").unwrap_or_else(|_| "rpx".to_string());
-    match base.as_str() {
-        "rpx" => {}
-        "p1" => {
-            let cap = std::env::var("NOEPOCH_P1_CAP").unwrap_or_else(|_| "4".to_string());
-            let c: u8 = match cap.as_str() {
-                "off" | "0" => 0,
-                h => h.parse().expect("NOEPOCH_P1_CAP: off or a height"),
-            };
-            opts.format.base = p1_at(c);
-            if std::env::var("NOEPOCH_P1_NO_TAG").is_ok_and(|v| v == "1") {
-                crate::hash_pin::P1_TAG_OMITTED.store(true, Ordering::SeqCst);
-            }
-        }
-        other => panic!("NOEPOCH_BASE={other:?}: rpx or p1"),
+    for gone in ["NOEPOCH_BASE", "NOEPOCH_P1_CAP", "NOEPOCH_P1_NO_TAG"] {
+        assert!(
+            std::env::var(gone).is_err(),
+            "{gone} is gone: the block's base and recursion are the block pin's (hash_pin::Block)"
+        );
     }
-    opts
+    if let Ok(cap) = std::env::var("NOEPOCH_LFM_CAP") {
+        let c: u8 = cap.parse().expect("NOEPOCH_LFM_CAP: a 4-ary height");
+        crate::hash_pin::set_lfm_cap_override(Some(c));
+    }
+    crate::lfm::proof::block_tree_base_options()
 }
 
 /// Peak resident set of this process, from `/proc/self/status` (Linux).

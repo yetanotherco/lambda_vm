@@ -961,7 +961,7 @@ fn late_emission_probe_over_freed_small_buffers() {
 /// absorbs and each program's preprocessed roots by slot (`TREE ROOTS`), so two
 /// runs that disagree can be compared group by group.
 fn tree_ids(plan: &BlockTreePlan) -> Vec<String> {
-    let wrap = super::proof::aggregation_wrap_options();
+    let wrap = super::proof::block_tree_options();
     let words = plan.child_layout().total();
     let hex = |id: &Commitment| id.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let roots = |j: usize, a: &LfmArtifacts| {
@@ -1121,7 +1121,7 @@ fn a_p1_base_small_tree_derives() {
         // The socket review's A1: a parent takes a P1W16 child's hasher from the
         // child's artifacts — the hasher the pinned program id names — and
         // builds the child's `LFM_HASH` as the socket from them.
-        let wrap = super::proof::aggregation_wrap_options();
+        let wrap = super::proof::block_tree_options();
         let leaf = super::block_plan::artifacts_of(&plan.leaf_program(0).expect("emits"), &wrap);
         assert_eq!(
             leaf.hasher,
@@ -1283,7 +1283,7 @@ fn p1_leaf_census_at_production_heights() {
 fn p1_node_leg_census() {
     use super::airs::{ChipSet, LfmAirs, NUM_LFM_CHIPS, lfm_chip_census_with_hasher};
     use stark::proof::options::{BaseFormat, CapPolicy};
-    let wrap = super::proof::aggregation_wrap_options();
+    let wrap = super::proof::block_tree_options();
     let arms = [
         ("rpx", BaseFormat::RPX),
         (
@@ -1345,7 +1345,7 @@ fn p1_node_leg_census() {
 #[ignore = "laptop instrument: run with --exact --nocapture (≈ 2 min)"]
 fn p1_node_program_census() {
     use stark::proof::options::{BaseFormat, CapPolicy};
-    let wrap = super::proof::aggregation_wrap_options();
+    let wrap = super::proof::block_tree_options();
     for (name, opts) in [
         ("rpx", pinned_spread_plan_options()),
         ("p1-c1", p1_spread_options(CapPolicy::Fixed(1))),
@@ -1479,7 +1479,7 @@ fn shape_from_instances(
         public_output_len,
         trace_lengths: vec![32; n],
     };
-    let opts = super::proof::block_base_options();
+    let opts = super::proof::block_tree_base_options();
     let configs =
         super::block_plan::check_shape(elf, &opts, &shape).expect("the reconstructed shape checks");
     let airs = crate::VmAirs::new(
@@ -1534,7 +1534,7 @@ fn p1_one_table_per_leaf_sizing() {
         ..BaseFormat::P1
     };
     let opts = super::proof::block_base_options_for(base);
-    let wrap = super::proof::aggregation_wrap_options();
+    let wrap = super::proof::block_tree_options();
     let mut plan = BlockTreePlan::derive(&elf_bytes, &opts, &shape).expect("the plan derives");
     let law = |instrs: usize, cells: u64| 0.059 + 421e-9 * instrs as f64 + 5.63e-9 * cells as f64;
     let hash = super::airs::LFM_CHIP_NAMES[super::airs::HASH_SLOT];
@@ -1619,6 +1619,155 @@ fn p1_one_table_per_leaf_sizing() {
             cost_ns - cost,
             legs_ns as i64 - legs as i64
         );
+    }
+}
+
+/// ★ The P3b node census (laptop instrument, emission only, no proof): a real
+/// block's shape (`P3_SHAPE`, `AIR-name rows` lines from a box run; `P3_ELF`,
+/// its ELF) under the block pin's base, its tree's node programs derived under
+/// each configuration in `P3B_CAPS` (comma-separated): `legacy` is today's
+/// recursion (P1 leaves, RPX LFM proofs, RPX nodes), a number `c` is the block
+/// pin's recursion with its LFM trees capped at 4-ary height `c` (`c_L`).
+///
+/// Per configuration and per node: instructions, cells (main + 3·aux, the
+/// panel's metric), the FAST cost law, the `LFM_HASH` rows (one entry per
+/// chunk), the SELECT / HINT / BALU / XALU / LANES heights and the hint words
+/// it reads (its children's proofs, in words). The leaves once: their programs
+/// do not depend on the recursion's hash. Children's artifacts are placeholders
+/// (`registry::placeholder_artifacts`): real heights, fake roots — every count
+/// here is independent of the roots' values. One program at a time.
+#[test]
+#[ignore = "laptop instrument: P3_SHAPE, P3_ELF, P3B_CAPS; emission only, one program at a time"]
+fn p3b_node_census() {
+    use super::airs::lfm_chip_census_with_hasher;
+    use stark::proof::options::CapPolicy;
+    let read = |var: &str| std::env::var(var).unwrap_or_else(|_| panic!("{var} must be set"));
+    let elf_bytes = std::fs::read(read("P3_ELF")).expect("P3_ELF reads");
+    let elf = executor::elf::Elf::load(&elf_bytes).expect("load the ELF");
+    let lines = std::fs::read_to_string(read("P3_SHAPE")).expect("P3_SHAPE reads");
+    let configs: Vec<String> = read("P3B_CAPS")
+        .split(',')
+        .map(|c| c.trim().to_string())
+        .collect();
+    let shape = shape_from_instances(&elf, &lines, 4);
+    let opts = super::proof::block_tree_base_options();
+    let plan = BlockTreePlan::derive(&elf_bytes, &opts, &shape).expect("the plan derives");
+    let law = |instrs: usize, cells: u64| 0.059 + 421e-9 * instrs as f64 + 5.63e-9 * cells as f64;
+    let words = plan.child_layout().total();
+    let leaves = plan.partition().num_leaves();
+    let levels = plan.levels();
+    println!(
+        "P3B CENSUS: {} instances · {leaves} leaves · levels {:?} · base {:?} cap {}",
+        shape.trace_lengths.len(),
+        levels.iter().map(|l| l.arities.clone()).collect::<Vec<_>>(),
+        opts.format.base.hash,
+        opts.format.base.arity4_cap,
+    );
+    let row = |program: &LfmProgram, hasher| {
+        let census = lfm_chip_census_with_hasher(program, hasher);
+        let (main, aux) = census.iter().fold((0u64, 0u64), |(m, a), c| {
+            (m + c.main_cells(), a + c.aux_cells())
+        });
+        let cells = main + 3 * aux;
+        let rows = |name: &str| -> String {
+            census
+                .iter()
+                .filter(|c| c.name == name)
+                .map(|c| format!("{}/{}", c.real_rows, c.rows))
+                .collect::<Vec<_>>()
+                .join("+")
+        };
+        let hints: u64 = program
+            .arena_schema
+            .lens
+            .iter()
+            .map(|&l| u64::from(l))
+            .sum();
+        let n = program.instrs.len();
+        let text = format!(
+            "{n} instructions · {cells} cells · law {:.3} s · LFM_HASH {} · SELECT {} · HINT {} · \
+             BALU {} · XALU {} · LANES {} · hint words {hints}",
+            law(n, cells),
+            rows("LFM_HASH"),
+            rows("LFM_SELECT"),
+            rows("LFM_HINT"),
+            rows("LFM_BALU"),
+            rows("LFM_XALU"),
+            rows("LFM_LANES"),
+        );
+        (n, cells, law(n, cells), text)
+    };
+    // Each configuration's options, node wrap hash and socket.
+    let setups: Vec<(crate::ProofOptions, WrapHash, super::hash::HasherKind)> = configs
+        .iter()
+        .map(|config| {
+            if config == "legacy" {
+                let wrap = super::proof::aggregation_wrap_options();
+                (wrap, WrapHash::legacy(), crate::hash_pin::LEGACY_HASHER)
+            } else {
+                let c: u8 = config.parse().expect("P3B_CAPS: legacy or a 4-ary height");
+                let mut wrap = super::proof::block_tree_options();
+                wrap.format.base.arity4_cap = CapPolicy::Fixed(c);
+                (
+                    wrap,
+                    crate::hash_pin::BLOCK_WRAP,
+                    crate::hash_pin::BLOCK_SOCKET,
+                )
+            }
+        })
+        .collect();
+    let derive = |program: &LfmProgram, wrap: &crate::ProofOptions, hasher, seed: u64| {
+        let artifacts =
+            super::registry::placeholder_artifacts(program, wrap, program.hasher(hasher), seed);
+        DerivedChild::from_artifacts(&artifacts, wrap, words).expect("the child derives")
+    };
+    // The leaves: each emitted once, counted, and derived under every
+    // configuration.
+    let (mut li, mut lc, mut ll) = (0usize, 0u64, 0.0f64);
+    let mut derived: Vec<Vec<DerivedChild>> = configs.iter().map(|_| Vec::new()).collect();
+    for k in 0..leaves {
+        let program = plan.leaf_program(k).expect("the leaf emits");
+        let (n, c, t, _) = row(&program, crate::hash_pin::BLOCK_SOCKET);
+        li += n;
+        lc += c;
+        ll += t;
+        for (i, (wrap, _, _)) in setups.iter().enumerate() {
+            derived[i].push(derive(
+                &program,
+                wrap,
+                crate::hash_pin::BLOCK_SOCKET,
+                k as u64,
+            ));
+        }
+    }
+    println!("P3B CENSUS leaves: Σ {li} instructions · Σ {lc} cells · law Σ {ll:.2} s");
+    for ((config, (wrap, node_wrap, hasher)), mut level) in configs.iter().zip(&setups).zip(derived)
+    {
+        let (node_wrap, hasher) = (*node_wrap, *hasher);
+        let mut seed = 1_000u64;
+        let (mut ni, mut nc, mut nl) = (0usize, 0u64, 0.0f64);
+        for (lv, arities) in levels.iter().enumerate() {
+            let top = lv + 1 == levels.len();
+            let mut rest = level.into_iter();
+            let mut next = Vec::with_capacity(arities.arities.len());
+            for (j, &a) in arities.arities.iter().enumerate() {
+                let kids: Vec<DerivedChild> = rest.by_ref().take(a).collect();
+                let program = plan
+                    .node_program_under(node_wrap, &kids, top)
+                    .expect("the node emits");
+                let (n, c, t, text) = row(&program, program.hasher(hasher));
+                println!("P3B CENSUS {config} L{}N{j} ({a} children): {text}", lv + 1);
+                ni += n;
+                nc += c;
+                nl += t;
+                if !top {
+                    seed += 1;
+                    next.push(derive(&program, wrap, hasher, seed));
+                }
+            }
+            level = next;
+        }
+        println!("P3B CENSUS {config} nodes: Σ {ni} instructions · Σ {nc} cells · law Σ {nl:.2} s");
     }
 }
 
@@ -1771,7 +1920,7 @@ fn the_block_elfs_constants_at_once_are_the_same_at_every_width() {
     let path =
         std::env::var("NOEPOCH_ELF").unwrap_or_else(|_| panic!("NOEPOCH_ELF must name a file"));
     let elf = std::fs::read(&path).unwrap_or_else(|e| panic!("NOEPOCH_ELF {path}: {e}"));
-    let opts = super::proof::block_base_options();
+    let opts = super::proof::block_tree_base_options();
     let on = |threads: usize, at_once: bool| {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -2157,7 +2306,7 @@ pub(super) fn block_node_program_with(
     checks: BlockBindings,
 ) -> LfmProgram {
     let shapes: Vec<_> = children.iter().map(|c| child_shape(c)).collect();
-    let mut b = production_builder();
+    let mut b = LfmBuilder::new().with_wrap_hash(crate::hash_pin::BLOCK_WRAP);
     emit_block_node_with(
         &mut b,
         &BlockNodeInputs {
@@ -2235,7 +2384,12 @@ pub(super) fn verify_block_top(
     top: &super::proof::LfmProof,
     opts: &crate::ProofOptions,
 ) -> bool {
-    super::proof::verify_against_artifacts(expected, &top.proof, &top.public_words, opts)
+    super::proof::verify_against_artifacts_under::<crate::hash_pin::Block>(
+        expected,
+        &top.proof,
+        &top.public_words,
+        opts,
+    )
 }
 
 /// Levels above the leaves, as the plan lays them out
@@ -2283,13 +2437,10 @@ pub(super) fn assert_top_claims_the_block(top: &RealChild, rb: &RealBlock) {
 
 /// The small block's options: a real format at blowup 4 (every table's LDE pairs
 /// index at least one bit) with two queries, so the leaves stay small. The base
-/// is the harness's (`NOEPOCH_BASE`, `NOEPOCH_P1_CAP`: RPX unset), so the same
-/// suites run a Poseidon1 base's leaves (P3a).
+/// is the block pin's ([`crate::hash_pin::BLOCK_BASE`]).
 fn fixture_block_options() -> crate::ProofOptions {
     let mut opts = super::epoch_tests::from_proof_gate_options();
-    opts.format.base = crate::tests::noepoch_block_tests::noepoch_harness_options()
-        .format
-        .base;
+    opts.format.base = crate::hash_pin::BLOCK_BASE;
     opts
 }
 
@@ -2364,7 +2515,7 @@ fn block_leaves_execute_over_a_real_block_proof() {
         "BLOCK FIXTURE BASE: {:?} cap {}",
         opts.format.base.hash, opts.format.base.arity4_cap
     );
-    let wrap_opts = super::proof::aggregation_wrap_options();
+    let wrap_opts = super::proof::block_tree_options();
     let (elf_bytes, proof) = small_block("poc_rodata_commit", &[], &opts);
     assert!(
         crate::block::verify_block(&proof, &elf_bytes, &opts).expect("verifies"),
@@ -2610,7 +2761,7 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
         "BLOCK FIXTURE BASE: {:?} cap {}",
         opts.format.base.hash, opts.format.base.arity4_cap
     );
-    let wrap_opts = super::proof::aggregation_wrap_options();
+    let wrap_opts = super::proof::block_tree_options();
     let input_a: Vec<u8> = (0u8..16).collect();
     let mut input_b = input_a.clone();
     input_b[13] ^= 0xff;
@@ -2835,7 +2986,7 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
 #[ignore = "proves a VM block and its tree; box tier"]
 fn the_block_verifier_derives_the_tree_and_accepts_only_its_top() {
     let opts = fixture_block_options();
-    let wrap_opts = super::proof::aggregation_wrap_options();
+    let wrap_opts = super::proof::block_tree_options();
     let (elf_bytes, proof) = small_block("poc_rodata_commit", &[], &opts);
     let shape = BlockShape::of_proof(&proof);
     let (rb, ..) = harvest_block(&opts, &elf_bytes, &proof).expect("harvest");
@@ -2982,7 +3133,7 @@ fn the_block_tree_verifies_logup_k4_and_refuses_it_under_pairs() {
         },
         ..pair.clone()
     };
-    let wrap_opts = super::proof::aggregation_wrap_options();
+    let wrap_opts = super::proof::block_tree_options();
     assert_eq!(
         wrap_opts.format.logup,
         LogUpPolicy::Pair,
@@ -3070,7 +3221,7 @@ fn the_block_tree_verifies_logup_k4_and_refuses_it_under_pairs() {
 #[ignore = "proves a VM block and its tree; box tier"]
 fn the_block_tree_verifies_a_chunked_ecdas() {
     let opts = fixture_block_options();
-    let wrap_opts = super::proof::aggregation_wrap_options();
+    let wrap_opts = super::proof::block_tree_options();
     let max_rows = crate::tables::MaxRowsConfig {
         ecdas: 16,
         ..crate::tables::MaxRowsConfig::small()
@@ -3134,7 +3285,7 @@ fn the_block_tree_verifies_a_chunked_ecdas() {
 #[ignore = "proves two VM blocks and their trees; box tier"]
 fn the_block_tree_verifies_chunked_keccak_and_ecsm() {
     let opts = fixture_block_options();
-    let wrap_opts = super::proof::aggregation_wrap_options();
+    let wrap_opts = super::proof::block_tree_options();
     let small = crate::tables::MaxRowsConfig::small;
     for (guest, kind, max_rows, cap) in [
         (
@@ -3313,26 +3464,25 @@ fn the_block_tree_composes_to_a_top_node() {
     };
     let elf_bytes = read("NOEPOCH_ELF");
     let input = read("NOEPOCH_INPUT");
-    let wrap_opts = super::proof::aggregation_wrap_options();
-    let mut cfg = super::block_tree::BlockTreeConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
-    // The base format the harness's environment names (`NOEPOCH_BASE`,
-    // `NOEPOCH_P1_CAP`; RPX unset): test code, the library reads no such
-    // variable. Under P1 the static preprocessed roots are computed here,
+    let cfg = super::block_tree::BlockTreeConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
+    // The block pin's base and recursion (`noepoch_harness_options`, which also
+    // takes the test-only `NOEPOCH_LFM_CAP`, so it comes before the tree's
+    // options are read). The static preprocessed roots are computed here,
     // before the run's clock, as the base harness does.
     let base_opts = crate::tests::noepoch_block_tests::noepoch_harness_options();
-    cfg.base = base_opts.format.base;
-    let p1 = crate::hash_pin::base_of(&base_opts.format) == crate::hash_pin::BaseHash::P1;
+    let wrap_opts = super::proof::block_tree_options();
+    let base = base_opts.format.base;
     println!(
-        "BASE HASH: {} (format {:?}, cap {}) · statement tag {} · cost model {:#x}",
-        if p1 { "p1" } else { "rpx" },
-        cfg.base.hash,
-        cfg.base.arity4_cap,
+        "BASE HASH: p1 (format {:?}, cap {}) · statement tag {} · cost model {:#x} · LFM cap {} · \
+         LFM statement tag {}",
+        base.hash,
+        base.arity4_cap,
         String::from_utf8_lossy(&crate::hash_pin::statement_tag(&base_opts.format)),
-        super::block_plan::CostModel::for_base(&cfg.base).id
+        super::block_plan::CostModel::for_base(&base).id,
+        wrap_opts.format.base.arity4_cap,
+        String::from_utf8_lossy(&crate::hash_pin::lfm_statement_tag(&wrap_opts.format)),
     );
-    if p1 {
-        crate::hash_pin::warm_base_statics(&base_opts);
-    }
+    crate::hash_pin::warm_base_statics(&base_opts);
     #[cfg(feature = "cuda")]
     let tree_downloads_at_start = math_cuda::device::tree_download_totals();
     let run = super::block_tree::prove_block_tree(
@@ -3432,7 +3582,6 @@ fn the_block_tree_composes_to_a_top_node() {
     let derived = match forced {
         None => {
             let (id, times) = super::block_plan::verify_block_tree_timed(
-                cfg.base,
                 &elf_bytes,
                 None,
                 &shape,
@@ -3498,7 +3647,6 @@ fn the_block_tree_composes_to_a_top_node() {
     if let (None, Some(consts)) = (forced, consts.as_deref()) {
         let t = Instant::now();
         let (id, warm) = super::block_plan::verify_block_tree_timed(
-            cfg.base,
             &elf_bytes,
             Some(consts),
             &shape,
@@ -3690,7 +3838,7 @@ fn six_leaf_fixture_plan() -> BlockTreePlan {
 #[test]
 #[ignore = "box tier: two derivations of a six-leaf tree under the wrap preset, ≈ 2 min on the laptop"]
 fn the_streaming_derivation_derives_the_kept_trees_top() {
-    let wrap_opts = super::proof::aggregation_wrap_options();
+    let wrap_opts = super::proof::block_tree_options();
     let plan = six_leaf_fixture_plan();
     let streamed = plan.derive_top(&wrap_opts).expect("the top derives");
     let (tree, _) = plan
@@ -3715,7 +3863,7 @@ fn the_streaming_derivation_derives_the_kept_trees_top() {
 fn the_derive_gate_bounds_the_derivation_on_the_card() {
     use super::derive_gate::{Setting, pin_setting, take_summary};
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-    let wrap_opts = super::proof::aggregation_wrap_options();
+    let wrap_opts = super::proof::block_tree_options();
     let plan = six_leaf_fixture_plan();
     let derive = |setting: Setting| {
         pin_setting(Some(setting));
@@ -3796,8 +3944,8 @@ fn the_block_verifiers_derivation_from_a_saved_shape() {
         &std::fs::read_to_string(path("NOEPOCH_SHAPE")).expect("read NOEPOCH_SHAPE"),
     );
     let hold = std::env::var("LAMBDA_VM_BLOCK_DERIVE_HOLD").unwrap_or_default();
-    let opts = super::proof::block_base_options();
-    let wrap_opts = super::proof::aggregation_wrap_options();
+    let opts = super::proof::block_tree_base_options();
+    let wrap_opts = super::proof::block_tree_options();
     let sampler = HostSampler::start();
     let t = Instant::now();
     let consts =

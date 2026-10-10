@@ -805,11 +805,29 @@ fn expected_public_balance(
 /// from these options sees one format. Unset knobs give
 /// [`ZfFormat::DEFAULT`](crate::zf_format::ZfFormat::DEFAULT), the measured
 /// configuration; every knob at its off spelling gives the legacy options.
+/// Committed under the legacy pin; the block tree's proofs take
+/// [`block_tree_options`].
 pub fn aggregation_wrap_options() -> ProofOptions {
     let mut opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(4)
         .expect("blowup=4 is valid");
     opts.fri_final_poly_log_degree = 8;
     crate::zf_format::ZfFormat::global().options(opts)
+}
+
+/// The block tree's LFM options — every leaf, node and the top: the
+/// [`aggregation_wrap_options`] preset committed under the block pin
+/// ([`crate::hash_pin::BLOCK_LFM`]), the hash the block's base is
+/// ([`block_tree_base_options`]): one system, base and recursion. A PRODUCTION
+/// FORMAT SITE, like its preset.
+pub fn block_tree_options() -> ProofOptions {
+    let mut opts = aggregation_wrap_options();
+    opts.format.base = crate::hash_pin::BLOCK_LFM;
+    // Test builds only: the node census's and the box's `c_L` arms.
+    #[cfg(test)]
+    if let Some(cap) = crate::hash_pin::lfm_cap_override() {
+        opts.format.base.arity4_cap = stark::proof::options::CapPolicy::Fixed(cap);
+    }
+    opts
 }
 
 /// The STARK block's base-epoch options: the blowup-4 preset the production
@@ -821,15 +839,26 @@ pub fn aggregation_wrap_options() -> ProofOptions {
 ///
 /// Not [`crate::recursion::Preset::options`] itself: that value also fixes
 /// the RV64 recursion guest's verifier, which stays on the LEGACY format
-/// (its presets name it).
+/// (its presets name it). Committed under the process format's base hash; the
+/// no-epoch block's base takes [`block_tree_base_options`].
 pub fn block_base_options() -> ProofOptions {
     crate::zf_format::ZfFormat::global().base_options(crate::recursion::Preset::Blowup4.options())
 }
 
-/// [`block_base_options`] with the base proof committed under `base` (the
-/// caller's format, never the environment's): the block tree's base and its
-/// verifier under a Poseidon1 base (P3a). `BaseFormat::RPX` is
-/// [`block_base_options`].
+/// The no-epoch block's base options: [`block_base_options`] committed under
+/// the block pin ([`crate::hash_pin::BLOCK_BASE`]), the hash the block's
+/// recursion is ([`block_tree_options`]): one system, base and recursion. The
+/// block prover's tree, its verifier and the CLI take it.
+pub fn block_tree_base_options() -> ProofOptions {
+    let mut opts = block_base_options();
+    opts.format.base = crate::hash_pin::BLOCK_BASE;
+    opts
+}
+
+/// [`block_base_options`] with the base proof committed under `base`: the
+/// base-only tests' variants (another cap, the legacy hash). The block tree
+/// takes [`block_base_options`] alone.
+#[cfg(test)]
 pub fn block_base_options_for(base: stark::proof::options::BaseFormat) -> ProofOptions {
     let mut opts = block_base_options();
     opts.format.base = base;

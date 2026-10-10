@@ -237,6 +237,29 @@ pub const BLOCK_SOCKET: crate::lfm::hash::HasherKind = crate::lfm::hash::HasherK
 /// are committed under.
 pub type Legacy = RpxBlock;
 
+/// Test builds only: the 4-ary cap the block's LFM proofs take in place of
+/// [`BLOCK_LFM_CAP`] (`crate::lfm::proof::aggregation_wrap_options`), for the
+/// node census and the box's `c_L` arms. Process-global; 0 = none.
+#[cfg(test)]
+static LFM_CAP_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Set (`Some`) or clear the test-only `c_L` override, stored as `cap + 1`.
+#[cfg(test)]
+pub fn set_lfm_cap_override(cap: Option<u8>) {
+    LFM_CAP_OVERRIDE.store(
+        cap.map_or(0, |c| c + 1),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+/// The test-only `c_L` override, if set.
+#[cfg(test)]
+pub fn lfm_cap_override() -> Option<u8> {
+    LFM_CAP_OVERRIDE
+        .load(std::sync::atomic::Ordering::SeqCst)
+        .checked_sub(1)
+}
+
 // The pin is one system: its formats name `Block`'s hash, and the wrap hash and
 // socket are the ones that hash's in-guest verifier runs.
 const _: () = assert!(
