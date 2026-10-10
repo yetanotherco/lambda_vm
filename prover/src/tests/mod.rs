@@ -100,6 +100,8 @@ pub mod multilinear_table_tests;
 #[cfg(test)]
 pub mod ood_window_ir_tests;
 #[cfg(test)]
+pub mod p1_stark_tests;
+#[cfg(test)]
 pub mod page_layout_tests;
 #[cfg(test)]
 pub mod page_offset_forgery_poc;
@@ -150,6 +152,8 @@ pub mod whir_identity_tests;
 pub mod zf_air_cache_tests;
 #[cfg(test)]
 pub mod zf_lfm_bytes_tests;
+#[cfg(all(test, feature = "cuda"))]
+pub mod zf_p1_device_tests;
 #[cfg(all(test, feature = "cuda"))]
 pub mod zf_rpx_device_tests;
 #[cfg(test)]
