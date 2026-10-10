@@ -372,9 +372,12 @@ fn codeword(log_len: usize, seed: u64) -> Vec<FE> {
 /// Every binary depth 1–9 at cap 0: every opening verifies with exactly
 /// `3⌈d/2⌉` siblings, and none at an index past the tree. At an odd depth the
 /// walk reaches the top group's two padding siblings: they are the zero digest,
-/// and anything else there is refused. The root binds them already (they are
-/// hashed into it); the host's own zero check (REV-P1-JUDGE F4) is defence in
-/// depth, which a mutation dropping it leaves this test green.
+/// and anything else there is refused. Here the honest root hashes zeros, so a
+/// moved sibling misses it; but the root does not bind the padding in general
+/// — a prover chooses the root, and may commit non-zero padding at the top. The
+/// host's zero check (REV-P1-JUDGE F4) is what refuses that (covered by
+/// `rp1a_uncapped_odd_top_padding_is_bound_on_the_host`), which a mutation
+/// dropping it leaves this test green.
 #[test]
 fn every_depth_opens_and_an_odd_tops_padding_is_bound() {
     for depth in 1..=9usize {

@@ -177,8 +177,10 @@ impl IsTranscript<Degree3GoldilocksExtensionField> for P1Transcript {
     }
 
     /// Constant consumption: one felt per draw, masked to a power-of-two bound.
+    /// Any other bound (zero included) is refused in every build: the mask
+    /// would bias it, and no caller may draw that way (REV-P1W-JUDGE V1).
     fn sample_u64(&mut self, upper_bound: u64) -> u64 {
-        debug_assert!(
+        assert!(
             upper_bound.is_power_of_two(),
             "sample_u64 is masked, so a non-power-of-two bound ({upper_bound}) would be biased"
         );

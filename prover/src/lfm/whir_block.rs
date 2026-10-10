@@ -109,6 +109,12 @@ pub const P1_LEAF_HEIGHTS: ChipRows = ChipRows {
     accel: 0,
 };
 
+// The conjectured LFM bits stay at 128 or above only while a Poseidon1 leaf's
+// socket and bit-dec tables stay at 2^19 rows or fewer (REV-P1W-JUDGE V3: the
+// calculator reads 128.005 for the socket and 128.51 for bit-dec at 2^20). A
+// wider chip re-runs the calculator before this bound moves.
+const _: () = assert!(P1_LEAF_HEIGHTS.hash <= 1 << 19 && P1_LEAF_HEIGHTS.bitdec <= 1 << 19);
+
 /// The leaf cap a block's base takes: [`LEAF_P1_CAP`] under Poseidon1, else
 /// [`LEAF_PERMS_CAP`].
 pub fn leaf_cap_for(base: &stark::proof::options::BaseFormat) -> usize {
