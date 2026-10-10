@@ -22,15 +22,20 @@ use super::proof::{LfmProof, lfm_prove_under, verify_against_artifacts_under};
 use super::registry::{LfmArtifacts, build_artifacts_under};
 use super::word::LfmWord;
 
-/// The child's options: the production format (cap auto — which an arity-4
-/// configuration replaces by its own C2 — and `fri = dp`) at blowup 4, with
+/// The child's options: the production format's `fri = dp` at blowup 4, with
 /// few queries so the node stays small, and a grind so the leg checks one.
+/// Its binary cap policy is OFF: an arity-4 configuration caps its trees at
+/// its own C2 whatever the format says, so a shape that took the format's
+/// policy instead would lay the trees out uncapped and refuse the child (at
+/// six queries `auto` would coincide with C2 and hide that).
 fn options() -> ProofOptions {
     let mut o = GoldilocksCubicProofOptions::with_blowup(4).expect("options");
     o.fri_number_of_queries = 6;
     o.grinding_factor = 4;
     o.fri_final_poly_log_degree = 2;
-    crate::zf_format::ZfFormat::DEFAULT.options(o)
+    let mut o = crate::zf_format::ZfFormat::DEFAULT.options(o);
+    o.format.merkle_cap = stark::proof::options::CapPolicy::Off;
+    o
 }
 
 fn arenas() -> Vec<Vec<LfmWord>> {
