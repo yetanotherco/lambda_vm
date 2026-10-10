@@ -42,7 +42,9 @@ use stark::proof::options::ProofOptions;
 
 use super::compiler::LfmProgram;
 use super::hash::HasherKind;
-use super::registry::{LfmArtifacts, build_artifacts_with_hasher};
+use super::registry::LfmArtifacts;
+#[cfg(test)]
+use super::registry::build_artifacts_with_hasher;
 
 /// What one level's worth of artifact builds did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -185,7 +187,7 @@ fn lock() -> MutexGuard<'static, Census> {
         .expect("the program census mutex is never held across a panic")
 }
 
-/// [`build_artifacts_with_hasher`], counted.
+/// [`super::registry::build_artifacts_with_hasher`], counted.
 ///
 /// ⛔ NOT a cache and never becomes one: no map, no key, no reuse. It runs the
 /// build every time, exactly as the raw call does, and records which program it
@@ -197,6 +199,16 @@ fn lock() -> MutexGuard<'static, Census> {
 /// that was a self-deadlock, and a quiet one: the thread parked, the test binary
 /// sat at 0% CPU and 22 MB of RSS, and nothing printed.
 pub fn build_artifacts_counted(
+    program: &LfmProgram,
+    options: &ProofOptions,
+    hasher: HasherKind,
+) -> LfmArtifacts {
+    build_artifacts_counted_under::<crate::hash_pin::BlockStarkHash>(program, options, hasher)
+}
+
+/// [`build_artifacts_counted`] with the roots built under the commitment
+/// configuration `S` ([`super::registry::build_artifacts_under`]).
+pub fn build_artifacts_counted_under<S: stark::config::StarkHash>(
     program: &LfmProgram,
     options: &ProofOptions,
     hasher: HasherKind,
@@ -213,7 +225,7 @@ pub fn build_artifacts_counted(
     let t = Instant::now();
     let artifacts = {
         let _card = super::device_permit::hold_labeled("build_artifacts");
-        build_artifacts_with_hasher(program, options, hasher)
+        super::registry::build_artifacts_under::<S>(program, options, hasher)
     };
     let build_nanos = t.elapsed().as_nanos();
     lock().record(artifacts.program_id, build_nanos);

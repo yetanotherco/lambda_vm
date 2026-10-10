@@ -9,7 +9,7 @@
 
 use math::polynomial::Polynomial;
 use stark::commitment::commit_bit_reversed_with;
-use stark::config::Commitment;
+use stark::config::{Commitment, StarkHash};
 use stark::leaf_layout::LeafLayout;
 use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
@@ -102,10 +102,20 @@ pub fn commit_lde_columns_with(lde_columns: &[Vec<FE>], layout: LeafLayout) -> C
     // BUILDS them and the hash the program identity CLAIMS have to be the same
     // one — `registry.rs` records that as the condition under which this read
     // moves, and the pin is what moved it.
-    let (_, root) = commit_bit_reversed_with::<
-        GoldilocksField,
-        <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>,
-    >(lde_columns, layout.rows_per_leaf())
+    commit_lde_columns_under::<crate::hash_pin::BlockStarkHash>(lde_columns, layout)
+}
+
+/// [`commit_lde_columns_with`] under the commitment configuration `S` (a proof
+/// family's, `registry::build_artifacts_under`): the root a program's
+/// preprocessed column group has when its proofs commit under `S`.
+pub fn commit_lde_columns_under<S: StarkHash>(
+    lde_columns: &[Vec<FE>],
+    layout: LeafLayout,
+) -> Commitment {
+    let (_, root) = commit_bit_reversed_with::<GoldilocksField, S::Batched<GoldilocksField>>(
+        lde_columns,
+        layout.rows_per_leaf(),
+    )
     .expect("Merkle build failed for LFM column group");
     root
 }
@@ -227,6 +237,20 @@ pub fn commit_group_device_or_host_with(
     options: &ProofOptions,
     layout: LeafLayout,
 ) -> Commitment {
+    commit_group_device_or_host_under::<crate::hash_pin::BlockStarkHash>(
+        label, group, options, layout,
+    )
+}
+
+/// [`commit_group_device_or_host_with`] under the commitment configuration
+/// `S`: the card's kernels for `S`'s hash (`DeviceTreeBackend`), or the host
+/// commit under `S`.
+pub fn commit_group_device_or_host_under<S: StarkHash>(
+    label: &str,
+    group: &ColumnGroup,
+    options: &ProofOptions,
+    layout: LeafLayout,
+) -> Commitment {
     #[cfg(feature = "cuda")]
     if device_artifacts() && group.padded_rows > 0 && group.width > 0 {
         let set = stark::device_set::commit_device_set_rpl(
@@ -252,7 +276,7 @@ pub fn commit_group_device_or_host_with(
         let probe_t = super::tree_probe::enabled().then(std::time::Instant::now);
         let committed = stark::gpu_lde::try_commit_row_major_with::<
             GoldilocksField,
-            <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>,
+            S::Batched<GoldilocksField>,
         >(
             label,
             &group.data,
@@ -272,7 +296,7 @@ pub fn commit_group_device_or_host_with(
     }
     let _ = label;
     HOST_GROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    commit_lde_columns_with(&lde_columns(&group_columns(group), options), layout)
+    commit_lde_columns_under::<S>(&lde_columns(&group_columns(group), options), layout)
 }
 
 /// Commits one instruction column group.
