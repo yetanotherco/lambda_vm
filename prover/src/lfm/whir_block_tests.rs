@@ -2605,6 +2605,20 @@ fn the_whir_block_tree_on_a_real_block() {
         multilinear::gpu::gkr_tree_refusals(),
         multilinear::gpu_fused::fused_declines(),
     );
+    // The precomputed trees the run downloaded on cache misses, by path, and
+    // the staging pairs' waits (I-COPIES L1): the recursion's LFM proofs are
+    // where they happen.
+    #[cfg(feature = "cuda")]
+    println!(
+        "W3 TREE DOWNLOAD ({}): {} · staging pair waits {}",
+        if math_cuda::device::tree_download_staged() {
+            "staged"
+        } else {
+            "pageable"
+        },
+        math_cuda::device::tree_download_totals().line(),
+        math_cuda::device::staging_totals().pair_waits
+    );
     // The top proof's bytes: two runs prove the same ones under
     // LAMBDA_VM_FIXED_TRACE_HASH=1 and LAMBDA_VM_DETERMINISTIC_GRIND=1.
     let top_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&top.proof).expect("serialize the top");
