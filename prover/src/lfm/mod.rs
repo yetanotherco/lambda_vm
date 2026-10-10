@@ -197,6 +197,8 @@ mod one_row_tests;
 #[cfg(test)]
 mod p1_family_tests;
 #[cfg(test)]
+mod p1_node_census_tests;
+#[cfg(test)]
 mod p1_node_tests;
 #[cfg(test)]
 mod p1w16_census_tests;

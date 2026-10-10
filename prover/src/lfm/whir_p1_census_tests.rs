@@ -55,7 +55,7 @@ const RUNTIME_PAGE_BASE: u64 = 0x4000_0000;
 
 /// The statement of [`MEDIAN_MIX`] over `elf_bytes`, its groups packed as the
 /// prover packs them ([`stark::multilinear_block::block_groups`]).
-fn median_statement(
+pub(super) fn median_statement(
     elf_bytes: &[u8],
     opts: &crate::ProofOptions,
     format: &BlockFormat,
