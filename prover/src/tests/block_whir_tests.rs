@@ -1691,6 +1691,111 @@ fn no_disk_is_off_beside_live_regeneration_and_auto_without_it() {
     }
 }
 
+/// ★ Both regenerators start at the finish's end (N4c), before phase A has
+/// committed its last groups: the rest's regenerator takes each table's fate
+/// as phase A decides it. With each of the rest's drops held back (so the
+/// regenerator meets tables not yet decided), every dropped table is still
+/// rebuilt and deposited, and the proof is regeneration off's bytes; started
+/// with phase B instead (the knob off), the same.
+#[test]
+fn regenerators_started_at_the_finishs_end_prove_the_same_bytes() {
+    use crate::block_whir::BlockSpillPolicy;
+    use crate::block_whir::regen::RegenMode;
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let (plain, _) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Off,
+        BlockSpillPolicy::Off,
+        Deviations::default(),
+    )
+    .expect("prove");
+    for early in [true, false] {
+        let (proof, stamps) = regenerated(
+            &elf,
+            &format,
+            RegenMode::Always,
+            BlockSpillPolicy::Off,
+            Deviations {
+                regen_early: Some(early),
+                rest_drop_delay: Some(std::time::Duration::from_millis(150)),
+                ..Deviations::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("early {early}: {e:?}"));
+        let r = stamps.regen.expect("live regeneration's readout");
+        let lines = r.lines.join("\n");
+        assert_eq!(r.head_start.is_some(), early, "{lines}");
+        assert!(r.rest_dropped > 0 && r.dropped > r.rest_dropped, "{lines}");
+        assert_eq!(r.regenerated, r.dropped, "{lines}");
+        assert_eq!((r.mismatches, r.failed), (0, 0), "{lines}");
+        if early {
+            // The rest's regenerator asked for some table before phase A had
+            // decided it, and waited.
+            let late = lines
+                .split("started before phase A's end: ")
+                .nth(1)
+                .and_then(|t| t.split(' ').next())
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(0);
+            assert!(
+                late > 0,
+                "no table decided after the regenerator asked\n{lines}"
+            );
+        }
+        assert_eq!(proof.groups, plain.groups, "early {early}: the partition");
+        assert!(verify(&proof, &elf, &format), "early {early}");
+        if crypto::grinding::deterministic() {
+            assert!(
+                bytes(&proof) == bytes(&plain),
+                "early {early}: the proof differs"
+            );
+        }
+    }
+}
+
+/// N4c's liveness: phase A ends in an error right after the finish, with both
+/// regenerators started and the rest's waiting on tables not yet decided. The
+/// prove returns the error (their windows closed, their threads joined) and
+/// never hangs.
+#[test]
+fn an_early_regenerator_never_hangs_a_failed_phase_a() {
+    use crate::block_whir::BlockSpillPolicy;
+    use crate::block_whir::regen::RegenMode;
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let out = regenerated(
+            &elf,
+            &format,
+            RegenMode::Always,
+            BlockSpillPolicy::Off,
+            Deviations {
+                regen_early: Some(true),
+                rest_drop_delay: Some(std::time::Duration::from_millis(400)),
+                abort_after_finish: true,
+                ..Deviations::default()
+            },
+        );
+        let _ = tx.send(out.map(|_| ()).map_err(|e| format!("{e:?}")));
+    });
+    let out = rx
+        .recv_timeout(std::time::Duration::from_secs(600))
+        .expect("the failed prove returned");
+    let why = out.expect_err("phase A failed");
+    assert!(
+        why.contains("a test's abort right after the finish"),
+        "{why}"
+    );
+}
+
 /// ★ Live regeneration never proves over columns it did not rebuild, and never
 /// hangs: a deposit one bit off is refused at its slot before any device work
 /// ("not the ones dropped"); with the digest off, the kept tree top refuses it
