@@ -333,16 +333,19 @@ fn prove_and_verify(ops: &[BranchOperation]) -> bool {
         (&receiver_air, &mut receiver_trace, &()),
     ];
 
-    let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
+    let multi_proof = multi_prove_ram(
+        air_trace_pairs,
+        &mut crate::hash_pin::legacy_transcript(&[]),
+    )
+    .unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
 
-    crate::hash_pin::BlockVerifier::multi_verify(
+    crate::hash_pin::LegacyVerifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut crate::hash_pin::block_transcript(&[]),
+        &mut crate::hash_pin::legacy_transcript(&[]),
         &FieldElement::zero(),
     )
 }
@@ -423,16 +426,19 @@ fn prove_and_verify_custom(ops: &[BranchOperation], receiver_rows: &[CustomBranc
         (&receiver_air, &mut receiver_trace, &()),
     ];
 
-    let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
+    let multi_proof = multi_prove_ram(
+        air_trace_pairs,
+        &mut crate::hash_pin::legacy_transcript(&[]),
+    )
+    .unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
 
-    crate::hash_pin::BlockVerifier::multi_verify(
+    crate::hash_pin::LegacyVerifier::multi_verify(
         &airs,
         &multi_proof,
-        &mut crate::hash_pin::block_transcript(&[]),
+        &mut crate::hash_pin::legacy_transcript(&[]),
         &FieldElement::zero(),
     )
 }

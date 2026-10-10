@@ -1070,7 +1070,7 @@ mod tests {
         arena: &[Vec<crate::lfm::LfmWord>],
         what: &str,
     ) -> crate::lfm::LfmExecution {
-        match crate::lfm::execute(program, arena, &crate::hash_pin::BLOCK_HASHER) {
+        match crate::lfm::execute(program, arena, &crate::hash_pin::LEGACY_HASHER) {
             Ok(exec) => exec,
             Err(crate::lfm::LfmExecError::DivByZero { addr }) => panic!(
                 "{what} REFUSED — a failing equality assert, not a machine fault.\n{}",

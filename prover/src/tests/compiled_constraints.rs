@@ -105,7 +105,7 @@ pub(crate) fn production_programs(
         &roots,
         opts,
         1,
-        crate::hash_pin::BLOCK_HASHER,
+        crate::hash_pin::LEGACY_HASHER,
         crate::lfm::airs::ChipSet::FULL,
     );
     for air in lfm.air_refs() {
@@ -411,7 +411,7 @@ impl FixedTraces {
             .iter()
             .filter(|c| c.is_private_input)
             .count();
-        let mut transcript = crate::hash_pin::block_transcript(&[]);
+        let mut transcript = crate::hash_pin::legacy_transcript(&[]);
         crate::statement::absorb_statement(
             &mut transcript,
             crate::statement::StatementKind::Monolithic,

@@ -1569,7 +1569,7 @@ pub fn whir_epoch_program(epoch: &WhirRealEpoch, airs: EpochAirs<'_>) -> LfmProg
     let words = whir_epoch_arena(epoch, airs);
     let total = words[0].len() as u32;
 
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(total);
     let mut at = 0u32;
 

@@ -103,7 +103,7 @@ pub fn commit_lde_columns_with(lde_columns: &[Vec<FE>], layout: LeafLayout) -> C
     // one — `registry.rs` records that as the condition under which this read
     // moves, and the pin is what moved it. A base table under another base
     // format commits through [`commit_lde_columns_for`].
-    commit_lde_columns_under::<crate::hash_pin::BlockStarkHash>(lde_columns, layout)
+    commit_lde_columns_under::<crate::hash_pin::LegacyStarkHash>(lde_columns, layout)
 }
 
 /// [`commit_lde_columns_with`] under the base configuration `options` names
@@ -338,7 +338,7 @@ pub(super) fn commit_group_device_or_host_in(
         };
         let committed = match crate::hash_pin::base_of(&options.format) {
             crate::hash_pin::BaseHash::Rpx => commit_group_device_under::<
-                crate::hash_pin::BlockStarkHash,
+                crate::hash_pin::LegacyStarkHash,
             >(label, group, options, layout),
             crate::hash_pin::BaseHash::P1 => commit_group_device_under::<
                 crate::lfm::p1_commit::P1StarkHash,

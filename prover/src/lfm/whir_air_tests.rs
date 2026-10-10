@@ -178,7 +178,7 @@ fn factor_values(shape: &Shape, seed: u64) -> Vec<FEE> {
 /// `combine` over hinted betas and hinted factor values, the answer published.
 fn combine_program(shape: &Shape, num_values: usize) -> LfmProgram {
     let roots = shape.num_roots();
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena((roots + num_values) as u32);
     let betas: Vec<_> = (0..roots)
         .map(|i| b.hint_word(arena, i as u32).as_ext())
@@ -198,7 +198,7 @@ fn marginal_rows(shape: &Shape, num_values: usize) -> usize {
     let roots = shape.num_roots();
     let with = combine_program(shape, num_values);
     let without = {
-        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
         let arena = b.declare_arena((roots + num_values) as u32);
         let first = b.hint_word(arena, 0).as_ext();
         for i in 1..roots + num_values {
@@ -235,7 +235,7 @@ fn the_combine_leg_computes_what_the_host_computes() {
                         .map(ext_word)
                         .collect::<Vec<_>>(),
                 ];
-                let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+                let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
                     .unwrap_or_else(|e| panic!("{name}: the combine leg must execute: {e:?}"));
                 let got =
                     word_as_ext(&exec.public_words[0].1).expect("a published extension value");

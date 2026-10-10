@@ -175,7 +175,7 @@ fn reduce_program(num_vars: usize, num_columns: usize, sources: &[FactorSource])
         num_vars,
         num_columns,
     };
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(layout.total());
     let mut transcript = WhirTranscript::new();
 
@@ -278,7 +278,7 @@ fn the_reduce_leg_executes_and_lands_where_the_host_does() {
         let program = reduce_program(num_vars, num_columns, &sources);
         let arena = reduce_arena(&f, &f.proof, num_columns);
         let exec =
-            execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
+            execute(&program, &[arena], &crate::hash_pin::LEGACY_HASHER).unwrap_or_else(|e| {
                 panic!(
                     "{num_vars} vars, {} factors: the machine refused an accepted proof: {e:?}",
                     sources.len()
@@ -318,7 +318,7 @@ fn a_tampered_reduction_cannot_execute() {
         execute(
             &program,
             &[reduce_arena(&f, &f.proof, num_columns)],
-            &crate::hash_pin::BLOCK_HASHER
+            &crate::hash_pin::LEGACY_HASHER
         )
         .is_ok(),
         "the ground proof must execute"
@@ -354,7 +354,7 @@ fn a_tampered_reduction_cannot_execute() {
             arena[i] = ext_word(value);
         }
         assert!(
-            execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER).is_err(),
+            execute(&program, &[arena], &crate::hash_pin::LEGACY_HASHER).is_err(),
             "the machine must refuse the forgery at {site}"
         );
         refused += 1;

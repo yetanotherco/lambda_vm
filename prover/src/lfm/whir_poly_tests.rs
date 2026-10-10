@@ -29,7 +29,7 @@ fn sample(seed: u64, n: usize) -> Vec<FEE> {
 
 /// `eq` over `n` variables, both points hinted, the result published.
 fn eq_only_program(n: usize) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(2 * n as u32);
     let r: Vec<_> = (0..n)
         .map(|i| b.hint_word(arena, i as u32).as_ext())
@@ -48,7 +48,7 @@ fn eq_only_program(n: usize) -> LfmProgram {
 fn marginal_rows(n: usize) -> usize {
     let with = eq_only_program(n);
     let without = {
-        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
         let arena = b.declare_arena(2 * n as u32);
         let first = b.hint_word(arena, 0).as_ext();
         for i in 1..2 * n {
@@ -80,7 +80,7 @@ fn the_eq_leg_emits_its_closed_form() {
 /// each leg's plumbing contributes, which is countable by construction rather
 /// than by differencing against another program.
 fn legs_rows(n: usize, legs: usize) -> usize {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena((2 * n * legs) as u32);
     for leg in 0..legs {
         let base = (2 * n * leg) as u32;
@@ -170,7 +170,7 @@ fn eq_over_no_variables_is_the_empty_product() {
     );
 
     let program = eq_only_program(0);
-    let exec = execute(&program, &[Vec::new()], &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &[Vec::new()], &crate::hash_pin::LEGACY_HASHER)
         .expect("the eq leg executes over an empty point");
     let got = word_as_ext(&exec.public_words[0].1).expect("a published extension value");
     let want = eq_eval::<GoldilocksExtension>(&[], &[]).expect("the host agrees on the width");
@@ -190,7 +190,7 @@ fn the_eq_leg_computes_what_the_host_computes() {
             let r = sample(seed, n);
             let x = sample(seed ^ 0xFFFF, n);
             let arenas = vec![r.iter().chain(x.iter()).map(ext_word).collect::<Vec<_>>()];
-            let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+            let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
                 .expect("the eq leg executes");
             let got = word_as_ext(&exec.public_words[0].1).expect("a published extension value");
             let want = eq_eval(&r, &x).expect("the host agrees on the width");
@@ -220,7 +220,7 @@ fn eq_is_one_on_the_diagonal_and_zero_off_it() {
     };
     let run = |r: &[FEE], x: &[FEE]| -> FEE {
         let arenas = vec![r.iter().chain(x.iter()).map(ext_word).collect::<Vec<_>>()];
-        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).expect("executes");
+        let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER).expect("executes");
         word_as_ext(&exec.public_words[0].1).expect("a published extension value")
     };
     for mask in [0usize, 1, 0b101010, 0b111111] {
@@ -247,7 +247,7 @@ fn eq_is_one_on_the_diagonal_and_zero_off_it() {
 /// arena rule forbids deriving a challenge from an arena. The replay supplies
 /// them in the assembled program.
 fn sumcheck_program(degree: usize, rounds: usize) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(sumcheck_arena_words(degree, rounds) as u32);
     let claim = b.hint_word(arena, 0).as_ext();
     let mut evaluations = Vec::with_capacity(rounds);
@@ -385,7 +385,7 @@ fn a_degree_zero_rule_is_verified_at_degree_one() {
         arena.push(ext_word(r));
     }
     let program = sumcheck_program(1, rounds);
-    let exec = execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &[arena], &crate::hash_pin::LEGACY_HASHER)
         .expect("the sumcheck leg executes at the clamped width");
     let got = word_as_ext(&exec.public_words[0].1).expect("a published claim");
     assert_eq!(
@@ -429,7 +429,7 @@ fn the_sumcheck_leg_computes_what_the_host_computes() {
                     arena.push(ext_word(r));
                 }
                 let program = sumcheck_program(degree, rounds);
-                let exec = execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER)
+                let exec = execute(&program, &[arena], &crate::hash_pin::LEGACY_HASHER)
                     .expect("the sumcheck leg executes");
                 let got = word_as_ext(&exec.public_words[0].1).expect("a published claim");
                 assert_eq!(
@@ -444,7 +444,7 @@ fn the_sumcheck_leg_computes_what_the_host_computes() {
 
 /// `shift_k` over `n` variables, both points hinted, the result published.
 fn shift_only_program(n: usize, k: usize) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(2 * n as u32);
     let x: Vec<_> = (0..n)
         .map(|i| b.hint_word(arena, i as u32).as_ext())
@@ -464,7 +464,7 @@ fn shift_only_program(n: usize, k: usize) -> LfmProgram {
 fn shift_marginal_rows(n: usize, k: usize) -> usize {
     let with = shift_only_program(n, k);
     let without = {
-        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
         let arena = b.declare_arena(2 * n as u32);
         let first = b.hint_word(arena, 0).as_ext();
         for i in 1..2 * n {
@@ -542,7 +542,7 @@ fn the_shift_leg_computes_what_the_host_computes() {
             let x = sample(seed, n);
             let y = sample(seed ^ 0xFFFF, n);
             let arenas = vec![x.iter().chain(y.iter()).map(ext_word).collect::<Vec<_>>()];
-            let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+            let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
                 .expect("the shift leg executes");
             let got = word_as_ext(&exec.public_words[0].1).expect("a published extension value");
             let want = shift_eval(&x, &y, k).expect("the host agrees on the width");
@@ -591,7 +591,7 @@ fn the_shift_is_one_exactly_where_the_index_advances() {
                 let x = corner(from);
                 let y = corner(to);
                 let arenas = vec![x.iter().chain(y.iter()).map(ext_word).collect::<Vec<_>>()];
-                let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+                let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
                     .expect("the shift leg executes");
                 let got = word_as_ext(&exec.public_words[0].1).expect("a published value");
                 let want = if to == (from + k) % size {

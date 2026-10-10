@@ -434,13 +434,13 @@ fn the_wrap_proves_and_verifies() {
 /// The classification rule, stated here rather than cited — the document that
 /// carries it lands with the RPX pin and does not exist on this branch:
 ///
-/// > A program built at `WrapHash::production()` emits `Instr::Hash` and must
-/// > be proved under `BLOCK_HASHER`. A program that pins a byte hash on its own
+/// > A program built at `WrapHash::legacy()` emits `Instr::Hash` and must
+/// > be proved under `LEGACY_HASHER`. A program that pins a byte hash on its own
 /// > builder emits none, never consults the socket, and is correct at the
 /// > registry's blessed default under every pin.
 ///
-/// `epoch_tests::epoch_program` builds at [`WrapHash::production()`], so this
-/// site is in the first class and must name [`crate::hash_pin::BLOCK_HASHER`].
+/// `epoch_tests::epoch_program` builds at [`WrapHash::legacy()`], so this
+/// site is in the first class and must name [`crate::hash_pin::LEGACY_HASHER`].
 /// It does, twice over: `build_artifacts_with_hasher` for the artifacts and
 /// `lfm_cell_counts_with_hasher` for the numbers, so neither the proof nor the
 /// census can be taken at `HasherKind::default()`.
@@ -555,12 +555,12 @@ fn fixture_wrap_run(inner: ProofOptions, inputs: EpochInputs) {
     // RPO 436, RPX 316), so a defaulted census does not report a smaller number
     // under an algebraic pin — it reports the wrong chip's.
     let (main, aux) =
-        super::airs::lfm_cell_counts_with_hasher(&program, crate::hash_pin::BLOCK_HASHER);
+        super::airs::lfm_cell_counts_with_hasher(&program, crate::hash_pin::LEGACY_HASHER);
     println!(
         "   census at {:?}: {main} main + {aux} aux ext = {} base-field equivalents; \
          PROJECTED peak RSS {:.1} GiB (a projection from slice 0's coefficient, \
          not a measurement of this run)",
-        crate::hash_pin::BLOCK_HASHER,
+        crate::hash_pin::LEGACY_HASHER,
         main + 3 * aux,
         projected_peak_bytes(main, aux) / (1u64 << 30) as f64,
     );
@@ -579,7 +579,7 @@ fn fixture_wrap_run(inner: ProofOptions, inputs: EpochInputs) {
     let artifacts = super::registry::build_artifacts_with_hasher(
         &program,
         &opts,
-        crate::hash_pin::BLOCK_HASHER,
+        crate::hash_pin::LEGACY_HASHER,
     );
     println!(
         "   wrap options: blowup {}, {} queries (the framework's 128-bit count), \
@@ -739,7 +739,7 @@ fn the_wrap_reports_gpu_counters() {
     let program = super::epoch_tests::epoch_program(&e, true);
     let arenas = super::epoch_tests::epoch_arena_words(&e, true);
     let opts = wrap_options();
-    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::LEGACY_HASHER);
     println!("   chip log-heights: {:?}", artifacts.log_heights);
 
     g::reset_all_gpu_call_counters();
@@ -901,7 +901,7 @@ fn wrap_run_from(inner: ProofOptions, inputs: EpochInputs) {
     // after it — so both sides of the closed-form check follow it: the emitted
     // count is that hash's own instruction, and the prediction uses its block
     // rule. Counting keccak against a BLAKE3 leg reads 0 and fails spuriously.
-    let wrap_hash = WrapHash::production();
+    let wrap_hash = WrapHash::legacy();
     let leg_hash_ops = hash_ops(&program, wrap_hash) - hash_ops(&spine, wrap_hash);
     let predicted: usize = e
         .legs
@@ -930,7 +930,7 @@ fn wrap_run_from(inner: ProofOptions, inputs: EpochInputs) {
     report_ratio(&e, main, aux);
 
     let opts = wrap_options();
-    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::LEGACY_HASHER);
     println!(
         "   wrap options: blowup {}, {} queries, grinding {}\n   chip log-heights: {:?}",
         opts.blowup_factor, opts.fri_number_of_queries, opts.grinding_factor, artifacts.log_heights
@@ -1109,7 +1109,7 @@ fn the_wrap_commitments_match_across_residency_modes() {
     let program = super::epoch_tests::epoch_program(&e, true);
     let arenas = super::epoch_tests::epoch_arena_words(&e, true);
     let opts = wrap_options();
-    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::LEGACY_HASHER);
 
     let prove_under = |residency: ResidencyMode| {
         let t = Instant::now();
@@ -1357,7 +1357,7 @@ fn the_wrap_census_at_blowup_8() {
     // under the production hash before running it there; until then, fail with
     // the cause named instead of an inscrutable count mismatch.
     assert_eq!(
-        WrapHash::production(),
+        WrapHash::legacy(),
         WrapHash::Keccak,
         "the blowup-8 census's pinned predictions are keccak-era; re-derive them \
          under the production wrap hash before running this instrument"
@@ -1755,7 +1755,7 @@ fn the_from_proof_final_epoch_wraps() {
     let program = super::epoch_tests::epoch_program(&e, true);
     let arenas = super::epoch_tests::epoch_arena_words(&e, true);
     let opts = wrap_options();
-    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::LEGACY_HASHER);
 
     let t = Instant::now();
     let proved = lfm_prove(&program, &artifacts, &arenas, &opts).expect("the wrap must prove");
@@ -1907,7 +1907,7 @@ fn the_real_block_proves_and_wraps_end_to_end() {
         let program = super::epoch_tests::epoch_program(&e, true);
         let arenas = super::epoch_tests::epoch_arena_words(&e, true);
         let artifacts =
-            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_with_hasher(&program, &wrap_opts, crate::hash_pin::LEGACY_HASHER);
         let c = t.elapsed().as_secs_f64();
         construct_secs += c;
 

@@ -161,12 +161,12 @@ pub(crate) fn census_panel(
 ) -> (u64, usize, String) {
     let (main, aux) = super::airs::lfm_cell_counts_with_hasher(
         program,
-        program.hasher(crate::hash_pin::BLOCK_HASHER),
+        program.hasher(crate::hash_pin::LEGACY_HASHER),
     );
     let cells = main + 3 * aux;
     let panel = super::airs::lfm_chip_census_with_hasher(
         program,
-        program.hasher(crate::hash_pin::BLOCK_HASHER),
+        program.hasher(crate::hash_pin::LEGACY_HASHER),
     );
     let text = census_panel_text(label, cells, program.instrs.len(), &panel, fan_in);
     (cells, program.instrs.len(), text)

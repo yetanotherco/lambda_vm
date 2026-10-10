@@ -15,9 +15,9 @@ round is linear. Cheaper on the host and narrower in the AIR than RPO
 
 | pin item | value |
 |---|---|
-| `BlockStarkHash` | `algebraic_commit::RpxStarkHash` |
-| `BlockTranscript` / `block_transcript()` | `algebraic_transcript::AlgebraicTranscript`, built `with_seed(BLOCK_HASHER, seed)` |
-| `BLOCK_HASHER` | `hash::HasherKind::Rpx` |
+| `LegacyStarkHash` | `algebraic_commit::RpxStarkHash` |
+| `LegacyTranscript` / `legacy_transcript()` | `algebraic_transcript::AlgebraicTranscript`, built `with_seed(LEGACY_HASHER, seed)` |
+| `LEGACY_HASHER` | `hash::HasherKind::Rpx` |
 
 ⚖ **Provenance, stated plainly.** Miden publishes no known-answer table for
 RPX — the opposite of RPO's nineteen published vectors — so this hash has a
@@ -46,15 +46,15 @@ hash does the block path use" into a property of one module.
 
 | axis | name | this pin |
 |---|---|---|
-| what the HOST commits under | `BlockStarkHash` | `algebraic_commit::RpxStarkHash` |
-| the Fiat–Shamir transcript OBJECT | `BlockTranscript` / `block_transcript` | `algebraic_transcript::AlgebraicTranscript` |
-| the `LFM_HASH` socket permutation | `BLOCK_HASHER` | `hash::HasherKind::Rpx` |
+| what the HOST commits under | `LegacyStarkHash` | `algebraic_commit::RpxStarkHash` |
+| the Fiat–Shamir transcript OBJECT | `LegacyTranscript` / `legacy_transcript` | `algebraic_transcript::AlgebraicTranscript` |
+| the `LFM_HASH` socket permutation | `LEGACY_HASHER` | `hash::HasherKind::Rpx` |
 
 ⚠ **Axis 2 is the dangerous one.** `StarkHash::Transcript` names a *digest*
 configuration, which is what GRINDING computes over; the Fiat–Shamir transcript
 *object* is built by the caller and handed to `multi_prove`, so the type system
 does not force it to match. For the byte hashes the two coincide. For an
-algebraic hash they do not, and a branch that pinned only `BlockStarkHash`
+algebraic hash they do not, and a branch that pinned only `LegacyStarkHash`
 would commit under RPX while sponging Fiat–Shamir through bytes — self-consistent
 between prover and verifier, and therefore **silent**.
 
@@ -74,14 +74,14 @@ the builder default are one definition. The hasher is part of program IDENTITY
 (`HasherKind::as_tag` is folded into `lfm_program_id`), so the block path names
 its hasher AT THE CALL SITE instead:
 
-> **A program built at `WrapHash::production()` emits `Instr::Hash` and must be
-> proved under `BLOCK_HASHER`. A program that pins a byte hash on its own
+> **A program built at `WrapHash::legacy()` emits `Instr::Hash` and must be
+> proved under `LEGACY_HASHER`. A program that pins a byte hash on its own
 > builder emits none, never consults the socket, and is correct at the
 > registry's blessed default under every pin.**
 
 It is *checkable*, not a judgement — read which program the site builds. The 17
 block-path sites (`wrap_tests` 8, `aggregator_tests` 7, `fri_tests` 1,
-`join_tests` 1) name `BLOCK_HASHER` through `build_artifacts_with_hasher`;
+`join_tests` 1) name `LEGACY_HASHER` through `build_artifacts_with_hasher`;
 `wrap_tests`' keccak-chain census site keeps the default because
 `keccak_chain_program` pins keccak on its own builder. The registry-identity
 suites (`machine_tests`, the chip suites) keep the default too — that is what
@@ -92,7 +92,7 @@ the pin.** Beyond violating the table's own doctrine — *a second hasher become
 additional ROWS, never a silent replacement* — it would move registry
 identities on the BLAKE3 control, converting "control drifted → STOP and
 investigate" into a self-inflicted alarm on the one measurement the comparison
-turns on. `build_artifacts` was briefly made to name `BLOCK_HASHER` itself;
+turns on. `build_artifacts` was briefly made to name `LEGACY_HASHER` itself;
 that fixed a real aggregator defect at the wrong scope, and every registry
 identity moved.
 
@@ -101,7 +101,7 @@ identity moved.
 `prover/src/tests/hash_pin_enumeration.rs` scans the crate for any code line
 reaching `DefaultStarkHash`, `DefaultStarkTranscript` or `HasherKind::default()`,
 any `Prover::multi_prove` / `Verifier::multi_verify` call that is not the
-`BlockProver::` / `BlockVerifier::` spelling, and any item taken from
+`LegacyProver::` / `LegacyVerifier::` spelling, and any item taken from
 `stark::config` outside the hash-agnostic allowlist (`Commitment`,
 `CommitmentHash`, `StarkHash`, `DeviceTreeBackend`) — an allowlist over a
 namespace, because a name list always lags one spelling behind the newest way
@@ -117,7 +117,7 @@ one; the instruments for that are `hash_pin::tests` and the differentials in
 argument. The machine side passes `edsl::digest_words(b)` — the builder's width,
 the one every emitter advances its cursor by — and the host side passes
 `proof_arena::words_per_root()`, the width it serialises roots at. A shape that
-read the configuration instead agreed with a builder at `WrapHash::production()`
+read the configuration instead agreed with a builder at `WrapHash::legacy()`
 and disagreed with any other, and the executor's arena-length check is strict:
 a program declaring a roots arena at a literal two words per digest is an
 `ArenaLenMismatch` under this pin, not a slow path.
@@ -192,7 +192,7 @@ commas are the only expected textual difference) BEFORE trusting it on RPX.
 ⛔ **AND THAT IS ALL THE CONTROL PROVES.** `compute_lfm_registry` names
 `REGISTRY_HASHER` explicitly and never reads `build_artifacts`, so re-running it
 validates the generator **against itself**. When `build_artifacts` was briefly
-changed to name `BLOCK_HASHER`, every registry `program_id` moved and this
+changed to name `LEGACY_HASHER`, every registry `program_id` moved and this
 control reproduced byte-for-byte anyway — it could not have fired. **The check
 that fires is `machine_tests::registry_drift_*`**, because it recomputes from
 the changed path and compares against the blessed table. A self-consistency
@@ -237,7 +237,7 @@ chain return `[Cell; 2]` because those digests genuinely are two cells.
   A fresh directory still persists artifacts, so an aggregation OOM does not
   cost the first hour again.
 - The fixture cache is separate and IS keyed on the pin:
-  `proof_fixture::cache_format_key()` reads `BLOCK_COMMITMENT_HASH`, so this pin
+  `proof_fixture::cache_format_key()` reads `LEGACY_COMMITMENT_HASH`, so this pin
   gets its own blob for free.
 - **Proof BYTES do not reproduce run to run** (grinding draws a nonce
   non-deterministically); roots do. Never `sha256`-compare proofs.
@@ -258,7 +258,7 @@ recorded here so nobody rediscovers them from a red run:
 |---|---|---|
 | `epoch_tests::the_batched_query_census_matches_the_closed_form`, `epoch_tests::the_assembled_carved_batched_epoch_verifier_runs` | the census closures count `Instr::KeccakF` / `Instr::Blake3` only; the algebraic wrap hash is `Instr::Hash`, and `batched_query_permutations_for` has no algebraic arm | byte-hash counter model; algebraic arm owed |
 | `fri_tests::the_emitted_permutation_count_meets_the_pinned_prediction`, `fri_tests::the_fri_join_adds_no_second_point_derivation` | "six component byteswaps per layer" and the leaf-swap decompositions are byte-encoding costs; an algebraic leaf needs none | byte-hash counter model; algebraic arm owed |
-| `machine_tests::transcript_replay_cell_counts`, `machine_tests::register_derivation_cost` | `wrap_hash_rows` dispatches on `WrapHash::production()`, not on the PROGRAM's own builder hash, so a registry program pinned to BLAKE3 counts zero rows under an algebraic pin | the helper must read the program's hash |
+| `machine_tests::transcript_replay_cell_counts`, `machine_tests::register_derivation_cost` | `wrap_hash_rows` dispatches on `WrapHash::legacy()`, not on the PROGRAM's own builder hash, so a registry program pinned to BLAKE3 counts zero rows under an algebraic pin | the helper must read the program's hash |
 | `machine_tests::the_register_derivation_matches_production`, `machine_tests::the_register_derivation_proves_and_verifies` | `register_derivation_program` is built at `WrapHash::Blake3` and has no algebraic arm, while production's REGISTER commitment now follows the pin | ⚠ FEATURE GAP (the machine REGISTER derivation under an algebraic hash), planned as its own item, not a test fix |
 | `per_table_census_tests::the_blake3_tenant_socket_matches_the_record` | lane C's guard, firing correctly: the recorded census — and the lever-0 figure of record it anchors — was produced under the Test/BLAKE3 socket, and this build's socket is RPX | re-record the census under the pin (follow-up); do NOT weaken the guard |
 | `epoch_tests::the_closure_rejects_a_moved_index_or_output` | the fixture epoch reports an empty public output; fails at the pre-pin head too | PRE-EXISTING on `per-table-gpu`, not the pin's |

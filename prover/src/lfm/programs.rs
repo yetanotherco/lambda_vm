@@ -303,7 +303,7 @@ pub const TRANSCRIPT_QUERY_BITS: usize = 20;
 /// ★ The hash the R1d replay is ABOUT, named once so a count over it cannot
 /// drift from the program it counts.
 ///
-/// `WrapHash::production` is deliberately NOT read here — its own doc carves out
+/// `WrapHash::legacy` is deliberately NOT read here — its own doc carves out
 /// the instruments that name their hash directly, and this is one of them. The
 /// script is a BYTE sponge: the table above is denominated in 32- and 136-byte
 /// segments and in which rate block each squeeze lands in, none of which is a
@@ -870,7 +870,7 @@ pub fn merkle_opening_program_source_with_hash(
     let mut b = LfmBuilder::new().with_wrap_hash(wrap_hash);
     // ⚠ A root is `digest_words` arena words, not two. This program takes its
     // hash BY ARGUMENT and `merkle_opening_program` passes
-    // `WrapHash::production()`, so under an algebraic pin every stride here is
+    // `WrapHash::legacy()`, so under an algebraic pin every stride here is
     // ONE word — while `machine_tests::merkle_arenas` writes the siblings with
     // `proof_arena::commitment_words`, which already follows the pin. Spelling
     // the stride `2` made the writer and the reader disagree exactly as the
@@ -918,7 +918,7 @@ pub fn keccak_merkle_opening_program(shape: MerkleOpeningShape) -> LfmProgram {
 /// program above stays exactly as it is — it is the instrument whose identity
 /// the registry pins, and this is a second program, not a re-blessing of it.
 pub fn merkle_opening_program(shape: MerkleOpeningShape) -> LfmProgram {
-    merkle_opening_program_with_hash(shape, WrapHash::production())
+    merkle_opening_program_with_hash(shape, WrapHash::legacy())
 }
 
 pub fn merkle_opening_program_with_hash(
@@ -968,7 +968,7 @@ pub fn l2g_binding_program_source(num_epochs: usize) -> LfmProgramSource {
     // The L2G roots are the block path's own commitments, so this program
     // follows the configuration and reads each root at the DIGEST's width —
     // two words on a byte hash, one on an algebraic one — never a literal two.
-    let mut b = LfmBuilder::new().with_wrap_hash(edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(edsl::WrapHash::legacy());
     let dw = edsl::digest_words(&b);
     let words = dw * num_epochs as u32;
     let epoch_arena = b.declare_arena(words);
@@ -1507,7 +1507,7 @@ pub fn register_derivation_program_source(shape: RegisterDerivationShape) -> Lfm
     use crate::tables::register::NUM_REGISTER_ADDRESSES;
 
     let supplied = NUM_REGISTER_ADDRESSES as u32;
-    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::legacy());
     let init_arena = b.declare_arena(supplied);
     let fini_arena = b.declare_arena(supplied);
     let init: Vec<_> = (0..supplied).map(|r| b.hint_felt(init_arena, r)).collect();

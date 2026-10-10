@@ -52,7 +52,7 @@
 //! ✓ VERIFIED by reading: [`super::sub_proof::SubProofShape::opening_words`]
 //! (`sub_proof.rs:149`) and [`super::fri::FriShape::query_words`] (`fri.rs:164`)
 //! size their arena strides from `proof_arena::words_per_root()`, which reads
-//! `WrapHash::production()` — the PIN — while
+//! `WrapHash::legacy()` — the PIN — while
 //! [`super::epoch_verify::emit_table_verification`] advances its cursor by
 //! `edsl::digest_words(b)`, which reads the BUILDER. On this branch the pin is
 //! BLAKE3, so a builder at `WrapHash::Algebraic` strides 1 against a declared
@@ -177,7 +177,7 @@ struct Tenant {
 }
 
 /// ⚠⚠ The `LFM_HASH` socket permutation of a BLAKE3-tenant wrap proof is
-/// **`Test`, not `Blake3`** — `hash_pin::BLOCK_HASHER` on a BLAKE3-pinned build.
+/// **`Test`, not `Blake3`** — `hash_pin::LEGACY_HASHER` on a BLAKE3-pinned build.
 ///
 /// The two axes are orthogonal and this is the trap in confusing them. Under a
 /// byte hash the emitter's Merkle work goes through `ByteWrapHash::hash_bytes`,
@@ -620,7 +620,7 @@ fn the_block_rule_is_hash_invariant_on_every_tenant_group() {
 /// the recorded run rather than left to the tenant table's spelling.
 ///
 /// ⚠⚠ **THIS TEST WAS RED, AND THE DEFECT WAS THE ASSERTION, NOT THE NUMBER.**
-/// It required `BLAKE3_TENANT_SOCKET == hash_pin::BLOCK_HASHER`, which has been
+/// It required `BLAKE3_TENANT_SOCKET == hash_pin::LEGACY_HASHER`, which has been
 /// false since `603c1e155` (2026-09-08) re-pinned the block path to RPX. The
 /// obvious readings were both wrong:
 ///
@@ -676,7 +676,7 @@ fn the_block_rule_is_hash_invariant_on_every_tenant_group() {
 /// reaches `lfm_chip_census`, which is `lfm_chip_census_with_hasher(program,
 /// HasherKind::default())` and `HasherKind::default()` is `Test` — so it reports
 /// this very pair under ANY pin. That is why the panel below names its hasher on
-/// every line: a census that does not is not evidence about `BLOCK_HASHER`.
+/// every line: a census that does not is not evidence about `LEGACY_HASHER`.
 #[test]
 fn the_blake3_tenant_socket_matches_the_record() {
     /// `LFM_HASH` as `tip-wrappt-24.stdout`'s CHIP CENSUS reports it: 28 main
@@ -691,8 +691,8 @@ fn the_blake3_tenant_socket_matches_the_record() {
     // hasher, because a width without the tag that produced it is the mistake
     // this whole finding is about.
     println!(
-        "\n★ LFM_HASH SOCKET WIDTH BY TENANT — BLOCK_HASHER is {:?}",
-        crate::hash_pin::BLOCK_HASHER
+        "\n★ LFM_HASH SOCKET WIDTH BY TENANT — LEGACY_HASHER is {:?}",
+        crate::hash_pin::LEGACY_HASHER
     );
     for tenant in TENANTS.iter() {
         let airs = tenant.airs(&opts);
@@ -708,7 +708,7 @@ fn the_blake3_tenant_socket_matches_the_record() {
             tenant.algebraic,
             hash.main_cols,
             hash.aux_cols,
-            if tenant.hasher == crate::hash_pin::BLOCK_HASHER {
+            if tenant.hasher == crate::hash_pin::LEGACY_HASHER {
                 "   <== THE PIN"
             } else {
                 ""
@@ -723,7 +723,7 @@ fn the_blake3_tenant_socket_matches_the_record() {
     // ★★ WHAT THE OLD ASSERTION GOT WRONG, and it is a modelling error rather
     // than a stale number. It read
     //
-    //     assert_eq!(BLAKE3_TENANT_SOCKET, hash_pin::BLOCK_HASHER)
+    //     assert_eq!(BLAKE3_TENANT_SOCKET, hash_pin::LEGACY_HASHER)
     //
     // — "the BLAKE3 tenant's socket must be the build's own pin". That ties a
     // COUNTERFACTUAL tenant to the CURRENT build. The BLAKE3 tenant models a
@@ -743,18 +743,18 @@ fn the_blake3_tenant_socket_matches_the_record() {
     //
     // ★ WHAT THE ASSERTION WAS REACHING FOR is below, and it is checkable:
     // production must be the ALGEBRAIC tenant, and one tenant must model it.
-    // ✓ VERIFIED at `c8c7c036e`: `hash_pin::BlockStarkHash = RpxStarkHash`, so
-    // `BLOCK_COMMITMENT_HASH` is `Rpx256`, and `WrapHash::production()` maps
+    // ✓ VERIFIED at `c8c7c036e`: `hash_pin::LegacyStarkHash = RpxStarkHash`, so
+    // `LEGACY_COMMITMENT_HASH` is `Rpx256`, and `WrapHash::legacy()` maps
     // Rpo256/Rpx256/Poseidon to `Algebraic`. The production wrap therefore
     // EMITS `Instr::Hash` and USES the socket — it is the RPX tenant, not the
     // BLAKE3 one. Both halves can fail: a pin moved to a byte commitment hash
     // fails the first, and a TENANTS table that stopped covering the pin fails
     // the second.
     assert_eq!(
-        WrapHash::production(),
+        WrapHash::legacy(),
         WrapHash::Algebraic,
         "the production wrap is the tenant this census prices as `algebraic`. \
-         If `BLOCK_COMMITMENT_HASH` has moved to a byte hash, production is a \
+         If `LEGACY_COMMITMENT_HASH` has moved to a byte hash, production is a \
          BYTE tenant, the baseline and the subject of the lever-0 ratio swap \
          places, and every ratio in this module needs re-reading before it is \
          quoted"
@@ -762,11 +762,11 @@ fn the_blake3_tenant_socket_matches_the_record() {
     assert!(
         TENANTS
             .iter()
-            .any(|t| t.algebraic && t.hasher == crate::hash_pin::BLOCK_HASHER),
+            .any(|t| t.algebraic && t.hasher == crate::hash_pin::LEGACY_HASHER),
         "no tenant models the production wrap: the pin is {:?} and the \
          algebraic tenants are {:?}. The census would then be pricing only \
          builds nobody ships",
-        crate::hash_pin::BLOCK_HASHER,
+        crate::hash_pin::LEGACY_HASHER,
         TENANTS
             .iter()
             .filter(|t| t.algebraic)

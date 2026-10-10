@@ -35,7 +35,7 @@ use std::path::Path;
 /// the gate reported green.
 ///
 /// Matched as call forms rather than as bare identifiers, because `Prover` and
-/// `Verifier` appear inside `IsStarkProver`, `BlockProver` and ordinary prose.
+/// `Verifier` appear inside `IsStarkProver`, `LegacyProver` and ordinary prose.
 /// A line naming the pin is excluded by [`PIN_CALLS`] rather than by the pattern.
 /// `compute_precomputed_commitment_for_testing` joined the list when a test
 /// declared BLAKE3 preprocessed commitments through it while the pinned prover
@@ -47,7 +47,7 @@ const ALIAS_CALLS: &[&str] = &[
 ];
 
 /// The pinned spellings, which contain [`ALIAS_CALLS`] as substrings.
-const PIN_CALLS: &[&str] = &["BlockProver::", "BlockVerifier::"];
+const PIN_CALLS: &[&str] = &["LegacyProver::", "LegacyVerifier::"];
 
 /// ★★ Items `prover` may name from `stark::config` — the hash-AGNOSTIC three.
 ///
@@ -178,8 +178,8 @@ const BLESSED: &[(&str, &str)] = &[
          NON-IGNORED prove sites, which is a narrower claim than `test-only`: \
          `wrap_tests::the_fixture_epoch_wraps` proves the assembled PER-TABLE \
          epoch verifier against artifacts that follow the pin on every suite \
-         run, so it names `lfm_cell_counts_with_hasher(.., BLOCK_HASHER)` and \
-         `build_artifacts_with_hasher(.., BLOCK_HASHER)` rather than either \
+         run, so it names `lfm_cell_counts_with_hasher(.., LEGACY_HASHER)` and \
+         `build_artifacts_with_hasher(.., LEGACY_HASHER)` rather than either \
          defaulting form. Pairing this default with a pinned non-default is the \
          failure the list exists for — the `LFM_HASH` chip's width is \
          tenant-dependent, so a defaulted census under an algebraic pin reports \

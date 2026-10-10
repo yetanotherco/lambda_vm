@@ -34,7 +34,7 @@ fn fe(v: u64) -> FE {
 fn fold_program(log_domain: usize, levels: usize, index_bits: usize) -> LfmProgram {
     let block = 1usize << levels;
     let domain = Domain::<F>::new(log_domain).expect("a domain of that size");
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena((block + levels + 1) as u32);
 
     let values: Vec<Ext> = (0..block)
@@ -187,7 +187,7 @@ fn the_fold_computes_what_the_host_computes() {
                 let exec = execute(
                     &program,
                     &[fold_arena(&words, &alphas, index)],
-                    &crate::hash_pin::BLOCK_HASHER,
+                    &crate::hash_pin::LEGACY_HASHER,
                 )
                 .expect("the fold leg executes");
                 let got = word_as_ext(&exec.public_words[0].1).expect("a published value");
@@ -232,7 +232,7 @@ fn the_fold_over_a_base_block_agrees_with_the_hosts_base_instantiation() {
                 let exec = execute(
                     &program,
                     &[fold_arena(&words, &alphas, index)],
-                    &crate::hash_pin::BLOCK_HASHER,
+                    &crate::hash_pin::LEGACY_HASHER,
                 )
                 .expect("the fold leg executes over a base block");
                 let got = word_as_ext(&exec.public_words[0].1).expect("a published value");
@@ -280,7 +280,7 @@ fn the_point_chain_holds_at_the_widest_indices() {
         let exec = execute(
             &program,
             &[fold_arena(&words, &alphas, index)],
-            &crate::hash_pin::BLOCK_HASHER,
+            &crate::hash_pin::LEGACY_HASHER,
         )
         .expect("the fold leg executes");
         let got = word_as_ext(&exec.public_words[0].1).expect("a published value");
@@ -311,7 +311,7 @@ use super::whir_fold::{
 fn lean_fold_program(log_domain: usize, levels: usize, index_bits: usize) -> LfmProgram {
     let block = 1usize << levels;
     let domain = Domain::<F>::new(log_domain).expect("a domain of that size");
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena((block + levels + 1) as u32);
 
     let values: Vec<Ext> = (0..block)
@@ -399,7 +399,7 @@ fn the_lean_fold_computes_what_the_host_computes() {
                 let exec = execute(
                     &program,
                     &[fold_arena(&words, &alphas, index)],
-                    &crate::hash_pin::BLOCK_HASHER,
+                    &crate::hash_pin::LEGACY_HASHER,
                 )
                 .expect("the lean fold executes");
                 assert_eq!(
@@ -417,7 +417,7 @@ fn the_lean_fold_computes_what_the_host_computes() {
                 let exec = execute(
                     &program,
                     &[fold_arena(&words, &alphas, index)],
-                    &crate::hash_pin::BLOCK_HASHER,
+                    &crate::hash_pin::LEGACY_HASHER,
                 )
                 .expect("the lean fold executes over a base block");
                 assert_eq!(
@@ -442,7 +442,7 @@ fn the_lean_fold_computes_what_the_host_computes() {
         let exec = execute(
             &program,
             &[fold_arena(&words, &alphas, index)],
-            &crate::hash_pin::BLOCK_HASHER,
+            &crate::hash_pin::LEGACY_HASHER,
         )
         .expect("the lean fold executes");
         assert_eq!(
@@ -470,7 +470,7 @@ fn the_lean_fold_moves_with_every_input() {
         let exec = execute(
             &program,
             &[fold_arena(&words, alphas, index)],
-            &crate::hash_pin::BLOCK_HASHER,
+            &crate::hash_pin::LEGACY_HASHER,
         )
         .expect("the lean fold executes");
         word_as_ext(&exec.public_words[0].1).expect("a value")

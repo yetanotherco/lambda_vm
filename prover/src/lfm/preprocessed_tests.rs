@@ -45,7 +45,7 @@ fn sample_point(seed: u64) -> Vec<FEE> {
 /// the point is the reduced claim the sumcheck left, and a challenge must never
 /// come from an arena.
 fn leg_only_program() -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(NUM_VARS as u32);
     let point: Vec<_> = (0..NUM_VARS)
         .map(|i| b.hint_word(arena, i as u32).as_ext())
@@ -67,7 +67,7 @@ fn leg_only_program() -> LfmProgram {
 fn marginal_rows() -> usize {
     let with = leg_only_program();
     let without = {
-        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
         let arena = b.declare_arena(NUM_VARS as u32);
         let point: Vec<_> = (0..NUM_VARS)
             .map(|i| b.hint_word(arena, i as u32).as_ext())
@@ -118,7 +118,7 @@ fn the_bitwise_leg_computes_what_the_host_fold_computes() {
     for seed in [0x5eed_1001u64, 0x5eed_1002] {
         let point = sample_point(seed);
         let arenas = vec![point.iter().map(ext_word).collect::<Vec<_>>()];
-        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
             .expect("the preprocessed leg executes");
         let got: Vec<FEE> = exec
             .public_words
@@ -191,7 +191,7 @@ fn const_mle_fixtures() -> Vec<(&'static str, Vec<Vec<FE>>)> {
 
 /// The leg alone: the point arrives by hint, the columns' values are published.
 fn const_mle_program(columns: &[Vec<FE>], num_vars: usize, leg: bool) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(num_vars as u32);
     let point: Vec<_> = (0..num_vars)
         .map(|i| b.hint_word(arena, i as u32).as_ext())
@@ -245,7 +245,7 @@ fn the_constant_mle_leg_is_the_hosts_fold() {
         for seed in [1u64, 0x5eed, 0xDEAD_BEEF] {
             let point = sample_point_n(seed, num_vars);
             let arena: Vec<_> = point.iter().map(ext_word).collect();
-            let exec = execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER)
+            let exec = execute(&program, &[arena], &crate::hash_pin::LEGACY_HASHER)
                 .unwrap_or_else(|e| panic!("{name}: the leg must execute: {e:?}"));
             assert_eq!(
                 exec.public_words.len(),
@@ -357,7 +357,7 @@ fn a_table_at_the_cap_still_emits() {
     let program = const_mle_program(&columns, num_vars, true);
     let point = sample_point_n(7, num_vars);
     let arena: Vec<_> = point.iter().map(ext_word).collect();
-    let exec = execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &[arena], &crate::hash_pin::LEGACY_HASHER)
         .expect("a table at the cap must still execute");
     let emitted = word_as_ext(&exec.public_words[0].1).expect("a published value");
     let host = Mle::new(column)
@@ -376,7 +376,7 @@ fn a_table_at_the_cap_still_emits() {
 
 /// The ramp leg alone: the point arrives by hint, the one value is published.
 fn ramp_only_program(num_vars: usize, leg: bool) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(num_vars as u32);
     let point: Vec<_> = (0..num_vars)
         .map(|i| b.hint_word(arena, i as u32).as_ext())
@@ -416,7 +416,7 @@ fn the_offset_ramp_computes_what_the_hosts_page_fold_computes() {
     for seed in [0x0ff5_e701u64, 0x0ff5_e702, 0x0ff5_e703] {
         let point = sample_point_n(seed, num_vars);
         let arenas = vec![point.iter().map(ext_word).collect::<Vec<_>>()];
-        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
             .expect("the ramp leg executes");
         assert_eq!(exec.public_words.len(), 1, "the leg publishes one value");
         let got = word_as_ext(&exec.public_words[0].1).expect("an extension value");
@@ -558,7 +558,7 @@ fn the_offset_ramp_is_cheaper_than_the_fold_it_replaces() {
 /// publish ONE word, so the publish cancels out of the delta and what is left is
 /// the leg.
 fn sparse_only_program(column: &[FE], num_vars: usize, leg: bool) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(num_vars as u32);
     let point: Vec<_> = (0..num_vars)
         .map(|i| b.hint_word(arena, i as u32).as_ext())
@@ -626,7 +626,7 @@ fn the_sparse_leg_computes_what_the_hosts_genesis_fold_computes() {
     for seed in [0x5a17_0001u64, 0x5a17_0002, 0x5a17_0003] {
         let point = sample_point_n(seed, num_vars);
         let arenas = vec![point.iter().map(ext_word).collect::<Vec<_>>()];
-        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
             .expect("the sparse leg executes");
         assert_eq!(exec.public_words.len(), 1, "the leg publishes one value");
         let got = word_as_ext(&exec.public_words[0].1).expect("an extension value");
@@ -676,7 +676,7 @@ fn the_sparse_legs_bit_order_is_observable() {
 
     let run = |p: &[FEE]| {
         let arenas = vec![p.iter().map(ext_word).collect::<Vec<_>>()];
-        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
             .expect("the sparse leg executes");
         word_as_ext(&exec.public_words[0].1).expect("an extension value")
     };

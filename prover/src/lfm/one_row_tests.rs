@@ -44,7 +44,7 @@ fn the_commit_helpers_follow_the_layout() {
         .map(|_| (0..64).map(|_| FE::from(splitmix(&mut st))).collect())
         .collect();
     type B =
-        <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>;
+        <crate::hash_pin::LegacyStarkHash as stark::config::StarkHash>::Batched<GoldilocksField>;
     let (_, row) =
         stark::commitment::commit_bit_reversed_with::<GoldilocksField, B>(&cols, 1).expect("tree");
     let (_, pair) =
@@ -189,7 +189,7 @@ fn the_register_derivation_matches_its_host_twin_at_both_layouts() {
                     .collect::<Vec<_>>()
             };
             let arenas = vec![column(&init), column(&fini)];
-            let exec = super::executor::execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+            let exec = super::executor::execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
                 .unwrap_or_else(|e| panic!("blowup {blowup} {layout:?}: {e:?}"));
             let host = crate::tables::register::compute_precomputed_commitment_with_fini_layout(
                 &opts, &init, &fini, layout,

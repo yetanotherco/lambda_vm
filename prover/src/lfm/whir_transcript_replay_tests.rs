@@ -34,12 +34,12 @@ fn leaf_hash_consts(distinct_lengths: usize) -> usize {
 }
 
 fn builder() -> LfmBuilder {
-    LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production())
+    LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy())
 }
 
 fn run_program(program: &LfmProgram, arenas: &[Vec<LfmWord>]) -> Vec<LfmWord> {
     let exec =
-        execute(program, arenas, &crate::hash_pin::BLOCK_HASHER).expect("the replay must execute");
+        execute(program, arenas, &crate::hash_pin::LEGACY_HASHER).expect("the replay must execute");
     exec.public_words.iter().map(|(_, word)| *word).collect()
 }
 
@@ -490,7 +490,7 @@ fn the_grind_accepts_what_the_host_accepts_and_refuses_the_rest() {
         let mut forged = arena.clone();
         forged[seed_felts] = [FE::from(candidate), FE::zero(), FE::zero(), FE::zero()];
         assert!(
-            execute(&program, &[forged], &crate::hash_pin::BLOCK_HASHER).is_err(),
+            execute(&program, &[forged], &crate::hash_pin::LEGACY_HASHER).is_err(),
             "nonce {candidate}: the host rejects it, so the machine must refuse to execute"
         );
         refused += 1;

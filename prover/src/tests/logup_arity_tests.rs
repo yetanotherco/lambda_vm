@@ -57,7 +57,7 @@ fn programs(opts: &ProofOptions) -> Vec<Program> {
         &roots,
         opts,
         1,
-        crate::hash_pin::BLOCK_HASHER,
+        crate::hash_pin::LEGACY_HASHER,
         crate::lfm::airs::ChipSet::FULL,
     );
     for air in lfm.air_refs() {

@@ -315,7 +315,7 @@ fn the_prover_cannot_prove_a_step_size_two_air() {
         _,
         _,
     )> = vec![(&air, &mut trace, &())];
-    let _ = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]));
+    let _ = multi_prove_ram(pairs, &mut crate::hash_pin::legacy_transcript(&[]));
 }
 
 /// ★ The same ceiling, as release actually reaches it — see the debug body above
@@ -338,15 +338,15 @@ fn the_prover_cannot_prove_a_step_size_two_air() {
         _,
         _,
     )> = vec![(&air, &mut trace, &())];
-    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::legacy_transcript(&[]))
         .expect("with the debug_assert compiled out the prover runs to completion");
 
     let refs: Vec<&dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>> = vec![&air];
     assert!(
-        !crate::hash_pin::BlockVerifier::multi_verify_views(
+        !crate::hash_pin::LegacyVerifier::multi_verify_views(
             &refs,
             MultiProofView::Owned(&proof),
-            &mut crate::hash_pin::block_transcript(&[]),
+            &mut crate::hash_pin::legacy_transcript(&[]),
             &FEE::zero(),
         ),
         "production accepted a step_size = 2 proof — the framework ceiling lifted, \
@@ -394,7 +394,7 @@ fn fib_proof() -> (
         _,
         _,
     )> = vec![(&air, &mut trace, &pi)];
-    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::legacy_transcript(&[]))
         .expect("the three-offset fixture must prove");
     (air, pi, proof)
 }
@@ -435,7 +435,7 @@ fn fib_replay(
     // preprocessed and has no aux trace, so it is the main root and nothing else.
     assert!(!air.is_preprocessed(), "the fixture is not preprocessed");
     assert!(!air.has_aux_trace(), "the fixture has no aux trace");
-    let mut transcript = crate::hash_pin::block_transcript(&[]);
+    let mut transcript = crate::hash_pin::legacy_transcript(&[]);
     transcript.append_bytes(view.lde_trace_main_merkle_root());
 
     let domain = new_verifier_domain(air, trace_length);
@@ -499,7 +499,7 @@ fn fib_challenge_program(
     r: &FibReplay,
 ) -> (super::compiler::LfmProgram, Vec<Vec<super::word::LfmWord>>) {
     let s = &r.shape;
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
 
     let a_main = b.declare_arena(super::proof_arena::words_per_root() as u32);
     let a_composition = b.declare_arena(super::proof_arena::words_per_root() as u32);
@@ -607,10 +607,10 @@ fn the_machine_absorbs_a_multi_row_ood_block_in_productions_order() {
     // Production must accept it, or the blocks below are not a real proof's.
     let refs: Vec<&dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = FibPi>> = vec![&air];
     assert!(
-        crate::hash_pin::BlockVerifier::multi_verify_views(
+        crate::hash_pin::LegacyVerifier::multi_verify_views(
             &refs,
             MultiProofView::Owned(&proof),
-            &mut crate::hash_pin::block_transcript(&[]),
+            &mut crate::hash_pin::legacy_transcript(&[]),
             &FEE::zero(),
         ),
         "production must accept the three-offset fixture"
@@ -648,7 +648,7 @@ fn the_machine_absorbs_a_multi_row_ood_block_in_productions_order() {
 
     // ---- the differential: every challenge, against production's own replay.
     let (program, arenas) = fib_challenge_program(&r);
-    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
         .expect("the three-offset replay must execute");
 
     let pub_ext = |i: usize| word_as_ext(&exec.public_words[i].1).expect("an ext challenge");
@@ -712,7 +712,7 @@ fn the_machine_absorbs_a_multi_row_ood_block_in_productions_order() {
 /// the control needs nothing past `γ`.
 fn row_major_control_gamma(r: &FibReplay) -> FEE {
     let s = &r.shape;
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
 
     let a_main = b.declare_arena(super::proof_arena::words_per_root() as u32);
     let a_composition = b.declare_arena(super::proof_arena::words_per_root() as u32);
@@ -767,7 +767,7 @@ fn row_major_control_gamma(r: &FibReplay) -> FEE {
         r.ood_next.iter().map(ext_word).collect(),
         r.parts.iter().map(ext_word).collect(),
     ];
-    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
         .expect("the control must execute");
     word_as_ext(&exec.public_words[0].1).expect("gamma is ext")
 }

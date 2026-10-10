@@ -255,7 +255,7 @@ fn the_emitted_fri_verifier_accepts_every_rpx_vector() {
             );
         }
         let program = v.program();
-        let exec = execute(&program, &v.arenas(), &crate::hash_pin::BLOCK_HASHER)
+        let exec = execute(&program, &v.arenas(), &crate::hash_pin::LEGACY_HASHER)
             .unwrap_or_else(|e| panic!("{}: the honest vector must execute: {e:?}", v.name));
         assert_eq!(exec.public_words.len(), s.num_queries);
         let closed = s.num_queries * s.permutations_per_query() + s.cap_permutations();
@@ -291,7 +291,7 @@ fn no_tampered_group_opening_value_can_pass() {
         }
         let program = v.program();
         let honest = v.arenas();
-        execute(&program, &honest, &crate::hash_pin::BLOCK_HASHER).expect("honest");
+        execute(&program, &honest, &crate::hash_pin::LEGACY_HASHER).expect("honest");
         let q0 = &v.json["queries_detail"][0]["layers"][0];
         let slot = q0["slot"].as_u64().expect("slot") as usize;
         let d0 = 1usize << v.shape.layer_fold(0);
@@ -313,7 +313,7 @@ fn no_tampered_group_opening_value_can_pass() {
         for (label, arena, word) in bump {
             let mut bad = honest.clone();
             bad[arena][word][0] += FE::one();
-            execute(&program, &bad, &crate::hash_pin::BLOCK_HASHER).expect_err(&format!(
+            execute(&program, &bad, &crate::hash_pin::LEGACY_HASHER).expect_err(&format!(
                 "{}: moving {label} must make the program unexecutable",
                 v.name
             ));
@@ -339,14 +339,14 @@ fn the_slot_check_is_load_bearing() {
     moved[0][1][0] += FE::one();
 
     let with = v.program();
-    execute(&with, &honest, &crate::hash_pin::BLOCK_HASHER).expect("honest");
-    execute(&with, &moved, &crate::hash_pin::BLOCK_HASHER)
+    execute(&with, &honest, &crate::hash_pin::LEGACY_HASHER).expect("honest");
+    execute(&with, &moved, &crate::hash_pin::LEGACY_HASHER)
         .expect_err("a moved p0 must be refused by the slot check");
 
     super::fri::SKIP_SLOT_CHECK.with(|c| c.set(true));
     let without = v.program();
     super::fri::SKIP_SLOT_CHECK.with(|c| c.set(false));
-    execute(&without, &moved, &crate::hash_pin::BLOCK_HASHER)
+    execute(&without, &moved, &crate::hash_pin::LEGACY_HASHER)
         .expect("WITHOUT the slot check a moved p0 is accepted — the check is the only binding");
 }
 
@@ -363,7 +363,7 @@ fn the_slot_check_is_load_bearing() {
 fn the_cap_and_fri_matrix_round_trips_in_guest() {
     use super::epoch_verify::{blocks_for, group_leaf_felts};
 
-    let hash = super::edsl::WrapHash::production();
+    let hash = super::edsl::WrapHash::legacy();
     for cap in [CapPolicy::Off, CapPolicy::Auto] {
         for (label, fri, over) in [
             ("pair", FriMode::Pair, None),
@@ -393,7 +393,7 @@ fn the_cap_and_fri_matrix_round_trips_in_guest() {
             let exec = execute(
                 &program,
                 &h.all_arenas(&all),
-                &crate::hash_pin::BLOCK_HASHER,
+                &crate::hash_pin::LEGACY_HASHER,
             )
             .unwrap_or_else(|e| panic!("cap={cap} fri={label}: FRI leg: {e:?}"));
             for (k, &q) in all.iter().enumerate() {
@@ -420,7 +420,7 @@ fn the_cap_and_fri_matrix_round_trips_in_guest() {
             let joined = compile(b.finish());
             let mut arenas = h.trace.arenas(&all);
             arenas.extend(h.fri_arenas(&all));
-            let exec = execute(&joined, &arenas, &crate::hash_pin::BLOCK_HASHER)
+            let exec = execute(&joined, &arenas, &crate::hash_pin::LEGACY_HASHER)
                 .unwrap_or_else(|e| panic!("cap={cap} fri={label}: joined: {e:?}"));
             for (k, &q) in all.iter().enumerate() {
                 let v = word_as_ext(&exec.public_words[k].1).expect("ext");
@@ -543,7 +543,7 @@ fn fri_layer_program(d: u32, c: usize, times: usize) -> LfmProgram {
 
     let n = if pair { 1 } else { 1usize << d };
     let num_siblings = MEASURED_DEPTH - c;
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     assert_eq!(
         super::edsl::digest_words(&b),
         1,
@@ -690,7 +690,7 @@ fn deep_point_program(shape: &DeepShape, times: usize) -> LfmProgram {
     let e = shape.num_eval_points;
     let cols = shape.num_total_cols;
     let parts = shape.num_composition_parts;
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena((4 * e + 4 + times * (1 + cols + parts)) as u32);
     let mut at = 0u32;
     let mut next = |b: &mut LfmBuilder| {

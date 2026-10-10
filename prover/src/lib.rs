@@ -1764,7 +1764,7 @@ pub fn prove_with_options_and_inputs(
 
     // Bind the full statement (program, public output, table layout) into the
     // Fiat-Shamir transcript so every challenge depends on it.
-    let mut transcript = crate::hash_pin::block_transcript(&[]);
+    let mut transcript = crate::hash_pin::legacy_transcript(&[]);
     absorb_statement(
         &mut transcript,
         StatementKind::Monolithic,
@@ -1784,7 +1784,7 @@ pub fn prove_with_options_and_inputs(
     shape_profile::capture(pairs.iter().map(|(air, trace, _)| (*air, trace.num_rows())));
     // ★ The block path's PIN, not `stark`'s default alias — the monolithic
     // production prove, the twin of the batched one in `continuation.rs`.
-    let proof = crate::hash_pin::BlockProver::multi_prove(
+    let proof = crate::hash_pin::LegacyProver::multi_prove(
         pairs,
         &mut transcript,
         #[cfg(feature = "disk-spill")]

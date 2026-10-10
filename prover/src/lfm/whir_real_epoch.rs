@@ -444,7 +444,7 @@ where
 ///
 /// `None` when the process is set to RPX. Otherwise a line naming the setting.
 ///
-/// ⚠ WHY THIS REFUSES NOTHING. The compile-time pin `hash_pin::BlockStarkHash`
+/// ⚠ WHY THIS REFUSES NOTHING. The compile-time pin `hash_pin::LegacyStarkHash`
 /// is RPX, so a production tree built in a keccak process is almost certainly
 /// an operator's mistake — but "almost certainly" is not a soundness property.
 /// A keccak bundle harvested under keccak is a correctly verified epoch; it is

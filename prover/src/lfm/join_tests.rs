@@ -459,7 +459,7 @@ fn the_join_premises_hold_on_a_real_proof() {
     // bit weights here instead would only check a host formula against
     // production and leave the emitter unexamined — the same oracle mistake
     // the method rules warn about, one level up.
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(1);
     let index = b.hint_felt(arena, 0);
     let bits = b.bit_dec(index, s.merkle_depth);
@@ -471,7 +471,7 @@ fn the_join_premises_hold_on_a_real_proof() {
 
     for (q, iota) in h.iotas.iter().enumerate() {
         let arenas = vec![vec![base_word(FE::from(*iota as u64))]];
-        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
             .expect("the derivation executes");
         assert_eq!(
             exec.public_words[0].1[0], h.points[q].0,
@@ -504,7 +504,7 @@ fn the_join_matches_the_production_verifier_on_every_query() {
     let h = host_sub_proof();
     let all: Vec<usize> = (0..h.iotas.len()).collect();
 
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let (_, outs) = emit_sub_proof(&mut b, &h.shape, all.len());
     for (p, s) in &outs {
         b.public(p.as_cell());
@@ -513,7 +513,7 @@ fn the_join_matches_the_production_verifier_on_every_query() {
     let program = compile(b.finish());
     validate(&program).expect("the joined sub-proof program is admissible");
 
-    let exec = execute(&program, &h.arenas(&all), &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &h.arenas(&all), &crate::hash_pin::LEGACY_HASHER)
         .expect("an honest sub-proof must authenticate and fold");
 
     let mut nonzero = 0usize;
@@ -673,10 +673,10 @@ struct PerQuery {
 }
 
 fn marginal(shape: &SubProofShape) -> PerQuery {
-    let mut one = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut one = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     emit_sub_proof(&mut one, shape, 1);
     let one = compile(one.finish());
-    let mut two = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut two = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     emit_sub_proof(&mut two, shape, 2);
     let two = compile(two.finish());
     PerQuery {
@@ -726,16 +726,16 @@ fn deep_only_rows(shape: &SubProofShape) -> usize {
         (g, z, steps, parts, openings, points)
     };
 
-    let mut bare = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut bare = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let _ = plumb(&mut bare);
     let baseline = bare.finish().instrs.len();
 
-    let mut inv_only = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut inv_only = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let (g, z, steps, parts, _, _) = plumb(&mut inv_only);
     let _ = emit_deep_invariants(&mut inv_only, d, g, z, &steps, &parts);
     let invariant_rows = inv_only.finish().instrs.len() - baseline;
 
-    let mut full = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut full = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let (g, z, steps, parts, openings, points) = plumb(&mut full);
     let inv = emit_deep_invariants(&mut full, d, g, z, &steps, &parts);
     for (k, (trace, qparts)) in openings.into_iter().enumerate() {
@@ -928,7 +928,7 @@ fn control_program_source(
     shape: &SubProofShape,
     control: Control,
 ) -> super::builder::LfmProgramSource {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let groups = shape.groups();
 
     let uniforms = b.declare_arena(2);
@@ -1094,18 +1094,18 @@ fn the_join_proves_and_verifies() {
     let opts = prove_options();
     let queries = [0usize];
 
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let (_, outs) = emit_sub_proof(&mut b, &h.shape, queries.len());
     for (p, s) in &outs {
         b.public(p.as_cell());
         b.public(s.as_cell());
     }
     let program = compile(b.finish());
-    // Built at `WrapHash::production()`, so it emits `Instr::Hash` and the
+    // Built at `WrapHash::legacy()`, so it emits `Instr::Hash` and the
     // artifacts must carry the pin's tenant — the classification rule in
     // HASH-PINNING.md. `build_artifacts` defaults to the registry's blessed
     // hasher, which is correct for registry programs and wrong for this one.
-    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::LEGACY_HASHER);
     let proved = lfm_prove(&program, &artifacts, &h.arenas(&queries), &opts)
         .expect("the joined sub-proof must prove");
 
@@ -1164,7 +1164,7 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
     let q = 0usize;
     let groups = h.shape.groups();
 
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let (_, outs) = emit_sub_proof(&mut b, &h.shape, 1);
     for (p, s) in &outs {
         b.public(p.as_cell());
@@ -1172,7 +1172,7 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
     }
     let program = compile(b.finish());
     let honest =
-        execute(&program, &h.arenas(&[q]), &crate::hash_pin::BLOCK_HASHER).expect("honest");
+        execute(&program, &h.arenas(&[q]), &crate::hash_pin::LEGACY_HASHER).expect("honest");
 
     // Sweep every value slot of every group, so no vector class (first group,
     // first column, regular point) is silently the only one tested.
@@ -1192,7 +1192,7 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
             arenas[4][word_of_slot][0] += FE::one();
 
             // Incoherent: the real roots, a moved leaf.
-            let err = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+            let err = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
                 .err()
                 .unwrap_or_else(|| {
                     panic!("{label}: group {g} slot {slot}: a moved value must not authenticate")
@@ -1210,7 +1210,7 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
             let mut coherent_roots = h.roots.clone();
             coherent_roots[g] = forged;
             arenas[3] = commitments_to_arena(&coherent_roots);
-            let forged_run = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+            let forged_run = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
                 .unwrap_or_else(|e| {
                     panic!(
                         "{label}: group {g} slot {slot}: the coherent forgery must execute: {e:?}"
@@ -1280,7 +1280,7 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
              trees are degenerate at this index and the walk half of this vector \
              tests nothing"
         );
-        execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
             .err()
             .unwrap_or_else(|| {
                 panic!("{label}: index bit {level}: a moved index must not authenticate")
@@ -1288,7 +1288,7 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
 
         arenas[3] = commitments_to_arena(&coherent_roots);
         let forged =
-            execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
+            execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER).unwrap_or_else(|e| {
                 panic!("{label}: index bit {level}: coherent forgery must execute: {e:?}")
             });
         assert_ne!(
@@ -1310,7 +1310,7 @@ fn sweep_tampers(h: &HostSubProof, label: &str) {
         let base = 1 + groups[0].num_values();
         arenas[4][base..base + super::proof_arena::words_per_root() * h.shape.merkle_depth]
             .copy_from_slice(&commitments_to_arena(&siblings));
-        execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
             .err()
             .unwrap_or_else(|| {
                 panic!("{label}: sibling level {level}: a moved path must not authenticate")
@@ -1359,7 +1359,7 @@ fn the_controls_show_what_the_join_denies() {
     validate(&program).expect("admissible");
     let mut arenas = h.arenas(&[q]);
     arenas.push(h.split_values(q));
-    let clean = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+    let clean = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
         .expect("the control must accept honest inputs");
     assert_eq!(
         word_as_ext(&clean.public_words[0].1).expect("ext"),
@@ -1370,7 +1370,7 @@ fn the_controls_show_what_the_join_denies() {
 
     let mut attacked = arenas.clone();
     attacked[5][0][0] += FE::one();
-    let forged = execute(&program, &attacked, &crate::hash_pin::BLOCK_HASHER).expect(
+    let forged = execute(&program, &attacked, &crate::hash_pin::LEGACY_HASHER).expect(
         "SplitValues: authenticating one set of values and folding another is \
          exactly what this control permits",
     );
@@ -1394,7 +1394,7 @@ fn the_controls_show_what_the_join_denies() {
         base_word(h.points[q].0),
         base_word(h.points[q].1.expect("a row-pair fixture")),
     ]);
-    let clean = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).expect("honest");
+    let clean = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER).expect("honest");
     assert_eq!(
         word_as_ext(&clean.public_words[0].1).expect("ext"),
         h.expected[q].0
@@ -1405,7 +1405,7 @@ fn the_controls_show_what_the_join_denies() {
         base_word(h.points[other].0),
         base_word(h.points[other].1.expect("a row-pair fixture")),
     ];
-    let forged = execute(&program, &attacked, &crate::hash_pin::BLOCK_HASHER).expect(
+    let forged = execute(&program, &attacked, &crate::hash_pin::LEGACY_HASHER).expect(
         "HintedPoint: a hinted point is not tied to the authenticated index, \
          which is what this control permits",
     );
@@ -1535,11 +1535,11 @@ fn preprocessed_fixture() -> (
     let trace = make_trace();
     // `DefaultStarkHash`, not a named hash: this commitment has to be the one
     // `multi_prove_ram` below recomputes, and that follows the alias.
-    let commitment = <crate::hash_pin::BlockProver<Gl, Ext3, ()> as IsStarkProver<
+    let commitment = <crate::hash_pin::LegacyProver<Gl, Ext3, ()> as IsStarkProver<
         Gl,
         Ext3,
         (),
-        crate::hash_pin::BlockStarkHash,
+        crate::hash_pin::LegacyStarkHash,
     >>::compute_precomputed_commitment_for_testing(
         &trace, &build(None), NUM_PRECOMPUTED
     )
@@ -1552,7 +1552,7 @@ fn preprocessed_fixture() -> (
         _,
         _,
     )> = vec![(&air, &mut trace, &())];
-    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::legacy_transcript(&[]))
         .expect("the preprocessed fixture must prove");
     (Box::new(air), proof)
 }
@@ -1620,7 +1620,7 @@ fn the_precomputed_group_comes_first_and_that_is_checkable() {
 
     // ---- half one: the machine agrees with production. -------------------
     let queries: Vec<usize> = (0..h.iotas.len().min(16)).collect();
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let (_, outs) = emit_sub_proof(&mut b, &h.shape, queries.len());
     for (p, s) in &outs {
         b.public(p.as_cell());
@@ -1631,7 +1631,7 @@ fn the_precomputed_group_comes_first_and_that_is_checkable() {
     let exec = execute(
         &program,
         &h.arenas(&queries),
-        &crate::hash_pin::BLOCK_HASHER,
+        &crate::hash_pin::LEGACY_HASHER,
     )
     .expect("the four-group sub-proof must authenticate and fold");
     for (k, q) in queries.iter().enumerate() {
@@ -1782,7 +1782,7 @@ fn the_exposed_bits_are_the_cells_the_walk_consumed() {
     let h = host_sub_proof();
     const QUERIES: usize = 3;
 
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let (_, out) = emit_sub_proof_with_bits(&mut b, &h.shape, QUERIES);
     let src = b.finish();
     assert_eq!(out.len(), QUERIES);

@@ -36,7 +36,7 @@ use super::proof_arena::commitments_to_arena_for;
 use super::registry::{LfmArtifacts, build_artifacts, build_artifacts_with_hasher};
 use super::statement::{lfm_program_id, lfm_program_id_chunked};
 use super::word::{LfmWord, base_word};
-use crate::hash_pin::BLOCK_HASHER;
+use crate::hash_pin::LEGACY_HASHER;
 
 const HASHERS: [HasherKind; 5] = [
     HasherKind::Test,
@@ -674,7 +674,7 @@ fn an_emitted_leg_verifies_a_split_child_without_bitwise() {
     use super::per_table_aggregator_tests::{child_arena_words, child_shape, real_child};
 
     let opts = super::proof::aggregation_wrap_options();
-    let hasher = crate::hash_pin::BLOCK_HASHER;
+    let hasher = crate::hash_pin::LEGACY_HASHER;
     let program = trivial_program().with_hash_chunking(HashChunking::split_at(2));
     let built = build_artifacts_with_hasher(&program, &opts, hasher);
     let artifacts = under_mask(
@@ -691,7 +691,7 @@ fn an_emitted_leg_verifies_a_split_child_without_bitwise() {
     let words = child_arena_words(&child);
 
     let leg_program = |shape: &super::per_table_aggregator::ChildShape<'_>| {
-        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
         let arenas = declare_leg_arenas(&mut b, shape);
         let _ = emit_leg(&mut b, shape, &arenas);
         super::compiler::compile(b.finish())
@@ -825,7 +825,7 @@ fn fold_arena(values: &AttestedInputs) -> Vec<LfmWord> {
 }
 
 /// Both root widths: the production wrap hash's and the byte hash's.
-const WRAP_HASHES: [WrapHash; 2] = [WrapHash::production(), WrapHash::Keccak];
+const WRAP_HASHES: [WrapHash; 2] = [WrapHash::legacy(), WrapHash::Keccak];
 
 /// The default is the host attestation; `1` folds; anything else stops the run.
 #[test]
@@ -871,7 +871,7 @@ fn the_host_attestation_publishes_the_folds_words() {
     for num_pages in [0usize, 2] {
         let inputs = attestation_inputs(num_pages);
         let fold = program_id_program(ProgramIdShape { num_pages });
-        let fold_words = execute(&fold, &[fold_arena(&inputs)], &BLOCK_HASHER)
+        let fold_words = execute(&fold, &[fold_arena(&inputs)], &LEGACY_HASHER)
             .expect("the fold executes")
             .public_words;
         let values: Vec<LfmWord> = fold_words.iter().map(|(_, w)| *w).collect();
@@ -885,7 +885,7 @@ fn the_host_attestation_publishes_the_folds_words() {
             let words = execute(
                 &host,
                 &host_attestation_arenas(&inputs, hash),
-                &BLOCK_HASHER,
+                &LEGACY_HASHER,
             )
             .expect("the host attestation executes on honest cells")
             .public_words;
@@ -927,7 +927,7 @@ fn a_forged_attested_constant_has_no_execution() {
             execute(
                 &host_attestation_program(&honest, hash),
                 &arenas,
-                &BLOCK_HASHER
+                &LEGACY_HASHER
             )
             .is_ok(),
             "{hash:?}: the honest constants execute"
@@ -938,7 +938,7 @@ fn a_forged_attested_constant_has_no_execution() {
                 execute(
                     &host_attestation_program(forged, hash),
                     &arenas,
-                    &BLOCK_HASHER
+                    &LEGACY_HASHER
                 )
                 .is_err(),
                 "{hash:?}, {what}: a forged constant must have no execution on honest cells"
@@ -957,7 +957,7 @@ fn an_attested_cell_that_differs_from_its_constant_has_no_execution() {
     for hash in WRAP_HASHES {
         let program = host_attestation_program(&inputs, hash);
         let arenas = host_attestation_arenas(&inputs, hash);
-        assert!(execute(&program, &arenas, &BLOCK_HASHER).is_ok());
+        assert!(execute(&program, &arenas, &LEGACY_HASHER).is_ok());
         let mut moved = 0;
         for (a, arena) in arenas.iter().enumerate() {
             let lanes = if a == DECODE_ARENA { 4 } else { 1 };
@@ -966,7 +966,7 @@ fn an_attested_cell_that_differs_from_its_constant_has_no_execution() {
                     let mut tampered = arenas.clone();
                     tampered[a][w][lane] += FE::from(1u64);
                     assert!(
-                        execute(&program, &tampered, &BLOCK_HASHER).is_err(),
+                        execute(&program, &tampered, &LEGACY_HASHER).is_err(),
                         "{hash:?}: arena {a} word {w} lane {lane} differs from its constant \
                          and must have no execution"
                     );
@@ -991,7 +991,7 @@ fn an_attested_cell_that_differs_from_its_constant_has_no_execution() {
 /// family and its `BITWISE` receiver under every hasher.
 #[test]
 fn the_host_attestation_leaves_no_bitwise_sender_without_its_receiver() {
-    let host = host_attestation_program(&attestation_inputs(0), WrapHash::production());
+    let host = host_attestation_program(&attestation_inputs(0), WrapHash::legacy());
     let fold = program_id_program(ProgramIdShape { num_pages: 0 });
     for hasher in HASHERS {
         let mask = ChipSet::for_program_under(&host, hasher, true);
@@ -1015,7 +1015,7 @@ fn the_host_attestation_leaves_no_bitwise_sender_without_its_receiver() {
             "{hasher:?}: the fold keeps the keccak family and BITWISE, {fold_mask:?}"
         );
     }
-    let mask = ChipSet::for_program_under(&host, BLOCK_HASHER, true);
+    let mask = ChipSet::for_program_under(&host, LEGACY_HASHER, true);
     assert!(
         !mask.bitwise,
         "under the block hasher the host-attested program carries no BITWISE"

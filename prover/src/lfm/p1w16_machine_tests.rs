@@ -78,7 +78,7 @@ fn a_width16_program_compiles_admits_and_proves_under_the_socket() {
     let (program, _, _) = chained_program();
     assert!(program.hash16());
     assert_eq!(
-        program.hasher(crate::hash_pin::BLOCK_HASHER),
+        program.hasher(crate::hash_pin::LEGACY_HASHER),
         HasherKind::Poseidon1W16
     );
     assert_eq!(program.groups.hash.real_rows, 2);
@@ -204,7 +204,7 @@ fn the_twelve_felt_contract_hands_out_no_hash_under_the_socket() {
 ///
 /// The other callers of the twelve-felt contract are not production entry
 /// points with a program's hasher: the host block transcript is pinned to
-/// `BLOCK_HASHER` at compile time (`hash_pin`), and `fixture`'s host sponge and
+/// `LEGACY_HASHER` at compile time (`hash_pin`), and `fixture`'s host sponge and
 /// tree serve the fixture programs and the suites only.
 #[test]
 fn no_production_entry_point_reaches_the_twelve_felt_hash_under_the_socket() {

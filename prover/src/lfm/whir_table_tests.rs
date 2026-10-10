@@ -48,7 +48,7 @@ fn every_selector(num_vars: usize) -> Vec<Selector> {
 
 /// The first `count` selectors emitted over one hinted point, each published.
 fn selectors_program(num_vars: usize, count: usize) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(num_vars.max(1) as u32);
     let point: Vec<_> = (0..num_vars)
         .map(|i| b.hint_word(arena, i as u32).as_ext())
@@ -77,7 +77,7 @@ fn the_selector_is_the_hosts_indicator() {
         validate(&program).expect("the selector leg must be admissible");
         for seed in [0x5E1EC7u64, 0xB17, 0xC0FFEE] {
             let point = pseudo(seed, num_vars);
-            let exec = execute(&program, &words(&point), &crate::hash_pin::BLOCK_HASHER)
+            let exec = execute(&program, &words(&point), &crate::hash_pin::LEGACY_HASHER)
                 .unwrap_or_else(|e| panic!("num_vars {num_vars}: must execute: {e:?}"));
             let got: Vec<FEE> = exec.public_words[1..]
                 .iter()
@@ -113,7 +113,7 @@ fn the_trivial_and_the_all_exempt_selectors_are_literals() {
         (Selector::ALL, FEE::one()),
         (Selector::except_last(1usize << num_vars), FEE::zero()),
     ] {
-        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
         let arena = b.declare_arena(num_vars as u32);
         let wires: Vec<_> = (0..num_vars)
             .map(|i| b.hint_word(arena, i as u32).as_ext())
@@ -121,7 +121,7 @@ fn the_trivial_and_the_all_exempt_selectors_are_literals() {
         let value = emit_selector(&mut b, selector, &wires);
         b.public(value.as_cell());
         let program = compile(b.finish());
-        let exec = execute(&program, &words(&point), &crate::hash_pin::BLOCK_HASHER)
+        let exec = execute(&program, &words(&point), &crate::hash_pin::LEGACY_HASHER)
             .expect("the literal cases must execute");
         let got = word_as_ext(&exec.public_words[0].1).expect("a published extension value");
         assert_eq!(got, want, "end_exemptions {}", selector.end_exemptions);
@@ -431,7 +431,7 @@ fn table_program(
     total: usize,
     leg: bool,
 ) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(total as u32);
     let mut index = 0u32;
     let mut take = |b: &mut LfmBuilder, count: usize| -> Vec<super::builder::Ext> {
@@ -563,7 +563,7 @@ fn the_table_verify_computes_what_the_host_computes() {
         let program = table_program(&proof, &shape, alpha_powers.len(), values.len(), true);
         validate(&program).expect("the table leg must be admissible");
 
-        let exec = execute(&program, &words(&values), &crate::hash_pin::BLOCK_HASHER)
+        let exec = execute(&program, &words(&values), &crate::hash_pin::LEGACY_HASHER)
             .unwrap_or_else(|e| panic!("num_vars {num_vars}: the table leg must execute: {e:?}"));
         let got: Vec<FEE> = exec
             .public_words
@@ -694,7 +694,7 @@ fn the_tamper_arm_refuses_what_the_host_rejects() {
     let run = |proof: &TableProof<E>| -> Result<(), String> {
         let values = flatten(proof, z, &alpha_powers, beta);
         let program = table_program(proof, &shape, alpha_powers.len(), values.len(), true);
-        execute(&program, &words(&values), &crate::hash_pin::BLOCK_HASHER)
+        execute(&program, &words(&values), &crate::hash_pin::LEGACY_HASHER)
             .map(|_| ())
             .map_err(|e| format!("{e:?}"))
     };

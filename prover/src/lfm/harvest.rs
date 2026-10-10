@@ -73,7 +73,7 @@ pub(crate) fn host_table_forked(
     view: StarkProofView<'_, Gl, Ext3, ()>,
     index: usize,
     num_tables: usize,
-    fork: &mut crate::hash_pin::BlockTranscript,
+    fork: &mut crate::hash_pin::LegacyTranscript,
     lookup_challenges: &[FEE],
 ) -> Result<HostTable, String> {
     host_table_forked_under::<crate::hash_pin::RpxBlock>(
@@ -694,7 +694,7 @@ pub(crate) fn harvest_child(
     // The seed IS `verify_against_chunked`'s: the LFM statement over the claimed
     // words, and nothing before it.
     let seed = || {
-        let mut t = crate::hash_pin::block_transcript(&[]);
+        let mut t = crate::hash_pin::legacy_transcript(&[]);
         super::statement::absorb_lfm_statement(
             &mut t,
             &artifacts.program_id,

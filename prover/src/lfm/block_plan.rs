@@ -838,7 +838,7 @@ fn partition_for(names: &[&str], costs: &[usize], cap: usize) -> Result<BlockPar
 
 /// A node's builder: nodes verify LFM proofs, which the pin commits.
 fn builder() -> LfmBuilder {
-    LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production())
+    LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy())
 }
 
 /// A leaf's builder: a leaf verifies base sub-proofs, committed under `base`.
@@ -858,7 +858,7 @@ pub fn artifacts_of(program: &LfmProgram, wrap_opts: &crate::ProofOptions) -> Lf
     super::program_census::build_artifacts_counted(
         program,
         wrap_opts,
-        program.hasher(crate::hash_pin::BLOCK_HASHER),
+        program.hasher(crate::hash_pin::LEGACY_HASHER),
     )
 }
 

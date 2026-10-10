@@ -322,7 +322,7 @@ pub fn build_artifacts(program: &LfmProgram, options: &ProofOptions) -> LfmArtif
     // `REGISTRY_HASHER = Test`, whose own doc calls changing it a re-blessing of
     // the whole table rather than a re-run.
     //
-    // ⚠ This entry point was briefly changed to name `hash_pin::BLOCK_HASHER`,
+    // ⚠ This entry point was briefly changed to name `hash_pin::LEGACY_HASHER`,
     // to fix a real defect on the AGGREGATOR path where `lfm_prove_batched`
     // inherited a toy permutation from a defaulted build. That fix was correct
     // about the defect and wrong about its scope: it moved every registry
@@ -454,7 +454,7 @@ pub fn program_groups(program: &LfmProgram) -> [&ColumnGroup; PROGRAM_GROUP_SLOT
 /// `hasher` names the `LFM_HASH` chip the machine RUNS. The hash the roots below
 /// are BUILT with is a different question: `commit_group` and the two
 /// `preprocessed_commitment` helpers all commit through `stark`'s Merkle layer
-/// under whatever [`crate::hash_pin::BLOCK_COMMITMENT_HASH`] names — BLAKE3 on
+/// under whatever [`crate::hash_pin::LEGACY_COMMITMENT_HASH`] names — BLAKE3 on
 /// this branch, keccak on a `cuda` build, an algebraic hash on a branch that
 /// pins one.
 ///
@@ -470,9 +470,9 @@ pub fn program_groups(program: &LfmProgram) -> [&ColumnGroup; PROGRAM_GROUP_SLOT
 /// ★ **The read has MOVED, on exactly the condition this note set.** The commit
 /// helpers were hard-wired to `stark`'s default aliases, so the global const was
 /// then the truthful name for their output. They are now threaded through
-/// [`crate::hash_pin::BlockStarkHash`] — the block path's own configuration,
+/// [`crate::hash_pin::LegacyStarkHash`] — the block path's own configuration,
 /// which a hash-comparison branch re-points without touching the workspace
-/// default — and `lfm_program_id` reads `BLOCK_COMMITMENT_HASH` with them. The
+/// default — and `lfm_program_id` reads `LEGACY_COMMITMENT_HASH` with them. The
 /// two axes still move together, which is the property that matters; what
 /// changed is that the axis they follow is the pin rather than the alias.
 ///

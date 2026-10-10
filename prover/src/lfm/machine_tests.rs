@@ -638,7 +638,7 @@ fn sponge_arenas(msg: &[u8]) -> Vec<Vec<LfmWord>> {
 /// bytes are the backend's own serialisation of them.
 ///
 /// ⛔ **The discriminator is the slice's own length, NOT
-/// `WrapHash::production()`, and that distinction is the whole point.** This
+/// `WrapHash::legacy()`, and that distinction is the whole point.** This
 /// helper's callers mix two kinds of program: ones that pin a byte hash on their
 /// own builder (`keccak_sponge_program`, `blake3_sponge_program` — always two
 /// words, on every branch, because their identity is registry-pinned) and ones
@@ -3320,12 +3320,12 @@ fn the_merkle_walk_authenticates_a_real_opening() {
     // root the host actually built. The keccak instrument cannot, and the name
     // moved with the hash rather than outliving it.
     let program = merkle_opening_program(R1F_SHAPE);
-    // Built at `WrapHash::production()`, so it emits `Instr::Hash` and must be
+    // Built at `WrapHash::legacy()`, so it emits `Instr::Hash` and must be
     // proved under the pin's tenant — the classification rule in HASH-PINNING.md.
     let artifacts = super::registry::build_artifacts_with_hasher(
         &program,
         &opts,
-        crate::hash_pin::BLOCK_HASHER,
+        crate::hash_pin::LEGACY_HASHER,
     );
     let proved = lfm_prove(&program, &artifacts, &merkle_arenas(opening, *index), &opts)
         .expect("the honest opening must execute and prove");
@@ -3377,12 +3377,12 @@ fn tampered_merkle_opening_rejects() {
     // Same production twin as the honest-path test above — a tamper control is
     // only a control over the walk the honest path uses.
     let program = merkle_opening_program(R1F_SHAPE);
-    // Built at `WrapHash::production()`, so it emits `Instr::Hash` and must be
+    // Built at `WrapHash::legacy()`, so it emits `Instr::Hash` and must be
     // proved under the pin's tenant — the classification rule in HASH-PINNING.md.
     let artifacts = super::registry::build_artifacts_with_hasher(
         &program,
         &opts,
-        crate::hash_pin::BLOCK_HASHER,
+        crate::hash_pin::LEGACY_HASHER,
     );
     let honest = lfm_prove(&program, &artifacts, &merkle_arenas(opening, *index), &opts)
         .expect("honest prove");
@@ -3451,7 +3451,7 @@ fn tampered_merkle_opening_rejects() {
         );
 
         // Incoherent: still claiming the real root.
-        let err = super::executor::execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        let err = super::executor::execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
             .err()
             .unwrap_or_else(|| panic!("{what}: claiming the real root must not execute"));
         println!("R1f tamper {what}: incoherent run rejected with {err:?}");
@@ -3505,12 +3505,12 @@ pub(super) fn byteswap_cells() -> u64 {
 /// `groups.keccak` directly made them silently read ZERO the moment production
 /// moved to BLAKE3, which reports a true structural claim as a failed one.
 pub(super) fn wrap_hash_rows(program: &super::compiler::LfmProgram) -> usize {
-    wrap_hash_rows_at(program, super::edsl::WrapHash::production())
+    wrap_hash_rows_at(program, super::edsl::WrapHash::legacy())
 }
 
 /// [`wrap_hash_rows`] against a NAMED hash rather than the production pin.
 ///
-/// ★ For the programs that are ABOUT a hash. `WrapHash::production`'s own doc
+/// ★ For the programs that are ABOUT a hash. `WrapHash::legacy`'s own doc
 /// carves them out — the R1b/R1c/R1d instruments name their hash directly and
 /// must keep doing so — and a count taken over such a program has to name the
 /// same one, or it reads zero the moment the pin moves away from it and reports
@@ -3543,7 +3543,7 @@ pub(super) fn wrap_hash_rows_at(
 /// they multiply by `proof_arena::words_per_root`: the shape of the claim is
 /// hash-independent, the width of a term is not.
 pub(super) fn byteswaps_per_value() -> usize {
-    usize::from(super::edsl::WrapHash::production().byte_hash().is_some())
+    usize::from(super::edsl::WrapHash::legacy().byte_hash().is_some())
 }
 
 /// [`wrap_hash_rows`]'s instruction-stream twin: emitted compressions of the
@@ -3553,7 +3553,7 @@ pub(super) fn wrap_hash_instrs(program: &super::compiler::LfmProgram) -> usize {
     program
         .instrs
         .iter()
-        .filter(|i| match super::edsl::WrapHash::production() {
+        .filter(|i| match super::edsl::WrapHash::legacy() {
             super::edsl::WrapHash::Keccak => matches!(i, Instr::KeccakF(_)),
             super::edsl::WrapHash::Blake3 => matches!(i, Instr::Blake3(_)),
             super::edsl::WrapHash::Algebraic => matches!(i, Instr::Hash { .. }),
@@ -3876,11 +3876,11 @@ fn l2g_binding_proves_and_verifies() {
     let opts = options();
     let (epoch, global) = r1g_l2g_roots();
     let program = l2g_binding_program(R1G_EPOCHS);
-    // A production() program: proved under the pin's tenant, as above.
+    // A legacy() program: proved under the pin's tenant, as above.
     let artifacts = super::registry::build_artifacts_with_hasher(
         &program,
         &opts,
-        crate::hash_pin::BLOCK_HASHER,
+        crate::hash_pin::LEGACY_HASHER,
     );
     let proved = lfm_prove(&program, &artifacts, &l2g_arenas(epoch, global), &opts)
         .expect("the honest binding must execute and prove");
@@ -3918,11 +3918,11 @@ fn tampered_l2g_binding_rejects() {
     let opts = options();
     let (epoch, global) = r1g_l2g_roots();
     let program = l2g_binding_program(R1G_EPOCHS);
-    // A production() program: proved under the pin's tenant, as above.
+    // A legacy() program: proved under the pin's tenant, as above.
     let artifacts = super::registry::build_artifacts_with_hasher(
         &program,
         &opts,
-        crate::hash_pin::BLOCK_HASHER,
+        crate::hash_pin::LEGACY_HASHER,
     );
     let honest =
         lfm_prove(&program, &artifacts, &l2g_arenas(epoch, global), &opts).expect("honest prove");
@@ -3951,7 +3951,7 @@ fn tampered_l2g_binding_rejects() {
             l2g_arenas(&swapped_one_side, global),
         ),
     ] {
-        let err = super::executor::execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        let err = super::executor::execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
             .err()
             .unwrap_or_else(|| panic!("{what}: must not execute"));
         println!("R1g tamper {what}: rejected with {err:?}");
@@ -4369,7 +4369,7 @@ fn the_register_derivation_matches_production() {
 
         for (what, init, fini) in register_file_cases() {
             let arenas = register_arenas(&init, &fini);
-            let exec = super::executor::execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+            let exec = super::executor::execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
                 .unwrap_or_else(|e| panic!("blowup {blowup} / {what}: execution failed: {e:?}"));
             let expected = crate::tables::register::compute_precomputed_commitment_with_fini(
                 &opts, &init, &fini,
@@ -4631,12 +4631,12 @@ fn the_register_derivation_proves_and_verifies() {
     // defaults to `REGISTRY_HASHER = Test` and must, but its own doc licenses
     // that default only for programs that "pin a byte hash on their own builders,
     // emit no `Instr::Hash`, and never consult the socket". Since the derivation
-    // follows `WrapHash::production()`, this one IS a socket program, and proving
+    // follows `WrapHash::legacy()`, this one IS a socket program, and proving
     // it under a toy permutation would derive a root production never computes.
     let artifacts = super::registry::build_artifacts_with_hasher(
         &program,
         &opts,
-        crate::hash_pin::BLOCK_HASHER,
+        crate::hash_pin::LEGACY_HASHER,
     );
     let (init, fini) = fixture_register_boundary();
     let arenas = register_arenas(&init, &fini);
@@ -4915,7 +4915,7 @@ fn a_blake3_authenticating_program_carries_no_keccak_family() {
 ///
 /// This is the control that makes the primary test mean something. It also
 /// pins why the mask is per-program rather than keyed on
-/// `WrapHash::production()`: the production wrap hash here is BLAKE3, and
+/// `WrapHash::legacy()`: the production wrap hash here is BLAKE3, and
 /// keying off it would have silently stripped the keccak family from the very
 /// programs that exist to exercise keccak.
 #[test]

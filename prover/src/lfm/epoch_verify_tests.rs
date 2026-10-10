@@ -107,8 +107,8 @@ fn the_assembled_epoch_verifier_runs() {
     let program = super::epoch_tests::epoch_program(&e, true);
     let arenas = super::epoch_tests::epoch_arena_words(&e, true);
     // ★ The PINNED socket permutation, not a literal. `epoch_program` builds at
-    // `WrapHash::production()`, and the classification rule is that such a
-    // program emits `Instr::Hash` and must run under `BLOCK_HASHER`; only a
+    // `WrapHash::legacy()`, and the classification rule is that such a
+    // program emits `Instr::Hash` and must run under `LEGACY_HASHER`; only a
     // program pinning a byte hash on its own builder may take the default.
     //
     // ⚠ Under a BYTE pin this is inert — `ByteWrapHash` lowers to the KECCAK /
@@ -116,7 +116,7 @@ fn the_assembled_epoch_verifier_runs() {
     // consulted and a toy permutation was free and correct. Under an ALGEBRAIC
     // pin the walks ARE `Instr::Hash`: a toy would rebuild roots the host never
     // committed, and this test would fail on its HONEST path, naming nothing.
-    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
         .expect("the assembled verifier must execute");
 
     // ---- the spine's differential, unchanged: production's own challenges.
@@ -337,13 +337,13 @@ fn the_assembled_epoch_verifier_runs() {
                     .collect();
                 (z, beta, parts, steps, evals)
             };
-            let mut bare = super::builder::LfmBuilder::new()
-                .with_wrap_hash(super::edsl::WrapHash::production());
+            let mut bare =
+                super::builder::LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
             let _ = plumb(&mut bare);
             let baseline = bare.finish().instrs.len();
 
-            let mut full = super::builder::LfmBuilder::new()
-                .with_wrap_hash(super::edsl::WrapHash::production());
+            let mut full =
+                super::builder::LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
             let (z, beta, parts, steps, evals) = plumb(&mut full);
             let ood = super::constraints::OodOperands {
                 steps,
@@ -390,7 +390,7 @@ fn the_assembled_epoch_verifier_runs() {
     // absorption is block-sensitive, compression is not — so they go through
     // `blocks_for` while the walk terms stay plain counts.
     use super::epoch_verify::blocks_for;
-    let hash = super::edsl::WrapHash::production();
+    let hash = super::edsl::WrapHash::legacy();
     let mut fri_perms = 0usize;
     let mut leaf_perms = 0usize;
     let mut walk_perms = 0usize;
@@ -413,10 +413,7 @@ fn the_assembled_epoch_verifier_runs() {
         .legs
         .iter()
         .map(|l| {
-            super::epoch_verify::query_permutations_for(
-                &l.verify,
-                super::edsl::WrapHash::production(),
-            )
+            super::epoch_verify::query_permutations_for(&l.verify, super::edsl::WrapHash::legacy())
         })
         .sum();
     assert_eq!(
@@ -698,11 +695,11 @@ fn the_assembled_verifier_rejects_tampered_leg_data() {
     let program = super::epoch_tests::epoch_program(&e, true);
     let good = super::epoch_tests::epoch_arena_words(&e, true);
     // The pin, for the same reason as `the_assembled_epoch_verifier_runs`: this
-    // is the same `WrapHash::production()` program. It matters most on THIS
+    // is the same `WrapHash::legacy()` program. It matters most on THIS
     // arm — the honest control is what a wrong socket permutation breaks first,
     // and a tamper suite whose control is broken rejects everything and passes.
     assert!(
-        execute(&program, &good, &crate::hash_pin::BLOCK_HASHER).is_ok(),
+        execute(&program, &good, &crate::hash_pin::LEGACY_HASHER).is_ok(),
         "the untampered assembled verifier must run"
     );
 
@@ -773,7 +770,7 @@ fn the_assembled_verifier_rejects_tampered_leg_data() {
         let before = arenas[*arena][*word];
         arenas[*arena][*word][0] = before[0] + FE::one();
         assert!(
-            execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).is_err(),
+            execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER).is_err(),
             "tampering {label} must make the assembled verifier unexecutable, \
              and did not"
         );
@@ -1219,7 +1216,7 @@ fn assembled_twin_at_the_process_format(base: crate::ProofOptions) {
     let e = super::epoch_tests::real_epoch_with(opts.clone());
     let program = super::epoch_tests::epoch_program(&e, true);
     let arenas = super::epoch_tests::epoch_arena_words(&e, true);
-    execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+    execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
         .expect("the assembled verifier must execute at the process format");
 
     let spine = super::epoch_tests::epoch_program(&e, false);
@@ -1230,7 +1227,7 @@ fn assembled_twin_at_the_process_format(base: crate::ProofOptions) {
             .filter(|i| matches!(i, super::instr::Instr::Select { .. }))
             .count()
     };
-    let hash = super::edsl::WrapHash::production();
+    let hash = super::edsl::WrapHash::legacy();
     let emitted = perms(&program) - perms(&spine);
     let predicted: usize = e
         .legs
@@ -1334,7 +1331,7 @@ fn assembled_twin_at_the_process_format(base: crate::ProofOptions) {
             .expect("the one-row leg's FRI arena is among the program's arenas");
         let mut bad = arenas.clone();
         bad[at][0][0] += FE::one();
-        execute(&program, &bad, &crate::hash_pin::BLOCK_HASHER)
+        execute(&program, &bad, &crate::hash_pin::LEGACY_HASHER)
             .expect_err("a moved input-tree value must not execute");
         println!("  leg {k}: a moved one-row input-tree value is refused");
     }
@@ -1353,7 +1350,7 @@ fn assembled_twin_at_the_process_format(base: crate::ProofOptions) {
             .expect("the caps arena is among the program's arenas");
         let mut bad = arenas.clone();
         bad[at][0][0] += FE::one();
-        execute(&program, &bad, &crate::hash_pin::BLOCK_HASHER)
+        execute(&program, &bad, &crate::hash_pin::LEGACY_HASHER)
             .expect_err("a moved cap word must not execute");
         println!("  leg {k}: a moved cap word is refused");
     }

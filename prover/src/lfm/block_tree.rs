@@ -730,8 +730,8 @@ pub(crate) fn block_seed(
     num_private_input_pages: usize,
     runtime_page_ranges: &[crate::RuntimePageRange],
     fri_final_poly_log_degree: u8,
-) -> crate::hash_pin::BlockTranscript {
-    let mut t = crate::hash_pin::block_transcript(&[]);
+) -> crate::hash_pin::LegacyTranscript {
+    let mut t = crate::hash_pin::legacy_transcript(&[]);
     crate::statement::absorb_statement_with_digest(
         &mut t,
         crate::statement::StatementKind::Monolithic,
@@ -1133,7 +1133,7 @@ pub(crate) fn prove_program_with(
         super::program_census::build_artifacts_counted(
             program,
             opts,
-            program.hasher(crate::hash_pin::BLOCK_HASHER),
+            program.hasher(crate::hash_pin::LEGACY_HASHER),
         )
     });
     let t_artifacts = t.elapsed().as_secs_f64();
@@ -1562,7 +1562,7 @@ pub fn prove_block_tree(
                                     super::registry::build_artifacts_with_hasher(
                                         program,
                                         &wrap,
-                                        program.hasher(crate::hash_pin::BLOCK_HASHER),
+                                        program.hasher(crate::hash_pin::LEGACY_HASHER),
                                     )
                                 })?;
                                 (Arc::new(Pipe::filled(tree)), phases)

@@ -561,7 +561,7 @@ mod soundness_tests {
         // the same hash `multi_prove_ram` recomputes it with. The workspace
         // `Prover` alias is BLAKE3 whatever the pin says, and under an algebraic
         // pin it makes the honest arm fail with PrecomputedCommitmentMismatch.
-        crate::hash_pin::BlockProver::compute_precomputed_commitment_for_testing(
+        crate::hash_pin::LegacyProver::compute_precomputed_commitment_for_testing(
             trace, &dummy_air, 3,
         )
         .expect("Failed to compute commitment")
@@ -630,16 +630,19 @@ mod soundness_tests {
             (&receiver_air, &mut receiver_trace, &()),
         ];
 
-        let multi_proof =
-            multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
+        let multi_proof = multi_prove_ram(
+            air_trace_pairs,
+            &mut crate::hash_pin::legacy_transcript(&[]),
+        )
+        .unwrap();
 
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];
 
-        let result = crate::hash_pin::BlockVerifier::multi_verify(
+        let result = crate::hash_pin::LegacyVerifier::multi_verify(
             &airs,
             &multi_proof,
-            &mut crate::hash_pin::block_transcript(&[]),
+            &mut crate::hash_pin::legacy_transcript(&[]),
             &FieldElement::zero(),
         );
 
@@ -678,16 +681,19 @@ mod soundness_tests {
             (&receiver_air, &mut receiver_trace, &()),
         ];
 
-        let multi_proof =
-            multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
+        let multi_proof = multi_prove_ram(
+            air_trace_pairs,
+            &mut crate::hash_pin::legacy_transcript(&[]),
+        )
+        .unwrap();
 
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];
 
-        let result = crate::hash_pin::BlockVerifier::multi_verify(
+        let result = crate::hash_pin::LegacyVerifier::multi_verify(
             &airs,
             &multi_proof,
-            &mut crate::hash_pin::block_transcript(&[]),
+            &mut crate::hash_pin::legacy_transcript(&[]),
             &FieldElement::zero(),
         );
 
@@ -748,17 +754,20 @@ mod soundness_tests {
             (&prover_receiver_air, &mut malicious_trace, &()),
         ];
 
-        let multi_proof =
-            multi_prove_ram(air_trace_pairs, &mut crate::hash_pin::block_transcript(&[])).unwrap();
+        let multi_proof = multi_prove_ram(
+            air_trace_pairs,
+            &mut crate::hash_pin::legacy_transcript(&[]),
+        )
+        .unwrap();
 
         // Verifier uses DIFFERENT AIR with honest commitment
         let verifier_airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &verifier_receiver_air];
 
-        let result = crate::hash_pin::BlockVerifier::multi_verify(
+        let result = crate::hash_pin::LegacyVerifier::multi_verify(
             &verifier_airs,
             &multi_proof,
-            &mut crate::hash_pin::block_transcript(&[]),
+            &mut crate::hash_pin::legacy_transcript(&[]),
             &FieldElement::zero(),
         );
 

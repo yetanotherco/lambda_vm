@@ -3,7 +3,7 @@
 //! ## The oracles
 //!
 //! Two, both production's own. `compute_commit_bus_offset` (`lib.rs`) for the
-//! COMMIT-bus target, and `crate::hash_pin::BlockVerifier::multi_verify` for the balance itself — the
+//! COMMIT-bus target, and `crate::hash_pin::LegacyVerifier::multi_verify` for the balance itself — the
 //! fixture is a real sender/receiver pair whose bus genuinely closes, and
 //! production accepting it at target zero is what says so. Nothing here asserts
 //! a balance this file computed.
@@ -258,7 +258,7 @@ fn balanced_pair() -> (Vec<BoxedAir>, MultiProof<Gl, Ext3, ()>) {
         (&sender, &mut sender_trace, &()),
         (&receiver, &mut receiver_trace, &()),
     ];
-    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::legacy_transcript(&[]))
         .expect("the balanced pair must prove");
     (vec![Box::new(sender), Box::new(receiver)], proof)
 }
@@ -278,10 +278,10 @@ fn the_closure_matches_a_bus_that_really_balances() {
         airs.iter().map(|a| &**a).collect();
 
     assert!(
-        crate::hash_pin::BlockVerifier::multi_verify(
+        crate::hash_pin::LegacyVerifier::multi_verify(
             &air_refs,
             &proof,
-            &mut crate::hash_pin::block_transcript(&[]),
+            &mut crate::hash_pin::legacy_transcript(&[]),
             &FEE::zero(),
         ),
         "production must accept this pair at target zero, or the fixture is not \
@@ -729,7 +729,7 @@ fn chunked_family() -> (Vec<BoxedAir>, MultiProof<Gl, Ext3, ()>) {
         (&recv0, &mut recv0_trace, &()),
         (&recv1, &mut recv1_trace, &()),
     ];
-    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::legacy_transcript(&[]))
         .expect("the chunked family must prove");
     (
         vec![Box::new(sender), Box::new(recv0), Box::new(recv1)],
@@ -757,10 +757,10 @@ fn the_closure_accumulates_per_chunk_not_per_family() {
     assert_eq!(air_refs.len(), 3, "one sender and two chunks of one family");
 
     assert!(
-        crate::hash_pin::BlockVerifier::multi_verify(
+        crate::hash_pin::LegacyVerifier::multi_verify(
             &air_refs,
             &proof,
-            &mut crate::hash_pin::block_transcript(&[]),
+            &mut crate::hash_pin::legacy_transcript(&[]),
             &FEE::zero(),
         ),
         "production must accept the chunked family at target zero, or the \
@@ -970,7 +970,7 @@ enum RowWitness {
 /// One REAL continuation epoch — epoch 0 of the LFM fixture guest, built by
 /// `Traces::from_image_and_logs` and proved over the production epoch AIR set
 /// (`VmAirs` + the epoch-local L2G table) under the real epoch statement, then
-/// ACCEPTED by `crate::hash_pin::BlockVerifier::multi_verify_views` against production's own
+/// ACCEPTED by `crate::hash_pin::LegacyVerifier::multi_verify_views` against production's own
 /// `compute_expected_commit_bus_balance_view`. The acceptance is load-bearing
 /// twice over: it is what makes this "what a verifying epoch proof carries"
 /// rather than "what some prover run emitted", and it is what runs
@@ -1179,7 +1179,7 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
     // The real epoch statement, so the challenges are the ones a production
     // epoch proof is bound to.
     let seed = || {
-        let mut t = crate::hash_pin::block_transcript(&[]);
+        let mut t = crate::hash_pin::legacy_transcript(&[]);
         crate::statement::absorb_statement(
             &mut t,
             crate::statement::StatementKind::ContinuationEpoch {
@@ -1236,7 +1236,7 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
     )
     .expect("the COMMIT-bus target must exist");
     assert!(
-        crate::hash_pin::BlockVerifier::multi_verify_views(&refs, view, &mut seed(), &expected),
+        crate::hash_pin::LegacyVerifier::multi_verify_views(&refs, view, &mut seed(), &expected),
         "production must ACCEPT this epoch proof — the measurement is about what \
          a VERIFYING proof carries, and this is also the run of \
          verifier.rs:1238's presence check"
@@ -1366,7 +1366,7 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
         let mut tampered = proof.clone();
         tampered.proofs[i].bus_public_inputs = None;
         assert!(
-            !crate::hash_pin::BlockVerifier::multi_verify_views(
+            !crate::hash_pin::LegacyVerifier::multi_verify_views(
                 &refs,
                 MultiProofView::Owned(&tampered),
                 &mut seed(),

@@ -94,7 +94,7 @@ fn p1w16_chain_census() {
             &chain_program_from(
                 &s,
                 LfmBuilder::new()
-                    .with_wrap_hash(WrapHash::production())
+                    .with_wrap_hash(WrapHash::legacy())
                     .with_p1w16_census(),
             ),
             HasherKind::Rpx,

@@ -349,7 +349,7 @@ fn machine_roots_block(
     derived: &[super::word::LfmWord],
     leg: bool,
 ) -> (Vec<FEE>, usize, usize) {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(carried.len() as u32);
     let cells: Vec<_> = (0..carried.len())
         .map(|i| b.hint_word(arena, i as u32))
@@ -373,7 +373,7 @@ fn machine_roots_block(
     let rows = program.instrs.len();
     let consts = const_rows(&program);
     let arena_words: Vec<_> = carried.to_vec();
-    let exec = execute(&program, &[arena_words], &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &[arena_words], &crate::hash_pin::LEGACY_HASHER)
         .expect("the roots block executes");
     let drawn: Vec<FEE> = exec
         .public_words
@@ -390,7 +390,7 @@ fn machine_roots_block_constants(
     derived: &[super::word::LfmWord],
 ) -> Vec<super::word::LfmWord> {
     let words_of = |leg: bool| -> Vec<super::word::LfmWord> {
-        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
         let arena = b.declare_arena(carried.len() as u32);
         let cells: Vec<_> = (0..carried.len())
             .map(|i| b.hint_word(arena, i as u32))
@@ -520,7 +520,7 @@ fn the_roots_block_emits_its_closed_form() {
 fn the_derived_root_is_program_text_and_not_an_arena_word() {
     let carried_words: Vec<_> = (0..8).map(|i| a_root(i as u8).1).collect();
     let derived_words: Vec<_> = (0..1).map(|i| a_root(200 + i as u8).1).collect();
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(carried_words.len() as u32);
     let cells: Vec<_> = (0..carried_words.len())
         .map(|i| b.hint_word(arena, i as u32))
@@ -593,7 +593,7 @@ fn machine_closure(
     alpha: FEE,
     leg: bool,
 ) -> (Option<Vec<FEE>>, usize, usize) {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let words = 2 * outputs.len() + 2;
     let arena = b.declare_arena(words as u32);
     let wires: Vec<_> = (0..words)
@@ -625,7 +625,7 @@ fn machine_closure(
     }
     arena_words.push(ext_word(&z));
     arena_words.push(ext_word(&alpha));
-    let drawn = execute(&program, &[arena_words], &crate::hash_pin::BLOCK_HASHER)
+    let drawn = execute(&program, &[arena_words], &crate::hash_pin::LEGACY_HASHER)
         .ok()
         .map(|exec| {
             exec.public_words
@@ -1065,7 +1065,7 @@ fn walk_program(
     stage: WalkStage,
 ) -> LfmProgram {
     let words = walk_arena(proof, layouts, config);
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(words.len() as u32);
     let mut at = 0u32;
     let carried: Vec<_> = proof
@@ -1403,7 +1403,7 @@ fn the_table_walk_computes_what_the_host_computes() {
         WalkStage::Groups,
     );
     let arena = walk_arena(&proof, &layouts, &config);
-    let exec = execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &[arena], &crate::hash_pin::LEGACY_HASHER)
         .expect("the machine must execute the host's own proof");
 
     let published: Vec<FEE> = exec
@@ -1973,7 +1973,7 @@ fn the_epoch_program_executes_on_the_epoch_the_host_accepts() {
         "every arena word is hinted exactly once"
     );
 
-    let exec = execute(&program, &arena, &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &arena, &crate::hash_pin::LEGACY_HASHER)
         .expect("the machine must execute the epoch the host accepted");
     println!(
         "epoch {index} of {}: {} instructions, {} arena words, {} permutations, z published {}",
@@ -2087,7 +2087,7 @@ fn machine_publishes(
     public_output: &[u8],
     leg: bool,
 ) -> (usize, usize, Vec<LfmWord>) {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(4);
     let z = b.hint_word(arena, 0).as_ext();
     let alpha = b.hint_word(arena, 1).as_ext();
@@ -2251,7 +2251,7 @@ fn the_epoch_program_publishes_the_aggregation_set() {
     let refs = airs.refs();
     let program = super::whir_epoch::whir_epoch_program(&epoch, &refs);
     let arena = super::whir_epoch::whir_epoch_arena(&epoch, &refs);
-    let exec = execute(&program, &arena, &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &arena, &crate::hash_pin::LEGACY_HASHER)
         .expect("the machine must execute the epoch the host accepted");
     let public = &exec.public_words;
 
@@ -2666,7 +2666,7 @@ fn a_tampered_epoch_is_refused_at_three_sites() {
             site.what
         );
 
-        let refusal = execute(&program, &tampered_arena, &crate::hash_pin::BLOCK_HASHER);
+        let refusal = execute(&program, &tampered_arena, &crate::hash_pin::LEGACY_HASHER);
         assert!(
             refusal.is_err(),
             "{}: the machine must refuse an arena whose {} was moved",
@@ -2701,7 +2701,7 @@ fn a_tampered_epoch_is_refused_at_three_sites() {
         restored, honest,
         "every restore must put the arena back word for word"
     );
-    execute(&program, &restored, &crate::hash_pin::BLOCK_HASHER)
+    execute(&program, &restored, &crate::hash_pin::LEGACY_HASHER)
         .expect("the honest bundle must still execute after every tamper is undone");
     println!(
         "  the three sites moved arena words {moved:?}; the honest arena executes after all of them"

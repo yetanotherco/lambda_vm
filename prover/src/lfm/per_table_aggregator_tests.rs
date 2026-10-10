@@ -7,7 +7,7 @@
 //! ([`global_verifier_program`]) and fills the arenas that program declares
 //! ([`global_arena_words`]).
 //!
-//! It is the per-table verification path at `WrapHash::production()` against a
+//! It is the per-table verification path at `WrapHash::legacy()` against a
 //! real per-table `MultiProof`, differentialled against the harvest's own
 //! production challenges through the published shared pair and tampered through
 //! a flipped L2G main root. Every emission primitive it drives — the spine's
@@ -110,7 +110,7 @@ pub(super) fn real_global(
     }
 
     let seed = || {
-        let mut t = crate::hash_pin::block_transcript(&[]);
+        let mut t = crate::hash_pin::legacy_transcript(&[]);
         crate::statement::absorb_continuation_global_statement(
             &mut t,
             elf_bytes,
@@ -124,7 +124,7 @@ pub(super) fn real_global(
     let view = bundle.global_proof_view();
     assert_eq!(refs.len(), view.len(), "one AIR per global sub-proof");
     assert!(
-        crate::hash_pin::BlockVerifier::<Gl, Ext3, ()>::multi_verify_views(
+        crate::hash_pin::LegacyVerifier::<Gl, Ext3, ()>::multi_verify_views(
             &refs,
             view,
             &mut seed(),
@@ -240,7 +240,7 @@ pub(super) fn global_slice_program(
     use super::epoch::{TableAbsorbs, fork_table};
     use super::statement_replay::{PhaseAPreprocessed, PhaseATable, replay_phase_a};
 
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let n = g.tables.len();
 
     // ---- arenas, declaration order = absorb order ----
@@ -486,7 +486,7 @@ fn the_global_verifier_leg_runs_and_rejects_tampers() {
     let g = real_global(&elf_bytes, &bundle, &inner);
     let program = global_verifier_program(&g);
     let arenas = global_arena_words(&g);
-    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
         .expect("the global leg must execute");
 
     let pub_ext = |i: usize| super::word::word_as_ext(&exec.public_words[i].1).expect("an ext");
@@ -524,7 +524,7 @@ fn the_global_verifier_leg_runs_and_rejects_tampers() {
     let mut tampered = global_arena_words(&g);
     tampered[0][0][0] += FE::one();
     assert!(
-        execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER).is_err(),
+        execute(&program, &tampered, &crate::hash_pin::LEGACY_HASHER).is_err(),
         "a flipped L2G re-commit root must make the global leg unprovable"
     );
 }
@@ -619,7 +619,7 @@ fn the_global_slices_verify_and_sum_to_zero() {
         let (lo, hi) = partition.slice(i);
         let program = global_slice_program(&g, &partition, i);
         let artifacts =
-            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::LEGACY_HASHER);
         let t = Instant::now();
         let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
             .unwrap_or_else(|e| panic!("global slice {i} (tables {lo}..{hi}) must prove: {e:?}"));
@@ -698,7 +698,7 @@ fn the_global_slices_verify_and_sum_to_zero() {
     // ---- the parent.
     let program = global_parent_program(&slices, &partition, slice_layout);
     let arenas: Vec<Vec<LfmWord>> = slices.iter().flat_map(child_arena_words).collect();
-    let artifacts = build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+    let artifacts = build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::LEGACY_HASHER);
     let t = Instant::now();
     let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
         .unwrap_or_else(|e| panic!("★ THE GLOBAL PARENT MUST PROVE: {e:?}"));
@@ -760,7 +760,7 @@ fn the_aggregation_publish_profile_drops_only_diagnostics() {
 
     let run = |publishes| {
         let program = epoch_program_publishing(&e, true, publishes);
-        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
             .expect("the assembled verifier must execute under either profile");
         (program.instrs.len(), exec.public_words)
     };
@@ -850,7 +850,7 @@ fn publics_only_program(count: usize) -> LfmProgram {
     use super::per_table_aggregator::{emit_lfm_statement, emit_public_balance, hint_public_words};
     use super::statement_replay::replay_phase_a;
 
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(8 * count as u32);
     let words = hint_public_words(&mut b, arena, count);
     let mut t = TranscriptReplay::new(&[]);
@@ -875,7 +875,7 @@ fn bindings_only_program(children: usize, with_bindings: bool) -> (LfmProgram, u
     let layout = SchemaLayout::wrap(OUT_HALVES);
     let words = layout.total();
 
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let mut legs = Vec::with_capacity(children);
     for _ in 0..children {
         let arena = b.declare_arena(8 * words as u32);
@@ -932,10 +932,10 @@ fn bindings_only_program(children: usize, with_bindings: bool) -> (LfmProgram, u
 fn the_node_cost_model_is_measured() {
     use super::per_table_aggregator::SchemaLayout;
 
-    let hash = super::edsl::WrapHash::production();
+    let hash = super::edsl::WrapHash::legacy();
     let census = |p: &LfmProgram| -> (usize, usize, u64) {
         let (main, aux) =
-            super::airs::lfm_cell_counts_with_hasher(p, crate::hash_pin::BLOCK_HASHER);
+            super::airs::lfm_cell_counts_with_hasher(p, crate::hash_pin::LEGACY_HASHER);
         (
             p.instrs.len(),
             super::wrap_tests::hash_ops(p, hash),
@@ -1093,7 +1093,7 @@ pub(super) fn node_program(
     label_range: (u64, u64),
     publishes: super::per_table_aggregator::NodePublishSet,
 ) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let shapes: Vec<_> = children.iter().map(child_shape).collect();
     super::per_table_aggregator::emit_node(
         &mut b,
@@ -1131,7 +1131,7 @@ pub(super) fn global_parent_program(
     partition: &super::global_split::SlicePartition,
     layout: &super::block_root::SliceLayout,
 ) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let shapes: Vec<_> = slices.iter().map(child_shape).collect();
     super::global_parent::emit_global_parent(
         &mut b,
@@ -1161,7 +1161,7 @@ pub(super) fn root_program(
     fold_shape: &super::block_root::FoldShape,
     publishes: super::block_root::RootPublishSet,
 ) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let shapes: Vec<_> = interior.iter().map(child_shape).collect();
     let g = child_shape(global);
     super::block_root::emit_block_root(
@@ -1295,7 +1295,7 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
             super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
         let arenas = super::epoch_tests::epoch_arena_words(&e, true);
         let artifacts =
-            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::LEGACY_HASHER);
         let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
             .expect("the epoch wrap must prove at the aggregation preset");
         let layout = SchemaLayout::wrap(out_halves);
@@ -1359,7 +1359,7 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
         label_range,
         NodePublishSet::Diagnostic,
     );
-    let exec_diag = execute(&diagnostic, &arenas, &crate::hash_pin::BLOCK_HASHER)
+    let exec_diag = execute(&diagnostic, &arenas, &crate::hash_pin::LEGACY_HASHER)
         .expect("the diagnostic node must execute");
     let tail = node_layout.head + node_layout.schema_words();
     assert_eq!(
@@ -1402,7 +1402,7 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
     );
 
     let t = Instant::now();
-    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
         .expect("★ the leaf node must execute");
     node_layout.assert_covers(exec.public_words.len());
     println!(
@@ -1433,7 +1433,7 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
     // ⓘ This measurement runs ONE proof, so it is always a cache MISS and the
     // figure below is a real build — which is what it is here to price.
     let t = Instant::now();
-    let artifacts = build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+    let artifacts = build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::LEGACY_HASHER);
     println!(
         "   RSS high-water AFTER build_artifacts ({:.1}s): {:?} GiB",
         t.elapsed().as_secs_f64(),
@@ -1455,7 +1455,7 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
     // from a production one.
     {
         let (main, aux) =
-            super::airs::lfm_cell_counts_with_hasher(&program, crate::hash_pin::BLOCK_HASHER);
+            super::airs::lfm_cell_counts_with_hasher(&program, crate::hash_pin::LEGACY_HASHER);
         let cells = main + 3 * aux;
         const EMPTY_MACHINE_CELLS: u64 = 26_482_828;
         println!(
@@ -1512,7 +1512,7 @@ fn the_leaf_node_verifies_and_binds_two_wraps() {
         let mut tampered = arenas.clone();
         bump(&mut tampered, arena_of(child), word);
         assert!(
-            execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER).is_err(),
+            execute(&program, &tampered, &crate::hash_pin::LEGACY_HASHER).is_err(),
             "moving {name} in child {child} must make the node unprovable"
         );
         println!("   ✓ tamper arm: {name} rejected");
@@ -1561,20 +1561,20 @@ fn a_zero_bit_query_draw_consumes_what_the_host_does() {
 
     // ---- the HOST, exactly as `sample_query_indexes` drives it at a one-row
     // table: one `sample_u64(1)`, then the next thing the transcript would give.
-    let mut host = crate::hash_pin::block_transcript(SEED);
+    let mut host = crate::hash_pin::legacy_transcript(SEED);
     let index = host.sample_u64(1);
     assert_eq!(index, 0, "a two-leaf domain has exactly one query index");
     let host_after: FEE = host.sample_field_element();
 
     // ---- the EMITTER, same seed, same sequence.
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let mut t = TranscriptReplay::new(SEED);
     let bits = t.sample_u64_pow2(&mut b, 0);
     assert!(bits.is_empty(), "a zero-bit draw yields no bits");
     let after = t.sample_ext(&mut b);
     b.public(after.as_cell());
     let program = compile(b.finish());
-    let exec = execute(&program, &[], &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &[], &crate::hash_pin::LEGACY_HASHER)
         .expect("a zero-bit query draw must emit and execute");
 
     assert_eq!(
@@ -1770,13 +1770,13 @@ fn build_beside_prepare(
             let artifacts = super::program_census::build_artifacts_counted(
                 program,
                 opts,
-                crate::hash_pin::BLOCK_HASHER,
+                crate::hash_pin::LEGACY_HASHER,
             );
             (artifacts, t.elapsed().as_secs_f64())
         });
         cached_stage(mode, path, label, || {
             let prepared =
-                super::proof::lfm_prepare(program, arenas, crate::hash_pin::BLOCK_HASHER)
+                super::proof::lfm_prepare(program, arenas, crate::hash_pin::LEGACY_HASHER)
                     .expect("the epoch wrap must execute");
             let (artifacts, t_artifacts) = build
                 .join()
@@ -1813,7 +1813,7 @@ fn building_beside_the_prepare_is_a_build_then_a_prove() {
     let plain = super::registry::build_artifacts_with_hasher(
         &program,
         &opts,
-        crate::hash_pin::BLOCK_HASHER,
+        crate::hash_pin::LEGACY_HASHER,
     );
     let (artifacts, proved, _, _) =
         build_beside_prepare(&program, &arenas, &opts, CacheMode::Off, None, "beside");
@@ -2003,7 +2003,7 @@ fn prove_node_program_as_child(
     let artifacts = super::program_census::build_artifacts_counted(
         program,
         opts,
-        crate::hash_pin::BLOCK_HASHER,
+        crate::hash_pin::LEGACY_HASHER,
     );
     let t_artifacts = t.elapsed().as_secs_f64();
     // ★ WHAT THE ARTIFACT BUILD SPENT QUEUEING rather than committing. Bracketed
@@ -2201,7 +2201,7 @@ fn the_inner_node_verifies_two_leaf_nodes() {
                 super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
             let arenas = super::epoch_tests::epoch_arena_words(&e, true);
             let artifacts =
-                build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+                build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::LEGACY_HASHER);
             let proved = cached_stage(
                 mode,
                 stage_path(cache_dir.as_deref(), &format!("wrap-{leaf}-{i}")),
@@ -2356,7 +2356,7 @@ fn a_depth_zero_walk_still_binds_leaf_to_root() {
         .collect();
 
     // ---- the root, from the emitter's own leaf hash over those values.
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(shape.num_values() as u32);
     let cells: Vec<_> = (0..shape.num_values() as u32)
         .map(|i| b.hint_word(arena, i))
@@ -2370,14 +2370,14 @@ fn a_depth_zero_walk_still_binds_leaf_to_root() {
     let leaf_exec = execute(
         &leaf_program,
         std::slice::from_ref(&leaf_arena),
-        &crate::hash_pin::BLOCK_HASHER,
+        &crate::hash_pin::LEGACY_HASHER,
     )
     .expect("the leaf hash must execute");
     let root_words: Vec<LfmWord> = leaf_exec.public_words.iter().map(|(_, w)| *w).collect();
 
     // ---- the authentication at depth ZERO: no bits, no siblings.
     let build = || {
-        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
         let a_vals = b.declare_arena(shape.num_values() as u32);
         let a_root = b.declare_arena(root_words.len() as u32);
         let vals: Vec<_> = (0..shape.num_values() as u32)
@@ -2401,7 +2401,7 @@ fn a_depth_zero_walk_still_binds_leaf_to_root() {
     execute(
         &program,
         &[leaf_arena.clone(), root_words.clone()],
-        &crate::hash_pin::BLOCK_HASHER,
+        &crate::hash_pin::LEGACY_HASHER,
     )
     .expect("★ a one-leaf tree must authenticate against its own leaf hash");
 
@@ -2412,7 +2412,7 @@ fn a_depth_zero_walk_still_binds_leaf_to_root() {
         execute(
             &program,
             &[leaf_arena, wrong],
-            &crate::hash_pin::BLOCK_HASHER
+            &crate::hash_pin::LEGACY_HASHER
         )
         .is_err(),
         "a depth-zero walk must still REJECT a root that is not the leaf hash — \
@@ -2691,7 +2691,7 @@ fn the_production_leaf_node_measures() {
             super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
         let arenas = super::epoch_tests::epoch_arena_words(&e, true);
         let artifacts =
-            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::LEGACY_HASHER);
         let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
             .expect("the epoch wrap must prove");
         let layout = SchemaLayout::wrap(out_halves);
@@ -2751,7 +2751,7 @@ fn the_production_leaf_node_measures() {
     );
     let arenas: Vec<Vec<LfmWord>> = children.iter().flat_map(child_arena_words).collect();
     let (main, aux) =
-        super::airs::lfm_cell_counts_with_hasher(&program, crate::hash_pin::BLOCK_HASHER);
+        super::airs::lfm_cell_counts_with_hasher(&program, crate::hash_pin::LEGACY_HASHER);
     let cells = main + 3 * aux;
     const EMPTY_MACHINE_CELLS: u64 = 26_482_828;
     println!(
@@ -2773,7 +2773,7 @@ fn the_production_leaf_node_measures() {
     // not the smooth ratio the census reports, and this panel is the only thing
     // that says which chips are standing near an edge. The wrap paid five
     // simultaneous doublings once for want of exactly this reading (#903).
-    let panel = super::airs::lfm_chip_census_with_hasher(&program, crate::hash_pin::BLOCK_HASHER);
+    let panel = super::airs::lfm_chip_census_with_hasher(&program, crate::hash_pin::LEGACY_HASHER);
     println!("   chip panel — rows real/committed, headroom to the next doubling:");
     for c in &panel {
         println!(
@@ -2808,7 +2808,7 @@ fn the_production_leaf_node_measures() {
     mark("BEFORE build_artifacts (this live figure IS L)");
 
     let t = Instant::now();
-    let artifacts = build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+    let artifacts = build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::LEGACY_HASHER);
     println!("   build_artifacts: {:.1}s", t.elapsed().as_secs_f64());
     mark("after build_artifacts");
     // Counters reset HERE, not at the top: the base prove and the wraps have
@@ -3015,7 +3015,7 @@ fn the_tree_shape_matches_the_epoch_count() {
 fn assert_the_rpx_grind_reached_the_device(stage: &str) {
     let grinds = stark::gpu_lde::gpu_grind_calls_rpx();
     println!("     RPX device grinds during the {stage}: {grinds}");
-    if crate::hash_pin::BLOCK_COMMITMENT_HASH == stark::config::CommitmentHash::Rpx256 {
+    if crate::hash_pin::LEGACY_COMMITMENT_HASH == stark::config::CommitmentHash::Rpx256 {
         assert!(
             grinds > 0,
             "the {stage} did ZERO RPX grinds on the device under an RPX pin — every \
@@ -3819,7 +3819,7 @@ fn the_block_root_proves_over_real_children() {
             super::epoch_tests::epoch_program_publishing(&e, true, Publishes::Aggregation);
         let arenas = super::epoch_tests::epoch_arena_words(&e, true);
         let artifacts =
-            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::LEGACY_HASHER);
         let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
             .expect("the epoch wrap must prove at the aggregation preset");
         let layout = SchemaLayout::wrap(out_halves);
@@ -3889,7 +3889,7 @@ fn the_block_root_proves_over_real_children() {
     );
     let node_arenas: Vec<Vec<LfmWord>> = wraps.iter().flat_map(child_arena_words).collect();
     let node_artifacts =
-        build_artifacts_counted(&node_prog, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        build_artifacts_counted(&node_prog, &wrap_opts, crate::hash_pin::LEGACY_HASHER);
     let node_proved = lfm_prove(&node_prog, &node_artifacts, &node_arenas, &wrap_opts)
         .expect("the leaf node must prove");
     let node_layout = SchemaLayout::node(node_out_halves);
@@ -3921,7 +3921,7 @@ fn the_block_root_proves_over_real_children() {
     for i in 0..K {
         let program = global_slice_program(&g, &partition, i);
         let artifacts =
-            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::LEGACY_HASHER);
         let proved = lfm_prove(&program, &artifacts, &slice_arenas, &wrap_opts)
             .unwrap_or_else(|e| panic!("global slice {i} must prove: {e:?}"));
         assert_eq!(proved.public_words.len(), slice_layout.total());
@@ -3930,7 +3930,7 @@ fn the_block_root_proves_over_real_children() {
     let parent_prog = global_parent_program(&slices, &partition, slice_layout);
     let parent_arenas: Vec<Vec<LfmWord>> = slices.iter().flat_map(child_arena_words).collect();
     let parent_artifacts =
-        build_artifacts_counted(&parent_prog, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        build_artifacts_counted(&parent_prog, &wrap_opts, crate::hash_pin::LEGACY_HASHER);
     let parent_proved = lfm_prove(&parent_prog, &parent_artifacts, &parent_arenas, &wrap_opts)
         .expect("the global parent must prove");
     let g_layout = g_shared();
@@ -3980,7 +3980,7 @@ fn the_block_root_proves_over_real_children() {
             .flat_map(child_arena_words)
             .collect();
         let artifacts =
-            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::LEGACY_HASHER);
         // ⛔ `lfm_prove` and not `execute`: a root that EXECUTES has satisfied
         // every assert, and a root that PROVES and does not VERIFY is the failure
         // that reads as success. Only the pair says anything.
@@ -4656,7 +4656,7 @@ fn prove_global_child(
             let arenas = global_arena_words(&g);
             let t = Instant::now();
             let artifacts =
-                build_artifacts_counted(&program, wrap_opts, crate::hash_pin::BLOCK_HASHER);
+                build_artifacts_counted(&program, wrap_opts, crate::hash_pin::LEGACY_HASHER);
             println!(
                 "\n★ PROVING global slice {slice} (tables {lo}..{hi}): \
                  build_artifacts {:.1}s",
@@ -4799,7 +4799,8 @@ fn prove_global_child(
         // exactly this call — so the default path emits the program it always
         // emitted rather than a second spelling of it.
         let program = super::card_schedule::host_phase(|| global_slice_program(&g, &partition, i));
-        let artifacts = build_artifacts_counted(&program, wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        let artifacts =
+            build_artifacts_counted(&program, wrap_opts, crate::hash_pin::LEGACY_HASHER);
         // ⛔ ONE CACHE NAME PER SHAPE, for the same reason there is one layout per
         // shape. The k = 1 wrap closes its bus against zero and a slice does not,
         // so they are DIFFERENT PROGRAMS with different `program_id`s: a slice
@@ -4971,7 +4972,8 @@ fn prove_global_child(
         // inferred from a ratio.
         census_and_panel(&program, "the GLOBAL PARENT", fan_in);
         let arenas: Vec<Vec<LfmWord>> = slices.iter().flat_map(child_arena_words).collect();
-        let artifacts = build_artifacts_counted(&program, wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        let artifacts =
+            build_artifacts_counted(&program, wrap_opts, crate::hash_pin::LEGACY_HASHER);
         #[cfg(feature = "cuda")]
         stark::gpu_lde::reset_all_gpu_call_counters();
         let sampler = HostSampler::start();
@@ -7280,7 +7282,7 @@ fn the_production_tree_composes_to_a_root() {
         } else {
             let t = Instant::now();
             let artifacts =
-                build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+                build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::LEGACY_HASHER);
             let t_artifacts = t.elapsed().as_secs_f64();
             let t = Instant::now();
             let proved = cached_stage(wrap_mode, wrap_path, &wrap_label, || {
@@ -7727,7 +7729,7 @@ fn the_production_tree_composes_to_a_root() {
             .flat_map(child_arena_words)
             .collect();
         let artifacts =
-            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+            build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::LEGACY_HASHER);
         #[cfg(feature = "cuda")]
         stark::gpu_lde::reset_all_gpu_call_counters();
         let sampler = HostSampler::start();
@@ -7962,7 +7964,7 @@ where
     // ⛔ THE PROCESS HASH IS REFUSED HERE, NOT REPORTED — and this is the one
     // place in the harness that is stricter than the driver it calls.
     //
-    // A wrap program's sponge is `WrapHash::production()`, the compile-time RPX
+    // A wrap program's sponge is `WrapHash::legacy()`, the compile-time RPX
     // pin, while the epochs it verifies were proven under whatever
     // `LAMBDA_VM_WHIR_HASH` said. Mismatch the two and the program replays the
     // epoch's transcript under a different hash: every challenge diverges and
@@ -8162,7 +8164,8 @@ where
         let wrap_sampler = HostSampler::start();
 
         let t = Instant::now();
-        let artifacts = build_artifacts_counted(&program, wrap_opts, crate::hash_pin::BLOCK_HASHER);
+        let artifacts =
+            build_artifacts_counted(&program, wrap_opts, crate::hash_pin::LEGACY_HASHER);
         let t_artifacts = t.elapsed().as_secs_f64();
 
         let t = Instant::now();
@@ -8478,7 +8481,7 @@ pub(super) struct WhirGlobalChild {
 /// # ⚠ THE HASH IS THE PROCESS'S, and a wrong one has already been refused
 ///
 /// `H` comes from `with_whir_hash!` at the call site, exactly as level 0's does,
-/// while the cross-epoch program's own sponge is `WrapHash::production()` — the
+/// while the cross-epoch program's own sponge is `WrapHash::legacy()` — the
 /// compile-time RPX pin. So a non-RPX process hash is unprovable here for
 /// precisely the reason it is unprovable at level 0, and `whir_level_zero` has
 /// already refused it by the time this runs. ⛔ NO SECOND COPY OF THAT CHECK: it
@@ -8545,7 +8548,7 @@ where
     // this panel and never inferred from a ratio.
     let (cells, instrs) = census_and_panel(&program, "the WHIR GLOBAL wrap", fan_in);
 
-    let artifacts = build_artifacts_counted(&program, wrap_opts, crate::hash_pin::BLOCK_HASHER);
+    let artifacts = build_artifacts_counted(&program, wrap_opts, crate::hash_pin::LEGACY_HASHER);
     #[cfg(feature = "cuda")]
     stark::gpu_lde::reset_all_gpu_call_counters();
     let sampler = HostSampler::start();
@@ -9525,7 +9528,7 @@ fn the_whir_production_tree_composes_to_a_root() {
                 .flat_map(child_arena_words)
                 .collect();
             let artifacts =
-                build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+                build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::LEGACY_HASHER);
             #[cfg(feature = "cuda")]
             stark::gpu_lde::reset_all_gpu_call_counters();
             let sampler = HostSampler::start();
@@ -10072,7 +10075,7 @@ fn the_whir_fixture_tree_composes_to_a_block_artifact() {
         .chain(std::iter::once(&global.child))
         .flat_map(child_arena_words)
         .collect();
-    let artifacts = build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::BLOCK_HASHER);
+    let artifacts = build_artifacts_counted(&program, &wrap_opts, crate::hash_pin::LEGACY_HASHER);
     let t_root = Instant::now();
     let proved = lfm_prove(&program, &artifacts, &arenas, &wrap_opts)
         .unwrap_or_else(|e| panic!("★ THE FIXTURE WHIR ROOT MUST PROVE: {e:?}"));

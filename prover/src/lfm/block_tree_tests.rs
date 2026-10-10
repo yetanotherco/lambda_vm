@@ -33,7 +33,7 @@ use super::statement_replay::{NUM_TABLE_COUNTS, PhaseAPreprocessed, PhaseATable}
 use super::word::{LfmWord, base_word, ext_word, word_as_ext};
 
 fn production_builder() -> LfmBuilder {
-    LfmBuilder::new().with_wrap_hash(WrapHash::production())
+    LfmBuilder::new().with_wrap_hash(WrapHash::legacy())
 }
 
 use super::block_tree::block_seed;
@@ -52,7 +52,7 @@ fn the_block_front_replays_the_hosts_transcript() {
     use crypto::fiat_shamir::is_transcript::IsTranscript;
 
     assert_eq!(
-        WrapHash::production(),
+        WrapHash::legacy(),
         WrapHash::Algebraic,
         "the block transcript is algebraic, and this compares its state word"
     );
@@ -179,7 +179,7 @@ fn the_block_front_replays_the_hosts_transcript() {
     let exec = execute(
         &program,
         &arenas,
-        &program.hasher(crate::hash_pin::BLOCK_HASHER),
+        &program.hasher(crate::hash_pin::LEGACY_HASHER),
     )
     .expect("the block front must execute");
     let got = |i: usize| word_as_ext(&exec.public_words[i].1).expect("an ext challenge");
@@ -214,7 +214,7 @@ fn the_block_front_replays_the_hosts_transcript() {
         let e = execute(
             &program,
             &tampered,
-            &program.hasher(crate::hash_pin::BLOCK_HASHER),
+            &program.hasher(crate::hash_pin::LEGACY_HASHER),
         )
         .unwrap_or_else(|e| panic!("the front alone takes {what}: {e:?}"));
         let words: Vec<LfmWord> = e.public_words.iter().map(|(_, w)| *w).collect();
@@ -253,7 +253,7 @@ fn the_commit_target_pins_every_output_half_to_its_bytes() {
     let exec = execute(
         &program,
         &honest,
-        &program.hasher(crate::hash_pin::BLOCK_HASHER),
+        &program.hasher(crate::hash_pin::LEGACY_HASHER),
     )
     .expect("canonical halves execute");
     let got: Vec<u8> = exec
@@ -274,7 +274,7 @@ fn the_commit_target_pins_every_output_half_to_its_bytes() {
             execute(
                 &program,
                 &tampered,
-                &program.hasher(crate::hash_pin::BLOCK_HASHER)
+                &program.hasher(crate::hash_pin::LEGACY_HASHER)
             )
             .is_err(),
             "{what} must not execute"
@@ -1109,7 +1109,7 @@ fn a_p1_base_small_tree_derives() {
             let program = plan.leaf_program(k).expect("the P1 leaf emits");
             assert!(program.hash16(), "leaf {k} hashes on the width-16 socket");
             assert_eq!(
-                program.hasher(crate::hash_pin::BLOCK_HASHER),
+                program.hasher(crate::hash_pin::LEGACY_HASHER),
                 HasherKind::Poseidon1W16
             );
             println!(
@@ -1244,7 +1244,7 @@ fn p1_leaf_census_at_production_heights() {
             println!("CENSUS {name} leaf {k} groups: {}", groups.join(" · "));
             let (main, aux) = super::airs::lfm_cell_counts_with_hasher(
                 &program,
-                program.hasher(crate::hash_pin::BLOCK_HASHER),
+                program.hasher(crate::hash_pin::LEGACY_HASHER),
             );
             let instrs = program.instrs.len();
             println!(
@@ -1297,7 +1297,7 @@ fn p1_node_leg_census() {
     for (name, base) in arms {
         let plan = spread_plan_under(13, 40, &super::proof::block_base_options_for(base));
         let program = plan.leaf_program(0).expect("the leaf emits");
-        let hasher = program.hasher(crate::hash_pin::BLOCK_HASHER);
+        let hasher = program.hasher(crate::hash_pin::LEGACY_HASHER);
         let census = lfm_chip_census_with_hasher(&program, hasher);
         let airs = LfmAirs::new_with_hasher(
             &[[0u8; 32]; NUM_LFM_CHIPS],
@@ -1307,9 +1307,8 @@ fn p1_node_leg_census() {
             ChipSet::for_program_with_hasher(&program, hasher),
         );
         let refs = airs.air_refs();
-        let dw =
-            super::edsl::digest_words(&LfmBuilder::new().with_wrap_hash(WrapHash::production()))
-                as usize;
+        let dw = super::edsl::digest_words(&LfmBuilder::new().with_wrap_hash(WrapHash::legacy()))
+            as usize;
         let (mut perms, mut words) = (0usize, 0usize);
         for c in &census {
             let Some(air) = refs.iter().find(|a| a.name() == c.name) else {
@@ -1319,7 +1318,7 @@ fn p1_node_leg_census() {
             let rows = (c.rows as usize).max(1);
             let (v, _) = super::epoch_verify::TableVerifyShape::derive(*air, rows)
                 .expect("the child table's shape derives");
-            let p = super::epoch_verify::table_permutations_for(&v, WrapHash::production());
+            let p = super::epoch_verify::table_permutations_for(&v, WrapHash::legacy());
             let w = v.opening_words(dw) + v.fri_words(dw);
             perms += p;
             words += w;
@@ -1375,7 +1374,7 @@ fn p1_node_program_census() {
                 r.ext_alu,
                 r.mul_base,
                 r.constants,
-                super::epoch_verify::table_permutations_for(&v, WrapHash::production()),
+                super::epoch_verify::table_permutations_for(&v, WrapHash::legacy()),
                 v.opening_words(dw) + v.fri_words(dw)
             );
         }
@@ -1556,7 +1555,7 @@ fn p1_one_table_per_leaf_sizing() {
         let mut over = i64::MIN;
         for k in 0..leaves {
             let program = plan.leaf_program(k).expect("the leaf emits");
-            let hasher = program.hasher(crate::hash_pin::BLOCK_HASHER);
+            let hasher = program.hasher(crate::hash_pin::LEGACY_HASHER);
             let (main, aux) = super::airs::lfm_cell_counts_with_hasher(&program, hasher);
             let census = lfm_chip_census_with_hasher(&program, hasher);
             let airs = LfmAirs::new_with_hasher(
@@ -1575,7 +1574,7 @@ fn p1_one_table_per_leaf_sizing() {
                 let (v, _) =
                     super::epoch_verify::TableVerifyShape::derive(*air, rows.max(1) as usize)
                         .expect("the child table's shape derives");
-                super::epoch_verify::table_permutations_for(&v, WrapHash::production())
+                super::epoch_verify::table_permutations_for(&v, WrapHash::legacy())
             };
             let chunks: Vec<_> = census.iter().filter(|c| c.name == hash).collect();
             let leaf_legs: usize = census.iter().map(|c| leg(c.name, c.rows)).sum();
@@ -1824,7 +1823,7 @@ fn no_production_height_p1_leaf_splits_its_hash_table() {
             "leaf {k}: {rows} socket rows, outside one 2^18 table's unsplit window"
         );
         let census =
-            lfm_chip_census_with_hasher(&program, program.hasher(crate::hash_pin::BLOCK_HASHER));
+            lfm_chip_census_with_hasher(&program, program.hasher(crate::hash_pin::LEGACY_HASHER));
         let tables: Vec<u64> = census
             .iter()
             .filter(|c| c.name == hash)
@@ -1922,7 +1921,7 @@ fn a_nonzero_pad_byte_in_the_output_is_refused() {
     execute(
         &program,
         &arenas,
-        &program.hasher(crate::hash_pin::BLOCK_HASHER),
+        &program.hasher(crate::hash_pin::LEGACY_HASHER),
     )
     .unwrap_or_else(|e| panic!("the honest leaf executes: {e:?}"));
     let last = arenas[0].len() - 1;
@@ -1933,7 +1932,7 @@ fn a_nonzero_pad_byte_in_the_output_is_refused() {
         execute(
             &program,
             &padded,
-            &program.hasher(crate::hash_pin::BLOCK_HASHER)
+            &program.hasher(crate::hash_pin::LEGACY_HASHER)
         )
         .is_err(),
         "a nonzero pad byte in the last output half must not execute"
@@ -2003,7 +2002,7 @@ fn run_bindings(
     execute(
         &program,
         &arenas,
-        &program.hasher(crate::hash_pin::BLOCK_HASHER),
+        &program.hasher(crate::hash_pin::LEGACY_HASHER),
     )
     .map(|e| e.public_words.iter().map(|(_, w)| *w).collect())
     .map_err(|e| format!("{e:?}"))
@@ -2397,7 +2396,7 @@ fn block_leaves_execute_over_a_real_block_proof() {
         let exec = execute(
             &program,
             &arenas,
-            &program.hasher(crate::hash_pin::BLOCK_HASHER),
+            &program.hasher(crate::hash_pin::LEGACY_HASHER),
         )
         .unwrap_or_else(|e| panic!("leaf {k} must execute: {e:?}"));
         let got: Vec<LfmWord> = exec.public_words.iter().map(|(_, w)| *w).collect();
@@ -2447,7 +2446,7 @@ fn block_leaves_execute_over_a_real_block_proof() {
                 execute(
                     &program,
                     &bad,
-                    &program.hasher(crate::hash_pin::BLOCK_HASHER)
+                    &program.hasher(crate::hash_pin::LEGACY_HASHER)
                 )
                 .is_err(),
                 "leaf {k}: a tampered L of instance {i} must not execute"
@@ -2485,7 +2484,7 @@ fn block_leaves_execute_over_a_real_block_proof() {
                 execute(
                     &program,
                     &bad,
-                    &program.hasher(crate::hash_pin::BLOCK_HASHER)
+                    &program.hasher(crate::hash_pin::LEGACY_HASHER)
                 )
                 .is_err(),
                 "leaf {k}: {what} moved and the leaf executed"
@@ -2512,7 +2511,7 @@ fn block_leaves_execute_over_a_real_block_proof() {
         execute(
             &program,
             &over,
-            &program.hasher(crate::hash_pin::BLOCK_HASHER)
+            &program.hasher(crate::hash_pin::LEGACY_HASHER)
         )
         .is_err(),
         "an output half at or over 2^32 must not execute"
@@ -2527,7 +2526,7 @@ fn block_leaves_execute_over_a_real_block_proof() {
             execute(
                 &program,
                 &padded,
-                &program.hasher(crate::hash_pin::BLOCK_HASHER)
+                &program.hasher(crate::hash_pin::LEGACY_HASHER)
             )
             .is_err(),
             "a nonzero pad byte in the last output half must not execute"
@@ -2674,7 +2673,7 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
         execute(
             &program,
             &block_node_arenas(&mixed),
-            &crate::hash_pin::BLOCK_HASHER,
+            &crate::hash_pin::LEGACY_HASHER,
         )
     };
     assert!(
@@ -2696,7 +2695,7 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
             execute(
                 &program,
                 &block_node_arenas(&wrong),
-                &crate::hash_pin::BLOCK_HASHER,
+                &crate::hash_pin::LEGACY_HASHER,
             )
         };
         assert!(
@@ -2875,7 +2874,7 @@ fn the_block_verifier_derives_the_tree_and_accepts_only_its_top() {
                 super::registry::build_artifacts_with_hasher(
                     program,
                     &wrap_opts,
-                    crate::hash_pin::BLOCK_HASHER,
+                    crate::hash_pin::LEGACY_HASHER,
                 )
             })
         })

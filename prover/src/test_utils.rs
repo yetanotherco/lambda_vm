@@ -147,7 +147,7 @@ where
     // proves through the alias while the pin names another hash produces a green
     // suite that means nothing: the prover's recomputed preprocessed root then
     // disagrees with the AIR's and it fails as `PrecomputedCommitmentMismatch`.
-    crate::hash_pin::BlockProver::<F, E, PI>::multi_prove(
+    crate::hash_pin::LegacyProver::<F, E, PI>::multi_prove(
         air_trace_pairs,
         transcript,
         #[cfg(feature = "disk-spill")]

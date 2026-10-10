@@ -250,7 +250,7 @@ fn hint_inputs(
 
 /// The leg's whole program: both rule values published.
 fn statements_program(case: &BusCase, shapes: &[Shape], shape: &Inputs) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let (z, alpha_powers, claim_point, values) = hint_inputs(&mut b, shape);
     let out = emit_claim_statements(
         &mut b,
@@ -273,7 +273,7 @@ fn statements_program(case: &BusCase, shapes: &[Shape], shape: &Inputs) -> LfmPr
 
 /// The same program without the leg: the marginal is the leg.
 fn empty_program(shape: &Inputs) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let (z, _alpha, _point, values) = hint_inputs(&mut b, shape);
     b.public(z.as_cell());
     b.public(values[0].as_cell());
@@ -281,7 +281,7 @@ fn empty_program(shape: &Inputs) -> LfmProgram {
 }
 
 fn run(program: &LfmProgram, shape: &Inputs, name: &str) -> Vec<FEE> {
-    let exec = execute(program, &shape.words(), &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(program, &shape.words(), &crate::hash_pin::LEGACY_HASHER)
         .unwrap_or_else(|e| panic!("{name}: the bus leg must execute: {e:?}"));
     exec.public_words
         .iter()
@@ -318,7 +318,7 @@ fn the_weights_are_the_hosts_eq_table() {
             values: Vec::new(),
         };
 
-        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
         let (_z, _alpha, wires, _values) = hint_inputs(&mut b, &shape);
         let table = emit_eq_evals(&mut b, &wires);
         for entry in &table {
@@ -346,7 +346,7 @@ fn the_weight_table_emits_its_closed_form() {
             values: Vec::new(),
         };
         let with = {
-            let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+            let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
             let (z, _alpha, wires, _values) = hint_inputs(&mut b, &shape);
             let table = emit_eq_evals(&mut b, &wires);
             b.public(table[0].as_cell());
@@ -354,7 +354,7 @@ fn the_weight_table_emits_its_closed_form() {
             compile(b.finish())
         };
         let without = {
-            let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+            let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
             let (z, _alpha, wires, _values) = hint_inputs(&mut b, &shape);
             let first = wires.first().copied().unwrap_or(z);
             b.public(first.as_cell());
@@ -386,7 +386,7 @@ fn every_interaction_is_what_the_host_probes() {
         let shapes = case.shapes();
         for (index, (z, alpha)) in challenges().into_iter().enumerate() {
             let shape = inputs(&case, &shapes, z, alpha, 0xB0_5A11 + index as u64);
-            let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+            let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
             let (z_wire, alpha_wires, _point, values) = hint_inputs(&mut b, &shape);
             for interaction in &shapes {
                 let (num, den) =

@@ -115,7 +115,7 @@ fn arena_words(shape: &Shape) -> usize {
 /// Hints `at`, then each group's point, then every column's weight — the order
 /// [`weight_arena`] fills.
 fn weight_program(shape: &Shape, poly: usize) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(arena_words(shape) as u32);
     let mut idx = 0u32;
     let next = |b: &mut LfmBuilder, idx: &mut u32| -> Ext {
@@ -232,7 +232,7 @@ fn the_weight_leg_computes_what_the_host_computes() {
 
                 let program = weight_program(&shape, poly);
                 let arena = weight_arena(&at, &points, &weights);
-                let exec = execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER)
+                let exec = execute(&program, &[arena], &crate::hash_pin::LEGACY_HASHER)
                     .expect("the weight leg executes");
                 let got = word_as_ext(&exec.public_words[0].1).expect("a published weight");
                 assert_eq!(
@@ -534,7 +534,7 @@ fn plumbing(arena: &Arena) -> usize {
 
 fn stacked_program(fixture: &Fixture) -> LfmProgram {
     let at = Arena::new(fixture);
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(at.total);
     let mut transcript = WhirTranscript::new();
 
@@ -639,7 +639,7 @@ fn the_stacked_verify_executes_on_a_proof_the_host_accepts() {
         let program = stacked_program(&fixture);
         let arena = stacked_arena(&fixture);
         let exec =
-            execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
+            execute(&program, &[arena], &crate::hash_pin::LEGACY_HASHER).unwrap_or_else(|e| {
                 panic!(
                     "{}: the machine must execute the host's proof: {e:?}",
                     fixture.name

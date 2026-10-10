@@ -208,7 +208,7 @@ fn the_machine_transcript_tracks_the_host_absorb_for_absorb() {
         let program = compile(b.finish());
         let mut arenas = vec![vec![root_word, base_word(felt_v), ext_word(&ext_v)]];
         // ⚠ The ALGEBRAIC form directly, NOT `proof_arena::commitment_words`.
-        // That helper reads `WrapHash::production()` — the workspace PIN — while
+        // That helper reads `WrapHash::legacy()` — the workspace PIN — while
         // this program's reader is `RootCells::words_per_root`, which reads THIS
         // BUILDER's arm, and the builder is unconditionally `Algebraic` here.
         // The two coincide only on an algebraic pin, so mixing them makes the

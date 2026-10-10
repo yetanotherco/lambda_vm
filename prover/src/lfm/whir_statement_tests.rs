@@ -156,7 +156,7 @@ fn machine_epoch_challenge_under(
     table_num_vars: &[u8],
     root_word: LfmWord,
 ) -> (FEE, StatementCost, usize, usize) {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(1);
     let mut transcript = WhirTranscript::new();
 
@@ -181,8 +181,12 @@ fn machine_epoch_challenge_under(
     validate(&program).expect("the statement leg must be admissible");
     let rows = program.instrs.len();
     let consts = super::whir_chain_tests::const_rows(&program);
-    let exec = execute(&program, &[vec![root_word]], &crate::hash_pin::BLOCK_HASHER)
-        .expect("the statement leg executes");
+    let exec = execute(
+        &program,
+        &[vec![root_word]],
+        &crate::hash_pin::LEGACY_HASHER,
+    )
+    .expect("the statement leg executes");
     let drawn = word_as_ext(&exec.public_words[0].1).expect("a published challenge");
     (drawn, cost, rows, consts)
 }
@@ -524,7 +528,7 @@ fn the_pad_is_what_keeps_the_roots_aligned() {
             }
 
             // With the pad: the root absorbs.
-            let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+            let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
             let arena = b.declare_arena(1);
             let mut transcript = WhirTranscript::new();
             emit_epoch_statement(&mut transcript, &statement);
@@ -533,7 +537,7 @@ fn the_pad_is_what_keeps_the_roots_aligned() {
 
             // Without it: the same absorb has no felt boundary to start on, and
             // the transcript must refuse rather than shift.
-            let mut b2 = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+            let mut b2 = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
             let arena2 = b2.declare_arena(1);
             let mut bare = WhirTranscript::new();
             bare.absorb_const_bytes(&bytes);
@@ -655,7 +659,7 @@ fn the_global_statement_draws_the_challenge_the_host_draws() {
     host.append_bytes(&root_bytes);
     let want = host.sample_field_element();
 
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(1);
     let mut transcript = WhirTranscript::new();
     let cost = emit_global_statement(
@@ -675,8 +679,12 @@ fn the_global_statement_draws_the_challenge_the_host_draws() {
     b.public(challenge.as_cell());
     let program = compile(b.finish());
     validate(&program).expect("the global statement leg must be admissible");
-    let exec = execute(&program, &[vec![root_word]], &crate::hash_pin::BLOCK_HASHER)
-        .expect("the global statement leg executes");
+    let exec = execute(
+        &program,
+        &[vec![root_word]],
+        &crate::hash_pin::LEGACY_HASHER,
+    )
+    .expect("the global statement leg executes");
     let got = word_as_ext(&exec.public_words[0].1).expect("a published challenge");
 
     println!(

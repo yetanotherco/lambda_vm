@@ -200,7 +200,7 @@ impl SubProofShape {
     /// emitter advances its cursor by — and the host side passes
     /// `proof_arena::words_per_root()`, the width it serialises roots at. A
     /// shape that read the configuration here would agree with a builder at
-    /// `WrapHash::production()` and disagree with any other, and the
+    /// `WrapHash::legacy()` and disagree with any other, and the
     /// disagreement would surface as the emitter's own stride assertion.
     pub fn query_words(&self, digest_words: usize) -> usize {
         1 + self.opening_words(digest_words)

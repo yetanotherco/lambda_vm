@@ -36,11 +36,11 @@ type FE = FieldElement<GoldilocksField>;
 /// test comparing a machine leaf against that alias compares against BLAKE3
 /// whatever the branch pins.
 pub type BlockBatched<F> =
-    <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Batched<F>;
+    <crate::hash_pin::LegacyStarkHash as stark::config::StarkHash>::Batched<F>;
 
 /// The PAIR backend FRI layers commit under. See [`BlockBatched`]; the alias it
 /// replaces is `stark::config::FriLayerMerkleTreeBackend` = `PairBlake3Backend`.
-pub type BlockPair<F> = <crate::hash_pin::BlockStarkHash as stark::config::StarkHash>::Pair<F>;
+pub type BlockPair<F> = <crate::hash_pin::LegacyStarkHash as stark::config::StarkHash>::Pair<F>;
 
 /// The Merkle backend the main trace is committed under — the BLOCK PATH's pin,
 /// not a locally chosen equivalent and no longer `stark`'s default alias, so a
@@ -108,9 +108,9 @@ pub fn halves_to_arena(halves: Vec<FE>) -> Vec<LfmWord> {
 ///
 /// ⚠ These two must agree or every root in the arena is off by a word. They do
 /// because both are functions of the configuration's digest width and neither
-/// restates it: this reads `WrapHash::production()`, that reads the builder's.
+/// restates it: this reads `WrapHash::legacy()`, that reads the builder's.
 pub fn words_per_root() -> usize {
-    if super::edsl::WrapHash::production() == super::edsl::WrapHash::Algebraic {
+    if super::edsl::WrapHash::legacy() == super::edsl::WrapHash::Algebraic {
         1
     } else {
         2
@@ -162,7 +162,7 @@ pub fn commitment_lanes(c: &Commitment) -> Vec<FE> {
 /// the arena is off by a word. They agree because both are functions of the
 /// configuration's `WrapDigest` width and neither restates it.
 pub fn commitment_words(c: &Commitment) -> Vec<LfmWord> {
-    if super::edsl::WrapHash::production() == super::edsl::WrapHash::Algebraic {
+    if super::edsl::WrapHash::legacy() == super::edsl::WrapHash::Algebraic {
         return vec![super::algebraic_commit::commitment_to_digest(c)];
     }
     let halves = pack_stream(c);

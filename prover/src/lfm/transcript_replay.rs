@@ -479,7 +479,7 @@ impl TranscriptReplay {
 
     /// Whether this builder's configuration replays the ALGEBRAIC chain.
     ///
-    /// Read from the BUILDER and never from `WrapHash::production()`: the
+    /// Read from the BUILDER and never from `WrapHash::legacy()`: the
     /// hash-pinned instruments override the configuration with
     /// `with_wrap_hash(WrapHash::Blake3)` and must keep the byte arm even in a
     /// build whose default is algebraic.

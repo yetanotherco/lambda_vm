@@ -371,7 +371,7 @@ mod tests {
         let mut publics = honest_slice_publics(k, &layout);
         mutate(&mut publics);
 
-        let mut b = LfmBuilder::new().with_wrap_hash(super::super::edsl::WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(super::super::edsl::WrapHash::legacy());
         let ids: Vec<_> = (0..k)
             .map(|_| b.declare_arena((8 * layout.total()) as u32))
             .collect();
@@ -397,7 +397,7 @@ mod tests {
         emit_parent_checks_and_publishes(&mut b, &legs, &layout);
         let program = super::super::compiler::compile(b.finish());
         let arenas: Vec<Vec<LfmWord>> = publics.iter().map(|w| publics_arena(w)).collect();
-        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER);
+        let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER);
         (layout, exec)
     }
 
@@ -580,7 +580,7 @@ mod tests {
                 tables: Vec::new(),
             })
             .collect();
-        let mut b = LfmBuilder::new().with_wrap_hash(super::super::edsl::WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(super::super::edsl::WrapHash::legacy());
         emit_global_parent(
             &mut b,
             &ParentInputs {
@@ -617,7 +617,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "a parent folds at least TWO slices")]
     fn a_parent_over_a_single_slice_is_refused() {
-        let mut b = LfmBuilder::new().with_wrap_hash(super::super::edsl::WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(super::super::edsl::WrapHash::legacy());
         emit_global_parent(
             &mut b,
             &ParentInputs {

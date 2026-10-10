@@ -29,10 +29,10 @@
 //! `DefaultTranscript<E, H::Transcript>`, a sponge over that digest. **For an
 //! algebraic hash they do not.** `AlgebraicTranscript` is a compress chain over
 //! cells, not a byte sponge over `AlgebraicDigest`, and a branch that pinned only
-//! [`BlockStarkHash`] would commit under RPO while sponging Fiat–Shamir through
+//! [`LegacyStarkHash`] would commit under RPO while sponging Fiat–Shamir through
 //! bytes — self-consistent between prover and verifier, and therefore **silent**.
 //! That is the same half-flip `stark::config::DefaultStarkTranscript`'s own doc
-//! warns about, and [`block_transcript`] is why it cannot happen here.
+//! warns about, and [`legacy_transcript`] is why it cannot happen here.
 //!
 //! # What a branch changes
 //!
@@ -40,16 +40,16 @@
 //! algebraic branch they become, for example:
 //!
 //! ```ignore
-//! pub type BlockStarkHash  = crate::lfm::algebraic_commit::RpoStarkHash;
-//! pub type BlockTranscript = crate::lfm::algebraic_transcript::AlgebraicTranscript;
-//! pub fn block_transcript(seed: &[u8]) -> BlockTranscript {
-//!     BlockTranscript::with_seed(crate::lfm::hash::HasherKind::Rpo, seed)
+//! pub type LegacyStarkHash  = crate::lfm::algebraic_commit::RpoStarkHash;
+//! pub type LegacyTranscript = crate::lfm::algebraic_transcript::AlgebraicTranscript;
+//! pub fn legacy_transcript(seed: &[u8]) -> LegacyTranscript {
+//!     LegacyTranscript::with_seed(crate::lfm::hash::HasherKind::Rpo, seed)
 //! }
 //! ```
 //!
 //! ✓ VERIFIED that flip compiles and runs end to end — it was performed, built,
 //! and executed against this crate's own prove/verify tests before this module
-//! was written, which is how [`BlockProver`], the generic transcript parameter
+//! was written, which is how [`LegacyProver`], the generic transcript parameter
 //! on `compute_expected_commit_bus_balance_view`, and the
 //! `IsStreamingLeafBackend` import in `proof_arena` were found. None of those
 //! three shows up on a build that only ever pins BLAKE3.
@@ -104,13 +104,13 @@
 /// Every `multi_prove` / `multi_verify` instantiation in this crate names this
 /// rather than `stark::config::DefaultStarkHash`, so the two can differ on a
 /// branch without the workspace default moving.
-pub type BlockStarkHash = crate::lfm::algebraic_commit::RpxStarkHash;
+pub type LegacyStarkHash = crate::lfm::algebraic_commit::RpxStarkHash;
 
 /// The Fiat–Shamir transcript OBJECT the block path builds.
 ///
 /// See the module header for why this is pinned separately from
-/// [`BlockStarkHash`] rather than derived from it.
-pub type BlockTranscript = crate::lfm::algebraic_transcript::AlgebraicTranscript;
+/// [`LegacyStarkHash`] rather than derived from it.
+pub type LegacyTranscript = crate::lfm::algebraic_transcript::AlgebraicTranscript;
 
 /// A fresh block-path transcript over `seed`.
 ///
@@ -118,11 +118,11 @@ pub type BlockTranscript = crate::lfm::algebraic_transcript::AlgebraicTranscript
 /// differently: a byte transcript takes the seed in its constructor, an
 /// algebraic one absorbs it as its first `append_bytes` call. Callers should not
 /// have to know which.
-pub fn block_transcript(seed: &[u8]) -> BlockTranscript {
-    BlockTranscript::with_seed(BLOCK_HASHER, seed)
+pub fn legacy_transcript(seed: &[u8]) -> LegacyTranscript {
+    LegacyTranscript::with_seed(LEGACY_HASHER, seed)
 }
 
-/// The prover the block path drives, at [`BlockStarkHash`].
+/// The prover the block path drives, at [`LegacyStarkHash`].
 ///
 /// ⚠ **Not `stark::prover::Prover`.** That alias is `GenericProver` at
 /// `DefaultStarkHash`, so it is BLAKE3-fixed regardless of what `H` a call site
@@ -130,18 +130,18 @@ pub fn block_transcript(seed: &[u8]) -> BlockTranscript {
 /// silent wrong hash, which is how this was found. The `IsStarkProver` impl
 /// itself is fully generic over `H`; only the alias is pinned, so the fix is an
 /// alias at the pin rather than anything in `crypto/stark`.
-pub type BlockProver<Field, FieldExtension, PI> =
-    stark::prover::GenericProver<Field, FieldExtension, PI, BlockStarkHash>;
+pub type LegacyProver<Field, FieldExtension, PI> =
+    stark::prover::GenericProver<Field, FieldExtension, PI, LegacyStarkHash>;
 
-/// The verifier the block path drives, at [`BlockStarkHash`]. See
-/// [`BlockProver`] for why the `stark::verifier::Verifier` alias is not it.
-pub type BlockVerifier<Field, FieldExtension, PI> =
-    stark::verifier::GenericVerifier<Field, FieldExtension, PI, BlockStarkHash>;
+/// The verifier the block path drives, at [`LegacyStarkHash`]. See
+/// [`LegacyProver`] for why the `stark::verifier::Verifier` alias is not it.
+pub type LegacyVerifier<Field, FieldExtension, PI> =
+    stark::verifier::GenericVerifier<Field, FieldExtension, PI, LegacyStarkHash>;
 
 /// The `LFM_HASH` socket permutation the block path's programs are EXECUTED and
 /// proved under — the machine's own hash chip.
 ///
-/// ⚠ **A third axis, and it is orthogonal to [`BlockStarkHash`].** That one says
+/// ⚠ **A third axis, and it is orthogonal to [`LegacyStarkHash`].** That one says
 /// which hash the HOST commits under; this says which permutation the MACHINE's
 /// `Instr::Hash` rows compute. They have to agree, and nothing in the type
 /// system makes them: the socket hasher is passed per call to `execute` and
@@ -158,14 +158,14 @@ pub type BlockVerifier<Field, FieldExtension, PI> =
 /// Every `execute` and prove call on the block path names this rather than a
 /// literal, so the two axes cannot drift apart in a test harness while
 /// production stays correct.
-pub const BLOCK_HASHER: crate::lfm::hash::HasherKind = crate::lfm::hash::HasherKind::Rpx;
+pub const LEGACY_HASHER: crate::lfm::hash::HasherKind = crate::lfm::hash::HasherKind::Rpx;
 
-// The host block transcript (`block_transcript`) hashes twelve-felt steps with
-// `BLOCK_HASHER`; the width-16 socket has no twelve-felt hash (its contract
+// The host block transcript (`legacy_transcript`) hashes twelve-felt steps with
+// `LEGACY_HASHER`; the width-16 socket has no twelve-felt hash (its contract
 // refuses), so it can never be the block hasher. A width-16 program takes the
 // socket from its own instructions (`LfmProgram::hasher`), never from here.
 const _: () = assert!(
-    !matches!(BLOCK_HASHER, crate::lfm::hash::HasherKind::Poseidon1W16),
+    !matches!(LEGACY_HASHER, crate::lfm::hash::HasherKind::Poseidon1W16),
     "the block hasher hashes twelve-felt transcript steps; the width-16 socket has none"
 );
 
@@ -176,8 +176,8 @@ const _: () = assert!(
 /// run under a configuration whose `COMMITMENT_HASH` differs and the const will
 /// not know. The block path IS such a configuration on three of the four
 /// branches, so anything describing a block proof's roots must read the pin.
-pub const BLOCK_COMMITMENT_HASH: stark::config::CommitmentHash =
-    <BlockStarkHash as stark::config::StarkHash>::COMMITMENT_HASH;
+pub const LEGACY_COMMITMENT_HASH: stark::config::CommitmentHash =
+    <LegacyStarkHash as stark::config::StarkHash>::COMMITMENT_HASH;
 
 // =========================================================================
 // The base format (`p1/*` exploration branch)
@@ -195,7 +195,7 @@ pub const BLOCK_COMMITMENT_HASH: stark::config::CommitmentHash =
 /// the epoch and LFM provers refuse a P1 format ([`require_rpx_base`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaseHash {
-    /// [`BlockStarkHash`] under [`BlockTranscript`]: `BaseFormat::RPX`, today.
+    /// [`LegacyStarkHash`] under [`LegacyTranscript`]: `BaseFormat::RPX`, today.
     Rpx,
     /// [`crate::lfm::p1_commit::P1StarkHash`] under
     /// [`crate::lfm::p1_commit::P1Transcript`]: `BaseFormat::P1`.
@@ -236,10 +236,10 @@ pub fn checked_base(format: &stark::proof::options::ProofFormat) -> Result<BaseH
             }
             Ok(BaseHash::P1)
         }
-        h if h == BLOCK_COMMITMENT_HASH => Ok(BaseHash::Rpx),
+        h if h == LEGACY_COMMITMENT_HASH => Ok(BaseHash::Rpx),
         h => Err(format!(
             "the block path has no base configuration for the format's hash {h:?} \
-             (expected {BLOCK_COMMITMENT_HASH:?} or Poseidon1)"
+             (expected {LEGACY_COMMITMENT_HASH:?} or Poseidon1)"
         )),
     }
 }
@@ -375,21 +375,21 @@ pub trait BlockHash: Send + Sync + 'static {
     fn state_word(t: &Self::Transcript) -> crate::lfm::word::LfmWord;
 }
 
-/// The pin: [`BlockStarkHash`] under [`BlockTranscript`].
+/// The pin: [`LegacyStarkHash`] under [`LegacyTranscript`].
 pub struct RpxBlock;
 
 impl BlockHash for RpxBlock {
-    type H = BlockStarkHash;
-    type Transcript = BlockTranscript;
+    type H = LegacyStarkHash;
+    type Transcript = LegacyTranscript;
     const BASE: BaseHash = BaseHash::Rpx;
-    fn transcript(seed: &[u8]) -> BlockTranscript {
-        block_transcript(seed)
+    fn transcript(seed: &[u8]) -> LegacyTranscript {
+        legacy_transcript(seed)
     }
     /// Today's tag, byte for byte: RPX statements do not move.
     fn statement_tag(_: &stark::proof::options::ProofFormat) -> Vec<u8> {
         crate::statement::DOMAIN_TAG.to_vec()
     }
-    fn state_word(t: &BlockTranscript) -> crate::lfm::word::LfmWord {
+    fn state_word(t: &LegacyTranscript) -> crate::lfm::word::LfmWord {
         t.state_word()
     }
 }
@@ -580,14 +580,14 @@ mod tests {
         use crypto::fiat_shamir::is_transcript::IsTranscript;
         assert_eq!(
             std::any::TypeId::of::<<RpxBlock as BlockHash>::H>(),
-            std::any::TypeId::of::<BlockStarkHash>()
+            std::any::TypeId::of::<LegacyStarkHash>()
         );
         assert_eq!(
             std::any::TypeId::of::<<RpxBlock as BlockHash>::Transcript>(),
-            std::any::TypeId::of::<BlockTranscript>()
+            std::any::TypeId::of::<LegacyTranscript>()
         );
-        let a = <BlockTranscript as IsTranscript<E>>::state(&RpxBlock::transcript(b"seed"));
-        let b = <BlockTranscript as IsTranscript<E>>::state(&block_transcript(b"seed"));
+        let a = <LegacyTranscript as IsTranscript<E>>::state(&RpxBlock::transcript(b"seed"));
+        let b = <LegacyTranscript as IsTranscript<E>>::state(&legacy_transcript(b"seed"));
         assert_eq!(a, b);
         // The P1 configuration is a different hash and a different stream.
         let p = <crate::lfm::p1_commit::P1Transcript as IsTranscript<E>>::state(
@@ -595,7 +595,7 @@ mod tests {
         );
         assert_ne!(a, p);
     }
-    // Named here rather than at module scope: the byte arm's `BlockTranscript`
+    // Named here rather than at module scope: the byte arm's `LegacyTranscript`
     // mentions the extension field and an algebraic arm's does not, so a
     // module-scope import would be unused on one of the two.
     use crate::tables::types::GoldilocksExtension as E;
@@ -605,7 +605,7 @@ mod tests {
     /// on the same hash the commitment configuration names.
     ///
     /// ⚠ This is the half-flip guard, and it is a real one rather than a
-    /// tautology only because [`BlockTranscript`] is pinned separately — the two
+    /// tautology only because [`LegacyTranscript`] is pinned separately — the two
     /// names can disagree, which is exactly the failure this catches. It is
     /// stated over `NAME` because that is the one thing both sides expose.
     #[test]
@@ -616,7 +616,7 @@ mod tests {
         // agreement is by construction here and this test says so cheaply. On an
         // algebraic branch the two are independent types and this becomes the
         // check that matters.
-        let named = <<BlockStarkHash as StarkHash>::Transcript as TranscriptHash>::NAME;
+        let named = <<LegacyStarkHash as StarkHash>::Transcript as TranscriptHash>::NAME;
         assert!(
             !named.is_empty(),
             "a commitment configuration must name its Fiat-Shamir hash"
@@ -629,9 +629,9 @@ mod tests {
     fn a_seeded_transcript_is_a_function_of_its_seed() {
         use crypto::fiat_shamir::is_transcript::IsTranscript;
 
-        let a = <BlockTranscript as IsTranscript<E>>::state(&block_transcript(b"seed-one"));
-        let b = <BlockTranscript as IsTranscript<E>>::state(&block_transcript(b"seed-one"));
-        let c = <BlockTranscript as IsTranscript<E>>::state(&block_transcript(b"seed-two"));
+        let a = <LegacyTranscript as IsTranscript<E>>::state(&legacy_transcript(b"seed-one"));
+        let b = <LegacyTranscript as IsTranscript<E>>::state(&legacy_transcript(b"seed-one"));
+        let c = <LegacyTranscript as IsTranscript<E>>::state(&legacy_transcript(b"seed-two"));
         assert_eq!(a, b, "the same seed must give the same state");
         assert_ne!(a, c, "a different seed must give a different state");
     }

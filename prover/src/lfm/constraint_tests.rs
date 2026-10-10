@@ -914,7 +914,7 @@ pub(super) fn real_fixture() -> (BoxedAir, MultiProof<Gl, Ext3, ()>) {
         _,
         _,
     )> = vec![(&air, &mut trace, &())];
-    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::legacy_transcript(&[]))
         .expect("the L2G_MEMORY fixture must prove");
 
     (Box::new(air), proof)
@@ -937,7 +937,7 @@ pub(super) fn open_sub_proof(
 
     // ---- Round 1, Phase A/B/C, transcribed from `multi_verify_views` for the
     // single-table case (no per-table domain separator).
-    let mut transcript = crate::hash_pin::block_transcript(&[]);
+    let mut transcript = crate::hash_pin::legacy_transcript(&[]);
     if air.is_preprocessed() {
         transcript.append_bytes(&super::epoch_verify_tests::layout_precomputed_commitment(
             air,

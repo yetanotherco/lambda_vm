@@ -97,7 +97,7 @@ fn opening_arena(
 /// these bits over rather than rebuilding them — and publishes the root so the
 /// program has an output.
 fn opening_program(block: usize, is_ext: bool, depth: usize) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena((block + depth + 2) as u32);
 
     // ⚠ Only the field this round holds is hinted. Building both vectors and
@@ -305,7 +305,7 @@ fn the_opening_accepts_what_the_host_accepts() {
                 commitment_to_digest(&commitment.root()),
                 index,
             );
-            execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
+            execute(&program, &[arena], &crate::hash_pin::LEGACY_HASHER).unwrap_or_else(|e| {
                 panic!(
                     "{} base at {index}: the machine refused a valid opening: {e:?}",
                     shape.name
@@ -329,7 +329,7 @@ fn the_opening_accepts_what_the_host_accepts() {
                 commitment_to_digest(&commitment.root()),
                 index,
             );
-            execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
+            execute(&program, &[arena], &crate::hash_pin::LEGACY_HASHER).unwrap_or_else(|e| {
                 panic!(
                     "{} ext at {index}: the machine refused a valid opening: {e:?}",
                     shape.name
@@ -377,7 +377,7 @@ fn a_tampered_opening_cannot_execute() {
                 honest_root,
                 index
             )],
-            &crate::hash_pin::BLOCK_HASHER
+            &crate::hash_pin::LEGACY_HASHER
         )
         .is_ok(),
         "the untouched opening must execute, or the arm below proves nothing"
@@ -395,7 +395,7 @@ fn a_tampered_opening_cannot_execute() {
         execute(
             &program,
             &[opening_arena(&values, &honest_siblings, honest_root, index)],
-            &crate::hash_pin::BLOCK_HASHER
+            &crate::hash_pin::LEGACY_HASHER
         )
         .is_err(),
         "the machine must refuse a corrupted value"
@@ -417,7 +417,7 @@ fn a_tampered_opening_cannot_execute() {
                 honest_root,
                 index
             )],
-            &crate::hash_pin::BLOCK_HASHER
+            &crate::hash_pin::LEGACY_HASHER
         )
         .is_err(),
         "the machine must refuse a corrupted sibling"
@@ -439,7 +439,7 @@ fn a_tampered_opening_cannot_execute() {
                 commitment_to_digest(&wrong_root),
                 index
             )],
-            &crate::hash_pin::BLOCK_HASHER
+            &crate::hash_pin::LEGACY_HASHER
         )
         .is_err(),
         "the machine must refuse a wrong root"
@@ -462,7 +462,7 @@ fn a_tampered_opening_cannot_execute() {
                 honest_root,
                 elsewhere
             )],
-            &crate::hash_pin::BLOCK_HASHER
+            &crate::hash_pin::LEGACY_HASHER
         )
         .is_err(),
         "the machine must refuse an opening claimed at the wrong index"
@@ -508,7 +508,7 @@ fn the_leaf_pins_a_hinted_base_value_to_its_low_lane() {
         execute(
             &program,
             &[opening_arena(&honest, &siblings, root, index)],
-            &crate::hash_pin::BLOCK_HASHER
+            &crate::hash_pin::LEGACY_HASHER
         )
         .is_ok(),
         "the control must execute, or the refusal below is a refusal of nothing"
@@ -519,7 +519,7 @@ fn the_leaf_pins_a_hinted_base_value_to_its_low_lane() {
     let refusal = execute(
         &program,
         &[opening_arena(&smuggled, &siblings, root, index)],
-        &crate::hash_pin::BLOCK_HASHER,
+        &crate::hash_pin::LEGACY_HASHER,
     )
     .expect_err(
         "a base opening value with a nonzero lane 1 must have no execution: the leaf's \
@@ -577,7 +577,7 @@ fn capped_arena(
 /// check alone (measured by building the same prefix twice).
 fn capped_program(depth: usize, c: usize, n: usize) -> LfmProgram {
     let block = 2usize;
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let per = block + (depth - c) + 1;
     let arena = b.declare_arena(((1 << c) + 1 + n * per) as u32);
     let cap: Vec<WrapDigest> = (0..1u32 << c)
@@ -642,7 +642,7 @@ fn the_cap_mux_selects_every_index() {
         execute(
             &program,
             &[capped_arena(&commitment, c, &openings, &cap)],
-            &crate::hash_pin::BLOCK_HASHER,
+            &crate::hash_pin::LEGACY_HASHER,
         )
         .unwrap_or_else(|e| panic!("c={c}: the machine refused honest capped openings: {e:?}"));
 
@@ -672,7 +672,7 @@ fn the_cap_mux_selects_every_index() {
             execute(
                 &program,
                 &[capped_arena(&commitment, c, &forged, &cap)],
-                &crate::hash_pin::BLOCK_HASHER
+                &crate::hash_pin::LEGACY_HASHER
             )
             .is_err(),
             "c={c}: the machine must refuse the wrong subtree"
@@ -697,7 +697,7 @@ fn a_tampered_cap_word_cannot_execute() {
         execute(
             &program,
             std::slice::from_ref(&honest),
-            &crate::hash_pin::BLOCK_HASHER
+            &crate::hash_pin::LEGACY_HASHER
         )
         .is_ok(),
         "the untouched arena must execute, or the arm proves nothing"
@@ -706,7 +706,7 @@ fn a_tampered_cap_word_cannot_execute() {
         let mut forged = honest.clone();
         forged[node][1] += FE::one();
         assert!(
-            execute(&program, &[forged], &crate::hash_pin::BLOCK_HASHER).is_err(),
+            execute(&program, &[forged], &crate::hash_pin::LEGACY_HASHER).is_err(),
             "cap word {node} tampered: the machine must refuse"
         );
     }

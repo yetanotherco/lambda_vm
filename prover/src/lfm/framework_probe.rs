@@ -111,8 +111,8 @@ fn prep_root(opts: &ProofOptions) -> Commitment {
     commit_columns(&[values(), vec![FE::one(); NUM_ROWS]], opts)
 }
 
-fn transcript() -> crate::hash_pin::BlockTranscript {
-    let mut t = crate::hash_pin::block_transcript(&[]);
+fn transcript() -> crate::hash_pin::LegacyTranscript {
+    let mut t = crate::hash_pin::legacy_transcript(&[]);
     t.append_bytes(PROBE_TAG);
     t
 }
@@ -126,7 +126,7 @@ fn prove(
     let pairs: Vec<(DynAir, &mut TraceTable<F, E>, &())> =
         vec![(sender, &mut st, &()), (receiver, &mut rt, &())];
     let mut t = transcript();
-    crate::hash_pin::BlockProver::multi_prove(
+    crate::hash_pin::LegacyProver::multi_prove(
         pairs,
         &mut t,
         #[cfg(feature = "disk-spill")]
@@ -146,7 +146,7 @@ fn b0_preprocessed_multiplicity_round_trips() {
     let refs: Vec<DynAir> = vec![&sender, &receiver];
     let mut vt = transcript();
     assert!(
-        crate::hash_pin::BlockVerifier::multi_verify_views(
+        crate::hash_pin::LegacyVerifier::multi_verify_views(
             &refs,
             MultiProofView::Owned(&proof),
             &mut vt,
@@ -183,7 +183,7 @@ fn b0_verifier_rejects_wrong_preprocessed_root() {
     let refs: Vec<DynAir> = vec![&bad_sender, &receiver];
     let mut vt = transcript();
     assert!(
-        !crate::hash_pin::BlockVerifier::multi_verify_views(
+        !crate::hash_pin::LegacyVerifier::multi_verify_views(
             &refs,
             MultiProofView::Owned(&proof),
             &mut vt,
@@ -208,7 +208,7 @@ fn b0_tampered_witness_value_breaks_balance() {
     let pairs: Vec<(DynAir, &mut TraceTable<F, E>, &())> =
         vec![(&sender, &mut st, &()), (&receiver, &mut rt, &())];
     let mut t = transcript();
-    let proof = crate::hash_pin::BlockProver::multi_prove(
+    let proof = crate::hash_pin::LegacyProver::multi_prove(
         pairs,
         &mut t,
         #[cfg(feature = "disk-spill")]
@@ -220,7 +220,7 @@ fn b0_tampered_witness_value_breaks_balance() {
     let refs: Vec<DynAir> = vec![&sender, &receiver];
     let mut vt = transcript();
     assert!(
-        !crate::hash_pin::BlockVerifier::multi_verify_views(
+        !crate::hash_pin::LegacyVerifier::multi_verify_views(
             &refs,
             MultiProofView::Owned(&proof),
             &mut vt,

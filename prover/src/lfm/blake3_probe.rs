@@ -68,8 +68,8 @@ fn options() -> ProofOptions {
     GoldilocksCubicProofOptions::with_blowup(2).expect("probe options")
 }
 
-fn transcript() -> crate::hash_pin::BlockTranscript {
-    let mut t = crate::hash_pin::block_transcript(&[]);
+fn transcript() -> crate::hash_pin::LegacyTranscript {
+    let mut t = crate::hash_pin::legacy_transcript(&[]);
     t.append_bytes(PROBE_TAG);
     t
 }
@@ -266,7 +266,7 @@ fn prove_traces(
     let pairs: Vec<(DynAir, &mut TraceTable<F, E>, &())> =
         vec![(chip, t0, &()), (&mirror, t1, &()), (&bw_air, t2, &())];
     let mut t = transcript();
-    crate::hash_pin::BlockProver::multi_prove(
+    crate::hash_pin::LegacyProver::multi_prove(
         pairs,
         &mut t,
         #[cfg(feature = "disk-spill")]
@@ -287,7 +287,7 @@ fn verify_proof(
     );
     let refs: Vec<DynAir> = vec![chip, &mirror, &bw_air];
     let mut vt = transcript();
-    crate::hash_pin::BlockVerifier::multi_verify_views(
+    crate::hash_pin::LegacyVerifier::multi_verify_views(
         &refs,
         MultiProofView::Owned(proof),
         &mut vt,

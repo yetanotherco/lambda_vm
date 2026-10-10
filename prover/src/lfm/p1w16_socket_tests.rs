@@ -493,9 +493,9 @@ fn socket_prove_cost_on_the_card() {
                  w: usize|
      -> f64 {
         let mut trace = TraceTable::<Gl, Gl3>::new_main(data.to_vec(), w, 1);
-        let mut transcript = crate::hash_pin::block_transcript(&[]);
+        let mut transcript = crate::hash_pin::legacy_transcript(&[]);
         let t = Instant::now();
-        crate::hash_pin::BlockProver::<Gl, Gl3, ()>::multi_prove(
+        crate::hash_pin::LegacyProver::<Gl, Gl3, ()>::multi_prove(
             vec![(air, &mut trace, &())],
             &mut transcript,
             #[cfg(feature = "disk-spill")]

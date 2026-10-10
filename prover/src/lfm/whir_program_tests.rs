@@ -133,7 +133,7 @@ fn shapes() -> Vec<Shape> {
 
 /// The program's factors hinted, its root published.
 fn program_of(shape: &Shape) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(shape.factors as u32);
     let values: Vec<Ext> = (0..shape.factors)
         .map(|slot| b.hint_word(arena, slot as u32).as_ext())
@@ -181,7 +181,7 @@ fn the_constraint_leg_computes_what_the_host_computes() {
             let want = shape.program.eval(&values, &mut scratch);
 
             let arena: Vec<_> = values.iter().map(ext_word).collect();
-            let exec = execute(&emitted, &[arena], &crate::hash_pin::BLOCK_HASHER)
+            let exec = execute(&emitted, &[arena], &crate::hash_pin::LEGACY_HASHER)
                 .expect("the constraint leg executes");
             let got = word_as_ext(&exec.public_words[0].1).expect("a published value");
             assert_eq!(

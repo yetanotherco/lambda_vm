@@ -143,7 +143,7 @@ struct Arenas {
 /// hardcoded precomputed commitment when the AIR is preprocessed, the main
 /// root, then the shared LogUp challenges. The fork follows, then rounds 2-4.
 fn challenge_program(h: &HostTable) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let shape = &h.shape;
 
     let a = Arenas {
@@ -263,7 +263,7 @@ fn challenge_arenas(h: &HostTable) -> Vec<Vec<LfmWord>> {
 fn run(h: &HostTable) -> (FEE, FEE, FEE, Vec<FEE>, Vec<u64>) {
     let program = challenge_program(h);
     let arenas = challenge_arenas(h);
-    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
         .expect("the replay must execute");
 
     let pub_ext = |i: usize| word_as_ext(&exec.public_words[i].1).expect("an ext challenge");
@@ -370,7 +370,7 @@ fn the_one_row_challenge_replay_matches_production() {
             let mutated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let program = challenge_program(&h);
                 let arenas = challenge_arenas(&h);
-                execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+                execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
                     .ok()
                     .map(|exec| {
                         (0..h.zetas.len())
@@ -456,7 +456,7 @@ fn the_z_guard_rejects_a_point_in_either_domain() {
     };
 
     let program = {
-        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
         let a = b.declare_arena(1);
         let z = b.hint_word(a, 0).as_ext();
         super::epoch::assert_z_outside_domains(&mut b, z, &shape);
@@ -468,7 +468,7 @@ fn the_z_guard_rejects_a_point_in_either_domain() {
         execute(
             &program,
             &[vec![ext_word(&z)]],
-            &crate::hash_pin::BLOCK_HASHER,
+            &crate::hash_pin::LEGACY_HASHER,
         )
         .is_ok()
     };
@@ -533,7 +533,7 @@ fn a_nonce_that_did_not_grind_is_rejected() {
         execute(
             &program,
             &challenge_arenas(&h2),
-            &crate::hash_pin::BLOCK_HASHER,
+            &crate::hash_pin::LEGACY_HASHER,
         )
         .is_ok()
     };
@@ -899,8 +899,8 @@ pub(super) fn epoch_seed(
     runtime_page_ranges: &[crate::RuntimePageRange],
     fri_final_poly_log_degree: u8,
     is_final: bool,
-) -> crate::hash_pin::BlockTranscript {
-    let mut t = crate::hash_pin::block_transcript(&[]);
+) -> crate::hash_pin::LegacyTranscript {
+    let mut t = crate::hash_pin::legacy_transcript(&[]);
     crate::statement::absorb_statement(
         &mut t,
         crate::statement::StatementKind::ContinuationEpoch {
@@ -1056,7 +1056,7 @@ impl EpochFront {
     }
 
     /// [`epoch_seed`] over this epoch's own statement.
-    pub(super) fn seed(&self) -> crate::hash_pin::BlockTranscript {
+    pub(super) fn seed(&self) -> crate::hash_pin::LegacyTranscript {
         epoch_seed(
             self.label,
             &self.elf_bytes,
@@ -1218,7 +1218,7 @@ fn harvest_real_epoch(
         &mut seed(),
     )
     .ok_or("the COMMIT bus target must compute")?;
-    if !crate::hash_pin::BlockVerifier::<Gl, Ext3, ()>::multi_verify_views(
+    if !crate::hash_pin::LegacyVerifier::<Gl, Ext3, ()>::multi_verify_views(
         &refs,
         view,
         &mut seed(),
@@ -1764,7 +1764,7 @@ pub(super) fn host_table_forked(
     view: StarkProofView<'_, Gl, Ext3, ()>,
     index: usize,
     num_tables: usize,
-    fork: &mut crate::hash_pin::BlockTranscript,
+    fork: &mut crate::hash_pin::LegacyTranscript,
     lookup_challenges: &[FEE],
 ) -> HostTable {
     super::harvest::host_table_forked(air, view, index, num_tables, fork, lookup_challenges)
@@ -1889,7 +1889,7 @@ pub(super) fn epoch_program_attesting(
 ) -> LfmProgram {
     use super::statement_replay::{EpochStatementVars, PhaseATable, absorb_epoch_statement};
 
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let n = e.tables.len();
     assert_eq!(e.legs.len(), n, "one leg reading per sub-proof");
 
@@ -2506,7 +2506,7 @@ fn the_epoch_challenge_spine_matches_production() {
     let e = real_epoch();
     let program = epoch_challenge_program(&e);
     let arenas = epoch_arenas(&e);
-    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
         .expect("the epoch spine must execute");
 
     let pub_ext = |i: usize| word_as_ext(&exec.public_words[i].1).expect("an ext challenge");
@@ -2862,7 +2862,7 @@ fn a_split_decode_cell_forges_the_attestation() {
     // ---- (a) the SPLIT program: the forgery runs and publishes the forged id.
     let mut split_arenas = honest.clone();
     split_arenas.push(super::proof_arena::commitments_to_arena(&[substituted]));
-    let exec = execute(&split, &split_arenas, &crate::hash_pin::BLOCK_HASHER).expect(
+    let exec = execute(&split, &split_arenas, &crate::hash_pin::LEGACY_HASHER).expect(
         "the split-cell program must RUN on the forgery — that is the hazard, and \
          a rejection here would mean this control does not demonstrate it",
     );
@@ -2876,7 +2876,7 @@ fn a_split_decode_cell_forges_the_attestation() {
     // honest root in the surplus arena, publishes the honest id.
     let mut split_honest = honest.clone();
     split_honest.push(super::proof_arena::commitments_to_arena(&[real_decode]));
-    let exec_honest = execute(&split, &split_honest, &crate::hash_pin::BLOCK_HASHER)
+    let exec_honest = execute(&split, &split_honest, &crate::hash_pin::LEGACY_HASHER)
         .expect("the split program must also run honestly");
     assert_eq!(
         published_digest(&exec_honest.public_words, 2),
@@ -2893,7 +2893,7 @@ fn a_split_decode_cell_forges_the_attestation() {
     let mut joined_arenas = honest.clone();
     joined_arenas[1] = super::proof_arena::commitments_to_arena(&[substituted]);
     assert!(
-        execute(&joined, &joined_arenas, &crate::hash_pin::BLOCK_HASHER).is_err(),
+        execute(&joined, &joined_arenas, &crate::hash_pin::LEGACY_HASHER).is_err(),
         "with one cell, substituting the DECODE root must break the run: the \
          transcript absorbed it, so the challenges cannot survive it"
     );
@@ -2950,7 +2950,7 @@ fn the_host_attestation_binds_what_the_fold_attested() {
     let keccak = |p: &LfmProgram| p.instrs.iter().any(|i| matches!(i, Instr::KeccakF(_)));
     assert!(keccak(&fold), "the fold is one keccak permutation");
     assert!(!keccak(&host), "the host attestation emits no keccak");
-    let hasher = crate::hash_pin::BLOCK_HASHER;
+    let hasher = crate::hash_pin::LEGACY_HASHER;
     let host_mask = ChipSet::for_program_under(&host, hasher, true);
     assert!(
         !host_mask.keccak && !host_mask.blake3 && !host_mask.bitwise,
@@ -2969,7 +2969,7 @@ fn the_host_attestation_binds_what_the_fold_attested() {
     // ---- (2) the same words.
     let arenas = epoch_arenas(&e);
     let run = |p: &LfmProgram, a: &[Vec<LfmWord>]| {
-        execute(p, a, &crate::hash_pin::BLOCK_HASHER).map(|x| x.public_words)
+        execute(p, a, &crate::hash_pin::LEGACY_HASHER).map(|x| x.public_words)
     };
     let fold_words = run(&fold, &arenas).expect("the fold executes");
     let host_words =
@@ -3039,7 +3039,7 @@ fn a_forged_attested_constant_has_no_wrap_execution() {
             Publishes::Diagnostic,
             &Attestation::Host(inputs.clone()),
         );
-        execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).map(|x| x.public_words)
+        execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER).map(|x| x.public_words)
     };
     let words = run(&honest).expect("the honest constants execute");
     assert_eq!(published_digest(&words, 2), e.expected_program_id);
@@ -3093,7 +3093,7 @@ fn the_derivation_binds_every_register_boundary_word() {
     let program = epoch_challenge_program(&e);
     let good = epoch_arenas(&e);
     assert!(
-        execute(&program, &good, &crate::hash_pin::BLOCK_HASHER).is_ok(),
+        execute(&program, &good, &crate::hash_pin::LEGACY_HASHER).is_ok(),
         "the untampered epoch must run"
     );
 
@@ -3106,7 +3106,7 @@ fn the_derivation_binds_every_register_boundary_word() {
             let bumped = arenas[arena][slot][0] + FE::one();
             arenas[arena][slot] = base_word(bumped);
             assert!(
-                execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).is_err(),
+                execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER).is_err(),
                 "{what} slot {slot} moved by one must not verify: the REGISTER \
                  preprocessed root is derived from it, and the transcript absorbed \
                  that root"
@@ -3141,7 +3141,7 @@ fn the_derivation_binds_every_register_boundary_word() {
 fn the_register_boundary_is_width_checked() {
     // ---- (1) the check itself.
     let drive = |v: u64| {
-        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
         let arena = b.declare_arena(1);
         let cell = b.hint_felt(arena, 0);
         super::epoch::assert_u32(&mut b, cell);
@@ -3150,7 +3150,7 @@ fn the_register_boundary_is_width_checked() {
         execute(
             &program,
             &[vec![base_word(FE::from(v))]],
-            &crate::hash_pin::BLOCK_HASHER,
+            &crate::hash_pin::LEGACY_HASHER,
         )
         .is_ok()
     };
@@ -3238,7 +3238,7 @@ fn the_closure_rejects_a_moved_index_or_output() {
     let program = epoch_challenge_program(&e);
     let good = epoch_arenas(&e);
     assert!(
-        execute(&program, &good, &crate::hash_pin::BLOCK_HASHER).is_ok(),
+        execute(&program, &good, &crate::hash_pin::LEGACY_HASHER).is_ok(),
         "the untampered epoch must run"
     );
 
@@ -3249,7 +3249,7 @@ fn the_closure_rejects_a_moved_index_or_output() {
         let mut arenas = good.clone();
         arenas[3][crate::tables::register::X254_INDEX] = base_word(FE::from(e.start_index + delta));
         assert!(
-            execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).is_err(),
+            execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER).is_err(),
             "start_index + {delta} must not close the bus"
         );
     }
@@ -3267,7 +3267,7 @@ fn the_closure_rejects_a_moved_index_or_output() {
         let bumped = arenas[0][idx][0] + FE::one();
         arenas[0][idx] = base_word(bumped);
         assert!(
-            execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER).is_err(),
+            execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER).is_err(),
             "moving output half {half} must not verify"
         );
     }
@@ -3330,7 +3330,7 @@ fn the_arena_writer_and_the_machine_reader_agree_on_a_roots_width() {
     );
 
     // ---- the machine reads them back at the same stride ----
-    let mut b = LfmBuilder::new().with_wrap_hash(edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(edsl::WrapHash::legacy());
     assert_eq!(
         RootCells::words_per_root(&b) as usize,
         per_root,
@@ -3345,7 +3345,7 @@ fn the_arena_writer_and_the_machine_reader_agree_on_a_roots_width() {
     }
     let program = compile(b.finish());
     let words: Vec<LfmWord> = roots.iter().flat_map(commitment_words).collect();
-    let exec = execute(&program, &[words], &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &[words], &crate::hash_pin::LEGACY_HASHER)
         .expect("the root-width program must execute");
 
     let want: Vec<FE> = roots.iter().flat_map(commitment_lanes).collect();

@@ -341,12 +341,12 @@ all (§6.7, axis 3).
 ### 6.7 THE HASH IS NAMED, NEVER IMPLIED — three axes, and two deliberate carve-outs
 
 **The rule.** Every prove, verify, execute and commitment-building call on the block path names the
-pin (`hash_pin::BlockStarkHash`, `hash_pin::BlockTranscript` / `block_transcript`,
-`hash_pin::BLOCK_HASHER`). None reaches a workspace default alias.
+pin (`hash_pin::LegacyStarkHash`, `hash_pin::LegacyTranscript` / `legacy_transcript`,
+`hash_pin::LEGACY_HASHER`). None reaches a workspace default alias.
 
 **Three orthogonal axes.** They must agree and nothing in the type system makes them:
 
-1. **The commitment configuration** — what the HOST commits under (`BlockStarkHash`). Reaching
+1. **The commitment configuration** — what the HOST commits under (`LegacyStarkHash`). Reaching
    `stark::config::DefaultStarkHash`, or the `stark::prover::Prover` / `stark::verifier::Verifier`
    aliases (which are `GenericProver`/`GenericVerifier` *at* that default), pins BLAKE3 whatever
    `H` the surrounding code passes.

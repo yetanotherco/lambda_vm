@@ -544,7 +544,7 @@ pub fn keccak_merkle_tree_root(b: &mut LfmBuilder, leaves: &[KeccakDigest]) -> K
 ///   code) is a real control rather than a different code path.
 ///
 /// [`Keccak`](WrapHash::Keccak) is the **unset** value, not the production one
-/// — see [`WrapHash::production`] and the header of `programs.rs`.
+/// — see [`WrapHash::legacy`] and the header of `programs.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WrapHash {
     #[default]
@@ -617,8 +617,8 @@ impl WrapHash {
     /// **Not for programs that are ABOUT a hash.** The R1b/R1c/R1d keccak
     /// instruments and `program_id_program_source` name their hash directly and
     /// must keep doing so.
-    pub const fn production() -> Self {
-        match crate::hash_pin::BLOCK_COMMITMENT_HASH {
+    pub const fn legacy() -> Self {
+        match crate::hash_pin::LEGACY_COMMITMENT_HASH {
             stark::config::CommitmentHash::Keccak256 => WrapHash::Keccak,
             stark::config::CommitmentHash::Blake3 => WrapHash::Blake3,
             // ★ Three commitment hashes, ONE emitter arm. The permutation is
@@ -643,7 +643,7 @@ impl WrapHash {
     pub fn for_base(base: &stark::proof::options::BaseFormat) -> Self {
         match crate::hash_pin::base_of_hash(base.hash) {
             crate::hash_pin::BaseHash::P1 => WrapHash::Poseidon1,
-            crate::hash_pin::BaseHash::Rpx => Self::production(),
+            crate::hash_pin::BaseHash::Rpx => Self::legacy(),
         }
     }
 

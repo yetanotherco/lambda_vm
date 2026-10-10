@@ -408,7 +408,7 @@ impl Layout {
 pub(super) fn chain_program(shape: &ChainShape) -> LfmProgram {
     let program = chain_program_from(
         shape,
-        LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production()),
+        LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy()),
     );
     validate(&program).expect("the chain leg must be admissible");
     program
@@ -493,7 +493,7 @@ fn the_chain_executes_on_a_proof_the_host_accepts() {
             program.instrs.len(),
             chain_opening_perms(&f.shape)
         );
-        execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
+        execute(&program, &[arena], &crate::hash_pin::LEGACY_HASHER).unwrap_or_else(|e| {
             panic!("S={num_vars} Q={num_queries}: the machine refused an accepted proof: {e:?}")
         });
     }
@@ -518,7 +518,7 @@ fn a_tampered_chain_cannot_execute() {
         execute(
             &program,
             &[chain_arena(&f, &f.proof)],
-            &crate::hash_pin::BLOCK_HASHER
+            &crate::hash_pin::LEGACY_HASHER
         )
         .is_ok(),
         "the untouched proof must execute, or the arm below proves nothing"
@@ -581,7 +581,7 @@ fn a_tampered_chain_cannot_execute() {
             execute(
                 &program,
                 &[chain_arena(&f, forged)],
-                &crate::hash_pin::BLOCK_HASHER
+                &crate::hash_pin::LEGACY_HASHER
             )
             .is_err(),
             "{name}: the machine must refuse the forgery"
@@ -607,7 +607,7 @@ fn the_chain_spends_its_grinds_where_the_host_does() {
         execute(
             &program,
             &[chain_arena(&f, &f.proof)],
-            &crate::hash_pin::BLOCK_HASHER
+            &crate::hash_pin::LEGACY_HASHER
         )
         .is_ok(),
         "the ground proof must execute"
@@ -631,7 +631,7 @@ fn the_chain_spends_its_grinds_where_the_host_does() {
                 execute(
                     &program,
                     &[chain_arena(&f, &forged)],
-                    &crate::hash_pin::BLOCK_HASHER
+                    &crate::hash_pin::LEGACY_HASHER
                 )
                 .is_err(),
                 "round {r}, the {spot} nonce: a wrong nonce must have no execution"
@@ -697,7 +697,7 @@ fn the_production_shape_reproduces_the_campaigns_permutation_count() {
 /// A one-refusal program: hints its inputs, runs the refusal, publishes a
 /// witness so the program has an output.
 fn refusal_program(which: &str) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(3);
     let one = b.ext_const(&FEE::one());
     let a = b.hint_word(arena, 0).as_ext();
@@ -715,7 +715,7 @@ fn refusal_program(which: &str) -> LfmProgram {
 
 fn runs(program: &LfmProgram, words: [FEE; 3]) -> bool {
     let arena: Vec<LfmWord> = words.iter().map(ext_word).collect();
-    execute(program, &[arena], &crate::hash_pin::BLOCK_HASHER).is_ok()
+    execute(program, &[arena], &crate::hash_pin::LEGACY_HASHER).is_ok()
 }
 
 /// ★ The two refusals a chain-level gate CANNOT exercise, driven directly.
@@ -1534,7 +1534,7 @@ fn a_capped_chain_executes_on_a_proof_the_host_accepts() {
             );
             let program = chain_program(&f.shape);
             let arena = chain_arena(&f, &f.proof);
-            execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
+            execute(&program, &[arena], &crate::hash_pin::LEGACY_HASHER).unwrap_or_else(|e| {
                 panic!(
                     "S={num_vars} Q={num_queries} {cap} caps {:?}: the machine refused an \
                      accepted proof: {e:?}",
@@ -1606,7 +1606,7 @@ fn a_tampered_capped_chain_cannot_execute() {
         execute(
             &program,
             &[chain_arena(&f, &f.proof)],
-            &crate::hash_pin::BLOCK_HASHER
+            &crate::hash_pin::LEGACY_HASHER
         )
         .is_ok(),
         "the untouched proof must execute, or the arm proves nothing"
@@ -1661,7 +1661,7 @@ fn a_tampered_capped_chain_cannot_execute() {
             execute(
                 &program,
                 &[chain_arena(&f, forged)],
-                &crate::hash_pin::BLOCK_HASHER
+                &crate::hash_pin::LEGACY_HASHER
             )
             .is_err(),
             "{name}: the machine must refuse the forgery"
@@ -1798,7 +1798,7 @@ fn a_first_fold_chain_executes_on_a_proof_the_host_accepts() {
         execute(
             &program,
             &[chain_arena(&f, &f.proof)],
-            &crate::hash_pin::BLOCK_HASHER,
+            &crate::hash_pin::LEGACY_HASHER,
         )
         .unwrap_or_else(|e| {
             panic!(
@@ -1824,7 +1824,7 @@ fn a_tampered_first_fold_chain_cannot_execute() {
         execute(
             &program,
             &[chain_arena(&f, &f.proof)],
-            &crate::hash_pin::BLOCK_HASHER
+            &crate::hash_pin::LEGACY_HASHER
         )
         .is_ok(),
         "the untouched proof must execute, or the arm below proves nothing"
@@ -1873,7 +1873,7 @@ fn a_tampered_first_fold_chain_cannot_execute() {
             execute(
                 &program,
                 &[chain_arena(&f, forged)],
-                &crate::hash_pin::BLOCK_HASHER
+                &crate::hash_pin::LEGACY_HASHER
             )
             .is_err(),
             "{name}: the machine must refuse the forgery"
@@ -2257,7 +2257,7 @@ fn both_fold_emissions_execute_on_a_proof_the_host_accepts() {
         );
         for (fold, program) in FOLDS.iter().zip([&lean, &classic]) {
             let arena = chain_arena(&f, &f.proof);
-            execute(program, &[arena], &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
+            execute(program, &[arena], &crate::hash_pin::LEGACY_HASHER).unwrap_or_else(|e| {
                 panic!(
                     "S={num_vars} Q={num_queries}: the {fold:?} chain refused an accepted \
                      proof: {e:?}"
@@ -2300,7 +2300,7 @@ fn a_tampered_chain_cannot_execute_under_either_fold() {
             execute(
                 &program,
                 &[chain_arena(&f, &f.proof)],
-                &crate::hash_pin::BLOCK_HASHER
+                &crate::hash_pin::LEGACY_HASHER
             )
             .is_ok(),
             "{fold:?}: the untouched proof must execute"
@@ -2310,7 +2310,7 @@ fn a_tampered_chain_cannot_execute_under_either_fold() {
                 execute(
                     &program,
                     &[chain_arena(&f, forged)],
-                    &crate::hash_pin::BLOCK_HASHER
+                    &crate::hash_pin::LEGACY_HASHER
                 )
                 .is_err(),
                 "{fold:?}, {name}: the chain must refuse the forgery"
@@ -2371,7 +2371,7 @@ fn host_accepts(f: &Fixture, cfg: &ChainConfig, proof: &ChainProof<F, E>) -> boo
 }
 
 fn machine_accepts(program: &LfmProgram, arena: Vec<LfmWord>) -> bool {
-    execute(program, &[arena], &crate::hash_pin::BLOCK_HASHER).is_ok()
+    execute(program, &[arena], &crate::hash_pin::LEGACY_HASHER).is_ok()
 }
 
 /// ★ A query-only chain executes on a proof the host accepts, and a wrong query

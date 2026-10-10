@@ -373,7 +373,7 @@ pub(crate) fn prove_traces_with_hasher(
     if let Some(one_row) = &artifacts.one_row_roots {
         airs = airs.with_one_row_roots(one_row);
     }
-    let mut transcript = crate::hash_pin::block_transcript(&[]);
+    let mut transcript = crate::hash_pin::legacy_transcript(&[]);
     absorb_lfm_statement(
         &mut transcript,
         &artifacts.program_id,
@@ -382,7 +382,7 @@ pub(crate) fn prove_traces_with_hasher(
     );
     crate::hash_pin::require_rpx_base("the LFM prover", options)
         .map_err(ProvingError::WrongParameter)?;
-    crate::hash_pin::BlockProver::<F, E, ()>::multi_prove(
+    crate::hash_pin::LegacyProver::<F, E, ()>::multi_prove(
         airs.air_trace_pairs(traces),
         &mut transcript,
         #[cfg(feature = "disk-spill")]
@@ -608,7 +608,7 @@ fn verify_against_chunked_with(
     }
     let refs = airs.air_refs();
 
-    let mut transcript = crate::hash_pin::block_transcript(&[]);
+    let mut transcript = crate::hash_pin::legacy_transcript(&[]);
     absorb_lfm_statement(
         &mut transcript,
         program_id,
@@ -627,7 +627,7 @@ fn verify_against_chunked_with(
         return false;
     };
 
-    crate::hash_pin::BlockVerifier::<F, E, ()>::multi_verify_views(
+    crate::hash_pin::LegacyVerifier::<F, E, ()>::multi_verify_views(
         &refs,
         view,
         &mut transcript,

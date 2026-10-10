@@ -579,7 +579,7 @@ mod tests {
 
         for epochs in [2usize, 4, 5, 10, 19] {
             let fan_in = 2usize;
-            let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::production());
+            let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::legacy());
             let lanes_per_root = super::super::proof_arena::lanes_per_root();
             let digests: Vec<_> = (0..epochs)
                 .map(|k| {
@@ -647,7 +647,7 @@ mod tests {
         use super::super::edsl::WrapHash;
         use crate::tables::types::FE;
 
-        let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::legacy());
         let lanes_per_root = super::super::proof_arena::lanes_per_root();
         let digests: Vec<_> = (0..3)
             .map(|k| {
@@ -790,7 +790,7 @@ mod tests {
         // The count each option's fold shape produces, which is what the root
         // compares against its children — `emit_l2g_compare`'s own `recomputed`.
         let refolded = |epochs: usize, fan_in: usize, option: RootOption| -> usize {
-            let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::production());
+            let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::legacy());
             let lanes = super::super::proof_arena::lanes_per_root();
             let digests: Vec<_> = (0..epochs)
                 .map(|k| {
@@ -997,7 +997,7 @@ mod tests {
         use super::super::edsl::WrapHash;
         use super::super::per_table_aggregator::fold_l2g;
         let lanes_per_root = super::super::proof_arena::lanes_per_root();
-        let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::legacy());
         let digests: Vec<WrapDigest> = roots
             .iter()
             .map(|lanes| {
@@ -1035,7 +1035,7 @@ mod tests {
         }
         let program = super::super::compiler::compile(b.finish());
         let arenas: Vec<Vec<LfmWord>> = Vec::new();
-        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
             .expect("the refold oracle must execute");
         assert_eq!(
             exec.public_words.len(),
@@ -1169,7 +1169,7 @@ mod tests {
         let (plan, mut fixture) = plan_and_fixture(epochs, fan_in, replaces_top, out_halves);
         mutate(&mut fixture);
 
-        let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::legacy());
         // ⚠ DECLARATION ORDER IS ABSORB ORDER, and the global child goes LAST —
         // the order `emit_block_root` declares in, so the arenas below are a
         // plain per-child concatenation in the same order.
@@ -1218,7 +1218,7 @@ mod tests {
         let mut arenas: Vec<Vec<LfmWord>> =
             fixture.interior.iter().map(|w| publics_arena(w)).collect();
         arenas.push(publics_arena(&fixture.global));
-        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER);
+        let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER);
         (plan, exec)
     }
 
@@ -1479,7 +1479,7 @@ mod tests {
         use super::super::per_table_aggregator::fold_l2g;
         let lanes = super::super::proof_arena::lanes_per_root();
         for epochs in [4usize, 8] {
-            let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::production());
+            let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::legacy());
             let digests: Vec<WrapDigest> = (0..epochs)
                 .map(|k| {
                     let cells: Vec<_> = (0..lanes)
@@ -1501,7 +1501,7 @@ mod tests {
             }
             let program = super::super::compiler::compile(b.finish());
             let arenas: Vec<Vec<LfmWord>> = Vec::new();
-            let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+            let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
                 .expect("both folds must execute");
             let (tree_lanes, flat_lanes) = exec.public_words.split_at(lanes);
             assert_ne!(

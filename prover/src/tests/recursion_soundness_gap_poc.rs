@@ -170,7 +170,7 @@ fn custom_prove_with_statement_elf(
         .filter(|c| c.is_private_input)
         .count();
 
-    let mut transcript = crate::hash_pin::block_transcript(&[]);
+    let mut transcript = crate::hash_pin::legacy_transcript(&[]);
     absorb_statement(
         &mut transcript,
         StatementKind::Monolithic,
@@ -182,7 +182,7 @@ fn custom_prove_with_statement_elf(
         opts.fri_final_poly_log_degree,
     );
 
-    let proof = crate::hash_pin::BlockProver::multi_prove(
+    let proof = crate::hash_pin::LegacyProver::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
         #[cfg(feature = "disk-spill")]

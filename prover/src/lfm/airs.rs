@@ -144,7 +144,7 @@ pub const fn num_lfm_airs(keccak_rnd_chunks: usize, blake3_chunks: usize) -> usi
 ///
 /// ## What decides it
 ///
-/// A program's own compiled groups. `WrapHash::production()` is the upstream
+/// A program's own compiled groups. `WrapHash::legacy()` is the upstream
 /// cause — it is what makes an authenticating program's keccak group empty
 /// once the commitment hash is BLAKE3 — but it is not the predicate: programs
 /// that are ABOUT a hash (`KeccakChainV0`, `KeccakSpongeV0`) name keccak

@@ -123,7 +123,7 @@ pub(super) fn folding_fixture_with(
         _,
         _,
     )> = vec![(&air, &mut trace, &())];
-    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
+    let proof = multi_prove_ram(pairs, &mut crate::hash_pin::legacy_transcript(&[]))
         .expect("the L2G_MEMORY fixture must prove at any power-of-two row count");
 
     (Box::new(air), proof)
@@ -299,7 +299,7 @@ fn the_fri_leaf_is_byte_identical_to_productions_own_backends() {
     // The wrap hash production commits under: this leg's whole claim is that
     // the machine's leaf IS the verifier's leaf, and the verifier's backend
     // follows the aliases.
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(2);
     let v0 = b.hint_word(arena, 0);
     let v1 = b.hint_word(arena, 1);
@@ -316,7 +316,7 @@ fn the_fri_leaf_is_byte_identical_to_productions_own_backends() {
     let mut digests = Vec::new();
     for (i, (a, c)) in vectors.iter().enumerate() {
         let arenas = vec![vec![ext_word(a), ext_word(c)]];
-        let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
             .expect("the leaf hash executes");
         let got: Vec<LfmWord> = exec.public_words.iter().map(|(_, w)| *w).collect();
 
@@ -362,7 +362,7 @@ fn the_fri_leaf_is_byte_identical_to_productions_own_backends() {
 /// Arena order: the per-query `(index, p₀, p₀ˢ)` block, then the four
 /// [`FriArenas`].
 pub(super) fn fri_only_program(shape: FriShape, num_queries: usize) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     // Per query `(index, p₀, p₀ˢ)`, or `(r, DEEP(x_r))` under one-row leaves.
     let per = fri_deep_words(shape) as u32;
     let q = b.declare_arena(per * num_queries as u32);
@@ -666,7 +666,7 @@ fn the_fri_emitter_verifies_every_query_of_a_real_folding_proof() {
         let exec = execute(
             &program,
             &h.all_arenas(&all),
-            &crate::hash_pin::BLOCK_HASHER,
+            &crate::hash_pin::LEGACY_HASHER,
         )
         .expect(
             "an honest FRI decommitment must authenticate every layer and reach \
@@ -742,7 +742,7 @@ fn the_two_legs_verify_one_real_folding_proof_as_one_program() {
         ..h.shape
     };
 
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let (_, _, terminal) =
         super::fri::emit_sub_proof_with_fri(&mut b, &h.trace.shape, shape, queries.len());
     for v in &terminal {
@@ -753,7 +753,7 @@ fn the_two_legs_verify_one_real_folding_proof_as_one_program() {
 
     let mut arenas = h.trace.arenas(&queries);
     arenas.extend(h.fri_arenas(&queries));
-    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
         .expect("the honest proof must authenticate, fold and reach the terminal");
 
     let codeword = h.terminal_codeword();
@@ -982,7 +982,7 @@ fn the_fri_join_adds_no_second_point_derivation() {
         |p: &LfmProgram| count_matching(p, |i| matches!(i, super::instr::Instr::BitDec { .. }));
 
     let emit = |n: usize| {
-        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
         super::fri::emit_sub_proof_with_fri(
             &mut b,
             sub,
@@ -1002,7 +1002,7 @@ fn the_fri_join_adds_no_second_point_derivation() {
     let per_query_decs = decs(&two) - decs(&one);
 
     // The digest's width, as the HOST reads it: `emit` builds at
-    // `WrapHash::production()`, whose builder width this is the counterpart of.
+    // `WrapHash::legacy()`, whose builder width this is the counterpart of.
     let dw = super::proof_arena::words_per_root();
     let expected_selects = h.shape.index_bits()
         + dw * sub.merkle_depth * groups.len()
@@ -1100,11 +1100,11 @@ fn no_tampered_fri_value_can_pass() {
     };
     let program = fri_only_program(shape, queries.len());
     let honest = h.all_arenas(&queries);
-    execute(&program, &honest, &crate::hash_pin::BLOCK_HASHER)
+    execute(&program, &honest, &crate::hash_pin::LEGACY_HASHER)
         .expect("the honest run must execute");
 
     // Host-side offsets at the host's digest width; the program was built at
-    // `WrapHash::production()`, which this is the counterpart of.
+    // `WrapHash::legacy()`, which this is the counterpart of.
     let dw = super::proof_arena::words_per_root();
     let stride = h.shape.query_words(dw);
     // (label, arena, word) — arena order is the driver's: deep, roots, zetas,
@@ -1133,7 +1133,7 @@ fn no_tampered_fri_value_can_pass() {
     for (label, arena, word) in bump {
         let mut tampered = honest.clone();
         tampered[arena][word][0] += FE::one();
-        let err = execute(&program, &tampered, &crate::hash_pin::BLOCK_HASHER).expect_err(
+        let err = execute(&program, &tampered, &crate::hash_pin::LEGACY_HASHER).expect_err(
             &format!("moving the {label} must make the program unexecutable"),
         );
         println!("  {label:<40} rejected: {err:?}");
@@ -1152,7 +1152,7 @@ fn no_tampered_fri_value_can_pass() {
          splice is a no-op and this vector proves nothing"
     );
     spliced[4][to..to + len].copy_from_slice(&borrowed);
-    let err = execute(&program, &spliced, &crate::hash_pin::BLOCK_HASHER).expect_err(
+    let err = execute(&program, &spliced, &crate::hash_pin::LEGACY_HASHER).expect_err(
         "a REAL leaf and a REAL path, at the wrong index, must still be rejected \
          — the walk climbs at this query's own bits",
     );
@@ -1192,7 +1192,7 @@ fn the_shape_pins_the_lengths_production_must_check_at_runtime() {
     };
     let program = fri_only_program(shape, 1);
     let honest = h.all_arenas(&queries);
-    execute(&program, &honest, &crate::hash_pin::BLOCK_HASHER)
+    execute(&program, &honest, &crate::hash_pin::LEGACY_HASHER)
         .expect("the honest run must execute");
 
     // (label, arena, what the truncation would buy a prover)
@@ -1217,7 +1217,7 @@ fn the_shape_pins_the_lengths_production_must_check_at_runtime() {
     for (label, arena, mirrors) in attacks {
         let mut truncated = honest.clone();
         truncated[arena].clear();
-        let err = execute(&program, &truncated, &crate::hash_pin::BLOCK_HASHER)
+        let err = execute(&program, &truncated, &crate::hash_pin::LEGACY_HASHER)
             .expect_err(&format!("{label} must be refused"));
         assert!(
             matches!(err, LfmExecError::ArenaLenMismatch { .. }),
@@ -1267,7 +1267,7 @@ fn the_fri_leg_proves_and_verifies() {
         ..h.shape
     };
 
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let (_, _, terminal) =
         super::fri::emit_sub_proof_with_fri(&mut b, &h.trace.shape, shape, queries.len());
     for v in &terminal {
@@ -1278,11 +1278,11 @@ fn the_fri_leg_proves_and_verifies() {
 
     let mut arenas = h.trace.arenas(&queries);
     arenas.extend(h.fri_arenas(&queries));
-    // Built at `WrapHash::production()`, so it emits `Instr::Hash` and the
+    // Built at `WrapHash::legacy()`, so it emits `Instr::Hash` and the
     // artifacts must carry the pin's tenant — the classification rule in
     // HASH-PINNING.md. `build_artifacts` defaults to the registry's blessed
     // hasher, which is correct for registry programs and wrong for this one.
-    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::BLOCK_HASHER);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, crate::hash_pin::LEGACY_HASHER);
     let proved = lfm_prove(&program, &artifacts, &arenas, &opts)
         .expect("the joined trace+DEEP+FRI program must prove");
 
@@ -1364,7 +1364,7 @@ fn the_fri_emitter_verifies_a_capped_folding_proof() {
         let exec = execute(
             &program,
             &h.all_arenas(&all),
-            &crate::hash_pin::BLOCK_HASHER,
+            &crate::hash_pin::LEGACY_HASHER,
         )
         .expect("an honest capped FRI decommitment must execute");
 
@@ -1421,7 +1421,7 @@ fn every_fri_cap_word_is_bound_even_the_unreached_ones() {
     };
     let program = fri_only_program(shape, 1);
     let honest = h.all_arenas(&queries);
-    execute(&program, &honest, &crate::hash_pin::BLOCK_HASHER).expect("honest");
+    execute(&program, &honest, &crate::hash_pin::LEGACY_HASHER).expect("honest");
     // Arena order: deep, roots, zetas, coeffs, queries, caps.
     let caps = honest.len() - 1;
     assert_eq!(
@@ -1432,7 +1432,7 @@ fn every_fri_cap_word_is_bound_even_the_unreached_ones() {
     for w in 0..honest[caps].len() {
         let mut bad = honest.clone();
         bad[caps][w][0] += FE::one();
-        execute(&program, &bad, &crate::hash_pin::BLOCK_HASHER)
+        execute(&program, &bad, &crate::hash_pin::LEGACY_HASHER)
             .expect_err(&format!("cap word {w} moved must not execute"));
     }
 }
@@ -1451,7 +1451,7 @@ fn the_two_legs_verify_one_capped_folding_proof_as_one_program() {
         num_queries: queries.len(),
         ..h.shape
     };
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let (_, _, terminal) =
         super::fri::emit_sub_proof_with_fri(&mut b, &h.trace.shape, shape, queries.len());
     for v in &terminal {
@@ -1462,7 +1462,7 @@ fn the_two_legs_verify_one_capped_folding_proof_as_one_program() {
 
     let mut arenas = h.trace.arenas(&queries);
     arenas.extend(h.fri_arenas(&queries));
-    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
         .expect("the honest capped proof must authenticate, fold and reach the terminal");
     let codeword = h.terminal_codeword();
     for (k, &q) in queries.iter().enumerate() {
@@ -1471,7 +1471,7 @@ fn the_two_legs_verify_one_capped_folding_proof_as_one_program() {
     }
 
     let sub = &h.trace.shape;
-    let hash = super::edsl::WrapHash::production();
+    let hash = super::edsl::WrapHash::legacy();
     let leaves: usize = sub
         .groups()
         .iter()
@@ -1487,6 +1487,6 @@ fn the_two_legs_verify_one_capped_folding_proof_as_one_program() {
     // sixth arena (uniforms, ood, parts, roots, queries, caps).
     let mut bad = arenas.clone();
     bad[5][0][0] += FE::one();
-    execute(&program, &bad, &crate::hash_pin::BLOCK_HASHER)
+    execute(&program, &bad, &crate::hash_pin::LEGACY_HASHER)
         .expect_err("a moved trace-tree cap word must not execute");
 }

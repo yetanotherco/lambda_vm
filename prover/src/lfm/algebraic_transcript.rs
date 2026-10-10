@@ -8,7 +8,7 @@
 //! that wrong and Fiat–Shamir does not fail loudly — the walk reconstructs
 //! nothing, some difference that should have been non-zero is inverted, and the
 //! executor reports `DivByZero` at an address that names neither the hash nor
-//! the site (the diagnostic signature `edsl::WrapHash::production`'s header
+//! the site (the diagnostic signature `edsl::WrapHash::legacy`'s header
 //! warns about).
 //!
 //! Under the byte hashes the two sides agree because both are byte sponges. An

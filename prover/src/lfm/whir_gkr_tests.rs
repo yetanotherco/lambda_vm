@@ -97,7 +97,7 @@ fn gkr_public_words(layers: usize) -> usize {
 }
 
 fn gkr_program(layers: usize) -> LfmProgram {
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(gkr_arena_words(layers) as u32);
     let mut idx = 0u32;
     let next = |b: &mut LfmBuilder, idx: &mut u32| -> Ext {
@@ -222,7 +222,7 @@ fn the_gkr_leg_computes_what_the_host_computes() {
         let layers = proved.proof.layers.len();
         let program = gkr_program(layers);
         let arena = gkr_arena(output, &proved.proof, &verifying.sampled);
-        let exec = execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER)
+        let exec = execute(&program, &[arena], &crate::hash_pin::LEGACY_HASHER)
             .expect("the GKR leg executes on a proof the host accepts");
 
         let published: Vec<FEE> = exec
@@ -285,7 +285,7 @@ fn a_corrupted_proof_value_cannot_execute() {
     let program = gkr_program(layers);
     let honest = gkr_arena(output, &proved.proof, &verifying.sampled);
     assert!(
-        execute(&program, &[honest], &crate::hash_pin::BLOCK_HASHER).is_ok(),
+        execute(&program, &[honest], &crate::hash_pin::LEGACY_HASHER).is_ok(),
         "the untouched proof must execute, or the arm below proves nothing"
     );
 
@@ -309,7 +309,7 @@ fn a_corrupted_proof_value_cannot_execute() {
 
             let arena = gkr_arena(output, &forged, &verifying.sampled);
             assert!(
-                execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER).is_err(),
+                execute(&program, &[arena], &crate::hash_pin::LEGACY_HASHER).is_err(),
                 "layer {layer}, {which}: the machine must refuse the forgery too"
             );
         }

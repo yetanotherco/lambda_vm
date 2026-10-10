@@ -300,7 +300,7 @@ fn the_emitted_fri_verifier_accepts_every_one_row_rpx_vector() {
         }
 
         let program = v.program();
-        let exec = execute(&program, &v.arenas(), &crate::hash_pin::BLOCK_HASHER)
+        let exec = execute(&program, &v.arenas(), &crate::hash_pin::LEGACY_HASHER)
             .unwrap_or_else(|e| panic!("{}: the honest vector must execute: {e:?}", v.name));
         assert_eq!(exec.public_words.len(), s.num_queries);
         let closed = s.num_queries * s.permutations_per_query() + s.cap_permutations();
@@ -333,7 +333,7 @@ fn no_tampered_input_tree_value_can_pass() {
     for v in one_row_rpx_vectors() {
         let program = v.program();
         let honest = v.arenas();
-        execute(&program, &honest, &crate::hash_pin::BLOCK_HASHER).expect("honest");
+        execute(&program, &honest, &crate::hash_pin::LEGACY_HASHER).expect("honest");
         let q0 = &v.json["queries_detail"][0]["layers"][0];
         let slot = q0["slot"].as_u64().expect("slot") as usize;
         assert_eq!(
@@ -358,7 +358,7 @@ fn no_tampered_input_tree_value_can_pass() {
         for (label, arena, word) in bump {
             let mut bad = honest.clone();
             bad[arena][word][0] += FE::one();
-            execute(&program, &bad, &crate::hash_pin::BLOCK_HASHER).expect_err(&format!(
+            execute(&program, &bad, &crate::hash_pin::LEGACY_HASHER).expect_err(&format!(
                 "{}: moving {label} must make the program unexecutable",
                 v.name
             ));
@@ -381,14 +381,14 @@ fn the_input_slot_check_is_load_bearing() {
         moved[0][1][0] += FE::one();
 
         let with = v.program();
-        execute(&with, &honest, &crate::hash_pin::BLOCK_HASHER).expect("honest");
-        execute(&with, &moved, &crate::hash_pin::BLOCK_HASHER)
+        execute(&with, &honest, &crate::hash_pin::LEGACY_HASHER).expect("honest");
+        execute(&with, &moved, &crate::hash_pin::LEGACY_HASHER)
             .expect_err("a moved DEEP(x_r) must be refused by the input-slot check");
 
         super::fri::SKIP_SLOT_CHECK.with(|c| c.set(true));
         let without = v.program();
         super::fri::SKIP_SLOT_CHECK.with(|c| c.set(false));
-        execute(&without, &moved, &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
+        execute(&without, &moved, &crate::hash_pin::LEGACY_HASHER).unwrap_or_else(|e| {
             panic!(
                 "{}: WITHOUT the slot check a moved DEEP(x_r) is accepted — the input-slot \
                  check is the only binding: {e:?}",
@@ -445,7 +445,7 @@ fn the_one_row_trace_leaf_is_the_hosts() {
                 num_columns: width,
                 is_ext,
             };
-            let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+            let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
             let arena = b.declare_arena(shape.values_at(rows_per_leaf) as u32);
             let cells: Vec<_> = (0..shape.values_at(rows_per_leaf) as u32)
                 .map(|i| b.hint_word(arena, i))
@@ -468,7 +468,7 @@ fn the_one_row_trace_leaf_is_the_hosts() {
                         words.extend(base.iter().map(|c| base_word(c[row])));
                     }
                 }
-                let exec = execute(&program, &[words], &crate::hash_pin::BLOCK_HASHER)
+                let exec = execute(&program, &[words], &crate::hash_pin::LEGACY_HASHER)
                     .expect("the leaf hash executes");
                 let got: Vec<LfmWord> = exec.public_words.iter().map(|(_, w)| *w).collect();
                 assert_eq!(
@@ -527,7 +527,7 @@ fn emit_both_legs(b: &mut LfmBuilder, h: &HostFri) -> (Vec<Vec<LfmWord>>, usize)
     let mut arenas = h.trace.arenas(&all);
     arenas.extend(h.fri_arenas(&all));
 
-    let hash = super::edsl::WrapHash::production();
+    let hash = super::edsl::WrapHash::legacy();
     let sub = &h.trace.shape;
     let leaves: usize = sub
         .groups()
@@ -571,7 +571,7 @@ fn one_row_round_trips_in_guest() {
                 let exec = execute(
                     &program,
                     &h.all_arenas(&all),
-                    &crate::hash_pin::BLOCK_HASHER,
+                    &crate::hash_pin::LEGACY_HASHER,
                 )
                 .unwrap_or_else(|e| panic!("{label}: FRI leg: {e:?}"));
                 for (k, &q) in all.iter().enumerate() {
@@ -589,10 +589,10 @@ fn one_row_round_trips_in_guest() {
                 );
 
                 // Both legs as one program.
-                let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+                let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
                 let (arenas, closed) = emit_both_legs(&mut b, &h);
                 let joined = compile(b.finish());
-                let exec = execute(&joined, &arenas, &crate::hash_pin::BLOCK_HASHER)
+                let exec = execute(&joined, &arenas, &crate::hash_pin::LEGACY_HASHER)
                     .unwrap_or_else(|e| panic!("{label}: joined: {e:?}"));
                 for (k, &q) in all.iter().enumerate() {
                     let v = word_as_ext(&exec.public_words[k].1).expect("ext");
@@ -613,7 +613,7 @@ fn one_row_round_trips_in_guest() {
                     // right after the index word) must not execute.
                     let mut bad = arenas.clone();
                     bad[4][1][0] += FE::one();
-                    execute(&joined, &bad, &crate::hash_pin::BLOCK_HASHER).expect_err(&format!(
+                    execute(&joined, &bad, &crate::hash_pin::LEGACY_HASHER).expect_err(&format!(
                         "{label}: a moved one-row trace value must be refused"
                     ));
                     // The upper half of the LDE is reached: r is not a pair index.
@@ -664,12 +664,12 @@ fn a_one_row_and_a_row_pair_table_verify_in_one_program() {
     assert_eq!(a.shape.leaf_layout(), LeafLayout::Row);
     assert_eq!(b_host.shape.leaf_layout(), LeafLayout::RowPair);
 
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let (mut arenas, closed_a) = emit_both_legs(&mut b, &a);
     let (arenas_b, closed_b) = emit_both_legs(&mut b, &b_host);
     arenas.extend(arenas_b);
     let program = compile(b.finish());
-    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+    let exec = execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
         .expect("a one-row and a row-pair table verify in one program");
     let mut k = 0usize;
     for h in [&a, &b_host] {
@@ -702,10 +702,10 @@ fn an_uneven_one_row_schedule_round_trips_in_guest() {
     let (air, proof) = folding_fixture_with(2048, opts);
     let h = host_fri_from(&*air, &proof);
     assert_eq!(h.shape.schedule(), vec![3, 1, 3, 2]);
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let (arenas, closed) = emit_both_legs(&mut b, &h);
     let program = compile(b.finish());
-    execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+    execute(&program, &arenas, &crate::hash_pin::LEGACY_HASHER)
         .expect("the uneven one-row schedule verifies");
     assert_eq!(permutations(&program), closed);
 }

@@ -98,8 +98,8 @@ fn epoch_transcript(
     epoch_label: u64,
     is_final: bool,
     fri_final_poly_log_degree: u8,
-) -> crate::hash_pin::BlockTranscript {
-    let mut transcript = crate::hash_pin::block_transcript(&[]);
+) -> crate::hash_pin::LegacyTranscript {
+    let mut transcript = crate::hash_pin::legacy_transcript(&[]);
     absorb_statement(
         &mut transcript,
         StatementKind::ContinuationEpoch {
@@ -126,8 +126,8 @@ fn global_transcript(
     num_private_input_pages: usize,
     fri_final_poly_log_degree: u8,
     touched_page_bases: &[u64],
-) -> crate::hash_pin::BlockTranscript {
-    let mut transcript = crate::hash_pin::block_transcript(&[]);
+) -> crate::hash_pin::LegacyTranscript {
+    let mut transcript = crate::hash_pin::legacy_transcript(&[]);
     absorb_continuation_global_statement(
         &mut transcript,
         elf_bytes,
@@ -1966,7 +1966,7 @@ fn prove_prepped_epoch(
     #[cfg(feature = "shape-profile")]
     crate::shape_profile::capture(pairs.iter().map(|(air, trace, _)| (*air, trace.num_rows())));
     crate::hash_pin::require_rpx_base("the epoch pipeline", opts).map_err(Error::Prover)?;
-    let proof = crate::hash_pin::BlockProver::<F, E, ()>::multi_prove(
+    let proof = crate::hash_pin::LegacyProver::<F, E, ()>::multi_prove(
         pairs,
         &mut seed(),
         #[cfg(feature = "disk-spill")]
@@ -2185,7 +2185,7 @@ fn verify_epoch(
     stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
     );
 
-    if !crate::hash_pin::BlockVerifier::<F, E, ()>::multi_verify_views(
+    if !crate::hash_pin::LegacyVerifier::<F, E, ()>::multi_verify_views(
         &refs,
         proof,
         &mut seed(),
@@ -2320,7 +2320,7 @@ fn prove_prepped_global(
     crate::shape_profile::capture(pairs.iter().map(|(air, trace, _)| (*air, trace.num_rows())));
 
     crate::hash_pin::require_rpx_base("the epoch pipeline", opts).map_err(Error::Prover)?;
-    crate::hash_pin::BlockProver::<F, E, ()>::multi_prove(
+    crate::hash_pin::LegacyProver::<F, E, ()>::multi_prove(
         pairs,
         &mut global_transcript(
             elf_bytes,
@@ -2411,7 +2411,7 @@ fn verify_global(
     stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
     );
 
-    crate::hash_pin::BlockVerifier::<F, E, ()>::multi_verify_views(
+    crate::hash_pin::LegacyVerifier::<F, E, ()>::multi_verify_views(
         &refs,
         proof,
         &mut global_transcript(

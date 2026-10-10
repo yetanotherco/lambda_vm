@@ -869,7 +869,7 @@ pub fn whir_global_program(
     let words = whir_global_arena(global, airs, elf_bytes);
     let total = words[0].len() as u32;
 
-    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::legacy());
     let arena = b.declare_arena(total);
     let mut at = 0u32;
 
