@@ -45,6 +45,7 @@ fn small_format() -> BlockFormat {
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
         argue: ArgueFormat::PerTable,
+        group: multilinear::whir_chain::GroupFold::PerPoly,
     }
 }
 
@@ -531,6 +532,7 @@ fn dense_format() -> BlockFormat {
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
         argue: ArgueFormat::PerTable,
+        group: multilinear::whir_chain::GroupFold::PerPoly,
     }
 }
 
@@ -3127,6 +3129,7 @@ fn a_p1_block_leaf_refuses_a_tampered_witness() {
     match &mut sibling.proof.columns[0].polys[0].rounds[0].openings {
         RoundOpenings::Base(p) => p.current[1].proof.merkle_path[0][0] ^= 1,
         RoundOpenings::Extension(p) => p.current[1].proof.merkle_path[0][0] ^= 1,
+        RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
     }
     assert!(
         run_leaf(&plan, &sibling, 0, LeafChecks::ALL).is_err(),

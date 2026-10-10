@@ -556,6 +556,7 @@ fn a_tampered_p1_chain_cannot_execute() {
         match &mut forged.rounds[0].openings {
             RoundOpenings::Base(p) => p.current[1].proof.merkle_path[0][0] ^= 1,
             RoundOpenings::Extension(p) => p.current[1].proof.merkle_path[0][0] ^= 1,
+            RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
         }
         sites.push(("a current Merkle sibling", forged));
         // A successor sibling: the first round whose successor paths walk at
@@ -565,6 +566,7 @@ fn a_tampered_p1_chain_cannot_execute() {
             let next = match &mut round.openings {
                 RoundOpenings::Base(p) => &mut p.next,
                 RoundOpenings::Extension(p) => &mut p.next,
+                RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
             };
             match next.get_mut(1) {
                 Some(o) if !o.proof.merkle_path.is_empty() => {
@@ -591,6 +593,7 @@ fn a_tampered_p1_chain_cannot_execute() {
                     let last = path.len() - 1;
                     path[last][0] ^= 1;
                 }
+                RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
             }
             sites.push(("a cap node", forged));
         }

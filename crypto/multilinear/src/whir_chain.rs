@@ -66,7 +66,9 @@ use crate::{
     whir::{Domain, encode, fold_codeword_k, lift_coefficients},
     whir_commit::{Codeword, CodewordCommitment, Commitment, fold_coset, verify_opening_capped},
     whir_hash::{GrindingDigest, WhirHash},
-    whir_round::{self, RoundCaps, RoundCommitments, RoundConfig, RoundProof, TreeCheck},
+    whir_round::{
+        self, GroupedRoundProof, RoundCaps, RoundCommitments, RoundConfig, RoundProof, TreeCheck,
+    },
 };
 
 /// `w(x)·f(x)`, the shape every group's sumcheck runs over.
@@ -271,6 +273,9 @@ pub struct ChainFormat {
     /// binary caps only. Read at arity 4 alone, so it cannot move a binary
     /// hash's bytes; `Off` = today.
     pub arity4_cap: CapPolicy,
+    /// How a stack's polynomials are cut into chains (D-ONECHAIN, W-14).
+    /// [`GroupFold::PerPoly`] = today.
+    pub group: GroupFold,
 }
 
 impl ChainFormat {
@@ -282,6 +287,7 @@ impl ChainFormat {
         nonces: NonceLayout::Three,
         argue: ArgueFormat::PerTable,
         arity4_cap: CapPolicy::Off,
+        group: GroupFold::PerPoly,
     };
 
     /// True when this is today's format (`Fixed(0)` counts as `Off`).
@@ -292,6 +298,7 @@ impl ChainFormat {
             && self.nonces == NonceLayout::Three
             && self.argue == ArgueFormat::PerTable
             && self.arity4_cap.is_off()
+            && self.group == GroupFold::PerPoly
     }
 
     /// The cap policy of trees with `arity` children per node:
@@ -498,6 +505,180 @@ impl FirstFold {
 /// `log_folding`, far below it, so no non-default word equals a default one.
 pub const FOLD_WORD_TAG: u64 = 1 << 63;
 
+/// The bit of [`ChainConfig::fold_word`] that says [`GroupFold::Indexed`],
+/// always beside [`FOLD_WORD_TAG`]. No other word sets it: a `First` word's
+/// fields sit at bits 52+, 48 and the low nibble.
+pub const FOLD_WORD_INDEXED: u64 = 1 << 47;
+
+/// How a stack's polynomials are opened (D-ONECHAIN, the ledger's W-14).
+///
+/// [`PerPoly`](Self::PerPoly) is today's: one chain per stacked polynomial.
+/// [`Indexed`](Self::Indexed) cuts them into consecutive runs of at most
+/// [`MAX_INDEX_POLYS`] (`stacked_eval::index_chains`) and opens a run of
+/// `P' ≥ 2` with ONE chain at `n + m` variables, `m = ⌈log2 P'⌉`
+/// ([`index_vars`]):
+/// - round 0 runs `k0 + m` sumcheck rounds, the `m` index challenges `ρ` LAST;
+/// - it opens the run's `P'` round-0 trees at ONE position set, combines each
+///   query's blocks as `Σ_p eq(ρ, p)·block_p` ([`eq_index`]) and folds that as
+///   today's `2^k0` block;
+/// - rounds ≥ 1 are today's chain on the one successor.
+///
+/// A run of one polynomial is today's chain exactly. The chain is today's at
+/// `n + m` variables restricted to round-0 words whose absent slots are zero
+/// (D-ONECHAIN §3.3, Lemma B), which needs `m ≤ 2` and `n + m + log_blowup`
+/// within the field's two-adicity ([`check_index_domain`]).
+///
+/// ★ A FORMAT VALUE, NOT A HINT. A verifier-side constant like the rest of
+/// [`ChainFormat`], bound into the statement through [`ChainConfig::fold_word`]
+/// ([`FOLD_WORD_INDEXED`]), and never read from a proof.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum GroupFold {
+    /// One chain per stacked polynomial. Today's format.
+    #[default]
+    PerPoly,
+    /// One chain per run of at most [`MAX_INDEX_POLYS`] polynomials.
+    Indexed,
+}
+
+/// The most index variables a grouped chain binds. `m = 3` drops the
+/// conjectured round-0 fold term below 128 bits (127.393 at a 2^27 stack,
+/// REV-B2-JUDGE §5), and past it Lemma B's virtual domain stops existing.
+pub const MAX_INDEX_VARS: usize = 2;
+
+/// The most polynomials one grouped chain opens: `2^MAX_INDEX_VARS`.
+pub const MAX_INDEX_POLYS: usize = 1 << MAX_INDEX_VARS;
+
+/// `m = ⌈log2 P'⌉`: the index variables a chain over `polys` polynomials
+/// binds. 0 for one polynomial, which is today's chain.
+pub const fn index_vars(polys: usize) -> usize {
+    polys.next_power_of_two().trailing_zeros() as usize
+}
+
+/// `eq(ρ, p)`, with `ρ_0` against the MOST significant of `p`'s `ρ.len()`
+/// bits: index variable `y_0` is the high bit of the slot, as the index rounds
+/// bind it (the run's tables concatenated in slot order, variable 0 the
+/// highest).
+///
+/// ★ THE ONE CONVENTION. The prover's factors after the index rounds, its
+/// round-0 successor, the verifier's combine and the verifier's weight all
+/// read it, so they cannot disagree (REV-B2-JUDGE B1-3).
+pub fn eq_index<E: IsField>(rho: &[FieldElement<E>], p: usize) -> FieldElement<E> {
+    let m = rho.len();
+    rho.iter()
+        .enumerate()
+        .fold(FieldElement::<E>::one(), |acc, (i, r)| {
+            if (p >> (m - 1 - i)) & 1 == 1 {
+                acc * r
+            } else {
+                acc * (FieldElement::<E>::one() - r)
+            }
+        })
+}
+
+/// Refuses an index width whose virtual chain has no domain: Lemma B's
+/// `H_{n+m+lb}` exists only when `n + m + log_blowup ≤` the field's two-adicity
+/// (REV-B2-A C5). A verifier constant check, run before anything is read.
+pub fn check_index_domain(
+    num_vars: usize,
+    index_vars: usize,
+    log_blowup: usize,
+    two_adicity: usize,
+) -> Result<(), Error> {
+    if num_vars + index_vars + log_blowup > two_adicity {
+        return Err(Error::GroupedShape(GroupedShape::IndexDomain {
+            num_vars,
+            index_vars,
+            log_blowup,
+            two_adicity,
+        }));
+    }
+    Ok(())
+}
+
+/// Test only: verifier faults a grouped-chain test switches on, one at a time,
+/// to show that each use of the index convention is load-bearing
+/// (REV-B2-JUDGE B1-3): with any of them an honest proof must be refused.
+/// Thread-local, so a test that sets one moves no other test's verifier.
+#[cfg(test)]
+pub(crate) mod grouped_faults {
+    /// Which piece of the verifier reads the index wrongly.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) enum Fault {
+        #[default]
+        None,
+        /// The round-0 combine reads `ρ` reversed (`ρ_0 ↔ ρ_1` at `m = 2`).
+        SwapRhoInCombine,
+        /// The final weight reads `ρ` reversed.
+        SwapRhoInWeight,
+        /// The final weight drops `eq(ρ, p)`: `Σ_p w_p` at the data point.
+        DropIndexFactor,
+        /// The final weight gives each absent slot `p ≥ P'` a weight of 1.
+        AbsentSlotWeightOne,
+    }
+
+    std::thread_local! {
+        static FAULT: std::cell::Cell<Fault> = const { std::cell::Cell::new(Fault::None) };
+    }
+
+    pub(crate) fn get() -> Fault {
+        FAULT.with(std::cell::Cell::get)
+    }
+
+    /// Runs `f` under `fault`, restoring the previous one after.
+    pub(crate) fn with<R>(fault: Fault, f: impl FnOnce() -> R) -> R {
+        struct Restore(Fault);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FAULT.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(FAULT.with(|c| c.replace(fault)));
+        f()
+    }
+}
+
+/// The shape a grouped opening must have, refused by name before any block is
+/// indexed or zipped (REV-B2-JUDGE B1-2). A lenient count would let a prover
+/// choose, after the positions are drawn, whether a slot reads its committed
+/// block or nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupedShape {
+    /// A stacked proof's chain count is not the derived split's.
+    ChainCount { expected: usize, got: usize },
+    /// A chain asked to open no polynomial, or more than [`MAX_INDEX_POLYS`].
+    RunWidth { polys: usize },
+    /// The virtual chain's domain does not exist ([`check_index_domain`]).
+    IndexDomain {
+        num_vars: usize,
+        index_vars: usize,
+        log_blowup: usize,
+        two_adicity: usize,
+    },
+    /// Round 0 of a grouped chain carries other than `k0 + m` messages.
+    Round0Messages { expected: usize, got: usize },
+    /// A round's openings are the grouped variant where they must not be, or
+    /// not it where they must be: round 0 of a chain over `P' ≥ 2` and nowhere
+    /// else.
+    Variant { round: usize },
+    /// Other than `Q` queries.
+    Queries { expected: usize, got: usize },
+    /// A query carries other than one block per round-0 tree.
+    BlocksPerQuery {
+        query: usize,
+        expected: usize,
+        got: usize,
+    },
+    /// A block of other than `2^k0` values.
+    BlockWidth {
+        query: usize,
+        tree: usize,
+        expected: usize,
+        got: usize,
+    },
+    /// Other than one successor block a query (none on a final round).
+    SuccessorBlocks { expected: usize, got: usize },
+}
+
 impl ChainConfig {
     /// Parameters for a security target, in the **same regime the univariate
     /// prover uses**: the Johnson bound, `proximity = 1 − √rate − 1/300`, so
@@ -589,13 +770,17 @@ impl ChainConfig {
     ///   a prefix encoding with a one-entry prefix (tail
     ///   `log_folding`, length 1, the fold in the low nibble).
     ///
+    /// - [`GroupFold::Indexed`] → either word above with [`FOLD_WORD_TAG`] and
+    ///   [`FOLD_WORD_INDEXED`] set, so a grouped statement shares no word with
+    ///   a per-polynomial one under any fold schedule.
+    ///
     /// Every chain's schedule is a function of this word and its own
     /// `num_vars`, which the statement already binds, so binding the word
     /// binds every schedule — including the heights where two policies give
     /// the same schedule (`first6` and `uniform4` at `num_vars <= 4`), where
     /// only the word tells the proofs apart.
     pub fn fold_word(&self) -> u64 {
-        match self.format.folds {
+        let word = match self.format.folds {
             WhirFolds::Uniform => self.log_folding as u64,
             WhirFolds::First(k0) => {
                 FOLD_WORD_TAG
@@ -603,7 +788,29 @@ impl ChainConfig {
                     | (1 << 48)
                     | k0.get() as u64
             }
+        };
+        match self.format.group {
+            GroupFold::PerPoly => word,
+            GroupFold::Indexed => word | FOLD_WORD_TAG | FOLD_WORD_INDEXED,
         }
+    }
+
+    /// The sumcheck messages each round of a chain over `num_vars`-variable
+    /// polynomials carries when it binds `index_vars` index variables:
+    /// [`schedule`](Self::schedule) with round 0 widened by them.
+    ///
+    /// ★ (k0, m, tail), NEVER `schedule(n + m)` (REV-B2-JUDGE J1). The blocks
+    /// round 0 opens are still `2^k0` wide — the index is folded by combining
+    /// the trees' blocks, not by a wider block — so the folds, the trees, their
+    /// caps, the round count and with it Q are the per-polynomial chain's.
+    /// `schedule(n + m)` would fold index variables in round 1, another
+    /// protocol; `First(k0 + m)` would open blocks no tree has.
+    pub fn index_schedule(&self, num_vars: usize, index_vars: usize) -> Vec<usize> {
+        let mut messages = self.schedule(num_vars);
+        if let Some(first) = messages.first_mut() {
+            *first += index_vars;
+        }
+        messages
     }
 
     /// The Merkle cap height of each of the chain's `R` commitment trees, tree
@@ -697,6 +904,11 @@ pub struct RoundNonces {
 /// Only the first round's current codeword is base-field; every later one has
 /// already been folded with an extension challenge. The successor is always in
 /// the extension.
+///
+/// ⚠ APPEND ONLY. A variant's serde index is its position, and rkyv lays the
+/// enum out at its widest variant: [`BaseGrouped`](Self::BaseGrouped) is last
+/// and, like the others, two `Vec`s, so neither encoding of a proof that does
+/// not use it moves (REV-B2-JUDGE B1-6).
 #[derive(
     Clone,
     Debug,
@@ -710,6 +922,10 @@ pub struct RoundNonces {
 pub enum RoundOpenings<F: IsField, E: IsField> {
     Base(RoundProof<F, E>),
     Extension(RoundProof<E, E>),
+    /// Round 0 of a [`GroupFold::Indexed`] chain over `P' ≥ 2` polynomials,
+    /// and nowhere else: per query one base block per round-0 tree, then the
+    /// successor block ([`GroupedRoundProof`]).
+    BaseGrouped(GroupedRoundProof<F, E>),
 }
 
 /// One round of the chain.
@@ -762,6 +978,10 @@ impl<F: IsField, E: IsField> ChainProof<F, E> {
                 RoundOpenings::Base(p) => block_size(&p.current) + block_size::<E>(&p.next),
                 RoundOpenings::Extension(p) => {
                     block_size::<E>(&p.current) + block_size::<E>(&p.next)
+                }
+                RoundOpenings::BaseGrouped(p) => {
+                    p.current.iter().map(|q| block_size(q)).sum::<usize>()
+                        + block_size::<E>(&p.next)
                 }
             })
             .sum()
@@ -958,6 +1178,14 @@ enum Factors<F: IsField + IsSubFieldOf<E>, E: IsField> {
         field: core::marker::PhantomData<F>,
     },
     Device(crate::gpu::OpeningFactors),
+    /// Round 0 of a grouped chain, before it runs: each polynomial's
+    /// `(weight, message)` tables, on the host. Its first [`rounds`]
+    /// (Self::rounds) call runs them in lockstep, binds the index, and leaves
+    /// one [`Host`](Self::Host) pair behind ([`lockstep_rounds`]).
+    Lockstep {
+        parts: Vec<(Mle<E>, Mle<E>)>,
+        index_vars: usize,
+    },
 }
 
 impl<F, E> Factors<F, E>
@@ -1019,6 +1247,7 @@ where
         match self {
             Self::Host { message, .. } => message.num_vars(),
             Self::Device(device) => device.num_vars(),
+            Self::Lockstep { parts, .. } => parts.first().map_or(0, |(_, f)| f.num_vars()),
         }
     }
 
@@ -1052,6 +1281,17 @@ where
                 })?;
                 Ok((proofs, challenges))
             }
+            Self::Lockstep { parts, index_vars } => {
+                let index_vars = *index_vars;
+                let (proofs, challenges, weight, message) =
+                    lockstep_rounds(core::mem::take(parts), rounds, index_vars, transcript)?;
+                *self = Self::Host {
+                    weight,
+                    message,
+                    field: core::marker::PhantomData,
+                };
+                Ok((proofs, challenges))
+            }
         }
     }
 
@@ -1059,6 +1299,9 @@ where
         match self {
             Self::Host { message, .. } => message.evaluate(point),
             Self::Device(device) => device.evaluate_message(point),
+            // Round 0's rounds turn lockstep factors into one pair before any
+            // out-of-domain point exists.
+            Self::Lockstep { .. } => Err(Error::NoVariablesLeft),
         }
     }
 
@@ -1074,8 +1317,112 @@ where
                 Ok(())
             }
             Self::Device(device) => device.add_scaled_eq(point, gamma),
+            Self::Lockstep { .. } => Err(Error::NoVariablesLeft),
         }
     }
+}
+
+/// Round 0 of a grouped chain's sumcheck, on the host (D-ONECHAIN §2.1, §2.5).
+///
+/// - `rounds` data rounds over the run's `P'` pairs IN LOCKSTEP: each round's
+///   message is the sum of theirs and one challenge binds them all, since
+///   `Σ_y W·F` over the slots is `Σ_p w_p·f_p`.
+/// - Then the `m = index_vars` index rounds over the bound tables, laid out
+///   slot by slot (`y` the high variables, absent slots zero): `ρ`.
+///
+/// Returns the `rounds + m` messages and challenges, and the pair the chain
+/// carries on: `Σ_p eq(ρ, p)·(w_p, f_p)` at the data challenges, built with
+/// [`eq_index`], the convention the verifier's combine and weight read. The
+/// index rounds' own folded tables are that same pair when the conventions
+/// agree, and are dropped; a disagreement would show as an honest proof that
+/// does not verify.
+#[allow(clippy::type_complexity)]
+fn lockstep_rounds<E, T>(
+    parts: Vec<(Mle<E>, Mle<E>)>,
+    rounds: usize,
+    index_vars: usize,
+    transcript: &mut T,
+) -> Result<
+    (
+        Vec<SumcheckRoundProof<E>>,
+        Vec<FieldElement<E>>,
+        Mle<E>,
+        Mle<E>,
+    ),
+    Error,
+>
+where
+    E: IsField + Send + Sync + 'static,
+    FieldElement<E>: Send + Sync,
+    T: IsTranscript<E>,
+{
+    use crate::poly::SumcheckPolynomial;
+    let mut polys = parts
+        .into_iter()
+        .map(|(weight, message)| Composed::new(vec![weight, message], product::<E>, 2))
+        .collect::<Result<Vec<_>, Error>>()?;
+    let mut proofs = Vec::with_capacity(rounds + index_vars);
+    let mut challenges = Vec::with_capacity(rounds + index_vars);
+    for _ in 0..rounds {
+        let mut sent = vec![FieldElement::<E>::zero(); 2];
+        for poly in &polys {
+            for (total, value) in sent
+                .iter_mut()
+                .zip(sumcheck::round_evaluations(poly, 2, false))
+            {
+                *total += value;
+            }
+        }
+        for value in &sent {
+            transcript.append_field_element(value);
+        }
+        let r: FieldElement<E> = transcript.sample_field_element();
+        for poly in &mut polys {
+            poly.fix_first_variable(&r)?;
+        }
+        proofs.push(SumcheckRoundProof { evaluations: sent });
+        challenges.push(r);
+    }
+
+    let tables: Vec<(Mle<E>, Mle<E>)> = polys
+        .into_iter()
+        .map(|poly| {
+            let mut factors = poly.into_polys();
+            match (factors.pop(), factors.pop()) {
+                (Some(message), Some(weight)) => Ok((weight, message)),
+                _ => Err(Error::EmptyPolynomial),
+            }
+        })
+        .collect::<Result<_, Error>>()?;
+    let width = tables.first().map_or(1, |(weight, _)| weight.len());
+    let slots = 1usize << index_vars;
+    let mut weight = Vec::with_capacity(width * slots);
+    let mut message = Vec::with_capacity(width * slots);
+    for (w, f) in &tables {
+        weight.extend_from_slice(w.evals());
+        message.extend_from_slice(f.evals());
+    }
+    weight.resize(width * slots, FieldElement::<E>::zero());
+    message.resize(width * slots, FieldElement::<E>::zero());
+    let mut index = Composed::new(vec![Mle::new(weight)?, Mle::new(message)?], product::<E>, 2)?;
+    let (index_proofs, rho) = sumcheck::prove_rounds(&mut index, index_vars, transcript)?;
+    drop(index);
+
+    let eqs: Vec<FieldElement<E>> = (0..tables.len()).map(|p| eq_index(&rho, p)).collect();
+    let combine = |pick: fn(&(Mle<E>, Mle<E>)) -> &Mle<E>| -> Result<Mle<E>, Error> {
+        let mut out = vec![FieldElement::<E>::zero(); width];
+        for (table, eq) in tables.iter().zip(&eqs) {
+            for (acc, value) in out.iter_mut().zip(pick(table).evals()) {
+                *acc += eq * value;
+            }
+        }
+        Mle::new(out)
+    };
+    let weight = combine(|t| &t.0)?;
+    let message = combine(|t| &t.1)?;
+    proofs.extend(index_proofs);
+    challenges.extend(rho);
+    Ok((proofs, challenges, weight, message))
 }
 
 /// What a round folds: the codeword and the commitment that answers for it.
@@ -1088,6 +1435,9 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
 {
     Base(&'a CodewordCommitment<F, H>),
+    /// Round 0 of a grouped chain: the run's round-0 commitments, in slot
+    /// order.
+    Grouped(&'a [&'a CodewordCommitment<F, H>]),
     Extension(CodewordCommitment<E, H>),
 }
 
@@ -1137,7 +1487,80 @@ where
     prove_with_factors::<F, E, T, H>(
         f.num_vars(),
         factors,
-        commitment,
+        Current::Base(commitment),
+        domain,
+        config,
+        transcript,
+    )
+}
+
+/// One chain over a run of `P'` stacked polynomials ([`GroupFold::Indexed`],
+/// D-ONECHAIN §2.1): `polys[p]` committed as `commitments[p]`, its weight
+/// given as `shares[p]`. The claim is the sum of the polynomials' claims.
+///
+/// Round 0 runs its data rounds over the `P'` pairs in lockstep and then the
+/// `m` index rounds ([`lockstep_rounds`]), folds each round-0 codeword and
+/// combines the folds with `eq(ρ, p)` into the one successor, and opens the
+/// `P'` trees at one position set ([`whir_round::prove_grouped`]). Every later
+/// round is today's.
+///
+/// `2 ≤ P' ≤ MAX_INDEX_POLYS`; a run of one is [`prove_shared`]. On the host
+/// only: the round-0 tables are built here and the codewords must be host
+/// ones (the device's grouped round 0 is D-ONECHAIN's stage B3).
+#[allow(clippy::too_many_arguments)]
+pub fn prove_grouped_shared<F, E, T, H>(
+    polys: &[Stacked<'_, F>],
+    shares: &[Vec<crate::stacked_eval::WeightShare<'_, E>>],
+    n_stack: usize,
+    commitments: &[&CodewordCommitment<F, H>],
+    domain: &Domain<F>,
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<ChainProof<F, E>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    let width = commitments.len();
+    if !(2..=MAX_INDEX_POLYS).contains(&width) || polys.len() != width || shares.len() != width {
+        return Err(Error::GroupedShape(GroupedShape::RunWidth { polys: width }));
+    }
+    check_index_domain(
+        n_stack,
+        index_vars(width),
+        config.log_blowup,
+        F::TWO_ADICITY as usize,
+    )?;
+    if commitments.iter().any(|c| c.codeword().host().is_none()) {
+        return Err(Error::DeviceFailed {
+            stage: "a grouped round 0 (it folds host codewords until D-ONECHAIN B3)",
+        });
+    }
+    let parts = polys
+        .iter()
+        .zip(shares)
+        .map(|(f, shares)| -> Result<(Mle<E>, Mle<E>), Error> {
+            let message = Mle::new(
+                f.assemble()?
+                    .evals()
+                    .iter()
+                    .map(|v| v.clone().to_extension::<E>())
+                    .collect(),
+            )?;
+            Ok((crate::stacked_eval::weight_table(shares, n_stack)?, message))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    prove_with_factors::<F, E, T, H>(
+        n_stack,
+        Factors::Lockstep {
+            parts,
+            index_vars: index_vars(width),
+        },
+        Current::Grouped(commitments),
         domain,
         config,
         transcript,
@@ -1165,18 +1588,20 @@ where
     prove_with_factors::<F, E, T, H>(
         f.num_vars(),
         factors,
-        commitment,
+        Current::Base(commitment),
         domain,
         config,
         transcript,
     )
 }
 
-/// The chain itself, over factors that are wherever they are.
+/// The chain itself, over factors that are wherever they are. `current` is
+/// round 0's commitment, or a grouped chain's commitments
+/// ([`Current::Grouped`]); `num_vars` is a polynomial's, without the index.
 fn prove_with_factors<F, E, T, H>(
     num_vars: usize,
     mut factors: Factors<F, E>,
-    commitment: &CodewordCommitment<F, H>,
+    mut current: Current<'_, F, E, H>,
     domain: &Domain<F>,
     config: &ChainConfig,
     transcript: &mut T,
@@ -1198,7 +1623,6 @@ where
     let caps = config.tree_caps_at(num_vars, crate::whir_hash::arity::<F, H>());
     // The codeword comes out of the commitment rather than being encoded
     // again: it is the same array, and the NTT is not cheap.
-    let mut current = Current::<F, E, H>::Base(commitment);
     let mut current_domain = domain.clone();
 
     let mut rounds = Vec::with_capacity(schedule.len());
@@ -1227,17 +1651,21 @@ where
         crate::whir_split::add(&crate::whir_split::GRIND, __wc_g);
 
         let __wc_sc = crate::whir_split::mark();
-        let (sumcheck_rounds, alphas) = factors.rounds(k, transcript)?;
+        let (sumcheck_rounds, challenges) = factors.rounds(k, transcript)?;
         crate::whir_split::add(&crate::whir_split::SUMCHECK, __wc_sc);
+        // A grouped round 0 also bound its index: the challenges past the
+        // first `k` are `ρ`, and only the first `k` fold a block.
+        let (alphas, rho) = challenges.split_at(k.min(challenges.len()));
 
         // The fold lands in the extension whichever field it started in, so
         // the field is the only thing the two cases differ in — and a codeword
         // the device holds is folded where it is.
         let __wc_fold = crate::whir_split::mark();
         let (folded, folded_domain) = match &current {
-            Current::Base(held) => fold_held::<F, F, E>(held.codeword(), &current_domain, &alphas)?,
+            Current::Base(held) => fold_held::<F, F, E>(held.codeword(), &current_domain, alphas)?,
+            Current::Grouped(held) => fold_grouped::<F, E, H>(held, &current_domain, alphas, rho)?,
             Current::Extension(held) => {
-                fold_held::<F, E, E>(held.codeword(), &current_domain, &alphas)?
+                fold_held::<F, E, E>(held.codeword(), &current_domain, alphas)?
             }
         };
         crate::whir_split::add(&crate::whir_split::FOLD, __wc_fold);
@@ -1333,6 +1761,15 @@ where
                         transcript,
                     )?)
                 }
+                (Current::Grouped(held), next) => {
+                    RoundOpenings::BaseGrouped(whir_round::prove_grouped(
+                        held,
+                        next.as_ref(),
+                        &round_config,
+                        round_caps,
+                        transcript,
+                    )?)
+                }
             };
         crate::whir_split::add(&crate::whir_split::QUERIES, __wc_q);
 
@@ -1385,6 +1822,42 @@ where
     })?;
     let (folded, folded_domain) = fold_codeword_k::<F, C, N>(values, domain, alphas)?;
     Ok((Codeword::Host(folded), folded_domain))
+}
+
+/// Round 0's successor in a grouped chain: each round-0 codeword folded by the
+/// data challenges, the folds combined with `eq(ρ, p)` ([`eq_index`]). Block
+/// `j` of it is the fold of `Σ_p eq(ρ, p)·block_p(j)`, which is what the
+/// verifier checks (D-ONECHAIN §3.3, Lemma B item 5).
+fn fold_grouped<F, E, H>(
+    held: &[&CodewordCommitment<F, H>],
+    domain: &Domain<F>,
+    alphas: &[FieldElement<E>],
+    rho: &[FieldElement<E>],
+) -> Result<(Codeword<E>, Domain<F>), Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    H: WhirHash,
+{
+    let mut combined: Vec<FieldElement<E>> = Vec::new();
+    let mut folded_domain = domain.clone();
+    for (p, commitment) in held.iter().enumerate() {
+        let values = commitment.codeword().host().ok_or(Error::DeviceFailed {
+            stage: "a grouped round 0 (it folds host codewords until D-ONECHAIN B3)",
+        })?;
+        let (folded, at) = fold_codeword_k::<F, F, E>(values, domain, alphas)?;
+        let eq = eq_index(rho, p);
+        if combined.is_empty() {
+            combined = folded.into_iter().map(|v| &eq * v).collect();
+        } else {
+            for (acc, v) in combined.iter_mut().zip(folded) {
+                *acc += &eq * v;
+            }
+        }
+        folded_domain = at;
+    }
+    Ok((Codeword::Host(combined), folded_domain))
 }
 
 /// Commits a folded codeword where it is.
@@ -1506,7 +1979,118 @@ where
     W: FnOnce(&[FieldElement<E>]) -> Result<FieldElement<E>, Error>,
     H: WhirHash,
 {
+    verify_chain::<F, E, T, W, H>(
+        proof,
+        core::slice::from_ref(root),
+        weight_at,
+        y,
+        num_vars,
+        domain,
+        config,
+        transcript,
+    )
+}
+
+/// Verifies ONE chain over a run of `roots.len() = P'` stacked polynomials
+/// ([`GroupFold::Indexed`], D-ONECHAIN §2.6): `Σ_x Σ_p eq(y, p)·w_p(x)·f_p(x)
+/// = y_claim`, round 0 over the `P'` trees at one position set.
+///
+/// `num_vars` is a polynomial's, without the index. `weight_at` is the
+/// weight's closed form at the chain's challenges in binding order, `n + m` of
+/// them: round 0's `k0` data challenges, its `m` index challenges `ρ`, then
+/// every later round's. A run of one is [`verify_weighted`], byte for byte.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_grouped<'a, F, E, T, W, H>(
+    proof: &'a ChainProof<F, E>,
+    roots: &'a [Commitment],
+    weight_at: W,
+    y: FieldElement<E>,
+    num_vars: usize,
+    domain: &Domain<F>,
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<(), Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    W: FnOnce(&[FieldElement<E>]) -> Result<FieldElement<E>, Error>,
+    H: WhirHash,
+{
+    verify_chain::<F, E, T, W, H>(
+        proof, roots, weight_at, y, num_vars, domain, config, transcript,
+    )
+}
+
+/// Where a round's openings may be which variant (REV-B2-JUDGE B1-2):
+/// [`RoundOpenings::BaseGrouped`] exactly at round 0 of a chain over `P' ≥ 2`
+/// (final or not), [`RoundOpenings::Base`] exactly at round 0 of a chain over
+/// one polynomial, [`RoundOpenings::Extension`] after round 0. A one-polynomial
+/// chain's refusals are today's.
+fn check_variant<F: IsField, E: IsField>(
+    r: usize,
+    grouped: bool,
+    openings: &RoundOpenings<F, E>,
+) -> Result<(), Error> {
+    match (openings, r == 0, grouped) {
+        (RoundOpenings::BaseGrouped(_), true, true) => Ok(()),
+        (RoundOpenings::BaseGrouped(_), _, _) | (RoundOpenings::Base(_), true, true) => {
+            Err(Error::GroupedShape(GroupedShape::Variant { round: r }))
+        }
+        // Only the first round's current codeword is base-field. Said here
+        // rather than left to a Merkle check failing on the byte width.
+        (RoundOpenings::Base(_), first, _) | (RoundOpenings::Extension(_), first, _)
+            if first != matches!(openings, RoundOpenings::Base(_)) =>
+        {
+            Err(Error::RoundCountMismatch {
+                expected: 0,
+                got: r,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// [`verify_weighted`] and [`verify_grouped`]: one chain over `roots.len()`
+/// polynomials. At one polynomial every check and every transcript call is
+/// [`verify_weighted`]'s as it was.
+#[allow(clippy::too_many_arguments)]
+fn verify_chain<'a, F, E, T, W, H>(
+    proof: &'a ChainProof<F, E>,
+    roots: &'a [Commitment],
+    weight_at: W,
+    y: FieldElement<E>,
+    num_vars: usize,
+    domain: &Domain<F>,
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<(), Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    W: FnOnce(&[FieldElement<E>]) -> Result<FieldElement<E>, Error>,
+    H: WhirHash,
+{
+    // The run's width, and with it the index, are the caller's derivation
+    // (`stacked_eval::index_chains`) — never the proof's.
+    let width = roots.len();
+    let Some(root) = roots.first().filter(|_| width <= MAX_INDEX_POLYS) else {
+        return Err(Error::GroupedShape(GroupedShape::RunWidth { polys: width }));
+    };
+    let grouped = width >= 2;
+    let index = index_vars(width);
+    if grouped {
+        check_index_domain(num_vars, index, config.log_blowup, F::TWO_ADICITY as usize)?;
+    }
+    // The folds — and so the trees, their caps and the round count — are the
+    // per-polynomial chain's; round 0 alone carries `m` more messages.
     let schedule = config.schedule(num_vars);
+    let messages = config.index_schedule(num_vars, index);
     if proof.rounds.len() != schedule.len() {
         return Err(Error::RoundCountMismatch {
             expected: schedule.len(),
@@ -1515,11 +2099,11 @@ where
     }
 
     let mut claim = y;
-    let mut alphas: Vec<FieldElement<E>> = Vec::with_capacity(num_vars);
+    let mut alphas: Vec<FieldElement<E>> = Vec::with_capacity(num_vars + index);
     // Tree 0 is authenticated by the cap round 0's first current opening
     // carries; every later tree by the check the round that committed it
     // returned. A verifier constant per tree, derived from the config and the
-    // hash alone.
+    // hash alone. A grouped round 0 has `P'` trees 0, each today's tree 0.
     let caps = config.tree_caps_at(num_vars, crate::whir_hash::arity::<F, H>());
     // Which nonce slots the proof carries: a verifier constant too.
     let layout = config.format.nonces;
@@ -1527,27 +2111,42 @@ where
         root,
         cap_height: caps[0],
     };
+    let round0_trees: Vec<TreeCheck<'a>> = if grouped {
+        roots
+            .iter()
+            .map(|root| TreeCheck::Owner {
+                root,
+                cap_height: caps[0],
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut current_domain = domain.clone();
     // Each round's out-of-domain claim, and how many variables were bound when
     // it entered the weight — the challenges after that are where its `eq`
     // lands.
     let mut ood: Vec<(FieldElement<E>, Vec<FieldElement<E>>, usize)> = Vec::new();
 
-    for (r, (round, &k)) in proof.rounds.iter().zip(&schedule).enumerate() {
-        if round.sumcheck.len() != k {
+    for (r, (round, (&k, &sent))) in proof
+        .rounds
+        .iter()
+        .zip(schedule.iter().zip(&messages))
+        .enumerate()
+    {
+        if round.sumcheck.len() != sent {
+            if grouped && r == 0 {
+                return Err(Error::GroupedShape(GroupedShape::Round0Messages {
+                    expected: sent,
+                    got: round.sumcheck.len(),
+                }));
+            }
             return Err(Error::RoundCountMismatch {
                 expected: k,
                 got: round.sumcheck.len(),
             });
         }
-        // Only the first round's current codeword is base-field. Said here
-        // rather than left to a Merkle check failing on the byte width.
-        if (r == 0) != matches!(round.openings, RoundOpenings::Base(_)) {
-            return Err(Error::RoundCountMismatch {
-                expected: 0,
-                got: r,
-            });
-        }
+        check_variant(r, grouped, &round.openings)?;
         check_nonce::<E, T, H>(
             transcript,
             config.grind.folding,
@@ -1557,12 +2156,14 @@ where
         // The weight raises the degree of the plain `f` term to two.
         let group = sumcheck::verify_rounds(&round.sumcheck, claim, 2, transcript)?;
         claim = group.expected_evaluation;
+        // Round 0 of a grouped chain bound its index last: `ρ` folds no block.
+        let (data, rho) = group.point.split_at(k);
 
         let mut next_domain = current_domain.clone();
         for _ in 0..k {
             next_domain = next_domain.squared()?;
         }
-        let bound = alphas.len() + k;
+        let bound = alphas.len() + group.point.len();
 
         let round_config = RoundConfig {
             num_queries: config.num_queries,
@@ -1578,7 +2179,7 @@ where
 
                 let z0: FieldElement<E> = transcript.sample_field_element();
                 require_out_of_domain::<F, E>(&z0, &next_domain)?;
-                let point = ood_point(&z0, num_vars - bound);
+                let point = ood_point(&z0, num_vars + index - bound);
                 transcript.append_field_element(y0);
 
                 check_nonce::<E, T, H>(transcript, config.grind.ood, round.nonces.ood, layout)?;
@@ -1598,7 +2199,7 @@ where
                         openings,
                         commitments,
                         &current_domain,
-                        &group.point,
+                        data,
                         &round_config,
                         transcript,
                     )?,
@@ -1606,10 +2207,32 @@ where
                         openings,
                         commitments,
                         &current_domain,
-                        &group.point,
+                        data,
                         &round_config,
                         transcript,
                     )?,
+                    RoundOpenings::BaseGrouped(openings) => {
+                        whir_round::verify_grouped::<F, E, T, H>(
+                            openings,
+                            &round0_trees,
+                            whir_round::GroupedEnd::Successor {
+                                root: next_root,
+                                num_leaves: next_domain.size() >> next_k,
+                                cap_height: caps[r + 1],
+                            },
+                            &current_domain,
+                            data,
+                            rho,
+                            &round_config,
+                            transcript,
+                        )?
+                        .ok_or(Error::GroupedShape(
+                            GroupedShape::SuccessorBlocks {
+                                expected: config.num_queries,
+                                got: 0,
+                            },
+                        ))?
+                    }
                 };
                 current = TreeCheck::Checked(next_check);
             }
@@ -1624,7 +2247,7 @@ where
                         openings,
                         current,
                         &current_domain,
-                        &group.point,
+                        data,
                         &round_config,
                         &proof.final_value,
                         transcript,
@@ -1633,11 +2256,23 @@ where
                         openings,
                         current,
                         &current_domain,
-                        &group.point,
+                        data,
                         &round_config,
                         &proof.final_value,
                         transcript,
                     )?,
+                    RoundOpenings::BaseGrouped(openings) => {
+                        whir_round::verify_grouped::<F, E, T, H>(
+                            openings,
+                            &round0_trees,
+                            whir_round::GroupedEnd::Final(&proof.final_value),
+                            &current_domain,
+                            data,
+                            rho,
+                            &round_config,
+                            transcript,
+                        )?;
+                    }
                 }
             }
             // A successor or an out-of-domain value where the schedule ends, or
@@ -1746,6 +2381,7 @@ mod tests {
         match openings {
             RoundOpenings::Base(p) => &p.current,
             RoundOpenings::Extension(p) => &p.current,
+            RoundOpenings::BaseGrouped(_) => panic!("a per-polynomial chain"),
         }
     }
 
@@ -1755,6 +2391,7 @@ mod tests {
         match openings {
             RoundOpenings::Base(p) => &mut p.current,
             RoundOpenings::Extension(p) => &mut p.current,
+            RoundOpenings::BaseGrouped(_) => panic!("a per-polynomial chain"),
         }
     }
 
@@ -2015,20 +2652,37 @@ mod tests {
 
     #[test]
     fn every_fold_word_is_distinct_and_the_non_default_ones_are_tagged() {
+        // {Uniform, First(k0)} × {PerPoly, Indexed} (REV-B2-JUDGE B1-5): every
+        // word distinct, and every non-default one tagged.
+        let indexed = |mut c: ChainConfig| {
+            c.format.group = GroupFold::Indexed;
+            c
+        };
         let mut seen = std::collections::HashSet::new();
         for k in 1..=MAX_FOLD {
             let uniform = config(k).fold_word();
             assert_eq!(uniform & FOLD_WORD_TAG, 0);
             assert!(seen.insert(uniform));
+            let w = indexed(config(k)).fold_word();
+            assert_ne!(w & FOLD_WORD_TAG, 0, "k={k} uniform, indexed");
+            assert_ne!(w & FOLD_WORD_INDEXED, 0, "k={k} uniform, indexed");
+            assert!(seen.insert(w), "k={k} uniform, indexed: {w:#x} repeats");
             for k0 in 1..=MAX_FOLD {
                 let w = first(k0, k).fold_word();
                 assert_ne!(w & FOLD_WORD_TAG, 0, "k={k} k0={k0}");
+                assert_eq!(w & FOLD_WORD_INDEXED, 0, "k={k} k0={k0}");
                 assert!(seen.insert(w), "k={k} k0={k0}: {w:#x} repeats");
+                let w = indexed(first(k0, k)).fold_word();
+                assert_ne!(w & FOLD_WORD_TAG, 0, "k={k} k0={k0} indexed");
+                assert_ne!(w & FOLD_WORD_INDEXED, 0, "k={k} k0={k0} indexed");
+                assert!(seen.insert(w), "k={k} k0={k0} indexed: {w:#x} repeats");
             }
         }
         // The production words, spelled out.
         assert_eq!(first(6, 4).fold_word(), 0x8041_0000_0000_0006);
         assert_eq!(first(5, 4).fold_word(), 0x8041_0000_0000_0005);
+        assert_eq!(indexed(first(6, 4)).fold_word(), 0x8041_8000_0000_0006);
+        assert_eq!(indexed(config(4)).fold_word(), 0x8000_8000_0000_0004);
     }
 
     /// No accepted first fold raises the round count at any height, so the
