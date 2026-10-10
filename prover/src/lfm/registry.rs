@@ -663,6 +663,70 @@ pub fn build_artifacts_under<S: stark::config::StarkHash>(
     }
 }
 
+/// [`build_artifacts_under`]'s heights, chunk lists and chip set with NO
+/// commit (every root zero, the id zero): what a node's shape over this
+/// program depends on (`DerivedChild`), for the census, which must not pay
+/// the commits. Test-only; `the_census_artifacts_are_the_real_ones_shape`
+/// pins it against a real build.
+#[cfg(test)]
+pub(crate) fn census_artifacts(program: &LfmProgram, hasher: HasherKind) -> LfmArtifacts {
+    let range = range_group();
+    let program_slots = program_groups(program);
+    let hash_chunks: Vec<ColumnGroup> = if program.hash_chunk_count() > 1 {
+        (0..program.hash_chunk_count())
+            .map(|c| program.hash_chunk_group(c))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let groups: [&ColumnGroup; 11] = std::array::from_fn(|i| {
+        if i == HASH_SLOT && !hash_chunks.is_empty() {
+            &hash_chunks[0]
+        } else if i < PROGRAM_GROUP_SLOTS {
+            program_slots[i]
+        } else {
+            &range
+        }
+    });
+    let mut log_heights = [0u8; NUM_LFM_CHIPS];
+    for (i, g) in groups.iter().enumerate() {
+        log_heights[i] = g.padded_rows.trailing_zeros() as u8;
+    }
+    let blake3_chunk_log_heights: Vec<u8> = blake3_chunk_rows(program)
+        .into_iter()
+        .map(|rows| rows.trailing_zeros() as u8)
+        .collect();
+    log_heights[BLAKE3_SLOT] = blake3_chunk_log_heights[0];
+    let mut hash_chunk_log_heights: Vec<u8> = vec![log_heights[HASH_SLOT]];
+    hash_chunk_log_heights.extend(
+        hash_chunks
+            .iter()
+            .skip(1)
+            .map(|g| g.padded_rows.trailing_zeros() as u8),
+    );
+    log_heights[13] = keccak_rc::NUM_ROWS.trailing_zeros() as u8;
+    log_heights[14] = bitwise::NUM_ROWS.trailing_zeros() as u8;
+    let chip_set = ChipSet::for_program_with_hasher(program, hasher);
+    let keccak_rnd_chunks = chip_set.keccak_rnd_chunks(
+        program
+            .chunking
+            .chunk_count(program.groups.keccak.real_rows),
+    );
+    LfmArtifacts {
+        roots: [[0u8; 32]; NUM_LFM_CHIPS],
+        log_heights,
+        keccak_rnd_chunks,
+        blake3_chunk_roots: vec![[0u8; 32]; blake3_chunk_log_heights.len()],
+        blake3_chunk_log_heights,
+        hash_chunk_roots: vec![[0u8; 32]; hash_chunk_log_heights.len()],
+        hash_chunk_log_heights,
+        hasher,
+        chip_set,
+        program_id: [0u8; 32],
+        one_row_roots: None,
+    }
+}
+
 /// The one-row roots of every committed group (host pass: the device commit
 /// builds row-pair leaves only), plus the static tables' one-row twins.
 fn build_one_row_roots<S: stark::config::StarkHash>(

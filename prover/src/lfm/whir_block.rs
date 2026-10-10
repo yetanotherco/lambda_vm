@@ -844,8 +844,20 @@ impl WhirBlockPlan {
         children: &[&DerivedChild],
         top: bool,
     ) -> Result<LfmProgram, String> {
+        self.node_program_under::<crate::hash_pin::LegacyFamily>(children, top)
+    }
+
+    /// [`Self::node_program`] for children proved under the family `Fam`: the
+    /// node's legs replay them under `Fam`'s wrap hash (its hash rows on
+    /// `Fam`'s socket). The children's shapes carry their own trees and tag
+    /// (`DerivedChild::from_artifacts_under::<Fam>`).
+    pub(crate) fn node_program_under<Fam: crate::hash_pin::ProofFamily>(
+        &self,
+        children: &[&DerivedChild],
+        top: bool,
+    ) -> Result<LfmProgram, String> {
         let shapes: Vec<_> = children.iter().map(|c| c.shape()).collect();
-        let mut b = builder();
+        let mut b = LfmBuilder::new().with_wrap_hash(Fam::WRAP);
         super::block_node::emit_block_node(
             &mut b,
             &BlockNodeInputs {
@@ -1126,10 +1138,6 @@ pub fn artifacts_of(program: &LfmProgram, wrap_opts: &crate::ProofOptions) -> Lf
         wrap_opts,
         program.hasher(crate::hash_pin::BLOCK_HASHER),
     )
-}
-
-fn builder() -> LfmBuilder {
-    LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production())
 }
 
 fn finish(b: LfmBuilder) -> Result<LfmProgram, String> {
