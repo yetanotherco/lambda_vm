@@ -261,7 +261,9 @@ fn the_statement_calls_are_absorb_blocks_own() {
 
 /// The WHIR configuration `base` dispatches to, by its type's name.
 fn dispatched(base: BaseFormat) -> Result<&'static str, crate::Error> {
-    Ok(crate::with_block_hash!(base, |H| { std::any::type_name::<H>() }))
+    Ok(crate::with_block_hash!(base, |H| {
+        std::any::type_name::<H>()
+    }))
 }
 
 /// ★ The dispatch itself, whatever the process's knob says: an RPX base binds
@@ -270,7 +272,10 @@ fn dispatched(base: BaseFormat) -> Result<&'static str, crate::Error> {
 /// `KeccakWhir` here — the behaviour the source test below can only infer.
 #[test]
 fn the_base_alone_binds_the_block_hash() {
-    println!("the process's WHIR hash knob: {:?}", std::env::var(crate::whir_hash_knob::ENV));
+    println!(
+        "the process's WHIR hash knob: {:?}",
+        std::env::var(crate::whir_hash_knob::ENV)
+    );
     assert_eq!(
         dispatched(BaseFormat::RPX).expect("RPX dispatches"),
         std::any::type_name::<multilinear::whir_hash::RpxWhir>()

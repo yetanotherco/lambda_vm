@@ -19,9 +19,7 @@ use super::word::{LfmWord, base_word};
 type B = super::p1_commit::P1BatchBackend<GoldilocksField>;
 
 fn mix(seed: u64, i: u64) -> u64 {
-    let mut z = seed
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(i + 1);
+    let mut z = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(i + 1);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
@@ -62,12 +60,18 @@ fn guest_grind(seed: [FE; 4], nonce: u64, factor: u8) -> Result<(), String> {
 fn rp1wa_the_emitted_grind_accepts_exactly_the_hosts_nonces() {
     let p = 0xFFFF_FFFF_0000_0001u64;
     let mut seeds: Vec<[FE; 4]> = (0..3).map(|s| lanes(900 + s)).collect();
-    seeds.push([FE::from(p - 1), FE::from(p - 2), FE::zero(), FE::from(1u64 << 63)]);
+    seeds.push([
+        FE::from(p - 1),
+        FE::from(p - 2),
+        FE::zero(),
+        FE::from(1u64 << 63),
+    ]);
     let mut boundary_hits = 0;
     for seed in &seeds {
         let bytes = digest_to_commitment(seed);
         for factor in [1u8, 2, 3, 5, 7] {
-            let host = |n: u64| crypto::grinding::is_valid_nonce::<P1GrindDigest>(&bytes, n, factor);
+            let host =
+                |n: u64| crypto::grinding::is_valid_nonce::<P1GrindDigest>(&bytes, n, factor);
             let mut nonces: Vec<u64> = (0..48).collect();
             nonces.extend([p, p + 1, p + 5, u64::MAX, u64::MAX - 3]);
             for n in nonces {
@@ -89,12 +93,19 @@ fn rp1wa_the_emitted_grind_accepts_exactly_the_hosts_nonces() {
                         "nonce {n} has exactly {} leading zero bits and passed at {factor}",
                         factor - 1
                     );
-                    assert!(guest_grind(*seed, n, factor - 1).is_ok(), "nonce {n} at {}", factor - 1);
+                    assert!(
+                        guest_grind(*seed, n, factor - 1).is_ok(),
+                        "nonce {n} at {}",
+                        factor - 1
+                    );
                 }
             }
         }
     }
-    assert!(boundary_hits >= 12, "the boundary was probed: {boundary_hits}");
+    assert!(
+        boundary_hits >= 12,
+        "the boundary was probed: {boundary_hits}"
+    );
 }
 
 /// One opening of a host Poseidon1 tree over `2^depth` leaves checked in-guest
@@ -194,9 +205,8 @@ fn rp1wa_the_child_order_walk_and_cap_bind_every_index() {
                 super::merkle_cap::cap_nodes(depth, c, 4)
             };
             for index in 0..n {
-                child_opening(depth, c, index, index, None).unwrap_or_else(|e| {
-                    panic!("depth {depth} cap {c} index {index}: {e}")
-                });
+                child_opening(depth, c, index, index, None)
+                    .unwrap_or_else(|e| panic!("depth {depth} cap {c} index {index}: {e}"));
                 let other = (index + 1 + index % 3) % n;
                 if other != index {
                     assert!(

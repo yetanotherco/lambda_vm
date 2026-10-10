@@ -699,7 +699,11 @@ fn rp1wa_a_p1_chain_verifies_under_its_own_cap_only() {
         assert!(check::<KeccakWhir>(&chain, &chain.proof, &c2).is_err());
         let off = config(log_folding, 5, CapPolicy::Off);
         let uncapped = prove_chain::<P1Whir>(num_vars, &off, 18);
-        check::<P1Whir>(&uncapped, &uncapped.proof, &config(log_folding, 5, CapPolicy::Fixed(0)))
-            .unwrap();
+        check::<P1Whir>(
+            &uncapped,
+            &uncapped.proof,
+            &config(log_folding, 5, CapPolicy::Fixed(0)),
+        )
+        .unwrap();
     }
 }
