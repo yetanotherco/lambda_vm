@@ -300,6 +300,18 @@ pub(crate) fn rest_ahead_bytes() -> u64 {
     gib_knob("LAMBDA_VM_BLOCK_REGEN_REST_AHEAD_GIB", 4.0)
 }
 
+/// `LAMBDA_VM_BLOCK_REGEN_EARLY` (default on; `0` turns it off): live
+/// regeneration starts both regenerators at the finish's end when it has armed
+/// by then (N4c), instead of at phase B's start, so phase B's first rebuilt
+/// groups do not wait for their start-up (ULTRA 123: ≈ 2.5 s a window).
+pub(crate) fn early_start() -> bool {
+    parse_early(std::env::var("LAMBDA_VM_BLOCK_REGEN_EARLY").ok().as_deref())
+}
+
+fn parse_early(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
+}
+
 /// `LAMBDA_VM_BLOCK_REGEN_RESERVE_GIB` (default 10, #1013's): the host bytes
 /// `auto` reserves for the regenerator in phase B once regeneration is armed —
 /// its walk state, windows, jobs and generators' outputs, and the columns
@@ -469,6 +481,11 @@ struct Recorded {
     /// the rest's laid-out tables, and the block index of the rest's first.
     rest: std::collections::HashMap<usize, (RegenFamily, usize)>,
     rest_base: Option<usize>,
+    /// The same tags by family and index (their place among the rest's), and
+    /// whether every rest table has been laid out (N4c: a regenerator started
+    /// before then waits for a table's tag, or for this).
+    rest_rev: std::collections::HashMap<(RegenFamily, usize), usize>,
+    rest_done: bool,
 }
 
 impl Recorder {
@@ -484,7 +501,32 @@ impl Recorder {
     /// The `k`-th table of the rest laid out is `family`'s `j`-th
     /// (`KECCAK_RND[j]`, `LT[j]`): phase B can build it again.
     pub(crate) fn rest_tag(&self, k: usize, family: RegenFamily, j: usize) {
-        self.lock().rest.insert(k, (family, j));
+        let mut recorded = self.lock();
+        recorded.rest.insert(k, (family, j));
+        recorded.rest_rev.insert((family, j), k);
+    }
+
+    /// The block index of the rest's first table, once the streamed chunks
+    /// are all placed.
+    pub(crate) fn rest_base(&self) -> Option<usize> {
+        self.lock().rest_base
+    }
+
+    /// Every rest table is laid out: no more tags.
+    pub(crate) fn set_rest_done(&self) {
+        self.lock().rest_done = true;
+    }
+
+    /// The block index of `family`'s `j`-th table when it is tagged; `Err`
+    /// while the rest is still being laid out and it is not (yet), `Ok(None)`
+    /// once it is all laid out and the table is not one phase B can build.
+    pub(crate) fn rest_block(&self, family: RegenFamily, j: usize) -> Result<Option<usize>, ()> {
+        let recorded = self.lock();
+        match (recorded.rest_base, recorded.rest_rev.get(&(family, j))) {
+            (Some(base), Some(&k)) => Ok(Some(base + k)),
+            _ if recorded.rest_done => Ok(None),
+            _ => Err(()),
+        }
     }
 
     /// The rest's tables start at block index `base` (every streamed chunk
@@ -1945,6 +1987,11 @@ pub(crate) struct RestReport {
     pub(crate) cpu: Option<f64>,
     pub(crate) generators: usize,
     pub(crate) error: Option<String>,
+    /// Started before phase A's end (N4c): the tables whose fate (or tag) it
+    /// waited for, and the seconds it waited.
+    pub(crate) fed: bool,
+    pub(crate) decided_late: usize,
+    pub(crate) fed_waited: f64,
 }
 
 impl RestReport {
@@ -1954,7 +2001,7 @@ impl RestReport {
         format!(
             "BLOCK REGEN rest: {} of {} dropped tables deposited · {} mismatches · {} failed · {} \
              refused (window closed) · KECCAK_RND {} · LT {} built again · {:.2} GiB packed · \
-             ready from {} s to {} s · wall {:.2} s · {} generators CPU {} s{}",
+             ready from {} s to {} s · wall {:.2} s · {} generators CPU {} s{}{}",
             self.deposited,
             self.dropped,
             self.mismatches,
@@ -1968,6 +2015,14 @@ impl RestReport {
             self.wall,
             self.generators,
             secs(self.cpu),
+            if self.fed {
+                format!(
+                    " · started before phase A's end: {} tables decided after it asked, waited {:.2} s",
+                    self.decided_late, self.fed_waited
+                )
+            } else {
+                String::new()
+            },
             self.error
                 .as_ref()
                 .map_or(String::new(), |e| format!(" · stopped: {e}")),
@@ -1992,79 +2047,68 @@ pub(crate) struct RestRun {
     spawn_error: Option<String>,
 }
 
+/// Where the rest's regenerator takes its tables from ([`RestRun::spawn`]).
+pub(crate) enum RestSource {
+    /// Phase A's drops, final (the regenerator starts with phase B): each
+    /// table's block index, and the dropped tables' ranks and slots.
+    Planned {
+        blocks: std::collections::HashMap<(RegenFamily, usize), usize>,
+        dropped: Vec<(u64, RegenSlot)>,
+    },
+    /// A start before phase A's end (N4c): each table's block index from the
+    /// recorder as the rest is laid out, and its fate from `feed`
+    /// ([`stark::multilinear_block::BlockRegen::await_rank`]), waited for in
+    /// rank order. Nothing is skipped before its fate is known.
+    Fed {
+        recorder: Arc<Recorder>,
+        feed: stark::multilinear_block::BlockRegen,
+    },
+}
+
 impl RestRun {
-    /// The regenerator over `regen`, depositing `dropped` (each a rank, the
-    /// block index `blocks` gives a family's table, and its slot) into
-    /// `window`; `producer` holds the window's slots open until it ends.
+    /// The regenerator over `regen`, depositing the tables `source` names
+    /// into `window`; `producer` holds the window's slots open until it ends.
     /// `faults` name a table by its place among the dropped ones, in rank
     /// order.
     pub(crate) fn spawn(
         mut regen: RestRegen,
-        blocks: std::collections::HashMap<(RegenFamily, usize), usize>,
+        source: RestSource,
         window: Arc<RegenWindow>,
         producer: RegenProducer,
-        dropped: Vec<(u64, RegenSlot)>,
         generators: usize,
         faults: LiveFaults,
     ) -> Self {
         use std::panic::{AssertUnwindSafe, catch_unwind};
-        let count = dropped.len();
+        let count = match &source {
+            RestSource::Planned { dropped, .. } => dropped.len(),
+            RestSource::Fed { .. } => 0,
+        };
         let started = Instant::now();
+        let window_in = Arc::clone(&window);
         let spawned = std::thread::Builder::new()
             .name("regen-rest".to_string())
             .spawn(move || {
-                let mut slots: std::collections::HashMap<u64, RegenSlot> =
-                    dropped.into_iter().collect();
+                let window = window_in;
                 let mut report = RestReport {
                     dropped: count,
                     generators,
+                    fed: matches!(source, RestSource::Fed { .. }),
                     ..RestReport::default()
                 };
-                // The work, in rank order: each family in AIR order, each table
-                // in the family's order (the rest's block indices ascend so).
-                let mut work: Vec<RestWork> = Vec::new();
-                let mut built = [0usize; 2];
-                for (f, family) in RegenFamily::ALL.into_iter().enumerate() {
-                    let jobs = match regen.take(family) {
-                        Ok(jobs) => jobs,
+                // Each family's jobs, in AIR order (the rest's block indices
+                // ascend so, family by family, table by table).
+                let mut families = Vec::new();
+                for family in RegenFamily::ALL {
+                    match regen.take(family) {
+                        Ok(jobs) => families.push((family, jobs)),
                         Err(e) => {
                             report.error = Some(format!("{e:?}"));
                             break;
                         }
-                    };
-                    for (j, job) in jobs.into_iter().enumerate() {
-                        let Some(job) = job else { continue };
-                        let Some(slot) = blocks
-                            .get(&(family, j))
-                            .and_then(|&t| slots.remove(&(t as u64)).map(|slot| (t as u64, slot)))
-                        else {
-                            continue;
-                        };
-                        built[f] += 1;
-                        work.push((0, slot.0, slot.1, job));
                     }
                 }
-                work.sort_by_key(|(_, _, slot, _)| slot.order_key());
-                for (k, item) in work.iter_mut().enumerate() {
-                    item.0 = k as u64;
-                }
-                // A dropped table no job builds is failed now, as is every one
-                // after a stop.
-                for (rank, slot) in slots.drain() {
-                    let why = format!("rest table {rank} has no job to build it again");
-                    slot.fail(&why);
-                    report.failures.push(why);
-                }
-                if let Some(why) = report.error.clone() {
-                    for (_, _, slot, _) in &work {
-                        slot.fail(&why);
-                    }
-                    drop(producer);
-                    report.wall = started.elapsed().as_secs_f64();
-                    return report;
-                }
-                report.built = built;
-                let queue = Mutex::new(std::collections::VecDeque::from(work));
+                let (wtx, wrx) = std::sync::mpsc::channel::<RestWork>();
+                let wrx = Mutex::new(wrx);
                 let deposited = AtomicUsize::new(0);
                 let mismatches = AtomicUsize::new(0);
                 let closed = AtomicUsize::new(0);
@@ -2078,9 +2122,8 @@ impl RestRun {
                             loop {
                                 // FIFO: ranks go out in order, so the window's
                                 // frontier is always a table some thread builds.
-                                let next =
-                                    queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
-                                let Some((k, rank, slot, job)) = next else {
+                                let next = wrx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                                let Ok((k, rank, slot, job)) = next else {
                                     break;
                                 };
                                 let fail = |why: String| {
@@ -2150,6 +2193,126 @@ impl RestRun {
                             *total = total.zip(spent).map(|(a, b)| a + b);
                         });
                     }
+                    // This thread hands the work out, in rank order.
+                    let mut built = [0usize; 2];
+                    let fail_all =
+                        |slots: Vec<(u64, RegenSlot)>, why: &str, report: &mut RestReport| {
+                            for (rank, slot) in slots {
+                                let why = format!("rest table {rank}: {why}");
+                                slot.fail(&why);
+                                report.failures.push(why);
+                            }
+                        };
+                    match source {
+                        RestSource::Planned { blocks, dropped } => {
+                            let mut slots: std::collections::HashMap<u64, RegenSlot> =
+                                dropped.into_iter().collect();
+                            let mut work: Vec<RestWork> = Vec::new();
+                            if report.error.is_none() {
+                                for (f, (family, jobs)) in families.into_iter().enumerate() {
+                                    for (j, job) in jobs.into_iter().enumerate() {
+                                        let Some(job) = job else { continue };
+                                        let Some((t, slot)) =
+                                            blocks.get(&(family, j)).and_then(|&t| {
+                                                slots
+                                                    .remove(&(t as u64))
+                                                    .map(|slot| (t as u64, slot))
+                                            })
+                                        else {
+                                            continue;
+                                        };
+                                        built[f] += 1;
+                                        work.push((0, t, slot, job));
+                                    }
+                                }
+                            }
+                            work.sort_by_key(|(_, _, slot, _)| slot.order_key());
+                            // A dropped table no job builds is failed now, as
+                            // is every one after a stop.
+                            let why = report.error.clone();
+                            fail_all(
+                                slots.drain().collect(),
+                                why.as_deref().unwrap_or("no job builds it again"),
+                                &mut report,
+                            );
+                            for (k, mut item) in work.into_iter().enumerate() {
+                                item.0 = k as u64;
+                                if let Some(why) = &why {
+                                    item.2.fail(why);
+                                    continue;
+                                }
+                                let _ = wtx.send(item);
+                            }
+                        }
+                        RestSource::Fed { recorder, feed } => {
+                            let mut handed: std::collections::HashSet<u64> = Default::default();
+                            let mut k = 0u64;
+                            let mut stopped = report.error.is_some();
+                            'families: for (f, (family, jobs)) in families.into_iter().enumerate() {
+                                if stopped {
+                                    break;
+                                }
+                                for (j, job) in jobs.into_iter().enumerate() {
+                                    let Some(job) = job else { continue };
+                                    // Its block index, once the rest is laid out
+                                    // that far.
+                                    let asked = Instant::now();
+                                    let t = loop {
+                                        match recorder.rest_block(family, j) {
+                                            Ok(t) => break t,
+                                            Err(()) if window.is_closed() => {
+                                                stopped = true;
+                                                break 'families;
+                                            }
+                                            Err(()) => std::thread::sleep(
+                                                std::time::Duration::from_millis(10),
+                                            ),
+                                        }
+                                    };
+                                    let Some(t) = t else { continue };
+                                    let (decision, waited) = feed.await_rank(1, t as u64);
+                                    let waited = asked.elapsed().max(waited);
+                                    if waited > std::time::Duration::from_millis(1) {
+                                        report.decided_late += 1;
+                                        report.fed_waited += waited.as_secs_f64();
+                                    }
+                                    match decision {
+                                        stark::multilinear_block::RankDecision::Dropped(slot) => {
+                                            built[f] += 1;
+                                            handed.insert(t as u64);
+                                            let _ = wtx.send((k, t as u64, slot, job));
+                                            k += 1;
+                                        }
+                                        stark::multilinear_block::RankDecision::Kept => {}
+                                        stark::multilinear_block::RankDecision::Stopped => {
+                                            stopped = true;
+                                            break 'families;
+                                        }
+                                    }
+                                }
+                            }
+                            // A dropped table no job took is failed once phase
+                            // A's end closes the decisions (none should be).
+                            if !stopped {
+                                while !feed.decisions_closed() && !window.is_closed() {
+                                    std::thread::sleep(std::time::Duration::from_millis(20));
+                                }
+                            }
+                            let leftover: Vec<(u64, RegenSlot)> = feed
+                                .dropped_of(1)
+                                .into_iter()
+                                .filter(|(rank, _)| !handed.contains(rank))
+                                .collect();
+                            report.dropped = handed.len() + leftover.len();
+                            let why = report
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "no job builds it again".to_string());
+                            fail_all(leftover, &why, &mut report);
+                        }
+                    }
+                    report.built = built;
+                    drop(wtx);
                 });
                 drop(producer);
                 report.deposited = deposited.into_inner();
@@ -2211,6 +2374,199 @@ impl Drop for RestRun {
         self.window.close("the block's prove ended");
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
+        }
+    }
+}
+
+/// The `BLOCK REGEN head start` line (N4c): how long before phase B the
+/// regenerators started (at the finish's end), and how long the streamed
+/// chunks' fates kept the streamed one waiting; or none.
+pub(crate) fn head_start_line(head_start: Option<f64>, streamed_waited: Option<f64>) -> String {
+    match head_start {
+        Some(secs) => format!(
+            "BLOCK REGEN head start: {secs:.2} s before phase B (both regenerators started at the \
+             finish's end) · streamed chunks' fates awaited {:.2} s",
+            streamed_waited.unwrap_or(0.0)
+        ),
+        None => "BLOCK REGEN head start: none (the regenerators started with phase B)".to_string(),
+    }
+}
+
+/// What [`EarlyStart`] started: the streamed chunks' regenerator over the
+/// class's final drops (with each dropped rank's chunk, for phase B to check
+/// against the layout), the rest's regenerator fed table by table, and how
+/// long it waited for the streamed chunks' fates.
+#[derive(Default)]
+pub(crate) struct EarlyRuns {
+    pub(crate) live: Option<LiveRun>,
+    pub(crate) keys: Vec<(u64, StreamKey)>,
+    pub(crate) rest: Option<RestRun>,
+    pub(crate) streamed_waited: f64,
+    pub(crate) error: Option<String>,
+}
+
+/// The arguments [`LiveRun::spawn`] takes besides its window, producer and
+/// dropped chunks.
+pub(crate) struct LiveArgs {
+    pub(crate) elf_bytes: Vec<u8>,
+    pub(crate) private_input: Vec<u8>,
+    pub(crate) max_rows: crate::tables::MaxRowsConfig,
+    pub(crate) window_cycles: usize,
+    pub(crate) form: TraceForm,
+    pub(crate) faults: LiveFaults,
+    pub(crate) policy: AheadPolicy,
+}
+
+/// Both regenerators started at the finish's end (D-WHIR-NODISK N4c), on a
+/// thread of their own outside phase A's: the rest's at once, fed each
+/// table's fate as phase A commits it
+/// ([`stark::multilinear_block::BlockRegen::await_rank`]); the streamed
+/// chunks' once every streamed chunk's fate is known (their groups commit
+/// first). Dropped before phase B takes it (the prove failed), it closes every
+/// class's window, so nothing waits on, and joins.
+pub(crate) struct EarlyStart {
+    thread: Option<std::thread::JoinHandle<EarlyRuns>>,
+    windows: Vec<Arc<RegenWindow>>,
+    started: Instant,
+}
+
+impl EarlyStart {
+    pub(crate) fn spawn(
+        feed: stark::multilinear_block::BlockRegen,
+        recorder: Arc<Recorder>,
+        rest_regen: RestRegen,
+        live: LiveArgs,
+        generators: usize,
+        rest_faults: LiveFaults,
+    ) -> Self {
+        let started = Instant::now();
+        let windows = feed.windows().to_vec();
+        let windows_in = windows.clone();
+        let thread = std::thread::Builder::new()
+            .name("regen-early".to_string())
+            .spawn(move || {
+                let mut runs = EarlyRuns::default();
+                match (feed.take_producer(1), windows_in.get(1)) {
+                    (Some(producer), Some(window)) => {
+                        runs.rest = Some(RestRun::spawn(
+                            rest_regen,
+                            RestSource::Fed {
+                                recorder: Arc::clone(&recorder),
+                                feed: feed.clone(),
+                            },
+                            Arc::clone(window),
+                            producer,
+                            generators,
+                            rest_faults,
+                        ));
+                    }
+                    _ => drop(rest_regen),
+                }
+                let Some(window) = windows_in.first().cloned() else {
+                    return runs;
+                };
+                // Every streamed chunk's fate: phase A placed them all before
+                // the rest, and their groups commit first.
+                let base = loop {
+                    if let Some(base) = recorder.rest_base() {
+                        break base;
+                    }
+                    if window.is_closed() {
+                        runs.error = Some("the streamed chunks were never all placed".to_string());
+                        return runs;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                };
+                let mut keyed = Vec::new();
+                for t in 0..base {
+                    let Some(key) = recorder.chunk_at(t) else {
+                        continue;
+                    };
+                    let (decision, waited) = feed.await_rank(0, t as u64);
+                    runs.streamed_waited += waited.as_secs_f64();
+                    match decision {
+                        stark::multilinear_block::RankDecision::Dropped(slot) => {
+                            keyed.push((key, slot));
+                            runs.keys.push((t as u64, key));
+                        }
+                        stark::multilinear_block::RankDecision::Kept => {}
+                        stark::multilinear_block::RankDecision::Stopped => {
+                            runs.error = Some(format!(
+                                "the prove ended before streamed chunk {t}'s fate was known"
+                            ));
+                            return runs;
+                        }
+                    }
+                }
+                if !keyed.is_empty() {
+                    match feed.take_producer(0) {
+                        Some(producer) => {
+                            runs.live = Some(LiveRun::spawn(
+                                live.elf_bytes,
+                                live.private_input,
+                                live.max_rows,
+                                live.window_cycles,
+                                window,
+                                producer,
+                                keyed,
+                                live.form,
+                                live.faults,
+                                live.policy,
+                            ));
+                        }
+                        None => {
+                            runs.error =
+                                Some("the streamed chunks' window has no producer".to_string());
+                        }
+                    }
+                }
+                runs
+            });
+        match thread {
+            Ok(thread) => Self {
+                thread: Some(thread),
+                windows,
+                started,
+            },
+            // No thread: the closure, its runs and the producers it would
+            // have taken went with it; phase B finds no producer and refuses.
+            Err(_) => Self {
+                thread: None,
+                windows,
+                started,
+            },
+        }
+    }
+
+    /// When it started.
+    pub(crate) fn started(&self) -> Instant {
+        self.started
+    }
+
+    /// The runs it started, once it has (phase B's start: every streamed
+    /// chunk's fate is known by phase A's end).
+    pub(crate) fn join(mut self) -> EarlyRuns {
+        match self.thread.take() {
+            Some(thread) => thread.join().unwrap_or_else(|_| EarlyRuns {
+                error: Some("the early regeneration thread panicked".to_string()),
+                ..EarlyRuns::default()
+            }),
+            None => EarlyRuns {
+                error: Some("the early regeneration thread did not start".to_string()),
+                ..EarlyRuns::default()
+            },
+        }
+    }
+}
+
+impl Drop for EarlyStart {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            for window in &self.windows {
+                window.close("the block's prove ended before phase B");
+            }
+            // Its runs close their windows and join as they drop.
+            let _ = thread.join();
         }
     }
 }
@@ -2332,6 +2688,9 @@ pub struct RegenStamps {
     pub held: usize,
     /// The groups in the order phase B took them.
     pub phase_b_order: Vec<usize>,
+    /// Seconds before phase B the regenerators started (N4c), when they
+    /// started at the finish's end.
+    pub head_start: Option<f64>,
     /// The `BLOCK REGEN` lines.
     pub lines: Vec<String>,
 }
@@ -2468,6 +2827,26 @@ mod tests {
         assert_eq!(
             regen_mode_line(RegenMode::Off, false, Some(" off "), Some("auto")),
             "BLOCK REGEN mode: Off · LAMBDA_VM_BLOCK_REGEN=off · LAMBDA_VM_BLOCK_SPILL=auto"
+        );
+    }
+
+    /// `LAMBDA_VM_BLOCK_REGEN_EARLY` (N4c): on unless `0`; and the head-start
+    /// line, with a start and without.
+    #[test]
+    fn the_early_start_reads_its_knob_and_says_its_head_start() {
+        assert!(parse_early(None));
+        assert!(parse_early(Some("1")));
+        assert!(parse_early(Some("yes")));
+        assert!(!parse_early(Some("0")));
+        assert!(!parse_early(Some(" 0 ")));
+        assert_eq!(
+            head_start_line(Some(3.4), Some(0.02)),
+            "BLOCK REGEN head start: 3.40 s before phase B (both regenerators started at the \
+             finish's end) · streamed chunks' fates awaited 0.02 s"
+        );
+        assert_eq!(
+            head_start_line(None, None),
+            "BLOCK REGEN head start: none (the regenerators started with phase B)"
         );
     }
 

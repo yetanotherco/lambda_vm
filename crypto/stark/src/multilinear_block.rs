@@ -640,6 +640,24 @@ pub struct BlockRegen {
     always: bool,
     started: Instant,
     inner: Arc<std::sync::Mutex<RegenState>>,
+    /// Wakes [`Self::await_rank`] at each decision and when the decisions
+    /// close.
+    decided: Arc<std::sync::Condvar>,
+}
+
+/// A droppable table's fate, as a regenerator started before phase A's end
+/// needs it ([`BlockRegen::await_rank`]).
+#[derive(Clone)]
+pub enum RankDecision {
+    /// Dropped: its slot, which the regenerator fills.
+    Dropped(RegenSlot),
+    /// Not dropped, and never will be: held by its group's class
+    /// ([`drop_one_class`]), gone to the store, or phase A ended without
+    /// dropping it.
+    Kept,
+    /// Its class's window closed (the prove ended or failed) before the table
+    /// was decided.
+    Stopped,
 }
 
 #[derive(Default)]
@@ -662,6 +680,15 @@ struct RegenState {
     held: usize,
     /// A memory log, which counts each drop out of the held bytes.
     mem: Option<Arc<BlockMem>>,
+    /// Each decided table by class and rank: its slot when dropped; the
+    /// ranks decided to stay; and whether the decisions are over (phase A's
+    /// end: an undecided table then stays).
+    slots: std::collections::HashMap<(usize, u64), RegenSlot>,
+    kept: std::collections::HashSet<(usize, u64)>,
+    decisions_closed: bool,
+    /// Test only: a pause before each drop of this class, so a regenerator
+    /// started early meets undecided tables.
+    drop_delay: Option<(usize, std::time::Duration)>,
 }
 
 /// A table for the drop thread, and whether drop-back sent it.
@@ -717,17 +744,23 @@ impl BlockRegen {
             ..RegenState::default()
         }));
         let (tx, rx) = std::sync::mpsc::channel::<DropJob>();
-        let (windows_in, inner_in) = (windows.clone(), Arc::clone(&inner));
+        let decided = Arc::new(std::sync::Condvar::new());
+        let (windows_in, inner_in, decided_in) =
+            (windows.clone(), Arc::clone(&inner), Arc::clone(&decided));
         let thread = std::thread::Builder::new()
             .name("block-regen-drop".to_string())
             .spawn(move || {
                 for job in rx {
                     let rank = job.parked.rank;
-                    let mem = inner_in
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .mem
-                        .clone();
+                    let (mem, delay) = {
+                        let state = inner_in.lock().unwrap_or_else(|e| e.into_inner());
+                        (state.mem.clone(), state.drop_delay)
+                    };
+                    if let (Some((class, pause)), Some((c, _))) = (delay, rank)
+                        && class == c
+                    {
+                        std::thread::sleep(pause);
+                    }
                     let dropped = rank.and_then(|(class, rank)| {
                         let window = windows_in.get(class)?;
                         drop_parked(window, &job.parked, rank, mem.as_deref())
@@ -735,10 +768,16 @@ impl BlockRegen {
                     let mut state = inner_in.lock().unwrap_or_else(|e| e.into_inner());
                     match (dropped, rank) {
                         (Some(slot), Some(rank)) => {
+                            state.slots.insert(rank, slot.clone());
                             state.dropped.push((rank, slot, job.parked.len, job.back))
+                        }
+                        (None, Some(rank)) => {
+                            state.kept.insert(rank);
+                            state.refused_late += 1
                         }
                         _ => state.refused_late += 1,
                     }
+                    decided_in.notify_all();
                 }
             });
         {
@@ -759,6 +798,7 @@ impl BlockRegen {
             always,
             started: Instant::now(),
             inner,
+            decided,
         }
     }
 
@@ -825,7 +865,8 @@ impl BlockRegen {
         }
     }
 
-    /// No more drops: the drop thread finishes what is queued and ends.
+    /// No more drops: the drop thread finishes what is queued and ends, and
+    /// every table not dropped by then stays ([`RankDecision::Kept`]).
     fn close_drops(&self) {
         let thread = {
             let mut state = self.lock();
@@ -835,14 +876,87 @@ impl BlockRegen {
         if let Some(thread) = thread {
             let _ = thread.join();
         }
+        self.lock().decisions_closed = true;
+        self.decided.notify_all();
+    }
+
+    /// Tables kept because their group dropped another class.
+    fn held(&self, ranks: &[(usize, u64)]) {
+        let mut state = self.lock();
+        state.held += ranks.len();
+        state.kept.extend(ranks.iter().copied());
+        drop(state);
+        self.decided.notify_all();
+    }
+
+    /// Whether every table phase B can rebuild that phase A still commits will
+    /// be dropped (armed, or `always`): a regenerator may start before phase
+    /// A's end and take each table's fate from [`Self::await_rank`].
+    pub fn drops_all_from_now(&self) -> bool {
+        self.always || self.is_armed()
+    }
+
+    /// Class `class`'s first producer, for a regenerator that starts before
+    /// phase A's end ([`Self::into_plan`] then hands out none for the class).
+    pub fn take_producer(&self, class: usize) -> Option<RegenProducer> {
+        self.lock().producers.get_mut(class).and_then(Option::take)
+    }
+
+    /// The fate of class `class`'s table of rank `rank`, waiting for it:
+    /// dropped (its slot), kept, or `Stopped` once the class's window
+    /// closes. Returns too how long it waited. A table phase A never dropped
+    /// is kept once phase A's end closes the decisions; nothing is taken as
+    /// kept before that, so a regenerator never skips a table that drops
+    /// later.
+    pub fn await_rank(&self, class: usize, rank: u64) -> (RankDecision, std::time::Duration) {
+        let started = Instant::now();
+        let window = self.windows.get(class).cloned();
+        let mut state = self.lock();
+        loop {
+            if let Some(slot) = state.slots.get(&(class, rank)) {
+                return (RankDecision::Dropped(slot.clone()), started.elapsed());
+            }
+            if state.kept.contains(&(class, rank)) || state.decisions_closed {
+                return (RankDecision::Kept, started.elapsed());
+            }
+            if window.as_ref().is_none_or(|w| w.is_closed()) {
+                return (RankDecision::Stopped, started.elapsed());
+            }
+            // A closed window does not wake this condvar: poll for it.
+            state = self
+                .decided
+                .wait_timeout(state, std::time::Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    /// Class `class`'s drops so far, in the window's order.
+    pub fn dropped_of(&self, class: usize) -> Vec<(u64, RegenSlot)> {
+        let state = self.lock();
+        let mut dropped: Vec<(u64, RegenSlot)> = state
+            .dropped
+            .iter()
+            .filter(|((c, _), ..)| *c == class)
+            .map(|((_, rank), slot, ..)| (*rank, slot.clone()))
+            .collect();
+        dropped.sort_by_key(|(_, slot)| slot.order_key());
+        dropped
+    }
+
+    /// Whether phase A's end has closed the decisions.
+    pub fn decisions_closed(&self) -> bool {
+        self.lock().decisions_closed
+    }
+
+    /// Test only: pause before each drop of class `class`, so a regenerator
+    /// started early meets undecided tables.
+    #[doc(hidden)]
+    pub fn delay_drops(&self, class: usize, pause: std::time::Duration) {
+        self.lock().drop_delay = Some((class, pause));
     }
 
     /// What it dropped.
-    /// Counts `n` tables kept because their group dropped another class.
-    fn held(&self, n: usize) {
-        self.lock().held += n;
-    }
-
     pub fn report(&self) -> DropReport {
         let state = self.lock();
         let back = state.dropped.iter().filter(|d| d.3);
@@ -974,12 +1088,16 @@ where
             spill.regen.as_ref()?.rank_of(first + k)
         })
         .collect();
-    let droppable = ranks.iter().flatten().count();
+    let before = ranks.clone();
     drop_one_class(&mut ranks);
     if let Some(regen) = &spill.regen {
-        let held = droppable - ranks.iter().flatten().count();
-        if held > 0 {
-            regen.held(held);
+        let held: Vec<(usize, u64)> = before
+            .iter()
+            .zip(&ranks)
+            .filter_map(|(b, a)| b.filter(|_| a.is_none()))
+            .collect();
+        if !held.is_empty() {
+            regen.held(&held);
         }
     }
     for (k, (table, slot)) in tables.iter_mut().zip(out.iter_mut()).enumerate() {
@@ -3143,6 +3261,71 @@ mod spill_tests {
         assert_eq!(one_class([None, None]), Some(None));
         assert_eq!(one_class([]), Some(None));
         assert_eq!(one_class([Some(0), None, Some(1)]), None);
+    }
+
+    /// The decision feed a regenerator started before phase A's end reads
+    /// (N4c): a table dropped after the wait began is handed over with its
+    /// slot; a held table is kept; a table never dropped is kept only once
+    /// phase A's end closes the decisions; and a waiter on an undecided table
+    /// returns `Stopped` as soon as its class's window closes (a failed or
+    /// ended prove), never hanging.
+    #[test]
+    fn a_regenerator_started_early_waits_for_each_tables_fate() {
+        use super::{BlockRegen, Parked, ParkedState, RankDecision};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let words: Vec<u64> = (0..2 * 1024u64).map(|i| i * 7919 % 50_000).collect();
+        let packed = || NarrowColumns::pack_row_major(&words, 2).expect("packs");
+        let parked = |class: usize, rank: u64| {
+            Arc::new(Parked {
+                len: packed().data().len() as u64,
+                rank: Some((class, rank)),
+                state: std::sync::Mutex::new(ParkedState::Resident(packed())),
+            })
+        };
+        let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30, 1 << 30], true);
+        let _producers = (regen.take_producer(0), regen.take_producer(1));
+        assert!(regen.drops_all_from_now());
+        // Dropped after the wait began: handed over with its slot.
+        regen.delay_drops(1, Duration::from_millis(300));
+        let waiter = {
+            let regen = regen.clone();
+            std::thread::spawn(move || regen.await_rank(1, 7))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        regen.parked(parked(1, 7));
+        let (decision, waited) = waiter.join().expect("joins");
+        assert!(matches!(decision, RankDecision::Dropped(ref slot) if slot.rank() == 7));
+        assert!(waited >= Duration::from_millis(200), "waited {waited:?}");
+        // Held by its group's class: kept at once.
+        regen.held(&[(1, 9)]);
+        assert!(matches!(regen.await_rank(1, 9).0, RankDecision::Kept));
+        // Never dropped: undecided while phase A runs, kept once it ends.
+        let waiter = {
+            let regen = regen.clone();
+            std::thread::spawn(move || regen.await_rank(1, 11))
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!waiter.is_finished(), "kept before phase A's end");
+        regen.close_drops();
+        assert!(matches!(
+            waiter.join().expect("joins").0,
+            RankDecision::Kept
+        ));
+        assert!(regen.decisions_closed());
+        // Liveness: a waiter on an undecided table of a class whose window
+        // closes (the prove failed) returns at once, Stopped.
+        let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30, 1 << 30], true);
+        let waiter = {
+            let regen = regen.clone();
+            std::thread::spawn(move || regen.await_rank(1, 3))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished());
+        regen.windows()[1].close("the prove failed");
+        let (decision, waited) = waiter.join().expect("joins");
+        assert!(matches!(decision, RankDecision::Stopped));
+        assert!(waited < Duration::from_secs(2), "waited {waited:?}");
     }
 
     /// The rebuilt groups go last, each set in group order; nothing rebuilt is
