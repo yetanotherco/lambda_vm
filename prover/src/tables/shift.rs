@@ -365,11 +365,21 @@ pub fn generate_shift_trace_as(
     operations: &[ShiftOperation],
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_shift_trace_segments_as(&[operations], form)
+}
+
+/// [`generate_shift_trace_as`] over `segments`, the operations one after another: a
+/// chunk handed out as the window parts it lies in.
+pub(crate) fn generate_shift_trace_segments_as(
+    segments: &[&[ShiftOperation]],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let len: usize = segments.iter().map(|s| s.len()).sum();
     // No deduplication: each operation gets its own row with μ=1.
     // Spec declares μ: Bit.
-    let num_rows = operations.len().next_power_of_two().max(4);
+    let num_rows = len.next_power_of_two().max(4);
     generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
-        for (row_idx, op) in operations.iter().enumerate() {
+        for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
             let aux = op.compute_aux();
 
             // Input columns
@@ -413,7 +423,7 @@ pub fn generate_shift_trace_as(
         // Padding rows: set ZBS=1 per spec. All other columns remain 0.
         // μ=0 so C13 (limb_shift encoding) is inactive. left=right=0 so shifted=0,
         // making C14 (out=shifted) trivially satisfied regardless of limb_shift.
-        for row_idx in operations.len()..num_rows {
+        for row_idx in len..num_rows {
             table.set_bool(row_idx, cols::ZBS, true);
         }
     })

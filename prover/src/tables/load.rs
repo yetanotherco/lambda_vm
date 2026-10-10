@@ -208,9 +208,19 @@ pub fn generate_load_trace_as(
     operations: &[LoadOperation],
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let num_rows = operations.len().next_power_of_two().max(4);
+    generate_load_trace_segments_as(&[operations], form)
+}
+
+/// [`generate_load_trace_as`] over `segments`, the operations one after another: a
+/// chunk handed out as the window parts it lies in.
+pub(crate) fn generate_load_trace_segments_as(
+    segments: &[&[LoadOperation]],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let len: usize = segments.iter().map(|s| s.len()).sum();
+    let num_rows = len.next_power_of_two().max(4);
     generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
-        for (row_idx, op) in operations.iter().enumerate() {
+        for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
             // Input columns
             table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
             table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);

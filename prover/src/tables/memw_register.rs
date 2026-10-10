@@ -224,9 +224,19 @@ pub(crate) fn generate_memw_register_trace_from_rows_as(
     rows: &[RegRow],
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let num_rows = rows.len().next_power_of_two().max(4);
+    generate_memw_register_trace_from_rows_segments_as(&[rows], form)
+}
+
+/// [`generate_memw_register_trace_from_rows_as`] over `segments`, the rows one after another: a
+/// chunk handed out as the window parts it lies in.
+pub(crate) fn generate_memw_register_trace_from_rows_segments_as(
+    segments: &[&[RegRow]],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let len: usize = segments.iter().map(|s| s.len()).sum();
+    let num_rows = len.next_power_of_two().max(4);
     generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
-        for (row_idx, r) in rows.iter().enumerate() {
+        for (row_idx, r) in segments.iter().flat_map(|s| s.iter()).enumerate() {
             // ADDRESS = base_address / 2 (already divided in RegRow).
             table.set_u64(row_idx, cols::ADDRESS, r.address as u64);
             // Timestamp split into lo/hi 32-bit words.

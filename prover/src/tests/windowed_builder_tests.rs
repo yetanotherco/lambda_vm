@@ -892,15 +892,19 @@ fn dropping_the_streamed_ops_holds_less_than_a_chunk_per_table() {
 }
 
 /// The hand-out's stamps count every chunk it handed out, table by table, and
-/// the ops it copied: a CPU chunk whose window lists are each exactly a chunk
-/// moves out whole (none copied); one cut out of windows of 7 cycles is copied
-/// op for op. The tables are the same either way.
+/// the ops it copied. Handed out as the window parts they lie in (the default)
+/// no chunk is copied; under `LAMBDA_VM_HANDOUT_COPY=1` a CPU chunk whose
+/// window lists are each exactly a chunk moves out whole (none copied) and one
+/// cut out of windows of 7 cycles is copied op for op. The tables are the same
+/// every way.
 #[test]
 fn the_handout_stamps_count_each_tables_chunks_and_copies() {
     let max_rows = MaxRowsConfig::small();
     let (program, logs) = run("bench_32k");
     let reference = whole(&program, &logs, &max_rows);
-    for (window, cpu_copied_per_chunk) in [(max_rows.cpu, 0), (7, max_rows.cpu)] {
+    let copies = std::env::var("LAMBDA_VM_HANDOUT_COPY").is_ok_and(|v| v.trim() == "1");
+    for (window, copied_when_copying) in [(max_rows.cpu, 0), (7, max_rows.cpu)] {
+        let cpu_copied_per_chunk = if copies { copied_when_copying } else { 0 };
         let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows)
             .expect("the builder")
             .drop_streamed_ops()

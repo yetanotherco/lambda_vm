@@ -171,9 +171,19 @@ pub fn generate_lt_trace_as(
     operations: &[LtOperation],
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_lt_trace_segments_as(&[operations], form)
+}
+
+/// [`generate_lt_trace_as`] over `segments`, the operations one after another
+/// (deduplicated as their concatenation): a chunk handed out as the window
+/// parts it lies in.
+pub(crate) fn generate_lt_trace_segments_as(
+    segments: &[&[LtOperation]],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     // Deduplicate operations: (lhs, rhs, signed) -> multiplicity
     let mut op_map: OpMap<LtOperation, u64> = OpMap::with_hasher(trace_hash_state());
-    for op in operations {
+    for op in segments.iter().flat_map(|s| s.iter()) {
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
 

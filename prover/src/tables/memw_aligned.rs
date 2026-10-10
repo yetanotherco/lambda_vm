@@ -225,9 +225,19 @@ pub(crate) fn generate_memw_aligned_trace_as(
     operations: &[AlignedRow],
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let num_rows = operations.len().next_power_of_two().max(4);
+    generate_memw_aligned_trace_segments_as(&[operations], form)
+}
+
+/// [`generate_memw_aligned_trace_as`] over `segments`, the operations one after another: a
+/// chunk handed out as the window parts it lies in.
+pub(crate) fn generate_memw_aligned_trace_segments_as(
+    segments: &[&[AlignedRow]],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let len: usize = segments.iter().map(|s| s.len()).sum();
+    let num_rows = len.next_power_of_two().max(4);
     generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
-        for (row_idx, op) in operations.iter().enumerate() {
+        for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
             table.set_bool(row_idx, cols::IS_REGISTER, op.is_register());
 
             table.set_dword_whh(row_idx, cols::BASE_ADDRESS[0], op.base_address());
