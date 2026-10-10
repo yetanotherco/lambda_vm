@@ -1309,6 +1309,12 @@ impl<T: Clone> Tail<T> {
             let (ops, copied) = self.take_copy_counted(n);
             return (Segments::one(ops), copied);
         }
+        (self.take_segments(n), 0)
+    }
+
+    /// The first `n` ops (at most `len`) as the parts they lie in, whatever
+    /// [`handout_copies`] says.
+    fn take_segments(&mut self, n: usize) -> Segments<T> {
         let mut want = n.min(self.len);
         self.len -= want;
         let mut parts = Vec::new();
@@ -1330,7 +1336,7 @@ impl<T: Clone> Tail<T> {
                 want = 0;
             }
         }
-        (Segments { parts }, 0)
+        Segments { parts }
     }
 
     /// The first `n` ops (at most `len`), copied into one list.

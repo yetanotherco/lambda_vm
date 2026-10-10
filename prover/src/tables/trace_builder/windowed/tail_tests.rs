@@ -1,6 +1,7 @@
 //! The hand-out's two ways of taking a chunk out of a tail: as the window
-//! parts it lies in ([`Tail::take`]) and copied into one list
-//! ([`Tail::take_copy`]) give the same ops, and so does what stays behind.
+//! parts it lies in ([`Tail::take_segments`], what [`Tail::take`] does unless
+//! `LAMBDA_VM_HANDOUT_COPY=1`) and copied into one list ([`Tail::take_copy`])
+//! give the same ops, and so does what stays behind.
 
 use super::{Segments, Tail};
 
@@ -42,7 +43,7 @@ fn a_chunk_taken_as_parts_is_the_copied_chunk() {
             }
             let n = [1, 8, 33, 64, 200][rng.below(5) as usize];
             while shared.len >= n && rng.below(4) != 0 {
-                let parts = shared.take(n);
+                let parts = shared.take_segments(n);
                 let copy = copied.take_copy(n);
                 assert_eq!(ops(&parts), copy, "seed {seed}");
                 let reversed: Vec<u64> = parts.iter().rev().copied().collect();
@@ -61,10 +62,10 @@ fn a_chunk_taken_as_parts_is_the_copied_chunk() {
 fn a_straddling_part_is_shared_until_used_up() {
     let mut tail = Tail::new();
     tail.push((0..10u64).collect());
-    let first = tail.take(4);
+    let first = tail.take_segments(4);
     assert_eq!(ops(&first), vec![0, 1, 2, 3]);
     assert_eq!(tail.parts.len(), 1, "the part stays in the tail");
-    let second = tail.take(6);
+    let second = tail.take_segments(6);
     assert_eq!(ops(&second), (4..10).collect::<Vec<_>>());
     assert!(tail.parts.is_empty(), "the part left with the last chunk");
     assert!(std::sync::Arc::ptr_eq(
