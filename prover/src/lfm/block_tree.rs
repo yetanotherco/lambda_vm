@@ -332,7 +332,8 @@ pub struct BlockTreeConfig {
     /// `LFM_TREE_SIBLINGS` (or `LFM_TREE_K`): node proofs at once.
     pub siblings: usize,
     /// The base proof's format ([`super::proof::block_base_options_for`]):
-    /// RPX, today's, unless the caller names another. No knob sets it — the
+    /// [`super::proof::BLOCK_DEFAULT_BASE`] (Poseidon1 at cap 1) unless the
+    /// caller names another, such as RPX. No knob sets it — the
     /// library reads the base from no environment variable; a harness or a
     /// CLI flag maps its own spelling into it. The leaves verify the base
     /// under it ([`super::edsl::WrapHash::for_base`]) and the block verifier
@@ -363,7 +364,7 @@ impl BlockTreeConfig {
             forced_leaves: parse_leaves(var("NOEPOCH_LEAVES").as_deref())?,
             siblings_l0: super::tree_run::tree_siblings_l0()?,
             siblings: super::tree_run::tree_siblings()?,
-            base: stark::proof::options::BaseFormat::RPX,
+            base: super::proof::BLOCK_DEFAULT_BASE,
             program_budget: super::program_budget::setting_from_env()?,
         })
     }
@@ -2284,9 +2285,21 @@ impl BlockTreeProof {
 
 /// ★ A block proof file verified: [`super::block_plan::verify_block_tree`]
 /// over its claimed shape and output and its top proof, under the block
-/// presets, against the trusted `elf_bytes`. Returns the id of the top program
-/// the proof verified against.
+/// presets and the default base ([`super::proof::BLOCK_DEFAULT_BASE`]), against
+/// the trusted `elf_bytes`. Returns the id of the top program the proof
+/// verified against.
 pub fn verify_block_tree_proof(
+    elf_bytes: &[u8],
+    proof: &BlockTreeProof,
+) -> Result<Commitment, String> {
+    verify_block_tree_proof_for(super::proof::BLOCK_DEFAULT_BASE, elf_bytes, proof)
+}
+
+/// [`verify_block_tree_proof`] under the verifier's own `base`. The file does
+/// not name its base: a proof of another base derives another top and is
+/// refused.
+pub fn verify_block_tree_proof_for(
+    base: stark::proof::options::BaseFormat,
     elf_bytes: &[u8],
     proof: &BlockTreeProof,
 ) -> Result<Commitment, String> {
@@ -2294,7 +2307,14 @@ pub fn verify_block_tree_proof(
         proof: proof.top_proof.clone(),
         public_words: proof.top_public_words.clone(),
     };
-    super::block_plan::verify_block_tree(elf_bytes, &proof.shape(), &proof.public_output, &top)
+    super::block_plan::verify_block_tree_for(
+        base,
+        elf_bytes,
+        None,
+        &proof.shape(),
+        &proof.public_output,
+        &top,
+    )
 }
 
 /// What the ELF-constants thread hands back on `ready`: the constants and
@@ -2364,6 +2384,34 @@ mod tests {
             late_trigger(68 * G, 38 * G, 30 * G, settled, true),
             Some("fell")
         );
+    }
+
+    /// The block's default base is Poseidon1 at 4-ary cap 1, under its own
+    /// statement tag, and the tree's config takes it; RPX stays the explicit
+    /// alternative, and every other proof keeps the process format's RPX.
+    #[test]
+    fn the_block_default_base_is_poseidon1_at_cap_1() {
+        use crate::hash_pin::{BaseHash, base_of_hash, checked_base, statement_tag};
+        use stark::proof::options::{BaseFormat, CapPolicy};
+        let base = super::super::proof::BLOCK_DEFAULT_BASE;
+        assert_eq!(base_of_hash(base.hash), BaseHash::P1);
+        assert_eq!(base.arity4_cap, CapPolicy::Fixed(1));
+        let opts = super::super::proof::block_base_options_for(base);
+        assert_eq!(checked_base(&opts.format), Ok(BaseHash::P1));
+        assert!(statement_tag(&opts.format).ends_with(b"/P1W16/C1"));
+        let rpx = super::super::proof::block_base_options_for(BaseFormat::RPX);
+        assert_eq!(checked_base(&rpx.format), Ok(BaseHash::Rpx));
+        assert_eq!(
+            statement_tag(&rpx.format),
+            crate::statement::DOMAIN_TAG.to_vec()
+        );
+        assert_eq!(
+            BlockTreeConfig::from_env()
+                .expect("the harness defaults")
+                .base,
+            base
+        );
+        assert_eq!(crate::zf_format::ZfFormat::DEFAULT.base, BaseFormat::RPX);
     }
 
     /// Every knob reads the harness's defaults when unset, and a value it

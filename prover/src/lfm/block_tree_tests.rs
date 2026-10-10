@@ -2284,8 +2284,8 @@ pub(super) fn assert_top_claims_the_block(top: &RealChild, rb: &RealBlock) {
 
 /// The small block's options: a real format at blowup 4 (every table's LDE pairs
 /// index at least one bit) with two queries, so the leaves stay small. The base
-/// is the harness's (`NOEPOCH_BASE`, `NOEPOCH_P1_CAP`: RPX unset), so the same
-/// suites run a Poseidon1 base's leaves (P3a).
+/// is the harness's (`NOEPOCH_BASE`, `NOEPOCH_P1_CAP`; unset, the block
+/// default, Poseidon1 at cap 1), so the same suites run either base's leaves.
 fn fixture_block_options() -> crate::ProofOptions {
     let mut opts = super::epoch_tests::from_proof_gate_options();
     opts.format.base = crate::tests::noepoch_block_tests::noepoch_harness_options()

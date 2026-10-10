@@ -1065,7 +1065,9 @@ pub fn top_claims(plan: &BlockTreePlan, words: &[(u32, LfmWord)], public_output:
 /// ★ The no-epoch block's verifier, over its tree's top proof: derive the plan
 /// ([`BlockTreePlan::derive`]) and the top program
 /// ([`BlockTreePlan::derive_top`]) under the block presets — the base
-/// under [`super::proof::block_base_options`], the tree under
+/// under [`super::proof::block_base_options_for`] the default base
+/// ([`super::proof::BLOCK_DEFAULT_BASE`]; [`verify_block_tree_for`] names
+/// another, such as RPX), the tree under
 /// [`super::proof::aggregation_wrap_options`], verifier constants, never a
 /// caller's or a prover's — verify `top` against that program, and check that it
 /// publishes the ELF's attestation id and `public_output`. Returns the id of the
@@ -1082,7 +1084,7 @@ pub fn verify_block_tree(
     top: &super::proof::LfmProof,
 ) -> Result<Commitment, String> {
     verify_block_tree_for(
-        stark::proof::options::BaseFormat::RPX,
+        super::proof::BLOCK_DEFAULT_BASE,
         elf_bytes,
         None,
         shape,
@@ -1092,7 +1094,8 @@ pub fn verify_block_tree(
 }
 
 /// [`verify_block_tree`] over ELF constants computed ahead
-/// ([`ElfConstants::compute`] under [`super::proof::block_base_options`]), so a
+/// ([`ElfConstants::compute`] under
+/// `block_base_options_for(BLOCK_DEFAULT_BASE)`), so a
 /// consumer verifying many blocks of one ELF computes them once. Refuses
 /// constants of another ELF or other options, as [`BlockTreePlan::derive_with`]
 /// does.
@@ -1104,7 +1107,7 @@ pub fn verify_block_tree_with(
     top: &super::proof::LfmProof,
 ) -> Result<Commitment, String> {
     verify_block_tree_for(
-        stark::proof::options::BaseFormat::RPX,
+        super::proof::BLOCK_DEFAULT_BASE,
         elf_bytes,
         Some(consts),
         shape,

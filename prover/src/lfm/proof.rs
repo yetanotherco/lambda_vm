@@ -712,6 +712,20 @@ pub fn block_base_options() -> ProofOptions {
     crate::zf_format::ZfFormat::global().base_options(crate::recursion::Preset::Blowup4.options())
 }
 
+/// The block's base hash by default: Poseidon1 at width 16 (ZisK's instance
+/// plus the leaf width tag), chosen to compare with ZisK like for like (Mauro,
+/// 2026-10). RPX stays selectable ([`stark::proof::options::BaseFormat::RPX`]).
+/// Its 4-ary cap is 1 because the leaves walk every cap in the guest. At cap 4
+/// the cap mux costs the leaves +42 % (I-P3 §4.4). The tree's config
+/// ([`super::block_tree::BlockTreeConfig`]), the default block verifier
+/// ([`super::block_plan::verify_block_tree`]) and the CLI default to it; the
+/// process's `ZfFormat` keeps RPX for every other proof.
+pub const BLOCK_DEFAULT_BASE: stark::proof::options::BaseFormat =
+    stark::proof::options::BaseFormat {
+        arity4_cap: stark::proof::options::CapPolicy::Fixed(1),
+        ..stark::proof::options::BaseFormat::P1
+    };
+
 /// [`block_base_options`] with the base proof committed under `base` (the
 /// caller's format, never the environment's): the block tree's base and its
 /// verifier under a Poseidon1 base (P3a). `BaseFormat::RPX` is

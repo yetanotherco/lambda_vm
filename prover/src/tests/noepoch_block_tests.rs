@@ -459,13 +459,18 @@ fn noepoch_p1_proof_is_refused_by_rpx_and_when_tampered() {
 }
 
 /// The harness's options: the block's (`block_base_options`), with the base
-/// format its test environment names. `NOEPOCH_BASE` = `rpx` (unset) or `p1`;
-/// `NOEPOCH_P1_CAP` = `off` or a 4-ary height (unset: 4); `NOEPOCH_P1_NO_TAG=1`
-/// proves and verifies P1 under RPX's statement tag (the pre-tag bytes). Test
-/// code: the library reads no such variable.
+/// format its test environment names. `NOEPOCH_BASE` unset is the library's
+/// block default ([`crate::lfm::proof::BLOCK_DEFAULT_BASE`], Poseidon1 at cap
+/// 1); `rpx`; or `p1` at `NOEPOCH_P1_CAP` = `off` or a 4-ary height (unset: 4,
+/// the base-only harness's height). `NOEPOCH_P1_NO_TAG=1` proves and verifies P1
+/// under RPX's statement tag (the pre-tag bytes). Test code: the library reads
+/// no such variable.
 pub(crate) fn noepoch_harness_options() -> ProofOptions {
     let mut opts = crate::lfm::proof::block_base_options();
-    let base = std::env::var("NOEPOCH_BASE").unwrap_or_else(|_| "rpx".to_string());
+    let Ok(base) = std::env::var("NOEPOCH_BASE") else {
+        opts.format.base = crate::lfm::proof::BLOCK_DEFAULT_BASE;
+        return opts;
+    };
     match base.as_str() {
         "rpx" => {}
         "p1" => {

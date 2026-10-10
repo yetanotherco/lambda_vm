@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use clap::{Parser, Subcommand, ValueHint};
+use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -369,6 +369,11 @@ enum Commands {
         /// (the base digest is taken inside the run's clock: not for timing)
         #[arg(long)]
         digest: bool,
+
+        /// The base proof's hash: Poseidon1 (the default, to compare with
+        /// ZisK) or RPX
+        #[arg(long, value_enum, default_value_t = BlockBase::P1)]
+        base: BlockBase,
     },
 
     /// Verify a block proof produced by `prove-block`
@@ -384,6 +389,10 @@ enum Commands {
         /// Print verification time
         #[arg(long)]
         time: bool,
+
+        /// The base hash the proof was made under (the file does not name it)
+        #[arg(long, value_enum, default_value_t = BlockBase::P1)]
+        base: BlockBase,
     },
 
     /// Count main-trace and aux-trace field elements without proving
@@ -483,8 +492,14 @@ fn main() -> ExitCode {
             output,
             time,
             digest,
-        } => cmd_prove_block(elf, input, output, time, digest),
-        Commands::VerifyBlock { proof, elf, time } => cmd_verify_block(proof, elf, time),
+            base,
+        } => cmd_prove_block(elf, input, output, time, digest, base),
+        Commands::VerifyBlock {
+            proof,
+            elf,
+            time,
+            base,
+        } => cmd_verify_block(proof, elf, time, base),
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
     }
 }
@@ -623,6 +638,42 @@ unsafe fn apply_posture() -> Vec<String> {
     lines
 }
 
+/// A block's base hash, as `prove-block` and `verify-block` name it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum BlockBase {
+    /// Poseidon1 at width 16, 4-ary cap 1: the block default.
+    P1,
+    /// RPX256 over binary trees.
+    Rpx,
+}
+
+impl BlockBase {
+    fn format(self) -> stark::proof::options::BaseFormat {
+        match self {
+            Self::P1 => prover::lfm::proof::BLOCK_DEFAULT_BASE,
+            Self::Rpx => stark::proof::options::BaseFormat::RPX,
+        }
+    }
+
+    /// The `BLOCK BASE` line: the hash, its cap and the statement tag.
+    fn line(self) -> String {
+        let format = self.format();
+        let tag = prover::hash_pin::statement_tag(
+            &prover::lfm::proof::block_base_options_for(format).format,
+        );
+        format!(
+            "BLOCK BASE: {} ({:?}, cap {}) · statement tag {}",
+            match self {
+                Self::P1 => "p1",
+                Self::Rpx => "rpx",
+            },
+            format.hash,
+            format.arity4_cap,
+            String::from_utf8_lossy(&tag)
+        )
+    }
+}
+
 /// `prove-block`'s sink: the driver's lines to stderr, and with `--digest`
 /// the base proof's digest, taken as it proves.
 struct CliSink {
@@ -661,6 +712,7 @@ fn cmd_prove_block(
     output_path: PathBuf,
     time: bool,
     digest: bool,
+    base: BlockBase,
 ) -> ExitCode {
     use prover::lfm::block_tree::{BlockTreeConfig, BlockTreeProof, prove_block_tree};
 
@@ -678,13 +730,15 @@ fn cmd_prove_block(
             return ExitCode::FAILURE;
         }
     };
-    let cfg = match BlockTreeConfig::from_env() {
+    let mut cfg = match BlockTreeConfig::from_env() {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
+    cfg.base = base.format();
+    eprintln!("{}", base.line());
     let sink = std::sync::Arc::new(CliSink {
         digest,
         base_digest: std::sync::Mutex::new(None),
@@ -726,6 +780,7 @@ fn cmd_prove_block(
         "Block proof written to {output_path:?} ({} bytes)",
         bytes.len()
     );
+    println!("{}", base.line());
     println!("Top program id: {top_id}");
     println!("Output: {output_hex}");
     if let Some(line) = sink
@@ -745,8 +800,13 @@ fn cmd_prove_block(
     ExitCode::SUCCESS
 }
 
-fn cmd_verify_block(proof_path: PathBuf, elf_path: PathBuf, time: bool) -> ExitCode {
-    use prover::lfm::block_tree::{BlockTreeProof, verify_block_tree_proof};
+fn cmd_verify_block(
+    proof_path: PathBuf,
+    elf_path: PathBuf,
+    time: bool,
+    base: BlockBase,
+) -> ExitCode {
+    use prover::lfm::block_tree::{BlockTreeProof, verify_block_tree_proof_for};
 
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -770,13 +830,14 @@ fn cmd_verify_block(proof_path: PathBuf, elf_path: PathBuf, time: bool) -> ExitC
         }
     };
     drop(bytes);
-    eprintln!("Verifying block proof...");
+    eprintln!("Verifying block proof under {}...", base.line());
     let start = Instant::now();
-    let result = verify_block_tree_proof(&elf_data, &proof);
+    let result = verify_block_tree_proof_for(base.format(), &elf_data, &proof);
     let verify_elapsed = start.elapsed();
     match result {
         Ok(top_id) => {
             eprintln!("Verification succeeded!");
+            println!("{}", base.line());
             println!("Top program id: {}", hex(&top_id));
             println!("Output: {}", hex(&proof.public_output));
             if time {
@@ -1620,6 +1681,49 @@ fn parse_epoch_size_log2(value: &str) -> Result<u32, String> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// `prove-block` and `verify-block` default to the block's default base,
+    /// Poseidon1 at cap 1, and `--base rpx` selects RPX.
+    #[test]
+    fn the_block_commands_default_to_poseidon1_and_take_rpx() {
+        let base = |args: &[&str]| match Cli::try_parse_from(args).expect("parses").command {
+            Commands::ProveBlock { base, .. } | Commands::VerifyBlock { base, .. } => base,
+            _ => unreachable!("a block command"),
+        };
+        assert_eq!(
+            base(&["cli", "prove-block", "g.elf", "-o", "p.bin"]),
+            BlockBase::P1
+        );
+        assert_eq!(
+            base(&[
+                "cli",
+                "prove-block",
+                "g.elf",
+                "-o",
+                "p.bin",
+                "--base",
+                "rpx"
+            ]),
+            BlockBase::Rpx
+        );
+        assert_eq!(
+            base(&["cli", "verify-block", "p.bin", "g.elf"]),
+            BlockBase::P1
+        );
+        assert_eq!(
+            base(&["cli", "verify-block", "p.bin", "g.elf", "--base", "rpx"]),
+            BlockBase::Rpx
+        );
+        assert_eq!(
+            BlockBase::P1.format(),
+            prover::lfm::proof::BLOCK_DEFAULT_BASE
+        );
+        assert_eq!(
+            BlockBase::Rpx.format(),
+            stark::proof::options::BaseFormat::RPX
+        );
+        assert!(BlockBase::P1.line().contains("/P1W16/C1"));
+    }
 
     // The arg graph is well-formed (e.g. `requires`/`conflicts_with` reference real args).
     #[test]
