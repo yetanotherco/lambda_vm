@@ -662,7 +662,9 @@ fn cmd_prove_block(
     time: bool,
     digest: bool,
 ) -> ExitCode {
-    use prover::lfm::block_tree::{BlockTreeConfig, BlockTreeProof, prove_block_tree};
+    use prover::lfm::block_tree::{
+        BlockTreeConfig, BlockTreeProof, block_hash_line, prove_block_tree,
+    };
 
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -689,6 +691,7 @@ fn cmd_prove_block(
         digest,
         base_digest: std::sync::Mutex::new(None),
     });
+    eprintln!("{}", block_hash_line());
     let run = match prove_block_tree(&elf_data, &input, &cfg, sink.clone()) {
         Ok(run) => run,
         Err(e) => {
@@ -726,6 +729,7 @@ fn cmd_prove_block(
         "Block proof written to {output_path:?} ({} bytes)",
         bytes.len()
     );
+    println!("{}", block_hash_line());
     println!("Top program id: {top_id}");
     println!("Output: {output_hex}");
     if let Some(line) = sink
@@ -746,7 +750,7 @@ fn cmd_prove_block(
 }
 
 fn cmd_verify_block(proof_path: PathBuf, elf_path: PathBuf, time: bool) -> ExitCode {
-    use prover::lfm::block_tree::{BlockTreeProof, verify_block_tree_proof};
+    use prover::lfm::block_tree::{BlockTreeProof, block_hash_line, verify_block_tree_proof};
 
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -771,6 +775,8 @@ fn cmd_verify_block(proof_path: PathBuf, elf_path: PathBuf, time: bool) -> ExitC
     };
     drop(bytes);
     eprintln!("Verifying block proof...");
+    // The verifier's own proof system: the file names none.
+    println!("{}", block_hash_line());
     let start = Instant::now();
     let result = verify_block_tree_proof(&elf_data, &proof);
     let verify_elapsed = start.elapsed();

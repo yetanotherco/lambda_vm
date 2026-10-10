@@ -2281,6 +2281,22 @@ impl BlockTreeProof {
     }
 }
 
+/// The block pin as the line the CLI prints beside a block proof: the hash, the
+/// base's and the LFM proofs' 4-ary caps, and both statements' leading tags.
+/// One line, so a reader of a run's log knows which proof system made it.
+pub fn block_hash_line() -> String {
+    let base = super::proof::block_tree_base_options();
+    let lfm = super::proof::block_tree_options();
+    format!(
+        "BLOCK HASH: {:?} · base cap {} · LFM cap {} · statement tags {} · {}",
+        base.format.base.hash,
+        base.format.base.arity4_cap,
+        lfm.format.base.arity4_cap,
+        String::from_utf8_lossy(&crate::hash_pin::statement_tag(&base.format)),
+        String::from_utf8_lossy(&crate::hash_pin::lfm_statement_tag(&lfm.format)),
+    )
+}
+
 /// ★ A block proof file verified: [`super::block_plan::verify_block_tree`]
 /// over its claimed shape and output and its top proof, under the block
 /// presets, against the trusted `elf_bytes`. Returns the id of the top program
@@ -2315,6 +2331,21 @@ type BesideResult = (
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CLI's line names the block pin: Poseidon1, the base at cap 1, the
+    /// LFM proofs at the pin's cap, and both tags.
+    #[test]
+    fn the_block_hash_line_names_the_pin() {
+        let line = block_hash_line();
+        let c = crate::hash_pin::BLOCK_LFM_CAP;
+        assert_eq!(
+            line,
+            format!(
+                "BLOCK HASH: Poseidon1 · base cap 1 · LFM cap {c} · statement tags \
+                 LAMBDAVM_STARK_STATEMENT_V5/P1W16/C1 · LAMBDAVM_LFM_STATEMENT_V1/P1W16/C{c}"
+            )
+        );
+    }
 
     /// The default emits late only above its floor, a margin forces it, `off`
     /// never.
