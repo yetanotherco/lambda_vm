@@ -32,6 +32,10 @@ struct GateState {
     released: usize,
     /// The most bytes held at once.
     most: usize,
+    /// The seconds acquirers waited for room, summed over them, and how many
+    /// acquisitions waited.
+    waited: f64,
+    waits: usize,
     /// Why the gate stopped, once it has.
     stopped: Option<String>,
 }
@@ -76,12 +80,18 @@ impl ByteGate {
     /// lowest not yet released, and holds them. An error once the gate stops.
     pub(crate) fn acquire(&self, table: usize, bytes: usize) -> Result<(), Error> {
         let mut state = self.state();
+        let mut since: Option<std::time::Instant> = None;
         loop {
             state.check()?;
             if state.admits(self.budget, table, bytes) {
                 state.admit(table, bytes);
+                if let Some(since) = since {
+                    state.waited += since.elapsed().as_secs_f64();
+                    state.waits += 1;
+                }
                 return Ok(());
             }
+            since.get_or_insert_with(std::time::Instant::now);
             state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
@@ -134,6 +144,14 @@ impl ByteGate {
         self.state().most
     }
 
+    /// The seconds acquirers waited for room, summed over them, and how many
+    /// acquisitions waited (a measurement: the finish's time not spent
+    /// building).
+    pub(crate) fn waited(&self) -> (f64, usize) {
+        let state = self.state();
+        (state.waited, state.waits)
+    }
+
     pub(crate) fn budget(&self) -> usize {
         self.budget
     }
@@ -167,12 +185,15 @@ mod tests {
 
     /// A table over the budget is admitted when it is the lowest not yet
     /// released, and the next waits until it is placed (within a timeout: a
-    /// gate that never admits fails the test instead of hanging the suite).
+    /// gate that never admits fails the test instead of hanging the suite);
+    /// the gate counts that one wait and its time, not the acquisition that
+    /// did not wait.
     #[test]
     fn the_lowest_pending_table_is_admitted_over_the_budget() {
         let done = within(20, || {
             let gate = Arc::new(ByteGate::new(10));
             gate.acquire(0, 100).expect("the lowest pending table");
+            assert_eq!(gate.waited(), (0.0, 0), "no wait yet");
             assert!(!gate.try_acquire(1, 1).expect("not stopped"));
             let waiter = {
                 let gate = Arc::clone(&gate);
@@ -185,9 +206,12 @@ mod tests {
                 .join()
                 .expect("joined")
                 .expect("admitted once table 0 is placed");
-            gate.most()
+            (gate.most(), gate.waited())
         });
-        assert_eq!(done, Some(100), "the lowest pending table must be admitted");
+        let (most, (waited, waits)) = done.expect("the lowest pending table must be admitted");
+        assert_eq!(most, 100);
+        assert_eq!(waits, 1, "one acquisition waited");
+        assert!(waited >= 0.04, "it waited {waited} s for table 0's release");
     }
 
     /// Tables under the budget go in together; the held bytes follow the

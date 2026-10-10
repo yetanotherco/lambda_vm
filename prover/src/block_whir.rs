@@ -3980,9 +3980,11 @@ fn prove_streamed(
                     }
                     let rest_regen = emitted?;
                     let g = |b: usize| b as f64 / (1u64 << 30) as f64;
+                    let (waited, waits) = rest_gate.waited();
                     eprintln!(
                         "BLOCK REST STREAM: the rest built in waves under a {:.2} GiB gate, held at most \
-                         {:.2} GiB (built and not yet placed)",
+                         {:.2} GiB (built and not yet placed) · {waits} acquisitions waited {waited:.2}s \
+                         for room (summed)",
                         g(rest_gate.budget()),
                         g(rest_gate.most()),
                     );
@@ -5569,6 +5571,56 @@ mod rest_order_tests {
         assert!(
             format!("{err:?}").contains("past the run's 1 tables"),
             "{err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod producer_report_tests {
+    use super::{BlockStamps, ProducerStamps, StreamTable};
+
+    /// The readout's two producer lines: what each thread waited on, and the
+    /// hand-out table by table, only the tables that handed a chunk out (the
+    /// box gates parse these lines).
+    #[test]
+    fn the_report_says_what_the_producer_waited_on() {
+        let mut stamps = BlockStamps {
+            streamed: (29.23, 558),
+            producer: ProducerStamps {
+                executor_send: 24.1,
+                walker_recv: 0.4,
+                walker_send: 11.9,
+                accumulator_recv: 1.2,
+                accumulator_send: 1.55,
+                layout_send: 20.3,
+                worker_permit: 40.2,
+                worker_recv: 15.7,
+            },
+            ..BlockStamps::default()
+        };
+        let h = &mut stamps.windows.handout;
+        let (cpu, store) = (StreamTable::Cpu.position(), StreamTable::Store.position());
+        (h.take[cpu], h.count[cpu], h.chunks[cpu], h.copied[cpu]) = (6.5, 1.86, 142, 297_795_584);
+        (h.take[store], h.count[store], h.chunks[store]) = (0.05, 0.35, 15);
+        let report = stamps.report();
+        let line = |prefix: &str| {
+            report
+                .lines()
+                .find(|l| l.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no {prefix} line in\n{report}"))
+                .to_string()
+        };
+        assert_eq!(
+            line("BLOCK PRODUCER:"),
+            "BLOCK PRODUCER: executor send-blocked 24.10s · walker recv-wait 0.40s send-blocked \
+             11.90s · accumulator recv-wait 1.20s send-blocked 1.55s · layout hand-on blocked \
+             20.30s · workers permit-wait 40.20s recv-wait 15.70s (summed)"
+        );
+        assert_eq!(
+            line("BLOCK HANDOUT:"),
+            "BLOCK HANDOUT: take 6.55s · count 2.21s · copied 297.8 M ops || per table (take s · \
+             count s · chunks · copied ops): CPU 6.50 · 1.86 · 142 · 297.8 M | STORE 0.05 · 0.35 · \
+             15 · 0.0 M"
         );
     }
 }
