@@ -854,7 +854,13 @@ fn publics_only_program(count: usize) -> LfmProgram {
     let arena = b.declare_arena(8 * count as u32);
     let words = hint_public_words(&mut b, arena, count);
     let mut t = TranscriptReplay::new(&[]);
-    emit_lfm_statement(&mut t, &ZERO_ROOT, &words, 8);
+    emit_lfm_statement(
+        &mut t,
+        super::statement::LFM_STATEMENT_TAG,
+        &ZERO_ROOT,
+        &words,
+        8,
+    );
     let (z, alpha) = replay_phase_a(&mut t, &mut b, &[]);
     let target = emit_public_balance(&mut b, &words, z, alpha);
     b.public(target.as_cell());
@@ -1066,6 +1072,7 @@ pub(super) fn child_shape(c: &RealChild) -> super::per_table_aggregator::ChildSh
         program_id: &c.artifacts.program_id,
         num_public_words: c.public_words.len(),
         fri_final_poly_log_degree: c.opts.fri_final_poly_log_degree,
+        statement_tag: super::statement::LFM_STATEMENT_TAG,
         tables: c
             .tables
             .iter()

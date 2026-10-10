@@ -319,6 +319,7 @@ fn under_mask(artifacts: &LfmArtifacts, chip_set: ChipSet) -> LfmArtifacts {
         &artifacts.blake3_chunk_log_heights,
         &artifacts.hash_chunk_roots,
         &artifacts.hash_chunk_log_heights,
+        artifacts.commitment,
     );
     out
 }
@@ -529,6 +530,7 @@ fn an_unsplit_hash_keeps_the_program_digest() {
             &a.blake3_chunk_log_heights,
             roots,
             heights,
+            a.commitment,
         )
     };
     let legacy = lfm_program_id(

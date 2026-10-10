@@ -471,6 +471,9 @@ impl<'p> BuildPlan<'p> {
         // and the mask decides what a proof carries, exactly where it always did:
         // `ChipSet::num_airs` and `LfmAirs::air_refs`.
 
+        // The hash the walk committed with (`commit` dispatches on the same
+        // configuration), named in the id.
+        let commitment = crate::hash_pin::commitment_of(&options.format);
         let program_id = lfm_program_id_chunked(
             &roots,
             &log_heights,
@@ -481,6 +484,7 @@ impl<'p> BuildPlan<'p> {
             &blake3_chunk_log_heights,
             &hash_chunk_roots,
             &hash_chunk_log_heights,
+            commitment,
         );
         let one_row_roots = walked
             .one_row
@@ -494,6 +498,7 @@ impl<'p> BuildPlan<'p> {
             hash_chunk_roots,
             hash_chunk_log_heights,
             hasher,
+            commitment,
             chip_set,
             program_id,
             one_row_roots,

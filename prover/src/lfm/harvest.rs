@@ -68,6 +68,7 @@ pub(crate) struct HostTable {
 /// A sub-proof inside a multi-table proof, read into [`HostTable`]: the fork
 /// is already positioned (separator, aux root and `L` absorbed), so the oracle
 /// comes from `replay_rounds_after_round_1` on THAT transcript.
+#[cfg(test)]
 pub(crate) fn host_table_forked(
     air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
     view: StarkProofView<'_, Gl, Ext3, ()>,
@@ -230,6 +231,7 @@ fn check_eq<T: PartialEq + std::fmt::Debug>(got: T, want: T, what: &str) -> Resu
 /// verifier for the reason the arena schema makes it one: the program is emitted
 /// for a specific epoch shape, and a proof whose trace length disagreed would
 /// not match the arenas it declares.
+#[cfg(test)]
 pub(crate) fn build_table_legs(
     air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
     view: StarkProofView<'_, Gl, Ext3, ()>,
@@ -652,14 +654,24 @@ pub(crate) struct HarvestedChild {
 
 /// [`harvest_child`], after verifying the proof against its artifacts, and the
 /// seconds that verify cost: a child read from a proof production would reject
-/// describes nothing, so a refusal is an error.
+/// describes nothing, so a refusal is an error. Under the legacy pin;
+/// [`harvest_child_verified_under`] names the configuration.
 pub(crate) fn harvest_child_verified(
     artifacts: super::registry::LfmArtifacts,
     opts: crate::ProofOptions,
     proved: &super::proof::LfmProof,
 ) -> Result<(HarvestedChild, f64), String> {
+    harvest_child_verified_under::<crate::hash_pin::Legacy>(artifacts, opts, proved)
+}
+
+/// [`harvest_child_verified`] for a child committed under the configuration `C`.
+pub(crate) fn harvest_child_verified_under<C: crate::hash_pin::BlockHash>(
+    artifacts: super::registry::LfmArtifacts,
+    opts: crate::ProofOptions,
+    proved: &super::proof::LfmProof,
+) -> Result<(HarvestedChild, f64), String> {
     let t_verify = std::time::Instant::now();
-    if !super::proof::verify_against_artifacts(
+    if !super::proof::verify_against_artifacts_under::<C>(
         &artifacts,
         &proved.proof,
         &proved.public_words,
@@ -668,19 +680,36 @@ pub(crate) fn harvest_child_verified(
         return Err("the child proof does not verify against its artifacts".to_string());
     }
     let verify_secs = t_verify.elapsed().as_secs_f64();
-    Ok((harvest_child(artifacts, opts, proved)?, verify_secs))
+    Ok((
+        harvest_child_under::<C>(artifacts, opts, proved)?,
+        verify_secs,
+    ))
 }
 
 /// A child proof read without its verify, for a caller that verifies the same
 /// proof elsewhere and fails the run on a refusal before it reports anything
-/// (the block tree's children, verified beside the timed path).
+/// (the block tree's children, verified beside the timed path). Under the
+/// legacy pin; [`harvest_child_under`] names the configuration.
 pub(crate) fn harvest_child(
+    artifacts: super::registry::LfmArtifacts,
+    opts: crate::ProofOptions,
+    proved: &super::proof::LfmProof,
+) -> Result<HarvestedChild, String> {
+    harvest_child_under::<crate::hash_pin::Legacy>(artifacts, opts, proved)
+}
+
+/// [`harvest_child`] for a child committed under the configuration `C`: its
+/// transcript and LFM statement tag, its verifier's replay, and each query's
+/// leaf index for the arity-4 paths (`build_table_legs_at`).
+pub(crate) fn harvest_child_under<C: crate::hash_pin::BlockHash>(
     artifacts: super::registry::LfmArtifacts,
     opts: crate::ProofOptions,
     proved: &super::proof::LfmProof,
 ) -> Result<HarvestedChild, String> {
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     use stark::proof::view::MultiProofView;
+
+    super::proof::check_configuration::<C>(artifacts.commitment, &opts)?;
 
     // The AIR set the artifacts describe — `KECCAK_RND`/`LFM_BLAKE3` chunks, the
     // `LFM_HASH` chunks and (S2) the one-row preprocessed roots, exactly
@@ -694,9 +723,10 @@ pub(crate) fn harvest_child(
     // The seed IS `verify_against_chunked`'s: the LFM statement over the claimed
     // words, and nothing before it.
     let seed = || {
-        let mut t = crate::hash_pin::legacy_transcript(&[]);
+        let mut t = C::transcript(&[]);
         super::statement::absorb_lfm_statement(
             &mut t,
+            &C::lfm_statement_tag(&opts.format),
             &artifacts.program_id,
             &proved.public_words,
             opts.fri_final_poly_log_degree,
@@ -732,13 +762,18 @@ pub(crate) fn harvest_child(
             if let Some(c) = v.bus_table_contribution() {
                 fork.append_field_element(&c);
             }
-            host_table_forked(*air, v, idx, num_tables, &mut fork, &lookup)
+            host_table_forked_under::<C>(*air, v, idx, num_tables, &mut fork, &lookup)
         })
         .collect::<Result<Vec<_>, String>>()?;
+    // Each query's leaf index from the fork's replay: an arity-4 path is laid
+    // out at it (the walk's hint order); a binary one ignores it.
     let legs = refs
         .iter()
+        .zip(&tables)
         .enumerate()
-        .map(|(idx, air)| build_table_legs(*air, view.get(idx), &lookup))
+        .map(|(idx, (air, table))| {
+            build_table_legs_at(*air, view.get(idx), &lookup, Some(&table.iotas))
+        })
         .collect::<Result<Vec<_>, String>>()?;
 
     Ok(HarvestedChild {

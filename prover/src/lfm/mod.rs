@@ -202,6 +202,8 @@ mod p1w16_proof_tests;
 #[cfg(test)]
 mod p1w16_socket_tests;
 #[cfg(test)]
+mod p3b_lfm_tests;
+#[cfg(test)]
 mod per_table_aggregator_tests;
 #[cfg(test)]
 mod per_table_census_tests;

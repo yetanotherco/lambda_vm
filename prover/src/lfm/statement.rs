@@ -37,9 +37,11 @@ const LFM_BLAKE3_CHUNK_TAG: &[u8] = b"LAMBDAVM_LFM_BLAKE3_CHUNKS_V1";
 
 /// Domain tag of the `LFM_HASH` chunk tail in [`lfm_program_id_chunked`].
 const LFM_HASH_CHUNK_TAG: &[u8] = b"LAMBDAVM_LFM_HASH_CHUNKS_V1";
-/// `pub(super)`: the aggregation layer's emitted verifier replays
-/// [`absorb_lfm_statement`] byte for byte and needs the same tag bytes.
-pub(super) const LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1";
+/// The legacy LFM statement's leading tag, and the prefix of every other
+/// configuration's (`hash_pin::BlockHash::lfm_statement_tag`): the aggregation
+/// layer's emitted verifier replays [`absorb_lfm_statement`] byte for byte and
+/// needs the same tag bytes.
+pub(crate) const LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1";
 
 /// The byte that names a commitment hash inside [`lfm_program_id`].
 ///
@@ -95,10 +97,10 @@ pub(crate) const fn commitment_hash_tag(hash: CommitmentHash) -> u8 {
 /// "says which" are different properties, and only the second one lets a
 /// mismatch be reported as *what it is* rather than as an unrecognised root.
 ///
-/// It is read from the global rather than taken as a parameter because the three
-/// commit helpers in `registry.rs` are hard-wired to `stark`'s default aliases,
-/// which is exactly what `stark::config::COMMITMENT_HASH` names. Should those
-/// helpers ever become generic over `H`, this read moves with them.
+/// This form names the LEGACY pin's commitment hash, the hash `LFM_REGISTRY`'s
+/// roots are built with. A program whose roots were committed under another
+/// configuration takes [`lfm_program_id_chunked`] with that hash, which the
+/// artifact build reads off its options (`hash_pin::commitment_of`).
 #[allow(clippy::too_many_arguments)]
 pub fn lfm_program_id(
     roots: &[Commitment; NUM_LFM_CHIPS],
@@ -119,6 +121,7 @@ pub fn lfm_program_id(
         blake3_chunk_log_heights,
         &[],
         &[],
+        crate::hash_pin::LEGACY_COMMITMENT_HASH,
     )
 }
 
@@ -127,6 +130,9 @@ pub fn lfm_program_id(
 /// slot 5's own entry. A one-chunk (or empty) list absorbs NOTHING, so an
 /// unsplit program keeps the digest it always had; a split one absorbs chunks
 /// 1.. as a length-prefixed tail under its own tag, after the `LFM_BLAKE3` tail.
+/// `commitment` is the hash the roots were committed with, named by its tag
+/// ([`commitment_hash_tag`]): the legacy pin's for the registry, Poseidon1 for
+/// the block's programs.
 #[allow(clippy::too_many_arguments)]
 pub fn lfm_program_id_chunked(
     roots: &[Commitment; NUM_LFM_CHIPS],
@@ -138,13 +144,14 @@ pub fn lfm_program_id_chunked(
     blake3_chunk_log_heights: &[u8],
     hash_chunk_roots: &[Commitment],
     hash_chunk_log_heights: &[u8],
+    commitment: CommitmentHash,
 ) -> Commitment {
     let mut h = Keccak256::new();
     h.update(LFM_PROGRAM_TAG);
     h.update(LFM_MACHINE_VERSION.to_le_bytes());
     h.update(LFM_PRESET_TAG.to_le_bytes());
     h.update([hasher.as_tag()]);
-    h.update([commitment_hash_tag(crate::hash_pin::LEGACY_COMMITMENT_HASH)]);
+    h.update([commitment_hash_tag(commitment)]);
     // ★ The chip set is program shape and is bound by NAME, for the reason the
     // commitment hash is: the roots of an absent family are still in the array
     // (a hole, like KECCAK_RND's), so nothing else in this digest distinguishes
@@ -210,9 +217,11 @@ pub fn lfm_program_id_chunked(
     h.finalize().into()
 }
 
-/// Binds the LFM statement: program identity, machine version, the claimed
-/// public words and the FRI terminal degree. Exhaustive by construction —
-/// extending the statement means extending this function, in one place.
+/// Binds the LFM statement: its configuration's tag (`tag`,
+/// `hash_pin::BlockHash::lfm_statement_tag`: [`LFM_STATEMENT_TAG`] under the
+/// legacy pin), program identity, machine version, the claimed public words and
+/// the FRI terminal degree. Exhaustive by construction — extending the statement
+/// means extending this function, in one place.
 ///
 /// Generic over the transcript because the statement bind is hash-agnostic: it
 /// only absorbs, so it is the same sequence of `append_bytes` calls whichever
@@ -222,11 +231,12 @@ pub fn lfm_program_id_chunked(
 /// "exhaustive by construction" note above exists to prevent.
 pub fn absorb_lfm_statement(
     transcript: &mut impl IsTranscript<E>,
+    tag: &[u8],
     program_id: &Commitment,
     public_words: &[(u32, LfmWord)],
     fri_final_poly_log_degree: u8,
 ) {
-    transcript.append_bytes(LFM_STATEMENT_TAG);
+    transcript.append_bytes(tag);
     transcript.append_bytes(program_id);
     transcript.append_bytes(&LFM_MACHINE_VERSION.to_le_bytes());
     transcript.append_bytes(&(public_words.len() as u64).to_le_bytes());

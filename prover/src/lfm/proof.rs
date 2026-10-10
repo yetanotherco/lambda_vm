@@ -100,7 +100,9 @@ pub enum LfmProveError {
     Prover(ProvingError),
 }
 
-/// Proves under the permutation `artifacts` was built for.
+/// Proves under the permutation `artifacts` was built for, committed under the
+/// legacy pin ([`crate::hash_pin::Legacy`]). The block's programs prove through
+/// [`lfm_prove_under`] at [`crate::hash_pin::Block`].
 ///
 /// The hasher comes from the artifacts rather than from a default, because
 /// `artifacts.program_id` is derived from it: taking it from anywhere else
@@ -112,6 +114,26 @@ pub fn lfm_prove(
     options: &ProofOptions,
 ) -> Result<LfmProof, LfmProveError> {
     lfm_prove_with_hasher(program, artifacts, arenas, options, artifacts.hasher)
+}
+
+/// [`lfm_prove`] with the proof committed, transcribed and ground under the
+/// configuration `C` — a type the caller names, never the options' or the
+/// proof's. `options` and `artifacts` must name `C`'s hash (a typed refusal
+/// otherwise, [`check_configuration`]).
+pub fn lfm_prove_under<C: crate::hash_pin::BlockHash>(
+    program: &LfmProgram,
+    artifacts: &LfmArtifacts,
+    arenas: &[Vec<LfmWord>],
+    options: &ProofOptions,
+) -> Result<LfmProof, LfmProveError> {
+    lfm_prove_with_residency_under::<C>(
+        program,
+        artifacts,
+        arenas,
+        options,
+        artifacts.hasher,
+        decide_lfm_residency(),
+    )
 }
 
 /// [`lfm_prove`] with the `LFM_HASH` permutation named explicitly at the call
@@ -164,8 +186,22 @@ pub(crate) fn lfm_prove_with_residency(
     hasher: HasherKind,
     residency: ResidencyMode,
 ) -> Result<LfmProof, LfmProveError> {
+    lfm_prove_with_residency_under::<crate::hash_pin::Legacy>(
+        program, artifacts, arenas, options, hasher, residency,
+    )
+}
+
+/// [`lfm_prove_with_residency`] under the configuration `C`.
+pub(crate) fn lfm_prove_with_residency_under<C: crate::hash_pin::BlockHash>(
+    program: &LfmProgram,
+    artifacts: &LfmArtifacts,
+    arenas: &[Vec<LfmWord>],
+    options: &ProofOptions,
+    hasher: HasherKind,
+    residency: ResidencyMode,
+) -> Result<LfmProof, LfmProveError> {
     let prepared = lfm_prepare(program, arenas, hasher)?;
-    prove_prepared(artifacts, prepared, options, residency)
+    prove_prepared::<C>(artifacts, prepared, options, residency)
 }
 
 /// A program executed and its traces filled: everything a prove needs except
@@ -261,10 +297,10 @@ pub fn lfm_prove_prepared(
          program_id binds the hasher, so the two must agree",
         artifacts.hasher, prepared.hasher
     );
-    prove_prepared(artifacts, prepared, options, decide_lfm_residency())
+    prove_prepared::<crate::hash_pin::Legacy>(artifacts, prepared, options, decide_lfm_residency())
 }
 
-fn prove_prepared(
+fn prove_prepared<C: crate::hash_pin::BlockHash>(
     artifacts: &LfmArtifacts,
     prepared: LfmPrepared,
     options: &ProofOptions,
@@ -280,7 +316,7 @@ fn prove_prepared(
     } = prepared;
     let t = Instant::now();
     let waited_before = super::device_permit::waited_secs();
-    let proof = prove_traces_with_hasher(
+    let proof = prove_traces_under::<C>(
         artifacts,
         &mut traces,
         &public_words,
@@ -343,6 +379,10 @@ pub(crate) fn prove_traces(
 /// recompute changes how long an LDE lives, never a byte the transcript absorbs
 /// — so threading them through the prove signature would put knobs with no wire
 /// meaning in front of every caller.
+///
+/// Committed under the legacy pin; [`prove_traces_under`] names the
+/// configuration.
+#[cfg(test)]
 pub(crate) fn prove_traces_with_hasher(
     artifacts: &LfmArtifacts,
     traces: &mut LfmTraces,
@@ -351,6 +391,53 @@ pub(crate) fn prove_traces_with_hasher(
     hasher: HasherKind,
     residency: ResidencyMode,
 ) -> Result<MultiProof<F, E, ()>, ProvingError> {
+    prove_traces_under::<crate::hash_pin::Legacy>(
+        artifacts,
+        traces,
+        public_words,
+        options,
+        hasher,
+        residency,
+    )
+}
+
+/// The configuration `C` an LFM proof is made or checked under must be the
+/// one its options name ([`crate::hash_pin::checked_base`]) and the one its
+/// artifacts' roots were committed with (`LfmArtifacts::commitment`). Every
+/// LFM prove and verify checks it first: a mismatch would pair roots built by
+/// one hash with trees and a transcript of another.
+pub(crate) fn check_configuration<C: crate::hash_pin::BlockHash>(
+    commitment: stark::config::CommitmentHash,
+    options: &ProofOptions,
+) -> Result<(), String> {
+    let named = crate::hash_pin::checked_base(&options.format)?;
+    if named != C::BASE {
+        return Err(format!(
+            "an LFM proof under {:?} was given options whose format names {named:?}",
+            C::BASE
+        ));
+    }
+    let hash = <C::H as stark::config::StarkHash>::COMMITMENT_HASH;
+    if commitment != hash {
+        return Err(format!(
+            "an LFM proof committed under {hash:?} was given roots committed under {commitment:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// [`prove_traces_with_hasher`] under the configuration `C`: its transcript,
+/// its LFM statement tag and its commitment configuration.
+pub(crate) fn prove_traces_under<C: crate::hash_pin::BlockHash>(
+    artifacts: &LfmArtifacts,
+    traces: &mut LfmTraces,
+    public_words: &[(u32, LfmWord)],
+    options: &ProofOptions,
+    hasher: HasherKind,
+    residency: ResidencyMode,
+) -> Result<MultiProof<F, E, ()>, ProvingError> {
+    check_configuration::<C>(artifacts.commitment, options)
+        .map_err(ProvingError::WrongParameter)?;
     // ⛔ THE CARD, FOR THE SECOND OF A PROOF'S TWO DEVICE PHASES. Inert unless
     // a driver has armed it, and then exclusive: `multi_prove` builds its own
     // full-budget `VramGate`, so two of them in flight would budget the card
@@ -373,16 +460,15 @@ pub(crate) fn prove_traces_with_hasher(
     if let Some(one_row) = &artifacts.one_row_roots {
         airs = airs.with_one_row_roots(one_row);
     }
-    let mut transcript = crate::hash_pin::legacy_transcript(&[]);
+    let mut transcript = C::transcript(&[]);
     absorb_lfm_statement(
         &mut transcript,
+        &C::lfm_statement_tag(&options.format),
         &artifacts.program_id,
         public_words,
         options.fri_final_poly_log_degree,
     );
-    crate::hash_pin::require_rpx_base("the LFM prover", options)
-        .map_err(ProvingError::WrongParameter)?;
-    crate::hash_pin::LegacyProver::<F, E, ()>::multi_prove(
+    crate::hash_pin::BlockProverOf::<C, F, E, ()>::multi_prove(
         airs.air_trace_pairs(traces),
         &mut transcript,
         #[cfg(feature = "disk-spill")]
@@ -445,7 +531,26 @@ pub fn verify_against_artifacts(
     claimed_public: &[(u32, LfmWord)],
     options: &ProofOptions,
 ) -> bool {
-    verify_against_chunked_with(
+    verify_against_artifacts_under::<crate::hash_pin::Legacy>(
+        artifacts,
+        proof,
+        claimed_public,
+        options,
+    )
+}
+
+/// [`verify_against_artifacts`] under the configuration `C`, which the caller
+/// names: a proof is refused unless `options` and `artifacts` name `C`'s hash
+/// ([`check_configuration`]), and it is then checked on `C`'s transcript, with
+/// `C`'s LFM statement tag and `C`'s verifier.
+pub fn verify_against_artifacts_under<C: crate::hash_pin::BlockHash>(
+    artifacts: &LfmArtifacts,
+    proof: &MultiProof<F, E, ()>,
+    claimed_public: &[(u32, LfmWord)],
+    options: &ProofOptions,
+) -> bool {
+    verify_against_chunked_with::<C>(
+        artifacts.commitment,
         artifacts.one_row_roots.as_ref(),
         &artifacts.roots,
         &artifacts.blake3_chunk_roots,
@@ -529,7 +634,10 @@ pub fn verify_against_chunked(
     hasher: HasherKind,
     chip_set: ChipSet,
 ) -> bool {
-    verify_against_chunked_with(
+    // Roots handed in loose are the legacy pin's: the registry's, and every
+    // test program's built under legacy options.
+    verify_against_chunked_with::<crate::hash_pin::Legacy>(
+        crate::hash_pin::LEGACY_COMMITMENT_HASH,
         None,
         roots,
         blake3_roots,
@@ -549,9 +657,11 @@ pub fn verify_against_chunked(
 
 /// [`verify_against_chunked`] with the program's one-row (S2) roots, when it
 /// has them (`None` = row-pair roots only: a chip resolved to one row then
-/// rejects).
+/// rejects), under the configuration `C`, for roots committed under
+/// `commitment` ([`check_configuration`]).
 #[allow(clippy::too_many_arguments)]
-fn verify_against_chunked_with(
+fn verify_against_chunked_with<C: crate::hash_pin::BlockHash>(
+    commitment: stark::config::CommitmentHash,
     one_row_roots: Option<&super::registry::LfmOneRowRoots>,
     roots: &[Commitment; NUM_LFM_CHIPS],
     blake3_roots: &[Commitment],
@@ -564,6 +674,9 @@ fn verify_against_chunked_with(
     hasher: HasherKind,
     chip_set: ChipSet,
 ) -> bool {
+    if check_configuration::<C>(commitment, options).is_err() {
+        return false;
+    }
     // The chunk count and the mask must agree, and BOTH come from the resolved
     // registry entry rather than the proof — so this rejects a malformed entry,
     // not a hostile prover.
@@ -608,9 +721,10 @@ fn verify_against_chunked_with(
     }
     let refs = airs.air_refs();
 
-    let mut transcript = crate::hash_pin::legacy_transcript(&[]);
+    let mut transcript = C::transcript(&[]);
     absorb_lfm_statement(
         &mut transcript,
+        &C::lfm_statement_tag(&options.format),
         program_id,
         claimed_public,
         options.fri_final_poly_log_degree,
@@ -627,7 +741,7 @@ fn verify_against_chunked_with(
         return false;
     };
 
-    crate::hash_pin::LegacyVerifier::<F, E, ()>::multi_verify_views(
+    crate::hash_pin::BlockVerifierOf::<C, F, E, ()>::multi_verify_views(
         &refs,
         view,
         &mut transcript,

@@ -48,7 +48,7 @@ use super::constraints::Analysis;
 use super::epoch::{RootCells, TableAbsorbs, TableChallengeShape, fork_table};
 use super::epoch_verify::{TableQueryArenas, TableVerifyShape};
 use super::instr::ArenaId;
-use super::statement::{LFM_MACHINE_VERSION, LFM_STATEMENT_TAG};
+use super::statement::LFM_MACHINE_VERSION;
 use super::statement_replay::{PhaseAPreprocessed, PhaseATable, replay_phase_a};
 use super::transcript_replay::{Candidate, TranscriptReplay, assert_canonical, candidate_to_felt};
 
@@ -98,6 +98,9 @@ pub struct ChildShape<'a> {
     /// The child's `ProofOptions::fri_final_poly_log_degree` — the statement's
     /// last byte.
     pub fri_final_poly_log_degree: u8,
+    /// The child's LFM statement tag — its configuration's under its options
+    /// (`hash_pin::lfm_statement_tag`), the statement's first bytes.
+    pub statement_tag: &'a [u8],
     /// The child's sub-proofs, in proof order.
     pub tables: Vec<ChildTable<'a>>,
 }
@@ -117,6 +120,7 @@ pub struct DerivedChild {
     program_id: Commitment,
     num_public_words: usize,
     fri_final_poly_log_degree: u8,
+    statement_tag: Vec<u8>,
     tables: Vec<DerivedTable>,
 }
 
@@ -167,6 +171,7 @@ impl DerivedChild {
             program_id: artifacts.program_id,
             num_public_words,
             fri_final_poly_log_degree: opts.fri_final_poly_log_degree,
+            statement_tag: crate::hash_pin::lfm_statement_tag(&opts.format),
             tables,
         })
     }
@@ -177,6 +182,7 @@ impl DerivedChild {
             program_id: &self.program_id,
             num_public_words: self.num_public_words,
             fri_final_poly_log_degree: self.fri_final_poly_log_degree,
+            statement_tag: &self.statement_tag,
             tables: self
                 .tables
                 .iter()
@@ -274,17 +280,18 @@ pub(super) fn publics_arena(words: &[super::word::LfmWord]) -> Vec<super::word::
     out
 }
 
-/// Emits [`super::statement::absorb_lfm_statement`] byte for byte: the tag, the
-/// child's program id (a PROGRAM CONSTANT), the machine version, the word count,
-/// each word's emit-time-constant index and hinted lane halves, and the FRI
-/// terminal byte.
+/// Emits [`super::statement::absorb_lfm_statement`] byte for byte: the child's
+/// configuration's tag, the child's program id (a PROGRAM CONSTANT), the
+/// machine version, the word count, each word's emit-time-constant index and
+/// hinted lane halves, and the FRI terminal byte.
 pub fn emit_lfm_statement(
     t: &mut TranscriptReplay,
+    tag: &[u8],
     program_id: &Commitment,
     words: &[HintedPublicWord],
     fri_final_poly_log_degree: u8,
 ) {
-    t.append_const_bytes(LFM_STATEMENT_TAG);
+    t.append_const_bytes(tag);
     t.append_const_bytes(program_id);
     t.append_const_bytes(&LFM_MACHINE_VERSION.to_le_bytes());
     t.append_const_bytes(&(words.len() as u64).to_le_bytes());
@@ -427,6 +434,7 @@ pub fn emit_leg(b: &mut LfmBuilder, child: &ChildShape<'_>, a: &LegArenas) -> Le
     let mut t = TranscriptReplay::new(&[]);
     emit_lfm_statement(
         &mut t,
+        child.statement_tag,
         child.program_id,
         &publics,
         child.fri_final_poly_log_degree,

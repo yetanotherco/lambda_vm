@@ -1,5 +1,21 @@
-//! ★★ **THE HASH PIN** — the one place a build says which hash the BLOCK path
-//! proves under.
+//! ★★ **THE HASH PINS** — the one place a build says which hash each proof
+//! path proves under.
+//!
+//! # Two pins
+//!
+//! - **The block pin** ([`Block`], [`BLOCK_BASE`], [`BLOCK_LFM`],
+//!   [`BLOCK_WRAP`], [`BLOCK_SOCKET`]): the no-epoch block's whole proof
+//!   system, its base proof and its LFM recursion together, under ZisK's
+//!   Poseidon1 at width 16. Nothing at run time selects it, so a block whose
+//!   base and recursion hash differently cannot be built or derived. A move to
+//!   another hash (BLAKE3, say) repins these lines and gives that hash a
+//!   [`BlockHash`] impl; base and recursion move in one edit.
+//! - **The legacy pin** ([`LegacyStarkHash`], [`LegacyTranscript`],
+//!   [`LEGACY_HASHER`], …): RPX256, for the paths that never touch a no-epoch
+//!   block proof — continuation epochs, the monolithic prover, the LFM registry
+//!   fixtures and the probes. Everything below up to the block pin's section
+//!   describes it; it was the block path's pin before the block moved to
+//!   Poseidon1, hence the history in its notes.
 //!
 //! # Why this is a module and not a line in `crypto/stark`
 //!
@@ -99,20 +115,20 @@
 //! governs both: a drift failure is investigated, never re-blessed to silence
 //! the test, and neither table is ever hand-edited.
 
-/// The commitment configuration the block path proves and verifies under.
+/// The commitment configuration the legacy paths prove and verify under.
 ///
-/// Every `multi_prove` / `multi_verify` instantiation in this crate names this
-/// rather than `stark::config::DefaultStarkHash`, so the two can differ on a
-/// branch without the workspace default moving.
+/// Every legacy `multi_prove` / `multi_verify` instantiation in this crate
+/// names this rather than `stark::config::DefaultStarkHash`, so the two can
+/// differ on a branch without the workspace default moving.
 pub type LegacyStarkHash = crate::lfm::algebraic_commit::RpxStarkHash;
 
-/// The Fiat–Shamir transcript OBJECT the block path builds.
+/// The Fiat–Shamir transcript OBJECT the legacy paths build.
 ///
 /// See the module header for why this is pinned separately from
 /// [`LegacyStarkHash`] rather than derived from it.
 pub type LegacyTranscript = crate::lfm::algebraic_transcript::AlgebraicTranscript;
 
-/// A fresh block-path transcript over `seed`.
+/// A fresh legacy transcript over `seed`.
 ///
 /// A function rather than a bare `::new`, because the two arms construct
 /// differently: a byte transcript takes the seed in its constructor, an
@@ -122,7 +138,7 @@ pub fn legacy_transcript(seed: &[u8]) -> LegacyTranscript {
     LegacyTranscript::with_seed(LEGACY_HASHER, seed)
 }
 
-/// The prover the block path drives, at [`LegacyStarkHash`].
+/// The prover the legacy paths drive, at [`LegacyStarkHash`].
 ///
 /// ⚠ **Not `stark::prover::Prover`.** That alias is `GenericProver` at
 /// `DefaultStarkHash`, so it is BLAKE3-fixed regardless of what `H` a call site
@@ -133,13 +149,14 @@ pub fn legacy_transcript(seed: &[u8]) -> LegacyTranscript {
 pub type LegacyProver<Field, FieldExtension, PI> =
     stark::prover::GenericProver<Field, FieldExtension, PI, LegacyStarkHash>;
 
-/// The verifier the block path drives, at [`LegacyStarkHash`]. See
+/// The verifier the legacy paths drive, at [`LegacyStarkHash`]. See
 /// [`LegacyProver`] for why the `stark::verifier::Verifier` alias is not it.
 pub type LegacyVerifier<Field, FieldExtension, PI> =
     stark::verifier::GenericVerifier<Field, FieldExtension, PI, LegacyStarkHash>;
 
-/// The `LFM_HASH` socket permutation the block path's programs are EXECUTED and
-/// proved under — the machine's own hash chip.
+/// The `LFM_HASH` socket permutation the legacy paths' programs are EXECUTED
+/// and proved under — the machine's own hash chip. The block's programs take
+/// [`BLOCK_SOCKET`].
 ///
 /// ⚠ **A third axis, and it is orthogonal to [`LegacyStarkHash`].** That one says
 /// which hash the HOST commits under; this says which permutation the MACHINE's
@@ -169,7 +186,7 @@ const _: () = assert!(
     "the block hasher hashes twelve-felt transcript steps; the width-16 socket has none"
 );
 
-/// The [`CommitmentHash`] the block path's roots may be called by.
+/// The [`CommitmentHash`] the legacy paths' roots may be called by.
 ///
 /// ★ Read this rather than `stark::config::COMMITMENT_HASH`. That const names
 /// the hash of the workspace ALIASES and says so in its own doc — a prover can
@@ -180,19 +197,74 @@ pub const LEGACY_COMMITMENT_HASH: stark::config::CommitmentHash =
     <LegacyStarkHash as stark::config::StarkHash>::COMMITMENT_HASH;
 
 // =========================================================================
+// THE BLOCK PIN: the no-epoch block's base and recursion, one hash
+// =========================================================================
+
+/// ★★ The no-epoch block's proof system: the base proof's commitment
+/// configuration and transcript, and the LFM recursion's, are this one
+/// [`BlockHash`]. The block prover, the tree and the block verifier name it;
+/// nothing selects another at run time.
+pub type Block = P1Block;
+
+/// The 4-ary cap height of the LFM recursion's trees (`c_L`), shared with
+/// #1014's recursion. Picked from both lanes' node census (D-P3B-1013 §8).
+pub const BLOCK_LFM_CAP: u8 = 1;
+
+/// The block's BASE proof format: [`Block`]'s hash, its 4-ary trees capped at
+/// height 1 (the in-guest optimum the leaves measured: cap 4 cost them +42 %,
+/// I-P3 §4.4). [`crate::lfm::proof::block_base_options`] stamps it.
+pub const BLOCK_BASE: stark::proof::options::BaseFormat = stark::proof::options::BaseFormat {
+    hash: stark::config::CommitmentHash::Poseidon1,
+    arity4_cap: stark::proof::options::CapPolicy::Fixed(1),
+};
+
+/// The format of the block's LFM proofs — every leaf, node and the top:
+/// [`Block`]'s hash at cap [`BLOCK_LFM_CAP`].
+/// [`crate::lfm::proof::aggregation_wrap_options`] stamps it.
+pub const BLOCK_LFM: stark::proof::options::BaseFormat = stark::proof::options::BaseFormat {
+    hash: stark::config::CommitmentHash::Poseidon1,
+    arity4_cap: stark::proof::options::CapPolicy::Fixed(BLOCK_LFM_CAP),
+};
+
+/// How the block's programs hash in-guest: the leaves verifying the base, the
+/// nodes and the top verifying their children.
+pub const BLOCK_WRAP: crate::lfm::edsl::WrapHash = crate::lfm::edsl::WrapHash::Poseidon1;
+
+/// The `LFM_HASH` chip every block program proves under (its `Hash16` rows).
+pub const BLOCK_SOCKET: crate::lfm::hash::HasherKind = crate::lfm::hash::HasherKind::Poseidon1W16;
+
+/// The legacy configuration ([`RpxBlock`]): what the legacy paths' LFM proofs
+/// are committed under.
+pub type Legacy = RpxBlock;
+
+// The pin is one system: its formats name `Block`'s hash, and the wrap hash and
+// socket are the ones that hash's in-guest verifier runs.
+const _: () = assert!(
+    matches!(BLOCK_BASE.hash, stark::config::CommitmentHash::Poseidon1)
+        && matches!(BLOCK_LFM.hash, stark::config::CommitmentHash::Poseidon1)
+        && matches!(
+            <<Block as BlockHash>::H as stark::config::StarkHash>::COMMITMENT_HASH,
+            stark::config::CommitmentHash::Poseidon1
+        )
+        && matches!(BLOCK_WRAP, crate::lfm::edsl::WrapHash::Poseidon1)
+        && matches!(BLOCK_SOCKET, crate::lfm::hash::HasherKind::Poseidon1W16),
+    "the block pin names one hash: its formats, configuration, wrap hash and socket agree"
+);
+
+// =========================================================================
 // The base format (`p1/*` exploration branch)
 // =========================================================================
 
-/// Which hash the block path's BASE proof commits under: the pin above
-/// ([`BaseHash::Rpx`], the default), or ZisK's Poseidon1 ([`BaseHash::P1`]:
-/// `lfm::p1_commit`, 4-ary trees, ZisK's transcript and width-8 grind).
+/// Which configuration a proof's options name: the legacy pin
+/// ([`BaseHash::Rpx`]) or ZisK's Poseidon1 ([`BaseHash::P1`]: `lfm::p1_commit`,
+/// 4-ary trees, ZisK's transcript and width-8 grind).
 ///
 /// It is the verifier's format, never the proof's and never the
 /// environment's: [`base_of`] reads it from the `ProofOptions` the caller
-/// passes (`format.base`), and the block prover, the host verifier and the
-/// preprocessed roots all take it from there. The recursion still verifies
-/// RPX proofs, so a P1 base proof is proved and host-verified, never wrapped;
-/// the epoch and LFM provers refuse a P1 format ([`require_rpx_base`]).
+/// passes (`format.base`), and the base prover, the host verifier, the LFM
+/// prover's configuration check and the preprocessed roots all take it from
+/// there. The epoch pipeline and the monolithic prover refuse a P1 format
+/// ([`require_rpx_base`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaseHash {
     /// [`LegacyStarkHash`] under [`LegacyTranscript`]: `BaseFormat::RPX`, today.
@@ -244,8 +316,8 @@ pub fn checked_base(format: &stark::proof::options::ProofFormat) -> Result<BaseH
     }
 }
 
-/// Refuse a path that has no P1 arm (the epoch pipeline, the monolithic and
-/// LFM provers) under a P1 format, rather than letting it mix RPX proofs with
+/// Refuse a path that has no P1 arm (the epoch pipeline, the monolithic
+/// prover) under a P1 format, rather than letting it mix RPX proofs with
 /// P1 preprocessed roots. The error names the path; the caller types it.
 pub fn require_rpx_base(
     path: &str,
@@ -373,6 +445,10 @@ pub trait BlockHash: Send + Sync + 'static {
     /// The transcript's state digest as a machine word: what the block
     /// tree's leaves publish (`TranscriptReplay::state`).
     fn state_word(t: &Self::Transcript) -> crate::lfm::word::LfmWord;
+    /// The LFM statement's leading tag for an LFM proof made under `format`
+    /// (`statement::absorb_lfm_statement`): like [`Self::statement_tag`], it
+    /// names the commitment geometry the proof is about.
+    fn lfm_statement_tag(format: &stark::proof::options::ProofFormat) -> Vec<u8>;
 }
 
 /// The pin: [`LegacyStarkHash`] under [`LegacyTranscript`].
@@ -391,6 +467,10 @@ impl BlockHash for RpxBlock {
     }
     fn state_word(t: &LegacyTranscript) -> crate::lfm::word::LfmWord {
         t.state_word()
+    }
+    /// Today's LFM tag, byte for byte: legacy LFM statements do not move.
+    fn lfm_statement_tag(_: &stark::proof::options::ProofFormat) -> Vec<u8> {
+        crate::lfm::statement::LFM_STATEMENT_TAG.to_vec()
     }
 }
 
@@ -415,6 +495,11 @@ impl BlockHash for P1Block {
         let bytes = IsTranscript::<crate::tables::types::GoldilocksExtension>::state(t);
         crate::lfm::algebraic_commit::commitment_to_digest(&bytes)
     }
+    /// `LAMBDAVM_LFM_STATEMENT_V1/P1W16/C<h>`: the LFM tag with the base's
+    /// suffix, so it is domain-separated from the legacy `…_V1` tag.
+    fn lfm_statement_tag(format: &stark::proof::options::ProofFormat) -> Vec<u8> {
+        p1_lfm_statement_tag(format.base.arity4_cap)
+    }
 }
 
 /// [`BlockHash::statement_tag`] of the configuration `format` names
@@ -424,6 +509,26 @@ pub fn statement_tag(format: &stark::proof::options::ProofFormat) -> Vec<u8> {
     match base_of(format) {
         BaseHash::Rpx => RpxBlock::statement_tag(format),
         BaseHash::P1 => P1Block::statement_tag(format),
+    }
+}
+
+/// [`BlockHash::lfm_statement_tag`] of the configuration `format` names
+/// ([`base_of`]): the LFM statement's leading tag, the legacy one byte for
+/// byte under RPX.
+pub fn lfm_statement_tag(format: &stark::proof::options::ProofFormat) -> Vec<u8> {
+    match base_of(format) {
+        BaseHash::Rpx => RpxBlock::lfm_statement_tag(format),
+        BaseHash::P1 => P1Block::lfm_statement_tag(format),
+    }
+}
+
+/// The hash a commit under `format` builds its roots with: its configuration's
+/// ([`base_of`]), which is what `lfm::commit` dispatches on. An LFM program's
+/// artifacts record it, and its program id names it.
+pub fn commitment_of(format: &stark::proof::options::ProofFormat) -> stark::config::CommitmentHash {
+    match base_of(format) {
+        BaseHash::Rpx => <<RpxBlock as BlockHash>::H as stark::config::StarkHash>::COMMITMENT_HASH,
+        BaseHash::P1 => <<P1Block as BlockHash>::H as stark::config::StarkHash>::COMMITMENT_HASH,
     }
 }
 
@@ -438,19 +543,39 @@ pub const MAX_P1_CAP_HEIGHT: usize = crypto::merkle_tree::cap::MAX_CAP_HEIGHT / 
 /// build the RPX tag in its place (`p1_tag_omitted_for_test`) to show the tag
 /// is checked.
 pub fn p1_statement_tag(cap: stark::proof::options::CapPolicy) -> Vec<u8> {
-    use stark::proof::options::CapPolicy;
     #[cfg(test)]
     if P1_TAG_OMITTED.load(std::sync::atomic::Ordering::Relaxed) {
         return crate::statement::DOMAIN_TAG.to_vec();
     }
+    let mut tag = crate::statement::DOMAIN_TAG.to_vec();
+    tag.extend_from_slice(p1_tag_suffix(cap).as_bytes());
+    tag
+}
+
+/// The P1 LFM statement tag at cap `cap` ([`BlockHash::lfm_statement_tag`]):
+/// `LAMBDAVM_LFM_STATEMENT_V1` and [`p1_statement_tag`]'s suffix. A test can
+/// build the legacy tag in its place (`P1_LFM_TAG_OMITTED`) to show the tag is
+/// absorbed.
+pub fn p1_lfm_statement_tag(cap: stark::proof::options::CapPolicy) -> Vec<u8> {
+    #[cfg(test)]
+    if P1_LFM_TAG_OMITTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return crate::lfm::statement::LFM_STATEMENT_TAG.to_vec();
+    }
+    let mut tag = crate::lfm::statement::LFM_STATEMENT_TAG.to_vec();
+    tag.extend_from_slice(p1_tag_suffix(cap).as_bytes());
+    tag
+}
+
+/// `/P1W16/C<h>`: the effective cap policy's height, `C0` uncapped (`Off` and
+/// `Fixed(0)`), `C<h>` at a fixed height, `Cauto` under `Auto`.
+fn p1_tag_suffix(cap: stark::proof::options::CapPolicy) -> String {
+    use stark::proof::options::CapPolicy;
     let height = match cap {
         CapPolicy::Off | CapPolicy::Fixed(0) => "0".to_string(),
         CapPolicy::Fixed(c) => c.to_string(),
         CapPolicy::Auto => "auto".to_string(),
     };
-    let mut tag = crate::statement::DOMAIN_TAG.to_vec();
-    tag.extend_from_slice(format!("/P1W16/C{height}").as_bytes());
-    tag
+    format!("/P1W16/C{height}")
 }
 
 /// Test only: P1 statements take RPX's tag while set (a mutation of the tag,
@@ -458,6 +583,12 @@ pub fn p1_statement_tag(cap: stark::proof::options::CapPolicy) -> Vec<u8> {
 /// sets it runs in its own process.
 #[cfg(test)]
 pub static P1_TAG_OMITTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test only: P1 LFM statements take the legacy LFM tag while set (a mutation
+/// of the tag). Process-global, like [`P1_TAG_OMITTED`].
+#[cfg(test)]
+pub static P1_LFM_TAG_OMITTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// The prover at configuration `C`.

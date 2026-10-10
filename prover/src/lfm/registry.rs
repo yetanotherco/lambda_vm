@@ -157,6 +157,8 @@ impl LfmRegistryEntry {
             hash_chunk_roots: vec![self.roots[HASH_SLOT]],
             hash_chunk_log_heights: vec![self.log_heights[HASH_SLOT]],
             hasher: self.hasher,
+            // The registry is blessed under the legacy pin.
+            commitment: crate::hash_pin::LEGACY_COMMITMENT_HASH,
             chip_set: self.chip_set,
             program_id: self.program_id,
             // The registry is ROW-PAIR ONLY: a one-row
@@ -204,6 +206,11 @@ pub struct LfmArtifacts {
     /// The hasher `program_id` was derived under; the prove and verify paths
     /// both take it from here rather than defaulting.
     pub hasher: HasherKind,
+    /// The hash every root above was committed with (the build options'
+    /// configuration, `hash_pin::commitment_of`), which `program_id` names. A
+    /// prove or verify under options naming another refuses, rather than
+    /// pairing these roots with another hash's trees.
+    pub commitment: stark::config::CommitmentHash,
     /// The hash families this program instantiates, derived from its own
     /// compiled groups at bless time. See [`ChipSet`].
     pub chip_set: ChipSet,
