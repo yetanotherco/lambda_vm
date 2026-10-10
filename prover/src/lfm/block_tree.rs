@@ -865,16 +865,16 @@ pub(crate) fn harvest_block_over(
     sink: &dyn BlockTreeSink,
 ) -> Result<(BlockWitness, f64, f64), String> {
     // The base configuration is the verifier's format (`opts.format.base`),
-    // never the proof's: a P1 base proof is read with the P1 verifier on ZisK's
-    // transcript, an RPX one as before.
-    match crate::hash_pin::checked_base(&opts.format)? {
-        crate::hash_pin::BaseHash::Rpx => harvest_block_under::<crate::hash_pin::RpxBlock>(
-            opts, elf_bytes, proof, verify, consts, sink,
-        ),
-        crate::hash_pin::BaseHash::P1 => harvest_block_under::<crate::hash_pin::P1Block>(
-            opts, elf_bytes, proof, verify, consts, sink,
-        ),
+    // never the proof's, and the block tree reads a base proof under the block
+    // pin alone: the tree's recursion is the pin's, so a base under another
+    // hash would be a mixed block.
+    let base = crate::hash_pin::checked_base(&opts.format)?;
+    if base != <crate::hash_pin::Block as crate::hash_pin::BlockHash>::BASE {
+        return Err(format!(
+            "the block tree reads base proofs under the block pin alone, not {base:?}"
+        ));
     }
+    harvest_block_under::<crate::hash_pin::Block>(opts, elf_bytes, proof, verify, consts, sink)
 }
 
 /// [`harvest_block_over`] under the block configuration `C`.
@@ -2331,6 +2331,101 @@ type BesideResult = (
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The production text of a source: every `#[cfg(test)]` item left out
+    /// (to its closing brace at the attribute's indent, or its one `;` line).
+    fn production_text(src: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            if line.trim() == "#[cfg(test)]" {
+                let indent = line.len() - line.trim_start().len();
+                let close = format!("{}}}", " ".repeat(indent));
+                i += 1;
+                while i < lines.len() {
+                    let l = lines[i];
+                    let one_line = l.trim_end().ends_with(';')
+                        && !l.contains('{')
+                        && l.len() - l.trim_start().len() == indent;
+                    if l == close || one_line {
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+            i += 1;
+        }
+        out
+    }
+
+    /// ★ The production block paths name only the block pin: the tree prover
+    /// and its pipeline, the block verifier and the CLI's `prove-block` /
+    /// `verify-block` take the pin's presets, refuse a base of another hash,
+    /// and name no legacy configuration outside `#[cfg(test)]` items. So the
+    /// base prover's RPX arm (test-only legacy, removed in the cleanup commit)
+    /// is reachable only from the base-only test presets, and no user-run path
+    /// can make an RPX-base block proof.
+    #[test]
+    fn the_production_block_paths_name_only_the_pin() {
+        use crate::hash_pin::{BLOCK_BASE, BLOCK_LFM, Block, BlockHash, checked_base};
+        // The presets the tree prover (`prove_block_tree`) and the block
+        // verifier (`verify_block_tree`) take.
+        let base = super::super::proof::block_tree_base_options();
+        let lfm = super::super::proof::block_tree_options();
+        assert_eq!(base.format.base, BLOCK_BASE);
+        assert_eq!(lfm.format.base, BLOCK_LFM);
+        for o in [&base, &lfm] {
+            assert_eq!(checked_base(&o.format), Ok(<Block as BlockHash>::BASE));
+        }
+        // The code.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let files = [
+            root.join("src/lfm/block_tree.rs"),
+            root.join("src/lfm/block_tree_pipeline.rs"),
+            root.join("src/lfm/block_plan.rs"),
+            root.join("../bin/cli/src/main.rs"),
+        ];
+        let legacy_names = [
+            "block_base_options()",
+            "block_base_options_for",
+            "aggregation_wrap_options()",
+            "BaseFormat::RPX",
+            "hash_pin::Legacy",
+            "hash_pin::RpxBlock",
+            "LEGACY_HASHER",
+            "WrapHash::legacy()",
+            "proof::lfm_prove(",
+            "proof::verify_against_artifacts(",
+            "harvest::harvest_child(",
+            "harvest::harvest_child_verified(",
+            "NOEPOCH_BASE",
+        ];
+        for file in &files {
+            let text = production_text(&std::fs::read_to_string(file).expect("readable source"));
+            assert!(text.lines().count() > 300, "{} reads", file.display());
+            for name in legacy_names {
+                assert!(
+                    !text.contains(name),
+                    "{} names `{name}` on a production block path",
+                    file.display()
+                );
+            }
+        }
+        // The scan sees what it looks for: a production line naming one is caught.
+        assert!(
+            production_text("let o = block_base_options();\n").contains("block_base_options()")
+        );
+        assert!(
+            !production_text("#[cfg(test)]\nfn t() {\n    block_base_options();\n}\n")
+                .contains("block_base_options()")
+        );
+    }
 
     /// The CLI's line names the block pin: Poseidon1, the base at cap 1, the
     /// LFM proofs at the pin's cap, and both tags.

@@ -1787,6 +1787,33 @@ mod tests {
             !ok(&["cli", "verify-block", "block.proof"]),
             "the ELF is required"
         );
+        // No base hash to choose: the block's base and recursion are the block
+        // pin's, so neither command takes a flag that could name another.
+        for flag in ["--base", "--base-hash"] {
+            assert!(
+                !ok(&[
+                    "cli",
+                    "prove-block",
+                    "guest.elf",
+                    "-o",
+                    "block.proof",
+                    flag,
+                    "rpx"
+                ]),
+                "prove-block takes no {flag}"
+            );
+            assert!(
+                !ok(&[
+                    "cli",
+                    "verify-block",
+                    "block.proof",
+                    "guest.elf",
+                    flag,
+                    "rpx"
+                ]),
+                "verify-block takes no {flag}"
+            );
+        }
     }
 
     /// The posture sets exactly the knobs the environment leaves unset, and
