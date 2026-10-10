@@ -1137,6 +1137,7 @@ fn the_candidate_rate_model_is_derived_not_remembered() {
         coset_offset: 3,
         num_queries: 73,
         format: stark::proof::options::ProofFormat::DEFAULT,
+        trees: stark::config::TreeGeometry::BINARY,
     };
     assert!(fri.num_committed() > 0, "the shape must exercise the term");
 

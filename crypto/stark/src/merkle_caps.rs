@@ -91,6 +91,24 @@ impl StarkCaps {
         lde_log: usize,
         one_row: bool,
     ) -> Result<Self, crate::fri::schedule::FriFormatError> {
+        Self::for_options_with(
+            options,
+            lde_log,
+            one_row,
+            crate::config::TreeGeometry::BINARY,
+        )
+    }
+
+    /// [`Self::for_options`] for trees of `geometry` (a configuration's arity
+    /// and arity-4 cap, `TreeGeometry::of::<H>()`): the heights the prover and
+    /// the host verifier of that configuration lay out. At
+    /// `TreeGeometry::BINARY` it is [`Self::for_options`].
+    pub fn for_options_with(
+        options: &crate::proof::options::ProofOptions,
+        lde_log: usize,
+        one_row: bool,
+        geometry: crate::config::TreeGeometry,
+    ) -> Result<Self, crate::fri::schedule::FriFormatError> {
         let blowup_log = (options.blowup_factor as u32).trailing_zeros();
         let layout = crate::fri::terminal::FriFoldLayout::for_options(
             lde_log as u32,
@@ -99,11 +117,11 @@ impl StarkCaps {
             one_row,
         )?;
         Ok(Self::from_layout_arity(
-            options.format.merkle_cap,
+            geometry.cap_policy(options.format.merkle_cap),
             options.fri_number_of_queries,
             lde_log,
             &layout,
-            2,
+            geometry.arity,
         ))
     }
 

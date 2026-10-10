@@ -310,10 +310,46 @@ pub trait StarkHash: Send + Sync + 'static {
 /// constant, from the configuration and the verifier's format, never from the
 /// proof.
 pub fn effective_cap_policy<H: StarkHash>(format_cap: CapPolicy) -> CapPolicy {
-    if H::ARITY == 2 {
-        format_cap
-    } else {
-        H::ARITY4_CAP
+    TreeGeometry::of::<H>().cap_policy(format_cap)
+}
+
+/// A configuration's tree shape as a value — its arity and its own arity-4
+/// cap ([`StarkHash::ARITY`], [`StarkHash::ARITY4_CAP`]) — for code that lays
+/// out a proof's trees without naming the configuration type (the in-guest
+/// verifier's shapes). Taken from the configuration ([`Self::of`]), never
+/// from a proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TreeGeometry {
+    /// Children per node: 2 or 4.
+    pub arity: usize,
+    /// The cap policy at arity 4, heights in 4-ary levels (unused at 2).
+    pub arity4_cap: CapPolicy,
+}
+
+impl TreeGeometry {
+    /// Binary trees under the format's cap policy: every configuration but an
+    /// arity-4 one, and today's shapes.
+    pub const BINARY: Self = Self {
+        arity: 2,
+        arity4_cap: CapPolicy::Off,
+    };
+
+    /// The geometry of the configuration `H`.
+    pub const fn of<H: StarkHash>() -> Self {
+        Self {
+            arity: H::ARITY,
+            arity4_cap: H::ARITY4_CAP,
+        }
+    }
+
+    /// The cap policy these trees run under a format whose binary policy is
+    /// `format_cap` ([`effective_cap_policy`]).
+    pub fn cap_policy(self, format_cap: CapPolicy) -> CapPolicy {
+        if self.arity == 2 {
+            format_cap
+        } else {
+            self.arity4_cap
+        }
     }
 }
 
