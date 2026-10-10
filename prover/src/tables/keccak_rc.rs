@@ -165,6 +165,16 @@ pub fn compute_preprocessed_commitment_with(
     options: &ProofOptions,
     layout: LeafLayout,
 ) -> Commitment {
+    compute_preprocessed_commitment_under::<crate::hash_pin::BlockStarkHash>(options, layout)
+}
+
+/// [`compute_preprocessed_commitment_with`] under the commitment configuration
+/// `S` (a proof family's: `crate::lfm::registry::build_artifacts_under`).
+#[doc(hidden)]
+pub fn compute_preprocessed_commitment_under<S: stark::config::StarkHash>(
+    options: &ProofOptions,
+    layout: LeafLayout,
+) -> Commitment {
     let columns = preprocessed_columns();
 
     // Interpolate each column to a polynomial
@@ -193,7 +203,7 @@ pub fn compute_preprocessed_commitment_with(
     // the hash that path commits under — on a branch that pins an algebraic
     // hash, a root left on the alias would be the one BLAKE3 artifact in an RPO
     // proof, and it would fail as a root nothing reconstructs.
-    crate::lfm::commit::commit_lde_columns_with(&lde_columns, layout)
+    crate::lfm::commit::commit_lde_columns_under::<S>(&lde_columns, layout)
 }
 
 /// Returns the preprocessed commitment for the keccak_rc table.
@@ -232,6 +242,40 @@ pub fn preprocessed_commitment_for(
         LeafLayout::Row => (options.coset_offset == 3)
             .then(|| static_commitment_one_row(options.blowup_factor))
             .flatten(),
+    }
+}
+
+/// The row-pair preprocessed commitment under the commitment configuration
+/// `S`: the legacy pin's blessed root ([`preprocessed_commitment`]), any other
+/// configuration's computed once per process
+/// ([`crate::hash_pin::static_root_under`]).
+pub fn preprocessed_root_under<S: stark::config::StarkHash>(options: &ProofOptions) -> Commitment {
+    if S::COMMITMENT_HASH == crate::hash_pin::BLOCK_COMMITMENT_HASH {
+        return preprocessed_commitment(options);
+    }
+    crate::hash_pin::static_root_under::<S>("keccak_rc", options, LeafLayout::RowPair, || {
+        compute_preprocessed_commitment_under::<S>(options, LeafLayout::RowPair)
+    })
+}
+
+/// [`preprocessed_commitment_for`] under the commitment configuration `S`: the
+/// legacy pin's static roots (a one-row miss stays a miss), any other
+/// configuration's computed once per process.
+pub fn preprocessed_commitment_under<S: stark::config::StarkHash>(
+    options: &ProofOptions,
+    layout: LeafLayout,
+) -> Option<Commitment> {
+    match layout {
+        LeafLayout::RowPair => Some(preprocessed_root_under::<S>(options)),
+        LeafLayout::Row if S::COMMITMENT_HASH == crate::hash_pin::BLOCK_COMMITMENT_HASH => {
+            preprocessed_commitment_for(options, layout)
+        }
+        LeafLayout::Row => Some(crate::hash_pin::static_root_under::<S>(
+            "keccak_rc",
+            options,
+            layout,
+            || compute_preprocessed_commitment_under::<S>(options, layout),
+        )),
     }
 }
 

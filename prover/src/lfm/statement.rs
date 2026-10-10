@@ -139,12 +139,43 @@ pub fn lfm_program_id_chunked(
     hash_chunk_roots: &[Commitment],
     hash_chunk_log_heights: &[u8],
 ) -> Commitment {
+    lfm_program_id_chunked_under(
+        crate::hash_pin::BLOCK_COMMITMENT_HASH,
+        roots,
+        log_heights,
+        keccak_rnd_chunks,
+        hasher,
+        chip_set,
+        blake3_chunk_roots,
+        blake3_chunk_log_heights,
+        hash_chunk_roots,
+        hash_chunk_log_heights,
+    )
+}
+
+/// [`lfm_program_id_chunked`] for roots built under the commitment hash
+/// `commitment` (a proof family's, `registry::build_artifacts_under`) rather
+/// than the legacy pin's: the hash that BUILT the roots is the one the
+/// identity names.
+#[allow(clippy::too_many_arguments)]
+pub fn lfm_program_id_chunked_under(
+    commitment: CommitmentHash,
+    roots: &[Commitment; NUM_LFM_CHIPS],
+    log_heights: &[u8; NUM_LFM_CHIPS],
+    keccak_rnd_chunks: usize,
+    hasher: HasherKind,
+    chip_set: ChipSet,
+    blake3_chunk_roots: &[Commitment],
+    blake3_chunk_log_heights: &[u8],
+    hash_chunk_roots: &[Commitment],
+    hash_chunk_log_heights: &[u8],
+) -> Commitment {
     let mut h = Keccak256::new();
     h.update(LFM_PROGRAM_TAG);
     h.update(LFM_MACHINE_VERSION.to_le_bytes());
     h.update(LFM_PRESET_TAG.to_le_bytes());
     h.update([hasher.as_tag()]);
-    h.update([commitment_hash_tag(crate::hash_pin::BLOCK_COMMITMENT_HASH)]);
+    h.update([commitment_hash_tag(commitment)]);
     // ★ The chip set is program shape and is bound by NAME, for the reason the
     // commitment hash is: the roots of an absent family are still in the array
     // (a hole, like KECCAK_RND's), so nothing else in this digest distinguishes
@@ -226,6 +257,31 @@ pub fn absorb_lfm_statement(
     public_words: &[(u32, LfmWord)],
     fri_final_poly_log_degree: u8,
 ) {
+    absorb_lfm_statement_tagged(
+        transcript,
+        None,
+        program_id,
+        public_words,
+        fri_final_poly_log_degree,
+    );
+}
+
+/// [`absorb_lfm_statement`] under a proof family's statement tag
+/// (`hash_pin::ProofFamily::STATEMENT_TAG`): the tag is absorbed first, as one
+/// `append_bytes` call, then today's statement. `None` (the legacy pin) is
+/// today's bytes exactly. Domain separation, not the binding: a statement names
+/// the family its proof was made under, so no statement of one family can
+/// coincide with another's.
+pub fn absorb_lfm_statement_tagged(
+    transcript: &mut impl IsTranscript<E>,
+    family_tag: Option<&[u8]>,
+    program_id: &Commitment,
+    public_words: &[(u32, LfmWord)],
+    fri_final_poly_log_degree: u8,
+) {
+    if let Some(tag) = family_tag {
+        transcript.append_bytes(tag);
+    }
     transcript.append_bytes(LFM_STATEMENT_TAG);
     transcript.append_bytes(program_id);
     transcript.append_bytes(&LFM_MACHINE_VERSION.to_le_bytes());

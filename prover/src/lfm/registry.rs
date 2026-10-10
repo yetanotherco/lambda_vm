@@ -19,10 +19,10 @@ use crate::tables::{bitwise, keccak_rc};
 
 use super::airs::{BLAKE3_SLOT, ChipSet, HASH_SLOT, NUM_LFM_CHIPS, blake3_chunk_rows};
 
-use super::commit::commit_group_device_or_host;
+use super::commit::commit_group_device_or_host_under;
 use super::compiler::{ColumnGroup, LfmProgram};
 use super::hash::HasherKind;
-use super::statement::lfm_program_id_chunked;
+use super::statement::lfm_program_id_chunked_under;
 use super::trace::range_group;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -485,6 +485,21 @@ pub fn build_artifacts_with_hasher(
     options: &ProofOptions,
     hasher: HasherKind,
 ) -> LfmArtifacts {
+    build_artifacts_under::<crate::hash_pin::BlockStarkHash>(program, options, hasher)
+}
+
+/// [`build_artifacts_with_hasher`] with every root built under the commitment
+/// configuration `S` — a proof family's (`hash_pin::ProofFamily::Stark`) —
+/// and `program_id` naming `S`'s hash: the artifacts a program's proofs under
+/// that family are made and checked against. The parameter is the one hash
+/// both the commits and the identity read, so they cannot name two hashes.
+/// At the legacy pin it is [`build_artifacts_with_hasher`] byte for byte.
+pub fn build_artifacts_under<S: stark::config::StarkHash>(
+    program: &LfmProgram,
+    options: &ProofOptions,
+    hasher: HasherKind,
+) -> LfmArtifacts {
+    use stark::leaf_layout::LeafLayout::RowPair;
     let range = range_group();
     // Slots 0..=10 in slot order: the program's own nine groups, then
     // `LFM_RANGE`. Slot 11 (`LFM_BLAKE3`) is not here because it is the CHUNKED
@@ -562,7 +577,7 @@ pub fn build_artifacts_with_hasher(
     let in_flight = groups_in_flight();
     for (base, window) in groups.chunks(in_flight).enumerate() {
         let commits = map_maybe_parallel(window, |g| {
-            commit_group_device_or_host(PREP_GROUP_LABEL, g, options)
+            commit_group_device_or_host_under::<S>(PREP_GROUP_LABEL, g, options, RowPair)
         });
         for (k, root) in commits.into_iter().enumerate() {
             roots[base * in_flight + k] = root;
@@ -577,7 +592,7 @@ pub fn build_artifacts_with_hasher(
     for window in chunks.chunks(in_flight) {
         blake3_chunk_roots.extend(map_maybe_parallel(window, |c| {
             let group = program.blake3_chunk_group(*c);
-            commit_group_device_or_host(BLAKE3_CHUNK_LABEL, &group, options)
+            commit_group_device_or_host_under::<S>(BLAKE3_CHUNK_LABEL, &group, options, RowPair)
         }));
     }
     roots[BLAKE3_SLOT] = blake3_chunk_roots[0];
@@ -588,14 +603,16 @@ pub fn build_artifacts_with_hasher(
     let tail: Vec<&ColumnGroup> = hash_chunks.iter().skip(1).collect();
     for window in tail.chunks(in_flight) {
         hash_chunk_roots.extend(map_maybe_parallel(window, |g| {
-            commit_group_device_or_host(HASH_CHUNK_LABEL, g, options)
+            commit_group_device_or_host_under::<S>(HASH_CHUNK_LABEL, g, options, RowPair)
         }));
     }
     hash_chunk_log_heights.extend(tail.iter().map(|g| g.padded_rows.trailing_zeros() as u8));
     // Slot 12 (KECCAK_RND) keeps the all-zero sentinel installed above.
-    roots[13] = keccak_rc::preprocessed_commitment(options);
+    // The static tables: the legacy pin's blessed roots, or `S`'s computed
+    // once per process.
+    roots[13] = keccak_rc::preprocessed_root_under::<S>(options);
     log_heights[13] = keccak_rc::NUM_ROWS.trailing_zeros() as u8;
-    roots[14] = bitwise::preprocessed_commitment(options);
+    roots[14] = bitwise::preprocessed_root_under::<S>(options);
     log_heights[14] = bitwise::NUM_ROWS.trailing_zeros() as u8;
 
     // The families this program uses, and the chunk count that follows from
@@ -617,7 +634,8 @@ pub fn build_artifacts_with_hasher(
     // and the mask decides what a proof carries, exactly where it always did:
     // `ChipSet::num_airs` and `LfmAirs::air_refs`.
 
-    let program_id = lfm_program_id_chunked(
+    let program_id = lfm_program_id_chunked_under(
+        S::COMMITMENT_HASH,
         &roots,
         &log_heights,
         keccak_rnd_chunks,
@@ -629,7 +647,7 @@ pub fn build_artifacts_with_hasher(
         &hash_chunk_log_heights,
     );
     let one_row_roots = (options.format.one_row != stark::proof::options::OneRowMode::Off)
-        .then(|| build_one_row_roots(program, options, &groups, &tail));
+        .then(|| build_one_row_roots::<S>(program, options, &groups, &tail));
     LfmArtifacts {
         roots,
         log_heights,
@@ -647,7 +665,7 @@ pub fn build_artifacts_with_hasher(
 
 /// The one-row roots of every committed group (host pass: the device commit
 /// builds row-pair leaves only), plus the static tables' one-row twins.
-fn build_one_row_roots(
+fn build_one_row_roots<S: stark::config::StarkHash>(
     program: &LfmProgram,
     options: &ProofOptions,
     groups: &[&ColumnGroup; 11],
@@ -656,7 +674,7 @@ fn build_one_row_roots(
     use stark::leaf_layout::LeafLayout::Row;
     let mut roots: [Option<Commitment>; NUM_LFM_CHIPS] = [None; NUM_LFM_CHIPS];
     let commits = map_maybe_parallel(groups, |g| {
-        super::commit::commit_group_device_or_host_with(PREP_GROUP_LABEL, g, options, Row)
+        commit_group_device_or_host_under::<S>(PREP_GROUP_LABEL, g, options, Row)
     });
     for (slot, root) in commits.into_iter().enumerate() {
         roots[slot] = Some(root);
@@ -664,15 +682,15 @@ fn build_one_row_roots(
     let chunks: Vec<usize> = (0..blake3_chunk_rows(program).len()).collect();
     let blake3_chunk_roots = map_maybe_parallel(&chunks, |c| {
         let group = program.blake3_chunk_group(*c);
-        super::commit::commit_group_device_or_host_with(BLAKE3_CHUNK_LABEL, &group, options, Row)
+        commit_group_device_or_host_under::<S>(BLAKE3_CHUNK_LABEL, &group, options, Row)
     });
     roots[BLAKE3_SLOT] = blake3_chunk_roots.first().copied();
-    roots[13] = keccak_rc::preprocessed_commitment_for(options, Row);
-    roots[14] = bitwise::preprocessed_commitment_for(options, Row);
+    roots[13] = keccak_rc::preprocessed_commitment_under::<S>(options, Row);
+    roots[14] = bitwise::preprocessed_commitment_under::<S>(options, Row);
     // Chunk 0 is slot 5's one-row root; the hash tail follows.
     let mut hash_chunk_roots: Vec<Commitment> = roots[HASH_SLOT].into_iter().collect();
     hash_chunk_roots.extend(map_maybe_parallel(hash_tail, |g| {
-        super::commit::commit_group_device_or_host_with(HASH_CHUNK_LABEL, g, options, Row)
+        commit_group_device_or_host_under::<S>(HASH_CHUNK_LABEL, g, options, Row)
     }));
     LfmOneRowRoots {
         roots,

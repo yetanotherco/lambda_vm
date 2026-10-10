@@ -27,9 +27,10 @@ use super::compiler::LfmProgram;
 use super::executor::{LfmExecError, LfmExecution, execute};
 use super::hash::HasherKind;
 use super::registry::{LfmArtifacts, LfmProgramKind, LfmRegistryError};
-use super::statement::absorb_lfm_statement;
+use super::statement::absorb_lfm_statement_tagged;
 use super::trace::{LfmTraces, build_traces_with_hasher};
 use super::word::LfmWord;
+use crate::hash_pin::{LegacyFamily, ProofFamily};
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;
@@ -163,6 +164,23 @@ pub fn lfm_prove_with_hasher(
     )
 }
 
+/// [`lfm_prove`] under the proof family `Fam` (`hash_pin::ProofFamily`): its
+/// commitment configuration, transcript and statement tag. `artifacts` must be
+/// built under `Fam::Stark` (`registry::build_artifacts_under`); artifacts of
+/// another configuration fail at the precomputed-root check.
+pub fn lfm_prove_under<Fam: ProofFamily>(
+    program: &LfmProgram,
+    artifacts: &LfmArtifacts,
+    arenas: &[Vec<LfmWord>],
+    options: &ProofOptions,
+) -> Result<LfmProof, LfmProveError> {
+    lfm_execute_and_fill(program, arenas, artifacts.hasher)?.prove_under::<Fam>(
+        artifacts,
+        options,
+        decide_lfm_residency(),
+    )
+}
+
 /// [`lfm_prove_with_hasher`] with the residency mode supplied instead of read
 /// from the environment, so a test can prove the same program under both modes
 /// in one process without touching global state.
@@ -281,6 +299,16 @@ impl LfmFilled {
         options: &ProofOptions,
         residency: ResidencyMode,
     ) -> Result<LfmProof, LfmProveError> {
+        self.prove_under::<LegacyFamily>(artifacts, options, residency)
+    }
+
+    /// [`Self::prove`] under the proof family `Fam` ([`prove_traces_under`]).
+    pub(crate) fn prove_under<Fam: ProofFamily>(
+        self,
+        artifacts: &LfmArtifacts,
+        options: &ProofOptions,
+        residency: ResidencyMode,
+    ) -> Result<LfmProof, LfmProveError> {
         let LfmFilled {
             mut traces,
             public_words,
@@ -292,7 +320,7 @@ impl LfmFilled {
         same_hasher(artifacts.hasher, hasher)?;
         let t = Instant::now();
         let waited_before = super::device_permit::waited_secs();
-        let proof = prove_traces_with_hasher(
+        let proof = prove_traces_under::<Fam>(
             artifacts,
             &mut traces,
             &public_words,
@@ -364,7 +392,27 @@ pub(crate) fn prove_traces(
 /// recompute changes how long an LDE lives, never a byte the transcript absorbs
 /// — so threading them through the prove signature would put knobs with no wire
 /// meaning in front of every caller.
+#[cfg(test)]
 pub(crate) fn prove_traces_with_hasher(
+    artifacts: &LfmArtifacts,
+    traces: &mut LfmTraces,
+    public_words: &[(u32, LfmWord)],
+    options: &ProofOptions,
+    hasher: HasherKind,
+    residency: ResidencyMode,
+) -> Result<MultiProof<F, E, ()>, ProvingError> {
+    prove_traces_under::<LegacyFamily>(artifacts, traces, public_words, options, hasher, residency)
+}
+
+/// Proves an already-built trace set against an AIR set built for `hasher`
+/// (the traces must have been built with the same one), under the proof
+/// family `Fam`: the transcript is `Fam`'s, seeded and statement-bound as the
+/// legacy one is but with the family's statement tag first, and the proof
+/// commits under `Fam::Stark`.
+///
+/// Storage mode comes from [`crate::auto_storage::decide_lfm`] and residency
+/// mode is the caller's: both are resource decisions, invisible to the proof.
+pub(crate) fn prove_traces_under<Fam: ProofFamily>(
     artifacts: &LfmArtifacts,
     traces: &mut LfmTraces,
     public_words: &[(u32, LfmWord)],
@@ -394,14 +442,15 @@ pub(crate) fn prove_traces_with_hasher(
     if let Some(one_row) = &artifacts.one_row_roots {
         airs = airs.with_one_row_roots(one_row);
     }
-    let mut transcript = crate::hash_pin::block_transcript(&[]);
-    absorb_lfm_statement(
+    let mut transcript = Fam::transcript(&[]);
+    absorb_lfm_statement_tagged(
         &mut transcript,
+        Fam::STATEMENT_TAG,
         &artifacts.program_id,
         public_words,
         options.fri_final_poly_log_degree,
     );
-    crate::hash_pin::BlockProver::<F, E, ()>::multi_prove(
+    stark::prover::GenericProver::<F, E, (), Fam::Stark>::multi_prove(
         airs.air_trace_pairs(traces),
         &mut transcript,
         #[cfg(feature = "disk-spill")]
@@ -464,7 +513,20 @@ pub fn verify_against_artifacts(
     claimed_public: &[(u32, LfmWord)],
     options: &ProofOptions,
 ) -> bool {
-    verify_against_chunked_with(
+    verify_against_artifacts_under::<LegacyFamily>(artifacts, proof, claimed_public, options)
+}
+
+/// [`verify_against_artifacts`] under the proof family `Fam`: `Fam`'s
+/// transcript and statement tag, `Fam::Stark`'s verifier. The family is the
+/// verifier's constant: a proof made under any other fails its first Merkle
+/// check or transcript draw.
+pub fn verify_against_artifacts_under<Fam: ProofFamily>(
+    artifacts: &LfmArtifacts,
+    proof: &MultiProof<F, E, ()>,
+    claimed_public: &[(u32, LfmWord)],
+    options: &ProofOptions,
+) -> bool {
+    verify_against_chunked_with::<Fam>(
         artifacts.one_row_roots.as_ref(),
         &artifacts.roots,
         &artifacts.blake3_chunk_roots,
@@ -548,7 +610,7 @@ pub fn verify_against_chunked(
     hasher: HasherKind,
     chip_set: ChipSet,
 ) -> bool {
-    verify_against_chunked_with(
+    verify_against_chunked_with::<LegacyFamily>(
         None,
         roots,
         blake3_roots,
@@ -570,7 +632,7 @@ pub fn verify_against_chunked(
 /// has them (`None` = row-pair roots only: a chip resolved to one row then
 /// rejects).
 #[allow(clippy::too_many_arguments)]
-fn verify_against_chunked_with(
+fn verify_against_chunked_with<Fam: ProofFamily>(
     one_row_roots: Option<&super::registry::LfmOneRowRoots>,
     roots: &[Commitment; NUM_LFM_CHIPS],
     blake3_roots: &[Commitment],
@@ -627,9 +689,10 @@ fn verify_against_chunked_with(
     }
     let refs = airs.air_refs();
 
-    let mut transcript = crate::hash_pin::block_transcript(&[]);
-    absorb_lfm_statement(
+    let mut transcript = Fam::transcript(&[]);
+    absorb_lfm_statement_tagged(
         &mut transcript,
+        Fam::STATEMENT_TAG,
         program_id,
         claimed_public,
         options.fri_final_poly_log_degree,
@@ -646,7 +709,7 @@ fn verify_against_chunked_with(
         return false;
     };
 
-    crate::hash_pin::BlockVerifier::<F, E, ()>::multi_verify_views(
+    stark::verifier::GenericVerifier::<F, E, (), Fam::Stark>::multi_verify_views(
         &refs,
         view,
         &mut transcript,
