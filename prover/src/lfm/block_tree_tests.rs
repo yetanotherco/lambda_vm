@@ -3532,12 +3532,15 @@ fn the_block_tree_composes_to_a_top_node() {
             .unwrap_or_else(|e| panic!("NOEPOCH_SHAPE_OUT {path}: {e}"));
         println!("   BLOCK SHAPE written to {path}");
     }
-    // Off the run's clock: the top proof's size, and the plan's partition.
+    // Off the run's clock: the top proof's size and digest (two runs under the
+    // deterministic grind print the same one), and the plan's partition.
+    let top_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&top_proof.proof)
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
     println!(
-        "   BLOCK TOP PROOF: {} B · {} leaves · cost model {:#x}",
-        rkyv::to_bytes::<rkyv::rancor::Error>(&top_proof.proof)
-            .map(|b| b.len())
-            .unwrap_or(0),
+        "   BLOCK TOP PROOF: {} B · digest {} · {} leaves · cost model {:#x}",
+        top_bytes.len(),
+        &blake3::hash(&top_bytes).to_hex()[..32],
         rb.plan.partition().num_leaves(),
         rb.plan.cost_model()
     );
