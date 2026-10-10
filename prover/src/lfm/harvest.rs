@@ -70,6 +70,7 @@ pub(crate) struct HostTable {
 /// A sub-proof inside a multi-table proof, read into [`HostTable`]: the fork
 /// is already positioned (separator, aux root and `L` absorbed), so the oracle
 /// comes from `replay_rounds_after_round_1` on THAT transcript.
+#[cfg(test)]
 pub(crate) fn host_table_forked(
     air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
     view: StarkProofView<'_, Gl, Ext3, ()>,
@@ -78,14 +79,35 @@ pub(crate) fn host_table_forked(
     fork: &mut crate::hash_pin::BlockTranscript,
     lookup_challenges: &[FEE],
 ) -> Result<HostTable, String> {
-    use crate::hash_pin::BlockVerifier as Verifier;
+    host_table_forked_under::<crate::hash_pin::LegacyFamily>(
+        air,
+        view,
+        index,
+        num_tables,
+        fork,
+        lookup_challenges,
+    )
+}
+
+/// [`host_table_forked`] for a sub-proof of a proof made under the family
+/// `Fam`: `Fam`'s transcript, its configuration's verifier replay.
+pub(crate) fn host_table_forked_under<Fam: crate::hash_pin::ProofFamily>(
+    air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
+    view: StarkProofView<'_, Gl, Ext3, ()>,
+    index: usize,
+    num_tables: usize,
+    fork: &mut Fam::Transcript,
+    lookup_challenges: &[FEE],
+) -> Result<HostTable, String> {
     use stark::domain::new_verifier_domain;
     use stark::verifier::IsStarkVerifier;
+    type Verifier<F, E, PI, Fam> =
+        stark::verifier::GenericVerifier<F, E, PI, <Fam as crate::hash_pin::ProofFamily>::Stark>;
 
     let trace_length = view.trace_length();
     let domain = new_verifier_domain(air, trace_length);
-    let layout = Verifier::<Gl, Ext3, ()>::ood_layout(air);
-    let challenges = Verifier::<Gl, Ext3, ()>::replay_rounds_after_round_1(
+    let layout = Verifier::<Gl, Ext3, (), Fam>::ood_layout(air);
+    let challenges = Verifier::<Gl, Ext3, (), Fam>::replay_rounds_after_round_1(
         air,
         view,
         &(),
@@ -212,15 +234,34 @@ fn check_eq<T: PartialEq + std::fmt::Debug>(got: T, want: T, what: &str) -> Resu
 /// verifier for the reason the arena schema makes it one: the program is emitted
 /// for a specific epoch shape, and a proof whose trace length disagreed would
 /// not match the arenas it declares.
+#[cfg(test)]
 pub(crate) fn build_table_legs(
     air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
     view: StarkProofView<'_, Gl, Ext3, ()>,
     rap_challenges: &[FEE],
 ) -> Result<TableLegs, String> {
+    build_table_legs_with(
+        air,
+        view,
+        rap_challenges,
+        stark::config::TreeGeometry::BINARY,
+    )
+}
+
+/// [`build_table_legs`] for a sub-proof whose trees are `trees` (its
+/// configuration's arity and arity-4 cap): every path is laid out to the cap
+/// in the walk's order, child order at arity 4
+/// ([`super::merkle_cap::child_path_to_cap`]).
+pub(crate) fn build_table_legs_with(
+    air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
+    view: StarkProofView<'_, Gl, Ext3, ()>,
+    rap_challenges: &[FEE],
+    trees: stark::config::TreeGeometry,
+) -> Result<TableLegs, String> {
     // The shapes, from the AIR and the trace length alone; the proof's blocks
     // are then checked against them, never read into them.
     let trace_length = view.trace_length();
-    let (verify, analysis) = TableVerifyShape::derive(air, trace_length)
+    let (verify, analysis) = TableVerifyShape::derive_with(air, trace_length, trees)
         .map_err(|e| format!("the legs' shape derives: {e}"))?;
     let (main_width, aux_width) = air.trace_layout();
     let num_precomputed = if air.is_preprocessed() {
@@ -263,25 +304,19 @@ pub(crate) fn build_table_legs(
     )?;
 
     // ---- the owner split: query 0 of a capped tree carries the cap at the end
-    // of its path; the arenas take the `D − c` siblings, the caps arena the cap.
+    // of its path; the arenas take the path to the cap (in the walk's order),
+    // the caps arena the cap.
     let mut trace_caps: Vec<Vec<Commitment>> = Vec::new();
+    let arity = verify.sub.arity;
     let mut split = |q: usize,
                      path: &[Commitment],
                      depth: usize,
                      c: usize|
      -> Result<Vec<Commitment>, String> {
-        if c == 0 || q != 0 {
-            check_eq(
-                path.len(),
-                depth - c,
-                &format!("query {q}: a path to the cap"),
-            )?;
-            return Ok(path.to_vec());
-        }
-        let (siblings, cap) = crypto::merkle_tree::cap::split_owner_path(path, depth, c)
-            .ok_or("the owner path is D − c + 2^c long")?;
-        trace_caps.push(cap.to_vec());
-        Ok(siblings.to_vec())
+        let (siblings, cap) = super::merkle_cap::child_path_to_cap(path, depth, c, arity, q == 0)
+            .map_err(|e| format!("query {q}: {e}"))?;
+        trace_caps.extend(cap);
+        Ok(siblings)
     };
     let (depth, c_trace) = (verify.sub.merkle_depth, verify.sub.trace_cap);
 
@@ -435,15 +470,13 @@ where
             offset += fri.layer_values(i);
             let path = d.layer_auth_path(i);
             let (depth, c) = (fri.layer_depth(i), fri.layer_cap(i));
-            if c == 0 || q != 0 {
-                check_eq(path.len(), depth - c, &format!("query {q} FRI layer {i}"))?;
-                layers.push((values, path.to_vec()));
-                continue;
+            let (siblings, cap) =
+                super::merkle_cap::child_path_to_cap(path, depth, c, fri.arity(), q == 0)
+                    .map_err(|e| format!("query {q} FRI layer {i}: {e}"))?;
+            if let Some(cap) = cap {
+                caps.extend(cap);
             }
-            let (siblings, cap) = crypto::merkle_tree::cap::split_owner_path(path, depth, c)
-                .ok_or("the owner path is D − c + 2^c long")?;
-            caps.extend_from_slice(cap);
-            layers.push((values, siblings.to_vec()));
+            layers.push((values, siblings));
         }
         openings.push(layers);
     }
@@ -583,6 +616,16 @@ pub(crate) fn harvest_child(
     opts: crate::ProofOptions,
     proved: &super::proof::LfmProof,
 ) -> Result<HarvestedChild, String> {
+    harvest_child_under::<crate::hash_pin::LegacyFamily>(artifacts, opts, proved)
+}
+
+/// [`harvest_child`] of a proof made under the family `Fam`: `Fam`'s
+/// statement seed and transcript, its configuration's trees.
+pub(crate) fn harvest_child_under<Fam: crate::hash_pin::ProofFamily>(
+    artifacts: super::registry::LfmArtifacts,
+    opts: crate::ProofOptions,
+    proved: &super::proof::LfmProof,
+) -> Result<HarvestedChild, String> {
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     use stark::proof::view::MultiProofView;
 
@@ -598,9 +641,10 @@ pub(crate) fn harvest_child(
     // The seed IS `verify_against_chunked`'s: the LFM statement over the claimed
     // words, and nothing before it.
     let seed = || {
-        let mut t = crate::hash_pin::block_transcript(&[]);
-        super::statement::absorb_lfm_statement(
+        let mut t = Fam::transcript(&[]);
+        super::statement::absorb_lfm_statement_tagged(
             &mut t,
+            Fam::STATEMENT_TAG,
             &artifacts.program_id,
             &proved.public_words,
             opts.fri_final_poly_log_degree,
@@ -636,13 +680,20 @@ pub(crate) fn harvest_child(
             if let Some(c) = v.bus_table_contribution() {
                 fork.append_field_element(&c);
             }
-            host_table_forked(*air, v, idx, num_tables, &mut fork, &lookup)
+            host_table_forked_under::<Fam>(*air, v, idx, num_tables, &mut fork, &lookup)
         })
         .collect::<Result<Vec<_>, String>>()?;
     let legs = refs
         .iter()
         .enumerate()
-        .map(|(idx, air)| build_table_legs(*air, view.get(idx), &lookup))
+        .map(|(idx, air)| {
+            build_table_legs_with(
+                *air,
+                view.get(idx),
+                &lookup,
+                stark::config::TreeGeometry::of::<Fam::Stark>(),
+            )
+        })
         .collect::<Result<Vec<_>, String>>()?;
 
     Ok(HarvestedChild {

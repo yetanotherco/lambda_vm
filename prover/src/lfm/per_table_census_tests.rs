@@ -417,6 +417,7 @@ fn table_shape(
             .merkle_cap
             .height(opts.fri_number_of_queries, merkle_depth),
         layout: leaf_layout,
+        arity: 2,
     };
     let has_aux_trace = air.has_aux_trace();
     let fri = FriShape::for_layout(opts, log2_lde_length, leaf_layout);

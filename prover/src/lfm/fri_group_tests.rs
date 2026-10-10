@@ -535,6 +535,7 @@ fn fri_layer_program(d: u32, c: usize, times: usize) -> LfmProgram {
                 ..ProofFormat::DEFAULT
             }
         },
+        trees: stark::config::TreeGeometry::BINARY,
     };
     shape.check();
     assert_eq!(shape.is_legacy(), pair);

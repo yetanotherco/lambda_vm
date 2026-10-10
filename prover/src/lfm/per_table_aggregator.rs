@@ -98,6 +98,10 @@ pub struct ChildShape<'a> {
     /// The child's `ProofOptions::fri_final_poly_log_degree` — the statement's
     /// last byte.
     pub fri_final_poly_log_degree: u8,
+    /// The child's proof family's statement tag
+    /// (`hash_pin::ProofFamily::STATEMENT_TAG`), absorbed before its statement;
+    /// `None` for the legacy pin. A program constant, like the id.
+    pub statement_tag: Option<&'static [u8]>,
     /// The child's sub-proofs, in proof order.
     pub tables: Vec<ChildTable<'a>>,
 }
@@ -117,6 +121,7 @@ pub struct DerivedChild {
     program_id: Commitment,
     num_public_words: usize,
     fri_final_poly_log_degree: u8,
+    statement_tag: Option<&'static [u8]>,
     tables: Vec<DerivedTable>,
 }
 
@@ -132,6 +137,23 @@ impl DerivedChild {
         opts: &crate::ProofOptions,
         num_public_words: usize,
     ) -> Result<Self, String> {
+        Self::from_artifacts_under::<crate::hash_pin::LegacyFamily>(
+            artifacts,
+            opts,
+            num_public_words,
+        )
+    }
+
+    /// [`Self::from_artifacts`] for a child proved under the family `Fam`:
+    /// its trees are `Fam::Stark`'s (arity, cap) and its statement carries
+    /// `Fam`'s tag. `artifacts` must be built under `Fam::Stark`
+    /// (`registry::build_artifacts_under`).
+    pub fn from_artifacts_under<Fam: crate::hash_pin::ProofFamily>(
+        artifacts: &super::registry::LfmArtifacts,
+        opts: &crate::ProofOptions,
+        num_public_words: usize,
+    ) -> Result<Self, String> {
+        let trees = stark::config::TreeGeometry::of::<Fam::Stark>();
         let heights = super::airs::LfmAirs::log_heights_in_air_order(artifacts)
             .ok_or("a child with KECCAK_RND chunks has workload heights")?;
         let airs = super::airs::LfmAirs::for_artifacts(artifacts, opts);
@@ -146,7 +168,7 @@ impl DerivedChild {
             .enumerate()
             .map(|(idx, (air, h))| {
                 let rows = 1usize << h;
-                let (verify, analysis) = TableVerifyShape::derive(*air, rows)?;
+                let (verify, analysis) = TableVerifyShape::derive_with(*air, rows, trees)?;
                 let precomputed_root = if air.is_preprocessed() {
                     Some(
                         super::epoch_verify::layout_precomputed_commitment(*air, rows)
@@ -167,6 +189,7 @@ impl DerivedChild {
             program_id: artifacts.program_id,
             num_public_words,
             fri_final_poly_log_degree: opts.fri_final_poly_log_degree,
+            statement_tag: Fam::STATEMENT_TAG,
             tables,
         })
     }
@@ -177,6 +200,7 @@ impl DerivedChild {
             program_id: &self.program_id,
             num_public_words: self.num_public_words,
             fri_final_poly_log_degree: self.fri_final_poly_log_degree,
+            statement_tag: self.statement_tag,
             tables: self
                 .tables
                 .iter()
@@ -284,6 +308,22 @@ pub fn emit_lfm_statement(
     words: &[HintedPublicWord],
     fri_final_poly_log_degree: u8,
 ) {
+    emit_lfm_statement_tagged(t, None, program_id, words, fri_final_poly_log_degree);
+}
+
+/// Emits [`super::statement::absorb_lfm_statement_tagged`]: the child
+/// family's tag as one call first (a PROGRAM CONSTANT; nothing for the legacy
+/// pin), then [`emit_lfm_statement`]'s calls.
+pub fn emit_lfm_statement_tagged(
+    t: &mut TranscriptReplay,
+    family_tag: Option<&[u8]>,
+    program_id: &Commitment,
+    words: &[HintedPublicWord],
+    fri_final_poly_log_degree: u8,
+) {
+    if let Some(tag) = family_tag {
+        t.append_const_bytes(tag);
+    }
     t.append_const_bytes(LFM_STATEMENT_TAG);
     t.append_const_bytes(program_id);
     t.append_const_bytes(&LFM_MACHINE_VERSION.to_le_bytes());
@@ -425,8 +465,9 @@ pub fn emit_leg(b: &mut LfmBuilder, child: &ChildShape<'_>, a: &LegArenas) -> Le
     // ---- the statement, over the child's claimed published words ----
     let publics = hint_public_words(b, a.publics, child.num_public_words);
     let mut t = TranscriptReplay::new(&[]);
-    emit_lfm_statement(
+    emit_lfm_statement_tagged(
         &mut t,
+        child.statement_tag,
         child.program_id,
         &publics,
         child.fri_final_poly_log_degree,
