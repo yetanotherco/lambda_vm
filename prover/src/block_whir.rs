@@ -4350,20 +4350,7 @@ fn prove_streamed(
         // Phase B's order (N3): the groups with nothing dropped first, then the
         // rebuilt streamed and rest groups interleaved by their cells, so each
         // regenerator keeps up with only its share of phase B's pace.
-        let group_cells: Vec<u64> = {
-            let mut at = 0usize;
-            laid.groups
-                .iter()
-                .map(|group| {
-                    let cells = laid.shapes[at..at + group.len()]
-                        .iter()
-                        .map(|&(w, n)| (w as u64) << n)
-                        .sum();
-                    at += group.len();
-                    cells
-                })
-                .collect()
-        };
+        let group_cells = group_cells(&laid.shapes, &laid.groups);
         let order: Vec<usize> = match deviations.phase_b_order {
             Some(order) => order(laid.groups.len()),
             None => multilinear_block::interleaved_order(&classes, &group_cells),
@@ -5374,6 +5361,50 @@ mod spill_policy_tests {
         assert!(parse_hand_off(Some(" on ")));
         assert!(!parse_hand_off(Some("off")));
         assert!(!parse_hand_off(Some(" off ")));
+    }
+}
+
+/// Each group's cells, from its own tables: `shapes` is in AIR order and a
+/// group lists its tables' AIR indices, which phase A's packer does not keep
+/// contiguous (a group of streamed CPU and MEMW_R chunks sits between rest
+/// families in AIR order). Phase B's interleave and its readout weigh the
+/// groups by these.
+fn group_cells(shapes: &[(usize, usize)], groups: &[Vec<u32>]) -> Vec<u64> {
+    groups
+        .iter()
+        .map(|group| {
+            group
+                .iter()
+                .filter_map(|&i| shapes.get(i as usize))
+                .map(|&(w, n)| (w as u64) << n)
+                .sum()
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod group_cells_tests {
+    use super::group_cells;
+
+    /// A group weighs its own tables, wherever they sit in AIR order: here
+    /// group 0 holds AIRs 3 and 1, group 1 AIRs 0, 4 and 2.
+    #[test]
+    fn each_group_weighs_its_own_tables_in_any_air_order() {
+        let shapes = [(1, 4), (2, 10), (3, 0), (5, 20), (7, 1)];
+        let groups = vec![vec![3, 1], vec![0, 4, 2]];
+        assert_eq!(
+            group_cells(&shapes, &groups),
+            vec![(5 << 20) + (2 << 10), (1 << 4) + (7 << 1) + 3]
+        );
+    }
+
+    /// Groups in AIR order weigh the same as before, and an index past the
+    /// shapes adds nothing (no panic).
+    #[test]
+    fn contiguous_groups_and_a_stray_index() {
+        let shapes = [(4, 2), (1, 3), (2, 1)];
+        assert_eq!(group_cells(&shapes, &[vec![0, 1], vec![2]]), vec![24, 4]);
+        assert_eq!(group_cells(&shapes, &[vec![2, 9]]), vec![4]);
     }
 }
 
