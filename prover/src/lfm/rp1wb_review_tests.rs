@@ -3,7 +3,6 @@
 //! the sparse width-8 permutation is the dense one. (The grind's accept set is
 //! pinned by `rp1wa_review_tests`.)
 
-use crypto::fiat_shamir::is_transcript::IsTranscript;
 use crypto::fiat_shamir::p1_transcript::P1Transcript;
 use crypto::hash::poseidon1_w8;
 use multilinear::mle::Mle;
@@ -24,7 +23,9 @@ use super::executor::execute;
 use super::hash::HasherKind;
 use super::p1w16_emit::{Lane, w8_permute, w8_permute_lanes};
 use super::validator::validate;
-use super::whir_chain::{ChainShape, RoundStorage, emit_verify_weighted, push_round_words, round_words};
+use super::whir_chain::{
+    ChainShape, RoundStorage, emit_verify_weighted, push_round_words, round_words,
+};
 use super::whir_poly::emit_eq_eval;
 use super::whir_transcript::WhirTranscript;
 use super::word::{LfmWord, base_word, ext_word};
@@ -109,7 +110,10 @@ fn fixture(num_vars: usize, cfg: ChainConfig) -> Fixture {
         domain,
         shape,
     };
-    assert!(host_accepts(&fx, &fx.proof), "the host accepts its own proof");
+    assert!(
+        host_accepts(&fx, &fx.proof),
+        "the host accepts its own proof"
+    );
     fx
 }
 
@@ -221,7 +225,10 @@ fn rp1wb_an_opening_moved_to_another_query_index_is_refused() {
                 f.shape.caps
             );
         }
-        assert!(tried >= 2, "at least two sides were swapped (caps {cap4:?})");
+        assert!(
+            tried >= 2,
+            "at least two sides were swapped (caps {cap4:?})"
+        );
     }
 }
 
@@ -254,8 +261,16 @@ fn rp1wb_the_sparse_w8_is_the_dense_w8() {
             let arena: Vec<LfmWord> = input.iter().map(|v| base_word(*v)).collect();
             let got = run(b, &[arena]).expect("executes");
             for k in 0..keep {
-                assert_eq!(got[8 * k], want[k], "trial {trial} keep {keep} sparse lane {k}");
-                assert_eq!(got[8 * k + 4], want[k], "trial {trial} keep {keep} dense lane {k}");
+                assert_eq!(
+                    got[8 * k],
+                    want[k],
+                    "trial {trial} keep {keep} sparse lane {k}"
+                );
+                assert_eq!(
+                    got[8 * k + 4],
+                    want[k],
+                    "trial {trial} keep {keep} dense lane {k}"
+                );
             }
         }
     }
