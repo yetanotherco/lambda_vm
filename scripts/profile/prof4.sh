@@ -115,6 +115,8 @@ BUILD_ENV=("PATH=$BASE_PATH" "HOME=$W/home" "RUSTUP_HOME=$RUSTUP_HOME_REAL" "RUS
            "TMPDIR=$W/tmp" "LC_ALL=C" "LANG=C" "CUDA_HOME=$CUDA_DIR" "CUDA_VISIBLE_DEVICES=$GPU")
 TOOL="$W/tools/prof4_summary.py"; SAMPLER="$W/tools/prof4_sampler.py"
 
+text_of() { "$@" 2>&1 || true; }                       # a command's whole output, whatever its status
+first_of() { grep -oE -- "$1" | head -1 || true; }      # the first match of an ERE on stdin, or nothing
 gpu_q() { "$NVSMI" -i "$GPU" --query-gpu="$1" --format=csv,noheader,nounits 2>/dev/null | head -1 | sed 's/^ *//; s/ *$//'; }
 gpu_idle() {  # used MiB below the floor and no compute process on this GPU
   local used apps
@@ -131,20 +133,25 @@ wait_ready() {  # wait_ready LABEL: the GPU idle and ≥ 46 GiB available, up to
     sleep 10; t=$((t + 10))
   done
 }
-bounded() {  # bounded SECS OUT cmd...: own process group; past SECS: INT, 60 s, KILL to the group; status or 124
-  local secs="$1" out="$2" pid t=0 rc
+bounded() {  # bounded SECS OUT cmd...: own process group; past SECS: INT, 60 s, KILL to the group; status or 124. With
+             # ABORT_LOG set: once that log shows a device ABORT, the group gets 60 s to exit on its own, then the same stop (125)
+  local secs="$1" out="$2" pid t=0 rc ab=-1
   shift 2
   set -m
   "$@" < /dev/null > "$out" 2>&1 &
   pid=$!
   set +m
   while kill -0 "$pid" 2>/dev/null; do
-    if [ "$t" -ge "$secs" ]; then
-      say "timeout after ${secs} s: stopping process group $pid"
+    if [ -n "${ABORT_LOG:-}" ] && [ "$ab" -lt 0 ] && [ $((t % 5)) -eq 0 ] && grep '\[gpu\] ABORT' "$ABORT_LOG" > /dev/null 2>&1; then
+      ab=$t; say "a device ABORT in $(basename "$(dirname "$ABORT_LOG")"): the run gets 60 s to exit, then it is stopped"
+    fi
+    if [ "$t" -ge "$secs" ] || { [ "$ab" -ge 0 ] && [ $((t - ab)) -ge 60 ]; }; then
+      say "$( [ "$t" -ge "$secs" ] && echo "timeout after ${secs} s" || echo "hung after a device ABORT"): stopping process group $pid"
       kill -INT -- "-$pid" 2>/dev/null || true
       for _ in $(seq 60); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
       kill -KILL -- "-$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
+      [ "$ab" -ge 0 ] && return 125
       return 124
     fi
     sleep 1; t=$((t + 1))
@@ -168,7 +175,7 @@ preflight() {
   else chk FAIL "python3 >= 3.8 with the sqlite3 module needed"; fi
   for v in NVSMI NVCC NSYS NCU; do [ -n "${!v}" ] && [ -x "${!v}" ] || chk FAIL "missing: $(echo "$v" | tr 'A-Z' 'a-z' | sed 's/nvsmi/nvidia-smi/') (CUDA toolkit / Nsight Systems / Nsight Compute)"; done
   [ "$NFAIL" -eq 0 ] || return 0
-  local name cc mem drv used nsv ncv
+  local name cc mem drv used
   name="$(gpu_q name)"; cc="$(gpu_q compute_cap)"; mem="$(gpu_q memory.total)"; drv="$(gpu_q driver_version)"
   [ -n "$name" ] && chk PASS "gpu $GPU: $name · compute capability $cc · $mem MiB · driver $drv" || chk FAIL "gpu $GPU: nvidia-smi sees none"
   [ "$cc" = "12.0" ] || chk WARN "compute capability $cc: the plan was made on an RTX 5090 (12.0)"
@@ -176,10 +183,11 @@ preflight() {
   used="$(gpu_q memory.used)"
   gpu_idle && chk PASS "idle: gpu $GPU uses $used MiB, no compute process" || chk FAIL "gpu $GPU is busy ($used MiB used or a compute process): close it and re-run"
   case "$drv" in 58[0-9].*) chk WARN "driver $drv: on 580.65 the 10-01 run saw freed device memory not reused (VRAM climbs per group); a run that aborts on the device is retried once with a smaller VRAM budget (16000 MiB, pool released at each sync) and says so" ;; esac
-  nsv="$("$NSYS" --version 2>&1 | grep -oE '20[0-9]{2}\.[0-9.]+' | head -1)"; ncv="$("$NCU" --version 2>&1 | grep -oE '20[0-9]{2}\.[0-9.]+' | head -1)"
-  chk PASS "nvcc $("$NVCC" --version | grep -oE 'release [0-9.]+' | head -1) · nsys $nsv · ncu $ncv"
-  if "$NSYS" profile --help 2>&1 | grep -q -- '--gpu-metrics-devices'; then GM_FLAG=--gpu-metrics-devices; else GM_FLAG=--gpu-metrics-device; fi
-  if "$NCU" --help 2>&1 | grep -q -- '--kill'; then NCU_KILL=1; else NCU_KILL=0; chk WARN "ncu has no --kill: each run-B pass runs its workload to the end (slower)"; fi
+  NVCC_VER="$(text_of "$NVCC" --version | first_of 'release [0-9.]+')"; NSYS_VER="$(text_of "$NSYS" --version | first_of '20[0-9]{2}\.[0-9.]+')"
+  NCU_VER="$(text_of "$NCU" --version | first_of '20[0-9]{2}\.[0-9.]+')"
+  chk PASS "nvcc $NVCC_VER · nsys $NSYS_VER · ncu $NCU_VER"
+  case "$(text_of "$NSYS" profile --help)" in *--gpu-metrics-devices*) GM_FLAG=--gpu-metrics-devices ;; *) GM_FLAG=--gpu-metrics-device ;; esac
+  case "$(text_of "$NCU" --help)" in *--kill*) NCU_KILL=1 ;; *) NCU_KILL=0; chk WARN "ncu has no --kill: each run-B pass runs its workload to the end (slower)" ;; esac
   local mt av fr
   mt="$(awk '/^MemTotal:/ {printf "%.1f", $2 / 1048576}' /proc/meminfo)"; av="$(awk '/^MemAvailable:/ {printf "%.1f", $2 / 1048576}' /proc/meminfo)"
   awk -v m="$mt" 'BEGIN { exit !(m >= 56) }' && chk PASS "ram: MemTotal $mt GiB, $av available (the prover sizes its spill and program budget to MemTotal - 10 GiB)" \
@@ -187,7 +195,7 @@ preflight() {
   awk -v a="$av" 'BEGIN { exit !(a >= 46) }' || chk FAIL "ram: only $av GiB available; close other programs (>= 46 needed before each run)"
   fr="$(df -BG --output=avail "$W" | tail -1 | tr -dc 0-9)"
   [ "${fr:-0}" -ge 80 ] && chk PASS "disk: $fr GiB free in the work directory" || chk FAIL "disk: $fr GiB free in $W; need >= 80 (builds ≈ 15, captures ≈ 10, a possible spill ≈ 30)"
-  if RUSTUP_HOME="$RUSTUP_HOME_REAL" "$CARGO_BIN/rustup" toolchain list 2>/dev/null | grep -q "^$RUST_TOOLCHAIN"; then chk PASS "rust: toolchain $RUST_TOOLCHAIN installed"
+  if text_of env RUSTUP_HOME="$RUSTUP_HOME_REAL" "$CARGO_BIN/rustup" toolchain list | grep "^$RUST_TOOLCHAIN" > /dev/null; then chk PASS "rust: toolchain $RUST_TOOLCHAIN installed"
   else chk FAIL "rust: toolchain $RUST_TOOLCHAIN missing: rustup toolchain install $RUST_TOOLCHAIN"; fi
   # counters, the nsys GPU-metrics flags and the export on a 3-kernel probe, with the exact run flags
   cat > "$W/probe/probe.cu" <<'CU'
@@ -276,10 +284,19 @@ build() {  # build w|s → BIN_w / BIN_s
     (cd "$wt" && bounded 5400 "$SEND/build-$k.log" env -i "${BUILD_ENV[@]}" "CARGO_TARGET_DIR=$W/target-$k" "CUDARC_NVCC_ARCH=$CC_ARCH" \
        cargo test --release -p lambda-vm-prover --features cuda --lib --no-run) || { tail -30 "$SEND/build-$k.log"; die 3 "build $k failed: $SEND/build-$k.log"; }
   fi
-  rel="$(sed -n 's/.*Executable unittests src\/lib.rs (\(.*lambda_vm_prover-[0-9a-f]*\)).*/\1/p' "$SEND/build-$k.log" 2>/dev/null | tail -1)"
-  [ -n "$rel" ] || rel="$(find "$W/target-$k/release/deps" -maxdepth 1 -name 'lambda_vm_prover-*' -type f -perm -u+x -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
-  case "$rel" in /*) ;; *) rel="$wt/$rel" ;; esac
-  [ -x "$rel" ] || die 3 "no test binary for $k"
+  # Under --skip-build this run directory has no build log: the binary is the newest test executable in the target dir.
+  # Each lookup tolerates a missing file (under set -e + pipefail a failing sed or find would end the script silently).
+  rel=""
+  [ ! -f "$SEND/build-$k.log" ] || rel="$({ sed -n 's/.*Executable unittests src\/lib.rs (\(.*lambda_vm_prover-[0-9a-f]*\)).*/\1/p' "$SEND/build-$k.log" || true; } | tail -1)"
+  if [ -z "$rel" ]; then
+    local f
+    for f in "$W/target-$k"/release/deps/lambda_vm_prover-*; do
+      [ -f "$f" ] && [ -x "$f" ] || continue
+      if [ -z "$rel" ] || [ "$f" -nt "$rel" ]; then rel="$f"; fi
+    done
+  fi
+  case "$rel" in /*|"") ;; *) rel="$wt/$rel" ;; esac
+  [ -n "$rel" ] && [ -f "$rel" ] && [ -x "$rel" ] || die 3 "no test binary for $k$( [ "$SKIP_BUILD" = 0 ] || echo " in $W/target-$k (--skip-build needs an earlier build in this work directory)")"
   [ -z "$(git -C "$wt" status --porcelain --untracked-files=no)" ] || die 3 "worktree $wt changed during the build"
   printf -v "BIN_$k" '%s' "$rel"
   say "binary $k: $(basename "$rel") sha256 $(sha256sum "$rel" | cut -c1-16)…"
@@ -343,7 +360,7 @@ run_one() {
   spid=$!
   t0=$(date +%s)
   set +e
-  bounded "$to" "$RD/bounded.out" bash "$RD/cmd.sh"
+  ABORT_LOG="$RD/out.log" bounded "$to" "$RD/bounded.out" bash "$RD/cmd.sh"
   RC=$?
   set -e
   kill "$upid" "$spid" 2>/dev/null || true; wait "$upid" "$spid" 2>/dev/null || true
@@ -366,7 +383,8 @@ runa() {
   if [ "$RC" -ne 0 ] && [ ! -s "$RD/watchdog.txt" ] && device_abort "$RD/out.log"; then
     say "$name: the device aborted (driver-side memory?): one retry with $SAFE_VRAM"
     mv "$RD" "$RD.aborted"; rm -f "$RD.aborted/cap.nsys-rep"
-    run_one "$name" "$k" "$arm" "$blk" nsys "$SAFE_VRAM"; note="retried with $SAFE_VRAM"
+    local safe="$SAFE_VRAM"; [ "$k" = w ] || safe="$SAFE_VRAM TABLE_PARALLELISM=4"
+    run_one "$name" "$k" "$arm" "$blk" nsys "$safe"; note="retried with $safe"
   fi
   local out="$SEND/runa/$name"; mkdir -p "$out"
   cp "$RD/knobs.txt" "$RD/tz.txt" "$RD/smi.csv" "$RD/host.tsv" "$out/" 2>/dev/null || true
@@ -427,7 +445,7 @@ facts() {
     echo "prof4: script sha256 $(sha256sum "$SCRIPT" | cut -c1-16)… from ${PROF4_REV:-?} · mode $MODE · started $STAMP · deadline $DEADLINE_MIN min"
     echo "pins: W $W_SHA ($W_BRANCH, arms BLOCK_WHIR_BASE=p1w|rpx) · S $S_SHA ($S_BRANCH, NOEPOCH_BASE=p1 cap 1)"
     [ -z "$NVSMI" ] || echo "gpu $GPU: $(gpu_q name) · cc $(gpu_q compute_cap) · $(gpu_q memory.total) MiB · driver $(gpu_q driver_version) · power limit $(gpu_q power.limit) W · max SM $(gpu_q clocks.max.sm) MHz"
-    echo "tools: nvcc $("${NVCC:-false}" --version 2>/dev/null | grep -oE 'release [0-9.]+' | head -1) · nsys $("${NSYS:-false}" --version 2>&1 | grep -oE '20[0-9.]+' | head -1) ($GM_FLAG 2 kHz, osrt $NSYS_OSRT) · ncu $("${NCU:-false}" --version 2>&1 | grep -oE '20[0-9.]+' | head -1) (--clock-control base, kill $NCU_KILL)"
+    echo "tools: nvcc ${NVCC_VER:-?} · nsys ${NSYS_VER:-?} ($GM_FLAG 2 kHz, osrt $NSYS_OSRT) · ncu ${NCU_VER:-?} (--clock-control base, kill $NCU_KILL)"
     echo "host: $(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo 2>/dev/null) · $(nproc) threads · MemTotal $(awk '/^MemTotal:/ {printf "%.1f", $2 / 1048576}' /proc/meminfo 2>/dev/null) GiB · $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-?}")"
     echo "binaries: w $(sha256sum "${BIN_w:-/dev/null}" 2>/dev/null | cut -c1-16)… s $(sha256sum "${BIN_s:-/dev/null}" 2>/dev/null | cut -c1-16)… (cargo test --release -p lambda-vm-prover --features cuda --lib, CUDARC_NVCC_ARCH=${CC_ARCH:-?})"
     echo "fixtures: $ELF_NAME, $BENCH_NAME, $MED_NAME (sha256-checked)"
