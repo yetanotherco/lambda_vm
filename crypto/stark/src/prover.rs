@@ -3095,11 +3095,12 @@ pub trait IsStarkProver<
         // layout (row pairs `log2(lde) − 1`, one row `log2(lde)`) and each FRI
         // layer's from the fold layout (a group tree under a fold schedule),
         // so a capped `fri = dp` or one-row proof caps the trees it committed.
-        let caps = crate::merkle_caps::StarkCaps::from_layout(
-            air.options().format.merkle_cap,
+        let caps = crate::merkle_caps::StarkCaps::from_layout_arity(
+            crate::config::effective_cap_policy::<H>(air.options().format.merkle_cap),
             number_of_queries,
             domain_size.trailing_zeros() as usize,
             &fri_layout,
+            H::ARITY,
         );
         if caps.fri.len() != fri_layers.len() {
             return Err(ProvingError::WrongParameter(format!(
@@ -3165,6 +3166,7 @@ pub trait IsStarkProver<
             depth: usize,
             cap: &[Commitment],
             what: &str,
+            arity: usize,
         ) -> Result<(), ProvingError> {
             let mut paths: Vec<&mut Vec<Commitment>> =
                 paths.collect::<Option<_>>().ok_or_else(|| {
@@ -3172,7 +3174,7 @@ pub trait IsStarkProver<
                         "Merkle cap: an opening of the {what} tree is missing"
                     ))
                 })?;
-            crypto::merkle_tree::cap::embed_cap(&mut paths, depth, cap).map_err(|e| {
+            crypto::merkle_tree::cap::embed_cap_arity(&mut paths, depth, cap, arity).map_err(|e| {
                 ProvingError::WrongParameter(format!("Merkle cap of the {what} tree: {e}"))
             })
         }
@@ -3210,6 +3212,7 @@ pub trait IsStarkProver<
                 depth,
                 &main_cap,
                 "main",
+                H::ARITY,
             )?;
             if let Some(tree) = round_1_result.main.precomputed_tree.as_ref() {
                 // Always a full host tree (the process-wide cache; its openings
@@ -3224,6 +3227,7 @@ pub trait IsStarkProver<
                     depth,
                     &cap,
                     "precomputed",
+                    H::ARITY,
                 )?;
             }
             if let Some(aux) = round_1_result.aux.as_ref() {
@@ -3241,6 +3245,7 @@ pub trait IsStarkProver<
                     depth,
                     &cap,
                     "aux",
+                    H::ARITY,
                 )?;
             }
             #[cfg(feature = "cuda")]
@@ -3263,6 +3268,7 @@ pub trait IsStarkProver<
                 depth,
                 &cap,
                 "composition",
+                H::ARITY,
             )?;
         }
 
@@ -3288,6 +3294,7 @@ pub trait IsStarkProver<
                 depth,
                 &cap,
                 &what,
+                H::ARITY,
             )?;
         }
         Ok(())
@@ -3312,9 +3319,12 @@ pub trait IsStarkProver<
         B: IsMerkleTreeBackend<Node = Commitment>,
     {
         if !host.is_root_only() {
-            if host.depth() != Some(depth) {
+            // `MerkleTree::depth` counts the tree's own levels (4-ary at arity 4).
+            let levels = crypto::merkle_tree::cap::tree_levels(depth, B::ARITY);
+            if host.depth() != Some(levels) {
                 return Err(ProvingError::WrongParameter(format!(
-                    "Merkle cap: the {what} tree has depth {:?}, the format expects {depth}",
+                    "Merkle cap: the {what} tree has {:?} levels, the format expects {levels} \
+                     (depth {depth})",
                     host.depth()
                 )));
             }
