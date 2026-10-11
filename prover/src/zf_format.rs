@@ -107,8 +107,9 @@ pub const LEGACY_WHIR_GRIND_BITS: u8 = 20;
 /// minimum it has at 20: the binding phase is the unground fold at 27 variables
 /// (130.393 per polynomial; 128.393 under `GroupFold::Indexed`, D-ONECHAIN),
 /// which neither the query grind nor Q reaches; the query phases move 130.926 →
-/// 130.907. The proven figure as implemented is W-10's 95.3 (CRYPTO-REVIEW). Not below 18: each bit given up costs every chain the recursion
-/// verifies a query (on the block, every block leaf's in-guest openings).
+/// 130.907. The proven figure as implemented is W-10's 95.3 (CRYPTO-REVIEW).
+/// Not below 18: each bit given up costs every chain the recursion verifies a
+/// query (on the block, every block leaf's in-guest openings).
 /// Widening this list is a format decision, not a parser one.
 pub const WHIR_GRIND_BITS: [u8; 2] = [20, 18];
 

@@ -956,12 +956,17 @@ where
     // One root per polynomial, and — before anything is absorbed — one chain
     // per run of the verifier's own split, never the proof's count.
     let chains = layout_chains::<F>(layout, config)?;
-    if roots.len() != layout.num_polys()
-        || (config.format.group == GroupFold::PerPoly && proof.polys.len() != layout.num_polys())
-    {
+    let per_poly = config.format.group == GroupFold::PerPoly;
+    if roots.len() != layout.num_polys() || (per_poly && proof.polys.len() != layout.num_polys()) {
         return Err(Error::QueryCountMismatch {
             expected: layout.num_polys(),
-            got: proof.polys.len().min(roots.len()),
+            // Today's report under `PerPoly`; under `Indexed` the root count,
+            // the chain count being refused by name below.
+            got: if per_poly {
+                proof.polys.len().min(roots.len())
+            } else {
+                roots.len()
+            },
         });
     }
     if proof.polys.len() != chains.len() {
