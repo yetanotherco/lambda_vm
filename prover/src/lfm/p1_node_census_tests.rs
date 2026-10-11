@@ -8,7 +8,8 @@
 //!
 //! Run alone: `cargo test --release -p lambda-vm-prover --lib --
 //! --ignored --exact lfm::p1_node_census_tests::p1_node_census --nocapture`
-//! (`CENSUS_ELF` for a real guest; `CENSUS_LEVELS=1` stops after level 1).
+//! (`CENSUS_ELF` for a real guest; `CENSUS_LEVELS=1` stops after level 1;
+//! `CENSUS_ARMS=c1,c2` runs only those of `rpx`, `c1`, `c2`, `c4`).
 //! Prints one `NODES …` line per level and arm and one `NODES … total` line
 //! per arm.
 
@@ -177,10 +178,20 @@ fn p1_node_census() {
         started.elapsed().as_secs_f64()
     );
     let wrap = super::proof::aggregation_wrap_options();
-    census::<LegacyFamily>("today (RPX recursion)", &plan, &leaves, &wrap, max_levels);
-    census::<P1At<1>>("P1 C1", &plan, &leaves, &wrap, max_levels);
-    census::<P1At<2>>("P1 C2", &plan, &leaves, &wrap, max_levels);
-    census::<P1At<4>>("P1 C4", &plan, &leaves, &wrap, max_levels);
+    let arms = std::env::var("CENSUS_ARMS").unwrap_or_else(|_| "rpx,c1,c2,c4".to_string());
+    let arm = |name: &str| arms.split(',').any(|a| a == name);
+    if arm("rpx") {
+        census::<LegacyFamily>("today (RPX recursion)", &plan, &leaves, &wrap, max_levels);
+    }
+    if arm("c1") {
+        census::<P1At<1>>("P1 C1", &plan, &leaves, &wrap, max_levels);
+    }
+    if arm("c2") {
+        census::<P1At<2>>("P1 C2", &plan, &leaves, &wrap, max_levels);
+    }
+    if arm("c4") {
+        census::<P1At<4>>("P1 C4", &plan, &leaves, &wrap, max_levels);
+    }
 }
 
 /// The census's heights-only artifacts describe the program's real shape:
