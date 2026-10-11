@@ -154,20 +154,19 @@ pub(crate) fn resolve_siblings(k: Option<&str>, siblings: Option<&str>) -> Resul
 /// fan-in-2 configuration it named `LFM_HASH`, and `LFM_HASH` is the table that
 /// stepped 2^20 → 2^21 and put fan-in 3 over the card at 25.95 GiB of ~26.2
 /// usable. Print it at EVERY level.
+///
+/// `socket` is the hasher a program without width-16 rows runs
+/// ([`LfmProgram::hasher`]'s default): the block's `BLOCK_SOCKET`, the legacy
+/// trees' `LEGACY_HASHER`.
 pub(crate) fn census_panel(
     program: &LfmProgram,
     label: &str,
     fan_in: usize,
+    socket: super::hash::HasherKind,
 ) -> (u64, usize, String) {
-    let (main, aux) = super::airs::lfm_cell_counts_with_hasher(
-        program,
-        program.hasher(crate::hash_pin::LEGACY_HASHER),
-    );
+    let (main, aux) = super::airs::lfm_cell_counts_with_hasher(program, program.hasher(socket));
     let cells = main + 3 * aux;
-    let panel = super::airs::lfm_chip_census_with_hasher(
-        program,
-        program.hasher(crate::hash_pin::LEGACY_HASHER),
-    );
+    let panel = super::airs::lfm_chip_census_with_hasher(program, program.hasher(socket));
     let text = census_panel_text(label, cells, program.instrs.len(), &panel, fan_in);
     (cells, program.instrs.len(), text)
 }

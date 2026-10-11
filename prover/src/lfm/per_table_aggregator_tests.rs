@@ -3441,7 +3441,8 @@ fn the_sibling_count_reads_either_spelling_and_refuses_a_contradiction() {
 /// ([`super::tree_run::census_panel`]), and Lane E's reach profile under
 /// `LFM_REACH_PROFILE`.
 pub(super) fn census_and_panel(program: &LfmProgram, label: &str, fan_in: usize) -> (u64, usize) {
-    let (cells, _, text) = super::tree_run::census_panel(program, label, fan_in);
+    let (cells, _, text) =
+        super::tree_run::census_panel(program, label, fan_in, crate::hash_pin::LEGACY_HASHER);
     // ONE `print!` for the whole panel, never a `println!` per line: see
     // `census_panel_text`.
     print!("{text}");

@@ -1291,7 +1291,15 @@ pub(super) fn compose_block_tree_with(
                     },
                     te.elapsed().as_secs_f64()
                 ));
-                sink.write(&super::tree_run::census_panel(&program, &label, fan_in).2);
+                sink.write(
+                    &super::tree_run::census_panel(
+                        &program,
+                        &label,
+                        fan_in,
+                        crate::hash_pin::BLOCK_SOCKET,
+                    )
+                    .2,
+                );
                 let inline = top || beside.is_none();
                 let (child, proof) = prove_program_with(
                     &label,
@@ -1976,8 +1984,13 @@ pub fn prove_block_tree(
                 te.elapsed().as_secs_f64()
             ));
             sink.write(
-                &super::tree_run::census_panel(&program, &label, super::block_plan::block_fan_in())
-                    .2,
+                &super::tree_run::census_panel(
+                    &program,
+                    &label,
+                    super::block_plan::block_fan_in(),
+                    crate::hash_pin::BLOCK_SOCKET,
+                )
+                .2,
             );
             let (child, proof) = prove_program_with(
                 &label,
@@ -2332,36 +2345,138 @@ type BesideResult = (
 mod tests {
     use super::*;
 
-    /// The production text of a source: every `#[cfg(test)]` item left out
-    /// (to its closing brace at the attribute's indent, or its one `;` line).
-    fn production_text(src: &str) -> String {
-        let lines: Vec<&str> = src.lines().collect();
-        let mut out = String::new();
+    /// Which of `chars` are code: comments (nested block comments included),
+    /// string, raw string and char literals are not, so a brace or a name
+    /// inside one counts for nothing.
+    fn code_mask(chars: &[char]) -> Vec<bool> {
+        let at = |i: usize, s: &str| {
+            s.chars()
+                .enumerate()
+                .all(|(k, c)| chars.get(i + k) == Some(&c))
+        };
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        // `r"…"`, `r#"…"#`, … (and `br…`): the number of `#`s.
+        let raw = |i: usize| -> Option<usize> {
+            let prefix_ok = i == 0
+                || !ident(chars[i - 1])
+                || (chars[i - 1] == 'b' && (i == 1 || !ident(chars[i - 2])));
+            if chars[i] != 'r' || !prefix_ok {
+                return None;
+            }
+            let hashes = chars[i + 1..].iter().take_while(|&&c| c == '#').count();
+            (chars.get(i + 1 + hashes) == Some(&'"')).then_some(hashes)
+        };
+        let mut code = vec![true; chars.len()];
         let mut i = 0;
-        while i < lines.len() {
-            let line = lines[i];
-            if line.trim() == "#[cfg(test)]" {
-                let indent = line.len() - line.trim_start().len();
-                let close = format!("{}}}", " ".repeat(indent));
-                i += 1;
-                while i < lines.len() {
-                    let l = lines[i];
-                    let one_line = l.trim_end().ends_with(';')
-                        && !l.contains('{')
-                        && l.len() - l.trim_start().len() == indent;
-                    if l == close || one_line {
-                        break;
-                    }
+        while i < chars.len() {
+            let start = i;
+            if at(i, "//") {
+                while i < chars.len() && chars[i] != '\n' {
                     i += 1;
                 }
+            } else if at(i, "/*") {
+                let mut depth = 0;
+                while i < chars.len() {
+                    if at(i, "/*") {
+                        depth += 1;
+                        i += 2;
+                    } else if at(i, "*/") {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            } else if let Some(hashes) = raw(i) {
+                let close = format!("\"{}", "#".repeat(hashes));
+                i += hashes + 2;
+                while i < chars.len() && !at(i, &close) {
+                    i += 1;
+                }
+                i = (i + hashes + 1).min(chars.len());
+            } else if chars[i] == '"' {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    i += if chars[i] == '\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(chars.len());
+            } else if chars[i] == '\'' && chars.get(i + 1) == Some(&'\\') {
+                i += 2;
+                while i < chars.len() && chars[i] != '\'' {
+                    i += 1;
+                }
+                i = (i + 1).min(chars.len());
+            } else if chars[i] == '\'' && chars.get(i + 2) == Some(&'\'') {
+                i += 3;
+            } else {
                 i += 1;
                 continue;
             }
-            out.push_str(line);
-            out.push('\n');
+            for c in &mut code[start..i] {
+                *c = false;
+            }
+        }
+        code
+    }
+
+    /// The production part of a source, as (code, text): every
+    /// `#[cfg(test)]` attribute's target left out — the item, statement,
+    /// field or arm it governs, to its `;` or `,` at its own depth, to the
+    /// brace that closes it, or to the brace that closes what holds it. `code`
+    /// blanks comments and literals (for names); `text` keeps them (for the
+    /// environment variables a path reads, which are string literals).
+    fn production(src: &str) -> (String, String) {
+        const ATTR: &str = "#[cfg(test)]";
+        let chars: Vec<char> = src.chars().collect();
+        let mask = code_mask(&chars);
+        let attr: Vec<char> = ATTR.chars().collect();
+        let (mut code, mut text) = (String::new(), String::new());
+        let mut i = 0;
+        while i < chars.len() {
+            let is_attr =
+                chars[i..].starts_with(&attr) && mask[i..i + attr.len()].iter().all(|&m| m);
+            if is_attr {
+                let mut depth = 0usize;
+                let mut j = i + attr.len();
+                while j < chars.len() {
+                    if mask[j] {
+                        match chars[j] {
+                            '{' | '(' | '[' => depth += 1,
+                            '}' | ')' | ']' if depth == 0 => break,
+                            '}' if depth == 1 => {
+                                j += 1;
+                                break;
+                            }
+                            '}' | ')' | ']' => depth -= 1,
+                            ';' | ',' if depth == 0 => {
+                                j += 1;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            text.push(chars[i]);
+            code.push(if mask[i] || chars[i] == '\n' {
+                chars[i]
+            } else {
+                ' '
+            });
             i += 1;
         }
-        out
+        (code, text)
+    }
+
+    /// [`production`]'s text, literals and comments kept.
+    fn production_text(src: &str) -> String {
+        production(src).1
     }
 
     /// ★ The production block paths name only the block pin: the tree prover
@@ -2383,47 +2498,196 @@ mod tests {
         for o in [&base, &lfm] {
             assert_eq!(checked_base(&o.format), Ok(<Block as BlockHash>::BASE));
         }
-        // The code.
+        // The code: the files only the block paths run, each with production
+        // items the scan must still read (so no `#[cfg(test)]` target swallows
+        // the code after it). The shared modules (`proof.rs`, `harvest.rs`,
+        // `per_table_aggregator.rs`, `block.rs`) keep their legacy entry points
+        // for the other paths; the block paths reach their generic `_under::<C>`
+        // forms, at `Block`, from the files below.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let files = [
-            root.join("src/lfm/block_tree.rs"),
-            root.join("src/lfm/block_tree_pipeline.rs"),
-            root.join("src/lfm/block_plan.rs"),
-            root.join("../bin/cli/src/main.rs"),
+        let files: [(&str, &[&str]); 7] = [
+            (
+                "src/lfm/block_tree.rs",
+                &[
+                    "pub fn hex_id(",
+                    "pub fn prove_block_tree(",
+                    "pub struct BlockTreeProof",
+                    "pub fn verify_block_tree_proof(",
+                    "fn harvest_block_under<",
+                ],
+            ),
+            (
+                "src/lfm/block_tree_pipeline.rs",
+                &[
+                    "fn emit_in_order<",
+                    "impl Pipe {",
+                    "fn submit(",
+                    "struct Grouper",
+                ],
+            ),
+            (
+                "src/lfm/block_plan.rs",
+                &[
+                    "pub fn verify_block_tree(",
+                    "fn verify_under(",
+                    "pub fn artifacts_of(",
+                ],
+            ),
+            (
+                "src/lfm/block_leaf.rs",
+                &["pub fn emit_block_leaf(", "fn emit_leaf("],
+            ),
+            (
+                "src/lfm/block_node.rs",
+                &["pub fn emit_block_node(", "fn bind("],
+            ),
+            (
+                "src/lfm/tree_run.rs",
+                &[
+                    "pub(crate) fn census_panel(",
+                    "pub(crate) fn cgroup_limit_gib(",
+                ],
+            ),
+            (
+                "../bin/cli/src/main.rs",
+                &[
+                    "fn cmd_prove_block(",
+                    "fn cmd_verify_block(",
+                    "fn parse_epoch_size_log2(",
+                ],
+            ),
         ];
-        let legacy_names = [
-            "block_base_options()",
-            "block_base_options_for",
-            "aggregation_wrap_options()",
-            "BaseFormat::RPX",
-            "hash_pin::Legacy",
-            "hash_pin::RpxBlock",
-            "LEGACY_HASHER",
-            "WrapHash::legacy()",
-            "proof::lfm_prove(",
-            "proof::verify_against_artifacts(",
-            "harvest::harvest_child(",
-            "harvest::harvest_child_verified(",
-            "NOEPOCH_BASE",
-        ];
-        for file in &files {
-            let text = production_text(&std::fs::read_to_string(file).expect("readable source"));
-            assert!(text.lines().count() > 300, "{} reads", file.display());
-            for name in legacy_names {
-                assert!(
-                    !text.contains(name),
-                    "{} names `{name}` on a production block path",
-                    file.display()
-                );
+        for (file, anchors) in files {
+            let src = std::fs::read_to_string(root.join(file)).expect("readable source");
+            let (code, text) = production(&src);
+            for a in anchors {
+                assert!(text.contains(a), "{file}: the scan reaches `{a}`");
+            }
+            if let Some(name) = legacy_name(&code, &text) {
+                panic!("{file} names `{name}` on a production block path");
             }
         }
-        // The scan sees what it looks for: a production line naming one is caught.
+        // The scan sees what it looks for: a production line naming one is
+        // caught, through a grouped import or a turbofish too, and a
+        // `#[cfg(test)]` item is not.
+        for line in [
+            "let o = block_base_options();\n",
+            "use crate::hash_pin::{Block, Legacy};\n",
+            "let c = harvest_child_verified_under::<Legacy>(a, o, p);\n",
+            "let k = HasherKind :: Rpx;\n",
+            "let v = std::env::var(\"NOEPOCH_BASE\");\n",
+        ] {
+            let (code, text) = production(line);
+            assert!(
+                legacy_name(&code, &text).is_some(),
+                "the scan misses {line:?}"
+            );
+        }
+        for src in [
+            "#[cfg(test)]\nfn t() {\n    block_base_options();\n}\n",
+            "struct S {\n    #[cfg(test)]\n    l: Legacy,\n}\n",
+            "// block_base_options()\nlet s = \"Legacy\";\n",
+        ] {
+            let (code, text) = production(src);
+            assert_eq!(
+                legacy_name(&code, &text),
+                None,
+                "the scan reads test code in {src:?}"
+            );
+        }
+    }
+
+    /// The first legacy configuration a production `code` / `text` (from
+    /// [`production`]) names: an identifier (whole word, so a grouped import
+    /// or a turbofish counts), a path, or an environment variable the legacy
+    /// arms read. `BaseHash::Rpx` is not one: the cost model's RPX arm
+    /// (`CostModel::for_base`) stays as test-only legacy until the cleanup
+    /// commit, and the harvest refuses a non-pin base before a plan exists.
+    fn legacy_name(code: &str, text: &str) -> Option<String> {
+        const NAMES: [&str; 29] = [
+            "Legacy",
+            "RpxBlock",
+            "LegacyStarkHash",
+            "LegacyTranscript",
+            "LegacyProver",
+            "LegacyVerifier",
+            "LEGACY_HASHER",
+            "LEGACY_COMMITMENT_HASH",
+            "legacy_transcript",
+            "legacy",
+            "RPX",
+            "Rpx256",
+            "Algebraic",
+            "block_base_options",
+            "block_base_options_for",
+            "aggregation_wrap_options",
+            "lfm_prove",
+            "lfm_prove_prepared",
+            "lfm_prove_with_hasher",
+            "lfm_prove_with_residency",
+            "lfm_verify",
+            "verify_against",
+            "verify_against_artifacts",
+            "verify_against_chunked",
+            "harvest_child",
+            "harvest_child_verified",
+            "host_table_forked",
+            "build_artifacts",
+            "resolve_artifacts",
+        ];
+        let words: std::collections::BTreeSet<&str> = code
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .collect();
+        if let Some(name) = NAMES.iter().find(|n| words.contains(*n)) {
+            return Some(name.to_string());
+        }
+        let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        let path = "HasherKind::Rpx";
+        if compact.match_indices(path).any(|(at, _)| {
+            compact[at + path.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+        }) {
+            return Some(path.to_string());
+        }
+        [
+            "\"NOEPOCH_BASE\"",
+            "\"NOEPOCH_P1_CAP\"",
+            "\"NOEPOCH_P1_NO_TAG\"",
+        ]
+        .into_iter()
+        .find(|v| text.contains(v))
+        .map(str::to_string)
+    }
+
+    /// The production scan reads every production item of the
+    /// tree's file. A `#[cfg(test)]` on a struct field or a struct-literal
+    /// field must hide that field alone, never the production lines after it
+    /// up to the next brace at the attribute's indent.
+    #[test]
+    fn the_production_scan_reads_every_production_item() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(root.join("src/lfm/block_tree.rs")).expect("readable");
+        let text = production_text(&src);
+        for item in [
+            "pub fn hex_id(",
+            "pub fn prove_block_tree(",
+            "const PROOF_MAGIC",
+            "pub struct BlockTreeProof",
+            "pub fn stark(shape",
+        ] {
+            assert!(
+                text.contains(item),
+                "the scan drops the production item `{item}`"
+            );
+        }
+        let planted = "struct S {\n    #[cfg(test)]\n    a: u8,\n}\n\nfn f() {\n    \
+                       let o = block_base_options();\n}\n";
         assert!(
-            production_text("let o = block_base_options();\n").contains("block_base_options()")
-        );
-        assert!(
-            !production_text("#[cfg(test)]\nfn t() {\n    block_base_options();\n}\n")
-                .contains("block_base_options()")
+            production_text(planted).contains("block_base_options()"),
+            "a production line after a field-level `#[cfg(test)]` is hidden from the scan"
         );
     }
 
