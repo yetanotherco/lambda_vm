@@ -154,9 +154,9 @@ fn nodes() -> Vec<u64> {
     vec![1, 0, 0, 2, 0, 0]
 }
 
-/// Six rounds both ways at the same challenges, then the bound tables and the
-/// message at a point.
-fn lean_matches_materialised(s: &Stack, resident: bool) {
+/// `rounds` rounds both ways at the same challenges, then the bound tables and
+/// the message at a point.
+fn lean_matches_materialised(s: &Stack, resident: bool, rounds_wanted: usize) {
     let parts: Vec<(&[u64], usize)> = s
         .columns
         .iter()
@@ -209,13 +209,13 @@ fn lean_matches_materialised(s: &Stack, resident: bool) {
         )
         .expect("session rounds");
     let mut rng = Rng(0xABCD);
-    for round in 1..=6 {
+    for round in 1..=rounds_wanted {
         let want = rounds.round(&nodes()).expect("materialised round");
         let got = lean.round(&nodes()).expect("lean round");
         assert_eq!(
             canonical(&got),
             canonical(&want),
-            "round {round} ({}): the evaluations differ",
+            "round {round} of {rounds_wanted} ({}): the evaluations differ",
             if resident { "resident" } else { "parts" }
         );
         let alpha = limbs(&rng.ext());
@@ -223,7 +223,7 @@ fn lean_matches_materialised(s: &Stack, resident: bool) {
         lean.bind(&alpha);
     }
     drop(rounds);
-    session.bound(6);
+    session.bound(rounds_wanted);
     let (want_w, want_f) = session.tables_to_host().expect("read back");
 
     let bound = lean.materialize().expect("materialise");
@@ -239,7 +239,9 @@ fn lean_matches_materialised(s: &Stack, resident: bool) {
         "the bound message differs"
     );
 
-    let point: Vec<u64> = (0..s.n - 6).flat_map(|_| limbs(&rng.ext())).collect();
+    let point: Vec<u64> = (0..s.n - rounds_wanted)
+        .flat_map(|_| limbs(&rng.ext()))
+        .collect();
     assert_eq!(
         canonical(&bound.evaluate_message(&point).expect("evaluate")),
         canonical(&session.evaluate_message(&point).expect("evaluate")),
@@ -247,16 +249,24 @@ fn lean_matches_materialised(s: &Stack, resident: bool) {
     );
 }
 
+/// The default (three rounds) and `LAMBDA_VM_WHIR_LEAN_ROUNDS=6`, each against
+/// the session materialised up front (`=0`).
+const ROUNDS: [usize; 2] = [math_cuda::whir_open::LEAN_ROUNDS_DEFAULT, 6];
+
 #[test]
 fn the_lean_rounds_match_the_materialised_session_from_host_parts() {
     let _device = device();
-    lean_matches_materialised(&stack(14, 0x51), false);
+    for rounds in ROUNDS {
+        lean_matches_materialised(&stack(14, 0x51), false, rounds);
+    }
 }
 
 #[test]
 fn the_lean_rounds_match_the_materialised_session_from_resident_columns() {
     let _device = device();
-    lean_matches_materialised(&stack(15, 0x77), true);
+    for rounds in ROUNDS {
+        lean_matches_materialised(&stack(15, 0x77), true, rounds);
+    }
 }
 
 /// ★ The accounting the lean path exists for. At 2^22 the materialised

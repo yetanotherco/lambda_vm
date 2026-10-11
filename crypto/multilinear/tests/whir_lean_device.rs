@@ -8,8 +8,11 @@
 //! cargo test --release -p multilinear --features cuda --test whir_lean_device
 //! ```
 //!
-//! Needs a GPU. Both new paths are asserted TAKEN in the one arm and NOT in the
-//! other (the call counters), so a card that declined could not turn this into
+//! Three arms: the path before the kernels (lean rounds 0, folds level by
+//! level), six lean rounds with the fused fold (`LAMBDA_VM_WHIR_LEAN_ROUNDS=6`,
+//! the way back), and the defaults (three lean rounds, the fused fold). Needs a
+//! GPU. Both new paths are asserted TAKEN in the kernel arms and NOT in the
+//! first (the call counters), so a card that declined could not turn this into
 //! a comparison of today's path with itself. One `#[test]`: the arms switch a
 //! process-wide override, and parallel tests would race it.
 #![cfg(feature = "cuda")]
@@ -102,14 +105,45 @@ fn case() -> Case {
     }
 }
 
-/// One arm: today's device path (`lean = false`) or the two kernels.
+/// Which path an arm proves on.
+#[derive(Clone, Copy, Debug)]
+enum Arm {
+    /// No lean rounds, every fold level by level: the path before the kernels.
+    Materialised,
+    /// Six lean rounds and the fused fold (`LAMBDA_VM_WHIR_LEAN_ROUNDS=6`).
+    Six,
+    /// Nothing forced: the defaults, three lean rounds and the fused fold.
+    Defaults,
+}
+
+/// One arm: the path before the kernels or the two kernels.
 fn prove_arm<H: WhirHash>(
     c: &Case,
-    lean: bool,
+    arm: Arm,
     resident: Option<&gpu::ResidentColumns>,
 ) -> (StackedProof<F, Ext>, Vec<[u8; 32]>) {
-    gpu::force_lean_rounds(Some(if lean { 6 } else { 0 }));
-    gpu::force_fused_fold(Some(lean));
+    let lean = !matches!(arm, Arm::Materialised);
+    match arm {
+        Arm::Materialised => {
+            gpu::force_lean_rounds(Some(0));
+            gpu::force_fused_fold(Some(false));
+        }
+        Arm::Six => {
+            gpu::force_lean_rounds(Some(6));
+            gpu::force_fused_fold(Some(true));
+        }
+        Arm::Defaults => {
+            gpu::force_lean_rounds(None);
+            gpu::force_fused_fold(None);
+            if std::env::var_os("LAMBDA_VM_WHIR_LEAN_ROUNDS").is_none() {
+                assert_eq!(
+                    gpu::lean_rounds_in_effect(),
+                    3,
+                    "the default is three lean rounds"
+                );
+            }
+        }
+    }
     let columns = multilinear::stacking::borrow(&c.columns);
     let stacked = StackedCommitment::<F, H>::commit(
         c.layout.clone(),
@@ -185,24 +219,25 @@ fn prove_arm<H: WhirHash>(
 }
 
 fn both_arms<H: WhirHash>(c: &Case, resident: Option<&gpu::ResidentColumns>) {
-    let (today, today_roots) = prove_arm::<H>(c, false, resident);
-    let (lean, lean_roots) = prove_arm::<H>(c, true, resident);
-    assert_eq!(today_roots, lean_roots, "{}: roots", H::NAME);
-    assert_eq!(
-        rkyv::to_bytes::<rkyv::rancor::Error>(&lean)
-            .unwrap()
-            .as_slice(),
-        rkyv::to_bytes::<rkyv::rancor::Error>(&today)
-            .unwrap()
-            .as_slice(),
-        "{} ({}): the lean opening and the fused fold must prove today's bytes",
-        H::NAME,
-        if resident.is_some() {
-            "resident"
-        } else {
-            "parts"
-        },
-    );
+    let (today, today_roots) = prove_arm::<H>(c, Arm::Materialised, resident);
+    let today_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&today).unwrap();
+    for arm in [Arm::Six, Arm::Defaults] {
+        let (lean, lean_roots) = prove_arm::<H>(c, arm, resident);
+        assert_eq!(today_roots, lean_roots, "{} {arm:?}: roots", H::NAME);
+        assert_eq!(
+            rkyv::to_bytes::<rkyv::rancor::Error>(&lean)
+                .unwrap()
+                .as_slice(),
+            today_bytes.as_slice(),
+            "{} ({}, {arm:?}): the lean opening and the fused fold must prove today's bytes",
+            H::NAME,
+            if resident.is_some() {
+                "resident"
+            } else {
+                "parts"
+            },
+        );
+    }
 }
 
 #[test]

@@ -731,8 +731,9 @@ pub fn reserve_budget() -> u64 {
 /// One codeword was the right number once: two commits in flight at a fold of
 /// four hold (half a codeword, less a node) each. At the production first fold
 /// of six a commit holds a quarter, and an opening under the lean rounds and
-/// the fused fold about a fifth — where before them an opening held nearly
-/// four codewords against the one it had promised.
+/// the fused fold `23/64` at the default three rounds (about a fifth at six) —
+/// where before them an opening held nearly four codewords against the one it
+/// had promised.
 pub(crate) fn room_resize() -> bool {
     match ROOM_RESIZE_FORCED.load(Ordering::Relaxed) {
         1 => true,
@@ -4586,16 +4587,17 @@ enum OpeningState {
 }
 
 /// Rounds a stacked opening runs over its shares before materialising its
-/// factors (`LAMBDA_VM_WHIR_LEAN_ROUNDS`, `0..=6`; default 6, a first6 chain's
-/// whole first group). `0` materialises at full width up front, which is the
-/// path before this existed; every setting proves the same values.
+/// factors (`LAMBDA_VM_WHIR_LEAN_ROUNDS`, `0..=6`; default 3 since ULTRA 129,
+/// [`math_cuda::whir_open::LEAN_ROUNDS_DEFAULT`] says why; `=6` is the way
+/// back). `0` materialises at full width up front, which is the path before
+/// this existed; every setting proves the same values.
 ///
 /// The factors at full width are the weight and the lifted message, `2·2^n`
 /// extension values — 1.5× the committed base codeword, plus the base staging
 /// while they are built — and they grow with the stack. Bound first, they are
 /// `2^(n − rounds)` wide.
 #[cfg(feature = "cuda")]
-pub const LEAN_ROUNDS_DEFAULT: usize = 6;
+pub const LEAN_ROUNDS_DEFAULT: usize = math_cuda::whir_open::LEAN_ROUNDS_DEFAULT;
 
 #[cfg(feature = "cuda")]
 static LEAN_ROUNDS_FORCED: std::sync::atomic::AtomicUsize =
@@ -4609,11 +4611,9 @@ fn lean_rounds() -> usize {
     }
     static SET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SET.get_or_init(|| {
-        std::env::var("LAMBDA_VM_WHIR_LEAN_ROUNDS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .map(|v| v.min(math_cuda::whir::FUSED_MAX_FOLD))
-            .unwrap_or(LEAN_ROUNDS_DEFAULT)
+        math_cuda::whir_open::lean_rounds_setting(
+            std::env::var("LAMBDA_VM_WHIR_LEAN_ROUNDS").ok().as_deref(),
+        )
     })
 }
 

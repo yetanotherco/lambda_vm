@@ -10809,7 +10809,7 @@ fn whir_production_tree<C: TreeChild>() {
     );
     // Which WHIR kernels ran, read off the counters of the paths themselves, so
     // the log shows the path taken rather than the switches' spelling. At the
-    // defaults: `fused folds F of F`, `lean opens L of O (6 rounds)` with L = O
+    // defaults: `fused folds F of F`, `lean opens L of O (3 rounds)` with L = O
     // unless a stack is one the lean path cannot read, `turn-sized rooms S of S`.
     // Each opt-out zeroes its own share and leaves the total standing:
     // `LAMBDA_VM_NO_WHIR_FUSED_FOLD=1` reads `fused folds 0 of F`,

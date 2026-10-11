@@ -287,6 +287,28 @@ const LEAN_BLOCK: u32 = 256;
 /// Share ids are `u16` on the card, and `0xFFFF` marks a position no column
 /// covers.
 const LEAN_MAX_SHARES: usize = 0xFFFF;
+
+/// Rounds a stacked opening runs over its shares before it materialises its
+/// factors at `2^(n − rounds)`, when `LAMBDA_VM_WHIR_LEAN_ROUNDS` does not say
+/// otherwise. Every setting proves the same values.
+///
+/// 3, not the 6 WBATCH chose at the 2^25 stack as a memory lever: at today's
+/// 2^27 stack each lean round is a pass over the whole stack, and three of them
+/// plus the materialisation cost less than six. ULTRA 129 (D-SPEED §12):
+/// median phase-B openings −2.74 s (t −141), whole −2.54 s, the top proof's
+/// bytes unchanged at 6, 3 and 2, no refusals; the open peak +672 MiB (20.5 of
+/// 25.1 GiB usable). `LAMBDA_VM_WHIR_LEAN_ROUNDS=6` is the way back.
+pub const LEAN_ROUNDS_DEFAULT: usize = 3;
+
+/// `LAMBDA_VM_WHIR_LEAN_ROUNDS`'s value read: a count, clamped to the widest
+/// fold ([`crate::whir::FUSED_MAX_FOLD`]); unset or not a number is
+/// [`LEAN_ROUNDS_DEFAULT`].
+pub fn lean_rounds_setting(value: Option<&str>) -> usize {
+    value
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|v| v.min(crate::whir::FUSED_MAX_FOLD))
+        .unwrap_or(LEAN_ROUNDS_DEFAULT)
+}
 /// The round scratch a lean opening keeps: the nodes, one partial per node
 /// and block, and the sums.
 const LEAN_SCRATCH_BYTES: u64 =
@@ -767,14 +789,53 @@ mod tests {
         }
     }
 
-    /// The production chain's shape at `2^n`: first6 then four, 400 columns.
+    /// Three lean rounds unless the knob says otherwise; 7 or more is the
+    /// widest fold; unreadable is the default.
+    #[test]
+    fn three_lean_rounds_by_default_and_the_knob_clamps_to_the_widest_fold() {
+        use crate::whir::FUSED_MAX_FOLD;
+        assert_eq!(LEAN_ROUNDS_DEFAULT, 3);
+        assert_eq!(lean_rounds_setting(None), 3);
+        assert_eq!(lean_rounds_setting(Some("6")), 6, "the way back");
+        assert_eq!(lean_rounds_setting(Some(" 2 ")), 2);
+        assert_eq!(lean_rounds_setting(Some("0")), 0, "materialise up front");
+        assert_eq!(FUSED_MAX_FOLD, 6);
+        assert_eq!(lean_rounds_setting(Some("7")), FUSED_MAX_FOLD);
+        assert_eq!(lean_rounds_setting(Some("99")), FUSED_MAX_FOLD);
+        assert_eq!(lean_rounds_setting(Some("three")), LEAN_ROUNDS_DEFAULT);
+        assert_eq!(lean_rounds_setting(Some("-1")), LEAN_ROUNDS_DEFAULT);
+    }
+
+    /// A stack of `LEAN_MAX_SHARES` shares or more cannot be named by the
+    /// card's `u16` share ids: the lean rounds decline before the device is
+    /// touched, and the opening materialises at full width as before.
+    #[test]
+    fn a_stack_of_too_many_shares_declines_the_lean_rounds() {
+        let shares: Vec<LeanShare> = (0..LEAN_MAX_SHARES)
+            .map(|i| LeanShare {
+                stack_offset: i,
+                num_vars: 0,
+                lo_bits: 0,
+                hi_at: 0,
+                lo_at: 0,
+                scale: [1, 0, 0],
+            })
+            .collect();
+        let eq = vec![1u64, 0, 0];
+        let lean = LeanRound0::new(&shares, &eq, 16, LeanMessage::Parts(&[]))
+            .expect("declining touches no device");
+        assert!(lean.is_none(), "{} shares must materialise", shares.len());
+    }
+
+    /// The production chain's shape at `2^n`: first6 then four, 400 columns,
+    /// the default lean rounds.
     fn production(n: usize) -> OpeningShape {
         OpeningShape {
             num_vars: n,
             log_blowup: 2,
             first_fold: 6,
             next_fold: 4,
-            lean_rounds: 6,
+            lean_rounds: LEAN_ROUNDS_DEFAULT,
             fused: true,
             staged: false,
             shares: 400,
@@ -786,17 +847,23 @@ mod tests {
     /// ★ The turn a group's openings take, in numbers.
     ///
     /// With both kernels the largest phase is the first fold's: the factors
-    /// bound six variables down, the fold's output (`3C/64`) and the tree its
-    /// queries' paths come from (`C/8`) — about a fifth of the committed base
-    /// codeword `C`, at every stack. Without them it is the factors at full
-    /// width (`1.5 C`) beside a level-by-level fold (`2.25 C`): three and three
-    /// quarters, EXACTLY — the working set that ran nearly three codewords past
-    /// the one-codeword room every opening had promised.
+    /// bound three variables down at the default (`3C/16`), the fold's output
+    /// (`3C/64`) and the tree its queries' paths come from (`C/8`) — `23/64` of
+    /// the committed base codeword `C`, over a third, at every stack. Six lean
+    /// rounds (the way back) bind the factors to `3C/128` and the turn to about
+    /// a fifth. Without the kernels it is the factors at full width (`1.5 C`)
+    /// beside a level-by-level fold (`2.25 C`): three and three quarters,
+    /// EXACTLY — the working set that ran nearly three codewords past the
+    /// one-codeword room every opening had promised.
     #[test]
-    fn an_opening_turn_is_a_fifth_of_a_codeword_with_the_kernels() {
+    fn an_opening_turn_is_a_third_of_a_codeword_with_the_kernels_a_fifth_at_six() {
         for n in [16usize, 22, 25, 27, 28] {
             let codeword = 8u64 << (n + 2);
             let lean = opening_transient_bytes(&production(n));
+            let six = opening_transient_bytes(&OpeningShape {
+                lean_rounds: 6,
+                ..production(n)
+            });
             let today = opening_transient_bytes(&OpeningShape {
                 lean_rounds: 0,
                 fused: false,
@@ -807,15 +874,21 @@ mod tests {
                 ..production(n)
             });
             println!(
-                "2^{n}: opening turn {:.4} C resident, {:.4} C staged; {:.4} C without the kernels",
+                "2^{n}: opening turn {:.4} C resident, {:.4} C staged, {:.4} C at six rounds; \
+                 {:.4} C without the kernels",
                 lean as f64 / codeword as f64,
                 staged as f64 / codeword as f64,
+                six as f64 / codeword as f64,
                 today as f64 / codeword as f64,
             );
             if n >= 22 {
                 assert!(
-                    lean * 5 < codeword && lean * 6 > codeword,
-                    "2^{n}: {lean} B is not about a fifth of {codeword} B"
+                    lean * 3 > codeword && lean * 64 <= codeword * 23,
+                    "2^{n}: {lean} B is not 23/64 of {codeword} B"
+                );
+                assert!(
+                    six * 5 < codeword && six * 6 > codeword,
+                    "2^{n}: {six} B at six rounds is not about a fifth of {codeword} B"
                 );
             }
             assert_eq!(today * 4, codeword * 15, "2^{n}: {today} B");
