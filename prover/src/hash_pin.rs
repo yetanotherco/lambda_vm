@@ -265,7 +265,31 @@ const _: () = assert!(
 );
 
 /// ★★★ THE SWITCH: the proof family of the no-epoch WHIR block's recursion.
+/// Fixed at compile time: nothing selects it at run time, and nothing but the
+/// LFM prover's off-path users (continuation, the epoch tree, the registry,
+/// the probes: [`LegacyFamily`]) names another family until the cleanup
+/// commit collapses the two.
 pub type BlockFamily = P1Family;
+
+/// ★★★ The no-epoch block's WHIR base configuration: ZisK's Poseidon1 WHIR,
+/// the hash [`BlockFamily`]'s recursion is made in — one hash end to end, so
+/// no base of one hash ever sits under another's recursion. The block path
+/// binds it (`with_block_hash!`) after `block_whir::checked_base` has
+/// admitted the format's base, which must be [`BLOCK_BASE`].
+pub type BlockWhirHash = multilinear::whir_hash::P1Whir;
+
+/// The base format of every no-epoch block: [`BlockWhirHash`]'s hash at its
+/// 4-ary cap (a WHIR geometry, the base's own, separate from the LFM trees'
+/// `P1_STARK_CAP`). `ZfFormat`'s default names it, and the block path admits
+/// no other.
+pub const BLOCK_BASE: stark::proof::options::BaseFormat =
+    stark::proof::options::BaseFormat::P1_WHIR;
+
+// The base and the recursion are one hash.
+const _: () = assert!(
+    BLOCK_BASE.hash as u8
+        == <<BlockFamily as ProofFamily>::Stark as stark::config::StarkHash>::COMMITMENT_HASH as u8
+);
 
 /// The root of a static preprocessed table (`table`: `bitwise`, `keccak_rc`)
 /// under a commitment configuration OTHER than the legacy pin's, whose roots
@@ -362,6 +386,12 @@ mod tests {
             b"LAMBDAVM_LFM_STATEMENT_V1/P1W16/C2"
         );
         assert_eq!(P1Family::WRAP, crate::lfm::edsl::WrapHash::Poseidon1);
+        // The block's base is the family's hash: P1's WHIR at the base's cap.
+        assert_eq!(
+            <BlockWhirHash as multilinear::whir_hash::WhirHash>::NAME,
+            <multilinear::whir_hash::P1Whir as multilinear::whir_hash::WhirHash>::NAME
+        );
+        assert_eq!(BLOCK_BASE, stark::proof::options::BaseFormat::P1_WHIR);
         assert_eq!(P1Family::SOCKET, crate::lfm::hash::HasherKind::Poseidon1W16);
         // The P1 transcript object is ZisK's sponge seeded like the legacy
         // one (the seed is its first `append_bytes`).

@@ -10,7 +10,7 @@
 //!
 //! # What a leaf does
 //!
-//! 1. The statement, as program constants ([`block_statement_bytes`]), then the
+//! 1. The statement, as program constants (`block_whir::block_statement_calls`), then the
 //!    roots block over EVERY root of the block — the groups' (arena) and the
 //!    prepared tables' (constants the plan derived) — then `z, α, β` and the
 //!    transcript's state digest. Every leaf replays the same front, so every leaf
@@ -62,20 +62,15 @@ use super::whir_chain::{ChainShape, ChipRows};
 use super::whir_epoch::{
     BITWISE_NAME, DECODE_NAME, GroupWires, KECCAK_RC_NAME, PreprocessedPlan, PreprocessedRoute,
     REGISTER_NAME, TableWires, emit_expected, emit_group_walk, emit_roots_block, emit_table_walk,
-    fresh_schedule, group_columns, hint_group_chains_shaped, hint_table_wires_shaped,
-    push_table_words, table_words,
+    group_columns, hint_group_chains_shaped, hint_table_wires_shaped, push_table_words,
+    table_words,
 };
 use super::whir_stacked::{StackedPolyWires, stacked_verify_cost};
 use super::whir_table::{TableProofWires, TableShape, table_verify_cost};
 use super::whir_transcript::{SpongeEntry, WhirTranscript};
 use super::word::{LfmWord, base_word};
 
-/// The leaf-load cap in permutations: today's wrap LFM_HASH shape, 2^18 + 2^15
-/// rows, less the headroom wrap 2 runs at (D-NOEPOCH §12.2, the STARK block's
-/// cap too).
-pub const LEAF_PERMS_CAP: usize = 279_000;
-
-/// The leaf-load cap under a Poseidon1 base, in socket (`Hash16`) rows: one
+/// The leaf-load cap, in socket (`Hash16`) rows: one
 /// 2^18 table, all of it — seven full groups a leaf, 13 leaves at the median
 /// (I-WHIR-P1 §S6b). The recursion's time is the card's: the leaves prove one
 /// at a time, each ≈ 0.28 s plus ≈ 0.0122 s a million padded cells outside the
@@ -114,15 +109,6 @@ pub const P1_LEAF_HEIGHTS: ChipRows = ChipRows {
 // calculator reads 128.005 for the socket and 128.51 for bit-dec at 2^20). A
 // wider chip re-runs the calculator before this bound moves.
 const _: () = assert!(P1_LEAF_HEIGHTS.hash <= 1 << 19 && P1_LEAF_HEIGHTS.bitdec <= 1 << 19);
-
-/// The leaf cap a block's base takes: [`LEAF_P1_CAP`] under Poseidon1, else
-/// [`LEAF_PERMS_CAP`].
-pub fn leaf_cap_for(base: &stark::proof::options::BaseFormat) -> usize {
-    match base.hash {
-        stark::config::CommitmentHash::Poseidon1 => LEAF_P1_CAP,
-        _ => LEAF_PERMS_CAP,
-    }
-}
 
 /// The leaf that subtracts the COMMIT-bus target.
 pub const CARRIER: usize = 0;
@@ -493,15 +479,12 @@ impl PlannedPrepared {
 /// the format and the statement. See the module docs.
 pub struct WhirBlockPlan {
     frame: BlockFrame,
-    statement_bytes: Vec<u8>,
-    /// The statement's `append_bytes` calls, under a Poseidon1 base (whose
-    /// sponge binds each call's length); empty under RPX, whose byte sponge
-    /// absorbs [`Self::statement_bytes`] as one run.
+    /// The statement's `append_bytes` calls: the base's sponge (ZisK's)
+    /// binds each call's length, so the leaves replay them call by call.
     statement_calls: Vec<Vec<u8>>,
-    /// The leaves' wrap hash: the base's ([`WrapHash::for_base`]). The nodes
-    /// stay on the production hash (D-WHIR-P1 P3a).
-    ///
-    /// [`WrapHash::for_base`]: super::edsl::WrapHash::for_base
+    /// The tree's wrap hash, the block proof family's (`hash_pin::BlockFamily`):
+    /// the leaves replay the base's transcript in it and the nodes their
+    /// children's LFM proofs.
     wrap_hash: super::edsl::WrapHash,
     public_output: Vec<u8>,
     /// The statement's groups: AIR indices in each group's order.
@@ -511,8 +494,8 @@ pub struct WhirBlockPlan {
     prepared: Vec<PlannedPrepared>,
     /// Each group's in-guest cost, in permutations.
     costs: Vec<usize>,
-    /// Under Poseidon1: each group's rows in every bounded chip, and the
-    /// per-leaf front's ([`leaf_partition_rows`]); empty under RPX.
+    /// Each group's rows in every bounded chip, and the per-leaf front's
+    /// ([`leaf_partition_rows`]).
     loads: Vec<ChipRows>,
     front: ChipRows,
     partition: BlockPartition,
@@ -537,10 +520,10 @@ pub struct TreeProgram {
 }
 
 impl WhirBlockPlan {
-    /// Derive the plan over `num_leaves` leaves (when `None`, the fewest from
-    /// `⌈Σ cost / cap⌉` with no leaf over the cap: [`leaf_partition`]), or
-    /// refuse a statement the host verifier refuses or whose group is over the
-    /// leaf cap.
+    /// Derive the plan over `num_leaves` leaves (when `None`, the fewest that
+    /// keep every chip of every leaf under [`P1_LEAF_HEIGHTS`]:
+    /// [`leaf_partition_rows`]), or refuse a statement the host verifier
+    /// refuses or whose group no leaf holds.
     pub fn derive(
         elf_bytes: &[u8],
         proof_options: &crate::ProofOptions,
@@ -581,13 +564,13 @@ impl WhirBlockPlan {
             num_leaves,
             fan_in,
             prepared_roots,
-            leaf_cap_for(&format.zf.base),
+            LEAF_P1_CAP,
         )
     }
 
-    /// [`Self::derive_with`] under a leaf cap of `leaf_cap` permutations
-    /// ([`leaf_partition`]); everything but the tests' refusals runs at
-    /// [`leaf_cap_for`] the base.
+    /// [`Self::derive_with`] under a leaf cap of `leaf_cap` socket rows (the
+    /// partition's `hash` height); everything but the tests' refusals and
+    /// censuses runs at [`LEAF_P1_CAP`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn derive_capped(
         elf_bytes: &[u8],
@@ -602,23 +585,19 @@ impl WhirBlockPlan {
         if fan_in < 2 {
             return Err(format!("a fan-in of {fan_in} closes no tree"));
         }
-        // The machine replays the base's transcript: RPX's algebraic one, or
-        // under a Poseidon1 base ZisK's sponge — the format's hash, which the
-        // base proof was made under too (`with_block_hash!` reads no knob).
+        // The machine replays the base's transcript, ZisK's sponge: the block
+        // family's hash, which the base proof was made under too
+        // (`with_block_hash!` admits no other base and reads no knob).
         let base = &format.zf.base;
-        let wrap_hash = super::edsl::WrapHash::for_base(base);
         crate::block_whir::checked_base(base).map_err(|e| format!("{e:?}"))?;
+        let wrap_hash = <crate::hash_pin::BlockFamily as crate::hash_pin::ProofFamily>::WRAP;
         let frame = block_frame(statement, elf_bytes, proof_options, format)
             .map_err(|e| format!("statement: {e:?}"))?;
         let elf_digest = crate::statement::elf_digest(elf_bytes);
         let tag = crate::block_whir::block_statement_tag(base);
         let statement_bytes = block_statement_bytes(statement, &tag, &elf_digest, &frame.config);
-        let statement_calls = match wrap_hash {
-            super::edsl::WrapHash::Poseidon1 => {
-                crate::block_whir::block_statement_calls(statement, &tag, elf_bytes, &frame.config)?
-            }
-            _ => Vec::new(),
-        };
+        let statement_calls =
+            crate::block_whir::block_statement_calls(statement, &tag, elf_bytes, &frame.config)?;
         let groups: Vec<Vec<usize>> = statement
             .groups
             .iter()
@@ -682,19 +661,15 @@ impl WhirBlockPlan {
             });
         }
 
-        // Each group's cost: its tables' legs, its opening, its prepared ones —
-        // in socket rows under Poseidon1.
+        // Each group's cost in socket rows: its tables' legs, its opening, its
+        // prepared ones.
         let refs = frame.airs.air_refs();
         let arity = wrap_hash.arity();
-        let p1 = wrap_hash == super::edsl::WrapHash::Poseidon1;
         let mut costs = Vec::with_capacity(groups.len());
         for (g, list) in groups.iter().enumerate() {
             let owned = Shapes::build(&refs, &frame.shapes, list)?;
             let shapes = owned.table_shapes();
-            let entry = match wrap_hash {
-                super::edsl::WrapHash::Poseidon1 => SpongeEntry::fresh_for(wrap_hash),
-                _ => fresh_schedule().entry(),
-            };
+            let entry = SpongeEntry::fresh_for(wrap_hash);
             let tables: usize = match batched_cap(config) {
                 None => shapes
                     .iter()
@@ -728,16 +703,11 @@ impl WhirBlockPlan {
         }
         drop(refs);
         let id = crate::statement::elf_digest(&statement_bytes);
-        // RPX's partition by cost; Poseidon1's after its rows are measured,
-        // over a plan whose partition the measuring never reads.
-        let partition = if p1 {
-            partition_groups(&costs, 1)
-        } else {
-            leaf_partition(&costs, num_leaves, leaf_cap)?
-        };
+        // The partition comes after the rows are measured, over a plan whose
+        // partition the measuring never reads.
+        let partition = partition_groups(&costs, 1);
         let mut plan = Self {
             frame,
-            statement_bytes,
             statement_calls,
             wrap_hash,
             public_output: statement.public_output.to_vec(),
@@ -750,21 +720,19 @@ impl WhirBlockPlan {
             fan_in,
             id,
         };
-        // Under Poseidon1, every chip's rows by group, emitted; the partition
-        // bounds them all (a fixed leaf count, the tests', bounds none).
-        if p1 {
-            (plan.loads, plan.front) = chip_loads_by_emission(&plan)?;
-            plan.partition = match num_leaves {
-                None => {
-                    let heights = ChipRows {
-                        hash: leaf_cap,
-                        ..P1_LEAF_HEIGHTS
-                    };
-                    leaf_partition_rows(&plan.loads, plan.front, heights)?
-                }
-                Some(_) => leaf_partition(&plan.costs, num_leaves, leaf_cap)?,
-            };
-        }
+        // Every chip's rows by group, emitted; the partition bounds them all (a
+        // fixed leaf count, the tests', bounds none).
+        (plan.loads, plan.front) = chip_loads_by_emission(&plan)?;
+        plan.partition = match num_leaves {
+            None => {
+                let heights = ChipRows {
+                    hash: leaf_cap,
+                    ..P1_LEAF_HEIGHTS
+                };
+                leaf_partition_rows(&plan.loads, plan.front, heights)?
+            }
+            Some(_) => leaf_partition(&plan.costs, num_leaves, leaf_cap)?,
+        };
         Ok(plan)
     }
 
@@ -772,24 +740,23 @@ impl WhirBlockPlan {
         &self.partition
     }
 
-    /// Each group's in-guest cost, in permutations (socket rows under a
-    /// Poseidon1 base).
+    /// Each group's in-guest cost, in socket rows.
     pub fn costs(&self) -> &[usize] {
         &self.costs
     }
 
-    /// Under Poseidon1: each group's rows in every bounded chip, and the
-    /// per-leaf front's — what the partition admitted each leaf by.
+    /// Each group's rows in every bounded chip, and the per-leaf front's —
+    /// what the partition admitted each leaf by.
     pub fn chip_loads(&self) -> (&[ChipRows], ChipRows) {
         (&self.loads, self.front)
     }
 
-    /// The leaves' wrap hash: the base's.
+    /// The tree's wrap hash: the block family's.
     pub fn wrap_hash(&self) -> super::edsl::WrapHash {
         self.wrap_hash
     }
 
-    /// A leaf's builder: the base's wrap hash.
+    /// A leaf's builder: the tree's wrap hash.
     fn leaf_builder(&self) -> LfmBuilder {
         LfmBuilder::new().with_wrap_hash(self.wrap_hash)
     }
@@ -838,13 +805,15 @@ impl WhirBlockPlan {
         finish(b)
     }
 
-    /// The node over `children`, the top when `top`, emitted and validated.
+    /// The node over `children`, the top when `top`, emitted and validated:
+    /// its legs replay the children under the block's proof family
+    /// ([`crate::hash_pin::BlockFamily`]).
     pub fn node_program(
         &self,
         children: &[&DerivedChild],
         top: bool,
     ) -> Result<LfmProgram, String> {
-        self.node_program_under::<crate::hash_pin::LegacyFamily>(children, top)
+        self.node_program_under::<crate::hash_pin::BlockFamily>(children, top)
     }
 
     /// [`Self::node_program`] for children proved under the family `Fam`: the
@@ -889,7 +858,7 @@ impl WhirBlockPlan {
         let words = self.child_layout().total();
         let build = |program: LfmProgram| -> Result<TreeProgram, String> {
             let artifacts = artifacts_of(&program, wrap_opts);
-            let derived = DerivedChild::from_artifacts(&artifacts, wrap_opts, words)?;
+            let derived = derived_of(&artifacts, wrap_opts, words)?;
             Ok(TreeProgram {
                 program,
                 artifacts,
@@ -972,7 +941,7 @@ impl WhirBlockPlan {
         let words = self.child_layout().total();
         let derive = |program: LfmProgram| -> Result<DerivedChild, String> {
             let artifacts = artifacts_of(&program, wrap_opts);
-            DerivedChild::from_artifacts(&artifacts, wrap_opts, words)
+            derived_of(&artifacts, wrap_opts, words)
         };
         let leaves: Vec<usize> = (0..self.partition.num_leaves()).collect();
         let mut below = map_in_windows(&leaves, window, |&k| derive(self.leaf_program(k)?))?;
@@ -998,7 +967,7 @@ impl WhirBlockPlan {
                     let artifacts = artifacts_of(&program, wrap_opts);
                     // The top's shape too, as [`Self::programs`] derives it: the
                     // same refusals.
-                    DerivedChild::from_artifacts(&artifacts, wrap_opts, words)?;
+                    derived_of(&artifacts, wrap_opts, words)?;
                     if at + a != below.len() {
                         return Err(format!("level {}: arities leave children over", lv + 1));
                     }
@@ -1130,14 +1099,29 @@ pub(crate) fn map_in_windows<T: Sync, R: Send>(
     Ok(done)
 }
 
-/// A tree program's artifacts, under the block hasher — the width-16 socket's
-/// for a leaf with `Hash16` rows ([`LfmProgram::hasher`]).
+/// A tree program's artifacts, committed under the block's proof family
+/// ([`crate::hash_pin::BlockFamily`]'s STARK configuration) and the socket
+/// its hash rows run on — the width-16 socket's for a program with `Hash16`
+/// rows ([`LfmProgram::hasher`]).
 pub fn artifacts_of(program: &LfmProgram, wrap_opts: &crate::ProofOptions) -> LfmArtifacts {
-    super::program_census::build_artifacts_counted(
+    super::program_census::build_artifacts_counted_under::<BlockStark>(
         program,
         wrap_opts,
-        program.hasher(crate::hash_pin::BLOCK_HASHER),
+        program.hasher(<crate::hash_pin::BlockFamily as crate::hash_pin::ProofFamily>::SOCKET),
     )
+}
+
+/// The block family's LFM commitment configuration.
+type BlockStark = <crate::hash_pin::BlockFamily as crate::hash_pin::ProofFamily>::Stark;
+
+/// A tree program's shape as its parent's emitter reads it: [`artifacts`]
+/// proved under the block's proof family.
+pub(crate) fn derived_of(
+    artifacts: &LfmArtifacts,
+    wrap_opts: &crate::ProofOptions,
+    words: usize,
+) -> Result<DerivedChild, String> {
+    DerivedChild::from_artifacts_under::<crate::hash_pin::BlockFamily>(artifacts, wrap_opts, words)
 }
 
 fn finish(b: LfmBuilder) -> Result<LfmProgram, String> {
@@ -1173,7 +1157,8 @@ pub fn top_claims(plan: &WhirBlockPlan, words: &[(u32, LfmWord)]) -> bool {
 ///
 /// Every preset is pinned here, none is a caller's: the base's proof options
 /// ([`super::proof::block_base_options`]), the block format
-/// ([`BlockFormat::production`]), the tree's options
+/// ([`BlockFormat::production`], whose base is the block family's,
+/// `hash_pin::BLOCK_BASE`, never read from the proof), the tree's options
 /// ([`super::proof::aggregation_wrap_options`]), the plan's leaf rule and its
 /// fan-in ([`BLOCK_FAN_IN`]). A caller who could pass weaker ones would choose
 /// the programs the top is checked against.
@@ -1182,32 +1167,10 @@ pub fn verify_block_tree(
     statement: BlockStatement<'_>,
     top: &super::proof::LfmProof,
 ) -> Result<(), String> {
-    verify_block_tree_based(
-        elf_bytes,
-        &stark::proof::options::BaseFormat::RPX,
-        statement,
-        top,
-    )
-}
-
-/// [`verify_block_tree`] of a block proved over `base`: the production format
-/// with its base hash the verifier's own constant, never read from the proof
-/// (D-WHIR-P1 D7). Every other preset is [`verify_block_tree`]'s.
-pub fn verify_block_tree_based(
-    elf_bytes: &[u8],
-    base: &stark::proof::options::BaseFormat,
-    statement: BlockStatement<'_>,
-    top: &super::proof::LfmProof,
-) -> Result<(), String> {
-    let production = BlockFormat::production();
-    let format = BlockFormat {
-        zf: production.zf.with_base(*base),
-        ..production
-    };
     verify_block_tree_with(
         elf_bytes,
         &super::proof::block_base_options(),
-        &format,
+        &BlockFormat::production(),
         statement,
         None,
         BLOCK_FAN_IN,
@@ -1263,8 +1226,12 @@ fn verify_block_tree_with(
         None,
     )?;
     let artifacts = plan.derive_top(wrap_opts)?;
-    if !super::proof::verify_against_artifacts(&artifacts, &top.proof, &top.public_words, wrap_opts)
-    {
+    if !super::proof::verify_against_artifacts_under::<crate::hash_pin::BlockFamily>(
+        &artifacts,
+        &top.proof,
+        &top.public_words,
+        wrap_opts,
+    ) {
         return Err("the top proof does not verify against the derived top program".to_string());
     }
     if !top_claims(&plan, &top.public_words) {
@@ -1437,14 +1404,9 @@ fn emit_front(
         })
         .collect();
     let mut transcript = WhirTranscript::for_builder(b);
-    match plan.wrap_hash {
-        // ZisK's sponge binds each call's length: the statement call by call.
-        super::edsl::WrapHash::Poseidon1 => {
-            for call in &plan.statement_calls {
-                transcript.absorb_const_bytes(call);
-            }
-        }
-        _ => transcript.absorb_const_bytes(&plan.statement_bytes),
+    // ZisK's sponge binds each call's length: the statement call by call.
+    for call in &plan.statement_calls {
+        transcript.absorb_const_bytes(call);
     }
     let derived: Vec<LfmWord> = plan
         .prepared

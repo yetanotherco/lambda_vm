@@ -3146,19 +3146,19 @@ fn block_whir_on_a_real_block() {
         Err(_) => BlockFormat::production().argue,
         Ok(other) => panic!("BLOCK_WHIR_ARGUE={other}: per-table or batched"),
     };
-    // `BLOCK_WHIR_BASE=p1|p1w|rpx` (production rpx): the block's base hash —
-    // ZisK's Poseidon1 at its 4-ary cap (`BaseFormat::P1_WHIR`; `p1w` is the
-    // spelling as long as `rpx`, for A/B arms of equal environment bytes). A
-    // test word this harness maps into the format; the library reads no
-    // environment for it.
-    let base = match std::env::var("BLOCK_WHIR_BASE").as_deref().map(str::trim) {
-        Ok("p1" | "p1w") => stark::proof::options::BaseFormat::P1_WHIR,
-        Ok("rpx") | Err(_) => stark::proof::options::BaseFormat::RPX,
-        Ok(other) => panic!("BLOCK_WHIR_BASE={other}: rpx, p1 or p1w"),
-    };
+    // The block's base is its proof family's (D-P3B P3). `BLOCK_WHIR_BASE`
+    // was this harness's word for it: `p1`/`p1w` are still accepted and change
+    // nothing (an A/B against an older binary keeps equal environment bytes);
+    // any other value — `rpx` — is refused rather than ignored.
+    if let Ok(word) = std::env::var("BLOCK_WHIR_BASE") {
+        assert!(
+            matches!(word.trim(), "p1" | "p1w"),
+            "BLOCK_WHIR_BASE={word}: the block's base is its proof family's (p1)"
+        );
+    }
     let production = BlockFormat::production();
+    let base = production.zf.base;
     let format = BlockFormat {
-        zf: production.zf.with_base(base),
         prepared,
         argue,
         ..production

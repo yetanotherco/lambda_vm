@@ -262,7 +262,8 @@ fn whir_p1_leaf_census() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
     let opts = super::proof::block_base_options();
     let mut four: Vec<(String, u64)> = Vec::new();
-    for (name, base) in [("RPX", BaseFormat::RPX), ("P1", BaseFormat::P1_WHIR)] {
+    // The block admits its proof family's base only (D-P3B P3): the RPX arm is gone.
+    for (name, base) in [("P1", BaseFormat::P1_WHIR)] {
         let production = BlockFormat::production();
         let format = BlockFormat {
             zf: production.zf.with_base(base),
@@ -287,7 +288,7 @@ fn whir_p1_leaf_census() {
             owned.table_num_vars.len(),
             plan.num_groups(),
             plan.partition().num_leaves(),
-            super::whir_block::leaf_cap_for(&format.zf.base),
+            super::whir_block::LEAF_P1_CAP,
             costs
         );
         let heaviest = (0..plan.partition().num_leaves())
@@ -820,8 +821,7 @@ fn whir_s6b_census() {
     };
     let opts = super::proof::block_base_options();
     let production = BlockFormat::production();
-    let arms: [(&str, BaseFormat, Option<usize>); 3] = [
-        ("RPX", BaseFormat::RPX, None),
+    let arms: [(&str, BaseFormat, Option<usize>); 2] = [
         ("P1-S6 (178 k)", BaseFormat::P1_WHIR, Some(178_000)),
         ("P1-S6b", BaseFormat::P1_WHIR, None),
     ];
@@ -844,7 +844,7 @@ fn whir_s6b_census() {
             None,
             super::whir_block::BLOCK_FAN_IN,
             None,
-            cap.unwrap_or_else(|| super::whir_block::leaf_cap_for(&format.zf.base)),
+            cap.unwrap_or(super::whir_block::LEAF_P1_CAP),
         )
         .expect("the plan derives");
         let derived = started.elapsed().as_secs_f64();
