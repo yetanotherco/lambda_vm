@@ -245,6 +245,16 @@ impl ChainShape {
             "a run of {trees} polynomials under {:?}",
             self.group
         );
+        // Lemma B's virtual domain `H_{n+m+lb}` must exist (REV-B2-JUDGE B1-1):
+        // the host refuses such a config before reading, and no program for
+        // one is emitted.
+        let two_adicity =
+            <GoldilocksField as math::field::traits::IsFFTField>::TWO_ADICITY as usize;
+        assert!(
+            self.domain_log[0] + index_vars(trees) <= two_adicity,
+            "a run of {trees} over 2^{} has no virtual domain",
+            self.domain_log[0]
+        );
         Self {
             trees,
             ..self.clone()

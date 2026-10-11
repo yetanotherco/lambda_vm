@@ -770,6 +770,18 @@ fn each_in_guest_reading_of_the_index_is_load_bearing() {
     }
 }
 
+/// REV-B2-JUDGE B1-1 in guest: a run whose virtual domain `H_{n+m+lb}` would
+/// pass the field's two-adicity has no program — the shape refuses it at emit
+/// time, as the host refuses the config before reading.
+#[test]
+#[should_panic(expected = "has no virtual domain")]
+fn a_run_past_the_two_adicity_has_no_program() {
+    let mut cfg = config(&rpx("wide", &[6; 3], 6, 0));
+    cfg.log_blowup = 32 - 6 - 2 + 1;
+    let shape = ChainShape::new_at(&cfg, 6, 2);
+    let _ = shape.run(3);
+}
+
 // ─────────────────── the production shape's cost (B2-7) ───────────────────
 
 /// ★ The production grouped chain's in-guest openings, from the closed form
