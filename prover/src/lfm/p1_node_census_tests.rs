@@ -40,25 +40,43 @@ impl<const C: u8> ProofFamily for P1At<C> {
     }
 }
 
-/// A program's padded cells (main + aux) over every chip, its `LFM_HASH`
-/// share and every chip's rows.
-fn cells_of(program: &LfmProgram) -> (u64, u64, BTreeMap<&'static str, u64>) {
+/// A program's cells over every chip: padded (main + aux), its `LFM_HASH`
+/// share, every chip's padded rows, and the unpadded cells and `LFM_SELECT`
+/// rows (what the walk order moves below a padding step).
+struct Cells {
+    padded: u64,
+    hash: u64,
+    rows: BTreeMap<&'static str, u64>,
+    real: u64,
+    select_real: u64,
+}
+
+fn cells_of(program: &LfmProgram) -> Cells {
     let chips = super::airs::lfm_chip_census_with_hasher(
         program,
         program.hasher(crate::hash_pin::BLOCK_HASHER),
     );
-    let mut rows = BTreeMap::new();
-    let (mut all, mut hash) = (0u64, 0u64);
+    let mut out = Cells {
+        padded: 0,
+        hash: 0,
+        rows: BTreeMap::new(),
+        real: 0,
+        select_real: 0,
+    };
     for c in &chips {
         let cells = c.main_cells() + c.aux_cells();
-        all += cells;
+        out.padded += cells;
+        out.real += c.real_rows * (c.main_cols + c.aux_cols) as u64;
         if c.name == "LFM_HASH" {
-            hash += cells;
+            out.hash += cells;
         }
-        let e: &mut u64 = rows.entry(c.name).or_default();
+        if c.name == "LFM_SELECT" {
+            out.select_real += c.real_rows;
+        }
+        let e: &mut u64 = out.rows.entry(c.name).or_default();
         *e = (*e).max(c.rows);
     }
-    (all, hash, rows)
+    out
 }
 
 /// A program's heights-only artifacts, under the socket its hash rows run on.
@@ -86,9 +104,11 @@ fn census<Fam: ProofFamily>(
     let mut below: Vec<DerivedChild> = leaves.iter().map(derive).collect();
     let shape = plan.levels();
     let (mut total, mut total_hash, mut nodes) = (0u64, 0u64, 0usize);
+    let (mut total_real, mut total_select) = (0u64, 0u64);
     for (lv, arities) in shape.iter().enumerate().take(max_levels) {
         let top = lv + 1 == shape.len();
         let (mut level_cells, mut level_hash, mut level_max) = (0u64, 0u64, 0u64);
+        let (mut level_real, mut level_select, mut select_max) = (0u64, 0u64, 0u64);
         let mut chips: BTreeMap<&'static str, u64> = BTreeMap::new();
         let mut next = Vec::with_capacity(arities.arities.len());
         let mut at = 0usize;
@@ -98,10 +118,19 @@ fn census<Fam: ProofFamily>(
             let program = plan
                 .node_program_under::<Fam>(&kids, top)
                 .unwrap_or_else(|e| panic!("{label} level {}: {e}", lv + 1));
-            let (cells, hash, rows) = cells_of(&program);
+            let Cells {
+                padded: cells,
+                hash,
+                rows,
+                real,
+                select_real,
+            } = cells_of(&program);
             level_cells += cells;
             level_hash += hash;
             level_max = level_max.max(cells);
+            level_real += real;
+            level_select += select_real;
+            select_max = select_max.max(select_real);
             for (n, r) in rows {
                 let e = chips.entry(n).or_default();
                 *e = (*e).max(r);
@@ -113,13 +142,19 @@ fn census<Fam: ProofFamily>(
         nodes += arities.arities.len();
         total += level_cells;
         total_hash += level_hash;
+        total_real += level_real;
+        total_select += level_select;
         println!(
-            "NODES {label} L{}: {} nodes · cells Σ {:.1} M (max {:.1} M) · LFM_HASH Σ {:.1} M · padded max {}",
+            "NODES {label} L{}: {} nodes · cells Σ {:.1} M (max {:.1} M) · LFM_HASH Σ {:.1} M · \
+             unpadded Σ {:.1} M · LFM_SELECT real Σ {} (max {}) · padded max {}",
             lv + 1,
             arities.arities.len(),
             level_cells as f64 / 1e6,
             level_max as f64 / 1e6,
             level_hash as f64 / 1e6,
+            level_real as f64 / 1e6,
+            level_select,
+            select_max,
             chips
                 .iter()
                 .filter(|(_, r)| **r > 0)
@@ -130,9 +165,11 @@ fn census<Fam: ProofFamily>(
         below = next;
     }
     println!(
-        "NODES {label} total: {nodes} nodes · cells Σ {:.1} M · LFM_HASH Σ {:.1} M · {:.1} s",
+        "NODES {label} total: {nodes} nodes · cells Σ {:.1} M · LFM_HASH Σ {:.1} M · unpadded Σ {:.1} M \
+         · LFM_SELECT real Σ {total_select} · {:.1} s",
         total as f64 / 1e6,
         total_hash as f64 / 1e6,
+        total_real as f64 / 1e6,
         started.elapsed().as_secs_f64()
     );
 }
