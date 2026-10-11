@@ -404,8 +404,15 @@ pub(crate) fn prove_traces_with_hasher(
 /// The configuration `C` an LFM proof is made or checked under must be the
 /// one its options name ([`crate::hash_pin::checked_base`]) and the one its
 /// artifacts' roots were committed with (`LfmArtifacts::commitment`). Every
-/// LFM prove and verify checks it first: a mismatch would pair roots built by
-/// one hash with trees and a transcript of another.
+/// LFM prove and verify checks it first.
+///
+/// It is the only guard of those two LABELS. The hash itself is bound by the
+/// type: `C`'s transcript, statement tag and trees are what a prove or verify
+/// runs, whatever the options say, so roots or a proof of another hash fail
+/// without this check too. What only this check refuses is a caller whose
+/// options or artifacts name one configuration while it runs another — the
+/// legacy verifier handed options that name the block's base would otherwise
+/// accept a legacy proof under them.
 pub(crate) fn check_configuration<C: crate::hash_pin::BlockHash>(
     commitment: stark::config::CommitmentHash,
     options: &ProofOptions,

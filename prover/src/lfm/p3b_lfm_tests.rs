@@ -178,6 +178,17 @@ fn a_block_lfm_proof_round_trips_and_refuses_the_legacy_pin() {
         &lopts
     ));
     assert!(check_configuration::<Block>(lart.commitment, &lopts).is_err());
+    // The legacy verifier over its own roots and proof, handed the block's
+    // options: nothing but the check refuses this one (the legacy pin runs its
+    // own hash whatever the options name), so it is the row that sees the
+    // verify entry's call removed.
+    assert!(!verify_against_artifacts(
+        &lart,
+        &legacy_proof.proof,
+        &words,
+        &bopts
+    ));
+    assert!(check_configuration::<Legacy>(lart.commitment, &bopts).is_err());
     // … and by the proof itself, the configuration check passing: a block
     // proof read by the legacy pin over its own artifacts, and a legacy proof
     // read as a block one with the block's artifacts and options.
