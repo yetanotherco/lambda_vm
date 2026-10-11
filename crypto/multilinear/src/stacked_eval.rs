@@ -927,7 +927,9 @@ where
 /// Verifies the column claims against the stacked commitments.
 ///
 /// The layout is public and derived from the column heights, so it is not part
-/// of the proof.
+/// of the proof. A chain's refusal is reported as its first polynomial's
+/// `ColumnOpeningRejected` (a shape refusal by its own name); the cause is
+/// [`verify_traced`]'s.
 #[allow(clippy::too_many_arguments)]
 pub fn verify<F, E, T, H>(
     proof: &StackedProof<F, E>,
@@ -947,18 +949,73 @@ where
     T: IsTranscript<E>,
     H: WhirHash,
 {
+    verify_traced::<F, E, T, H>(
+        proof, layout, roots, point, values, domain, config, transcript,
+    )
+    .map_err(Refusal::into_error)
+}
+
+/// Why [`verify_traced`] refused: before any chain ran, with the error
+/// [`verify`] returns as it is, or in chain `chain` — whose first polynomial is
+/// `poly` — with the chain verifier's own error, the check that refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refusal {
+    Before(Error),
+    Chain {
+        chain: usize,
+        poly: usize,
+        cause: Error,
+    },
+}
+
+impl Refusal {
+    /// The error [`verify`] reports: a shape refusal by its own name, any other
+    /// chain refusal as the chain's first polynomial's `ColumnOpeningRejected`.
+    pub fn into_error(self) -> Error {
+        match self {
+            Refusal::Before(e) => e,
+            Refusal::Chain { cause, poly, .. } => match cause {
+                Error::GroupedShape(_) => cause,
+                _ => Error::ColumnOpeningRejected { column: poly },
+            },
+        }
+    }
+}
+
+/// [`verify`], its refusal carrying the cause ([`Refusal`]): which chain, and
+/// the check inside it that refused. The verdict and the transcript are
+/// [`verify`]'s.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_traced<F, E, T, H>(
+    proof: &StackedProof<F, E>,
+    layout: &StackedLayout,
+    roots: &[Commitment],
+    point: &Claimed<'_, E>,
+    values: &[FieldElement<E>],
+    domain: &Domain<F>,
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<(), Refusal>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
     if values.len() != layout.placements().len() {
-        return Err(Error::QueryCountMismatch {
+        return Err(Refusal::Before(Error::QueryCountMismatch {
             expected: layout.placements().len(),
             got: values.len(),
-        });
+        }));
     }
     // One root per polynomial, and — before anything is absorbed — one chain
     // per run of the verifier's own split, never the proof's count.
-    let chains = layout_chains::<F>(layout, config)?;
+    let chains = layout_chains::<F>(layout, config).map_err(Refusal::Before)?;
     let per_poly = config.format.group == GroupFold::PerPoly;
     if roots.len() != layout.num_polys() || (per_poly && proof.polys.len() != layout.num_polys()) {
-        return Err(Error::QueryCountMismatch {
+        return Err(Refusal::Before(Error::QueryCountMismatch {
             expected: layout.num_polys(),
             // Today's report under `PerPoly`; under `Indexed` the root count,
             // the chain count being refused by name below.
@@ -967,40 +1024,40 @@ where
             } else {
                 roots.len()
             },
-        });
+        }));
     }
     if proof.polys.len() != chains.len() {
-        return Err(Error::GroupedShape(GroupedShape::ChainCount {
-            expected: chains.len(),
-            got: proof.polys.len(),
-        }));
+        return Err(Refusal::Before(Error::GroupedShape(
+            GroupedShape::ChainCount {
+                expected: chains.len(),
+                got: proof.polys.len(),
+            },
+        )));
     }
     for value in values {
         transcript.append_field_element(value);
     }
     let weights = challenge_powers(&transcript.sample_field_element(), values.len());
-    // A shape refusal keeps its name; any other is the column's.
-    let rejected = |column: usize| {
-        move |e: Error| match e {
-            Error::GroupedShape(_) => e,
-            _ => Error::ColumnOpeningRejected { column },
-        }
-    };
 
-    for (eval_proof, run) in proof.polys.iter().zip(chains) {
+    for (chain, (eval_proof, run)) in proof.polys.iter().zip(chains).enumerate() {
+        let refused = |cause: Error| Refusal::Chain {
+            chain,
+            poly: run.start,
+            cause,
+        };
         if run.len() == 1 {
             let i = run.start;
             whir_chain::verify_weighted::<F, E, T, _, H>(
                 eval_proof,
                 &roots[i],
                 |at: &[FieldElement<E>]| weight_at(layout, i, point, &weights, at),
-                claimed(layout, i, values, &weights)?,
+                claimed(layout, i, values, &weights).map_err(Refusal::Before)?,
                 layout.n_stack(),
                 domain,
                 config,
                 transcript,
             )
-            .map_err(rejected(i))?;
+            .map_err(refused)?;
             continue;
         }
         // The run's claim is its polynomials' claims summed: one γ for the
@@ -1008,25 +1065,26 @@ where
         // polynomials share an exponent (D-ONECHAIN §3.2, Lemma A).
         let mut claim = FieldElement::<E>::zero();
         for i in run.clone() {
-            claim += claimed(layout, i, values, &weights)?;
+            claim += claimed(layout, i, values, &weights).map_err(Refusal::Before)?;
         }
         let k0 = config
             .schedule(layout.n_stack())
             .first()
             .copied()
             .unwrap_or(0);
-        let column = run.start;
         whir_chain::verify_grouped::<F, E, T, _, H>(
             eval_proof,
             &roots[run.clone()],
-            |at: &[FieldElement<E>]| grouped_weight_at(layout, run, k0, point, &weights, at),
+            |at: &[FieldElement<E>]| {
+                grouped_weight_at(layout, run.clone(), k0, point, &weights, at)
+            },
             claim,
             layout.n_stack(),
             domain,
             config,
             transcript,
         )
-        .map_err(rejected(column))?;
+        .map_err(refused)?;
     }
 
     Ok(())

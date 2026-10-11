@@ -9,8 +9,8 @@
 //! leaves these out.
 
 use crate::block_whir::{
-    self, BlockFormat, BlockOptions, BlockWhirProof, Deviations, prove_block_whir_with,
-    verify_block_whir,
+    self, BlockFormat, BlockOptions, BlockRefusal, BlockWhirProof, Deviations,
+    prove_block_whir_with,
 };
 use crate::tables::MaxRowsConfig;
 use crate::test_utils::asm_elf_bytes;
@@ -20,6 +20,7 @@ use multilinear::whir_chain::{
     ArgueFormat, GroupFold, MAX_INDEX_POLYS, MAX_INDEX_VARS, RoundOpenings, StackVars,
     check_index_domain, index_vars,
 };
+use stark::multilinear_table::batched::VerifierChecks;
 use stark::proof::options::{BaseFormat, ProofOptions};
 
 /// A stack of 2^10 and `group_polys` polynomials a group under `base`, so a
@@ -91,10 +92,6 @@ fn prove(elf: &[u8], format: &BlockFormat, max_rows: MaxRowsConfig) -> BlockWhir
     )
     .expect("prove")
     .0
-}
-
-fn verify(proof: &BlockWhirProof, elf: &[u8], format: &BlockFormat) -> bool {
-    verify_block_whir(proof, elf, &ProofOptions::default_test_options(), format).unwrap_or(false)
 }
 
 /// The width of every grouped chain's run in the proof, groups and prepared
@@ -196,10 +193,19 @@ fn a_wide_singleton_group_splits_into_runs_of_four() {
 /// and under Poseidon1's 4-ary capped trees, an `Indexed` block proves and
 /// verifies with grouped chains, its phase-A roots are the per-polynomial
 /// block's (B2-sep), and neither mode's proof verifies under the other's
-/// verifier.
+/// verifier — refused by the STATEMENT: the two modes' statement bytes differ
+/// in one bit, the fold word's bit 47, so the transcript parts at the first
+/// absorb and the first group's argue refuses, before any opening's shape is
+/// read (the shapes' own refusals, `ChainCount` and the per-polynomial count,
+/// are `whir_group_tests`').
 #[test]
 fn an_indexed_block_round_trips_and_refuses_the_other_mode() {
     let elf = asm_elf_bytes("all_instructions_64");
+    let opts = ProofOptions::default_test_options();
+    let traced = |proof: &BlockWhirProof, format: &BlockFormat| {
+        block_whir::verify_block_whir_traced(proof, &elf, &opts, format, false, VerifierChecks::ALL)
+            .expect("the statement frames under either mode")
+    };
     for base in [BaseFormat::RPX, BaseFormat::P1_WHIR] {
         for group_polys in 2..=MAX_INDEX_POLYS {
             let indexed = format(base, group_polys, GroupFold::Indexed);
@@ -218,11 +224,94 @@ fn an_indexed_block_round_trips_and_refuses_the_other_mode() {
             );
             assert!(widths.iter().all(|&w| (2..=group_polys).contains(&w)));
             assert!(grouped_widths(&b).is_empty());
-            assert_eq!(a.proof.roots, b.proof.roots, "phase A's roots");
-            assert!(verify(&a, &elf, &indexed), "{base:?} {group_polys}");
-            assert!(verify(&b, &elf, &per_poly), "{base:?} {group_polys}");
-            assert!(!verify(&a, &elf, &per_poly), "{base:?} {group_polys}");
-            assert!(!verify(&b, &elf, &indexed), "{base:?} {group_polys}");
+            assert_same_roots(&elf, &a, &b, &indexed);
+            assert!(traced(&a, &indexed).is_ok(), "{base:?} {group_polys}");
+            assert!(traced(&b, &per_poly).is_ok(), "{base:?} {group_polys}");
+
+            // The statement: one bit apart, the fold word's 47.
+            let frame = |format: &BlockFormat| {
+                block_whir::block_frame(a.statement(), &elf, &opts, format).expect("frame")
+            };
+            let tag = block_whir::block_statement_tag(&base);
+            let digest = crate::statement::elf_digest(&elf);
+            let (sa, sb) = (
+                block_whir::block_statement_bytes(
+                    a.statement(),
+                    &tag,
+                    &digest,
+                    &frame(&indexed).config,
+                ),
+                block_whir::block_statement_bytes(
+                    a.statement(),
+                    &tag,
+                    &digest,
+                    &frame(&per_poly).config,
+                ),
+            );
+            assert_eq!(sa.len(), sb.len());
+            let differ: Vec<(usize, u8)> = sa
+                .iter()
+                .zip(&sb)
+                .enumerate()
+                .filter(|(_, (x, y))| x != y)
+                .map(|(i, (x, y))| (i, x ^ y))
+                .collect();
+            assert_eq!(differ.len(), 1, "{base:?} {group_polys}: {differ:?}");
+            assert_eq!(differ[0].1, 0x80, "bit 47 is byte 5's top bit");
+
+            for (label, proof, format) in [
+                ("Indexed under PerPoly", &a, &per_poly),
+                ("PerPoly under Indexed", &b, &indexed),
+            ] {
+                match traced(proof, format) {
+                    Err(BlockRefusal::Proof(e)) => {
+                        println!(
+                            "ONECHAIN B1-5 {base:?} {group_polys} {label}: refused with {e:?}"
+                        );
+                        assert!(
+                            !matches!(
+                                e,
+                                multilinear::Error::QueryCountMismatch { .. }
+                                    | multilinear::Error::GroupedShape(_)
+                                    | multilinear::Error::ColumnOpeningRejected { .. }
+                            ),
+                            "{base:?} {group_polys} {label}: refused at an opening's shape or \
+                             chain, not by the statement: {e:?}"
+                        );
+                    }
+                    other => panic!("{base:?} {group_polys} {label}: {other:?}"),
+                }
+            }
         }
     }
+}
+
+/// The two modes' phase-A roots are one list (B2-sep). On a mismatch, names the
+/// first differing root's group, polynomial and tables, then fails: a
+/// difference is a design finding, not a test to adjust.
+fn assert_same_roots(elf: &[u8], a: &BlockWhirProof, b: &BlockWhirProof, format: &BlockFormat) {
+    let Some(first) = (0..a.proof.roots.len().max(b.proof.roots.len()))
+        .find(|&i| a.proof.roots.get(i) != b.proof.roots.get(i))
+    else {
+        return;
+    };
+    let opts = ProofOptions::default_test_options();
+    let frame = block_whir::block_frame(a.statement(), elf, &opts, format).expect("frame");
+    let mut at = first;
+    let mut g = 0;
+    while g < frame.stack_layouts.len() && at >= frame.stack_layouts[g].num_polys() {
+        at -= frame.stack_layouts[g].num_polys();
+        g += 1;
+    }
+    let tables: Vec<String> = a.groups.get(g).map_or_else(Vec::new, |group| {
+        group
+            .iter()
+            .map(|&t| format!("{t} {}", frame.airs.air_refs()[t as usize].name()))
+            .collect()
+    });
+    panic!(
+        "phase A's roots differ first at root {first} of {}: group {g}, polynomial {at} \
+         (tables {tables:?})",
+        a.proof.roots.len()
+    );
 }

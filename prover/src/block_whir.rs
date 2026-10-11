@@ -5144,6 +5144,40 @@ pub(crate) fn verify_block_whir_with(
     skip_prepared: bool,
     argue_checks: VerifierChecks,
 ) -> Result<bool, Error> {
+    verify_block_whir_traced(
+        proof,
+        elf_bytes,
+        proof_options,
+        format,
+        skip_prepared,
+        argue_checks,
+    )
+    .map(|verdict| verdict.is_ok())
+}
+
+/// Why [`verify_block_whir_traced`] refused a proof whose statement frames: the
+/// derived prepared stacks did not commit, the COMMIT bus's target does not
+/// exist, or the multilinear proof's own check refused (with its error).
+///
+/// The error is read by the host-build tests only (a card build compiles none).
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) enum BlockRefusal {
+    Prepared,
+    Owed,
+    Proof(multilinear::Error),
+}
+
+/// [`verify_block_whir_with`], a refusal carrying the check that refused: what
+/// a negative test asserts, so it cannot pass on another error.
+pub(crate) fn verify_block_whir_traced(
+    proof: &BlockWhirProof,
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+    skip_prepared: bool,
+    argue_checks: VerifierChecks,
+) -> Result<Result<(), BlockRefusal>, Error> {
     // One argument per table, or one per group, by the verifier's format; the
     // other format's messages absent.
     let (tables, argues) = match format.argue {
@@ -5215,7 +5249,7 @@ pub(crate) fn verify_block_whir_with(
             .and_then(|stacks| commit_groups::<H>(stacks, config))
         {
             Ok(prepared) => prepared,
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(Err(BlockRefusal::Prepared)),
         };
         let checks: Vec<multilinear_block::BlockPreparedCheck<'_, F>> = prepared
             .iter()
@@ -5239,7 +5273,7 @@ pub(crate) fn verify_block_whir_with(
         let alpha: FieldElement<E> = probe.sample_field_element();
         let Some(owed) = crate::compute_commit_bus_offset(&proof.public_output, 0, &z, &alpha)
         else {
-            return Ok(false);
+            return Ok(Err(BlockRefusal::Owed));
         };
         multilinear_block::block_verify_with::<_, _, _, H>(
             &proof.proof,
@@ -5256,7 +5290,7 @@ pub(crate) fn verify_block_whir_with(
             skip_prepared,
             argue_checks,
         )
-        .is_ok()
+        .map_err(BlockRefusal::Proof)
     }))
 }
 

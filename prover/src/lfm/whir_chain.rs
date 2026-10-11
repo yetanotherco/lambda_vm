@@ -868,6 +868,8 @@ fn emit_chain(
             "round {r} carries {sent} sumcheck messages"
         );
 
+        #[cfg(test)]
+        onechain_steps::mark(b, onechain_steps::Step::Sumcheck { round: r });
         emit_spent_grind(b, transcript, grind_folding, round.nonces.folding);
 
         // The sumcheck, interleaved: a round's challenge is drawn only after
@@ -912,6 +914,8 @@ fn emit_chain(
         }
         let bound = alphas.len() + sent;
 
+        #[cfg(test)]
+        onechain_steps::mark(b, onechain_steps::Step::Ood { round: r });
         let next_tree = match (round.next_root, round.ood_value, shape.next_depth(r)) {
             (Some(next_root), Some(y0), Some(_)) => {
                 let lanes = b.unpack(next_root);
@@ -983,6 +987,8 @@ fn emit_chain(
 
     // The accumulated weight: the caller's own, plus each out-of-domain claim's
     // batched `eq` over the challenges that came after it.
+    #[cfg(test)]
+    onechain_steps::mark(b, onechain_steps::Step::Final);
     let mut weight = weight_at(b, &alphas, &eqs);
     for (gamma, point, bound) in &ood {
         let eq = emit_eq_eval(b, point, &alphas[*bound..]);
@@ -1032,6 +1038,100 @@ pub(crate) mod onechain_faults {
         }
         let _restore = Restore(FAULT.with(|c| c.replace(fault)));
         f()
+    }
+}
+
+/// Test only: where each check of a chain's emission begins, as the builder's
+/// instruction index, so a refusal is named by the check holding the assert
+/// that failed — the executor reports a failed `assert_eq` as `DivByZero` at
+/// the address of its difference (`executor::locate_addr`), and a negative
+/// test names the step against its honest twin, which executes past it.
+/// Recording only: nothing is emitted, and nothing is kept outside
+/// [`onechain_steps::record`].
+#[cfg(test)]
+pub(crate) mod onechain_steps {
+    use super::super::builder::LfmBuilder;
+    use super::super::compiler::LfmProgram;
+    use super::super::executor::LfmExecError;
+    use super::super::instr::Instr;
+
+    /// A check of the emitted chain, in emission order.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Step {
+        /// A stacked opening's chain whose first polynomial is this begins
+        /// (its roots, its claim).
+        Chain(usize),
+        /// A round's folding grind and sumcheck.
+        Sumcheck { round: usize },
+        /// A round's successor root, out-of-domain point, grinds (or the final
+        /// value) and query draws.
+        Ood { round: usize },
+        /// Tree `tree`'s opening at a query (a grouped round 0 has several).
+        Opening {
+            round: usize,
+            query: usize,
+            tree: usize,
+        },
+        /// The successor's opening at a query.
+        Successor { round: usize, query: usize },
+        /// A query's combine (a grouped round 0), fold and compare.
+        Fold { round: usize, query: usize },
+        /// The weight and the final check.
+        Final,
+    }
+
+    /// [`Step::Opening`].
+    pub(crate) fn opening(round: usize, query: usize, tree: usize) -> Step {
+        Step::Opening { round, query, tree }
+    }
+
+    std::thread_local! {
+        static MARKS: std::cell::RefCell<Option<Vec<(Step, usize)>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(crate) fn mark(b: &LfmBuilder, step: Step) {
+        MARKS.with(|m| {
+            if let Some(marks) = m.borrow_mut().as_mut() {
+                marks.push((step, b.instrs().len()));
+            }
+        });
+    }
+
+    /// Runs `f` and returns the marks its emission left.
+    pub(crate) fn record<R>(f: impl FnOnce() -> R) -> (R, Vec<(Step, usize)>) {
+        let previous = MARKS.with(|m| m.replace(Some(Vec::new())));
+        let out = f();
+        let marks = MARKS.with(|m| m.replace(previous)).unwrap_or_default();
+        (out, marks)
+    }
+
+    /// The chain (by its first polynomial) and the step whose assert failed:
+    /// the instruction that wrote a `DivByZero`'s address, under the last chain
+    /// mark and the last step mark at or before it. `None` for any other
+    /// refusal.
+    pub(crate) fn failed_at(
+        program: &LfmProgram,
+        marks: &[(Step, usize)],
+        error: &LfmExecError,
+    ) -> Option<(Option<usize>, Step)> {
+        let LfmExecError::DivByZero { addr } = error else {
+            return None;
+        };
+        let index = program.instrs.iter().position(|i| match i {
+            Instr::BaseAlu { out, .. } | Instr::ExtAlu { out, .. } => out.0 == *addr,
+            _ => false,
+        })?;
+        let before = marks.iter().filter(|(_, at)| *at <= index);
+        let chain = before.clone().rev().find_map(|(s, _)| match s {
+            Step::Chain(c) => Some(*c),
+            _ => None,
+        });
+        let step = before
+            .rev()
+            .find(|(s, _)| !matches!(s, Step::Chain(_)))
+            .map(|(s, _)| *s)?;
+        Some((chain, step))
     }
 }
 
@@ -1251,16 +1351,22 @@ fn emit_query_phase(
                 // Each tree's block at the query's one position, against that
                 // tree's own check.
                 let blocks = &round.current[q * trees..(q + 1) * trees];
-                for (tree, current) in current_trees.iter().zip(blocks) {
-                    tree.verify_opening(b, current.values, bits, current.siblings);
+                for (p, current) in blocks.iter().enumerate() {
+                    #[cfg(test)]
+                    onechain_steps::mark(b, onechain_steps::opening(r, q, p));
+                    current_trees[p].verify_opening(b, current.values, bits, current.siblings);
                 }
                 let next = &round.next[q];
                 // `leaf_and_slot`: the low `next_depth` bits index the successor
                 // leaf and the high ones choose the slot inside it. Both bounds
                 // are powers of two, so this is a partition of the bits.
                 let (leaf_bits, slot_bits) = bits.split_at(next_depth);
+                #[cfg(test)]
+                onechain_steps::mark(b, onechain_steps::Step::Successor { round: r, query: q });
                 next_tree.verify_opening(b, next.values, leaf_bits, next.siblings);
 
+                #[cfg(test)]
+                onechain_steps::mark(b, onechain_steps::Step::Fold { round: r, query: q });
                 let block = folded_block(b, blocks, eqs);
                 let folded = fold.fold(b, &block, current_domain, bits);
                 let claimed = emit_slot_mux(b, &block_ext(next.values), slot_bits);
@@ -1271,9 +1377,13 @@ fn emit_query_phase(
         _ => {
             for (q, bits) in queries.iter().enumerate() {
                 let blocks = &round.current[q * trees..(q + 1) * trees];
-                for (tree, current) in current_trees.iter().zip(blocks) {
-                    tree.verify_opening(b, current.values, bits, current.siblings);
+                for (p, current) in blocks.iter().enumerate() {
+                    #[cfg(test)]
+                    onechain_steps::mark(b, onechain_steps::opening(r, q, p));
+                    current_trees[p].verify_opening(b, current.values, bits, current.siblings);
                 }
+                #[cfg(test)]
+                onechain_steps::mark(b, onechain_steps::Step::Fold { round: r, query: q });
                 let block = folded_block(b, blocks, eqs);
                 let folded = fold.fold(b, &block, current_domain, bits);
                 b.assert_eq_ext(folded, final_value);

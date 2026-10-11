@@ -409,6 +409,11 @@ pub fn emit_stacked_verify_chains(
         .collect();
 
     for (chain, run) in chains.iter().zip(runs) {
+        #[cfg(test)]
+        super::whir_chain::onechain_steps::mark(
+            b,
+            super::whir_chain::onechain_steps::Step::Chain(run.start),
+        );
         assert_eq!(
             chain.roots.len(),
             run.len(),

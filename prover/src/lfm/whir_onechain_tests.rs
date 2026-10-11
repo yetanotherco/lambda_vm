@@ -13,7 +13,7 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use crypto::fiat_shamir::p1_transcript::P1Transcript;
 use crypto::fiat_shamir::transcript_hash::RpxTranscriptHash;
 use multilinear::mle::Mle;
-use multilinear::stacked_eval::{Claimed, StackedCommitment, StackedProof};
+use multilinear::stacked_eval::{Claimed, Refusal, StackedCommitment, StackedProof};
 use multilinear::stacking::StackedLayout;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{
@@ -29,10 +29,11 @@ use super::algebraic_commit::commitment_to_digest;
 use super::builder::{Cell, Ext, LfmBuilder};
 use super::compiler::{LfmProgram, compile};
 use super::edsl::WrapHash;
-use super::executor::{LfmExecError, execute};
+use super::executor::{LfmExecError, execute, execute_serial};
 use super::hash::HasherKind;
 use super::instr::Instr;
 use super::validator::validate;
+use super::whir_chain::onechain_steps::{self, Step};
 use super::whir_chain::{
     ChainShape, RoundStorage, chain_opening_perms, onechain_faults, push_round_words,
 };
@@ -63,6 +64,7 @@ struct Case {
     n_stack: usize,
     first: Option<usize>,
     log_folding: usize,
+    log_blowup: usize,
     num_queries: usize,
     grind: u8,
     cap: CapPolicy,
@@ -76,6 +78,7 @@ fn rpx(name: &'static str, heights: &[usize], n_stack: usize, grind: u8) -> Case
         n_stack,
         first: None,
         log_folding: 2,
+        log_blowup: 2,
         num_queries: 3,
         grind,
         cap: CapPolicy::Off,
@@ -105,9 +108,12 @@ fn cases() -> Vec<Case> {
             log_folding: 4,
             ..rpx("first fold 6 over eight variables", &[8; 3], 8, 8)
         },
+        // Blowup 2^6: a one-round chain's tree has 2^log_blowup leaves, and a
+        // forgery from another position needs positions that differ.
         Case {
             first: Some(6),
             log_folding: 4,
+            log_blowup: 6,
             ..rpx("one round (n ≤ k0)", &[5; 3], 5, 8)
         },
         rpx("three polynomials, no grind", &[6; 3], 6, 0),
@@ -120,7 +126,7 @@ fn cases() -> Vec<Case> {
             first: Some(6),
             log_folding: 4,
             cap: CapPolicy::Fixed(2),
-            ..rpx("P1, three polynomials at C2", &[8; 3], 8, 6)
+            ..rpx("P1, three polynomials at C2", &[10; 3], 10, 6)
         },
         Case {
             base: Base::P1,
@@ -144,7 +150,7 @@ fn config(case: &Case) -> ChainConfig {
         Base::P1 => format.arity4_cap = case.cap,
     }
     ChainConfig {
-        log_blowup: 2,
+        log_blowup: case.log_blowup,
         log_folding: case.log_folding,
         num_queries: case.num_queries,
         grind: GrindBits::uniform(case.grind),
@@ -369,6 +375,16 @@ impl Arena {
 /// [`emit_stacked_verify_chains`] — the block leaf's group opening — and the
 /// batching challenge published.
 fn program(f: &Fixture) -> LfmProgram {
+    traced_program(f).0
+}
+
+/// [`program`] with the marks of its checks ([`onechain_steps`]), so a refusal
+/// can be named by the check that refused.
+fn traced_program(f: &Fixture) -> (LfmProgram, Vec<(Step, usize)>) {
+    onechain_steps::record(|| emit_program(f))
+}
+
+fn emit_program(f: &Fixture) -> LfmProgram {
     let at = Arena::new(f);
     let hash = match f.base {
         Base::Rpx => WrapHash::production(),
@@ -455,6 +471,92 @@ fn arena(f: &Fixture, proof: &StackedProof<F, E>) -> Vec<LfmWord> {
 fn machine_runs(f: &Fixture, program: &LfmProgram, words: Vec<LfmWord>) -> Result<FEE, String> {
     let exec = execute(program, &[words], &socket(f.base)).map_err(|e| format!("{e:?}"))?;
     word_as_ext(&exec.public_words[0].1).ok_or_else(|| "no published challenge".to_string())
+}
+
+/// How the machine refused an arena: at an emitted check (a failed assert,
+/// named by its chain and step), or with another executor error.
+#[derive(Debug)]
+enum Refused {
+    At(Option<usize>, Step),
+    Other(LfmExecError),
+}
+
+/// The machine's refusal of `words`, or `None` when it executes. On the serial
+/// schedule, so the refusal reported is the FIRST failing check in program
+/// order — the host's order; the level schedule may meet a later one first (it
+/// refuses all the same: [`machine_runs`] runs it).
+fn machine_refusal(
+    f: &Fixture,
+    (program, marks): &(LfmProgram, Vec<(Step, usize)>),
+    words: Vec<LfmWord>,
+) -> Option<Refused> {
+    assert_eq!(
+        execute(program, std::slice::from_ref(&words), &socket(f.base)).is_ok(),
+        execute_serial(program, std::slice::from_ref(&words), &socket(f.base)).is_ok(),
+        "{}: both schedules give one verdict",
+        f.name
+    );
+    let error = execute_serial(program, &[words], &socket(f.base)).err()?;
+    Some(match onechain_steps::failed_at(program, marks, &error) {
+        Some((chain, step)) => Refused::At(chain, step),
+        None => Refused::Other(error),
+    })
+}
+
+/// The host's refusal of `proof` with its cause, or `None` when it accepts.
+fn host_refusal(f: &Fixture, proof: &StackedProof<F, E>) -> Option<Refusal> {
+    macro_rules! traced_under {
+        ($h:ty, $t:expr) => {
+            multilinear::stacked_eval::verify_traced::<F, E, _, $h>(
+                proof,
+                &f.layout,
+                &f.roots,
+                &Claimed::PerColumn(&f.points),
+                &f.values,
+                &f.domain,
+                &f.cfg,
+                &mut $t,
+            )
+        };
+    }
+    match f.base {
+        Base::Rpx => traced_under!(RpxWhir, RpxHost::new(&[])),
+        Base::P1 => traced_under!(P1Whir, P1Transcript::new()),
+    }
+    .err()
+}
+
+/// Whether the machine's step is the check the host's cause names: a grouped
+/// round-0 tree's opening, another opening, a fold, a grind, or the final
+/// check — in the same chain, at the same query and tree where the host says.
+fn same_check(host: &Refusal, machine: &Refused) -> bool {
+    use multilinear::Error as H;
+    let (Refusal::Chain { chain, cause, .. }, Refused::At(Some(at_chain), step)) = (host, machine)
+    else {
+        return false;
+    };
+    chain == at_chain
+        && match (cause, *step) {
+            (
+                H::GroupedOpeningRejected { query, tree },
+                Step::Opening {
+                    round,
+                    query: q,
+                    tree: p,
+                },
+            ) => round == 0 && *query == q && *tree == p,
+            (
+                H::OpeningRejected { query },
+                Step::Opening {
+                    round, query: q, ..
+                },
+            ) => round > 0 && *query == q,
+            (H::OpeningRejected { query }, Step::Successor { query: q, .. }) => *query == q,
+            (H::FoldInconsistent { query }, Step::Fold { query: q, .. }) => *query == q,
+            (H::GrindingRejected { .. }, Step::Sumcheck { .. } | Step::Ood { .. }) => true,
+            (H::EvaluationMismatch, Step::Final) => true,
+            _ => false,
+        }
 }
 
 fn grouped(proof: &mut StackedProof<F, E>, chain: usize) -> &mut GroupedRoundProof<F, E> {
@@ -641,87 +743,204 @@ fn every_slots_round_zero_value_is_pinned_to_its_low_lane() {
 
 // ────────────── B2-3, B2-4, B2-6: every forgery has no execution ──────────────
 
+/// A forgery: what it is, the forged proof, the host's cause when it is fixed
+/// (`None` when the forgery moves the transcript), the machine's step likewise.
+type Forgery = (
+    String,
+    StackedProof<F, E>,
+    Option<multilinear::Error>,
+    Option<Step>,
+);
+
 /// ★ REV-B2-JUDGE B2-3, B2-4 and B2-6: every forgery the host refuses has no
-/// execution — a value in each slot; blocks swapped between trees (each tree
-/// against its own root, by position); one tree's block from another
-/// position (one draw feeds every tree); a round-0 sibling; an index message;
-/// the successor's block; the final value — and every shape B1-2 names (a
-/// block short, one in the absent slot, `k0` round-0 messages) reads another
-/// arena length, which the program, reading a fixed number of wires, refuses.
+/// execution, and the machine refuses it at the SAME check the host does
+/// ([`same_check`], against the honest twin, which executes):
+/// - a value in slot `p` at query 1 — tree `p`'s opening there;
+/// - blocks swapped between trees 0 and 1 — tree 0's opening (each tree
+///   against its own root, by position);
+/// - the last tree's block from another query's position — that tree's
+///   opening (one draw feeds every tree);
+/// - a round-0 sibling of tree 1 at query 2 — tree 1's opening there;
+/// - the successor's block at query 0 — the successor's opening;
+/// - an index round's message and the final value, which move the
+///   transcript: wherever the host's refusal lands (a grind, an opening at a
+///   moved position, a fold), the machine's is the same check;
+/// - B1-2's shapes (a block short, one in the absent slot, `k0` round-0
+///   messages): the host's named shape refusal, and an arena of another length,
+///   which the program — reading a fixed number of wires — refuses as such.
 #[test]
 fn every_grouped_forgery_the_host_refuses_has_no_execution() {
-    let three = |c: &Case| c.heights.len() == 3 && c.grind > 0 && c.cap == CapPolicy::Off;
+    use multilinear::Error as H;
+    use multilinear::whir_chain::GroupedShape as S;
+    let three = |c: &Case| c.heights.len() == 3 && c.cap == CapPolicy::Off;
     for case in cases()
         .into_iter()
         .filter(|c| three(c) || c.base == Base::P1)
     {
-        let f = fixture(&case);
-        let program = program(&f);
-        assert!(machine_runs(&f, &program, arena(&f, &f.proof)).is_ok());
+        // Eight queries: a block from another position needs one whose
+        // position differs from query 1's.
+        let f = fixture(&Case {
+            num_queries: 8,
+            ..case
+        });
+        let traced = traced_program(&f);
+        assert!(machine_refusal(&f, &traced, arena(&f, &f.proof)).is_none());
         let k0 = f.shape.schedule[0];
         let trees = f.shape.chains(f.layout.num_polys())[0].len();
-        let mut forgeries: Vec<(String, StackedProof<F, E>)> = Vec::new();
+        let opening = |query, tree| Some(H::GroupedOpeningRejected { query, tree });
+        // (what, the forgery, the host's cause when it is fixed, the machine's step)
+        let mut forgeries: Vec<Forgery> = Vec::new();
         for p in 0..trees {
             let mut proof = f.proof.clone();
             grouped(&mut proof, 0).current[1][p].values[2] += FE::one();
-            forgeries.push((format!("a value in slot {p}"), proof));
+            forgeries.push((
+                format!("a value in slot {p}"),
+                proof,
+                opening(1, p),
+                Some(onechain_steps::opening(0, 1, p)),
+            ));
         }
         let mut swapped = f.proof.clone();
         grouped(&mut swapped, 0).current[1].swap(0, 1);
-        forgeries.push(("blocks swapped between trees 0 and 1".into(), swapped));
-        let g = {
-            let mut proof = f.proof.clone();
-            grouped(&mut proof, 0).clone()
-        };
-        if let Some(other) = (0..g.current.len())
-            .find(|&j| g.current[j][trees - 1].values != g.current[1][trees - 1].values)
-        {
-            let mut moved = f.proof.clone();
-            grouped(&mut moved, 0).current[1][trees - 1] = g.current[other][trees - 1].clone();
-            forgeries.push(("the last tree's block from another position".into(), moved));
-        }
+        forgeries.push((
+            "blocks swapped between trees 0 and 1".into(),
+            swapped,
+            opening(1, 0),
+            Some(onechain_steps::opening(0, 1, 0)),
+        ));
+        let g = grouped(&mut f.proof.clone(), 0).clone();
+        let last = trees - 1;
+        // From a query past the owner (query 0, whose paths carry the caps), so
+        // the arena keeps its length and only the position differs.
+        let other = (2..g.current.len())
+            .find(|&j| g.current[j][last].values != g.current[1][last].values)
+            .unwrap_or_else(|| panic!("{}: no query at another position", f.name));
+        let mut moved = f.proof.clone();
+        grouped(&mut moved, 0).current[1][last] = g.current[other][last].clone();
+        forgeries.push((
+            "the last tree's block from another position".into(),
+            moved,
+            opening(1, last),
+            Some(onechain_steps::opening(0, 1, last)),
+        ));
         let mut sibling = f.proof.clone();
-        if let Some(node) = grouped(&mut sibling, 0).current[2][1]
+        grouped(&mut sibling, 0).current[2][1]
             .proof
             .merkle_path
             .first_mut()
-        {
-            node[0] ^= 1;
-            forgeries.push(("a round-0 sibling of tree 1".into(), sibling));
-        }
-        let mut index = f.proof.clone();
-        index.polys[0].rounds[0].sumcheck[k0].evaluations[0] += FEE::one();
-        forgeries.push(("an index round's message".into(), index));
+            .unwrap_or_else(|| panic!("{}: a walked level to tamper", f.name))[0] ^= 1;
+        forgeries.push((
+            "a round-0 sibling of tree 1".into(),
+            sibling,
+            opening(2, 1),
+            Some(onechain_steps::opening(0, 2, 1)),
+        ));
         if f.shape.rounds() > 1 {
             let mut next = f.proof.clone();
             grouped(&mut next, 0).next[0].values[0] += FEE::one();
-            forgeries.push(("the successor's block".into(), next));
+            forgeries.push((
+                "the successor's block".into(),
+                next,
+                Some(H::OpeningRejected { query: 0 }),
+                Some(Step::Successor { round: 0, query: 0 }),
+            ));
         }
-        let mut last = f.proof.clone();
-        last.polys[0].final_value += FEE::one();
-        forgeries.push(("the final value".into(), last));
-        // B1-2's shapes: another arena length.
+        let mut index = f.proof.clone();
+        index.polys[0].rounds[0].sumcheck[k0].evaluations[0] += FEE::one();
+        forgeries.push(("an index round's message".into(), index, None, None));
+        let mut final_value = f.proof.clone();
+        final_value.polys[0].final_value += FEE::one();
+        forgeries.push(("the final value".into(), final_value, None, None));
+
+        for (what, forged, cause, step) in forgeries {
+            let host = host_refusal(&f, &forged)
+                .unwrap_or_else(|| panic!("{} [{what}]: the host must refuse", f.name));
+            let machine = machine_refusal(&f, &traced, arena(&f, &forged))
+                .unwrap_or_else(|| panic!("{} [{what}]: the machine executed it", f.name));
+            println!(
+                "ONECHAIN FORGERY [{}] {what}: host {host:?} · machine {machine:?}",
+                f.name
+            );
+            if let Some(cause) = cause {
+                assert_eq!(
+                    host,
+                    Refusal::Chain {
+                        chain: 0,
+                        poly: 0,
+                        cause
+                    },
+                    "{} [{what}]: the host's check",
+                    f.name
+                );
+            }
+            if let Some(step) = step {
+                assert!(
+                    matches!(machine, Refused::At(Some(0), s) if s == step),
+                    "{} [{what}]: the machine refused at {machine:?}, not {step:?}",
+                    f.name
+                );
+            }
+            assert!(
+                same_check(&host, &machine),
+                "{} [{what}]: the host refused at {host:?}, the machine at {machine:?}",
+                f.name
+            );
+        }
+
+        // B1-2's shapes: the host names them; the arena has another length.
         let mut short = f.proof.clone();
         grouped(&mut short, 0).current[1].pop();
-        forgeries.push(("a block short at a query".into(), short));
         let mut absent = f.proof.clone();
         let extra = grouped(&mut absent, 0).current[1][0].clone();
         grouped(&mut absent, 0).current[1].push(extra);
-        forgeries.push(("a block in the absent slot".into(), absent));
         let mut messages = f.proof.clone();
         messages.polys[0].rounds[0].sumcheck.truncate(k0);
-        forgeries.push((format!("{k0} round-0 messages"), messages));
-
-        for (what, forged) in forgeries {
-            assert!(
-                !host_accepts(&f, &forged),
-                "{} [{what}]: the host must refuse, or the machine's refusal is a refusal of \
-                 something valid",
+        let m = f.shape.run(trees).index_vars();
+        for (what, forged, shape) in [
+            (
+                "a block short at a query",
+                short,
+                S::BlocksPerQuery {
+                    query: 1,
+                    expected: trees,
+                    got: trees - 1,
+                },
+            ),
+            (
+                "a block in the absent slot",
+                absent,
+                S::BlocksPerQuery {
+                    query: 1,
+                    expected: trees,
+                    got: trees + 1,
+                },
+            ),
+            (
+                "k0 round-0 messages",
+                messages,
+                S::Round0Messages {
+                    expected: k0 + m,
+                    got: k0,
+                },
+            ),
+        ] {
+            assert_eq!(
+                host_refusal(&f, &forged),
+                Some(Refusal::Chain {
+                    chain: 0,
+                    poly: 0,
+                    cause: H::GroupedShape(shape)
+                }),
+                "{} [{what}]: the host's named shape",
                 f.name
             );
+            let machine = machine_refusal(&f, &traced, arena(&f, &forged));
             assert!(
-                machine_runs(&f, &program, arena(&f, &forged)).is_err(),
-                "{} [{what}]: the machine executed a forgery the host refuses",
+                matches!(
+                    machine,
+                    Some(Refused::Other(LfmExecError::ArenaLenMismatch { .. }))
+                ),
+                "{} [{what}]: refused as another arena length, got {machine:?}",
                 f.name
             );
         }
@@ -731,11 +950,12 @@ fn every_grouped_forgery_the_host_refuses_has_no_execution() {
 // ─────────────────── B2-5: each reading of the index ───────────────────
 
 /// ★ REV-B2-JUDGE B2-5, the host's B1-3 negatives in-guest: each place the
-/// leg reads the index is load-bearing. With `ρ` swapped in the combine only,
-/// `ρ` swapped in the weight only, the index factor dropped, or the absent
-/// slot given weight 1, the honest arena has no execution; with none of them
-/// it executes. (`eq(ρ, p)` is computed from the sampled `ρ` wires: there is
-/// no hint wire to set it by.)
+/// leg reads the index is load-bearing, and each refuses at its own check.
+/// With `ρ` swapped in the combine only, the honest arena is refused at round
+/// 0's first fold; with `ρ` swapped in the weight only, the index factor
+/// dropped, or the absent slot given weight 1, at the final check; with none of
+/// them it executes. (`eq(ρ, p)` is computed from the sampled `ρ` wires: there
+/// is no hint wire to set it by.)
 #[test]
 fn each_in_guest_reading_of_the_index_is_load_bearing() {
     use onechain_faults::Fault;
@@ -748,22 +968,23 @@ fn each_in_guest_reading_of_the_index_is_load_bearing() {
     for case in cases().into_iter().filter(wide) {
         let f = fixture(&case);
         let words = arena(&f, &f.proof);
-        let honest = onechain_faults::with(Fault::None, || program(&f));
-        assert!(machine_runs(&f, &honest, words.clone()).is_ok());
+        let honest = onechain_faults::with(Fault::None, || traced_program(&f));
+        assert!(machine_refusal(&f, &honest, words.clone()).is_none());
         let trees = f.shape.chains(f.layout.num_polys())[0].len();
-        for fault in [
-            Fault::SwapRhoInCombine,
-            Fault::SwapRhoInWeight,
-            Fault::DropIndexFactor,
-            Fault::AbsentSlotWeightOne,
+        for (fault, step) in [
+            (Fault::SwapRhoInCombine, Step::Fold { round: 0, query: 0 }),
+            (Fault::SwapRhoInWeight, Step::Final),
+            (Fault::DropIndexFactor, Step::Final),
+            (Fault::AbsentSlotWeightOne, Step::Final),
         ] {
             if fault == Fault::AbsentSlotWeightOne && trees.is_power_of_two() {
                 continue;
             }
-            let faulty = onechain_faults::with(fault, || program(&f));
+            let faulty = onechain_faults::with(fault, || traced_program(&f));
+            let refused = machine_refusal(&f, &faulty, words.clone());
             assert!(
-                machine_runs(&f, &faulty, words.clone()).is_err(),
-                "{} {fault:?}: the faulty leg executed the honest arena",
+                matches!(refused, Some(Refused::At(Some(0), s)) if s == step),
+                "{} {fault:?}: refused at {refused:?}, not {step:?}",
                 f.name
             );
         }
