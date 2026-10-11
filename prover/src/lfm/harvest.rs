@@ -188,6 +188,11 @@ pub(crate) fn host_table_forked_under<Fam: crate::hash_pin::ProofFamily>(
 /// the reader as well as in the emitted program.
 pub(crate) struct TableLegs {
     pub(crate) verify: TableVerifyShape,
+    /// The wrap hash the node reading these legs runs (the child's proof
+    /// family's, `ProofFamily::WRAP`): every digest in the arenas is laid at
+    /// its width (`proof_arena::words_per_root_for`), the width the node's
+    /// builder reads (`edsl::digest_words`).
+    pub(crate) wrap: super::edsl::WrapHash,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) analysis: Analysis,
     /// `[query][group]` — the row pair in leaf order, then the path.
@@ -247,6 +252,7 @@ pub(crate) fn build_table_legs(
         rap_challenges,
         stark::config::TreeGeometry::BINARY,
         None,
+        super::edsl::WrapHash::production(),
     )
 }
 
@@ -256,13 +262,15 @@ pub(crate) fn build_table_legs(
 /// out to the cap in the walk's order — at arity 4 the hint order of
 /// [`super::p1w16_emit::walk4`] at the opening's index
 /// ([`super::merkle_cap::path_to_cap`]), so an arity-4 proof needs `iotas`; a
-/// binary one ignores them.
+/// binary one ignores them. The arenas are laid at `wrap`'s digest width, the
+/// reading node's.
 pub(crate) fn build_table_legs_with(
     air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
     view: StarkProofView<'_, Gl, Ext3, ()>,
     rap_challenges: &[FEE],
     trees: stark::config::TreeGeometry,
     iotas: Option<&[usize]>,
+    wrap: super::edsl::WrapHash,
 ) -> Result<TableLegs, String> {
     // The shapes, from the AIR and the trace length alone; the proof's blocks
     // are then checked against them, never read into them.
@@ -406,14 +414,16 @@ pub(crate) fn build_table_legs_with(
         .collect();
 
     let caps: Vec<Commitment> = trace_caps.into_iter().flatten().chain(fri_caps).collect();
+    let words_per_root = super::proof_arena::words_per_root_for(wrap);
     check_eq(
-        caps.len() * super::proof_arena::words_per_root(),
-        verify.cap_words(super::proof_arena::words_per_root()),
+        caps.len() * words_per_root,
+        verify.cap_words(words_per_root),
         "every capped tree's cap, and nothing else",
     )?;
 
     Ok(TableLegs {
         verify,
+        wrap,
         analysis,
         openings,
         fri_openings,
@@ -532,13 +542,15 @@ impl TableLegs {
         for query in &self.openings {
             for (values, siblings) in query {
                 out.extend(values.iter().copied());
-                out.extend(super::proof_arena::commitments_to_arena(siblings));
+                out.extend(super::proof_arena::commitments_to_arena_for(
+                    siblings, self.wrap,
+                ));
             }
         }
         check_eq(
             out.len(),
             self.verify
-                .opening_words(super::proof_arena::words_per_root()),
+                .opening_words(super::proof_arena::words_per_root_for(self.wrap)),
             "the opening arena must fill exactly what the shape declares",
         )?;
         Ok(out)
@@ -548,12 +560,14 @@ impl TableLegs {
     /// the emitter declares no caps arena
     /// (`epoch_verify::declare_table_arenas`).
     pub(crate) fn try_caps_arena(&self) -> Result<Option<Vec<LfmWord>>, String> {
-        let words = self.verify.cap_words(super::proof_arena::words_per_root());
+        let words = self
+            .verify
+            .cap_words(super::proof_arena::words_per_root_for(self.wrap));
         if words == 0 {
             check_eq(self.caps.len(), 0, "no caps at a format without caps")?;
             return Ok(None);
         }
-        let out = super::proof_arena::commitments_to_arena(&self.caps);
+        let out = super::proof_arena::commitments_to_arena_for(&self.caps, self.wrap);
         check_eq(
             out.len(),
             words,
@@ -568,12 +582,15 @@ impl TableLegs {
         for query in &self.fri_openings {
             for (values, path) in query {
                 out.extend(values.iter().map(ext_word));
-                out.extend(super::proof_arena::commitments_to_arena(path));
+                out.extend(super::proof_arena::commitments_to_arena_for(
+                    path, self.wrap,
+                ));
             }
         }
         check_eq(
             out.len(),
-            self.verify.fri_words(super::proof_arena::words_per_root()),
+            self.verify
+                .fri_words(super::proof_arena::words_per_root_for(self.wrap)),
             "the FRI arena must fill exactly what the shape declares",
         )?;
         Ok(out)
@@ -607,6 +624,9 @@ impl TableLegs {
 /// and a VM epoch proof alike. That is what makes one node emitter serve every
 /// level.
 pub(crate) struct HarvestedChild {
+    /// The child's proof family's wrap hash: the node reading the child runs
+    /// it, and every digest of the child's arenas is laid at its width.
+    pub(crate) wrap: super::edsl::WrapHash,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) artifacts: super::registry::LfmArtifacts,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -739,11 +759,13 @@ pub(crate) fn harvest_child_under<Fam: crate::hash_pin::ProofFamily>(
                 &lookup,
                 stark::config::TreeGeometry::of::<Fam::Stark>(),
                 Some(&table.iotas),
+                Fam::WRAP,
             )
         })
         .collect::<Result<Vec<_>, String>>()?;
 
     Ok(HarvestedChild {
+        wrap: Fam::WRAP,
         artifacts,
         opts,
         public_words: proved.public_words.clone(),
@@ -766,23 +788,31 @@ pub(crate) fn try_child_arena_words(c: &HarvestedChild) -> Result<Vec<Vec<LfmWor
         }
     }
     arenas.push(publics);
-    arenas.push(super::proof_arena::commitments_to_arena(
+    arenas.push(super::proof_arena::commitments_to_arena_for(
         &c.tables.iter().map(|h| h.main_root).collect::<Vec<_>>(),
+        c.wrap,
     ));
     for (h, leg) in c.tables.iter().zip(&c.legs) {
         if let Some(root) = &h.aux_root {
-            arenas.push(super::proof_arena::commitments_to_arena(&[*root]));
+            arenas.push(super::proof_arena::commitments_to_arena_for(
+                &[*root],
+                c.wrap,
+            ));
         }
         if let Some(l) = &h.contribution {
             arenas.push(vec![ext_word(l)]);
         }
-        arenas.push(super::proof_arena::commitments_to_arena(&[
-            h.composition_root
-        ]));
+        arenas.push(super::proof_arena::commitments_to_arena_for(
+            &[h.composition_root],
+            c.wrap,
+        ));
         arenas.push(h.ood_current.iter().map(ext_word).collect());
         arenas.push(h.ood_next.iter().map(ext_word).collect());
         arenas.push(h.parts.iter().map(ext_word).collect());
-        arenas.push(super::proof_arena::commitments_to_arena(&h.fri_roots));
+        arenas.push(super::proof_arena::commitments_to_arena_for(
+            &h.fri_roots,
+            c.wrap,
+        ));
         arenas.push(h.fri_coeffs.iter().map(ext_word).collect());
         if let Some(nonce) = h.nonce {
             arenas.push(vec![base_word(FE::from(nonce))]);
