@@ -1061,3 +1061,262 @@ fn the_production_grouped_chain_costs_what_the_design_sized() {
         "the sponge within the gate's 3 %"
     );
 }
+
+// ─────────────────── from the code review (REV-OC-B) ───────────────────
+
+/// The code review's M-a, in guest: each round-0 tree's cap is authenticated
+/// against ITS root, by position. Under the binary cap and Poseidon1's C2 cap,
+/// the arena words of trees 0's and 1's caps traded have no execution, and
+/// the failing assert lies in the chain's cap authentication — after its
+/// `Chain` mark and before round 0's first check; the honest arena executes.
+#[test]
+fn round_zero_caps_are_bound_per_tree_in_guest() {
+    for case in cases().into_iter().filter(|c| c.cap != CapPolicy::Off) {
+        let f = fixture(&case);
+        let (program, marks) = traced_program(&f);
+        let honest = arena(&f, &f.proof);
+        assert!(machine_runs(&f, &program, honest.clone()).is_ok());
+        let at = Arena::new(&f);
+        let runs = f.shape.chains(f.layout.num_polys());
+        let shape = f.shape.run(runs[0].len());
+        let words = shape.cap_words(shape.current_depth(0), shape.caps[0]);
+        assert!(words > 0, "{}: a capped round-0 tree", f.name);
+        let nonces = shape.carries(0).iter().filter(|&&c| c).count();
+        let caps = at.chain_at[0] as usize + runs[0].len() + 1 + 2 * shape.messages(0) + nonces;
+        let mut traded = honest.clone();
+        for w in 0..words {
+            traded.swap(caps + w, caps + words + w);
+        }
+        assert_ne!(traded, honest, "{}: two trees, two caps", f.name);
+        let error = execute_serial(&program, &[traded], &socket(f.base))
+            .expect_err("traded caps must have no execution");
+        let LfmExecError::DivByZero { addr } = error else {
+            panic!("{}: a failed assert, got {error:?}", f.name);
+        };
+        let index = program
+            .instrs
+            .iter()
+            .position(|i| match i {
+                Instr::BaseAlu { out, .. } | Instr::ExtAlu { out, .. } => out.0 == addr,
+                _ => false,
+            })
+            .expect("the assert's difference");
+        let chain0 = marks
+            .iter()
+            .find(|(s, _)| *s == Step::Chain(0))
+            .map(|&(_, at)| at)
+            .expect("chain 0's mark");
+        let round0 = marks
+            .iter()
+            .find(|(s, _)| *s == Step::Sumcheck { round: 0 })
+            .map(|&(_, at)| at)
+            .expect("round 0's mark");
+        println!(
+            "ONECHAIN CAPS [{}]: {words} cap words a tree; refused at instruction {index} in \
+             [{chain0}, {round0})",
+            f.name
+        );
+        assert!(
+            chain0 <= index && index < round0,
+            "{}: refused at {index}, outside the cap authentication [{chain0}, {round0})",
+            f.name
+        );
+    }
+}
+
+/// An instrument, asserting nothing: a digest of each case's emitted
+/// instruction stream and its arena length, at `Fault::None` with the step
+/// marks recording. Run once as is and once with the emitters' `cfg(test)`
+/// statements compiled out, as a release build compiles them: equal digests
+/// show the test build emits what a release build does (the code review found
+/// 24 of 24 equal).
+#[test]
+#[ignore = "instrument: prints digests to compare across two builds"]
+fn emitted_program_digests() {
+    use std::hash::{Hash, Hasher};
+    let mut all = cases();
+    all.push(rpx("one polynomial", &[6], 6, 8));
+    for case in all {
+        let mut f = build(&case, GroupFold::Indexed);
+        for group in [GroupFold::Indexed, GroupFold::PerPoly] {
+            if group == GroupFold::PerPoly {
+                f = build(&case, GroupFold::PerPoly);
+            }
+            let program = onechain_faults::with(onechain_faults::Fault::None, || program(&f));
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            format!("{:?}", program.instrs).hash(&mut h);
+            println!(
+                "ONECHAIN DIGEST [{} {group:?}] {} instructions {:016x} arena {}",
+                f.name,
+                program.instrs.len(),
+                h.finish(),
+                Arena::new(&f).total
+            );
+        }
+    }
+}
+
+/// The leg with its roots as PROGRAM CONSTANTS, as the block leaf's prepared
+/// branch wires them (`whir_block`: derived roots as `digest_const`, each chain
+/// its run's slice): tree `p` is checked against the constant of root
+/// `order[p]`. Its arena holds no root word.
+fn const_root_program(f: &Fixture, order: &[usize]) -> (LfmProgram, Vec<(Step, usize)>) {
+    onechain_steps::record(|| {
+        let runs = f.shape.chains(f.layout.num_polys());
+        let values_at: u32 = f.points.iter().map(|p| p.len() as u32).sum();
+        let mut total = values_at + f.values.len() as u32;
+        let chain_at: Vec<u32> = runs
+            .iter()
+            .map(|run| {
+                let at = total;
+                total += 1 + RoundStorage::words(&f.shape.run(run.len()));
+                at
+            })
+            .collect();
+        let hash = match f.base {
+            Base::Rpx => WrapHash::production(),
+            Base::P1 => WrapHash::Poseidon1,
+        };
+        let mut b = LfmBuilder::new().with_wrap_hash(hash);
+        let arena = b.declare_arena(total);
+        let mut transcript = WhirTranscript::for_builder(&mut b);
+        let mut next = 0u32;
+        let points: Vec<Vec<Ext>> = f
+            .points
+            .iter()
+            .map(|p| {
+                p.iter()
+                    .map(|_| {
+                        let w = b.hint_word(arena, next).as_ext();
+                        next += 1;
+                        w
+                    })
+                    .collect()
+            })
+            .collect();
+        let values: Vec<Ext> = (0..f.values.len() as u32)
+            .map(|i| b.hint_word(arena, values_at + i).as_ext())
+            .collect();
+        let mut finals: Vec<Ext> = Vec::new();
+        let mut storage: Vec<RoundStorage> = Vec::new();
+        for (run, &base) in runs.iter().zip(&chain_at) {
+            finals.push(b.hint_word(arena, base).as_ext());
+            storage.push(RoundStorage::hint(
+                &mut b,
+                arena,
+                base + 1,
+                &f.shape.run(run.len()),
+            ));
+        }
+        let roots: Vec<Cell> = order
+            .iter()
+            .map(|&p| b.digest_const(commitment_to_digest(&f.roots[p])).as_cell())
+            .collect();
+        let openings: Vec<_> = storage.iter().map(RoundStorage::openings).collect();
+        let rounds: Vec<Vec<_>> = storage
+            .iter()
+            .zip(&openings)
+            .map(|(chain, (current, next))| chain.wires(current, next))
+            .collect();
+        let chains: Vec<StackedChainWires<'_>> = runs
+            .iter()
+            .enumerate()
+            .map(|(i, run)| StackedChainWires {
+                rounds: &rounds[i],
+                roots: &roots[run.clone()],
+                final_value: finals[i],
+            })
+            .collect();
+        let claimed_at: Vec<&[Ext]> = points.iter().map(Vec::as_slice).collect();
+        let gamma = emit_stacked_verify_chains(
+            &mut b,
+            &mut transcript,
+            &f.layout,
+            &chains,
+            &claimed_at,
+            &values,
+            &f.shape,
+            &f.domain,
+        );
+        b.public(gamma.as_cell());
+        let program = compile(b.finish());
+        validate(&program).expect("the constant-root leg must be admissible");
+        program
+    })
+}
+
+/// The arena [`const_root_program`] reads: the points, the values, then per
+/// chain its final value and its rounds.
+fn const_root_arena(f: &Fixture, proof: &StackedProof<F, E>) -> Vec<LfmWord> {
+    let mut words: Vec<LfmWord> = f.points.iter().flatten().map(ext_word).collect();
+    words.extend(f.values.iter().map(ext_word));
+    let runs = f.shape.chains(f.layout.num_polys());
+    for (chain, run) in proof.polys.iter().zip(&runs) {
+        words.push(ext_word(&chain.final_value));
+        push_round_words(&mut words, &f.shape.run(run.len()), chain);
+    }
+    words
+}
+
+/// The code review's M-g at the stacked level: grouped chains opened
+/// against roots that are PROGRAM CONSTANTS, the wiring of the block leaf's
+/// prepared branch. The honest arena executes; with the constants of trees 0
+/// and 1 exchanged it has no execution (tree 0's opening at query 0, or its cap
+/// where the tree is capped); a value of tree 1's block at query 1 is refused
+/// at tree 1's opening there. Under RPX (a run of three, a split [4, 1]) and
+/// Poseidon1 (C2, and a split).
+#[test]
+fn grouped_chains_open_against_constant_roots() {
+    let picked = |c: &Case| {
+        c.base == Base::P1
+            || (c.n_stack == 6
+                && [3, 5].contains(&c.heights.len())
+                && c.grind > 0
+                && c.cap == CapPolicy::Off)
+    };
+    for case in cases().into_iter().filter(picked) {
+        let f = fixture(&Case {
+            num_queries: 8,
+            ..case
+        });
+        let order: Vec<usize> = (0..f.roots.len()).collect();
+        let traced = const_root_program(&f, &order);
+        let words = const_root_arena(&f, &f.proof);
+        assert!(
+            machine_refusal(&f, &traced, words.clone()).is_none(),
+            "{}: the honest arena executes against constant roots",
+            f.name
+        );
+
+        let mut exchanged = order.clone();
+        exchanged.swap(0, 1);
+        let wrong = const_root_program(&f, &exchanged);
+        let refused = machine_refusal(&f, &wrong, words.clone());
+        let capped = f.shape.caps[0] > 0;
+        assert!(
+            match &refused {
+                Some(Refused::At(Some(0), s)) => !capped && *s == onechain_steps::opening(0, 0, 0),
+                // A capped tree's cap is authenticated before the chain's first
+                // marked check.
+                Some(Refused::Other(LfmExecError::DivByZero { .. })) => capped,
+                _ => false,
+            },
+            "{}: constants exchanged, refused at {refused:?}",
+            f.name
+        );
+
+        let mut forged = f.proof.clone();
+        grouped(&mut forged, 0).current[1][1].values[2] += FE::one();
+        let refused = machine_refusal(&f, &traced, const_root_arena(&f, &forged));
+        assert!(
+            matches!(&refused, Some(Refused::At(Some(0), s)) if *s == onechain_steps::opening(0, 1, 1)),
+            "{}: a value of tree 1's block, refused at {refused:?}",
+            f.name
+        );
+        println!(
+            "ONECHAIN CONST ROOTS [{}]: runs {:?}, capped {capped}",
+            f.name,
+            f.shape.chains(f.layout.num_polys())
+        );
+    }
+}

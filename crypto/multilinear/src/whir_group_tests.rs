@@ -1025,3 +1025,79 @@ fn a_grouped_opening_round_trips_under_p1_caps() {
     let o = open_tower(&[N3; 4], N3, &cfg);
     check_tower(&o, &o.proof, &cfg).unwrap();
 }
+
+// ─────────────────── from the code review (REV-OC-B) ───────────────────
+
+/// The code review's M-a, host: each round-0 tree is bound to its OWN cap and
+/// root. Under a binary cap, trees 0 and 1 trading the cap their owner paths
+/// carry (query 0) is refused at tree 0's cap, `CapRejected`; under
+/// Poseidon1's 4-ary cap, trading the whole owner paths likewise.
+#[test]
+fn round_zero_trees_cannot_trade_caps() {
+    let mut cfg = indexed(Some(6), 4, 3);
+    cfg.format.cap = CapPolicy::Fixed(2);
+    let o = open_tower(&[N3; 3], N3, &cfg);
+    check_tower(&o, &o.proof, &cfg).unwrap();
+    let cap_nodes = 1usize << 2;
+    let mut traded = o.proof.clone();
+    let g = grouped_mut(&mut traded, 0);
+    let len0 = g.current[0][0].proof.merkle_path.len();
+    let len1 = g.current[0][1].proof.merkle_path.len();
+    assert_eq!(len0, len1);
+    assert!(len0 >= cap_nodes, "the owner path carries the cap");
+    let cap0: Vec<_> = g.current[0][0].proof.merkle_path[len0 - cap_nodes..].to_vec();
+    let cap1: Vec<_> = g.current[0][1].proof.merkle_path[len1 - cap_nodes..].to_vec();
+    assert_ne!(cap0, cap1, "two trees, two caps");
+    g.current[0][0].proof.merkle_path[len0 - cap_nodes..].clone_from_slice(&cap1);
+    g.current[0][1].proof.merkle_path[len1 - cap_nodes..].clone_from_slice(&cap0);
+    assert_eq!(
+        trace_tower(&o, &traded, &cfg),
+        in_chain_0(Error::CapRejected),
+        "tree 0's cap is tree 1's"
+    );
+
+    let mut cfg = indexed(Some(6), 4, 3);
+    cfg.format.arity4_cap = CapPolicy::Fixed(1);
+    let o = open::<Ext, P1Whir, _>(&[N3; 3], N3, &cfg, 9, tower_p1).unwrap();
+    check::<Ext, P1Whir, _>(&o, &o.proof, &cfg, tower_p1).unwrap();
+    let mut traded = o.proof.clone();
+    let g = grouped_mut(&mut traded, 0);
+    let path0 = g.current[0][0].proof.merkle_path.clone();
+    g.current[0][0].proof.merkle_path = g.current[0][1].proof.merkle_path.clone();
+    g.current[0][1].proof.merkle_path = path0;
+    assert_eq!(
+        trace::<Ext, P1Whir, _>(&o, &traded, &cfg, tower_p1),
+        in_chain_0(Error::CapRejected),
+        "P1: tree 0's owner path is tree 1's"
+    );
+}
+
+/// The code review's M-b, host: how many successor blocks a grouped round 0
+/// carries is the verifier's schedule, never the proof's — a final round 0
+/// (R = 1) presenting successor blocks, and a non-final one presenting none,
+/// are each refused by name before anything is opened.
+#[test]
+fn successor_blocks_follow_the_schedule_not_the_proof() {
+    let cfg = indexed(Some(6), 4, 3);
+    let (o, _) = p3();
+    let r1 = open_tower(&[3; 3], 3, &cfg);
+    assert_eq!(r1.proof.polys[0].rounds.len(), 1, "R = 1");
+    let mut extra = r1.proof.clone();
+    grouped_mut(&mut extra, 0).next = grouped(&o.proof, 0).next.clone();
+    assert_eq!(
+        shape(check_tower(&r1, &extra, &cfg)),
+        GroupedShape::SuccessorBlocks {
+            expected: 0,
+            got: 3
+        }
+    );
+    let mut none = o.proof.clone();
+    grouped_mut(&mut none, 0).next.clear();
+    assert_eq!(
+        shape(check_tower(&o, &none, &cfg)),
+        GroupedShape::SuccessorBlocks {
+            expected: 3,
+            got: 0
+        }
+    );
+}

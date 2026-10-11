@@ -3189,3 +3189,185 @@ fn an_indexed_blocks_leaves_execute_and_refuse_a_grouped_forgery() {
         );
     }
 }
+
+/// The code review's M-g: a small `Indexed` block under a stack of
+/// `2^stack` and `group_polys` polynomials a group, its prepared stack forged
+/// in one chain, at the block and in its leaf.
+///
+/// The block proves and verifies ([`small_block`]); every leaf executes and the
+/// shares cancel. `pick` chooses, from the prepared stacks' chains — `(stack,
+/// chain, width)`, a width of 1 being a per-polynomial chain — the one to
+/// forge: a value of its round-0 block at query 1, in tree 1 of a grouped
+/// chain or the one tree of another. The host must refuse at that stack's
+/// opening, reported as the run's first polynomial, and the leaf holding the
+/// stack's group at that tree's opening at query 1 under the chain's own mark.
+/// The forgery touches the prepared opening alone, and the honest leaf
+/// executes.
+#[cfg(not(feature = "cuda"))]
+fn forged_prepared_chain(
+    base: stark::proof::options::BaseFormat,
+    stack: usize,
+    group_polys: usize,
+    pick: impl Fn(&[(usize, usize, usize)]) -> Option<(usize, usize, usize)>,
+) {
+    use super::whir_chain::onechain_steps::{self, Step};
+    use multilinear::whir_chain::{GroupFold, RoundOpenings};
+    let small = indexed_format(base);
+    let mut zf = small.zf;
+    zf.whir_stack = StackVars::new(stack).expect("a valid stack");
+    let format = BlockFormat {
+        zf,
+        group_polys,
+        ..small
+    };
+    let (elf, proof) = small_block("all_instructions_64", &format);
+    let chains: Vec<(usize, usize, usize)> = proof
+        .prepared
+        .iter()
+        .enumerate()
+        .flat_map(|(k, opening)| {
+            opening.polys.iter().enumerate().map(move |(i, chain)| {
+                let width = match &chain.rounds[0].openings {
+                    RoundOpenings::BaseGrouped(g) => g.current.first().map_or(0, Vec::len),
+                    _ => 1,
+                };
+                (k, i, width)
+            })
+        })
+        .collect();
+    println!(
+        "ONECHAIN PREPARED {:?} stack 2^{stack}: {} groups, prepared chains (stack, chain, width) \
+         {chains:?}",
+        base.hash,
+        proof.groups.len()
+    );
+    let (k, i, width) = pick(&chains).unwrap_or_else(|| {
+        panic!(
+            "{:?} stack 2^{stack}: the prepared stacks' chains {chains:?} hold none to forge",
+            base.hash
+        )
+    });
+
+    let plan = plan_of(&elf, &proof, &format, None);
+    let words = leaves_words(&plan, &proof);
+    let layout = plan.child_layout();
+    let sum = words
+        .iter()
+        .fold(FEE::zero(), |acc, w| acc + ext_of(&w[layout.sum()]));
+    assert_eq!(
+        sum,
+        FEE::zero(),
+        "{:?}: the leaves' shares cancel",
+        base.hash
+    );
+
+    let prepared = &plan.prepared()[k];
+    let run =
+        multilinear::stacked_eval::index_chains(prepared.layout.num_polys(), GroupFold::Indexed)[i]
+            .clone();
+    assert_eq!(run.len(), width, "the proof's chain is the derived run");
+    let mut forged = proof.clone();
+    let tree = match &mut forged.prepared[k].polys[i].rounds[0].openings {
+        RoundOpenings::BaseGrouped(round) => {
+            round.current[1][1].values[0] += FE::one();
+            1
+        }
+        RoundOpenings::Base(round) => {
+            round.current[1].values[0] += FE::one();
+            0
+        }
+        RoundOpenings::Extension(_) => unreachable!("round 0 is base-field"),
+    };
+    let opts = ProofOptions::default_test_options();
+    let refusal = block_whir::verify_block_whir_traced(
+        &forged,
+        &elf,
+        &opts,
+        &format,
+        false,
+        stark::multilinear_table::batched::VerifierChecks::ALL,
+    )
+    .expect("the statement frames");
+    assert!(
+        matches!(
+            refusal,
+            Err(block_whir::BlockRefusal::Proof(
+                multilinear::Error::ColumnOpeningRejected { column }
+            )) if column == run.start
+        ),
+        "{:?}: the host refuses prepared stack {k} chain {i}'s opening, got {refusal:?}",
+        base.hash
+    );
+    let g = prepared.group;
+    let leaf = (0..plan.partition().num_leaves())
+        .find(|&l| plan.partition().leaf(l).contains(&g))
+        .expect("a leaf holds the group");
+    let (program, marks) = onechain_steps::record(|| {
+        leaf_program_with(&plan, leaf, LeafChecks::ALL).expect("the leaf emits")
+    });
+    let hasher = program.hasher(crate::hash_pin::BLOCK_HASHER);
+    let honest = block_leaf_arena(&plan, &proof, leaf).expect("the honest arena");
+    super::executor::execute_serial(&program, &honest, &hasher).expect("the honest leaf executes");
+    let forged_arena = block_leaf_arena(&plan, &forged, leaf).expect("the forged arena");
+    let error = super::executor::execute_serial(&program, &forged_arena, &hasher)
+        .expect_err("the leaf refuses the forgery");
+    assert_eq!(
+        onechain_steps::failed_at(&program, &marks, &error),
+        Some((
+            Some(run.start),
+            Step::Opening {
+                round: 0,
+                query: 1,
+                tree
+            }
+        )),
+        "{:?}: leaf {leaf} refuses prepared stack {k} chain {i} at tree {tree}'s opening, got \
+         {error:?}",
+        base.hash
+    );
+    println!(
+        "ONECHAIN PREPARED {:?} stack 2^{stack}: REFUSED prepared stack {k} chain {i} (run {run:?}) \
+         — host at its opening, leaf {leaf} of {} at tree {tree}'s opening at query 1",
+        base.hash,
+        plan.partition().num_leaves()
+    );
+}
+
+/// The code review's M-g: a PREPARED stack opened by a GROUPED chain. Under a
+/// stack of 2^8, DECODE's five ELF-derived columns (2^7 rows for this program)
+/// stack into three polynomials — one chain of three, slot 3 absent — while
+/// twelve polynomials a group keep each group's cells those of the 2^10
+/// format. The grouped prepared chain is forged in tree 1.
+#[test]
+#[ignore = "proves small blocks and executes their leaves; box tier"]
+#[cfg(not(feature = "cuda"))]
+fn a_grouped_prepared_stack_verifies_and_its_leaf_refuses_a_forgery() {
+    use stark::proof::options::BaseFormat;
+    for base in [BaseFormat::RPX, BaseFormat::P1_WHIR] {
+        forged_prepared_chain(base, 8, 12, |chains| {
+            chains.iter().copied().find(|&(_, _, width)| width >= 2)
+        });
+    }
+}
+
+/// The code review's M-g: a prepared stack SPLIT into two chains. Under a stack
+/// of 2^7 each of DECODE's five 2^7-row columns is a polynomial of its own:
+/// runs [4, 1]. The LAST chain — whose roots are the stack's derived roots from
+/// polynomial 4 on — is forged, so each chain's slice of the derived roots
+/// (`roots[run]`) is what refuses it, by position.
+#[test]
+#[ignore = "proves small blocks and executes their leaves; box tier"]
+#[cfg(not(feature = "cuda"))]
+fn a_split_prepared_stack_refuses_a_forgery_in_its_last_chain() {
+    use stark::proof::options::BaseFormat;
+    for base in [BaseFormat::RPX, BaseFormat::P1_WHIR] {
+        forged_prepared_chain(base, 7, 24, |chains| {
+            chains.iter().copied().rfind(|&(k, i, _)| {
+                i >= 1
+                    && chains
+                        .iter()
+                        .any(|&(kk, ii, w)| kk == k && ii == 0 && w >= 2)
+            })
+        });
+    }
+}
