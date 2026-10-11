@@ -517,6 +517,97 @@ fn whir_p1_group_census() {
     }
 }
 
+/// ★ D-ONECHAIN B2-7 (REV-B2-JUDGE §4): the median block's census by
+/// emission under `GroupFold::Indexed`, beside `PerPoly`, on the Poseidon1
+/// base at the production format: one plan each over the same statement (the
+/// groups do not depend on the opening's mode), every group emitted
+/// ([`super::whir_block::chip_loads_by_emission`]), the partition at
+/// [`P1_LEAF_HEIGHTS`], and every leaf's emitted rows under every chip's
+/// height — the socket and bit-dec within the LFM bits guard's 2^19 by the
+/// heights' own const-assert.
+///
+/// Prints `ONECHAIN CENSUS …` lines: per mode the leaves, the L0 socket rows
+/// (Σ group costs), the group costs' spread, the heaviest group's chips, and
+/// each leaf's emitted chips. Pre-registered (D-ONECHAIN §5, B2): Indexed
+/// 6–7 leaves (RED at 8, STOP at ≥ 10), every chip under its height.
+#[test]
+#[ignore = "instrument (box with BLOCK_WHIR_ELF, or CENSUS_ELF): run with --exact"]
+fn whir_onechain_census() {
+    let real = std::env::var("CENSUS_ELF")
+        .or_else(|_| std::env::var("BLOCK_WHIR_ELF"))
+        .ok();
+    let elf_bytes = match &real {
+        Some(path) => std::fs::read(path).expect("read the guest ELF"),
+        None => crate::test_utils::asm_elf_bytes("poc_rodata_commit"),
+    };
+    let opts = super::proof::block_base_options();
+    let per_poly = p1_format();
+    let indexed = BlockFormat {
+        group: multilinear::whir_chain::GroupFold::Indexed,
+        ..p1_format()
+    };
+    let owned = median_statement(&elf_bytes, &opts, &per_poly);
+    let mut leaves_of = Vec::new();
+    for (label, format) in [("PerPoly", &per_poly), ("Indexed", &indexed)] {
+        let started = std::time::Instant::now();
+        let plan = WhirBlockPlan::derive_with(
+            &elf_bytes,
+            &opts,
+            format,
+            owned.view(),
+            None,
+            super::whir_block::BLOCK_FAN_IN,
+            None,
+        )
+        .expect("the plan derives");
+        let (loads, front) = plan.chip_loads();
+        let costs = plan.costs();
+        let mut sorted = costs.to_vec();
+        sorted.sort_unstable();
+        let heaviest = loads.iter().fold(ChipRows::default(), |m, l| {
+            let (m, l) = (m.to_array(), l.to_array());
+            ChipRows::from_array(core::array::from_fn(|c| m[c].max(l[c])))
+        });
+        let leaves = plan.partition().num_leaves();
+        println!(
+            "ONECHAIN CENSUS {label}: {} groups, {leaves} leaves, L0 socket {} (derived in {:.1} \
+             s); group costs min {} median {} max {}; heaviest group {heaviest:?}; front {front:?}",
+            plan.num_groups(),
+            costs.iter().sum::<usize>(),
+            started.elapsed().as_secs_f64(),
+            sorted[0],
+            sorted[sorted.len() / 2],
+            sorted[sorted.len() - 1],
+        );
+        let mut target = None;
+        for k in 0..leaves {
+            let leaf = plan.partition().leaf(k);
+            let emitted = ChipRows::of(&plan.leaf_program(k).expect("the leaf emits"));
+            let planned = leaf.iter().fold(front, |acc, &g| acc.plus(loads[g]));
+            assert_planned(
+                &format!("{label} leaf {k}"),
+                k == CARRIER,
+                emitted,
+                planned,
+                &mut target,
+            );
+            println!(
+                "ONECHAIN CENSUS {label} LEAF {k}: {} groups · {emitted:?}",
+                leaf.len()
+            );
+            assert!(
+                emitted.under(P1_LEAF_HEIGHTS),
+                "{label} leaf {k} is past a chip's height: {emitted:?}"
+            );
+        }
+        leaves_of.push(leaves);
+    }
+    println!(
+        "ONECHAIN CENSUS LEAVES: PerPoly {} Indexed {}",
+        leaves_of[0], leaves_of[1]
+    );
+}
+
 // ======================== the leaves' chip heights ========================
 
 use super::whir_block::{CARRIER, P1_LEAF_HEIGHTS, leaf_partition_rows};

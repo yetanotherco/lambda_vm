@@ -29,7 +29,7 @@ use super::builder::{Cell, Ext, LfmBuilder};
 use super::instr::Addr;
 use super::whir_chain::{
     ChainRoundWires, ChainShape, chain_grind_perms, chain_opening_perms, chain_shape_rows,
-    chain_sponge, emit_verify_weighted,
+    chain_sponge, emit_verify_grouped, emit_verify_weighted,
 };
 use super::whir_poly::{
     challenge_powers_rows, emit_challenge_powers, emit_eq_eval, eq_eval_rows_again,
@@ -248,6 +248,31 @@ pub struct StackedPolyWires<'a> {
     pub final_value: Ext,
 }
 
+impl<'a> StackedPolyWires<'a> {
+    /// The one-polynomial chain these wires are.
+    pub fn as_chain(&'a self) -> StackedChainWires<'a> {
+        StackedChainWires {
+            rounds: self.rounds,
+            roots: std::slice::from_ref(&self.root),
+            final_value: self.final_value,
+        }
+    }
+}
+
+/// One chain of a stacked opening, as wires: per polynomial under
+/// [`multilinear::whir_chain::GroupFold::PerPoly`], or per run of
+/// [`ChainShape::chains`] under `Indexed` (D-ONECHAIN).
+pub struct StackedChainWires<'a> {
+    /// Its rounds, one entry per scheduled round of the run's shape.
+    pub rounds: &'a [ChainRoundWires<'a>],
+    /// The roots of the polynomials it opens, as words, in slot order: the
+    /// run's slice of the group's carried roots, so tree `p` is checked against
+    /// the root at a position the program fixes (REV-B2-JUDGE B2-4).
+    pub roots: &'a [Cell],
+    /// The value its chain folds down to.
+    pub final_value: Ext,
+}
+
 /// `claimed` (`stacked_eval.rs:320-331`): one stacked polynomial's columns,
 /// batched by their `gamma` powers.
 ///
@@ -257,15 +282,19 @@ pub struct StackedPolyWires<'a> {
 /// column zero anyway. This is where the analogy with `challenge_powers` — whose
 /// first power IS free — misleads, so the form says `|columns|` and not
 /// `|columns| − 1`.
+///
+/// A grouped chain's claim is its run's polynomials' claims summed, which is
+/// the same accumulation over the run's columns in order: one `γ` for the
+/// whole group, its powers indexed by the group's columns (D-ONECHAIN §3.2).
 fn emit_claimed(
     b: &mut LfmBuilder,
     layout: &StackedLayout,
-    poly: usize,
+    run: std::ops::Range<usize>,
     values: &[Ext],
     weights: &[Ext],
 ) -> Ext {
     let mut claimed: Option<Ext> = None;
-    for column in columns_of(layout, poly) {
+    for column in run.flat_map(|poly| columns_of(layout, poly)) {
         claimed = Some(match claimed {
             None => b.emul(weights[column], values[column]),
             Some(acc) => b.emul_add(weights[column], values[column], acc),
@@ -300,12 +329,45 @@ fn emit_claimed(
 /// assignment; γ comes back so a gate can compare it against the element the
 /// HOST verifier sampled, which turns "the draw is in the right place" from an
 /// absence of execution into a named assertion.
+///
+/// One chain per polynomial: [`emit_stacked_verify_chains`] over
+/// [`StackedPolyWires::as_chain`], whose rows at one polynomial a chain are
+/// these.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_stacked_verify(
     b: &mut LfmBuilder,
     transcript: &mut WhirTranscript,
     layout: &StackedLayout,
     polys: &[StackedPolyWires<'_>],
+    points: &[&[Ext]],
+    values: &[Ext],
+    shape: &ChainShape,
+    domain: &Domain<GoldilocksField>,
+) -> Ext {
+    assert_eq!(
+        polys.len(),
+        layout.num_polys(),
+        "one chain per stacked polynomial"
+    );
+    let chains: Vec<StackedChainWires<'_>> = polys.iter().map(StackedPolyWires::as_chain).collect();
+    emit_stacked_verify_chains(
+        b, transcript, layout, &chains, points, values, shape, domain,
+    )
+}
+
+/// ★ [`emit_stacked_verify`] over the stack's CHAINS: one per run of
+/// [`ChainShape::chains`], the host's own split (`stacked_eval::index_chains`,
+/// REV-B2-JUDGE B2-1). A run of one is [`emit_verify_weighted`] with
+/// [`emit_weight_at`] as its `W`, today's chain; a run of `P' ≥ 2` under
+/// `GroupFold::Indexed` is ONE [`emit_verify_grouped`] whose claim is the run's
+/// columns batched and whose weight is `Σ_p eq(ρ, p)·weight_at_p` read at the
+/// data challenges `at[..k0] ‖ at[k0+m..]` (REV-B2-JUDGE B1-3, B2-5).
+#[allow(clippy::too_many_arguments)]
+pub fn emit_stacked_verify_chains(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    layout: &StackedLayout,
+    chains: &[StackedChainWires<'_>],
     points: &[&[Ext]],
     values: &[Ext],
     shape: &ChainShape,
@@ -321,10 +383,11 @@ pub fn emit_stacked_verify(
         layout.placements().len(),
         "one claimed point per column of the layout"
     );
+    let runs = shape.chains(layout.num_polys());
     assert_eq!(
-        polys.len(),
-        layout.num_polys(),
-        "one chain per stacked polynomial"
+        chains.len(),
+        runs.len(),
+        "one chain per run of the verifier's split"
     );
     assert_eq!(
         shape.num_vars,
@@ -345,23 +408,98 @@ pub fn emit_stacked_verify(
         })
         .collect();
 
-    for (i, poly) in polys.iter().enumerate() {
-        let root_lanes = b.unpack(poly.root);
-        let claimed = emit_claimed(b, layout, i, values, &weights);
-        emit_verify_weighted(
+    for (chain, run) in chains.iter().zip(runs) {
+        assert_eq!(
+            chain.roots.len(),
+            run.len(),
+            "one root per polynomial of the run"
+        );
+        let roots: Vec<[super::builder::Felt; 4]> =
+            chain.roots.iter().map(|&root| b.unpack(root)).collect();
+        let claimed = emit_claimed(b, layout, run.clone(), values, &weights);
+        if run.len() == 1 {
+            let i = run.start;
+            emit_verify_weighted(
+                b,
+                transcript,
+                chain.rounds,
+                &roots[0],
+                chain.final_value,
+                claimed,
+                shape,
+                domain,
+                |b, at| emit_weight_at(b, layout, i, &claims, at),
+            );
+            continue;
+        }
+        let run_shape = shape.run(run.len());
+        let (k0, m) = (run_shape.schedule[0], run_shape.index_vars());
+        emit_verify_grouped(
             b,
             transcript,
-            poly.rounds,
-            &root_lanes,
-            poly.final_value,
+            chain.rounds,
+            &roots,
+            chain.final_value,
             claimed,
-            shape,
+            &run_shape,
             domain,
-            |b, at| emit_weight_at(b, layout, i, &claims, at),
+            |b, at, eqs| {
+                // Each polynomial's weight at the data challenges, the index
+                // left out where round 0 bound it.
+                let data: Vec<Ext> = at[..k0].iter().chain(&at[k0 + m..]).copied().collect();
+                #[cfg(test)]
+                let faulted = weight_faults(b, &at[k0..k0 + m], eqs);
+                #[cfg(test)]
+                let eqs: &[Ext] = &faulted;
+                let mut total: Option<Ext> = None;
+                for (eq, poly) in eqs.iter().zip(run) {
+                    let weight = emit_weight_at(b, layout, poly, &claims, &data);
+                    total = Some(match total {
+                        None => b.emul(*eq, weight),
+                        Some(acc) => b.emul_add(*eq, weight, acc),
+                    });
+                }
+                let total = total.expect("a run of two or more");
+                #[cfg(test)]
+                let total = absent_slot_fault(b, &at[k0..k0 + m], eqs.len(), total);
+                total
+            },
         );
     }
 
     gamma
+}
+
+/// Test only: the final weight's `eq(ρ, p)`s under the weight faults of
+/// [`super::whir_chain::onechain_faults`] — `ρ` reversed, or the index factor
+/// dropped (every slot's `eq` one).
+#[cfg(test)]
+fn weight_faults(b: &mut LfmBuilder, rho: &[Ext], eqs: &[Ext]) -> Vec<Ext> {
+    use super::whir_chain::onechain_faults::{Fault, get};
+    let one = b.ext_const(&FEE::one());
+    match get() {
+        Fault::SwapRhoInWeight => {
+            let swapped: Vec<Ext> = rho.iter().rev().copied().collect();
+            super::whir_chain::emit_eq_index(b, &swapped, eqs.len(), one)
+        }
+        Fault::DropIndexFactor => vec![one; eqs.len()],
+        _ => eqs.to_vec(),
+    }
+}
+
+/// Test only: under `AbsentSlotWeightOne`, the weight plus `eq(ρ, p)` for
+/// every absent slot `p ≥ trees`, as if each held a weight of one.
+#[cfg(test)]
+fn absent_slot_fault(b: &mut LfmBuilder, rho: &[Ext], trees: usize, total: Ext) -> Ext {
+    use super::whir_chain::onechain_faults::{Fault, get};
+    if get() != Fault::AbsentSlotWeightOne {
+        return total;
+    }
+    let one = b.ext_const(&FEE::one());
+    let slots = 1usize << rho.len();
+    super::whir_chain::emit_eq_index(b, rho, slots, one)[trees..]
+        .iter()
+        .fold(total, |acc, eq| b.eadd(acc, *eq))
 }
 
 /// What [`emit_stacked_verify`] costs: its rows, its permutations, and the
@@ -479,18 +617,35 @@ pub fn stacked_verify_cost(
     }
     schedule.draw_ext();
 
-    for poly in 0..polys {
-        ops += 1;
-        ops += columns_of(layout, poly).len();
-        ops += weight_at_rows(layout, poly, group_of);
-        ops += chain_shape_rows(shape);
-        chain_sponge(shape, &mut schedule);
+    // One chain per run of the verifier's split (B2-1): its roots' `Unpack`s,
+    // its claim over the run's columns, each polynomial's weight (and, for a
+    // run of several, the `eq(ρ, p)` combination of them), and its chain at
+    // the run's shape.
+    let runs = shape.chains(polys);
+    let mut chain_perms = 0;
+    for run in &runs {
+        let chain = shape.run(run.len());
+        ops += run.len();
+        ops += run
+            .clone()
+            .map(|poly| columns_of(layout, poly).len())
+            .sum::<usize>();
+        ops += run
+            .clone()
+            .map(|poly| weight_at_rows(layout, poly, group_of))
+            .sum::<usize>();
+        if run.len() >= 2 {
+            ops += run.len();
+        }
+        ops += chain_shape_rows(&chain);
+        chain_sponge(&chain, &mut schedule);
+        chain_perms += chain_opening_perms(&chain) + chain_grind_perms(&chain);
     }
 
     StackedCost {
         ops,
-        chain_perms: polys * (chain_opening_perms(shape) + chain_grind_perms(shape)),
+        chain_perms,
         schedule,
-        chains: polys,
+        chains: runs.len(),
     }
 }

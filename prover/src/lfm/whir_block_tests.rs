@@ -3215,3 +3215,102 @@ fn the_p1_whir_block_tree_proves_to_the_derived_top() {
         plan.partition().leaves()
     );
 }
+
+// ============ D-ONECHAIN B2: the leaves over an `Indexed` block ============
+
+/// [`small_format`] at three polynomials a group under `base`, each group
+/// opened by one chain per run of its polynomials (`GroupFold::Indexed`).
+#[cfg(not(feature = "cuda"))]
+fn indexed_format(base: stark::proof::options::BaseFormat) -> BlockFormat {
+    let small = small_format();
+    BlockFormat {
+        zf: small.zf.with_base(base),
+        group_polys: 3,
+        group: multilinear::whir_chain::GroupFold::Indexed,
+        ..small
+    }
+}
+
+/// ★ REV-B2-JUDGE B2-6 at the block (D-ONECHAIN B2), under RPX and Poseidon1:
+/// the plan's split is the proof's (one chain per run), every leaf of an
+/// `Indexed` block executes over the honest proof and the leaves' shares
+/// cancel; a grouped round-0 value tampered in a group is refused by the host
+/// and by that group's leaf; and the plan prices each group at most at its
+/// per-polynomial cost, below it wherever a run opens several trees. Host
+/// builds only: the card's grouped round 0 is stage B3.
+#[test]
+#[ignore = "executes block leaves over small block proofs; box tier"]
+#[cfg(not(feature = "cuda"))]
+fn an_indexed_blocks_leaves_execute_and_refuse_a_grouped_forgery() {
+    use multilinear::whir_chain::RoundOpenings;
+    use stark::proof::options::BaseFormat;
+    for base in [BaseFormat::RPX, BaseFormat::P1_WHIR] {
+        let format = indexed_format(base);
+        let (elf, proof) = small_block("all_instructions_64", &format);
+        let plan = plan_of(&elf, &proof, &format, Some(2));
+        let grouped: Vec<(usize, usize)> = proof
+            .proof
+            .columns
+            .iter()
+            .enumerate()
+            .flat_map(|(g, stack)| {
+                stack
+                    .polys
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, chain)| {
+                        matches!(chain.rounds[0].openings, RoundOpenings::BaseGrouped(_))
+                    })
+                    .map(move |(i, _)| (g, i))
+            })
+            .collect();
+        assert!(!grouped.is_empty(), "{base:?}: a grouped chain");
+
+        let words = leaves_words(&plan, &proof);
+        let layout = plan.child_layout();
+        let sum = words
+            .iter()
+            .fold(FEE::zero(), |acc, w| acc + ext_of(&w[layout.sum()]));
+        assert_eq!(sum, FEE::zero(), "{base:?}: the leaves' shares cancel");
+
+        let per_poly = BlockFormat {
+            group: multilinear::whir_chain::GroupFold::PerPoly,
+            ..format
+        };
+        let apart = plan_of(&elf, &proof, &per_poly, Some(2));
+        for (g, (&one, &many)) in plan.costs().iter().zip(apart.costs()).enumerate() {
+            let runs = proof.proof.columns[g].polys.len();
+            assert!(one <= many, "{base:?} group {g}: {one} against {many}");
+            if grouped.iter().any(|&(gg, _)| gg == g) {
+                assert!(one < many, "{base:?} group {g}: {runs} chains");
+            }
+        }
+        println!(
+            "ONECHAIN BLOCK {base:?}: {} groups, grouped chains {grouped:?}, costs {:?} (per \
+             polynomial {:?}), leaves {:?}",
+            plan.num_groups(),
+            plan.costs(),
+            apart.costs(),
+            plan.partition().leaves()
+        );
+
+        let (g, i) = grouped[0];
+        let mut forged = proof.clone();
+        match &mut forged.proof.columns[g].polys[i].rounds[0].openings {
+            RoundOpenings::BaseGrouped(round) => round.current[1][1].values[0] += FE::one(),
+            _ => unreachable!("a grouped round 0"),
+        }
+        let opts = ProofOptions::default_test_options();
+        assert!(
+            !verify_block_whir(&forged, &elf, &opts, &format).unwrap_or(false),
+            "{base:?}: the host refuses the forgery"
+        );
+        let k = (0..plan.partition().num_leaves())
+            .find(|&k| plan.partition().leaf(k).contains(&g))
+            .expect("a leaf holds the group");
+        assert!(
+            run_leaf(&plan, &forged, k, LeafChecks::ALL).is_err(),
+            "{base:?}: leaf {k} refuses group {g}'s forged round 0"
+        );
+    }
+}
