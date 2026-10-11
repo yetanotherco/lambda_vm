@@ -3,8 +3,9 @@
 //! node's arenas, and one leg (`per_table_aggregator::emit_leg`) emitted under
 //! `WrapHash::Poseidon1` — ZisK's transcript replay with the family's
 //! statement tag, the width-8 grind check, the tagged leaf hash and the 4-ary
-//! child-order walks to each tree's cap (`P1_STARK_CAP`). The honest arenas execute; every
-//! tamper below is refused by the machine, never by the host harvest.
+//! hint-order walks (`p1w16_emit::walk4`) to each tree's cap
+//! (`P1_STARK_CAP`). The honest arenas execute; every tamper below is refused
+//! by the machine, never by the host harvest.
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 
