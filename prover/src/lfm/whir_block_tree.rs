@@ -269,7 +269,7 @@ impl WhirTreeConfig {
         options.stream_memw_lt =
             std::env::var("BLOCK_WHIR_STREAM_MEMW_LT").is_ok_and(|v| v.trim() == "1");
         // `BLOCK_WHIR_LAYOUT_WORKERS=n`: the streamed chunks laid out on n threads
-        // (production 3; 0 is the inline layout).
+        // (production 6; 0 is the inline layout).
         if let Some(n) = count_knob("BLOCK_WHIR_LAYOUT_WORKERS")? {
             options.layout_workers = n;
         }

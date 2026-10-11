@@ -366,16 +366,17 @@ pub struct BlockOptions {
     /// it arrives; `n > 0` lays them out on `n` threads, packed in arrival
     /// order all the same (the same groups and proof bytes), while the layout
     /// thread lays out the rest of the run as soon as it is built. Production:
-    /// 3. Once phase A uploads ahead, the inline layout closes the middle groups
-    /// after the card is free; three workers close them in time (FAST 835:
-    /// phase A −0.93 s, whole block −1.00 s, peak −0.68 GiB at 1×). Unbounded
-    /// they held more host memory as the block grew (BIG 390); `layout_ahead`
-    /// bounds them (BIG 392: flat).
+    /// [`BLOCK_LAYOUT_WORKERS`]. Once phase A uploads ahead, the inline layout
+    /// closes the middle groups after the card is free; three workers close
+    /// them in time (FAST 835: phase A −0.93 s, whole block −1.00 s, peak −0.68
+    /// GiB at 1×). Unbounded they held more host memory as the block grew (BIG
+    /// 390); `layout_ahead` bounds them (BIG 392: flat).
     pub layout_workers: usize,
     /// With `layout_workers > 0`: `Some(k)` lets at most `k + 1` streamed
     /// chunks be laid out (or in the making) and not yet packed, where the
     /// inline layout holds one; `None` leaves only the channels to bound them,
-    /// which BIG 390 saw grow with the block. Production `Some(2)` (D-EXEC E3).
+    /// which BIG 390 saw grow with the block. Production
+    /// `Some(`[`BLOCK_LAYOUT_AHEAD`]`)`.
     pub layout_ahead: Option<usize>,
     /// With `layout_workers > 0`: pack the rest of the run as it is laid out,
     /// in AIR order, so a group closes once its own tables are ready instead
@@ -781,8 +782,8 @@ impl BlockOptions {
             stream_keccak_rnd: false,
             stream_memw_lt: false,
             drop_streamed_ops: true,
-            layout_workers: 3,
-            layout_ahead: Some(2),
+            layout_workers: BLOCK_LAYOUT_WORKERS,
+            layout_ahead: Some(BLOCK_LAYOUT_AHEAD),
             pack_rest_as_laid_out: false,
             narrow: multilinear_block::Narrowing::CARD,
             upload_ahead: true,
@@ -967,6 +968,21 @@ pub(crate) fn chunked_census(counts: &TableCounts, table_num_vars: &[u8]) -> Str
 /// Cycles a streamed prove collects at a time: half a CPU instance at 2^21, so
 /// every chunk is handed to phase A within a window of completing.
 pub const BLOCK_WINDOW_LOG2: usize = 20;
+
+/// Threads a streamed prove lays its chunks out on
+/// ([`BlockOptions::layout_workers`]). Three workers with two chunks ahead
+/// bound the median block's windows: the layout thread stayed blocked handing
+/// chunks on, and the accumulator waited on it. Six with five ahead leave the
+/// walker to set the pace (ZEN5 020, P1 median: phase A −2.32 s against
+/// three, peak RSS no higher). The groups and the proof bytes are the same at
+/// any count. `BLOCK_WHIR_LAYOUT_WORKERS` overrides it in the tree harness
+/// and the CLI.
+pub const BLOCK_LAYOUT_WORKERS: usize = 6;
+
+/// Streamed chunks laid out (or in the making) and not yet packed, beyond the
+/// one the inline layout holds ([`BlockOptions::layout_ahead`]): one per
+/// worker of [`BLOCK_LAYOUT_WORKERS`]. `BLOCK_WHIR_LAYOUT_AHEAD` overrides it.
+pub const BLOCK_LAYOUT_AHEAD: usize = 5;
 
 /// A block proved in one proof.
 ///
@@ -5599,7 +5615,23 @@ mod rest_order_tests {
 
 #[cfg(test)]
 mod producer_report_tests {
-    use super::{BLOCK_WINDOW_LOG2, BlockStamps, ProducerStamps, StreamTable, parse_window_log2};
+    use super::{
+        BLOCK_LAYOUT_AHEAD, BLOCK_LAYOUT_WORKERS, BLOCK_WINDOW_LOG2, BlockOptions, BlockStamps,
+        ProducerStamps, StreamTable, parse_window_log2,
+    };
+
+    /// Production lays the streamed chunks out on six workers with five
+    /// chunks ahead: one permit per worker, so none idles on a permit while
+    /// the packer is up to date.
+    #[test]
+    fn production_lays_out_on_six_workers_five_ahead() {
+        assert_eq!(BLOCK_LAYOUT_WORKERS, 6);
+        assert_eq!(BLOCK_LAYOUT_AHEAD, 5);
+        let options = BlockOptions::production();
+        assert_eq!(options.layout_workers, BLOCK_LAYOUT_WORKERS);
+        assert_eq!(options.layout_ahead, Some(BLOCK_LAYOUT_AHEAD));
+        assert_eq!(BLOCK_LAYOUT_AHEAD + 1, BLOCK_LAYOUT_WORKERS);
+    }
 
     /// The window knob takes production's 2^20 only, unset is production's,
     /// and anything else (#1013's 2^21 included) is refused.
