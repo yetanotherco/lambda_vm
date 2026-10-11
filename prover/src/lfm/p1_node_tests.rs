@@ -234,10 +234,12 @@ fn a_node_without_the_family_tag_refuses_the_p1_child() {
 /// proved at `g − 1` bits whose nonces do not all meet `g` is accepted by the
 /// node derived at `g − 1` and refused by the one derived at `g`, as the host
 /// verifier at `g` refuses it. `rp1wa_the_emitted_grind_accepts_exactly_the_
-/// hosts_nonces` drives the grind gadget directly and the tamper test's nonce
-/// flip re-rolls every query, so neither sees a weaker factor handed to the
-/// gadget at the leg's call site (`epoch::emit_table_challenges`); this does.
-/// From the reviewer's `rp3b14a_a_p1_node_refuses_a_child_ground_one_bit_short`.
+/// hosts_nonces` drives the grind gadget directly, and the tamper test's nonce
+/// flip re-rolls every query, so neither sees the leg's call site
+/// (`epoch::emit_table_challenges`) drop the check or skip it on the P1 wrap
+/// hash; this does. (A weaker factor at the call site is no stealthy mutant:
+/// the factor is part of the grind's hashed preimage, so the honest node
+/// tests refuse too.) From the reviewers' short-grind tests (REV-P3B14).
 #[test]
 fn a_p1_node_refuses_a_child_ground_one_bit_short() {
     let (short, full) = (options_at(3), options_at(4));
@@ -251,9 +253,10 @@ fn a_p1_node_refuses_a_child_ground_one_bit_short() {
         artifacts.program_id, full_artifacts.program_id,
         "the grind is no part of the program"
     );
-    // A child at 3 bits that some table's nonce does not carry to 4: each
-    // table's 3-bit nonce misses the fourth bit about half the time, so the
-    // first salt nearly always gives one.
+    // A child at 3 bits that some table's nonce does not carry to 4: the
+    // factor is part of the hashed preimage, so a 3-bit nonce passes a 4-bit
+    // check about 1/16 of the time per table, and the first salt nearly
+    // always gives one.
     let (proof, salt) = (0..16u64)
         .find_map(|salt| {
             let proof =
