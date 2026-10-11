@@ -74,7 +74,8 @@ use super::whir_bus::Cost;
 use super::whir_chain::ChainShape;
 use super::whir_real_epoch::WhirRealEpoch;
 use super::whir_stacked::{
-    StackedCost, StackedPolyWires, emit_stacked_verify, stacked_verify_cost,
+    StackedChainWires, StackedCost, StackedPolyWires, emit_stacked_verify,
+    emit_stacked_verify_chains, stacked_verify_cost,
 };
 use super::whir_table::{
     TableProofWires, TableShape, TableVerdictWires, emit_table_verify, table_verify_cost,
@@ -1222,6 +1223,16 @@ pub struct GroupWires<'a> {
     pub domain: &'a Domain<GoldilocksField>,
 }
 
+/// [`GroupWires`] by CHAIN: one per run of the shape's split
+/// ([`ChainShape::chains`]), which is one per polynomial under
+/// `GroupFold::PerPoly` and a run of up to four under `Indexed` (D-ONECHAIN).
+pub struct GroupChainWires<'a> {
+    pub layout: &'a StackedLayout,
+    pub chains: &'a [StackedChainWires<'a>],
+    pub shape: &'a ChainShape,
+    pub domain: &'a Domain<GoldilocksField>,
+}
+
 /// ★ The commitment-group walk, emitted: `multi_verify`'s second loop
 /// (`multilinear_table.rs:1254`).
 ///
@@ -1242,6 +1253,39 @@ pub fn emit_group_walk(
     sizes: &[usize],
     walk: &TableWalk,
 ) -> Vec<Ext> {
+    let chains: Vec<Vec<StackedChainWires<'_>>> = groups
+        .iter()
+        .map(|group| {
+            assert_eq!(
+                group.polys.len(),
+                group.layout.num_polys(),
+                "one chain per stacked polynomial"
+            );
+            group.polys.iter().map(StackedPolyWires::as_chain).collect()
+        })
+        .collect();
+    let groups: Vec<GroupChainWires<'_>> = groups
+        .iter()
+        .zip(&chains)
+        .map(|(group, chains)| GroupChainWires {
+            layout: group.layout,
+            chains,
+            shape: group.shape,
+            domain: group.domain,
+        })
+        .collect();
+    emit_group_walk_chains(b, transcript, &groups, sizes, walk)
+}
+
+/// [`emit_group_walk`] over each group's chains ([`GroupChainWires`]): the
+/// counters as there, each group's opening [`emit_stacked_verify_chains`].
+pub fn emit_group_walk_chains(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    groups: &[GroupChainWires<'_>],
+    sizes: &[usize],
+    walk: &TableWalk,
+) -> Vec<Ext> {
     assert_eq!(groups.len(), sizes.len(), "one size per commitment group");
     assert_eq!(
         sizes.iter().sum::<usize>(),
@@ -1254,11 +1298,11 @@ pub fn emit_group_walk(
     let mut gammas = Vec::with_capacity(groups.len());
     for (group, &size) in groups.iter().zip(sizes) {
         let width: usize = walk.widths[statement_at..statement_at + size].iter().sum();
-        gammas.push(emit_stacked_verify(
+        gammas.push(emit_stacked_verify_chains(
             b,
             transcript,
             group.layout,
-            group.polys,
+            group.chains,
             &points[column_at..column_at + width],
             &walk.values[column_at..column_at + width],
             group.shape,
@@ -2064,8 +2108,10 @@ pub(crate) fn hint_table_wires_shaped(
     }
 }
 
-/// [`hint_group_chains`] for `polys` chains of `shape`, the count the verifier's
-/// own layout gives rather than the proof's.
+/// [`hint_group_chains`] for a stack of `polys` polynomials under `shape`: one
+/// chain per run of [`ChainShape::chains`], each at its run's shape — the count
+/// and the shapes the verifier's own layout and format give rather than the
+/// proof's.
 #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn hint_group_chains_shaped(
     b: &mut LfmBuilder,
@@ -2074,15 +2120,21 @@ pub(crate) fn hint_group_chains_shaped(
     polys: usize,
     shape: &ChainShape,
 ) -> GroupChains {
-    let mut finals = Vec::with_capacity(polys);
-    let mut storage = Vec::with_capacity(polys);
-    for _ in 0..polys {
+    let runs = shape.chains(polys);
+    let mut finals = Vec::with_capacity(runs.len());
+    let mut storage = Vec::with_capacity(runs.len());
+    for run in &runs {
+        let shape = shape.run(run.len());
         finals.push(b.hint_word(arena, *at).as_ext());
         *at += 1;
-        storage.push(super::whir_chain::RoundStorage::hint(b, arena, *at, shape));
-        *at += super::whir_chain::RoundStorage::words(shape);
+        storage.push(super::whir_chain::RoundStorage::hint(b, arena, *at, &shape));
+        *at += super::whir_chain::RoundStorage::words(&shape);
     }
-    GroupChains { finals, storage }
+    GroupChains {
+        finals,
+        storage,
+        runs,
+    }
 }
 
 /// One commitment group's hinted chains, OWNED for the same reason.
@@ -2094,6 +2146,8 @@ pub(crate) fn hint_group_chains_shaped(
 pub(crate) struct GroupChains {
     pub(crate) finals: Vec<Ext>,
     pub(crate) storage: Vec<super::whir_chain::RoundStorage>,
+    /// Each chain's polynomials, a range of the stack's ([`ChainShape::chains`]).
+    pub(crate) runs: Vec<std::ops::Range<usize>>,
 }
 
 /// Hints one group's chains, in [`whir_epoch_arena`]'s order.
@@ -2112,5 +2166,10 @@ pub(crate) fn hint_group_chains(
         storage.push(super::whir_chain::RoundStorage::hint(b, arena, *at, shape));
         *at += super::whir_chain::RoundStorage::words(shape);
     }
-    GroupChains { finals, storage }
+    let runs = (0..opening.polys.len()).map(|i| i..i + 1).collect();
+    GroupChains {
+        finals,
+        storage,
+        runs,
+    }
 }

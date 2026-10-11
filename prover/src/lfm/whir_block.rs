@@ -60,12 +60,12 @@ use super::per_table_aggregator::DerivedChild;
 use super::registry::LfmArtifacts;
 use super::whir_chain::{ChainShape, ChipRows};
 use super::whir_epoch::{
-    BITWISE_NAME, DECODE_NAME, GroupWires, KECCAK_RC_NAME, PreprocessedPlan, PreprocessedRoute,
-    REGISTER_NAME, TableWires, emit_expected, emit_group_walk, emit_roots_block, emit_table_walk,
-    group_columns, hint_group_chains_shaped, hint_table_wires_shaped, push_table_words,
-    table_words,
+    BITWISE_NAME, DECODE_NAME, GroupChainWires, KECCAK_RC_NAME, PreprocessedPlan,
+    PreprocessedRoute, REGISTER_NAME, TableWires, emit_expected, emit_group_walk_chains,
+    emit_roots_block, emit_table_walk, group_columns, hint_group_chains_shaped,
+    hint_table_wires_shaped, push_table_words, table_words,
 };
-use super::whir_stacked::{StackedPolyWires, stacked_verify_cost};
+use super::whir_stacked::{StackedChainWires, stacked_verify_cost};
 use super::whir_table::{TableProofWires, TableShape, table_verify_cost};
 use super::whir_transcript::{SpongeEntry, WhirTranscript};
 use super::word::{LfmWord, base_word};
@@ -1638,20 +1638,26 @@ fn emit_leaf_over(
             .zip(&openings)
             .map(|(chain, (current, next))| chain.wires(current, next))
             .collect();
+        // Each chain against its run's slice of the carried roots: tree `p` of
+        // a run is checked against the root at `root_at + run.start + p`, a
+        // program constant (REV-B2-JUDGE B2-4).
         let root_at = plan.root_start(g);
-        let polys: Vec<StackedPolyWires<'_>> = (0..held.finals.len())
-            .map(|poly| StackedPolyWires {
-                rounds: &rounds[poly],
-                root: carried[root_at + poly],
-                final_value: held.finals[poly],
+        let chains: Vec<StackedChainWires<'_>> = held
+            .runs
+            .iter()
+            .enumerate()
+            .map(|(i, run)| StackedChainWires {
+                rounds: &rounds[i],
+                roots: &carried[root_at + run.start..root_at + run.end],
+                final_value: held.finals[i],
             })
             .collect();
-        emit_group_walk(
+        emit_group_walk_chains(
             b,
             &mut fork,
-            &[GroupWires {
+            &[GroupChainWires {
                 layout,
-                polys: &polys,
+                chains: &chains,
                 shape: &chain,
                 domain: &frame.domains[g],
             }],
@@ -1683,11 +1689,14 @@ fn emit_leaf_over(
                 .zip(&openings)
                 .map(|(chain, (current, next))| chain.wires(current, next))
                 .collect();
-            let polys: Vec<StackedPolyWires<'_>> = (0..held.finals.len())
-                .map(|poly| StackedPolyWires {
-                    rounds: &rounds[poly],
-                    root: roots[poly],
-                    final_value: held.finals[poly],
+            let chains: Vec<StackedChainWires<'_>> = held
+                .runs
+                .iter()
+                .enumerate()
+                .map(|(i, run)| StackedChainWires {
+                    rounds: &rounds[i],
+                    roots: &roots[run.clone()],
+                    final_value: held.finals[i],
                 })
                 .collect();
             if !checks.prepared {
@@ -1700,8 +1709,8 @@ fn emit_leaf_over(
                 points.extend(std::iter::repeat_n(walk.points[slot].as_slice(), n));
                 values.extend_from_slice(&walk.values[column_at..column_at + n]);
             }
-            super::whir_stacked::emit_stacked_verify(
-                b, &mut fork, &p.layout, &polys, &points, &values, &shape, &p.domain,
+            super::whir_stacked::emit_stacked_verify_chains(
+                b, &mut fork, &p.layout, &chains, &points, &values, &shape, &p.domain,
             );
         }
         outputs.extend(walk.outputs.iter().copied());
@@ -1870,24 +1879,28 @@ pub fn group_arena_words(
     Ok(words)
 }
 
-/// One opening's chains: per polynomial its final value, then its rounds.
+/// One opening's chains: per chain (a run of [`ChainShape::chains`]) its final
+/// value, then its rounds at the run's shape.
 fn push_chains(
     words: &mut Vec<LfmWord>,
     opening: &multilinear::stacked_eval::StackedProof<GoldilocksField, GoldilocksExtension>,
     polys: usize,
     shape: &ChainShape,
 ) -> Result<(), String> {
-    if opening.polys.len() != polys {
+    let runs = shape.chains(polys);
+    if opening.polys.len() != runs.len() {
         return Err(format!(
-            "an opening of {} chains where the layout has {polys}",
-            opening.polys.len()
+            "an opening of {} chains where the layout's {polys} polynomials take {}",
+            opening.polys.len(),
+            runs.len()
         ));
     }
-    for chain in &opening.polys {
+    for (chain, run) in opening.polys.iter().zip(&runs) {
+        let shape = shape.run(run.len());
         words.push(super::word::ext_word(&chain.final_value));
         let before = words.len();
-        super::whir_chain::push_round_words(words, shape, chain);
-        if words.len() - before != super::whir_chain::RoundStorage::words(shape) as usize {
+        super::whir_chain::push_round_words(words, &shape, chain);
+        if words.len() - before != super::whir_chain::RoundStorage::words(&shape) as usize {
             return Err("a chain whose rounds are not its shape's".to_string());
         }
     }

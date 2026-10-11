@@ -80,8 +80,12 @@
 //! `epoch_verify.rs:171-179` idiom — the absence of a second value rather than
 //! an assert somebody could forget.
 
+use multilinear::stacked_eval::index_chains;
 use multilinear::whir::Domain;
-use multilinear::whir_chain::{ChainConfig, ChainProof, ChainRound, NonceLayout, RoundOpenings};
+use multilinear::whir_chain::{
+    ChainConfig, ChainProof, ChainRound, GroupFold, MAX_INDEX_POLYS, NonceLayout, RoundOpenings,
+    index_vars,
+};
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
@@ -135,13 +139,16 @@ pub struct ChainRoundWires<'a> {
     pub ood_value: Option<Ext>,
     pub nonces: RoundNonces,
     /// Per query: the block of the current codeword that folds onto the query.
+    /// A grouped round 0 holds one block a tree, query-major
+    /// (`num_queries · trees`, [`ChainShape::trees_at`]).
     pub current: &'a [QueryOpening<'a>],
     /// Per query: the successor block holding the folded value. Empty on the
     /// last round.
     pub next: &'a [QueryOpening<'a>],
     /// The current tree's Merkle cap, when this round OWNS it: round 0 with
-    /// `caps[0] > 0`. Empty otherwise (W1; a later round's current tree was
-    /// authenticated as the round before's successor).
+    /// `caps[0] > 0` — a grouped round 0's trees' caps, in tree order. Empty
+    /// otherwise (W1; a later round's current tree was authenticated as the
+    /// round before's successor).
     pub current_cap: &'a [WrapDigest],
     /// The successor tree's Merkle cap, when it has one (`caps[r + 1] > 0`).
     pub next_cap: &'a [WrapDigest],
@@ -170,6 +177,15 @@ pub struct ChainShape {
     /// Children per Merkle node: 2, or 4 for a Poseidon1 base's trees, whose
     /// caps then count 4-ary levels (`ChainConfig::tree_caps_at`).
     pub arity: usize,
+    /// How a stack's polynomials are cut into chains (D-ONECHAIN, W-14): the
+    /// config's own, so the emitter, the arena and the plan split a stack as
+    /// the host does ([`Self::chains`]).
+    pub group: GroupFold,
+    /// The polynomials this chain opens: one, or a run of up to
+    /// `MAX_INDEX_POLYS` under [`GroupFold::Indexed`] ([`Self::run`]), whose
+    /// round 0 opens one tree each at one position set and binds `m =
+    /// ⌈log2 trees⌉` index variables after its `k0` data ones.
+    pub trees: usize,
 }
 
 impl ChainShape {
@@ -202,11 +218,55 @@ impl ChainShape {
             ),
             nonces: config.format.nonces,
             arity,
+            group: config.format.group,
+            trees: 1,
         }
     }
 
     pub fn rounds(&self) -> usize {
         self.schedule.len()
+    }
+
+    /// The chains a stack of `num_polys` polynomials is opened by, each a range
+    /// of its polynomials: the host's own split (`stacked_eval::index_chains`,
+    /// REV-B2-JUDGE B2-1), which the emitter, the arena and the plan all cut by.
+    pub fn chains(&self, num_polys: usize) -> Vec<std::ops::Range<usize>> {
+        index_chains(num_polys, self.group)
+    }
+
+    /// This shape for a chain over `trees` polynomials, a run of
+    /// [`Self::chains`]: the folds, trees, caps and `Q` stay the
+    /// per-polynomial chain's, and round 0 carries the index (REV-B2-JUDGE J1).
+    pub fn run(&self, trees: usize) -> Self {
+        assert_eq!(self.trees, 1, "a run is cut from a per-polynomial shape");
+        assert!(
+            (1..=MAX_INDEX_POLYS).contains(&trees)
+                && (trees == 1 || self.group == GroupFold::Indexed),
+            "a run of {trees} polynomials under {:?}",
+            self.group
+        );
+        Self {
+            trees,
+            ..self.clone()
+        }
+    }
+
+    /// `m`: the index variables round 0 binds after its data ones (0 for one
+    /// polynomial, today's chain).
+    pub fn index_vars(&self) -> usize {
+        index_vars(self.trees)
+    }
+
+    /// Sumcheck messages round `r` carries: its folds, and at round 0 the `m`
+    /// index rounds after them (`k0 + m`, `ChainConfig::index_schedule`).
+    pub fn messages(&self, r: usize) -> usize {
+        self.schedule[r] + if r == 0 { self.index_vars() } else { 0 }
+    }
+
+    /// The trees round `r` opens at each query position: the run's at round 0,
+    /// the one successor after it.
+    pub fn trees_at(&self, r: usize) -> usize {
+        if r == 0 { self.trees } else { 1 }
     }
 
     /// Which of round `r`'s nonce slots (folding, out-of-domain, query) have an
@@ -312,9 +372,15 @@ impl ChainShape {
         if r == 0 { values } else { 3 * values }
     }
 
-    /// Variables bound after round `r`.
+    /// Variables bound after round `r`, the index ones included (round 0 binds
+    /// them).
     pub fn bound(&self, r: usize) -> usize {
-        self.schedule[..=r].iter().sum()
+        self.schedule[..=r].iter().sum::<usize>() + self.index_vars()
+    }
+
+    /// Variables the chain binds in all: the polynomial's and the index's.
+    pub fn chain_vars(&self) -> usize {
+        self.num_vars + self.index_vars()
     }
 }
 
@@ -330,11 +396,12 @@ impl ChainShape {
 pub fn chain_opening_perms(shape: &ChainShape) -> usize {
     let mut per_query = 0;
     for r in 0..shape.rounds() {
-        per_query += shape.opening_perms(
-            shape.current_felts(r),
-            shape.current_depth(r),
-            shape.caps[r],
-        );
+        per_query += shape.trees_at(r)
+            * shape.opening_perms(
+                shape.current_felts(r),
+                shape.current_depth(r),
+                shape.caps[r],
+            );
         if let Some(depth) = shape.next_depth(r) {
             per_query += shape.opening_perms(3 << shape.schedule[r + 1], depth, shape.caps[r + 1]);
         }
@@ -343,11 +410,12 @@ pub fn chain_opening_perms(shape: &ChainShape) -> usize {
 }
 
 /// PERMUTATIONS the chain's cap checks cost: each capped tree's cap hashed up
-/// to its root once, `2^c − 1` parents. Zero at the default. Part of
-/// [`chain_opening_perms`], stated apart so the per-tree term is visible.
+/// to its root once, `2^c − 1` parents (a grouped round 0's trees each). Zero
+/// at the default. Part of [`chain_opening_perms`], stated apart so the
+/// per-tree term is visible.
 pub fn chain_cap_perms(shape: &ChainShape) -> usize {
     (0..shape.rounds())
-        .map(|r| shape.cap_perms(shape.current_depth(r), shape.caps[r]))
+        .map(|r| shape.trees_at(r) * shape.cap_perms(shape.current_depth(r), shape.caps[r]))
         .sum()
 }
 
@@ -363,9 +431,11 @@ pub fn chain_query_rows(shape: &ChainShape) -> usize {
             1usize << shape.schedule[r]
         };
         let depth = shape.current_depth(r);
-        // The index draw, the current opening, and the fold.
+        // The index draw, the current opening (one a tree), the trees' blocks
+        // combined (a grouped round 0), and the fold.
         let mut q = 1
-            + verify_opening_rows_capped(felts, unpacks, depth, shape.caps[r])
+            + shape.trees_at(r) * verify_opening_rows_capped(felts, unpacks, depth, shape.caps[r])
+            + combine_rows(shape, r)
             + fold_rows_for(1usize << shape.schedule[r], depth);
         match shape.next_depth(r) {
             Some(next_depth) => {
@@ -406,8 +476,12 @@ pub fn chain_fixed_rows(shape: &ChainShape) -> usize {
         let k = shape.schedule[r];
         rows += grind_fixed(folding);
         // Per sumcheck round: two absorbed evaluations (one `Unpack` each), one
-        // drawn challenge (one `Pack`), and the round itself.
-        rows += k * (SUMCHECK_DEGREE + 1 + sumcheck_round_rows(SUMCHECK_DEGREE));
+        // drawn challenge (one `Pack`), and the round itself. Round 0 of a
+        // grouped chain has `m` more, then its `eq(ρ, p)`s.
+        rows += shape.messages(r) * (SUMCHECK_DEGREE + 1 + sumcheck_round_rows(SUMCHECK_DEGREE));
+        if r == 0 {
+            rows += eq_index_rows(shape.trees);
+        }
         match shape.next_depth(r) {
             Some(_) => {
                 let next_domain_log = shape.domain_log[r] - k;
@@ -431,13 +505,42 @@ pub fn chain_fixed_rows(shape: &ChainShape) -> usize {
     // The tail: one `eq` and one `MulAdd` per out-of-domain claim, then the
     // inversion, the multiply and the assert.
     for r in 0..shape.rounds() - 1 {
-        rows += eq_eval_rows_again(shape.num_vars - shape.bound(r)) + 1;
+        rows += eq_eval_rows_again(shape.chain_vars() - shape.bound(r)) + 1;
     }
     rows += 1 + 1 + 2;
     // W1: each capped tree's cap check, once (its hinted words are arena
     // words, counted with the arena like every other hint).
-    rows += shape.caps.iter().map(|&c| cap_check_rows(c)).sum::<usize>();
+    rows += shape
+        .caps
+        .iter()
+        .enumerate()
+        .map(|(r, &c)| shape.trees_at(r) * cap_check_rows(c))
+        .sum::<usize>();
     rows
+}
+
+/// INSTRUCTIONS round `r`'s query spends combining its trees' blocks: one
+/// extension row a value a tree ([`emit_combine`]), none with one tree.
+pub fn combine_rows(shape: &ChainShape, r: usize) -> usize {
+    match shape.trees_at(r) {
+        1 => 0,
+        trees => trees << shape.schedule[r],
+    }
+}
+
+/// INSTRUCTIONS [`emit_eq_index`] spends on `trees` slots: one `1 − ρ_i` a
+/// position some slot reads as a zero bit (shared), and `m − 1` products a
+/// slot; none for one polynomial.
+pub fn eq_index_rows(trees: usize) -> usize {
+    let m = index_vars(trees);
+    let complements = (0..m)
+        .filter(|&i| (0..trees).any(|p| (p >> (m - 1 - i)) & 1 == 0))
+        .count();
+    if m == 0 {
+        0
+    } else {
+        complements + trees * (m - 1)
+    }
 }
 
 /// A grind's rows beyond the sponge state it reads — see
@@ -514,7 +617,7 @@ pub fn chain_sponge(shape: &ChainShape, sponge: &mut SpongeSchedule) {
 
     for r in 0..shape.rounds() {
         sponge.grind(folding);
-        for _ in 0..shape.schedule[r] {
+        for _ in 0..shape.messages(r) {
             sponge.absorb(SUMCHECK_DEGREE * COORDINATES_PER_EXT);
             sponge.draw_ext();
         }
@@ -631,33 +734,129 @@ pub fn emit_verify_weighted(
     weight_at: impl FnOnce(&mut LfmBuilder, &[Ext]) -> Ext,
 ) {
     assert_eq!(
+        shape.trees, 1,
+        "a chain over one polynomial; a run of several is emit_verify_grouped's"
+    );
+    emit_chain(
+        b,
+        transcript,
+        rounds,
+        std::slice::from_ref(root_lanes),
+        final_value,
+        y,
+        shape,
+        domain,
+        |b, at, _| weight_at(b, at),
+    );
+}
+
+/// ★ `whir_chain::verify_grouped`, emitted: ONE chain over a run of
+/// `shape.trees` stacked polynomials ([`GroupFold::Indexed`], D-ONECHAIN
+/// §2.7), each committed under its own root in `roots`, in slot order.
+///
+/// Round 0 runs `k0 + m` sumcheck rounds, the `m` index challenges `ρ` last;
+/// at each query position it opens EVERY tree at the one drawn index, combines
+/// the blocks as `Σ_p eq(ρ, p)·block_p` and folds that as today's `2^k0`
+/// block. Every later round is [`emit_verify_weighted`]'s.
+///
+/// `weight_at` is handed the chain's `n + m` challenges in binding order and
+/// the run's `eq(ρ, p)`s, `p < trees` ([`emit_eq_index`]): the one evaluation
+/// the combine reads too, from the sampled `ρ` wires. An absent slot `p ≥
+/// trees` has no `eq`, no block and no hint wire.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_verify_grouped(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    rounds: &[ChainRoundWires<'_>],
+    roots: &[[Felt; 4]],
+    final_value: Ext,
+    y: Ext,
+    shape: &ChainShape,
+    domain: &Domain<GoldilocksField>,
+    weight_at: impl FnOnce(&mut LfmBuilder, &[Ext], &[Ext]) -> Ext,
+) {
+    assert!(
+        shape.trees >= 2,
+        "a run of one polynomial is emit_verify_weighted's"
+    );
+    emit_chain(
+        b,
+        transcript,
+        rounds,
+        roots,
+        final_value,
+        y,
+        shape,
+        domain,
+        weight_at,
+    );
+}
+
+/// [`emit_verify_weighted`] and [`emit_verify_grouped`]: one chain over
+/// `roots.len() = shape.trees` polynomials. At one polynomial every row it
+/// emits, and their order, are [`emit_verify_weighted`]'s as they were.
+#[allow(clippy::too_many_arguments)]
+fn emit_chain(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    rounds: &[ChainRoundWires<'_>],
+    roots: &[[Felt; 4]],
+    final_value: Ext,
+    y: Ext,
+    shape: &ChainShape,
+    domain: &Domain<GoldilocksField>,
+    weight_at: impl FnOnce(&mut LfmBuilder, &[Ext], &[Ext]) -> Ext,
+) {
+    assert_eq!(
         rounds.len(),
         shape.rounds(),
         "one set of wires per scheduled round"
     );
+    assert_eq!(roots.len(), shape.trees, "one root per round-0 tree");
     let one = b.ext_const(&FEE::one());
     let (grind_folding, grind_ood, grind_query) = shape.grind;
 
     let mut claim = y;
-    let mut alphas: Vec<Ext> = Vec::with_capacity(shape.num_vars);
-    // Tree 0: its cap (when it has one) is authenticated against the root
-    // here, once; every later tree where its root is absorbed.
-    let mut current_tree = tree_auth(
-        b,
-        shape,
-        shape.current_depth(0),
-        shape.caps[0],
-        rounds[0].current_cap,
-        root_lanes,
+    let mut alphas: Vec<Ext> = Vec::with_capacity(shape.chain_vars());
+    // Round 0's trees: each one's cap (when it has one) is authenticated
+    // against its root here, once; every later tree where its root is absorbed.
+    // Tree `p` is checked against `roots[p]` alone, by its position.
+    let depth0 = shape.current_depth(0);
+    let cap_words = shape.cap_words(depth0, shape.caps[0]);
+    assert_eq!(
+        rounds[0].current_cap.len(),
+        shape.trees * cap_words,
+        "one cap a round-0 tree"
     );
+    let mut current_trees: Vec<TreeAuth> = roots
+        .iter()
+        .enumerate()
+        .map(|(p, lanes)| {
+            tree_auth(
+                b,
+                shape,
+                depth0,
+                shape.caps[0],
+                &rounds[0].current_cap[p * cap_words..(p + 1) * cap_words],
+                lanes,
+            )
+        })
+        .collect();
     let mut current_domain = domain.clone();
     // Each out-of-domain claim: its batching weight, its point, and how many
     // variables were bound when it entered.
     let mut ood: Vec<(Ext, Vec<Ext>, usize)> = Vec::new();
+    // The run's `eq(ρ, p)`s, once round 0 has drawn `ρ`; none for one tree.
+    let mut eqs: Vec<Ext> = Vec::new();
 
     for (r, round) in rounds.iter().enumerate() {
         let k = shape.schedule[r];
-        assert_eq!(round.sumcheck.len(), k, "round {r} folds {k} variables");
+        let sent = shape.messages(r);
+        assert_eq!(
+            round.sumcheck.len(),
+            sent,
+            "round {r} carries {sent} sumcheck messages"
+        );
 
         emit_spent_grind(b, transcript, grind_folding, round.nonces.folding);
 
@@ -665,7 +864,7 @@ pub fn emit_verify_weighted(
         // its evaluations are absorbed, which is the order `verify_rounds`
         // takes (`sumcheck.rs:386-390`) and the seam the round primitive was
         // left with.
-        let mut point = Vec::with_capacity(k);
+        let mut point = Vec::with_capacity(sent);
         for evaluations in round.sumcheck {
             assert_eq!(evaluations.len(), SUMCHECK_DEGREE);
             for e in evaluations {
@@ -675,6 +874,25 @@ pub fn emit_verify_weighted(
             claim = emit_sumcheck_round(b, claim, evaluations, challenge);
             point.push(challenge);
         }
+        // A grouped round 0 bound its index LAST: the challenges past the
+        // first `k` are `ρ`, and only the first `k` fold a block.
+        let (data, rho) = point.split_at(k);
+        if !rho.is_empty() {
+            eqs = emit_eq_index(b, rho, shape.trees, one);
+        }
+        // The combine reads the same `eq(ρ, p)`s the weight does.
+        #[cfg(test)]
+        let faulted: Vec<Ext> =
+            if r == 0 && onechain_faults::get() == onechain_faults::Fault::SwapRhoInCombine {
+                let swapped: Vec<Ext> = rho.iter().rev().copied().collect();
+                emit_eq_index(b, &swapped, shape.trees, one)
+            } else {
+                eqs.clone()
+            };
+        #[cfg(test)]
+        let combine_eqs: &[Ext] = &faulted;
+        #[cfg(not(test))]
+        let combine_eqs: &[Ext] = &eqs;
 
         let mut next_domain = current_domain.clone();
         for _ in 0..k {
@@ -682,7 +900,7 @@ pub fn emit_verify_weighted(
                 .squared()
                 .expect("the schedule never folds past the domain");
         }
-        let bound = alphas.len() + k;
+        let bound = alphas.len() + sent;
 
         let next_tree = match (round.next_root, round.ood_value, shape.next_depth(r)) {
             (Some(next_root), Some(y0), Some(_)) => {
@@ -692,7 +910,7 @@ pub fn emit_verify_weighted(
                 let z0 = transcript.sample_ext(b);
 
                 // ONE squaring chain for two consumers. `powers[j] = z0^(2^j)`:
-                // the out-of-domain point takes the first `num_vars − bound` of
+                // the out-of-domain point takes the first `n + m − bound` of
                 // them and the domain check takes the last.
                 let depth = next_domain.log_size();
                 let mut powers = Vec::with_capacity(depth + 1);
@@ -702,7 +920,7 @@ pub fn emit_verify_weighted(
                     powers.push(squared);
                 }
                 emit_require_out_of_domain(b, powers[depth], one);
-                let ood_point: Vec<Ext> = powers[..shape.num_vars - bound].to_vec();
+                let ood_point: Vec<Ext> = powers[..shape.chain_vars() - bound].to_vec();
 
                 transcript.absorb_ext(b, y0);
                 emit_spent_grind(b, transcript, grind_ood, round.nonces.ood);
@@ -739,14 +957,15 @@ pub fn emit_verify_weighted(
             shape,
             r,
             &current_domain,
-            &point,
-            &current_tree,
+            data,
+            &current_trees,
+            if r == 0 { combine_eqs } else { &[] },
             next_tree.as_ref(),
             final_value,
         );
 
         if let Some(tree) = next_tree {
-            current_tree = tree;
+            current_trees = vec![tree];
         }
         alphas.extend(point);
         current_domain = next_domain;
@@ -754,13 +973,123 @@ pub fn emit_verify_weighted(
 
     // The accumulated weight: the caller's own, plus each out-of-domain claim's
     // batched `eq` over the challenges that came after it.
-    let mut weight = weight_at(b, &alphas);
+    let mut weight = weight_at(b, &alphas, &eqs);
     for (gamma, point, bound) in &ood {
         let eq = emit_eq_eval(b, point, &alphas[*bound..]);
         weight = b.emul_add(*gamma, eq, weight);
     }
 
     emit_final_check(b, claim, weight, final_value, one);
+}
+
+/// Test only: emitter faults a grouped-chain test switches on, one at a time,
+/// to show each in-guest reading of the index is load-bearing (REV-B2-JUDGE
+/// B2-5, the host's B1-3 negatives): under any of them the honest arena has no
+/// execution. Thread-local, so a test that sets one moves no other test's
+/// program.
+#[cfg(test)]
+pub(crate) mod onechain_faults {
+    /// Which piece of the emitted verifier reads the index wrongly.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) enum Fault {
+        #[default]
+        None,
+        /// Round 0's combine reads `ρ` reversed.
+        SwapRhoInCombine,
+        /// The final weight reads `ρ` reversed.
+        SwapRhoInWeight,
+        /// The final weight drops `eq(ρ, p)`: `Σ_p w_p` at the data point.
+        DropIndexFactor,
+        /// The final weight gives each absent slot `p ≥ P'` a weight of 1.
+        AbsentSlotWeightOne,
+    }
+
+    std::thread_local! {
+        static FAULT: std::cell::Cell<Fault> = const { std::cell::Cell::new(Fault::None) };
+    }
+
+    pub(crate) fn get() -> Fault {
+        FAULT.with(std::cell::Cell::get)
+    }
+
+    /// Runs `f` under `fault`, restoring the previous one after.
+    pub(crate) fn with<R>(fault: Fault, f: impl FnOnce() -> R) -> R {
+        struct Restore(Fault);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FAULT.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(FAULT.with(|c| c.replace(fault)));
+        f()
+    }
+}
+
+/// `eq(ρ, p)` for each slot `p < trees`, `ρ_0` against the MOST significant of
+/// `p`'s bits: the host's `whir_chain::eq_index`, emitted from the sampled `ρ`
+/// wires and never hinted (REV-B2-JUDGE B2-5). An absent slot `p ≥ trees` has
+/// no `eq` at all. `1 − ρ_i` is emitted once a position, when a slot reads it.
+pub fn emit_eq_index(b: &mut LfmBuilder, rho: &[Ext], trees: usize, one: Ext) -> Vec<Ext> {
+    let m = rho.len();
+    assert_eq!(
+        m,
+        index_vars(trees),
+        "{trees} slots bind {m} index variables"
+    );
+    let mut complement: Vec<Option<Ext>> = vec![None; m];
+    let mut eqs = Vec::with_capacity(trees);
+    for p in 0..trees {
+        let mut acc: Option<Ext> = None;
+        for (i, &r) in rho.iter().enumerate() {
+            let factor = if (p >> (m - 1 - i)) & 1 == 1 {
+                r
+            } else {
+                match complement[i] {
+                    Some(c) => c,
+                    None => {
+                        let c = b.esub(one, r);
+                        complement[i] = Some(c);
+                        c
+                    }
+                }
+            };
+            acc = Some(match acc {
+                None => factor,
+                Some(a) => b.emul(a, factor),
+            });
+        }
+        eqs.push(acc.expect("a run of two or more binds an index variable"));
+    }
+    eqs
+}
+
+/// `Σ_p eqs[p]·block_p`, value by value: the one `2^k0` block a grouped round
+/// 0 folds (the host's `whir_round::combine_blocks`).
+///
+/// ★ THE BASE-LIFT PIN, PER SLOT (REV-B2-JUDGE B2-2, REV-B2-B RF-2). Each block
+/// is read as EXACTLY the felt slice tree `p`'s `verify_opening` hashed — the
+/// caller hands both the same [`QueryOpening`] — so its upper lanes are pinned
+/// by that leaf hash's `Pack`s before the lift reads them ([`super::whir_open`]'s
+/// obligation). A block not hashed by its tree has no way in.
+fn emit_combine(b: &mut LfmBuilder, eqs: &[Ext], blocks: &[QueryOpening<'_>]) -> Vec<Ext> {
+    assert_eq!(eqs.len(), blocks.len(), "one eq(ρ, p) a tree's block");
+    let felts: Vec<&[Felt]> = blocks
+        .iter()
+        .map(|block| match block.values {
+            BlockValues::Base(felts) => felts,
+            BlockValues::Ext(_) => panic!("a grouped round 0's blocks are base-field"),
+        })
+        .collect();
+    let width = felts[0].len();
+    (0..width)
+        .map(|t| {
+            let mut acc = b.emul_base(eqs[0], felts[0][t]);
+            for (eq, block) in eqs.iter().zip(&felts).skip(1) {
+                acc = b.emul_add(*eq, block[t].as_ext(), acc);
+            }
+            acc
+        })
+        .collect()
 }
 
 /// One grind slot, emitted: [`emit_grind_check`] where the grind spends bits,
@@ -862,6 +1191,13 @@ pub fn emit_final_check(b: &mut LfmBuilder, claim: Ext, weight: Ext, final_value
 /// `sample_queries` takes (`whir_round.rs:68-76`) and the transcript is
 /// sequential — interleaving them with the openings would change every
 /// challenge after the first.
+///
+/// ★ A grouped round 0 (`current_trees.len() ≥ 2`, `whir_round::verify_grouped`)
+/// reads `round.current` query-major, one opening a tree, and ONE draw a query
+/// feeds every tree's `verify_opening`, the successor's leaf and slot, and the
+/// fold point (REV-B2-JUDGE B2-3): a tree opened at another position has no
+/// wire to arrive on. The trees' blocks are combined with `eqs` and folded as
+/// one block.
 #[allow(clippy::too_many_arguments)]
 fn emit_query_phase(
     b: &mut LfmBuilder,
@@ -871,13 +1207,25 @@ fn emit_query_phase(
     r: usize,
     current_domain: &Domain<GoldilocksField>,
     alphas: &[Ext],
-    current_tree: &TreeAuth,
+    current_trees: &[TreeAuth],
+    eqs: &[Ext],
     next_tree: Option<&TreeAuth>,
     final_value: Ext,
 ) {
     let depth = shape.current_depth(r);
-    debug_assert_eq!(current_tree.cap_height(), shape.caps[r]);
-    assert_eq!(round.current.len(), shape.num_queries);
+    let trees = shape.trees_at(r);
+    assert_eq!(current_trees.len(), trees, "round {r} opens {trees} trees");
+    debug_assert!(
+        current_trees
+            .iter()
+            .all(|t| t.cap_height() == shape.caps[r])
+    );
+    assert_eq!(round.current.len(), shape.num_queries * trees);
+    assert_eq!(
+        eqs.len(),
+        if trees == 1 { 0 } else { trees },
+        "one eq(ρ, p) a tree"
+    );
     let queries: Vec<Vec<_>> = (0..shape.num_queries)
         .map(|_| transcript.sample_u64_pow2(b, depth))
         .collect();
@@ -890,16 +1238,21 @@ fn emit_query_phase(
             let next_block = 1usize << shape.schedule[r + 1];
             assert_eq!(round.next.len(), shape.num_queries);
             for (q, bits) in queries.iter().enumerate() {
-                let current = &round.current[q];
+                // Each tree's block at the query's one position, against that
+                // tree's own check.
+                let blocks = &round.current[q * trees..(q + 1) * trees];
+                for (tree, current) in current_trees.iter().zip(blocks) {
+                    tree.verify_opening(b, current.values, bits, current.siblings);
+                }
                 let next = &round.next[q];
-                current_tree.verify_opening(b, current.values, bits, current.siblings);
                 // `leaf_and_slot`: the low `next_depth` bits index the successor
                 // leaf and the high ones choose the slot inside it. Both bounds
                 // are powers of two, so this is a partition of the bits.
                 let (leaf_bits, slot_bits) = bits.split_at(next_depth);
                 next_tree.verify_opening(b, next.values, leaf_bits, next.siblings);
 
-                let folded = fold.fold(b, &block_ext(current.values), current_domain, bits);
+                let block = folded_block(b, blocks, eqs);
+                let folded = fold.fold(b, &block, current_domain, bits);
                 let claimed = emit_slot_mux(b, &block_ext(next.values), slot_bits);
                 b.assert_eq_ext(folded, claimed);
                 debug_assert_eq!(1usize << slot_bits.len(), next_block);
@@ -907,12 +1260,24 @@ fn emit_query_phase(
         }
         _ => {
             for (q, bits) in queries.iter().enumerate() {
-                let current = &round.current[q];
-                current_tree.verify_opening(b, current.values, bits, current.siblings);
-                let folded = fold.fold(b, &block_ext(current.values), current_domain, bits);
+                let blocks = &round.current[q * trees..(q + 1) * trees];
+                for (tree, current) in current_trees.iter().zip(blocks) {
+                    tree.verify_opening(b, current.values, bits, current.siblings);
+                }
+                let block = folded_block(b, blocks, eqs);
+                let folded = fold.fold(b, &block, current_domain, bits);
                 b.assert_eq_ext(folded, final_value);
             }
         }
+    }
+}
+
+/// The block a query folds: its one opening's values, or a grouped round 0's
+/// trees' blocks combined with `eqs` ([`emit_combine`]).
+fn folded_block(b: &mut LfmBuilder, blocks: &[QueryOpening<'_>], eqs: &[Ext]) -> Vec<Ext> {
+    match blocks {
+        [one] => block_ext(one.values),
+        _ => emit_combine(b, eqs, blocks),
     }
 }
 
@@ -1047,7 +1412,7 @@ impl RoundStorage {
                 cell
             };
             let k = shape.schedule[r];
-            let sumcheck: Vec<Vec<Ext>> = (0..k)
+            let sumcheck: Vec<Vec<Ext>> = (0..shape.messages(r))
                 .map(|_| (0..2).map(|_| next_word(b, &mut at).as_ext()).collect())
                 .collect();
             // The nonces are FELTS: `append_bytes(&nonce.to_be_bytes())` is one
@@ -1062,9 +1427,10 @@ impl RoundStorage {
             });
 
             // W1: tree 0's cap, right after round 0's nonces (the words the
-            // owner path carried after its siblings).
+            // owner path carried after its siblings) — a grouped round 0's
+            // trees' caps, in tree order.
             let current_cap: Vec<WrapDigest> = if r == 0 {
-                (0..shape.cap_words(shape.current_depth(0), shape.caps[0]))
+                (0..shape.trees * shape.cap_words(shape.current_depth(0), shape.caps[0]))
                     .map(|_| WrapDigest::from_cell(next_word(b, &mut at)))
                     .collect()
             } else {
@@ -1077,7 +1443,9 @@ impl RoundStorage {
             // not three. Hinting it as extension wires would hash forty-eight
             // felts where the committer hashed sixteen and the root would never
             // match — which is exactly how this test first failed.
-            let current: Vec<(CurrentBlock, Vec<WrapDigest>)> = (0..shape.num_queries)
+            // A grouped round 0: one block and path a tree, query-major.
+            let current: Vec<(CurrentBlock, Vec<WrapDigest>)> = (0..shape.num_queries
+                * shape.trees_at(r))
                 .map(|_| {
                     let values = if r == 0 {
                         let felts: Vec<Felt> = (0..block)
@@ -1219,13 +1587,14 @@ pub fn round_words(shape: &ChainShape, r: usize) -> u32 {
     // and per query the current block plus its path (to the cap, when the tree
     // has one).
     let nonces = shape.carries(r).iter().filter(|&&carried| carried).count();
-    let mut n = (2 * k + nonces) as u32;
+    let mut n = (2 * shape.messages(r) + nonces) as u32;
     let depth = shape.current_path(r);
     let block = 1usize << k;
-    n += (shape.num_queries * (block + depth)) as u32;
+    // A grouped round 0 opens each of its trees at every query.
+    n += (shape.num_queries * shape.trees_at(r) * (block + depth)) as u32;
     if r == 0 {
-        // W1: tree 0's cap words.
-        n += shape.cap_words(shape.current_depth(0), shape.caps[0]) as u32;
+        // W1: tree 0's cap words, a grouped round 0's trees' each.
+        n += (shape.trees * shape.cap_words(shape.current_depth(0), shape.caps[0])) as u32;
     }
     if let Some(next_depth) = shape.next_depth(r) {
         // The successor root, its out-of-domain value, its cap, and per query
@@ -1370,9 +1739,46 @@ fn push_openings(
             let openings = if current { &p.current } else { &p.next };
             side(words, openings, owner_cap, ext_word);
         }
-        // A grouped round 0 (D-ONECHAIN) has no in-guest leg yet (its stage
-        // B2): nothing is written, and the arena's length refuses the chain.
-        RoundOpenings::BaseGrouped(_) => {}
+        // A grouped round 0 (D-ONECHAIN): every tree's cap off its owner
+        // (query 0's opening of it), in tree order; then per query each
+        // tree's block and path.
+        RoundOpenings::BaseGrouped(p) => {
+            if current {
+                let owner_splits: Vec<usize> = p
+                    .current
+                    .first()
+                    .map(|row| {
+                        row.iter()
+                            .map(|owner| {
+                                let path = &owner.proof.merkle_path;
+                                let split = path.len().saturating_sub(owner_cap);
+                                for node in &path[split..] {
+                                    words.push(commitment_to_digest(node));
+                                }
+                                split
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (i, row) in p.current.iter().enumerate() {
+                    for (tree, opening) in row.iter().enumerate() {
+                        for v in &opening.values {
+                            words.push([*v, FE::zero(), FE::zero(), FE::zero()]);
+                        }
+                        let path = &opening.proof.merkle_path;
+                        let path = match (i, owner_splits.get(tree)) {
+                            (0, Some(&split)) => &path[..split],
+                            _ => &path[..],
+                        };
+                        for node in path {
+                            words.push(commitment_to_digest(node));
+                        }
+                    }
+                }
+            } else {
+                side(words, &p.next, owner_cap, ext_word);
+            }
+        }
     }
 }
 
@@ -1437,8 +1843,49 @@ fn push_openings4(
             let openings = if current { &p.current } else { &p.next };
             side(words, openings, tree, ext_word);
         }
-        // See `push_openings`: no in-guest leg yet.
-        RoundOpenings::BaseGrouped(_) => {}
+        // See `push_openings`: the trees' caps in tree order, then per query
+        // each tree's block and path.
+        RoundOpenings::BaseGrouped(p) => {
+            if current {
+                let laid: Vec<Vec<(Vec<_>, Option<Vec<_>>)>> = p
+                    .current
+                    .iter()
+                    .enumerate()
+                    .map(|(i, row)| {
+                        row.iter()
+                            .map(|o| {
+                                let path = &o.proof.merkle_path;
+                                super::merkle_cap::child_path_to_cap(
+                                    path,
+                                    tree.depth,
+                                    tree.cap,
+                                    4,
+                                    tree.owner && i == 0,
+                                )
+                                .unwrap_or_else(|_| (path.clone(), None))
+                            })
+                            .collect()
+                    })
+                    .collect();
+                for (_, cap) in laid.first().into_iter().flatten() {
+                    for node in cap.iter().flatten() {
+                        words.push(commitment_to_digest(node));
+                    }
+                }
+                for (row, laid_row) in p.current.iter().zip(&laid) {
+                    for (opening, (path, _)) in row.iter().zip(laid_row) {
+                        for v in &opening.values {
+                            words.push([*v, FE::zero(), FE::zero(), FE::zero()]);
+                        }
+                        for node in path {
+                            words.push(commitment_to_digest(node));
+                        }
+                    }
+                }
+            } else {
+                side(words, &p.next, tree, ext_word);
+            }
+        }
     }
 }
 

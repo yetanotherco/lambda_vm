@@ -253,6 +253,8 @@ mod whir_global_tests;
 #[cfg(test)]
 mod whir_leg_tests;
 #[cfg(test)]
+mod whir_onechain_tests;
+#[cfg(test)]
 mod whir_open_tests;
 #[cfg(test)]
 mod whir_p1_census_tests;
