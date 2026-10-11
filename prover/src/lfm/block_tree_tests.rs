@@ -2824,7 +2824,7 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
         execute(
             &program,
             &block_node_arenas(&mixed),
-            &crate::hash_pin::LEGACY_HASHER,
+            &program.hasher(crate::hash_pin::BLOCK_SOCKET),
         )
     };
     assert!(
@@ -2846,7 +2846,7 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
             execute(
                 &program,
                 &block_node_arenas(&wrong),
-                &crate::hash_pin::LEGACY_HASHER,
+                &program.hasher(crate::hash_pin::BLOCK_SOCKET),
             )
         };
         assert!(
@@ -3025,7 +3025,7 @@ fn the_block_verifier_derives_the_tree_and_accepts_only_its_top() {
                 super::registry::build_artifacts_with_hasher(
                     program,
                     &wrap_opts,
-                    crate::hash_pin::LEGACY_HASHER,
+                    program.hasher(crate::hash_pin::BLOCK_SOCKET),
                 )
             })
         })
