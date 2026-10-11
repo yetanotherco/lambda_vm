@@ -186,8 +186,10 @@ pub const BLOCK_COMMITMENT_HASH: stark::config::CommitmentHash =
 /// ★★★ Everything a block's recursion proves and verifies with, named ONCE: the
 /// LFM proofs' commitment configuration and their transcript, the tag every
 /// LFM statement names them by, the wrap hash a node's in-guest legs replay
-/// them with, the socket the tree programs' hash rows run on, and the WHIR
-/// base the leaves verify.
+/// them with, and the socket the tree programs' hash rows run on. The block's
+/// WHIR base is pinned beside the family ([`BlockWhirHash`], [`BLOCK_BASE`]),
+/// not in it: the family serves the LFM prover's two users (the block path and
+/// the legacy users off it), the base only the block path.
 ///
 /// A compile-time choice, not a run-time one: there is ONE family per build
 /// ([`BlockFamily`]), so no proof of the block path is ever made or checked

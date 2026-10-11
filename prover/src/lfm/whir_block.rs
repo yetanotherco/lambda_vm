@@ -74,9 +74,8 @@ use super::word::{LfmWord, base_word};
 /// 2^18 table, all of it — seven full groups a leaf, 13 leaves at the median
 /// (I-WHIR-P1 §S6b). The recursion's time is the card's: the leaves prove one
 /// at a time, each ≈ 0.28 s plus ≈ 0.0122 s a million padded cells outside the
-/// socket (RYZEN 062), so fewer, fuller leaves win where RPX's leaf count (four
-/// groups a leaf, S6) padded `Select`, base ALU and words to 2^20 for half of
-/// them.
+/// socket (RYZEN 062), so fewer, fuller leaves win over four groups a leaf
+/// (S6), which padded `Select`, base ALU and words to 2^20 for half of them.
 pub const LEAF_P1_CAP: usize = 1 << 18;
 
 /// The padded heights a Poseidon1 leaf keeps every chip under: the
