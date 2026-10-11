@@ -363,7 +363,61 @@ fn an_index_past_the_two_adicity_is_refused() {
     }
 }
 
+/// REV-B2-JUDGE B1-1: that refusal is the stacked verifier's, on its own
+/// layout and config, before anything is read: a three-polynomial opening
+/// checked at a blowup where `n + m + log_blowup` passes the two-adicity is
+/// refused by name. A per-polynomial verifier binds no index there.
+#[test]
+fn the_verifier_refuses_an_index_past_the_two_adicity_before_reading() {
+    let (o, cfg) = p3();
+    let mut wide = cfg;
+    wide.log_blowup = 32 - N3 - 2 + 1;
+    assert_eq!(
+        shape(check_tower(&o, &o.proof, &wide)),
+        GroupedShape::IndexDomain {
+            num_vars: N3,
+            index_vars: 2,
+            log_blowup: wide.log_blowup,
+            two_adicity: 32
+        }
+    );
+    wide.format.group = GroupFold::PerPoly;
+    assert!(!matches!(
+        check_tower(&o, &o.proof, &wide),
+        Err(Error::GroupedShape(GroupedShape::IndexDomain { .. }))
+    ));
+}
+
 // ─────────────────────── B1-2: exact shapes, by name ───────────────────────
+
+/// REV-B2-JUDGE B1-2: one root per polynomial under `Indexed`, as today — a
+/// root slice one short or one long is refused before anything is absorbed,
+/// whatever the chain count.
+#[test]
+fn a_root_slice_other_than_one_per_polynomial_is_refused() {
+    let (o, cfg) = p3();
+    let mut long = o.roots.clone();
+    long.push(o.roots[0]);
+    for roots in [&o.roots[..2], &long[..]] {
+        let refused = verify::<F, Ext, _, KeccakWhir>(
+            &o.proof,
+            &o.layout,
+            roots,
+            &Claimed::PerColumn(&o.points),
+            &o.values,
+            &o.domain,
+            &cfg,
+            &mut tower(),
+        );
+        assert_eq!(
+            refused,
+            Err(Error::QueryCountMismatch {
+                expected: 3,
+                got: roots.len()
+            })
+        );
+    }
+}
 
 /// REV-B2-JUDGE B1-2: per query exactly `P'` blocks — one fewer, or one in the
 /// absent slot, is refused by name.
