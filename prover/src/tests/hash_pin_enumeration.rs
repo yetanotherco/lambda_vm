@@ -87,6 +87,13 @@ const CONFIG_ALLOWED: &[&str] = &[
     // Added when `80d746321` gave `lfm/algebraic_commit.rs` a host grinding
     // test spelling `GrindingDigest<RpxStarkHash>`.
     "GrindingDigest",
+    // `TreeGeometry` is a configuration's tree shape as a value, its arity and
+    // its 4-ary cap, and names no hash: `TreeGeometry::of::<H>()` reads the
+    // configuration its caller names, and `TreeGeometry::BINARY` is the shape
+    // of every configuration that is not 4-ary. The query emitter asserts the
+    // builder's arity against the shape's (`sub_proof::emit_query_from_bits`),
+    // so a shape of the other arity is refused at emission.
+    "TreeGeometry",
 ];
 
 /// Every item named from `stark::config` on this line, `use` lists included.
@@ -225,6 +232,16 @@ const BLESSED: &[(&str, &str)] = &[
          the pin) has no subject here. `GrindingDigest` itself is hash-agnostic \
          and lives in CONFIG_ALLOWED; this entry covers only the concrete \
          `Blake3StarkHash`, which must keep flagging everywhere else.",
+    ),
+    (
+        "lfm/p1_commit.rs",
+        "One mention: the re-export of `stark::config::P1StarkHashCapped`, the \
+         Poseidon1 STARK configuration generic over its 4-ary cap, which this \
+         module fixes at `P1_STARK_CAP` as `P1StarkHash`. It NAMES a hash that \
+         is not the workspace default, the opposite of implying one, and \
+         production reaches it through `hash_pin::P1Family` alone. The file \
+         is blessed rather than the name allowed, so another site spelling \
+         `stark::config::P1StarkHashCapped` at a cap of its own still flags.",
     ),
 ];
 
