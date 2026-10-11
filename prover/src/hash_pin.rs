@@ -207,8 +207,10 @@ pub const LEGACY_COMMITMENT_HASH: stark::config::CommitmentHash =
 pub type Block = P1Block;
 
 /// The 4-ary cap height of the LFM recursion's trees (`c_L`), shared with
-/// #1014's recursion. Picked from both lanes' node census (D-P3B-1013 §8).
-pub const BLOCK_LFM_CAP: u8 = 1;
+/// #1014's recursion. Picked from both lanes' node census (D-P3B-1013 §8): on
+/// the median block cap 2's recursion ran 1.5 s under cap 1's (whose
+/// second-level nodes step a table to 2^22), with a 21 % smaller top proof.
+pub const BLOCK_LFM_CAP: u8 = 2;
 
 /// The block's BASE proof format: [`Block`]'s hash, its 4-ary trees capped at
 /// height 1 (the in-guest optimum the leaves measured: cap 4 cost them +42 %,
