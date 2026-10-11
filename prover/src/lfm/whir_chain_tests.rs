@@ -1967,6 +1967,12 @@ struct ChainPins {
 /// had before the bits moved ([`the_grind_bits_opt_out_chain_keeps_its_pins`]),
 /// and the opt-out of both (`whir_grind=all` at 20 bits) the pins this chain
 /// had before P2 ([`the_grind_opt_out_chain_keeps_the_pins_from_before_p2`]).
+///
+/// The format also carries the block base's 4-ary cap
+/// ([`crate::hash_pin::BLOCK_BASE`]), under every grind knob: a 4-ary chain
+/// alone reads it (`ChainFormat::cap_policy_at`). The shape and the pins of
+/// these three tests are the binary chain's ([`ChainShape::new`]), which it
+/// does not enter.
 #[test]
 fn the_production_default_chain_is_first6_under_the_auto_cap() {
     let production = crate::multilinear_prove::chain_config_under(
@@ -1981,7 +1987,7 @@ fn the_production_default_chain_is_first6_under_the_auto_cap() {
             stack: multilinear::whir_chain::StackVars::new(27).expect("27"),
             nonces: NonceLayout::Spent,
             argue: multilinear::whir_chain::ArgueFormat::PerTable,
-            arity4_cap: CapPolicy::Off,
+            arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
         },
         ..config(114, 0)
     };
@@ -2023,7 +2029,7 @@ fn the_grind_bits_opt_out_chain_keeps_its_pins() {
             stack: multilinear::whir_chain::StackVars::new(27).expect("27"),
             nonces: NonceLayout::Spent,
             argue: multilinear::whir_chain::ArgueFormat::PerTable,
-            arity4_cap: CapPolicy::Off,
+            arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
         },
         ..config(112, 0)
     };
@@ -2058,7 +2064,7 @@ fn the_grind_opt_out_chain_keeps_the_pins_from_before_p2() {
             stack: multilinear::whir_chain::StackVars::new(27).expect("27"),
             nonces: NonceLayout::Three,
             argue: multilinear::whir_chain::ArgueFormat::PerTable,
-            arity4_cap: CapPolicy::Off,
+            arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
         },
         ..config(112, 20)
     };
