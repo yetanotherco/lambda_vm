@@ -1485,6 +1485,37 @@ fn regenerated(
     )
 }
 
+/// How long a hang guard waits for a regenerating prove: ten times the plain
+/// prove the test timed before it, and at least ten minutes. A hang never
+/// returns, so any bound finds one; a bound scaled to the plain prove also
+/// holds where every prove is slower (a host without a card, a costlier base
+/// hash), where a fixed one fails a prove that completes: one-byte windows
+/// ran past 600 s on the laptop under the RPX base, phase B never waiting.
+fn hang_bound(plain: std::time::Duration) -> std::time::Duration {
+    std::time::Duration::from_secs(600).max(plain.saturating_mul(10))
+}
+
+/// The hang guard's bound: ten minutes under a fast plain prove, ten plain
+/// proves past one minute.
+#[test]
+fn a_hang_bound_is_ten_plain_proves_and_at_least_ten_minutes() {
+    use std::time::Duration;
+    assert_eq!(hang_bound(Duration::ZERO), Duration::from_secs(600));
+    assert_eq!(
+        hang_bound(Duration::from_secs(60)),
+        Duration::from_secs(600)
+    );
+    assert_eq!(
+        hang_bound(Duration::from_secs(61)),
+        Duration::from_secs(610)
+    );
+    assert_eq!(
+        hang_bound(Duration::from_secs(550)),
+        Duration::from_secs(5500)
+    );
+    assert_eq!(hang_bound(Duration::MAX), Duration::MAX);
+}
+
 /// ★ Live regeneration moves no byte (D-WHIR-NODISK N2): with `always` every
 /// streamed chunk is dropped after its group's commit and rebuilt in phase B —
 /// with no store (no disk), and with the rest spilled — and `auto` armed from
@@ -1882,13 +1913,15 @@ fn live_regeneration_refuses_what_it_did_not_rebuild() {
 /// ★ Windows of one byte (N3): each admits only its frontier, so a phase-B
 /// order or a group that takes a class out of its rank order cannot complete.
 /// With every streamed chunk and every KECCAK_RND and LT table dropped, the
-/// interleaved order proves the same bytes, within a bound on the time.
+/// interleaved order proves the same bytes, within a bound on the time
+/// ([`hang_bound`]).
 #[test]
 fn one_byte_windows_take_each_class_in_its_order() {
     use crate::block_whir::BlockSpillPolicy;
     use crate::block_whir::regen::RegenMode;
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
+    let started = std::time::Instant::now();
     let (plain, _) = regenerated(
         &elf,
         &format,
@@ -1897,6 +1930,7 @@ fn one_byte_windows_take_each_class_in_its_order() {
         Deviations::default(),
     )
     .expect("prove");
+    let bound = hang_bound(started.elapsed());
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let out = regenerated(
@@ -1912,7 +1946,7 @@ fn one_byte_windows_take_each_class_in_its_order() {
         let _ = tx.send(out.map_err(|e| format!("{e:?}")));
     });
     let (proof, stamps) = rx
-        .recv_timeout(std::time::Duration::from_secs(600))
+        .recv_timeout(bound)
         .expect("the prove did not hang")
         .expect("prove");
     let r = stamps.regen.expect("live regeneration's readout");
@@ -1949,6 +1983,7 @@ fn a_mixed_boundary_group_drops_one_class_only() {
     let elf = asm_elf_bytes("test_keccak_multi");
     let mut format = many_groups();
     format.zf.whir_stack = StackVars::new(24).expect("a valid stack");
+    let started = std::time::Instant::now();
     let (plain, plain_stamps) = regenerated(
         &elf,
         &format,
@@ -1957,6 +1992,7 @@ fn a_mixed_boundary_group_drops_one_class_only() {
         Deviations::default(),
     )
     .expect("prove");
+    let bound = hang_bound(started.elapsed());
     let streamed = plain_stamps.streamed.1;
     let (tx, rx) = std::sync::mpsc::channel();
     {
@@ -1973,7 +2009,7 @@ fn a_mixed_boundary_group_drops_one_class_only() {
         });
     }
     let (proof, stamps) = rx
-        .recv_timeout(std::time::Duration::from_secs(600))
+        .recv_timeout(bound)
         .expect("the prove did not hang")
         .expect("a mixed group is proved, one class dropped");
     let r = stamps.regen.expect("live regeneration's readout");
