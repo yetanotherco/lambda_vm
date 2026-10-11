@@ -1101,3 +1101,162 @@ fn successor_blocks_follow_the_schedule_not_the_proof() {
         }
     );
 }
+
+// ─────────── each binding of a grouped round 0, on its own ───────────
+
+/// [`open`] over the caller's columns, each column `i` claimed at the point
+/// [`open`] gives it under `seed` — so two stacks that differ in one column
+/// are claimed at the same points.
+fn open_columns<E, H, T>(
+    columns: &[Mle<F>],
+    n_stack: usize,
+    cfg: &ChainConfig,
+    seed: u64,
+    transcript: fn() -> T,
+) -> Opened<E>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<E>: AsBytes + Send + Sync,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    let heights: Vec<usize> = columns.iter().map(Mle::num_vars).collect();
+    let points: Vec<Vec<FieldElement<E>>> = heights
+        .iter()
+        .enumerate()
+        .map(|(i, &h)| {
+            (0..h)
+                .map(|j| FieldElement::<E>::from(7 + seed + 11 * i as u64 + 3 * j as u64))
+                .collect()
+        })
+        .collect();
+    let values = columns
+        .iter()
+        .zip(&points)
+        .map(|(c, p)| c.evaluate_in(p))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let layout = StackedLayout::build(&heights, n_stack).unwrap();
+    let stacked =
+        StackedCommitment::<F, H>::commit(layout.clone(), &borrow(columns), None, cfg).unwrap();
+    let roots = stacked.roots();
+    let proof = prove::<F, E, T, H, _>(
+        &stacked,
+        &borrow(columns),
+        None,
+        &Claimed::PerColumn(&points),
+        &values,
+        cfg,
+        &mut transcript(),
+    )
+    .unwrap();
+    Opened {
+        layout,
+        roots,
+        domain: stacked.domain().clone(),
+        points,
+        values,
+        proof,
+    }
+}
+
+/// EACH round-0 tree of a grouped chain is bound to the root at its own
+/// position, its cap included — tree 0 as much as a later one. The forgery,
+/// for every slot `p` in turn: slot `p` commits another polynomial, and the
+/// proof is that stack's honest one (its own trees, caps and paths,
+/// self-consistent), claimed against the stated roots, which differ from its
+/// own at slot `p` alone. The claim is false — slot `p`'s values are not the
+/// evaluations of the polynomial its stated root commits — and every check
+/// but tree `p`'s binding to that root passes; trading two trees' caps
+/// ([`round_zero_trees_cannot_trade_caps`]) breaks two bindings at once and
+/// cannot show either alone. A capped tree refuses at its cap (`CapRejected`,
+/// before any query is opened), an uncapped one at its first opening.
+#[test]
+fn a_tree_committing_another_polynomial_is_refused_at_its_own_root() {
+    fn case<H: WhirHash, T: IsTranscript<Ext>>(
+        cfg: &ChainConfig,
+        capped: bool,
+        transcript: fn() -> T,
+    ) {
+        let honest: Vec<Mle<F>> = (0..3).map(|i| column(N3, 3 + 31 * i)).collect();
+        for slot in 0..3 {
+            let mut other = honest.clone();
+            other[slot] = column(N3, 1_000 + slot as u64);
+            let a = open_columns::<Ext, H, T>(&honest, N3, cfg, 3, transcript);
+            let mut b = open_columns::<Ext, H, T>(&other, N3, cfg, 3, transcript);
+            assert_eq!(a.points, b.points);
+            assert_ne!(a.values, b.values);
+            for p in 0..3 {
+                assert_eq!(a.roots[p] == b.roots[p], p != slot, "slot {slot}: root {p}");
+            }
+            assert_eq!(trace::<Ext, H, T>(&b, &b.proof, cfg, transcript), Ok(()));
+            b.roots = a.roots.clone();
+            let cause = if capped {
+                Error::CapRejected
+            } else {
+                Error::GroupedOpeningRejected {
+                    query: 0,
+                    tree: slot,
+                }
+            };
+            assert_eq!(
+                trace::<Ext, H, T>(&b, &b.proof, cfg, transcript),
+                in_chain_0(cause),
+                "slot {slot}, capped {capped}"
+            );
+        }
+    }
+    for cap in [CapPolicy::Fixed(2), CapPolicy::Off] {
+        let mut cfg = indexed(Some(6), 4, 3);
+        cfg.format.cap = cap;
+        case::<KeccakWhir, _>(&cfg, cap != CapPolicy::Off, tower);
+    }
+    for cap in [CapPolicy::Fixed(1), CapPolicy::Off] {
+        let mut cfg = indexed(Some(6), 4, 3);
+        cfg.format.arity4_cap = cap;
+        case::<P1Whir, _>(&cfg, cap != CapPolicy::Off, tower_p1);
+    }
+}
+
+/// The grouped round 0's SUCCESSOR is authenticated by its own cap against the
+/// root the round absorbed (`whir_round::verify_grouped`'s copy of the
+/// per-polynomial round's check): a successor cap word that does not hash to
+/// that root is refused at the cap, before any query's opening is read.
+#[test]
+fn a_grouped_successor_cap_off_its_root_is_refused_at_the_cap() {
+    let mut cfg = indexed(Some(6), 4, 3);
+    cfg.format.cap = CapPolicy::Fixed(1);
+    let caps = cfg.tree_caps_at(N3, 2);
+    assert!(caps[1] >= 1, "a capped successor: {caps:?}");
+    let o = open_tower(&[N3; 3], N3, &cfg);
+    check_tower(&o, &o.proof, &cfg).unwrap();
+    let mut forged = o.proof.clone();
+    let owner = &mut grouped_mut(&mut forged, 0).next[0].proof.merkle_path;
+    let last = owner.len() - 1;
+    owner[last][0] ^= 1;
+    assert_eq!(
+        trace_tower(&o, &forged, &cfg),
+        in_chain_0(Error::CapRejected)
+    );
+}
+
+/// A grouped round 0 that is the chain's last round (R = 1) compares each
+/// query's combined fold with the final value — its own check, ahead of the
+/// final weight check. At a blowup of one the round-0 trees have one leaf, so
+/// a moved final value moves no query: the openings stay valid and the fold is
+/// what refuses (the final check alone would say `EvaluationMismatch`).
+#[test]
+fn a_one_round_grouped_chain_compares_its_folds_with_the_final_value() {
+    let mut cfg = indexed(Some(6), 4, 3);
+    cfg.log_blowup = 0;
+    let r1 = open_tower(&[3; 3], 3, &cfg);
+    assert_eq!(r1.proof.polys[0].rounds.len(), 1);
+    check_tower(&r1, &r1.proof, &cfg).unwrap();
+    let mut forged = r1.proof.clone();
+    forged.polys[0].final_value += EE::one();
+    assert_eq!(
+        trace_tower(&r1, &forged, &cfg),
+        in_chain_0(Error::FoldInconsistent { query: 0 })
+    );
+}

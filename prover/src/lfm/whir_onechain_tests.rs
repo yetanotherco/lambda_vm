@@ -204,6 +204,12 @@ struct Fixture {
 /// Commits and proves one case on the host under its base, opened per
 /// `group`.
 fn build(case: &Case, group: GroupFold) -> Fixture {
+    build_over(case, group, None)
+}
+
+/// [`build`], column `slot` replaced by another polynomial (`seed`) when
+/// `other` is `Some((slot, seed))`: the same points, another stack.
+fn build_over(case: &Case, group: GroupFold, other: Option<(usize, u64)>) -> Fixture {
     let mut cfg = config(case);
     cfg.format.group = group;
     let layout = StackedLayout::build(&case.heights, case.n_stack).expect("the layout packs");
@@ -211,7 +217,10 @@ fn build(case: &Case, group: GroupFold) -> Fixture {
         .heights
         .iter()
         .enumerate()
-        .map(|(c, &h)| column(h, 17 + 13 * c as u64))
+        .map(|(c, &h)| match other {
+            Some((slot, seed)) if slot == c => column(h, seed),
+            _ => column(h, 17 + 13 * c as u64),
+        })
         .collect();
     let borrowed = multilinear::stacking::borrow(&columns);
     let points: Vec<Vec<FEE>> = case
@@ -1317,6 +1326,403 @@ fn grouped_chains_open_against_constant_roots() {
             "ONECHAIN CONST ROOTS [{}]: runs {:?}, capped {capped}",
             f.name,
             f.shape.chains(f.layout.num_polys())
+        );
+    }
+}
+
+// ─────────── each binding of a grouped round 0, on its own ───────────
+
+/// The chain whose PROLOGUE holds the assert a `DivByZero` failed at: after
+/// that chain's `Chain` mark and before its round 0's `Sumcheck` mark — its
+/// roots unpacked, its claim batched and its round-0 trees' caps
+/// authenticated, of which only the caps assert. `None` for any other refusal.
+fn refused_in_prologue(
+    (program, marks): &(LfmProgram, Vec<(Step, usize)>),
+    error: &LfmExecError,
+) -> Option<usize> {
+    let LfmExecError::DivByZero { addr } = error else {
+        return None;
+    };
+    let index = program.instrs.iter().position(|i| match i {
+        Instr::BaseAlu { out, .. } | Instr::ExtAlu { out, .. } => out.0 == *addr,
+        _ => false,
+    })?;
+    match marks.iter().rev().find(|(_, at)| *at <= index)? {
+        (Step::Chain(c), _) => Some(*c),
+        _ => None,
+    }
+}
+
+/// EACH round-0 tree of a grouped chain is bound, in guest, to the root at its
+/// own position, its cap included — tree 0 as much as a later one. Trading
+/// trees 0's and 1's caps ([`round_zero_caps_are_bound_per_tree_in_guest`])
+/// breaks two bindings at once, so it cannot show either tree bound alone;
+/// this forgery moves one slot and leaves every other tree as committed.
+///
+/// For every slot `p` in turn, slot `p` commits another polynomial; the proof
+/// is that stack's honest one (its own trees, caps and paths,
+/// self-consistent), claimed against the stated roots, which differ from its
+/// own at slot `p` alone. The claim is false, and every check but tree `p`'s
+/// binding to its root passes. A capped tree refuses at its cap (host
+/// `CapRejected`; the machine in the chain's prologue, where the caps are
+/// authenticated), an uncapped one at its first opening
+/// (`GroupedOpeningRejected { 0, p }`; the machine at tree `p`'s opening at
+/// query 0).
+#[test]
+fn a_tree_committing_another_polynomial_has_no_execution() {
+    let cases = [
+        Case {
+            cap: CapPolicy::Fixed(1),
+            ..rpx("three polynomials under a binary cap", &[6; 3], 6, 8)
+        },
+        rpx("three polynomials, uncapped", &[6; 3], 6, 8),
+        Case {
+            base: Base::P1,
+            first: Some(6),
+            log_folding: 4,
+            cap: CapPolicy::Fixed(2),
+            ..rpx("P1, three polynomials at C2", &[10; 3], 10, 6)
+        },
+    ];
+    for case in cases {
+        let capped = case.cap != CapPolicy::Off;
+        let honest = build(&case, GroupFold::Indexed);
+        for slot in 0..3 {
+            let mut forged =
+                build_over(&case, GroupFold::Indexed, Some((slot, 0xBAD + slot as u64)));
+            assert_eq!(forged.points, honest.points);
+            assert_ne!(forged.values, honest.values);
+            for p in 0..3 {
+                assert_eq!(
+                    forged.roots[p] == honest.roots[p],
+                    p != slot,
+                    "{}: root {p}",
+                    case.name
+                );
+            }
+            let traced = traced_program(&forged);
+            assert!(
+                host_accepts(&forged, &forged.proof),
+                "{}: the control",
+                case.name
+            );
+            assert!(
+                machine_refusal(&forged, &traced, arena(&forged, &forged.proof)).is_none(),
+                "{}: the control executes",
+                case.name
+            );
+            let proof = forged.proof.clone();
+            forged.roots = honest.roots.clone();
+            let cause = if capped {
+                multilinear::Error::CapRejected
+            } else {
+                multilinear::Error::GroupedOpeningRejected {
+                    query: 0,
+                    tree: slot,
+                }
+            };
+            assert_eq!(
+                host_refusal(&forged, &proof),
+                Some(Refusal::Chain {
+                    chain: 0,
+                    poly: 0,
+                    cause
+                }),
+                "{} slot {slot}: the host's check",
+                case.name
+            );
+            let words = arena(&forged, &proof);
+            if capped {
+                let Err(error) = execute_serial(
+                    &traced.0,
+                    std::slice::from_ref(&words),
+                    &socket(forged.base),
+                ) else {
+                    panic!(
+                        "{} slot {slot}: a tree's cap off its root was executed",
+                        case.name
+                    );
+                };
+                assert!(execute(&traced.0, &[words], &socket(forged.base)).is_err());
+                assert_eq!(
+                    refused_in_prologue(&traced, &error),
+                    Some(0),
+                    "{} slot {slot}: refused at the chain's caps, got {error:?}",
+                    case.name
+                );
+            } else {
+                let refused = machine_refusal(&forged, &traced, words);
+                assert!(
+                    matches!(
+                        refused,
+                        Some(Refused::At(Some(0), Step::Opening { round: 0, query: 0, tree })) if tree == slot
+                    ),
+                    "{} slot {slot}: refused at {refused:?}",
+                    case.name
+                );
+            }
+        }
+    }
+}
+
+/// The grouped leg's instruction stream, emitted over hinted wires alone — it
+/// is a function of the layout and the config, never of a proof — as
+/// `(instructions, FNV-1a of their Debug text)`. ★ The SAME body sits in
+/// `prover/tests/onechain_release_stream.rs`, built against the library
+/// WITHOUT `cfg(test)` (no faults, no step marks), and both builds are held to
+/// the same pins: the test build emits exactly the release build's program.
+fn grouped_leg_stream(p1: bool, heights: &[usize], n_stack: usize) -> (usize, u64) {
+    use multilinear::whir_chain::{
+        CapPolicy, ChainConfig, ChainFormat, FirstFold, GrindBits, GroupFold, WhirFolds,
+    };
+    let mut format = ChainFormat {
+        folds: WhirFolds::First(FirstFold::new(6).expect("first6")),
+        group: GroupFold::Indexed,
+        ..ChainFormat::DEFAULT
+    };
+    if p1 {
+        format.arity4_cap = CapPolicy::Fixed(2);
+    } else {
+        format.cap = CapPolicy::Fixed(1);
+    }
+    let cfg = ChainConfig {
+        log_blowup: 2,
+        log_folding: 4,
+        num_queries: 3,
+        grind: GrindBits::uniform(8),
+        format,
+    };
+    let layout = multilinear::stacking::StackedLayout::build(heights, n_stack).expect("packs");
+    let shape = ChainShape::new_at(&cfg, n_stack, if p1 { 4 } else { 2 });
+    let domain = multilinear::whir::Domain::<GoldilocksField>::new(n_stack + cfg.log_blowup)
+        .expect("domain");
+    let hash = if p1 {
+        WrapHash::Poseidon1
+    } else {
+        WrapHash::production()
+    };
+    let runs = shape.chains(layout.num_polys());
+    let mut total: u32 = heights.iter().sum::<usize>() as u32 + heights.len() as u32;
+    for run in &runs {
+        total += run.len() as u32 + 1 + RoundStorage::words(&shape.run(run.len()));
+    }
+    let mut b = LfmBuilder::new().with_wrap_hash(hash);
+    let arena = b.declare_arena(total);
+    let mut transcript = WhirTranscript::for_builder(&mut b);
+    let mut at = 0u32;
+    let next = |b: &mut LfmBuilder, at: &mut u32| {
+        let cell = b.hint_word(arena, *at);
+        *at += 1;
+        cell
+    };
+    let points: Vec<Vec<Ext>> = heights
+        .iter()
+        .map(|&h| (0..h).map(|_| next(&mut b, &mut at).as_ext()).collect())
+        .collect();
+    let values: Vec<Ext> = heights
+        .iter()
+        .map(|_| next(&mut b, &mut at).as_ext())
+        .collect();
+    let mut roots: Vec<Vec<Cell>> = Vec::new();
+    let mut finals: Vec<Ext> = Vec::new();
+    let mut storage: Vec<RoundStorage> = Vec::new();
+    for run in &runs {
+        roots.push(run.clone().map(|_| next(&mut b, &mut at)).collect());
+        finals.push(next(&mut b, &mut at).as_ext());
+        let run_shape = shape.run(run.len());
+        let base = at;
+        storage.push(RoundStorage::hint(&mut b, arena, base, &run_shape));
+        at += RoundStorage::words(&run_shape);
+    }
+    let openings: Vec<_> = storage.iter().map(RoundStorage::openings).collect();
+    let rounds: Vec<Vec<_>> = storage
+        .iter()
+        .zip(&openings)
+        .map(|(chain, (current, next))| chain.wires(current, next))
+        .collect();
+    let chains: Vec<StackedChainWires<'_>> = (0..runs.len())
+        .map(|i| StackedChainWires {
+            rounds: &rounds[i],
+            roots: &roots[i],
+            final_value: finals[i],
+        })
+        .collect();
+    let claimed_at: Vec<&[Ext]> = points.iter().map(Vec::as_slice).collect();
+    let gamma = emit_stacked_verify_chains(
+        &mut b,
+        &mut transcript,
+        &layout,
+        &chains,
+        &claimed_at,
+        &values,
+        &shape,
+        &domain,
+    );
+    b.public(gamma.as_cell());
+    let program = compile(b.finish());
+    let text = format!("{:?}", program.instrs);
+    let digest = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, byte| {
+        (h ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    (program.instrs.len(), digest)
+}
+
+/// One pinned case: the base (`true` for Poseidon1), the columns' heights, the
+/// stack's height, and the stream's `(instructions, FNV-1a)`.
+type StreamPin = (bool, &'static [usize], usize, (usize, u64));
+
+/// The cases both builds are held to, each with its stream's pin: RPX and
+/// Poseidon1, five polynomials split [4, 1] and six split [4, 2] whose short
+/// columns' selectors run past `k0`. A pin moves only with the emitted
+/// program; move it in both files together.
+const GROUPED_LEG_STREAMS: [StreamPin; 4] = [
+    (false, &[8; 5], 8, (5241, 0x8d95_4e39_3cca_f387)),
+    (false, &[8, 3, 8, 2, 4, 8], 8, (5229, 0xac5d_a244_80ae_4271)),
+    (true, &[10; 5], 10, (28895, 0x52ec_ae97_ae80_6593)),
+    (
+        true,
+        &[10, 3, 10, 2, 4, 10],
+        10,
+        (28868, 0x02e6_e3fd_5c51_0e98),
+    ),
+];
+
+/// Under `Fault::None`, and with the step marks recorded or not, the test
+/// build emits one program — and it is the pinned one, which
+/// `prover/tests/onechain_release_stream.rs` holds a build without `cfg(test)`
+/// to as well: the test build's program is the release build's.
+#[test]
+fn the_grouped_leg_stream_of_a_test_build() {
+    for (p1, heights, n, pin) in GROUPED_LEG_STREAMS {
+        let plain = grouped_leg_stream(p1, heights, n);
+        let (marked, marks) = onechain_steps::record(|| {
+            onechain_faults::with(onechain_faults::Fault::None, || {
+                grouped_leg_stream(p1, heights, n)
+            })
+        });
+        assert_eq!(plain, marked, "the marks and Fault::None emit nothing");
+        assert!(!marks.is_empty(), "the marks were recorded");
+        println!(
+            "ONECHAIN STREAM p1={p1} heights={heights:?}: {} instructions, digest {:016x}",
+            plain.0, plain.1
+        );
+        assert_eq!(plain, pin, "p1={p1} heights={heights:?}: the pinned stream");
+    }
+}
+
+/// In guest, a grouped round 0 that is the chain's last round (R = 1) compares
+/// each query's combined fold with the final value, as its own check ahead of
+/// the final weight check. Unground, so a moved final
+/// value moves only the query positions; the forgery is the first such value
+/// whose first position does not move (two leaves a tree), so that query's
+/// openings stay valid and the host refuses at its fold — and the machine at
+/// the same fold.
+#[test]
+fn a_one_round_grouped_chain_folds_to_its_final_value_in_guest() {
+    let case = Case {
+        first: Some(6),
+        log_folding: 4,
+        log_blowup: 1,
+        ..rpx("one round, unground", &[5; 3], 5, 0)
+    };
+    let f = fixture(&case);
+    assert_eq!(f.shape.rounds(), 1, "R = 1");
+    let traced = traced_program(&f);
+    assert!(machine_refusal(&f, &traced, arena(&f, &f.proof)).is_none());
+    let fold = || Refusal::Chain {
+        chain: 0,
+        poly: 0,
+        cause: multilinear::Error::FoldInconsistent { query: 0 },
+    };
+    let forged = (1u64..512)
+        .map(|delta| {
+            let mut proof = f.proof.clone();
+            proof.polys[0].final_value += FEE::from(delta);
+            proof
+        })
+        .find(|proof| host_refusal(&f, proof) == Some(fold()))
+        .expect("a final value whose first query position does not move, refused at the fold");
+    let refused = machine_refusal(&f, &traced, arena(&f, &forged));
+    assert!(
+        matches!(
+            refused,
+            Some(Refused::At(Some(0), Step::Fold { round: 0, query: 0 }))
+        ),
+        "the machine refused at {refused:?}, not round 0's first fold"
+    );
+}
+
+// ─────────── the grouped round 0's successor, bound to its root in guest ───────────
+
+/// A grouped round 0's SUCCESSOR tree is bound, through its cap, to the root
+/// the round absorbed — in guest as on the host (`whir_round::verify_grouped`).
+/// Each node of the successor's cap moved in turn (in the proof, so the host
+/// reads the same forgery) is refused by the host at the cap, and has no
+/// execution: the failing assert lies in round 0's out-of-domain step, where
+/// the successor's cap is authenticated — never at an opening, which a cap
+/// node no query reaches would not meet.
+#[test]
+fn a_grouped_successor_cap_off_its_root_has_no_execution() {
+    let cases = [
+        Case {
+            cap: CapPolicy::Fixed(1),
+            ..rpx("three polynomials under a binary cap", &[6; 3], 6, 8)
+        },
+        Case {
+            base: Base::P1,
+            first: Some(6),
+            log_folding: 4,
+            cap: CapPolicy::Fixed(2),
+            ..rpx("P1, three polynomials at C2", &[10; 3], 10, 6)
+        },
+    ];
+    for case in cases {
+        let f = build(&case, GroupFold::Indexed);
+        let traced = traced_program(&f);
+        let run = f.shape.run(f.shape.chains(f.layout.num_polys())[0].len());
+        assert!(run.trees >= 2, "{}: a grouped chain", case.name);
+        let depth = run.next_depth(0).expect("round 0 has a successor");
+        let cap_words = run.cap_words(depth, run.caps[1]);
+        assert!(
+            cap_words >= 2,
+            "{}: a capped successor, {cap_words} cap words",
+            case.name
+        );
+        assert!(
+            machine_refusal(&f, &traced, arena(&f, &f.proof)).is_none(),
+            "{}: the control executes",
+            case.name
+        );
+        // Every node first, then the verdict: a node no query reaches is the
+        // one only the cap's own check refuses.
+        let mut elsewhere = Vec::new();
+        for node in 0..cap_words {
+            let mut forged = f.proof.clone();
+            let owner = &mut grouped(&mut forged, 0).next[0].proof.merkle_path;
+            let at = owner.len() - cap_words + node;
+            owner[at][0] ^= 1;
+            let host = host_refusal(&f, &forged);
+            let refused = machine_refusal(&f, &traced, arena(&f, &forged));
+            println!(
+                "ONECHAIN SUCCESSOR CAP [{}] node {node} of {cap_words}: host {host:?}, machine \
+                 {refused:?}",
+                case.name
+            );
+            let at_the_cap =
+                host == Some(Refusal::Chain {
+                    chain: 0,
+                    poly: 0,
+                    cause: multilinear::Error::CapRejected,
+                }) && matches!(refused, Some(Refused::At(Some(0), Step::Ood { round: 0 })));
+            if !at_the_cap {
+                elsewhere.push((node, host, refused));
+            }
+        }
+        assert!(
+            elsewhere.is_empty(),
+            "{}: a successor cap node off its root is refused at the cap by the host and where \
+             the cap is authenticated by the machine; not so: {elsewhere:?}",
+            case.name
         );
     }
 }
