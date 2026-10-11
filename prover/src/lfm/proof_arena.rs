@@ -109,12 +109,17 @@ pub fn halves_to_arena(halves: Vec<FE>) -> Vec<LfmWord> {
 /// ⚠ These two must agree or every root in the arena is off by a word. They do
 /// because both are functions of the configuration's digest width and neither
 /// restates it: this reads `WrapHash::production()`, that reads the builder's.
+/// A program built under another wrap hash (a proof family's) is fed at
+/// [`words_per_root_for`] that hash.
 pub fn words_per_root() -> usize {
-    if super::edsl::WrapHash::production() == super::edsl::WrapHash::Algebraic {
-        1
-    } else {
-        2
-    }
+    words_per_root_for(super::edsl::WrapHash::production())
+}
+
+/// [`words_per_root`] under the wrap hash `hash`: one word for a one-cell
+/// digest (every algebraic configuration, Poseidon1 included), two for a byte
+/// digest — `edsl::digest_words` of a builder under `hash`.
+pub fn words_per_root_for(hash: super::edsl::WrapHash) -> usize {
+    if hash.one_cell_digest() { 1 } else { 2 }
 }
 
 /// LANES one commitment occupies once its arena words are unpacked — four per
@@ -162,15 +167,7 @@ pub fn commitment_lanes(c: &Commitment) -> Vec<FE> {
 /// the arena is off by a word. They agree because both are functions of the
 /// configuration's `WrapDigest` width and neither restates it.
 pub fn commitment_words(c: &Commitment) -> Vec<LfmWord> {
-    if super::edsl::WrapHash::production() == super::edsl::WrapHash::Algebraic {
-        return vec![super::algebraic_commit::commitment_to_digest(c)];
-    }
-    let halves = pack_stream(c);
-    debug_assert_eq!(halves.len(), ROOT_HALVES);
-    vec![
-        [halves[0], halves[1], halves[2], halves[3]],
-        [halves[4], halves[5], halves[6], halves[7]],
-    ]
+    commitment_words_for(c, super::edsl::WrapHash::production())
 }
 
 // ==================== one query's main-trace opening ====================
@@ -389,9 +386,10 @@ pub fn commitments_to_arena_for(roots: &[Commitment], hash: super::edsl::WrapHas
 }
 
 /// [`commitment_words`] at the width of an explicit wrap hash. See
-/// [`commitments_to_arena_for`].
+/// [`commitments_to_arena_for`]. A one-cell digest (RPX, Poseidon1: four
+/// canonical big-endian felts) is one word; a byte digest is two.
 pub fn commitment_words_for(c: &Commitment, hash: super::edsl::WrapHash) -> Vec<LfmWord> {
-    if hash == super::edsl::WrapHash::Algebraic {
+    if hash.one_cell_digest() {
         return vec![super::algebraic_commit::commitment_to_digest(c)];
     }
     let halves = pack_stream(c);

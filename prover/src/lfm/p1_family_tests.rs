@@ -210,3 +210,37 @@ fn the_tag_replaces_todays_first_call() {
     );
     assert!(P1Family::STATEMENT_TAG.starts_with(LFM_STATEMENT_TAG));
 }
+
+/// The host lays a root at the width the reading node's builder reads it
+/// (REV-P3B14-A A2): `proof_arena::words_per_root_for` is `edsl::digest_words`
+/// of a builder under the same wrap hash, for every wrap hash, and a
+/// one-cell digest (RPX, Poseidon1) is the backend's four canonical felts. So
+/// the harvest, which lays a child's arenas at its family's `WRAP`, follows a
+/// family flip to a byte-digest hash instead of keeping the legacy pin's width.
+#[test]
+fn each_wrap_hash_lays_a_root_at_its_builders_width() {
+    use super::edsl::WrapHash;
+    use super::proof_arena::{commitment_words, commitment_words_for, words_per_root_for};
+    let root: [u8; 32] = core::array::from_fn(|i| (7 * i + 3) as u8);
+    for hash in [
+        WrapHash::Keccak,
+        WrapHash::Blake3,
+        WrapHash::Algebraic,
+        WrapHash::Poseidon1,
+    ] {
+        let b = super::builder::LfmBuilder::new().with_wrap_hash(hash);
+        let words = words_per_root_for(hash);
+        assert_eq!(words as u32, super::edsl::digest_words(&b), "{hash:?}");
+        assert_eq!(commitment_words_for(&root, hash).len(), words, "{hash:?}");
+    }
+    assert_eq!(
+        commitment_words_for(&root, P1Family::WRAP),
+        vec![super::algebraic_commit::commitment_to_digest(&root)],
+        "a P1 root is one cell"
+    );
+    assert_eq!(
+        commitment_words(&root),
+        commitment_words_for(&root, LegacyFamily::WRAP),
+        "the legacy pin's width is its family's"
+    );
+}
