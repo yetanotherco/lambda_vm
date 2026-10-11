@@ -159,6 +159,9 @@ fn a_p1_node_verifies_a_p1_child_and_refuses_its_tampers() {
         "a P1 node's hash rows are the width-16 socket's"
     );
     assert!(runs(&program, &honest), "the honest child executes");
+    // The child's arenas are laid at the family's digest width, the node's.
+    assert_eq!(honest.wrap, P1Family::WRAP);
+    assert!(honest.legs.iter().all(|l| l.wrap == P1Family::WRAP));
     // The P1 child's trees are capped (`P1_STARK_CAP`): a cap is hinted per
     // tree.
     assert!(

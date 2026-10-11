@@ -695,6 +695,19 @@ mod scan {
                 sites: &[],
                 forbidden: &[],
             },
+            File {
+                name: "lfm/harvest.rs",
+                source: include_str!("../lfm/harvest.rs").to_string(),
+                anchors: &[
+                    "fn build_table_legs_with(",
+                    "fn harvest_child_under<",
+                    "fn try_child_arena_words(",
+                ],
+                sites: &[],
+                // The child's arenas are laid at its family's digest width,
+                // never the legacy pin's.
+                forbidden: &["words_per_root", "commitments_to_arena", "commitment_words"],
+            },
         ]
     }
 }
