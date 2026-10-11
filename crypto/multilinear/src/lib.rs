@@ -186,4 +186,8 @@ pub enum Error {
     /// before anything is indexed.
     #[error("the grouped opening's shape is not the derived one: {0:?}")]
     GroupedShape(whir_chain::GroupedShape),
+    /// A grouped round 0's block of round-0 tree `tree` at query `query` does
+    /// not open against that tree's own root (or cap).
+    #[error("query {query}: tree {tree}'s block does not open against its root")]
+    GroupedOpeningRejected { query: usize, tree: usize },
 }

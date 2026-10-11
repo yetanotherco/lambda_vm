@@ -18,7 +18,10 @@ use math::{
 use crate::{
     Error,
     mle::Mle,
-    stacked_eval::{Claimed, StackedCommitment, StackedProof, index_chains, prove, verify},
+    stacked_eval::{
+        Claimed, Refusal, StackedCommitment, StackedProof, index_chains, prove, verify,
+        verify_traced,
+    },
     stacking::{StackedLayout, borrow},
     sumcheck,
     whir::Domain,
@@ -189,6 +192,51 @@ fn check_tower(
     cfg: &ChainConfig,
 ) -> Result<(), Error> {
     check::<Ext, KeccakWhir, _>(o, proof, cfg, tower)
+}
+
+/// [`check`] with the refusal's cause: the chain, and the check inside it that
+/// refused ([`verify_traced`]) — what a negative asserts, so it cannot pass on
+/// another error.
+fn trace<E, H, T>(
+    o: &Opened<E>,
+    proof: &StackedProof<F, E>,
+    cfg: &ChainConfig,
+    transcript: fn() -> T,
+) -> Result<(), Refusal>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<E>: AsBytes + Send + Sync,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    verify_traced::<F, E, T, H>(
+        proof,
+        &o.layout,
+        &o.roots,
+        &Claimed::PerColumn(&o.points),
+        &o.values,
+        &o.domain,
+        cfg,
+        &mut transcript(),
+    )
+}
+
+fn trace_tower(
+    o: &Opened<Ext>,
+    proof: &StackedProof<F, Ext>,
+    cfg: &ChainConfig,
+) -> Result<(), Refusal> {
+    trace::<Ext, KeccakWhir, _>(o, proof, cfg, tower)
+}
+
+/// Chain 0 (over polynomials 0..), refused by `cause`.
+fn in_chain_0(cause: Error) -> Result<(), Refusal> {
+    Err(Refusal::Chain {
+        chain: 0,
+        poly: 0,
+        cause,
+    })
 }
 
 fn grouped(proof: &StackedProof<F, Ext>, chain: usize) -> &GroupedRoundProof<F, Ext> {
@@ -381,11 +429,16 @@ fn the_verifier_refuses_an_index_past_the_two_adicity_before_reading() {
             two_adicity: 32
         }
     );
+    // A per-polynomial verifier binds no index there: what refuses the one
+    // grouped chain is its count against three polynomials.
     wide.format.group = GroupFold::PerPoly;
-    assert!(!matches!(
+    assert_eq!(
         check_tower(&o, &o.proof, &wide),
-        Err(Error::GroupedShape(GroupedShape::IndexDomain { .. }))
-    ));
+        Err(Error::QueryCountMismatch {
+            expected: 3,
+            got: 1
+        })
+    );
 }
 
 // ─────────────────────── B1-2: exact shapes, by name ───────────────────────
@@ -634,14 +687,19 @@ fn each_reading_of_the_index_is_load_bearing() {
         "one chain over three, slot 3 absent"
     );
     grouped_faults::with(Fault::None, || check_tower(&o, &o.proof, &cfg)).unwrap();
-    for fault in [
-        Fault::SwapRhoInCombine,
-        Fault::SwapRhoInWeight,
-        Fault::DropIndexFactor,
-        Fault::AbsentSlotWeightOne,
+    // The combine's reading refuses at round 0's first fold; the weight's at
+    // the final check.
+    for (fault, cause) in [
+        (
+            Fault::SwapRhoInCombine,
+            Error::FoldInconsistent { query: 0 },
+        ),
+        (Fault::SwapRhoInWeight, Error::EvaluationMismatch),
+        (Fault::DropIndexFactor, Error::EvaluationMismatch),
+        (Fault::AbsentSlotWeightOne, Error::EvaluationMismatch),
     ] {
-        let refused = grouped_faults::with(fault, || check_tower(&o, &o.proof, &cfg));
-        assert!(refused.is_err(), "{fault:?} accepted the honest proof");
+        let refused = grouped_faults::with(fault, || trace_tower(&o, &o.proof, &cfg));
+        assert_eq!(refused, in_chain_0(cause), "{fault:?}");
     }
     check_tower(&o, &o.proof, &cfg).unwrap();
 }
@@ -740,7 +798,14 @@ fn an_indexed_proof_and_a_per_poly_proof_refuse_each_others_verifier() {
     assert_eq!(g.roots, p.roots, "the commitments are the same");
     check_tower(&g, &g.proof, &grouped_cfg).unwrap();
     check_tower(&p, &p.proof, &per_poly).unwrap();
-    assert!(check_tower(&g, &g.proof, &per_poly).is_err());
+    assert_eq!(
+        check_tower(&g, &g.proof, &per_poly),
+        Err(Error::QueryCountMismatch {
+            expected: 3,
+            got: 1
+        }),
+        "one chain where a per-polynomial verifier counts three"
+    );
     assert_eq!(
         shape(check_tower(&p, &p.proof, &grouped_cfg)),
         GroupedShape::ChainCount {
@@ -830,7 +895,8 @@ fn random_layouts_round_trip() {
     }
 }
 
-/// REV-B2-JUDGE B1-7: a tampered value in any slot `p` is refused.
+/// REV-B2-JUDGE B1-7: a tampered value in any slot `p` is refused by tree
+/// `p`'s own opening at that query (and reported as the chain's).
 #[test]
 fn a_tampered_value_in_any_slot_is_refused() {
     let (o, cfg) = p3();
@@ -838,9 +904,13 @@ fn a_tampered_value_in_any_slot_is_refused() {
         let mut proof = o.proof.clone();
         grouped_mut(&mut proof, 0).current[1][p].values[5] += FE::one();
         assert_eq!(
-            check_tower(&o, &proof, &cfg),
-            Err(Error::ColumnOpeningRejected { column: 0 }),
+            trace_tower(&o, &proof, &cfg),
+            in_chain_0(Error::GroupedOpeningRejected { query: 1, tree: p }),
             "slot {p}"
+        );
+        assert_eq!(
+            check_tower(&o, &proof, &cfg),
+            Err(Error::ColumnOpeningRejected { column: 0 })
         );
     }
 }
@@ -853,7 +923,11 @@ fn blocks_from_another_tree_or_position_are_refused() {
     let (o, cfg) = p3();
     let mut swapped = o.proof.clone();
     grouped_mut(&mut swapped, 0).current[1].swap(0, 1);
-    assert!(check_tower(&o, &swapped, &cfg).is_err());
+    assert_eq!(
+        trace_tower(&o, &swapped, &cfg),
+        in_chain_0(Error::GroupedOpeningRejected { query: 1, tree: 0 }),
+        "tree 0 reads tree 1's block"
+    );
 
     let g = grouped(&o.proof, 0);
     let other = (0..g.current.len())
@@ -861,7 +935,11 @@ fn blocks_from_another_tree_or_position_are_refused() {
         .expect("two queries at different positions");
     let mut moved = o.proof.clone();
     grouped_mut(&mut moved, 0).current[1][2] = g.current[other][2].clone();
-    assert!(check_tower(&o, &moved, &cfg).is_err());
+    assert_eq!(
+        trace_tower(&o, &moved, &cfg),
+        in_chain_0(Error::GroupedOpeningRejected { query: 1, tree: 2 }),
+        "tree 2 at query {other}'s position"
+    );
 }
 
 /// Each tree's path is load-bearing on its own, not just through the fold: in
@@ -901,8 +979,9 @@ fn a_combination_preserving_forgery_is_refused_by_the_paths() {
     let kept = crate::whir_round::combine_blocks(&g.current[1], &[eq_index(rho, 0), e1, e2]);
     assert_eq!(kept, honest, "the forgery keeps the combination");
     assert_eq!(
-        check::<F, KeccakWhir, _>(&o, &forged, &cfg, base),
-        Err(Error::ColumnOpeningRejected { column: 0 })
+        trace::<F, KeccakWhir, _>(&o, &forged, &cfg, base),
+        in_chain_0(Error::GroupedOpeningRejected { query: 1, tree: 1 }),
+        "tree 1's own opening, not the fold"
     );
     check::<F, KeccakWhir, _>(&o, &o.proof, &cfg, base).unwrap();
 }
@@ -925,8 +1004,16 @@ fn a_grouped_opening_round_trips_under_p1_caps() {
             } else {
                 CapPolicy::Off
             };
-            assert!(
-                check::<Ext, P1Whir, _>(&o, &o.proof, &other, tower_p1).is_err(),
+            // Uncapped trees read under a cap have no cap to check; capped ones
+            // read uncapped walk the owner's cap words to no root.
+            let cause = if policy == CapPolicy::Off {
+                Error::CapRejected
+            } else {
+                Error::GroupedOpeningRejected { query: 0, tree: 0 }
+            };
+            assert_eq!(
+                trace::<Ext, P1Whir, _>(&o, &o.proof, &other, tower_p1),
+                in_chain_0(cause),
                 "{policy} P={polys}: read under {}",
                 other.format.arity4_cap
             );

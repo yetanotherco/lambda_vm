@@ -602,14 +602,14 @@ where
     for (i, (&q, blocks)) in queries.iter().zip(&proof.current).enumerate() {
         // One position for every tree: the oracle read is the run's tuple at
         // block `q`, each component against its own root.
-        for (opening, (check, first_siblings)) in blocks.iter().zip(&checks) {
+        for (tree, (opening, (check, first_siblings))) in blocks.iter().zip(&checks).enumerate() {
             let siblings = if i == 0 {
                 *first_siblings
             } else {
                 opening.proof.merkle_path.as_slice()
             };
             if !verify_opening_capped::<F, H>(check, q, opening, siblings) {
-                return Err(Error::OpeningRejected { query: i });
+                return Err(Error::GroupedOpeningRejected { query: i, tree });
             }
         }
         let folded = fold_coset::<F, E, E>(&combine_blocks(blocks, &eqs), domain, q, alphas)?;

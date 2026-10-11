@@ -3294,6 +3294,11 @@ fn an_indexed_blocks_leaves_execute_and_refuse_a_grouped_forgery() {
             plan.partition().leaves()
         );
 
+        // A value of tree 1's block at query 1 in the first grouped chain: the
+        // host refuses it at that chain's opening (reported as the run's first
+        // polynomial), and the leaf holding the group at tree 1's opening at
+        // query 1 — the first failing check in program order, against the
+        // honest leaf, which executes.
         let (g, i) = grouped[0];
         let mut forged = proof.clone();
         match &mut forged.proof.columns[g].polys[i].rounds[0].openings {
@@ -3301,16 +3306,60 @@ fn an_indexed_blocks_leaves_execute_and_refuse_a_grouped_forgery() {
             _ => unreachable!("a grouped round 0"),
         }
         let opts = ProofOptions::default_test_options();
+        let frame =
+            block_whir::block_frame(proof.statement(), &elf, &opts, &format).expect("frame");
+        let run = multilinear::stacked_eval::index_chains(
+            frame.stack_layouts[g].num_polys(),
+            multilinear::whir_chain::GroupFold::Indexed,
+        )[i]
+            .clone();
+        let refusal = block_whir::verify_block_whir_traced(
+            &forged,
+            &elf,
+            &opts,
+            &format,
+            false,
+            stark::multilinear_table::batched::VerifierChecks::ALL,
+        )
+        .expect("the statement frames");
         assert!(
-            !verify_block_whir(&forged, &elf, &opts, &format).unwrap_or(false),
-            "{base:?}: the host refuses the forgery"
+            matches!(
+                refusal,
+                Err(block_whir::BlockRefusal::Proof(
+                    multilinear::Error::ColumnOpeningRejected { column }
+                )) if column == run.start
+            ),
+            "{base:?}: the host refuses group {g} chain {i}'s opening, got {refusal:?}"
         );
         let k = (0..plan.partition().num_leaves())
             .find(|&k| plan.partition().leaf(k).contains(&g))
             .expect("a leaf holds the group");
+        use super::whir_chain::onechain_steps::{self, Step};
+        let (program, marks) = onechain_steps::record(|| {
+            leaf_program_with(&plan, k, LeafChecks::ALL).expect("the leaf emits")
+        });
+        let hasher = program.hasher(crate::hash_pin::BLOCK_HASHER);
+        let honest = block_leaf_arena(&plan, &proof, k).expect("the honest arena");
+        super::executor::execute_serial(&program, &honest, &hasher)
+            .expect("the honest leaf executes");
+        let forged_arena = block_leaf_arena(&plan, &forged, k).expect("the forged arena");
+        let error = super::executor::execute_serial(&program, &forged_arena, &hasher)
+            .expect_err("the leaf refuses the forgery");
+        assert_eq!(
+            onechain_steps::failed_at(&program, &marks, &error),
+            Some((
+                Some(run.start),
+                Step::Opening {
+                    round: 0,
+                    query: 1,
+                    tree: 1
+                }
+            )),
+            "{base:?}: leaf {k} refuses group {g} chain {i} at tree 1's opening, got {error:?}"
+        );
         assert!(
             run_leaf(&plan, &forged, k, LeafChecks::ALL).is_err(),
-            "{base:?}: leaf {k} refuses group {g}'s forged round 0"
+            "{base:?}: and on the production schedule"
         );
     }
 }
