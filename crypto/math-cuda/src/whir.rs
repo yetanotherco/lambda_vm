@@ -2000,7 +2000,7 @@ pub const fn encode_successor_transient_bytes(log_out: usize, log_evals: usize) 
 /// otherwise. Either way proves the same values.
 ///
 /// On: the fold reads the whole `2^(n+blowup)` base codeword, the encode a
-/// `2^(n−k)` message (ZEN5 030, I-COPIES §12). `=0` is the way back.
+/// `2^(n−k)` message (I-COPIES §12). `=0` is the way back.
 pub const ENCODE_SUCCESSOR_DEFAULT: bool = true;
 
 /// `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR`'s value read: `0` folds, `1` encodes,
