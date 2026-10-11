@@ -1995,6 +1995,40 @@ pub const fn encode_successor_transient_bytes(log_out: usize, log_evals: usize) 
     (24u64 << log_out) + (8u64 << log_out) + (8u64 << log_evals)
 }
 
+/// Whether a chain's first successor is encoded from its bound message
+/// ([`encode_successor`]) when `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR` does not say
+/// otherwise. Either way proves the same values.
+///
+/// On: the fold reads the whole `2^(n+blowup)` base codeword, the encode a
+/// `2^(n−k)` message (ZEN5 030, I-COPIES §12). `=0` is the way back.
+pub const ENCODE_SUCCESSOR_DEFAULT: bool = true;
+
+/// `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR`'s value read: `0` folds, `1` encodes,
+/// unset or anything else is [`ENCODE_SUCCESSOR_DEFAULT`].
+pub fn encode_successor_setting(value: Option<&str>) -> bool {
+    match value.map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => ENCODE_SUCCESSOR_DEFAULT,
+    }
+}
+
+#[cfg(test)]
+mod encode_successor_tests {
+    use super::encode_successor_setting;
+
+    /// The first successor is encoded unless the knob says `0`.
+    #[test]
+    fn the_first_successor_is_encoded_by_default_and_zero_folds() {
+        assert!(encode_successor_setting(None), "the default encodes");
+        assert!(encode_successor_setting(Some("1")));
+        assert!(!encode_successor_setting(Some("0")), "the way back");
+        assert!(!encode_successor_setting(Some(" 0 ")));
+        assert!(encode_successor_setting(Some("")));
+        assert!(encode_successor_setting(Some("off")), "only 0 opts out");
+    }
+}
+
 /// Levels a tile fuses at once: 32 rows of 32 columns is a full block, and the
 /// shared tile it needs is a few kilobytes.
 const MOBIUS_TILE_LEVELS: u32 = 5;

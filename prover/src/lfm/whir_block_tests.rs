@@ -2645,8 +2645,9 @@ fn the_whir_block_tree_on_a_real_block() {
         multilinear::gpu::lean_open_calls(),
         multilinear::gpu::open_calls()
     );
-    // Each chain's first successor: encoded from the bound message
-    // (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=1`) or folded, and how many folds ran.
+    // Each chain's first successor: encoded from the bound message (the
+    // default) or folded (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0`), and how many
+    // folds ran.
     println!(
         "W3 WHIR SUCCESSORS: encode {} · {} encoded · {} folds ({} fused)",
         if multilinear::gpu::encode_successor_in_effect() {

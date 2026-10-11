@@ -10,9 +10,10 @@
 //!
 //! Four arms: the path before the kernels (lean rounds 0, folds level by
 //! level), six lean rounds with the fused fold (`LAMBDA_VM_WHIR_LEAN_ROUNDS=6`,
-//! the way back), the defaults (three lean rounds, the fused fold), and the
-//! defaults with the first successor encoded from the bound message instead of
-//! folded (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=1`). Needs a GPU. Each new path is
+//! the way back), three lean rounds and the fused fold with every successor
+//! folded (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0`, the way back), and the
+//! defaults (three lean rounds, the fused fold, the first successor encoded
+//! from the bound message instead of folded). Needs a GPU. Each new path is
 //! asserted TAKEN in its arms and NOT in the others (the call counters), so a
 //! card that declined could not turn this into a comparison of today's path
 //! with itself. One `#[test]`: the arms switch process-wide overrides, and
@@ -114,11 +115,12 @@ enum Arm {
     Materialised,
     /// Six lean rounds and the fused fold (`LAMBDA_VM_WHIR_LEAN_ROUNDS=6`).
     Six,
-    /// Nothing forced: the defaults, three lean rounds and the fused fold.
+    /// Three lean rounds and the fused fold, every successor folded
+    /// (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0`).
+    Folded,
+    /// Nothing forced: the defaults, three lean rounds, the fused fold and
+    /// each chain's first successor encoded from its bound message.
     Defaults,
-    /// The defaults, with each chain's first successor encoded from its bound
-    /// message (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=1`).
-    Encoded,
 }
 
 /// One arm: the path before the kernels or the two kernels.
@@ -128,7 +130,10 @@ fn prove_arm<H: WhirHash>(
     resident: Option<&gpu::ResidentColumns>,
 ) -> (StackedProof<F, Ext>, Vec<[u8; 32]>) {
     let lean = !matches!(arm, Arm::Materialised);
-    gpu::force_encode_successor(Some(matches!(arm, Arm::Encoded)));
+    gpu::force_encode_successor(match arm {
+        Arm::Defaults => None,
+        _ => Some(false),
+    });
     match arm {
         Arm::Materialised => {
             gpu::force_lean_rounds(Some(0));
@@ -138,7 +143,7 @@ fn prove_arm<H: WhirHash>(
             gpu::force_lean_rounds(Some(6));
             gpu::force_fused_fold(Some(true));
         }
-        Arm::Defaults | Arm::Encoded => {
+        Arm::Folded | Arm::Defaults => {
             gpu::force_lean_rounds(None);
             gpu::force_fused_fold(None);
             if std::env::var_os("LAMBDA_VM_WHIR_LEAN_ROUNDS").is_none() {
@@ -146,6 +151,14 @@ fn prove_arm<H: WhirHash>(
                     gpu::lean_rounds_in_effect(),
                     3,
                     "the default is three lean rounds"
+                );
+            }
+            if matches!(arm, Arm::Defaults)
+                && std::env::var_os("LAMBDA_VM_WHIR_ENCODE_SUCCESSOR").is_none()
+            {
+                assert!(
+                    gpu::encode_successor_in_effect(),
+                    "the default encodes the first successor"
                 );
             }
         }
@@ -188,7 +201,7 @@ fn prove_arm<H: WhirHash>(
     // chain's later folds still fold.
     assert_eq!(
         gpu::encoded_successors() - encoded_before,
-        if matches!(arm, Arm::Encoded) {
+        if matches!(arm, Arm::Defaults) && gpu::encode_successor_in_effect() {
             opens
         } else {
             0
@@ -240,7 +253,7 @@ fn prove_arm<H: WhirHash>(
 fn both_arms<H: WhirHash>(c: &Case, resident: Option<&gpu::ResidentColumns>) {
     let (today, today_roots) = prove_arm::<H>(c, Arm::Materialised, resident);
     let today_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&today).unwrap();
-    for arm in [Arm::Six, Arm::Defaults, Arm::Encoded] {
+    for arm in [Arm::Six, Arm::Folded, Arm::Defaults] {
         let (lean, lean_roots) = prove_arm::<H>(c, arm, resident);
         assert_eq!(today_roots, lean_roots, "{} {arm:?}: roots", H::NAME);
         assert_eq!(

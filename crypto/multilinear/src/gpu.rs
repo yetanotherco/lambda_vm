@@ -91,8 +91,8 @@ static FUSED_FOLD_CALLS: AtomicU64 = AtomicU64::new(0);
 /// [`FUSED_FOLD_CALLS`] is a share of.
 static RESIDENT_FOLD_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Successors encoded from their bound message instead of folded from the
-/// codeword (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR`; D-SPEED lever 5a). Not in
-/// [`RESIDENT_FOLD_CALLS`]: no fold ran.
+/// codeword (the default; `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0` folds; D-SPEED
+/// lever 5a). Not in [`RESIDENT_FOLD_CALLS`]: no fold ran.
 static ENCODED_SUCCESSORS: AtomicU64 = AtomicU64::new(0);
 /// ★ Stacked openings whose codeword the device holds but whose factors the
 /// device did not build from the shares.
@@ -340,9 +340,9 @@ pub fn encoded_successors() -> u64 {
     ENCODED_SUCCESSORS.load(Ordering::Relaxed)
 }
 
-/// Whether a chain's first successor is encoded from its bound message
-/// (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=1`, or a test's override). `false` in a
-/// build without a device.
+/// Whether a chain's first successor is encoded from its bound message (the
+/// default; `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0` or a test's override turns it
+/// off). `false` in a build without a device.
 pub fn encode_successor_in_effect() -> bool {
     #[cfg(feature = "cuda")]
     {
@@ -4697,7 +4697,8 @@ fn fused_fold() -> bool {
 
 /// Whether a chain's first successor is encoded from the message its rounds
 /// bound rather than folded from the committed codeword
-/// (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=1`; off by default until gated). The
+/// (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR`; on by default,
+/// [`math_cuda::whir::ENCODE_SUCCESSOR_DEFAULT`] says why; `=0` folds). The
 /// same values either way (`math_cuda::whir::encode_successor`): the fold
 /// reads the `2^(n+blowup)` base codeword, the encode a `2^(n−k)` message.
 #[cfg(feature = "cuda")]
@@ -4708,7 +4709,11 @@ fn encode_successor() -> bool {
         _ => {
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *ON.get_or_init(|| {
-                std::env::var("LAMBDA_VM_WHIR_ENCODE_SUCCESSOR").is_ok_and(|v| v.trim() == "1")
+                math_cuda::whir::encode_successor_setting(
+                    std::env::var("LAMBDA_VM_WHIR_ENCODE_SUCCESSOR")
+                        .ok()
+                        .as_deref(),
+                )
             })
         }
     }
@@ -4960,8 +4965,8 @@ impl OpeningFactors {
 
     /// ★ The successor a `levels`-level fold of `codeword` would make, encoded
     /// from the message these factors' rounds bound
-    /// ([`math_cuda::whir_open::OpeningSession::encode_successor`]), when
-    /// `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR` is on. `None` sends the caller to the
+    /// ([`math_cuda::whir_open::OpeningSession::encode_successor`]), unless
+    /// `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0`. `None` sends the caller to the
     /// fold: the knob off, or the card declining.
     pub(crate) fn encode_successor(
         &mut self,

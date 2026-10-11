@@ -1064,7 +1064,7 @@ where
 
     /// The successor a `levels`-level fold of `codeword` would make, encoded
     /// from the message these rounds bound — on a device, when the factors and
-    /// the codeword are both there and `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR` is on.
+    /// the codeword are both there, unless `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0`.
     /// `None` is the fold's turn.
     fn encode_successor<C: IsField>(
         &mut self,
@@ -1250,8 +1250,8 @@ where
         // The fold lands in the extension whichever field it started in, so
         // the field is the only thing the two cases differ in — and a codeword
         // the device holds is folded where it is. The first one, the widest,
-        // may be encoded from the message the rounds just bound instead: the
-        // same codeword (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR`).
+        // is encoded from the message the rounds just bound instead: the same
+        // codeword (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0` folds it).
         let __wc_fold = crate::whir_split::mark();
         let (folded, folded_domain) = match &current {
             Current::Base(held) => match factors.encode_successor(held.codeword(), k) {
