@@ -31,9 +31,14 @@ use super::word::LfmWord;
 /// refuse the child (at six queries `auto` could coincide with it and hide
 /// that).
 fn options() -> ProofOptions {
+    options_at(4)
+}
+
+/// [`options`] at `grinding` bits.
+fn options_at(grinding: u8) -> ProofOptions {
     let mut o = GoldilocksCubicProofOptions::with_blowup(4).expect("options");
     o.fri_number_of_queries = 6;
-    o.grinding_factor = 4;
+    o.grinding_factor = grinding;
     o.fri_final_poly_log_degree = 2;
     let mut o = crate::zf_format::ZfFormat::DEFAULT.options(o);
     o.format.merkle_cap = stark::proof::options::CapPolicy::Off;
@@ -41,9 +46,15 @@ fn options() -> ProofOptions {
 }
 
 fn arenas() -> Vec<Vec<LfmWord>> {
+    arenas_salted(0)
+}
+
+/// The trivial program's arena, its words moved by `salt` (another
+/// execution, another transcript).
+fn arenas_salted(salt: u64) -> Vec<Vec<LfmWord>> {
     vec![
         (0..4u64)
-            .map(|i| core::array::from_fn(|j| FE::from(1_000 * (i + 1) + j as u64)))
+            .map(|i| core::array::from_fn(|j| FE::from(1_000 * (i + 1) + j as u64 + 17 * salt)))
             .collect(),
     ]
 }
@@ -82,12 +93,19 @@ fn harvest(c: &P1Child) -> HarvestedChild {
 /// One leg over the child, under `wrap`, with the child's statement tag
 /// `tag` (the family's, unless a mutation swaps it).
 fn node(c: &P1Child, tag: &'static [u8]) -> LfmProgram {
-    let derived = DerivedChild::from_artifacts_under::<P1Family>(
-        &c.artifacts,
-        &c.opts,
-        c.proof.public_words.len(),
-    )
-    .unwrap_or_else(|e| panic!("{e}"));
+    node_at(&c.artifacts, &c.opts, c.proof.public_words.len(), tag)
+}
+
+/// One leg over a child of `artifacts` whose shapes — the grind factor
+/// among them — the node derives at `opts`.
+fn node_at(
+    artifacts: &LfmArtifacts,
+    opts: &ProofOptions,
+    words: usize,
+    tag: &'static [u8],
+) -> LfmProgram {
+    let derived = DerivedChild::from_artifacts_under::<P1Family>(artifacts, opts, words)
+        .unwrap_or_else(|e| panic!("{e}"));
     let mut shape = derived.shape();
     shape.statement_tag = tag;
     let mut b = LfmBuilder::new().with_wrap_hash(P1Family::WRAP);
@@ -180,4 +198,66 @@ fn a_node_without_the_family_tag_refuses_the_p1_child() {
         &node(&c, crate::hash_pin::LegacyFamily::STATEMENT_TAG),
         &honest
     ));
+}
+
+/// ★ The leg checks each table's grind at the factor the NODE derives from
+/// the child's options, not at one the child chose (REV-P3B14-A A1): a child
+/// proved at `g − 1` bits whose nonces do not all meet `g` is accepted by the
+/// node derived at `g − 1` and refused by the one derived at `g`, as the host
+/// verifier at `g` refuses it. `rp1wa_the_emitted_grind_accepts_exactly_the_
+/// hosts_nonces` drives the grind gadget directly and the tamper test's nonce
+/// flip re-rolls every query, so neither sees a weaker factor handed to the
+/// gadget at the leg's call site (`epoch::emit_table_challenges`); this does.
+/// From the reviewer's `rp3b14a_a_p1_node_refuses_a_child_ground_one_bit_short`.
+#[test]
+fn a_p1_node_refuses_a_child_ground_one_bit_short() {
+    let (short, full) = (options_at(3), options_at(4));
+    let program = trivial_program();
+    let hasher = super::registry::build_artifacts(&program, &short).hasher;
+    let artifacts =
+        build_artifacts_under::<<P1Family as ProofFamily>::Stark>(&program, &short, hasher);
+    let full_artifacts =
+        build_artifacts_under::<<P1Family as ProofFamily>::Stark>(&program, &full, hasher);
+    assert_eq!(
+        artifacts.program_id, full_artifacts.program_id,
+        "the grind is no part of the program"
+    );
+    // A child at 3 bits that some table's nonce does not carry to 4: each
+    // table's 3-bit nonce misses the fourth bit about half the time, so the
+    // first salt nearly always gives one.
+    let (proof, salt) = (0..16u64)
+        .find_map(|salt| {
+            let proof =
+                lfm_prove_under::<P1Family>(&program, &artifacts, &arenas_salted(salt), &short)
+                    .expect("prove");
+            let verifies = |opts: &ProofOptions| {
+                verify_against_artifacts_under::<P1Family>(
+                    &artifacts,
+                    &proof.proof,
+                    &proof.public_words,
+                    opts,
+                )
+            };
+            assert!(verifies(&short), "salt {salt}: the honest child at 3 bits");
+            (!verifies(&full)).then_some((proof, salt))
+        })
+        .expect("a child whose nonces do not all meet 4 bits");
+    println!("P1 NODE GRIND: salt {salt}: the host at 4 bits refuses the 3-bit child");
+    let child = harvest_child_under::<P1Family>(artifacts.clone(), short.clone(), &proof)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let words = proof.public_words.len();
+    assert!(
+        runs(
+            &node_at(&artifacts, &short, words, P1Family::STATEMENT_TAG),
+            &child
+        ),
+        "the node at 3 bits accepts the 3-bit child"
+    );
+    assert!(
+        !runs(
+            &node_at(&artifacts, &full, words, P1Family::STATEMENT_TAG),
+            &child
+        ),
+        "the node at 4 bits must refuse a child ground at 3"
+    );
 }
