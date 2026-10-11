@@ -254,6 +254,18 @@ impl OpeningSession {
         crate::sumcheck::evaluate_resident_ext3(&self.stream, &mut copy, self.len, point)
     }
 
+    /// The successor a `levels`-level fold of `codeword` would make, encoded
+    /// from the message as these factors have bound it
+    /// ([`crate::whir::encode_successor`]). Reads a copy: the message stays the
+    /// next group's factor.
+    pub fn encode_successor(
+        &self,
+        codeword: &crate::whir::DeviceCodeword,
+        levels: usize,
+    ) -> Result<crate::whir::DeviceCodeword> {
+        crate::whir::encode_successor(codeword, levels, &self.stream, &self.message, self.len)
+    }
+
     /// `weight += scale · eq(point, ·)`, the weight the next group carries.
     pub fn add_scaled_eq(&self, point: &[u64], scale: &[u64]) -> Result<()> {
         assert_eq!(point.len(), self.num_vars() * 3, "the point spans the cube");
@@ -686,6 +698,9 @@ pub struct OpeningShape {
     pub lean_rounds: usize,
     /// Whether a fold runs every level in one launch.
     pub fused: bool,
+    /// Whether the first successor may be encoded from the bound message
+    /// instead of folded ([`crate::whir::encode_successor`]).
+    pub encoded: bool,
     /// Whether the message is sent rather than read where the columns lie.
     pub staged: bool,
     /// Columns in the stacked polynomial, and the extension values of their
@@ -712,7 +727,10 @@ pub struct OpeningShape {
 /// - **Rounds** over the written factors: the factors and a session's slot
 ///   file and partials ([`SumcheckSession::scratch_bytes`]).
 /// - **The first fold and what follows it**: the factors, then the fold's
-///   transient ([`fold_transient_bytes`]); after it, beside the fold's output,
+///   transient ([`fold_transient_bytes`]) — or, when the successor may be
+///   encoded from the bound message instead, the larger of that and the
+///   encode's ([`crate::whir::encode_successor_transient_bytes`]), since a
+///   declined encode folds; after it, beside the fold's output,
 ///   one at a time: the successor's tree, the tree over the committed codeword
 ///   its queries' paths are read from, and the out-of-domain answer's copy of
 ///   the message with the next weight's `eq` table.
@@ -721,7 +739,9 @@ pub struct OpeningShape {
 /// smaller, so it is inside these. A leaf layer kept for retention is promised
 /// by the codeword it belongs to, not by the turn.
 pub fn opening_transient_bytes(shape: &OpeningShape) -> u64 {
-    use crate::whir::{FUSED_MAX_FOLD, fold_transient_bytes, tree_bytes};
+    use crate::whir::{
+        FUSED_MAX_FOLD, encode_successor_transient_bytes, fold_transient_bytes, tree_bytes,
+    };
 
     let n = shape.num_vars;
     let lean = shape.lean_rounds > 0 && shape.shares > 0 && shape.shares < LEAN_MAX_SHARES;
@@ -744,6 +764,14 @@ pub fn opening_transient_bytes(shape: &OpeningShape) -> u64 {
         shape.first_fold,
         shape.fused && shape.first_fold <= FUSED_MAX_FOLD,
     );
+    let transient = if shape.encoded {
+        transient.max(encode_successor_transient_bytes(
+            folded,
+            n - shape.first_fold.min(n),
+        ))
+    } else {
+        transient
+    };
     let successor = if shape.next_fold > 0 {
         tree_bytes(folded - shape.next_fold)
     } else {
@@ -837,6 +865,7 @@ mod tests {
             next_fold: 4,
             lean_rounds: LEAN_ROUNDS_DEFAULT,
             fused: true,
+            encoded: false,
             staged: false,
             shares: 400,
             eq_values: 30 * 2 * 2048,
@@ -928,5 +957,46 @@ mod tests {
         });
         assert_eq!(too_many, materialised);
         assert!(too_many > opening_transient_bytes(&production(n)));
+    }
+
+    /// A successor encoded from the bound message holds more beside the
+    /// factors than the fused fold — the interleaved successor, one limb's
+    /// plane and its encoding (`17/8 · 2^n` bytes at a first fold of six)
+    /// against the output alone (`3/2 · 2^n`) — but never more than the fold's
+    /// output and the tree the first round's paths are read from
+    /// (`32·2^f + 8·2^(n−k) ≤ 40·2^f` against `88·2^f` less a node, `f` the
+    /// folded codeword's log size), so the turn is the one the fold takes, at
+    /// every first fold.
+    #[test]
+    fn an_encoded_successor_fits_the_turn_the_fold_takes() {
+        use crate::whir::{encode_successor_transient_bytes, fold_transient_bytes, tree_bytes};
+        for n in [16usize, 22, 25, 27, 28] {
+            let folded = n + 2 - 6;
+            let encode = encode_successor_transient_bytes(folded, n - 6);
+            assert_eq!(encode * 8, 17u64 << n);
+            assert_eq!(fold_transient_bytes(n + 2, 6, true) * 2, 3u64 << n);
+            for first_fold in 1..=6 {
+                for lean_rounds in [0, 3, 6] {
+                    let shape = OpeningShape {
+                        first_fold,
+                        lean_rounds,
+                        ..production(n)
+                    };
+                    let folded = n + 2 - first_fold;
+                    assert!(
+                        encode_successor_transient_bytes(folded, n - first_fold)
+                            < (24u64 << folded) + tree_bytes(folded)
+                    );
+                    assert_eq!(
+                        opening_transient_bytes(&OpeningShape {
+                            encoded: true,
+                            ..shape
+                        }),
+                        opening_transient_bytes(&shape),
+                        "2^{n}, first fold {first_fold}, {lean_rounds} lean rounds"
+                    );
+                }
+            }
+        }
     }
 }

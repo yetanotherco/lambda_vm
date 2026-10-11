@@ -1824,7 +1824,35 @@ fn encode_from(source: Source<'_>, log_blowup: usize, transient: bool) -> Result
     // SAFETY: every element is written by the copy below.
     let mut coeffs = unsafe { alloc_or_trim::<u64>(&stream, 1usize << log_evals) }?;
     source.write(&stream, &mut coeffs)?;
+    let x = encode_values(&stream, be, coeffs, log_evals, log_blowup)?;
 
+    let codeword = DeviceCodeword {
+        buffer: Arc::new(x),
+        stream,
+        elements: n,
+        base: true,
+        builds: BuildCount::default(),
+        leaf_passes: BuildCount::default(),
+        leaves: Arc::new(Mutex::new(None)),
+        room: Arc::new(room),
+        registered: Arc::new(AtomicBool::new(false)),
+    };
+    Ok(codeword)
+}
+
+/// The codeword of the multilinear whose `2^log_evals` hypercube values
+/// `values` holds, base field: the Möbius transform in place, the lift's
+/// spread, the NTT onto the `2^log_blowup`-times larger domain, in domain
+/// order — `encode(lift_coefficients(·))` on the card. `values` is spent.
+fn encode_values(
+    stream: &Arc<CudaStream>,
+    be: &crate::device::Backend,
+    mut coeffs: CudaSlice<u64>,
+    log_evals: u64,
+    log_blowup: usize,
+) -> Result<CudaSlice<u64>> {
+    let log_n = log_evals + log_blowup as u64;
+    let n = 1usize << log_n;
     mobius(
         stream.as_ref(),
         be,
@@ -1838,7 +1866,7 @@ fn encode_from(source: Source<'_>, log_blowup: usize, transient: bool) -> Result
     // the memset that zeroed it is one pass that writes all of it.
     // SAFETY: the spread writes every element, padding included (on the column
     // engine its first pass does, storing all of its tile).
-    let mut x = unsafe { alloc_or_trim::<u64>(&stream, n) }?;
+    let mut x = unsafe { alloc_or_trim::<u64>(stream, n) }?;
     let n_u64 = n as u64;
     let log_blowup_u32 = log_blowup as u32;
     if crate::lde_cm::engine_enabled()
@@ -1847,9 +1875,9 @@ fn encode_from(source: Source<'_>, log_blowup: usize, transient: bool) -> Result
         // The same spread and transform in the column engine's ceil(log_n / 8)
         // passes, the spread fused into the first one, and no twiddle table
         // (see `lde_cm`). `LAMBDA_VM_LDE_LEGACY=1` takes the branch below.
-        let src = coeffs.device_ptr(&stream).0;
-        let dst = x.device_ptr(&stream).0;
-        crate::lde_cm::spread_ntt_column(&stream, be, src, dst, log_n as u32, log_blowup_u32)?;
+        let src = coeffs.device_ptr(stream).0;
+        let dst = x.device_ptr(stream).0;
+        crate::lde_cm::spread_ntt_column(stream, be, src, dst, log_n as u32, log_blowup_u32)?;
         // Spent: the first pass has read them, and the free is stream-ordered.
         drop(coeffs);
     } else {
@@ -1867,19 +1895,104 @@ fn encode_from(source: Source<'_>, log_blowup: usize, transient: bool) -> Result
         let twiddles = be.fwd_twiddles_for(log_n)?;
         crate::ntt::run_ntt_body(stream.as_ref(), &mut x, twiddles.as_ref(), n_u64, log_n)?;
     }
+    Ok(x)
+}
 
-    let codeword = DeviceCodeword {
-        buffer: Arc::new(x),
-        stream,
-        elements: n,
-        base: true,
+/// ★ The successor [`fold_resident_fused`] would make of `codeword` over
+/// `levels` levels, encoded from the message those levels' rounds bound
+/// instead (D-SPEED lever 5a).
+///
+/// Folding the committed codeword with `α` encodes the message with its first
+/// variables fixed to `α`, on the folded domain (`multilinear`'s
+/// `every_successor_is_the_bound_message_encoded_at_the_production_shape`), so
+/// the `2^(n+blowup)`-element pass the fold reads becomes an encode of the
+/// `2^(n−levels)` message: per limb, a gather out of the interleaved message,
+/// [`encode_values`], and a scatter into the interleaved successor. The
+/// encoding is base-field linear, so the limbs are independent.
+///
+/// `message` is interleaved ext3 and its first `len` values are the bound
+/// message, read on `stream` — the stream that bound it. The successor is
+/// ordered on that stream too, and lives inside `codeword`'s room, as a fold
+/// does.
+///
+/// ★ EQUAL to the fold, not raw-identical: the same field values by another
+/// sequence of operations, so raw limbs agree wherever both are canonical —
+/// the parity the lean rounds have (`whir_lean_round`). Trees hash canonical
+/// values (or absorb field elements), so roots and the transcript agree.
+pub fn encode_successor(
+    codeword: &DeviceCodeword,
+    levels: usize,
+    stream: &Arc<CudaStream>,
+    message: &CudaSlice<u64>,
+    len: usize,
+) -> Result<DeviceCodeword> {
+    assert!(len.is_power_of_two(), "the bound message spans a cube");
+    assert!(message.len() >= len * 3, "three u64 per ext3 value");
+    assert!(
+        codeword.elements >> levels >= len
+            && codeword.elements >> levels << levels == codeword.elements,
+        "{levels} folds of {} elements do not cover a message of {len}",
+        codeword.elements
+    );
+    let n_out = codeword.elements >> levels;
+    let log_evals = len.trailing_zeros() as u64;
+    let log_blowup = (n_out / len).trailing_zeros() as usize;
+    assert_eq!(
+        len << log_blowup,
+        n_out,
+        "the successor is the message's blowup"
+    );
+
+    let be = backend()?;
+    // SAFETY: the three scatters below write every limb of every element.
+    let mut out = unsafe { alloc_or_trim::<u64>(stream, n_out * 3) }?;
+    let len_arg = len as u64;
+    let n_out_arg = n_out as u64;
+    for limb in 0..3u32 {
+        // SAFETY: the gather writes every element.
+        let mut plane = unsafe { alloc_or_trim::<u64>(stream, len) }?;
+        unsafe {
+            stream
+                .launch_builder(&be.ext3_limb_gather)
+                .arg(message)
+                .arg(&len_arg)
+                .arg(&limb)
+                .arg(&mut plane)
+                .launch(LaunchConfig::for_num_elems(len as u32))?;
+        }
+        let encoded = encode_values(stream, be, plane, log_evals, log_blowup)?;
+        unsafe {
+            stream
+                .launch_builder(&be.ext3_limb_scatter)
+                .arg(&encoded)
+                .arg(&n_out_arg)
+                .arg(&limb)
+                .arg(&mut out)
+                .launch(LaunchConfig::for_num_elems(n_out as u32))?;
+        }
+        // Spent once scattered; the free is stream-ordered.
+        drop(encoded);
+    }
+
+    Ok(DeviceCodeword {
+        buffer: Arc::new(out),
+        stream: stream.clone(),
+        elements: n_out,
+        base: false,
+        // Its own codeword, as a fold's is.
         builds: BuildCount::default(),
         leaf_passes: BuildCount::default(),
         leaves: Arc::new(Mutex::new(None)),
-        room: Arc::new(room),
+        room: codeword.room.clone(),
         registered: Arc::new(AtomicBool::new(false)),
-    };
-    Ok(codeword)
+    })
+}
+
+/// The most [`encode_successor`] holds beside its inputs for a successor of
+/// `2^log_out` elements from a message of `2^log_evals`: the interleaved
+/// successor, one limb's plane and one limb's encoding.
+pub const fn encode_successor_transient_bytes(log_out: usize, log_evals: usize) -> u64 {
+    (24u64 << log_out) + (8u64 << log_out) + (8u64 << log_evals)
 }
 
 /// Levels a tile fuses at once: 32 rows of 32 columns is a full block, and the

@@ -495,3 +495,32 @@ extern "C" __global__ void whir_lean_materialize(const uint16_t *__restrict__ co
         out_f[y * 3 + 2] = f.c;
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A chain's successor from its bound message (D-SPEED lever 5a).
+//
+// The fold of a committed codeword is the encoding of the message its rounds
+// bound, on the folded domain — so the successor can be encoded from the
+// `2^(n−k)` message instead of folded from the `2^(n+blowup)` codeword. The
+// encoding is the base field's (Möbius, the lift's spread, the NTT), and it is
+// linear over the base field, so an ext3 message is encoded one limb at a
+// time: each limb comes out of the interleaved message as a plane, is encoded
+// as a base-field codeword, and goes back into its place in the interleaved
+// successor.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// `plane[i] = values[3·i + limb]` for `i < n`.
+extern "C" __global__ void ext3_limb_gather(const uint64_t *__restrict__ values, uint64_t n,
+                                            uint32_t limb, uint64_t *__restrict__ plane) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    plane[i] = values[i * 3 + limb];
+}
+
+// `values[3·i + limb] = plane[i]` for `i < n`.
+extern "C" __global__ void ext3_limb_scatter(const uint64_t *__restrict__ plane, uint64_t n,
+                                             uint32_t limb, uint64_t *__restrict__ values) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    values[i * 3 + limb] = plane[i];
+}
