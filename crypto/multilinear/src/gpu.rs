@@ -1064,7 +1064,28 @@ where
     Some(limbs)
 }
 
-/// Rebuilds an ext3 element from its three limbs.
+/// A Goldilocks limb as the card left it, reduced to `[0, p)`.
+///
+/// ★ The card's arithmetic leaves values anywhere in `[0, 2^64)`, and a proof
+/// serializes the representative it holds: `FieldElement`'s rkyv form is the
+/// raw `u64` (`math::field::element`), unlike its hashed and absorbed bytes,
+/// which are canonical. Two kernels computing the same value by different
+/// operations — the lean rounds and the materialised session, an encoded and
+/// a folded successor — can leave different representatives, and the proof's
+/// bytes would show which one ran. Every limb read back from the card is
+/// reduced here, so they cannot.
+#[inline]
+pub(crate) fn canonical_limb(limb: u64) -> u64 {
+    use math::field::goldilocks::GOLDILOCKS_PRIME;
+    if limb >= GOLDILOCKS_PRIME {
+        limb - GOLDILOCKS_PRIME
+    } else {
+        limb
+    }
+}
+
+/// Rebuilds an ext3 element from its three limbs, canonical
+/// ([`canonical_limb`]).
 pub fn ext3_from_raw<E>(limbs: &[u64]) -> math::field::element::FieldElement<E>
 where
     E: math::field::traits::IsField + 'static,
@@ -1074,9 +1095,9 @@ where
     use math::field::goldilocks::GoldilocksField as Gl;
 
     let value = FieldElement::<Ext3>::new([
-        FieldElement::<Gl>::from_raw(limbs[0]),
-        FieldElement::<Gl>::from_raw(limbs[1]),
-        FieldElement::<Gl>::from_raw(limbs[2]),
+        FieldElement::<Gl>::from_raw(canonical_limb(limbs[0])),
+        FieldElement::<Gl>::from_raw(canonical_limb(limbs[1])),
+        FieldElement::<Gl>::from_raw(canonical_limb(limbs[2])),
     ]);
     // SAFETY: only called under a TypeId check that `E == Ext3`.
     unsafe { core::mem::transmute_copy::<FieldElement<Ext3>, FieldElement<E>>(&value) }
@@ -1890,12 +1911,16 @@ where
     let raw = unsafe {
         core::slice::from_raw_parts(codeword.as_ptr() as *const u64, codeword.len() * limbs)
     };
-    let folded = if base {
+    let mut folded = if base {
         math_cuda::whir::fold_codeword_base(raw, two_inv, &g_invs, &raw_alphas).ok()?
     } else {
         math_cuda::whir::fold_codeword_ext3(raw, two_inv, &g_invs, &raw_alphas).ok()?
     };
 
+    // Canonical, as every value read back from the card ([`canonical_limb`]).
+    for limb in folded.iter_mut() {
+        *limb = canonical_limb(*limb);
+    }
     // SAFETY: `N == Ext3`, three limbs per element and no drop glue, so the
     // allocation changes type in place instead of being copied.
     let mut folded = core::mem::ManuallyDrop::new(folded);
@@ -5718,7 +5743,7 @@ where
 }
 
 /// Limbs as field elements, one `u64` each for a base codeword and three for
-/// an extension one.
+/// an extension one, canonical ([`canonical_limb`]).
 #[cfg(feature = "cuda")]
 fn values_from_raw<F>(raw: &[u64], base: bool) -> Option<Vec<math::field::element::FieldElement<F>>>
 where
@@ -5736,7 +5761,7 @@ where
         return Some(
             raw.iter()
                 .map(|limb| {
-                    let value = FieldElement::<Gl>::from_raw(*limb);
+                    let value = FieldElement::<Gl>::from_raw(canonical_limb(*limb));
                     // SAFETY: `F == Gl`, checked above; same representation.
                     unsafe {
                         core::mem::transmute_copy::<FieldElement<Gl>, FieldElement<F>>(&value)
@@ -5845,9 +5870,45 @@ mod tests {
     use crate::program::Builder;
     use math::field::element::FieldElement;
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
-    use math::field::goldilocks::GoldilocksField as Gl;
+    use math::field::goldilocks::{GOLDILOCKS_PRIME as P, GoldilocksField as Gl};
 
     type FE = FieldElement<Ext3>;
+
+    /// ★ A value read back from the card is serialized canonically whatever
+    /// representative the card left: a limb `v + p` and the limb `v` give the
+    /// same proof bytes, and the bytes are `v`'s. Without the reduction the
+    /// rkyv bytes are the raw limb, which this checks first.
+    #[test]
+    fn a_non_canonical_limb_from_the_card_serializes_canonically() {
+        let raw = |value: &FE| {
+            rkyv::to_bytes::<rkyv::rancor::Error>(value)
+                .unwrap()
+                .to_vec()
+        };
+        let unreduced = FE::new([
+            FieldElement::<Gl>::from_raw(P + 5),
+            FieldElement::<Gl>::from_raw(P),
+            FieldElement::<Gl>::from_raw(7),
+        ]);
+        let reduced = FE::new([
+            FieldElement::<Gl>::from_raw(5),
+            FieldElement::<Gl>::from_raw(0),
+            FieldElement::<Gl>::from_raw(7),
+        ]);
+        assert_eq!(unreduced, reduced, "the same value");
+        assert_ne!(
+            raw(&unreduced),
+            raw(&reduced),
+            "rkyv writes the representative"
+        );
+
+        let read = ext3_from_raw::<Ext3>(&[P + 5, P, 7]);
+        assert_eq!(raw(&read), raw(&reduced));
+        assert_eq!((*read.value()).map(|limb| *limb.value()), [5, 0, 7]);
+        assert_eq!(canonical_limb(u64::MAX), u64::MAX - P);
+        assert_eq!(canonical_limb(P - 1), P - 1);
+        assert_eq!(canonical_limb(P), 0);
+    }
 
     /// The kernel's walk, in Rust: the same slot file, the same node encoding.
     ///
