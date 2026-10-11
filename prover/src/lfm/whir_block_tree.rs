@@ -74,9 +74,9 @@ impl WhirTreeSink for StderrSink {
 /// suite env sets that change behaviour or performance, at its values (ULTRA's
 /// and BIG's W3 env). The CLI sets each one the environment leaves unset, and
 /// the harness never does: its arms rely on unset meaning the library default.
-/// The base hash is not posture: it is the format's (`BlockFormat.zf.base`,
-/// the CLI's `--base-hash`), and `LAMBDA_VM_WHIR_HASH` is not read on the
-/// block path. The measurement-only `LAMBDA_VM_BASE_SPLIT` is not posture, and
+/// The base hash is not posture: it is the build's (`hash_pin::BLOCK_BASE`, the
+/// only base `block_whir::checked_base` admits), and `LAMBDA_VM_WHIR_HASH` is
+/// not read on the block path. The measurement-only `LAMBDA_VM_BASE_SPLIT` is not posture, and
 /// the allocator's never-purge posture is compiled into the binary.
 /// `LFM_PRECOMPUTED_TREE_CACHE_CAP`'s posture follows the host target
 /// ([`posture_tree_cache_cap`]): the table's 64 from a 64 GiB target up, 16

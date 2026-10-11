@@ -186,8 +186,10 @@ pub const BLOCK_COMMITMENT_HASH: stark::config::CommitmentHash =
 /// ★★★ Everything a block's recursion proves and verifies with, named ONCE: the
 /// LFM proofs' commitment configuration and their transcript, the tag every
 /// LFM statement names them by, the wrap hash a node's in-guest legs replay
-/// them with, the socket the tree programs' hash rows run on, and the WHIR
-/// base the leaves verify.
+/// them with, and the socket the tree programs' hash rows run on. The block's
+/// WHIR base is pinned beside the family ([`BlockWhirHash`], [`BLOCK_BASE`]),
+/// not in it: the family serves the LFM prover's two users (the block path and
+/// the legacy users off it), the base only the block path.
 ///
 /// A compile-time choice, not a run-time one: there is ONE family per build
 /// ([`BlockFamily`]), so no proof of the block path is ever made or checked
@@ -285,11 +287,26 @@ pub type BlockWhirHash = multilinear::whir_hash::P1Whir;
 pub const BLOCK_BASE: stark::proof::options::BaseFormat =
     stark::proof::options::BaseFormat::P1_WHIR;
 
-// The base and the recursion are one hash.
-const _: () = assert!(
-    BLOCK_BASE.hash as u8
-        == <<BlockFamily as ProofFamily>::Stark as stark::config::StarkHash>::COMMITMENT_HASH as u8
-);
+// The base and the recursion are one hash, and the base's configuration is the
+// base format's hash: the device key `BlockWhirHash` dispatches on names the
+// same hash as `BLOCK_BASE`.
+const _: () = {
+    assert!(
+        BLOCK_BASE.hash as u8
+            == <<BlockFamily as ProofFamily>::Stark as stark::config::StarkHash>::COMMITMENT_HASH
+                as u8
+    );
+    let device = match <BlockWhirHash as multilinear::whir_hash::WhirHash>::DEVICE {
+        multilinear::whir_hash::DeviceHashKey::Keccak256 => {
+            stark::config::CommitmentHash::Keccak256
+        }
+        multilinear::whir_hash::DeviceHashKey::Rpx256 => stark::config::CommitmentHash::Rpx256,
+        multilinear::whir_hash::DeviceHashKey::Poseidon1 => {
+            stark::config::CommitmentHash::Poseidon1
+        }
+    };
+    assert!(device as u8 == BLOCK_BASE.hash as u8);
+};
 
 /// The root of a static preprocessed table (`table`: `bitwise`, `keccak_rc`)
 /// under a commitment configuration OTHER than the legacy pin's, whose roots
