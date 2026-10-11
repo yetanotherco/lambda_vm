@@ -11,6 +11,10 @@ pub mod bitwise_tests;
 #[cfg(test)]
 #[cfg(feature = "parallel")]
 pub mod block_batched_tests;
+// The card's grouped round 0 is D-ONECHAIN's stage B3: host builds only.
+#[cfg(test)]
+#[cfg(all(feature = "parallel", not(feature = "cuda")))]
+pub mod block_onechain_tests;
 #[cfg(test)]
 #[cfg(feature = "parallel")]
 pub mod block_whir_p1_tests;
