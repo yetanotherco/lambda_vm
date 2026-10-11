@@ -12,9 +12,10 @@ pub use crypto::merkle_tree::backends::p1::{
 pub use stark::config::P1StarkHashCapped;
 
 /// The 4-ary cap height of every Poseidon1 STARK tree (trace, precomputed,
-/// aux, composition, FRI layers): C2, the WHIR base's (D-P3B §2.4), pending
-/// the node census that confirms it.
-pub const P1_STARK_CAP: u8 = 2;
+/// aux, composition, FRI layers): C1, the node census's pick (D-P3B §2.4,
+/// I-P1REC §P2.3: 6 % fewer node cells than C2), shared with #1013. A
+/// provisional pick until #1013's C1/C2/C4 timing settles `c_L` for both PRs.
+pub const P1_STARK_CAP: u8 = 1;
 
 /// ★ ZisK's Poseidon1 as a STARK commitment configuration: 4-ary trees of
 /// ZisK's tagged leaf hash, capped at 4-ary height [`P1_STARK_CAP`], ground
