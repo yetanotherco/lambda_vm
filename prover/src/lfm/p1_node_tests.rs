@@ -78,8 +78,8 @@ fn harvest(c: &P1Child) -> HarvestedChild {
 }
 
 /// One leg over the child, under `wrap`, with the child's statement tag
-/// `tag` (the family's, unless a mutation drops it).
-fn node(c: &P1Child, tag: Option<&'static [u8]>) -> LfmProgram {
+/// `tag` (the family's, unless a mutation swaps it).
+fn node(c: &P1Child, tag: &'static [u8]) -> LfmProgram {
     let derived = DerivedChild::from_artifacts_under::<P1Family>(
         &c.artifacts,
         &c.opts,
@@ -166,11 +166,15 @@ fn a_p1_node_verifies_a_p1_child_and_refuses_its_tampers() {
 }
 
 /// The family's statement tag is load-bearing in the guest: a node that
-/// replays the child's statement without it refuses the honest child.
+/// replays the child's statement under today's tag (the legacy family's)
+/// refuses the honest child.
 #[test]
 fn a_node_without_the_family_tag_refuses_the_p1_child() {
     let c = p1_child();
     let honest = harvest(&c);
     assert!(runs(&node(&c, P1Family::STATEMENT_TAG), &honest));
-    assert!(!runs(&node(&c, None), &honest));
+    assert!(!runs(
+        &node(&c, crate::hash_pin::LegacyFamily::STATEMENT_TAG),
+        &honest
+    ));
 }

@@ -99,9 +99,10 @@ pub struct ChildShape<'a> {
     /// last byte.
     pub fri_final_poly_log_degree: u8,
     /// The child's proof family's statement tag
-    /// (`hash_pin::ProofFamily::STATEMENT_TAG`), absorbed before its statement;
-    /// `None` for the legacy pin. A program constant, like the id.
-    pub statement_tag: Option<&'static [u8]>,
+    /// (`hash_pin::ProofFamily::STATEMENT_TAG`), the statement's first call:
+    /// [`LFM_STATEMENT_TAG`] for the legacy pin. A program constant, like the
+    /// id.
+    pub statement_tag: &'static [u8],
     /// The child's sub-proofs, in proof order.
     pub tables: Vec<ChildTable<'a>>,
 }
@@ -121,7 +122,7 @@ pub struct DerivedChild {
     program_id: Commitment,
     num_public_words: usize,
     fri_final_poly_log_degree: u8,
-    statement_tag: Option<&'static [u8]>,
+    statement_tag: &'static [u8],
     tables: Vec<DerivedTable>,
 }
 
@@ -308,23 +309,27 @@ pub fn emit_lfm_statement(
     words: &[HintedPublicWord],
     fri_final_poly_log_degree: u8,
 ) {
-    emit_lfm_statement_tagged(t, None, program_id, words, fri_final_poly_log_degree);
+    emit_lfm_statement_tagged(
+        t,
+        LFM_STATEMENT_TAG,
+        program_id,
+        words,
+        fri_final_poly_log_degree,
+    );
 }
 
 /// Emits [`super::statement::absorb_lfm_statement_tagged`]: the child
-/// family's tag as one call first (a PROGRAM CONSTANT; nothing for the legacy
-/// pin), then [`emit_lfm_statement`]'s calls.
+/// family's tag (a PROGRAM CONSTANT) in place of [`LFM_STATEMENT_TAG`], then
+/// [`emit_lfm_statement`]'s other calls. The legacy pin's tag is
+/// [`LFM_STATEMENT_TAG`].
 pub fn emit_lfm_statement_tagged(
     t: &mut TranscriptReplay,
-    family_tag: Option<&[u8]>,
+    tag: &[u8],
     program_id: &Commitment,
     words: &[HintedPublicWord],
     fri_final_poly_log_degree: u8,
 ) {
-    if let Some(tag) = family_tag {
-        t.append_const_bytes(tag);
-    }
-    t.append_const_bytes(LFM_STATEMENT_TAG);
+    t.append_const_bytes(tag);
     t.append_const_bytes(program_id);
     t.append_const_bytes(&LFM_MACHINE_VERSION.to_le_bytes());
     t.append_const_bytes(&(words.len() as u64).to_le_bytes());
