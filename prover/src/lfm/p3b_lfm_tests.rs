@@ -449,10 +449,18 @@ fn a_block_node_verifies_block_children_and_refuses_tampers() {
         "P3B T6: the legacy child is refused by {:?}",
         r.as_ref().err()
     );
-    assert!(r.is_err(), "a block node accepted a legacy child");
+    assert!(
+        matches!(
+            r,
+            Err(super::executor::LfmExecError::ArenaCountMismatch { .. }
+                | super::executor::LfmExecError::ArenaLenMismatch { .. })
+        ),
+        "a legacy child does not fit a block node: {:?}",
+        r.err()
+    );
 }
 
-// ============ the review's box tier: caps, cap roots, every arena ===========
+// ================ the review's tests: caps, cap roots, every arena ==========
 
 /// The block's LFM format at nine queries: few enough that most of a C2
 /// tree's sixteen cap nodes are reached by no opening, so only the
@@ -481,7 +489,6 @@ fn refused_by_a_check(
 /// bound. At nine queries most nodes are reached by no opening, so a moved one
 /// is refused only by the cap-to-root comparison (`CappedRoot::from_owner`).
 #[test]
-#[ignore = "box tier: proves a block LFM program and verifies it once per cap node"]
 fn every_cap_node_of_a_block_lfm_proof_is_bound_by_the_cap_root() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let opts = sparse_block_options();
@@ -541,7 +548,6 @@ fn every_cap_node_of_a_block_lfm_proof_is_bound_by_the_cap_root() {
 /// by its layout). Most cap nodes are reached by no opening, so the node's
 /// cap-to-root step (`CapCells::authenticate_at`) is what refuses them.
 #[test]
-#[ignore = "box tier: proves a block LFM program and executes a node once per cap word"]
 fn a_block_node_binds_every_cap_node_to_the_root() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let opts = sparse_block_options();
@@ -594,7 +600,6 @@ fn block_options_at(cap: u8) -> ProofOptions {
 /// the pin's, and with the tag dropped on both sides (`P1_LFM_TAG_OMITTED`)
 /// it is still refused there: the geometry alone (path lengths) binds the cap.
 #[test]
-#[ignore = "box tier: proves a block LFM program at three caps, with and without the tag"]
 fn a_block_lfm_proof_at_another_cap_is_refused() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let pinned = block_options();
