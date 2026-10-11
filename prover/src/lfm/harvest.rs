@@ -623,17 +623,28 @@ pub(crate) struct HarvestedChild {
     pub(crate) z_alpha: (FEE, FEE),
 }
 
-/// [`harvest_child`], after verifying the proof against its artifacts, and the
-/// seconds that verify cost: a child read from a proof production would reject
-/// describes nothing, so a refusal is an error.
+/// [`harvest_child_under`] at the legacy pin, after verifying the proof against
+/// its artifacts, and the seconds that verify cost: a child read from a proof
+/// production would reject describes nothing, so a refusal is an error.
 #[cfg(test)]
 pub(crate) fn harvest_child_verified(
     artifacts: super::registry::LfmArtifacts,
     opts: crate::ProofOptions,
     proved: &super::proof::LfmProof,
 ) -> Result<(HarvestedChild, f64), String> {
+    harvest_child_verified_under::<crate::hash_pin::LegacyFamily>(artifacts, opts, proved)
+}
+
+/// [`harvest_child_verified`] of a proof made under the family `Fam`: verified
+/// under `Fam`, then [`harvest_child_under`].
+#[cfg(test)]
+pub(crate) fn harvest_child_verified_under<Fam: crate::hash_pin::ProofFamily>(
+    artifacts: super::registry::LfmArtifacts,
+    opts: crate::ProofOptions,
+    proved: &super::proof::LfmProof,
+) -> Result<(HarvestedChild, f64), String> {
     let t_verify = std::time::Instant::now();
-    if !super::proof::verify_against_artifacts(
+    if !super::proof::verify_against_artifacts_under::<Fam>(
         &artifacts,
         &proved.proof,
         &proved.public_words,
@@ -642,22 +653,17 @@ pub(crate) fn harvest_child_verified(
         return Err("the child proof does not verify against its artifacts".to_string());
     }
     let verify_secs = t_verify.elapsed().as_secs_f64();
-    Ok((harvest_child(artifacts, opts, proved)?, verify_secs))
+    Ok((
+        harvest_child_under::<Fam>(artifacts, opts, proved)?,
+        verify_secs,
+    ))
 }
 
-/// A child proof read without its verify, for a caller that verifies the same
-/// proof elsewhere and fails the run on a refusal before it reports anything
-/// (the block tree's children, verified beside the timed path).
-pub(crate) fn harvest_child(
-    artifacts: super::registry::LfmArtifacts,
-    opts: crate::ProofOptions,
-    proved: &super::proof::LfmProof,
-) -> Result<HarvestedChild, String> {
-    harvest_child_under::<crate::hash_pin::LegacyFamily>(artifacts, opts, proved)
-}
-
-/// [`harvest_child`] of a proof made under the family `Fam`: `Fam`'s
-/// statement seed and transcript, its configuration's trees.
+/// A child proof of the family `Fam` read without its verify — `Fam`'s
+/// statement seed and transcript, its configuration's trees — for a caller
+/// that verifies the same proof elsewhere and fails the run on a refusal
+/// before it reports anything (the block tree's children, verified beside the
+/// timed path).
 pub(crate) fn harvest_child_under<Fam: crate::hash_pin::ProofFamily>(
     artifacts: super::registry::LfmArtifacts,
     opts: crate::ProofOptions,

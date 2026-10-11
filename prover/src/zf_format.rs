@@ -115,11 +115,11 @@ pub struct ZfFormat {
     pub whir_grind: WhirGrind,
     /// How many bits each of those grinds spends.
     pub whir_grind_bits: u8,
-    /// The WHIR block's base hash and its arity-4 cap ([`BaseFormat`]):
-    /// [`BaseFormat::RPX`] = today. No knob sets it: a caller that proves or
-    /// verifies Poseidon1 says so in the format it passes
-    /// ([`Self::with_base`]). The block path dispatches on it and the LFM
-    /// proofs never read it.
+    /// The WHIR block's base hash and its arity-4 cap ([`BaseFormat`]): the
+    /// block proof family's ([`crate::hash_pin::BlockFamily`]) at the
+    /// default, and the only base the block path admits
+    /// (`block_whir::checked_base`). No knob sets it. The LFM proofs never
+    /// read it: their configuration is the family's too.
     pub base: BaseFormat,
 }
 
@@ -232,7 +232,7 @@ impl ZfFormat {
         whir_stack: DEFAULT_WHIR_STACK,
         whir_grind: WhirGrind::Query,
         whir_grind_bits: PRODUCTION_WHIR_GRIND_BITS,
-        base: BaseFormat::RPX,
+        base: crate::hash_pin::BLOCK_BASE,
     };
 
     /// The legacy format: every lever off. What all eight knobs at their
@@ -247,7 +247,7 @@ impl ZfFormat {
         whir_stack: StackVars::LEGACY,
         whir_grind: WhirGrind::All,
         whir_grind_bits: LEGACY_WHIR_GRIND_BITS,
-        base: BaseFormat::RPX,
+        base: crate::hash_pin::BLOCK_BASE,
     };
 
     /// This format with `base` as the WHIR block's base hash.
@@ -266,7 +266,7 @@ impl ZfFormat {
             && self.whir_stack == StackVars::LEGACY
             && self.whir_grind == WhirGrind::All
             && self.whir_grind_bits == LEGACY_WHIR_GRIND_BITS
-            && self.base == BaseFormat::RPX
+            && self.base == crate::hash_pin::BLOCK_BASE
     }
 
     /// The grind bits the WHIR chains run at: [`WhirGrind`]'s placement with
@@ -405,9 +405,10 @@ impl ZfFormat {
             self.whir_stack.get(),
             self.whir_grind,
             self.whir_grind_bits
-        ) + &match self.base {
-            BaseFormat::RPX => String::new(),
-            base => format!(" base={:?}/c{}", base.hash, base.arity4_cap),
+        ) + &if self.base == crate::hash_pin::BLOCK_BASE {
+            String::new()
+        } else {
+            format!(" base={:?}/c{}", self.base.hash, self.base.arity4_cap)
         }
     }
 
@@ -597,7 +598,7 @@ mod tests {
                 whir_stack: StackVars::new(27).unwrap(),
                 whir_grind: WhirGrind::Query,
                 whir_grind_bits: 18,
-                base: BaseFormat::RPX,
+                base: crate::hash_pin::BLOCK_BASE,
             }
         );
         assert_eq!(
@@ -634,7 +635,19 @@ mod tests {
         assert!(f.unimplemented_levers().is_empty());
         assert!(f.proof_format().is_legacy());
         assert_eq!(f.proof_format(), ProofFormat::LEGACY);
-        assert_eq!(f.chain_format(), ChainFormat::DEFAULT);
+        // The chain format carries the block family's base cap, which only a
+        // 4-ary chain reads (inert under RPX and keccak:
+        // `whir_p1_tests::an_arity4_cap_moves_no_rpx_byte`).
+        assert_eq!(f.chain_format(), legacy_chain_format());
+    }
+
+    /// Today's chain format with the block family's base cap — the legacy
+    /// format's: every lever off.
+    fn legacy_chain_format() -> ChainFormat {
+        ChainFormat {
+            arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
+            ..ChainFormat::DEFAULT
+        }
     }
 
     /// One knob at its off spelling turns off that lever ONLY; the others keep
@@ -837,7 +850,7 @@ mod tests {
             whir_stack: StackVars::new(26).unwrap(),
             whir_grind: WhirGrind::All,
             whir_grind_bits: 18,
-            base: BaseFormat::RPX,
+            base: crate::hash_pin::BLOCK_BASE,
         };
         assert_eq!(
             f.banner(),
@@ -1150,7 +1163,7 @@ mod tests {
     fn the_production_chain_config_under_each_arm() {
         use crate::multilinear_prove::chain_config_under;
         let today = chain_config_under(&ZfFormat::LEGACY, &[(1, 25)]);
-        assert_eq!(today.format, ChainFormat::DEFAULT);
+        assert_eq!(today.format, legacy_chain_format());
         assert_eq!((today.rounds(25), today.num_queries), (7, 112));
         // The production config (no knob set) is the measured default's:
         // cap auto, first6 — six rounds at 25; Q 114 at 18 grind bits.
@@ -1392,7 +1405,7 @@ mod tests {
                 stack: StackVars::new(27).unwrap(),
                 nonces: NonceLayout::Three,
                 argue: multilinear::whir_chain::ArgueFormat::PerTable,
-                arity4_cap: CapPolicy::Off,
+                arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
             },
         };
         let opt_out = parse(&[(ENV_WHIR_GRIND, "all"), (ENV_WHIR_GRIND_BITS, "20")]).unwrap();

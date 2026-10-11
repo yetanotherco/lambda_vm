@@ -370,10 +370,6 @@ enum Commands {
         /// Print the blake3 digest of the top proof's bytes
         #[arg(long)]
         digest: bool,
-
-        /// The base proof's hash (a proof-format constant)
-        #[arg(long, value_enum, default_value_t = BaseHash::Rpx)]
-        base_hash: BaseHash,
     },
 
     /// Verify a block proof produced by `prove-block`
@@ -389,11 +385,6 @@ enum Commands {
         /// Print verification time
         #[arg(long)]
         time: bool,
-
-        /// The base hash the block was proved over (`prove-block --base-hash`);
-        /// the verifier's own constant, never read from the proof
-        #[arg(long, value_enum, default_value_t = BaseHash::Rpx)]
-        base_hash: BaseHash,
     },
 
     /// Count main-trace and aux-trace field elements without proving
@@ -406,25 +397,6 @@ enum Commands {
         #[arg(long, value_hint = ValueHint::FilePath)]
         private_input: Option<PathBuf>,
     },
-}
-
-/// A block's base hash (`--base-hash`): a proof-format constant the prover
-/// and the verifier each take from the operator, never from the proof file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum BaseHash {
-    /// RPX256, the production base
-    Rpx,
-    /// ZisK's Poseidon1 at width 16 over 4-ary trees (opt-in)
-    P1,
-}
-
-impl BaseHash {
-    fn format(self) -> stark::proof::options::BaseFormat {
-        match self {
-            Self::Rpx => stark::proof::options::BaseFormat::RPX,
-            Self::P1 => stark::proof::options::BaseFormat::P1_WHIR,
-        }
-    }
 }
 
 fn main() -> ExitCode {
@@ -512,14 +484,8 @@ fn main() -> ExitCode {
             output,
             time,
             digest,
-            base_hash,
-        } => cmd_prove_block(elf, input, output, time, digest, base_hash),
-        Commands::VerifyBlock {
-            proof,
-            elf,
-            time,
-            base_hash,
-        } => cmd_verify_block(proof, elf, time, base_hash),
+        } => cmd_prove_block(elf, input, output, time, digest),
+        Commands::VerifyBlock { proof, elf, time } => cmd_verify_block(proof, elf, time),
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
     }
 }
@@ -614,7 +580,6 @@ fn cmd_prove_block(
     output_path: PathBuf,
     time: bool,
     digest: bool,
-    base_hash: BaseHash,
 ) -> ExitCode {
     use prover::lfm::whir_block_tree::{
         StderrSink, WhirBlockTreeProof, WhirTreeConfig, prove_whir_block_tree,
@@ -634,14 +599,13 @@ fn cmd_prove_block(
             return ExitCode::FAILURE;
         }
     };
-    let mut cfg = match WhirTreeConfig::from_env() {
+    let cfg = match WhirTreeConfig::from_env() {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
-    cfg.format.zf = cfg.format.zf.with_base(base_hash.format());
     // A forced leaf count, another fan-in or another argue is another tree than
     // the one `verify-block` derives: harness arms, not a production proof.
     if !cfg.at_presets() {
@@ -698,14 +662,9 @@ fn cmd_prove_block(
     ExitCode::SUCCESS
 }
 
-fn cmd_verify_block(
-    proof_path: PathBuf,
-    elf_path: PathBuf,
-    time: bool,
-    base_hash: BaseHash,
-) -> ExitCode {
+fn cmd_verify_block(proof_path: PathBuf, elf_path: PathBuf, time: bool) -> ExitCode {
     use prover::lfm::whir_block_tree::{
-        WhirBlockTreeProof, base_line, verify_whir_block_tree_proof_based,
+        WhirBlockTreeProof, base_line, verify_whir_block_tree_proof,
     };
 
     let elf_data = match std::fs::read(&elf_path) {
@@ -730,11 +689,12 @@ fn cmd_verify_block(
         }
     };
     drop(bytes);
-    let base = base_hash.format();
-    eprintln!("{}", base_line(&base));
+    // The block's base is its proof family's: the verifier's constant, never
+    // read from the file.
+    eprintln!("{}", base_line(&prover::hash_pin::BLOCK_BASE));
     eprintln!("Verifying block proof...");
     let start = Instant::now();
-    let result = verify_whir_block_tree_proof_based(&elf_data, &base, &proof);
+    let result = verify_whir_block_tree_proof(&elf_data, &proof);
     let verify_elapsed = start.elapsed();
     match result {
         Ok(()) => {
@@ -1744,37 +1704,24 @@ mod tests {
         );
     }
 
-    /// `--base-hash` takes `rpx` (the default) or `p1` on both block commands,
-    /// and maps onto the format's bases; nothing else parses.
+    /// The block commands take no base hash: the block's base is its proof
+    /// family's, a constant of the build, so `--base-hash` is refused on both.
     #[test]
-    fn the_block_commands_take_a_base_hash() {
-        let base = |args: &[&str]| match Cli::try_parse_from(args).map(|c| c.command) {
-            Ok(
-                Commands::ProveBlock { base_hash, .. } | Commands::VerifyBlock { base_hash, .. },
-            ) => Some(base_hash),
-            _ => None,
-        };
+    fn the_block_commands_take_no_base_hash() {
+        let ok = |args: &[&str]| Cli::try_parse_from(args).is_ok();
         let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
         let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
         for cmd in [&prove[..], &verify[..]] {
-            assert_eq!(base(cmd), Some(BaseHash::Rpx), "RPX by default");
-            for (word, want) in [("rpx", BaseHash::Rpx), ("p1", BaseHash::P1)] {
+            assert!(ok(cmd));
+            for word in ["rpx", "p1"] {
                 let args = [cmd, &["--base-hash", word]].concat();
-                assert_eq!(base(&args), Some(want), "{word}");
-            }
-            for bad in ["keccak", "poseidon1", "P1W"] {
-                let args = [cmd, &["--base-hash", bad]].concat();
-                assert_eq!(base(&args), None, "{bad} is not a base");
+                assert!(!ok(&args), "--base-hash {word} is refused");
             }
         }
         assert_eq!(
-            BaseHash::Rpx.format(),
             prover::block_whir::BlockFormat::production().zf.base,
-            "the default is the production base"
-        );
-        assert_eq!(
-            BaseHash::P1.format(),
-            stark::proof::options::BaseFormat::P1_WHIR
+            stark::proof::options::BaseFormat::P1_WHIR,
+            "the production base is the family's"
         );
     }
 
