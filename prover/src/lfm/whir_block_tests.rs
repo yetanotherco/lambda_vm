@@ -6,6 +6,7 @@
 use crate::block_whir::{
     self, BlockFormat, BlockOptions, BlockWhirProof, prove_block_whir, verify_block_whir,
 };
+use crate::hash_pin::{BlockFamily, ProofFamily};
 use crate::tables::MaxRowsConfig;
 use crate::tables::types::{FE, FEE};
 use crate::test_utils::E as FEE_FIELD;
@@ -21,12 +22,12 @@ use super::builder::LfmBuilder;
 use super::compiler::{LfmProgram, compile};
 use super::executor::execute;
 use super::per_table_aggregator::{DerivedChild, LegCells, hint_public_words, publics_arena};
-use super::per_table_aggregator_tests::{RealChild, child_arena_words, real_child_timed};
-use super::proof::{LfmProof, aggregation_wrap_options, lfm_prove};
+use super::per_table_aggregator_tests::{RealChild, child_arena_words};
+use super::proof::{LfmProof, aggregation_wrap_options, lfm_prove_under};
 use super::whir_block::{
-    BLOCK_FAN_IN, BlockPartition, LEAF_PERMS_CAP, LeafChecks, WhirBlockPlan, artifacts_of,
-    block_leaf_arena, emit_share, group_arena_words, id_words, leaf_arena, leaf_partition,
-    leaf_program_with, out_halves, partition_groups, verify_block_tree_under,
+    BLOCK_FAN_IN, BlockPartition, LeafChecks, WhirBlockPlan, artifacts_of, block_leaf_arena,
+    emit_share, group_arena_words, id_words, leaf_arena, leaf_partition, leaf_program_with,
+    out_halves, partition_groups, verify_block_tree_under,
 };
 use super::whir_block_tree::{
     FailEmpty, FailUnpublished, GroupMsg, ProgramSlot, Published, TreeAt, TreeBudget, build_levels,
@@ -307,10 +308,12 @@ fn the_leaf_partition_keeps_every_leaf_under_the_cap() {
             .num_leaves(),
         1
     );
+    // A cost partition over one block's group costs, at the retired RPX leaf
+    // cap of 279 k permutations (the function serves a fixed leaf count now).
     let block = [
         65825, 64356, 64405, 64474, 66559, 65146, 81574, 68482, 105991,
     ];
-    let p = leaf_partition(&block, None, LEAF_PERMS_CAP).expect("partitions");
+    let p = leaf_partition(&block, None, 279_000).expect("partitions");
     assert_eq!(p.leaves(), partition_groups(&block, 3).leaves());
     assert_eq!(p.leaves(), &[vec![1, 5, 8], vec![0, 2, 6], vec![3, 4, 7]]);
 }
@@ -326,9 +329,10 @@ fn the_group_partition_refuses_a_gap_an_overlap_and_an_empty_leaf() {
 
 // ================================ the leaves ==============================
 
-/// ★ Every leaf executes over an honest block proof, all of them publish the
-/// same id, state and output — the plan's — and their shares cancel: the
-/// block's bus, checked once over every table, closes across the leaves.
+/// ★ Every leaf executes over an honest block proof — on the width-16 socket,
+/// with no twelve-felt hash row — all of them publish the same id, state and
+/// output — the plan's — and their shares cancel: the block's bus, checked
+/// once over every table, closes across the leaves.
 #[test]
 #[ignore = "executes block leaves over small block proofs; box tier"]
 fn whir_block_leaves_execute_and_close_the_bus() {
@@ -349,6 +353,10 @@ fn whir_block_leaves_execute_and_close_the_bus() {
             plan.partition().leaves(),
             plan.prepared().len()
         );
+        for k in 0..plan.partition().num_leaves() {
+            let program = plan.leaf_program(k).expect("the leaf emits");
+            assert!(program.hash16(), "leaf {k} proves on the socket");
+        }
         let words = leaves_words(&plan, &proof);
         let id = id_words(plan.id());
         let out: Vec<LfmWord> = out_halves(&proof.public_output)
@@ -372,111 +380,6 @@ fn whir_block_leaves_execute_and_close_the_bus() {
         }
         assert_eq!(sum, FEE::zero(), "{name}: the leaves' shares cancel");
     }
-}
-
-/// The leaves' front draws the host verifier's challenges: `z, α, β` after the
-/// statement and every root (the groups' and the derived prepared ones), and a
-/// group fork's first draw after the group's index.
-#[test]
-#[ignore = "executes a block leaf's front over a small block proof; box tier"]
-fn the_block_front_draws_the_hosts_challenges() {
-    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-    use crypto::fiat_shamir::is_transcript::IsTranscript;
-    let format = small_format();
-    let (elf, proof) = small_block("test_commit_4", &format);
-    let plan = plan_of(&elf, &proof, &format, Some(1));
-    let g = plan.num_groups() - 1;
-    let program = super::whir_block::front_program(&plan, g);
-    let arena: Vec<LfmWord> = proof
-        .proof
-        .roots
-        .iter()
-        .map(super::algebraic_commit::commitment_to_digest)
-        .collect();
-    let words: Vec<LfmWord> = execute(&program, &[arena], &crate::hash_pin::BLOCK_HASHER)
-        .expect("the front executes")
-        .public_words
-        .iter()
-        .map(|(_, w)| *w)
-        .collect();
-    let opts = ProofOptions::default_test_options();
-    let frame = block_whir::block_frame(proof.statement(), &elf, &opts, &format).expect("frame");
-    let derived: Vec<multilinear::whir_commit::Commitment> = plan
-        .prepared()
-        .iter()
-        .flat_map(|p| p.roots.iter().copied())
-        .collect();
-    // RPX: the base `small_format` names, whatever the process's knob.
-    let host: Vec<FEE> = {
-        type H = multilinear::whir_hash::RpxWhir;
-        type T = DefaultTranscript<FEE_FIELD, <H as multilinear::whir_hash::WhirHash>::Transcript>;
-        let mut t = T::new(&[]);
-        block_whir::absorb_block(
-            &mut t,
-            crate::statement::MULTILINEAR_BLOCK_TAG,
-            &elf,
-            &proof.public_output,
-            &proof.table_counts,
-            proof.num_private_input_pages,
-            &proof.runtime_page_ranges,
-            &proof.table_num_vars,
-            &frame.config,
-            &proof.groups,
-        );
-        stark::multilinear_table::absorb_roots::<FEE_FIELD, _>(
-            &mut t,
-            &proof.proof.roots,
-            &derived,
-        );
-        let mut drawn: Vec<FEE> = (0..3).map(|_| t.sample_field_element()).collect();
-        let mut fork = t.clone();
-        fork.append_bytes(&(g as u64).to_le_bytes());
-        drawn.push(fork.sample_field_element());
-        drawn
-    };
-    let machine: Vec<FEE> = words.iter().map(ext_of).collect();
-    assert_eq!(machine, host, "z, α, β and the fork's first draw");
-}
-
-/// ★ A leaf refuses a tampered witness — a group root, a table's argument, a
-/// prepared opening — and the prepared opening is the check refusing the last:
-/// with it left out, the tampered opening executes.
-#[test]
-#[ignore = "executes block leaves over small block proofs; box tier"]
-fn a_block_leaf_refuses_a_tampered_witness() {
-    let format = small_format();
-    let (elf, proof) = small_block("test_commit_4", &format);
-    let plan = plan_of(&elf, &proof, &format, Some(1));
-    run_leaf(&plan, &proof, 0, LeafChecks::ALL).expect("the honest leaf executes");
-
-    let mut root = proof.clone();
-    root.proof.roots[0][0] ^= 1;
-    assert!(
-        run_leaf(&plan, &root, 0, LeafChecks::ALL).is_err(),
-        "a tampered group root"
-    );
-
-    let mut table = proof.clone();
-    table.proof.tables[0].bus_output.0 += FEE::one();
-    assert!(
-        run_leaf(&plan, &table, 0, LeafChecks::ALL).is_err(),
-        "a tampered table argument"
-    );
-
-    let mut prepared = proof.clone();
-    prepared.prepared[0].polys[0].final_value += FEE::one();
-    assert!(
-        run_leaf(&plan, &prepared, 0, LeafChecks::ALL).is_err(),
-        "a tampered prepared opening"
-    );
-    let without = LeafChecks {
-        prepared: false,
-        ..LeafChecks::ALL
-    };
-    assert!(
-        run_leaf(&plan, &prepared, 0, without).is_ok(),
-        "with the prepared openings left out the tamper executes, so they are what refuses it"
-    );
 }
 
 /// ★ W1: the leaf's bus share ([`emit_share`]). Under the inverse form (the
@@ -596,7 +499,7 @@ fn dense_block_with(
 /// - executing only with those roots trusted AND the openings left out — the
 ///   two together bind the prepared columns to the program.
 #[test]
-#[ignore = "proves the dense fixture under RPX and executes its leaf; box tier"]
+#[ignore = "proves the dense fixture and executes its leaf; box tier"]
 fn a_block_leaf_refuses_wrong_prepared_openings() {
     use block_whir::{Deviations, StackTamper};
     let format = dense_format();
@@ -831,12 +734,13 @@ fn prove_tree_program(
     let t = std::time::Instant::now();
     let artifacts = artifacts_of(program, &opts);
     let t_artifacts = t.elapsed().as_secs_f64();
-    let derived = DerivedChild::from_artifacts(&artifacts, &opts, words)?;
+    let derived = super::whir_block::derived_of(&artifacts, &opts, words)?;
     let t = std::time::Instant::now();
-    let proof =
-        lfm_prove(program, &artifacts, arenas, &opts).map_err(|e| format!("{label}: {e:?}"))?;
+    let proof = lfm_prove_under::<BlockFamily>(program, &artifacts, arenas, &opts)
+        .map_err(|e| format!("{label}: {e:?}"))?;
     let t_prove = t.elapsed().as_secs_f64();
-    let (child, verify) = real_child_timed(artifacts, opts, &proof);
+    let (child, verify) =
+        super::harvest::harvest_child_verified_under::<BlockFamily>(artifacts, opts, &proof)?;
     println!(
         "   {label} TIMING: {} instructions · build_artifacts {t_artifacts:.2}s · prove {t_prove:.2}s · harvest verify {verify:.2}s",
         program.instrs.len()
@@ -920,50 +824,6 @@ fn compose(
     }
     let [top] = <[Proved; 1]>::try_from(level).map_err(|l| format!("{} tops", l.len()))?;
     Ok((top.proof, walls))
-}
-
-/// ★ G3 through the plan: test_commit_4's heaviest group costs ≈ 220 k
-/// permutations; under a 200 k leaf cap the plan refuses the statement (no
-/// leaf can hold that group), under the production cap it derives today's
-/// partition.
-#[test]
-#[ignore = "proves a small block; box tier"]
-fn a_group_over_the_leaf_cap_is_refused() {
-    let format = small_format();
-    let (elf, proof) = small_block("test_commit_4", &format);
-    let opts = ProofOptions::default_test_options();
-    let derive = |cap: usize| {
-        WhirBlockPlan::derive_capped(
-            &elf,
-            &opts,
-            &format,
-            proof.statement(),
-            None,
-            BLOCK_FAN_IN,
-            None,
-            cap,
-        )
-    };
-    let plan = derive(LEAF_PERMS_CAP).expect("the production cap derives the plan");
-    let heaviest = *plan.costs().iter().max().expect("a group");
-    assert!(
-        heaviest > 200_000 && heaviest <= LEAF_PERMS_CAP,
-        "{heaviest}"
-    );
-    assert_eq!(
-        plan.partition().leaves(),
-        plan_of(&elf, &proof, &format, None).partition().leaves()
-    );
-    let refused = derive(heaviest - 1);
-    let msg = refused.as_ref().err().cloned().unwrap_or_default();
-    assert!(
-        msg.contains("costs") && msg.contains(&format!("at most {}", heaviest - 1)),
-        "a group over the leaf cap must be refused, got {msg:?}"
-    );
-    println!(
-        "WHIR BLOCK LEAF CAP: heaviest group {heaviest}; under a cap of {}: {msg}",
-        heaviest - 1
-    );
 }
 
 /// ★ ECDAS cut through the block's recursion: test_ecsm_multi with ECDAS in
@@ -1204,7 +1064,12 @@ fn the_lean_derive_still_refuses_a_tampered_leaf_and_node() {
     for window in [Some(1), Some(8), None] {
         let honest = plan.derive_top_in(&wrap, window).expect("the honest top");
         assert!(
-            super::proof::verify_against_artifacts(&honest, &top.proof, &top.public_words, &wrap),
+            super::proof::verify_against_artifacts_under::<BlockFamily>(
+                &honest,
+                &top.proof,
+                &top.public_words,
+                &wrap
+            ),
             "window {window:?}: the honest top verifies"
         );
         let other = bad
@@ -1212,7 +1077,12 @@ fn the_lean_derive_still_refuses_a_tampered_leaf_and_node() {
             .expect("the tampered plan's top");
         assert_ne!(other.program_id, honest.program_id, "window {window:?}");
         assert!(
-            !super::proof::verify_against_artifacts(&other, &top.proof, &top.public_words, &wrap),
+            !super::proof::verify_against_artifacts_under::<BlockFamily>(
+                &other,
+                &top.proof,
+                &top.public_words,
+                &wrap
+            ),
             "window {window:?}: the honest top does not verify against a tampered leaf's tree"
         );
     }
@@ -1284,6 +1154,30 @@ fn the_whir_block_tree_proves_to_the_derived_top() {
         &top,
     )
     .expect("the block's verifier accepts the honest top");
+    // The block's base is its proof family's: under RPX's the verifier refuses
+    // the honest top, and no RPX plan derives at all.
+    let rpx = BlockFormat {
+        zf: format.zf.with_base(stark::proof::options::BaseFormat::RPX),
+        ..format
+    };
+    assert!(
+        verify_block_tree_under(
+            &elf,
+            &opts,
+            &rpx,
+            proof.statement(),
+            Some(2),
+            BLOCK_FAN_IN,
+            &wrap,
+            &top,
+        )
+        .is_err(),
+        "the top under an RPX base"
+    );
+    assert!(
+        WhirBlockPlan::derive(&elf, &opts, &rpx, proof.statement(), Some(2)).is_err(),
+        "no plan under an RPX base"
+    );
 
     // The prover's roots shortcut only the prover's side. A plan built from
     // tampered ones holds other leaf programs, so another top; its leaves
@@ -1348,7 +1242,12 @@ fn the_whir_block_tree_proves_to_the_derived_top() {
     );
     let own = swapped.derive_top(&wrap).expect("its own top derives");
     assert!(
-        super::proof::verify_against_artifacts(&own, &other.proof, &other.public_words, &wrap),
+        super::proof::verify_against_artifacts_under::<BlockFamily>(
+            &own,
+            &other.proof,
+            &other.public_words,
+            &wrap
+        ),
         "against its own top it verifies: the derived program's identity is what refuses it"
     );
 
@@ -1378,7 +1277,7 @@ fn the_whir_block_tree_proves_to_the_derived_top() {
         .flat_map(|l| child_arena_words(&l.child))
         .collect();
     let node = |checks: BlockBindings| -> LfmProgram {
-        let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+        let mut b = LfmBuilder::new().with_wrap_hash(<BlockFamily as ProofFamily>::WRAP);
         emit_block_node_with(
             &mut b,
             &BlockNodeInputs {
@@ -2534,8 +2433,9 @@ fn a_failed_program_fails_every_program_above_it_without_a_hang() {
     }
 }
 
-/// ★ W3's readout on a real block (box only, `--ignored`, `--features cuda`,
-/// `LAMBDA_VM_WHIR_HASH=rpx`), through the one driver the CLI's `prove-block`
+/// ★ W3's readout on a real block (box only, `--ignored`, `--features cuda`;
+/// the block path reads no WHIR hash knob), through the one driver the CLI's
+/// `prove-block`
 /// runs too ([`super::whir_block_tree::prove_whir_block_tree`]), run the way a
 /// prover would:
 /// - the block proved in one proof at the production format;
@@ -2558,17 +2458,17 @@ fn the_whir_block_tree_on_a_real_block() {
         .expect("read the ELF");
     let input = std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT"))
         .expect("read the input");
-    let mut cfg = WhirTreeConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
-    // `BLOCK_WHIR_BASE=p1|p1w|rpx` (production rpx): the block's base hash, a
-    // test word this harness maps into the format (`p1w` as long as `rpx`, for
-    // A/B arms of equal environment bytes); the library reads no environment
-    // for it.
-    let base = match std::env::var("BLOCK_WHIR_BASE").as_deref().map(str::trim) {
-        Ok("p1" | "p1w") => stark::proof::options::BaseFormat::P1_WHIR,
-        Ok("rpx") | Err(_) => stark::proof::options::BaseFormat::RPX,
-        Ok(other) => panic!("BLOCK_WHIR_BASE={other}: rpx, p1 or p1w"),
-    };
-    cfg.format.zf = cfg.format.zf.with_base(base);
+    let cfg = WhirTreeConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
+    // The block's base is its proof family's (D-P3B P3). `BLOCK_WHIR_BASE`
+    // was this harness's word for it: `p1`/`p1w` are still accepted and
+    // change nothing (an A/B against an older binary keeps equal environment
+    // bytes); any other value — `rpx` — is refused rather than ignored.
+    if let Ok(word) = std::env::var("BLOCK_WHIR_BASE") {
+        assert!(
+            matches!(word.trim(), "p1" | "p1w"),
+            "BLOCK_WHIR_BASE={word}: the block's base is its proof family's (p1)"
+        );
+    }
     println!("W3 BASE HASH: {:?}", cfg.format.zf.base.hash);
     let run =
         prove_whir_block_tree(&elf, &input, &cfg, &StdoutSink).unwrap_or_else(|e| panic!("{e}"));
@@ -2708,7 +2608,12 @@ fn the_whir_block_tree_on_a_real_block() {
     let t = std::time::Instant::now();
     for (i, (artifacts, lfm)) in proofs.iter().enumerate() {
         assert!(
-            super::proof::verify_against_artifacts(artifacts, &lfm.proof, &lfm.public_words, &wrap),
+            super::proof::verify_against_artifacts_under::<BlockFamily>(
+                artifacts,
+                &lfm.proof,
+                &lfm.public_words,
+                &wrap
+            ),
             "tree proof {i} verifies against its own program"
         );
     }
@@ -2723,23 +2628,21 @@ fn the_whir_block_tree_on_a_real_block() {
     let t = std::time::Instant::now();
     // The production verifier when the run is at its presets; the fixture form
     // only when a knob moved the tree off them.
-    let verdict = if leaves.is_none()
-        && fan_in == BLOCK_FAN_IN
-        && argue == BlockFormat::production().argue
-    {
-        super::whir_block::verify_block_tree_based(&elf, &format.zf.base, proof.statement(), top)
-    } else {
-        verify_block_tree_under(
-            &elf,
-            &opts,
-            &format,
-            proof.statement(),
-            leaves,
-            fan_in,
-            &wrap,
-            top,
-        )
-    };
+    let verdict =
+        if leaves.is_none() && fan_in == BLOCK_FAN_IN && argue == BlockFormat::production().argue {
+            super::whir_block::verify_block_tree(&elf, proof.statement(), top)
+        } else {
+            verify_block_tree_under(
+                &elf,
+                &opts,
+                &format,
+                proof.statement(),
+                leaves,
+                fan_in,
+                &wrap,
+                top,
+            )
+        };
     println!(
         "W3 TREE VERIFY: {} in {:.2}s (derives every program and its artifacts)",
         if verdict.is_ok() {
@@ -2750,44 +2653,6 @@ fn the_whir_block_tree_on_a_real_block() {
         t.elapsed().as_secs_f64()
     );
     verdict.expect("the block's verifier accepts the top");
-
-    // Off the clock, on an RPX run: the Poseidon1 plan over the same statement
-    // (its groups do not depend on the base), so a P1 arm's leaf count is
-    // registered before the A/B that reads it.
-    if format.zf.base == stark::proof::options::BaseFormat::RPX {
-        let p1 = BlockFormat {
-            zf: format
-                .zf
-                .with_base(stark::proof::options::BaseFormat::P1_WHIR),
-            ..format
-        };
-        let plan =
-            super::whir_block::WhirBlockPlan::derive(&elf, &opts, &p1, proof.statement(), leaves)
-                .expect("the P1 plan derives over the statement");
-        let (loads, front) = plan.chip_loads();
-        let leaf_max = |f: fn(&super::whir_chain::ChipRows) -> usize| {
-            plan.partition()
-                .leaves()
-                .iter()
-                .map(|l| f(&front) + l.iter().map(|&g| f(&loads[g])).sum::<usize>())
-                .max()
-                .unwrap_or(0)
-        };
-        println!(
-            "W3 P1 PLAN: {} groups · {} leaves · {} prepared · leaf max socket {} · Select {} · base ALU {} · words {} · ext ALU {} · lanes {} · bit-dec {} · const {}",
-            plan.num_groups(),
-            plan.partition().num_leaves(),
-            plan.prepared().len(),
-            leaf_max(|r| r.hash),
-            leaf_max(|r| r.select),
-            leaf_max(|r| r.balu),
-            leaf_max(|r| r.hint),
-            leaf_max(|r| r.xalu),
-            leaf_max(|r| r.lanes),
-            leaf_max(|r| r.bitdec),
-            leaf_max(|r| r.consts),
-        );
-    }
 }
 
 // ========================= the batched argue (N-4) ========================
@@ -3029,18 +2894,6 @@ fn grind_bits_group_cost_census() {
 
 // ======================== the Poseidon1 base (S5) =========================
 
-/// [`small_format`] over a Poseidon1 base (`BaseFormat::P1_WHIR`: 4-ary trees
-/// capped at height 2, ZisK's sponge, the width-8 grind).
-fn p1_format() -> BlockFormat {
-    let small = small_format();
-    BlockFormat {
-        zf: small
-            .zf
-            .with_base(stark::proof::options::BaseFormat::P1_WHIR),
-        ..small
-    }
-}
-
 /// ★ The Poseidon1 leaves' front draws the host verifier's challenges:
 /// `P1Transcript` over the statement (call by call), every root, `z, α, β`,
 /// and a group fork's first draw.
@@ -3049,7 +2902,7 @@ fn p1_format() -> BlockFormat {
 fn the_p1_block_front_draws_the_hosts_challenges() {
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     use crypto::fiat_shamir::p1_transcript::P1Transcript;
-    let format = p1_format();
+    let format = small_format();
     let (elf, proof) = small_block("test_commit_4", &format);
     let plan = plan_of(&elf, &proof, &format, Some(1));
     assert_eq!(plan.wrap_hash(), super::edsl::WrapHash::Poseidon1);
@@ -3101,38 +2954,6 @@ fn the_p1_block_front_draws_the_hosts_challenges() {
     assert_eq!(machine, host, "z, α, β and the fork's first draw");
 }
 
-/// ★ Poseidon1 leaves execute over a small Poseidon1 block proof — on the
-/// width-16 socket, with no twelve-felt hash row — publish one state, and
-/// their bus shares cancel.
-#[test]
-#[ignore = "executes block leaves over small block proofs; box tier"]
-fn p1_block_leaves_execute_and_close_the_bus() {
-    let format = p1_format();
-    for (name, leaves) in [("test_commit_4", Some(2)), ("all_instructions_64", Some(3))] {
-        let (elf, proof) = small_block(name, &format);
-        let plan = plan_of(&elf, &proof, &format, leaves);
-        let layout = plan.child_layout();
-        println!(
-            "P1 WHIR BLOCK LEAVES {name}: {} groups, costs {:?} (socket rows), partition {:?}",
-            plan.num_groups(),
-            plan.costs(),
-            plan.partition().leaves(),
-        );
-        for k in 0..plan.partition().num_leaves() {
-            let program = plan.leaf_program(k).expect("the leaf emits");
-            assert!(program.hash16(), "leaf {k} proves on the socket");
-        }
-        let words = leaves_words(&plan, &proof);
-        let mut sum = FEE::zero();
-        for w in &words {
-            assert_eq!(w.len(), layout.total());
-            assert_eq!(w[layout.state(0)], words[0][layout.state(0)]);
-            sum += ext_of(&w[layout.sum()]);
-        }
-        assert_eq!(sum, FEE::zero(), "{name}: the leaves' shares cancel");
-    }
-}
-
 /// ★ A Poseidon1 leaf refuses a tampered witness: a group root, a table's
 /// argument, a Merkle sibling and a grind nonce of a group opening, and a
 /// prepared opening (the prepared check is the one refusing it).
@@ -3140,7 +2961,7 @@ fn p1_block_leaves_execute_and_close_the_bus() {
 #[ignore = "executes block leaves over small block proofs; box tier"]
 fn a_p1_block_leaf_refuses_a_tampered_witness() {
     use multilinear::whir_chain::RoundOpenings;
-    let format = p1_format();
+    let format = small_format();
     let (elf, proof) = small_block("test_commit_4", &format);
     let plan = plan_of(&elf, &proof, &format, Some(1));
     run_leaf(&plan, &proof, 0, LeafChecks::ALL).expect("the honest leaf executes");
@@ -3189,62 +3010,5 @@ fn a_p1_block_leaf_refuses_a_tampered_witness() {
     assert!(
         run_leaf(&plan, &prepared, 0, without).is_ok(),
         "with the prepared openings left out the tamper executes"
-    );
-}
-
-/// ★ The Poseidon1 tree proves to the top its plan derives (leaves on the
-/// socket, nodes on RPX); the block's verifier accepts it under the Poseidon1
-/// base and refuses it under RPX's; and no leaf program of the Poseidon1 tree
-/// is one of the RPX tree's over the same statement.
-#[test]
-#[ignore = "proves block leaves and nodes over a small block; box tier"]
-fn the_p1_whir_block_tree_proves_to_the_derived_top() {
-    super::device_permit::arm(1);
-    let format = p1_format();
-    let (elf, proof) = small_block("test_commit_4", &format);
-    let opts = ProofOptions::default_test_options();
-    let wrap = aggregation_wrap_options();
-    let plan = plan_of(&elf, &proof, &format, Some(2));
-    let (top, _) = compose(&plan, &proof, "P1 TREE").expect("the honest tree proves");
-    verify_block_tree_under(
-        &elf,
-        &opts,
-        &format,
-        proof.statement(),
-        Some(2),
-        BLOCK_FAN_IN,
-        &wrap,
-        &top,
-    )
-    .expect("the block's verifier accepts the honest top under the Poseidon1 base");
-    assert!(
-        verify_block_tree_under(
-            &elf,
-            &opts,
-            &small_format(),
-            proof.statement(),
-            Some(2),
-            BLOCK_FAN_IN,
-            &wrap,
-            &top,
-        )
-        .is_err(),
-        "the Poseidon1 top under the RPX base"
-    );
-    let rpx = plan_of(&elf, &proof, &small_format(), Some(2));
-    let ids = |plan: &WhirBlockPlan| -> Vec<[u8; 32]> {
-        (0..plan.partition().num_leaves())
-            .map(|k| artifacts_of(&plan.leaf_program(k).expect("a leaf"), &wrap).program_id)
-            .collect()
-    };
-    let (p1_ids, rpx_ids) = (ids(&plan), ids(&rpx));
-    assert!(
-        p1_ids.iter().all(|id| !rpx_ids.contains(id)),
-        "no leaf id is shared across the bases"
-    );
-    println!(
-        "P1 TREE TOP: {} public words; leaves {:?}",
-        top.public_words.len(),
-        plan.partition().leaves()
     );
 }

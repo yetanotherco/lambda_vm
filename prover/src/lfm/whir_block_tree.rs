@@ -25,7 +25,7 @@ use multilinear::whir_chain::ArgueFormat;
 use crate::block_whir::{self, BlockFormat, BlockOptions, BlockWhirProof};
 
 use super::compiler::LfmProgram;
-use super::harvest::{HarvestedChild, harvest_child, try_child_arena_words};
+use super::harvest::{HarvestedChild, harvest_child_under, try_child_arena_words};
 use super::per_table_aggregator::DerivedChild;
 use super::proof::{
     LfmFilled, LfmProof, aggregation_wrap_options, decide_lfm_residency, lfm_execute_and_fill,
@@ -35,6 +35,7 @@ use super::whir_block::{
     BLOCK_FAN_IN, WhirBlockPlan, artifacts_of, block_leaf_arena, group_arena_words, leaf_arena,
 };
 use super::word::LfmWord;
+use crate::hash_pin::{BlockFamily, ProofFamily};
 
 // ================================ the sink ================================
 
@@ -920,7 +921,7 @@ pub(crate) fn build_nodes(
         |_, _, (program, emitted): (std::sync::Arc<Admitted>, f64)| -> Result<TreeNode, String> {
             let t = std::time::Instant::now();
             let artifacts = artifacts_of(&program.program, wrap);
-            let derived = DerivedChild::from_artifacts(&artifacts, wrap, words)?;
+            let derived = super::whir_block::derived_of(&artifacts, wrap, words)?;
             Ok(TreeNode {
                 artifacts,
                 derived,
@@ -1288,7 +1289,7 @@ pub(crate) fn prove_tree_pipelined(
                         let t = std::time::Instant::now();
                         let artifacts = artifacts_of(&program.program, &wrap);
                         drop(program);
-                        let derived = DerivedChild::from_artifacts(&artifacts, &wrap, words)?;
+                        let derived = super::whir_block::derived_of(&artifacts, &wrap, words)?;
                         *leaf_built_at[k]
                             .lock()
                             .map_err(|_| "a built-at stamp is poisoned")? =
@@ -1341,13 +1342,14 @@ pub(crate) fn prove_tree_pipelined(
                             lfm_execute_and_fill(
                                 &program.program,
                                 &arenas,
-                                program.program.hasher(crate::hash_pin::BLOCK_HASHER),
+                                program.program.hasher(<BlockFamily as ProofFamily>::SOCKET),
                             )
                             .map_err(|e| format!("leaf {k}: {e:?}"))?
                         }
                     };
                     let artifacts = &built[k].wait()?.0;
-                    let lfm = filled.prove(artifacts, &wrap, decide_lfm_residency());
+                    let lfm =
+                        filled.prove_under::<BlockFamily>(artifacts, &wrap, decide_lfm_residency());
                     // Proved, so its artifacts are built: nothing reads
                     // the program again.
                     program.release();
@@ -1360,7 +1362,8 @@ pub(crate) fn prove_tree_pipelined(
                         end: t_tree.elapsed().as_secs_f64(),
                         split: prove_split_now(),
                     };
-                    let child = harvest_child(artifacts.clone(), wrap.clone(), &lfm)?;
+                    let child =
+                        harvest_child_under::<BlockFamily>(artifacts.clone(), wrap.clone(), &lfm)?;
                     return Ok(ProvedProgram {
                         lfm,
                         child,
@@ -1378,10 +1381,9 @@ pub(crate) fn prove_tree_pipelined(
                 }
                 // Execute and fill from the program as soon as it is
                 // emitted, prove once the node's own artifacts are built
-                // ([`node_flow`]); traces filled under the block hasher,
-                // which the node's artifacts are built for (the prove
-                // asserts it).
-                let hasher = crate::hash_pin::BLOCK_HASHER;
+                // ([`node_flow`]); traces filled under the socket its hash
+                // rows run on, which the node's artifacts are built for (the
+                // prove asserts it).
                 node_flow(
                     &programs,
                     &slots,
@@ -1394,6 +1396,7 @@ pub(crate) fn prove_tree_pipelined(
                         // own reference) reads it again.
                         emitted.program.claim();
                         let program = emitted.program.get()?;
+                        let hasher = program.program.hasher(<BlockFamily as ProofFamily>::SOCKET);
                         // The top streams only if a child is still unproved
                         // now that it can execute; the choice is kept for
                         // the readout.
@@ -1423,7 +1426,11 @@ pub(crate) fn prove_tree_pipelined(
                     },
                     |(filled, t, program_at), node: &TreeNode| {
                         let lfm = filled
-                            .prove(&node.artifacts, &wrap, decide_lfm_residency())
+                            .prove_under::<BlockFamily>(
+                                &node.artifacts,
+                                &wrap,
+                                decide_lfm_residency(),
+                            )
                             .map_err(|e| format!("level {} node {}: {e:?}", at.lv, at.j))?;
                         let prove = t.elapsed().as_secs_f64();
                         let times = ProgramTimes {
@@ -1433,7 +1440,11 @@ pub(crate) fn prove_tree_pipelined(
                             end: t_tree.elapsed().as_secs_f64(),
                             split: prove_split_now(),
                         };
-                        let child = harvest_child(node.artifacts.clone(), wrap.clone(), &lfm)?;
+                        let child = harvest_child_under::<BlockFamily>(
+                            node.artifacts.clone(),
+                            wrap.clone(),
+                            &lfm,
+                        )?;
                         Ok(ProvedProgram {
                             lfm,
                             child,
@@ -1815,7 +1826,7 @@ pub fn prove_whir_block_tree(
                         let filled = lfm_execute_and_fill(
                             &program.program,
                             &arena,
-                            program.program.hasher(crate::hash_pin::BLOCK_HASHER),
+                            program.program.hasher(<BlockFamily as ProofFamily>::SOCKET),
                         )
                         .map_err(|e| format!("early leaf {k}: {e:?}"))?;
                         Ok((filled, arena, started, t.elapsed().as_secs_f64()))
@@ -1927,7 +1938,7 @@ pub fn prove_whir_block_tree(
         let program = slot.wait()?.get()?;
         let chips: Vec<String> = super::airs::lfm_chip_census_with_hasher(
             &program.program,
-            program.program.hasher(crate::hash_pin::BLOCK_HASHER),
+            program.program.hasher(<BlockFamily as ProofFamily>::SOCKET),
         )
         .iter()
         .filter(|c| c.real_rows > 0)
@@ -2270,22 +2281,11 @@ pub fn verify_whir_block_tree_proof(
     elf_bytes: &[u8],
     proof: &WhirBlockTreeProof,
 ) -> Result<(), String> {
-    verify_whir_block_tree_proof_based(elf_bytes, &stark::proof::options::BaseFormat::RPX, proof)
-}
-
-/// [`verify_whir_block_tree_proof`] of a block proved over `base`: the
-/// verifier's own constant (the CLI's `--base-hash`), never read from the
-/// file; a proof made over the other base derives another top and is refused.
-pub fn verify_whir_block_tree_proof_based(
-    elf_bytes: &[u8],
-    base: &stark::proof::options::BaseFormat,
-    proof: &WhirBlockTreeProof,
-) -> Result<(), String> {
     let top = LfmProof {
         proof: proof.top_proof.clone(),
         public_words: proof.top_public_words.clone(),
     };
-    super::whir_block::verify_block_tree_based(elf_bytes, base, proof.statement(), &top)
+    super::whir_block::verify_block_tree(elf_bytes, proof.statement(), &top)
 }
 
 #[cfg(test)]
