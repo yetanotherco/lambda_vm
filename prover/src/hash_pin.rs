@@ -204,11 +204,12 @@ pub trait ProofFamily: Send + Sync + 'static {
             crate::tables::types::GoldilocksField,
         > + Clone
         + Send;
-    /// The family's name in every LFM statement: absorbed as one
-    /// `append_bytes` call BEFORE the statement (`statement::absorb_lfm_statement_for`),
-    /// so a statement names the proof family it was made under. `None` is the
-    /// legacy pin, whose statements stay today's bytes.
-    const STATEMENT_TAG: Option<&'static [u8]>;
+    /// The family's name in every LFM statement: the statement's first
+    /// `append_bytes` call (`statement::absorb_lfm_statement_tagged`), so a
+    /// statement names the proof family it was made under. The legacy pin's
+    /// is `LAMBDAVM_LFM_STATEMENT_V1` itself, so its statements stay today's
+    /// bytes; another family's replaces it.
+    const STATEMENT_TAG: &'static [u8];
     /// The in-guest wrap hash a program verifying this family's proofs runs.
     const WRAP: crate::lfm::edsl::WrapHash;
     /// The machine's hash chip under that wrap hash.
@@ -227,7 +228,7 @@ pub struct LegacyFamily;
 impl ProofFamily for LegacyFamily {
     type Stark = BlockStarkHash;
     type Transcript = BlockTranscript;
-    const STATEMENT_TAG: Option<&'static [u8]> = None;
+    const STATEMENT_TAG: &'static [u8] = crate::lfm::statement::LFM_STATEMENT_TAG;
     const WRAP: crate::lfm::edsl::WrapHash = crate::lfm::edsl::WrapHash::production();
     const SOCKET: crate::lfm::hash::HasherKind = BLOCK_HASHER;
     fn transcript(seed: &[u8]) -> Self::Transcript {
@@ -244,7 +245,7 @@ pub struct P1Family;
 impl ProofFamily for P1Family {
     type Stark = crate::lfm::p1_commit::P1StarkHash;
     type Transcript = crate::lfm::p1_commit::P1Transcript;
-    const STATEMENT_TAG: Option<&'static [u8]> = Some(P1_LFM_STATEMENT_TAG);
+    const STATEMENT_TAG: &'static [u8] = P1_LFM_STATEMENT_TAG;
     const WRAP: crate::lfm::edsl::WrapHash = crate::lfm::edsl::WrapHash::Poseidon1;
     const SOCKET: crate::lfm::hash::HasherKind = crate::lfm::hash::HasherKind::Poseidon1W16;
     fn transcript(seed: &[u8]) -> Self::Transcript {
@@ -252,9 +253,10 @@ impl ProofFamily for P1Family {
     }
 }
 
-/// [`P1Family`]'s statement tag (D-P3B §9, shared with #1013): the family and
-/// its cap height, `C` + [`crate::lfm::p1_commit::P1_STARK_CAP`].
-pub const P1_LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT/P1W16/C2";
+/// [`P1Family`]'s statement tag (D-P3B §9, shared with #1013): today's
+/// `LAMBDAVM_LFM_STATEMENT_V1`, the family and its cap height, `C` +
+/// [`crate::lfm::p1_commit::P1_STARK_CAP`] — absorbed in place of today's tag.
+pub const P1_LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1/P1W16/C2";
 
 // The tag's cap digit is the configuration's.
 const _: () = assert!(
@@ -346,7 +348,7 @@ mod tests {
             <<LegacyFamily as ProofFamily>::Stark as StarkHash>::COMMITMENT_HASH,
             BLOCK_COMMITMENT_HASH
         );
-        assert_eq!(LegacyFamily::STATEMENT_TAG, None);
+        assert_eq!(LegacyFamily::STATEMENT_TAG, b"LAMBDAVM_LFM_STATEMENT_V1");
         assert_eq!(
             <<P1Family as ProofFamily>::Stark as StarkHash>::COMMITMENT_HASH,
             stark::config::CommitmentHash::Poseidon1
@@ -357,7 +359,7 @@ mod tests {
         );
         assert_eq!(
             P1Family::STATEMENT_TAG,
-            Some(&b"LAMBDAVM_LFM_STATEMENT/P1W16/C2"[..])
+            b"LAMBDAVM_LFM_STATEMENT_V1/P1W16/C2"
         );
         assert_eq!(P1Family::WRAP, crate::lfm::edsl::WrapHash::Poseidon1);
         assert_eq!(P1Family::SOCKET, crate::lfm::hash::HasherKind::Poseidon1W16);

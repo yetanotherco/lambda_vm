@@ -37,9 +37,10 @@ const LFM_BLAKE3_CHUNK_TAG: &[u8] = b"LAMBDAVM_LFM_BLAKE3_CHUNKS_V1";
 
 /// Domain tag of the `LFM_HASH` chunk tail in [`lfm_program_id_chunked`].
 const LFM_HASH_CHUNK_TAG: &[u8] = b"LAMBDAVM_LFM_HASH_CHUNKS_V1";
-/// `pub(super)`: the aggregation layer's emitted verifier replays
-/// [`absorb_lfm_statement`] byte for byte and needs the same tag bytes.
-pub(super) const LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1";
+/// `pub(crate)`: the aggregation layer's emitted verifier replays
+/// [`absorb_lfm_statement`] byte for byte and needs the same tag bytes, and the
+/// legacy proof family (`hash_pin::LegacyFamily`) names it as its statement tag.
+pub(crate) const LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1";
 
 /// The byte that names a commitment hash inside [`lfm_program_id`].
 ///
@@ -259,7 +260,7 @@ pub fn absorb_lfm_statement(
 ) {
     absorb_lfm_statement_tagged(
         transcript,
-        None,
+        LFM_STATEMENT_TAG,
         program_id,
         public_words,
         fri_final_poly_log_degree,
@@ -267,22 +268,20 @@ pub fn absorb_lfm_statement(
 }
 
 /// [`absorb_lfm_statement`] under a proof family's statement tag
-/// (`hash_pin::ProofFamily::STATEMENT_TAG`): the tag is absorbed first, as one
-/// `append_bytes` call, then today's statement. `None` (the legacy pin) is
-/// today's bytes exactly. Domain separation, not the binding: a statement names
-/// the family its proof was made under, so no statement of one family can
-/// coincide with another's.
+/// (`hash_pin::ProofFamily::STATEMENT_TAG`), absorbed IN PLACE of
+/// [`LFM_STATEMENT_TAG`] as the statement's first `append_bytes` call, then the
+/// rest of the statement unchanged. The legacy family's tag is
+/// [`LFM_STATEMENT_TAG`] itself, so its statements are today's bytes exactly.
+/// Domain separation, not the binding: a statement names the family its proof
+/// was made under, so no statement of one family can coincide with another's.
 pub fn absorb_lfm_statement_tagged(
     transcript: &mut impl IsTranscript<E>,
-    family_tag: Option<&[u8]>,
+    tag: &[u8],
     program_id: &Commitment,
     public_words: &[(u32, LfmWord)],
     fri_final_poly_log_degree: u8,
 ) {
-    if let Some(tag) = family_tag {
-        transcript.append_bytes(tag);
-    }
-    transcript.append_bytes(LFM_STATEMENT_TAG);
+    transcript.append_bytes(tag);
     transcript.append_bytes(program_id);
     transcript.append_bytes(&LFM_MACHINE_VERSION.to_le_bytes());
     transcript.append_bytes(&(public_words.len() as u64).to_le_bytes());

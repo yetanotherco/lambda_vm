@@ -3,21 +3,23 @@
 //! artifacts committed under `P1StarkHash`, ZisK's transcript, the family's
 //! statement tag — and refused across the families, either way and with
 //! either family's artifacts. The tag is load-bearing: a family that differs
-//! from P1's only by dropping the tag accepts nothing P1 proves, and P1
-//! accepts nothing it proves.
+//! from P1's only by keeping today's `LAMBDAVM_LFM_STATEMENT_V1` tag accepts
+//! nothing P1 proves, and P1 accepts nothing it proves.
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use stark::config::StarkHash;
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 
 use crate::hash_pin::{LegacyFamily, P1Family, ProofFamily};
-use crate::tables::types::{FE, GoldilocksExtension};
+use math::field::traits::IsPrimeField;
+
+use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
 
 use super::p1_commit::P1StarkHash;
 use super::programs::trivial_program;
 use super::proof::{LfmProof, lfm_prove_under, verify_against_artifacts_under};
 use super::registry::{LfmArtifacts, build_artifacts_under};
-use super::statement::{absorb_lfm_statement, absorb_lfm_statement_tagged};
+use super::statement::{LFM_STATEMENT_TAG, absorb_lfm_statement, absorb_lfm_statement_tagged};
 use super::word::LfmWord;
 
 fn options() -> ProofOptions {
@@ -32,13 +34,14 @@ fn arenas() -> Vec<Vec<LfmWord>> {
     ]
 }
 
-/// P1 in everything but the statement tag: the mutant the tag must refuse.
+/// P1 in everything but the statement tag, which is today's
+/// `LAMBDAVM_LFM_STATEMENT_V1`: the mutant the tag must refuse.
 struct P1Untagged;
 
 impl ProofFamily for P1Untagged {
     type Stark = <P1Family as ProofFamily>::Stark;
     type Transcript = <P1Family as ProofFamily>::Transcript;
-    const STATEMENT_TAG: Option<&'static [u8]> = None;
+    const STATEMENT_TAG: &'static [u8] = LFM_STATEMENT_TAG;
     const WRAP: super::edsl::WrapHash = P1Family::WRAP;
     const SOCKET: super::hash::HasherKind = P1Family::SOCKET;
     fn transcript(seed: &[u8]) -> Self::Transcript {
@@ -133,8 +136,8 @@ fn a_p1_lfm_proof_verifies_and_the_families_do_not_cross() {
     ));
 }
 
-/// The family's statement tag is load-bearing: P1 without it accepts no P1
-/// proof, and P1 accepts none of its proofs; each accepts its own.
+/// The family's statement tag is load-bearing: P1 under today's tag accepts
+/// no P1 proof, and P1 accepts none of its proofs; each accepts its own.
 #[test]
 fn the_p1_statement_tag_is_load_bearing() {
     let opts = options();
@@ -153,27 +156,57 @@ fn the_p1_statement_tag_is_load_bearing() {
     );
 }
 
-/// The tagged absorb is the untagged one with the tag as a first call: `None`
-/// is today's statement, the tag moves the state.
+/// The family's tag REPLACES today's: the statement is the tag as its first
+/// call, then today's calls after `LAMBDAVM_LFM_STATEMENT_V1` unchanged. The
+/// legacy family's tag is `LAMBDAVM_LFM_STATEMENT_V1` itself, so its statement
+/// is today's bytes.
 #[test]
-fn the_tag_is_one_call_before_todays_statement() {
+fn the_tag_replaces_todays_first_call() {
     type E = GoldilocksExtension;
     let id = [7u8; 32];
-    let words: Vec<(u32, LfmWord)> = vec![(0, core::array::from_fn(|j| FE::from(j as u64 + 1)))];
-    let state = |tag: Option<&[u8]>| {
+    let words: Vec<(u32, LfmWord)> = vec![
+        (0, core::array::from_fn(|j| FE::from(j as u64 + 1))),
+        (3, core::array::from_fn(|j| FE::from(u64::MAX - j as u64))),
+    ];
+    let state = |tag: &[u8]| {
         let mut t = P1Family::transcript(&[]);
         absorb_lfm_statement_tagged(&mut t, tag, &id, &words, 8);
         <_ as IsTranscript<E>>::state(&t)
     };
+    // Today's statement, call by call, under `first` as its first call.
+    let by_hand = |first: &[u8]| {
+        let mut t = P1Family::transcript(&[]);
+        let mut append = |bytes: &[u8]| <_ as IsTranscript<E>>::append_bytes(&mut t, bytes);
+        append(first);
+        append(&id);
+        append(&super::statement::LFM_MACHINE_VERSION.to_le_bytes());
+        append(&(words.len() as u64).to_le_bytes());
+        for (index, word) in &words {
+            append(&index.to_le_bytes());
+            for lane in word {
+                append(&GoldilocksField::canonical(lane.value()).to_le_bytes());
+            }
+        }
+        append(&[8]);
+        <_ as IsTranscript<E>>::state(&t)
+    };
     let mut today = P1Family::transcript(&[]);
     absorb_lfm_statement(&mut today, &id, &words, 8);
-    assert_eq!(state(None), <_ as IsTranscript<E>>::state(&today));
-    assert_ne!(state(P1Family::STATEMENT_TAG), state(None));
-    let mut by_hand = P1Family::transcript(&[]);
-    <_ as IsTranscript<E>>::append_bytes(&mut by_hand, crate::hash_pin::P1_LFM_STATEMENT_TAG);
-    absorb_lfm_statement(&mut by_hand, &id, &words, 8);
+    let today = <_ as IsTranscript<E>>::state(&today);
+    assert_eq!(state(LegacyFamily::STATEMENT_TAG), today);
+    assert_eq!(by_hand(b"LAMBDAVM_LFM_STATEMENT_V1"), today);
     assert_eq!(
         state(P1Family::STATEMENT_TAG),
-        <_ as IsTranscript<E>>::state(&by_hand)
+        by_hand(crate::hash_pin::P1_LFM_STATEMENT_TAG)
     );
+    assert_ne!(state(P1Family::STATEMENT_TAG), today);
+    // Replaced, not prepended: the P1 tag then today's tag is another state.
+    let mut prepended = P1Family::transcript(&[]);
+    <_ as IsTranscript<E>>::append_bytes(&mut prepended, P1Family::STATEMENT_TAG);
+    absorb_lfm_statement(&mut prepended, &id, &words, 8);
+    assert_ne!(
+        state(P1Family::STATEMENT_TAG),
+        <_ as IsTranscript<E>>::state(&prepended)
+    );
+    assert!(P1Family::STATEMENT_TAG.starts_with(LFM_STATEMENT_TAG));
 }
