@@ -2580,6 +2580,119 @@ mod tests {
         assert_eq!(folded, re_encoded);
     }
 
+    /// ★ The same at the production shape, through the prover's own steps: a
+    /// stacked base-field commitment at blowup 4, a first fold of six into the
+    /// cubic extension and folds of four after it, the message bound by the
+    /// chain's sumcheck on challenges from its transcript, the weight batched
+    /// with the out-of-domain term between rounds. Every round's successor —
+    /// the fold of the codeword it opens — is the bound message encoded on the
+    /// folded domain, byte for byte as the tree hashes it. So a successor can
+    /// be encoded from the `2^(n−k)` message instead of folded from the
+    /// `2^(n+blowup)` codeword (D-SPEED lever 5a). The domain is the subgroup
+    /// itself: there is no coset offset to match.
+    ///
+    /// Two near misses must differ, so the equality is not one any encoding
+    /// would show: the message encoded without the lift's bit reversal, and the
+    /// first round's variables bound from the other end.
+    #[test]
+    fn every_successor_is_the_bound_message_encoded_at_the_production_shape() {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as E;
+        type EE = FieldElement<E>;
+        let bytes = |values: &[EE]| -> Vec<u8> { values.iter().flat_map(|v| v.as_bytes()).collect() };
+        let lift = |m: &Mle<F>| -> Mle<E> {
+            Mle::new(m.evals().iter().map(|v| v.clone().to_extension::<E>()).collect()).unwrap()
+        };
+
+        let num_vars = 15;
+        let cfg = first(6, 4);
+        let schedule = cfg.schedule(num_vars);
+        assert_eq!(schedule, [6, 4, 4, 1], "the production schedule's shape");
+
+        // Columns of mixed heights where the production layout puts them.
+        let heights = [13usize, 13, 12, 11, 10, 8, 6, 3];
+        let columns: Vec<Mle<F>> = heights
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| pseudo_mle(h, 71 + 13 * i as u64))
+            .collect();
+        let layout = crate::stacking::StackedLayout::build(&heights, num_vars).unwrap();
+        assert_eq!(layout.num_polys(), 1);
+        let stacked = Stacked {
+            parts: layout
+                .placements()
+                .iter()
+                .zip(&columns)
+                .map(|(place, column)| (column as &dyn HostColumn<F>, place.offset))
+                .collect(),
+            resident: None,
+            num_vars,
+        };
+        let (commitment, domain) = commit_stacked::<F, KeccakWhir>(&stacked, &cfg, true).unwrap();
+        let base = commitment
+            .codeword()
+            .host()
+            .expect("no device: the host committed")
+            .to_vec();
+        let message = stacked.assemble().unwrap();
+
+        let weight = Mle::new(
+            (0..1u64 << num_vars)
+                .map(|i| EE::from(i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 7))
+                .collect(),
+        )
+        .unwrap();
+        let mut factors = Factors::<F, E>::new(&message, weight).unwrap();
+        let mut transcript = DefaultTranscript::<E>::new(b"whir-chain-5a");
+
+        let mut current: Vec<EE> = Vec::new();
+        let mut current_domain = domain;
+        for (r, &k) in schedule.iter().enumerate() {
+            let (_, alphas) = factors.rounds(k, &mut transcript).unwrap();
+            let (folded, folded_domain) = if r == 0 {
+                crate::whir::fold_codeword_k_on_host::<F, F, E>(&base, &current_domain, &alphas)
+            } else {
+                crate::whir::fold_codeword_k_on_host::<F, E, E>(&current, &current_domain, &alphas)
+            }
+            .unwrap();
+            let Factors::Host { message: bound, .. } = &factors else {
+                panic!("no device: the host bound the message");
+            };
+            let left: usize = num_vars - schedule[..=r].iter().sum::<usize>();
+            assert_eq!(bound.num_vars(), left);
+            assert_eq!(folded.len(), 1 << (left + cfg.log_blowup));
+            let encoded = encode::<F, E>(&lift_coefficients(bound), &folded_domain).unwrap();
+            assert_eq!(
+                bytes(&encoded),
+                bytes(&folded),
+                "round {r} (fold {k}): the encoded message is not the folded codeword"
+            );
+
+            if r == 0 {
+                let unreversed =
+                    encode::<F, E>(&crate::whir::monomial_coefficients(bound), &folded_domain)
+                        .unwrap();
+                assert_ne!(bytes(&unreversed), bytes(&folded), "the lift's order matters");
+                let mut other_end = lift(&message);
+                for alpha in &alphas {
+                    other_end.fix_last_variable_in_place(alpha).unwrap();
+                }
+                let wrong = encode::<F, E>(&lift_coefficients(&other_end), &folded_domain).unwrap();
+                assert_ne!(bytes(&wrong), bytes(&folded), "the binding order matters");
+            }
+
+            if schedule.get(r + 1).is_some() {
+                let z0: EE = transcript.sample_field_element();
+                let point = ood_point(&z0, factors.num_vars());
+                let y0 = factors.evaluate_message(&point).unwrap();
+                transcript.append_field_element(&y0);
+                let gamma: EE = transcript.sample_field_element();
+                factors.add_scaled_eq(&point, &gamma).unwrap();
+            }
+            current = folded;
+            current_domain = folded_domain;
+        }
+    }
+
     #[test]
     fn every_round_but_the_last_answers_out_of_domain() {
         let proof = run(6, 2).unwrap();
