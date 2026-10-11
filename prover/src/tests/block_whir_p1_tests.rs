@@ -476,9 +476,15 @@ mod scan {
 
     /// The production tokens of a source: its masked tokens with every
     /// `#[cfg(test)]`-gated item or statement removed — from the attribute to
-    /// the end of what it gates: the first `;` or `,` at its own depth, the
-    /// close of a block it opens (and a `;`/`,` right after), or the close of
-    /// the enclosing block, whichever comes first.
+    /// the end of what it gates. An ITEM (`fn`, `struct`, `impl`, `mod`,
+    /// `const`, `use`, … after any visibility) ends at the first `;` at its own
+    /// depth or at the close of the block it opens; a comma never ends one, so a
+    /// generic `Result<A, B>` in its signature is no end. Anything else (a
+    /// field, a variant, a match arm, a statement) ends at the first `;` or `,`
+    /// at its own depth or at the close of a block it opens — a comma inside a
+    /// generic type ends it early, which scans more code, never less. Either
+    /// way the close of the enclosing block ends it. No `<` is read as a
+    /// bracket: in an arm or a field it may be a comparison or a shift.
     pub(super) fn production(src: &str) -> Vec<String> {
         let t = tokens(&masked(src));
         let gate: Vec<String> = tokens("#[cfg(test)]");
@@ -506,16 +512,39 @@ mod scan {
                         i += 1;
                     }
                 }
-                // `angle` counts generic brackets outside any block, so a `,`
-                // inside `Result<A, B>` of a gated signature or field type ends
-                // nothing (`->` and `=>` are no brackets); a `;` ends the item
-                // whatever it holds.
-                let (mut depth, mut angle) = (0i64, 0i64);
+                // Past any visibility (`pub`, `pub(crate)`, …): an item keyword?
+                let mut k = i;
+                if t.get(k).map(String::as_str) == Some("pub") {
+                    k += 1;
+                    if t.get(k).map(String::as_str) == Some("(") {
+                        while k < t.len() && t[k] != ")" {
+                            k += 1;
+                        }
+                        k += 1;
+                    }
+                }
+                let item = matches!(
+                    t.get(k).map(String::as_str),
+                    Some(
+                        "fn" | "struct"
+                            | "enum"
+                            | "union"
+                            | "impl"
+                            | "trait"
+                            | "mod"
+                            | "type"
+                            | "const"
+                            | "static"
+                            | "use"
+                            | "extern"
+                            | "macro_rules"
+                            | "unsafe"
+                            | "async"
+                    )
+                );
+                let mut depth = 0i64;
                 while i < t.len() {
-                    let arrow = i > 0 && matches!(t[i - 1].as_str(), "-" | "=");
                     match t[i].as_str() {
-                        "<" if depth == 0 => angle += 1,
-                        ">" if depth == 0 && !arrow && angle > 0 => angle -= 1,
                         "{" | "(" | "[" => depth += 1,
                         "}" | ")" | "]" => {
                             if depth == 0 {
@@ -535,7 +564,7 @@ mod scan {
                             i += 1;
                             break;
                         }
-                        "," if depth == 0 && angle == 0 => {
+                        "," if depth == 0 && !item => {
                             i += 1;
                             break;
                         }
@@ -803,6 +832,37 @@ fn the_block_path_scan_refuses_planted_regressions() {
             "lfm_prove"
         ),
         0
+    );
+    // A gated struct-literal field or match arm holding a shift or a
+    // comparison ends at its comma: the fields and arms after it are scanned.
+    assert_eq!(
+        scan::count(
+            &scan::production(
+                "fn f() -> S {\n    S {\n        #[cfg(test)]\n        a: 1 << 2,\n        b: lfm_prove,\n    }\n}\n"
+            ),
+            "lfm_prove"
+        ),
+        1
+    );
+    assert_eq!(
+        scan::count(
+            &scan::production(
+                "fn f(k: K) -> bool {\n    match k {\n        #[cfg(test)]\n        K::A => x < y,\n        K::B => lfm_prove(),\n    }\n}\n"
+            ),
+            "lfm_prove"
+        ),
+        1
+    );
+    // A gated item whose signature carries a where-clause comma is left out
+    // whole, to its block's close.
+    assert_eq!(
+        scan::count(
+            &scan::production(
+                "#[cfg(test)]\npub(crate) fn t<P>(p: P) -> u8\nwhere\n    P: A,\n    u8: B<P>,\n{\n    lfm_prove(p)\n}\nfn g() { lfm_prove(1) }\n"
+            ),
+            "lfm_prove"
+        ),
+        1
     );
     // A gated field of a generic type ends at its comma.
     assert_eq!(
