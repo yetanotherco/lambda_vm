@@ -2637,6 +2637,14 @@ fn the_whir_block_tree_on_a_real_block() {
         math_cuda::device::tree_download_totals().line(),
         math_cuda::device::staging_totals().pair_waits
     );
+    // The base's stacked openings: the lean rounds in effect
+    // (`LAMBDA_VM_WHIR_LEAN_ROUNDS`, default 3) and how many openings took them.
+    println!(
+        "W3 WHIR LEAN: {} rounds · lean opens {} of {}",
+        multilinear::gpu::lean_rounds_in_effect(),
+        multilinear::gpu::lean_open_calls(),
+        multilinear::gpu::open_calls()
+    );
     // The top proof's bytes: two runs prove the same ones under
     // LAMBDA_VM_FIXED_TRACE_HASH=1 and LAMBDA_VM_DETERMINISTIC_GRIND=1.
     let top_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&top.proof).expect("serialize the top");
