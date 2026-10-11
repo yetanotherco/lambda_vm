@@ -167,17 +167,16 @@ fn the_encoded_successor_is_the_fold(num_vars: usize, levels: usize, seed: u64) 
         "the encode moved the message"
     );
 
-    // A near miss must differ: the fold at the challenges in another order.
-    let mut swapped = alphas.clone();
-    swapped.swap(0, 3);
-    swapped.swap(1, 4);
-    swapped.swap(2, 5);
-    let other = math_cuda::whir::fold_resident_fused(&committed, two_inv, &g_invs, &swapped)
+    // A near miss must differ: the fold at another first challenge (one
+    // limb moved, which a fold of any number of levels has).
+    let mut moved = alphas.clone();
+    moved[0] = if moved[0] == 0 { 1 } else { moved[0] - 1 };
+    let other = math_cuda::whir::fold_resident_fused(&committed, two_inv, &g_invs, &moved)
         .expect("fused fold");
     assert_ne!(
         canonical(&other.to_host().expect("read back")),
         canonical(&encoded_raw),
-        "the comparison must see the challenges' order"
+        "the comparison must see the challenge"
     );
 }
 
