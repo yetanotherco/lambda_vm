@@ -189,8 +189,8 @@ fn a_wide_singleton_group_splits_into_runs_of_four() {
 }
 
 /// REV-B2-JUDGE B1-5 at the block, and the grouped chain's round trip
-/// through it: at up to two, three and four polynomials a group, under RPX
-/// and under Poseidon1's 4-ary capped trees, an `Indexed` block proves and
+/// through it: at up to two, three and four polynomials a group, under the
+/// block's base (Poseidon1's 4-ary capped trees), an `Indexed` block proves and
 /// verifies with grouped chains, its phase-A roots are the per-polynomial
 /// block's (B2-sep), and neither mode's proof verifies under the other's
 /// verifier — refused by the STATEMENT: the two modes' statement bytes differ
@@ -206,81 +206,78 @@ fn an_indexed_block_round_trips_and_refuses_the_other_mode() {
         block_whir::verify_block_whir_traced(proof, &elf, &opts, format, false, VerifierChecks::ALL)
             .expect("the statement frames under either mode")
     };
-    for base in [BaseFormat::RPX, BaseFormat::P1_WHIR] {
-        for group_polys in 2..=MAX_INDEX_POLYS {
-            let indexed = format(base, group_polys, GroupFold::Indexed);
-            let per_poly = format(base, group_polys, GroupFold::PerPoly);
-            let a = prove(&elf, &indexed, MaxRowsConfig::small());
-            let b = prove(&elf, &per_poly, MaxRowsConfig::small());
-            let widths = grouped_widths(&a);
-            println!(
-                "ONECHAIN B1-5 {base:?} group_polys {group_polys}: {} groups, grouped runs \
+    let base = crate::hash_pin::BLOCK_BASE;
+    for group_polys in 2..=MAX_INDEX_POLYS {
+        let indexed = format(base, group_polys, GroupFold::Indexed);
+        let per_poly = format(base, group_polys, GroupFold::PerPoly);
+        let a = prove(&elf, &indexed, MaxRowsConfig::small());
+        let b = prove(&elf, &per_poly, MaxRowsConfig::small());
+        let widths = grouped_widths(&a);
+        println!(
+            "ONECHAIN B1-5 {base:?} group_polys {group_polys}: {} groups, grouped runs \
                  {widths:?}",
-                a.proof.columns.len()
-            );
-            assert!(
-                widths.iter().any(|&w| w >= 2),
-                "{base:?} {group_polys}: no grouped chain"
-            );
-            assert!(widths.iter().all(|&w| (2..=group_polys).contains(&w)));
-            assert!(grouped_widths(&b).is_empty());
-            assert_same_roots(&elf, &a, &b, &indexed);
-            assert!(traced(&a, &indexed).is_ok(), "{base:?} {group_polys}");
-            assert!(traced(&b, &per_poly).is_ok(), "{base:?} {group_polys}");
+            a.proof.columns.len()
+        );
+        assert!(
+            widths.iter().any(|&w| w >= 2),
+            "{base:?} {group_polys}: no grouped chain"
+        );
+        assert!(widths.iter().all(|&w| (2..=group_polys).contains(&w)));
+        assert!(grouped_widths(&b).is_empty());
+        assert_same_roots(&elf, &a, &b, &indexed);
+        assert!(traced(&a, &indexed).is_ok(), "{base:?} {group_polys}");
+        assert!(traced(&b, &per_poly).is_ok(), "{base:?} {group_polys}");
 
-            // The statement: one bit apart, the fold word's 47.
-            let frame = |format: &BlockFormat| {
-                block_whir::block_frame(a.statement(), &elf, &opts, format).expect("frame")
-            };
-            let tag = block_whir::block_statement_tag(&base);
-            let digest = crate::statement::elf_digest(&elf);
-            let (sa, sb) = (
-                block_whir::block_statement_bytes(
-                    a.statement(),
-                    &tag,
-                    &digest,
-                    &frame(&indexed).config,
-                ),
-                block_whir::block_statement_bytes(
-                    a.statement(),
-                    &tag,
-                    &digest,
-                    &frame(&per_poly).config,
-                ),
-            );
-            assert_eq!(sa.len(), sb.len());
-            let differ: Vec<(usize, u8)> = sa
-                .iter()
-                .zip(&sb)
-                .enumerate()
-                .filter(|(_, (x, y))| x != y)
-                .map(|(i, (x, y))| (i, x ^ y))
-                .collect();
-            assert_eq!(differ.len(), 1, "{base:?} {group_polys}: {differ:?}");
-            assert_eq!(differ[0].1, 0x80, "bit 47 is byte 5's top bit");
+        // The statement: one bit apart, the fold word's 47.
+        let frame = |format: &BlockFormat| {
+            block_whir::block_frame(a.statement(), &elf, &opts, format).expect("frame")
+        };
+        let tag = block_whir::block_statement_tag(&base);
+        let digest = crate::statement::elf_digest(&elf);
+        let (sa, sb) = (
+            block_whir::block_statement_bytes(
+                a.statement(),
+                &tag,
+                &digest,
+                &frame(&indexed).config,
+            ),
+            block_whir::block_statement_bytes(
+                a.statement(),
+                &tag,
+                &digest,
+                &frame(&per_poly).config,
+            ),
+        );
+        assert_eq!(sa.len(), sb.len());
+        let differ: Vec<(usize, u8)> = sa
+            .iter()
+            .zip(&sb)
+            .enumerate()
+            .filter(|(_, (x, y))| x != y)
+            .map(|(i, (x, y))| (i, x ^ y))
+            .collect();
+        assert_eq!(differ.len(), 1, "{base:?} {group_polys}: {differ:?}");
+        assert_eq!(differ[0].1, 0x80, "bit 47 is byte 5's top bit");
 
-            for (label, proof, format) in [
-                ("Indexed under PerPoly", &a, &per_poly),
-                ("PerPoly under Indexed", &b, &indexed),
-            ] {
-                match traced(proof, format) {
-                    Err(BlockRefusal::Proof(e)) => {
-                        println!(
-                            "ONECHAIN B1-5 {base:?} {group_polys} {label}: refused with {e:?}"
-                        );
-                        assert!(
-                            !matches!(
-                                e,
-                                multilinear::Error::QueryCountMismatch { .. }
-                                    | multilinear::Error::GroupedShape(_)
-                                    | multilinear::Error::ColumnOpeningRejected { .. }
-                            ),
-                            "{base:?} {group_polys} {label}: refused at an opening's shape or \
+        for (label, proof, format) in [
+            ("Indexed under PerPoly", &a, &per_poly),
+            ("PerPoly under Indexed", &b, &indexed),
+        ] {
+            match traced(proof, format) {
+                Err(BlockRefusal::Proof(e)) => {
+                    println!("ONECHAIN B1-5 {base:?} {group_polys} {label}: refused with {e:?}");
+                    assert!(
+                        !matches!(
+                            e,
+                            multilinear::Error::QueryCountMismatch { .. }
+                                | multilinear::Error::GroupedShape(_)
+                                | multilinear::Error::ColumnOpeningRejected { .. }
+                        ),
+                        "{base:?} {group_polys} {label}: refused at an opening's shape or \
                              chain, not by the statement: {e:?}"
-                        );
-                    }
-                    other => panic!("{base:?} {group_polys} {label}: {other:?}"),
+                    );
                 }
+                other => panic!("{base:?} {group_polys} {label}: {other:?}"),
             }
         }
     }

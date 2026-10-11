@@ -3057,7 +3057,7 @@ fn indexed_format(base: stark::proof::options::BaseFormat) -> BlockFormat {
     }
 }
 
-/// ★ REV-B2-JUDGE B2-6 at the block (D-ONECHAIN B2), under RPX and Poseidon1:
+/// ★ REV-B2-JUDGE B2-6 at the block (D-ONECHAIN B2), under the block's base:
 /// the plan's split is the proof's (one chain per run), every leaf of an
 /// `Indexed` block executes over the honest proof and the leaves' shares
 /// cancel; a grouped round-0 value tampered in a group is refused by the host
@@ -3069,125 +3069,121 @@ fn indexed_format(base: stark::proof::options::BaseFormat) -> BlockFormat {
 #[cfg(not(feature = "cuda"))]
 fn an_indexed_blocks_leaves_execute_and_refuse_a_grouped_forgery() {
     use multilinear::whir_chain::RoundOpenings;
-    use stark::proof::options::BaseFormat;
-    for base in [BaseFormat::RPX, BaseFormat::P1_WHIR] {
-        let format = indexed_format(base);
-        let (elf, proof) = small_block("all_instructions_64", &format);
-        let plan = plan_of(&elf, &proof, &format, Some(2));
-        let grouped: Vec<(usize, usize)> = proof
-            .proof
-            .columns
-            .iter()
-            .enumerate()
-            .flat_map(|(g, stack)| {
-                stack
-                    .polys
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, chain)| {
-                        matches!(chain.rounds[0].openings, RoundOpenings::BaseGrouped(_))
-                    })
-                    .map(move |(i, _)| (g, i))
-            })
-            .collect();
-        assert!(!grouped.is_empty(), "{base:?}: a grouped chain");
+    let base = crate::hash_pin::BLOCK_BASE;
+    let format = indexed_format(base);
+    let (elf, proof) = small_block("all_instructions_64", &format);
+    let plan = plan_of(&elf, &proof, &format, Some(2));
+    let grouped: Vec<(usize, usize)> = proof
+        .proof
+        .columns
+        .iter()
+        .enumerate()
+        .flat_map(|(g, stack)| {
+            stack
+                .polys
+                .iter()
+                .enumerate()
+                .filter(|(_, chain)| {
+                    matches!(chain.rounds[0].openings, RoundOpenings::BaseGrouped(_))
+                })
+                .map(move |(i, _)| (g, i))
+        })
+        .collect();
+    assert!(!grouped.is_empty(), "{base:?}: a grouped chain");
 
-        let words = leaves_words(&plan, &proof);
-        let layout = plan.child_layout();
-        let sum = words
-            .iter()
-            .fold(FEE::zero(), |acc, w| acc + ext_of(&w[layout.sum()]));
-        assert_eq!(sum, FEE::zero(), "{base:?}: the leaves' shares cancel");
+    let words = leaves_words(&plan, &proof);
+    let layout = plan.child_layout();
+    let sum = words
+        .iter()
+        .fold(FEE::zero(), |acc, w| acc + ext_of(&w[layout.sum()]));
+    assert_eq!(sum, FEE::zero(), "{base:?}: the leaves' shares cancel");
 
-        let per_poly = BlockFormat {
-            group: multilinear::whir_chain::GroupFold::PerPoly,
-            ..format
-        };
-        let apart = plan_of(&elf, &proof, &per_poly, Some(2));
-        for (g, (&one, &many)) in plan.costs().iter().zip(apart.costs()).enumerate() {
-            let runs = proof.proof.columns[g].polys.len();
-            assert!(one <= many, "{base:?} group {g}: {one} against {many}");
-            if grouped.iter().any(|&(gg, _)| gg == g) {
-                assert!(one < many, "{base:?} group {g}: {runs} chains");
-            }
+    let per_poly = BlockFormat {
+        group: multilinear::whir_chain::GroupFold::PerPoly,
+        ..format
+    };
+    let apart = plan_of(&elf, &proof, &per_poly, Some(2));
+    for (g, (&one, &many)) in plan.costs().iter().zip(apart.costs()).enumerate() {
+        let runs = proof.proof.columns[g].polys.len();
+        assert!(one <= many, "{base:?} group {g}: {one} against {many}");
+        if grouped.iter().any(|&(gg, _)| gg == g) {
+            assert!(one < many, "{base:?} group {g}: {runs} chains");
         }
-        println!(
-            "ONECHAIN BLOCK {base:?}: {} groups, grouped chains {grouped:?}, costs {:?} (per \
-             polynomial {:?}), leaves {:?}",
-            plan.num_groups(),
-            plan.costs(),
-            apart.costs(),
-            plan.partition().leaves()
-        );
-
-        // A value of tree 1's block at query 1 in the first grouped chain: the
-        // host refuses it at that chain's opening (reported as the run's first
-        // polynomial), and the leaf holding the group at tree 1's opening at
-        // query 1 — the first failing check in program order, against the
-        // honest leaf, which executes.
-        let (g, i) = grouped[0];
-        let mut forged = proof.clone();
-        match &mut forged.proof.columns[g].polys[i].rounds[0].openings {
-            RoundOpenings::BaseGrouped(round) => round.current[1][1].values[0] += FE::one(),
-            _ => unreachable!("a grouped round 0"),
-        }
-        let opts = ProofOptions::default_test_options();
-        let frame =
-            block_whir::block_frame(proof.statement(), &elf, &opts, &format).expect("frame");
-        let run = multilinear::stacked_eval::index_chains(
-            frame.stack_layouts[g].num_polys(),
-            multilinear::whir_chain::GroupFold::Indexed,
-        )[i]
-            .clone();
-        let refusal = block_whir::verify_block_whir_traced(
-            &forged,
-            &elf,
-            &opts,
-            &format,
-            false,
-            stark::multilinear_table::batched::VerifierChecks::ALL,
-        )
-        .expect("the statement frames");
-        assert!(
-            matches!(
-                refusal,
-                Err(block_whir::BlockRefusal::Proof(
-                    multilinear::Error::ColumnOpeningRejected { column }
-                )) if column == run.start
-            ),
-            "{base:?}: the host refuses group {g} chain {i}'s opening, got {refusal:?}"
-        );
-        let k = (0..plan.partition().num_leaves())
-            .find(|&k| plan.partition().leaf(k).contains(&g))
-            .expect("a leaf holds the group");
-        use super::whir_chain::onechain_steps::{self, Step};
-        let (program, marks) = onechain_steps::record(|| {
-            leaf_program_with(&plan, k, LeafChecks::ALL).expect("the leaf emits")
-        });
-        let hasher = program.hasher(crate::hash_pin::BLOCK_HASHER);
-        let honest = block_leaf_arena(&plan, &proof, k).expect("the honest arena");
-        super::executor::execute_serial(&program, &honest, &hasher)
-            .expect("the honest leaf executes");
-        let forged_arena = block_leaf_arena(&plan, &forged, k).expect("the forged arena");
-        let error = super::executor::execute_serial(&program, &forged_arena, &hasher)
-            .expect_err("the leaf refuses the forgery");
-        assert_eq!(
-            onechain_steps::failed_at(&program, &marks, &error),
-            Some((
-                Some(run.start),
-                Step::Opening {
-                    round: 0,
-                    query: 1,
-                    tree: 1
-                }
-            )),
-            "{base:?}: leaf {k} refuses group {g} chain {i} at tree 1's opening, got {error:?}"
-        );
-        assert!(
-            run_leaf(&plan, &forged, k, LeafChecks::ALL).is_err(),
-            "{base:?}: and on the production schedule"
-        );
     }
+    println!(
+        "ONECHAIN BLOCK {base:?}: {} groups, grouped chains {grouped:?}, costs {:?} (per \
+             polynomial {:?}), leaves {:?}",
+        plan.num_groups(),
+        plan.costs(),
+        apart.costs(),
+        plan.partition().leaves()
+    );
+
+    // A value of tree 1's block at query 1 in the first grouped chain: the
+    // host refuses it at that chain's opening (reported as the run's first
+    // polynomial), and the leaf holding the group at tree 1's opening at
+    // query 1 — the first failing check in program order, against the
+    // honest leaf, which executes.
+    let (g, i) = grouped[0];
+    let mut forged = proof.clone();
+    match &mut forged.proof.columns[g].polys[i].rounds[0].openings {
+        RoundOpenings::BaseGrouped(round) => round.current[1][1].values[0] += FE::one(),
+        _ => unreachable!("a grouped round 0"),
+    }
+    let opts = ProofOptions::default_test_options();
+    let frame = block_whir::block_frame(proof.statement(), &elf, &opts, &format).expect("frame");
+    let run = multilinear::stacked_eval::index_chains(
+        frame.stack_layouts[g].num_polys(),
+        multilinear::whir_chain::GroupFold::Indexed,
+    )[i]
+        .clone();
+    let refusal = block_whir::verify_block_whir_traced(
+        &forged,
+        &elf,
+        &opts,
+        &format,
+        false,
+        stark::multilinear_table::batched::VerifierChecks::ALL,
+    )
+    .expect("the statement frames");
+    assert!(
+        matches!(
+            refusal,
+            Err(block_whir::BlockRefusal::Proof(
+                multilinear::Error::ColumnOpeningRejected { column }
+            )) if column == run.start
+        ),
+        "{base:?}: the host refuses group {g} chain {i}'s opening, got {refusal:?}"
+    );
+    let k = (0..plan.partition().num_leaves())
+        .find(|&k| plan.partition().leaf(k).contains(&g))
+        .expect("a leaf holds the group");
+    use super::whir_chain::onechain_steps::{self, Step};
+    let (program, marks) = onechain_steps::record(|| {
+        leaf_program_with(&plan, k, LeafChecks::ALL).expect("the leaf emits")
+    });
+    let hasher = program.hasher(crate::hash_pin::BLOCK_HASHER);
+    let honest = block_leaf_arena(&plan, &proof, k).expect("the honest arena");
+    super::executor::execute_serial(&program, &honest, &hasher).expect("the honest leaf executes");
+    let forged_arena = block_leaf_arena(&plan, &forged, k).expect("the forged arena");
+    let error = super::executor::execute_serial(&program, &forged_arena, &hasher)
+        .expect_err("the leaf refuses the forgery");
+    assert_eq!(
+        onechain_steps::failed_at(&program, &marks, &error),
+        Some((
+            Some(run.start),
+            Step::Opening {
+                round: 0,
+                query: 1,
+                tree: 1
+            }
+        )),
+        "{base:?}: leaf {k} refuses group {g} chain {i} at tree 1's opening, got {error:?}"
+    );
+    assert!(
+        run_leaf(&plan, &forged, k, LeafChecks::ALL).is_err(),
+        "{base:?}: and on the production schedule"
+    );
 }
 
 /// The code review's M-g: a small `Indexed` block under a stack of
@@ -3342,12 +3338,9 @@ fn forged_prepared_chain(
 #[ignore = "proves small blocks and executes their leaves; box tier"]
 #[cfg(not(feature = "cuda"))]
 fn a_grouped_prepared_stack_verifies_and_its_leaf_refuses_a_forgery() {
-    use stark::proof::options::BaseFormat;
-    for base in [BaseFormat::RPX, BaseFormat::P1_WHIR] {
-        forged_prepared_chain(base, 8, 12, |chains| {
-            chains.iter().copied().find(|&(_, _, width)| width >= 2)
-        });
-    }
+    forged_prepared_chain(crate::hash_pin::BLOCK_BASE, 8, 12, |chains| {
+        chains.iter().copied().find(|&(_, _, width)| width >= 2)
+    });
 }
 
 /// The code review's M-g: a prepared stack SPLIT into two chains. Under a stack
@@ -3359,15 +3352,12 @@ fn a_grouped_prepared_stack_verifies_and_its_leaf_refuses_a_forgery() {
 #[ignore = "proves small blocks and executes their leaves; box tier"]
 #[cfg(not(feature = "cuda"))]
 fn a_split_prepared_stack_refuses_a_forgery_in_its_last_chain() {
-    use stark::proof::options::BaseFormat;
-    for base in [BaseFormat::RPX, BaseFormat::P1_WHIR] {
-        forged_prepared_chain(base, 7, 24, |chains| {
-            chains.iter().copied().rfind(|&(k, i, _)| {
-                i >= 1
-                    && chains
-                        .iter()
-                        .any(|&(kk, ii, w)| kk == k && ii == 0 && w >= 2)
-            })
-        });
-    }
+    forged_prepared_chain(crate::hash_pin::BLOCK_BASE, 7, 24, |chains| {
+        chains.iter().copied().rfind(|&(k, i, _)| {
+            i >= 1
+                && chains
+                    .iter()
+                    .any(|&(kk, ii, w)| kk == k && ii == 0 && w >= 2)
+        })
+    });
 }
