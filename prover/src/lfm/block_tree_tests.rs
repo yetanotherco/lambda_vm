@@ -669,31 +669,34 @@ fn gib(bytes: usize) -> f64 {
 
 /// The production-height plan the S5 instruments emit from:
 /// [`spread_fixture_shape`] with 13 chunks of each accelerator and 40 CPU
-/// chunks, under the block base's options, every leaf filled toward
-/// [`super::block_plan::LEAF_PERMS_CAP`] as the median block's are.
+/// chunks, under the legacy (RPX) base's options ([`spread_plan`]), every leaf
+/// filled toward [`super::block_plan::LEAF_PERMS_CAP`] as the median block's
+/// were before the block pin.
 fn production_height_plan() -> BlockTreePlan {
     spread_plan(13, 40)
 }
 
-/// [`spread_fixture_shape`]'s plan under the block base's options.
+/// [`spread_fixture_shape`]'s plan under the legacy (RPX) base's options
+/// (`block_base_options`): the S5 instruments' plan, recorded before the block
+/// pin. The block's own plans take [`super::proof::block_tree_base_options`].
 fn spread_plan(chunks: usize, cpus: usize) -> BlockTreePlan {
     spread_plan_under(chunks, cpus, &super::proof::block_base_options())
 }
 
-/// [`spread_plan`] at the default format with the LogUp pair layout — the
-/// format the pinned tree ids were recorded under, before k4 became the
-/// default. The pins guard the program form, which no format choice changes,
-/// so they keep holding at the rollback format.
+/// [`spread_fixture_shape`]'s plan over the block's own base
+/// ([`super::proof::block_tree_base_options`]: Poseidon1, cap 1): the plan the
+/// pinned tree ids ([`SMALL_TREE_IDS`], [`PRODUCTION_HEIGHT_TREE_IDS`]) guard,
+/// its tree derived under the block pin ([`tree_recursion`]), as the block
+/// prover builds it.
 fn pinned_spread_plan(chunks: usize, cpus: usize) -> BlockTreePlan {
-    let pair = crate::zf_format::ZfFormat {
-        logup: stark::proof::options::LogUpPolicy::Pair,
-        ..crate::zf_format::ZfFormat::DEFAULT
-    };
-    spread_plan_under(
-        chunks,
-        cpus,
-        &pair.base_options(crate::recursion::Preset::Blowup4.options()),
-    )
+    spread_plan_under(chunks, cpus, &super::proof::block_tree_base_options())
+}
+
+/// [`spread_plan`] at the legacy (RPX) default format with the LogUp pair
+/// layout: the plan the RPX-era tree ids were recorded over, before the block
+/// pin. The census instruments and the P1 small tree compare against it.
+fn legacy_spread_plan(chunks: usize, cpus: usize) -> BlockTreePlan {
+    spread_plan_under(chunks, cpus, &legacy_spread_options())
 }
 
 fn spread_plan_under(chunks: usize, cpus: usize, opts: &crate::ProofOptions) -> BlockTreePlan {
@@ -954,14 +957,40 @@ fn late_emission_probe_over_freed_small_buffers() {
     late_emission_reuse_probe("small", &[1 << 20]);
 }
 
-/// Every program id of `plan`'s tree under the tree's wrap options, as hex:
-/// each leaf's, then each node level's in node order, the top's last. Derived
-/// one program at a time (emit, build, keep the child's derived shape, drop the
-/// program), so one program is held at once. Prints the ELF digest the plan
-/// absorbs and each program's preprocessed roots by slot (`TREE ROOTS`), so two
-/// runs that disagree can be compared group by group.
+/// The recursion a plan's tree derives under, from its base: the block pin's
+/// over a block-pin base (the trees [`SMALL_TREE_IDS`] and
+/// [`PRODUCTION_HEIGHT_TREE_IDS`] pin), the legacy pin's over a legacy base
+/// ([`legacy_spread_plan`]) — never a mix, which no prover builds. The wrap
+/// options, the nodes' wrap hash and the socket a program without width-16
+/// rows runs.
+fn tree_recursion(
+    plan: &BlockTreePlan,
+) -> (crate::ProofOptions, WrapHash, super::hash::HasherKind) {
+    match crate::hash_pin::base_of_hash(plan.base().hash) {
+        crate::hash_pin::BaseHash::P1 => (
+            super::proof::block_tree_options(),
+            crate::hash_pin::BLOCK_WRAP,
+            crate::hash_pin::BLOCK_SOCKET,
+        ),
+        crate::hash_pin::BaseHash::Rpx => (
+            super::proof::aggregation_wrap_options(),
+            WrapHash::legacy(),
+            crate::hash_pin::LEGACY_HASHER,
+        ),
+    }
+}
+
+/// Every program id of `plan`'s tree under its recursion ([`tree_recursion`]),
+/// as hex: each leaf's, then each node level's in node order, the top's last.
+/// Derived one program at a time (emit, build, keep the child's derived shape,
+/// drop the program), so one program is held at once. Prints the ELF digest the
+/// plan absorbs and each program's preprocessed roots by slot (`TREE ROOTS`), so
+/// two runs that disagree can be compared group by group.
 fn tree_ids(plan: &BlockTreePlan) -> Vec<String> {
-    let wrap = super::proof::block_tree_options();
+    let (wrap, wrap_hash, socket) = tree_recursion(plan);
+    let artifacts_of = |program: &LfmProgram| {
+        super::program_census::build_artifacts_counted(program, &wrap, program.hasher(socket))
+    };
     let words = plan.child_layout().total();
     let hex = |id: &Commitment| id.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let roots = |j: usize, a: &LfmArtifacts| {
@@ -984,7 +1013,7 @@ fn tree_ids(plan: &BlockTreePlan) -> Vec<String> {
     let mut level: Vec<DerivedChild> = Vec::new();
     for k in 0..plan.partition().num_leaves() {
         let program = plan.leaf_program(k).expect("the leaf emits");
-        let artifacts = super::block_plan::artifacts_of(&program, &wrap);
+        let artifacts = artifacts_of(&program);
         roots(ids.len(), &artifacts);
         ids.push(hex(&artifacts.program_id));
         level.push(
@@ -998,8 +1027,10 @@ fn tree_ids(plan: &BlockTreePlan) -> Vec<String> {
         let mut next = Vec::new();
         for &a in &arities.arities {
             let group: Vec<DerivedChild> = kids.by_ref().take(a).collect();
-            let program = plan.node_program(&group, top).expect("the node emits");
-            let artifacts = super::block_plan::artifacts_of(&program, &wrap);
+            let program = plan
+                .node_program_under(wrap_hash, &group, top)
+                .expect("the node emits");
+            let artifacts = artifacts_of(&program);
             roots(ids.len(), &artifacts);
             ids.push(hex(&artifacts.program_id));
             next.push(
@@ -1046,23 +1077,26 @@ fn pinned_tree_ids_refuse_an_elf_they_do_not_know() {
     check_pinned_tree_ids("NONE", &pinned_spread_plan(2, 4), &[("00", &[])]);
 }
 
-/// The fixture ELF's digest on the laptop (macOS clang) and on FAST.
+/// The fixture ELF's digest on the laptop (macOS clang). FAST's, ULTRA's and
+/// RYZEN's is `f5e120d0…` (FAST 670).
 const LAPTOP_ELF_DIGEST: &str = "3b39e219ec8e9d539067daf43e89cf56c58677134c0fdbc7373ece7d042eadde";
-const FAST_ELF_DIGEST: &str = "f5e120d0eaa369d7ebdec2767b8d0c0559ceeac138edf0970d47753105df8069";
 
-/// ★ The compact program form changes no program: every id of a small spread
-/// plan's tree equals the one recorded before the form changed — on the laptop
-/// at 541f4bdc2 (#1013's d740eb5d5 + the instruments), on FAST at fe1fb1691
-/// (FAST 672, where the new sha's ids matched it, device and host).
+/// ★ The block tree's programs hold their ids: every id of a small spread
+/// plan's tree, planned over the block's base and derived under the block pin
+/// ([`pinned_spread_plan`]), equals the one recorded at P3b. A change to how a
+/// program is emitted, compacted or committed, or to the pin, moves one. (The
+/// RPX tree's ids, which guarded the compact program form from 541f4bdc2 / FAST
+/// 672, were retired with the block pin.) The box's ids are recorded with
+/// [`record_pinned_tree_ids`]; until they are, a box refuses by its digest.
 #[test]
 #[ignore = "laptop or box: run with --exact"]
 fn the_compact_program_form_keeps_a_small_trees_ids() {
     check_pinned_tree_ids("SMALL TREE IDS", &pinned_spread_plan(2, 4), &SMALL_TREE_IDS);
 }
 
-/// The same at production heights ([`production_height_plan`]: 7 leaves, 2
-/// nodes and the top), on a box: ≈ 4.7 min and 4.6 GiB on the laptop's host
-/// commit. The box gates add the 1× and median trees' top ids.
+/// The same at production heights (the 13-chunk, 40-CPU plan over the block's
+/// base), on a box: ≈ 4.7 min and 4.6 GiB on the laptop's host commit. The box
+/// gates add the 1× and median trees' top ids.
 #[test]
 #[ignore = "box tier: production-height artifacts, ≈ 4.7 min and 4.6 GiB on the laptop's host commit"]
 fn the_compact_program_form_keeps_every_production_height_tree_id() {
@@ -1073,7 +1107,27 @@ fn the_compact_program_form_keeps_every_production_height_tree_id() {
     );
 }
 
-/// [`pinned_spread_plan`]'s format with a Poseidon1 base at 4-ary cap
+/// Prints the ids [`SMALL_TREE_IDS`] pins for this machine's fixture ELF (its
+/// digest first, `TREE ELF digest`), asserting nothing: how a machine's row is
+/// recorded.
+#[test]
+#[ignore = "instrument: run with --exact --nocapture (≈ 35 s)"]
+fn record_small_tree_ids() {
+    for (j, id) in tree_ids(&pinned_spread_plan(2, 4)).iter().enumerate() {
+        println!("RECORD SMALL TREE IDS {j}: {id}");
+    }
+}
+
+/// [`record_small_tree_ids`] for [`PRODUCTION_HEIGHT_TREE_IDS`].
+#[test]
+#[ignore = "instrument, box tier: run with --exact --nocapture (≈ 4.7 min and 4.6 GiB on the laptop's host commit)"]
+fn record_production_height_tree_ids() {
+    for (j, id) in tree_ids(&pinned_spread_plan(13, 40)).iter().enumerate() {
+        println!("RECORD TREE IDS {j}: {id}");
+    }
+}
+
+/// [`legacy_spread_plan`]'s format with a Poseidon1 base at 4-ary cap
 /// `cap` (P3a).
 fn p1_spread_options(cap: stark::proof::options::CapPolicy) -> crate::ProofOptions {
     let pair = crate::zf_format::ZfFormat {
@@ -1098,7 +1152,7 @@ fn p1_spread_options(cap: stark::proof::options::CapPolicy) -> crate::ProofOptio
 fn a_p1_base_small_tree_derives() {
     use super::hash::HasherKind;
     use stark::proof::options::CapPolicy;
-    let rpx = tree_ids(&pinned_spread_plan(2, 4));
+    let rpx = tree_ids(&legacy_spread_plan(2, 4));
     for cap in [CapPolicy::Fixed(1), CapPolicy::Off] {
         let plan = spread_plan_under(2, 4, &p1_spread_options(cap));
         assert_eq!(
@@ -1347,7 +1401,7 @@ fn p1_node_program_census() {
     use stark::proof::options::{BaseFormat, CapPolicy};
     let wrap = super::proof::block_tree_options();
     for (name, opts) in [
-        ("rpx", pinned_spread_plan_options()),
+        ("rpx", legacy_spread_options()),
         ("p1-c1", p1_spread_options(CapPolicy::Fixed(1))),
     ] {
         let _ = BaseFormat::RPX;
@@ -1771,8 +1825,8 @@ fn p3b_node_census() {
     }
 }
 
-/// [`pinned_spread_plan`]'s options.
-fn pinned_spread_plan_options() -> crate::ProofOptions {
+/// [`legacy_spread_plan`]'s options: the RPX base, LogUp pairs.
+fn legacy_spread_options() -> crate::ProofOptions {
     let pair = crate::zf_format::ZfFormat {
         logup: stark::proof::options::LogUpPolicy::Pair,
         ..crate::zf_format::ZfFormat::DEFAULT
@@ -1780,58 +1834,23 @@ fn pinned_spread_plan_options() -> crate::ProofOptions {
     pair.base_options(crate::recursion::Preset::Blowup4.options())
 }
 
-/// [`the_compact_program_form_keeps_a_small_trees_ids`]'s ids by ELF digest.
-const SMALL_TREE_IDS: [(&str, &[&str]); 2] = [
-    (
-        LAPTOP_ELF_DIGEST,
-        &[
-            "ec0cf01af432b895627d8f30c4242baf927bec4152776dbfb72fc7549207bc6e",
-            "56e894da228b62995082187277db3dbcb3a8a5dc8a4e5d3ecbef27d36f2c076b",
-        ],
-    ),
-    (
-        FAST_ELF_DIGEST,
-        &[
-            "739667a9adcb14185565133c71d8c788215133379a6d8eb6c371c2c6233ff9a8",
-            "71600bdb4c4ee9098105cd0166d4580fd64cdf8f21509b6e054e71ccc5eb79a1",
-        ],
-    ),
-];
+/// [`the_compact_program_form_keeps_a_small_trees_ids`]'s ids by ELF digest:
+/// the laptop's, recorded at P3b ([`record_small_tree_ids`]); a box's row is
+/// added from its own run (laptop ids never hold on a box: the fixture ELF's
+/// bytes differ by clang).
+const SMALL_TREE_IDS: [(&str, &[&str]); 1] = [(
+    LAPTOP_ELF_DIGEST,
+    &[
+        "6854804408854a94f5882bdaac6aadce0030c051b58676b3e1d7c507781d7343",
+        "2e2020c5c5f011daf21179311f57b33c276ae2c605bc290456331b709e946782",
+    ],
+)];
 
 /// [`the_compact_program_form_keeps_every_production_height_tree_id`]'s ids by
-/// ELF digest.
-const PRODUCTION_HEIGHT_TREE_IDS: [(&str, &[&str]); 2] = [
-    (
-        LAPTOP_ELF_DIGEST,
-        &[
-            "193da2aac2d21a96430f5571d56bf290f34d8865d1fa1eeaf10d6717058538c0",
-            "b8a136ce48d98a671236a4a0531b4765ce9446f134a1258d814020b56d8c56d2",
-            "cbdc9f20884aa0227e7f6515e75592256ea1be9908e5d29416ddb7c00c1c18ba",
-            "a71a9f6384d06fa55ff73affe25f9c0a10f2d9e2087bbfe44347d06f7f16db33",
-            "56ac2dd62a1e75fc96ac5d600fc664ebc69c29bedb4973a02add0779c58f64f0",
-            "bbc20a4e8ebabb8b8789ec97817b8f8702e23bd1c54923cba0a961f62a9d3ce6",
-            "8eb7e4a80e9b8ada89769aba3cfb74df56ac57a8db11f21f4e8d009f5da834a6",
-            "7706e7ceca21108335c57bff62d1ac964898ddebcb5f221671420610d31c4183",
-            "a032aae4d0d21619c2c4ef89fe387759733b670c55c1c3e4ff65a350a5760735",
-            "eceac60369a194dc12f3a83321f88d15f990ba05cf1f882d8ea9239692d63219",
-        ],
-    ),
-    (
-        FAST_ELF_DIGEST,
-        &[
-            "93cc53931a1160fc8c109eb6d5f81ecc0cd828223367fcb0a6d2851c0810bb14",
-            "2b0b474e7b7f771bb37329b9b752b9c5625e98ba4293b6a6cbc164005cb6a1c1",
-            "0ed61e2212f08cf3fb039335af80d5c3145b65a2c74d057ea6a2692398bdef08",
-            "092289d251a74532e006eedfd89d111fe5420e20d3eb99f83cbce71d620b812d",
-            "7033ec9d5130aa89831052e30c027ac7cb6aeede9bba093654a19705d0ae9fb0",
-            "4b398b930a6f65e84762f90909eec00eced87f6159271d986e7e287b32a79cd6",
-            "100d981243118b7bded7b4989e377827124c9c435286f23713cb882d46473dea",
-            "b9fa1c3e7fd580f0d7fc87f733d282de0fbaab94b6f535475852fae48186be15",
-            "95e17686fd5a5b11dab21fd18e1cdd6cc06bf8d185ffbd72f31dad322be40b30",
-            "6e1111f64f288f6b4b94ef9baa1277a184ccc976b876ab9ec3e3519d31e64241",
-        ],
-    ),
-];
+/// ELF digest: none yet under the block pin; a box's row is recorded with
+/// [`record_production_height_tree_ids`]. Until then the test refuses by the
+/// digest, naming it.
+const PRODUCTION_HEIGHT_TREE_IDS: [(&str, &[&str]); 0] = [];
 
 /// The ELF constants a plan may take from ahead of time (beside the base) are
 /// tied to the ELF and the options they were computed under: another ELF's, or
@@ -2827,9 +2846,11 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
             &program.hasher(crate::hash_pin::BLOCK_SOCKET),
         )
     };
+    let r = node(BlockBindings::ALL);
     assert!(
-        node(BlockBindings::ALL).is_err(),
-        "a node over two blocks' leaves must not execute"
+        refused_by_a_check(&r),
+        "a node over two blocks' leaves must be refused by a check: {:?}",
+        r.err()
     );
     assert!(
         node(BlockBindings::without("state")).is_ok(),
@@ -2849,9 +2870,12 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
                 &program.hasher(crate::hash_pin::BLOCK_SOCKET),
             )
         };
+        let r = top_over(BlockBindings::ALL);
         assert!(
-            top_over(BlockBindings::ALL).is_err(),
-            "a top over shares {what} carries must not execute: they do not close the bus"
+            refused_by_a_check(&r),
+            "a top over shares {what} carries must be refused by a check (the bus does not \
+             close): {:?}",
+            r.err()
         );
         assert!(
             top_over(BlockBindings::without("bus")).is_ok(),
@@ -2973,6 +2997,19 @@ fn the_block_fixture_tree_proves_and_refuses_another_blocks_leaf() {
     }
 }
 
+/// A refusal one of a program's checks made (a failed assertion, a non-boolean
+/// bit, a non-`u32` half), not its arenas' layout: the arenas fit, so what was
+/// moved reached the check it feeds.
+fn refused_by_a_check(
+    r: &Result<super::executor::LfmExecution, super::executor::LfmExecError>,
+) -> bool {
+    use super::executor::LfmExecError as E;
+    matches!(
+        r,
+        Err(E::DivByZero { .. } | E::NonBooleanBit(_) | E::NotU32Half { .. })
+    )
+}
+
 /// ★ M1 end to end at fixture scale: the block VERIFIER
 /// ([`super::block_plan::verify_block_tree`]) derives the plan and the top
 /// program from the trusted ELF, the options and the claimed shape — no proof
@@ -3059,26 +3096,34 @@ fn the_block_verifier_derives_the_tree_and_accepts_only_its_top() {
         "the verifier's top is the program the harness proved"
     );
 
+    // Where each is refused: another output passes the top's verify (the plan
+    // and its programs do not depend on it) and fails its claims; another ELF
+    // and a lying shape derive another plan or top, so they are refused before
+    // the claims are read.
+    const CLAIMS: &str = "the top proof does not claim this ELF's id and this output";
     let other_elf = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
     let other = verify(&other_elf, &shape, &proof.public_output);
     assert!(
-        other.is_err(),
-        "another ELF's verifier must refuse the block"
+        other.as_ref().is_err_and(|e| e != CLAIMS),
+        "another ELF's verifier must refuse the block before its claims: {other:?}"
     );
     let mut output = proof.public_output.clone();
     output[0] ^= 1;
-    assert!(
-        verify(&elf_bytes, &shape, &output).is_err(),
-        "another claimed output must be refused"
+    assert_eq!(
+        verify(&elf_bytes, &shape, &output),
+        Err(CLAIMS.to_string()),
+        "another claimed output must be refused by the claims"
     );
     let mut lie = shape.clone();
     let i = (0..lie.trace_lengths.len())
         .find(|&i| !rb.plan.instance(i).name.starts_with("PAGE") && lie.trace_lengths[i] < 1 << 10)
         .expect("a small table");
     lie.trace_lengths[i] *= 2;
+    let lied = verify(&elf_bytes, &lie, &proof.public_output);
     assert!(
-        verify(&elf_bytes, &lie, &proof.public_output).is_err(),
-        "a shape that lies about instance {i}'s trace length must be refused"
+        lied.as_ref().is_err_and(|e| e != CLAIMS),
+        "a shape that lies about instance {i}'s trace length must be refused before the \
+         claims: {lied:?}"
     );
     println!(
         "BLOCK VERIFIER FIXTURE: accepts the plan's tree; refuses another ELF ({}), another \
