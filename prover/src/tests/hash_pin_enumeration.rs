@@ -49,11 +49,12 @@ const ALIAS_CALLS: &[&str] = &[
 /// The pinned spellings, which contain [`ALIAS_CALLS`] as substrings.
 const PIN_CALLS: &[&str] = &["BlockProver::", "BlockVerifier::"];
 
-/// ★★ Items `prover` may name from `stark::config` — the hash-AGNOSTIC three.
+/// ★★ Items `prover` may name from `stark::config` — the hash-AGNOSTIC ones.
 ///
 /// **Everything else that module exports is a spelling of the workspace
-/// DEFAULT**, so this is an ALLOWLIST over a namespace rather than a list of
-/// forbidden names, and that difference is the point.
+/// DEFAULT or a concrete configuration of its own** (`P1StarkHashCapped`), so
+/// this is an ALLOWLIST over a namespace rather than a list of forbidden
+/// names, and that difference is the point.
 ///
 /// ⚠ The three misses this gate has had — `DefaultStarkHash` as a substring,
 /// then the `Prover`/`Verifier` call forms, then the Merkle backend type
@@ -87,12 +88,27 @@ const CONFIG_ALLOWED: &[&str] = &[
     // Added when `80d746321` gave `lfm/algebraic_commit.rs` a host grinding
     // test spelling `GrindingDigest<RpxStarkHash>`.
     "GrindingDigest",
-    // `TreeGeometry` is a configuration's tree shape as a value, its arity and
-    // its 4-ary cap, and names no hash: `TreeGeometry::of::<H>()` reads the
-    // configuration its caller names, and `TreeGeometry::BINARY` is the shape
-    // of every configuration that is not 4-ary. The query emitter asserts the
-    // builder's arity against the shape's (`sub_proof::emit_query_from_bits`),
-    // so a shape of the other arity is refused at emission.
+    // `TreeGeometry` is a configuration's tree shape as a value: its arity and
+    // its 4-ary cap. It names no hash, backend or transcript, so it cannot
+    // choose what a tree is hashed with. `TreeGeometry::of::<H>()` reads the
+    // configuration its caller names, and a concrete tag spelled from this
+    // namespace still flags. `TreeGeometry::BINARY` is a constant, not a
+    // generic: the shape of every configuration that is not 4-ary, the
+    // workspace default's among them, and allowing the name allows it at
+    // every site. So this gate does not ask what a binary shape is paired
+    // with; the consumer does. Both leg emitters assert the builder's arity
+    // against the shape's (`sub_proof::emit_query_from_bits`,
+    // `fri::emit_query_fri`), so a shape of the other arity is refused when
+    // the program is emitted, and the block path takes its shapes from its
+    // family (`TreeGeometry::of::<Fam::Stark>()`, the type parameter its
+    // builder's wrap hash comes from). One binary shape does reach the block
+    // path: `FriShape::for_layout` defaults to it and the challenge replay's
+    // shape (`TableChallengeShape::derive`) keeps the default. That replay
+    // reads fold counts and index bits and no tree shape, and the leg shape
+    // replaces the default (`TableVerifyShape::derive_with`). A replay that
+    // starts reading a tree's shape must take the family's first. In the
+    // block's own files the name is refused in production code by the
+    // block-path scan (`block_whir_p1_tests`, its `FAMILY_ONLY` names).
     "TreeGeometry",
 ];
 
@@ -238,10 +254,19 @@ const BLESSED: &[(&str, &str)] = &[
         "One mention: the re-export of `stark::config::P1StarkHashCapped`, the \
          Poseidon1 STARK configuration generic over its 4-ary cap, which this \
          module fixes at `P1_STARK_CAP` as `P1StarkHash`. It NAMES a hash that \
-         is not the workspace default, the opposite of implying one, and \
-         production reaches it through `hash_pin::P1Family` alone. The file \
-         is blessed rather than the name allowed, so another site spelling \
-         `stark::config::P1StarkHashCapped` at a cap of its own still flags.",
+         is not the workspace default, so no default is handed to any consumer \
+         and the question this list asks has no subject here. Reachability: \
+         production names the configuration at one place, \
+         `hash_pin::P1Family::Stark`, and the block path names `BlockFamily`, \
+         never this module; the module's other production readers are \
+         `transcript_replay`'s Poseidon1 arms, selected by the builder's wrap \
+         hash, which is the family's. The file is blessed rather than the name \
+         allowed, so a site spelling `stark::config::P1StarkHashCapped` at a \
+         cap of its own still flags. A site that reaches the same type through \
+         this module's re-export does not: this gate sees a configuration only \
+         by its `stark::config` spelling. Blessing a file excuses every flagged \
+         symbol in it, so this file stays a module of re-exports and constants: \
+         nothing that proves, verifies or commits belongs here.",
     ),
 ];
 

@@ -617,6 +617,13 @@ mod scan {
         "::prove(",
     ];
 
+    /// What the block path takes from its family alone, as code: a binary
+    /// tree shape (the block's shapes are `TreeGeometry::of::<Fam::Stark>()`),
+    /// and the Poseidon1 family or its configuration module by name (the
+    /// block names `BlockFamily`, so a flip of that alias moves every site).
+    /// None may appear in a production line of the block path.
+    pub(super) const FAMILY_ONLY: &[&str] = &["TreeGeometry::BINARY", "P1Family", "p1_commit"];
+
     /// One file of the scan: its name, its production entry points (each must
     /// survive the `#[cfg(test)]` skipper, so a misplaced gate cannot hide the
     /// code after it), and the family-instantiated sites it must hold, with
@@ -642,7 +649,7 @@ mod scan {
                     return Err(format!("{}: the scan does not reach `{a}`", f.name));
                 }
             }
-            for name in LEGACY.iter().chain(f.forbidden) {
+            for name in LEGACY.iter().chain(FAMILY_ONLY).chain(f.forbidden) {
                 let n = count(&code, name);
                 if n > 0 {
                     return Err(format!(
@@ -747,9 +754,11 @@ mod scan {
 /// transcript, prover, verifier or socket, or a legacy-family entry point
 /// (`LegacyFamily`'s instances: `lfm_prove`, `LfmFilled::prove`,
 /// `verify_against_artifacts`, `harvest_child`, …); every LFM site of the W3
-/// tree is instantiated at `BlockFamily`, at its exact count. Read as code
-/// tokens ([`scan`]), so a comment or a string neither hides a site nor fakes
-/// one.
+/// tree is instantiated at `BlockFamily`, at its exact count. Nor does one
+/// name a binary tree shape, the Poseidon1 family or its configuration module
+/// (`scan::FAMILY_ONLY`): the block takes its shapes and its hash from
+/// `BlockFamily` alone. Read as code tokens ([`scan`]), so a comment or a
+/// string neither hides a site nor fakes one.
 #[test]
 fn no_block_path_site_names_the_legacy_pin() {
     scan::check(&scan::block_path()).unwrap_or_else(|e| panic!("{e}"));
@@ -759,8 +768,10 @@ fn no_block_path_site_names_the_legacy_pin() {
 /// sources (REV-P3B14-A A3): the leaf prove put back to dcc4703e9's legacy
 /// `filled.prove(artifacts, …)` with the family's name left in a comment; a
 /// legacy name in a statement split over lines; a `#[cfg(test)]` that would
-/// swallow a production function; and the scan reads past comments and
-/// strings without false positives.
+/// swallow a production function; a binary tree shape at the harvest's
+/// family site, the Poseidon1 family named in the plan in place of
+/// `BlockFamily`, and its configuration module named there; and the scan
+/// reads past comments and strings without false positives.
 #[test]
 fn the_block_path_scan_refuses_planted_regressions() {
     let planted = |file: &str, from: &str, to: &str| -> Result<(), String> {
@@ -797,6 +808,30 @@ fn the_block_path_scan_refuses_planted_regressions() {
     )
     .expect_err("a gated entry point");
     assert!(e.contains("does not reach"), "{e}");
+    // A binary shape where the harvest takes its family's.
+    let e = planted(
+        "lfm/harvest.rs",
+        "stark::config::TreeGeometry::of::<Fam::Stark>(),",
+        "stark::config::TreeGeometry::BINARY,",
+    )
+    .expect_err("a binary shape on the block path");
+    assert!(e.contains("`TreeGeometry::BINARY`"), "{e}");
+    // The Poseidon1 family by name where the plan names the block's.
+    let e = planted(
+        "lfm/whir_block.rs",
+        "from_artifacts_under::<crate::hash_pin::BlockFamily>(",
+        "from_artifacts_under::<crate::hash_pin::P1Family>(",
+    )
+    .expect_err("the Poseidon1 family by name");
+    assert!(e.contains("`P1Family`"), "{e}");
+    // Its configuration module named in the plan.
+    let e = planted(
+        "lfm/whir_block.rs",
+        "pub fn artifacts_of(",
+        "fn planted() -> u8 { crate::lfm::p1_commit::P1_STARK_CAP }\npub fn artifacts_of(",
+    )
+    .expect_err("the Poseidon1 configuration module by name");
+    assert!(e.contains("`p1_commit`"), "{e}");
     // Comments and strings are no sites.
     assert_eq!(
         planted(
