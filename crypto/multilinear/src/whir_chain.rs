@@ -1062,6 +1062,23 @@ where
         }
     }
 
+    /// The successor a `levels`-level fold of `codeword` would make, encoded
+    /// from the message these rounds bound — on a device, when the factors and
+    /// the codeword are both there and `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR` is on.
+    /// `None` is the fold's turn.
+    fn encode_successor<C: IsField>(
+        &mut self,
+        codeword: &Codeword<C>,
+        levels: usize,
+    ) -> Option<Codeword<E>> {
+        match (self, codeword.device()) {
+            (Self::Device(device), Some(held)) => {
+                device.encode_successor(held, levels).map(Codeword::Device)
+            }
+            _ => None,
+        }
+    }
+
     /// `weight += gamma·eq(point, ·)`, the weight the next group carries.
     fn add_scaled_eq(
         &mut self,
@@ -1232,10 +1249,21 @@ where
 
         // The fold lands in the extension whichever field it started in, so
         // the field is the only thing the two cases differ in — and a codeword
-        // the device holds is folded where it is.
+        // the device holds is folded where it is. The first one, the widest,
+        // may be encoded from the message the rounds just bound instead: the
+        // same codeword (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR`).
         let __wc_fold = crate::whir_split::mark();
         let (folded, folded_domain) = match &current {
-            Current::Base(held) => fold_held::<F, F, E>(held.codeword(), &current_domain, &alphas)?,
+            Current::Base(held) => match factors.encode_successor(held.codeword(), k) {
+                Some(encoded) => {
+                    let mut folded_domain = current_domain.clone();
+                    for _ in 0..k {
+                        folded_domain = folded_domain.squared()?;
+                    }
+                    (encoded, folded_domain)
+                }
+                None => fold_held::<F, F, E>(held.codeword(), &current_domain, &alphas)?,
+            },
             Current::Extension(held) => {
                 fold_held::<F, E, E>(held.codeword(), &current_domain, &alphas)?
             }
@@ -2598,9 +2626,10 @@ mod tests {
     fn every_successor_is_the_bound_message_encoded_at_the_production_shape() {
         use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as E;
         type EE = FieldElement<E>;
-        let bytes = |values: &[EE]| -> Vec<u8> { values.iter().flat_map(|v| v.as_bytes()).collect() };
+        let bytes =
+            |values: &[EE]| -> Vec<u8> { values.iter().flat_map(|v| v.as_bytes()).collect() };
         let lift = |m: &Mle<F>| -> Mle<E> {
-            Mle::new(m.evals().iter().map(|v| v.clone().to_extension::<E>()).collect()).unwrap()
+            Mle::new(m.evals().iter().map(|v| (*v).to_extension::<E>()).collect()).unwrap()
         };
 
         let num_vars = 15;
@@ -2671,7 +2700,11 @@ mod tests {
                 let unreversed =
                     encode::<F, E>(&crate::whir::monomial_coefficients(bound), &folded_domain)
                         .unwrap();
-                assert_ne!(bytes(&unreversed), bytes(&folded), "the lift's order matters");
+                assert_ne!(
+                    bytes(&unreversed),
+                    bytes(&folded),
+                    "the lift's order matters"
+                );
                 let mut other_end = lift(&message);
                 for alpha in &alphas {
                     other_end.fix_last_variable_in_place(alpha).unwrap();

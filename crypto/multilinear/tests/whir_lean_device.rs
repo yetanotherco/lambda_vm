@@ -8,13 +8,15 @@
 //! cargo test --release -p multilinear --features cuda --test whir_lean_device
 //! ```
 //!
-//! Three arms: the path before the kernels (lean rounds 0, folds level by
+//! Four arms: the path before the kernels (lean rounds 0, folds level by
 //! level), six lean rounds with the fused fold (`LAMBDA_VM_WHIR_LEAN_ROUNDS=6`,
-//! the way back), and the defaults (three lean rounds, the fused fold). Needs a
-//! GPU. Both new paths are asserted TAKEN in the kernel arms and NOT in the
-//! first (the call counters), so a card that declined could not turn this into
-//! a comparison of today's path with itself. One `#[test]`: the arms switch a
-//! process-wide override, and parallel tests would race it.
+//! the way back), the defaults (three lean rounds, the fused fold), and the
+//! defaults with the first successor encoded from the bound message instead of
+//! folded (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=1`). Needs a GPU. Each new path is
+//! asserted TAKEN in its arms and NOT in the others (the call counters), so a
+//! card that declined could not turn this into a comparison of today's path
+//! with itself. One `#[test]`: the arms switch process-wide overrides, and
+//! parallel tests would race them.
 #![cfg(feature = "cuda")]
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
@@ -114,6 +116,9 @@ enum Arm {
     Six,
     /// Nothing forced: the defaults, three lean rounds and the fused fold.
     Defaults,
+    /// The defaults, with each chain's first successor encoded from its bound
+    /// message (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=1`).
+    Encoded,
 }
 
 /// One arm: the path before the kernels or the two kernels.
@@ -123,6 +128,7 @@ fn prove_arm<H: WhirHash>(
     resident: Option<&gpu::ResidentColumns>,
 ) -> (StackedProof<F, Ext>, Vec<[u8; 32]>) {
     let lean = !matches!(arm, Arm::Materialised);
+    gpu::force_encode_successor(Some(matches!(arm, Arm::Encoded)));
     match arm {
         Arm::Materialised => {
             gpu::force_lean_rounds(Some(0));
@@ -132,7 +138,7 @@ fn prove_arm<H: WhirHash>(
             gpu::force_lean_rounds(Some(6));
             gpu::force_fused_fold(Some(true));
         }
-        Arm::Defaults => {
+        Arm::Defaults | Arm::Encoded => {
             gpu::force_lean_rounds(None);
             gpu::force_fused_fold(None);
             if std::env::var_os("LAMBDA_VM_WHIR_LEAN_ROUNDS").is_none() {
@@ -153,6 +159,7 @@ fn prove_arm<H: WhirHash>(
     )
     .unwrap();
     let (lean_before, fused_before) = (gpu::lean_open_calls(), gpu::fused_fold_calls());
+    let encoded_before = gpu::encoded_successors();
     let (opens_before, folds_before) = (gpu::open_calls(), gpu::resident_fold_calls());
     let proof = stacked_eval::prove::<F, Ext, _, H, _>(
         &stacked,
@@ -177,6 +184,18 @@ fn prove_arm<H: WhirHash>(
     );
     assert!(opens > 0, "{}: no opening ran on the device", H::NAME);
     assert!(folds > 0, "{}: no fold ran on the device", H::NAME);
+    // Each chain's first successor, and only in its arm: one a chain, and the
+    // chain's later folds still fold.
+    assert_eq!(
+        gpu::encoded_successors() - encoded_before,
+        if matches!(arm, Arm::Encoded) {
+            opens
+        } else {
+            0
+        },
+        "{} {arm:?}: successors encoded",
+        H::NAME
+    );
     if lean {
         assert!(
             lean_opens > 0,
@@ -221,7 +240,7 @@ fn prove_arm<H: WhirHash>(
 fn both_arms<H: WhirHash>(c: &Case, resident: Option<&gpu::ResidentColumns>) {
     let (today, today_roots) = prove_arm::<H>(c, Arm::Materialised, resident);
     let today_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&today).unwrap();
-    for arm in [Arm::Six, Arm::Defaults] {
+    for arm in [Arm::Six, Arm::Defaults, Arm::Encoded] {
         let (lean, lean_roots) = prove_arm::<H>(c, arm, resident);
         assert_eq!(today_roots, lean_roots, "{} {arm:?}: roots", H::NAME);
         assert_eq!(
@@ -229,7 +248,7 @@ fn both_arms<H: WhirHash>(c: &Case, resident: Option<&gpu::ResidentColumns>) {
                 .unwrap()
                 .as_slice(),
             today_bytes.as_slice(),
-            "{} ({}, {arm:?}): the lean opening and the fused fold must prove today's bytes",
+            "{} ({}, {arm:?}): the kernels must prove today's bytes",
             H::NAME,
             if resident.is_some() {
                 "resident"
@@ -250,4 +269,5 @@ fn the_memory_kernels_prove_todays_bytes() {
     both_arms::<RpxWhir>(&c, Some(&store));
     gpu::force_lean_rounds(None);
     gpu::force_fused_fold(None);
+    gpu::force_encode_successor(None);
 }

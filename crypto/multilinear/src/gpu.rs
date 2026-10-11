@@ -90,6 +90,10 @@ static FUSED_FOLD_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Folds of a codeword the device holds, in one launch or one per level: what
 /// [`FUSED_FOLD_CALLS`] is a share of.
 static RESIDENT_FOLD_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Successors encoded from their bound message instead of folded from the
+/// codeword (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR`; D-SPEED lever 5a). Not in
+/// [`RESIDENT_FOLD_CALLS`]: no fold ran.
+static ENCODED_SUCCESSORS: AtomicU64 = AtomicU64::new(0);
 /// ★ Stacked openings whose codeword the device holds but whose factors the
 /// device did not build from the shares.
 ///
@@ -330,6 +334,26 @@ pub fn resident_fold_calls() -> u64 {
     RESIDENT_FOLD_CALLS.load(Ordering::Relaxed)
 }
 
+/// Successors encoded from their bound message rather than folded — see
+/// [`ENCODED_SUCCESSORS`].
+pub fn encoded_successors() -> u64 {
+    ENCODED_SUCCESSORS.load(Ordering::Relaxed)
+}
+
+/// Whether a chain's first successor is encoded from its bound message
+/// (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=1`, or a test's override). `false` in a
+/// build without a device.
+pub fn encode_successor_in_effect() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        encode_successor()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
+}
+
 /// The rounds a stacked opening runs over its shares, as this process reads
 /// `LAMBDA_VM_WHIR_LEAN_ROUNDS` (or a test's override). `0` in a build without
 /// a device, where no opening runs there.
@@ -448,6 +472,7 @@ pub fn reset_call_counters() {
     LEAN_OPEN_CALLS.store(0, Ordering::Relaxed);
     FUSED_FOLD_CALLS.store(0, Ordering::Relaxed);
     RESIDENT_FOLD_CALLS.store(0, Ordering::Relaxed);
+    ENCODED_SUCCESSORS.store(0, Ordering::Relaxed);
     OPEN_HOST_FALLBACKS.store(0, Ordering::Relaxed);
     ROOM_PARKS.store(0, Ordering::Relaxed);
     ROOM_TURNS.store(0, Ordering::Relaxed);
@@ -811,6 +836,7 @@ pub fn room_turns_for(
         next_fold,
         lean_rounds: lean_rounds(),
         fused: fused_fold(),
+        encoded: encode_successor(),
         staged,
         shares: shares.iter().copied().max().unwrap_or(0),
         eq_values: eq_values.iter().copied().max().unwrap_or(0),
@@ -4644,6 +4670,43 @@ fn fused_fold() -> bool {
     }
 }
 
+/// Whether a chain's first successor is encoded from the message its rounds
+/// bound rather than folded from the committed codeword
+/// (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=1`; off by default until gated). The
+/// same values either way (`math_cuda::whir::encode_successor`): the fold
+/// reads the `2^(n+blowup)` base codeword, the encode a `2^(n−k)` message.
+#[cfg(feature = "cuda")]
+fn encode_successor() -> bool {
+    match ENCODE_SUCCESSOR_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| {
+                std::env::var("LAMBDA_VM_WHIR_ENCODE_SUCCESSOR").is_ok_and(|v| v.trim() == "1")
+            })
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+static ENCODE_SUCCESSOR_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR` for the whole process. `None`
+/// restores the environment's setting. Not for production callers.
+#[doc(hidden)]
+#[cfg(feature = "cuda")]
+pub fn force_encode_successor(on: Option<bool>) {
+    ENCODE_SUCCESSOR_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
 /// The same override for the fused fold. Not for production callers.
 #[doc(hidden)]
 #[cfg(feature = "cuda")]
@@ -4869,6 +4932,25 @@ impl OpeningFactors {
     pub fn is_lean(&self) -> bool {
         matches!(self.state, OpeningState::Lean { .. })
     }
+
+    /// ★ The successor a `levels`-level fold of `codeword` would make, encoded
+    /// from the message these factors' rounds bound
+    /// ([`math_cuda::whir_open::OpeningSession::encode_successor`]), when
+    /// `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR` is on. `None` sends the caller to the
+    /// fold: the knob off, or the card declining.
+    pub(crate) fn encode_successor(
+        &mut self,
+        codeword: &DeviceCodeword,
+        levels: usize,
+    ) -> Option<DeviceCodeword> {
+        if !encode_successor() {
+            return None;
+        }
+        let session = self.materialize().ok()?;
+        let successor = session.encode_successor(&codeword.0, levels).ok()?;
+        ENCODED_SUCCESSORS.fetch_add(1, Ordering::Relaxed);
+        Some(DeviceCodeword(successor))
+    }
 }
 
 /// A point as the limbs the kernels read.
@@ -4922,6 +5004,14 @@ impl OpeningFactors {
     where
         E: math::field::traits::IsField + 'static,
     {
+        match self.0 {}
+    }
+
+    pub(crate) fn encode_successor(
+        &mut self,
+        _codeword: &DeviceCodeword,
+        _levels: usize,
+    ) -> Option<DeviceCodeword> {
         match self.0 {}
     }
 }
