@@ -1,12 +1,13 @@
-//! D-WHIR-P1 S3: the block's base hash is a format field. A block format whose
-//! base is [`BaseFormat::P1_WHIR`] proves and verifies under ZisK's Poseidon1
-//! (4-ary trees capped at height 2, its field sponge and W8 grind), selected by
-//! the format alone; RPX stays today's, byte for byte; the two bases do not
-//! cross-verify; and the statement's tag names the base's geometry.
+//! D-WHIR-P1 S3, D-P3B P3: the block's base is its proof family's
+//! ([`crate::hash_pin::BlockFamily`]): [`BaseFormat::P1_WHIR`], ZisK's
+//! Poseidon1 (4-ary trees capped at height 2, its field sponge and W8 grind).
+//! The format names it, the family pins it: any other base — RPX's included —
+//! is refused; a P1 proof verifies under no other base; and the statement's tag
+//! names the base's geometry.
 
 use crate::block_whir::{
-    self, BlockFormat, BlockHash, BlockOptions, BlockWhirProof, Deviations, MAX_P1_CAP_HEIGHT,
-    P1_TAG_OMITTED, block_statement_tag, checked_base, prove_block_whir_with, verify_block_whir,
+    self, BlockFormat, BlockOptions, BlockWhirProof, Deviations, MAX_P1_CAP_HEIGHT, P1_TAG_OMITTED,
+    block_statement_tag, checked_base, prove_block_whir_with, verify_block_whir,
 };
 use crate::statement::MULTILINEAR_BLOCK_TAG;
 use crate::tables::MaxRowsConfig;
@@ -78,78 +79,77 @@ fn verify(proof: &BlockWhirProof, elf: &[u8], format: &BlockFormat) -> bool {
     verify_block_whir(proof, elf, &ProofOptions::default_test_options(), format).unwrap_or(false)
 }
 
-/// The tag names the base's effective geometry; RPX's is today's.
+/// The tag names the base's effective geometry under the family's hash: no
+/// base, RPX's included, gets the untagged V1 tag.
 #[test]
 fn the_statement_tag_names_the_bases_geometry() {
-    assert_eq!(block_statement_tag(&BaseFormat::RPX), MULTILINEAR_BLOCK_TAG);
     let p1 = |cap| BaseFormat {
         hash: CommitmentHash::Poseidon1,
         arity4_cap: cap,
     };
     let tag = |cap| String::from_utf8(block_statement_tag(&p1(cap))).expect("ascii");
-    let rpx = String::from_utf8(MULTILINEAR_BLOCK_TAG.to_vec()).expect("ascii");
-    assert_eq!(tag(CapPolicy::Fixed(2)), format!("{rpx}/P1W16/C2"));
+    let v1 = String::from_utf8(MULTILINEAR_BLOCK_TAG.to_vec()).expect("ascii");
+    assert_ne!(block_statement_tag(&BaseFormat::RPX), MULTILINEAR_BLOCK_TAG);
+    assert_eq!(tag(CapPolicy::Fixed(2)), format!("{v1}/P1W16/C2"));
     assert_eq!(
         block_statement_tag(&BaseFormat::P1_WHIR),
         tag(CapPolicy::Fixed(2)).as_bytes()
     );
-    assert_eq!(tag(CapPolicy::Off), format!("{rpx}/P1W16/C0"));
+    assert_eq!(tag(CapPolicy::Off), format!("{v1}/P1W16/C0"));
     assert_eq!(
         tag(CapPolicy::Fixed(0)),
         tag(CapPolicy::Off),
         "both uncapped"
     );
-    assert_eq!(tag(CapPolicy::Auto), format!("{rpx}/P1W16/Cauto"));
+    assert_eq!(tag(CapPolicy::Auto), format!("{v1}/P1W16/Cauto"));
     assert_ne!(tag(CapPolicy::Fixed(1)), tag(CapPolicy::Fixed(2)));
 }
 
-/// The base check: RPX and Poseidon1 at a cap its trees run, and nothing else.
+/// The base check: the block proof family's base and nothing else — not RPX,
+/// not Poseidon1 at another cap, not another hash.
 #[test]
 fn checked_base_refuses_what_no_block_proves() {
-    assert_eq!(checked_base(&BaseFormat::RPX).ok(), Some(BlockHash::Rpx));
-    assert_eq!(
-        checked_base(&BaseFormat::P1_WHIR).ok(),
-        Some(BlockHash::Poseidon1)
+    let family = crate::hash_pin::BLOCK_BASE;
+    assert_eq!(family, BaseFormat::P1_WHIR);
+    assert!(checked_base(&family).is_ok());
+    assert!(
+        checked_base(&BaseFormat::RPX).is_err(),
+        "RPX left the block path"
     );
     for cap in [
         CapPolicy::Off,
         CapPolicy::Auto,
+        CapPolicy::Fixed(1),
         CapPolicy::Fixed(MAX_P1_CAP_HEIGHT as u8),
+        CapPolicy::Fixed(MAX_P1_CAP_HEIGHT as u8 + 1),
     ] {
         let base = BaseFormat {
             arity4_cap: cap,
             ..BaseFormat::P1_WHIR
         };
-        assert_eq!(
-            checked_base(&base).ok(),
-            Some(BlockHash::Poseidon1),
-            "{cap}"
-        );
+        assert!(checked_base(&base).is_err(), "{cap}");
     }
-    let tall = BaseFormat {
-        arity4_cap: CapPolicy::Fixed(MAX_P1_CAP_HEIGHT as u8 + 1),
-        ..BaseFormat::P1_WHIR
-    };
-    assert!(checked_base(&tall).is_err(), "a cap no tree runs at");
     for hash in [
         CommitmentHash::Keccak256,
         CommitmentHash::Blake3,
         CommitmentHash::Rpo256,
+        CommitmentHash::Rpx256,
         CommitmentHash::Poseidon,
     ] {
         let base = BaseFormat {
             hash,
-            arity4_cap: CapPolicy::Off,
+            ..BaseFormat::P1_WHIR
         };
         assert!(checked_base(&base).is_err(), "{hash:?}");
     }
 }
 
-/// ★ One process proves and verifies both bases, each selected by the format
-/// alone; neither verifies under the other's format; and the P1 proof is not
-/// the RPX one. Groups retire and revive between the phases (drop 3).
+/// ★ A block proves and verifies under the family's base; it verifies under no
+/// other (RPX's, or Poseidon1 at another cap), and no other base proves: the
+/// format names the base, the family decides it. Groups retire and revive
+/// between the phases (drop 3).
 #[test]
-fn a_block_proves_under_both_bases_and_they_do_not_cross_verify() {
+fn a_block_proves_under_its_family_base_and_no_other_verifies_it() {
     let elf = asm_elf_bytes("all_instructions_64");
     let (rpx, p1) = (
         many_groups(BaseFormat::RPX),
@@ -165,16 +165,18 @@ fn a_block_proves_under_both_bases_and_they_do_not_cross_verify() {
         !verify(&p1_proof, &elf, &rpx),
         "a P1 proof under the RPX format"
     );
-    let rpx_proof = prove(&elf, &rpx, 3);
     assert!(
-        verify(&rpx_proof, &elf, &rpx),
-        "an RPX proof under the RPX format"
+        prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &rpx,
+            &options(3),
+            &Deviations::default(),
+        )
+        .is_err(),
+        "an RPX base is refused, not proved"
     );
-    assert!(
-        !verify(&rpx_proof, &elf, &p1),
-        "an RPX proof under the P1 format"
-    );
-    assert_ne!(p1_proof.proof.roots, rpx_proof.proof.roots);
     // The cap is the verifier's constant too.
     let other_cap = many_groups(BaseFormat {
         arity4_cap: CapPolicy::Fixed(1),
@@ -184,8 +186,9 @@ fn a_block_proves_under_both_bases_and_they_do_not_cross_verify() {
 }
 
 /// ★ The tag is in the statement: a P1 proof is refused by a verifier that
-/// absorbs RPX's tag in its place, and a proof made and verified with RPX's tag
-/// in both places is accepted — the tag is the only thing the mutation moves.
+/// absorbs the untagged `…_V1` tag in its place, and a proof made and verified
+/// with that tag in both places is accepted — the tag is the only thing the
+/// mutation moves.
 #[test]
 fn the_p1_statement_tag_is_bound() {
     let elf = asm_elf_bytes("sub");
@@ -197,7 +200,7 @@ fn the_p1_statement_tag_is_bound() {
     let untagged = prove(&elf, &p1, 0);
     let both_untagged = verify(&untagged, &elf, &p1);
     P1_TAG_OMITTED.with(|omitted| omitted.set(false));
-    assert!(refused, "a P1 proof verified under RPX's tag");
+    assert!(refused, "a P1 proof verified under the untagged tag");
     assert!(both_untagged, "the mutation is the tag alone");
     assert!(
         !verify(&untagged, &elf, &p1),
@@ -207,8 +210,8 @@ fn the_p1_statement_tag_is_bound() {
 
 /// ★ The statement the Poseidon1 leaf absorbs call by call
 /// (`block_statement_calls`) is `absorb_block`'s own: the calls concatenate to
-/// the RPX leaf's one run (`block_statement_bytes`), and `P1Transcript` fed
-/// them lands where `absorb_block` leaves it.
+/// the statement's one run (`block_statement_bytes`, the block id's preimage),
+/// and `P1Transcript` fed them lands where `absorb_block` leaves it.
 #[test]
 fn the_statement_calls_are_absorb_blocks_own() {
     use crypto::fiat_shamir::is_transcript::IsTranscript;
@@ -266,10 +269,9 @@ fn dispatched(base: BaseFormat) -> Result<&'static str, crate::Error> {
     }))
 }
 
-/// ★ The dispatch itself, whatever the process's knob says: an RPX base binds
-/// `RpxWhir` and a Poseidon1 base `P1Whir`. Where the knob is unset (its
-/// default keccak, as in CI) or keccak, an RPX arm still reading it would bind
-/// `KeccakWhir` here — the behaviour the source test below can only infer.
+/// ★ The dispatch itself, whatever the process's knob says: the family's base
+/// binds the family's WHIR configuration (`P1Whir`), and every other base —
+/// RPX's, keccak's — is refused, not bound to a configuration of its own.
 #[test]
 fn the_base_alone_binds_the_block_hash() {
     println!(
@@ -277,12 +279,12 @@ fn the_base_alone_binds_the_block_hash() {
         std::env::var(crate::whir_hash_knob::ENV)
     );
     assert_eq!(
-        dispatched(BaseFormat::RPX).expect("RPX dispatches"),
-        std::any::type_name::<multilinear::whir_hash::RpxWhir>()
-    );
-    assert_eq!(
         dispatched(BaseFormat::P1_WHIR).expect("Poseidon1 dispatches"),
         std::any::type_name::<multilinear::whir_hash::P1Whir>()
+    );
+    assert!(
+        dispatched(BaseFormat::RPX).is_err(),
+        "an RPX base is refused"
     );
     let keccak = BaseFormat {
         hash: CommitmentHash::Keccak256,
@@ -293,9 +295,9 @@ fn the_base_alone_binds_the_block_hash() {
 
 /// ★ No environment read decides the base: the block's prove, verify and
 /// plan sites dispatch through `with_block_hash!` on the format alone, whose
-/// arms — RPX's and Poseidon1's — and base check read no environment and never
-/// consult the WHIR hash knob, and the plan reads no knob either
-/// (D-WHIR-P1 S7: `LAMBDA_VM_WHIR_HASH` left the block path).
+/// body — the base check, then the family's configuration — reads no
+/// environment and never consults the WHIR hash knob, and the plan reads no
+/// knob either (D-WHIR-P1 S7: `LAMBDA_VM_WHIR_HASH` left the block path).
 #[test]
 fn no_environment_read_decides_the_base() {
     let block = include_str!("../block_whir.rs");
@@ -318,9 +320,12 @@ fn no_environment_read_decides_the_base() {
     let arms = &knob[knob
         .find("macro_rules! with_block_hash")
         .expect("the macro")..];
-    let arms = &arms[arms.find("match $crate::block_whir").expect("the match")..];
     let arms = &arms[..arms.find("\n}\n").expect("its end")];
-    assert!(arms.contains("BlockHash::Rpx") && arms.contains("BlockHash::Poseidon1"));
+    assert!(
+        arms.contains("checked_base(&$base)?")
+            && arms.contains("type $h = $crate::hash_pin::BlockWhirHash;"),
+        "the macro checks the base and binds the family's configuration"
+    );
     for (name, source) in [
         ("checked_base", check),
         ("the tag", tag),
@@ -341,4 +346,69 @@ fn no_environment_read_decides_the_base() {
     for read in ["whir_hash_knob", "with_whir_hash", "LAMBDA_VM_WHIR_HASH"] {
         assert!(!plan.contains(read), "the block plan names {read}");
     }
+}
+
+/// ★ The block path names one proof family (D-P3B §2.1, review item 1): no
+/// LFM prove, verify, harvest, shape or artifact site of the W3 tree is at the
+/// legacy pin. The plan, the tree driver, the node and the block's dispatch
+/// name neither the legacy family nor the pin's configuration, transcript,
+/// prover, verifier or socket, nor the legacy-family entry points (which are
+/// `LegacyFamily`'s instances); they reach the LFM through `BlockFamily`.
+#[test]
+fn no_block_path_site_names_the_legacy_pin() {
+    let files = [
+        ("block_whir.rs", include_str!("../block_whir.rs")),
+        ("lfm/whir_block.rs", include_str!("../lfm/whir_block.rs")),
+        (
+            "lfm/whir_block_tree.rs",
+            include_str!("../lfm/whir_block_tree.rs"),
+        ),
+        ("lfm/block_node.rs", include_str!("../lfm/block_node.rs")),
+    ];
+    let legacy = [
+        "LegacyFamily",
+        "BlockStarkHash",
+        "BlockTranscript",
+        "block_transcript(",
+        "BlockProver",
+        "BlockVerifier",
+        "BLOCK_HASHER",
+        "BLOCK_COMMITMENT_HASH",
+        "WrapHash::production()",
+        "verify_against_artifacts(",
+        "harvest_child(",
+        "DerivedChild::from_artifacts(",
+        "build_artifacts_counted(",
+        ".prove(&",
+        "lfm_prove(",
+    ];
+    for (name, source) in files {
+        // Only the code: the block path's own tests may name what they refuse.
+        let code = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or(source);
+        for word in legacy {
+            assert!(!code.contains(word), "{name} names {word}");
+        }
+    }
+    let plan = include_str!("../lfm/whir_block.rs");
+    for word in [
+        "build_artifacts_counted_under::<BlockStark>",
+        "from_artifacts_under::<crate::hash_pin::BlockFamily>",
+        "verify_against_artifacts_under::<crate::hash_pin::BlockFamily>",
+        "node_program_under::<crate::hash_pin::BlockFamily>",
+    ] {
+        assert!(plan.contains(word), "the plan reaches the LFM by {word}");
+    }
+    let tree = include_str!("../lfm/whir_block_tree.rs");
+    assert_eq!(
+        tree.matches("prove_under::<BlockFamily>").count(),
+        2,
+        "leaves and nodes"
+    );
+    assert_eq!(
+        tree.matches("harvest_child_under::<BlockFamily>").count(),
+        2
+    );
 }

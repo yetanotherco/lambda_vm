@@ -232,71 +232,65 @@ fn check_group_count(groups: usize, max_groups: usize) -> Result<(), Error> {
     Ok(())
 }
 
-/// Which WHIR configuration a block format's base names
-/// ([`checked_base`]): the format's alone. The process's
-/// `LAMBDA_VM_WHIR_HASH` is not read on the block path (D-WHIR-P1 S7).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlockHash {
-    /// RPX256 ([`multilinear::whir_hash::RpxWhir`]), the production base.
-    Rpx,
-    /// ZisK's Poseidon1 ([`multilinear::whir_hash::P1Whir`]).
-    Poseidon1,
-}
-
 /// The tallest 4-ary cap a Poseidon1 base may name: the trees clamp a taller
 /// one (`multilinear::whir_commit::tree_cap_height`), so [`checked_base`]
 /// refuses it rather than let the tag name a height no tree has.
 pub const MAX_P1_CAP_HEIGHT: usize = crypto::merkle_tree::cap::MAX_CAP_HEIGHT / 2;
 
-/// The configuration `base` names, or a typed refusal: RPX or Poseidon1,
-/// whose cap must be one its trees run at.
-pub fn checked_base(base: &BaseFormat) -> Result<BlockHash, Error> {
-    match base.hash {
-        CommitmentHash::Rpx256 => Ok(BlockHash::Rpx),
-        CommitmentHash::Poseidon1 => match base.arity4_cap {
-            CapPolicy::Fixed(c) if c as usize > MAX_P1_CAP_HEIGHT => Err(Error::Prover(format!(
-                "a Poseidon1 base capped at 4-ary height {c}: its trees clamp the cap at \
-                 {MAX_P1_CAP_HEIGHT}"
-            ))),
-            _ => Ok(BlockHash::Poseidon1),
-        },
-        other => Err(Error::Prover(format!(
-            "a block's base hash is RPX or Poseidon1, not {other:?}"
-        ))),
+/// The block's base, or a typed refusal: exactly [`crate::hash_pin::BLOCK_BASE`],
+/// the block proof family's, whose configuration [`crate::with_block_hash!`]
+/// binds. The block proves and verifies one family end to end (D-P3B §2.1),
+/// so any other base — RPX's included — is refused, never dispatched: no base
+/// of one hash under another's recursion.
+pub fn checked_base(base: &BaseFormat) -> Result<(), Error> {
+    let family = crate::hash_pin::BLOCK_BASE;
+    if *base != family {
+        return Err(Error::Prover(format!(
+            "a block's base is its proof family's ({:?}, 4-ary cap {}), not {:?} (cap {})",
+            family.hash, family.arity4_cap, base.hash, base.arity4_cap
+        )));
     }
+    Ok(())
 }
 
-/// The block statement's leading tag under `base`: RPX keeps
-/// [`MULTILINEAR_BLOCK_TAG`] byte for byte; Poseidon1 absorbs
+// The block's base is Poseidon1 at a cap its trees run at.
+const _: () = {
+    assert!(matches!(
+        crate::hash_pin::BLOCK_BASE.hash,
+        CommitmentHash::Poseidon1
+    ));
+    if let CapPolicy::Fixed(c) = crate::hash_pin::BLOCK_BASE.arity4_cap {
+        assert!(c as usize <= MAX_P1_CAP_HEIGHT);
+    }
+};
+
+/// The block statement's leading tag under `base`'s geometry:
 /// `LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V1/P1W16/C<h>`, the effective cap:
 /// `C0` uncapped (`Off` and `Fixed(0)`), `C<h>` at a fixed height and `Cauto`
-/// under `Auto`, so no two geometries share a tag (REV-P1-JUDGE F2). Domain
-/// separation only: the dispatch is what keeps the bases apart.
+/// under `Auto`, so no two geometries share a tag (REV-P1-JUDGE F2). The hash
+/// part is the block family's (`hash_pin::BLOCK_BASE`, Poseidon1 at width
+/// 16): every site that absorbs a statement admits the base through
+/// [`checked_base`] first, which refuses any other. Domain separation only.
 pub fn block_statement_tag(base: &BaseFormat) -> Vec<u8> {
     #[cfg(test)]
     if P1_TAG_OMITTED.with(std::cell::Cell::get) {
         return MULTILINEAR_BLOCK_TAG.to_vec();
     }
-    match base.hash {
-        CommitmentHash::Poseidon1 => {
-            let height = match base.arity4_cap {
-                CapPolicy::Off | CapPolicy::Fixed(0) => "0".to_string(),
-                CapPolicy::Fixed(c) => c.to_string(),
-                CapPolicy::Auto => "auto".to_string(),
-            };
-            let mut tag = MULTILINEAR_BLOCK_TAG.to_vec();
-            tag.extend_from_slice(format!("/P1W16/C{height}").as_bytes());
-            tag
-        }
-        _ => MULTILINEAR_BLOCK_TAG.to_vec(),
-    }
+    let height = match base.arity4_cap {
+        CapPolicy::Off | CapPolicy::Fixed(0) => "0".to_string(),
+        CapPolicy::Fixed(c) => c.to_string(),
+        CapPolicy::Auto => "auto".to_string(),
+    };
+    let mut tag = MULTILINEAR_BLOCK_TAG.to_vec();
+    tag.extend_from_slice(format!("/P1W16/C{height}").as_bytes());
+    tag
 }
 
 #[cfg(test)]
 thread_local! {
-    /// Test only: on this thread, a Poseidon1 statement takes RPX's tag (the
-    /// tag's mutation). Thread-local, so a test that sets it moves no other
-    /// test's statement.
+    /// Test only: on this thread, a statement takes the untagged
+    /// `LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V1` (the tag's mutation).
+    /// Thread-local, so a test that sets it moves no other test's statement.
     pub(crate) static P1_TAG_OMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
