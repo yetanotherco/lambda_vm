@@ -3,7 +3,7 @@
 //! node's arenas, and one leg (`per_table_aggregator::emit_leg`) emitted under
 //! `WrapHash::Poseidon1` — ZisK's transcript replay with the family's
 //! statement tag, the width-8 grind check, the tagged leaf hash and the 4-ary
-//! child-order walks to each tree's C2 cap. The honest arenas execute; every
+//! child-order walks to each tree's cap (`P1_STARK_CAP`). The honest arenas execute; every
 //! tamper below is refused by the machine, never by the host harvest.
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -25,9 +25,10 @@ use super::word::LfmWord;
 /// The child's options: the production format's `fri = dp` at blowup 4, with
 /// few queries so the node stays small, and a grind so the leg checks one.
 /// Its binary cap policy is OFF: an arity-4 configuration caps its trees at
-/// its own C2 whatever the format says, so a shape that took the format's
-/// policy instead would lay the trees out uncapped and refuse the child (at
-/// six queries `auto` would coincide with C2 and hide that).
+/// its own height (`P1_STARK_CAP`) whatever the format says, so a shape that
+/// took the format's policy instead would lay the trees out uncapped and
+/// refuse the child (at six queries `auto` could coincide with it and hide
+/// that).
 fn options() -> ProofOptions {
     let mut o = GoldilocksCubicProofOptions::with_blowup(4).expect("options");
     o.fri_number_of_queries = 6;
@@ -113,7 +114,8 @@ fn a_p1_node_verifies_a_p1_child_and_refuses_its_tampers() {
         "a P1 node's hash rows are the width-16 socket's"
     );
     assert!(runs(&program, &honest), "the honest child executes");
-    // The P1 child's trees are capped at C2: a cap is hinted per tree.
+    // The P1 child's trees are capped (`P1_STARK_CAP`): a cap is hinted per
+    // tree.
     assert!(
         honest.legs.iter().any(|l| !l.caps.is_empty()),
         "some table carries caps"
