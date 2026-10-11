@@ -348,8 +348,8 @@ enum Commands {
     /// `verify-block` against the ELF. Needs a `--features cuda` build. The
     /// production posture (table parallelism, retention, the grind's search,
     /// ...) is set for every knob the environment leaves unset; the `BLOCK
-    /// POSTURE` lines on stderr say which. The base hash is `--base-hash`'s,
-    /// a proof-format constant `verify-block` must be given too.
+    /// POSTURE` lines on stderr say which. The base hash is the build's
+    /// (`hash_pin::BLOCK_BASE`), a constant `verify-block` shares.
     ProveBlock {
         /// Path to the guest ELF
         #[arg(value_parser, value_hint = ValueHint::FilePath)]
@@ -534,7 +534,8 @@ fn posture_plan(env: impl Fn(&str) -> Option<String>, target: impl Fn() -> u64) 
 
 /// The block's production posture ([`prover::lfm::whir_block_tree::POSTURE`]),
 /// set for every knob the environment leaves unset ([`posture_plan`]), for
-/// `verify-block` too. The base hash is not posture: it is `--base-hash`'s.
+/// `verify-block` too. The base hash is not posture: it is the build's
+/// (`hash_pin::BLOCK_BASE`).
 /// Returns the lines that say what it set and what it left.
 ///
 /// # Safety
