@@ -256,7 +256,7 @@ impl ProofFamily for P1Family {
 /// [`P1Family`]'s statement tag (D-P3B §9, shared with #1013): today's
 /// `LAMBDAVM_LFM_STATEMENT_V1`, the family and its cap height, `C` +
 /// [`crate::lfm::p1_commit::P1_STARK_CAP`] — absorbed in place of today's tag.
-pub const P1_LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1/P1W16/C1";
+pub const P1_LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1/P1W16/C2";
 
 // The tag's cap digit is the configuration's.
 const _: () = assert!(
@@ -359,7 +359,7 @@ mod tests {
         );
         assert_eq!(
             P1Family::STATEMENT_TAG,
-            b"LAMBDAVM_LFM_STATEMENT_V1/P1W16/C1"
+            b"LAMBDAVM_LFM_STATEMENT_V1/P1W16/C2"
         );
         assert_eq!(P1Family::WRAP, crate::lfm::edsl::WrapHash::Poseidon1);
         assert_eq!(P1Family::SOCKET, crate::lfm::hash::HasherKind::Poseidon1W16);
