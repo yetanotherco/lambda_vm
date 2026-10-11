@@ -684,17 +684,19 @@ fn spread_plan(chunks: usize, cpus: usize) -> BlockTreePlan {
 }
 
 /// [`spread_fixture_shape`]'s plan over the block's own base
-/// ([`super::proof::block_tree_base_options`]: Poseidon1, cap 1): the plan the
-/// pinned tree ids ([`SMALL_TREE_IDS`], [`PRODUCTION_HEIGHT_TREE_IDS`]) guard,
-/// its tree derived under the block pin ([`tree_recursion`]), as the block
-/// prover builds it.
-fn pinned_spread_plan(chunks: usize, cpus: usize) -> BlockTreePlan {
+/// ([`super::proof::block_tree_base_options`]: Poseidon1, cap 1), its tree
+/// derived under the block pin ([`tree_recursion`]), as the block prover builds
+/// it: the tree [`BLOCK_SMALL_TREE_IDS`] pins.
+fn block_spread_plan(chunks: usize, cpus: usize) -> BlockTreePlan {
     spread_plan_under(chunks, cpus, &super::proof::block_tree_base_options())
 }
 
 /// [`spread_plan`] at the legacy (RPX) default format with the LogUp pair
-/// layout: the plan the RPX-era tree ids were recorded over, before the block
-/// pin. The census instruments and the P1 small tree compare against it.
+/// layout — the format the compact program form's pinned tree ids
+/// ([`SMALL_TREE_IDS`], [`PRODUCTION_HEIGHT_TREE_IDS`]) were recorded under,
+/// before k4 became the default. Those pins guard the program form, which no
+/// format choice changes, so they keep holding at the rollback format. The
+/// census instruments and the P1 small tree compare against it too.
 fn legacy_spread_plan(chunks: usize, cpus: usize) -> BlockTreePlan {
     spread_plan_under(chunks, cpus, &legacy_spread_options())
 }
@@ -958,11 +960,16 @@ fn late_emission_probe_over_freed_small_buffers() {
 }
 
 /// The recursion a plan's tree derives under, from its base: the block pin's
-/// over a block-pin base (the trees [`SMALL_TREE_IDS`] and
-/// [`PRODUCTION_HEIGHT_TREE_IDS`] pin), the legacy pin's over a legacy base
-/// ([`legacy_spread_plan`]) — never a mix, which no prover builds. The wrap
-/// options, the nodes' wrap hash and the socket a program without width-16
-/// rows runs.
+/// over a block-pin base ([`block_spread_plan`]), the legacy pin's over a
+/// legacy base (the RPX trees [`SMALL_TREE_IDS`] and
+/// [`PRODUCTION_HEIGHT_TREE_IDS`] recorded) — never a mix, which no prover
+/// builds. The wrap options, the nodes' wrap hash and the socket a program
+/// without width-16 rows runs.
+///
+/// Those RPX pins guard the compact program form's encoding (how a program is
+/// held moves no id), which does not depend on the hash. The trees the block
+/// builds are pinned by the box gates' top ids, and between gates by
+/// [`BLOCK_SMALL_TREE_IDS`] on the laptop.
 fn tree_recursion(
     plan: &BlockTreePlan,
 ) -> (crate::ProofOptions, WrapHash, super::hash::HasherKind) {
@@ -1074,57 +1081,51 @@ fn check_pinned_tree_ids(label: &str, plan: &BlockTreePlan, pins: &[(&str, &[&st
 #[test]
 #[should_panic(expected = "no pinned ids for the fixture ELF's digest")]
 fn pinned_tree_ids_refuse_an_elf_they_do_not_know() {
-    check_pinned_tree_ids("NONE", &pinned_spread_plan(2, 4), &[("00", &[])]);
+    check_pinned_tree_ids("NONE", &legacy_spread_plan(2, 4), &[("00", &[])]);
 }
 
-/// The fixture ELF's digest on the laptop (macOS clang). FAST's, ULTRA's and
-/// RYZEN's is `f5e120d0…` (FAST 670).
+/// The fixture ELF's digest on the laptop (macOS clang) and on FAST.
 const LAPTOP_ELF_DIGEST: &str = "3b39e219ec8e9d539067daf43e89cf56c58677134c0fdbc7373ece7d042eadde";
+const FAST_ELF_DIGEST: &str = "f5e120d0eaa369d7ebdec2767b8d0c0559ceeac138edf0970d47753105df8069";
 
-/// ★ The block tree's programs hold their ids: every id of a small spread
-/// plan's tree, planned over the block's base and derived under the block pin
-/// ([`pinned_spread_plan`]), equals the one recorded at P3b. A change to how a
-/// program is emitted, compacted or committed, or to the pin, moves one. (The
-/// RPX tree's ids, which guarded the compact program form from 541f4bdc2 / FAST
-/// 672, were retired with the block pin.) The box's ids are recorded with
-/// [`record_pinned_tree_ids`]; until they are, a box refuses by its digest.
+/// ★ The compact program form changes no program: every id of a small spread
+/// plan's tree equals the one recorded before the form changed — on the laptop
+/// at 541f4bdc2 (#1013's d740eb5d5 + the instruments), on FAST at fe1fb1691
+/// (FAST 672, where the new sha's ids matched it, device and host). The plan
+/// is the legacy one ([`legacy_spread_plan`]): the form is hash-independent,
+/// and its tree derives under the legacy pin ([`tree_recursion`]).
 #[test]
 #[ignore = "laptop or box: run with --exact"]
 fn the_compact_program_form_keeps_a_small_trees_ids() {
-    check_pinned_tree_ids("SMALL TREE IDS", &pinned_spread_plan(2, 4), &SMALL_TREE_IDS);
+    check_pinned_tree_ids("SMALL TREE IDS", &legacy_spread_plan(2, 4), &SMALL_TREE_IDS);
 }
 
-/// The same at production heights (the 13-chunk, 40-CPU plan over the block's
-/// base), on a box: ≈ 4.7 min and 4.6 GiB on the laptop's host commit. The box
-/// gates add the 1× and median trees' top ids.
+/// The same at production heights ([`production_height_plan`]: 7 leaves, 2
+/// nodes and the top), on a box: ≈ 4.7 min and 4.6 GiB on the laptop's host
+/// commit. The box gates add the 1× and median trees' top ids.
 #[test]
 #[ignore = "box tier: production-height artifacts, ≈ 4.7 min and 4.6 GiB on the laptop's host commit"]
 fn the_compact_program_form_keeps_every_production_height_tree_id() {
     check_pinned_tree_ids(
         "TREE IDS",
-        &pinned_spread_plan(13, 40),
+        &legacy_spread_plan(13, 40),
         &PRODUCTION_HEIGHT_TREE_IDS,
     );
 }
 
-/// Prints the ids [`SMALL_TREE_IDS`] pins for this machine's fixture ELF (its
-/// digest first, `TREE ELF digest`), asserting nothing: how a machine's row is
-/// recorded.
+/// ★ The block's own small tree holds its ids between box gates: the small
+/// spread plan over the block's base, derived under the block pin
+/// ([`block_spread_plan`]), against the ids recorded on the laptop at P3b. A
+/// box has no row (laptop ids never hold on a box) and refuses by its digest;
+/// the box gates pin the 1× and median trees' tops.
 #[test]
-#[ignore = "instrument: run with --exact --nocapture (≈ 35 s)"]
-fn record_small_tree_ids() {
-    for (j, id) in tree_ids(&pinned_spread_plan(2, 4)).iter().enumerate() {
-        println!("RECORD SMALL TREE IDS {j}: {id}");
-    }
-}
-
-/// [`record_small_tree_ids`] for [`PRODUCTION_HEIGHT_TREE_IDS`].
-#[test]
-#[ignore = "instrument, box tier: run with --exact --nocapture (≈ 4.7 min and 4.6 GiB on the laptop's host commit)"]
-fn record_production_height_tree_ids() {
-    for (j, id) in tree_ids(&pinned_spread_plan(13, 40)).iter().enumerate() {
-        println!("RECORD TREE IDS {j}: {id}");
-    }
+#[ignore = "laptop: run with --exact (≈ 35 s)"]
+fn the_block_trees_small_ids_hold() {
+    check_pinned_tree_ids(
+        "BLOCK SMALL TREE IDS",
+        &block_spread_plan(2, 4),
+        &BLOCK_SMALL_TREE_IDS,
+    );
 }
 
 /// [`legacy_spread_plan`]'s format with a Poseidon1 base at 4-ary cap
@@ -1834,23 +1835,67 @@ fn legacy_spread_options() -> crate::ProofOptions {
     pair.base_options(crate::recursion::Preset::Blowup4.options())
 }
 
-/// [`the_compact_program_form_keeps_a_small_trees_ids`]'s ids by ELF digest:
-/// the laptop's, recorded at P3b ([`record_small_tree_ids`]); a box's row is
-/// added from its own run (laptop ids never hold on a box: the fixture ELF's
-/// bytes differ by clang).
-const SMALL_TREE_IDS: [(&str, &[&str]); 1] = [(
+/// [`the_compact_program_form_keeps_a_small_trees_ids`]'s ids by ELF digest.
+const SMALL_TREE_IDS: [(&str, &[&str]); 2] = [
+    (
+        LAPTOP_ELF_DIGEST,
+        &[
+            "ec0cf01af432b895627d8f30c4242baf927bec4152776dbfb72fc7549207bc6e",
+            "56e894da228b62995082187277db3dbcb3a8a5dc8a4e5d3ecbef27d36f2c076b",
+        ],
+    ),
+    (
+        FAST_ELF_DIGEST,
+        &[
+            "739667a9adcb14185565133c71d8c788215133379a6d8eb6c371c2c6233ff9a8",
+            "71600bdb4c4ee9098105cd0166d4580fd64cdf8f21509b6e054e71ccc5eb79a1",
+        ],
+    ),
+];
+
+/// [`the_compact_program_form_keeps_every_production_height_tree_id`]'s ids by
+/// ELF digest.
+const PRODUCTION_HEIGHT_TREE_IDS: [(&str, &[&str]); 2] = [
+    (
+        LAPTOP_ELF_DIGEST,
+        &[
+            "193da2aac2d21a96430f5571d56bf290f34d8865d1fa1eeaf10d6717058538c0",
+            "b8a136ce48d98a671236a4a0531b4765ce9446f134a1258d814020b56d8c56d2",
+            "cbdc9f20884aa0227e7f6515e75592256ea1be9908e5d29416ddb7c00c1c18ba",
+            "a71a9f6384d06fa55ff73affe25f9c0a10f2d9e2087bbfe44347d06f7f16db33",
+            "56ac2dd62a1e75fc96ac5d600fc664ebc69c29bedb4973a02add0779c58f64f0",
+            "bbc20a4e8ebabb8b8789ec97817b8f8702e23bd1c54923cba0a961f62a9d3ce6",
+            "8eb7e4a80e9b8ada89769aba3cfb74df56ac57a8db11f21f4e8d009f5da834a6",
+            "7706e7ceca21108335c57bff62d1ac964898ddebcb5f221671420610d31c4183",
+            "a032aae4d0d21619c2c4ef89fe387759733b670c55c1c3e4ff65a350a5760735",
+            "eceac60369a194dc12f3a83321f88d15f990ba05cf1f882d8ea9239692d63219",
+        ],
+    ),
+    (
+        FAST_ELF_DIGEST,
+        &[
+            "93cc53931a1160fc8c109eb6d5f81ecc0cd828223367fcb0a6d2851c0810bb14",
+            "2b0b474e7b7f771bb37329b9b752b9c5625e98ba4293b6a6cbc164005cb6a1c1",
+            "0ed61e2212f08cf3fb039335af80d5c3145b65a2c74d057ea6a2692398bdef08",
+            "092289d251a74532e006eedfd89d111fe5420e20d3eb99f83cbce71d620b812d",
+            "7033ec9d5130aa89831052e30c027ac7cb6aeede9bba093654a19705d0ae9fb0",
+            "4b398b930a6f65e84762f90909eec00eced87f6159271d986e7e287b32a79cd6",
+            "100d981243118b7bded7b4989e377827124c9c435286f23713cb882d46473dea",
+            "b9fa1c3e7fd580f0d7fc87f733d282de0fbaab94b6f535475852fae48186be15",
+            "95e17686fd5a5b11dab21fd18e1cdd6cc06bf8d185ffbd72f31dad322be40b30",
+            "6e1111f64f288f6b4b94ef9baa1277a184ccc976b876ab9ec3e3519d31e64241",
+        ],
+    ),
+];
+
+/// [`the_block_trees_small_ids_hold`]'s ids: the laptop's, recorded at P3b.
+const BLOCK_SMALL_TREE_IDS: [(&str, &[&str]); 1] = [(
     LAPTOP_ELF_DIGEST,
     &[
         "6854804408854a94f5882bdaac6aadce0030c051b58676b3e1d7c507781d7343",
         "2e2020c5c5f011daf21179311f57b33c276ae2c605bc290456331b709e946782",
     ],
 )];
-
-/// [`the_compact_program_form_keeps_every_production_height_tree_id`]'s ids by
-/// ELF digest: none yet under the block pin; a box's row is recorded with
-/// [`record_production_height_tree_ids`]. Until then the test refuses by the
-/// digest, naming it.
-const PRODUCTION_HEIGHT_TREE_IDS: [(&str, &[&str]); 0] = [];
 
 /// The ELF constants a plan may take from ahead of time (beside the base) are
 /// tied to the ELF and the options they were computed under: another ELF's, or
