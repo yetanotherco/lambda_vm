@@ -63,7 +63,8 @@ pub(crate) struct HostTable {
     pub(crate) gamma: FEE,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) zetas: Vec<FEE>,
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Every query's leaf index, the transcript's: an arity-4 path is laid
+    /// out at it in the walk's hint order ([`build_table_legs_with`]).
     pub(crate) iotas: Vec<usize>,
 }
 
@@ -245,18 +246,23 @@ pub(crate) fn build_table_legs(
         view,
         rap_challenges,
         stark::config::TreeGeometry::BINARY,
+        None,
     )
 }
 
 /// [`build_table_legs`] for a sub-proof whose trees are `trees` (its
-/// configuration's arity and arity-4 cap): every path is laid out to the cap
-/// in the walk's order, child order at arity 4
-/// ([`super::merkle_cap::child_path_to_cap`]).
+/// configuration's arity and arity-4 cap), with every query's leaf index
+/// (`iotas`, the transcript's, from [`HostTable::iotas`]): every path is laid
+/// out to the cap in the walk's order — at arity 4 the hint order of
+/// [`super::p1w16_emit::walk4`] at the opening's index
+/// ([`super::merkle_cap::path_to_cap`]), so an arity-4 proof needs `iotas`; a
+/// binary one ignores them.
 pub(crate) fn build_table_legs_with(
     air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
     view: StarkProofView<'_, Gl, Ext3, ()>,
     rap_challenges: &[FEE],
     trees: stark::config::TreeGeometry,
+    iotas: Option<&[usize]>,
 ) -> Result<TableLegs, String> {
     // The shapes, from the AIR and the trace length alone; the proof's blocks
     // are then checked against them, never read into them.
@@ -313,7 +319,8 @@ pub(crate) fn build_table_legs_with(
                      depth: usize,
                      c: usize|
      -> Result<Vec<Commitment>, String> {
-        let (siblings, cap) = super::merkle_cap::child_path_to_cap(path, depth, c, arity, q == 0)
+        let index = leaf_index(iotas, q, 0)?;
+        let (siblings, cap) = super::merkle_cap::path_to_cap(path, depth, c, arity, q == 0, index)
             .map_err(|e| format!("query {q}: {e}"))?;
         trace_caps.extend(cap);
         Ok(siblings)
@@ -370,7 +377,7 @@ pub(crate) fn build_table_legs_with(
         openings.push(groups);
     }
 
-    let (fri_openings, fri_caps) = fri_layer_openings(view, verify.fri)?;
+    let (fri_openings, fri_caps) = fri_layer_openings_at(view, verify.fri, iotas)?;
 
     // Production's own boundary list, for the premise check only. It takes the
     // bus public inputs, which are PROOF data — which is exactly why the emitted
@@ -444,9 +451,25 @@ type FriOpenings = Vec<Vec<(Vec<FEE>, Vec<Commitment>)>>;
 /// under a fold schedule; `FriShape::layer_values` says which.
 /// Each path is cut at its layer's cap: query 0 of a capped layer carries
 /// `D − c + 2^c` nodes, every other query `D − c`.
+#[cfg(test)]
 pub(crate) fn fri_layer_openings<PI>(
     view: StarkProofView<'_, Gl, Ext3, PI>,
     fri: FriShape,
+) -> Result<(FriOpenings, Vec<Commitment>), String>
+where
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, stark::proof::view::PiDeserializer>,
+{
+    fri_layer_openings_at(view, fri, None)
+}
+
+/// [`fri_layer_openings`] with every query's index (see
+/// [`build_table_legs_with`]): layer `j`'s tree leaf is the index past the
+/// layer's slot, `iota >> (G_j + d_j)` (`FriShape::layer_bit_offset`).
+pub(crate) fn fri_layer_openings_at<PI>(
+    view: StarkProofView<'_, Gl, Ext3, PI>,
+    fri: FriShape,
+    iotas: Option<&[usize]>,
 ) -> Result<(FriOpenings, Vec<Commitment>), String>
 where
     PI: rkyv::Archive,
@@ -470,8 +493,10 @@ where
             offset += fri.layer_values(i);
             let path = d.layer_auth_path(i);
             let (depth, c) = (fri.layer_depth(i), fri.layer_cap(i));
+            let shift = fri.layer_bit_offset(i) + fri.layer_fold(i) as usize;
+            let index = leaf_index(iotas, q, shift)?;
             let (siblings, cap) =
-                super::merkle_cap::child_path_to_cap(path, depth, c, fri.arity(), q == 0)
+                super::merkle_cap::path_to_cap(path, depth, c, fri.arity(), q == 0, index)
                     .map_err(|e| format!("query {q} FRI layer {i}: {e}"))?;
             if let Some(cap) = cap {
                 caps.extend(cap);
@@ -481,6 +506,18 @@ where
         openings.push(layers);
     }
     Ok((openings, caps))
+}
+
+/// Query `q`'s leaf index shifted right by `shift` (a FRI layer's tree), when
+/// the caller supplied the indices.
+fn leaf_index(iotas: Option<&[usize]>, q: usize, shift: usize) -> Result<Option<usize>, String> {
+    iotas
+        .map(|all| {
+            all.get(q)
+                .map(|iota| iota >> shift)
+                .ok_or_else(|| format!("no index for query {q}"))
+        })
+        .transpose()
 }
 
 impl TableLegs {
@@ -683,15 +720,19 @@ pub(crate) fn harvest_child_under<Fam: crate::hash_pin::ProofFamily>(
             host_table_forked_under::<Fam>(*air, v, idx, num_tables, &mut fork, &lookup)
         })
         .collect::<Result<Vec<_>, String>>()?;
+    // Each query's leaf index from the fork's replay: an arity-4 path is laid
+    // out at it (the walk's hint order); a binary one ignores it.
     let legs = refs
         .iter()
         .enumerate()
-        .map(|(idx, air)| {
+        .zip(&tables)
+        .map(|((idx, air), table)| {
             build_table_legs_with(
                 *air,
                 view.get(idx),
                 &lookup,
                 stark::config::TreeGeometry::of::<Fam::Stark>(),
+                Some(&table.iotas),
             )
         })
         .collect::<Result<Vec<_>, String>>()?;

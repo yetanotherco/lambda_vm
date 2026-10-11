@@ -153,7 +153,7 @@ pub struct SubProofShape {
     /// committed under an arity-4 configuration (Poseidon1). `trace_cap` then
     /// counts 4-ary levels, the host's units, and a path carries three
     /// siblings per walked 4-ary level ([`super::merkle_cap::path_hints`]), in
-    /// child order. A verifier constant: the child's configuration
+    /// the walk's hint order. A verifier constant: the child's configuration
     /// (`stark::config::TreeGeometry`), never the proof.
     pub arity: usize,
     /// The trace trees' leaf layout (S2): today's row
@@ -518,10 +518,13 @@ pub fn emit_group_authentication_at(
 /// Authenticate one opened leaf digest at the tree's whole leaf index `bits`
 /// (low first, one per binary level): against the root by walking every level
 /// when the tree is uncapped, against the cap's node otherwise
-/// ([`CapCells::verify_path_child`]: the cap splits the index, walk low, mux
-/// top). At arity 4 the siblings are in CHILD order, the proof's own
-/// ([`super::p1w16_emit::walk4_child`]): every placement is a `Select` on an
-/// index bit, so the node hashed is the one the transcript's index names.
+/// ([`CapCells::verify_path`]: the cap splits the index, walk low, mux top).
+/// At arity 4 the siblings are in the walk's HINT order
+/// ([`super::p1w16_emit::walk4`]: the partner, then the other pair, per
+/// level), laid out by the harvest at the transcript's index
+/// (`merkle_cap::path_to_cap`): every placement is a `Select` on an index bit,
+/// so the node hashed is the one the transcript's index names, whatever the
+/// hints — three `Select`s a level against the child order's five.
 pub(crate) fn authenticate_leaf(
     b: &mut LfmBuilder,
     leaf: WrapDigest,
@@ -537,15 +540,11 @@ pub(crate) fn authenticate_leaf(
                 b.wrap_hash().path_hints(bits.len()),
                 "a path's hints for every level, and every group walks the same index"
             );
-            let root = if b.wrap_hash().arity() == 4 {
-                super::p1w16_emit::walk4_child(b, leaf, bits, siblings)
-            } else {
-                edsl::wrap_merkle_walk(b, leaf, bits, siblings)
-            };
+            let root = edsl::wrap_merkle_walk(b, leaf, bits, siblings);
             edsl::assert_digest_eq_lanes(b, root, root_lanes);
         }
         // The whole index goes in; the cap splits it (walk low, mux top).
-        Some(cap) => cap.verify_path_child(b, leaf, bits, siblings),
+        Some(cap) => cap.verify_path(b, leaf, bits, siblings),
     }
 }
 
