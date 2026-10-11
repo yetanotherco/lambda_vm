@@ -407,8 +407,8 @@ pub(crate) fn prove_traces_with_hasher(
 /// Proves an already-built trace set against an AIR set built for `hasher`
 /// (the traces must have been built with the same one), under the proof
 /// family `Fam`: the transcript is `Fam`'s, seeded and statement-bound as the
-/// legacy one is but with the family's statement tag first, and the proof
-/// commits under `Fam::Stark`.
+/// legacy one is but under the family's statement tag, and the proof commits
+/// under `Fam::Stark`.
 ///
 /// Storage mode comes from [`crate::auto_storage::decide_lfm`] and residency
 /// mode is the caller's: both are resource decisions, invisible to the proof.

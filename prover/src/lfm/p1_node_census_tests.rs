@@ -31,7 +31,7 @@ struct P1At<const C: u8>;
 impl<const C: u8> ProofFamily for P1At<C> {
     type Stark = P1StarkHashCapped<C>;
     type Transcript = P1Transcript;
-    const STATEMENT_TAG: Option<&'static [u8]> = P1Family::STATEMENT_TAG;
+    const STATEMENT_TAG: &'static [u8] = P1Family::STATEMENT_TAG;
     const WRAP: super::edsl::WrapHash = P1Family::WRAP;
     const SOCKET: super::hash::HasherKind = P1Family::SOCKET;
     fn transcript(seed: &[u8]) -> Self::Transcript {
