@@ -348,67 +348,457 @@ fn no_environment_read_decides_the_base() {
     }
 }
 
-/// ★ The block path names one proof family (D-P3B §2.1, review item 1): no
-/// LFM prove, verify, harvest, shape or artifact site of the W3 tree is at the
-/// legacy pin. The plan, the tree driver, the node and the block's dispatch
-/// name neither the legacy family nor the pin's configuration, transcript,
-/// prover, verifier or socket, nor the legacy-family entry points (which are
-/// `LegacyFamily`'s instances); they reach the LFM through `BlockFamily`.
-#[test]
-fn no_block_path_site_names_the_legacy_pin() {
-    let files = [
-        ("block_whir.rs", include_str!("../block_whir.rs")),
-        ("lfm/whir_block.rs", include_str!("../lfm/whir_block.rs")),
-        (
-            "lfm/whir_block_tree.rs",
-            include_str!("../lfm/whir_block_tree.rs"),
-        ),
-        ("lfm/block_node.rs", include_str!("../lfm/block_node.rs")),
-    ];
-    let legacy = [
+// ==================== the block path's source scan ====================
+
+/// What a scan of the block path reads: production code as tokens, with every
+/// `#[cfg(test)]` item and statement left out, comments dropped and the
+/// contents of string and character literals blanked. A name in a comment, a
+/// doc or a string is no site; a name in code is one, however it is spelled
+/// across whitespace (REV-P3B14-A A3: a legacy prove left in code beside the
+/// family's name in a comment passed the text scan this replaces).
+mod scan {
+    /// `src` with comments dropped and string / char literal contents blanked
+    /// (a literal becomes `""` or `' '`; a lifetime stays). Newlines kept.
+    fn masked(src: &str) -> String {
+        let c: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        let ident = |ch: char| ch.is_ascii_alphanumeric() || ch == '_';
+        while i < c.len() {
+            let next = c.get(i + 1).copied();
+            if c[i] == '/' && next == Some('/') {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+            } else if c[i] == '/' && next == Some('*') {
+                let mut depth = 0usize;
+                while i < c.len() {
+                    if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        if c[i] == '\n' {
+                            out.push('\n');
+                        }
+                        i += 1;
+                    }
+                }
+            } else if c[i] == 'r'
+                && (i == 0 || !ident(c[i - 1]))
+                && matches!(next, Some('"') | Some('#'))
+                && {
+                    let mut j = i + 1;
+                    while c.get(j) == Some(&'#') {
+                        j += 1;
+                    }
+                    c.get(j) == Some(&'"')
+                }
+            {
+                let mut j = i + 1;
+                let mut hashes = 0;
+                while c[j] == '#' {
+                    hashes += 1;
+                    j += 1;
+                }
+                j += 1;
+                while j < c.len()
+                    && !(c[j] == '"' && (0..hashes).all(|k| c.get(j + 1 + k) == Some(&'#')))
+                {
+                    if c[j] == '\n' {
+                        out.push('\n');
+                    }
+                    j += 1;
+                }
+                out.push_str("\"\"");
+                i = j + 1 + hashes;
+            } else if c[i] == '"' {
+                let mut j = i + 1;
+                while j < c.len() && c[j] != '"' {
+                    if c[j] == '\\' {
+                        j += 1;
+                    }
+                    if c.get(j) == Some(&'\n') {
+                        out.push('\n');
+                    }
+                    j += 1;
+                }
+                out.push_str("\"\"");
+                i = j + 1;
+            } else if c[i] == '\'' && next == Some('\\') {
+                let mut j = i + 2;
+                while j < c.len() && c[j] != '\'' {
+                    j += 1;
+                }
+                out.push_str("' '");
+                i = j + 1;
+            } else if c[i] == '\'' && c.get(i + 2) == Some(&'\'') {
+                out.push_str("' '");
+                i += 3;
+            } else {
+                out.push(c[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// `src` tokenised: identifiers and numbers as words, `::` as one token,
+    /// every other non-space character a token of its own.
+    pub(super) fn tokens(src: &str) -> Vec<String> {
+        let c: Vec<char> = src.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < c.len() {
+            if c[i].is_whitespace() {
+                i += 1;
+            } else if c[i].is_ascii_alphanumeric() || c[i] == '_' {
+                let start = i;
+                while i < c.len() && (c[i].is_ascii_alphanumeric() || c[i] == '_') {
+                    i += 1;
+                }
+                out.push(c[start..i].iter().collect());
+            } else if c[i] == ':' && c.get(i + 1) == Some(&':') {
+                out.push("::".to_string());
+                i += 2;
+            } else {
+                out.push(c[i].to_string());
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The production tokens of a source: its masked tokens with every
+    /// `#[cfg(test)]`-gated item or statement removed — from the attribute to
+    /// the end of what it gates: the first `;` or `,` at its own depth, the
+    /// close of a block it opens (and a `;`/`,` right after), or the close of
+    /// the enclosing block, whichever comes first.
+    pub(super) fn production(src: &str) -> Vec<String> {
+        let t = tokens(&masked(src));
+        let gate: Vec<String> = tokens("#[cfg(test)]");
+        let mut out = Vec::with_capacity(t.len());
+        let mut i = 0;
+        while i < t.len() {
+            if t[i..].starts_with(&gate) {
+                i += gate.len();
+                // Further attributes on the same item.
+                while t.get(i).map(String::as_str) == Some("#") {
+                    let mut depth = 0i64;
+                    i += 1;
+                    while i < t.len() {
+                        match t[i].as_str() {
+                            "[" => depth += 1,
+                            "]" => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    i += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+                // `angle` counts generic brackets outside any block, so a `,`
+                // inside `Result<A, B>` of a gated signature or field type ends
+                // nothing (`->` and `=>` are no brackets); a `;` ends the item
+                // whatever it holds.
+                let (mut depth, mut angle) = (0i64, 0i64);
+                while i < t.len() {
+                    let arrow = i > 0 && matches!(t[i - 1].as_str(), "-" | "=");
+                    match t[i].as_str() {
+                        "<" if depth == 0 => angle += 1,
+                        ">" if depth == 0 && !arrow && angle > 0 => angle -= 1,
+                        "{" | "(" | "[" => depth += 1,
+                        "}" | ")" | "]" => {
+                            if depth == 0 {
+                                // The enclosing block closes: the gated item ended.
+                                break;
+                            }
+                            depth -= 1;
+                            if depth == 0 && t[i] == "}" {
+                                i += 1;
+                                if matches!(t.get(i).map(String::as_str), Some(";") | Some(",")) {
+                                    i += 1;
+                                }
+                                break;
+                            }
+                        }
+                        ";" if depth == 0 => {
+                            i += 1;
+                            break;
+                        }
+                        "," if depth == 0 && angle == 0 => {
+                            i += 1;
+                            break;
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            out.push(t[i].clone());
+            i += 1;
+        }
+        out
+    }
+
+    /// Occurrences of `pattern`'s tokens as a contiguous run in `code`.
+    pub(super) fn count(code: &[String], pattern: &str) -> usize {
+        let p = tokens(pattern);
+        code.windows(p.len()).filter(|w| *w == p.as_slice()).count()
+    }
+
+    /// The legacy pin's names and entry points, as code: none may appear in a
+    /// production line of the block path. Whole identifiers (so
+    /// `harvest_child_under` is not `harvest_child`), and the legacy family's
+    /// `LfmFilled::prove` / `prove` method as a call (`.prove(`, `::prove(`).
+    pub(super) const LEGACY: &[&str] = &[
         "LegacyFamily",
         "BlockStarkHash",
         "BlockTranscript",
-        "block_transcript(",
+        "block_transcript",
         "BlockProver",
         "BlockVerifier",
         "BLOCK_HASHER",
         "BLOCK_COMMITMENT_HASH",
-        "WrapHash::production()",
-        "verify_against_artifacts(",
-        "harvest_child(",
-        "DerivedChild::from_artifacts(",
-        "build_artifacts_counted(",
-        ".prove(&",
-        "lfm_prove(",
+        "WrapHash::production",
+        "verify_against_artifacts",
+        "verify_against_chunked",
+        "harvest_child",
+        "harvest_child_verified",
+        "host_table_forked",
+        "lfm_prove",
+        "lfm_prove_with_hasher",
+        "prove_traces_with_hasher",
+        "build_artifacts_counted",
+        "build_artifacts_with_hasher",
+        "registry::build_artifacts",
+        "from_artifacts(",
+        "TableVerifyShape::derive(",
+        ".prove(",
+        "::prove(",
     ];
-    for (name, source) in files {
-        // Only the code: the block path's own tests may name what they refuse.
-        let code = source
-            .split("#[cfg(test)]\nmod tests")
-            .next()
-            .unwrap_or(source);
-        for word in legacy {
-            assert!(!code.contains(word), "{name} names {word}");
+
+    /// One file of the scan: its name, its production entry points (each must
+    /// survive the `#[cfg(test)]` skipper, so a misplaced gate cannot hide the
+    /// code after it), and the family-instantiated sites it must hold, with
+    /// their exact counts.
+    pub(super) struct File {
+        pub name: &'static str,
+        pub source: String,
+        pub anchors: &'static [&'static str],
+        pub sites: &'static [(&'static str, usize)],
+        /// Names this file must not use beyond [`LEGACY`].
+        pub forbidden: &'static [&'static str],
+    }
+
+    /// The scan: `Err` names the first violation.
+    pub(super) fn check(files: &[File]) -> Result<(), String> {
+        for f in files {
+            let code = production(&f.source);
+            if code.len() < 1000 {
+                return Err(format!("{}: {} production tokens read", f.name, code.len()));
+            }
+            for a in f.anchors {
+                if count(&code, a) == 0 {
+                    return Err(format!("{}: the scan does not reach `{a}`", f.name));
+                }
+            }
+            for name in LEGACY.iter().chain(f.forbidden) {
+                let n = count(&code, name);
+                if n > 0 {
+                    return Err(format!(
+                        "{} names `{name}` in production code ({n}×)",
+                        f.name
+                    ));
+                }
+            }
+            for (site, want) in f.sites {
+                let n = count(&code, site);
+                if n != *want {
+                    return Err(format!(
+                        "{}: `{site}` {n}× in production code, want {want}",
+                        f.name
+                    ));
+                }
+            }
         }
+        Ok(())
     }
-    let plan = include_str!("../lfm/whir_block.rs");
-    for word in [
-        "build_artifacts_counted_under::<BlockStark>",
-        "from_artifacts_under::<crate::hash_pin::BlockFamily>",
-        "verify_against_artifacts_under::<crate::hash_pin::BlockFamily>",
-        "node_program_under::<crate::hash_pin::BlockFamily>",
-    ] {
-        assert!(plan.contains(word), "the plan reaches the LFM by {word}");
+
+    /// The block path's production files, as built.
+    pub(super) fn block_path() -> Vec<File> {
+        vec![
+            File {
+                name: "block_whir.rs",
+                source: include_str!("../block_whir.rs").to_string(),
+                anchors: &[
+                    "pub fn checked_base(",
+                    "pub fn block_statement_tag(",
+                    "pub fn prove_block_whir(",
+                    "pub fn verify_block_whir(",
+                    "fn verify_block_whir_with(",
+                ],
+                sites: &[],
+                forbidden: &[],
+            },
+            File {
+                name: "lfm/whir_block.rs",
+                source: include_str!("../lfm/whir_block.rs").to_string(),
+                anchors: &[
+                    "fn derive_capped(",
+                    "pub fn node_program(",
+                    "pub fn artifacts_of(",
+                    "fn derived_of(",
+                    "pub fn verify_block_tree(",
+                    "fn verify_block_tree_with(",
+                ],
+                forbidden: &[],
+                sites: &[
+                    ("build_artifacts_counted_under::<BlockStark>(", 1),
+                    ("from_artifacts_under::<crate::hash_pin::BlockFamily>(", 1),
+                    (
+                        "verify_against_artifacts_under::<crate::hash_pin::BlockFamily>(",
+                        1,
+                    ),
+                    ("node_program_under::<crate::hash_pin::BlockFamily>(", 1),
+                ],
+            },
+            File {
+                name: "lfm/whir_block_tree.rs",
+                source: include_str!("../lfm/whir_block_tree.rs").to_string(),
+                anchors: &[
+                    "fn build_nodes(",
+                    "fn prove_tree_pipelined(",
+                    "pub fn prove_whir_block_tree(",
+                    "pub fn verify_whir_block_tree_proof(",
+                ],
+                forbidden: &[],
+                sites: &[
+                    ("prove_under::<BlockFamily>(", 2),
+                    ("harvest_child_under::<BlockFamily>(", 2),
+                ],
+            },
+            File {
+                name: "lfm/block_node.rs",
+                source: include_str!("../lfm/block_node.rs").to_string(),
+                anchors: &["pub fn emit_block_node(", "fn emit_node("],
+                sites: &[],
+                forbidden: &[],
+            },
+        ]
     }
-    let tree = include_str!("../lfm/whir_block_tree.rs");
+}
+
+/// ★ The block path names one proof family (D-P3B §2.1, review item 1): no
+/// production line of the plan, the tree driver, the node or the block's
+/// dispatch names the legacy family, the legacy pin's configuration,
+/// transcript, prover, verifier or socket, or a legacy-family entry point
+/// (`LegacyFamily`'s instances: `lfm_prove`, `LfmFilled::prove`,
+/// `verify_against_artifacts`, `harvest_child`, …); every LFM site of the W3
+/// tree is instantiated at `BlockFamily`, at its exact count. Read as code
+/// tokens ([`scan`]), so a comment or a string neither hides a site nor fakes
+/// one.
+#[test]
+fn no_block_path_site_names_the_legacy_pin() {
+    scan::check(&scan::block_path()).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// ★ The scan refuses the regressions it exists for, planted into the real
+/// sources (REV-P3B14-A A3): the leaf prove put back to dcc4703e9's legacy
+/// `filled.prove(artifacts, …)` with the family's name left in a comment; a
+/// legacy name in a statement split over lines; a `#[cfg(test)]` that would
+/// swallow a production function; and the scan reads past comments and
+/// strings without false positives.
+#[test]
+fn the_block_path_scan_refuses_planted_regressions() {
+    let planted = |file: &str, from: &str, to: &str| -> Result<(), String> {
+        let mut files = scan::block_path();
+        let f = files
+            .iter_mut()
+            .find(|f| f.name == file)
+            .expect("a scanned file");
+        assert_eq!(f.source.matches(from).count(), 1, "{file}: `{from}` once");
+        f.source = f.source.replacen(from, to, 1);
+        scan::check(&files)
+    };
+    assert_eq!(scan::check(&scan::block_path()), Ok(()));
+    // dcc4703e9's leaf prove, the family's call left in a comment.
+    let leaf = "filled.prove_under::<BlockFamily>(artifacts, &wrap, decide_lfm_residency());";
+    let legacy_leaf = "filled.prove(artifacts, &wrap, decide_lfm_residency()); \
+                       // filled.prove_under::<BlockFamily>(artifacts, &wrap, decide_lfm_residency());";
+    let e =
+        planted("lfm/whir_block_tree.rs", leaf, legacy_leaf).expect_err("the legacy leaf prove");
+    assert!(e.contains("`.prove(`"), "{e}");
+    // A legacy entry point spelled across lines and spaces.
+    let e = planted(
+        "lfm/whir_block.rs",
+        "pub fn artifacts_of(",
+        "fn planted() { super :: proof ::\n    verify_against_artifacts (); }\npub fn artifacts_of(",
+    )
+    .expect_err("a split legacy call");
+    assert!(e.contains("`verify_against_artifacts`"), "{e}");
+    // A test gate that would hide the verifier's entry point.
+    let e = planted(
+        "lfm/whir_block_tree.rs",
+        "pub fn verify_whir_block_tree_proof(",
+        "#[cfg(test)]\npub fn verify_whir_block_tree_proof(",
+    )
+    .expect_err("a gated entry point");
+    assert!(e.contains("does not reach"), "{e}");
+    // Comments and strings are no sites.
     assert_eq!(
-        tree.matches("prove_under::<BlockFamily>").count(),
-        2,
-        "leaves and nodes"
+        planted(
+            "lfm/block_node.rs",
+            "pub fn emit_block_node(",
+            "// LegacyFamily, harvest_child(, .prove(\nconst _PLANTED: &str = \"lfm_prove( BLOCK_HASHER\";\n\
+             /* verify_against_artifacts( */\npub fn emit_block_node(",
+        ),
+        Ok(())
+    );
+    // A test-gated statement inside a production function stays out.
+    assert_eq!(
+        scan::count(
+            &scan::production("fn f() {\n    #[cfg(test)]\n    lfm_prove(a, b);\n    g();\n}\n"),
+            "lfm_prove"
+        ),
+        0
     );
     assert_eq!(
-        tree.matches("harvest_child_under::<BlockFamily>").count(),
-        2
+        scan::count(
+            &scan::production("fn f() {\n    lfm_prove(a, b);\n}\n"),
+            "lfm_prove"
+        ),
+        1
+    );
+    // A gated function whose signature holds a generic comma is left out
+    // whole, its body included.
+    assert_eq!(
+        scan::count(
+            &scan::production(
+                "#[cfg(test)]\nfn t(a: u8) -> Result<u8, String> {\n    lfm_prove(a);\n}\nfn g() {}\n"
+            ),
+            "lfm_prove"
+        ),
+        0
+    );
+    // A gated field of a generic type ends at its comma.
+    assert_eq!(
+        scan::count(
+            &scan::production(
+                "struct S {\n    #[cfg(test)]\n    a: Result<u8, String>,\n    b: lfm_prove,\n}\n"
+            ),
+            "lfm_prove"
+        ),
+        1
     );
 }

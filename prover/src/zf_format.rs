@@ -250,7 +250,9 @@ impl ZfFormat {
         base: crate::hash_pin::BLOCK_BASE,
     };
 
-    /// This format with `base` as the WHIR block's base hash.
+    /// This format with `base` as the WHIR block's base hash. The block path
+    /// admits [`crate::hash_pin::BLOCK_BASE`] alone (`block_whir::checked_base`),
+    /// so another base here is a refusal's input (the tests'), never a proof.
     pub const fn with_base(self, base: BaseFormat) -> Self {
         Self { base, ..self }
     }
@@ -455,7 +457,8 @@ impl ZfFormat {
             // caller until its wiring lands (D-BATCH B-4b), so a knob here could
             // only make those callers refuse.
             argue: multilinear::whir_chain::ArgueFormat::PerTable,
-            // Read at arity 4 only, so RPX's `Off` moves nothing.
+            // Read at arity 4 only, so a binary chain (keccak, RPX) moves
+            // nothing.
             arity4_cap: self.base.arity4_cap,
         }
     }
