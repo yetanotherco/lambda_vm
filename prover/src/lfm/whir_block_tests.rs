@@ -154,7 +154,7 @@ fn run_leaf(
     execute(
         &program,
         &arenas,
-        &program.hasher(crate::hash_pin::BLOCK_HASHER),
+        &program.hasher(<BlockFamily as ProofFamily>::SOCKET),
     )
     .map(|e| e.public_words.iter().map(|(_, w)| *w).collect())
     .map_err(|e| format!("{e:?}"))
@@ -2771,7 +2771,12 @@ fn the_batched_whir_block_tree_proves_to_the_derived_top() {
 /// ★ The grind bits (`LAMBDA_VM_ZF_WHIR_GRIND_BITS`) are a verifier constant
 /// on the block's recursion too: the statement, Q and the grind are the leaf
 /// program's constants. Over a block ground at 18 bits the plan at 18 emits a
-/// leaf that executes; the plan at 20 emits one that refuses the same proof.
+/// leaf that executes; the plan at 20 emits one that refuses the same proof,
+/// and executes over a block ground at 20 (the control: the refusal is the
+/// bits', not the leaf's). Every leaf runs on the family's socket, so no
+/// refusal is the hasher's (REV-P3B14-A A4). Q moves with the bits (114 at 18,
+/// 112 at 20), so the refusal may be the arena's layout before any grind is
+/// checked; the line `GRIND LEAF REFUSAL:` says which.
 #[test]
 #[ignore = "executes block leaves over small block proofs; box tier"]
 fn a_block_leaf_at_20_bits_refuses_a_block_ground_at_18() {
@@ -2793,6 +2798,12 @@ fn a_block_leaf_at_20_bits_refuses_a_block_ground_at_18() {
         "the statement at 20 bits is another statement"
     );
     let program = leaf_program_with(&strict, 0, LeafChecks::ALL).expect("the leaf at 20 emits");
+    let socket = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
+    assert_eq!(
+        socket,
+        super::hash::HasherKind::Poseidon1W16,
+        "the leaf's socket"
+    );
     let refusal = match block_leaf_arena(&strict, &proof, 0) {
         Err(e) => format!("the arena: {e}"),
         Ok(arenas) if program.arena_schema.lens != vec![arenas[0].len() as u32] => format!(
@@ -2800,12 +2811,27 @@ fn a_block_leaf_at_20_bits_refuses_a_block_ground_at_18() {
             arenas[0].len(),
             program.arena_schema.lens
         ),
-        Ok(arenas) => match execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER) {
-            Err(e) => format!("the execution: {e:?}"),
+        Ok(arenas) => match execute(&program, &arenas, &socket) {
+            Err(e) => {
+                assert!(
+                    !matches!(
+                        e,
+                        super::executor::LfmExecError::HasherRejected(_)
+                            | super::executor::LfmExecError::Internal(_)
+                    ),
+                    "the leaf at 20 refused for another reason than the proof: {e:?}"
+                );
+                format!("the execution: {e:?}")
+            }
             Ok(_) => panic!("a leaf at 20 bits executed over a block ground at 18"),
         },
     };
     println!("GRIND LEAF REFUSAL: {refusal}");
+    // The control: the same leaf at 20 executes over a block ground at 20.
+    let (elf20, proof20) = small_block("test_commit_4", &at(20));
+    let plan20 = plan_of(&elf20, &proof20, &at(20), Some(1));
+    run_leaf(&plan20, &proof20, 0, LeafChecks::ALL)
+        .expect("the leaf at 20 executes over a block at 20");
 }
 
 /// I-GRIND2 instrument (not a gate): a block group's in-guest opening cost
@@ -2882,7 +2908,7 @@ fn the_p1_block_front_draws_the_hosts_challenges() {
     let words: Vec<LfmWord> = execute(
         &program,
         &[arena],
-        &program.hasher(crate::hash_pin::BLOCK_HASHER),
+        &program.hasher(<BlockFamily as ProofFamily>::SOCKET),
     )
     .expect("the front executes")
     .public_words
