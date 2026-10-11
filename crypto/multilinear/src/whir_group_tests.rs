@@ -891,13 +891,10 @@ fn a_combination_preserving_forgery_is_refused_by_the_paths() {
     let RoundOpenings::BaseGrouped(g) = &mut forged.polys[0].rounds[0].openings else {
         panic!("grouped");
     };
-    let honest = crate::whir_round::combine_blocks(
-        &g.current[1],
-        &[eq_index(rho, 0), e1.clone(), e2.clone()],
-    );
+    let honest = crate::whir_round::combine_blocks(&g.current[1], &[eq_index(rho, 0), e1, e2]);
     for i in 0..g.current[1][1].values.len() {
         let delta = FE::from(1 + i as u64);
-        g.current[1][1].values[i] += delta.clone();
+        g.current[1][1].values[i] += delta;
         let kept = &g.current[1][2].values[i] - &delta * &ratio;
         g.current[1][2].values[i] = kept;
     }

@@ -1134,6 +1134,8 @@ fn run_facts(
                 .map(|r| match &r.openings {
                     multilinear::whir_chain::RoundOpenings::Base(p) => p.current.len(),
                     multilinear::whir_chain::RoundOpenings::Extension(p) => p.current.len(),
+                    // Queries, each one block per tree (D-ONECHAIN).
+                    multilinear::whir_chain::RoundOpenings::BaseGrouped(p) => p.current.len(),
                 })
                 .expect("a chain has at least one round"),
         })
