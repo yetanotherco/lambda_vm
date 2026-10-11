@@ -1664,6 +1664,20 @@ fn a_one_round_grouped_chain_folds_to_its_final_value_in_guest() {
 #[test]
 fn a_grouped_successor_cap_off_its_root_has_no_execution() {
     let cases = [
+        // A cap of eight nodes, unground: the successor is opened at most six
+        // times (three as round 0's successor, three as round 1's current
+        // tree), so some node is met by no opening whatever the draw, and the
+        // draw is the same every build. Were the cap not authenticated, the
+        // arenas that move those nodes would execute.
+        Case {
+            cap: CapPolicy::Fixed(3),
+            ..rpx(
+                "three polynomials under a binary cap of eight, unground",
+                &[6; 3],
+                6,
+                0,
+            )
+        },
         Case {
             cap: CapPolicy::Fixed(1),
             ..rpx("three polynomials under a binary cap", &[6; 3], 6, 8)
