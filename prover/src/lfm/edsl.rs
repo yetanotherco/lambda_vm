@@ -633,8 +633,8 @@ impl WrapHash {
     }
 
     /// The wrap hash of a program that verifies a base proof committed under
-    /// `base`: [`WrapHash::Poseidon1`] for ZisK's Poseidon1, else the pin's
-    /// ([`Self::production`]) — the block path maps every other hash to the pin
+    /// `base`: [`WrapHash::Poseidon1`] for ZisK's Poseidon1, else the legacy pin's
+    /// ([`Self::legacy`]) — the block path maps every other hash to the pin
     /// (`hash_pin::base_of`) and its prove and verify entries refuse one it has
     /// no configuration for (`hash_pin::checked_base`). A verifier constant
     /// from the caller's format, never from the environment or the proof, so

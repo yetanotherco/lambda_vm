@@ -1113,7 +1113,7 @@ pub fn verify_block_tree(
 }
 
 /// [`verify_block_tree`] over ELF constants computed ahead
-/// ([`ElfConstants::compute`] under [`super::proof::block_base_options`]), so a
+/// ([`ElfConstants::compute`] under [`super::proof::block_tree_base_options`]), so a
 /// consumer verifying many blocks of one ELF computes them once. Refuses
 /// constants of another ELF or other options, as [`BlockTreePlan::derive_with`]
 /// does.
