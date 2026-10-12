@@ -72,6 +72,7 @@ fn test_domain_constructor() {
         coset_offset,
         grinding_factor,
         fri_final_poly_log_degree: 7,
+        format: crate::proof::options::ProofFormat::DEFAULT,
     };
 
     let domain = Domain::new(
@@ -163,6 +164,7 @@ fn barycentric_trace_eval_matches_horner_trace_eval() {
         coset_offset,
         grinding_factor: 0,
         fri_final_poly_log_degree: 7,
+        format: crate::proof::options::ProofFormat::DEFAULT,
     };
 
     let air = simple_fibonacci::FibonacciAIR::<GoldilocksField>::new(&proof_options);
@@ -235,6 +237,7 @@ fn test_decompose_and_extend_d2_matches_original() {
         coset_offset: 3,
         grinding_factor: 0,
         fri_final_poly_log_degree: 7,
+        format: crate::proof::options::ProofFormat::DEFAULT,
     };
 
     // We need an AIR with composition_poly_degree_bound = 2 * trace_length.
@@ -289,6 +292,85 @@ fn test_decompose_and_extend_d2_matches_original() {
     }
 }
 
+/// ★ The four-part split (a degree-5 AIR: LogUp groups of four) is exactly
+/// `break_in_parts(4)` evaluated on the LDE: the radix-2 split applied twice
+/// on the coset, then each part extended ×4, against interpolate →
+/// `break_in_parts(4)` → evaluate, at blowup 4 over base-field and
+/// extension-field `H`, from the smallest to a mid-size trace.
+#[test]
+fn test_decompose_and_extend_d4_matches_break_in_parts() {
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::traits::IsSubFieldOf;
+    type Fp3 = FieldElement<Ext3>;
+
+    fn check<E>(n: usize, coeff: impl Fn(usize) -> FieldElement<E>)
+    where
+        E: math::field::traits::IsField + Send + Sync + 'static,
+        GoldilocksField: IsSubFieldOf<E>,
+        FieldElement<E>: math::traits::AsBytes + math::traits::ByteConversion + Send + Sync,
+    {
+        let blowup_factor = 4usize;
+        let proof_options = ProofOptions {
+            blowup_factor: blowup_factor as u8,
+            fri_number_of_queries: 1,
+            coset_offset: 7,
+            grinding_factor: 0,
+            fri_final_poly_log_degree: 7,
+            format: crate::proof::options::ProofFormat::DEFAULT,
+        };
+        let air = QuadraticAIR::<GoldilocksField>::new(&proof_options);
+        let domain = Domain::new(&air, n);
+        let lde_size = n * blowup_factor;
+        // H of full degree < 4n: four parts of n coefficients each.
+        let coeffs: Vec<FieldElement<E>> = (0..lde_size).map(&coeff).collect();
+        let h_poly = Polynomial::new(&coeffs);
+        let evals: Vec<FieldElement<E>> = domain
+            .lde_roots_of_unity_coset
+            .iter()
+            .map(|x| h_poly.evaluate(&x.to_extension::<E>()))
+            .collect();
+        assert_eq!(evals.len(), lde_size);
+
+        let reference: Vec<Vec<FieldElement<E>>> =
+            Polynomial::interpolate_offset_fft(&evals, &domain.coset_offset)
+                .expect("interpolation")
+                .break_in_parts(4)
+                .iter()
+                .map(|part| {
+                    evaluate_polynomial_on_lde_domain(part, blowup_factor, n, &domain.coset_offset)
+                        .expect("LDE evaluation")
+                })
+                .collect();
+
+        let twiddles = LdeTwiddles::new(&domain);
+        let parts = <Prover<GoldilocksField, E, ()> as IsStarkProver<
+            GoldilocksField,
+            E,
+            (),
+            crate::config::Blake3StarkHash,
+        >>::decompose_and_extend_d4(&evals, &domain, &twiddles);
+        assert_eq!(parts.len(), 4, "n={n}");
+        for (j, (got, want)) in parts.iter().zip(&reference).enumerate() {
+            assert_eq!(got.len(), lde_size, "n={n} part {j}");
+            assert!(
+                got == want,
+                "n={n}: part {j} differs from break_in_parts(4)"
+            );
+        }
+    }
+
+    for n in [4usize, 16, 256, 1024] {
+        check::<GoldilocksField>(n, |i| Felt::from((i as u64) * 0x9E37 + 11));
+        check::<Ext3>(n, |i| {
+            Fp3::new([
+                Felt::from(i as u64 * 31 + 1),
+                Felt::from(i as u64 * 17 + 5),
+                Felt::from(i as u64 ^ 0xABCD),
+            ])
+        });
+    }
+}
+
 /// Test that the domain cache 3-tuple key `(trace_length, blowup, coset_offset)` correctly
 /// distinguishes AIRs that share the same `(trace_length, blowup)` but differ in
 /// `coset_offset`. Both AIRs must get their own `Domain` and the resulting proofs must
@@ -301,6 +383,7 @@ fn test_multi_prove_mixed_coset_offsets() {
         coset_offset: 3,
         grinding_factor: 1,
         fri_final_poly_log_degree: 7,
+        format: crate::proof::options::ProofFormat::DEFAULT,
     };
     let proof_options_7 = ProofOptions {
         blowup_factor: 2,
@@ -308,6 +391,7 @@ fn test_multi_prove_mixed_coset_offsets() {
         coset_offset: 7,
         grinding_factor: 1,
         fri_final_poly_log_degree: 7,
+        format: crate::proof::options::ProofFormat::DEFAULT,
     };
 
     // Both AIRs have the same trace length and blowup, but different coset offsets.
@@ -373,6 +457,7 @@ fn test_multi_prove_dedups_shared_domain_params() {
         coset_offset: 3,
         grinding_factor: 1,
         fri_final_poly_log_degree: 7,
+        format: crate::proof::options::ProofFormat::DEFAULT,
     };
 
     let mut trace_1 = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
@@ -463,6 +548,7 @@ fn test_deep_poly_direct_2n_matches_interpolate_fft_extend() {
         coset_offset: 3,
         grinding_factor: 0,
         fri_final_poly_log_degree: 7,
+        format: crate::proof::options::ProofFormat::DEFAULT,
     };
 
     let air = QuadraticAIR::<GoldilocksField>::new(&proof_options);

@@ -75,6 +75,18 @@ pub fn zeroed_fe_vec(len: usize) -> Vec<FE> {
     unsafe { Vec::from_raw_parts(zeros.as_mut_ptr() as *mut FE, zeros.len(), zeros.capacity()) }
 }
 
+/// The raw words of `data`, without a copy: what a trace's packed form
+/// (`stark::narrow`) stores.
+#[inline]
+pub fn fe_words(data: &[FE]) -> &[u64] {
+    const _: () = assert!(core::mem::size_of::<FE>() == core::mem::size_of::<u64>());
+    const _: () = assert!(core::mem::align_of::<FE>() == core::mem::align_of::<u64>());
+    // SAFETY: `FE` is `#[repr(transparent)]` over `u64` with identical size and
+    // alignment (asserted above), so `data`'s elements are `data.len()` valid,
+    // aligned `u64`s for as long as `data` is borrowed.
+    unsafe { core::slice::from_raw_parts(data.as_ptr() as *const u64, data.len()) }
+}
+
 #[cfg(test)]
 mod zeroed_fe_vec_tests {
     use super::*;
@@ -359,6 +371,28 @@ pub enum BusId {
     /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
     /// boundary claims, matched across epochs by the final aggregation LogUp.
     GlobalMemory = 31,
+
+    // =========================================================================
+    // LFM — the Lambda Field Machine (recursion machine; `lfm` module)
+    // =========================================================================
+    /// LFM write-once memory: token `(addr, v0..v3)`. Writes send with the
+    /// preprocessed static read count; reads receive gated by is_real.
+    LfmMem = 32,
+    /// LFM 16-bit range lookup (the `LFM_RANGE` fixed table).
+    LfmRange = 33,
+    /// LFM public values: token `(index, v0..v3)`; closed by a
+    /// consumer-computed balance (the COMMIT-bus pattern).
+    LfmPublic = 34,
+
+    // =========================================================================
+    // BLAKE3 chained absorb
+    // =========================================================================
+    /// BLAKE3 absorb self-referencing chain (row N → row N+1 of one absorb
+    /// group): `(timestamp, remaining, msg_base, ctrl_addr, cv[0..8])`.
+    ///
+    /// ID 35 rather than 29: 29 is a gap left by a removed bus and reusing it
+    /// would make a stale artifact decode as this one.
+    Blake3Absorb = 35,
 }
 
 impl BusId {
@@ -388,6 +422,10 @@ impl BusId {
             BusId::Ecdas => "Ecdas",
             BusId::Bit => "Bit",
             BusId::GlobalMemory => "GlobalMemory",
+            BusId::LfmMem => "LfmMem",
+            BusId::LfmRange => "LfmRange",
+            BusId::LfmPublic => "LfmPublic",
+            BusId::Blake3Absorb => "Blake3Absorb",
         }
     }
 }
@@ -420,6 +458,10 @@ impl TryFrom<u64> for BusId {
             28 => Ok(BusId::Ecdas),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
+            32 => Ok(BusId::LfmMem),
+            33 => Ok(BusId::LfmRange),
+            34 => Ok(BusId::LfmPublic),
+            35 => Ok(BusId::Blake3Absorb),
             other => Err(other),
         }
     }

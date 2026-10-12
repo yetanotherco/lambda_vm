@@ -497,6 +497,56 @@ extern "C" __global__ void decompose_d2_ext3(
 }
 
 // ============================================================================
+// Four-part quotient decomposition, pointwise on the LDE coset (4q rows):
+// the radix-2 split applied twice. With x_i = g·w^i (w a 4q-th root),
+// -x_i = x_{i+2q}, and y_i = x_i^2 with -y_i = y_{i+q}:
+//   A[i]   = two_inv * (h[i] + h[i+2q]),    B[i]   = inv_2x[i]   * (h[i] - h[i+2q])
+//   A[i+q] = two_inv * (h[i+q] + h[i+3q]),  B[i+q] = inv_2x[i+q] * (h[i+q] - h[i+3q])
+//   H0[i] = two_inv * (A[i] + A[i+q]),      H2[i] = inv_2y[i] * (A[i] - A[i+q])
+//   H1[i] = two_inv * (B[i] + B[i+q]),      H3[i] = inv_2y[i] * (B[i] - B[i+q])
+// so H(x) = H0(x^4) + x·H1(x^4) + x^2·H2(x^4) + x^3·H3(x^4), each part on the
+// g^4-coset of q points (inv_2y[i] = 1/(2·y_i)). Writes the four parts in slab
+// layout (12 base slabs, part j at slabs 3j..3j+3, `slab_stride` u64 each; rows
+// q.. stay zero as the LDE zero-pad).
+extern "C" __global__ void decompose_d4_ext3(
+    const uint64_t *__restrict__ h,
+    const uint64_t *__restrict__ inv_2x,
+    const uint64_t *__restrict__ inv_2y,
+    uint64_t two_inv,
+    uint64_t q,
+    uint64_t slab_stride,
+    uint64_t *__restrict__ out) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < q;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        uint64_t r0 = i, r1 = i + q, r2 = i + 2 * q, r3 = i + 3 * q;
+        Fe3 h0 = ext3::make(h[r0 * 3], h[r0 * 3 + 1], h[r0 * 3 + 2]);
+        Fe3 h1 = ext3::make(h[r1 * 3], h[r1 * 3 + 1], h[r1 * 3 + 2]);
+        Fe3 h2 = ext3::make(h[r2 * 3], h[r2 * 3 + 1], h[r2 * 3 + 2]);
+        Fe3 h3 = ext3::make(h[r3 * 3], h[r3 * 3 + 1], h[r3 * 3 + 2]);
+        Fe3 a0 = ext3::mul_base(ext3::add(h0, h2), two_inv);
+        Fe3 b0 = ext3::mul_base(ext3::sub(h0, h2), inv_2x[r0]);
+        Fe3 a1 = ext3::mul_base(ext3::add(h1, h3), two_inv);
+        Fe3 b1 = ext3::mul_base(ext3::sub(h1, h3), inv_2x[r1]);
+        Fe3 p0 = ext3::mul_base(ext3::add(a0, a1), two_inv);
+        Fe3 p2 = ext3::mul_base(ext3::sub(a0, a1), inv_2y[i]);
+        Fe3 p1 = ext3::mul_base(ext3::add(b0, b1), two_inv);
+        Fe3 p3 = ext3::mul_base(ext3::sub(b0, b1), inv_2y[i]);
+        out[0 * slab_stride + i] = p0.a;
+        out[1 * slab_stride + i] = p0.b;
+        out[2 * slab_stride + i] = p0.c;
+        out[3 * slab_stride + i] = p1.a;
+        out[4 * slab_stride + i] = p1.b;
+        out[5 * slab_stride + i] = p1.c;
+        out[6 * slab_stride + i] = p2.a;
+        out[7 * slab_stride + i] = p2.b;
+        out[8 * slab_stride + i] = p2.c;
+        out[9 * slab_stride + i] = p3.a;
+        out[10 * slab_stride + i] = p3.b;
+        out[11 * slab_stride + i] = p3.c;
+    }
+}
+
+// ============================================================================
 // Degree-1 (num_parts==1) composition part: H IS the single part, already on
 // the LDE coset, so there is no decompose and no re-extension. Only de-interleave
 // the resident ext3 composition evals `h` (num_rows rows, interleaved

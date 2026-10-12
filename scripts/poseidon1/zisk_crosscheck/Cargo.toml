@@ -1,0 +1,12 @@
+[package]
+name = "zisk-crosscheck"
+version = "0.1.0"
+edition = "2021"
+
+# pil2-proofman's Rust field crate (MIT OR Apache-2.0; NOT the AGPL pil2-stark tree),
+# checked out at d485fac2 (v1.3.0-alpha, the release ZisK was measured at).
+# Override with a [patch] or edit the path for another checkout.
+[dependencies]
+proofman-fields = { path = "/Users/maurofab/workspace/lambda_vm/others/pil2-proofman/fields" }
+
+[workspace]

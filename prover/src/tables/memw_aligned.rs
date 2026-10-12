@@ -41,6 +41,7 @@ use stark::trace::TraceTable;
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::memw::MemwOperation;
 use super::types::{BusId, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::constraints::templates::emit_is_bit;
@@ -90,45 +91,179 @@ pub mod cols {
 ///
 /// Reuses `MemwOperation` — the trace generator uses `old_timestamp[0]`
 /// (verified equal for all accessed bytes by the routing logic).
-pub fn generate_memw_aligned_trace(
-    operations: &[MemwOperation],
-) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let num_rows = operations.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+/// One MEMW_A row as the walk keeps it: 48 bytes where a [`MemwOperation`]
+/// takes 152 (the walk materializes about one every three cycles). An aligned
+/// access's bytes share one old timestamp ([`MemwOperation`]'s
+/// `old_timestamp[0]`), and its eight value (old) elements fit one `u64`: eight
+/// bytes for a memory access, the two 32-bit register halves (the rest zero)
+/// for a register access that missed MEMW_R.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AlignedRow {
+    base_address: u64,
+    timestamp: u64,
+    old_timestamp: u64,
+    value: u64,
+    old: u64,
+    width: u8,
+    is_read: bool,
+    is_register: bool,
+}
 
-    for (row_idx, op) in operations.iter().enumerate() {
-        table.set_bool(row_idx, cols::IS_REGISTER, op.is_register);
-
-        table.set_dword_whh(row_idx, cols::BASE_ADDRESS[0], op.base_address);
-
-        for i in 0..8 {
-            table.set_u64(row_idx, cols::VALUE[i], op.value[i] as u64);
-        }
-
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
-
-        let (w2, w4, w8) = op.write_flags();
-        table.set_bool(row_idx, cols::WRITE2, w2);
-        table.set_bool(row_idx, cols::WRITE4, w4);
-        table.set_bool(row_idx, cols::WRITE8, w8);
-
-        for i in 0..8 {
-            table.set_u64(row_idx, cols::OLD[i], op.old[i] as u64);
-        }
-
-        // Single old_timestamp (from old_timestamp[0], verified equal for all bytes)
-        table.set_dword_wl(row_idx, cols::OLD_TIMESTAMP_0, op.old_timestamp[0]);
-
-        table.set_bool(row_idx, cols::MU_READ, op.is_read);
-        table.set_bool(row_idx, cols::MU_WRITE, !op.is_read);
+impl AlignedRow {
+    /// The row of an op [`super::trace_builder`] routed to MEMW_A.
+    #[inline]
+    pub(crate) fn from_memw(op: &MemwOperation) -> Self {
+        let pack = |elements: &[u32; 8]| -> u64 {
+            if op.is_register {
+                elements[0] as u64 | (elements[1] as u64) << 32
+            } else {
+                elements.iter().enumerate().fold(0, |packed, (i, &byte)| {
+                    packed | (byte as u64 & 0xFF) << (8 * i)
+                })
+            }
+        };
+        let row = Self {
+            base_address: op.base_address,
+            timestamp: op.timestamp,
+            old_timestamp: op.old_timestamp[0],
+            value: pack(&op.value),
+            old: pack(&op.old),
+            width: op.width,
+            is_read: op.is_read,
+            is_register: op.is_register,
+        };
+        debug_assert!(
+            row.value() == op.value && row.old() == op.old,
+            "a MEMW_A op's elements do not fit its row: {op:?}"
+        );
+        row
     }
 
-    trace
+    #[inline]
+    fn unpack(&self, packed: u64) -> [u32; 8] {
+        let mut elements = [0u32; 8];
+        if self.is_register {
+            elements[0] = packed as u32;
+            elements[1] = (packed >> 32) as u32;
+        } else {
+            for (i, element) in elements.iter_mut().enumerate() {
+                *element = (packed >> (8 * i)) as u8 as u32;
+            }
+        }
+        elements
+    }
+
+    /// [`MemwOperation::value`].
+    #[inline]
+    pub(crate) fn value(&self) -> [u32; 8] {
+        self.unpack(self.value)
+    }
+
+    /// [`MemwOperation::old`].
+    #[inline]
+    pub(crate) fn old(&self) -> [u32; 8] {
+        self.unpack(self.old)
+    }
+
+    #[inline]
+    pub(crate) fn base_address(&self) -> u64 {
+        self.base_address
+    }
+
+    #[inline]
+    pub(crate) fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    /// The accessed bytes' (register words') shared old timestamp.
+    #[inline]
+    pub(crate) fn old_timestamp(&self) -> u64 {
+        self.old_timestamp
+    }
+
+    #[inline]
+    pub(crate) fn width(&self) -> u8 {
+        self.width
+    }
+
+    #[inline]
+    pub(crate) fn is_read(&self) -> bool {
+        self.is_read
+    }
+
+    #[inline]
+    pub(crate) fn is_register(&self) -> bool {
+        self.is_register
+    }
+
+    /// [`MemwOperation::write_flags`].
+    #[inline]
+    pub(crate) fn write_flags(&self) -> (bool, bool, bool) {
+        match self.width {
+            2 => (true, false, false),
+            4 => (false, true, false),
+            8 => (false, false, true),
+            _ => (false, false, false),
+        }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<AlignedRow>() == 48);
+
+#[cfg(test)]
+pub(crate) fn generate_memw_aligned_trace(
+    operations: &[AlignedRow],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_memw_aligned_trace_as(operations, TraceForm::Wide)
+}
+
+/// The MEMW_A trace of `operations` in `form` (`tables::gpack`).
+pub(crate) fn generate_memw_aligned_trace_as(
+    operations: &[AlignedRow],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_memw_aligned_trace_segments_as(&[operations], form)
+}
+
+/// The widths MEMW_A traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_memw_aligned_trace_as`] over `segments`, the operations one after
+/// another: a chunk handed out as the window parts it lies in.
+pub(crate) fn generate_memw_aligned_trace_segments_as(
+    segments: &[&[AlignedRow]],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let len: usize = segments.iter().map(|s| s.len()).sum();
+    let num_rows = len.next_power_of_two().max(4);
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
+            table.set_bool(row_idx, cols::IS_REGISTER, op.is_register());
+
+            table.set_dword_whh(row_idx, cols::BASE_ADDRESS[0], op.base_address());
+
+            for (column, element) in cols::VALUE.into_iter().zip(op.value()) {
+                table.set_u64(row_idx, column, element as u64);
+            }
+
+            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp());
+
+            let (w2, w4, w8) = op.write_flags();
+            table.set_bool(row_idx, cols::WRITE2, w2);
+            table.set_bool(row_idx, cols::WRITE4, w4);
+            table.set_bool(row_idx, cols::WRITE8, w8);
+
+            for (column, element) in cols::OLD.into_iter().zip(op.old()) {
+                table.set_u64(row_idx, column, element as u64);
+            }
+
+            // Single old_timestamp (verified equal for all bytes when routed here)
+            table.set_dword_wl(row_idx, cols::OLD_TIMESTAMP_0, op.old_timestamp());
+
+            table.set_bool(row_idx, cols::MU_READ, op.is_read());
+            table.set_bool(row_idx, cols::MU_WRITE, !op.is_read());
+        }
+    })
 }
 
 // =========================================================================

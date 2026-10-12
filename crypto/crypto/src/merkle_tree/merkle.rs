@@ -11,12 +11,15 @@ use math::spill_safe::SpillSafe;
 pub enum Error {
     OutOfBounds,
     EmptyPositionList,
+    /// The operation exists for binary trees only.
+    Arity,
 }
 impl Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::OutOfBounds => write!(f, "Accessed node was out of bound"),
             Error::EmptyPositionList => write!(f, "Position list cannot be empty"),
+            Error::Arity => write!(f, "Operation not supported at this tree arity"),
         }
     }
 }
@@ -43,6 +46,17 @@ pub(crate) struct MmapNodeBacking {
 ///    leaf 1     leaf 2 leaf 3  leaf 4
 /// The bottom leafs correspond to the hashes of the elements, while each upper
 /// layer contains the hash of the concatenation of the daughter nodes.
+///
+/// # Arity 4 ([`IsMerkleTreeBackend::ARITY`] = 4)
+///
+/// Every inner node hashes four children ([`IsMerkleTreeBackend::hash_four`]);
+/// a level whose length is not a multiple of four is padded with
+/// [`IsMerkleTreeBackend::padding_node`] when its parents are hashed (ZisK's
+/// rule: 2^odd leaves end in a two-node level). `nodes` stores only real nodes,
+/// level by level top-down (root at 0, leaves last; `utils::level_offsets4`).
+/// A path carries, per level from the leaves up, the three other children of
+/// the node's group in child order — a padding digest where the group is
+/// short — so it is `3 · depth` nodes long, `depth = ⌈log2(leaves) / 2⌉`.
 #[cfg_attr(not(feature = "disk-spill"), derive(Clone))]
 #[cfg_attr(
     all(feature = "serde", not(feature = "disk-spill")),
@@ -142,6 +156,17 @@ where
         if nodes.is_empty() {
             return None;
         }
+        if B::ARITY == 4 {
+            // The arity-4 layout (type docs): its node count names its leaf count.
+            leaves_len4(nodes.len())?;
+            let root = nodes[ROOT].clone();
+            return Some(MerkleTree {
+                root,
+                nodes,
+                #[cfg(feature = "disk-spill")]
+                mmap_backing: None,
+            });
+        }
         // Validate (cheap) that (nodes.len() + 1) is a power of two: there
         // must be `leaves_len - 1 + leaves_len = 2*leaves_len - 1` entries.
         let total = nodes.len();
@@ -207,6 +232,19 @@ where
         let hashed_leaves = complete_until_power_of_two(hashed_leaves);
         let leaves_len = hashed_leaves.len();
 
+        if B::ARITY == 4 {
+            let inner: usize = level_sizes4(leaves_len)[1..].iter().sum();
+            let mut nodes = vec![hashed_leaves[0].clone(); inner];
+            nodes.extend(hashed_leaves);
+            build4::<B>(&mut nodes, leaves_len)?;
+            return Some(MerkleTree {
+                root: nodes[ROOT].clone(),
+                nodes,
+                #[cfg(feature = "disk-spill")]
+                mmap_backing: None,
+            });
+        }
+
         //The length of leaves minus one inner node in the merkle tree
         //The first elements are overwritten by build function, it doesn't matter what it's there
         let mut nodes = vec![hashed_leaves[0].clone(); leaves_len - 1];
@@ -256,6 +294,51 @@ where
         self.nodes.get(idx)
     }
 
+    /// `log2` of the padded leaf count: the number of siblings on a full
+    /// authentication path. `None` on a root-only tree
+    /// ([`from_root`](Self::from_root)), whose shape is not known here.
+    pub fn depth(&self) -> Option<usize> {
+        if self.is_root_only() {
+            return None;
+        }
+        if B::ARITY == 4 {
+            return Some(level_sizes4(self.leaves_len()).len() - 1);
+        }
+        // `node_count = 2·leaves − 1` with `leaves` a power of two (every
+        // constructor guarantees it), so `leaves = (node_count + 1) / 2`.
+        let leaves = self.node_count().div_ceil(2);
+        Some(leaves.ilog2() as usize)
+    }
+
+    /// The Merkle cap at height `cap_height`: the `2^cap_height` nodes that
+    /// sit `cap_height` levels below the root, left to right (heap indices
+    /// `[2^c − 1, 2^{c+1} − 1)`). Height 0 is `[root]`; height `depth` is the
+    /// leaf-hash layer.
+    ///
+    /// `None` on a root-only tree, and when `cap_height > depth` — a cap taller
+    /// than the tree is not representable, and a caller asking for one has a
+    /// policy bug that must fail closed rather than be clamped here. Reads go
+    /// through the node accessor, so a disk-spilled tree works too.
+    pub fn cap(&self, cap_height: usize) -> Option<Vec<B::Node>> {
+        let depth = self.depth()?;
+        if cap_height > depth {
+            return None;
+        }
+        if B::ARITY == 4 {
+            // The real nodes of the level `cap_height` below the root.
+            let sizes = level_sizes4(self.leaves_len());
+            let offsets = level_offsets4(&sizes);
+            let level = depth - cap_height;
+            return (offsets[level]..offsets[level] + sizes[level])
+                .map(|i| self.node_get(i).cloned())
+                .collect();
+        }
+        let start = (1usize << cap_height) - 1;
+        (start..2 * start + 1)
+            .map(|i| self.node_get(i).cloned())
+            .collect()
+    }
+
     /// Read-only access to the full node buffer in standard layout:
     /// `nodes[0..leaves_len - 1]` are inner nodes (root at index 0) and
     /// `nodes[leaves_len - 1..]` are the leaves.
@@ -274,6 +357,11 @@ where
         if self.is_root_only() {
             return None;
         }
+        if B::ARITY == 4 {
+            return self
+                .build_merkle_path4(pos)
+                .map(|merkle_path| Proof { merkle_path });
+        }
         let pos = pos + self.node_count() / 2;
         let Ok(merkle_path) = self.build_merkle_path(pos) else {
             return None;
@@ -285,6 +373,41 @@ where
     /// Creates a proof from a Merkle pasth
     fn create_proof(&self, merkle_path: Vec<B::Node>) -> Option<Proof<B::Node>> {
         Some(Proof { merkle_path })
+    }
+
+    /// The leaf count: `(nodes + 1) / 2` for a binary tree, the inverse of
+    /// the level-size sum at arity 4. Not meaningful on a root-only tree.
+    fn leaves_len(&self) -> usize {
+        if B::ARITY == 4 {
+            leaves_len4(self.node_count()).unwrap_or(0)
+        } else {
+            self.node_count().div_ceil(2)
+        }
+    }
+
+    /// The arity-4 path of leaf `pos` (type docs): per level from the leaves
+    /// up, the three other children of its group in child order. `None` past
+    /// the last leaf.
+    fn build_merkle_path4(&self, pos: usize) -> Option<Vec<B::Node>> {
+        let sizes = level_sizes4(self.leaves_len());
+        if pos >= sizes[0] {
+            return None;
+        }
+        let offsets = level_offsets4(&sizes);
+        let mut path = Vec::with_capacity(3 * (sizes.len() - 1));
+        let mut i = pos;
+        for level in 0..sizes.len() - 1 {
+            let first = i / 4 * 4;
+            for c in (first..first + 4).filter(|&c| c != i) {
+                path.push(if c < sizes[level] {
+                    self.node_get(offsets[level] + c)?.clone()
+                } else {
+                    B::padding_node()?
+                });
+            }
+            i /= 4;
+        }
+        Some(path)
     }
 
     /// Returns the Merkle path for the element/s for the leaf at position pos
@@ -328,6 +451,9 @@ where
     pub fn get_batch_proof(&self, pos_list: &[usize]) -> Result<BatchProof<B::Node>, Error> {
         if pos_list.is_empty() {
             return Err(Error::EmptyPositionList);
+        }
+        if B::ARITY != 2 {
+            return Err(Error::Arity);
         }
 
         let num_leaves = (self.node_count() + 1).div_ceil(2);

@@ -21,7 +21,10 @@
 
 pub mod types;
 
+pub mod gpack;
+
 pub mod bitwise;
+pub mod blake3;
 pub mod branch;
 pub mod bytewise;
 pub mod commit;
@@ -50,6 +53,7 @@ pub mod register;
 pub mod shift;
 pub mod store;
 pub mod trace_builder;
+pub mod trace_hash;
 
 pub use types::BusId;
 
@@ -59,6 +63,14 @@ pub use types::BusId;
 /// between the generator and the drift tests so adding a blowup here cannot
 /// silently skip a test.
 pub const STATIC_BLOWUP_FACTORS: &[u8] = &[2, 4, 8];
+
+/// Blowup factors for which the ONE-ROW (S2) twins of those static
+/// commitments ship (`static_commitment_one_row` and the page twins), emitted
+/// by `compute_static_commitments --layout row` and pinned by the one-row drift
+/// tests. Only the blowup the knob is measured at (4 for
+/// the base and for the LFM chips): under one row any other blowup is a hard
+/// miss, never a recompute.
+pub const STATIC_BLOWUP_FACTORS_ONE_ROW: &[u8] = &[4];
 
 /// Per-table maximum rows, sized so each chunk uses roughly the same memory.
 ///
@@ -118,10 +130,85 @@ pub struct MaxRowsConfig {
     pub bytewise: usize,
     pub store: usize,
     pub cpu32: usize,
+    /// KECCAK rows per table, or [`KECCAK_UNCHUNKED`] for one table (every
+    /// configuration but the no-epoch block's). A KECCAK row is one whole
+    /// permutation call, so a cut falls between two calls; each call reaches
+    /// its rounds (KECCAK_RND) and its memory only through buses keyed by its
+    /// timestamp.
+    pub keccak: usize,
+    /// KECCAK_RND rows per table, or [`KECCAK_RND_UNCHUNKED`] for one table
+    /// (every configuration but the no-epoch block's). A chunk holds whole
+    /// permutations: `keccak_rnd / 24` of them, at least one.
+    pub keccak_rnd: usize,
+    /// ECSM rows per table, or [`ECSM_UNCHUNKED`] for one table (every
+    /// configuration but the no-epoch block's). An ECSM row is one whole
+    /// scalar multiplication call, so a cut falls between two calls; each
+    /// call reaches its double/add steps (ECDAS), its scalar bits and its
+    /// memory only through buses keyed by its timestamp.
+    pub ecsm: usize,
+    /// ECDAS rows per table, or [`ECDAS_UNCHUNKED`] for one table (every
+    /// configuration but the no-epoch block's). An ECDAS row is one
+    /// double/add step, so a chunk holds `ecdas` steps and a scalar
+    /// multiplication may continue in the next chunk: its steps chain through
+    /// the Ecdas bus, keyed by the call's timestamp and the step's
+    /// `(round, op)`, never through a row-to-row constraint.
+    pub ecdas: usize,
+}
+
+/// [`MaxRowsConfig::keccak`]'s "one table", the value every constructor here
+/// sets: a chunked KECCAK is accepted only by the block verifier.
+pub const KECCAK_UNCHUNKED: usize = usize::MAX;
+
+/// [`MaxRowsConfig::keccak_rnd`]'s "one table", the value every constructor
+/// here sets: a chunked KECCAK_RND is accepted only by the block verifier.
+pub const KECCAK_RND_UNCHUNKED: usize = usize::MAX;
+
+/// [`MaxRowsConfig::ecsm`]'s "one table", the value every constructor here
+/// sets: a chunked ECSM is accepted only by the block verifier.
+pub const ECSM_UNCHUNKED: usize = usize::MAX;
+
+/// [`MaxRowsConfig::ecdas`]'s "one table", the value every constructor here
+/// sets: a chunked ECDAS is accepted only by the block verifier.
+pub const ECDAS_UNCHUNKED: usize = usize::MAX;
+
+/// The uniform table cap this process proves at, or `None` for the production
+/// per-table values.
+///
+/// ★ ONE READER, AND IT IS THIS ONE. [`MaxRowsConfig::default`] is what decides
+/// how an epoch is chunked, so anything that wants to describe the posture a
+/// run was proven at has to ask the same question the same way. A second parse
+/// of `LAMBDA_VM_MAX_ROWS_LOG2` somewhere else is how a label comes to name a
+/// posture the epochs were not chunked at — and the transcript pin is exactly
+/// such a label, since its counts ARE the chunking.
+pub(crate) fn max_rows_log2_override() -> Option<u32> {
+    let v = std::env::var("LAMBDA_VM_MAX_ROWS_LOG2").ok()?;
+    let n: u32 = v
+        .parse()
+        .expect("LAMBDA_VM_MAX_ROWS_LOG2 must be an integer");
+    assert!(
+        (5..=26).contains(&n),
+        "LAMBDA_VM_MAX_ROWS_LOG2 must be in 5..=26, got {n}"
+    );
+    Some(n)
 }
 
 impl Default for MaxRowsConfig {
+    /// The production values from [`max_rows`], unless
+    /// `LAMBDA_VM_MAX_ROWS_LOG2` overrides them with one uniform cap.
+    ///
+    /// The env knob is a prover-side SHAPE choice, like `TABLE_PARALLELISM` is
+    /// a resource one: chunk counts already ride the statement (the verifier
+    /// reads them from the proof it checks, never from this config), so two
+    /// provers with different caps produce differently-chunked but equally
+    /// verifiable epochs. It exists for compression-posture measurement — the
+    /// production 2^19/2^20 values are sized for equal-memory parallel chunks,
+    /// which multiplies SUB-PROOFS per epoch, and every extra sub-proof is a
+    /// leg the recursion wrap pays for. Tall-table postures (2^24) trade chunk
+    /// parallelism for fewer legs.
     fn default() -> Self {
+        if let Some(n) = max_rows_log2_override() {
+            return Self::uniform(1 << n);
+        }
         Self {
             cpu: max_rows::CPU,
             memw: max_rows::MEMW,
@@ -137,11 +224,39 @@ impl Default for MaxRowsConfig {
             bytewise: max_rows::BYTEWISE,
             store: max_rows::STORE,
             cpu32: max_rows::CPU32,
+            keccak: KECCAK_UNCHUNKED,
+            keccak_rnd: KECCAK_RND_UNCHUNKED,
+            ecsm: ECSM_UNCHUNKED,
+            ecdas: ECDAS_UNCHUNKED,
         }
     }
 }
 
 impl MaxRowsConfig {
+    /// One cap for every table — the tall-table posture the env override uses.
+    pub fn uniform(rows: usize) -> Self {
+        Self {
+            cpu: rows,
+            memw: rows,
+            memw_aligned: rows,
+            dvrm: rows,
+            mul: rows,
+            lt: rows,
+            shift: rows,
+            load: rows,
+            branch: rows,
+            memw_register: rows,
+            eq: rows,
+            bytewise: rows,
+            store: rows,
+            cpu32: rows,
+            keccak: KECCAK_UNCHUNKED,
+            keccak_rnd: KECCAK_RND_UNCHUNKED,
+            ecsm: ECSM_UNCHUNKED,
+            ecdas: ECDAS_UNCHUNKED,
+        }
+    }
+
     /// Small limits for low-memory testing. Generates multiple chunks
     /// per table even for tiny programs (~32 rows per chunk).
     pub fn small() -> Self {
@@ -160,6 +275,10 @@ impl MaxRowsConfig {
             bytewise: 1 << 5,
             store: 1 << 5,
             cpu32: 1 << 5,
+            keccak: KECCAK_UNCHUNKED,
+            keccak_rnd: KECCAK_RND_UNCHUNKED,
+            ecsm: ECSM_UNCHUNKED,
+            ecdas: ECDAS_UNCHUNKED,
         }
     }
 }

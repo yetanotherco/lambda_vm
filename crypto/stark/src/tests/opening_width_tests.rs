@@ -71,12 +71,15 @@ pub struct FibonacciSplitAIR<F: IsFFTField> {
     out: Option<FieldElement<F>>,
     precomputed_columns: usize,
     precomputed_commitment: Commitment,
+    /// The one-row (S2) root of the same precomputed columns; `None` = the
+    /// AIR has none (the one-row prover must refuse, never recompute).
+    precomputed_commitment_row: Option<Commitment>,
     phantom: PhantomData<F>,
 }
 
 impl<F: IsFFTField + Send + Sync + 'static> FibonacciSplitAIR<F> {
     /// The AIR as the verifier sees it: plain, non-preprocessed.
-    fn honest(proof_options: &ProofOptions, out: Option<FieldElement<F>>) -> Self {
+    pub(crate) fn honest(proof_options: &ProofOptions, out: Option<FieldElement<F>>) -> Self {
         let mut air = <Self as AIR>::new(proof_options);
         air.out = out;
         air
@@ -96,7 +99,7 @@ impl<F: IsFFTField + Send + Sync + 'static> FibonacciSplitAIR<F> {
     /// Handing the verifier a different count than the prover used is how the
     /// hook-free test below reaches the precomputed term of the guard: both
     /// sides still absorb the same commitment, so the transcripts agree.
-    fn preprocessed_declaring(
+    pub(crate) fn preprocessed_declaring(
         proof_options: &ProofOptions,
         out: Option<FieldElement<F>>,
         precomputed_columns: usize,
@@ -106,6 +109,12 @@ impl<F: IsFFTField + Send + Sync + 'static> FibonacciSplitAIR<F> {
         air.precomputed_columns = precomputed_columns;
         air.precomputed_commitment = commitment;
         air
+    }
+
+    /// This AIR with a one-row (S2) precomputed root as well.
+    pub(crate) fn with_one_row_commitment(mut self, commitment: Commitment) -> Self {
+        self.precomputed_commitment_row = Some(commitment);
+        self
     }
 }
 
@@ -135,6 +144,7 @@ where
             out: None,
             precomputed_columns: 0,
             precomputed_commitment: [0u8; 32],
+            precomputed_commitment_row: None,
             phantom: PhantomData,
         }
     }
@@ -212,6 +222,16 @@ where
 
     fn precomputed_commitment(&self) -> Commitment {
         self.precomputed_commitment
+    }
+
+    fn precomputed_commitment_for(
+        &self,
+        layout: crate::leaf_layout::LeafLayout,
+    ) -> Option<Commitment> {
+        match layout {
+            crate::leaf_layout::LeafLayout::RowPair => Some(self.precomputed_commitment),
+            crate::leaf_layout::LeafLayout::Row => self.precomputed_commitment_row,
+        }
     }
 }
 

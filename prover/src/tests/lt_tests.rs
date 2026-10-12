@@ -3,7 +3,9 @@
 use stark::proof::options::ProofOptions;
 use stark::traits::AIR;
 
-use crate::tables::lt::{LtConstraints, LtOperation, bus_interactions, cols, generate_lt_trace};
+use crate::tables::lt::{
+    LtConstraints, LtOperation, bus_interactions, cols, generate_lt_trace, generate_lt_trace_packed,
+};
 use crate::tables::types::FE;
 use crate::test_utils::{busless_air, create_lt_air, in_chip_constraint_count, validate_busless};
 
@@ -231,4 +233,30 @@ fn test_lt_rejects_forged_out() {
         !validate_busless(&air, &trace),
         "forged out=1 (lt=invert=0) must be rejected by OutXorInvert"
     );
+}
+
+/// Built packed a block at a time, LT packs to the words of the 64-bit build in
+/// the same row order, byte for byte: fewer distinct ops than a block, a block
+/// and one, several blocks with repeats, and none.
+#[test]
+fn the_packed_build_is_the_64_bit_build_packed() {
+    let ops: Vec<LtOperation> = (0..20_000u64)
+        .map(|i| {
+            let x = i.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            // Every third op repeats an earlier one (multiplicities above one).
+            let j = if i % 3 == 2 { i / 2 } else { i };
+            LtOperation::new(x ^ j, j.rotate_left(17), i % 5 == 0)
+        })
+        .collect();
+    for n in [0, 1, 4097, 20_000] {
+        let mut wide = generate_lt_trace(&ops[..n]);
+        assert!(wide.pack_main_narrow(), "{n}: the 64-bit build packs");
+        let packed = generate_lt_trace_packed(&ops[..n]).expect("packed build");
+        assert_eq!(packed.num_rows(), wide.num_rows(), "{n} rows");
+        assert_eq!(
+            packed.narrow_main(),
+            wide.narrow_main(),
+            "{n}: packed words"
+        );
+    }
 }

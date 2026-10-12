@@ -75,7 +75,28 @@ impl<T: Copy> PagedMem<T> {
     #[inline]
     pub fn set(&mut self, addr: u64, val: T) {
         let (base, off) = Self::split(addr);
-        let i = match self.pages.binary_search_by_key(&base, |(b, _)| *b) {
+        let i = self.page_index_or_insert(base);
+        self.page_set(i, off, val);
+    }
+
+    /// `addr`'s page base and its offset in the page.
+    #[inline]
+    pub fn page_of(addr: u64) -> (u64, usize) {
+        Self::split(addr)
+    }
+
+    /// The index of the page at `base` (page-aligned), if it is allocated. An
+    /// index stays valid until a page is allocated.
+    #[inline]
+    pub fn page_index(&self, base: u64) -> Option<usize> {
+        self.pages.binary_search_by_key(&base, |(b, _)| *b).ok()
+    }
+
+    /// The index of the page at `base` (page-aligned), allocating it (filled)
+    /// on first touch, which moves the index of every page above it.
+    #[inline]
+    pub fn page_index_or_insert(&mut self, base: u64) -> usize {
+        match self.pages.binary_search_by_key(&base, |(b, _)| *b) {
             Ok(i) => i,
             Err(i) => {
                 self.pages.insert(
@@ -90,8 +111,19 @@ impl<T: Copy> PagedMem<T> {
                 );
                 i
             }
-        };
-        let page = &mut self.pages[i].1;
+        }
+    }
+
+    /// The value at offset `off` of page `index`.
+    #[inline]
+    pub fn page_get(&self, index: usize, off: usize) -> T {
+        self.pages[index].1.data[off]
+    }
+
+    /// Sets offset `off` of page `index` to `val`, as [`Self::set`] does.
+    #[inline]
+    pub fn page_set(&mut self, index: usize, off: usize, val: T) {
+        let page = &mut self.pages[index].1;
         page.data[off] = val;
         page.occupied[off / WORD_BITS] |= 1u64 << (off % WORD_BITS);
     }
@@ -120,6 +152,13 @@ impl<T: Copy> PagedMem<T> {
             Ok(i) => Some(&self.pages[i].1.data),
             Err(_) => None,
         }
+    }
+
+    /// The bytes its pages take on the heap.
+    pub fn heap_bytes(&self) -> usize {
+        self.pages.capacity() * std::mem::size_of::<(u64, Page<T>)>()
+            + self.pages.len()
+                * (DEFAULT_PAGE_SIZE * std::mem::size_of::<T>() + OCC_WORDS * size_of::<u64>())
     }
 
     /// Number of cells that were explicitly `set`.

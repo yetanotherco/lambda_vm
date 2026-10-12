@@ -12,8 +12,8 @@
 use std::any::TypeId;
 
 use crate::lookup::{
-    BusInteraction, BusValue, LOGUP_CHALLENGE_ALPHA, LinearTerm, Multiplicity, Packing,
-    compute_alpha_powers, split_interactions,
+    BusInteraction, BusValue, LOGUP_CHALLENGE_ALPHA, LinearTerm, LogUpLayout, Multiplicity,
+    Packing, compute_alpha_powers, split_interactions_k,
 };
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
@@ -125,7 +125,7 @@ pub struct FingerprintDescriptor {
     pub term_col: Vec<u32>,
 
     // --- term-combine (K3) data ---
-    /// Number of output term columns = committed pairs + 1 virtual.
+    /// Number of output term columns = committed groups + 1 virtual.
     pub num_out_cols: usize,
     /// Per interaction: signed multiplicity constant (negated for receivers).
     pub mult_const: Vec<u64>,
@@ -269,8 +269,12 @@ impl FingerprintDescriptor {
     }
 }
 
-/// Compile a table's interactions into a [`FingerprintDescriptor`].
-pub fn build_fingerprint_descriptor(interactions: &[BusInteraction]) -> FingerprintDescriptor {
+/// Compile a table's interactions into a [`FingerprintDescriptor`] for its
+/// LogUp layout's `arity` (interactions per committed term column).
+pub fn build_fingerprint_descriptor(
+    interactions: &[BusInteraction],
+    arity: usize,
+) -> FingerprintDescriptor {
     let mut d = FingerprintDescriptor {
         num_interactions: interactions.len(),
         ..Default::default()
@@ -299,20 +303,21 @@ pub fn build_fingerprint_descriptor(interactions: &[BusInteraction]) -> Fingerpr
     }
     d.alpha_powers_len = max_bus_elements;
 
-    // Output term columns: committed pair p = {2p, 2p+1}; the trailing 1-2
-    // absorbed interactions form one virtual column.
-    let (committed_pairs, absorbed) = split_interactions(interactions.len());
+    // Output term columns: committed group g = {k·g, …, k·g + k − 1}; the
+    // trailing 1..=k absorbed interactions form one virtual column.
+    let (committed_groups, absorbed) = split_interactions_k(interactions.len(), arity);
     d.out_col_offsets.push(0);
-    for p in 0..committed_pairs {
-        d.out_col_interactions.push(2 * p as u32);
-        d.out_col_interactions.push(2 * p as u32 + 1);
+    for g in 0..committed_groups {
+        for i in 0..arity {
+            d.out_col_interactions.push((arity * g + i) as u32);
+        }
         d.out_col_offsets.push(d.out_col_interactions.len() as u32);
     }
     for k in (interactions.len() - absorbed)..interactions.len() {
         d.out_col_interactions.push(k as u32);
     }
     d.out_col_offsets.push(d.out_col_interactions.len() as u32);
-    d.num_out_cols = committed_pairs + 1;
+    d.num_out_cols = committed_groups + 1;
     d
 }
 
@@ -346,7 +351,7 @@ impl FingerprintDescriptor {
 /// to the aux trace; the virtual column feeds the accumulated column.
 #[allow(clippy::type_complexity)]
 pub fn try_build_term_columns_gpu<F, E>(
-    interactions: &[BusInteraction],
+    layout: &LogUpLayout,
     main_cols: &[Vec<FieldElement<F>>],
     trace_len: usize,
     challenges: &[FieldElement<E>],
@@ -360,6 +365,7 @@ where
     {
         return None;
     }
+    let interactions = &layout.interactions;
     if trace_len < GPU_LOGUP_MIN_ROWS || main_cols.is_empty() || interactions.is_empty() {
         return None;
     }
@@ -368,7 +374,7 @@ where
         return None;
     }
 
-    let desc = build_fingerprint_descriptor(interactions);
+    let desc = build_fingerprint_descriptor(interactions, layout.arity);
     if desc.num_out_cols == 0 {
         return None;
     }
@@ -416,10 +422,15 @@ where
 /// Returns `None` to fall back (non Goldilocks, below threshold, no GPU, GPU
 /// error). This is the residency path that avoids the term-column download.
 pub fn try_build_aux_resident_gpu<'a, F, E>(
-    interactions: &[BusInteraction],
+    table: &str,
+    layout: &LogUpLayout,
     num_cols: usize,
     main_cols: impl FnOnce() -> &'a [Vec<FieldElement<F>>],
-    main_dev: Option<(&math_cuda::CudaSlice<u64>, usize)>,
+    main_dev: Option<(
+        &math_cuda::CudaSlice<u64>,
+        usize,
+        Option<&math_cuda::device::PooledEvent>,
+    )>,
     trace_len: usize,
     challenges: &[FieldElement<E>],
 ) -> Option<math_cuda::logup::ResidentAux>
@@ -432,13 +443,14 @@ where
     {
         return None;
     }
+    let interactions = &layout.interactions;
     if trace_len < GPU_LOGUP_MIN_ROWS || num_cols == 0 || interactions.is_empty() {
         return None;
     }
     if std::env::var_os("LAMBDA_VM_NO_GPU_LOGUP").is_some() {
         return None;
     }
-    let desc = build_fingerprint_descriptor(interactions);
+    let desc = build_fingerprint_descriptor(interactions, layout.arity);
     if desc.num_out_cols == 0 {
         return None;
     }
@@ -450,7 +462,7 @@ where
     // host columns. The resident buffer skips both the host transpose and the
     // ~3 GB main re-upload.
     let resident_main =
-        main_dev.filter(|&(buf, rows)| rows == trace_len && buf.len() == num_cols * trace_len);
+        main_dev.filter(|&(buf, rows, _)| rows == trace_len && buf.len() == num_cols * trace_len);
     let mut main_flat = Vec::new();
     if resident_main.is_none() {
         main_flat = vec![0u64; num_cols * trace_len];
@@ -476,9 +488,23 @@ where
     let stream = be.next_stream();
     let md = desc.as_cuda();
     let main = match resident_main {
-        Some((buf, _)) => math_cuda::logup::ResidentMain::Dev(buf),
+        Some((buf, _, _)) => math_cuda::logup::ResidentMain::Dev(buf),
         None => math_cuda::logup::ResidentMain::Host(&main_flat),
     };
+    // The resident main is written on its producer's stream, and nothing else
+    // orders this one after it: event tracking is off, and the kept-top-levels
+    // recompute (`coset_lde_row_major_keep_no_tree`) returns with the snapshot
+    // still queued — unlike the tree-building commits, whose root download
+    // host-blocks behind it. Reading it unordered computes the aux columns
+    // from stale rows, and the table's proof is refused. Wait device-side.
+    let producer = resident_main.and_then(|(_, _, ready)| ready);
+    let probe =
+        crate::gpu_lde::gpu_xcheck() && producer.is_some_and(|ev| !ev.event().is_complete());
+    if let Some(ev) = producer
+        && crate::gpu_lde::aux_waits_for_resident_main()
+    {
+        stream.wait(ev.event()).ok()?;
+    }
     let ra = math_cuda::logup::logup_aux_resident(
         main,
         trace_len,
@@ -489,6 +515,27 @@ where
         &stream,
     )
     .ok()?;
+    // Diagnostic: the producer had not finished when this build was queued.
+    // Rebuild once it has; a different contribution means the first build
+    // read the snapshot before it was written.
+    if probe && let Some(ev) = producer {
+        ev.event().synchronize().ok()?;
+        let again = math_cuda::logup::logup_aux_resident(
+            main,
+            trace_len,
+            &md,
+            &alpha_flat,
+            z_arr,
+            inv_n,
+            &be.next_stream(),
+        )
+        .ok()?;
+        let stale = again.table_contribution != ra.table_contribution;
+        eprintln!(
+            "[xcheck] aux build queued before its resident main was written: table={table} \
+             rows={trace_len} stale={stale}"
+        );
+    }
     crate::gpu_lde::GPU_LOGUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(ra)
 }
@@ -640,7 +687,7 @@ mod tests {
         let z = FieldElement::<E>::from(lcg(&mut st));
         let shifts = PackingShifts::<F>::new();
 
-        let desc = build_fingerprint_descriptor(&interactions);
+        let desc = build_fingerprint_descriptor(&interactions, 2);
         let max_be = interactions
             .iter()
             .map(|i| i.num_bus_elements())
@@ -726,7 +773,7 @@ mod tests {
         let alpha = mk_ext3(&mut st);
         let z = mk_ext3(&mut st);
 
-        let desc = build_fingerprint_descriptor(&interactions);
+        let desc = build_fingerprint_descriptor(&interactions, 2);
         let alpha_powers = compute_alpha_powers(&alpha, desc.alpha_powers_len);
 
         // CPU reference, layout [(k*num_rows + row)*3 + limb].
@@ -854,7 +901,7 @@ mod tests {
         let z = FieldElement::<E>::from(lcg(&mut st));
         let shifts = PackingShifts::<F>::new();
 
-        let desc = build_fingerprint_descriptor(&interactions);
+        let desc = build_fingerprint_descriptor(&interactions, 2);
         let alpha_powers = compute_alpha_powers(&alpha, desc.alpha_powers_len);
 
         // Reciprocals of every interaction's fingerprint, laid out [k*num_rows+row].
@@ -888,6 +935,95 @@ mod tests {
         }
     }
 
+    /// ★ T0d: the descriptor's output columns are the LogUp layout's, at every
+    /// arity: committed group `g` = interactions `k·g .. k·g + k`, then one
+    /// virtual column of the absorbed tail. The term combine over the
+    /// descriptor equals the faithful per-group reference (k = 3, 4).
+    #[test]
+    fn descriptor_groups_follow_the_layout_at_every_arity() {
+        let base = term_test_interactions();
+        let interactions_of = |n: usize| -> Vec<BusInteraction> {
+            (0..n)
+                .map(|i| {
+                    let mut it = base[i % base.len()].clone();
+                    it.bus_id = 10 + i as u64;
+                    it
+                })
+                .collect()
+        };
+        for arity in [2usize, 3, 4] {
+            for n in 1..=14 {
+                let interactions = interactions_of(n);
+                let desc = build_fingerprint_descriptor(&interactions, arity);
+                let layout = LogUpLayout::with_arity(interactions.clone(), arity);
+                assert_eq!(
+                    desc.num_out_cols,
+                    layout.num_term_columns + 1,
+                    "k={arity} N={n}"
+                );
+                let index = |it: &BusInteraction| (it.bus_id - 10) as u32;
+                let mut want_cols: Vec<Vec<u32>> = (0..layout.num_committed_groups)
+                    .map(|g| layout.group(g).iter().map(index).collect())
+                    .collect();
+                want_cols.push(layout.absorbed().iter().map(index).collect());
+                let got_cols: Vec<Vec<u32>> = (0..desc.num_out_cols)
+                    .map(|c| {
+                        desc.out_col_interactions
+                            [desc.out_col_offsets[c] as usize..desc.out_col_offsets[c + 1] as usize]
+                            .to_vec()
+                    })
+                    .collect();
+                assert_eq!(got_cols, want_cols, "k={arity} N={n}");
+            }
+        }
+
+        let num_cols = 8;
+        let num_rows = 32;
+        let mut st = 0x51ed_270b_27b0_c7c1u64;
+        let main: Vec<Vec<FieldElement<F>>> = (0..num_cols)
+            .map(|_| {
+                (0..num_rows)
+                    .map(|_| FieldElement::<F>::from(lcg(&mut st) % 251))
+                    .collect()
+            })
+            .collect();
+        let alpha = FieldElement::<E>::from(lcg(&mut st));
+        let z = FieldElement::<E>::from(lcg(&mut st));
+        let shifts = PackingShifts::<F>::new();
+        for (arity, n) in [(3usize, 10usize), (4, 13), (4, 15)] {
+            let interactions = interactions_of(n);
+            let desc = build_fingerprint_descriptor(&interactions, arity);
+            let layout = LogUpLayout::with_arity(interactions.clone(), arity);
+            let alpha_powers = compute_alpha_powers(&alpha, desc.alpha_powers_len);
+            let mut recips: Vec<FieldElement<E>> = Vec::with_capacity(n * num_rows);
+            #[allow(clippy::needless_range_loop)] // main is column-major: main[c][row]
+            for k in 0..n {
+                for row in 0..num_rows {
+                    recips.push(eval_fingerprint::<F, E>(
+                        &desc,
+                        k,
+                        |c| &main[c][row],
+                        &alpha_powers,
+                        &z,
+                    ));
+                }
+            }
+            FieldElement::inplace_batch_inverse(&mut recips).unwrap();
+            let mut groups: Vec<Vec<&BusInteraction>> = (0..layout.num_committed_groups)
+                .map(|g| layout.group(g).iter().collect())
+                .collect();
+            groups.push(layout.absorbed().iter().collect());
+            for (col, g) in groups.iter().enumerate() {
+                let want = reference_term_column(g, &main, num_rows, &alpha_powers, &z, &shifts);
+                for row in 0..num_rows {
+                    let got =
+                        eval_term::<F, E>(&desc, col, row, num_rows, |c| &main[c][row], &recips);
+                    assert_eq!(got, want[row], "k={arity} N={n} col {col} row {row}");
+                }
+            }
+        }
+    }
+
     // Full GPU term pipeline (fingerprint -> batch invert -> term) vs the CPU
     // reference, byte for byte. Covers committed pairs + the virtual column.
     #[test]
@@ -911,7 +1047,7 @@ mod tests {
         let z = mk_ext3(&mut st);
         let shifts = PackingShifts::<F>::new();
 
-        let desc = build_fingerprint_descriptor(&interactions);
+        let desc = build_fingerprint_descriptor(&interactions, 2);
         let alpha_powers = compute_alpha_powers(&alpha, desc.alpha_powers_len);
 
         // CPU reference term columns: 2 committed pairs + virtual (last 1).
@@ -1021,7 +1157,7 @@ mod tests {
         let alpha = mk_ext3(&mut st);
         let z = mk_ext3(&mut st);
         let shifts = PackingShifts::<F>::new();
-        let desc = build_fingerprint_descriptor(&interactions);
+        let desc = build_fingerprint_descriptor(&interactions, 2);
         let alpha_powers = compute_alpha_powers(&alpha, desc.alpha_powers_len);
 
         let committed = vec![
@@ -1129,6 +1265,87 @@ mod tests {
             canon(&gpu_dev),
             canon(&expected),
             "resident-main aux buffer mismatch CPU reference"
+        );
+    }
+
+    // The resident aux build reads a main snapshot still being written on its
+    // producer's stream (the kept-top-levels recompute returns without a host
+    // barrier). With the producer's event passed it waits and matches the CPU
+    // reference; without it (the control) it reads the zeroed buffer and does
+    // not — so the wait is what makes the first arm pass. Runs on the GPU box.
+    #[test]
+    #[ignore = "requires GPU; run with --ignored"]
+    fn gpu_aux_resident_waits_for_the_producer_of_its_main() {
+        let interactions = term_test_interactions();
+        let num_cols = 8;
+        let num_rows = GPU_LOGUP_MIN_ROWS;
+        let mut st = 0x1319_8a2e_0370_7344u64;
+        let main: Vec<Vec<FieldElement<F>>> = (0..num_cols)
+            .map(|_| {
+                (0..num_rows)
+                    .map(|_| FieldElement::<F>::from(lcg(&mut st) % 251))
+                    .collect()
+            })
+            .collect();
+        let alpha = mk_ext3(&mut st);
+        let z = mk_ext3(&mut st);
+        let mut challenges = vec![z; LOGUP_CHALLENGE_ALPHA + 1];
+        challenges[LOGUP_CHALLENGE_ALPHA] = alpha;
+        let shifts = PackingShifts::<F>::new();
+        let desc = build_fingerprint_descriptor(&interactions, 2);
+        let alpha_powers = compute_alpha_powers(&alpha, desc.alpha_powers_len);
+        let groups: [Vec<&BusInteraction>; 3] = [
+            vec![&interactions[0], &interactions[1]],
+            vec![&interactions[2], &interactions[3]],
+            vec![&interactions[4]],
+        ];
+        let cols: Vec<Vec<FieldElement<E>>> = groups
+            .iter()
+            .map(|g| reference_term_column(g, &main, num_rows, &alpha_powers, &z, &shifts))
+            .collect();
+        let (_, total) = reference_accumulate(&cols, num_rows);
+
+        let mut main_flat = vec![0u64; num_cols * num_rows];
+        for c in 0..num_cols {
+            for r in 0..num_rows {
+                main_flat[c * num_rows + r] = *main[c][r].value();
+            }
+        }
+        let be = math_cuda::device::backend().unwrap();
+        // One arm: the snapshot zeroed, then written on a producer stream held
+        // for 300 ms, its event recorded behind the write; the build queued at
+        // once on its own stream.
+        let build = |pass_event: bool| -> [u64; 3] {
+            let producer = be.next_stream();
+            let src = producer.clone_htod(&main_flat).unwrap();
+            let mut snap = producer.alloc_zeros::<u64>(main_flat.len()).unwrap();
+            producer.synchronize().unwrap();
+            math_cuda::device::stall_stream_for_test(&producer, 300).unwrap();
+            producer.memcpy_dtod(&src, &mut snap).unwrap();
+            let ready = be.take_event().unwrap();
+            ready.event().record(&producer).unwrap();
+            let ra = try_build_aux_resident_gpu::<F, E>(
+                "producer-wait-test",
+                &crate::lookup::LogUpLayout::from_interactions(interactions.clone()),
+                num_cols,
+                || main.as_slice(),
+                Some((&snap, num_rows, pass_event.then_some(&ready))),
+                num_rows,
+                &challenges,
+            )
+            .expect("the resident aux build runs");
+            producer.synchronize().unwrap();
+            ra.table_contribution
+        };
+        assert_eq!(
+            canon(&build(true)),
+            canon(&limbs(&total)),
+            "the build waited on its producer's event and still differs from the CPU reference"
+        );
+        assert_ne!(
+            canon(&build(false)),
+            canon(&limbs(&total)),
+            "control: without the event the build should read the zeroed snapshot"
         );
     }
 }
