@@ -1780,6 +1780,56 @@ fn regenerators_started_at_the_finishs_end_prove_the_same_bytes() {
     }
 }
 
+/// ★ The regenerator's thread is up before the drops: with each streamed
+/// chunk's drop held back, it asks for fates phase A has not decided yet, waits
+/// for every one, and rebuilds exactly what was dropped; the proof is
+/// regeneration off's bytes. A fate answered "kept" before it is decided would
+/// leave ranks out, and phase A's end refuses that ("the early regenerator
+/// took … streamed chunks, phase A dropped …").
+#[test]
+fn a_regenerator_up_before_the_drops_proves_the_same_bytes() {
+    use crate::block_whir::BlockSpillPolicy;
+    use crate::block_whir::regen::{EarlySpawn, RegenMode};
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let (plain, _) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Off,
+        BlockSpillPolicy::Off,
+        Deviations::default(),
+    )
+    .expect("prove");
+    let (proof, stamps) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Always,
+        BlockSpillPolicy::Off,
+        Deviations {
+            regen_early: Some(EarlySpawn::Fates),
+            streamed_drop_delay: Some(std::time::Duration::from_millis(100)),
+            ..Deviations::default()
+        },
+    )
+    .unwrap_or_else(|e| panic!("the drops held back: {e:?}"));
+    let r = stamps.regen.expect("live regeneration's readout");
+    let lines = r.lines.join("\n");
+    assert!(r.head_start.is_some(), "{lines}");
+    assert!(r.dropped > r.rest_dropped, "{lines}");
+    assert_eq!(r.regenerated, r.dropped, "{lines}");
+    assert_eq!((r.mismatches, r.failed), (0, 0), "{lines}");
+    assert_eq!(proof.groups, plain.groups, "the partition");
+    assert!(verify(&proof, &elf, &format), "the drops held back");
+    if crypto::grinding::deterministic() {
+        assert!(bytes(&proof) == bytes(&plain), "the proof differs");
+    }
+}
+
 /// N4c's liveness: phase A ends in an error right after the finish, with the
 /// streamed chunks' regenerator started and waiting on chunks not yet
 /// decided. The prove returns the error (its window closed, its thread
