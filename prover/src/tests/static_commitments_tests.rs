@@ -582,7 +582,8 @@ fn keccak_rc_p1_static_matches_recompute() {
 /// keeps its own constants, and the two tables' roots are their own. Every
 /// case on `keccak_rc` (32 rows), where a recompute is cheap; `bitwise`
 /// dispatches in a function of its own, so one case off its key (the other
-/// coset) is recomputed for it too.
+/// coset) is recomputed for it too. A configuration of neither family is
+/// computed at Poseidon1's own key, in both functions.
 #[test]
 fn a_p1_static_is_taken_at_its_own_key_only() {
     let blessed = keccak_rc::static_commitment_p1(4).expect("the block family's key");
@@ -648,4 +649,26 @@ fn a_p1_static_is_taken_at_its_own_key_only() {
         bitwise::static_commitment_p1(4),
         keccak_rc::static_commitment_p1(4)
     );
+    // A third configuration: neither the legacy pin nor Poseidon1. Should the
+    // pin ever become this hash, name another here.
+    type Third = crate::lfm::algebraic_commit::RpoStarkHash;
+    let third = <Third as stark::config::StarkHash>::COMMITMENT_HASH;
+    assert_ne!(third, crate::hash_pin::BLOCK_COMMITMENT_HASH);
+    assert_ne!(third, stark::config::CommitmentHash::Poseidon1);
+    let got = keccak_rc::preprocessed_root_under::<Third>(&options);
+    assert_eq!(
+        got,
+        keccak_rc::compute_preprocessed_commitment_under::<Third>(&options, LeafLayout::RowPair),
+        "a third configuration is computed at Poseidon1's key"
+    );
+    assert_ne!(got, blessed);
+    assert_ne!(got, keccak_rc::preprocessed_commitment(&options));
+    let got = bitwise::preprocessed_root_under::<Third>(&options);
+    assert_eq!(
+        got,
+        bitwise::compute_preprocessed_commitment_under::<Third>(&options, LeafLayout::RowPair),
+        "bitwise: a third configuration is computed at Poseidon1's key"
+    );
+    assert_ne!(Some(got), bitwise::static_commitment_p1(4));
+    assert_ne!(got, bitwise::preprocessed_commitment(&options));
 }
