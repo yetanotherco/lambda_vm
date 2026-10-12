@@ -29,10 +29,18 @@
 //! A block that proves with no disk ([`note_no_disk`]) notes memory pressure
 //! from a forecast of the disk path's growth, and then never grows that way:
 //! on a 118 GiB host the p90 block stayed under 68 GiB and still paid both
-//! purges and their page faults, 4.1 s (ZEN5 096). There `auto` purges at its
-//! two points only when the resident set has come within the block's headroom
-//! of its pressure line ([`has_room`], `LAMBDA_VM_ALLOC_PURGE_ROOM`): a 64 GiB
-//! host purges at both as before, a host with room at neither.
+//! purges, 4.1 s of their own time (2.4 s at phase A's end, 1.6 s at the
+//! base's; ZEN5 096, 099). There `auto` purges at its two points only when the
+//! resident set has come within the block's headroom of its pressure line
+//! ([`has_room`], `LAMBDA_VM_ALLOC_PURGE_ROOM`): a 64 GiB host purges at both
+//! as before, a host with room at neither.
+//!
+//! Phase B's time does not follow the purge. It follows the leaf programs the
+//! tree proves beside the base, and a block that skips the purges keeps fewer
+//! of them there, because the tree's budget counts the pages the allocator
+//! still holds. At p90 on that host (ZEN5 099) 13 of 26 stay beside the base:
+//! phase B is 3.4 s shorter and the tree 2.7 s longer. With all 26 beside the
+//! base and no purge, phase B is as long as it is with the purges.
 
 /// The allocator's statistics, in bytes (jemalloc's `stats.*`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
