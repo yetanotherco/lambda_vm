@@ -1724,7 +1724,7 @@ fn no_disk_is_off_beside_live_regeneration_and_auto_without_it() {
     }
 }
 
-/// ★ The streamed chunks' regenerator starts before phase B (N4c), from each
+/// ★ The streamed chunks' regenerator starts before phase B, from each
 /// chunk's fate as phase A decided it: its thread up where the streamed chunks
 /// end and started once their fates are known (the default), or started at
 /// the finish's end; the rest's starts with phase B. Every dropped table is

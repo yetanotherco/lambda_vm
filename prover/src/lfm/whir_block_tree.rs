@@ -242,8 +242,9 @@ fn count_knob(name: &str) -> Result<Option<usize>, String> {
 
 /// How many leaf programs are emitted at once beside phase B by default
 /// (`W3_LEAF_EMITTERS`). One thread a leaf, all started at the statement, took
-/// the host from phase B's first groups (ZEN5 100, the median: 0.61 s a group
-/// while 13 emitters ran against 0.45 s after them; 0.95 s with 26), and
+/// the host from phase B's first groups (measured on a 16-core host with one
+/// RTX 5090: at the median 0.61 s a group while 13 emitters ran against
+/// 0.45 s after them; on a large block 0.95 s with 26), and
 /// nothing needs a leaf's program before the base ends but the early leaf,
 /// which is among the first emitted.
 pub const LEAF_EMITTERS: usize = 3;

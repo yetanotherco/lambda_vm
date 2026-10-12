@@ -311,10 +311,11 @@ pub(crate) fn rest_ahead_bytes() -> u64 {
 pub enum EarlySpawn {
     /// `0`: with phase B, from phase A's final drops.
     Off,
-    /// `finish`: at the finish's end, when regeneration has armed by then
-    /// (N4c). Its first chunk needs about a second, so a phase B that starts
-    /// sooner than that after the finish waits for it (ZEN5 072: the median's
-    /// first rebuilt groups waited 0.28-0.64 s).
+    /// `finish`: at the finish's end, when regeneration has armed by then.
+    /// Its first chunk needs about a second, so a phase B that starts sooner
+    /// than that after the finish waits for it (the median block's first
+    /// rebuilt groups waited 0.28-0.64 s, measured on a 118 GiB host with one
+    /// RTX 5090).
     Finish,
     /// The default: as soon as every streamed chunk's fate is known. Its
     /// thread is there from the walk's end and waits for the fates
@@ -348,7 +349,8 @@ pub(crate) const REGEN_LEAD: usize = 4;
 /// regenerator starts with phase B, from phase A's final drops, and its first
 /// group's tables take it about a second and a half; the streamed chunks' has
 /// started before. With one streamed group ahead of it, the rest's first group
-/// waited 0.31-0.45 s at the median (ZEN5 099, 100).
+/// waited 0.31-0.45 s at the median (measured on a 118 GiB host with one RTX
+/// 5090).
 pub(crate) fn regen_lead() -> usize {
     parse_lead(std::env::var("LAMBDA_VM_BLOCK_REGEN_LEAD").ok().as_deref())
 }
@@ -2400,8 +2402,8 @@ pub(crate) struct LiveArgs {
     pub(crate) policy: AheadPolicy,
 }
 
-/// The streamed chunks' regenerator started before phase B (D-WHIR-NODISK
-/// N4c), on a thread of its own outside phase A's, once every streamed chunk's
+/// The streamed chunks' regenerator started before phase B, on a thread of
+/// its own outside phase A's, once every streamed chunk's
 /// fate is known (their groups commit first; each waited for through
 /// [`stark::multilinear_block::BlockRegen::await_rank`], which answers nothing
 /// for a table the arm may still drop). The thread may be there before
@@ -2827,7 +2829,7 @@ mod tests {
         );
     }
 
-    /// `LAMBDA_VM_BLOCK_REGEN_EARLY` (N4c): at the fates unless `0` (with
+    /// `LAMBDA_VM_BLOCK_REGEN_EARLY`: at the fates unless `0` (with
     /// phase B) or `finish` (at the finish's end); and the head-start line,
     /// with a start and without.
     #[test]

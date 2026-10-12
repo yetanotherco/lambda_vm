@@ -4120,7 +4120,7 @@ fn prove_streamed(
                     && !deviations.omit_first_keccak_rnd;
                 if streams {
                     let keep = live_recorder.is_some();
-                    // The streamed chunks' regenerator (N4c): its thread waits
+                    // The streamed chunks' regenerator: its thread waits
                     // for every streamed chunk's fate and starts it then; the
                     // rest's starts with phase B, from its final drops.
                     let start_early = || {
