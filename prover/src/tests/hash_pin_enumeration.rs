@@ -256,11 +256,15 @@ const BLESSED: &[(&str, &str)] = &[
          module fixes at `P1_STARK_CAP` as `P1StarkHash`. It NAMES a hash that \
          is not the workspace default, so no default is handed to any consumer \
          and the question this list asks has no subject here. Reachability: \
-         production names the configuration at one place, \
-         `hash_pin::P1Family::Stark`, and the block path names `BlockFamily`, \
-         never this module; the module's other production readers are \
-         `transcript_replay`'s Poseidon1 arms, selected by the builder's wrap \
-         hash, which is the family's. The file is blessed rather than the name \
+         the prover and the verifier name the configuration at one place, \
+         `hash_pin::P1Family::Stark`, and the block's own files (the five the \
+         block-path scan reads) name `BlockFamily`, never this module. The \
+         module's other production readers are `transcript_replay`'s \
+         Poseidon1 arms, which the block's nodes run, selected by the \
+         builder's wrap hash, which is the family's. The static tables' \
+         generator (`bin/compute_static_commitments`) names the configuration \
+         too, to recompute the blessed Poseidon1 roots; it proves and \
+         verifies nothing. The file is blessed rather than the name \
          allowed, so a site spelling `stark::config::P1StarkHashCapped` at a \
          cap of its own still flags. A site that reaches the same type through \
          this module's re-export does not: this gate sees a configuration only \
