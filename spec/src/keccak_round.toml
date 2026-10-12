@@ -169,6 +169,11 @@ desc = ""
 name = "io"
 
 [[constraints.io]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+
+[[constraints.io]]
 kind = "interaction"
 tag = "KECCAK"
 input = ["timestamp", "round", "start"]
@@ -227,7 +232,6 @@ kind = "template"
 tag = "IS_BYTE"
 input = [["idx", ["idx", "Cxz_left", "x"], "z"]]
 iters = [["x", 0, 4], ["z", 0, 7]]
-cond = "μ"
 
 [[constraints.theta]]
 kind = "template"
@@ -275,7 +279,6 @@ kind = "template"
 tag = "IS_BYTE"
 input = [["idx", ["idx", ["idx", "rot_left", "x"], "y"], "z"]]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
-cond = "μ"
 ref = "keccak:c:range_rot_left"
 
 [[constraints.rho]]
@@ -283,7 +286,6 @@ kind = "template"
 tag = "IS_BYTE"
 input = [["idx", ["idx", ["idx", "rot_right", "x"], "y"], "z"]]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
-cond = "μ"
 ref = "keccak:c:range_rot_right"
 
 [[constraint_groups]]

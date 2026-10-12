@@ -26,12 +26,17 @@ pad = 0
 
 [[variables.multiplicity]]
 name = "μ"
-type = "BaseField"
+type = "Byte"
 desc = ""
 pad = 0
 
 [[constraint_groups]]
 name = "all"
+
+[[constraints.all]]
+kind = "template"
+tag = "IS_BYTE"
+input = ["μ"]
 
 [[constraints.all]]
 kind = "interaction"

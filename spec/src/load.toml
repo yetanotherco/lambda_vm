@@ -86,6 +86,11 @@ name = "all"
 [[constraints.all]]
 kind = "template"
 tag = "IS_BIT"
+input = ["μ"]
+
+[[constraints.all]]
+kind = "template"
+tag = "IS_BIT"
 input = ["signed"]
 
 [[constraints.all]]

@@ -8,12 +8,18 @@ pad = 0
 
 [[variables.multiplicity]]
 name = "μ"
-type = "BaseField"
+type = "B20"
 desc = ""
 pad = 0
 
 [[constraint_groups]]
 name = "all"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "IS_B20"
+input = ["μ"]
+multiplicity = 1
 
 [[constraints.all]]
 kind = "interaction"

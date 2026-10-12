@@ -99,7 +99,7 @@ pad = 0
 
 [[variables.multiplicity]]
 name = "μ"
-type = "BaseField"
+type = "Bit"
 desc = ""
 pad = 0
 
@@ -178,6 +178,11 @@ iter = ["i", 0, 3]
 
 [[constraint_groups]]
 name = "output"
+
+[[constraints.output]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
 
 [[constraints.output]]
 kind = "interaction"

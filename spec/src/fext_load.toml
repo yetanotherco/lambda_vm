@@ -30,6 +30,11 @@ name = "all"
 
 [[constraints.all]]
 kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+
+[[constraints.all]]
+kind = "template"
 tag = "REG"
 input = [10, "addr", "timestamp"]
 output = "addr"

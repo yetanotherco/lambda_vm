@@ -45,6 +45,7 @@
 
 #let interactions = signatures.signatures.filter(s => s.kind == "interaction")
 The following lists signatures of the #interactions.len() interactions in this VM.
+#show figure: set block(breakable: true)
 #figure(table(
     columns: (1fr, auto),
     inset: 7pt,

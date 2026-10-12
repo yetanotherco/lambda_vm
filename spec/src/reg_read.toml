@@ -2,7 +2,7 @@ name = "REG"
 
 [[variables.condition]]
 name = "cond"
-type = "BaseField"
+type = "Bit"
 desc = "the multiplicity with which to apply the interaction"
 
 [[variables.input]]

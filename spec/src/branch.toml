@@ -78,7 +78,7 @@ def = {idx = "i", polys = [
 
 [[variables.multiplicity]]
 name = "μ"
-type = "Bit"
+type = "Byte"
 desc = ""
 pad = 0
 
@@ -111,6 +111,11 @@ name = "all"
 
 [[constraints.all]]
 kind = "template"
+tag = "IS_BYTE"
+input = ["μ"]
+
+[[constraints.all]]
+kind = "template"
 tag = "ADD"
 input = ["pc", ["cast", "offset", "DWordWL"]]
 output = "next_pc_unmasked"
@@ -127,7 +132,6 @@ cond = "JALR"
 kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "next_pc_low", 1]]
-cond = "μ"
 
 [[constraints.all]]
 kind = "interaction"
