@@ -21,7 +21,7 @@
       ("is_byte", [`IS_BYTE` template], <isbyte>),
       ("is_whh", [`IS_WHH` template], <iswhh>),
       ("sign", [`SIGN` template], <sign>),
-      ("add", [`ADD`/`SUB` template], <add>),
+      ("add", [`ADD`/`SUB` templates], <add>),
       ("neg", [`NEG` template], <neg>),
       ("reg", [`REG`/`REGW` template], <reg>),
     )),
@@ -49,11 +49,11 @@
     ("ECALLS", (
       ("about_ecalls", [About `ECALL`], <ecall>),
       ("halt", [`HALT` chip], <halt>),
-      ("commit", [`COMMIT` chip], <commit>),
       ("sha256", [`SHA256` accelerator], <sha256>),
       ("keccak", [`KECCAK` accelerator], <keccak>),
       ("ecsm", [`ECSM` accelerator], <ecsm>),
       ("fext", [Extension field accelerator], <fext>),
+      ("copy", [`COPY` accelerator], <copy>),
     )),
     ("RECURSION", (
       ("recursion", [Recursive verification], <recursion>),
