@@ -2181,6 +2181,9 @@ pub(crate) struct Deviations {
     /// When live regeneration starts the streamed chunks' regenerator
     /// ([`regen::EarlyStart`]), instead of the knob ([`regen::early_start`]).
     pub regen_early: Option<regen::EarlySpawn>,
+    /// The streamed groups phase B takes ahead of the rest's first
+    /// ([`led_order`]), instead of the knob ([`regen::regen_lead`]).
+    pub regen_lead: Option<usize>,
     /// A pause before each drop of a streamed chunk, so the streamed
     /// chunks' regenerator started early meets chunks whose fate phase A has
     /// not decided yet.
@@ -3755,6 +3758,7 @@ fn prove_streamed(
     // (N4c); phase B takes it, and an error before then closes its window and
     // joins.
     let early_spawn = deviations.regen_early.unwrap_or_else(regen::early_start);
+    let regen_lead = deviations.regen_lead.unwrap_or_else(regen::regen_lead);
     let early_owned: std::sync::Mutex<Option<regen::EarlyStart>> = std::sync::Mutex::new(None);
     let early_slot = &early_owned;
     let (early_feed, early_recorder) = (live_regen.clone(), regen_recorder.clone());
@@ -4741,7 +4745,7 @@ fn prove_streamed(
         let group_cells = group_cells(&laid.shapes, &laid.groups);
         let order: Vec<usize> = match deviations.phase_b_order {
             Some(order) => order(laid.groups.len()),
-            None => multilinear_block::interleaved_order(&classes, &group_cells),
+            None => led_order(&classes, &group_cells, regen_lead),
         };
         // Each class's regenerator deposits in its rank order, its groups'
         // order: an order that takes a class's groups otherwise could wait on a
@@ -4821,12 +4825,18 @@ fn prove_streamed(
             let in_class = |c: usize| classes.iter().filter(|&&k| k == Some(c)).count();
             lines.push(format!(
                 "BLOCK REGEN phase B order: {} of {} groups rebuilt ({} streamed, {} rest), \
-                 interleaved after the others · phase B began {} after the regenerator",
+                 interleaved after the others · phase B began {} after the regenerator · {} \
+                 streamed groups ahead of the rest's first",
                 classes.iter().filter(|c| c.is_some()).count(),
                 classes.len(),
                 in_class(0),
                 in_class(1),
                 offset.map_or("n/a".to_string(), |s| format!("{s:.2} s")),
+                order
+                    .iter()
+                    .filter(|&&g| classes.get(g).copied().flatten().is_some())
+                    .take_while(|&&g| classes[g] == Some(0))
+                    .count(),
             ));
             let spans: Vec<(f64, f64)> = groups.iter().map(|g| (g.start_b, g.end_b)).collect();
             lines.push(regen::order_taken_line(
@@ -5925,6 +5935,142 @@ mod spill_policy_tests {
         assert!(parse_hand_off(Some(" on ")));
         assert!(!parse_hand_off(Some("off")));
         assert!(!parse_hand_off(Some(" off ")));
+    }
+}
+
+/// Phase B's order when live regeneration rebuilds tables: the groups it
+/// rebuilds nothing of first, then the first `lead` groups of the streamed
+/// chunks' class (class 0), then the others of both classes interleaved by
+/// their cells ([`multilinear_block::interleaved_order`]). Each class's groups
+/// stay in group order. The rest's regenerator (class 1) starts with phase B
+/// and its first group's tables take it about a second and a half, while the
+/// streamed chunks' has started before; taken second, the rest's first group
+/// waits for them ([`regen::regen_lead`]). With `lead` 0, or no group of the
+/// rest's class, it is the interleave's order.
+fn led_order(classes: &[Option<usize>], cells: &[u64], lead: usize) -> Vec<usize> {
+    let rest = classes.contains(&Some(1));
+    let led: Vec<usize> = (0..classes.len())
+        .filter(|&g| classes[g] == Some(0))
+        .take(if rest { lead } else { 0 })
+        .collect();
+    if led.is_empty() {
+        return multilinear_block::interleaved_order(classes, cells);
+    }
+    // The interleave puts every group with no class first, in group order:
+    // with the led groups' class masked, those are the groups phase B rebuilds
+    // nothing of and the led ones. The first kind goes first.
+    let mut masked = classes.to_vec();
+    for &g in &led {
+        masked[g] = None;
+    }
+    let order = multilinear_block::interleaved_order(&masked, cells);
+    let front = masked
+        .iter()
+        .filter(|c| c.is_none())
+        .count()
+        .min(order.len());
+    let (unclassed, interleaved) = order.split_at(front);
+    unclassed
+        .iter()
+        .copied()
+        .filter(|&g| classes[g].is_none())
+        .chain(led.iter().copied())
+        .chain(interleaved.iter().copied())
+        .collect()
+}
+
+#[cfg(test)]
+mod led_order_tests {
+    use super::{led_order, multilinear_block};
+
+    const S: Option<usize> = Some(0);
+    const R: Option<usize> = Some(1);
+
+    /// The groups phase B rebuilds nothing of, then `lead` streamed groups,
+    /// then the interleave of what is left: the rest's first group comes after
+    /// `lead` + 1 streamed ones (the interleave's tie goes to the streamed
+    /// class).
+    #[test]
+    fn the_rests_first_group_follows_the_led_streamed_groups() {
+        let classes = [None, S, S, S, S, S, S, R, R, None];
+        let ones = [1u64; 10];
+        assert_eq!(
+            led_order(&classes, &ones, 2),
+            vec![0, 9, 1, 2, 3, 7, 4, 5, 8, 6]
+        );
+        // A lead of 0, and a block with no rest group, are the interleave's.
+        assert_eq!(
+            led_order(&classes, &ones, 0),
+            multilinear_block::interleaved_order(&classes, &ones)
+        );
+        let no_rest = [None, S, S, S];
+        assert_eq!(
+            led_order(&no_rest, &[1; 4], 3),
+            multilinear_block::interleaved_order(&no_rest, &[1; 4])
+        );
+        // A lead past the class takes all of it, then the rest's.
+        assert_eq!(
+            led_order(&[R, S, None, S, R], &[1; 5], 9),
+            vec![2, 1, 3, 0, 4]
+        );
+        // Nothing rebuilt: the group order.
+        assert_eq!(led_order(&[None; 3], &[], 4), vec![0, 1, 2]);
+    }
+
+    /// Whatever the lead and the weights: every group once, and each class's
+    /// groups in group order (their regenerator deposits in that order).
+    #[test]
+    fn a_led_order_takes_every_group_once_and_each_class_in_order() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..200 {
+            let n = 1 + (next() % 40) as usize;
+            let classes: Vec<Option<usize>> = (0..n)
+                .map(|_| match next() % 5 {
+                    0 => None,
+                    1..=3 => S,
+                    _ => R,
+                })
+                .collect();
+            let cells: Vec<u64> = (0..n).map(|_| 1 + next() % 1000).collect();
+            let lead = (next() % 8) as usize;
+            let order = led_order(&classes, &cells, lead);
+            let mut seen = order.clone();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..n).collect::<Vec<_>>(), "{classes:?} lead {lead}");
+            for class in [S, R] {
+                let taken: Vec<usize> = order
+                    .iter()
+                    .copied()
+                    .filter(|&g| classes[g] == class)
+                    .collect();
+                assert!(
+                    taken.windows(2).all(|w| w[0] < w[1]),
+                    "{classes:?} lead {lead}"
+                );
+            }
+            // The groups phase B rebuilds nothing of come first.
+            let plain = classes.iter().filter(|c| c.is_none()).count();
+            assert!(order[..plain].iter().all(|&g| classes[g].is_none()));
+            // With a rest group, the streamed ones ahead of it are the lead's
+            // (or all there are), and one more by the interleave's tie.
+            if classes.contains(&R) {
+                let ahead = order[plain..]
+                    .iter()
+                    .take_while(|&&g| classes[g] == S)
+                    .count();
+                let streamed = classes.iter().filter(|c| **c == S).count();
+                assert!(
+                    ahead >= lead.min(streamed),
+                    "{classes:?} lead {lead}: {order:?}"
+                );
+            }
+        }
     }
 }
 

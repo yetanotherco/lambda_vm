@@ -338,6 +338,28 @@ fn parse_early(value: Option<&str>) -> EarlySpawn {
     }
 }
 
+/// The streamed groups phase B takes ahead of the rest's first when it
+/// rebuilds both classes ([`regen_lead`]).
+pub(crate) const REGEN_LEAD: usize = 4;
+
+/// `LAMBDA_VM_BLOCK_REGEN_LEAD` (default [`REGEN_LEAD`]; `0` is the plain
+/// interleave): how many groups of the streamed chunks' class phase B takes
+/// before it starts interleaving the two rebuilt classes. The rest's
+/// regenerator starts with phase B, from phase A's final drops, and its first
+/// group's tables take it about a second and a half; the streamed chunks' has
+/// started before. With one streamed group ahead of it, the rest's first group
+/// waited 0.31-0.45 s at the median (ZEN5 099, 100).
+pub(crate) fn regen_lead() -> usize {
+    parse_lead(std::env::var("LAMBDA_VM_BLOCK_REGEN_LEAD").ok().as_deref())
+}
+
+fn parse_lead(value: Option<&str>) -> usize {
+    value
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n <= 64)
+        .unwrap_or(REGEN_LEAD)
+}
+
 /// `LAMBDA_VM_BLOCK_REGEN_RESERVE_GIB` (default 10, #1013's): the host bytes
 /// `auto` reserves for the regenerator in phase B once regeneration is armed —
 /// its walk state, windows, jobs and generators' outputs, and the columns
@@ -2844,6 +2866,18 @@ mod tests {
             "room 0 with 3 parked"
         );
         assert_eq!(early_ahead(100 * G, 50 * G, 0, 16 * G), 16 * G, "capped");
+    }
+
+    /// `LAMBDA_VM_BLOCK_REGEN_LEAD`: a count up to 64, else the default.
+    #[test]
+    fn the_lead_reads_its_knob() {
+        assert_eq!(parse_lead(None), REGEN_LEAD);
+        assert_eq!(parse_lead(Some("0")), 0);
+        assert_eq!(parse_lead(Some(" 6 ")), 6);
+        assert_eq!(parse_lead(Some("64")), 64);
+        assert_eq!(parse_lead(Some("65")), REGEN_LEAD);
+        assert_eq!(parse_lead(Some("-1")), REGEN_LEAD);
+        assert_eq!(parse_lead(Some("many")), REGEN_LEAD);
     }
 
     /// While the finish runs the early window keeps its frontier whatever the
