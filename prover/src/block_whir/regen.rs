@@ -305,17 +305,37 @@ pub(crate) fn rest_ahead_bytes() -> u64 {
     gib_knob("LAMBDA_VM_BLOCK_REGEN_REST_AHEAD_GIB", 4.0)
 }
 
-/// `LAMBDA_VM_BLOCK_REGEN_EARLY` (default on; `0` turns it off): live
-/// regeneration starts the streamed chunks' regenerator at the finish's end
-/// when it has armed by then (N4c), instead of at phase B's start, so phase B's
-/// first rebuilt groups do not wait for its start-up (ULTRA 123: ≈ 2.5 s). The
-/// rest's starts with phase B either way.
-pub(crate) fn early_start() -> bool {
+/// When live regeneration starts the streamed chunks' regenerator
+/// (`LAMBDA_VM_BLOCK_REGEN_EARLY`). The rest's starts with phase B either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EarlySpawn {
+    /// `0`: with phase B, from phase A's final drops.
+    Off,
+    /// `finish`: at the finish's end, when regeneration has armed by then
+    /// (N4c). Its first chunk needs about a second, so a phase B that starts
+    /// sooner than that after the finish waits for it (ZEN5 072: the median's
+    /// first rebuilt groups waited 0.28-0.64 s).
+    Finish,
+    /// The default: as soon as every streamed chunk's fate is known. Its
+    /// thread is there from the walk's end and waits for the fates
+    /// ([`stark::multilinear_block::BlockRegen::await_rank`]), which the arm
+    /// and the streamed groups' commits decide while the finish still runs;
+    /// until the finish's end its window holds only its frontier.
+    Fates,
+}
+
+/// `LAMBDA_VM_BLOCK_REGEN_EARLY`: [`EarlySpawn::Fates`] unless `0` or
+/// `finish`.
+pub(crate) fn early_start() -> EarlySpawn {
     parse_early(std::env::var("LAMBDA_VM_BLOCK_REGEN_EARLY").ok().as_deref())
 }
 
-fn parse_early(value: Option<&str>) -> bool {
-    value.map(str::trim) != Some("0")
+fn parse_early(value: Option<&str>) -> EarlySpawn {
+    match value.map(str::trim) {
+        Some("0") => EarlySpawn::Off,
+        Some("finish") => EarlySpawn::Finish,
+        _ => EarlySpawn::Fates,
+    }
 }
 
 /// `LAMBDA_VM_BLOCK_REGEN_RESERVE_GIB` (default 10, #1013's): the host bytes
@@ -2245,18 +2265,22 @@ impl Drop for RestRun {
 }
 
 /// The `BLOCK REGEN head start` line (N4c): how long before phase B the
-/// streamed chunks' regenerator started (at the finish's end), how long their
-/// fates kept it waiting, and what its window held before phase B; or none.
+/// streamed chunks' regenerator started (once their fates were known), how
+/// long before phase B its thread was there (`spawned`), how long the fates
+/// kept it waiting, and what its window held before phase B; or none.
 pub(crate) fn head_start_line(
     head_start: Option<f64>,
+    spawned: Option<f64>,
     streamed_waited: Option<f64>,
     pace: Option<EarlyPace>,
 ) -> String {
     match head_start {
         Some(secs) => format!(
             "BLOCK REGEN head start: {secs:.2} s before phase B (the streamed chunks' regenerator \
-             started at the finish's end, the rest's with phase B) · streamed chunks' fates awaited \
-             {:.2} s · its window sized by the host's room until phase B: most {:.2} GiB, {} readings",
+             started when their fates were known, its thread {:.2} s before phase B; the rest's \
+             with phase B) · streamed chunks' fates awaited {:.2} s · its window sized by the \
+             host's room until phase B: most {:.2} GiB, {} readings",
+            spawned.unwrap_or(secs),
             streamed_waited.unwrap_or(0.0),
             pace.map_or(0, |p| p.most) as f64 / GIB,
             pace.map_or(0, |p| p.readings),
@@ -2284,12 +2308,32 @@ pub(crate) struct EarlyPace {
     pub(crate) most: u64,
 }
 
+/// One early reading's window size: nothing to set while the finish still
+/// runs (`paced` unset: the window keeps its frontier, so the regenerator does
+/// not rebuild beside the finish) or with no reading (no `/proc`); after the
+/// finish, [`early_ahead`]'s size (at most `cap`), moved from `now` in whole
+/// [`PACE_STEP`]s ([`paced_ahead`]).
+pub(crate) fn early_step(
+    paced: bool,
+    now: u64,
+    reading: Option<(u64, u64)>,
+    parked: u64,
+    cap: u64,
+) -> Option<u64> {
+    let (hwm, rss) = reading.filter(|_| paced)?;
+    Some(paced_ahead(now, early_ahead(hwm, rss, parked, cap)).min(cap))
+}
+
 /// Until phase B starts (`gate`) or the window closes: every [`PACE`] the
-/// window takes [`early_ahead`]'s size (at most `cap`), moved in whole
-/// [`PACE_STEP`]s ([`paced_ahead`]); with no reading (no `/proc`) it stays at
-/// its frontier. When phase B starts it takes the size it starts phase B with
+/// window takes [`early_step`]'s size, its frontier until the finish has ended
+/// (`paced`). When phase B starts it takes the size it starts phase B with
 /// (`open`), and its own pacer.
-fn early_pace(window: &RegenWindow, gate: &AtomicBool, (cap, open): (u64, u64)) -> EarlyPace {
+fn early_pace(
+    window: &RegenWindow,
+    gate: &AtomicBool,
+    paced: &AtomicBool,
+    (cap, open): (u64, u64),
+) -> EarlyPace {
     let mut report = EarlyPace::default();
     loop {
         if gate.load(Ordering::Acquire) {
@@ -2299,9 +2343,8 @@ fn early_pace(window: &RegenWindow, gate: &AtomicBool, (cap, open): (u64, u64)) 
         if window.is_closed() {
             return report;
         }
-        if let Some((hwm, rss)) = resident() {
-            let ahead =
-                paced_ahead(window.ahead(), early_ahead(hwm, rss, window.parked(), cap)).min(cap);
+        let reading = paced.load(Ordering::Acquire).then(resident).flatten();
+        if let Some(ahead) = early_step(true, window.ahead(), reading, window.parked(), cap) {
             window.set_ahead(ahead);
             report.readings += 1;
             report.most = report.most.max(ahead);
@@ -2316,6 +2359,8 @@ fn early_pace(window: &RegenWindow, gate: &AtomicBool, (cap, open): (u64, u64)) 
 #[derive(Default)]
 pub(crate) struct EarlyRuns {
     pub(crate) live: Option<LiveRun>,
+    /// When `live` started: every streamed chunk's fate was known.
+    pub(crate) live_started: Option<Instant>,
     pub(crate) keys: Vec<(u64, StreamKey)>,
     pub(crate) streamed_waited: f64,
     pub(crate) error: Option<String>,
@@ -2333,35 +2378,41 @@ pub(crate) struct LiveArgs {
     pub(crate) policy: AheadPolicy,
 }
 
-/// The streamed chunks' regenerator started at the finish's end
-/// (D-WHIR-NODISK N4c), on a thread of its own outside phase A's, once every
-/// streamed chunk's fate is known (their groups commit first; each waited for
-/// through [`stark::multilinear_block::BlockRegen::await_rank`]). The rest's
-/// regenerator starts with phase B, from phase A's final drops: phase B's
-/// order spreads the rest's groups so it leads them. Dropped before phase B
-/// takes it (the prove failed), it closes the streamed window, so nothing
-/// waits on it, and joins.
+/// The streamed chunks' regenerator started before phase B (D-WHIR-NODISK
+/// N4c), on a thread of its own outside phase A's, once every streamed chunk's
+/// fate is known (their groups commit first; each waited for through
+/// [`stark::multilinear_block::BlockRegen::await_rank`], which answers nothing
+/// for a table the arm may still drop). The thread may be there before
+/// regeneration arms ([`EarlySpawn::Fates`]): it then waits for the arm's
+/// drop-back, or for phase A's end, where every undropped table is kept and it
+/// starts nothing. The rest's regenerator starts with phase B, from phase A's
+/// final drops. Dropped before phase B takes it (the prove failed), it closes
+/// the streamed window, so nothing waits on it, and joins.
 pub(crate) struct EarlyStart {
     thread: Option<std::thread::JoinHandle<EarlyRuns>>,
     window: Option<Arc<RegenWindow>>,
     started: Instant,
-    /// The early pacer: the window sized by the host's room until phase B
-    /// opens `gate` ([`early_pace`]).
+    /// The early pacer: the window at its frontier until the finish has
+    /// ended, then sized by the host's room until phase B opens `gate`
+    /// ([`early_pace`]).
     pacer: Option<std::thread::JoinHandle<EarlyPace>>,
 }
 
 impl EarlyStart {
+    /// `paced` is set once the finish has ended: until then the window holds
+    /// only its frontier. `gate` opens when phase B starts.
     pub(crate) fn spawn(
         feed: stark::multilinear_block::BlockRegen,
         recorder: Arc<Recorder>,
         live: LiveArgs,
         gate: Arc<AtomicBool>,
+        paced: Arc<AtomicBool>,
     ) -> Self {
         let started = Instant::now();
         let window = feed.windows().first().cloned();
         // Before phase B the window holds only what the host's room allows:
-        // nothing ahead of its frontier until the early pacer's first reading,
-        // at most its phase-B size after.
+        // nothing ahead of its frontier while the finish runs and until the
+        // early pacer's first reading after it, at most its phase-B size after.
         let cap = match live.policy {
             AheadPolicy::Fixed(bytes) => bytes,
             AheadPolicy::Adaptive => AHEAD_CAP,
@@ -2372,7 +2423,7 @@ impl EarlyStart {
             let (window, gate) = (Arc::clone(window), Arc::clone(&gate));
             std::thread::Builder::new()
                 .name("regen-early-pacer".to_string())
-                .spawn(move || early_pace(&window, &gate, (cap, open)))
+                .spawn(move || early_pace(&window, &gate, &paced, (cap, open)))
                 .ok()
         });
         let window_in = window.clone();
@@ -2419,6 +2470,7 @@ impl EarlyStart {
                 if !keyed.is_empty() {
                     match feed.take_producer(0) {
                         Some(producer) => {
+                            runs.live_started = Some(Instant::now());
                             runs.live = Some(LiveRun::spawn(
                                 live.elf_bytes,
                                 live.private_input,
@@ -2451,7 +2503,8 @@ impl EarlyStart {
         }
     }
 
-    /// When it started.
+    /// When its thread was spawned (its regenerator starts later, once the
+    /// fates are known: [`EarlyRuns::live_started`]).
     pub(crate) fn started(&self) -> Instant {
         self.started
     }
@@ -2752,27 +2805,32 @@ mod tests {
         );
     }
 
-    /// `LAMBDA_VM_BLOCK_REGEN_EARLY` (N4c): on unless `0`; and the head-start
-    /// line, with a start and without.
+    /// `LAMBDA_VM_BLOCK_REGEN_EARLY` (N4c): at the fates unless `0` (with
+    /// phase B) or `finish` (at the finish's end); and the head-start line,
+    /// with a start and without.
     #[test]
     fn the_early_start_reads_its_knob_and_says_its_head_start() {
-        assert!(parse_early(None));
-        assert!(parse_early(Some("1")));
-        assert!(parse_early(Some("yes")));
-        assert!(!parse_early(Some("0")));
-        assert!(!parse_early(Some(" 0 ")));
+        assert_eq!(parse_early(None), EarlySpawn::Fates);
+        assert_eq!(parse_early(Some("1")), EarlySpawn::Fates);
+        assert_eq!(parse_early(Some("yes")), EarlySpawn::Fates);
+        assert_eq!(parse_early(Some("0")), EarlySpawn::Off);
+        assert_eq!(parse_early(Some(" 0 ")), EarlySpawn::Off);
+        assert_eq!(parse_early(Some("finish")), EarlySpawn::Finish);
+        assert_eq!(parse_early(Some(" finish ")), EarlySpawn::Finish);
+        assert_eq!(parse_early(Some("Finish")), EarlySpawn::Fates);
         let pace = EarlyPace {
             readings: 14,
             most: 2 << 30,
         };
         assert_eq!(
-            head_start_line(Some(3.4), Some(0.02), Some(pace)),
+            head_start_line(Some(3.4), Some(9.75), Some(0.02), Some(pace)),
             "BLOCK REGEN head start: 3.40 s before phase B (the streamed chunks' regenerator \
-             started at the finish's end, the rest's with phase B) · streamed chunks' fates awaited \
-             0.02 s · its window sized by the host's room until phase B: most 2.00 GiB, 14 readings"
+             started when their fates were known, its thread 9.75 s before phase B; the rest's \
+             with phase B) · streamed chunks' fates awaited 0.02 s · its window sized by the \
+             host's room until phase B: most 2.00 GiB, 14 readings"
         );
         assert_eq!(
-            head_start_line(None, None, None),
+            head_start_line(None, Some(9.75), None, None),
             "BLOCK REGEN head start: none (the regenerators started with phase B)"
         );
         // Before phase B the window holds only the room under the peak less
@@ -2786,6 +2844,50 @@ mod tests {
             "room 0 with 3 parked"
         );
         assert_eq!(early_ahead(100 * G, 50 * G, 0, 16 * G), 16 * G, "capped");
+    }
+
+    /// While the finish runs the early window keeps its frontier whatever the
+    /// host's room (the regenerator must not rebuild beside the finish); after
+    /// it, it takes the room in whole steps; with no reading it sets nothing.
+    #[test]
+    fn the_early_window_keeps_its_frontier_until_the_finish_ends() {
+        const G: u64 = 1 << 30;
+        let room = Some((100 * G, 50 * G));
+        assert_eq!(
+            early_step(false, 0, room, 0, 16 * G),
+            None,
+            "the finish runs"
+        );
+        assert_eq!(early_step(false, 3 * G, room, 0, 16 * G), None);
+        assert_eq!(
+            early_step(true, 0, room, 0, 16 * G),
+            Some(16 * G),
+            "after it"
+        );
+        assert_eq!(
+            early_step(true, 0, Some((70 * G, 60 * G)), 0, 16 * G),
+            Some(6 * G)
+        );
+        assert_eq!(
+            early_step(true, 0, Some((70 * G, 66 * G)), 0, 16 * G),
+            Some(0),
+            "no room"
+        );
+        assert_eq!(early_step(true, 0, None, 0, 16 * G), None, "no reading");
+        // The pacer itself: its frontier while `paced` is unset, and phase B's
+        // size once the gate opens.
+        let (window, _producer) = RegenWindow::new(4 * G);
+        window.set_ahead(0);
+        let (gate, paced) = (AtomicBool::new(false), AtomicBool::new(false));
+        std::thread::scope(|s| {
+            let pacer = s.spawn(|| early_pace(&window, &gate, &paced, (16 * G, 4 * G)));
+            std::thread::sleep(PACE * 2);
+            assert_eq!(window.ahead(), 0, "the frontier while the finish runs");
+            gate.store(true, Ordering::Release);
+            let report = pacer.join().expect("the pacer");
+            assert_eq!((report.readings, report.most), (0, 0));
+        });
+        assert_eq!(window.ahead(), 4 * G, "phase B's size at the gate");
     }
 
     /// `LAMBDA_VM_BLOCK_REGEN`: `off` (and unset), `shadow`, `auto`, `always`;

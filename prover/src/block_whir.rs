@@ -2178,10 +2178,9 @@ pub(crate) struct Deviations {
     /// frontier, so a phase-B order that takes a class out of its rank order
     /// cannot complete.
     pub regen_windows: Option<(u64, u64)>,
-    /// Whether live regeneration may start the streamed chunks' regenerator
-    /// at the finish's end ([`regen::EarlyStart`]), instead of the knob
-    /// ([`regen::early_start`]).
-    pub regen_early: Option<bool>,
+    /// When live regeneration starts the streamed chunks' regenerator
+    /// ([`regen::EarlyStart`]), instead of the knob ([`regen::early_start`]).
+    pub regen_early: Option<regen::EarlySpawn>,
     /// A pause before each drop of a streamed chunk, so the streamed
     /// chunks' regenerator started early meets chunks whose fate phase A has
     /// not decided yet.
@@ -3752,10 +3751,10 @@ fn prove_streamed(
     if let (Some(regen), Some(pause)) = (&live_regen, deviations.streamed_drop_delay) {
         regen.delay_drops(0, pause);
     }
-    // The streamed chunks' regenerator started at the finish's end, when it is
+    // The streamed chunks' regenerator started before phase B, when it is
     // (N4c); phase B takes it, and an error before then closes its window and
     // joins.
-    let early_on = deviations.regen_early.unwrap_or_else(regen::early_start);
+    let early_spawn = deviations.regen_early.unwrap_or_else(regen::early_start);
     let early_owned: std::sync::Mutex<Option<regen::EarlyStart>> = std::sync::Mutex::new(None);
     let early_slot = &early_owned;
     let (early_feed, early_recorder) = (live_regen.clone(), regen_recorder.clone());
@@ -3763,6 +3762,9 @@ fn prove_streamed(
     // only what the host's room allows (N4c).
     let early_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let early_gate_in = std::sync::Arc::clone(&early_gate);
+    // Set at the finish's end: until then an early start's window holds only
+    // its frontier, so the regenerator does not rebuild beside the finish.
+    let early_paced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let run_airs: std::sync::OnceLock<VmAirs> = std::sync::OnceLock::new();
     // Phase A's commits read the blowup, the fold schedule and the format of
     // the config and nothing else; the full config (its query count reads every
@@ -4114,6 +4116,38 @@ fn prove_streamed(
                     && !deviations.omit_first_keccak_rnd;
                 if streams {
                     let keep = live_recorder.is_some();
+                    // The streamed chunks' regenerator (N4c): its thread waits
+                    // for every streamed chunk's fate and starts it then; the
+                    // rest's starts with phase B, from its final drops.
+                    let start_early = || {
+                        if let (Some(feed), Some(recorder)) = (&early_feed, &early_recorder) {
+                            let early = regen::EarlyStart::spawn(
+                                feed.clone(),
+                                std::sync::Arc::clone(recorder),
+                                regen::LiveArgs {
+                                    elf_bytes: elf_bytes.to_vec(),
+                                    private_input: private_inputs.to_vec(),
+                                    max_rows: options.max_rows.clone(),
+                                    window_cycles: window,
+                                    form: stream_form,
+                                    faults: deviations.regen_faults,
+                                    policy: deviations.regen_windows.map_or_else(
+                                        regen::ahead_policy,
+                                        |(streamed, _)| regen::AheadPolicy::Fixed(streamed),
+                                    ),
+                                },
+                                std::sync::Arc::clone(&early_gate_in),
+                                std::sync::Arc::clone(&early_paced),
+                            );
+                            *early_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(early);
+                        }
+                    };
+                    // Every streamed chunk is handed out and the finish begins:
+                    // the thread goes up now, whether or not regeneration has
+                    // armed, and takes each chunk's fate as phase A decides it.
+                    if early_spawn == regen::EarlySpawn::Fates {
+                        start_early();
+                    }
                     let emitted = builder.finish_streamed_keeping(&last, rest_gate, keep, |header| {
                         let (tx, rx) = std::sync::mpsc::channel();
                         btx.send(Built::Stream(Box::new(RestStream {
@@ -4141,33 +4175,15 @@ fn prove_streamed(
                         ledger.image.store(0, Relaxed);
                     }
                     let rest_regen = emitted?;
-                    // The finish's end: when live regeneration has armed (or
-                    // drops every table), the streamed chunks' regenerator
-                    // starts now, not at phase B (N4c); the rest's starts with
-                    // phase B, from its final drops.
-                    if let (Some(feed), Some(recorder)) = (&early_feed, &early_recorder)
-                        && early_on
-                        && feed.drops_all_from_now()
+                    // The finish's end. `finish`: the regenerator starts here,
+                    // when live regeneration has armed (or drops every table).
+                    // Either way its window may now take the host's room.
+                    if early_spawn == regen::EarlySpawn::Finish
+                        && early_feed.as_ref().is_some_and(|feed| feed.drops_all_from_now())
                     {
-                        let early = regen::EarlyStart::spawn(
-                            feed.clone(),
-                            std::sync::Arc::clone(recorder),
-                            regen::LiveArgs {
-                                elf_bytes: elf_bytes.to_vec(),
-                                private_input: private_inputs.to_vec(),
-                                max_rows: options.max_rows.clone(),
-                                window_cycles: window,
-                                form: stream_form,
-                                faults: deviations.regen_faults,
-                                policy: deviations.regen_windows.map_or_else(
-                                    regen::ahead_policy,
-                                    |(streamed, _)| regen::AheadPolicy::Fixed(streamed),
-                                ),
-                            },
-                            std::sync::Arc::clone(&early_gate_in),
-                        );
-                        *early_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(early);
+                        start_early();
                     }
+                    early_paced.store(true, std::sync::atomic::Ordering::Release);
                     if deviations.abort_after_finish {
                         return Err(Error::Prover(
                             "a test's abort right after the finish".into(),
@@ -4522,11 +4538,14 @@ fn prove_streamed(
         // The streamed chunks' regenerator started at the finish's end, when it
         // did (N4c).
         let early = early_owned.lock().unwrap_or_else(|e| e.into_inner()).take();
-        let early_started = early.as_ref().map(regen::EarlyStart::started);
+        let early_spawned = early.as_ref().map(regen::EarlyStart::started);
         let (early_runs, early_pacer) = match early.map(regen::EarlyStart::join) {
             Some((runs, pacer)) => (Some(runs), pacer),
             None => (None, None),
         };
+        // Its head start is its regenerator's, started once the fates were
+        // known; a thread that started none (nothing dropped) gave none.
+        let early_started = early_runs.as_ref().and_then(|e| e.live_started);
         let early_streamed_waited = early_runs.as_ref().map(|e| e.streamed_waited);
         let mut rest_regen = rest_regen;
         let live = match (block.regen().cloned(), &regen_recorder) {
@@ -4779,6 +4798,7 @@ fn prove_streamed(
             let early_pace = early_pacer.and_then(|pacer| pacer.join().ok());
             lines.push(regen::head_start_line(
                 head_start,
+                early_spawned.map(|t| phase_b_start.saturating_duration_since(t).as_secs_f64()),
                 early_streamed_waited,
                 early_pace,
             ));

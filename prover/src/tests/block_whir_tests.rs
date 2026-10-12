@@ -1724,16 +1724,18 @@ fn no_disk_is_off_beside_live_regeneration_and_auto_without_it() {
     }
 }
 
-/// ★ The streamed chunks' regenerator starts at the finish's end (N4c), from
-/// each chunk's fate as phase A decided it; the rest's starts with phase B.
-/// Every dropped table is rebuilt and deposited, and the proof is
-/// regeneration off's bytes; started with phase B instead (the knob off), the
-/// same. (A fate decided after the regenerator asks is
-/// `stark::multilinear_block`'s `a_regenerator_started_early_waits_for_each_tables_fate`.)
+/// ★ The streamed chunks' regenerator starts before phase B (N4c), from each
+/// chunk's fate as phase A decided it: its thread up where the streamed chunks
+/// end and started once their fates are known (the default), or started at
+/// the finish's end; the rest's starts with phase B. Every dropped table is
+/// rebuilt and deposited, and the proof is regeneration off's bytes; started
+/// with phase B instead (the knob off), the same. (A fate decided after the
+/// regenerator asks is `stark::multilinear_block`'s
+/// `a_regenerator_started_early_waits_for_each_tables_fate`.)
 #[test]
 fn regenerators_started_at_the_finishs_end_prove_the_same_bytes() {
     use crate::block_whir::BlockSpillPolicy;
-    use crate::block_whir::regen::RegenMode;
+    use crate::block_whir::regen::{EarlySpawn, RegenMode};
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
     let bytes = |p: &BlockWhirProof| {
@@ -1749,7 +1751,7 @@ fn regenerators_started_at_the_finishs_end_prove_the_same_bytes() {
         Deviations::default(),
     )
     .expect("prove");
-    for early in [true, false] {
+    for early in [EarlySpawn::Fates, EarlySpawn::Finish, EarlySpawn::Off] {
         let (proof, stamps) = regenerated(
             &elf,
             &format,
@@ -1760,19 +1762,19 @@ fn regenerators_started_at_the_finishs_end_prove_the_same_bytes() {
                 ..Deviations::default()
             },
         )
-        .unwrap_or_else(|e| panic!("early {early}: {e:?}"));
+        .unwrap_or_else(|e| panic!("early {early:?}: {e:?}"));
         let r = stamps.regen.expect("live regeneration's readout");
         let lines = r.lines.join("\n");
-        assert_eq!(r.head_start.is_some(), early, "{lines}");
+        assert_eq!(r.head_start.is_some(), early != EarlySpawn::Off, "{lines}");
         assert!(r.rest_dropped > 0 && r.dropped > r.rest_dropped, "{lines}");
         assert_eq!(r.regenerated, r.dropped, "{lines}");
         assert_eq!((r.mismatches, r.failed), (0, 0), "{lines}");
-        assert_eq!(proof.groups, plain.groups, "early {early}: the partition");
-        assert!(verify(&proof, &elf, &format), "early {early}");
+        assert_eq!(proof.groups, plain.groups, "early {early:?}: the partition");
+        assert!(verify(&proof, &elf, &format), "early {early:?}");
         if crypto::grinding::deterministic() {
             assert!(
                 bytes(&proof) == bytes(&plain),
-                "early {early}: the proof differs"
+                "early {early:?}: the proof differs"
             );
         }
     }
@@ -1785,7 +1787,7 @@ fn regenerators_started_at_the_finishs_end_prove_the_same_bytes() {
 #[test]
 fn an_early_regenerator_never_hangs_a_failed_phase_a() {
     use crate::block_whir::BlockSpillPolicy;
-    use crate::block_whir::regen::RegenMode;
+    use crate::block_whir::regen::{EarlySpawn, RegenMode};
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1796,7 +1798,7 @@ fn an_early_regenerator_never_hangs_a_failed_phase_a() {
             RegenMode::Always,
             BlockSpillPolicy::Off,
             Deviations {
-                regen_early: Some(true),
+                regen_early: Some(EarlySpawn::Fates),
                 streamed_drop_delay: Some(std::time::Duration::from_millis(400)),
                 abort_after_finish: true,
                 ..Deviations::default()
