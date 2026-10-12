@@ -2204,6 +2204,90 @@ fn the_bounded_layout_holds_at_most_k_plus_one_chunks_unpacked() {
     }
 }
 
+/// Closed groups waiting for phase A behind one another move no byte of the
+/// proof: a no-disk block proved with no bytes for them to wait in, one byte,
+/// every byte, and under the room rule packs the groups of the channel of one
+/// and, under the deterministic grind, proves its bytes; with every byte,
+/// groups do wait behind one another, and with none they never do. A block
+/// with a store keeps the channel of one whatever the knob says.
+#[test]
+fn a_deeper_group_queue_moves_no_byte_of_the_proof() {
+    use crate::block_whir::BlockSpillPolicy;
+    use crate::block_whir::group_queue::Setting;
+    use crate::block_whir::regen::RegenMode;
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    // Phase A takes a group every ten milliseconds, so the packer is ahead of
+    // it in every arm.
+    let queued = |setting: Setting, policy: BlockSpillPolicy| {
+        let (proof, stamps) = regenerated(
+            &elf,
+            &format,
+            RegenMode::Always,
+            policy,
+            Deviations {
+                group_queue: Some(setting),
+                group_take_pause: Some(std::time::Duration::from_millis(10)),
+                ..Deviations::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{setting:?}, {policy:?}: {e:?}"));
+        let line = stamps.group_queue.expect("the queue's line");
+        (proof, line)
+    };
+    let (plain, line) = queued(Setting::None, BlockSpillPolicy::Off);
+    assert!(groups_of(&plain) >= 3, "{} groups", groups_of(&plain));
+    assert!(verify(&plain, &elf, &format));
+    assert_eq!(
+        line,
+        "BLOCK GROUP QUEUE: none · one closed group waits (the default)"
+    );
+    let same = |what: &str, proof: &BlockWhirProof| {
+        assert_eq!(proof.groups, plain.groups, "{what}: the partition");
+        assert_eq!(
+            format!("{:?}", proof.table_counts),
+            format!("{:?}", plain.table_counts),
+            "{what}"
+        );
+        assert!(verify(proof, &elf, &format), "{what}");
+        if crypto::grinding::deterministic() {
+            assert_eq!(bytes(proof), bytes(&plain), "{what}: the proof");
+        }
+    };
+    for (what, setting) in [
+        ("no byte", Setting::Bytes(0)),
+        ("one byte", Setting::Bytes(1)),
+        ("every byte", Setting::Bytes(u64::MAX)),
+    ] {
+        let (proof, line) = queued(setting, BlockSpillPolicy::Off);
+        same(what, &proof);
+        assert!(line.contains("fixed, the host not read"), "{what}: {line}");
+        let waited = !line.contains("none waited behind another");
+        assert_eq!(
+            waited,
+            setting == Setting::Bytes(u64::MAX),
+            "{what}: {line}"
+        );
+    }
+    let (proof, line) = queued(Setting::Room, BlockSpillPolicy::Off);
+    same("room", &proof);
+    assert!(
+        line.contains("GiB while VmRSS + waiting + 16.00 stays under the line"),
+        "{line}"
+    );
+    let (proof, line) = queued(Setting::Bytes(u64::MAX), BlockSpillPolicy::Always);
+    same("a store", &proof);
+    assert!(
+        line.contains("the block does not prove with no disk: one closed group waits"),
+        "{line}"
+    );
+}
+
 /// The partition is part of the statement: a table named twice, two tables
 /// swapped inside a group, or a table moved to another group is refused.
 #[test]
