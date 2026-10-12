@@ -1,0 +1,13 @@
+==========================================================================
+TRANSCRIPT KATs — compress-chain (option B1)
+==========================================================================
+  [PASS] K1 PASS: 6 steps, word route == byte route
+  [PASS] K2: FriToyV0-shaped transcript, 10 ops, 11 compressions @7r
+  [PASS] K1 PASS: 6 steps, word route == byte route
+  [PASS] K2: FriToyV0-shaped transcript, 10 ops, 11 compressions @6r
+  [PASS] K3 PASS: transcript step != Merkle parent on the same two cells (the LFMT/LFMC tag is load-bearing)
+  [PASS] K4 PASS: counter-free squeezes diverge from the spec at squeeze #2 (they iterate one fixed map)
+  [PASS] K5 PASS: swapping two absorbs changes the state
+  [PASS] K6: FriToyV0 transcript costs 11 compressions (spec claims 11)
+--------------------------------------------------------------------------
+TRANSCRIPT KATs: PASS

@@ -30,8 +30,9 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use std::collections::HashMap;
+use super::trace_hash::{OpMap, trace_hash_state};
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
 
 // =========================================================================
@@ -157,59 +158,63 @@ impl BranchOperation {
 pub fn generate_branch_trace(
     operations: &[BranchOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_branch_trace_as(operations, TraceForm::Wide)
+}
+
+/// The widths BRANCH traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_branch_trace`] in `form` (`tables::gpack`).
+pub fn generate_branch_trace_as(
+    operations: &[BranchOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     // Deduplicate operations: (pc, offset, register, jalr) -> multiplicity
-    let mut op_map: HashMap<BranchOperation, u64> = HashMap::new();
+    let mut op_map: OpMap<BranchOperation, u64> = OpMap::with_hasher(trace_hash_state());
     for op in operations {
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
+            // Compute next_pc
+            let next_pc_unmasked = op.compute_next_pc_unmasked();
+            let next_pc = op.compute_next_pc();
 
-    for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
-        // Compute next_pc
-        let next_pc_unmasked = op.compute_next_pc_unmasked();
-        let next_pc = op.compute_next_pc();
+            // Extract next_pc components
+            // next_pc_low[0]: bits 0-7 (masked)
+            // next_pc_low[1]: bits 8-15
+            // next_pc_high[0]: bits 16-31
+            // next_pc_high[1]: bits 32-47
+            // next_pc_high[2]: bits 48-63
+            let unmasked_low_byte = (next_pc_unmasked & 0xFF) as u8;
+            let next_pc_low_0 = (next_pc & 0xFF) as u8; // = unmasked_low_byte & 0xFE
+            let next_pc_low_1 = ((next_pc >> 8) & 0xFF) as u8;
+            let next_pc_high_0 = ((next_pc >> 16) & 0xFFFF) as u16;
+            let next_pc_high_1 = ((next_pc >> 32) & 0xFFFF) as u16;
+            let next_pc_high_2 = ((next_pc >> 48) & 0xFFFF) as u16;
 
-        // Extract next_pc components
-        // next_pc_low[0]: bits 0-7 (masked)
-        // next_pc_low[1]: bits 8-15
-        // next_pc_high[0]: bits 16-31
-        // next_pc_high[1]: bits 32-47
-        // next_pc_high[2]: bits 48-63
-        let unmasked_low_byte = (next_pc_unmasked & 0xFF) as u8;
-        let next_pc_low_0 = (next_pc & 0xFF) as u8; // = unmasked_low_byte & 0xFE
-        let next_pc_low_1 = ((next_pc >> 8) & 0xFF) as u8;
-        let next_pc_high_0 = ((next_pc >> 16) & 0xFFFF) as u16;
-        let next_pc_high_1 = ((next_pc >> 32) & 0xFFFF) as u16;
-        let next_pc_high_2 = ((next_pc >> 48) & 0xFFFF) as u16;
-
-        // Store columns
-        table.set_dword_wl(row_idx, cols::PC_0, op.pc);
-        table.set_dword_wl(row_idx, cols::OFFSET_0, op.offset);
-        table.set_dword_wl(row_idx, cols::REGISTER_0, op.register);
-        table.set_bool(row_idx, cols::JALR, op.jalr);
-        table.set_halves(
-            row_idx,
-            cols::NEXT_PC_HIGH_0,
-            &[next_pc_high_0, next_pc_high_1, next_pc_high_2],
-        );
-        table.set_bytes(
-            row_idx,
-            cols::NEXT_PC_LOW_0,
-            &[next_pc_low_0, next_pc_low_1],
-        );
-        table.set_byte(row_idx, cols::UNMASKED_LOW_BYTE, unmasked_low_byte);
-        table.set_u64(row_idx, cols::MU, *multiplicity);
-    }
-
-    trace
+            // Store columns
+            table.set_dword_wl(row_idx, cols::PC_0, op.pc);
+            table.set_dword_wl(row_idx, cols::OFFSET_0, op.offset);
+            table.set_dword_wl(row_idx, cols::REGISTER_0, op.register);
+            table.set_bool(row_idx, cols::JALR, op.jalr);
+            table.set_halves(
+                row_idx,
+                cols::NEXT_PC_HIGH_0,
+                &[next_pc_high_0, next_pc_high_1, next_pc_high_2],
+            );
+            table.set_bytes(
+                row_idx,
+                cols::NEXT_PC_LOW_0,
+                &[next_pc_low_0, next_pc_low_1],
+            );
+            table.set_byte(row_idx, cols::UNMASKED_LOW_BYTE, unmasked_low_byte);
+            table.set_u64(row_idx, cols::MU, *multiplicity);
+        }
+    })
 }
 
 // =========================================================================

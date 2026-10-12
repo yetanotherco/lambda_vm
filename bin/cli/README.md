@@ -79,6 +79,43 @@ cargo run -p cli --release -- verify <PROOF> <PROGRAM.elf> [flags]
 Returns exit code `0` on successful verification, `1` on failure. `--blowup` must
 match the value used during proving.
 
+### Prove a block
+
+Prove a whole block as a recursion tree: the block's WHIR base proof, the leaves that verify its groups, the nodes
+and the top. A consumer verifies the one top proof against the ELF with `verify-block`. Needs a CUDA build
+(`cargo build --release -p cli --features cuda`).
+
+```sh
+cli prove-block <PROGRAM.elf> --input <BLOCK.bin> -o block.proof [--time] [--digest]
+```
+
+| Flag | Description |
+|---|---|
+| `--input <FILE>` | The block's private input (the guest reads it with `get_private_input()`). |
+| `-o, --output <FILE>` | Output path for the block proof. Required. |
+| `--time` | Print the whole run's wall, base to top node. |
+| `--digest` | Print the blake3 digest of the top proof's bytes. |
+
+stdout carries the public output and the requested numbers; the run's progress lines go to stderr.
+
+The command runs the production posture: every knob in `POSTURE` (`prover/src/lfm/whir_block_tree.rs`) that the
+environment leaves unset is set to its posture value: the table parallelism, the row cap, the WHIR retention, the
+WHIR hash (RPX), the tree cache cap, the executor schedule and the grind search. The `BLOCK POSTURE` lines on stderr
+say what was set and what came from the environment. The WHIR hash is a format knob, so `verify-block` sets it too:
+prove and verify under the same environment. The binary compiles in jemalloc's never-purge posture. The tree's
+leaf count, fan-in and argue format are the block verifier's; `W3_LEAVES`, `W3_FAN_IN` and `BLOCK_WHIR_ARGUE`
+(harness arms) are refused.
+
+### Verify a block
+
+```sh
+cli verify-block <block.proof> <PROGRAM.elf> [--time]
+```
+
+Derives the block's recursion plan and top program from the ELF and the proof's claimed statement under the block
+presets, verifies the top proof against that program, and checks it claims the ELF's id and the output. Prints the
+public output. Returns exit code `0` on success, `1` on failure.
+
 ### Count Elements
 
 Build traces and print main-trace and aux-trace field element counts **without** running the proof step. Useful for sizing.

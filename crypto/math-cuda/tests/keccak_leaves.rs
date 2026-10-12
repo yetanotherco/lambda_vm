@@ -11,7 +11,7 @@ use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use stark::config::FriLayerMerkleTreeBackend;
+use stark::config::KeccakFriLayerMerkleTreeBackend as FriLayerMerkleTreeBackend;
 use stark::prover::{keccak_leaves_bit_reversed, keccak_leaves_row_pair_bit_reversed};
 
 type Fp = FieldElement<GoldilocksField>;

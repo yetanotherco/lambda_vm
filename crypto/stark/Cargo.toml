@@ -15,6 +15,7 @@ math = { path = "../math", features = [
     "rkyv",
 ] }
 crypto = { path = "../crypto", features = ["std", "serde", "rkyv"] }
+multilinear = { path = "../multilinear" }
 thiserror = "1.0.38"
 log = "0.4.17"
 digest = "0.10.7"
@@ -28,7 +29,8 @@ rayon = { version = "1.8.0", optional = true }
 
 memmap2 = { version = "0.9", optional = true }
 tempfile = { version = "3", optional = true }
-libc = { version = "0.2", optional = true }
+# The trace spill (`spill`): O_DIRECT, O_TMPFILE, statfs, fadvise.
+libc = "0.2"
 
 # GPU backend for trace LDE — only linked when `cuda` is enabled.
 math-cuda = { path = "../math-cuda", optional = true }
@@ -47,6 +49,9 @@ test-log = { version = "0.2.11", features = ["log"] }
 bincode = "1"
 rand = { version = "0.8.5", features = ["std"] }
 rand_chacha = "0.3.1"
+# Digests of the default-format golden proofs (tests::zf_golden_tests); the
+# version the `crypto` crate already links.
+sha3 = "0.10.8"
 
 [features]
 test-utils = []
@@ -55,14 +60,14 @@ instruments = []                                                     # This enab
 profile-markers = []                                                 # Emits inlining-immune asm markers for guest step profiling
 debug-checks = []                                                    # Enables validate_trace + bus balance report in prover
 parallel = ["dep:rayon", "crypto/parallel"]
-cuda = ["dep:math-cuda"]
+cuda = ["dep:math-cuda", "crypto/cuda"]
 test-cuda-faults = ["cuda", "math-cuda/test-faults"]
 # NVTX ranges for Nsight Systems: every instruments span (prover phases,
 # per-epoch marks) becomes a named timeline range. Pulls in `instruments`
 # so the span tree exists to mirror, and `cuda` for math-cuda's bindings.
 nvtx = ["cuda", "instruments", "math-cuda/nvtx"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
-disk-spill = ["dep:memmap2", "dep:tempfile", "dep:libc", "crypto/disk-spill"]
+disk-spill = ["dep:memmap2", "dep:tempfile", "crypto/disk-spill"]
 
 
 [package.metadata.wasm-pack.profile.dev]

@@ -63,6 +63,7 @@ use stark::trace::TraceTable;
 
 use crate::constraints::templates::emit_is_bit;
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 
 /// One past the largest valid hint selector (`a0 ∈ {0, 1, 2}` = FIELD_INV / SCALAR_INV /
@@ -135,29 +136,33 @@ pub struct HintOperation {
 pub fn generate_hint_trace(
     ops: &[HintOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_hint_trace_as(ops, TraceForm::Wide)
+}
+
+/// The widths HINT traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_hint_trace`] in `form` (`tables::gpack`).
+pub fn generate_hint_trace_as(
+    ops: &[HintOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = ops.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
-
-    for (row, op) in ops.iter().enumerate() {
-        debug_assert!(
-            op.timestamp <= u32::MAX as u64,
-            "HINT timestamp {} exceeds u32",
-            op.timestamp
-        );
-        table.set_dword_wl(row, cols::TIMESTAMP_0, op.timestamp);
-        table.set_dword_wl(row, cols::ADDR_OUT_0, op.out_addr);
-        table.set_bytes(row, cols::OUT, &op.out_bytes);
-        table.set_dword_wl(row, cols::SEL_0, op.hint_id);
-        table.set_dword_wl(row, cols::ADDR_IN_0, op.in_addr);
-        table.set_fe(row, cols::MU, FE::one());
-    }
-
-    trace
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row, op) in ops.iter().enumerate() {
+            debug_assert!(
+                op.timestamp <= u32::MAX as u64,
+                "HINT timestamp {} exceeds u32",
+                op.timestamp
+            );
+            table.set_dword_wl(row, cols::TIMESTAMP_0, op.timestamp);
+            table.set_dword_wl(row, cols::ADDR_OUT_0, op.out_addr);
+            table.set_bytes(row, cols::OUT, &op.out_bytes);
+            table.set_dword_wl(row, cols::SEL_0, op.hint_id);
+            table.set_dword_wl(row, cols::ADDR_IN_0, op.in_addr);
+            table.set_fe(row, cols::MU, FE::one());
+        }
+    })
 }
 
 // =========================================================================

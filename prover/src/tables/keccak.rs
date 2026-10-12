@@ -21,6 +21,7 @@ use stark::trace::TraceTable;
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::constraints::templates::{AddOperand, INV_SHIFT_32};
 
@@ -95,62 +96,88 @@ pub struct KeccakOperation {
 pub fn generate_keccak_trace(
     ops: &[KeccakOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_keccak_trace_as(ops, TraceForm::Wide)
+}
+
+/// The widths KECCAK traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_keccak_trace`] in `form` (`tables::gpack`).
+pub fn generate_keccak_trace_as(
+    ops: &[KeccakOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_keccak_rows_as(ops, ops.len().next_power_of_two().max(4), form)
+}
+
+/// Whether [`generate_keccak_rows_as`] in `form` writes its rows packed, with no
+/// 64-bit table on the way: in [`TraceForm::Narrow`] once an earlier KECCAK
+/// trace of this process left its widths (`tables::gpack`).
+pub(crate) fn rows_written_packed(form: TraceForm) -> bool {
+    matches!(
+        super::gpack::Plan::new(form, &WIDTHS, cols::NUM_COLUMNS),
+        super::gpack::Plan::Write(_)
+    )
+}
+
+/// A KECCAK table of `num_rows` rows in `form`: `ops` (at most `num_rows`, a row
+/// each, one permutation call a row), then the padding rows. A row reads its own op alone and
+/// the padding rows are constants, so rows `[k·R, (k+1)·R)` of the whole padded
+/// table are this over the ops in that range with `num_rows = R`: the block's
+/// cut of the whole table, built on its own.
+pub fn generate_keccak_rows_as(
+    ops: &[KeccakOperation],
+    num_rows: usize,
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = ops.len();
-    let num_rows = n.next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, op) in ops.iter().enumerate() {
+            // Timestamp
+            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
 
-    for (row_idx, op) in ops.iter().enumerate() {
-        // Timestamp
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+            // Address as 8 bytes
+            table.set_dword_bl(row_idx, cols::addr(0), op.state_addr);
 
-        // Address as 8 bytes
-        table.set_dword_bl(row_idx, cols::addr(0), op.state_addr);
+            // Input state as bytes
+            for x in 0..5 {
+                for y in 0..5 {
+                    let lane = op.input[x + 5 * y];
+                    table.set_dword_bl(row_idx, cols::input_state(x, y, 0), lane);
+                }
+            }
 
-        // Input state as bytes
-        for x in 0..5 {
-            for y in 0..5 {
-                let lane = op.input[x + 5 * y];
-                table.set_dword_bl(row_idx, cols::input_state(x, y, 0), lane);
+            // Output state as bytes
+            for x in 0..5 {
+                for y in 0..5 {
+                    let lane = op.output[x + 5 * y];
+                    table.set_dword_bl(row_idx, cols::output_state(x, y, 0), lane);
+                }
+            }
+
+            // State pointers: state_ptr[lane] = addr + 8 * lane_idx
+            for lane_idx in 0..25 {
+                let ptr = op
+                    .state_addr
+                    .checked_add(lane_idx as u64 * 8)
+                    .expect("keccak state address range must be validated by the executor");
+                table.set_dword_hl(row_idx, cols::state_ptr(lane_idx, 0), ptr);
+            }
+
+            // mu = 1 (real row)
+            table.set_fe(row_idx, cols::MU, FE::one());
+        }
+
+        // Padding rows: state_ptr[lane][0] = 8 * lane_idx (per spec keccak.toml pad).
+        // Halfwords 1..3 stay zero since 8*24 = 192 fits in the low halfword.
+        // mu = 0 gates all bus interactions and the ADD constraint, so these values
+        // only need to satisfy the pad requirement, not reconstruct a real address.
+        for row_idx in n..num_rows {
+            for lane_idx in 0..25 {
+                table.set_u64(row_idx, cols::state_ptr(lane_idx, 0), (lane_idx as u64) * 8);
             }
         }
-
-        // Output state as bytes
-        for x in 0..5 {
-            for y in 0..5 {
-                let lane = op.output[x + 5 * y];
-                table.set_dword_bl(row_idx, cols::output_state(x, y, 0), lane);
-            }
-        }
-
-        // State pointers: state_ptr[lane] = addr + 8 * lane_idx
-        for lane_idx in 0..25 {
-            let ptr = op
-                .state_addr
-                .checked_add(lane_idx as u64 * 8)
-                .expect("keccak state address range must be validated by the executor");
-            table.set_dword_hl(row_idx, cols::state_ptr(lane_idx, 0), ptr);
-        }
-
-        // mu = 1 (real row)
-        table.set_fe(row_idx, cols::MU, FE::one());
-    }
-
-    // Padding rows: state_ptr[lane][0] = 8 * lane_idx (per spec keccak.toml pad).
-    // Halfwords 1..3 stay zero since 8*24 = 192 fits in the low halfword.
-    // mu = 0 gates all bus interactions and the ADD constraint, so these values
-    // only need to satisfy the pad requirement, not reconstruct a real address.
-    for row_idx in n..num_rows {
-        for lane_idx in 0..25 {
-            table.set_u64(row_idx, cols::state_ptr(lane_idx, 0), (lane_idx as u64) * 8);
-        }
-    }
-
-    trace
+    })
 }
 
 // =========================================================================

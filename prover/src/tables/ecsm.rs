@@ -19,9 +19,10 @@ use executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 use crate::constraints::templates::INV_SHIFT_32;
-use ecsm::{B, EcsmWitness, N_BYTES, P_BYTES};
+use ecsm::{B, EcdasStep, EcsmWitness, N_BYTES, P_BYTES};
 
 // Bias signed convolution carries into IsHalfword [0, 2^16); see spec ecsm.typ "Carry offset" (@ecsm-limb_carry).
 pub(crate) const CARRY_OFFSET_X2: i64 = 8160;
@@ -124,6 +125,14 @@ pub struct EcsmOperation {
     pub witness: EcsmWitness,
 }
 
+impl EcsmOperation {
+    /// The heap its witness owns beyond the op: the double/add steps' buffer
+    /// (one ECDAS row each), which no ECSM table reads.
+    pub(crate) fn steps_heap_bytes(&self) -> usize {
+        self.witness.steps.capacity() * std::mem::size_of::<EcdasStep>()
+    }
+}
+
 // =========================================================================
 // Trace generation
 // =========================================================================
@@ -149,50 +158,76 @@ fn write_halfwords(table: &mut impl VmTable, row: usize, col: usize, bytes: &[u8
 pub fn generate_ecsm_trace(
     ops: &[EcsmOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let n = ops.len();
-    let num_rows = n.next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_ecsm_trace_as(ops, TraceForm::Wide)
+}
 
-    for (row_idx, op) in ops.iter().enumerate() {
-        let w = &op.witness;
+/// The widths ECSM traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
 
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
-        table.set_dword_wl(row_idx, cols::ADDR_XG_0, op.addr_xg);
-        table.set_dword_wl(row_idx, cols::ADDR_K_0, op.addr_k);
-        table.set_dword_wl(row_idx, cols::ADDR_XR_0, op.addr_xr);
+/// [`generate_ecsm_trace`] in `form` (`tables::gpack`).
+pub fn generate_ecsm_trace_as(
+    ops: &[EcsmOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_ecsm_rows_as(ops, ops.len().next_power_of_two().max(4), form)
+}
 
-        table.set_bytes(row_idx, cols::XR, &w.x_r);
-        table.set_bytes(row_idx, cols::YR, &w.y_r);
-        for b in 0..256 {
-            let bit = (w.k[b / 8] >> (b % 8)) & 1;
-            table.set_fe(row_idx, cols::k_bit(b), FE::from(bit as u64));
+/// Whether [`generate_ecsm_rows_as`] in `form` writes its rows packed, with no
+/// 64-bit table on the way: in [`TraceForm::Narrow`] once an earlier ECSM
+/// trace of this process left its widths (`tables::gpack`).
+pub(crate) fn rows_written_packed(form: TraceForm) -> bool {
+    matches!(
+        super::gpack::Plan::new(form, &WIDTHS, cols::NUM_COLUMNS),
+        super::gpack::Plan::Write(_)
+    )
+}
+
+/// A ECSM table of `num_rows` rows in `form`: `ops` (at most `num_rows`, a row
+/// each, one scalar multiplication a row), then the padding rows. A row reads its own op alone and
+/// the padding rows are constants, so rows `[k·R, (k+1)·R)` of the whole padded
+/// table are this over the ops in that range with `num_rows = R`: the block's
+/// cut of the whole table, built on its own.
+pub fn generate_ecsm_rows_as(
+    ops: &[EcsmOperation],
+    num_rows: usize,
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    // Padding rows are all zero.
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, op) in ops.iter().enumerate() {
+            let w = &op.witness;
+
+            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+            table.set_dword_wl(row_idx, cols::ADDR_XG_0, op.addr_xg);
+            table.set_dword_wl(row_idx, cols::ADDR_K_0, op.addr_k);
+            table.set_dword_wl(row_idx, cols::ADDR_XR_0, op.addr_xr);
+
+            table.set_bytes(row_idx, cols::XR, &w.x_r);
+            table.set_bytes(row_idx, cols::YR, &w.y_r);
+            for b in 0..256 {
+                let bit = (w.k[b / 8] >> (b % 8)) & 1;
+                table.set_fe(row_idx, cols::k_bit(b), FE::from(bit as u64));
+            }
+            table.set_u64(row_idx, cols::LEN_K, w.len_k as u64);
+            table.set_bytes(row_idx, cols::XG, &w.x_g);
+            table.set_bytes(row_idx, cols::YG, &w.y_g);
+            table.set_bytes(row_idx, cols::X2, &w.x2);
+            table.set_bytes(row_idx, cols::Q0, &w.q0);
+            table.set_bytes(row_idx, cols::Q1, &w.q1);
+            write_halfwords(table, row_idx, cols::XG_SUB_P, &w.x_g_sub_p);
+            write_halfwords(table, row_idx, cols::K_SUB_N, &w.k_sub_n);
+            write_halfwords(table, row_idx, cols::XR_SUB_P, &w.x_r_sub_p);
+
+            for i in 0..64 {
+                debug_assert!((0..1 << 16).contains(&(w.c0[i] + CARRY_OFFSET_X2)));
+                debug_assert!((0..1 << 16).contains(&(w.c1[i] + CARRY_OFFSET_YG)));
+                table.set_fe(row_idx, cols::c0(i), fe_from_i64(w.c0[i]));
+                table.set_fe(row_idx, cols::c1(i), fe_from_i64(w.c1[i]));
+            }
+
+            table.set_fe(row_idx, cols::MU, FE::one());
         }
-        table.set_u64(row_idx, cols::LEN_K, w.len_k as u64);
-        table.set_bytes(row_idx, cols::XG, &w.x_g);
-        table.set_bytes(row_idx, cols::YG, &w.y_g);
-        table.set_bytes(row_idx, cols::X2, &w.x2);
-        table.set_bytes(row_idx, cols::Q0, &w.q0);
-        table.set_bytes(row_idx, cols::Q1, &w.q1);
-        write_halfwords(table, row_idx, cols::XG_SUB_P, &w.x_g_sub_p);
-        write_halfwords(table, row_idx, cols::K_SUB_N, &w.k_sub_n);
-        write_halfwords(table, row_idx, cols::XR_SUB_P, &w.x_r_sub_p);
-
-        for i in 0..64 {
-            debug_assert!((0..1 << 16).contains(&(w.c0[i] + CARRY_OFFSET_X2)));
-            debug_assert!((0..1 << 16).contains(&(w.c1[i] + CARRY_OFFSET_YG)));
-            table.set_fe(row_idx, cols::c0(i), fe_from_i64(w.c0[i]));
-            table.set_fe(row_idx, cols::c1(i), fe_from_i64(w.c1[i]));
-        }
-
-        table.set_fe(row_idx, cols::MU, FE::one());
-    }
-
-    trace
+    })
 }
 
 // =========================================================================

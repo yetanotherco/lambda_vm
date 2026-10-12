@@ -576,10 +576,10 @@ becomes an **explicit verifier action**:
 - **Reconstruct the output** by concatenating the per-epoch commit slices (each
   commit-bus-bound, contiguous via the x254 chain).
 - The verifier also `validate()`s `table_counts` — which since per-epoch table skipping
-  means *only* that CPU and MEMW_R are present and that no accelerator claims more than
-  one table, not that every table is there — and never trusts a prover-supplied
-  page config (continuation epochs have none — PAGE is skipped under the L2G
-  bookend, so `page_configs` is always empty).
+  means *only* that CPU and MEMW_R are present and that no unchunked chip claims more
+  than one table (the six accelerators and BLAKE3), not that every table is there — and
+  never trusts a prover-supplied page config (continuation epochs have none — PAGE is
+  skipped under the L2G bookend, so `page_configs` is always empty).
 
 A single `build_epoch_airs` helper builds the AIR set identically on both sides, so
 prove and verify cannot diverge.
