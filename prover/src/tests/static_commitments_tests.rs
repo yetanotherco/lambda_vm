@@ -579,9 +579,10 @@ fn keccak_rc_p1_static_matches_recompute() {
 
 /// ★ A blessed Poseidon1 root is returned at its own key alone: another
 /// blowup, another coset and the one-row layout are computed, the legacy pin
-/// keeps its own constants, and the two tables' roots are their own. On
-/// `keccak_rc` (32 rows), where every recompute is cheap; `bitwise`'s
-/// dispatch is the same code.
+/// keeps its own constants, and the two tables' roots are their own. Every
+/// case on `keccak_rc` (32 rows), where a recompute is cheap; `bitwise`
+/// dispatches in a function of its own, so one case off its key (the other
+/// coset) is recomputed for it too.
 #[test]
 fn a_p1_static_is_taken_at_its_own_key_only() {
     let blessed = keccak_rc::static_commitment_p1(4).expect("the block family's key");
@@ -612,6 +613,13 @@ fn a_p1_static_is_taken_at_its_own_key_only() {
         "coset {NON_STANDARD_COSET} takes the computation"
     );
     assert_ne!(got, blessed);
+    let got = bitwise::preprocessed_root_under::<P1StarkHash>(&coset7);
+    assert_eq!(
+        got,
+        bitwise::compute_preprocessed_commitment_under::<P1StarkHash>(&coset7, LeafLayout::RowPair),
+        "bitwise: coset {NON_STANDARD_COSET} takes the computation"
+    );
+    assert_ne!(Some(got), bitwise::static_commitment_p1(4));
     let options = options_for(4);
     let one_row =
         keccak_rc::preprocessed_commitment_under::<P1StarkHash>(&options, LeafLayout::Row);
