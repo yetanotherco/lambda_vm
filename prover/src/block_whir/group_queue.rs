@@ -435,6 +435,10 @@ mod tests {
     /// sender's hands until that one is taken: the channel of one.
     #[test]
     fn no_budget_is_one_group_waiting() {
+        within_a_minute("no budget", one_at_a_time);
+    }
+
+    fn one_at_a_time() {
         let (tx, mut rx, stats) = fixed::<usize>(0);
         let sent = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&sent);
@@ -522,6 +526,10 @@ mod tests {
     /// error; a sender that stops ends the receiver once nothing waits.
     #[test]
     fn either_end_stopping_ends_the_other() {
+        within_a_minute("an end stopping", ends_stopping);
+    }
+
+    fn ends_stopping() {
         let (tx, rx, _) = fixed::<usize>(0);
         tx.send(0, 1).expect("the first goes");
         let stopped = Arc::new(AtomicBool::new(false));
@@ -604,6 +612,10 @@ mod tests {
     /// resident set leaves room, and one at a time once it does not.
     #[test]
     fn the_queue_follows_the_resident_set() {
+        within_a_minute("the resident set", following_the_resident_set);
+    }
+
+    fn following_the_resident_set() {
         let resident = Arc::new(AtomicU64::new(10 * G));
         let reading = Arc::clone(&resident);
         let stats = Arc::new(Stats::default());
