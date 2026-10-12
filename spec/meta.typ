@@ -66,7 +66,7 @@
   )
 )
 
-#let todo(background: white, foreground: black, name: none, body) = block(fill: background, outset: 0.4em, radius: 20%, stroke: black)[
+#let todo(background: white, foreground: black, name: none, body) = block(fill: background, outset: 0.4em, radius: .5em, stroke: black)[
   #set text(fill: foreground)
   *TODO #if name != none { [(#name)] }*: #body
 ]
