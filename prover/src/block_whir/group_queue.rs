@@ -343,6 +343,26 @@ impl<T> Iterator for In<'_, T> {
     }
 }
 
+/// Runs `test` on a thread of its own and fails if it has not ended in a
+/// minute: a queue that stops handing groups on hangs, it does not fail.
+#[cfg(test)]
+pub(crate) fn within_a_minute(what: &str, test: impl FnOnce() + Send + 'static) {
+    use std::sync::mpsc::RecvTimeoutError;
+    let (done, ended) = std::sync::mpsc::channel();
+    let run = std::thread::spawn(move || {
+        test();
+        let _ = done.send(());
+    });
+    match ended.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(()) => run.join().expect("the test"),
+        // The test panicked: its own message.
+        Err(RecvTimeoutError::Disconnected) => {
+            std::panic::resume_unwind(run.join().expect_err("a panic"))
+        }
+        Err(RecvTimeoutError::Timeout) => panic!("{what}: the queue hung"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicBool;
@@ -382,6 +402,10 @@ mod tests {
     /// slowly they are taken.
     #[test]
     fn groups_leave_in_the_order_they_entered() {
+        within_a_minute("the order", in_order);
+    }
+
+    fn in_order() {
         let (tx, rx, stats) = fixed::<usize>(64);
         let sender = std::thread::spawn(move || {
             let mut bytes = stream(1);
@@ -444,6 +468,10 @@ mod tests {
     /// the budget goes when nothing waits, so no budget can stop the block.
     #[test]
     fn at_most_the_budget_waits_and_a_larger_group_still_goes() {
+        within_a_minute("the budget", under_a_budget);
+    }
+
+    fn under_a_budget() {
         let budget = 1000;
         let (tx, rx, stats) = fixed::<u64>(budget);
         let sizes: Vec<u64> = {
@@ -713,6 +741,10 @@ mod tests {
     /// order through [`Out`] and [`In`]; only the queue weighs their bytes.
     #[test]
     fn both_ways_hand_the_same_groups_on() {
+        within_a_minute("both ways", both_ways);
+    }
+
+    fn both_ways() {
         let groups: Vec<Vec<u8>> = (0..50u8).map(|k| vec![k; usize::from(k % 7)]).collect();
         let through = |out: Out<Vec<u8>>, weigh: bool| {
             let sending = groups.clone();

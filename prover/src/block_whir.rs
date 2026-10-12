@@ -6363,6 +6363,10 @@ mod packer_tests {
     /// to wait in, taken slowly.
     #[test]
     fn the_packer_closes_the_same_groups_whatever_waits() {
+        group_queue::within_a_minute("the packer", packs_alike);
+    }
+
+    fn packs_alike() {
         let opts = ProofOptions::default_test_options();
         let airs = StreamAirs::new(&opts, TraceForm::Wide);
         let air = airs.of(StreamTable::Lt);
