@@ -193,6 +193,12 @@ pub struct WhirTreeConfig {
     /// phase B finished while another group was still to come executes and
     /// fills right then, or (0, the control) with the others after the base.
     pub early_on: bool,
+    /// `W3_LEAF_EMITTERS` ([`LEAF_EMITTERS`] by default): how many of the
+    /// leaves' programs are emitted at once beside phase B, in leaf order,
+    /// each published as it is ready while the planner takes phase B's groups;
+    /// or (0, the control: `None`) one thread a leaf, all at once, the first
+    /// group taken after the last is emitted.
+    pub leaf_emitters: Option<usize>,
     /// `BLOCK_WHIR_ARGUE=batched|per-table` (production: batched, at the
     /// format's bin cap; `BLOCK_WHIR_ARGUE_CAP=k` for 2^k). Another argue is
     /// another format than the production verifier's.
@@ -234,6 +240,23 @@ fn count_knob(name: &str) -> Result<Option<usize>, String> {
     }
 }
 
+/// How many leaf programs are emitted at once beside phase B by default
+/// (`W3_LEAF_EMITTERS`). One thread a leaf, all started at the statement, took
+/// the host from phase B's first groups (ZEN5 100, the median: 0.61 s a group
+/// while 13 emitters ran against 0.45 s after them; 0.95 s with 26), and
+/// nothing needs a leaf's program before the base ends but the early leaf,
+/// which is among the first emitted.
+pub const LEAF_EMITTERS: usize = 3;
+
+/// `W3_LEAF_EMITTERS`'s reading: unset is [`LEAF_EMITTERS`]; 0 is the control,
+/// one thread a leaf.
+fn leaf_emitters_setting(knob: Option<usize>) -> Option<usize> {
+    match knob {
+        Some(0) => None,
+        other => Some(other.unwrap_or(LEAF_EMITTERS)),
+    }
+}
+
 impl WhirTreeConfig {
     /// Every knob from the environment, under the names and defaults the
     /// harness always read. A value a knob cannot take is an error (the
@@ -245,6 +268,7 @@ impl WhirTreeConfig {
         let beside = count_knob("W3_EXEC_BESIDE_ARTIFACTS")?.is_none_or(|v| v != 0);
         let leaves_each = count_knob("W3_LEAF_ARTIFACTS_EACH")? == Some(1);
         let early_on = count_knob("W3_LEAF_DURING_PHASE_B")?.is_none_or(|v| v != 0);
+        let leaf_emitters = leaf_emitters_setting(count_knob("W3_LEAF_EMITTERS")?);
         let argue = match std::env::var("BLOCK_WHIR_ARGUE").as_deref().map(str::trim) {
             Ok("batched") => match count_knob("BLOCK_WHIR_ARGUE_CAP")? {
                 Some(cap) => ArgueFormat::Batched {
@@ -344,6 +368,7 @@ impl WhirTreeConfig {
             leaves_each,
             program_budget: super::program_budget::setting_from_env()?,
             early_on,
+            leaf_emitters,
             argue,
             format,
             options,
@@ -659,6 +684,51 @@ impl<T> Drop for FailEmpty<'_, T> {
             let _ = slot.0.set(Err(self.1.to_string()));
         }
     }
+}
+
+/// The leaves admitted beside phase B (one permit each, in leaf order; `None`
+/// without a program budget): emitted on `threads` plain threads, off the rayon
+/// pool phase B is using, and each published to its slot strictly in leaf
+/// order, as soon as it and every leaf before it are emitted
+/// ([`super::program_budget::emit_ordered`]). `published(k)` is called on this
+/// thread after leaf k's slot is set. Returns once every admitted leaf's slot
+/// holds a program or an error: after an emitter fails, its error is in its
+/// slot and the slots after it say the emitter stopped, so no waiter blocks on
+/// a program that will never come. The first error is the result.
+pub(crate) fn emit_admitted_leaves<P: Send + Sync>(
+    slots: &[Published<ProgramSlot<P>>],
+    permits: Vec<Option<super::program_budget::Permit>>,
+    threads: usize,
+    emit: &(dyn Fn(usize) -> Result<P, String> + Sync),
+    bytes: &(dyn Fn(&P) -> u64 + Sync),
+    published: &mut dyn FnMut(usize),
+) -> Result<(), String> {
+    let upto = permits.len();
+    let permits: Vec<std::sync::Mutex<Option<super::program_budget::Permit>>> =
+        permits.into_iter().map(std::sync::Mutex::new).collect();
+    let _fail = FailEmpty(&slots[..upto], "the leaf emitter stopped");
+    let admitted = |k: usize| -> Result<ProgramSlot<P>, String> {
+        let program = emit(k)?;
+        let mut permit = permits[k].lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(permit) = permit.as_mut() {
+            permit.emitted(bytes(&program));
+        }
+        Ok(ProgramSlot::new(program, permit))
+    };
+    let mut failed = None;
+    super::program_budget::emit_ordered(0..upto, threads, &admitted, &mut |k, slot| {
+        let emitted = match &slot {
+            Ok(_) => true,
+            Err(e) => {
+                failed = Some(e.clone());
+                false
+            }
+        };
+        let _ = slots[k].0.set(slot);
+        published(k);
+        emitted
+    });
+    failed.map_or(Ok(()), Err)
 }
 
 /// Each item's value built one after another on this thread and published to
@@ -1605,6 +1675,7 @@ type Planned = (
     usize,
     Option<TreeBudget>,
     f64,
+    Option<f64>,
     f64,
     Option<EarlyLeaf>,
 );
@@ -1624,12 +1695,13 @@ pub fn prove_whir_block_tree(
     cfg: &WhirTreeConfig,
     sink: &dyn WhirTreeSink,
 ) -> Result<WhirTreeRun, String> {
-    let (leaves, siblings, fan_in, beside, early_on) = (
+    let (leaves, siblings, fan_in, beside, early_on, leaf_emitters) = (
         cfg.leaves,
         cfg.siblings,
         cfg.fan_in,
         cfg.beside,
         cfg.early_on,
+        cfg.leaf_emitters,
     );
     let (argue, format, options) = (cfg.argue, cfg.format, &cfg.options);
     sink.line(&posture_line());
@@ -1749,96 +1821,124 @@ pub fn prove_whir_block_tree(
                 None => (0..n).map(|_| None).collect(),
             };
             let upto = permits.len();
-            // One plain thread a leaf, off the rayon pool phase B is using.
-            let programs: Vec<LfmProgram> = std::thread::scope(|inner| {
-                let handles: Vec<_> = (0..upto)
-                    .map(|k| {
-                        let plan = &plan;
-                        inner.spawn(move || plan.leaf_program(k))
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        h.join()
-                            .map_err(|_| "a leaf emitter panicked".to_string())?
-                    })
-                    .collect::<Result<_, String>>()
-            })?;
-            let programs: Vec<Published<ProgramSlot>> = programs
-                .into_iter()
-                .zip(permits)
-                .map(|(program, mut permit)| {
-                    if let Some(permit) = permit.as_mut() {
-                        permit.emitted(program_bytes(&program));
+            let programs: Vec<Published<ProgramSlot>> = (0..n).map(|_| Published::new()).collect();
+            // The admitted leaves' programs, on plain threads off the rayon
+            // pool phase B is using; the stamps are leaf 0's and the last's.
+            let emit = |k: usize| plan.leaf_program(k);
+            let emit_leaves = |permits: Vec<Option<super::program_budget::Permit>>,
+                               threads: usize|
+             -> Result<(Option<f64>, f64), String> {
+                let mut first = None;
+                emit_admitted_leaves(
+                    &programs,
+                    permits,
+                    threads,
+                    &emit,
+                    &program_bytes,
+                    &mut |k| {
+                        if k == 0 {
+                            first = Some(t0.elapsed().as_secs_f64());
+                        }
+                    },
+                )?;
+                Ok((first, t0.elapsed().as_secs_f64()))
+            };
+            // The control (`W3_LEAF_EMITTERS=0`): one thread a leaf, all at
+            // once, and the first group taken after the last is emitted.
+            // Otherwise `leaf_emitters` at a time beside the groups below.
+            let (control, beside) = match leaf_emitters {
+                None => (Some(emit_leaves(permits, upto)?), None),
+                Some(threads) => (None, Some((permits, threads))),
+            };
+            let (looped, emitted) = std::thread::scope(|inner| {
+                let emitter = beside
+                    .map(|(permits, threads)| inner.spawn(move || emit_leaves(permits, threads)));
+                let looped = (|| -> Result<Option<EarlyLeaf>, String> {
+                    // The groups as phase B finishes them (none unless `early_on`):
+                    // the first leaf complete while a group is still to come runs
+                    // its execute + fill now, on a thread of its own.
+                    let mut early = None;
+                    let mut words: Vec<Option<Vec<LfmWord>>> =
+                        (0..plan.num_groups()).map(|_| None).collect();
+                    let mut block_roots = Vec::new();
+                    let mut done = 0usize;
+                    while let Ok(msg) = grx.recv() {
+                        done += 1;
+                        let g = msg.group;
+                        let slot = words.get_mut(g).ok_or("a group the plan does not hold")?;
+                        *slot = Some(group_arena_words(
+                            &plan,
+                            g,
+                            &msg.tables,
+                            msg.argue.as_ref(),
+                            &msg.opening,
+                            msg.prepared.as_ref(),
+                        )?);
+                        if block_roots.is_empty() {
+                            block_roots = msg.roots;
+                        }
+                        if early.is_some() || done >= plan.num_groups() {
+                            continue;
+                        }
+                        let partition = plan.partition();
+                        let complete = (0..partition.num_leaves())
+                            .find(|&k| partition.leaf(k).iter().all(|&g| words[g].is_some()))
+                            .filter(|&k| k < upto);
+                        if let Some(k) = complete {
+                            let groups: Vec<Vec<LfmWord>> = partition
+                                .leaf(k)
+                                .iter()
+                                .map(|&g| words[g].clone().unwrap_or_default())
+                                .collect();
+                            let arena = leaf_arena(&block_roots, groups);
+                            // This executor takes the leaf's program.
+                            let slot = programs[k].wait()?;
+                            slot.claim();
+                            let program = slot.get()?;
+                            let handle = std::thread::spawn(move || -> Result<EarlyOut, String> {
+                                let started = t0.elapsed().as_secs_f64();
+                                let t = std::time::Instant::now();
+                                let filled = lfm_execute_and_fill(
+                                    &program.program,
+                                    &arena,
+                                    program.program.hasher(<BlockFamily as ProofFamily>::SOCKET),
+                                )
+                                .map_err(|e| format!("early leaf {k}: {e:?}"))?;
+                                Ok((filled, arena, started, t.elapsed().as_secs_f64()))
+                            });
+                            early = Some(EarlyLeaf {
+                                leaf: k,
+                                complete_at: msg.at,
+                                handle,
+                            });
+                        }
                     }
-                    let slot = Published::new();
-                    let _ = slot.0.set(Ok(ProgramSlot::new(program, permit)));
-                    slot
-                })
-                .chain((upto..n).map(|_| Published::new()))
-                .collect();
-            let ready = t0.elapsed().as_secs_f64();
-            // The groups as phase B finishes them (none unless `early_on`):
-            // the first leaf complete while a group is still to come runs
-            // its execute + fill now, on a thread of its own.
-            let mut early = None;
-            let mut words: Vec<Option<Vec<LfmWord>>> =
-                (0..plan.num_groups()).map(|_| None).collect();
-            let mut block_roots = Vec::new();
-            let mut done = 0usize;
-            while let Ok(msg) = grx.recv() {
-                done += 1;
-                let g = msg.group;
-                let slot = words.get_mut(g).ok_or("a group the plan does not hold")?;
-                *slot = Some(group_arena_words(
-                    &plan,
-                    g,
-                    &msg.tables,
-                    msg.argue.as_ref(),
-                    &msg.opening,
-                    msg.prepared.as_ref(),
-                )?);
-                if block_roots.is_empty() {
-                    block_roots = msg.roots;
-                }
-                if early.is_some() || done >= plan.num_groups() {
-                    continue;
-                }
-                let partition = plan.partition();
-                let complete = (0..partition.num_leaves())
-                    .find(|&k| partition.leaf(k).iter().all(|&g| words[g].is_some()))
-                    .filter(|&k| k < upto);
-                if let Some(k) = complete {
-                    let groups: Vec<Vec<LfmWord>> = partition
-                        .leaf(k)
-                        .iter()
-                        .map(|&g| words[g].clone().unwrap_or_default())
-                        .collect();
-                    let arena = leaf_arena(&block_roots, groups);
-                    // This executor takes the leaf's program.
-                    let slot = programs[k].wait()?;
-                    slot.claim();
-                    let program = slot.get()?;
-                    let handle = std::thread::spawn(move || -> Result<EarlyOut, String> {
-                        let started = t0.elapsed().as_secs_f64();
-                        let t = std::time::Instant::now();
-                        let filled = lfm_execute_and_fill(
-                            &program.program,
-                            &arena,
-                            program.program.hasher(<BlockFamily as ProofFamily>::SOCKET),
-                        )
-                        .map_err(|e| format!("early leaf {k}: {e:?}"))?;
-                        Ok((filled, arena, started, t.elapsed().as_secs_f64()))
-                    });
-                    early = Some(EarlyLeaf {
-                        leaf: k,
-                        complete_at: msg.at,
-                        handle,
-                    });
-                }
-            }
-            Ok((plan, programs, upto, tree_budget, at, ready, early))
+                    Ok(early)
+                })();
+                // Every admitted leaf published before the tree may look: an
+                // empty slot is, to it, a leaf the budget left to the tree.
+                let emitted = emitter.map(|h| {
+                    h.join()
+                        .map_err(|_| "a leaf emitter panicked".to_string())
+                        .and_then(|stamps| stamps)
+                });
+                (looped, emitted)
+            });
+            let early = looped?;
+            let (first_ready, ready) = match control {
+                Some(stamps) => stamps,
+                None => emitted.ok_or("the leaf emitters never ran")??,
+            };
+            Ok((
+                plan,
+                programs,
+                upto,
+                tree_budget,
+                at,
+                first_ready,
+                ready,
+                early,
+            ))
         });
         let proved = block_whir::prove_block_whir_observed_groups(
             elf, input, &opts, &format, options, &observe, &on_group,
@@ -1855,7 +1955,7 @@ pub fn prove_whir_block_tree(
     // the block found its memory short, or as `LAMBDA_VM_ALLOC_PURGE` names it
     // (`alloc_purge`).
     crate::alloc_purge::purge_point("base");
-    let (plan, programs, upto, tree_budget, stated_at, ready_at, early) = pre
+    let (plan, programs, upto, tree_budget, stated_at, first_ready_at, ready_at, early) = pre
         .map_err(|_| "the planner panicked".to_string())?
         .map_err(|e| format!("the plan and the leaves derive: {e}"))?;
     sink.write(&stamps.report());
@@ -1909,6 +2009,18 @@ pub fn prove_whir_block_tree(
         } else {
             "after the base"
         }
+    ));
+    sink.line(&format!(
+        "W3 LEAF EMITTERS: {} · leaf 0's program at {} · the last at {ready_at:.2}s",
+        match leaf_emitters {
+            Some(threads) => format!(
+                "{threads} at a time in leaf order, beside phase B's groups (W3_LEAF_EMITTERS)"
+            ),
+            None => "one thread a leaf, all at once, before the first group is taken \
+                     (W3_LEAF_EMITTERS=0, the control)"
+                .to_string(),
+        },
+        first_ready_at.map_or("-".to_string(), |t| format!("{t:.2}s")),
     ));
     sink.line(&format!(
         "W3 TREE PROGRAM BUDGET: {}",
@@ -2409,6 +2521,7 @@ mod tests {
             leaves_each: false,
             program_budget: super::super::program_budget::BudgetSetting::Auto,
             early_on: true,
+            leaf_emitters: Some(LEAF_EMITTERS),
             argue: BlockFormat::production().argue,
             format: BlockFormat::production(),
             options: BlockOptions::production(),
@@ -2437,5 +2550,137 @@ mod tests {
             off(|c| c.siblings = 6),
             "the sibling count is scheduling only"
         );
+    }
+
+    /// `W3_LEAF_EMITTERS`: unset is the default count, 0 is the control (one
+    /// thread a leaf), any other count is itself.
+    #[test]
+    fn the_leaf_emitters_knob_reads_a_count_and_zero_as_the_control() {
+        assert_eq!(leaf_emitters_setting(None), Some(LEAF_EMITTERS));
+        assert_eq!(leaf_emitters_setting(Some(0)), None);
+        assert_eq!(leaf_emitters_setting(Some(1)), Some(1));
+        assert_eq!(leaf_emitters_setting(Some(26)), Some(26));
+        assert_eq!(LEAF_EMITTERS, 3);
+    }
+
+    /// The admitted leaves' programs are emitted at most `threads` at a time
+    /// (and more than one at a time), and each is published strictly in leaf
+    /// order although leaf 0 is the slowest; the leaves the budget did not
+    /// admit keep an empty slot, which is how the tree knows them.
+    #[test]
+    fn the_admitted_leaves_are_emitted_a_few_at_a_time_and_published_in_leaf_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (n, upto, threads) = (9usize, 7usize, 3usize);
+        let slots: Vec<Published<ProgramSlot<usize>>> = (0..n).map(|_| Published::new()).collect();
+        let (active, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let emit = |k: usize| -> Result<usize, String> {
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            if k == 0 {
+                // Leaf 0 waits for a second emitter (a bounded wait), then is
+                // the last of its batch to finish.
+                let t = std::time::Instant::now();
+                while active.load(Ordering::SeqCst) < 2 && t.elapsed().as_secs() < 5 {
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(100 + k)
+        };
+        let mut order = Vec::new();
+        let mut set_when_published = true;
+        let emitted = emit_admitted_leaves(
+            &slots,
+            (0..upto).map(|_| None).collect(),
+            threads,
+            &emit,
+            &|_: &usize| 0,
+            &mut |k| {
+                set_when_published &= slots[k].0.get().is_some();
+                order.push(k);
+            },
+        );
+        assert_eq!(emitted, Ok(()));
+        assert_eq!(
+            order,
+            (0..upto).collect::<Vec<_>>(),
+            "strictly in leaf order"
+        );
+        assert!(
+            set_when_published,
+            "a leaf's slot is set before it is announced"
+        );
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= threads,
+            "{peak} emitters at once, the cap is {threads}"
+        );
+        assert!(peak >= 2, "the emitters run beside each other");
+        for (k, slot) in slots.iter().enumerate().take(upto) {
+            let program = slot
+                .0
+                .get()
+                .map(|s| s.as_ref().map(|s| s.get().map(|a| a.program)));
+            assert_eq!(program, Some(Ok(Ok(100 + k))));
+        }
+        for slot in &slots[upto..] {
+            assert!(slot.0.get().is_none(), "a leaf left to the tree");
+        }
+
+        // The control: one thread a leaf.
+        let slots: Vec<Published<ProgramSlot<usize>>> = (0..n).map(|_| Published::new()).collect();
+        let emitted = emit_admitted_leaves(
+            &slots,
+            (0..n).map(|_| None).collect(),
+            n,
+            &|k| Ok(k),
+            &|_: &usize| 0,
+            &mut |_| {},
+        );
+        assert_eq!(emitted, Ok(()));
+        assert!(slots.iter().all(|slot| slot.0.get().is_some()));
+    }
+
+    /// An emitter that fails leaves its error in its own slot and no admitted
+    /// slot empty after it, so nothing waits for a program that will not come;
+    /// the leaves before it keep their programs, and the error is the result.
+    #[test]
+    fn a_failed_leaf_emitter_leaves_no_admitted_slot_empty() {
+        let (n, upto) = (8usize, 6usize);
+        let slots: Vec<Published<ProgramSlot<usize>>> = (0..n).map(|_| Published::new()).collect();
+        let emit = |k: usize| -> Result<usize, String> {
+            if k == 2 {
+                Err("leaf 2 does not emit".to_string())
+            } else {
+                Ok(k)
+            }
+        };
+        let emitted = emit_admitted_leaves(
+            &slots,
+            (0..upto).map(|_| None).collect(),
+            2,
+            &emit,
+            &|_: &usize| 0,
+            &mut |_| {},
+        );
+        assert_eq!(emitted, Err("leaf 2 does not emit".to_string()));
+        // Read without waiting: a slot left empty fails here, it does not hang.
+        let state = |k: usize| {
+            slots[k]
+                .0
+                .get()
+                .map(|r| r.as_ref().map(|_| ()).map_err(Clone::clone))
+        };
+        assert_eq!(state(0), Some(Ok(())));
+        assert_eq!(state(1), Some(Ok(())));
+        assert_eq!(state(2), Some(Err("leaf 2 does not emit".to_string())));
+        for k in 3..upto {
+            assert_eq!(state(k), Some(Err("the leaf emitter stopped".to_string())));
+        }
+        for slot in &slots[upto..] {
+            assert!(slot.0.get().is_none());
+        }
     }
 }
