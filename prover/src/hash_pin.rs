@@ -579,11 +579,11 @@ pub fn p1_statement_tag(cap: stark::proof::options::CapPolicy) -> Vec<u8> {
 
 /// The P1 LFM statement tag at cap `cap` ([`BlockHash::lfm_statement_tag`]):
 /// `LAMBDAVM_LFM_STATEMENT_V1` and [`p1_statement_tag`]'s suffix. A test can
-/// build the legacy tag in its place (`P1_LFM_TAG_OMITTED`) to show the tag is
-/// absorbed.
+/// build the legacy tag in its place on its own thread ([`omit_p1_lfm_tag`])
+/// to show the tag is absorbed.
 pub fn p1_lfm_statement_tag(cap: stark::proof::options::CapPolicy) -> Vec<u8> {
     #[cfg(test)]
-    if P1_LFM_TAG_OMITTED.load(std::sync::atomic::Ordering::Relaxed) {
+    if P1_LFM_TAG_OMITTED.with(std::cell::Cell::get) {
         return crate::lfm::statement::LFM_STATEMENT_TAG.to_vec();
     }
     let mut tag = crate::lfm::statement::LFM_STATEMENT_TAG.to_vec();
@@ -610,11 +610,35 @@ fn p1_tag_suffix(cap: stark::proof::options::CapPolicy) -> String {
 pub static P1_TAG_OMITTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Test only: P1 LFM statements take the legacy LFM tag while set (a mutation
-/// of the tag). Process-global, like [`P1_TAG_OMITTED`].
 #[cfg(test)]
-pub static P1_LFM_TAG_OMITTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    /// Set while a [`P1LfmTagOmitted`] guard lives on this thread.
+    static P1_LFM_TAG_OMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test only: until the returned guard drops, P1 LFM statements built ON THIS
+/// THREAD take the legacy LFM tag (a mutation of the tag). Thread-scoped,
+/// unlike [`P1_TAG_OMITTED`]: the LFM prove, verify and harvest entries read
+/// the tag on their caller's thread, so a test that drops it moves no tag
+/// another test reads, in one process or many. The guard restores the tag on
+/// unwind too.
+#[cfg(test)]
+#[must_use = "the tag is dropped only while the guard lives"]
+pub fn omit_p1_lfm_tag() -> P1LfmTagOmitted {
+    P1_LFM_TAG_OMITTED.with(|omitted| omitted.set(true));
+    P1LfmTagOmitted(())
+}
+
+/// [`omit_p1_lfm_tag`]'s guard.
+#[cfg(test)]
+pub struct P1LfmTagOmitted(());
+
+#[cfg(test)]
+impl Drop for P1LfmTagOmitted {
+    fn drop(&mut self) {
+        P1_LFM_TAG_OMITTED.with(|omitted| omitted.set(false));
+    }
+}
 
 /// The prover at configuration `C`.
 pub type BlockProverOf<C, Field, FieldExtension, PI> =
@@ -678,6 +702,37 @@ mod tests {
             P1Block::statement_tag(&p1(CapPolicy::Off)),
             b"LAMBDAVM_STARK_STATEMENT_V5/P1W16/C0".to_vec()
         );
+    }
+
+    /// Dropping the LFM tag ([`omit_p1_lfm_tag`]) is seen on the thread that
+    /// holds the guard and nowhere else, and ends with the guard, on a panic
+    /// too: a test that drops the tag cannot move the tag another test reads.
+    #[test]
+    fn dropping_the_lfm_tag_is_scoped_to_the_thread_and_the_guard() {
+        use stark::proof::options::CapPolicy;
+        let cap = CapPolicy::Fixed(BLOCK_LFM_CAP);
+        let legacy = crate::lfm::statement::LFM_STATEMENT_TAG.to_vec();
+        let tagged = p1_lfm_statement_tag(cap);
+        assert_ne!(tagged, legacy);
+        {
+            let _untagged = omit_p1_lfm_tag();
+            assert_eq!(p1_lfm_statement_tag(cap), legacy);
+            let elsewhere = std::thread::spawn(move || p1_lfm_statement_tag(cap))
+                .join()
+                .expect("the other thread renders its tag");
+            assert_eq!(elsewhere, tagged, "another thread saw the dropped tag");
+        }
+        assert_eq!(p1_lfm_statement_tag(cap), tagged, "the guard's end");
+        // A test that fails while it holds the guard (no panic message: this
+        // unwind is the test's own).
+        let unwound = std::panic::catch_unwind(|| {
+            let _untagged = omit_p1_lfm_tag();
+            if p1_lfm_statement_tag(cap) != tagged {
+                std::panic::resume_unwind(Box::new("fails with the tag dropped"));
+            }
+        });
+        assert!(unwound.is_err(), "the guard dropped no tag");
+        assert_eq!(p1_lfm_statement_tag(cap), tagged, "an unwind's end");
     }
 
     /// ★ No environment read decides the base: the library's sources name

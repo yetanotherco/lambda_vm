@@ -20,7 +20,6 @@
 //!   an OOD value, the published words) and a legacy child are refused.
 
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
 
 use stark::config::CommitmentHash;
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofFormat, ProofOptions};
@@ -302,14 +301,14 @@ fn the_block_lfm_statement_tag_is_absorbed() {
         .public_words;
     let honest = prove_block(&bart, &bopts).expect("the block pin proves");
     // Mutation: the block's statements under the legacy tag.
-    crate::hash_pin::P1_LFM_TAG_OMITTED.store(true, Ordering::SeqCst);
+    let untagged_scope = crate::hash_pin::omit_p1_lfm_tag();
     let untagged = prove_block(&bart, &bopts);
     let accepted_without_tag = untagged
         .as_ref()
         .is_ok_and(|p| verify_against_artifacts_under::<Block>(&bart, &p.proof, &words, &bopts));
     let honest_without_tag =
         verify_against_artifacts_under::<Block>(&bart, &honest.proof, &words, &bopts);
-    crate::hash_pin::P1_LFM_TAG_OMITTED.store(false, Ordering::SeqCst);
+    drop(untagged_scope);
     let untagged = untagged.expect("the block pin proves without its tag");
     assert!(
         accepted_without_tag,
@@ -608,7 +607,7 @@ fn block_options_at(cap: u8) -> ProofOptions {
 /// ★ The cap is bound by the verifier's options, not by the
 /// program. The artifacts (roots and id) are the same at every cap; a block
 /// LFM proof made at C0, C1 or C4 verifies at its own cap and is refused at
-/// the pin's, and with the tag dropped on both sides (`P1_LFM_TAG_OMITTED`)
+/// the pin's, and with the tag dropped on both sides (`omit_p1_lfm_tag`)
 /// it is still refused there: the geometry alone (path lengths) binds the cap.
 #[test]
 fn a_block_lfm_proof_at_another_cap_is_refused() {
@@ -641,7 +640,7 @@ fn a_block_lfm_proof_at_another_cap_is_refused() {
     // The geometry alone: both sides drop the tag.
     // (cap, its proof verified (at its own cap, at the pin's), or why it did not prove)
     type Untagged = (u8, Result<(bool, bool), String>);
-    crate::hash_pin::P1_LFM_TAG_OMITTED.store(true, Ordering::SeqCst);
+    let untagged_scope = crate::hash_pin::omit_p1_lfm_tag();
     let untagged: Vec<Untagged> = caps
         .iter()
         .map(|&cap| {
@@ -652,7 +651,7 @@ fn a_block_lfm_proof_at_another_cap_is_refused() {
             (cap, got)
         })
         .collect();
-    crate::hash_pin::P1_LFM_TAG_OMITTED.store(false, Ordering::SeqCst);
+    drop(untagged_scope);
     for (cap, got) in untagged {
         let (own, at_pin) = got.expect("proves without the tag");
         assert!(own, "C{cap} without the tag: refused at its own cap");
@@ -740,13 +739,13 @@ fn a_block_node_refuses_every_arena_tamper_and_other_configurations() {
     // A child on the block's geometry under the legacy tag: harvested with the
     // tag dropped (so its arenas are laid out at its own query indices), fed
     // to the node, which replays the C2 tag. Same layout, so a check refuses.
-    crate::hash_pin::P1_LFM_TAG_OMITTED.store(true, Ordering::SeqCst);
+    let untagged_scope = crate::hash_pin::omit_p1_lfm_tag();
     let untagged = prove_block(&bart, &bopts)
         .map_err(|e| format!("{e:?}"))
         .and_then(|p| {
             super::harvest::harvest_child_under::<Block>(bart.clone(), bopts.clone(), &p)
         });
-    crate::hash_pin::P1_LFM_TAG_OMITTED.store(false, Ordering::SeqCst);
+    drop(untagged_scope);
     let untagged = untagged.expect("an untagged child harvests");
     let arenas = try_child_arena_words(&untagged).expect("arenas");
     let r = execute(&node, &both(&arenas), &BLOCK_SOCKET);
