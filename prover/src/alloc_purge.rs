@@ -468,7 +468,7 @@ pub fn parse_watermark(value: Option<&str>) -> Result<WatermarkSetting, String> 
 /// median on a 32 GiB emulated host a fire read that gap at ≥ 4 GiB and
 /// returned nothing (VmRSS 25.52 → 25.50 GiB), and its spacing held the next
 /// fire past level 1's peak (RYZEN 058b, I-MEMFIT §6.13).
-fn purgeable(stats: &AllocStats) -> u64 {
+pub(crate) fn purgeable(stats: &AllocStats) -> u64 {
     stats.resident.saturating_sub(stats.active) as u64
 }
 

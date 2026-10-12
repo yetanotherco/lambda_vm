@@ -43,6 +43,18 @@
 //! file (not Linux) `auto` has no reading and admits by the other two rules
 //! only, which is what the line reports.
 //!
+//! What `auto` reads of the host is [`READING_ENV`]'s choice. `resident`, the
+//! default, is `VmRSS` as it is. `live` takes off what a purge could return
+//! ([`live_bytes`]): after phase A frees its tables the resident set is mostly
+//! pages the allocator holds and a new program is written into, and counting
+//! them made the room shortest on the hosts with the most of it. A large
+//! block on a 118 GiB host stated with 66.9 GiB resident, 64.2 GiB of it
+//! purgeable and 10.8 GiB live, and 13 of its 26 leaf programs came in beside
+//! phase B; the same block on a 64 GiB host, purged at that point, got 24 in.
+//! Under `live` a host is short only of what a purge cannot give back, so the
+//! budget is a ceiling there and no longer a schedule. Where nothing is
+//! purgeable the two readings are one.
+//!
 //! ⛔ [`ProgramBudget::acquire`] parks its thread on a condvar. Call it only
 //! from a plain thread, never from a rayon worker: a worker that parked there
 //! could hold the pool's jobs a prover waits for (the derive gate's hazard,
@@ -130,6 +142,35 @@ pub fn parse_share(value: Option<&str>) -> Result<f64, String> {
     }
 }
 
+/// What `auto` reads of the host: [`READING_ENV`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reading {
+    /// Unset, empty or `resident` (the default): the process's resident
+    /// bytes ([`resident_bytes`]).
+    Resident,
+    /// `live`: the resident bytes less what a purge could return
+    /// ([`live_bytes`]).
+    Live,
+}
+
+/// [`Reading`]'s knob.
+pub const READING_ENV: &str = "LAMBDA_VM_TREE_PROGRAM_BUDGET_READING";
+
+/// [`READING_ENV`], parsed.
+pub fn reading_from_env() -> Result<Reading, String> {
+    parse_reading(std::env::var(READING_ENV).ok().as_deref())
+}
+
+/// A value of [`READING_ENV`]: unset or empty is [`Reading::Resident`];
+/// nonsense is an error.
+pub fn parse_reading(value: Option<&str>) -> Result<Reading, String> {
+    match value.map(str::trim) {
+        None | Some("" | "resident") => Ok(Reading::Resident),
+        Some("live") => Ok(Reading::Live),
+        Some(v) => Err(format!("{READING_ENV} must be resident or live, got `{v}`")),
+    }
+}
+
 /// What counts as room.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Room {
@@ -137,7 +178,8 @@ pub enum Room {
     Unbounded,
     /// The admitted programs alive hold at most this many bytes.
     Bytes(u64),
-    /// The process's resident bytes, plus the programs admitted and not yet
+    /// The host's reading ([`Reading`]: the process's resident bytes, or those
+    /// a purge could not return), plus the programs admitted and not yet
     /// emitted, plus the new one, stay at or under `line`: the host target
     /// times the room share ([`ROOM_SHARE`]).
     Host { line: u64 },
@@ -168,6 +210,40 @@ pub fn resident_bytes() -> Option<u64> {
         .parse()
         .ok()?;
     Some(kib << 10)
+}
+
+/// The part of `rss` a purge could not return: `rss` less the allocator's
+/// purgeable bytes ([`crate::alloc_purge::purgeable`]: its resident bytes less
+/// its active ones), never under its active bytes and never over `rss`.
+///
+/// The floor is there because the allocator's resident figure is an upper
+/// bound (an extent counts before it is touched) and so is its purgeable one:
+/// at the statement of a large block the difference alone read 2.7 GiB where
+/// the live heap was 10.8. What the process holds outside the allocator is in
+/// `rss` and in neither of the allocator's figures; where the floor decides,
+/// the reading is short by it (about 5 GiB at that point), which the room
+/// share's quarter of the host target covers. Where nothing is purgeable this
+/// is `rss`. Without the allocator's figures (`None`) it is `rss` too: the
+/// reading before.
+fn live_of(rss: u64, stats: Option<&crate::alloc_purge::AllocStats>) -> u64 {
+    match stats {
+        Some(stats) => rss
+            .saturating_sub(crate::alloc_purge::purgeable(stats))
+            .max(stats.active as u64)
+            .min(rss),
+        None => rss,
+    }
+}
+
+/// This process's resident bytes less what a purge could return
+/// ([`live_of`]), on Linux. A program written into pages the allocator held
+/// moves them from purgeable to live, so this reading counts an emitted
+/// program where `VmRSS` does not move. The allocator's figures are its
+/// statistics behind one epoch turn, read where `VmRSS` is: per admission
+/// decision and per 200 ms of a wait.
+pub fn live_bytes() -> Option<u64> {
+    let rss = resident_bytes()?;
+    Some(live_of(rss, crate::alloc_purge::stats().as_ref()))
 }
 
 /// How a program got in.
@@ -221,6 +297,8 @@ pub struct ProgramBudget {
     room: Room,
     ahead: usize,
     reading: Box<dyn Fn() -> Option<u64> + Send + Sync>,
+    /// What `reading` is, for the line ([`Self::describe`]).
+    reads: Reading,
     state: Mutex<State>,
     changed: Condvar,
 }
@@ -235,10 +313,17 @@ pub struct Permit {
 }
 
 impl ProgramBudget {
-    /// A budget with `room` and [`AHEAD`], reading the host with
-    /// [`resident_bytes`].
-    pub fn new(room: Room) -> Arc<Self> {
-        Self::with_reading(room, AHEAD, Box::new(resident_bytes))
+    /// A budget with `room` and [`AHEAD`], reading the host as `reads` says:
+    /// [`resident_bytes`] or [`live_bytes`].
+    pub fn new(room: Room, reads: Reading) -> Arc<Self> {
+        let reading: Box<dyn Fn() -> Option<u64> + Send + Sync> = match reads {
+            Reading::Resident => Box::new(resident_bytes),
+            Reading::Live => Box::new(live_bytes),
+        };
+        Arc::new(Self {
+            reads,
+            ..Self::over(room, AHEAD, reading)
+        })
     }
 
     /// A budget with `room`, `ahead` programs always admitted ahead of the
@@ -249,13 +334,18 @@ impl ProgramBudget {
         ahead: usize,
         reading: Box<dyn Fn() -> Option<u64> + Send + Sync>,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new(Self::over(room, ahead, reading))
+    }
+
+    fn over(room: Room, ahead: usize, reading: Box<dyn Fn() -> Option<u64> + Send + Sync>) -> Self {
+        Self {
             room,
             ahead: ahead.max(1),
             reading,
+            reads: Reading::Resident,
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
-        })
+        }
     }
 
     /// Whether this budget ever refuses.
@@ -385,7 +475,13 @@ impl ProgramBudget {
             Room::Bytes(b) => format!("{:.2} GiB of programs", gib(b)),
             Room::Host { line } => match (self.reading)() {
                 Some(rss) => format!(
-                    "auto: VmRSS ({:.2} GiB now) against the room line {:.2} GiB",
+                    "auto: {} ({:.2} GiB now) against the room line {:.2} GiB",
+                    match self.reads {
+                        Reading::Resident => "VmRSS",
+                        Reading::Live if crate::alloc_purge::stats().is_some() =>
+                            "VmRSS less what a purge could return",
+                        Reading::Live => "VmRSS, the allocator's figures unread",
+                    },
                     gib(rss),
                     gib(line)
                 ),
@@ -660,6 +756,101 @@ mod tests {
         assert!(
             none.try_acquire(0, GIB).is_some(),
             "no reading: room never short"
+        );
+    }
+
+    #[test]
+    fn the_reading_knob_reads_resident_or_live_and_refuses_nonsense() {
+        assert_eq!(parse_reading(None), Ok(Reading::Resident));
+        assert_eq!(parse_reading(Some(" ")), Ok(Reading::Resident));
+        assert_eq!(parse_reading(Some("resident")), Ok(Reading::Resident));
+        assert_eq!(parse_reading(Some(" live ")), Ok(Reading::Live));
+        for bad in ["rss", "1", "LIVE", "purgeable"] {
+            assert!(parse_reading(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// The allocator's figures, in MiB.
+    fn allocator(resident: u64, active: u64) -> crate::alloc_purge::AllocStats {
+        crate::alloc_purge::AllocStats {
+            allocated: (active * MIB) as usize,
+            active: (active * MIB) as usize,
+            resident: (resident * MIB) as usize,
+            ..Default::default()
+        }
+    }
+
+    /// The live reading is the resident set less what a purge could return,
+    /// never under the allocator's active bytes, never over the resident set,
+    /// and the resident set itself when nothing is purgeable or the allocator
+    /// cannot be read.
+    #[test]
+    fn the_live_reading_takes_off_what_a_purge_could_return_and_no_more() {
+        // Nothing purgeable: the two readings are one.
+        assert_eq!(live_of(140 * MIB, Some(&allocator(90, 90))), 140 * MIB);
+        // 80 purgeable of 490 resident.
+        assert_eq!(live_of(490 * MIB, Some(&allocator(480, 400))), 410 * MIB);
+        // The allocator's resident figure runs over the process's (a large
+        // block's statement, in units of 0.1 GiB): the difference alone would
+        // read 27, the live heap is 108.
+        assert_eq!(live_of(669 * MIB, Some(&allocator(750, 108))), 108 * MIB);
+        // Active pages never touched: not over the resident set.
+        assert_eq!(live_of(200 * MIB, Some(&allocator(300, 300))), 200 * MIB);
+        // No figures from the allocator: the resident set, the reading before.
+        assert_eq!(live_of(669 * MIB, None), 669 * MIB);
+    }
+
+    /// The count of 1.08-unit programs a budget admits in one burst, as the
+    /// planner asks at the statement (none emitted in between).
+    fn admitted_at_once(line: u64, reading: u64) -> usize {
+        let b =
+            ProgramBudget::with_reading(Room::Host { line }, 1, Box::new(move || Some(reading)));
+        let permits: Vec<Permit> = (0..26).map_while(|k| b.try_acquire(k, 108 * MIB)).collect();
+        permits.len()
+    }
+
+    /// A host with room, in units of 0.01 GiB: 66.9 resident, 64.2 of it
+    /// purgeable, the room line at 81.21. The resident reading admits 13 of
+    /// 26 programs; the live reading admits them all. A host whose memory is
+    /// really short (the same block purged at that point on a 64 GiB host:
+    /// 14.6 resident, nothing purgeable, the line at 40.5) admits 24 under
+    /// either reading and refuses the 25th.
+    #[test]
+    fn the_live_reading_admits_into_freed_pages_and_a_short_host_still_refuses() {
+        let (rss, stats) = (6690 * MIB, allocator(7500, 1080));
+        assert_eq!(admitted_at_once(8121 * MIB, rss), 13);
+        assert_eq!(admitted_at_once(8121 * MIB, live_of(rss, Some(&stats))), 26);
+        let (rss, stats) = (1458 * MIB, allocator(900, 900));
+        assert_eq!(live_of(rss, Some(&stats)), rss);
+        assert_eq!(admitted_at_once(4050 * MIB, rss), 24);
+        assert_eq!(admitted_at_once(4050 * MIB, live_of(rss, Some(&stats))), 24);
+        // Short of live memory with pages to purge as well: the live heap
+        // alone fills the line, and only the next to be taken comes in.
+        let (rss, stats) = (5000 * MIB, allocator(5400, 4000));
+        assert_eq!(live_of(rss, Some(&stats)), 4000 * MIB);
+        assert_eq!(admitted_at_once(4050 * MIB, live_of(rss, Some(&stats))), 1);
+    }
+
+    /// The line names the reading; under the default it reads as it always
+    /// did.
+    #[test]
+    fn the_budget_line_names_its_reading() {
+        let room = Room::Host { line: 3 * GIB };
+        let before = ProgramBudget::with_reading(room, 1, Box::new(|| Some(GIB)));
+        assert_eq!(
+            before.describe(),
+            "auto: VmRSS (1.00 GiB now) against the room line 3.00 GiB"
+        );
+        let resident = ProgramBudget::new(room, Reading::Resident).describe();
+        assert!(
+            resident.starts_with("auto: VmRSS (") || resident.starts_with("auto: no VmRSS reading"),
+            "{resident}"
+        );
+        let live = ProgramBudget::new(room, Reading::Live).describe();
+        assert!(
+            live.starts_with("auto: VmRSS less what a purge could return (")
+                || live.starts_with("auto: no VmRSS reading"),
+            "{live}"
         );
     }
 

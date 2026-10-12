@@ -1778,8 +1778,9 @@ pub fn prove_whir_block_tree(
     };
     // The tree programs' budget (`LAMBDA_VM_TREE_PROGRAM_BUDGET`): against the
     // spill target, which `LAMBDA_VM_BLOCK_SPILL_TARGET_GIB` moves too, `auto`'s
-    // room line at `LAMBDA_VM_TREE_PROGRAM_BUDGET_SHARE` of it; `off` emits
-    // every leaf beside phase B, as before.
+    // room line at `LAMBDA_VM_TREE_PROGRAM_BUDGET_SHARE` of it, the host read
+    // as `LAMBDA_VM_TREE_PROGRAM_BUDGET_READING` says; `off` emits every leaf
+    // beside phase B, as before.
     let budget = match cfg.program_budget {
         super::program_budget::BudgetSetting::Off => None,
         setting => Some(super::program_budget::ProgramBudget::new(
@@ -1788,6 +1789,7 @@ pub fn prove_whir_block_tree(
                 block_whir::spill_target_bytes(),
                 super::program_budget::share_from_env()?,
             ),
+            super::program_budget::reading_from_env()?,
         )),
     };
     let (elf_ref, opts_ref, format_ref) = (elf, &opts, &format);
