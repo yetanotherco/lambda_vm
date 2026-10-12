@@ -40,12 +40,12 @@ Negative numbers (represented as 2s complement 64-bit numbers), are used for our
 
 == Committing to values
 
-In order to make a claim about a public value to the verifier, a guest program can _commit_ to it.
+To make a claim about a public value to the verifier, a guest program can _commit_ to it.
 In this VM, this is achieved by writing to `stdout`, with a write syscall to file descriptor 1.
 Values are committed by letting the verifier initialize and finalize the global memory argument
 (see @memory and @streaming), with the claimed commitments in its own domain separated part of memory,
 with domain separator value 2.#footnote[
-  In order to make sure the verifier can properly finalize the committed values, the last epoch can "bring forward"
+  To make sure the verifier can properly finalize the committed values, the last epoch can "bring forward"
   all commitments from earlier epochs, similar to padded values, in the `L2G` table.
   Then the contribution of the commitments only consists of the tuples `(2, address, last_epoch_index, value)`, which is entirely known to the verifier.
 ]
