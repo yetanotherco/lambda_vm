@@ -25,6 +25,14 @@
 //! purges took the base's phase-B peak 119.79 → 116.60 GiB and level 0's start
 //! ≈ 115 → 55.6 GiB, where without them level 0 was OOM-killed (BIG 120, 1215);
 //! a block that fits never arms, so it pays nothing.
+//!
+//! A block that proves with no disk ([`note_no_disk`]) notes memory pressure
+//! from a forecast of the disk path's growth, and then never grows that way:
+//! on a 118 GiB host the p90 block stayed under 68 GiB and still paid both
+//! purges and their page faults, 4.1 s (ZEN5 096). There `auto` purges at its
+//! two points only when the resident set has come within the block's headroom
+//! of its pressure line ([`has_room`], `LAMBDA_VM_ALLOC_PURGE_ROOM`): a 64 GiB
+//! host purges at both as before, a host with room at neither.
 
 /// The allocator's statistics, in bytes (jemalloc's `stats.*`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -89,7 +97,8 @@ pub struct Purge {
 }
 
 /// `LAMBDA_VM_ALLOC_PURGE`: `auto` (and unset or empty) purges at
-/// [`AUTO_POINTS`] once memory is short ([`note_memory_pressure`]); `off`
+/// [`AUTO_POINTS`] once memory is short ([`note_memory_pressure`]), a no-disk
+/// block with room excepted ([`ROOM_ENV`]); `off`
 /// purges nowhere; `all`, or a list of the boundary names [`purge_point`] is
 /// called with, separated by commas or dots (`base.tree`, for job specs that
 /// split their knobs on commas), purges there regardless. The block's points:
@@ -111,9 +120,67 @@ pub fn note_memory_pressure() {
     PRESSURE.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// A new block starts: no pressure seen yet.
+/// A new block starts: no pressure seen yet, and no word on its disk.
 pub fn clear_memory_pressure() {
     PRESSURE.store(false, std::sync::atomic::Ordering::Relaxed);
+    note_no_disk(None);
+}
+
+/// What `auto` weighs at its points in a block that proves with no disk: the
+/// line past which the block's memory is short (the block's pressure share of
+/// its host target) and what the block may still add past a boundary (its
+/// regeneration window's ceiling).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoDisk {
+    pub line: u64,
+    pub headroom: u64,
+}
+
+/// The block in progress proves with no disk, when it does.
+static NO_DISK: std::sync::Mutex<Option<NoDisk>> = std::sync::Mutex::new(None);
+
+/// The block says whether it proves with no disk (`Some`), once it knows:
+/// `auto` then purges at its points only without room ([`has_room`]). `None`,
+/// a block with a store, purges there whenever memory is short.
+pub fn note_no_disk(no_disk: Option<NoDisk>) {
+    *NO_DISK.lock().unwrap_or_else(|e| e.into_inner()) = no_disk;
+}
+
+/// `LAMBDA_VM_ALLOC_PURGE_ROOM`: `auto` (unset or empty, the default) lets a
+/// no-disk block with room skip `auto`'s purges ([`has_room`]); `off` purges
+/// at them whenever memory is short, as a block with a store does.
+pub const ROOM_ENV: &str = "LAMBDA_VM_ALLOC_PURGE_ROOM";
+
+/// What [`ROOM_ENV`] says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoomSetting {
+    Auto,
+    Off,
+}
+
+/// A value of [`ROOM_ENV`]; nonsense is an error.
+pub fn parse_room(value: Option<&str>) -> Result<RoomSetting, String> {
+    match value.map(str::trim) {
+        None | Some("" | "auto") => Ok(RoomSetting::Auto),
+        Some("off") => Ok(RoomSetting::Off),
+        Some(v) => Err(format!("{ROOM_ENV} must be auto or off, got `{v}`")),
+    }
+}
+
+/// Whether a no-disk block has room at a boundary: its resident set and its
+/// headroom together stay under its line. A block with a store has none to
+/// weigh, and neither has one whose resident set cannot be read: both purge.
+///
+/// The p90 block, VmRSS at phase A's end and at the base's end (ZEN5 096): on a
+/// 118 GiB host 66.8 and 68.2 GiB against a line of 92.0, room at both; on a
+/// 64 GiB host 36.1 and 45.6 GiB (the median 33.1 and 33.2) against 45.9, room
+/// at neither. Without the purge at phase A's end that host admits 4 leaf
+/// programs beside the base where it admitted 24, and proves 2.2 s slower.
+pub(crate) fn has_room(no_disk: Option<NoDisk>, resident: Option<u64>) -> bool {
+    match (no_disk, resident) {
+        (Some(no_disk), Some(resident)) => resident.saturating_add(no_disk.headroom) < no_disk.line,
+        _ => false,
+    }
 }
 
 /// What the knob says at a point.
@@ -122,17 +189,22 @@ enum Decision {
     Purge,
     /// `auto` at one of its points, with no memory pressure.
     Skip,
+    /// `auto` at one of its points, under memory pressure, in a no-disk block
+    /// with room.
+    Room,
     /// Not a point the knob purges at.
     No,
 }
 
-fn decide(setting: Option<&str>, point: &str, pressure: bool) -> Decision {
+fn decide(setting: Option<&str>, point: &str, pressure: bool, room: bool) -> Decision {
     match setting.map(str::trim) {
         None | Some("") | Some("auto") if AUTO_POINTS.contains(&point) => {
-            if pressure {
-                Decision::Purge
-            } else {
+            if !pressure {
                 Decision::Skip
+            } else if room {
+                Decision::Room
+            } else {
+                Decision::Purge
             }
         }
         None | Some("") | Some("auto") | Some("off") => Decision::No,
@@ -151,16 +223,39 @@ fn names_point(setting: &str, point: &str) -> bool {
 
 /// At the boundary `point`, purge every jemalloc arena's dirty pages when
 /// [`ALLOC_PURGE_ENV`] says so ([`decide`]), and print one `ALLOC PURGE` line
-/// (the wall time and jemalloc's resident bytes before and after, or that
+/// (the wall time and jemalloc's resident bytes before and after, or why
 /// `auto` skipped it). Returns what it did, or `None` when it did not purge or
 /// the build cannot.
 pub fn purge_point(point: &str) -> Option<Purge> {
     let setting = std::env::var(ALLOC_PURGE_ENV).ok();
     let pressure = PRESSURE.load(std::sync::atomic::Ordering::Relaxed);
-    match decide(setting.as_deref(), point, pressure) {
+    let no_disk = match parse_room(std::env::var(ROOM_ENV).ok().as_deref()) {
+        Ok(RoomSetting::Auto) => *NO_DISK.lock().unwrap_or_else(|e| e.into_inner()),
+        Ok(RoomSetting::Off) => None,
+        Err(why) => {
+            eprintln!("ALLOC PURGE {point}: {why}; the room is not weighed");
+            None
+        }
+    };
+    let resident = crate::lfm::program_budget::resident_bytes();
+    let room = has_room(no_disk, resident);
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    match decide(setting.as_deref(), point, pressure, room) {
         Decision::No => return None,
         Decision::Skip => {
             eprintln!("ALLOC PURGE {point}: skipped (auto, no memory pressure)");
+            return None;
+        }
+        Decision::Room => {
+            if let (Some(no_disk), Some(resident)) = (no_disk, resident) {
+                eprintln!(
+                    "ALLOC PURGE {point}: skipped (auto, no disk, the host has room; VmRSS {:.2} + \
+                     {:.2} of the line {:.2} GiB)",
+                    gib(resident),
+                    gib(no_disk.headroom),
+                    gib(no_disk.line)
+                );
+            }
             return None;
         }
         Decision::Purge => {}
@@ -842,24 +937,139 @@ mod tests {
         for setting in [None, Some(""), Some("auto"), Some(" auto ")] {
             for point in ["phase-a", "base"] {
                 assert_eq!(
-                    decide(setting, point, true),
+                    decide(setting, point, true, false),
                     Decision::Purge,
                     "{setting:?} {point}"
                 );
                 assert_eq!(
-                    decide(setting, point, false),
+                    decide(setting, point, false, false),
                     Decision::Skip,
                     "{setting:?} {point}"
                 );
             }
-            assert_eq!(decide(setting, "tree", true), Decision::No);
+            assert_eq!(decide(setting, "tree", true, false), Decision::No);
         }
         for point in ["phase-a", "base", "tree"] {
-            assert_eq!(decide(Some("off"), point, true), Decision::No);
-            assert_eq!(decide(Some("all"), point, false), Decision::Purge);
+            assert_eq!(decide(Some("off"), point, true, false), Decision::No);
+            assert_eq!(decide(Some("all"), point, false, false), Decision::Purge);
         }
-        assert_eq!(decide(Some("base.tree"), "tree", false), Decision::Purge);
-        assert_eq!(decide(Some("base.tree"), "phase-a", true), Decision::No);
+        assert_eq!(
+            decide(Some("base.tree"), "tree", false, false),
+            Decision::Purge
+        );
+        assert_eq!(
+            decide(Some("base.tree"), "phase-a", true, false),
+            Decision::No
+        );
+    }
+
+    /// Room changes `auto` under memory pressure at its two points and nothing
+    /// else: without pressure it skips as before, `tree` is no point of its,
+    /// `off` purges nowhere, and a point the knob names is purged whatever the
+    /// room.
+    #[test]
+    fn room_spares_only_autos_purges_under_pressure() {
+        for setting in [None, Some(""), Some("auto"), Some(" auto ")] {
+            for point in ["phase-a", "base"] {
+                assert_eq!(
+                    decide(setting, point, true, true),
+                    Decision::Room,
+                    "{setting:?} {point}"
+                );
+                assert_eq!(
+                    decide(setting, point, false, true),
+                    Decision::Skip,
+                    "{setting:?} {point}"
+                );
+            }
+            assert_eq!(decide(setting, "tree", true, true), Decision::No);
+        }
+        for point in ["phase-a", "base", "tree"] {
+            assert_eq!(decide(Some("off"), point, true, true), Decision::No);
+            assert_eq!(decide(Some("all"), point, true, true), Decision::Purge);
+        }
+        assert_eq!(
+            decide(Some("phase-a.base"), "phase-a", true, true),
+            Decision::Purge
+        );
+        assert_eq!(decide(Some("base"), "phase-a", true, true), Decision::No);
+    }
+
+    #[test]
+    fn the_room_knob_reads_auto_or_off() {
+        assert_eq!(parse_room(None), Ok(RoomSetting::Auto));
+        assert_eq!(parse_room(Some("")), Ok(RoomSetting::Auto));
+        assert_eq!(parse_room(Some(" auto ")), Ok(RoomSetting::Auto));
+        assert_eq!(parse_room(Some("off")), Ok(RoomSetting::Off));
+        assert!(parse_room(Some("on")).is_err());
+    }
+
+    /// GiB as bytes, to the hundredth the logs print.
+    fn gib(x: f64) -> u64 {
+        (x * (1u64 << 30) as f64) as u64
+    }
+
+    /// The p90 block's two boundaries as ZEN5 096 read them. On a 118 GiB host
+    /// (line 92.03 GiB) the block has room at both and skips both purges; on a
+    /// 64 GiB host (line 45.90 GiB) it has room at neither, nor has the median,
+    /// and purges as it did.
+    #[test]
+    fn a_host_with_room_skips_and_a_64_gib_host_purges() {
+        let headroom = 16 << 30;
+        let large = Some(NoDisk {
+            line: gib(92.03),
+            headroom,
+        });
+        for (resident, at) in [(66.75, "phase A's end"), (68.17, "the base's end")] {
+            assert!(has_room(large, Some(gib(resident))), "118 GiB, {at}");
+        }
+        let small = Some(NoDisk {
+            line: gib(45.90),
+            headroom,
+        });
+        for (resident, at) in [
+            (36.08, "p90, phase A's end"),
+            (45.60, "p90, the base's end"),
+            (33.13, "the median, phase A's end"),
+            (33.16, "the median, the base's end"),
+        ] {
+            assert!(!has_room(small, Some(gib(resident))), "64 GiB, {at}");
+        }
+    }
+
+    /// Room is the resident set and the headroom strictly under the line: at
+    /// the line the purge runs.
+    #[test]
+    fn at_the_line_there_is_no_room() {
+        const G: u64 = 1 << 30;
+        let no_disk = Some(NoDisk {
+            line: 90 * G,
+            headroom: 16 * G,
+        });
+        assert!(has_room(no_disk, Some(74 * G - 1)));
+        assert!(!has_room(no_disk, Some(74 * G)));
+        assert!(!has_room(no_disk, Some(90 * G)));
+        assert!(!has_room(no_disk, Some(u64::MAX)), "no overflow");
+    }
+
+    /// A resident set that cannot be read is no room: the purge runs, as it
+    /// did before the room was weighed.
+    #[test]
+    fn no_resident_reading_is_no_room() {
+        const G: u64 = 1 << 30;
+        let no_disk = Some(NoDisk {
+            line: 90 * G,
+            headroom: 16 * G,
+        });
+        assert!(!has_room(no_disk, None));
+    }
+
+    /// A block with a store has no line: it purges under pressure whatever its
+    /// resident set.
+    #[test]
+    fn a_block_with_a_store_has_no_room() {
+        assert!(!has_room(None, Some(1 << 30)));
+        assert!(!has_room(None, None));
     }
 
     /// A purge goes through the hooks it is given: it reads the resident bytes

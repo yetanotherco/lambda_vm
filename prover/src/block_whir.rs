@@ -760,10 +760,33 @@ fn note_pressure_past(host: u64, target: u64) -> bool {
     short
 }
 
+/// The line past which the block's memory is short: [`PRESSURE_SHARE`] of
+/// `target`.
+fn pressure_line(target: u64) -> u64 {
+    let (num, den) = PRESSURE_SHARE;
+    target / den * num
+}
+
 /// Whether `host` bytes are past [`PRESSURE_SHARE`] of `target`.
 fn memory_short(host: u64, target: u64) -> bool {
-    let (num, den) = PRESSURE_SHARE;
-    host > target / den * num
+    host > pressure_line(target)
+}
+
+/// What the allocator's purges at phase A's end and the base's end weigh in a
+/// block that proves with no disk ([`crate::alloc_purge::has_room`]): the
+/// pressure line of `target`, and the regeneration window's ceiling as what
+/// the block may still add. `None` for a block with a store: it purges at both
+/// whenever its memory is short, as ever.
+///
+/// The pressure such a block notes comes from [`hand_off_need`]'s forecast of
+/// the finish's growth, which is the growth of tables that stay; a no-disk
+/// block drops them, and on a host with room its resident set never comes near
+/// the line the forecast crossed.
+fn no_disk_room(no_disk: bool, target: u64) -> Option<crate::alloc_purge::NoDisk> {
+    no_disk.then(|| crate::alloc_purge::NoDisk {
+        line: pressure_line(target),
+        headroom: regen::AHEAD_CAP,
+    })
 }
 
 /// The finish's growth of the resident set, from the walk's end to phase A's
@@ -780,9 +803,8 @@ const FINISH_GROWTH_PER_CYCLE: f64 = 30.08 * (1u64 << 30) as f64 / 612.3e6;
 /// finish is still ahead, so the parked tables leave before its hump builds,
 /// and the hump reuses their pages.
 fn hand_off_need(hwm: u64, cycles: u64, target: u64) -> u64 {
-    let (num, den) = PRESSURE_SHARE;
     let forecast = hwm.saturating_add((FINISH_GROWTH_PER_CYCLE * cycles as f64) as u64);
-    forecast.saturating_sub(target / den * num)
+    forecast.saturating_sub(pressure_line(target))
 }
 
 /// `LAMBDA_VM_BLOCK_HAND_OFF`: `auto` (and unset) decides the hand-off at the
@@ -3793,6 +3815,9 @@ fn prove_streamed(
     // `auto` does, with no store, and a table it would move off the host is
     // dropped if phase B can rebuild it, else stays.
     let no_disk = live_regen.is_some() && policy == BlockSpillPolicy::Off;
+    // With no disk the allocator's two boundary purges wait for the resident
+    // set to come within the regeneration window of the pressure line.
+    crate::alloc_purge::note_no_disk(no_disk_room(no_disk, target));
     let decide = if no_disk {
         BlockSpillPolicy::Auto
     } else {
@@ -4058,7 +4083,7 @@ fn prove_streamed(
                             g(hwm),
                             FINISH_GROWTH_PER_CYCLE * cycles as f64 / (1u64 << 30) as f64,
                             cycles as f64 / 1e6,
-                            g(target / PRESSURE_SHARE.1 * PRESSURE_SHARE.0),
+                            g(pressure_line(target)),
                             PRESSURE_SHARE.0,
                             PRESSURE_SHARE.1,
                             if need == u64::MAX {
@@ -5468,10 +5493,11 @@ pub(crate) fn verify_block_whir_traced(
 mod spill_policy_tests {
     use super::{
         BlockSpillPolicy, CgroupValue, HostReading, SPILL_RESERVE_PER_G, cgroup_memory,
-        hand_off_need, memory_short, parse_hand_off, parse_reserve_per_g, parse_spill_policy,
-        parse_tree_drop, production_spill_from, spill_reserve_bytes, spill_target_from,
-        spill_wanted,
+        hand_off_need, memory_short, no_disk_room, parse_hand_off, parse_reserve_per_g,
+        parse_spill_policy, parse_tree_drop, pressure_line, production_spill_from,
+        spill_reserve_bytes, spill_target_from, spill_wanted,
     };
+    use crate::alloc_purge::{NoDisk, has_room};
 
     const GIB: u64 = 1 << 30;
 
@@ -5772,6 +5798,47 @@ mod spill_policy_tests {
         assert!(!memory_short(gib(45.8), small));
         assert!(memory_short(gib(46.0), small));
         assert!(!memory_short(1024 * GIB, u64::MAX));
+    }
+
+    /// What a no-disk block gives the allocator's two boundary purges to weigh:
+    /// the pressure line of its target, 85 % of it and not the target, and the
+    /// regeneration window's 16 GiB. On ZEN5 (target 108.28 GiB) the line is
+    /// 92.03 and the p90 block has room at both boundaries (VmRSS 66.75 and
+    /// 68.17 GiB, ZEN5 096); on a 64 GiB host (target 54) the line is 45.90 and
+    /// neither p90 (36.08, 45.60) nor the median (33.13, 33.16) has room: under
+    /// the target itself the median would have.
+    #[test]
+    fn a_no_disk_block_weighs_its_window_against_the_pressure_line() {
+        let gib = |g: f64| (g * GIB as f64) as u64;
+        let zen5 = 126_997_233_664 - 10 * GIB;
+        let large = no_disk_room(true, zen5);
+        assert_eq!(
+            large,
+            Some(NoDisk {
+                line: pressure_line(zen5),
+                headroom: 16 * GIB
+            })
+        );
+        assert_eq!(pressure_line(zen5), zen5 / 20 * 17);
+        assert!(memory_short(pressure_line(zen5) + 1, zen5));
+        assert!(!memory_short(pressure_line(zen5), zen5));
+        for resident in [66.75, 68.17] {
+            assert!(has_room(large, Some(gib(resident))), "ZEN5 {resident}");
+        }
+        let small = no_disk_room(true, 54 * GIB);
+        assert_eq!(small.map(|n| n.line), Some(54 * GIB / 20 * 17));
+        assert!(pressure_line(54 * GIB).abs_diff(gib(45.9)) < 1 << 20);
+        for resident in [36.08, 45.60, 33.13, 33.16] {
+            assert!(!has_room(small, Some(gib(resident))), "64 GiB {resident}");
+        }
+    }
+
+    /// A block with a store gives the purges nothing to weigh: they run
+    /// whenever its memory is short, whatever its resident set.
+    #[test]
+    fn a_block_with_a_store_gives_the_purges_no_line() {
+        assert_eq!(no_disk_room(false, 54 * GIB), None);
+        assert!(!has_room(no_disk_room(false, 54 * GIB), Some(GIB)));
     }
 
     /// The hand-off at the walk's end, against the rows its coefficient comes
