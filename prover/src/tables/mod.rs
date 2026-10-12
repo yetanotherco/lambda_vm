@@ -72,6 +72,15 @@ pub const STATIC_BLOWUP_FACTORS: &[u8] = &[2, 4, 8];
 /// miss, never a recompute.
 pub const STATIC_BLOWUP_FACTORS_ONE_ROW: &[u8] = &[4];
 
+/// Blowup factors for which the POSEIDON1 twins of the bitwise and keccak_rc
+/// static commitments ship (`static_commitment_p1`), emitted by
+/// `compute_static_commitments --hash p1` and pinned by the Poseidon1 drift
+/// tests. Only the blowup the block's proof family commits its LFM tables at
+/// (4), in row pairs: the one key its provers and verifiers ask for. Any
+/// other key under Poseidon1 is computed
+/// ([`crate::hash_pin::static_root_under`]).
+pub const STATIC_BLOWUP_FACTORS_P1: &[u8] = &[4];
+
 /// Per-table maximum rows, sized so each chunk uses roughly the same memory.
 ///
 /// Effective width = main_cols + 3 × bus_interactions (extension field = 3× cost).

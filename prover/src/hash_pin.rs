@@ -79,6 +79,9 @@
 //!    algebraic root, compares it against a BLAKE3 constant, and fails with
 //!    `ProvingError::PrecomputedCommitmentMismatch`.
 //!    `cargo run --bin compute_static_commitments --release`, then paste.
+//!    `bitwise` and `keccak_rc` also ship POSEIDON1 twins for the block's proof
+//!    family (`static_commitment_p1`, `-- --hash p1`): regenerate them with the
+//!    rest whenever the tables or the commit pipeline change.
 //! 2. **`LFM_REGISTRY` — SECOND, only once the statics are in the tree.**
 //!    `registry.rs` fills slots 13 and 14 of every entry from `keccak_rc` and
 //!    `bitwise`'s `preprocessed_commitment` — the blessed constants above, not a
@@ -309,8 +312,9 @@ const _: () = {
 };
 
 /// The root of a static preprocessed table (`table`: `bitwise`, `keccak_rc`)
-/// under a commitment configuration OTHER than the legacy pin's, whose roots
-/// are blessed constants (the module header's regenerations): computed by
+/// at a key with no blessed constant — the legacy pin's roots and the
+/// Poseidon1 twins the block's family asks for are constants (the module
+/// header's regenerations; the callers return those first): computed by
 /// `compute` once per process for each (hash, blowup, coset, leaf layout) and
 /// reused. The cap of an arity-4 configuration does not enter: it moves path
 /// nodes, never a root.

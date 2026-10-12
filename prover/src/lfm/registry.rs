@@ -608,8 +608,8 @@ pub fn build_artifacts_under<S: stark::config::StarkHash>(
     }
     hash_chunk_log_heights.extend(tail.iter().map(|g| g.padded_rows.trailing_zeros() as u8));
     // Slot 12 (KECCAK_RND) keeps the all-zero sentinel installed above.
-    // The static tables: the legacy pin's blessed roots, or `S`'s computed
-    // once per process.
+    // The static tables: the legacy pin's blessed roots, the Poseidon1
+    // family's where they ship, or `S`'s computed once per process.
     roots[13] = keccak_rc::preprocessed_root_under::<S>(options);
     log_heights[13] = keccak_rc::NUM_ROWS.trailing_zeros() as u8;
     roots[14] = bitwise::preprocessed_root_under::<S>(options);

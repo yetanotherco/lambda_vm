@@ -16,6 +16,12 @@
 //! and pinned by the one-row drift tests. `--layout pair` (the default) is
 //! the output above, unchanged.
 //!
+//! `--hash p1` prints the POSEIDON1 twins of `bitwise` and `keccak_rc` instead
+//! — the same columns in row pairs, committed by the Poseidon1 configuration
+//! of the block's proof family — for `STATIC_BLOWUP_FACTORS_P1`; they are
+//! pasted into the `static_commitment_p1` match bodies and pinned by the
+//! Poseidon1 drift tests. `--hash legacy` (the default) is the output above.
+//!
 //! ⚠ On a hash-pin change run this FIRST and paste before `compute_lfm_registry`:
 //! the registry embeds these constants (slots 13 and 14 of every entry, and
 //! `program_id` folds them), so a registry generated before the paste carries
@@ -28,7 +34,8 @@
 //! regenerates all four families together (`prover/src/hash_pin.rs`).
 
 use lambda_vm_prover::tables::{
-    STATIC_BLOWUP_FACTORS, STATIC_BLOWUP_FACTORS_ONE_ROW, bitwise, keccak_rc, page,
+    STATIC_BLOWUP_FACTORS, STATIC_BLOWUP_FACTORS_ONE_ROW, STATIC_BLOWUP_FACTORS_P1, bitwise,
+    keccak_rc, page,
 };
 use stark::config::Commitment;
 use stark::leaf_layout::LeafLayout;
@@ -50,23 +57,78 @@ fn format_commitment(commitment: &Commitment) -> String {
     out
 }
 
-/// `--layout pair|row` (default `pair`). Anything else aborts: a typo must
-/// not print the other layout's constants under this one's name.
-fn layout_arg() -> LeafLayout {
+/// `--layout pair|row` (default `pair`) and `--hash legacy|p1` (default
+/// `legacy`). Anything else aborts: a typo must not print another family's
+/// constants under this one's name.
+fn args() -> (LeafLayout, bool) {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.as_slice() {
-        [] => LeafLayout::RowPair,
-        [flag, value] if flag == "--layout" => match value.as_str() {
-            "pair" => LeafLayout::RowPair,
-            "row" => LeafLayout::Row,
-            other => panic!("--layout must be `pair` or `row`, got `{other}`"),
-        },
-        other => panic!("usage: compute_static_commitments [--layout pair|row], got {other:?}"),
+    let (mut layout, mut p1) = (LeafLayout::RowPair, false);
+    for pair in args.chunks(2) {
+        match pair {
+            [flag, value] if flag == "--layout" => {
+                layout = match value.as_str() {
+                    "pair" => LeafLayout::RowPair,
+                    "row" => LeafLayout::Row,
+                    other => panic!("--layout must be `pair` or `row`, got `{other}`"),
+                }
+            }
+            [flag, value] if flag == "--hash" => {
+                p1 = match value.as_str() {
+                    "legacy" => false,
+                    "p1" => true,
+                    other => panic!("--hash must be `legacy` or `p1`, got `{other}`"),
+                }
+            }
+            other => panic!(
+                "usage: compute_static_commitments [--layout pair|row] [--hash legacy|p1], got {other:?}"
+            ),
+        }
+    }
+    assert!(
+        !(p1 && layout.is_one_row()),
+        "the Poseidon1 twins ship in row pairs only"
+    );
+    (layout, p1)
+}
+
+/// The Poseidon1 twins of `bitwise` and `keccak_rc`, in row pairs.
+fn print_p1() {
+    type P1 = lambda_vm_prover::lfm::p1_commit::P1StarkHash;
+    println!(
+        "// commitment hash: Poseidon1 · leaf layout: RowPair\n\
+         // Paste these match arms into the `static_commitment_p1` match bodies\n\
+         // in `prover/src/tables/{{bitwise,keccak_rc}}.rs`.\n"
+    );
+    for &blowup in STATIC_BLOWUP_FACTORS_P1 {
+        let options = match GoldilocksCubicProofOptions::with_blowup(blowup) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("skipping blowup={blowup}: {e}");
+                continue;
+            }
+        };
+        let bitwise =
+            bitwise::compute_preprocessed_commitment_under::<P1>(&options, LeafLayout::RowPair);
+        let keccak_rc =
+            keccak_rc::compute_preprocessed_commitment_under::<P1>(&options, LeafLayout::RowPair);
+        println!(
+            "// blowup_factor = {blowup}\n\
+             // ---- bitwise:\n        \
+             {blowup} => Some({bitwise_fmt}),\n\
+             // ---- keccak_rc:\n        \
+             {blowup} => Some({keccak_fmt}),\n",
+            bitwise_fmt = format_commitment(&bitwise),
+            keccak_fmt = format_commitment(&keccak_rc),
+        );
     }
 }
 
 fn main() {
-    let layout = layout_arg();
+    let (layout, p1) = args();
+    if p1 {
+        print_p1();
+        return;
+    }
     let blowups = match layout {
         LeafLayout::RowPair => STATIC_BLOWUP_FACTORS,
         LeafLayout::Row => STATIC_BLOWUP_FACTORS_ONE_ROW,
