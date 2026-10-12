@@ -3,7 +3,8 @@
 //! must be this build's, word for word. Test-only, kept for one release.
 //!
 //! A test turns it on for its own thread ([`with`]); [`super::build_traces`]
-//! then runs this instead of the plan.
+//! then runs this instead of the plan. It pads the cut tables as it always
+//! did ([`CutPadding::WholeRun`]), whatever the build's settings say.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -741,6 +742,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             return cut_tables(
                 &keccak_ops,
                 skip.keccak_rows,
+                CutPadding::WholeRun,
                 pack,
                 form,
                 keccak::rows_written_packed,
@@ -776,6 +778,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             &keccak_rnd_ops,
             skip.keccak_rnd_rows,
             skip.keccak_rnd,
+            CutPadding::WholeRun,
             pack,
             form,
         )
@@ -828,6 +831,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             return cut_tables(
                 &ecsm_ops,
                 skip.ecsm_rows,
+                CutPadding::WholeRun,
                 pack,
                 form,
                 ecsm::rows_written_packed,
@@ -846,6 +850,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             return cut_tables(
                 &ecdas_ops,
                 skip.ecdas_rows,
+                CutPadding::WholeRun,
                 pack,
                 form,
                 ecdas::rows_written_packed,

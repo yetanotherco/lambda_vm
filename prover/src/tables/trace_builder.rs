@@ -79,6 +79,8 @@ mod clock;
 mod compact_branch;
 mod compact_bytewise;
 mod compact_eq;
+#[cfg(test)]
+mod cut_padding_tests;
 mod delta;
 mod finish;
 #[cfg(test)]
@@ -4066,6 +4068,74 @@ pub struct StreamSkip {
     /// the segments, `LAMBDA_VM_BLOCK_LT_CONCAT=1` on the block). The tables
     /// are the same.
     pub concat_lt: bool,
+    /// How the tables cut at `keccak_rnd_rows`, `keccak_rows`, `ecsm_rows` and
+    /// `ecdas_rows` are padded ([`CutPadding`]): the table phase's counts, its
+    /// tables and the tables built again from its lists all read it here. The
+    /// default is the tables the block's split makes.
+    pub cut_padding: CutPadding,
+}
+
+/// How the tables a block cuts at a fixed number of rows (KECCAK_RND, KECCAK,
+/// ECSM, ECDAS) are padded. A prover's choice: a block statement states each
+/// family's count and every table's height, whatever they are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CutPadding {
+    /// The whole run's rows padded to a power of two, then cut: the tables the
+    /// block's split makes of the whole padded table (`split_rows`). Past the
+    /// table that holds the last real row they are padding rows alone.
+    #[default]
+    WholeRun,
+    /// Cut, and stop at the table that holds the last real row, padded to the
+    /// cut: [`Self::WholeRun`]'s tables without the ones of padding rows
+    /// alone. A padding row of each of the four families has every bus
+    /// multiplicity at zero, so a table of them adds nothing to the bus.
+    LastTable,
+}
+
+impl CutPadding {
+    /// `LAMBDA_VM_BLOCK_CUT_PADDING`: unset or `run`, [`Self::WholeRun`] (the
+    /// default); `last`, [`Self::LastTable`]. Read once; any other value is
+    /// refused. It is the rule of the tables the table phase cuts
+    /// ([`StreamSkip::cut_padding`]): a table built whole and split by the
+    /// block afterwards (its comparison arms) keeps the whole run's padding.
+    pub(crate) fn from_env() -> Result<Self, Error> {
+        static PADDING: std::sync::OnceLock<Result<CutPadding, String>> =
+            std::sync::OnceLock::new();
+        PADDING
+            .get_or_init(|| {
+                Self::parse(std::env::var("LAMBDA_VM_BLOCK_CUT_PADDING").ok().as_deref())
+            })
+            .clone()
+            .map_err(Error::Prover)
+    }
+
+    /// [`Self::from_env`]'s reading of its variable.
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim) {
+            None | Some("run") => Ok(Self::WholeRun),
+            Some("last") => Ok(Self::LastTable),
+            Some(v) => Err(format!("LAMBDA_VM_BLOCK_CUT_PADDING={v}: run or last")),
+        }
+    }
+
+    /// How many tables `n` rows cut at `rows` rows a table make: none without
+    /// rows; one when the whole padded table (`n.next_power_of_two().max(4)`
+    /// rows) is no taller than `rows`; else that table's `total / rows` cuts
+    /// ([`Self::WholeRun`]), or the `n.div_ceil(rows)` of them that hold a
+    /// real row ([`Self::LastTable`]).
+    pub(crate) fn tables(self, n: usize, rows: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        let total = n.next_power_of_two().max(4);
+        if total <= rows || rows == 0 {
+            return 1;
+        }
+        match self {
+            Self::WholeRun => total / rows,
+            Self::LastTable => n.div_ceil(rows),
+        }
+    }
 }
 
 /// BITWISE lookups a windowed build counted while the run was still being
@@ -4124,16 +4194,17 @@ impl PreCounted {
 /// KECCAK_RND cut into tables of `rows` rows, the first `streamed` of them left
 /// as placeholders: the tables `split_rows` makes of the whole table
 /// ([`keccak_rnd::generate_keccak_rnd_trace`]), each built from the ops that
-/// reach it. A table no taller than `rows` stays one table, as the split leaves
-/// it.
+/// reach it, as many of them as `padding` counts ([`CutPadding::tables`]). A
+/// table no taller than `rows` stays one table, as the split leaves it.
 pub(crate) fn keccak_rnd_chunks(
     ops: &[KeccakRoundOperation],
     rows: usize,
     streamed: usize,
+    padding: CutPadding,
     pack: bool,
     form: TraceForm,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
-    keccak_rnd_chunks_in_waves(ops, rows, streamed, pack, form, kr_packed_wave())
+    keccak_rnd_chunks_in_waves(ops, rows, streamed, padding, pack, form, kr_packed_wave())
 }
 
 /// `LAMBDA_VM_KR_PACKED_WAVE`: how many KECCAK_RND chunks [`keccak_rnd_chunks`]
@@ -4166,6 +4237,7 @@ fn keccak_rnd_chunks_in_waves(
     ops: &[KeccakRoundOperation],
     rows: usize,
     streamed: usize,
+    padding: CutPadding,
     pack: bool,
     form: TraceForm,
     packed_wave: usize,
@@ -4185,7 +4257,7 @@ fn keccak_rnd_chunks_in_waves(
             keccak_rnd::generate_keccak_rnd_rows_as(ops, 0, total, form),
         )]);
     }
-    let chunks = total / rows;
+    let chunks = padding.tables(ops.len() * 24, rows);
     if streamed > chunks {
         return Err(Error::Prover(format!(
             "{streamed} KECCAK_RND chunks were streamed but the run has {chunks}"
@@ -4240,13 +4312,15 @@ const KECCAK_RND_PACK_WAVE: usize = 4;
 /// (`split_rows`): one table when the whole is no taller than `rows`, else
 /// `total / rows` cuts, cut k the ops of rows `[k·rows, (k+1)·rows)` and the
 /// padding to `rows` rows (`generate(ops, rows, form)`, a family's
-/// `generate_*_rows_as`). No ops, no table. Each cut is packed as it is built
-/// when `pack`. The words are the split's; the whole table and its split copy
-/// are never held. A cut is read from the list's blocks: borrowed when it is a
-/// block (ECDAS's blocks are its cut), copied when it straddles two.
+/// `generate_*_rows_as`), as many of them as `padding` counts
+/// ([`CutPadding::tables`]). No ops, no table. Each cut is packed as it is
+/// built when `pack`. The words are the split's; the whole table and its split
+/// copy are never held. A cut is read from the list's blocks: borrowed when it
+/// is a block (ECDAS's blocks are its cut), copied when it straddles two.
 fn cut_tables<T: Clone + Sync>(
     ops: &BlockVec<T>,
     rows: usize,
+    padding: CutPadding,
     pack: bool,
     form: TraceForm,
     written_packed: fn(TraceForm) -> bool,
@@ -4271,7 +4345,7 @@ fn cut_tables<T: Clone + Sync>(
         let (first, end) = ((k * rows).min(n), ((k + 1) * rows).min(n));
         packed_if(pack, generate(&ops.range(first, end), rows, form))
     };
-    let cuts = total / rows;
+    let cuts = padding.tables(n, rows);
     // Written packed once the family's widths are known (`tables::gpack`):
     // until then a cut is built at 8 bytes a cell, so the first goes alone and
     // leaves its widths for the rest.
@@ -6865,7 +6939,7 @@ mod p4_slice_tests {
 #[cfg(test)]
 mod kr_wave_tests {
     use super::{
-        KECCAK_RND_PACK_WAVE, KeccakRoundOperation, TraceForm, keccak_rnd,
+        CutPadding, KECCAK_RND_PACK_WAVE, KeccakRoundOperation, TraceForm, keccak_rnd,
         keccak_rnd_chunks_in_waves, kr_packed_wave_from,
     };
 
@@ -6911,13 +6985,22 @@ mod kr_wave_tests {
         // 21 ops = 504 rows in a 512-row table: eight chunks of 64 rows, the last part padding,
         // and ops cut across chunk edges.
         let ops = ops(21);
-        let reference =
-            keccak_rnd_chunks_in_waves(&ops, 64, 0, true, TraceForm::Narrow, KECCAK_RND_PACK_WAVE)
-                .expect("the chunks");
+        let padding = CutPadding::default();
+        let reference = keccak_rnd_chunks_in_waves(
+            &ops,
+            64,
+            0,
+            padding,
+            true,
+            TraceForm::Narrow,
+            KECCAK_RND_PACK_WAVE,
+        )
+        .expect("the chunks");
         assert_eq!(reference.len(), 8);
         for wave in [1, 3, usize::MAX] {
-            let tables = keccak_rnd_chunks_in_waves(&ops, 64, 0, true, TraceForm::Narrow, wave)
-                .expect("the chunks");
+            let tables =
+                keccak_rnd_chunks_in_waves(&ops, 64, 0, padding, true, TraceForm::Narrow, wave)
+                    .expect("the chunks");
             assert_eq!(tables.len(), reference.len(), "wave {wave}");
             for (i, (got, want)) in tables.iter().zip(&reference).enumerate() {
                 assert_eq!(
@@ -6929,8 +7012,9 @@ mod kr_wave_tests {
             }
         }
         // The wide build is the same words too.
-        let wide = keccak_rnd_chunks_in_waves(&ops, 64, 0, false, TraceForm::Wide, usize::MAX)
-            .expect("the chunks");
+        let wide =
+            keccak_rnd_chunks_in_waves(&ops, 64, 0, padding, false, TraceForm::Wide, usize::MAX)
+                .expect("the chunks");
         for (i, (got, want)) in wide.iter().zip(&reference).enumerate() {
             assert_eq!(words(got), words(want), "wide, chunk {i}");
         }
@@ -7245,10 +7329,12 @@ mod segmented_tests {
 
 #[cfg(all(test, feature = "parallel"))]
 mod cut_tests {
+    use super::cut_padding_tests::is_today_without_its_padding_tables;
     use super::{
-        BlockVec, Error, GoldilocksExtension, GoldilocksField, KeccakOperation, TraceForm,
-        cut_tables, ecdas, ecsm, keccak,
+        BlockVec, CutPadding, Error, GoldilocksExtension, GoldilocksField, KeccakOperation,
+        TraceForm, cut_tables, ecdas, ecsm, keccak,
     };
+    use stark::lookup::BusInteraction;
     use stark::trace::TraceTable;
 
     type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
@@ -7358,14 +7444,20 @@ mod cut_tests {
     /// `cut_tables` against the block's split of the whole wide table, for one
     /// family: every op count around the cut sizes, every cut size from one row
     /// to past the whole table, built wide, packed after the build, and
-    /// written packed. The same tables, word for word, in the same order.
+    /// written packed. With the whole run padded, the same tables, word for
+    /// word, in the same order; cut at the last real row, those tables without
+    /// the ones of padding rows alone, which carry nothing on the family's
+    /// bus `interactions`.
     fn cuts_are_the_split<T: Clone + Sync>(
         name: &str,
         ops: impl Fn(usize) -> Vec<T>,
         whole: impl Fn(&[T]) -> Table,
         written_packed: fn(TraceForm) -> bool,
         rows_as: impl Fn(&[T], usize, TraceForm) -> Table + Send + Sync + Copy,
+        interactions: &[BusInteraction],
     ) {
+        let whole_run = CutPadding::WholeRun;
+        let mut left_out = 0usize;
         for n in [1usize, 2, 3, 4, 5, 7, 8, 9, 16, 17, 31, 33, 64, 65] {
             let ops = ops(n);
             // The ops in one block, and in blocks of three that cuts straddle.
@@ -7381,8 +7473,9 @@ mod cut_tests {
                     (true, TraceForm::Narrow, &one),
                     (true, TraceForm::Narrow, &threes),
                 ] {
-                    let cut = cut_tables(blocks, rows, pack, form, written_packed, rows_as)
-                        .expect("the cuts");
+                    let cut =
+                        cut_tables(blocks, rows, whole_run, pack, form, written_packed, rows_as)
+                            .expect("the cuts");
                     assert_eq!(
                         cut.len(),
                         split.len(),
@@ -7404,34 +7497,61 @@ mod cut_tests {
                             "{name} n {n} rows {rows} cut {k} (pack {pack}, {form:?}): words"
                         );
                     }
+                    let last = cut_tables(
+                        blocks,
+                        rows,
+                        CutPadding::LastTable,
+                        pack,
+                        form,
+                        written_packed,
+                        rows_as,
+                    )
+                    .expect("the cuts");
+                    assert_eq!(
+                        last.len(),
+                        CutPadding::LastTable.tables(n, rows),
+                        "{name} n {n} rows {rows}: tables with a real row"
+                    );
+                    is_today_without_its_padding_tables(&last, &cut, interactions).unwrap_or_else(
+                        |e| panic!("{name} n {n} rows {rows} (pack {pack}, {form:?}): {e}"),
+                    );
+                    left_out += cut.len() - last.len();
                 }
             }
         }
-        // No ops, no table, as the whole build's `generate_optional`.
         assert!(
-            cut_tables(
-                &BlockVec::from_vec(ops(0)),
-                4,
-                true,
-                TraceForm::Narrow,
-                written_packed,
-                rows_as
-            )
-            .expect("no cuts")
-            .is_empty()
+            left_out > 0,
+            "{name}: no table of padding rows alone was left out"
         );
-        // A cut that is not a power of two is refused, not split some other way.
-        assert!(matches!(
-            cut_tables(
-                &BlockVec::from_vec(ops(9)),
-                6,
-                true,
-                TraceForm::Narrow,
-                written_packed,
-                rows_as
-            ),
-            Err(Error::Prover(_))
-        ));
+        for padding in [whole_run, CutPadding::LastTable] {
+            // No ops, no table, as the whole build's `generate_optional`.
+            assert!(
+                cut_tables(
+                    &BlockVec::from_vec(ops(0)),
+                    4,
+                    padding,
+                    true,
+                    TraceForm::Narrow,
+                    written_packed,
+                    rows_as
+                )
+                .expect("no cuts")
+                .is_empty()
+            );
+            // A cut that is not a power of two is refused, not split some other way.
+            assert!(matches!(
+                cut_tables(
+                    &BlockVec::from_vec(ops(9)),
+                    6,
+                    padding,
+                    true,
+                    TraceForm::Narrow,
+                    written_packed,
+                    rows_as
+                ),
+                Err(Error::Prover(_))
+            ));
+        }
     }
 
     #[test]
@@ -7442,6 +7562,7 @@ mod cut_tests {
             keccak::generate_keccak_trace,
             keccak::rows_written_packed,
             keccak::generate_keccak_rows_as,
+            &keccak::bus_interactions(),
         );
     }
 
@@ -7453,6 +7574,7 @@ mod cut_tests {
             ecsm::generate_ecsm_trace,
             ecsm::rows_written_packed,
             ecsm::generate_ecsm_rows_as,
+            &ecsm::bus_interactions(),
         );
     }
 
@@ -7478,6 +7600,7 @@ mod cut_tests {
             ecdas::generate_ecdas_trace,
             ecdas::rows_written_packed,
             ecdas::generate_ecdas_rows_as,
+            &ecdas::bus_interactions(),
         );
     }
 }

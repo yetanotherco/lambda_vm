@@ -114,15 +114,6 @@ fn chunked(
     Ok(chunks)
 }
 
-/// How many tables [`cut_tables`] makes of `n` ops at `rows` rows a table.
-fn cuts(n: usize, rows: usize) -> usize {
-    if n == 0 {
-        return 0;
-    }
-    let total = n.next_power_of_two().max(4);
-    if total <= rows { 1 } else { total / rows }
-}
-
 /// A build's table phase, planned: every list phase 5 reads, what phases 3 and
 /// 4 derived from them, and the [`RestHeader`]. See the module docs.
 pub(super) struct FinishPlan<'a> {
@@ -162,6 +153,8 @@ pub(super) struct FinishPlan<'a> {
     halt_next_pc: u64,
     register_final_state: FinalRegisterStateMap,
     header: RestHeader,
+    /// [`Self::cut_line`].
+    cut_line: Option<String>,
 }
 
 impl<'a> FinishPlan<'a> {
@@ -658,7 +651,7 @@ impl<'a> FinishPlan<'a> {
             (0, _) => 0,
             (n, rows) => {
                 let total = (n * 24).next_power_of_two().max(4);
-                let chunks = if total <= rows { 1 } else { total / rows };
+                let chunks = skip.cut_padding.tables(n * 24, rows);
                 if skip.keccak_rnd > 0 && (total <= rows || skip.keccak_rnd > chunks) {
                     return Err(Error::Prover(format!(
                         "{} KECCAK_RND chunks were streamed but the run has {chunks}",
@@ -668,9 +661,10 @@ impl<'a> FinishPlan<'a> {
                 chunks
             }
         };
+        // [`cut_tables`]' count, or the one whole table.
         let accelerator = |n: usize, rows: usize| {
             if rows > 0 {
-                cuts(n, rows)
+                skip.cut_padding.tables(n, rows)
             } else {
                 usize::from(n > 0)
             }
@@ -710,6 +704,48 @@ impl<'a> FinishPlan<'a> {
             commit: usize::from(!commit_ops.is_empty()),
             blake3: usize::from(num_blake3_ops > 0),
         };
+        // The families cut at a fixed number of rows: the tables counted, and
+        // how many of them hold a real row.
+        let cut: Vec<String> = [
+            (
+                "KECCAK",
+                skip.keccak_rows,
+                keccak_ops.len(),
+                table_counts.keccak,
+            ),
+            (
+                "KECCAK_RND",
+                skip.keccak_rnd_rows,
+                keccak_ops.len() * 24,
+                table_counts.keccak_rnd,
+            ),
+            ("ECSM", skip.ecsm_rows, ecsm_ops.len(), table_counts.ecsm),
+            (
+                "ECDAS",
+                skip.ecdas_rows,
+                ecdas_ops.len(),
+                table_counts.ecdas,
+            ),
+        ]
+        .into_iter()
+        .filter(|&(_, rows, _, _)| rows > 0)
+        .map(|(name, rows, n, tables)| {
+            format!(
+                "{name} {tables} ({})",
+                CutPadding::LastTable.tables(n, rows)
+            )
+        })
+        .collect();
+        let cut_line = (!cut.is_empty()).then(|| {
+            format!(
+                "BLOCK CUT PADDING: {} · tables (of them with a real row): {}",
+                match skip.cut_padding {
+                    CutPadding::WholeRun => "the whole run padded, then cut (the default)",
+                    CutPadding::LastTable => "cut, the last table padded",
+                },
+                cut.join(" · "),
+            )
+        });
 
         Ok(Self {
             memory_state,
@@ -753,12 +789,20 @@ impl<'a> FinishPlan<'a> {
                 public_output_bytes,
                 num_blake3_ops,
             },
+            cut_line,
         })
     }
 
     /// What a statement reads off the build, before any table is built.
     pub(crate) fn header(&self) -> &RestHeader {
         &self.header
+    }
+
+    /// A `BLOCK CUT PADDING` line for the readout, when the build cuts a
+    /// family at a fixed number of rows: the rule ([`StreamSkip::cut_padding`])
+    /// and, per cut family, the tables it makes and how many hold a real row.
+    pub(crate) fn cut_line(&self) -> Option<&str> {
+        self.cut_line.as_deref()
     }
 
     /// The header's counts replaced (a test's wrong plan, which
@@ -809,6 +853,7 @@ impl<'a> FinishPlan<'a> {
             halt_next_pc,
             register_final_state,
             header,
+            cut_line: _,
         } = self;
         let lt_ops = lt.segments();
 
@@ -1042,6 +1087,7 @@ impl<'a> FinishPlan<'a> {
                 return cut_tables(
                     &keccak_ops,
                     skip.keccak_rows,
+                    skip.cut_padding,
                     pack,
                     form,
                     keccak::rows_written_packed,
@@ -1077,6 +1123,7 @@ impl<'a> FinishPlan<'a> {
                 &keccak_rnd_ops,
                 skip.keccak_rnd_rows,
                 skip.keccak_rnd,
+                skip.cut_padding,
                 pack,
                 form,
             )
@@ -1120,6 +1167,7 @@ impl<'a> FinishPlan<'a> {
                 return cut_tables(
                     &ecsm_ops,
                     skip.ecsm_rows,
+                    skip.cut_padding,
                     pack,
                     form,
                     ecsm::rows_written_packed,
@@ -1138,6 +1186,7 @@ impl<'a> FinishPlan<'a> {
                 return cut_tables(
                     &ecdas_ops,
                     skip.ecdas_rows,
+                    skip.cut_padding,
                     pack,
                     form,
                     ecdas::rows_written_packed,
@@ -1520,12 +1569,14 @@ fn chunked_units<'a>(
 
 /// A one-row-an-op family's units ([`cut_tables`]'s tables): none without
 /// ops, one table when the whole is no taller than `rows`, else its cuts of
-/// `rows` rows; or, without cuts (`rows` 0), the whole table wide
-/// (`whole`), as the finish builds it to be split later.
+/// `rows` rows, as many as `padding` counts; or, without cuts (`rows` 0), the
+/// whole table wide (`whole`), as the finish builds it to be split later.
+#[allow(clippy::too_many_arguments)]
 fn cut_units<'a, T: Clone + Send + Sync + 'a>(
     family: usize,
     ops: &std::sync::Arc<BlockVec<T>>,
     rows: usize,
+    padding: CutPadding,
     pack: bool,
     form: TraceForm,
     generate: CutGenerator<'a, T>,
@@ -1556,7 +1607,7 @@ fn cut_units<'a, T: Clone + Send + Sync + 'a>(
             job: Box::new(move || Ok(packed_if(pack, generate(&ops.whole(), total, form)))),
         }]);
     }
-    Ok((0..total / rows)
+    Ok((0..padding.tables(n, rows))
         .map(|k| {
             let ops = std::sync::Arc::clone(ops);
             let generate = std::sync::Arc::clone(&generate);
@@ -1642,6 +1693,7 @@ impl<'a> FinishPlan<'a> {
             halt_next_pc,
             register_final_state,
             header,
+            cut_line: _,
         } = self;
         #[cfg(feature = "disk-spill")]
         if storage_mode == StorageMode::Disk {
@@ -1741,6 +1793,7 @@ impl<'a> FinishPlan<'a> {
             family("KECCAK"),
             &keccak_ops,
             skip.keccak_rows,
+            skip.cut_padding,
             pack,
             form,
             Arc::new(keccak::generate_keccak_rows_as),
@@ -1756,6 +1809,7 @@ impl<'a> FinishPlan<'a> {
             family("ECSM"),
             &ecsm_ops,
             skip.ecsm_rows,
+            skip.cut_padding,
             pack,
             form,
             Arc::new(ecsm::generate_ecsm_rows_as),
@@ -1767,6 +1821,7 @@ impl<'a> FinishPlan<'a> {
             family("ECDAS"),
             &ecdas_ops,
             skip.ecdas_rows,
+            skip.cut_padding,
             pack,
             form,
             Arc::new(|rows: &[ecdas::CompactEcdasOp], num_rows, form| {
@@ -2161,9 +2216,10 @@ fn segmented_units<'a, T: Clone + Send + Sync + 'a>(
     })
 }
 
-/// KECCAK_RND's units ([`keccak_rnd_chunks`]' tables, or the whole table wide
-/// without chunks): a chunk's round ops are derived from the KECCAK ops that
-/// reach it as the chunk is built.
+/// KECCAK_RND's units ([`keccak_rnd_chunks`]' tables, as many as
+/// [`StreamSkip::cut_padding`] counts, or the whole table wide without
+/// chunks): a chunk's round ops are derived from the KECCAK ops that reach it
+/// as the chunk is built.
 fn keccak_rnd_units<'a>(
     keccak_ops: &std::sync::Arc<BlockVec<KeccakOperation>>,
     skip: &StreamSkip,
@@ -2213,7 +2269,7 @@ fn keccak_rnd_units<'a>(
             }),
         }]);
     }
-    let chunks = total / rows;
+    let chunks = skip.cut_padding.tables(n * 24, rows);
     if streamed > chunks {
         return Err(Error::Prover(format!(
             "{streamed} KECCAK_RND chunks were streamed but the run has {chunks}"

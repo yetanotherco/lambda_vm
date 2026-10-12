@@ -4,7 +4,9 @@
 //! place, at any byte budget (one byte, 2 GiB, none). The byte gate's
 //! lowest-pending rule keeps a one-byte budget from deadlocking; a job's error
 //! and a stopped packer each stop the emitter and every waiter; a header that
-//! miscounts is refused.
+//! miscounts is refused. The cut tables' padding rule
+//! ([`CutPadding`]) is one of the configurations: the header, the stream and
+//! the lists kept for phase B count the same tables under either rule.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -160,7 +162,79 @@ fn configs() -> Vec<(&'static str, Configure)> {
                     .expect("before any window")
             }),
         ),
+        (
+            "dropped, KECCAK_RND at the finish, cuts, packed, written packed, cut at the last \
+             real row",
+            Box::new(|b| cut(b, CutPadding::LastTable)),
+        ),
     ]
+}
+
+/// The block's configuration with every family cut small (KECCAK_RND at 32
+/// rows, KECCAK and ECSM at one row, ECDAS at 16), the cut tables padded as
+/// `padding`.
+fn cut(b: WindowedTraceBuilder<'_>, padding: CutPadding) -> WindowedTraceBuilder<'_> {
+    b.keccak_rnd_chunks_at_finish(32)
+        .expect("rows")
+        .cuts_at_finish(1, 1, 16)
+        .expect("rows")
+        .cut_padding(padding)
+        .pack_finished_tables()
+        .generate_packed()
+        .drop_streamed_ops()
+        .expect("before any window")
+}
+
+/// ★ The header, the streamed tables and the lists kept for phase B count the
+/// same KECCAK_RND tables under either padding rule: test_keccak_multi's 72
+/// rows at 32 rows a table are four tables with the whole run padded and three
+/// cut at the last real row, and phase B's jobs build each of them again word
+/// for word. KECCAK (3 rows at one row a table) is four tables against three.
+#[test]
+fn the_header_the_stream_and_the_rebuild_count_the_rules_tables() {
+    use super::RegenFamily;
+    let (program, logs) = run("test_keccak_multi");
+    let max_rows = MaxRowsConfig::small();
+    for (padding, tables) in [(CutPadding::WholeRun, 4usize), (CutPadding::LastTable, 3)] {
+        let what = format!("{padding:?}");
+        let configure = move |b| cut(b, padding);
+        let (builder, last) = pushed(&program, &logs, &max_rows, 7, &configure);
+        let whole = builder.finish(last).expect("the monolithic finish");
+        assert_eq!(
+            whole.keccak_rnds.len(),
+            tables,
+            "{what}: the finish's tables"
+        );
+        assert_eq!(whole.keccaks.len(), tables, "{what}: KECCAK's tables");
+
+        let (builder, last) = pushed(&program, &logs, &max_rows, 7, &configure);
+        let (header, got, _) = streamed(builder, last, usize::MAX);
+        assert_eq!(header.table_counts.keccak_rnd, tables, "{what}: the header");
+        assert_eq!(header.table_counts.keccak, tables, "{what}: the header");
+        assert_eq!(
+            got.len(),
+            air_order(&whole).len(),
+            "{what}: the stream's tables"
+        );
+
+        let (builder, last) = pushed(&program, &logs, &max_rows, 7, &configure);
+        let (got, regen) = streamed_keeping(builder, last, true);
+        let jobs = regen
+            .expect("the lists kept")
+            .take(RegenFamily::KeccakRnd)
+            .expect("the jobs");
+        assert_eq!(jobs.len(), tables, "{what}: phase B's jobs");
+        let first = regen_ranges(&whole)[0].start;
+        for (j, job) in jobs.into_iter().enumerate() {
+            let again = job.expect("no chunk was streamed")().expect("the job builds again");
+            let table = got[first + j].table.as_ref().expect("a table, not a slot");
+            assert_eq!(
+                shape_and_words(&again),
+                shape_and_words(table),
+                "{what}: KECCAK_RND[{j}] built again"
+            );
+        }
+    }
 }
 
 /// A windowed builder over windows of `window` cycles, `configure` applied,

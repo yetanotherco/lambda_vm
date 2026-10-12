@@ -5,12 +5,15 @@
 //! finish, KECCAK / ECSM / ECDAS cut, tables packed or written packed, the
 //! derived LT ops raw or compact, LT concatenated or kept as segments). Its
 //! header is the oracle's counts and pages before any table exists, and a
-//! header that miscounts is refused.
+//! header that miscounts is refused. With the cut tables stopped at the last
+//! real row ([`CutPadding::LastTable`]) the plan builds the oracle's tables
+//! without the ones of padding rows alone, and every other table as it is.
 
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use executor::vm::logs::Log;
 
+use super::cut_padding_tests::is_today_without_its_padding_tables;
 use super::finish::{FinishPlan, counts_of};
 use super::*;
 use crate::tables::MaxRowsConfig;
@@ -537,4 +540,277 @@ fn the_header_is_the_tables_counts_and_a_wrong_one_is_refused() {
             }
         }
     }
+}
+
+/// The four families a block cuts at a fixed number of rows: each one's
+/// tables in a build and its bus interactions.
+fn cut_families(t: &Traces) -> [(&'static str, &[Table], Vec<stark::lookup::BusInteraction>); 4] {
+    [
+        ("KECCAK", &t.keccaks, keccak::bus_interactions()),
+        ("KECCAK_RND", &t.keccak_rnds, keccak_rnd::bus_interactions()),
+        ("ECSM", &t.ecsms, ecsm::bus_interactions()),
+        ("ECDAS", &t.ecdases, ecdas::bus_interactions()),
+    ]
+}
+
+/// [`contents`] without the four cut families' tables and counts.
+fn contents_but_the_cut_families(t: &Traces) -> Vec<(String, String)> {
+    let cut = ["KECCAK", "KECCAK_RND", "ECSM", "ECDAS"];
+    contents(t)
+        .into_iter()
+        .filter(|(name, _)| {
+            name != "counts"
+                && !cut.iter().any(|family| {
+                    *name == format!("{family} count") || name.starts_with(&format!("{family}["))
+                })
+        })
+        .collect()
+}
+
+/// The block's windowed build with every family cut: KECCAK_RND at 32 rows,
+/// KECCAK, ECSM and ECDAS at `cuts`, wide (`packed` false) or packed, written
+/// packed and with the streamed ops dropped, the cut tables padded as
+/// `padding`.
+fn cut_build(
+    program: &Elf,
+    logs: &[Log],
+    window: usize,
+    cuts: (usize, usize, usize),
+    packed: bool,
+    padding: CutPadding,
+) -> Traces {
+    windowed(program, logs, &MaxRowsConfig::small(), window, &|b| {
+        let b = b
+            .keccak_rnd_chunks_at_finish(32)
+            .expect("rows")
+            .cuts_at_finish(cuts.0, cuts.1, cuts.2)
+            .expect("rows")
+            .cut_padding(padding);
+        if packed {
+            b.pack_finished_tables()
+                .generate_packed()
+                .drop_streamed_ops()
+                .expect("before any window")
+        } else {
+            b
+        }
+    })
+}
+
+/// ★ Cut at the last real row, a windowed build is the frozen build's — which
+/// pads the whole run, whatever the settings say — without the cut families'
+/// tables of padding rows alone: each family's tables are the frozen build's
+/// first ones word for word, every table left out has all its bus
+/// multiplicities at zero, the last one kept holds a real row, and every
+/// other table of the build (BITWISE's counts and KECCAK_RC's among them) is
+/// the frozen build's.
+#[test]
+fn a_build_cut_at_the_last_real_row_is_the_oracles_without_its_padding_tables() {
+    let mut left_out = [0usize; 4];
+    for name in [
+        "all_instructions_64",
+        "test_keccak",
+        "test_keccak_multi",
+        "test_ecsm",
+        "test_ecsm_multi",
+        "test_ecsm_split",
+    ] {
+        let (program, logs) = run(name);
+        for cuts in [(1, 1, 1), (2, 2, 16), (2, 4, 2)] {
+            for (window, packed) in [(7, true), (1000, true), (1000, false)] {
+                let what = format!("{name} cuts {cuts:?} window {window} packed {packed}");
+                let build =
+                    || cut_build(&program, &logs, window, cuts, packed, CutPadding::LastTable);
+                let frozen = oracle(build);
+                let last = build();
+                for (f, ((family, kept, interactions), (_, today, _))) in cut_families(&last)
+                    .into_iter()
+                    .zip(cut_families(&frozen))
+                    .enumerate()
+                {
+                    is_today_without_its_padding_tables(kept, today, &interactions)
+                        .unwrap_or_else(|e| panic!("{what}: {family}: {e}"));
+                    left_out[f] += today.len() - kept.len();
+                }
+                let (a, b) = (
+                    contents_but_the_cut_families(&frozen),
+                    contents_but_the_cut_families(&last),
+                );
+                assert_eq!(a.len(), b.len(), "{what}: the other tables");
+                for ((table, x), (_, y)) in a.iter().zip(&b) {
+                    assert_eq!(x, y, "{what}: {table}");
+                }
+            }
+        }
+    }
+    assert!(
+        left_out.iter().all(|&n| n > 0),
+        "each cut family left a table of padding rows out somewhere: {left_out:?}"
+    );
+}
+
+/// The cut families' tables of a build as (family, tables, rows of each).
+fn cut_shapes(t: &Traces) -> Vec<(&'static str, usize, Vec<usize>)> {
+    cut_families(t)
+        .into_iter()
+        .map(|(family, tables, _)| {
+            (
+                family,
+                tables.len(),
+                tables
+                    .iter()
+                    .map(|table| shape_and_words(table).1)
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// ★ The knob off builds exactly the tables it always built, on two pinned
+/// programs: the type's default and what an unset variable reads as are the
+/// whole run padded, table for table as listed here and word for word the
+/// frozen build's. test_keccak_multi is 3 permutations: 3 KECCAK rows (4
+/// padded) and 72 KECCAK_RND rows (128 padded). test_ecsm_multi is 3 scalar
+/// multiplications: 3 ECSM rows (4 padded) and 42 ECDAS steps (64 padded).
+/// Cut at the last real row the same programs keep the tables with a real row.
+#[test]
+fn the_knob_off_builds_the_whole_runs_tables_on_pinned_programs() {
+    let unset = CutPadding::parse(None).expect("an unset variable");
+    for (name, padding, want) in [
+        (
+            "test_keccak_multi",
+            CutPadding::default(),
+            [
+                ("KECCAK", 2, 2),
+                ("KECCAK_RND", 4, 32),
+                ("ECSM", 0, 0),
+                ("ECDAS", 0, 0),
+            ],
+        ),
+        (
+            "test_keccak_multi",
+            unset,
+            [
+                ("KECCAK", 2, 2),
+                ("KECCAK_RND", 4, 32),
+                ("ECSM", 0, 0),
+                ("ECDAS", 0, 0),
+            ],
+        ),
+        (
+            "test_ecsm_multi",
+            CutPadding::default(),
+            [
+                ("KECCAK", 0, 0),
+                ("KECCAK_RND", 0, 0),
+                ("ECSM", 2, 2),
+                ("ECDAS", 4, 16),
+            ],
+        ),
+        (
+            "test_ecsm_multi",
+            unset,
+            [
+                ("KECCAK", 0, 0),
+                ("KECCAK_RND", 0, 0),
+                ("ECSM", 2, 2),
+                ("ECDAS", 4, 16),
+            ],
+        ),
+        (
+            "test_keccak_multi",
+            CutPadding::LastTable,
+            [
+                ("KECCAK", 2, 2),
+                ("KECCAK_RND", 3, 32),
+                ("ECSM", 0, 0),
+                ("ECDAS", 0, 0),
+            ],
+        ),
+        (
+            "test_ecsm_multi",
+            CutPadding::LastTable,
+            [
+                ("KECCAK", 0, 0),
+                ("KECCAK_RND", 0, 0),
+                ("ECSM", 2, 2),
+                ("ECDAS", 3, 16),
+            ],
+        ),
+    ] {
+        let (program, logs) = run(name);
+        let build = || cut_build(&program, &logs, 1000, (2, 2, 16), true, padding);
+        let built = build();
+        let want: Vec<(&str, usize, Vec<usize>)> = want
+            .into_iter()
+            .map(|(family, tables, rows)| (family, tables, vec![rows; tables]))
+            .collect();
+        assert_eq!(cut_shapes(&built), want, "{name} {padding:?}");
+        if padding == CutPadding::WholeRun {
+            same(&format!("{name} knob off"), &oracle(build), &built);
+        }
+    }
+}
+
+/// The readout's line names the rule and, per cut family, the tables built
+/// and how many of them hold a real row.
+#[test]
+fn the_cut_line_names_the_rule_and_the_tables_with_a_real_row() {
+    let (program, logs) = run("test_keccak_multi");
+    let artifacts = DecodeArtifacts::from_elf(&program).expect("the artifacts");
+    let image = build_initial_image(&program, &[]);
+    let register_init = register::register_init_from_entry_point(program.entry_point);
+    let max_rows = MaxRowsConfig::small();
+    let line = |skip: StreamSkip| {
+        let CollectedEpoch {
+            ops,
+            memory_state,
+            register_state,
+        } = Traces::collect_epoch(&artifacts, &image, &register_init, &logs, true)
+            .expect("collected");
+        FinishPlan::new(
+            ops,
+            Some(&image),
+            &memory_state,
+            &register_init,
+            artifacts.decode_trace.clone(),
+            &artifacts.decode,
+            register_state,
+            &max_rows,
+            #[cfg(feature = "disk-spill")]
+            StorageMode::Ram,
+            &[],
+            true,
+            false,
+            &skip,
+            None,
+        )
+        .expect("the plan")
+        .cut_line()
+        .map(str::to_string)
+    };
+    let cut = |cut_padding| StreamSkip {
+        keccak_rnd_rows: 32,
+        keccak_rows: 1,
+        ecsm_rows: 1,
+        ecdas_rows: 1,
+        cut_padding,
+        ..StreamSkip::default()
+    };
+    assert_eq!(
+        line(cut(CutPadding::WholeRun)).as_deref(),
+        Some(
+            "BLOCK CUT PADDING: the whole run padded, then cut (the default) · tables (of them \
+             with a real row): KECCAK 4 (3) · KECCAK_RND 4 (3) · ECSM 0 (0) · ECDAS 0 (0)"
+        )
+    );
+    assert_eq!(
+        line(cut(CutPadding::LastTable)).as_deref(),
+        Some(
+            "BLOCK CUT PADDING: cut, the last table padded · tables (of them with a real row): \
+             KECCAK 3 (3) · KECCAK_RND 3 (3) · ECSM 0 (0) · ECDAS 0 (0)"
+        )
+    );
+    // A build that cuts nothing has no line.
+    assert_eq!(line(StreamSkip::default()), None);
 }

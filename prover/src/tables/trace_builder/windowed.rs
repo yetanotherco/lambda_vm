@@ -69,10 +69,10 @@ use stark::trace::TraceTable;
 use super::super::gpack::TraceForm;
 use super::super::types::{GoldilocksExtension, GoldilocksField};
 use super::{
-    BlockVec, CollectedOps, DecodeArtifacts, MemoryState, MemwBuckets, PreCounted, RegisterState,
-    RoutedBlocks, StreamSkip, Traces, WalkLean, WalkOutputs, WalkSizes, bitwise, block_len,
-    build_initial_image, build_traces, collect_halt_ops, collect_ops_from_cpu_into, route_ops,
-    route_ops_one_pass,
+    BlockVec, CollectedOps, CutPadding, DecodeArtifacts, MemoryState, MemwBuckets, PreCounted,
+    RegisterState, RoutedBlocks, StreamSkip, Traces, WalkLean, WalkOutputs, WalkSizes, bitwise,
+    block_len, build_initial_image, build_traces, collect_halt_ops, collect_ops_from_cpu_into,
+    route_ops, route_ops_one_pass,
 };
 use crate::Error;
 use crate::tables::decode::DecodeTable;
@@ -164,6 +164,9 @@ pub struct WindowedTraceBuilder<'a> {
     pack_finished: bool,
     /// [`Self::generate_packed`].
     gpack: bool,
+    /// How `finish` pads the tables it cuts ([`CutPadding`]):
+    /// `LAMBDA_VM_BLOCK_CUT_PADDING`'s rule.
+    cut_padding: CutPadding,
     /// The cycles the walker collects and walks at a time ([`walk_batch`]).
     walk_batch: usize,
     /// The last walked window's list lengths, to size the next window's lists
@@ -269,6 +272,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             finish_cut_rows: (0, 0, 0),
             pack_finished: false,
             gpack: false,
+            cut_padding: CutPadding::from_env()?,
             walk_batch: walk_batch(),
             walk_sizes: WalkSizes::default(),
         })
@@ -281,6 +285,14 @@ impl<'a> WindowedTraceBuilder<'a> {
         assert_eq!(self.cycles, 0, "walk_lean after a window was walked");
         self.memory_state.lean = lean.memory;
         self.lean = lean;
+        self
+    }
+
+    /// `finish` pads the tables it cuts as `padding`, whatever
+    /// `LAMBDA_VM_BLOCK_CUT_PADDING` says.
+    #[cfg(test)]
+    pub(crate) fn cut_padding(mut self, padding: CutPadding) -> Self {
+        self.cut_padding = padding;
         self
     }
 
@@ -351,6 +363,8 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// built from the ops that reach it, and packed as it is built with
     /// [`Self::pack_finished_tables`] — instead of one wide table each that the
     /// split then copies apart. The words are the same. Each a power of two.
+    /// Under [`CutPadding::LastTable`], here and for KECCAK_RND's tables, the
+    /// ones of padding rows alone are not built.
     pub fn cuts_at_finish(
         mut self,
         keccak: usize,
@@ -618,6 +632,9 @@ impl<'a> WindowedTraceBuilder<'a> {
             &skip,
             Some(pre),
         )?;
+        if let Some(line) = plan.cut_line() {
+            eprintln!("{line}");
+        }
         let mut send = match on_header(plan.header().clone()) {
             Ok(send) => send,
             Err(e) => {
@@ -673,6 +690,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             finish_cut_rows,
             pack_finished,
             gpack,
+            cut_padding,
             ..
         } = self;
         // Chunks at the finish alone: none were handed out.
@@ -692,6 +710,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             keccak_rows,
             ecsm_rows,
             ecdas_rows,
+            cut_padding,
             ..emitted
         };
         let (ops, decode_trace, skip, pre) = match kept {
