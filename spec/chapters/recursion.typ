@@ -1,4 +1,4 @@
-#import "/meta.typ": et, aside
+#import "/meta.typ": et, aside, rj
 
 // Spaces and instances
 #let (programSpace, program) = ($cal(F)$, $f$)
@@ -10,6 +10,7 @@
 #let (commitmentSpace, commitment) = ($cal(C)$, $bb(c)$)
 #let commit(x) = $dash(#x)$
 #let comm(x) = $commit(#x)$
+#let comm2(x) = $hat(#x)$
 
 #let hash = $H$
 
@@ -238,9 +239,59 @@ The produced proof $proof'$ now attests to $instance in language$ when
 $verify(comm(product(verify_0, verify_1)(comm(instance), dot)), proof') = 1$.
 
 = Split proving
-#et("todo")
+To enable recursion from a split verifier, we start by considering that each part of the split may
+be prove in a different proof system, and with a different commitment scheme.
+For a split verifier $(verify_0, verify_1, d_verify)$ to be recursively proven,
+we will write $comm(x)$ and $comm2(x)$ as the (deterministic) commitments to $x$
+in the proof system of $verify_0$ and $verify_1$ respectively.
 
-= Split-recursion
+If we write $verify'_(b)([c_x, c_w]; w)$ to be an adaptation of $verify_(b)(c_x; w)$ that additionally gives has a public commitment to the private witness,#footnote[
+  In practice for most proof systems, this is already available.
+  For a proof system where it is not available, we let $verify'_(b)$ explicitly verify that this relation holds.
+]
+our goal then becomes to prove the following statements in parallel:
+
+1. $verify'_0([comm(bb(x)), c_0]; [pi, r]) = 1$
+2. $verify'_1([comm2(bb(x)), c_1]; [pi, r]) = 1$
+3. $exists pi, r: comm([pi, r]) = c_0 and comm2([pi, r]) = c_1$
+
+The first two statements would follow naturally from proving $verify_(b)$ or the derived $verify'_(b)$.
+To integrate the last statement, we introduce a "checksum" of the witness, which will be checked by both halves of the split:
+$ verify^*_(b)([x, s]; w) = verify'_(b)(x; w) dot (serif("cksum")(w) =^? s). $
+The choice of checksum function, in turn, can depend on the choice of proof systems.
+We briefly present a few trivial instantiations, before bringing the cost down further.
+
+- $serif("cksum")(x) = serif("Hash")(x)$: compute a hash in both halves, at the cost of needing to evaluate a hash in a proof system that is likely not a good fit for that hash.
+- $serif("cksum")(x) = comm2(x)$: recompute the commitment $comm2(x)$ as part of $verify^*_0$, and let $verify^*_1$ simply check that the checksum equals the public commitment.
+  In practice, this would come at the cost of evaluating a Reed-Solomon blowup over the field of $verify_0$ and computing a merkle tree, both inside $verify^*_0$.
+
+Finally, we consider the instantiation $serif("chsum")(x) = chevron.l x, z chevron.r$ for a random zero-evader $z$.
+This could be implemented by having an additional public input provided to $verify^*_(b)$, or by having $verify^*_(b)$ itself
+derive it from the public inputs and context as a Fiat-Shamir challenge.
+In either case, $z$ should not be known to the (recursion) prover before being bound to $[x, r]$ via its public commitment.
+If the proof systems for the split verifier work over different fields, field emulation would need to happen on one side, with the other using native arithmetic,
+or both sides could target a common target field that is simpler to emulate in both.#footnote[
+  In a practical implementation with flock and the lambda proof system side by side, an inner product in the goldilocks extension field should
+  be possible in a repetitive binary circuit that fits well in flock's model.
+]
+Choices for the structure of $z$ include $z = (alpha_1, alpha_2, alpha_3, ..., alpha_(|x|))$, $z = (1, alpha, alpha^2, ..., alpha^(|x| - 1))$
+or even $z = (alpha_1, alpha_1^2, ..., alpha_1^ell, alpha_2, alpha_2^2, ..., alpha_(lr(|x|)/ell)^ell)$, depending on tradeoffs between
+the verification cost of computing $z$ and the soundness error of the zero-evader.
+Where needed, multiple independent $z$ can be used to amplify soundnes.
+In settings where both $verify^*_(b)$ are in the same proof system, with the same commitment scheme, but different representations of the committed data
+(e.g. representing $pi$ as a sequence of committed bytes and as a sequence of extension field elemens),
+one can even use a permutation argument such as in @logup to check equality of the data.
+
+#aside[Minimizing the length of $z$][
+  A larger $[pi, r]$ comes at a cost --- whether a cost of soundness or a cost of deriving more independent random $alpha_i$ ---
+  and as such should be kept as short as possible.
+  Since values that only one $verify^*_(b)$ reads or writes cannot lead to a differing result, the checksummed data need only
+  be the subsequence of elements of $[pi, r]$ that is read or written by both $verify^*_0$ and $verify^*_1$.
+]
+#rj[Define these as "a recursion split of $verify$" somehow to avoid more notation pain down below?]
+
+= Split recursion
+#rj[Update everything below to match differing commitments]
 With proof recursion and split verification formalized, we now combine both concepts into a unified system.
 To this end, we first introduce the selector function
 $
