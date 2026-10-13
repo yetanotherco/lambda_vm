@@ -1680,8 +1680,9 @@ fn reg_ts_delta_in_range(timestamp: u64, old_ts: u64) -> bool {
 /// Collects bitwise lookups from LT operations (MSB16 and IS_HALFWORD).
 ///
 /// MSB16 and the operand/difference IS_HALFWORD lookups are emitted once per raw
-/// op. The IS_HALF[μ] multiplicity bound is counted over the rows of each
-/// `max_rows_lt` chunk, mirroring `chunk_and_generate_optional`.
+/// op. The IS_BYTE[μ] multiplicity bound (`ARE_BYTES[μ, 0] | 1`) is counted once
+/// per row of each `max_rows_lt` chunk, padding rows included, mirroring
+/// `chunk_and_generate_optional`.
 ///
 /// Returns: Vec of bitwise lookups
 pub(crate) fn collect_bitwise_from_lt(
@@ -1732,13 +1733,16 @@ pub(crate) fn collect_bitwise_from_lt(
         ));
     }
 
-    // IS_BYTE[μ] | μ: each row sends its own μ, μ times (padding sends nothing),
-    // over exactly the rows `generate_lt_trace` builds for each chunk.
+    // IS_BYTE[μ] | 1: every row sends its own μ once, padding rows (μ = 0)
+    // included, over exactly the rows `generate_lt_trace` builds for each chunk.
+    let mu_byte = |v: u64| BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, v as u8);
     for chunk in lt_ops.chunks(max_rows_lt) {
-        for (_, mu) in lt::dedup_lt_rows(chunk) {
-            let op = BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, mu as u8);
-            bitwise_ops.extend(std::iter::repeat_n(op, mu as usize));
-        }
+        let rows = lt::dedup_lt_rows(chunk);
+        bitwise_ops.extend(rows.iter().map(|(_, mu)| mu_byte(*mu)));
+        bitwise_ops.extend(std::iter::repeat_n(
+            mu_byte(0),
+            dedup_padding_rows(rows.len()),
+        ));
     }
 
     bitwise_ops
@@ -1812,16 +1816,22 @@ pub(crate) fn collect_bitwise_from_mul(
     }
 
     // Per-row lookups, over exactly the rows `generate_mul_trace` builds for each
-    // `max_rows_mul` chunk (`chunk_and_generate_optional`): IS_BYTE[μ_lo] and
-    // IS_BYTE[μ_hi] are sent μ_lo / μ_hi times (so padding rows send nothing), and
-    // MSB16 fires once per row whose sign flag is set — a unique signed op spanning two
-    // instances, or split over two rows by `mul::MU_MAX`, is sent once per row.
-    let mu_byte = |v: u64| BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, v as u8);
+    // `max_rows_mul` chunk (`chunk_and_generate_optional`): ARE_BYTES[μ_lo, μ_hi]
+    // (the batched IS_BYTE bounds) once per row, padding rows included as
+    // ARE_BYTES[0, 0], and MSB16 once per row whose sign flag is set — a unique
+    // signed op spanning two instances, or split over two rows by `mul::MU_MAX`, is
+    // sent once per row.
+    let mu_bytes = |a: u64, b: u64| {
+        BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, a as u8, b as u8)
+    };
     for chunk in mul_ops.chunks(max_rows_mul) {
-        for (op, mu) in &mul::dedup_mul_rows(chunk) {
-            for m in [mu.mu_lo, mu.mu_hi] {
-                bitwise_ops.extend(std::iter::repeat_n(mu_byte(m), m as usize));
-            }
+        let rows = mul::dedup_mul_rows(chunk);
+        bitwise_ops.extend(std::iter::repeat_n(
+            mu_bytes(0, 0),
+            dedup_padding_rows(rows.len()),
+        ));
+        for (op, mu) in &rows {
+            bitwise_ops.push(mu_bytes(mu.mu_lo, mu.mu_hi));
             if op.lhs_signed {
                 let lhs_3 = ((op.lhs >> 48) & 0xFFFF) as u16;
                 bitwise_ops.push(BitwiseOperation::halfword(
@@ -1944,17 +1954,23 @@ pub(crate) fn collect_bitwise_from_dvrm(
     }
 
     // Per-row lookups, over exactly the rows `generate_dvrm_trace` builds for each
-    // `max_rows_dvrm` chunk (`chunk_and_generate_optional`): IS_BYTE[μ_q] and
-    // IS_BYTE[μ_r] sent μ_q / μ_r times (padding rows send nothing); MSB16 (Column(SIGNED))
+    // `max_rows_dvrm` chunk (`chunk_and_generate_optional`): ARE_BYTES[μ_q, μ_r] (the
+    // batched IS_BYTE bounds) once per row, padding rows included as
+    // ARE_BYTES[0, 0]; MSB16 (Column(SIGNED))
     // and the NEG-template ZERO lookups (Column(SIGN_R)/Column(SIGN_D)) once per
     // row whose bit is set. An op split over two rows by `dvrm::MU_MAX` sends
     // them once per row.
-    let mu_byte = |v: u64| BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, v as u8);
+    let mu_bytes = |a: u64, b: u64| {
+        BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, a as u8, b as u8)
+    };
     for chunk in dvrm_ops.chunks(max_rows_dvrm) {
-        for (op, mu) in &dvrm::dedup_dvrm_rows(chunk) {
-            for m in [mu.mu_q, mu.mu_r] {
-                bitwise_ops.extend(std::iter::repeat_n(mu_byte(m), m as usize));
-            }
+        let rows = dvrm::dedup_dvrm_rows(chunk);
+        bitwise_ops.extend(std::iter::repeat_n(
+            mu_bytes(0, 0),
+            dedup_padding_rows(rows.len()),
+        ));
+        for (op, mu) in &rows {
+            bitwise_ops.push(mu_bytes(mu.mu_q, mu.mu_r));
 
             if op.signed {
                 let r = op.compute_remainder();
@@ -2041,18 +2057,12 @@ pub(crate) fn collect_bitwise_from_branch(
         let next_pc_unmasked = op.compute_next_pc_unmasked();
 
         // Extract next_pc components
-        let _next_pc_low_0 = (next_pc & 0xFF) as u8; // Used by constraint, not lookup
-        let next_pc_low_1 = ((next_pc >> 8) & 0xFF) as u8;
+        // next_pc_low[0] is fixed by the BYTE_ALU AND below; next_pc_low[1] is
+        // range-checked per row with the μ bound (ARE_BYTES[μ, next_pc_low[1]]).
         let next_pc_high_0 = ((next_pc >> 16) & 0xFFFF) as u16;
         let next_pc_high_1 = ((next_pc >> 32) & 0xFFFF) as u16;
         let next_pc_high_2 = ((next_pc >> 48) & 0xFFFF) as u16;
         let unmasked_low_byte = (next_pc_unmasked & 0xFF) as u8;
-
-        // ARE_BYTES[next_pc_low[1], 0] - range check for byte value
-        bitwise_ops.push(BitwiseOperation::single_byte(
-            BitwiseOperationType::AreBytes,
-            next_pc_low_1,
-        ));
 
         // BYTE_ALU[AND, unmasked_low_byte, 254] → next_pc_low[0]
         // Verifies: next_pc_low[0] = unmasked_low_byte & 0xFE
@@ -2084,16 +2094,32 @@ pub(crate) fn collect_bitwise_from_branch(
         ));
     }
 
-    // IS_BYTE[μ] | μ: each row sends its own μ, μ times (padding sends nothing),
-    // over exactly the rows `generate_branch_trace` builds for each chunk.
+    // ARE_BYTES[μ, next_pc_low[1]] | 1 (the batched IS_BYTE bounds): every row
+    // sends it once, padding rows included as ARE_BYTES[0, 0], over exactly the
+    // rows `generate_branch_trace` builds for each chunk.
+    let row_bytes = |mu: u64, low_1: u8| {
+        BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, mu as u8, low_1)
+    };
     for chunk in branch_ops.chunks(max_rows_branch) {
-        for (_, mu) in branch::dedup_branch_rows(chunk) {
-            let op = BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, mu as u8);
-            bitwise_ops.extend(std::iter::repeat_n(op, mu as usize));
-        }
+        let rows = branch::dedup_branch_rows(chunk);
+        bitwise_ops.extend(
+            rows.iter()
+                .map(|(op, mu)| row_bytes(*mu, ((op.compute_next_pc() >> 8) & 0xFF) as u8)),
+        );
+        bitwise_ops.extend(std::iter::repeat_n(
+            row_bytes(0, 0),
+            dedup_padding_rows(rows.len()),
+        ));
     }
 
     bitwise_ops
+}
+
+/// Padding rows of a deduplicated chip instance (LT, MUL, DVRM, BRANCH, BYTEWISE)
+/// with `rows` real rows: their `generate_*_trace` pads to `next_power_of_two().max(4)`.
+/// Their μ bound is sent with multiplicity 1, so each padding row sends it too.
+fn dedup_padding_rows(rows: usize) -> usize {
+    rows.next_power_of_two().max(4) - rows
 }
 
 /// Generates ARE_BYTES ops for CPU padding rows.
@@ -3348,17 +3374,18 @@ fn build_traces<I: ImageSource + Sync>(
             for op in &bytewise_ops {
                 h.add_ops(&op.collect_bitwise_ops());
             }
-            // IS_BYTE[μ] | μ: each dedup row sends its own μ, μ times (padding
-            // sends nothing), over exactly the rows `generate_bytewise_trace`
-            // builds for each chunk. Mirrors the LT/MUL/DVRM/BRANCH bound.
+            // IS_BYTE[μ] | 1: every row sends its own μ once, padding rows (μ = 0)
+            // included, over exactly the rows `generate_bytewise_trace` builds for
+            // each chunk. Mirrors the LT/MUL/DVRM/BRANCH bound.
             // `.max(1)`: `chunks(0)` panics, and `bytewise_chunk` is an
             // externally supplied row cap that could be 0.
+            let mu_byte =
+                |v: u64| BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, v as u8);
             for chunk in bytewise_ops.chunks(bytewise_chunk.max(1)) {
-                for (_, mu) in bytewise::dedup_bytewise_rows(chunk) {
-                    let op =
-                        BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, mu as u8);
-                    h.add_ops(&std::iter::repeat_n(op, mu as usize).collect::<Vec<_>>());
-                }
+                let rows = bytewise::dedup_bytewise_rows(chunk);
+                let ops: Vec<_> = rows.iter().map(|(_, mu)| mu_byte(*mu)).collect();
+                h.add_ops(&ops);
+                h.bump_n(mu_byte(0), dedup_padding_rows(rows.len()) as u64);
             }
         }),
         Box::new(|h| {
@@ -3373,7 +3400,15 @@ fn build_traces<I: ImageSource + Sync>(
         }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
+        Box::new(|h| {
+            h.add_ops(&collect_bitwise_from_keccak(&keccak_ops));
+            // KECCAK_RND's byte checks have multiplicity 1, so its padding rows
+            // (all cells 0) send ARE_BYTES[0, 0] too.
+            h.bump_n(
+                BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, 0, 0),
+                keccak_rnd::padding_are_bytes(keccak_ops.len()),
+            );
+        }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),

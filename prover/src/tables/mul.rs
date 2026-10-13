@@ -283,17 +283,14 @@ impl MulOperation {
 // =========================================================================
 
 /// Largest per-row multiplicity: `μ_lo` and `μ_hi` are each range-checked to a
-/// byte (`IS_BYTE[μ]`, weighted by μ), so a row holds at most this many
-/// lookups of each kind. The bound is what makes `μ_lo + μ_hi = 0` imply
-/// `μ_lo = μ_hi = 0`: without it a `μ_lo = 1, μ_hi = −1` row receives a lookup
+/// byte by `IS_BYTE[μ_lo]` and `IS_BYTE[μ_hi]`, batched into one
+/// `ARE_BYTES[μ_lo, μ_hi]` with multiplicity 1 (the spec's default `cond`), so a
+/// row holds at most this many lookups of each kind. The bound is what makes
+/// `μ_lo + μ_hi = 0` imply `μ_lo = μ_hi = 0`: without it a `μ_lo = 1, μ_hi = −1`
+/// row receives a lookup
 /// while sending none of its range checks.
 ///
-/// The bound rides the ARE_BYTES bus, which the limb range checks
-/// (IS_HALFWORD) never use. That is what closes it: an IS_HALFWORD-bus
-/// bound could be cancelled by a non-canonical limb `(p−1, b+1)` (same
-/// packed value, passes every constraint) sending `IS_HALFWORD[p−1]`;
-/// on ARE_BYTES no limb can reach the `p−1` tuple, so a `μ = −1` row's
-/// bound send has no receiver and the whole proof is rejected.
+/// See `lt::MU_MAX` for why the bound is sent with multiplicity 1 rather than μ.
 pub const MU_MAX: u64 = (1 << 8) - 1;
 
 /// Deduplicates MUL operations into trace rows: `(lhs, lhs_signed, rhs,
@@ -393,7 +390,7 @@ pub fn generate_mul_trace(
 /// The MUL table:
 /// - **Sends** MSB16 lookups for sign bit extraction (×2)
 /// - **Sends** IS_HALF lookups for lhs/rhs input and lo/hi output range checks (×16)
-/// - **Sends** ARE_BYTES[μ_lo, 0] and ARE_BYTES[μ_hi, 0] to bound the multiplicities
+/// - **Sends** ARE_BYTES[μ_lo, μ_hi] to bound the multiplicities
 /// - **Sends** IS_B20 lookups for carry range checks (×4)
 /// - **Receives** MUL lookups from CPU table (×2: lo and hi)
 pub fn bus_interactions() -> Vec<BusInteraction> {
@@ -435,29 +432,28 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // ARE_BYTES[μ_lo, 0] | μ_lo,  ARE_BYTES[μ_hi, 0] | μ_hi.
+    // IS_BYTE[μ_lo], IS_BYTE[μ_hi] = ARE_BYTES[μ_lo, μ_hi] | 1.
     // Every check below fires with μ_lo + μ_hi, so the multiplicities themselves
     // must be bounded and non-negative. Otherwise μ_lo = 1, μ_hi = −1 receives a
     // `lo` lookup with all range checks off (forged product),
-    // and an honest μ_hi = 1 copy of the row cancels the stray −1. Each μ is sent
-    // with itself as multiplicity: `k` rows holding an out-of-range value `v`
-    // put weight `k·v ≠ 0` on a byte tuple ARE_BYTES has no row for, while padding
-    // (μ = 0) contributes nothing, so an empty instance still matches an absent
-    // one. See `MU_MAX`.
+    // and an honest μ_hi = 1 copy of the row cancels the stray −1.
+    // Both checks share the spec's default `cond` (1), so they batch into one
+    // interaction; padding rows send ARE_BYTES[0, 0]. See `MU_MAX`.
     // -------------------------------------------------------------------------
-    for col in [cols::MU_LO, cols::MU_HI] {
-        interactions.push(BusInteraction::sender(
-            BusId::AreBytes,
-            Multiplicity::Column(col),
-            vec![
-                BusValue::Packed {
-                    start_column: col,
-                    packing: Packing::Direct,
-                },
-                BusValue::constant(0),
-            ],
-        ));
-    }
+    interactions.push(BusInteraction::sender(
+        BusId::AreBytes,
+        Multiplicity::One,
+        vec![
+            BusValue::Packed {
+                start_column: cols::MU_LO,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::MU_HI,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
 
     // -------------------------------------------------------------------------
     // IS_HALF lookups for lhs/rhs INPUT range checks (multiplicity: mu_lo + mu_hi).

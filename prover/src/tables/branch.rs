@@ -150,18 +150,18 @@ impl BranchOperation {
     }
 }
 
-/// Largest per-row multiplicity: `μ` is range-checked to a byte
-/// (`IS_BYTE[μ]`, weighted by μ), so a row holds at most this many lookups. The
-/// bound keeps μ non-negative: without it a `μ = −1` twin of an honest row
-/// cancels it on the BRANCH bus while *receiving* its range lookups, absorbing
-/// another row's out-of-range limb (same bug as LT).
+/// Largest per-row multiplicity: `μ` is range-checked to a byte by `IS_BYTE[μ]`,
+/// batched with `IS_BYTE[next_pc_low_1]` into one `ARE_BYTES[μ, next_pc_low_1]`
+/// with multiplicity 1 (the spec's default `cond`), so a row holds at most this
+/// many lookups. The bound keeps μ non-negative: without it a `μ = −1` twin of
+/// an honest row cancels it on the BRANCH bus while *receiving* its range
+/// lookups, absorbing another row's out-of-range limb (same bug as LT).
 ///
-/// The bound rides the ARE_BYTES bus, which the limb range checks
-/// (IS_HALFWORD) never use. That is what closes it: an IS_HALFWORD-bus
-/// bound could be cancelled by a non-canonical limb `(p−1, b+1)` (same
-/// packed value, passes every constraint) sending `IS_HALFWORD[p−1]`;
-/// on ARE_BYTES no limb can reach the `p−1` tuple, so a `μ = −1` row's
-/// bound send has no receiver and the whole proof is rejected.
+/// `next_pc_low_1` is only constrained packed (`low0 + 2^8·low1 + 2^16·high0`),
+/// so its byte check must not be weighted by μ either: with weight μ a row with
+/// μ < 0 and `low1 = p−1` cancels its own (or another table's) bound on
+/// `(p−1, 0)` (`branch_carrier_poc::lt_forgery_with_branch_cycle_is_rejected`).
+/// See `lt::MU_MAX`.
 pub const MU_MAX: u64 = (1 << 8) - 1;
 
 /// Deduplicates BRANCH operations into trace rows: `(pc, offset, register,
@@ -249,24 +249,34 @@ pub fn generate_branch_trace(
 /// Creates all bus interactions for the BRANCH table.
 ///
 /// The BRANCH table:
-/// - **Sends** ARE_BYTES lookup for next_pc_low[1] range check (Y=0)
+/// - **Sends** ARE_BYTES[μ, next_pc_low[1]]: the μ bound and the next_pc_low[1]
+///   range check, batched (both have multiplicity 1)
 /// - **Sends** BYTE_ALU[AND] lookup for LSB masking
 ///   (next_pc_low[0] = unmasked_low_byte & 254)
 /// - **Sends** IS_HALFWORD lookups for next_pc_high[0..3] range checks and for
-///   (next_pc_high limbs); ARE_BYTES for the μ multiplicity bound
+///   (next_pc_high limbs)
 /// - **Receives** BRANCH lookups from CPU table
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
-        // ARE_BYTES[next_pc_low[1], 0] - range check bits 8-15
+        // IS_BYTE[μ], IS_BYTE[next_pc_low[1]] = ARE_BYTES[μ, next_pc_low[1]] | 1.
+        // Every lookup here fires with μ, so μ itself must be bounded and
+        // non-negative. Otherwise a μ = −1 twin of an honest row cancels it on
+        // the BRANCH bus while *receiving* its range lookups and absorbs an
+        // out-of-range IS_HALFWORD sent by any row (same as LT). Both checks
+        // have the spec's default `cond` (1), so they batch into one
+        // interaction; padding rows send ARE_BYTES[0, 0]. See `MU_MAX`.
         BusInteraction::sender(
             BusId::AreBytes,
-            Multiplicity::Column(cols::MU),
+            Multiplicity::One,
             vec![
+                BusValue::Packed {
+                    start_column: cols::MU,
+                    packing: Packing::Direct,
+                },
                 BusValue::Packed {
                     start_column: cols::NEXT_PC_LOW_1,
                     packing: Packing::Direct,
                 },
-                BusValue::constant(0),
             ],
         ),
         // BYTE_ALU[next_pc_low[0]; AND, unmasked_low_byte, 254]
@@ -313,24 +323,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::NEXT_PC_HIGH_2,
                 packing: Packing::Direct,
             }],
-        ),
-        // ARE_BYTES[μ, 0] | μ. Every lookup here fires with μ, so μ itself must be
-        // bounded and non-negative. Otherwise a μ = −1 twin of an honest row
-        // cancels it on the BRANCH bus while *receiving* its range lookups and
-        // absorbs an out-of-range IS_HALFWORD sent by any row (same as LT). Sent
-        // with itself as multiplicity: `k` rows holding an out-of-range `v` put
-        // weight `k·v ≠ 0` on a byte tuple ARE_BYTES has no row for, while padding
-        // (μ = 0) contributes nothing. See `MU_MAX`.
-        BusInteraction::sender(
-            BusId::AreBytes,
-            Multiplicity::Column(cols::MU),
-            vec![
-                BusValue::Packed {
-                    start_column: cols::MU,
-                    packing: Packing::Direct,
-                },
-                BusValue::constant(0),
-            ],
         ),
         // BRANCH[next_pc; pc, offset, register, JALR] (receiver)
         // Signature: [next_pc (DWordWL), pc (DWordWL), offset (DWordWL), register (DWordWL), JALR (Bit)]

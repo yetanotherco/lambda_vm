@@ -275,17 +275,14 @@ impl DvrmOperation {
 // =========================================================================
 
 /// Largest per-row multiplicity: `μ_q` and `μ_r` are each range-checked to a
-/// byte (`IS_BYTE[μ]`, weighted by μ), so a row holds at most this many
-/// lookups of each kind. The bound is what makes `μ_q + μ_r = 0` imply
-/// `μ_q = μ_r = 0`: without it a `μ_q = 1, μ_r = −1` row receives a quotient
+/// byte by `IS_BYTE[μ_q]` and `IS_BYTE[μ_r]`, batched into one
+/// `ARE_BYTES[μ_q, μ_r]` with multiplicity 1 (the spec's default `cond`), so a
+/// row holds at most this many lookups of each kind. The bound is what makes
+/// `μ_q + μ_r = 0` imply `μ_q = μ_r = 0`: without it a `μ_q = 1, μ_r = −1`
+/// row receives a quotient
 /// lookup while sending none of its checks (forged `n = q·d + r`).
 ///
-/// The bound rides the ARE_BYTES bus, which the limb range checks
-/// (IS_HALFWORD) never use. That is what closes it: an IS_HALFWORD-bus
-/// bound could be cancelled by a non-canonical limb `(p−1, b+1)` (same
-/// packed value, passes every constraint) sending `IS_HALFWORD[p−1]`;
-/// on ARE_BYTES no limb can reach the `p−1` tuple, so a `μ = −1` row's
-/// bound send has no receiver and the whole proof is rejected.
+/// See `lt::MU_MAX` for why the bound is sent with multiplicity 1 rather than μ.
 pub const MU_MAX: u64 = (1 << 8) - 1;
 
 /// Deduplicates DVRM operations into trace rows: `(n, d, signed) -> (μ_q, μ_r)`,
@@ -392,7 +389,7 @@ pub fn generate_dvrm_trace(
 ///
 /// The DVRM table:
 /// - **Sends** IS_HALF lookups for n, d, q, r, n_sub_r range checks (×20)
-/// - **Sends** ARE_BYTES[μ_q, 0] and ARE_BYTES[μ_r, 0] to bound the multiplicities
+/// - **Sends** ARE_BYTES[μ_q, μ_r] to bound the multiplicities
 /// - **Sends** MSB16 lookups for sign extraction (×3: n, d, r)
 /// - **Sends** LT lookup for |r| < |d| (×1)
 /// - **Sends** MUL lookups for n_sub_r = d * q verification (×2: lo and hi)
@@ -402,29 +399,28 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::new();
 
     // -------------------------------------------------------------------------
-    // ARE_BYTES[μ_q, 0] | μ_q,  ARE_BYTES[μ_r, 0] | μ_r.
+    // IS_BYTE[μ_q], IS_BYTE[μ_r] = ARE_BYTES[μ_q, μ_r] | 1.
     // Every check below fires with μ_q + μ_r, so the multiplicities themselves
     // must be bounded and non-negative. Otherwise μ_q = 1, μ_r = −1 receives a
     // quotient lookup with all checks off (forged quotient),
-    // and an honest μ_r = 1 copy of the row cancels the stray −1. Each μ is sent
-    // with itself as multiplicity: `k` rows holding an out-of-range value `v`
-    // put weight `k·v ≠ 0` on a byte tuple ARE_BYTES has no row for, while padding
-    // (μ = 0) contributes nothing, so an empty instance still matches an absent
-    // one. See `MU_MAX`.
+    // and an honest μ_r = 1 copy of the row cancels the stray −1.
+    // Both checks share the spec's default `cond` (1), so they batch into one
+    // interaction; padding rows send ARE_BYTES[0, 0]. See `MU_MAX`.
     // -------------------------------------------------------------------------
-    for col in [cols::MU_Q, cols::MU_R] {
-        interactions.push(BusInteraction::sender(
-            BusId::AreBytes,
-            Multiplicity::Column(col),
-            vec![
-                BusValue::Packed {
-                    start_column: col,
-                    packing: Packing::Direct,
-                },
-                BusValue::constant(0),
-            ],
-        ));
-    }
+    interactions.push(BusInteraction::sender(
+        BusId::AreBytes,
+        Multiplicity::One,
+        vec![
+            BusValue::Packed {
+                start_column: cols::MU_Q,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::MU_R,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
 
     // -------------------------------------------------------------------------
     // DVRM-A1.i: IS_HALF[n[i]] (×4) and DVRM-A2.i: IS_HALF[d[i]] (×4),

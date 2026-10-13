@@ -1,12 +1,11 @@
 //! Adversarial check of the MUL `μ` bound (`fix/multiplicity-soundness`).
 //!
-//! The fix bounds `μ_lo`/`μ_hi` with `IS_HALF[μ]` weighted *by μ itself*
-//! (`Multiplicity::Column`), because the skip-empty-tables invariant (#977)
-//! forbids a constant `Multiplicity::One` on an optional table. The open
-//! question (raised reviewing BRANCH): does weighting by μ leave a hole that
-//! `One` would not? A malicious `μ_hi = −1` row's bound send lands at value
-//! `p−1` with weight `p−1 = −1`; the proof then balances iff *something else*
-//! supplies `+1` at `p−1` on the IS_HALFWORD bus.
+//! The fix bounds `μ_lo`/`μ_hi` with one `ARE_BYTES[μ_lo, μ_hi]` with
+//! multiplicity 1 (spec #1017). Its first version was `IS_HALF[μ]` weighted *by
+//! μ itself*: a malicious `μ_hi = −1` row's bound send then landed at value
+//! `p−1` with weight `p−1 = −1`, and the proof balanced iff *something else*
+//! supplied `+1` at `p−1` on the IS_HALFWORD bus. Now the bound sends `+1` at
+//! `(1, p−1)`, which only a negative-weight ARE_BYTES sender could cancel.
 //!
 //! This test pins down exactly that, with the real fixed MUL AIR and real bus
 //! balance. Every surrounding table is a faithful mock built by evaluating
@@ -162,7 +161,14 @@ fn prove_and_verify(rows: &[Vec<FE>], extra_half: Option<u64>) -> bool {
     let b20: u64 = BusId::IsB20.into();
     let byte: u64 = BusId::AreBytes.into();
 
-    let net = mul_net(rows);
+    // The μ bound has multiplicity 1, so MUL's all-zero padding rows send
+    // ARE_BYTES[0, 0] too: tally the padded instance, not just `rows`.
+    let mut padded = rows.to_vec();
+    padded.resize(
+        rows.len().next_power_of_two().max(4),
+        vec![FE::zero(); cols::NUM_COLUMNS],
+    );
+    let net = mul_net(&padded);
     let mut cpu = Vec::new();
     let mut range = Vec::new();
     let mut range20 = Vec::new();
@@ -181,8 +187,8 @@ fn prove_and_verify(rows: &[Vec<FE>], extra_half: Option<u64>) -> bool {
             }
         } else if *bus == b20 && tuple[0] < B20 {
             range20.push((tuple.clone(), *m));
-        } else if *bus == byte && tuple[0] < 256 {
-            // μ bound: ARE_BYTES[μ, 0]; a real byte table has rows only for [0,256).
+        } else if *bus == byte && tuple[0] < 256 && tuple[1] < 256 {
+            // μ bound: ARE_BYTES[μ_lo, μ_hi]; a real byte table has rows only for [0,256)².
             arebytes.push((tuple.clone(), *m));
         }
     }
@@ -247,9 +253,9 @@ fn control_honest_mul_verifies() {
     assert!(prove_and_verify(&[row], None));
 }
 
-/// The twin's `μ_hi = −1` bound now lands on ARE_BYTES, not IS_HALFWORD: it
-/// leaves a `−1` at `ARE_BYTES[p−1]` (out of byte range, no receiver), which is
-/// why an IS_HALFWORD carrier cannot cancel it. The IS_HALFWORD bus carries no
+/// The twin's `μ_hi = −1` bound lands on ARE_BYTES, not IS_HALFWORD: it leaves a
+/// `+1` at `ARE_BYTES[1, p−1]` (out of byte range, no receiver), which is why an
+/// IS_HALFWORD carrier cannot cancel it. The IS_HALFWORD bus carries no
 /// out-of-range residue from the bound.
 #[test]
 fn forgery_bound_residue_is_on_are_bytes() {
@@ -257,10 +263,10 @@ fn forgery_bound_residue_is_on_are_bytes() {
     let byte: u64 = BusId::AreBytes.into();
     let net = mul_net(&forged_mul_rows());
 
-    // The μ bound's out-of-range residue is on ARE_BYTES[p−1] with weight −1.
+    // The μ bound's out-of-range residue is on ARE_BYTES[1, p−1] with weight +1.
     assert_eq!(
-        net.get(&(byte, vec![minus_one(), 0])).copied(),
-        Some(-FE::one())
+        net.get(&(byte, vec![1, minus_one()])).copied(),
+        Some(FE::one())
     );
     // No out-of-range IS_HALFWORD send comes from the μ bound any more.
     for ((bus, tuple), m) in &net {
@@ -279,7 +285,7 @@ fn forgery_without_carrier_is_rejected() {
 /// Regression: the μ bound now lives on ARE_BYTES, a bus the `lo`/`hi` limb
 /// range checks (IS_HALFWORD) never touch. So an IS_HALFWORD carrier at `p−1`
 /// can no longer cancel the twin's `μ_hi = −1` bound send (it lands on
-/// ARE_BYTES[p−1], out of byte range, with no receiver). The forgery is
+/// ARE_BYTES[1, p−1], out of byte range, with no receiver). The forgery is
 /// rejected even WITH the carrier.
 #[test]
 fn is_halfword_carrier_no_longer_defeats_byte_bound() {

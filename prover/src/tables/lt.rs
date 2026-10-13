@@ -153,18 +153,19 @@ impl LtOperation {
     }
 }
 
-/// Largest per-row multiplicity: `μ` is range-checked to a byte
-/// (`IS_BYTE[μ]`, weighted by μ), so a row holds at most this many lookups. The
-/// bound is what keeps μ non-negative: without it a `μ = −1` twin of an honest
-/// row cancels it on the ALU bus while *receiving* its range lookups, which
-/// absorbs another row's out-of-range limb (a forged `5 < 3 = 1` verified).
+/// Largest per-row multiplicity: `μ` is range-checked to a byte by `IS_BYTE[μ]`
+/// (`ARE_BYTES[μ, 0]` with multiplicity 1, the spec's default `cond`), so a row
+/// holds at most this many lookups. The bound is what keeps μ non-negative:
+/// without it a `μ = −1` twin of an honest row cancels it on the ALU bus while
+/// *receiving* its range lookups, which absorbs another row's out-of-range limb
+/// (a forged `5 < 3 = 1` verified).
 ///
-/// The bound rides the ARE_BYTES bus, which the limb range checks
-/// (IS_HALFWORD) never use. That is what closes it: an IS_HALFWORD-bus
-/// bound could be cancelled by a non-canonical limb `(p−1, b+1)` (same
-/// packed value, passes every constraint) sending `IS_HALFWORD[p−1]`;
-/// on ARE_BYTES no limb can reach the `p−1` tuple, so a `μ = −1` row's
-/// bound send has no receiver and the whole proof is rejected.
+/// The bound is sent with multiplicity 1, not μ. A `μ < 0` row then leaves `+1`
+/// on an out-of-range tuple, which nothing can cancel as long as no ARE_BYTES
+/// sender carries a negative weight (each one is `1` or a bit-constrained μ).
+/// Weighted by μ, the bound was itself that negative weight, and a real BRANCH
+/// row with a non-canonical `next_pc_low_1 = p−1` cancelled it
+/// (`branch_carrier_poc`).
 pub const MU_MAX: u64 = (1 << 8) - 1;
 
 /// Deduplicates LT operations into trace rows: `(lhs, rhs, signed, invert) -> μ`,
@@ -337,17 +338,16 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             }],
         ),
-        // ARE_BYTES[μ, 0] | μ. Every lookup here fires with μ, so μ itself must be
-        // bounded and non-negative. Otherwise a μ = −1 twin of an honest row
-        // cancels it on the ALU bus while *receiving* its range lookups, with
-        // `sub_0` free up to 2^32: it absorbs an out-of-range IS_HALFWORD sent
-        // by any row, another LT row included (forged `5 < 3 = 1`). Sent with
-        // itself as multiplicity: `k` rows holding an out-of-range `v` put
-        // weight `k·v ≠ 0` on a byte tuple ARE_BYTES has no row for, while padding
-        // (μ = 0) contributes nothing. See `MU_MAX`.
+        // IS_BYTE[μ] = ARE_BYTES[μ, 0] | 1. Every lookup here fires with μ, so μ
+        // itself must be bounded and non-negative. Otherwise a μ = −1 twin of an
+        // honest row cancels it on the ALU bus while *receiving* its range
+        // lookups, with `sub_0` free up to 2^32: it absorbs an out-of-range
+        // IS_HALFWORD sent by any row, another LT row included (forged
+        // `5 < 3 = 1`). Multiplicity 1 (the spec's default `cond`), so padding
+        // rows send ARE_BYTES[0, 0] too. See `MU_MAX`.
         BusInteraction::sender(
             BusId::AreBytes,
-            Multiplicity::Column(cols::MU),
+            Multiplicity::One,
             vec![
                 BusValue::Packed {
                     start_column: cols::MU,

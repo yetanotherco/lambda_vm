@@ -90,12 +90,12 @@ impl BytewiseOperation {
     }
 }
 
-/// Generates the BYTEWISE trace from a list of operations.
-///
-/// Largest per-row multiplicity: `μ` is range-checked to a byte on the ARE_BYTES
-/// bus (`IS_BYTE[μ]`, weighted by μ), so a row holds at most this many lookups.
-/// The bound keeps μ non-negative: without it a `μ = −1` row inverts its byte
-/// range checks and can hold an out-of-range byte (carrier). See [`dedup_bytewise_rows`].
+/// Largest per-row multiplicity: `μ` is range-checked to a byte by `IS_BYTE[μ]`
+/// (`ARE_BYTES[μ, 0]` with multiplicity 1, the spec's default `cond`), so a row
+/// holds at most this many lookups. The bound keeps μ non-negative: without it a
+/// `μ = −1` row inverts its byte range checks and can hold an out-of-range byte
+/// (carrier). See [`dedup_bytewise_rows`] and `lt::MU_MAX` for why the bound is
+/// sent with multiplicity 1 rather than μ.
 pub const MU_MAX: u64 = (1 << 8) - 1;
 
 /// Deduplicates BYTEWISE operations into trace rows: `op -> μ`, splitting an op
@@ -120,6 +120,8 @@ pub fn dedup_bytewise_rows(operations: &[BytewiseOperation]) -> Vec<(BytewiseOpe
     rows
 }
 
+/// Generates the BYTEWISE trace from a list of operations.
+///
 /// Duplicate operations are merged with summed multiplicities (split at
 /// [`MU_MAX`]), then padded to the next power of two (minimum 4).
 pub fn generate_bytewise_trace(
@@ -183,13 +185,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // ARE_BYTES[μ, 0] | μ. Bounds μ to a byte and keeps it non-negative: the eight
-    // BYTE_ALU sends above are weighted by μ, so a free μ = −1 would invert them
-    // and let the row hold an out-of-range byte. The bound rides ARE_BYTES with
-    // value = weight = μ, so a μ = −1 row lands at `(p−1, 0)` with no receiver.
+    // IS_BYTE[μ] = ARE_BYTES[μ, 0] | 1. Bounds μ to a byte and keeps it
+    // non-negative: the eight BYTE_ALU sends above are weighted by μ, so a free
+    // μ = −1 would invert them and let the row hold an out-of-range byte.
+    // Multiplicity 1 (the spec's default `cond`), so padding rows send
+    // ARE_BYTES[0, 0] too. See `MU_MAX`.
     interactions.push(BusInteraction::sender(
         BusId::AreBytes,
-        Multiplicity::Column(cols::MU),
+        Multiplicity::One,
         vec![
             BusValue::Packed {
                 start_column: cols::MU,

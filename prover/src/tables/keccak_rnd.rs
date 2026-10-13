@@ -238,6 +238,22 @@ fn hwsl(halfword: u16, shift: u8) -> (u16, u16) {
     }
 }
 
+/// `ARE_BYTES` sends per KECCAK_RND row: 20 `Cxz_left` pairs and 200
+/// `(rot_left, rot_right)` pairs. The spec gives these byte checks no `cond`
+/// (default 1, spec #1017 256e3970b), so they fire on padding rows too, where
+/// every cell is 0: each padding row sends `ARE_BYTES[0, 0]` this many times.
+pub const ARE_BYTES_PER_ROW: usize = 20 + 200;
+
+/// `ARE_BYTES[0, 0]` lookups sent by the padding rows of the KECCAK_RND table
+/// built for `num_ops` keccak calls (none when the table is absent).
+pub fn padding_are_bytes(num_ops: usize) -> u64 {
+    if num_ops == 0 {
+        return 0;
+    }
+    let rows = num_ops * 24;
+    ((rows.next_power_of_two().max(4) - rows) * ARE_BYTES_PER_ROW) as u64
+}
+
 #[allow(clippy::needless_range_loop)]
 /// Generate the KECCAK_RND trace table.
 ///
@@ -604,11 +620,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // byte pairs (z=2i, z=2i+1) into ARE_BYTES interactions per the
     // implementation guidance in spec/is_byte.typ.
     // Cxz_right uses IS_BIT polynomial constraints (see `KeccakRndConstraints`).
+    // Multiplicity 1 (the spec's default `cond`, see `ARE_BYTES_PER_ROW`).
     for x in 0..5 {
         for i in 0..4 {
             interactions.push(BusInteraction::sender(
                 BusId::AreBytes,
-                Multiplicity::Column(cols::MU),
+                Multiplicity::One,
                 vec![
                     BusValue::Packed {
                         start_column: cols::cxz_left(x, 2 * i),
@@ -692,12 +709,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // --- Rho: ARE_BYTES range checks on rot_left + rot_right (200 pairs) ---
     // Spec emits 400 IS_BYTE templates (200 per side); we merge each
     // (rot_left[x][y][b], rot_right[x][y][b]) into one ARE_BYTES interaction.
+    // Multiplicity 1 (the spec's default `cond`, see `ARE_BYTES_PER_ROW`).
     for x in 0..5 {
         for y in 0..5 {
             for b in 0..8 {
                 interactions.push(BusInteraction::sender(
                     BusId::AreBytes,
-                    Multiplicity::Column(cols::MU),
+                    Multiplicity::One,
                     vec![
                         BusValue::Packed {
                             start_column: cols::rot_left(x, y, b),

@@ -311,9 +311,9 @@ fn test_bus_interactions_count() {
     // - 2x MUL senders (n_sub_r = d*q lo + hi)
     // - 6x ZERO senders (C3×2 NEG r, C5×2 NEG d, C8 overflow, C17 div_by_zero)
     // - 2x DVRM receivers (quotient, remainder)
-    // - 2x ARE_BYTES senders bounding the multiplicities (μ_q, μ_r)
-    // Total: 8 + 12 + 3 + 1 + 2 + 6 + 2 + 2 = 36
-    assert_eq!(interactions.len(), 36, "Expected 36 bus interactions");
+    // - 1x ARE_BYTES[μ_q, μ_r] sender bounding both multiplicities (batched)
+    // Total: 8 + 12 + 3 + 1 + 2 + 6 + 2 + 1 = 35
+    assert_eq!(interactions.len(), 35, "Expected 35 bus interactions");
 }
 
 #[test]
@@ -559,26 +559,31 @@ fn neg_template_zero_lookups_dedup_per_chip_instance() {
 
 // Soundness regression: μ_q/μ_r are bounded, non-negative multiplicities.
 // Every DVRM check fires with μ_q + μ_r, so a free μ_r = −1 next to μ_q = 1
-// switched them all off (`multiplicity_forgery_poc`). Each μ is now ARE_BYTES-checked
-// weighted by itself, and trace generation splits a row whose count would
-// exceed `MU_MAX`.
+// switched them all off (`multiplicity_forgery_poc`). Both μ are now byte-checked
+// by one ARE_BYTES[μ_q, μ_r] with multiplicity 1 (spec #1017), and trace
+// generation splits a row whose count would exceed `MU_MAX`.
 
-/// Presence: each multiplicity is ARE_BYTES-checked weighted by itself, so an
-/// out-of-range value `v` always lands on the bus with weight `v ≠ 0`.
+/// Presence: both multiplicities are ARE_BYTES-checked with multiplicity 1, so an
+/// out-of-range value always leaves `+1` on a tuple ARE_BYTES has no row for.
 #[test]
 fn test_dvrm_bounds_its_multiplicities() {
     use crate::tables::types::BusId;
     use stark::lookup::{BusValue, Multiplicity, Packing};
-    for col in [cols::MU_Q, cols::MU_R] {
-        assert!(
-            bus_interactions().iter().any(|i| i.is_sender
-                && i.bus_id == BusId::AreBytes as u64
-                && matches!(i.multiplicity, Multiplicity::Column(m) if m == col)
-                && matches!(i.values.first(),
-                    Some(BusValue::Packed { start_column, packing: Packing::Direct }) if *start_column == col)),
-            "DVRM must IS_BYTE-check multiplicity column {col} weighted by itself"
-        );
-    }
+    let packed = |v: &BusValue| match v {
+        BusValue::Packed {
+            start_column,
+            packing: Packing::Direct,
+        } => Some(*start_column),
+        _ => None,
+    };
+    assert!(
+        bus_interactions().iter().any(|i| i.is_sender
+            && i.bus_id == BusId::AreBytes as u64
+            && matches!(i.multiplicity, Multiplicity::One)
+            && i.values.iter().map(packed).collect::<Vec<_>>()
+                == [Some(cols::MU_Q), Some(cols::MU_R)]),
+        "DVRM must IS_BYTE-check μ_q and μ_r in one ARE_BYTES with multiplicity 1"
+    );
 }
 
 /// Splitting: a count above `MU_MAX` spreads over rows within the bound that
@@ -603,8 +608,8 @@ fn test_dedup_dvrm_rows_splits_counts_above_mu_max() {
 }
 
 /// Consistency: the BITWISE collector tallies exactly the per-row lookups the
-/// generated DVRM instances send — IS_HALF[μ_q], IS_HALF[μ_r] weighted by μ
-/// (padding sends nothing), MSB16 ×3 per SIGNED row and the NEG-template ZERO ×2 per
+/// generated DVRM instances send — ARE_BYTES[μ_q, μ_r] once per row (padding rows
+/// included), MSB16 ×3 per SIGNED row and the NEG-template ZERO ×2 per
 /// SIGN_R / SIGN_D row — across small instances and for a row split by `MU_MAX`.
 #[test]
 fn test_dvrm_per_row_lookups_match_collector() {
@@ -657,24 +662,23 @@ fn test_dvrm_per_row_lookups_match_collector() {
             "IS_HALF must match exactly the limb range checks"
         );
 
-        // μ bounds: ARE_BYTES[μ_q, 0] and ARE_BYTES[μ_r, 0], weighted by μ.
-        let mut arebytes: HashMap<u8, i64> = HashMap::new();
+        // μ bounds: ARE_BYTES[μ_q, μ_r] once per trace row, padding included.
+        let mut arebytes: HashMap<(u8, u8), i64> = HashMap::new();
         for b in collected
             .iter()
             .filter(|b| b.lookup_type == BitwiseOperationType::AreBytes)
         {
-            assert_eq!(b.y, 0, "μ bounds send ARE_BYTES[μ, 0]");
-            *arebytes.entry(b.x).or_default() += 1;
+            *arebytes.entry((b.x, b.y)).or_default() += 1;
         }
-        let mut expected: HashMap<u8, i64> = HashMap::new();
+        let mut expected: HashMap<(u8, u8), i64> = HashMap::new();
         let (mut msb16, mut neg_zero) = (0usize, 0usize);
         for c in ops.chunks(chunk) {
             let t = generate_dvrm_trace(c);
             for r in 0..t.num_rows() {
-                for col in [cols::MU_Q, cols::MU_R] {
-                    let mu = t.get_main(r, col).to_raw();
-                    *expected.entry(mu as u8).or_default() += mu as i64;
-                }
+                let mu = |col| t.get_main(r, col).to_raw() as u8;
+                *expected
+                    .entry((mu(cols::MU_Q), mu(cols::MU_R)))
+                    .or_default() += 1;
                 msb16 += 3 * t.get_main(r, cols::SIGNED).to_raw() as usize;
                 neg_zero += 2 * t.get_main(r, cols::SIGN_R).to_raw() as usize;
                 neg_zero += 2 * t.get_main(r, cols::SIGN_D).to_raw() as usize;

@@ -9,8 +9,10 @@
 //! `X < 2^32`) with `sub_1 = 0` and still satisfy the carry constraints, so one
 //! IS_HALFWORD receive of X appears from nowhere. That absorbs an out-of-range
 //! limb of *any* sender, another LT row included — which forges the LT result.
-//! The fix range-checks μ (`IS_HALF[μ]`, weighted by μ), so a twin's `μ = −1`
-//! itself has no receiver.
+//! The fix range-checks μ (`ARE_BYTES[μ, 0]` with multiplicity 1, spec #1017),
+//! so a twin's `μ = −1` itself has no receiver. (Its first version, `IS_HALF[μ]`
+//! weighted by μ, was cancellable: see `are_bytes_bound_resists_in_table_carrier`
+//! and `branch_carrier_poc`.)
 //!
 //! Harness, with the real LT AIR (`lt::bus_interactions()` + `LtConstraints`):
 //! - CPU: a mock ALU sender for the LT lookups the program "made".
@@ -84,7 +86,7 @@ fn lookup_trace(rows: &[(Vec<u64>, FE)], n: usize) -> TraceTable<F, E> {
     TraceTable::new_main(data, n + 1, 1)
 }
 
-fn eval_mult(m: &Multiplicity, g: &dyn Fn(usize) -> FE) -> FE {
+pub(crate) fn eval_mult(m: &Multiplicity, g: &dyn Fn(usize) -> FE) -> FE {
     match m {
         Multiplicity::One => FE::one(),
         Multiplicity::Column(c) => g(*c),
@@ -174,7 +176,14 @@ fn prove_and_verify(lt_rows: &[Row], cpu: &[Vec<u64>], victim: &[u64]) -> bool {
     let msb_id: u64 = BusId::Msb16.into();
     let byte_id: u64 = BusId::AreBytes.into();
 
-    let mut net = lt_net(lt_rows);
+    // The μ bound has multiplicity 1, so LT's all-zero padding rows send
+    // ARE_BYTES[0, 0] too: tally the padded instance, not just `lt_rows`.
+    let mut padded = lt_rows.to_vec();
+    padded.resize(
+        lt_rows.len().next_power_of_two().max(4),
+        vec![FE::zero(); cols::NUM_COLUMNS],
+    );
+    let mut net = lt_net(&padded);
     for &v in victim {
         *net.entry((half_id, vec![v])).or_insert(FE::zero()) += FE::one();
     }

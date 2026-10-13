@@ -7,6 +7,8 @@ pub mod bitwise_tests;
 #[cfg(test)]
 pub mod branch_bus_tests;
 #[cfg(test)]
+pub mod branch_carrier_poc;
+#[cfg(test)]
 pub mod branch_constraints_tests;
 #[cfg(test)]
 pub mod branch_multiplicity_poc;

@@ -6,8 +6,9 @@
 //! row cancels it on the BRANCH bus while *receiving* its range lookups; split
 //! the high word non-canonically (`high_1 = 2^16, high_2 -= 1`, same packed
 //! `next_pc`) and the twin absorbs an out-of-range `IS_HALFWORD[2^16]` sent by
-//! another table. The fix range-checks `μ` (`IS_HALF[μ]`, weighted by μ), so the
-//! twin's `μ = −1` itself lands at `p−1` with no receiver.
+//! another table. The fix range-checks `μ` together with `next_pc_low_1`
+//! (`ARE_BYTES[μ, next_pc_low_1]` with multiplicity 1, spec #1017), so the twin's
+//! `μ = −1` itself lands at `(p−1, ·)` with no receiver.
 //!
 //! Real BRANCH AIR + real bus balance; the surrounding tables are faithful mocks
 //! built from BRANCH's own interactions (CPU sends what BRANCH receives; the
@@ -155,7 +156,14 @@ fn prove_and_verify(rows: &[Row], victim: Option<u64>) -> bool {
     .into_iter()
     .collect();
 
-    let mut net = branch_net(rows);
+    // The μ bound has multiplicity 1, so BRANCH's all-zero padding rows send
+    // ARE_BYTES[0, 0] too: tally the padded instance, not just `rows`.
+    let mut padded = rows.to_vec();
+    padded.resize(
+        rows.len().next_power_of_two().max(4),
+        vec![FE::zero(); cols::NUM_COLUMNS],
+    );
+    let mut net = branch_net(&padded);
     if let Some(v) = victim {
         *net.entry((half_id, vec![v])).or_insert(FE::zero()) += FE::one();
     }
@@ -168,9 +176,9 @@ fn prove_and_verify(rows: &[Row], victim: Option<u64>) -> bool {
         if *m == FE::zero() {
             continue;
         }
-        // A real byte table has rows only for [0, 256); the μ bound sends
-        // ARE_BYTES[μ, 0], so an out-of-range μ (p−1) has no receiver.
-        if *bus == BusId::AreBytes as u64 && tuple[0] >= 256 {
+        // A real byte table has rows only for [0, 256)²; the μ bound sends
+        // ARE_BYTES[μ, next_pc_low_1], so an out-of-range μ (p−1) has no receiver.
+        if *bus == BusId::AreBytes as u64 && (tuple[0] >= 256 || tuple[1] >= 256) {
             continue;
         }
         if *bus == half_id && tuple[0] >= HALF {

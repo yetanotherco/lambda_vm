@@ -237,11 +237,12 @@ fn test_lt_rejects_forged_out() {
 // lookup fires with μ, so a free μ = −1 twin of an honest row received range
 // lookups instead of sending them and absorbed another row's out-of-range limb
 // (`lt_multiplicity_poc`, `multiplicity_forgery_poc`). μ is now range-checked on
-// ARE_BYTES (`ARE_BYTES[μ, 0]`, weighted by μ), and trace generation splits a row
-// whose count would exceed `MU_MAX`.
+// ARE_BYTES (`ARE_BYTES[μ, 0]` with multiplicity 1, spec #1017), and trace
+// generation splits a row whose count would exceed `MU_MAX`.
 
-/// Presence: μ is ARE_BYTES-checked weighted by itself, so an out-of-range value
-/// `v` always lands on the bus with weight `v ≠ 0`.
+/// Presence: μ is ARE_BYTES-checked with multiplicity 1, so an out-of-range μ
+/// always leaves `+1` on a tuple ARE_BYTES has no row for (a weight-μ bound was
+/// itself cancellable, `branch_carrier_poc`).
 #[test]
 fn test_lt_bounds_its_multiplicity() {
     use crate::tables::types::BusId;
@@ -249,10 +250,10 @@ fn test_lt_bounds_its_multiplicity() {
     assert!(
         bus_interactions().iter().any(|i| i.is_sender
             && i.bus_id == BusId::AreBytes as u64
-            && matches!(i.multiplicity, Multiplicity::Column(m) if m == cols::MU)
+            && matches!(i.multiplicity, Multiplicity::One)
             && matches!(i.values.first(),
                 Some(BusValue::Packed { start_column, packing: Packing::Direct }) if *start_column == cols::MU)),
-        "LT must IS_BYTE-check μ weighted by itself"
+        "LT must IS_BYTE-check μ with multiplicity 1"
     );
 }
 
@@ -284,9 +285,9 @@ fn test_dedup_lt_rows_splits_counts_above_mu_max() {
     assert_eq!(total, ops.len() as u64);
 }
 
-/// Consistency: the BITWISE collector tallies exactly the IS_HALF[μ] lookups the
-/// generated LT instances send (each row's μ, weighted by μ; padding nothing),
-/// across several small instances and for a row split by `MU_MAX`.
+/// Consistency: the BITWISE collector tallies exactly the IS_BYTE[μ] lookups the
+/// generated LT instances send (each row's μ once, padding rows as μ = 0), across
+/// several small instances and for a row split by `MU_MAX`.
 #[test]
 fn test_lt_mu_bound_lookups_match_collector() {
     use crate::tables::bitwise::BitwiseOperationType;
@@ -332,7 +333,7 @@ fn test_lt_mu_bound_lookups_match_collector() {
             "IS_HALF must match exactly the limb range checks"
         );
 
-        // μ bound: ARE_BYTES[μ, 0] weighted by μ.
+        // μ bound: ARE_BYTES[μ, 0] once per trace row, padding (μ = 0) included.
         let mut arebytes: HashMap<u8, i64> = HashMap::new();
         for b in collected
             .iter()
@@ -346,7 +347,7 @@ fn test_lt_mu_bound_lookups_match_collector() {
             let t = generate_lt_trace(c);
             for r in 0..t.num_rows() {
                 let mu = t.get_main(r, cols::MU).to_raw();
-                *expected.entry(mu as u8).or_default() += mu as i64;
+                *expected.entry(mu as u8).or_default() += 1;
             }
         }
         arebytes.retain(|_, n| *n != 0);

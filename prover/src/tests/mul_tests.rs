@@ -270,9 +270,9 @@ fn test_bus_interactions_count() {
     // - 8x IS_HALF senders for outputs (lo[0..4], hi[0..4])
     // - 4x IS_B20 senders (carry[0..4] virtual range checks)
     // - 2x ALU receivers (lo, hi)
-    // - 2x ARE_BYTES senders bounding the multiplicities (μ_lo, μ_hi)
-    // Total: 2 + 8 + 8 + 4 + 2 + 2 = 26
-    assert_eq!(interactions.len(), 26, "Expected 26 bus interactions");
+    // - 1x ARE_BYTES[μ_lo, μ_hi] sender bounding both multiplicities (batched)
+    // Total: 2 + 8 + 8 + 4 + 2 + 1 = 25
+    assert_eq!(interactions.len(), 25, "Expected 25 bus interactions");
 }
 
 #[test]
@@ -420,26 +420,31 @@ fn msb16_bitwise_multiplicity_matches_per_instance_sends() {
 
 // Soundness regression: μ_lo/μ_hi are bounded, non-negative multiplicities.
 // Every MUL range check fires with μ_lo + μ_hi, so a free μ_hi = −1 next to
-// μ_lo = 1 switched them all off (`multiplicity_forgery_poc`). Each μ is now
-// IS_HALF-range-checked weighted by itself, and trace generation splits a
-// row whose count would exceed `MU_MAX`.
+// μ_lo = 1 switched them all off (`multiplicity_forgery_poc`). Both μ are now
+// byte-checked by one ARE_BYTES[μ_lo, μ_hi] with multiplicity 1 (spec #1017),
+// and trace generation splits a row whose count would exceed `MU_MAX`.
 
-/// Presence: each multiplicity is ARE_BYTES-checked weighted by itself, so an
-/// out-of-range value `v` always lands on the bus with weight `v ≠ 0`.
+/// Presence: both multiplicities are ARE_BYTES-checked with multiplicity 1, so an
+/// out-of-range value always leaves `+1` on a tuple ARE_BYTES has no row for.
 #[test]
 fn test_mul_bounds_its_multiplicities() {
     use crate::tables::types::BusId;
     use stark::lookup::{BusValue, Multiplicity, Packing};
-    for col in [cols::MU_LO, cols::MU_HI] {
-        assert!(
-            bus_interactions().iter().any(|i| i.is_sender
-                && i.bus_id == BusId::AreBytes as u64
-                && matches!(i.multiplicity, Multiplicity::Column(m) if m == col)
-                && matches!(i.values.first(),
-                    Some(BusValue::Packed { start_column, packing: Packing::Direct }) if *start_column == col)),
-            "MUL must IS_BYTE-check multiplicity column {col} weighted by itself"
-        );
-    }
+    let packed = |v: &BusValue| match v {
+        BusValue::Packed {
+            start_column,
+            packing: Packing::Direct,
+        } => Some(*start_column),
+        _ => None,
+    };
+    assert!(
+        bus_interactions().iter().any(|i| i.is_sender
+            && i.bus_id == BusId::AreBytes as u64
+            && matches!(i.multiplicity, Multiplicity::One)
+            && i.values.iter().map(packed).collect::<Vec<_>>()
+                == [Some(cols::MU_LO), Some(cols::MU_HI)]),
+        "MUL must IS_BYTE-check μ_lo and μ_hi in one ARE_BYTES with multiplicity 1"
+    );
 }
 
 /// Splitting: a count above `MU_MAX` spreads over rows that each stay within the
@@ -479,8 +484,8 @@ fn test_dedup_mul_rows_splits_counts_above_mu_max() {
 }
 
 /// Consistency: the BITWISE collector tallies exactly the per-row lookups the
-/// generated MUL instances send — IS_HALF[μ_lo], IS_HALF[μ_hi] weighted by μ
-/// (padding sends nothing) and MSB16 per row whose sign flag is set — both across
+/// generated MUL instances send — ARE_BYTES[μ_lo, μ_hi] once per row (padding
+/// rows included) and MSB16 per row whose sign flag is set — both across
 /// several small instances and for a row split by `MU_MAX`.
 #[test]
 fn test_mul_per_row_lookups_match_collector() {
@@ -533,24 +538,23 @@ fn test_mul_per_row_lookups_match_collector() {
             "IS_HALF must match exactly the limb range checks"
         );
 
-        // μ bounds: ARE_BYTES[μ_lo, 0] and ARE_BYTES[μ_hi, 0], weighted by μ.
-        let mut arebytes: HashMap<u8, i64> = HashMap::new();
+        // μ bounds: ARE_BYTES[μ_lo, μ_hi] once per trace row, padding included.
+        let mut arebytes: HashMap<(u8, u8), i64> = HashMap::new();
         for b in collected
             .iter()
             .filter(|b| b.lookup_type == BitwiseOperationType::AreBytes)
         {
-            assert_eq!(b.y, 0, "μ bounds send ARE_BYTES[μ, 0]");
-            *arebytes.entry(b.x).or_default() += 1;
+            *arebytes.entry((b.x, b.y)).or_default() += 1;
         }
-        let mut expected: HashMap<u8, i64> = HashMap::new();
+        let mut expected: HashMap<(u8, u8), i64> = HashMap::new();
         let mut msb16 = 0usize;
         for c in ops.chunks(chunk) {
             let t = generate_mul_trace(c);
             for r in 0..t.num_rows() {
-                for col in [cols::MU_LO, cols::MU_HI] {
-                    let mu = t.get_main(r, col).to_raw();
-                    *expected.entry(mu as u8).or_default() += mu as i64;
-                }
+                let mu = |col| t.get_main(r, col).to_raw() as u8;
+                *expected
+                    .entry((mu(cols::MU_LO), mu(cols::MU_HI)))
+                    .or_default() += 1;
                 msb16 += t.get_main(r, cols::LHS_SIGNED).to_raw() as usize;
                 msb16 += t.get_main(r, cols::RHS_SIGNED).to_raw() as usize;
             }

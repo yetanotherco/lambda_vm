@@ -694,8 +694,9 @@ fn test_soundness_wrong_offset() {
 // Soundness regression: μ is a bounded, non-negative multiplicity. Every BRANCH
 // lookup fires with μ, so a free μ = −1 twin of an honest row received range
 // lookups instead of sending them and absorbed another row's out-of-range limb
-// (`branch_multiplicity_poc`). μ is now IS_HALF-checked weighted by itself, and
-// trace generation splits a row whose count would exceed `MU_MAX`.
+// (`branch_multiplicity_poc`). μ is now byte-checked together with
+// next_pc_low[1] by one ARE_BYTES[μ, next_pc_low[1]] with multiplicity 1 (spec
+// #1017), and trace generation splits a row whose count would exceed `MU_MAX`.
 mod mu_bound {
     use crate::tables::branch::BranchOperation;
     use crate::tables::branch::{
@@ -703,17 +704,26 @@ mod mu_bound {
     };
     use crate::tables::types::BusId;
 
-    /// Presence: μ is IS_HALF-checked weighted by itself.
+    /// Presence: μ and next_pc_low[1] are byte-checked by one ARE_BYTES with
+    /// multiplicity 1. Weighted by μ, a μ < 0 row's next_pc_low[1] check could
+    /// cancel a μ bound (`branch_carrier_poc::lt_forgery_with_branch_cycle_is_rejected`).
     #[test]
     fn branch_bounds_its_multiplicity() {
         use stark::lookup::{BusValue, Multiplicity, Packing};
+        let packed = |v: &BusValue| match v {
+            BusValue::Packed {
+                start_column,
+                packing: Packing::Direct,
+            } => Some(*start_column),
+            _ => None,
+        };
         assert!(
             bus_interactions().iter().any(|i| i.is_sender
                 && i.bus_id == BusId::AreBytes as u64
-                && matches!(i.multiplicity, Multiplicity::Column(m) if m == cols::MU)
-                && matches!(i.values.first(),
-                    Some(BusValue::Packed { start_column, packing: Packing::Direct }) if *start_column == cols::MU)),
-            "BRANCH must IS_BYTE-check μ weighted by itself"
+                && matches!(i.multiplicity, Multiplicity::One)
+                && i.values.iter().map(packed).collect::<Vec<_>>()
+                    == [Some(cols::MU), Some(cols::NEXT_PC_LOW_1)]),
+            "BRANCH must IS_BYTE-check μ and next_pc_low[1] in one ARE_BYTES with multiplicity 1"
         );
     }
 
@@ -747,9 +757,10 @@ mod mu_bound {
         assert_eq!(total, ops.len() as u64);
     }
 
-    /// Consistency: the BITWISE collector tallies exactly the IS_HALF[μ] lookups
-    /// the generated BRANCH instances send (each row's μ, weighted by μ; padding
-    /// nothing), across small instances and for a row split by `MU_MAX`.
+    /// Consistency: the BITWISE collector tallies exactly the ARE_BYTES[μ,
+    /// next_pc_low[1]] lookups the generated BRANCH instances send (once per row,
+    /// padding rows included), across small instances and for a row split by
+    /// `MU_MAX`.
     #[test]
     fn branch_mu_bound_lookups_match_collector() {
         use crate::tables::bitwise::BitwiseOperationType;
@@ -793,26 +804,22 @@ mod mu_bound {
                 "IS_HALF must match exactly the next_pc_high range checks"
             );
 
-            // ARE_BYTES carries both the real next_pc_low[1] byte check and the
-            // μ bound; subtract the former to isolate the latter.
-            let mut arebytes: HashMap<u8, i64> = HashMap::new();
+            // ARE_BYTES[μ, next_pc_low[1]] once per trace row, padding included.
+            let mut arebytes: HashMap<(u8, u8), i64> = HashMap::new();
             for b in collected
                 .iter()
                 .filter(|b| b.lookup_type == BitwiseOperationType::AreBytes)
             {
-                assert_eq!(b.y, 0, "BRANCH ARE_BYTES sends are single bytes");
-                *arebytes.entry(b.x).or_default() += 1;
+                *arebytes.entry((b.x, b.y)).or_default() += 1;
             }
-            for op in &ops {
-                let next_pc = op.compute_next_pc();
-                *arebytes.entry(((next_pc >> 8) & 0xFF) as u8).or_default() -= 1;
-            }
-            let mut expected: HashMap<u8, i64> = HashMap::new();
+            let mut expected: HashMap<(u8, u8), i64> = HashMap::new();
             for c in ops.chunks(chunk) {
                 let t = generate_branch_trace(c);
                 for r in 0..t.num_rows() {
-                    let mu = t.get_main(r, cols::MU).to_raw();
-                    *expected.entry(mu as u8).or_default() += mu as i64;
+                    let byte = |col| t.get_main(r, col).to_raw() as u8;
+                    *expected
+                        .entry((byte(cols::MU), byte(cols::NEXT_PC_LOW_1)))
+                        .or_default() += 1;
                 }
             }
             arebytes.retain(|_, n| *n != 0);

@@ -9,10 +9,9 @@
 //! all while still receiving one `a` lookup: its result was free. The stray `−1`
 //! on the `b` tuple was cancelled by an honest copy of the row with
 //! `μ_a = 0, μ_b = +1`, whose checks fire once and pass. Both forgeries below
-//! verified against `main` (ffc4ac19). The fix range-checks each μ to a byte on
-//! the ARE_BYTES bus (`ARE_BYTES[μ, 0]`, weighted by μ) — a bus the limb checks
-//! (IS_HALFWORD) never use — so `μ_b = −1` lands at `ARE_BYTES[p−1, 0]` with no
-//! receiver.
+//! verified against `main` (ffc4ac19). The fix range-checks both μ to bytes with
+//! one `ARE_BYTES[μ_a, μ_b]` of multiplicity 1 (spec #1017), so `μ_b = −1` leaves
+//! `+1` at `ARE_BYTES[1, p−1]` with no receiver.
 //!
 //! **SHIFT.** The five HWSL senders fire with `1 − zbs`, and on a μ = 0 padding
 //! row nothing pinned `zbs`: `zbs = 2` made that −1, so the padding row provided
@@ -42,7 +41,7 @@
 //! Run under production proof options.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
+use stark::lookup::BusInteraction;
 use stark::proof::options::ProofOptions;
 use stark::prover::{IsStarkProver, Prover};
 use stark::trace::TraceTable;
@@ -232,17 +231,29 @@ fn craft_proof(s: &Scenario, forge: Forge) -> Result<VmProof, stark::prover::Pro
     })
 }
 
-/// Whether `interactions` range-check column `col`, weighted by itself.
-fn bounds_column(interactions: &[BusInteraction], col: usize) -> bool {
-    interactions.iter().any(|i| {
-        i.is_sender
-            && i.bus_id == BusId::AreBytes as u64
-            && matches!(i.multiplicity, Multiplicity::Column(m) if m == col)
-            && matches!(
-                i.values.first(),
-                Some(BusValue::Packed { start_column, packing: Packing::Direct }) if *start_column == col
-            )
-    })
+/// Net ARE_BYTES sends of `interactions` over every row of `t`, padding included.
+fn are_bytes_net(
+    interactions: &[BusInteraction],
+    t: &TraceTable<Base, Ext>,
+) -> std::collections::HashMap<Vec<u64>, FE> {
+    use super::lt_multiplicity_poc::eval_mult;
+    let id: u64 = BusId::AreBytes.into();
+    let mut net = std::collections::HashMap::new();
+    for bi in interactions.iter().filter(|i| i.bus_id == id) {
+        for r in 0..t.num_rows() {
+            let g = |c: usize| *t.get_main(r, c);
+            let m = eval_mult(&bi.multiplicity, &g);
+            let tuple: Vec<u64> = bi
+                .values
+                .iter()
+                .flat_map(|v| v.combine_from(g))
+                .map(|x: FE| x.canonical_u64())
+                .collect();
+            let e = net.entry(tuple).or_insert(FE::zero());
+            *e = if bi.is_sender { *e + m } else { *e - m };
+        }
+    }
+    net
 }
 
 /// Add `delta` to the BITWISE receiver multiplicity `mu_col` at halfword `half`.
@@ -262,17 +273,20 @@ fn bump_bitwise(traces: &mut Traces, mu_col: usize, half: u64, delta: FE) {
 ///   `μ_a = 0, μ_b = 1`.
 ///
 /// Returns the row-B copy's index so the caller can rebalance flag-gated sends.
-/// If the chip range-checks its μ columns (ARE_BYTES[μ, 0]), also rebalances
-/// those sends wherever a BITWISE row exists (`p−1` has none — that is the fix).
+/// Also rebalances the chip's ARE_BYTES sends (the batched μ bound
+/// `ARE_BYTES[μ_a, μ_b] | 1`) wherever a BITWISE row exists, and asserts the
+/// only send left without one is A's bound at `(1, p−1)` with `+1` — the
+/// out-of-range lookup that is what rejects the forgery.
 fn forge_two_rows(
     traces: &mut Traces,
     table: fn(&mut Traces) -> &mut TraceTable<Base, Ext>,
     find_a: impl Fn(&TraceTable<Base, Ext>, usize) -> bool,
     (mu_a, mu_b, num_cols): (usize, usize, usize),
-    bounded: bool,
+    interactions: &[BusInteraction],
     write_forged: impl Fn(&mut TraceTable<Base, Ext>, usize),
 ) -> usize {
     let t = table(traces);
+    let before = are_bytes_net(interactions, t);
     let rows = t.num_rows();
     let a = (0..rows)
         .find(|&r| find_a(t, r))
@@ -292,19 +306,39 @@ fn forge_two_rows(
     write_forged(t, a);
     t.set_main(a, mu_b, FE::zero() - FE::one());
 
-    if bounded {
-        // ARE_BYTES[μ, 0] | μ sends: B's μ_b 0 -> 1 adds ARE_BYTES[1, 0] once; A's
-        // μ_b 0 -> −1 adds ARE_BYTES[p−1, 0] with weight −1, which has no BITWISE
-        // row (that out-of-range send is what rejects the forgery).
-        bump_bitwise(traces, bw_cols::MU_ARE_BYTES, 1, FE::one());
+    let after = are_bytes_net(interactions, t);
+    let mut out_of_range = Vec::new();
+    let keys: std::collections::HashSet<_> = before.keys().chain(after.keys()).cloned().collect();
+    for tuple in keys {
+        let get = |n: &std::collections::HashMap<Vec<u64>, FE>| {
+            n.get(&tuple).copied().unwrap_or(FE::zero())
+        };
+        let delta = get(&after) - get(&before);
+        if delta == FE::zero() {
+            continue;
+        }
+        if tuple.iter().all(|&v| v < 256) {
+            bump_bitwise(
+                traces,
+                bw_cols::MU_ARE_BYTES,
+                tuple[0] + 256 * tuple[1],
+                delta,
+            );
+        } else {
+            out_of_range.push((tuple, delta));
+        }
     }
+    assert_eq!(
+        out_of_range,
+        vec![(vec![1, (-FE::one()).canonical_u64()], FE::one())],
+        "only A's μ bound may be left without a BITWISE row"
+    );
     b
 }
 
 /// MUL: `lo(3 * 5)` forged to 99 (`μ_lo = 1, μ_hi = −1`).
 fn forge_mul_rows(traces: &mut Traces, s: &Scenario) {
     use mul::cols;
-    let bounded = bounds_column(&mul::bus_interactions(), cols::MU_HI);
     let forged = s.forged;
     let b = forge_two_rows(
         traces,
@@ -315,7 +349,7 @@ fn forge_mul_rows(traces: &mut Traces, s: &Scenario) {
                 && *t.get_main(r, cols::MU_LO) == FE::one()
         },
         (cols::MU_LO, cols::MU_HI, cols::NUM_COLUMNS),
-        bounded,
+        &mul::bus_interactions(),
         |t, a| t.set_main(a, cols::LO_0, FE::from(forged)),
     );
 
@@ -335,7 +369,6 @@ fn forge_mul_rows(traces: &mut Traces, s: &Scenario) {
 /// the copy duplicates no SIGNED/SIGN_R/SIGN_D-gated sends.
 fn forge_dvrm_rows(traces: &mut Traces, s: &Scenario) {
     use dvrm::cols;
-    let bounded = bounds_column(&dvrm::bus_interactions(), cols::MU_R);
     let forged = s.forged;
     let b = forge_two_rows(
         traces,
@@ -346,7 +379,7 @@ fn forge_dvrm_rows(traces: &mut Traces, s: &Scenario) {
                 && *t.get_main(r, cols::MU_Q) == FE::one()
         },
         (cols::MU_Q, cols::MU_R, cols::NUM_COLUMNS),
-        bounded,
+        &dvrm::bus_interactions(),
         |t, a| t.set_main(a, cols::Q_0, FE::from(forged)),
     );
     let t = &traces.dvrms[0];
