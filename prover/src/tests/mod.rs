@@ -47,6 +47,8 @@ pub mod ecsm_tests;
 #[cfg(test)]
 pub mod eq_tests;
 #[cfg(test)]
+pub mod halt_pc_forgery_poc;
+#[cfg(test)]
 pub mod hint_tests;
 #[cfg(test)]
 pub mod ir_stats_dump;

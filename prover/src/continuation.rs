@@ -1665,6 +1665,21 @@ fn verify_continuation_view(
         let l2g_root = epoch.l2g_root();
         let epoch_public_output = epoch.public_output();
 
+        // The final epoch's `reg_fini` has no next epoch to bind it, so pin it to
+        // the halted register file (as the monolithic verifier does): this ends the
+        // PC chain on `pc = 1`, so execution cannot continue past the exit ecall.
+        // x254 counts every byte committed across the run.
+        if is_final {
+            let Ok(committed_bytes) =
+                u32::try_from(public_output.len() + epoch_public_output.len())
+            else {
+                return Ok(None);
+            };
+            if epoch.reg_fini()? != register::halted_fini(committed_bytes) {
+                return Ok(None);
+            }
+        }
+
         if !verify_epoch(
             &elf,
             elf_bytes,
@@ -1800,6 +1815,10 @@ pub(crate) mod test_fault {
     pub(crate) const MAGIC: &[u8] = b"__inject_pipeline_fault__";
     pub(crate) const FAIL_INDEX: u64 = 3;
 }
+
+#[cfg(test)]
+#[path = "tests/halt_continuation_poc.rs"]
+mod halt_continuation_poc;
 
 #[cfg(test)]
 mod tests {

@@ -1347,6 +1347,8 @@ pub fn prove_with_options_and_inputs(
     let __sp = stark::instruments::span("air_construction");
 
     let table_counts = traces.table_counts();
+    let committed_bytes = u32::try_from(traces.public_output_bytes.len())
+        .expect("trace build bounds the commit index to u32");
     let airs = VmAirs::new(
         &program,
         proof_options,
@@ -1357,7 +1359,11 @@ pub fn prove_with_options_and_inputs(
         true,
         None,
         None,
-        None,
+        Some(register::halted_preprocessed(
+            proof_options,
+            program.entry_point,
+            committed_bytes,
+        )),
     );
 
     #[cfg(feature = "instruments")]
@@ -1587,6 +1593,12 @@ fn verify_proof_parts(
         )));
     }
 
+    // The final register file is verifier-known: pinning it ends the PC chain on
+    // `pc = 1` (see `register::halted_fini`).
+    // An honest run cannot commit more bytes than x254 counts.
+    let Ok(committed_bytes) = u32::try_from(public_output.len()) else {
+        return Ok(false);
+    };
     let airs = VmAirs::new(
         program,
         proof_options,
@@ -1597,7 +1609,11 @@ fn verify_proof_parts(
         true,
         None,
         page_commitments,
-        None,
+        Some(register::halted_preprocessed(
+            proof_options,
+            program.entry_point,
+            committed_bytes,
+        )),
     );
 
     // Recompute the COMMIT output bus offset from the public output.

@@ -62,8 +62,8 @@ pub const NUM_PREPROCESSED_COLS: usize = 2;
 /// recomputes the commitment from it, the REG-C2 Memory-bus token forces it to
 /// equal the true final registers, and the next epoch reuses the same `R_{i+1}`
 /// as its preprocessed INIT — binding `init(epoch i+1) == fini(epoch i)` with no
-/// extra bus. The monolithic prover keeps FINI as a main-trace column (it has no
-/// verifier-known final state), using `NUM_PREPROCESSED_COLS` instead.
+/// extra bus. The monolithic prover preprocesses FINI too, against the
+/// verifier-known halted state (see [`halted_fini`]).
 pub const NUM_PREPROCESSED_COLS_WITH_FINI: usize = 3;
 
 // =========================================================================
@@ -166,6 +166,35 @@ pub(crate) fn register_init_from_entry_point(entry_point: u64) -> Vec<u32> {
         .iter()
         .map(|&addr| init_value_for_address(addr, entry_point))
         .collect()
+}
+
+/// The final register file of every run that halts, as the verifier knows it
+/// (`fini_from_trace` order): HALT zeroizes x1-x31 (x10 is read as 0), x0 is never
+/// written, x254 counts the committed bytes, and the PC ends on the padding value
+/// `pc = 1` (spec `halt.typ`: the verifier knows the final PC token).
+///
+/// Pinning FINI is what stops the PC chain from ending anywhere but `pc = 1`.
+/// HALT's `pc` column is free, so with a free FINI a prover could cancel HALT's
+/// consume/emit and keep executing past the exit ecall, ending the chain on the
+/// last post-exit `next_pc` (see `tests/halt_pc_forgery_poc.rs`).
+pub fn halted_fini(committed_bytes: u32) -> Vec<u32> {
+    let mut fini = vec![0u32; NUM_REGISTER_ADDRESSES];
+    fini[X254_INDEX] = committed_bytes;
+    fini[PC_LO_INDEX] = super::cpu::CPU_PADDING_PC as u32;
+    fini
+}
+
+/// REGISTER preprocessing for a monolithic proof: OFFSET, INIT from the entry
+/// point, and FINI pinned to [`halted_fini`].
+pub fn halted_preprocessed(
+    options: &ProofOptions,
+    entry_point: u64,
+    committed_bytes: u32,
+) -> (Commitment, usize) {
+    let init = register_init_from_entry_point(entry_point);
+    let commitment =
+        compute_precomputed_commitment_with_fini(options, &init, &halted_fini(committed_bytes));
+    (commitment, NUM_PREPROCESSED_COLS_WITH_FINI)
 }
 
 /// Build the register init map from an epoch's boundary register snapshot: the
