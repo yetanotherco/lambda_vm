@@ -112,7 +112,7 @@ pub(crate) fn weigh_the_bus(
     let table_counts = traces.table_counts();
     let register_init = crate::tables::register::register_init_from_entry_point(elf.entry_point);
     let register_commitment =
-        crate::test_utils::epoch_register_commitment(&proof_options, &register_init, traces);
+        crate::test_utils::trace_register_commitment(&proof_options, &register_init, traces);
     let airs = VmAirs::new(
         elf,
         &proof_options,
@@ -3463,7 +3463,7 @@ fn test_prove_first_epoch_without_halt() {
         None,
         false,
         None,
-        crate::test_utils::epoch_register_commitment(&proof_options, &register_init, &traces),
+        crate::test_utils::trace_register_commitment(&proof_options, &register_init, &traces),
     );
 
     let multi_proof = multi_prove_ram(
@@ -3551,7 +3551,7 @@ fn test_prove_second_epoch_from_snapshot() {
         None,
         false,
         None,
-        crate::test_utils::epoch_register_commitment(&proof_options, &register_init, &traces),
+        crate::test_utils::trace_register_commitment(&proof_options, &register_init, &traces),
     );
 
     let multi_proof = multi_prove_ram(
@@ -3646,7 +3646,7 @@ fn test_epoch_proof_commits_l2g() {
         None,
         false,
         None,
-        crate::test_utils::epoch_register_commitment(&proof_options, &register_init, &traces),
+        crate::test_utils::trace_register_commitment(&proof_options, &register_init, &traces),
     );
 
     // Inert L2G AIR: commits the trace columns, but no bus and no constraints.
@@ -3803,7 +3803,7 @@ fn test_continuation_pipeline_end_to_end() {
             None,
             is_final,
             None,
-            crate::test_utils::epoch_register_commitment(
+            crate::test_utils::trace_register_commitment(
                 &proof_options,
                 &register_inits[i],
                 &traces,
@@ -3943,7 +3943,7 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
         None,
         false,
         None,
-        crate::test_utils::epoch_register_commitment(&proof_options, &register_init, &traces),
+        crate::test_utils::trace_register_commitment(&proof_options, &register_init, &traces),
     );
 
     // L2G air on the epoch-local Memory bus (the bookend that replaces PAGE).

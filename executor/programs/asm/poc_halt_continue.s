@@ -2,6 +2,11 @@
 	.attribute	5, "rv64i2p1"
 	.globl	main
 main:
+	# Two rows before the exit sequence, so the rows before the exit ecall fill a
+	# power-of-two continuation epoch (4 rows) on their own.
+	nop
+	nop
+
 	# Exit with a NON-ZERO code. HALT enforces x10 == 0, so an honest prover
 	# cannot prove this program.
 	li	a0, 1
@@ -11,6 +16,8 @@ main:
 	# Never reached by an honest execution. The HALT PoC runs these rows AFTER
 	# the exit ecall to zero x10 before the trace ends.
 	li	a0, 0
+	nop
+	nop
 	nop
 	nop
 	nop

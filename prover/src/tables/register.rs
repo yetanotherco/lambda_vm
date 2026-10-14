@@ -13,10 +13,14 @@
 //!
 //! | Column | Type | Description |
 //! |--------|------|-------------|
-//! | offset | RowIndex | Byte offset within register space |
-//! | init | Word | Initial value (0 for all registers at start) |
-//! | fini | Word | Final value after execution |
+//! | offset | RowIndex | Word address within register space (preprocessed) |
+//! | init | Word | Initial value (preprocessed) |
+//! | fini | Word | Final value (preprocessed) |
 //! | timestamp | DWordWL | Final timestamp (1 if never accessed) |
+//!
+//! OFFSET, INIT and FINI are preprocessed, so the verifier knows both register
+//! files. A monolithic proof (and the final continuation epoch) pins FINI to the
+//! halted state ([`halted_fini`]); a non-final epoch's FINI is the next epoch's INIT.
 
 use std::collections::HashMap;
 
@@ -71,10 +75,10 @@ pub mod cols {
     /// offset: Row index / byte address within register space
     pub const OFFSET: usize = 0;
 
-    /// init: Initial byte value (0 for all registers)
+    /// init: Initial Word value (preprocessed)
     pub const INIT: usize = 1;
 
-    /// fini: Final byte value after execution
+    /// fini: Final Word value (preprocessed)
     pub const FINI: usize = 2;
 
     /// timestamp[0]: Final timestamp low word (1 if never accessed, matching REG-C1 init)
@@ -168,12 +172,18 @@ pub(crate) fn register_init_from_entry_point(entry_point: u64) -> Vec<u32> {
 /// The final register file of every run that halts, as the verifier knows it
 /// (`fini_from_trace` order): HALT zeroizes x1-x31 (x10 is read as 0), x0 is never
 /// written, x254 counts the committed bytes, and the PC ends on the padding value
-/// `pc = 1` (spec `halt.typ`: the verifier knows the final PC token).
+/// `pc = 1`.
 ///
 /// Pinning FINI is what stops the PC chain from ending anywhere but `pc = 1`.
 /// HALT's `pc` column is free, so with a free FINI a prover could cancel HALT's
 /// consume/emit and keep executing past the exit ecall, ending the chain on the
 /// last post-exit `next_pc` (see `tests/halt_pc_forgery_poc.rs`).
+///
+/// Only the final PC *value* is pinned; its timestamp (REGISTER TIMESTAMP) stays
+/// prover-chosen, unlike spec `halt.typ`, which has the verifier know the final
+/// padding-PC timestamp. The value is enough: no real row writes `next_pc = 1`
+/// (instruction addresses are even and BRANCH clears the LSB), so a token with
+/// value 1 can only come from HALT's emit or a padding row after it.
 pub fn halted_fini(committed_bytes: u32) -> Vec<u32> {
     let mut fini = vec![0u32; NUM_REGISTER_ADDRESSES];
     fini[X254_INDEX] = committed_bytes;

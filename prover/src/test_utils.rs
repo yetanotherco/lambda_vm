@@ -236,9 +236,11 @@ pub fn halted_register_commitment(
     crate::tables::register::halted_commitment(options, elf.entry_point, committed_bytes)
 }
 
-/// REGISTER commitment for the traces of a non-final epoch: INIT `init` and FINI
-/// as the REGISTER trace holds it, as a continuation epoch commits it.
-pub fn epoch_register_commitment(
+/// REGISTER commitment matching `traces`: INIT `init` and FINI as the REGISTER
+/// trace holds it. This is what a prover commits for its own trace (a non-final
+/// continuation epoch does it honestly; a forged run gets a root the halted
+/// verifier does not recompute).
+pub fn trace_register_commitment(
     options: &ProofOptions,
     init: &[u32],
     traces: &crate::tables::trace_builder::Traces,

@@ -36,7 +36,7 @@ const NOP: [u8; 4] = [0x13, 0x00, 0x00, 0x00];
 
 /// Rows the forged trace has: a power of two, so the CPU table gets no padding
 /// rows and the last real row's `next_pc` goes straight to the REGISTER table.
-const FORGED_ROWS: usize = 16;
+pub(crate) const FORGED_ROWS: usize = 16;
 
 pub(crate) fn opts() -> ProofOptions {
     crate::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid")
@@ -64,8 +64,8 @@ pub(crate) fn run_logs(elf_bytes: &[u8]) -> Vec<Log> {
 }
 
 /// The honest logs up to and including `exit(1)`, followed by the post-exit rows
-/// taken from the patched run, cut at `FORGED_ROWS` (before the second ecall).
-pub(crate) fn forged_logs(honest: &[u8]) -> Vec<Log> {
+/// taken from the patched run, cut at `rows` (before the second exit sequence).
+pub(crate) fn forged_logs(honest: &[u8], rows: usize) -> Vec<Log> {
     let honest_logs = run_logs(honest);
     let exit_row = honest_logs.len() - 1;
     assert_eq!(
@@ -75,8 +75,12 @@ pub(crate) fn forged_logs(honest: &[u8]) -> Vec<Log> {
 
     let patched_logs = run_logs(&patched_elf(honest));
     let mut logs = honest_logs;
-    logs.extend_from_slice(&patched_logs[exit_row + 1..FORGED_ROWS]);
-    assert_eq!(logs.len(), FORGED_ROWS);
+    logs.extend_from_slice(&patched_logs[exit_row + 1..rows]);
+    assert_eq!(logs.len(), rows);
+    assert!(
+        logs[exit_row + 1..].iter().all(|log| log.src1_val != 93),
+        "no post-exit row is the second exit"
+    );
     assert_eq!(
         logs[exit_row + 1].current_pc,
         logs[exit_row].current_pc + 4,
@@ -94,7 +98,8 @@ pub(crate) struct Tamper {
     /// timestamp. Main-trace columns.
     pub(crate) register_ts: bool,
     /// Set the REGISTER final x255 value to the last post-exit `next_pc`. A
-    /// main-trace column on `main`; preprocessed (pinned to `pc = 1`) by the fix.
+    /// main-trace column on `main`; preprocessed by the fix, so the forged root no
+    /// longer matches the halted one the verifier recomputes.
     pub(crate) register_fini: bool,
 }
 
@@ -163,11 +168,12 @@ fn craft_proof(
         None,
         true,
         None,
-        // As the production prover: FINI pinned to the halted register file.
-        crate::test_utils::halted_register_commitment(
+        // A malicious prover commits to its own (tampered) REGISTER trace. For an
+        // untampered FINI this is the halted root the production prover uses.
+        crate::test_utils::trace_register_commitment(
             &options,
-            &program,
-            &traces.public_output_bytes,
+            &crate::tables::register::register_init_from_entry_point(program.entry_point),
+            &traces,
         ),
     );
     let runtime_page_ranges = traces.runtime_page_ranges();
@@ -214,6 +220,17 @@ fn accepted(crafted: Result<VmProof, stark::prover::ProvingError>, elf: &[u8]) -
     }
 }
 
+/// The forged proof must build, so the rejection comes from the verifier and not
+/// from the prover refusing the trace.
+fn assert_verifier_rejects(
+    crafted: Result<VmProof, stark::prover::ProvingError>,
+    elf: &[u8],
+    msg: &str,
+) {
+    assert!(crafted.is_ok(), "the forged proof must build");
+    assert!(!accepted(crafted, elf), "{msg}");
+}
+
 /// POSITIVE CONTROL: the harness itself produces valid proofs. The patched ELF
 /// (no first ecall) exits 0 honestly at its second ecall.
 #[test]
@@ -236,57 +253,61 @@ fn poc_control_honest_exit_one_is_rejected() {
 
 /// NEGATIVE CONTROL: running past the exit while HALT's PC stays honest is
 /// rejected — HALT consumes the real `next_pc` token, so the first post-exit
-/// row has nothing to read. Isolates HALT's free PC column as the hole.
+/// row has nothing to read. FINI is left at the halted `pc = 1`, so this
+/// isolates HALT's free PC column as the hole.
 #[test]
 fn poc_control_continue_without_halt_pc_tamper_is_rejected() {
     let elf = asm_elf_bytes(GUEST);
-    let logs = forged_logs(&elf);
-    assert!(!accepted(
+    let logs = forged_logs(&elf, FORGED_ROWS);
+    assert_verifier_rejects(
         craft_proof(
             &elf,
             &logs,
             Tamper {
                 halt_pc: false,
+                register_fini: false,
                 ..FULL_ATTACK
-            }
+            },
         ),
-        &elf
-    ));
+        &elf,
+        "running past the exit without the HALT PC tamper must not verify",
+    );
 }
 
-/// THE BUG: set HALT `PC = (1, 0)`, keep executing after `exit(1)`, zero x10,
-/// stop. Must be rejected; if this test fails the verifier accepted a proof
-/// that `exit(1)` exited with code 0.
+/// THE BUG, as it verified on `main`: set HALT `PC = (1, 0)`, keep executing
+/// after `exit(1)`, zero x10, and end the PC chain on the last post-exit
+/// `next_pc` (REGISTER FINI and its timestamp). The prover commits to that FINI;
+/// the verifier must reject it because it pins FINI to the halted `pc = 1`.
 #[test]
 fn continue_past_exit_via_halt_pc_is_rejected() {
     let elf = asm_elf_bytes(GUEST);
-    let logs = forged_logs(&elf);
-    assert!(
-        !accepted(craft_proof(&elf, &logs, FULL_ATTACK), &elf),
+    let logs = forged_logs(&elf, FORGED_ROWS);
+    assert_verifier_rejects(
+        craft_proof(&elf, &logs, FULL_ATTACK),
+        &elf,
         "SOUNDNESS BUG: the verifier accepted a trace that runs past the exit ecall \
-         (HALT PC = (1, 0)) and turns exit(1) into exit(0)"
+         (HALT PC = (1, 0)) and turns exit(1) into exit(0)",
     );
 }
 
-/// THE BUG, respecting the fix's pinned FINI: HALT `PC = (1, 0)` and the final
-/// x255 token moved to the end of the post-exit rows, but its value left at
-/// `pc = 1`. Touches main-trace columns only, so the prover must build the
-/// proof; the verifier must reject it because no real row writes `next_pc = 1`.
+/// THE BUG, with FINI left at the halted `pc = 1`: HALT `PC = (1, 0)` and the
+/// final x255 token moved to the end of the post-exit rows. The REGISTER root
+/// matches, so the verifier must reject it on the bus: no real row writes
+/// `next_pc = 1`.
 #[test]
 fn continue_past_exit_with_pinned_fini_is_rejected() {
     let elf = asm_elf_bytes(GUEST);
-    let logs = forged_logs(&elf);
-    let crafted = craft_proof(
+    let logs = forged_logs(&elf, FORGED_ROWS);
+    assert_verifier_rejects(
+        craft_proof(
+            &elf,
+            &logs,
+            Tamper {
+                register_fini: false,
+                ..FULL_ATTACK
+            },
+        ),
         &elf,
-        &logs,
-        Tamper {
-            register_fini: false,
-            ..FULL_ATTACK
-        },
-    );
-    assert!(crafted.is_ok(), "main-trace-only tamper must still prove");
-    assert!(
-        !accepted(crafted, &elf),
-        "SOUNDNESS BUG: the PC chain ran past the exit ecall and still ended on pc = 1"
+        "SOUNDNESS BUG: the PC chain ran past the exit ecall and still ended on pc = 1",
     );
 }

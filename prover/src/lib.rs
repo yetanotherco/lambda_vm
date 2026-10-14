@@ -1581,8 +1581,8 @@ fn verify_proof_parts(
     }
 
     // The final register file is verifier-known: pinning it ends the PC chain on
-    // `pc = 1` (see `register::halted_fini`).
-    // An honest run cannot commit more bytes than x254 counts.
+    // `pc = 1` (see `register::halted_fini`). x254 is a u32 byte count, so a longer
+    // public output cannot be honest.
     let Ok(committed_bytes) = u32::try_from(public_output.len()) else {
         return Ok(false);
     };
