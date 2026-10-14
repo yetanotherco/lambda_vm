@@ -1,8 +1,8 @@
 //! BRANCH's `μ` must be a bounded, non-negative multiplicity — same bug and fix
 //! as LT (`lt_multiplicity_poc`).
 //!
-//! BRANCH weights its BRANCH receive and all range lookups (ARE_BYTES,
-//! BYTE_ALU[AND], IS_HALFWORD ×3) by one free `μ`. A `μ = −1` twin of an honest
+//! Before the fix, BRANCH weighted its BRANCH receive and all range lookups
+//! (ARE_BYTES, BYTE_ALU[AND], IS_HALFWORD ×3) by one free `μ`. A `μ = −1` twin of an honest
 //! row cancels it on the BRANCH bus while *receiving* its range lookups; split
 //! the high word non-canonically (`high_1 = 2^16, high_2 -= 1`, same packed
 //! `next_pc`) and the twin absorbs an out-of-range `IS_HALFWORD[2^16]` sent by

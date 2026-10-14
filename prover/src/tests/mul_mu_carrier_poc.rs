@@ -1,4 +1,4 @@
-//! Adversarial check of the MUL `μ` bound (`fix/multiplicity-soundness`).
+//! Adversarial check of the MUL `μ` bound.
 //!
 //! The fix bounds `μ_lo`/`μ_hi` with one `ARE_BYTES[μ_lo, μ_hi]` with
 //! multiplicity 1 (spec #1017). Its first version was `IS_HALF[μ]` weighted *by
@@ -15,11 +15,11 @@
 //! optionally sends `IS_HALFWORD[p−1]`, standing in for "some other table emits
 //! an out-of-range halfword with +1".
 //!
-//! Result characterises the fix:
+//! Result:
 //! - no carrier  → the `μ_hi = −1` forgery is REJECTED (the known attack is
 //!   blocked; same as `multiplicity_forgery_poc`);
-//! - with carrier → whether it verifies says whether the bound is unconditional
-//!   or only holds while no table leaks an out-of-range halfword.
+//! - with carrier → still REJECTED: the bound no longer rides IS_HALFWORD, so an
+//!   out-of-range halfword leaked by another table cannot cancel it.
 
 use std::collections::HashMap;
 

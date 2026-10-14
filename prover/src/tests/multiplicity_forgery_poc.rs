@@ -1,7 +1,6 @@
-//! End-to-end regression tests for unconstrained multiplicities: MUL's
-//! `μ_lo`/`μ_hi` and DVRM's `μ_q`/`μ_r` must be bounded and non-negative, and
-//! SHIFT's `zbs` and LOAD's `μ` must be bits, and LT's `μ` must be bounded and
-//! non-negative.
+//! End-to-end regression tests for unconstrained multiplicities: the dedup
+//! multiplicities (MUL's `μ_lo`/`μ_hi`, DVRM's `μ_q`/`μ_r`, LT's `μ`) must be
+//! bounded and non-negative, and SHIFT's `zbs` and LOAD's `μ` must be bits.
 //!
 //! **MUL / DVRM.** Both chips send every range check (and DVRM its MUL/LT/ZERO checks) with
 //! multiplicity `μ_a + μ_b`, the row's total lookup count. Before the fix neither

@@ -124,3 +124,28 @@ fn test_bus_interactions_shape() {
     // [a, b, flags, res, 0] — the ALU output is DWordWL ([res, 0]).
     assert_eq!(alu[0].values.len(), 5);
 }
+
+/// Soundness regression: μ must be a bit (spec `IS_BIT[μ]`). EQ does not
+/// deduplicate, so real rows have μ = 1 and padding rows μ = 0; μ = 2 or −1
+/// must be rejected by MuIsBit (idx 4).
+#[test]
+fn test_mu_is_bit_constrained() {
+    use crate::tables::eq::EqConstraints;
+    use crate::test_utils::{busless_air, validate_busless};
+
+    let honest = generate_eq_trace(&[EqOperation::new(5, 3, false), EqOperation::new(7, 7, true)]);
+    let air = busless_air(cols::NUM_COLUMNS, EqConstraints);
+    assert!(
+        validate_busless(&air, &honest),
+        "honest trace must validate"
+    );
+
+    for bad in [FE::from(2u64), -FE::one()] {
+        let mut t = honest.clone();
+        t.main_table.set(0, cols::MU, bad);
+        assert!(
+            !validate_busless(&air, &t),
+            "μ ∉ {{0,1}} must be rejected by MuIsBit"
+        );
+    }
+}

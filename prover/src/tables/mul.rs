@@ -26,7 +26,7 @@
 //! ## Bus Interactions
 //! - Sender: MSB16 (×2 for sign extraction)
 //! - Sender: IS_HALF (×16 for lhs/rhs input and lo/hi output range checks)
-//! - Sender: ARE_BYTES (×2 for the μ_lo/μ_hi multiplicity bounds)
+//! - Sender: ARE_BYTES (×1: `[μ_lo, μ_hi]`, the batched multiplicity bounds)
 //! - Sender: IS_B20 (×4 for carry range checks)
 //! - Receiver: ALU (×2 for lo and hi results — every MUL lookup, CPU
 //!   MUL/MULH dispatch and dvrm's internal `d*q` consistency)

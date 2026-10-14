@@ -852,7 +852,7 @@ fn halfword<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b.main(0, lo_col) + b.main(0, hi_col) * b.const_base(256)
 }
 
-/// The KECCAK round table's 140 transition constraints as a single
+/// The KECCAK round table's 141 transition constraints as a single
 /// [`ConstraintSet`]:
 ///
 /// * **20 IS_BIT** on the θ carry bits: for `x ∈ 0..5`, `hw ∈ 0..4`,
@@ -868,6 +868,7 @@ fn halfword<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
 ///   `in` is the `theta[x][y]` halfword, `left`/`right` the `rot_left`/
 ///   `rot_right` byte pairs (degree 2; the general form covers rnc = 0, which
 ///   pins right = 0, left = in).
+/// * **1 MuIsBit**: `μ · (1 − μ)` (degree 2).
 ///
 /// These identities replace the former θ/ρ HWSL bus lookups. Uniqueness of the
 /// (left, right) decomposition rests on the ARE_BYTES range checks bounding both
@@ -938,12 +939,11 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakRndConstraint
             }
         }
 
-        // MuIsBit — μ·(1−μ). Every other constraint and bus send is weighted by
-        // μ, so μ = 2, 7 or −1 is indistinguishable from μ = 1 at the constraint
-        // level, while on the bus a μ = −1 row inverts a range check and can hold
-        // a non-canonical (out-of-range) shift byte — the carrier mechanism.
-        // KECCAK_RND does not deduplicate (one row per round, μ ∈ {0,1}), so the
-        // bit constraint is honest and forbids μ = −1, closing the carrier.
+        // MuIsBit — μ·(1−μ). The shift identities and every bus send except the
+        // ARE_BYTES byte checks (multiplicity 1) are weighted by μ, so μ = 2, 7
+        // or −1 would scale those sends, and μ = −1 would turn them into
+        // receives. KECCAK_RND does not deduplicate (one row per round, μ ∈
+        // {0,1}), so the bit constraint is honest.
         let mu = b.main(0, cols::MU);
         let one = b.one();
         b.emit_base(idx, mu.clone() * (one - mu));

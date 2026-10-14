@@ -14,8 +14,8 @@
 //! - Shift decomposition (ALU-bus shift amount): `shift_b1` (idx 26, Byte = shift[1]), `shift_h1` (idx 27, Half = shift[2]), `shift_high` (idx 28, Word = shift[3])
 //! - Multiplicity: `μ`
 //!
-//! ## Bus Interactions (18 total)
-//! - Senders: MSB16, BYTE_ALU[AND] (×3), ZERO, HWSL (×5), ARE_BYTES (×2), IS_HALFWORD (×5)
+//! ## Bus Interactions (17 total)
+//! - Senders: MSB16, BYTE_ALU[AND] (×3), ZERO, HWSL (×5), ARE_BYTES (×1: `[shift[0], shift[1]]`), IS_HALFWORD (×5)
 //! - Receiver: ALU (from CPU)
 
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
@@ -1006,8 +1006,8 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
         // 0-7, bits 8-15] + IS_HALF[bits 16-31]. The high word (bits 32-63,
         // SHIFT_HIGH) is the spec's `shift[3]` Word; IS_WORD is assumed via its bus
         // equality with the CPU's well-formed arg2 high word, so it needs no check.
-        // Padding rows' ARE_BYTES[0, 0] are counted by the BITWISE collector in
-        // `trace_builder`, which knows the chunking.
+        // Padding rows' ARE_BYTES[0, 0] are counted by
+        // `trace_builder::shift_padding_are_bytes`, which knows the chunking.
         bitwise_ops.push(BitwiseOperation::byte_op(
             BitwiseOperationType::AreBytes,
             op.shift,

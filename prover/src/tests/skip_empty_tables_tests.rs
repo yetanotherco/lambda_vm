@@ -375,8 +375,8 @@ fn dropping_a_used_table_through_the_real_verifier_is_rejected() {
 /// enforced that this stays true.
 ///
 /// One exception, by bus: `ARE_BYTES` byte checks the spec gives no `cond`
-/// (default 1) — the μ bounds of the dedup tables (spec #1017) and KECCAK_RND's
-/// rotation bytes. A padding row sends them as `ARE_BYTES[0, 0]`, which is in
+/// (default 1) — the μ bounds of the dedup tables (spec #1017), SHIFT's
+/// `shift[0..1]` bytes and KECCAK_RND's θ/ρ bytes. A padding row sends them as `ARE_BYTES[0, 0]`, which is in
 /// range, and their only counterparty is BITWISE, whose multiplicity columns are
 /// free witnesses, so the contribution is absorbed whichever way an unused chip
 /// went; and an optional table with no ops is never shipped

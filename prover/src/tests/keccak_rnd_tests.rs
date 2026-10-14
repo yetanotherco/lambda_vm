@@ -56,17 +56,15 @@ fn test_pi_virtual_matches_rotate() {
     }
 }
 
-// Soundness regression: μ must be a bit. Every other constraint is `μ · identity`
-// (or `μ · x·(1−x)`), so μ = 2, 7 or −1 used to be indistinguishable from μ = 1 at
-// the constraint level, while on the bus μ weights (and with −1 inverts) every
-// send — so a μ = −1 row could invert a range check and act as a carrier (the
-// bytes are not pinned, see `are_bytes_carrier_poc`). The chip does not
-// deduplicate, so `MuIsBit` (μ·(1−μ)=0) is the right fix (like SHIFT/LOAD): it
-// forbids μ = −1 and closes the carrier.
+// Soundness regression: μ must be a bit. The shift identities are `μ · identity`,
+// and every bus send except the ARE_BYTES byte checks (multiplicity 1) is
+// weighted by μ, so μ = 2, 7 or −1 used to be indistinguishable from μ = 1 at the
+// constraint level while scaling those sends (and with −1 turning them into
+// receives). The chip does not deduplicate, so `MuIsBit` (μ·(1−μ)=0) is the right
+// fix (like SHIFT/LOAD).
 //
 // DEFENSIVE: this is a constraint-presence regression (μ ∉ {0,1} is rejected), not
-// an end-to-end forgery; the carrier was confirmed structurally (bytes not pinned,
-// see `are_bytes_carrier_poc`), not demonstrated.
+// an end-to-end forgery.
 mod mu_bit_regression {
     use crate::tables::keccak_rnd::{
         KeccakRndConstraints, KeccakRoundOperation, cols, generate_keccak_rnd_trace,
@@ -105,14 +103,14 @@ mod mu_bit_regression {
     }
 }
 
-// Why MuIsBit is necessary: the θ shift identity reads `cxz_left` as a HALFWORD
-// (`byte_lo + 256·byte_hi`), while ARE_BYTES range-checks the two bytes. So the
-// bytes are NOT pinned by the constraints — a non-canonical split keeps the
-// halfword (and the identity) unchanged while sending an out-of-range byte to
-// ARE_BYTES. A μ = −1 row would invert that send (carrier). With `MuIsBit`
-// forbidding μ = −1 the carrier is closed, but this test shows the underlying
-// gap — the constraints still do not range-constrain the bytes; a μ=−1 row could
-// hold an out-of-range byte and absorb another table's out-of-range ARE_BYTES.
+// Why the byte checks must not depend on μ: the θ shift identity reads
+// `cxz_left` as a HALFWORD (`byte_lo + 256·byte_hi`), while ARE_BYTES
+// range-checks the two bytes. So the bytes are NOT pinned by the constraints — a
+// non-canonical split keeps the halfword (and the identity) unchanged while
+// sending an out-of-range byte to ARE_BYTES. The bus catches it: the byte checks
+// are sent with multiplicity 1 (spec #1017), so no μ can invert them and the
+// out-of-range tuple stays unmatched. This test documents the constraint-level
+// gap.
 mod are_bytes_carrier_poc {
     use crate::tables::keccak_rnd::{
         KeccakRndConstraints, KeccakRoundOperation, cols, generate_keccak_rnd_trace,
@@ -166,5 +164,47 @@ mod are_bytes_carrier_poc {
             validate_busless(&air, &forged),
             "out-of-range cxz_left byte must still satisfy KECCAK_RND's constraints"
         );
+    }
+}
+
+// The θ carry bit `Cxz_right` is IS_BIT-checked on every row, not only when
+// μ = 1 (spec #1017 dropped the `cond = μ`). A padding row (μ = 0) holding
+// `Cxz_right = 2` must be rejected.
+mod cxz_right_bit_regression {
+    use crate::tables::keccak_rnd::{
+        KeccakRndConstraints, KeccakRoundOperation, cols, generate_keccak_rnd_trace,
+    };
+    use crate::tables::types::FE;
+    use crate::test_utils::{busless_air, validate_busless};
+    use executor::vm::instruction::execution::keccak_f1600;
+
+    #[test]
+    fn cxz_right_is_bit_on_padding_rows() {
+        let input = [0x0102030405060708u64; 25];
+        let mut output = input;
+        keccak_f1600(&mut output);
+        let honest = generate_keccak_rnd_trace(&[KeccakRoundOperation {
+            timestamp: 42,
+            input,
+            output,
+        }]);
+        let air = busless_air(cols::NUM_COLUMNS, KeccakRndConstraints);
+        assert!(
+            validate_busless(&air, &honest),
+            "honest trace must validate"
+        );
+
+        // 24 round rows padded to 32: the last row is padding (μ = 0).
+        let pad = honest.main_table.height - 1;
+        assert_eq!(*honest.main_table.get(pad, cols::MU), FE::zero());
+
+        for bad in [FE::from(2u64), -FE::one()] {
+            let mut t = honest.clone();
+            t.main_table.set(pad, cols::cxz_right_bit(0, 0), bad);
+            assert!(
+                !validate_busless(&air, &t),
+                "Cxz_right ∉ {{0,1}} must be rejected even on a μ = 0 row"
+            );
+        }
     }
 }

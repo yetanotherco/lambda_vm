@@ -769,7 +769,7 @@ mod keccak_tests {
         assert_eq!(
             keccak_rnd::KeccakRndConstraints.meta().len(),
             141,
-            "KECCAK_RND: 20 IS_BIT(μ; Cxz_right_bit) + 20 θ + 100 ρ inline shift identities + MuIsBit"
+            "KECCAK_RND: 20 IS_BIT(Cxz_right_bit) + 20 θ + 100 ρ inline shift identities + MuIsBit"
         );
     }
 }

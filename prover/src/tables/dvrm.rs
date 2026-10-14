@@ -23,7 +23,7 @@
 //!
 //! ## Bus Interactions
 //! - Sender: IS_HALF (×20: n, d, r, n_sub_r, q)
-//! - Sender: ARE_BYTES (×2: μ_q, μ_r bounds)
+//! - Sender: ARE_BYTES (×1: `[μ_q, μ_r]`, the batched multiplicity bounds)
 //! - Sender: MSB16 (×3 for sign extraction: n, d, r)
 //! - Sender: ALU (×3, on the unified bus: ×1 LT-flavored for `|r| < |d|`,
 //!   ×2 MUL-flavored for `n - r = d * q` lo/hi)

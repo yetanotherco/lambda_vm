@@ -211,7 +211,7 @@ mod zbs_mu_bit_regression {
     }
 }
 
-// Separate preexisting bug (NOT a multiplicity bug, not fixed by this PR):
+// Separate preexisting bug (not a multiplicity bug):
 // Soundness regression: `is_negative` must be 0 on unsigned rows. It is pinned
 // to the real MSB via the MSB16 bus only when `signed = 1` (multiplicity
 // `signed`), but `shifted_half` fills with `extension = 65535·is_negative`
@@ -260,5 +260,71 @@ mod is_negative_unsigned_poc {
             !validate_busless(&air, &t),
             "unsigned SRL with is_negative=1 must be rejected by UnsignedIsNotNegative"
         );
+    }
+}
+
+/// Consistency: the BITWISE collector tallies exactly the batched
+/// `ARE_BYTES[shift[0], shift[1]] | 1` sends of the generated SHIFT instances —
+/// each real row once and each padding row as `ARE_BYTES[0, 0]` — across single
+/// and multiple instances, with and without padding.
+#[test]
+fn test_shift_byte_checks_match_collector() {
+    use std::collections::HashMap;
+
+    use stark::lookup::{BusValue, Multiplicity, Packing};
+
+    use crate::tables::bitwise::BitwiseOperationType;
+    use crate::tables::shift::{ShiftOperation, collect_bitwise_from_shift, generate_shift_trace};
+    use crate::tables::trace_builder::shift_padding_are_bytes;
+    use crate::tables::types::BusId;
+
+    // The AIR sends one ARE_BYTES[shift[0], shift[1]] with multiplicity 1.
+    let packed = |v: &BusValue| match v {
+        BusValue::Packed {
+            start_column,
+            packing: Packing::Direct,
+        } => Some(*start_column),
+        _ => None,
+    };
+    let are_bytes: Vec<_> = bus_interactions()
+        .into_iter()
+        .filter(|i| i.bus_id == BusId::AreBytes as u64)
+        .collect();
+    assert_eq!(are_bytes.len(), 1);
+    assert!(are_bytes[0].is_sender && matches!(are_bytes[0].multiplicity, Multiplicity::One));
+    assert_eq!(
+        are_bytes[0].values.iter().map(packed).collect::<Vec<_>>(),
+        [Some(cols::SHIFT_AMOUNT), Some(cols::SHIFT_B1)]
+    );
+
+    let distinct = [
+        ShiftOperation::new(0x1234, 3, false, false, false),
+        ShiftOperation::new(u64::MAX, 0x0305, true, true, false),
+        ShiftOperation::new(7, 0xAB_0110, true, false, true),
+    ];
+    for (n, chunk) in [(11usize, 4usize), (5, 1 << 20), (8, 4), (1, 4)] {
+        let ops: Vec<_> = distinct.iter().cycle().take(n).cloned().collect();
+
+        let mut collected: HashMap<(u8, u8), u64> = HashMap::new();
+        for b in collect_bitwise_from_shift(&ops)
+            .iter()
+            .filter(|b| b.lookup_type == BitwiseOperationType::AreBytes)
+        {
+            *collected.entry((b.x, b.y)).or_default() += 1;
+        }
+        *collected.entry((0, 0)).or_default() += shift_padding_are_bytes(&ops, chunk);
+        collected.retain(|_, c| *c != 0);
+
+        let mut expected: HashMap<(u8, u8), u64> = HashMap::new();
+        for c in ops.chunks(chunk) {
+            let t = generate_shift_trace(c);
+            for r in 0..t.num_rows() {
+                let byte = |col| t.get_main(r, col).to_raw() as u8;
+                *expected
+                    .entry((byte(cols::SHIFT_AMOUNT), byte(cols::SHIFT_B1)))
+                    .or_default() += 1;
+            }
+        }
+        assert_eq!(collected, expected, "{n} ops in instances of {chunk}");
     }
 }

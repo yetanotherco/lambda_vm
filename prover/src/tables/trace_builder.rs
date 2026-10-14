@@ -1677,7 +1677,8 @@ fn reg_ts_delta_in_range(timestamp: u64, old_ts: u64) -> bool {
 // Phase 4: All → Bitwise lookups
 // =============================================================================
 
-/// Collects bitwise lookups from LT operations (MSB16 and IS_HALFWORD).
+/// Collects bitwise lookups from LT operations (MSB16, IS_HALFWORD and the
+/// ARE_BYTES[μ, 0] multiplicity bound).
 ///
 /// MSB16 and the operand/difference IS_HALFWORD lookups are emitted once per raw
 /// op. The IS_BYTE[μ] multiplicity bound (`ARE_BYTES[μ, 0] | 1`) is counted once
@@ -1736,7 +1737,7 @@ pub(crate) fn collect_bitwise_from_lt(
     // IS_BYTE[μ] | 1: every row sends its own μ once, padding rows (μ = 0)
     // included, over exactly the rows `generate_lt_trace` builds for each chunk.
     let mu_byte = |v: u64| BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, v as u8);
-    for chunk in lt_ops.chunks(max_rows_lt) {
+    for chunk in op_chunks(lt_ops, max_rows_lt) {
         let rows = lt::dedup_lt_rows(chunk);
         bitwise_ops.extend(rows.iter().map(|(_, mu)| mu_byte(*mu)));
         bitwise_ops.extend(std::iter::repeat_n(
@@ -1824,7 +1825,7 @@ pub(crate) fn collect_bitwise_from_mul(
     let mu_bytes = |a: u64, b: u64| {
         BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, a as u8, b as u8)
     };
-    for chunk in mul_ops.chunks(max_rows_mul) {
+    for chunk in op_chunks(mul_ops, max_rows_mul) {
         let rows = mul::dedup_mul_rows(chunk);
         bitwise_ops.extend(std::iter::repeat_n(
             mu_bytes(0, 0),
@@ -1963,7 +1964,7 @@ pub(crate) fn collect_bitwise_from_dvrm(
     let mu_bytes = |a: u64, b: u64| {
         BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, a as u8, b as u8)
     };
-    for chunk in dvrm_ops.chunks(max_rows_dvrm) {
+    for chunk in op_chunks(dvrm_ops, max_rows_dvrm) {
         let rows = dvrm::dedup_dvrm_rows(chunk);
         bitwise_ops.extend(std::iter::repeat_n(
             mu_bytes(0, 0),
@@ -2041,7 +2042,8 @@ pub(crate) fn collect_bitwise_from_dvrm(
 /// Collects bitwise lookups from BRANCH operations.
 ///
 /// BRANCH sends:
-/// - ARE_BYTES[next_pc_low[1], 0] - range check bits 8-15
+/// - ARE_BYTES[μ, next_pc_low[1]] | 1 - the μ bound batched with the bits 8-15
+///   range check, once per row (padding rows included)
 /// - BYTE_ALU[AND, unmasked_low_byte, 254, next_pc_low[0]] - LSB masking
 /// - IS_HALFWORD[next_pc_high[0..3]] - range checks for bits 16-63
 ///
@@ -2100,7 +2102,7 @@ pub(crate) fn collect_bitwise_from_branch(
     let row_bytes = |mu: u64, low_1: u8| {
         BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, mu as u8, low_1)
     };
-    for chunk in branch_ops.chunks(max_rows_branch) {
+    for chunk in op_chunks(branch_ops, max_rows_branch) {
         let rows = branch::dedup_branch_rows(chunk);
         bitwise_ops.extend(
             rows.iter()
@@ -2121,6 +2123,44 @@ pub(crate) fn collect_bitwise_from_branch(
 /// each padding row too, as `ARE_BYTES[0, 0]`.
 fn chunk_padding_rows(rows: usize) -> usize {
     rows.next_power_of_two().max(4) - rows
+}
+
+/// The per-instance op slices the BITWISE collectors walk, mirroring
+/// `chunk_and_generate_optional`. `.max(1)`: `chunks(0)` panics even on an empty
+/// slice, while the trace builder skips a table with no ops, so a zero row cap
+/// must not panic here either.
+fn op_chunks<T>(ops: &[T], max_rows: usize) -> std::slice::Chunks<'_, T> {
+    ops.chunks(max_rows.max(1))
+}
+
+/// SHIFT's `ARE_BYTES[shift[0], shift[1]] | 1` on the padding rows of every
+/// `max_rows` instance: each one sends `ARE_BYTES[0, 0]` (padding cells are 0).
+/// The real rows are counted by `shift::collect_bitwise_from_shift`.
+pub(crate) fn shift_padding_are_bytes(shift_ops: &[ShiftOperation], max_rows: usize) -> u64 {
+    op_chunks(shift_ops, max_rows)
+        .map(|chunk| chunk_padding_rows(chunk.len()) as u64)
+        .sum()
+}
+
+/// BYTEWISE's IS_BYTE[μ] bound (`ARE_BYTES[μ, 0] | 1`): every row of each
+/// `max_rows` instance sends its own μ once, padding rows (μ = 0) included, over
+/// exactly the rows `generate_bytewise_trace` builds. The per-op BYTE_ALU lookups
+/// are counted by `bytewise::BytewiseOperation::collect_bitwise_ops`.
+pub(crate) fn collect_bytewise_mu_bounds(
+    bytewise_ops: &[bytewise::BytewiseOperation],
+    max_rows: usize,
+) -> Vec<BitwiseOperation> {
+    let mu_byte = |v: u64| BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, v as u8);
+    let mut bounds = Vec::new();
+    for chunk in op_chunks(bytewise_ops, max_rows) {
+        let rows = bytewise::dedup_bytewise_rows(chunk);
+        bounds.extend(rows.iter().map(|(_, mu)| mu_byte(*mu)));
+        bounds.extend(std::iter::repeat_n(
+            mu_byte(0),
+            chunk_padding_rows(rows.len()),
+        ));
+    }
+    bounds
 }
 
 /// Generates ARE_BYTES ops for CPU padding rows.
@@ -3344,9 +3384,9 @@ fn build_traces<I: ImageSource + Sync>(
     // so every source can be collected in parallel and the per-worker histograms summed in
     // any order.
     //
-    // MUL/DVRM dedup their per-unique bit-gated lookups PER CHIP INSTANCE, so pass the same
-    // chunk size used to split them into instances so multiplicities match the per-instance
-    // sends. MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]. PAGE does a
+    // LT/MUL/DVRM/BRANCH/BYTEWISE count their per-row lookups (μ bound, bit-gated
+    // MSB16/ZERO) and SHIFT its padding rows PER CHIP INSTANCE, so pass the same chunk size
+    // used to split them into instances so multiplicities match the per-instance sends. MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]. PAGE does a
     // batched ARE_BYTES[init, fini] per row (skipped in continuation epochs, which the L2G
     // table owns). COMMIT sends AreBytes+IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL;
     // HINT sends ARE_BYTES for its 32 output cells.
@@ -3373,32 +3413,16 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_branch(&branch_ops, branch_chunk))),
         Box::new(|h| {
             h.add_ops(&shift::collect_bitwise_from_shift(&shift_ops));
-            // ARE_BYTES[shift[0], shift[1]] | 1 also fires on each chunk's padding rows.
-            // `.max(1)`: `chunks(0)` panics on an externally supplied zero row cap.
-            for chunk in shift_ops.chunks(shift_chunk.max(1)) {
-                h.bump_n(
-                    BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, 0, 0),
-                    chunk_padding_rows(chunk.len()) as u64,
-                );
-            }
+            h.bump_n(
+                BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, 0, 0),
+                shift_padding_are_bytes(&shift_ops, shift_chunk),
+            );
         }),
         Box::new(|h| {
             for op in &bytewise_ops {
                 h.add_ops(&op.collect_bitwise_ops());
             }
-            // IS_BYTE[μ] | 1: every row sends its own μ once, padding rows (μ = 0)
-            // included, over exactly the rows `generate_bytewise_trace` builds for
-            // each chunk. Mirrors the LT/MUL/DVRM/BRANCH bound.
-            // `.max(1)`: `chunks(0)` panics, and `bytewise_chunk` is an
-            // externally supplied row cap that could be 0.
-            let mu_byte =
-                |v: u64| BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, v as u8);
-            for chunk in bytewise_ops.chunks(bytewise_chunk.max(1)) {
-                let rows = bytewise::dedup_bytewise_rows(chunk);
-                let ops: Vec<_> = rows.iter().map(|(_, mu)| mu_byte(*mu)).collect();
-                h.add_ops(&ops);
-                h.bump_n(mu_byte(0), chunk_padding_rows(rows.len()) as u64);
-            }
+            h.add_ops(&collect_bytewise_mu_bounds(&bytewise_ops, bytewise_chunk));
         }),
         Box::new(|h| {
             for op in &eq_ops {
