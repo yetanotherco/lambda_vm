@@ -48,13 +48,8 @@ fn assert_count_table_lengths_matches(elf: &Elf, logs: &[Log]) {
         "shift"
     );
     assert_eq!(
-        predicted.commit_padded_rows,
-        sum_heights(&traces.commits),
-        "commit"
-    );
-    assert_eq!(
-        predicted.memmove_padded_rows, traces.memmove.main_table.height as u64,
-        "memmove"
+        predicted.copy_padded_rows, traces.copy.main_table.height as u64,
+        "copy"
     );
     assert_eq!(
         predicted.decode_rows, traces.decode.main_table.height as u64,

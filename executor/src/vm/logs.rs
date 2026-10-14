@@ -10,7 +10,7 @@
 /// write_register=false, so src/dst are unconstrained):
 /// - `src1_val` = syscall number (from x17): 64=Commit, 93=Halt, etc.
 /// - `src2_val` = Commit: buf_addr (x11); Keccak: state_addr; ECSM: addr_xG;
-///   Hint: input addr; DMA memcpy and DMA memset: the number of MEMMOVE rows the
+///   Hint: input addr; DMA memcpy and DMA memset: the number of COPY rows the
 ///   call produces. 0 for every other syscall.
 /// - `dst_val` = Commit: count (x12); ECSM: addr_k; Hint: output addr;
 ///   DMA memcpy and DMA memset: byte count. 0 for every other syscall, Keccak

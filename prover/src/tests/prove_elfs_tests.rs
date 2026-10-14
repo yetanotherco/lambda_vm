@@ -1409,15 +1409,12 @@ fn test_prove_dma_memcpy_cases_rust_guest() {
 
 #[test]
 fn test_prove_dma_memcpy_forged_value_rejected() {
-    use crate::tables::memmove::cols as dma_cols;
+    use crate::tables::copy::cols as dma_cols;
 
     let (elf, mut traces) = dma_memcpy_fixture();
     let forged_row = dma_row_matching(&traces, |_, end, _tail| !end);
-    let original = *traces
-        .memmove
-        .main_table
-        .get(forged_row, dma_cols::VALUE[0]);
-    traces.memmove.main_table.set(
+    let original = *traces.copy.main_table.get(forged_row, dma_cols::VALUE[0]);
+    traces.copy.main_table.set(
         forged_row,
         dma_cols::VALUE[0],
         original + FieldElement::<GoldilocksField>::one(),
@@ -1432,25 +1429,22 @@ fn test_prove_dma_memcpy_forged_value_rejected() {
 
 #[test]
 fn test_prove_dma_memcpy_forged_intermediate_source_rejected() {
-    use crate::tables::memmove::cols as dma_cols;
+    use crate::tables::copy::cols as dma_cols;
 
     let (elf, mut traces) = dma_memcpy_fixture();
     let forged_row = dma_row_matching(&traces, |first, end, _tail| !first && !end);
 
     // Shift both the current source and its locally-consistent successor. The
-    // row's ADD remains valid, but the predecessor's MemmoveNext tuple and the
+    // row's ADD remains valid, but the predecessor's CopyNext tuple and the
     // source-memory read no longer match.
-    let src_lo = *traces.memmove.main_table.get(forged_row, dma_cols::SRC_0);
-    let src_incr_lo = *traces
-        .memmove
-        .main_table
-        .get(forged_row, dma_cols::SRC_INCR_0);
-    traces.memmove.main_table.set(
+    let src_lo = *traces.copy.main_table.get(forged_row, dma_cols::SRC_0);
+    let src_incr_lo = *traces.copy.main_table.get(forged_row, dma_cols::SRC_INCR_0);
+    traces.copy.main_table.set(
         forged_row,
         dma_cols::SRC_0,
         src_lo + FieldElement::from(8u64),
     );
-    traces.memmove.main_table.set(
+    traces.copy.main_table.set(
         forged_row,
         dma_cols::SRC_INCR_0,
         src_incr_lo + FieldElement::from(8u64),
@@ -1465,26 +1459,26 @@ fn test_prove_dma_memcpy_forged_intermediate_source_rejected() {
 
 #[test]
 fn test_prove_dma_memcpy_forged_early_end_rejected() {
-    use crate::tables::memmove::cols as dma_cols;
+    use crate::tables::copy::cols as dma_cols;
 
     let (elf, mut traces) = dma_memcpy_fixture();
     let forged_row = dma_row_matching(&traces, |_first, end, _tail| !end);
     traces
-        .memmove
+        .copy
         .main_table
         .set(forged_row, dma_cols::END, FieldElement::one());
 
-    assert_dma_forgery_rejected(&elf, &mut traces, "END must be equivalent to count == 0");
+    assert_dma_forgery_rejected(&elf, &mut traces, "END must be equivalent to count == step");
 }
 
 #[test]
 fn test_prove_dma_memcpy_forged_wide_tail_rejected() {
-    use crate::tables::memmove::cols as dma_cols;
+    use crate::tables::copy::cols as dma_cols;
 
     let (elf, mut traces) = dma_memcpy_fixture();
     let forged_row = dma_row_matching(&traces, |_first, end, tail| !end && !tail);
     traces
-        .memmove
+        .copy
         .main_table
         .set(forged_row, dma_cols::SINGLE, FieldElement::one());
 
@@ -1493,7 +1487,7 @@ fn test_prove_dma_memcpy_forged_wide_tail_rejected() {
 
 #[test]
 fn test_prove_dma_memset_forged_intermediate_fill_rejected() {
-    use crate::tables::memmove::cols as dma_set_cols;
+    use crate::tables::copy::cols as dma_set_cols;
 
     let (elf, mut traces) = dma_memset_fixture();
     // A wide row matters here: on a one-byte row the unused lanes must stay zero, so
@@ -1503,8 +1497,8 @@ fn test_prove_dma_memset_forged_intermediate_fill_rejected() {
     // Shift both lanes so the row stays internally consistent locally; only the chain
     // token and the MEMW write disagree.
     for column in [dma_set_cols::VALUE[0], dma_set_cols::VALUE[1]] {
-        let original = *traces.memmove.main_table.get(forged_row, column);
-        traces.memmove.main_table.set(
+        let original = *traces.copy.main_table.get(forged_row, column);
+        traces.copy.main_table.set(
             forged_row,
             column,
             original + FieldElement::<GoldilocksField>::one(),
@@ -1520,30 +1514,30 @@ fn test_prove_dma_memset_forged_intermediate_fill_rejected() {
 
 #[test]
 fn test_prove_dma_memset_forged_early_end_rejected() {
-    use crate::tables::memmove::cols as dma_set_cols;
+    use crate::tables::copy::cols as dma_set_cols;
 
     let (elf, mut traces) = dma_memset_fixture();
     let forged_row = dma_set_row_matching(&traces, |_first, end, _tail| !end);
     traces
-        .memmove
+        .copy
         .main_table
         .set(forged_row, dma_set_cols::END, FieldElement::one());
 
-    assert_dma_forgery_rejected(&elf, &mut traces, "END must be equivalent to count == 0");
+    assert_dma_forgery_rejected(&elf, &mut traces, "END must be equivalent to count == step");
 }
 
-/// Flipping `tail` rewrites `step` from 8 to 1, so the row's own address and
-/// count arithmetic stop holding. Note this is rejected locally by the ADD
-/// carries, NOT by the ALU LT that pins `tail = (count < 8)` — that bus has no
-/// negative coverage here, the same gap the memcpy sibling has.
+/// Flipping `single` rewrites `step` from 8 to 1, so the row's own address and
+/// count arithmetic stop holding. It is rejected locally by the ADD carries; there
+/// is no ALU LT pinning the width any more, because a chain that takes the wrong
+/// width can no longer reach a legal `end`.
 #[test]
 fn test_prove_dma_memset_forged_wide_tail_rejected() {
-    use crate::tables::memmove::cols as dma_set_cols;
+    use crate::tables::copy::cols as dma_set_cols;
 
     let (elf, mut traces) = dma_memset_fixture();
     let forged_row = dma_set_row_matching(&traces, |_first, end, tail| !end && !tail);
     traces
-        .memmove
+        .copy
         .main_table
         .set(forged_row, dma_set_cols::SINGLE, FieldElement::one());
 
@@ -1551,18 +1545,18 @@ fn test_prove_dma_memset_forged_wide_tail_rejected() {
 }
 
 /// Soundness: the timestamp order is what makes a memset a memset. Clearing `IS_SET`
-/// on a chain turns the row back into an ordinary snapshot copy, which reads at `T+1`
-/// instead of `T+2` — so the read no longer observes the previous row's write and the
+/// on a chain turns the row back into an ordinary snapshot copy, which reads at `T`
+/// instead of `T+1` — so the read no longer observes the previous row's write and the
 /// MEMW tuples stop matching the memory the executor produced. This is the one piece of
 /// the unified chip with no ancestor in either of the tables it replaces.
 #[test]
 fn test_prove_dma_memset_forged_order_bit_rejected() {
-    use crate::tables::memmove::cols as mm_cols;
+    use crate::tables::copy::cols as mm_cols;
 
     let (elf, mut traces) = dma_memset_fixture();
     let forged_row = dma_set_row_matching(&traces, |_first, end, _tail| !end);
     traces
-        .memmove
+        .copy
         .main_table
         .set(forged_row, mm_cols::IS_SET, FieldElement::zero());
 
@@ -1575,18 +1569,18 @@ fn test_prove_dma_memset_forged_order_bit_rejected() {
 
 #[test]
 fn test_prove_dma_memset_forged_intermediate_destination_rejected() {
-    use crate::tables::memmove::cols as dma_set_cols;
+    use crate::tables::copy::cols as dma_set_cols;
 
     let (elf, mut traces) = dma_memset_fixture();
     let forged_row = dma_set_row_matching(&traces, |first, end, tail| !first && !end && !tail);
 
     // Shift both the current destination and its locally-consistent successor.
-    // The row's ADD stays valid; the predecessor's MemmoveNext tuple and the
+    // The row's ADD stays valid; the predecessor's CopyNext tuple and the
     // memory write no longer match.
     for column in [dma_set_cols::DST_0, dma_set_cols::DST_INCR_0] {
-        let original = *traces.memmove.main_table.get(forged_row, column);
+        let original = *traces.copy.main_table.get(forged_row, column);
         traces
-            .memmove
+            .copy
             .main_table
             .set(forged_row, column, original + FieldElement::from(8u64));
     }
@@ -1617,12 +1611,12 @@ fn dma_memset_fixture() -> (Elf, Traces) {
 }
 
 fn dma_set_row_matching(traces: &Traces, predicate: impl Fn(bool, bool, bool) -> bool) -> usize {
-    use crate::tables::memmove::cols as mm_cols;
+    use crate::tables::copy::cols as mm_cols;
 
     let one = FieldElement::<GoldilocksField>::one();
-    (0..traces.memmove.num_rows())
+    (0..traces.copy.num_rows())
         .find(|&row| {
-            let get = |column| *traces.memmove.main_table.get(row, column) == one;
+            let get = |column| *traces.copy.main_table.get(row, column) == one;
             get(mm_cols::MU)
                 && get(mm_cols::IS_SET)
                 && predicate(get(mm_cols::FIRST), get(mm_cols::END), get(mm_cols::SINGLE))
@@ -1649,19 +1643,19 @@ fn dma_memcpy_fixture() -> (Elf, Traces) {
 }
 
 fn dma_row_matching(traces: &Traces, predicate: impl Fn(bool, bool, bool) -> bool) -> usize {
-    use crate::tables::memmove::cols as mm_cols;
+    use crate::tables::copy::cols as mm_cols;
 
     let one = FieldElement::<GoldilocksField>::one();
-    (0..traces.memmove.num_rows())
+    (0..traces.copy.num_rows())
         .find(|&row| {
-            let get = |column| *traces.memmove.main_table.get(row, column) == one;
+            let get = |column| *traces.copy.main_table.get(row, column) == one;
             // memcpy rows only: memset and commit have their own forgery surface.
-            let is_copy = !get(mm_cols::IS_SET) && !get(mm_cols::IS_COMMIT);
+            let is_copy = !get(mm_cols::IS_SET) && !get(mm_cols::IS_WRITE);
             get(mm_cols::MU)
                 && is_copy
                 && predicate(get(mm_cols::FIRST), get(mm_cols::END), get(mm_cols::SINGLE))
         })
-        .expect("guest must contain the requested real MEMMOVE copy row")
+        .expect("guest must contain the requested real COPY copy row")
 }
 
 fn assert_dma_forgery_rejected(elf: &Elf, traces: &mut Traces, reason: &str) {
@@ -3208,7 +3202,6 @@ fn test_verify_rejects_zero_table_counts() {
             ecsm: 0,
             ecdas: 0,
             hint: 0,
-            commit: 0,
         },
         ..vm_proof
     };
@@ -3299,7 +3292,6 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         ecsm: 0,
         ecdas: 0,
         hint: 0,
-        commit: 0,
     };
     let airs = VmAirs::new(
         &elf,

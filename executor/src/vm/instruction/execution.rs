@@ -39,11 +39,11 @@ syscall_numbers! {
     Hint = 95,
     /// Placeholder discriminant. The actual syscall value is
     /// `DMA_MEMCPY_SYSCALL_NUMBER`. `memcpy` and `memmove` chunks are proven by
-    /// the MEMMOVE table.
+    /// the COPY table.
     DmaMemcpy = 96,
     /// Placeholder discriminant. The actual syscall value is
     /// `DMA_MEMSET_SYSCALL_NUMBER`. `memset` chunks are proven by the same
-    /// MEMMOVE table, which derives the inverted timestamp order from this number.
+    /// COPY table, which derives the inverted timestamp order from this number.
     DmaMemset = 97,
 }
 
@@ -63,7 +63,7 @@ pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
 /// Syscall number for the copy accelerator, serving `memcpy` and `memmove`.
 ///
 /// The spec uses ECALL number `-30`, i.e. `u64::MAX - 29 = 0xFFFF_FFFF_FFFF_FFE2`,
-/// which the MEMMOVE table puts on the `Ecall` bus as
+/// which the COPY table puts on the `Ecall` bus as
 /// `[lo32, hi32] = [2^32 - 30, 2^32 - 1]`.
 ///
 /// It starts a new group deliberately. `-1` through `-10` are reserved for hash
@@ -74,13 +74,13 @@ pub const DMA_MEMCPY_SYSCALL_NUMBER: u64 = u64::MAX - 29;
 /// larger copies, and the prover enforces this bound on every first DMA row.
 pub const DMA_MEMCPY_MAX_BYTES: u64 = 256;
 
-/// Width of one MEMMOVE row: eight bytes while at least eight remain, then one per
+/// Width of one COPY row: eight bytes while at least eight remain, then one per
 /// remaining byte.
 ///
-/// The AIR does not require this schedule. `tail` is a free bit, constrained only by
-/// `(1 - tail) * lt8 = 0`, so a one-byte row is legal at any count and a prover may
-/// walk one-byte rows to reach eight-byte alignment and keep the body on the cheaper
-/// `MEMW_A` table. This function simply declines to.
+/// The AIR does not require this schedule. `single` is a free bit, so a one-byte row
+/// is legal at any count and a prover may walk one-byte rows to reach eight-byte
+/// alignment and keep the body on the cheaper `MEMW_A` table. This function simply
+/// declines to.
 ///
 /// It used to do exactly that, splitting whenever `src` and `dst` shared a residue
 /// mod 8. Measured on a real mainnet block, that cost more than it saved: prove time
@@ -92,54 +92,58 @@ pub const DMA_MEMCPY_MAX_BYTES: u64 = 256;
 /// gated on a minimum body length could still win; the AIR already permits it, so it
 /// can be added later without touching the constraint system or the proof format.
 ///
-/// `src`, `dst`, `offset` and `to_commit` stay in the signature for that reason: every
+/// `src`, `dst`, `offset` and `is_write` stay in the signature for that reason: every
 /// consumer — the executor's row count, the trace builder, the sizing pass and the CLI
 /// report — already routes through here, so a future schedule needs no new plumbing.
-pub fn memmove_row_width(src: u64, dst: u64, offset: u64, remaining: u64, to_commit: bool) -> u8 {
+pub fn copy_row_width(src: u64, dst: u64, offset: u64, remaining: u64, is_write: bool) -> u8 {
     if remaining < 8 {
         return 1;
     }
-    let _ = (src, dst, offset, to_commit);
+    let _ = (src, dst, offset, is_write);
     8
 }
 
-/// Total MEMMOVE rows one ecall produces: its data rows plus the terminal row.
+/// Total COPY rows one ecall produces.
 ///
-/// The width follows from `count` alone today, so this is `count / 8 + count % 8 + 1`.
-/// It is still written as a loop over `memmove_row_width` because that function is what
-/// the trace builder and the sizing pass call, and a future schedule that reads the
-/// addresses would otherwise silently diverge from the rows actually built. Every
-/// consumer that needs a row count goes through here for the same reason.
-pub fn memmove_trace_rows(src: u64, dst: u64, count: u64, to_commit: bool) -> u64 {
-    let mut rows = 1;
+/// There is no separate terminal row: the chain ends on the row that moves the last
+/// bytes, which is the row where `count == step`. A zero-length call still needs one
+/// row, the degenerate `(count, first) = (0, 1)` state the AIR admits.
+///
+/// The width follows from `count` alone today, so this is `count / 8 + count % 8`,
+/// floored at one. It is still written as a loop over `copy_row_width` because that
+/// function is what the trace builder and the sizing pass call, and a future schedule
+/// that reads the addresses would otherwise silently diverge from the rows actually
+/// built. Every consumer that needs a row count goes through here for the same reason.
+pub fn copy_trace_rows(src: u64, dst: u64, count: u64, is_write: bool) -> u64 {
+    let mut rows = 0;
     let mut offset = 0u64;
     let mut remaining = count;
     while remaining != 0 {
-        let width = u64::from(memmove_row_width(src, dst, offset, remaining, to_commit));
+        let width = u64::from(copy_row_width(src, dst, offset, remaining, is_write));
         offset += width;
         remaining -= width;
         rows += 1;
     }
-    rows
+    rows.max(1)
 }
 /// Syscall number for `memset`, the same accelerator run with the read/write
 /// timestamp order inverted.
 ///
-/// ECALL number `-32`, i.e. `u64::MAX - 31`. It is not `-31` because
-/// [`HINT_SYSCALL_NUMBER`] already holds that, so the copy group is `-30` and `-32`
-/// with the hint wedged between. Must match `syscalls/src/syscalls.rs`.
+/// The spec uses ECALL number `-31`, i.e. `u64::MAX - 30 = 0xFFFF_FFFF_FFFF_FFE1`,
+/// which the COPY table puts on the `Ecall` bus as
+/// `[lo32, hi32] = [2^32 - 31, 2^32 - 1]`. Must match `syscalls/src/syscalls.rs`.
 ///
-/// MEMMOVE decodes the functionality by receiving the syscall number as a line in
-/// `is_set`, so any number on that line is reachable by some field element and no
-/// particular neighbour is special. `IS_BIT(is_set)` is what carries the decoding
-/// argument, and it does so whatever the numbering.
-pub const DMA_MEMSET_SYSCALL_NUMBER: u64 = u64::MAX - 31;
+/// COPY decodes the functionality by receiving the syscall number as a line in
+/// `is_set` and `is_write`, so the three accepted numbers are exactly `64`, `-30`
+/// and `-31` and nothing else is reachable. The bitness of the two flags is what
+/// carries the decoding argument.
+pub const DMA_MEMSET_SYSCALL_NUMBER: u64 = u64::MAX - 30;
 
 /// The one operand shape a DMA memset ecall may have: the destination trails the
 /// source by exactly one wide row.
 ///
 /// This is not a convention, it is what makes the call sound. The accelerator runs
-/// an `is_set` call with the write at `T+1` and the read at `T+2`, so a row's read
+/// an `is_set` call with the write at `T` and the read at `T+1`, so a row's read
 /// observes writes the same call already made — which is what propagates the seed.
 /// That pins the copied value only while the read resolves to a *different*,
 /// already-written address. With `dst == src` the read and the write address the
@@ -177,7 +181,10 @@ pub const fn dma_memset_crosses_limb_boundary(dst: u64, n: u64) -> bool {
 /// verification failure. The ecall adds no in-circuit correctness constraint of its
 /// own — it lets the guest replace an expensive computation with a cheap check,
 /// without letting the (prover-chosen) hinted value change the guest's result.
-pub const HINT_SYSCALL_NUMBER: u64 = u64::MAX - 30;
+/// ECALL number `-32`, i.e. `u64::MAX - 31`. The spec's ECALL list does not define
+/// `hint`, so it takes the first number below the copy group (`-30` memcpy/memmove,
+/// `-31` memset) rather than sitting between them.
+pub const HINT_SYSCALL_NUMBER: u64 = u64::MAX - 31;
 
 /// Hint operation selector passed in `a0`.
 pub const HINT_FIELD_INV: u64 = 0; // secp256k1 base-field inverse (mod p)
@@ -709,8 +716,8 @@ impl Instruction {
                     SyscallNumbers::DmaMemcpy => {
                         // memcpy(dst = x10, src = x11, n = x12). Snapshot the input
                         // before writing, which also gives this ecall well-defined
-                        // memmove semantics when the regions overlap. The DMA trace
-                        // authenticates the same read-at-T+1/write-at-T+2 relation.
+                        // memmove semantics when the regions overlap. The COPY trace
+                        // authenticates the same read-at-T/write-at-T+1 relation.
                         let dst = registers.read(10)?;
                         let src = registers.read(11)?;
                         let n = registers.read(12)?;
@@ -729,7 +736,7 @@ impl Instruction {
                         for (i, &byte) in bytes[..n as usize].iter().enumerate() {
                             memory.store_byte(dst + i as u64, byte);
                         }
-                        src2_val = memmove_trace_rows(src, dst, n, false);
+                        src2_val = copy_trace_rows(src, dst, n, false);
                         dst_val = n;
                     }
                     SyscallNumbers::DmaMemset => {
@@ -738,7 +745,7 @@ impl Instruction {
                         // ordinary store and calls with `dst = seed_end`,
                         // `src = seed_start`, so this is a plain overlapping memmove
                         // and only the timestamp order distinguishes it: the accelerator
-                        // writes at T+1 and reads at T+2, so each step observes the
+                        // writes at T and reads at T+1, so each step observes the
                         // previous step's write and the seed propagates across the range.
                         // A forward byte walk is exactly that semantics.
                         let dst = registers.read(10)?;
@@ -775,7 +782,7 @@ impl Instruction {
                             let byte = memory.load_byte(src + i);
                             memory.store_byte(dst + i, byte);
                         }
-                        src2_val = memmove_trace_rows(src, dst, n, false);
+                        src2_val = copy_trace_rows(src, dst, n, false);
                         dst_val = n;
                     }
                     SyscallNumbers::Hint => {

@@ -42,7 +42,7 @@ use stark::trace::TraceTable;
 use super::bitwise::{self, BitwiseOperation, BitwiseOperationType};
 use super::branch::{self, BranchOperation};
 use super::bytewise;
-use super::commit::{self, CommitOperation};
+use super::copy;
 use super::cpu::{self, CpuOperation};
 use super::cpu32;
 use super::decode;
@@ -58,7 +58,6 @@ use super::keccak_rnd::{self, KeccakRoundOperation};
 use super::load::{self, LoadOperation};
 use super::local_to_global;
 use super::lt::{self, LtOperation};
-use super::memmove;
 use super::memw::{self, MemwOperation};
 use super::memw_aligned;
 use super::memw_register::{self, RegRow};
@@ -265,12 +264,19 @@ impl RegisterState {
             );
         }
 
-        // Synthetic x254 commit index at address 508 (single-word per spec).
+        // Synthetic x254 commit index at addresses 508..509. COPY reads it through
+        // the same `REG` template as x10, so it is a two-word register like any
+        // other; the index itself never exceeds 32 bits, so the high word is zero.
         {
             let (value, timestamp) = self.index_register;
+            let base_addr = register::register_base_address(254);
+            map.insert(base_addr, FinalRegisterWordState { timestamp, value });
             map.insert(
-                register::register_base_address(254),
-                FinalRegisterWordState { timestamp, value },
+                base_addr + 1,
+                FinalRegisterWordState {
+                    timestamp,
+                    value: 0,
+                },
             );
         }
 
@@ -533,7 +539,7 @@ fn build_reg_fallback(
 ///
 /// MEMW and LOAD collection requires sequential processing with state tracking.
 ///
-/// Returns: (memw_buckets, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops,
+/// Returns: (memw_buckets, load_ops, lt_ops, shift_ops, bitwise_ops,
 /// keccak_ops, cpu32_ops, ecsm_ops, ecdas_ops)
 #[allow(clippy::type_complexity)]
 fn collect_ops_from_cpu(
@@ -546,12 +552,11 @@ fn collect_ops_from_cpu(
     Vec<LtOperation>,
     Vec<ShiftOperation>,
     Vec<BitwiseOperation>,
-    Vec<CommitOperation>,
     Vec<KeccakOperation>,
     Vec<cpu32::Cpu32Operation>,
     Vec<ecsm::EcsmOperation>,
     Vec<ecdas::EcdasOperation>,
-    Vec<memmove::MemmoveOperation>,
+    Vec<copy::CopyOperation>,
     Vec<hint::HintOperation>,
 ) {
     let mut memw = MemwBuckets::with_register_capacity(cpu_ops.len() * 3);
@@ -559,20 +564,18 @@ fn collect_ops_from_cpu(
     let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
     let mut shift_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
     let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
-    let mut commit_ops = Vec::new();
     let mut keccak_ops = Vec::new();
     let mut cpu32_ops = Vec::new();
     let mut ecsm_ops = Vec::new();
     let mut ecdas_ops = Vec::new();
-    let mut memmove_ops: Vec<memmove::MemmoveOperation> = Vec::new();
+    let mut copy_ops: Vec<copy::CopyOperation> = Vec::new();
     let mut hint_ops = Vec::new();
     // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
     // continuation epoch indexes its commits globally, matching the x254 the
     // register binding transports across epochs. Resetting to 0 here would drift
-    // from x254 and break the COMMIT chip's Memw token (see the drift assert below).
+    // from x254 and break the COPY chip's Memw token (see the drift assert below).
     let start_commit_index = register_state.read_index().0;
     let mut current_commit_index = start_commit_index;
-    let mut commit_ecall_count = 0u32;
 
     for op in cpu_ops {
         // Word (`*W`) instructions delegate to the CPU32 table (built in program
@@ -598,25 +601,28 @@ fn collect_ops_from_cpu(
         // Collect register operations (M1, M3, M5)
         collect_register_ops_from_cpu(op, register_state, &mut memw);
 
-        // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
+        // The `write` syscall: the COPY chip receives the ECALL, reads the operand
+        // registers, advances x254 and moves the bytes into the COMMIT domain.
         if op.ecall_commit {
-            commit_ops.extend(expand_commit_operations_for_ecall(
-                op,
-                memory_state,
-                current_commit_index as u64,
-            ));
-            let reg_commit_ops = collect_commit_memw_ops(op, register_state, memory_state);
-            memw.extend_ops(reg_commit_ops);
-            let (commit_memw, commit_rows) = collect_memmove_ops(
-                memmove::Functionality::Commit,
+            let index = u64::from(current_commit_index);
+            memw.extend_ops(collect_copy_register_ops(
+                copy::Functionality::Write,
                 op.timestamp,
                 op.commit_buf_addr,
-                current_commit_index as u64,
+                index,
+                op.commit_count,
+                register_state,
+            ));
+            let (write_memw, rows) = collect_copy_ops(
+                copy::Functionality::Write,
+                op.timestamp,
+                op.commit_buf_addr,
+                index,
                 op.commit_count,
                 memory_state,
             );
-            memw.extend_ops(commit_memw);
-            memmove_ops.extend(commit_rows);
+            memw.extend_ops(write_memw);
+            copy_ops.extend(rows);
             let count = u32::try_from(op.commit_count).expect("commit_count exceeds u32 range");
             current_commit_index = current_commit_index
                 .checked_add(count)
@@ -626,7 +632,6 @@ fn collect_ops_from_cpu(
                 register_state.read_index().0,
                 "commit index drift: current_commit_index and register_state.index_register must stay in sync"
             );
-            commit_ecall_count += 1;
         }
 
         // Collect KeccakPermute ECALL operations
@@ -676,17 +681,16 @@ fn collect_ops_from_cpu(
             let dst = register_state.read(10).0;
             let src = register_state.read(11).0;
             let count = register_state.read(12).0;
-            for (reg, value) in [(10u8, dst), (11u8, src), (12u8, count)] {
-                let packed = pack_register_value(value);
-                let (_old_value, old_ts) = register_state.read(reg);
-                memw.extend_ops(vec![
-                    MemwOperation::new(true, 2 * reg as u64, packed, op.timestamp, 2, true)
-                        .with_old(packed, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
-                ]);
-                register_state.write(reg, value, op.timestamp);
-            }
-            let (mm_memw, rows) = collect_memmove_ops(
-                memmove::Functionality::Copy,
+            memw.extend_ops(collect_copy_register_ops(
+                copy::Functionality::Copy,
+                op.timestamp,
+                src,
+                dst,
+                count,
+                register_state,
+            ));
+            let (mm_memw, rows) = collect_copy_ops(
+                copy::Functionality::Copy,
                 op.timestamp,
                 src,
                 dst,
@@ -694,7 +698,7 @@ fn collect_ops_from_cpu(
                 memory_state,
             );
             memw.extend_ops(mm_memw);
-            memmove_ops.extend(rows);
+            copy_ops.extend(rows);
         }
 
         // DMA memset: authenticate x10/x11/x12, then run the copy primitive with the
@@ -703,23 +707,22 @@ fn collect_ops_from_cpu(
         // calls with `dst = src + 8`, so each row's read observes the write eight
         // bytes back and the seed propagates. That is what the two `is_set` gap constraints pin.
         if op.ecall_dma_memset {
-            // memset is a memmove call whose only distinguishing feature is the
+            // memset is a copy call whose only distinguishing feature is the
             // inverted timestamp order; the stub already seeded the first eight
             // bytes and passed dst = seed_end, src = seed_start, count = n - 8.
             let dst = register_state.read(10).0;
             let src = register_state.read(11).0;
             let count = register_state.read(12).0;
-            for (reg, value) in [(10u8, dst), (11u8, src), (12u8, count)] {
-                let packed = pack_register_value(value);
-                let (_old_value, old_ts) = register_state.read(reg);
-                memw.extend_ops(vec![
-                    MemwOperation::new(true, 2 * reg as u64, packed, op.timestamp, 2, true)
-                        .with_old(packed, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
-                ]);
-                register_state.write(reg, value, op.timestamp);
-            }
-            let (memset_memw, rows) = collect_memmove_ops(
-                memmove::Functionality::Set,
+            memw.extend_ops(collect_copy_register_ops(
+                copy::Functionality::Set,
+                op.timestamp,
+                src,
+                dst,
+                count,
+                register_state,
+            ));
+            let (memset_memw, rows) = collect_copy_ops(
+                copy::Functionality::Set,
                 op.timestamp,
                 src,
                 dst,
@@ -727,7 +730,7 @@ fn collect_ops_from_cpu(
                 memory_state,
             );
             memw.extend_ops(memset_memw);
-            memmove_ops.extend(rows);
+            copy_ops.extend(rows);
         }
 
         // Collect Hint ecall operations (the 32-byte output write).
@@ -773,22 +776,17 @@ fn collect_ops_from_cpu(
         bitwise_ops.extend(op.collect_bitwise_ops());
     }
 
-    // COMMIT is one row per ecall now: the sys_write number, the fd check and the
-    // x254 update. The byte loop lives on the MEMMOVE chip, so the committed length
-    // is checked against the rows that actually move the bytes.
+    // There is no COMMIT table any more: COPY receives the `write` ECALL itself. The
+    // committed length is checked against the rows that actually move the bytes, and
+    // a zero-length `write` contributes a single row that moves none.
     debug_assert_eq!(
-        commit_ops.len(),
-        commit_ecall_count as usize,
-        "COMMIT should hold exactly one row per commit ecall"
-    );
-    debug_assert_eq!(
-        memmove_ops
+        copy_ops
             .iter()
-            .filter(|op| op.functionality == memmove::Functionality::Commit && !op.end)
+            .filter(|op| op.functionality == copy::Functionality::Write && op.count != 0)
             .map(|op| op.width as u64)
             .sum::<u64>(),
-        (current_commit_index - start_commit_index) as u64,
-        "MEMMOVE should move exactly the committed byte count"
+        u64::from(current_commit_index - start_commit_index),
+        "COPY should move exactly the committed byte count"
     );
 
     (
@@ -797,12 +795,11 @@ fn collect_ops_from_cpu(
         lt_ops,
         shift_ops,
         bitwise_ops,
-        commit_ops,
         keccak_ops,
         cpu32_ops,
         ecsm_ops,
         ecdas_ops,
-        memmove_ops,
+        copy_ops,
         hint_ops,
     )
 }
@@ -1043,35 +1040,107 @@ fn collect_ecsm_ops(
     (memw_ops, ecsm_op, ecdas_ops)
 }
 
-/// Replays one ecall through the unified memmove primitive.
+/// The register accesses one copy ecall makes, all at the raw ECALL timestamp.
 ///
-/// Register operands are read at `T`. For a copy, every source chunk is read at `T+1`
-/// before any destination chunk is written at `T+2`, which is the executor's snapshot
-/// semantics even when the regions overlap; a memset inverts that order so each row's
-/// read observes the previous row's write. Chunks are eight bytes while at least eight
-/// remain, then one byte per tail row — width is a per-row choice the AIR permits at
-/// any count, and this is simply the schedule the builder takes.
+/// These mirror `copy:c:read_src`, `copy:c:read_count`, `copy:c:read_dst` and
+/// `copy:c:read_fd` one for one. `x11` and `x12` are plain reads; `x10 + 244·is_write`
+/// is a read-modify-write that returns `dst_res` (the `void*` the `mem*` calls return,
+/// or the advanced commit index a `write` needs); and a `write` additionally reads the
+/// file descriptor out of `x10` and returns `count` there.
+fn collect_copy_register_ops(
+    functionality: copy::Functionality,
+    timestamp: u64,
+    src: u64,
+    dst: u64,
+    count: u64,
+    register_state: &mut RegisterState,
+) -> Vec<MemwOperation> {
+    let is_write = functionality == copy::Functionality::Write;
+    let mut ops = Vec::with_capacity(4);
+
+    let read_back = |reg: u8, value: u64, register_state: &mut RegisterState| {
+        let packed = pack_register_value(value);
+        let (_old_value, old_ts) = register_state.read(reg);
+        let op = MemwOperation::new(true, 2 * reg as u64, packed, timestamp, 2, true)
+            .with_old(packed, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]);
+        register_state.write(reg, value, timestamp);
+        op
+    };
+
+    ops.push(read_back(11, src, register_state));
+    ops.push(read_back(12, count, register_state));
+
+    if is_write {
+        // `dst` is the running commit index in x254, and `dst_res = dst + count`.
+        let (old_index, old_ts) = register_state.read_index();
+        debug_assert_eq!(
+            u64::from(old_index),
+            dst,
+            "the commit index in x254 must be the `write` destination"
+        );
+        let new_index = u32::try_from(dst + count).expect("commit index exceeds u32 range");
+        ops.push(
+            MemwOperation::new(
+                true,
+                register::register_base_address(254),
+                pack_register_value(u64::from(new_index)),
+                timestamp,
+                2,
+                true,
+            )
+            .with_old(
+                pack_register_value(u64::from(old_index)),
+                [old_ts, old_ts, 0, 0, 0, 0, 0, 0],
+            ),
+        );
+        register_state.write_index(new_index, timestamp);
+
+        // x10 carries the file descriptor in and the byte count out. Only stdout is
+        // supported, so the AIR pins the old value to 1.
+        let (fd, fd_ts) = register_state.read(10);
+        debug_assert_eq!(fd, 1, "ECALL write: x10 (fd) must be 1, got {fd}");
+        ops.push(
+            MemwOperation::new(true, 2 * 10, pack_register_value(count), timestamp, 2, true)
+                .with_old(pack_register_value(1), [fd_ts, fd_ts, 0, 0, 0, 0, 0, 0]),
+        );
+        register_state.write(10, count, timestamp);
+    } else {
+        // `dst_res == dst`: the `mem*` calls return their destination unchanged.
+        ops.push(read_back(10, dst, register_state));
+    }
+
+    ops
+}
+
+/// Replays one ecall through the unified copy primitive.
 ///
-/// Timestamp order follows the functionality: `Copy` and `Commit` read every chunk
-/// at `T+1` and write at `T+2`, which snapshots the whole source range and gives
-/// overlapping regions memmove semantics; `Set` inverts it, writing at `T+1` and
-/// reading at `T+2`, so each row observes the previous row's write and the seeded
-/// bytes propagate across the range. `Commit` writes into the COMMIT domain, so it
-/// emits no MEMW write at all.
-fn collect_memmove_ops(
-    functionality: memmove::Functionality,
+/// Register operands are read at `T` by [`collect_copy_register_ops`]. For a copy,
+/// every source chunk is read at `T` before any destination chunk is written at
+/// `T+1`, which is the executor's snapshot semantics even when the regions overlap;
+/// a memset inverts that order so each row's read observes the previous row's write.
+/// Chunks are eight bytes while at least eight remain, then one byte per tail row —
+/// width is a per-row choice the AIR permits at any count, and this is simply the
+/// schedule the builder takes.
+///
+/// `Write` moves its bytes into the COMMIT domain, so it emits no MEMW write at all.
+///
+/// There is no terminal row: the chain stops on the row that moves the last bytes,
+/// where `count == step`. A zero-length call still produces one row — the degenerate
+/// `(count, first) = (0, 1)` state — which moves nothing.
+fn collect_copy_ops(
+    functionality: copy::Functionality,
     timestamp: u64,
     src: u64,
     dst: u64,
     count: u64,
     memory_state: &mut MemoryState,
-) -> (Vec<MemwOperation>, Vec<memmove::MemmoveOperation>) {
+) -> (Vec<MemwOperation>, Vec<copy::CopyOperation>) {
     let mut memw_ops = Vec::new();
-    let mut rows = Vec::new();
-    let inverted = functionality == memmove::Functionality::Set;
-    let to_commit_domain = functionality == memmove::Functionality::Commit;
-    let read_ts = timestamp + 1 + u64::from(inverted);
-    let write_ts = timestamp + 2 - u64::from(inverted);
+    let mut rows: Vec<copy::CopyOperation> = Vec::new();
+    let inverted = functionality == copy::Functionality::Set;
+    let is_write = functionality == copy::Functionality::Write;
+    let read_ts = timestamp + u64::from(inverted);
+    let write_ts = timestamp + 1 - u64::from(inverted);
 
     let mut offset = 0u64;
     let mut remaining = count;
@@ -1081,12 +1150,8 @@ fn collect_memmove_ops(
     let mut deferred_writes = Vec::new();
 
     while remaining != 0 {
-        let width = executor::vm::instruction::execution::memmove_row_width(
-            src,
-            dst,
-            offset,
-            remaining,
-            to_commit_domain,
+        let width = executor::vm::instruction::execution::copy_row_width(
+            src, dst, offset, remaining, is_write,
         );
         let source_addr = src.wrapping_add(offset);
         let destination_addr = dst.wrapping_add(offset);
@@ -1115,12 +1180,12 @@ fn collect_memmove_ops(
                     .with_old(value, old_timestamps),
             );
             memory_state.write_bytes(source_addr, dword, width as usize, read_ts);
-            if !to_commit_domain {
+            if !is_write {
                 deferred_writes.push((destination_addr, width, value, dword));
             }
         }
 
-        rows.push(memmove::MemmoveOperation {
+        rows.push(copy::CopyOperation {
             timestamp,
             src: source_addr,
             dst: destination_addr,
@@ -1147,30 +1212,35 @@ fn collect_memmove_ops(
         memory_state.write_bytes(destination_addr, dword, width as usize, write_ts);
     }
 
-    rows.push(memmove::MemmoveOperation {
-        timestamp,
-        src: src.wrapping_add(count),
-        dst: dst.wrapping_add(count),
-        count: 0,
-        width: 1,
-        first,
-        end: true,
-        functionality,
-        value: [0; 8],
-    });
+    match rows.last_mut() {
+        Some(last) => last.end = true,
+        // A zero-length call: one row, first and last, moving nothing. `count - step`
+        // borrows out, which is the AIR's proxy for exactly this state.
+        None => rows.push(copy::CopyOperation {
+            timestamp,
+            src,
+            dst,
+            count: 0,
+            width: 1,
+            first: true,
+            end: true,
+            functionality,
+            value: [0; 8],
+        }),
+    }
 
     (memw_ops, rows)
 }
 
-/// Sizing-pass replay of one MEMMOVE-driven ecall.
+/// Sizing-pass replay of one COPY-driven ecall.
 ///
-/// Deliberately delegates to [`collect_memmove_ops`] rather than re-deriving the
+/// Deliberately delegates to [`collect_copy_ops`] rather than re-deriving the
 /// schedule: the two used to be separate implementations pinned together by an
 /// assertion, and the schedule is now a function of `dst` as well as `count`, which
 /// is exactly the kind of thing that drifts. The cost is one allocation per ecall.
 #[cfg(feature = "disk-spill")]
-fn replay_memmove_for_sizing(
-    functionality: memmove::Functionality,
+fn replay_copy_for_sizing(
+    functionality: copy::Functionality,
     timestamp: u64,
     src: u64,
     dst: u64,
@@ -1179,23 +1249,23 @@ fn replay_memmove_for_sizing(
     mut visit_memw: impl FnMut(&MemwOperation),
 ) -> u64 {
     let (memw_ops, rows) =
-        collect_memmove_ops(functionality, timestamp, src, dst, count, memory_state);
+        collect_copy_ops(functionality, timestamp, src, dst, count, memory_state);
     for op in &memw_ops {
         visit_memw(op);
     }
     rows.len() as u64
 }
 
-/// Test hook for the schedule, so the MEMMOVE unit tests can pin it.
+/// Test hook for the schedule, so the COPY unit tests can pin it.
 #[cfg(test)]
-pub fn memmove_row_width_for_test(
+pub fn copy_row_width_for_test(
     src: u64,
     dst: u64,
     offset: u64,
     remaining: u64,
     to_commit: bool,
 ) -> u8 {
-    executor::vm::instruction::execution::memmove_row_width(src, dst, offset, remaining, to_commit)
+    executor::vm::instruction::execution::copy_row_width(src, dst, offset, remaining, to_commit)
 }
 
 /// Collects the memory operations for a `Hint` ecall.
@@ -1504,102 +1574,6 @@ fn cpu32_chip_op(
     } else if op == alu_op::DIVREM {
         dvrm_ops.push((DvrmOperation::new(aux.arg1, aux.arg2, signed), muldiv));
     }
-}
-
-/// Collects MEMW operations for a COMMIT ECALL from CpuOperation.
-///
-/// All operations use the raw ECALL timestamp (no offsets). Per the spec,
-/// independent accesses at different addresses can share a timestamp.
-///
-/// Operations:
-/// - Read+write x10 at ts: asserts fd=1 (old), writes count (new)
-/// - Read x11 at ts: reads buf_addr
-/// - Read x12 at ts: reads count
-/// - Read+write x254 at ts: updates the global commit index
-/// - Read bytes at ts: reads committed bytes from memory
-///
-/// Note: x17 (syscall number) is read by CPU's M1 interaction (read_register1=true, rs1=17).
-///
-/// Returns: Vec of MEMW operations
-fn collect_commit_memw_ops(
-    op: &CpuOperation,
-    register_state: &mut RegisterState,
-    _memory_state: &mut MemoryState,
-) -> Vec<MemwOperation> {
-    let ts = op.timestamp;
-    let buf_addr = op.commit_buf_addr;
-    let count = op.commit_count;
-
-    let mut memw_ops = Vec::with_capacity(5 + count as usize);
-
-    // Combined read+write x10 at ts: old=fd=1, new=count
-    // This atomically asserts x10 held fd=1 and writes count as return value.
-    // Uses is_read=true so MEMW activates the CO24 receiver (24 elements with old[]),
-    // matching the COMMIT chip's CO24 bus send format.
-    {
-        let old_value = pack_register_value(1); // fd = 1
-        let new_value = pack_register_value(count);
-        let reg_addr = 2 * 10u64; // x10 → addr 20
-        let (old_val, old_ts) = register_state.read(10);
-        debug_assert_eq!(
-            old_val, 1,
-            "ECALL commit: x10 (fd) must be 1, got {old_val}"
-        );
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-        let memw_op = MemwOperation::new(true, reg_addr, new_value, ts, 2, true)
-            .with_old(old_value, old_timestamps);
-        memw_ops.push(memw_op);
-        register_state.write(10, count, ts);
-    }
-
-    // Read x11 (buf_addr) at ts
-    {
-        let reg_value = pack_register_value(buf_addr);
-        let reg_addr = 2 * 11u64; // x11 → addr 22
-        let (_old_val, old_ts) = register_state.read(11);
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-        let memw_op = MemwOperation::new(true, reg_addr, reg_value, ts, 2, true)
-            .with_old(reg_value, old_timestamps);
-        memw_ops.push(memw_op);
-        register_state.write(11, buf_addr, ts);
-    }
-
-    // Read x12 (count) at ts
-    {
-        let reg_value = pack_register_value(count);
-        let reg_addr = 2 * 12u64; // x12 → addr 24
-        let (_old_val, old_ts) = register_state.read(12);
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-        let memw_op = MemwOperation::new(true, reg_addr, reg_value, ts, 2, true)
-            .with_old(reg_value, old_timestamps);
-        memw_ops.push(memw_op);
-        register_state.write(12, count, ts);
-    }
-
-    // Read+write x254 (global commit index) at ts
-    {
-        let (old_index, old_ts) = register_state.read_index();
-        let new_index = old_index
-            .checked_add(u32::try_from(count).expect("commit_count exceeds u32 range"))
-            .expect("commit index exceeds u32 range");
-        let old_value = [old_index, 0, 0, 0, 0, 0, 0, 0];
-        let new_value = [new_index, 0, 0, 0, 0, 0, 0, 0];
-        let old_timestamps = [old_ts, 0, 0, 0, 0, 0, 0, 0];
-        let memw_op = MemwOperation::new(
-            true,
-            register::register_base_address(254),
-            new_value,
-            ts,
-            1,
-            true,
-        )
-        .with_old(old_value, old_timestamps);
-        memw_ops.push(memw_op);
-        register_state.write_index(new_index, ts);
-    }
-
-    // The byte reads moved to the MEMMOVE chip, eight at a time.
-    memw_ops
 }
 
 /// Collects HALT finalization MEMW operations for all 33 registers.
@@ -2470,56 +2444,32 @@ fn collect_bitwise_from_page<I: ImageSource>(
 }
 
 // =============================================================================
-// COMMIT Operation Expansion
-// =============================================================================
-
-/// Expand one Commit ECALL into its per-byte COMMIT rows using the memory state
-/// at the moment the ECALL executes.
-fn expand_commit_operations_for_ecall(
-    ecall: &CpuOperation,
-    _memory_state: &MemoryState,
-    start_index: u64,
-) -> Vec<CommitOperation> {
-    // One row per ecall now: the sys_write number, the fd check and the x254 update.
-    // The byte loop is deferred to the MEMMOVE chip over `BusId::CommitDefer`.
-    let count = ecall.commit_count;
-    vec![CommitOperation {
-        timestamp: ecall.timestamp,
-        index: start_index,
-        address: ecall.commit_buf_addr,
-        count,
-    }]
-}
-
-/// BITWISE lookups sent by the MEMMOVE table: twelve `IS_HALF` for the three
-/// incremented dwords plus the `ZERO` end detection, one set per row.
-fn collect_bitwise_from_memmove(ops: &[memmove::MemmoveOperation]) -> Vec<BitwiseOperation> {
-    let mut lookups = Vec::with_capacity(ops.len() * 13);
+/// BITWISE lookups sent by the COPY table: twelve `IS_HALF` for the three chained
+/// dwords on every row, plus four more for `dst_res` on a `write` row.
+///
+/// The `ZERO` end detection is gone with the lookup it fed: `end` is now pinned by
+/// the `restrict_end` constraint group against the borrow out of `count - step`.
+fn collect_bitwise_from_copy(ops: &[copy::CopyOperation]) -> Vec<BitwiseOperation> {
+    let mut lookups = Vec::with_capacity(ops.len() * 16);
     for op in ops {
         let width = u64::from(op.width);
         let count_decr = op.count.wrapping_sub(width);
         let src_incr = op.src.wrapping_add(width);
         let dst_incr = op.dst.wrapping_add(width);
 
-        for value in [count_decr, src_incr, dst_incr] {
+        for value in [src_incr, dst_incr, count_decr] {
             for shift in [0, 16, 32, 48] {
                 let half = ((value >> shift) & 0xFFFF) as u16;
-                lookups.push(BitwiseOperation::halfword(
-                    BitwiseOperationType::IsHalf,
-                    (half & 0xFF) as u8,
-                    (half >> 8) as u8,
-                ));
+                lookups.push(is_half_op(half));
             }
         }
 
-        let halves = [
-            (count_decr & 0xFFFF) as u32,
-            ((count_decr >> 16) & 0xFFFF) as u32,
-            ((count_decr >> 32) & 0xFFFF) as u32,
-            ((count_decr >> 48) & 0xFFFF) as u32,
-        ];
-        let zero_input = halves.into_iter().map(|half| 65535 - half).sum();
-        lookups.push(BitwiseOperation::zero(zero_input));
+        if op.functionality == copy::Functionality::Write {
+            for shift in [0, 16, 32, 48] {
+                let half = ((op.dst_res() >> shift) & 0xFFFF) as u16;
+                lookups.push(is_half_op(half));
+            }
+        }
     }
     lookups
 }
@@ -3050,10 +3000,6 @@ pub struct Traces {
     /// HALT single-row table for program termination
     pub halt: TraceTable<GoldilocksField, GoldilocksExtension>,
 
-    /// COMMIT table for write syscall (byte-by-byte commit with recursive bus).
-    /// Empty when the run commits no bytes.
-    pub commits: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
-
     /// KECCAK core table (one row per keccak permutation call). Empty when the
     /// run makes no keccak call.
     pub keccaks: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
@@ -3075,10 +3021,10 @@ pub struct Traces {
     /// makes no hint ecall.
     pub hints: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
-    /// Unified MEMMOVE table: one streaming copy primitive for memcpy/memmove,
+    /// Unified COPY table: one streaming copy primitive for memcpy/memmove,
     /// memset and the commit byte loop, selected by decoded functionality columns.
     /// Always present: the COMMIT byte loop is deferred to it.
-    pub memmove: TraceTable<GoldilocksField, GoldilocksExtension>,
+    pub copy: TraceTable<GoldilocksField, GoldilocksExtension>,
 
     /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
@@ -3112,7 +3058,6 @@ struct CollectedOps {
     branch_ops: Vec<BranchOperation>,
     mul_ops: Vec<(MulOperation, bool)>,
     dvrm_ops: Vec<(DvrmOperation, bool)>,
-    commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
     // Auxiliary ALU / memory / CPU32 dispatch chips (driven by the CPU ALU/MEMORY dispatch).
     eq_ops: Vec<eq::EqOperation>,
@@ -3122,8 +3067,8 @@ struct CollectedOps {
     // EC scalar-multiplication accelerator chips.
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
-    // Unified memmove rows: memcpy/memmove, memset and the commit byte loop.
-    memmove_ops: Vec<memmove::MemmoveOperation>,
+    // Unified COPY rows: memcpy/memmove, memset and the `write` byte loop.
+    copy_ops: Vec<copy::CopyOperation>,
     // Non-constraining hint ecall.
     hint_ops: Vec<hint::HintOperation>,
 }
@@ -3243,12 +3188,11 @@ fn collect_all_ops(
     mut lt_ops: Vec<LtOperation>,
     mut shift_ops: Vec<ShiftOperation>,
     mut bitwise_ops: Vec<BitwiseOperation>,
-    commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
     cpu32_ops: Vec<cpu32::Cpu32Operation>,
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
-    memmove_ops: Vec<memmove::MemmoveOperation>,
+    copy_ops: Vec<copy::CopyOperation>,
     hint_ops: Vec<hint::HintOperation>,
     register_state: &mut RegisterState,
     is_final: bool,
@@ -3384,7 +3328,6 @@ fn collect_all_ops(
         branch_ops,
         mul_ops,
         dvrm_ops,
-        commit_ops,
         keccak_ops,
         eq_ops,
         bytewise_ops,
@@ -3393,7 +3336,7 @@ fn collect_all_ops(
         ecsm_ops,
         ecdas_ops,
         hint_ops,
-        memmove_ops,
+        copy_ops,
     }
 }
 
@@ -3429,7 +3372,6 @@ fn build_traces<I: ImageSource + Sync>(
         branch_ops,
         mul_ops,
         dvrm_ops,
-        commit_ops,
         keccak_ops,
         eq_ops,
         bytewise_ops,
@@ -3437,7 +3379,7 @@ fn build_traces<I: ImageSource + Sync>(
         cpu32_ops,
         ecsm_ops,
         ecdas_ops,
-        memmove_ops,
+        copy_ops,
         hint_ops,
     } = ops;
 
@@ -3446,20 +3388,11 @@ fn build_traces<I: ImageSource + Sync>(
     // =====================================================================
     lt_ops.extend(collect_lt_from_memw(&memw_ops));
     lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
-    // MEMMOVE: the wide-row check, fired only on wide rows (multiplicity
-    // `mu - single`), and the per-ecall byte bound on the first row.
-    lt_ops.extend(
-        memmove_ops
-            .iter()
-            .filter(|op| op.width == 8)
-            .map(|op| LtOperation::new(op.count, 8, false)),
-    );
-    lt_ops.extend(
-        memmove_ops
-            .iter()
-            .filter(|op| op.first && op.functionality != memmove::Functionality::Commit)
-            .map(|op| LtOperation::new(op.count, memmove::MEMMOVE_MAX_BYTES + 1, false)),
-    );
+    // COPY sends no ALU lookups any more. The `count < 8` check on wide rows and the
+    // per-ecall `count <= 256` bound are both gone: a chain that overshoots can no
+    // longer reach a legal `end`, so the termination argument subsumes them. The
+    // executor still refuses an ecall above 256 bytes, which is where the guest ABI
+    // needs that bound.
     // HINT range-checks: selector < 3 and both address low limbs < 2^32 - 31 (matching
     // the executor's HintUnknownSelector / HintAddressOverflow rejections). Three LT ops
     // per hint call; the HINT table sends the matching ALU LT interactions.
@@ -3477,12 +3410,13 @@ fn build_traces<I: ImageSource + Sync>(
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("p4_bitwise_collect");
 
-    // The committed bytes now flow through the MEMMOVE chip, so the public output is
-    // read off its COMMIT-domain rows rather than off COMMIT's (one row per ecall).
+    // The committed bytes flow through the COPY chip, so the public output is read
+    // off its `write` rows. A zero-length `write` contributes a row that moves no
+    // bytes; `count != 0` is exactly the `mu - count_borrows[1]` gate the AIR uses.
     let public_output_bytes: Vec<u8> = {
-        let mut rows: Vec<&memmove::MemmoveOperation> = memmove_ops
+        let mut rows: Vec<&copy::CopyOperation> = copy_ops
             .iter()
-            .filter(|op| op.functionality == memmove::Functionality::Commit && !op.end)
+            .filter(|op| op.functionality == copy::Functionality::Write && op.count != 0)
             .collect();
         // `dst` is the COMMIT-domain address, i.e. the running global byte index.
         rows.sort_by_key(|op| op.dst);
@@ -3543,7 +3477,7 @@ fn build_traces<I: ImageSource + Sync>(
             }
         }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_memmove(&memmove_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_copy(&copy_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
@@ -3801,14 +3735,6 @@ fn build_traces<I: ImageSource + Sync>(
         decode::update_multiplicities(&mut decode, decode_pc_to_row, &decode_lookups);
         decode
     };
-    let gen_commits = || {
-        generate_optional(
-            &commit_ops,
-            commit::generate_commit_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
-    };
     let gen_keccaks = || {
         generate_optional(
             &keccak_ops,
@@ -3876,22 +3802,21 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
-    // MEMMOVE is not optional: COMMIT defers its byte loop here.
-    let gen_memmove = || memmove::generate_memmove_trace(&memmove_ops);
+    // COPY is not optional: COMMIT defers its byte loop here.
+    let gen_copy = || copy::generate_copy_trace(&copy_ops);
 
     let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =
         (None, None, None, None);
     let (mut loads_slot, mut lts_slot, mut shifts_slot, mut muls_slot) = (None, None, None, None);
     let (mut dvrms_slot, mut branches_slot, mut bitwise_slot, mut decode_slot) =
         (None, None, None, None);
-    let (mut commits_slot, mut keccaks_slot, mut keccak_rnds_slot, mut keccak_rc_slot) =
-        (None, None, None, None);
+    let (mut keccaks_slot, mut keccak_rnds_slot, mut keccak_rc_slot) = (None, None, None);
     let (mut pages_slot, mut register_slot, mut halt_slot) = (None, None, None);
     let (mut eqs_slot, mut bytewises_slot, mut stores_slot, mut cpu32s_slot) =
         (None, None, None, None);
     let (mut ecsms_slot, mut ecdases_slot) = (None, None);
     let mut hints_slot = None;
-    let mut memmove_slot = None;
+    let mut copy_slot = None;
 
     #[cfg(feature = "disk-spill")]
     let sequential = storage_mode == StorageMode::Disk || cfg!(not(feature = "parallel"));
@@ -3924,7 +3849,6 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(keccaks_slot, gen_keccaks);
             spawn_into!(keccak_rnds_slot, gen_keccak_rnds);
             spawn_into!(keccak_rc_slot, gen_keccak_rc);
-            spawn_into!(commits_slot, gen_commits);
             spawn_into!(register_slot, gen_register);
             spawn_into!(halt_slot, gen_halt);
             spawn_into!(eqs_slot, gen_eqs);
@@ -3934,7 +3858,7 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(ecsms_slot, gen_ecsms);
             spawn_into!(ecdases_slot, gen_ecdases);
             spawn_into!(hints_slot, gen_hints);
-            spawn_into!(memmove_slot, gen_memmove);
+            spawn_into!(copy_slot, gen_copy);
         });
     } else {
         cpus_slot = Some(gen_cpus());
@@ -3949,7 +3873,6 @@ fn build_traces<I: ImageSource + Sync>(
         branches_slot = Some(gen_branches());
         bitwise_slot = Some(gen_bitwise());
         decode_slot = Some(gen_decode());
-        commits_slot = Some(gen_commits());
         keccaks_slot = Some(gen_keccaks());
         keccak_rnds_slot = Some(gen_keccak_rnds());
         keccak_rc_slot = Some(gen_keccak_rc());
@@ -3963,7 +3886,7 @@ fn build_traces<I: ImageSource + Sync>(
         ecsms_slot = Some(gen_ecsms());
         ecdases_slot = Some(gen_ecdases());
         hints_slot = Some(gen_hints());
-        memmove_slot = Some(gen_memmove());
+        copy_slot = Some(gen_copy());
     }
 
     const PHASE5_RAN: &str = "phase 5 generation ran in one of the branches above";
@@ -3985,7 +3908,6 @@ fn build_traces<I: ImageSource + Sync>(
     let mut bitwise = bitwise_slot.expect(PHASE5_RAN);
     #[allow(unused_mut)]
     let mut decode = decode_slot.expect(PHASE5_RAN);
-    let commits = commits_slot.expect(PHASE5_RAN)?;
     let keccaks = keccaks_slot.expect(PHASE5_RAN)?;
     let keccak_rnds = keccak_rnds_slot.expect(PHASE5_RAN)?;
     let keccak_rc_trace = keccak_rc_slot.expect(PHASE5_RAN);
@@ -3998,7 +3920,7 @@ fn build_traces<I: ImageSource + Sync>(
     let ecsms = ecsms_slot.expect(PHASE5_RAN)?;
     let ecdases = ecdases_slot.expect(PHASE5_RAN)?;
     let hints = hints_slot.expect(PHASE5_RAN)?;
-    let memmove_trace = memmove_slot.expect(PHASE5_RAN);
+    let copy_trace = copy_slot.expect(PHASE5_RAN);
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
     // so spill them here before returning.
@@ -4056,14 +3978,13 @@ fn build_traces<I: ImageSource + Sync>(
         public_output_bytes,
         branches,
         halt: halt_trace,
-        commits,
         keccaks,
         keccak_rnds,
         keccak_rc: keccak_rc_trace,
         ecsms,
         ecdases,
         hints,
-        memmove: memmove_trace,
+        copy: copy_trace,
         memw_registers,
         local_to_global,
         touched_memory_cells,
@@ -4111,8 +4032,7 @@ pub struct TableLengths {
     pub mul_padded_rows: u64,
     pub dvrm_padded_rows: u64,
     pub branch_padded_rows: u64,
-    pub commit_padded_rows: u64,
-    pub memmove_padded_rows: u64,
+    pub copy_padded_rows: u64,
     pub decode_rows: u64,
     pub unique_page_count: u64,
     pub cycle_count: u64,
@@ -4151,8 +4071,7 @@ pub fn count_table_lengths(
     let mut mul_count = 0usize;
     let mut dvrm_count = 0usize;
     let mut branch_count = 0usize;
-    let mut commit_count = 0usize;
-    let mut memmove_count = 0usize;
+    let mut copy_count = 0usize;
     let mut current_commit_index = 0u32;
 
     let partition_memw = |op: &MemwOperation,
@@ -4220,69 +4139,47 @@ pub fn count_table_lengths(
             );
         }
 
-        // ECALL Commit
-        if cpu_op.ecall_commit {
-            // COMMIT is one row per ecall now; the byte loop is MEMMOVE's.
-            commit_count += 1;
-            let reg_commit_ops =
-                collect_commit_memw_ops(&cpu_op, &mut register_state, &mut memory_state);
-            for memw_op in &reg_commit_ops {
-                partition_memw(
-                    memw_op,
-                    &mut memw_by_width,
-                    &mut memw_aligned_count,
-                    &mut memw_register_count,
-                );
-            }
-            let rows = replay_memmove_for_sizing(
-                memmove::Functionality::Commit,
-                cpu_op.timestamp,
-                cpu_op.commit_buf_addr,
-                current_commit_index as u64,
-                cpu_op.commit_count,
-                &mut memory_state,
-                |memw_op| {
-                    partition_memw(
-                        memw_op,
-                        &mut memw_by_width,
-                        &mut memw_aligned_count,
-                        &mut memw_register_count,
-                    );
-                },
-            );
-            memmove_count += rows as usize;
-            lt_count += rows as usize;
-            let count = u32::try_from(cpu_op.commit_count)
-                .map_err(|_| Error::Execution("commit_count exceeds u32 range".into()))?;
-            current_commit_index = current_commit_index
-                .checked_add(count)
-                .ok_or_else(|| Error::Execution("commit index exceeds u32 range".into()))?;
-        }
-
-        if cpu_op.ecall_dma_memcpy || cpu_op.ecall_dma_memset {
-            let functionality = if cpu_op.ecall_dma_memset {
-                memmove::Functionality::Set
+        // Every copy ecall — `write`, `memcpy`/`memmove` and `memset` — goes through
+        // the same chip, so it is sized through the same path.
+        if cpu_op.ecall_commit || cpu_op.ecall_dma_memcpy || cpu_op.ecall_dma_memset {
+            let (functionality, src, dst, count) = if cpu_op.ecall_commit {
+                (
+                    copy::Functionality::Write,
+                    cpu_op.commit_buf_addr,
+                    u64::from(current_commit_index),
+                    cpu_op.commit_count,
+                )
             } else {
-                memmove::Functionality::Copy
+                let functionality = if cpu_op.ecall_dma_memset {
+                    copy::Functionality::Set
+                } else {
+                    copy::Functionality::Copy
+                };
+                (
+                    functionality,
+                    register_state.read(11).0,
+                    register_state.read(10).0,
+                    register_state.read(12).0,
+                )
             };
-            let dst = register_state.read(10).0;
-            let src = register_state.read(11).0;
-            let count = register_state.read(12).0;
-            for (reg, value) in [(10u8, dst), (11u8, src), (12u8, count)] {
-                let packed = pack_register_value(value);
-                let (_old_value, old_ts) = register_state.read(reg);
-                let reg_op =
-                    MemwOperation::new(true, 2 * reg as u64, packed, cpu_op.timestamp, 2, true)
-                        .with_old(packed, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]);
+
+            for reg_op in collect_copy_register_ops(
+                functionality,
+                cpu_op.timestamp,
+                src,
+                dst,
+                count,
+                &mut register_state,
+            ) {
                 partition_memw(
                     &reg_op,
                     &mut memw_by_width,
                     &mut memw_aligned_count,
                     &mut memw_register_count,
                 );
-                register_state.write(reg, value, cpu_op.timestamp);
             }
-            let rows = replay_memmove_for_sizing(
+
+            let rows = replay_copy_for_sizing(
                 functionality,
                 cpu_op.timestamp,
                 src,
@@ -4298,9 +4195,15 @@ pub fn count_table_lengths(
                     );
                 },
             );
-            memmove_count += rows as usize;
-            // One LT per row pins `lt8`, plus one per ecall for the chunk cap.
-            lt_count += rows as usize + 1;
+            copy_count += rows as usize;
+
+            if cpu_op.ecall_commit {
+                let delta = u32::try_from(count)
+                    .map_err(|_| Error::Execution("commit_count exceeds u32 range".into()))?;
+                current_commit_index = current_commit_index
+                    .checked_add(delta)
+                    .ok_or_else(|| Error::Execution("commit index exceeds u32 range".into()))?;
+            }
         }
 
         if cpu_op.ecall_hint {
@@ -4380,15 +4283,7 @@ pub fn count_table_lengths(
         mul_padded_rows: padded_chunked_rows_optional(mul_count, max_rows.mul),
         dvrm_padded_rows: padded_chunked_rows_optional(dvrm_count, max_rows.dvrm),
         branch_padded_rows: padded_chunked_rows_optional(branch_count, max_rows.branch),
-        commit_padded_rows: if commit_count == 0 {
-            0
-        } else {
-            commit_count
-                .checked_next_power_of_two()
-                .unwrap_or(usize::MAX)
-                .max(4) as u64
-        },
-        memmove_padded_rows: memmove_count.next_power_of_two().max(4) as u64,
+        copy_padded_rows: copy_count.next_power_of_two().max(4) as u64,
         decode_rows,
         unique_page_count,
         cycle_count,
@@ -4455,11 +4350,11 @@ impl Traces {
         tables.extend(self.keccak_rnds.iter_mut());
         tables.extend(self.ecsms.iter_mut());
         tables.extend(self.ecdases.iter_mut());
-        // MEMMOVE qualifies on the same criterion as ECSM/ECDAS: of the tables left
+        // COPY qualifies on the same criterion as ECSM/ECDAS: of the tables left
         // out, it is the only one whose height scales with the workload rather than
         // being one row per event. Nothing mutates it after the build, so unlike
         // BITWISE it cannot go stale on the device.
-        tables.push(&mut self.memmove);
+        tables.push(&mut self.copy);
 
         let bytes_of = |t: &TraceTable<GoldilocksField, GoldilocksExtension>| {
             t.num_rows() * t.num_main_columns * 8
@@ -4491,7 +4386,6 @@ impl Traces {
         use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
         use super::branch::cols::NUM_COLUMNS as BRANCH_COLS;
         use super::bytewise::cols::NUM_COLUMNS as BYTEWISE_COLS;
-        use super::commit::cols::NUM_COLUMNS as COMMIT_COLS;
         use super::cpu::cols::NUM_COLUMNS as CPU_COLS;
         use super::cpu32::cols::NUM_COLUMNS as CPU32_COLS;
         use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
@@ -4534,14 +4428,13 @@ impl Traces {
             register,
             branches,
             halt,
-            commits,
             keccaks,
             keccak_rnds,
             keccak_rc,
             ecsms,
             ecdases,
             hints,
-            memmove,
+            copy,
             memw_registers,
             eqs,
             bytewises,
@@ -4584,9 +4477,6 @@ impl Traces {
             total += (t.num_rows() * BRANCH_COLS) as u64;
         }
         total += (halt.num_rows() * HALT_COLS) as u64;
-        for t in commits {
-            total += (t.num_rows() * COMMIT_COLS) as u64;
-        }
         total += (register.num_rows() * (REGISTER_COLS - REGISTER_PREPROCESSED)) as u64;
         for t in pages {
             total += (t.num_rows() * (PAGE_COLS - PAGE_PREPROCESSED)) as u64;
@@ -4622,7 +4512,7 @@ impl Traces {
         for t in hints {
             total += (t.num_rows() * HINT_COLS) as u64;
         }
-        total += (memmove.num_rows() * super::memmove::cols::NUM_COLUMNS) as u64;
+        total += (copy.num_rows() * super::copy::cols::NUM_COLUMNS) as u64;
         total
     }
 
@@ -4650,7 +4540,6 @@ impl Traces {
         let n_dvrm = aux_cols(super::dvrm::bus_interactions().len());
         let n_branch = aux_cols(super::branch::bus_interactions().len());
         let n_halt = aux_cols(super::halt::bus_interactions().len());
-        let n_commit = aux_cols(super::commit::bus_interactions().len());
         let n_register = aux_cols(super::register::bus_interactions().len());
         // page::bus_interactions count is constant regardless of page_base.
         let n_page = aux_cols(super::page::bus_interactions(0).len());
@@ -4664,7 +4553,7 @@ impl Traces {
         let n_cpu32 = aux_cols(super::cpu32::bus_interactions().len());
         let n_ecsm = aux_cols(super::ecsm::bus_interactions().len());
         let n_ecdas = aux_cols(super::ecdas::bus_interactions().len());
-        let n_memmove = aux_cols(super::memmove::bus_interactions().len());
+        let n_copy = aux_cols(super::copy::bus_interactions().len());
         let n_hint = aux_cols(super::hint::bus_interactions().len());
 
         let Traces {
@@ -4682,14 +4571,13 @@ impl Traces {
             register,
             branches,
             halt,
-            commits,
             keccaks,
             keccak_rnds,
             keccak_rc,
             ecsms,
             ecdases,
             hints,
-            memmove,
+            copy,
             memw_registers,
             eqs,
             bytewises,
@@ -4732,9 +4620,6 @@ impl Traces {
             total += (t.num_rows() * n_branch) as u64;
         }
         total += (halt.num_rows() * n_halt) as u64;
-        for t in commits {
-            total += (t.num_rows() * n_commit) as u64;
-        }
         total += (register.num_rows() * n_register) as u64;
         for t in pages {
             total += (t.num_rows() * n_page) as u64;
@@ -4770,7 +4655,7 @@ impl Traces {
         for t in hints {
             total += (t.num_rows() * n_hint) as u64;
         }
-        total += (memmove.num_rows() * n_memmove) as u64;
+        total += (copy.num_rows() * n_copy) as u64;
         total
     }
 
@@ -4796,7 +4681,6 @@ impl Traces {
             ecsm: self.ecsms.len(),
             ecdas: self.ecdases.len(),
             hint: self.hints.len(),
-            commit: self.commits.len(),
         }
     }
 
@@ -5125,13 +5009,12 @@ impl Traces {
             lt_ops,
             shift_ops,
             bitwise_ops,
-            commit_ops,
             keccak_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
             hint_ops,
-            memmove_ops,
+            copy_ops,
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
         #[cfg(feature = "instruments")]
         drop(__sp);
@@ -5145,13 +5028,12 @@ impl Traces {
             lt_ops,
             shift_ops,
             bitwise_ops,
-            commit_ops,
             keccak_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
             hint_ops,
-            memmove_ops,
+            copy_ops,
             &mut register_state,
             is_final,
         );
@@ -5240,13 +5122,12 @@ impl Traces {
             lt_ops,
             shift_ops,
             bitwise_ops,
-            commit_ops,
             keccak_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
             hint_ops,
-            memmove_ops,
+            copy_ops,
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         let ops = collect_all_ops(
@@ -5256,13 +5137,12 @@ impl Traces {
             lt_ops,
             shift_ops,
             bitwise_ops,
-            commit_ops,
             keccak_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
             hint_ops,
-            memmove_ops,
+            copy_ops,
             &mut register_state,
             true,
         );

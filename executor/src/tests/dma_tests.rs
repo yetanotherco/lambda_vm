@@ -1,7 +1,7 @@
 use crate::vm::instruction::decoding::Instruction;
 use crate::vm::instruction::execution::{
     DMA_MEMCPY_MAX_BYTES, DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_GAP, DMA_MEMSET_SYSCALL_NUMBER,
-    ExecutionError, dma_memset_crosses_limb_boundary, memmove_row_width, memmove_trace_rows,
+    ExecutionError, copy_row_width, copy_trace_rows, dma_memset_crosses_limb_boundary,
 };
 use crate::vm::memory::Memory;
 use crate::vm::registers::Registers;
@@ -84,15 +84,16 @@ fn dma_row_helpers_match_the_chunk_loop() {
             let mut remaining = count;
             let mut offset = 0u64;
             while remaining != 0 {
-                let width = u64::from(memmove_row_width(src, dst, offset, remaining, false));
+                let width = u64::from(copy_row_width(src, dst, offset, remaining, false));
                 remaining -= width;
                 offset += width;
                 chunks += 1;
             }
             assert_eq!(
-                memmove_trace_rows(src, dst, count, false),
-                chunks + 1,
-                "src {src}, dst {dst}, count {count}: the terminal row is always emitted"
+                copy_trace_rows(src, dst, count, false),
+                chunks.max(1),
+                "src {src}, dst {dst}, count {count}: one row per chunk, and a \
+                 zero-length call still takes the degenerate row"
             );
         }
     }

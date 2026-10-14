@@ -231,27 +231,17 @@ mod branch {
 // commit.rs
 // =============================================================================
 
-mod commit {
-    use super::*;
-    use crate::tables::commit::{CommitConstraints, cols};
-
-    #[test]
-    fn commit_constraint_set_folder_capture_agree() {
-        check_table("commit", &CommitConstraints, cols::NUM_COLUMNS);
-    }
-}
-
 // =============================================================================
 // dma.rs
 // =============================================================================
 
-mod memmove {
+mod copy {
     use super::*;
-    use crate::tables::memmove::{MemmoveConstraints, cols};
+    use crate::tables::copy::{CopyConstraints, cols};
 
     #[test]
-    fn memmove_constraint_set_folder_capture_agree() {
-        check_table("memmove", &MemmoveConstraints, cols::NUM_COLUMNS);
+    fn copy_constraint_set_folder_capture_agree() {
+        check_table("copy", &CopyConstraints, cols::NUM_COLUMNS);
     }
 }
 

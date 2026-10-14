@@ -2085,7 +2085,6 @@ mod tests {
                     ("ecsm", c.ecsm),
                     ("ecdas", c.ecdas),
                     ("hint", c.hint),
-                    ("commit", c.commit),
                 ]
             })
             .collect();

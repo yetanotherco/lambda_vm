@@ -380,7 +380,7 @@ impl AccelCounts {
     /// Exhaustive `match`: a new `Accelerator` variant is a compile error here,
     /// so it cannot be executed without also being reported. `dst_val` is the
     /// ECALL's logged operands: `dst_val` is the chunk's byte count for DMA and
-    /// unused for the others; `rows` is the MEMMOVE row count the executor derived
+    /// unused for the others; `rows` is the COPY row count the executor derived
     /// at the ecall, where it knows `src`, `dst` and `count` — the schedule reads
     /// both ends' residues, so the count cannot be recovered from one address.
     fn tally(&mut self, accelerator: Accelerator, dst_val: u64, rows: u64) {

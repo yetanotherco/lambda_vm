@@ -11,7 +11,6 @@ pub mod branch_constraints_tests;
 #[cfg(test)]
 pub mod bytewise_tests;
 #[cfg(test)]
-pub mod commit_tests;
 #[cfg(test)]
 pub mod compute_commit_bus_offset_tests;
 #[cfg(test)]
@@ -26,6 +25,8 @@ pub mod constraint_set_tests_a;
 pub mod constraint_set_tests_b;
 #[cfg(test)]
 pub mod constraints_tests;
+#[cfg(test)]
+pub mod copy_tests;
 #[cfg(all(test, feature = "disk-spill"))]
 pub mod count_table_lengths_drift_tests;
 #[cfg(test)]
@@ -60,8 +61,6 @@ pub mod local_to_global_bus_tests;
 pub mod lt_bus_tests;
 #[cfg(test)]
 pub mod lt_tests;
-#[cfg(test)]
-pub mod memmove_tests;
 #[cfg(test)]
 pub mod memw_aligned_tests;
 #[cfg(test)]

@@ -6,7 +6,7 @@
 
 use math::field::element::FieldElement;
 
-use executor::vm::instruction::execution::memmove_row_width;
+use executor::vm::instruction::execution::copy_row_width;
 
 use crate::compute_commit_bus_offset;
 use crate::tables::types::{BusId, GoldilocksExtension};
@@ -125,11 +125,11 @@ fn test_zero_fingerprint_in_middle_returns_none() {
     );
 }
 
-/// The COMMIT tuples the MEMMOVE chip actually sends, walking the production row
+/// The COMMIT tuples the COPY chip actually sends, walking the production row
 /// schedule one commit ECALL at a time.
 ///
 /// This is the prover side, not a second copy of the verifier: the widths come from
-/// `memmove_row_width`, the same function the trace builder and the sizing pass use,
+/// `copy_row_width`, the same function the trace builder and the sizing pass use,
 /// and the tuple shape is the chip's — one `(global index, byte)` pair per byte.
 /// `commits` is the per-ECALL split of the public output, which is exactly the thing
 /// the verifier never learns.
@@ -149,7 +149,7 @@ fn prover_offset(
         let mut offset = 0u64;
         let mut remaining = bytes.len() as u64;
         while remaining != 0 {
-            let width = u64::from(memmove_row_width(0, base, offset, remaining, true));
+            let width = u64::from(copy_row_width(0, base, offset, remaining, true));
             for lane in 0..width {
                 let byte = bytes[(offset + lane) as usize];
                 let lc = bus_id

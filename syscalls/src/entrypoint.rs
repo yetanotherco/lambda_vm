@@ -97,8 +97,8 @@ memcpy:
 // to sit in the object the linker is obliged to extract.
 //
 // Reuses the memcpy ecall unchanged — no new table, no new syscall. Each ecall
-// already snapshots its whole source range before writing (all reads at T+1,
-// all writes at T+2), so a single chunk has memmove semantics for free.
+// already snapshots its whole source range before writing (all reads at T,
+// all writes at T+1), so a single chunk has memmove semantics for free.
 //
 // Chunking is what breaks it: copying [0,256) -> [4,260) clobbers source bytes
 // that a later forward chunk still needs. So when the destination starts inside
@@ -165,7 +165,7 @@ memmove:
 // memset is expressed as a *propagating* memmove, so it needs no accelerator of its
 // own: the stub seeds the first eight bytes with an ordinary store and then calls the
 // copy accelerator with `dst = seed_end`, `src = seed_start`. The chip runs that call
-// with the read/write timestamp order inverted — it writes at T+1 and reads at T+2 —
+// with the read/write timestamp order inverted — it writes at T and reads at T+1 —
 // so every step observes the previous step's write and the seed propagates across the
 // range. The ecall number is what selects the order; the guest never chooses it.
 //
