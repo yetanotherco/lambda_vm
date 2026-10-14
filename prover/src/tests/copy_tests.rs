@@ -963,3 +963,57 @@ fn padding_rows_match_the_declared_padding() {
         }
     }
 }
+
+/// The local `chain()` helper must agree with the production builder.
+///
+/// Every other test in this file constructs its rows with `chain()`, so nothing here
+/// would notice `collect_copy_ops` drifting away from it — the tests would keep
+/// passing while describing a schedule the prover no longer emits. This pins the two
+/// together across the shapes that matter: the width boundary, a tail, a mixed
+/// chain, and the zero-length call.
+#[test]
+fn the_test_helper_matches_the_production_builder() {
+    use crate::tables::trace_builder::copy_ops_for_test;
+
+    for functionality in [
+        Functionality::Copy,
+        Functionality::Set,
+        Functionality::Write,
+    ] {
+        // memset is only defined for `dst = src + 8`; `write` addresses the commit
+        // index rather than RAM.
+        let (src, dst) = match functionality {
+            Functionality::Set => (0x1000, 0x1008),
+            Functionality::Write => (0x1000, 0),
+            Functionality::Copy => (0x1000, 0x2000),
+        };
+
+        for count in [0u64, 1, 7, 8, 9, 16, 23, 64] {
+            let built = copy_ops_for_test(functionality, src, dst, count);
+            let helper = chain(functionality, src, dst, count);
+
+            assert_eq!(
+                built.len(),
+                helper.len(),
+                "{functionality:?} count {count}: row count"
+            );
+            for (i, (b, h)) in built.iter().zip(&helper).enumerate() {
+                assert_eq!(
+                    b.width, h.width,
+                    "{functionality:?} count {count} row {i}: width"
+                );
+                assert_eq!(
+                    b.count, h.count,
+                    "{functionality:?} count {count} row {i}: count"
+                );
+                assert_eq!(
+                    b.first, h.first,
+                    "{functionality:?} count {count} row {i}: first"
+                );
+                assert_eq!(b.end, h.end, "{functionality:?} count {count} row {i}: end");
+                assert_eq!(b.src, h.src, "{functionality:?} count {count} row {i}: src");
+                assert_eq!(b.dst, h.dst, "{functionality:?} count {count} row {i}: dst");
+            }
+        }
+    }
+}

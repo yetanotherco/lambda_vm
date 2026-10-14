@@ -1271,6 +1271,22 @@ pub fn copy_row_width_for_test(
     executor::vm::instruction::execution::copy_row_width(src, dst, offset, remaining, is_write)
 }
 
+/// Test hook for the row schedule the production builder actually emits.
+///
+/// The COPY unit tests build their rows with a local helper, which is fast but means
+/// nothing in that file would notice the real builder drifting away from it. This
+/// runs `collect_copy_ops` against a fresh memory image and hands back the rows.
+#[cfg(test)]
+pub fn copy_ops_for_test(
+    functionality: copy::Functionality,
+    src: u64,
+    dst: u64,
+    count: u64,
+) -> Vec<copy::CopyOperation> {
+    let mut memory_state = MemoryState::new();
+    collect_copy_ops(functionality, 100, src, dst, count, &mut memory_state).1
+}
+
 /// Collects the memory operations for a `Hint` ecall.
 ///
 /// The `hint` ecall writes a 32-byte value (a modular inverse / sqrt) to guest
@@ -4078,6 +4094,10 @@ pub fn count_table_lengths(
     let mut dvrm_count = 0usize;
     let mut branch_count = 0usize;
     let mut copy_count = 0usize;
+    // Zero, not the carried x254 the generation walk seeds from: `count_table_lengths`
+    // takes no register-init vector, so it is only usable for a whole run or a first
+    // epoch anyway. It is sound today because no row count depends on `dst` — wire a
+    // `register_init` through before that stops being true.
     let mut current_commit_index = 0u32;
 
     let partition_memw = |op: &MemwOperation,

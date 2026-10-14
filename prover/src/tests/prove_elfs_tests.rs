@@ -1738,6 +1738,32 @@ fn test_prove_commit_forged_index_rejected() {
     );
 }
 
+/// `first_write` is the gate on the file-descriptor check: clear it and the row no
+/// longer proves that x10 held 1 on the way in, nor that it returns `count`. It is
+/// the only thing standing between the chip and a `write` to an arbitrary descriptor.
+#[test]
+fn test_prove_commit_forged_first_write_rejected() {
+    use crate::tables::copy::cols as mm_cols;
+
+    let (elf, mut traces) = commit_fixture();
+    let forged_row = commit_row(&traces);
+    assert_eq!(
+        *traces.copy.main_table.get(forged_row, mm_cols::FIRST_WRITE),
+        FieldElement::<GoldilocksField>::one(),
+        "the fixture's first write row must carry first_write"
+    );
+    traces
+        .copy
+        .main_table
+        .set(forged_row, mm_cols::FIRST_WRITE, FieldElement::zero());
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "a write sequence cannot skip the file-descriptor check",
+    );
+}
+
 /// `dst_res` is what the chip writes back to x254, so it is the link between the
 /// COMMIT bus indices and the register file the verifier checks. Forging it on the
 /// first row breaks that link while the row's own copy stays consistent.

@@ -1904,7 +1904,7 @@ mod tests {
     // `test_commit_split` issues two Commit syscalls, one early and one late, so a
     // small epoch puts the second commit in a later epoch. That epoch starts with
     // x254 > 0 (the carried commit index), which exercises the cross-epoch commit
-    // indexing: both the COMMIT trace and the verifier's `compute_commit_bus_offset`
+    // indexing: both the COPY trace and the verifier's `compute_commit_bus_offset`
     // index from the carried x254 rather than 0. Regression test for that fix.
     #[test]
     fn test_commit_across_epochs_verifies() {

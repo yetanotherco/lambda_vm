@@ -92,6 +92,15 @@
 //! lookups prove the identical bound with the primitive it does have, at one extra
 //! column each. `mu_com`/`mu_com_wide` are the COMMIT-bus gate the spec does not
 //! need because it writes the committed bytes through `MEMW` in domain `2·is_write`.
+//!
+//! One consequence of that last divergence is worth stating here rather than leaving
+//! for a reader to find: the `Commit` bus carries the index as `dst[0]` alone, while
+//! the verifier enumerates `start_index + i` over a `u64`. The two agree only while
+//! the running commit index stays below `2^32`, and `x254`'s high word is pinned to
+//! zero by the trace builder rather than by a constraint. Past `2^32` committed bytes
+//! the prover panics ("commit index exceeds u32 range") instead of producing a bad
+//! proof, so this is a completeness cliff, not a soundness one — and it is the thing
+//! that goes away when the domain-2 write lands.
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
