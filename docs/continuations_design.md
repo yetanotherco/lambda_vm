@@ -469,8 +469,11 @@ locks compose:
 Compose them: public `R_{i+1}` = trace FINI = real last write. So the value handed
 to the next epoch is pinned to real execution.
 
-The **monolithic prover is unchanged**: it keeps FINI as a main-trace column (it
-has no verifier-known final state) and preprocesses 2 columns, not 3.
+The **monolithic prover** preprocesses the same 3 columns, with FINI pinned to the
+halted register file (`register::halted_fini`): x1-x31 = 0, x254 = the committed
+byte count, and the PC = 1. The final epoch's `R_{i+1}` must equal that same
+halted state. Pinning it ends the PC chain on `pc = 1`, so execution cannot
+continue past the exit ecall.
 
 ### Commit index (x254)
 
