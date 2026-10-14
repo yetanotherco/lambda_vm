@@ -1,6 +1,7 @@
 //! HINT table — receiver for the non-constraining `hint` ecall.
 //!
-//! The `hint` ecall (syscall `u64::MAX - 30`) lets the executor hand the guest a
+//! The `hint` ecall (syscall `u64::MAX - 31`, i.e. `-32`) lets the executor hand the
+//! guest a
 //! value that is expensive to compute but cheap to verify (modular inverse, sqrt,
 //! …); the guest verifies it with ordinary constrained instructions. Unlike a
 //! normal `STORE`, the ecall writes the 32-byte output to guest memory *directly*

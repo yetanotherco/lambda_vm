@@ -309,8 +309,8 @@ pub enum BusId {
     Decode = 18,
     /// System call handling (CPU → HALT/COMMIT for all ECALLs)
     Ecall = 19,
-    /// COMMIT self-referencing recursive bus (row N → row N+1)
-    CommitNextByte = 20,
+    // ID 20 is reserved for the removed CommitNextByte bus: COMMIT's per-byte
+    // recursion moved to COPY, which chains over [`BusId::CopyNext`].
     /// COMMIT output bus: verifier computes the receiver contribution externally
     /// from `VmProof.public_output` using the shared LogUp challenges
     Commit = 21,
@@ -354,11 +354,32 @@ pub enum BusId {
     Bit = 30,
 
     // =========================================================================
+    // DMA memcpy accelerator
+    // =========================================================================
+    // IDs 29 and 32 are reserved for the removed DmaNext and DmaSetNext buses:
+    // the DMA and DMA_SET tables they chained are both replaced by COPY, which
+    // chains over [`BusId::CopyNext`] and carries the functionality selectors
+    // inside the tuple rather than separating the paths by bus id.
+
+    // =========================================================================
     // Continuations
     // =========================================================================
     /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
     /// boundary claims, matched across epochs by the final aggregation LogUp.
     GlobalMemory = 31,
+
+    // =========================================================================
+    // Unified copy primitive
+    // =========================================================================
+    /// COPY self-referential streaming bus. A row sends
+    /// `(timestamp, src_incr, dst_incr, count_decr, is_set, is_write)` to the next
+    /// row and receives `(timestamp, src, dst, count, is_set, is_write)` from the
+    /// previous one. The functionality selectors travel inside the tuple, so a chain
+    /// cannot change operation half way through it — the guarantee that the three
+    /// removed DmaNext/DmaSetNext/CommitNextByte buses used to give structurally.
+    CopyNext = 33,
+    // ID 34 is reserved for the removed CommitDefer bus: the COMMIT chip is gone and
+    // COPY receives the `write` ECALL and reads its operand registers itself.
 }
 
 impl BusId {
@@ -377,8 +398,8 @@ impl BusId {
             BusId::Branch => "Branch",
             BusId::Decode => "Decode",
             BusId::Ecall => "Ecall",
-            BusId::CommitNextByte => "CommitNextByte",
             BusId::Commit => "Commit",
+            BusId::CopyNext => "CopyNext",
             BusId::Keccak => "Keccak",
             BusId::KeccakRc => "KeccakRc",
             BusId::ByteAlu => "ByteAlu",
@@ -409,7 +430,6 @@ impl TryFrom<u64> for BusId {
             17 => Ok(BusId::Branch),
             18 => Ok(BusId::Decode),
             19 => Ok(BusId::Ecall),
-            20 => Ok(BusId::CommitNextByte),
             21 => Ok(BusId::Commit),
             22 => Ok(BusId::Keccak),
             23 => Ok(BusId::KeccakRc),
@@ -420,6 +440,7 @@ impl TryFrom<u64> for BusId {
             28 => Ok(BusId::Ecdas),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
+            33 => Ok(BusId::CopyNext),
             other => Err(other),
         }
     }

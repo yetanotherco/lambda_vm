@@ -263,7 +263,6 @@ fn all_table_programs_gpu_match_cpu_oracle() {
     check_air(&create_dvrm_air(&opts), "DVRM");
     check_air(&create_branch_air(&opts), "BRANCH");
     check_air(&create_halt_air(&opts), "HALT");
-    check_air(&create_commit_air(&opts), "COMMIT");
     check_air(&create_page_air(&opts, 0x1000), "PAGE");
     check_air(&create_register_air(&opts), "REGISTER");
     check_air(&create_keccak_air(&opts), "KECCAK");
@@ -271,5 +270,6 @@ fn all_table_programs_gpu_match_cpu_oracle() {
     check_air(&create_keccak_rc_air(&opts), "KECCAK_RC");
     check_air(&create_ecsm_air(&opts), "ECSM");
     check_air(&create_ecdas_air(&opts), "ECDAS");
+    check_air(&create_copy_air(&opts), "copy");
     check_air(&create_hint_air(&opts), "HINT");
 }
