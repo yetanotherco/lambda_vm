@@ -148,7 +148,7 @@ pub(crate) const PC_HI_INDEX: usize = 67;
 /// and supply their own boundary register snapshot instead.
 ///
 /// - SP (x2) words at offset 4,5 hold STACK_TOP
-/// - x254 at offset 508 is the synthetic commit index, initialized to 0
+/// - x254 at offsets 508,509 is the synthetic commit index, initialized to 0
 /// - PC (x255) words at offset 510,511 hold entry_point
 /// - All others are 0
 fn init_value_for_address(word_addr: u64, entry_point: u64) -> u32 {
@@ -195,7 +195,7 @@ pub(crate) fn register_init_from_snapshot(registers: &Registers, pc: u64) -> Vec
         init[base + 1] = (value >> 32) as u32;
     }
     // x254 synthetic commit index, hardcoded to 0 in this test-only helper, so it
-    // is only correct for an epoch with no preceding COMMIT. The production path
+    // is only correct for an epoch with no preceding `write`. The production path
     // carries x254 across epochs via the previous epoch's bound FINI vector, not
     // this snapshot helper.
     init[X254_INDEX] = 0;
@@ -209,7 +209,7 @@ pub(crate) fn register_init_from_snapshot(registers: &Registers, pc: u64) -> Vec
 ///
 /// Creates a table with NUM_REGISTER_ADDRESSES rows.
 /// Each row represents one Word address in register space.
-/// x0-x31 at addresses 0..63, x254 at 508, x255 (PC) at 510..511.
+/// x0-x31 at addresses 0..63, x254 at 508..509, x255 (PC) at 510..511.
 ///
 /// ## Arguments
 ///

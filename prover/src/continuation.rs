@@ -39,7 +39,7 @@
 //!
 //! The x254 commit index is carried across epochs by that same register binding,
 //! so a continuation epoch indexes its commits from the carried value: both the
-//! COMMIT trace (`current_commit_index` seeded from x254) and the verifier's
+//! COPY trace (`current_commit_index` seeded from x254) and the verifier's
 //! `compute_commit_bus_offset` (a `start_index` parameter) count from it, and the
 //! driver concatenates each epoch's committed bytes into the run-wide output.
 //!

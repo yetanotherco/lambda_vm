@@ -381,8 +381,9 @@ impl AccelCounts {
     /// so it cannot be executed without also being reported. `dst_val` is the
     /// ECALL's logged operands: `dst_val` is the chunk's byte count for DMA and
     /// unused for the others; `rows` is the COPY row count the executor derived
-    /// at the ecall, where it knows `src`, `dst` and `count` — the schedule reads
-    /// both ends' residues, so the count cannot be recovered from one address.
+    /// at the ecall. The width follows from `count` alone today, so the row count is
+    /// recoverable from it; the slot is kept because the AIR permits a schedule that
+    /// reads both ends' residues and a future one may.
     fn tally(&mut self, accelerator: Accelerator, dst_val: u64, rows: u64) {
         match accelerator {
             Accelerator::Keccak => self.keccak += 1,

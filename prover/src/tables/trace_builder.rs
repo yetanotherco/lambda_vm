@@ -676,7 +676,7 @@ fn collect_ops_from_cpu(
         }
 
         // DMA memcpy: authenticate x10/x11/x12, snapshot all source bytes at
-        // T+1, then write all destination bytes at T+2.
+        // T, then write all destination bytes at T+1.
         if op.ecall_dma_memcpy {
             let dst = register_state.read(10).0;
             let src = register_state.read(11).0;
@@ -702,10 +702,10 @@ fn collect_ops_from_cpu(
         }
 
         // DMA memset: authenticate x10/x11/x12, then run the copy primitive with the
-        // read/write order inverted — write at T+1, read at T+2. There IS a source
+        // read/write order inverted — write at T, read at T+1. There IS a source
         // phase, and the self-overlap is the point: the stub seeds eight bytes and
         // calls with `dst = src + 8`, so each row's read observes the write eight
-        // bytes back and the seed propagates. That is what the two `is_set` gap constraints pin.
+        // bytes back and the seed propagates. That is what `copy:c:set_gap` pins.
         if op.ecall_dma_memset {
             // memset is a copy call whose only distinguishing feature is the
             // inverted timestamp order; the stub already seeded the first eight
@@ -1073,7 +1073,10 @@ fn collect_copy_register_ops(
     if is_write {
         // `dst` is the running commit index in x254, and `dst_res = dst + count`.
         let (old_index, old_ts) = register_state.read_index();
-        debug_assert_eq!(
+        // Hard, not `debug_assert`: a mismatch here produces a trace that is merely
+        // unprovable, surfacing as an opaque Memw bus imbalance in a release build.
+        // Panicking names the cause instead.
+        assert_eq!(
             u64::from(old_index),
             dst,
             "the commit index in x254 must be the `write` destination"
@@ -1098,7 +1101,7 @@ fn collect_copy_register_ops(
         // x10 carries the file descriptor in and the byte count out. Only stdout is
         // supported, so the AIR pins the old value to 1.
         let (fd, fd_ts) = register_state.read(10);
-        debug_assert_eq!(fd, 1, "ECALL write: x10 (fd) must be 1, got {fd}");
+        assert_eq!(fd, 1, "ECALL write: x10 (fd) must be 1, got {fd}");
         ops.push(
             MemwOperation::new(true, 2 * 10, pack_register_value(count), timestamp, 2, true)
                 .with_old(pack_register_value(1), [fd_ts, fd_ts, 0, 0, 0, 0, 0, 0]),
@@ -1263,9 +1266,9 @@ pub fn copy_row_width_for_test(
     dst: u64,
     offset: u64,
     remaining: u64,
-    to_commit: bool,
+    is_write: bool,
 ) -> u8 {
-    executor::vm::instruction::execution::copy_row_width(src, dst, offset, remaining, to_commit)
+    executor::vm::instruction::execution::copy_row_width(src, dst, offset, remaining, is_write)
 }
 
 /// Collects the memory operations for a `Hint` ecall.
@@ -1844,7 +1847,7 @@ fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperat
 /// 4. timestamp[0] > old_timestamp[0] (lower limb ordering)
 /// 5. timestamp[0] - old_timestamp[0] <= 0x10000 (delta fits in IS_HALF range [1, 2^16])
 ///
-/// Width-1 register ops (e.g. COMMIT x254) stay in MEMW, which has
+/// Width-1 register ops stay in MEMW, which has
 /// dynamic write flags. MEMW_R hardcodes write2=1.
 pub(crate) fn is_register_op(op: &MemwOperation) -> bool {
     if !op.is_register || op.width != 2 {
@@ -3023,7 +3026,10 @@ pub struct Traces {
 
     /// Unified COPY table: one streaming copy primitive for memcpy/memmove,
     /// memset and the commit byte loop, selected by decoded functionality columns.
-    /// Always present: the COMMIT byte loop is deferred to it.
+    /// Always present: COPY receives the `write` ECALL, so any run that produces
+    /// output reaches it. A run that neither commits nor copies still ships an
+    /// all-padding COPY sub-proof — it could be made optional like the other
+    /// accelerators, which is tracked separately.
     pub copy: TraceTable<GoldilocksField, GoldilocksExtension>,
 
     /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
@@ -3441,7 +3447,7 @@ fn build_traces<I: ImageSource + Sync>(
     // chunk size used to split them into instances so multiplicities match the per-instance
     // sends. MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]. PAGE does a
     // batched ARE_BYTES[init, fini] per row (skipped in continuation epochs, which the L2G
-    // table owns). COMMIT sends AreBytes+IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL;
+    // table owns). COPY sends IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL;
     // HINT sends ARE_BYTES for its 32 output cells.
     // We never concatenate the lookups into one giant `Vec<BitwiseOperation>` (~140 M ops /
     // ~560 MB at 10-tx whose only consumer is the multiplicity count). Each collector bumps
@@ -3802,7 +3808,7 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
-    // COPY is not optional: COMMIT defers its byte loop here.
+    // COPY is not optional: it receives the `write` ECALL directly.
     let gen_copy = || copy::generate_copy_trace(&copy_ops);
 
     let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =

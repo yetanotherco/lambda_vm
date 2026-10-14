@@ -1,7 +1,7 @@
 //! COPY table — one streaming copy primitive for `memcpy`/`memmove`, `memset`
 //! and the `write` syscall.
 //!
-//! Replaces the separate DMA, DMA_SET and COMMIT tables. A row copies `1` or `8`
+//! Replaces the COMMIT table, and the DMA/DMA_SET pair that preceded it. A row copies `1` or `8`
 //! bytes from `src` to `dst` and chains through [`BusId::CopyNext`] until the row
 //! where `count == step`.
 //!
@@ -49,14 +49,18 @@
 //!
 //! ## Width is chosen per row
 //!
-//! `single` is free: a one-byte row is legal at any count, and a wide row that
-//! overshoots is rejected by the termination argument rather than by a lookup. A
-//! chain that takes a wide row with fewer than eight bytes left can no longer reach
-//! `count == step`, and the only other way out — `count_borrows[1]` — demands
-//! `count == 0` *and* `first`. Its `count` wraps instead, so terminating would take
-//! on the order of `2^61` further rows. That is what let the `count < 8` ALU lookup
-//! go, together with the `count <= 256` bound (the executor still enforces the
-//! latter, which is where the guest ABI needs it).
+//! `single` is free upward: a one-byte row is legal at any count. Downward it is
+//! pinned exactly, and locally. A wide row with `count < 8` borrows out of
+//! `count - step`, and `copy:c:borrow_implies_count_is_zero` then demands
+//! `count == 0` — a contradiction. So a chain can never overshoot, and the prover is
+//! *forced* to take narrow rows for the last seven bytes. That is what replaced the
+//! `count < 8` ALU lookup, and it is stronger than the lookup was.
+//!
+//! The `count <= 256` lookup went for an unrelated reason: the spec places no bound
+//! on `count` and leaves the chain length to the prover. The executor still refuses
+//! an ecall above 256 bytes, so it is now strictly stricter than this chip — an
+//! intentional acceptance-set gap, benign (the same bytes, in fewer ecalls), with
+//! the executor's limit the side to relax.
 //!
 //! ## Terminating the chain
 //!
@@ -80,9 +84,9 @@
 //!   and a degree-2 constraint. The RAM write needs none: it rides
 //!   `mu - count_borrows[1] - mu_com` directly, which is the same product expanded.
 //!
-//! Two divergences from the spec's 34, both representational and both recorded in
+//! Three divergences from the spec's 34, all representational and all recorded in
 //! `shape_tests`: the spec types `timestamp` as a `Word` where this code uses a
-//! `DWordWL`, and it types the three increments and `dst_res` as `DWordWHH`
+//! `DWordWL`; it types the three increments and `dst_res` as `DWordWHH`
 //! (`Half, Half, Word`) where this code uses `DWordHL` (four `Half`s). `IS_WHH`
 //! decomposes into an `IS_WH` chip this prover does not have; four `IS_HALF`
 //! lookups prove the identical bound with the primitive it does have, at one extra
@@ -787,9 +791,12 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CopyConstraints {
         );
 
         // copy:c:src_incr and copy:c:dst_incr, plain `ADD`: the carry
-        // out of the high limb is a free bit. A chain whose position wraps cannot
-        // terminate (its `count` would have to wrap too), so nothing needs to forbid
-        // it here.
+        // out of the high limb is a free bit, so a chain's position may wrap 2^64.
+        // Nothing here forbids that, and nothing here needs to -- but not for the
+        // reason this comment used to give. `count` decrements independently of the
+        // two positions, so a wrapping chain terminates perfectly well. What stops it
+        // is what carries `set_gap` below: a wrapped address has no PAGE-backed token
+        // on the `Memory` bus, and the executor refuses the operand range outright.
         emit_add_pair(
             b,
             10,
@@ -872,8 +879,10 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CopyConstraints {
         // knowing before adding another `Memw` producer or a non-PAGE `Memory`
         // endpoint -- either would weaken this to the field statement.
         //
-        // The executor additionally refuses a call whose range crosses the 2^32 limb
-        // boundary, so the honest trace never has to rely on that argument.
+        // There is no executor backstop for the limb boundary any more: `set_gap` is
+        // one 64-bit `ADD`, carries and all, so a range crossing 2^32 is provable and
+        // the guard that used to refuse it is gone. The PAGE argument above carries
+        // this alone.
         emit_add_pair(
             b,
             20,

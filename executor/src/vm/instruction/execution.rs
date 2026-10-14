@@ -70,8 +70,11 @@ pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
 /// accelerators (`-1` SHA256, `-2` KECCAK today), and the earlier `-3`/`-4` pair sat
 /// inside that range. Must match `syscalls/src/syscalls.rs`.
 pub const DMA_MEMCPY_SYSCALL_NUMBER: u64 = u64::MAX - 29;
-/// Maximum bytes accepted by one DMA ecall. The guest `memcpy` stub chunks
-/// larger copies, and the prover enforces this bound on every first DMA row.
+/// Maximum bytes accepted by one DMA ecall. The guest `memcpy` stub chunks larger
+/// copies to stay under it, and it sizes the fixed scratch buffer the snapshot below
+/// copies through. The AIR does *not* enforce it — the spec places no bound on
+/// `count` — so the executor is strictly stricter than the chip here, and this limit
+/// is the side to relax if the two are ever made to agree.
 pub const DMA_MEMCPY_MAX_BYTES: u64 = 256;
 
 /// Width of one COPY row: eight bytes while at least eight remain, then one per
@@ -622,7 +625,8 @@ impl Instruction {
                     }
                     SyscallNumbers::Commit => {
                         // commit: write(fd, buf_addr, count) per POSIX convention
-                        // x10 = fd (must be 1 for stdout)
+                        // x10 = fd (must be 1 for stdout) on the way in, and the
+                        //       number of bytes written on the way out
                         // x11 = buf_addr (buffer address in memory)
                         // x12 = count (number of bytes to write)
                         let fd = registers.read(10)?;
@@ -632,6 +636,13 @@ impl Instruction {
                         let buf_addr = registers.read(11)?;
                         let count = registers.read(12)?;
                         memory.commit_public_output(buf_addr, count)?;
+                        // `write(2)` returns the byte count in A0, and `copy:c:read_fd`
+                        // proves that write-back happened. Without it the executor's
+                        // register file keeps `fd` where the AIR says `count` is, and
+                        // the next instruction to read A0 without first writing it
+                        // emits a register token COPY never produced — an honest
+                        // program that the prover cannot prove.
+                        registers.write(10, count)?;
                         src2_val = buf_addr;
                         dst_val = count;
                     }
@@ -972,10 +983,7 @@ pub enum ExecutionError {
     EcsmOperandOverlap,
     #[error("DMA chunk has {0} bytes; maximum per ecall is {DMA_MEMCPY_MAX_BYTES}")]
     DmaChunkTooLarge(u64),
-    #[error(
-        "DMA memset needs dst == src + {DMA_MEMSET_GAP}, with src and src + n clear of \
-         the 2^32 limb boundary; got src {src:#x}, dst {dst:#x}"
-    )]
+    #[error("DMA memset needs dst == src + {DMA_MEMSET_GAP}; got src {src:#x}, dst {dst:#x}")]
     DmaMemsetBadGap { src: u64, dst: u64 },
     #[error("Hint address range overflows the lower 32-bit limb")]
     HintAddressOverflow,

@@ -98,7 +98,11 @@ pub fn commit(slice: &[u8]) {
     unsafe {
         asm!(
             "ecall",
-            in("a0") 1usize,
+            // `a0` carries the file descriptor in and the byte count out, so it must
+            // be declared clobbered: with a plain `in` the compiler is entitled to
+            // assume it still holds 1 afterwards and reuse it, which would read a
+            // value the COPY chip proves is `count`.
+            inout("a0") 1usize => _,
             in("a1") slice.as_ptr(),
             in("a2") slice.len(),
             in("a7") SyscallNumbers::Commit as usize,

@@ -4,13 +4,13 @@ const MAX_MEMORY_SIZE: usize = 0xC000_0000;
 
 /// The accelerated `memset` depends on this.
 ///
-/// MEMMOVE pins `dst = src + 8` limb-wise on every `is_set` row, so a row whose low
-/// 32-bit limb carries has no representable successor and the executor refuses the
-/// call. Keeping every non-stack address below 2^32 is half of why no well-formed
-/// object can produce such a row; the other half is that a stack object satisfies
+/// COPY pins `dst = src + 8` with one 64-bit `ADD`, so a range crossing the 2^32 limb
+/// boundary is perfectly provable and neither the chip nor the executor refuses it
+/// any more. What this ceiling still buys is that every non-stack address stays in
+/// one limb, which keeps the gap's integer reading available without leaning on the
+/// PAGE canonicality argument; a stack object additionally satisfies
 /// `buf + n <= STACK_TOP`, whose low limb is `0xFFFF_FFF0`, leaving 15 bytes of
-/// headroom for the 8-byte gap. Raise this ceiling past 2^32 and accelerated `memset`
-/// starts failing on heap buffers.
+/// headroom for the 8-byte gap.
 const _: () = assert!(MAX_MEMORY_SIZE < 1 << 32);
 const WORD_SIZE: usize = 4;
 

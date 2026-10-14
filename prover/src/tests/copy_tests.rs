@@ -674,3 +674,292 @@ fn copy_chains_of_every_shape_validate() {
         }
     }
 }
+
+/// The other half of the width rule, and the constraint that replaced a lookup.
+///
+/// A wide row with fewer than eight bytes left used to be rejected by an ALU `LT`
+/// lookup pinning `count >= 8`. That lookup is gone, and `copy:c:borrow_implies_count_is_zero`
+/// is what replaced it: `count < step` forces the borrow out of `count - step`, and
+/// the borrow demands `count == 0`. Without it a prover serves a three-byte `memcpy`
+/// with one eight-byte row and writes five bytes past the range the ECALL authorised.
+#[test]
+fn a_wide_row_needs_eight_bytes_remaining() {
+    let air = air();
+
+    for count in 1..8u64 {
+        // `first` and `end` are set so that every *other* `restrict_end` constraint
+        // is satisfied or gated off; only the borrow implications can reject.
+        let trace = generate_copy_trace(&[row_of_width(
+            Functionality::Copy,
+            count,
+            8,
+            true,
+            true,
+            0x1000,
+            0x2000,
+        )]);
+        assert!(
+            !validate_busless(&air, &trace),
+            "a wide row with only {count} bytes left must be rejected"
+        );
+    }
+
+    // The boundary is exact: at eight bytes the same row is legal.
+    let legal = generate_copy_trace(&[row_of_width(
+        Functionality::Copy,
+        8,
+        8,
+        true,
+        true,
+        0x1000,
+        0x2000,
+    )]);
+    assert!(
+        validate_busless(&air, &legal),
+        "a wide row with exactly eight bytes left must be accepted"
+    );
+}
+
+/// `end` must match `count` in BOTH limbs.
+///
+/// `copy:c:end_implies_count_is_step_or_zc_upper` is the only constraint that looks
+/// at the high limb. Every other test in this file keeps `count` under 2^32, so it
+/// is identically satisfied there and a regression would go unnoticed. Broken, a
+/// prover could terminate a chain of 2^32 + 8 bytes after its first eight while the
+/// register read still authorised the full count.
+#[test]
+fn end_requires_the_high_limb_of_count_to_be_zero() {
+    let trace = generate_copy_trace(&[row_of_width(
+        Functionality::Copy,
+        0x1_0000_0008,
+        8,
+        true,
+        true,
+        0x1000,
+        0x2000,
+    )]);
+    assert!(
+        !validate_busless(&air(), &trace),
+        "the low limb matching `step` is not enough to close a chain"
+    );
+}
+
+/// The zero-length state must close the chain, not chain on.
+///
+/// `copy:c:borrow_implies_end` is the only thing that says so. Without it the
+/// degenerate row forwards `count_decr = 2^64 - 1` on `COPY_NEXT` and the chain
+/// walks off into a count no honest sequence produces.
+#[test]
+fn a_borrowing_row_must_close_the_chain() {
+    let mut trace = generate_copy_trace(&chain(Functionality::Copy, 0x1000, 0x2000, 0));
+    assert!(
+        validate_busless(&air(), &trace),
+        "the baseline must be clean"
+    );
+    trace.main_table.set(0, cols::END, FE::zero());
+    assert!(
+        !validate_busless(&air(), &trace),
+        "a zero-length row must set `end`"
+    );
+}
+
+/// `mu_com` is the gate that routes a row's bytes to the COMMIT bus *and* keeps them
+/// off the RAM write, which rides `mu - count_borrows[1] - mu_com`.
+///
+/// Its sibling `mu_com_wide` had a negative test and this did not. Clearing it on an
+/// honest `write` row drops the eight `(index, value)` pairs that feed
+/// `public_output` and simultaneously turns the RAM write back on — at `dst`, which
+/// on a write row is the small-integer commit index rather than an address.
+#[test]
+fn a_write_row_cannot_disown_the_commit_bus() {
+    let mut trace = generate_copy_trace(&chain(Functionality::Write, 0x3000, 0, 12));
+    assert!(
+        validate_busless(&air(), &trace),
+        "the baseline must be clean"
+    );
+    trace.main_table.set(0, cols::MU_COM, FE::zero());
+    trace.main_table.set(0, cols::MU_COM_WIDE, FE::zero());
+    assert!(
+        !validate_busless(&air(), &trace),
+        "a copying write row must carry mu_com"
+    );
+}
+
+/// A zero-length `write`: reachable from any guest, and the one shape that combines
+/// `is_write` with the degenerate row.
+///
+/// `syscalls::commit` passes `slice.len()` through with no guard, so `commit(b"")`
+/// produces a row with `first = end = 1`, `count = 0`, a borrow, and therefore no
+/// memory access and no COMMIT pair. If the `count != 0` gate in `generate_copy_trace`
+/// or in `public_output_bytes` broke, it would emit eight spurious `(index, 0)` pairs
+/// and the verifier's rebuild from `public_output` would disagree.
+#[test]
+fn a_zero_length_write_moves_nothing_and_commits_nothing() {
+    let rows = chain(Functionality::Write, 0x3000, 40, 0);
+    assert_eq!(rows.len(), 1);
+    let trace = generate_copy_trace(&rows);
+    assert!(validate_busless(&air(), &trace));
+
+    let row = trace.main_table.get_row(0);
+    assert_eq!(row[cols::FIRST], FE::one());
+    assert_eq!(row[cols::END], FE::one());
+    assert_eq!(row[cols::IS_WRITE], FE::one());
+    assert_eq!(row[cols::FIRST_WRITE], FE::one());
+    assert_eq!(
+        row[cols::MU_COM],
+        FE::zero(),
+        "an empty commit must send no COMMIT pair"
+    );
+    assert_eq!(row[cols::MU_COM_WIDE], FE::zero());
+    // `dst_res == dst`: the commit index does not advance.
+    assert_eq!(row[cols::DST_RES_0], FE::from(40u64));
+}
+
+/// `copy:c:read_fd` pins the OLD value of `x10` to the constant 1.
+///
+/// That constant is the AIR's entire "only stdout is supported" check. Nothing
+/// asserted its shape: `the_destination_register_follows_is_write` filters on
+/// `Multiplicity::Column(FIRST)` and so excludes this interaction, and changing the
+/// 1 to anything else would pass every unit test and surface only as a MEMW
+/// imbalance in a full prove run.
+#[test]
+fn the_file_descriptor_is_pinned_to_stdout() {
+    use crate::tables::copy::bus_interactions;
+    use crate::tables::types::BusId;
+    use stark::lookup::{BusValue, LinearTerm, Multiplicity, Packing};
+
+    let fd_reads: Vec<_> = bus_interactions()
+        .into_iter()
+        .filter(|i| {
+            i.bus_id == BusId::Memw as u64
+                && matches!(i.multiplicity, Multiplicity::Column(c) if c == cols::FIRST_WRITE)
+        })
+        .collect();
+    assert_eq!(fd_reads.len(), 1, "exactly one access rides first_write");
+    let fd = &fd_reads[0];
+
+    // Tuple layout: eight `old` lanes, `is_register`, two address limbs, eight
+    // `value` lanes. The old value is the descriptor; the value written back is
+    // `count`, the return value of `write(2)`.
+    assert!(
+        matches!(&fd.values[0], BusValue::Linear(terms)
+            if matches!(terms.as_slice(), [LinearTerm::Constant(1)])),
+        "the old value of x10 must be pinned to the stdout descriptor"
+    );
+    assert!(
+        matches!(&fd.values[9], BusValue::Linear(terms)
+            if matches!(terms.as_slice(), [LinearTerm::Constant(20)])),
+        "it must address x10 (word address 20), not the selected destination"
+    );
+    assert!(
+        matches!(fd.values[11], BusValue::Packed { start_column, packing: Packing::Direct }
+            if start_column == cols::COUNT_0),
+        "it must return `count` in x10"
+    );
+}
+
+/// A full-width timestamp survives the limb split.
+///
+/// Ported from the deleted `commit_tests`. Every other test in this file uses
+/// `timestamp: 100`, so `TIMESTAMP_1` is zero throughout and a regression in the
+/// split would be invisible — which matters because the high limb is what the
+/// `COPY_NEXT` tuple and both memory accesses carry unchanged.
+#[test]
+fn a_full_width_timestamp_survives_the_limb_split() {
+    let trace = generate_copy_trace(&[CopyOperation {
+        timestamp: u64::MAX,
+        src: 0x1000,
+        dst: 0x2000,
+        count: 8,
+        width: 8,
+        first: true,
+        end: true,
+        functionality: Functionality::Copy,
+        value: [0xAB; 8],
+    }]);
+    let row = trace.main_table.get_row(0);
+    assert_eq!(row[cols::TIMESTAMP_0], FE::from(0xFFFF_FFFFu64));
+    assert_eq!(row[cols::TIMESTAMP_1], FE::from(0xFFFF_FFFFu64));
+    assert!(validate_busless(&air(), &trace));
+}
+
+/// Two ecalls are two independent chains.
+///
+/// Ported from the deleted `commit_tests`. Each chain starts its own `first` row and
+/// neither receives from the other; the commit index continues across them, which is
+/// what makes the verifier's `start_index + i` enumeration line up with the per-byte
+/// `(index, value)` pairs regardless of where one ECALL ended and the next began.
+#[test]
+fn several_ecalls_are_several_chains_and_nothing_links_them() {
+    let mut rows = chain(Functionality::Write, 0x2000, 0, 3);
+    rows.extend(chain(Functionality::Write, 0x3000, 3, 9));
+    for row in rows.iter_mut().skip(3) {
+        row.timestamp = 200;
+    }
+    let trace = generate_copy_trace(&rows);
+    assert!(validate_busless(&air(), &trace));
+
+    // 3 one-byte rows, then one wide row and one one-byte row.
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows.iter().filter(|r| r.first).count(), 2);
+    assert_eq!(rows.iter().filter(|r| r.end).count(), 2);
+    assert_eq!(*trace.main_table.get(0, cols::FIRST), FE::one());
+    assert_eq!(*trace.main_table.get(3, cols::FIRST), FE::one());
+    assert_eq!(
+        *trace.main_table.get(3, cols::TIMESTAMP_0),
+        FE::from(200u64)
+    );
+    // The index carries over: the second chain starts where the first stopped.
+    assert_eq!(*trace.main_table.get(3, cols::DST_0), FE::from(3u64));
+}
+
+/// Padding rows carry exactly the padding the spec declares, and validate on their own.
+///
+/// Replaces the deleted `commit_tests::padding_rows_are_all_zero` — COPY's padding is
+/// *not* all zero, because `count = src_incr = dst_incr = 8` is what closes the three
+/// unconditional `ADD` relations and keeps both borrows at zero with `step = 8`. An
+/// all-padding trace is also what every proof now ships when the run neither commits
+/// nor copies, since COPY is in `FIXED_TABLE_COUNT`, and nothing covered it.
+#[test]
+fn padding_rows_match_the_declared_padding() {
+    let trace = generate_copy_trace(&[]);
+    assert_eq!(
+        trace.main_table.height, 4,
+        "an empty table still pads to four"
+    );
+    assert!(
+        validate_busless(&air(), &trace),
+        "an all-padding COPY trace must satisfy every constraint"
+    );
+
+    for row_idx in 0..4 {
+        let row = trace.main_table.get_row(row_idx);
+        assert_eq!(row[cols::COUNT_0], FE::from(8u64), "row {row_idx} count");
+        assert_eq!(
+            row[cols::SRC_INCR_0],
+            FE::from(8u64),
+            "row {row_idx} src_incr"
+        );
+        assert_eq!(
+            row[cols::DST_INCR_0],
+            FE::from(8u64),
+            "row {row_idx} dst_incr"
+        );
+        assert_eq!(row[cols::MU], FE::zero(), "row {row_idx} mu");
+        // Everything else is zero, which is what keeps every multiplicity at zero.
+        for column in [
+            cols::FIRST,
+            cols::END,
+            cols::SINGLE,
+            cols::IS_SET,
+            cols::IS_WRITE,
+            cols::FIRST_WRITE,
+            cols::MU_COM,
+            cols::MU_COM_WIDE,
+            cols::COUNT_1,
+            cols::COUNT_DECR_0,
+        ] {
+            assert_eq!(row[column], FE::zero(), "row {row_idx} column {column}");
+        }
+    }
+}

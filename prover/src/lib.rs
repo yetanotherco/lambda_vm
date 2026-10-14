@@ -83,8 +83,8 @@ pub struct RuntimePageRange {
 /// Number of tables that contribute exactly one sub-proof regardless of
 /// `TableCounts`: bitwise, decode, halt, keccak_rc, register, copy. The other
 /// accelerator chips are counted instead — a run that never calls one carries no
-/// table for it. COPY stays fixed because the COMMIT byte loop is deferred to
-/// it, so any run that produces output reaches it.
+/// table for it. COPY stays fixed because it receives the `write` ECALL itself, so
+/// any run that produces output reaches it.
 ///
 /// HALT is the exception, and the reason this is not simply "always": a
 /// continuation epoch carries it only when it is the final one, so `verify_epoch`

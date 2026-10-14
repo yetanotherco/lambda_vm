@@ -1649,7 +1649,7 @@ fn dma_row_matching(traces: &Traces, predicate: impl Fn(bool, bool, bool) -> boo
     (0..traces.copy.num_rows())
         .find(|&row| {
             let get = |column| *traces.copy.main_table.get(row, column) == one;
-            // memcpy rows only: memset and commit have their own forgery surface.
+            // memcpy rows only: memset and `write` have their own fixtures above.
             let is_copy = !get(mm_cols::IS_SET) && !get(mm_cols::IS_WRITE);
             get(mm_cols::MU)
                 && is_copy
@@ -1660,6 +1660,129 @@ fn dma_row_matching(traces: &Traces, predicate: impl Fn(bool, bool, bool) -> boo
 
 fn assert_dma_forgery_rejected(elf: &Elf, traces: &mut Traces, reason: &str) {
     assert!(!prove_and_verify_vm_minimal(elf, traces), "{reason}");
+}
+
+/// A guest that commits four bytes, and the COPY rows that carry them.
+///
+/// `test_commit_4` is the smallest fixture that drives the `write` functionality end
+/// to end: ECALL 64, the fd check on x10, the x254 commit-index update, and the
+/// COMMIT-domain sends that the verifier rebuilds from `public_output`.
+fn commit_fixture() -> (Elf, Traces) {
+    let (elf, logs, _instructions) = crate::test_utils::run_asm_elf("test_commit_4");
+    let traces = Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    (elf, traces)
+}
+
+/// The first `write` row of the chain.
+fn commit_row(traces: &Traces) -> usize {
+    use crate::tables::copy::cols as mm_cols;
+
+    let one = FieldElement::<GoldilocksField>::one();
+    (0..traces.copy.num_rows())
+        .find(|&row| {
+            let get = |column| *traces.copy.main_table.get(row, column) == one;
+            get(mm_cols::MU) && get(mm_cols::IS_WRITE) && get(mm_cols::MU_COM)
+        })
+        .expect("the guest must contain a real COPY write row")
+}
+
+/// Soundness: the committed bytes are what the verifier rebuilds `public_output`
+/// from, so a forged `value` lane has to break the bus.
+///
+/// This is the `write` counterpart of `test_prove_dma_memcpy_forged_value_rejected`.
+/// It did not exist: memcpy had four proof-level forgery tests and memset five,
+/// while the one functionality that determines the proof's public output had none.
+#[test]
+fn test_prove_commit_forged_value_rejected() {
+    use crate::tables::copy::cols as mm_cols;
+
+    let (elf, mut traces) = commit_fixture();
+    let forged_row = commit_row(&traces);
+    let original = *traces.copy.main_table.get(forged_row, mm_cols::VALUE[0]);
+    traces.copy.main_table.set(
+        forged_row,
+        mm_cols::VALUE[0],
+        original + FieldElement::<GoldilocksField>::one(),
+    );
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "a committed byte must match both the memory it was read from and the \
+         public output the verifier rebuilds",
+    );
+}
+
+/// The commit index is the COMMIT bus address. Shifting it moves every
+/// `(index, value)` pair this row sends away from where the verifier puts its
+/// receivers, while the row stays locally consistent — the analogue of
+/// `test_prove_dma_memset_forged_intermediate_destination_rejected`.
+#[test]
+fn test_prove_commit_forged_index_rejected() {
+    use crate::tables::copy::cols as mm_cols;
+
+    let (elf, mut traces) = commit_fixture();
+    let forged_row = commit_row(&traces);
+    for column in [mm_cols::DST_0, mm_cols::DST_INCR_0] {
+        let original = *traces.copy.main_table.get(forged_row, column);
+        traces
+            .copy
+            .main_table
+            .set(forged_row, column, original + FieldElement::from(8u64));
+    }
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "the commit index must stay where x254 and the verifier agree it is",
+    );
+}
+
+/// `dst_res` is what the chip writes back to x254, so it is the link between the
+/// COMMIT bus indices and the register file the verifier checks. Forging it on the
+/// first row breaks that link while the row's own copy stays consistent.
+#[test]
+fn test_prove_commit_forged_dst_res_rejected() {
+    use crate::tables::copy::cols as mm_cols;
+
+    let (elf, mut traces) = commit_fixture();
+    let forged_row = commit_row(&traces);
+    let original = *traces.copy.main_table.get(forged_row, mm_cols::DST_RES_0);
+    traces.copy.main_table.set(
+        forged_row,
+        mm_cols::DST_RES_0,
+        original + FieldElement::from(8u64),
+    );
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "the commit index written back to x254 must be dst + count",
+    );
+}
+
+/// `mu_com` routes the row's bytes to the COMMIT bus and keeps them off the RAM
+/// write. Clearing it drops the pairs that feed `public_output` and re-enables the
+/// RAM write at the commit index. Constraint 35 rejects it locally; this pins that
+/// the proof-level consequence follows too.
+#[test]
+fn test_prove_commit_forged_mu_com_rejected() {
+    use crate::tables::copy::cols as mm_cols;
+
+    let (elf, mut traces) = commit_fixture();
+    let forged_row = commit_row(&traces);
+    for column in [mm_cols::MU_COM, mm_cols::MU_COM_WIDE] {
+        traces
+            .copy
+            .main_table
+            .set(forged_row, column, FieldElement::zero());
+    }
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "a write row cannot disown the COMMIT bus",
+    );
 }
 /// End-to-end prove→verify for the non-constraining `Hint` ecall: the minimal Rust
 /// guest does one `hint` call (secp256k1 base-field inverse of 3) and commits the result.
