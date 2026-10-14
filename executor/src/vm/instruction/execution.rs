@@ -150,29 +150,10 @@ pub const DMA_MEMSET_SYSCALL_NUMBER: u64 = u64::MAX - 30;
 /// same cell at adjacent timestamps, the memory argument is satisfied by
 /// `value == value`, and the eight value lanes become free field elements: a prover
 /// could put anything it liked into RAM. The AIR therefore pins `dst = src + 8` on
-/// every `is_set` row, and this constant is what both sides import so the two
-/// bounds cannot drift.
+/// every `is_set` row — as one `ADD`, so the relation holds across the 2^32 limb
+/// boundary too — and this constant is what both sides import so the two bounds
+/// cannot drift.
 pub const DMA_MEMSET_GAP: u64 = 8;
-
-/// Whether a memset over `[dst, dst + n)` would straddle the 2^32 limb boundary.
-///
-/// The AIR pins `dst = src + 8` limb-wise on every `is_set` row, so a row whose low
-/// limb carries has no representable successor and the executor refuses the call.
-///
-/// No well-formed object can produce one. Every non-stack address lives below
-/// `MAX_MEMORY_SIZE` (0xC000_0000), and a stack object satisfies `buf + n <= STACK_TOP`,
-/// whose low limb is `0xFFFF_FFF0` — so `low(buf) + n <= 0xFFFF_FFF0`, leaving 15 bytes
-/// of headroom for the 8-byte gap. The margin comes from STACK_TOP's 16-byte ABI
-/// alignment, and `syscalls::allocator` holds the matching `MAX_MEMORY_SIZE < 1 << 32`
-/// assertion. A guest that computes a pointer past the stack top is already undefined
-/// behaviour in C and gets a clean error here rather than an unprovable trace.
-///
-/// So this is a guard, not a path anything takes. It exists because the AIR needs the
-/// operand relation to hold on every row, and the executor is where that is enforced.
-pub const fn dma_memset_crosses_limb_boundary(dst: u64, n: u64) -> bool {
-    // `n` is bounded by DMA_MEMCPY_MAX_BYTES on the ecall path, so this cannot wrap.
-    (dst & 0xFFFF_FFFF) + n + DMA_MEMSET_GAP > 0xFFFF_FFFF
-}
 
 /// Syscall number for the non-constraining `Hint` ecall.
 ///
@@ -759,22 +740,10 @@ impl Instruction {
 
                         // The operand contract, enforced unconditionally so that the
                         // executions this accepts are exactly the ones the AIR can
-                        // prove. The low-limb condition is the second half of that: the
-                        // AIR pins the gap limb-wise and so cannot express a carry out
-                        // of the low limb, and rejecting the straddle here is cheaper
-                        // than spending a carry column on an address range no guest
-                        // reaches (cf. the HINT limb bounds below).
-                        //
-                        // The bound has to cover the whole range, not just the first
-                        // row. `src` and `dst` both advance by the row width, and the
-                        // AIR pins the gap on EVERY `is_set` row, so a chain that starts
-                        // clear of the boundary can still walk into it: with
-                        // `src = 0xFFFF_FF00, n = 256` the row at offset 248 has
-                        // `SRC_0 = 0xFFFF_FFF8` against `DST_0 = 0`, which satisfies the
-                        // gap in full 64-bit arithmetic but not limb-wise. Bounding the
-                        // starting limb alone would accept an execution no prover can
-                        // then prove.
-                        if dma_memset_crosses_limb_boundary(src, n) || dst != src + DMA_MEMSET_GAP {
+                        // prove. `copy:c:set_gap` is a full 64-bit `ADD`, carries and
+                        // all, so a range whose low limb carries into the high one is
+                        // provable and needs no guard of its own here.
+                        if src.checked_add(DMA_MEMSET_GAP) != Some(dst) {
                             return Err(ExecutionError::DmaMemsetBadGap { src, dst });
                         }
 

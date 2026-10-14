@@ -740,6 +740,8 @@ pub struct CopyConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CopyConstraints {
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // `bits`: copy:c:range_first / range_end / range_single / range_mu, and
+        // `flags`: copy:c:range_is_set / range_is_write.
         emit_is_bit(b, 0, cols::FIRST, None);
         emit_is_bit(b, 1, cols::END, None);
         emit_is_bit(b, 2, cols::SINGLE, None);
@@ -755,13 +757,14 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CopyConstraints {
         let is_set = b.main(0, cols::IS_SET);
         let is_write = b.main(0, cols::IS_WRITE);
 
-        // An active row is implied by first or end, which keeps the chain
-        // multiplicities `mu - first` and `mu - end` binary.
+        // copy:c:first_or_end_implies_mu. An active row is implied by first or end,
+        // which keeps the chain multiplicities `mu - first` and `mu - end` binary.
         b.emit_base(
             6,
             (first.clone() + end.clone()) * (one.clone() - mu.clone()),
         );
-        // The functionality is one-hot and only set on active rows.
+        // copy:c:one_hot, copy:c:functionality_implies_mu, copy:c:first_write. The
+        // functionality is one-hot and only set on active rows.
         b.emit_base(7, is_set.clone() * is_write.clone());
         b.emit_base(
             8,
@@ -783,7 +786,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CopyConstraints {
             &[],
         );
 
-        // `src + step = src_incr` and `dst + step = dst_incr`, plain `ADD`: the carry
+        // copy:c:src_incr and copy:c:dst_incr, plain `ADD`: the carry
         // out of the high limb is a free bit. A chain whose position wraps cannot
         // terminate (its `count` would have to wrap too), so nothing needs to forbid
         // it here.
@@ -803,7 +806,8 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CopyConstraints {
             &step,
             &AddOperand::from_dword_hl(cols::DST_INCR_0),
         );
-        // `count_decr + step = count`. The two carries are `count_borrows`, the borrows
+        // copy:c:count_borrows: `count_decr + step = count`, the `SUB` the spec inlines.
+        // The two carries are `count_borrows`, the borrows
         // out of `count - step`; `count_borrows[1]` is what `restrict_end` reads.
         emit_add_pair(
             b,
@@ -814,7 +818,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CopyConstraints {
             &AddOperand::dword(cols::COUNT_0),
         );
 
-        // `dst_res = dst + count · is_write`.
+        // copy:c:dst_res_is_write and copy:c:dst_res_non_write.
         emit_add_pair(
             b,
             16,
@@ -836,7 +840,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CopyConstraints {
             (one.clone() - is_write) * (dst_res_hi - b.main(0, cols::DST_1)),
         );
 
-        // memset's operand contract: `dst = src + 8`.
+        // copy:c:set_gap -- memset's operand contract: `dst = src + 8`.
         //
         // This is what pins `value` on an `is_set` row. The inverted order puts the
         // write at `T` and the read at `T+1`, so a row's read observes writes this
@@ -879,12 +883,14 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CopyConstraints {
             &AddOperand::dword(cols::DST_0),
         );
 
-        // Unused lanes are zero on one-byte rows.
+        // copy:c:single_lanes: unused lanes are zero on one-byte rows.
         for (i, &column) in cols::VALUE.iter().enumerate().skip(1) {
             b.emit_base(21 + i, single.clone() * b.main(0, column));
         }
 
-        // `restrict_end`: `end <=> count == step or (count == 0 and first)`.
+        // `restrict_end`: `end <=> count == step or (count == 0 and first)`, i.e.
+        // copy:c:borrow_implies_first, borrow_implies_count_is_zero,
+        // end_implies_count_is_step_or_zc_upper / _lower and borrow_implies_end.
         //
         // The second state is the zero-length call, and `count_borrows[1]` -- the
         // borrow out of `count - step` -- is its proxy: a borrow can only happen when

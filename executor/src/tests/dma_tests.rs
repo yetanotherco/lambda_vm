@@ -1,7 +1,7 @@
 use crate::vm::instruction::decoding::Instruction;
 use crate::vm::instruction::execution::{
     DMA_MEMCPY_MAX_BYTES, DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_GAP, DMA_MEMSET_SYSCALL_NUMBER,
-    ExecutionError, copy_row_width, copy_trace_rows, dma_memset_crosses_limb_boundary,
+    ExecutionError, copy_row_width, copy_trace_rows,
 };
 use crate::vm::memory::Memory;
 use crate::vm::registers::Registers;
@@ -287,34 +287,23 @@ fn dma_memset_rejects_every_gap_but_one() {
         Err(ExecutionError::DmaMemsetBadGap { .. })
     ));
 
-    // The AIR pins the gap limb-wise, so a `src` whose low limb sits within the gap
-    // of the boundary has no representable successor and must be refused here.
+    // A range crossing the 2^32 limb boundary is accepted, and must be: the AIR's
+    // `copy:c:set_gap` is one 64-bit `ADD`, so `dst = src + 8` holds with the carry
+    // out of the low limb and every row of the chain is provable. The old limb-wise
+    // pair of constraints could not express that carry, and the guard that used to
+    // refuse these calls went with them.
     let mut memory = Memory::default();
-    assert!(matches!(
-        run_memset(&mut memory, 0x1_0000_0000, 0xFFFF_FFF8, 8),
-        Err(ExecutionError::DmaMemsetBadGap { .. })
-    ));
-
-    // And the bound must cover the whole range, not just the first row. This chain
-    // starts clear of the boundary but walks into it: at offset 248 the row is
-    // `src = 0xFFFF_FFF8, dst = 0x1_0000_0000`, whose low limbs differ by
-    // `-0xFFFF_FFF8` rather than by the gap, so the AIR rejects that row. Accepting
-    // the call here would hand an honest guest a trace no prover can prove.
-    let mut memory = Memory::default();
-    assert!(
-        matches!(
-            run_memset(&mut memory, 0xFFFF_FF08, 0xFFFF_FF00, 256),
-            Err(ExecutionError::DmaMemsetBadGap { .. })
-        ),
-        "a memset whose range crosses the 2^32 limb boundary must be refused"
-    );
-
-    // The row just inside the boundary is still fine, so the bound is not blanket.
-    let mut memory = Memory::default();
-    let src = 0xFFFF_FFFF - 256 - 8;
+    let src = 0xFFFF_FFF8u64;
     seed(&mut memory, src, 0x3C);
-    run_memset(&mut memory, src + 8, src, 256).unwrap();
-    assert_eq!(memory.load_byte(src + 263), 0x3C);
+    run_memset(&mut memory, src + DMA_MEMSET_GAP, src, 8).unwrap();
+    assert_eq!(memory.load_byte(0x1_0000_0007), 0x3C);
+
+    // ...including a chain that starts clear of the boundary and walks into it.
+    let mut memory = Memory::default();
+    let src = 0xFFFF_FF00u64;
+    seed(&mut memory, src, 0x5C);
+    run_memset(&mut memory, src + DMA_MEMSET_GAP, src, 256).unwrap();
+    assert_eq!(memory.load_byte(src + 263), 0x5C);
 
     // And the one legal shape still works.
     let mut memory = Memory::default();
@@ -323,49 +312,4 @@ fn dma_memset_rejects_every_gap_but_one() {
     for addr in 0x2000..0x2010 {
         assert_eq!(memory.load_byte(addr), 0x5A, "byte at {addr:#x}");
     }
-}
-
-/// The boundary guard's arithmetic.
-///
-/// The guard exists because the AIR needs `dst = src + 8` to hold on every row, not
-/// just the first, and the executor is where that is enforced. Nothing is expected to
-/// trip it — see `dma_memset_crosses_limb_boundary` for why no well-formed object can —
-/// so this pins the arithmetic rather than a reachable path: the predicate must agree
-/// with "some row of this chain has a carrying low limb", exactly, or the guard would
-/// either refuse honest calls or let through ones the prover cannot build.
-#[test]
-fn the_memset_limb_boundary_predicate_matches_the_rows_the_air_can_pin() {
-    // Brute force: for every low limb near the boundary and every legal length, the
-    // predicate must agree with "some row of this chain has a carrying low limb".
-    for n in [0u64, 1, 8, 9, 255, 256] {
-        for delta in 0..600u64 {
-            let dst = 0x1_0000_0000u64.wrapping_sub(delta);
-            let any_row_carries = (0..=n).any(|offset| {
-                let row_dst = dst.wrapping_add(offset);
-                (row_dst & 0xFFFF_FFFF) + DMA_MEMSET_GAP > 0xFFFF_FFFF
-            });
-            assert_eq!(
-                dma_memset_crosses_limb_boundary(dst, n),
-                any_row_carries,
-                "dst {dst:#x} (low {:#x}), n {n}",
-                dst & 0xFFFF_FFFF
-            );
-        }
-    }
-
-    // The stack is the only region whose low limb comes near the boundary, and it does
-    // not reach it: a real object satisfies `buf + n <= STACK_TOP`, so `low + n` tops
-    // out at 0xFFFF_FFF0 and the 8-byte gap still fits. Only a pointer past the stack
-    // top — already undefined behaviour — crosses.
-    const STACK_TOP: u64 = 0xFFFF_FFFF_FFFF_FFF0;
-    assert!(
-        !dma_memset_crosses_limb_boundary(STACK_TOP - 256, 256),
-        "a buffer that ends exactly at STACK_TOP must be accepted"
-    );
-    assert!(
-        dma_memset_crosses_limb_boundary(STACK_TOP - 8, 256),
-        "only a range running past STACK_TOP crosses"
-    );
-    // Ordinary heap buffers are nowhere near it.
-    assert!(!dma_memset_crosses_limb_boundary(0x1_0000, 256));
 }

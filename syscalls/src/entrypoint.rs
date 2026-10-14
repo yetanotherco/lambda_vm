@@ -172,17 +172,11 @@ memmove:
 // `a1` therefore carries a source address here, not the fill byte, and it is only ever
 // read by the `sb`s that lay down the seed.
 //
-// No range check for the 2^32 limb boundary here, and none is needed. The accelerator
-// pins `dst = src + 8` limb-wise, so a row whose low limb carries has no representable
-// successor and the executor refuses the call. No well-formed object can produce one:
-// every non-stack address lives below `MAX_MEMORY_SIZE` (0xC000_0000), and a stack
-// object satisfies `buf + n <= STACK_TOP`, whose low limb is 0xFFFF_FFF0 — so
-// `low(buf) + n <= 0xFFFF_FFF0`, leaving 15 bytes of headroom for the 8-byte gap. The
-// margin is STACK_TOP's 16-byte ABI alignment. A guest that computes a pointer past
-// the stack top is already undefined behaviour in C, and gets a clean executor error
-// rather than an unprovable trace. `sb` writes the low byte of its source, so
-// C's `(unsigned char)c` truncation comes for free and needs no masking of its own --
-// a wide or negative `int` fill lands as the right byte either way.
+// No range check for the 2^32 limb boundary here, and none is needed: the accelerator
+// pins `dst = src + 8` with a single 64-bit `ADD`, carries and all, so a range that
+// crosses the boundary is as provable as any other. `sb` writes the low byte of its
+// source, so C's `(unsigned char)c` truncation comes for free and needs no masking of
+// its own -- a wide or negative `int` fill lands as the right byte either way.
 //
 // Fills shorter than sixteen bytes take a plain store loop: they cannot amortise the
 // seed, and below eight bytes there is nothing left to propagate.

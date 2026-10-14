@@ -246,6 +246,16 @@ fn copy_constraints_pin_the_memset_gap() {
         "a gap of 8 in the low limb but not the high one must be rejected"
     );
 
+    // ...but a genuine gap of 8 that carries out of the low limb is accepted. This is
+    // what the single 64-bit `ADD` buys over the limb-wise pair it replaced: the
+    // executor used to refuse these ranges because the old constraints could not
+    // express the carry, and that guard is gone with them.
+    let crossing = generate_copy_trace(&set_chain(0xFFFF_FFFC, 0x1_0000_0004, 16));
+    assert!(
+        validate_busless(&air, &crossing),
+        "a gap of 8 carrying into the high limb must be accepted"
+    );
+
     // And the gate really is `is_set`. A memcpy with dst == src is harmless: its
     // read pins `value` to live memory, which is exactly why the pin is gated.
     let copy_aliased = generate_copy_trace(&chain(Functionality::Copy, 0x1000, 0x1000, 8));
@@ -634,4 +644,33 @@ fn copy_constraints_count_and_indices() {
     }
     // `restrict_end` and the two conditional ADDs are degree 3; nothing exceeds it.
     assert_eq!(CopyConstraints.max_degree(), 3);
+}
+
+/// The chain lengths around the width boundary, where `end` has to land on a row
+/// whose `count` equals its own `step` rather than on a row after the last byte.
+#[test]
+fn copy_chains_of_every_shape_validate() {
+    let air = air();
+    for count in [0u64, 1, 2, 7, 8, 9, 15, 16, 17, 64, 257] {
+        for (src, dst) in [(0x1000u64, 0x2000u64), (0x1003, 0x2007), (0x1007, 0x1000)] {
+            let rows = chain(Functionality::Copy, src, dst, count);
+            let trace = generate_copy_trace(&rows);
+            assert!(
+                validate_busless(&air, &trace),
+                "count {count}, src {src:#x}, dst {dst:#x}"
+            );
+            // The last row closes the chain and nothing else does.
+            let closers = rows.iter().filter(|r| r.end).count();
+            assert_eq!(closers, 1, "exactly one closing row at count {count}");
+            assert!(rows.last().expect("at least one row").end);
+            assert_eq!(rows.iter().filter(|r| r.first).count(), 1);
+            // No count above 256 is special any more: the per-ecall bound is gone.
+            assert_eq!(
+                rows.iter().map(|r| u64::from(r.width)).sum::<u64>(),
+                count.max(1),
+                "the chain must move exactly `count` bytes (the zero-length chain \
+                 carries one row that moves none)"
+            );
+        }
+    }
 }

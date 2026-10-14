@@ -372,4 +372,3 @@ pub fn emit_add_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>
     let root_1 = bit(b, c1, carry_1);
     b.emit_base(idx + 1, root_1);
 }
-
