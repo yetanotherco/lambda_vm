@@ -45,6 +45,7 @@ provide these below.
 
 Most constraints correspond to those already present in the CPU, and we present them here first,
 including some updates to the range checking corresponding to the differing types.
+We also need to make sure that for padding rows ($mu = 0$), no side effects can occur.
 
 #render_constraint_table(chip, config, groups: ("decode", "range", "alu", "mem", "logup"))
 
