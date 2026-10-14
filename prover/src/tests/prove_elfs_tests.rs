@@ -1738,6 +1738,41 @@ fn test_prove_commit_forged_index_rejected() {
     );
 }
 
+/// The high word of the commit index.
+///
+/// `copy:c:read_dst` writes the full `DWordWL` of `dst_res` back to x254, but the
+/// `Commit` bus carries the index as `dst[0]` alone and the trace builder pins x254's
+/// high word to zero rather than a constraint doing it. That makes the high half the
+/// one place where the register file and the COMMIT bus could drift apart, so it is
+/// worth pinning that a forged high word is caught — by the REGISTER side, since
+/// nothing in COPY looks at it.
+#[test]
+fn test_prove_commit_forged_index_high_word_rejected() {
+    use crate::tables::copy::cols as mm_cols;
+
+    let (elf, mut traces) = commit_fixture();
+    let forged_row = commit_row(&traces);
+    assert_eq!(
+        *traces
+            .copy
+            .main_table
+            .get(forged_row, mm_cols::DST_RES_0 + 2),
+        FieldElement::<GoldilocksField>::zero(),
+        "the honest commit index must fit the low word"
+    );
+    traces.copy.main_table.set(
+        forged_row,
+        mm_cols::DST_RES_0 + 2,
+        FieldElement::<GoldilocksField>::one(),
+    );
+
+    assert_dma_forgery_rejected(
+        &elf,
+        &mut traces,
+        "a forged high word of the commit index must not reach x254 unnoticed",
+    );
+}
+
 /// `first_write` is the gate on the file-descriptor check: clear it and the row no
 /// longer proves that x10 held 1 on the way in, nor that it returns `count`. It is
 /// the only thing standing between the chip and a `write` to an arbitrary descriptor.
