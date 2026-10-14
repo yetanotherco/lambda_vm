@@ -855,9 +855,10 @@ fn halfword<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
 /// The KECCAK round table's 140 transition constraints as a single
 /// [`ConstraintSet`]:
 ///
-/// * **20 IS_BIT** on the θ carry bits: for `x ∈ 0..5`, `hw ∈ 0..4`, the μ-gated
-///   `μ · Cxz_right·(1 − Cxz_right)` (degree 3). Load-bearing: it pins the θ
-///   carry to a single bit so the θ shift identity below is unique.
+/// * **20 IS_BIT** on the θ carry bits: for `x ∈ 0..5`, `hw ∈ 0..4`,
+///   `Cxz_right·(1 − Cxz_right)` (degree 2), unconditional as in the spec.
+///   Load-bearing: it pins the θ carry to a single bit so the θ shift identity
+///   below is unique.
 /// * **20 θ shift identities** (rnc = 1): for `x ∈ 0..5`, `hw ∈ 0..4`,
 ///   `μ · (in·2 − right·2¹⁶ − left)` where `in` is the `Cxz[x][3]` halfword,
 ///   `left` the `Cxz_left` byte pair and `right` the single `Cxz_right` carry
@@ -876,10 +877,10 @@ fn halfword<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
 pub struct KeccakRndConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakRndConstraints {
-    // The IS_BIT constraints are gated by μ (cond·x·(1−x)), so degree 3; the
-    // shift identities are μ × linear, degree 2.
+    // The IS_BIT constraints are x·(1−x) and the shift identities μ × linear,
+    // all degree 2.
     fn max_degree(&self) -> usize {
-        3
+        2
     }
 
     #[allow(clippy::needless_range_loop)]
@@ -892,7 +893,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakRndConstraint
         // (1) IS_BIT on the θ carry bits (Cxz_right).
         for x in 0..5 {
             for hw in 0..4 {
-                emit_is_bit(b, idx, cols::cxz_right_bit(x, hw), Some(cols::MU));
+                emit_is_bit(b, idx, cols::cxz_right_bit(x, hw), None);
                 idx += 1;
             }
         }

@@ -1741,7 +1741,7 @@ pub(crate) fn collect_bitwise_from_lt(
         bitwise_ops.extend(rows.iter().map(|(_, mu)| mu_byte(*mu)));
         bitwise_ops.extend(std::iter::repeat_n(
             mu_byte(0),
-            dedup_padding_rows(rows.len()),
+            chunk_padding_rows(rows.len()),
         ));
     }
 
@@ -1828,7 +1828,7 @@ pub(crate) fn collect_bitwise_from_mul(
         let rows = mul::dedup_mul_rows(chunk);
         bitwise_ops.extend(std::iter::repeat_n(
             mu_bytes(0, 0),
-            dedup_padding_rows(rows.len()),
+            chunk_padding_rows(rows.len()),
         ));
         for (op, mu) in &rows {
             bitwise_ops.push(mu_bytes(mu.mu_lo, mu.mu_hi));
@@ -1967,7 +1967,7 @@ pub(crate) fn collect_bitwise_from_dvrm(
         let rows = dvrm::dedup_dvrm_rows(chunk);
         bitwise_ops.extend(std::iter::repeat_n(
             mu_bytes(0, 0),
-            dedup_padding_rows(rows.len()),
+            chunk_padding_rows(rows.len()),
         ));
         for (op, mu) in &rows {
             bitwise_ops.push(mu_bytes(mu.mu_q, mu.mu_r));
@@ -2108,17 +2108,18 @@ pub(crate) fn collect_bitwise_from_branch(
         );
         bitwise_ops.extend(std::iter::repeat_n(
             row_bytes(0, 0),
-            dedup_padding_rows(rows.len()),
+            chunk_padding_rows(rows.len()),
         ));
     }
 
     bitwise_ops
 }
 
-/// Padding rows of a deduplicated chip instance (LT, MUL, DVRM, BRANCH, BYTEWISE)
-/// with `rows` real rows: their `generate_*_trace` pads to `next_power_of_two().max(4)`.
-/// Their μ bound is sent with multiplicity 1, so each padding row sends it too.
-fn dedup_padding_rows(rows: usize) -> usize {
+/// Padding rows of a chip instance with `rows` real rows: `generate_*_trace` pads to
+/// `next_power_of_two().max(4)`. The byte checks sent with multiplicity 1 (the μ bound of
+/// LT, MUL, DVRM, BRANCH, BYTEWISE and SHIFT's `ARE_BYTES[shift[0], shift[1]]`) fire on
+/// each padding row too, as `ARE_BYTES[0, 0]`.
+fn chunk_padding_rows(rows: usize) -> usize {
     rows.next_power_of_two().max(4) - rows
 }
 
@@ -3362,6 +3363,7 @@ fn build_traces<I: ImageSource + Sync>(
     let mul_chunk = max_rows.mul;
     let dvrm_chunk = max_rows.dvrm;
     let bytewise_chunk = max_rows.bytewise;
+    let shift_chunk = max_rows.shift;
     // Every source except the two dominant ones (the in-walk lookups and MEMW_R, which are
     // split into row-ranges in the parallel path below) stays a single whole-source collector.
     let mut collectors: Vec<Collector> = vec![
@@ -3369,7 +3371,17 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_branch(&branch_ops, branch_chunk))),
-        Box::new(|h| h.add_ops(&shift::collect_bitwise_from_shift(&shift_ops))),
+        Box::new(|h| {
+            h.add_ops(&shift::collect_bitwise_from_shift(&shift_ops));
+            // ARE_BYTES[shift[0], shift[1]] | 1 also fires on each chunk's padding rows.
+            // `.max(1)`: `chunks(0)` panics on an externally supplied zero row cap.
+            for chunk in shift_ops.chunks(shift_chunk.max(1)) {
+                h.bump_n(
+                    BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, 0, 0),
+                    chunk_padding_rows(chunk.len()) as u64,
+                );
+            }
+        }),
         Box::new(|h| {
             for op in &bytewise_ops {
                 h.add_ops(&op.collect_bitwise_ops());
@@ -3385,7 +3397,7 @@ fn build_traces<I: ImageSource + Sync>(
                 let rows = bytewise::dedup_bytewise_rows(chunk);
                 let ops: Vec<_> = rows.iter().map(|(_, mu)| mu_byte(*mu)).collect();
                 h.add_ops(&ops);
-                h.bump_n(mu_byte(0), dedup_padding_rows(rows.len()) as u64);
+                h.bump_n(mu_byte(0), chunk_padding_rows(rows.len()) as u64);
             }
         }),
         Box::new(|h| {

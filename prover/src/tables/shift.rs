@@ -669,32 +669,25 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // Range checks for the low-word high bits (so the in2 low-word decomposition
-    // is unique → SHIFT_AMOUNT is forced to `arg2 & 0xFF`). SHIFT_AMOUNT is also
-    // byte-checked implicitly via the BYTE_ALU[AND, shift, mask] lookups; we still emit
-    // the explicit ARE_BYTES[shift[0]] below to match the spec's `IS_BYTE[shift[0]]`
-    // (defense-in-depth, redundant with BYTE_ALU[AND]). SHIFT_HIGH (the high word) needs
-    // no check: IS_WORD is assumed (it equals the CPU's well-formed arg2 high word
-    // on the bus), matching the spec's `shift[3]`.
+    // is unique → SHIFT_AMOUNT is forced to `arg2 & 0xFF`). The spec's
+    // `IS_BYTE[shift[0]]` and `IS_BYTE[shift[1]]` (cond 1) are batched into one
+    // ARE_BYTES[shift[0], shift[1]] | 1, so padding rows send ARE_BYTES[0, 0] too.
+    // SHIFT_AMOUNT is also byte-checked implicitly via the BYTE_ALU[AND, shift, mask]
+    // lookups (defense-in-depth). SHIFT_HIGH (the high word) needs no check: IS_WORD
+    // is assumed (it equals the CPU's well-formed arg2 high word on the bus),
+    // matching the spec's `shift[3]`.
     interactions.push(BusInteraction::sender(
         BusId::AreBytes,
-        Multiplicity::Column(cols::MU),
-        vec![
-            BusValue::Packed {
-                start_column: cols::SHIFT_B1,
-                packing: Packing::Direct,
-            },
-            BusValue::constant(0),
-        ],
-    ));
-    interactions.push(BusInteraction::sender(
-        BusId::AreBytes,
-        Multiplicity::Column(cols::MU),
+        Multiplicity::One,
         vec![
             BusValue::Packed {
                 start_column: cols::SHIFT_AMOUNT,
                 packing: Packing::Direct,
             },
-            BusValue::constant(0),
+            BusValue::Packed {
+                start_column: cols::SHIFT_B1,
+                packing: Packing::Direct,
+            },
         ],
     ));
     interactions.push(BusInteraction::sender(
@@ -1010,18 +1003,15 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
         ));
 
         // Range checks (match the ALU-bus in2 reconstruction): ARE_BYTES[bits
-        // 8-15] + IS_HALF[bits 16-31]. The high word (bits 32-63, SHIFT_HIGH) is
-        // the spec's `shift[3]` Word; IS_WORD is assumed via its bus equality
-        // with the CPU's well-formed arg2 high word, so it needs no check.
-        bitwise_ops.push(BitwiseOperation::single_byte(
-            BitwiseOperationType::AreBytes,
-            ((op.shift_amount >> 8) & 0xFF) as u8,
-        ));
-        // ARE_BYTES[shift[0]] — spec IS_BYTE[shift[0]] (defense-in-depth,
-        // redundant with the BYTE_ALU[AND, shift, mask] lookups above).
-        bitwise_ops.push(BitwiseOperation::single_byte(
+        // 0-7, bits 8-15] + IS_HALF[bits 16-31]. The high word (bits 32-63,
+        // SHIFT_HIGH) is the spec's `shift[3]` Word; IS_WORD is assumed via its bus
+        // equality with the CPU's well-formed arg2 high word, so it needs no check.
+        // Padding rows' ARE_BYTES[0, 0] are counted by the BITWISE collector in
+        // `trace_builder`, which knows the chunking.
+        bitwise_ops.push(BitwiseOperation::byte_op(
             BitwiseOperationType::AreBytes,
             op.shift,
+            ((op.shift_amount >> 8) & 0xFF) as u8,
         ));
         let half = ((op.shift_amount >> 16) & 0xFFFF) as u16;
         bitwise_ops.push(BitwiseOperation::halfword(
