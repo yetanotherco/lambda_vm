@@ -221,6 +221,33 @@ pub fn is_halfword_sender_columns(interactions: &[BusInteraction]) -> Vec<usize>
 }
 
 // =============================================================================
+// REGISTER Commitment Helpers
+// =============================================================================
+
+/// REGISTER commitment for a monolithic proof of `elf` that committed
+/// `public_output`: FINI pinned to the halted state, as the production prover and
+/// verifier build it.
+pub fn halted_register_commitment(
+    options: &ProofOptions,
+    elf: &Elf,
+    public_output: &[u8],
+) -> stark::config::Commitment {
+    let committed_bytes = u32::try_from(public_output.len()).expect("public output fits in u32");
+    crate::tables::register::halted_commitment(options, elf.entry_point, committed_bytes)
+}
+
+/// REGISTER commitment for the traces of a non-final epoch: INIT `init` and FINI
+/// as the REGISTER trace holds it, as a continuation epoch commits it.
+pub fn epoch_register_commitment(
+    options: &ProofOptions,
+    init: &[u32],
+    traces: &crate::tables::trace_builder::Traces,
+) -> stark::config::Commitment {
+    let fini = crate::tables::register::fini_from_trace(&traces.register);
+    crate::tables::register::compute_precomputed_commitment_with_fini(options, init, &fini)
+}
+
+// =============================================================================
 // ELF Execution Helpers
 // =============================================================================
 

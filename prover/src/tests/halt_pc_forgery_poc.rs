@@ -21,7 +21,7 @@ use stark::prover::{IsStarkProver, Prover};
 
 use crate::statement::{StatementKind, absorb_statement};
 use crate::tables::halt::cols as halt_cols;
-use crate::tables::register::{self, cols as reg_cols};
+use crate::tables::register::cols as reg_cols;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{FE, VmTable};
 use crate::test_utils::{E, asm_elf_bytes};
@@ -163,13 +163,12 @@ fn craft_proof(
         None,
         true,
         None,
-        None,
         // As the production prover: FINI pinned to the halted register file.
-        Some(register::halted_preprocessed(
+        crate::test_utils::halted_register_commitment(
             &options,
-            program.entry_point,
-            u32::try_from(traces.public_output_bytes.len()).unwrap(),
-        )),
+            &program,
+            &traces.public_output_bytes,
+        ),
     );
     let runtime_page_ranges = traces.runtime_page_ranges();
     let num_private_input_pages = traces

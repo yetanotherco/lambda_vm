@@ -129,9 +129,6 @@ fn test_precomputed_commitment_with_fini_binds_fini() {
     // fails the verifier's preprocessed-root check.
     assert_eq!(root_a, root_a2);
     assert_ne!(root_a, root_b);
-
-    // The 3-column (with-fini) commitment differs from the 2-column monolithic one.
-    assert_ne!(root_a, compute_precomputed_commitment(&opts, &init));
 }
 
 /// `fini_from_final_state` must return exactly what `fini_from_trace` reads off

@@ -156,13 +156,8 @@ fn custom_prove_with_statement_elf(
         None,
         true,
         None,
-        None,
         // As the production prover: FINI pinned to the halted register file.
-        Some(crate::tables::register::halted_preprocessed(
-            opts,
-            program.entry_point,
-            u32::try_from(traces.public_output_bytes.len()).unwrap(),
-        )),
+        crate::test_utils::halted_register_commitment(opts, &program, &traces.public_output_bytes),
     );
 
     let runtime_page_ranges = traces.runtime_page_ranges();
