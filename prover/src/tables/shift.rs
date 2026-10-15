@@ -215,13 +215,12 @@ impl ShiftOperation {
         let left = !self.direction;
         let right = self.direction;
 
-        // is_negative is the MSB of in[3] BUT gated by `signed`. The SHIFT
-        // AIR constrains IS_NEGATIVE via the MSB16 bus (SHIFT-C14) only when
-        // `signed = 1` — for `signed = 0` IS_NEGATIVE is free, so we set it
-        // to zero. This makes `extension = 65535 * is_negative = 0` for SRL,
-        // so the extension contribution in `shifted_half` naturally
-        // vanishes (zero fill) — matching RISC-V SRL semantics regardless of
-        // the top-bit value of the input.
+        // is_negative is the MSB of in[3] BUT gated by `signed` (SIGN template):
+        // MSB16[in[3]] → is_negative when `signed = 1` (SHIFT-C14) and
+        // `(1 - signed) * is_negative = 0` (idx 21) otherwise. This makes
+        // `extension = 65535 * is_negative = 0` for SRL, so the extension
+        // contribution in `shifted_half` vanishes (zero fill) — matching RISC-V
+        // SRL semantics regardless of the top-bit value of the input.
         let is_negative = self.signed && (self.in_halves[3] >> 15) & 1 == 1;
         let extension: u16 = if is_negative { 0xFFFF } else { 0 };
 
@@ -422,7 +421,8 @@ pub fn generate_shift_trace(
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(15);
 
-    // SHIFT-C14: MSB16[in[3]] → is_negative | signed
+    // SHIFT-C14: MSB16[in[3]] → is_negative | signed (SIGN template; its
+    // `(1 - signed) * is_negative = 0` half is constraint idx 21)
     interactions.push(BusInteraction::sender(
         BusId::Msb16,
         Multiplicity::Column(cols::SIGNED),
@@ -904,13 +904,13 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for ShiftConstraints {
         let one = b.one();
         b.emit_base(20, mu.clone() * (one - mu));
 
-        // idx 21: UnsignedIsNotNegative — (1 - signed) * is_negative. On a signed
-        // row `is_negative` is pinned to the real MSB via the MSB16 bus (multiplicity
-        // `signed`); on an unsigned row nothing constrains it, yet `shifted_half`
-        // fills with `extension = 65535 * is_negative` without gating on `signed`.
-        // So an unsigned right shift (SRL) could set `is_negative = 1` and forge a
-        // sign-filled result (e.g. `srl 0, 16 = 0xFFFF_0000_0000_0000`). This pins
-        // it to 0 when `signed = 0`.
+        // idx 21: UnsignedIsNotNegative — (1 - signed) * is_negative, the second
+        // half of the spec's SIGN template (the first is the MSB16 lookup, which
+        // pins `is_negative` to the real MSB only when `signed = 1`). Without it,
+        // `shifted_half` fills with `extension = 65535 * is_negative` without
+        // gating on `signed`, so an unsigned right shift (SRL) could set
+        // `is_negative = 1` and forge a sign-filled result (e.g.
+        // `srl 0, 16 = 0xFFFF_0000_0000_0000`).
         let signed = b.main(0, cols::SIGNED);
         let is_negative = b.main(0, cols::IS_NEGATIVE);
         let one = b.one();

@@ -217,7 +217,7 @@ mod zbs_mu_bit_regression {
 // `signed`), but `shifted_half` fills with `extension = 65535·is_negative`
 // without gating on `signed`, so an unsigned right shift (SRL) could set
 // `is_negative = 1` and sign-fill the result. Closed by idx 21
-// `(1 − signed)·is_negative = 0`.
+// `(1 − signed)·is_negative = 0`, the second half of the spec's SIGN template.
 mod is_negative_unsigned_poc {
     use crate::tables::shift::{ShiftConstraints, ShiftOperation, cols, generate_shift_trace};
     use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
