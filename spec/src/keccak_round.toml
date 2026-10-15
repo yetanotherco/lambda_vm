@@ -190,7 +190,7 @@ kind = "interaction"
 tag = "KECCAK_RC"
 input = ["round"]
 output = "rc"
-multiplicity = ["-", "μ"]
+multiplicity = "μ"
 
 [[constraint_groups]]
 name = "theta"
