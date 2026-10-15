@@ -15,7 +15,8 @@
 //! - Multiplicity: `μ`
 //!
 //! ## Bus Interactions (17 total)
-//! - Senders: MSB16, BYTE_ALU[AND] (×3), ZERO, HWSL (×5), ARE_BYTES (×1: `[shift[0], shift[1]]`), IS_HALFWORD (×5)
+//! - Senders: MSB16, BYTE_ALU[AND] (×3), ZERO, HWSL (×5), ARE_BYTES (×1:
+//!   `[shift[0], shift[1]]`), IS_HALFWORD (×5)
 //! - Receiver: ALU (from CPU)
 
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
