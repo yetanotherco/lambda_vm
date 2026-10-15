@@ -149,7 +149,7 @@ Hereafter, one must only check that `out` is the proper cast of `shifted` into a
 #render_constraint_table(chip, config, groups: "limb_shifting")
 
 == Miscellaneous 
-#render_constraint_table(chip, config, groups: ("left_flag", "is_negative"))
+#render_constraint_table(chip, config, groups: ("left_flag", "sign"))
 
 == Lookups
 This chip adds the following interaction to the lookup.
