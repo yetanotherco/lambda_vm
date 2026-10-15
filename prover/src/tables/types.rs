@@ -365,8 +365,8 @@ pub enum BusId {
     // =========================================================================
     /// `IS_WH[Word, Half]`: range check that the top 48 bits of a `DWordWHH`
     /// are a valid `(Word, Half)` pair. Callers send it through the `IS_WHH`
-    /// template; the IS_WH table receives it. ID 29 (the removed ECSM bus) is
-    /// left unused.
+    /// template; the IS_WH table receives it. ID 29 (the removed EC_SCALAR
+    /// `ServeK` bus) stays unused.
     IsWh = 32,
 }
 

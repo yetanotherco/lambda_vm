@@ -201,10 +201,10 @@ impl TableCounts {
                 )));
             }
         }
-        // The accelerators are not chunked: `generate_optional` emits one table
-        // or none, so a count above 1 is a shape no prover can produce. The
-        // sub-proof cross-check constrains only the *total*, so on its own it
-        // lets an inflated accelerator count through whenever another count is
+        // The accelerators and IS_WH are not chunked: `generate_optional` emits
+        // one table or none, so a count above 1 is a shape no prover can produce.
+        // The sub-proof cross-check constrains only the *total*, so on its own it
+        // lets an inflated count through whenever another count is
         // lowered to match; this pins the per-field shape instead. It is not
         // load-bearing for memory safety — both verifiers run the cross-check
         // before any count sizes an AIR set — and if one of them ever becomes
@@ -224,7 +224,7 @@ impl TableCounts {
         for (name, count) in at_most_one {
             if count > 1 {
                 return Err(Error::InvalidTableCounts(format!(
-                    "{name} count is {count} — accelerator tables are not chunked"
+                    "{name} count is {count} — this table is not chunked"
                 )));
             }
         }

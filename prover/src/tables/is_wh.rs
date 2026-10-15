@@ -77,12 +77,12 @@ impl IsWhKey {
 
 /// Deduplicates `IS_WH` sends into trace rows: `(key) -> μ`, splitting a key
 /// over several rows when its count exceeds [`MU_MAX`]. Rows come out sorted by
-/// key so the trace is deterministic. Shared by trace generation and the
-/// BITWISE collector so the per-row lookups they count cannot drift apart.
-pub fn dedup_is_wh_rows(keys: &[IsWhKey]) -> Vec<(IsWhKey, u64)> {
+/// key so the trace is deterministic. The trace builder calls it once and hands
+/// the same rows to [`generate_is_wh_trace`] and [`collect_bitwise_from_is_wh`].
+pub fn dedup_is_wh_rows(keys: impl IntoIterator<Item = IsWhKey>) -> Vec<(IsWhKey, u64)> {
     let mut counts: BTreeMap<IsWhKey, u64> = BTreeMap::new();
     for key in keys {
-        *counts.entry(*key).or_insert(0) += 1;
+        *counts.entry(key).or_insert(0) += 1;
     }
 
     let mut rows = Vec::with_capacity(counts.len());
@@ -101,11 +101,12 @@ fn padded_rows(real_rows: usize) -> usize {
     real_rows.next_power_of_two().max(4)
 }
 
-/// Generates the IS_WH trace from the `IS_WH` sends of every caller.
+/// Generates the IS_WH trace from the rows of [`dedup_is_wh_rows`].
 ///
 /// Padding rows are all zero (`value = 0`, `μ = 0`, spec `pad = 0`).
-pub fn generate_is_wh_trace(keys: &[IsWhKey]) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let rows = dedup_is_wh_rows(keys);
+pub fn generate_is_wh_trace(
+    rows: &[(IsWhKey, u64)],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = padded_rows(rows.len());
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
@@ -127,12 +128,11 @@ pub fn generate_is_wh_trace(keys: &[IsWhKey]) -> TraceTable<GoldilocksField, Gol
 /// Counts the IS_WH table's BITWISE lookups: per row, `IS_HALFWORD` ×μ on each
 /// `value` limb and `IS_B20[μ]` ×1 — padding rows included, which send
 /// `IS_B20[0]`.
-pub(crate) fn collect_bitwise_from_is_wh(keys: &[IsWhKey], h: &mut BitwiseHistogram) {
-    if keys.is_empty() {
+pub(crate) fn collect_bitwise_from_is_wh(rows: &[(IsWhKey, u64)], h: &mut BitwiseHistogram) {
+    if rows.is_empty() {
         // No sends, no table (`generate_optional`), so nothing to count.
         return;
     }
-    let rows = dedup_is_wh_rows(keys);
     let padding = padded_rows(rows.len()) - rows.len();
 
     let half = |v: u16| {
@@ -144,7 +144,7 @@ pub(crate) fn collect_bitwise_from_is_wh(keys: &[IsWhKey], h: &mut BitwiseHistog
     };
     let b20 = |v: u64| BitwiseOperation::b20(v as u8, (v >> 8) as u8, (v >> 16) as u8);
 
-    for (key, mu) in &rows {
+    for (key, mu) in rows {
         h.bump_n(half(key.half), *mu);
         h.bump_n(half((key.word & 0xFFFF) as u16), *mu);
         h.bump_n(half((key.word >> 16) as u16), *mu);

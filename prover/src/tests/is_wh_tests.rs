@@ -56,14 +56,14 @@ fn test_is_wh_key_of_dword_takes_the_top_48_bits() {
 
 #[test]
 fn test_is_wh_dedup_collapses_repeated_keys() {
-    let rows = dedup_is_wh_rows(&[B, A, A, B, A]);
+    let rows = dedup_is_wh_rows([B, A, A, B, A]);
     // Sorted by key, so the trace does not depend on hash order.
     assert_eq!(rows, vec![(A, 3), (B, 2)]);
 }
 
 #[test]
 fn test_is_wh_dedup_of_no_sends_is_empty() {
-    assert!(dedup_is_wh_rows(&[]).is_empty());
+    assert!(dedup_is_wh_rows(std::iter::empty()).is_empty());
 }
 
 #[test]
@@ -71,17 +71,17 @@ fn test_is_wh_dedup_splits_mu_above_b20() {
     let total_mu = |rows: &[(IsWhKey, u64)]| rows.iter().map(|(_, mu)| mu).sum::<u64>();
 
     // Exactly MU_MAX fits one row.
-    let rows = dedup_is_wh_rows(&vec![A; MU_MAX as usize]);
+    let rows = dedup_is_wh_rows(vec![A; MU_MAX as usize]);
     assert_eq!(rows, vec![(A, MU_MAX)]);
 
     // One more spills into a second row of the same key.
-    let rows = dedup_is_wh_rows(&vec![A; MU_MAX as usize + 1]);
+    let rows = dedup_is_wh_rows(vec![A; MU_MAX as usize + 1]);
     assert_eq!(rows, vec![(A, MU_MAX), (A, 1)]);
 
     // Two full rows and a remainder, next to an unrelated key.
     let mut keys = vec![A; 2 * MU_MAX as usize + 3];
     keys.push(B);
-    let rows = dedup_is_wh_rows(&keys);
+    let rows = dedup_is_wh_rows(keys.iter().copied());
     assert_eq!(rows, vec![(A, MU_MAX), (A, MU_MAX), (A, 3), (B, 1)]);
     assert_eq!(total_mu(&rows), keys.len() as u64, "no send lost or added");
     assert!(rows.iter().all(|(_, mu)| *mu <= MU_MAX && *mu > 0));
@@ -93,7 +93,7 @@ fn test_is_wh_dedup_splits_mu_above_b20() {
 
 #[test]
 fn test_is_wh_trace_layout_and_padding() {
-    let trace = generate_is_wh_trace(&[A, B, A]);
+    let trace = generate_is_wh_trace(&dedup_is_wh_rows([A, B, A]));
     let t = &trace.main_table;
     assert_eq!(
         trace.num_rows(),
@@ -122,7 +122,7 @@ fn test_is_wh_trace_layout_and_padding() {
 #[test]
 fn test_is_wh_trace_exact_power_of_two_has_no_padding() {
     let keys: Vec<IsWhKey> = (0..8).map(|i| IsWhKey { word: i, half: 0 }).collect();
-    let trace = generate_is_wh_trace(&keys);
+    let trace = generate_is_wh_trace(&dedup_is_wh_rows(keys));
     assert_eq!(trace.num_rows(), 8);
     for row in 0..8 {
         assert_eq!(*trace.main_table.get(row, cols::MU), FE::one());
@@ -160,7 +160,7 @@ fn expected_ops(rows: &[(IsWhKey, u64)], padding: usize) -> Vec<BitwiseOperation
 fn test_is_wh_collector_counts_mu_bound_and_padding() {
     let keys = [A, B, A];
     let mut got = BitwiseHistogram::new();
-    collect_bitwise_from_is_wh(&keys, &mut got);
+    collect_bitwise_from_is_wh(&dedup_is_wh_rows(keys), &mut got);
 
     // Rows (A, 2), (B, 1), two padding rows each sending IS_B20[0].
     let mut want = BitwiseHistogram::new();
@@ -216,7 +216,7 @@ fn test_keccak_state_ptr_whh_across_limb_boundaries() {
         );
 
         // The IS_WH keys are the top 48 bits of the same pointers.
-        let keys = keccak::is_wh_keys(std::slice::from_ref(&op));
+        let keys: Vec<IsWhKey> = keccak::is_wh_keys(std::slice::from_ref(&op)).collect();
         assert_eq!(keys.len(), 25);
         for (lane, key) in keys.iter().enumerate() {
             assert_eq!(*key, IsWhKey::of_dword(state_addr + 8 * lane as u64));
