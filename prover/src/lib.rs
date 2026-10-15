@@ -840,6 +840,10 @@ impl VmAirs {
     /// caller-constant root is rejected (mismatches the proof root or diverges
     /// Fiat-Shamir); a consistent prover-supplied mismatch is NOT — such
     /// callers must bind identity externally (see `recursion::check_attestation`).
+    ///
+    /// `register_commitment` is the REGISTER preprocessed root (OFFSET, INIT,
+    /// FINI): [`register::halted_commitment`] for a monolithic proof, or the
+    /// epoch's `R_i`/`R_{i+1}` for a continuation epoch.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         elf: &Elf,
@@ -849,9 +853,8 @@ impl VmAirs {
         table_counts: &TableCounts,
         decode_commitment: Option<Commitment>,
         include_halt: bool,
-        register_init: Option<&[u32]>,
         page_commitments: Option<&[(u64, Commitment)]>,
-        register_preprocessed: Option<(Commitment, usize)>,
+        register_commitment: Commitment,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| {
@@ -971,21 +974,10 @@ impl VmAirs {
                 Box::new(create_hint_air(proof_options).with_name(&format!("HINT[{i}]"))) as VmAir
             })
             .collect();
-        let register: VmAir =
-            if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
-                Box::new(
-                    create_register_air(proof_options)
-                        .with_preprocessed(commitment, num_preprocessed_cols),
-                )
-            } else {
-                let register_init = register_init
-                    .map(<[u32]>::to_vec)
-                    .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
-                Box::new(create_register_air(proof_options).with_preprocessed(
-                    register::preprocessed_commitment(proof_options, &register_init),
-                    register::NUM_PREPROCESSED_COLS,
-                ))
-            };
+        let register: VmAir = Box::new(
+            create_register_air(proof_options)
+                .with_preprocessed(register_commitment, register::NUM_PREPROCESSED_COLS),
+        );
         // Every zero-init page shares one preprocessed commitment: OFFSET is
         // page-relative and INIT is all-zero, so it depends only on
         // (blowup, coset) — all fixed here. Compute it once (static const
@@ -1347,6 +1339,8 @@ pub fn prove_with_options_and_inputs(
     let __sp = stark::instruments::span("air_construction");
 
     let table_counts = traces.table_counts();
+    let committed_bytes = u32::try_from(traces.public_output_bytes.len())
+        .expect("trace build bounds the commit index to u32");
     let airs = VmAirs::new(
         &program,
         proof_options,
@@ -1356,8 +1350,7 @@ pub fn prove_with_options_and_inputs(
         None,
         true,
         None,
-        None,
-        None,
+        register::halted_commitment(proof_options, program.entry_point, committed_bytes),
     );
 
     #[cfg(feature = "instruments")]
@@ -1587,6 +1580,12 @@ fn verify_proof_parts(
         )));
     }
 
+    // The final register file is verifier-known: pinning it ends the PC chain on
+    // `pc = 1` (see `register::halted_fini`). x254 is a u32 byte count, so a longer
+    // public output cannot be honest.
+    let Ok(committed_bytes) = u32::try_from(public_output.len()) else {
+        return Ok(false);
+    };
     let airs = VmAirs::new(
         program,
         proof_options,
@@ -1595,9 +1594,8 @@ fn verify_proof_parts(
         table_counts,
         decode_commitment,
         true,
-        None,
         page_commitments,
-        None,
+        register::halted_commitment(proof_options, program.entry_point, committed_bytes),
     );
 
     // Recompute the COMMIT output bus offset from the public output.

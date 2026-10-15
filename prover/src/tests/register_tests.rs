@@ -110,7 +110,7 @@ fn test_fini_from_trace_reads_every_register() {
 }
 
 #[test]
-fn test_precomputed_commitment_with_fini_binds_fini() {
+fn test_precomputed_commitment_binds_fini() {
     let opts = ProofOptions::default_test_options();
     let init = register_init_from_entry_point(0x1000);
     // Fini vectors in register_word_address_list order (index = address for a < 64).
@@ -120,18 +120,15 @@ fn test_precomputed_commitment_with_fini_binds_fini() {
     let mut fini_b = fini_a.clone();
     fini_b[10] = 0x43; // a different final value at one address
 
-    let root_a = compute_precomputed_commitment_with_fini(&opts, &init, &fini_a);
-    let root_a2 = compute_precomputed_commitment_with_fini(&opts, &init, &fini_a);
-    let root_b = compute_precomputed_commitment_with_fini(&opts, &init, &fini_b);
+    let root_a = compute_precomputed_commitment(&opts, &init, &fini_a);
+    let root_a2 = compute_precomputed_commitment(&opts, &init, &fini_a);
+    let root_b = compute_precomputed_commitment(&opts, &init, &fini_b);
 
     // Deterministic, and sensitive to every fini value: a tampered R_{i+1} yields a
     // different preprocessed root, so a trace whose FINI != the committed R_{i+1}
     // fails the verifier's preprocessed-root check.
     assert_eq!(root_a, root_a2);
     assert_ne!(root_a, root_b);
-
-    // The 3-column (with-fini) commitment differs from the 2-column monolithic one.
-    assert_ne!(root_a, compute_precomputed_commitment(&opts, &init));
 }
 
 /// `fini_from_final_state` must return exactly what `fini_from_trace` reads off

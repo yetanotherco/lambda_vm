@@ -661,10 +661,6 @@ fn build_epoch_airs(
     // final register file is a verifier-known public value bound by the REG-C2
     // Memory-bus token; reusing the same R_{i+1} as the next epoch's INIT binds
     // init(epoch i+1) == fini(epoch i).
-    let register_preprocessed = Some((
-        register::compute_precomputed_commitment_with_fini(opts, register_init, reg_fini),
-        register::NUM_PREPROCESSED_COLS_WITH_FINI,
-    ));
     VmAirs::new(
         elf,
         opts,
@@ -674,8 +670,7 @@ fn build_epoch_airs(
         decode_commitment,
         is_final,
         None,
-        None,
-        register_preprocessed,
+        register::compute_precomputed_commitment(opts, register_init, reg_fini),
     )
 }
 
@@ -1665,6 +1660,21 @@ fn verify_continuation_view(
         let l2g_root = epoch.l2g_root();
         let epoch_public_output = epoch.public_output();
 
+        // The final epoch's `reg_fini` has no next epoch to bind it, so pin it to
+        // the halted register file (as the monolithic verifier does): this ends the
+        // PC chain on `pc = 1`, so execution cannot continue past the exit ecall.
+        // x254 counts every byte committed across the run.
+        if is_final {
+            let Ok(committed_bytes) =
+                u32::try_from(public_output.len() + epoch_public_output.len())
+            else {
+                return Ok(None);
+            };
+            if epoch.reg_fini()? != register::halted_fini(committed_bytes) {
+                return Ok(None);
+            }
+        }
+
         if !verify_epoch(
             &elf,
             elf_bytes,
@@ -1800,6 +1810,10 @@ pub(crate) mod test_fault {
     pub(crate) const MAGIC: &[u8] = b"__inject_pipeline_fault__";
     pub(crate) const FAIL_INDEX: u64 = 3;
 }
+
+#[cfg(test)]
+#[path = "tests/halt_continuation_poc.rs"]
+mod halt_continuation_poc;
 
 #[cfg(test)]
 mod tests {

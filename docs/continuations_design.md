@@ -440,9 +440,9 @@ global telescoping — we bind the whole snapshot directly.
 
 **Mechanism (no new bus).** The REGISTER table is the register analog of PAGE — it
 already puts each register's init/fini tokens on the epoch-local Memory bus
-(REG-C1 init, REG-C2 fini, matched against MEMW). For continuation epochs we
-**also preprocess the FINI column** = the epoch's final register file `R_{i+1}`
-(on top of the already-preprocessed INIT = `R_i`). "Preprocessed" means
+(REG-C1 init, REG-C2 fini, matched against MEMW). Every REGISTER table
+**preprocesses the FINI column** as well as INIT. For a continuation epoch, FINI
+is the epoch's final register file `R_{i+1}` (and INIT = `R_i`). "Preprocessed" means
 *verifier-known*: the verifier recomputes the column's commitment, so the prover
 cannot choose it. The verifier reuses the **same** `R_{i+1}` as epoch *i*'s FINI
 and epoch *i+1*'s INIT, so `init(i+1) == fini(i)` **by construction** — no equality
@@ -469,8 +469,11 @@ locks compose:
 Compose them: public `R_{i+1}` = trace FINI = real last write. So the value handed
 to the next epoch is pinned to real execution.
 
-The **monolithic prover is unchanged**: it keeps FINI as a main-trace column (it
-has no verifier-known final state) and preprocesses 2 columns, not 3.
+The **monolithic prover** preprocesses the same 3 columns, with FINI pinned to the
+halted register file (`register::halted_fini`): x1-x31 = 0, x254 = the committed
+byte count, and the PC = 1. The final epoch's `R_{i+1}` must equal that same
+halted state. Pinning it ends the PC chain on `pc = 1`, so execution cannot
+continue past the exit ecall.
 
 ### Commit index (x254)
 
@@ -640,8 +643,10 @@ recursion/aggregation layer (deferred).
 - `prover/src/tables/global_memory.rs` — the genesis (ELF-bound for ELF/runtime pages,
   committed/private for private-input pages, §3.6) and finalization anchors.
 - `prover/src/tables/register.rs` — the REGISTER table: REG-C1/REG-C2 Memory-bus
-  tokens, the preprocessed FINI commitment (`compute_precomputed_commitment_with_fini`,
-  `NUM_PREPROCESSED_COLS_WITH_FINI`), and `fini_from_trace`.
+  tokens, the preprocessed FINI commitment (`compute_precomputed_commitment`,
+  `NUM_PREPROCESSED_COLS`), `fini_from_trace`, and the halted register
+  file that monolithic proofs and the final epoch pin FINI to (`halted_fini`,
+  `halted_commitment`).
 - `prover/src/statement.rs` — the Fiat-Shamir statement absorbers
   (`absorb_statement` with `StatementKind`, `absorb_continuation_global_statement`).
 - `prover/src/continuation.rs` — the split prover/verifier: `prove_continuation` /

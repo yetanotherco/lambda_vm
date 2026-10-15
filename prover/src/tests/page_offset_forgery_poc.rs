@@ -180,8 +180,12 @@ fn craft_proof(
         None,
         true,
         None,
-        None,
-        None,
+        // As the production prover: FINI pinned to the halted register file.
+        crate::test_utils::halted_register_commitment(
+            &options,
+            &program,
+            &traces.public_output_bytes,
+        ),
     );
 
     let runtime_page_ranges = traces.runtime_page_ranges();
@@ -691,8 +695,12 @@ fn craft_proof_with_duplicate_page(
         None,
         true,
         None,
-        None,
-        None,
+        // As the production prover: FINI pinned to the halted register file.
+        crate::test_utils::halted_register_commitment(
+            &options,
+            &program,
+            &traces.public_output_bytes,
+        ),
     );
 
     let mut transcript = DefaultTranscript::<E>::new(&[]);

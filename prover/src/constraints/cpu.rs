@@ -355,7 +355,9 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CpuConstraints {
         emit_branch_cond(b, idx);
         idx += 1;
 
-        // idx 33,34: next_pc = pc + instruction_length.
+        // idx 33,34: next_pc = pc + instruction_length. With pc even and an even
+        // length, next_pc stays even, so no real row writes `next_pc = 1` (the final
+        // PC pinned in `register::halted_fini`).
         emit_next_pc_add_pair(b, idx);
         idx += 2;
 
