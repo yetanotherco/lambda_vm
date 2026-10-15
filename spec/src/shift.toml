@@ -207,11 +207,10 @@ ref = "shift:c:direction_implies_mu"
 name = "is_negative"
 
 [[constraints.is_negative]]
-kind = "interaction"
-tag = "MSB16"
-input = [["idx", "in", 3]]
+kind = "template"
+tag = "SIGN"
+input = [["idx", "in", 3], "signed"]
 output = "is_negative"
-multiplicity = "signed"
 ref = "shift:c:is_negative_if_signed"
 
 
