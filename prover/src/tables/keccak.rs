@@ -91,18 +91,16 @@ pub struct KeccakOperation {
 
 /// The `IS_WH` sends of the KECCAK table: one per lane of every call, the top
 /// 48 bits of `state_ptr[lane] = state_addr + 8·lane` (`keccak:c:range_state_ptr`).
-pub fn is_wh_keys(ops: &[KeccakOperation]) -> Vec<IsWhKey> {
-    let mut keys = Vec::with_capacity(ops.len() * 25);
-    for op in ops {
-        for lane_idx in 0..25 {
+pub fn is_wh_keys(ops: &[KeccakOperation]) -> impl Iterator<Item = IsWhKey> + '_ {
+    ops.iter().flat_map(|op| {
+        (0..25u64).map(move |lane_idx| {
             let ptr = op
                 .state_addr
-                .checked_add(lane_idx as u64 * 8)
+                .checked_add(lane_idx * 8)
                 .expect("keccak state address range must be validated by the executor");
-            keys.push(IsWhKey::of_dword(ptr));
-        }
-    }
-    keys
+            IsWhKey::of_dword(ptr)
+        })
+    })
 }
 
 // =========================================================================

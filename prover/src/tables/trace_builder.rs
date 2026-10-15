@@ -3402,9 +3402,10 @@ fn build_traces<I: ImageSource + Sync>(
     // sources fold their transient `collect_*` Vec in and drop it. The histogram is a
     // commutative monoid, so per-worker histograms tree-reduce to multiplicities that are
     // independent of accumulation order.
-    // `IS_WH` sends of every `IS_WHH` caller (today only KECCAK's state_ptr). Shared by
-    // the BITWISE collector below and the IS_WH trace in phase 5.
-    let is_wh_keys = keccak::is_wh_keys(&keccak_ops);
+    // IS_WH rows from the `IS_WH` sends of every `IS_WHH` caller (today only KECCAK's
+    // state_ptr), deduplicated once and shared by the BITWISE collector below and the
+    // IS_WH trace in phase 5, so the two read the same rows by construction.
+    let is_wh_rows = is_wh::dedup_is_wh_rows(keccak::is_wh_keys(&keccak_ops));
 
     type Collector<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + 'a>;
     let lt_chunk = max_rows.lt;
@@ -3457,7 +3458,7 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
-        Box::new(|h| is_wh::collect_bitwise_from_is_wh(&is_wh_keys, h)),
+        Box::new(|h| is_wh::collect_bitwise_from_is_wh(&is_wh_rows, h)),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ];
     if let Some(image) = initial_image
@@ -3789,7 +3790,7 @@ fn build_traces<I: ImageSource + Sync>(
     // IS_WH table. Absent entirely when no chip sends `IS_WH`.
     let gen_is_whs = || {
         generate_optional(
-            &is_wh_keys,
+            &is_wh_rows,
             is_wh::generate_is_wh_trace,
             #[cfg(feature = "disk-spill")]
             storage_mode,
