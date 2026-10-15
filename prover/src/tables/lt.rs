@@ -30,9 +30,9 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use std::collections::HashMap;
-
-use super::types::{BusId, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
+use super::types::{
+    BusId, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op, dedup_rows,
+};
 
 // =========================================================================
 // Column indices for LT table
@@ -153,51 +153,17 @@ impl LtOperation {
     }
 }
 
-/// Largest per-row multiplicity: `μ` is range-checked to a byte by `IS_BYTE[μ]`
-/// (`ARE_BYTES[μ, 0]` with multiplicity 1, the spec's default `cond`), so a row
-/// holds at most this many lookups. The bound is what keeps μ non-negative:
-/// without it a `μ = −1` twin of an honest row cancels it on the ALU bus while
-/// *receiving* its range lookups, which absorbs another row's out-of-range limb
-/// (a forged `5 < 3 = 1` verified).
-///
-/// The bound is sent with multiplicity 1, not μ. A `μ < 0` row then leaves `+1`
-/// on an out-of-range tuple, which nothing can cancel as long as no ARE_BYTES
-/// sender carries a negative weight (each one is `1` or a bit-constrained μ).
-/// Weighted by μ, the bound was itself that negative weight, and a real BRANCH
-/// row with a non-canonical `next_pc_low_1 = p−1` cancelled it
-/// (`branch_carrier_poc`).
-pub const MU_MAX: u64 = (1 << 8) - 1;
-
-/// Deduplicates LT operations into trace rows: `(lhs, rhs, signed, invert) -> μ`,
-/// splitting an op over several rows when its count exceeds [`MU_MAX`]. Shared
-/// by trace generation and the BITWISE collector so the per-row lookups they
-/// count cannot drift apart.
-pub fn dedup_lt_rows(operations: &[LtOperation]) -> Vec<(LtOperation, u64)> {
-    let mut op_map: HashMap<LtOperation, u64> = HashMap::new();
-    for op in operations {
-        *op_map.entry(op.clone()).or_insert(0) += 1;
-    }
-
-    let mut rows = Vec::with_capacity(op_map.len());
-    for (op, mut left) in op_map {
-        while left > 0 {
-            let mu = left.min(MU_MAX);
-            left -= mu;
-            rows.push((op.clone(), mu));
-        }
-    }
-    rows
-}
-
 /// Generates the LT trace table from a list of operations.
 ///
 /// Duplicate operations (same lhs, rhs, signed, invert) are merged into a single
-/// row with their multiplicities summed (see [`dedup_lt_rows`]). The table is
-/// then padded to the next power of 2.
+/// row with their multiplicities summed, split at
+/// [`MU_MAX`](crate::tables::types::MU_MAX) (see
+/// [`dedup_rows`]). The table is then padded
+/// to the next power of 2.
 pub fn generate_lt_trace(
     operations: &[LtOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let unique_ops = dedup_lt_rows(operations);
+    let unique_ops = dedup_rows(operations);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
@@ -344,7 +310,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // lookups, with `sub_0` free up to 2^32: it absorbs an out-of-range
         // IS_HALFWORD sent by any row, another LT row included (forged
         // `5 < 3 = 1`). Multiplicity 1 (the spec's default `cond`), so padding
-        // rows send ARE_BYTES[0, 0] too. See `MU_MAX`.
+        // rows send ARE_BYTES[0, 0] too. See `types::MU_MAX`.
         BusInteraction::sender(
             BusId::AreBytes,
             Multiplicity::One,

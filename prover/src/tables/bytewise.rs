@@ -19,7 +19,7 @@
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use super::types::{BusId, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
+use super::types::{BusId, GoldilocksExtension, GoldilocksField, VmTable, alu_op, dedup_rows};
 
 // =========================================================================
 // Column indices for BYTEWISE table
@@ -90,44 +90,16 @@ impl BytewiseOperation {
     }
 }
 
-/// Largest per-row multiplicity: `μ` is range-checked to a byte by `IS_BYTE[μ]`
-/// (`ARE_BYTES[μ, 0]` with multiplicity 1, the spec's default `cond`), so a row
-/// holds at most this many lookups. The bound keeps μ non-negative: without it a
-/// `μ = −1` row inverts its byte range checks and can hold an out-of-range byte
-/// (carrier). See [`dedup_bytewise_rows`] and `lt::MU_MAX` for why the bound is
-/// sent with multiplicity 1 rather than μ.
-pub const MU_MAX: u64 = (1 << 8) - 1;
-
-/// Deduplicates BYTEWISE operations into trace rows: `op -> μ`, splitting an op
-/// over several rows when its count exceeds [`MU_MAX`]. Shared by trace
-/// generation and the BITWISE collector so the per-row lookups cannot drift.
-pub fn dedup_bytewise_rows(operations: &[BytewiseOperation]) -> Vec<(BytewiseOperation, u64)> {
-    use std::collections::HashMap;
-
-    let mut op_map: HashMap<BytewiseOperation, u64> = HashMap::new();
-    for op in operations {
-        *op_map.entry(op.clone()).or_insert(0) += 1;
-    }
-
-    let mut rows = Vec::with_capacity(op_map.len());
-    for (op, mut left) in op_map {
-        while left > 0 {
-            let mu = left.min(MU_MAX);
-            left -= mu;
-            rows.push((op.clone(), mu));
-        }
-    }
-    rows
-}
-
 /// Generates the BYTEWISE trace from a list of operations.
 ///
-/// Duplicate operations are merged with summed multiplicities (split at
-/// [`MU_MAX`]), then padded to the next power of two (minimum 4).
+/// Duplicate operations are merged with summed multiplicities, split at
+/// [`MU_MAX`](crate::tables::types::MU_MAX) (see
+/// [`dedup_rows`]), then padded to the next
+/// power of two (minimum 4).
 pub fn generate_bytewise_trace(
     operations: &[BytewiseOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let unique_ops = dedup_bytewise_rows(operations);
+    let unique_ops = dedup_rows(operations);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
@@ -189,7 +161,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // non-negative: the eight BYTE_ALU sends above are weighted by μ, so a free
     // μ = −1 would invert them and let the row hold an out-of-range byte.
     // Multiplicity 1 (the spec's default `cond`), so padding rows send
-    // ARE_BYTES[0, 0] too. See `MU_MAX`.
+    // ARE_BYTES[0, 0] too. See `types::MU_MAX`.
     interactions.push(BusInteraction::sender(
         BusId::AreBytes,
         Multiplicity::One,

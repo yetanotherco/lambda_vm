@@ -21,7 +21,8 @@
 //! - `carry[0]`, `carry[1]`: Carries from 64-bit addition
 //!
 //! ## Bus Interactions
-//! - Sender: ARE_BYTES (×1 for `[μ, next_pc_low[1]]`, spec `IS_BYTE<μ>` and `IS_BYTE<next_pc_low[1]>` batched)
+//! - Sender: ARE_BYTES (×1 for `[μ, next_pc_low[1]]`, spec `IS_BYTE<μ>` and
+//!   `IS_BYTE<next_pc_low[1]>` batched)
 //! - Sender: BYTE_ALU[AND] (×1 for masking LSB)
 //! - Sender: IS_HALFWORD (×3 for next_pc_high[0..3])
 //! - Receiver: BRANCH (provides branch targets to CPU)
@@ -30,9 +31,9 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use std::collections::HashMap;
-
-use super::types::{BusId, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
+use super::types::{
+    BusId, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op, dedup_rows,
+};
 
 // =========================================================================
 // Column indices for BRANCH table
@@ -150,50 +151,17 @@ impl BranchOperation {
     }
 }
 
-/// Largest per-row multiplicity: `μ` is range-checked to a byte by `IS_BYTE[μ]`,
-/// batched with `IS_BYTE[next_pc_low_1]` into one `ARE_BYTES[μ, next_pc_low_1]`
-/// with multiplicity 1 (the spec's default `cond`), so a row holds at most this
-/// many lookups. The bound keeps μ non-negative: without it a `μ = −1` twin of
-/// an honest row cancels it on the BRANCH bus while *receiving* its range
-/// lookups, absorbing another row's out-of-range limb (same bug as LT).
-///
-/// `next_pc_low_1` is only constrained packed (`low0 + 2^8·low1 + 2^16·high0`),
-/// so its byte check must not be weighted by μ either: with weight μ a row with
-/// μ < 0 and `low1 = p−1` cancels its own (or another table's) bound on
-/// `(p−1, 0)` (`branch_carrier_poc::lt_forgery_with_branch_cycle_is_rejected`).
-/// See `lt::MU_MAX`.
-pub const MU_MAX: u64 = (1 << 8) - 1;
-
-/// Deduplicates BRANCH operations into trace rows: `(pc, offset, register,
-/// jalr) -> μ`, splitting an op over several rows when its count exceeds
-/// [`MU_MAX`]. Shared by trace generation and the BITWISE collector so the
-/// per-row lookups they count cannot drift apart.
-pub fn dedup_branch_rows(operations: &[BranchOperation]) -> Vec<(BranchOperation, u64)> {
-    let mut op_map: HashMap<BranchOperation, u64> = HashMap::new();
-    for op in operations {
-        *op_map.entry(op.clone()).or_insert(0) += 1;
-    }
-
-    let mut rows = Vec::with_capacity(op_map.len());
-    for (op, mut left) in op_map {
-        while left > 0 {
-            let mu = left.min(MU_MAX);
-            left -= mu;
-            rows.push((op.clone(), mu));
-        }
-    }
-    rows
-}
-
 /// Generates the BRANCH trace table from a list of operations.
 ///
 /// Duplicate operations (same pc, offset, register, jalr) are merged into a
-/// single row with their multiplicities summed (see [`dedup_branch_rows`]). The
-/// table is then padded to the next power of 2.
+/// single row with their multiplicities summed, split at
+/// [`MU_MAX`](crate::tables::types::MU_MAX) (see
+/// [`dedup_rows`]). The table is then padded
+/// to the next power of 2.
 pub fn generate_branch_trace(
     operations: &[BranchOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let unique_ops = dedup_branch_rows(operations);
+    let unique_ops = dedup_rows(operations);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
@@ -253,7 +221,7 @@ pub fn generate_branch_trace(
 ///   range check, batched (both have multiplicity 1)
 /// - **Sends** BYTE_ALU[AND] lookup for LSB masking
 ///   (next_pc_low[0] = unmasked_low_byte & 254)
-/// - **Sends** IS_HALFWORD lookups for the next_pc_high[0..2] range checks
+/// - **Sends** IS_HALFWORD lookups for the next_pc_high[0..3] range checks
 /// - **Receives** BRANCH lookups from CPU table
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
@@ -263,7 +231,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // the BRANCH bus while *receiving* its range lookups and absorbs an
         // out-of-range IS_HALFWORD sent by any row (same as LT). Both checks
         // have the spec's default `cond` (1), so they batch into one
-        // interaction; padding rows send ARE_BYTES[0, 0]. See `MU_MAX`.
+        // interaction; padding rows send ARE_BYTES[0, 0]. `next_pc_low_1` is
+        // only constrained packed (`low0 + 2^8·low1 + 2^16·high0`), so its byte
+        // check must not be weighted by μ either: with weight μ a row with μ < 0
+        // and `low1 = p−1` cancels its own (or another table's) bound on
+        // `(p−1, 0)` (`branch_carrier_poc::lt_forgery_with_branch_cycle_is_rejected`).
+        // See `types::MU_MAX`.
         BusInteraction::sender(
             BusId::AreBytes,
             Multiplicity::One,

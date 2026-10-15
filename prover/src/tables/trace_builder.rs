@@ -66,7 +66,7 @@ use super::page::{self, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
 use super::store;
-use super::types::{GoldilocksExtension, GoldilocksField};
+use super::types::{GoldilocksExtension, GoldilocksField, dedup_rows};
 use crate::Error;
 use crate::paged_mem::{ImageSource, PagedMem};
 
@@ -1738,7 +1738,7 @@ pub(crate) fn collect_bitwise_from_lt(
     // included, over exactly the rows `generate_lt_trace` builds for each chunk.
     let mu_byte = |v: u64| BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, v as u8);
     for chunk in op_chunks(lt_ops, max_rows_lt) {
-        let rows = lt::dedup_lt_rows(chunk);
+        let rows = dedup_rows(chunk);
         bitwise_ops.extend(rows.iter().map(|(_, mu)| mu_byte(*mu)));
         bitwise_ops.extend(std::iter::repeat_n(
             mu_byte(0),
@@ -1820,7 +1820,7 @@ pub(crate) fn collect_bitwise_from_mul(
     // `max_rows_mul` chunk (`chunk_and_generate_optional`): ARE_BYTES[μ_lo, μ_hi]
     // (the batched IS_BYTE bounds) once per row, padding rows included as
     // ARE_BYTES[0, 0], and MSB16 once per row whose sign flag is set — a unique
-    // signed op spanning two instances, or split over two rows by `mul::MU_MAX`, is
+    // signed op spanning two instances, or split over two rows by `types::MU_MAX`, is
     // sent once per row.
     let mu_bytes = |a: u64, b: u64| {
         BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, a as u8, b as u8)
@@ -1959,7 +1959,7 @@ pub(crate) fn collect_bitwise_from_dvrm(
     // batched IS_BYTE bounds) once per row, padding rows included as
     // ARE_BYTES[0, 0]; MSB16 (Column(SIGNED))
     // and the NEG-template ZERO lookups (Column(SIGN_R)/Column(SIGN_D)) once per
-    // row whose bit is set. An op split over two rows by `dvrm::MU_MAX` sends
+    // row whose bit is set. An op split over two rows by `types::MU_MAX` sends
     // them once per row.
     let mu_bytes = |a: u64, b: u64| {
         BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, a as u8, b as u8)
@@ -2103,7 +2103,7 @@ pub(crate) fn collect_bitwise_from_branch(
         BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, mu as u8, low_1)
     };
     for chunk in op_chunks(branch_ops, max_rows_branch) {
-        let rows = branch::dedup_branch_rows(chunk);
+        let rows = dedup_rows(chunk);
         bitwise_ops.extend(
             rows.iter()
                 .map(|(op, mu)| row_bytes(*mu, ((op.compute_next_pc() >> 8) & 0xFF) as u8)),
@@ -2153,7 +2153,7 @@ pub(crate) fn collect_bytewise_mu_bounds(
     let mu_byte = |v: u64| BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, v as u8);
     let mut bounds = Vec::new();
     for chunk in op_chunks(bytewise_ops, max_rows) {
-        let rows = bytewise::dedup_bytewise_rows(chunk);
+        let rows = dedup_rows(chunk);
         bounds.extend(rows.iter().map(|(_, mu)| mu_byte(*mu)));
         bounds.extend(std::iter::repeat_n(
             mu_byte(0),
@@ -3386,7 +3386,8 @@ fn build_traces<I: ImageSource + Sync>(
     //
     // LT/MUL/DVRM/BRANCH/BYTEWISE count their per-row lookups (μ bound, bit-gated
     // MSB16/ZERO) and SHIFT its padding rows PER CHIP INSTANCE, so pass the same chunk size
-    // used to split them into instances so multiplicities match the per-instance sends. MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]. PAGE does a
+    // used to split them into instances so multiplicities match the per-instance sends.
+    // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]. PAGE does a
     // batched ARE_BYTES[init, fini] per row (skipped in continuation epochs, which the L2G
     // table owns). COMMIT sends AreBytes+IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL;
     // HINT sends ARE_BYTES for its 32 output cells.

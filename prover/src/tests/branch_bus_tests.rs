@@ -699,10 +699,8 @@ fn test_soundness_wrong_offset() {
 // #1017), and trace generation splits a row whose count would exceed `MU_MAX`.
 mod mu_bound {
     use crate::tables::branch::BranchOperation;
-    use crate::tables::branch::{
-        MU_MAX, bus_interactions, cols, dedup_branch_rows, generate_branch_trace,
-    };
-    use crate::tables::types::BusId;
+    use crate::tables::branch::{bus_interactions, cols, generate_branch_trace};
+    use crate::tables::types::{BusId, MU_MAX, dedup_rows};
 
     /// Presence: μ and next_pc_low[1] are byte-checked by one ARE_BYTES with
     /// multiplicity 1. Weighted by μ, a μ < 0 row's next_pc_low[1] check could
@@ -730,16 +728,16 @@ mod mu_bound {
     /// Splitting: a count above `MU_MAX` spreads over rows within the bound that
     /// preserve the total; exactly `MU_MAX` still fits one row.
     #[test]
-    fn dedup_branch_rows_splits_counts_above_mu_max() {
+    fn branch_rows_split_counts_above_mu_max() {
         let op = BranchOperation::new(1 << 48, 0, 0, false);
         let ops: Vec<_> = std::iter::repeat_n(op.clone(), 2 * MU_MAX as usize + 7).collect();
-        let mut rows: Vec<u64> = dedup_branch_rows(&ops).iter().map(|(_, mu)| *mu).collect();
+        let mut rows: Vec<u64> = dedup_rows(&ops).iter().map(|(_, mu)| *mu).collect();
         rows.sort();
         assert_eq!(rows, vec![7, MU_MAX, MU_MAX]);
 
         let ops: Vec<_> = std::iter::repeat_n(op, MU_MAX as usize).collect();
-        assert_eq!(dedup_branch_rows(&ops).len(), 1);
-        assert!(dedup_branch_rows(&[]).is_empty());
+        assert_eq!(dedup_rows(&ops).len(), 1);
+        assert!(dedup_rows::<BranchOperation>(&[]).is_empty());
 
         // The generated trace never holds a μ above the bound.
         let ops: Vec<_> = std::iter::repeat_n(

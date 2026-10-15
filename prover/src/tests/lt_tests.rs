@@ -260,17 +260,17 @@ fn test_lt_bounds_its_multiplicity() {
 /// Splitting: a count above `MU_MAX` spreads over rows within the bound that
 /// preserve the total; exactly `MU_MAX` still fits one row.
 #[test]
-fn test_dedup_lt_rows_splits_counts_above_mu_max() {
-    use crate::tables::lt::{MU_MAX, dedup_lt_rows};
+fn test_lt_rows_split_counts_above_mu_max() {
+    use crate::tables::types::{MU_MAX, dedup_rows};
     let op = LtOperation::new(5, 3, SIGNED);
     let ops: Vec<_> = std::iter::repeat_n(op.clone(), 2 * MU_MAX as usize + 7).collect();
-    let mut rows: Vec<u64> = dedup_lt_rows(&ops).iter().map(|(_, mu)| *mu).collect();
+    let mut rows: Vec<u64> = dedup_rows(&ops).iter().map(|(_, mu)| *mu).collect();
     rows.sort();
     assert_eq!(rows, vec![7, MU_MAX, MU_MAX]);
 
     let ops: Vec<_> = std::iter::repeat_n(op, MU_MAX as usize).collect();
-    assert_eq!(dedup_lt_rows(&ops).len(), 1);
-    assert!(dedup_lt_rows(&[]).is_empty());
+    assert_eq!(dedup_rows(&ops).len(), 1);
+    assert!(dedup_rows::<LtOperation>(&[]).is_empty());
 
     // The generated trace never holds a μ above the bound.
     let ops: Vec<_> =
@@ -291,8 +291,8 @@ fn test_dedup_lt_rows_splits_counts_above_mu_max() {
 #[test]
 fn test_lt_mu_bound_lookups_match_collector() {
     use crate::tables::bitwise::BitwiseOperationType;
-    use crate::tables::lt::MU_MAX;
     use crate::tables::trace_builder::collect_bitwise_from_lt;
+    use crate::tables::types::MU_MAX;
     use std::collections::HashMap;
 
     let half = |h: u64| ((h & 0xFF) as u8, ((h >> 8) & 0xFF) as u8);

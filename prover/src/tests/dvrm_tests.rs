@@ -590,7 +590,8 @@ fn test_dvrm_bounds_its_multiplicities() {
 /// preserve both totals; exactly `MU_MAX` still fits one row.
 #[test]
 fn test_dedup_dvrm_rows_splits_counts_above_mu_max() {
-    use crate::tables::dvrm::{MU_MAX, dedup_dvrm_rows};
+    use crate::tables::dvrm::dedup_dvrm_rows;
+    use crate::tables::types::MU_MAX;
     let op = DvrmOperation::new(7, 2, UNSIGNED);
     let ops: Vec<_> = std::iter::repeat_n((op.clone(), true), MU_MAX as usize + 5)
         .chain(std::iter::repeat_n((op.clone(), false), 3))
@@ -614,8 +615,8 @@ fn test_dedup_dvrm_rows_splits_counts_above_mu_max() {
 #[test]
 fn test_dvrm_per_row_lookups_match_collector() {
     use crate::tables::bitwise::BitwiseOperationType;
-    use crate::tables::dvrm::MU_MAX;
     use crate::tables::trace_builder::collect_bitwise_from_dvrm;
+    use crate::tables::types::MU_MAX;
     use std::collections::HashMap;
 
     let half = |h: u64| ((h & 0xFF) as u8, ((h >> 8) & 0xFF) as u8);

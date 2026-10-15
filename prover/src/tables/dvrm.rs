@@ -36,7 +36,7 @@ use stark::trace::TraceTable;
 use std::collections::HashMap;
 
 use super::types::{
-    BusId, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
+    BusId, GoldilocksExtension, GoldilocksField, MU_MAX, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
     NEG_INV_2_64, SHIFT_16, VmTable, alu_op,
 };
 
@@ -274,21 +274,16 @@ impl DvrmOperation {
 // Trace generation
 // =========================================================================
 
-/// Largest per-row multiplicity: `μ_q` and `μ_r` are each range-checked to a
-/// byte by `IS_BYTE[μ_q]` and `IS_BYTE[μ_r]`, batched into one
-/// `ARE_BYTES[μ_q, μ_r]` with multiplicity 1 (the spec's default `cond`), so a
-/// row holds at most this many lookups of each kind. The bound is what makes
-/// `μ_q + μ_r = 0` imply `μ_q = μ_r = 0`: without it a `μ_q = 1, μ_r = −1`
-/// row receives a quotient
-/// lookup while sending none of its checks (forged `n = q·d + r`).
-///
-/// See `lt::MU_MAX` for why the bound is sent with multiplicity 1 rather than μ.
-pub const MU_MAX: u64 = (1 << 8) - 1;
-
 /// Deduplicates DVRM operations into trace rows: `(n, d, signed) -> (μ_q, μ_r)`,
 /// splitting an op over several rows when a count exceeds [`MU_MAX`]. Shared by
 /// trace generation and the BITWISE collector so the per-row lookups they count
 /// cannot drift apart.
+///
+/// `μ_q` and `μ_r` are each range-checked to a byte by `IS_BYTE[μ_q]` and
+/// `IS_BYTE[μ_r]`, batched into one `ARE_BYTES[μ_q, μ_r]` with multiplicity 1.
+/// The bound is what makes `μ_q + μ_r = 0` imply `μ_q = μ_r = 0`: without it a
+/// `μ_q = 1, μ_r = −1` row receives a quotient lookup while sending none of its
+/// checks (forged `n = q·d + r`).
 pub fn dedup_dvrm_rows(
     operations: &[(DvrmOperation, bool)],
 ) -> Vec<(DvrmOperation, DvrmMultiplicities)> {

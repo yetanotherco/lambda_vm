@@ -451,7 +451,8 @@ fn test_mul_bounds_its_multiplicities() {
 /// bound and together preserve both totals; exactly `MU_MAX` still fits one row.
 #[test]
 fn test_dedup_mul_rows_splits_counts_above_mu_max() {
-    use crate::tables::mul::{MU_MAX, dedup_mul_rows};
+    use crate::tables::mul::dedup_mul_rows;
+    use crate::tables::types::MU_MAX;
     let op = MulOperation::new(3, false, 5, false);
     let ops: Vec<_> = std::iter::repeat_n((op.clone(), false), MU_MAX as usize + 5)
         .chain(std::iter::repeat_n((op.clone(), true), 3))
@@ -490,8 +491,8 @@ fn test_dedup_mul_rows_splits_counts_above_mu_max() {
 #[test]
 fn test_mul_per_row_lookups_match_collector() {
     use crate::tables::bitwise::BitwiseOperationType;
-    use crate::tables::mul::MU_MAX;
     use crate::tables::trace_builder::collect_bitwise_from_mul;
+    use crate::tables::types::MU_MAX;
     use std::collections::HashMap;
 
     let half = |h: u64| ((h & 0xFF) as u8, ((h >> 8) & 0xFF) as u8);

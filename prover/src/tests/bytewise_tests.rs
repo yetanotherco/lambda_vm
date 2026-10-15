@@ -91,20 +91,17 @@ fn test_bus_interactions_shape() {
 /// Splitting: a count above `MU_MAX` spreads over rows that each stay within the
 /// bound and together preserve the total; exactly `MU_MAX` still fits one row.
 #[test]
-fn test_dedup_bytewise_rows_splits_counts_above_mu_max() {
-    use crate::tables::bytewise::{MU_MAX, dedup_bytewise_rows};
+fn test_bytewise_rows_split_counts_above_mu_max() {
+    use crate::tables::types::{MU_MAX, dedup_rows};
     let op = BytewiseOperation::new(0xF0, 0x3C, alu_op::AND);
     let ops: Vec<_> = std::iter::repeat_n(op.clone(), 2 * MU_MAX as usize + 7).collect();
-    let mut rows: Vec<u64> = dedup_bytewise_rows(&ops)
-        .iter()
-        .map(|(_, mu)| *mu)
-        .collect();
+    let mut rows: Vec<u64> = dedup_rows(&ops).iter().map(|(_, mu)| *mu).collect();
     rows.sort();
     assert_eq!(rows, vec![7, MU_MAX, MU_MAX]);
 
     let ops: Vec<_> = std::iter::repeat_n(op, MU_MAX as usize).collect();
-    assert_eq!(dedup_bytewise_rows(&ops).len(), 1);
-    assert!(dedup_bytewise_rows(&[]).is_empty());
+    assert_eq!(dedup_rows(&ops).len(), 1);
+    assert!(dedup_rows::<BytewiseOperation>(&[]).is_empty());
 
     // The generated trace never holds a μ above the bound.
     let ops: Vec<_> = std::iter::repeat_n(
@@ -128,8 +125,8 @@ fn test_dedup_bytewise_rows_splits_counts_above_mu_max() {
 #[test]
 fn test_bytewise_mu_bound_lookups_match_collector() {
     use crate::tables::bitwise::BitwiseOperationType;
-    use crate::tables::bytewise::MU_MAX;
     use crate::tables::trace_builder::collect_bytewise_mu_bounds;
+    use crate::tables::types::MU_MAX;
     use std::collections::HashMap;
 
     let distinct = [

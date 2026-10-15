@@ -37,7 +37,7 @@ use stark::trace::TraceTable;
 use std::collections::HashMap;
 
 use super::types::{
-    BusId, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
+    BusId, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128, MU_MAX,
     NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48, NEG_INV_2_64, NEG_INV_2_80, NEG_INV_2_96,
     NEG_INV_2_112, NEG_INV_2_128, SHIFT_16, VmTable, alu_op,
 };
@@ -282,21 +282,16 @@ impl MulOperation {
 // Trace generation
 // =========================================================================
 
-/// Largest per-row multiplicity: `μ_lo` and `μ_hi` are each range-checked to a
-/// byte by `IS_BYTE[μ_lo]` and `IS_BYTE[μ_hi]`, batched into one
-/// `ARE_BYTES[μ_lo, μ_hi]` with multiplicity 1 (the spec's default `cond`), so a
-/// row holds at most this many lookups of each kind. The bound is what makes
-/// `μ_lo + μ_hi = 0` imply `μ_lo = μ_hi = 0`: without it a `μ_lo = 1, μ_hi = −1`
-/// row receives a lookup
-/// while sending none of its range checks.
-///
-/// See `lt::MU_MAX` for why the bound is sent with multiplicity 1 rather than μ.
-pub const MU_MAX: u64 = (1 << 8) - 1;
-
 /// Deduplicates MUL operations into trace rows: `(lhs, lhs_signed, rhs,
 /// rhs_signed) -> (μ_lo, μ_hi)`, splitting an op over several rows when a count
 /// exceeds [`MU_MAX`]. Shared by trace generation and the BITWISE collector so
 /// the per-row lookups they count cannot drift apart.
+///
+/// `μ_lo` and `μ_hi` are each range-checked to a byte by `IS_BYTE[μ_lo]` and
+/// `IS_BYTE[μ_hi]`, batched into one `ARE_BYTES[μ_lo, μ_hi]` with multiplicity 1.
+/// The bound is what makes `μ_lo + μ_hi = 0` imply `μ_lo = μ_hi = 0`: without it
+/// a `μ_lo = 1, μ_hi = −1` row receives a lookup while sending none of its range
+/// checks.
 pub fn dedup_mul_rows(
     operations: &[(MulOperation, bool)],
 ) -> Vec<(MulOperation, MulMultiplicities)> {
