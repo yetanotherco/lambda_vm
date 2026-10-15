@@ -246,7 +246,7 @@ pub fn trace_register_commitment(
     traces: &crate::tables::trace_builder::Traces,
 ) -> stark::config::Commitment {
     let fini = crate::tables::register::fini_from_trace(&traces.register);
-    crate::tables::register::compute_precomputed_commitment_with_fini(options, init, &fini)
+    crate::tables::register::compute_precomputed_commitment(options, init, &fini)
 }
 
 // =============================================================================

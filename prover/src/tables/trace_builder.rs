@@ -4218,7 +4218,7 @@ impl Traces {
         use super::mul::cols::NUM_COLUMNS as MUL_COLS;
         use super::page::NUM_PREPROCESSED_COLS as PAGE_PREPROCESSED;
         use super::page::cols::NUM_COLUMNS as PAGE_COLS;
-        use super::register::NUM_PREPROCESSED_COLS_WITH_FINI as REGISTER_PREPROCESSED;
+        use super::register::NUM_PREPROCESSED_COLS as REGISTER_PREPROCESSED;
         use super::register::cols::NUM_COLUMNS as REGISTER_COLS;
         use super::shift::cols::NUM_COLUMNS as SHIFT_COLS;
         use super::store::cols::NUM_COLUMNS as STORE_COLS;

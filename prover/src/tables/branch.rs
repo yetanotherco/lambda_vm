@@ -97,6 +97,10 @@ pub mod cols {
 const SHIFT_8: u64 = 1 << 8;
 
 /// Mask value 254 = 0xFE (clears LSB)
+///
+/// Soundness relies on this: a branch target is always even, so no BRANCH row can
+/// write `next_pc = CPU_PADDING_PC` (1), the final PC the verifier pins in
+/// `register::halted_fini`.
 const MASK_254: u64 = 254;
 
 // =========================================================================

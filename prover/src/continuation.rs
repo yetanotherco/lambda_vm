@@ -670,7 +670,7 @@ fn build_epoch_airs(
         decode_commitment,
         is_final,
         None,
-        register::compute_precomputed_commitment_with_fini(opts, register_init, reg_fini),
+        register::compute_precomputed_commitment(opts, register_init, reg_fini),
     )
 }
 

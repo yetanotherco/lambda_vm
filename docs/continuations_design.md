@@ -643,8 +643,8 @@ recursion/aggregation layer (deferred).
 - `prover/src/tables/global_memory.rs` — the genesis (ELF-bound for ELF/runtime pages,
   committed/private for private-input pages, §3.6) and finalization anchors.
 - `prover/src/tables/register.rs` — the REGISTER table: REG-C1/REG-C2 Memory-bus
-  tokens, the preprocessed FINI commitment (`compute_precomputed_commitment_with_fini`,
-  `NUM_PREPROCESSED_COLS_WITH_FINI`), `fini_from_trace`, and the halted register
+  tokens, the preprocessed FINI commitment (`compute_precomputed_commitment`,
+  `NUM_PREPROCESSED_COLS`), `fini_from_trace`, and the halted register
   file that monolithic proofs and the final epoch pin FINI to (`halted_fini`,
   `halted_commitment`).
 - `prover/src/statement.rs` — the Fiat-Shamir statement absorbers

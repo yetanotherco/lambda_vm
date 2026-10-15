@@ -974,10 +974,10 @@ impl VmAirs {
                 Box::new(create_hint_air(proof_options).with_name(&format!("HINT[{i}]"))) as VmAir
             })
             .collect();
-        let register: VmAir = Box::new(create_register_air(proof_options).with_preprocessed(
-            register_commitment,
-            register::NUM_PREPROCESSED_COLS_WITH_FINI,
-        ));
+        let register: VmAir = Box::new(
+            create_register_air(proof_options)
+                .with_preprocessed(register_commitment, register::NUM_PREPROCESSED_COLS),
+        );
         // Every zero-init page shares one preprocessed commitment: OFFSET is
         // page-relative and INIT is all-zero, so it depends only on
         // (blowup, coset) — all fixed here. Compute it once (static const

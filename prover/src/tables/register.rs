@@ -65,7 +65,7 @@ pub const NUM_REGISTER_ADDRESSES: usize = NUM_REGISTERS * WORDS_PER_REGISTER - 1
 /// as its INIT, binding `init(epoch i+1) == fini(epoch i)` with no extra bus. A
 /// monolithic proof (and the final epoch) pins FINI to the halted state (see
 /// [`halted_fini`]).
-pub const NUM_PREPROCESSED_COLS_WITH_FINI: usize = 3;
+pub const NUM_PREPROCESSED_COLS: usize = 3;
 
 // =========================================================================
 // Column indices for REGISTER table
@@ -199,7 +199,7 @@ pub fn halted_commitment(
     committed_bytes: u32,
 ) -> Commitment {
     let init = register_init_from_entry_point(entry_point);
-    compute_precomputed_commitment_with_fini(options, &init, &halted_fini(committed_bytes))
+    compute_precomputed_commitment(options, &init, &halted_fini(committed_bytes))
 }
 
 /// Build the register init map from an epoch's boundary register snapshot: the
@@ -335,7 +335,7 @@ pub fn fini_from_final_state(final_state: &FinalRegisterStateMap, init: &[u32]) 
 /// produced by `fini_from_trace` (entry `i` = the register at
 /// `register_word_address_list()[i]`). Must match the column order of the REGISTER
 /// trace (OFFSET, INIT, FINI), and FINI on padding rows is 0 (as the trace builds it).
-pub fn compute_precomputed_commitment_with_fini(
+pub fn compute_precomputed_commitment(
     options: &ProofOptions,
     init: &[u32],
     fini: &[u32],
