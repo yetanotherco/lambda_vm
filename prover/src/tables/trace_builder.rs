@@ -52,6 +52,7 @@ use super::ecsm;
 use super::eq;
 use super::halt;
 use super::hint;
+use super::is_wh;
 use super::keccak::{self, KeccakOperation};
 use super::keccak_rc;
 use super::keccak_rnd::{self, KeccakRoundOperation};
@@ -2575,19 +2576,18 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
             ));
         }
 
-        // IS_HALF for state_ptr halfwords (100 per call)
+        // IS_HALF for state_ptr half_lo (25 per call). The top 48 bits go to
+        // IS_WH through `IS_WHH`; that table counts its own checks.
         for lane_idx in 0..25 {
             let ptr = state_addr
                 .checked_add(lane_idx as u64 * 8)
                 .expect("keccak state address range must be validated by the executor");
-            for shift in [0, 16, 32, 48] {
-                let half = ((ptr >> shift) & 0xFFFF) as u16;
-                ops.push(BitwiseOperation::halfword(
-                    BitwiseOperationType::IsHalf,
-                    (half & 0xFF) as u8,
-                    ((half >> 8) & 0xFF) as u8,
-                ));
-            }
+            let half = (ptr & 0xFFFF) as u16;
+            ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                ((half >> 8) & 0xFF) as u8,
+            ));
         }
 
         // Replay keccak round computation to extract bitwise lookups
@@ -2987,6 +2987,10 @@ pub struct Traces {
     /// HINT table (one row per non-constraining hint ecall). Empty when the run
     /// makes no hint ecall.
     pub hints: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+
+    /// IS_WH table (one row per distinct `(Word, Half)` address pair sent through
+    /// `IS_WHH`). Empty when no chip sends one.
+    pub is_whs: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
     /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
@@ -3398,6 +3402,10 @@ fn build_traces<I: ImageSource + Sync>(
     // sources fold their transient `collect_*` Vec in and drop it. The histogram is a
     // commutative monoid, so per-worker histograms tree-reduce to multiplicities that are
     // independent of accumulation order.
+    // `IS_WH` sends of every `IS_WHH` caller (today only KECCAK's state_ptr). Shared by
+    // the BITWISE collector below and the IS_WH trace in phase 5.
+    let is_wh_keys = keccak::is_wh_keys(&keccak_ops);
+
     type Collector<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + 'a>;
     let lt_chunk = max_rows.lt;
     let branch_chunk = max_rows.branch;
@@ -3449,6 +3457,7 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops))),
+        Box::new(|h| is_wh::collect_bitwise_from_is_wh(&is_wh_keys, h)),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ];
     if let Some(image) = initial_image
@@ -3777,6 +3786,15 @@ fn build_traces<I: ImageSource + Sync>(
             storage_mode,
         )
     };
+    // IS_WH table. Absent entirely when no chip sends `IS_WH`.
+    let gen_is_whs = || {
+        generate_optional(
+            &is_wh_keys,
+            is_wh::generate_is_wh_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
 
     let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =
         (None, None, None, None);
@@ -3790,6 +3808,7 @@ fn build_traces<I: ImageSource + Sync>(
         (None, None, None, None);
     let (mut ecsms_slot, mut ecdases_slot) = (None, None);
     let mut hints_slot = None;
+    let mut is_whs_slot = None;
 
     #[cfg(feature = "disk-spill")]
     let sequential = storage_mode == StorageMode::Disk || cfg!(not(feature = "parallel"));
@@ -3832,6 +3851,7 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(ecsms_slot, gen_ecsms);
             spawn_into!(ecdases_slot, gen_ecdases);
             spawn_into!(hints_slot, gen_hints);
+            spawn_into!(is_whs_slot, gen_is_whs);
         });
     } else {
         cpus_slot = Some(gen_cpus());
@@ -3860,6 +3880,7 @@ fn build_traces<I: ImageSource + Sync>(
         ecsms_slot = Some(gen_ecsms());
         ecdases_slot = Some(gen_ecdases());
         hints_slot = Some(gen_hints());
+        is_whs_slot = Some(gen_is_whs());
     }
 
     const PHASE5_RAN: &str = "phase 5 generation ran in one of the branches above";
@@ -3894,6 +3915,7 @@ fn build_traces<I: ImageSource + Sync>(
     let ecsms = ecsms_slot.expect(PHASE5_RAN)?;
     let ecdases = ecdases_slot.expect(PHASE5_RAN)?;
     let hints = hints_slot.expect(PHASE5_RAN)?;
+    let is_whs = is_whs_slot.expect(PHASE5_RAN)?;
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
     // so spill them here before returning.
@@ -3958,6 +3980,7 @@ fn build_traces<I: ImageSource + Sync>(
         ecsms,
         ecdases,
         hints,
+        is_whs,
         memw_registers,
         local_to_global,
         touched_memory_cells,
@@ -4329,6 +4352,7 @@ impl Traces {
         use super::eq::cols::NUM_COLUMNS as EQ_COLS;
         use super::halt::cols::NUM_COLUMNS as HALT_COLS;
         use super::hint::cols::NUM_COLUMNS as HINT_COLS;
+        use super::is_wh::cols::NUM_COLUMNS as IS_WH_COLS;
         use super::keccak::cols::NUM_COLUMNS as KECCAK_COLS;
         use super::keccak_rc::NUM_PRECOMPUTED_COLS as KECCAK_RC_PRECOMPUTED;
         use super::keccak_rc::cols::NUM_COLUMNS as KECCAK_RC_COLS;
@@ -4368,6 +4392,7 @@ impl Traces {
             ecsms,
             ecdases,
             hints,
+            is_whs,
             memw_registers,
             eqs,
             bytewises,
@@ -4448,6 +4473,9 @@ impl Traces {
         for t in hints {
             total += (t.num_rows() * HINT_COLS) as u64;
         }
+        for t in is_whs {
+            total += (t.num_rows() * IS_WH_COLS) as u64;
+        }
         total
     }
 
@@ -4490,6 +4518,7 @@ impl Traces {
         let n_ecsm = aux_cols(super::ecsm::bus_interactions().len());
         let n_ecdas = aux_cols(super::ecdas::bus_interactions().len());
         let n_hint = aux_cols(super::hint::bus_interactions().len());
+        let n_is_wh = aux_cols(super::is_wh::bus_interactions().len());
 
         let Traces {
             cpus,
@@ -4513,6 +4542,7 @@ impl Traces {
             ecsms,
             ecdases,
             hints,
+            is_whs,
             memw_registers,
             eqs,
             bytewises,
@@ -4593,6 +4623,9 @@ impl Traces {
         for t in hints {
             total += (t.num_rows() * n_hint) as u64;
         }
+        for t in is_whs {
+            total += (t.num_rows() * n_is_wh) as u64;
+        }
         total
     }
 
@@ -4619,6 +4652,7 @@ impl Traces {
             ecdas: self.ecdases.len(),
             hint: self.hints.len(),
             commit: self.commits.len(),
+            is_wh: self.is_whs.len(),
         }
     }
 

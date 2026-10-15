@@ -2058,6 +2058,7 @@ mod tests {
                     ("ecdas", c.ecdas),
                     ("hint", c.hint),
                     ("commit", c.commit),
+                    ("is_wh", c.is_wh),
                 ]
             })
             .collect();
