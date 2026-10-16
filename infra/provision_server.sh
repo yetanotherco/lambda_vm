@@ -10,6 +10,7 @@
 #                        First-run servers accept root SSH; once provision.sh
 #                        has hardened sshd, re-run as: SSH_USER=admin ...
 #   PROVISION_FILE       default: <script-dir>/provision.sh
+#   LLVM_VERSION         default: 21
 #
 # SSH wait is indefinite — Ctrl+C to abort.
 
@@ -25,6 +26,7 @@ NC='\033[0m'
 
 SSH_USER="${SSH_USER:-root}"
 PROVISION_FILE="${PROVISION_FILE:-$SCRIPT_DIR/provision.sh}"
+LLVM_VERSION="${LLVM_VERSION:-21}"
 
 err() { echo -e "${RED}error:${NC} $*" >&2; }
 info() { echo -e "${BOLD}$*${NC}"; }
@@ -45,6 +47,12 @@ if ! command -v ssh >/dev/null 2>&1; then
     err "ssh not found on PATH."
     exit 1
 fi
+case "$LLVM_VERSION" in
+    ''|*[!0-9]*)
+        err "LLVM_VERSION must be a numeric LLVM major version, got '$LLVM_VERSION'"
+        exit 2
+        ;;
+esac
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes)
 
@@ -60,9 +68,9 @@ done
 ok "sshd reachable on $SSH_USER@$IP (attempt $attempt)"
 
 if [ "$SSH_USER" = "root" ]; then
-    REMOTE_CMD="bash -s"
+    REMOTE_CMD="env LLVM_VERSION=$LLVM_VERSION bash -s"
 else
-    REMOTE_CMD="sudo bash -s"
+    REMOTE_CMD="sudo env LLVM_VERSION=$LLVM_VERSION bash -s"
 fi
 
 info "Running $PROVISION_FILE on $SSH_USER@$IP..."

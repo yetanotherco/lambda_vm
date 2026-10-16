@@ -1,6 +1,6 @@
 //! Parity: GPU fused `evaluate_poly_coset_batch_ext3_into_with_merkle_tree`
 //! (LDE + row-pair Keccak leaves + Merkle inner tree) against the same CPU
-//! pipeline produced by `commit_composition_polynomial`.
+//! row-pair commitment layout used by `commit_bit_reversed(.., 2)`.
 
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
@@ -83,7 +83,7 @@ fn cpu_hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-/// CPU: `commit_composition_polynomial`-style tree root over num_rows/2 leaves.
+/// CPU: `commit_bit_reversed(.., 2)`-style tree root over num_rows/2 leaves.
 fn cpu_tree_nodes(parts: &[Vec<Fp3>]) -> Vec<[u8; 32]> {
     let num_rows = parts[0].len();
     let num_parts = parts.len();

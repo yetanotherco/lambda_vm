@@ -1,5 +1,12 @@
 [workspace]
 
+# Thin LTO measurably lowers executed guest cycles (~2.3% on the committed
+# ethrex_bench fixtures) at a small ELF-size cost, which is free in this VM
+# (execution is priced per executed instruction, not by ELF size). Cargo's
+# release default is lto = false / codegen-units = 16.
+[profile.release]
+lto = "thin"
+
 [package]
 name = "ethrex"
 version = "0.1.0"
@@ -7,16 +14,41 @@ edition = "2024"
 
 [dependencies]
 lambda-vm-syscalls = { path = "../../../../syscalls" }
-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "a9de3e8b405dbf406cac31b930fd1ffdc216a429", package="guest_program", default-features = false, features=["c-kzg"] }
-rkyv = { version = "0.8.10", features = ["std", "unaligned"] }
-c-kzg = { version = "2.1.1", features = ["eip-7594"] }
-
-[patch.crates-io]
-c-kzg = { git = "https://github.com/risc0/c-kzg-4844", tag = "c-kzg/v2.1.1-risczero.0" }
-
-# Route ethrex's crypto through the lambda-vm keccak precompile (riscv64).
-# Replaces the upstream ethrex-crypto crate (whose keccak is tiny-keccak/software)
-# with a local copy whose keccak module calls the keccak_permute syscall on the
-# guest target; native builds keep the vendored asm. See patches/ethrex-crypto/.
-[patch."https://github.com/lambdaclass/ethrex.git"]
-ethrex-crypto = { path = "patches/ethrex-crypto" }
+# LambdaVM crypto provider (keccak + ECSM-accelerated ecrecover), defined in the
+# lambda_vm repo and injected in src/main.rs — so crypto changes stay in our repo
+# and don't require an ethrex PR.
+lambda-vm-ethrex-crypto = { path = "../../../../crypto/ethrex-crypto" }
+# Pinned by immutable `rev` to a commit on ethrex `main`. It used to point at the
+# open LambdaVM-backend PR branch (`feat/lambdavm-prover-backend`) and wait for
+# that to merge; it no longer does, because the branch stopped moving 69 commits
+# behind `main` while guest performance work kept landing there. Measured on the
+# real benchmark block, that wait had grown to -22.9%.
+#
+# No `features = [...]`, deliberately — not even `lambdavm`.
+#
+# `ethrex-guest-program` carries one feature per zkVM and, despite the names, none
+# of them selects a backend: each is only a list of optional crypto dependencies
+# to activate, and none gates any method of the `Crypto` trait (its gates are
+# `secp256k1`, `c-kzg`, `blst`, `std`). `lambdavm` was
+# `["dep:k256", "dep:lambda-vm-syscalls", "ethrex-l2-common/secp256k1"]`, and
+# since #702 moved the `Crypto` impl into this repo the syscalls it pulled are for
+# ethrex's own provider, which we no longer use — while this guest already depends
+# on `lambda-vm-syscalls` by path, above.
+#
+# What makes this guest LambdaVM is those path deps plus the
+# `riscv64im-lambda-vm-elf` target, and `lambdavm` existed ONLY on the unmerged
+# branch, so requiring it is what tied this guest to it. Re-pin with
+# scripts/set_ethrex_rev.sh.
+#
+# Measured, not assumed: against the sibling feature activating the widest dependency
+# set, `stress_modexp_150M` (6,373,285,966) and `stress_alt_bn128_150M`
+# (22,986,061,145) are identical to the cycle, and the real benchmark block is
+# 30,498,818 here vs 30,501,620 there, with a 2,928-byte smaller ELF. What the drop
+# actually removes is C libsecp256k1 (`secp256k1`, `secp256k1-sys`, `bitcoin_hashes`,
+# `bitcoin-io`, `hex-conservative` leave the lock); we inject our own ecrecover.
+#
+# 0x0a and 0x0b-0x11 are unsupported — see src/main.rs.
+ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", package = "ethrex-guest-program", default-features = false }
+# Exact pin: must match the fixture writer (tooling/ethrex-fixtures) and the
+# executor test reader so the rkyv ProgramInput layout stays consistent.
+rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }

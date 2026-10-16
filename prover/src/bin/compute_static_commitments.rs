@@ -54,6 +54,7 @@ fn main() {
         let bitwise = bitwise::compute_preprocessed_commitment(&options);
         let keccak_rc = keccak_rc::compute_preprocessed_commitment(&options);
         let zero_page = page::compute_precomputed_commitment(&zero_page_config, &options);
+        let private_page = page::compute_offset_only_commitment(&options);
 
         println!(
             "// blowup_factor = {blowup}\n\
@@ -62,10 +63,13 @@ fn main() {
              // ---- keccak_rc:\n        \
              {blowup} => Some({keccak_fmt}),\n\
              // ---- zero_page:\n        \
-             {blowup} => Some({zero_page_fmt}),\n",
+             {blowup} => Some({zero_page_fmt}),\n\
+             // ---- private_page (OFFSET only):\n        \
+             {blowup} => Some({private_page_fmt}),\n",
             bitwise_fmt = format_commitment(&bitwise),
             keccak_fmt = format_commitment(&keccak_rc),
             zero_page_fmt = format_commitment(&zero_page),
+            private_page_fmt = format_commitment(&private_page),
         );
     }
 }

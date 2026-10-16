@@ -11,7 +11,7 @@ use lambda_vm_prover::tables::MaxRowsConfig;
 use lambda_vm_prover::tables::trace_builder::count_table_lengths;
 use lambda_vm_prover::test_utils::{asm_elf_bytes, run_asm_elf};
 use stark::proof::options::GoldilocksCubicProofOptions;
-use stark::prover::table_parallelism;
+use stark::prover::storage_estimate_parallelism;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
@@ -20,6 +20,22 @@ use tikv_jemalloc_ctl::{epoch, stats};
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// ...with the shipped binary's purge policy, so this binary is the production
+// allocator *configuration* and not just the production allocator. The reason
+// and the numbers are at `bin/cli/src/main.rs`. `prover/tests/jemalloc_conf.rs`
+// asserts that this export pattern is read, but it does so against its own copy
+// in its own process — nothing checks the copy below.
+//
+// It moves nothing this file asserts — `stats::allocated` is live bytes, which
+// the decay timers do not touch; a resident-memory assertion added here later
+// would read the wrong configuration without it.
+const NEVER_PURGE: &[u8] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
+
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: Option<&'static core::ffi::c_char> =
+    Some(unsafe { &*(NEVER_PURGE.as_ptr() as *const core::ffi::c_char) });
 
 fn allocated_bytes() -> usize {
     epoch::advance().ok();
@@ -36,7 +52,8 @@ fn peak_bytes_does_not_underestimate_measured_heap() {
         count_table_lengths(&elf, &logs, &max_rows, &[]).expect("count_table_lengths succeeds");
 
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid");
-    let predicted = peak_bytes(&lengths, opts.blowup_factor, table_parallelism()) as usize;
+    let predicted =
+        peak_bytes(&lengths, opts.blowup_factor, storage_estimate_parallelism()) as usize;
 
     drop(logs);
 

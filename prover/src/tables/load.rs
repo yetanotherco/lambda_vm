@@ -23,14 +23,10 @@
 //! - Sender: MEMW (to read from memory)
 //! - Sender: MSB8 (for sign bit extraction)
 
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
 // =========================================================================
 // Column indices for LOAD table
@@ -183,42 +179,40 @@ pub fn generate_load_trace(
     operations: &[LoadOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, op) in operations.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-
         // Input columns
-        // base_address as DWordWL (2 words)
-        data[base + cols::BASE_ADDRESS_0] = FE::from(op.base_address & 0xFFFF_FFFF);
-        data[base + cols::BASE_ADDRESS_1] = FE::from(op.base_address >> 32);
-
-        // timestamp as DWordWL (2 words)
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
 
         // read flags
         let (r2, r4, r8) = op.read_flags();
-        data[base + cols::READ2] = FE::from(r2 as u64);
-        data[base + cols::READ4] = FE::from(r4 as u64);
-        data[base + cols::READ8] = FE::from(r8 as u64);
+        table.set_bool(row_idx, cols::READ2, r2);
+        table.set_bool(row_idx, cols::READ4, r4);
+        table.set_bool(row_idx, cols::READ8, r8);
 
         // signed
-        data[base + cols::SIGNED] = FE::from(op.signed as u64);
+        table.set_bool(row_idx, cols::SIGNED, op.signed);
 
         // Output: res[8]
         for i in 0..8 {
-            data[base + cols::RES[i]] = FE::from(op.res[i]);
+            table.set_u64(row_idx, cols::RES[i], op.res[i]);
         }
 
         // Auxiliary: sign_bit
-        data[base + cols::SIGN_BIT] = FE::from(op.compute_sign_bit() as u64);
+        table.set_bool(row_idx, cols::SIGN_BIT, op.compute_sign_bit());
 
         // Multiplicity: active row
-        data[base + cols::MU] = FE::one();
+        table.set_fe(row_idx, cols::MU, FE::one());
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================
@@ -425,48 +419,52 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // LOAD receiver (from CPU)
+    // MEMORY receiver (from CPU) — unified high-level memory op.
     // -------------------------------------------------------------------------
-    // Spec: LOAD[res::DWordWL; base_address, timestamp, read2, read4, read8, signed] | -μ
-    //
-    // res is DWordBL (8 bytes) but packed as DWordWL (2 words) for the bus.
-    // DWordBL packing: 8 bytes → 2 bus elements [lo32, hi32]
+    // MEMORY[out=res::DWordWL; timestamp, address, value, mem_flags] | -μ
+    // The CPU dispatches LOAD here (mem_flags bit 0 = memory_op = 0). The `value`
+    // field carries the store value and is 0 for loads; `out` is the loaded res.
+    // mem_flags = 2*signed + 4*read2 + 8*read4 + 16*read8 (memory_op = 0).
     interactions.push(BusInteraction::receiver(
-        BusId::Load,
+        BusId::MemoryOp,
         Multiplicity::Column(cols::MU),
         vec![
-            // res::DWordWL - pack 8 bytes as 2 words
-            BusValue::Packed {
-                start_column: cols::RES[0],
-                packing: Packing::DWordBL,
-            },
-            // base_address (DWordWL = 2 words)
-            BusValue::Packed {
-                start_column: cols::BASE_ADDRESS_0,
-                packing: Packing::DWordWL,
-            },
             // timestamp (DWordWL = 2 words)
             BusValue::Packed {
                 start_column: cols::TIMESTAMP_0,
                 packing: Packing::DWordWL,
             },
-            // read flags
+            // address = base_address (DWordWL = 2 words)
             BusValue::Packed {
-                start_column: cols::READ2,
-                packing: Packing::Direct,
+                start_column: cols::BASE_ADDRESS_0,
+                packing: Packing::DWordWL,
             },
+            // value (store value) = 0 for loads
+            BusValue::constant(0),
+            BusValue::constant(0),
+            // mem_flags byte
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 2,
+                    column: cols::SIGNED,
+                },
+                LinearTerm::Column {
+                    coefficient: 4,
+                    column: cols::READ2,
+                },
+                LinearTerm::Column {
+                    coefficient: 8,
+                    column: cols::READ4,
+                },
+                LinearTerm::Column {
+                    coefficient: 16,
+                    column: cols::READ8,
+                },
+            ]),
+            // out = res::DWordWL (8 bytes packed as 2 words) — the loaded value
             BusValue::Packed {
-                start_column: cols::READ4,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::READ8,
-                packing: Packing::Direct,
-            },
-            // signed flag
-            BusValue::Packed {
-                start_column: cols::SIGNED,
-                packing: Packing::Direct,
+                start_column: cols::RES[0],
+                packing: Packing::DWordBL,
             },
         ],
     ));
@@ -474,134 +472,108 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions
 }
 // =========================================================================
-// Constraints
+// Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
+//
+// One body against the generic `ConstraintBuilder` serves the compiled prover
+// folder, the verifier folder and IR capture. Constraint indices 0..13:
+//   0..4: FlagIsBit(SIGNED, READ2, READ4, READ8)   4: WidthSumIsBit
+//   5: ReadImpliesMu                                6..10: ExtensionHigh(4..8)
+//   10..12: ExtensionMid(2..4)                      12: ExtensionLow
 
-/// LOAD table constraint kinds.
-#[derive(Debug, Clone, Copy)]
-pub enum LoadConstraintKind {
-    /// (read2 + read4 + read8) => μ: if reading 2+ bytes, row must be active
-    ReadImpliesMu,
-    /// Extension constraint for res[i] when not reading those bytes
-    /// !read8 => res[i] = signed * sign_bit * 255 for i in 4..8
-    ExtensionHigh(usize),
-    /// !read4 && !read8 => res[i] = signed * sign_bit * 255 for i in 2..4
-    ExtensionMid(usize),
-    /// !read2 && !read4 && !read8 => res[1] = signed * sign_bit * 255
-    ExtensionLow,
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
+
+/// LOAD table constraints as a single-source [`ConstraintSet`]. No column
+/// configuration is needed (the LOAD layout is fixed via `cols`).
+#[derive(Clone, Copy)]
+pub struct LoadConstraints;
+
+impl LoadConstraints {
+    /// `flag · (1 − flag)` IS_BIT check for a boolean flag column.
+    fn flag_is_bit<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        col: usize,
+    ) -> B::Expr {
+        let flag = b.main(0, col);
+        let one = b.one();
+        flag.clone() * (one - flag)
+    }
+
+    /// `signed · sign_bit · 255` — the sign-extended byte value.
+    ///
+    /// Known redundancy: each extension constraint below rebuilds this
+    /// product. Hoisting it to one per-row local was tried and showed no
+    /// measurable speedup (ABBA), so the constraints keep the declarative
+    /// per-emit form.
+    fn extended<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) -> B::Expr {
+        let signed = b.main(0, cols::SIGNED);
+        let sign_bit = b.main(0, cols::SIGN_BIT);
+        let ff = b.const_base(255);
+        signed * sign_bit * ff
+    }
 }
 
-/// LOAD table constraint.
-pub struct LoadConstraint {
-    constraint_idx: usize,
-    kind: LoadConstraintKind,
-}
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for LoadConstraints {
+    fn max_degree(&self) -> usize {
+        3
+    }
 
-impl LoadConstraint {
-    pub fn new(kind: LoadConstraintKind, constraint_idx: usize) -> Self {
-        Self {
-            constraint_idx,
-            kind,
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0..4: IS_BIT on the width/sign flags.
+        for (i, flag_col) in [cols::SIGNED, cols::READ2, cols::READ4, cols::READ8]
+            .into_iter()
+            .enumerate()
+        {
+            let root = Self::flag_is_bit(b, flag_col);
+            b.emit_base(i, root);
         }
-    }
 
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let one = FieldElement::<F>::one();
-        let ff = FieldElement::<F>::from(255u64); // 0xFF for sign extension
+        // idx 4: IS_BIT on the width-selector sum (read2 + read4 + read8).
+        let read2 = b.main(0, cols::READ2);
+        let read4 = b.main(0, cols::READ4);
+        let read8 = b.main(0, cols::READ8);
+        let sum = read2 + read4 + read8;
+        let one = b.one();
+        b.emit_base(4, sum.clone() * (one - sum));
 
-        let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-        let read2 = step.get_main_evaluation_element(0, cols::READ2).clone();
-        let read4 = step.get_main_evaluation_element(0, cols::READ4).clone();
-        let read8 = step.get_main_evaluation_element(0, cols::READ8).clone();
-        let signed = step.get_main_evaluation_element(0, cols::SIGNED).clone();
-        let sign_bit = step.get_main_evaluation_element(0, cols::SIGN_BIT).clone();
+        // idx 5: (read2 + read4 + read8) * (1 - μ)
+        let read2 = b.main(0, cols::READ2);
+        let read4 = b.main(0, cols::READ4);
+        let read8 = b.main(0, cols::READ8);
+        let mu = b.main(0, cols::MU);
+        let read_sum = read2 + read4 + read8;
+        let one = b.one();
+        b.emit_base(5, read_sum * (one - mu));
 
-        match self.kind {
-            LoadConstraintKind::ReadImpliesMu => {
-                // (read2 + read4 + read8) * (1 - μ) = 0
-                let read_sum = &read2 + &read4 + &read8;
-                &read_sum * (&one - &mu)
-            }
-            LoadConstraintKind::ExtensionHigh(i) => {
-                // (1 - read8) * (res[i] - signed * sign_bit * 255) = 0
-                // i should be in 4..8
-                let res_i = step.get_main_evaluation_element(0, cols::RES[i]).clone();
-                let expected = &signed * &sign_bit * &ff;
-                (&one - &read8) * (&res_i - &expected)
-            }
-            LoadConstraintKind::ExtensionMid(i) => {
-                // (1 - read4 - read8) * (res[i] - signed * sign_bit * 255) = 0
-                // i should be in 2..4
-                let res_i = step.get_main_evaluation_element(0, cols::RES[i]).clone();
-                let expected = &signed * &sign_bit * &ff;
-                (&one - &read4 - &read8) * (&res_i - &expected)
-            }
-            LoadConstraintKind::ExtensionLow => {
-                // (1 - read2 - read4 - read8) * (res[1] - signed * sign_bit * 255) = 0
-                let res_1 = step.get_main_evaluation_element(0, cols::RES[1]).clone();
-                let expected = &signed * &sign_bit * &ff;
-                (&one - &read2 - &read4 - &read8) * (&res_1 - &expected)
-            }
+        // idx 6..10: ExtensionHigh(i) for i in 4..8:
+        // (1 - read8) * (res[i] - signed*sign_bit*255)
+        for (offset, i) in (4..8).enumerate() {
+            let read8 = b.main(0, cols::READ8);
+            let res_i = b.main(0, cols::RES[i]);
+            let expected = Self::extended(b);
+            let one = b.one();
+            b.emit_base(6 + offset, (one - read8) * (res_i - expected));
         }
-    }
-}
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LoadConstraint {
-    fn degree(&self) -> usize {
-        match self.kind {
-            LoadConstraintKind::ReadImpliesMu => 2,
-            // Extension constraints: (1 - readX) * (res[i] - signed * sign_bit * 255)
-            // = degree 1 * (degree 1 - degree 2) = degree 3
-            LoadConstraintKind::ExtensionHigh(_) => 3,
-            LoadConstraintKind::ExtensionMid(_) => 3,
-            LoadConstraintKind::ExtensionLow => 3,
+        // idx 10,11: ExtensionMid(i) for i in 2..4:
+        // (1 - read4 - read8) * (res[i] - signed*sign_bit*255)
+        for (offset, i) in (2..4).enumerate() {
+            let read4 = b.main(0, cols::READ4);
+            let read8 = b.main(0, cols::READ8);
+            let res_i = b.main(0, cols::RES[i]);
+            let expected = Self::extended(b);
+            let one = b.one();
+            b.emit_base(10 + offset, (one - read4 - read8) * (res_i - expected));
         }
+
+        // idx 12: ExtensionLow:
+        // (1 - read2 - read4 - read8) * (res[1] - signed*sign_bit*255)
+        let read2 = b.main(0, cols::READ2);
+        let read4 = b.main(0, cols::READ4);
+        let read8 = b.main(0, cols::READ8);
+        let res_1 = b.main(0, cols::RES[1]);
+        let expected = Self::extended(b);
+        let one = b.one();
+        b.emit_base(12, (one - read2 - read4 - read8) * (res_1 - expected));
     }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
-}
-
-/// Creates all constraints for the LOAD table.
-pub fn constraints()
--> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
-    let mut constraints: Vec<
-        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
-    > = Vec::new();
-
-    let mut idx = 0;
-
-    // (read2 + read4 + read8) => μ
-    constraints.push(LoadConstraint::new(LoadConstraintKind::ReadImpliesMu, idx).boxed());
-    idx += 1;
-
-    // Extension constraints for high bytes (4..8): !read8 => res[i] = extended
-    for i in 4..8 {
-        constraints.push(LoadConstraint::new(LoadConstraintKind::ExtensionHigh(i), idx).boxed());
-        idx += 1;
-    }
-
-    // Extension constraints for mid bytes (2..4): !(read4 + read8) => res[i] = extended
-    for i in 2..4 {
-        constraints.push(LoadConstraint::new(LoadConstraintKind::ExtensionMid(i), idx).boxed());
-        idx += 1;
-    }
-
-    // Extension constraint for low byte (1): !(read2 + read4 + read8) => res[1] = extended
-    constraints.push(LoadConstraint::new(LoadConstraintKind::ExtensionLow, idx).boxed());
-
-    constraints
 }

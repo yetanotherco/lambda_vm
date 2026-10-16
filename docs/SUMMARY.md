@@ -17,6 +17,7 @@
     - [Provable security and conjectured security](./cryptography/security.md)
     - [Lookup argument](./cryptography/lookup.md)
 - [Virtual machine](./virtual_machine/introduction.md)
+- [Continuations design](./continuations_design.md)
 
 ## Getting started
 

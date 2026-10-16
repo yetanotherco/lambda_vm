@@ -488,6 +488,11 @@ impl AsBytes for FieldElement<GoldilocksField> {
     fn as_bytes(&self) -> alloc::vec::Vec<u8> {
         ByteConversion::to_bytes_be(self)
     }
+
+    #[inline(always)]
+    fn stream_bytes(&self, sink: &mut dyn FnMut(&[u8])) {
+        sink(&self.canonical_u64().to_be_bytes());
+    }
 }
 
 // Implement IsPrimeField for the native Goldilocks
@@ -540,13 +545,11 @@ impl IsFFTField for GoldilocksField {
 }
 
 impl HasDefaultTranscript for GoldilocksField {
-    fn get_random_field_element_from_rng(rng: &mut impl rand::Rng) -> FieldElement<Self> {
-        let mut sample = [0u8; 8];
+    fn sample_field_element_from(mut next_u64: impl FnMut() -> u64) -> FieldElement<Self> {
         loop {
-            rng.fill(&mut sample);
-            let int_sample = u64::from_be_bytes(sample);
-            if int_sample < GOLDILOCKS_PRIME {
-                return FieldElement::from(int_sample);
+            let candidate = next_u64();
+            if candidate < GOLDILOCKS_PRIME {
+                return FieldElement::from(candidate);
             }
         }
     }

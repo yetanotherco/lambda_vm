@@ -1,7 +1,210 @@
 use std::cell::RefCell;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// Wall clock span timeline: the per step latency breakdown.
+//
+// Phase spans open and close on the thread that drives the phase, at phase
+// boundaries. Those are a true latency breakdown: they do not overlap and they
+// sum to their parent, unlike the accum_* thread local sub timers below, which
+// sum per worker CPU time across rayon threads and can exceed 100%. A parallel
+// region is one span around the blocking call; its internal split is reported
+// separately as CPU time, never mixed into the wall tree.
+//
+// Two properties of the recorded data are easy to misread:
+//
+//  - Spans are ALSO opened on worker threads, not only on the main thread —
+//    the per table drivers in `multi_prove` (`*_table` labels) and the
+//    per stage workers in `continuation.rs`. `SPAN_DEPTH` is thread local and
+//    a fresh thread starts at 0, so those records carry depth 0 and their
+//    siblings overlap in wall time. Read them as per instance wall time.
+//  - `scripts/profiling/phase_table.py` SUMS spans that share a label, so a
+//    label used once per table reports the sum over all tables, which can
+//    exceed the enclosing phase's wall clock by up to the scheduler's `k`.
+//    Give a per instance span its own label; never reuse a phase label for it.
+//
+//     let _s = instruments::span("trace_build");   // RAII, stops on drop
+//
+// Instant::now() is about 20 ns, fine at phase granularity, not in per op loops.
+
+#[derive(Clone, Debug)]
+pub struct SpanRecord {
+    pub label: &'static str,
+    pub depth: u16,
+    pub wall: Duration,
+    /// Open-order, so the tree reconstructs in start-order (records push on close).
+    pub order: u32,
+    /// Wall clock epoch (ns) when the span opened, for aligning with external
+    /// samplers (e.g. nvidia-smi GPU util) to attribute device busy time per step.
+    pub start_ns: u128,
+}
+
+static TIMELINE: Mutex<Vec<SpanRecord>> = Mutex::new(Vec::new());
+static SPAN_ORDER: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static SPAN_DEPTH: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+}
+
+#[must_use]
+pub struct SpanGuard {
+    label: &'static str,
+    depth: u16,
+    order: u32,
+    start: Instant,
+    start_ns: u128,
+    /// This span gates an nsys capture range (LAMBDA_VM_NSYS_CAPTURE_SPAN).
+    #[cfg(feature = "nvtx")]
+    capture: bool,
+}
+
+/// Label of the span that brackets an `nsys --capture-range=cudaProfilerApi`
+/// session, from `LAMBDA_VM_NSYS_CAPTURE_SPAN` (e.g. `rounds_2to4`, or
+/// `epoch_prove` to capture one epoch of a continuations run). None = never.
+#[cfg(feature = "nvtx")]
+fn capture_span_label() -> Option<&'static str> {
+    static LABEL: OnceLock<Option<String>> = OnceLock::new();
+    LABEL
+        .get_or_init(|| std::env::var("LAMBDA_VM_NSYS_CAPTURE_SPAN").ok())
+        .as_deref()
+}
+
+/// NVTX-only range with a runtime-formatted name (e.g. `epoch[i=3]`), for
+/// callers that need per-instance identity on Nsight timelines. Instruments
+/// spans require `'static` labels, so repeated phases (continuation epochs)
+/// are told apart by instance order in the JSON timeline and by one of these
+/// ranges in nsys. The closure only runs when a profiler-visible NVTX
+/// library is loaded.
+#[cfg(feature = "nvtx")]
+pub fn nvtx_range_fmt<F: FnOnce() -> String>(label: F) -> math_cuda::nvtx::Range {
+    math_cuda::nvtx::Range::fmt(label)
+}
+
+/// Open a wall-clock span; records elapsed time when the guard drops.
+/// Under the `nvtx` feature the span is mirrored as an NVTX range so Nsight
+/// timelines carry the same phase names as the instruments tree.
+pub fn span(label: &'static str) -> SpanGuard {
+    let depth = SPAN_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    let order = SPAN_ORDER.fetch_add(1, Ordering::Relaxed) as u32;
+    let start_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    #[cfg(feature = "nvtx")]
+    let capture = {
+        math_cuda::nvtx::range_push(label);
+        let capture = capture_span_label() == Some(label);
+        if capture {
+            math_cuda::nvtx::profiler_start();
+        }
+        capture
+    };
+    SpanGuard {
+        label,
+        depth,
+        order,
+        start: Instant::now(),
+        start_ns,
+        #[cfg(feature = "nvtx")]
+        capture,
+    }
+}
+
+impl Drop for SpanGuard {
+    fn drop(&mut self) {
+        #[cfg(feature = "nvtx")]
+        {
+            if self.capture {
+                math_cuda::nvtx::profiler_stop();
+            }
+            math_cuda::nvtx::range_pop();
+        }
+        let wall = self.start.elapsed();
+        SPAN_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        if let Ok(mut t) = TIMELINE.lock() {
+            t.push(SpanRecord {
+                label: self.label,
+                depth: self.depth,
+                wall,
+                order: self.order,
+                start_ns: self.start_ns,
+            });
+        }
+    }
+}
+
+/// Clear recorded spans. Call at the start of a measured prove.
+pub fn reset_timeline() {
+    SPAN_ORDER.store(0, Ordering::Relaxed);
+    SPAN_DEPTH.with(|d| d.set(0));
+    if let Ok(mut t) = TIMELINE.lock() {
+        t.clear();
+    }
+}
+
+/// Drain recorded spans, sorted in start-order (ready for the tree).
+pub fn take_timeline() -> Vec<SpanRecord> {
+    let mut spans = TIMELINE
+        .lock()
+        .map(|mut t| std::mem::take(&mut *t))
+        .unwrap_or_default();
+    spans.sort_by_key(|s| s.order);
+    spans
+}
+
+/// Indented wall-clock tree with % of the root span.
+pub fn format_timeline(spans: &[SpanRecord]) -> String {
+    use std::fmt::Write;
+    if spans.is_empty() {
+        return String::new();
+    }
+    let total_s = spans
+        .first()
+        .map(|s| s.wall.as_secs_f64())
+        .unwrap_or(1e-9)
+        .max(1e-9);
+    let mut out = String::from("=== TIMELINE (wall-clock) ===\n");
+    for s in spans {
+        let indent = "  ".repeat(s.depth as usize);
+        let pct = 100.0 * s.wall.as_secs_f64() / total_s;
+        let _ = writeln!(
+            out,
+            "{:<42} {:>10.3?} {:>6.1}%",
+            format!("{indent}{}", s.label),
+            s.wall,
+            pct
+        );
+    }
+    out
+}
+
+/// JSON array of `{label, depth, wall_ns, order}` for diffing / plotting.
+pub fn timeline_json(spans: &[SpanRecord]) -> String {
+    let mut out = String::from("[");
+    for (i, s) in spans.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        // Escape the label so a quote or backslash cannot break the JSON.
+        let label = s.label.replace('\\', "\\\\").replace('"', "\\\"");
+        out.push_str(&format!(
+            "{{\"label\":\"{}\",\"depth\":{},\"wall_ns\":{},\"order\":{},\"start_ns\":{}}}",
+            label,
+            s.depth,
+            s.wall.as_nanos(),
+            s.order,
+            s.start_ns
+        ));
+    }
+    out.push(']');
+    out
+}
 
 static HEAP_READER: OnceLock<fn() -> Option<usize>> = OnceLock::new();
 
@@ -33,7 +236,7 @@ pub struct TableSubOps {
     pub constraints: Duration,
     /// decompose_and_extend_d2
     pub comp_decompose: Duration,
-    /// commit_composition_polynomial
+    /// commit_bit_reversed (composition-polynomial commit step)
     pub comp_commit: Duration,
     /// Round 3: barycentric OOD evaluation
     pub ood: Duration,
@@ -52,20 +255,33 @@ pub struct TableSubOps {
 pub struct Round1SubOps {
     /// Main trace: expand_columns_to_lde (LDE/FFT)
     pub main_lde: Duration,
-    /// Main trace: commit_columns_bit_reversed (Merkle)
+    /// Main trace: commit_bit_reversed (Merkle)
     pub main_merkle: Duration,
     /// Aux trace: expand_columns_to_lde (LDE/FFT)
     pub aux_lde: Duration,
-    /// Aux trace: commit_columns_bit_reversed (Merkle)
+    /// Aux trace: commit_bit_reversed (Merkle)
     pub aux_merkle: Duration,
+    /// Aux build: LogUp fingerprint computation (CPU).
+    pub aux_fingerprint: Duration,
+    /// Aux build: fingerprint batch inverse (CPU).
+    pub aux_invert: Duration,
+    /// Aux build: term combine (CPU).
+    pub aux_term: Duration,
+    /// Aux build: accumulated-column running sum (CPU).
+    pub aux_accumulate: Duration,
 }
 
 /// Timing data collected inside `multi_prove`.
 pub struct MultiProveTiming {
     pub prepass: Duration,
+    /// Round 1 main trace commits. The last phase-wide barrier — every main
+    /// root must be absorbed before the shared LogUp challenges are sampled.
     pub main_commits: Duration,
-    pub aux_build: Duration,
-    pub aux_commit: Duration,
+    /// Wall clock of the fused per-table region: aux build, aux commit and
+    /// rounds 2-4, which run as one task per table across
+    /// `table_parallelism(num_airs)` drivers. There is no phase-level wall for
+    /// the aux stages on their own
+    /// any more; their CPU time shows up in `round1_sub`.
     pub rounds_2_4: Duration,
     /// Sub-op breakdown for Round 1 (main + aux LDE vs Merkle).
     pub round1_sub: Round1SubOps,
@@ -79,6 +295,11 @@ static R1_MAIN_LDE_US: AtomicU64 = AtomicU64::new(0);
 static R1_MAIN_MERKLE_US: AtomicU64 = AtomicU64::new(0);
 static R1_AUX_LDE_US: AtomicU64 = AtomicU64::new(0);
 static R1_AUX_MERKLE_US: AtomicU64 = AtomicU64::new(0);
+// Aux build (LogUp) sub-phases, CPU time accumulated across tables/chunks.
+static AUX_FINGERPRINT_US: AtomicU64 = AtomicU64::new(0);
+static AUX_INVERT_US: AtomicU64 = AtomicU64::new(0);
+static AUX_TERM_US: AtomicU64 = AtomicU64::new(0);
+static AUX_ACCUM_US: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static TIMING_DATA: RefCell<Option<MultiProveTiming>> = const { RefCell::new(None) };
@@ -110,20 +331,36 @@ pub fn accum_r1_aux(lde: Duration, merkle: Duration) {
     R1_AUX_MERKLE_US.fetch_add(merkle.as_micros() as u64, Ordering::Relaxed);
 }
 
+/// Aux build (LogUp term column) sub-phase CPU times, summed across chunks.
+pub fn accum_aux_term(fingerprint: Duration, invert: Duration, term: Duration) {
+    AUX_FINGERPRINT_US.fetch_add(fingerprint.as_micros() as u64, Ordering::Relaxed);
+    AUX_INVERT_US.fetch_add(invert.as_micros() as u64, Ordering::Relaxed);
+    AUX_TERM_US.fetch_add(term.as_micros() as u64, Ordering::Relaxed);
+}
+
+/// Aux build accumulated-column (running sum) CPU time.
+pub fn accum_aux_accumulate(d: Duration) {
+    AUX_ACCUM_US.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
+}
+
 pub fn take_r1_sub() -> Round1SubOps {
     Round1SubOps {
         main_lde: Duration::from_micros(R1_MAIN_LDE_US.swap(0, Ordering::Relaxed)),
         main_merkle: Duration::from_micros(R1_MAIN_MERKLE_US.swap(0, Ordering::Relaxed)),
         aux_lde: Duration::from_micros(R1_AUX_LDE_US.swap(0, Ordering::Relaxed)),
         aux_merkle: Duration::from_micros(R1_AUX_MERKLE_US.swap(0, Ordering::Relaxed)),
+        aux_fingerprint: Duration::from_micros(AUX_FINGERPRINT_US.swap(0, Ordering::Relaxed)),
+        aux_invert: Duration::from_micros(AUX_INVERT_US.swap(0, Ordering::Relaxed)),
+        aux_term: Duration::from_micros(AUX_TERM_US.swap(0, Ordering::Relaxed)),
+        aux_accumulate: Duration::from_micros(AUX_ACCUM_US.swap(0, Ordering::Relaxed)),
     }
 }
 
 /// Reset all instrument state. Call at the start of `multi_prove` to avoid
 /// stale data from a previous run in the same process.
 ///
-/// Note: thread-local stores (R2_SUB, R4_SUB, ROUND_SUB_OPS) are only cleared
-/// for the calling thread. Rayon worker threads are not reset — stale data is
+/// Note: thread local stores (R2_SUB, R4_SUB, ROUND_SUB_OPS) are only cleared
+/// for the calling thread. Rayon worker threads are not reset, so stale data is
 /// possible if a previous run panicked without consuming stored values.
 /// In practice this is safe because store/take pairs always execute within the
 /// same rayon task closure.
@@ -132,6 +369,10 @@ pub fn reset_all() {
     R1_MAIN_MERKLE_US.store(0, Ordering::Relaxed);
     R1_AUX_LDE_US.store(0, Ordering::Relaxed);
     R1_AUX_MERKLE_US.store(0, Ordering::Relaxed);
+    AUX_FINGERPRINT_US.store(0, Ordering::Relaxed);
+    AUX_INVERT_US.store(0, Ordering::Relaxed);
+    AUX_TERM_US.store(0, Ordering::Relaxed);
+    AUX_ACCUM_US.store(0, Ordering::Relaxed);
     TIMING_DATA.with(|cell| {
         cell.borrow_mut().take();
     });
