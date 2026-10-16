@@ -1,11 +1,14 @@
-//! The ARE_BYTES[μ, 0] bound is cancellable by a real BRANCH row.
+//! The ARE_BYTES[μ, 0] bound was cancellable by a real BRANCH row.
 //!
-//! BRANCH sends `ARE_BYTES[next_pc_low[1], 0]`, but `next_pc_low[1]` only enters
-//! its constraints and the BRANCH bus packed as `low0 + 2^8·low1 + 2^16·high0`.
-//! An honest `(low1, high0) = (255, h)` can be stored as `(p−1, h+1)`: same packed
-//! next_pc (−256 + 65536 = 255·256), every BranchConstraint holds, `IS_HALF[h+1]`
-//! is in range, and the row sends `ARE_BYTES[p−1, 0]` with +1. That cancels the
-//! μ bound of any `μ = −1` twin, which brings back the `5 < 3 = 1` forgery.
+//! Before the fix, BRANCH sent `ARE_BYTES[next_pc_low[1], 0]` weighted by μ, but
+//! `next_pc_low[1]` only enters its constraints and the BRANCH bus packed as
+//! `low0 + 2^8·low1 + 2^16·high0`. An honest `(low1, high0) = (255, h)` could be
+//! stored as `(p−1, h+1)`: same packed next_pc (−256 + 65536 = 255·256), every
+//! BranchConstraint holds, `IS_HALF[h+1]` is in range, and the row sent
+//! `ARE_BYTES[p−1, 0]` with +1. That cancelled the μ bound of any `μ = −1` twin,
+//! which brought back the `5 < 3 = 1` forgery. The fix sends
+//! `ARE_BYTES[μ, next_pc_low[1]]` with multiplicity 1 (spec #1017), so no
+//! ARE_BYTES sender carries a negative weight and the cycle is rejected.
 //!
 //! Harness: real LT and BRANCH AIRs; mock CPU senders (ALU, BRANCH); mock
 //! BITWISE receivers that only hold in-domain tuples (IS_HALFWORD < 2^16, MSB16,
