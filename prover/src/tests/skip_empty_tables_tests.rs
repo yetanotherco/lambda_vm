@@ -100,6 +100,7 @@ fn every_table_participates_in_the_bus() {
         ecdas: 1,
         hint: 1,
         commit: 1,
+        is_wh: 1,
     };
     let airs = VmAirs::new(
         &elf,
@@ -158,6 +159,7 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
         ecdas,
         hint,
         commit,
+        is_wh,
     } = counts;
     [
         ("CPU", cpu),
@@ -180,6 +182,7 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
         ("ECDAS", ecdas),
         ("HINT", hint),
         ("COMMIT", commit),
+        ("IS_WH", is_wh),
     ]
     .into_iter()
     .map(|(name, _count)| name)
@@ -374,12 +377,13 @@ fn dropping_a_used_table_through_the_real_verifier_is_rejected() {
 /// PAGE, REGISTER, GLOBAL_MEMORY — are exactly the mandatory ones, and nothing
 /// enforced that this stays true.
 ///
-/// One exception, by bus: `ARE_BYTES` byte checks the spec gives no `cond`
-/// (default 1) — the μ bounds of the dedup tables (spec #1017), SHIFT's
-/// `shift[0..1]` bytes and KECCAK_RND's θ/ρ bytes. A padding row sends them as
-/// `ARE_BYTES[0, 0]`, which is in range — the test checks this by requiring each
-/// value to vanish on an all-zero row (columns only, no nonzero constant term) —
-/// and their only counterparty is BITWISE, whose multiplicity columns are
+/// One exception, by bus: `ARE_BYTES` and `IS_B20` range checks the spec gives
+/// no `cond` (default 1) — the μ bounds of the dedup tables (spec #1017, an
+/// `IS_B20[μ]` on IS_WH), SHIFT's `shift[0..1]` bytes and KECCAK_RND's θ/ρ
+/// bytes. A padding row sends them as `ARE_BYTES[0, 0]` / `IS_B20[0]`, which is
+/// in range — the test checks this by requiring each value to vanish on an
+/// all-zero row (columns only, no nonzero constant term) — and their only
+/// counterparty is BITWISE, whose multiplicity columns are
 /// free witnesses, so the contribution is absorbed whichever way an unused chip
 /// went; and an optional table with no ops is never shipped
 /// (`chunk_and_generate_optional`/`generate_optional` return no table), so the
@@ -388,11 +392,11 @@ fn dropping_a_used_table_through_the_real_verifier_is_rejected() {
 #[test]
 fn no_optional_table_uses_a_constant_multiplicity() {
     use crate::tables::{
-        branch, bytewise, commit, cpu32, dvrm, ecdas, ecsm, eq, hint, keccak, keccak_rnd, load, lt,
-        memw, memw_aligned, mul, shift, store,
+        branch, bytewise, commit, cpu32, dvrm, ecdas, ecsm, eq, hint, is_wh, keccak, keccak_rnd,
+        load, lt, memw, memw_aligned, mul, shift, store,
     };
     use stark::lookup::{BusValue, LinearTerm};
-    let optional: [(&str, Vec<stark::lookup::BusInteraction>); 18] = [
+    let optional: [(&str, Vec<stark::lookup::BusInteraction>); 19] = [
         ("LT", lt::bus_interactions()),
         ("MEMW", memw::bus_interactions()),
         ("MEMW_A", memw_aligned::bus_interactions()),
@@ -411,6 +415,7 @@ fn no_optional_table_uses_a_constant_multiplicity() {
         ("ECDAS", ecdas::bus_interactions()),
         ("HINT", hint::bus_interactions()),
         ("COMMIT", commit::bus_interactions()),
+        ("IS_WH", is_wh::bus_interactions()),
     ];
     for (name, interactions) in optional {
         assert!(
@@ -418,13 +423,15 @@ fn no_optional_table_uses_a_constant_multiplicity() {
             "{name} declares no bus interactions"
         );
         for (i, interaction) in interactions.iter().enumerate() {
+            use crate::tables::types::BusId;
             let zero_on_padding = interaction.values.iter().all(|value| match value {
                 BusValue::Packed { .. } => true,
                 BusValue::Linear(terms) => terms
                     .iter()
                     .all(|term| !matches!(term, LinearTerm::Constant(c) if *c != 0)),
             });
-            let byte_check = interaction.bus_id == u64::from(crate::tables::types::BusId::AreBytes)
+            let byte_check = (interaction.bus_id == u64::from(BusId::AreBytes)
+                || interaction.bus_id == u64::from(BusId::IsB20))
                 && interaction.is_sender
                 && zero_on_padding;
             assert!(
@@ -587,13 +594,14 @@ fn an_accelerator_count_above_one_is_rejected() {
     // Named setters rather than a match with a catch-all: a wrong field would
     // otherwise pass the assertion below while testing the wrong count.
     type SetCount = fn(&mut TableCounts);
-    let inflate: [(&str, SetCount); 6] = [
+    let inflate: [(&str, SetCount); 7] = [
         ("keccak", |c| c.keccak = 2),
         ("keccak_rnd", |c| c.keccak_rnd = 2),
         ("ecsm", |c| c.ecsm = 2),
         ("ecdas", |c| c.ecdas = 2),
         ("hint", |c| c.hint = 2),
         ("commit", |c| c.commit = 2),
+        ("is_wh", |c| c.is_wh = 2),
     ];
     for (name, set_to_two) in inflate {
         let mut counts = honest.clone();
@@ -715,6 +723,30 @@ fn omitting_a_chip_dispatched_by_another_chip_fails_the_bus_balance() {
 
     traces.keccak_rnds.clear();
     assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "KECCAK_RND");
+}
+
+/// IS_WH is reached from a chip's range checks rather than from a dispatch: it
+/// receives the `IS_WH` half of every `IS_WHH` send (today KECCAK's
+/// `state_ptr`). Dropping it leaves those sends unmatched — and unlike the
+/// BITWISE range checks, whose receiver multiplicities are free witnesses, no
+/// other table receives `IS_WH`, so nothing can absorb them.
+#[test]
+fn omitting_the_is_wh_table_fails_the_bus_balance() {
+    let (elf, logs, _instructions) = run_asm_elf("test_keccak");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        !traces.is_whs.is_empty(),
+        "test_keccak must exercise IS_WH for this to be a forgery"
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "the honest proof must verify first, or the negative below proves nothing"
+    );
+
+    traces.is_whs.clear();
+    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "IS_WH");
 }
 
 /// COMMIT is the one newly-optional table whose bus target is not zero: the

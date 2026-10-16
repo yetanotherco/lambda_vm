@@ -53,10 +53,10 @@ use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
     create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ecdas_air,
-    create_ecsm_air, create_eq_air, create_halt_air, create_hint_air, create_keccak_air,
-    create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
-    create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
-    create_register_air, create_shift_air, create_store_air,
+    create_ecsm_air, create_eq_air, create_halt_air, create_hint_air, create_is_wh_air,
+    create_keccak_air, create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air,
+    create_memw_air, create_memw_aligned_air, create_memw_register_air, create_mul_air,
+    create_page_air, create_register_air, create_shift_air, create_store_air,
 };
 
 // Re-exported for downstream hosts and verifier guests (e.g. the in-VM
@@ -120,6 +120,9 @@ pub struct TableCounts {
     pub ecdas: usize,
     pub hint: usize,
     pub commit: usize,
+    // Range-check chip for the top 48 bits of `DWordWHH` addresses. One table
+    // when a chip sends `IS_WH` (today only KECCAK), none otherwise.
+    pub is_wh: usize,
 }
 
 impl TableCounts {
@@ -152,6 +155,7 @@ impl TableCounts {
             self.ecdas,
             self.hint,
             self.commit,
+            self.is_wh,
         ]
         .into_iter()
         .try_fold(0usize, usize::checked_add)
@@ -168,7 +172,7 @@ impl TableCounts {
     ///
     /// What keeps a zero count honest is the LogUp bus, not this check. A chip
     /// influences the run only through its bus interactions, and none of the
-    /// eighteen optional chips carries boundary constraints of its own, so one
+    /// nineteen optional chips carries boundary constraints of its own, so one
     /// with no rows contributes zero to the bus and removing it changes nothing.
     /// (The mandatory tables do constrain boundaries — that is part of why they
     /// are mandatory.) A prover that omits a table whose operations *did*
@@ -197,14 +201,15 @@ impl TableCounts {
                 )));
             }
         }
-        // The accelerators are not chunked: `generate_optional` emits one table
-        // or none, so a count above 1 is a shape no prover can produce. The
-        // sub-proof cross-check constrains only the *total*, so on its own it
-        // lets an inflated accelerator count through whenever another count is
+        // The accelerators and IS_WH are not chunked: `generate_optional` emits
+        // one table or none, so a count above 1 is a shape no prover can produce.
+        // The sub-proof cross-check constrains only the *total*, so on its own it
+        // lets an inflated count through whenever another count is
         // lowered to match; this pins the per-field shape instead. It is not
         // load-bearing for memory safety — both verifiers run the cross-check
-        // before any count sizes an AIR set — and if one of them ever becomes
-        // chunked, this list is what changes.
+        // before any count sizes an AIR set. For the accelerators it is only
+        // shape, and if one of them ever becomes chunked, this list is what
+        // changes. IS_WH is the exception, see its entry.
         let at_most_one = [
             ("keccak", self.keccak),
             ("keccak_rnd", self.keccak_rnd),
@@ -212,11 +217,17 @@ impl TableCounts {
             ("ecdas", self.ecdas),
             ("hint", self.hint),
             ("commit", self.commit),
+            // Load-bearing for soundness: this is what bounds the IS_WH
+            // multiplicity sum per proof. One table of at most 2^k rows, each
+            // μ < 2^20, stays far below p, so no stack of repeated rows reaches
+            // μ = −1 (spec verifier.typ TODO). Chunking IS_WH needs a bound on
+            // its total row count in place of this one.
+            ("is_wh", self.is_wh),
         ];
         for (name, count) in at_most_one {
             if count > 1 {
                 return Err(Error::InvalidTableCounts(format!(
-                    "{name} count is {count} — accelerator tables are not chunked"
+                    "{name} count is {count} — this table is not chunked"
                 )));
             }
         }
@@ -276,12 +287,13 @@ pub struct GuestInput {
 /// 4-byte magic identifying a lambda-vm recursion input blob ("LVMR").
 pub const RECURSION_INPUT_MAGIC: [u8; 4] = *b"LVMR";
 
-/// Wire-format version of the recursion input blob. v3: `TableCounts` gained the
+/// Wire-format version of the recursion input blob. v4: `TableCounts` gained
+/// `is_wh`. v3: `TableCounts` gained the
 /// six accelerator fields, which moves every field after it in the archive. v2:
 /// rkyv pointer_width_64 (64-bit rel-ptrs) — v1 archives use 32-bit offsets.
 /// Any change to a type reachable from `GuestInput` belongs here: the guest
 /// reads the archive in place, so a stale blob is misread rather than rejected.
-pub const RECURSION_INPUT_VERSION: u32 = 3;
+pub const RECURSION_INPUT_VERSION: u32 = 4;
 
 /// Required alignment (bytes) of the archive's first byte in guest memory.
 pub const RECURSION_INPUT_ALIGN: usize = 16;
@@ -593,6 +605,7 @@ pub(crate) struct VmAirs {
     pub ecsms: Vec<VmAir>,
     pub ecdases: Vec<VmAir>,
     pub hints: Vec<VmAir>,
+    pub is_whs: Vec<VmAir>,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
@@ -630,6 +643,7 @@ impl VmAirs {
                 self.ecsms.len(),
                 self.ecdases.len(),
                 self.hints.len(),
+                self.is_whs.len(),
                 self.pages.len(),
                 self.memw_registers.len(),
                 self.eqs.len(),
@@ -653,6 +667,7 @@ impl VmAirs {
                 traces.ecsms.len(),
                 traces.ecdases.len(),
                 traces.hints.len(),
+                traces.is_whs.len(),
                 traces.pages.len(),
                 traces.memw_registers.len(),
                 traces.eqs.len(),
@@ -687,6 +702,9 @@ impl VmAirs {
             pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.hints.iter().zip(traces.hints.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.is_whs.iter().zip(traces.is_whs.iter_mut()) {
             pairs.push((air.as_ref(), trace, &()));
         }
 
@@ -774,6 +792,9 @@ impl VmAirs {
             refs.push(air.as_ref());
         }
         for air in &self.hints {
+            refs.push(air.as_ref());
+        }
+        for air in &self.is_whs {
             refs.push(air.as_ref());
         }
 
@@ -971,6 +992,11 @@ impl VmAirs {
                 Box::new(create_hint_air(proof_options).with_name(&format!("HINT[{i}]"))) as VmAir
             })
             .collect();
+        let is_whs: Vec<_> = (0..table_counts.is_wh)
+            .map(|i| {
+                Box::new(create_is_wh_air(proof_options).with_name(&format!("IS_WH[{i}]"))) as VmAir
+            })
+            .collect();
         let register: VmAir =
             if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
                 Box::new(
@@ -1092,6 +1118,7 @@ impl VmAirs {
             ecsms,
             ecdases,
             hints,
+            is_whs,
             register,
             pages,
             memw_registers,
