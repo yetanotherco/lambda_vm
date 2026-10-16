@@ -30,7 +30,7 @@ use crate::tables::register::{
 };
 use crate::tables::shift::{bus_interactions as shift_buses, cols::NUM_COLUMNS as SHIFT_COLS};
 use crate::tables::trace_builder::TableLengths;
-use stark::prover::table_parallelism;
+use stark::prover::storage_estimate_parallelism;
 use stark::storage_mode::StorageMode;
 use sysinfo::System;
 
@@ -48,7 +48,8 @@ pub const SAFETY_FRACTION_DEN: u64 = 10;
 /// `(rows, main_cols, aux_cols, num_main_merkle_trees)` for a single table.
 type TableSpec = (u64, u64, u64, u64);
 
-/// Bytes alive for the duration of phase D (LDE columns + main/aux Merkle).
+/// Bytes counted as alive for the whole proof (LDE columns + main/aux Merkle).
+/// Deliberately an over-estimate for the aux half — see `peak_bytes`.
 fn persistent_per_table(spec: TableSpec, blowup: u64) -> u64 {
     let (rows, main_cols, aux_cols, main_trees) = spec;
     let main_lde = rows
@@ -221,26 +222,41 @@ pub fn decide(lengths: &TableLengths, blowup_factor: u8) -> StorageMode {
         log::info!("storage_mode: Disk (forced via FORCE_DISK_SPILL)");
         return StorageMode::Disk;
     }
-    let estimated = peak_bytes(lengths, blowup_factor, table_parallelism());
+    let estimated = peak_bytes(lengths, blowup_factor, storage_estimate_parallelism());
     let mode = select_storage_mode(estimated, available_ram_bytes());
     log::info!("estimated_peak_bytes: {estimated}, storage_mode: {mode:?}");
     mode
 }
 
 /// Peak RAM estimate in bytes for a proof whose trace shape matches `lengths`.
+///
+/// `table_parallelism` is how many tables' rounds 2-4 transients this assumes
+/// are alive at once. `decide` passes `storage_estimate_parallelism()`, which
+/// is deliberately *not* the scheduler's `k` — that one is `num_airs` under
+/// `cuda`, and summing every table's transients here inflates the estimate on
+/// many-PAGE shapes (up to +44 %) and makes `Disk` more likely than the real
+/// heap warrants. See that function for why the honest bound is a byte budget
+/// rather than a count.
 pub fn peak_bytes(lengths: &TableLengths, blowup_factor: u8, table_parallelism: usize) -> u64 {
     let blowup = blowup_factor as u64;
     let k = table_parallelism.max(1);
     let specs = table_specs(lengths);
 
-    // Persistent: every table's LDE + main/aux Merkle is alive across phase D.
+    // Persistent: every table's main LDE + Merkle really is alive at once (the
+    // Round 1 main commit is a phase-wide barrier). The aux LDE is produced and
+    // consumed inside one table's fused task, so only the scheduler's k coexist
+    // — exactly all of them on `cuda`, fewer on CPU builds. Counted for every
+    // table either way, which is exact on `cuda` and an over-estimate on CPU
+    // rather than an unsound bound.
     let persistent_total: u64 = specs
         .iter()
         .map(|s| persistent_per_table(*s, blowup))
         .fold(0u64, u64::saturating_add);
 
-    // Transient: only k tables run round 2-4 in parallel. Conservative bound is
-    // the top-k tables by transient bytes (worst possible chunk assignment).
+    // Transient: k tables' fused aux+rounds tasks assumed in flight at once.
+    // The top-k tables by transient bytes bound that; with the scheduler's
+    // heaviest-first admission that top-k is also the set admitted first, so
+    // this is the realistic peak, not a worst case.
     let mut transient_per: Vec<u64> = specs
         .iter()
         .map(|s| transient_per_table(*s, blowup))

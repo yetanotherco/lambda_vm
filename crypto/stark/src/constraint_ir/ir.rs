@@ -1,0 +1,162 @@
+//! Flat intermediate representation (IR) for captured transition constraints.
+//!
+//! A [`ConstraintProgram`] is a topologically ordered list of [`Op`] nodes plus
+//! a per-constraint root id. It is produced by the builder capture front-end
+//! (see [`crate::constraint_ir::builder`]) and consumed by the CPU interpreter
+//! (see [`crate::constraint_ir::interp`]).
+//!
+//! The IR is generic over a field tower `<F, E>` (default: the Goldilocks base
+//! field and its degree-3 extension). Each node carries a [`Dim`] tag
+//! distinguishing base-field values ([`Dim::Base`]) from extension-field values
+//! ([`Dim::Ext`]). Field constants live in side tables (`base_consts` /
+//! `ext_consts`) referenced by index, so [`Op`] stays a plain `Copy + Eq + Hash`
+//! payload of `u32`s with no bounds on `F`/`E` — this keeps the builder's
+//! `(Op, Dim)` common-subexpression map cheap and correct regardless of the
+//! field (`FieldElement` values would otherwise poison that key type, since
+//! non-canonical representations compare equal under `PartialEq` but hash
+//! differently).
+
+use math::field::element::FieldElement;
+use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as GoldilocksExtension;
+use math::field::goldilocks::GoldilocksField;
+use math::field::traits::IsField;
+
+/// Field-arithmetic dimension of a node's value: base field ([`Dim::Base`]) or
+/// its extension ([`Dim::Ext`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum Dim {
+    /// Base field.
+    #[default]
+    Base,
+    /// Extension field.
+    Ext,
+}
+
+/// One IR instruction. Operand fields are `u32` ids into the program's `nodes`
+/// arena; a node with id `i` only references nodes with id `< i`. Constant ops
+/// carry a `u32` index into the program's `base_consts` / `ext_consts` tables
+/// rather than the field value itself, so `Op` is `Copy + Eq + Hash` for any
+/// field tower.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Op {
+    /// A base-field literal: `base_consts[idx]`.
+    ConstBase(u32),
+    /// An extension-field literal: `ext_consts[idx]`.
+    ConstExt(u32),
+    /// A leaf read of a trace cell. `main` selects the main trace (base field)
+    /// vs the aux trace (extension field); `offset`/`row` select the frame
+    /// step/row, `col` the column.
+    Var {
+        /// `true` for a main-trace column read, `false` for an aux read.
+        main: bool,
+        /// Frame step index (0-based).
+        offset: u8,
+        /// Row within the step.
+        row: u8,
+        /// Column index.
+        col: u16,
+    },
+    /// A LogUp RAP challenge: `rap_challenges[idx]` ([`Dim::Ext`], uniform per
+    /// proof).
+    RapChallenge { idx: u16 },
+    /// A precomputed LogUp alpha power: `logup_alpha_powers[idx]` ([`Dim::Ext`],
+    /// uniform per proof).
+    AlphaPow { idx: u16 },
+    /// The LogUp table offset `L/N` ([`Dim::Ext`], uniform per proof).
+    TableOffset,
+    /// `nodes[a] + nodes[b]`.
+    Add(u32, u32),
+    /// `nodes[a] - nodes[b]`.
+    Sub(u32, u32),
+    /// `nodes[a] * nodes[b]`.
+    Mul(u32, u32),
+    /// `-nodes[a]`.
+    Neg(u32),
+    /// Embed a base value into the extension (`<F as IsSubFieldOf<E>>::embed`).
+    Embed(u32),
+}
+
+/// A captured program for one transition constraint (or a set of them).
+///
+/// `nodes` is topologically ordered (id `i` references only `< i`). `dims[i]`
+/// is the result dimension of `nodes[i]`. `roots[c]` is the node id of
+/// constraint `c`'s value. `base_consts` / `ext_consts` hold the field literals
+/// referenced by `Op::ConstBase` / `Op::ConstExt`.
+#[derive(Clone, Debug)]
+pub struct ConstraintProgram<F: IsField = GoldilocksField, E: IsField = GoldilocksExtension> {
+    /// Topologically ordered instruction list.
+    pub nodes: Vec<Op>,
+    /// Per-node result dimension, parallel to `nodes`.
+    pub dims: Vec<Dim>,
+    /// Base-field constant table, indexed by `Op::ConstBase`.
+    pub base_consts: Vec<FieldElement<F>>,
+    /// Extension-field constant table, indexed by `Op::ConstExt`.
+    pub ext_consts: Vec<FieldElement<E>>,
+    /// Per-constraint root node ids, indexed by `constraint_idx`.
+    pub roots: Vec<u32>,
+    /// Number of constraints (a prefix of `roots`) that are base-field
+    /// ([`Dim::Base`]) rooted, matching `AIR::num_base_transition_constraints()`.
+    /// The prover interpreter writes these into `base_evals`; the rest (LogUp,
+    /// always [`Dim::Ext`]) go into `ext_evals[num_base..]`.
+    pub num_base: usize,
+}
+
+impl<F: IsField, E: IsField> ConstraintProgram<F, E> {
+    /// Number of nodes in the program (an effectiveness measure for hash-consing).
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Whether the program has no nodes.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// The full-width `[main | aux]` trace-column indices that some transition
+    /// constraint in this program reads at the *next* row (frame offset ≥ 1),
+    /// sorted and deduplicated. A main-trace read maps to its column index; an
+    /// aux-trace read maps to `main_width + col` — the same concatenated
+    /// indexing the verifier's OOD frame uses (main columns first, then aux;
+    /// see [`crate::ood`] and the frame reconstruction in the verifier).
+    ///
+    /// This is the ground truth an AIR's
+    /// [`crate::traits::AIR::trace_ood_next_row_columns`] declaration must
+    /// cover: the verifier opens every trace column at `z` but prunes the `g·z`
+    /// (next-row) opening down to the *declared* set, reconstructing ZERO for
+    /// any column outside it. So every column this method returns that the
+    /// declaration omits is silently read as zero at the next row — a
+    /// soundness/completeness bug. Deriving the read set from the captured IR
+    /// lets a test cross-check the hand-maintained declaration instead of
+    /// trusting it.
+    ///
+    /// A leaf is counted as a next-row read when its frame `offset` (or its
+    /// intra-step `row`, always 0 in the single-row-step capture path) is
+    /// nonzero, so the derivation can never *under*-report a next-row read — the
+    /// dangerous direction for the `derived ⊆ declared` check that guards
+    /// soundness.
+    ///
+    /// For tests and tooling only: it walks the captured [`ConstraintProgram`],
+    /// which the verify/recursion path never materializes.
+    pub fn next_row_trace_reads(&self, main_width: usize) -> Vec<usize> {
+        let mut cols: Vec<usize> = self
+            .nodes
+            .iter()
+            .filter_map(|op| match *op {
+                Op::Var {
+                    main,
+                    offset,
+                    row,
+                    col,
+                } if offset >= 1 || row >= 1 => Some(if main {
+                    col as usize
+                } else {
+                    main_width + col as usize
+                }),
+                _ => None,
+            })
+            .collect();
+        cols.sort_unstable();
+        cols.dedup();
+        cols
+    }
+}

@@ -4,9 +4,11 @@ use crate::tables::bitwise::{
     NUM_PRECOMPUTED_COLS, NUM_ROWS, bus_interactions, cols, generate_bitwise_row,
     generate_bitwise_trace, is_preprocessed, preprocessed_commitment, row_index,
 };
-use crate::tables::types::FE;
+use crate::tables::types::{BusId, FE};
 use crate::test_utils::multi_prove_ram;
 use math::field::element::FieldElement;
+use stark::constraints::builder::EmptyConstraints;
+use stark::lookup::Multiplicity;
 use stark::proof::options::ProofOptions;
 
 #[test]
@@ -95,8 +97,42 @@ fn test_zero_check() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // Should have 10 interactions (one per lookup type; HWSLC merged into HWSL)
+    // 7 non-BYTE_ALU lookups + 3 BYTE_ALU receivers (opsel AND/OR/XOR).
     assert_eq!(interactions.len(), 10);
+}
+
+#[test]
+fn test_byte_alu_receivers() {
+    let byte_alu: Vec<_> = bus_interactions()
+        .into_iter()
+        .filter(|i| i.bus_id == u64::from(BusId::ByteAlu))
+        .collect();
+
+    // One receiver per opsel (AND/OR/XOR), each carrying [opsel, X, Y, out].
+    assert_eq!(byte_alu.len(), 3);
+    for interaction in &byte_alu {
+        assert!(!interaction.is_sender, "BYTE_ALU lookups are receivers");
+        assert_eq!(interaction.values.len(), 4, "[opsel, X, Y, out]");
+    }
+
+    // Each opsel uses its own multiplicity column, reusing the precomputed
+    // AND/OR/XOR result columns.
+    let mut mu_columns: Vec<usize> = byte_alu
+        .iter()
+        .map(|i| match i.multiplicity {
+            Multiplicity::Column(c) => c,
+            _ => panic!("BYTE_ALU multiplicity must be a column"),
+        })
+        .collect();
+    mu_columns.sort_unstable();
+    assert_eq!(
+        mu_columns,
+        vec![
+            cols::MU_BYTE_ALU_AND,
+            cols::MU_BYTE_ALU_OR,
+            cols::MU_BYTE_ALU_XOR
+        ]
+    );
 }
 
 #[test]
@@ -380,7 +416,6 @@ fn test_preprocessed_commitment_is_nonzero() {
 mod soundness_tests {
     use super::*;
     use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-    use stark::constraints::transition::TransitionConstraintEvaluator;
     use stark::lookup::{
         AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
         NullBoundaryConstraintBuilder, Packing,
@@ -416,15 +451,15 @@ mod soundness_tests {
 
     fn create_sender_air(
         proof_options: &ProofOptions,
-    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-        use crate::tables::types::BusId;
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
+        use crate::tables::types::{BusId, alu_op};
 
-        let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![BusInteraction::sender(
-                BusId::AndByte,
+                BusId::ByteAlu,
                 Multiplicity::Column(sender_cols::FLAG),
                 vec![
+                    BusValue::constant(alu_op::AND as u64),
                     BusValue::Packed {
                         start_column: sender_cols::X,
                         packing: Packing::Direct,
@@ -446,20 +481,20 @@ mod soundness_tests {
             auxiliary_trace_build_data,
             proof_options,
             1,
-            transition_constraints,
+            EmptyConstraints,
         )
     }
 
     fn create_receiver_air(
         proof_options: &ProofOptions,
-    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
         create_receiver_air_impl(proof_options, None)
     }
 
     fn create_receiver_air_preprocessed(
         proof_options: &ProofOptions,
         commitment: stark::config::Commitment,
-    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
         // 3 precomputed columns: X, Y, AND (column 3 = MU_AND is multiplicity)
         create_receiver_air_impl(proof_options, Some((commitment, 3)))
     }
@@ -467,15 +502,15 @@ mod soundness_tests {
     fn create_receiver_air_impl(
         proof_options: &ProofOptions,
         preprocessed: Option<(stark::config::Commitment, usize)>,
-    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-        use crate::tables::types::BusId;
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
+        use crate::tables::types::{BusId, alu_op};
 
-        let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![BusInteraction::receiver(
-                BusId::AndByte,
+                BusId::ByteAlu,
                 Multiplicity::Column(receiver_cols::MU_AND),
                 vec![
+                    BusValue::constant(alu_op::AND as u64),
                     BusValue::Packed {
                         start_column: receiver_cols::X,
                         packing: Packing::Direct,
@@ -497,7 +532,7 @@ mod soundness_tests {
             auxiliary_trace_build_data,
             proof_options,
             1,
-            transition_constraints,
+            EmptyConstraints,
         );
 
         match preprocessed {

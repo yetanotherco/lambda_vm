@@ -112,6 +112,40 @@ fn zero_page_static_matches_recompute_for_all_blowups() {
     }
 }
 
+/// Same drift guard for the private-input page's OFFSET-only commitment — the
+/// verifier's compiled-in anchor for every private page, and the thing that
+/// stops a prover repointing those rows at arbitrary addresses. Also asserts it
+/// DIFFERS from the zero-init commitment: the two cover different column sets
+/// (OFFSET alone vs OFFSET+INIT), so equal bytes would mean one of the two
+/// call sites is committing the wrong number of columns.
+#[test]
+fn private_page_static_matches_recompute_for_all_blowups() {
+    for &blowup in STATIC_BLOWUP_FACTORS {
+        let options = options_for(blowup);
+        let recomputed = page::compute_offset_only_commitment(&options);
+        let Some(static_bytes) = page::static_private_page_commitment(blowup) else {
+            panic!("no static private-page match arm shipped for blowup={blowup}");
+        };
+        assert_eq!(
+            static_bytes, recomputed,
+            "static private-page (OFFSET-only) commitment drifted for blowup={blowup}; \
+             regenerate constants via \
+             `cargo run --bin compute_static_commitments --release`",
+        );
+        let from_wrapper = page::private_page_preprocessed_commitment(&options);
+        assert_eq!(
+            from_wrapper, recomputed,
+            "private_page_preprocessed_commitment returned a wrong value for blowup={blowup}",
+        );
+        assert_ne!(
+            recomputed,
+            page::compute_precomputed_commitment(&page::PageConfig::zero_init(0), &options),
+            "OFFSET-only and OFFSET+INIT commitments must differ (blowup={blowup}); \
+             equality would mean a call site commits the wrong column count",
+        );
+    }
+}
+
 /// Asserts the page wrapper's fallback path (no static entry for this
 /// blowup) recomputes a commitment that matches the direct compute call.
 /// Ignored by default: at NON_STATIC_BLOWUP=16, the page LDE is 2^22 rows ×

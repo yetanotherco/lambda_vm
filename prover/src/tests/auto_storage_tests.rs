@@ -95,3 +95,43 @@ fn unknown_available_defaults_to_disk() {
     let mode = select_storage_mode(peak_bytes(&empty_lengths(), 2, ALL_TABLES), None);
     assert_eq!(mode, StorageMode::Disk);
 }
+
+/// A shape with one PAGE table — everything the monolithic path proves today.
+/// The top-k sum has saturated well before the table count, so the estimate is
+/// insensitive to `k` in that range: this is why raising the *scheduler's* `k`
+/// to `num_airs` does not move the storage decision on a normal workload.
+#[test]
+fn peak_bytes_is_k_saturated_on_single_page_shapes() {
+    let mut lengths = empty_lengths();
+    lengths.cpu_padded_rows = 1 << 20;
+    lengths.memw_padded_rows = 1 << 20;
+    lengths.decode_rows = 1 << 16;
+    lengths.unique_page_count = 1;
+
+    let bounded = peak_bytes(&lengths, 2, 12);
+    let unbounded = peak_bytes(&lengths, 2, ALL_TABLES);
+    assert!(
+        unbounded * 100 <= bounded * 101,
+        "estimate moved {bounded} -> {unbounded} on a one-page shape"
+    );
+}
+
+/// …and why `decide` must not simply be handed the scheduler's `k`. PAGE tables
+/// are all the same size, so once there are many of them the top-k truncation
+/// is doing real work: summing every table's transients inflates the estimate
+/// by >20 % here, which spills proofs to disk that fit in RAM.
+#[test]
+fn unbounded_k_inflates_peak_bytes_on_many_page_shapes() {
+    let mut lengths = empty_lengths();
+    lengths.cpu_padded_rows = 1 << 20;
+    lengths.memw_padded_rows = 1 << 20;
+    lengths.decode_rows = 1 << 16;
+    lengths.unique_page_count = 128;
+
+    let bounded = peak_bytes(&lengths, 2, 21);
+    let unbounded = peak_bytes(&lengths, 2, ALL_TABLES);
+    assert!(
+        unbounded * 10 > bounded * 12,
+        "expected >20 % inflation, got {bounded} -> {unbounded}"
+    );
+}

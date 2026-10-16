@@ -19,7 +19,7 @@ The **[public roadmap](https://yetanotherco.github.io/lambda_vm_roadmap/)** lays
 - Rust nightly with `rust-src` component
 - Clang with RISC-V target support and LLD linker (used by `make compile-programs-asm`)
   - **macOS**: `brew install llvm` (the Homebrew LLVM includes `clang` and `lld` with RISC-V support)
-  - **Linux**: `apt install clang lld` (or equivalent for your distribution)
+  - **Linux**: use LLVM 21+ from apt.llvm.org or your distribution; older distro clang packages may reject the assembly fixtures' RISC-V ISA attributes
 
 ### Dev dependencies
 
@@ -50,14 +50,15 @@ Some of the tests require linking with C libraries.
 The easiest way is to let `make` do it:
 
 ```sh
+SYSROOT_DIR=$HOME/.lambda-vm-sysroot make prepare-sysroot  # recommended: user-writable, no sudo
 make prepare-sysroot                                       # installs to /opt (uses sudo)
-SYSROOT_DIR=$HOME/.lambda-vm-sysroot make prepare-sysroot  # user-writable, no sudo
 ```
 
 Or do it manually:
 
 ```sh
 wget https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
+echo "420e394a096f3859235e3a8121a8d5a10f995ac48e636e8d700f17d50803a0e7  lambda-vm-sysroot-rv64im.tar.gz" | sha256sum -c -
 sudo mkdir -p /opt && sudo tar -xzf lambda-vm-sysroot-rv64im.tar.gz -C /opt
 ```
 
@@ -184,7 +185,11 @@ See [`spec/README.md`](./spec/README.md) for full setup instructions.
 | `make test-asm` | Compile and run ASM tests |
 | `make test-rust` | Compile and run Rust tests |
 | `make test-executor` | Compile all programs and run executor tests |
-| `make test-math-cuda` | math-cuda parity tests (requires NVIDIA GPU + nvcc) |
+| `make test-math-cuda` | math-cuda GPU kernel parity tests (requires NVIDIA GPU + nvcc; see GPU Tests) |
+| `make test-cuda-integration` | End-to-end GPU dispatch + proof verification (requires NVIDIA GPU + nvcc) |
+| `make test-cuda-fallback` | GPU error-path / CPU-fallback tests (requires NVIDIA GPU + nvcc) |
+| `make test-prover-cuda` | Prover/stark/crypto/ecsm suite on the GPU path (requires NVIDIA GPU + nvcc) |
+| `make test-prover-comprehensive-cuda` | Comprehensive all-instructions prove on the GPU path (requires NVIDIA GPU + nvcc) |
 | `make build` | Build all workspace crates |
 | `make check` | Check all crates (faster than build, no codegen) |
 | `make clippy` | Run clippy on all crates |
@@ -217,6 +222,29 @@ Then add the corresponding test under `executor/tests/rust.rs`
 You can run it with
 
 `make test-rust`
+
+### GPU Tests
+
+The CUDA test groups run only on a machine with an NVIDIA GPU and `nvcc`:
+
+- `make test-math-cuda` — GPU-vs-CPU kernel parity (NTT, LDE, barycentric, FRI, …)
+- `make test-cuda-integration` — proves a guest on GPU and checks every dispatch fired + the proof verifies
+- `make test-cuda-fallback` — forces GPU dispatch errors and checks the CPU fallback still verifies
+- `make test-prover-cuda` — the prover/stark/crypto/ecsm suite with the GPU path enabled
+- `make test-prover-comprehensive-cuda` — the comprehensive all-instructions prove on the GPU path
+
+The kernels are AOT-compiled by `nvcc` into native cubin (SASS) for the host GPU's real arch
+(detected via `nvidia-smi`, or overridden with `CUDARC_NVCC_ARCH`), not PTX. This sidesteps the
+PTX-ISA JIT version check, so a CUDA toolkit *newer* than the driver still loads and runs — no
+`CUDA_ERROR_UNSUPPORTED_PTX_VERSION` and no need to hand-match the toolkit to the driver. The only
+requirement is that the toolkit knows the GPU's compute capability (a too-old toolkit fails loudly
+at `nvcc` build time). cudarc's host-side driver-API symbol set is likewise pinned to a safe floor
+(`cuda-12080`) in `crypto/math-cuda/Cargo.toml`, so no `CUDARC_CUDA_VERSION` env is needed either.
+That pin makes the GPU path require a driver of CUDA >= 12.8 (driver branch 570+ — any
+Blackwell-capable driver qualifies); on an older driver cudarc's eager symbol resolution aborts at
+CUDA init rather than falling back to CPU.
+These groups run automatically on a rented GPU in the merge queue via
+`.github/workflows/gpu-tests.yml` (which filters offers on `cuda_max_good`).
 
 ## Benchmarking & Profiling
 
@@ -297,3 +325,4 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall
 be dual licensed as above, without any additional terms or conditions.
+

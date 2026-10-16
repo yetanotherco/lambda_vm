@@ -6,25 +6,22 @@
 //! 1. Intra-limb shift by `bit_shift = shift mod 16` using paired HWSL lookups (returning [SLL, SLLC]).
 //! 2. Full-limb shift by `limb_shift` (unary encoding of `shift >> 4`).
 //!
-//! ## Columns (26 total)
+//! ## Columns (29 total)
 //! - Input: `in[0..3]` (DWordHL), `shift` (Byte), `direction` (Bit), `signed` (Bit), `word_instr` (Bit)
 //! - Output: `out[0..1]` (DWordWL)
 //! - Auxiliary: `is_negative`, `bit_shift`, `zbs`, `X[0..4]`, `Y[0..3]`, `limb_shift_raw[0..2]`
 //! - Virtual: `limb_shift[3] = 1 - limb_shift_raw[0] - limb_shift_raw[1] - limb_shift_raw[2]`
+//! - Shift decomposition (ALU-bus shift amount): `shift_b1` (idx 26, Byte = shift[1]), `shift_h1` (idx 27, Half = shift[2]), `shift_high` (idx 28, Word = shift[3])
 //! - Multiplicity: `μ`
 //!
-//! ## Bus Interactions (11 total)
-//! - Senders: MSB16, AND_BYTE (×3), ZERO, HWSL (×5)
-//! - Receiver: SHIFT (from CPU)
+//! ## Bus Interactions (18 total)
+//! - Senders: MSB16, BYTE_ALU[AND] (×3), ZERO, HWSL (×5), ARE_BYTES (×2), IS_HALFWORD (×5)
+//! - Receiver: ALU (from CPU)
 
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
+use super::types::{BusId, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
 
 // =========================================================================
 // Column indices
@@ -74,7 +71,25 @@ pub mod cols {
     // Multiplicity
     pub const MU: usize = 25;
 
-    pub const NUM_COLUMNS: usize = 26;
+    // The unified ALU bus carries the full (un-reduced) shift
+    // amount `arg2` as in2. This mirrors the spec's `shift : DWordWHBB` layout
+    // `[Byte, Byte, Half, Word]`: SHIFT_AMOUNT (col 4) = shift[0] (low byte, used
+    // by the computation, which reduces mod 32/64), then SHIFT_B1 = shift[1],
+    // SHIFT_H1 = shift[2], SHIFT_HIGH = shift[3]. The low-word limbs are
+    // range-checked (byte/half) so the decomposition is unique → SHIFT_AMOUNT is
+    // forced to `arg2 & 0xFF`.
+    /// bits 8-15 of the shift amount (byte) — spec `shift[1]`
+    pub const SHIFT_B1: usize = 26;
+    /// bits 16-31 of the shift amount (half) — spec `shift[2]`
+    pub const SHIFT_H1: usize = 27;
+    /// bits 32-63 of the shift amount (word) — spec `shift[3]`. `IS_WORD` is
+    /// *assumed* (per the spec): on the ALU bus this column equals the CPU's
+    /// `arg2` high word, which is already a well-formed 32-bit word, so it needs
+    /// no in-chip range check. The high shift bits never affect the result
+    /// (`shift mod 32/64` only uses the low byte).
+    pub const SHIFT_HIGH: usize = 28;
+
+    pub const NUM_COLUMNS: usize = 29;
 
     // Helpers for iteration
     pub const IN: [usize; 4] = [IN_0, IN_1, IN_2, IN_3];
@@ -92,8 +107,10 @@ pub mod cols {
 pub struct ShiftOperation {
     /// Input value as 4 halfwords (DWordHL)
     pub in_halves: [u16; 4],
-    /// Shift amount (byte)
+    /// Shift amount low byte (used by the computation; effective = mod 32/64).
     pub shift: u8,
+    /// Full shift amount `arg2` (the unified ALU bus carries this as in2).
+    pub shift_amount: u64,
     /// 0 = left, 1 = right
     pub direction: bool,
     /// Whether arithmetic (signed) right shift
@@ -103,7 +120,15 @@ pub struct ShiftOperation {
 }
 
 impl ShiftOperation {
-    pub fn new(value: u64, shift: u8, direction: bool, signed: bool, word_instr: bool) -> Self {
+    /// `shift_amount` is the full (un-reduced) shift operand `arg2`; only its low
+    /// byte feeds the computation (the result depends on `arg2 mod 32/64`).
+    pub fn new(
+        value: u64,
+        shift_amount: u64,
+        direction: bool,
+        signed: bool,
+        word_instr: bool,
+    ) -> Self {
         Self {
             in_halves: [
                 (value & 0xFFFF) as u16,
@@ -111,7 +136,8 @@ impl ShiftOperation {
                 ((value >> 32) & 0xFFFF) as u16,
                 ((value >> 48) & 0xFFFF) as u16,
             ],
-            shift,
+            shift: (shift_amount & 0xFF) as u8,
+            shift_amount,
             direction,
             signed,
             word_instr,
@@ -175,6 +201,15 @@ impl ShiftOperation {
         }
     }
 
+    /// The raw shift output the chip writes to `OUT` (DWordWL) and sends on the
+    /// ALU bus as `res`. Unlike [`compute_result`](Self::compute_result), this is
+    /// NOT sign-extended for word shifts — the CPU32 applies that extension to
+    /// obtain `rvd`. For non-word shifts the two coincide.
+    pub fn compute_out(&self) -> u64 {
+        let aux = self.compute_aux();
+        aux.out[0] as u64 | ((aux.out[1] as u64) << 32)
+    }
+
     /// Compute all auxiliary values for trace generation.
     fn compute_aux(&self) -> ShiftAux {
         let left = !self.direction;
@@ -184,7 +219,7 @@ impl ShiftOperation {
         // AIR constrains IS_NEGATIVE via the MSB16 bus (SHIFT-C14) only when
         // `signed = 1` — for `signed = 0` IS_NEGATIVE is free, so we set it
         // to zero. This makes `extension = 65535 * is_negative = 0` for SRL,
-        // so the extension contribution in `compute_shifted_half` naturally
+        // so the extension contribution in `shifted_half` naturally
         // vanishes (zero fill) — matching RISC-V SRL semantics regardless of
         // the top-bit value of the input.
         let is_negative = self.signed && (self.in_halves[3] >> 15) & 1 == 1;
@@ -321,54 +356,62 @@ pub fn generate_shift_trace(
     // No deduplication: each operation gets its own row with μ=1.
     // Spec declares μ: Bit.
     let num_rows = operations.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, op) in operations.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
         let aux = op.compute_aux();
 
         // Input columns
-        for i in 0..4 {
-            data[base + cols::IN[i]] = FE::from(op.in_halves[i] as u64);
-        }
-        data[base + cols::SHIFT_AMOUNT] = FE::from(op.shift as u64);
-        data[base + cols::DIRECTION] = FE::from(op.direction as u64);
-        data[base + cols::SIGNED] = FE::from(op.signed as u64);
-        data[base + cols::WORD_INSTR] = FE::from(op.word_instr as u64);
+        table.set_halves(row_idx, cols::IN_0, &op.in_halves);
+        table.set_byte(row_idx, cols::SHIFT_AMOUNT, op.shift);
+        // High bits of the full shift amount (for the ALU bus in2 = arg2).
+        table.set_byte(
+            row_idx,
+            cols::SHIFT_B1,
+            ((op.shift_amount >> 8) & 0xFF) as u8,
+        );
+        table.set_half(
+            row_idx,
+            cols::SHIFT_H1,
+            ((op.shift_amount >> 16) & 0xFFFF) as u16,
+        );
+        table.set_word(row_idx, cols::SHIFT_HIGH, (op.shift_amount >> 32) as u32);
+        table.set_bool(row_idx, cols::DIRECTION, op.direction);
+        table.set_bool(row_idx, cols::SIGNED, op.signed);
+        table.set_bool(row_idx, cols::WORD_INSTR, op.word_instr);
 
         // Output columns
-        data[base + cols::OUT_0] = FE::from(aux.out[0] as u64);
-        data[base + cols::OUT_1] = FE::from(aux.out[1] as u64);
+        table.set_words(row_idx, cols::OUT_0, &aux.out);
 
         // Auxiliary columns
-        data[base + cols::IS_NEGATIVE] = FE::from(aux.is_negative as u64);
-        data[base + cols::BIT_SHIFT] = FE::from(aux.bit_shift as u64);
-        data[base + cols::ZBS] = FE::from(aux.zbs as u64);
+        table.set_bool(row_idx, cols::IS_NEGATIVE, aux.is_negative);
+        table.set_byte(row_idx, cols::BIT_SHIFT, aux.bit_shift);
+        table.set_bool(row_idx, cols::ZBS, aux.zbs);
 
-        for i in 0..5 {
-            data[base + cols::X[i]] = FE::from(aux.x[i] as u64);
-        }
-        for i in 0..4 {
-            data[base + cols::Y[i]] = FE::from(aux.y[i] as u64);
-        }
+        table.set_halves(row_idx, cols::X_0, &aux.x);
+        table.set_halves(row_idx, cols::Y_0, &aux.y);
         for i in 0..3 {
-            data[base + cols::LIMB_SHIFT_RAW[i]] = FE::from(aux.limb_shift[i] as u64);
+            table.set_bool(row_idx, cols::LIMB_SHIFT_RAW[i], aux.limb_shift[i]);
         }
         // limb_shift[3] is virtual: not stored in the trace
 
         // μ = 1 for all active rows (Bit)
-        data[base + cols::MU] = FE::one();
+        table.set_bool(row_idx, cols::MU, true);
     }
 
     // Padding rows: set ZBS=1 per spec. All other columns remain 0.
     // μ=0 so C13 (limb_shift encoding) is inactive. left=right=0 so shifted=0,
     // making C14 (out=shifted) trivially satisfied regardless of limb_shift.
     for row_idx in operations.len()..num_rows {
-        let base = row_idx * cols::NUM_COLUMNS;
-        data[base + cols::ZBS] = FE::one();
+        table.set_bool(row_idx, cols::ZBS, true);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================
@@ -377,7 +420,7 @@ pub fn generate_shift_trace(
 
 /// Creates all bus interactions for the SHIFT table.
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::with_capacity(11);
+    let mut interactions = Vec::with_capacity(15);
 
     // SHIFT-C14: MSB16[in[3]] → is_negative | signed
     interactions.push(BusInteraction::sender(
@@ -396,11 +439,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C1: AND_BYTE[shift, 15] → bit_shift | left (= μ - direction)
+    // SHIFT-C1: BYTE_ALU[bit_shift; AND, shift, 15] | left (= μ - direction)
     interactions.push(BusInteraction::sender(
-        BusId::AndByte,
+        BusId::ByteAlu,
         Multiplicity::Diff(cols::MU, cols::DIRECTION),
         vec![
+            BusValue::constant(alu_op::AND as u64),
             BusValue::Packed {
                 start_column: cols::SHIFT_AMOUNT,
                 packing: Packing::Direct,
@@ -413,15 +457,17 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C2: AND_BYTE[256 - zbs * 16 - shift, 15] → bit_shift | right (= direction)
+    // SHIFT-C2: BYTE_ALU[bit_shift; AND, 256 - zbs * 16 - shift, 15] | right
+    // (= direction)
     // 256 - shift would overflow a byte when shift = 0. Subtracting zbs * 16 keeps it in
     // [0,255].
     // When zbs = 1, shift is a multiple of 16 (i.e. shift ∈ [0, 240]), so
     // 256 - 16 - shift ∈ [0,255].
     interactions.push(BusInteraction::sender(
-        BusId::AndByte,
+        BusId::ByteAlu,
         Multiplicity::Column(cols::DIRECTION),
         vec![
+            BusValue::constant(alu_op::AND as u64),
             BusValue::linear(vec![
                 LinearTerm::Constant(256),
                 LinearTerm::Column {
@@ -492,7 +538,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // second output = extension - X[4] (the carry, expressed as a linear combination)
     interactions.push(BusInteraction::sender(
         BusId::Hwsl,
-        one_minus_zbs.clone(),
+        one_minus_zbs,
         vec![
             BusValue::linear(vec![LinearTerm::Column {
                 coefficient: 65535,
@@ -519,13 +565,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C11: AND_BYTE[encoded_limb; shift, mask] | μ
+    // SHIFT-C11: BYTE_ALU[encoded_limb; AND, shift, mask] | μ
     // encoded = (1 - ls[0]) + 15*ls[1] + 31*ls[2] + 47*ls[3]
     // mask = 48 - 32 * word_instr
     interactions.push(BusInteraction::sender(
-        BusId::AndByte,
+        BusId::ByteAlu,
         Multiplicity::Column(cols::MU),
         vec![
+            BusValue::constant(alu_op::AND as u64),
             // first input: shift
             BusValue::Packed {
                 start_column: cols::SHIFT_AMOUNT,
@@ -561,288 +608,292 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // SHIFT-C15: SHIFT[out; in, shift, direction, signed, word_instr] | -μ (receiver)
+    // Unified ALU receiver: the CPU dispatches SLL/SRL/SRA here.
+    // ALU[out::DWordWL; in1=in, in2=shift_amount, flags] where
+    //   flags = opsel(SHIFT=5, +word_instr→SHIFTW=6) + 32*signed + 64*direction.
+    // in2 = the full shift amount: [SHIFT_AMOUNT + 256*SHIFT_B1 + 2^16*SHIFT_H1,
+    //                               SHIFT_HIGH].
     interactions.push(BusInteraction::receiver(
-        BusId::Shift,
+        BusId::Alu,
         Multiplicity::Column(cols::MU),
         vec![
+            // in1 = in as DWordHL (4 halfwords → 2 words)
+            BusValue::Packed {
+                start_column: cols::IN_0,
+                packing: Packing::DWordHL,
+            },
+            // in2 = full shift amount, low word
+            BusValue::linear(vec![
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::SHIFT_AMOUNT,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 8,
+                    column: cols::SHIFT_B1,
+                },
+                LinearTerm::Column {
+                    coefficient: 1 << 16,
+                    column: cols::SHIFT_H1,
+                },
+            ]),
+            // in2 high word = arg2 bits 32-63 (spec `shift[3]`, a Word; IS_WORD
+            // assumed via this column's bus equality with the CPU's well-formed
+            // arg2 high word).
+            BusValue::Packed {
+                start_column: cols::SHIFT_HIGH,
+                packing: Packing::Direct,
+            },
+            // flags = opsel(SHIFT) + word_instr + 32*signed + 64*direction
+            BusValue::linear(vec![
+                LinearTerm::Constant(alu_op::SHIFT as i64),
+                LinearTerm::Column {
+                    coefficient: 1,
+                    column: cols::WORD_INSTR,
+                },
+                LinearTerm::Column {
+                    coefficient: 32,
+                    column: cols::SIGNED,
+                },
+                LinearTerm::Column {
+                    coefficient: 64,
+                    column: cols::DIRECTION,
+                },
+            ]),
             // out as DWordWL (2 elements)
             BusValue::Packed {
                 start_column: cols::OUT_0,
                 packing: Packing::DWordWL,
             },
-            // in as DWordHL (4 halfwords → 2 elements)
+        ],
+    ));
+
+    // Range checks for the low-word high bits (so the in2 low-word decomposition
+    // is unique → SHIFT_AMOUNT is forced to `arg2 & 0xFF`). SHIFT_AMOUNT is also
+    // byte-checked implicitly via the BYTE_ALU[AND, shift, mask] lookups; we still emit
+    // the explicit ARE_BYTES[shift[0]] below to match the spec's `IS_BYTE[shift[0]]`
+    // (defense-in-depth, redundant with BYTE_ALU[AND]). SHIFT_HIGH (the high word) needs
+    // no check: IS_WORD is assumed (it equals the CPU's well-formed arg2 high word
+    // on the bus), matching the spec's `shift[3]`.
+    interactions.push(BusInteraction::sender(
+        BusId::AreBytes,
+        Multiplicity::Column(cols::MU),
+        vec![
             BusValue::Packed {
-                start_column: cols::IN_0,
-                packing: Packing::DWordHL,
+                start_column: cols::SHIFT_B1,
+                packing: Packing::Direct,
             },
-            // shift
+            BusValue::constant(0),
+        ],
+    ));
+    interactions.push(BusInteraction::sender(
+        BusId::AreBytes,
+        Multiplicity::Column(cols::MU),
+        vec![
             BusValue::Packed {
                 start_column: cols::SHIFT_AMOUNT,
                 packing: Packing::Direct,
             },
-            // direction
-            BusValue::Packed {
-                start_column: cols::DIRECTION,
-                packing: Packing::Direct,
-            },
-            // signed
-            BusValue::Packed {
-                start_column: cols::SIGNED,
-                packing: Packing::Direct,
-            },
-            // word_instr
-            BusValue::Packed {
-                start_column: cols::WORD_INSTR,
-                packing: Packing::Direct,
-            },
+            BusValue::constant(0),
         ],
     ));
+    interactions.push(BusInteraction::sender(
+        BusId::IsHalfword,
+        Multiplicity::Column(cols::MU),
+        vec![BusValue::Packed {
+            start_column: cols::SHIFT_H1,
+            packing: Packing::Direct,
+        }],
+    ));
+
+    // VM-3: range-check every input half `in[i]` as a 16-bit value, unconditionally
+    // on every active row. The SHIFT bus carries only the *packed* operand, so
+    // without these a non-canonical half-decomposition that wraps in the field
+    // (keeping the packed word constant) would be invisible to the caller while
+    // still changing the shifted output.
+    for input_col in cols::IN {
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::Column(cols::MU),
+            vec![BusValue::Packed {
+                start_column: input_col,
+                packing: Packing::Direct,
+            }],
+        ));
+    }
 
     interactions
 }
 
+/// Total number of SHIFT transition constraints.
+pub const NUM_SHIFT_CONSTRAINTS: usize = 19;
+
 // =========================================================================
-// Constraints
+// Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
+//
+// One body against the generic `ConstraintBuilder` serves the compiled prover
+// folder, the verifier folder and IR capture. Constraint indices 0..19.
 
-/// Polynomial constraint kinds for the SHIFT table.
-#[derive(Debug, Clone, Copy)]
-pub enum ShiftConstraintKind {
-    /// SHIFT-C13: direction * (1 - μ) = 0
-    DirectionImpliesMu,
-    /// SHIFT-C5.i: zbs * (X[i] - in[i] * left) = 0
-    ZbsOverrideX(usize),
-    /// SHIFT-C7: zbs * X[4] = 0
-    ZbsOverrideX4,
-    /// SHIFT-C9.i: zbs * (Y[i] - in[i] * right) = 0
-    ZbsOverrideY(usize),
-    /// SHIFT-C10.i: IS_BIT<limb_shift[i]>
-    LimbShiftIsBit(usize),
-    /// SHIFT-C12.i: out[i] - (shifted::DWordWL)[i] = 0
-    OutputMatchesShifted(usize),
-}
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-pub struct ShiftConstraint {
-    constraint_idx: usize,
-    kind: ShiftConstraintKind,
-}
+/// SHIFT table constraints as a single-source [`ConstraintSet`]. No column
+/// configuration is needed (the SHIFT layout is fixed via `cols`).
+#[derive(Clone, Copy)]
+pub struct ShiftConstraints;
 
-impl ShiftConstraint {
-    pub fn new(kind: ShiftConstraintKind, constraint_idx: usize) -> Self {
-        Self {
-            constraint_idx,
-            kind,
+impl ShiftConstraints {
+    /// `limb_shift[i]` (i = 0..2 raw, i = 3 virtual
+    /// `1 - ls_raw[0] - ls_raw[1] - ls_raw[2]`).
+    fn limb_shift<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        i: usize,
+    ) -> B::Expr {
+        if i < 3 {
+            b.main(0, cols::LIMB_SHIFT_RAW[i])
+        } else {
+            let one = b.one();
+            let a = b.main(0, cols::LIMB_SHIFT_RAW[0]);
+            let c = b.main(0, cols::LIMB_SHIFT_RAW[1]);
+            let d = b.main(0, cols::LIMB_SHIFT_RAW[2]);
+            one - a - c - d
         }
     }
 
-    /// Compute the `shifted` virtual column at index `half_idx` (0..4).
-    fn compute_shifted_half<F, E>(half_idx: usize, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let dir: FieldElement<F> = step.get_main_evaluation_element(0, cols::DIRECTION).clone();
-        let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-        let left = &mu - &dir; // μ - direction
-        let right = dir;
+    /// intra_limb_left[i]: X[0] for i=0, X[i]+Y[i-1] for i>0.
+    fn intra_left<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        i: usize,
+    ) -> B::Expr {
+        if i == 0 {
+            b.main(0, cols::X[0])
+        } else {
+            let x = b.main(0, cols::X[i]);
+            let y = b.main(0, cols::Y[i - 1]);
+            x + y
+        }
+    }
+
+    /// intra_limb_right[i]: Y[i]+X[i+1].
+    fn intra_right<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        i: usize,
+    ) -> B::Expr {
+        let y = b.main(0, cols::Y[i]);
+        let x = b.main(0, cols::X[i + 1]);
+        y + x
+    }
+
+    /// The `shifted` virtual column at index `half_idx` (0..4).
+    fn shifted_half<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        i: usize,
+    ) -> B::Expr {
+        // left = μ - direction, right = direction
+        let mu = b.main(0, cols::MU);
+        let dir = b.main(0, cols::DIRECTION);
+        let left = mu - dir;
+        let right = b.main(0, cols::DIRECTION);
 
         // extension = 65535 * is_negative
-        let is_neg = step.get_main_evaluation_element(0, cols::IS_NEGATIVE);
-        let extension = is_neg * FieldElement::<F>::from(65535u64);
+        let is_neg = b.main(0, cols::IS_NEGATIVE);
+        let c65535 = b.const_base(65535);
+        let extension = is_neg * c65535;
 
-        // Get X, Y, limb_shift, in columns
-        let get_x = |i: usize| step.get_main_evaluation_element(0, cols::X[i]).clone();
-        let get_y = |i: usize| step.get_main_evaluation_element(0, cols::Y[i]).clone();
-        let get_ls = |i: usize| -> FieldElement<F> {
-            if i < 3 {
-                step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[i])
-                    .clone()
-            } else {
-                // limb_shift[3] is virtual: 1 - ls_raw[0] - ls_raw[1] - ls_raw[2]
-                FieldElement::<F>::one()
-                    - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[0])
-                    - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[1])
-                    - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[2])
-            }
-        };
-
-        // intra_limb_left[i]: X[0] for i=0, X[i]+Y[i-1] for i>0
-        let intra_left = |i: usize| -> FieldElement<F> {
-            if i == 0 {
-                get_x(0)
-            } else {
-                get_x(i) + get_y(i - 1)
-            }
-        };
-
-        // intra_limb_right[i]: Y[i]+X[i+1]
-        let intra_right = |i: usize| -> FieldElement<F> { get_y(i) + get_x(i + 1) };
-
-        let i = half_idx;
-        let zero = FieldElement::<F>::zero();
-
-        // left_part = left * Σ_j=0^i limb_shift[j] * intra_limb_left[i-j]
-        let mut left_part = zero.clone();
+        // left_part = left * Σ_{j=0}^{i} limb_shift[j] * intra_limb_left[i-j]
+        let mut left_part = b.zero();
         for j in 0..=i {
-            left_part += &get_ls(j) * intra_left(i - j);
+            left_part = left_part + Self::limb_shift(b, j) * Self::intra_left(b, i - j);
         }
-        left_part = &left * left_part;
+        let left_part = left * left_part;
 
-        // right_shift_part = right * Σ_j=0^(3-i) limb_shift[j] * intra_limb_right[i+j]
-        let mut right_shift_part = zero.clone();
+        // right_shift_part = Σ_{j=0}^{3-i} limb_shift[j] * intra_limb_right[i+j]
+        let mut right_shift_part = b.zero();
         for j in 0..=(3 - i) {
-            right_shift_part += &get_ls(j) * intra_right(i + j);
+            right_shift_part =
+                right_shift_part + Self::limb_shift(b, j) * Self::intra_right(b, i + j);
         }
 
-        // right_ext_part = right * extension * Σ_j=(4-i)^3 limb_shift[j]
-        let mut ext_sum = zero.clone();
+        // right_ext_part = extension * Σ_{j=4-i}^{3} limb_shift[j]
+        let mut ext_sum = b.zero();
         if i < 4 {
             for j in (4 - i)..4 {
-                ext_sum += get_ls(j);
+                ext_sum = ext_sum + Self::limb_shift(b, j);
             }
         }
-        let right_ext_part = &extension * ext_sum;
+        let right_ext_part = extension * ext_sum;
 
-        let right_part = &right * (right_shift_part + right_ext_part);
+        let right_part = right * (right_shift_part + right_ext_part);
 
         left_part + right_part
     }
-
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let one = FieldElement::<F>::one();
-        let shift_16 = FieldElement::<F>::from(SHIFT_16);
-
-        match self.kind {
-            ShiftConstraintKind::DirectionImpliesMu => {
-                // direction * (1 - μ) = 0
-                let dir = step.get_main_evaluation_element(0, cols::DIRECTION);
-                let mu = step.get_main_evaluation_element(0, cols::MU);
-                dir * (&one - mu)
-            }
-            ShiftConstraintKind::ZbsOverrideX(i) => {
-                // zbs * (X[i] - in[i] * left) = 0, where left = μ - direction
-                let zbs = step.get_main_evaluation_element(0, cols::ZBS);
-                let x_i = step.get_main_evaluation_element(0, cols::X[i]);
-                let in_i = step.get_main_evaluation_element(0, cols::IN[i]);
-                let mu = step.get_main_evaluation_element(0, cols::MU);
-                let dir = step.get_main_evaluation_element(0, cols::DIRECTION);
-                let left = mu - dir;
-                zbs * (x_i - in_i * &left)
-            }
-            ShiftConstraintKind::ZbsOverrideX4 => {
-                // zbs * X[4] = 0
-                let zbs = step.get_main_evaluation_element(0, cols::ZBS);
-                let x4 = step.get_main_evaluation_element(0, cols::X_4);
-                zbs * x4
-            }
-            ShiftConstraintKind::ZbsOverrideY(i) => {
-                // zbs * (Y[i] - in[i] * right) = 0
-                let zbs = step.get_main_evaluation_element(0, cols::ZBS);
-                let y_i = step.get_main_evaluation_element(0, cols::Y[i]);
-                let in_i = step.get_main_evaluation_element(0, cols::IN[i]);
-                let dir = step.get_main_evaluation_element(0, cols::DIRECTION);
-                zbs * (y_i - in_i * dir)
-            }
-            ShiftConstraintKind::LimbShiftIsBit(i) => {
-                // limb_shift[i] * (1 - limb_shift[i]) = 0
-                // limb_shift[3] is virtual: 1 - ls_raw[0] - ls_raw[1] - ls_raw[2]
-                let ls = if i < 3 {
-                    step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[i])
-                        .clone()
-                } else {
-                    one.clone()
-                        - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[0])
-                        - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[1])
-                        - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[2])
-                };
-                &ls * (&one - &ls)
-            }
-            ShiftConstraintKind::OutputMatchesShifted(i) => {
-                // C12.i: out[i] - (shifted::DWordWL)[i] = 0
-                // (shifted::DWordWL)[i] = shifted[2*i] + shifted[2*i+1] * 2^16
-                let out_col = if i == 0 { cols::OUT_0 } else { cols::OUT_1 };
-                let out = step.get_main_evaluation_element(0, out_col).clone();
-                let half_lo = Self::compute_shifted_half(2 * i, step);
-                let half_hi = Self::compute_shifted_half(2 * i + 1, step);
-                out - half_lo - half_hi * shift_16
-            }
-        }
-    }
 }
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ShiftConstraint {
-    fn degree(&self) -> usize {
-        match self.kind {
-            ShiftConstraintKind::DirectionImpliesMu => 2,
-            ShiftConstraintKind::ZbsOverrideX(_) => 3, // zbs * (X - in * left), left = 1 - dir
-            ShiftConstraintKind::ZbsOverrideX4 => 2,
-            ShiftConstraintKind::ZbsOverrideY(_) => 3, // zbs * (Y - in * dir)
-            ShiftConstraintKind::LimbShiftIsBit(_) => 2,
-            ShiftConstraintKind::OutputMatchesShifted(_) => 3, // out - left*ls*intra (degree 3)
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for ShiftConstraints {
+    fn max_degree(&self) -> usize {
+        3
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0: DirectionImpliesMu — direction * (1 - μ)
+        let dir = b.main(0, cols::DIRECTION);
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        b.emit_base(0, dir * (one - mu));
+
+        // idx 1..5: ZbsOverrideX(i) — zbs * (X[i] - in[i] * (μ - direction))
+        for i in 0..4 {
+            let zbs = b.main(0, cols::ZBS);
+            let x_i = b.main(0, cols::X[i]);
+            let in_i = b.main(0, cols::IN[i]);
+            let mu = b.main(0, cols::MU);
+            let dir = b.main(0, cols::DIRECTION);
+            let left = mu - dir;
+            b.emit_base(1 + i, zbs * (x_i - in_i * left));
+        }
+
+        // idx 5: ZbsOverrideX4 — zbs * X[4]
+        let zbs = b.main(0, cols::ZBS);
+        let x4 = b.main(0, cols::X_4);
+        b.emit_base(5, zbs * x4);
+
+        // idx 6..10: ZbsOverrideY(i) — zbs * (Y[i] - in[i] * direction)
+        for i in 0..4 {
+            let zbs = b.main(0, cols::ZBS);
+            let y_i = b.main(0, cols::Y[i]);
+            let in_i = b.main(0, cols::IN[i]);
+            let dir = b.main(0, cols::DIRECTION);
+            b.emit_base(6 + i, zbs * (y_i - in_i * dir));
+        }
+
+        // idx 10..14: LimbShiftIsBit(i) — limb_shift[i] * (1 - limb_shift[i])
+        for i in 0..4 {
+            let ls = Self::limb_shift(b, i);
+            let one = b.one();
+            b.emit_base(10 + i, ls.clone() * (one - ls));
+        }
+
+        // idx 14,15: OutputMatchesShifted(i) —
+        // out[i] - shifted_half[2i] - shifted_half[2i+1] * 2^16
+        for i in 0..2 {
+            let out_col = if i == 0 { cols::OUT_0 } else { cols::OUT_1 };
+            let out = b.main(0, out_col);
+            let half_lo = Self::shifted_half(b, 2 * i);
+            let half_hi = Self::shifted_half(b, 2 * i + 1);
+            let shift_16 = b.const_base(SHIFT_16);
+            b.emit_base(14 + i, out - half_lo - half_hi * shift_16);
+        }
+
+        // idx 16..19: FlagIsBit — flag * (1 - flag) for direction, signed, word_instr
+        for (off, flag_col) in [cols::DIRECTION, cols::SIGNED, cols::WORD_INSTR]
+            .into_iter()
+            .enumerate()
+        {
+            let flag = b.main(0, flag_col);
+            let one = b.one();
+            b.emit_base(16 + off, flag.clone() * (one - flag));
         }
     }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
-}
-
-/// Number of polynomial constraints in the SHIFT table.
-// 1 (DirectionImpliesMu) + 4 (ZbsOverrideX) + 1 (ZbsOverrideX4) + 4 (ZbsOverrideY)
-// + 4 (LimbShiftIsBit) + 2 (OutputMatchesShifted) = 16
-pub const NUM_SHIFT_CONSTRAINTS: usize = 16;
-
-/// Creates all polynomial constraints for the SHIFT table.
-pub fn shift_constraints(constraint_idx_start: usize) -> (Vec<ShiftConstraint>, usize) {
-    let mut idx = constraint_idx_start;
-    let mut constraints = Vec::with_capacity(NUM_SHIFT_CONSTRAINTS);
-
-    let mut push = |kind| {
-        constraints.push(ShiftConstraint::new(kind, idx));
-        idx += 1;
-    };
-
-    // C13: direction * (1 - μ) = 0
-    push(ShiftConstraintKind::DirectionImpliesMu);
-
-    // C5.i: zbs * (X[i] - in[i] * left) = 0
-    for i in 0..4 {
-        push(ShiftConstraintKind::ZbsOverrideX(i));
-    }
-
-    // C7: zbs * X[4] = 0
-    push(ShiftConstraintKind::ZbsOverrideX4);
-
-    // C9.i: zbs * (Y[i] - in[i] * right) = 0
-    for i in 0..4 {
-        push(ShiftConstraintKind::ZbsOverrideY(i));
-    }
-
-    // C10.i: IS_BIT<limb_shift[i]>
-    for i in 0..4 {
-        push(ShiftConstraintKind::LimbShiftIsBit(i));
-    }
-
-    // C12.i: out[i] - (shifted::DWordWL)[i] = 0
-    for i in 0..2 {
-        push(ShiftConstraintKind::OutputMatchesShifted(i));
-    }
-
-    debug_assert_eq!(constraints.len(), NUM_SHIFT_CONSTRAINTS);
-    (constraints, idx)
 }
 
 // =========================================================================
@@ -851,11 +902,7 @@ pub fn shift_constraints(constraint_idx_start: usize) -> (Vec<ShiftConstraint>, 
 
 use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 
-/// Collect BITWISE table lookups needed by a set of unique shift operations.
-///
-/// Each unique operation (with its multiplicity) generates HWSL/AND_BYTE/MSB16/ZERO
-/// lookups. The lookups must be generated per-unique-operation (matching the SHIFT table's
-/// deduplication and μ column), and repeated `multiplicity` times.
+/// Collect BITWISE table lookups needed by a set of shift operations.
 pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseOperation> {
     // No deduplication: each operation has μ=1, matching generate_shift_trace.
     let mut bitwise_ops = Vec::new();
@@ -876,21 +923,21 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
             ));
         }
 
-        // C1: AND_BYTE[shift, 15] | left (= μ - direction = 1 - direction)
+        // C1: BYTE_ALU[AND, shift, 15] | left (= μ - direction = 1 - direction)
         if left {
             bitwise_ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::AndByte,
+                BitwiseOperationType::ByteAluAnd,
                 op.shift,
                 15,
             ));
         }
 
-        // C2: AND_BYTE[256 - zbs*16 - shift, 15] | right (= direction)
+        // C2: BYTE_ALU[AND, 256 - zbs*16 - shift, 15] | right (= direction)
         if right {
             let zbs_16: u16 = if aux.zbs { 16 } else { 0 };
             let complement = (256u16 - zbs_16 - op.shift as u16) as u8;
             bitwise_ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::AndByte,
+                BitwiseOperationType::ByteAluAnd,
                 complement,
                 15,
             ));
@@ -925,13 +972,43 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
             ));
         }
 
-        // C11: AND_BYTE[shift, mask] | μ (= 1)
+        // C11: BYTE_ALU[AND, shift, mask] | μ (= 1)
         let mask = if op.word_instr { 16 } else { 48 };
         bitwise_ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::AndByte,
+            BitwiseOperationType::ByteAluAnd,
             op.shift,
             mask,
         ));
+
+        // Range checks (match the ALU-bus in2 reconstruction): ARE_BYTES[bits
+        // 8-15] + IS_HALF[bits 16-31]. The high word (bits 32-63, SHIFT_HIGH) is
+        // the spec's `shift[3]` Word; IS_WORD is assumed via its bus equality
+        // with the CPU's well-formed arg2 high word, so it needs no check.
+        bitwise_ops.push(BitwiseOperation::single_byte(
+            BitwiseOperationType::AreBytes,
+            ((op.shift_amount >> 8) & 0xFF) as u8,
+        ));
+        // ARE_BYTES[shift[0]] — spec IS_BYTE[shift[0]] (defense-in-depth,
+        // redundant with the BYTE_ALU[AND, shift, mask] lookups above).
+        bitwise_ops.push(BitwiseOperation::single_byte(
+            BitwiseOperationType::AreBytes,
+            op.shift,
+        ));
+        let half = ((op.shift_amount >> 16) & 0xFFFF) as u16;
+        bitwise_ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (half & 0xFF) as u8,
+            (half >> 8) as u8,
+        ));
+        // VM-3: IS_HALF[in[i]] for the four input halves, unconditional on every
+        // active row — matches the four IS_HALF senders added in `bus_interactions`.
+        for i in 0..4 {
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (op.in_halves[i] & 0xFF) as u8,
+                (op.in_halves[i] >> 8) as u8,
+            ));
+        }
     }
 
     bitwise_ops

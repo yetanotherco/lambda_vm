@@ -174,15 +174,21 @@ fn run_parity(
     stream.synchronize().unwrap();
 
     let main_handle = GpuLdeBase {
+        ready: None,
         buf: Arc::new(main_dev),
         m: num_main,
         lde_size,
+        tree: None,
+        trace_dev: None,
+        trace_rows: 0,
     };
     let aux_handle = if num_aux > 0 {
         Some(GpuLdeExt3 {
+            ready: None,
             buf: Arc::new(aux_dev),
             m: num_aux,
             lde_size,
+            tree: None,
         })
     } else {
         drop(aux_dev);

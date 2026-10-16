@@ -217,7 +217,9 @@ fn test_lt_deduplication() {
             && row[lt::cols::RHS_0] == FE::from(10u64)
             && row[lt::cols::SIGNED] == FE::from(1u64)
         {
-            // Found our SLT row - verify multiplicity is 3
+            // Found our SLT row - verify multiplicity is 3. Every LT lookup
+            // (including SLT) goes through the unified ALU bus and
+            // is counted in the single `MU` column.
             assert_eq!(row[lt::cols::MU], FE::from(3u64));
             found_slt = true;
             break;
@@ -268,10 +270,11 @@ fn test_bitwise_lookups_collected() {
 
     let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
-    // Check AND multiplicity was updated for (0x12, 0x34, 0)
+    // AND/OR/XOR now go through the BYTEWISE chip on the unified BYTE_ALU bus,
+    // so the AND byte (0x12, 0x34) increments MU_BYTE_ALU_AND.
     let row_idx = bitwise::row_index(0x12, 0x34, 0);
     let row = traces.bitwise.main_table.get_row(row_idx);
-    assert_eq!(row[bitwise::cols::MU_AND], FE::one());
+    assert_eq!(row[bitwise::cols::MU_BYTE_ALU_AND], FE::one());
 }
 
 #[test]
@@ -599,11 +602,11 @@ mod keccak_tests {
 
         let xor = ops
             .iter()
-            .filter(|o| o.lookup_type == BitwiseOperationType::XorByte)
+            .filter(|o| o.lookup_type == BitwiseOperationType::ByteAluXor)
             .count();
         let and = ops
             .iter()
-            .filter(|o| o.lookup_type == BitwiseOperationType::AndByte)
+            .filter(|o| o.lookup_type == BitwiseOperationType::ByteAluAnd)
             .count();
         let are_bytes = ops
             .iter()
@@ -618,15 +621,17 @@ mod keccak_tests {
             .filter(|o| o.lookup_type == BitwiseOperationType::IsHalf)
             .count();
 
-        assert_eq!(xor, 24 * 608, "XorByte count");
-        assert_eq!(and, 24 * 200 + 1, "AndByte count");
+        assert_eq!(xor, 24 * 608, "ByteAluXor count");
+        assert_eq!(and, 24 * 200 + 1, "ByteAluAnd count");
         // Cxz_right Byte→Bit (spec d75944ee): drops 40 ARE_BYTES per round.
         // Spec emits one IS_BYTE template per byte; ops pair adjacent bytes
         // into ARE_BYTES (20 cxz_left + 200 rho per round, 4 addr per call).
         assert_eq!(are_bytes, 24 * 220 + 4, "AreBytes count");
-        assert_eq!(hwsl, 24 * 120, "Hwsl count");
+        // θ/ρ halfword shifts are enforced by inline μ-gated identities on the
+        // keccak_rnd chip, so no HWSL lookups are emitted (was 24 * 120).
+        assert_eq!(hwsl, 0, "Hwsl count");
         assert_eq!(is_half, 100, "IsHalf count");
-        assert_eq!(ops.len(), 105 + 24 * 1148, "Total bitwise ops");
+        assert_eq!(ops.len(), 105 + 24 * 1028, "Total bitwise ops");
     }
 
     #[test]
@@ -667,7 +672,6 @@ mod keccak_tests {
             }
             ref_state[0] ^= rc;
 
-            let base = round * rnd_cols::NUM_COLUMNS;
             for (lane, &lane_val) in ref_state.iter().enumerate() {
                 let x = lane % 5;
                 let y = lane / 5;
@@ -678,7 +682,7 @@ mod keccak_tests {
                     } else {
                         rnd_cols::chi(x, y, byte_idx)
                     };
-                    let trace_val = &rnd_trace.main_table.data[base + col];
+                    let trace_val = rnd_trace.get_main(round, col);
                     assert_eq!(
                         &expected, trace_val,
                         "Round {round} lane ({x},{y}) byte {byte_idx}"
@@ -698,23 +702,22 @@ mod keccak_tests {
         for x in 0..5 {
             for y in 0..5 {
                 for b in 0..8 {
-                    let core_val = &core_trace.main_table.data[core_cols::input_state(x, y, b)];
-                    let rnd_val = &rnd_trace.main_table.data[rnd_cols::start(x, y, b)];
+                    let core_val = core_trace.get_main(0, core_cols::input_state(x, y, b));
+                    let rnd_val = rnd_trace.get_main(0, rnd_cols::start(x, y, b));
                     assert_eq!(core_val, rnd_val, "Round 0 start mismatch at ({x},{y},{b})");
                 }
             }
         }
 
         // Round 23 out == core output_state
-        let rnd_base_23 = 23 * rnd_cols::NUM_COLUMNS;
         for x in 0..5 {
             for y in 0..5 {
                 for b in 0..8 {
-                    let core_val = &core_trace.main_table.data[core_cols::output_state(x, y, b)];
+                    let core_val = core_trace.get_main(0, core_cols::output_state(x, y, b));
                     let rnd_val = if x == 0 && y == 0 {
-                        &rnd_trace.main_table.data[rnd_base_23 + rnd_cols::iota(b)]
+                        rnd_trace.get_main(23, rnd_cols::iota(b))
                     } else {
-                        &rnd_trace.main_table.data[rnd_base_23 + rnd_cols::chi(x, y, b)]
+                        rnd_trace.get_main(23, rnd_cols::chi(x, y, b))
                     };
                     assert_eq!(core_val, rnd_val, "Round 23 out mismatch at ({x},{y},{b})");
                 }
@@ -727,13 +730,14 @@ mod keccak_tests {
         assert_eq!(
             keccak::bus_interactions().len(),
             134,
-            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 100 IS_HALF + 1 AND_BYTE alignment + 4 ARE_BYTES addr pairs + 1 Keccak send + 1 Keccak recv"
+            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 100 IS_HALF + 1 BYTE_ALU alignment + 4 ARE_BYTES addr pairs + 1 Keccak send + 1 Keccak recv"
         );
         assert_eq!(
             keccak_rnd::bus_interactions().len(),
-            1151,
-            "KECCAK_RND: 3 IO + 440 theta + 300 rho + 400 chi + 8 iota \
-             (Cxz_right Byte→Bit drops 40 ARE_BYTES per spec d75944ee; \
+            1031,
+            "KECCAK_RND: 3 IO + 420 theta + 200 rho + 400 chi + 8 iota \
+             (θ/ρ HWSL sends replaced by inline μ-gated shift identities: −20 θ, −100 ρ; \
+             Cxz_right Byte→Bit drops 40 ARE_BYTES per spec d75944ee; \
              ARE_BYTES sends are paired per spec ARE_BYTES interaction signature)"
         );
         assert_eq!(
@@ -756,18 +760,16 @@ mod keccak_tests {
 
     #[test]
     fn test_keccak_constraint_counts() {
-        let (core_constraints, _) = keccak::create_constraints(0);
+        use stark::constraints::builder::ConstraintSet;
         assert_eq!(
-            core_constraints.len(),
+            keccak::KeccakConstraints.meta().len(),
             51,
             "KECCAK core: 25 ADD pairs + no-overflow"
         );
-
-        let (rnd_constraints, _) = keccak_rnd::create_constraints(0);
         assert_eq!(
-            rnd_constraints.len(),
-            20,
-            "KECCAK_RND: 20 IS_BIT(μ; Cxz_right_bit) per spec d75944ee"
+            keccak_rnd::KeccakRndConstraints.meta().len(),
+            140,
+            "KECCAK_RND: 20 IS_BIT(μ; Cxz_right_bit) + 20 θ + 100 ρ inline shift identities"
         );
     }
 }
@@ -820,5 +822,280 @@ mod routing_tests {
             !is_register_op(&op),
             "different upper limbs should fall back to MEMW_A"
         );
+    }
+}
+
+/// `from_image_and_logs` is a faithful generalization of `from_elf_and_logs`:
+/// fed the ELF-derived image, it must produce identical traces.
+#[test]
+fn test_from_image_and_logs_matches_from_elf_and_logs() {
+    use crate::tables::MaxRowsConfig;
+    use crate::tables::trace_builder::build_initial_image;
+    use crate::test_utils::asm_elf_bytes;
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let elf_bytes = asm_elf_bytes("basic_program");
+    let program = Elf::load(&elf_bytes).unwrap();
+    let logs = Executor::new(&program, vec![]).unwrap().run().unwrap().logs;
+    let max_rows = MaxRowsConfig::default();
+
+    let from_elf = Traces::from_elf_and_logs(
+        &program,
+        &logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
+
+    let image = build_initial_image(&program, &[]);
+    let register_init =
+        crate::tables::register::register_init_from_entry_point(program.entry_point);
+    let from_image = Traces::from_image_and_logs(
+        &program,
+        &image,
+        &register_init,
+        &logs,
+        &max_rows,
+        &[],
+        true,
+        false,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
+
+    assert_eq!(
+        from_elf.total_field_elements(),
+        from_image.total_field_elements()
+    );
+    assert_eq!(
+        format!("{:?}", from_elf.table_counts()),
+        format!("{:?}", from_image.table_counts())
+    );
+}
+
+/// A memory snapshot at an epoch boundary converts into a non-empty initial
+/// image (the input `from_image_and_logs` consumes for the next epoch).
+#[test]
+fn test_epoch_end_memory_converts_to_image() {
+    use crate::test_utils::asm_elf_bytes;
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use std::collections::HashMap;
+
+    let elf_bytes = asm_elf_bytes("basic_program");
+    let program = Elf::load(&elf_bytes).unwrap();
+
+    let total = Executor::new(&program, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size = (total / 3).max(1);
+    let epochs = Executor::new(&program, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    let image: HashMap<u64, u8> = epochs[0].end_memory.iter_bytes().collect();
+    assert!(!image.is_empty());
+}
+
+/// Every epoch builds traces: intermediate epochs (`is_final = false`) skip HALT
+/// and start from the previous epoch's memory; the last epoch terminates.
+#[test]
+fn test_build_traces_for_all_epochs() {
+    use crate::tables::MaxRowsConfig;
+    use crate::tables::trace_builder::build_initial_image;
+    use crate::test_utils::asm_elf_bytes;
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use std::collections::HashMap;
+
+    let elf_bytes = asm_elf_bytes("basic_program");
+    let program = Elf::load(&elf_bytes).unwrap();
+
+    let total = Executor::new(&program, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size = (total / 3).max(1);
+    let epochs = Executor::new(&program, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    let max_rows = MaxRowsConfig::default();
+    let last = epochs.len() - 1;
+
+    for (i, epoch) in epochs.iter().enumerate() {
+        // Epoch 0 starts from the program-start image; later epochs from the
+        // previous epoch's ending memory + register snapshot.
+        let (image, register_init): (HashMap<u64, u8>, Vec<u32>) = if i == 0 {
+            (
+                build_initial_image(&program, &[]),
+                crate::tables::register::register_init_from_entry_point(program.entry_point),
+            )
+        } else {
+            (
+                epochs[i - 1].end_memory.iter_bytes().collect(),
+                crate::tables::register::register_init_from_snapshot(
+                    &epochs[i - 1].end_registers,
+                    epochs[i - 1].end_pc,
+                ),
+            )
+        };
+
+        let traces = Traces::from_image_and_logs(
+            &program,
+            &image,
+            &register_init,
+            &epoch.logs,
+            &max_rows,
+            &[],
+            i == last,
+            false,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )
+        .unwrap_or_else(|e| panic!("epoch {i} (is_final={}) failed to build: {e:?}", i == last));
+
+        assert!(
+            traces.table_counts().cpu > 0,
+            "epoch {i} produced an empty CPU trace"
+        );
+    }
+}
+
+/// A non-final epoch carrying the program-terminating instruction is rejected
+/// (rather than silently producing an unverifiable proof).
+#[test]
+fn test_terminating_epoch_rejected_when_not_final() {
+    use crate::tables::MaxRowsConfig;
+    use crate::tables::register::register_init_from_snapshot;
+    use crate::test_utils::asm_elf_bytes;
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use std::collections::HashMap;
+
+    let elf_bytes = asm_elf_bytes("basic_program");
+    let program = Elf::load(&elf_bytes).unwrap();
+
+    let total = Executor::new(&program, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size = (total / 3).max(1);
+    let epochs = Executor::new(&program, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    // The last epoch holds the terminating instruction; building it as a
+    // non-final epoch (is_final = false) must error.
+    let last = epochs.len() - 1;
+    let image: HashMap<u64, u8> = epochs[last - 1].end_memory.iter_bytes().collect();
+    let register_init =
+        register_init_from_snapshot(&epochs[last - 1].end_registers, epochs[last - 1].end_pc);
+
+    let result = Traces::from_image_and_logs(
+        &program,
+        &image,
+        &register_init,
+        &epochs[last].logs,
+        &MaxRowsConfig::default(),
+        &[],
+        false,
+        false,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    );
+
+    assert!(
+        matches!(result, Err(crate::Error::HaltInNonFinalEpoch)),
+        "expected HaltInNonFinalEpoch error for a non-final terminating epoch"
+    );
+}
+
+/// End to end: extract real per-epoch touched cells from execution, feed them
+/// through the local-to-global boundary logic, and render each epoch's trace.
+#[test]
+fn test_local_to_global_traces_from_real_execution() {
+    use crate::tables::local_to_global::{epoch_boundaries, generate_local_to_global_trace};
+    use crate::tables::trace_builder::{build_initial_image, epoch_touched_cells};
+    use crate::test_utils::asm_elf_bytes;
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use std::collections::HashMap;
+
+    // A program that exercises memory (loads/stores), so some cells are touched.
+    let elf_bytes = asm_elf_bytes("all_loadstore_32");
+    let program = Elf::load(&elf_bytes).unwrap();
+
+    let total = Executor::new(&program, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size = (total / 3).max(1);
+    let epochs = Executor::new(&program, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    let elf_image = build_initial_image(&program, &[]);
+    let total_memory = elf_image.len();
+
+    // Per-epoch touched cells from real execution (epoch 0 from the ELF image,
+    // later epochs from the previous epoch's ending memory).
+    let mut per_epoch_touches: Vec<Vec<(u64, u64, u64)>> = Vec::new();
+    for (i, epoch) in epochs.iter().enumerate() {
+        let image: HashMap<u64, u8> = if i == 0 {
+            elf_image.clone()
+        } else {
+            epochs[i - 1].end_memory.iter_bytes().collect()
+        };
+        let register_init = if i == 0 {
+            crate::tables::register::register_init_from_entry_point(program.entry_point)
+        } else {
+            crate::tables::register::register_init_from_snapshot(
+                &epochs[i - 1].end_registers,
+                epochs[i - 1].end_pc,
+            )
+        };
+        per_epoch_touches
+            .push(epoch_touched_cells(&program, &image, &register_init, &epoch.logs).unwrap());
+    }
+
+    // The program touches memory somewhere, and every per-epoch touched set is
+    // sparse (far smaller than the whole memory image).
+    let total_touched: usize = per_epoch_touches.iter().map(Vec::len).sum();
+    assert!(total_touched > 0);
+    for touched in &per_epoch_touches {
+        assert!(touched.len() < total_memory);
+    }
+
+    // Boundary claims + rendered L2G trace per epoch.
+    let initial_memory: HashMap<u64, u64> =
+        elf_image.iter().map(|(&a, &v)| (a, v as u64)).collect();
+    let boundaries = epoch_boundaries(&initial_memory, &per_epoch_touches);
+
+    for (i, boundary_set) in boundaries.iter().enumerate() {
+        let trace = generate_local_to_global_trace(boundary_set);
+        let expected_rows = per_epoch_touches[i].len().next_power_of_two().max(1);
+        assert_eq!(trace.num_rows(), expected_rows);
     }
 }

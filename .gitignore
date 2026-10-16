@@ -9,3 +9,10 @@ executor/program_artifacts/
 # Shared cargo target directory for ELF builds
 executor/shared_target/
 
+
+# Python bytecode
+__pycache__/
+*.pyc
+# Profiling outputs (run_profile.sh / flamegraphs.sh) and working notes.
+reports/
+thoughts/

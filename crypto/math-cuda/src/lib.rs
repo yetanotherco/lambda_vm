@@ -1,16 +1,28 @@
 //! GPU backend for the lambda-vm STARK prover.
 //!
-//! Primary entry point: [`lde::coset_lde_base`]. Everything else (`ntt`,
-//! element-wise arith) is either internal to the LDE pipeline or used by the
-//! parity test suite.
+//! Primary entry points: [`lde::coset_lde_base`] for the LDE pipeline and
+//! [`logup::logup_aux_resident`] for the device-resident LogUp aux build.
+//! Everything else (`ntt`, element-wise arith) is either internal to those
+//! pipelines or used by the parity test suite.
 
 pub mod barycentric;
+pub mod constraint_interp;
 pub mod deep;
 pub mod device;
+#[cfg(feature = "test-faults")]
+pub mod faults;
 pub mod fri;
+pub mod grinding;
+pub mod inverse;
 pub mod lde;
+pub mod logup;
 pub mod merkle;
 pub mod ntt;
+pub mod nvtx;
+
+// Re-exported for downstream crates so they can refer to CUDA primitive
+// types without depending on cudarc directly.
+pub use cudarc::driver::{CudaSlice, CudaStream};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 

@@ -170,3 +170,112 @@ fn fork_isolation() {
 
     assert_eq!(fork_a.sample(), fork_a_fresh.sample());
 }
+
+// =========================================================================
+// Duplex output-buffer contract (the soundness-critical invalidation lines).
+//
+// The roundtrip suites structurally cannot catch a missing invalidation:
+// prover and verifier would consume identical stale bytes in lockstep. Each
+// test below fails if its invalidation is removed, because the "next" sample
+// would then come from bytes squeezed BEFORE the interleaved absorb — i.e.
+// a challenge that does not depend on the absorbed commitment.
+// =========================================================================
+
+#[test]
+fn absorb_bytes_invalidates_buffered_squeeze_output() {
+    let mut t1 = DefaultTranscript::<GoldilocksField>::new(b"seed");
+    let mut t2 = DefaultTranscript::<GoldilocksField>::new(b"seed");
+    // Fill the buffer and consume one candidate on both.
+    assert_eq!(t1.sample_field_element(), t2.sample_field_element());
+    // Diverge the absorbed input; the next challenge must depend on it.
+    t1.append_bytes(b"root-A");
+    t2.append_bytes(b"root-B");
+    assert_ne!(
+        t1.sample_field_element(),
+        t2.sample_field_element(),
+        "a challenge sampled after an absorb must depend on the absorbed bytes"
+    );
+}
+
+#[test]
+fn absorb_field_element_invalidates_buffered_squeeze_output() {
+    let mut t1 = DefaultTranscript::<GoldilocksField>::new(b"seed");
+    let mut t2 = DefaultTranscript::<GoldilocksField>::new(b"seed");
+    assert_eq!(t1.sample_field_element(), t2.sample_field_element());
+    t1.append_field_element(&FieldElement::from(1u64));
+    t2.append_field_element(&FieldElement::from(2u64));
+    assert_ne!(
+        t1.sample_field_element(),
+        t2.sample_field_element(),
+        "a challenge sampled after absorbing a field element must depend on it"
+    );
+}
+
+#[test]
+fn raw_sample_invalidates_buffered_squeeze_output() {
+    let mut t1 = DefaultTranscript::<GoldilocksField>::new(b"seed");
+    let mut t2 = DefaultTranscript::<GoldilocksField>::new(b"seed");
+    assert_eq!(t1.sample_field_element(), t2.sample_field_element());
+    // Interleave a raw squeeze on t1 only (the grinding path does this).
+    let _ = t1.sample();
+    assert_ne!(
+        t1.sample_field_element(),
+        t2.sample_field_element(),
+        "a raw sample() must invalidate buffered bytes, not hand them out again"
+    );
+}
+
+/// The GPU-FRI fallback clones the transcript mid-buffer; a clone that loses
+/// `out_buf`/`out_pos` would replay a different challenge sequence there.
+#[test]
+fn clone_replays_identically_mid_buffer() {
+    let mut t = DefaultTranscript::<GoldilocksField>::new(b"snapshot");
+    let _ = t.sample_field_element(); // leave the buffer partially consumed
+    let mut snap = t.clone();
+    let original: (Vec<FieldElement<GoldilocksField>>, u64) = (
+        (0..6).map(|_| t.sample_field_element()).collect(),
+        t.sample_u64(1 << 20),
+    );
+    let replay: (Vec<FieldElement<GoldilocksField>>, u64) = (
+        (0..6).map(|_| snap.sample_field_element()).collect(),
+        snap.sample_u64(1 << 20),
+    );
+    assert_eq!(
+        original, replay,
+        "a mid-buffer clone must replay identically"
+    );
+}
+
+/// Known-answer pin of the duplex byte semantics: BE u64 candidates, 8 bytes
+/// per candidate, refill after 4, absorb invalidation between phases. Any
+/// accidental change to byte order, chunking or refill granularity is a
+/// transcript hard-fork and must show up here, not in a red proof.
+#[test]
+fn pinned_duplex_sample_semantics_across_refill() {
+    let mut t = DefaultTranscript::<GoldilocksField>::new(b"lambda-vm-kat-v1");
+    // Five base samples: the fifth forces a refill (4 candidates per squeeze).
+    let base: Vec<u64> = (0..5).map(|_| *t.sample_field_element().value()).collect();
+    assert_eq!(base, KAT_BASE);
+    // A bounded index draw from the same buffered stream.
+    assert_eq!(t.sample_u64(1 << 20), KAT_U64);
+    // An ext3 sample after an absorb (invalidation + coordinate order).
+    let mut te = DefaultTranscript::<Degree3GoldilocksExtensionField>::new(b"lambda-vm-kat-v1");
+    te.append_bytes(b"phase-2");
+    let ext = te.sample_field_element();
+    let coords: Vec<u64> = ext.value().iter().map(|c| *c.value()).collect();
+    assert_eq!(coords, KAT_EXT3);
+}
+
+const KAT_BASE: [u64; 5] = [
+    14480544354348864378,
+    16386050731901120766,
+    7548241632395108276,
+    4782457473227177333,
+    12741265158531607555,
+];
+const KAT_U64: u64 = 661275;
+const KAT_EXT3: [u64; 3] = [
+    1422269417846962659,
+    13550644288133318291,
+    8414859559479507538,
+];

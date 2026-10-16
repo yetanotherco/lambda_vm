@@ -1,0 +1,24 @@
+[package]
+name = "ethrex-tests"
+version = "0.1.0"
+edition = "2024"
+
+# Detached workspace: ethrex pins rkyv with the `unaligned` feature (a global
+# archived-layout switch), which must never feature-unify with the main
+# workspace's aligned rkyv proof format. See tests/ethrex.rs.
+[workspace]
+
+[dev-dependencies]
+executor = { path = "../../executor" }
+# Pinned to the SAME ethrex rev as the guest (open LambdaVM-backend PR branch)
+# so the native reference reads the same ProgramInput rkyv layout.
+ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-guest-program" }
+# Exact pin: the fixture writer and the guest/executor readers must agree on the
+# rkyv layout. Keep this in sync with tooling/ethrex-fixtures and
+# executor/programs/rust/ethrex/Cargo.toml.
+rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
+
+# Match the root workspace's optimized dev profile: these tests execute the VM.
+[profile.dev]
+opt-level = 3
+debug = true
