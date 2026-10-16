@@ -6,11 +6,12 @@ use stark::prover::{IsStarkProver, Prover};
 
 use crate::statement::{StatementKind, absorb_statement};
 use crate::tables::bitwise::{
-    BitwiseHistogram, BitwiseOperation, BitwiseOperationType, cols as bw_cols,
-    row_index as bw_row_index,
+    BitwiseHistogram, BitwiseOperation, BitwiseOperationType, NUM_ROWS as BW_NUM_ROWS,
+    cols as bw_cols, row_index as bw_row_index,
 };
 use crate::tables::is_wh::{
-    self, IsWhKey, MU_MAX, collect_bitwise_from_is_wh, cols, dedup_is_wh_rows, generate_is_wh_trace,
+    self, IS_WH_MU_MAX, IsWhKey, collect_bitwise_from_is_wh, cols, dedup_is_wh_rows,
+    generate_is_wh_trace,
 };
 use crate::tables::keccak::{
     self, KeccakConstraints, KeccakOperation, cols as keccak_cols, generate_keccak_trace,
@@ -70,21 +71,38 @@ fn test_is_wh_dedup_of_no_sends_is_empty() {
 fn test_is_wh_dedup_splits_mu_above_b20() {
     let total_mu = |rows: &[(IsWhKey, u64)]| rows.iter().map(|(_, mu)| mu).sum::<u64>();
 
-    // Exactly MU_MAX fits one row.
-    let rows = dedup_is_wh_rows(vec![A; MU_MAX as usize]);
-    assert_eq!(rows, vec![(A, MU_MAX)]);
+    // Exactly IS_WH_MU_MAX fits one row.
+    let rows = dedup_is_wh_rows(vec![A; IS_WH_MU_MAX as usize]);
+    assert_eq!(rows, vec![(A, IS_WH_MU_MAX)]);
 
     // One more spills into a second row of the same key.
-    let rows = dedup_is_wh_rows(vec![A; MU_MAX as usize + 1]);
-    assert_eq!(rows, vec![(A, MU_MAX), (A, 1)]);
+    let rows = dedup_is_wh_rows(vec![A; IS_WH_MU_MAX as usize + 1]);
+    assert_eq!(rows, vec![(A, IS_WH_MU_MAX), (A, 1)]);
 
     // Two full rows and a remainder, next to an unrelated key.
-    let mut keys = vec![A; 2 * MU_MAX as usize + 3];
+    let mut keys = vec![A; 2 * IS_WH_MU_MAX as usize + 3];
     keys.push(B);
     let rows = dedup_is_wh_rows(keys.iter().copied());
-    assert_eq!(rows, vec![(A, MU_MAX), (A, MU_MAX), (A, 3), (B, 1)]);
+    assert_eq!(
+        rows,
+        vec![(A, IS_WH_MU_MAX), (A, IS_WH_MU_MAX), (A, 3), (B, 1)]
+    );
     assert_eq!(total_mu(&rows), keys.len() as u64, "no send lost or added");
-    assert!(rows.iter().all(|(_, mu)| *mu <= MU_MAX && *mu > 0));
+    assert!(rows.iter().all(|(_, mu)| *mu <= IS_WH_MU_MAX && *mu > 0));
+}
+
+/// The split point is the top of the `IS_B20` range: BITWISE row `i` receives
+/// `IS_B20[i]`, so the last row takes `IS_WH_MU_MAX` and there is none past it.
+/// A larger split point would build rows whose bound has no receiver.
+#[test]
+fn test_is_wh_mu_max_is_the_top_of_b20() {
+    let (x, y, z) = (
+        IS_WH_MU_MAX as u8,
+        (IS_WH_MU_MAX >> 8) as u8,
+        (IS_WH_MU_MAX >> 16) as u8,
+    );
+    assert_eq!(bw_row_index(x, y, z), BW_NUM_ROWS - 1);
+    assert_eq!(IS_WH_MU_MAX + 1, BW_NUM_ROWS as u64);
 }
 
 // =========================================================================
@@ -356,15 +374,15 @@ fn split_first_row(traces: &mut Traces, moved: FE) {
     bump_b20(traces, 0, -FE::one());
     for v in [kept, moved] {
         let v = v.canonical_u64();
-        if v <= MU_MAX {
+        if v <= IS_WH_MU_MAX {
             bump_b20(traces, v, FE::one());
         }
     }
 }
 
 /// Control: a split into two positive multiplicities is an honest witness (the
-/// same shape `dedup_is_wh_rows` produces past `MU_MAX`) and verifies. This is
-/// what makes the rejection below attributable to the sign of μ alone.
+/// same shape `dedup_is_wh_rows` produces past `IS_WH_MU_MAX`) and verifies.
+/// This is what makes the rejection below attributable to the sign of μ alone.
 #[test]
 fn test_is_wh_positive_split_verifies() {
     assert!(prove_keccak_with(|t| split_first_row(t, FE::one())));
@@ -385,4 +403,173 @@ fn test_is_wh_honest_keccak_verifies() {
     assert!(prove_keccak_with(|t| {
         assert_eq!(t.is_whs.len(), 1, "test_keccak must ship an IS_WH table");
     }));
+}
+
+// =========================================================================
+// End to end: the IS_HALFWORD checks on the key
+// =========================================================================
+//
+// A key limb is only bound by IS_WH's own IS_HALFWORD sends: the `IS_WH` bus
+// carries the Word packed (`value[1] + 2^16·value[2]`) and KECCAK's memory sends
+// carry `half_lo + 2^16·half_mid`, so a non-canonical split of either sum keeps
+// both buses and the ADD balanced. The forgeries below rebalance BITWISE from
+// the IS_HALFWORD sends IS_WH declares, as the attacker would: with a send
+// removed (and its count dropped from the collector) there is nothing to
+// rebalance for that limb and the forgery must go through, which is what keeps
+// the rejections falsifiable.
+
+/// IS_WH columns that IS_WH sends an `IS_HALFWORD` check on.
+fn is_wh_half_checked_columns() -> Vec<usize> {
+    let half: u64 = BusId::IsHalfword.into();
+    is_wh::bus_interactions()
+        .iter()
+        .filter(|bi| bi.bus_id == half && bi.is_sender)
+        .filter_map(|bi| match bi.values.as_slice() {
+            [stark::lookup::BusValue::Packed { start_column, .. }] => Some(*start_column),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Moves `delta` onto the BITWISE `IS_HALFWORD` receiver row for `value`. A
+/// value outside `[0, 2^16)` has no row to move onto, so it is left unbalanced.
+fn bump_half(traces: &mut Traces, value: FE, delta: FE) {
+    let v = value.canonical_u64();
+    if v >= 1 << 16 {
+        return;
+    }
+    let bw = &mut traces.bitwise.main_table;
+    let row = bw_row_index(v as u8, (v >> 8) as u8, 0);
+    let old = *bw.get(row, bw_cols::MU_IS_HALF);
+    bw.set(row, bw_cols::MU_IS_HALF, old + delta);
+}
+
+/// `lo + 2^16·hi` split again with `lo` replaced by `new_lo`: `hi` absorbs the
+/// difference, so the pair packs to the same field element. Unless
+/// `new_lo == lo`, the new `hi` is far outside `[0, 2^16)`.
+fn resplit_keeping_lo(lo: FE, hi: FE, new_lo: FE) -> (FE, FE) {
+    let inv_2_16 = FE::from(1u64 << 16).inv().expect("2^16 is invertible");
+    (new_lo, hi + (lo - new_lo) * inv_2_16)
+}
+
+/// Rewrites the Word of IS_WH row 0 into a non-canonical pair of halves with
+/// the same packing, so it still receives the honest `IS_WH` sends. The limb at
+/// `out_of_range` (`VALUE_1` or `VALUE_2`) leaves `[0, 2^16)`; the other limb
+/// moves to a different in-range value.
+fn resplit_word(traces: &mut Traces, out_of_range: usize) {
+    let t = &mut traces.is_whs[0].main_table;
+    let m = *t.get(0, cols::MU);
+    let (v1, v2) = (*t.get(0, cols::VALUE_1), *t.get(0, cols::VALUE_2));
+    let flip = |v: FE| FE::from(v.canonical_u64() ^ 1);
+    let (n1, n2) = if out_of_range == cols::VALUE_2 {
+        resplit_keeping_lo(v1, v2, flip(v1))
+    } else {
+        // `v1 + 2^16·v2` with `v2` replaced: `v1` absorbs `2^16·(v2 − v2')`.
+        let n2 = flip(v2);
+        (v1 + (v2 - n2) * FE::from(1u64 << 16), n2)
+    };
+    assert_eq!(
+        n1 + n2 * FE::from(1u64 << 16),
+        v1 + v2 * FE::from(1u64 << 16)
+    );
+    t.set(0, cols::VALUE_1, n1);
+    t.set(0, cols::VALUE_2, n2);
+
+    for col in is_wh_half_checked_columns() {
+        let (old, new) = match col {
+            c if c == cols::VALUE_1 => (v1, n1),
+            c if c == cols::VALUE_2 => (v2, n2),
+            _ => continue,
+        };
+        bump_half(traces, old, -m);
+        bump_half(traces, new, m);
+    }
+}
+
+/// An IS_WH row whose Word is split into halves that pack to the honest Word
+/// but are not both halfwords. It receives the honest `IS_WH` sends, so only its
+/// own `IS_HALFWORD` check on the bad limb can reject it — once per Word limb.
+#[test]
+fn test_is_wh_noncanonical_word_is_rejected() {
+    for limb in [cols::VALUE_1, cols::VALUE_2] {
+        assert!(
+            !prove_keccak_with(|t| resplit_word(t, limb)),
+            "IS_WH column {limb} out of range must be rejected"
+        );
+    }
+}
+
+/// Moves lane 0 of the real KECCAK row onto its own IS_WH row: IS_WH row 0
+/// gives up one send (μ = m − 1) and the first padding row takes it (μ = 1).
+/// With `noncanonical`, lane 0's `state_ptr` is also resplit as
+/// `(half_lo ^ 1, half_mid')` with the same `half_lo + 2^16·half_mid`, so the
+/// ADD and the memory address are untouched while `half_mid'` leaves
+/// `[0, 2^16)`; the new IS_WH row carries that key.
+fn move_lane_0_to_own_row(traces: &mut Traces, noncanonical: bool) {
+    let k = &mut traces.keccaks[0].main_table;
+    assert_eq!(
+        *k.get(0, keccak_cols::MU),
+        FE::one(),
+        "KECCAK row 0 is real"
+    );
+    let (lo_col, mid_col) = (keccak_cols::state_ptr(0, 0), keccak_cols::state_ptr(0, 1));
+    let (lo, mid) = (*k.get(0, lo_col), *k.get(0, mid_col));
+    let (new_lo, new_mid) = if noncanonical {
+        resplit_keeping_lo(lo, mid, FE::from(lo.canonical_u64() ^ 1))
+    } else {
+        (lo, mid)
+    };
+    k.set(0, lo_col, new_lo);
+    k.set(0, mid_col, new_mid);
+    // KECCAK's own IS_HALFWORD[half_lo] (the IS_WHH template): both in range.
+    bump_half(traces, lo, -FE::one());
+    bump_half(traces, new_lo, FE::one());
+
+    let t = &mut traces.is_whs[0].main_table;
+    assert_eq!(
+        *t.get(0, cols::VALUE_0),
+        mid,
+        "lane 0 sends IS_WH row 0's key"
+    );
+    let m = t.get(0, cols::MU).canonical_u64();
+    assert!(m >= 2, "test_keccak's 25 lanes must share a key");
+    let pad = (0..t.height)
+        .find(|&r| *t.get(r, cols::MU) == FE::zero())
+        .expect("a padding row");
+    let row_0: Vec<FE> = (0..cols::MU).map(|c| *t.get(0, c)).collect();
+    let mut new_row = row_0.clone();
+    new_row[cols::VALUE_0] = new_mid;
+    for (c, v) in new_row.iter().enumerate() {
+        t.set(pad, c, *v);
+    }
+    t.set(0, cols::MU, FE::from(m - 1));
+    t.set(pad, cols::MU, FE::one());
+
+    let b20: u64 = BusId::IsB20.into();
+    if is_wh::bus_interactions().iter().any(|bi| bi.bus_id == b20) {
+        bump_b20(traces, m, -FE::one());
+        bump_b20(traces, m - 1, FE::one());
+        bump_b20(traces, 0, -FE::one());
+        bump_b20(traces, 1, FE::one());
+    }
+    for col in is_wh_half_checked_columns() {
+        bump_half(traces, row_0[col], -FE::one());
+        bump_half(traces, new_row[col], FE::one());
+    }
+}
+
+/// Control: giving one lane its own row with the honest key is an honest
+/// witness and verifies, so the rejection below is the resplit alone.
+#[test]
+fn test_keccak_lane_on_its_own_is_wh_row_verifies() {
+    assert!(prove_keccak_with(|t| move_lane_0_to_own_row(t, false)));
+}
+
+/// A `state_ptr` resplit as `(half_lo ^ 1, half_mid')` that keeps
+/// `half_lo + 2^16·half_mid`: the ADD, the memory sends and KECCAK's
+/// `IS_HALFWORD[half_lo]` all still hold, and IS_WH has a row for the new key.
+/// Only that row's `IS_HALFWORD[value[0]]` sees `half_mid'` out of range.
+#[test]
+fn test_keccak_noncanonical_state_ptr_is_rejected() {
+    assert!(!prove_keccak_with(|t| move_lane_0_to_own_row(t, true)));
 }
