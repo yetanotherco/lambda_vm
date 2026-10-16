@@ -45,7 +45,7 @@ This relation induces the language $language subset.eq instanceSpace$ of _solvab
 where $instance in language$ if there exists a witness $witness$ for which $(instance, witness)in relation$.
 
 Lastly, we introduce the instance commitment function $c: instanceSpace to commitmentSpace$.
-Note that this commitment scheme does not involve randomness; it is a _determistic_ scheme.
+Note that this commitment scheme does not involve randomness; it is a _deterministic_ scheme.
 Randomness is typically required to make a commitment _hiding_.
 For the purposes of this discussion, we are not concerned with this property, 
 as the function will only be used for committing to public information. 
@@ -101,7 +101,7 @@ This increase in verifier computation is undesirable and should be avoided.
 A solution to this, is to leverage the following variation to the verification algorithm:
 $
   verify': commitmentSpace^2 times proofSpace: ([comm(x), comm(y)], proof) mapsto
-  verify(comm(x), proof) or verify(comm(y([comm(x), comm(y)], dot)), proof)
+  verify(comm(x), proof) or verify(comm(y([comm(x), comm(y)], dot)), proof),
 $
 where it is assumed that $comm(y([comm(x), comm(y)], dot)) in commitmentSpace$ can be constructed efficiently from $comm(x), comm(y) in commitmentSpace$.
 Now observe that setting $(comm(x), comm(y)) = (commit(instance), commit(verify'))$ yields
@@ -114,7 +114,7 @@ a) proof of $instance in language$, or
 b) proof of _the existence of a (different) proof_ that satisfies $verify'([comm(instance), comm(verify')], dot)$.
 We can now recursively expand the expression, yielding
 $
-  verify'(commit(instance), commit(verify'), proof)
+  verify'([commit(instance), commit(verify')], proof)
   &= verify(comm(instance), proof) or verify(comm(verify'([comm(instance), comm(verify')], dot)), proof)\
   &= verify(comm(instance), proof) or verify(comm(verify(comm(instance), dot) or verify(comm(verify'([comm(instance), comm(verify')]; dot)), dot)), proof)\
   &= verify(comm(instance), proof) or verify(comm(verify(comm(instance), dot) or verify(comm(verify(comm(instance), dot) or verify(comm(verify'([comm(instance), comm(verify')], dot)), dot)), dot)), proof)\
@@ -239,59 +239,67 @@ The produced proof $proof'$ now attests to $instance in language$ when
 $verify(comm(product(verify_0, verify_1)(comm(instance), dot)), proof') = 1$.
 
 = Split proving
-To enable recursion from a split verifier, we start by considering that each part of the split may
-be prove in a different proof system, and with a different commitment scheme.
-For a split verifier $(verify_0, verify_1, d_verify)$ to be recursively proven,
-we will write $comm(x)$ and $comm2(x)$ as the (deterministic) commitments to $x$
-in the proof system of $verify_0$ and $verify_1$ respectively.
+To enable recursion with a split verifier, we start by considering that each part of the split may
+be proven in a different proof system.
+We consider the case for a valid split verifier $(verify_0, verify_1, d_verify)$
+with proof functions $prove_0$ and $prove_1$.
+Since these proof systems can potentially use different commitments,
+we will write $comm(x)$ and $comm2(x)$ for a (deterministic) commitment to $x$
+in the $prove_0$ and $prove_1$ scheme respectively.
 
-If we write $verify'_(b)([c_x, c_w]; w)$ to be an adaptation of $verify_(b)(c_x; w)$ that additionally gives has a public commitment to the private witness,#footnote[
-  In practice for most proof systems, this is already available.
-  For a proof system where it is not available, we let $verify'_(b)$ explicitly verify that this relation holds.
-]
-our goal then becomes to prove the following statements in parallel:
+To then coherently prove the original verifier $verify$, our goal becomes:
 
-1. $verify'_0([comm(bb(x)), c_0]; [pi, r]) = 1$
-2. $verify'_1([comm2(bb(x)), c_1]; [pi, r]) = 1$
-3. $exists pi, r: comm([pi, r]) = c_0 and comm2([pi, r]) = c_1$
+1. $verify_0(comm(bb(x)), [proof_0, record_0]) = 1$
+2. $verify_1(comm2(bb(x)), [proof_1, record_1]) = 1$
+3. $[proof_0, record_0] = [proof_1, record_1]$
 
-The first two statements would follow naturally from proving $verify_(b)$ or the derived $verify'_(b)$.
+The first two statements would follow naturally from proving the evaluation of $verify_(b)$.
 To integrate the last statement, we introduce a "checksum" of the witness, which will be checked by both halves of the split:
-$ verify^*_(b)([x, s]; w) = verify'_(b)(x; w) dot (serif("cksum")(w) =^? s). $
+$ verify'_(b)([x, s], w) = verify_(b)(x, w) dot (serif("cksum")(w) =^? s). $
 The choice of checksum function, in turn, can depend on the choice of proof systems.
 We briefly present a few trivial instantiations, before bringing the cost down further.
 
 - $serif("cksum")(x) = serif("Hash")(x)$: compute a hash in both halves, at the cost of needing to evaluate a hash in a proof system that is likely not a good fit for that hash.
 - $serif("cksum")(x) = comm2(x)$: recompute the commitment $comm2(x)$ as part of $verify^*_0$, and let $verify^*_1$ simply check that the checksum equals the public commitment.
-  In practice, this would come at the cost of evaluating a Reed-Solomon blowup over the field of $verify_0$ and computing a merkle tree, both inside $verify^*_0$.
 
 Finally, we consider the instantiation $serif("chsum")(x) = chevron.l x, z chevron.r$ for a random zero-evader $z$.
-This could be implemented by having an additional public input provided to $verify^*_(b)$, or by having $verify^*_(b)$ itself
+This could be implemented by having an additional public input provided to $verify'_(b)$, or by having $verify'_(b)$ itself
 derive it from the public inputs and context as a Fiat-Shamir challenge.
-In either case, $z$ should not be known to the (recursion) prover before being bound to $[x, r]$ via its public commitment.
+In either case, $z$ should not be known to the (recursion) prover before being bound to both $[proof_b, record_b]$ pairs used.
 If the proof systems for the split verifier work over different fields, field emulation would need to happen on one side, with the other using native arithmetic,
-or both sides could target a common target field that is simpler to emulate in both.#footnote[
+or both sides could work in a common target field that is simpler to emulate in both.#footnote[
   In a practical implementation with flock and the lambda proof system side by side, an inner product in the goldilocks extension field should
   be possible in a repetitive binary circuit that fits well in flock's model.
 ]
-Choices for the structure of $z$ include $z = (alpha_1, alpha_2, alpha_3, ..., alpha_(|x|))$, $z = (1, alpha, alpha^2, ..., alpha^(|x| - 1))$
-or even $z = (alpha_1, alpha_1^2, ..., alpha_1^ell, alpha_2, alpha_2^2, ..., alpha_(lr(|x|)/ell)^ell)$, depending on tradeoffs between
-the verification cost of computing $z$ and the soundness error of the zero-evader.
-Where needed, multiple independent $z$ can be used to amplify soundnes.
-In settings where both $verify^*_(b)$ are in the same proof system, with the same commitment scheme, but different representations of the committed data
-(e.g. representing $pi$ as a sequence of committed bytes and as a sequence of extension field elemens),
+Choices for the structure of $z$ include $z = (1, alpha, alpha^2, ..., alpha^(lr(|x|) - 1))$ and $z = (alpha_1, alpha_2, alpha_3, ..., alpha_(|x|))$.
+The former has a soundness loss linear in the size of $x$, while the latter will require more computational
+work to derive independent challenges inside of the verifier.
+As a tradeoff, one could consider the mixture of both, through 
+$z = (alpha_1, alpha_1^2, ..., alpha_1^ell, alpha_2, alpha_2^2, ..., alpha_(lr(|x|)/ell)^ell)$, with a soundness loss $ell$ but only
+$lr(|x|)/ell$ independent challenges to derive.
+To avoid having to prove the derivation of the random challenges, they can be made into a public input.#footnote[
+  This requires a succinct description of $z$ (e.g. the single value $alpha$), as otherwise the shrinking
+  effect of providing $proof$ as private witness is lost.
+]
+Where needed, multiple independent inner products can be used to amplify soundness.
+In settings where both $verify'_(b)$ are in the same proof system, with the same commitment scheme, but different representations of the committed data
+(e.g. representing $proof$ as a sequence of committed bytes and as a sequence of extension field elements),
 one can even use a permutation argument such as in @logup to check equality of the data.
 
 #aside[Minimizing the length of $z$][
-  A larger $[pi, r]$ comes at a cost --- whether a cost of soundness or a cost of deriving more independent random $alpha_i$ ---
+  A larger $[proof, record]$ comes at a cost --- whether a cost of soundness or a cost of deriving more independent random $alpha_i$ ---
   and as such should be kept as short as possible.
-  Since values that only one $verify^*_(b)$ reads or writes cannot lead to a differing result, the checksummed data need only
-  be the subsequence of elements of $[pi, r]$ that is read or written by both $verify^*_0$ and $verify^*_1$.
+  Since values that only one $verify'_(b)$ accesses do not influence $verify'_(1-b)$, the checksummed data need only
+  be the subsequence of elements of $[proof, record]$ that is accessed by both $verify'_0$ and $verify'_1$.
 ]
-#rj[Define these as "a recursion split of $verify$" somehow to avoid more notation pain down below?]
+
+Observe that considering considering the proof
+$ proof_sans("rec") = s || prove_0(verify'_0([comm(x), s], dot); [proof, record]) || prove_1(verify'_1([comm2(x), s], dot); [proof, record]) $
+still allows us to treat the final output as a single proof, with a well-defined verifier.
+As such, it is possible to construct a split verifier for this combined proof system, and enable full split recursion.
 
 = Split recursion
-#rj[Update everything below to match differing commitments]
+#rj[Update everything below to match differing commitments (still needed if we're unifying above?)]
 With proof recursion and split verification formalized, we now combine both concepts into a unified system.
 To this end, we first introduce the selector function
 $
