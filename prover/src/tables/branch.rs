@@ -21,7 +21,8 @@
 //! - `carry[0]`, `carry[1]`: Carries from 64-bit addition
 //!
 //! ## Bus Interactions
-//! - Sender: ARE_BYTES (×1 for `[next_pc_low[1], 0]`, spec template `IS_BYTE<next_pc_low[1]>`)
+//! - Sender: ARE_BYTES (×1 for `[μ, next_pc_low[1]]`, spec `IS_BYTE<μ>` and
+//!   `IS_BYTE<next_pc_low[1]>` batched)
 //! - Sender: BYTE_ALU[AND] (×1 for masking LSB)
 //! - Sender: IS_HALFWORD (×3 for next_pc_high[0..3])
 //! - Receiver: BRANCH (provides branch targets to CPU)
@@ -30,9 +31,9 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use std::collections::HashMap;
-
-use super::types::{BusId, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
+use super::types::{
+    BusId, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op, dedup_rows,
+};
 
 // =========================================================================
 // Column indices for BRANCH table
@@ -152,18 +153,15 @@ impl BranchOperation {
 
 /// Generates the BRANCH trace table from a list of operations.
 ///
-/// Duplicate operations (same pc, offset, register, jalr) are merged into a single row
-/// with their multiplicities summed. The table is then padded to the next power of 2.
+/// Duplicate operations (same pc, offset, register, jalr) are merged into a
+/// single row with their multiplicities summed, split at
+/// [`MU_MAX`](crate::tables::types::MU_MAX) (see
+/// [`dedup_rows`]). The table is then padded
+/// to the next power of 2.
 pub fn generate_branch_trace(
     operations: &[BranchOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    // Deduplicate operations: (pc, offset, register, jalr) -> multiplicity
-    let mut op_map: HashMap<BranchOperation, u64> = HashMap::new();
-    for op in operations {
-        *op_map.entry(op.clone()).or_insert(0) += 1;
-    }
-
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let unique_ops = dedup_rows(operations);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
@@ -219,23 +217,38 @@ pub fn generate_branch_trace(
 /// Creates all bus interactions for the BRANCH table.
 ///
 /// The BRANCH table:
-/// - **Sends** ARE_BYTES lookup for next_pc_low[1] range check (Y=0)
+/// - **Sends** ARE_BYTES[μ, next_pc_low[1]]: the μ bound and the next_pc_low[1]
+///   range check, batched (both have multiplicity 1)
 /// - **Sends** BYTE_ALU[AND] lookup for LSB masking
 ///   (next_pc_low[0] = unmasked_low_byte & 254)
-/// - **Sends** IS_HALFWORD lookups for next_pc_high[0..3] range checks
+/// - **Sends** IS_HALFWORD lookups for the next_pc_high[0..3] range checks
 /// - **Receives** BRANCH lookups from CPU table
 pub fn bus_interactions() -> Vec<BusInteraction> {
     vec![
-        // ARE_BYTES[next_pc_low[1], 0] - range check bits 8-15
+        // IS_BYTE[μ], IS_BYTE[next_pc_low[1]] = ARE_BYTES[μ, next_pc_low[1]] | 1.
+        // Every lookup here fires with μ, so μ itself must be bounded and
+        // non-negative. Otherwise a μ = −1 twin of an honest row cancels it on
+        // the BRANCH bus while *receiving* its range lookups and absorbs an
+        // out-of-range IS_HALFWORD sent by any row (same as LT). Both checks
+        // have the spec's default `cond` (1), so they batch into one
+        // interaction; padding rows send ARE_BYTES[0, 0]. `next_pc_low_1` is
+        // only constrained packed (`low0 + 2^8·low1 + 2^16·high0`), so its byte
+        // check must not be weighted by μ either: with weight μ a row with μ < 0
+        // and `low1 = p−1` cancels its own (or another table's) bound on
+        // `(p−1, 0)` (`branch_carrier_poc::lt_forgery_with_branch_cycle_is_rejected`).
+        // See `types::MU_MAX`.
         BusInteraction::sender(
             BusId::AreBytes,
-            Multiplicity::Column(cols::MU),
+            Multiplicity::One,
             vec![
+                BusValue::Packed {
+                    start_column: cols::MU,
+                    packing: Packing::Direct,
+                },
                 BusValue::Packed {
                     start_column: cols::NEXT_PC_LOW_1,
                     packing: Packing::Direct,
                 },
-                BusValue::constant(0),
             ],
         ),
         // BYTE_ALU[next_pc_low[0]; AND, unmasked_low_byte, 254]

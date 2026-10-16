@@ -373,12 +373,25 @@ fn dropping_a_used_table_through_the_real_verifier_is_rejected() {
 /// on whether an unused chip shipped. The tables that do use one — CPU, HALT,
 /// PAGE, REGISTER, GLOBAL_MEMORY — are exactly the mandatory ones, and nothing
 /// enforced that this stays true.
+///
+/// One exception, by bus: `ARE_BYTES` byte checks the spec gives no `cond`
+/// (default 1) — the μ bounds of the dedup tables (spec #1017), SHIFT's
+/// `shift[0..1]` bytes and KECCAK_RND's θ/ρ bytes. A padding row sends them as
+/// `ARE_BYTES[0, 0]`, which is in range — the test checks this by requiring each
+/// value to vanish on an all-zero row (columns only, no nonzero constant term) —
+/// and their only counterparty is BITWISE, whose multiplicity columns are
+/// free witnesses, so the contribution is absorbed whichever way an unused chip
+/// went; and an optional table with no ops is never shipped
+/// (`chunk_and_generate_optional`/`generate_optional` return no table), so the
+/// collector only counts padding for instances that exist. On every other bus a
+/// constant multiplicity on a padding row would be a real receive or send.
 #[test]
 fn no_optional_table_uses_a_constant_multiplicity() {
     use crate::tables::{
         branch, bytewise, commit, cpu32, dvrm, ecdas, ecsm, eq, hint, keccak, keccak_rnd, load, lt,
         memw, memw_aligned, mul, shift, store,
     };
+    use stark::lookup::{BusValue, LinearTerm};
     let optional: [(&str, Vec<stark::lookup::BusInteraction>); 18] = [
         ("LT", lt::bus_interactions()),
         ("MEMW", memw::bus_interactions()),
@@ -405,8 +418,17 @@ fn no_optional_table_uses_a_constant_multiplicity() {
             "{name} declares no bus interactions"
         );
         for (i, interaction) in interactions.iter().enumerate() {
+            let zero_on_padding = interaction.values.iter().all(|value| match value {
+                BusValue::Packed { .. } => true,
+                BusValue::Linear(terms) => terms
+                    .iter()
+                    .all(|term| !matches!(term, LinearTerm::Constant(c) if *c != 0)),
+            });
+            let byte_check = interaction.bus_id == u64::from(crate::tables::types::BusId::AreBytes)
+                && interaction.is_sender
+                && zero_on_padding;
             assert!(
-                !matches!(interaction.multiplicity, stark::lookup::Multiplicity::One),
+                byte_check || !matches!(interaction.multiplicity, stark::lookup::Multiplicity::One),
                 "{name} interaction {i} uses a constant multiplicity, so its padding rows \
                  contribute and dropping the table stops being equivalent to shipping it empty"
             );

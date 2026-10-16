@@ -23,6 +23,7 @@
 //!
 //! ## Bus Interactions
 //! - Sender: IS_HALF (×20: n, d, r, n_sub_r, q)
+//! - Sender: ARE_BYTES (×1: `[μ_q, μ_r]`, the batched multiplicity bounds)
 //! - Sender: MSB16 (×3 for sign extraction: n, d, r)
 //! - Sender: ALU (×3, on the unified bus: ×1 LT-flavored for `|r| < |d|`,
 //!   ×2 MUL-flavored for `n - r = d * q` lo/hi)
@@ -35,7 +36,7 @@ use stark::trace::TraceTable;
 use std::collections::HashMap;
 
 use super::types::{
-    BusId, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
+    BusId, GoldilocksExtension, GoldilocksField, MU_MAX, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
     NEG_INV_2_64, SHIFT_16, VmTable, alu_op,
 };
 
@@ -273,19 +274,20 @@ impl DvrmOperation {
 // Trace generation
 // =========================================================================
 
-/// Generates the DVRM trace table from a list of operations.
+/// Deduplicates DVRM operations into trace rows: `(n, d, signed) -> (μ_q, μ_r)`,
+/// splitting an op over several rows when a count exceeds [`MU_MAX`]. Shared by
+/// trace generation and the BITWISE collector so the per-row lookups they count
+/// cannot drift apart.
 ///
-/// Operations are deduplicated by (n, d, signed).
-/// Each unique operation tracks separate multiplicities for quotient and remainder lookups.
-///
-/// # Arguments
-/// * `operations` - List of (DvrmOperation, wants_remainder) pairs
-pub fn generate_dvrm_trace(
+/// `μ_q` and `μ_r` are each range-checked to a byte by `IS_BYTE[μ_q]` and
+/// `IS_BYTE[μ_r]`, batched into one `ARE_BYTES[μ_q, μ_r]` with multiplicity 1.
+/// The bound is what makes `μ_q + μ_r = 0` imply `μ_q = μ_r = 0`: without it a
+/// `μ_q = 1, μ_r = −1` row receives a quotient lookup while sending none of its
+/// checks (forged `n = q·d + r`).
+pub fn dedup_dvrm_rows(
     operations: &[(DvrmOperation, bool)],
-) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    // Deduplicate: (n, d, signed) -> (mu_q, mu_r)
+) -> Vec<(DvrmOperation, DvrmMultiplicities)> {
     let mut op_map: HashMap<DvrmOperation, DvrmMultiplicities> = HashMap::new();
-
     for (op, wants_remainder) in operations {
         let entry = op_map.entry(op.clone()).or_default();
         if *wants_remainder {
@@ -295,7 +297,32 @@ pub fn generate_dvrm_trace(
         }
     }
 
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let mut rows = Vec::with_capacity(op_map.len());
+    for (op, mut left) in op_map {
+        while left.mu_q > 0 || left.mu_r > 0 {
+            let row = DvrmMultiplicities {
+                mu_q: left.mu_q.min(MU_MAX),
+                mu_r: left.mu_r.min(MU_MAX),
+            };
+            left.mu_q -= row.mu_q;
+            left.mu_r -= row.mu_r;
+            rows.push((op.clone(), row));
+        }
+    }
+    rows
+}
+
+/// Generates the DVRM trace table from a list of operations.
+///
+/// Operations are deduplicated by (n, d, signed) (see [`dedup_dvrm_rows`]).
+/// Each unique operation tracks separate multiplicities for quotient and remainder lookups.
+///
+/// # Arguments
+/// * `operations` - List of (DvrmOperation, wants_remainder) pairs
+pub fn generate_dvrm_trace(
+    operations: &[(DvrmOperation, bool)],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let unique_ops = dedup_dvrm_rows(operations);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
@@ -357,6 +384,7 @@ pub fn generate_dvrm_trace(
 ///
 /// The DVRM table:
 /// - **Sends** IS_HALF lookups for n, d, q, r, n_sub_r range checks (×20)
+/// - **Sends** ARE_BYTES[μ_q, μ_r] to bound the multiplicities
 /// - **Sends** MSB16 lookups for sign extraction (×3: n, d, r)
 /// - **Sends** LT lookup for |r| < |d| (×1)
 /// - **Sends** MUL lookups for n_sub_r = d * q verification (×2: lo and hi)
@@ -364,6 +392,30 @@ pub fn generate_dvrm_trace(
 /// - **Receives** DVRM lookups from CPU table (×2: quotient and remainder)
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::new();
+
+    // -------------------------------------------------------------------------
+    // IS_BYTE[μ_q], IS_BYTE[μ_r] = ARE_BYTES[μ_q, μ_r] | 1.
+    // Every check below fires with μ_q + μ_r, so the multiplicities themselves
+    // must be bounded and non-negative. Otherwise μ_q = 1, μ_r = −1 receives a
+    // quotient lookup with all checks off (forged quotient),
+    // and an honest μ_r = 1 copy of the row cancels the stray −1.
+    // Both checks share the spec's default `cond` (1), so they batch into one
+    // interaction; padding rows send ARE_BYTES[0, 0]. See `MU_MAX`.
+    // -------------------------------------------------------------------------
+    interactions.push(BusInteraction::sender(
+        BusId::AreBytes,
+        Multiplicity::One,
+        vec![
+            BusValue::Packed {
+                start_column: cols::MU_Q,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::MU_R,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
 
     // -------------------------------------------------------------------------
     // DVRM-A1.i: IS_HALF[n[i]] (×4) and DVRM-A2.i: IS_HALF[d[i]] (×4),

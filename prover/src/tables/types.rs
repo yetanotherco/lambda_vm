@@ -475,6 +475,49 @@ pub const NEG_INV_2_112: u64 = 18446462594437939201;
 pub const NEG_INV_2_128: u64 = 18446744065119617026;
 
 // =========================================================================
+// Multiplicity bound of the deduplicated tables
+// =========================================================================
+
+/// Largest per-row multiplicity of a deduplicated table (LT, BYTEWISE, MUL, DVRM,
+/// BRANCH): each `μ` is range-checked to a byte by `IS_BYTE[μ]` (an `ARE_BYTES`
+/// send with multiplicity 1, the spec's default `cond`), so a row holds at most
+/// this many lookups. The bound is what keeps μ non-negative: without it a
+/// `μ = −1` twin of an honest row cancels it on the ALU bus while *receiving*
+/// its range lookups, which absorbs another row's out-of-range limb (a forged
+/// `5 < 3 = 1` verified).
+///
+/// The bound is sent with multiplicity 1, not μ. A `μ < 0` row then leaves `+1`
+/// on an out-of-range tuple, which nothing can cancel as long as no ARE_BYTES
+/// sender carries a negative weight (each one is `1` or a bit-constrained μ).
+/// Weighted by μ, the bound was itself that negative weight, and a real BRANCH
+/// row with a non-canonical `next_pc_low_1 = p−1` cancelled it
+/// (`branch_carrier_poc`).
+///
+/// It is `u8::MAX` so the BITWISE collectors can send each μ as a byte.
+pub const MU_MAX: u64 = u8::MAX as u64;
+
+/// Deduplicates operations into trace rows: `op -> μ`, splitting an op over
+/// several rows when its count exceeds [`MU_MAX`]. Shared by trace generation
+/// and the BITWISE collectors of LT, BYTEWISE and BRANCH so the per-row lookups
+/// they count cannot drift apart.
+pub fn dedup_rows<T: std::hash::Hash + Eq + Clone>(operations: &[T]) -> Vec<(T, u64)> {
+    let mut op_map: std::collections::HashMap<T, u64> = std::collections::HashMap::new();
+    for op in operations {
+        *op_map.entry(op.clone()).or_insert(0) += 1;
+    }
+
+    let mut rows = Vec::with_capacity(op_map.len());
+    for (op, mut left) in op_map {
+        while left > 0 {
+            let mu = left.min(MU_MAX);
+            left -= mu;
+            rows.push((op.clone(), mu));
+        }
+    }
+    rows
+}
+
+// =========================================================================
 // ALU operation descriptors
 // =========================================================================
 
