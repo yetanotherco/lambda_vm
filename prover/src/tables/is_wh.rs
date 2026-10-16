@@ -24,9 +24,9 @@
 //! `μ` lives in the field, so `μ = −1` would turn a row from receiver into
 //! sender: it could cancel a forged `IS_WH` send while also receiving the row's
 //! own `IS_HALFWORD` checks. The `IS_B20[μ]` send (multiplicity 1, so it is not
-//! itself flipped by `μ`) pins `μ ∈ [0, 2^20)`. A pair sent more than [`MU_MAX`]
-//! times is split over several rows (see [`dedup_is_wh_rows`]). Padding rows send
-//! `IS_B20[0]`, which the BITWISE collector counts (see
+//! itself flipped by `μ`) pins `μ ∈ [0, 2^20)`. A pair sent more than
+//! [`IS_WH_MU_MAX`] times is split over several rows (see [`dedup_is_wh_rows`]).
+//! Padding rows send `IS_B20[0]`, which the BITWISE collector counts (see
 //! [`collect_bitwise_from_is_wh`]).
 //!
 //! The table has no polynomial constraints.
@@ -54,7 +54,7 @@ pub mod cols {
 }
 
 /// Largest multiplicity a single row may carry: `μ` is a `B20`.
-pub const MU_MAX: u64 = (1 << 20) - 1;
+pub const IS_WH_MU_MAX: u64 = (1 << 20) - 1;
 
 /// A `(Word, Half)` pair as it travels on the `IsWh` bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -76,9 +76,10 @@ impl IsWhKey {
 }
 
 /// Deduplicates `IS_WH` sends into trace rows: `(key) -> μ`, splitting a key
-/// over several rows when its count exceeds [`MU_MAX`]. Rows come out sorted by
-/// key so the trace is deterministic. The trace builder calls it once and hands
-/// the same rows to [`generate_is_wh_trace`] and [`collect_bitwise_from_is_wh`].
+/// over several rows when its count exceeds [`IS_WH_MU_MAX`]. Rows come out
+/// sorted by key so the trace is deterministic. The trace builder calls it once
+/// and hands the same rows to [`generate_is_wh_trace`] and
+/// [`collect_bitwise_from_is_wh`].
 pub fn dedup_is_wh_rows(keys: impl IntoIterator<Item = IsWhKey>) -> Vec<(IsWhKey, u64)> {
     let mut counts: BTreeMap<IsWhKey, u64> = BTreeMap::new();
     for key in keys {
@@ -88,7 +89,7 @@ pub fn dedup_is_wh_rows(keys: impl IntoIterator<Item = IsWhKey>) -> Vec<(IsWhKey
     let mut rows = Vec::with_capacity(counts.len());
     for (key, mut left) in counts {
         while left > 0 {
-            let mu = left.min(MU_MAX);
+            let mu = left.min(IS_WH_MU_MAX);
             left -= mu;
             rows.push((key, mu));
         }

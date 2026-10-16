@@ -207,8 +207,9 @@ impl TableCounts {
         // lets an inflated count through whenever another count is
         // lowered to match; this pins the per-field shape instead. It is not
         // load-bearing for memory safety — both verifiers run the cross-check
-        // before any count sizes an AIR set — and if one of them ever becomes
-        // chunked, this list is what changes.
+        // before any count sizes an AIR set. For the accelerators it is only
+        // shape, and if one of them ever becomes chunked, this list is what
+        // changes. IS_WH is the exception, see its entry.
         let at_most_one = [
             ("keccak", self.keccak),
             ("keccak_rnd", self.keccak_rnd),
@@ -216,9 +217,11 @@ impl TableCounts {
             ("ecdas", self.ecdas),
             ("hint", self.hint),
             ("commit", self.commit),
-            // Also what bounds the IS_WH multiplicity sum per proof: one table
-            // of at most 2^k rows, each μ < 2^20, stays far below p, so no
-            // stack of repeated rows reaches μ = −1 (spec verifier.typ TODO).
+            // Load-bearing for soundness: this is what bounds the IS_WH
+            // multiplicity sum per proof. One table of at most 2^k rows, each
+            // μ < 2^20, stays far below p, so no stack of repeated rows reaches
+            // μ = −1 (spec verifier.typ TODO). Chunking IS_WH needs a bound on
+            // its total row count in place of this one.
             ("is_wh", self.is_wh),
         ];
         for (name, count) in at_most_one {
