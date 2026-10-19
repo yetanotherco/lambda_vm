@@ -12,20 +12,30 @@
 //! `a0 = 0` and proves `exit(0)`. The spec makes the timestamp a preprocessed
 //! column (`4 * (i + 1)`), which leaves the prover no room for `ts_A + 1`.
 //!
+//! The forged run is shifted by −3 from B on, so two verifier pins reject it:
+//! the TIMESTAMP column is not the preprocessed one, and the PC chain ends at
+//! `4·N − 2` instead of the verifier-known `4·N + 1` REGISTER consumes x255 at.
+//! The tests build the forgery against the pins the prover would choose (its own
+//! TIMESTAMP root and final PC timestamp, as before the fix) and swap the honest
+//! pins back one at a time, so each rejection has a single cause.
+//!
 //! Production proof options, as in `halt_pc_forgery_poc`.
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use executor::elf::Elf;
 use executor::vm::logs::Log;
+use stark::config::Commitment;
+use stark::proof::view::MultiProofView;
 use stark::prover::{IsStarkProver, Prover};
+use stark::verifier::{IsStarkVerifier, Verifier};
 
 use super::halt_pc_forgery_poc::{opts, run_logs};
 use crate::statement::{StatementKind, absorb_statement};
-use crate::tables::cpu::{CpuOperation, cols as cpu_cols};
-use crate::tables::decode;
+use crate::tables::cpu::{self, CpuOperation, cols as cpu_cols};
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::VmTable;
-use crate::test_utils::{E, asm_elf_bytes};
+use crate::tables::{decode, register};
+use crate::test_utils::{E, asm_elf_bytes, create_cpu_air, create_register_air};
 use crate::{MaxRowsConfig, VmAirs, VmProof};
 
 const GUEST: &str = "poc_pc_double_read";
@@ -98,8 +108,7 @@ struct Tamper {
     /// Overwrite every CPU `TIMESTAMP` cell with the trace the builder wrote before
     /// the fix: the ops' own timestamps on the real rows, then padding continuing
     /// the +4 cadence from the last real row. With `double_read` this is exactly the
-    /// CPU trace that verified on the base. TIMESTAMP is now preprocessed, so the
-    /// column no longer matches the commitment the verifier expects.
+    /// CPU trace that verified on the base.
     timestamp_column: bool,
 }
 
@@ -108,16 +117,34 @@ const FULL_ATTACK: Tamper = Tamper {
     timestamp_column: true,
 };
 
-fn craft_proof(
-    elf_bytes: &[u8],
-    ops: Vec<CpuOperation>,
-    tamper: Tamper,
-) -> Result<VmProof, stark::prover::ProvingError> {
+/// What the CPU table's TIMESTAMP column and REGISTER's x255 final token are
+/// pinned to. The verifier always uses [`Crafted::honest`]; the forgery is
+/// committed against [`Crafted::forged`].
+#[derive(Clone, Copy)]
+struct Pins {
+    timestamp_root: Commitment,
+    final_pc_ts: u64,
+}
+
+/// A traced run, ready to be proven and verified against chosen pins.
+struct Crafted {
+    elf_bytes: Vec<u8>,
+    program: Elf,
+    traces: Traces,
+    /// The verifier's pins: the preprocessed `4·(i + 1)` column and `4·N + 1`.
+    honest: Pins,
+    /// The pins the trace itself implies: the root of its TIMESTAMP column and the
+    /// timestamp its last row writes `next_pc` at.
+    forged: Pins,
+}
+
+fn craft(elf_bytes: &[u8], ops: Vec<CpuOperation>, tamper: Tamper) -> Crafted {
     let options = opts();
     let program = Elf::load(elf_bytes).expect("ELF load");
-    let max_rows = MaxRowsConfig::default();
     let timestamps: Vec<u64> = ops.iter().map(|op| op.timestamp).collect();
-    let mut traces = Traces::from_elf_and_cpu_ops(&program, ops, &max_rows).expect("trace build");
+    let mut traces = Traces::from_elf_and_cpu_ops(&program, ops, &MaxRowsConfig::default())
+        .expect("trace build");
+    assert_eq!(traces.cpus.len(), 1, "one CPU table");
     let cpu = &mut traces.cpus[0].main_table;
     if tamper.double_read {
         cpu.set_bool(0, cpu_cols::PC_DOUBLE_READ, true);
@@ -135,70 +162,145 @@ fn craft_proof(
             cpu.set_u64(row, cpu_cols::TIMESTAMP, ts);
         }
     }
-
-    let table_counts = traces.table_counts();
-    let airs = VmAirs::new(
-        &program,
-        &options,
-        false,
-        &traces.page_configs,
-        &table_counts,
-        &crate::cpu_heights_from_traces(&traces),
-        None,
-        true,
-        None,
-        crate::test_utils::trace_register_commitment(
-            &options,
-            &crate::tables::register::register_init_from_entry_point(program.entry_point),
-            &traces,
-        ),
-    );
-    let runtime_page_ranges = traces.runtime_page_ranges();
-
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb_statement(
-        &mut transcript,
-        StatementKind::Monolithic,
-        elf_bytes,
-        &traces.public_output_bytes,
-        &table_counts,
-        0,
-        &runtime_page_ranges,
-        options.fri_final_poly_log_degree,
-    );
-
-    let proof = Prover::multi_prove(
-        airs.air_trace_pairs(&mut traces),
-        &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )?;
-
-    Ok(VmProof {
-        proof,
-        runtime_page_ranges,
-        table_counts,
-        public_output: traces.public_output_bytes.clone(),
-        num_private_input_pages: 0,
-    })
+    let height = cpu.height;
+    let column: Vec<_> = (0..height)
+        .map(|row| *cpu.get(row, cpu_cols::TIMESTAMP))
+        .collect();
+    let last_ts = column.last().expect("non-empty table").to_raw();
+    let honest = Pins {
+        timestamp_root: cpu::timestamp_commitment(&options, height),
+        final_pc_ts: cpu::final_pc_timestamp(height as u64),
+    };
+    let forged = Pins {
+        timestamp_root: cpu::commit_timestamp_column(&options, &column),
+        final_pc_ts: last_ts + 1,
+    };
+    Crafted {
+        elf_bytes: elf_bytes.to_vec(),
+        program,
+        traces,
+        honest,
+        forged,
+    }
 }
 
-/// Did the verifier accept the crafted proof?
-///
-/// Only a tamper of the preprocessed TIMESTAMP column may be refused by the
-/// prover, and only for its commitment. Which layer fires depends on the
-/// precomputed-tree cache (`crypto/stark/src/prover.rs`): cold, the prover rebuilds
-/// the forged column's tree, the root disagrees and it refuses with
-/// `PrecomputedCommitmentMismatch`; warm (an honest proof of the same height ran
-/// earlier in the process), it substitutes the honest tree and leaves the verifier
-/// to reject. Every other crafted proof must build, so its rejection comes from
-/// the verifier.
-fn accepted(
-    crafted: Result<VmProof, stark::prover::ProvingError>,
+impl Crafted {
+    /// The production AIR set with the CPU TIMESTAMP root and the REGISTER final
+    /// PC timestamp replaced by `pins`.
+    fn airs(&self, pins: Pins) -> VmAirs {
+        let options = opts();
+        let table_counts = self.traces.table_counts();
+        let mut airs = VmAirs::new(
+            &self.program,
+            &options,
+            false,
+            &self.traces.page_configs,
+            &table_counts,
+            &crate::cpu_heights_from_traces(&self.traces),
+            None,
+            true,
+            None,
+            self.register_commitment(),
+        );
+        airs.cpus[0] = Box::new(
+            create_cpu_air(&options, 0)
+                .with_name("CPU[0]")
+                .with_preprocessed(pins.timestamp_root, cpu::NUM_PRECOMPUTED_COLS),
+        );
+        airs.register = Box::new(
+            create_register_air(&options, pins.final_pc_ts)
+                .with_preprocessed(self.register_commitment(), register::NUM_PREPROCESSED_COLS),
+        );
+        airs
+    }
+
+    fn register_commitment(&self) -> Commitment {
+        crate::test_utils::trace_register_commitment(
+            &opts(),
+            &register::register_init_from_entry_point(self.program.entry_point),
+            &self.traces,
+        )
+    }
+
+    fn transcript(&self) -> DefaultTranscript<E> {
+        let mut transcript = DefaultTranscript::<E>::new(&[]);
+        absorb_statement(
+            &mut transcript,
+            StatementKind::Monolithic,
+            &self.elf_bytes,
+            &self.traces.public_output_bytes,
+            &self.traces.table_counts(),
+            0,
+            &self.traces.runtime_page_ranges(),
+            opts().fri_final_poly_log_degree,
+        );
+        transcript
+    }
+
+    /// Prove against `pins`. The CPU TIMESTAMP root is whatever `pins` says, so
+    /// with `forged` pins the prover commits its own column consistently.
+    fn prove(mut self, pins: Pins) -> (Self, Result<VmProof, stark::prover::ProvingError>) {
+        let airs = self.airs(pins);
+        let mut transcript = self.transcript();
+        let proof = Prover::multi_prove(
+            airs.air_trace_pairs(&mut self.traces),
+            &mut transcript,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )
+        .map(|proof| VmProof {
+            proof,
+            runtime_page_ranges: self.traces.runtime_page_ranges(),
+            table_counts: self.traces.table_counts(),
+            public_output: self.traces.public_output_bytes.clone(),
+            num_private_input_pages: 0,
+        });
+        (self, proof)
+    }
+
+    /// Verify `proof` against `pins`, with every other check of the production
+    /// verifier.
+    fn verifies(&self, proof: &VmProof, pins: Pins) -> bool {
+        let airs = self.airs(pins);
+        let refs = airs.air_refs();
+        let view = MultiProofView::Owned(&proof.proof);
+        let Some(expected) = crate::compute_expected_commit_bus_balance_view(
+            &refs,
+            view,
+            &proof.public_output,
+            0,
+            &mut self.transcript(),
+        ) else {
+            return false;
+        };
+        Verifier::multi_verify_views(&refs, view, &mut self.transcript(), &expected)
+    }
+}
+
+/// The forgery, proven against the pins it implies (what a free TIMESTAMP and a
+/// prover-chosen final PC timestamp allowed before the fix).
+fn forged_proof(tamper: Tamper) -> (Crafted, VmProof) {
+    let elf = asm_elf_bytes(GUEST);
+    let program = Elf::load(&elf).unwrap();
+    let crafted = craft(&elf, forged_ops(&program, &run_logs(&elf)), tamper);
+    let pins = crafted.forged;
+    let (crafted, proof) = crafted.prove(pins);
+    (
+        crafted,
+        proof.expect("the forgery is consistent with its own pins"),
+    )
+}
+
+/// A verdict of the production verifier. A prover refusal counts as "not
+/// accepted" only when it is the preprocessed TIMESTAMP root disagreeing with the
+/// forged column (cold precomputed-tree cache; with a warm cache the honest tree is
+/// substituted and the verifier rejects instead).
+fn production_accepts(
+    proof: Result<VmProof, stark::prover::ProvingError>,
     elf: &[u8],
     tamper: Tamper,
 ) -> bool {
-    match crafted {
+    match proof {
         Ok(proof) => crate::verify_with_options(&proof, elf, &opts(), None, None)
             .expect("verifier must not error"),
         Err(e) => {
@@ -221,13 +323,14 @@ fn accepted(
 fn poc_control_patched_program_verifies() {
     let patched = patched_elf(&asm_elf_bytes(GUEST));
     let program = Elf::load(&patched).unwrap();
-    let ops = honest_ops(&program, &run_logs(&patched));
-    let tamper = Tamper::default();
-    assert!(accepted(
-        craft_proof(&patched, ops, tamper),
+    let crafted = craft(
         &patched,
-        tamper
-    ));
+        honest_ops(&program, &run_logs(&patched)),
+        Tamper::default(),
+    );
+    let pins = crafted.honest;
+    let (_, proof) = crafted.prove(pins);
+    assert!(production_accepts(proof, &patched, Tamper::default()));
 }
 
 /// NEGATIVE CONTROL: `exit(5)` honestly is rejected (x10 != 0 at HALT).
@@ -235,55 +338,76 @@ fn poc_control_patched_program_verifies() {
 fn poc_control_honest_exit_five_is_rejected() {
     let elf = asm_elf_bytes(GUEST);
     let program = Elf::load(&elf).unwrap();
-    let ops = honest_ops(&program, &run_logs(&elf));
-    let tamper = Tamper::default();
-    assert!(!accepted(craft_proof(&elf, ops, tamper), &elf, tamper));
+    let crafted = craft(
+        &elf,
+        honest_ops(&program, &run_logs(&elf)),
+        Tamper::default(),
+    );
+    let pins = crafted.honest;
+    let (_, proof) = crafted.prove(pins);
+    assert!(!production_accepts(proof, &elf, Tamper::default()));
 }
 
-/// NEGATIVE CONTROL: the forged run without `pc_double_read` is rejected. On the
-/// base, where the builder wrote the forged timestamps into the TIMESTAMP column,
-/// B then read the PC at `ts_A - 2`, where no token was written: this isolated the
-/// double-read bit as the lever. The TIMESTAMP column is left as the builder
-/// writes it (the preprocessed `4·(i + 1)`), so the proof builds and the verifier
-/// rejects it.
+/// THE BUG, as it was before the fix: against the pins the prover chooses, the
+/// forged `exit(0)` is a valid proof. Everything but the two pins is the
+/// production verifier.
 #[test]
-fn poc_control_stale_read_without_double_read_is_rejected() {
-    let elf = asm_elf_bytes(GUEST);
-    let program = Elf::load(&elf).unwrap();
-    let ops = forged_ops(&program, &run_logs(&elf));
-    let tamper = Tamper::default();
-    assert!(!accepted(craft_proof(&elf, ops, tamper), &elf, tamper));
+fn poc_forgery_verifies_against_prover_chosen_pins() {
+    let (crafted, proof) = forged_proof(FULL_ATTACK);
+    assert_ne!(crafted.forged.timestamp_root, crafted.honest.timestamp_root);
+    assert_eq!(crafted.forged.final_pc_ts + 3, crafted.honest.final_pc_ts);
+    assert!(crafted.verifies(&proof, crafted.forged));
 }
 
-/// THE BUG, with the exact CPU trace that verified on the base: B at `ts_A + 1`
-/// with `pc_double_read = 1` reads `a0` before A writes it, turning `exit(5)` into
-/// `exit(0)`. Two independent pins now reject it: the TIMESTAMP column is not the
-/// preprocessed `4·(i + 1)` (the prover refuses it, or the verifier rejects its
-/// openings), and the forged PC chain, shifted by −3, ends at `4·N − 2` instead of
-/// the verifier-known `4·N + 1` REGISTER consumes x255 at.
+/// NEGATIVE CONTROL: the same forgery without `pc_double_read` is rejected even
+/// against the prover-chosen pins — B reads the PC at `ts_A - 2`, where no token
+/// was written. The double-read bit is the lever.
+#[test]
+fn poc_control_forgery_without_double_read_is_rejected() {
+    let (crafted, proof) = forged_proof(Tamper {
+        double_read: false,
+        ..FULL_ATTACK
+    });
+    assert!(!crafted.verifies(&proof, crafted.forged));
+}
+
+/// The preprocessed TIMESTAMP alone rejects the forgery: only the CPU root is
+/// switched back to the verifier's `4·(i + 1)`.
+#[test]
+fn preprocessed_timestamp_alone_rejects_the_forgery() {
+    let (crafted, proof) = forged_proof(FULL_ATTACK);
+    let pins = Pins {
+        timestamp_root: crafted.honest.timestamp_root,
+        ..crafted.forged
+    };
+    assert!(!crafted.verifies(&proof, pins));
+}
+
+/// The final PC pin alone rejects the forgery: only REGISTER's x255 final token
+/// is moved back to the verifier's `4·N + 1`.
+#[test]
+fn final_pc_pin_alone_rejects_the_forgery() {
+    let (crafted, proof) = forged_proof(FULL_ATTACK);
+    let pins = Pins {
+        final_pc_ts: crafted.honest.final_pc_ts,
+        ..crafted.forged
+    };
+    assert!(!crafted.verifies(&proof, pins));
+}
+
+/// THE BUG through the production prover and verifier: the exact CPU trace that
+/// verified on the base is rejected (the prover refuses its TIMESTAMP column, or
+/// the verifier rejects the proof).
 #[test]
 fn stale_register_read_via_pc_double_read_is_rejected() {
     let elf = asm_elf_bytes(GUEST);
     let program = Elf::load(&elf).unwrap();
-    let ops = forged_ops(&program, &run_logs(&elf));
+    let crafted = craft(&elf, forged_ops(&program, &run_logs(&elf)), FULL_ATTACK);
+    let pins = crafted.honest;
+    let (_, proof) = crafted.prove(pins);
     assert!(
-        !accepted(craft_proof(&elf, ops, FULL_ATTACK), &elf, FULL_ATTACK),
+        !production_accepts(proof, &elf, FULL_ATTACK),
         "SOUNDNESS BUG: a row with pc_double_read = 1 one timestamp after the \
          previous row read a register before that row wrote it (exit(5) -> exit(0))"
     );
-}
-
-/// THE BUG with the CPU `TIMESTAMP` column left as the preprocessed `4·(i + 1)`:
-/// the other tables still see the forged timestamps, so the buses do not balance
-/// and the verifier rejects a proof the prover builds without complaint.
-#[test]
-fn stale_register_read_with_honest_timestamp_column_is_rejected() {
-    let elf = asm_elf_bytes(GUEST);
-    let program = Elf::load(&elf).unwrap();
-    let ops = forged_ops(&program, &run_logs(&elf));
-    let tamper = Tamper {
-        timestamp_column: false,
-        ..FULL_ATTACK
-    };
-    assert!(!accepted(craft_proof(&elf, ops, tamper), &elf, tamper));
 }

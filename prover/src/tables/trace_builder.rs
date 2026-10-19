@@ -4191,7 +4191,8 @@ impl Traces {
     /// `main_area` — for apples-to-apples comparison with other zkVMs.
     ///
     /// Preprocessed columns (committed in a separate PCS round during setup, not at
-    /// proving time) are excluded: BITWISE (11), DECODE (5), REGISTER (3), PAGE (2).
+    /// proving time) are excluded: BITWISE (11), DECODE (5), REGISTER (4), PAGE (2),
+    /// CPU (1, `TIMESTAMP`).
     pub fn total_field_elements(&self) -> u64 {
         use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
         use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
@@ -4260,7 +4261,7 @@ impl Traces {
 
         let mut total: u64 = 0;
         for t in cpus {
-            total += (t.num_rows() * CPU_COLS) as u64;
+            total += (t.num_rows() * (CPU_COLS - super::cpu::NUM_PRECOMPUTED_COLS)) as u64;
         }
         total += (bitwise.num_rows() * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64;
         for t in lts {

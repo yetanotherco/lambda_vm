@@ -94,7 +94,7 @@ pub fn validate_heights(heights: &[usize]) -> Result<(), Error> {
     for &h in heights {
         if !h.is_power_of_two() || !(4..=super::max_rows::CPU).contains(&h) {
             return Err(Error::InvalidTableCounts(format!(
-                "CPU table height {h} is not a power of two in [4, {}]",
+                "CPU table height must be a power of two in [4, {}], got {h}",
                 super::max_rows::CPU
             )));
         }
@@ -106,6 +106,17 @@ pub fn validate_heights(heights: &[usize]) -> Result<(), Error> {
         )));
     }
     Ok(())
+}
+
+/// The CPU table heights the trace builder produces for `rows` executed cycles
+/// split into chunks of `max_rows_cpu`: full chunks, then the last one padded to
+/// a power of two (at least 4). Lets the prover check [`validate_heights`] right
+/// after execution, before building any trace.
+pub fn table_heights(rows: usize, max_rows_cpu: usize) -> Vec<usize> {
+    (0..rows)
+        .step_by(max_rows_cpu.max(1))
+        .map(|start| (rows - start).min(max_rows_cpu).next_power_of_two().max(4))
+        .collect()
 }
 
 /// Checks a prover's CPU chunk size before execution: every CPU table but the
@@ -130,13 +141,17 @@ pub fn timestamp_commitment(options: &ProofOptions, height: usize) -> Commitment
     {
         return commitment;
     }
-    log::warn!(
-        "CPU timestamp commitment not static for (blowup={}, coset={}, height={height}); \
-         falling back to recompute. Add it to `CPU_TIMESTAMP_COMMITMENTS` by running \
-         `cargo run --bin compute_static_commitments --release`.",
-        options.blowup_factor,
-        options.coset_offset,
-    );
+    // Once per process: the verifier asks for one commitment per CPU table.
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        log::warn!(
+            "CPU timestamp commitment not static for (blowup={}, coset={}); \
+             falling back to recompute. Add it to `CPU_TIMESTAMP_COMMITMENTS` by running \
+             `cargo run --bin compute_static_commitments --release`.",
+            options.blowup_factor,
+            options.coset_offset,
+        );
+    });
     compute_timestamp_commitment(options, height)
 }
 
@@ -147,12 +162,18 @@ pub fn compute_timestamp_commitment(options: &ProofOptions, height: usize) -> Co
     let column: Vec<FE> = (0..height as u64)
         .map(|i| FE::from(TIMESTAMP_STRIDE * (i + 1)))
         .collect();
-    let poly = Polynomial::interpolate_fft::<GoldilocksField>(&column)
+    commit_timestamp_column(options, &column)
+}
+
+/// Commits a CPU `TIMESTAMP` column as the prover commits a table's precomputed
+/// columns. Soundness tests use it to commit a forged column.
+pub(crate) fn commit_timestamp_column(options: &ProofOptions, column: &[FE]) -> Commitment {
+    let poly = Polynomial::interpolate_fft::<GoldilocksField>(column)
         .expect("FFT interpolation failed for CPU timestamp column");
     let lde = evaluate_polynomial_on_lde_domain(
         &poly,
         options.blowup_factor as usize,
-        height,
+        column.len(),
         &FE::from(options.coset_offset),
     )
     .expect("LDE evaluation failed for CPU timestamp column");
@@ -776,17 +797,22 @@ fn res_cast_wl() -> BusValue {
     }
 }
 
-/// `timestamp + ts_base + offset`: a timestamp slot of this row as one bus
-/// element (the low word; the high word is 0, CPU timestamps fit in 32 bits).
-fn timestamp_slot(ts_base: u64, offset: i64) -> BusValue {
+/// `timestamp + ts_base + offset` as linear terms.
+fn timestamp_terms(ts_base: u64, offset: i64) -> Vec<LinearTerm> {
     let base = i64::try_from(ts_base).expect("CPU timestamp base fits in i64");
-    BusValue::linear(vec![
+    vec![
         LinearTerm::Column {
             coefficient: 1,
             column: cols::TIMESTAMP,
         },
         LinearTerm::Constant(base + offset),
-    ])
+    ]
+}
+
+/// `timestamp + ts_base + offset`: a timestamp slot of this row as one bus
+/// element (the low word; the high word is 0, CPU timestamps fit in 32 bits).
+fn timestamp_slot(ts_base: u64, offset: i64) -> BusValue {
+    BusValue::linear(timestamp_terms(ts_base, offset))
 }
 
 /// Returns the bus interactions for a CPU table whose timestamps start at
@@ -968,18 +994,12 @@ pub fn bus_interactions(ts_base: u64) -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     let pc_mult = Multiplicity::One;
     // prev_ts = ts_base + timestamp - 3*(1 - pc_double_read)
-    let base = i64::try_from(ts_base).expect("CPU timestamp base fits in i64");
-    let prev_ts = BusValue::linear(vec![
-        LinearTerm::Column {
-            coefficient: 1,
-            column: cols::TIMESTAMP,
-        },
-        LinearTerm::Constant(base - 3),
-        LinearTerm::Column {
-            coefficient: 3,
-            column: cols::PC_DOUBLE_READ,
-        },
-    ]);
+    let mut prev_ts_terms = timestamp_terms(ts_base, -3);
+    prev_ts_terms.push(LinearTerm::Column {
+        coefficient: 3,
+        column: cols::PC_DOUBLE_READ,
+    });
+    let prev_ts = BusValue::linear(prev_ts_terms);
     for i in 0..2u64 {
         let pc_col = if i == 0 { cols::PC_0 } else { cols::PC_1 };
         let next_pc_col = if i == 0 {

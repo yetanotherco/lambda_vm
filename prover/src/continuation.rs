@@ -2444,6 +2444,38 @@ mod tests {
         );
     }
 
+    /// Hostile CPU heights in an intermediate epoch (no HALT, so its CPU
+    /// sub-proofs start one index earlier): heights `validate_heights` refuses
+    /// and a valid but wrong height are both rejected, without panicking.
+    #[test]
+    fn test_continuation_rejects_hostile_epoch_cpu_heights() {
+        let elf_bytes = asm_elf_bytes("all_instructions_64");
+        let max_rows = MaxRowsConfig::small();
+        let epoch_size_log2 = max_rows.cpu.trailing_zeros() + 1;
+        let opts = ProofOptions::default_test_options();
+        let mut bundle =
+            prove_continuation_with_max_rows(&elf_bytes, &[], epoch_size_log2, &opts, &max_rows)
+                .unwrap();
+        let cpu = crate::cpu_proof_start(false, &bundle.epochs[0].table_counts);
+        assert_eq!(
+            bundle.epochs[0].proof.proofs[cpu].trace_length,
+            max_rows.cpu
+        );
+        for height in [6, 2 * crate::tables::max_rows::CPU, 2 * max_rows.cpu] {
+            bundle.epochs[0].proof.proofs[cpu].trace_length = height;
+            assert!(
+                !matches!(verify_continuation(&elf_bytes, &bundle, &opts), Ok(Some(_))),
+                "height {height}"
+            );
+        }
+        bundle.epochs[0].proof.proofs[cpu].trace_length = max_rows.cpu;
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &opts)
+                .unwrap()
+                .is_some()
+        );
+    }
+
     // ---- Standalone (split) prover/verifier ----
 
     // Round-trip: a bundle from prove_continuation verifies on its own (only the

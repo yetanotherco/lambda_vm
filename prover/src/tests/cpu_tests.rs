@@ -7,7 +7,7 @@
 
 use crate::tables::cpu::{
     CPU_PADDING_PC, CpuOperation, MAX_CPU_ROWS, cols, final_pc_timestamp, generate_cpu_trace,
-    timestamp_bases, validate_heights,
+    table_heights, timestamp_bases, validate_heights,
 };
 use crate::tables::max_rows;
 use crate::tables::types::DecodeEntry;
@@ -440,4 +440,20 @@ fn test_validate_heights_rejects_epoch_over_row_bound() {
     let heights = vec![max_rows::CPU; 1 << 11];
     assert_eq!(heights.iter().sum::<usize>() as u64, MAX_CPU_ROWS + 1);
     assert!(validate_heights(&heights).is_err());
+}
+
+/// `table_heights` mirrors the trace builder's chunking: full chunks, then the
+/// remainder padded to a power of two, at least 4.
+#[test]
+fn test_table_heights_matches_chunking() {
+    assert_eq!(table_heights(0, 32), Vec::<usize>::new());
+    assert_eq!(table_heights(1, 32), vec![4]);
+    assert_eq!(table_heights(5, 32), vec![8]);
+    assert_eq!(table_heights(32, 32), vec![32]);
+    assert_eq!(table_heights(33, 32), vec![32, 4]);
+    assert_eq!(table_heights(70, 32), vec![32, 32, 8]);
+    // One cycle over the bound: 2^11 full tables of 2^19 rows, then the last one.
+    let rows = 1usize << 30;
+    assert!(validate_heights(&table_heights(rows, max_rows::CPU)).is_err());
+    assert!(validate_heights(&table_heights(rows - (1 << 18), max_rows::CPU)).is_ok());
 }

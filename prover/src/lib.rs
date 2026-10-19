@@ -1373,6 +1373,8 @@ pub fn prove_with_options_and_inputs(
     let result = executor
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
+    // A run over the per-proof CPU row bound fails here, before the trace build.
+    tables::cpu::validate_heights(&tables::cpu::table_heights(result.logs.len(), max_rows.cpu))?;
 
     #[cfg(feature = "instruments")]
     drop(__sp);
