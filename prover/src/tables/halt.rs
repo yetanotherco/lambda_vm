@@ -11,7 +11,7 @@
 //! ## Bus Interactions
 //! - **Receiver**: ECALL bus - receives `[timestamp, cast(rv1, DWordWL)]` from CPU
 //!   when the ECALL flag is set (rv1 must be 93 = sys_exit)
-//! - **Sender**: MEMW bus - 31 register finalization interactions at `ts = 2^64-1`:
+//! - **Sender**: MEMW bus - 31 register finalization interactions at `ts = 2^32-1`:
 //!   - x1-x9: write 0 (zeroize lo GPRs)
 //!   - x10: read with old=0 (enforce exit_code=0; non-zero → bus imbalance → proof failure)
 //!   - x11-x31: write 0 (zeroize hi GPRs)
@@ -20,7 +20,11 @@
 //!   the halting instruction and *re-emits* `pc = 1`. This bridges the last real PC
 //!   write to the CPU padding rows (which all carry PC=1); the padding chain then
 //!   carries PC=1 to the REGISTER table's final token. x255 is therefore NOT
-//!   finalized via MEMW at `2^64-1` anymore.
+//!   finalized via MEMW at `2^32-1` anymore.
+//!
+//! `2^32-1` is the largest `Word` timestamp (spec `halt.toml`). Every CPU
+//! timestamp stays below it: an epoch has at most
+//! [`super::cpu::MAX_CPU_ROWS`] CPU rows, whose last access is at `4·N + 2`.
 //!
 //! Corresponding MEMW table rows are generated in trace_builder.
 //!
@@ -35,6 +39,10 @@ use super::types::{BusId, GoldilocksExtension, GoldilocksField, VmTable};
 // =========================================================================
 // Column indices for HALT table
 // =========================================================================
+
+/// Timestamp of HALT's register finalization: `2^32 - 1`, the maximum `Word`
+/// timestamp (spec `halt.toml`), after every CPU access.
+pub const HALT_TIMESTAMP: u64 = (1 << 32) - 1;
 
 /// Column definitions for the HALT table.
 pub mod cols {
@@ -106,22 +114,22 @@ fn halt_read_bus_values(base_addr: u64) -> Vec<BusValue> {
         BusValue::constant(0),
         BusValue::constant(0),
         // input (same 16 elements as write format)
-        BusValue::constant(1),           // is_register = 1
-        BusValue::constant(base_addr),   // base_address[0]
-        BusValue::constant(0),           // base_address[1]
-        BusValue::constant(0),           // value[0] = 0
-        BusValue::constant(0),           // value[1]
-        BusValue::constant(0),           // value[2]
-        BusValue::constant(0),           // value[3]
-        BusValue::constant(0),           // value[4]
-        BusValue::constant(0),           // value[5]
-        BusValue::constant(0),           // value[6]
-        BusValue::constant(0),           // value[7]
-        BusValue::constant(0xFFFF_FFFF), // timestamp[0] = lo(2^64-1)
-        BusValue::constant(0xFFFF_FFFF), // timestamp[1] = hi(2^64-1)
-        BusValue::constant(1),           // write2 = 1
-        BusValue::constant(0),           // write4 = 0
-        BusValue::constant(0),           // write8 = 0
+        BusValue::constant(1),              // is_register = 1
+        BusValue::constant(base_addr),      // base_address[0]
+        BusValue::constant(0),              // base_address[1]
+        BusValue::constant(0),              // value[0] = 0
+        BusValue::constant(0),              // value[1]
+        BusValue::constant(0),              // value[2]
+        BusValue::constant(0),              // value[3]
+        BusValue::constant(0),              // value[4]
+        BusValue::constant(0),              // value[5]
+        BusValue::constant(0),              // value[6]
+        BusValue::constant(0),              // value[7]
+        BusValue::constant(HALT_TIMESTAMP), // timestamp[0] = 2^32-1
+        BusValue::constant(0),              // timestamp[1]
+        BusValue::constant(1),              // write2 = 1
+        BusValue::constant(0),              // write4 = 0
+        BusValue::constant(0),              // write8 = 0
     ]
 }
 
@@ -131,29 +139,29 @@ fn halt_read_bus_values(base_addr: u64) -> Vec<BusValue> {
 /// timestamp[0..1], write2, write4, write8]`.
 fn halt_write_bus_values(base_addr: u64, value_lo: u64) -> Vec<BusValue> {
     vec![
-        BusValue::constant(1),           // is_register = 1
-        BusValue::constant(base_addr),   // base_address[0]
-        BusValue::constant(0),           // base_address[1]
-        BusValue::constant(value_lo),    // value[0]
-        BusValue::constant(0),           // value[1]
-        BusValue::constant(0),           // value[2]
-        BusValue::constant(0),           // value[3]
-        BusValue::constant(0),           // value[4]
-        BusValue::constant(0),           // value[5]
-        BusValue::constant(0),           // value[6]
-        BusValue::constant(0),           // value[7]
-        BusValue::constant(0xFFFF_FFFF), // timestamp[0] = lo(2^64-1)
-        BusValue::constant(0xFFFF_FFFF), // timestamp[1] = hi(2^64-1)
-        BusValue::constant(1),           // write2 = 1
-        BusValue::constant(0),           // write4 = 0
-        BusValue::constant(0),           // write8 = 0
+        BusValue::constant(1),              // is_register = 1
+        BusValue::constant(base_addr),      // base_address[0]
+        BusValue::constant(0),              // base_address[1]
+        BusValue::constant(value_lo),       // value[0]
+        BusValue::constant(0),              // value[1]
+        BusValue::constant(0),              // value[2]
+        BusValue::constant(0),              // value[3]
+        BusValue::constant(0),              // value[4]
+        BusValue::constant(0),              // value[5]
+        BusValue::constant(0),              // value[6]
+        BusValue::constant(0),              // value[7]
+        BusValue::constant(HALT_TIMESTAMP), // timestamp[0] = 2^32-1
+        BusValue::constant(0),              // timestamp[1]
+        BusValue::constant(1),              // write2 = 1
+        BusValue::constant(0),              // write4 = 0
+        BusValue::constant(0),              // write8 = 0
     ]
 }
 
 /// Creates all bus interactions for the HALT table.
 ///
 /// - **ECALL receiver**: receives `[timestamp, cast(rv1, DWordWL)]` from CPU
-/// - **MEMW senders** (31 total): register finalization at `ts = 2^64-1`
+/// - **MEMW senders** (31 total): register finalization at `ts = 2^32-1`
 ///   - x1-x9: write 0 (zeroize lo GPRs)
 ///   - x10: read with old=0 (enforce exit_code=0)
 ///   - x11-x31: write 0 (zeroize hi GPRs)
@@ -181,7 +189,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // x1-x9: write 0 at ts=2^64-1 (zeroize lo registers)
+    // x1-x9: write 0 at ts=2^32-1 (zeroize lo registers)
     for i in 1..=9u64 {
         interactions.push(BusInteraction::sender(
             BusId::Memw,
@@ -190,7 +198,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // x10: read with old=0 at ts=2^64-1 (verify exit code = 0)
+    // x10: read with old=0 at ts=2^32-1 (verify exit code = 0)
     // Per spec halt:c:read_zero_exit_code: enforces that x10 was 0 at halt.
     // Non-zero exit code → bus imbalance → proof failure.
     interactions.push(BusInteraction::sender(
@@ -199,7 +207,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         halt_read_bus_values(20),
     ));
 
-    // x11-x31: write 0 at ts=2^64-1 (zeroize hi registers)
+    // x11-x31: write 0 at ts=2^32-1 (zeroize hi registers)
     for i in 11..=31u64 {
         interactions.push(BusInteraction::sender(
             BusId::Memw,

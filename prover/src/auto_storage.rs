@@ -120,7 +120,7 @@ fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
         (
             lengths.cpu_padded_rows,
             CPU_COLS as u64,
-            aux_cols(cpu_buses().len()),
+            aux_cols(cpu_buses(0).len()),
             1,
         ),
         (
@@ -203,7 +203,7 @@ fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
         (
             register_rows,
             REGISTER_COLS as u64,
-            aux_cols(register_buses().len()),
+            aux_cols(register_buses(0).len()),
             2,
         ),
     ];

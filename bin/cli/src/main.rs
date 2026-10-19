@@ -1001,6 +1001,12 @@ fn continuation_epoch_size(epoch_size_log2: u32) -> Result<usize, String> {
             "--epoch-size-log2 must be at least {MIN_CONTINUATION_EPOCH_SIZE_LOG2} for CLI proving"
         ));
     }
+    let max = prover::tables::cpu::MAX_EPOCH_SIZE_LOG2;
+    if epoch_size_log2 > max {
+        return Err(format!(
+            "--epoch-size-log2 must be at most {max} (an epoch has fewer than 2^30 CPU rows)"
+        ));
+    }
     1usize.checked_shl(epoch_size_log2).ok_or_else(|| {
         format!("--epoch-size-log2 {epoch_size_log2} is too large for this platform")
     })
@@ -1144,6 +1150,12 @@ mod tests {
     #[test]
     fn continuation_epoch_size_rejects_tiny_cli_values() {
         assert!(continuation_epoch_size(17).is_err());
+    }
+
+    #[test]
+    fn continuation_epoch_size_rejects_epochs_over_the_cpu_row_bound() {
+        assert!(continuation_epoch_size(prover::tables::cpu::MAX_EPOCH_SIZE_LOG2).is_ok());
+        assert!(continuation_epoch_size(prover::tables::cpu::MAX_EPOCH_SIZE_LOG2 + 1).is_err());
     }
 
     #[test]

@@ -93,6 +93,15 @@ an epoch. The cross-epoch chain is ordered by the **epoch number** (§3.3), so t
 GlobalMemory bus carries no timestamp at all (see §2 telescoping). `fini_timestamp`
 stays only because the epoch-local **Memory bus** needs it (matched against MEMW).
 
+The CPU timestamp is a **preprocessed** column (spec `Timestamp`): row `i` of every
+CPU table holds `4·(i + 1)`. An epoch splits its CPU rows over several tables, so
+table `k` adds `4·S_k` to every timestamp it sends, where `S_k` is the total
+height of tables `0..k`. The verifier reads the heights off the epoch proof, so
+every CPU timestamp, and the final PC timestamp `4·N + 1` (`N` = all CPU rows of
+the epoch), is verifier-known. The verifier rejects an epoch with more than
+`2^30 − 1` CPU rows: the last row's accesses reach `4·N + 2`, which must stay
+below HALT's `2^32 − 1`.
+
 ### Cross-epoch telescoping
 
 For a cell touched in epochs 1, 2, 3, the GlobalMemory bus checks:
@@ -469,11 +478,16 @@ locks compose:
 Compose them: public `R_{i+1}` = trace FINI = real last write. So the value handed
 to the next epoch is pinned to real execution.
 
-The **monolithic prover** preprocesses the same 3 columns, with FINI pinned to the
+The **monolithic prover** preprocesses the same columns, with FINI pinned to the
 halted register file (`register::halted_fini`): x1-x31 = 0, x254 = the committed
 byte count, and the PC = 1. The final epoch's `R_{i+1}` must equal that same
 halted state. Pinning it ends the PC chain on `pc = 1`, so execution cannot
 continue past the exit ecall.
+
+REGISTER also preprocesses `IS_PC` (1 on the two x255 rows). REG-C2 sends the x255
+final token at the verifier-known final PC timestamp `4·N + 1` instead of the
+`timestamp` column (spec `halt.typ`), so both the value and the timestamp the PC
+chain ends on are verifier-known.
 
 ### Commit index (x254)
 

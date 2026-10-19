@@ -33,7 +33,7 @@ fn peak_bytes_per_table_increment_is_exact() {
     let bumped = peak_bytes(&lengths, blowup, ALL_TABLES);
 
     let cpu_main = CPU_COLS as u64;
-    let cpu_aux = cpu_buses().len().div_ceil(2) as u64;
+    let cpu_aux = cpu_buses(0).len().div_ceil(2) as u64;
     let per_row_persistent = cpu_main * GOLDILOCKS_BYTES * (1 + b)
         + cpu_aux * CUBIC_EXT_BYTES * (1 + b)
         + 2 * b * KECCAK_NODE_BYTES   // main Merkle (1 tree)

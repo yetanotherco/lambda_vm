@@ -572,6 +572,45 @@ type AirTracePair<'a> = (
     &'a (),
 );
 
+/// Sub-proof index of the first CPU table: [`VmAirs::air_refs`] puts the four
+/// fixed tables, HALT (when included) and the accelerator tables first.
+fn cpu_start(include_halt: bool, accelerator_counts: [usize; 6]) -> usize {
+    4 + usize::from(include_halt) + accelerator_counts.iter().sum::<usize>()
+}
+
+/// [`cpu_start`] for a proof's declared `table_counts`.
+pub(crate) fn cpu_proof_start(include_halt: bool, table_counts: &TableCounts) -> usize {
+    cpu_start(
+        include_halt,
+        [
+            table_counts.commit,
+            table_counts.keccak,
+            table_counts.keccak_rnd,
+            table_counts.ecsm,
+            table_counts.ecdas,
+            table_counts.hint,
+        ],
+    )
+}
+
+/// The CPU tables' heights as a proof declares them (the sub-proofs' trace
+/// lengths), for [`VmAirs::new`]. `None` if the proof has fewer sub-proofs than
+/// `table_counts` places CPU tables at.
+pub(crate) fn cpu_heights_from_proofs(
+    proofs: MultiProofView<'_, F, E, ()>,
+    table_counts: &TableCounts,
+    include_halt: bool,
+) -> Option<Vec<usize>> {
+    let start = cpu_proof_start(include_halt, table_counts);
+    let end = start.checked_add(table_counts.cpu)?;
+    (end <= proofs.len()).then(|| (start..end).map(|i| proofs.get(i).trace_length()).collect())
+}
+
+/// The CPU tables' heights of a built trace set, for [`VmAirs::new`].
+pub(crate) fn cpu_heights_from_traces(traces: &Traces) -> Vec<usize> {
+    traces.cpus.iter().map(|t| t.num_rows()).collect()
+}
+
 /// All VM AIR instances, grouped by table.
 pub(crate) struct VmAirs {
     pub cpus: Vec<VmAir>,
@@ -777,6 +816,21 @@ impl VmAirs {
             refs.push(air.as_ref());
         }
 
+        debug_assert_eq!(
+            refs.len(),
+            cpu_start(
+                self.include_halt,
+                [
+                    self.commits.len(),
+                    self.keccaks.len(),
+                    self.keccak_rnds.len(),
+                    self.ecsms.len(),
+                    self.ecdases.len(),
+                    self.hints.len(),
+                ],
+            ),
+            "cpu_proof_start must match the air_refs layout"
+        );
         for air in &self.cpus {
             refs.push(air.as_ref());
         }
@@ -842,8 +896,15 @@ impl VmAirs {
     /// callers must bind identity externally (see `recursion::check_attestation`).
     ///
     /// `register_commitment` is the REGISTER preprocessed root (OFFSET, INIT,
-    /// FINI): [`register::halted_commitment`] for a monolithic proof, or the
+    /// FINI, IS_PC): [`register::halted_commitment`] for a monolithic proof, or the
     /// epoch's `R_i`/`R_{i+1}` for a continuation epoch.
+    ///
+    /// `cpu_heights` are the CPU tables' heights, in order (`table_counts.cpu` of
+    /// them; the trace heights on the prove side, the sub-proofs' trace lengths on
+    /// the verify side, see [`cpu_heights_from_proofs`]). They fix each CPU
+    /// table's preprocessed TIMESTAMP commitment and timestamp base, and the final
+    /// PC timestamp REGISTER consumes x255 at. Callers check them with
+    /// [`tables::cpu::validate_heights`] first.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         elf: &Elf,
@@ -851,16 +912,34 @@ impl VmAirs {
         minimal_bitwise: bool,
         page_configs: &[crate::tables::page::PageConfig],
         table_counts: &TableCounts,
+        cpu_heights: &[usize],
         decode_commitment: Option<Commitment>,
         include_halt: bool,
         page_commitments: Option<&[(u64, Commitment)]>,
         register_commitment: Commitment,
     ) -> Self {
-        let cpus: Vec<_> = (0..table_counts.cpu)
-            .map(|i| {
-                Box::new(create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i))) as VmAir
+        assert_eq!(
+            cpu_heights.len(),
+            table_counts.cpu,
+            "one height per CPU table"
+        );
+        let cpus: Vec<_> = cpu_heights
+            .iter()
+            .zip(tables::cpu::timestamp_bases(cpu_heights))
+            .enumerate()
+            .map(|(i, (&height, ts_base))| {
+                Box::new(
+                    create_cpu_air(proof_options, ts_base)
+                        .with_name(&format!("CPU[{}]", i))
+                        .with_preprocessed(
+                            tables::cpu::timestamp_commitment(proof_options, height),
+                            tables::cpu::NUM_PRECOMPUTED_COLS,
+                        ),
+                ) as VmAir
             })
             .collect();
+        let total_cpu_rows: u64 = cpu_heights.iter().map(|&h| h as u64).sum();
+        let final_pc_ts = tables::cpu::final_pc_timestamp(total_cpu_rows);
         let bitwise: VmAir = if minimal_bitwise {
             // TEST-ONLY BRANCH — must never be reached in production.
             //
@@ -975,7 +1054,7 @@ impl VmAirs {
             })
             .collect();
         let register: VmAir = Box::new(
-            create_register_air(proof_options)
+            create_register_air(proof_options, final_pc_ts)
                 .with_preprocessed(register_commitment, register::NUM_PREPROCESSED_COLS),
         );
         // Every zero-init page shares one preprocessed commitment: OFFSET is
@@ -1279,6 +1358,9 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let heap_before = stark::instruments::heap_bytes();
 
+    // A CPU chunk size the verifier would refuse fails here, not after the run.
+    tables::cpu::validate_max_rows(max_rows.cpu)?;
+
     // Phase 1: Execute (ELF load + run)
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
@@ -1339,6 +1421,8 @@ pub fn prove_with_options_and_inputs(
     let __sp = stark::instruments::span("air_construction");
 
     let table_counts = traces.table_counts();
+    let cpu_heights = cpu_heights_from_traces(&traces);
+    tables::cpu::validate_heights(&cpu_heights)?;
     let committed_bytes = u32::try_from(traces.public_output_bytes.len())
         .expect("trace build bounds the commit index to u32");
     let airs = VmAirs::new(
@@ -1347,6 +1431,7 @@ pub fn prove_with_options_and_inputs(
         false,
         &traces.page_configs,
         &table_counts,
+        &cpu_heights,
         None,
         true,
         None,
@@ -1586,12 +1671,21 @@ fn verify_proof_parts(
     let Ok(committed_bytes) = u32::try_from(public_output.len()) else {
         return Ok(false);
     };
+    // The CPU heights fix every CPU timestamp (preprocessed TIMESTAMP plus a
+    // per-table base) and the final PC timestamp, so they must respect the
+    // per-epoch row bound before they size anything.
+    let cpu_heights = cpu_heights_from_proofs(proofs, table_counts, true).ok_or_else(|| {
+        Error::InvalidTableCounts("proof has fewer sub-proofs than CPU tables".to_string())
+    })?;
+    tables::cpu::validate_heights(&cpu_heights)?;
+
     let airs = VmAirs::new(
         program,
         proof_options,
         false,
         &page_configs,
         table_counts,
+        &cpu_heights,
         decode_commitment,
         true,
         page_commitments,

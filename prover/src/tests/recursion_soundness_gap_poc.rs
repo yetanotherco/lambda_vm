@@ -153,6 +153,7 @@ fn custom_prove_with_statement_elf(
         false,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,

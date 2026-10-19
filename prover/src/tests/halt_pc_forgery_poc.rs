@@ -5,7 +5,7 @@
 //! anything, so a prover can set them to `(1, 0)`: HALT then consumes the `1` it
 //! emits itself, and the real `next_pc` token is left for another CPU row to pick
 //! up. The trace keeps executing after `exit` and HALT's x10 == 0 check reads x10
-//! at `ts = 2^64 - 1`, not at the exit call.
+//! at `ts = 2^32 - 1`, not at the exit call.
 //!
 //! The guest calls `exit(1)`, which no honest prover can prove. The forgery runs
 //! `li a0, 0` (+ nops) after the exit and must not verify against the same ELF.
@@ -94,8 +94,12 @@ pub(crate) fn forged_logs(honest: &[u8], rows: usize) -> Vec<Log> {
 pub(crate) struct Tamper {
     /// HALT `PC = (1, 0)`, so HALT's consume/emit cancel.
     pub(crate) halt_pc: bool,
-    /// Move the REGISTER final x255 token to the last post-exit row's write
-    /// timestamp. Main-trace columns.
+    /// Move the REGISTER final x255 timestamp to the last post-exit row's write
+    /// timestamp. Main-trace columns. Needed before the CPU timestamp was
+    /// preprocessed; REGISTER now consumes x255 at the verifier-known
+    /// `final_pc_ts` and never reads these cells on the x255 rows, so this tamper
+    /// changes nothing. The attack still lines up: with [`FORGED_ROWS`] rows the
+    /// forged chain ends at `final_pc_ts = 4·16 + 1`.
     pub(crate) register_ts: bool,
     /// Set the REGISTER final x255 value to the last post-exit `next_pc`. A
     /// main-trace column on `main`; preprocessed by the fix, so the forged root no
@@ -165,6 +169,7 @@ fn craft_proof(
         false,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
