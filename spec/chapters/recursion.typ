@@ -296,7 +296,7 @@ one can even use a permutation argument such as in @logup to check equality of t
   so that one or both of the verifier halves can have a simpler structure or ordering of its checks.
 ]
 
-Observe that considering considering the proof
+Observe that considering the proof
 $ proof_sans("rec") = s || prove_0(verify'_0([comm(x), s], dot); [proof, record]) || prove_1(verify'_1([comm2(x), s], dot); [proof, record]) $
 still allows us to treat the final output as a single proof, with a well-defined verifier.
 As such, it is possible to construct a split verifier for this combined proof system, and enable full split recursion.
