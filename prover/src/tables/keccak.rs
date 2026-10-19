@@ -175,7 +175,7 @@ pub fn generate_keccak_trace(
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let syscall_lo = KECCAK_SYSCALL_NUMBER & 0xFFFF_FFFF;
     let syscall_hi = KECCAK_SYSCALL_NUMBER >> 32;
-    let mut interactions = Vec::with_capacity(160);
+    let mut interactions = Vec::with_capacity(84);
 
     // 1. ECALL receiver (shared bus, per spec keccak:c:output)
     // Payload: [ts_lo, ts_hi, syscall_lo32, syscall_hi32] in DWordWL [lo, hi]

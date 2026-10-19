@@ -19,6 +19,8 @@ use crate::tables::keccak::{
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{BusId, FE};
 use crate::test_utils::{E, asm_elf_bytes, busless_air, validate_busless};
+use crate::tests::prove_elfs_tests::{BusOutcome, weigh_the_bus_with};
+use crate::tests::skip_empty_tables_tests::assert_only_the_bus_rejected;
 use crate::{MaxRowsConfig, VmAirs, VmProof};
 
 use executor::elf::Elf;
@@ -266,19 +268,17 @@ fn bump_b20(traces: &mut Traces, value: u64, delta: FE) {
     bw.set(row, bw_cols::MU_IS_B20, old + delta);
 }
 
-/// Proves `test_keccak` after letting `rewrite` reshape the IS_WH rows, and
-/// returns whether the verifier accepts. The prover is the malicious one: it
-/// skips no check of its own, it simply builds a proof over the rewritten trace.
-fn prove_keccak_with(rewrite: impl FnOnce(&mut Traces)) -> bool {
-    let elf_bytes = asm_elf_bytes("test_keccak");
-    let options = crate::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid");
+/// Runs the asm program `name` and builds its traces with the full
+/// preprocessed BITWISE table, the one a range-check forgery has to get past.
+fn full_traces(name: &str) -> (Vec<u8>, Elf, Traces) {
+    let elf_bytes = asm_elf_bytes(name);
     let program = Elf::load(&elf_bytes).expect("ELF load");
     let logs = Executor::new(&program, vec![])
         .expect("executor construction")
         .run()
         .expect("run")
         .logs;
-    let mut traces = Traces::from_elf_and_logs(
+    let traces = Traces::from_elf_and_logs(
         &program,
         &logs,
         &MaxRowsConfig::default(),
@@ -287,6 +287,20 @@ fn prove_keccak_with(rewrite: impl FnOnce(&mut Traces)) -> bool {
         stark::storage_mode::StorageMode::Ram,
     )
     .expect("trace build");
+    (elf_bytes, program, traces)
+}
+
+/// Proves `test_keccak` after letting `rewrite` reshape the IS_WH rows, and
+/// returns whether the verifier accepts. The prover is the malicious one: it
+/// skips no check of its own, it simply builds a proof over the rewritten trace.
+fn prove_keccak_with(rewrite: impl FnOnce(&mut Traces)) -> bool {
+    prove_asm_with("test_keccak", rewrite)
+}
+
+/// [`prove_keccak_with`] for any asm program.
+fn prove_asm_with(name: &str, rewrite: impl FnOnce(&mut Traces)) -> bool {
+    let options = crate::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid");
+    let (elf_bytes, program, mut traces) = full_traces(name);
 
     rewrite(&mut traces);
 
@@ -336,6 +350,15 @@ fn prove_keccak_with(rewrite: impl FnOnce(&mut Traces)) -> bool {
     };
     crate::verify_with_options(&proof, &elf_bytes, &options, None, None)
         .expect("verify must not error")
+}
+
+/// The same forgery on `test_keccak`, weighed instead of only verified: tells a
+/// rejection by the bus balance apart from one anywhere else in the verifier
+/// (see `assert_only_the_bus_rejected`).
+fn weigh_keccak_with(rewrite: impl FnOnce(&mut Traces)) -> BusOutcome {
+    let (_, program, mut traces) = full_traces("test_keccak");
+    rewrite(&mut traces);
+    weigh_the_bus_with(&program, &mut traces, true, false)
 }
 
 /// Splits IS_WH row 0 (μ = m) into `m − moved` on row 0 and `moved` on the
@@ -455,18 +478,21 @@ fn resplit_keeping_lo(lo: FE, hi: FE, new_lo: FE) -> (FE, FE) {
 /// Rewrites the Word of IS_WH row 0 into a non-canonical pair of halves with
 /// the same packing, so it still receives the honest `IS_WH` sends. The limb at
 /// `out_of_range` (`VALUE_1` or `VALUE_2`) leaves `[0, 2^16)`; the other limb
-/// moves to a different in-range value.
-fn resplit_word(traces: &mut Traces, out_of_range: usize) {
+/// moves to a different in-range value. `None` rewrites the row to itself
+/// through the same steps.
+fn resplit_word(traces: &mut Traces, out_of_range: Option<usize>) {
     let t = &mut traces.is_whs[0].main_table;
     let m = *t.get(0, cols::MU);
     let (v1, v2) = (*t.get(0, cols::VALUE_1), *t.get(0, cols::VALUE_2));
     let flip = |v: FE| FE::from(v.canonical_u64() ^ 1);
-    let (n1, n2) = if out_of_range == cols::VALUE_2 {
-        resplit_keeping_lo(v1, v2, flip(v1))
-    } else {
-        // `v1 + 2^16·v2` with `v2` replaced: `v1` absorbs `2^16·(v2 − v2')`.
-        let n2 = flip(v2);
-        (v1 + (v2 - n2) * FE::from(1u64 << 16), n2)
+    let (n1, n2) = match out_of_range {
+        None => (v1, v2),
+        Some(c) if c == cols::VALUE_2 => resplit_keeping_lo(v1, v2, flip(v1)),
+        Some(_) => {
+            // `v1 + 2^16·v2` with `v2` replaced: `v1` absorbs `2^16·(v2 − v2')`.
+            let n2 = flip(v2);
+            (v1 + (v2 - n2) * FE::from(1u64 << 16), n2)
+        }
     };
     assert_eq!(
         n1 + n2 * FE::from(1u64 << 16),
@@ -486,15 +512,22 @@ fn resplit_word(traces: &mut Traces, out_of_range: usize) {
     }
 }
 
+/// Control: the rewrite path of the test below with the Word left canonical
+/// verifies, so its BITWISE rebalancing is what an honest witness needs.
+#[test]
+fn test_is_wh_canonical_word_rewrite_verifies() {
+    assert!(prove_keccak_with(|t| resplit_word(t, None)));
+}
+
 /// An IS_WH row whose Word is split into halves that pack to the honest Word
 /// but are not both halfwords. It receives the honest `IS_WH` sends, so only its
 /// own `IS_HALFWORD` check on the bad limb can reject it — once per Word limb.
 #[test]
 fn test_is_wh_noncanonical_word_is_rejected() {
     for limb in [cols::VALUE_1, cols::VALUE_2] {
-        assert!(
-            !prove_keccak_with(|t| resplit_word(t, limb)),
-            "IS_WH column {limb} out of range must be rejected"
+        assert_only_the_bus_rejected(
+            &weigh_keccak_with(|t| resplit_word(t, Some(limb))),
+            &format!("an IS_WH row with column {limb} out of range"),
         );
     }
 }
@@ -571,5 +604,88 @@ fn test_keccak_lane_on_its_own_is_wh_row_verifies() {
 /// Only that row's `IS_HALFWORD[value[0]]` sees `half_mid'` out of range.
 #[test]
 fn test_keccak_noncanonical_state_ptr_is_rejected() {
-    assert!(!prove_keccak_with(|t| move_lane_0_to_own_row(t, true)));
+    assert_only_the_bus_rejected(
+        &weigh_keccak_with(|t| move_lane_0_to_own_row(t, true)),
+        "a KECCAK state_ptr with half_mid out of range",
+    );
+}
+
+// =========================================================================
+// End to end: more than one key, continuations and recursion
+// =========================================================================
+
+/// `test_keccak_64k` puts the state right across a 64 KiB boundary, so its
+/// lanes carry two keys: IS_WH ships two real rows, 12 lanes below the
+/// boundary and 13 above, and the proof verifies.
+#[test]
+fn test_keccak_state_across_64k_boundary_verifies() {
+    assert!(prove_asm_with("test_keccak_64k", |t| {
+        assert_eq!(t.is_whs.len(), 1);
+        let is_wh = &t.is_whs[0].main_table;
+        let rows: Vec<(u64, u64)> = (0..is_wh.height)
+            .map(|r| {
+                (
+                    is_wh.get(r, cols::VALUE_0).canonical_u64(),
+                    is_wh.get(r, cols::MU).canonical_u64(),
+                )
+            })
+            .filter(|&(_, mu)| mu > 0)
+            .collect();
+        assert_eq!(rows.len(), 2, "two keys: {rows:?}");
+        assert_eq!(rows[1].0, (rows[0].0 + 1) & 0xFFFF, "adjacent halves");
+        assert_eq!((rows[0].1, rows[1].1), (12, 13));
+    }));
+}
+
+/// Continuations ship IS_WH per epoch: the epoch that runs the keccak ecall
+/// has an IS_WH table and the others do not, and the bundle verifies.
+#[test]
+fn test_keccak_continuation_carries_is_wh_in_its_epoch() {
+    let elf_bytes = asm_elf_bytes("test_keccak_64k");
+    let opts = crate::recursion::MIN_PROOF_OPTIONS;
+    let bundle = crate::continuation::prove_continuation(&elf_bytes, &[], 4, &opts)
+        .expect("continuation prove");
+    let is_wh: Vec<usize> = bundle
+        .epoch_table_counts()
+        .iter()
+        .map(|c| c.is_wh)
+        .collect();
+    assert!(is_wh.len() > 1, "16-cycle epochs must split the program");
+    assert_eq!(
+        is_wh.iter().filter(|&&n| n == 1).count(),
+        1,
+        "exactly the keccak epoch ships IS_WH: {is_wh:?}"
+    );
+    assert!(is_wh.iter().all(|&n| n <= 1));
+    crate::continuation::verify_continuation(&elf_bytes, &bundle, &opts)
+        .expect("verify_continuation errored")
+        .expect("a keccak bundle must verify");
+}
+
+/// The recursion guest's verify path (mirrored on the host) on an inner proof
+/// that contains IS_WH: the blob carries `is_wh = 1` and still verifies and
+/// attests.
+#[test]
+fn test_recursion_blob_with_is_wh_verifies_on_host() {
+    use crate::recursion::{self, MIN_PROOF_OPTIONS};
+
+    let elf_bytes = asm_elf_bytes("test_keccak_64k");
+    let inner = crate::prove_with_options_and_inputs(
+        &elf_bytes,
+        &[],
+        &MIN_PROOF_OPTIONS,
+        &MaxRowsConfig::default(),
+    )
+    .expect("inner prove");
+    assert_eq!(inner.table_counts.is_wh, 1);
+
+    let blob =
+        recursion::encode_guest_input(&inner, &elf_bytes, &MIN_PROOF_OPTIONS).expect("encode");
+    let attestation = recursion::verify_and_attest_blob(&blob, &MIN_PROOF_OPTIONS)
+        .expect("verify_and_attest_blob errored")
+        .expect("an inner proof with IS_WH must verify on the guest path");
+    let output = recursion::check_attestation(&attestation, &elf_bytes, &MIN_PROOF_OPTIONS)
+        .expect("check_attestation errored")
+        .expect("attestation must bind to the inner ELF");
+    assert_eq!(output, inner.public_output);
 }

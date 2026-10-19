@@ -36,7 +36,8 @@ fn run_rust_elf(name: &str) -> (Elf, ExecutionResult) {
     (elf, result)
 }
 
-/// The claim every drop-forgery below makes, in one place.
+/// The claim every drop-forgery below makes, in one place (the IS_WH range
+/// forgeries in `is_wh_tests` make it too).
 ///
 /// `multi_verify_views` returns `false` from about ten places, so
 /// `assert!(!accepted)` on its own would pass just as happily if the forged
@@ -44,11 +45,11 @@ fn run_rust_elf(name: &str) -> (Elf, ExecutionResult) {
 /// check — the opposite of what these tests say they demonstrate. Moving the
 /// target onto the sum the forgery actually produced is what separates them: if
 /// the same proof then verifies, the balance was the only objection.
-fn assert_only_the_bus_rejected(outcome: &BusOutcome, what: &str) {
-    assert!(!outcome.accepted, "dropping {what} must not verify");
+pub(crate) fn assert_only_the_bus_rejected(outcome: &BusOutcome, what: &str) {
+    assert!(!outcome.accepted, "{what} must not verify");
     assert_ne!(
         outcome.contribution_sum, outcome.target,
-        "dropping {what} left the bus balanced, so the rejection came from \
+        "{what} left the bus balanced, so the rejection came from \
          elsewhere and the bus did not notice the forgery at all"
     );
     assert!(
@@ -540,7 +541,7 @@ fn omitting_a_table_whose_ops_ran_fails_the_bus_balance() {
         "validate deliberately lets this through — the bus is what rejects it"
     );
 
-    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "MUL");
+    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "dropping MUL");
 }
 
 /// What `validate` still refuses: a proof with no CPU describes no execution,
@@ -650,9 +651,9 @@ fn counts_that_wrap_have_no_total() {
 
 /// The accelerators are the ones a run most often never reaches, and each cost a
 /// four-row sub-proof regardless. A program with no keccak, no EC and no hint
-/// ecall now carries none of the six.
+/// ecall now carries none of the six, nor the IS_WH table KECCAK feeds.
 #[test]
-fn a_run_without_accelerators_omits_all_six() {
+fn a_run_without_accelerators_omits_all_six_and_is_wh() {
     let (elf, logs, _instructions) = run_asm_elf("xori");
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
@@ -665,6 +666,8 @@ fn a_run_without_accelerators_omits_all_six() {
         ("ecdas", counts.ecdas),
         ("hint", counts.hint),
         ("commit", counts.commit),
+        // Not an accelerator, but only KECCAK feeds it today.
+        ("is_wh", counts.is_wh),
     ] {
         assert_eq!(
             count, 0,
@@ -699,7 +702,7 @@ fn omitting_a_used_accelerator_fails_the_bus_balance() {
     );
 
     traces.hints.clear();
-    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "HINT");
+    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "dropping HINT");
 }
 
 /// The dispatch above is CPU-to-chip. KECCAK_RND is reached from KECCAK, not
@@ -722,7 +725,10 @@ fn omitting_a_chip_dispatched_by_another_chip_fails_the_bus_balance() {
     );
 
     traces.keccak_rnds.clear();
-    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "KECCAK_RND");
+    assert_only_the_bus_rejected(
+        &weigh_the_bus(&elf, &mut traces, true),
+        "dropping KECCAK_RND",
+    );
 }
 
 /// IS_WH is reached from a chip's range checks rather than from a dispatch: it
@@ -746,7 +752,7 @@ fn omitting_the_is_wh_table_fails_the_bus_balance() {
     );
 
     traces.is_whs.clear();
-    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "IS_WH");
+    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "dropping IS_WH");
 }
 
 /// COMMIT is the one newly-optional table whose bus target is not zero: the
@@ -771,7 +777,7 @@ fn omitting_the_commit_table_fails_the_bus_balance() {
     );
 
     traces.commits.clear();
-    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "COMMIT");
+    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "dropping COMMIT");
 }
 
 /// The variant the test above does not cover: a prover who drops COMMIT can
@@ -794,5 +800,5 @@ fn omitting_the_commit_table_and_its_output_fails_the_bus_balance() {
         "clearing the public output must move the target, or this test is the \
          previous one over again"
     );
-    assert_only_the_bus_rejected(&outcome, "COMMIT together with its output");
+    assert_only_the_bus_rejected(&outcome, "dropping COMMIT together with its output");
 }
