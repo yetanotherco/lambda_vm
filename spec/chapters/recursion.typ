@@ -291,6 +291,9 @@ one can even use a permutation argument such as in @logup to check equality of t
   and as such should be kept as short as possible.
   Since values that only one $verify'_(b)$ accesses do not influence $verify'_(1-b)$, the checksummed data need only
   be the subsequence of elements of $[proof, record]$ that is accessed by both $verify'_0$ and $verify'_1$.
+
+  An even stronger version of this additionally allows re-ordering of the elements of this subsequence,
+  so that one or both of the verifier halves can have a simpler structure or ordering of its checks.
 ]
 
 Observe that considering considering the proof
