@@ -2277,7 +2277,7 @@ fn a_deeper_group_queue_moves_no_byte_of_the_proof() {
     let (proof, line) = queued(Setting::Room, BlockSpillPolicy::Off);
     same("room", &proof);
     assert!(
-        line.contains("GiB while VmRSS + waiting + 16.00 stays under the line"),
+        line.contains("GiB waiting while VmRSS + the group + 16.00 stays under the line"),
         "{line}"
     );
     let (proof, line) = queued(Setting::Bytes(u64::MAX), BlockSpillPolicy::Always);

@@ -66,11 +66,10 @@ pub(crate) fn parse_setting(value: Option<&str>) -> Result<Setting, Error> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Rule {
     /// While the host has room by the purge rule's own test
-    /// ([`crate::alloc_purge::has_room`]): the resident set, the bytes
-    /// waiting, the group's own and the block's headroom together stay under
-    /// its pressure line; and never more than `cap` bytes waiting in all. The
-    /// waiting bytes are in the resident set too: counted twice, on the
-    /// careful side.
+    /// ([`crate::alloc_purge::has_room`]): the resident set, the group's
+    /// bytes and the block's headroom together stay under its pressure line;
+    /// and never more than `cap` bytes waiting in all. The bytes waiting are
+    /// in the resident set already, and count once, there.
     Room { room: NoDisk, cap: u64 },
     /// While at most this many bytes wait.
     Bytes(u64),
@@ -100,7 +99,7 @@ impl Rule {
                 after <= cap
                     && crate::alloc_purge::has_room(
                         Some(room),
-                        resident().map(|resident| resident.saturating_add(after)),
+                        resident().map(|resident| resident.saturating_add(bytes)),
                     )
             }
         }
@@ -143,7 +142,8 @@ pub(crate) fn line(setting: Setting, rule: Option<Rule>, stats: &Stats) -> Strin
             );
         }
         Some(Rule::Room { room, cap }) => format!(
-            "at most {:.2} GiB while VmRSS + waiting + {:.2} stays under the line {:.2} GiB",
+            "at most {:.2} GiB waiting while VmRSS + the group + {:.2} stays under the line {:.2} \
+             GiB",
             gib(cap),
             gib(room.headroom),
             gib(room.line)
@@ -566,11 +566,12 @@ mod tests {
     }
 
     /// The room rule on the readings of the large block (a group of 0.65
-    /// GiB): a 118 GiB host, line 92.03 GiB, has room at its highest resident
-    /// set of the commit phase until about nine GiB wait; a 64 GiB host, line
-    /// 45.90 GiB, has none from 29.25 GiB of resident set on, which it passes
-    /// nine seconds in. The waiting bytes count beside the resident set, and
-    /// the cap holds whatever the host reads.
+    /// GiB): a 118 GiB host, line 92.03 GiB, has room while the resident set
+    /// stays under 75.38 GiB (its highest of the commit phase was 66.34), and
+    /// then the cap's 16 GiB may wait; a 64 GiB host, line 45.90 GiB, has
+    /// none from 29.25 GiB of resident set on, which it passes nine seconds
+    /// in. The bytes waiting count once, in the resident set, and the cap
+    /// holds whatever the host reads.
     #[test]
     fn the_room_rule_at_the_measured_readings() {
         let gib = |g: f64| (g * GIB) as u64;
@@ -580,10 +581,18 @@ mod tests {
         };
         let large = room(92.03, 16);
         assert!(admits(large, 0.65, 66.34));
-        assert!(admits(large, 8.9, 66.34));
-        assert!(!admits(large, 9.1, 66.34));
-        assert!(admits(large, 5.3, 70.0));
-        assert!(!admits(large, 5.5, 70.0));
+        assert!(admits(large, 9.1, 66.34));
+        assert!(admits(large, 0.65, 75.3));
+        assert!(!admits(large, 0.65, 75.4));
+        // The bytes waiting are not added to the resident set again: the
+        // answer under the cap is the resident set's alone.
+        for resident in [66.34, 75.3, 75.4] {
+            assert_eq!(
+                admits(large, 0.0, resident),
+                admits(large, 15.3, resident),
+                "{resident}"
+            );
+        }
         // The cap, on a host with all the room.
         assert!(admits(large, 15.3, 10.0));
         assert!(!admits(large, 15.4, 10.0));
@@ -595,10 +604,11 @@ mod tests {
             },
             cap: 16 * G,
         };
-        assert!(!line.admits(4 * G, G, || Some(19 * G)));
-        assert!(line.admits(4 * G, G, || Some(19 * G - 1)));
+        assert!(!line.admits(4 * G, G, || Some(23 * G)));
+        assert!(line.admits(4 * G, G, || Some(23 * G - 1)));
         let small = room(45.90, 16);
         assert!(admits(small, 0.65, 25.62));
+        assert!(admits(small, 3.0, 29.2));
         assert!(!admits(small, 0.65, 29.34));
         assert!(!admits(small, 0.0, 36.08));
         // No reading is no room.
@@ -733,9 +743,9 @@ mod tests {
         stats.refused.store(181, Relaxed);
         assert_eq!(
             line(Setting::Room, Some(room(45.90, 16)), &stats),
-            "BLOCK GROUP QUEUE: room · at most 16.00 GiB while VmRSS + waiting + 16.00 stays under the \
-             line 45.90 GiB · most at once 1 groups 0.50 GiB · none waited behind another · the rule \
-             refused 181 groups"
+            "BLOCK GROUP QUEUE: room · at most 16.00 GiB waiting while VmRSS + the group + 16.00 \
+             stays under the line 45.90 GiB · most at once 1 groups 0.50 GiB · none waited behind \
+             another · the rule refused 181 groups"
         );
         stats.behind.store(96, Relaxed);
         stats.most_groups.store(13, Relaxed);
