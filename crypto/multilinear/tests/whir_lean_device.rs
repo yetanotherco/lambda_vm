@@ -18,6 +18,13 @@
 //! card that declined could not turn this into a comparison of today's path
 //! with itself. One `#[test]`: the arms switch process-wide overrides, and
 //! parallel tests would race them.
+//!
+//! Three more arms run the lean rounds in TILE form
+//! (`LAMBDA_VM_WHIR_LEAN_TILES=1`, `=wide`, `=check`) on a second stack, one
+//! the form takes: the same bytes again, every opening counted in tile form,
+//! and under `check` every round compared with the share form on the card
+//! with none different. On the first stack — a column of eight rows, which the
+//! form declines — the same arms prove today's bytes in share form.
 #![cfg(feature = "cuda")]
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
@@ -79,19 +86,32 @@ struct Case {
 
 fn case() -> Case {
     let heights = [13usize, 13, 13, 12, 12, 10, 8, 6, 3];
+    case_of(&heights, &[0, 1, 2, 3, 4, 5, 6, 7, 8])
+}
+
+/// A stack the tile form takes: three tables of several columns each (their
+/// columns share a point), no column under `2^9` rows.
+fn tile_case() -> Case {
+    let heights = [13usize, 13, 13, 12, 12, 12, 11, 9, 9];
+    case_of(&heights, &[0, 0, 0, 1, 1, 1, 2, 3, 3])
+}
+
+/// Columns of `heights` in one stack of `2^16`, column `i` claimed at the
+/// point of table `tables[i]`.
+fn case_of(heights: &[usize], tables: &[usize]) -> Case {
     let columns: Vec<Mle<F>> = heights
         .iter()
         .enumerate()
         .map(|(i, &h)| column(h, 7 + 31 * i as u64))
         .collect();
-    let layout = StackedLayout::build(&heights, 16).unwrap();
+    let layout = StackedLayout::build(heights, 16).unwrap();
     assert_eq!(layout.num_polys(), 1);
     let points: Vec<Vec<EE>> = heights
         .iter()
-        .enumerate()
-        .map(|(i, &h)| {
+        .zip(tables)
+        .map(|(&h, &table)| {
             (0..h)
-                .map(|j| EE::from(101 + 13 * i as u64 + j as u64))
+                .map(|j| EE::from(101 + 13 * table as u64 + j as u64))
                 .collect()
         })
         .collect();
@@ -121,19 +141,31 @@ enum Arm {
     /// Nothing forced: the defaults, three lean rounds, the fused fold and
     /// each chain's first successor encoded from its bound message.
     Defaults,
+    /// The defaults with the lean rounds in tile form
+    /// (`LAMBDA_VM_WHIR_LEAN_TILES`): on, wide, or checked against the share
+    /// form on every round.
+    Tiles(gpu::LeanTiles),
 }
 
 /// One arm: the path before the kernels or the two kernels.
+///
+/// `tiled` says whether the stack is one the tile form takes: its arms then
+/// open every chain in tile form, and in share form otherwise.
 fn prove_arm<H: WhirHash>(
     c: &Case,
     arm: Arm,
     resident: Option<&gpu::ResidentColumns>,
+    tiled: bool,
 ) -> (StackedProof<F, Ext>, Vec<[u8; 32]>) {
     let lean = !matches!(arm, Arm::Materialised);
     gpu::force_encode_successor(match arm {
-        Arm::Defaults => None,
+        Arm::Defaults | Arm::Tiles(_) => None,
         _ => Some(false),
     });
+    gpu::force_lean_tiles(Some(match arm {
+        Arm::Tiles(tiles) => tiles,
+        _ => gpu::LeanTiles::Off,
+    }));
     match arm {
         Arm::Materialised => {
             gpu::force_lean_rounds(Some(0));
@@ -143,7 +175,7 @@ fn prove_arm<H: WhirHash>(
             gpu::force_lean_rounds(Some(6));
             gpu::force_fused_fold(Some(true));
         }
-        Arm::Folded | Arm::Defaults => {
+        Arm::Folded | Arm::Defaults | Arm::Tiles(_) => {
             gpu::force_lean_rounds(None);
             gpu::force_fused_fold(None);
             if std::env::var_os("LAMBDA_VM_WHIR_LEAN_ROUNDS").is_none() {
@@ -153,7 +185,7 @@ fn prove_arm<H: WhirHash>(
                     "the default is three lean rounds"
                 );
             }
-            if matches!(arm, Arm::Defaults)
+            if matches!(arm, Arm::Defaults | Arm::Tiles(_))
                 && std::env::var_os("LAMBDA_VM_WHIR_ENCODE_SUCCESSOR").is_none()
             {
                 assert!(
@@ -174,6 +206,7 @@ fn prove_arm<H: WhirHash>(
     let (lean_before, fused_before) = (gpu::lean_open_calls(), gpu::fused_fold_calls());
     let encoded_before = gpu::encoded_successors();
     let (opens_before, folds_before) = (gpu::open_calls(), gpu::resident_fold_calls());
+    let (tiles_before, checks_before) = (gpu::lean_tile_opens(), gpu::lean_tile_checks());
     let proof = stacked_eval::prove::<F, Ext, _, H, _>(
         &stacked,
         &columns,
@@ -201,7 +234,7 @@ fn prove_arm<H: WhirHash>(
     // chain's later folds still fold.
     assert_eq!(
         gpu::encoded_successors() - encoded_before,
-        if matches!(arm, Arm::Defaults) && gpu::encode_successor_in_effect() {
+        if matches!(arm, Arm::Defaults | Arm::Tiles(_)) && gpu::encode_successor_in_effect() {
             opens
         } else {
             0
@@ -209,6 +242,42 @@ fn prove_arm<H: WhirHash>(
         "{} {arm:?}: successors encoded",
         H::NAME
     );
+    // The tile form in its arms on a stack that takes it, every chain; never
+    // elsewhere. Under `check`, each chain's lean rounds compared with the
+    // share form, none different.
+    let tile_opens = gpu::lean_tile_opens() - tiles_before;
+    let (checked, mismatched) = gpu::lean_tile_checks();
+    let checked = (checked - checks_before.0, mismatched - checks_before.1);
+    match arm {
+        Arm::Tiles(tiles) if tiled => {
+            assert_eq!(
+                tile_opens,
+                opens,
+                "{} {arm:?}: every opening in tile form",
+                H::NAME
+            );
+            let rounds = if tiles == gpu::LeanTiles::Check {
+                opens * gpu::lean_rounds_in_effect() as u64
+            } else {
+                0
+            };
+            assert_eq!(
+                checked,
+                (rounds, 0),
+                "{} {arm:?}: rounds compared, differing",
+                H::NAME
+            );
+        }
+        _ => {
+            assert_eq!(
+                tile_opens,
+                0,
+                "{} {arm:?}: an opening in tile form",
+                H::NAME
+            );
+            assert_eq!(checked, (0, 0), "{} {arm:?}: rounds compared", H::NAME);
+        }
+    }
     if lean {
         assert!(
             lean_opens > 0,
@@ -250,11 +319,18 @@ fn prove_arm<H: WhirHash>(
     (proof, stacked.roots())
 }
 
-fn both_arms<H: WhirHash>(c: &Case, resident: Option<&gpu::ResidentColumns>) {
-    let (today, today_roots) = prove_arm::<H>(c, Arm::Materialised, resident);
+fn both_arms<H: WhirHash>(c: &Case, resident: Option<&gpu::ResidentColumns>, tiled: bool) {
+    let (today, today_roots) = prove_arm::<H>(c, Arm::Materialised, resident, tiled);
     let today_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&today).unwrap();
-    for arm in [Arm::Six, Arm::Folded, Arm::Defaults] {
-        let (lean, lean_roots) = prove_arm::<H>(c, arm, resident);
+    for arm in [
+        Arm::Six,
+        Arm::Folded,
+        Arm::Defaults,
+        Arm::Tiles(gpu::LeanTiles::On),
+        Arm::Tiles(gpu::LeanTiles::Wide),
+        Arm::Tiles(gpu::LeanTiles::Check),
+    ] {
+        let (lean, lean_roots) = prove_arm::<H>(c, arm, resident, tiled);
         assert_eq!(today_roots, lean_roots, "{} {arm:?}: roots", H::NAME);
         assert_eq!(
             rkyv::to_bytes::<rkyv::rancor::Error>(&lean)
@@ -274,13 +350,34 @@ fn both_arms<H: WhirHash>(c: &Case, resident: Option<&gpu::ResidentColumns>) {
 
 #[test]
 fn the_memory_kernels_prove_todays_bytes() {
-    let c = case();
-    both_arms::<RpxWhir>(&c, None);
-    both_arms::<KeccakWhir>(&c, None);
-    let store = gpu::upload_columns(&multilinear::stacking::borrow(&c.columns))
-        .expect("the card took the columns (needs a GPU)");
-    both_arms::<RpxWhir>(&c, Some(&store));
+    // The first stack has a column of eight rows, which the tile form
+    // declines; the second is one it takes.
+    for (c, tiled) in [(case(), false), (tile_case(), true)] {
+        let raw: Vec<(usize, Vec<u64>, [u64; 3])> = c
+            .points
+            .iter()
+            .zip(c.layout.placements())
+            .map(|(point, place)| {
+                let limbs = point
+                    .iter()
+                    .flat_map(|z| gpu::ext3_raw(z).unwrap())
+                    .collect();
+                (place.offset, limbs, [1, 0, 0])
+            })
+            .collect();
+        assert_eq!(
+            multilinear::lean_tiles::plan(&raw, 16, 3).is_some(),
+            tiled,
+            "which stack the tile form takes"
+        );
+        both_arms::<RpxWhir>(&c, None, tiled);
+        both_arms::<KeccakWhir>(&c, None, tiled);
+        let store = gpu::upload_columns(&multilinear::stacking::borrow(&c.columns))
+            .expect("the card took the columns (needs a GPU)");
+        both_arms::<RpxWhir>(&c, Some(&store), tiled);
+    }
     gpu::force_lean_rounds(None);
     gpu::force_fused_fold(None);
     gpu::force_encode_successor(None);
+    gpu::force_lean_tiles(None);
 }

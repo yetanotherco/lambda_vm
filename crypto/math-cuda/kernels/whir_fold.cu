@@ -497,6 +497,280 @@ extern "C" __global__ void whir_lean_materialize(const uint16_t *__restrict__ co
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// THE LEAN ROUNDS FROM ONE PASS OVER THE MESSAGE: THE TILE FORM.
+//
+// `whir_lean_round` walks every stack position in every round and rebuilds the
+// weight there. The walk is not needed more than once. Cut the stack into TILES
+// of `2^u` positions, `u` no more than the smallest column's variables: columns
+// sit at multiples of their own size, so a tile lies inside one column or one
+// gap, and inside a column
+//
+//   w(T, j) = ω(T) · eq(λ, j),    ω(T) = scale · eq(z_hi, T − first tile),
+//
+// with `λ` the last `u` coordinates of the column's point and `z_hi` the rest.
+// Columns with the same `λ` are one CLASS, named by where its `eq(λ, ·)` table
+// sits in `eqbuf` (the shares' `lo_at`, which the host gives once per class).
+//
+// A COLUMN OF TILES is the `2^L` tiles that differ only in the `L` top bits
+// the lean rounds bind. Number the classes met in it `κ = 0, 1, …` (its
+// SLOTS, at most `2^L`) and define, over the tiles,
+//
+//   Ω_κ(T) = ω(T) if tile T is of slot κ, else 0
+//   Φ_κ(T) = Σ_j eq(λ_κ, j) · f(T, j)
+//
+// Then the first `L` round polynomials of the opening are the first `L` round
+// polynomials of the sumcheck of `Σ_κ Ω_κ·Φ_κ` over the tiles, at the same
+// challenges: bound in its first `s` variables the weight at `(R, j)` is
+// `Σ_κ Ω̃_κ(R)·eq(λ_κ, j)` — the slot numbering depends only on the bits of `R`
+// below the lean rounds — and `Σ_j eq(λ_κ, j)·f̃(R, j) = Φ̃_κ(R)`.
+//
+// So `Φ` is one pass over the message, three products a position and class,
+// `Ω` one product a tile, and every round after that reads `2^(n−u)` values a
+// slot instead of `2^n` positions. Bound at the rounds' challenges, the weight
+// is `Σ_κ Ω_κ^bound(R)·eq(λ_κ, j)` and the message is what
+// `whir_lean_materialize` writes.
+//
+// ★ EQUAL, not raw-identical, as the share form above is: the same field
+// elements by another sequence of operations.
+//
+// The share rows are the share form's with `lo_bits = u` in every row. The
+// tile map is `whir_lean_colmap` run over tiles (starts and ends in tiles).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#define WHIR_TILE_MAX_SLOTS 8
+#define WHIR_TILE_NO_SLOT 0xFFFFFFFFFFFFFFFFull
+
+__device__ __forceinline__ Fe3 whir_load3(const uint64_t *__restrict__ at) {
+    return ext3::make(at[0], at[1], at[2]);
+}
+
+__device__ __forceinline__ void whir_store3(uint64_t *__restrict__ at, const Fe3 &v) {
+    at[0] = v.a;
+    at[1] = v.b;
+    at[2] = v.c;
+}
+
+// One column of tiles: its slots — `slot_lo[col·slots + κ]`, the class of slot
+// `κ` or `NO_SLOT` — and `Ω` for its `2^lean` tiles, every slot written. `nu`
+// is the tiles' variable count, `n − u`. The host promises `slots` is at least
+// the classes any column meets.
+__device__ void whir_tile_plan_at(const uint16_t *__restrict__ tilemap,
+                                  const uint64_t *__restrict__ shares,
+                                  const uint64_t *__restrict__ eqbuf, uint32_t nu, uint32_t lean,
+                                  uint32_t u, uint32_t slots, uint64_t col,
+                                  uint64_t *__restrict__ slot_lo, uint64_t *__restrict__ omega) {
+    uint64_t cols = 1ull << (nu - lean);
+    uint64_t tiles = 1ull << nu;
+    uint64_t found[WHIR_TILE_MAX_SLOTS];
+    uint32_t used = 0;
+    for (uint64_t q = 0; q < (1ull << lean); ++q) {
+        uint64_t tile = q * cols + col;
+        uint16_t id = tilemap[tile];
+        uint32_t slot = slots;
+        Fe3 weight = ext3::zero();
+        if (id != WHIR_LEAN_NONE) {
+            const uint64_t *share = shares + (uint64_t)id * WHIR_LEAN_SHARE_WORDS;
+            uint64_t lo_at = share[4];
+            slot = 0;
+            while (slot < used && found[slot] != lo_at) ++slot;
+            if (slot == used && used < slots) {
+                found[used] = lo_at;
+                ++used;
+            }
+            uint64_t hi_at = (share[3] + (tile - (share[0] >> u))) * 3;
+            weight = ext3::mul(ext3::make(share[5], share[6], share[7]), whir_load3(eqbuf + hi_at));
+        }
+        for (uint32_t s = 0; s < slots; ++s) {
+            whir_store3(omega + ((uint64_t)s * tiles + tile) * 3,
+                        s == slot ? weight : ext3::zero());
+        }
+    }
+    for (uint32_t s = 0; s < slots; ++s) {
+        slot_lo[col * slots + s] = s < used ? found[s] : WHIR_TILE_NO_SLOT;
+    }
+}
+
+extern "C" __global__ void whir_tile_plan(const uint16_t *__restrict__ tilemap,
+                                          const uint64_t *__restrict__ shares,
+                                          const uint64_t *__restrict__ eqbuf, uint32_t nu,
+                                          uint32_t lean, uint32_t u, uint32_t slots,
+                                          uint64_t *__restrict__ slot_lo,
+                                          uint64_t *__restrict__ omega) {
+    uint64_t cols = 1ull << (nu - lean);
+    uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    for (uint64_t col = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; col < cols;
+         col += stride) {
+        whir_tile_plan_at(tilemap, shares, eqbuf, nu, lean, u, slots, col, slot_lo, omega);
+    }
+}
+
+// `Φ_κ(tile)` for every slot of the tile's column, over the cells `first,
+// first + step, …` of the tile: all of it at `(0, 1)`, one lane's part of it
+// at `(lane, lanes)`. A tile no column covers, and a slot its column does not
+// use, are zero.
+__device__ void whir_tile_contract_at(const uint16_t *__restrict__ tilemap,
+                                      const uint64_t *__restrict__ shares,
+                                      const uint64_t *__restrict__ eqbuf,
+                                      const uint64_t *__restrict__ data,
+                                      const uint64_t *__restrict__ slot_lo, uint32_t nu,
+                                      uint32_t lean, uint32_t u, uint32_t slots, uint64_t tile,
+                                      uint64_t first, uint64_t step, Fe3 *acc) {
+    for (uint32_t s = 0; s < slots; ++s) acc[s] = ext3::zero();
+    uint16_t id = tilemap[tile];
+    if (id == WHIR_LEAN_NONE) return;
+    const uint64_t *share = shares + (uint64_t)id * WHIR_LEAN_SHARE_WORDS;
+    const uint64_t *from = data + share[1] + ((tile - (share[0] >> u)) << u);
+    const uint64_t *lo_of = slot_lo + (tile & ((1ull << (nu - lean)) - 1)) * slots;
+    // Slots fill from zero, so the used ones are a prefix.
+    const uint64_t *lo[WHIR_TILE_MAX_SLOTS];
+    uint32_t used = 0;
+    while (used < slots && lo_of[used] != WHIR_TILE_NO_SLOT) {
+        lo[used] = eqbuf + lo_of[used] * 3;
+        ++used;
+    }
+    uint64_t cells = 1ull << u;
+    for (uint64_t j = first; j < cells; j += step) {
+        uint64_t f = from[j];
+        for (uint32_t s = 0; s < used; ++s) {
+            acc[s] = ext3::add(acc[s], ext3::mul_base(whir_load3(lo[s] + j * 3), f));
+        }
+    }
+}
+
+// `Φ`, one thread a tile.
+extern "C" __global__ void whir_tile_contract(const uint16_t *__restrict__ tilemap,
+                                              const uint64_t *__restrict__ shares,
+                                              const uint64_t *__restrict__ eqbuf,
+                                              const uint64_t *__restrict__ data,
+                                              const uint64_t *__restrict__ slot_lo, uint32_t nu,
+                                              uint32_t lean, uint32_t u, uint32_t slots,
+                                              uint64_t *__restrict__ phi) {
+    uint64_t tiles = 1ull << nu;
+    uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    for (uint64_t tile = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; tile < tiles;
+         tile += stride) {
+        Fe3 acc[WHIR_TILE_MAX_SLOTS];
+        whir_tile_contract_at(tilemap, shares, eqbuf, data, slot_lo, nu, lean, u, slots, tile, 0,
+                              1, acc);
+        for (uint32_t s = 0; s < slots; ++s) {
+            whir_store3(phi + ((uint64_t)s * tiles + tile) * 3, acc[s]);
+        }
+    }
+}
+
+// The block's threads' values summed into thread 0's `out`. Every thread of
+// the block calls it, with its own `value`.
+__device__ __forceinline__ void whir_tile_block_sum(const Fe3 &value, Fe3 &out) {
+    extern __shared__ uint64_t shared[];
+    whir_store3(shared + threadIdx.x * 3, value);
+    __syncthreads();
+    for (uint32_t width = blockDim.x / 2; width > 0; width >>= 1) {
+        if (threadIdx.x < width) {
+            Fe3 sum = ext3::add(whir_load3(shared + threadIdx.x * 3),
+                                whir_load3(shared + (threadIdx.x + width) * 3));
+            whir_store3(shared + threadIdx.x * 3, sum);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out = whir_load3(shared);
+    __syncthreads();
+}
+
+// `Φ`, one block a tile: the block's threads take the tile's cells in turn, so
+// a warp reads consecutive words, and their parts are summed in the block.
+// The same values as `whir_tile_contract`. The block is a power of two.
+extern "C" __global__ void whir_tile_contract_wide(const uint16_t *__restrict__ tilemap,
+                                                   const uint64_t *__restrict__ shares,
+                                                   const uint64_t *__restrict__ eqbuf,
+                                                   const uint64_t *__restrict__ data,
+                                                   const uint64_t *__restrict__ slot_lo,
+                                                   uint32_t nu, uint32_t lean, uint32_t u,
+                                                   uint32_t slots, uint64_t *__restrict__ phi) {
+    uint64_t tiles = 1ull << nu;
+    for (uint64_t tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
+        Fe3 acc[WHIR_TILE_MAX_SLOTS];
+        whir_tile_contract_at(tilemap, shares, eqbuf, data, slot_lo, nu, lean, u, slots, tile,
+                              threadIdx.x, blockDim.x, acc);
+        for (uint32_t s = 0; s < slots; ++s) {
+            Fe3 sum = ext3::zero();
+            whir_tile_block_sum(acc[s], sum);
+            if (threadIdx.x == 0) {
+                whir_store3(phi + ((uint64_t)s * tiles + tile) * 3, sum);
+            }
+        }
+    }
+}
+
+// One pair's share of a round over the slot tables as they stand — `2·half`
+// live values at the front of each, `stride` values apart: the product rule at
+// each node, summed over the slots.
+__device__ void whir_tile_round_at(const uint64_t *__restrict__ omega,
+                                   const uint64_t *__restrict__ phi, uint64_t stride,
+                                   uint32_t slots, uint64_t half,
+                                   const uint64_t *__restrict__ d_t, uint32_t num_t, uint64_t i,
+                                   Fe3 *acc) {
+    for (uint32_t s = 0; s < slots; ++s) {
+        const uint64_t *w = omega + (uint64_t)s * stride * 3;
+        const uint64_t *f = phi + (uint64_t)s * stride * 3;
+        Fe3 w_lo = whir_load3(w + i * 3), w_hi = whir_load3(w + (i + half) * 3);
+        Fe3 f_lo = whir_load3(f + i * 3), f_hi = whir_load3(f + (i + half) * 3);
+        Fe3 w_d = ext3::sub(w_hi, w_lo), f_d = ext3::sub(f_hi, f_lo);
+        for (uint32_t ti = 0; ti < num_t; ++ti) {
+            Fe3 t = whir_load3(d_t + ti * 3);
+            Fe3 w_t = ext3::add(w_lo, ext3::mul(t, w_d));
+            Fe3 f_t = ext3::add(f_lo, ext3::mul(t, f_d));
+            acc[ti] = ext3::add(acc[ti], ext3::mul(w_t, f_t));
+        }
+    }
+}
+
+// A round's evaluations at the `num_t` nodes, one partial per (node, block) in
+// `sum_partials_ext3`'s layout, as `whir_lean_round` leaves them.
+extern "C" __global__ void whir_tile_round(const uint64_t *__restrict__ omega,
+                                           const uint64_t *__restrict__ phi, uint64_t stride,
+                                           uint32_t slots, uint64_t half,
+                                           const uint64_t *__restrict__ d_t, uint32_t num_t,
+                                           uint64_t *__restrict__ d_partials) {
+    Fe3 acc[WHIR_LEAN_MAX_T];
+    for (uint32_t ti = 0; ti < num_t; ++ti) acc[ti] = ext3::zero();
+    uint64_t step = (uint64_t)gridDim.x * blockDim.x;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < half; i += step) {
+        whir_tile_round_at(omega, phi, stride, slots, half, d_t, num_t, i, acc);
+    }
+    for (uint32_t ti = 0; ti < num_t; ++ti) {
+        Fe3 sum = ext3::zero();
+        whir_tile_block_sum(acc[ti], sum);
+        if (threadIdx.x == 0) {
+            whir_store3(d_partials + ((uint64_t)ti * gridDim.x + blockIdx.x) * 3, sum);
+        }
+    }
+}
+
+// `x[i] ← x[i] + r·(x[i + half] − x[i])`: one table bound at a round's
+// challenge, in place, the order `Mle::fix_first_variable` binds in.
+__device__ __forceinline__ void whir_tile_fold_at(uint64_t *__restrict__ x, uint64_t half,
+                                                  uint64_t i, const Fe3 &r) {
+    Fe3 lo = whir_load3(x + i * 3), hi = whir_load3(x + (i + half) * 3);
+    whir_store3(x + i * 3, ext3::add(lo, ext3::mul(r, ext3::sub(hi, lo))));
+}
+
+// Every slot table of `Ω` and of `Φ` bound at `r`.
+extern "C" __global__ void whir_tile_fold(uint64_t *__restrict__ omega, uint64_t *__restrict__ phi,
+                                          uint64_t stride, uint32_t slots, uint64_t half,
+                                          const uint64_t *__restrict__ r) {
+    Fe3 challenge = whir_load3(r);
+    uint64_t tasks = 2ull * slots * half;
+    uint64_t step = (uint64_t)gridDim.x * blockDim.x;
+    for (uint64_t task = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; task < tasks;
+         task += step) {
+        uint64_t table = task / half;
+        uint64_t i = task - table * half;
+        uint64_t *x = table < slots ? omega + table * stride * 3 : phi + (table - slots) * stride * 3;
+        whir_tile_fold_at(x, half, i, challenge);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // A chain's successor from its bound message (D-SPEED lever 5a).
 //
 // The fold of a committed codeword is the encoding of the message its rounds

@@ -421,6 +421,14 @@ pub struct Backend {
     pub whir_lean_colmap: CudaFunction,
     pub whir_lean_round: CudaFunction,
     pub whir_lean_materialize: CudaFunction,
+    /// The lean rounds in tile form (`whir_open::TileSpec`): each column of
+    /// tiles' slots and weights, the one pass over the message (a thread a
+    /// tile, or a block a tile), a round over the slot tables, and their fold.
+    pub whir_tile_plan: CudaFunction,
+    pub whir_tile_contract: CudaFunction,
+    pub whir_tile_contract_wide: CudaFunction,
+    pub whir_tile_round: CudaFunction,
+    pub whir_tile_fold: CudaFunction,
     /// An interleaved ext3 array's limb as a plane, and back (a successor
     /// encoded from its bound message, `whir::encode_successor`).
     pub ext3_limb_gather: CudaFunction,
@@ -1222,6 +1230,11 @@ impl Backend {
             whir_lean_colmap: whir_fold.load_function("whir_lean_colmap")?,
             whir_lean_round: whir_fold.load_function("whir_lean_round")?,
             whir_lean_materialize: whir_fold.load_function("whir_lean_materialize")?,
+            whir_tile_plan: whir_fold.load_function("whir_tile_plan")?,
+            whir_tile_contract: whir_fold.load_function("whir_tile_contract")?,
+            whir_tile_contract_wide: whir_fold.load_function("whir_tile_contract_wide")?,
+            whir_tile_round: whir_fold.load_function("whir_tile_round")?,
+            whir_tile_fold: whir_fold.load_function("whir_tile_fold")?,
             ext3_limb_gather: whir_fold.load_function("ext3_limb_gather")?,
             ext3_limb_scatter: whir_fold.load_function("ext3_limb_scatter")?,
             sumcheck_round_ext3: sumcheck.load_function("sumcheck_round_ext3")?,

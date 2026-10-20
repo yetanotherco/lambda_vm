@@ -2549,6 +2549,19 @@ fn the_whir_block_tree_on_a_real_block() {
         multilinear::gpu::lean_open_calls(),
         multilinear::gpu::open_calls()
     );
+    // How those rounds were computed (`LAMBDA_VM_WHIR_LEAN_TILES`): over every
+    // stack position in every round (off, the default), or from one pass over
+    // the message; under `check`, the rounds run both ways and how many
+    // differed.
+    {
+        let (compared, differing) = multilinear::gpu::lean_tile_checks();
+        println!(
+            "W3 WHIR LEAN TILES: {} · tile opens {} of {} lean · rounds compared {compared} · differing {differing}",
+            multilinear::gpu::lean_tiles_in_effect(),
+            multilinear::gpu::lean_tile_opens(),
+            multilinear::gpu::lean_open_calls()
+        );
+    }
     // Each chain's first successor: encoded from the bound message (the
     // default) or folded (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0`), and how many
     // folds ran.

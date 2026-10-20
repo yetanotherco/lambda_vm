@@ -16,6 +16,7 @@ pub mod gkr_gruen;
 pub mod gkr_lockstep;
 pub mod gpu;
 pub mod gpu_fused;
+pub mod lean_tiles;
 pub mod logup;
 pub mod mle;
 pub mod narrow;

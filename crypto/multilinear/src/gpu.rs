@@ -85,6 +85,8 @@ static FACTOR_CALLS: AtomicU64 = AtomicU64::new(0);
 static OPEN_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Of those, the ones that began in share form.
 static LEAN_OPEN_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Of those, the ones whose rounds ran in tile form.
+static LEAN_TILE_OPENS: AtomicU64 = AtomicU64::new(0);
 /// Device folds that ran every level in one launch.
 static FUSED_FOLD_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Folds of a codeword the device holds, in one launch or one per level: what
@@ -324,6 +326,25 @@ pub fn lean_open_calls() -> u64 {
     LEAN_OPEN_CALLS.load(Ordering::Relaxed)
 }
 
+/// Lean openings whose rounds ran in tile form — one pass over the message,
+/// then tables a tile's size smaller ([`crate::lean_tiles`],
+/// `LAMBDA_VM_WHIR_LEAN_TILES`) — rather than over every stack position.
+pub fn lean_tile_opens() -> u64 {
+    LEAN_TILE_OPENS.load(Ordering::Relaxed)
+}
+
+/// Rounds `LAMBDA_VM_WHIR_LEAN_TILES=check` ran both ways and compared, and
+/// how many differed (a round that differed sent the share form's values).
+#[cfg(feature = "cuda")]
+pub fn lean_tile_checks() -> (u64, u64) {
+    math_cuda::whir_open::tile_check_counts()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn lean_tile_checks() -> (u64, u64) {
+    (0, 0)
+}
+
 /// Device folds that ran every level in one launch.
 pub fn fused_fold_calls() -> u64 {
     FUSED_FOLD_CALLS.load(Ordering::Relaxed)
@@ -470,6 +491,7 @@ pub fn reset_call_counters() {
     FACTOR_CALLS.store(0, Ordering::Relaxed);
     OPEN_CALLS.store(0, Ordering::Relaxed);
     LEAN_OPEN_CALLS.store(0, Ordering::Relaxed);
+    LEAN_TILE_OPENS.store(0, Ordering::Relaxed);
     FUSED_FOLD_CALLS.store(0, Ordering::Relaxed);
     RESIDENT_FOLD_CALLS.store(0, Ordering::Relaxed);
     ENCODED_SUCCESSORS.store(0, Ordering::Relaxed);
@@ -4677,6 +4699,70 @@ pub fn force_lean_rounds(rounds: Option<usize>) {
     LEAN_ROUNDS_FORCED.store(rounds.unwrap_or(usize::MAX), Ordering::Relaxed);
 }
 
+/// How a lean opening's rounds are computed (`LAMBDA_VM_WHIR_LEAN_TILES`):
+/// unset or `0`, over every stack position in every round, as they always
+/// have been; `1`, from one pass over the message and tables a tile's size
+/// smaller ([`crate::lean_tiles`]); `wide`, the same with the pass one block a
+/// tile; `check`, both on every round, compared ([`lean_tile_checks`]). The
+/// same values every way; a stack the tile form does not take runs as today.
+#[cfg(feature = "cuda")]
+pub use math_cuda::whir_open::LeanTiles;
+
+#[cfg(feature = "cuda")]
+static LEAN_TILES_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(feature = "cuda")]
+fn lean_tiles() -> LeanTiles {
+    match LEAN_TILES_FORCED.load(Ordering::Relaxed) {
+        1 => LeanTiles::Off,
+        2 => LeanTiles::On,
+        3 => LeanTiles::Wide,
+        4 => LeanTiles::Check,
+        _ => {
+            static SET: std::sync::OnceLock<LeanTiles> = std::sync::OnceLock::new();
+            *SET.get_or_init(|| {
+                math_cuda::whir_open::lean_tiles_setting(
+                    std::env::var("LAMBDA_VM_WHIR_LEAN_TILES").ok().as_deref(),
+                )
+            })
+        }
+    }
+}
+
+/// Overrides `LAMBDA_VM_WHIR_LEAN_TILES` for the whole process — for a parity
+/// test that proves every way in one binary. `None` restores the
+/// environment's setting. Not for production callers.
+#[doc(hidden)]
+#[cfg(feature = "cuda")]
+pub fn force_lean_tiles(tiles: Option<LeanTiles>) {
+    LEAN_TILES_FORCED.store(
+        match tiles {
+            None => 0,
+            Some(LeanTiles::Off) => 1,
+            Some(LeanTiles::On) => 2,
+            Some(LeanTiles::Wide) => 3,
+            Some(LeanTiles::Check) => 4,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// The setting in effect, for a harness's banner.
+#[cfg(feature = "cuda")]
+pub fn lean_tiles_in_effect() -> &'static str {
+    match lean_tiles() {
+        LeanTiles::Off => "off",
+        LeanTiles::On => "on",
+        LeanTiles::Wide => "wide",
+        LeanTiles::Check => "check",
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn lean_tiles_in_effect() -> &'static str {
+    "off"
+}
+
 /// Whether a device fold runs every level in one launch
 /// ([`math_cuda::whir::fold_resident_fused`]) or one launch per level. `true`
 /// unless `LAMBDA_VM_NO_WHIR_FUSED_FOLD` is set; the two are raw-identical.
@@ -5118,7 +5204,7 @@ where
     // before, before any challenge is drawn.
     let rounds = lean_rounds().min(n_stack);
     if rounds > 0
-        && let Some(lean) = lean_opening(&shares, n_stack, message, &host_parts)
+        && let Some(lean) = lean_opening(&shares, n_stack, message, &host_parts, rounds)
     {
         OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
         LEAN_OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -5174,18 +5260,68 @@ fn materialize_state(
 /// The lean opening of a stacked polynomial: its shares with their points'
 /// `eq` tables in halves (computed here, a few kilobytes each), and the
 /// message where it already is. `None` when the stack is not one it can read.
+///
+/// Under `LAMBDA_VM_WHIR_LEAN_TILES` its `rounds` rounds run in tile form
+/// when the stack takes it ([`crate::lean_tiles::plan`]); otherwise, and by
+/// default, in share form.
 #[cfg(feature = "cuda")]
 fn lean_opening<F>(
     shares: &[(usize, Vec<u64>, [u64; 3])],
     n_stack: usize,
     message: &crate::whir_chain::Stacked<'_, F>,
     host_parts: &[(&[u64], usize)],
+    rounds: usize,
 ) -> Option<math_cuda::whir_open::LeanRound0>
 where
     F: math::field::traits::IsField + 'static,
 {
     use math::field::element::FieldElement;
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+
+    let source = || match &message.resident {
+        Some((store, parts)) => math_cuda::whir_open::LeanMessage::Resident {
+            store: &store.0,
+            parts,
+        },
+        None => math_cuda::whir_open::LeanMessage::Parts(host_parts),
+    };
+    let tiles = lean_tiles();
+    if tiles != LeanTiles::Off
+        && let Some(plan) = crate::lean_tiles::plan(shares, n_stack, rounds)
+    {
+        let tile_shares: Vec<math_cuda::whir_open::LeanShare> = plan
+            .shares
+            .iter()
+            .map(|share| math_cuda::whir_open::LeanShare {
+                stack_offset: share.stack_offset,
+                num_vars: share.num_vars,
+                lo_bits: plan.tile_bits,
+                hi_at: share.hi_at,
+                lo_at: share.lo_at,
+                scale: share.scale,
+            })
+            .collect();
+        let spec = math_cuda::whir_open::TileSpec {
+            tile_bits: plan.tile_bits,
+            lean_rounds: rounds,
+            slots: plan.slots,
+            wide: tiles == LeanTiles::Wide,
+            check: tiles == LeanTiles::Check,
+        };
+        // A decline here — the device's own reading of the stack, or a card
+        // that will not hold the form — opens in share form: no challenge
+        // has been drawn.
+        if let Ok(Some(lean)) = math_cuda::whir_open::LeanRound0::with_tiles(
+            &tile_shares,
+            &plan.eq,
+            n_stack,
+            source(),
+            Some(spec),
+        ) {
+            LEAN_TILE_OPENS.fetch_add(1, Ordering::Relaxed);
+            return Some(lean);
+        }
+    }
 
     // Sorted by offset: the map from a stack position to its column is a
     // binary search over them.
@@ -5227,14 +5363,7 @@ where
             scale: *scale,
         });
     }
-    let source = match &message.resident {
-        Some((store, parts)) => math_cuda::whir_open::LeanMessage::Resident {
-            store: &store.0,
-            parts,
-        },
-        None => math_cuda::whir_open::LeanMessage::Parts(host_parts),
-    };
-    math_cuda::whir_open::LeanRound0::new(&lean_shares, &eq, n_stack, source)
+    math_cuda::whir_open::LeanRound0::new(&lean_shares, &eq, n_stack, source())
         .ok()
         .flatten()
 }

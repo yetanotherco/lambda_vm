@@ -326,6 +326,280 @@ pub fn lean_rounds_setting(value: Option<&str>) -> usize {
 const LEAN_SCRATCH_BYTES: u64 =
     ((LEAN_MAX_T * 3 + LEAN_MAX_T * LEAN_MAX_GRID as usize * 3 + LEAN_MAX_T * 3) * 8) as u64;
 
+/// Slot tables a tile-form opening may hold (`WHIR_TILE_MAX_SLOTS` in
+/// `whir_fold.cu`).
+pub const TILE_MAX_SLOTS: usize = 8;
+
+/// ★ The lean rounds from ONE pass over the message: the tile form
+/// (`whir_tile_*` in `whir_fold.cu`, where the identity is written out).
+///
+/// The share form walks every stack position in every round. Here the stack is
+/// cut into tiles of `2^tile_bits` positions — every share at least that long,
+/// its point's `eq` table split there — so the weight inside a tile is one
+/// number times a small table its class shares. One pass over the message
+/// reduces each tile to a value per slot (`Φ`), one multiply a tile gives the
+/// weight's (`Ω`), and every round then reads those tables, `2^tile_bits`
+/// times smaller than the stack. The same field elements as the share form's
+/// rounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileSpec {
+    /// A tile is `2^tile_bits` stack positions: every share's `lo_bits`.
+    pub tile_bits: usize,
+    /// The rounds the opening runs before it writes its tables. A column of
+    /// tiles is the `2^lean_rounds` tiles those rounds bind together.
+    pub lean_rounds: usize,
+    /// Slot tables held: at least the classes (distinct `lo_at`) any column
+    /// of tiles meets.
+    pub slots: usize,
+    /// The pass over the message as one block a tile (a warp reads consecutive
+    /// words) rather than one thread a tile. The same values.
+    pub wide: bool,
+    /// Every round also run in share form and compared
+    /// ([`tile_check_counts`]): a difference is counted, and the round sends
+    /// the share form's values, so the proof is today's either way.
+    pub check: bool,
+}
+
+impl TileSpec {
+    /// Device bytes the tile form holds beside the share form's: a `u16` per
+    /// tile, each column's slots, `Ω` and `Φ` (three limbs a tile and slot
+    /// each), and a challenge.
+    pub const fn device_bytes(&self, num_vars: usize) -> u64 {
+        let tiles = 1u64 << (num_vars - self.tile_bits);
+        let columns = tiles >> self.lean_rounds;
+        let slots = self.slots as u64;
+        2 * tiles + 8 * slots * columns + 48 * slots * tiles + 24
+    }
+
+    /// Whether a stack of `2^num_vars` takes this form: the rounds bind tile
+    /// variables only, the slots are ones the kernels have room for, and ALL
+    /// the form holds is no larger than the tables written once the rounds
+    /// are spent (`48 · 2^(num_vars − lean_rounds)` bytes) — it is freed
+    /// before they are allocated, so an opening's working set is the share
+    /// form's.
+    pub const fn fits(&self, num_vars: usize) -> bool {
+        self.tile_bits <= num_vars
+            && self.lean_rounds >= 1
+            && self.lean_rounds <= num_vars - self.tile_bits
+            && self.slots >= 1
+            && self.slots <= TILE_MAX_SLOTS
+            && self.device_bytes(num_vars) <= 48u64 << (num_vars - self.lean_rounds)
+    }
+}
+
+/// What `LAMBDA_VM_WHIR_LEAN_TILES` asks of a stacked opening's lean rounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeanTiles {
+    /// The share form: `whir_lean_round` over every position, every round.
+    Off,
+    /// The tile form ([`TileSpec`]), one thread a tile.
+    On,
+    /// The tile form with the pass over the message one block a tile.
+    Wide,
+    /// The tile form, every round also run in share form and compared; the
+    /// share form's values are the ones sent.
+    Check,
+}
+
+/// `LAMBDA_VM_WHIR_LEAN_TILES`'s value read: `1` the tile form, `wide` the
+/// same with the wide pass, `check` the tile form compared with the share form
+/// on every round; unset, `0` or anything else is the share form.
+pub fn lean_tiles_setting(value: Option<&str>) -> LeanTiles {
+    match value.map(str::trim) {
+        Some("1") => LeanTiles::On,
+        Some("wide") => LeanTiles::Wide,
+        Some("check") => LeanTiles::Check,
+        _ => LeanTiles::Off,
+    }
+}
+
+static TILE_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TILE_MISMATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Rounds a checking tile-form opening ([`TileSpec::check`]) compared with
+/// the share form since the process started, and how many differed. A round
+/// that differed still sent the share form's values.
+pub fn tile_check_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (TILE_CHECKED.load(Relaxed), TILE_MISMATCHED.load(Relaxed))
+}
+
+static TILE_CHECK_FAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Moves every tile-form round value a checking opening compares by one,
+/// before the comparison and nowhere else — for the test that shows the
+/// comparison counts a difference. What a round sends is unchanged. Not for
+/// production callers.
+#[doc(hidden)]
+pub fn force_tile_check_fault(on: bool) {
+    TILE_CHECK_FAULT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `shares` are a stack the tile form reads under `spec`: the spec
+/// fits, every share is split at the tile, is at least a tile long and sits at
+/// a multiple of its own size, and the slots cover the classes a column of
+/// tiles can meet.
+fn tiles_read(shares: &[LeanShare], num_vars: usize, spec: &TileSpec) -> bool {
+    if !spec.fits(num_vars) {
+        return false;
+    }
+    let mut classes = std::collections::BTreeSet::new();
+    for share in shares {
+        if share.lo_bits != spec.tile_bits
+            || share.num_vars < spec.tile_bits
+            || share.stack_offset & ((1usize << share.num_vars) - 1) != 0
+        {
+            return false;
+        }
+        classes.insert(share.lo_at);
+    }
+    spec.slots >= classes.len().min(1usize << spec.lean_rounds)
+}
+
+/// The tile form's device state.
+struct Tiles {
+    spec: TileSpec,
+    tilemap: CudaSlice<u16>,
+    slot_lo: CudaSlice<u64>,
+    omega: CudaSlice<u64>,
+    phi: CudaSlice<u64>,
+    r_dev: CudaSlice<u64>,
+    /// Challenges the slot tables are bound at. The rest of the opening's
+    /// are folded in before the next round reads them.
+    folded: usize,
+}
+
+impl Tiles {
+    /// The tile map, each column's slots and `Ω`, and the one pass over the
+    /// message for `Φ`, queued on `stream`.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        stream: &Arc<CudaStream>,
+        spec: TileSpec,
+        num_vars: usize,
+        shares: &CudaSlice<u64>,
+        eq: &CudaSlice<u64>,
+        data: &CudaSlice<u64>,
+        starts: &[u64],
+        ends: &[u64],
+    ) -> Result<Self> {
+        let be = backend()?;
+        let nu = num_vars - spec.tile_bits;
+        let tiles = 1usize << nu;
+        let columns = tiles >> spec.lean_rounds;
+        let tile_starts: Vec<u64> = starts.iter().map(|s| s >> spec.tile_bits).collect();
+        let tile_ends: Vec<u64> = ends.iter().map(|e| e >> spec.tile_bits).collect();
+        let starts_dev = crate::device::htod_or_trim(stream, &tile_starts)?;
+        let ends_dev = crate::device::htod_or_trim(stream, &tile_ends)?;
+        // SAFETY: each kernel below writes every element of what it is handed.
+        let mut tilemap = unsafe { crate::device::alloc_or_trim::<u16>(stream, tiles) }?;
+        let mut slot_lo =
+            unsafe { crate::device::alloc_or_trim::<u64>(stream, columns * spec.slots) }?;
+        let mut omega =
+            unsafe { crate::device::alloc_or_trim::<u64>(stream, spec.slots * tiles * 3) }?;
+        let mut phi =
+            unsafe { crate::device::alloc_or_trim::<u64>(stream, spec.slots * tiles * 3) }?;
+        let r_dev = crate::device::alloc_zeros_or_trim::<u64>(stream, 3)?;
+        let grid_for = |work: usize| {
+            (work as u64)
+                .div_ceil(LEAN_BLOCK as u64)
+                .min(LEAN_MAX_GRID as u64) as u32
+        };
+        let count = starts.len() as u32;
+        let (nu_arg, lean_arg, u_arg, slots_arg) = (
+            nu as u32,
+            spec.lean_rounds as u32,
+            spec.tile_bits as u32,
+            spec.slots as u32,
+        );
+        unsafe {
+            stream
+                .launch_builder(&be.whir_lean_colmap)
+                .arg(&mut tilemap)
+                .arg(&(tiles as u64))
+                .arg(&starts_dev)
+                .arg(&ends_dev)
+                .arg(&count)
+                .launch(LaunchConfig {
+                    grid_dim: (grid_for(tiles).max(1), 1, 1),
+                    block_dim: (LEAN_BLOCK, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+            stream
+                .launch_builder(&be.whir_tile_plan)
+                .arg(&tilemap)
+                .arg(shares)
+                .arg(eq)
+                .arg(&nu_arg)
+                .arg(&lean_arg)
+                .arg(&u_arg)
+                .arg(&slots_arg)
+                .arg(&mut slot_lo)
+                .arg(&mut omega)
+                .launch(LaunchConfig {
+                    grid_dim: (grid_for(columns).max(1), 1, 1),
+                    block_dim: (LEAN_BLOCK, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+            if spec.wide {
+                // One block a tile at a time, its threads the tile's cells in
+                // turn: never more threads than cells.
+                let block = LEAN_BLOCK.min(1u32 << spec.tile_bits.min(31));
+                stream
+                    .launch_builder(&be.whir_tile_contract_wide)
+                    .arg(&tilemap)
+                    .arg(shares)
+                    .arg(eq)
+                    .arg(data)
+                    .arg(&slot_lo)
+                    .arg(&nu_arg)
+                    .arg(&lean_arg)
+                    .arg(&u_arg)
+                    .arg(&slots_arg)
+                    .arg(&mut phi)
+                    .launch(LaunchConfig {
+                        grid_dim: ((tiles as u64).min(LEAN_MAX_GRID as u64) as u32, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: block * 3 * 8,
+                    })?;
+            } else {
+                stream
+                    .launch_builder(&be.whir_tile_contract)
+                    .arg(&tilemap)
+                    .arg(shares)
+                    .arg(eq)
+                    .arg(data)
+                    .arg(&slot_lo)
+                    .arg(&nu_arg)
+                    .arg(&lean_arg)
+                    .arg(&u_arg)
+                    .arg(&slots_arg)
+                    .arg(&mut phi)
+                    .launch(LaunchConfig {
+                        grid_dim: (grid_for(tiles).max(1), 1, 1),
+                        block_dim: (LEAN_BLOCK, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+        }
+        Ok(Self {
+            spec,
+            tilemap,
+            slot_lo,
+            omega,
+            phi,
+            r_dev,
+            folded: 0,
+        })
+    }
+
+    fn device_bytes(&self) -> u64 {
+        (self.tilemap.len() * 2
+            + (self.slot_lo.len() + self.omega.len() + self.phi.len() + self.r_dev.len()) * 8)
+            as u64
+    }
+}
+
 /// One column of a stacked polynomial as the lean rounds read it: where it sits
 /// in the stack, how many variables it spans, its weight's scale, and where its
 /// point's `eq` table sits in the shared buffer, in two halves.
@@ -397,6 +671,9 @@ pub struct LeanRound0 {
     t_host: Vec<u64>,
     partials: CudaSlice<u64>,
     sums: CudaSlice<u64>,
+    /// The rounds' tables in tile form ([`TileSpec`]), when the opening was
+    /// built with one; `None` is the share form.
+    tiles: Option<Tiles>,
 }
 
 impl LeanRound0 {
@@ -409,8 +686,29 @@ impl LeanRound0 {
         num_vars: usize,
         message: LeanMessage<'_>,
     ) -> Result<Option<Self>> {
+        Self::with_tiles(shares, eq, num_vars, message, None)
+    }
+
+    /// [`new`](Self::new), with the rounds in tile form when `tiles` is given
+    /// ([`TileSpec`]). `Ok(None)` too when the shares are not a stack the
+    /// tile form reads under that spec — a share shorter than a tile, split
+    /// elsewhere or off its own alignment, more classes than slots, a form
+    /// larger than the tables written after it — and the caller opens in
+    /// share form instead.
+    pub fn with_tiles(
+        shares: &[LeanShare],
+        eq: &[u64],
+        num_vars: usize,
+        message: LeanMessage<'_>,
+        tiles: Option<TileSpec>,
+    ) -> Result<Option<Self>> {
         let len = 1usize << num_vars;
         if shares.is_empty() || shares.len() >= LEAN_MAX_SHARES || eq.is_empty() {
+            return Ok(None);
+        }
+        if let Some(spec) = &tiles
+            && !tiles_read(shares, num_vars, spec)
+        {
             return Ok(None);
         }
         let mut end = 0usize;
@@ -512,6 +810,19 @@ impl LeanRound0 {
             LEAN_MAX_T * LEAN_MAX_GRID as usize * 3,
         )?;
         let sums = crate::device::alloc_zeros_or_trim::<u64>(&stream, LEAN_MAX_T * 3)?;
+        let tiles = match tiles {
+            Some(spec) => Some(Tiles::build(
+                &stream,
+                spec,
+                num_vars,
+                &shares_dev,
+                &eq_dev,
+                data.as_ref(),
+                &starts,
+                &ends,
+            )?),
+            None => None,
+        };
         Ok(Some(Self {
             stream,
             num_vars,
@@ -525,7 +836,19 @@ impl LeanRound0 {
             t_host: Vec::new(),
             partials,
             sums,
+            tiles,
         }))
+    }
+
+    /// Whether the rounds run in tile form.
+    pub fn is_tiled(&self) -> bool {
+        self.tiles.is_some()
+    }
+
+    /// Waits for everything queued on this opening's stream — for a test or a
+    /// measurement that times its steps one by one.
+    pub fn synchronize(&self) -> Result<()> {
+        self.stream.synchronize()
     }
 
     /// Variables still free.
@@ -564,6 +887,7 @@ impl LeanRound0 {
             + (self.shares.len() + self.eq.len() + self.partials.len() + self.sums.len()) * 8
             + self.t_dev.len() * 8
             + staged) as u64
+            + self.tiles.as_ref().map_or(0, Tiles::device_bytes)
     }
 
     /// `eq(bound challenges, ·)` over the `2^bound` prefixes, on the card —
@@ -583,15 +907,146 @@ impl LeanRound0 {
         let num_t = t.len() / 3;
         assert!(num_t > 0 && num_t <= LEAN_MAX_T, "nodes per round");
         assert!(self.num_vars() >= 1, "a round needs a variable to bind");
-        let be = backend()?;
-        let round = self.bound() + 1;
-        let eqc = self.prefix_weights()?;
+        match self.tiles.as_ref().map(|tiles| tiles.spec.check) {
+            None => self.share_round(t),
+            Some(false) => self.tile_round(t),
+            Some(true) => {
+                use std::sync::atomic::Ordering::Relaxed;
+                let mut tiled = self.tile_round(t)?;
+                let shared = self.share_round(t)?;
+                TILE_CHECKED.fetch_add(1, Relaxed);
+                if TILE_CHECK_FAULT.load(Relaxed) {
+                    tiled[0] = tiled[0].wrapping_add(1) % 0xFFFF_FFFF_0000_0001;
+                }
+                let canonical = |limbs: &[u64]| -> Vec<u64> {
+                    const P: u64 = 0xFFFF_FFFF_0000_0001;
+                    limbs
+                        .iter()
+                        .map(|&v| if v >= P { v - P } else { v })
+                        .collect()
+                };
+                if canonical(&tiled) != canonical(&shared) {
+                    // Every one counted, the first few printed.
+                    if TILE_MISMATCHED.fetch_add(1, Relaxed) < 4 {
+                        eprintln!(
+                            "[gpu] WHIR lean tiles: round {} of a 2^{} stack differs from the \
+                             share form: {tiled:?} against {shared:?}",
+                            self.bound() + 1,
+                            self.num_vars
+                        );
+                    }
+                }
+                Ok(shared)
+            }
+        }
+    }
+
+    /// The nodes on the card, sent when they change: they are the same every
+    /// round of an opening.
+    fn send_nodes(&mut self, t: &[u64]) -> Result<()> {
         if self.t_host != t {
             let mut head = self.t_dev.slice_mut(0..t.len());
             self.stream.memcpy_htod(t, &mut head)?;
             self.t_host.clear();
             self.t_host.extend_from_slice(t);
         }
+        Ok(())
+    }
+
+    /// Binds the slot tables at the challenges they have not been bound at
+    /// yet, each one fold over what the one before left.
+    fn fold_tiles(&mut self) -> Result<()> {
+        let Some(tiles) = self.tiles.as_mut() else {
+            return Ok(());
+        };
+        let be = backend()?;
+        let stride = 1u64 << (self.num_vars - tiles.spec.tile_bits);
+        let slots = tiles.spec.slots as u32;
+        while tiles.folded < self.bound.len() / 3 {
+            let at = tiles.folded * 3;
+            self.stream
+                .memcpy_htod(&self.bound[at..at + 3], &mut tiles.r_dev)?;
+            let half = (stride >> tiles.folded) / 2;
+            let tasks = 2 * slots as u64 * half;
+            let grid = tasks.div_ceil(LEAN_BLOCK as u64).min(LEAN_MAX_GRID as u64) as u32;
+            unsafe {
+                self.stream
+                    .launch_builder(&be.whir_tile_fold)
+                    .arg(&mut tiles.omega)
+                    .arg(&mut tiles.phi)
+                    .arg(&stride)
+                    .arg(&slots)
+                    .arg(&half)
+                    .arg(&tiles.r_dev)
+                    .launch(LaunchConfig {
+                        grid_dim: (grid.max(1), 1, 1),
+                        block_dim: (LEAN_BLOCK, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            tiles.folded += 1;
+        }
+        Ok(())
+    }
+
+    /// [`round`](Self::round) over the slot tables: no stack position is read.
+    fn tile_round(&mut self, t: &[u64]) -> Result<Vec<u64>> {
+        let num_t = t.len() / 3;
+        let be = backend()?;
+        self.fold_tiles()?;
+        self.send_nodes(t)?;
+        let tiles = self.tiles.as_ref().expect("a tile round runs in tile form");
+        // Past its lean rounds a pair would join two columns of tiles, whose
+        // slots name different classes.
+        assert!(
+            tiles.folded < tiles.spec.lean_rounds,
+            "a tile round binds one of the lean rounds' variables"
+        );
+        let stride = 1u64 << (self.num_vars - tiles.spec.tile_bits);
+        let half = (stride >> tiles.folded) / 2;
+        let grid = half.div_ceil(LEAN_BLOCK as u64).min(LEAN_MAX_GRID as u64) as u32;
+        let slots = tiles.spec.slots as u32;
+        let num_t_arg = num_t as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&be.whir_tile_round)
+                .arg(&tiles.omega)
+                .arg(&tiles.phi)
+                .arg(&stride)
+                .arg(&slots)
+                .arg(&half)
+                .arg(&self.t_dev)
+                .arg(&num_t_arg)
+                .arg(&mut self.partials)
+                .launch(LaunchConfig {
+                    grid_dim: (grid.max(1), 1, 1),
+                    block_dim: (LEAN_BLOCK, 1, 1),
+                    shared_mem_bytes: LEAN_BLOCK * 3 * 8,
+                })?;
+            self.stream
+                .launch_builder(&be.sum_partials_ext3)
+                .arg(&self.partials)
+                .arg(&(grid.max(1) as u64))
+                .arg(&mut self.sums)
+                .launch(LaunchConfig {
+                    grid_dim: (num_t as u32, 1, 1),
+                    block_dim: (LEAN_BLOCK, 1, 1),
+                    shared_mem_bytes: LEAN_BLOCK * 3 * 8,
+                })?;
+        }
+        let sums = self.stream.clone_dtoh(&self.sums.slice(0..num_t * 3))?;
+        self.stream.synchronize()?;
+        Ok(sums)
+    }
+
+    /// [`round`](Self::round) in share form: every stack position, read where
+    /// the columns lie.
+    fn share_round(&mut self, t: &[u64]) -> Result<Vec<u64>> {
+        let num_t = t.len() / 3;
+        let be = backend()?;
+        let round = self.bound() + 1;
+        let eqc = self.prefix_weights()?;
+        self.send_nodes(t)?;
         let rests = 1u64 << (self.num_vars - round);
         let grid = rests.div_ceil(LEAN_BLOCK as u64).min(LEAN_MAX_GRID as u64) as u32;
         let n_arg = self.num_vars as u32;
@@ -641,8 +1096,15 @@ impl LeanRound0 {
 
     /// The factors at the challenges bound so far, written out at
     /// `2^(n − bound)`: the session the rest of the chain runs on.
-    pub fn materialize(self) -> Result<OpeningSession> {
+    pub fn materialize(mut self) -> Result<OpeningSession> {
         let be = backend()?;
+        // The tile form goes before the tables are allocated: nothing below
+        // reads it, and an opening's working set is then the share form's
+        // ([`TileSpec::fits`]). Its last kernel has to have run first.
+        if self.tiles.is_some() {
+            self.stream.synchronize()?;
+            self.tiles = None;
+        }
         let bound = self.bound();
         let len = 1usize << (self.num_vars - bound);
         let eqfull = self.prefix_weights()?;
@@ -853,6 +1315,129 @@ mod tests {
         let lean = LeanRound0::new(&shares, &eq, 16, LeanMessage::Parts(&[]))
             .expect("declining touches no device");
         assert!(lean.is_none(), "{} shares must materialise", shares.len());
+    }
+
+    /// `LAMBDA_VM_WHIR_LEAN_TILES`: the share form unless it says `1`, `wide`
+    /// or `check`.
+    #[test]
+    fn the_lean_rounds_run_in_share_form_unless_the_knob_asks_for_tiles() {
+        assert_eq!(lean_tiles_setting(None), LeanTiles::Off);
+        assert_eq!(lean_tiles_setting(Some("0")), LeanTiles::Off);
+        assert_eq!(lean_tiles_setting(Some("")), LeanTiles::Off);
+        assert_eq!(lean_tiles_setting(Some("yes")), LeanTiles::Off);
+        assert_eq!(lean_tiles_setting(Some("1")), LeanTiles::On);
+        assert_eq!(lean_tiles_setting(Some(" 1 ")), LeanTiles::On);
+        assert_eq!(lean_tiles_setting(Some("wide")), LeanTiles::Wide);
+        assert_eq!(lean_tiles_setting(Some("check")), LeanTiles::Check);
+    }
+
+    fn tile_share(stack_offset: usize, num_vars: usize, lo_bits: usize, lo_at: usize) -> LeanShare {
+        LeanShare {
+            stack_offset,
+            num_vars,
+            lo_bits,
+            hi_at: 0,
+            lo_at,
+            scale: [1, 0, 0],
+        }
+    }
+
+    fn spec(tile_bits: usize, lean_rounds: usize, slots: usize) -> TileSpec {
+        TileSpec {
+            tile_bits,
+            lean_rounds,
+            slots,
+            wide: false,
+            check: false,
+        }
+    }
+
+    /// ★ The tile form adds nothing to an opening's working set: wherever it
+    /// fits, ALL it holds is no larger than the tables written once the
+    /// rounds are spent, and `materialize` frees it before it allocates them.
+    /// At the production stack and three rounds a slot is 6.4 MiB against
+    /// those tables' 768 MiB, and the turn a group's openings take
+    /// ([`opening_transient_bytes`]) is what it was.
+    #[test]
+    fn the_tile_form_is_no_larger_than_the_tables_written_after_it() {
+        for n in [16usize, 22, 25, 27, 28] {
+            for lean_rounds in 1..=6usize {
+                for tile_bits in 0..=10usize {
+                    for slots in 1..=TILE_MAX_SLOTS {
+                        let form = spec(tile_bits, lean_rounds, slots);
+                        if form.fits(n) {
+                            assert!(form.device_bytes(n) <= 48u64 << (n - lean_rounds));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(spec(10, 3, 1).device_bytes(27), (6 << 20) + (3 << 17) + 24);
+        assert_eq!(spec(10, 3, 8).device_bytes(27), (49 << 20) + (1 << 18) + 24);
+        assert!(spec(10, 3, 8).fits(27) && spec(8, 3, 8).fits(27) && spec(7, 3, 8).fits(27));
+        assert!(
+            !spec(6, 3, 8).fits(27),
+            "eight slots of 2^21 tiles are 788 MiB"
+        );
+        assert!(spec(4, 3, 1).fits(27) && !spec(3, 3, 1).fits(27));
+        // Not a form at all: no round, a round past the tiles, no slot, too many.
+        assert!(!spec(10, 0, 1).fits(27) && !spec(10, 18, 1).fits(27));
+        assert!(!spec(10, 3, 0).fits(27) && !spec(10, 3, TILE_MAX_SLOTS + 1).fits(27));
+        assert!(!spec(28, 1, 1).fits(27));
+    }
+
+    /// What the tile form reads: every share split at the tile, at least a
+    /// tile long, at a multiple of its own size, and no more classes in a
+    /// column of tiles than slots.
+    #[test]
+    fn the_tile_form_reads_aligned_shares_split_at_the_tile() {
+        let table = [
+            tile_share(0, 12, 6, 0),
+            tile_share(1 << 12, 12, 6, 0),
+            tile_share(1 << 13, 8, 6, 64),
+        ];
+        assert!(tiles_read(&table, 16, &spec(6, 3, 2)));
+        assert!(
+            !tiles_read(&table, 16, &spec(6, 3, 1)),
+            "two classes, one slot"
+        );
+        // Two rounds bind four tiles: a column of tiles meets two classes at most.
+        let many: Vec<LeanShare> = (0..5).map(|c| tile_share(c << 12, 12, 6, c * 64)).collect();
+        assert!(!tiles_read(&many, 16, &spec(6, 3, 4)));
+        assert!(tiles_read(&many, 16, &spec(6, 2, 4)));
+        assert!(
+            !tiles_read(&[tile_share(0, 12, 5, 0)], 16, &spec(6, 3, 1)),
+            "split elsewhere"
+        );
+        assert!(
+            !tiles_read(&[tile_share(0, 5, 6, 0)], 16, &spec(6, 3, 1)),
+            "shorter than a tile"
+        );
+        assert!(
+            !tiles_read(&[tile_share(1 << 11, 12, 6, 0)], 16, &spec(6, 3, 1)),
+            "off its alignment"
+        );
+        assert!(
+            !tiles_read(&table, 16, &spec(6, 11, 2)),
+            "the spec does not fit"
+        );
+    }
+
+    /// A stack the tile form does not read declines before the device is
+    /// touched, and the caller opens in share form.
+    #[test]
+    fn a_stack_the_tile_form_cannot_read_declines_before_the_device() {
+        let shares = [tile_share(0, 12, 5, 0)];
+        let eq = vec![1u64, 0, 0];
+        let lean = LeanRound0::with_tiles(
+            &shares,
+            &eq,
+            16,
+            LeanMessage::Parts(&[]),
+            Some(spec(6, 3, 1)),
+        )
+        .expect("declining touches no device");
+        assert!(lean.is_none());
     }
 
     /// The production chain's shape at `2^n`: first6 then four, 400 columns,
