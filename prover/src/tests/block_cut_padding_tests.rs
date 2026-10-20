@@ -1,9 +1,15 @@
 //! The block proved with its cut tables stopped at the last real row
-//! (`CutPadding::LastTable`, `LAMBDA_VM_BLOCK_CUT_PADDING=last`): the verifier,
-//! unchanged, accepts the block without its tables of padding rows alone, and
-//! refuses a block one table short of the real rows on the bus balance, which
-//! is its only objection. The streamed prove counts the tables of the rule
-//! the process runs under, and phase B builds every one it dropped again.
+//! (`CutPadding::LastTable`, the default; `LAMBDA_VM_BLOCK_CUT_PADDING=run`
+//! pads the whole run): the verifier accepts the block without its tables of
+//! padding rows alone, and refuses a block one table short of the real rows on
+//! the bus balance, which is its only objection. The streamed prove counts the
+//! tables of the rule the process runs under, and phase B builds every one it
+//! dropped again.
+//!
+//! Box tier: each test proves several small blocks and takes minutes on a CPU
+//! runner, so all three are `#[ignore]`d. Run them with
+//! `--ignored --exact --test-threads=1 tests::block_cut_padding_tests::<name>`,
+//! the last one once with the variable unset and once at `run`.
 
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
@@ -131,6 +137,7 @@ fn cut_counts(proof: &BlockWhirProof) -> [usize; 4] {
 /// the whole run padded and cut at the last real row: both verify, and the
 /// second states one table fewer of each cut family the program has.
 #[test]
+#[ignore = "proves small blocks, minutes on a CPU runner; box tier"]
 fn a_block_without_its_padding_tables_proves_and_verifies() {
     let opts = ProofOptions::default_test_options();
     for (program, argue, whole_run, last_table) in [
@@ -191,6 +198,7 @@ fn a_block_without_its_padding_tables_proves_and_verifies() {
 /// off (the mutation) it accepts the same proof, so no other check objects to
 /// the missing table.
 #[test]
+#[ignore = "proves small blocks, minutes on a CPU runner; box tier"]
 fn a_block_one_table_short_of_the_real_rows_is_refused_on_the_bus() {
     let opts = ProofOptions::default_test_options();
     type Family = fn(
@@ -274,6 +282,7 @@ fn a_block_one_table_short_of_the_real_rows_is_refused_on_the_bus() {
 /// then builds each dropped KECCAK_RND table again with no mismatch — and
 /// verified each time. Run once per value of the variable.
 #[test]
+#[ignore = "proves small blocks, minutes on a CPU runner; box tier"]
 fn a_streamed_block_counts_the_tables_of_the_rule_in_effect() {
     let padding = CutPadding::from_env().expect("the variable reads");
     let tables = match padding {
