@@ -12,6 +12,11 @@
 //! rule admits it or nothing waits. The groups, their order and the proof's
 //! bytes are the same: the queue is first in, first out, and a group is closed
 //! before it comes here.
+//!
+//! While a rule runs, the rule that arms the drops counts the main cells of
+//! the groups waiting behind the first as committed ([`arming_cells`]): a
+//! table is on the host whether it waits or is committed, so the block arms at
+//! the number of tables built it arms at by default.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -106,6 +111,19 @@ impl Rule {
     }
 }
 
+/// The main cells the rule that arms the drops weighs as committed
+/// ([`super::spill_wanted`]): `committed`, and while a rule runs, the cells of
+/// the groups waiting behind the first. The first is where the channel of one
+/// holds a group, which that rule does not count either; a group's cells leave
+/// the count as phase A takes it, before its commit counts them. With no rule
+/// the queue is not read: the cells are `committed`.
+pub(crate) fn arming_cells(rule: Option<Rule>, stats: &Stats, committed: u64) -> u64 {
+    match rule {
+        None => committed,
+        Some(_) => committed.saturating_add(stats.behind_cells.load(Relaxed)),
+    }
+}
+
 /// What a block's queue did, for its `BLOCK GROUP QUEUE` line.
 #[derive(Debug, Default)]
 pub(crate) struct Stats {
@@ -120,6 +138,11 @@ pub(crate) struct Stats {
     /// When the last group went in behind another, in milliseconds since the
     /// queue was made.
     last_behind_ms: AtomicU64,
+    /// The main cells of the groups waiting behind the first, as the rule
+    /// that arms the drops counts them ([`arming_cells`]), and the most at
+    /// once.
+    behind_cells: AtomicU64,
+    most_behind_cells: AtomicU64,
 }
 
 /// The `BLOCK GROUP QUEUE` line of a block: the setting, the rule it ran and
@@ -161,11 +184,20 @@ pub(crate) fn line(setting: Setting, rule: Option<Rule>, stats: &Stats) -> Strin
     };
     format!(
         "BLOCK GROUP QUEUE: {knob} · {ran} · most at once {} groups {:.2} GiB · {waited} · the rule \
-         refused {} groups",
+         refused {} groups · the drops counted at most {:.2} G cells waiting",
         stats.most_groups.load(Relaxed),
         gib(stats.most_bytes.load(Relaxed)),
         stats.refused.load(Relaxed),
+        stats.most_behind_cells.load(Relaxed) as f64 / 1e9,
     )
+}
+
+/// A closed group as the queue weighs it: its bytes as held, and its main
+/// cells, each committed column's rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Weight {
+    pub(crate) bytes: u64,
+    pub(crate) cells: u64,
 }
 
 /// The process's resident bytes, as the rule reads them.
@@ -181,16 +213,32 @@ struct Queue<T> {
 }
 
 struct State<T> {
-    /// The groups waiting, oldest first, each with its bytes.
-    waiting: VecDeque<(T, u64)>,
+    /// The groups waiting, oldest first, each with its weight, and their
+    /// bytes and cells.
+    waiting: VecDeque<(T, Weight)>,
     bytes: u64,
+    cells: u64,
     sender_gone: bool,
     receiver_gone: bool,
+}
+
+impl<T> State<T> {
+    /// The cells waiting behind the first group.
+    fn behind_cells(&self) -> u64 {
+        self.cells - self.waiting.front().map_or(0, |(_, weight)| weight.cells)
+    }
 }
 
 impl<T> Queue<T> {
     fn state(&self) -> std::sync::MutexGuard<'_, State<T>> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Publishes the cells waiting behind the first, under the state's lock.
+    fn publish_cells(&self, state: &State<T>) {
+        let behind = state.behind_cells();
+        self.stats.behind_cells.store(behind, Relaxed);
+        self.stats.most_behind_cells.fetch_max(behind, Relaxed);
     }
 }
 
@@ -213,6 +261,7 @@ fn queue_reading<T>(rule: Rule, stats: Arc<Stats>, resident: Resident) -> (Sende
         state: Mutex::new(State {
             waiting: VecDeque::new(),
             bytes: 0,
+            cells: 0,
             sender_gone: false,
             receiver_gone: false,
         }),
@@ -229,10 +278,10 @@ pub(crate) struct Stopped;
 pub(crate) struct Sender<T>(Arc<Queue<T>>);
 
 impl<T> Sender<T> {
-    /// Hands a closed group of `bytes` on, behind those waiting. While
+    /// Hands a closed group of `weight` on, behind those waiting. While
     /// another waits and the rule refuses this one, it waits here: each
     /// group taken is another look at the rule.
-    fn send(&self, group: T, bytes: u64) -> Result<(), Stopped> {
+    fn send(&self, group: T, weight: Weight) -> Result<(), Stopped> {
         let queue = &*self.0;
         let mut state = queue.state();
         let mut refused = false;
@@ -241,7 +290,11 @@ impl<T> Sender<T> {
                 return Err(Stopped);
             }
             let behind = !state.waiting.is_empty();
-            if !behind || queue.rule.admits(state.bytes, bytes, || (queue.resident)()) {
+            if !behind
+                || queue
+                    .rule
+                    .admits(state.bytes, weight.bytes, || (queue.resident)())
+            {
                 break behind;
             }
             if !refused {
@@ -250,8 +303,10 @@ impl<T> Sender<T> {
             }
             state = queue.changed.wait(state).unwrap_or_else(|e| e.into_inner());
         };
-        state.waiting.push_back((group, bytes));
-        state.bytes += bytes;
+        state.waiting.push_back((group, weight));
+        state.bytes += weight.bytes;
+        state.cells += weight.cells;
+        queue.publish_cells(&state);
         let stats = &queue.stats;
         stats.groups.fetch_add(1, Relaxed);
         stats.most_groups.fetch_max(state.waiting.len(), Relaxed);
@@ -275,7 +330,8 @@ impl<T> Drop for Sender<T> {
 }
 
 /// Phase A's end: the groups in the order they were sent, until the sender is
-/// gone and nothing waits.
+/// gone and nothing waits. A group's cells leave the count of those waiting
+/// before it is handed on.
 pub(crate) struct Receiver<T>(Arc<Queue<T>>);
 
 impl<T> Iterator for Receiver<T> {
@@ -285,8 +341,10 @@ impl<T> Iterator for Receiver<T> {
         let queue = &*self.0;
         let mut state = queue.state();
         loop {
-            if let Some((group, bytes)) = state.waiting.pop_front() {
-                state.bytes -= bytes;
+            if let Some((group, weight)) = state.waiting.pop_front() {
+                state.bytes -= weight.bytes;
+                state.cells -= weight.cells;
+                queue.publish_cells(&state);
                 drop(state);
                 queue.changed.notify_all();
                 return Some(group);
@@ -313,14 +371,14 @@ pub(crate) enum Out<T> {
 }
 
 impl<T> Out<T> {
-    /// Sends `group`, waiting as its way makes it wait; the queue weighs the
-    /// group's `bytes`.
-    pub(crate) fn send(&self, group: T, bytes: impl FnOnce(&T) -> u64) -> Result<(), Stopped> {
+    /// Sends `group`, waiting as its way makes it wait; only the queue weighs
+    /// the group.
+    pub(crate) fn send(&self, group: T, weigh: impl FnOnce(&T) -> Weight) -> Result<(), Stopped> {
         match self {
             Self::Channel(out) => out.send(group).map_err(|_| Stopped),
             Self::Queue(out) => {
-                let bytes = bytes(&group);
-                out.send(group, bytes)
+                let weight = weigh(&group);
+                out.send(group, weight)
             }
         }
     }
@@ -378,6 +436,14 @@ mod tests {
         (tx, rx, stats)
     }
 
+    /// A group of `bytes`, of twice as many main cells.
+    fn weight(bytes: u64) -> Weight {
+        Weight {
+            bytes,
+            cells: 2 * bytes,
+        }
+    }
+
     /// Waits for `done`, at most ten seconds.
     fn until(what: &str, done: impl Fn() -> bool) {
         let t = Instant::now();
@@ -410,7 +476,7 @@ mod tests {
         let sender = std::thread::spawn(move || {
             let mut bytes = stream(1);
             for group in 0..2000 {
-                tx.send(group, 1 + bytes() % 8)
+                tx.send(group, weight(1 + bytes() % 8))
                     .expect("the receiver is there");
             }
         });
@@ -444,7 +510,7 @@ mod tests {
         let counted = Arc::clone(&sent);
         let sender = std::thread::spawn(move || {
             for group in 0..4 {
-                tx.send(group, 100).expect("the receiver is there");
+                tx.send(group, weight(100)).expect("the receiver is there");
                 counted.fetch_add(1, Relaxed);
             }
         });
@@ -464,6 +530,9 @@ mod tests {
         assert_eq!(stats.most_groups.load(Relaxed), 1);
         assert_eq!(stats.behind.load(Relaxed), 0);
         assert_eq!(stats.refused.load(Relaxed), 3);
+        // The one waiting is where the channel holds one: the drops never
+        // counted a cell more than by default.
+        assert_eq!(stats.most_behind_cells.load(Relaxed), 0);
         let text = line(Setting::Bytes(0), Some(Rule::Bytes(0)), &stats);
         assert!(text.contains("none waited behind another"), "{text}");
     }
@@ -487,7 +556,8 @@ mod tests {
         let sending = sizes.clone();
         let sender = std::thread::spawn(move || {
             for bytes in sending {
-                tx.send(bytes, bytes).expect("the receiver is there");
+                tx.send(bytes, weight(bytes))
+                    .expect("the receiver is there");
             }
         });
         // Each group as it is taken, with what still waits behind it.
@@ -497,6 +567,10 @@ mod tests {
         for bytes in rx {
             let (waiting, groups) = {
                 let state = queue.state();
+                // The cells published are those behind the first, as read
+                // under the lock they are published under.
+                let behind: u64 = state.waiting.iter().skip(1).map(|(_, w)| w.cells).sum();
+                assert_eq!(stats.behind_cells.load(Relaxed), behind, "the cells behind");
                 (state.bytes, state.waiting.len())
             };
             assert!(
@@ -531,11 +605,11 @@ mod tests {
 
     fn ends_stopping() {
         let (tx, rx, _) = fixed::<usize>(0);
-        tx.send(0, 1).expect("the first goes");
+        tx.send(0, weight(1)).expect("the first goes");
         let stopped = Arc::new(AtomicBool::new(false));
         let seen = Arc::clone(&stopped);
         let sender = std::thread::spawn(move || {
-            let sent = tx.send(1, 1);
+            let sent = tx.send(1, weight(1));
             seen.store(true, Relaxed);
             sent
         });
@@ -549,8 +623,8 @@ mod tests {
         assert_eq!(sender.join().expect("the sender"), Err(Stopped));
 
         let (tx, rx, _) = fixed::<usize>(u64::MAX);
-        tx.send(7, 1).expect("the receiver is there");
-        tx.send(8, 1).expect("the receiver is there");
+        tx.send(7, weight(1)).expect("the receiver is there");
+        tx.send(8, weight(1)).expect("the receiver is there");
         drop(tx);
         assert_eq!(rx.collect::<Vec<_>>(), [7, 8]);
     }
@@ -644,7 +718,8 @@ mod tests {
                         std::thread::sleep(Duration::from_millis(1));
                     }
                 }
-                tx.send(group, G / 2).expect("the receiver is there");
+                tx.send(group, weight(G / 2))
+                    .expect("the receiver is there");
                 counted.fetch_add(1, Relaxed);
             }
         });
@@ -745,22 +820,24 @@ mod tests {
             line(Setting::Room, Some(room(45.90, 16)), &stats),
             "BLOCK GROUP QUEUE: room · at most 16.00 GiB waiting while VmRSS + the group + 16.00 \
              stays under the line 45.90 GiB · most at once 1 groups 0.50 GiB · none waited behind \
-             another · the rule refused 181 groups"
+             another · the rule refused 181 groups · the drops counted at most 0.00 G cells waiting"
         );
         stats.behind.store(96, Relaxed);
         stats.most_groups.store(13, Relaxed);
         stats.most_bytes.store(8 * G, Relaxed);
         stats.refused.store(41, Relaxed);
         stats.last_behind_ms.store(58_420, Relaxed);
+        stats.most_behind_cells.store(4_496_000_000, Relaxed);
         assert_eq!(
             line(Setting::Bytes(8 * G), Some(Rule::Bytes(8 * G)), &stats),
             "BLOCK GROUP QUEUE: 8.00 GiB · fixed, the host not read · most at once 13 groups 8.00 GiB · \
-             96 of 182 groups waited behind another, the last at 58.42s · the rule refused 41 groups"
+             96 of 182 groups waited behind another, the last at 58.42s · the rule refused 41 groups · \
+             the drops counted at most 4.50 G cells waiting"
         );
     }
 
     /// The channel of one and the queue hand the same groups on in the same
-    /// order through [`Out`] and [`In`]; only the queue weighs their bytes.
+    /// order through [`Out`] and [`In`]; only the queue weighs them.
     #[test]
     fn both_ways_hand_the_same_groups_on() {
         within_a_minute("both ways", both_ways);
@@ -774,7 +851,7 @@ mod tests {
                 for group in sending {
                     out.send(group, |group| {
                         assert!(weigh, "the channel weighed a group");
-                        group.len() as u64
+                        weight(group.len() as u64)
                     })
                     .expect("the receiver is there");
                 }
@@ -790,5 +867,232 @@ mod tests {
             assert_eq!(In::Queue(rx).collect::<Vec<_>>(), groups, "budget {budget}");
             sender.join().expect("the sender");
         }
+    }
+
+    /// By default the rule that arms the drops weighs the committed cells
+    /// alone, exactly: the knob unset, empty or `none` runs no rule, and with
+    /// no rule the queue is not read, whatever it would say. So does a block
+    /// with a store, under every setting. With a rule, the cells behind the
+    /// first count.
+    #[test]
+    fn by_default_the_drops_count_the_committed_cells_alone() {
+        let stats = Stats::default();
+        stats.behind_cells.store(4_123_000_000, Relaxed);
+        let no_disk = NoDisk {
+            line: 92 * G,
+            headroom: 16 * G,
+        };
+        for value in [None, Some(""), Some("none"), Some(" none ")] {
+            let rule = Rule::of(parse_setting(value).unwrap(), Some(no_disk), 16 * G);
+            assert_eq!(rule, None, "{value:?}");
+            for committed in [0, 1, 22_790_000_000, u64::MAX] {
+                assert_eq!(
+                    arming_cells(rule, &stats, committed),
+                    committed,
+                    "{value:?}"
+                );
+            }
+        }
+        for setting in [Setting::Room, Setting::Bytes(G)] {
+            let store = Rule::of(setting, None, 16 * G);
+            assert_eq!(arming_cells(store, &stats, 22_790_000_000), 22_790_000_000);
+            let no_disk = Rule::of(setting, Some(no_disk), 16 * G);
+            assert_eq!(
+                arming_cells(no_disk, &stats, 22_790_000_000),
+                26_913_000_000
+            );
+        }
+    }
+
+    /// A group's cells are counted once: behind the first while it waits
+    /// there, then by phase A's commit once taken, never both. Phase A
+    /// commits each group as it takes it here, so the drops count every cell
+    /// sent but the first waiting group's, whatever was sent and taken.
+    #[test]
+    fn a_groups_cells_are_counted_once() {
+        within_a_minute("counted once", counted_once);
+    }
+
+    fn counted_once() {
+        let (tx, mut rx, stats) = fixed::<usize>(u64::MAX);
+        let rule = Some(Rule::Bytes(u64::MAX));
+        let cells: Vec<u64> = (0..40u64).map(|k| 300_000_000 + k * 7_000_000).collect();
+        let mut next = stream(5);
+        let (mut sent, mut taken, mut committed, mut most) = (0, 0, 0u64, 0u64);
+        while taken < cells.len() {
+            if sent < cells.len() && (sent == taken || !next().is_multiple_of(3)) {
+                let weight = Weight {
+                    bytes: 1,
+                    cells: cells[sent],
+                };
+                tx.send(sent, weight).expect("the receiver is there");
+                sent += 1;
+            } else {
+                assert_eq!(rx.next(), Some(taken));
+                committed += cells[taken];
+                taken += 1;
+            }
+            let first = if taken < sent { cells[taken] } else { 0 };
+            let all: u64 = cells[..sent].iter().sum();
+            assert_eq!(
+                arming_cells(rule, &stats, committed) + first,
+                all,
+                "{sent} sent, {taken} taken"
+            );
+            most = most.max(all - committed - first);
+        }
+        assert_eq!(stats.behind_cells.load(Relaxed), 0);
+        assert_eq!(stats.most_behind_cells.load(Relaxed), most);
+        assert!(
+            most >= 3 * cells[0],
+            "at most {most} cells waited behind the first"
+        );
+        drop(tx);
+        assert_eq!(rx.next(), None);
+    }
+
+    /// The rule that arms the drops on the large block's readings (a 118 GiB
+    /// host, target 108.28 GiB, a group of 374.8 M cells): by default it
+    /// armed with 61 groups committed, at a host of about 64.5 GiB, with one
+    /// group in the channel and one in the packer's hands. With the queue the
+    /// same tables built can be 51 committed, one first in the queue and
+    /// eleven behind it. Counted, the eleven make it arm within a group's
+    /// reserve of the default's host (0.62 GiB: the packer's group now counts);
+    /// not counted, about 6 GiB higher.
+    #[test]
+    fn the_drops_arm_at_the_tables_built_they_arm_at_by_default() {
+        use crate::block_whir::{BlockSpillPolicy, SPILL_RESERVE_PER_G, spill_wanted};
+        let gib = |g: f64| (g * GIB) as u64;
+        let target = gib(108.28);
+        let group = 374_800_000u64;
+        // The least host, in steps of 0.01 GiB, at which the rule arms with
+        // `cells` counted as committed, for a table of 0.1 GiB.
+        let arms_from = |cells: u64| -> f64 {
+            (0..12_000u32)
+                .map(|k| f64::from(k) / 100.0)
+                .find(|&host| {
+                    spill_wanted(
+                        BlockSpillPolicy::Auto,
+                        target,
+                        SPILL_RESERVE_PER_G,
+                        0,
+                        cells,
+                        gib(0.1),
+                        || gib(host),
+                    )
+                })
+                .expect("it arms under the target")
+        };
+        let (tx, _rx, stats) = fixed::<usize>(u64::MAX);
+        for g in 0..12 {
+            let weight = Weight {
+                bytes: gib(0.65),
+                cells: group,
+            };
+            tx.send(g, weight).expect("the receiver is there");
+        }
+        let committed = 51 * group;
+        let counted = arming_cells(Some(Rule::Bytes(u64::MAX)), &stats, committed);
+        assert_eq!(counted, 62 * group);
+        let default = arms_from(61 * group);
+        let (with, without) = (arms_from(counted), arms_from(committed));
+        assert!(
+            (default - 64.5).abs() < 0.2,
+            "the default arms from {default}"
+        );
+        assert!(
+            with <= default && default - with <= 1.0,
+            "counted, it arms from {with} GiB against {default}"
+        );
+        assert!(
+            without - default > 1.0,
+            "not counted, it arms from {without} GiB against {default}"
+        );
+    }
+
+    /// On a 64 GiB host (target 54 GiB, the pressure line 45.90): groups wait
+    /// behind one another early in the block, but the room rule refuses any
+    /// from a resident set of 29.25 GiB on, which the large block passes
+    /// about nine seconds in, and the drops arm near 33.2 GiB, at ten. By
+    /// then one group waits at most, and the drops count the committed cells
+    /// alone: the default's arming, exactly.
+    #[test]
+    fn on_a_64_gib_host_the_drops_arm_as_by_default() {
+        within_a_minute("a 64 GiB host", on_a_64_gib_host);
+    }
+
+    fn on_a_64_gib_host() {
+        use crate::block_whir::{BlockSpillPolicy, SPILL_RESERVE_PER_G, spill_wanted};
+        let gib = |g: f64| (g * GIB) as u64;
+        let group = Weight {
+            bytes: gib(0.65),
+            cells: 374_800_000,
+        };
+        let resident = Arc::new(AtomicU64::new(gib(25.62)));
+        let reading = Arc::clone(&resident);
+        let stats = Arc::new(Stats::default());
+        let rule = room(45.90, 16);
+        let (tx, mut rx) = queue_reading::<usize>(
+            rule,
+            Arc::clone(&stats),
+            Arc::new(move || Some(reading.load(Relaxed))),
+        );
+        let sent = Arc::new(AtomicUsize::new(0));
+        let go = Arc::new(AtomicBool::new(false));
+        let (counted, gone) = (Arc::clone(&sent), Arc::clone(&go));
+        let sender = std::thread::spawn(move || {
+            for g in 0..5 {
+                if g == 3 {
+                    while !gone.load(Relaxed) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                tx.send(g, group).expect("the receiver is there");
+                counted.fetch_add(1, Relaxed);
+            }
+        });
+        let rule = Some(rule);
+        // Early in the block: three wait, the two behind the first count.
+        until("three are sent", || sent.load(Relaxed) == 3);
+        let mut committed = 23 * group.cells;
+        assert_eq!(
+            arming_cells(rule, &stats, committed),
+            committed + 2 * group.cells
+        );
+        // Past the room: the fourth is refused until nothing waits.
+        resident.store(gib(33.3), Relaxed);
+        go.store(true, Relaxed);
+        until("the fourth is refused", || stats.refused.load(Relaxed) == 1);
+        let decide = |cells: u64| {
+            spill_wanted(
+                BlockSpillPolicy::Auto,
+                gib(54.0),
+                SPILL_RESERVE_PER_G,
+                0,
+                cells,
+                gib(0.1),
+                || gib(33.3),
+            )
+        };
+        for g in 0..5 {
+            assert_eq!(rx.next(), Some(g));
+            committed += group.cells;
+            let behind = if g == 0 { group.cells } else { 0 };
+            assert_eq!(
+                arming_cells(rule, &stats, committed),
+                committed + behind,
+                "after group {g}"
+            );
+        }
+        // The readings arm by default, and the queue's count is the same.
+        assert!(decide(committed));
+        assert!(!decide(23 * group.cells));
+        assert_eq!(
+            decide(arming_cells(rule, &stats, committed)),
+            decide(committed)
+        );
+        sender.join().expect("the sender");
+        assert_eq!(rx.next(), None);
+        assert_eq!(stats.most_behind_cells.load(Relaxed), 2 * group.cells);
     }
 }

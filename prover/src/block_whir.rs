@@ -2931,7 +2931,13 @@ impl<'a> Packer<'a> {
         let sent = self
             .out
             .send(std::mem::take(&mut self.open), |group| {
-                memlog::group_bytes(group) as u64
+                group_queue::Weight {
+                    bytes: memlog::group_bytes(group) as u64,
+                    cells: group
+                        .iter()
+                        .map(|table| (table.num_committed_columns() as u64) << table.num_vars())
+                        .sum(),
+                }
             })
             .map_err(|_| Error::Prover("phase A stopped".into()));
         self.blocked += t.elapsed().as_secs_f64();
@@ -3894,13 +3900,17 @@ fn prove_streamed(
     };
     // The host is read at each decision, whatever the policy: `auto` decides
     // on it and the purge's pressure is noted from it (`note_pressure_past`).
-    // Once live regeneration has armed, its phase-B reserve counts.
+    // Once live regeneration has armed, its phase-B reserve counts. While
+    // closed groups may wait behind one another, their cells count as
+    // committed ([`group_queue::arming_cells`]).
     let wanted: std::sync::Arc<multilinear_block::SpillWanted> = {
         let host_most = std::sync::Arc::clone(&host_most);
         let armed = live_regen.clone();
         let reserve = regen::regen_reserve_bytes();
         let per_g = spill_reserve_per_g();
+        let waiting = std::sync::Arc::clone(&queue_stats);
         std::sync::Arc::new(move |kept, cells, bytes| {
+            let cells = group_queue::arming_cells(queue_rule, &waiting, cells);
             let reading = HostReading::now();
             {
                 let mut most = host_most.lock().unwrap_or_else(|e| e.into_inner());
