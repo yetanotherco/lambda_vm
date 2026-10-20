@@ -2551,15 +2551,22 @@ fn the_whir_block_tree_on_a_real_block() {
     );
     // How those rounds were computed (`LAMBDA_VM_WHIR_LEAN_TILES`): over every
     // stack position in every round (off, the default), or from one pass over
-    // the message; under `check`, the rounds run both ways and how many
-    // differed.
+    // the message; under `check`, the rounds and the bound tables both ways,
+    // and how many differed. Then the most one opening held on the card, by
+    // form.
     {
         let (compared, differing) = multilinear::gpu::lean_tile_checks();
+        let (tables, positions) = multilinear::gpu::lean_tile_table_checks();
+        let mib = |bytes: u64| bytes as f64 / (1u64 << 20) as f64;
+        let [share, tile, check] = multilinear::gpu::lean_open_peaks();
         println!(
-            "W3 WHIR LEAN TILES: {} · tile opens {} of {} lean · rounds compared {compared} · differing {differing}",
+            "W3 WHIR LEAN TILES: {} · tile opens {} of {} lean · rounds compared {compared} · differing {differing} · tables compared {tables} · positions differing {positions} · opening peak MiB share {:.1} tile {:.1} check {:.1}",
             multilinear::gpu::lean_tiles_in_effect(),
             multilinear::gpu::lean_tile_opens(),
-            multilinear::gpu::lean_open_calls()
+            multilinear::gpu::lean_open_calls(),
+            mib(share),
+            mib(tile),
+            mib(check)
         );
     }
     // Each chain's first successor: encoded from the bound message (the

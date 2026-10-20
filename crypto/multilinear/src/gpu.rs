@@ -345,6 +345,32 @@ pub fn lean_tile_checks() -> (u64, u64) {
     (0, 0)
 }
 
+/// Lean openings whose bound tables `LAMBDA_VM_WHIR_LEAN_TILES=check` wrote
+/// both ways and compared, and the positions that differed (the share form's
+/// tables are the ones kept).
+#[cfg(feature = "cuda")]
+pub fn lean_tile_table_checks() -> (u64, u64) {
+    math_cuda::whir_open::tile_table_check_counts()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn lean_tile_table_checks() -> (u64, u64) {
+    (0, 0)
+}
+
+/// The most one lean opening held on the card at once, by form — share,
+/// tile, checking — counted from its own allocations
+/// ([`math_cuda::whir_open::lean_peak_bytes`]).
+#[cfg(feature = "cuda")]
+pub fn lean_open_peaks() -> [u64; 3] {
+    math_cuda::whir_open::lean_peak_bytes()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn lean_open_peaks() -> [u64; 3] {
+    [0; 3]
+}
+
 /// Device folds that ran every level in one launch.
 pub fn fused_fold_calls() -> u64 {
     FUSED_FOLD_CALLS.load(Ordering::Relaxed)

@@ -528,10 +528,12 @@ extern "C" __global__ void whir_lean_materialize(const uint16_t *__restrict__ co
 // `Ω` one product a tile, and every round after that reads `2^(n−u)` values a
 // slot instead of `2^n` positions. Bound at the rounds' challenges, the weight
 // is `Σ_κ Ω_κ^bound(R)·eq(λ_κ, j)` and the message is what
-// `whir_lean_materialize` writes.
+// `whir_lean_materialize` writes: `whir_tile_materialize` writes both from the
+// tile form, with no position map.
 //
 // ★ EQUAL, not raw-identical, as the share form above is: the same field
-// elements by another sequence of operations.
+// elements by another sequence of operations. The bound message alone is
+// written by the share form's own sequence, so that table is raw-identical.
 //
 // The share rows are the share form's with `lo_bits = u` in every row. The
 // tile map is `whir_lean_colmap` run over tiles (starts and ends in tiles).
@@ -767,6 +769,94 @@ extern "C" __global__ void whir_tile_fold(uint64_t *__restrict__ omega, uint64_t
         uint64_t i = task - table * half;
         uint64_t *x = table < slots ? omega + table * stride * 3 : phi + (table - slots) * stride * 3;
         whir_tile_fold_at(x, half, i, challenge);
+    }
+}
+
+// The factors at the `bound` challenges so far, from the tile form, at
+// `y < 2^(n − bound)`: what `whir_lean_materialize_at` writes there, without a
+// position map. The weight is `Σ_κ Ω_κ(t)·eq(λ_κ, j)` over the slots of the
+// column of tile `t = y >> u`, `j` the cell in it, with `Ω` bound at the same
+// challenges: EQUAL to the share form's weight. The message is the share
+// form's own sequence, `Σ_p eqfull[p]·f(p ‖ y)` with a gap's cells zero, each
+// cell found through the tile map: RAW-identical to it.
+__device__ void whir_tile_materialize_at(const uint16_t *__restrict__ tilemap,
+                                         const uint64_t *__restrict__ shares,
+                                         const uint64_t *__restrict__ eqbuf,
+                                         const uint64_t *__restrict__ data,
+                                         const uint64_t *__restrict__ slot_lo,
+                                         const uint64_t *__restrict__ omega, uint32_t n,
+                                         uint32_t lean, uint32_t u, uint32_t slots,
+                                         uint32_t bound, const uint64_t *__restrict__ eqfull,
+                                         uint64_t y, Fe3 &w_out, Fe3 &f_out) {
+    uint32_t nu = n - u;
+    uint64_t tiles = 1ull << nu;
+    uint64_t tile = y >> u, j = y & ((1ull << u) - 1);
+    uint64_t column = tile & ((1ull << (nu - lean)) - 1);  // below the lean rounds' bits
+    const uint64_t *lo_of = slot_lo + column * slots;
+    Fe3 w = ext3::zero();
+    for (uint32_t s = 0; s < slots && lo_of[s] != WHIR_TILE_NO_SLOT; ++s) {
+        w = ext3::add(w, ext3::mul(whir_load3(omega + ((uint64_t)s * tiles + tile) * 3),
+                                   whir_load3(eqbuf + (lo_of[s] + j) * 3)));
+    }
+    uint32_t below = n - bound;
+    Fe3 f_acc = ext3::zero();
+    uint64_t prefixes = 1ull << bound;
+    for (uint64_t p = 0; p < prefixes; ++p) {
+        Fe3 c = whir_load3(eqfull + p * 3);
+        uint64_t x = (p << below) | y;
+        uint16_t id = tilemap[x >> u];
+        uint64_t f = 0;
+        if (id != WHIR_LEAN_NONE) {
+            const uint64_t *share = shares + (uint64_t)id * WHIR_LEAN_SHARE_WORDS;
+            f = data[share[1] + (x - share[0])];
+        }
+        f_acc = ext3::add(f_acc, ext3::mul_base(c, f));
+    }
+    w_out = w;
+    f_out = f_acc;
+}
+
+extern "C" __global__ void whir_tile_materialize(
+    const uint16_t *__restrict__ tilemap, const uint64_t *__restrict__ shares,
+    const uint64_t *__restrict__ eqbuf, const uint64_t *__restrict__ data,
+    const uint64_t *__restrict__ slot_lo, const uint64_t *__restrict__ omega, uint32_t n,
+    uint32_t lean, uint32_t u, uint32_t slots, uint32_t bound,
+    const uint64_t *__restrict__ eqfull, uint64_t *__restrict__ out_w,
+    uint64_t *__restrict__ out_f) {
+    uint64_t len = 1ull << (n - bound);
+    uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    for (uint64_t y = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; y < len; y += stride) {
+        Fe3 w, f;
+        whir_tile_materialize_at(tilemap, shares, eqbuf, data, slot_lo, omega, n, lean, u, slots,
+                                 bound, eqfull, y, w, f);
+        whir_store3(out_w + y * 3, w);
+        whir_store3(out_f + y * 3, f);
+    }
+}
+
+// The same values against tables already written — the share form's, when a
+// checking opening writes them — as canonical limbs: one is added to
+// `*differing` for every position where either factor differs.
+extern "C" __global__ void whir_tile_materialize_check(
+    const uint16_t *__restrict__ tilemap, const uint64_t *__restrict__ shares,
+    const uint64_t *__restrict__ eqbuf, const uint64_t *__restrict__ data,
+    const uint64_t *__restrict__ slot_lo, const uint64_t *__restrict__ omega, uint32_t n,
+    uint32_t lean, uint32_t u, uint32_t slots, uint32_t bound,
+    const uint64_t *__restrict__ eqfull, const uint64_t *__restrict__ table_w,
+    const uint64_t *__restrict__ table_f, unsigned long long *__restrict__ differing) {
+    uint64_t len = 1ull << (n - bound);
+    uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    for (uint64_t y = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; y < len; y += stride) {
+        Fe3 w, f;
+        whir_tile_materialize_at(tilemap, shares, eqbuf, data, slot_lo, omega, n, lean, u, slots,
+                                 bound, eqfull, y, w, f);
+        Fe3 mw = ext3::canonical(w), mf = ext3::canonical(f);
+        Fe3 tw = ext3::canonical(whir_load3(table_w + y * 3));
+        Fe3 tf = ext3::canonical(whir_load3(table_f + y * 3));
+        if (mw.a != tw.a || mw.b != tw.b || mw.c != tw.c || mf.a != tf.a || mf.b != tf.b ||
+            mf.c != tf.c) {
+            atomicAdd(differing, 1ull);
+        }
     }
 }
 

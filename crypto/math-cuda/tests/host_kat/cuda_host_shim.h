@@ -48,6 +48,14 @@ static inline unsigned long long atomicMin(unsigned long long *address,
     return old;
 }
 
+// And the counter a comparison kernel keeps (`whir_tile_materialize_check`):
+// the same single-threaded read-modify-write, returning the old value.
+static inline unsigned long long atomicAdd(unsigned long long *address, unsigned long long val) {
+    unsigned long long old = *address;
+    *address = old + val;
+    return old;
+}
+
 // `goldilocks.cuh`'s field multiply needs this intrinsic. `blake3.cu` only uses
 // `goldilocks::canonical`, but the header compiles as a whole, so supply it.
 static inline uint64_t __umul64hi(uint64_t a, uint64_t b) {

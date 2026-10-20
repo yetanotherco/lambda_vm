@@ -325,8 +325,15 @@ fn tiles_match(s: &Stack, resident: bool, rounds: usize, wide: bool, check: bool
     }
 
     let (want_w, want_f) = session.tables_to_host().expect("read back");
+    let tables_before = math_cuda::whir_open::tile_table_check_counts();
     let old_bound = old.materialize().expect("materialise");
     let new_bound = new.materialize().expect("materialise");
+    let (tables, positions) = math_cuda::whir_open::tile_table_check_counts();
+    assert_eq!(
+        (tables - tables_before.0, positions - tables_before.1),
+        (u64::from(check), 0),
+        "{what}: a checking opening compares the tile form's write, and nothing differs"
+    );
     for (name, bound) in [("share", &old_bound), ("tile", &new_bound)] {
         let (got_w, got_f) = bound.tables_to_host().expect("read back");
         assert_eq!(
@@ -340,6 +347,12 @@ fn tiles_match(s: &Stack, resident: bool, rounds: usize, wide: bool, check: bool
             "{what}: the {name} form's bound message"
         );
     }
+    // The tile form writes the message by the share form's own sequence.
+    assert_eq!(
+        new_bound.tables_to_host().expect("read back").1,
+        old_bound.tables_to_host().expect("read back").1,
+        "{what}: the bound message raw-identical to the share form's"
+    );
     let point: Vec<u64> = rng.point(s.n - rounds);
     assert_eq!(
         canonical(&new_bound.evaluate_message(&point).expect("evaluate")),
@@ -402,9 +415,11 @@ impl Drop for FaultOff {
     }
 }
 
-/// ★ The comparison is load-bearing: with every tile-form value moved by one
-/// before it is compared, every round counts as different — and the opening
-/// still sends the share form's values, today's.
+/// ★ The comparisons are load-bearing: with every tile-form round value moved
+/// by one before it is compared, every round counts as different, and with
+/// one entry of the bound weight moved for the comparison of the write, one
+/// position does — and the opening still sends the share form's values and
+/// keeps its tables, today's.
 #[test]
 fn the_checking_form_counts_a_round_that_differs_and_sends_todays_values() {
     let _device = device();
@@ -444,6 +459,9 @@ fn the_checking_form_counts_a_round_that_differs_and_sends_todays_values() {
         old.bind(&alpha);
         new.bind(&alpha);
     }
+    let tables_before = math_cuda::whir_open::tile_table_check_counts();
+    let old_bound = old.materialize().expect("materialise");
+    let new_bound = new.materialize().expect("materialise");
     drop(fault);
     let (checked, mismatched) = math_cuda::whir_open::tile_check_counts();
     assert_eq!(
@@ -451,6 +469,75 @@ fn the_checking_form_counts_a_round_that_differs_and_sends_todays_values() {
         (3, 3),
         "every round compared, every one counted as different"
     );
+    let (tables, positions) = math_cuda::whir_open::tile_table_check_counts();
+    assert_eq!(
+        (tables - tables_before.0, positions - tables_before.1),
+        (1, 1),
+        "the write compared, the one moved position counted"
+    );
+    let (got_w, got_f) = new_bound.tables_to_host().expect("read back");
+    let (want_w, want_f) = old_bound.tables_to_host().expect("read back");
+    assert_eq!(
+        (canonical(&got_w), got_f),
+        (canonical(&want_w), want_f),
+        "a checking opening keeps the share form's tables as written, the moved entry put back"
+    );
+}
+
+/// An opening whose rounds stop before its lean rounds are spent — a group
+/// shorter than they are — writes its tables from the slot tables bound that
+/// far: the share form's values at every count, the message raw-identical.
+#[test]
+fn a_tile_opening_written_early_writes_the_share_forms_tables() {
+    let _device = device();
+    let s = mixed_stack(17, 8, 3, true, 0x5A);
+    let parts: Vec<(&[u64], usize)> = s
+        .columns
+        .iter()
+        .map(|(column, offset)| (column.as_slice(), *offset))
+        .collect();
+    let (old_shares, old_eq) = share_form(&s);
+    let (new_shares, new_eq, spec) = tile_form(&s, 3, false, false);
+    for spent in 0..3usize {
+        let mut old = LeanRound0::new(&old_shares, &old_eq, s.n, LeanMessage::Parts(&parts))
+            .expect("device")
+            .expect("the share form takes this stack");
+        let mut new = LeanRound0::with_tiles(
+            &new_shares,
+            &new_eq,
+            s.n,
+            LeanMessage::Parts(&parts),
+            Some(spec),
+        )
+        .expect("device")
+        .expect("the tile form takes this stack");
+        let mut rng = Rng(0xE4);
+        for _ in 0..spent {
+            assert_eq!(
+                canonical(&new.round(&nodes()).expect("tile round")),
+                canonical(&old.round(&nodes()).expect("share round"))
+            );
+            let alpha = limbs(&rng.ext());
+            old.bind(&alpha);
+            new.bind(&alpha);
+        }
+        let (want_w, want_f) = old
+            .materialize()
+            .expect("materialise")
+            .tables_to_host()
+            .expect("read back");
+        let (got_w, got_f) = new
+            .materialize()
+            .expect("materialise")
+            .tables_to_host()
+            .expect("read back");
+        assert_eq!(
+            canonical(&got_w),
+            canonical(&want_w),
+            "{spent} of 3: the weight"
+        );
+        assert_eq!(got_f, want_f, "{spent} of 3: the message, raw-identical");
+    }
 }
 
 /// The opening the tile form declines is the share form's: a stack with a
@@ -540,20 +627,23 @@ fn high_water(
     (peak.saturating_sub(held_before), accounted)
 }
 
-/// ★ The tile form adds nothing to an opening's working set. It is freed
-/// before the bound tables are allocated, and all it holds is smaller than
-/// they are ([`TileSpec::fits`]), so the pool's high water over an opening's
-/// rounds and its `materialize` is the share form's.
+/// ★ The tile form adds nothing to an opening's working set, and takes the
+/// share form's position map out of it. It never allocates that map (a `u16`
+/// a position); through the rounds all it holds is smaller than the bound
+/// tables, which `materialize` allocates once `Φ` is freed, and what it keeps
+/// beside them while it writes them is smaller than the map
+/// ([`TileSpec::fits`]). So the pool's high water over an opening's rounds and
+/// its `materialize` is the share form's less about the map.
 #[test]
 fn the_tile_form_adds_nothing_to_an_openings_high_water() {
     let _device = device();
-    // 16 columns of 2^18 at one point: 2^22, the shape of a block's chain at
-    // a thirty-second of its size.
+    // 16 columns of 2^20 at one point: 2^24, the shape of a block's chain at
+    // an eighth of its size. The map is 32 MiB, the bound tables 96 MiB.
     let mut rng = Rng(0x22);
-    let point = rng.point(18);
+    let point = rng.point(20);
     let s = stack_of(
-        22,
-        (0..16).map(|c| (c << 18, 18, point.clone())).collect(),
+        24,
+        (0..16).map(|c| (c << 20, 20, point.clone())).collect(),
         0x23,
     );
     let store = math_cuda::columns::DeviceColumns::upload(
@@ -566,21 +656,23 @@ fn the_tile_form_adds_nothing_to_an_openings_high_water() {
     let (share_peak, share_accounted) = high_water(&s, &store, None);
     let (tile_peak, tile_accounted) = high_water(&s, &store, Some(false));
     let (wide_peak, _) = high_water(&s, &store, Some(true));
-    let tables = 48u64 << (22 - 3);
+    let tables = 48u64 << (24 - 3);
+    let map = 2u64 << 24;
     println!(
-        "opening high water at 2^22, three rounds: share form {share_peak} B (accounted {share_accounted} B \
+        "opening high water at 2^24, three rounds: share form {share_peak} B (accounted {share_accounted} B \
          before its tables), tile form {tile_peak} B (accounted {tile_accounted} B), wide {wide_peak} B; \
-         the bound tables {tables} B"
+         the bound tables {tables} B, the map {map} B"
     );
     assert!(
-        tile_accounted > share_accounted,
-        "the tile form holds its tables during the rounds"
+        tile_accounted + map / 2 < share_accounted,
+        "the tile form holds no position map through its rounds"
     );
-    assert!(tile_accounted - share_accounted < tables);
-    // A page of slack: the pool rounds what it hands out.
+    // Half the map of margin: the pool rounds what it hands out, and the
+    // tile form keeps a few small tables the share form does not.
     assert!(
-        tile_peak <= share_peak + (64 << 10) && wide_peak <= share_peak + (64 << 10),
-        "the tile form raised the opening's high water: {tile_peak} / {wide_peak} B against {share_peak} B"
+        tile_peak + map / 2 <= share_peak && wide_peak + map / 2 <= share_peak,
+        "the tile form's high water is not the share form's less the map: {tile_peak} / {wide_peak} B \
+         against {share_peak} B"
     );
 }
 
@@ -724,10 +816,11 @@ fn production_shape(name: &str) -> Stack {
 /// the four shapes. Three warm-ups and twenty timed openings a form, every
 /// step waited for. Values first: the three rounds' evaluations and both
 /// bound tables equal across the forms, as canonical limbs. Then, per shape
-/// and form, `TILE BENCH` lines (median/min/max milliseconds), the pool's
-/// high water over an opening (`TILE MEM`), and the host's planning time
-/// (`TILE PLAN`). Whoever runs it reads its verdict from these lines;
-/// nothing here asserts a time.
+/// and form, `TILE BENCH` lines (median/min/max milliseconds: the
+/// construction, each round, the bound tables' write), the pool's high water
+/// over an opening (`TILE MEM`), and the host's planning time (`TILE PLAN`);
+/// last, the most one opening held by form (`TILE PEAKS`). Whoever runs it
+/// reads its verdict from these lines; nothing here asserts a time.
 #[test]
 #[ignore = "the measurement: a 2^27 stack on the card, about a minute"]
 fn the_tile_form_at_the_production_stack() {
@@ -830,4 +923,14 @@ fn the_tile_form_at_the_production_stack() {
             "{name}: the forms' values differ"
         );
     }
+    // The most one opening held, by form, counted from its allocations: the
+    // number a block's gate reads.
+    let mib = |bytes: u64| bytes as f64 / (1u64 << 20) as f64;
+    let [share, tile, check] = math_cuda::whir_open::lean_peak_bytes();
+    println!(
+        "TILE PEAKS share_mib={:.1} tile_mib={:.1} check_mib={:.1}",
+        mib(share),
+        mib(tile),
+        mib(check)
+    );
 }

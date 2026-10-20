@@ -24,9 +24,13 @@
 //      opening, round by round, on random stacks: one to eight classes meeting
 //      in a column of tiles, gaps, a column taller than the bound blocks, equal
 //      points apart, columns read from a store that is not laid out as the
-//      stack, one to six rounds. EQUAL values. The planner of these stacks is
-//      this file's own: the host planner in Rust is not what it is checked
-//      against.
+//      stack, one to six rounds. EQUAL values. Then the bound tables written
+//      from the tile form (`whir_tile_materialize_at`) at every count of bound
+//      challenges: the weight EQUAL to the share form's write, the message
+//      RAW-identical to it; and the comparison a checking opening runs
+//      (`whir_tile_materialize_check`) counts one moved entry of either
+//      table. The planner of these stacks is this file's own: the host
+//      planner in Rust is not what it is checked against.
 //
 // WHAT IT DOES NOT COVER, and the GPU tests are still required for: whether
 // nvcc accepts the file, the shared-memory squares and block reductions,
@@ -578,11 +582,70 @@ uint32_t tile_form_on(const TileStack &t, const char *name) {
     snprintf(what, sizeof what, "%s: the tiles' sum is the opening's claim", name);
     check(same_value(tile_claim, claim), what);
 
+    // ── the bound tables written from the tile form, at the challenges bound
+    //    so far: the weight EQUAL to the share form's write and to the
+    //    materialised opening, the message RAW-identical to the share form's
+    //    write. `last` also runs the comparison kernel a checking opening
+    //    uses: nothing on the share form's tables, then one position counted
+    //    for one moved entry of either table. ──
+    std::vector<uint64_t> bound;
+    uint64_t width = len;
+    auto written = [&](bool last) {
+        const uint32_t b = bound.size() / 3;
+        std::vector<Fe3> prefix;
+        for (size_t i = 0; i < bound.size(); i += 3) prefix.push_back(whir_load3(&bound[i]));
+        std::vector<uint64_t> eqfull = eq_table(prefix);
+        std::vector<uint64_t> share_w(width * 3), share_f(width * 3);
+        bool weight_ok = true, message_raw = true, opening_ok = true;
+        for (uint64_t y = 0; y < width; ++y) {
+            Fe3 tw, tf, sw, sf;
+            whir_tile_materialize_at(tt.tilemap.data(), t.rows.data(), t.eqbuf.data(),
+                                     t.store.data(), tt.slot_lo.data(), tt.omega.data(), n, lean,
+                                     u, slots, b, eqfull.data(), y, tw, tf);
+            whir_lean_materialize_at(colmap.data(), t.rows.data(), t.eqbuf.data(), t.store.data(),
+                                     n, b, eqfull.data(), y, sw, sf);
+            weight_ok &= same_value(tw, sw);
+            message_raw &= tf.a == sf.a && tf.b == sf.b && tf.c == sf.c;
+            opening_ok &= same_value(tw, w[y]) && same_value(tf, f[y]);
+            whir_store3(share_w.data() + y * 3, sw);
+            whir_store3(share_f.data() + y * 3, sf);
+        }
+        snprintf(what, sizeof what, "%s: written at %u bound: the weight = the share form's", name,
+                 b);
+        check(weight_ok, what);
+        snprintf(what, sizeof what,
+                 "%s: written at %u bound: the message raw-identical to the share form's", name, b);
+        check(message_raw, what);
+        snprintf(what, sizeof what, "%s: written at %u bound: both = the materialised opening",
+                 name, b);
+        check(opening_ok, what);
+        if (!last) return;
+        auto differing = [&]() {
+            unsigned long long count = 0;
+            CUDA_HOST_SINGLE_THREAD();
+            whir_tile_materialize_check(tt.tilemap.data(), t.rows.data(), t.eqbuf.data(),
+                                        t.store.data(), tt.slot_lo.data(), tt.omega.data(), n,
+                                        lean, u, slots, b, eqfull.data(), share_w.data(),
+                                        share_f.data(), &count);
+            return count;
+        };
+        snprintf(what, sizeof what, "%s: the comparison finds the share form's tables equal", name);
+        check(differing() == 0, what);
+        const uint64_t at = (width / 2) * 3;
+        share_w[at + 1] = goldilocks::add(share_w[at + 1], 1);
+        snprintf(what, sizeof what, "%s: the comparison counts one moved weight entry", name);
+        check(differing() == 1, what);
+        share_w[at + 1] = goldilocks::sub(share_w[at + 1], 1);
+        share_f[at] = goldilocks::add(share_f[at], 1);
+        snprintf(what, sizeof what, "%s: the comparison counts one moved message entry", name);
+        check(differing() == 1, what);
+    };
+
     // ── the rounds ──
     const uint64_t nodes[6] = {1, 0, 0, 2, 0, 0};
-    std::vector<uint64_t> bound;
-    uint64_t width = len, tile_half = tiles / 2;
+    uint64_t tile_half = tiles / 2;
     for (uint32_t s = 1; s <= lean; ++s) {
+        written(false);
         uint64_t half = width / 2;
         Fe3 want[2] = {ext3::zero(), ext3::zero()};
         for (uint64_t j = 0; j < half; ++j) {
@@ -631,6 +694,7 @@ uint32_t tile_form_on(const TileStack &t, const char *name) {
         bound.push_back(alpha.b);
         bound.push_back(alpha.c);
     }
+    written(true);
 
     // ── the bound weight is `Σ_κ Ω_κ^bound(R)·eq(λ_κ, j)`, and `Φ^bound` the
     //    bound message's tiles at their slots' points ──
@@ -724,7 +788,7 @@ void tile_form_equals_the_lean_rounds_and_the_materialised_opening() {
     check(!same_value(tile_first_round(scale), base_line), "control: a share's scale moves the round");
     printf("tile form: %d stacks (most classes meeting in a column of tiles 1/2/3/4/5/6/7/8: "
            "%d/%d/%d/%d/%d/%d/%d/%d; %d with gaps, %d with a tall column) equal the lean rounds "
-           "and the materialised opening\n",
+           "and the materialised opening, their written tables the share form's\n",
            stacks, by_slots[1], by_slots[2], by_slots[3], by_slots[4], by_slots[5], by_slots[6],
            by_slots[7], by_slots[8], gaps, talls);
 }

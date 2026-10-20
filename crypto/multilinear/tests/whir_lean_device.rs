@@ -22,8 +22,8 @@
 //! Three more arms run the lean rounds in TILE form
 //! (`LAMBDA_VM_WHIR_LEAN_TILES=1`, `=wide`, `=check`) on a second stack, one
 //! the form takes: the same bytes again, every opening counted in tile form,
-//! and under `check` every round compared with the share form on the card
-//! with none different. On the first stack — a column of eight rows, which the
+//! and under `check` every round and every opening's bound tables compared
+//! with the share form on the card with none different. On the first stack — a column of eight rows, which the
 //! form declines — the same arms prove today's bytes in share form.
 #![cfg(feature = "cuda")]
 
@@ -207,6 +207,7 @@ fn prove_arm<H: WhirHash>(
     let encoded_before = gpu::encoded_successors();
     let (opens_before, folds_before) = (gpu::open_calls(), gpu::resident_fold_calls());
     let (tiles_before, checks_before) = (gpu::lean_tile_opens(), gpu::lean_tile_checks());
+    let tables_before = gpu::lean_tile_table_checks();
     let proof = stacked_eval::prove::<F, Ext, _, H, _>(
         &stacked,
         &columns,
@@ -248,6 +249,8 @@ fn prove_arm<H: WhirHash>(
     let tile_opens = gpu::lean_tile_opens() - tiles_before;
     let (checked, mismatched) = gpu::lean_tile_checks();
     let checked = (checked - checks_before.0, mismatched - checks_before.1);
+    let (tables, positions) = gpu::lean_tile_table_checks();
+    let tables = (tables - tables_before.0, positions - tables_before.1);
     match arm {
         Arm::Tiles(tiles) if tiled => {
             assert_eq!(
@@ -256,15 +259,21 @@ fn prove_arm<H: WhirHash>(
                 "{} {arm:?}: every opening in tile form",
                 H::NAME
             );
-            let rounds = if tiles == gpu::LeanTiles::Check {
-                opens * gpu::lean_rounds_in_effect() as u64
+            let (rounds, written) = if tiles == gpu::LeanTiles::Check {
+                (opens * gpu::lean_rounds_in_effect() as u64, opens)
             } else {
-                0
+                (0, 0)
             };
             assert_eq!(
                 checked,
                 (rounds, 0),
                 "{} {arm:?}: rounds compared, differing",
+                H::NAME
+            );
+            assert_eq!(
+                tables,
+                (written, 0),
+                "{} {arm:?}: bound tables compared, positions differing",
                 H::NAME
             );
         }
@@ -276,6 +285,7 @@ fn prove_arm<H: WhirHash>(
                 H::NAME
             );
             assert_eq!(checked, (0, 0), "{} {arm:?}: rounds compared", H::NAME);
+            assert_eq!(tables, (0, 0), "{} {arm:?}: tables compared", H::NAME);
         }
     }
     if lean {

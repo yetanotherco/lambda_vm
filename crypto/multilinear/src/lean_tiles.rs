@@ -60,11 +60,23 @@ pub struct TilePlan {
     pub eq: Vec<u64>,
 }
 
-/// Device bytes the tile form holds: a `u16` a tile, each column of tiles'
-/// slots, the two slot tables at three limbs a tile and slot, a challenge.
-/// `math_cuda::whir_open::TileSpec::device_bytes`, which a `cuda` build's
-/// test holds this to.
+/// Device bytes the tile form holds through its rounds: a `u16` a tile, each
+/// column of tiles' slots, the two slot tables at three limbs a tile and
+/// slot, a challenge. `math_cuda::whir_open::TileSpec::device_bytes`, which a
+/// `cuda` build's test holds this to.
 pub const fn device_bytes(
+    n_stack: usize,
+    tile_bits: usize,
+    lean_rounds: usize,
+    slots: usize,
+) -> u64 {
+    write_bytes(n_stack, tile_bits, lean_rounds, slots)
+        + ((24 * slots as u64) << (n_stack - tile_bits))
+}
+
+/// What it keeps beside the bound tables while it writes them: all of the
+/// above but the message's slot tables (`TileSpec::write_bytes`).
+pub const fn write_bytes(
     n_stack: usize,
     tile_bits: usize,
     lean_rounds: usize,
@@ -73,13 +85,15 @@ pub const fn device_bytes(
     let tiles = 1u64 << (n_stack - tile_bits);
     let columns = tiles >> lean_rounds;
     let slots = slots as u64;
-    2 * tiles + 8 * slots * columns + 48 * slots * tiles + 24
+    2 * tiles + 8 * slots * columns + 24 * slots * tiles + 24
 }
 
 /// Whether the form fits a stack of `2^n_stack`: the rounds bind tile
-/// variables only, the kernels have the slots, and all the form holds is no
-/// larger than the tables written once the rounds are spent — it is freed
-/// before they are allocated, so the opening's working set does not grow.
+/// variables only, the kernels have the slots, and the opening never holds
+/// more than the share form does while it writes its tables — the position
+/// map (a `u16` a position, which the tile form does not allocate) beside
+/// the bound tables. Through the rounds all the form holds is no larger than
+/// those tables; through the write what it keeps is no larger than the map.
 pub const fn fits(n_stack: usize, tile_bits: usize, lean_rounds: usize, slots: usize) -> bool {
     tile_bits <= n_stack
         && lean_rounds >= 1
@@ -87,6 +101,7 @@ pub const fn fits(n_stack: usize, tile_bits: usize, lean_rounds: usize, slots: u
         && slots >= 1
         && slots <= MAX_SLOTS
         && device_bytes(n_stack, tile_bits, lean_rounds, slots) <= 48u64 << (n_stack - lean_rounds)
+        && write_bytes(n_stack, tile_bits, lean_rounds, slots) <= 2u64 << n_stack
 }
 
 /// The tile form of the opening whose weight is `shares` — `(stack offset,
@@ -514,14 +529,24 @@ mod tests {
         // tables after it.
         let tall = point(12);
         let small = tall[10 * 3..].to_vec();
-        let stack = [(0, tall, scale), (1 << 12, small, scale)];
+        let stack = [(0, tall.clone(), scale), (1 << 12, small, scale)];
         assert!(plan(&stack, 16, 3).is_none());
-        // The same stack at one round fits: the tables after it are four
-        // times larger.
-        assert_eq!(
-            plan(&stack, 16, 1).map(|p| (p.tile_bits, p.slots)),
-            Some((2, 1))
-        );
+        // A column of three variables, one round: through the round the form
+        // is under the tables after it, but what the write keeps beside them
+        // would be more than the share form's position map.
+        let three = tall[9 * 3..].to_vec();
+        let stack = [(0, tall.clone(), scale), (1 << 12, three, scale)];
+        assert!(plan(&stack, 16, 1).is_none());
+        assert!(device_bytes(16, 3, 1, 1) <= 48 << 15 && write_bytes(16, 3, 1, 1) > 2 << 16);
+        // Four variables fit, at one round and at three.
+        let four = tall[8 * 3..].to_vec();
+        let stack = [(0, tall, scale), (1 << 12, four, scale)];
+        for rounds in [1, 3] {
+            assert_eq!(
+                plan(&stack, 16, rounds).map(|p| (p.tile_bits, p.slots)),
+                Some((4, 1))
+            );
+        }
         // Nine classes at four rounds are more slots than the kernels have.
         let nine: Vec<_> = (0..9).map(|c| (c << 12, point(12), scale)).collect();
         assert!(plan(&nine, 16, 4).is_none());
@@ -569,9 +594,11 @@ mod tests {
     }
 
     /// ★ The opening's working set does not grow: wherever the form fits, all
-    /// it holds is no larger than the tables written once the rounds are
-    /// spent, which are allocated after it is freed. At the production stack
-    /// and three rounds: 6.4 MiB a slot against 768 MiB.
+    /// it holds through the rounds is no larger than the tables written once
+    /// they are spent, and what it keeps through the write is no larger than
+    /// the share form's position map, which it never allocates. At the
+    /// production stack and three rounds: 6.4 MiB a slot against 768 MiB, and
+    /// 3.3 MiB a slot against 256 MiB.
     #[test]
     fn the_form_holds_no_more_than_the_tables_written_after_it() {
         for n in [16usize, 22, 25, 27, 28] {
@@ -581,6 +608,9 @@ mod tests {
                         if fits(n, tile_bits, lean_rounds, slots) {
                             let after = 48u64 << (n - lean_rounds);
                             assert!(device_bytes(n, tile_bits, lean_rounds, slots) <= after);
+                            // Beside those tables, no more than the share
+                            // form's position map.
+                            assert!(write_bytes(n, tile_bits, lean_rounds, slots) <= 2u64 << n);
                         }
                     }
                 }
@@ -597,6 +627,10 @@ mod tests {
             );
             assert!((mib(held) - want).abs() < 0.1, "{} MiB", mib(held));
             assert!(fits(27, 10, 3, slots));
+            // Through the write: `Ω`, the tile map and the slots, against the
+            // 256 MiB map the share form holds there.
+            let kept = write_bytes(27, 10, 3, slots);
+            assert!(kept * 8 < 2 << 27, "{} MiB", mib(kept));
         }
         // The smallest tile that fits at the production stack and three
         // rounds: 2^4 positions for one slot, 2^7 for eight.

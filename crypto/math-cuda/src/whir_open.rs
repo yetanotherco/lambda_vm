@@ -339,8 +339,10 @@ pub const TILE_MAX_SLOTS: usize = 8;
 /// number times a small table its class shares. One pass over the message
 /// reduces each tile to a value per slot (`Φ`), one multiply a tile gives the
 /// weight's (`Ω`), and every round then reads those tables, `2^tile_bits`
-/// times smaller than the stack. The same field elements as the share form's
-/// rounds.
+/// times smaller than the stack. The bound tables are written from `Ω` and
+/// the classes' tables, the message through a `u16` a tile: the share form's
+/// map of a `u16` a position is never built. The same field elements as the
+/// share form's rounds and tables; the bound message raw-identical.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TileSpec {
     /// A tile is `2^tile_bits` stack positions: every share's `lo_bits`.
@@ -355,28 +357,41 @@ pub struct TileSpec {
     /// words) rather than one thread a tile. The same values.
     pub wide: bool,
     /// Every round also run in share form and compared
-    /// ([`tile_check_counts`]): a difference is counted, and the round sends
-    /// the share form's values, so the proof is today's either way.
+    /// ([`tile_check_counts`]), and the bound tables written by the share
+    /// form and compared with the tile form's write
+    /// ([`tile_table_check_counts`]): a difference is counted, and the share
+    /// form's values are the ones sent and kept, so the proof is today's
+    /// either way. The share form's map is built for it, so a checking
+    /// opening holds the map and the tile form at once.
     pub check: bool,
 }
 
 impl TileSpec {
-    /// Device bytes the tile form holds beside the share form's: a `u16` per
-    /// tile, each column's slots, `Ω` and `Φ` (three limbs a tile and slot
-    /// each), and a challenge.
+    /// Device bytes the tile form holds through its rounds: a `u16` per tile,
+    /// each column's slots, `Ω` and `Φ` (three limbs a tile and slot each),
+    /// and a challenge.
     pub const fn device_bytes(&self, num_vars: usize) -> u64 {
+        self.write_bytes(num_vars) + ((24 * self.slots as u64) << (num_vars - self.tile_bits))
+    }
+
+    /// What it keeps beside the bound tables while it writes them: all of
+    /// the above but `Φ`, which is freed first.
+    pub const fn write_bytes(&self, num_vars: usize) -> u64 {
         let tiles = 1u64 << (num_vars - self.tile_bits);
         let columns = tiles >> self.lean_rounds;
         let slots = self.slots as u64;
-        2 * tiles + 8 * slots * columns + 48 * slots * tiles + 24
+        2 * tiles + 8 * slots * columns + 24 * slots * tiles + 24
     }
 
     /// Whether a stack of `2^num_vars` takes this form: the rounds bind tile
-    /// variables only, the slots are ones the kernels have room for, and ALL
-    /// the form holds is no larger than the tables written once the rounds
-    /// are spent (`48 · 2^(num_vars − lean_rounds)` bytes) — it is freed
-    /// before they are allocated, so an opening's working set is the share
-    /// form's.
+    /// variables only, the slots are ones the kernels have room for, and the
+    /// opening never holds more than the share form does when it writes its
+    /// tables — the position map (a `u16` a position, which the tile form
+    /// does not allocate outside [`check`](Self::check)) beside the bound
+    /// tables (`48 · 2^(num_vars − lean_rounds)` bytes). Through the rounds
+    /// ALL the form holds is no larger than those tables, which are allocated
+    /// once `Φ` is freed; through the write what it keeps is no larger than
+    /// the map.
     pub const fn fits(&self, num_vars: usize) -> bool {
         self.tile_bits <= num_vars
             && self.lean_rounds >= 1
@@ -384,6 +399,7 @@ impl TileSpec {
             && self.slots >= 1
             && self.slots <= TILE_MAX_SLOTS
             && self.device_bytes(num_vars) <= 48u64 << (num_vars - self.lean_rounds)
+            && self.write_bytes(num_vars) <= 2u64 << num_vars
     }
 }
 
@@ -424,12 +440,48 @@ pub fn tile_check_counts() -> (u64, u64) {
     (TILE_CHECKED.load(Relaxed), TILE_MISMATCHED.load(Relaxed))
 }
 
+static LEAN_PEAKS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// ★ The most one lean opening held on the card at once since the process
+/// started, by form — `[share, tile, checking]` — counted from its own
+/// allocations: once it is built (its rounds allocate nothing that lasts)
+/// and while its bound tables are written. What a block gate reads to show
+/// the tile form holds no more than the share form.
+pub fn lean_peak_bytes() -> [u64; 3] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        LEAN_PEAKS[0].load(Relaxed),
+        LEAN_PEAKS[1].load(Relaxed),
+        LEAN_PEAKS[2].load(Relaxed),
+    ]
+}
+
+static TILE_TABLES_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TILE_TABLES_DIFFERING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Openings whose bound tables a checking opening ([`TileSpec::check`])
+/// compared with the tile form's write since the process started, and the
+/// positions where either factor differed. The tables kept are the share
+/// form's either way.
+pub fn tile_table_check_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        TILE_TABLES_CHECKED.load(Relaxed),
+        TILE_TABLES_DIFFERING.load(Relaxed),
+    )
+}
+
 static TILE_CHECK_FAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Moves every tile-form round value a checking opening compares by one,
+/// Moves every tile-form round value a checking opening compares by one, and
+/// one entry of the bound weight it compares the tile form's write with,
 /// before the comparison and nowhere else — for the test that shows the
-/// comparison counts a difference. What a round sends is unchanged. Not for
-/// production callers.
+/// comparisons count a difference. What the opening sends and keeps is
+/// unchanged. Not for production callers.
 #[doc(hidden)]
 pub fn force_tile_check_fault(on: bool) {
     TILE_CHECK_FAULT.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -462,7 +514,8 @@ struct Tiles {
     tilemap: CudaSlice<u16>,
     slot_lo: CudaSlice<u64>,
     omega: CudaSlice<u64>,
-    phi: CudaSlice<u64>,
+    /// `None` once the rounds are spent: the write does not read it.
+    phi: Option<CudaSlice<u64>>,
     r_dev: CudaSlice<u64>,
     /// Challenges the slot tables are bound at. The rest of the opening's
     /// are folded in before the next round reads them.
@@ -587,16 +640,16 @@ impl Tiles {
             tilemap,
             slot_lo,
             omega,
-            phi,
+            phi: Some(phi),
             r_dev,
             folded: 0,
         })
     }
 
     fn device_bytes(&self) -> u64 {
+        let phi = self.phi.as_ref().map_or(0, CudaSlice::len);
         (self.tilemap.len() * 2
-            + (self.slot_lo.len() + self.omega.len() + self.phi.len() + self.r_dev.len()) * 8)
-            as u64
+            + (self.slot_lo.len() + self.omega.len() + phi + self.r_dev.len()) * 8) as u64
     }
 }
 
@@ -659,7 +712,9 @@ pub struct LeanRound0 {
     stream: Arc<CudaStream>,
     /// The stack's variables.
     num_vars: usize,
-    colmap: CudaSlice<u16>,
+    /// The share holding each position: `None` for an opening in tile form
+    /// that does not check itself, which never reads it.
+    colmap: Option<CudaSlice<u16>>,
     shares: CudaSlice<u64>,
     eq: CudaSlice<u64>,
     data: Arc<CudaSlice<u64>>,
@@ -781,29 +836,37 @@ impl LeanRound0 {
         }
         let shares_dev = crate::device::htod_or_trim(&stream, &rows)?;
         let eq_dev = crate::device::htod_or_trim(&stream, eq)?;
-        let starts_dev = crate::device::htod_or_trim(&stream, &starts)?;
-        let ends_dev = crate::device::htod_or_trim(&stream, &ends)?;
-        // SAFETY: the kernel writes every position.
-        let mut colmap = unsafe { crate::device::alloc_or_trim::<u16>(&stream, len) }?;
-        let count = shares.len() as u32;
-        let len_arg = len as u64;
-        let grid = (len as u64)
-            .div_ceil(LEAN_BLOCK as u64)
-            .min(LEAN_MAX_GRID as u64) as u32;
-        unsafe {
-            stream
-                .launch_builder(&be.whir_lean_colmap)
-                .arg(&mut colmap)
-                .arg(&len_arg)
-                .arg(&starts_dev)
-                .arg(&ends_dev)
-                .arg(&count)
-                .launch(LaunchConfig {
-                    grid_dim: (grid.max(1), 1, 1),
-                    block_dim: (LEAN_BLOCK, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
-        }
+        // The share form's map, a `u16` a position: what its rounds and its
+        // write read, and a checking tile form's. The tile form reads a `u16`
+        // a tile instead.
+        let colmap = if tiles.is_none_or(|spec| spec.check) {
+            let starts_dev = crate::device::htod_or_trim(&stream, &starts)?;
+            let ends_dev = crate::device::htod_or_trim(&stream, &ends)?;
+            // SAFETY: the kernel writes every position.
+            let mut colmap = unsafe { crate::device::alloc_or_trim::<u16>(&stream, len) }?;
+            let count = shares.len() as u32;
+            let len_arg = len as u64;
+            let grid = (len as u64)
+                .div_ceil(LEAN_BLOCK as u64)
+                .min(LEAN_MAX_GRID as u64) as u32;
+            unsafe {
+                stream
+                    .launch_builder(&be.whir_lean_colmap)
+                    .arg(&mut colmap)
+                    .arg(&len_arg)
+                    .arg(&starts_dev)
+                    .arg(&ends_dev)
+                    .arg(&count)
+                    .launch(LaunchConfig {
+                        grid_dim: (grid.max(1), 1, 1),
+                        block_dim: (LEAN_BLOCK, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            Some(colmap)
+        } else {
+            None
+        };
         let t_dev = crate::device::alloc_zeros_or_trim::<u64>(&stream, LEAN_MAX_T * 3)?;
         let partials = crate::device::alloc_zeros_or_trim::<u64>(
             &stream,
@@ -823,7 +886,7 @@ impl LeanRound0 {
             )?),
             None => None,
         };
-        Ok(Some(Self {
+        let lean = Self {
             stream,
             num_vars,
             colmap,
@@ -837,7 +900,20 @@ impl LeanRound0 {
             partials,
             sums,
             tiles,
-        }))
+        };
+        lean.note_peak(lean.device_bytes());
+        Ok(Some(lean))
+    }
+
+    /// Adds what this opening holds right now to [`lean_peak_bytes`], under
+    /// its form.
+    fn note_peak(&self, bytes: u64) {
+        let form = match &self.tiles {
+            None => 0,
+            Some(tiles) if !tiles.spec.check => 1,
+            Some(_) => 2,
+        };
+        LEAN_PEAKS[form].fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether the rounds run in tile form.
@@ -879,11 +955,12 @@ impl LeanRound0 {
             + staging
     }
 
-    /// Device bytes this opening holds: the share map, the shares, the `eq`
-    /// halves, the round scratch, and the staged message when it staged one.
+    /// Device bytes this opening holds: the share map when it has one, the
+    /// shares, the `eq` halves, the round scratch, the staged message when it
+    /// staged one, and the tile form's tables.
     pub fn device_bytes(&self) -> u64 {
         let staged = if self.staged { self.data.len() * 8 } else { 0 };
-        (self.colmap.len() * 2
+        (self.colmap.as_ref().map_or(0, CudaSlice::len) * 2
             + (self.shares.len() + self.eq.len() + self.partials.len() + self.sums.len()) * 8
             + self.t_dev.len() * 8
             + staged) as u64
@@ -962,29 +1039,38 @@ impl LeanRound0 {
         let be = backend()?;
         let stride = 1u64 << (self.num_vars - tiles.spec.tile_bits);
         let slots = tiles.spec.slots as u32;
-        while tiles.folded < self.bound.len() / 3 {
-            let at = tiles.folded * 3;
-            self.stream
-                .memcpy_htod(&self.bound[at..at + 3], &mut tiles.r_dev)?;
-            let half = (stride >> tiles.folded) / 2;
+        let Tiles {
+            omega,
+            phi,
+            r_dev,
+            folded,
+            ..
+        } = tiles;
+        let phi = phi
+            .as_mut()
+            .expect("Φ is held until the tables are written");
+        while *folded < self.bound.len() / 3 {
+            let at = *folded * 3;
+            self.stream.memcpy_htod(&self.bound[at..at + 3], r_dev)?;
+            let half = (stride >> *folded) / 2;
             let tasks = 2 * slots as u64 * half;
             let grid = tasks.div_ceil(LEAN_BLOCK as u64).min(LEAN_MAX_GRID as u64) as u32;
             unsafe {
                 self.stream
                     .launch_builder(&be.whir_tile_fold)
-                    .arg(&mut tiles.omega)
-                    .arg(&mut tiles.phi)
+                    .arg(&mut *omega)
+                    .arg(&mut *phi)
                     .arg(&stride)
                     .arg(&slots)
                     .arg(&half)
-                    .arg(&tiles.r_dev)
+                    .arg(&*r_dev)
                     .launch(LaunchConfig {
                         grid_dim: (grid.max(1), 1, 1),
                         block_dim: (LEAN_BLOCK, 1, 1),
                         shared_mem_bytes: 0,
                     })?;
             }
-            tiles.folded += 1;
+            *folded += 1;
         }
         Ok(())
     }
@@ -1011,7 +1097,12 @@ impl LeanRound0 {
             self.stream
                 .launch_builder(&be.whir_tile_round)
                 .arg(&tiles.omega)
-                .arg(&tiles.phi)
+                .arg(
+                    tiles
+                        .phi
+                        .as_ref()
+                        .expect("Φ is held until the tables are written"),
+                )
                 .arg(&stride)
                 .arg(&slots)
                 .arg(&half)
@@ -1052,10 +1143,14 @@ impl LeanRound0 {
         let n_arg = self.num_vars as u32;
         let s_arg = round as u32;
         let num_t_arg = num_t as u32;
+        let colmap = self
+            .colmap
+            .as_ref()
+            .expect("the share form runs where its map is built");
         unsafe {
             self.stream
                 .launch_builder(&be.whir_lean_round)
-                .arg(&self.colmap)
+                .arg(colmap)
                 .arg(&self.shares)
                 .arg(&self.eq)
                 .arg(self.data.as_ref())
@@ -1096,14 +1191,18 @@ impl LeanRound0 {
 
     /// The factors at the challenges bound so far, written out at
     /// `2^(n − bound)`: the session the rest of the chain runs on.
+    ///
+    /// In tile form they are written from the slot tables
+    /// (`whir_tile_materialize`): `Ω` bound at every challenge so far, and
+    /// `Φ` freed before the tables are allocated ([`TileSpec::fits`]). A
+    /// checking opening writes the share form's tables, keeps them, and
+    /// compares the tile form's write with them
+    /// ([`tile_table_check_counts`]).
     pub fn materialize(mut self) -> Result<OpeningSession> {
         let be = backend()?;
-        // The tile form goes before the tables are allocated: nothing below
-        // reads it, and an opening's working set is then the share form's
-        // ([`TileSpec::fits`]). Its last kernel has to have run first.
-        if self.tiles.is_some() {
-            self.stream.synchronize()?;
-            self.tiles = None;
+        self.fold_tiles()?;
+        if let Some(tiles) = self.tiles.as_mut() {
+            tiles.phi = None;
         }
         let bound = self.bound();
         let len = 1usize << (self.num_vars - bound);
@@ -1111,28 +1210,69 @@ impl LeanRound0 {
         // SAFETY: the kernel writes every element of both.
         let mut weight = unsafe { crate::device::alloc_or_trim::<u64>(&self.stream, len * 3) }?;
         let mut message = unsafe { crate::device::alloc_or_trim::<u64>(&self.stream, len * 3) }?;
+        self.note_peak(
+            self.device_bytes() + ((weight.len() + message.len() + eqfull.len()) * 8) as u64,
+        );
         let n_arg = self.num_vars as u32;
         let bound_arg = bound as u32;
         let grid = (len as u64)
             .div_ceil(LEAN_BLOCK as u64)
             .min(LEAN_MAX_GRID as u64) as u32;
-        unsafe {
-            self.stream
-                .launch_builder(&be.whir_lean_materialize)
-                .arg(&self.colmap)
-                .arg(&self.shares)
-                .arg(&self.eq)
-                .arg(self.data.as_ref())
-                .arg(&n_arg)
-                .arg(&bound_arg)
-                .arg(&eqfull)
-                .arg(&mut weight)
-                .arg(&mut message)
-                .launch(LaunchConfig {
-                    grid_dim: (grid.max(1), 1, 1),
-                    block_dim: (LEAN_BLOCK, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+        let config = LaunchConfig {
+            grid_dim: (grid.max(1), 1, 1),
+            block_dim: (LEAN_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        match &self.tiles {
+            Some(tiles) if !tiles.spec.check => {
+                let (lean_arg, u_arg, slots_arg) = (
+                    tiles.spec.lean_rounds as u32,
+                    tiles.spec.tile_bits as u32,
+                    tiles.spec.slots as u32,
+                );
+                unsafe {
+                    self.stream
+                        .launch_builder(&be.whir_tile_materialize)
+                        .arg(&tiles.tilemap)
+                        .arg(&self.shares)
+                        .arg(&self.eq)
+                        .arg(self.data.as_ref())
+                        .arg(&tiles.slot_lo)
+                        .arg(&tiles.omega)
+                        .arg(&n_arg)
+                        .arg(&lean_arg)
+                        .arg(&u_arg)
+                        .arg(&slots_arg)
+                        .arg(&bound_arg)
+                        .arg(&eqfull)
+                        .arg(&mut weight)
+                        .arg(&mut message)
+                        .launch(config)?;
+                }
+            }
+            tiles => {
+                let colmap = self
+                    .colmap
+                    .as_ref()
+                    .expect("the share form writes where its map is built");
+                unsafe {
+                    self.stream
+                        .launch_builder(&be.whir_lean_materialize)
+                        .arg(colmap)
+                        .arg(&self.shares)
+                        .arg(&self.eq)
+                        .arg(self.data.as_ref())
+                        .arg(&n_arg)
+                        .arg(&bound_arg)
+                        .arg(&eqfull)
+                        .arg(&mut weight)
+                        .arg(&mut message)
+                        .launch(config)?;
+                }
+                if let Some(tiles) = tiles {
+                    self.check_write(tiles, &eqfull, &mut weight, &message, config)?;
+                }
+            }
         }
         Ok(OpeningSession::from_tables(
             self.stream.clone(),
@@ -1140,6 +1280,81 @@ impl LeanRound0 {
             message,
             len,
         ))
+    }
+
+    /// A checking opening's comparison of the tile form's write with the
+    /// share form's tables just written: the positions where either factor
+    /// differs, counted on the card and added to
+    /// [`tile_table_check_counts`]. The tables are left as written.
+    fn check_write(
+        &self,
+        tiles: &Tiles,
+        eqfull: &CudaSlice<u64>,
+        weight: &mut CudaSlice<u64>,
+        message: &CudaSlice<u64>,
+        config: LaunchConfig,
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let be = backend()?;
+        // The fault moves the weight's first entry for the comparison only.
+        let kept = if TILE_CHECK_FAULT.load(Relaxed) {
+            let kept = self.stream.clone_dtoh(&weight.slice(0..3))?;
+            self.stream.synchronize()?;
+            let mut moved = kept.clone();
+            moved[0] = moved[0].wrapping_add(1) % 0xFFFF_FFFF_0000_0001;
+            self.stream
+                .memcpy_htod(&moved, &mut weight.slice_mut(0..3))?;
+            self.stream.synchronize()?;
+            Some(kept)
+        } else {
+            None
+        };
+        let mut differing = crate::device::alloc_zeros_or_trim::<u64>(&self.stream, 1)?;
+        let (n_arg, lean_arg, u_arg, slots_arg, bound_arg) = (
+            self.num_vars as u32,
+            tiles.spec.lean_rounds as u32,
+            tiles.spec.tile_bits as u32,
+            tiles.spec.slots as u32,
+            self.bound() as u32,
+        );
+        unsafe {
+            self.stream
+                .launch_builder(&be.whir_tile_materialize_check)
+                .arg(&tiles.tilemap)
+                .arg(&self.shares)
+                .arg(&self.eq)
+                .arg(self.data.as_ref())
+                .arg(&tiles.slot_lo)
+                .arg(&tiles.omega)
+                .arg(&n_arg)
+                .arg(&lean_arg)
+                .arg(&u_arg)
+                .arg(&slots_arg)
+                .arg(&bound_arg)
+                .arg(eqfull)
+                .arg(&*weight)
+                .arg(message)
+                .arg(&mut differing)
+                .launch(config)?;
+        }
+        let count = self.stream.clone_dtoh(&differing)?;
+        self.stream.synchronize()?;
+        if let Some(kept) = kept {
+            self.stream
+                .memcpy_htod(&kept, &mut weight.slice_mut(0..3))?;
+            self.stream.synchronize()?;
+        }
+        TILE_TABLES_CHECKED.fetch_add(1, Relaxed);
+        if count[0] > 0 && TILE_TABLES_DIFFERING.fetch_add(count[0], Relaxed) == 0 {
+            eprintln!(
+                "[gpu] WHIR lean tiles: the tables written at {} bound of a 2^{} stack differ from \
+                 the share form's at {} positions",
+                self.bound(),
+                self.num_vars,
+                count[0]
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1352,12 +1567,16 @@ mod tests {
         }
     }
 
-    /// ★ The tile form adds nothing to an opening's working set: wherever it
-    /// fits, ALL it holds is no larger than the tables written once the
-    /// rounds are spent, and `materialize` frees it before it allocates them.
-    /// At the production stack and three rounds a slot is 6.4 MiB against
-    /// those tables' 768 MiB, and the turn a group's openings take
-    /// ([`opening_transient_bytes`]) is what it was.
+    /// ★ The tile form adds nothing to an opening's working set. It never
+    /// allocates the share form's position map (outside `check`); wherever it
+    /// fits, ALL it holds through the rounds is no larger than the tables
+    /// written once they are spent — `materialize` frees `Φ` before it
+    /// allocates them — and what it keeps beside those tables while it writes
+    /// them is no larger than the map. So at no step does an opening hold
+    /// more than the share form at its write, and the turn a group's openings
+    /// take ([`opening_transient_bytes`]) is what it was. At the production
+    /// stack and three rounds a slot is 6.4 MiB against the tables' 768 MiB,
+    /// and 3.3 MiB against the map's 256 MiB.
     #[test]
     fn the_tile_form_is_no_larger_than_the_tables_written_after_it() {
         for n in [16usize, 22, 25, 27, 28] {
@@ -1366,12 +1585,27 @@ mod tests {
                     for slots in 1..=TILE_MAX_SLOTS {
                         let form = spec(tile_bits, lean_rounds, slots);
                         if form.fits(n) {
-                            assert!(form.device_bytes(n) <= 48u64 << (n - lean_rounds));
+                            let tables = 48u64 << (n - lean_rounds);
+                            let map = 2u64 << n;
+                            assert!(form.device_bytes(n) <= tables);
+                            assert!(form.write_bytes(n) <= map);
+                            assert_eq!(
+                                form.device_bytes(n) - form.write_bytes(n),
+                                (24 * slots as u64) << (n - tile_bits),
+                                "the write frees Φ alone"
+                            );
                         }
                     }
                 }
             }
         }
+        assert_eq!(spec(10, 3, 1).write_bytes(27), (3 << 20) + (3 << 17) + 24);
+        assert!(
+            spec(3, 1, 1).device_bytes(27) <= 48 << 26 && !spec(3, 1, 1).fits(27),
+            "at one round, tiles of eight positions: the write would keep 480 MiB beside the \
+             tables, more than the 256 MiB map"
+        );
+        assert!(spec(4, 1, 1).fits(27));
         assert_eq!(spec(10, 3, 1).device_bytes(27), (6 << 20) + (3 << 17) + 24);
         assert_eq!(spec(10, 3, 8).device_bytes(27), (49 << 20) + (1 << 18) + 24);
         assert!(spec(10, 3, 8).fits(27) && spec(8, 3, 8).fits(27) && spec(7, 3, 8).fits(27));
