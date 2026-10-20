@@ -2456,6 +2456,8 @@ mod tests {
         let mut bundle =
             prove_continuation_with_max_rows(&elf_bytes, &[], epoch_size_log2, &opts, &max_rows)
                 .unwrap();
+        // Epoch 0 must be intermediate (no HALT) for `cpu_proof_start(false, ..)`.
+        assert!(bundle.epochs.len() >= 2, "need an intermediate epoch");
         let cpu = crate::cpu_proof_start(false, &bundle.epochs[0].table_counts);
         assert_eq!(
             bundle.epochs[0].proof.proofs[cpu].trace_length,

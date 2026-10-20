@@ -452,7 +452,7 @@ fn test_table_heights_matches_chunking() {
     assert_eq!(table_heights(32, 32), vec![32]);
     assert_eq!(table_heights(33, 32), vec![32, 4]);
     assert_eq!(table_heights(70, 32), vec![32, 32, 8]);
-    // One cycle over the bound: 2^11 full tables of 2^19 rows, then the last one.
+    // One cycle over the bound: exactly 2^11 full tables of 2^19 rows.
     let rows = 1usize << 30;
     assert!(validate_heights(&table_heights(rows, max_rows::CPU)).is_err());
     assert!(validate_heights(&table_heights(rows - (1 << 18), max_rows::CPU)).is_ok());

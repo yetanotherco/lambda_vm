@@ -175,13 +175,25 @@ fn craft(elf_bytes: &[u8], ops: Vec<CpuOperation>, tamper: Tamper) -> Crafted {
         timestamp_root: cpu::commit_timestamp_column(&options, &column),
         final_pc_ts: last_ts + 1,
     };
-    Crafted {
+    let crafted = Crafted {
         elf_bytes: elf_bytes.to_vec(),
         program,
         traces,
         honest,
         forged,
-    }
+    };
+    // HALT zeroizes x1-x31 on every run here, forged or not, so the trace's FINI is
+    // the halted register file the production verifier pins.
+    assert_eq!(
+        crate::test_utils::trace_register_commitment(
+            &opts(),
+            &register::register_init_from_entry_point(crafted.program.entry_point),
+            &crafted.traces,
+        ),
+        crafted.register_commitment(),
+        "the run must end in the halted register file"
+    );
+    crafted
 }
 
 impl Crafted {
@@ -214,12 +226,11 @@ impl Crafted {
         airs
     }
 
+    /// As the production verifier: REGISTER FINI pinned to the halted register file.
     fn register_commitment(&self) -> Commitment {
-        crate::test_utils::trace_register_commitment(
-            &opts(),
-            &register::register_init_from_entry_point(self.program.entry_point),
-            &self.traces,
-        )
+        let committed_bytes = u32::try_from(self.traces.public_output_bytes.len())
+            .expect("public output fits in u32");
+        register::halted_commitment(&opts(), self.program.entry_point, committed_bytes)
     }
 
     fn transcript(&self) -> DefaultTranscript<E> {
