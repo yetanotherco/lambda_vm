@@ -8,7 +8,9 @@ use math::field::element::FieldElement;
 use stark::trace::TraceTable;
 
 use crate::tables::MaxRowsConfig;
-use crate::tables::trace_builder::{StreamTable, Traces, WalkLean, WindowedTraceBuilder};
+use crate::tables::trace_builder::{
+    CutPadding, StreamTable, Traces, WalkLean, WindowedTraceBuilder,
+};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::test_utils::asm_elf_bytes;
 
@@ -362,9 +364,17 @@ fn windowed_builds_the_whole_run_tables_at_production_sizes() {
     same_traces(&reference, &traces);
 }
 
+/// The padding rule the windowed builder reads (`LAMBDA_VM_BLOCK_CUT_PADDING`).
+fn padding() -> CutPadding {
+    CutPadding::from_env().expect("the padding rule")
+}
+
 /// The whole-run KECCAK_RND table cut into tables of `rows` rows — rows
-/// `[k·rows, (k+1)·rows)`, as the block proof splits it.
+/// `[k·rows, (k+1)·rows)`, as the block proof splits it — as many as the
+/// builder's padding rule counts ([`CutPadding::tables`]) of the table's real
+/// rows (up to the last one whose μ is set).
 fn split_keccak_rnd(t: &Traces, per: usize) -> Vec<Table> {
+    use crate::tables::keccak_rnd::cols::MU;
     t.keccak_rnds
         .iter()
         .flat_map(|table| {
@@ -373,7 +383,20 @@ fn split_keccak_rnd(t: &Traces, per: usize) -> Vec<Table> {
             if all.len() <= per {
                 return vec![rebuild(&all, width)];
             }
-            all.chunks(per).map(|chunk| rebuild(chunk, width)).collect()
+            let keep = match padding() {
+                CutPadding::WholeRun => all.len() / per,
+                last => {
+                    let real = all
+                        .iter()
+                        .rposition(|row| row[MU] != FieldElement::zero())
+                        .map_or(0, |row| row + 1);
+                    last.tables(real, per)
+                }
+            };
+            all.chunks(per)
+                .take(keep)
+                .map(|chunk| rebuild(chunk, width))
+                .collect()
         })
         .collect()
 }
@@ -467,9 +490,9 @@ fn windowed_streams_keccak_rnd_as_the_split_whole_run_table() {
 
 /// With KECCAK, ECSM and ECDAS built as their cuts at the finish, the windowed
 /// build (its streamed ops dropped) is the whole-run build with those three
-/// split by the block's `split_rows`, table for table, at every cut size from
-/// one row to past the whole table; the other tables are untouched. And a cut
-/// that is not a power of two is refused.
+/// split by the block's split under the build's padding rule, table for table,
+/// at every cut size from one row to past the whole table; the other tables
+/// are untouched. And a cut that is not a power of two is refused.
 #[cfg(feature = "parallel")]
 #[test]
 fn windowed_builds_the_cut_tables_as_the_split_whole_run_tables() {
@@ -487,9 +510,9 @@ fn windowed_builds_the_cut_tables_as_the_split_whole_run_tables() {
             let rows = 1usize << log2;
             let mut want = whole(&program, &logs, &max_rows);
             let counts = [want.keccaks.len(), want.ecsms.len(), want.ecdases.len()];
-            split_keccak(&mut want, log2);
-            split_ecsm(&mut want, log2);
-            split_ecdas(&mut want, log2);
+            split_keccak(&mut want, log2, padding());
+            split_ecsm(&mut want, log2, padding());
+            split_ecdas(&mut want, log2, padding());
             for (any, (before, after)) in cut_any.iter_mut().zip(counts.iter().zip([
                 want.keccaks.len(),
                 want.ecsms.len(),

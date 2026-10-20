@@ -44,7 +44,7 @@ use crate::multilinear_prove::{
 use crate::statement::{self, MULTILINEAR_BLOCK_TAG};
 use crate::tables::gpack::{self, TraceForm};
 use crate::tables::trace_builder::{
-    ChunkJob, StreamTable, Traces, WindowStamps, WindowedTraceBuilder,
+    ChunkJob, CutPadding, StreamTable, Traces, WindowStamps, WindowedTraceBuilder,
 };
 use crate::test_utils::{E, F};
 use crate::zf_format::ZfFormat;
@@ -1682,6 +1682,40 @@ pub fn validate_groups(groups: &[Vec<u32>], tables: usize) -> Result<Vec<usize>,
 /// constraints read one row (no shifted reads), so each piece is a table of
 /// the same AIR, and the bus sums over the pieces are the sum over the whole.
 pub(crate) fn split_rows(table: TraceTable<F, E>, rows: usize) -> Vec<TraceTable<F, E>> {
+    let pieces = table.main_table.height / rows.max(1);
+    first_pieces(table, rows, pieces)
+}
+
+/// [`split_rows`] for a family the block cuts at a fixed number of rows
+/// (KECCAK_RND, KECCAK, ECSM, ECDAS), keeping as many pieces as `padding`
+/// counts ([`CutPadding::tables`]) of the table's real rows: its rows up to the
+/// last one whose `mu` (the family's multiplicity column, zero on a padding
+/// row) is set. Under [`CutPadding::LastTable`] the pieces of padding rows
+/// alone go, as the finish leaves them unbuilt; under [`CutPadding::WholeRun`]
+/// every piece stays.
+fn split_cut(
+    table: TraceTable<F, E>,
+    rows: usize,
+    mu: usize,
+    padding: CutPadding,
+) -> Vec<TraceTable<F, E>> {
+    let height = table.main_table.height;
+    match padding {
+        CutPadding::LastTable if height > rows => {
+            let real = (0..height)
+                .rev()
+                .find(|&row| *table.main_table.get(row, mu) != FieldElement::zero())
+                .map_or(0, |row| row + 1);
+            let pieces = padding.tables(real, rows).clamp(1, height / rows);
+            first_pieces(table, rows, pieces)
+        }
+        _ => split_rows(table, rows),
+    }
+}
+
+/// The first `pieces` of [`split_rows`]'s tables; `table` itself when it is no
+/// taller than `rows`.
+fn first_pieces(table: TraceTable<F, E>, rows: usize, pieces: usize) -> Vec<TraceTable<F, E>> {
     let height = table.main_table.height;
     if height <= rows {
         return vec![table];
@@ -1691,7 +1725,7 @@ pub(crate) fn split_rows(table: TraceTable<F, E>, rows: usize) -> Vec<TraceTable
     // Row-major in, row-major out: each piece is a run of whole rows, copied
     // as they lie (a transposition of KECCAK_RND's 1,480 columns is what this
     // used to cost).
-    (0..height / rows)
+    (0..pieces.min(height / rows))
         .into_par_iter()
         .map(|k| {
             let mut data = Vec::with_capacity(rows * width);
@@ -2360,10 +2394,11 @@ fn prove_block_whir_inner(
     stamps.build_marks = crate::tables::trace_builder::build_stamps::take();
 
     let t = Instant::now();
-    split_keccak_rnd(&mut traces, options.keccak_rnd_rows_log2);
-    split_ecdas(&mut traces, options.ecdas_rows_log2);
-    split_keccak(&mut traces, options.keccak_rows_log2);
-    split_ecsm(&mut traces, options.ecsm_rows_log2);
+    let padding = CutPadding::from_env()?;
+    split_keccak_rnd(&mut traces, options.keccak_rnd_rows_log2, padding);
+    split_ecdas(&mut traces, options.ecdas_rows_log2, padding);
+    split_keccak(&mut traces, options.keccak_rows_log2, padding);
+    split_ecsm(&mut traces, options.ecsm_rows_log2, padding);
     if deviations.omit_first_keccak_rnd && !traces.keccak_rnds.is_empty() {
         traces.keccak_rnds.remove(0);
     }
@@ -2383,45 +2418,51 @@ fn prove_block_whir_inner(
     Ok((proof, stamps))
 }
 
-/// Cuts every KECCAK_RND table into tables of at most `2^rows_log2` rows.
-pub(crate) fn split_keccak_rnd(traces: &mut Traces, rows_log2: usize) {
+/// Cuts every KECCAK_RND table into tables of at most `2^rows_log2` rows, as
+/// many as `padding` keeps ([`split_cut`]).
+pub(crate) fn split_keccak_rnd(traces: &mut Traces, rows_log2: usize, padding: CutPadding) {
     let rows = 1usize << rows_log2;
+    let mu = crate::tables::keccak_rnd::cols::MU;
     traces.keccak_rnds = std::mem::take(&mut traces.keccak_rnds)
         .into_iter()
-        .flat_map(|table| split_rows(table, rows))
+        .flat_map(|table| split_cut(table, rows, mu, padding))
         .collect();
 }
 
-/// Cuts every ECDAS table into tables of at most `2^rows_log2` rows: a cut
-/// may fall inside one scalar multiplication, whose steps chain through the
-/// Ecdas bus alone ([`BLOCK_ECDAS_ROWS_LOG2`]).
-pub(crate) fn split_ecdas(traces: &mut Traces, rows_log2: usize) {
+/// Cuts every ECDAS table into tables of at most `2^rows_log2` rows, as many
+/// as `padding` keeps ([`split_cut`]): a cut may fall inside one scalar
+/// multiplication, whose steps chain through the Ecdas bus alone
+/// ([`BLOCK_ECDAS_ROWS_LOG2`]).
+pub(crate) fn split_ecdas(traces: &mut Traces, rows_log2: usize, padding: CutPadding) {
     let rows = 1usize << rows_log2;
+    let mu = crate::tables::ecdas::cols::MU;
     traces.ecdases = std::mem::take(&mut traces.ecdases)
         .into_iter()
-        .flat_map(|table| split_rows(table, rows))
+        .flat_map(|table| split_cut(table, rows, mu, padding))
         .collect();
 }
 
-/// Cuts every KECCAK table into tables of at most `2^rows_log2` rows: a row is
-/// one whole permutation call, so a cut falls between calls
-/// ([`BLOCK_KECCAK_ROWS_LOG2`]).
-pub(crate) fn split_keccak(traces: &mut Traces, rows_log2: usize) {
+/// Cuts every KECCAK table into tables of at most `2^rows_log2` rows, as many
+/// as `padding` keeps ([`split_cut`]): a row is one whole permutation call, so
+/// a cut falls between calls ([`BLOCK_KECCAK_ROWS_LOG2`]).
+pub(crate) fn split_keccak(traces: &mut Traces, rows_log2: usize, padding: CutPadding) {
     let rows = 1usize << rows_log2;
+    let mu = crate::tables::keccak::cols::MU;
     traces.keccaks = std::mem::take(&mut traces.keccaks)
         .into_iter()
-        .flat_map(|table| split_rows(table, rows))
+        .flat_map(|table| split_cut(table, rows, mu, padding))
         .collect();
 }
 
-/// Cuts every ECSM table into tables of at most `2^rows_log2` rows: a row is
-/// one whole scalar multiplication, so a cut falls between calls
-/// ([`BLOCK_ECSM_ROWS_LOG2`]).
-pub(crate) fn split_ecsm(traces: &mut Traces, rows_log2: usize) {
+/// Cuts every ECSM table into tables of at most `2^rows_log2` rows, as many as
+/// `padding` keeps ([`split_cut`]): a row is one whole scalar multiplication,
+/// so a cut falls between calls ([`BLOCK_ECSM_ROWS_LOG2`]).
+pub(crate) fn split_ecsm(traces: &mut Traces, rows_log2: usize, padding: CutPadding) {
     let rows = 1usize << rows_log2;
+    let mu = crate::tables::ecsm::cols::MU;
     traces.ecsms = std::mem::take(&mut traces.ecsms)
         .into_iter()
-        .flat_map(|table| split_rows(table, rows))
+        .flat_map(|table| split_cut(table, rows, mu, padding))
         .collect();
 }
 
@@ -4226,13 +4267,15 @@ fn prove_streamed(
                 }
                 let mut rest = built_rest?;
                 let finish_marks = crate::tables::trace_builder::build_stamps::take();
-                split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2);
+                // The builder's own rule (it read the same variable).
+                let padding = CutPadding::from_env()?;
+                split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2, padding);
                 // Cut at the finish already, and held packed: a packed table
                 // has no rows for `split_rows` to copy.
                 if !options.finish_cuts {
-                    split_ecdas(&mut rest, options.ecdas_rows_log2);
-                    split_keccak(&mut rest, options.keccak_rows_log2);
-                    split_ecsm(&mut rest, options.ecsm_rows_log2);
+                    split_ecdas(&mut rest, options.ecdas_rows_log2, padding);
+                    split_keccak(&mut rest, options.keccak_rows_log2, padding);
+                    split_ecsm(&mut rest, options.ecsm_rows_log2, padding);
                 }
                 if deviations.omit_first_keccak_rnd && options.stream_keccak_rnd {
                     return Err(Error::Prover(

@@ -4071,7 +4071,7 @@ pub struct StreamSkip {
     /// How the tables cut at `keccak_rnd_rows`, `keccak_rows`, `ecsm_rows` and
     /// `ecdas_rows` are padded ([`CutPadding`]): the table phase's counts, its
     /// tables and the tables built again from its lists all read it here. The
-    /// default is the tables the block's split makes.
+    /// default stops at the table that holds the last real row.
     pub cut_padding: CutPadding,
 }
 
@@ -4083,21 +4083,21 @@ pub enum CutPadding {
     /// The whole run's rows padded to a power of two, then cut: the tables the
     /// block's split makes of the whole padded table (`split_rows`). Past the
     /// table that holds the last real row they are padding rows alone.
-    #[default]
     WholeRun,
     /// Cut, and stop at the table that holds the last real row, padded to the
     /// cut: [`Self::WholeRun`]'s tables without the ones of padding rows
     /// alone. A padding row of each of the four families has every bus
     /// multiplicity at zero, so a table of them adds nothing to the bus.
+    #[default]
     LastTable,
 }
 
 impl CutPadding {
-    /// `LAMBDA_VM_BLOCK_CUT_PADDING`: unset or `run`, [`Self::WholeRun`] (the
-    /// default); `last`, [`Self::LastTable`]. Read once; any other value is
+    /// `LAMBDA_VM_BLOCK_CUT_PADDING`: unset or `last`, [`Self::LastTable`] (the
+    /// default); `run`, [`Self::WholeRun`]. Read once; any other value is
     /// refused. It is the rule of the tables the table phase cuts
-    /// ([`StreamSkip::cut_padding`]): a table built whole and split by the
-    /// block afterwards (its comparison arms) keeps the whole run's padding.
+    /// ([`StreamSkip::cut_padding`]) and of the block's split of a table built
+    /// whole (its comparison arms), so every arm builds the same tables.
     pub(crate) fn from_env() -> Result<Self, Error> {
         static PADDING: std::sync::OnceLock<Result<CutPadding, String>> =
             std::sync::OnceLock::new();
@@ -4112,8 +4112,8 @@ impl CutPadding {
     /// [`Self::from_env`]'s reading of its variable.
     fn parse(value: Option<&str>) -> Result<Self, String> {
         match value.map(str::trim) {
-            None | Some("run") => Ok(Self::WholeRun),
-            Some("last") => Ok(Self::LastTable),
+            None | Some("last") => Ok(Self::LastTable),
+            Some("run") => Ok(Self::WholeRun),
             Some(v) => Err(format!("LAMBDA_VM_BLOCK_CUT_PADDING={v}: run or last")),
         }
     }

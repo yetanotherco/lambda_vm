@@ -740,8 +740,8 @@ impl<'a> FinishPlan<'a> {
             format!(
                 "BLOCK CUT PADDING: {} · tables (of them with a real row): {}",
                 match skip.cut_padding {
-                    CutPadding::WholeRun => "the whole run padded, then cut (the default)",
-                    CutPadding::LastTable => "cut, the last table padded",
+                    CutPadding::WholeRun => "the whole run padded, then cut",
+                    CutPadding::LastTable => "cut, the last table padded (the default)",
                 },
                 cut.join(" · "),
             )

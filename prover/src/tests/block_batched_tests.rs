@@ -455,7 +455,11 @@ fn fixed_traces(
         stark::storage_mode::StorageMode::Ram,
     )
     .expect("the traces build");
-    block_whir::split_keccak_rnd(&mut traces, keccak_rnd_log2);
+    block_whir::split_keccak_rnd(
+        &mut traces,
+        keccak_rnd_log2,
+        crate::tables::trace_builder::CutPadding::default(),
+    );
     (program, elf, traces)
 }
 

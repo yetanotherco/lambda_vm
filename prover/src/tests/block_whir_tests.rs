@@ -7,6 +7,7 @@ use crate::block_whir::{
     verify_block_whir,
 };
 use crate::tables::MaxRowsConfig;
+use crate::tables::trace_builder::CutPadding;
 use crate::test_utils::{E, asm_elf_bytes};
 use crate::zf_format::ZfFormat;
 use math::field::element::FieldElement;
@@ -210,7 +211,7 @@ fn the_kept_tree_depth_moves_no_byte_of_the_proof() {
         stark::storage_mode::StorageMode::Ram,
     )
     .expect("the traces build");
-    block_whir::split_keccak_rnd(&mut traces, 16);
+    block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default());
     let mut proved = |drop_levels: usize| {
         let mut o = options(MaxRowsConfig::small(), 16);
         o.drop_levels = multilinear::whir_commit::TreeDrop::uniform(drop_levels);
@@ -270,7 +271,7 @@ fn narrow_storage_moves_no_byte_of_the_proof() {
         stark::storage_mode::StorageMode::Ram,
     )
     .expect("the traces build");
-    block_whir::split_keccak_rnd(&mut traces, 16);
+    block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default());
     for argue in [ArgueFormat::PerTable, ArgueFormat::BATCHED] {
         let format = BlockFormat {
             argue,
@@ -346,7 +347,7 @@ fn uploading_ahead_moves_no_byte_of_the_proof() {
         stark::storage_mode::StorageMode::Ram,
     )
     .expect("the traces build");
-    block_whir::split_keccak_rnd(&mut traces, 16);
+    block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default());
     for argue in [ArgueFormat::PerTable, ArgueFormat::BATCHED] {
         let format = BlockFormat {
             argue,
@@ -1186,7 +1187,9 @@ fn a_streamed_block_with_keccak_chunks_proves_and_verifies() {
 }
 
 /// The streamed build cuts ECDAS at the run's end like the whole-run build:
-/// test_ecsm_multi's 64 ECDAS rows in 16-row tables, windows of 2^4 cycles.
+/// test_ecsm_multi's 42 ECDAS steps (64 rows padded) in 16-row tables,
+/// windows of 2^4 cycles; at the default the fourth table, padding rows alone,
+/// is not built.
 #[test]
 fn a_streamed_block_with_ecdas_chunks_proves_and_verifies() {
     let elf = asm_elf_bytes("test_ecsm_multi");
@@ -1194,7 +1197,7 @@ fn a_streamed_block_with_ecdas_chunks_proves_and_verifies() {
     let mut o = streamed(MaxRowsConfig::small(), 16, 4);
     o.ecdas_rows_log2 = 4;
     let proof = prove(&elf, &format, &o);
-    assert_eq!(proof.table_counts.ecdas, 4);
+    assert_eq!(proof.table_counts.ecdas, 3);
     assert!(verify(&proof, &elf, &format));
 }
 
@@ -2953,15 +2956,16 @@ fn chunked_table_ranges_name_the_chunked_airs() {
 }
 
 /// ECDAS cut into tables of 2^4 rows: test_ecsm_multi's 42 double/add steps
-/// (calls k = 1, 5, 0xABCDEF) over four tables, the 0xABCDEF call through
-/// three of them; their bus sums add up to the whole table's.
+/// (calls k = 1, 5, 0xABCDEF) over three tables at the default (the fourth,
+/// padding rows alone, is not built), the 0xABCDEF call through all three;
+/// their bus sums add up to the whole table's.
 #[test]
 fn ecdas_split_into_chunks_proves_and_verifies() {
     let elf = asm_elf_bytes("test_ecsm_multi");
     let mut o = options(MaxRowsConfig::default(), 16);
     o.ecdas_rows_log2 = 4;
     let proof = prove(&elf, &many_groups(), &o);
-    assert_eq!(proof.table_counts.ecdas, 4, "64 rows in 16-row tables");
+    assert_eq!(proof.table_counts.ecdas, 3, "42 rows in 16-row tables");
     assert!(verify(&proof, &elf, &many_groups()));
     // The production cut leaves the same program one table.
     let one = prove(&elf, &many_groups(), &options(MaxRowsConfig::default(), 16));
@@ -2997,7 +3001,7 @@ fn split_traces(
         stark::storage_mode::StorageMode::Ram,
     )
     .expect("the traces build");
-    block_whir::split_keccak_rnd(&mut traces, 16);
+    block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default());
     cut(&mut traces);
     (program, elf, traces)
 }
@@ -3009,7 +3013,7 @@ fn ecsm_multi_split() -> (
     crate::tables::trace_builder::Traces,
 ) {
     split_traces("test_ecsm_multi", |traces| {
-        block_whir::split_ecdas(traces, 4);
+        block_whir::split_ecdas(traces, 4, CutPadding::WholeRun);
         assert_eq!(traces.ecdases.len(), 4);
     })
 }
@@ -3149,10 +3153,11 @@ impl CallTable {
         o
     }
 
+    /// The whole run padded: the padding row keeps its own table.
     fn split(self, traces: &mut crate::tables::trace_builder::Traces, rows_log2: usize) {
         match self {
-            CallTable::Keccak => block_whir::split_keccak(traces, rows_log2),
-            CallTable::Ecsm => block_whir::split_ecsm(traces, rows_log2),
+            CallTable::Keccak => block_whir::split_keccak(traces, rows_log2, CutPadding::WholeRun),
+            CallTable::Ecsm => block_whir::split_ecsm(traces, rows_log2, CutPadding::WholeRun),
         }
     }
 
@@ -3213,16 +3218,17 @@ impl CallTable {
 
 /// ★ KECCAK and ECSM cut between calls: test_keccak_multi's three
 /// permutations and test_ecsm_multi's three scalar multiplications (one table
-/// of four rows each, the last row padding) at one row a table (four tables:
-/// one call each and the padding row) and at two rows a table (two); every
-/// proof verifies, the bus sums over the tables adding up to the one table's.
-/// The production cuts leave each guest one table.
+/// of four rows each, the last row padding) at one row a table (three tables
+/// at the default: one call each, the padding row's table not built) and at
+/// two rows a table (two); every proof verifies, the bus sums over the tables
+/// adding up to the one table's. The production cuts leave each guest one
+/// table.
 #[test]
 fn keccak_and_ecsm_split_into_chunks_prove_and_verify() {
     let format = many_groups();
     for table in CallTable::ALL {
         let (name, elf) = (table.name(), asm_elf_bytes(table.guest()));
-        for (rows_log2, tables) in [(0, 4), (1, 2)] {
+        for (rows_log2, tables) in [(0, 3), (1, 2)] {
             let o = table.cut(options(MaxRowsConfig::default(), 16), rows_log2);
             let proof = prove(&elf, &format, &o);
             assert_eq!(
@@ -3237,8 +3243,16 @@ fn keccak_and_ecsm_split_into_chunks_prove_and_verify() {
             println!("BLOCK WHIR {name} CHUNKED: {tables} tables of 2^{rows_log2} rows, accepted");
         }
         let (_, _, mut traces) = split_traces(table.guest(), |traces| {
-            block_whir::split_keccak(traces, block_whir::BLOCK_KECCAK_ROWS_LOG2);
-            block_whir::split_ecsm(traces, block_whir::BLOCK_ECSM_ROWS_LOG2);
+            block_whir::split_keccak(
+                traces,
+                block_whir::BLOCK_KECCAK_ROWS_LOG2,
+                CutPadding::default(),
+            );
+            block_whir::split_ecsm(
+                traces,
+                block_whir::BLOCK_ECSM_ROWS_LOG2,
+                CutPadding::default(),
+            );
         });
         assert_eq!(table.tables(&mut traces).len(), 1, "{name}: production cut");
     }

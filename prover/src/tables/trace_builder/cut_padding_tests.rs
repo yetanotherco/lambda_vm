@@ -122,16 +122,16 @@ fn round_tables(
     keccak_rnd_chunks_in_waves(ops, rows, 0, padding, pack, form, usize::MAX).expect("the chunks")
 }
 
-/// The knob off is the whole run padded: the type's default, a build's
+/// The default stops at the last real row: the type's default, a build's
 /// default settings, and what an unset variable reads as. The knob reads two
-/// words and refuses the rest.
+/// words (`run`, the whole run padded) and refuses the rest.
 #[test]
-fn the_default_is_the_whole_run_padded_and_the_knob_reads_two_words() {
-    assert_eq!(CutPadding::default(), CutPadding::WholeRun);
-    assert_eq!(StreamSkip::default().cut_padding, CutPadding::WholeRun);
-    assert_eq!(CutPadding::parse(None), Ok(CutPadding::WholeRun));
-    assert_eq!(CutPadding::parse(Some("run")), Ok(CutPadding::WholeRun));
+fn the_default_is_the_last_real_row_and_the_knob_reads_two_words() {
+    assert_eq!(CutPadding::default(), CutPadding::LastTable);
+    assert_eq!(StreamSkip::default().cut_padding, CutPadding::LastTable);
+    assert_eq!(CutPadding::parse(None), Ok(CutPadding::LastTable));
     assert_eq!(CutPadding::parse(Some(" last ")), Ok(CutPadding::LastTable));
+    assert_eq!(CutPadding::parse(Some("run")), Ok(CutPadding::WholeRun));
     for other in ["", "0", "1", "Last", "whole", "last,run"] {
         let refused = CutPadding::parse(Some(other)).expect_err("another word");
         assert!(

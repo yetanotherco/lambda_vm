@@ -265,7 +265,10 @@ fn the_plan_builds_the_oracles_epoch_tables() {
 }
 
 /// Windowed builds in every configuration the block uses (and their A arms):
-/// the plan's tables are the oracle's, packed or not.
+/// the plan's tables are the oracle's, packed or not. The configurations that
+/// cut pad the whole run, as the oracle does whatever the settings say (cut at
+/// the last real row:
+/// [`a_build_cut_at_the_last_real_row_is_the_oracles_without_its_padding_tables`]).
 #[test]
 fn the_plan_builds_the_oracles_windowed_tables() {
     type Configure = Box<dyn Fn(WindowedTraceBuilder<'_>) -> WindowedTraceBuilder<'_>>;
@@ -292,6 +295,7 @@ fn the_plan_builds_the_oracles_windowed_tables() {
                     .expect("rows")
                     .cuts_at_finish(2, 4, 2)
                     .expect("rows")
+                    .cut_padding(CutPadding::WholeRun)
                     .pack_finished_tables()
                     .generate_packed()
                     .drop_streamed_ops()
@@ -303,6 +307,7 @@ fn the_plan_builds_the_oracles_windowed_tables() {
             Box::new(|b| {
                 b.keccak_rnd_chunks(32)
                     .expect("rows")
+                    .cut_padding(CutPadding::WholeRun)
                     .pack_finished_tables()
                     .drop_streamed_ops()
                     .expect("before any window")
@@ -666,20 +671,38 @@ fn cut_shapes(t: &Traces) -> Vec<(&'static str, usize, Vec<usize>)> {
         .collect()
 }
 
-/// ★ The knob off builds exactly the tables it always built, on two pinned
-/// programs: the type's default and what an unset variable reads as are the
-/// whole run padded, table for table as listed here and word for word the
-/// frozen build's. test_keccak_multi is 3 permutations: 3 KECCAK rows (4
-/// padded) and 72 KECCAK_RND rows (128 padded). test_ecsm_multi is 3 scalar
-/// multiplications: 3 ECSM rows (4 padded) and 42 ECDAS steps (64 padded).
-/// Cut at the last real row the same programs keep the tables with a real row.
+/// ★ The default stops at the last real row, and the knob at `run` builds
+/// exactly the tables the block always built before, on two pinned programs:
+/// the type's default and what an unset variable reads as keep the tables
+/// with a real row; `run` is the whole run padded, table for table as listed
+/// here and word for word the frozen build's. test_keccak_multi is 3
+/// permutations: 3 KECCAK rows (4 padded) and 72 KECCAK_RND rows (128
+/// padded). test_ecsm_multi is 3 scalar multiplications: 3 ECSM rows (4
+/// padded) and 42 ECDAS steps (64 padded).
 #[test]
-fn the_knob_off_builds_the_whole_runs_tables_on_pinned_programs() {
+fn the_knob_at_run_builds_the_whole_runs_tables_on_pinned_programs() {
     let unset = CutPadding::parse(None).expect("an unset variable");
+    let run_word = CutPadding::parse(Some("run")).expect("the word run");
+    let keccak_last = [
+        ("KECCAK", 2, 2),
+        ("KECCAK_RND", 3, 32),
+        ("ECSM", 0, 0),
+        ("ECDAS", 0, 0),
+    ];
+    let ecsm_last = [
+        ("KECCAK", 0, 0),
+        ("KECCAK_RND", 0, 0),
+        ("ECSM", 2, 2),
+        ("ECDAS", 3, 16),
+    ];
     for (name, padding, want) in [
+        ("test_keccak_multi", CutPadding::default(), keccak_last),
+        ("test_keccak_multi", unset, keccak_last),
+        ("test_ecsm_multi", CutPadding::default(), ecsm_last),
+        ("test_ecsm_multi", unset, ecsm_last),
         (
             "test_keccak_multi",
-            CutPadding::default(),
+            run_word,
             [
                 ("KECCAK", 2, 2),
                 ("KECCAK_RND", 4, 32),
@@ -688,53 +711,13 @@ fn the_knob_off_builds_the_whole_runs_tables_on_pinned_programs() {
             ],
         ),
         (
-            "test_keccak_multi",
-            unset,
-            [
-                ("KECCAK", 2, 2),
-                ("KECCAK_RND", 4, 32),
-                ("ECSM", 0, 0),
-                ("ECDAS", 0, 0),
-            ],
-        ),
-        (
             "test_ecsm_multi",
-            CutPadding::default(),
+            run_word,
             [
                 ("KECCAK", 0, 0),
                 ("KECCAK_RND", 0, 0),
                 ("ECSM", 2, 2),
                 ("ECDAS", 4, 16),
-            ],
-        ),
-        (
-            "test_ecsm_multi",
-            unset,
-            [
-                ("KECCAK", 0, 0),
-                ("KECCAK_RND", 0, 0),
-                ("ECSM", 2, 2),
-                ("ECDAS", 4, 16),
-            ],
-        ),
-        (
-            "test_keccak_multi",
-            CutPadding::LastTable,
-            [
-                ("KECCAK", 2, 2),
-                ("KECCAK_RND", 3, 32),
-                ("ECSM", 0, 0),
-                ("ECDAS", 0, 0),
-            ],
-        ),
-        (
-            "test_ecsm_multi",
-            CutPadding::LastTable,
-            [
-                ("KECCAK", 0, 0),
-                ("KECCAK_RND", 0, 0),
-                ("ECSM", 2, 2),
-                ("ECDAS", 3, 16),
             ],
         ),
     ] {
@@ -747,7 +730,7 @@ fn the_knob_off_builds_the_whole_runs_tables_on_pinned_programs() {
             .collect();
         assert_eq!(cut_shapes(&built), want, "{name} {padding:?}");
         if padding == CutPadding::WholeRun {
-            same(&format!("{name} knob off"), &oracle(build), &built);
+            same(&format!("{name} knob at run"), &oracle(build), &built);
         }
     }
 }
@@ -800,15 +783,15 @@ fn the_cut_line_names_the_rule_and_the_tables_with_a_real_row() {
     assert_eq!(
         line(cut(CutPadding::WholeRun)).as_deref(),
         Some(
-            "BLOCK CUT PADDING: the whole run padded, then cut (the default) · tables (of them \
-             with a real row): KECCAK 4 (3) · KECCAK_RND 4 (3) · ECSM 0 (0) · ECDAS 0 (0)"
+            "BLOCK CUT PADDING: the whole run padded, then cut · tables (of them with a real \
+             row): KECCAK 4 (3) · KECCAK_RND 4 (3) · ECSM 0 (0) · ECDAS 0 (0)"
         )
     );
     assert_eq!(
         line(cut(CutPadding::LastTable)).as_deref(),
         Some(
-            "BLOCK CUT PADDING: cut, the last table padded · tables (of them with a real row): \
-             KECCAK 3 (3) · KECCAK_RND 3 (3) · ECSM 0 (0) · ECDAS 0 (0)"
+            "BLOCK CUT PADDING: cut, the last table padded (the default) · tables (of them \
+             with a real row): KECCAK 3 (3) · KECCAK_RND 3 (3) · ECSM 0 (0) · ECDAS 0 (0)"
         )
     );
     // A build that cuts nothing has no line.

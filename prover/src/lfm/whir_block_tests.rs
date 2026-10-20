@@ -829,7 +829,8 @@ fn compose(
 }
 
 /// ★ ECDAS cut through the block's recursion: test_ecsm_multi with ECDAS in
-/// 16-row tables (four; the 0xABCDEF call through three) proves as a block
+/// 16-row tables (three at the default, the fourth of padding rows alone not
+/// built; the 0xABCDEF call through the three) proves as a block
 /// whose tree the verifier accepts. The same statement with one ECDAS table
 /// stated over [`block_whir::BLOCK_ECDAS_MAX_VARS`] is refused before any
 /// program is derived.
@@ -839,7 +840,7 @@ fn the_whir_block_tree_verifies_a_split_ecdas() {
     super::device_permit::arm(1);
     let format = small_format();
     let (elf, proof) = small_block_at("test_ecsm_multi", &format, 4);
-    assert_eq!(proof.table_counts.ecdas, 4, "four ECDAS tables");
+    assert_eq!(proof.table_counts.ecdas, 3, "three ECDAS tables");
     let opts = ProofOptions::default_test_options();
     let wrap = aggregation_wrap_options();
     let plan = plan_of(&elf, &proof, &format, None);
@@ -870,7 +871,7 @@ fn the_whir_block_tree_verifies_a_split_ecdas() {
         "an ECDAS table stated over its cap must be refused"
     );
     println!(
-        "WHIR BLOCK TREE ECDAS SPLIT: {} groups, 4 ECDAS tables, accepted; an ECDAS over its cap \
+        "WHIR BLOCK TREE ECDAS SPLIT: {} groups, 3 ECDAS tables, accepted; an ECDAS over its cap \
          refused ({})",
         plan.num_groups(),
         refused.err().unwrap_or_default()
@@ -879,7 +880,8 @@ fn the_whir_block_tree_verifies_a_split_ecdas() {
 
 /// ★ KECCAK and ECSM cut through the block's recursion: test_keccak_multi's
 /// three permutations and test_ecsm_multi's three scalar multiplications, one
-/// row a table (four tables each: three calls and the padding row), prove as
+/// row a table (three tables each at the default: the three calls, the padding
+/// row's table not built), prove as
 /// blocks whose trees the verifier derives and accepts. Each statement with
 /// its first table stated over its cap ([`block_whir::BLOCK_KECCAK_MAX_VARS`],
 /// [`block_whir::BLOCK_ECSM_MAX_VARS`]) is refused before any program is
@@ -900,7 +902,7 @@ fn the_whir_block_tree_verifies_split_keccak_and_ecsm() {
             .into_iter()
             .find(|(n, ..)| *n == name)
             .expect("the table's range");
-        assert_eq!(range.len(), 4, "{name}: one row a table");
+        assert_eq!(range.len(), 3, "{name}: one row a table");
         let plan = plan_of(&elf, &proof, &format, None);
         let (top, _) =
             compose(&plan, &proof, &format!("{name} TREE")).expect("the honest tree proves");
@@ -927,7 +929,7 @@ fn the_whir_block_tree_verifies_split_keccak_and_ecsm() {
             "a {name} table stated over its cap must be refused"
         );
         println!(
-            "WHIR BLOCK TREE {name} SPLIT: {} groups, 4 {name} tables, accepted; a {name} over its \
+            "WHIR BLOCK TREE {name} SPLIT: {} groups, 3 {name} tables, accepted; a {name} over its \
              cap refused ({})",
             plan.num_groups(),
             refused.err().unwrap_or_default()
