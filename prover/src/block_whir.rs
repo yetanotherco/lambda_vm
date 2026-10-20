@@ -6464,5 +6464,27 @@ mod packer_tests {
             assert_eq!(queued, packed, "budget {budget}: the groups");
             assert_eq!(handed, taken, "budget {budget}: what phase A is handed");
         }
+        // With every byte to wait in and nobody taking, every group waits at
+        // once: the drops then count the main cells of all but the first, each
+        // committed column's rows, as phase A's commit counts a table's.
+        let stats = Arc::new(group_queue::Stats::default());
+        let rule = group_queue::Rule::Bytes(u64::MAX);
+        let (tx, rx) = group_queue::queue(rule, Arc::clone(&stats));
+        assert_eq!(pack(group_queue::Out::Queue(tx)), packed);
+        let counted = group_queue::arming_cells(Some(rule), &stats, 0);
+        let cells: Vec<u64> = rx
+            .map(
+                |group: Vec<stark::multilinear_table::CommittedTable<'_, _, _>>| {
+                    group
+                        .iter()
+                        .map(|table| (table.num_committed_columns() as u64) << table.num_vars())
+                        .sum()
+                },
+            )
+            .collect();
+        assert_eq!(cells.len(), packed.len());
+        assert!(counted > 0);
+        assert_eq!(counted, cells[1..].iter().sum::<u64>());
+        assert_eq!(group_queue::arming_cells(Some(rule), &stats, 0), 0);
     }
 }
