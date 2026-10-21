@@ -578,6 +578,7 @@ mod tests {
                 num_public_words: layout.total(),
                 fri_final_poly_log_degree: 1,
                 statement_tag: super::super::statement::LFM_STATEMENT_TAG,
+                kind: super::super::per_table_aggregator::ChildKind::Lfm,
                 tables: Vec::new(),
             })
             .collect();

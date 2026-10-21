@@ -5186,9 +5186,39 @@ impl BlockWhirProof {
 /// What a verifier derives from the program and a statement before any root,
 /// once the statement's checks pass. The host verifier and the recursion's tree
 /// plan both start from it, so they check one statement the same way.
+/// A frame's AIR set: the Lambda VM's, or an owned list of other AIRs (the Field
+/// VM's, behind a unit-public-input adapter) verified with the same emitters.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum FrameAirs {
+    Vm(VmAirs),
+    #[cfg(all(test, feature = "parallel"))]
+    Owned(Vec<Box<dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>>>),
+}
+
+impl FrameAirs {
+    pub(crate) fn air_refs(
+        &self,
+    ) -> Vec<&dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
+        match self {
+            FrameAirs::Vm(airs) => airs.air_refs(),
+            #[cfg(all(test, feature = "parallel"))]
+            FrameAirs::Owned(airs) => airs.iter().map(|a| a.as_ref()).collect(),
+        }
+    }
+
+    /// The Lambda VM's AIRs; `None` for an owned set.
+    pub(crate) fn vm(&self) -> Option<&VmAirs> {
+        match self {
+            FrameAirs::Vm(airs) => Some(airs),
+            #[cfg(all(test, feature = "parallel"))]
+            FrameAirs::Owned(_) => None,
+        }
+    }
+}
+
 pub(crate) struct BlockFrame {
     pub(crate) page_configs: Vec<crate::tables::page::PageConfig>,
-    pub(crate) airs: VmAirs,
+    pub(crate) airs: FrameAirs,
     /// Per table in [`VmAirs::air_refs`] order: the AIR's width and the stated
     /// height in variables.
     pub(crate) shapes: Vec<(usize, usize)>,
@@ -5299,7 +5329,7 @@ pub(crate) fn block_frame(
     }
     Ok(BlockFrame {
         page_configs,
-        airs,
+        airs: FrameAirs::Vm(airs),
         shapes,
         config,
         order,
@@ -5421,7 +5451,11 @@ pub(crate) fn verify_block_whir_traced(
     // The proof's tables are in group order, so the statements are taken in
     // that order too.
     let statements: Vec<TableStatement<'_, F, E>> = order.iter().map(|&i| statements[i]).collect();
-    let prepared_columns = prepared_tables(airs, page_configs, format)?;
+    let prepared_columns = prepared_tables(
+        airs.vm().expect("a block's frame holds the VM's AIRs"),
+        page_configs,
+        format,
+    )?;
 
     let tag = block_statement_tag(&format.zf.base);
     Ok(crate::with_block_hash!(format.zf.base, |H| {

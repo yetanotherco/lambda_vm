@@ -2534,14 +2534,18 @@ fn prepared_of(elf: &[u8], proof: &BlockWhirProof, format: &BlockFormat) -> Vec<
     let opts = ProofOptions::default_test_options();
     let frame = block_whir::block_frame(proof.statement(), elf, &opts, format).expect("frame");
     let order: Vec<usize> = proof.groups.iter().flatten().map(|&t| t as usize).collect();
-    block_whir::prepared_tables(&frame.airs, &frame.page_configs, format)
-        .expect("the prepared set")
-        .into_iter()
-        .map(|(table, _)| {
-            let position = order.iter().position(|&t| t == table).expect("in a group");
-            (table, position)
-        })
-        .collect()
+    block_whir::prepared_tables(
+        frame.airs.vm().expect("a VM frame"),
+        &frame.page_configs,
+        format,
+    )
+    .expect("the prepared set")
+    .into_iter()
+    .map(|(table, _)| {
+        let position = order.iter().position(|&t| t == table).expect("in a group");
+        (table, position)
+    })
+    .collect()
 }
 
 fn verify_skipping_prepared(proof: &BlockWhirProof, elf: &[u8], format: &BlockFormat) -> bool {

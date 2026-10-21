@@ -133,7 +133,7 @@ fn hinted_ext(b: &mut LfmBuilder, w: &HintedPublicWord) -> Ext {
 
 /// The cross-child checks on verified children's published words, and the sum of
 /// their bus shares.
-fn emit_block_bindings(
+pub(crate) fn emit_block_bindings(
     b: &mut LfmBuilder,
     legs: &[LegCells],
     layout: &BlockLayout,
@@ -212,9 +212,19 @@ fn emit_node(b: &mut LfmBuilder, inputs: &BlockNodeInputs<'_>, checks: BlockBind
     } = *inputs;
     assert!(!children.is_empty(), "a node verifies at least one child");
     for child in children {
-        assert_eq!(
-            child.num_public_words,
-            layout.total(),
+        let published_words = match &child.kind {
+            super::per_table_aggregator::ChildKind::Lfm => child.num_public_words,
+            super::per_table_aggregator::ChildKind::Hybrid { .. } => {
+                assert_eq!(
+                    child.num_public_words % 2,
+                    0,
+                    "hybrid publics are lane pairs"
+                );
+                child.num_public_words / 2
+            }
+        };
+        assert!(
+            published_words >= layout.total(),
             "every child publishes the block layout"
         );
     }
@@ -222,10 +232,57 @@ fn emit_node(b: &mut LfmBuilder, inputs: &BlockNodeInputs<'_>, checks: BlockBind
         .iter()
         .map(|child| declare_leg_arenas(b, child))
         .collect();
-    let legs: Vec<LegCells> = children
+    let raw_legs: Vec<LegCells> = children
         .iter()
         .zip(&arenas)
         .map(|(child, a)| emit_leg(b, child, a))
+        .collect();
+    // A hybrid Field VM statement publishes each memory cell as
+    // `[addr, c0, c1, c2]`, then publishes lane 3 in a companion tuple at
+    // `addr + 2^39`. Public cells are sorted by address, so all primaries
+    // precede all companions. Pair the two sorted halves: adding the same
+    // offset preserves address order, even though each companion is no longer
+    // adjacent to its primary. The BlockLayout word contains values only, so
+    // drop each tuple's address lane while reconstructing it.
+    let legs: Vec<LegCells> = children
+        .iter()
+        .zip(raw_legs)
+        .map(|(child, mut leg)| {
+            if matches!(
+                &child.kind,
+                super::per_table_aggregator::ChildKind::Hybrid { .. }
+            ) {
+                assert_eq!(leg.publics.len() % 2, 0, "hybrid publics are lane pairs");
+                let half = leg.publics.len() / 2;
+                let (primary, companions) = leg.publics.split_at(half);
+                let publics: Vec<_> = primary
+                    .iter()
+                    .zip(companions)
+                    .map(|(word, companion)| {
+                        // Public tuples are [addr, c0, c1, c2]. Block words
+                        // are [c0, c1, c2, companion.c0]. In particular, do
+                        // not bind the public addresses as values.
+                        let lanes = vec![
+                            word.lanes[1],
+                            word.lanes[2],
+                            word.lanes[3],
+                            companion.lanes[1],
+                        ];
+                        let mut halves = word.halves[2..].to_vec();
+                        halves.extend_from_slice(&companion.halves[2..4]);
+                        HintedPublicWord {
+                            index: word.index,
+                            halves,
+                            lanes,
+                        }
+                    })
+                    .take(layout.total())
+                    .collect();
+                assert_eq!(publics.len(), layout.total());
+                leg.publics = publics;
+            }
+            leg
+        })
         .collect();
     bind(b, &legs, &layout, top, checks);
 }

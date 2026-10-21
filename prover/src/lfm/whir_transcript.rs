@@ -220,7 +220,7 @@ impl WhirTranscript {
     /// One `append_bytes` of `len` RUNTIME bytes that are exactly `felts`, big-
     /// endian: the felts on the byte arm, the length and then the felts under
     /// Poseidon1.
-    fn absorb_byte_felts(&mut self, b: &mut LfmBuilder, len: usize, felts: &[Felt]) {
+    pub(crate) fn absorb_byte_felts(&mut self, b: &mut LfmBuilder, len: usize, felts: &[Felt]) {
         if let Some(arm) = &mut self.p1 {
             arm.consts.push(FE::from(len as u64));
         }

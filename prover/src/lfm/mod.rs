@@ -180,6 +180,12 @@ mod framework_probe;
 mod fri_group_tests;
 #[cfg(test)]
 mod fri_tests;
+#[cfg(all(test, feature = "parallel"))]
+mod fvm_node;
+#[cfg(all(test, feature = "parallel"))]
+mod fvm_whir_leaf;
+#[cfg(all(test, feature = "parallel"))]
+mod fvm_whir_node;
 #[cfg(test)]
 mod join_tests;
 #[cfg(test)]

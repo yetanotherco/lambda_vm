@@ -441,6 +441,17 @@ pub struct TableChallenges {
     pub iota_bits: Vec<Vec<Bit>>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The first rounds' emitted cells, for a failing verifier's memory dump.
+    static TEST_TABLE_CHALLENGE_CELLS: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_table_challenge_cells() -> Vec<(u64, u64)> {
+    TEST_TABLE_CHALLENGE_CELLS.with(|cells| std::mem::take(&mut *cells.borrow_mut()))
+}
+
 /// Fork the shared transcript for table `index` — `verifier.rs:1263-1266`.
 ///
 /// The clone emits nothing: the shared prefix's keccak rows were emitted once,
@@ -913,6 +924,8 @@ pub fn emit_table_challenges(
 
     // ---- Round 3: z, then both OOD blocks COLUMN-major, then the parts.
     let z = emit_z_ood(b, t, shape);
+    #[cfg(test)]
+    TEST_TABLE_CHALLENGE_CELLS.with(|cells| cells.borrow_mut().push((beta.addr().0, z.addr().0)));
     for (dims, block) in [
         (shape.ood_current_dims, absorbs.ood_current),
         (shape.ood_next_dims, absorbs.ood_next),
