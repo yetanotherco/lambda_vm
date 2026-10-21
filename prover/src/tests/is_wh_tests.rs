@@ -525,10 +525,12 @@ fn test_is_wh_canonical_word_rewrite_verifies() {
 #[test]
 fn test_is_wh_noncanonical_word_is_rejected() {
     for limb in [cols::VALUE_1, cols::VALUE_2] {
-        assert_only_the_bus_rejected(
-            &weigh_keccak_with(|t| resplit_word(t, Some(limb))),
-            &format!("an IS_WH row with column {limb} out of range"),
+        let what = format!("an IS_WH row with column {limb} out of range");
+        assert!(
+            !prove_keccak_with(|t| resplit_word(t, Some(limb))),
+            "{what} must not verify"
         );
+        assert_only_the_bus_rejected(&weigh_keccak_with(|t| resplit_word(t, Some(limb))), &what);
     }
 }
 
@@ -604,9 +606,14 @@ fn test_keccak_lane_on_its_own_is_wh_row_verifies() {
 /// Only that row's `IS_HALFWORD[value[0]]` sees `half_mid'` out of range.
 #[test]
 fn test_keccak_noncanonical_state_ptr_is_rejected() {
+    let what = "a KECCAK state_ptr with half_mid out of range";
+    assert!(
+        !prove_keccak_with(|t| move_lane_0_to_own_row(t, true)),
+        "{what} must not verify"
+    );
     assert_only_the_bus_rejected(
         &weigh_keccak_with(|t| move_lane_0_to_own_row(t, true)),
-        "a KECCAK state_ptr with half_mid out of range",
+        what,
     );
 }
 
