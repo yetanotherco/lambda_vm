@@ -43,8 +43,8 @@
 //! file (not Linux) `auto` has no reading and admits by the other two rules
 //! only, which is what the line reports.
 //!
-//! What `auto` reads of the host is [`READING_ENV`]'s choice. `resident`, the
-//! default, is `VmRSS` as it is. `live` takes off what a purge could return
+//! What `auto` reads of the host is [`READING_ENV`]'s choice. `live`, the
+//! default ([`READING_DEFAULT`]), takes off what a purge could return
 //! ([`live_bytes`]): after phase A frees its tables the resident set is mostly
 //! pages the allocator holds and a new program is written into, and counting
 //! them made the room shortest on the hosts with the most of it. A large
@@ -53,7 +53,14 @@
 //! phase B; the same block on a 64 GiB host, purged at that point, got 24 in.
 //! Under `live` a host is short only of what a purge cannot give back, so the
 //! budget is a ceiling there and no longer a schedule. Where nothing is
-//! purgeable the two readings are one.
+//! purgeable the two readings are one. `resident` is `VmRSS` as it is, the
+//! reading before. Against it, on one card (a 5090 held at 400 W, a 9950X) at
+//! a 108.28 GiB host target: the large block took all 26 leaf programs beside
+//! phase B where `resident` took 11 to 13, and proved 3.3 s faster (the tree
+//! 3.7 s), four runs each; the median, all 13 beside phase B either way,
+//! +0.2 s. At a 54 GiB target the large block took 19 at the statement under
+//! either reading and `live` proved 2.1 s faster, its programs waiting 24 s for
+//! room against 55 s (one run each).
 //!
 //! ⛔ [`ProgramBudget::acquire`] parks its thread on a condvar. Call it only
 //! from a plain thread, never from a rayon worker: a worker that parked there
@@ -145,13 +152,17 @@ pub fn parse_share(value: Option<&str>) -> Result<f64, String> {
 /// What `auto` reads of the host: [`READING_ENV`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reading {
-    /// Unset, empty or `resident` (the default): the process's resident
-    /// bytes ([`resident_bytes`]).
+    /// `resident`: the process's resident bytes ([`resident_bytes`]), the
+    /// reading before.
     Resident,
-    /// `live`: the resident bytes less what a purge could return
-    /// ([`live_bytes`]).
+    /// Unset, empty or `live` (the default): the resident bytes less what a
+    /// purge could return ([`live_bytes`]).
     Live,
 }
+
+/// [`READING_ENV`] unset or empty: the live reading. `resident` is the way
+/// back.
+pub const READING_DEFAULT: Reading = Reading::Live;
 
 /// [`Reading`]'s knob.
 pub const READING_ENV: &str = "LAMBDA_VM_TREE_PROGRAM_BUDGET_READING";
@@ -161,11 +172,12 @@ pub fn reading_from_env() -> Result<Reading, String> {
     parse_reading(std::env::var(READING_ENV).ok().as_deref())
 }
 
-/// A value of [`READING_ENV`]: unset or empty is [`Reading::Resident`];
+/// A value of [`READING_ENV`]: unset or empty is [`READING_DEFAULT`];
 /// nonsense is an error.
 pub fn parse_reading(value: Option<&str>) -> Result<Reading, String> {
     match value.map(str::trim) {
-        None | Some("" | "resident") => Ok(Reading::Resident),
+        None | Some("") => Ok(READING_DEFAULT),
+        Some("resident") => Ok(Reading::Resident),
         Some("live") => Ok(Reading::Live),
         Some(v) => Err(format!("{READING_ENV} must be resident or live, got `{v}`")),
     }
@@ -759,10 +771,12 @@ mod tests {
         );
     }
 
+    /// Unset or empty, the knob reads live; `resident` is the reading before.
     #[test]
     fn the_reading_knob_reads_resident_or_live_and_refuses_nonsense() {
-        assert_eq!(parse_reading(None), Ok(Reading::Resident));
-        assert_eq!(parse_reading(Some(" ")), Ok(Reading::Resident));
+        assert_eq!(READING_DEFAULT, Reading::Live);
+        assert_eq!(parse_reading(None), Ok(Reading::Live));
+        assert_eq!(parse_reading(Some(" ")), Ok(Reading::Live));
         assert_eq!(parse_reading(Some("resident")), Ok(Reading::Resident));
         assert_eq!(parse_reading(Some(" live ")), Ok(Reading::Live));
         for bad in ["rss", "1", "LIVE", "purgeable"] {
@@ -831,8 +845,9 @@ mod tests {
         assert_eq!(admitted_at_once(4050 * MIB, live_of(rss, Some(&stats))), 1);
     }
 
-    /// The line names the reading; under the default it reads as it always
-    /// did.
+    /// The line names the reading: `VmRSS` for the resident one (and for a
+    /// test's own reading), as it always read; the default's line says what
+    /// it takes off.
     #[test]
     fn the_budget_line_names_its_reading() {
         let room = Room::Host { line: 3 * GIB };
@@ -851,6 +866,12 @@ mod tests {
             live.starts_with("auto: VmRSS less what a purge could return (")
                 || live.starts_with("auto: no VmRSS reading"),
             "{live}"
+        );
+        let default = ProgramBudget::new(room, parse_reading(None).expect("unset")).describe();
+        assert!(
+            default.starts_with("auto: VmRSS less what a purge could return (")
+                || default.starts_with("auto: no VmRSS reading"),
+            "{default}"
         );
     }
 

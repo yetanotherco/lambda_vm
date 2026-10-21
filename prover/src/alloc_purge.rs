@@ -36,11 +36,13 @@
 //! as before, a host with room at neither.
 //!
 //! Phase B's time does not follow the purge. It follows the leaf programs the
-//! tree proves beside the base, and a block that skips the purges keeps fewer
-//! of them there, because the tree's budget counts the pages the allocator
-//! still holds. At p90 on that host 13 of 26 stay beside the base:
-//! phase B is 3.4 s shorter and the tree 2.7 s longer. With all 26 beside the
-//! base and no purge, phase B is as long as it is with the purges.
+//! tree proves beside the base. Under the tree budget's resident reading a
+//! block that skips the purges keeps fewer of them there, because that reading
+//! counts the pages the allocator still holds: at p90 on that host 13 of 26
+//! stay beside the base, phase B is 3.4 s shorter and the tree 2.7 s longer.
+//! With all 26 beside the base and no purge, phase B is as long as it is with
+//! the purges. The budget's default reading takes those pages off
+//! ([`crate::lfm::program_budget::READING_DEFAULT`]).
 
 /// The allocator's statistics, in bytes (jemalloc's `stats.*`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -182,8 +184,9 @@ pub fn parse_room(value: Option<&str>) -> Result<RoomSetting, String> {
 /// The p90 block, VmRSS at phase A's end and at the base's end (ZEN5 096): on a
 /// 118 GiB host 66.8 and 68.2 GiB against a line of 92.0, room at both; on a
 /// 64 GiB host 36.1 and 45.6 GiB (the median 33.1 and 33.2) against 45.9, room
-/// at neither. Without the purge at phase A's end that host admits 4 leaf
-/// programs beside the base where it admitted 24, and proves 2.2 s slower.
+/// at neither. Without the purge at phase A's end that host admitted 4 leaf
+/// programs beside the base where it admitted 24, and proved 2.2 s slower
+/// (the tree budget's resident reading, the default then).
 pub(crate) fn has_room(no_disk: Option<NoDisk>, resident: Option<u64>) -> bool {
     match (no_disk, resident) {
         (Some(no_disk), Some(resident)) => resident.saturating_add(no_disk.headroom) < no_disk.line,
