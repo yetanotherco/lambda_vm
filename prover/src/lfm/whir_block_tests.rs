@@ -2549,11 +2549,11 @@ fn the_whir_block_tree_on_a_real_block() {
         multilinear::gpu::lean_open_calls(),
         multilinear::gpu::open_calls()
     );
-    // How those rounds were computed (`LAMBDA_VM_WHIR_LEAN_TILES`): over every
-    // stack position in every round (off, the default), or from one pass over
-    // the message; under `check`, the rounds and the bound tables both ways,
-    // and how many differed. Then the most one opening held on the card, by
-    // form.
+    // How those rounds were computed (`LAMBDA_VM_WHIR_LEAN_TILES`): from one
+    // pass over the message (the default, `wide`), or over every stack
+    // position in every round (`0`); under `check`, the rounds and the bound
+    // tables both ways, and how many differed. Then the most one opening held
+    // on the card, by form.
     {
         let (compared, differing) = multilinear::gpu::lean_tile_checks();
         let (tables, positions) = multilinear::gpu::lean_tile_table_checks();

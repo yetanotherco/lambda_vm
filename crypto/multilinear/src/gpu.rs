@@ -4726,11 +4726,13 @@ pub fn force_lean_rounds(rounds: Option<usize>) {
 }
 
 /// How a lean opening's rounds are computed (`LAMBDA_VM_WHIR_LEAN_TILES`):
-/// unset or `0`, over every stack position in every round, as they always
-/// have been; `1`, from one pass over the message and tables a tile's size
-/// smaller ([`crate::lean_tiles`]); `wide`, the same with the pass one block a
-/// tile; `check`, both on every round, compared ([`lean_tile_checks`]). The
-/// same values every way; a stack the tile form does not take runs as today.
+/// unset, from one pass over the message and tables a tile's size smaller
+/// ([`crate::lean_tiles`]), the pass one block a tile
+/// ([`math_cuda::whir_open::LEAN_TILES_DEFAULT`]); `1`, the same with the pass
+/// one thread a tile; `0`, over every stack position in every round, as they
+/// were before; `check`, both on every round, compared ([`lean_tile_checks`]).
+/// The same values every way; a stack the tile form does not take runs over
+/// every position.
 #[cfg(feature = "cuda")]
 pub use math_cuda::whir_open::LeanTiles;
 
@@ -5287,9 +5289,9 @@ fn materialize_state(
 /// `eq` tables in halves (computed here, a few kilobytes each), and the
 /// message where it already is. `None` when the stack is not one it can read.
 ///
-/// Under `LAMBDA_VM_WHIR_LEAN_TILES` its `rounds` rounds run in tile form
-/// when the stack takes it ([`crate::lean_tiles::plan`]); otherwise, and by
-/// default, in share form.
+/// Its `rounds` rounds run in tile form when the stack takes it
+/// ([`crate::lean_tiles::plan`]), which is the default; in share form under
+/// `LAMBDA_VM_WHIR_LEAN_TILES=0` and for a stack the tile form does not take.
 #[cfg(feature = "cuda")]
 fn lean_opening<F>(
     shares: &[(usize, Vec<u64>, [u64; 3])],

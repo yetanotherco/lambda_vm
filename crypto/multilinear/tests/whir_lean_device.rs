@@ -19,12 +19,14 @@
 //! with itself. One `#[test]`: the arms switch process-wide overrides, and
 //! parallel tests would race them.
 //!
-//! Three more arms run the lean rounds in TILE form
-//! (`LAMBDA_VM_WHIR_LEAN_TILES=1`, `=wide`, `=check`) on a second stack, one
-//! the form takes: the same bytes again, every opening counted in tile form,
-//! and under `check` every round and every opening's bound tables compared
-//! with the share form on the card with none different. On the first stack — a column of eight rows, which the
-//! form declines — the same arms prove today's bytes in share form.
+//! The tile form is the lean rounds' default, so the defaults arm runs it; the
+//! arms before it force the share form. Three more arms run the lean rounds in
+//! TILE form (`LAMBDA_VM_WHIR_LEAN_TILES=1`, `=wide`, `=check`) on a second
+//! stack, one the form takes: the same bytes again, every opening counted in
+//! tile form, and under `check` every round and every opening's bound tables
+//! compared with the share form on the card, none different. On the first
+//! stack — a column of eight rows, which the form declines — the same arms
+//! prove today's bytes in share form.
 #![cfg(feature = "cuda")]
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
@@ -138,12 +140,13 @@ enum Arm {
     /// Three lean rounds and the fused fold, every successor folded
     /// (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0`).
     Folded,
-    /// Nothing forced: the defaults, three lean rounds, the fused fold and
-    /// each chain's first successor encoded from its bound message.
+    /// Nothing forced: the defaults, three lean rounds in tile form (a block a
+    /// tile), the fused fold and each chain's first successor encoded from its
+    /// bound message.
     Defaults,
-    /// The defaults with the lean rounds in tile form
-    /// (`LAMBDA_VM_WHIR_LEAN_TILES`): on, wide, or checked against the share
-    /// form on every round.
+    /// The defaults with the lean rounds' form forced
+    /// (`LAMBDA_VM_WHIR_LEAN_TILES`): tile form a thread or a block a tile, or
+    /// checked against the share form on every round.
     Tiles(gpu::LeanTiles),
 }
 
@@ -162,10 +165,14 @@ fn prove_arm<H: WhirHash>(
         Arm::Defaults | Arm::Tiles(_) => None,
         _ => Some(false),
     });
-    gpu::force_lean_tiles(Some(match arm {
-        Arm::Tiles(tiles) => tiles,
-        _ => gpu::LeanTiles::Off,
-    }));
+    // The arms before the tile form force the share form; the defaults force
+    // nothing.
+    gpu::force_lean_tiles(match arm {
+        Arm::Tiles(tiles) => Some(tiles),
+        Arm::Defaults => None,
+        _ => Some(gpu::LeanTiles::Off),
+    });
+    let default_tiles = std::env::var_os("LAMBDA_VM_WHIR_LEAN_TILES").is_none();
     match arm {
         Arm::Materialised => {
             gpu::force_lean_rounds(Some(0));
@@ -191,6 +198,13 @@ fn prove_arm<H: WhirHash>(
                 assert!(
                     gpu::encode_successor_in_effect(),
                     "the default encodes the first successor"
+                );
+            }
+            if matches!(arm, Arm::Defaults) && default_tiles {
+                assert_eq!(
+                    gpu::lean_tiles_in_effect(),
+                    "wide",
+                    "the default runs the lean rounds in tile form, a block a tile"
                 );
             }
         }
@@ -243,9 +257,9 @@ fn prove_arm<H: WhirHash>(
         "{} {arm:?}: successors encoded",
         H::NAME
     );
-    // The tile form in its arms on a stack that takes it, every chain; never
-    // elsewhere. Under `check`, each chain's lean rounds compared with the
-    // share form, none different.
+    // The tile form in its arms and at the defaults on a stack that takes it,
+    // every chain; never elsewhere. Under `check`, each chain's lean rounds
+    // compared with the share form, none different.
     let tile_opens = gpu::lean_tile_opens() - tiles_before;
     let (checked, mismatched) = gpu::lean_tile_checks();
     let checked = (checked - checks_before.0, mismatched - checks_before.1);
@@ -277,6 +291,18 @@ fn prove_arm<H: WhirHash>(
                 H::NAME
             );
         }
+        Arm::Defaults if tiled && default_tiles => {
+            assert_eq!(
+                tile_opens,
+                opens,
+                "{} {arm:?}: every opening in tile form by default",
+                H::NAME
+            );
+            assert_eq!(checked, (0, 0), "{} {arm:?}: rounds compared", H::NAME);
+            assert_eq!(tables, (0, 0), "{} {arm:?}: tables compared", H::NAME);
+        }
+        // The environment chose the defaults' form: nothing to hold here.
+        Arm::Defaults if !default_tiles => {}
         _ => {
             assert_eq!(
                 tile_opens,

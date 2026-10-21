@@ -406,22 +406,37 @@ impl TileSpec {
 /// What `LAMBDA_VM_WHIR_LEAN_TILES` asks of a stacked opening's lean rounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeanTiles {
-    /// The share form: `whir_lean_round` over every position, every round.
+    /// The share form: `whir_lean_round` over every position, every round
+    /// (`0`).
     Off,
-    /// The tile form ([`TileSpec`]), one thread a tile.
+    /// The tile form ([`TileSpec`]), one thread a tile (`1`).
     On,
-    /// The tile form with the pass over the message one block a tile.
+    /// The tile form with the pass over the message one block a tile
+    /// (`wide`, and [`LEAN_TILES_DEFAULT`]).
     Wide,
     /// The tile form, every round also run in share form and compared; the
     /// share form's values are the ones sent.
     Check,
 }
 
-/// `LAMBDA_VM_WHIR_LEAN_TILES`'s value read: `1` the tile form, `wide` the
-/// same with the wide pass, `check` the tile form compared with the share form
-/// on every round; unset, `0` or anything else is the share form.
+/// A stacked opening's lean rounds when `LAMBDA_VM_WHIR_LEAN_TILES` is unset:
+/// the tile form, its pass over the message one block a tile. The same values
+/// as the share form. Against the share form on one card (a 5090 held at
+/// 400 W, a 9950X), two runs of each: the whole median block −5.6 s and the
+/// whole large block −13.0 s, the openings' sumcheck a quarter of its
+/// seconds, an opening in tile form 0.23 GiB lighter on the card. At 2^27 a
+/// block a tile was the faster pass where a column of tiles meets one class
+/// (most chains), a thread a tile where it meets two or more. `=0` is the way
+/// back.
+pub const LEAN_TILES_DEFAULT: LeanTiles = LeanTiles::Wide;
+
+/// `LAMBDA_VM_WHIR_LEAN_TILES`'s value read: unset, [`LEAN_TILES_DEFAULT`];
+/// `1` the tile form a thread a tile, `wide` a block a tile, `check` the tile
+/// form compared with the share form on every round; `0` or anything else is
+/// the share form.
 pub fn lean_tiles_setting(value: Option<&str>) -> LeanTiles {
     match value.map(str::trim) {
+        None => LEAN_TILES_DEFAULT,
         Some("1") => LeanTiles::On,
         Some("wide") => LeanTiles::Wide,
         Some("check") => LeanTiles::Check,
@@ -1532,11 +1547,12 @@ mod tests {
         assert!(lean.is_none(), "{} shares must materialise", shares.len());
     }
 
-    /// `LAMBDA_VM_WHIR_LEAN_TILES`: the share form unless it says `1`, `wide`
-    /// or `check`.
+    /// `LAMBDA_VM_WHIR_LEAN_TILES`: unset, the tile form a block a tile; the
+    /// share form at `0` or any word but `1`, `wide` and `check`.
     #[test]
-    fn the_lean_rounds_run_in_share_form_unless_the_knob_asks_for_tiles() {
-        assert_eq!(lean_tiles_setting(None), LeanTiles::Off);
+    fn the_lean_rounds_run_in_tile_form_unless_the_knob_says_otherwise() {
+        assert_eq!(LEAN_TILES_DEFAULT, LeanTiles::Wide);
+        assert_eq!(lean_tiles_setting(None), LEAN_TILES_DEFAULT);
         assert_eq!(lean_tiles_setting(Some("0")), LeanTiles::Off);
         assert_eq!(lean_tiles_setting(Some("")), LeanTiles::Off);
         assert_eq!(lean_tiles_setting(Some("yes")), LeanTiles::Off);
