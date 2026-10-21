@@ -56,10 +56,10 @@ use super::transcript_replay::{ByteString, TranscriptReplay};
 
 /// A sub-proof's AIR as the shape derivations read it: the block's VM AIRs and
 /// the LFM chips alike.
-pub type DynVmAir<'a> = dyn stark::traits::AIR<
+pub type DynVmAir<'a, PI = ()> = dyn stark::traits::AIR<
         Field = crate::tables::types::GoldilocksField,
         FieldExtension = GoldilocksExtension,
-        PublicInputs = (),
+        PublicInputs = PI,
     > + 'a;
 
 /// The grinding prefix, `crypto/stark/src/grinding.rs`'s `PREFIX`.
@@ -312,12 +312,16 @@ impl TableChallengeShape {
     /// `ood_blocks_well_formed`, the `L` presence to `has_trace_interaction`.
     ///
     /// `trace_length` must be a power of two; the caller bounds it.
-    pub fn derive(
-        air: &DynVmAir<'_>,
+    pub fn derive<PI>(
+        air: &DynVmAir<'_, PI>,
         index: usize,
         num_tables: usize,
         trace_length: usize,
-    ) -> Self {
+    ) -> Self
+    where
+        PI: rkyv::Archive + Clone,
+        <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, stark::proof::view::PiDeserializer>,
+    {
         use stark::verifier::IsStarkVerifier;
         debug_assert!(trace_length.is_power_of_two(), "a power-of-two trace");
         let opts = air.options();
@@ -326,7 +330,7 @@ impl TableChallengeShape {
         let layout = stark::verifier::Verifier::<
             crate::tables::types::GoldilocksField,
             GoldilocksExtension,
-            (),
+            PI,
         >::ood_layout(air);
         Self {
             index,

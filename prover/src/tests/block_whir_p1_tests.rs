@@ -738,7 +738,7 @@ mod scan {
                 anchors: &[
                     "fn build_table_legs_with(",
                     "fn harvest_child_under<",
-                    "fn try_child_arena_words(",
+                    "fn try_child_arena_words<",
                 ],
                 sites: &[],
                 // The child's arenas are laid at its family's digest width,

@@ -100,6 +100,34 @@ pub(crate) fn host_table_forked_under<Fam: crate::hash_pin::ProofFamily>(
     fork: &mut Fam::Transcript,
     lookup_challenges: &[FEE],
 ) -> Result<HostTable, String> {
+    host_table_forked_with_inputs::<Fam, ()>(
+        air,
+        view,
+        &(),
+        index,
+        num_tables,
+        fork,
+        lookup_challenges,
+    )
+}
+
+/// [`host_table_forked_under`] for any proof public-input type. The inputs are
+/// passed through to the production verifier replay, so FVM boundary claims
+/// participate in the same proof-view path as unit-input LFM proofs.
+pub(crate) fn host_table_forked_with_inputs<Fam, PI>(
+    air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = PI>,
+    view: StarkProofView<'_, Gl, Ext3, PI>,
+    public_inputs: &PI,
+    index: usize,
+    num_tables: usize,
+    fork: &mut Fam::Transcript,
+    lookup_challenges: &[FEE],
+) -> Result<HostTable, String>
+where
+    Fam: crate::hash_pin::ProofFamily,
+    PI: rkyv::Archive + Clone,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, stark::proof::view::PiDeserializer>,
+{
     use stark::domain::new_verifier_domain;
     use stark::verifier::IsStarkVerifier;
     type Verifier<F, E, PI, Fam> =
@@ -107,11 +135,11 @@ pub(crate) fn host_table_forked_under<Fam: crate::hash_pin::ProofFamily>(
 
     let trace_length = view.trace_length();
     let domain = new_verifier_domain(air, trace_length);
-    let layout = Verifier::<Gl, Ext3, (), Fam>::ood_layout(air);
-    let challenges = Verifier::<Gl, Ext3, (), Fam>::replay_rounds_after_round_1(
+    let layout = Verifier::<Gl, Ext3, PI, Fam>::ood_layout(air);
+    let challenges = Verifier::<Gl, Ext3, PI, Fam>::replay_rounds_after_round_1(
         air,
         view,
-        &(),
+        public_inputs,
         &domain,
         fork,
         lookup_challenges.to_vec(),
@@ -272,6 +300,24 @@ pub(crate) fn build_table_legs_with(
     iotas: Option<&[usize]>,
     wrap: super::edsl::WrapHash,
 ) -> Result<TableLegs, String> {
+    build_table_legs_with_inputs(air, view, &(), rap_challenges, trees, iotas, wrap)
+}
+
+/// [`build_table_legs_with`] for any proof public-input type. Table legs are
+/// shaped by the AIR and proof; PI affects only the Stark view's type.
+pub(crate) fn build_table_legs_with_inputs<PI>(
+    air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = PI>,
+    view: StarkProofView<'_, Gl, Ext3, PI>,
+    public_inputs: &PI,
+    rap_challenges: &[FEE],
+    trees: stark::config::TreeGeometry,
+    iotas: Option<&[usize]>,
+    wrap: super::edsl::WrapHash,
+) -> Result<TableLegs, String>
+where
+    PI: rkyv::Archive + Clone,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, stark::proof::view::PiDeserializer>,
+{
     // The shapes, from the AIR and the trace length alone; the proof's blocks
     // are then checked against them, never read into them.
     let trace_length = view.trace_length();
@@ -399,7 +445,7 @@ pub(crate) fn build_table_legs_with(
     .map_err(|_| "a power-of-two trace length has a root of unity")?;
     let production_boundary = air
         .boundary_constraints(
-            &(),
+            public_inputs,
             rap_challenges,
             bus_public_inputs.as_ref(),
             trace_length,
@@ -623,7 +669,7 @@ impl TableLegs {
 /// StarkProofView)`, so the same two functions read a wrap proof, a node proof
 /// and a VM epoch proof alike. That is what makes one node emitter serve every
 /// level.
-pub(crate) struct HarvestedChild {
+pub(crate) struct HarvestedChild<PI = ()> {
     /// The child's proof family's wrap hash: the node reading the child runs
     /// it, and every digest of the child's arenas is laid at its width.
     pub(crate) wrap: super::edsl::WrapHash,
@@ -641,6 +687,8 @@ pub(crate) struct HarvestedChild {
     /// `NodePublishSet::Diagnostic`.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) z_alpha: (FEE, FEE),
+    /// The proof's public-input type; arena layout is shared across PI types.
+    pub(crate) _public_inputs: std::marker::PhantomData<PI>,
 }
 
 /// [`harvest_child_under`] at the legacy pin, after verifying the proof against
@@ -772,15 +820,29 @@ pub(crate) fn harvest_child_under<Fam: crate::hash_pin::ProofFamily>(
         tables,
         legs,
         z_alpha: (lookup[0], lookup[1]),
+        _public_inputs: std::marker::PhantomData,
     })
 }
 
 /// The child's arenas, in `declare_leg_arenas`' declaration order.
-pub(crate) fn try_child_arena_words(c: &HarvestedChild) -> Result<Vec<Vec<LfmWord>>, String> {
+pub(crate) fn try_child_arena_words<PI>(
+    c: &HarvestedChild<PI>,
+) -> Result<Vec<Vec<LfmWord>>, String> {
+    try_child_arenas_for::<PI>(c.wrap, &c.public_words, &c.tables, &c.legs)
+}
+
+/// Serialize a child's proof arenas for any Stark public-input type. Public
+/// words are the child's published statement cells; table and leg arenas are
+/// read from the same generic proof-view harvest above.
+pub(crate) fn try_child_arenas_for<PI>(
+    wrap: super::edsl::WrapHash,
+    public_words: &[(u32, LfmWord)],
+    tables: &[HostTable],
+    legs: &[TableLegs],
+) -> Result<Vec<Vec<LfmWord>>, String> {
     let mut arenas: Vec<Vec<LfmWord>> = Vec::new();
-    // The published words, eight halves each — the statement's own layout.
-    let mut publics = Vec::with_capacity(8 * c.public_words.len());
-    for (_, word) in &c.public_words {
+    let mut publics = Vec::with_capacity(8 * public_words.len());
+    for (_, word) in public_words {
         for lane in word {
             let v: u64 = lane.canonical();
             publics.push(base_word(FE::from(v & 0xFFFF_FFFF)));
@@ -789,29 +851,26 @@ pub(crate) fn try_child_arena_words(c: &HarvestedChild) -> Result<Vec<Vec<LfmWor
     }
     arenas.push(publics);
     arenas.push(super::proof_arena::commitments_to_arena_for(
-        &c.tables.iter().map(|h| h.main_root).collect::<Vec<_>>(),
-        c.wrap,
+        &tables.iter().map(|h| h.main_root).collect::<Vec<_>>(),
+        wrap,
     ));
-    for (h, leg) in c.tables.iter().zip(&c.legs) {
+    for (h, leg) in tables.iter().zip(legs) {
         if let Some(root) = &h.aux_root {
-            arenas.push(super::proof_arena::commitments_to_arena_for(
-                &[*root],
-                c.wrap,
-            ));
+            arenas.push(super::proof_arena::commitments_to_arena_for(&[*root], wrap));
         }
         if let Some(l) = &h.contribution {
             arenas.push(vec![ext_word(l)]);
         }
         arenas.push(super::proof_arena::commitments_to_arena_for(
             &[h.composition_root],
-            c.wrap,
+            wrap,
         ));
         arenas.push(h.ood_current.iter().map(ext_word).collect());
         arenas.push(h.ood_next.iter().map(ext_word).collect());
         arenas.push(h.parts.iter().map(ext_word).collect());
         arenas.push(super::proof_arena::commitments_to_arena_for(
             &h.fri_roots,
-            c.wrap,
+            wrap,
         ));
         arenas.push(h.fri_coeffs.iter().map(ext_word).collect());
         if let Some(nonce) = h.nonce {
@@ -821,5 +880,8 @@ pub(crate) fn try_child_arena_words(c: &HarvestedChild) -> Result<Vec<Vec<LfmWor
         arenas.push(leg.try_fri_arena()?);
         arenas.extend(leg.try_caps_arena()?);
     }
+    // Keep PI in this API's type so the compiler checks the serializer is
+    // reachable from the same typed proof-view path as the harvest.
+    let _ = core::marker::PhantomData::<PI>;
     Ok(arenas)
 }

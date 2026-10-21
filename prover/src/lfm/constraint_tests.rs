@@ -1058,6 +1058,11 @@ pub(super) fn open_sub_proof(
         quotient: QuotientShape {
             log2_trace_length: trace_length.trailing_zeros(),
             num_composition_parts: claimed_parts.len(),
+            transition_end_exemptions: artifact
+                .constraints_meta()
+                .iter()
+                .map(|m| m.end_exemptions)
+                .collect(),
             boundary,
         },
         artifact,
@@ -1427,6 +1432,11 @@ fn quotient_rows(artifact: &ConstraintArtifact, log2_trace_length: u32) -> usize
     let quotient = QuotientShape {
         log2_trace_length,
         num_composition_parts: num_parts,
+        transition_end_exemptions: artifact
+            .constraints_meta()
+            .iter()
+            .map(|m| m.end_exemptions)
+            .collect(),
         // Every table with bus interactions carries the framework's single
         // acc[0] = 0 constraint on the last aux column, and no production table
         // declares any other boundary constraint.
