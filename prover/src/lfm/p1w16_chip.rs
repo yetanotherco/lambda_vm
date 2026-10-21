@@ -279,33 +279,33 @@ pub fn fill_row(layout: Layout, mds: Mds, mode: Mode, input: [FE; STATE_FELTS]) 
 /// An affine form over the row: `Σ col[c]·main(c) + m_coeff·m`, with `m` the
 /// mode sum. Dense over the columns; the chip is under a thousand wide.
 #[derive(Clone)]
-struct Affine {
-    col: Vec<FE>,
-    m: FE,
+pub(crate) struct Affine {
+    pub(crate) col: Vec<FE>,
+    pub(crate) m: FE,
 }
 
 impl Affine {
-    fn zero(width: usize) -> Self {
+    pub(crate) fn zero(width: usize) -> Self {
         Self {
             col: vec![FE::zero(); width],
             m: FE::zero(),
         }
     }
 
-    fn column(width: usize, c: usize) -> Self {
+    pub(crate) fn column(width: usize, c: usize) -> Self {
         let mut a = Self::zero(width);
         a.col[c] = FE::one();
         a
     }
 
-    fn add_scaled(&mut self, other: &Affine, k: FE) {
+    pub(crate) fn add_scaled(&mut self, other: &Affine, k: FE) {
         for (x, y) in self.col.iter_mut().zip(&other.col) {
             *x += k * y;
         }
         self.m += k * other.m;
     }
 
-    fn expr<B: ConstraintBuilder<F, E>>(&self, b: &B, m: &B::Expr) -> B::Expr {
+    pub(crate) fn expr<B: ConstraintBuilder<F, E>>(&self, b: &B, m: &B::Expr) -> B::Expr {
         let mut acc = b.const_base(canon(&self.m)) * m.clone();
         for (c, k) in self.col.iter().enumerate() {
             if *k != FE::zero() {
@@ -321,7 +321,7 @@ fn canon(x: &FE) -> u64 {
 }
 
 /// The MDS over affine forms: `out_o = Σ_i M[o][i]·f_i`.
-fn mds_affine(mds: Mds, f: &[Affine]) -> Vec<Affine> {
+pub(crate) fn mds_affine(mds: Mds, f: &[Affine]) -> Vec<Affine> {
     let width = f[0].col.len();
     (0..STATE_FELTS)
         .map(|o| {

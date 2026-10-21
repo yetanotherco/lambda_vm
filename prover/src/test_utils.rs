@@ -1054,6 +1054,34 @@ pub fn create_ecsm_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcsmConstr
 }
 
 /// Create ECDAS AIR (per-step double/add of the scalar-multiplication sequence).
+/// Create P1W16 AIR (one width-16 Poseidon1 permutation per row).
+pub fn create_p1w16_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::p1w16::P1w16Constraints> {
+    build_air(
+        crate::tables::p1w16::cols::NUM_COLUMNS,
+        crate::tables::p1w16::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::p1w16::P1w16Constraints,
+        "P1W16",
+    )
+}
+
+/// Create FP3MAC AIR (one cubic-extension multiply-add per row).
+pub fn create_fp3mac_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::fp3mac::Fp3MacConstraints> {
+    build_air(
+        crate::tables::fp3mac::cols::NUM_COLUMNS,
+        crate::tables::fp3mac::bus_interactions(),
+        proof_options,
+        1,
+        crate::tables::fp3mac::Fp3MacConstraints,
+        "FP3MAC",
+    )
+}
+
 pub fn create_ecdas_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcdasConstraints> {
     build_air(
         ecdas_cols::NUM_COLUMNS,
@@ -1141,6 +1169,8 @@ pub fn production_airs(proof_options: &ProofOptions) -> Vec<LabeledAir> {
         ("KECCAK_RC", Box::new(create_keccak_rc_air(proof_options))),
         ("ECSM", Box::new(create_ecsm_air(proof_options))),
         ("ECDAS", Box::new(create_ecdas_air(proof_options))),
+        ("P1W16", Box::new(create_p1w16_air(proof_options))),
+        ("FP3MAC", Box::new(create_fp3mac_air(proof_options))),
         ("HINT", Box::new(create_hint_air(proof_options))),
         // ---- continuation-only tables (no monolithic proof contains these) ----
         (
@@ -1179,7 +1209,7 @@ pub fn create_global_memory_air(
     crate::continuation::global_memory_air(proof_options, &config, Some([0u8; 32]))
 }
 
-/// The number of production table AIRs [`production_airs`] yields: 26 monolithic
+/// The number of production table AIRs [`production_airs`] yields: 28 monolithic
 /// plus 3 continuation-only.
 ///
 /// Every suite that iterates the list asserts against this. That assert is the
@@ -1188,4 +1218,4 @@ pub fn create_global_memory_air(
 /// per-table suite at once and silently — which is exactly what happened to the
 /// three continuation tables. Bump it deliberately when a table is genuinely
 /// added or removed.
-pub const NUM_PRODUCTION_AIRS: usize = 29;
+pub const NUM_PRODUCTION_AIRS: usize = 31;

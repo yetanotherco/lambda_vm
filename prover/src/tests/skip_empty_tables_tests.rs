@@ -101,6 +101,8 @@ fn every_table_participates_in_the_bus() {
         hint: 1,
         commit: 1,
         blake3: 1,
+        p1w16: 0,
+        fp3mac: 0,
     };
     let airs = VmAirs::new(
         &elf,
@@ -160,6 +162,8 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
         hint,
         commit,
         blake3,
+        p1w16,
+        fp3mac,
     } = counts;
     // ⛔ BLAKE3 IS DROPPABLE AND IS DELIBERATELY NOT IN THIS LIST — a
     // COVERAGE GAP, not an exemption. It belongs here on exactly the
@@ -175,6 +179,9 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
     // silent, and it is a property of the TEST SET only: the production
     // elision reads `TableCounts`, never this list.
     let _ = blake3;
+    // P1W16 likewise: no fixture here calls its syscall.
+    let _ = p1w16;
+    let _ = fp3mac;
     [
         ("CPU", cpu),
         ("LT", lt),

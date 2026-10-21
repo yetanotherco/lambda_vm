@@ -31,7 +31,7 @@ impl RestHeader {
 }
 
 /// [`crate::TableCounts`] field by field, to compare two.
-pub(super) fn counts_of(c: &crate::TableCounts) -> [usize; 21] {
+pub(super) fn counts_of(c: &crate::TableCounts) -> [usize; 23] {
     [
         c.cpu,
         c.lt,
@@ -54,6 +54,8 @@ pub(super) fn counts_of(c: &crate::TableCounts) -> [usize; 21] {
         c.hint,
         c.commit,
         c.blake3,
+        c.p1w16,
+        c.fp3mac,
     ]
 }
 
@@ -156,6 +158,8 @@ pub(super) struct FinishPlan<'a> {
     ecsm_ops: BlockVec<ecsm::EcsmOperation>,
     ecdas_ops: BlockVec<ecdas::CompactEcdasOp>,
     hint_ops: BlockVec<hint::HintOperation>,
+    p1w16_ops: BlockVec<P1w16Operation>,
+    fp3mac_ops: BlockVec<Fp3MacOperation>,
     bitwise_histogram: bitwise::BitwiseHistogram,
     num_padding_rows: usize,
     halt_timestamp: u64,
@@ -209,6 +213,8 @@ impl<'a> FinishPlan<'a> {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            p1w16_ops,
+            fp3mac_ops,
         } = ops;
 
         // =====================================================================
@@ -522,6 +528,8 @@ impl<'a> FinishPlan<'a> {
                 }),
                 Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops.whole()))),
                 Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops.whole()))),
+                Box::new(|h| h.add_ops(&collect_bitwise_from_p1w16(&p1w16_ops.whole()))),
+                Box::new(|h| h.add_ops(&collect_bitwise_from_fp3mac(&fp3mac_ops.whole()))),
                 Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
             ]);
             if let Some(image) = initial_image
@@ -707,6 +715,8 @@ impl<'a> FinishPlan<'a> {
             ecsm: accelerator(ecsm_ops.len(), skip.ecsm_rows),
             ecdas: accelerator(ecdas_ops.len(), skip.ecdas_rows),
             hint: usize::from(!hint_ops.is_empty()),
+            p1w16: usize::from(!p1w16_ops.is_empty()),
+            fp3mac: usize::from(!fp3mac_ops.is_empty()),
             commit: usize::from(!commit_ops.is_empty()),
             blake3: usize::from(num_blake3_ops > 0),
         };
@@ -742,6 +752,8 @@ impl<'a> FinishPlan<'a> {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            p1w16_ops,
+            fp3mac_ops,
             bitwise_histogram,
             num_padding_rows,
             halt_timestamp,
@@ -803,6 +815,8 @@ impl<'a> FinishPlan<'a> {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            p1w16_ops,
+            fp3mac_ops,
             bitwise_histogram,
             num_padding_rows,
             halt_timestamp,
@@ -1165,6 +1179,23 @@ impl<'a> FinishPlan<'a> {
                 storage_mode,
             )
         };
+        // P1W16 table. Absent for programs that make no width-16 Poseidon1 ecall.
+        let gen_p1w16s = || {
+            generate_optional(
+                &p1w16_ops.whole(),
+                packed_by(pack, p1w16::generate_p1w16_trace),
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        };
+        let gen_fp3macs = || {
+            generate_optional(
+                &fp3mac_ops.whole(),
+                packed_by(pack, fp3mac::generate_fp3mac_trace),
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        };
 
         let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =
             (None, None, None, None);
@@ -1180,6 +1211,8 @@ impl<'a> FinishPlan<'a> {
             (None, None, None, None);
         let (mut ecsms_slot, mut ecdases_slot) = (None, None);
         let mut hints_slot = None;
+        let mut p1w16s_slot = None;
+        let mut fp3macs_slot = None;
 
         #[cfg(feature = "disk-spill")]
         let sequential = storage_mode == StorageMode::Disk || cfg!(not(feature = "parallel"));
@@ -1226,6 +1259,8 @@ impl<'a> FinishPlan<'a> {
                 spawn_into!(ecsms_slot, gen_ecsms);
                 spawn_into!(ecdases_slot, gen_ecdases);
                 spawn_into!(hints_slot, gen_hints);
+                spawn_into!(p1w16s_slot, gen_p1w16s);
+                spawn_into!(fp3macs_slot, gen_fp3macs);
             });
         } else {
             cpus_slot = Some(gen_cpus());
@@ -1255,6 +1290,8 @@ impl<'a> FinishPlan<'a> {
             ecsms_slot = Some(gen_ecsms());
             ecdases_slot = Some(gen_ecdases());
             hints_slot = Some(gen_hints());
+            p1w16s_slot = Some(gen_p1w16s());
+            fp3macs_slot = Some(gen_fp3macs());
         }
 
         build_stamps::mark("p5 end");
@@ -1291,6 +1328,8 @@ impl<'a> FinishPlan<'a> {
         let ecsms = ecsms_slot.expect(PHASE5_RAN)?;
         let ecdases = ecdases_slot.expect(PHASE5_RAN)?;
         let hints = hints_slot.expect(PHASE5_RAN)?;
+        let p1w16s = p1w16s_slot.expect(PHASE5_RAN)?;
+        let fp3macs = fp3macs_slot.expect(PHASE5_RAN)?;
 
         // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
         // so spill them here before returning.
@@ -1362,6 +1401,8 @@ impl<'a> FinishPlan<'a> {
             ecsms,
             ecdases,
             hints,
+            p1w16s,
+            fp3macs,
             memw_registers,
             local_to_global,
             touched_memory_cells,
@@ -1419,7 +1460,7 @@ pub(crate) struct Emitted {
 /// The rest's families in AIR order (`VmAirs::air_refs`), each with its
 /// columns at eight bytes a cell: what a family's first table is estimated
 /// at, before one of them has been built.
-const FAMILIES: [(&str, usize); 27] = [
+const FAMILIES: [(&str, usize); 29] = [
     ("BITWISE", bitwise::cols::NUM_COLUMNS),
     ("DECODE", decode::cols::NUM_COLUMNS),
     ("KECCAK_RC", keccak_rc::cols::NUM_COLUMNS),
@@ -1431,6 +1472,8 @@ const FAMILIES: [(&str, usize); 27] = [
     ("ECSM", ecsm::cols::NUM_COLUMNS),
     ("ECDAS", ecdas::cols::NUM_COLUMNS),
     ("HINT", hint::cols::NUM_COLUMNS),
+    ("P1W16", p1w16::cols::NUM_COLUMNS),
+    ("FP3MAC", fp3mac::cols::NUM_COLUMNS),
     ("BLAKE3", blake3::cols::NUM_COLUMNS),
     ("CPU", cpu::cols::NUM_COLUMNS),
     ("LT", lt::cols::NUM_COLUMNS),
@@ -1636,6 +1679,8 @@ impl<'a> FinishPlan<'a> {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            p1w16_ops,
+            fp3mac_ops,
             bitwise_histogram,
             num_padding_rows,
             halt_timestamp,
@@ -1792,6 +1837,24 @@ impl<'a> FinishPlan<'a> {
                 Ok(packed_if(
                     pack,
                     hint::generate_hint_trace_as(&hint_ops.whole(), form),
+                ))
+            })
+        }));
+        let p1w16_ops = Arc::new(p1w16_ops);
+        units.extend(optional_unit(family("P1W16"), p1w16_ops.len(), || {
+            Box::new(move || {
+                Ok(packed_if(
+                    pack,
+                    p1w16::generate_p1w16_trace(&p1w16_ops.whole()),
+                ))
+            })
+        }));
+        let fp3mac_ops = Arc::new(fp3mac_ops);
+        units.extend(optional_unit(family("FP3MAC"), fp3mac_ops.len(), || {
+            Box::new(move || {
+                Ok(packed_if(
+                    pack,
+                    fp3mac::generate_fp3mac_trace(&fp3mac_ops.whole()),
                 ))
             })
         }));
@@ -2277,6 +2340,8 @@ fn check_units(units: &[Unit<'_>], counts: &crate::TableCounts) -> Result<(), Er
         ecsm: of("ECSM"),
         ecdas: of("ECDAS"),
         hint: of("HINT"),
+        p1w16: of("P1W16"),
+        fp3mac: of("FP3MAC"),
         commit: of("COMMIT"),
         blake3: of("BLAKE3"),
     };

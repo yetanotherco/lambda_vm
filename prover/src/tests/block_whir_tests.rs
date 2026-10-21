@@ -1127,6 +1127,72 @@ fn a_group_proved_on_another_fork_is_refused() {
 /// bus balance, which is checked once over every table of the block. The
 /// chunk left out holds real rounds (the first): the last one of a small
 /// program can be padding alone, which the bus does not see.
+/// The `p1w16_precompile` guest (five width-16 Poseidon1 ecalls).
+fn p1w16_guest_elf() -> Vec<u8> {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("executor/program_artifacts/rust/p1w16_precompile.elf");
+    std::fs::read(&root).expect("p1w16_precompile.elf not found — run `make compile-programs-rust`")
+}
+
+/// ★ The P1W16 table on the block path: a guest calling the width-16
+/// Poseidon1 ecall proves and verifies in one group and across several.
+#[test]
+fn a_p1w16_guest_proves_and_verifies_as_a_block() {
+    let elf = p1w16_guest_elf();
+    for format in [one_group(), many_groups()] {
+        let proof = prove(&elf, &format, &options(MaxRowsConfig::small(), 16));
+        assert_eq!(proof.table_counts.p1w16, 1);
+        assert!(verify(&proof, &elf, &format));
+    }
+}
+
+/// A block proof that drops its P1W16 table from the counts is refused.
+#[test]
+fn a_block_claiming_no_p1w16_table_is_refused() {
+    let elf = p1w16_guest_elf();
+    let format = many_groups();
+    let mut proof = prove(&elf, &format, &options(MaxRowsConfig::small(), 16));
+    assert!(verify(&proof, &elf, &format));
+    proof.table_counts.p1w16 = 0;
+    assert!(!verify(&proof, &elf, &format));
+}
+
+/// The `fp3mac_precompile` guest (a Horner over 48 cells with the
+/// cubic-extension multiply-add ecall).
+fn fp3mac_guest_elf() -> Vec<u8> {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("executor/program_artifacts/rust/fp3mac_precompile.elf");
+    std::fs::read(&root)
+        .expect("fp3mac_precompile.elf not found — run `make compile-programs-rust`")
+}
+
+/// The FP3MAC table on the block path: a guest calling the multiply-add ecall
+/// proves and verifies in one group and across several.
+#[test]
+fn a_fp3mac_guest_proves_and_verifies_as_a_block() {
+    let elf = fp3mac_guest_elf();
+    for format in [one_group(), many_groups()] {
+        let proof = prove(&elf, &format, &options(MaxRowsConfig::default(), 16));
+        assert_eq!(proof.table_counts.fp3mac, 1);
+        assert!(verify(&proof, &elf, &format));
+    }
+}
+
+/// A block proof that drops its FP3MAC table from the counts is refused.
+#[test]
+fn a_block_claiming_no_fp3mac_table_is_refused() {
+    let elf = fp3mac_guest_elf();
+    let format = many_groups();
+    let mut proof = prove(&elf, &format, &options(MaxRowsConfig::default(), 16));
+    assert!(verify(&proof, &elf, &format));
+    proof.table_counts.fp3mac = 0;
+    assert!(!verify(&proof, &elf, &format));
+}
+
 #[test]
 fn a_block_missing_an_instance_is_refused_on_the_bus() {
     let elf = asm_elf_bytes("test_keccak");
@@ -2660,6 +2726,8 @@ fn chunked_counts() -> crate::TableCounts {
         hint: 1,
         commit: 1,
         blake3: 0,
+        p1w16: 0,
+        fp3mac: 0,
     }
 }
 

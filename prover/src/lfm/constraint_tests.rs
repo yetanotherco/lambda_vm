@@ -368,6 +368,8 @@ const DESIGN_INSTR: &[(&str, usize)] = &[
     ("L2G_GLOBAL", 27),
     ("L2G_MEMORY", 65),
     ("GLOBAL_MEMORY", 25),
+    ("P1W16", 10_177), // not in §8.1: the emitter's own count.
+    ("FP3MAC", 1_658), // not in §8.1: the emitter's own count.
 ];
 
 /// ★ What the emitter actually costs per AIR, against the design's table.

@@ -1878,6 +1878,8 @@ fn the_per_branch_term_is_the_table_kind_count() {
         hint: 0,
         commit: 0,
         blake3: 0,
+        p1w16: 0,
+        fp3mac: 0,
     };
     let kinds = crate::statement::table_count_values(&zero).len();
     assert_eq!(

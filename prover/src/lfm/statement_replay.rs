@@ -60,7 +60,7 @@ use super::transcript_replay::TranscriptReplay;
 /// challenge equality in `algebraic_transcript`'s replay test, plus the
 /// hand-written `[u64; NUM_TABLE_COUNTS]` literal it builds — which fails to
 /// compile when this number moves and the literal does not.
-pub const NUM_TABLE_COUNTS: usize = 21;
+pub const NUM_TABLE_COUNTS: usize = 23;
 
 /// The shape-static half of the statement — emitted as program constants.
 #[derive(Debug, Clone)]
