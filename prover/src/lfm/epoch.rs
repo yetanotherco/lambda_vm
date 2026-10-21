@@ -710,6 +710,8 @@ fn emit_p1_grinding_check(
     use super::p1w16_emit::{Lane, w8_permute_lanes};
 
     assert_eq!(seed.len(), 1, "a Poseidon1 transcript state is ONE cell");
+    #[cfg(test)]
+    super::fn_scope::begin(b, format!("p1_grind_{factor}"));
     let [s0, s1, s2, s3] = b.unpack(seed[0]);
     let prefix = FE::from(u64::from_be_bytes(GRINDING_PREFIX));
     let fac = FE::from(u64::from(factor) << 56);
@@ -739,6 +741,8 @@ fn emit_p1_grinding_check(
     for bit in &bits[64 - factor as usize..] {
         b.assert_eq(Felt(bit.addr()), zero);
     }
+    #[cfg(test)]
+    super::fn_scope::end(b);
 }
 
 fn emit_algebraic_grinding_check(

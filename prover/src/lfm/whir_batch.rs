@@ -235,6 +235,8 @@ pub fn emit_batched_argue(
     let betas = emit_challenge_powers(b, beta, max_roots);
     let mut rebuilt: Option<Ext> = None;
     for (t, shape) in shapes.iter().enumerate() {
+        #[cfg(test)]
+        super::fn_scope::begin(b, "table");
         let num_vars = shape.num_vars;
         let at = &r[..num_vars];
         let (weight_r, weight_z) = weight_slots(shape.kinds.len());
@@ -269,6 +271,8 @@ pub fn emit_batched_argue(
             Some(padding) if num_vars < plan.num_vars => b.emul(value, padding),
             _ => value,
         };
+        #[cfg(test)]
+        super::fn_scope::end(b);
         rebuilt = Some(match rebuilt {
             None => term,
             Some(acc) => b.emul_add(weights[t], term, acc),
