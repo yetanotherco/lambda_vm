@@ -1,0 +1,651 @@
+use super::air::cols;
+use super::asm::Asm;
+#[cfg_attr(any(feature = "fvm-narrow", feature = "fvm-n1"), allow(unused_imports))]
+use super::executor::{Execution, HintRequest, Memory, NoHints, execute};
+use super::isa::{Arg, Program, gpr};
+use super::mem::cols as mem_cols;
+use super::prove::{
+    FvmTraces, PublicCell, default_options, generate_traces, generate_traces_with, program_id,
+    prove, prove_traces, public_cells, verify,
+};
+use crate::tables::types::{FE, FEE};
+
+fn fee(a: u64, b: u64, c: u64) -> FEE {
+    FEE::new([FE::from(a), FE::from(b), FE::from(c)])
+}
+
+fn power_program(n: i64) -> Program {
+    if super::isa::N == 1 {
+        // One register: the power as a straight-line chain.
+        let acc = gpr(0);
+        let mut asm = Asm::new();
+        asm.mov(Arg::reg(acc), Arg::imm(1));
+        for _ in 0..n {
+            asm.mul(Arg::reg(acc), Arg::reg(acc), Arg::mem_abs(0));
+        }
+        asm.store(Arg::mem_abs(1), Arg::reg(acc)).halt();
+        return asm.finish().unwrap();
+    }
+    let (acc, cnt) = (gpr(0), gpr(1));
+    let mut asm = Asm::new();
+    asm.mov(Arg::reg(acc), Arg::imm(1))
+        .mov(Arg::reg(cnt), Arg::imm(n));
+    let top = asm.label();
+    asm.bind(top);
+    asm.mul(Arg::reg(acc), Arg::reg(acc), Arg::mem_abs(0))
+        .sub(Arg::reg(cnt), Arg::reg(cnt), Arg::imm(1))
+        .jump_not_zero(top)
+        .store(Arg::mem_abs(1), Arg::reg(acc))
+        .halt();
+    asm.finish().unwrap()
+}
+
+fn prove_and_verify(program: &Program, exec: &Execution, public: &[u64]) -> bool {
+    let options = default_options();
+    let proof = prove(program, exec, public, &options).expect("proving");
+    verify(
+        &program_id(program, &options),
+        &public_cells(exec, public),
+        &proof,
+        &options,
+    )
+}
+
+#[test]
+fn power_loop_proves_and_verifies() {
+    let program = power_program(13);
+    let exec = execute(
+        &program,
+        Memory::with_init(2, &[fee(2, 1, 9)]),
+        &mut NoHints,
+        1 << 12,
+    )
+    .unwrap();
+    assert!(prove_and_verify(&program, &exec, &[0, 1]));
+}
+
+#[cfg(not(feature = "fvm-n1"))]
+#[test]
+fn inv_and_straight_line_prove_and_verify() {
+    let (r, a) = (gpr(0), gpr(1));
+    let mut asm = Asm::new();
+    asm.mov(Arg::reg(a), Arg::mem_abs(0))
+        .inv(r, Arg::reg(a))
+        .fma(Arg::mem_abs(1), Arg::reg(r), Arg::mem_abs(0), Arg::imm(0))
+        .halt();
+    let program = asm.finish().unwrap();
+    let exec = execute(
+        &program,
+        Memory::with_init(2, &[fee(5, 6, 7), FEE::one()]),
+        &mut NoHints,
+        64,
+    )
+    .unwrap();
+    assert!(prove_and_verify(&program, &exec, &[0, 1]));
+}
+
+#[cfg(not(any(feature = "fvm-narrow", feature = "fvm-n1")))]
+#[test]
+fn recursive_calls_prove_and_verify() {
+    let (fp, n, t, res) = (gpr(0), gpr(1), gpr(2), gpr(3));
+    let mut asm = Asm::new();
+    let fact = asm.label();
+    asm.mov(Arg::reg(fp), Arg::imm(8))
+        .call(fact, fp, &[], &[Arg::imm(4)], Some(res))
+        .store(Arg::mem_abs(0), Arg::reg(res))
+        .halt();
+    asm.bind(fact);
+    let base = asm.label();
+    asm.mov(Arg::reg(n), Arg::mem(fp, 2)).jump_zero(base);
+    asm.sub(Arg::reg(t), Arg::reg(n), Arg::imm(1))
+        .call(fact, fp, &[n], &[Arg::reg(t)], Some(res))
+        .mul(Arg::reg(res), Arg::reg(res), Arg::reg(n))
+        .store(Arg::mem(fp, 3), Arg::reg(res))
+        .ret(fp);
+    asm.bind(base);
+    asm.store(Arg::mem(fp, 3), Arg::imm(1)).ret(fp);
+    let program = asm.finish().unwrap();
+    let mut next = 16u64;
+    let mut frames = |_: &HintRequest| {
+        next += 16;
+        Some(FEE::from(next))
+    };
+    let exec = execute(&program, Memory::new(128), &mut frames, 1 << 12).unwrap();
+    assert_eq!(exec.mem[0], FEE::from(24u64));
+    assert!(prove_and_verify(&program, &exec, &[0]));
+}
+
+fn power_exec() -> (Program, Execution) {
+    let program = power_program(3);
+    let exec = execute(
+        &program,
+        Memory::with_init(2, &[fee(2, 1, 9)]),
+        &mut NoHints,
+        1 << 12,
+    )
+    .unwrap();
+    (program, exec)
+}
+
+/// The power program's input `x` and its output `x^3`.
+const POWER_PUBLIC: [u64; 2] = [0, 1];
+
+/// Proves `exec` after `tamper` edits its traces, with [`POWER_PUBLIC`]
+/// flagged; `true` iff the proof verifies against `claimed`.
+fn verifies_with(
+    program: &Program,
+    exec: &Execution,
+    claimed: &[PublicCell],
+    tamper: impl FnOnce(&mut FvmTraces),
+) -> bool {
+    let options = default_options();
+    let id = program_id(program, &options);
+    let proved = public_cells(exec, &POWER_PUBLIC);
+    let mut traces = generate_traces(program, exec, &POWER_PUBLIC);
+    tamper(&mut traces);
+    match prove_traces(&id, &proved, &mut traces, &options) {
+        Ok(proof) => verify(&id, claimed, &proof, &options),
+        Err(_) => false,
+    }
+}
+
+fn verifies_after(
+    program: &Program,
+    exec: &Execution,
+    tamper: impl FnOnce(&mut FvmTraces),
+) -> bool {
+    verifies_with(program, exec, &public_cells(exec, &POWER_PUBLIC), tamper)
+}
+
+fn bump(
+    t: &mut stark::table::Table<crate::tables::types::GoldilocksField>,
+    row: usize,
+    col: usize,
+) {
+    let v = *t.get(row, col);
+    t.set(row, col, v + FE::one());
+}
+
+#[test]
+fn untampered_traces_verify() {
+    let (program, exec) = power_exec();
+    assert!(verifies_after(&program, &exec, |_| {}));
+}
+
+#[cfg(not(any(feature = "fvm-narrow", feature = "fvm-n1")))]
+#[test]
+fn register_changed_without_a_hint_is_rejected() {
+    let (program, exec) = power_exec();
+    // General-purpose register 4 is never hinted by this program.
+    assert!(!verifies_after(&program, &exec, |t| bump(
+        &mut t.fvm[0].main_table,
+        3,
+        cols::reg(4)
+    )));
+}
+
+#[test]
+fn pc_skipping_without_a_hint_is_rejected() {
+    let (program, exec) = power_exec();
+    assert!(!verifies_after(&program, &exec, |t| bump(
+        &mut t.fvm[0].main_table,
+        2,
+        cols::PC
+    )));
+}
+
+#[test]
+fn lying_zero_flag_is_rejected() {
+    let (program, exec) = power_exec();
+    assert!(!verifies_after(&program, &exec, |t| {
+        let z = *t.fvm[0].main_table.get(4, cols::ZERO);
+        t.fvm[0].main_table.set(4, cols::ZERO, FE::one() - z);
+    }));
+}
+
+#[test]
+fn wrong_fma_output_is_rejected() {
+    let (program, exec) = power_exec();
+    assert!(!verifies_after(&program, &exec, |t| bump(
+        &mut t.fvm[0].main_table,
+        1,
+        cols::arg(0)
+    )));
+}
+
+#[test]
+fn out_of_range_register_index_is_rejected() {
+    let (program, exec) = power_exec();
+    assert!(!verifies_after(&program, &exec, |t| {
+        t.fvm[0]
+            .main_table
+            .set(1, cols::ARG_REG + 1, FE::from(super::isa::NUM_REGS as u64));
+    }));
+}
+
+#[test]
+fn forged_memory_value_is_rejected() {
+    let (program, exec) = power_exec();
+    assert!(!verifies_after(&program, &exec, |t| bump(
+        &mut t.mem.main_table,
+        0,
+        mem_cols::VALUE
+    )));
+}
+
+#[test]
+fn duplicate_memory_address_is_rejected() {
+    let (program, exec) = power_exec();
+    assert!(!verifies_after(&program, &exec, |t| t.mem.main_table.set(
+        1,
+        mem_cols::ADDR,
+        FE::zero()
+    )));
+}
+
+#[test]
+fn tampered_program_column_is_rejected() {
+    let (program, exec) = power_exec();
+    assert!(!verifies_after(&program, &exec, |t| bump(
+        &mut t.decode[0].main_table,
+        5,
+        1
+    )));
+}
+
+#[test]
+fn execution_that_never_halts_is_rejected() {
+    let (program, mut exec) = power_exec();
+    exec.steps.truncate(exec.steps.len() - 2);
+    assert!(!verifies_after(&program, &exec, |_| {}));
+}
+
+#[test]
+fn proof_does_not_verify_for_another_program() {
+    let (program, exec) = power_exec();
+    let options = default_options();
+    let proof = prove(&program, &exec, &POWER_PUBLIC, &options).unwrap();
+    assert!(!verify(
+        &program_id(&power_program(4), &options),
+        &public_cells(&exec, &POWER_PUBLIC),
+        &proof,
+        &options
+    ));
+}
+
+#[test]
+fn lying_last_row_is_rejected() {
+    let (program, exec) = power_exec();
+    let options = default_options();
+    let mut proof = prove(&program, &exec, &POWER_PUBLIC, &options).unwrap();
+    proof.proofs[0].public_inputs.last_row -= 1;
+    assert!(!verify(
+        &program_id(&program, &options),
+        &public_cells(&exec, &POWER_PUBLIC),
+        &proof,
+        &options
+    ));
+}
+
+fn with_value(cells: &[PublicCell], i: usize, v: FEE) -> Vec<PublicCell> {
+    let mut cells = cells.to_vec();
+    cells[i].1 = v;
+    cells
+}
+
+#[test]
+fn wrong_public_output_is_rejected() {
+    let (program, exec) = power_exec();
+    let cells = public_cells(&exec, &POWER_PUBLIC);
+    let forged = with_value(&cells, 1, cells[1].1 + FEE::one());
+    assert!(!verifies_with(&program, &exec, &forged, |_| {}));
+}
+
+#[test]
+fn wrong_public_input_is_rejected() {
+    let (program, exec) = power_exec();
+    let cells = public_cells(&exec, &POWER_PUBLIC);
+    let forged = with_value(&cells, 0, fee(2, 1, 8));
+    assert!(!verifies_with(&program, &exec, &forged, |_| {}));
+}
+
+#[test]
+fn missing_or_extra_public_cells_are_rejected() {
+    let (program, exec) = power_exec();
+    let cells = public_cells(&exec, &POWER_PUBLIC);
+    assert!(!verifies_with(&program, &exec, &cells[..1], |_| {}));
+    assert!(!verifies_with(&program, &exec, &[], |_| {}));
+    let mut extra = cells.clone();
+    extra.push((5, FEE::zero()));
+    assert!(!verifies_with(&program, &exec, &extra, |_| {}));
+}
+
+#[test]
+fn unsorted_or_repeated_public_claims_are_rejected() {
+    let (program, exec) = power_exec();
+    let cells = public_cells(&exec, &POWER_PUBLIC);
+    let reversed: Vec<_> = cells.iter().rev().copied().collect();
+    assert!(!verifies_with(&program, &exec, &reversed, |_| {}));
+    assert!(!verifies_with(
+        &program,
+        &exec,
+        &[cells[0], cells[0]],
+        |_| {}
+    ));
+}
+
+#[test]
+fn non_canonical_public_address_is_rejected() {
+    let (program, exec) = power_exec();
+    let cells = public_cells(&exec, &POWER_PUBLIC);
+    let p = math::field::goldilocks::GOLDILOCKS_PRIME;
+    let aliased = [cells[0], (cells[1].0 + p, cells[1].1)];
+    let options = default_options();
+    let id = program_id(&program, &options);
+    let mut traces = generate_traces(&program, &exec, &POWER_PUBLIC);
+    let proof = prove_traces(&id, &aliased, &mut traces, &options).unwrap();
+    assert!(!verify(&id, &aliased, &proof, &options));
+}
+
+#[test]
+fn programs_start_with_the_halt_loop_and_start_nop() {
+    let program = power_program(3);
+    assert_eq!(program.instrs[0], super::isa::Instr::halt());
+    assert_eq!(program.instrs[1], super::isa::Instr::nop());
+}
+
+#[test]
+fn flagging_an_unclaimed_cell_is_rejected() {
+    let (program, exec) = power_exec();
+    assert!(!verifies_after(&program, &exec, |t| {
+        t.mem.main_table.set(5, mem_cols::PUB, FE::one())
+    }));
+}
+
+#[test]
+fn non_bit_public_flag_is_rejected() {
+    let (program, exec) = power_exec();
+    assert!(!verifies_after(&program, &exec, |t| {
+        t.mem.main_table.set(1, mem_cols::PUB, FE::from(2u64))
+    }));
+}
+
+#[cfg(not(any(feature = "fvm-narrow", feature = "fvm-n1")))]
+fn horner_program(len: usize) -> Program {
+    let (acc, i, x) = (gpr(0), gpr(1), gpr(2));
+    let mut asm = Asm::new();
+    asm.mov(Arg::reg(x), Arg::mem_abs(0))
+        .mov(Arg::reg(acc), Arg::imm(0))
+        .mov(Arg::reg(i), Arg::imm(len as i64));
+    let top = asm.label();
+    asm.bind(top);
+    asm.fma_out(Arg::reg(acc), Arg::reg(acc), Arg::reg(x), Arg::mem(i, 0))
+        .sub(Arg::reg(i), Arg::reg(i), Arg::imm(1))
+        .jump_not_zero(top)
+        .store(Arg::mem_abs(len as u64 + 1), Arg::reg(acc))
+        .halt();
+    asm.finish().unwrap()
+}
+
+/// Sizes and timings of a Horner evaluation (3 rows per coefficient).
+/// `cargo test --release -p lambda-vm-prover --lib field_vm::prove_tests::report_horner -- --ignored --nocapture`
+#[cfg(not(any(feature = "fvm-narrow", feature = "fvm-n1")))]
+#[test]
+#[ignore]
+fn report_horner() {
+    use std::time::Instant;
+    let options = default_options();
+    for len in [1usize << 10, 1 << 14, 1 << 16] {
+        let program = horner_program(len);
+        let init: Vec<FEE> = (0..=len as u64)
+            .map(|k| fee(k + 3, 2 * k + 1, k * k + 7))
+            .collect();
+        let exec = execute(
+            &program,
+            Memory::with_init(len + 2, &init),
+            &mut NoHints,
+            1 << 22,
+        )
+        .unwrap();
+        let id = program_id(&program, &options);
+        let public: Vec<u64> = (0..=len as u64 + 1).collect();
+        let cells_pub = public_cells(&exec, &public);
+        let traces = generate_traces(&program, &exec, &public);
+        let rows = [
+            traces.fvm.iter().map(|t| t.num_rows()).sum::<usize>(),
+            traces.decode.iter().map(|t| t.num_rows()).sum::<usize>(),
+            traces.mem.num_rows(),
+        ];
+        // Main width + 3 base columns per LogUp aux column (⌈interactions / 2⌉).
+        let widths = [
+            cols::NUM_COLUMNS + 3 * 3,
+            super::decode::NUM_COLUMNS + 3,
+            mem_cols::NUM_COLUMNS + 3,
+        ];
+        let cells: usize = rows.iter().zip(widths).map(|(r, w)| r * w).sum();
+        let mut prove_ms = Vec::new();
+        let mut verify_ms = Vec::new();
+        let mut size = 0;
+        for _ in 0..5 {
+            let mut t = generate_traces(&program, &exec, &public);
+            let start = Instant::now();
+            let proof = prove_traces(&id, &cells_pub, &mut t, &options).unwrap();
+            prove_ms.push(start.elapsed().as_secs_f64() * 1e3);
+            let start = Instant::now();
+            assert!(verify(&id, &cells_pub, &proof, &options));
+            verify_ms.push(start.elapsed().as_secs_f64() * 1e3);
+            size = rkyv::to_bytes::<rkyv::rancor::Error>(&proof).unwrap().len();
+        }
+        prove_ms.sort_by(f64::total_cmp);
+        verify_ms.sort_by(f64::total_cmp);
+        eprintln!(
+            "len={len} steps={} rows(fvm,dec,mem)={rows:?} cells={cells} prove_ms(min/med/max)={:.1}/{:.1}/{:.1} verify_ms(med)={:.1} proof_bytes={size}",
+            exec.steps.len(),
+            prove_ms[0],
+            prove_ms[2],
+            prove_ms[4],
+            verify_ms[2]
+        );
+    }
+}
+
+/// The power program at `n = 13`: long enough for an 8-row cap to split it
+/// into many segments.
+fn long_power_exec() -> (Program, Execution) {
+    let program = power_program(13);
+    let exec = execute(
+        &program,
+        Memory::with_init(2, &[fee(2, 1, 9)]),
+        &mut NoHints,
+        1 << 12,
+    )
+    .unwrap();
+    (program, exec)
+}
+
+/// Proves `exec` with FIELD_VM split into segments of at most `max_rows`.
+fn segmented_proof(
+    program: &Program,
+    exec: &Execution,
+    max_rows: usize,
+) -> (super::prove::FvmProof, Vec<PublicCell>) {
+    let options = default_options();
+    let cells = public_cells(exec, &POWER_PUBLIC);
+    let mut traces = generate_traces_with(program, exec, &POWER_PUBLIC, Some(max_rows));
+    assert!(traces.fvm.len() > 2, "the cap must force several segments");
+    let proof = prove_traces(
+        &program_id(program, &options),
+        &cells,
+        &mut traces,
+        &options,
+    )
+    .unwrap();
+    (proof, cells)
+}
+
+#[test]
+fn segmented_execution_proves_and_verifies() {
+    let (program, exec) = long_power_exec();
+    let options = default_options();
+    let (proof, cells) = segmented_proof(&program, &exec, 8);
+    assert!(verify(
+        &program_id(&program, &options),
+        &cells,
+        &proof,
+        &options
+    ));
+}
+
+#[test]
+fn dropped_or_reordered_segments_are_rejected() {
+    let (program, exec) = long_power_exec();
+    let options = default_options();
+    let id = program_id(&program, &options);
+    let (proof, cells) = segmented_proof(&program, &exec, 8);
+    let mut dropped = proof.clone();
+    dropped.proofs.remove(1);
+    assert!(!verify(&id, &cells, &dropped, &options));
+    let mut swapped = proof.clone();
+    swapped.proofs.swap(0, 1);
+    assert!(!verify(&id, &cells, &swapped, &options));
+}
+
+#[test]
+fn forged_segment_boundary_is_rejected() {
+    let (program, exec) = long_power_exec();
+    let options = default_options();
+    let id = program_id(&program, &options);
+    let (proof, cells) = segmented_proof(&program, &exec, 8);
+    // Consistent on both sides of the boundary, so only the traces can object.
+    let mut forged = proof.clone();
+    forged.proofs[0].public_inputs.last[2] += 1;
+    forged.proofs[1].public_inputs.first[2] += 1;
+    assert!(!verify(&id, &cells, &forged, &options));
+    // Inconsistent across the boundary.
+    let mut broken = proof;
+    broken.proofs[1].public_inputs.first[0] += 1;
+    assert!(!verify(&id, &cells, &broken, &options));
+}
+
+#[test]
+fn segment_plan_covers_every_step() {
+    for steps in [1usize, 7, 8, 9, 100, 4851, 19_320, 21_234, 538_706] {
+        for cap in [None, Some(8), Some(64)] {
+            let plan = super::air::segment_plan(steps, 8, cap);
+            assert_eq!(
+                plan.iter().map(|(real, _)| real).sum::<usize>(),
+                steps,
+                "{steps} {cap:?}"
+            );
+            for (k, &(real, rows)) in plan.iter().enumerate() {
+                assert!(rows.is_power_of_two() && rows >= 8);
+                if k + 1 < plan.len() {
+                    assert_eq!(real + 1, rows);
+                } else {
+                    assert!(real <= rows);
+                }
+                if let Some(c) = cap {
+                    assert!(rows <= c.max(8));
+                }
+            }
+            if cap.is_none() {
+                assert!(plan.len() <= super::air::MAX_SEGMENTS);
+            }
+        }
+    }
+    // The default bound; `FVM_SEGMENT_WASTE` moves the plan.
+    if std::env::var_os("FVM_SEGMENT_WASTE").is_none() {
+        assert_eq!(
+            super::air::segment_plan(538_706, 8, None),
+            vec![(524_287, 524_288), (14_419, 16_384)]
+        );
+    }
+}
+
+#[test]
+fn decode_chunks_cover_the_program() {
+    for len in [2usize, 9, 100, 5000, 16_385, 538_706] {
+        let program = super::isa::Program::new(vec![super::isa::Instr::nop(); len - 2]).unwrap();
+        let plan = super::decode::chunks(&program, 8);
+        assert!(plan.len() <= super::decode::MAX_CHUNKS);
+        let mut next = 0;
+        for &(start, n, rows) in &plan {
+            assert_eq!(start, next);
+            assert!(rows.is_power_of_two() && n <= rows && rows >= 8);
+            next += n;
+        }
+        assert_eq!(next, len);
+    }
+}
+
+/// With a single register the translation still borrows it for selects and
+/// chains; a one-register program proves, and a forged register is rejected.
+#[test]
+fn one_register_program_proves_and_rejects_forgery() {
+    let (program, exec) = power_exec();
+    let options = default_options();
+    let proof = prove(&program, &exec, &POWER_PUBLIC, &options).unwrap();
+    let cells = public_cells(&exec, &POWER_PUBLIC);
+    assert!(verify(
+        &program_id(&program, &options),
+        &cells,
+        &proof,
+        &options
+    ));
+    assert!(!verifies_after(&program, &exec, |t| bump(
+        &mut t.fvm[0].main_table,
+        2,
+        cols::reg(0)
+    )));
+}
+
+/// The translated bit decomposition (option B's query bits) proves only the
+/// canonical bits of `x`: those of `x + p`, which sum to `x` too, are proved
+/// from that witness and rejected, and only its canonicality row breaks.
+#[test]
+fn non_canonical_bit_decomposition_is_rejected() {
+    const P: u64 = 0xFFFF_FFFF_0000_0001;
+    let x = 5u64;
+    let run = |v: u64| {
+        let mut mem = vec![FEE::from(x)];
+        let bits: [u64; 64] = core::array::from_fn(|i| {
+            mem.push(FEE::from((v >> i) & 1));
+            i as u64 + 1
+        });
+        let mut asm = Asm::new();
+        super::lfm_translate::canonical_bit_dec(&mut asm, &mut mem, Arg::mem_abs(0), &bits, gpr(0));
+        asm.halt();
+        let program = asm.finish().unwrap();
+        let (exec, violated) = super::executor::execute_violating(
+            &program,
+            Memory::with_init(mem.len(), &mem),
+            &mut NoHints,
+            1 << 12,
+        )
+        .unwrap();
+        (program, exec, violated)
+    };
+    let public: Vec<u64> = (0..=64).collect();
+    let verifies = |program: &Program, exec: &Execution| {
+        let options = default_options();
+        prove(program, exec, &public, &options).is_ok_and(|proof| {
+            verify(
+                &program_id(program, &options),
+                &public_cells(exec, &public),
+                &proof,
+                &options,
+            )
+        })
+    };
+    let (program, honest, violated) = run(x);
+    assert!(violated.is_empty());
+    assert!(verifies(&program, &honest), "the canonical bits");
+    let (program, forged, violated) = run(x + P);
+    assert_ne!(
+        public_cells(&forged, &public),
+        public_cells(&honest, &public),
+        "the bits of x + p differ"
+    );
+    assert!(!verifies(&program, &forged), "the bits of x + p");
+    assert_eq!(violated.len(), 1, "only the canonicality row breaks");
+}

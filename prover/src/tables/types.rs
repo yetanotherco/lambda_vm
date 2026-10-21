@@ -381,6 +381,19 @@ pub enum BusId {
     /// ID 35 rather than 29: 29 is a gap left by a removed bus and reusing it
     /// would make a stale artifact decode as this one.
     Blake3Absorb = 35,
+
+    // =========================================================================
+    // Field VM (`crate::field_vm`)
+    // =========================================================================
+    /// `FIELD_VM_DECODE[pc, imm..., flags, registers]`: the program lookup.
+    FieldVmDecode = 40,
+    /// `FIELD_VM_MEM[addr] -> value`: the read-only memory lookup.
+    FieldVmMem = 41,
+    /// `FIELD_VM_PUBLIC[addr, value]`: the public memory cells, closed by a
+    /// verifier-computed balance (the COMMIT-bus pattern).
+    FieldVmPublic = 42,
+    /// `FIELD_VM_STATE[pc, zero, registers]`: segment starts and ends.
+    FieldVmState = 43,
 }
 
 impl BusId {
@@ -414,6 +427,10 @@ impl BusId {
             BusId::LfmRange => "LfmRange",
             BusId::LfmPublic => "LfmPublic",
             BusId::Blake3Absorb => "Blake3Absorb",
+            BusId::FieldVmDecode => "FieldVmDecode",
+            BusId::FieldVmMem => "FieldVmMem",
+            BusId::FieldVmPublic => "FieldVmPublic",
+            BusId::FieldVmState => "FieldVmState",
         }
     }
 }
@@ -450,6 +467,10 @@ impl TryFrom<u64> for BusId {
             33 => Ok(BusId::LfmRange),
             34 => Ok(BusId::LfmPublic),
             35 => Ok(BusId::Blake3Absorb),
+            40 => Ok(BusId::FieldVmDecode),
+            41 => Ok(BusId::FieldVmMem),
+            42 => Ok(BusId::FieldVmPublic),
+            43 => Ok(BusId::FieldVmState),
             other => Err(other),
         }
     }
