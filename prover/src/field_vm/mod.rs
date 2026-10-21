@@ -14,7 +14,9 @@ pub mod generic_fold;
 pub mod isa;
 pub mod mem;
 pub mod mux;
+pub mod native_vbin;
 pub mod prove;
+pub mod rv64;
 pub mod whir;
 
 #[cfg(test)]
@@ -25,5 +27,8 @@ mod lfm_compare;
 pub(crate) mod lfm_translate;
 #[cfg(test)]
 mod prove_tests;
+#[cfg(test)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) mod split;
 #[cfg(test)]
 mod tests;
