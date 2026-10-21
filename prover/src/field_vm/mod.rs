@@ -7,12 +7,14 @@
 pub mod air;
 pub mod asm;
 pub mod bridge;
+pub mod cksum;
 pub mod decode;
 pub mod executor;
 pub mod isa;
 pub mod mem;
 pub mod mux;
 pub mod prove;
+pub mod whir;
 
 #[cfg(test)]
 pub(crate) mod hash_side;
