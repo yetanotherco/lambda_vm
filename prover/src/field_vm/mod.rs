@@ -17,6 +17,7 @@ pub mod mux;
 pub mod native_vbin;
 pub mod prove;
 pub mod rv64;
+pub mod vbin_generic;
 pub mod whir;
 
 #[cfg(test)]
