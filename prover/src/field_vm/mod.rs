@@ -10,6 +10,7 @@ pub mod bridge;
 pub mod cksum;
 pub mod decode;
 pub mod executor;
+pub mod generic_fold;
 pub mod isa;
 pub mod mem;
 pub mod mux;
