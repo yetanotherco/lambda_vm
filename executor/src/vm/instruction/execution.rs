@@ -17,6 +17,10 @@ pub enum SyscallNumbers {
     // Placeholder discriminant. The actual syscall value is
     // BLAKE3_ABSORB_SYSCALL_NUMBER.
     Blake3Absorb = 4,
+    // Placeholder discriminant. The actual syscall value is P1W16_SYSCALL_NUMBER.
+    P1w16Permute = 5,
+    // Placeholder discriminant. The actual syscall value is FP3MAC_SYSCALL_NUMBER.
+    Fp3Mac = 7,
     Commit = 64,
     Halt = 93,
     // Placeholder discriminant. The actual syscall value is ECSM_SYSCALL_NUMBER.
@@ -31,6 +35,27 @@ pub enum SyscallNumbers {
 /// Cannot be an enum discriminant because it exceeds isize::MAX.
 pub const KECCAK_SYSCALL_NUMBER: u64 = u64::MAX - 1;
 const KECCAK_STATE_BYTES: u64 = 25 * 8;
+
+/// Syscall number for the width-16 Poseidon1 permutation accelerator
+/// (u64::MAX - 5 = 0xFFFF_FFFF_FFFF_FFFA).
+///
+/// ABI: `x10` points to an 8-byte-aligned `[u64; 16]` Goldilocks state, permuted
+/// in place. Every input word must be canonical (`< p`): the chip range-checks
+/// the input and output encodings, so a non-canonical word would make the trace
+/// unprovable and is rejected here up front.
+pub const P1W16_SYSCALL_NUMBER: u64 = u64::MAX - 5;
+const P1W16_STATE_BYTES: u64 = 16 * 8;
+
+/// Syscall number for the cubic-extension multiply-add accelerator
+/// (u64::MAX - 7 = 0xFFFF_FFFF_FFFF_FFF8).
+///
+/// ABI: `x10` points to an 8-byte-aligned `[acc0, acc1, acc2, al0, al1, al2]`
+/// and `x11` to an 8-byte-aligned `[x0, x1, x2]`, Goldilocks words. In
+/// `Fp3 = Fp[t]/(t³ − 2)` it computes `acc ← acc·al + x` and writes the three
+/// `acc` words back in place. Every word read must be canonical (`< p`).
+pub const FP3MAC_SYSCALL_NUMBER: u64 = u64::MAX - 7;
+const FP3MAC_STATE_BYTES: u64 = 6 * 8;
+const FP3MAC_CELL_BYTES: u64 = 3 * 8;
 
 /// Syscall number for the BLAKE3 6-round compression accelerator
 /// (u64::MAX - 2 = 0xFFFF_FFFF_FFFF_FFFD).
@@ -190,6 +215,31 @@ const _: () = {
 /// largest per-access offset is added: the 32-byte operands reach offset +31 (last byte).
 const LOW_LIMB: u64 = 1 << 32;
 
+/// The Goldilocks prime, the bound every Poseidon1 state word must sit below.
+const GOLDILOCKS_P: u64 = math::field::goldilocks::GOLDILOCKS_PRIME;
+
+/// Width-16 Poseidon1 over canonical Goldilocks words, the host side of the
+/// accelerator: the permutation the LFM's `Hash16` rows use.
+pub fn p1w16_permute(state: [u64; 16]) -> [u64; 16] {
+    use crypto::hash::poseidon1_w16::{Fp, permute};
+    permute(state.map(Fp::from)).map(|v| v.canonical())
+}
+
+/// `acc·al + x` in `Fp[t]/(t³ − 2)` over canonical Goldilocks words, the host
+/// side of the FP3MAC accelerator: the prover's cubic extension.
+pub fn fp3mac(state: [u64; 6], x: [u64; 3]) -> [u64; 3] {
+    use math::field::element::FieldElement;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+    use math::field::goldilocks::GoldilocksField;
+    type Fp = FieldElement<GoldilocksField>;
+    type Fp3 = FieldElement<Degree3GoldilocksExtensionField>;
+    let ext = |w: [u64; 3]| Fp3::new(w.map(Fp::from));
+    let acc = ext([state[0], state[1], state[2]]);
+    let al = ext([state[3], state[4], state[5]]);
+    let out = acc * al + ext(x);
+    (*out.value()).map(|v| v.canonical())
+}
+
 impl TryFrom<u64> for SyscallNumbers {
     type Error = ();
     fn try_from(value: u64) -> Result<Self, Self::Error> {
@@ -201,6 +251,8 @@ impl TryFrom<u64> for SyscallNumbers {
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             v if v == BLAKE3_SYSCALL_NUMBER => Ok(SyscallNumbers::Blake3Compress),
             v if v == BLAKE3_ABSORB_SYSCALL_NUMBER => Ok(SyscallNumbers::Blake3Absorb),
+            v if v == P1W16_SYSCALL_NUMBER => Ok(SyscallNumbers::P1w16Permute),
+            v if v == FP3MAC_SYSCALL_NUMBER => Ok(SyscallNumbers::Fp3Mac),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
             v if v == HINT_SYSCALL_NUMBER => Ok(SyscallNumbers::Hint),
             _ => Err(()),
@@ -214,6 +266,8 @@ pub enum Accelerator {
     Keccak,
     Blake3,
     Ecsm,
+    P1w16,
+    Fp3Mac,
 }
 
 impl SyscallNumbers {
@@ -229,6 +283,8 @@ impl SyscallNumbers {
             // calls" that no longer track BLAKE3 rows.
             SyscallNumbers::Blake3Absorb => Some(Accelerator::Blake3),
             SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
+            SyscallNumbers::P1w16Permute => Some(Accelerator::P1w16),
+            SyscallNumbers::Fp3Mac => Some(Accelerator::Fp3Mac),
             SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
@@ -637,6 +693,62 @@ impl Instruction {
                         }
                         src2_val = state_addr;
                     }
+                    SyscallNumbers::P1w16Permute => {
+                        let state_addr = registers.read(10)?;
+                        if !state_addr.is_multiple_of(8) {
+                            return Err(ExecutionError::UnalignedP1w16StateAddress(state_addr));
+                        }
+                        state_addr
+                            .checked_add(P1W16_STATE_BYTES - 1)
+                            .ok_or(ExecutionError::P1w16StateAddressOverflow(state_addr))?;
+
+                        let mut state = [0u64; 16];
+                        for (i, lane) in state.iter_mut().enumerate() {
+                            *lane = memory.load_doubleword(state_addr + (i as u64) * 8)?;
+                            if *lane >= GOLDILOCKS_P {
+                                return Err(ExecutionError::P1w16NonCanonicalInput(*lane));
+                            }
+                        }
+                        for (i, lane) in p1w16_permute(state).iter().enumerate() {
+                            memory.store_doubleword(state_addr + (i as u64) * 8, *lane)?;
+                        }
+                        src2_val = state_addr;
+                    }
+                    SyscallNumbers::Fp3Mac => {
+                        let state_addr = registers.read(10)?;
+                        let cell_addr = registers.read(11)?;
+                        for (addr, bytes) in [
+                            (state_addr, FP3MAC_STATE_BYTES),
+                            (cell_addr, FP3MAC_CELL_BYTES),
+                        ] {
+                            if !addr.is_multiple_of(8) {
+                                return Err(ExecutionError::UnalignedFp3MacAddress(addr));
+                            }
+                            addr.checked_add(bytes - 1)
+                                .ok_or(ExecutionError::Fp3MacAddressOverflow(addr))?;
+                        }
+                        // The chip accesses all nine words at one timestamp.
+                        if state_addr < cell_addr + FP3MAC_CELL_BYTES
+                            && cell_addr < state_addr + FP3MAC_STATE_BYTES
+                        {
+                            return Err(ExecutionError::Fp3MacOverlap(state_addr, cell_addr));
+                        }
+                        let mut state = [0u64; 6];
+                        for (i, w) in state.iter_mut().enumerate() {
+                            *w = memory.load_doubleword(state_addr + (i as u64) * 8)?;
+                        }
+                        let mut x = [0u64; 3];
+                        for (i, w) in x.iter_mut().enumerate() {
+                            *w = memory.load_doubleword(cell_addr + (i as u64) * 8)?;
+                        }
+                        if let Some(&w) = state.iter().chain(&x).find(|&&w| w >= GOLDILOCKS_P) {
+                            return Err(ExecutionError::Fp3MacNonCanonicalInput(w));
+                        }
+                        for (i, w) in fp3mac(state, x).iter().enumerate() {
+                            memory.store_doubleword(state_addr + (i as u64) * 8, *w)?;
+                        }
+                        src2_val = state_addr;
+                    }
                     SyscallNumbers::Blake3Compress => {
                         // BLAKE3 6-round compression on a 176-byte region at the
                         // address in x10 (layout: see BLAKE3_SYSCALL_NUMBER docs).
@@ -1017,6 +1129,20 @@ pub enum ExecutionError {
     UnalignedKeccakStateAddress(u64),
     #[error("Keccak state address range overflows: {0:#018x}")]
     KeccakStateAddressOverflow(u64),
+    #[error("Unaligned Poseidon1 state address: {0:#018x}")]
+    UnalignedP1w16StateAddress(u64),
+    #[error("Poseidon1 state address range overflows: {0:#018x}")]
+    P1w16StateAddressOverflow(u64),
+    #[error("Poseidon1 input word is not a canonical Goldilocks element: {0:#018x}")]
+    P1w16NonCanonicalInput(u64),
+    #[error("Unaligned FP3MAC operand address: {0:#018x}")]
+    UnalignedFp3MacAddress(u64),
+    #[error("FP3MAC operand address range overflows: {0:#018x}")]
+    Fp3MacAddressOverflow(u64),
+    #[error("FP3MAC input word is not a canonical Goldilocks element: {0:#018x}")]
+    Fp3MacNonCanonicalInput(u64),
+    #[error("FP3MAC state {0:#018x} and cell {1:#018x} overlap")]
+    Fp3MacOverlap(u64, u64),
     #[error("Unaligned BLAKE3 state address: {0:#018x}")]
     UnalignedBlake3StateAddress(u64),
     #[error("BLAKE3 state address range overflows: {0:#018x}")]
