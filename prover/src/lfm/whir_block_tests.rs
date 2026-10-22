@@ -2662,11 +2662,12 @@ fn the_whir_block_tree_on_a_real_block() {
     );
     assert!(ok, "the block proof must verify");
     let t = std::time::Instant::now();
-    // The production verifier when the run is at its presets; the fixture form
-    // only when a knob moved the tree off them.
+    // The production verifier when the run is at its presets, given the run's
+    // group opening (`BLOCK_WHIR_GROUP`) as the CLI's `verify-block --group`
+    // gives it; the fixture form only when a knob moved the tree off them.
     let verdict =
         if leaves.is_none() && fan_in == BLOCK_FAN_IN && argue == BlockFormat::production().argue {
-            super::whir_block::verify_block_tree(&elf, proof.statement(), top)
+            super::whir_block::verify_block_tree_grouped(&elf, proof.statement(), top, format.group)
         } else {
             verify_block_tree_under(
                 &elf,
@@ -3078,13 +3079,15 @@ fn a_p1_block_leaf_refuses_a_tampered_witness() {
 
 // ============ D-ONECHAIN B2: the leaves over an `Indexed` block ============
 
-/// [`small_format`] at three polynomials a group under `base`, each group
-/// opened by one chain per run of its polynomials (`GroupFold::Indexed`).
-fn indexed_format(base: stark::proof::options::BaseFormat) -> BlockFormat {
+/// [`small_format`] at three polynomials a group under `base`, each group's
+/// tables argued per `argue` and its stacked polynomials opened by one chain
+/// per run of them (`GroupFold::Indexed`).
+fn indexed_format(base: stark::proof::options::BaseFormat, argue: ArgueFormat) -> BlockFormat {
     let small = small_format();
     BlockFormat {
         zf: small.zf.with_base(base),
         group_polys: 3,
+        argue,
         group: multilinear::whir_chain::GroupFold::Indexed,
         ..small
     }
@@ -3099,9 +3102,115 @@ fn indexed_format(base: stark::proof::options::BaseFormat) -> BlockFormat {
 #[test]
 #[ignore = "executes block leaves over small block proofs; box tier"]
 fn an_indexed_blocks_leaves_execute_and_refuse_a_grouped_forgery() {
+    indexed_leaves_execute_and_refuse_a_grouped_forgery(ArgueFormat::PerTable);
+}
+
+/// [`an_indexed_blocks_leaves_execute_and_refuse_a_grouped_forgery`] with each
+/// group's tables argued together (`ArgueFormat::BATCHED`), the argue
+/// production runs: the pairing a default would ship, every leaf executed.
+#[test]
+#[ignore = "executes block leaves over small block proofs; box tier"]
+fn an_indexed_blocks_leaves_execute_under_the_batched_argue() {
+    indexed_leaves_execute_and_refuse_a_grouped_forgery(ArgueFormat::BATCHED);
+}
+
+/// ★ The group opening is the leaf's constant too: a plan derived for the
+/// other mode, over a block proved under one, has no leaf that executes the
+/// proof's groups — the leaf programs of one mode refuse the other mode's
+/// base, both ways, whichever check or arena shape refuses first. The honest
+/// pairs execute.
+#[test]
+#[ignore = "proves small blocks and executes their leaves; box tier"]
+fn a_leaf_of_one_group_opening_refuses_the_others_base() {
+    use multilinear::whir_chain::GroupFold;
+    let base = crate::hash_pin::BLOCK_BASE;
+    let indexed = indexed_format(base, ArgueFormat::BATCHED);
+    let per_poly = BlockFormat {
+        group: GroupFold::PerPoly,
+        ..indexed
+    };
+    for (label, proved, other) in [
+        ("an Indexed base under PerPoly leaves", &indexed, &per_poly),
+        ("a PerPoly base under Indexed leaves", &per_poly, &indexed),
+    ] {
+        let (elf, proof) = small_block("all_instructions_64", proved);
+        let honest = plan_of(&elf, &proof, proved, Some(2));
+        for k in 0..honest.partition().num_leaves() {
+            run_leaf(&honest, &proof, k, LeafChecks::ALL)
+                .unwrap_or_else(|e| panic!("{label}: the honest leaf {k} refused: {e}"));
+        }
+        let crossed = plan_of(&elf, &proof, other, Some(2));
+        // `run_leaf` without its assertion: an arena of another length than
+        // the program hints is one more way the crossed leaf refuses.
+        let crossed_leaf = |k: usize| -> Result<(), String> {
+            let program = leaf_program_with(&crossed, k, LeafChecks::ALL)?;
+            let arenas = block_leaf_arena(&crossed, &proof, k)?;
+            if program.arena_schema.lens != vec![arenas[0].len() as u32] {
+                return Err(format!(
+                    "the arena holds {} words, the program hints {:?}",
+                    arenas[0].len(),
+                    program.arena_schema.lens
+                ));
+            }
+            execute(
+                &program,
+                &arenas,
+                &program.hasher(<BlockFamily as ProofFamily>::SOCKET),
+            )
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"))
+        };
+        let refused = (0..crossed.partition().num_leaves())
+            .filter(|&k| crossed_leaf(k).is_err())
+            .count();
+        println!(
+            "ONECHAIN CROSS LEAF {label}: {refused} of {} leaves refuse",
+            crossed.partition().num_leaves()
+        );
+        assert!(
+            refused > 0,
+            "{label}: a leaf of the other mode executed the base"
+        );
+        // Every leaf over a group the two modes open differently — one of
+        // two or more polynomials — refuses.
+        let frame = block_whir::block_frame(
+            proof.statement(),
+            &elf,
+            &ProofOptions::default_test_options(),
+            proved,
+        )
+        .expect("the frame");
+        let differ: Vec<usize> = frame
+            .stack_layouts
+            .iter()
+            .enumerate()
+            .filter(|(_, layout)| layout.num_polys() >= 2)
+            .map(|(g, _)| g)
+            .collect();
+        assert!(
+            !differ.is_empty(),
+            "{label}: a group of several polynomials"
+        );
+        for k in 0..crossed.partition().num_leaves() {
+            if crossed
+                .partition()
+                .leaf(k)
+                .iter()
+                .any(|g| differ.contains(g))
+            {
+                assert!(
+                    crossed_leaf(k).is_err(),
+                    "{label}: leaf {k} holds a group the modes open differently and executed"
+                );
+            }
+        }
+    }
+}
+
+fn indexed_leaves_execute_and_refuse_a_grouped_forgery(argue: ArgueFormat) {
     use multilinear::whir_chain::RoundOpenings;
     let base = crate::hash_pin::BLOCK_BASE;
-    let format = indexed_format(base);
+    let format = indexed_format(base, argue);
     let (elf, proof) = small_block("all_instructions_64", &format);
     let plan = plan_of(&elf, &proof, &format, Some(2));
     let grouped: Vec<(usize, usize)> = proof
@@ -3232,13 +3341,14 @@ fn an_indexed_blocks_leaves_execute_and_refuse_a_grouped_forgery() {
 /// executes.
 fn forged_prepared_chain(
     base: stark::proof::options::BaseFormat,
+    argue: ArgueFormat,
     stack: usize,
     group_polys: usize,
     pick: impl Fn(&[(usize, usize, usize)]) -> Option<(usize, usize, usize)>,
 ) {
     use super::whir_chain::onechain_steps::{self, Step};
     use multilinear::whir_chain::{GroupFold, RoundOpenings};
-    let small = indexed_format(base);
+    let small = indexed_format(base, argue);
     let mut zf = small.zf;
     zf.whir_stack = StackVars::new(stack).expect("a valid stack");
     let format = BlockFormat {
@@ -3367,9 +3477,11 @@ fn forged_prepared_chain(
 #[test]
 #[ignore = "proves small blocks and executes their leaves; box tier"]
 fn a_grouped_prepared_stack_verifies_and_its_leaf_refuses_a_forgery() {
-    forged_prepared_chain(crate::hash_pin::BLOCK_BASE, 8, 12, |chains| {
-        chains.iter().copied().find(|&(_, _, width)| width >= 2)
-    });
+    for argue in [ArgueFormat::PerTable, ArgueFormat::BATCHED] {
+        forged_prepared_chain(crate::hash_pin::BLOCK_BASE, argue, 8, 12, |chains| {
+            chains.iter().copied().find(|&(_, _, width)| width >= 2)
+        });
+    }
 }
 
 /// The code review's M-g: a prepared stack SPLIT into two chains. Under a stack
@@ -3380,7 +3492,13 @@ fn a_grouped_prepared_stack_verifies_and_its_leaf_refuses_a_forgery() {
 #[test]
 #[ignore = "proves small blocks and executes their leaves; box tier"]
 fn a_split_prepared_stack_refuses_a_forgery_in_its_last_chain() {
-    forged_prepared_chain(crate::hash_pin::BLOCK_BASE, 7, 24, |chains| {
+    for argue in [ArgueFormat::PerTable, ArgueFormat::BATCHED] {
+        split_prepared_stack_refuses_a_forgery_in_its_last_chain(argue);
+    }
+}
+
+fn split_prepared_stack_refuses_a_forgery_in_its_last_chain(argue: ArgueFormat) {
+    forged_prepared_chain(crate::hash_pin::BLOCK_BASE, argue, 7, 24, |chains| {
         chains.iter().copied().rfind(|&(k, i, _)| {
             i >= 1
                 && chains

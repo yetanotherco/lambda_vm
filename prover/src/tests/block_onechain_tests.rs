@@ -23,8 +23,14 @@ use stark::multilinear_table::batched::VerifierChecks;
 use stark::proof::options::{BaseFormat, ProofOptions};
 
 /// A stack of 2^10 and `group_polys` polynomials a group under `base`, so a
-/// small program spans several groups, opened per `group`.
-fn format(base: BaseFormat, group_polys: usize, group: GroupFold) -> BlockFormat {
+/// small program spans several groups, argued per `argue` and opened per
+/// `group`.
+fn format(
+    base: BaseFormat,
+    group_polys: usize,
+    group: GroupFold,
+    argue: ArgueFormat,
+) -> BlockFormat {
     let mut zf = ZfFormat::DEFAULT.with_base(base);
     zf.whir_stack = StackVars::new(10).expect("a valid stack");
     BlockFormat {
@@ -32,7 +38,7 @@ fn format(base: BaseFormat, group_polys: usize, group: GroupFold) -> BlockFormat
         group_polys,
         max_groups: block_whir::BLOCK_MAX_GROUPS,
         prepared: true,
-        argue: ArgueFormat::PerTable,
+        argue,
         group,
     }
 }
@@ -217,9 +223,48 @@ fn a_wide_singleton_group_splits_into_runs_of_four() {
 /// in one bit, the fold word's bit 47, so the transcript parts at the first
 /// absorb and the first group's argue refuses, before any opening's shape is
 /// read (the shapes' own refusals, `ChainCount` and the per-polynomial count,
-/// are `whir_group_tests`').
+/// are `whir_group_tests`'). Each group's tables argued one by one.
 #[test]
 fn an_indexed_block_round_trips_and_refuses_the_other_mode() {
+    let seen = round_trips_and_refuses_the_other_mode(ArgueFormat::PerTable, 2..=MAX_INDEX_POLYS);
+    // Runs of two, three and four each round-tripped and each was refused
+    // across the modes: the three budgets pack the program into all of them.
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        (2..=MAX_INDEX_POLYS).collect::<Vec<_>>(),
+        "a grouped run of every width from two to {MAX_INDEX_POLYS}"
+    );
+}
+
+/// [`an_indexed_block_round_trips_and_refuses_the_other_mode`] under the
+/// argue production runs, each group's tables argued together
+/// (`ArgueFormat::BATCHED`), at the production budget of three polynomials a
+/// group: the grouped opening takes its points and values from whichever
+/// argue ran, and this is the pairing a default would ship. The same round
+/// trip, the same equal roots, the statements one bit apart, and both
+/// cross-mode refusals at the statement, never at an opening's shape — over
+/// runs of two, three and four.
+#[test]
+fn an_indexed_block_round_trips_under_the_batched_argue() {
+    let seen = round_trips_and_refuses_the_other_mode(
+        ArgueFormat::BATCHED,
+        block_whir::BLOCK_GROUP_POLYS..=block_whir::BLOCK_GROUP_POLYS,
+    );
+    // The production budget packs the program into runs of every width: the
+    // tables of a group, and two tables alone in theirs split into fours.
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        (2..=MAX_INDEX_POLYS).collect::<Vec<_>>(),
+        "a grouped run of every width under the batched argue"
+    );
+}
+
+/// The round trip and the cross-mode refusals at each budget of `budgets`
+/// polynomials a group, under `argue`; returns the grouped run widths seen.
+fn round_trips_and_refuses_the_other_mode(
+    argue: ArgueFormat,
+    budgets: std::ops::RangeInclusive<usize>,
+) -> std::collections::BTreeSet<usize> {
     let elf = asm_elf_bytes("all_instructions_64");
     let opts = ProofOptions::default_test_options();
     let traced = |proof: &BlockWhirProof, format: &BlockFormat| {
@@ -228,9 +273,9 @@ fn an_indexed_block_round_trips_and_refuses_the_other_mode() {
     };
     let base = crate::hash_pin::BLOCK_BASE;
     let mut seen = std::collections::BTreeSet::new();
-    for group_polys in 2..=MAX_INDEX_POLYS {
-        let indexed = format(base, group_polys, GroupFold::Indexed);
-        let per_poly = format(base, group_polys, GroupFold::PerPoly);
+    for group_polys in budgets {
+        let indexed = format(base, group_polys, GroupFold::Indexed, argue);
+        let per_poly = format(base, group_polys, GroupFold::PerPoly, argue);
         let a = prove(&elf, &indexed, MaxRowsConfig::small());
         let b = prove(&elf, &per_poly, MaxRowsConfig::small());
         let widths = grouped_widths(&a);
@@ -366,14 +411,8 @@ fn an_indexed_block_round_trips_and_refuses_the_other_mode() {
             }
         }
     }
-    // Runs of two, three and four each round-tripped and each was refused
-    // across the modes: the three budgets pack the program into all of them.
-    println!("ONECHAIN B1-5 run widths seen: {seen:?}");
-    assert_eq!(
-        seen.into_iter().collect::<Vec<_>>(),
-        (2..=MAX_INDEX_POLYS).collect::<Vec<_>>(),
-        "a grouped run of every width from two to {MAX_INDEX_POLYS}"
-    );
+    println!("ONECHAIN B1-5 {argue:?} run widths seen: {seen:?}");
+    seen
 }
 
 /// The two modes' phase-A roots are one list (B2-sep). On a mismatch, names the
