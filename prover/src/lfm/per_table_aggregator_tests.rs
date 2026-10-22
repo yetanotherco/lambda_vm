@@ -3342,12 +3342,11 @@ fn the_production_leaf_node_measures() {
 /// ★ THE TREE'S SHAPE COMES FROM THE EPOCH COUNT, not a constant.
 ///
 /// Pure arithmetic — no proving, so it runs on every suite. It exists because
-/// the shape was twice planned against a number that was not the block's, and
-/// once in each direction. Block 25368371 is **39,631,559** cycles: 10 epochs at
-/// 2^22, **19 at 2^21**. The retired **74,819,518** — the July prebuilt guest,
-/// ~47% dearer at identical work — gives 18 and 36 instead, i.e. a tree a whole
-/// level too deep. A tree built to a constant answers whichever question that
-/// constant came from.
+/// the shape was planned more than once against a number that was not the
+/// block's. Block 25368371 is **23,935,913** cycles: 6 epochs at 2^22, **12 at
+/// 2^21**. The retired **74,819,518** — the July prebuilt guest, ~3x dearer at
+/// identical work — gives 18 and 36 instead, i.e. a tree two levels too deep. A
+/// tree built to a constant answers whichever question that constant came from.
 ///
 /// ⚠ **2^21 is the posture of record.** 2^22 does not fit a 32 GiB card at
 /// blowup 4 — the resident per-table LDE + snapshot + tree roughly doubles from
@@ -3364,10 +3363,11 @@ fn the_tree_shape_matches_the_epoch_count() {
     use super::per_table_aggregator::{tree_node_count, tree_shape};
 
     // The real block, both postures. Epoch counts are `ceil(cycles / 2^k)` for
-    // block 25368371's **30,498,818** cycles, the guest PR #894 bumped the
-    // ethrex rev to.
+    // block 25368371's **23,935,913** cycles: the guest built with fat LTO over
+    // one codegen unit, the runtime's own memcpy and the Keccak final block
+    // absorbed without its buffer.
     //
-    // ⚠ TWO stale figures now, and they went stale the same way.
+    // ⚠ THREE stale figures now, and they went stale the same way.
     //
     // 74,819,518 is the JULY prebuilt guest; thin-LTO and the accelerators made
     // it ~47% cheaper at identical work — same block, same keccak 10,478, same
@@ -3379,18 +3379,22 @@ fn the_tree_shape_matches_the_epoch_count() {
     // 39,631,559 is the 2026-09-07 guest, and it is what THIS comment said
     // until #894. That bump cost another ~23% at identical work, so the 2^21
     // posture went from 19 epochs to 15 and the 2^22 posture from 10 to 8 —
-    // one whole level off the fan-in-2 tree in both. Nothing failed when it
-    // changed: every number below is a literal, so the test went on passing
-    // while describing a block this repository no longer proves. Any epoch
-    // count, tree shape or IDENTITY-line count derived from either old figure
-    // is stale, and that includes saved run logs.
+    // one whole level off the fan-in-2 tree in both.
+    //
+    // 30,498,818 is the #894 guest. The guest build that followed (fat LTO,
+    // the runtime memcpy, the leaner Keccak final block) cost 21.5% less at
+    // identical work: 15 epochs became 12 at 2^21 and 8 became 6 at 2^22.
+    // Nothing failed when either changed: every number below is a literal, so
+    // the test went on passing while describing a block this repository no
+    // longer proves. Any epoch count, tree shape or IDENTITY-line count derived
+    // from an old figure is stale, and that includes saved run logs.
     for (epochs, fan_in, levels, nodes) in [
-        (8usize, 2usize, 3usize, 7usize), // 2^22: 8 -> 4 -> 2 -> 1
-        (8, 3, 2, 4),                     // 2^22: 8 -> 3 -> 1
-        (15, 2, 4, 15),                   // 2^21: 15 -> 8 -> 4 -> 2 -> 1
-        (15, 3, 3, 8),                    // 2^21: 15 -> 5 -> 2 -> 1
-        (15, 4, 2, 5),                    // 2^21, fan-in 4 (the WHIR tree's opt-out): 15 -> 4 -> 1
-        (15, 5, 2, 4), // 2^21, pure WHIR's default (the WHIR tree only): 15 -> 3 -> 1
+        (6usize, 2usize, 3usize, 6usize), // 2^22: 6 -> 3 -> 2 -> 1
+        (6, 3, 2, 3),                     // 2^22: 6 -> 2 -> 1
+        (12, 2, 4, 12),                   // 2^21: 12 -> 6 -> 3 -> 2 -> 1
+        (12, 3, 3, 7),                    // 2^21: 12 -> 4 -> 2 -> 1
+        (12, 4, 2, 4),                    // 2^21, fan-in 4 (the WHIR tree's opt-out): 12 -> 3 -> 1
+        (12, 5, 2, 4), // 2^21, pure WHIR's default (the WHIR tree only): 12 -> 3 -> 1
     ] {
         let shape = tree_shape(epochs, fan_in);
         assert_eq!(
@@ -3437,14 +3441,13 @@ fn the_tree_shape_matches_the_epoch_count() {
     };
 
     // The shipped posture. ⚠ It is WEAKER than it was: at 19 epochs this was 3
-    // short levels (19, 5 and 3 all left one over), and at 15 it is 1 — the
-    // 15 -> 8 level — because 8, 4 and 2 are all even. At the 2^22 posture it
-    // is 0: `8 -> 4 -> 2 -> 1` never leaves a leftover at all. So the real
-    // block no longer covers this rule on its own.
+    // short levels (19, 5 and 3 all left one over), and at 12 it is 1 — the
+    // 3 -> 2 level — because 12 and 6 are even. So the real block no longer
+    // covers this rule on its own.
     assert_eq!(
-        short_levels(15, 2),
+        short_levels(12, 2),
         1,
-        "15 at fan-in 2 must still exercise the leftover rule at least once"
+        "12 at fan-in 2 must still exercise the leftover rule at least once"
     );
     assert_eq!(
         short_levels(8, 2),
@@ -3463,19 +3466,19 @@ fn the_tree_shape_matches_the_epoch_count() {
         "the synthetic shape must exercise the leftover rule on three levels"
     );
     assert!(
-        short_levels(15, 3) >= 2,
+        short_levels(12, 3) >= 2,
         "fan-in 3 at the shipped epoch count must leave a short node on at \
          least two levels"
     );
     assert_eq!(
-        short_levels(15, 4),
+        short_levels(12, 4),
         1,
-        "fan-in 4 leaves its one short node at level 1 (4 / 4 / 4 / 3)"
+        "fan-in 4 fills level 1 (4 / 4 / 4); its short node is the root's level (3)"
     );
     assert_eq!(
-        short_levels(15, 5),
-        1,
-        "pure WHIR's default fills level 1 (5 / 5 / 5); its short node is the root's level"
+        short_levels(12, 5),
+        2,
+        "pure WHIR's default leaves a short node at level 1 (5 / 5 / 2) and at the root's level (3)"
     );
 }
 

@@ -827,15 +827,17 @@ mod tests {
 
         // ---- the real tree, with the real numbers from the box log.
         //
-        // ⚠ 15 epochs, not 19: PR #894's guest runs block 25368371 in
-        // 30,498,818 cycles, so the 2^21 posture lost a level. Every number in
-        // this block moved with it, and NONE of them would have failed — they
-        // are literals about a tree the repository no longer builds.
-        let real = outputs(15, 2);
+        // ⚠ 12 epochs, not 19 or 15: the guest runs block 25368371 in
+        // 23,935,913 cycles (30,498,818 for PR #894's build, 39,631,559 before
+        // it). Every number in this block moved with it each time, and NONE of
+        // them would have failed — they are literals about a tree, so a stale
+        // one goes on passing while describing a tree the repository no longer
+        // builds.
+        let real = outputs(12, 2);
         assert_eq!(
             real,
-            vec![15, 8, 4, 2, 1],
-            "15 epochs at fan-in 2 is the tree that is proved and cached; if this              moved, every number below is about a different tree"
+            vec![12, 6, 3, 2, 1],
+            "12 epochs at fan-in 2 is the tree that is proved and cached; if this              moved, every number below is about a different tree"
         );
         let top = real.len() - 1;
         assert_eq!(top, 4, "four node levels");
@@ -844,13 +846,13 @@ mod tests {
         assert_eq!(real[RootOption::A.child_level(top)], 2, "A takes 2 nodes");
         assert_eq!(real[RootOption::B.child_level(top)], 1, "B takes 1 node");
         // ⛔ The mis-capture, named: one level below A's is a DIFFERENT count.
-        // It was 3 at 19 epochs and is 4 at 15 — the POINT is that it differs
-        // from A's 2, which is what the emitter's guard compares, and that
-        // survives the bump.
+        // It was 3 at 19 epochs, 4 at 15 and is 3 at 12 — the POINT is that it
+        // differs from A's 2, which is what the emitter's guard compares, and
+        // that survives every bump.
         assert_eq!(
             real[RootOption::A.child_level(top) - 1],
-            4,
-            "level 3's INPUT is 4 nodes — the shape the emitter's guard reports as              `right` against its `left: 2`"
+            3,
+            "level 3's INPUT is 3 nodes — the shape the emitter's guard reports as              `right` against its `left: 2`"
         );
 
         // ---- and the rule generally: the level an option names carries exactly
