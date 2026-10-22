@@ -637,7 +637,7 @@ fn copy_constraints_count_and_indices() {
     use crate::tables::copy::CopyConstraints;
     use stark::constraints::builder::ConstraintSet;
     let meta = CopyConstraints.meta();
-    assert_eq!(meta.len(), 37);
+    assert_eq!(meta.len(), 39);
     // Dense, idx-ordered.
     for (i, m) in meta.iter().enumerate() {
         assert_eq!(m.constraint_idx, i);
@@ -717,6 +717,81 @@ fn a_wide_row_needs_eight_bytes_remaining() {
     assert!(
         validate_busless(&air, &legal),
         "a wide row with exactly eight bytes left must be accepted"
+    );
+}
+
+/// A chain may not walk off the top of the address space.
+///
+/// `src_incr`/`dst_incr` come out of a plain `ADD`, whose high carry the spec leaves
+/// a free bit, so without the two constraints at the end of `eval` a chain can pass
+/// `2^64` and resume at `0`. Nothing else in the chip objects: `count` decrements
+/// independently of the two positions, so such a chain still terminates, and every
+/// row still reads and writes PAGE-backed cells. The executor refuses the operand
+/// range outright (`src.checked_add(n)`), so this is the acceptance-set gap those
+/// constraints close.
+#[test]
+fn a_chain_may_not_wrap_the_address_space() {
+    let air = air();
+
+    // `src + 8` lands exactly on `2^64`.
+    let wrapping_src = generate_copy_trace(&[row_of_width(
+        Functionality::Copy,
+        16,
+        8,
+        true,
+        false,
+        u64::MAX - 7,
+        0x2000,
+    )]);
+    assert!(
+        !validate_busless(&air, &wrapping_src),
+        "a row whose source walks past 2^64 must be rejected"
+    );
+
+    let wrapping_dst = generate_copy_trace(&[row_of_width(
+        Functionality::Copy,
+        16,
+        8,
+        true,
+        false,
+        0x1000,
+        u64::MAX - 7,
+    )]);
+    assert!(
+        !validate_busless(&air, &wrapping_dst),
+        "a row whose destination walks past 2^64 must be rejected"
+    );
+
+    // The gate is `mu`, not `mu - end`: the executor rejects a copy that ends on
+    // `2^64` too, because `checked_add` returns `None` there.
+    let wrapping_end = generate_copy_trace(&[row_of_width(
+        Functionality::Copy,
+        8,
+        8,
+        true,
+        true,
+        u64::MAX - 7,
+        0x2000,
+    )]);
+    assert!(
+        !validate_busless(&air, &wrapping_end),
+        "the last row of a chain may not wrap either"
+    );
+
+    // One byte below the boundary the same row is legal, so it is the wraparound
+    // being rejected and not the magnitude of the address.
+    let legal = generate_copy_trace(&[row_of_width(
+        Functionality::Copy,
+        16,
+        8,
+        true,
+        false,
+        u64::MAX - 15,
+        0x2000,
+    )]);
+    assert!(
+        validate_busless(&air, &legal),
+        "a chain ending exactly at the top of the address space must be accepted"
     );
 }
 

@@ -33,9 +33,13 @@
 //! propagates its first bytes across the range: `memset`. `old_ts < ts` holds strictly
 //! either way, so the memory argument is undisturbed.
 //!
-//! `memset` needs no special handling here at all. Its stub seeds the first eight
-//! bytes with an ordinary store and calls with `(dst = seed_end, src = seed_start,
-//! count = n - 8)`, so the chip sees a plain overlapping memmove.
+//! `memset` reuses the copy path, but not without a constraint of its own. Its stub
+//! seeds the first eight bytes with an ordinary store and calls with
+//! `(dst = seed_end, src = seed_start, count = n - 8)`, so the chip sees an
+//! overlapping memmove -- and `copy:c:set_gap` is what pins that overlap to exactly
+//! `dst = src + 8`. Drop it and `dst == src` becomes provable, where a row's read and
+//! its write hit the same cell at adjacent timestamps and all eight lanes go free:
+//! an arbitrary memory write. See the comment on `set_gap` in `eval`.
 //!
 //! ## Return value
 //!
@@ -84,8 +88,8 @@
 //!   and a degree-2 constraint. The RAM write needs none: it rides
 //!   `mu - count_borrows[1] - mu_com` directly, which is the same product expanded.
 //!
-//! Three divergences from the spec's 34, all representational and all recorded in
-//! `shape_tests`: the spec types `timestamp` as a `Word` where this code uses a
+//! Three divergences in the columns from the spec's 34, all representational and all
+//! recorded in `shape_tests`: the spec types `timestamp` as a `Word` where this code uses a
 //! `DWordWL`; it types the three increments and `dst_res` as `DWordWHH`
 //! (`Half, Half, Word`) where this code uses `DWordHL` (four `Half`s). `IS_WHH`
 //! decomposes into an `IS_WH` chip this prover does not have; four `IS_HALF`
@@ -93,7 +97,14 @@
 //! column each. `mu_com`/`mu_com_wide` are the COMMIT-bus gate the spec does not
 //! need because it writes the committed bytes through `MEMW` in domain `2·is_write`.
 //!
-//! One consequence of that last divergence is worth stating here rather than leaving
+//! A fourth divergence is not representational: constraints 37 and 38 pin the carry
+//! out of `src + step` and `dst + step` to zero on active rows. The spec has neither
+//! -- its `ADD` template range-checks both carries as bits and stops there -- and
+//! without them the chip accepts chains that wrap the address space, which the
+//! executor refuses outright. Extra constraints only ever narrow the acceptance set,
+//! so this is soundness-safe; it narrows it to the executor's.
+//!
+//! One consequence of that last column divergence is worth stating here rather than leaving
 //! for a reader to find: the `Commit` bus carries the index as `dst[0]` alone, while
 //! the verifier enumerates `start_index + i` over a `u64`. The two agree only while
 //! the running commit index stays below `2^32`, and `x254`'s high word is pinned to
@@ -105,7 +116,9 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use crate::constraints::templates::{AddLinearTerm, AddOperand, emit_add_pair, emit_is_bit};
+use crate::constraints::templates::{
+    AddLinearTerm, AddOperand, add_pair_carry_hi, emit_add_pair, emit_is_bit,
+};
 
 use executor::vm::instruction::execution::{
     DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_GAP, DMA_MEMSET_SYSCALL_NUMBER,
@@ -145,9 +158,9 @@ pub mod cols {
 
     pub const SRC_0: usize = 10;
     pub const SRC_1: usize = 11;
-    /// `src + step`, four halfwords. Plain `ADD`: the carry out of the high limb is
-    /// a free bit, so this may wrap — nothing downstream consumes a wrapped value,
-    /// because a chain that wraps can no longer terminate.
+    /// `src + step`, four halfwords. The `ADD` leaves the carry out of the high limb
+    /// free; constraints 37 and 38 pin it to zero on active rows, so a chain cannot
+    /// walk past the top of the address space. See the end of `eval`.
     pub const SRC_INCR_0: usize = 12;
 
     pub const DST_0: usize = 16;
@@ -799,13 +812,11 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CopyConstraints {
             &[],
         );
 
-        // copy:c:src_incr and copy:c:dst_incr, plain `ADD`: the carry
-        // out of the high limb is a free bit, so a chain's position may wrap 2^64.
-        // Nothing here forbids that, and nothing here needs to -- but not for the
-        // reason this comment used to give. `count` decrements independently of the
-        // two positions, so a wrapping chain terminates perfectly well. What stops it
-        // is what carries `set_gap` below: a wrapped address has no PAGE-backed token
-        // on the `Memory` bus, and the executor refuses the operand range outright.
+        // copy:c:src_incr and copy:c:dst_incr, plain `ADD`. The carry out of the high
+        // limb is free here, exactly as the spec's `ADD` leaves it; the two
+        // constraints at the end of `eval` are what forbid it. Nothing else does:
+        // `count` decrements independently of the two positions, so a wrapping chain
+        // terminates perfectly well.
         emit_add_pair(
             b,
             10,
@@ -947,10 +958,40 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CopyConstraints {
         // `mu_com` restricts it to `write` rows and `mu_com_wide` to wide ones.
         b.emit_base(
             35,
-            b.main(0, cols::MU_COM) - (mu - borrow_1) * b.main(0, cols::IS_WRITE),
+            b.main(0, cols::MU_COM) - (mu.clone() - borrow_1) * b.main(0, cols::IS_WRITE),
         );
         let mu_com = b.main(0, cols::MU_COM);
         b.emit_base(36, b.main(0, cols::MU_COM_WIDE) - mu_com * (one - single));
+
+        // No chain may wrap the address space. The two `ADD`s above leave the carry
+        // out of `src + step` and `dst + step` free -- that is the spec's `ADD`, and
+        // the `ADDNW` the DMA chip used for exactly this is gone. Unconstrained, a
+        // chain walks off the top of the address space and resumes at 0: every row
+        // still reads and writes PAGE-backed cells at consistent timestamps, so the
+        // memory argument balances and no byte value is forged, but the verifier
+        // accepts a copy the executor refuses (`src.checked_add(n)` and
+        // `dst.checked_add(n)` in `execution.rs`). An acceptance set wider than the
+        // VM's is the one thing a proof of execution may not have.
+        //
+        // Gating on `mu` and not `mu - end` is what matches the executor: it rejects
+        // a copy ending exactly on `2^64` too, since `checked_add` returns `None`
+        // there. Padding rows carry `mu = 0` and are unaffected.
+        //
+        // Neither constraint is in the spec; see the divergence note at the top.
+        let src_carry_hi = add_pair_carry_hi(
+            b,
+            &AddOperand::dword(cols::SRC_0),
+            &step,
+            &AddOperand::from_dword_hl(cols::SRC_INCR_0),
+        );
+        b.emit_base(37, mu.clone() * src_carry_hi);
+        let dst_carry_hi = add_pair_carry_hi(
+            b,
+            &AddOperand::dword(cols::DST_0),
+            &step,
+            &AddOperand::from_dword_hl(cols::DST_INCR_0),
+        );
+        b.emit_base(38, mu * dst_carry_hi);
     }
 
     /// `restrict_end` multiplies `end`, `1 - count_borrows[1]` and a `count` limb,
