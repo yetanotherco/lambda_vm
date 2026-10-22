@@ -10,6 +10,7 @@
 //! LAMBDA_VM_ZF_WHIR_GRIND  query | all                    WHIR proof of work: before the queries only, or all three (P2)
 //! LAMBDA_VM_ZF_WHIR_GRIND_BITS  20 | 18               WHIR proof-of-work bits; Q buys back what the grind gives up
 //! LAMBDA_VM_ZF_WHIR_BLOWUP  4 | 2                     WHIR base code blowup (rate 1/4 or 1/2); Q follows from the rate
+//! LAMBDA_VM_ZF_WHIR_LEAVES  natural | coset           WHIR round-0 leaf order (coset: Poseidon1 trees only)
 //! ```
 //!
 //! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration:
@@ -17,8 +18,9 @@
 //! whir_grind_bits=18`. Each lever was measured net positive on block runs before it became the
 //! default. Every knob keeps its OFF spelling (`cap=off`, `whir_cap=off`,
 //! `fri=pair`, `one_row=0`, `whir_folds=uniform4`, `whir_stack=25`, `whir_grind=all`,
-//! `whir_grind_bits=20`, `whir_blowup=4` — the WHIR blowup's default is its off), so setting all nine to off reproduces [`ZfFormat::LEGACY`] — the format before any lever, byte for
-//! byte — for rollback and for A/B arms. The crypto crates' own defaults
+//! `whir_grind_bits=20`, `whir_blowup=4`, `whir_leaves=natural` — the WHIR blowup's and the leaf
+//! order's defaults are their offs), so setting all ten to off reproduces [`ZfFormat::LEGACY`] — the
+//! format before any lever, byte for byte — for rollback and for A/B arms. The crypto crates' own defaults
 //! (`stark::proof::options::ProofFormat::DEFAULT`,
 //! `multilinear::whir_chain::ChainFormat::DEFAULT`) stay the legacy format: a
 //! library value built without a format is the legacy one, and the production
@@ -51,8 +53,8 @@
 //! **The banner prints on every setting, including the default**:
 //! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27 whir_grind=query
 //! whir_grind_bits=18`. Its absence in a log is then a fact about the run, not an ambiguity. The WHIR blowup
-//! is the one word printed only off its default (` whir_blowup=2`), so a default run's banner is the
-//! banner every earlier run printed.
+//! and the leaf order are the two words printed only off their defaults (` whir_blowup=2`,
+//! ` whir_leaves=coset`), so a default run's banner is the banner every earlier run printed.
 
 use std::sync::OnceLock;
 
@@ -324,7 +326,7 @@ impl ZfFormat {
         whir_leaves: LeafOrder::Natural,
     };
 
-    /// The legacy format: every lever off. What all nine knobs at their
+    /// The legacy format: every lever off. What all ten knobs at their
     /// OFF spellings select, what the crypto crates' own defaults are, and the
     /// only format the RV64 recursion guest verifies.
     pub const LEGACY: Self = Self {
@@ -376,7 +378,7 @@ impl ZfFormat {
         self.whir_blowup.trailing_zeros() as usize
     }
 
-    /// Parse the nine knobs through `lookup` (the process environment in
+    /// Parse the ten knobs through `lookup` (the process environment in
     /// production, a map in tests). An unset knob is [`Self::DEFAULT`]'s value; a set one
     /// must be one of the accepted spellings (surrounding whitespace and case
     /// are ignored, as for `LAMBDA_VM_WHIR_HASH`).
