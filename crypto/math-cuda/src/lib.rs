@@ -55,6 +55,7 @@ pub mod rpx;
 pub mod rpx_paths;
 pub mod sumcheck;
 pub mod whir;
+pub mod whir_coset;
 pub mod whir_open;
 
 // Re-exported for downstream crates so they can refer to CUDA primitive
