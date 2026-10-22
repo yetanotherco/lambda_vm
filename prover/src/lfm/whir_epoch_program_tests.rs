@@ -34,8 +34,16 @@ use super::word::{LfmWord, ext_word, word_as_ext};
 /// Epoch 0 of block 25368371 at `epoch_size_log2 = 21`, `(width, num_vars)` per
 /// table in sub-proof order, on the OLD guest: the ethrex guest as it was built
 /// before it moved to fat LTO, the runtime's own memcpy and the leaner Keccak
-/// final block. That guest is still a valid program and these are still its
-/// shapes; the guest built today runs this epoch at other heights.
+/// final block, and at the CODE of that run. That guest is still a valid
+/// program; the guest built today runs this epoch at other heights
+/// ([`current_guest_epoch_zero_shapes`]).
+///
+/// ⚠ AND TODAY'S CODE NO LONGER COMMITS THE SEVEN `2^2` TABLES BELOW (COMMIT,
+/// KECCAK, KECCAK_RND, ECSM, ECDAS, HINT, DVRM): they hold no real row in this
+/// epoch, and a table with no real row is now left out. The same old guest's
+/// epoch 0 is 27 tables today, and those 27 are the rows below unchanged, in
+/// order (a box run of `whir_epoch_shapes` on 2026-10-22, production caps). The
+/// recount keeps the 34 because its other inputs were measured with them.
 ///
 /// ⚠ A FIXTURE READ FROM A BOX RUN, not a laptop measurement: the file is
 /// `thoughts/shared/whir-recursion/handoffs/sh1-epoch-shapes-2026-09-18.log`,
@@ -86,6 +94,87 @@ fn epoch_zero_shapes() -> Vec<(usize, usize)> {
         (38, 10),  // CPU32[0]
         (9, 21),   // the l2g bookend, committed alone in the last group
     ]
+}
+
+/// Epoch 0 of block 25368371 at `epoch_size_log2 = 21` on the guest built at
+/// 90e9dde5b (ELF sha256
+/// `3e8f1ce152d4d3cd60809ee7fc537e5c4f12145efec1881052c28119ff6a5482`,
+/// 2,711,800 B, the box build every block reference since is tied to),
+/// `(width, num_vars)` per table in sub-proof order, at the production table
+/// caps and today's code.
+///
+/// ⚠ A FIXTURE READ FROM A BOX RUN of `whir_epoch_shapes` (2026-10-22), next
+/// to a control run on the old guest that reproduced [`epoch_zero_shapes`] less
+/// the seven tables that hold no real row. Its own line for this epoch read
+/// `tables 29 cells 294290368 | group0 n_stack 27 polys 3 | bookend n_stack 25
+/// polys 1 | chains 4 rounds 28 | Q 114`, under the default format.
+fn current_guest_epoch_zero_shapes() -> Vec<(usize, usize)> {
+    vec![
+        (21, 20), // BITWISE
+        (6, 19),  // DECODE
+        (10, 5),  // KECCAK_RC
+        (5, 7),   // REGISTER
+        (38, 19), // CPU[0]
+        (38, 19), // CPU[1]
+        (38, 19), // CPU[2]
+        (38, 19), // CPU[3]
+        (17, 18), // LT[0]
+        (17, 18), // LT[1]
+        (17, 18), // LT[2]
+        (17, 20), // LT[3]
+        (17, 17), // LT[4]
+        (29, 16), // SHIFT[0]
+        (49, 19), // MEMW[0]
+        (29, 19), // MEMW_A[0]
+        (29, 19), // MEMW_A[1]
+        (18, 20), // LOAD[0]
+        (26, 11), // MUL[0]
+        (14, 15), // BRANCH[0]
+        (10, 20), // MEMW_R[0]
+        (10, 20), // MEMW_R[1]
+        (10, 20), // MEMW_R[2]
+        (10, 20), // MEMW_R[3]
+        (12, 13), // EQ[0]
+        (26, 15), // BYTEWISE[0]
+        (16, 20), // STORE[0]
+        (38, 11), // CPU32[0]
+        (9, 21),  // the l2g bookend, committed alone in the last group
+    ]
+}
+
+/// ★ THE GUEST BUILT TODAY, EPOCH 0: the stacking the code derives from the
+/// measured shapes is the one the box printed for the same epoch.
+///
+/// Every number asserted here is a function of [`current_guest_epoch_zero_shapes`]
+/// and the code, and each equals a field of the box's own line, so a change to
+/// the stacker or the default format that moves this epoch's layout shows up
+/// here by name.
+#[test]
+fn the_current_guests_epoch_zero_stacks_as_the_box_printed() {
+    let shapes = current_guest_epoch_zero_shapes();
+    assert_eq!(shapes.len(), 29, "epoch 0 is 29 tables");
+    let cells: u64 = shapes.iter().map(|&(w, v)| (w as u64) << v).sum();
+    assert_eq!(cells, 294_290_368, "the box's cells");
+    let sizes = epoch_groups(shapes.len());
+    assert_eq!(sizes, vec![28, 1], "the bookend is committed alone");
+    let config =
+        crate::multilinear_prove::chain_config_under(&crate::zf_format::ZfFormat::DEFAULT, &shapes);
+    let (layouts, _domains) = stacks(&shapes, &sizes, &config).expect("the epoch's stacks build");
+    assert_eq!(layouts.len(), 2, "two commitment groups");
+    assert_eq!(layouts[0].n_stack(), 27, "group0 n_stack 27");
+    assert_eq!(layouts[0].num_polys(), 3, "group0 polys 3");
+    assert_eq!(layouts[1].n_stack(), 25, "bookend n_stack 25");
+    assert_eq!(layouts[1].num_polys(), 1, "bookend polys 1");
+    let chains: usize = layouts.iter().map(|l| l.num_polys()).sum();
+    assert_eq!(chains, 4, "chains 4");
+    // The box line's `rounds` column, computed the way `whir_epoch_shapes`
+    // computes it.
+    let rounds: usize = layouts
+        .iter()
+        .map(|l| l.num_polys() * l.n_stack().div_ceil(config.log_folding))
+        .sum();
+    assert_eq!(rounds, 28, "rounds 28");
+    assert_eq!(config.num_queries, 114, "Q 114");
 }
 
 /// The per-table half, from `bs2-table-costs-2026-09-19.log`: 34 tables'
