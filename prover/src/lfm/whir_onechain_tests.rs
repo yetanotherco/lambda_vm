@@ -17,7 +17,8 @@ use multilinear::stacked_eval::{Claimed, Refusal, StackedCommitment, StackedProo
 use multilinear::stacking::StackedLayout;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{
-    CapPolicy, ChainConfig, ChainFormat, FirstFold, GrindBits, GroupFold, RoundOpenings, WhirFolds,
+    CapPolicy, ChainConfig, ChainFormat, FirstFold, GrindBits, GroupFold, LeafOrder, RoundOpenings,
+    WhirFolds,
 };
 use multilinear::whir_commit::Commitment;
 use multilinear::whir_hash::{P1Whir, RpxWhir, WhirHash};
@@ -55,8 +56,9 @@ enum Base {
 }
 
 /// One case: columns' heights in a stack of `n_stack`, the fold schedule,
-/// `Q`, a uniform grind, and the base's cap (binary under RPX, 4-ary under
-/// Poseidon1). Every column is claimed at a point of its own.
+/// `Q`, a uniform grind, the base's cap (binary under RPX, 4-ary under
+/// Poseidon1) and the round-0 trees' leaf order. Every column is claimed at a
+/// point of its own.
 struct Case {
     name: &'static str,
     base: Base,
@@ -68,6 +70,7 @@ struct Case {
     num_queries: usize,
     grind: u8,
     cap: CapPolicy,
+    leaves: LeafOrder,
 }
 
 fn rpx(name: &'static str, heights: &[usize], n_stack: usize, grind: u8) -> Case {
@@ -82,6 +85,7 @@ fn rpx(name: &'static str, heights: &[usize], n_stack: usize, grind: u8) -> Case
         num_queries: 3,
         grind,
         cap: CapPolicy::Off,
+        leaves: LeafOrder::Natural,
     }
 }
 
@@ -143,6 +147,7 @@ fn config(case: &Case) -> ChainConfig {
             WhirFolds::First(FirstFold::new(k).expect("a tested first fold"))
         }),
         group: GroupFold::Indexed,
+        leaves: case.leaves,
         ..ChainFormat::DEFAULT
     };
     match case.base {
@@ -643,6 +648,7 @@ fn at_blowup(case: &Case, log_blowup: usize) -> Case {
         num_queries: case.num_queries,
         grind: case.grind,
         cap: case.cap,
+        leaves: case.leaves,
     }
 }
 
@@ -700,6 +706,85 @@ fn grouped_openings_at_blowup_2_execute_and_are_refused_at_blowup_4() {
             "{}: the machine at blowup 4 must refuse it",
             half.name
         );
+    }
+}
+
+/// `case` with its round-0 trees in `leaves`' order, everything else the same.
+fn in_order(case: &Case, leaves: LeafOrder) -> Case {
+    Case {
+        leaves,
+        ..at_blowup(case, case.log_blowup)
+    }
+}
+
+/// Whether the host verifier of `f`'s config accepts `proof` over `roots`,
+/// which may be another fixture's.
+fn host_accepts_under(f: &Fixture, roots: &[Commitment], proof: &StackedProof<F, E>) -> bool {
+    macro_rules! accepts {
+        ($h:ty, $t:expr) => {
+            multilinear::stacked_eval::verify::<F, E, _, $h>(
+                proof,
+                &f.layout,
+                roots,
+                &Claimed::PerColumn(&f.points),
+                &f.values,
+                &f.domain,
+                &f.cfg,
+                &mut $t,
+            )
+            .is_ok()
+        };
+    }
+    match f.base {
+        Base::Rpx => accepts!(RpxWhir, RpxHost::new(&[])),
+        Base::P1 => accepts!(P1Whir, P1Transcript::new()),
+    }
+}
+
+/// ★ The coset round-0 leaf order (`LAMBDA_VM_ZF_WHIR_LEAVES`, Poseidon1 only)
+/// under `Indexed`: every Poseidon1 case — a run of three at the C2 cap, a
+/// split group — executes on the machine built for it over a proof the host
+/// accepts, so EVERY round-0 tree of a run is walked at the position the order
+/// puts the block at (one tree walked at the index would refuse the honest
+/// proof). Across the two orders the host and the machine each refuse the
+/// other order's proof over its roots, both ways.
+#[test]
+fn grouped_openings_under_the_coset_order_execute_and_are_refused_in_the_natural_one() {
+    for case in cases().into_iter().filter(|c| c.base == Base::P1) {
+        let coset = fixture(&in_order(&case, LeafOrder::Coset));
+        let natural = fixture(&case);
+        assert_eq!(coset.shape.leaves, LeafOrder::Coset);
+        assert_ne!(
+            coset.roots, natural.roots,
+            "{}: the order moves the roots",
+            coset.name
+        );
+        machine_runs(&coset, &program(&coset), arena(&coset, &coset.proof)).unwrap_or_else(|e| {
+            panic!(
+                "{}: the machine under the coset order refused an accepted proof: {e}",
+                coset.name
+            )
+        });
+        for (label, verifier, prover) in [
+            ("natural refuses coset", &natural, &coset),
+            ("coset refuses natural", &coset, &natural),
+        ] {
+            assert!(
+                !host_accepts_under(verifier, &prover.roots, &prover.proof),
+                "{}: {label} (host)",
+                case.name
+            );
+            assert!(
+                machine_runs(
+                    verifier,
+                    &program(verifier),
+                    arena_under(verifier, &prover.roots, &prover.proof)
+                )
+                .is_err(),
+                "{}: {label} (machine)",
+                case.name
+            );
+        }
     }
 }
 
