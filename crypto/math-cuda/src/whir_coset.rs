@@ -283,6 +283,26 @@ impl CosetPlan {
         self.classes.binary_search(&(leaf & (class_mod - 1))).ok()
     }
 
+    /// Where `leaf` sits among the blocks: its coset's output block `q` and
+    /// its position `r` under that coset's kept node (`leaf =
+    /// classes()[q] + bitrev_kept(r)·2^(D−L)`).
+    pub fn slot_of(&self, leaf: u64) -> Option<(usize, usize)> {
+        let q = self.block_of(leaf)?;
+        let r = reverse(leaf >> self.classes_bits(), self.kept) as usize;
+        Some((q, r))
+    }
+
+    /// The tree position, among the kept nodes, of output block `q`'s node:
+    /// the coset's class with its `D − L` bits reversed.
+    pub fn block_position(&self, q: usize) -> usize {
+        reverse(self.classes[q], self.classes_bits()) as usize
+    }
+
+    /// Binary tree levels under a kept node: a block is `2^kept` leaves.
+    pub fn kept(&self) -> usize {
+        self.kept
+    }
+
     /// `D − L`: there are `2^(D−L)` cosets of `2^L` points in the domain.
     fn classes_bits(&self) -> usize {
         self.num_vars + self.log_blowup - self.log_coset
@@ -427,6 +447,24 @@ impl CosetValues {
     }
 }
 
+/// Wall-clock laps of an evaluation's phases, read only when asked for.
+struct Laps<'a> {
+    split: Option<&'a mut Vec<(&'static str, f64)>>,
+    clock: std::time::Instant,
+}
+
+impl Laps<'_> {
+    /// Synchronizes and records the phase just queued, when laps are kept.
+    fn lap(&mut self, name: &'static str, stream: &Arc<CudaStream>) -> Result<()> {
+        if let Some(split) = self.split.as_deref_mut() {
+            stream.synchronize()?;
+            split.push((name, self.clock.elapsed().as_secs_f64() * 1e3));
+            self.clock = std::time::Instant::now();
+        }
+        Ok(())
+    }
+}
+
 /// The plan's cosets over a stacked polynomial whose columns the card holds:
 /// `(column, offset)` into `store`, zeros between, as
 /// [`crate::whir::encode_codeword_resident`] assembles it.
@@ -438,22 +476,16 @@ pub fn evaluate_resident(
     store: &crate::columns::DeviceColumns,
     parts: &[(usize, usize)],
     plan: &CosetPlan,
-    mut split: Option<&mut Vec<(&'static str, f64)>>,
+    split: Option<&mut Vec<(&'static str, f64)>>,
 ) -> Result<CosetValues> {
     let be = backend()?;
     let m = module()?;
     let stream = be.next_stream();
     let n = 1usize << plan.num_vars;
-    let mut clock = std::time::Instant::now();
-    let mut lap = |name: &'static str, stream: &Arc<CudaStream>| -> Result<()> {
-        if let Some(split) = split.as_deref_mut() {
-            stream.synchronize()?;
-            split.push((name, clock.elapsed().as_secs_f64() * 1e3));
-            clock = std::time::Instant::now();
-        }
-        Ok(())
+    let mut laps = Laps {
+        split,
+        clock: std::time::Instant::now(),
     };
-
     for &(column, offset) in parts {
         ensure!(column < store.num_columns() && offset + store.span(column).1 <= n);
     }
@@ -463,16 +495,34 @@ pub fn evaluate_resident(
     for &(column, offset) in parts {
         store.copy_into(column, &mut f, offset, &stream)?;
     }
-    lap("assemble", &stream)?;
+    laps.lap("assemble", &stream)?;
+    let len = plan.classes.len() * plan.coset_len();
+    let out = evaluate_from(&stream, m, f, plan, &mut laps, 0, len)?;
+    Ok(CosetValues {
+        buffer: out,
+        stream,
+    })
+}
 
+/// The cosets from the assembled stack `f` (spent), into a buffer of
+/// `out_len` values laid out by `stride` (`coset_leaf_order`), on `stream`.
+fn evaluate_from(
+    stream: &Arc<CudaStream>,
+    m: &Module,
+    f: CudaSlice<u64>,
+    plan: &CosetPlan,
+    laps: &mut Laps<'_>,
+    stride: u64,
+    out_len: usize,
+) -> Result<CudaSlice<u64>> {
     let tiles = plan.tiles();
     let last = plan.slab_rows();
-    let count = htod_or_trim(&stream, &plan.level_count)?;
-    let offset = htod_or_trim(&stream, &plan.level_offset)?;
-    let parents = htod_or_trim(&stream, &plan.parents)?;
-    let gammas = htod_or_trim(&stream, &plan.gammas)?;
+    let count = htod_or_trim(stream, &plan.level_count)?;
+    let offset = htod_or_trim(stream, &plan.level_offset)?;
+    let parents = htod_or_trim(stream, &plan.parents)?;
+    let gammas = htod_or_trim(stream, &plan.gammas)?;
     // SAFETY: the tile kernel writes every (class, tile) entry.
-    let mut slab = unsafe { alloc_or_trim::<u64>(&stream, last * tiles) }?;
+    let mut slab = unsafe { alloc_or_trim::<u64>(stream, last * tiles) }?;
     let tiles_u64 = tiles as u64;
     let levels_u32 = plan.tile_levels as u32;
     let total_u32 = plan.gammas.len() as u32;
@@ -498,21 +548,21 @@ pub fn evaluate_resident(
     }
     // Spent; the free is stream-ordered.
     drop(f);
-    lap("tiles", &stream)?;
+    laps.lap("tiles", stream)?;
 
     let cosets = plan.classes.len();
     let len = plan.coset_len();
     let log_len = plan.log_coset as u32;
-    let slab_of = htod_or_trim(&stream, &plan.slab_of)?;
+    let slab_of = htod_or_trim(stream, &plan.slab_of)?;
     // A zero-length upload is not an allocation the driver takes; the kernel
     // reads no constant when there is no bit left.
     let rest_gammas = if plan.rest_gammas.is_empty() {
-        htod_or_trim(&stream, &[0u64])?
+        htod_or_trim(stream, &[0u64])?
     } else {
-        htod_or_trim(&stream, &plan.rest_gammas)?
+        htod_or_trim(stream, &plan.rest_gammas)?
     };
     // SAFETY: the rest kernel writes every coset value.
-    let mut g = unsafe { alloc_or_trim::<u64>(&stream, cosets * len) }?;
+    let mut g = unsafe { alloc_or_trim::<u64>(stream, cosets * len) }?;
     let rest_u32 = plan.rest_levels as u32;
     let cosets_u32 = cosets as u32;
     let warps = (cosets * len) as u64;
@@ -534,10 +584,10 @@ pub fn evaluate_resident(
             })?;
     }
     drop(slab);
-    lap("rest", &stream)?;
+    laps.lap("rest", stream)?;
 
-    let twists = htod_or_trim(&stream, &plan.twists)?;
-    let twiddles = htod_or_trim(&stream, &plan.twiddles)?;
+    let twists = htod_or_trim(stream, &plan.twists)?;
+    let twiddles = htod_or_trim(stream, &plan.twiddles)?;
     let chunk_levels = plan.chunk_levels();
     let pairs = (cosets * len / 2) as u64;
     let pair_grid = LaunchConfig {
@@ -587,8 +637,12 @@ pub fn evaluate_resident(
                 .launch(pair_grid)?;
         }
     }
-    // SAFETY: the permutation writes every value.
-    let mut out = unsafe { alloc_or_trim::<u64>(&stream, cosets * len) }?;
+    // SAFETY: the permutation writes every value of a coset; past them (a
+    // strided layout padded to a power of two) the memset below does.
+    let mut out = unsafe { alloc_or_trim::<u64>(stream, out_len) }?;
+    if out_len > cosets * len {
+        stream.memset_zeros(&mut out)?;
+    }
     let total = (cosets * len) as u64;
     let kept_u32 = plan.kept as u32;
     unsafe {
@@ -598,6 +652,7 @@ pub fn evaluate_resident(
             .arg(&total)
             .arg(&log_len)
             .arg(&kept_u32)
+            .arg(&stride)
             .arg(&mut out)
             .launch(LaunchConfig {
                 grid_dim: (total.div_ceil(BLOCK as u64) as u32, 1, 1),
@@ -606,10 +661,191 @@ pub fn evaluate_resident(
             })?;
     }
     drop(g);
-    lap("transform", &stream)?;
-    Ok(CosetValues {
-        buffer: out,
-        stream,
+    laps.lap("transform", stream)?;
+    Ok(out)
+}
+
+/// A stacked polynomial the card holds as slices of one buffer — `(element
+/// offset in the buffer, elements, offset in the stack)`, zeros between —
+/// with its own handle on the buffer, so a revived commitment can evaluate its
+/// cosets after the borrow of the store it was revived from has ended.
+#[derive(Clone)]
+pub struct StackSlices {
+    buffer: Arc<CudaSlice<u64>>,
+    parts: Vec<(usize, usize, usize)>,
+    num_vars: usize,
+    log_blowup: usize,
+    /// What a successor encoded from this stack's bound message lives inside,
+    /// as a fold lives inside its codeword's room.
+    room: Arc<crate::device::DeviceReservation>,
+}
+
+impl StackSlices {
+    /// The stack `parts` — `(column, offset)` into `store` — make, at
+    /// `2^num_vars` values and a code of `2^log_blowup` times that.
+    pub fn from_resident(
+        store: &crate::columns::DeviceColumns,
+        parts: &[(usize, usize)],
+        num_vars: usize,
+        log_blowup: usize,
+    ) -> Result<Self> {
+        let n = 1usize << num_vars;
+        let mut held = Vec::with_capacity(parts.len());
+        for &(column, offset) in parts {
+            ensure!(column < store.num_columns());
+            let (at, len) = store.span(column);
+            ensure!(offset + len <= n);
+            held.push((at, len, offset));
+        }
+        let room = crate::device::reserve(0).ok_or_else(crate::invalid_value)?;
+        Ok(Self {
+            buffer: store.buffer(),
+            parts: held,
+            num_vars,
+            log_blowup,
+            room: Arc::new(room),
+        })
+    }
+
+    /// Values the codeword would have: `2^(n + b)`.
+    pub fn elements(&self) -> usize {
+        1 << (self.num_vars + self.log_blowup)
+    }
+
+    pub fn num_vars(&self) -> usize {
+        self.num_vars
+    }
+
+    pub fn log_blowup(&self) -> usize {
+        self.log_blowup
+    }
+
+    pub fn room(&self) -> &Arc<crate::device::DeviceReservation> {
+        &self.room
+    }
+
+    /// The whole codeword, as the re-encode makes it: what a fold, or a plan
+    /// the kernels do not take, falls back to.
+    pub fn encode(&self, transient: bool) -> Result<crate::whir::DeviceCodeword> {
+        crate::whir::encode_codeword_slices(
+            &self.buffer,
+            &self.parts,
+            self.num_vars,
+            self.log_blowup,
+            transient,
+        )
+    }
+
+    fn assemble(&self, stream: &Arc<CudaStream>) -> Result<CudaSlice<u64>> {
+        // SAFETY: `copy_slices` writes every element (zeros, then the parts).
+        let mut f = unsafe { alloc_or_trim::<u64>(stream, 1 << self.num_vars) }?;
+        crate::whir::copy_slices(stream, &self.buffer, &self.parts, &mut f)?;
+        Ok(f)
+    }
+}
+
+/// What a retired round-0 tree in the coset order needs for its openings,
+/// evaluated from the stack: one tree over the plan's blocks (block `q` = the
+/// gathered leaves `[q·2^kept, (q+1)·2^kept)`, padded to `leaves`), in the
+/// hash's node layout as `DeviceCodeword::block_subtrees` returns it, and the
+/// queried blocks' values.
+pub struct CosetOpenings {
+    pub nodes: Vec<u8>,
+    pub leaves: usize,
+    /// `2^fold` values a query, in the order the queries were given.
+    pub values: Vec<u64>,
+}
+
+/// The kept blocks' subtrees and the queried blocks' values of a round-0
+/// tree in the coset order, from the stack: the cosets evaluated straight into
+/// the strided layout the coset leaf kernel reads, hashed and built by the
+/// commit's own kernels (so each block's subtree is the committed one, which
+/// the caller checks against its kept node), and the queried blocks gathered
+/// from the same buffer. `queried` are leaf indices, each in one of the plan's
+/// cosets. Poseidon1 trees only.
+pub fn coset_openings(
+    stack: &StackSlices,
+    plan: &CosetPlan,
+    queried: &[u64],
+    hash: crate::DeviceHash,
+) -> Result<CosetOpenings> {
+    ensure!(hash == crate::DeviceHash::Poseidon1);
+    ensure!(plan.num_vars == stack.num_vars && plan.log_blowup == stack.log_blowup);
+    let be = backend()?;
+    let m = module()?;
+    let stream = be.next_stream();
+    let block = 1usize << (plan.log_coset - plan.kept);
+    let leaves = (plan.classes.len() << plan.kept).next_power_of_two().max(2);
+    let mut at = Vec::with_capacity(queried.len());
+    for &leaf in queried {
+        let (q, r) = plan.slot_of(leaf).ok_or_else(crate::invalid_value)?;
+        at.push(((q << plan.kept) | r) as u64);
+    }
+
+    let f = stack.assemble(&stream)?;
+    let mut laps = Laps {
+        split: None,
+        clock: std::time::Instant::now(),
+    };
+    let out = evaluate_from(
+        &stream,
+        m,
+        f,
+        plan,
+        &mut laps,
+        leaves as u64,
+        leaves * block,
+    )?;
+
+    let total_nodes = crate::tree_nodes(hash, leaves);
+    // SAFETY: every byte is written before it is read — the leaves by the
+    // kernel below, the inner nodes by the level loop after it.
+    let mut nodes = unsafe { alloc_or_trim::<u8>(&stream, total_nodes * 32) }?;
+    let leaves_offset = crate::leaves_offset(hash, leaves) * 32;
+    let leaves_u64 = leaves as u64;
+    let block_u64 = block as u64;
+    {
+        let mut region = nodes.slice_mut(leaves_offset..leaves_offset + leaves * 32);
+        let k = crate::p1_stark::kernels()?;
+        unsafe {
+            stream
+                .launch_builder(&k.leaves_base_coset)
+                .arg(&out)
+                .arg(&leaves_u64)
+                .arg(&block_u64)
+                .arg(&mut region)
+                .launch(crate::p1_stark::launch_cfg(leaves_u64))?;
+        }
+    }
+    crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes, leaves, hash)?;
+    let nodes_host = stream.clone_dtoh(&nodes)?;
+
+    let index_dev = htod_or_trim(&stream, &at)?;
+    // SAFETY: the gather writes every value it is sized for.
+    let mut values = unsafe { alloc_or_trim::<u64>(&stream, queried.len().max(1) * block) }?;
+    if !queried.is_empty() {
+        let queries = queried.len() as u64;
+        let limbs = 1u64;
+        unsafe {
+            stream
+                .launch_builder(&be.gather_cosets)
+                .arg(&out)
+                .arg(&index_dev)
+                .arg(&queries)
+                .arg(&leaves_u64)
+                .arg(&block_u64)
+                .arg(&limbs)
+                .arg(&mut values)
+                .launch(LaunchConfig::for_num_elems((queried.len() * block) as u32))?;
+        }
+    }
+    let mut values_host = stream.clone_dtoh(&values)?;
+    stream.synchronize()?;
+    values_host.truncate(queried.len() * block);
+    Ok(CosetOpenings {
+        nodes: nodes_host,
+        leaves,
+        values: values_host,
     })
 }
 
@@ -708,6 +944,23 @@ mod tests {
         use super::super::*;
 
         pub fn kernels(plan: &CosetPlan, values: &[u64]) -> Vec<u64> {
+            let len = plan.classes.len() * plan.coset_len();
+            kernels_into(plan, values, 0, len)
+        }
+
+        /// [`kernels`] into the strided layout `coset_openings` hashes:
+        /// `leaves` gathered leaves (padded to a power of two), value `t` of
+        /// leaf `i` at `i + t·leaves`.
+        pub fn kernels_strided(plan: &CosetPlan, values: &[u64]) -> (Vec<u64>, usize) {
+            let leaves = (plan.classes.len() << plan.kept).next_power_of_two().max(2);
+            let block = 1usize << (plan.log_coset - plan.kept);
+            (
+                kernels_into(plan, values, leaves as u64, leaves * block),
+                leaves,
+            )
+        }
+
+        fn kernels_into(plan: &CosetPlan, values: &[u64], stride: u64, out_len: usize) -> Vec<u64> {
             let tiles = plan.tiles();
             let mut slab = vec![0u64; plan.slab_rows() * tiles];
             fold_tiles(plan, values, &mut slab);
@@ -724,8 +977,8 @@ mod tests {
             for stage in cl + 1..=plan.log_coset {
                 ntt_stage(&mut g, pairs, plan.log_coset, stage, &plan.twiddles);
             }
-            let mut out = vec![0u64; cosets * len];
-            leaf_order(&g, plan.log_coset, plan.kept, &mut out);
+            let mut out = vec![0u64; out_len];
+            leaf_order(&g, plan.log_coset, plan.kept, stride, &mut out);
             out
         }
 
@@ -891,7 +1144,7 @@ mod tests {
             }
         }
 
-        fn leaf_order(g: &[u64], log_size: usize, kept: usize, out: &mut [u64]) {
+        fn leaf_order(g: &[u64], log_size: usize, kept: usize, stride: u64, out: &mut [u64]) {
             for (idx, &v) in g.iter().enumerate() {
                 let q = idx >> log_size;
                 let u = idx & ((1 << log_size) - 1);
@@ -902,7 +1155,50 @@ mod tests {
                     reverse(low as u64, kept) as usize
                 };
                 let t = u >> kept;
-                out[(q << log_size) | (r << (log_size - kept)) | t] = v;
+                if stride == 0 {
+                    out[(q << log_size) | (r << (log_size - kept)) | t] = v;
+                } else {
+                    out[((q << kept) | r) + t * stride as usize] = v;
+                }
+            }
+        }
+    }
+
+    /// The strided layout the openings hash: value `t` of gathered leaf
+    /// `q·2^kept + r` is the codeword at the leaf `slot_of` names, the
+    /// padding is zero, and each block's tree position is its class reversed.
+    #[test]
+    fn the_strided_layout_holds_each_slot_s_leaf() {
+        let (num_vars, log_blowup, log_fold, kept) = (14, 2, 2, 3);
+        let mut rng = Rng(21);
+        let values: Vec<u64> = (0..1usize << num_vars).map(|_| rng.next() % P).collect();
+        let num_leaves = 1u64 << (num_vars + log_blowup - log_fold);
+        let leaves: Vec<u64> = (0..13).map(|_| rng.next() % num_leaves).collect();
+        let plan = CosetPlan::new(num_vars, log_blowup, log_fold, kept, &leaves).expect("plan");
+        let word = codeword(&values, num_vars, log_blowup);
+        let (strided, gathered) = emulate::kernels_strided(&plan, &values);
+        let block = 1usize << log_fold;
+        let real = plan.classes().len() << kept;
+        assert_eq!(gathered, real.next_power_of_two());
+        let depth = (num_vars + log_blowup - log_fold) as u32;
+        for q in 0..plan.classes().len() {
+            for (r, leaf) in plan.block_leaves(q).into_iter().enumerate() {
+                assert_eq!(plan.slot_of(leaf), Some((q, r)), "leaf {leaf}");
+                for t in 0..block {
+                    assert_eq!(
+                        canonical(strided[((q << kept) | r) + t * gathered]),
+                        word[leaf as usize + t * num_leaves as usize]
+                    );
+                }
+                // Block q's node sits at the position its class reversed
+                // names: the leaf's tree position has those top bits.
+                let position = leaf.reverse_bits() >> (64 - depth);
+                assert_eq!(position as usize, (plan.block_position(q) << kept) | r);
+            }
+        }
+        for i in real..gathered {
+            for t in 0..block {
+                assert_eq!(strided[i + t * gathered], 0, "padding");
             }
         }
     }

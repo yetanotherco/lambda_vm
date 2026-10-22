@@ -247,8 +247,11 @@ extern "C" __global__ void coset_ntt_stage(uint64_t *__restrict__ g, uint64_t pa
 // `c + u·2^(D-L)`), written in the order its kept subtree's leaves take them:
 // leaf `r` (position `r` under the node) is `j = c + bitrev_kept(r)·2^(D-L)`,
 // and its `2^fold` values are `u = bitrev_kept(r) + t·2^kept`, `t` ascending.
+// `stride == 0`: leaf-major, leaf `r` of coset `q` at `(q·2^kept + r)·2^fold`.
+// Otherwise strided as the coset leaf kernels read a codeword: value `t` of
+// gathered leaf `q·2^kept + r` at `(q·2^kept + r) + t·stride`.
 extern "C" __global__ void coset_leaf_order(const uint64_t *__restrict__ g, uint64_t total,
-                                            uint32_t log_size, uint32_t kept,
+                                            uint32_t log_size, uint32_t kept, uint64_t stride,
                                             uint64_t *__restrict__ out) {
     const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
@@ -257,5 +260,9 @@ extern "C" __global__ void coset_leaf_order(const uint64_t *__restrict__ g, uint
     const uint64_t low = u & ((1ull << kept) - 1);
     const uint64_t r = kept == 0 ? 0 : __brevll(low) >> (64 - kept);
     const uint64_t t = u >> kept;
-    out[(q << log_size) | (r << (log_size - kept)) | t] = g[idx];
+    if (stride == 0) {
+        out[(q << log_size) | (r << (log_size - kept)) | t] = g[idx];
+    } else {
+        out[((q << kept) | r) + t * stride] = g[idx];
+    }
 }

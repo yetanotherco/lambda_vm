@@ -62,6 +62,8 @@ pub struct Kernels {
     pub fri_group_leaves: CudaFunction,
     /// WHIR's coset leaves over a base / ext3 codeword (`crate::whir`).
     pub leaves_base_coset: CudaFunction,
+    /// [`Self::leaves_base_coset`] with leaf `j` placed at `bitrev(j)`.
+    pub leaves_base_coset_rev: CudaFunction,
     pub leaves_ext3_coset: CudaFunction,
     pub merkle_level4: CudaFunction,
     pub merkle_tail4: CudaFunction,
@@ -84,6 +86,7 @@ pub fn kernels() -> Result<&'static Kernels> {
         leaves_rm_row: module.load_function("p1s_leaves_rm_row")?,
         fri_group_leaves: module.load_function("p1s_fri_group_leaves")?,
         leaves_base_coset: module.load_function("p1s_leaves_base_coset")?,
+        leaves_base_coset_rev: module.load_function("p1s_leaves_base_coset_rev")?,
         leaves_ext3_coset: module.load_function("p1s_leaves_ext3_coset")?,
         merkle_level4: module.load_function("p1s_merkle_level4")?,
         merkle_tail4: module.load_function("p1s_merkle_tail4")?,
