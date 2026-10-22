@@ -1322,6 +1322,7 @@ fn chunk_jobs(
 /// shared with the tail (and with the chunk on its other side when it straddles
 /// a chunk boundary), so a chunk leaves the tail without a copy and its
 /// generator fills the rows from the parts.
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct Segments<T> {
     parts: Vec<(Arc<Vec<T>>, std::ops::Range<usize>)>,
 }
@@ -2105,12 +2106,14 @@ fn concatenate(windows: Vec<WalkedWindow>) -> (Vec<super::CpuOperation>, WalkOut
 /// A completed chunk not generated yet: which chunk it is, and its ops.
 /// [`generate`](Self::generate) builds the table a whole-run build puts in that
 /// slot, with the same function.
+#[cfg_attr(test, derive(Clone))]
 pub struct ChunkJob {
     pub table: StreamTable,
     pub index: usize,
     ops: ChunkOps,
 }
 
+#[cfg_attr(test, derive(Clone))]
 enum ChunkOps {
     /// The ops and the decode they are read with.
     Cpu(Segments<super::CpuOperation>, Arc<DecodeTable>),
@@ -2561,6 +2564,9 @@ impl Traces {
 
 #[cfg(test)]
 mod head_tests;
+
+#[cfg(test)]
+mod parallel_walk_tests;
 
 #[cfg(test)]
 mod regen_tests;

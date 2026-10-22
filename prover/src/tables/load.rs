@@ -75,6 +75,7 @@ pub mod cols {
 
 /// A single LOAD operation to be added to the trace.
 #[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct LoadOperation {
     /// Base address (64-bit)
     pub base_address: u64,

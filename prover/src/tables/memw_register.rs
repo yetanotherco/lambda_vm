@@ -105,6 +105,7 @@ pub mod cols {
 /// - `old_ts_lo` = `old_timestamp[0] & 0xFFFF_FFFF` (the two words share old_timestamp,
 ///   enforced by `is_register_op`; the upper limb is TIMESTAMP_1 = timestamp>>32)
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(test, derive(PartialEq))]
 pub(crate) struct RegRow {
     /// Register index 0..=255 (`base_address / 2`); u16 keeps the struct at
     /// 32 bytes — it is the largest persisted array of the walk.

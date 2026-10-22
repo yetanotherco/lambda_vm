@@ -114,6 +114,7 @@ type MemoryCell = (u8, u64);
 type RegisterCell = (u64, u64);
 
 /// Memory state tracker for generating MEMW/LOAD traces.
+#[cfg_attr(test, derive(Clone))]
 struct MemoryState {
     /// Per byte-address `(value, timestamp)`, as a dense per-page store. This is
     /// the hot structure — `read_byte`/`write_byte` hit it on every memory access
@@ -277,6 +278,7 @@ impl MemoryState {
 }
 
 /// Register state tracker for generating MEMW register traces.
+#[cfg_attr(test, derive(Clone))]
 struct RegisterState {
     /// Register file: (value, last_write_timestamp)
     regs: [RegisterCell; 32],

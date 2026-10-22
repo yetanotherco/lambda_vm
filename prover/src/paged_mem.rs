@@ -24,6 +24,7 @@ use crate::tables::page::DEFAULT_PAGE_SIZE;
 const WORD_BITS: usize = 64;
 const OCC_WORDS: usize = DEFAULT_PAGE_SIZE / WORD_BITS;
 
+#[cfg_attr(test, derive(Clone))]
 struct Page<T> {
     /// Dense values, length `DEFAULT_PAGE_SIZE`, initialized to `fill`.
     data: Box<[T]>,
@@ -40,6 +41,7 @@ struct Page<T> {
 /// infeasible, but there are only a handful of touched pages, so binary-search
 /// lookup + sorted insert are cheap — and no hashing). The bulk (the cells)
 /// lives in each page's dense array.
+#[cfg_attr(test, derive(Clone))]
 pub struct PagedMem<T> {
     pages: Vec<(u64, Page<T>)>,
     fill: T,

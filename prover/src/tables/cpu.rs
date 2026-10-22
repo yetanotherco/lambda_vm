@@ -158,6 +158,7 @@ pub mod cols {
 /// [`DecodeEntry`]. For `word_instr` rows all operational values are 0 (the row
 /// is a pure CPU32 delegate).
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct CpuOperation {
     /// The row of its instruction in the DECODE table ([`DecodeTable::row`]).
     pub decode_row: u32,
