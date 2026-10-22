@@ -377,6 +377,12 @@ enum Commands {
         /// same one; the proof file does not carry it.
         #[arg(long, value_parser = ["per-poly", "indexed"], default_value = "per-poly")]
         group: String,
+
+        /// The WHIR base code's blowup: 4 (production) or 2, its query count
+        /// from the code's own rule. A format choice: `verify-block` must be
+        /// given the same one; the proof file does not carry it.
+        #[arg(long, value_parser = ["4", "2"], default_value = "4")]
+        blowup: String,
     },
 
     /// Verify a block proof produced by `prove-block`
@@ -397,6 +403,11 @@ enum Commands {
         /// --group`): the verifier's constant, never read from the proof.
         #[arg(long, value_parser = ["per-poly", "indexed"], default_value = "per-poly")]
         group: String,
+
+        /// The WHIR blowup the block was proved with (`prove-block
+        /// --blowup`): the verifier's constant, never read from the proof.
+        #[arg(long, value_parser = ["4", "2"], default_value = "4")]
+        blowup: String,
     },
 
     /// Count main-trace and aux-trace field elements without proving
@@ -497,13 +508,15 @@ fn main() -> ExitCode {
             time,
             digest,
             group,
-        } => cmd_prove_block(elf, input, output, time, digest, &group),
+            blowup,
+        } => cmd_prove_block(elf, input, output, time, digest, &group, &blowup),
         Commands::VerifyBlock {
             proof,
             elf,
             time,
             group,
-        } => cmd_verify_block(proof, elf, time, &group),
+            blowup,
+        } => cmd_verify_block(proof, elf, time, &group, &blowup),
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
     }
 }
@@ -600,9 +613,11 @@ fn cmd_prove_block(
     time: bool,
     digest: bool,
     group: &str,
+    blowup: &str,
 ) -> ExitCode {
     use prover::lfm::whir_block_tree::{
-        StderrSink, WhirBlockTreeProof, WhirTreeConfig, group_setting, prove_whir_block_tree,
+        StderrSink, WhirBlockTreeProof, WhirTreeConfig, blowup_setting, group_setting,
+        prove_whir_block_tree,
     };
 
     let elf_data = match std::fs::read(&elf_path) {
@@ -626,6 +641,14 @@ fn cmd_prove_block(
         eprintln!("LAMBDA_VM_WHIR_GROUP is the harness's knob: give the CLI --group instead");
         return ExitCode::FAILURE;
     }
+    // So is the WHIR blowup: `--blowup`, not the format's environment knob.
+    if std::env::var_os(prover::zf_format::ENV_WHIR_BLOWUP).is_some() {
+        eprintln!(
+            "{} is the harness's knob: give the CLI --blowup instead",
+            prover::zf_format::ENV_WHIR_BLOWUP
+        );
+        return ExitCode::FAILURE;
+    }
     let mut cfg = match WhirTreeConfig::from_env() {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -641,6 +664,14 @@ fn cmd_prove_block(
         }
     };
     eprintln!("BLOCK GROUP OPENING: {group}");
+    cfg.format.zf.whir_blowup = match blowup_setting(Some(blowup)) {
+        Ok(blowup) => blowup,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("BLOCK WHIR BLOWUP: {blowup}");
     // A forced leaf count, another fan-in or another argue is another tree than
     // the one `verify-block` derives: harness arms, not a production proof.
     if !cfg.at_presets() {
@@ -697,13 +728,37 @@ fn cmd_prove_block(
     ExitCode::SUCCESS
 }
 
-fn cmd_verify_block(proof_path: PathBuf, elf_path: PathBuf, time: bool, group: &str) -> ExitCode {
+fn cmd_verify_block(
+    proof_path: PathBuf,
+    elf_path: PathBuf,
+    time: bool,
+    group: &str,
+    blowup: &str,
+) -> ExitCode {
     use prover::lfm::whir_block_tree::{
-        WhirBlockTreeProof, base_line, group_setting, verify_whir_block_tree_proof_grouped,
+        WhirBlockTreeProof, base_line, blowup_setting, group_setting,
+        verify_whir_block_tree_proof_as,
     };
 
     let fold = match group_setting(Some(group)) {
         Ok(fold) => fold,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The verifier is told the rate as it is told the group opening; the
+    // format's environment knob is refused rather than silently outranked.
+    if std::env::var_os(prover::zf_format::ENV_WHIR_BLOWUP).is_some() {
+        eprintln!(
+            "{} is the harness's knob: give the CLI --blowup instead",
+            prover::zf_format::ENV_WHIR_BLOWUP
+        );
+        return ExitCode::FAILURE;
+    }
+    let mut format = prover::block_whir::BlockFormat::production_with(fold);
+    format.zf.whir_blowup = match blowup_setting(Some(blowup)) {
+        Ok(blowup) => blowup,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::FAILURE;
@@ -737,9 +792,10 @@ fn cmd_verify_block(proof_path: PathBuf, elf_path: PathBuf, time: bool, group: &
     eprintln!("{}", base_line(&prover::hash_pin::BLOCK_BASE));
     // So is the group opening: the caller's, never the file's.
     eprintln!("BLOCK GROUP OPENING: {group}");
+    eprintln!("BLOCK WHIR BLOWUP: {blowup}");
     eprintln!("Verifying block proof...");
     let start = Instant::now();
-    let result = verify_whir_block_tree_proof_grouped(&elf_data, &proof, fold);
+    let result = verify_whir_block_tree_proof_as(&elf_data, &proof, &format);
     let verify_elapsed = start.elapsed();
     match result {
         Ok(()) => {
@@ -1775,6 +1831,42 @@ mod tests {
             let args = [cmd, &["--group", "index"]].concat();
             assert!(parse(&args).is_err(), "another word is refused");
         }
+    }
+
+    /// Both block commands take the WHIR blowup, 4 unless told otherwise, and
+    /// nothing but its two words; each word reads to the blowup it names.
+    #[test]
+    fn the_block_commands_take_the_blowup() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            let blowup = |args: &[&str]| match parse(args).map(|cli| cli.command) {
+                Ok(Commands::ProveBlock { blowup, .. } | Commands::VerifyBlock { blowup, .. }) => {
+                    Some(blowup)
+                }
+                _ => None,
+            };
+            assert_eq!(blowup(cmd).as_deref(), Some("4"), "the default");
+            for (word, want) in [("4", 4u8), ("2", 2)] {
+                let args = [cmd, &["--blowup", word]].concat();
+                assert_eq!(blowup(&args).as_deref(), Some(word));
+                assert_eq!(
+                    prover::lfm::whir_block_tree::blowup_setting(Some(word)),
+                    Ok(want),
+                    "{word} reads"
+                );
+            }
+            for word in ["1", "8", "half"] {
+                let args = [cmd, &["--blowup", word]].concat();
+                assert!(parse(&args).is_err(), "--blowup {word} is refused");
+            }
+        }
+        assert_eq!(
+            prover::lfm::whir_block_tree::blowup_setting(None),
+            Ok(prover::block_whir::BlockFormat::production().zf.whir_blowup),
+            "unset is the production blowup"
+        );
     }
 
     /// The block commands take no base hash: the block's base is its proof

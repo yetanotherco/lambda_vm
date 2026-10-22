@@ -254,6 +254,21 @@ pub fn group_setting(value: Option<&str>) -> Result<GroupFold, String> {
     }
 }
 
+/// The CLI's `--blowup` reading: unset or `4` is the production WHIR base code
+/// (blowup 4), `2` is blowup 2 ([`crate::zf_format::WHIR_BLOWUPS`]); anything
+/// else an error. A format choice: the block's verifier must be given the same
+/// one, and the proof file does not carry it.
+pub fn blowup_setting(value: Option<&str>) -> Result<u8, String> {
+    match value.map(str::trim) {
+        None => Ok(crate::zf_format::ZfFormat::DEFAULT.whir_blowup),
+        Some(word) => crate::zf_format::WHIR_BLOWUPS
+            .iter()
+            .copied()
+            .find(|b| word == b.to_string())
+            .ok_or_else(|| format!("--blowup {word}: 4 or 2")),
+    }
+}
+
 /// How many leaf programs are emitted at once beside phase B by default
 /// (`W3_LEAF_EMITTERS`). One thread a leaf, all started at the statement, took
 /// the host from phase B's first groups (measured on a 16-core host with one
@@ -2431,6 +2446,21 @@ pub fn verify_whir_block_tree_proof_grouped(
         public_words: proof.top_public_words.clone(),
     };
     super::whir_block::verify_block_tree_grouped(elf_bytes, proof.statement(), &top, group)
+}
+
+/// [`verify_whir_block_tree_proof`] under the caller's block `format`
+/// ([`super::whir_block::verify_block_tree_as`]): its group opening and its
+/// WHIR blowup are the caller's to give; the file carries neither.
+pub fn verify_whir_block_tree_proof_as(
+    elf_bytes: &[u8],
+    proof: &WhirBlockTreeProof,
+    format: &BlockFormat,
+) -> Result<(), String> {
+    let top = LfmProof {
+        proof: proof.top_proof.clone(),
+        public_words: proof.top_public_words.clone(),
+    };
+    super::whir_block::verify_block_tree_as(elf_bytes, proof.statement(), &top, format)
 }
 
 #[cfg(test)]
