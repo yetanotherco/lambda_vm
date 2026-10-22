@@ -1189,11 +1189,28 @@ pub fn verify_block_tree_grouped(
     )
 }
 
-/// [`verify_block_tree`] under the caller's block `format` — production with
-/// its group opening and its WHIR blowup given by the caller
-/// (`verify-block --group / --blowup`), every other preset pinned as before.
-/// The format is the verifier's constant; the proof does not carry it.
-pub fn verify_block_tree_as(
+/// [`verify_block_tree`] at production's format with the caller's NAMED
+/// choices: its group opening and its WHIR blowup (`verify-block --group /
+/// --blowup`), every other preset pinned as before. Both are the verifier's
+/// constants; the proof carries neither. A caller cannot hand in a format of
+/// its own: `verify_block_tree_as` is crate-internal.
+pub fn verify_block_tree_at(
+    elf_bytes: &[u8],
+    statement: BlockStatement<'_>,
+    top: &super::proof::LfmProof,
+    group: GroupFold,
+    blowup: crate::zf_format::WhirBlowup,
+) -> Result<(), String> {
+    let mut format = BlockFormat::production_with(group);
+    format.zf.whir_blowup = blowup.factor();
+    verify_block_tree_as(elf_bytes, statement, top, &format)
+}
+
+/// [`verify_block_tree`] under a block `format` of the crate's choosing.
+/// Crate-internal: a public caller who could pass any format would choose the
+/// programs the top is checked against ([`verify_block_tree`]); the public
+/// entry points build production's pinned format from named choices.
+pub(crate) fn verify_block_tree_as(
     elf_bytes: &[u8],
     statement: BlockStatement<'_>,
     top: &super::proof::LfmProof,

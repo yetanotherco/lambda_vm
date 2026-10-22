@@ -23,6 +23,7 @@
 use multilinear::whir_chain::{ArgueFormat, GroupFold};
 
 use crate::block_whir::{self, BlockFormat, BlockOptions, BlockWhirProof};
+use crate::zf_format::WhirBlowup;
 
 use super::compiler::LfmProgram;
 use super::harvest::{HarvestedChild, harvest_child_under, try_child_arena_words};
@@ -255,17 +256,14 @@ pub fn group_setting(value: Option<&str>) -> Result<GroupFold, String> {
 }
 
 /// The CLI's `--blowup` reading: unset or `4` is the production WHIR base code
-/// (blowup 4), `2` is blowup 2 ([`crate::zf_format::WHIR_BLOWUPS`]); anything
-/// else an error. A format choice: the block's verifier must be given the same
-/// one, and the proof file does not carry it.
-pub fn blowup_setting(value: Option<&str>) -> Result<u8, String> {
+/// ([`WhirBlowup::Four`]), `2` is blowup 2 ([`WhirBlowup::Two`]); anything else
+/// an error. A format choice: the block's verifier must be given the same one,
+/// and the proof file does not carry it.
+pub fn blowup_setting(value: Option<&str>) -> Result<WhirBlowup, String> {
     match value.map(str::trim) {
-        None => Ok(crate::zf_format::ZfFormat::DEFAULT.whir_blowup),
-        Some(word) => crate::zf_format::WHIR_BLOWUPS
-            .iter()
-            .copied()
-            .find(|b| word == b.to_string())
-            .ok_or_else(|| format!("--blowup {word}: 4 or 2")),
+        None | Some("4") => Ok(WhirBlowup::Four),
+        Some("2") => Ok(WhirBlowup::Two),
+        Some(word) => Err(format!("--blowup {word}: 4 or 2")),
     }
 }
 
@@ -2448,24 +2446,79 @@ pub fn verify_whir_block_tree_proof_grouped(
     super::whir_block::verify_block_tree_grouped(elf_bytes, proof.statement(), &top, group)
 }
 
-/// [`verify_whir_block_tree_proof`] under the caller's block `format`
-/// ([`super::whir_block::verify_block_tree_as`]): its group opening and its
-/// WHIR blowup are the caller's to give; the file carries neither.
-pub fn verify_whir_block_tree_proof_as(
+/// [`verify_whir_block_tree_proof`] at production's format with the caller's
+/// named choices, its group opening and its WHIR blowup
+/// ([`super::whir_block::verify_block_tree_at`]); the file carries neither. No
+/// public entry point takes a format of the caller's own.
+///
+/// ```no_run
+/// use lambda_vm_prover::lfm::whir_block_tree::{
+///     WhirBlockTreeProof, verify_whir_block_tree_proof_at,
+/// };
+/// use lambda_vm_prover::zf_format::WhirBlowup;
+/// use multilinear::whir_chain::GroupFold;
+///
+/// fn check(elf: &[u8], proof: &WhirBlockTreeProof) -> Result<(), String> {
+///     verify_whir_block_tree_proof_at(elf, proof, GroupFold::Indexed, WhirBlowup::Two)
+/// }
+/// ```
+///
+/// The any-format verifier is crate-internal, so outside the crate this does
+/// not compile:
+///
+/// ```compile_fail
+/// use lambda_vm_prover::lfm::whir_block::verify_block_tree_as;
+/// ```
+pub fn verify_whir_block_tree_proof_at(
     elf_bytes: &[u8],
     proof: &WhirBlockTreeProof,
-    format: &BlockFormat,
+    group: GroupFold,
+    blowup: WhirBlowup,
 ) -> Result<(), String> {
     let top = LfmProof {
         proof: proof.top_proof.clone(),
         public_words: proof.top_public_words.clone(),
     };
-    super::whir_block::verify_block_tree_as(elf_bytes, proof.statement(), &top, format)
+    super::whir_block::verify_block_tree_at(elf_bytes, proof.statement(), &top, group, blowup)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★ No public block-tree verifier takes a format of the caller's own (a
+    /// caller who could would choose the programs the top is checked against):
+    /// every top-level `pub fn verify…` of this file and of `whir_block.rs` is
+    /// read off the source and its parameters must not name `BlockFormat`, and
+    /// the one any-format verifier, `whir_block::verify_block_tree_as`, is
+    /// declared crate-internal. From outside the crate the same is checked by
+    /// [`verify_whir_block_tree_proof_at`]'s `compile_fail` doc test.
+    #[test]
+    fn no_public_tree_verifier_takes_a_block_format() {
+        let block = include_str!("whir_block.rs");
+        for (file, src) in [
+            ("whir_block.rs", block),
+            ("whir_block_tree.rs", include_str!("whir_block_tree.rs")),
+        ] {
+            let mut public = Vec::new();
+            for (at, _) in src.match_indices("\npub fn verify") {
+                let sig = &src[at + 1..];
+                let params = &sig[..sig.find(')').expect("a parameter list")];
+                let name = &sig[7..sig.find('(').expect("a name")];
+                assert!(
+                    !params.contains("BlockFormat"),
+                    "{file}: the public verifier {name} takes a BlockFormat"
+                );
+                public.push(name.to_string());
+            }
+            assert!(
+                public.len() >= 2,
+                "{file}: the scan found its public verifiers: {public:?}"
+            );
+        }
+        assert!(block.contains("\npub(crate) fn verify_block_tree_as("));
+        assert!(!block.contains("\npub fn verify_block_tree_as("));
+    }
 
     /// The posture line names every posture knob, in the table's order, and
     /// the WHIR hash (a format knob both sides must share) is one of them.

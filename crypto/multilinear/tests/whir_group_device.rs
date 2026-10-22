@@ -22,7 +22,8 @@
 //! declined could not turn a comparison into one of the host with itself. One
 //! `#[test]`: the arms switch process-wide overrides, and parallel tests would
 //! race them. Every case runs at blowup 4 and again at blowup 2
-//! (`LAMBDA_VM_ZF_WHIR_BLOWUP=2`).
+//! (`LAMBDA_VM_ZF_WHIR_BLOWUP=2`), its lines then labelled ` · lb 1`: twelve
+//! `GROUPED PARITY` lines a blowup, the blowup-4 ones as before.
 #![cfg(feature = "cuda")]
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
@@ -131,8 +132,21 @@ fn case_of(name: &'static str, heights: &[usize], n_stack: usize, polys: usize) 
     }
 }
 
+impl Case {
+    /// The case's name, tagged ` · lb 1` at blowup 2: the blowup-4 lines stay
+    /// the lines they were.
+    fn label(&self) -> String {
+        if self.log_blowup == 2 {
+            self.name.to_string()
+        } else {
+            format!("{} · lb {}", self.name, self.log_blowup)
+        }
+    }
+}
+
 /// `c` at blowup `2^log_blowup`: the card takes a stack whose codeword reaches
-/// its commit threshold (2^16 elements).
+/// its commit threshold (2^16 elements). Its label names the blowup off the
+/// default (`run of 2 · lb 1`), so a read-out counts each blowup's parity lines.
 fn at_blowup(c: Case, log_blowup: usize) -> Case {
     let n_stack = c.layout.n_stack();
     Case {
@@ -285,12 +299,7 @@ fn prove_arm<H: WhirHash>(
     resident: Option<&gpu::ResidentColumns>,
 ) -> (Vec<u8>, Vec<[u8; 32]>) {
     force(arm);
-    let tag = format!(
-        "{} · {} · {arm:?} · blowup 2^{}",
-        c.name,
-        H::NAME,
-        c.log_blowup
-    );
+    let tag = format!("{} · {} · {arm:?}", c.label(), H::NAME);
     let columns = multilinear::stacking::borrow(&c.columns);
     let before = counters();
     let stacked = StackedCommitment::<F, H>::commit(
@@ -468,10 +477,9 @@ fn every_arm<H: WhirHash>(c: &Case) {
         }
     }
     println!(
-        "GROUPED PARITY {} · {} · blowup 2^{}: {} chains ({} grouped over {} polynomials) · every arm the host's {} bytes",
-        c.name,
+        "GROUPED PARITY {} · {}: {} chains ({} grouped over {} polynomials) · every arm the host's {} bytes",
+        c.label(),
         H::NAME,
-        c.log_blowup,
         c.chains,
         c.grouped,
         c.grouped_polys,

@@ -666,7 +666,8 @@ fn cmd_prove_block(
     };
     eprintln!("BLOCK GROUP OPENING: {group}");
     assert_eq!(
-        cfg.format.zf.whir_blowup, blowup,
+        cfg.format.zf.whir_blowup,
+        blowup.factor(),
         "the tree's format is the installed one"
     );
     // A forced leaf count, another fan-in or another argue is another tree than
@@ -733,7 +734,7 @@ fn cmd_verify_block(
     blowup: &str,
 ) -> ExitCode {
     use prover::lfm::whir_block_tree::{
-        WhirBlockTreeProof, base_line, group_setting, verify_whir_block_tree_proof_as,
+        WhirBlockTreeProof, base_line, group_setting, verify_whir_block_tree_proof_at,
     };
 
     let fold = match group_setting(Some(group)) {
@@ -752,10 +753,12 @@ fn cmd_verify_block(
             return ExitCode::FAILURE;
         }
     };
-    let format = prover::block_whir::BlockFormat::production_with(fold);
     assert_eq!(
-        format.zf.whir_blowup, blowup,
-        "the verifier's format is the installed one"
+        prover::block_whir::BlockFormat::production_with(fold)
+            .zf
+            .whir_blowup,
+        blowup.factor(),
+        "the verifier's process format is the installed one"
     );
 
     let elf_data = match std::fs::read(&elf_path) {
@@ -788,7 +791,7 @@ fn cmd_verify_block(
     eprintln!("BLOCK WHIR BLOWUP: {blowup}");
     eprintln!("Verifying block proof...");
     let start = Instant::now();
-    let result = verify_whir_block_tree_proof_as(&elf_data, &proof, &format);
+    let result = verify_whir_block_tree_proof_at(&elf_data, &proof, fold, blowup);
     let verify_elapsed = start.elapsed();
     match result {
         Ok(()) => {
@@ -811,7 +814,7 @@ fn cmd_verify_block(
 /// process format, so its banner — printed once, on stdout — and every reader
 /// of it state the blowup the block is proved or verified under. The format's
 /// own environment knob for the blowup is refused: the flag is the caller's.
-fn install_block_format(word: &str) -> Result<u8, String> {
+fn install_block_format(word: &str) -> Result<prover::zf_format::WhirBlowup, String> {
     use prover::zf_format::{ENV_WHIR_BLOWUP, ZfFormat};
     if std::env::var_os(ENV_WHIR_BLOWUP).is_some() {
         return Err(format!(
@@ -820,7 +823,7 @@ fn install_block_format(word: &str) -> Result<u8, String> {
     }
     let blowup = prover::lfm::whir_block_tree::blowup_setting(Some(word))?;
     let format = ZfFormat {
-        whir_blowup: blowup,
+        whir_blowup: blowup.factor(),
         ..ZfFormat::from_env()?
     };
     ZfFormat::install(format)?;
@@ -1862,7 +1865,10 @@ mod tests {
                 _ => None,
             };
             assert_eq!(blowup(cmd).as_deref(), Some("4"), "the default");
-            for (word, want) in [("4", 4u8), ("2", 2)] {
+            for (word, want) in [
+                ("4", prover::zf_format::WhirBlowup::Four),
+                ("2", prover::zf_format::WhirBlowup::Two),
+            ] {
                 let args = [cmd, &["--blowup", word]].concat();
                 assert_eq!(blowup(&args).as_deref(), Some(word));
                 assert_eq!(
@@ -1877,7 +1883,7 @@ mod tests {
             }
         }
         assert_eq!(
-            prover::lfm::whir_block_tree::blowup_setting(None),
+            prover::lfm::whir_block_tree::blowup_setting(None).map(|b| b.factor()),
             Ok(prover::block_whir::BlockFormat::production().zf.whir_blowup),
             "unset is the production blowup"
         );

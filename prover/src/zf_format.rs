@@ -95,6 +95,33 @@ pub const PRODUCTION_WHIR_LOG_BLOWUP: usize = 2;
 /// read it. Widening this list is a format decision, not a parser one.
 pub const WHIR_BLOWUPS: [u8; 2] = [4, 2];
 
+/// The WHIR base code's blowup as a caller names it — the block commands'
+/// `--blowup 4|2`, the public block verifier's argument — so a caller chooses
+/// among [`WHIR_BLOWUPS`] and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WhirBlowup {
+    /// Blowup 4, rate 1/4: the default and the legacy format.
+    Four,
+    /// Blowup 2, rate 1/2.
+    Two,
+}
+
+impl WhirBlowup {
+    /// The blowup factor, as [`ZfFormat::whir_blowup`] holds it.
+    pub const fn factor(self) -> u8 {
+        match self {
+            Self::Four => WHIR_BLOWUPS[0],
+            Self::Two => WHIR_BLOWUPS[1],
+        }
+    }
+}
+
+impl std::fmt::Display for WhirBlowup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.factor())
+    }
+}
+
 // A grouped chain (D-ONECHAIN) is today's chain at `n + m` variables over
 // `H_{n+m+lb}`, which exists only within the field's two-adicity: at the widest
 // stack, the widest accepted blowup and the widest index, it must (REV-B2-B A-1).
@@ -1460,6 +1487,20 @@ mod tests {
         assert!(refused.contains("read before it could be set"), "{refused}");
         assert!(refused.contains(" whir_blowup=2"), "{refused}");
         assert_eq!(*ZfFormat::global(), process, "the refusal changed nothing");
+    }
+
+    /// The named blowups are the accepted list, and print as their factors.
+    #[test]
+    fn the_named_blowups_are_the_accepted_ones() {
+        assert_eq!(
+            [WhirBlowup::Four.factor(), WhirBlowup::Two.factor()],
+            WHIR_BLOWUPS
+        );
+        assert_eq!(WhirBlowup::Four.factor(), ZfFormat::DEFAULT.whir_blowup);
+        assert_eq!(
+            (WhirBlowup::Four.to_string(), WhirBlowup::Two.to_string()),
+            ("4".to_string(), "2".to_string())
+        );
     }
 
     #[test]
