@@ -1,0 +1,974 @@
+//! ⛔ MEASUREMENT (on no proving path): the values a first-round query's kept
+//! subtree holds, evaluated from the stacked multilinear instead of read out of
+//! its re-encoded codeword.
+//!
+//! Today a retired first-round codeword is rebuilt whole
+//! ([`crate::whir::encode_codeword_resident`]: `2^(n+b)` values) only for its
+//! openings to read the `2^kept` leaves under each query's kept tree node. A
+//! leaf `j` is the `2^fold` values `word[j + t·2^(D−fold)]`, `D = n + b`. If
+//! the tree put leaf `j` at position `bitrev(j)`, the leaves under one kept
+//! node would be `j ≡ c (mod 2^(D−L))`, `L = fold + kept`, and their values the
+//! codeword on ONE coset `ω^c·⟨ζ⟩`, `ζ = ω^(2^(D−L))`, `2^L` points.
+//!
+//! The codeword is `P(ω^j)` with `P(x) = f̂(x^(2^(n−1)), …, x^2, x)`: hypercube
+//! bit `s` goes to `x^(2^(n−1−s))` (`multilinear::whir::lift_coefficients`).
+//! On the coset `x^(2^m)` is the constant `ω^(c·2^m)` for every `m ≥ L`, so
+//! the bits `s < n − L` fold away against constants,
+//! `f'(rest) = f(rest, 0) + γ·(f(rest, 1) − f(rest, 0))`,
+//! `γ_s(c) = ω^(c·2^(n−1−s))`, and what is left is a multilinear of `L`
+//! variables: its Möbius transform, a twist by `ω^(c·i)` and one NTT of `2^L`
+//! over `ζ` give the coset's values. Bit `s`'s constant depends on `c` modulo
+//! `2^(b+1+s)` only, so the low bits fold once per residue class for every
+//! coset in it (the tile kernel), the rest per coset.
+//!
+//! No Möbius transform of the whole polynomial and no `2^(n+b)` transform.
+//! [`CosetPlan::evaluate_on_host`] is the same algorithm on the host, and the
+//! tests pin both against `encode(lift_coefficients(f))`.
+//!
+//! The module is loaded on first use from its own cubin, never by
+//! [`crate::device::Backend::init`].
+
+use std::sync::{Arc, OnceLock};
+
+use cudarc::driver::{
+    CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+};
+use cudarc::nvrtc::Ptx;
+use math::field::goldilocks::GoldilocksField;
+use math::field::traits::{IsFFTField, IsField};
+
+use crate::Result;
+use crate::device::{alloc_or_trim, backend, htod_or_trim};
+
+const WHIR_COSET_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/whir_coset.cubin"));
+
+/// Tile bits the tile kernel folds at most: a 256-value tile, its block.
+const MAX_TILE_LEVELS: usize = 8;
+/// Bits the rest kernel folds at most: one warp's lanes.
+const MAX_REST_LEVELS: usize = 5;
+/// Tiles a block of the tile kernel folds (`COSET_TILES_PER_BLOCK`).
+const TILES_PER_BLOCK: usize = 8;
+/// NTT stages and Möbius levels the chunk kernel takes in shared memory.
+const MAX_CHUNK_LEVELS: usize = 10;
+/// Dynamic shared memory the tile kernel may ask for: under the 48 KiB a
+/// block takes without an attribute, with room for its static arrays.
+const SHARED_LIMIT: usize = 47 * 1024;
+const BLOCK: u32 = 256;
+
+struct Module {
+    _module: Arc<CudaModule>,
+    fold_tiles: CudaFunction,
+    fold_rest: CudaFunction,
+    mobius_level: CudaFunction,
+    chunk: CudaFunction,
+    ntt_stage: CudaFunction,
+    leaf_order: CudaFunction,
+}
+
+fn module() -> Result<&'static Module> {
+    static MODULE: OnceLock<Module> = OnceLock::new();
+    if let Some(m) = MODULE.get() {
+        return Ok(m);
+    }
+    let be = backend()?;
+    let module = be
+        .ctx
+        .load_module(Ptx::from_binary(WHIR_COSET_CUBIN.to_vec()))?;
+    let m = Module {
+        fold_tiles: module.load_function("coset_fold_tiles")?,
+        fold_rest: module.load_function("coset_fold_rest")?,
+        mobius_level: module.load_function("coset_mobius_level")?,
+        chunk: module.load_function("coset_chunk")?,
+        ntt_stage: module.load_function("coset_ntt_stage")?,
+        leaf_order: module.load_function("coset_leaf_order")?,
+        _module: module,
+    };
+    Ok(MODULE.get_or_init(|| m))
+}
+
+fn fmul(a: u64, b: u64) -> u64 {
+    GoldilocksField::mul(&a, &b)
+}
+
+fn fadd(a: u64, b: u64) -> u64 {
+    GoldilocksField::add(&a, &b)
+}
+
+fn fsub(a: u64, b: u64) -> u64 {
+    GoldilocksField::sub(&a, &b)
+}
+
+fn fpow(mut base: u64, mut exp: u64) -> u64 {
+    let mut acc = 1u64;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            acc = fmul(acc, base);
+        }
+        base = fmul(base, base);
+        exp >>= 1;
+    }
+    acc
+}
+
+fn fold(f0: u64, f1: u64, gamma: u64) -> u64 {
+    fadd(f0, fmul(gamma, fsub(f1, f0)))
+}
+
+fn reverse(value: u64, bits: usize) -> u64 {
+    if bits == 0 {
+        0
+    } else {
+        value.reverse_bits() >> (64 - bits)
+    }
+}
+
+/// Everything the kernels read besides the polynomial, for one set of queried
+/// leaves: the cosets they fall in and the folding constants.
+#[derive(Clone, Debug)]
+pub struct CosetPlan {
+    num_vars: usize,
+    log_blowup: usize,
+    log_coset: usize,
+    kept: usize,
+    /// The cosets, as `c = j mod 2^(D−L)` over the queried leaves, ascending
+    /// and distinct. Output block `q` is coset `classes[q]`.
+    classes: Vec<u64>,
+    tile_levels: usize,
+    rest_levels: usize,
+    level_count: Vec<u32>,
+    level_offset: Vec<u32>,
+    parents: Vec<u32>,
+    gammas: Vec<u64>,
+    buf_len: usize,
+    slab_of: Vec<u32>,
+    rest_gammas: Vec<u64>,
+    twists: Vec<u64>,
+    twiddles: Vec<u64>,
+}
+
+impl CosetPlan {
+    /// The plan for a codeword of a `num_vars`-variable multilinear at
+    /// `log_blowup`, leaves of `2^log_fold` values, `kept` binary levels under
+    /// a kept node, and the queried `leaves` (each `< 2^(D−log_fold)`).
+    ///
+    /// `None` for a shape the kernels do not take: no bit to fold
+    /// (`num_vars ≤ L`), more than 13 bits to fold (8 tile + 5 rest), a
+    /// domain past the field's two-adicity, a leaf out of range, or no leaf.
+    pub fn new(
+        num_vars: usize,
+        log_blowup: usize,
+        log_fold: usize,
+        kept: usize,
+        leaves: &[u64],
+    ) -> Option<Self> {
+        let log_coset = log_fold + kept;
+        let log_domain = num_vars + log_blowup;
+        if leaves.is_empty()
+            || log_coset < 1
+            || num_vars <= log_coset
+            || log_domain > GoldilocksField::TWO_ADICITY as usize
+            || leaves.iter().any(|&j| j >> (log_domain - log_fold) != 0)
+        {
+            return None;
+        }
+        let folded = num_vars - log_coset;
+        let tile_levels = folded.min(MAX_TILE_LEVELS);
+        let rest_levels = folded - tile_levels;
+        if rest_levels > MAX_REST_LEVELS {
+            return None;
+        }
+        let omega = *GoldilocksField::get_primitive_root_of_unity(log_domain as u64)
+            .ok()?
+            .value();
+        // ω^(2^m), m = 0..D.
+        let mut omega_pow2 = Vec::with_capacity(log_domain + 1);
+        let mut w = omega;
+        for _ in 0..=log_domain {
+            omega_pow2.push(w);
+            w = fmul(w, w);
+        }
+        // Bit `s`'s constant for the class of `c`: ω^(c·2^(n−1−s)).
+        let gamma_of = |c: u64, s: usize| fpow(omega_pow2[num_vars - 1 - s], c);
+
+        let class_mod = 1u64 << (log_domain - log_coset);
+        let mut classes: Vec<u64> = leaves.iter().map(|&j| j & (class_mod - 1)).collect();
+        classes.sort_unstable();
+        classes.dedup();
+
+        // Level t lists the residues c mod 2^(b+1+t), ascending.
+        let mut keys: Vec<Vec<u64>> = Vec::with_capacity(tile_levels);
+        let mut level_count = Vec::with_capacity(tile_levels);
+        let mut level_offset = Vec::with_capacity(tile_levels);
+        let mut parents = Vec::new();
+        let mut gammas = Vec::new();
+        for t in 0..tile_levels {
+            let modulus = 1u64 << (log_blowup + 1 + t);
+            let mut level: Vec<u64> = classes.iter().map(|&c| c & (modulus - 1)).collect();
+            level.sort_unstable();
+            level.dedup();
+            level_offset.push(parents.len() as u32);
+            level_count.push(level.len() as u32);
+            for &key in &level {
+                let parent = if t == 0 {
+                    0
+                } else {
+                    keys[t - 1]
+                        .binary_search(&(key & ((modulus >> 1) - 1)))
+                        .ok()?
+                };
+                parents.push(parent as u32);
+                gammas.push(gamma_of(key, t));
+            }
+            keys.push(level);
+        }
+        let buf_len = (0..tile_levels)
+            .map(|t| (level_count[t] as usize) << (tile_levels - 1 - t))
+            .chain(std::iter::once(1usize << tile_levels))
+            .max()
+            .unwrap_or(1);
+
+        let last = keys.last()?;
+        let last_mod = 1u64 << (log_blowup + tile_levels);
+        let mut slab_of = Vec::with_capacity(classes.len());
+        let mut rest_gammas = Vec::with_capacity(classes.len() * rest_levels);
+        for &c in &classes {
+            slab_of.push(last.binary_search(&(c & (last_mod - 1))).ok()? as u32);
+            for l in 0..rest_levels {
+                rest_gammas.push(gamma_of(c, tile_levels + l));
+            }
+        }
+        let twists = classes.iter().map(|&c| fpow(omega, c)).collect();
+        let zeta = omega_pow2[log_domain - log_coset];
+        let mut twiddles = Vec::with_capacity(1 << (log_coset - 1));
+        let mut z = 1u64;
+        for _ in 0..1usize << (log_coset - 1) {
+            twiddles.push(z);
+            z = fmul(z, zeta);
+        }
+
+        let plan = Self {
+            num_vars,
+            log_blowup,
+            log_coset,
+            kept,
+            classes,
+            tile_levels,
+            rest_levels,
+            level_count,
+            level_offset,
+            parents,
+            gammas,
+            buf_len,
+            slab_of,
+            rest_gammas,
+            twists,
+            twiddles,
+        };
+        (plan.tile_shared_bytes() <= SHARED_LIMIT).then_some(plan)
+    }
+
+    /// The cosets, ascending; output block `q` is `classes()[q]`.
+    pub fn classes(&self) -> &[u64] {
+        &self.classes
+    }
+
+    /// Values a coset holds: `2^L`.
+    pub fn coset_len(&self) -> usize {
+        1 << self.log_coset
+    }
+
+    /// The output block of the coset `leaf` falls in.
+    pub fn block_of(&self, leaf: u64) -> Option<usize> {
+        let class_mod = 1u64 << self.classes_bits();
+        self.classes.binary_search(&(leaf & (class_mod - 1))).ok()
+    }
+
+    /// `D − L`: there are `2^(D−L)` cosets of `2^L` points in the domain.
+    fn classes_bits(&self) -> usize {
+        self.num_vars + self.log_blowup - self.log_coset
+    }
+
+    /// The leaves of output block `q` in its order: entry `r` is the leaf at
+    /// position `r` under the kept node, `c + bitrev_kept(r)·2^(D−L)`.
+    pub fn block_leaves(&self, q: usize) -> Vec<u64> {
+        let stride = 1u64 << self.classes_bits();
+        (0..1u64 << self.kept)
+            .map(|r| self.classes[q] + reverse(r, self.kept) * stride)
+            .collect()
+    }
+
+    /// Tiles of `2^tile_levels` values the polynomial splits into.
+    fn tiles(&self) -> usize {
+        1 << (self.num_vars - self.tile_levels)
+    }
+
+    /// Classes the last tile level lists: the slab's rows.
+    fn slab_rows(&self) -> usize {
+        *self.level_count.last().unwrap_or(&0) as usize
+    }
+
+    /// Möbius levels and NTT stages the chunk kernel takes.
+    fn chunk_levels(&self) -> usize {
+        self.log_coset.min(MAX_CHUNK_LEVELS)
+    }
+
+    /// Bytes the tile kernel's dynamic shared memory takes: the constants,
+    /// two level buffers, the block's last-level values, the parents.
+    fn tile_shared_bytes(&self) -> usize {
+        let total = self.gammas.len();
+        8 * (total + 2 * self.buf_len + self.slab_rows() * TILES_PER_BLOCK) + 4 * total
+    }
+
+    /// Bytes the device evaluation allocates for a polynomial: the assembled
+    /// stack, the classes' slabs, the cosets twice (transform and leaf order).
+    pub fn device_bytes(&self) -> usize {
+        8 * ((1 << self.num_vars)
+            + self.slab_rows() * self.tiles()
+            + 2 * self.classes.len() * self.coset_len())
+    }
+
+    /// The cosets' values from the multilinear's `2^n` hypercube values, on the
+    /// host, by the kernels' algorithm: block `q` is `2^L` values in leaf order
+    /// (leaf `r`'s `2^fold` values at `r·2^fold`).
+    pub fn evaluate_on_host(&self, values: &[u64]) -> Vec<u64> {
+        assert_eq!(
+            values.len(),
+            1 << self.num_vars,
+            "one value a hypercube point"
+        );
+        let tile = 1usize << self.tile_levels;
+        let tiles = self.tiles();
+        let mut slab = vec![0u64; self.slab_rows() * tiles];
+        for at in 0..tiles {
+            let mut rows = vec![values[at * tile..(at + 1) * tile].to_vec()];
+            for t in 0..self.tile_levels {
+                let off = self.level_offset[t] as usize;
+                rows = (0..self.level_count[t] as usize)
+                    .map(|k| {
+                        let row = &rows[self.parents[off + k] as usize];
+                        row.chunks_exact(2)
+                            .map(|p| fold(p[0], p[1], self.gammas[off + k]))
+                            .collect()
+                    })
+                    .collect();
+            }
+            for (k, row) in rows.iter().enumerate() {
+                slab[k * tiles + at] = row[0];
+            }
+        }
+
+        let n = self.coset_len();
+        let fold_bits = self.log_coset - self.kept;
+        let mut out = Vec::with_capacity(self.classes.len() * n);
+        for q in 0..self.classes.len() {
+            let row = &slab[self.slab_of[q] as usize * tiles..][..tiles];
+            let gammas = &self.rest_gammas[q * self.rest_levels..][..self.rest_levels];
+            let mut g: Vec<u64> = row
+                .chunks_exact(1 << self.rest_levels)
+                .map(|chunk| {
+                    let mut v = chunk.to_vec();
+                    for &gamma in gammas {
+                        v = v.chunks_exact(2).map(|p| fold(p[0], p[1], gamma)).collect();
+                    }
+                    v[0]
+                })
+                .collect();
+            for level in 0..self.log_coset {
+                for i in 0..n {
+                    if i >> level & 1 == 1 {
+                        g[i] = fsub(g[i], g[i ^ (1 << level)]);
+                    }
+                }
+            }
+            for (h, v) in g.iter_mut().enumerate() {
+                *v = fmul(*v, fpow(self.twists[q], reverse(h as u64, self.log_coset)));
+            }
+            for s in 1..=self.log_coset {
+                let half = 1usize << (s - 1);
+                for block in (0..n).step_by(2 * half) {
+                    for j in 0..half {
+                        let w = self.twiddles[j << (self.log_coset - s)];
+                        let u = g[block + j];
+                        let v = fmul(g[block + j + half], w);
+                        g[block + j] = fadd(u, v);
+                        g[block + j + half] = fsub(u, v);
+                    }
+                }
+            }
+            let mut block = vec![0u64; n];
+            for (u, &v) in g.iter().enumerate() {
+                let r = reverse(u as u64 & ((1 << self.kept) - 1), self.kept) as usize;
+                block[(r << fold_bits) | (u >> self.kept)] = v;
+            }
+            out.extend_from_slice(&block);
+        }
+        out
+    }
+}
+
+/// The cosets' values on the card: block `q` (`2^L` values, leaf order) for
+/// coset `plan.classes()[q]`, queued on `stream`.
+pub struct CosetValues {
+    buffer: CudaSlice<u64>,
+    stream: Arc<CudaStream>,
+}
+
+impl CosetValues {
+    /// Waits for the evaluation queued on this buffer's stream.
+    pub fn synchronize(&self) -> Result<()> {
+        self.stream.synchronize()
+    }
+
+    /// Every block, read back.
+    pub fn to_host(&self) -> Result<Vec<u64>> {
+        let values = self.stream.clone_dtoh(&self.buffer)?;
+        self.stream.synchronize()?;
+        Ok(values)
+    }
+}
+
+/// The plan's cosets over a stacked polynomial whose columns the card holds:
+/// `(column, offset)` into `store`, zeros between, as
+/// [`crate::whir::encode_codeword_resident`] assembles it.
+///
+/// `split`, when given, synchronizes after each phase and records its wall
+/// milliseconds (assemble, tiles, rest, transform); the timed path passes
+/// `None` and queues everything.
+pub fn evaluate_resident(
+    store: &crate::columns::DeviceColumns,
+    parts: &[(usize, usize)],
+    plan: &CosetPlan,
+    mut split: Option<&mut Vec<(&'static str, f64)>>,
+) -> Result<CosetValues> {
+    let be = backend()?;
+    let m = module()?;
+    let stream = be.next_stream();
+    let n = 1usize << plan.num_vars;
+    let mut clock = std::time::Instant::now();
+    let mut lap = |name: &'static str, stream: &Arc<CudaStream>| -> Result<()> {
+        if let Some(split) = split.as_deref_mut() {
+            stream.synchronize()?;
+            split.push((name, clock.elapsed().as_secs_f64() * 1e3));
+            clock = std::time::Instant::now();
+        }
+        Ok(())
+    };
+
+    for &(column, offset) in parts {
+        ensure!(column < store.num_columns() && offset + store.span(column).1 <= n);
+    }
+    // SAFETY: the memset writes every element.
+    let mut f = unsafe { alloc_or_trim::<u64>(&stream, n) }?;
+    stream.memset_zeros(&mut f)?;
+    for &(column, offset) in parts {
+        store.copy_into(column, &mut f, offset, &stream)?;
+    }
+    lap("assemble", &stream)?;
+
+    let tiles = plan.tiles();
+    let last = plan.slab_rows();
+    let count = htod_or_trim(&stream, &plan.level_count)?;
+    let offset = htod_or_trim(&stream, &plan.level_offset)?;
+    let parents = htod_or_trim(&stream, &plan.parents)?;
+    let gammas = htod_or_trim(&stream, &plan.gammas)?;
+    // SAFETY: the tile kernel writes every (class, tile) entry.
+    let mut slab = unsafe { alloc_or_trim::<u64>(&stream, last * tiles) }?;
+    let tiles_u64 = tiles as u64;
+    let levels_u32 = plan.tile_levels as u32;
+    let total_u32 = plan.gammas.len() as u32;
+    let buf_u32 = plan.buf_len as u32;
+    unsafe {
+        stream
+            .launch_builder(&m.fold_tiles)
+            .arg(&f)
+            .arg(&tiles_u64)
+            .arg(&levels_u32)
+            .arg(&count)
+            .arg(&offset)
+            .arg(&parents)
+            .arg(&gammas)
+            .arg(&total_u32)
+            .arg(&buf_u32)
+            .arg(&mut slab)
+            .launch(LaunchConfig {
+                grid_dim: (tiles.div_ceil(TILES_PER_BLOCK) as u32, 1, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: plan.tile_shared_bytes() as u32,
+            })?;
+    }
+    // Spent; the free is stream-ordered.
+    drop(f);
+    lap("tiles", &stream)?;
+
+    let cosets = plan.classes.len();
+    let len = plan.coset_len();
+    let log_len = plan.log_coset as u32;
+    let slab_of = htod_or_trim(&stream, &plan.slab_of)?;
+    // A zero-length upload is not an allocation the driver takes; the kernel
+    // reads no constant when there is no bit left.
+    let rest_gammas = if plan.rest_gammas.is_empty() {
+        htod_or_trim(&stream, &[0u64])?
+    } else {
+        htod_or_trim(&stream, &plan.rest_gammas)?
+    };
+    // SAFETY: the rest kernel writes every coset value.
+    let mut g = unsafe { alloc_or_trim::<u64>(&stream, cosets * len) }?;
+    let rest_u32 = plan.rest_levels as u32;
+    let cosets_u32 = cosets as u32;
+    let warps = (cosets * len) as u64;
+    unsafe {
+        stream
+            .launch_builder(&m.fold_rest)
+            .arg(&slab)
+            .arg(&tiles_u64)
+            .arg(&rest_u32)
+            .arg(&cosets_u32)
+            .arg(&slab_of)
+            .arg(&rest_gammas)
+            .arg(&log_len)
+            .arg(&mut g)
+            .launch(LaunchConfig {
+                grid_dim: ((warps * 32).div_ceil(BLOCK as u64) as u32, 1, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    drop(slab);
+    lap("rest", &stream)?;
+
+    let twists = htod_or_trim(&stream, &plan.twists)?;
+    let twiddles = htod_or_trim(&stream, &plan.twiddles)?;
+    let chunk_levels = plan.chunk_levels();
+    let pairs = (cosets * len / 2) as u64;
+    let pair_grid = LaunchConfig {
+        grid_dim: (pairs.div_ceil(BLOCK as u64) as u32, 1, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    // The Möbius levels commute, so the ones past the chunk go first and the
+    // chunk kernel ends the transform where the NTT starts.
+    for level in chunk_levels..plan.log_coset {
+        let level_u32 = level as u32;
+        unsafe {
+            stream
+                .launch_builder(&m.mobius_level)
+                .arg(&mut g)
+                .arg(&pairs)
+                .arg(&log_len)
+                .arg(&level_u32)
+                .launch(pair_grid)?;
+        }
+    }
+    let chunk_u32 = chunk_levels as u32;
+    unsafe {
+        stream
+            .launch_builder(&m.chunk)
+            .arg(&mut g)
+            .arg(&log_len)
+            .arg(&chunk_u32)
+            .arg(&twists)
+            .arg(&twiddles)
+            .launch(LaunchConfig {
+                grid_dim: ((cosets << (plan.log_coset - chunk_levels)) as u32, 1, 1),
+                block_dim: (1 << (chunk_levels - 1), 1, 1),
+                shared_mem_bytes: (8usize << chunk_levels) as u32,
+            })?;
+    }
+    for stage in chunk_levels + 1..=plan.log_coset {
+        let stage_u32 = stage as u32;
+        unsafe {
+            stream
+                .launch_builder(&m.ntt_stage)
+                .arg(&mut g)
+                .arg(&pairs)
+                .arg(&log_len)
+                .arg(&stage_u32)
+                .arg(&twiddles)
+                .launch(pair_grid)?;
+        }
+    }
+    // SAFETY: the permutation writes every value.
+    let mut out = unsafe { alloc_or_trim::<u64>(&stream, cosets * len) }?;
+    let total = (cosets * len) as u64;
+    let kept_u32 = plan.kept as u32;
+    unsafe {
+        stream
+            .launch_builder(&m.leaf_order)
+            .arg(&g)
+            .arg(&total)
+            .arg(&log_len)
+            .arg(&kept_u32)
+            .arg(&mut out)
+            .launch(LaunchConfig {
+                grid_dim: (total.div_ceil(BLOCK as u64) as u32, 1, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    drop(g);
+    lap("transform", &stream)?;
+    Ok(CosetValues {
+        buffer: out,
+        stream,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use math::field::element::FieldElement;
+    use multilinear::mle::Mle;
+    use multilinear::whir::{Domain, encode, lift_coefficients};
+
+    type FE = FieldElement<GoldilocksField>;
+    const P: u64 = 0xFFFF_FFFF_0000_0001;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    fn canonical(v: u64) -> u64 {
+        if v >= P { v - P } else { v }
+    }
+
+    /// The codeword the commit encodes: `encode(lift_coefficients(f))` over
+    /// the `2^(n+b)` subgroup.
+    fn codeword(values: &[u64], num_vars: usize, log_blowup: usize) -> Vec<u64> {
+        let mle = Mle::new(values.iter().map(|&v| FE::from(v)).collect()).expect("mle");
+        let domain = Domain::<GoldilocksField>::new(num_vars + log_blowup).expect("domain");
+        encode::<GoldilocksField, GoldilocksField>(&lift_coefficients(&mle), &domain)
+            .expect("encode")
+            .iter()
+            .map(|v| canonical(*v.value()))
+            .collect()
+    }
+
+    /// Every block equals the codeword at its leaves, leaf by leaf and value
+    /// by value: block `q`'s entry `r·2^fold + t` is `word[leaf_r + t·2^(D−fold)]`.
+    fn the_host_plan_is_the_codeword(
+        num_vars: usize,
+        log_blowup: usize,
+        log_fold: usize,
+        kept: usize,
+        queries: usize,
+        seed: u64,
+    ) {
+        let mut rng = Rng(seed);
+        let values: Vec<u64> = (0..1usize << num_vars).map(|_| rng.next() % P).collect();
+        let num_leaves = 1u64 << (num_vars + log_blowup - log_fold);
+        let leaves: Vec<u64> = (0..queries).map(|_| rng.next() % num_leaves).collect();
+        let plan = CosetPlan::new(num_vars, log_blowup, log_fold, kept, &leaves).expect("plan");
+        let word = codeword(&values, num_vars, log_blowup);
+        let got = plan.evaluate_on_host(&values);
+        let n = plan.coset_len();
+        assert_eq!(got.len(), plan.classes().len() * n);
+        let emulated = emulate::kernels(&plan, &values);
+        assert_eq!(
+            emulated.iter().map(|&v| canonical(v)).collect::<Vec<_>>(),
+            got.iter().map(|&v| canonical(v)).collect::<Vec<_>>(),
+            "the kernels' emulation and the host algorithm"
+        );
+        for (q, block) in got.chunks_exact(n).enumerate() {
+            for (r, leaf) in plan.block_leaves(q).into_iter().enumerate() {
+                for t in 0..1usize << log_fold {
+                    let want = word[leaf as usize + t * num_leaves as usize];
+                    assert_eq!(
+                        canonical(block[(r << log_fold) + t]),
+                        want,
+                        "n {num_vars} b {log_blowup} fold {log_fold} kept {kept}: block {q} leaf {leaf} value {t}"
+                    );
+                }
+            }
+        }
+        for &leaf in &leaves {
+            let q = plan.block_of(leaf).expect("every query has a block");
+            assert!(
+                plan.block_leaves(q).contains(&leaf),
+                "a query's block holds its leaf"
+            );
+        }
+    }
+
+    /// `kernels/whir_coset.cu` transcribed: each kernel's blocks, threads and
+    /// warps run in turn (a phase between two barriers at a time), over the
+    /// shared-memory layout and the launch parameters [`evaluate_resident`]
+    /// passes. What the laptop can say about the device code without a card:
+    /// an index, a layout or a launch-size slip shows here as a wrong value
+    /// or an out-of-bounds panic.
+    // A transcription keeps the kernels' thread loops, indices and all.
+    #[allow(clippy::needless_range_loop)]
+    mod emulate {
+        use super::super::*;
+
+        pub fn kernels(plan: &CosetPlan, values: &[u64]) -> Vec<u64> {
+            let tiles = plan.tiles();
+            let mut slab = vec![0u64; plan.slab_rows() * tiles];
+            fold_tiles(plan, values, &mut slab);
+            let cosets = plan.classes.len();
+            let len = plan.coset_len();
+            let mut g = vec![0u64; cosets * len];
+            fold_rest(plan, &slab, &mut g);
+            let cl = plan.chunk_levels();
+            let pairs = cosets * len / 2;
+            for level in cl..plan.log_coset {
+                mobius_level(&mut g, pairs, plan.log_coset, level);
+            }
+            chunk(plan, &mut g, cl);
+            for stage in cl + 1..=plan.log_coset {
+                ntt_stage(&mut g, pairs, plan.log_coset, stage, &plan.twiddles);
+            }
+            let mut out = vec![0u64; cosets * len];
+            leaf_order(&g, plan.log_coset, plan.kept, &mut out);
+            out
+        }
+
+        fn fold_tiles(plan: &CosetPlan, f: &[u64], slab: &mut [u64]) {
+            const TILES: usize = TILES_PER_BLOCK;
+            let levels = plan.tile_levels;
+            let num_tiles = plan.tiles();
+            let total = plan.gammas.len();
+            let buf_len = plan.buf_len;
+            let last_count = plan.level_count[levels - 1] as usize;
+            // The kernel's dynamic layout, in u64 words, and the bytes asked for.
+            let fin_at = total + 2 * buf_len;
+            let parent_at_bytes = 8 * (fin_at + last_count * TILES);
+            assert_eq!(parent_at_bytes + 4 * total, plan.tile_shared_bytes());
+            let grid = num_tiles.div_ceil(TILES);
+            for block in 0..grid {
+                let mut bufs = [vec![0u64; buf_len], vec![0u64; buf_len]];
+                let mut fin = vec![0u64; last_count * TILES];
+                let tile = 1usize << levels;
+                let first = block * TILES;
+                for i in 0..TILES {
+                    let at = first + i;
+                    if at >= num_tiles {
+                        break;
+                    }
+                    bufs[0][..tile].copy_from_slice(&f[at * tile..(at + 1) * tile]);
+                    let (mut inp, mut out) = (0usize, 1usize);
+                    let mut width = tile;
+                    for t in 0..levels {
+                        let cnt = plan.level_count[t] as usize;
+                        let off = plan.level_offset[t] as usize;
+                        let log_half = levels - 1 - t;
+                        let half = 1usize << log_half;
+                        let outputs = cnt << log_half;
+                        let last = t + 1 == levels;
+                        let mut wrote = vec![0u64; buf_len];
+                        for o in 0..outputs {
+                            let k = o >> log_half;
+                            let j = o & (half - 1);
+                            let row = plan.parents[off + k] as usize * width + 2 * j;
+                            let r = fold(bufs[inp][row], bufs[inp][row + 1], plan.gammas[off + k]);
+                            if last {
+                                fin[k * TILES + i] = r;
+                            } else {
+                                wrote[o] = r;
+                            }
+                        }
+                        if !last {
+                            bufs[out][..outputs].copy_from_slice(&wrote[..outputs]);
+                        }
+                        std::mem::swap(&mut inp, &mut out);
+                        width = half;
+                    }
+                }
+                for x in 0..last_count * TILES {
+                    let k = x / TILES;
+                    let at = first + x % TILES;
+                    if at < num_tiles {
+                        slab[k * num_tiles + at] = fin[x];
+                    }
+                }
+            }
+        }
+
+        fn fold_rest(plan: &CosetPlan, slab: &[u64], g: &mut [u64]) {
+            let rest = plan.rest_levels;
+            let num_tiles = plan.tiles();
+            let log_free = plan.log_coset;
+            let warps = plan.classes.len() << log_free;
+            let threads = (warps * 32).div_ceil(BLOCK as usize) * BLOCK as usize;
+            for warp in 0..threads / 32 {
+                if warp >= warps {
+                    continue;
+                }
+                let q = warp >> log_free;
+                let h = warp & ((1 << log_free) - 1);
+                let src = plan.slab_of[q] as usize * num_tiles + (h << rest);
+                let mut v: Vec<u64> = (0..32)
+                    .map(|lane| {
+                        if lane < 1 << rest {
+                            slab[src + lane]
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                for l in 0..rest {
+                    let snap = v.clone();
+                    for lane in 0..32 {
+                        let partner = if lane + (1 << l) < 32 {
+                            snap[lane + (1 << l)]
+                        } else {
+                            snap[lane]
+                        };
+                        if lane & ((2 << l) - 1) == 0 {
+                            v[lane] = fold(snap[lane], partner, plan.rest_gammas[q * rest + l]);
+                        }
+                    }
+                }
+                g[warp] = v[0];
+            }
+        }
+
+        fn mobius_level(g: &mut [u64], pairs: usize, log_size: usize, level: usize) {
+            for idx in 0..pairs {
+                let q = idx >> (log_size - 1);
+                let r = idx & ((1 << (log_size - 1)) - 1);
+                let lo = ((r >> level) << (level + 1)) | (r & ((1 << level) - 1));
+                let base = q << log_size;
+                g[base + lo + (1 << level)] = fsub(g[base + lo + (1 << level)], g[base + lo]);
+            }
+        }
+
+        fn chunk(plan: &CosetPlan, g: &mut [u64], cl: usize) {
+            let log_size = plan.log_coset;
+            let half = 1usize << (cl - 1);
+            let chunks = 1usize << (log_size - cl);
+            for block in 0..plan.classes.len() << (log_size - cl) {
+                let q = block / chunks;
+                let at = (block % chunks) << cl;
+                let base = (q << log_size) + at;
+                let mut x = g[base..base + 2 * half].to_vec();
+                for l in 0..cl {
+                    for tid in 0..half {
+                        let lo = ((tid >> l) << (l + 1)) | (tid & ((1 << l) - 1));
+                        x[lo + (1 << l)] = fsub(x[lo + (1 << l)], x[lo]);
+                    }
+                }
+                let w = plan.twists[q];
+                for tid in 0..half {
+                    for e in [tid, tid + half] {
+                        let i = reverse((at + e) as u64, log_size);
+                        x[e] = fmul(x[e], fpow(w, i));
+                    }
+                }
+                for s in 1..=cl {
+                    let h = 1usize << (s - 1);
+                    for tid in 0..half {
+                        let i0 = ((tid >> (s - 1)) << s) | (tid & (h - 1));
+                        let tw = plan.twiddles[(tid & (h - 1)) << (log_size - s)];
+                        let u = x[i0];
+                        let v = fmul(x[i0 + h], tw);
+                        x[i0] = fadd(u, v);
+                        x[i0 + h] = fsub(u, v);
+                    }
+                }
+                g[base..base + 2 * half].copy_from_slice(&x);
+            }
+        }
+
+        fn ntt_stage(g: &mut [u64], pairs: usize, log_size: usize, s: usize, twiddles: &[u64]) {
+            for idx in 0..pairs {
+                let q = idx >> (log_size - 1);
+                let r = idx & ((1 << (log_size - 1)) - 1);
+                let h = 1usize << (s - 1);
+                let j = r & (h - 1);
+                let i0 = ((r >> (s - 1)) << s) | j;
+                let base = q << log_size;
+                let u = g[base + i0];
+                let v = fmul(g[base + i0 + h], twiddles[j << (log_size - s)]);
+                g[base + i0] = fadd(u, v);
+                g[base + i0 + h] = fsub(u, v);
+            }
+        }
+
+        fn leaf_order(g: &[u64], log_size: usize, kept: usize, out: &mut [u64]) {
+            for (idx, &v) in g.iter().enumerate() {
+                let q = idx >> log_size;
+                let u = idx & ((1 << log_size) - 1);
+                let low = u & ((1 << kept) - 1);
+                let r = if kept == 0 {
+                    0
+                } else {
+                    reverse(low as u64, kept) as usize
+                };
+                let t = u >> kept;
+                out[(q << log_size) | (r << (log_size - kept)) | t] = v;
+            }
+        }
+    }
+
+    /// Tile levels only, the rest kernel copying.
+    #[test]
+    fn cosets_equal_the_codeword_with_tile_levels_only() {
+        the_host_plan_is_the_codeword(10, 2, 3, 4, 9, 1);
+        the_host_plan_is_the_codeword(12, 2, 2, 3, 20, 2);
+    }
+
+    /// Tile levels and rest levels both, at blowups 2, 4 and 8.
+    #[test]
+    fn cosets_equal_the_codeword_with_rest_levels() {
+        the_host_plan_is_the_codeword(14, 2, 2, 2, 17, 3);
+        the_host_plan_is_the_codeword(15, 1, 3, 1, 11, 4);
+        the_host_plan_is_the_codeword(16, 3, 2, 1, 33, 5);
+    }
+
+    /// The production geometry's coset (first fold 6, 256 leaves a kept node:
+    /// 2^14 points) over the smallest stack that still folds bits.
+    #[test]
+    fn cosets_equal_the_codeword_at_the_production_coset() {
+        the_host_plan_is_the_codeword(16, 2, 6, 8, 12, 6);
+    }
+
+    /// The production plan's shape: 13 bits fold (8 tile, 5 rest), the
+    /// classes and the device footprint, without a polynomial.
+    #[test]
+    fn the_production_plan_folds_eight_tile_and_five_rest_bits() {
+        let mut rng = Rng(7);
+        let leaves: Vec<u64> = (0..114).map(|_| rng.next() % (1 << 23)).collect();
+        let plan = CosetPlan::new(27, 2, 6, 8, &leaves).expect("plan");
+        assert_eq!((plan.tile_levels, plan.rest_levels), (8, 5));
+        assert_eq!(plan.coset_len(), 1 << 14);
+        assert!(plan.classes().len() <= 114);
+        // Level t lists at most the 2^(3+t) residues, and at most the queries.
+        for (t, &count) in plan.level_count.iter().enumerate() {
+            assert!(
+                count as usize <= (8usize << t).min(114),
+                "level {t}: {count}"
+            );
+        }
+        assert!(plan.tile_shared_bytes() <= SHARED_LIMIT);
+        assert!(plan.buf_len <= 1024);
+        for &leaf in &leaves {
+            let q = plan.block_of(leaf).expect("block");
+            assert!(plan.block_leaves(q).contains(&leaf));
+        }
+    }
+
+    #[test]
+    fn shapes_the_kernels_do_not_take_are_refused() {
+        assert!(
+            CosetPlan::new(14, 2, 6, 8, &[0]).is_none(),
+            "no bit to fold"
+        );
+        assert!(
+            CosetPlan::new(28, 2, 6, 8, &[0]).is_none(),
+            "14 bits to fold"
+        );
+        assert!(CosetPlan::new(20, 2, 6, 8, &[]).is_none(), "no query");
+        assert!(
+            CosetPlan::new(20, 2, 6, 8, &[1 << 16]).is_none(),
+            "leaf out of range"
+        );
+        assert!(CosetPlan::new(20, 2, 6, 8, &[(1 << 16) - 1]).is_some());
+    }
+}

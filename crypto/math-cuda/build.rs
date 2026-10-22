@@ -279,4 +279,7 @@ fn main() {
     compile_kernel("p1w16.cu", "p1w16.cubin", have_nvcc, &[]);
     compile_kernel("sumcheck.cu", "sumcheck.cubin", have_nvcc, &[]);
     compile_kernel("whir_fold.cu", "whir_fold.cubin", have_nvcc, &[]);
+    // The first-round cosets evaluated from the polynomial (`src/whir_coset.rs`),
+    // a measurement module loaded on first use, never by the backend.
+    compile_kernel("whir_coset.cu", "whir_coset.cubin", have_nvcc, &[]);
 }
