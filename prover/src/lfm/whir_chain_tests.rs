@@ -1995,6 +1995,7 @@ fn the_production_default_chain_is_first6_under_the_auto_cap() {
             argue: multilinear::whir_chain::ArgueFormat::PerTable,
             arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
             group: multilinear::whir_chain::GroupFold::PerPoly,
+            leaves: multilinear::whir_chain::LeafOrder::Natural,
         },
         ..config(114, 0)
     };
@@ -2038,6 +2039,7 @@ fn the_grind_bits_opt_out_chain_keeps_its_pins() {
             argue: multilinear::whir_chain::ArgueFormat::PerTable,
             arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
             group: multilinear::whir_chain::GroupFold::PerPoly,
+            leaves: multilinear::whir_chain::LeafOrder::Natural,
         },
         ..config(112, 0)
     };
@@ -2074,6 +2076,7 @@ fn the_grind_opt_out_chain_keeps_the_pins_from_before_p2() {
             argue: multilinear::whir_chain::ArgueFormat::PerTable,
             arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
             group: multilinear::whir_chain::GroupFold::PerPoly,
+            leaves: multilinear::whir_chain::LeafOrder::Natural,
         },
         ..config(112, 20)
     };

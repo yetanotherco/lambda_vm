@@ -71,6 +71,8 @@ use crate::{
     },
 };
 
+pub use crate::whir_commit::LeafOrder;
+
 /// `w(x)·f(x)`, the shape every group's sumcheck runs over.
 fn product<E: IsField>(values: &[FieldElement<E>]) -> FieldElement<E> {
     &values[0] * &values[1]
@@ -276,6 +278,9 @@ pub struct ChainFormat {
     /// How a stack's polynomials are cut into chains (D-ONECHAIN, W-14).
     /// [`GroupFold::PerPoly`] = today.
     pub group: GroupFold,
+    /// Where the round-0 trees put their leaves. [`LeafOrder::Natural`] =
+    /// today.
+    pub leaves: LeafOrder,
 }
 
 impl ChainFormat {
@@ -288,6 +293,7 @@ impl ChainFormat {
         argue: ArgueFormat::PerTable,
         arity4_cap: CapPolicy::Off,
         group: GroupFold::PerPoly,
+        leaves: LeafOrder::Natural,
     };
 
     /// True when this is today's format (`Fixed(0)` counts as `Off`).
@@ -299,6 +305,7 @@ impl ChainFormat {
             && self.argue == ArgueFormat::PerTable
             && self.arity4_cap.is_off()
             && self.group == GroupFold::PerPoly
+            && self.leaves == LeafOrder::Natural
     }
 
     /// The cap policy of trees with `arity` children per node:
@@ -509,6 +516,12 @@ pub const FOLD_WORD_TAG: u64 = 1 << 63;
 /// always beside [`FOLD_WORD_TAG`]. No other word sets it: a `First` word's
 /// fields sit at bits 52+, 48 and the low nibble.
 pub const FOLD_WORD_INDEXED: u64 = 1 << 47;
+
+/// The bit of [`ChainConfig::fold_word`] that says [`LeafOrder::Coset`],
+/// always beside [`FOLD_WORD_TAG`]. No other word sets it: a `First` word's
+/// fields sit at bits 52+, 48 and the low nibble, and [`FOLD_WORD_INDEXED`]
+/// is bit 47.
+pub const FOLD_WORD_COSET: u64 = 1 << 46;
 
 /// How a stack's polynomials are opened (D-ONECHAIN, the ledger's W-14).
 ///
@@ -773,6 +786,9 @@ impl ChainConfig {
     /// - [`GroupFold::Indexed`] → either word above with [`FOLD_WORD_TAG`] and
     ///   [`FOLD_WORD_INDEXED`] set, so a grouped statement shares no word with
     ///   a per-polynomial one under any fold schedule.
+    /// - [`LeafOrder::Coset`] → any word above with [`FOLD_WORD_TAG`] and
+    ///   [`FOLD_WORD_COSET`] set: the round-0 trees' roots and paths follow the
+    ///   order, so a statement under one order shares no word with the other.
     ///
     /// Every chain's schedule is a function of this word and its own
     /// `num_vars`, which the statement already binds, so binding the word
@@ -789,9 +805,13 @@ impl ChainConfig {
                     | k0.get() as u64
             }
         };
-        match self.format.group {
+        let word = match self.format.group {
             GroupFold::PerPoly => word,
             GroupFold::Indexed => word | FOLD_WORD_TAG | FOLD_WORD_INDEXED,
+        };
+        match self.format.leaves {
+            LeafOrder::Natural => word,
+            LeafOrder::Coset => word | FOLD_WORD_TAG | FOLD_WORD_COSET,
         }
     }
 
@@ -1073,7 +1093,10 @@ where
     let domain = Domain::<F>::new(num_vars + config.log_blowup)?;
     // On a device the codeword stays there: the chain folds it and opens a
     // handful of its values, and it is the biggest array the proof holds.
+    // The card places its leaves in natural order only, so a round-0 tree in
+    // another order is built on the host.
     let attempt = match &f.resident {
+        _ if config.format.leaves != LeafOrder::Natural => None,
         Some((store, parts)) => crate::gpu::commit_resident(
             store,
             parts,
@@ -1103,10 +1126,11 @@ where
         // figure — neither of which names the cause.
         None => {
             crate::gpu::note_host_fallback();
-            CodewordCommitment::from_codeword(
-                encode::<F, F>(&lift_coefficients(&f.assemble()?), &domain)?,
-                first,
-            )?
+            let codeword = encode::<F, F>(&lift_coefficients(&f.assemble()?), &domain)?;
+            match config.format.leaves {
+                LeafOrder::Natural => CodewordCommitment::from_codeword(codeword, first)?,
+                leaves => CodewordCommitment::from_codeword_on_host_in(codeword, first, leaves)?,
+            }
         }
     };
     Ok((commitment, domain))
@@ -2220,9 +2244,12 @@ where
     let caps = config.tree_caps_at(num_vars, crate::whir_hash::arity::<F, H>());
     // Which nonce slots the proof carries: a verifier constant too.
     let layout = config.format.nonces;
+    // Round-0 trees put their leaves in the chain's order; every later tree is
+    // a successor's, natural.
     let mut current: TreeCheck<'a> = TreeCheck::Owner {
         root,
         cap_height: caps[0],
+        leaves: config.format.leaves,
     };
     let round0_trees: Vec<TreeCheck<'a>> = if grouped {
         roots
@@ -2230,6 +2257,7 @@ where
             .map(|root| TreeCheck::Owner {
                 root,
                 cap_height: caps[0],
+                leaves: config.format.leaves,
             })
             .collect()
     } else {
@@ -2463,7 +2491,8 @@ where
         } else {
             opening.proof.merkle_path.as_slice()
         };
-        if !verify_opening_capped::<C, H>(&check, q, opening, siblings) {
+        let at = current.position(q, depth);
+        if !verify_opening_capped::<C, H>(&check, at, opening, siblings) {
             return Err(Error::OpeningRejected { query: i });
         }
         if fold_coset::<F, C, N>(&opening.values, current_domain, q, alphas)? != *final_value {
