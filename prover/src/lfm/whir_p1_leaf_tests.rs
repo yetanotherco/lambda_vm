@@ -13,8 +13,8 @@ use crypto::hash::poseidon1_stark::Merkle4;
 use multilinear::mle::Mle;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{
-    CapPolicy, ChainConfig, ChainFormat, ChainProof, GrindBits, RoundOpenings, commit, prove,
-    verify,
+    CapPolicy, ChainConfig, ChainFormat, ChainProof, FirstFold, GrindBits, LeafOrder,
+    RoundOpenings, WhirFolds, commit, prove, verify,
 };
 use multilinear::whir_hash::P1Whir;
 
@@ -607,6 +607,176 @@ fn a_tampered_p1_chain_cannot_execute() {
                 execute(&program, &[p1_chain_arena(&f, forged)], &SOCKET).is_err(),
                 "{name} (caps {:?}): the machine must refuse the forgery",
                 f.shape.caps
+            );
+        }
+    }
+}
+
+/// [`p1_config`] with its round-0 trees in `leaves`' order, round 0 folding
+/// `first` variables when given.
+fn p1_ordered_config(
+    num_queries: usize,
+    grind: u8,
+    cap4: CapPolicy,
+    first: Option<usize>,
+    leaves: LeafOrder,
+) -> ChainConfig {
+    let mut cfg = p1_config(num_queries, grind, cap4);
+    cfg.format.leaves = leaves;
+    if let Some(k0) = first {
+        cfg.format.folds = WhirFolds::First(FirstFold::new(k0).expect("a tested first fold"));
+    }
+    cfg
+}
+
+/// The coset gates' shapes: [`chain_cases`] in the coset order, and the
+/// production's first fold of 6 under the production cap (`Auto`) and at the C2
+/// cap, at odd and even round-0 depths.
+fn coset_chain_cases() -> Vec<(usize, ChainConfig)> {
+    let mut cases: Vec<(usize, ChainConfig)> = chain_cases()
+        .into_iter()
+        .map(|(num_vars, mut cfg)| {
+            cfg.format.leaves = LeafOrder::Coset;
+            (num_vars, cfg)
+        })
+        .collect();
+    for cap4 in [CapPolicy::Auto, CapPolicy::Fixed(2)] {
+        for (num_vars, num_queries, grind) in [(9usize, 3usize, 0u8), (10, 4, 6), (11, 4, 0)] {
+            cases.push((
+                num_vars,
+                p1_ordered_config(num_queries, grind, cap4, Some(6), LeafOrder::Coset),
+            ));
+        }
+    }
+    cases
+}
+
+/// ★ A Poseidon1 chain whose round-0 tree places block `j` at `bitrev(j)`
+/// executes on every proof the host accepts: round 0's 4-ary walks take the
+/// index bits reversed, the position the host prover placed the block at.
+#[test]
+fn a_coset_p1_chain_executes_on_a_proof_the_host_accepts() {
+    for (num_vars, cfg) in coset_chain_cases() {
+        let f = fixture(num_vars, cfg);
+        assert_eq!(f.shape.leaves, LeafOrder::Coset);
+        let program = p1_chain_program(&f.shape);
+        execute(&program, &[p1_chain_arena(&f, &f.proof)], &SOCKET).unwrap_or_else(|e| {
+            panic!(
+                "S={num_vars} {:?} caps {:?}: the machine refused an accepted coset proof: {e:?}",
+                f.shape.schedule, f.shape.caps
+            )
+        });
+    }
+}
+
+/// ★ The round-0 rewire adds no row and is load-bearing. At every coset shape
+/// the coset program and the natural one have the same rows chip by chip and
+/// different instructions. Each refuses the other's proofs (and so does the
+/// host, so each refusal is of a proof invalid under that order). The refusals
+/// are run where round 0's tree has 2^7 leaves, 16 of them their own bit
+/// reversal, with nine queries and no grind: a natural proof whose every query
+/// lands on such a leaf is valid under both orders, as it should be, and turns
+/// up with probability 8^-9.
+#[test]
+fn a_coset_p1_program_and_a_natural_one_refuse_each_others_proofs() {
+    for (num_vars, cfg) in coset_chain_cases() {
+        let mut natural = cfg;
+        natural.format.leaves = LeafOrder::Natural;
+        let coset_program = p1_chain_program(&ChainShape::new_at(&cfg, num_vars, 4));
+        let natural_program = p1_chain_program(&ChainShape::new_at(&natural, num_vars, 4));
+        assert_eq!(
+            super::whir_chain::ChipRows::of(&coset_program),
+            super::whir_chain::ChipRows::of(&natural_program),
+            "S={num_vars}: no row added"
+        );
+        assert_ne!(
+            format!("{:?}", coset_program.instrs),
+            format!("{:?}", natural_program.instrs),
+            "S={num_vars}: the round-0 walks are wired otherwise"
+        );
+    }
+    for cap4 in [CapPolicy::Off, CapPolicy::Fixed(2)] {
+        let coset = p1_ordered_config(9, 0, cap4, Some(6), LeafOrder::Coset);
+        let natural = p1_ordered_config(9, 0, cap4, Some(6), LeafOrder::Natural);
+        let made_coset = fixture(11, coset);
+        let made_natural = fixture(11, natural);
+        assert_eq!(
+            made_coset.shape.domain_log[0] - made_coset.shape.schedule[0],
+            7
+        );
+        let coset_program = p1_chain_program(&made_coset.shape);
+        let natural_program = p1_chain_program(&made_natural.shape);
+        let mut t = P1Transcript::new();
+        let natural_under_coset = verify::<F, E, _, P1Whir>(
+            &made_natural.proof,
+            &made_natural.root_bytes,
+            &made_natural.z,
+            made_natural.y,
+            &made_natural.domain,
+            &coset,
+            &mut t,
+        );
+        assert!(
+            natural_under_coset.is_err(),
+            "{cap4:?}: the host, a natural proof"
+        );
+        assert!(
+            !host_accepts(&made_natural, &made_coset.proof),
+            "{cap4:?}: the host, a coset proof"
+        );
+        assert!(
+            execute(
+                &coset_program,
+                &[p1_chain_arena(&made_natural, &made_natural.proof)],
+                &SOCKET
+            )
+            .is_err(),
+            "{cap4:?}: a coset program accepted a natural proof"
+        );
+        assert!(
+            execute(
+                &natural_program,
+                &[p1_chain_arena(&made_coset, &made_coset.proof)],
+                &SOCKET
+            )
+            .is_err(),
+            "{cap4:?}: a natural program accepted a coset proof"
+        );
+    }
+}
+
+/// ★ Under the coset order the machine refuses what the host rejects: a round-0
+/// block value and a round-0 Merkle sibling, uncapped and capped.
+#[test]
+fn a_tampered_coset_p1_chain_cannot_execute() {
+    for cap4 in [CapPolicy::Off, CapPolicy::Fixed(2)] {
+        let f = fixture(11, p1_ordered_config(4, 0, cap4, Some(6), LeafOrder::Coset));
+        let program = p1_chain_program(&f.shape);
+        assert!(
+            execute(&program, &[p1_chain_arena(&f, &f.proof)], &SOCKET).is_ok(),
+            "the untouched proof must execute, or the arm below proves nothing"
+        );
+        let mut sites: Vec<(&str, ChainProof<F, E>)> = Vec::new();
+        let mut forged = f.proof.clone();
+        match &mut forged.rounds[0].openings {
+            RoundOpenings::Base(p) => p.current[1].values[63] += FE::one(),
+            _ => unreachable!("a per-polynomial chain opens base blocks in round 0"),
+        }
+        sites.push(("a round-0 block value", forged));
+        let mut forged = f.proof.clone();
+        match &mut forged.rounds[0].openings {
+            RoundOpenings::Base(p) => p.current[1].proof.merkle_path[0][0] ^= 1,
+            _ => unreachable!("a per-polynomial chain opens base blocks in round 0"),
+        }
+        sites.push(("a round-0 Merkle sibling", forged));
+        for (name, forged) in &sites {
+            assert!(
+                !host_accepts(&f, forged),
+                "{name} ({cap4:?}): the host must reject it"
+            );
+            assert!(
+                execute(&program, &[p1_chain_arena(&f, forged)], &SOCKET).is_err(),
+                "{name} ({cap4:?}): the machine must refuse it"
             );
         }
     }

@@ -193,4 +193,19 @@ pub enum Error {
     /// not open against that tree's own root (or cap).
     #[error("query {query}: tree {tree}'s block does not open against its root")]
     GroupedOpeningRejected { query: usize, tree: usize },
+    /// The format's round-0 leaf order is not defined for the hash its trees
+    /// are built with: the coset order is Poseidon1's alone. Refused before a
+    /// tree is built or a proof is read.
+    #[error("the {order:?} round-0 leaf order is not defined under {hash}")]
+    LeafOrderUnsupported {
+        order: whir_commit::LeafOrder,
+        hash: &'static str,
+    },
+    /// A round-0 commitment placed its leaves in another order than the
+    /// config it is proved under.
+    #[error("a round-0 commitment's leaves are in the {got:?} order, the config's in {expected:?}")]
+    LeafOrderMismatch {
+        expected: whir_commit::LeafOrder,
+        got: whir_commit::LeafOrder,
+    },
 }

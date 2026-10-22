@@ -65,13 +65,29 @@ use crate::{
     sumcheck::{self, RoundProof as SumcheckRoundProof},
     whir::{Domain, encode, fold_codeword_k, lift_coefficients},
     whir_commit::{Codeword, CodewordCommitment, Commitment, fold_coset, verify_opening_capped},
-    whir_hash::{GrindingDigest, WhirHash},
+    whir_hash::{DeviceHashKey, GrindingDigest, WhirHash},
     whir_round::{
         self, GroupedRoundProof, RoundCaps, RoundCommitments, RoundConfig, RoundProof, TreeCheck,
     },
 };
 
 pub use crate::whir_commit::LeafOrder;
+
+/// Refuses a format whose round-0 leaf order `H`'s trees do not take: the
+/// coset order is defined for Poseidon1 trees alone — the production hash,
+/// base and recursion alike — so under any other hash it is not a state a
+/// prover or a verifier can reach. Called before a round-0 tree is built
+/// ([`commit_stacked`]), before a chain is proved, and before a proof is read.
+pub fn check_leaf_order<H: WhirHash>(format: &ChainFormat) -> Result<(), Error> {
+    match format.leaves {
+        LeafOrder::Natural => Ok(()),
+        LeafOrder::Coset if H::DEVICE == DeviceHashKey::Poseidon1 => Ok(()),
+        order => Err(Error::LeafOrderUnsupported {
+            order,
+            hash: H::NAME,
+        }),
+    }
+}
 
 /// `w(x)·f(x)`, the shape every group's sumcheck runs over.
 fn product<E: IsField>(values: &[FieldElement<E>]) -> FieldElement<E> {
@@ -1087,6 +1103,7 @@ where
     H: WhirHash,
     FieldElement<F>: AsBytes + Sync + Send,
 {
+    check_leaf_order::<H>(&config.format)?;
     let num_vars = f.num_vars();
     let schedule = config.schedule(num_vars);
     let first = schedule.first().copied().unwrap_or(0);
@@ -1704,6 +1721,21 @@ where
     T: IsTranscript<E>,
     H: WhirHash,
 {
+    check_leaf_order::<H>(&config.format)?;
+    let round0: &[&CodewordCommitment<F, H>] = match &current {
+        Current::Base(held) => std::slice::from_ref(held),
+        Current::Grouped(held) => held,
+        Current::Extension(_) => &[],
+    };
+    if let Some(held) = round0
+        .iter()
+        .find(|held| held.leaves() != config.format.leaves)
+    {
+        return Err(Error::LeafOrderMismatch {
+            expected: config.format.leaves,
+            got: held.leaves(),
+        });
+    }
     // One chain, counted — arm F's identity is per chain, and a group can open
     // several (`stacked_eval::prove` runs one per commitment).
     crate::whir_split::bump(&crate::whir_split::CHAIN_COUNT);
@@ -2213,6 +2245,7 @@ where
     W: FnOnce(&[FieldElement<E>]) -> Result<FieldElement<E>, Error>,
     H: WhirHash,
 {
+    check_leaf_order::<H>(&config.format)?;
     // The run's width, and with it the index, are the caller's derivation
     // (`stacked_eval::index_chains`) — never the proof's.
     let width = roots.len();

@@ -1,6 +1,7 @@
 //! The coset leaf order ([`LeafOrder::Coset`]) on the host: a round-0 tree
 //! places block `j` at position `bitrev(j)`, the prover's paths (whole trees
-//! and kept tops) and the verifier read it there, and nothing else moves.
+//! and kept tops) and the verifier read it there, and nothing else moves. The
+//! order is Poseidon1's alone: under any other hash it is refused by name.
 //!
 //! The refusals across orders are the mutations that show each side's map is
 //! load-bearing: a verifier that reads positions in the natural order (the
@@ -21,11 +22,11 @@ use crate::{
     stacked_eval::{Claimed, Refusal, StackedCommitment, StackedProof, prove, verify_traced},
     stacking::{StackedLayout, borrow},
     whir_chain::{
-        ChainConfig, ChainFormat, FOLD_WORD_COSET, FOLD_WORD_INDEXED, FOLD_WORD_TAG, FirstFold,
-        GrindBits, GroupFold, LeafOrder, WhirFolds,
+        self, ChainConfig, ChainFormat, FOLD_WORD_COSET, FOLD_WORD_INDEXED, FOLD_WORD_TAG,
+        FirstFold, GrindBits, GroupFold, LeafOrder, WhirFolds,
     },
     whir_commit::{CodewordCommitment, Commitment, TreeDrop, verify_opening},
-    whir_hash::{KeccakWhir, P1Whir, WhirHash},
+    whir_hash::{KeccakWhir, P1Whir, RpxWhir, WhirHash},
 };
 
 type FE = FieldElement<F>;
@@ -211,8 +212,10 @@ fn the_coset_position_is_an_involution_that_keeps_an_index_past_the_tree() {
 
 /// The coset tree holds block `j` at `bitrev(j)` and nowhere else: its opening
 /// of `j` authenticates at that position, not at `j`; the natural tree's at
-/// `j`. Both arities.
-fn a_coset_tree_holds_block_j_at_its_reversed_position<H: WhirHash>() {
+/// `j`.
+#[test]
+fn a_coset_tree_holds_block_j_at_its_reversed_position() {
+    type H = P1Whir;
     let log_folding = 2;
     let codeword: Vec<FE> = (0..1u64 << 9).map(|i| FE::from(i * i + 17)).collect();
     let natural = CodewordCommitment::<F, H>::from_codeword_on_host_in(
@@ -256,21 +259,13 @@ fn a_coset_tree_holds_block_j_at_its_reversed_position<H: WhirHash>() {
     }
 }
 
-#[test]
-fn a_coset_tree_holds_block_j_at_its_reversed_position_keccak() {
-    a_coset_tree_holds_block_j_at_its_reversed_position::<KeccakWhir>();
-}
-
-#[test]
-fn a_coset_tree_holds_block_j_at_its_reversed_position_p1() {
-    a_coset_tree_holds_block_j_at_its_reversed_position::<P1Whir>();
-}
-
 /// A coset stack verifies under the coset config, whole or retired to any
 /// kept top (the paths re-hashed from the kept blocks), and the retired
 /// proofs are the whole tree's, byte for byte. Per polynomial and grouped,
 /// uncapped and capped.
-fn a_coset_stack_verifies_whole_or_retired<H: WhirHash>() {
+#[test]
+fn a_coset_stack_verifies_whole_or_retired() {
+    type H = P1Whir;
     for (first, log_folding, n_stack) in SHAPES {
         for group in [GroupFold::PerPoly, GroupFold::Indexed] {
             for cap in [CapPolicy::Off, CapPolicy::Auto] {
@@ -289,23 +284,20 @@ fn a_coset_stack_verifies_whole_or_retired<H: WhirHash>() {
     }
 }
 
-#[test]
-fn a_coset_stack_verifies_whole_or_retired_keccak() {
-    a_coset_stack_verifies_whole_or_retired::<KeccakWhir>();
-}
-
-#[test]
-fn a_coset_stack_verifies_whole_or_retired_p1() {
-    a_coset_stack_verifies_whole_or_retired::<P1Whir>();
-}
-
 /// ★ Each side's map is load-bearing. A verifier reading the natural order
 /// (the map dropped from the verifier) refuses a coset proof at a round-0
 /// opening; a coset verifier refuses a proof whose trees are natural (the map
 /// dropped from the prover). The roots differ too, so the natural verifier is
 /// handed the coset roots: only the position can refuse.
-fn each_side_of_the_order_is_load_bearing<H: WhirHash>() {
-    for (first, log_folding, n_stack) in SHAPES {
+///
+/// On the two shapes whose round-0 trees have 2^7 and 2^9 leaves: a query
+/// whose index is its own bit reversal opens the same leaf under either order
+/// (as it should), and a chain whose nine queries all are has probability
+/// 8^-9 there; on the 4-leaf tree of the one-round shape it is 2^-9 a chain.
+#[test]
+fn each_side_of_the_order_is_load_bearing() {
+    type H = P1Whir;
+    for (first, log_folding, n_stack) in SHAPES.into_iter().take(2) {
         for group in [GroupFold::PerPoly, GroupFold::Indexed] {
             let coset = config(first, log_folding, group, LeafOrder::Coset, CapPolicy::Off);
             let natural = config(
@@ -337,16 +329,6 @@ fn each_side_of_the_order_is_load_bearing<H: WhirHash>() {
     }
 }
 
-#[test]
-fn each_side_of_the_order_is_load_bearing_keccak() {
-    each_side_of_the_order_is_load_bearing::<KeccakWhir>();
-}
-
-#[test]
-fn each_side_of_the_order_is_load_bearing_p1() {
-    each_side_of_the_order_is_load_bearing::<P1Whir>();
-}
-
 /// One sibling byte of a round-0 path moved: refused, by that opening.
 #[test]
 fn a_tampered_round0_sibling_is_refused_under_the_coset_order() {
@@ -358,14 +340,14 @@ fn a_tampered_round0_sibling_is_refused_under_the_coset_order() {
             LeafOrder::Coset,
             CapPolicy::Off,
         );
-        let honest = open::<KeccakWhir>(&heights(n_stack), n_stack, &cfg, None);
+        let honest = open::<P1Whir>(&heights(n_stack), n_stack, &cfg, None);
         let mut proof = honest.proof.clone();
         let opening = match &mut proof.polys[0].rounds[0].openings {
             crate::whir_chain::RoundOpenings::Base(round) => &mut round.current[1],
             other => panic!("a per-polynomial round 0 opens base blocks: {other:?}"),
         };
         opening.proof.merkle_path[0][7] ^= 1;
-        let r = check::<KeccakWhir>(&honest, &proof, &cfg);
+        let r = check::<P1Whir>(&honest, &proof, &cfg);
         assert!(refused_by_an_opening(&r), "{first:?}/{n_stack}: {r:?}");
     }
 }
@@ -408,4 +390,121 @@ fn the_coset_order_has_its_own_fold_word_and_is_not_the_default() {
     distinct.dedup();
     assert_eq!(distinct.len(), words.len(), "eight formats, eight words");
     assert_ne!(FOLD_WORD_COSET, FOLD_WORD_INDEXED);
+}
+
+/// ★ The coset order is Poseidon1's alone: under Keccak and RPX trees the
+/// config is refused by name before a tree is built (a stack's commit, a
+/// chain's commit) and before a proof is read (a stack's verifier, a chain's).
+fn the_coset_order_is_refused_by_name<H: WhirHash>() {
+    let cfg = config(
+        Some(6),
+        4,
+        GroupFold::PerPoly,
+        LeafOrder::Coset,
+        CapPolicy::Off,
+    );
+    let refused = || crate::Error::LeafOrderUnsupported {
+        order: LeafOrder::Coset,
+        hash: H::NAME,
+    };
+    let columns: Vec<Mle<F>> = (0..3).map(|i| column(10 - i, 9 + i as u64)).collect();
+    let layout = StackedLayout::build(&[10, 9, 8], 11).unwrap();
+    assert_eq!(
+        StackedCommitment::<F, H>::commit(layout, &borrow(&columns), None, &cfg).err(),
+        Some(refused()),
+        "{}: a stack's commit",
+        H::NAME
+    );
+    assert_eq!(
+        whir_chain::commit::<F, H>(&columns[0], &cfg, true).err(),
+        Some(refused()),
+        "{}: a chain's commit",
+        H::NAME
+    );
+    // A proof made where the order is defined, read under `H`.
+    let made = open::<P1Whir>(&heights(11), 11, &cfg, None);
+    let r = check::<H>(&made, &made.proof, &cfg);
+    assert!(
+        matches!(&r, Err(Refusal::Before(e) | Refusal::Chain { cause: e, .. }) if *e == refused()),
+        "{}: a stack's verifier: {r:?}",
+        H::NAME
+    );
+    let chain = &made.proof.polys[0];
+    let z: Vec<EE> = (0..11).map(|i| EE::from(3 + i as u64)).collect();
+    assert_eq!(
+        whir_chain::verify::<F, Ext, _, H>(
+            chain,
+            &made.roots[0],
+            &z,
+            EE::from(1),
+            &made.domain,
+            &cfg,
+            &mut sponge::<H>(),
+        )
+        .err(),
+        Some(refused()),
+        "{}: a chain's verifier",
+        H::NAME
+    );
+    // The natural order stays every hash's.
+    let natural = config(
+        Some(6),
+        4,
+        GroupFold::PerPoly,
+        LeafOrder::Natural,
+        CapPolicy::Off,
+    );
+    assert!(whir_chain::commit::<F, H>(&columns[0], &natural, true).is_ok());
+}
+
+#[test]
+fn the_coset_order_is_refused_by_name_under_keccak() {
+    the_coset_order_is_refused_by_name::<KeccakWhir>();
+}
+
+#[test]
+fn the_coset_order_is_refused_by_name_under_rpx() {
+    the_coset_order_is_refused_by_name::<RpxWhir>();
+}
+
+/// A round-0 commitment placed in the natural order is not proved under a
+/// coset config (nor the reverse): the prover refuses by name rather than
+/// emit paths the verifier would read at other positions.
+#[test]
+fn a_commitment_in_another_order_is_not_proved() {
+    let coset = config(
+        Some(6),
+        4,
+        GroupFold::PerPoly,
+        LeafOrder::Coset,
+        CapPolicy::Off,
+    );
+    let natural = config(
+        Some(6),
+        4,
+        GroupFold::PerPoly,
+        LeafOrder::Natural,
+        CapPolicy::Off,
+    );
+    let f = column(11, 4);
+    let z: Vec<EE> = (0..11).map(|i| EE::from(5 + 2 * i as u64)).collect();
+    for (committed_under, proved_under) in [(&natural, &coset), (&coset, &natural)] {
+        let (commitment, domain) =
+            whir_chain::commit::<F, P1Whir>(&f, committed_under, true).unwrap();
+        let r = whir_chain::prove::<F, Ext, _, P1Whir>(
+            &f,
+            &z,
+            &commitment,
+            &domain,
+            proved_under,
+            &mut sponge::<P1Whir>(),
+        );
+        assert_eq!(
+            r.err(),
+            Some(crate::Error::LeafOrderMismatch {
+                expected: proved_under.format.leaves,
+                got: committed_under.format.leaves,
+            })
+        );
+    }
 }
