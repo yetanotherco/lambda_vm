@@ -1,7 +1,8 @@
 use executor::{
-    elf::Elf,
+    elf::{Elf, SymbolTable},
     vm::execution::{Executor, ReturnValues},
 };
+use std::ops::Range;
 
 // NOTE: These tests require 64-bit RISC-V ELF files (RV64IM).
 // The test binaries need to be recompiled for 64-bit architecture.
@@ -157,6 +158,135 @@ fn test_commit() {
         "./program_artifacts/rust/commit.elf",
         vec![4, 5, 6, 7],
         vec![4, 5, 6, 7],
+    );
+}
+
+const MEM_SWEEP_ELF: &str = "./program_artifacts/rust/mem_sweep.elf";
+
+/// How the runtime's `memcpy` (syscalls' `fast-memcpy` feature) starts: `mv t0, a0`
+/// and `li t1, 32`. compiler_builtins' `memcpy` does not.
+const FAST_MEMCPY_HEAD: [u32; 2] = [0x0005_0293, 0x0200_0313];
+
+/// The most instructions `test_mem_sweep` may spend inside the library's `memmove`.
+/// Built with compiler_builtins' `mem-unaligned` setting (the sweep guest's
+/// `.cargo/config.toml`) it spends 4,026,828; without it 5,975,778,
+/// reassembling every misaligned word with shifts (both measured at the Makefile's
+/// pinned nightly). Only compiler_builtins reads that setting's name, with no
+/// stability guarantee, so a toolchain bump can silently drop it: this bound is
+/// what notices.
+const SWEEP_MEMMOVE_MAX: u64 = 5_000_000;
+
+/// The address range and the instruction words of the function that starts at `pc`.
+fn function_at(program: &Elf, symbols: &SymbolTable, pc: u64) -> Option<(Range<u64>, Vec<u32>)> {
+    let f = symbols.lookup(pc).filter(|f| f.address == pc)?;
+    let segment = program.data.iter().find(|s| {
+        s.is_executable && pc >= s.base_addr && pc < s.base_addr + 4 * s.values.len() as u64
+    })?;
+    let first = ((pc - segment.base_addr) / 4) as usize;
+    let words = segment.values[first..first + (f.size / 4) as usize].to_vec();
+    Some((pc..pc + f.size, words))
+}
+
+/// The address range and the instruction words of the function `name` in an ELF.
+fn function_in(elf_bytes: &[u8], name: &str) -> (Range<u64>, Vec<u32>) {
+    let program = Elf::load(elf_bytes).unwrap();
+    let symbols = SymbolTable::parse(elf_bytes);
+    for segment in program.data.iter().filter(|s| s.is_executable) {
+        for i in 0..segment.values.len() as u64 {
+            let pc = segment.base_addr + 4 * i;
+            if symbols
+                .lookup(pc)
+                .is_some_and(|f| f.address == pc && f.name == name)
+            {
+                return function_at(&program, &symbols, pc).unwrap();
+            }
+        }
+    }
+    panic!("no function `{name}` in the ELF");
+}
+
+/// The address range and the instruction words of what `name` executes: the
+/// function itself or, when it is a two-instruction tail jump (`auipc rd, hi` then
+/// `jalr x0, lo(rd)`, which is how these guests' `memmove` enters compiler_builtins'
+/// implementation), the function it jumps to. The words are compared across ELFs,
+/// so they must not depend on where the code sits.
+fn body_of(elf_bytes: &[u8], name: &str) -> (Range<u64>, Vec<u32>) {
+    let (range, words) = function_in(elf_bytes, name);
+    let &[auipc, jalr] = words.as_slice() else {
+        return (range, words);
+    };
+    let rd = (auipc >> 7) & 31;
+    let is_auipc = auipc & 0x7f == 0x17;
+    let is_jump = jalr & 0x7f == 0x67 && (jalr >> 7) & 31 == 0 && (jalr >> 15) & 31 == rd;
+    if !(is_auipc && is_jump) {
+        return (range, words);
+    }
+    let hi = i64::from((auipc & 0xffff_f000) as i32);
+    let lo = i64::from(jalr as i32 >> 20);
+    let target = (range.start as i64 + hi + lo) as u64;
+    let program = Elf::load(elf_bytes).unwrap();
+    let symbols = SymbolTable::parse(elf_bytes);
+    function_at(&program, &symbols, target)
+        .unwrap_or_else(|| panic!("`{name}` jumps to {target:#x}, where no function starts"))
+}
+
+/// In-VM sweep of the memory routines the guest links (`memcpy` is the runtime's
+/// own, from syscalls' `fast-memcpy`; `memmove`, `memset` and `memcmp` are the
+/// library's, built with the ethrex guest's flags). The guest compares every result
+/// with values recomputed from the index and commits `OK` plus its case counts, or
+/// `FAIL` plus the first failing case. Counts, in order: memcpy at every length
+/// 0..=1100 and offsets mod 8; memcpy at lengths 0..=160 and offsets mod 16; memcpy
+/// large lengths, lengths up to a page and the compiler's own copies; memcpy onto
+/// itself and between touching regions; memmove overlapping both ways; memset and
+/// memcmp.
+#[test]
+fn test_mem_sweep() {
+    let elf = std::fs::read(MEM_SWEEP_ELF).unwrap();
+    let (_, memcpy) = function_in(&elf, "memcpy");
+    assert_eq!(
+        memcpy[..2],
+        FAST_MEMCPY_HEAD,
+        "the sweep guest does not link the runtime's memcpy"
+    );
+    let (memmove, _) = body_of(&elf, "memmove");
+    let program = Elf::load(&elf).unwrap();
+    let mut executor = Executor::new(&program, vec![]).expect("Failed to run program");
+    let mut in_memmove = 0u64;
+    while let Some(logs) = executor.resume().expect("Failed to run program") {
+        in_memmove += logs
+            .iter()
+            .filter(|log| memmove.contains(&log.current_pc))
+            .count() as u64;
+    }
+    let out = executor
+        .finish()
+        .expect("Failed to run program")
+        .memory_values;
+    if !out.starts_with(b"OK") {
+        assert!(
+            out.starts_with(b"FAIL") && out.len() == 15,
+            "unexpected output {out:?}"
+        );
+        panic!(
+            "mem_sweep failed: stage {} length {} source alignment {} destination alignment {} first wrong byte at destination + {}",
+            out[4],
+            u32::from_le_bytes(out[5..9].try_into().unwrap()),
+            out[9],
+            out[10],
+            i32::from_le_bytes(out[11..15].try_into().unwrap()),
+        );
+    }
+    let counts: Vec<u32> = out[2..]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    // 1101 lengths x 64; 161 lengths x 256; 6 x 16 + 2 x 4 + 428 x 4 + 16; 301 x 8 x 3;
+    // 201 x 8 x 19; 301 x 8 x 2 memset + 64 + 64 lengths x 64 x 7 memcmp.
+    assert_eq!(counts, [70_464, 41_216, 1_832, 7_224, 30_552, 33_552]);
+    assert!(
+        in_memmove <= SWEEP_MEMMOVE_MAX,
+        "the sweep spent {in_memmove} instructions inside memmove (at most \
+         {SWEEP_MEMMOVE_MAX}): compiler_builtins' `mem-unaligned` setting is not in effect"
     );
 }
 
