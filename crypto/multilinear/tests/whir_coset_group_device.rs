@@ -42,8 +42,13 @@ fn sponge() -> <P1Whir as WhirHash>::Sponge {
 /// First6 then uniform4, one chain per run of up to four, no grind (its nonce
 /// is not reproducible across two searches).
 fn config(leaves: LeafOrder) -> ChainConfig {
+    config_at(leaves, 2)
+}
+
+/// [`config`] at blowup `2^log_blowup` (`LAMBDA_VM_ZF_WHIR_BLOWUP=2` is 1).
+fn config_at(leaves: LeafOrder, log_blowup: usize) -> ChainConfig {
     ChainConfig {
-        log_blowup: 2,
+        log_blowup,
         log_folding: 4,
         num_queries: 33,
         grind: GrindBits::default(),
@@ -204,7 +209,22 @@ impl Stack {
 #[test]
 fn a_grouped_coset_run_on_the_card_proves_the_host_runs_bytes() {
     let _serial = serial();
-    let coset = config(LeafOrder::Coset);
+    grouped_coset_run_on_the_card(2);
+}
+
+/// ★ Blowup 2 — the composed format's round 0 (one chain a run, the coset
+/// order, rate 1/2): the same run on the card encodes its successor and proves
+/// the host run's bytes, whole and revived.
+#[test]
+fn a_grouped_coset_run_at_blowup_two_on_the_card_proves_the_host_runs_bytes() {
+    let _serial = serial();
+    grouped_coset_run_on_the_card(1);
+}
+
+/// [`a_grouped_coset_run_on_the_card_proves_the_host_runs_bytes`] at blowup
+/// `2^log_blowup`.
+fn grouped_coset_run_on_the_card(log_blowup: usize) {
+    let coset = config_at(LeafOrder::Coset, log_blowup);
     let stack = Stack::new();
     gpu::force_host_whir_commit(true);
     gpu::force_shared_open_declined(true);
@@ -214,7 +234,7 @@ fn a_grouped_coset_run_on_the_card_proves_the_host_runs_bytes() {
     let (host_roots, host_proof) = host.unwrap_or_else(|e| panic!("the host run: {e:?}"));
     stack.verify(&host_roots, &host_proof, &coset, "the host run");
     for drop in [None, Some(2), Some(4)] {
-        let label = format!("drop {drop:?}");
+        let label = format!("drop {drop:?} blowup 2^{log_blowup}");
         let (encoded, chains) = (gpu::encoded_successors(), gpu::grouped_card_chains());
         let (roots, proof) = stack
             .try_prove(&coset, drop)
@@ -236,7 +256,9 @@ fn a_grouped_coset_run_on_the_card_proves_the_host_runs_bytes() {
             "{label}: the host run's bytes"
         );
     }
-    let (natural_roots, _) = stack.try_prove(&config(LeafOrder::Natural), None).unwrap();
+    let (natural_roots, _) = stack
+        .try_prove(&config_at(LeafOrder::Natural, log_blowup), None)
+        .unwrap();
     assert_ne!(natural_roots, host_roots, "the coset order moves the roots");
 }
 

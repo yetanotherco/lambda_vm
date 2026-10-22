@@ -38,8 +38,13 @@ fn sponge() -> <P1Whir as WhirHash>::Sponge {
 }
 
 fn config(leaves: LeafOrder, cap: CapPolicy) -> ChainConfig {
+    config_at(leaves, cap, 2)
+}
+
+/// [`config`] at blowup `2^log_blowup` (`LAMBDA_VM_ZF_WHIR_BLOWUP=2` is 1).
+fn config_at(leaves: LeafOrder, cap: CapPolicy, log_blowup: usize) -> ChainConfig {
     ChainConfig {
-        log_blowup: 2,
+        log_blowup,
         log_folding: 4,
         num_queries: 33,
         grind: GrindBits::uniform(8),
@@ -92,9 +97,23 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 #[test]
 fn a_coset_chain_on_the_card_proves_the_host_chains_bytes() {
     let _serial = serial();
+    coset_chain_on_the_card(2);
+}
+
+/// ★ Blowup 2: the same, every tree a level shallower (its depth parity
+/// flipped), at a 2^18 codeword as at blowup 4.
+#[test]
+fn a_coset_chain_at_blowup_two_on_the_card_proves_the_host_chains_bytes() {
+    let _serial = serial();
+    coset_chain_on_the_card(1);
+}
+
+/// [`a_coset_chain_on_the_card_proves_the_host_chains_bytes`] at blowup
+/// `2^log_blowup`, over a `2^18` codeword (above the card's commit threshold).
+fn coset_chain_on_the_card(log_blowup: usize) {
     for cap in [CapPolicy::Off, CapPolicy::Fixed(2), CapPolicy::Auto] {
-        let num_vars = 16;
-        let cfg = config(LeafOrder::Coset, cap);
+        let num_vars = 18 - log_blowup;
+        let cfg = config_at(LeafOrder::Coset, cap, log_blowup);
         let f = column(num_vars, 3);
         let z: Vec<EE> = (0..num_vars).map(|i| EE::from(301 + i as u64)).collect();
         let y = f.evaluate_in(&z).unwrap();
@@ -111,8 +130,12 @@ fn a_coset_chain_on_the_card_proves_the_host_chains_bytes() {
         )
         .unwrap();
         assert_eq!(host.root(), device.root(), "{cap}: roots");
-        let (natural, _) =
-            whir_chain::commit::<F, P1Whir>(&f, &config(LeafOrder::Natural, cap), true).unwrap();
+        let (natural, _) = whir_chain::commit::<F, P1Whir>(
+            &f,
+            &config_at(LeafOrder::Natural, cap, log_blowup),
+            true,
+        )
+        .unwrap();
         assert_ne!(
             natural.root(),
             device.root(),
@@ -261,17 +284,31 @@ impl Stack {
 #[test]
 fn a_revived_coset_stack_proves_the_whole_trees_bytes_from_the_stack_or_a_reencode() {
     let _serial = serial();
+    revived_coset_stack(2);
+}
+
+/// ★ Blowup 2: the lever's parity at the rate's shapes — the kept top's cosets
+/// are still `2^(k0 + 2·drop)` points, the codeword half as long.
+#[test]
+fn a_revived_coset_stack_at_blowup_two_proves_the_whole_trees_bytes_from_the_stack_or_a_reencode() {
+    let _serial = serial();
+    revived_coset_stack(1);
+}
+
+/// [`a_revived_coset_stack_proves_the_whole_trees_bytes_from_the_stack_or_a_reencode`]
+/// at blowup `2^log_blowup`.
+fn revived_coset_stack(log_blowup: usize) {
     for (n_stack, cap) in [
         (18usize, CapPolicy::Auto),
         (18, CapPolicy::Off),
         (20, CapPolicy::Auto),
     ] {
-        let cfg = config(LeafOrder::Coset, cap);
+        let cfg = config_at(LeafOrder::Coset, cap, log_blowup);
         let stack = Stack::new(n_stack);
         let (roots, whole) = stack.prove(&cfg, None);
         stack.verify(&roots, &whole, &cfg);
         for drop in [2usize, 4] {
-            let label = format!("2^{n_stack} {cap} drop {drop}");
+            let label = format!("2^{n_stack} {cap} drop {drop} blowup 2^{log_blowup}");
             multilinear::gpu::force_coset_openings(Some(true));
             let served = multilinear::gpu::coset_openings();
             let fell_back = multilinear::gpu::coset_fallbacks();

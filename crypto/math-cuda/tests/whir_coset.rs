@@ -59,8 +59,13 @@ fn whole(columns: &[Vec<u64>], num_vars: usize) -> Vec<u64> {
 }
 
 fn queries(num_vars: usize, count: usize, seed: u64) -> Vec<u64> {
+    queries_at(num_vars, LOG_BLOWUP, count, seed)
+}
+
+/// [`queries`] over a codeword of blowup `2^log_blowup`.
+fn queries_at(num_vars: usize, log_blowup: usize, count: usize, seed: u64) -> Vec<u64> {
     let mut rng = Rng(seed ^ 0x9e37_79b9_7f4a_7c15);
-    let num_leaves = 1u64 << (num_vars + LOG_BLOWUP - LOG_FOLD);
+    let num_leaves = 1u64 << (num_vars + log_blowup - LOG_FOLD);
     (0..count).map(|_| rng.next() % num_leaves).collect()
 }
 
@@ -72,14 +77,25 @@ fn reencoded_at_blocks(
     num_vars: usize,
     plan: &CosetPlan,
 ) -> Vec<u64> {
+    reencoded_at_blocks_at(store, parts, num_vars, LOG_BLOWUP, plan)
+}
+
+/// [`reencoded_at_blocks`] for a codeword of blowup `2^log_blowup`.
+fn reencoded_at_blocks_at(
+    store: &DeviceColumns,
+    parts: &[(usize, usize)],
+    num_vars: usize,
+    log_blowup: usize,
+    plan: &CosetPlan,
+) -> Vec<u64> {
     let codeword =
-        math_cuda::whir::encode_codeword_resident(store, parts, num_vars, LOG_BLOWUP, true)
+        math_cuda::whir::encode_codeword_resident(store, parts, num_vars, log_blowup, true)
             .expect("re-encode");
     codeword.synchronize().expect("re-encode done");
     let leaves: Vec<u64> = (0..plan.classes().len())
         .flat_map(|q| plan.block_leaves(q))
         .collect();
-    let num_leaves = 1usize << (num_vars + LOG_BLOWUP - LOG_FOLD);
+    let num_leaves = 1usize << (num_vars + log_blowup - LOG_FOLD);
     codeword
         .cosets(&leaves, num_leaves, 1 << LOG_FOLD)
         .expect("gather the leaves")
@@ -98,10 +114,23 @@ fn mismatches(a: &[u64], b: &[u64]) -> usize {
 /// (tiles only), 10 (8 tile + 2 rest); the split path once.
 #[test]
 fn coset_blocks_equal_the_reencoded_codeword() {
+    coset_blocks_at(LOG_BLOWUP, 114);
+}
+
+/// Blowup 2 (`LAMBDA_VM_ZF_WHIR_BLOWUP=2`) and its 229 queries: the same
+/// parity over a codeword half as long, whose kept cosets are the same width.
+#[test]
+fn coset_blocks_at_blowup_two_equal_the_reencoded_codeword() {
+    coset_blocks_at(1, 229);
+}
+
+/// [`coset_blocks_equal_the_reencoded_codeword`] at blowup `2^log_blowup` with
+/// `count` queries.
+fn coset_blocks_at(log_blowup: usize, count: usize) {
     for (num_vars, seed) in [(16usize, 11u64), (20, 12), (24, 13)] {
         let (store, parts, columns) = stack(num_vars, seed);
-        let leaves = queries(num_vars, 114, seed);
-        let plan = CosetPlan::new(num_vars, LOG_BLOWUP, LOG_FOLD, KEPT, &leaves).expect("plan");
+        let leaves = queries_at(num_vars, log_blowup, count, seed);
+        let plan = CosetPlan::new(num_vars, log_blowup, LOG_FOLD, KEPT, &leaves).expect("plan");
         let mut split = Vec::new();
         let device = evaluate_resident(&store, &parts, &plan, Some(&mut split))
             .expect("coset evaluation")
@@ -112,22 +141,29 @@ fn coset_blocks_equal_the_reencoded_codeword() {
             .expect("coset evaluation")
             .to_host()
             .expect("read back");
-        let gathered = reencoded_at_blocks(&store, &parts, num_vars, &plan);
+        let gathered = reencoded_at_blocks_at(&store, &parts, num_vars, log_blowup, &plan);
         let host = plan.evaluate_on_host(&whole(&columns, num_vars));
         let (vs_codeword, vs_host, vs_queued) = (
             mismatches(&device, &gathered),
             mismatches(&device, &host),
             mismatches(&device, &queued),
         );
+        // The blowup-4 line is the one the J5 read-out parses; blowup 2's names
+        // its rate at the end.
+        let rate = if log_blowup == LOG_BLOWUP {
+            String::new()
+        } else {
+            format!(" blowup_log={log_blowup}")
+        };
         println!(
-            "J5 PARITY n={num_vars} cosets={} values={} vs_codeword={vs_codeword} vs_host={vs_host} vs_queued={vs_queued}",
+            "J5 PARITY n={num_vars} cosets={} values={} vs_codeword={vs_codeword} vs_host={vs_host} vs_queued={vs_queued}{rate}",
             plan.classes().len(),
             device.len()
         );
         assert_eq!(
             (vs_codeword, vs_host, vs_queued),
             (0, 0, 0),
-            "n {num_vars}: the cosets differ"
+            "n {num_vars} blowup 2^{log_blowup}: the cosets differ"
         );
         for &leaf in &leaves {
             let q = plan.block_of(leaf).expect("a block");
