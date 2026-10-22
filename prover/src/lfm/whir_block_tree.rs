@@ -204,7 +204,7 @@ pub struct WhirTreeConfig {
     /// another format than the production verifier's.
     pub argue: ArgueFormat,
     /// The block format: production, with `argue`, its groups' stacked
-    /// polynomials opened per `BLOCK_WHIR_GROUP=per-poly|indexed`
+    /// polynomials opened per `LAMBDA_VM_WHIR_GROUP=per-poly|indexed`
     /// ([`group_setting`]; production: per-poly).
     pub format: BlockFormat,
     /// The base's options: production, with the `BLOCK_WHIR_*` knobs.
@@ -242,7 +242,7 @@ fn count_knob(name: &str) -> Result<Option<usize>, String> {
     }
 }
 
-/// `BLOCK_WHIR_GROUP`'s reading: unset or `per-poly` is one chain per stacked
+/// `LAMBDA_VM_WHIR_GROUP`'s reading: unset or `per-poly` is one chain per stacked
 /// polynomial ([`GroupFold::PerPoly`], production); `indexed` one chain per
 /// run of up to four ([`GroupFold::Indexed`]); anything else an error. A
 /// format choice: the block's verifier must be given the same one.
@@ -250,7 +250,7 @@ pub fn group_setting(value: Option<&str>) -> Result<GroupFold, String> {
     match value.map(str::trim) {
         None | Some("per-poly") => Ok(GroupFold::PerPoly),
         Some("indexed") => Ok(GroupFold::Indexed),
-        Some(other) => Err(format!("BLOCK_WHIR_GROUP={other}: per-poly or indexed")),
+        Some(other) => Err(format!("LAMBDA_VM_WHIR_GROUP={other}: per-poly or indexed")),
     }
 }
 
@@ -299,7 +299,7 @@ impl WhirTreeConfig {
         let format = BlockFormat {
             argue,
             ..BlockFormat::production_with(group_setting(
-                std::env::var("BLOCK_WHIR_GROUP").ok().as_deref(),
+                std::env::var("LAMBDA_VM_WHIR_GROUP").ok().as_deref(),
             )?)
         };
         let mut options = BlockOptions::production();
@@ -2458,7 +2458,7 @@ mod tests {
         );
     }
 
-    /// `BLOCK_WHIR_GROUP` reads two words, unset is production's per
+    /// `LAMBDA_VM_WHIR_GROUP` reads two words, unset is production's per
     /// polynomial, and anything else is refused rather than defaulted.
     #[test]
     fn the_group_opening_reads_two_words() {

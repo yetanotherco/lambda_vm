@@ -2663,7 +2663,7 @@ fn the_whir_block_tree_on_a_real_block() {
     assert!(ok, "the block proof must verify");
     let t = std::time::Instant::now();
     // The production verifier when the run is at its presets, given the run's
-    // group opening (`BLOCK_WHIR_GROUP`) as the CLI's `verify-block --group`
+    // group opening (`LAMBDA_VM_WHIR_GROUP`) as the CLI's `verify-block --group`
     // gives it; the fixture form only when a knob moved the tree off them.
     let verdict =
         if leaves.is_none() && fan_in == BLOCK_FAN_IN && argue == BlockFormat::production().argue {

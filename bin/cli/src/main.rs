@@ -622,8 +622,8 @@ fn cmd_prove_block(
     // The group opening is the caller's constant, given on the command line
     // and to `verify-block` alike; the harness's environment word for it is
     // refused here rather than silently outranked.
-    if std::env::var_os("BLOCK_WHIR_GROUP").is_some() {
-        eprintln!("BLOCK_WHIR_GROUP is the harness's knob: give the CLI --group instead");
+    if std::env::var_os("LAMBDA_VM_WHIR_GROUP").is_some() {
+        eprintln!("LAMBDA_VM_WHIR_GROUP is the harness's knob: give the CLI --group instead");
         return ExitCode::FAILURE;
     }
     let mut cfg = match WhirTreeConfig::from_env() {
