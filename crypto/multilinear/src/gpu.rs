@@ -4968,10 +4968,12 @@ static HOST_WHIR_COMMIT_FORCED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Makes every stacked commit, re-encode and successor tree decline while
-/// `on`, as `LAMBDA_VM_NO_GPU_WHIR_COMMIT` does for a whole process, and every
-/// fold of a host codeword too (`LAMBDA_VM_NO_GPU_WHIR_FOLD`) — for a parity
-/// test whose reference arm proves on the host alone, codewords included, in
-/// the same binary as its card arms. Not for production callers.
+/// `on`, as `LAMBDA_VM_NO_GPU_WHIR_COMMIT` does for a whole process, every fold
+/// of a host codeword (`LAMBDA_VM_NO_GPU_WHIR_FOLD`), and every opening of
+/// host-built factors (`LAMBDA_VM_NO_GPU_OPEN`) — for a parity test whose
+/// reference arm proves on the host alone, in the same binary as its card arms;
+/// with [`force_shared_open_declined`] nothing of a WHIR opening reaches the
+/// card. Not for production callers.
 #[doc(hidden)]
 #[cfg(feature = "cuda")]
 pub fn force_host_whir_commit(on: bool) {
@@ -5007,7 +5009,9 @@ where
         return None;
     }
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_OPEN").is_some()) {
+    if HOST_WHIR_COMMIT_FORCED.load(Ordering::Relaxed)
+        || *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_OPEN").is_some())
+    {
         return None;
     }
     let lowered = lower(program)?;

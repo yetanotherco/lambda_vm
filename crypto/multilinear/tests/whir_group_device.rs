@@ -339,7 +339,13 @@ fn prove_arm<H: WhirHash>(
                 moved.combined, c.grouped,
                 "{tag}: every grouped successor folded and combined on the card"
             );
-            assert_eq!(moved.encoded, 0, "{tag}: an encode from host factors");
+            // A run of one falls back as today: its host-built tables go to
+            // the card whole, and its successor is encoded from them there.
+            assert_eq!(
+                moved.encoded,
+                c.chains - c.grouped,
+                "{tag}: successors encoded (the runs of one alone)"
+            );
         }
         _ if card => {
             assert_eq!(
