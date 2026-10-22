@@ -60,7 +60,7 @@
   // Fix 3: Replace overlines with a border-top CSS rule for browsers that
   // do not stretch the top line properly. (e.g. chromium (and forks like Brave))
   for (let elem of document.body.querySelectorAll("mover mo:last-child")) {
-    if (isOverline(elem.textContent) && elem.getBoundingClientRect().width < elem.parentElement.getBoundingClientRect().width * 0.9) {
+    if (isOverline(elem.textContent) && elem.getBoundingClientRect().width < elem.parentElement.getBoundingClientRect().width * 0.8) {
       elem.style.display = "none";
       elem.parentElement.style.borderTop = "0.06em solid currentColor";
       elem.parentElement.style.paddingTop = "0.12em";
