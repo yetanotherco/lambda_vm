@@ -342,8 +342,14 @@ pub static CHAIN_COUNT: Counter = Counter::new();
 /// Pre-registered as an identity the record can check itself against: a chain
 /// of `R` rounds calls `open_many` twice per non-final round and once in the
 /// final one, so `2R − 1`. Summed over `g` chains that is
-/// `2·Σ R − g = 2·round_count − groups`, which is [`check_closure`]'s arm F.
+/// `2·Σ R − g = 2·round_count − groups`, which is [`check_closure`]'s arm F —
+/// plus [`GROUPED_TREES`], a grouped round 0's trees past its first.
 pub static REBUILD_CALLS: Counter = Counter::new();
+
+/// Round-0 trees a grouped chain (`GroupFold::Indexed`) opens past the first:
+/// `P' − 1` a chain over `P'` polynomials, each one `open_many` call more than
+/// a per-polynomial chain's round 0 makes. Arm F adds them to `2R − 1`.
+pub static GROUPED_TREES: Counter = Counter::new();
 
 /// Columns the argument's claim reduces valued on the CARD, in one batched
 /// evaluation per table — beside [`COLUMNS_ON_HOST`], the ones walked on the
@@ -861,6 +867,8 @@ pub struct ChainSlots {
     pub chain_count: u64,
     pub round_count: u64,
     pub rebuild_calls: u64,
+    /// Grouped round-0 trees past each chain's first ([`GROUPED_TREES`]).
+    pub grouped_trees: u64,
 }
 
 /// The chain's slots, as taken at the group-loop boundary.
@@ -871,6 +879,7 @@ static CHAIN_AT_GROUPS: Mutex<ChainSlots> = Mutex::new(ChainSlots {
     chain_count: 0,
     round_count: 0,
     rebuild_calls: 0,
+    grouped_trees: 0,
 });
 
 /// Park the chain's slots for the record being built one layer up.
@@ -904,6 +913,7 @@ pub fn take_chain() -> ChainSlots {
         chain_count: CHAIN_COUNT.take(),
         round_count: ROUND_COUNT.take(),
         rebuild_calls: REBUILD_CALLS.take(),
+        grouped_trees: GROUPED_TREES.take(),
     }
 }
 
@@ -1070,6 +1080,9 @@ pub struct ProverSplit {
     pub chain_count: u64,
     pub round_count: u64,
     pub rebuild_calls: u64,
+    /// Grouped round-0 trees past each chain's first ([`GROUPED_TREES`]):
+    /// each one more `open_many` call than `2R − 1` counts.
+    pub grouped_trees: u64,
     /// The device ledger's peak over `commit_grouped`, the argument and the
     /// openings, and the budget it is promised against — bytes, 0 without a
     /// device ([`RESERVED_COMMIT`], [`RESERVED_ARGUE`], [`RESERVED_OPEN`]).
@@ -1196,14 +1209,15 @@ impl ProverSplit {
     }
     /// ★ The `open_many` calls the group openings SHOULD have made, from the
     /// chains and rounds they ran: `2R − 1` per chain, summed over the chains,
-    /// which is `2·ΣR − chains`.
+    /// which is `2·ΣR − chains` — and one more per grouped round-0 tree past
+    /// its chain's first (`P' − 1` a grouped chain).
     ///
     /// ⛔ CHAINS, not groups: `stacked_eval::prove` runs one chain per
     /// commitment, so a group can open several. Both numbers are counted by the
     /// run, so this is a claim about the call structure that the run can refute
     /// — not a constant retyped from a reading of the source.
     pub fn derived_rebuild_calls(&self) -> i128 {
-        2 * self.round_count as i128 - self.chain_count as i128
+        2 * self.round_count as i128 - self.chain_count as i128 + self.grouped_trees as i128
     }
     pub fn is_global(&self) -> bool {
         self.index == GLOBAL_INDEX
@@ -1539,6 +1553,7 @@ pub fn push_prover(mut rec: ProverSplit) {
     rec.chain_count = parked.chain_count;
     rec.round_count = parked.round_count;
     rec.rebuild_calls = parked.rebuild_calls;
+    rec.grouped_trees = parked.grouped_trees;
     let names = TABLE_NAMES
         .lock()
         .map(|mut h| std::mem::take(&mut *h))
@@ -1867,13 +1882,15 @@ pub fn check_closure(
         {
             return Err(format!(
                 "arm F: {who}'s query openings made {} `open_many` calls, but \
-                 {} round(s) over {} chain(s) derive {} (2R − 1 per chain). \
-                 Either a call is not being counted, or the chain no longer \
-                 opens the current commitment and its successor once each per \
-                 round.",
+                 {} round(s) over {} chain(s) and {} grouped round-0 tree(s) \
+                 past their chains' first derive {} (2R − 1 per chain, plus one \
+                 a grouped tree). Either a call is not being counted, or the \
+                 chain no longer opens the current commitment and its \
+                 successor once each per round.",
                 r.rebuild_calls,
                 r.round_count,
                 r.chain_count,
+                r.grouped_trees,
                 r.derived_rebuild_calls(),
             ));
         }

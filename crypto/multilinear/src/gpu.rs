@@ -109,6 +109,19 @@ static ENCODED_SUCCESSORS: AtomicU64 = AtomicU64::new(0);
 /// is where an opening runs without the turn its group asked for (see
 /// `stacked_eval::StackedCommitment`).
 static OPEN_HOST_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+/// ★ Grouped chains (`GroupFold::Indexed`, a run of two or more polynomials)
+/// whose round 0 ran on the card: the polynomials' openings in lockstep, the
+/// index rounds over their bound tables ([`GroupedFactors`]).
+static GROUPED_CARD_CHAINS: AtomicU64 = AtomicU64::new(0);
+/// ★ Grouped chains over codewords the card holds whose round-0 factors were
+/// built on the HOST — the grouped twin of [`OPEN_HOST_FALLBACKS`], which each
+/// of their polynomials also counts. A grouped chain over host codewords is
+/// the host path, not a fallback, and counts in neither.
+static GROUPED_HOST_CHAINS: AtomicU64 = AtomicU64::new(0);
+/// Grouped round-0 successors folded on the card polynomial by polynomial and
+/// combined there ([`combine_codewords`]): the path when the successor is not
+/// encoded from the bound message.
+static GROUPED_COMBINES: AtomicU64 = AtomicU64::new(0);
 /// Groups that gave their room back when their commits ended.
 static ROOM_PARKS: AtomicU64 = AtomicU64::new(0);
 /// Group openings that took their room back.
@@ -436,6 +449,37 @@ pub fn open_calls() -> u64 {
     OPEN_CALLS.load(Ordering::Relaxed)
 }
 
+/// Grouped chains whose round 0 ran on the card — see [`GROUPED_CARD_CHAINS`].
+pub fn grouped_card_chains() -> u64 {
+    GROUPED_CARD_CHAINS.load(Ordering::Relaxed)
+}
+
+/// Grouped chains over card codewords whose round-0 factors the host built —
+/// see [`GROUPED_HOST_CHAINS`]. Zero in a build without a device.
+pub fn grouped_host_chains() -> u64 {
+    GROUPED_HOST_CHAINS.load(Ordering::Relaxed)
+}
+
+/// Grouped round-0 successors folded and combined on the card — see
+/// [`GROUPED_COMBINES`].
+pub fn grouped_combined_successors() -> u64 {
+    GROUPED_COMBINES.load(Ordering::Relaxed)
+}
+
+/// Called where a grouped chain over card codewords builds its round-0
+/// factors on the host: counted once as a chain and once a polynomial
+/// ([`note_open_host_fallback`]), and said.
+pub(crate) fn note_grouped_host_fallback(polys: usize, n_stack: usize) {
+    let count = GROUPED_HOST_CHAINS.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!(
+        "[whir] a grouped round 0 of {polys} polynomials built on the HOST over device \
+         codewords (stack 2^{n_stack}); grouped host chains {count}"
+    );
+    for _ in 0..polys {
+        note_open_host_fallback(n_stack);
+    }
+}
+
 /// Groups that gave their room back when their commits ended.
 pub fn room_parks() -> u64 {
     ROOM_PARKS.load(Ordering::Relaxed)
@@ -522,6 +566,9 @@ pub fn reset_call_counters() {
     RESIDENT_FOLD_CALLS.store(0, Ordering::Relaxed);
     ENCODED_SUCCESSORS.store(0, Ordering::Relaxed);
     OPEN_HOST_FALLBACKS.store(0, Ordering::Relaxed);
+    GROUPED_CARD_CHAINS.store(0, Ordering::Relaxed);
+    GROUPED_HOST_CHAINS.store(0, Ordering::Relaxed);
+    GROUPED_COMBINES.store(0, Ordering::Relaxed);
     ROOM_PARKS.store(0, Ordering::Relaxed);
     ROOM_TURNS.store(0, Ordering::Relaxed);
     ROOM_TURN_REFUSALS.store(0, Ordering::Relaxed);
@@ -548,6 +595,15 @@ type SumcheckRounds<E> = (
     Vec<crate::sumcheck::RoundProof<E>>,
     Vec<math::field::element::FieldElement<E>>,
     Vec<crate::mle::Mle<E>>,
+);
+
+/// What a grouped chain's round 0 hands back ([`GroupedFactors::rounds`]): its
+/// messages, its challenges (the data ones, then the index's), and the one
+/// opening every later round runs on.
+type GroupedRounds<E> = (
+    Vec<crate::sumcheck::RoundProof<E>>,
+    Vec<math::field::element::FieldElement<E>>,
+    OpeningFactors,
 );
 
 /// Codeword size below which the host wins: the kernels are a dozen launches
@@ -840,7 +896,9 @@ pub struct RoomTurns {
     /// The commits', two in flight ([`math_cuda::whir::commit_transient_bytes`]).
     pub commit: u64,
     /// One chain's opening at a time, from the kernels that will run it
-    /// ([`math_cuda::whir_open::opening_transient_bytes`]).
+    /// ([`math_cuda::whir_open::opening_transient_bytes`]) — a grouped
+    /// chain's whole run at once under `GroupFold::Indexed`
+    /// ([`math_cuda::whir_open::grouped_opening_transient_bytes`]).
     pub open: u64,
 }
 
@@ -877,7 +935,7 @@ pub fn room_turns_for(
         .ok()
         .and_then(|program| lower(&program))
         .map_or(0, |lowered| lowered.num_slots);
-    let open = math_cuda::whir_open::opening_transient_bytes(&math_cuda::whir_open::OpeningShape {
+    let shape = math_cuda::whir_open::OpeningShape {
         num_vars: n,
         log_blowup: config.log_blowup,
         first_fold,
@@ -889,7 +947,21 @@ pub fn room_turns_for(
         shares: shares.iter().copied().max().unwrap_or(0),
         eq_values: eq_values.iter().copied().max().unwrap_or(0),
         slots,
-    });
+    };
+    // A grouped chain holds its whole run's openings at once in round 0: the
+    // widest run's turn, when it is wider than one.
+    let widest = crate::stacked_eval::index_chains(layout.num_polys(), config.format.group)
+        .iter()
+        .map(|run| run.len())
+        .max()
+        .unwrap_or(1);
+    let open = math_cuda::whir_open::opening_transient_bytes(&shape).max(
+        math_cuda::whir_open::grouped_opening_transient_bytes(
+            &shape,
+            widest,
+            crate::whir_chain::index_vars(widest),
+        ),
+    );
     RoomTurns { commit, open }
 }
 
@@ -1932,7 +2004,9 @@ where
         return None;
     }
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_FOLD").is_some()) {
+    if HOST_WHIR_COMMIT_FORCED.load(Ordering::Relaxed)
+        || *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_FOLD").is_some())
+    {
         return None;
     }
 
@@ -2015,8 +2089,7 @@ where
     if codeword.len() < COMMIT_THRESHOLD || codeword.len() >> log_folding < 2 {
         return None;
     }
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_COMMIT").is_some()) {
+    if whir_commit_declined() {
         return None;
     }
     // No device is a decline, not an error (see `commit_parts`).
@@ -4879,6 +4952,32 @@ pub fn force_shared_open_declined(on: bool) {
     SHARED_OPEN_DECLINED.store(on, Ordering::Relaxed);
 }
 
+/// Whether the card declines every stacked commit, re-encode and successor
+/// tree (`LAMBDA_VM_NO_GPU_WHIR_COMMIT`, or a test's
+/// [`force_host_whir_commit`]): the codewords and their trees are then the
+/// host's.
+#[cfg(feature = "cuda")]
+fn whir_commit_declined() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    HOST_WHIR_COMMIT_FORCED.load(Ordering::Relaxed)
+        || *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_COMMIT").is_some())
+}
+
+#[cfg(feature = "cuda")]
+static HOST_WHIR_COMMIT_FORCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Makes every stacked commit, re-encode and successor tree decline while
+/// `on`, as `LAMBDA_VM_NO_GPU_WHIR_COMMIT` does for a whole process, and every
+/// fold of a host codeword too (`LAMBDA_VM_NO_GPU_WHIR_FOLD`) — for a parity
+/// test whose reference arm proves on the host alone, codewords included, in
+/// the same binary as its card arms. Not for production callers.
+#[doc(hidden)]
+#[cfg(feature = "cuda")]
+pub fn force_host_whir_commit(on: bool) {
+    HOST_WHIR_COMMIT_FORCED.store(on, Ordering::Relaxed);
+}
+
 /// Factors a build declined to upload. Never constructed.
 #[cfg(not(feature = "cuda"))]
 pub struct OpeningFactors(std::convert::Infallible);
@@ -5157,6 +5256,247 @@ impl OpeningFactors {
         _levels: usize,
     ) -> Option<DeviceCodeword> {
         match self.0 {}
+    }
+}
+
+/// ★ A grouped chain's round 0 on a card (`GroupFold::Indexed`, D-ONECHAIN
+/// §2.5): one opening per polynomial of the run, in slot order, each in share
+/// or tile form for its lean rounds and materialised after them as a
+/// per-polynomial chain's is ([`open_shared`]).
+///
+/// [`rounds`](Self::rounds) runs them in LOCKSTEP — each round's message the
+/// sum of theirs, one challenge binding every one — then the index rounds over
+/// their bound tables laid slot by slot
+/// ([`math_cuda::whir_open::OpeningSession::gather_slots`]), and hands back
+/// the one opening the chain carries on. The host's grouped round 0
+/// (`whir_chain::lockstep_rounds`) step for step: the same messages, the same
+/// challenges, the same tables, so the same proof.
+#[cfg(feature = "cuda")]
+pub struct GroupedFactors {
+    parts: Vec<OpeningFactors>,
+}
+
+/// A grouped round 0 a build declined to put on a card. Never constructed.
+#[cfg(not(feature = "cuda"))]
+pub struct GroupedFactors(std::convert::Infallible);
+
+/// The openings of a grouped chain's polynomials on the card, or `None` when
+/// the card declines any one of them — before any challenge is drawn, so the
+/// caller builds the run's factors on the host instead (counted by
+/// [`note_grouped_host_fallback`] when the codewords are on the card).
+#[cfg(feature = "cuda")]
+pub(crate) fn open_grouped<F, E>(
+    messages: &[crate::whir_chain::Stacked<'_, F>],
+    shares: &[Vec<crate::stacked_eval::WeightShare<'_, E>>],
+    n_stack: usize,
+    program: &crate::program::Program<E>,
+) -> Option<GroupedFactors>
+where
+    F: math::field::traits::IsField + 'static,
+    E: math::field::traits::IsField + 'static,
+{
+    if messages.len() < 2 || messages.len() != shares.len() {
+        return None;
+    }
+    let parts = messages
+        .iter()
+        .zip(shares)
+        .map(|(message, shares)| open_shared(message, shares, n_stack, program))
+        .collect::<Option<Vec<_>>>()?;
+    Some(GroupedFactors { parts })
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn open_grouped<F, E>(
+    _messages: &[crate::whir_chain::Stacked<'_, F>],
+    _shares: &[Vec<crate::stacked_eval::WeightShare<'_, E>>],
+    _n_stack: usize,
+    _program: &crate::program::Program<E>,
+) -> Option<GroupedFactors>
+where
+    F: math::field::traits::IsField + 'static,
+    E: math::field::traits::IsField + 'static,
+{
+    None
+}
+
+#[cfg(feature = "cuda")]
+impl GroupedFactors {
+    /// Round 0 of the grouped chain: `data_rounds` rounds over the
+    /// polynomials in lockstep, then `index_vars` index rounds. Returns the
+    /// `data_rounds + index_vars` messages, the challenges (the data ones,
+    /// then `ρ`), and the opening every later round runs on — the run's
+    /// tables combined at `ρ`, `Σ_p eq(ρ, p)·(w_p, f_p)`, `2^(n − data_rounds)`
+    /// wide.
+    ///
+    /// A part runs its lean rounds while it has them and then its
+    /// materialised session's, each round one launch a part and one wait,
+    /// the message summed here. Past the first round the transcript has
+    /// moved, so every failure is an error.
+    pub(crate) fn rounds<E>(
+        self,
+        data_rounds: usize,
+        index_vars: usize,
+        mut challenge: impl FnMut(
+            &[math::field::element::FieldElement<E>],
+        ) -> math::field::element::FieldElement<E>,
+    ) -> Result<GroupedRounds<E>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        use math::field::element::FieldElement;
+
+        let failed = |stage| crate::Error::DeviceFailed { stage };
+        let Self { mut parts } = self;
+        let lowered = parts
+            .first()
+            .map(|part| part.lowered.clone())
+            .ok_or_else(|| failed("grouped round 0 without a polynomial"))?;
+        // The opening's rule is `w·f`: its rounds are degree two, sent at the
+        // nodes 1 and 2, as every opening's are.
+        let degree = 2;
+        let mut t = Vec::with_capacity(degree * 3);
+        for node in 1..=degree {
+            t.extend_from_slice(
+                &ext3_raw(&FieldElement::<E>::from(node as u64))
+                    .ok_or_else(|| failed("interpolation node"))?,
+            );
+        }
+        let mut sessions: Vec<Option<math_cuda::sumcheck::SumcheckSession>> =
+            parts.iter().map(|_| None).collect();
+        let mut folded = vec![0usize; parts.len()];
+        let mut proofs = Vec::with_capacity(data_rounds + index_vars);
+        let mut challenges = Vec::with_capacity(data_rounds + index_vars);
+        for _ in 0..data_rounds {
+            let mut sums = vec![FieldElement::<E>::zero(); degree];
+            for (part, session) in parts.iter_mut().zip(sessions.iter_mut()) {
+                let lean = match &mut part.state {
+                    OpeningState::Lean { lean, rounds }
+                        if lean.bound() < *rounds && lean.num_vars() > 0 =>
+                    {
+                        Some(lean.round(&t).map_err(|_| failed("grouped lean round"))?)
+                    }
+                    _ => None,
+                };
+                let raw = match lean {
+                    Some(raw) => raw,
+                    None => {
+                        if session.is_none() {
+                            let tables = materialize_state(&mut part.state)?;
+                            *session = Some(
+                                tables
+                                    .sumcheck(
+                                        &lowered.nodes,
+                                        &lowered.consts,
+                                        lowered.num_slots,
+                                        lowered.root_slot,
+                                    )
+                                    .map_err(|_| failed("grouped opening session"))?,
+                            );
+                        }
+                        session
+                            .as_mut()
+                            .ok_or_else(|| failed("grouped opening session"))?
+                            .round(&t)
+                            .map_err(|_| failed("grouped round"))?
+                    }
+                };
+                for (sum, limbs) in sums.iter_mut().zip(raw.chunks_exact(3)) {
+                    *sum += ext3_from_raw::<E>(limbs);
+                }
+            }
+            let r = challenge(&sums);
+            let raw = ext3_raw(&r).ok_or_else(|| failed("challenge"))?;
+            for ((part, session), folds) in parts
+                .iter_mut()
+                .zip(sessions.iter_mut())
+                .zip(folded.iter_mut())
+            {
+                match (session.as_mut(), &mut part.state) {
+                    (Some(session), _) => {
+                        session.fold(&raw).map_err(|_| failed("grouped fold"))?;
+                        *folds += 1;
+                    }
+                    (None, OpeningState::Lean { lean, .. }) => lean.bind(&raw),
+                    (None, _) => return Err(failed("grouped factors")),
+                }
+            }
+            proofs.push(crate::sumcheck::RoundProof { evaluations: sums });
+            challenges.push(r);
+            SUMCHECK_ROUNDS.fetch_add(1, Ordering::Relaxed);
+        }
+        // The sessions' clones of the tables go first, so the gather can
+        // write into the first part's own allocation.
+        drop(sessions);
+        let mut tables = Vec::with_capacity(parts.len());
+        for (part, folds) in parts.into_iter().zip(folded) {
+            let mut state = part.state;
+            materialize_state(&mut state)?.bound(folds);
+            match state {
+                OpeningState::Session(session) => tables.push(session),
+                _ => return Err(failed("grouped factors")),
+            }
+        }
+        let gathered = math_cuda::whir_open::OpeningSession::gather_slots(tables, index_vars)
+            .map_err(|_| failed("grouped slots"))?;
+        let mut combined = OpeningFactors {
+            state: OpeningState::Session(gathered),
+            lowered,
+        };
+        let (more, rho, _) = combined.rounds(index_vars, degree, &mut challenge)?;
+        proofs.extend(more);
+        challenges.extend(rho);
+        GROUPED_CARD_CHAINS.fetch_add(1, Ordering::Relaxed);
+        Ok((proofs, challenges, combined))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl GroupedFactors {
+    pub(crate) fn rounds<E>(
+        self,
+        _data_rounds: usize,
+        _index_vars: usize,
+        _challenge: impl FnMut(
+            &[math::field::element::FieldElement<E>],
+        ) -> math::field::element::FieldElement<E>,
+    ) -> Result<GroupedRounds<E>, crate::Error>
+    where
+        E: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+}
+
+/// `Σ_p scales[p]·parts[p]` on the card: a grouped round-0 successor from its
+/// polynomials' folds ([`math_cuda::whir::combine_codewords`]). `None` when
+/// the card declines, before anything is drawn from it.
+#[cfg(feature = "cuda")]
+pub(crate) fn combine_codewords<E>(
+    parts: &[&DeviceCodeword],
+    scales: &[math::field::element::FieldElement<E>],
+) -> Option<DeviceCodeword>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    let raw: Vec<[u64; 3]> = scales.iter().map(ext3_raw).collect::<Option<_>>()?;
+    let inner: Vec<&math_cuda::whir::DeviceCodeword> = parts.iter().map(|part| &part.0).collect();
+    let combined = math_cuda::whir::combine_codewords(&inner, &raw).ok()?;
+    GROUPED_COMBINES.fetch_add(1, Ordering::Relaxed);
+    Some(DeviceCodeword(combined))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn combine_codewords<E>(
+    parts: &[&DeviceCodeword],
+    _scales: &[math::field::element::FieldElement<E>],
+) -> Option<DeviceCodeword>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    match parts.first() {
+        Some(part) => match part.0 {},
+        None => None,
     }
 }
 
@@ -5461,8 +5801,7 @@ where
     if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
         return None;
     }
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_COMMIT").is_some()) {
+    if whir_commit_declined() {
         return None;
     }
     // A part past the end would be an out-of-bounds device write.
@@ -5518,8 +5857,7 @@ pub(crate) fn commit_resident(
     if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
         return None;
     }
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_COMMIT").is_some()) {
+    if whir_commit_declined() {
         return None;
     }
     // No device is a decline, not an error (see `commit_parts`).
@@ -5558,8 +5896,7 @@ pub(crate) fn encode_resident(
     if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
         return None;
     }
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_COMMIT").is_some()) {
+    if whir_commit_declined() {
         return None;
     }
     math_cuda::device::backend().ok()?;
@@ -5593,8 +5930,7 @@ where
     if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
         return None;
     }
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_WHIR_COMMIT").is_some()) {
+    if whir_commit_declined() {
         return None;
     }
     if parts
@@ -5864,6 +6200,16 @@ impl DeviceCodeword {
         let raw = self.0.first().ok()?;
         values_from_raw(&raw, false)?.into_iter().next()
     }
+
+    /// Every value, brought home (canonical): for a grouped round-0 successor
+    /// whose polynomials' folds did not all land on the card.
+    pub(crate) fn values<F>(&self) -> Option<Vec<math::field::element::FieldElement<F>>>
+    where
+        F: math::field::traits::IsField + 'static,
+    {
+        let raw = self.0.to_host().ok()?;
+        values_from_raw(&raw, self.0.is_base())
+    }
 }
 
 /// `two_inv`, each level's inverse generator, and the challenges as limbs.
@@ -6019,6 +6365,13 @@ impl DeviceCodeword {
     }
 
     pub(crate) fn first<F>(&self) -> Option<math::field::element::FieldElement<F>>
+    where
+        F: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn values<F>(&self) -> Option<Vec<math::field::element::FieldElement<F>>>
     where
         F: math::field::traits::IsField + 'static,
     {

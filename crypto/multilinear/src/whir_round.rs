@@ -366,6 +366,12 @@ where
     let mut rows: Vec<Vec<CosetOpening<C>>> = (0..queries.len())
         .map(|_| Vec::with_capacity(current.len()))
         .collect();
+    // Each tree past the first is an `open_many` call a per-polynomial round 0
+    // does not make: arm F's identity counts it.
+    crate::whir_split::bump_by(
+        &crate::whir_split::GROUPED_TREES,
+        current.len().saturating_sub(1) as u64,
+    );
     for tree in current {
         let opened = tree.open_many_capped(&queries, caps.current, caps.current_owner)?;
         for (row, opening) in rows.iter_mut().zip(opened) {

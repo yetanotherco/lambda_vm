@@ -1186,6 +1186,16 @@ enum Factors<F: IsField + IsSubFieldOf<E>, E: IsField> {
         parts: Vec<(Mle<E>, Mle<E>)>,
         index_vars: usize,
     },
+    /// The same on a card: each polynomial's opening there. Its first
+    /// [`rounds`](Self::rounds) call runs them in lockstep, binds the index,
+    /// and leaves one [`Device`](Self::Device) opening behind
+    /// ([`crate::gpu::GroupedFactors::rounds`]) — the host's steps, so the
+    /// host's messages and tables.
+    DeviceLockstep {
+        parts: crate::gpu::GroupedFactors,
+        index_vars: usize,
+        num_vars: usize,
+    },
 }
 
 impl<F, E> Factors<F, E>
@@ -1248,6 +1258,7 @@ where
             Self::Host { message, .. } => message.num_vars(),
             Self::Device(device) => device.num_vars(),
             Self::Lockstep { parts, .. } => parts.first().map_or(0, |(_, f)| f.num_vars()),
+            Self::DeviceLockstep { num_vars, .. } => *num_vars,
         }
     }
 
@@ -1292,6 +1303,29 @@ where
                 };
                 Ok((proofs, challenges))
             }
+            Self::DeviceLockstep { .. } => {
+                let Self::DeviceLockstep {
+                    parts, index_vars, ..
+                } = core::mem::replace(
+                    self,
+                    Self::Lockstep {
+                        parts: Vec::new(),
+                        index_vars: 0,
+                    },
+                )
+                else {
+                    return Err(Error::NoVariablesLeft);
+                };
+                let (proofs, challenges, combined) =
+                    parts.rounds(rounds, index_vars, |evaluations| {
+                        for value in evaluations {
+                            transcript.append_field_element(value);
+                        }
+                        transcript.sample_field_element()
+                    })?;
+                *self = Self::Device(combined);
+                Ok((proofs, challenges))
+            }
         }
     }
 
@@ -1301,7 +1335,7 @@ where
             Self::Device(device) => device.evaluate_message(point),
             // Round 0's rounds turn lockstep factors into one pair before any
             // out-of-domain point exists.
-            Self::Lockstep { .. } => Err(Error::NoVariablesLeft),
+            Self::Lockstep { .. } | Self::DeviceLockstep { .. } => Err(Error::NoVariablesLeft),
         }
     }
 
@@ -1334,7 +1368,7 @@ where
                 Ok(())
             }
             Self::Device(device) => device.add_scaled_eq(point, gamma),
-            Self::Lockstep { .. } => Err(Error::NoVariablesLeft),
+            Self::Lockstep { .. } | Self::DeviceLockstep { .. } => Err(Error::NoVariablesLeft),
         }
     }
 }
@@ -1521,9 +1555,14 @@ where
 /// `P'` trees at one position set ([`whir_round::prove_grouped`]). Every later
 /// round is today's.
 ///
-/// `2 ≤ P' ≤ MAX_INDEX_POLYS`; a run of one is [`prove_shared`]. On the host
-/// only: the round-0 tables are built here and the codewords must be host
-/// ones (the device's grouped round 0 is D-ONECHAIN's stage B3).
+/// `2 ≤ P' ≤ MAX_INDEX_POLYS`; a run of one is [`prove_shared`]. Round 0 runs
+/// on a card when it takes every polynomial's opening
+/// ([`crate::gpu::open_grouped`]), on the host otherwise — counted as a
+/// fallback when the codewords are on a card
+/// ([`crate::gpu::note_grouped_host_fallback`]). The successor is encoded from
+/// the combined bound message when the factors and codewords are on a card,
+/// as a per-polynomial chain's is, and folded and combined otherwise
+/// ([`fold_grouped`]).
 #[allow(clippy::too_many_arguments)]
 pub fn prove_grouped_shared<F, E, T, H>(
     polys: &[Stacked<'_, F>],
@@ -1552,31 +1591,41 @@ where
         config.log_blowup,
         F::TWO_ADICITY as usize,
     )?;
-    if commitments.iter().any(|c| c.codeword().host().is_none()) {
-        return Err(Error::DeviceFailed {
-            stage: "a grouped round 0 (it folds host codewords until D-ONECHAIN B3)",
-        });
-    }
-    let parts = polys
-        .iter()
-        .zip(shares)
-        .map(|(f, shares)| -> Result<(Mle<E>, Mle<E>), Error> {
-            let message = Mle::new(
-                f.assemble()?
-                    .evals()
-                    .iter()
-                    .map(|v| v.clone().to_extension::<E>())
-                    .collect(),
-            )?;
-            Ok((crate::stacked_eval::weight_table(shares, n_stack)?, message))
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
-    prove_with_factors::<F, E, T, H>(
-        n_stack,
-        Factors::Lockstep {
+    let factors = match crate::gpu::open_grouped(polys, shares, n_stack, &opening_program::<E>()?) {
+        Some(parts) => Factors::DeviceLockstep {
             parts,
             index_vars: index_vars(width),
+            num_vars: n_stack,
         },
+        None => {
+            if commitments.iter().any(|c| c.codeword().device().is_some()) {
+                crate::gpu::note_grouped_host_fallback(width, n_stack);
+            }
+            // Only here do the run's stacked polynomials and weights exist on
+            // the host.
+            let parts = polys
+                .iter()
+                .zip(shares)
+                .map(|(f, shares)| -> Result<(Mle<E>, Mle<E>), Error> {
+                    let message = Mle::new(
+                        f.assemble()?
+                            .evals()
+                            .iter()
+                            .map(|v| v.clone().to_extension::<E>())
+                            .collect(),
+                    )?;
+                    Ok((crate::stacked_eval::weight_table(shares, n_stack)?, message))
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            Factors::Lockstep {
+                parts,
+                index_vars: index_vars(width),
+            }
+        }
+    };
+    prove_with_factors::<F, E, T, H>(
+        n_stack,
+        factors,
         Current::Grouped(commitments),
         domain,
         config,
@@ -1691,7 +1740,22 @@ where
                 }
                 None => fold_held::<F, F, E>(held.codeword(), &current_domain, alphas)?,
             },
-            Current::Grouped(held) => fold_grouped::<F, E, H>(held, &current_domain, alphas, rho)?,
+            Current::Grouped(held) => match held
+                .first()
+                .and_then(|first| factors.encode_successor(first.codeword(), k))
+            {
+                // The run's combined bound message encoded: the successor
+                // `Σ_p eq(ρ, p)·Fold_α(C_p)` is, the fold and the encoding
+                // being linear and equal polynomial by polynomial.
+                Some(encoded) => {
+                    let mut folded_domain = current_domain.clone();
+                    for _ in 0..k {
+                        folded_domain = folded_domain.squared()?;
+                    }
+                    (encoded, folded_domain)
+                }
+                None => fold_grouped::<F, E, H>(held, &current_domain, alphas, rho)?,
+            },
             Current::Extension(held) => {
                 fold_held::<F, E, E>(held.codeword(), &current_domain, alphas)?
             }
@@ -1853,9 +1917,11 @@ where
 }
 
 /// Round 0's successor in a grouped chain: each round-0 codeword folded by the
-/// data challenges, the folds combined with `eq(ρ, p)` ([`eq_index`]). Block
-/// `j` of it is the fold of `Σ_p eq(ρ, p)·block_p(j)`, which is what the
-/// verifier checks (D-ONECHAIN §3.3, Lemma B item 5).
+/// data challenges where it is, the folds combined with `eq(ρ, p)`
+/// ([`eq_index`]) — on the card when every fold landed there
+/// ([`crate::gpu::combine_codewords`]), on the host otherwise, a card fold
+/// brought home first. Block `j` of it is the fold of `Σ_p eq(ρ, p)·block_p(j)`,
+/// which is what the verifier checks (D-ONECHAIN §3.3, Lemma B item 5).
 fn fold_grouped<F, E, H>(
     held: &[&CodewordCommitment<F, H>],
     domain: &Domain<F>,
@@ -1868,22 +1934,41 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     H: WhirHash,
 {
-    let mut combined: Vec<FieldElement<E>> = Vec::new();
+    let eqs: Vec<FieldElement<E>> = (0..held.len()).map(|p| eq_index(rho, p)).collect();
+    let mut folds = Vec::with_capacity(held.len());
     let mut folded_domain = domain.clone();
-    for (p, commitment) in held.iter().enumerate() {
-        let values = commitment.codeword().host().ok_or(Error::DeviceFailed {
-            stage: "a grouped round 0 (it folds host codewords until D-ONECHAIN B3)",
-        })?;
-        let (folded, at) = fold_codeword_k::<F, F, E>(values, domain, alphas)?;
-        let eq = eq_index(rho, p);
+    for commitment in held {
+        let (folded, at) = fold_held::<F, F, E>(commitment.codeword(), domain, alphas)?;
+        folds.push(folded);
+        folded_domain = at;
+    }
+    if let Some(on_card) = folds
+        .iter()
+        .map(Codeword::device)
+        .collect::<Option<Vec<_>>>()
+        && let Some(combined) = crate::gpu::combine_codewords(&on_card, &eqs)
+    {
+        return Ok((Codeword::Device(combined), folded_domain));
+    }
+    let mut combined: Vec<FieldElement<E>> = Vec::new();
+    for (folded, eq) in folds.iter().zip(&eqs) {
+        let brought;
+        let values: &[FieldElement<E>] = match folded {
+            Codeword::Host(values) => values,
+            Codeword::Device(device) => {
+                brought = device.values::<E>().ok_or(Error::DeviceFailed {
+                    stage: "a grouped round-0 fold brought home",
+                })?;
+                &brought
+            }
+        };
         if combined.is_empty() {
-            combined = folded.into_iter().map(|v| &eq * v).collect();
+            combined = values.iter().map(|v| eq * v).collect();
         } else {
-            for (acc, v) in combined.iter_mut().zip(folded) {
-                *acc += &eq * v;
+            for (acc, v) in combined.iter_mut().zip(values) {
+                *acc += eq * v;
             }
         }
-        folded_domain = at;
     }
     Ok((Codeword::Host(combined), folded_domain))
 }
@@ -3377,6 +3462,125 @@ mod tests {
             }
             current = folded;
             current_domain = folded_domain;
+        }
+    }
+
+    /// The grouped round 0's successor — each round-0 codeword folded by the
+    /// data challenges, the folds combined with `eq(ρ, p)` ([`fold_grouped`])
+    /// — is the encoding of the message the lockstep rounds leave bound
+    /// ([`lockstep_rounds`]), for runs of 2, 3 and 4, and so is every later
+    /// round's successor. So a card that holds the run's combined factors may
+    /// encode the successor from them instead of folding `P'` codewords. A
+    /// near miss must differ: `ρ` read from the other end, where two index
+    /// variables make the order matter.
+    #[test]
+    fn a_grouped_successor_is_the_runs_bound_message_encoded() {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as E;
+        type EE = FieldElement<E>;
+        let bytes =
+            |values: &[EE]| -> Vec<u8> { values.iter().flat_map(|v| v.as_bytes()).collect() };
+        let num_vars = 11;
+        let cfg = first(6, 4);
+        let schedule = cfg.schedule(num_vars);
+        assert_eq!(schedule, [6, 4, 1]);
+        for width in 2..=MAX_INDEX_POLYS {
+            let polys: Vec<Mle<F>> = (0..width)
+                .map(|p| pseudo_mle(num_vars, 71 + 13 * p as u64))
+                .collect();
+            let stacks: Vec<Stacked<'_, F>> = polys
+                .iter()
+                .map(|f| Stacked {
+                    parts: vec![(f as &dyn HostColumn<F>, 0)],
+                    resident: None,
+                    num_vars,
+                })
+                .collect();
+            let committed: Vec<(CodewordCommitment<F, KeccakWhir>, Domain<F>)> = stacks
+                .iter()
+                .map(|s| commit_stacked::<F, KeccakWhir>(s, &cfg, true).unwrap())
+                .collect();
+            let domain = committed[0].1.clone();
+            let held: Vec<&CodewordCommitment<F, KeccakWhir>> =
+                committed.iter().map(|(c, _)| c).collect();
+            let parts: Vec<(Mle<E>, Mle<E>)> = polys
+                .iter()
+                .enumerate()
+                .map(|(p, f)| {
+                    let weight = Mle::new(
+                        (0..1u64 << num_vars)
+                            .map(|i| {
+                                EE::from(
+                                    (i + 1 + p as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 7,
+                                )
+                            })
+                            .collect(),
+                    )
+                    .unwrap();
+                    let message =
+                        Mle::new(f.evals().iter().map(|v| (*v).to_extension::<E>()).collect())
+                            .unwrap();
+                    (weight, message)
+                })
+                .collect();
+            let m = index_vars(width);
+            let mut factors = Factors::<F, E>::Lockstep {
+                parts,
+                index_vars: m,
+            };
+            let mut transcript = DefaultTranscript::<E>::new(b"whir-chain-grouped-5a");
+            let mut current: Vec<EE> = Vec::new();
+            let mut current_domain = domain;
+            for (r, &k) in schedule.iter().enumerate() {
+                let (_, challenges) = factors.rounds(k, &mut transcript).unwrap();
+                let (alphas, rho) = challenges.split_at(k.min(challenges.len()));
+                assert_eq!(rho.len(), if r == 0 { m } else { 0 });
+                let (folded, folded_domain) = if r == 0 {
+                    let (codeword, at) =
+                        fold_grouped::<F, E, KeccakWhir>(&held, &current_domain, alphas, rho)
+                            .unwrap();
+                    (codeword.host().expect("a host fold").to_vec(), at)
+                } else {
+                    crate::whir::fold_codeword_k_on_host::<F, E, E>(
+                        &current,
+                        &current_domain,
+                        alphas,
+                    )
+                    .unwrap()
+                };
+                let Factors::Host { message: bound, .. } = &factors else {
+                    panic!("round 0 leaves one host pair");
+                };
+                let left = num_vars - schedule[..=r].iter().sum::<usize>();
+                assert_eq!(bound.num_vars(), left);
+                assert_eq!(folded.len(), 1 << (left + cfg.log_blowup));
+                let encoded = encode::<F, E>(&lift_coefficients(bound), &folded_domain).unwrap();
+                assert_eq!(
+                    bytes(&encoded),
+                    bytes(&folded),
+                    "width {width} round {r}: the encoded message is not the successor"
+                );
+                if r == 0 && m == 2 {
+                    let swapped: Vec<EE> = rho.iter().rev().cloned().collect();
+                    let (other, _) =
+                        fold_grouped::<F, E, KeccakWhir>(&held, &current_domain, alphas, &swapped)
+                            .unwrap();
+                    assert_ne!(
+                        bytes(other.host().unwrap()),
+                        bytes(&folded),
+                        "width {width}: the index order matters"
+                    );
+                }
+                if schedule.get(r + 1).is_some() {
+                    let z0: EE = transcript.sample_field_element();
+                    let point = ood_point(&z0, factors.num_vars());
+                    let y0 = factors.evaluate_message(&point).unwrap();
+                    transcript.append_field_element(&y0);
+                    let gamma: EE = transcript.sample_field_element();
+                    factors.add_scaled_eq(&point, &gamma).unwrap();
+                }
+                current = folded;
+                current_domain = folded_domain;
+            }
         }
     }
 
