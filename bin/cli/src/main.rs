@@ -616,10 +616,26 @@ fn cmd_prove_block(
     blowup: &str,
 ) -> ExitCode {
     use prover::lfm::whir_block_tree::{
-        StderrSink, WhirBlockTreeProof, WhirTreeConfig, blowup_setting, group_setting,
-        prove_whir_block_tree,
+        StderrSink, WhirBlockTreeProof, WhirTreeConfig, group_setting, prove_whir_block_tree,
     };
 
+    // The group opening is the caller's constant, given on the command line
+    // and to `verify-block` alike; the harness's environment word for it is
+    // refused here rather than silently outranked.
+    if std::env::var_os("LAMBDA_VM_WHIR_GROUP").is_some() {
+        eprintln!("LAMBDA_VM_WHIR_GROUP is the harness's knob: give the CLI --group instead");
+        return ExitCode::FAILURE;
+    }
+    // So is the WHIR blowup, installed as the process format before anything
+    // reads it: the banner then states the format this block is proved under.
+    let blowup = match install_block_format(blowup) {
+        Ok(blowup) => blowup,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("BLOCK WHIR BLOWUP: {blowup}");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
         Err(e) => {
@@ -634,21 +650,6 @@ fn cmd_prove_block(
             return ExitCode::FAILURE;
         }
     };
-    // The group opening is the caller's constant, given on the command line
-    // and to `verify-block` alike; the harness's environment word for it is
-    // refused here rather than silently outranked.
-    if std::env::var_os("LAMBDA_VM_WHIR_GROUP").is_some() {
-        eprintln!("LAMBDA_VM_WHIR_GROUP is the harness's knob: give the CLI --group instead");
-        return ExitCode::FAILURE;
-    }
-    // So is the WHIR blowup: `--blowup`, not the format's environment knob.
-    if std::env::var_os(prover::zf_format::ENV_WHIR_BLOWUP).is_some() {
-        eprintln!(
-            "{} is the harness's knob: give the CLI --blowup instead",
-            prover::zf_format::ENV_WHIR_BLOWUP
-        );
-        return ExitCode::FAILURE;
-    }
     let mut cfg = match WhirTreeConfig::from_env() {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -664,14 +665,10 @@ fn cmd_prove_block(
         }
     };
     eprintln!("BLOCK GROUP OPENING: {group}");
-    cfg.format.zf.whir_blowup = match blowup_setting(Some(blowup)) {
-        Ok(blowup) => blowup,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    eprintln!("BLOCK WHIR BLOWUP: {blowup}");
+    assert_eq!(
+        cfg.format.zf.whir_blowup, blowup,
+        "the tree's format is the installed one"
+    );
     // A forced leaf count, another fan-in or another argue is another tree than
     // the one `verify-block` derives: harness arms, not a production proof.
     if !cfg.at_presets() {
@@ -736,8 +733,7 @@ fn cmd_verify_block(
     blowup: &str,
 ) -> ExitCode {
     use prover::lfm::whir_block_tree::{
-        WhirBlockTreeProof, base_line, blowup_setting, group_setting,
-        verify_whir_block_tree_proof_as,
+        WhirBlockTreeProof, base_line, group_setting, verify_whir_block_tree_proof_as,
     };
 
     let fold = match group_setting(Some(group)) {
@@ -747,23 +743,20 @@ fn cmd_verify_block(
             return ExitCode::FAILURE;
         }
     };
-    // The verifier is told the rate as it is told the group opening; the
-    // format's environment knob is refused rather than silently outranked.
-    if std::env::var_os(prover::zf_format::ENV_WHIR_BLOWUP).is_some() {
-        eprintln!(
-            "{} is the harness's knob: give the CLI --blowup instead",
-            prover::zf_format::ENV_WHIR_BLOWUP
-        );
-        return ExitCode::FAILURE;
-    }
-    let mut format = prover::block_whir::BlockFormat::production_with(fold);
-    format.zf.whir_blowup = match blowup_setting(Some(blowup)) {
+    // The verifier is told the rate as it is told the group opening, and the
+    // rate is installed as the process format before anything reads it.
+    let blowup = match install_block_format(blowup) {
         Ok(blowup) => blowup,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
+    let format = prover::block_whir::BlockFormat::production_with(fold);
+    assert_eq!(
+        format.zf.whir_blowup, blowup,
+        "the verifier's format is the installed one"
+    );
 
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -811,6 +804,27 @@ fn cmd_verify_block(
             ExitCode::FAILURE
         }
     }
+}
+
+/// The block commands' process format: the environment's ZF knobs with the
+/// WHIR blowup of `--blowup` (`word`), installed before anything reads the
+/// process format, so its banner — printed once, on stdout — and every reader
+/// of it state the blowup the block is proved or verified under. The format's
+/// own environment knob for the blowup is refused: the flag is the caller's.
+fn install_block_format(word: &str) -> Result<u8, String> {
+    use prover::zf_format::{ENV_WHIR_BLOWUP, ZfFormat};
+    if std::env::var_os(ENV_WHIR_BLOWUP).is_some() {
+        return Err(format!(
+            "{ENV_WHIR_BLOWUP} is the harness's knob: give the CLI --blowup instead"
+        ));
+    }
+    let blowup = prover::lfm::whir_block_tree::blowup_setting(Some(word))?;
+    let format = ZfFormat {
+        whir_blowup: blowup,
+        ..ZfFormat::from_env()?
+    };
+    ZfFormat::install(format)?;
+    Ok(blowup)
 }
 
 fn read_private_input(path: Option<&PathBuf>) -> Result<Vec<u8>, String> {

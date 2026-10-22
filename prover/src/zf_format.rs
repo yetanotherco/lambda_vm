@@ -133,6 +133,10 @@ pub const LEGACY_WHIR_GRIND_BITS: u8 = 20;
 /// Widening this list is a format decision, not a parser one.
 pub const WHIR_GRIND_BITS: [u8; 2] = [20, 18];
 
+/// The process's format: [`ZfFormat::global`] (the environment's) or
+/// [`ZfFormat::install`] (a caller's), whichever comes first.
+static PROCESS_FORMAT: OnceLock<ZfFormat> = OnceLock::new();
+
 /// One process's proof format. [`ZfFormat::default`] is [`ZfFormat::DEFAULT`],
 /// the measured configuration; [`ZfFormat::LEGACY`] is every lever off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -425,8 +429,7 @@ impl ZfFormat {
     /// Prints the banner on the first call. Aborts on an unrecognised value
     /// or a lever this build does not implement — see the module header.
     pub fn global() -> &'static Self {
-        static FORMAT: OnceLock<ZfFormat> = OnceLock::new();
-        FORMAT.get_or_init(|| {
+        PROCESS_FORMAT.get_or_init(|| {
             let format = Self::from_env().unwrap_or_else(|e| {
                 // eprintln then abort rather than a panic: a configuration
                 // error at startup, and the operator needs the accepted
@@ -434,21 +437,61 @@ impl ZfFormat {
                 eprintln!("ZF FORMAT: {e}");
                 std::process::abort()
             });
-            let missing = format.unimplemented_levers();
-            if !missing.is_empty() {
-                eprintln!(
-                    "ZF FORMAT: {} set to a non-default value, but this build does not \
-                     implement that lever yet ({})",
-                    missing.join(", "),
-                    format.banner()
-                );
+            if let Err(e) = format.check_implemented() {
+                eprintln!("{e}");
                 std::process::abort()
             }
-            // Always, including the default — see the module header.
-            println!("{}", format.banner());
-            println!("{}", format.whir_schedule_line());
+            format.announce();
             format
         })
+    }
+
+    /// Makes `format` this process's format ([`Self::global`]) before
+    /// anything has read it, for a caller that is given a format field on its
+    /// command line rather than in the environment (`prove-block` /
+    /// `verify-block --blowup`). The banner then prints `format`, once, as
+    /// `global` would have printed the environment's: every reader of the
+    /// process format and the log agree with what the caller proves or
+    /// verifies under. Refused if the process format was already read under
+    /// another value (its banner is out), or names a lever this build lacks.
+    pub fn install(format: Self) -> Result<&'static Self, String> {
+        format.check_implemented()?;
+        let mut installed = false;
+        let got = PROCESS_FORMAT.get_or_init(|| {
+            installed = true;
+            format.announce();
+            format
+        });
+        if installed || *got == format {
+            Ok(got)
+        } else {
+            Err(format!(
+                "the process format was read before it could be set: {} (wanted {})",
+                got.banner(),
+                format.banner()
+            ))
+        }
+    }
+
+    /// The process format's banner and schedule lines, on stdout. Always,
+    /// including the default — see the module header.
+    fn announce(&self) {
+        println!("{}", self.banner());
+        println!("{}", self.whir_schedule_line());
+    }
+
+    /// `Err` naming the knobs set to a lever this build does not implement.
+    fn check_implemented(&self) -> Result<(), String> {
+        let missing = self.unimplemented_levers();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "ZF FORMAT: {} set to a non-default value, but this build does not implement that \
+             lever yet ({})",
+            missing.join(", "),
+            self.banner()
+        ))
     }
 
     /// `ZF FORMAT: cap=… whir_cap=… fri=… one_row=… whir_folds=… whir_stack=…
@@ -1398,6 +1441,25 @@ mod tests {
                 "{n}"
             );
         }
+    }
+
+    /// `install` makes a caller's format the process format only before
+    /// anything has read it: once the environment's is out (and its banner
+    /// printed), another value is refused, naming both, and the same value is
+    /// accepted. A test process sets no knob, so its format is the default.
+    #[test]
+    fn a_format_is_installed_only_before_the_process_format_is_read() {
+        let process = *ZfFormat::global();
+        assert_eq!(process, ZfFormat::DEFAULT);
+        assert_eq!(ZfFormat::install(process).copied(), Ok(process));
+        let half = ZfFormat {
+            whir_blowup: 2,
+            ..process
+        };
+        let refused = ZfFormat::install(half).expect_err("the process format is already out");
+        assert!(refused.contains("read before it could be set"), "{refused}");
+        assert!(refused.contains(" whir_blowup=2"), "{refused}");
+        assert_eq!(*ZfFormat::global(), process, "the refusal changed nothing");
     }
 
     #[test]
