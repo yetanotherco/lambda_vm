@@ -1988,6 +1988,60 @@ pub fn encode_successor(
     })
 }
 
+/// `Σ_p scales[p] · parts[p]`, the parts extension codewords of one length:
+/// a grouped chain's round-0 successor from its polynomials' folds, each
+/// weighted by its slot's `eq(ρ, p)` (three limbs a scale). Written on
+/// `parts[0]`'s stream and inside its room, as a fold of it would be; every
+/// part's queued work is waited for first, and the sums before this returns,
+/// since each part is freed on its own stream.
+///
+/// The same field values as the host's combination of the same folds; raw
+/// limbs agree wherever both are canonical.
+pub fn combine_codewords(parts: &[&DeviceCodeword], scales: &[[u64; 3]]) -> Result<DeviceCodeword> {
+    ensure!(
+        !parts.is_empty() && parts.len() == scales.len(),
+        "one scale a part"
+    );
+    let first = parts[0];
+    let n = first.elements;
+    ensure!(
+        parts.iter().all(|part| !part.base && part.elements == n),
+        "extension codewords of one length"
+    );
+    let be = backend()?;
+    let stream = first.stream.clone();
+    for part in parts {
+        part.stream.synchronize()?;
+    }
+    let mut out = crate::device::alloc_zeros_or_trim::<u64>(&stream, n * 3)?;
+    let count = n as u64;
+    for (part, scale) in parts.iter().zip(scales) {
+        let scale_dev = crate::device::htod_or_trim(&stream, scale)?;
+        unsafe {
+            stream
+                .launch_builder(&be.add_scaled_ext3)
+                .arg(&mut out)
+                .arg(part.buffer.as_ref())
+                .arg(&count)
+                .arg(&scale_dev)
+                .launch(LaunchConfig::for_num_elems(n as u32))?;
+        }
+    }
+    stream.synchronize()?;
+    Ok(DeviceCodeword {
+        buffer: Arc::new(out),
+        stream,
+        elements: n,
+        base: false,
+        // Its own codeword, as a fold's is.
+        builds: BuildCount::default(),
+        leaf_passes: BuildCount::default(),
+        leaves: Arc::new(Mutex::new(None)),
+        room: first.room.clone(),
+        registered: Arc::new(AtomicBool::new(false)),
+    })
+}
+
 /// The most [`encode_successor`] holds beside its inputs for a successor of
 /// `2^log_out` elements from a message of `2^log_evals`: the interleaved
 /// successor, one limb's plane and one limb's encoding.

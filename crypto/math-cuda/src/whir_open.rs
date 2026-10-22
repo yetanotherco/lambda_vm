@@ -266,6 +266,93 @@ impl OpeningSession {
         crate::whir::encode_successor(codeword, levels, &self.stream, &self.message, self.len)
     }
 
+    /// ★ A grouped chain's index rounds' factors: `parts`' live tables laid
+    /// slot by slot, `2^index_vars` slots of `parts[0].len()`, the slots past
+    /// the parts zero — slot `p` at cube indices `[p·len, (p + 1)·len)`, so the
+    /// index is the cube's HIGH variables and a sumcheck over the result binds
+    /// it first, slot index `y_0` (its most significant bit) before `y_1`.
+    /// The layout a grouped chain's host index rounds read, so the same rounds
+    /// and the same tables at the end.
+    ///
+    /// Written into `parts[0]`'s own allocation when it has the room and no
+    /// one else holds it (a session's tables stay allocated at the width they
+    /// were written at, and the rounds that bound them since left `len` of
+    /// it live), and into a fresh pair otherwise. Every part is drained of
+    /// its queued work first, and the copies before any part is let go: each
+    /// part's tables are freed on its own stream.
+    pub fn gather_slots(mut parts: Vec<Self>, index_vars: usize) -> Result<Self> {
+        ensure!(
+            !parts.is_empty() && parts.len() <= 1usize << index_vars,
+            "at least one part, and no more than the slots"
+        );
+        let len = parts[0].len;
+        ensure!(
+            parts.iter().all(|part| part.len == len),
+            "every slot spans the same cube"
+        );
+        let wide = len << index_vars;
+        for part in &parts {
+            part.stream.synchronize()?;
+        }
+        let first = parts.remove(0);
+        let stream = first.stream.clone();
+        // In place only when nothing else holds the tables: a sumcheck over
+        // them keeps a clone of each for as long as it lives.
+        let in_place = [&first.weight, &first.message]
+            .iter()
+            .all(|table| table.len() >= wide * 3 && Arc::strong_count(table) == 1);
+        let (mut weight, mut message) = match (in_place, first.weight, first.message) {
+            (true, weight, message) => match (Arc::try_unwrap(weight), Arc::try_unwrap(message)) {
+                (Ok(weight), Ok(message)) => (weight, message),
+                _ => return Err(crate::invalid_value()),
+            },
+            (false, first_weight, first_message) => {
+                let mut weight = crate::device::alloc_zeros_or_trim::<u64>(&stream, wide * 3)?;
+                let mut message = crate::device::alloc_zeros_or_trim::<u64>(&stream, wide * 3)?;
+                stream.memcpy_dtod(
+                    &first_weight.slice(0..len * 3),
+                    &mut weight.slice_mut(0..len * 3),
+                )?;
+                stream.memcpy_dtod(
+                    &first_message.slice(0..len * 3),
+                    &mut message.slice_mut(0..len * 3),
+                )?;
+                // Part 0's tables are freed on its stream: not before the copy.
+                stream.synchronize()?;
+                (weight, message)
+            }
+        };
+        for (slot, part) in parts.iter().enumerate() {
+            let at = (slot + 1) * len * 3;
+            stream.memcpy_dtod(
+                &part.weight.slice(0..len * 3),
+                &mut weight.slice_mut(at..at + len * 3),
+            )?;
+            stream.memcpy_dtod(
+                &part.message.slice(0..len * 3),
+                &mut message.slice_mut(at..at + len * 3),
+            )?;
+        }
+        // The slots no polynomial fills: zero in both factors, so they add
+        // nothing to any round and fold away under any challenge. In place,
+        // what the earlier rounds left there is overwritten.
+        let filled = (parts.len() + 1) * len * 3;
+        if filled < wide * 3 {
+            stream.memset_zeros(&mut weight.slice_mut(filled..wide * 3))?;
+            stream.memset_zeros(&mut message.slice_mut(filled..wide * 3))?;
+        }
+        // The other parts are freed on their own streams: not before the
+        // copies that read them have run.
+        stream.synchronize()?;
+        drop(parts);
+        Ok(Self {
+            stream,
+            weight: Arc::new(weight),
+            message: Arc::new(message),
+            len: wide,
+        })
+    }
+
     /// `weight += scale · eq(point, ·)`, the weight the next group carries.
     pub fn add_scaled_eq(&self, point: &[u64], scale: &[u64]) -> Result<()> {
         assert_eq!(point.len(), self.num_vars() * 3, "the point spans the cube");
@@ -1475,6 +1562,92 @@ pub fn opening_transient_bytes(shape: &OpeningShape) -> u64 {
     written.max(rounds).max(fold)
 }
 
+/// ★ [`opening_transient_bytes`] for a GROUPED chain over `polys` stacked
+/// polynomials of `shape` (`GroupFold::Indexed`, `index_vars` = ⌈log2 polys⌉):
+/// its round 0 holds every polynomial's opening at once, where a
+/// per-polynomial chain holds one. One chain at a time either way, so this is
+/// a grouped run's turn; `polys` of 1 is a per-polynomial chain's.
+///
+/// Four phases, each freeing what it no longer needs before the next:
+///
+/// - **The openings written**: every polynomial's lean opening built up
+///   front, then each written at the width the lean rounds leave, one after
+///   another, the last beside the ones written before it. Without the lean
+///   rounds each is written at full width as it opens, through one base copy
+///   at a time.
+/// - **The lockstep rounds** over the written factors: every polynomial's
+///   factors and a session's slot file and partials beside each.
+/// - **The index rounds**: the factors laid slot by slot
+///   ([`OpeningSession::gather_slots`]) — in the first polynomial's own
+///   allocation when the data rounds left it room for `2^index_vars` slots,
+///   in a fresh pair otherwise — and one session over them.
+/// - **The successor and what follows it**: the combined factors (that
+///   allocation), then the encode's transient — or, when it is not encoded,
+///   every polynomial's fold beside the sum they are combined into
+///   ([`crate::whir::combine_codewords`]); after it, as for a
+///   per-polynomial chain, the successor's tree, the round-0 trees' rebuilt
+///   paths one tree at a time, and the out-of-domain answer's copy.
+pub fn grouped_opening_transient_bytes(
+    shape: &OpeningShape,
+    polys: usize,
+    index_vars: usize,
+) -> u64 {
+    use crate::whir::{
+        FUSED_MAX_FOLD, encode_successor_transient_bytes, fold_transient_bytes, tree_bytes,
+    };
+
+    if polys < 2 {
+        return opening_transient_bytes(shape);
+    }
+    let p = polys as u64;
+    let n = shape.num_vars;
+    let first_fold = shape.first_fold.min(n);
+    let lean = shape.lean_rounds > 0 && shape.shares > 0 && shape.shares < LEAN_MAX_SHARES;
+    let bound = if lean {
+        shape.lean_rounds.min(first_fold)
+    } else {
+        0
+    };
+    let factors = 48u64 << (n - bound);
+    let written = if lean {
+        let opening = LeanRound0::planned_bytes(n, shape.shares, shape.eq_values, shape.staged);
+        factors + opening + (p - 1) * factors.max(opening)
+    } else {
+        p * factors + (8u64 << n)
+    };
+    let rounds = p * (factors + SumcheckSession::scratch_bytes(1usize << (n - bound), shape.slots));
+    let slots_at = n - first_fold;
+    let gathered = 48u64 << (slots_at + index_vars);
+    let in_place = bound + index_vars <= first_fold;
+    let kept = if in_place { factors } else { gathered };
+    let index = p * factors
+        + if in_place { 0 } else { gathered }
+        + SumcheckSession::scratch_bytes(1usize << (slots_at + index_vars), shape.slots);
+    let log_codeword = n + shape.log_blowup;
+    let folded = log_codeword - first_fold;
+    let one_fold = fold_transient_bytes(
+        log_codeword,
+        first_fold,
+        shape.fused && first_fold <= FUSED_MAX_FOLD,
+    );
+    let output = 24u64 << folded;
+    let combined = ((p - 1) * output + one_fold).max((p + 1) * output);
+    let transient = if shape.encoded {
+        combined.max(encode_successor_transient_bytes(folded, slots_at))
+    } else {
+        combined
+    };
+    let successor = if shape.next_fold > 0 {
+        tree_bytes(folded - shape.next_fold)
+    } else {
+        0
+    };
+    let out_of_domain = 2 * (24u64 << slots_at);
+    let beside = tree_bytes(folded).max(successor).max(out_of_domain);
+    let fold = kept + transient.max(output + beside);
+    written.max(rounds).max(index).max(fold)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1773,6 +1946,59 @@ mod tests {
         });
         assert!(lean_only * 4 > codeword * 9, "{lean_only} B");
         assert!(fused_only * 2 > codeword * 3, "{fused_only} B");
+    }
+
+    /// ★ A grouped chain's turn, in numbers: its round 0 holds every
+    /// polynomial's factors at once — `P'·3C/16` at the default three lean
+    /// rounds, beside one polynomial's share-form opening as the last is
+    /// written — where a per-polynomial chain's turn is its first fold's,
+    /// `23/64 C`. A run of one is a per-polynomial chain's turn exactly; a run
+    /// of `P'` never holds less than its `P'` factors; and at six lean rounds,
+    /// where the factors are written at `2^(n−6)`, the slots no longer fit the
+    /// first polynomial's allocation and the gather takes a pair of its own.
+    #[test]
+    fn a_grouped_turn_holds_every_polynomials_factors_at_once() {
+        for n in [16usize, 22, 25, 27] {
+            let codeword = 8u64 << (n + 2);
+            let shape = production(n);
+            let one = opening_transient_bytes(&shape);
+            assert_eq!(grouped_opening_transient_bytes(&shape, 1, 0), one, "2^{n}");
+            let factors = 48u64 << (n - LEAN_ROUNDS_DEFAULT);
+            let opening = LeanRound0::planned_bytes(n, shape.shares, shape.eq_values, false);
+            for (polys, index_vars) in [(2usize, 1usize), (3, 2), (4, 2)] {
+                let grouped = grouped_opening_transient_bytes(&shape, polys, index_vars);
+                let p = polys as u64;
+                println!(
+                    "2^{n}: a run of {polys} {:.4} C against {:.4} C a polynomial",
+                    grouped as f64 / codeword as f64,
+                    one as f64 / codeword as f64,
+                );
+                assert!(grouped >= one, "2^{n} run of {polys}");
+                // Every polynomial's factors and the last one's share-form
+                // opening while it is written, `(3P' + 1)·C/16`; or the
+                // lockstep rounds, each factor pair beside its session's slot
+                // file — at a small stack the slot file is not small.
+                let scratch = SumcheckSession::scratch_bytes(
+                    1usize << (n - LEAN_ROUNDS_DEFAULT),
+                    shape.slots,
+                );
+                let written = p * factors + opening;
+                let rounds = p * (factors + scratch);
+                assert!(grouped >= written.max(rounds), "2^{n} run of {polys}");
+                if n == 27 {
+                    assert_eq!(grouped, written, "2^{n} run of {polys}: the writes bind");
+                }
+            }
+            let six = OpeningShape {
+                lean_rounds: 6,
+                ..production(n)
+            };
+            let gathered = 48u64 << (n - 6 + 2);
+            assert!(
+                grouped_opening_transient_bytes(&six, 4, 2) >= 4 * (48u64 << (n - 6)) + gathered,
+                "2^{n} at six rounds: the gather's own pair"
+            );
+        }
     }
 
     /// The shares and the stack decide which path the turn is sized for: past
