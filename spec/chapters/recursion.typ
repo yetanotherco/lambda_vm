@@ -129,7 +129,7 @@ $(comm(instance), comm(verify'))$ is _constant_ in the depth of the recursion.
 In fact, the size of the verification instance is typically fully determined by 
 $comm(instance)$, since $comm(verify')$ can often be precomputed.
 
-#aside([Soundness])[
+#aside[Soundness][
   It is important to note that soundness of this construction is not yet proven.
   For example, there may exist proofs that _attest to the existence of itself_ in a finite number of recursion steps.
   Such a proof would be accepted by $verify'$ even if $instance in.not language$.
@@ -137,7 +137,7 @@ $comm(instance)$, since $comm(verify')$ can often be precomputed.
   a recursion-level counter in the proof.
 ]
 
-#aside([$comm(verify')$ absorption])[
+#aside[$comm(verify')$ absorption][
   Note that $commit(verify')$ must be provided to $verify'$ as a _parameter_;
   absorbing it into $verify'$ would imply an object containing a cryptographic 
   commitment of itself at a static location, which is practically impossible.
@@ -302,7 +302,6 @@ still allows us to treat the final output as a single proof, with a well-defined
 As such, it is possible to construct a split verifier for this combined proof system, and enable full split recursion.
 
 = Split recursion
-#rj[Update everything below to match differing commitments (still needed if we're unifying above?)]
 With proof recursion and split verification formalized, we now combine both concepts into a unified system.
 To this end, we first introduce the selector function
 $
@@ -310,7 +309,11 @@ $
 $
 which, given a bit $b in BB$ and two elements $x,y$ of some space $cal(A)$, selects 
 an element based on the value of $b$.
-We can now use this selector to define $verify^*$ --- a variation to $verify'$ --- as follows:
+We can now use this selector to define $verify^*$ as a variation on $verify'$.
+With the right choice of proof system and commitment scheme $comm(x)$, $verify'$ and by extension
+$verify^*$ can be applied directly to a proof string $pi$ that is either the output of a base proof,
+or a recursive proof that is potentially split as in the previous section.
+
 $
   verify^*([comm(x), comm(y)], [proof, b])
   :&= Delta_BB (verify(comm(x), proof), verify(comm(y([comm(x), comm(y)], dot)), proof), b)\
