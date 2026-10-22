@@ -3160,6 +3160,12 @@ fn a_leaf_of_one_group_opening_refuses_the_others_base() {
             .map(|_| ())
             .map_err(|e| format!("{e:?}"))
         };
+        // A hint builder that cannot read the other mode's openings may stop
+        // by a panic rather than an error: the leaf has no arena either way.
+        let crossed_leaf = |k: usize| -> Result<(), String> {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crossed_leaf(k)))
+                .unwrap_or_else(|_| Err("the hint builder stopped (a panic)".to_string()))
+        };
         let refused = (0..crossed.partition().num_leaves())
             .filter(|&k| crossed_leaf(k).is_err())
             .count();
