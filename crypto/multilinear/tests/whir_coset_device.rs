@@ -311,10 +311,16 @@ fn a_revived_coset_stack_proves_the_whole_trees_bytes_from_the_stack_or_a_reenco
 
 /// ★ Under the coset order a successor that is not encoded from the bound
 /// message refuses the prove, named by its cause, on each path — the knob off,
-/// the factors on the host (the card declined the opening), the card declining
-/// the encode — for a stack committed on the card and one revived over its
-/// columns. Each path is shown taken by its own counter where it has one. The
-/// natural order under the same forcing folds and proves its whole tree's bytes.
+/// the factors kept on the host (the card declined the opening: the shared one
+/// and the uploaded one both), the card declining the encode — for a stack
+/// committed on the card and one revived over its columns. Each path is shown
+/// taken by its own counter where it has one. The natural order under the same
+/// forcing folds and proves its whole tree's bytes.
+///
+/// And the fallback that still encodes: with only the shared opening declined,
+/// the factors are built from the host's tables and uploaded to the card, so
+/// the successor IS encoded and the coset prove passes with its whole tree's
+/// bytes (the host fallback counted all the same).
 #[test]
 fn an_unencoded_successor_refuses_the_coset_prove_by_cause() {
     let _serial = serial();
@@ -330,8 +336,11 @@ fn an_unencoded_successor_refuses_the_coset_prove_by_cause() {
             UnencodedSuccessor::KnobOff,
         ),
         (
-            "the factors on the host",
-            multilinear::gpu::force_shared_open_declined,
+            "the factors kept on the host",
+            |on| {
+                multilinear::gpu::force_shared_open_declined(on);
+                multilinear::gpu::force_device_open_declined(on);
+            },
             UnencodedSuccessor::HostFactors,
         ),
         (
@@ -380,6 +389,25 @@ fn an_unencoded_successor_refuses_the_coset_prove_by_cause() {
     let (_, again) = stack.prove(&coset, Some(4));
     let (_, whole) = stack.prove(&coset, None);
     assert_eq!(bytes!(&again), bytes!(&whole));
+    // Only the shared opening declined: the host's tables go to the card, the
+    // successor is encoded, and the coset prove passes with the same bytes.
+    for drop in [None, Some(4)] {
+        let host = multilinear::gpu::open_host_fallbacks();
+        multilinear::gpu::force_shared_open_declined(true);
+        let uploaded = stack.try_prove(&coset, drop);
+        multilinear::gpu::force_shared_open_declined(false);
+        let (_, uploaded) = uploaded
+            .unwrap_or_else(|e| panic!("drop {drop:?}: the uploaded factors encode: {e:?}"));
+        assert!(
+            multilinear::gpu::open_host_fallbacks() > host,
+            "drop {drop:?}: the host's tables were built (counted)"
+        );
+        assert_eq!(
+            bytes!(&uploaded),
+            bytes!(&whole),
+            "drop {drop:?}: the same bytes"
+        );
+    }
 }
 
 /// The natural order on the card is untouched: a retired natural stack still

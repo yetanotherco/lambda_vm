@@ -430,6 +430,21 @@ fn note_encode_declined(levels: usize) {
     );
 }
 
+/// Whether [`open_on_device`] declines as a card that will not take the
+/// opening would, so a test can reach factors built on the host and KEPT there
+/// over a device codeword: [`force_shared_open_declined`] alone sends the
+/// opening to the host's tables, which [`open_on_device`] then uploads.
+#[cfg(feature = "cuda")]
+static DEVICE_OPEN_DECLINED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Makes [`open_on_device`] decline while `on`. Not for production callers.
+#[doc(hidden)]
+#[cfg(feature = "cuda")]
+pub fn force_device_open_declined(on: bool) {
+    DEVICE_OPEN_DECLINED.store(on, Ordering::Relaxed);
+}
+
 /// [`COSET_OPENINGS`].
 pub fn coset_openings() -> u64 {
     COSET_OPENINGS.load(Ordering::Relaxed)
@@ -5114,6 +5129,7 @@ where
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if HOST_WHIR_COMMIT_FORCED.load(Ordering::Relaxed)
         || *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_OPEN").is_some())
+        || DEVICE_OPEN_DECLINED.load(Ordering::Relaxed)
     {
         return None;
     }
