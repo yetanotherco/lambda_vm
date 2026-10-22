@@ -139,6 +139,19 @@ fn device_commit_matches_the_host_pipeline_under_rpx() {
     every_shape::<RpxWhir>();
 }
 
+/// ★ Blowup 2 (`LAMBDA_VM_ZF_WHIR_BLOWUP=2`): the device commit at the rate's
+/// production shapes is the host's, under both block hashes — the first fold
+/// of `first6` at a production-like height and two others, and a later round's
+/// fold of four. Every tree is a level shallower than at blowup 4, so its depth
+/// parity flips (the arity-4 layout's odd tops move).
+#[test]
+fn device_commit_matches_the_host_pipeline_at_blowup_two() {
+    for (num_vars, log_folding) in [(16usize, 6usize), (13, 6), (14, 4), (15, 4)] {
+        parity::<RpxWhir>(num_vars, 1, log_folding);
+        parity::<P1Whir>(num_vars, 1, log_folding);
+    }
+}
+
 /// ★★ The two hashes really do build DIFFERENT trees on the device.
 ///
 /// Without this, both tests above would pass on a dispatch that ignored its key

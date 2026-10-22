@@ -76,7 +76,16 @@ fn ext(raw: &[u64]) -> Vec<FE3> {
 /// binds the message with the session's rounds, and compares the encoded
 /// successor with the fused fold and the host fold at the same challenges.
 fn the_encoded_successor_is_the_fold(num_vars: usize, levels: usize, seed: u64) {
-    let log_blowup = 2;
+    the_encoded_successor_is_the_fold_at(num_vars, levels, seed, 2);
+}
+
+/// [`the_encoded_successor_is_the_fold`] at blowup `2^log_blowup`.
+fn the_encoded_successor_is_the_fold_at(
+    num_vars: usize,
+    levels: usize,
+    seed: u64,
+    log_blowup: usize,
+) {
     let mut rng = Rng(seed);
     let len = 1usize << num_vars;
     let evals: Vec<u64> = (0..len).map(|_| rng.next()).collect();
@@ -186,6 +195,15 @@ fn the_encoded_successor_is_the_fold(num_vars: usize, levels: usize, seed: u64) 
 fn the_encoded_successor_is_the_fold_at_the_production_first_fold() {
     the_encoded_successor_is_the_fold(20, 6, 0x5A5A);
     the_encoded_successor_is_the_fold(12, 6, 0x0A0A);
+}
+
+/// Blowup 2 (`LAMBDA_VM_ZF_WHIR_BLOWUP=2`): the successor is the bound message
+/// encoded at the rate the codeword has, which the encode reads off the sizes.
+#[test]
+fn the_encoded_successor_is_the_fold_at_blowup_two() {
+    the_encoded_successor_is_the_fold_at(20, 6, 0x6B6B, 1);
+    the_encoded_successor_is_the_fold_at(12, 6, 0x0B0B, 1);
+    the_encoded_successor_is_the_fold_at(16, 4, 0x1B1B, 1);
 }
 
 /// Other first folds: the encode is not tied to six.

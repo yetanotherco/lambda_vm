@@ -35,11 +35,16 @@ fn sponge() -> <P1Whir as WhirHash>::Sponge {
 }
 
 fn run(arity4_cap: CapPolicy, log_folding: usize) {
-    // 2^16 evaluations at blowup 4: a 2^18 codeword, above the device commit
-    // threshold, so the chain's first tree lives on the card.
-    let num_vars = 16;
+    run_at(arity4_cap, log_folding, 2);
+}
+
+/// [`run`] at blowup `2^log_blowup`.
+fn run_at(arity4_cap: CapPolicy, log_folding: usize, log_blowup: usize) {
+    // A 2^18 codeword (2^16 evaluations at blowup 4, 2^17 at blowup 2), above
+    // the device commit threshold, so the chain's first tree lives on the card.
+    let num_vars = 18 - log_blowup;
     let cfg = ChainConfig {
-        log_blowup: 2,
+        log_blowup,
         log_folding,
         num_queries: 25,
         grind: GrindBits::uniform(8),
@@ -56,7 +61,7 @@ fn run(arity4_cap: CapPolicy, log_folding: usize) {
     .unwrap();
     let z: Vec<EE> = (0..num_vars).map(|i| EE::from(301 + i as u64)).collect();
     let y = f.evaluate_in(&z).unwrap();
-    let tag = format!("k={log_folding} cap4={arity4_cap}");
+    let tag = format!("k={log_folding} cap4={arity4_cap} blowup 2^{log_blowup}");
 
     let (device, domain) = commit::<F, P1Whir>(&f, &cfg, true).unwrap();
     assert!(
@@ -126,6 +131,19 @@ fn the_device_p1_chain_proves_the_host_chains_bytes() {
     for cap in [CapPolicy::Off, CapPolicy::Fixed(1), CapPolicy::Fixed(2)] {
         for k in [4usize, 3] {
             run(cap, k);
+        }
+    }
+}
+
+/// ★ Blowup 2 (`LAMBDA_VM_ZF_WHIR_BLOWUP=2`): the same bytes at the rate's
+/// shapes — first folds of 6 (`first6`), 4 and 3, so tree 0's depth is 12, 14
+/// and 15 at 2^17 evaluations, both parities — uncapped and at the base's
+/// arity-4 cap of 2.
+#[test]
+fn the_device_p1_chain_at_blowup_two_proves_the_host_chains_bytes() {
+    for cap in [CapPolicy::Off, CapPolicy::Fixed(2)] {
+        for k in [6usize, 4, 3] {
+            run_at(cap, k, 1);
         }
     }
 }
