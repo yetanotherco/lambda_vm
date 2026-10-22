@@ -96,6 +96,12 @@ jobs:
         run: |
           make compile-programs-asm
 
+      # The key hashes every source a Rust guest build reads: the guest crates, the guest
+      # runtime (syscalls), the crypto crates guests depend on by path (ethrex-crypto for the
+      # ethrex guest; crypto and math for keccak_transcript_pattern), the target spec and the
+      # Makefile's recipe. An exact hit skips the compile step below, so a change confined to
+      # one of them that the key missed would run every test on a stale ELF. The same key
+      # appears in each job that restores these ELFs.
       - name: Cache compiled Rust ELF artifacts and build cache
         id: cache-rust-elfs
         uses: actions/cache@v4
@@ -103,7 +109,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'crypto/ethrex-crypto/src/**', 'crypto/ethrex-crypto/Cargo.toml', 'crypto/crypto/src/**', 'crypto/crypto/Cargo.toml', 'crypto/math/src/**', 'crypto/math/Cargo.toml', 'Makefile') }}
           restore-keys: |
             rust-elf-artifacts-
 
@@ -317,7 +323,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'crypto/ethrex-crypto/src/**', 'crypto/ethrex-crypto/Cargo.toml', 'crypto/crypto/src/**', 'crypto/crypto/Cargo.toml', 'crypto/math/src/**', 'crypto/math/Cargo.toml', 'Makefile') }}
           restore-keys: |
             rust-elf-artifacts-
 
@@ -433,7 +439,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'crypto/ethrex-crypto/src/**', 'crypto/ethrex-crypto/Cargo.toml', 'crypto/crypto/src/**', 'crypto/crypto/Cargo.toml', 'crypto/math/src/**', 'crypto/math/Cargo.toml', 'Makefile') }}
           restore-keys: |
             rust-elf-artifacts-
 
@@ -522,7 +528,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'crypto/ethrex-crypto/src/**', 'crypto/ethrex-crypto/Cargo.toml', 'crypto/crypto/src/**', 'crypto/crypto/Cargo.toml', 'crypto/math/src/**', 'crypto/math/Cargo.toml', 'Makefile') }}
           restore-keys: |
             rust-elf-artifacts-
 
@@ -606,7 +612,7 @@ jobs:
           path: |
             executor/program_artifacts/rust
             executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'crypto/ethrex-crypto/src/**', 'crypto/ethrex-crypto/Cargo.toml', 'crypto/crypto/src/**', 'crypto/crypto/Cargo.toml', 'crypto/math/src/**', 'crypto/math/Cargo.toml', 'Makefile') }}
           restore-keys: |
             rust-elf-artifacts-
 
