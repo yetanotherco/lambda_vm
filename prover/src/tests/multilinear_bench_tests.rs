@@ -378,6 +378,14 @@ mod transcript_pin {
     /// A guard on a value nobody measured to full width is a guard on a guess.
     /// Anything shortened for a message is a display; the constant is the
     /// measurement.
+    ///
+    /// ★ KEPT ON THIS GUEST ON PURPOSE. The ethrex guest has since been rebuilt
+    /// (fat LTO, the runtime memcpy, the leaner Keccak final block) and is a
+    /// different program with its own sha, which this pin skips by name. This
+    /// one stays on every box as a fixture, and the pin guards the transcript
+    /// code whichever guest is proved in production: re-read on 2026-10-22 at
+    /// the legacy knobs, it gave prove (407,369, 149,321, 3,428) and verify
+    /// (407,529, 149,351, 3,428), the totals the bases below compose to.
     pub const ELF_SHA256: &str = "8f826601776d4085cbb6fbf0302fe8d8d5d1be7940ac1aaca24899c6244ec80a";
     pub const ELF_LEN: usize = 3_948_504;
     pub const EPOCH_LOG2: u32 = 21;
@@ -973,6 +981,22 @@ mod transcript_pin {
     );
 }
 
+/// The WHIR chain format the pinned counts were measured at: the legacy
+/// format's, every lever off, carrying the block base's 4-ary cap as every
+/// chain format the process reports does since the block moved to Poseidon1.
+///
+/// ⛔ NOT `ChainFormat::DEFAULT`, which has that cap off. A guard comparing the
+/// process's format against the bare default skipped on every run at every knob
+/// setting, the pinned guest included, and its skip line named no knob that
+/// could change it. The cap is read at arity 4 only, so the binary (RPX) chains
+/// this bench proves are the same either way: a box run of the pinned guest at
+/// the legacy knobs read the pinned prove and verify counts to the unit with the
+/// cap carried.
+#[cfg(feature = "hash-metrics")]
+fn pinned_chain_format() -> multilinear::whir_chain::ChainFormat {
+    crate::zf_format::ZfFormat::LEGACY.chain_format()
+}
+
 /// Whether the pinned counts describe THIS run.
 ///
 /// Pure, and taking the sha as a string so the refusal can be tested without
@@ -1180,7 +1204,7 @@ fn check_transcript_pins(
     // squeezes read.
     let whir_format = crate::zf_format::ZfFormat::global().chain_format();
     let grind_bits = crate::zf_format::ZfFormat::global().whir_grind_bits;
-    if whir_format != multilinear::whir_chain::ChainFormat::DEFAULT
+    if whir_format != pinned_chain_format()
         || grind_bits != crate::zf_format::LEGACY_WHIR_GRIND_BITS
     {
         println!(
@@ -1191,7 +1215,7 @@ fn check_transcript_pins(
              LAMBDA_VM_ZF_WHIR_GRIND_BITS=20)",
             "WHIR",
             whir_format,
-            multilinear::whir_chain::ChainFormat::DEFAULT,
+            pinned_chain_format(),
             crate::zf_format::LEGACY_WHIR_GRIND_BITS,
         );
         return;
@@ -2431,8 +2455,7 @@ fn check_device_pins(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    if crate::zf_format::ZfFormat::global().chain_format()
-        != multilinear::whir_chain::ChainFormat::DEFAULT
+    if crate::zf_format::ZfFormat::global().chain_format() != pinned_chain_format()
         || !pin_applies(
             &sha,
             elf.len(),
