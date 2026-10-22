@@ -32,7 +32,10 @@ use super::whir_transcript::{SpongeEntry, WhirTranscript};
 use super::word::{LfmWord, ext_word, word_as_ext};
 
 /// Epoch 0 of block 25368371 at `epoch_size_log2 = 21`, `(width, num_vars)` per
-/// table in sub-proof order.
+/// table in sub-proof order, on the OLD guest: the ethrex guest as it was built
+/// before it moved to fat LTO, the runtime's own memcpy and the leaner Keccak
+/// final block. That guest is still a valid program and these are still its
+/// shapes; the guest built today runs this epoch at other heights.
 ///
 /// ⚠ A FIXTURE READ FROM A BOX RUN, not a laptop measurement: the file is
 /// `thoughts/shared/whir-recursion/handoffs/sh1-epoch-shapes-2026-09-18.log`,
@@ -87,7 +90,8 @@ fn epoch_zero_shapes() -> Vec<(usize, usize)> {
 
 /// The per-table half, from `bs2-table-costs-2026-09-19.log`: 34 tables'
 /// `table_verify_cost` with the sponge threaded, at the same shape and the same
-/// guest.
+/// guest — the OLD guest of [`epoch_zero_shapes`]. Not re-measured for the guest
+/// built today.
 ///
 /// ⚠ CONST-INCLUSIVE, and measured with EACH TABLE ITS OWN PROGRAM, so its
 /// constants are 34 pools. In one epoch program there is one pool and they
@@ -98,6 +102,8 @@ const BS2_PER_TABLE_PERMS: usize = 19_394;
 /// The DECODE group, whole, from V1f item 3's production cross-check: the
 /// wrapper and its one chain at `n_stack` 23 under the posture
 /// `ChainConfig::with_security(2, 4, 25, 128, uniform(20))`. CONST-FREE.
+/// Measured on the OLD guest of [`epoch_zero_shapes`], whose instruction count
+/// sets the DECODE table's height; not re-measured for the guest built today.
 const DECODE_GROUP_ROWS: usize = 161_783;
 const DECODE_GROUP_PERMS: usize = 19_205;
 
@@ -142,6 +148,16 @@ fn preprocessed_rows() -> usize {
 /// the box's. What it IS: the same closed forms whose F1s are pinned against
 /// emitted programs at gated shapes, evaluated at the shape a box run measured.
 /// Arm B is the sizing note's 12,301,266 instructions for one epoch wrap.
+///
+/// ⚠ EVERY INPUT IS THE OLD GUEST'S, and that is deliberate. The shapes
+/// ([`epoch_zero_shapes`], sh1), the per-table half (`BS2_PER_TABLE_*`, bs2), the
+/// DECODE group (`DECODE_GROUP_*`, V1f) and arm B were all measured on the guest
+/// as it was built before fat LTO and the runtime memcpy, so the recount and
+/// its judgement compare one program with itself. Swapping in the new guest's
+/// shapes alone would compare a new epoch's groups against an old epoch's
+/// per-table costs and assert nothing true. The guest built today has its own
+/// epoch 0, asserted by its own test; re-measuring the other three inputs on it
+/// is a separate box measurement.
 #[test]
 fn the_production_epoch_recount() {
     let shapes = epoch_zero_shapes();
