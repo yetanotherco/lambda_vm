@@ -307,6 +307,61 @@ fn an_indexed_block_at_blowup_2_is_refused_by_a_verifier_at_blowup_4() {
     );
 }
 
+/// ★ The coset round-0 leaf order (`LAMBDA_VM_ZF_WHIR_LEAVES`) under one chain
+/// a run and the batched argue, at the production budget of three polynomials
+/// a group, at either blowup: a coset block has grouped chains and verifies
+/// under its own format; a verifier of the natural order refuses it, and so
+/// does a coset verifier at the other blowup; a coset verifier refuses the
+/// natural block.
+#[test]
+fn an_indexed_coset_block_is_refused_by_a_natural_verifier() {
+    use multilinear::whir_chain::LeafOrder;
+    let elf = asm_elf_bytes("all_instructions_64");
+    let opts = ProofOptions::default_test_options();
+    let at = |blowup: u8, leaves: LeafOrder| {
+        let mut f = format(
+            crate::hash_pin::BLOCK_BASE,
+            block_whir::BLOCK_GROUP_POLYS,
+            GroupFold::Indexed,
+            ArgueFormat::BATCHED,
+        );
+        f.zf.whir_blowup = blowup;
+        f.zf.whir_leaves = leaves;
+        f
+    };
+    let verify = |proof: &BlockWhirProof, format: &BlockFormat| {
+        block_whir::verify_block_whir(proof, &elf, &opts, format).unwrap_or(false)
+    };
+    for (blowup, other) in [(4, 2), (2, 4)] {
+        let coset = prove(&elf, &at(blowup, LeafOrder::Coset), MaxRowsConfig::small());
+        assert!(
+            grouped_widths(&coset).iter().any(|&w| w >= 2),
+            "a grouped chain under the coset order at blowup {blowup}"
+        );
+        assert!(
+            verify(&coset, &at(blowup, LeafOrder::Coset)),
+            "the control at blowup {blowup}"
+        );
+        assert!(
+            !verify(&coset, &at(blowup, LeafOrder::Natural)),
+            "a natural verifier must refuse the coset block at blowup {blowup}"
+        );
+        assert!(
+            !verify(&coset, &at(other, LeafOrder::Coset)),
+            "a coset verifier at blowup {other} must refuse the coset block at blowup {blowup}"
+        );
+    }
+    let natural = prove(&elf, &at(4, LeafOrder::Natural), MaxRowsConfig::small());
+    assert!(
+        verify(&natural, &at(4, LeafOrder::Natural)),
+        "the natural control"
+    );
+    assert!(
+        !verify(&natural, &at(4, LeafOrder::Coset)),
+        "a coset verifier must refuse the natural block"
+    );
+}
+
 /// The round trip and the cross-mode refusals at each budget of `budgets`
 /// polynomials a group, under `argue`; returns the grouped run widths seen.
 fn round_trips_and_refuses_the_other_mode(
