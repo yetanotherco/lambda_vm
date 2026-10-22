@@ -57,11 +57,13 @@
 //!
 //! [`finish`]: WindowedTraceBuilder::finish
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use executor::elf::Elf;
+use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
+use executor::vm::memory::U64HashMap;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use stark::trace::TraceTable;
@@ -69,12 +71,13 @@ use stark::trace::TraceTable;
 use super::super::gpack::TraceForm;
 use super::super::types::{GoldilocksExtension, GoldilocksField};
 use super::{
-    BlockVec, CollectedOps, CutPadding, DecodeArtifacts, MemoryState, MemwBuckets, PreCounted,
-    RegisterState, RoutedBlocks, StreamSkip, Traces, WalkLean, WalkOutputs, WalkSizes, bitwise,
-    block_len, build_initial_image, build_traces, collect_halt_ops, collect_ops_from_cpu_into,
+    BlockVec, CollectedOps, CutPadding, MemoryState, MemwBuckets, PreCounted, RegisterState,
+    RoutedBlocks, StreamSkip, Traces, WalkLean, WalkOutputs, WalkSizes, bitwise, block_len,
+    build_initial_image_paged, build_traces, collect_halt_ops, collect_ops_from_cpu_into,
     route_ops, route_ops_one_pass,
 };
 use crate::Error;
+use crate::paged_mem::PagedMem;
 use crate::tables::decode::DecodeTable;
 use crate::tables::{
     cpu, decode, keccak_rnd, load, lt, memw, memw_aligned, memw_register, register, shift, store,
@@ -128,8 +131,13 @@ pub struct StreamedChunk {
 
 /// A run's traces, built window by window. See the module docs.
 pub struct WindowedTraceBuilder<'a> {
-    artifacts: DecodeArtifacts,
-    image: HashMap<u64, u8>,
+    /// Every instruction's decode by DECODE row: what the walk reads each
+    /// cycle's decode with (shared with the threads that generate CPU chunks).
+    decode: Arc<DecodeTable>,
+    /// DECODE's trace, until [`Self::drop_streamed_ops`] hands it to the kept
+    /// run, which counts the handed-out CPU ops' rows into it.
+    decode_trace: Option<DecodeTrace>,
+    image: PagedMem<u8>,
     register_init: Vec<u32>,
     max_rows: crate::tables::MaxRowsConfig,
     private_input: &'a [u8],
@@ -172,6 +180,81 @@ pub struct WindowedTraceBuilder<'a> {
     /// The last walked window's list lengths, to size the next window's lists
     /// ([`walk_sized`]).
     walk_sizes: WalkSizes,
+    /// [`Self::setup_stamps`].
+    setup: SetupStamps,
+}
+
+/// Where a builder's creation spent its time, seconds: the initial image and
+/// the memory state seeded from it, and the decode table the walk reads.
+/// DECODE's trace is generated on a thread of its own meanwhile.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetupStamps {
+    pub image: f64,
+    pub decode: f64,
+}
+
+/// DECODE's pristine trace (every multiplicity zero), generated on a thread of
+/// its own from the builder's creation on: the walk reads only the decode
+/// table, and the trace is first read where the first CPU chunk's DECODE rows
+/// are counted, windows later. [`Self::table`] waits for the thread; a panic in
+/// it is raised there, on the thread that reads the trace, as building the
+/// trace in place would have raised it.
+struct DecodeTrace {
+    thread: Option<std::thread::JoinHandle<Table>>,
+    table: Table,
+}
+
+impl DecodeTrace {
+    fn spawn(instructions: U64HashMap<Instruction>) -> Result<Self, Error> {
+        #[cfg(test)]
+        let delay = DECODE_TRACE_DELAY.with(std::cell::Cell::get);
+        let thread = std::thread::Builder::new()
+            .name("decode-trace".to_string())
+            .spawn(move || {
+                #[cfg(test)]
+                std::thread::sleep(delay);
+                // As `DecodeArtifacts::from_elf`: `generate_decode_trace` lays
+                // the rows out in the order the AIR's commitment holds.
+                decode::generate_decode_trace(&instructions).0
+            })
+            .map_err(|e| Error::Prover(format!("DECODE's trace thread did not start: {e}")))?;
+        Ok(Self {
+            thread: Some(thread),
+            table: super::streamed_placeholder(),
+        })
+    }
+
+    /// The trace, once its thread has generated it.
+    fn table(&mut self) -> &mut Table {
+        if let Some(thread) = self.thread.take() {
+            self.table = thread
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        }
+        &mut self.table
+    }
+
+    fn into_table(mut self) -> Table {
+        self.table();
+        self.table
+    }
+
+    /// The bytes the trace takes on the heap once its thread has handed it
+    /// over; none before.
+    fn heap_bytes(&self) -> usize {
+        if self.thread.is_some() {
+            return 0;
+        }
+        self.table.num_rows() * self.table.num_main_columns * std::mem::size_of::<u64>()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's delay before DECODE's trace thread generates the trace, read
+    /// where a builder is created ([`DecodeTrace::spawn`]).
+    pub(crate) static DECODE_TRACE_DELAY: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
 }
 
 /// What the table phase of a windowed build starts from
@@ -179,11 +262,11 @@ pub struct WindowedTraceBuilder<'a> {
 /// left, and what the windows streamed and counted.
 struct Finishing<'a> {
     ops: CollectedOps,
-    image: HashMap<u64, u8>,
+    image: PagedMem<u8>,
     memory_state: MemoryState,
     register_init: Vec<u32>,
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
-    artifacts: DecodeArtifacts,
+    decode: Arc<DecodeTable>,
     register_state: RegisterState,
     max_rows: crate::tables::MaxRowsConfig,
     private_input: &'a [u8],
@@ -237,15 +320,26 @@ impl<'a> WindowedTraceBuilder<'a> {
         private_input: &'a [u8],
         max_rows: &crate::tables::MaxRowsConfig,
     ) -> Result<Self, Error> {
-        let image = build_initial_image(elf, private_input);
+        let t = std::time::Instant::now();
+        // The initial image as pages, and the walk's memory state seeded from
+        // them page by page: the state the image as a map of bytes, seeded byte
+        // by byte, gives.
+        let image = build_initial_image_paged(elf, private_input);
         let register_init = register::register_init_from_entry_point(elf.entry_point);
-        let mut memory_state = MemoryState::from_image(&image);
+        let mut memory_state = MemoryState::from_pages(&image);
         let register_state = RegisterState::from_init(&register_init);
-        let artifacts = DecodeArtifacts::from_elf(elf)?;
+        let image_secs = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let instructions = decode::instructions_from_elf(elf)
+            .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
+        let decode = Arc::new(DecodeTable::from_instructions(&instructions));
+        let decode_secs = t.elapsed().as_secs_f64();
+        let decode_trace = DecodeTrace::spawn(instructions)?;
         let lean = WalkLean::from_env()?;
         memory_state.lean = lean.memory;
         Ok(Self {
-            artifacts,
+            decode,
+            decode_trace: Some(decode_trace),
             image,
             register_init,
             max_rows: max_rows.clone(),
@@ -275,6 +369,10 @@ impl<'a> WindowedTraceBuilder<'a> {
             cut_padding: CutPadding::from_env()?,
             walk_batch: walk_batch(),
             walk_sizes: WalkSizes::default(),
+            setup: SetupStamps {
+                image: image_secs,
+                decode: decode_secs,
+            },
         })
     }
 
@@ -452,10 +550,10 @@ impl<'a> WindowedTraceBuilder<'a> {
                 "drop_streamed_ops after a window was walked".to_string(),
             ));
         }
-        self.kept = Some(Kept::new(
-            self.artifacts.decode_trace.clone(),
-            &self.max_rows,
-        ));
+        let decode = self.decode_trace.take().ok_or_else(|| {
+            Error::Prover("drop_streamed_ops: DECODE's trace was handed over already".to_string())
+        })?;
+        self.kept = Some(Kept::new(decode, &self.max_rows));
         Ok(self)
     }
 
@@ -478,10 +576,14 @@ impl<'a> WindowedTraceBuilder<'a> {
         ])
     }
 
-    /// The bytes the initial memory image (a map of bytes) takes on the heap,
-    /// at about one entry and one control byte per slot.
+    /// The bytes the initial memory image (its pages) takes on the heap.
     pub fn image_bytes(&self) -> usize {
-        self.image.capacity() * (std::mem::size_of::<(u64, u8)>() + 1)
+        self.image.heap_bytes()
+    }
+
+    /// Where the builder's creation spent its time.
+    pub fn setup_stamps(&self) -> SetupStamps {
+        self.setup
     }
 
     /// The time the windows took so far.
@@ -541,7 +643,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             memory_state,
             register_init,
             decode_trace,
-            artifacts,
+            decode,
             register_state,
             max_rows,
             private_input,
@@ -554,7 +656,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             &memory_state,
             &register_init,
             decode_trace,
-            &artifacts.decode,
+            &decode,
             register_state,
             &max_rows,
             #[cfg(feature = "disk-spill")]
@@ -608,7 +710,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             memory_state,
             register_init,
             decode_trace,
-            artifacts,
+            decode,
             register_state,
             max_rows,
             private_input,
@@ -621,7 +723,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             &memory_state,
             &register_init,
             decode_trace,
-            &artifacts.decode,
+            &decode,
             register_state,
             &max_rows,
             #[cfg(feature = "disk-spill")]
@@ -649,7 +751,7 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// assembled: what the table phase starts from.
     fn finishing(mut self, logs: &[Log]) -> Result<Finishing<'a>, Error> {
         // The last window may halt: it is walked here, not by the `Walker`.
-        let decode = &self.artifacts.decode;
+        let decode = &self.decode;
         let cpu_ops = super::collect_cpu_ops_from(logs, decode, self.cycles)?;
         self.cycles += logs.len();
         let mut walk = WalkOutputs::with_capacity(cpu_ops.len());
@@ -669,11 +771,12 @@ impl<'a> WindowedTraceBuilder<'a> {
             route_ops
         };
         self.segments
-            .append(route(&cpu_ops, &self.artifacts.decode, &walk.cpu32_ops));
+            .append(route(&cpu_ops, &self.decode, &walk.cpu32_ops));
         let last = WalkedWindow { cpu_ops, walk };
         super::build_stamps::mark("p0 last window");
         let Self {
-            artifacts,
+            decode,
+            decode_trace,
             image,
             register_init,
             max_rows,
@@ -721,7 +824,15 @@ impl<'a> WindowedTraceBuilder<'a> {
                 let rest = KeptRest::from_walk(&mut walk);
                 let ops = assemble(cpu_ops, walk, rest, segments, &mut register_state);
                 super::build_stamps::mark("p0 assemble");
-                (ops, artifacts.decode_trace.clone(), emitted, counted)
+                let decode_trace = decode_trace
+                    .ok_or_else(|| {
+                        Error::Prover(
+                            "the finish: DECODE's trace is neither the builder's nor the kept run's"
+                                .to_string(),
+                        )
+                    })?
+                    .into_table();
+                (ops, decode_trace, emitted, counted)
             }
             Some(mut kept) => {
                 // The last window's ops, its in-walk lookups and its MEMW
@@ -769,7 +880,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             memory_state,
             register_init,
             decode_trace,
-            artifacts,
+            decode,
             register_state,
             max_rows,
             private_input,
@@ -787,7 +898,7 @@ impl<'a> WindowedTraceBuilder<'a> {
     pub fn split(&mut self) -> (Walker<'_>, Accumulator<'_>) {
         (
             Walker {
-                decode: &self.artifacts.decode,
+                decode: &self.decode,
                 lookups: !self.lean.lookups,
                 batch: self.walk_batch,
                 sizes: &mut self.walk_sizes,
@@ -801,7 +912,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 lean: self.lean,
                 stream_memw_lt: self.stream_memw_lt,
                 max_rows: &self.max_rows,
-                decode: &self.artifacts.decode,
+                decode: &self.decode,
                 kept: self.kept.as_mut(),
                 windows: &mut self.windows,
                 segments: &mut self.segments,
@@ -1447,7 +1558,7 @@ struct Kept {
     /// only hold what is left to count).
     rest: KeptRest,
     /// DECODE with the lookups of the CPU ops handed out counted.
-    decode: Table,
+    decode: DecodeTrace,
 }
 
 /// The walk lists a run keeps whole to its end, each appended window by
@@ -1539,7 +1650,7 @@ impl KeptRest {
 }
 
 impl Kept {
-    fn new(decode: Table, max_rows: &crate::tables::MaxRowsConfig) -> Self {
+    fn new(decode: DecodeTrace, max_rows: &crate::tables::MaxRowsConfig) -> Self {
         Self {
             cpu: Tail::new(),
             register_rows: Tail::new(),
@@ -1569,7 +1680,7 @@ impl Kept {
                 .iter()
                 .map(|&(_, bytes, _)| bytes)
                 .sum::<usize>()
-            + self.decode.num_rows() * self.decode.num_main_columns * std::mem::size_of::<u64>()
+            + self.decode.heap_bytes()
     }
 
     /// [`Self::heap_bytes`] list by list, each named `kept {list}`.
@@ -1582,10 +1693,7 @@ impl Kept {
             ("kept load".to_string(), self.load.heap_bytes()),
             ("kept lt".to_string(), self.lt.heap_bytes()),
             ("kept shift".to_string(), self.shift.heap_bytes()),
-            (
-                "kept decode".to_string(),
-                self.decode.num_rows() * self.decode.num_main_columns * std::mem::size_of::<u64>(),
-            ),
+            ("kept decode".to_string(), self.decode.heap_bytes()),
         ];
         parts.extend(
             self.rest
@@ -1609,10 +1717,7 @@ impl Kept {
             ("kept load".to_string(), self.load.largest_bytes()),
             ("kept lt".to_string(), self.lt.largest_bytes()),
             ("kept shift".to_string(), self.shift.largest_bytes()),
-            (
-                "kept decode".to_string(),
-                self.decode.num_rows() * self.decode.num_main_columns * std::mem::size_of::<u64>(),
-            ),
+            ("kept decode".to_string(), self.decode.heap_bytes()),
         ];
         parts.extend(
             self.rest
@@ -1684,7 +1789,7 @@ impl Kept {
         walk.load_ops = load.into_vec();
         walk.lt_ops = lt.into_vec();
         walk.shift_ops = shift.into_vec();
-        (cpu.into_vec(), walk, rest, decode)
+        (cpu.into_vec(), walk, rest, decode.into_table())
     }
 }
 
@@ -1733,7 +1838,7 @@ fn tail_jobs(
         let taken = t.elapsed().as_secs_f64();
         let t = Instant::now();
         decode::count_rows(
-            &mut kept.decode,
+            kept.decode.table(),
             ops.iter().map(|op| op.decode_row as usize),
         );
         if let Some(op) = ops
@@ -2251,7 +2356,8 @@ impl RegenBuilder {
         private_input: &[u8],
         max_rows: &crate::tables::MaxRowsConfig,
     ) -> Result<Self, Error> {
-        let mut memory_state = MemoryState::from_image(&build_initial_image(elf, private_input));
+        let mut memory_state =
+            MemoryState::from_pages(&build_initial_image_paged(elf, private_input));
         memory_state.lean = WalkLean::from_env()?.memory;
         let register_init = register::register_init_from_entry_point(elf.entry_point);
         let instructions = decode::instructions_from_elf(elf)
@@ -2452,6 +2558,9 @@ impl Traces {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod head_tests;
 
 #[cfg(test)]
 mod regen_tests;

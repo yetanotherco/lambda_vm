@@ -96,9 +96,11 @@ use compact_branch::CompactBranch;
 use compact_bytewise::CompactBytewise;
 use compact_eq::CompactEq;
 pub(crate) use finish::{Emitted, RegenFamily, RegenJob, RestHeader, RestRegen};
+#[cfg(test)]
+pub(crate) use windowed::DECODE_TRACE_DELAY;
 pub use windowed::{
-    Accumulator, ChunkJob, RegenBuilder, StreamTable, StreamedChunk, WalkedWindow, Walker,
-    WindowStamps, WindowedTraceBuilder,
+    Accumulator, ChunkJob, RegenBuilder, SetupStamps, StreamTable, StreamedChunk, WalkedWindow,
+    Walker, WindowStamps, WindowedTraceBuilder,
 };
 
 // =============================================================================
@@ -154,6 +156,16 @@ impl MemoryState {
         }
         Self {
             cells,
+            lean: false,
+            hot: NO_PAGE,
+        }
+    }
+
+    /// [`Self::from_image`] of an image held as pages, seeded page by page: the
+    /// same pages, cells and set cells as seeding it byte by byte.
+    fn from_pages(image: &PagedMem<u8>) -> Self {
+        Self {
+            cells: image.map((0, 0), |value| (value, 0)),
             lean: false,
             hot: NO_PAGE,
         }
