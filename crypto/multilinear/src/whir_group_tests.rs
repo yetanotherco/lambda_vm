@@ -1260,3 +1260,52 @@ fn a_one_round_grouped_chain_compares_its_folds_with_the_final_value() {
         in_chain_0(Error::FoldInconsistent { query: 0 })
     );
 }
+
+// ──────────────── the base code's rate (LAMBDA_VM_ZF_WHIR_BLOWUP) ───────────────
+
+/// The rate is a verifier constant under `Indexed` too. Runs of two, three and
+/// four at blowup 2 round-trip; a verifier at blowup 4 refuses them over the
+/// same roots, and a verifier at blowup 2 refuses a stack opened at blowup 4
+/// (every domain and tree depth differs by one); and at blowup 2 the two modes
+/// refuse each other's proofs, as at blowup 4 (B1-5).
+#[test]
+fn an_indexed_stack_at_one_blowup_is_refused_at_the_other() {
+    let at = |log_blowup: usize, group: GroupFold| ChainConfig {
+        log_blowup,
+        ..config(Some(6), 4, 3, group)
+    };
+    for polys in 2..=MAX_INDEX_POLYS {
+        let heights = vec![N3; polys];
+        for (own, other) in [(1usize, 2usize), (2, 1)] {
+            let cfg = at(own, GroupFold::Indexed);
+            let o = open_tower(&heights, N3, &cfg);
+            assert_eq!(o.domain.log_size(), N3 + own, "{polys} polynomials");
+            check_tower(&o, &o.proof, &cfg).unwrap_or_else(|e| {
+                panic!("{polys} polynomials at blowup 2^{own}: the control: {e:?}")
+            });
+            let wrong = at(other, GroupFold::Indexed);
+            let domain = Domain::<F>::new(N3 + other).unwrap();
+            assert!(
+                verify::<F, Ext, _, KeccakWhir>(
+                    &o.proof,
+                    &o.layout,
+                    &o.roots,
+                    &Claimed::PerColumn(&o.points),
+                    &o.values,
+                    &domain,
+                    &wrong,
+                    &mut tower(),
+                )
+                .is_err(),
+                "{polys} polynomials at blowup 2^{own}: a verifier at 2^{other} must refuse it"
+            );
+        }
+        let grouped = at(1, GroupFold::Indexed);
+        let per_poly = at(1, GroupFold::PerPoly);
+        let g = open_tower(&heights, N3, &grouped);
+        let p = open_tower(&heights, N3, &per_poly);
+        assert_eq!(g.roots, p.roots, "{polys}: the commitments are the same");
+        assert!(check_tower(&g, &g.proof, &per_poly).is_err(), "{polys}");
+        assert!(check_tower(&p, &p.proof, &grouped).is_err(), "{polys}");
+    }
+}

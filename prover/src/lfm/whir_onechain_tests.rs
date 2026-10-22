@@ -466,11 +466,17 @@ fn emit_program(f: &Fixture) -> LfmProgram {
 
 /// The arena from a proof, in [`program`]'s order.
 fn arena(f: &Fixture, proof: &StackedProof<F, E>) -> Vec<LfmWord> {
+    arena_under(f, &f.roots, proof)
+}
+
+/// [`arena`] laid out by `f`'s shape over `roots` and `proof`, which may be
+/// another fixture's: a proof written into the arena of another config.
+fn arena_under(f: &Fixture, roots: &[Commitment], proof: &StackedProof<F, E>) -> Vec<LfmWord> {
     let mut words: Vec<LfmWord> = f.points.iter().flatten().map(ext_word).collect();
     words.extend(f.values.iter().map(ext_word));
     let runs = f.shape.chains(f.layout.num_polys());
     for (chain, run) in proof.polys.iter().zip(&runs) {
-        words.extend(f.roots[run.clone()].iter().map(commitment_to_digest));
+        words.extend(roots[run.clone()].iter().map(commitment_to_digest));
         words.push(ext_word(&chain.final_value));
         push_round_words(&mut words, &f.shape.run(run.len()), chain);
     }
@@ -620,6 +626,79 @@ fn grouped_openings_execute_on_proofs_the_host_accepts() {
             f.name,
             f.shape.chains(f.layout.num_polys()),
             program.instrs.len()
+        );
+    }
+}
+
+/// `case` at blowup `2^log_blowup`, everything else the same.
+fn at_blowup(case: &Case, log_blowup: usize) -> Case {
+    Case {
+        name: case.name,
+        base: case.base,
+        heights: case.heights.clone(),
+        n_stack: case.n_stack,
+        first: case.first,
+        log_folding: case.log_folding,
+        log_blowup,
+        num_queries: case.num_queries,
+        grind: case.grind,
+        cap: case.cap,
+    }
+}
+
+/// ★ The base code's rate (`LAMBDA_VM_ZF_WHIR_BLOWUP`) under `Indexed`: every
+/// case at blowup 2 — runs of two, three and four, a split group, mixed
+/// heights, both bases, capped and not — executes on the machine built for it
+/// over a proof the host accepts. The host and the machine built for blowup 4
+/// refuse the same proof over the same roots: every tree is a level shallower,
+/// so the other rate's domain and arena (verifier constants) do not fit it.
+#[test]
+fn grouped_openings_at_blowup_2_execute_and_are_refused_at_blowup_4() {
+    for case in cases().into_iter().filter(|c| c.log_blowup == 2) {
+        let half = fixture(&at_blowup(&case, 1));
+        assert_eq!(
+            half.domain.log_size(),
+            half.layout.n_stack() + 1,
+            "{}: the stack's domain at blowup 2",
+            half.name
+        );
+        machine_runs(&half, &program(&half), arena(&half, &half.proof)).unwrap_or_else(|e| {
+            panic!(
+                "{}: the machine at blowup 2 refused an accepted proof: {e}",
+                half.name
+            )
+        });
+
+        let four = build(&case, GroupFold::Indexed);
+        macro_rules! refused_by_four {
+            ($h:ty, $t:expr) => {
+                multilinear::stacked_eval::verify::<F, E, _, $h>(
+                    &half.proof,
+                    &half.layout,
+                    &half.roots,
+                    &Claimed::PerColumn(&half.points),
+                    &half.values,
+                    &four.domain,
+                    &four.cfg,
+                    &mut $t,
+                )
+                .is_err()
+            };
+        }
+        let host = match half.base {
+            Base::Rpx => refused_by_four!(RpxWhir, RpxHost::new(&[])),
+            Base::P1 => refused_by_four!(P1Whir, P1Transcript::new()),
+        };
+        assert!(host, "{}: the host at blowup 4 must refuse it", half.name);
+        assert!(
+            machine_runs(
+                &four,
+                &program(&four),
+                arena_under(&four, &half.roots, &half.proof)
+            )
+            .is_err(),
+            "{}: the machine at blowup 4 must refuse it",
+            half.name
         );
     }
 }
