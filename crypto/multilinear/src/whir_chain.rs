@@ -1859,6 +1859,22 @@ where
                     }
                     (encoded, folded_domain)
                 }
+                // ★ The same rule as a polynomial's own round 0: under the
+                // coset order a run whose round-0 codewords are on the card is
+                // never folded — its successor is encoded from the combined
+                // bound message, or the prove is refused by cause (the knob
+                // off; the run's factors built on the host; the card declining
+                // the encode). A run whose codewords the host holds folds.
+                None if config.format.leaves == LeafOrder::Coset
+                    && held.iter().any(|c| c.codeword().on_device()) =>
+                {
+                    return Err(Error::CosetSuccessorNotEncoded {
+                        cause: UnencodedSuccessor::of(
+                            crate::gpu::encode_successor_in_effect(),
+                            factors.on_card(),
+                        ),
+                    });
+                }
                 None => fold_grouped::<F, E, H>(held, &current_domain, alphas, rho)?,
             },
             Current::Extension(held) => {
