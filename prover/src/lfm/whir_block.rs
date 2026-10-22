@@ -1190,19 +1190,24 @@ pub fn verify_block_tree_grouped(
 }
 
 /// [`verify_block_tree`] at production's format with the caller's NAMED
-/// choices: its group opening and its WHIR blowup (`verify-block --group /
-/// --blowup`), every other preset pinned as before. Both are the verifier's
-/// constants; the proof carries neither. A caller cannot hand in a format of
-/// its own: `verify_block_tree_as` is crate-internal.
+/// choices: its group opening, its WHIR blowup and its round-0 leaf order
+/// (`verify-block --group / --blowup / --leaves`), every other preset pinned
+/// as before. All three are the verifier's constants; the proof carries none
+/// of them. A caller cannot hand in a format of its own:
+/// `verify_block_tree_as` is crate-internal. The coset order is refused by
+/// name under a base whose trees do not take it.
 pub fn verify_block_tree_at(
     elf_bytes: &[u8],
     statement: BlockStatement<'_>,
     top: &super::proof::LfmProof,
     group: GroupFold,
     blowup: crate::zf_format::WhirBlowup,
+    leaves: multilinear::whir_chain::LeafOrder,
 ) -> Result<(), String> {
     let mut format = BlockFormat::production_with(group);
     format.zf.whir_blowup = blowup.factor();
+    format.zf.whir_leaves = leaves;
+    format.zf.check_leaves()?;
     verify_block_tree_as(elf_bytes, statement, top, &format)
 }
 

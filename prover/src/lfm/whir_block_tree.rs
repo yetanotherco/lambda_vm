@@ -20,7 +20,7 @@
 //! leaves unset, and the driver's first line says how the running process
 //! compares with it.
 
-use multilinear::whir_chain::{ArgueFormat, GroupFold};
+use multilinear::whir_chain::{ArgueFormat, GroupFold, LeafOrder};
 
 use crate::block_whir::{self, BlockFormat, BlockOptions, BlockWhirProof};
 use crate::zf_format::WhirBlowup;
@@ -264,6 +264,19 @@ pub fn blowup_setting(value: Option<&str>) -> Result<WhirBlowup, String> {
         None | Some("4") => Ok(WhirBlowup::Four),
         Some("2") => Ok(WhirBlowup::Two),
         Some(word) => Err(format!("--blowup {word}: 4 or 2")),
+    }
+}
+
+/// The CLI's `--leaves` reading: unset or `natural` is the production round-0
+/// leaf order ([`LeafOrder::Natural`]), `coset` the coset order
+/// ([`LeafOrder::Coset`], Poseidon1 trees only); anything else an error. A
+/// format choice: the block's verifier must be given the same one, and the
+/// proof file does not carry it.
+pub fn leaves_setting(value: Option<&str>) -> Result<LeafOrder, String> {
+    match value.map(str::trim) {
+        None | Some("natural") => Ok(LeafOrder::Natural),
+        Some("coset") => Ok(LeafOrder::Coset),
+        Some(word) => Err(format!("--leaves {word}: natural or coset")),
     }
 }
 
@@ -2447,19 +2460,25 @@ pub fn verify_whir_block_tree_proof_grouped(
 }
 
 /// [`verify_whir_block_tree_proof`] at production's format with the caller's
-/// named choices, its group opening and its WHIR blowup
-/// ([`super::whir_block::verify_block_tree_at`]); the file carries neither. No
-/// public entry point takes a format of the caller's own.
+/// named choices, its group opening, its WHIR blowup and its round-0 leaf
+/// order ([`super::whir_block::verify_block_tree_at`]); the file carries none
+/// of them. No public entry point takes a format of the caller's own.
 ///
 /// ```no_run
 /// use lambda_vm_prover::lfm::whir_block_tree::{
 ///     WhirBlockTreeProof, verify_whir_block_tree_proof_at,
 /// };
 /// use lambda_vm_prover::zf_format::WhirBlowup;
-/// use multilinear::whir_chain::GroupFold;
+/// use multilinear::whir_chain::{GroupFold, LeafOrder};
 ///
 /// fn check(elf: &[u8], proof: &WhirBlockTreeProof) -> Result<(), String> {
-///     verify_whir_block_tree_proof_at(elf, proof, GroupFold::Indexed, WhirBlowup::Two)
+///     verify_whir_block_tree_proof_at(
+///         elf,
+///         proof,
+///         GroupFold::Indexed,
+///         WhirBlowup::Two,
+///         LeafOrder::Coset,
+///     )
 /// }
 /// ```
 ///
@@ -2474,12 +2493,20 @@ pub fn verify_whir_block_tree_proof_at(
     proof: &WhirBlockTreeProof,
     group: GroupFold,
     blowup: WhirBlowup,
+    leaves: LeafOrder,
 ) -> Result<(), String> {
     let top = LfmProof {
         proof: proof.top_proof.clone(),
         public_words: proof.top_public_words.clone(),
     };
-    super::whir_block::verify_block_tree_at(elf_bytes, proof.statement(), &top, group, blowup)
+    super::whir_block::verify_block_tree_at(
+        elf_bytes,
+        proof.statement(),
+        &top,
+        group,
+        blowup,
+        leaves,
+    )
 }
 
 #[cfg(test)]
@@ -2492,7 +2519,9 @@ mod tests {
     /// read off the source and its parameters must not name `BlockFormat`, and
     /// the one any-format verifier, `whir_block::verify_block_tree_as`, is
     /// declared crate-internal. From outside the crate the same is checked by
-    /// [`verify_whir_block_tree_proof_at`]'s `compile_fail` doc test.
+    /// [`verify_whir_block_tree_proof_at`]'s `compile_fail` doc test. The
+    /// verifiers of named choices (`…_at`) take each choice typed: the group
+    /// opening, the WHIR blowup and the round-0 leaf order.
     #[test]
     fn no_public_tree_verifier_takes_a_block_format() {
         let block = include_str!("whir_block.rs");
@@ -2509,11 +2538,23 @@ mod tests {
                     !params.contains("BlockFormat"),
                     "{file}: the public verifier {name} takes a BlockFormat"
                 );
+                if name.ends_with("_at") {
+                    for choice in ["GroupFold", "WhirBlowup", "LeafOrder"] {
+                        assert!(
+                            params.contains(choice),
+                            "{file}: {name} takes its {choice} as a named choice"
+                        );
+                    }
+                }
                 public.push(name.to_string());
             }
             assert!(
                 public.len() >= 2,
                 "{file}: the scan found its public verifiers: {public:?}"
+            );
+            assert!(
+                public.iter().any(|name| name.ends_with("_at")),
+                "{file}: a verifier of named choices: {public:?}"
             );
         }
         assert!(block.contains("\npub(crate) fn verify_block_tree_as("));

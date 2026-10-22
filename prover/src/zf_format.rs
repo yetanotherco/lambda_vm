@@ -56,8 +56,11 @@
 
 use std::sync::OnceLock;
 
+/// The round-0 leaf order ([`ZfFormat::whir_leaves`]), named here for the
+/// callers that choose it (the block commands' `--leaves`).
+pub use multilinear::whir_chain::LeafOrder;
 use multilinear::whir_chain::{
-    ChainConfig, ChainFormat, FirstFold, GrindBits, LeafOrder, NonceLayout, StackVars, WhirFolds,
+    ChainConfig, ChainFormat, FirstFold, GrindBits, NonceLayout, StackVars, WhirFolds,
 };
 use stark::proof::options::{
     BaseFormat, CapPolicy, FriMode, OneRowMode, ProofFormat, ProofOptions,

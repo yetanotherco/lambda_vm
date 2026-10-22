@@ -383,6 +383,13 @@ enum Commands {
         /// given the same one; the proof file does not carry it.
         #[arg(long, value_parser = ["4", "2"], default_value = "4")]
         blowup: String,
+
+        /// Where the WHIR round-0 trees put their leaves: in the codeword's
+        /// order (`natural`, production) or each query's coset together
+        /// (`coset`). A format choice: `verify-block` must be given the same
+        /// one; the proof file does not carry it.
+        #[arg(long, value_parser = ["natural", "coset"], default_value = "natural")]
+        leaves: String,
     },
 
     /// Verify a block proof produced by `prove-block`
@@ -408,6 +415,11 @@ enum Commands {
         /// --blowup`): the verifier's constant, never read from the proof.
         #[arg(long, value_parser = ["4", "2"], default_value = "4")]
         blowup: String,
+
+        /// The round-0 leaf order the block was proved with (`prove-block
+        /// --leaves`): the verifier's constant, never read from the proof.
+        #[arg(long, value_parser = ["natural", "coset"], default_value = "natural")]
+        leaves: String,
     },
 
     /// Count main-trace and aux-trace field elements without proving
@@ -509,14 +521,36 @@ fn main() -> ExitCode {
             digest,
             group,
             blowup,
-        } => cmd_prove_block(elf, input, output, time, digest, &group, &blowup),
+            leaves,
+        } => cmd_prove_block(
+            elf,
+            input,
+            output,
+            time,
+            digest,
+            BlockChoices {
+                group: &group,
+                blowup: &blowup,
+                leaves: &leaves,
+            },
+        ),
         Commands::VerifyBlock {
             proof,
             elf,
             time,
             group,
             blowup,
-        } => cmd_verify_block(proof, elf, time, &group, &blowup),
+            leaves,
+        } => cmd_verify_block(
+            proof,
+            elf,
+            time,
+            BlockChoices {
+                group: &group,
+                blowup: &blowup,
+                leaves: &leaves,
+            },
+        ),
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
     }
 }
@@ -606,18 +640,31 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The block commands' format choices, the words of `--group`, `--blowup` and
+/// `--leaves`: `verify-block` must be given the ones `prove-block` was, and
+/// the proof file carries none of them.
+struct BlockChoices<'a> {
+    group: &'a str,
+    blowup: &'a str,
+    leaves: &'a str,
+}
+
 fn cmd_prove_block(
     elf_path: PathBuf,
     input_path: Option<PathBuf>,
     output_path: PathBuf,
     time: bool,
     digest: bool,
-    group: &str,
-    blowup: &str,
+    choices: BlockChoices<'_>,
 ) -> ExitCode {
     use prover::lfm::whir_block_tree::{
         StderrSink, WhirBlockTreeProof, WhirTreeConfig, group_setting, prove_whir_block_tree,
     };
+    let BlockChoices {
+        group,
+        blowup,
+        leaves,
+    } = choices;
 
     // The group opening is the caller's constant, given on the command line
     // and to `verify-block` alike; the harness's environment word for it is
@@ -626,16 +673,18 @@ fn cmd_prove_block(
         eprintln!("LAMBDA_VM_WHIR_GROUP is the harness's knob: give the CLI --group instead");
         return ExitCode::FAILURE;
     }
-    // So is the WHIR blowup, installed as the process format before anything
-    // reads it: the banner then states the format this block is proved under.
-    let blowup = match install_block_format(blowup) {
-        Ok(blowup) => blowup,
+    // So are the WHIR blowup and the round-0 leaf order, installed as the
+    // process format before anything reads it: the banner then states the
+    // format this block is proved under.
+    let (blowup, order) = match install_block_format(blowup, leaves) {
+        Ok(choices) => choices,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
     eprintln!("BLOCK WHIR BLOWUP: {blowup}");
+    eprintln!("BLOCK WHIR LEAVES: {leaves}");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
         Err(e) => {
@@ -666,8 +715,8 @@ fn cmd_prove_block(
     };
     eprintln!("BLOCK GROUP OPENING: {group}");
     assert_eq!(
-        cfg.format.zf.whir_blowup,
-        blowup.factor(),
+        (cfg.format.zf.whir_blowup, cfg.format.zf.whir_leaves),
+        (blowup.factor(), order),
         "the tree's format is the installed one"
     );
     // A forced leaf count, another fan-in or another argue is another tree than
@@ -730,12 +779,16 @@ fn cmd_verify_block(
     proof_path: PathBuf,
     elf_path: PathBuf,
     time: bool,
-    group: &str,
-    blowup: &str,
+    choices: BlockChoices<'_>,
 ) -> ExitCode {
     use prover::lfm::whir_block_tree::{
         WhirBlockTreeProof, base_line, group_setting, verify_whir_block_tree_proof_at,
     };
+    let BlockChoices {
+        group,
+        blowup,
+        leaves,
+    } = choices;
 
     let fold = match group_setting(Some(group)) {
         Ok(fold) => fold,
@@ -744,20 +797,20 @@ fn cmd_verify_block(
             return ExitCode::FAILURE;
         }
     };
-    // The verifier is told the rate as it is told the group opening, and the
-    // rate is installed as the process format before anything reads it.
-    let blowup = match install_block_format(blowup) {
-        Ok(blowup) => blowup,
+    // The verifier is told the rate and the leaf order as it is told the group
+    // opening, and both are installed as the process format before anything
+    // reads it.
+    let (blowup, order) = match install_block_format(blowup, leaves) {
+        Ok(choices) => choices,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
+    let zf = prover::block_whir::BlockFormat::production_with(fold).zf;
     assert_eq!(
-        prover::block_whir::BlockFormat::production_with(fold)
-            .zf
-            .whir_blowup,
-        blowup.factor(),
+        (zf.whir_blowup, zf.whir_leaves),
+        (blowup.factor(), order),
         "the verifier's process format is the installed one"
     );
 
@@ -789,9 +842,10 @@ fn cmd_verify_block(
     // So is the group opening: the caller's, never the file's.
     eprintln!("BLOCK GROUP OPENING: {group}");
     eprintln!("BLOCK WHIR BLOWUP: {blowup}");
+    eprintln!("BLOCK WHIR LEAVES: {leaves}");
     eprintln!("Verifying block proof...");
     let start = Instant::now();
-    let result = verify_whir_block_tree_proof_at(&elf_data, &proof, fold, blowup);
+    let result = verify_whir_block_tree_proof_at(&elf_data, &proof, fold, blowup, order);
     let verify_elapsed = start.elapsed();
     match result {
         Ok(()) => {
@@ -810,24 +864,33 @@ fn cmd_verify_block(
 }
 
 /// The block commands' process format: the environment's ZF knobs with the
-/// WHIR blowup of `--blowup` (`word`), installed before anything reads the
-/// process format, so its banner — printed once, on stdout — and every reader
-/// of it state the blowup the block is proved or verified under. The format's
-/// own environment knob for the blowup is refused: the flag is the caller's.
-fn install_block_format(word: &str) -> Result<prover::zf_format::WhirBlowup, String> {
-    use prover::zf_format::{ENV_WHIR_BLOWUP, ZfFormat};
-    if std::env::var_os(ENV_WHIR_BLOWUP).is_some() {
-        return Err(format!(
-            "{ENV_WHIR_BLOWUP} is the harness's knob: give the CLI --blowup instead"
-        ));
+/// WHIR blowup of `--blowup` (`blowup`) and the round-0 leaf order of
+/// `--leaves` (`leaves`), installed before anything reads the process format,
+/// so its banner — printed once, on stdout — and every reader of it state the
+/// blowup and the order the block is proved or verified under. The format's
+/// own environment knobs for both are refused: the flags are the caller's.
+fn install_block_format(
+    blowup: &str,
+    leaves: &str,
+) -> Result<(prover::zf_format::WhirBlowup, prover::zf_format::LeafOrder), String> {
+    use prover::zf_format::{ENV_WHIR_BLOWUP, ENV_WHIR_LEAVES, ZfFormat};
+    for (knob, flag) in [(ENV_WHIR_BLOWUP, "--blowup"), (ENV_WHIR_LEAVES, "--leaves")] {
+        if std::env::var_os(knob).is_some() {
+            return Err(format!(
+                "{knob} is the harness's knob: give the CLI {flag} instead"
+            ));
+        }
     }
-    let blowup = prover::lfm::whir_block_tree::blowup_setting(Some(word))?;
+    let blowup = prover::lfm::whir_block_tree::blowup_setting(Some(blowup))?;
+    let leaves = prover::lfm::whir_block_tree::leaves_setting(Some(leaves))?;
     let format = ZfFormat {
         whir_blowup: blowup.factor(),
+        whir_leaves: leaves,
         ..ZfFormat::from_env()?
     };
+    format.check_leaves()?;
     ZfFormat::install(format)?;
-    Ok(blowup)
+    Ok((blowup, leaves))
 }
 
 fn read_private_input(path: Option<&PathBuf>) -> Result<Vec<u8>, String> {
@@ -1886,6 +1949,44 @@ mod tests {
             prover::lfm::whir_block_tree::blowup_setting(None).map(|b| b.factor()),
             Ok(prover::block_whir::BlockFormat::production().zf.whir_blowup),
             "unset is the production blowup"
+        );
+    }
+
+    /// Both block commands take the round-0 leaf order, natural unless told
+    /// otherwise, and nothing but its two words; each word reads to the order
+    /// it names.
+    #[test]
+    fn the_block_commands_take_the_leaf_order() {
+        use prover::zf_format::LeafOrder;
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            let leaves = |args: &[&str]| match parse(args).map(|cli| cli.command) {
+                Ok(Commands::ProveBlock { leaves, .. } | Commands::VerifyBlock { leaves, .. }) => {
+                    Some(leaves)
+                }
+                _ => None,
+            };
+            assert_eq!(leaves(cmd).as_deref(), Some("natural"), "the default");
+            for (word, want) in [("natural", LeafOrder::Natural), ("coset", LeafOrder::Coset)] {
+                let args = [cmd, &["--leaves", word]].concat();
+                assert_eq!(leaves(&args).as_deref(), Some(word));
+                assert_eq!(
+                    prover::lfm::whir_block_tree::leaves_setting(Some(word)),
+                    Ok(want),
+                    "{word} reads"
+                );
+            }
+            for word in ["Coset", "bit-reversed", "1"] {
+                let args = [cmd, &["--leaves", word]].concat();
+                assert!(parse(&args).is_err(), "--leaves {word} is refused");
+            }
+        }
+        assert_eq!(
+            prover::lfm::whir_block_tree::leaves_setting(None),
+            Ok(prover::zf_format::ZfFormat::DEFAULT.whir_leaves),
+            "unset is the production order"
         );
     }
 

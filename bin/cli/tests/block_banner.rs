@@ -1,7 +1,10 @@
 //! The block commands' `ZF FORMAT` banner states the format they run under:
 //! `--blowup 2` prints `whir_blowup=2` on the one banner line (and Q 229 on the
 //! schedule line), the default and `--blowup 4` name no blowup (Q 114), and the
-//! format's environment knob for the blowup is refused before any banner. The
+//! format's environment knob for the blowup is refused before any banner. So
+//! for the round-0 leaf order: `--leaves coset` prints `whir_leaves=coset`
+//! (after the blowup when both are set), the default and `--leaves natural`
+//! name no order, and its environment knob is refused before any banner. The
 //! banner is printed before the files are read, so a missing file is enough.
 
 use std::process::Command;
@@ -71,6 +74,52 @@ fn the_block_commands_banner_states_the_blowup_they_run_under() {
         );
         assert!(
             stderr.contains("give the CLI --blowup instead"),
+            "{name}: the refusal names the flag\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn the_block_commands_banner_states_the_leaf_order_they_run_under() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let missing = dir.path().join("missing");
+    let missing = missing.to_str().expect("a UTF-8 path");
+    let proof = dir.path().join("block.proof");
+    let proof = proof.to_str().expect("a UTF-8 path");
+    let commands: [(&str, Vec<&str>); 2] = [
+        ("prove-block", vec!["prove-block", missing, "-o", proof]),
+        ("verify-block", vec!["verify-block", missing, missing]),
+    ];
+    for (name, base) in &commands {
+        for (flags, tail) in [
+            (&[][..], None),
+            (&["--leaves", "natural"][..], None),
+            (&["--leaves", "coset"][..], Some(" whir_leaves=coset")),
+            (
+                &["--leaves", "coset", "--blowup", "2"][..],
+                Some(" whir_blowup=2 whir_leaves=coset"),
+            ),
+        ] {
+            let mut args = base.clone();
+            args.extend(flags);
+            let (ok, stdout, stderr) = run(&args, &[]);
+            let tag = format!("{name} {flags:?}");
+            assert!(!ok, "{tag}: a missing file fails the command");
+            let banners = lines(&stdout, "ZF FORMAT:");
+            assert_eq!(banners.len(), 1, "{tag}: one banner\n{stdout}\n{stderr}");
+            match tail {
+                Some(tail) => assert!(banners[0].ends_with(tail), "{tag}: {}", banners[0]),
+                None => assert!(!banners[0].contains("whir_leaves"), "{tag}: {}", banners[0]),
+            }
+        }
+        let (ok, stdout, stderr) = run(base, &[("LAMBDA_VM_ZF_WHIR_LEAVES", "coset")]);
+        assert!(!ok, "{name}: the environment knob is refused");
+        assert!(
+            lines(&stdout, "ZF FORMAT:").is_empty(),
+            "{name}: no banner before the refusal\n{stdout}"
+        );
+        assert!(
+            stderr.contains("give the CLI --leaves instead"),
             "{name}: the refusal names the flag\n{stderr}"
         );
     }
