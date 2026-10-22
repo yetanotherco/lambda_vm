@@ -547,13 +547,15 @@ pub(crate) fn global_memory_configs_from_init_page_data(
 // holding a few constants, and ruinous for a page that is genuinely full.
 //
 // Measured on block 25368371 (ELF sha256
-// `8f826601776d4085cbb6fbf0302fe8d8d5d1be7940ac1aaca24899c6244ec80a`, 3,948,504
+// `3e8f1ce152d4d3cd60809ee7fc537e5c4f12145efec1881052c28119ff6a5482`, 2,711,800
 // B; input `573004e62e3680a00d3cdbae19dc4897e2ec60d6ec0c1d05d9ef118cb8aef17f`,
-// 1,110,183 B; `LAMBDA_VM_MAX_ROWS_LOG2=21`), the run touches 35 pages — 30
-// genesis and 5 private — and the genesis bytes are CONCENTRATED: `0x0` carries
-// 116,692 nonzero of 262,144, `0x40000` 229,290, `0x280000` 223,380, and the
-// other 27 are all-zero. Total 10,249,056 rows for INIT alone, against a 2-4 M
-// band for the WHOLE cross-epoch program. Three pages of thirty carry all of it.
+// 1,110,183 B; epoch 2^21), the run touches 33 pages — 28 genesis and 5 private
+// — and the genesis bytes are CONCENTRATED: `0x0` carries 127,574 nonzero of
+// 262,144, `0x200000` 61,514, and the other 26 are all-zero. Total 3,404,088
+// rows for INIT alone, against a 2-4 M band for the WHOLE cross-epoch program.
+// Two pages of twenty-eight carry all of it. (The guest as built before fat LTO
+// and the runtime memcpy, ELF `8f826601…`, touched 35 pages and charged
+// 10,249,056 rows to three dense pages, `0x0`, `0x40000` and `0x280000`.)
 //
 // ⛔ THE PRIVATE-INPUT PAGES ARE EXCLUDED FIRST, AND NOT AS AN OPTIMISATION.
 // [`global_memory_configs_from_init_page_data`] is called with
@@ -574,7 +576,7 @@ pub(crate) fn global_memory_configs_from_init_page_data(
 //    [`marginal_stacked_rows`], evaluated at the fixed height
 //    [`fixed_stack_vars`]. On the block that is `18 + 18*S > 111`, so
 //    `S >= 6`: a page with six nonzero genesis bytes is already worth more
-//    carried than kept, and the 27 all-zero pages are not. ⚠ BOTH SIDES MOVE
+//    carried than kept, and the 26 all-zero pages are not. ⚠ BOTH SIDES MOVE
 //    WITH THE RUN'S BRACKET — the marginal is a form evaluated at the height
 //    this run's genesis page count puts the stack at, not a number quoted
 //    once, and `τ` is 5 below nine genesis pages and 6 from there.
@@ -614,9 +616,9 @@ pub(crate) const PAGE_NUM_VARS: usize = page::DEFAULT_PAGE_SIZE.trailing_zeros()
 /// `sum_k 2^k * r_k` and costs `num_vars - 1` rows to check outright. But
 /// `check_preprocessed` skips a PREFIX of a table's preprocessed columns, and
 /// `{1}` is not one, so settling INIT alone is inexpressible. Taking `{0, 1}`
-/// keeps that contract unchanged at a cost of about 230 rows on the block: 51
-/// lost ramps against 282 for three more stacked columns, on a hybrid costing
-/// order `10^5`.
+/// keeps that contract unchanged at a cost of about 150 rows on the block: 34
+/// lost ramps against 188 for two more stacked columns (51 against 282 on the
+/// old guest's three dense pages), on a hybrid costing order `10^5`.
 pub(crate) const PAGE_PREPROCESSED_COLUMNS: usize = 2;
 
 /// The rows the in-guest verifier spends discharging one page's INIT by the
@@ -624,7 +626,7 @@ pub(crate) const PAGE_PREPROCESSED_COLUMNS: usize = 2;
 /// `num_vars` complements hoisted plus `num_vars` rows per nonzero entry.
 ///
 /// An all-zero page costs `num_vars` — the interned zero — and not nothing,
-/// which is why the block's 27 zero pages are 486 rows and not 0.
+/// which is why the block's 26 zero pages are 468 rows and not 0.
 pub(crate) fn sparse_leg_rows(num_vars: usize, nonzero: usize) -> usize {
     num_vars + num_vars * nonzero
 }
@@ -669,13 +671,13 @@ pub(crate) const PREPARED_LEG_ROWS: usize = 175_066;
 /// ★ AND THIS IS THE BRACKET THE MARGINAL IS EVALUATED AT, per run.
 /// [`marginal_stacked_rows`] reads it, so a run standing taller is charged MORE
 /// rather than charged too little — which is the whole gain over the literal
-/// this replaces. The block's thirty pages give 24 ([`BLOCK_STACK_VARS`]); a
+/// this replaces. The block's twenty-eight pages give 24 ([`BLOCK_STACK_VARS`]); a
 /// lone page gives 19 and is charged 101 rather than the block's 111.
 pub(crate) const fn fixed_stack_vars(num_vars: usize, genesis_pages: usize) -> usize {
     num_vars + (2 * genesis_pages).next_power_of_two().trailing_zeros() as usize
 }
 
-/// The bracket the block's thirty genesis pages put the stack at, and the
+/// The bracket the block's twenty-eight genesis pages put the stack at, and the
 /// bracket every consequence quoted in these docs is quoted AT.
 ///
 /// ⛔⛔ A MARGINAL HAS NO MEANING WITHOUT ITS BRACKET, which is exactly what
@@ -774,8 +776,8 @@ pub(crate) const MAX_SPONGE_MARGINAL: usize = 3;
 /// ⚠ IT IS AN UPPER BOUND AT EVERY BRACKET, deliberately: part 1 asks a page to
 /// beat the dearest position it could occupy, and part 2 understates the set's
 /// savings, so both parts are conservative. The block is charged above its own
-/// stack twice over — its three dense pages are six columns standing at
-/// `n_stack` 21 with a prefix of 3, so its true weight marginal is 96 against
+/// stack twice over — its two dense pages are four columns standing at
+/// `n_stack` 20 with a prefix of 2, so its true weight marginal is 94 against
 /// the 102 charged here, before `s`.
 ///
 /// The pin
@@ -822,7 +824,7 @@ pub(crate) fn is_candidate(num_vars: usize, n_fixed: usize, nonzero: usize) -> b
 /// `[108, 125]` and at 7 on `[126, 143]` — so the form's 111 will make it 6.
 /// The only page that difference reclassifies is one carrying five nonzero
 /// genesis bytes,
-/// and neither the block (0, or 116,692 and up) nor any fixture (112, 65,652)
+/// and neither the block (0, or 61,514 and up) nor any fixture (112, 65,652)
 /// sits there; `the_ruled_boundaries_hold_for_every_marginal_in_band` is the
 /// reading of that rather than the assurance.
 ///
@@ -4966,19 +4968,20 @@ mod tests {
     /// The block's measured census, reproduced by the forms — an F1 on the
     /// census rather than a restatement of it.
     ///
-    /// Read on the box at 60d790310 (`cens2`, one execution of the guest, no
-    /// proving, no card): `GENESIS CENSUS: 35 pages = 30 genesis + 5 private;
-    /// 569362 nonzero entries, worst page 229290; 10249056 leg rows`.
-    const BLOCK_DENSE: [(u64, usize, usize); 3] = [
-        (0x0, 116_692, 2_100_474),
-        (0x40000, 229_290, 4_127_238),
-        (0x280000, 223_380, 4_020_858),
-    ];
-    const BLOCK_ZERO_PAGES: usize = 27;
+    /// Read on a box with the guest of 90e9dde5b (ELF sha256 `3e8f1ce1…`,
+    /// 2,711,800 B; one execution of the guest, no proving, no card), after a
+    /// control run on the previous guest (`8f826601…`) reproduced the census
+    /// these constants held before: `GENESIS CENSUS: 33 pages = 28 genesis + 5
+    /// private; 189088 nonzero entries, worst page 127574; 3404088 leg rows`.
+    const BLOCK_DENSE: [(u64, usize, usize); 2] =
+        [(0x0, 127_574, 2_296_350), (0x200000, 61_514, 1_107_270)];
+    const BLOCK_ZERO_PAGES: usize = 26;
     const BLOCK_PAGE_VARS: usize = 18;
-    const BLOCK_CENSUS_LEG_ROWS: usize = 10_249_056;
-    /// The census's genesis pages: 35 touched less the 5 private.
-    const BLOCK_GENESIS_PAGES: usize = 30;
+    const BLOCK_CENSUS_LEG_ROWS: usize = 3_404_088;
+    /// The census's genesis pages: 33 touched less the 5 private.
+    const BLOCK_GENESIS_PAGES: usize = 28;
+    /// The census's epochs at 2^21.
+    const BLOCK_EPOCHS: usize = 12;
     /// The bracket the block stands at and what the form charges there — both
     /// named here so a reader of these numbers sees what they rest on.
     const BLOCK_N_FIXED: usize = BLOCK_STACK_VARS;
@@ -5015,7 +5018,7 @@ mod tests {
             assert_eq!(got, rows, "page {base:#x}: {nonzero} nonzero entries");
             total += got;
         }
-        // The 27 all-zero pages are not free: each costs the interned zero.
+        // The 26 all-zero pages are not free: each costs the interned zero.
         total += BLOCK_ZERO_PAGES * sparse_leg_rows(BLOCK_PAGE_VARS, 0);
         assert_eq!(
             total, BLOCK_CENSUS_LEG_ROWS,
@@ -5028,7 +5031,7 @@ mod tests {
     ///
     /// ⚠ THESE TESTS BUILD A SET AND RUN THE PLANNER, rather than calling the
     /// forms. Part 2 is a property of the whole set, so a two-page answer and a
-    /// thirty-page answer are different questions, and only a real plan
+    /// twenty-eight-page answer are different questions, and only a real plan
     /// exercises the two passes that decide them.
     fn genesis_pages_with(counts: &[usize]) -> Vec<PageConfig> {
         let page = 1u64 << BLOCK_PAGE_VARS;
@@ -5045,8 +5048,8 @@ mod tests {
         configs
     }
 
-    /// The block's own thirty genesis pages: the three dense ones at their
-    /// census bases and counts, and twenty-seven all-zero.
+    /// The block's own twenty-eight genesis pages: the two dense ones at their
+    /// census bases and counts, and twenty-six all-zero.
     fn block_genesis_configs() -> Vec<PageConfig> {
         assert_eq!(
             BLOCK_DENSE.len() + BLOCK_ZERO_PAGES,
@@ -5084,7 +5087,7 @@ mod tests {
         assert_eq!(
             fixed_stack_vars(BLOCK_PAGE_VARS, BLOCK_GENESIS_PAGES),
             BLOCK_STACK_VARS,
-            "18 + ceil(log2(60))"
+            "18 + ceil(log2(56))"
         );
         assert_eq!(BLOCK_MARGINAL, 111);
         assert_eq!(LONE_N_FIXED, 19, "18 + ceil(log2(2))");
@@ -5223,14 +5226,14 @@ mod tests {
     }
 
     /// ★ CONSEQUENCE (a) — THE PRE-REGISTRATION, on a real plan over the
-    /// block's thirty pages: exactly those three bases, in that order.
+    /// block's twenty-eight pages: exactly those two bases, in that order.
     #[test]
-    fn the_threshold_selects_exactly_the_blocks_three_dense_pages() {
+    fn the_threshold_selects_exactly_the_blocks_dense_pages() {
         let configs = block_genesis_configs();
-        let plan = genesis_stack_plan(&configs, 15, BLOCK_PAGE_VARS);
+        let plan = genesis_stack_plan(&configs, BLOCK_EPOCHS, BLOCK_PAGE_VARS);
         assert_eq!(plan.n_fixed, BLOCK_N_FIXED);
 
-        // Part 1: the three, and only the three. The 27 zero pages cost 18 rows
+        // Part 1: the two, and only the two. The 26 zero pages cost 18 rows
         // sparse against a 103-row marginal, so carrying one would COST rows.
         assert_eq!(sparse_leg_rows(BLOCK_PAGE_VARS, 0), 18);
         assert!(!is_candidate(BLOCK_PAGE_VARS, plan.n_fixed, 0));
@@ -5245,18 +5248,18 @@ mod tests {
             .map(|&(_, _, rows)| rows - BLOCK_MARGINAL)
             .sum();
         assert_eq!(plan.savings, expected);
-        assert_eq!(plan.savings, 10_248_237);
+        assert_eq!(plan.savings, 3_403_398);
         assert!(chain_is_paid(plan.savings));
 
         // ⚠ THE SET AND ITS ORDER, not a count: the stack's column order IS
-        // page-base order, so three of the wrong three would pass a count.
+        // page-base order, so two of the wrong pages would pass a count.
         let carried: Vec<u64> = plan
             .routes
             .iter()
             .filter(|route| route.dense)
             .map(|route| route.page_base)
             .collect();
-        assert_eq!(carried, vec![0x0, 0x40000, 0x280000]);
+        assert_eq!(carried, vec![0x0, 0x200000]);
         assert_eq!(plan.sparse_rows, BLOCK_ZERO_PAGES * 18);
     }
 
@@ -5264,9 +5267,10 @@ mod tests {
     /// routing rule rather than a tuning knob.
     #[test]
     fn nothing_on_the_block_sits_near_the_threshold() {
-        let least_dense = BLOCK_DENSE.iter().map(|&(_, _, r)| r).min().expect("three");
-        // Part 1: the cheapest carried page clears the marginal 20,000-fold.
-        assert!(least_dense > 10_000 * BLOCK_MARGINAL);
+        let least_dense = BLOCK_DENSE.iter().map(|&(_, _, r)| r).min().expect("two");
+        // Part 1: the cheapest carried page clears the marginal nearly
+        // 10,000-fold (it was 19,000-fold on the previous guest's census).
+        assert!(least_dense > 9_000 * BLOCK_MARGINAL);
 
         // ⛔ AND THE ZERO PAGES' MARGIN IS A RATIO WITH A FLOOR, NOT A FIXED
         // FACTOR. This read `* 6 <`, which was true at 109, FALSE at 103 and
@@ -5285,7 +5289,7 @@ mod tests {
         assert!(
             margin >= 5,
             "an all-zero page costs {zero_page} rows against a marginal of \
-             {BLOCK_MARGINAL}, within a factor of {margin} of qualifying — the 27 zero \
+             {BLOCK_MARGINAL}, within a factor of {margin} of qualifying — the 26 zero \
              pages are supposed to fail part 1 by a wide margin"
         );
         assert!(
@@ -5294,11 +5298,11 @@ mod tests {
              within a factor of {} of qualifying",
             LONE_MARGINAL / zero_page
         );
-        // Part 2: the CHEAPEST carried page is worth twelve chains on its own,
-        // and the three together fifty-eight, so no plausible re-sizing of the
+        // Part 2: the CHEAPEST carried page is worth six chains on its own,
+        // and the two together nineteen, so no plausible re-sizing of the
         // budget changes the block's answer.
         assert!(
-            least_dense > 10 * PREPARED_LEG_ROWS,
+            least_dense > 6 * PREPARED_LEG_ROWS,
             "the cheapest stacked page is {least_dense} rows against a \
              {PREPARED_LEG_ROWS} budget"
         );
@@ -5315,7 +5319,7 @@ mod tests {
     /// `densest_sparse_entries()` and one more, and it MOVES one entry per
     /// `num_vars` rows of marginal. A LONE page stands at 19 variables and is
     /// charged 101, which puts it at (9,730 sparse, 9,731 dense) across a
-    /// marginal of `[92, 109]`; a page inside the BLOCK's thirty stands at 24,
+    /// marginal of `[92, 109]`; a page inside the BLOCK's twenty-eight stands at 24,
     /// is charged 111, and faces (9,731, 9,732) across `[110, 127]`. ⚠ BOTH
     /// PAIRS ARE REAL AND NEITHER IS "the" boundary — which is the reading the
     /// literal could not produce, since it charged a lone page the block's
@@ -5656,7 +5660,7 @@ mod tests {
     ///
     /// [`marginal_stacked_rows`] is a form now, so the question is no longer
     /// "what will the pin say" but "which bracket is this run in": the same
-    /// form charges 101 at one genesis page, 111 at the block's thirty and 125
+    /// form charges 101 at one genesis page, 111 at the block's twenty-eight and 125
     /// at a run of 4,096. So "the exact value is immaterial" is a claim that
     /// has to be READ over the whole range a run can put it in, one consequence
     /// at a time.
@@ -5666,7 +5670,7 @@ mod tests {
     ///
     /// | consequence | holds for a marginal in |
     /// |---|---|
-    /// | the block's three pages, paid | `[19, 2_100_474]` |
+    /// | the block's two dense pages, paid | `[19, 1_107_270]` |
     /// | the fixture (S = 112) refused by part 2 | every marginal |
     /// | two pages of 5,000 share one chain | `[1, 2_484]` |
     /// | the lone-page pair (9,730, 9,731) | `[92, 109]` ⚠ |
@@ -5723,11 +5727,11 @@ mod tests {
             );
         }
 
-        // ★ AND THE BLOCK'S SET IS STABLE ACROSS FIVE ORDERS OF MAGNITUDE,
+        // ★ AND THE BLOCK'S SET IS STABLE ACROSS NEARLY FIVE ORDERS OF MAGNITUDE,
         // which is the argument that this is a routing rule and not a knob: any
         // marginal from the cost of one zero page up to the cheapest dense
-        // page's own leg selects exactly those three.
-        for m in [19usize, 109, 1_000, 100_000, 2_100_473] {
+        // page's own leg selects exactly those two.
+        for m in [19usize, 109, 1_000, 100_000, 1_107_269] {
             let block: usize = BLOCK_DENSE.iter().map(|&(_, _, r)| r - m).sum();
             assert!(chain_is_paid(block) && sparse_leg_rows(BLOCK_PAGE_VARS, 0) <= m);
         }

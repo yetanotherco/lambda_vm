@@ -1819,7 +1819,7 @@ fn the_interned_genesis_root_is_the_elfs_own_bytes_at_the_dense_pages() {
     // the line below: this root, over this guest named by sha, this many
     // columns at this height, under this hash. Nothing inside the program
     // checks it. The BLOCK's own root is read by
-    // `the_blocks_dense_pages_are_the_three_the_threshold_pre_registers` on the
+    // `the_blocks_dense_pages_are_the_ones_the_threshold_pre_registers` on the
     // box; this is the fixture-scale half of the same pin.
     println!(
         "GENESIS STACK ROOT {:02x?} guest dense_data_page_touch sha {} ({} bytes)  \
@@ -1856,17 +1856,17 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// ⛔⛔ THE PRE-REGISTRATION, READ OFF THE REAL ELF INSTEAD OF COPIED.
 ///
-/// The split's unit tests in `continuation` encode the block's census — 116,692 nonzero
-/// entries at `0x0`, 229,290 at `0x40000`, 223,380 at `0x280000`, zero at the
-/// other 27 — as numbers I typed from a box log. That is enough to check the
-/// closed form's ARITHMETIC and not enough to check that the form, run against
-/// the actual program, selects those three pages. A routing rule whose
+/// The split's unit tests in `continuation` encode the block's census — 127,574
+/// nonzero entries at `0x0`, 61,514 at `0x200000`, zero at the other 26 — as
+/// numbers typed from a box log. That is enough to check the closed form's
+/// ARITHMETIC and not enough to check that the form, run against the actual
+/// program, selects those two pages. A routing rule whose
 /// pre-registration rests on a transcription is a rule nobody has tested.
 ///
 /// This runs the block guest once — no proving, no card, the same shape as
 /// `whir_global_tests::the_block_genesis_census` — rebuilds the page configs
 /// from the ELF, evaluates [`crate::continuation::genesis_stack_plan`] on them, and asserts
-/// the dense set is EXACTLY those three bases.
+/// the dense set is EXACTLY those two bases.
 ///
 /// ⛔ IT REFUSES RATHER THAN SKIPS when the shas are unstated, and SKIPS with
 /// its own line when the ELF is simply absent. Two outcomes, two meanings: a
@@ -1875,9 +1875,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// failure of this check.
 #[test]
 #[ignore = "the box runs it: one execution of the block guest, no proving"]
-fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
-    // What the ruling names, and what this arm exists to confirm against the ELF.
-    const PRE_REGISTERED: [u64; 3] = [0x0, 0x40000, 0x280000];
+fn the_blocks_dense_pages_are_the_ones_the_threshold_pre_registers() {
+    // What the ruling names, and what this arm exists to confirm against the ELF:
+    // the census of the guest built at 90e9dde5b (ELF sha256 `3e8f1ce1…`). The
+    // guest built before fat LTO and the runtime memcpy (`8f826601…`) stacked
+    // three, `0x0`, `0x40000` and `0x280000`.
+    const PRE_REGISTERED: [u64; 2] = [0x0, 0x200000];
 
     let name = std::env::var("LAMBDA_VM_BENCH_ELF").unwrap_or_else(|_| "ethrex".into());
     let input_name = std::env::var("LAMBDA_VM_BENCH_INPUT").unwrap_or_default();
@@ -1998,8 +2001,8 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
         },
     );
 
-    // ⚠ THE ASSERTION IS THE SET AND ITS ORDER, not a count. Three pages of the
-    // wrong three would pass a count, and the stack's column order IS page-base
+    // ⚠ THE ASSERTION IS THE SET AND ITS ORDER, not a count. The wrong pages in
+    // the right number would pass a count, and the stack's column order IS page-base
     // order, so the order is part of what the opening means.
     assert_eq!(
         dense_bases,
@@ -2015,7 +2018,7 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
     // assumed into the form.
     assert_eq!(
         plan.n_fixed, 24,
-        "thirty genesis pages: 18 + ceil(log2(60))"
+        "twenty-eight genesis pages: 18 + ceil(log2(56))"
     );
     assert_eq!(plan.n_fixed, crate::continuation::BLOCK_STACK_VARS);
     assert_eq!(
@@ -2028,9 +2031,9 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
     assert_eq!(
         plan.routes.iter().filter(|r| r.candidate).count(),
         PRE_REGISTERED.len(),
-        "the 27 all-zero pages must fail PART 1: 18 sparse rows against {marginal}"
+        "the 26 all-zero pages must fail PART 1: 18 sparse rows against {marginal}"
     );
-    assert_eq!(plan.savings, 10_248_237);
+    assert_eq!(plan.savings, 3_403_398);
     assert!(crate::continuation::chain_is_paid(plan.savings));
     // And the pages left behind must be genuinely cheap, or the hybrid is not
     // the win the ruling claimed.
@@ -2051,7 +2054,7 @@ fn the_blocks_dense_pages_are_the_three_the_threshold_pre_registers() {
         let prepared =
             multilinear_continuation::genesis_prepared_for::<H>(&configs, plan.clone(), &config)
                 .expect("the block's genesis stack")
-                .expect("three dense pages must produce a stack");
+                .expect("the dense pages must produce a stack");
         println!(
             "GENESIS STACK ROOT {:02x?} elf {elf_sha} input {input_sha} columns {} at \
              {num_vars} variables hash {}",

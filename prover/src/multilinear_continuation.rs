@@ -266,11 +266,11 @@ where
 ///
 /// A genesis page's INIT column is checked by the host with a fold and by the
 /// machine with the sparse closed form — one term per nonzero entry. On block
-/// 25368371 that is 10,249,056 rows for INIT alone, against a 2-4 M band for the
-/// whole cross-epoch program, and three pages of thirty carry all of it
-/// (`crate::continuation`'s genesis-stack section). Those three go into this commitment instead; the
-/// other twenty-seven keep the sparse form, for which they cost the interned
-/// zero.
+/// 25368371 that is 3,404,088 rows for INIT alone, against a 2-4 M band for the
+/// whole cross-epoch program, and two pages of twenty-eight carry all of it
+/// (`crate::continuation`'s genesis-stack section). Those two go into this
+/// commitment instead; the other twenty-six keep the sparse form, for which
+/// they cost the interned zero.
 ///
 /// # How it differs from [`DecodePrepared`], which it is modelled on
 ///
@@ -529,9 +529,11 @@ fn committed_under(
 /// # Cost, stated
 ///
 /// One commitment over `n_dense * 2^18` field elements, per prove and per
-/// verify. On the block that is three columns at twenty stacked variables;
-/// DECODE's equivalent is one commitment over 2^23 for a whole run. What it
-/// buys is 10,249,056 rows of in-guest sparse evaluation, which is the trade.
+/// verify. On the block that is two pages' columns at twenty stacked
+/// variables; DECODE's equivalent is one commitment over 2^22 for a whole run
+/// (2^23 for the previous guest, whose instruction table filled 2^20 rows).
+/// What it buys is 3,404,088 rows of in-guest sparse evaluation, which is the
+/// trade.
 pub(crate) fn genesis_prepared_for<H>(
     configs: &[crate::tables::page::PageConfig],
     plan: crate::continuation::GenesisStackPlan,
