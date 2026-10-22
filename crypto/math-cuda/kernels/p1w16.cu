@@ -1024,6 +1024,24 @@ extern "C" __global__ void p1s_leaves_base_coset(const uint64_t *__restrict__ co
     p1s::store_be(d, out + tid * 32);
 }
 
+// The same leaves placed in the coset order: leaf `tid` (the block that folds
+// onto `tid`) at position `bitrev(tid)` over `leaf_bits` bits, so the leaves
+// under an aligned subtree are one coset of the domain
+// (`multilinear::whir_commit::LeafOrder::Coset`). The reads are
+// `p1s_leaves_base_coset`'s; only the digest's slot moves.
+extern "C" __global__ void p1s_leaves_base_coset_rev(const uint64_t *__restrict__ codeword,
+                                                     uint64_t num_leaves, uint64_t block,
+                                                     uint32_t leaf_bits,
+                                                     uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    uint64_t d[p1w16::DIGEST];
+    p1w16::zisk_leaf<2, true>(
+        block, [&](uint64_t i) { return codeword[tid + i * num_leaves]; }, d);
+    const uint64_t at = leaf_bits == 0 ? tid : (__brevll(tid) >> (64 - leaf_bits));
+    p1s::store_be(d, out + at * 32);
+}
+
 extern "C" __global__ void p1s_leaves_ext3_coset(const uint64_t *__restrict__ codeword,
                                                  uint64_t num_leaves, uint64_t block,
                                                  uint8_t *__restrict__ out) {

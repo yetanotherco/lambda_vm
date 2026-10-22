@@ -266,6 +266,24 @@ impl OpeningSession {
         crate::whir::encode_successor(codeword, levels, &self.stream, &self.message, self.len)
     }
 
+    /// [`Self::encode_successor`] of a codeword of `elements` values that is
+    /// not held, inside `room` (`crate::whir::encode_successor_sized`).
+    pub fn encode_successor_sized(
+        &self,
+        elements: usize,
+        room: &std::sync::Arc<crate::device::DeviceReservation>,
+        levels: usize,
+    ) -> Result<crate::whir::DeviceCodeword> {
+        crate::whir::encode_successor_sized(
+            elements,
+            room,
+            levels,
+            &self.stream,
+            &self.message,
+            self.len,
+        )
+    }
+
     /// `weight += scale · eq(point, ·)`, the weight the next group carries.
     pub fn add_scaled_eq(&self, point: &[u64], scale: &[u64]) -> Result<()> {
         assert_eq!(point.len(), self.num_vars() * 3, "the point spans the cube");

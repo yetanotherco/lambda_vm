@@ -1110,10 +1110,8 @@ where
     let domain = Domain::<F>::new(num_vars + config.log_blowup)?;
     // On a device the codeword stays there: the chain folds it and opens a
     // handful of its values, and it is the biggest array the proof holds.
-    // The card places its leaves in natural order only, so a round-0 tree in
-    // another order is built on the host.
+    let leaves = config.format.leaves;
     let attempt = match &f.resident {
-        _ if config.format.leaves != LeafOrder::Natural => None,
         Some((store, parts)) => crate::gpu::commit_resident(
             store,
             parts,
@@ -1122,6 +1120,7 @@ where
             first,
             transient,
             H::DEVICE,
+            leaves,
         ),
         None => crate::gpu::commit_parts(
             &f.parts,
@@ -1130,10 +1129,13 @@ where
             first,
             transient,
             H::DEVICE,
+            leaves,
         ),
     };
     let commitment = match attempt {
-        Some((codeword, nodes)) => CodewordCommitment::from_device(codeword, nodes, first)?,
+        Some((codeword, nodes)) => {
+            CodewordCommitment::from_device_in(codeword, nodes, first, leaves)?
+        }
         // ⚠ COUNTED, because this arm is otherwise silent. The device declining
         // is not a slower path to the same place: the codeword is assembled,
         // lifted and encoded here, and the commitment then holds that codeword
@@ -1355,10 +1357,13 @@ where
         codeword: &Codeword<C>,
         levels: usize,
     ) -> Option<Codeword<E>> {
-        match (self, codeword.device()) {
-            (Self::Device(device), Some(held)) => {
+        match (self, codeword) {
+            (Self::Device(device), Codeword::Device(held)) => {
                 device.encode_successor(held, levels).map(Codeword::Device)
             }
+            (Self::Device(device), Codeword::Source(held)) => device
+                .encode_successor_from(held.source(), levels)
+                .map(Codeword::Device),
             _ => None,
         }
     }
@@ -1541,7 +1546,7 @@ where
     H: WhirHash,
 {
     let factors =
-        Factors::<F, E>::from_shares(f, shares, n_stack, commitment.codeword().device().is_some())?;
+        Factors::<F, E>::from_shares(f, shares, n_stack, commitment.codeword().on_device())?;
     prove_with_factors::<F, E, T, H>(
         f.num_vars(),
         factors,
@@ -1889,8 +1894,17 @@ where
     N: IsField + 'static,
     FieldElement<C>: AsBytes + Sync + Send,
 {
-    if let Some(folded) = codeword
-        .device()
+    // A round-0 codeword held as its stack is re-encoded to be folded
+    // (counted): the fold reads every value.
+    let encoded = codeword.source().and_then(|held| held.source().encode());
+    if codeword.source().is_some() && encoded.is_none() {
+        return Err(Error::DeviceFailed {
+            stage: "re-encoding a round-0 codeword from its stack to fold it",
+        });
+    }
+    if let Some(folded) = encoded
+        .as_ref()
+        .or_else(|| codeword.device())
         .and_then(|device| device.fold(domain.generator(), alphas))
     {
         let mut folded_domain = domain.clone();
@@ -1962,6 +1976,10 @@ where
                 .ok_or(Error::DeviceFailed { stage: "fold tree" })?;
             CodewordCommitment::from_device(device, nodes, log_folding)
         }
+        // A successor is always held.
+        Codeword::Source(_) => Err(Error::DeviceFailed {
+            stage: "committing a successor held as a stack",
+        }),
     }
 }
 
@@ -1974,6 +1992,9 @@ where
         Codeword::Host(values) => values.first().cloned().ok_or(Error::EmptyPolynomial),
         Codeword::Device(device) => device.first().ok_or(Error::DeviceFailed {
             stage: "final value",
+        }),
+        Codeword::Source(_) => Err(Error::DeviceFailed {
+            stage: "the final value of a codeword held as a stack",
         }),
     }
 }

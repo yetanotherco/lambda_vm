@@ -346,6 +346,60 @@ impl RetiredCommitment {
 pub enum Codeword<F: IsField> {
     Host(Vec<FieldElement<F>>),
     Device(crate::gpu::DeviceCodeword),
+    /// Not held: the stack it encodes ([`SourceCodeword`]).
+    Source(SourceCodeword<F>),
+}
+
+/// A round-0 codeword not held at all: the stack it encodes, from which each
+/// opening evaluates the cosets its queries fall in (`crate::gpu::CosetSource`).
+/// Only a commitment in the coset leaf order, revived for its openings, holds
+/// one.
+pub struct SourceCodeword<F: IsField> {
+    source: crate::gpu::CosetSource,
+    /// The blocks the last paths gathered, by leaf index: an opening reads its
+    /// paths and its values in two calls, and both come from one evaluation.
+    opened: std::sync::Mutex<Vec<(usize, Vec<FieldElement<F>>)>>,
+}
+
+impl<F: IsField> SourceCodeword<F> {
+    pub fn new(source: crate::gpu::CosetSource) -> Self {
+        Self {
+            source,
+            opened: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn source(&self) -> &crate::gpu::CosetSource {
+        &self.source
+    }
+
+    fn keep(&self, blocks: Vec<(usize, Vec<FieldElement<F>>)>) {
+        if let Ok(mut held) = self.opened.lock() {
+            *held = blocks;
+        }
+    }
+
+    /// The kept blocks of `indices`, or `None` when the last paths did not
+    /// gather one of them.
+    fn opened(&self, indices: &[usize]) -> Option<Vec<Vec<FieldElement<F>>>> {
+        let held = self.opened.lock().ok()?;
+        indices
+            .iter()
+            .map(|index| {
+                held.iter()
+                    .find(|(leaf, _)| leaf == index)
+                    .map(|(_, values)| values.clone())
+            })
+            .collect()
+    }
+}
+
+impl<F: IsField> std::fmt::Debug for SourceCodeword<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceCodeword")
+            .field("elements", &self.source.elements())
+            .finish()
+    }
 }
 
 impl<F: IsField> Codeword<F> {
@@ -353,6 +407,21 @@ impl<F: IsField> Codeword<F> {
         match self {
             Self::Host(values) => values.len(),
             Self::Device(device) => device.elements(),
+            Self::Source(source) => source.source.elements(),
+        }
+    }
+
+    /// Whether the codeword's values come from a device: held there, or
+    /// evaluated there from the stack.
+    pub fn on_device(&self) -> bool {
+        !matches!(self, Self::Host(_))
+    }
+
+    /// The stack it is evaluated from, when it is not held.
+    pub fn source(&self) -> Option<&SourceCodeword<F>> {
+        match self {
+            Self::Source(source) => Some(source),
+            _ => None,
         }
     }
 
@@ -364,14 +433,14 @@ impl<F: IsField> Codeword<F> {
     pub fn host(&self) -> Option<&[FieldElement<F>]> {
         match self {
             Self::Host(values) => Some(values),
-            Self::Device(_) => None,
+            Self::Device(_) | Self::Source(_) => None,
         }
     }
 
     /// The device holding them, when one does.
     pub fn device(&self) -> Option<&crate::gpu::DeviceCodeword> {
         match self {
-            Self::Host(_) => None,
+            Self::Host(_) | Self::Source(_) => None,
             Self::Device(device) => Some(device),
         }
     }
@@ -587,6 +656,23 @@ where
         root: Commitment,
         log_folding: usize,
     ) -> Result<Self, Error> {
+        Self::from_device_in(codeword, root, log_folding, LeafOrder::Natural)
+    }
+
+    /// [`from_device`](Self::from_device) for a tree the card built with its
+    /// leaves in `leaves`' order. The codeword must say so: a tree it would
+    /// rebuild in another order is refused here rather than at its first path.
+    pub fn from_device_in(
+        codeword: crate::gpu::DeviceCodeword,
+        root: Commitment,
+        log_folding: usize,
+        leaves: LeafOrder,
+    ) -> Result<Self, Error> {
+        if !codeword.placed_in(leaves) {
+            return Err(Error::DeviceFailed {
+                stage: "a device tree in another leaf order",
+            });
+        }
         let elements = codeword.elements();
         if !elements.is_power_of_two() {
             return Err(Error::NotPowerOfTwo(elements));
@@ -603,7 +689,7 @@ where
             codeword: Codeword::Device(codeword),
             log_folding,
             log_domain_size,
-            leaves: LeafOrder::Natural,
+            leaves,
             top: None,
         })
     }
@@ -719,6 +805,13 @@ where
                     }
                     all[..keep].to_vec()
                 }
+                // Held as its stack only once revived, and a revived one
+                // returned its kept top above.
+                Codeword::Source(_) => {
+                    return Err(Error::DeviceFailed {
+                        stage: "retiring a commitment held as its stack",
+                    });
+                }
             };
         if nodes.len() != keep || nodes.first() != Some(&self.tree.root) {
             return Err(Error::RecomputedCodewordMismatch { block: 0 });
@@ -746,6 +839,13 @@ where
                 index: bad,
                 bound: num_leaves,
             });
+        }
+        if let Codeword::Source(source) = &self.codeword {
+            let started = std::time::Instant::now();
+            let paths = self.source_top_paths(source, top, indices);
+            TOP_DEVICE_CALLS.fetch_add(1, Relaxed);
+            TOP_DEVICE_NANOS.fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+            return paths;
         }
         let on_device = matches!(self.codeword, Codeword::Device(_));
         if on_device && !top_paths_on_host() {
@@ -778,31 +878,27 @@ where
         let Codeword::Device(device) = &self.codeword else {
             return None;
         };
-        // The card gathers a block's leaves by consecutive index; under the
-        // coset order they are not, so the host re-hashes them.
-        if self.leaves != LeafOrder::Natural {
-            return None;
-        }
-        let arity = Self::arity();
+        self.card_top_paths_over(device, top, indices)
+    }
+
+    /// [`Self::card_top_paths`] over `device`, this commitment's codeword
+    /// (or, for one held as its stack, the codeword re-encoded from it).
+    fn card_top_paths_over(
+        &self,
+        device: &crate::gpu::DeviceCodeword,
+        top: &TreeTop,
+        indices: &[usize],
+    ) -> Option<Result<Vec<Proof<Commitment>>, Error>> {
         let dropped = top.dropped;
-        // A block is `2^dropped` leaves, or `4^dropped` at arity 4.
-        let block_bits = if arity == 4 { 2 * dropped } else { dropped };
+        let block_bits = self.block_bits(top);
         let span = 1usize << block_bits;
         let mut blocks: Vec<usize> = indices.iter().map(|index| index >> block_bits).collect();
         blocks.sort_unstable();
         blocks.dedup();
-        let nodes = device.block_subtrees(self.log_folding, &blocks, dropped, H::DEVICE)?;
-        // The card's one tree over the gathered leaves, in the layout of this
-        // arity: the binary heap, or the arity-4 levels top-down.
+        let nodes =
+            device.block_subtrees(self.log_folding, &blocks, dropped, H::DEVICE, self.leaves)?;
         let leaves = (blocks.len() << block_bits).next_power_of_two().max(2);
-        let sizes4 = level_sizes4(leaves);
-        let offsets4 = level_offsets4(&sizes4);
-        let expected = if arity == 4 {
-            sizes4.iter().sum()
-        } else {
-            2 * leaves - 1
-        };
-        if nodes.len() != expected {
+        if nodes.len() != Self::gathered_nodes(leaves) {
             return None;
         }
         TOP_PATH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -810,6 +906,63 @@ where
             (blocks.len() << block_bits) as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+        // Block `k` of the gathered leaves is the `k`-th queried block in
+        // position order.
+        let slots: Vec<(usize, usize)> = indices
+            .iter()
+            .map(|&index| {
+                let k = blocks
+                    .binary_search(&(index >> block_bits))
+                    .expect("every queried block was gathered");
+                (k, index & (span - 1))
+            })
+            .collect();
+        Some(self.gathered_paths(top, &nodes, leaves, &blocks, indices, &slots))
+    }
+
+    /// A block's binary levels under its kept node: `dropped`, or twice that
+    /// at arity 4.
+    fn block_bits(&self, top: &TreeTop) -> usize {
+        if Self::arity() == 4 {
+            2 * top.dropped
+        } else {
+            top.dropped
+        }
+    }
+
+    /// Nodes of one tree over `leaves` gathered leaves in this arity's layout:
+    /// the binary heap, or the arity-4 levels top-down.
+    fn gathered_nodes(leaves: usize) -> usize {
+        if Self::arity() == 4 {
+            level_sizes4(leaves).iter().sum()
+        } else {
+            2 * leaves - 1
+        }
+    }
+
+    /// The paths of tree positions `indices` from one tree over gathered
+    /// blocks (`nodes`, `leaves` leaves with the padding): gathered block `k`
+    /// is the kept block at position `blocks[k]`, and query `i` is leaf
+    /// `slots[i].1` of gathered block `slots[i].0`. Every gathered block's
+    /// root is checked against its kept node before a path leaves.
+    fn gathered_paths(
+        &self,
+        top: &TreeTop,
+        nodes: &[Commitment],
+        leaves: usize,
+        blocks: &[usize],
+        indices: &[usize],
+        slots: &[(usize, usize)],
+    ) -> Result<Vec<Proof<Commitment>>, Error> {
+        let arity = Self::arity();
+        let dropped = top.dropped;
+        let block_bits = self.block_bits(top);
+        let span = 1usize << block_bits;
+        let sizes4 = level_sizes4(leaves);
+        let offsets4 = level_offsets4(&sizes4);
+        if nodes.len() != Self::gathered_nodes(leaves) {
+            return Err(Error::RecomputedCodewordMismatch { block: 0 });
+        }
         let frontier = self.frontier(top);
         // The blocks are `span`-aligned among the gathered leaves, so block
         // `k`'s root sits `dropped` levels up, `k`-th on its level.
@@ -820,22 +973,23 @@ where
         };
         for (k, &block) in blocks.iter().enumerate() {
             if top.nodes.get(frontier + block) != Some(&nodes[roots_at + k]) {
-                return Some(Err(Error::RecomputedCodewordMismatch { block }));
+                return Err(Error::RecomputedCodewordMismatch { block });
             }
         }
         let pad = Backend::<F, H>::padding_node();
-        let paths = indices
+        indices
             .iter()
-            .map(|&index| {
+            .zip(slots)
+            .map(|(&index, &(k, slot))| {
                 let block = index >> block_bits;
-                let k = blocks
-                    .binary_search(&block)
-                    .map_err(|_| Error::QueryOutOfRange {
+                if blocks.get(k) != Some(&block) || slot != index & (span - 1) {
+                    return Err(Error::QueryOutOfRange {
                         index,
                         bound: self.num_leaves(),
-                    })?;
+                    });
+                }
                 let mut merkle_path = Vec::with_capacity(self.path_len());
-                let leaf = (k << block_bits) + (index & (span - 1));
+                let leaf = (k << block_bits) + slot;
                 if arity == 4 {
                     // Inside an aligned block every group is whole; the
                     // padding arm is the layout's rule, not a case reached.
@@ -863,8 +1017,63 @@ where
                 self.push_kept_siblings(top, block, &mut merkle_path)?;
                 Ok(Proof { merkle_path })
             })
+            .collect()
+    }
+
+    /// [`Self::top_paths`] of a commitment held as its stack: each queried
+    /// coset evaluated from the polynomial and hashed on the card, its root
+    /// checked against the kept node, and the queried blocks' values kept for
+    /// the opening that asked. A plan the kernels do not take, or a card that
+    /// declines, re-encodes the codeword from the stack (counted) and takes
+    /// the card's re-hash over it.
+    fn source_top_paths(
+        &self,
+        source: &SourceCodeword<F>,
+        top: &TreeTop,
+        indices: &[usize],
+    ) -> Result<Vec<Proof<Commitment>>, Error> {
+        let depth = self.depth();
+        let block_bits = self.block_bits(top);
+        let wanted: Vec<usize> = indices
+            .iter()
+            .map(|&index| self.leaves.position(index, depth))
             .collect();
-        Some(paths)
+        if let Some(opened) =
+            source
+                .source
+                .openings::<F>(self.log_folding, block_bits, &wanted, H::DEVICE)
+        {
+            TOP_PATH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            TOP_LEAVES_REHASHED.fetch_add(
+                (opened.positions.len() << block_bits) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let paths = self.gathered_paths(
+                top,
+                &opened.nodes,
+                opened.leaves,
+                &opened.positions,
+                indices,
+                &opened.slots,
+            )?;
+            source.keep(wanted.into_iter().zip(opened.values).collect());
+            return Ok(paths);
+        }
+        let device = source.source.encode().ok_or(Error::DeviceFailed {
+            stage: "re-encoding a round-0 codeword from its stack",
+        })?;
+        let paths =
+            self.card_top_paths_over(&device, top, indices)
+                .ok_or(Error::DeviceFailed {
+                    stage: "re-hashing a re-encoded round-0 codeword",
+                })??;
+        let values = device
+            .cosets::<F>(&wanted, self.num_leaves(), 1usize << self.log_folding)
+            .ok_or(Error::DeviceFailed {
+                stage: "gathering a re-encoded round-0 codeword",
+            })?;
+        source.keep(wanted.into_iter().zip(values).collect());
+        Ok(paths)
     }
 
     /// [`Self::top_paths`] on the host: the leaves of each queried block are
@@ -1021,6 +1230,10 @@ where
                     index: 0,
                     bound: num_leaves,
                 }),
+            Codeword::Source(source) => source.opened(indices).ok_or(Error::QueryOutOfRange {
+                index: 0,
+                bound: num_leaves,
+            }),
         }
     }
 
@@ -1085,6 +1298,11 @@ where
                         bound: num_leaves,
                     })?
             }
+            // The paths above evaluated and kept these blocks.
+            Codeword::Source(source) => source.opened(indices).ok_or(Error::QueryOutOfRange {
+                index: 0,
+                bound: num_leaves,
+            })?,
         };
 
         crate::whir_split::add(&crate::whir_split::COSET_GATHER, __wq_gather);
@@ -1123,9 +1341,11 @@ where
             bound: num_leaves,
         };
         match &self.codeword {
-            Codeword::Device(_) if self.leaves != LeafOrder::Natural => Err(Error::DeviceFailed {
-                stage: "a device tree in the coset leaf order",
-            }),
+            Codeword::Device(device) if !device.placed_in(self.leaves) => {
+                Err(Error::DeviceFailed {
+                    stage: "a device tree in another leaf order",
+                })
+            }
             Codeword::Device(device) => {
                 if let Some(&bad) = indices.iter().find(|index| **index >= num_leaves) {
                     return Err(out_of_range(bad));
@@ -1150,6 +1370,10 @@ where
                         .ok_or_else(|| out_of_range(*index))
                 })
                 .collect(),
+            // Held as its stack only once revived, with its kept top.
+            Codeword::Source(_) => Err(Error::DeviceFailed {
+                stage: "a stack-held commitment with no kept top",
+            }),
         }
     }
 
@@ -1212,9 +1436,9 @@ where
             (self.top_paths(top, indices)?, Some(cap))
         } else if owner {
             match &self.codeword {
-                Codeword::Device(_) if self.leaves != LeafOrder::Natural => {
+                Codeword::Device(device) if !device.placed_in(self.leaves) => {
                     return Err(Error::DeviceFailed {
-                        stage: "a device tree in the coset leaf order",
+                        stage: "a device tree in another leaf order",
                     });
                 }
                 Codeword::Device(device) => {
@@ -1243,6 +1467,11 @@ where
                         reason: "the host tree has no cap at this height",
                     })?;
                     (self.paths_at(indices)?, Some(cap))
+                }
+                Codeword::Source(_) => {
+                    return Err(Error::DeviceFailed {
+                        stage: "a stack-held commitment with no kept top",
+                    });
                 }
             }
         } else {
@@ -1295,6 +1524,14 @@ where
             // here: that is a gather, not a codeword coming back.
             Codeword::Device(device) => device
                 .cosets(&[index], num_leaves, 1usize << self.log_folding)
+                .and_then(|blocks| blocks.into_iter().next())
+                .ok_or(Error::QueryOutOfRange {
+                    index,
+                    bound: num_leaves,
+                })?,
+            // The path above evaluated and kept it.
+            Codeword::Source(source) => source
+                .opened(&[index])
                 .and_then(|blocks| blocks.into_iter().next())
                 .ok_or(Error::QueryOutOfRange {
                     index,

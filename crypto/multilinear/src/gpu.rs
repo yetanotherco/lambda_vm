@@ -96,6 +96,13 @@ static RESIDENT_FOLD_CALLS: AtomicU64 = AtomicU64::new(0);
 /// codeword (the default; `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0` folds; D-SPEED
 /// lever 5a). Not in [`RESIDENT_FOLD_CALLS`]: no fold ran.
 static ENCODED_SUCCESSORS: AtomicU64 = AtomicU64::new(0);
+/// Round-0 openings of a coset-ordered tree served from the stack: each
+/// queried coset evaluated from the polynomial, no codeword re-encoded.
+static COSET_OPENINGS: AtomicU64 = AtomicU64::new(0);
+/// ⚠ Coset-ordered round-0 commitments that re-encoded their codeword after
+/// all: a plan the kernels do not take, the card declining, or a fold. Each is
+/// today's cost paid where the lever was meant to save it.
+static COSET_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// ★ Stacked openings whose codeword the device holds but whose factors the
 /// device did not build from the shares.
 ///
@@ -387,6 +394,61 @@ pub fn encoded_successors() -> u64 {
     ENCODED_SUCCESSORS.load(Ordering::Relaxed)
 }
 
+/// [`COSET_OPENINGS`].
+pub fn coset_openings() -> u64 {
+    COSET_OPENINGS.load(Ordering::Relaxed)
+}
+
+/// [`COSET_FALLBACKS`].
+pub fn coset_fallbacks() -> u64 {
+    COSET_FALLBACKS.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "cuda")]
+fn note_coset_fallback() {
+    COSET_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Whether a coset-ordered round-0 commitment is revived over its stack (its
+/// openings evaluated coset by coset) instead of re-encoded: the default under
+/// the coset order; `LAMBDA_VM_WHIR_COSET_OPENINGS=0` or a test's override
+/// re-encodes. The same bytes either way. `false` in a build without a device.
+pub fn coset_openings_in_effect() -> bool {
+    match COSET_OPENINGS_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            cfg!(feature = "cuda")
+                && *ON.get_or_init(|| {
+                    !matches!(
+                        std::env::var("LAMBDA_VM_WHIR_COSET_OPENINGS")
+                            .ok()
+                            .as_deref()
+                            .map(str::trim),
+                        Some("0")
+                    )
+                })
+        }
+    }
+}
+
+static COSET_OPENINGS_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_WHIR_COSET_OPENINGS` for the whole process. `None`
+/// restores the environment's setting. Not for production callers.
+#[doc(hidden)]
+pub fn force_coset_openings(on: Option<bool>) {
+    COSET_OPENINGS_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
 /// Whether a chain's first successor is encoded from its bound message (the
 /// default; `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0` or a test's override turns it
 /// off). `false` in a build without a device.
@@ -521,6 +583,8 @@ pub fn reset_call_counters() {
     FUSED_FOLD_CALLS.store(0, Ordering::Relaxed);
     RESIDENT_FOLD_CALLS.store(0, Ordering::Relaxed);
     ENCODED_SUCCESSORS.store(0, Ordering::Relaxed);
+    COSET_OPENINGS.store(0, Ordering::Relaxed);
+    COSET_FALLBACKS.store(0, Ordering::Relaxed);
     OPEN_HOST_FALLBACKS.store(0, Ordering::Relaxed);
     ROOM_PARKS.store(0, Ordering::Relaxed);
     ROOM_TURNS.store(0, Ordering::Relaxed);
@@ -5095,6 +5159,24 @@ impl OpeningFactors {
         ENCODED_SUCCESSORS.fetch_add(1, Ordering::Relaxed);
         Some(DeviceCodeword(successor))
     }
+
+    /// [`Self::encode_successor`] of a round-0 codeword held as its stack
+    /// ([`CosetSource`]): the size and the room are the stack's.
+    pub(crate) fn encode_successor_from(
+        &mut self,
+        source: &CosetSource,
+        levels: usize,
+    ) -> Option<DeviceCodeword> {
+        if !encode_successor() {
+            return None;
+        }
+        let session = self.materialize().ok()?;
+        let successor = session
+            .encode_successor_sized(source.0.elements(), source.0.room(), levels)
+            .ok()?;
+        ENCODED_SUCCESSORS.fetch_add(1, Ordering::Relaxed);
+        Some(DeviceCodeword(successor))
+    }
 }
 
 /// A point as the limbs the kernels read.
@@ -5154,6 +5236,14 @@ impl OpeningFactors {
     pub(crate) fn encode_successor(
         &mut self,
         _codeword: &DeviceCodeword,
+        _levels: usize,
+    ) -> Option<DeviceCodeword> {
+        match self.0 {}
+    }
+
+    pub(crate) fn encode_successor_from(
+        &mut self,
+        _source: &CosetSource,
         _levels: usize,
     ) -> Option<DeviceCodeword> {
         match self.0 {}
@@ -5410,6 +5500,130 @@ where
     None
 }
 
+/// A round-0 stack the card holds, which a revived coset-ordered commitment
+/// opens from: each queried coset evaluated from the polynomial instead of a
+/// re-encoded codeword (`math_cuda::whir_coset`).
+#[cfg(feature = "cuda")]
+pub struct CosetSource(math_cuda::whir_coset::StackSlices);
+
+/// A stack a build without a device never holds. Never constructed.
+#[cfg(not(feature = "cuda"))]
+pub struct CosetSource(std::convert::Infallible);
+
+/// A coset source's openings: one tree over its gathered blocks (block `k` =
+/// the leaves `[k·2^kept, (k+1)·2^kept)`, `leaves` in all with the padding),
+/// each block's node's position among the kept nodes, and per query its block,
+/// its slot in it and its raw values.
+pub(crate) struct SourceOpenings<F: math::field::traits::IsField> {
+    pub nodes: Vec<[u8; 32]>,
+    pub leaves: usize,
+    pub positions: Vec<usize>,
+    pub slots: Vec<(usize, usize)>,
+    pub values: Vec<Vec<math::field::element::FieldElement<F>>>,
+}
+
+#[cfg(feature = "cuda")]
+impl CosetSource {
+    /// The stack `parts` (`(column, offset)` into `store`) make. `None` when
+    /// the card declines.
+    pub(crate) fn from_resident(
+        store: &ResidentColumns,
+        parts: &[(usize, usize)],
+        num_vars: usize,
+        log_blowup: usize,
+    ) -> Option<Self> {
+        math_cuda::whir_coset::StackSlices::from_resident(&store.0, parts, num_vars, log_blowup)
+            .ok()
+            .map(Self)
+    }
+
+    /// Values the codeword would have.
+    pub(crate) fn elements(&self) -> usize {
+        self.0.elements()
+    }
+
+    /// The openings of `leaves` (leaf indices) under kept nodes of `2^kept`
+    /// leaves. `None` when the plan is not one the kernels take or the card
+    /// declines: the caller re-encodes ([`Self::encode`]).
+    pub(crate) fn openings<F>(
+        &self,
+        log_folding: usize,
+        kept: usize,
+        leaves: &[usize],
+        hash: crate::whir_hash::DeviceHashKey,
+    ) -> Option<SourceOpenings<F>>
+    where
+        F: math::field::traits::IsField + 'static,
+    {
+        let raw: Vec<u64> = leaves.iter().map(|&leaf| leaf as u64).collect();
+        let plan = math_cuda::whir_coset::CosetPlan::new(
+            self.0.num_vars(),
+            self.0.log_blowup(),
+            log_folding,
+            kept,
+            &raw,
+        )?;
+        let opened =
+            math_cuda::whir_coset::coset_openings(&self.0, &plan, &raw, hash.into_math_cuda())
+                .ok()?;
+        let slots = raw
+            .iter()
+            .map(|&leaf| plan.slot_of(leaf))
+            .collect::<Option<Vec<_>>>()?;
+        let block = 1usize << log_folding;
+        let values = values_from_raw::<F>(&opened.values, true)?;
+        COSET_OPENINGS.fetch_add(1, Ordering::Relaxed);
+        Some(SourceOpenings {
+            nodes: nodes_in_place(opened.nodes)?,
+            leaves: opened.leaves,
+            positions: (0..plan.classes().len())
+                .map(|q| plan.block_position(q))
+                .collect(),
+            slots,
+            values: values.chunks_exact(block).map(<[_]>::to_vec).collect(),
+        })
+    }
+
+    /// The whole codeword, re-encoded: the fallback. Counted.
+    pub(crate) fn encode(&self) -> Option<DeviceCodeword> {
+        note_coset_fallback();
+        self.0.encode(false).ok().map(DeviceCodeword)
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CosetSource {
+    pub(crate) fn from_resident(
+        _store: &ResidentColumns,
+        _parts: &[(usize, usize)],
+        _num_vars: usize,
+        _log_blowup: usize,
+    ) -> Option<Self> {
+        None
+    }
+
+    pub(crate) fn elements(&self) -> usize {
+        match self.0 {}
+    }
+
+    pub(crate) fn openings<F>(
+        &self,
+        _log_folding: usize,
+        _kept: usize,
+        _leaves: &[usize],
+        _hash: crate::whir_hash::DeviceHashKey,
+    ) -> Option<SourceOpenings<F>>
+    where
+        F: math::field::traits::IsField + 'static,
+    {
+        match self.0 {}
+    }
+
+    pub(crate) fn encode(&self) -> Option<DeviceCodeword> {
+        match self.0 {}
+    }
+}
+
 /// A codeword the device holds: the commit leaves one there and the chain
 /// folds it there, so the array itself never crosses the bus.
 #[cfg(feature = "cuda")]
@@ -5442,6 +5656,7 @@ impl std::fmt::Debug for DeviceCodeword {
 /// assembled first — a copy of every byte about to be uploaded — is never
 /// built. `parts` is `(column, offset in elements)`.
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn commit_parts<F>(
     parts: &[(&dyn crate::narrow::HostColumn<F>, usize)],
     log_evals: usize,
@@ -5449,6 +5664,7 @@ pub(crate) fn commit_parts<F>(
     log_folding: usize,
     transient: bool,
     hash: crate::whir_hash::DeviceHashKey,
+    leaves: crate::whir_commit::LeafOrder,
 ) -> Option<(DeviceCodeword, [u8; 32])>
 where
     F: math::field::traits::IsField + 'static,
@@ -5486,13 +5702,14 @@ where
     // No device is a decline, not an error: the device is asked only once one
     // exists (a GPU-less `cuda` build fails here on every commit).
     math_cuda::device::backend().ok()?;
-    let (codeword, root) = match math_cuda::whir::commit_codeword_parts(
+    let (codeword, root) = match math_cuda::whir::commit_codeword_parts_placed(
         &raw,
         log_evals,
         log_blowup,
         log_folding,
         transient,
         hash.into_math_cuda(),
+        placement(leaves),
     ) {
         Ok(committed) => committed,
         Err(err) => {
@@ -5504,8 +5721,18 @@ where
     Some((DeviceCodeword(codeword), root))
 }
 
+/// The tree placement of a round-0 leaf order on the card.
+#[cfg(feature = "cuda")]
+fn placement(leaves: crate::whir_commit::LeafOrder) -> math_cuda::whir::LeafPlacement {
+    match leaves {
+        crate::whir_commit::LeafOrder::Natural => math_cuda::whir::LeafPlacement::Natural,
+        crate::whir_commit::LeafOrder::Coset => math_cuda::whir::LeafPlacement::Reversed,
+    }
+}
+
 /// The same for parts the card already holds.
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn commit_resident(
     store: &ResidentColumns,
     parts: &[(usize, usize)],
@@ -5514,6 +5741,7 @@ pub(crate) fn commit_resident(
     log_folding: usize,
     transient: bool,
     hash: crate::whir_hash::DeviceHashKey,
+    leaves: crate::whir_commit::LeafOrder,
 ) -> Option<(DeviceCodeword, [u8; 32])> {
     if (1usize << log_evals) << log_blowup < COMMIT_THRESHOLD {
         return None;
@@ -5524,7 +5752,7 @@ pub(crate) fn commit_resident(
     }
     // No device is a decline, not an error (see `commit_parts`).
     math_cuda::device::backend().ok()?;
-    let (codeword, root) = match math_cuda::whir::commit_codeword_resident(
+    let (codeword, root) = match math_cuda::whir::commit_codeword_resident_placed(
         &store.0,
         parts,
         log_evals,
@@ -5532,6 +5760,7 @@ pub(crate) fn commit_resident(
         log_folding,
         transient,
         hash.into_math_cuda(),
+        placement(leaves),
     ) {
         Ok(committed) => committed,
         Err(err) => {
@@ -5649,6 +5878,7 @@ where
 }
 
 #[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn commit_resident(
     _store: &ResidentColumns,
     _parts: &[(usize, usize)],
@@ -5657,11 +5887,13 @@ pub(crate) fn commit_resident(
     _log_folding: usize,
     _transient: bool,
     _hash: crate::whir_hash::DeviceHashKey,
+    _leaves: crate::whir_commit::LeafOrder,
 ) -> Option<(DeviceCodeword, [u8; 32])> {
     None
 }
 
 #[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn commit_parts<F>(
     _parts: &[(&dyn crate::narrow::HostColumn<F>, usize)],
     _log_evals: usize,
@@ -5669,6 +5901,7 @@ pub(crate) fn commit_parts<F>(
     _log_folding: usize,
     _transient: bool,
     _hash: crate::whir_hash::DeviceHashKey,
+    _leaves: crate::whir_commit::LeafOrder,
 ) -> Option<(DeviceCodeword, [u8; 32])>
 where
     F: math::field::traits::IsField + 'static,
@@ -5847,13 +6080,25 @@ impl DeviceCodeword {
         blocks: &[usize],
         dropped: usize,
         hash: crate::whir_hash::DeviceHashKey,
+        leaves: crate::whir_commit::LeafOrder,
     ) -> Option<Vec<[u8; 32]>> {
         let blocks: Vec<u64> = blocks.iter().map(|block| *block as u64).collect();
         let bytes = self
             .0
-            .block_subtrees(log_folding, &blocks, dropped, hash.into_math_cuda())
+            .block_subtrees_placed(
+                log_folding,
+                &blocks,
+                dropped,
+                hash.into_math_cuda(),
+                placement(leaves),
+            )
             .ok()?;
         nodes_in_place(bytes)
+    }
+
+    /// Whether the tree this codeword builds puts its leaves in `leaves`.
+    pub(crate) fn placed_in(&self, leaves: crate::whir_commit::LeafOrder) -> bool {
+        self.0.placement() == placement(leaves)
     }
 
     /// Its first value, which is what the last fold leaves behind.
@@ -6014,7 +6259,12 @@ impl DeviceCodeword {
         _blocks: &[usize],
         _dropped: usize,
         _hash: crate::whir_hash::DeviceHashKey,
+        _leaves: crate::whir_commit::LeafOrder,
     ) -> Option<Vec<[u8; 32]>> {
+        match self.0 {}
+    }
+
+    pub(crate) fn placed_in(&self, _leaves: crate::whir_commit::LeafOrder) -> bool {
         match self.0 {}
     }
 

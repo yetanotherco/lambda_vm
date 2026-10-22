@@ -516,6 +516,15 @@ where
             room
         };
         let transient = room.is_none();
+        // ★ A coset-ordered round 0 is revived over its stack, not re-encoded:
+        // each opening evaluates the cosets its queries fall in. Only where
+        // the stack is resident, the successor is encoded from the bound
+        // message (a fold reads the whole codeword), and the chain is a
+        // polynomial's own (a grouped round 0 folds host codewords).
+        let from_stack = config.format.leaves == crate::whir_commit::LeafOrder::Coset
+            && config.format.group == crate::whir_chain::GroupFold::PerPoly
+            && crate::gpu::coset_openings_in_effect()
+            && crate::gpu::encode_successor_in_effect();
         let mut commitments = Vec::with_capacity(retired.len());
         for (poly, retired) in retired.into_iter().enumerate() {
             let source = whir_chain::Stacked {
@@ -536,7 +545,21 @@ where
                 }),
                 num_vars: layout.n_stack(),
             };
-            let codeword = whir_chain::encode_stacked::<F>(&source, config, transient)?;
+            let held = match (&source.resident, from_stack) {
+                (Some((store, parts)), true) => crate::gpu::CosetSource::from_resident(
+                    store,
+                    parts,
+                    layout.n_stack(),
+                    config.log_blowup,
+                ),
+                _ => None,
+            };
+            let codeword = match held {
+                Some(held) => crate::whir_commit::Codeword::Source(
+                    crate::whir_commit::SourceCodeword::new(held),
+                ),
+                None => whir_chain::encode_stacked::<F>(&source, config, transient)?,
+            };
             commitments.push(retired.revive::<F, H>(codeword)?);
         }
         Ok(StackedCommitment {

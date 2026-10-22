@@ -894,6 +894,28 @@ fn gather_paths(
     }
 }
 
+/// Where a tree puts the leaf of fold block `j`: at position `j`, or at
+/// `bitrev(j)` over the tree's depth (`multilinear::whir_commit::LeafOrder`).
+/// Only a round-0 tree is ever reversed, and only under Poseidon1.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LeafPlacement {
+    #[default]
+    Natural,
+    Reversed,
+}
+
+impl LeafPlacement {
+    /// The leaf at tree position `pos` of a tree of `2^depth` leaves (the map
+    /// is its own inverse).
+    pub fn leaf_at(self, pos: u64, depth: u32) -> u64 {
+        match self {
+            Self::Natural => pos,
+            Self::Reversed if depth == 0 => pos,
+            Self::Reversed => pos.reverse_bits() >> (64 - depth),
+        }
+    }
+}
+
 /// A codeword the device holds, base-field or ext3.
 ///
 /// The commit leaves one here and the chain folds it here: it is the biggest
@@ -905,6 +927,9 @@ pub struct DeviceCodeword {
     stream: Arc<CudaStream>,
     elements: usize,
     base: bool,
+    /// Where this codeword's tree puts its leaves; set by the commit that
+    /// builds the tree, and the same for every rebuild.
+    placement: LeafPlacement,
     /// Trees this codeword has built: the commit's, and one for each opening
     /// that no kept whole tree served.
     builds: BuildCount,
@@ -940,6 +965,11 @@ impl DeviceCodeword {
 
     pub fn is_base(&self) -> bool {
         self.base
+    }
+
+    /// Where this codeword's tree puts its leaves.
+    pub fn placement(&self) -> LeafPlacement {
+        self.placement
     }
 
     /// Every limb, read back — one per value for a base codeword, three for an
@@ -1005,15 +1035,38 @@ impl DeviceCodeword {
                 // label the result. `hash` is the key the caller's `WhirHash`
                 // supplied, so a tree labelled RPX was hashed by RPX's kernels or
                 // was not built here at all.
-                let (kernel, cfg) = coset_leaf_kernel(be, hash, self.base, num_leaves_u64)?;
-                unsafe {
-                    self.stream
-                        .launch_builder(kernel)
-                        .arg(self.buffer.as_ref())
-                        .arg(&num_leaves_u64)
-                        .arg(&block)
-                        .arg(&mut leaves)
-                        .launch(cfg)?;
+                match self.placement {
+                    LeafPlacement::Natural => {
+                        let (kernel, cfg) = coset_leaf_kernel(be, hash, self.base, num_leaves_u64)?;
+                        unsafe {
+                            self.stream
+                                .launch_builder(kernel)
+                                .arg(self.buffer.as_ref())
+                                .arg(&num_leaves_u64)
+                                .arg(&block)
+                                .arg(&mut leaves)
+                                .launch(cfg)?;
+                        }
+                    }
+                    // Reversed leaves exist for Poseidon1's base trees alone
+                    // (the round-0 trees of the production hash).
+                    LeafPlacement::Reversed => {
+                        if hash != crate::DeviceHash::Poseidon1 || !self.base {
+                            return Err(crate::invalid_value());
+                        }
+                        let k = crate::p1_stark::kernels()?;
+                        let leaf_bits = num_leaves.trailing_zeros();
+                        unsafe {
+                            self.stream
+                                .launch_builder(&k.leaves_base_coset_rev)
+                                .arg(self.buffer.as_ref())
+                                .arg(&num_leaves_u64)
+                                .arg(&block)
+                                .arg(&leaf_bits)
+                                .arg(&mut leaves)
+                                .launch(crate::p1_stark::launch_cfg(num_leaves_u64))?;
+                        }
+                    }
                 }
             }
             // The borrow of `nodes` ends at the brace above, which is what lets
@@ -1544,6 +1597,20 @@ impl DeviceCodeword {
         dropped: usize,
         hash: crate::DeviceHash,
     ) -> Result<Vec<u8>> {
+        self.block_subtrees_placed(log_folding, blocks, dropped, hash, LeafPlacement::Natural)
+    }
+
+    /// [`Self::block_subtrees`] of a tree whose leaves sit in `placement`: a
+    /// block is still `2^dropped` consecutive POSITIONS, and the leaf at each
+    /// is the fold block the placement puts there.
+    pub fn block_subtrees_placed(
+        &self,
+        log_folding: usize,
+        blocks: &[u64],
+        dropped: usize,
+        hash: crate::DeviceHash,
+        placement: LeafPlacement,
+    ) -> Result<Vec<u8>> {
         assert!(!blocks.is_empty(), "a round opens at least one block");
         let num_leaves = self.elements >> log_folding;
         // `dropped` counts the tree's own levels: a block is `2^dropped`
@@ -1556,15 +1623,17 @@ impl DeviceCodeword {
         };
         let real = blocks.len() * span as usize;
         let leaves = real.next_power_of_two().max(2);
+        let depth = num_leaves.trailing_zeros();
         let mut indices: Vec<u64> = blocks
             .iter()
             .flat_map(|&b| (b * span)..((b + 1) * span))
+            .map(|pos| placement.leaf_at(pos, depth))
             .collect();
-        let last = *indices.last().expect("at least one leaf");
         assert!(
-            (last as usize) < num_leaves,
+            ((blocks[blocks.len() - 1] + 1) * span) as usize <= num_leaves,
             "block past the tree's {num_leaves} leaves"
         );
+        let last = *indices.last().expect("at least one leaf");
         indices.resize(leaves, last);
         let limbs = if self.base { 1u64 } else { 3 };
         let block = 1u64 << log_folding;
@@ -1639,12 +1708,34 @@ pub fn commit_codeword_parts(
     transient: bool,
     hash: crate::DeviceHash,
 ) -> Result<(DeviceCodeword, [u8; 32])> {
+    commit_codeword_parts_placed(
+        parts,
+        log_evals,
+        log_blowup,
+        log_folding,
+        transient,
+        hash,
+        LeafPlacement::Natural,
+    )
+}
+
+/// [`commit_codeword_parts`] with the tree's leaves in `placement`.
+pub fn commit_codeword_parts_placed(
+    parts: &[(&[u64], usize)],
+    log_evals: usize,
+    log_blowup: usize,
+    log_folding: usize,
+    transient: bool,
+    hash: crate::DeviceHash,
+    placement: LeafPlacement,
+) -> Result<(DeviceCodeword, [u8; 32])> {
     commit_from(
         Source::Parts { parts, log_evals },
         log_blowup,
         log_folding,
         transient,
         hash,
+        placement,
     )
 }
 
@@ -1660,6 +1751,30 @@ pub fn commit_codeword_resident(
     transient: bool,
     hash: crate::DeviceHash,
 ) -> Result<(DeviceCodeword, [u8; 32])> {
+    commit_codeword_resident_placed(
+        store,
+        parts,
+        log_evals,
+        log_blowup,
+        log_folding,
+        transient,
+        hash,
+        LeafPlacement::Natural,
+    )
+}
+
+/// [`commit_codeword_resident`] with the tree's leaves in `placement`.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_codeword_resident_placed(
+    store: &crate::columns::DeviceColumns,
+    parts: &[(usize, usize)],
+    log_evals: usize,
+    log_blowup: usize,
+    log_folding: usize,
+    transient: bool,
+    hash: crate::DeviceHash,
+    placement: LeafPlacement,
+) -> Result<(DeviceCodeword, [u8; 32])> {
     commit_from(
         Source::Resident {
             store,
@@ -1670,6 +1785,7 @@ pub fn commit_codeword_resident(
         log_folding,
         transient,
         hash,
+        placement,
     )
 }
 
@@ -1686,13 +1802,23 @@ enum Source<'a> {
         parts: &'a [(usize, usize)],
         log_evals: usize,
     },
+    /// Slices of one device buffer: `(element offset in it, elements, offset
+    /// in the stack)` — a stack the card still holds after the borrow of its
+    /// store ended (`crate::whir_coset::StackSlices`).
+    Slices {
+        buffer: &'a CudaSlice<u64>,
+        parts: &'a [(usize, usize, usize)],
+        log_evals: usize,
+    },
 }
 
 impl Source<'_> {
     fn log_evals(&self) -> u64 {
         match self {
             Self::Whole(evals) => evals.len().trailing_zeros() as u64,
-            Self::Parts { log_evals, .. } | Self::Resident { log_evals, .. } => *log_evals as u64,
+            Self::Parts { log_evals, .. }
+            | Self::Resident { log_evals, .. }
+            | Self::Slices { log_evals, .. } => *log_evals as u64,
         }
     }
 
@@ -1717,8 +1843,61 @@ impl Source<'_> {
                 }
                 Ok(())
             }
+            Self::Slices { buffer, parts, .. } => copy_slices(stream, buffer, parts, coeffs),
         }
     }
+}
+
+/// Writes a stack of `coeffs.len()` elements from `parts` of `buffer` —
+/// `(element offset in buffer, elements, offset in the stack)` — and zeros
+/// between, on `stream`.
+pub(crate) fn copy_slices(
+    stream: &Arc<CudaStream>,
+    buffer: &CudaSlice<u64>,
+    parts: &[(usize, usize, usize)],
+    coeffs: &mut CudaSlice<u64>,
+) -> Result<()> {
+    ensure!(
+        parts
+            .iter()
+            .all(|&(at, len, offset)| at + len <= buffer.len() && offset + len <= coeffs.len())
+    );
+    stream.memset_zeros(coeffs)?;
+    let (src, _src_guard) = buffer.device_ptr(stream);
+    let (dst, _dst_guard) = cudarc::driver::DevicePtrMut::device_ptr_mut(coeffs, stream);
+    for &(at, len, offset) in parts {
+        // SAFETY: both ranges are inside allocations held here, checked above.
+        unsafe {
+            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                dst + (offset * 8) as u64,
+                src + (at * 8) as u64,
+                len * 8,
+                stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+    Ok(())
+}
+
+/// The codeword of a stack held as slices of one device buffer
+/// ([`copy_slices`]), with no tree: [`encode_codeword_resident`]'s values.
+pub fn encode_codeword_slices(
+    buffer: &CudaSlice<u64>,
+    parts: &[(usize, usize, usize)],
+    log_evals: usize,
+    log_blowup: usize,
+    transient: bool,
+) -> Result<DeviceCodeword> {
+    encode_from(
+        Source::Slices {
+            buffer,
+            parts,
+            log_evals,
+        },
+        log_blowup,
+        transient,
+    )
 }
 
 pub fn commit_codeword(
@@ -1734,6 +1913,7 @@ pub fn commit_codeword(
         log_folding,
         transient,
         hash,
+        LeafPlacement::Natural,
     )
 }
 
@@ -1743,6 +1923,7 @@ fn commit_from(
     log_folding: usize,
     transient: bool,
     hash: crate::DeviceHash,
+    placement: LeafPlacement,
 ) -> Result<(DeviceCodeword, [u8; 32])> {
     let log_n = source.log_evals() + log_blowup as u64;
     assert!(
@@ -1753,7 +1934,8 @@ fn commit_from(
         (1usize << log_n) >> log_folding >= 2,
         "tree needs at least two leaves"
     );
-    let codeword = encode_from(source, log_blowup, transient)?;
+    let mut codeword = encode_from(source, log_blowup, transient)?;
+    codeword.placement = placement;
     let root = codeword.commit(log_folding, hash)?;
     Ok((codeword, root))
 }
@@ -1836,6 +2018,7 @@ fn encode_from(source: Source<'_>, log_blowup: usize, transient: bool) -> Result
         leaves: Arc::new(Mutex::new(None)),
         room: Arc::new(room),
         registered: Arc::new(AtomicBool::new(false)),
+        placement: LeafPlacement::Natural,
     };
     Ok(codeword)
 }
@@ -1926,15 +2109,35 @@ pub fn encode_successor(
     message: &CudaSlice<u64>,
     len: usize,
 ) -> Result<DeviceCodeword> {
+    encode_successor_sized(
+        codeword.elements,
+        &codeword.room,
+        levels,
+        stream,
+        message,
+        len,
+    )
+}
+
+/// [`encode_successor`] of a codeword of `elements` values that need not
+/// exist: the successor's size is `elements >> levels`, and it lives inside
+/// `room` as a fold would. What a round-0 codeword evaluated coset by coset
+/// (`crate::whir_coset`) is succeeded by.
+pub fn encode_successor_sized(
+    elements: usize,
+    room: &Arc<crate::device::DeviceReservation>,
+    levels: usize,
+    stream: &Arc<CudaStream>,
+    message: &CudaSlice<u64>,
+    len: usize,
+) -> Result<DeviceCodeword> {
     assert!(len.is_power_of_two(), "the bound message spans a cube");
     assert!(message.len() >= len * 3, "three u64 per ext3 value");
     assert!(
-        codeword.elements >> levels >= len
-            && codeword.elements >> levels << levels == codeword.elements,
-        "{levels} folds of {} elements do not cover a message of {len}",
-        codeword.elements
+        elements >> levels >= len && elements >> levels << levels == elements,
+        "{levels} folds of {elements} elements do not cover a message of {len}"
     );
-    let n_out = codeword.elements >> levels;
+    let n_out = elements >> levels;
     let log_evals = len.trailing_zeros() as u64;
     let log_blowup = (n_out / len).trailing_zeros() as usize;
     assert_eq!(
@@ -1983,8 +2186,9 @@ pub fn encode_successor(
         builds: BuildCount::default(),
         leaf_passes: BuildCount::default(),
         leaves: Arc::new(Mutex::new(None)),
-        room: codeword.room.clone(),
+        room: room.clone(),
         registered: Arc::new(AtomicBool::new(false)),
+        placement: LeafPlacement::Natural,
     })
 }
 
@@ -2277,6 +2481,7 @@ pub fn fold_resident(
         // A fold is its own codeword for retention too: its own slot, its own
         // registry entry once it captures.
         registered: Arc::new(AtomicBool::new(false)),
+        placement: LeafPlacement::Natural,
     })
 }
 
@@ -2404,6 +2609,7 @@ pub fn fold_resident_fused(
         leaves: Arc::new(Mutex::new(None)),
         room: codeword.room.clone(),
         registered: Arc::new(AtomicBool::new(false)),
+        placement: LeafPlacement::Natural,
     })
 }
 
