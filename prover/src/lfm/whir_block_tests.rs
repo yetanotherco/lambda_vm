@@ -2527,6 +2527,17 @@ fn the_whir_block_tree_on_a_real_block() {
         multilinear::gpu::gkr_tree_refusals(),
         multilinear::gpu_fused::fused_declines(),
     );
+    // Only under the coset round-0 order, so every other run's lines are
+    // today's: the round-0 openings served from the stack and the codewords
+    // re-encoded after all.
+    if crate::zf_format::ZfFormat::global().whir_leaves == multilinear::whir_chain::LeafOrder::Coset
+    {
+        println!(
+            "W3 WHIR COSET: round-0 leaves in the coset order · openings from the stack {} · re-encoded {}",
+            multilinear::gpu::coset_openings(),
+            multilinear::gpu::coset_fallbacks(),
+        );
+    }
     // The precomputed trees the run downloaded on cache misses, by path, and
     // the staging pairs' waits (I-COPIES L1): the recursion's LFM proofs are
     // where they happen.
