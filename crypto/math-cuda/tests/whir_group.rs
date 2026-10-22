@@ -142,7 +142,16 @@ fn fold_scalars(g: FE, levels: usize) -> (u64, Vec<u64>) {
 /// `Σ_p scale_p·fold_p` of the same folds, value for value. A near miss — two
 /// scales exchanged — differs.
 fn the_combined_successor_is_the_scaled_sum(parts: usize, num_vars: usize, seed: u64) {
-    let log_blowup = 2;
+    the_combined_successor_is_the_scaled_sum_at(parts, num_vars, seed, 2);
+}
+
+/// [`the_combined_successor_is_the_scaled_sum`] at blowup `2^log_blowup`.
+fn the_combined_successor_is_the_scaled_sum_at(
+    parts: usize,
+    num_vars: usize,
+    seed: u64,
+    log_blowup: usize,
+) {
     let levels = 6;
     let mut rng = Rng(seed);
     let len = 1usize << num_vars;
@@ -203,6 +212,15 @@ fn the_combined_successor_is_the_scaled_sum(parts: usize, num_vars: usize, seed:
 fn a_combined_successor_is_the_eq_weighted_sum_of_the_folds() {
     for parts in 2..=4 {
         the_combined_successor_is_the_scaled_sum(parts, 14, 31 + parts as u64);
+    }
+}
+
+/// Blowup 2 (`LAMBDA_VM_ZF_WHIR_BLOWUP=2`): the same sum over codewords half
+/// as long.
+#[test]
+fn a_combined_successor_at_blowup_two_is_the_eq_weighted_sum_of_the_folds() {
+    for parts in 2..=4 {
+        the_combined_successor_is_the_scaled_sum_at(parts, 15, 41 + parts as u64, 1);
     }
 }
 

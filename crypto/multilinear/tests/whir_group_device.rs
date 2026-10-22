@@ -21,7 +21,8 @@
 //! Every path is asserted TAKEN in its arm by its counter, so a card that
 //! declined could not turn a comparison into one of the host with itself. One
 //! `#[test]`: the arms switch process-wide overrides, and parallel tests would
-//! race them.
+//! race them. Every case runs at blowup 4 and again at blowup 2
+//! (`LAMBDA_VM_ZF_WHIR_BLOWUP=2`).
 #![cfg(feature = "cuda")]
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
@@ -57,10 +58,11 @@ fn column(num_vars: usize, seed: u64) -> Mle<F> {
 }
 
 /// First6 then uniform4, caps on every tree, one chain per run of up to four
-/// polynomials; no grind, whose nonce is not reproducible across two searches.
-fn config() -> ChainConfig {
+/// polynomials, at blowup `2^log_blowup`; no grind, whose nonce is not
+/// reproducible across two searches.
+fn config(log_blowup: usize) -> ChainConfig {
     ChainConfig {
-        log_blowup: 2,
+        log_blowup,
         log_folding: 4,
         num_queries: 20,
         grind: GrindBits::default(),
@@ -88,6 +90,8 @@ struct Case {
     chains: u64,
     /// Whether the stack is wide enough for the card to take it at all.
     on_card: bool,
+    /// The case's blowup, `log2`.
+    log_blowup: usize,
 }
 
 fn case_of(name: &'static str, heights: &[usize], n_stack: usize, polys: usize) -> Case {
@@ -123,6 +127,18 @@ fn case_of(name: &'static str, heights: &[usize], n_stack: usize, polys: usize) 
         grouped_polys: grouped.iter().map(|run| run.len() as u64).sum(),
         chains: runs.len() as u64,
         on_card: n_stack >= 14,
+        log_blowup: 2,
+    }
+}
+
+/// `c` at blowup `2^log_blowup`: the card takes a stack whose codeword reaches
+/// its commit threshold (2^16 elements).
+fn at_blowup(c: Case, log_blowup: usize) -> Case {
+    let n_stack = c.layout.n_stack();
+    Case {
+        on_card: n_stack + log_blowup >= 16,
+        log_blowup,
+        ..c
     }
 }
 
@@ -269,14 +285,19 @@ fn prove_arm<H: WhirHash>(
     resident: Option<&gpu::ResidentColumns>,
 ) -> (Vec<u8>, Vec<[u8; 32]>) {
     force(arm);
-    let tag = format!("{} · {} · {arm:?}", c.name, H::NAME);
+    let tag = format!(
+        "{} · {} · {arm:?} · blowup 2^{}",
+        c.name,
+        H::NAME,
+        c.log_blowup
+    );
     let columns = multilinear::stacking::borrow(&c.columns);
     let before = counters();
     let stacked = StackedCommitment::<F, H>::commit(
         c.layout.clone(),
         &columns,
         resident.map(|s| (s, 0)),
-        &config(),
+        &config(c.log_blowup),
     )
     .unwrap();
     let proof = stacked_eval::prove::<F, Ext, _, H, _>(
@@ -285,7 +306,7 @@ fn prove_arm<H: WhirHash>(
         resident.map(|s| (s, 0)),
         &Claimed::PerColumn(&c.points),
         &c.values,
-        &config(),
+        &config(c.log_blowup),
         &mut sponge::<H>(),
     )
     .unwrap_or_else(|e| panic!("{tag}: the prover refused: {e:?}"));
@@ -297,7 +318,7 @@ fn prove_arm<H: WhirHash>(
         &Claimed::PerColumn(&c.points),
         &c.values,
         stacked.domain(),
-        &config(),
+        &config(c.log_blowup),
         &mut sponge::<H>(),
     )
     .unwrap_or_else(|e| panic!("{tag}: the host verifier refused: {e:?}"));
@@ -447,9 +468,10 @@ fn every_arm<H: WhirHash>(c: &Case) {
         }
     }
     println!(
-        "GROUPED PARITY {} · {}: {} chains ({} grouped over {} polynomials) · every arm the host's {} bytes",
+        "GROUPED PARITY {} · {} · blowup 2^{}: {} chains ({} grouped over {} polynomials) · every arm the host's {} bytes",
         c.name,
         H::NAME,
+        c.log_blowup,
         c.chains,
         c.grouped,
         c.grouped_polys,
@@ -489,6 +511,11 @@ fn a_grouped_chain_on_the_card_proves_the_hosts_bytes() {
     for c in &cases {
         every_arm::<P1Whir>(c);
         every_arm::<RpxWhir>(c);
+    }
+    // Blowup 2: the same cases, every arm the host's bytes again.
+    for c in cases.into_iter().map(|c| at_blowup(c, 1)) {
+        every_arm::<P1Whir>(&c);
+        every_arm::<RpxWhir>(&c);
     }
     release();
 }
