@@ -9,6 +9,7 @@
 //! LAMBDA_VM_ZF_WHIR_STACK  25 | 26 | 27                   WHIR stack cap, in variables (S2)
 //! LAMBDA_VM_ZF_WHIR_GRIND  query | all                    WHIR proof of work: before the queries only, or all three (P2)
 //! LAMBDA_VM_ZF_WHIR_GRIND_BITS  20 | 18               WHIR proof-of-work bits; Q buys back what the grind gives up
+//! LAMBDA_VM_ZF_WHIR_BLOWUP  4 | 2                     WHIR base code blowup (rate 1/4 or 1/2); Q follows from the rate
 //! ```
 //!
 //! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration:
@@ -16,7 +17,7 @@
 //! whir_grind_bits=18`. Each lever was measured net positive on block runs before it became the
 //! default. Every knob keeps its OFF spelling (`cap=off`, `whir_cap=off`,
 //! `fri=pair`, `one_row=0`, `whir_folds=uniform4`, `whir_stack=25`, `whir_grind=all`,
-//! `whir_grind_bits=20`), so setting all eight to off reproduces [`ZfFormat::LEGACY`] — the format before any lever, byte for
+//! `whir_grind_bits=20`, `whir_blowup=4` — the WHIR blowup's default is its off), so setting all nine to off reproduces [`ZfFormat::LEGACY`] — the format before any lever, byte for
 //! byte — for rollback and for A/B arms. The crypto crates' own defaults
 //! (`stark::proof::options::ProofFormat::DEFAULT`,
 //! `multilinear::whir_chain::ChainFormat::DEFAULT`) stay the legacy format: a
@@ -49,7 +50,9 @@
 //!
 //! **The banner prints on every setting, including the default**:
 //! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27 whir_grind=query
-//! whir_grind_bits=18`. Its absence in a log is then a fact about the run, not an ambiguity.
+//! whir_grind_bits=18`. Its absence in a log is then a fact about the run, not an ambiguity. The WHIR blowup
+//! is the one word printed only off its default (` whir_blowup=2`), so a default run's banner is the
+//! banner every earlier run printed.
 
 use std::sync::OnceLock;
 
@@ -69,19 +72,36 @@ pub const ENV_WHIR_FOLDS: &str = "LAMBDA_VM_ZF_WHIR_FOLDS";
 pub const ENV_WHIR_STACK: &str = "LAMBDA_VM_ZF_WHIR_STACK";
 pub const ENV_WHIR_GRIND: &str = "LAMBDA_VM_ZF_WHIR_GRIND";
 pub const ENV_WHIR_GRIND_BITS: &str = "LAMBDA_VM_ZF_WHIR_GRIND_BITS";
+pub const ENV_WHIR_BLOWUP: &str = "LAMBDA_VM_ZF_WHIR_BLOWUP";
 
 /// The uniform WHIR schedule's fold, as production configures it
 /// (`multilinear_prove::chain_config`); the banner spells the default
 /// `uniform4` after it.
 pub const PRODUCTION_WHIR_LOG_FOLDING: usize = 4;
 
-/// The WHIR chains' `log2` inverse rate, as production configures it
-/// (`multilinear_prove::chain_config_under`): blowup 4.
+/// The WHIR chains' `log2` inverse rate at the default
+/// ([`ZfFormat::whir_blowup`], `multilinear_prove::chain_config_under`): blowup 4.
 pub const PRODUCTION_WHIR_LOG_BLOWUP: usize = 2;
+
+/// The WHIR base code blowups `LAMBDA_VM_ZF_WHIR_BLOWUP` accepts: 4 (the default, today's
+/// format) and 2. The query count follows from the rate by the code's own rule
+/// (`multilinear::query_count::num_queries`): at the default fold schedule and
+/// 18 query-grind bits, blowup 2 charges Q 229 at every stack of 23 variables or
+/// more (seven rounds) and 228 below (five), where blowup 4 charges 114. Every
+/// phase keeps the conjectured (Johnson-regime) 128 bits: the binding phase is
+/// the unground fold at 27 variables, 130.393 → 130.344 per polynomial (128.393 →
+/// 128.344 under `GroupFold::Indexed`); the query phases move 130.907 → 130.946.
+/// The recursion's own proofs (`lfm::proof::aggregation_wrap_options`) do not
+/// read it. Widening this list is a format decision, not a parser one.
+pub const WHIR_BLOWUPS: [u8; 2] = [4, 2];
 
 // A grouped chain (D-ONECHAIN) is today's chain at `n + m` variables over
 // `H_{n+m+lb}`, which exists only within the field's two-adicity: at the widest
-// stack, the production blowup and the widest index, it must (REV-B2-B A-1).
+// stack, the widest accepted blowup and the widest index, it must (REV-B2-B A-1).
+// The production blowup is the widest the knob accepts.
+const _: () = assert!(
+    WHIR_BLOWUPS[0] == 1 << PRODUCTION_WHIR_LOG_BLOWUP && WHIR_BLOWUPS[1] < WHIR_BLOWUPS[0]
+);
 // `multilinear::stacked_eval` refuses any other config at run time.
 const _: () = assert!(
     multilinear::whir_chain::StackVars::WIDEST
@@ -133,6 +153,10 @@ pub struct ZfFormat {
     pub whir_grind: WhirGrind,
     /// How many bits each of those grinds spends.
     pub whir_grind_bits: u8,
+    /// The WHIR base code's blowup, one of [`WHIR_BLOWUPS`]: every base chain's
+    /// codeword is this many times its polynomial. 4 at the default and in the
+    /// legacy format.
+    pub whir_blowup: u8,
     /// The WHIR block's base hash and its arity-4 cap ([`BaseFormat`]): the
     /// block proof family's ([`crate::hash_pin::BlockFamily`]) at the
     /// default, and the only base the block path admits
@@ -242,6 +266,9 @@ impl ZfFormat {
     /// conjectured (Johnson) minimum stays 130.393 bits per polynomial (128.393
     /// under `GroupFold::Indexed`), at the unground fold (WHIR block base −0.90
     /// s, FAST 320). `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20` is its rollback.
+    /// `whir_blowup` stays 4, the legacy rate: blowup 2
+    /// (`LAMBDA_VM_ZF_WHIR_BLOWUP=2`, [`WHIR_BLOWUPS`]) is opt-in and has not
+    /// been measured as a default.
     pub const DEFAULT: Self = Self {
         cap: CapPolicy::Auto,
         whir_cap: CapPolicy::Auto,
@@ -251,10 +278,11 @@ impl ZfFormat {
         whir_stack: DEFAULT_WHIR_STACK,
         whir_grind: WhirGrind::Query,
         whir_grind_bits: PRODUCTION_WHIR_GRIND_BITS,
+        whir_blowup: 1 << PRODUCTION_WHIR_LOG_BLOWUP,
         base: crate::hash_pin::BLOCK_BASE,
     };
 
-    /// The legacy format: every lever off. What all eight knobs at their
+    /// The legacy format: every lever off. What all nine knobs at their
     /// OFF spellings select, what the crypto crates' own defaults are, and the
     /// only format the RV64 recursion guest verifies.
     pub const LEGACY: Self = Self {
@@ -266,6 +294,7 @@ impl ZfFormat {
         whir_stack: StackVars::LEGACY,
         whir_grind: WhirGrind::All,
         whir_grind_bits: LEGACY_WHIR_GRIND_BITS,
+        whir_blowup: 1 << PRODUCTION_WHIR_LOG_BLOWUP,
         base: crate::hash_pin::BLOCK_BASE,
     };
 
@@ -287,6 +316,7 @@ impl ZfFormat {
             && self.whir_stack == StackVars::LEGACY
             && self.whir_grind == WhirGrind::All
             && self.whir_grind_bits == LEGACY_WHIR_GRIND_BITS
+            && self.whir_blowup == 1 << PRODUCTION_WHIR_LOG_BLOWUP
             && self.base == crate::hash_pin::BLOCK_BASE
     }
 
@@ -296,7 +326,13 @@ impl ZfFormat {
         self.whir_grind.bits(self.whir_grind_bits)
     }
 
-    /// Parse the eight knobs through `lookup` (the process environment in
+    /// The WHIR base code's `log2` inverse rate: what
+    /// [`crate::multilinear_prove::chain_config_under`] builds the chains at.
+    pub const fn whir_log_blowup(&self) -> usize {
+        self.whir_blowup.trailing_zeros() as usize
+    }
+
+    /// Parse the nine knobs through `lookup` (the process environment in
     /// production, a map in tests). An unset knob is [`Self::DEFAULT`]'s value; a set one
     /// must be one of the accepted spellings (surrounding whitespace and case
     /// are ignored, as for `LAMBDA_VM_WHIR_HASH`).
@@ -332,6 +368,9 @@ impl ZfFormat {
         }
         if let Some(v) = get(ENV_WHIR_GRIND_BITS) {
             format.whir_grind_bits = parse_whir_grind_bits(&v)?;
+        }
+        if let Some(v) = get(ENV_WHIR_BLOWUP) {
+            format.whir_blowup = parse_whir_blowup(&v)?;
         }
         Ok(format)
     }
@@ -426,7 +465,11 @@ impl ZfFormat {
             self.whir_stack.get(),
             self.whir_grind,
             self.whir_grind_bits
-        ) + &if self.base == crate::hash_pin::BLOCK_BASE {
+        ) + &if self.whir_blowup == 1 << PRODUCTION_WHIR_LOG_BLOWUP {
+            String::new()
+        } else {
+            format!(" whir_blowup={}", self.whir_blowup)
+        } + &if self.base == crate::hash_pin::BLOCK_BASE {
             String::new()
         } else {
             format!(" base={:?}/c{}", self.base.hash, self.base.arity4_cap)
@@ -567,6 +610,24 @@ fn parse_whir_grind_bits(v: &str) -> Result<u8, String> {
         })
 }
 
+/// `4` | `2`.
+fn parse_whir_blowup(v: &str) -> Result<u8, String> {
+    WHIR_BLOWUPS
+        .iter()
+        .copied()
+        .find(|&b| v == b.to_string())
+        .ok_or_else(|| {
+            format!(
+                "{ENV_WHIR_BLOWUP}={v:?}: expected {}",
+                WHIR_BLOWUPS
+                    .iter()
+                    .map(|b| format!("`{b}`"))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            )
+        })
+}
+
 /// The stack caps the knob accepts: the three proved, verified and measured
 /// to fit on the 32 GiB card (block 25368371, E2c). Not 28: its argument's
 /// reservations would not fit the device ledger. Not below 25: nothing asks
@@ -623,6 +684,7 @@ mod tests {
                 whir_stack: StackVars::new(27).unwrap(),
                 whir_grind: WhirGrind::Query,
                 whir_grind_bits: 18,
+                whir_blowup: 4,
                 base: crate::hash_pin::BLOCK_BASE,
             }
         );
@@ -807,6 +869,13 @@ mod tests {
                 "{v:?}"
             );
         }
+        for (v, want) in [("4", 4u8), ("2", 2), (" 2 ", 2)] {
+            assert_eq!(
+                parse(&[(ENV_WHIR_BLOWUP, v)]).unwrap().whir_blowup,
+                want,
+                "{v:?}"
+            );
+        }
     }
 
     #[test]
@@ -858,6 +927,14 @@ mod tests {
             (ENV_WHIR_GRIND_BITS, "18.0"),
             (ENV_WHIR_GRIND_BITS, "off"),
             (ENV_WHIR_GRIND_BITS, "query"),
+            (ENV_WHIR_BLOWUP, ""),
+            (ENV_WHIR_BLOWUP, "1"),
+            (ENV_WHIR_BLOWUP, "8"),
+            (ENV_WHIR_BLOWUP, "0"),
+            (ENV_WHIR_BLOWUP, "02"),
+            (ENV_WHIR_BLOWUP, "2.0"),
+            (ENV_WHIR_BLOWUP, "half"),
+            (ENV_WHIR_BLOWUP, "off"),
         ] {
             let err = parse(&[(name, v)]).expect_err(&format!("{name}={v:?} must be refused"));
             assert!(err.contains(name), "{err}");
@@ -875,12 +952,13 @@ mod tests {
             whir_stack: StackVars::new(26).unwrap(),
             whir_grind: WhirGrind::All,
             whir_grind_bits: 18,
+            whir_blowup: 2,
             base: crate::hash_pin::BLOCK_BASE,
         };
         assert_eq!(
             f.banner(),
             "ZF FORMAT: cap=auto whir_cap=2 fri=dp one_row=auto whir_folds=first6 whir_stack=26 \
-             whir_grind=all whir_grind_bits=18"
+             whir_grind=all whir_grind_bits=18 whir_blowup=2"
         );
         // Every banner value is a spelling its knob accepts, back to the same
         // format.
@@ -899,6 +977,7 @@ mod tests {
             (ENV_WHIR_STACK, fields["whir_stack"]),
             (ENV_WHIR_GRIND, fields["whir_grind"]),
             (ENV_WHIR_GRIND_BITS, fields["whir_grind_bits"]),
+            (ENV_WHIR_BLOWUP, fields["whir_blowup"]),
         ])
         .unwrap();
         assert_eq!(back, f);
@@ -1219,6 +1298,105 @@ mod tests {
                 (today.log_blowup, today.log_folding, f.whir_grind_bits())
             );
             assert_ne!(c.fold_word(), today.fold_word());
+        }
+    }
+
+    /// ★ `LAMBDA_VM_ZF_WHIR_BLOWUP`: blowup 4 is the default and the legacy
+    /// format's, and the default banner does not name it. Blowup 2 moves the
+    /// chains' rate and the query count the rule charges for it, and nothing
+    /// else: not the WHIR format fields, not the univariate options the
+    /// recursion's proofs are built from.
+    #[test]
+    fn the_blowup_knob_moves_the_rate_and_the_rule_s_queries_only() {
+        use crate::multilinear_prove::chain_config_under;
+        assert_eq!(WHIR_BLOWUPS, [4, 2]);
+        assert_eq!(ZfFormat::DEFAULT.whir_blowup, 4);
+        assert_eq!(ZfFormat::LEGACY.whir_blowup, 4);
+        assert_eq!(
+            ZfFormat::DEFAULT.whir_log_blowup(),
+            PRODUCTION_WHIR_LOG_BLOWUP
+        );
+        assert_eq!(parse(&[(ENV_WHIR_BLOWUP, "4")]).unwrap(), ZfFormat::DEFAULT);
+        assert!(!ZfFormat::DEFAULT.banner().contains("whir_blowup"));
+
+        let half = parse(&[(ENV_WHIR_BLOWUP, "2")]).unwrap();
+        assert_eq!(half.whir_log_blowup(), 1);
+        assert!(half.unimplemented_levers().is_empty());
+        assert!(!half.is_legacy());
+        assert!(
+            half.banner().ends_with(" whir_grind_bits=18 whir_blowup=2"),
+            "{}",
+            half.banner()
+        );
+        assert_eq!(
+            ZfFormat {
+                whir_blowup: 4,
+                ..half
+            },
+            ZfFormat::DEFAULT,
+            "the knob moves the blowup and nothing else"
+        );
+        assert_eq!(half.chain_format(), ZfFormat::DEFAULT.chain_format());
+        assert_eq!(half.proof_format(), ZfFormat::DEFAULT.proof_format());
+        let lfm = || stark::proof::options::GoldilocksCubicProofOptions::with_blowup(4).unwrap();
+        assert_eq!(
+            format!("{:?}", half.options(lfm())),
+            format!("{:?}", ZfFormat::DEFAULT.options(lfm())),
+            "the recursion's proofs do not read the WHIR rate"
+        );
+        assert!(half.whir_schedule_line().contains(" q=229 "));
+
+        for n in WHIR_STACKS {
+            let stack = StackVars::new(n).unwrap();
+            let four = ZfFormat {
+                whir_stack: stack,
+                ..ZfFormat::DEFAULT
+            };
+            let two = ZfFormat {
+                whir_stack: stack,
+                ..half
+            };
+            for shapes in [
+                &[(1usize, n)][..],
+                &[(1, 27)][..],
+                &[(64, 21), (1480, 16), (8, 20)][..],
+            ] {
+                let c4 = chain_config_under(&four, shapes);
+                let c2 = chain_config_under(&two, shapes);
+                assert_eq!(
+                    (c4.log_blowup, c4.num_queries, c2.log_blowup, c2.num_queries),
+                    (2, 114, 1, 229),
+                    "stack {n}, shapes {shapes:?}"
+                );
+                assert_eq!(
+                    ChainConfig {
+                        log_blowup: c2.log_blowup,
+                        num_queries: c2.num_queries,
+                        ..c4
+                    },
+                    c2,
+                    "stack {n}, shapes {shapes:?}: only the rate and Q move"
+                );
+            }
+        }
+        // Every height a production chain reaches: Q from the rule at the worst
+        // round count up to that height, 229 from 23 variables (seven rounds at
+        // 27, six from 23) and 228 below (five rounds), where blowup 4 charges
+        // 114 throughout.
+        for n in 15..=27 {
+            let c4 = chain_config_under(&ZfFormat::DEFAULT, &[(1, n)]);
+            let c2 = chain_config_under(&half, &[(1, n)]);
+            let worst = (1..=n).map(|m| c2.rounds(m)).max().unwrap();
+            assert_eq!(
+                c2.num_queries,
+                multilinear::query_count::num_queries(1, worst, 128, 18),
+                "{n}"
+            );
+            assert_eq!(
+                (c4.num_queries, c2.num_queries),
+                (114, if n >= 23 { 229 } else { 228 }),
+                "{n}"
+            );
         }
     }
 
