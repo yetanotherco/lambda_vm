@@ -54,7 +54,7 @@
 use std::sync::OnceLock;
 
 use multilinear::whir_chain::{
-    ChainConfig, ChainFormat, FirstFold, GrindBits, NonceLayout, StackVars, WhirFolds,
+    ChainConfig, ChainFormat, FirstFold, GrindBits, LeafOrder, NonceLayout, StackVars, WhirFolds,
 };
 use stark::proof::options::{
     BaseFormat, CapPolicy, FriMode, OneRowMode, ProofFormat, ProofOptions,
@@ -69,6 +69,11 @@ pub const ENV_WHIR_FOLDS: &str = "LAMBDA_VM_ZF_WHIR_FOLDS";
 pub const ENV_WHIR_STACK: &str = "LAMBDA_VM_ZF_WHIR_STACK";
 pub const ENV_WHIR_GRIND: &str = "LAMBDA_VM_ZF_WHIR_GRIND";
 pub const ENV_WHIR_GRIND_BITS: &str = "LAMBDA_VM_ZF_WHIR_GRIND_BITS";
+/// Where the WHIR round-0 trees put their leaves: `natural` (the default) or
+/// `coset` (block `j` at `bitrev(j)`, so a prover evaluates its openings from
+/// the polynomial instead of re-encoding it). A proof format: the roots, the
+/// paths and the in-guest walks follow it. Poseidon1 trees only.
+pub const ENV_WHIR_LEAVES: &str = "LAMBDA_VM_ZF_WHIR_LEAVES";
 
 /// The uniform WHIR schedule's fold, as production configures it
 /// (`multilinear_prove::chain_config`); the banner spells the default
@@ -133,6 +138,8 @@ pub struct ZfFormat {
     pub whir_grind: WhirGrind,
     /// How many bits each of those grinds spends.
     pub whir_grind_bits: u8,
+    /// Where the WHIR round-0 trees put their leaves ([`ENV_WHIR_LEAVES`]).
+    pub whir_leaves: LeafOrder,
     /// The WHIR block's base hash and its arity-4 cap ([`BaseFormat`]): the
     /// block proof family's ([`crate::hash_pin::BlockFamily`]) at the
     /// default, and the only base the block path admits
@@ -252,6 +259,7 @@ impl ZfFormat {
         whir_grind: WhirGrind::Query,
         whir_grind_bits: PRODUCTION_WHIR_GRIND_BITS,
         base: crate::hash_pin::BLOCK_BASE,
+        whir_leaves: LeafOrder::Natural,
     };
 
     /// The legacy format: every lever off. What all eight knobs at their
@@ -267,6 +275,7 @@ impl ZfFormat {
         whir_grind: WhirGrind::All,
         whir_grind_bits: LEGACY_WHIR_GRIND_BITS,
         base: crate::hash_pin::BLOCK_BASE,
+        whir_leaves: LeafOrder::Natural,
     };
 
     /// This format with `base` as the WHIR block's base hash. The block path
@@ -287,6 +296,7 @@ impl ZfFormat {
             && self.whir_stack == StackVars::LEGACY
             && self.whir_grind == WhirGrind::All
             && self.whir_grind_bits == LEGACY_WHIR_GRIND_BITS
+            && self.whir_leaves == LeafOrder::Natural
             && self.base == crate::hash_pin::BLOCK_BASE
     }
 
@@ -333,7 +343,33 @@ impl ZfFormat {
         if let Some(v) = get(ENV_WHIR_GRIND_BITS) {
             format.whir_grind_bits = parse_whir_grind_bits(&v)?;
         }
+        if let Some(v) = get(ENV_WHIR_LEAVES) {
+            format.whir_leaves = match v.as_str() {
+                "natural" => LeafOrder::Natural,
+                "coset" => LeafOrder::Coset,
+                _ => {
+                    return Err(format!(
+                        "{ENV_WHIR_LEAVES}={v:?}: expected `natural` or `coset`"
+                    ));
+                }
+            };
+        }
+        format.check_leaves()?;
         Ok(format)
+    }
+
+    /// Refuses a round-0 leaf order the base's trees do not take: the coset
+    /// order is Poseidon1's alone (the block's base and recursion hash), so
+    /// under any other base it is refused by name before anything is built.
+    pub fn check_leaves(&self) -> Result<(), String> {
+        match (self.whir_leaves, self.base.hash) {
+            (LeafOrder::Natural, _)
+            | (LeafOrder::Coset, stark::config::CommitmentHash::Poseidon1) => Ok(()),
+            (LeafOrder::Coset, hash) => Err(format!(
+                "{ENV_WHIR_LEAVES}=coset: the coset leaf order is defined for Poseidon1 trees \
+                 only, and the base hash is {hash:?}"
+            )),
+        }
     }
 
     /// [`from_lookup`](Self::from_lookup) over the process environment. A
@@ -430,6 +466,10 @@ impl ZfFormat {
             String::new()
         } else {
             format!(" base={:?}/c{}", self.base.hash, self.base.arity4_cap)
+        } + match self.whir_leaves {
+            // Printed only when set, so the default banner is today's.
+            LeafOrder::Natural => "",
+            LeafOrder::Coset => " whir_leaves=coset",
         }
     }
 
@@ -482,9 +522,7 @@ impl ZfFormat {
             // The block's own constant (`BlockFormat::group`), set where the
             // block builds its config: every other path opens per polynomial.
             group: multilinear::whir_chain::GroupFold::PerPoly,
-            // No knob yet: the card commits and the in-guest verifier place
-            // round-0 leaves in natural order only.
-            leaves: multilinear::whir_chain::LeafOrder::Natural,
+            leaves: self.whir_leaves,
         }
     }
 
@@ -627,6 +665,7 @@ mod tests {
                 whir_grind: WhirGrind::Query,
                 whir_grind_bits: 18,
                 base: crate::hash_pin::BLOCK_BASE,
+                whir_leaves: LeafOrder::Natural,
             }
         );
         assert_eq!(
@@ -636,6 +675,48 @@ mod tests {
         );
         assert!(!f.is_legacy());
         assert!(f.unimplemented_levers().is_empty());
+    }
+
+    /// The round-0 leaf order: natural unless set, `coset` in any case and
+    /// spacing, nothing else accepted. Coset moves the chain format, its fold
+    /// word and the banner (which prints the knob only when set); and it is
+    /// refused by name under a base whose trees are not Poseidon1.
+    #[test]
+    fn the_leaf_order_knob_selects_the_coset_order_on_poseidon1_alone() {
+        assert_eq!(parse(&[]).unwrap().whir_leaves, LeafOrder::Natural);
+        assert_eq!(
+            parse(&[(ENV_WHIR_LEAVES, "natural")]).unwrap(),
+            ZfFormat::DEFAULT
+        );
+        let coset = parse(&[(ENV_WHIR_LEAVES, " Coset ")]).unwrap();
+        assert_eq!(coset.whir_leaves, LeafOrder::Coset);
+        assert_eq!(coset.chain_format().leaves, LeafOrder::Coset);
+        assert!(!coset.is_legacy());
+        assert_eq!(
+            coset.banner(),
+            format!("{} whir_leaves=coset", ZfFormat::DEFAULT.banner())
+        );
+        let cfg = |f: &ZfFormat| crate::multilinear_prove::chain_config_under(f, &[(1, 27)]);
+        assert_eq!(
+            cfg(&coset).fold_word(),
+            cfg(&ZfFormat::DEFAULT).fold_word()
+                | multilinear::whir_chain::FOLD_WORD_TAG
+                | multilinear::whir_chain::FOLD_WORD_COSET
+        );
+        for bad in ["", "bitrev", "reversed", "1", "on"] {
+            let err = parse(&[(ENV_WHIR_LEAVES, bad)]).unwrap_err();
+            assert!(err.contains("`natural` or `coset`"), "{bad:?}: {err}");
+        }
+        assert_eq!(coset.check_leaves(), Ok(()));
+        let err = coset.with_base(BaseFormat::RPX).check_leaves().unwrap_err();
+        assert!(
+            err.contains("Poseidon1") && err.contains(ENV_WHIR_LEAVES),
+            "{err}"
+        );
+        assert_eq!(
+            ZfFormat::DEFAULT.with_base(BaseFormat::RPX).check_leaves(),
+            Ok(())
+        );
     }
 
     /// Every knob keeps its OFF spelling, and all seven at off are the legacy
@@ -879,6 +960,7 @@ mod tests {
             whir_grind: WhirGrind::All,
             whir_grind_bits: 18,
             base: crate::hash_pin::BLOCK_BASE,
+            whir_leaves: LeafOrder::Natural,
         };
         assert_eq!(
             f.banner(),
