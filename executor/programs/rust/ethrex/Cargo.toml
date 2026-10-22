@@ -1,11 +1,13 @@
 [workspace]
 
-# Thin LTO measurably lowers executed guest cycles (~2.3% on the committed
-# ethrex_bench fixtures) at a small ELF-size cost, which is free in this VM
-# (execution is priced per executed instruction, not by ELF size). Cargo's
-# release default is lto = false / codegen-units = 16.
+# Whole-program optimisation: fat LTO over one codegen unit. On mainnet block
+# 25475471 the guest executes 5.5 % fewer instructions than with thin LTO and 16
+# units (one unit alone gives 4.8 %), and the ELF is smaller; the guest build
+# takes about three times as long. Execution is priced per executed instruction,
+# not by ELF size. Cargo's release default is lto = false / codegen-units = 16.
 [profile.release]
-lto = "thin"
+lto = "fat"
+codegen-units = 1
 
 [package]
 name = "ethrex"
@@ -13,7 +15,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-lambda-vm-syscalls = { path = "../../../../syscalls" }
+# `fast-memcpy`: the runtime's 32-bytes-an-iteration `memcpy` instead of
+# compiler_builtins' (see syscalls/src/entrypoint.rs for its contract).
+lambda-vm-syscalls = { path = "../../../../syscalls", features = ["fast-memcpy"] }
 # LambdaVM crypto provider (keccak + ECSM-accelerated ecrecover), defined in the
 # lambda_vm repo and injected in src/main.rs — so crypto changes stay in our repo
 # and don't require an ethrex PR.

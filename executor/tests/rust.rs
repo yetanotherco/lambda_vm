@@ -161,6 +161,7 @@ fn test_commit() {
     );
 }
 
+const ETHREX_ELF: &str = "./program_artifacts/rust/ethrex.elf";
 const MEM_SWEEP_ELF: &str = "./program_artifacts/rust/mem_sweep.elf";
 
 /// How the runtime's `memcpy` (syscalls' `fast-memcpy` feature) starts: `mv t0, a0`
@@ -288,6 +289,27 @@ fn test_mem_sweep() {
         "the sweep spent {in_memmove} instructions inside memmove (at most \
          {SWEEP_MEMMOVE_MAX}): compiler_builtins' `mem-unaligned` setting is not in effect"
     );
+}
+
+/// The guest every block proof is about links the very `memcpy` and `memmove` that
+/// `test_mem_sweep` exercises: the same instruction words in both ELFs.
+#[test]
+fn test_ethrex_links_the_swept_memory_routines() {
+    let ethrex = std::fs::read(ETHREX_ELF).unwrap();
+    let sweep = std::fs::read(MEM_SWEEP_ELF).unwrap();
+    let (_, memcpy) = function_in(&ethrex, "memcpy");
+    assert_eq!(
+        memcpy[..2],
+        FAST_MEMCPY_HEAD,
+        "the ethrex guest does not link the runtime's memcpy"
+    );
+    for name in ["memcpy", "memmove"] {
+        assert_eq!(
+            body_of(&ethrex, name).1,
+            body_of(&sweep, name).1,
+            "`{name}` differs between the ethrex guest and the sweep guest"
+        );
+    }
 }
 
 #[test]
