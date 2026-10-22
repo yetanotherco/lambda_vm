@@ -2557,6 +2557,67 @@ fn a_chain_ground_at_fewer_bits_is_refused_by_the_stricter_verifier() {
     }
 }
 
+/// ★ The base code's rate (`LAMBDA_VM_ZF_WHIR_BLOWUP`) is a verifier constant,
+/// at a test width, under today's chain format and the production one (first6,
+/// the auto cap, one nonce a round): a chain committed at one blowup executes on
+/// the machine built for its own config, and both the host and the machine built
+/// for the other blowup refuse it, each way round. Under the other rate every
+/// tree is a level deeper or shallower, so the machine's arena (a verifier
+/// constant) no longer fits the proof's paths.
+#[test]
+fn a_chain_at_one_blowup_is_refused_by_the_verifier_at_the_other() {
+    let formats = [
+        ("today's chain format", query_only_config(4, 2).format),
+        (
+            "the production chain format",
+            crate::zf_format::ZfFormat::DEFAULT.chain_format(),
+        ),
+    ];
+    for (label, format) in formats {
+        let at = |log_blowup: usize| ChainConfig {
+            log_blowup,
+            format,
+            ..query_only_config(4, 2)
+        };
+        for num_vars in [6usize, 9] {
+            for (own, other) in [(1usize, 2usize), (2, 1)] {
+                let tag = format!("{label}, S={num_vars}, blowup 2^{own}");
+                let cfg = at(own);
+                let f = fixture_with(&cfg, num_vars);
+                assert_eq!(f.domain.log_size(), num_vars + own, "{tag}");
+                assert!(host_accepts(&f, &cfg, &f.proof), "{tag}: the control");
+                assert!(
+                    machine_accepts(&chain_program(&f.shape), chain_arena(&f, &f.proof)),
+                    "{tag}: the honest proof must execute"
+                );
+
+                let wrong = at(other);
+                let domain = Domain::<F>::new(num_vars + other).expect("the other rate's domain");
+                let mut t = Recording::new();
+                assert!(
+                    verify::<F, E, _, RpxWhir>(
+                        &f.proof,
+                        &f.root_bytes,
+                        &f.z,
+                        f.y,
+                        &domain,
+                        &wrong,
+                        &mut t
+                    )
+                    .is_err(),
+                    "{tag}: the host at blowup 2^{other} must refuse it"
+                );
+                let shape = ChainShape::new(&wrong, num_vars);
+                assert_ne!(shape.domain_log, f.shape.domain_log, "{tag}");
+                assert!(
+                    !machine_accepts(&chain_program(&shape), chain_arena_as(&shape, &f, &f.proof)),
+                    "{tag}: the machine at blowup 2^{other} must refuse it"
+                );
+            }
+        }
+    }
+}
+
 /// ★ An unspent nonce has no word in the arena. Under `Spent`, a set folding or
 /// out-of-domain nonce, in any round and the last round's out-of-domain slot
 /// included, is refused by the host and cannot reach the machine: the arena

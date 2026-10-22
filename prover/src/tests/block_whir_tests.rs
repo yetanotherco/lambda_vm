@@ -154,6 +154,74 @@ fn a_block_ground_at_18_bits_is_refused_by_a_verifier_at_20() {
     );
 }
 
+/// ★ `LAMBDA_VM_ZF_WHIR_BLOWUP` on the block: the base code's rate, and the Q
+/// the rule charges for it, are the verifier's constants, never the proof's. A
+/// block at blowup 2 verifies under blowup 2 and is refused by a verifier at
+/// blowup 4; a block at blowup 4 is refused by a verifier at blowup 2.
+#[test]
+fn a_block_at_blowup_2_is_refused_by_a_verifier_at_blowup_4() {
+    let at = |blowup: u8| BlockFormat {
+        zf: ZfFormat {
+            whir_blowup: blowup,
+            ..many_groups().zf
+        },
+        ..many_groups()
+    };
+    let (c4, c2) = (
+        at(4).chain_config(&[(1, 27)]),
+        at(2).chain_config(&[(1, 27)]),
+    );
+    assert_eq!(
+        (c4.log_blowup, c4.num_queries, c2.log_blowup, c2.num_queries),
+        (2, 114, 1, 229)
+    );
+    let elf = asm_elf_bytes("sub");
+    let options = options(MaxRowsConfig::small(), 3);
+    let half = prove(&elf, &at(2), &options);
+    assert!(verify(&half, &elf, &at(2)), "the control at blowup 2");
+    assert!(
+        !verify(&half, &elf, &at(4)),
+        "a verifier at blowup 4 must refuse a block at blowup 2"
+    );
+    let today = prove(&elf, &at(4), &options);
+    assert!(verify(&today, &elf, &at(4)), "the control at blowup 4");
+    assert!(
+        !verify(&today, &elf, &at(2)),
+        "a verifier at blowup 2 must refuse a block at blowup 4"
+    );
+}
+
+/// The bytes of a small block at each blowup, for a comparison across builds:
+/// a card build and a host build of one sha, each run as its own process under
+/// `LAMBDA_VM_FIXED_TRACE_HASH=1` and `LAMBDA_VM_DETERMINISTIC_GRIND=1`, must
+/// print the same `RATE BLOCK DIGEST` lines (the card's commit, folds,
+/// successors and openings prove the host's bytes at blowup 2 as at 4). Each
+/// proof also verifies here.
+#[test]
+#[ignore = "prints proof digests for a comparison across builds; box tier"]
+fn a_block_at_each_blowup_prints_its_proof_bytes() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let options = options(MaxRowsConfig::small(), 16);
+    for blowup in crate::zf_format::WHIR_BLOWUPS {
+        let format = BlockFormat {
+            zf: ZfFormat {
+                whir_blowup: blowup,
+                ..many_groups().zf
+            },
+            ..many_groups()
+        };
+        let proof = prove(&elf, &format, &options);
+        assert!(verify(&proof, &elf, &format), "blowup {blowup}");
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof).expect("serialize");
+        println!(
+            "RATE BLOCK DIGEST blowup={blowup} groups={} bytes={} blake3={}",
+            groups_of(&proof),
+            bytes.len(),
+            &blake3::hash(&bytes).to_hex()[..32]
+        );
+    }
+}
+
 /// The block's shape: many chunks of every table, spread over several groups,
 /// each argued and opened on its own fork.
 #[test]

@@ -2908,6 +2908,66 @@ fn a_block_leaf_at_20_bits_refuses_a_block_ground_at_18() {
         .expect("the leaf at 20 executes over a block at 20");
 }
 
+/// ★ The base code's rate (`LAMBDA_VM_ZF_WHIR_BLOWUP`) is a verifier constant
+/// on the block's recursion too: the statement, the domains, the tree depths
+/// and Q are the leaf program's constants. Each way round, the plan at the
+/// block's own blowup emits a leaf that executes over it, and the plan at the
+/// other blowup is another statement whose leaf refuses the same proof — at its
+/// arena (other path lengths and Q) or in its execution, never at the hasher
+/// (every leaf runs on the family's socket). The line `RATE LEAF REFUSAL:`
+/// says where.
+#[test]
+#[ignore = "executes block leaves over small block proofs; box tier"]
+fn a_block_leaf_at_one_blowup_refuses_a_block_at_the_other() {
+    let at = |blowup: u8| BlockFormat {
+        zf: ZfFormat {
+            whir_blowup: blowup,
+            ..small_format().zf
+        },
+        ..small_format()
+    };
+    for (own, other) in [(2u8, 4u8), (4, 2)] {
+        let (elf, proof) = small_block("test_commit_4", &at(own));
+        let plan = plan_of(&elf, &proof, &at(own), Some(1));
+        run_leaf(&plan, &proof, 0, LeafChecks::ALL)
+            .unwrap_or_else(|e| panic!("the leaf at blowup {own} executes over its block: {e}"));
+
+        let wrong = plan_of(&elf, &proof, &at(other), Some(1));
+        assert_ne!(
+            wrong.id(),
+            plan.id(),
+            "the statement at blowup {other} is another statement"
+        );
+        let program =
+            leaf_program_with(&wrong, 0, LeafChecks::ALL).expect("the leaf at the other blowup");
+        let socket = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
+        let refusal = match block_leaf_arena(&wrong, &proof, 0) {
+            Err(e) => format!("the arena: {e}"),
+            Ok(arenas) if program.arena_schema.lens != vec![arenas[0].len() as u32] => format!(
+                "the arena's length: {} words for a leaf hinting {:?}",
+                arenas[0].len(),
+                program.arena_schema.lens
+            ),
+            Ok(arenas) => match execute(&program, &arenas, &socket) {
+                Err(e) => {
+                    assert!(
+                        !matches!(
+                            e,
+                            super::executor::LfmExecError::HasherRejected(_)
+                                | super::executor::LfmExecError::Internal(_)
+                        ),
+                        "the leaf at blowup {other} refused for another reason than the \
+                         proof: {e:?}"
+                    );
+                    format!("the execution: {e:?}")
+                }
+                Ok(_) => panic!("a leaf at blowup {other} executed over a block at blowup {own}"),
+            },
+        };
+        println!("RATE LEAF REFUSAL: a block at blowup {own}, a leaf at {other}: {refusal}");
+    }
+}
+
 /// I-GRIND2 instrument (not a gate): a block group's in-guest opening cost
 /// ([`super::whir_stacked::stacked_verify_cost`], what the plan charges a
 /// group for its stacked opening and each prepared one) at 20 grind bits
