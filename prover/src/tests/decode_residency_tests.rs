@@ -505,7 +505,7 @@ struct Arm {
 /// guest. A name in the output is a display; the sha is the measurement.
 ///
 /// ```text
-/// LAMBDA_VM_ONE_COMMIT_ELF=ethrex_8f826601 cargo test --release \
+/// LAMBDA_VM_ONE_COMMIT_ELF=ethrex_3e8f1ce1 cargo test --release \
 ///     -p lambda-vm-prover --lib --features cuda \
 ///     tests::decode_residency_tests::the_one_commit_cost -- --exact --ignored --nocapture
 /// ```

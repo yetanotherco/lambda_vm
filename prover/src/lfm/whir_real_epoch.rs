@@ -269,9 +269,10 @@ pub(crate) fn real_epoch_from_whir_continuation(
 /// commitment, and it feeds `verify_epoch_bookend`.
 ///
 /// `prepared` is `Some` so a walk over every epoch derives DECODE's prepared
-/// commitment ONCE per bundle rather than once per epoch — fifteen derivations
-/// to one on the block, the same saving `decode_commitment` exists for on the
-/// STARK driver. `None` derives it here, exactly as before.
+/// commitment ONCE per bundle rather than once per epoch — twelve derivations
+/// to one on the block (fifteen on the guest of the measurement below), the
+/// same saving `decode_commitment` exists for on the STARK driver. `None`
+/// derives it here, exactly as before.
 ///
 /// ⚠ AND THE SIZE OF IT, SO NOBODY REACHES FOR IT AS A LEVER. The derivation
 /// costs ≈0.08 s per call on the card — rs4 on FAST at the 8f826601 fixture,
