@@ -362,6 +362,63 @@ fn an_indexed_coset_block_is_refused_by_a_natural_verifier() {
     );
 }
 
+/// ★ The composed format at the block: one chain a run, the coset round-0
+/// order and blowup 2, under the batched argue at the production budget. A
+/// block proved in it verifies, and is refused by the verifier of each format
+/// one setting away — blowup 4, the natural order, one chain a polynomial —
+/// and a block one setting away (the natural order) is refused by the composed
+/// verifier. Each setting is a verifier constant; the proof carries none.
+#[test]
+fn a_composed_block_is_refused_one_setting_away() {
+    use multilinear::whir_chain::LeafOrder;
+    let elf = asm_elf_bytes("all_instructions_64");
+    let opts = ProofOptions::default_test_options();
+    let at = |group: GroupFold, leaves: LeafOrder, blowup: u8| {
+        let mut f = format(
+            crate::hash_pin::BLOCK_BASE,
+            block_whir::BLOCK_GROUP_POLYS,
+            group,
+            ArgueFormat::BATCHED,
+        );
+        f.zf.whir_leaves = leaves;
+        f.zf.whir_blowup = blowup;
+        f
+    };
+    let verify = |proof: &BlockWhirProof, format: &BlockFormat| {
+        block_whir::verify_block_whir(proof, &elf, &opts, format).unwrap_or(false)
+    };
+    let composed = at(GroupFold::Indexed, LeafOrder::Coset, 2);
+    let proof = prove(&elf, &composed, MaxRowsConfig::small());
+    assert!(
+        grouped_widths(&proof).iter().any(|&w| w >= 2),
+        "a grouped chain in the composed block"
+    );
+    assert!(verify(&proof, &composed), "the composed format's control");
+    for (label, other) in [
+        ("blowup 4", at(GroupFold::Indexed, LeafOrder::Coset, 4)),
+        (
+            "the natural order",
+            at(GroupFold::Indexed, LeafOrder::Natural, 2),
+        ),
+        (
+            "one chain a polynomial",
+            at(GroupFold::PerPoly, LeafOrder::Coset, 2),
+        ),
+    ] {
+        assert!(
+            !verify(&proof, &other),
+            "a verifier at {label} must refuse the composed block"
+        );
+    }
+    let natural = at(GroupFold::Indexed, LeafOrder::Natural, 2);
+    let neighbour = prove(&elf, &natural, MaxRowsConfig::small());
+    assert!(verify(&neighbour, &natural), "the natural order's control");
+    assert!(
+        !verify(&neighbour, &composed),
+        "the composed verifier must refuse a block in the natural order"
+    );
+}
+
 /// The round trip and the cross-mode refusals at each budget of `budgets`
 /// polynomials a group, under `argue`; returns the grouped run widths seen.
 fn round_trips_and_refuses_the_other_mode(
