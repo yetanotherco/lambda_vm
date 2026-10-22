@@ -741,6 +741,59 @@ fn host_accepts_under(f: &Fixture, roots: &[Commitment], proof: &StackedProof<F,
     }
 }
 
+/// ★ The composed format at laptop width — one chain a run, the coset round-0
+/// order and blowup 2 (`LAMBDA_VM_ZF_WHIR_LEAVES=coset`,
+/// `LAMBDA_VM_ZF_WHIR_BLOWUP=2`): every Poseidon1 case executes on the machine
+/// built for it over a proof the host accepts, and the host and the machine of
+/// each format one setting away — the coset order at blowup 4, the natural
+/// order at blowup 2 — refuse it over its roots.
+#[test]
+fn grouped_openings_under_the_composed_format_execute_and_are_refused_one_setting_away() {
+    for case in cases().into_iter().filter(|c| c.base == Base::P1) {
+        let composed = fixture(&in_order(&at_blowup(&case, 1), LeafOrder::Coset));
+        assert_eq!(
+            composed.domain.log_size(),
+            composed.layout.n_stack() + 1,
+            "{}: blowup 2",
+            composed.name
+        );
+        assert_eq!(composed.shape.leaves, LeafOrder::Coset);
+        machine_runs(
+            &composed,
+            &program(&composed),
+            arena(&composed, &composed.proof),
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "{}: the machine under the composed format refused an accepted proof: {e}",
+                composed.name
+            )
+        });
+        let coset_four = fixture(&in_order(&case, LeafOrder::Coset));
+        let natural_two = fixture(&at_blowup(&case, 1));
+        for (label, verifier) in [
+            ("the coset order at blowup 4", &coset_four),
+            ("the natural order at blowup 2", &natural_two),
+        ] {
+            assert!(
+                !host_accepts_under(verifier, &composed.roots, &composed.proof),
+                "{}: {label} (host)",
+                case.name
+            );
+            assert!(
+                machine_runs(
+                    verifier,
+                    &program(verifier),
+                    arena_under(verifier, &composed.roots, &composed.proof)
+                )
+                .is_err(),
+                "{}: {label} (machine)",
+                case.name
+            );
+        }
+    }
+}
+
 /// ★ The coset round-0 leaf order (`LAMBDA_VM_ZF_WHIR_LEAVES`, Poseidon1 only)
 /// under `Indexed`: every Poseidon1 case — a run of three at the C2 cap, a
 /// split group — executes on the machine built for it over a proof the host
