@@ -3175,6 +3175,64 @@ fn an_indexed_blocks_leaves_execute_under_the_batched_argue() {
     indexed_leaves_execute_and_refuse_a_grouped_forgery(ArgueFormat::BATCHED);
 }
 
+/// ★ The base code's rate is the leaf's constant under one chain a run too, at
+/// the batched argue (the composed format): each way round, every leaf of the
+/// plan at the block's own blowup executes, and the plan at the other blowup —
+/// another statement — has a first leaf that refuses the block at its arena or
+/// in its execution, never at the hasher. The line `RATE INDEXED LEAF REFUSAL:`
+/// says where.
+#[test]
+#[ignore = "executes block leaves over small block proofs; box tier"]
+fn an_indexed_blocks_leaves_at_one_blowup_refuse_a_block_at_the_other() {
+    let at = |blowup: u8| {
+        let mut f = indexed_format(crate::hash_pin::BLOCK_BASE, ArgueFormat::BATCHED);
+        f.zf.whir_blowup = blowup;
+        f
+    };
+    for (own, other) in [(2u8, 4u8), (4, 2)] {
+        let (elf, proof) = small_block("all_instructions_64", &at(own));
+        let plan = plan_of(&elf, &proof, &at(own), Some(2));
+        for k in 0..plan.partition().num_leaves() {
+            run_leaf(&plan, &proof, k, LeafChecks::ALL).unwrap_or_else(|e| {
+                panic!("leaf {k} at blowup {own} executes over its Indexed block: {e}")
+            });
+        }
+        let wrong = plan_of(&elf, &proof, &at(other), Some(2));
+        assert_ne!(wrong.id(), plan.id(), "another statement at blowup {other}");
+        let program =
+            leaf_program_with(&wrong, 0, LeafChecks::ALL).expect("the leaf at the other blowup");
+        let socket = program.hasher(<BlockFamily as ProofFamily>::SOCKET);
+        let refusal = match block_leaf_arena(&wrong, &proof, 0) {
+            Err(e) => format!("the arena: {e}"),
+            Ok(arenas) if program.arena_schema.lens != vec![arenas[0].len() as u32] => format!(
+                "the arena's length: {} words for a leaf hinting {:?}",
+                arenas[0].len(),
+                program.arena_schema.lens
+            ),
+            Ok(arenas) => match execute(&program, &arenas, &socket) {
+                Err(e) => {
+                    assert!(
+                        !matches!(
+                            e,
+                            super::executor::LfmExecError::HasherRejected(_)
+                                | super::executor::LfmExecError::Internal(_)
+                        ),
+                        "the leaf at blowup {other} refused for another reason than the \
+                         proof: {e:?}"
+                    );
+                    format!("the execution: {e:?}")
+                }
+                Ok(_) => panic!(
+                    "an Indexed leaf at blowup {other} executed over a block at blowup {own}"
+                ),
+            },
+        };
+        println!(
+            "RATE INDEXED LEAF REFUSAL: a block at blowup {own}, a leaf at {other}: {refusal}"
+        );
+    }
+}
+
 /// ★ The group opening is the leaf's constant too: a plan derived for the
 /// other mode, over a block proved under one, has no leaf that executes the
 /// proof's groups — the leaf programs of one mode refuse the other mode's

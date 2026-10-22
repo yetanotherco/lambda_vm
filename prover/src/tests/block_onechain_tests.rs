@@ -259,6 +259,54 @@ fn an_indexed_block_round_trips_under_the_batched_argue() {
     );
 }
 
+/// ★ The base code's rate (`LAMBDA_VM_ZF_WHIR_BLOWUP`) under one chain a run
+/// and the batched argue — the composed format, at the production budget of
+/// three polynomials a group: a block at blowup 2 has grouped chains and
+/// verifies; a verifier at blowup 4 refuses it, and a verifier at blowup 2
+/// refuses a block at blowup 4; and at blowup 2 a per-polynomial verifier
+/// refuses the grouped block.
+#[test]
+fn an_indexed_block_at_blowup_2_is_refused_by_a_verifier_at_blowup_4() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let opts = ProofOptions::default_test_options();
+    let at = |blowup: u8, group: GroupFold| {
+        let mut f = format(
+            crate::hash_pin::BLOCK_BASE,
+            block_whir::BLOCK_GROUP_POLYS,
+            group,
+            ArgueFormat::BATCHED,
+        );
+        f.zf.whir_blowup = blowup;
+        f
+    };
+    let verify = |proof: &BlockWhirProof, format: &BlockFormat| {
+        block_whir::verify_block_whir(proof, &elf, &opts, format).unwrap_or(false)
+    };
+    let half = prove(&elf, &at(2, GroupFold::Indexed), MaxRowsConfig::small());
+    assert!(
+        grouped_widths(&half).iter().any(|&w| w >= 2),
+        "a grouped chain at blowup 2"
+    );
+    assert!(verify(&half, &at(2, GroupFold::Indexed)), "the control");
+    assert!(
+        !verify(&half, &at(4, GroupFold::Indexed)),
+        "a verifier at blowup 4 must refuse a block at blowup 2"
+    );
+    assert!(
+        !verify(&half, &at(2, GroupFold::PerPoly)),
+        "a per-polynomial verifier must refuse the grouped block at blowup 2"
+    );
+    let four = prove(&elf, &at(4, GroupFold::Indexed), MaxRowsConfig::small());
+    assert!(
+        verify(&four, &at(4, GroupFold::Indexed)),
+        "the control at blowup 4"
+    );
+    assert!(
+        !verify(&four, &at(2, GroupFold::Indexed)),
+        "a verifier at blowup 2 must refuse a block at blowup 4"
+    );
+}
+
 /// The round trip and the cross-mode refusals at each budget of `budgets`
 /// polynomials a group, under `argue`; returns the grouped run widths seen.
 fn round_trips_and_refuses_the_other_mode(
