@@ -2573,7 +2573,7 @@ fn the_whir_block_tree_on_a_real_block() {
     // default) or folded (`LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0`), and how many
     // folds ran.
     println!(
-        "W3 WHIR SUCCESSORS: encode {} · {} encoded · {} folds ({} fused)",
+        "W3 WHIR SUCCESSORS: encode {} · {} encoded · {} folds ({} fused) · encodes the card declined {}",
         if multilinear::gpu::encode_successor_in_effect() {
             "on"
         } else {
@@ -2581,7 +2581,8 @@ fn the_whir_block_tree_on_a_real_block() {
         },
         multilinear::gpu::encoded_successors(),
         multilinear::gpu::resident_fold_calls(),
-        multilinear::gpu::fused_fold_calls()
+        multilinear::gpu::fused_fold_calls(),
+        multilinear::gpu::encode_declines()
     );
     // How each group's stacked polynomials were opened (`format.group`): one
     // chain a polynomial, or one a run of up to four whose round 0 ran on the

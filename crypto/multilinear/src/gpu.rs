@@ -96,6 +96,12 @@ static RESIDENT_FOLD_CALLS: AtomicU64 = AtomicU64::new(0);
 /// codeword (the default; `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0` folds; D-SPEED
 /// lever 5a). Not in [`RESIDENT_FOLD_CALLS`]: no fold ran.
 static ENCODED_SUCCESSORS: AtomicU64 = AtomicU64::new(0);
+/// ★ Successors the card was asked to encode — the encode on, the factors and
+/// the codeword on the card — and declined: the session would not write its
+/// tables, or the encode returned an error. The chain folds instead, which
+/// proves the same bytes, so nothing else would name it: [`ENCODED_SUCCESSORS`]
+/// only fails to rise.
+static ENCODE_DECLINES: AtomicU64 = AtomicU64::new(0);
 /// ★ Stacked openings whose codeword the device holds but whose factors the
 /// device did not build from the shares.
 ///
@@ -400,6 +406,23 @@ pub fn encoded_successors() -> u64 {
     ENCODED_SUCCESSORS.load(Ordering::Relaxed)
 }
 
+/// Successor encodes the card declined, the chain folding instead — see
+/// [`ENCODE_DECLINES`]. Zero in a build without a device.
+pub fn encode_declines() -> u64 {
+    ENCODE_DECLINES.load(Ordering::Relaxed)
+}
+
+/// Called where the card declines a successor encode it was asked for:
+/// counted, and said.
+#[cfg(feature = "cuda")]
+fn note_encode_declined(levels: usize) {
+    let count = ENCODE_DECLINES.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!(
+        "[whir] the card DECLINED a successor encode ({levels}-level fold); the chain folds \
+         instead; encode declines {count}"
+    );
+}
+
 /// Whether a chain's first successor is encoded from its bound message (the
 /// default; `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0` or a test's override turns it
 /// off). `false` in a build without a device.
@@ -565,6 +588,7 @@ pub fn reset_call_counters() {
     FUSED_FOLD_CALLS.store(0, Ordering::Relaxed);
     RESIDENT_FOLD_CALLS.store(0, Ordering::Relaxed);
     ENCODED_SUCCESSORS.store(0, Ordering::Relaxed);
+    ENCODE_DECLINES.store(0, Ordering::Relaxed);
     OPEN_HOST_FALLBACKS.store(0, Ordering::Relaxed);
     GROUPED_CARD_CHAINS.store(0, Ordering::Relaxed);
     GROUPED_HOST_CHAINS.store(0, Ordering::Relaxed);
@@ -4938,6 +4962,21 @@ pub fn force_fused_fold(on: Option<bool>) {
     );
 }
 
+/// Whether every successor encode declines as a card that cannot would, so a
+/// test can reach the path [`note_encode_declined`] counts.
+#[cfg(feature = "cuda")]
+static ENCODE_DECLINE_FORCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Makes every successor encode the card is asked for decline while `on` —
+/// for the test that the fold it falls to is counted. Not for production
+/// callers.
+#[doc(hidden)]
+#[cfg(feature = "cuda")]
+pub fn force_encode_decline(on: bool) {
+    ENCODE_DECLINE_FORCED.store(on, Ordering::Relaxed);
+}
+
 /// Whether [`open_shared`] declines as a full card would make it, so a test can
 /// reach the path [`note_open_host_fallback`] counts without filling one.
 #[cfg(feature = "cuda")]
@@ -5193,10 +5232,23 @@ impl OpeningFactors {
         if !encode_successor() {
             return None;
         }
-        let session = self.materialize().ok()?;
-        let successor = session.encode_successor(&codeword.0, levels).ok()?;
-        ENCODED_SUCCESSORS.fetch_add(1, Ordering::Relaxed);
-        Some(DeviceCodeword(successor))
+        let encoded = if ENCODE_DECLINE_FORCED.load(Ordering::Relaxed) {
+            None
+        } else {
+            self.materialize()
+                .ok()
+                .and_then(|session| session.encode_successor(&codeword.0, levels).ok())
+        };
+        match encoded {
+            Some(successor) => {
+                ENCODED_SUCCESSORS.fetch_add(1, Ordering::Relaxed);
+                Some(DeviceCodeword(successor))
+            }
+            None => {
+                note_encode_declined(levels);
+                None
+            }
+        }
     }
 }
 
