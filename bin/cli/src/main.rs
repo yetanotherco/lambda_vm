@@ -370,6 +370,13 @@ enum Commands {
         /// Print the blake3 digest of the top proof's bytes
         #[arg(long)]
         digest: bool,
+
+        /// How each group's stacked polynomials are opened: one chain per
+        /// polynomial (`per-poly`, production) or one per run of up to four
+        /// (`indexed`). A format choice: `verify-block` must be given the
+        /// same one; the proof file does not carry it.
+        #[arg(long, value_parser = ["per-poly", "indexed"], default_value = "per-poly")]
+        group: String,
     },
 
     /// Verify a block proof produced by `prove-block`
@@ -385,6 +392,11 @@ enum Commands {
         /// Print verification time
         #[arg(long)]
         time: bool,
+
+        /// The group opening the block was proved with (`prove-block
+        /// --group`): the verifier's constant, never read from the proof.
+        #[arg(long, value_parser = ["per-poly", "indexed"], default_value = "per-poly")]
+        group: String,
     },
 
     /// Count main-trace and aux-trace field elements without proving
@@ -484,8 +496,14 @@ fn main() -> ExitCode {
             output,
             time,
             digest,
-        } => cmd_prove_block(elf, input, output, time, digest),
-        Commands::VerifyBlock { proof, elf, time } => cmd_verify_block(proof, elf, time),
+            group,
+        } => cmd_prove_block(elf, input, output, time, digest, &group),
+        Commands::VerifyBlock {
+            proof,
+            elf,
+            time,
+            group,
+        } => cmd_verify_block(proof, elf, time, &group),
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
     }
 }
@@ -581,9 +599,10 @@ fn cmd_prove_block(
     output_path: PathBuf,
     time: bool,
     digest: bool,
+    group: &str,
 ) -> ExitCode {
     use prover::lfm::whir_block_tree::{
-        StderrSink, WhirBlockTreeProof, WhirTreeConfig, prove_whir_block_tree,
+        StderrSink, WhirBlockTreeProof, WhirTreeConfig, group_setting, prove_whir_block_tree,
     };
 
     let elf_data = match std::fs::read(&elf_path) {
@@ -600,13 +619,28 @@ fn cmd_prove_block(
             return ExitCode::FAILURE;
         }
     };
-    let cfg = match WhirTreeConfig::from_env() {
+    // The group opening is the caller's constant, given on the command line
+    // and to `verify-block` alike; the harness's environment word for it is
+    // refused here rather than silently outranked.
+    if std::env::var_os("BLOCK_WHIR_GROUP").is_some() {
+        eprintln!("BLOCK_WHIR_GROUP is the harness's knob: give the CLI --group instead");
+        return ExitCode::FAILURE;
+    }
+    let mut cfg = match WhirTreeConfig::from_env() {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
+    cfg.format.group = match group_setting(Some(group)) {
+        Ok(group) => group,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("BLOCK GROUP OPENING: {group}");
     // A forced leaf count, another fan-in or another argue is another tree than
     // the one `verify-block` derives: harness arms, not a production proof.
     if !cfg.at_presets() {
@@ -663,9 +697,17 @@ fn cmd_prove_block(
     ExitCode::SUCCESS
 }
 
-fn cmd_verify_block(proof_path: PathBuf, elf_path: PathBuf, time: bool) -> ExitCode {
+fn cmd_verify_block(proof_path: PathBuf, elf_path: PathBuf, time: bool, group: &str) -> ExitCode {
     use prover::lfm::whir_block_tree::{
-        WhirBlockTreeProof, base_line, verify_whir_block_tree_proof,
+        WhirBlockTreeProof, base_line, group_setting, verify_whir_block_tree_proof_grouped,
+    };
+
+    let fold = match group_setting(Some(group)) {
+        Ok(fold) => fold,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
     };
 
     let elf_data = match std::fs::read(&elf_path) {
@@ -693,9 +735,11 @@ fn cmd_verify_block(proof_path: PathBuf, elf_path: PathBuf, time: bool) -> ExitC
     // The block's base is its proof family's: the verifier's constant, never
     // read from the file.
     eprintln!("{}", base_line(&prover::hash_pin::BLOCK_BASE));
+    // So is the group opening: the caller's, never the file's.
+    eprintln!("BLOCK GROUP OPENING: {group}");
     eprintln!("Verifying block proof...");
     let start = Instant::now();
-    let result = verify_whir_block_tree_proof(&elf_data, &proof);
+    let result = verify_whir_block_tree_proof_grouped(&elf_data, &proof, fold);
     let verify_elapsed = start.elapsed();
     match result {
         Ok(()) => {
@@ -1703,6 +1747,34 @@ mod tests {
             !ok(&["cli", "verify-block", "block.proof"]),
             "the ELF is required"
         );
+    }
+
+    /// Both block commands take the group opening, per polynomial unless
+    /// told otherwise, and nothing but its two words.
+    #[test]
+    fn the_block_commands_take_the_group_opening() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            let group = |args: &[&str]| match parse(args).map(|cli| cli.command) {
+                Ok(Commands::ProveBlock { group, .. } | Commands::VerifyBlock { group, .. }) => {
+                    Some(group)
+                }
+                _ => None,
+            };
+            assert_eq!(group(cmd).as_deref(), Some("per-poly"), "the default");
+            for word in ["per-poly", "indexed"] {
+                let args = [cmd, &["--group", word]].concat();
+                assert_eq!(group(&args).as_deref(), Some(word));
+                assert!(
+                    prover::lfm::whir_block_tree::group_setting(Some(word)).is_ok(),
+                    "{word} reads"
+                );
+            }
+            let args = [cmd, &["--group", "index"]].concat();
+            assert!(parse(&args).is_err(), "another word is refused");
+        }
     }
 
     /// The block commands take no base hash: the block's base is its proof

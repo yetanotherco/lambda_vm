@@ -43,6 +43,7 @@
 
 use multilinear::stacking::StackedLayout;
 use multilinear::whir::Domain;
+use multilinear::whir_chain::GroupFold;
 use multilinear::whir_commit::Commitment;
 use stark::multilinear_logup::InteractionShape;
 use stark::multilinear_table::TableLayout;
@@ -1166,10 +1167,24 @@ pub fn verify_block_tree(
     statement: BlockStatement<'_>,
     top: &super::proof::LfmProof,
 ) -> Result<(), String> {
+    verify_block_tree_grouped(elf_bytes, statement, top, GroupFold::PerPoly)
+}
+
+/// [`verify_block_tree`] for a block whose groups' stacked polynomials were
+/// opened per `group` ([`BlockFormat::production_with`]): the one format
+/// choice a caller makes, and the verifier's constant — the prover's must
+/// match, the statement binds it, and nothing reads it from the proof. Every
+/// other preset is [`verify_block_tree`]'s.
+pub fn verify_block_tree_grouped(
+    elf_bytes: &[u8],
+    statement: BlockStatement<'_>,
+    top: &super::proof::LfmProof,
+    group: GroupFold,
+) -> Result<(), String> {
     verify_block_tree_with(
         elf_bytes,
         &super::proof::block_base_options(),
-        &BlockFormat::production(),
+        &BlockFormat::production_with(group),
         statement,
         None,
         BLOCK_FAN_IN,

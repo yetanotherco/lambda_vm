@@ -317,6 +317,17 @@ impl BlockFormat {
         }
     }
 
+    /// [`production`](Self::production) with each group's stacked polynomials
+    /// opened per `group`: the caller's constant, which the prover and the
+    /// verifier of one block must share (it is bound into the statement
+    /// through the fold word, and never read from a proof).
+    pub fn production_with(group: GroupFold) -> Self {
+        Self {
+            group,
+            ..Self::production()
+        }
+    }
+
     /// The chain's config over `shapes`: the WHIR format's, with this format's
     /// argue and group fold. Every side of a block builds its config here.
     pub fn chain_config(&self, shapes: &[(usize, usize)]) -> ChainConfig {

@@ -20,7 +20,7 @@
 //! leaves unset, and the driver's first line says how the running process
 //! compares with it.
 
-use multilinear::whir_chain::ArgueFormat;
+use multilinear::whir_chain::{ArgueFormat, GroupFold};
 
 use crate::block_whir::{self, BlockFormat, BlockOptions, BlockWhirProof};
 
@@ -203,7 +203,9 @@ pub struct WhirTreeConfig {
     /// format's bin cap; `BLOCK_WHIR_ARGUE_CAP=k` for 2^k). Another argue is
     /// another format than the production verifier's.
     pub argue: ArgueFormat,
-    /// The block format: production, with `argue`.
+    /// The block format: production, with `argue`, its groups' stacked
+    /// polynomials opened per `BLOCK_WHIR_GROUP=per-poly|indexed`
+    /// ([`group_setting`]; production: per-poly).
     pub format: BlockFormat,
     /// The base's options: production, with the `BLOCK_WHIR_*` knobs.
     pub options: BlockOptions,
@@ -237,6 +239,18 @@ fn count_knob(name: &str) -> Result<Option<usize>, String> {
             .parse()
             .map(Some)
             .map_err(|_| format!("{name} is a count, got `{v}`")),
+    }
+}
+
+/// `BLOCK_WHIR_GROUP`'s reading: unset or `per-poly` is one chain per stacked
+/// polynomial ([`GroupFold::PerPoly`], production); `indexed` one chain per
+/// run of up to four ([`GroupFold::Indexed`]); anything else an error. A
+/// format choice: the block's verifier must be given the same one.
+pub fn group_setting(value: Option<&str>) -> Result<GroupFold, String> {
+    match value.map(str::trim) {
+        None | Some("per-poly") => Ok(GroupFold::PerPoly),
+        Some("indexed") => Ok(GroupFold::Indexed),
+        Some(other) => Err(format!("BLOCK_WHIR_GROUP={other}: per-poly or indexed")),
     }
 }
 
@@ -284,7 +298,9 @@ impl WhirTreeConfig {
         };
         let format = BlockFormat {
             argue,
-            ..BlockFormat::production()
+            ..BlockFormat::production_with(group_setting(
+                std::env::var("BLOCK_WHIR_GROUP").ok().as_deref(),
+            )?)
         };
         let mut options = BlockOptions::production();
         // `BLOCK_WHIR_STREAM_KECCAK_RND=1`: KECCAK_RND's chunks streamed (off by
@@ -1708,6 +1724,7 @@ pub fn prove_whir_block_tree(
     sink.line(&posture_line());
     sink.line(&base_line(&format.zf.base));
     sink.line(&format!("W3 ARGUE: {argue:?}"));
+    sink.line(&format!("W3 GROUP OPENING: {:?}", format.group));
     sink.line(&format!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead));
     sink.line(&finish_idle_line());
     sink.line(&format!(
@@ -2397,11 +2414,23 @@ pub fn verify_whir_block_tree_proof(
     elf_bytes: &[u8],
     proof: &WhirBlockTreeProof,
 ) -> Result<(), String> {
+    verify_whir_block_tree_proof_grouped(elf_bytes, proof, GroupFold::PerPoly)
+}
+
+/// [`verify_whir_block_tree_proof`] for a block whose groups were opened per
+/// `group` — the verifier's constant, the caller's to give
+/// ([`super::whir_block::verify_block_tree_grouped`]); the file does not
+/// carry it.
+pub fn verify_whir_block_tree_proof_grouped(
+    elf_bytes: &[u8],
+    proof: &WhirBlockTreeProof,
+    group: GroupFold,
+) -> Result<(), String> {
     let top = LfmProof {
         proof: proof.top_proof.clone(),
         public_words: proof.top_public_words.clone(),
     };
-    super::whir_block::verify_block_tree(elf_bytes, proof.statement(), &top)
+    super::whir_block::verify_block_tree_grouped(elf_bytes, proof.statement(), &top, group)
 }
 
 #[cfg(test)]
@@ -2426,6 +2455,23 @@ mod tests {
                 .iter()
                 .all(|(name, _)| *name != crate::whir_hash_knob::ENV),
             "the base hash is the format's, not posture"
+        );
+    }
+
+    /// `BLOCK_WHIR_GROUP` reads two words, unset is production's per
+    /// polynomial, and anything else is refused rather than defaulted.
+    #[test]
+    fn the_group_opening_reads_two_words() {
+        assert_eq!(group_setting(None), Ok(GroupFold::PerPoly));
+        assert_eq!(BlockFormat::production().group, GroupFold::PerPoly);
+        assert_eq!(group_setting(Some("per-poly")), Ok(GroupFold::PerPoly));
+        assert_eq!(group_setting(Some(" indexed ")), Ok(GroupFold::Indexed));
+        for word in ["index", "Indexed", "1", ""] {
+            assert!(group_setting(Some(word)).is_err(), "`{word}` is refused");
+        }
+        assert_eq!(
+            BlockFormat::production_with(GroupFold::Indexed).group,
+            GroupFold::Indexed
         );
     }
 
