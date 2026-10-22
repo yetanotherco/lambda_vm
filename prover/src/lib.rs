@@ -274,12 +274,14 @@ pub struct GuestInput {
 /// 4-byte magic identifying a lambda-vm recursion input blob ("LVMR").
 pub const RECURSION_INPUT_MAGIC: [u8; 4] = *b"LVMR";
 
-/// Wire-format version of the recursion input blob. v3: `TableCounts` gained the
-/// six accelerator fields, which moves every field after it in the archive. v2:
-/// rkyv pointer_width_64 (64-bit rel-ptrs) — v1 archives use 32-bit offsets.
+/// Wire-format version of the recursion input blob. v4: `TableCounts` lost its
+/// `commit` field when COPY absorbed the COMMIT table, which shortens the
+/// archive. v3: `TableCounts` gained the six accelerator fields, which moves
+/// every field after it in the archive. v2: rkyv pointer_width_64 (64-bit
+/// rel-ptrs) — v1 archives use 32-bit offsets.
 /// Any change to a type reachable from `GuestInput` belongs here: the guest
 /// reads the archive in place, so a stale blob is misread rather than rejected.
-pub const RECURSION_INPUT_VERSION: u32 = 3;
+pub const RECURSION_INPUT_VERSION: u32 = 4;
 
 /// Required alignment (bytes) of the archive's first byte in guest memory.
 pub const RECURSION_INPUT_ALIGN: usize = 16;
