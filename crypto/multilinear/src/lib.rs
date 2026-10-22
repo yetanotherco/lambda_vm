@@ -35,6 +35,8 @@ pub mod whir;
 mod whir_cap_tests;
 pub mod whir_chain;
 pub mod whir_commit;
+#[cfg(test)]
+mod whir_coset_tests;
 pub mod whir_eval;
 #[cfg(test)]
 mod whir_group_tests;

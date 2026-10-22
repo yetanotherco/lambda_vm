@@ -38,6 +38,43 @@ pub type Commitment = [u8; 32];
 type Backend<F, H> = <H as WhirHash>::Backend<F>;
 type Tree<F, H> = MerkleTree<Backend<F, H>>;
 
+/// Where a chain's round-0 trees put their leaves.
+///
+/// [`Natural`](Self::Natural) is today's: block `j` (the coset that folds onto
+/// `j`) sits at tree position `j`. [`Coset`](Self::Coset) puts it at position
+/// `bitrev_d(j)`, `d` the tree's depth. Then the leaves under any aligned
+/// subtree of `2^m` positions are the blocks `j ≡ c (mod 2^(d−m))`, whose
+/// values are the codeword on ONE coset of the domain: a prover can evaluate
+/// them from the polynomial instead of re-encoding the whole codeword.
+///
+/// Only a round-0 tree takes this order; a successor's tree is always natural.
+/// A FORMAT VALUE and a verifier-side constant ([`crate::whir_chain::ChainFormat`]),
+/// never read from a proof: the roots, the paths and the in-guest walk all
+/// follow it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LeafOrder {
+    /// Block `j` at position `j`. Today's format.
+    #[default]
+    Natural,
+    /// Block `j` at position `bitrev_d(j)`.
+    Coset,
+}
+
+impl LeafOrder {
+    /// The tree position of block `index` in a tree of `2^depth` leaves.
+    ///
+    /// The map is its own inverse, so it also gives the block at a position.
+    /// An index past the tree is returned as it is, for the caller's range
+    /// check to refuse: reversing its low bits would land it inside.
+    pub fn position(self, index: usize, depth: usize) -> usize {
+        match self {
+            Self::Natural => index,
+            Self::Coset if depth == 0 || index >> depth != 0 => index,
+            Self::Coset => index.reverse_bits() >> (usize::BITS as usize - depth),
+        }
+    }
+}
+
 /// A committed codeword and the tree needed to open it.
 pub struct CodewordCommitment<F: IsField + 'static, H: WhirHash = KeccakWhir>
 where
@@ -47,6 +84,9 @@ where
     codeword: Codeword<F>,
     log_folding: usize,
     log_domain_size: usize,
+    /// Where the tree puts its leaves: a round-0 tree's [`LeafOrder`],
+    /// natural for every other.
+    leaves: LeafOrder,
     /// The top of the tree, when the commitment was retired and revived
     /// ([`Self::retire`], [`RetiredCommitment::revive`]): the paths are then
     /// read from it and from the leaves under one kept node, re-hashed from
@@ -247,6 +287,7 @@ pub struct RetiredCommitment {
     top: TreeTop,
     log_folding: usize,
     log_domain_size: usize,
+    leaves: LeafOrder,
 }
 
 impl RetiredCommitment {
@@ -290,6 +331,7 @@ impl RetiredCommitment {
             codeword,
             log_folding: self.log_folding,
             log_domain_size: self.log_domain_size,
+            leaves: self.leaves,
             top: Some(self.top),
         })
     }
@@ -432,6 +474,7 @@ where
                 codeword: Codeword::Host(codeword),
                 log_folding,
                 log_domain_size,
+                leaves: LeafOrder::Natural,
                 top: None,
             });
         }
@@ -443,6 +486,17 @@ where
     pub fn from_codeword_on_host(
         codeword: Vec<FieldElement<F>>,
         log_folding: usize,
+    ) -> Result<Self, Error> {
+        Self::from_codeword_on_host_in(codeword, log_folding, LeafOrder::Natural)
+    }
+
+    /// [`from_codeword_on_host`](Self::from_codeword_on_host) with the leaves
+    /// placed in `leaves`' order: the hashes are the same, their positions are
+    /// not.
+    pub fn from_codeword_on_host_in(
+        codeword: Vec<FieldElement<F>>,
+        log_folding: usize,
+        leaves: LeafOrder,
     ) -> Result<Self, Error> {
         if !codeword.len().is_power_of_two() {
             return Err(Error::NotPowerOfTwo(codeword.len()));
@@ -474,12 +528,21 @@ where
             (0..num_leaves).map(|j| hash_leaf(&mut buffer, j)).collect()
         };
 
+        // Position `p` holds block `π(p)`: the order is its own inverse.
+        let depth = log_domain_size - log_folding;
+        let hashed = match leaves {
+            LeafOrder::Natural => hashed,
+            LeafOrder::Coset => (0..num_leaves)
+                .map(|p| hashed[leaves.position(p, depth)])
+                .collect(),
+        };
         let tree = Tree::<F, H>::build_from_hashed_leaves(hashed).ok_or(Error::EmptyPolynomial)?;
         Ok(Self {
             tree,
             codeword: Codeword::Host(codeword),
             log_folding,
             log_domain_size,
+            leaves,
             top: None,
         })
     }
@@ -509,6 +572,7 @@ where
             codeword: Codeword::Host(codeword),
             log_folding,
             log_domain_size,
+            leaves: LeafOrder::Natural,
             top: None,
         })
     }
@@ -539,6 +603,7 @@ where
             codeword: Codeword::Device(codeword),
             log_folding,
             log_domain_size,
+            leaves: LeafOrder::Natural,
             top: None,
         })
     }
@@ -582,6 +647,24 @@ where
         self.log_domain_size
     }
 
+    /// Where this commitment's tree puts its leaves.
+    pub fn leaves(&self) -> LeafOrder {
+        self.leaves
+    }
+
+    /// The tree positions of blocks `indices`, in their order.
+    fn positions<'i>(&self, indices: &'i [usize]) -> std::borrow::Cow<'i, [usize]> {
+        match self.leaves {
+            LeafOrder::Natural => std::borrow::Cow::Borrowed(indices),
+            LeafOrder::Coset => std::borrow::Cow::Owned(
+                indices
+                    .iter()
+                    .map(|&index| self.leaves.position(index, self.depth()))
+                    .collect(),
+            ),
+        }
+    }
+
     /// The committed codeword, in domain order.
     ///
     /// The prover folds from here rather than encoding a second time — on a
@@ -609,6 +692,7 @@ where
                 top,
                 log_folding: self.log_folding,
                 log_domain_size: self.log_domain_size,
+                leaves: self.leaves,
             });
         }
         let depth = self.depth();
@@ -644,15 +728,16 @@ where
             top: TreeTop { nodes, dropped },
             log_folding: self.log_folding,
             log_domain_size: self.log_domain_size,
+            leaves: self.leaves,
         })
     }
 
-    /// The paths of `indices` from the kept top: each queried block of
-    /// `2^dropped` leaves is re-hashed — on the card when the codeword is
-    /// there ([`Self::card_top_paths`]), else, or when the card's re-hash
-    /// fails, on the host ([`Self::host_top_paths`]) — its subtree's root is
-    /// checked against the kept node, and the path continues through the kept
-    /// levels. Either route gives the same paths, byte for byte.
+    /// The paths of tree positions `indices` from the kept top: each queried
+    /// block of `2^dropped` leaves is re-hashed — on the card when the
+    /// codeword is there ([`Self::card_top_paths`]), else, or when the card's
+    /// re-hash fails, on the host ([`Self::host_top_paths`]) — its subtree's
+    /// root is checked against the kept node, and the path continues through
+    /// the kept levels. Either route gives the same paths, byte for byte.
     fn top_paths(&self, top: &TreeTop, indices: &[usize]) -> Result<Vec<Proof<Commitment>>, Error> {
         use std::sync::atomic::Ordering::Relaxed;
         let num_leaves = self.num_leaves();
@@ -693,6 +778,11 @@ where
         let Codeword::Device(device) = &self.codeword else {
             return None;
         };
+        // The card gathers a block's leaves by consecutive index; under the
+        // coset order they are not, so the host re-hashes them.
+        if self.leaves != LeafOrder::Natural {
+            return None;
+        }
         let arity = Self::arity();
         let dropped = top.dropped;
         // A block is `2^dropped` leaves, or `4^dropped` at arity 4.
@@ -801,7 +891,8 @@ where
             .flat_map(|block| (block << block_bits)..((block + 1) << block_bits))
             .collect();
         let gathering = std::time::Instant::now();
-        let values = self.gather(&leaves)?;
+        // A position's leaf is the block the order puts there.
+        let values = self.gather(&self.positions(&leaves))?;
         TOP_GATHER_NANOS.fetch_add(
             gathering.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
@@ -1018,6 +1109,11 @@ where
     /// a gigabyte is the slowest thing in the commit. What a proof wants of a
     /// tree is a kilobyte per query.
     fn paths(&self, indices: &[usize]) -> Result<Vec<Proof<Commitment>>, Error> {
+        self.paths_at(&self.positions(indices))
+    }
+
+    /// [`paths`](Self::paths) of tree positions.
+    fn paths_at(&self, indices: &[usize]) -> Result<Vec<Proof<Commitment>>, Error> {
         if let Some(top) = &self.top {
             return self.top_paths(top, indices);
         }
@@ -1027,6 +1123,9 @@ where
             bound: num_leaves,
         };
         match &self.codeword {
+            Codeword::Device(_) if self.leaves != LeafOrder::Natural => Err(Error::DeviceFailed {
+                stage: "a device tree in the coset leaf order",
+            }),
             Codeword::Device(device) => {
                 if let Some(&bad) = indices.iter().find(|index| **index >= num_leaves) {
                     return Err(out_of_range(bad));
@@ -1062,8 +1161,18 @@ where
         cap_height: usize,
         owner: bool,
     ) -> Result<Vec<Proof<Commitment>>, Error> {
+        self.paths_capped_at(&self.positions(indices), cap_height, owner)
+    }
+
+    /// [`paths_capped`](Self::paths_capped) of tree positions.
+    fn paths_capped_at(
+        &self,
+        indices: &[usize],
+        cap_height: usize,
+        owner: bool,
+    ) -> Result<Vec<Proof<Commitment>>, Error> {
         if cap_height == 0 {
-            return self.paths(indices);
+            return self.paths_at(indices);
         }
         let depth = self.depth();
         let arity = Self::arity();
@@ -1103,6 +1212,11 @@ where
             (self.top_paths(top, indices)?, Some(cap))
         } else if owner {
             match &self.codeword {
+                Codeword::Device(_) if self.leaves != LeafOrder::Natural => {
+                    return Err(Error::DeviceFailed {
+                        stage: "a device tree in the coset leaf order",
+                    });
+                }
                 Codeword::Device(device) => {
                     let num_leaves = self.num_leaves();
                     if let Some(&bad) = indices.iter().find(|index| **index >= num_leaves) {
@@ -1128,11 +1242,11 @@ where
                     let cap = self.tree.cap(cap_height).ok_or(Error::CapEmbedFailed {
                         reason: "the host tree has no cap at this height",
                     })?;
-                    (self.paths(indices)?, Some(cap))
+                    (self.paths_at(indices)?, Some(cap))
                 }
             }
         } else {
-            (self.paths(indices)?, None)
+            (self.paths_at(indices)?, None)
         };
         match cap {
             Some(cap) => {

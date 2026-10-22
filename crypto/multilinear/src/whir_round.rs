@@ -18,7 +18,7 @@ use crate::{
     Error,
     whir::Domain,
     whir_commit::{
-        CodewordCommitment, Commitment, CosetOpening, fold_coset, leaf_and_slot,
+        CodewordCommitment, Commitment, CosetOpening, LeafOrder, fold_coset, leaf_and_slot,
         verify_opening_capped,
     },
     whir_hash::WhirHash,
@@ -47,14 +47,25 @@ pub enum TreeCheck<'a> {
     /// Authenticated in an earlier round.
     Checked(CappedRoot<'a, Commitment>),
     /// Owned by this round: its first opening carries its cap of height
-    /// `cap_height` (none at 0).
+    /// `cap_height` (none at 0). `leaves` is where the tree puts its blocks:
+    /// the chain's [`LeafOrder`] for a round-0 tree, natural for a successor.
     Owner {
         root: &'a Commitment,
         cap_height: usize,
+        leaves: LeafOrder,
     },
 }
 
 impl<'a> TreeCheck<'a> {
+    /// The tree position of block `index` in this tree of `2^depth` leaves.
+    /// A tree checked in an earlier round is a successor's, in natural order.
+    pub(crate) fn position(&self, index: usize, depth: usize) -> usize {
+        match self {
+            TreeCheck::Checked(_) => index,
+            TreeCheck::Owner { leaves, .. } => leaves.position(index, depth),
+        }
+    }
+
     /// The tree's check and the siblings of `first`, the tree's first opening
     /// in this round.
     ///
@@ -85,11 +96,12 @@ impl<'a> TreeCheck<'a> {
             TreeCheck::Owner {
                 root,
                 cap_height: 0,
+                ..
             } => Ok((CappedRoot::uncapped(root, depth), path)),
-            TreeCheck::Owner { root, cap_height } => {
-                CappedRoot::from_owner::<Backend<C, H>>(root, path, depth, cap_height)
-                    .ok_or(Error::CapRejected)
-            }
+            TreeCheck::Owner {
+                root, cap_height, ..
+            } => CappedRoot::from_owner::<Backend<C, H>>(root, path, depth, cap_height)
+                .ok_or(Error::CapRejected),
         }
     }
 }
@@ -280,6 +292,7 @@ where
                 let (next_check, next_first) = TreeCheck::Owner {
                     root: commitments.next_root,
                     cap_height: commitments.next_cap_height,
+                    leaves: LeafOrder::Natural,
                 }
                 .open::<N, H>(next_depth, nxt)?;
                 (current_check, current_first, next_check, next_first)
@@ -307,7 +320,8 @@ where
                 nxt.proof.merkle_path.as_slice(),
             )
         };
-        if !verify_opening_capped::<C, H>(&current_check, q, cur, cur_siblings) {
+        let at = commitments.current.position(q, current_depth);
+        if !verify_opening_capped::<C, H>(&current_check, at, cur, cur_siblings) {
             return Err(Error::OpeningRejected { query: i });
         }
         let (leaf, slot) = leaf_and_slot(q, commitments.next_num_leaves);
@@ -590,8 +604,12 @@ where
     }
     let next_check = match (next_tree, proof.next.first()) {
         (Some((root, num_leaves, cap_height)), Some(opening)) => Some(
-            TreeCheck::Owner { root, cap_height }
-                .open::<E, H>(num_leaves.trailing_zeros() as usize, opening)?,
+            TreeCheck::Owner {
+                root,
+                cap_height,
+                leaves: LeafOrder::Natural,
+            }
+            .open::<E, H>(num_leaves.trailing_zeros() as usize, opening)?,
         ),
         _ => None,
     };
@@ -608,7 +626,8 @@ where
             } else {
                 opening.proof.merkle_path.as_slice()
             };
-            if !verify_opening_capped::<F, H>(check, q, opening, siblings) {
+            let at = trees[tree].position(q, current_depth);
+            if !verify_opening_capped::<F, H>(check, at, opening, siblings) {
                 return Err(Error::GroupedOpeningRejected { query: i, tree });
             }
         }
@@ -713,6 +732,7 @@ mod tests {
             current: TreeCheck::Owner {
                 root: current_root,
                 cap_height: 0,
+                leaves: LeafOrder::Natural,
             },
             next_root,
             next_num_leaves: fx.next.num_leaves(),
@@ -950,6 +970,7 @@ mod tests {
                 current: TreeCheck::Owner {
                     root: &current_root,
                     cap_height: caps.current,
+                    leaves: LeafOrder::Natural,
                 },
                 next_root: &next_root,
                 next_num_leaves: fx.next.num_leaves(),

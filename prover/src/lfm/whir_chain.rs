@@ -83,8 +83,8 @@
 use multilinear::stacked_eval::index_chains;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{
-    ChainConfig, ChainProof, ChainRound, GroupFold, MAX_INDEX_POLYS, NonceLayout, RoundOpenings,
-    index_vars,
+    ChainConfig, ChainProof, ChainRound, GroupFold, LeafOrder, MAX_INDEX_POLYS, NonceLayout,
+    RoundOpenings, index_vars,
 };
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
@@ -186,6 +186,10 @@ pub struct ChainShape {
     /// round 0 opens one tree each at one position set and binds `m =
     /// ⌈log2 trees⌉` index variables after its `k0` data ones.
     pub trees: usize,
+    /// Where the round-0 trees put their leaves: the config's own, so round
+    /// 0's walks authenticate the position the host prover placed the block
+    /// at ([`walk_bits`]).
+    pub leaves: LeafOrder,
 }
 
 impl ChainShape {
@@ -220,6 +224,7 @@ impl ChainShape {
             arity,
             group: config.format.group,
             trees: 1,
+            leaves: config.format.leaves,
         }
     }
 
@@ -1339,6 +1344,12 @@ fn emit_query_phase(
     let queries: Vec<Vec<_>> = (0..shape.num_queries)
         .map(|_| transcript.sample_u64_pow2(b, depth))
         .collect();
+    // The current trees are walked at the block's tree position; the fold, the
+    // successor's leaf and its slot read the index itself.
+    let walks: Vec<std::borrow::Cow<'_, [Bit]>> = queries
+        .iter()
+        .map(|bits| walk_bits(shape, r, bits))
+        .collect();
     // The lean fold halves the round's challenges once, here, rather
     // than once per query; the classic fold prepares nothing.
     let fold = RoundFold::prepare(b, alphas);
@@ -1354,7 +1365,7 @@ fn emit_query_phase(
                 for (p, current) in blocks.iter().enumerate() {
                     #[cfg(test)]
                     onechain_steps::mark(b, onechain_steps::opening(r, q, p));
-                    current_trees[p].verify_opening(b, current.values, bits, current.siblings);
+                    current_trees[p].verify_opening(b, current.values, &walks[q], current.siblings);
                 }
                 let next = &round.next[q];
                 // `leaf_and_slot`: the low `next_depth` bits index the successor
@@ -1380,7 +1391,7 @@ fn emit_query_phase(
                 for (p, current) in blocks.iter().enumerate() {
                     #[cfg(test)]
                     onechain_steps::mark(b, onechain_steps::opening(r, q, p));
-                    current_trees[p].verify_opening(b, current.values, bits, current.siblings);
+                    current_trees[p].verify_opening(b, current.values, &walks[q], current.siblings);
                 }
                 #[cfg(test)]
                 onechain_steps::mark(b, onechain_steps::Step::Fold { round: r, query: q });
@@ -1389,6 +1400,18 @@ fn emit_query_phase(
                 b.assert_eq_ext(folded, final_value);
             }
         }
+    }
+}
+
+/// The bits round `r`'s current trees are walked on for a query of index bits
+/// `bits` (low first): the index itself, or at round 0 under
+/// [`LeafOrder::Coset`] the position the order puts the block at, the index
+/// bits reversed (`LeafOrder::position`) — the same wires in the other order,
+/// no row.
+fn walk_bits<'a>(shape: &ChainShape, r: usize, bits: &'a [Bit]) -> std::borrow::Cow<'a, [Bit]> {
+    match (r, shape.leaves) {
+        (0, LeafOrder::Coset) => std::borrow::Cow::Owned(bits.iter().rev().copied().collect()),
+        _ => std::borrow::Cow::Borrowed(bits),
     }
 }
 

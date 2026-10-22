@@ -482,6 +482,9 @@ impl ZfFormat {
             // The block's own constant (`BlockFormat::group`), set where the
             // block builds its config: every other path opens per polynomial.
             group: multilinear::whir_chain::GroupFold::PerPoly,
+            // No knob yet: the card commits and the in-guest verifier place
+            // round-0 leaves in natural order only.
+            leaves: multilinear::whir_chain::LeafOrder::Natural,
         }
     }
 
@@ -1432,6 +1435,7 @@ mod tests {
                 argue: multilinear::whir_chain::ArgueFormat::PerTable,
                 arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
                 group: multilinear::whir_chain::GroupFold::PerPoly,
+                leaves: multilinear::whir_chain::LeafOrder::Natural,
             },
         };
         let opt_out = parse(&[(ENV_WHIR_GRIND, "all"), (ENV_WHIR_GRIND_BITS, "20")]).unwrap();
