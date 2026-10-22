@@ -64,14 +64,15 @@ env:
   # from one real one. Only the headline screen was dropped.
   #
   # Cycle counts below are for the ELF THIS JOB BUILDS (see "Build ethrex guest ELF"),
-  # as of main @ 9ccdaf2 with clang 21. They move with guest optimisation (#861 gave the
-  # guest thin LTO) and ~2% with the clang major on PATH, so a count quoted against a
+  # as of the guest built with fat LTO and its own memcpy. They move with guest
+  # optimisation (#861 gave the guest thin LTO, fat LTO and the runtime memcpy took
+  # another 20 %) and ~2% with the clang major on PATH, so a count quoted against a
   # different ELF reads as a regression — always pin the ELF when repeating one.
   ELF: executor/program_artifacts/rust/ethrex.elf
   # The workload: a real Ethereum block. WHICH block lives in
   # the Makefile and nowhere else — nothing in this file names one, so a repoint
   # moves this job without editing it. At the current default and pinned ethrex rev that
-  # is 30,498,818 cycles, 10,659 keccak calls and 116 ecsm calls — several times the work
+  # is 23,935,913 cycles, 10,659 keccak calls and 116 ecsm calls — several times the work
   # of the synthetic block, at a very different keccak:ecrecover mix. That is the whole
   # point: a prover change can move the synthetic number and the real one in opposite
   # directions. All three figures move with the ethrex rev, so re-measure on a bump

@@ -21,7 +21,7 @@ which rev it was taken at; the synthetic column has not been re-measured since t
 | gas used | 420,000 | **2,428,684** |
 | transactions | 20 (all plain transfers) | 29 (real mix) |
 | serialized size | 32,766 B | 1,110,183 B |
-| cycles | 8,734,622 | **30,498,818** |
+| cycles | 8,734,622 | **23,935,913** |
 | keccak / ecsm calls | 411 / 80 | **10,659** / 116 |
 | keccaks per ECSM call | 5.1 | **92** |
 
@@ -376,7 +376,9 @@ the same epoch 2^22: **45,074,552 cycles** (−11.24%), **142.37 s** CPU prove (
 **936.7 MB** proof (−12.22%), peak RSS flat at ~48 GB.
 
 At the currently pinned `797df554` only the cycle count has been re-measured —
-**30,498,818 cycles**, 10,659 keccak, 116 ecsm. Prove time, proof size and the GPU column
+**23,935,913 cycles**, 10,659 keccak, 116 ecsm (30,498,818 before the guest moved to
+fat LTO over one codegen unit, the runtime's own `memcpy` and the leaner Keccak
+final block). Prove time, proof size and the GPU column
 have no counterpart at this rev yet; re-run `/bench` rather than reading the rows below
 as current.
 
