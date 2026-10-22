@@ -4051,6 +4051,13 @@ fn prove_streamed(
                     ledger.image.store(builder.image_bytes(), Relaxed);
                     ledger.line("builder created");
                 }
+                let setup = builder.setup_stamps();
+                eprintln!(
+                    "BLOCK BUILDER: ready at {:.2}s · image and memory state {:.2}s · decode table {:.2}s · DECODE's trace generated on a thread of its own",
+                    start.elapsed().as_secs_f64(),
+                    setup.image,
+                    setup.decode,
+                );
                 let mut streamed = 0usize;
                 // The walk on its own thread, doing nothing but walk; this
                 // thread appends each walked window, routes it and hands its

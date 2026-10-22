@@ -873,6 +873,79 @@ fn dropping_the_streamed_ops_builds_the_same_tables() {
     }
 }
 
+/// ★ DECODE's trace is generated on a thread of its own while the walk starts,
+/// and the first CPU chunks' DECODE rows are counted into it as they leave: with
+/// that thread held back past the first hand-outs, the hand-out waits for the
+/// trace and the build is the whole-run build, table for table, through the
+/// split (the block's path) and through `push`.
+#[test]
+fn a_late_decode_trace_is_waited_for_before_its_rows_are_counted() {
+    use crate::tables::trace_builder::DECODE_TRACE_DELAY;
+    let max_rows = MaxRowsConfig::small();
+    let (program, logs) = run("test_keccak_multi");
+    let reference = whole(&program, &logs, &max_rows);
+    DECODE_TRACE_DELAY.with(|d| d.set(std::time::Duration::from_millis(300)));
+    for split in [true, false] {
+        let t = std::time::Instant::now();
+        let (late, _, streamed) = windowed_streaming(&program, &logs, &max_rows, 7, split, |b| {
+            b.drop_streamed_ops().expect("before any window")
+        });
+        assert!(streamed.contains("Cpu"), "no CPU chunk was handed out");
+        assert!(t.elapsed() >= std::time::Duration::from_millis(300));
+        same_traces(&reference, &late);
+    }
+    DECODE_TRACE_DELAY.with(|d| d.set(std::time::Duration::ZERO));
+}
+
+/// ★ With a private input in the initial image (more than a page of it), the
+/// windowed build is the whole-run build of the same run, table for table, its
+/// streamed ops kept or dropped: the image held as pages gives the PAGE tables
+/// and the walk's state the image as a map of bytes gives.
+#[test]
+fn a_windowed_build_with_a_private_input_is_the_whole_run_build() {
+    let max_rows = MaxRowsConfig::small();
+    let input: Vec<u8> = (0..300_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    for name in ["all_instructions_64", "test_keccak_multi"] {
+        let program = Elf::load(&asm_elf_bytes(name)).expect("the ELF loads");
+        let logs = Executor::new(&program, input.clone())
+            .expect("the executor starts")
+            .run()
+            .expect("the program runs")
+            .logs;
+        let reference = Traces::from_elf_and_logs(
+            &program,
+            &logs,
+            &max_rows,
+            &input,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )
+        .expect("the whole-run build");
+        for window in [7, 33, 1000] {
+            for drop in [false, true] {
+                let mut builder =
+                    WindowedTraceBuilder::new(&program, &input, &max_rows).expect("the builder");
+                if drop {
+                    builder = builder.drop_streamed_ops().expect("before any window");
+                }
+                let body = logs.len() - 1;
+                let cut = body - body % window;
+                let mut chunks = Vec::new();
+                for w in logs[..cut].chunks(window) {
+                    chunks.extend(builder.push(w).expect("a window"));
+                }
+                let mut traces = builder.finish(&logs[cut..]).expect("the last window");
+                traces
+                    .insert_streamed(chunks)
+                    .expect("every chunk has a placeholder");
+                same_traces(&reference, &traces);
+            }
+        }
+    }
+}
+
 /// The same with KECCAK_RND cut into streamed chunks.
 #[test]
 fn dropping_the_streamed_ops_streams_keccak_rnd_the_same() {

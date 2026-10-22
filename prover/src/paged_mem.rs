@@ -128,6 +128,29 @@ impl<T: Copy> PagedMem<T> {
         page.occupied[off / WORD_BITS] |= 1u64 << (off % WORD_BITS);
     }
 
+    /// The store with each cell's value mapped through `f`, page by page: the
+    /// same pages and the same `set` cells, each offset holding `f` of what it
+    /// held. `f(fill)` should be `fill` (the new store's), so that an offset
+    /// never `set` reads alike in an allocated page and outside every page.
+    pub fn map<U: Copy>(&self, fill: U, f: impl Fn(T) -> U) -> PagedMem<U> {
+        PagedMem {
+            pages: self
+                .pages
+                .iter()
+                .map(|(base, page)| {
+                    (
+                        *base,
+                        Page {
+                            data: page.data.iter().map(|&value| f(value)).collect(),
+                            occupied: page.occupied.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            fill,
+        }
+    }
+
     /// Base addresses of the pages that hold at least one `set` cell, ascending.
     /// (For a `DEFAULT_PAGE_SIZE`-aligned page, this equals `page_base_for_address`
     /// of every cell in it, so it replaces `cells.keys().map(page_base)`.)
@@ -244,5 +267,52 @@ impl Iterator for BitIter {
             self.bits &= self.bits - 1; // clear lowest set bit
             Some(b)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `map` keeps every page and every `set` cell, maps each offset's value,
+    /// and reads unset cells as the new fill inside and outside the pages: the
+    /// store `set` cell by cell with the mapped values.
+    #[test]
+    fn a_mapped_store_is_the_store_set_with_the_mapped_values() {
+        let page = DEFAULT_PAGE_SIZE as u64;
+        let mut bytes = PagedMem::new(0u8);
+        let cells = [
+            (0x10, 7u8),
+            (page - 1, 0),
+            (page, 255),
+            (5 * page + 3, 1),
+            (u64::MAX, 9),
+        ];
+        for (addr, value) in cells {
+            bytes.set(addr, value);
+        }
+        let mapped = bytes.map((0u8, 0u64), |value| (value, 0));
+        let mut set = PagedMem::new((0u8, 0u64));
+        for (addr, value) in cells {
+            set.set(addr, (value, 0));
+        }
+        assert_eq!(
+            mapped.page_bases().collect::<Vec<_>>(),
+            set.page_bases().collect::<Vec<_>>()
+        );
+        for base in set.page_bases() {
+            assert_eq!(
+                mapped.page_data(base),
+                set.page_data(base),
+                "page {base:#x}"
+            );
+        }
+        assert_eq!(
+            mapped.iter().collect::<Vec<_>>(),
+            set.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(mapped.len(), cells.len());
+        assert_eq!(mapped.get(page + 1), (0, 0));
+        assert_eq!(mapped.get(3 * page), (0, 0));
     }
 }
