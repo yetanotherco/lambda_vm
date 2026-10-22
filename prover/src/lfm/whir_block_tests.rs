@@ -2583,6 +2583,18 @@ fn the_whir_block_tree_on_a_real_block() {
         multilinear::gpu::resident_fold_calls(),
         multilinear::gpu::fused_fold_calls()
     );
+    // How each group's stacked polynomials were opened (`format.group`): one
+    // chain a polynomial, or one a run of up to four whose round 0 ran on the
+    // card, or fell to the host over the card's codewords (a fallback, each of
+    // its polynomials also among the openings on the host above); and the
+    // grouped successors folded and combined on the card rather than encoded.
+    println!(
+        "W3 WHIR GROUPED: {:?} · grouped chains on the card {} · on the host (fallback) {} · successors combined {}",
+        format.group,
+        multilinear::gpu::grouped_card_chains(),
+        multilinear::gpu::grouped_host_chains(),
+        multilinear::gpu::grouped_combined_successors()
+    );
     // The top proof's bytes: two runs prove the same ones under
     // LAMBDA_VM_FIXED_TRACE_HASH=1 and LAMBDA_VM_DETERMINISTIC_GRIND=1.
     let top_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&top.proof).expect("serialize the top");
@@ -3068,7 +3080,6 @@ fn a_p1_block_leaf_refuses_a_tampered_witness() {
 
 /// [`small_format`] at three polynomials a group under `base`, each group
 /// opened by one chain per run of its polynomials (`GroupFold::Indexed`).
-#[cfg(not(feature = "cuda"))]
 fn indexed_format(base: stark::proof::options::BaseFormat) -> BlockFormat {
     let small = small_format();
     BlockFormat {
@@ -3084,11 +3095,9 @@ fn indexed_format(base: stark::proof::options::BaseFormat) -> BlockFormat {
 /// `Indexed` block executes over the honest proof and the leaves' shares
 /// cancel; a grouped round-0 value tampered in a group is refused by the host
 /// and by that group's leaf; and the plan prices each group at most at its
-/// per-polynomial cost, below it wherever a run opens several trees. Host
-/// builds only: the card's grouped round 0 is stage B3.
+/// per-polynomial cost, below it wherever a run opens several trees.
 #[test]
 #[ignore = "executes block leaves over small block proofs; box tier"]
-#[cfg(not(feature = "cuda"))]
 fn an_indexed_blocks_leaves_execute_and_refuse_a_grouped_forgery() {
     use multilinear::whir_chain::RoundOpenings;
     let base = crate::hash_pin::BLOCK_BASE;
@@ -3221,7 +3230,6 @@ fn an_indexed_blocks_leaves_execute_and_refuse_a_grouped_forgery() {
 /// stack's group at that tree's opening at query 1 under the chain's own mark.
 /// The forgery touches the prepared opening alone, and the honest leaf
 /// executes.
-#[cfg(not(feature = "cuda"))]
 fn forged_prepared_chain(
     base: stark::proof::options::BaseFormat,
     stack: usize,
@@ -3358,7 +3366,6 @@ fn forged_prepared_chain(
 /// format. The grouped prepared chain is forged in tree 1.
 #[test]
 #[ignore = "proves small blocks and executes their leaves; box tier"]
-#[cfg(not(feature = "cuda"))]
 fn a_grouped_prepared_stack_verifies_and_its_leaf_refuses_a_forgery() {
     forged_prepared_chain(crate::hash_pin::BLOCK_BASE, 8, 12, |chains| {
         chains.iter().copied().find(|&(_, _, width)| width >= 2)
@@ -3372,7 +3379,6 @@ fn a_grouped_prepared_stack_verifies_and_its_leaf_refuses_a_forgery() {
 /// (`roots[run]`) is what refuses it, by position.
 #[test]
 #[ignore = "proves small blocks and executes their leaves; box tier"]
-#[cfg(not(feature = "cuda"))]
 fn a_split_prepared_stack_refuses_a_forgery_in_its_last_chain() {
     forged_prepared_chain(crate::hash_pin::BLOCK_BASE, 7, 24, |chains| {
         chains.iter().copied().rfind(|&(k, i, _)| {

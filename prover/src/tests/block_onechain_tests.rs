@@ -1,12 +1,11 @@
 //! D-ONECHAIN B1 at the block: one WHIR chain per run of a group's stacked
 //! polynomials ([`GroupFold::Indexed`]) through the block's frame, prover and
 //! verifier (REV-B2-JUDGE B1-1 (a), B1-5). The chain-level gates are
-//! `multilinear`'s `whir_group_tests`.
+//! `multilinear`'s `whir_group_tests`, and on the card its
+//! `whir_group_device`.
 //!
-//! On the host build only: a grouped round 0 folds host codewords, and the
-//! card's grouped round 0 is D-ONECHAIN's stage B3. Until then a card prover
-//! refuses an `Indexed` group by name (`DeviceFailed`), and a card build
-//! leaves these out.
+//! On either build: a card build runs a grouped round 0 on the card where it
+//! takes the stack, and on the host where it does not.
 
 use crate::block_whir::{
     self, BlockFormat, BlockOptions, BlockRefusal, BlockWhirProof, Deviations,
