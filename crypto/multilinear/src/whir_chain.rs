@@ -73,6 +73,33 @@ use crate::{
 
 pub use crate::whir_commit::LeafOrder;
 
+/// Why a round-0 successor was not encoded from its bound message — what
+/// [`Error::CosetSuccessorNotEncoded`] names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnencodedSuccessor {
+    /// `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0` (or a test's override): the fold
+    /// was chosen.
+    KnobOff,
+    /// The opening's factors were built on the host — the card declined the
+    /// opening (`gpu::open_host_fallbacks`) — and only factors on the card
+    /// encode.
+    HostFactors,
+    /// The card was asked for the encode and declined it
+    /// (`gpu::encode_declines`).
+    CardDeclined,
+}
+
+impl UnencodedSuccessor {
+    /// The cause, from whether the encode was on and where the factors were.
+    pub fn of(encode_on: bool, factors_on_card: bool) -> Self {
+        match (encode_on, factors_on_card) {
+            (false, _) => Self::KnobOff,
+            (true, false) => Self::HostFactors,
+            (true, true) => Self::CardDeclined,
+        }
+    }
+}
+
 /// Refuses a format whose round-0 leaf order `H`'s trees do not take: the
 /// coset order is defined for Poseidon1 trees alone — the production hash,
 /// base and recursion alike — so under any other hash it is not a state a
@@ -1382,6 +1409,11 @@ where
         }
     }
 
+    /// Whether these factors live on the card (the only ones that encode).
+    fn on_card(&self) -> bool {
+        matches!(self, Self::Device(_))
+    }
+
     /// The successor a `levels`-level fold of `codeword` would make, encoded
     /// from the message these rounds bound — on a device, when the factors and
     /// the codeword are both there, unless `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0`.
@@ -1799,6 +1831,18 @@ where
                     }
                     (encoded, folded_domain)
                 }
+                // ★ Under the coset order a round-0 codeword on the card, or
+                // held as its stack, is never folded: its successor is encoded
+                // from the bound message or the prove is refused, by cause. A
+                // codeword the host holds (a prover with no card) folds.
+                None if config.format.leaves == LeafOrder::Coset && held.codeword().on_device() => {
+                    return Err(Error::CosetSuccessorNotEncoded {
+                        cause: UnencodedSuccessor::of(
+                            crate::gpu::encode_successor_in_effect(),
+                            factors.on_card(),
+                        ),
+                    });
+                }
                 None => fold_held::<F, F, E>(held.codeword(), &current_domain, alphas)?,
             },
             Current::Grouped(held) => match held
@@ -1958,17 +2002,15 @@ where
     N: IsField + 'static,
     FieldElement<C>: AsBytes + Sync + Send,
 {
-    // A round-0 codeword held as its stack is re-encoded to be folded
-    // (counted): the fold reads every value.
-    let encoded = codeword.source().and_then(|held| held.source().encode());
-    if codeword.source().is_some() && encoded.is_none() {
+    // A round-0 codeword held as its stack exists only under the coset
+    // order, whose round 0 refuses a fold before reaching here.
+    if codeword.source().is_some() {
         return Err(Error::DeviceFailed {
-            stage: "re-encoding a round-0 codeword from its stack to fold it",
+            stage: "folding a round-0 codeword held as its stack",
         });
     }
-    if let Some(folded) = encoded
-        .as_ref()
-        .or_else(|| codeword.device())
+    if let Some(folded) = codeword
+        .device()
         .and_then(|device| device.fold(domain.generator(), alphas))
     {
         let mut folded_domain = domain.clone();

@@ -208,4 +208,13 @@ pub enum Error {
         expected: whir_commit::LeafOrder,
         got: whir_commit::LeafOrder,
     },
+    /// Under the coset round-0 leaf order, a round-0 codeword on the card (or
+    /// held as its stack) whose first successor was not encoded from the
+    /// bound message: the prove is refused rather than folded, by cause.
+    #[error(
+        "the coset round-0 order needs the first successor encoded from the bound message: {cause:?}"
+    )]
+    CosetSuccessorNotEncoded {
+        cause: whir_chain::UnencodedSuccessor,
+    },
 }

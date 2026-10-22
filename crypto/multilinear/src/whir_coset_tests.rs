@@ -23,7 +23,7 @@ use crate::{
     stacking::{StackedLayout, borrow},
     whir_chain::{
         self, ChainConfig, ChainFormat, FOLD_WORD_COSET, FOLD_WORD_INDEXED, FOLD_WORD_TAG,
-        FirstFold, GrindBits, GroupFold, LeafOrder, WhirFolds,
+        FirstFold, GrindBits, GroupFold, LeafOrder, UnencodedSuccessor, WhirFolds,
     },
     whir_commit::{CodewordCommitment, Commitment, TreeDrop, verify_opening},
     whir_hash::{KeccakWhir, P1Whir, RpxWhir, WhirHash},
@@ -465,6 +465,29 @@ fn the_coset_order_is_refused_by_name_under_keccak() {
 #[test]
 fn the_coset_order_is_refused_by_name_under_rpx() {
     the_coset_order_is_refused_by_name::<RpxWhir>();
+}
+
+/// A coset round 0 whose successor was not encoded is refused by cause: the
+/// knob off whatever the factors, then factors on the host, then the card
+/// declining. (The paths themselves need a card: `tests/whir_coset_device.rs`.)
+#[test]
+fn an_unencoded_successor_is_named_by_its_cause() {
+    assert_eq!(
+        UnencodedSuccessor::of(false, true),
+        UnencodedSuccessor::KnobOff
+    );
+    assert_eq!(
+        UnencodedSuccessor::of(false, false),
+        UnencodedSuccessor::KnobOff
+    );
+    assert_eq!(
+        UnencodedSuccessor::of(true, false),
+        UnencodedSuccessor::HostFactors
+    );
+    assert_eq!(
+        UnencodedSuccessor::of(true, true),
+        UnencodedSuccessor::CardDeclined
+    );
 }
 
 /// A round-0 commitment placed in the natural order is not proved under a

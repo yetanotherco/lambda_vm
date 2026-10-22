@@ -5325,12 +5325,25 @@ impl OpeningFactors {
         if !encode_successor() {
             return None;
         }
-        let session = self.materialize().ok()?;
-        let successor = session
-            .encode_successor_sized(source.0.elements(), source.0.room(), levels)
-            .ok()?;
-        ENCODED_SUCCESSORS.fetch_add(1, Ordering::Relaxed);
-        Some(DeviceCodeword(successor))
+        let encoded = if ENCODE_DECLINE_FORCED.load(Ordering::Relaxed) {
+            None
+        } else {
+            self.materialize().ok().and_then(|session| {
+                session
+                    .encode_successor_sized(source.0.elements(), source.0.room(), levels)
+                    .ok()
+            })
+        };
+        match encoded {
+            Some(successor) => {
+                ENCODED_SUCCESSORS.fetch_add(1, Ordering::Relaxed);
+                Some(DeviceCodeword(successor))
+            }
+            None => {
+                note_encode_declined(levels);
+                None
+            }
+        }
     }
 }
 

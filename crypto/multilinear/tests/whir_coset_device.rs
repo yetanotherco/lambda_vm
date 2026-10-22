@@ -23,7 +23,7 @@ use multilinear::stacked_eval::{Claimed, StackedCommitment, StackedProof, prove,
 use multilinear::stacking::{StackedLayout, borrow};
 use multilinear::whir::{Domain, encode, lift_coefficients};
 use multilinear::whir_chain::{
-    self, ChainConfig, ChainFormat, FirstFold, GrindBits, LeafOrder, WhirFolds,
+    self, ChainConfig, ChainFormat, FirstFold, GrindBits, LeafOrder, UnencodedSuccessor, WhirFolds,
 };
 use multilinear::whir_commit::{CodewordCommitment, TreeDrop};
 use multilinear::whir_hash::{P1Whir, WhirHash};
@@ -148,6 +148,9 @@ fn a_coset_chain_on_the_card_proves_the_host_chains_bytes() {
     }
 }
 
+/// A stack's roots and its proof.
+type Proved = (Vec<[u8; 32]>, StackedProof<F, Ext>);
+
 /// A stack committed over resident columns and opened: the whole tree's
 /// proof, then the same stack retired to `drop` 4-ary levels and revived.
 struct Stack {
@@ -193,6 +196,15 @@ impl Stack {
         cfg: &ChainConfig,
         drop: Option<usize>,
     ) -> (Vec<[u8; 32]>, StackedProof<F, Ext>) {
+        self.try_prove(cfg, drop).unwrap()
+    }
+
+    /// [`Self::prove`], its refusal returned.
+    fn try_prove(
+        &self,
+        cfg: &ChainConfig,
+        drop: Option<usize>,
+    ) -> Result<Proved, multilinear::Error> {
         let refs: Vec<&Mle<F>> = self.columns.iter().collect();
         let store = multilinear::gpu::upload_columns(&refs).expect("resident columns (a GPU)");
         let committed = StackedCommitment::<F, P1Whir>::commit(
@@ -200,20 +212,17 @@ impl Stack {
             &borrow(&self.columns),
             Some((&store, 0)),
             cfg,
-        )
-        .unwrap();
+        )?;
         let roots = committed.roots();
         let stacked = match drop {
             None => committed,
             Some(drop) => committed
-                .retire(TreeDrop::uniform(drop), cfg)
-                .unwrap()
+                .retire(TreeDrop::uniform(drop), cfg)?
                 .revive::<P1Whir, _>(
                     &borrow(&self.columns),
                     Some((&store, multilinear::stacked_eval::ColumnsAt::From(0))),
                     cfg,
-                )
-                .unwrap(),
+                )?,
         };
         let proof = prove::<F, Ext, _, P1Whir, _>(
             &stacked,
@@ -223,9 +232,8 @@ impl Stack {
             &self.values,
             cfg,
             &mut sponge(),
-        )
-        .unwrap();
-        (roots, proof)
+        )?;
+        Ok((roots, proof))
     }
 
     fn verify(&self, roots: &[[u8; 32]], proof: &StackedProof<F, Ext>, cfg: &ChainConfig) {
@@ -301,27 +309,77 @@ fn a_revived_coset_stack_proves_the_whole_trees_bytes_from_the_stack_or_a_reenco
     }
 }
 
-/// With the successor folded instead of encoded, a coset-ordered revive
-/// re-encodes its codeword (a fold reads every value) and proves the same
-/// bytes.
+/// ★ Under the coset order a successor that is not encoded from the bound
+/// message refuses the prove, named by its cause, on each path — the knob off,
+/// the factors on the host (the card declined the opening), the card declining
+/// the encode — for a stack committed on the card and one revived over its
+/// columns. Each path is shown taken by its own counter where it has one. The
+/// natural order under the same forcing folds and proves its whole tree's bytes.
 #[test]
-fn a_revived_coset_stack_folding_its_successor_reencodes_and_proves_the_same_bytes() {
+fn an_unencoded_successor_refuses_the_coset_prove_by_cause() {
     let _serial = serial();
-    let cfg = config(LeafOrder::Coset, CapPolicy::Auto);
+    let coset = config(LeafOrder::Coset, CapPolicy::Auto);
+    let natural = config(LeafOrder::Natural, CapPolicy::Auto);
     let stack = Stack::new(18);
-    let (_, whole) = stack.prove(&cfg, None);
-    multilinear::gpu::force_coset_openings(Some(true));
-    multilinear::gpu::force_encode_successor(Some(false));
-    let served = multilinear::gpu::coset_openings();
-    let (_, folded) = stack.prove(&cfg, Some(4));
-    assert_eq!(
-        multilinear::gpu::coset_openings(),
-        served,
-        "no stack-held revive"
-    );
-    multilinear::gpu::force_encode_successor(None);
-    multilinear::gpu::force_coset_openings(None);
-    assert_eq!(bytes!(&folded), bytes!(&whole));
+    let (_, natural_whole) = stack.prove(&natural, None);
+    type Force = fn(bool);
+    let paths: [(&str, Force, UnencodedSuccessor); 3] = [
+        (
+            "the knob off",
+            |on| multilinear::gpu::force_encode_successor(on.then_some(false)),
+            UnencodedSuccessor::KnobOff,
+        ),
+        (
+            "the factors on the host",
+            multilinear::gpu::force_shared_open_declined,
+            UnencodedSuccessor::HostFactors,
+        ),
+        (
+            "the card declining the encode",
+            multilinear::gpu::force_encode_decline,
+            UnencodedSuccessor::CardDeclined,
+        ),
+    ];
+    for (name, force, cause) in paths {
+        for drop in [None, Some(4)] {
+            let label = format!("{name}, drop {drop:?}");
+            let (declines, host) = (
+                multilinear::gpu::encode_declines(),
+                multilinear::gpu::open_host_fallbacks(),
+            );
+            force(true);
+            let refused = stack.try_prove(&coset, drop);
+            let natural_proof = stack.try_prove(&natural, drop);
+            force(false);
+            assert_eq!(
+                refused.err(),
+                Some(multilinear::Error::CosetSuccessorNotEncoded { cause }),
+                "{label}"
+            );
+            let (_, natural_proof) =
+                natural_proof.unwrap_or_else(|e| panic!("{label}: the natural order folds: {e:?}"));
+            assert_eq!(
+                bytes!(&natural_proof),
+                bytes!(&natural_whole),
+                "{label}: natural bytes"
+            );
+            match cause {
+                UnencodedSuccessor::CardDeclined => assert!(
+                    multilinear::gpu::encode_declines() > declines,
+                    "{label}: the decline counted"
+                ),
+                UnencodedSuccessor::HostFactors => assert!(
+                    multilinear::gpu::open_host_fallbacks() > host,
+                    "{label}: the host fallback counted"
+                ),
+                UnencodedSuccessor::KnobOff => {}
+            }
+        }
+    }
+    // Every forcing undone: the coset stack proves again, retired as whole.
+    let (_, again) = stack.prove(&coset, Some(4));
+    let (_, whole) = stack.prove(&coset, None);
+    assert_eq!(bytes!(&again), bytes!(&whole));
 }
 
 /// The natural order on the card is untouched: a retired natural stack still
