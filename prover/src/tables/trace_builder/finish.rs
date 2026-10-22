@@ -2360,58 +2360,98 @@ impl<'a> FinishPlan<'a> {
         gate: &gate::ByteGate,
         send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        emit_streamed_units(self.units(), gate, send)
+        emit_streamed_units(self.units(), gate, send, false)
     }
 
     /// [`Self::emit_streamed`], and with `keep` what phase B needs to build
-    /// KECCAK_RND's and LT's tables again ([`RestRegen`]).
+    /// KECCAK_RND's and LT's tables again ([`RestRegen`]); with `slide` the
+    /// tables are built as they are admitted instead of in waves
+    /// ([`emit_units_sliding`]).
     pub(super) fn emit_streamed_keeping(
         self,
         gate: &gate::ByteGate,
         send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
         keep: bool,
+        slide: bool,
     ) -> Result<Option<RestRegen>, Error> {
         let (units, regen) = match self.units_keeping(keep) {
             Ok((units, regen)) => (Ok(units), regen),
             Err(e) => (Err(e), None),
         };
-        emit_streamed_units(units, gate, send)?;
+        emit_streamed_units(units, gate, send, slide)?;
         Ok(regen)
     }
 }
 
-/// [`FinishPlan::emit_streamed`] over `units`: an error stops the gate, so it
-/// reaches every waiter, and is returned.
+/// [`FinishPlan::emit_streamed`] over `units`, in waves or sliding (`slide`;
+/// a build without the `parallel` feature builds one table at a time either
+/// way, so it always takes the waves): an error stops the gate, so it reaches
+/// every waiter, and is returned.
 fn emit_streamed_units(
     units: Result<Vec<Unit<'_>>, Error>,
     gate: &gate::ByteGate,
     send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
+    slide: bool,
 ) -> Result<(), Error> {
-    let result = emit_units(units, gate, send);
+    #[cfg(feature = "parallel")]
+    let result = if slide {
+        emit_units_sliding(units, gate, send)
+    } else {
+        emit_units(units, gate, send)
+    };
+    #[cfg(not(feature = "parallel"))]
+    let result = {
+        let _ = slide;
+        emit_units(units, gate, send)
+    };
     if let Err(e) = &result {
         gate.stop(&format!("the finish stopped: {e:?}"));
     }
     result
 }
 
-/// [`emit_streamed_units`]' loop.
+/// A table's bytes before it is built: its family's measured bytes a row once
+/// one of the family has been built, eight bytes a cell before.
+struct Estimates {
+    per_row: [Option<f64>; FAMILIES.len()],
+}
+
+impl Estimates {
+    fn new() -> Self {
+        Self {
+            per_row: [None; FAMILIES.len()],
+        }
+    }
+
+    fn of(&self, family: usize, rows: usize) -> usize {
+        let wide = FAMILIES.get(family).map_or(1, |&(_, columns)| columns) * 8;
+        let a_row = self
+            .per_row
+            .get(family)
+            .copied()
+            .flatten()
+            .unwrap_or(wide as f64);
+        (a_row * rows as f64).ceil() as usize
+    }
+
+    /// `table` of `family` was built at `bytes`.
+    fn learn(&mut self, family: usize, table: &Table, bytes: usize) {
+        if table.main_table.height > 0
+            && let Some(slot) = self.per_row.get_mut(family)
+        {
+            *slot = Some(bytes as f64 / table.main_table.height as f64);
+        }
+    }
+}
+
+/// [`emit_streamed_units`]' loop in waves.
 fn emit_units(
     units: Result<Vec<Unit<'_>>, Error>,
     gate: &gate::ByteGate,
     send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let wave_bytes = (gate.budget() / 2).max(1);
-    // Bytes a row each family's tables took, once one was built.
-    let mut per_row: [Option<f64>; FAMILIES.len()] = [None; FAMILIES.len()];
-    let estimate = |per_row: &[Option<f64>; FAMILIES.len()], family: usize, rows: usize| {
-        let wide = FAMILIES.get(family).map_or(1, |&(_, columns)| columns) * 8;
-        let a_row = per_row
-            .get(family)
-            .copied()
-            .flatten()
-            .unwrap_or(wide as f64);
-        (a_row * rows as f64).ceil() as usize
-    };
+    let mut estimates = Estimates::new();
     let mut units = units?.into_iter().enumerate().peekable();
     let mut next_table = 0usize;
     while units.peek().is_some() {
@@ -2422,7 +2462,7 @@ fn emit_units(
         let mut tables = 0usize;
         while let Some((_, unit)) = units.peek() {
             if let Unit::Build { family, rows, .. } = unit {
-                let est = estimate(&per_row, *family, *rows);
+                let est = estimates.of(*family, *rows);
                 if tables == 0 {
                     gate.acquire(next_table, est)?;
                 } else if bytes.saturating_add(est) > wave_bytes
@@ -2467,11 +2507,7 @@ fn emit_units(
                     })??;
                     let bytes = table_bytes(&table);
                     gate.resize(number, bytes);
-                    if table.main_table.height > 0
-                        && let Some(slot) = per_row.get_mut(family)
-                    {
-                        *slot = Some(bytes as f64 / table.main_table.height as f64);
-                    }
+                    estimates.learn(family, &table, bytes);
                     Some(table)
                 }
             };
@@ -2481,6 +2517,109 @@ fn emit_units(
     }
     build_stamps::mark("p5 end");
     Ok(())
+}
+
+/// A table built on the pool: its AIR position, its number among the rest's
+/// tables, its family, and the table or its error.
+#[cfg(feature = "parallel")]
+type Built = (usize, usize, usize, Result<Table, Error>);
+
+/// [`emit_streamed_units`]' loop without waves: each table starts building on
+/// the pool as soon as the gate admits its estimated bytes, while earlier ones
+/// still build, and is handed on in AIR order once it and every table before
+/// it are built. A wave lasts as long as its slowest table; here a slow table
+/// holds back only the hand-on of the tables after it, not their builds. The
+/// gate, the estimates, the tables and their order are the waves'. When
+/// nothing builds and every built table has been handed on, the packer holds
+/// every earlier table, so the next one may wait for its room (the lowest
+/// table not yet placed always goes). A job that panics ends the stream with
+/// an error.
+#[cfg(feature = "parallel")]
+fn emit_units_sliding(
+    units: Result<Vec<Unit<'_>>, Error>,
+    gate: &gate::ByteGate,
+    send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let units = units?;
+    let total = units.len();
+    let mut estimates = Estimates::new();
+    // Built, not yet handed on, by AIR position (`Some(None)`: a streamed
+    // chunk's slot).
+    let mut ready: Vec<Option<Option<Table>>> = (0..total).map(|_| None).collect();
+    let (tx, rx) = std::sync::mpsc::channel::<Built>();
+    let (mut next_send, mut next_table, mut building) = (0usize, 0usize, 0usize);
+    let mut units = units.into_iter().enumerate().peekable();
+    rayon::in_place_scope_fifo(|scope| {
+        loop {
+            while let Some(table) = ready.get_mut(next_send).and_then(Option::take) {
+                send(Emitted {
+                    position: next_send,
+                    table,
+                })?;
+                next_send += 1;
+            }
+            if next_send == total {
+                break;
+            }
+            // Start every table the gate admits, in order.
+            let mut waiting = false;
+            while let Some((position, unit)) = units.peek() {
+                if let Unit::Build { family, rows, .. } = unit {
+                    let est = estimates.of(*family, *rows);
+                    if building == 0 && next_send == *position {
+                        gate.acquire(next_table, est)?;
+                    } else if !gate.try_acquire(next_table, est)? {
+                        waiting = true;
+                        break;
+                    }
+                }
+                let Some((position, unit)) = units.next() else {
+                    break;
+                };
+                match unit {
+                    Unit::Streamed { .. } => ready[position] = Some(None),
+                    Unit::Build { family, job, .. } => {
+                        let (tx, number) = (tx.clone(), next_table);
+                        scope.spawn_fifo(move |_| {
+                            let table = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+                                .unwrap_or_else(|_| {
+                                    Err(Error::Prover(format!(
+                                        "the rest's table {number} panicked while building"
+                                    )))
+                                });
+                            let _ = tx.send((position, number, family, table));
+                        });
+                        next_table += 1;
+                        building += 1;
+                    }
+                }
+            }
+            if ready.get(next_send).is_some_and(Option::is_some) || building == 0 {
+                continue;
+            }
+            let built = if waiting {
+                match rx.recv_timeout(std::time::Duration::from_millis(5)) {
+                    Ok(built) => built,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(Error::Prover("the rest's builders stopped".into()));
+                    }
+                }
+            } else {
+                rx.recv()
+                    .map_err(|_| Error::Prover("the rest's builders stopped".into()))?
+            };
+            let (position, number, family, table) = built;
+            building -= 1;
+            let table = table?;
+            let bytes = table_bytes(&table);
+            gate.resize(number, bytes);
+            estimates.learn(family, &table, bytes);
+            ready[position] = Some(Some(table));
+        }
+        build_stamps::mark("p5 end");
+        Ok(())
+    })
 }
 
 #[cfg(test)]

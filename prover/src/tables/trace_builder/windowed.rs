@@ -182,6 +182,8 @@ pub struct WindowedTraceBuilder<'a> {
     walk_sizes: WalkSizes,
     /// [`Self::setup_stamps`].
     setup: SetupStamps,
+    /// [`Self::slide_rest`].
+    slide_rest: bool,
 }
 
 /// Where a builder's creation spent its time, seconds: the initial image and
@@ -373,6 +375,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 image: image_secs,
                 decode: decode_secs,
             },
+            slide_rest: false,
         })
     }
 
@@ -513,6 +516,15 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// length.
     pub fn stream_memw_lt(mut self) -> Self {
         self.stream_memw_lt = true;
+        self
+    }
+
+    /// The streamed finish builds each table as soon as its byte gate admits
+    /// it, while earlier ones still build, instead of in waves that each wait
+    /// for their slowest table ([`super::finish::FinishPlan::emit_streamed_keeping`]).
+    /// The tables and their order are the same.
+    pub fn slide_rest(mut self) -> Self {
+        self.slide_rest = true;
         self
     }
 
@@ -704,6 +716,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             Error,
         >,
     ) -> Result<Option<super::RestRegen>, Error> {
+        let slide = self.slide_rest;
         let Finishing {
             ops,
             image,
@@ -744,7 +757,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 return Err(e);
             }
         };
-        plan.emit_streamed_keeping(gate, &mut *send, keep)
+        plan.emit_streamed_keeping(gate, &mut *send, keep, slide)
     }
 
     /// The run's last window collected and walked, and the run's lists

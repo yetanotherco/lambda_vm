@@ -928,6 +928,15 @@ fn lt_concat() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_LT_CONCAT").is_ok_and(|v| v.trim() == "1")
 }
 
+/// `LAMBDA_VM_BLOCK_REST_SLIDE=1`: the streamed finish builds each of the rest's
+/// tables as soon as the byte gate admits it, while earlier ones still build,
+/// instead of in waves that each last as long as their slowest table
+/// ([`WindowedTraceBuilder::slide_rest`]); off by default. The tables and their
+/// order are the same.
+fn rest_slide() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_REST_SLIDE").is_ok_and(|v| v.trim() == "1")
+}
+
 /// The rows the rest's layout transposes at once ([`BlockOptions::rest_layout_bytes`]):
 /// each transposition is parallel within its table, so a wave of a few
 /// tables keeps the cores busy while bounding the copies in flight.
@@ -4058,6 +4067,9 @@ fn prove_streamed(
                 if lt_concat() {
                     builder = builder.concat_lt();
                 }
+                if rest_slide() {
+                    builder = builder.slide_rest();
+                }
                 if let Some(ledger) = ledger {
                     ledger.image.store(builder.image_bytes(), Relaxed);
                     ledger.line("builder created");
@@ -4287,9 +4299,14 @@ fn prove_streamed(
                     let g = |b: usize| b as f64 / (1u64 << 30) as f64;
                     let (waited, waits) = rest_gate.waited();
                     eprintln!(
-                        "BLOCK REST STREAM: the rest built in waves under a {:.2} GiB gate, held at most \
+                        "BLOCK REST STREAM: the rest built {} under a {:.2} GiB gate, held at most \
                          {:.2} GiB (built and not yet placed) · {waits} acquisitions waited {waited:.2}s \
                          for room (summed)",
+                        if rest_slide() {
+                            "as the gate admits each table"
+                        } else {
+                            "in waves"
+                        },
                         g(rest_gate.budget()),
                         g(rest_gate.most()),
                     );

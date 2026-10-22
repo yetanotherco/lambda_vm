@@ -6,7 +6,10 @@
 //! and a stopped packer each stop the emitter and every waiter; a header that
 //! miscounts is refused. The cut tables' padding rule
 //! ([`CutPadding`]) is one of the configurations: the header, the stream and
-//! the lists kept for phase B count the same tables under either rule.
+//! the lists kept for phase B count the same tables under either rule. Built
+//! as the gate admits each table instead of in waves
+//! ([`WindowedTraceBuilder::slide_rest`]), the stream is the same, and a slow
+//! table holds back only the hand-on of the tables after it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -570,58 +573,230 @@ fn units<'a>(n: usize, fail: Option<usize>) -> Vec<Unit<'a>> {
 /// gate, within a timeout.
 #[test]
 fn a_jobs_error_reaches_every_waiter() {
-    let done = within(30, || {
-        let gate = Arc::new(ByteGate::new(1));
-        let waiter = {
-            let gate = Arc::clone(&gate);
-            std::thread::spawn(move || gate.acquire(1000, 1 << 40))
-        };
-        let mut placed = 0usize;
-        let result = emit_streamed_units(Ok(units(4, Some(2))), &gate, &mut |emitted: Emitted| {
-            if emitted.table.is_some() {
-                gate.release(placed);
-                placed += 1;
-            }
-            Ok(())
+    for slide in [false, true] {
+        let done = within(30, move || {
+            let gate = Arc::new(ByteGate::new(1));
+            let waiter = {
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || gate.acquire(1000, 1 << 40))
+            };
+            let mut placed = 0usize;
+            let result = emit_streamed_units(
+                Ok(units(4, Some(2))),
+                &gate,
+                &mut |emitted: Emitted| {
+                    if emitted.table.is_some() {
+                        gate.release(placed);
+                        placed += 1;
+                    }
+                    Ok(())
+                },
+                slide,
+            );
+            (result, waiter.join().expect("the waiter"))
         });
-        (result, waiter.join().expect("the waiter"))
-    });
-    let (result, waited) = done.expect("an error must not hang the stream");
-    let err = result.expect_err("the stream fails");
-    assert!(format!("{err:?}").contains("job 2 failed"), "{err:?}");
-    assert!(waited.is_err(), "the waiter is stopped too");
+        let (result, waited) = done.expect("an error must not hang the stream");
+        let err = result.expect_err("the stream fails");
+        assert!(
+            format!("{err:?}").contains("job 2 failed"),
+            "slide {slide}: {err:?}"
+        );
+        assert!(waited.is_err(), "slide {slide}: the waiter is stopped too");
+    }
 }
 
 /// A packer that stops (its gate stopped, nothing placed) stops the emitter
 /// waiting for its next table's bytes; a sink that refuses stops it too.
 #[test]
 fn a_stopped_packer_stops_the_emitter() {
+    for slide in [false, true] {
+        let done = within(30, move || {
+            let gate = Arc::new(ByteGate::new(1));
+            let stopper = {
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    gate.stop("the packer stopped");
+                })
+            };
+            let result = emit_streamed_units(Ok(units(3, None)), &gate, &mut |_| Ok(()), slide);
+            stopper.join().expect("the stopper");
+            result
+        });
+        let err = done
+            .expect("a stopped packer must not hang the emitter")
+            .expect_err("stopped");
+        assert!(
+            format!("{err:?}").contains("the packer stopped"),
+            "slide {slide}: {err:?}"
+        );
+        let gate = ByteGate::new(usize::MAX);
+        let err = emit_streamed_units(
+            Ok(units(3, None)),
+            &gate,
+            &mut |_| Err(Error::Prover("the layout thread stopped".into())),
+            slide,
+        )
+        .expect_err("the sink refused");
+        assert!(
+            format!("{err:?}").contains("the layout thread stopped"),
+            "slide {slide}: {err:?}"
+        );
+    }
+}
+
+/// Built as the gate admits each table: every configuration, chunked small,
+/// windows of 7 and 1000 cycles, budgets of one byte, 2 GiB and none, hands on
+/// the monolithic finish's tables word for word in AIR order, as the waves do.
+#[test]
+fn the_sliding_stream_is_the_monolithic_finish_in_air_order() {
+    let max_rows = MaxRowsConfig::small();
+    for name in [
+        "misalign_sd",
+        "test_keccak_multi",
+        "test_ecsm_multi",
+        "test_blake3_absorb",
+    ] {
+        let (program, logs) = run(name);
+        for window in [7, 1000] {
+            for (config, configure) in &configs() {
+                let (builder, last) =
+                    pushed(&program, &logs, &max_rows, window, configure.as_ref());
+                let want = air_order(&builder.finish(last).expect("the monolithic finish"))
+                    .into_iter()
+                    .map(|t| t.map(shape_and_words))
+                    .collect::<Vec<_>>();
+                for budget in [1usize, 2 << 30, usize::MAX] {
+                    let what = format!("{name} window {window} {config} budget {budget}");
+                    let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                        configure(b).slide_rest()
+                    });
+                    let (_, got, _) = streamed(builder, last, budget);
+                    let got: Vec<_> = got
+                        .iter()
+                        .enumerate()
+                        .map(|(k, e)| {
+                            assert_eq!(e.position, k, "{what}: position {k}");
+                            e.table.as_ref().map(shape_and_words)
+                        })
+                        .collect();
+                    assert!(got == want, "{what}: the tables in AIR order");
+                }
+            }
+        }
+    }
+}
+
+/// Synthetic units that sleep: unit `slow` takes `long` ms, the others `short`;
+/// each notes when it starts building.
+#[cfg(feature = "parallel")]
+fn sleeping_units<'a>(
+    n: usize,
+    slow: usize,
+    long: u64,
+    short: u64,
+    started: &'a std::sync::Mutex<Vec<(usize, std::time::Instant)>>,
+) -> Vec<Unit<'a>> {
+    (0..n)
+        .map(|k| Unit::Build {
+            family: 0,
+            rows: 1,
+            job: Box::new(move || {
+                started
+                    .lock()
+                    .expect("the start log")
+                    .push((k, std::time::Instant::now()));
+                std::thread::sleep(Duration::from_millis(if k == slow { long } else { short }));
+                let width = FAMILIES[0].1;
+                Ok(TraceTable::new_main(
+                    crate::tables::types::zeroed_fe_vec(width),
+                    width,
+                    1,
+                ))
+            }) as Job<'a>,
+        })
+        .collect()
+}
+
+/// ★ Built as the gate admits each table, a slow first table does not hold
+/// back the next tables' builds (they all start before it ends), only their
+/// hand-on, which stays in order; built in waves of half the gate's budget,
+/// the tables after the first wave wait for its slowest table. The budget is
+/// the `n` tables' estimated bytes and the packer places each table as it
+/// comes.
+#[test]
+#[cfg(feature = "parallel")]
+fn a_slow_table_holds_back_only_the_hand_on() {
+    let n = rayon::current_num_threads().min(6);
+    assert!(n >= 2, "a pool of at least two threads");
+    let one = FAMILIES[0].1 * 8;
+    for slide in [true, false] {
+        let started = std::sync::Mutex::new(Vec::new());
+        let gate = ByteGate::new(n * one);
+        let t0 = std::time::Instant::now();
+        let (mut order, mut first_sent) = (Vec::new(), None);
+        emit_streamed_units(
+            Ok(sleeping_units(n, 0, 600, 20, &started)),
+            &gate,
+            &mut |e: Emitted| {
+                first_sent.get_or_insert(t0.elapsed());
+                gate.release(order.len());
+                order.push(e.position);
+                Ok(())
+            },
+            slide,
+        )
+        .expect("the stream");
+        assert_eq!(
+            order,
+            (0..n).collect::<Vec<_>>(),
+            "slide {slide}: in AIR order"
+        );
+        let started = started.into_inner().expect("the start log");
+        assert_eq!(started.len(), n, "slide {slide}");
+        let latest = started
+            .iter()
+            .map(|(_, at)| at.duration_since(t0))
+            .max()
+            .expect("starts");
+        let first_sent = first_sent.expect("a table was handed on");
+        assert!(
+            first_sent >= Duration::from_millis(600),
+            "slide {slide}: the slow table was handed on at {first_sent:?}"
+        );
+        if slide {
+            assert!(
+                latest < Duration::from_millis(400),
+                "the last table started at {latest:?}, behind the slow one"
+            );
+        } else {
+            assert!(
+                latest >= Duration::from_millis(600),
+                "in waves the last table started at {latest:?}, before the slow one ended"
+            );
+        }
+    }
+}
+
+/// A job that panics ends the sliding stream with an error naming its table,
+/// within a timeout, instead of hanging it.
+#[test]
+#[cfg(feature = "parallel")]
+fn a_panicking_job_ends_the_sliding_stream() {
     let done = within(30, || {
-        let gate = Arc::new(ByteGate::new(1));
-        let stopper = {
-            let gate = Arc::clone(&gate);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(100));
-                gate.stop("the packer stopped");
-            })
+        let gate = ByteGate::new(usize::MAX);
+        let mut units = units(3, None);
+        units[1] = Unit::Build {
+            family: 0,
+            rows: 1,
+            job: Box::new(|| panic!("a generator bug")),
         };
-        let result = emit_streamed_units(Ok(units(3, None)), &gate, &mut |_| Ok(()));
-        stopper.join().expect("the stopper");
-        result
+        emit_streamed_units(Ok(units), &gate, &mut |_| Ok(()), true)
     });
     let err = done
-        .expect("a stopped packer must not hang the emitter")
-        .expect_err("stopped");
-    assert!(format!("{err:?}").contains("the packer stopped"), "{err:?}");
-    let gate = ByteGate::new(usize::MAX);
-    let err = emit_streamed_units(Ok(units(3, None)), &gate, &mut |_| {
-        Err(Error::Prover("the layout thread stopped".into()))
-    })
-    .expect_err("the sink refused");
-    assert!(
-        format!("{err:?}").contains("the layout thread stopped"),
-        "{err:?}"
-    );
+        .expect("a panicking job must not hang the stream")
+        .expect_err("the stream fails");
+    assert!(format!("{err:?}").contains("table 1 panicked"), "{err:?}");
 }
 
 /// A header that miscounts any family by one is refused before a table is
