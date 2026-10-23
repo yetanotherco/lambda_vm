@@ -121,7 +121,7 @@ fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
             lengths.cpu_padded_rows,
             CPU_COLS as u64,
             aux_cols(cpu_buses(0).len()),
-            1,
+            2, // TIMESTAMP is preprocessed: see the note above BITWISE
         ),
         (
             lengths.memw_padded_rows,
@@ -183,10 +183,10 @@ fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
             aux_cols(copy_buses().len()),
             1,
         ),
-        // BITWISE / DECODE / PAGE / REGISTER take the preprocessed-trace commit
-        // path: it extracts ALL columns into the LDE and builds two Merkle trees
-        // (precomputed_tree + mult_tree), so main_cols = full NUM_COLUMNS and
-        // main_trees = 2.
+        // BITWISE / DECODE / PAGE / REGISTER, and CPU above, take the
+        // preprocessed-trace commit path: it extracts ALL columns into the LDE and
+        // builds two Merkle trees (precomputed_tree + mult_tree), so main_cols =
+        // full NUM_COLUMNS and main_trees = 2.
         (
             bitwise_rows,
             BITWISE_COLS as u64,

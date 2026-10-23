@@ -109,19 +109,21 @@
 //! One consequence of that last column divergence is worth stating here rather than
 //! leaving for a reader to find: the `Commit` bus carries the index as `dst[0]`
 //! alone, while the verifier enumerates `start_index + i` over a `u64`. The two
-//! agree only while the running commit index stays below `2^32`. COPY puts no
-//! constraint on `x254`'s high word, but the verifier pins the run's final register
-//! file (`register::halted_fini`: x254 is the output length, high word 0) and refuses
-//! an output of `2^32` bytes or more, so a run whose index carried into the high word
+//! agree only while the running commit index stays below `2^32`. Nothing in COPY
+//! forces `x254`'s high word to zero: `copy:c:dst_res_is_write` only makes the
+//! value written back `dst + count`, so the index never decreases and a carry into
+//! the high word stays there. The verifier pins the run's final register file
+//! (`register::halted_fini`: x254 is the output length, high word 0) and refuses an
+//! output of `2^32` bytes or more, so a run whose index carried into the high word
 //! does not verify.
 //!
-//! What keeps that safe is not the prover's own range check -- that is a backstop
-//! for a bug, and it is unreachable. It is the executor: `commit_public_output`
-//! caps the total committed output at `MAX_PUBLIC_OUTPUT_TOTAL_SIZE`, one mebibyte,
-//! so the index of an honest run stays four orders of magnitude below `2^32`. A run
-//! that tried to pass the cap fails in the executor, long before any trace exists.
-//! Raising that cap is what would make this a live question, and the domain-2 write
-//! is what retires it.
+//! The executor is what keeps an honest run inside that bound:
+//! `commit_public_output` caps the total committed output at
+//! `MAX_PUBLIC_OUTPUT_TOTAL_SIZE`, one mebibyte, so the index of an honest run stays
+//! four orders of magnitude below `2^32`. A run that tried to pass the cap fails in
+//! the executor, long before any trace exists, and the prover's own range check is a
+//! backstop for a bug, unreachable. Raising the cap past `2^32` bytes would make such
+//! runs unprovable, not unsound; the domain-2 write is what would lift the bound.
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;

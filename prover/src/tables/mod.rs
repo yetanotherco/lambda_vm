@@ -76,7 +76,7 @@ pub const STATIC_BLOWUP_FACTORS: &[u8] = &[2, 4, 8];
 /// |---------|------|-----|-----------|----------|
 /// | MEMW    |  49  |  26 |    127    |  2^19    |
 /// | MEMW_A  |  29  |  20 |     89    |  2^19 *  |
-/// | CPU     |  38  |  20 |     98    |  2^19    |
+/// | CPU     |  37  |  20 |     97    |  2^19    |
 /// | DVRM    |  34  |  35 |    139    |  2^19    |
 /// | MUL     |  26  |  25 |    101    |  2^20 †  |
 /// | LT      |  17  |  10 |     47    |  2^20    |
@@ -85,7 +85,7 @@ pub const STATIC_BLOWUP_FACTORS: &[u8] = &[2, 4, 8];
 /// | BRANCH  |  14  |   6 |     32    |  2^20    |
 /// | MEMW_R  |  10  |   7 |     31    |  2^20    |
 pub mod max_rows {
-    pub const CPU: usize = 1 << 19; // 524,288   — eff. width 98
+    pub const CPU: usize = 1 << 19; // 524,288   — eff. width 97
     pub const MEMW: usize = 1 << 19; // 524,288  — eff. width 127 (baseline)
     pub const MEMW_A: usize = 1 << 19; // 524,288 — eff. width 89
     pub const DVRM: usize = 1 << 19; // 524,288  — eff. width 139

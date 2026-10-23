@@ -1773,11 +1773,12 @@ fn test_prove_commit_forged_index_rejected() {
 /// The high word of the commit index.
 ///
 /// `copy:c:read_dst` writes the full `DWordWL` of `dst_res` back to x254, but the
-/// `Commit` bus carries the index as `dst[0]` alone and the trace builder pins x254's
-/// high word to zero rather than a constraint doing it. That makes the high half the
-/// one place where the register file and the COMMIT bus could drift apart, so it is
-/// worth pinning that a forged high word is caught — by the REGISTER side, since
-/// nothing in COPY looks at it.
+/// `Commit` bus carries the index as `dst[0]` alone, which makes the high half the
+/// one place where the register file and the COMMIT bus could drift apart. The
+/// verifier pins x254's final high word to zero (`register::halted_fini`), but this
+/// harness commits the trace's own FINI, so what refuses the forged high word here
+/// is COPY's `copy:c:dst_res_is_write` (the `ADD`'s high carry is no longer a bit)
+/// and the MEMW bus, where the forged x254 update no longer matches the honest one.
 #[test]
 fn test_prove_commit_forged_index_high_word_rejected() {
     use crate::tables::copy::cols as mm_cols;

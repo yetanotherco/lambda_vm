@@ -165,7 +165,7 @@ fn hostile_cpu_heights_are_rejected_by_the_verifier() {
 }
 
 /// `cpu_proof_start` (which the verifier reads CPU heights with) matches the
-/// `air_refs` layout for every HALT / accelerator combination. Checked in
+/// `air_refs` layout for every HALT / accelerator / IS_WH combination. Checked in
 /// release builds too, unlike the `debug_assert` in `air_refs`.
 #[test]
 fn cpu_proof_start_matches_air_refs_layout() {
@@ -201,7 +201,7 @@ fn cpu_proof_start_matches_air_refs_layout() {
                 assert_eq!(
                     refs[start + k].name(),
                     format!("CPU[{k}]"),
-                    "halt={include_halt} accelerators={mask:06b}"
+                    "halt={include_halt} optional={mask:06b}"
                 );
             }
         }

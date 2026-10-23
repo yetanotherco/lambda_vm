@@ -1447,7 +1447,7 @@ pub fn prove_with_options_and_inputs(
     let cpu_heights = cpu_heights_from_traces(&traces);
     tables::cpu::validate_heights(&cpu_heights)?;
     let committed_bytes = u32::try_from(traces.public_output_bytes.len())
-        .expect("trace build bounds the commit index to u32");
+        .map_err(|_| Error::Prover("public output exceeds u32 range".to_string()))?;
     let airs = VmAirs::new(
         &program,
         proof_options,
