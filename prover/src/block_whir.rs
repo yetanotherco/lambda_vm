@@ -3049,7 +3049,24 @@ pub(crate) struct Deviations {
     /// prover's own checks cannot tell it from the committed one.
     #[cfg(test)]
     pub card_fill_records_fault: usize,
+    /// The trace alone: phase A drains each closed group as it comes instead
+    /// of committing it, and the prove stops after the trace with
+    /// [`HOST_ONLY`] ([`trace_block_host_only`]).
+    pub host_only: bool,
 }
+
+/// What a host-only build ([`Deviations::host_only`]) drained: its groups,
+/// tables and cells, and when the last group was drained (seconds since the
+/// streamed prove started).
+struct Drained {
+    groups: usize,
+    tables: usize,
+    cells: u64,
+    at: f64,
+}
+
+/// The error a host-only build stops with, once its trace is built.
+pub(crate) const HOST_ONLY: &str = "host only";
 
 /// A prepared stack committed wrongly, tables by AIR index.
 #[derive(Clone, Copy, Debug)]
@@ -3136,6 +3153,48 @@ pub fn prove_block_whir_observed_groups(
         on_statement,
         on_group,
     )
+}
+
+/// The block's trace as the streamed prove builds it, each closed group
+/// drained instead of committed ([`Deviations::host_only`]): a box harness's
+/// measure of the host's own pace, with no card to wait for. Returns the
+/// stamps and the line naming what was drained.
+#[cfg(test)]
+pub(crate) fn trace_block_host_only(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+    options: &BlockOptions,
+) -> Result<(BlockStamps, String), Error> {
+    let window_log2 = options
+        .window_log2
+        .ok_or_else(|| Error::Prover("a host-only build is a streamed one".into()))?;
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let mut stamps = BlockStamps::default();
+    let deviations = Deviations {
+        host_only: true,
+        ..Default::default()
+    };
+    match prove_streamed(
+        &program,
+        elf_bytes,
+        private_inputs,
+        1usize << window_log2,
+        proof_options,
+        format,
+        options,
+        &deviations,
+        &|_, _| {},
+        &|_| {},
+        &mut stamps,
+    ) {
+        Err(Error::Prover(line)) if line.starts_with(HOST_ONLY) => Ok((stamps, line)),
+        Err(e) => Err(e),
+        Ok(_) => Err(Error::Prover(
+            "a host-only build committed its groups".into(),
+        )),
+    }
 }
 
 /// [`prove_block_whir_observed`] with a test's deviations.
@@ -5623,22 +5682,43 @@ fn prove_streamed(
                 Some(groups) => group_queue::In::Queue(groups),
                 None => group_queue::In::Channel(grx.iter()),
             };
-            let block = BlockCommitted::commit_groups_logged::<H>(
-                groups.inspect(|group| {
-                    if let Some(ledger) = ledger {
-                        ledger.sent.fetch_sub(memlog::group_bytes(group), Relaxed);
-                    }
-                    if let Some(pause) = deviations.group_take_pause {
-                        std::thread::sleep(pause);
-                    }
-                }),
-                &commit_config,
-                options.drop_levels,
-                options.narrow,
-                options.upload_ahead,
-                ledger.map(|ledger| ledger.block.clone()),
-                spill.clone(),
-            );
+            let block = if deviations.host_only {
+                // The trace alone: each closed group counted and dropped as
+                // it comes, nothing committed.
+                let mut drained = Drained {
+                    groups: 0,
+                    tables: 0,
+                    cells: 0,
+                    at: 0.0,
+                };
+                for group in groups {
+                    drained.groups += 1;
+                    drained.tables += group.len();
+                    drained.cells += group
+                        .iter()
+                        .map(|table| (table.num_committed_columns() as u64) << table.num_vars())
+                        .sum::<u64>();
+                }
+                drained.at = start.elapsed().as_secs_f64();
+                Err(drained)
+            } else {
+                Ok(BlockCommitted::commit_groups_logged::<H>(
+                    groups.inspect(|group| {
+                        if let Some(ledger) = ledger {
+                            ledger.sent.fetch_sub(memlog::group_bytes(group), Relaxed);
+                        }
+                        if let Some(pause) = deviations.group_take_pause {
+                            std::thread::sleep(pause);
+                        }
+                    }),
+                    &commit_config,
+                    options.drop_levels,
+                    options.narrow,
+                    options.upload_ahead,
+                    ledger.map(|ledger| ledger.block.clone()),
+                    spill.clone(),
+                ))
+            };
             (block, builder.join(), layout.join(), executor.join())
         });
         let queue_line = group_queue::line(queue_setting, queue_rule, &queue_stats);
@@ -5655,6 +5735,21 @@ fn prove_streamed(
         stamps.producer = waits.stamps();
         let laid =
             laid.map_err(|_| Error::Prover("the block's layout thread panicked".into()))??;
+        let block = match block {
+            Ok(block) => block,
+            Err(drained) => {
+                stamps.build = finished;
+                stamps.streamed = (windows_done, streamed);
+                stamps.prep = laid.busy;
+                stamps.layout = laid.layout.clone();
+                stamps.phase_a = start.elapsed().as_secs_f64();
+                return Err(Error::Prover(format!(
+                    "{HOST_ONLY}: the trace built and drained at {:.2}s · {} groups · {} tables · {} \
+                     cells · nothing committed",
+                    drained.at, drained.groups, drained.tables, drained.cells
+                )));
+            }
+        };
         let mut block = block.map_err(|e| Error::Prover(format!("{e:?}")))?;
         if deviations.narrow_width_map && !block.fault_narrow_width_map() {
             return Err(Error::Prover("no narrow table to break".into()));

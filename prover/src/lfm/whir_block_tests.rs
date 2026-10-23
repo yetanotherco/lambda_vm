@@ -3043,6 +3043,28 @@ fn the_whir_block_tree_on_a_real_block() {
     }
 }
 
+/// The real block's trace alone, as the streamed prove builds it under the
+/// harness's options, each closed group drained instead of committed
+/// ([`block_whir::trace_block_host_only`]): the host's own pace, with no card
+/// to wait for. The words of [`the_whir_block_tree_on_a_real_block`]; prints
+/// the build's stamps and a `BLOCK HOST ONLY` line.
+#[test]
+#[ignore = "a real block's trace: box only"]
+fn the_whir_block_trace_host_only_on_a_real_block() {
+    use super::whir_block_tree::WhirTreeConfig;
+    let elf = std::fs::read(std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF"))
+        .expect("read the ELF");
+    let input = std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT"))
+        .expect("read the input");
+    let cfg = WhirTreeConfig::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let opts = super::proof::block_base_options();
+    let (stamps, drained) =
+        block_whir::trace_block_host_only(&elf, &input, &opts, &cfg.format, &cfg.options)
+            .unwrap_or_else(|e| panic!("{e}"));
+    print!("{}", stamps.report());
+    println!("BLOCK HOST ONLY: {drained}");
+}
+
 // ========================= the batched argue (N-4) ========================
 
 /// [`small_format`] with each group's tables argued together at the format's

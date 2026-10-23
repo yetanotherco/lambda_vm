@@ -1374,6 +1374,33 @@ fn a_streamed_block_proves_and_verifies() {
     assert!(verify(&proof, &elf, &format));
 }
 
+/// A host-only build (a box harness's measure of the host's pace) drains the
+/// groups and tables the streamed prove commits, and commits none.
+#[test]
+fn a_host_only_build_drains_the_groups_the_prove_commits() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let options = streamed(MaxRowsConfig::small(), 16, 3);
+    let proof = prove(&elf, &format, &options);
+    let (stamps, drained) = block_whir::trace_block_host_only(
+        &elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        &format,
+        &options,
+    )
+    .expect("the host-only build");
+    let tables: usize = proof.groups.iter().map(Vec::len).sum();
+    assert!(
+        drained.contains(&format!(
+            "· {} groups · {tables} tables ·",
+            groups_of(&proof)
+        )),
+        "{drained}"
+    );
+    assert!(stamps.phase_a > 0.0 && stamps.build > 0.0);
+}
+
 #[test]
 fn a_streamed_block_with_keccak_chunks_proves_and_verifies() {
     let elf = asm_elf_bytes("test_keccak");
