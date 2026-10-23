@@ -1237,8 +1237,10 @@ mod tests {
     #[test]
     fn accel_counts_sizes_dma_calls() {
         let mut counts = AccelCounts::default();
-        // (bytes, rows) as the executor derives them at each ecall.
-        for (bytes, rows) in [(256, 33), (256, 33), (8, 2), (3, 4), (0, 1)] {
+        // Rows as the executor derives them at each ecall.
+        for bytes in [256, 256, 8, 3, 0] {
+            let rows =
+                executor::vm::instruction::execution::copy_trace_rows(0x1000, 0x2000, bytes, false);
             counts.tally(Accelerator::Dma, bytes, rows);
         }
 
@@ -1246,7 +1248,7 @@ mod tests {
         assert_eq!(counts.dma_bytes, 523);
         // The rows are the executor's, derived where src, dst and count are all known;
         // the report only sums them.
-        assert_eq!(counts.dma_rows, 73);
+        assert_eq!(counts.dma_rows, 32 + 32 + 1 + 3 + 1);
 
         // The other accelerators must leave the DMA size lines alone.
         let mut others = AccelCounts::default();

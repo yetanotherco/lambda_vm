@@ -33,7 +33,7 @@
 //! sound and avoids the mixed-timestamp bookkeeping of a partial-buffer read.
 //!
 //! `mu` is constrained to a bit (`IS_BIT`, the table's only algebraic constraint) —
-//! the same guard every other multiplicity-column table carries (ECSM/ECDAS/COMMIT/
+//! the same guard every other multiplicity-column table carries (ECSM/ECDAS/COPY/
 //! STORE/MEMW_R). The `Ecall` bus alone does not establish it: its tuple carries the
 //! timestamp, a free column, so the LogUp identity pins only the *sum* of `mu` over
 //! the rows sharing a `(ts, syscall)` tuple to the CPU's send — it does not rule out

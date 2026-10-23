@@ -976,7 +976,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // -------------------------------------------------------------------------
-    // ECALL: system-call bus (HALT/COMMIT/KECCAK receive). mult = ECALL.
+    // ECALL: system-call bus (HALT/COPY/KECCAK/ECSM/HINT receive). mult = ECALL.
     // ECALL[timestamp, rv1].
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(

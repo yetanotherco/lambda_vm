@@ -307,11 +307,11 @@ pub enum BusId {
     // =========================================================================
     /// Instruction decode lookup
     Decode = 18,
-    /// System call handling (CPU → HALT/COMMIT for all ECALLs)
+    /// System call handling (CPU → HALT/COPY/KECCAK/ECSM/HINT for all ECALLs)
     Ecall = 19,
     // ID 20 is reserved for the removed CommitNextByte bus: COMMIT's per-byte
     // recursion moved to COPY, which chains over [`BusId::CopyNext`].
-    /// COMMIT output bus: verifier computes the receiver contribution externally
+    /// Commit output bus (sent by COPY's commit rows): verifier computes the receiver contribution externally
     /// from `VmProof.public_output` using the shared LogUp challenges
     Commit = 21,
     /// Keccak core ↔ round chip: (timestamp, round, state[200 bytes])

@@ -93,7 +93,7 @@ pub struct RuntimePageRange {
 pub const FIXED_TABLE_COUNT: usize = 6;
 
 /// How many sub-proofs each counted table contributes. Chunked chips report
-/// their chunk count; the six accelerators are not chunked and report 0 or 1
+/// their chunk count; the five accelerators are not chunked and report 0 or 1
 /// (see `validate`). The verifier needs this to reconstruct matching AIRs.
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct TableCounts {

@@ -535,7 +535,7 @@ fn validate_still_requires_cpu_and_the_register_file() {
 }
 
 /// The counts ride in the proof, so they are the prover's to choose, and the
-/// sub-proof cross-check constrains only their *sum*. The six accelerators are
+/// sub-proof cross-check constrains only their *sum*. The five accelerators are
 /// not chunked — `generate_optional` emits one table or none — so any count
 /// above 1 describes a table set no prover can build, and the sum alone does not
 /// catch it: lower another count by the same amount and the total still matches.
@@ -577,7 +577,7 @@ fn an_accelerator_count_above_one_is_rejected() {
         );
     }
 
-    // The chunked chips keep taking any count: this is a cap on the six, not a
+    // The chunked chips keep taking any count: this is a cap on the five, not a
     // cap on chunking.
     let mut many_mul = honest.clone();
     many_mul.mul = 7;
@@ -615,9 +615,9 @@ fn counts_that_wrap_have_no_total() {
 
 /// The accelerators are the ones a run most often never reaches, and each cost a
 /// four-row sub-proof regardless. A program with no keccak, no EC and no hint
-/// ecall now carries none of the six.
+/// ecall now carries none of the five.
 #[test]
-fn a_run_without_accelerators_omits_all_six() {
+fn a_run_without_accelerators_omits_all_five() {
     let (elf, logs, _instructions) = run_asm_elf("xori");
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();

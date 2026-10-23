@@ -2,7 +2,7 @@ use riscv as _;
 
 const MAX_MEMORY_SIZE: usize = 0xC000_0000;
 
-/// The accelerated `memset` depends on this.
+/// Kept for the accelerated `memset`, though its soundness no longer depends on it.
 ///
 /// COPY pins `dst = src + 8` with one 64-bit `ADD`, so a range crossing the 2^32 limb
 /// boundary is perfectly provable and neither the chip nor the executor refuses it
