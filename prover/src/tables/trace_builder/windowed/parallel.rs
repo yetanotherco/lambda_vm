@@ -296,7 +296,7 @@ pub struct ParallelWalk {
     pub most_entries: usize,
     /// The most walked windows held, waiting for an earlier one.
     pub held_most: usize,
-    /// The most bytes the walkers' window states took, summed.
+    /// The most bytes the walkers' window states took at once.
     pub state_bytes: usize,
 }
 
@@ -318,17 +318,32 @@ impl ParallelWalk {
 
 /// The run's windows, as the executor sends them (each with its memory at the
 /// window's start), walked on `walkers` threads from the lean pass's entries
-/// and absorbed strictly in window order by `absorb`. The builder then holds
-/// the state the walk holds before the run's last window, which is returned
-/// (the finish walks it as usual). The first error anywhere stops every thread
-/// and is returned; a walker that panics is an error.
+/// and absorbed strictly in window order by `absorb`, which is also given the
+/// bytes the walkers' window states take then. The builder then holds the
+/// state the walk holds before the run's last window, which is returned (the
+/// finish walks it as usual). The builder must not have walked a window yet.
+/// The first error anywhere stops every thread and is returned; a walker that
+/// panics is an error.
 pub fn walk_windows(
     builder: &mut WindowedTraceBuilder<'_>,
     windows: Receiver<(Vec<Log>, Option<MemorySnapshot>)>,
     walkers: usize,
-    mut absorb: impl FnMut(&mut Accumulator<'_>, WalkedWindow) -> Result<(), Error>,
+    absorb: impl FnMut(&mut Accumulator<'_>, WalkedWindow, usize) -> Result<(), Error>,
+) -> Result<ParallelWalk, Error> {
+    walk_numbered(builder, windows, walkers, |k| k, absorb)
+}
+
+/// [`walk_windows`], each job numbered `number(k)` for the run's window `k`:
+/// a test numbers them wrong to show the absorbing side refuses it.
+fn walk_numbered(
+    builder: &mut WindowedTraceBuilder<'_>,
+    windows: Receiver<(Vec<Log>, Option<MemorySnapshot>)>,
+    walkers: usize,
+    number: fn(u32) -> u32,
+    mut absorb: impl FnMut(&mut Accumulator<'_>, WalkedWindow, usize) -> Result<(), Error>,
 ) -> Result<ParallelWalk, Error> {
     assert!(walkers >= 1, "walk_windows needs a walker");
+    debug_assert_eq!(builder.cycles, 0, "walk_windows starts the run");
     let settings = Arc::new(WalkSettings {
         decode: Arc::clone(&builder.decode),
         lookups: !builder.lean.lookups,
@@ -342,7 +357,9 @@ pub fn walk_windows(
         let job_rx = Mutex::new(job_rx);
         std::thread::scope(|scope| -> Result<_, Error> {
             let (done_tx, done_rx) =
-                sync_channel::<(u32, Result<(WalkedWindow, f64, usize), Error>)>(walkers + 2);
+                sync_channel::<(u32, usize, Result<(WalkedWindow, f64, usize), Error>)>(
+                    walkers + 2,
+                );
             let (permit_tx, permit_rx) = sync_channel::<()>(walkers + 2);
             let decode = Arc::clone(&settings.decode);
             let pass = scope.spawn(move || {
@@ -352,12 +369,13 @@ pub fn walk_windows(
                     image,
                     lean,
                     windows,
+                    number,
                     job_tx,
                     permit_tx,
                 )
             });
             let mut threads = Vec::with_capacity(walkers);
-            for _ in 0..walkers {
+            for w in 0..walkers {
                 let (job_rx, done_tx, settings) = (&job_rx, done_tx.clone(), Arc::clone(&settings));
                 threads.push(scope.spawn(move || {
                     let mut walker = WindowWalker::new(settings);
@@ -389,7 +407,7 @@ pub fn walk_windows(
                             })
                             .map(|(walked, busy)| (walked, busy, walker.state_bytes()));
                         let failed = outcome.is_err();
-                        if done_tx.send((window, outcome)).is_err() || failed {
+                        if done_tx.send((window, w, outcome)).is_err() || failed {
                             stopped = true;
                         }
                     }
@@ -397,11 +415,13 @@ pub fn walk_windows(
             }
             drop(done_tx);
             let (mut held, mut next, mut held_most) = (BTreeMap::new(), 0u32, 0usize);
-            let (mut walk_secs, mut states) = (0.0, vec![0usize; 0]);
+            // Each walker's window state as of its last window, and the most
+            // they took at once.
+            let (mut walk_secs, mut states, mut state_bytes) = (0.0, vec![0usize; walkers], 0);
             // The first error from a walker or from absorbing; an absorbing
             // error is this thread's own and always wins.
             let (mut failure, mut absorbing) = (None, false);
-            'windows: for (window, outcome) in &done_rx {
+            'windows: for (window, w, outcome) in &done_rx {
                 let (walked, busy, bytes) = match outcome {
                     Ok(walked) => walked,
                     Err(e) => {
@@ -410,20 +430,29 @@ pub fn walk_windows(
                     }
                 };
                 walk_secs += busy;
-                states.push(bytes);
+                states[w] = bytes;
+                state_bytes = state_bytes.max(states.iter().sum());
                 if window < next || held.insert(window, walked).is_some() {
                     failure = Some(Error::Prover(format!("window {window} was walked twice")));
                     break;
                 }
                 held_most = held_most.max(held.len());
                 while let Some(walked) = held.remove(&next) {
-                    if let Err(e) = absorb(&mut accumulator, walked) {
+                    if let Err(e) = absorb(&mut accumulator, walked, states.iter().sum()) {
                         (failure, absorbing) = (Some(e), true);
                         break 'windows;
                     }
                     // One window fewer handed out and not absorbed.
                     let _ = permit_rx.recv();
                     next += 1;
+                }
+                // On a correct run window `next` is handed out before every
+                // window held, so the permits leave room for at most
+                // `walkers + 1` held. With `walkers + 2` the pass waits for a
+                // permit only window `next` frees: it was never handed out.
+                if held.len() >= walkers + 2 {
+                    failure = Some(Error::Prover(format!("window {next} was never walked")));
+                    break;
                 }
             }
             // On a failure the other threads see their channels close.
@@ -450,12 +479,7 @@ pub fn walk_windows(
                         end.windows
                     )))
                 }
-                (None, Ok(end)) => {
-                    // A window state's bytes, as many walkers as there are.
-                    states.sort_unstable();
-                    let state_bytes = states.iter().rev().take(walkers).sum();
-                    Ok((end, walk_secs, held_most, state_bytes))
-                }
+                (None, Ok(end)) => Ok((end, walk_secs, held_most, state_bytes)),
             }
         })?
     };
@@ -486,14 +510,17 @@ pub fn walk_windows(
 }
 
 /// The pass's thread: each window but the last passed and handed out as a
-/// job, a permit taken for each; what follows each job sent once the next
-/// window is passed (or, after the run's last window, the finish's state).
+/// job (numbered `number(k)`), a permit taken for each; what follows each job
+/// sent once the next window is passed (or, after the run's last window, the
+/// finish's state).
+#[allow(clippy::too_many_arguments)]
 fn pass_thread(
     decode: Arc<DecodeTable>,
     start_registers: &RegisterState,
     image: &PagedMem<u8>,
     lean: bool,
     windows: Receiver<(Vec<Log>, Option<MemorySnapshot>)>,
+    number: fn(u32) -> u32,
     jobs: SyncSender<Ticket>,
     permits: SyncSender<()>,
 ) -> Result<PassEnd, Error> {
@@ -533,7 +560,7 @@ fn pass_thread(
         let cycles = logs.len();
         jobs.send(Ticket {
             job: WindowJob {
-                window: k,
+                window: number(k),
                 first,
                 logs,
                 start,

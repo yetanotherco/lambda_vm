@@ -922,6 +922,11 @@ impl<'a> WindowedTraceBuilder<'a> {
         self.stamps.walk += walk_secs;
     }
 
+    /// The bytes the walk's carried memory state takes on the heap.
+    pub(crate) fn state_bytes(&self) -> usize {
+        self.memory_state.heap_bytes()
+    }
+
     /// The accumulating half alone, with the run's initial image: what a run
     /// walked from its entries ([`parallel::walk_windows`]) absorbs its windows
     /// with and builds the finish's state from.

@@ -10,7 +10,7 @@ use executor::vm::logs::Log;
 
 use super::super::lean_pass::LeanPass;
 use super::super::{ChunkJob, WalkedWindow, WindowedTraceBuilder};
-use super::{WalkSettings, WindowJob, WindowWalker, walk_windows};
+use super::{WalkSettings, WindowJob, WindowWalker, walk_numbered, walk_windows};
 use crate::Error;
 use crate::tables::MaxRowsConfig;
 use crate::tables::trace_builder::Traces;
@@ -567,7 +567,7 @@ fn walked_on_threads(
                 k += 1;
             }
         });
-        walk_windows(&mut builder, rx, walkers, |accumulator, walked| {
+        walk_windows(&mut builder, rx, walkers, |accumulator, walked, _| {
             chunks.extend(
                 accumulator
                     .absorb(walked)
@@ -644,7 +644,7 @@ fn an_error_anywhere_stops_the_walk_and_is_returned() {
             }
         });
         let mut absorbed = 0;
-        walk_windows(&mut builder, rx, 3, |_, _| {
+        walk_windows(&mut builder, rx, 3, |_, _, _| {
             absorbed += 1;
             if absorbed == 4 {
                 return Err(Error::Prover("the absorbing side stopped".into()));
@@ -657,4 +657,68 @@ fn an_error_anywhere_stops_the_walk_and_is_returned() {
         "{:?}",
         walked.err()
     );
+}
+
+/// The run of program `name` by windows of 7 cycles on `walkers` threads,
+/// each job numbered `number(k)`, on a thread of its own: what it returns, or
+/// `None` if it has not returned within 30 s.
+fn numbered_on_a_thread(
+    name: &'static str,
+    walkers: usize,
+    number: fn(u32) -> u32,
+) -> Option<Result<(), Error>> {
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (program, _) = run(name);
+        let max_rows = MaxRowsConfig::small();
+        let walked = WindowedTraceBuilder::new(&program, &[], &max_rows).and_then(|mut builder| {
+            let (tx, rx) = std::sync::mpsc::sync_channel(2);
+            std::thread::scope(|scope| {
+                let program = &program;
+                scope.spawn(move || {
+                    let mut executor = Executor::new(program, Vec::new()).expect("the executor");
+                    let mut start = Some(executor.memory().snapshot());
+                    while let Some(logs) = executor
+                        .resume_with_limit(7)
+                        .expect("the run")
+                        .map(<[Log]>::to_vec)
+                    {
+                        let next = Some(executor.memory().snapshot());
+                        if tx
+                            .send((logs, std::mem::replace(&mut start, next)))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+                walk_numbered(&mut builder, rx, walkers, number, |_, _, _| Ok(()))
+            })
+            .map(|_| ())
+        });
+        let _ = out_tx.send(walked);
+    });
+    out_rx.recv_timeout(std::time::Duration::from_secs(30)).ok()
+}
+
+/// A window number the pass never hands out is refused, not waited for
+/// forever; one handed out twice is refused too.
+#[test]
+fn a_window_never_walked_or_walked_twice_is_refused() {
+    let name = "test_keccak_multi";
+    // Enough windows to fill every permit with window 1 missing, at 4 walkers.
+    let (_, logs) = run(name);
+    assert!(logs.len() > 7 * 12, "{} cycles", logs.len());
+    for walkers in [1, 2, 4] {
+        let skipped = numbered_on_a_thread(name, walkers, |k| k + (k > 0) as u32);
+        assert!(
+            matches!(&skipped, Some(Err(Error::Prover(m))) if m == "window 1 was never walked"),
+            "{walkers} walkers, window 1 skipped: {skipped:?}"
+        );
+        let repeated = numbered_on_a_thread(name, walkers, |k| if k == 2 { 1 } else { k });
+        assert!(
+            matches!(&repeated, Some(Err(Error::Prover(m))) if m == "window 1 was walked twice"),
+            "{walkers} walkers, window 1 repeated: {repeated:?}"
+        );
+    }
 }

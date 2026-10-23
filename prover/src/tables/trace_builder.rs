@@ -99,6 +99,7 @@ use compact_eq::CompactEq;
 pub(crate) use finish::{Emitted, RegenFamily, RegenJob, RestHeader, RestRegen};
 #[cfg(test)]
 pub(crate) use windowed::DECODE_TRACE_DELAY;
+#[cfg(feature = "parallel")]
 pub(crate) use windowed::parallel;
 pub use windowed::{
     Accumulator, ChunkJob, RegenBuilder, SetupStamps, StreamTable, StreamedChunk, WalkedWindow,

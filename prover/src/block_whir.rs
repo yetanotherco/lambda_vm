@@ -942,29 +942,49 @@ fn rest_slide() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_REST_SLIDE").is_ok_and(|v| v.trim() == "1")
 }
 
+/// The most window walkers `LAMBDA_VM_BLOCK_WALKERS` takes: each walker holds
+/// a window's state and walked lists, and this is the most whose memory was
+/// measured on the largest blocks.
+const MAX_WALKERS: usize = 4;
+
 /// `LAMBDA_VM_BLOCK_WALKERS`: unset, empty or `0` walks the run's windows on
-/// one thread (the default); `1` to `16` walks them on that many threads, each
-/// window from the bytes it touches as they stood before it
+/// one thread (the default); `1` to [`MAX_WALKERS`] walks them on that many
+/// threads, each window from the bytes it touches as they stood before it
 /// ([`parallel::walk_windows`]). The tables and their order are the same.
-/// Anything else refuses the prove.
+/// Anything else refuses the prove, and so do walkers with the executor's
+/// words store (`LAMBDA_VM_EXEC_MEMORY=words`), whose every window's snapshot
+/// copies the whole map.
 fn block_walkers() -> Result<usize, Error> {
-    parse_walkers(std::env::var("LAMBDA_VM_BLOCK_WALKERS").ok().as_deref())
+    parse_walkers(
+        std::env::var("LAMBDA_VM_BLOCK_WALKERS").ok().as_deref(),
+        executor::vm::memory::StoreKind::from_env(),
+    )
 }
 
-/// [`block_walkers`] of the knob's value.
-fn parse_walkers(value: Option<&str>) -> Result<usize, Error> {
-    match value.map(str::trim) {
-        None | Some("" | "0") => Ok(0),
+/// [`block_walkers`] of the knob's value and the executor's store.
+fn parse_walkers(
+    value: Option<&str>,
+    store: executor::vm::memory::StoreKind,
+) -> Result<usize, Error> {
+    let walkers = match value.map(str::trim) {
+        None | Some("" | "0") => return Ok(0),
         Some(v) => v
             .parse::<usize>()
             .ok()
-            .filter(|n| (1..=16).contains(n))
+            .filter(|n| (1..=MAX_WALKERS).contains(n))
             .ok_or_else(|| {
                 Error::Prover(format!(
-                    "LAMBDA_VM_BLOCK_WALKERS={v}: 0 (one walker), or 1 to 16 walkers"
+                    "LAMBDA_VM_BLOCK_WALKERS={v}: 0 (one walker), or 1 to {MAX_WALKERS} walkers"
                 ))
-            }),
+            })?,
+    };
+    if store == executor::vm::memory::StoreKind::Words {
+        return Err(Error::Prover(format!(
+            "LAMBDA_VM_BLOCK_WALKERS={walkers} needs the executor's pages store, not \
+             LAMBDA_VM_EXEC_MEMORY=words"
+        )));
     }
+    Ok(walkers)
 }
 
 /// The rows the rest's layout transposes at once ([`BlockOptions::rest_layout_bytes`]):
@@ -4126,10 +4146,15 @@ fn prove_streamed(
                 let last = if walkers > 0 {
                     // The windows walked from their entries on `walkers`
                     // threads, absorbed here in order as below.
-                    let report =
-                        parallel::walk_windows(&mut builder, lrx, walkers, |accumulator, walked| {
+                    let report = parallel::walk_windows(
+                        &mut builder,
+                        lrx,
+                        walkers,
+                        |accumulator, walked, states| {
+                            // The walked windows wait in the walk's reorder
+                            // buffer, not on a channel: no `walked` term.
                             if let Some(ledger) = ledger {
-                                ledger.walked.fetch_sub(walked.heap_bytes(), Relaxed);
+                                ledger.walk.store(states, Relaxed);
                                 ledger.logs.fetch_sub(
                                     walked.cycles() * size_of::<executor::vm::logs::Log>(),
                                     Relaxed,
@@ -4158,7 +4183,13 @@ fn prove_streamed(
                                 ledger.builder.store(accumulator.held_bytes(), Relaxed);
                             }
                             Ok(())
-                        })?;
+                        },
+                    )?;
+                    if let Some(ledger) = ledger {
+                        // The window states are gone; the walk's state is the
+                        // finish's, as on one walker.
+                        ledger.walk.store(builder.state_bytes(), Relaxed);
+                    }
                     eprintln!("{}", report.line());
                     report.last
                 } else {
@@ -6602,24 +6633,41 @@ mod packer_tests {
 
 #[cfg(test)]
 mod walkers_knob_tests {
-    use super::parse_walkers;
+    use executor::vm::memory::StoreKind;
+
+    use super::{Error, parse_walkers};
 
     /// `LAMBDA_VM_BLOCK_WALKERS`: unset, empty or 0 is one walker (the
-    /// default path); 1 to 16 that many; any other word refuses the prove.
+    /// default path); 1 to 4 that many; any other word refuses the prove, and
+    /// so do walkers with the executor's words store.
     #[test]
-    fn the_walkers_knob_takes_0_to_16_and_refuses_anything_else() {
+    fn the_walkers_knob_takes_0_to_4_and_refuses_anything_else() {
         for (value, walkers) in [
             (None, 0),
             (Some(""), 0),
             (Some("0"), 0),
-            (Some(" 4 "), 4),
             (Some("1"), 1),
-            (Some("16"), 16),
+            (Some(" 3 "), 3),
+            (Some("4"), 4),
         ] {
-            assert_eq!(parse_walkers(value).ok(), Some(walkers), "{value:?}");
+            assert_eq!(
+                parse_walkers(value, StoreKind::Pages).ok(),
+                Some(walkers),
+                "{value:?}"
+            );
         }
-        for value in ["17", "-1", "auto", "4x", "1.5"] {
-            assert!(parse_walkers(Some(value)).is_err(), "{value}");
+        for value in ["5", "8", "16", "17", "-1", "auto", "4x", "1.5"] {
+            assert!(parse_walkers(Some(value), StoreKind::Pages).is_err(), "{value}");
+        }
+        for value in [None, Some(""), Some("0")] {
+            assert_eq!(parse_walkers(value, StoreKind::Words).ok(), Some(0));
+        }
+        for value in ["1", "4"] {
+            let refused = parse_walkers(Some(value), StoreKind::Words);
+            assert!(
+                matches!(&refused, Err(Error::Prover(m)) if m.contains("pages store")),
+                "{value}: {refused:?}"
+            );
         }
     }
 }
