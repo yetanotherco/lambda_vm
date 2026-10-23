@@ -566,8 +566,9 @@ pub fn grouped_combined_successors() -> u64 {
     GROUPED_COMBINES.load(Ordering::Relaxed)
 }
 
-/// Called where a grouped chain over card codewords builds its round-0
-/// factors on the host: counted once as a chain and once a polynomial
+/// Called where a grouped chain over card codewords (held, or served from
+/// their stack) builds its round-0 factors on the host: counted once as a
+/// chain and once a polynomial
 /// ([`note_open_host_fallback`]), and said.
 pub(crate) fn note_grouped_host_fallback(polys: usize, n_stack: usize) {
     let count = GROUPED_HOST_CHAINS.fetch_add(1, Ordering::Relaxed) + 1;

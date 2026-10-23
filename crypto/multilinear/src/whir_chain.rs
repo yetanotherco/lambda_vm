@@ -1676,7 +1676,9 @@ where
             num_vars: n_stack,
         },
         None => {
-            if commitments.iter().any(|c| c.codeword().device().is_some()) {
+            // Counted over codewords the card holds or a stack it serves from:
+            // either way the card was meant to build these factors.
+            if commitments.iter().any(|c| c.codeword().on_device()) {
                 crate::gpu::note_grouped_host_fallback(width, n_stack);
             }
             // Only here do the run's stacked polynomials and weights exist on
