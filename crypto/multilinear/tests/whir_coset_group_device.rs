@@ -263,11 +263,12 @@ fn grouped_coset_run_on_the_card(log_blowup: usize) {
 }
 
 /// ★ Under the coset order a grouped run's successor that is not encoded
-/// refuses the prove, named by its cause, on each path — the knob off, the
-/// run's factors built on the host (the card declined an opening), the card
+/// refuses the prove, named by its cause, on each path — the knob off, the card
 /// declining the encode — committed and opened whole and revived. Each path is
 /// shown taken by its counter where it has one. The natural order under the
-/// same forcing folds and proves its unforced bytes.
+/// same forcing folds and proves its unforced bytes. A run whose factors the
+/// host built (the card declined an opening) encodes its successor on the host
+/// and proves its unforced bytes.
 #[test]
 fn an_unencoded_grouped_successor_refuses_the_coset_prove_by_cause() {
     let _serial = serial();
@@ -276,16 +277,11 @@ fn an_unencoded_grouped_successor_refuses_the_coset_prove_by_cause() {
     let stack = Stack::new();
     let (_, natural_whole) = stack.try_prove(&natural, None).unwrap();
     type Force = fn(bool);
-    let paths: [(&str, Force, UnencodedSuccessor); 3] = [
+    let paths: [(&str, Force, UnencodedSuccessor); 2] = [
         (
             "the knob off",
             |on| gpu::force_encode_successor(on.then_some(false)),
             UnencodedSuccessor::KnobOff,
-        ),
-        (
-            "the run's factors on the host",
-            gpu::force_shared_open_declined,
-            UnencodedSuccessor::HostFactors,
         ),
         (
             "the card declining the encode",
@@ -317,15 +313,40 @@ fn an_unencoded_grouped_successor_refuses_the_coset_prove_by_cause() {
                     gpu::encode_declines() > declines,
                     "{label}: the decline counted"
                 ),
-                UnencodedSuccessor::HostFactors => assert!(
-                    gpu::grouped_host_chains() > host,
-                    "{label}: the grouped host fallback counted"
-                ),
-                UnencodedSuccessor::KnobOff => {}
+                UnencodedSuccessor::HostFactors | UnencodedSuccessor::KnobOff => {}
             }
+            assert_eq!(
+                gpu::grouped_host_chains(),
+                host,
+                "{label}: the run's factors on the card"
+            );
         }
     }
     // Every forcing undone: the coset run proves again.
     let (roots, again) = stack.try_prove(&coset, Some(4)).unwrap();
     stack.verify(&roots, &again, &coset, "after the forcings");
+    // The run's factors on the host (the card declined the opening): its
+    // successor is encoded there, from the combined message the rounds bound,
+    // and the run proves the bytes it proves unforced.
+    let (_, whole) = stack.try_prove(&coset, None).unwrap();
+    for drop in [None, Some(4)] {
+        let label = format!("the run's factors on the host, drop {drop:?}");
+        let (host, encodes) = (gpu::grouped_host_chains(), gpu::coset_host_encodes());
+        gpu::force_shared_open_declined(true);
+        let encoded = stack.try_prove(&coset, drop);
+        gpu::force_shared_open_declined(false);
+        let (roots, encoded) =
+            encoded.unwrap_or_else(|e| panic!("{label}: the host encodes the successor: {e:?}"));
+        assert!(
+            gpu::grouped_host_chains() > host,
+            "{label}: the grouped host fallback counted"
+        );
+        assert_eq!(
+            gpu::coset_host_encodes() - encodes,
+            1,
+            "{label}: one host encode, the run's"
+        );
+        stack.verify(&roots, &encoded, &coset, &label);
+        assert!(bytes(&encoded) == bytes(&whole), "{label}: the run's bytes");
+    }
 }

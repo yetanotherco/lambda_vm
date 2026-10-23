@@ -348,11 +348,14 @@ fn a_revived_grouped_coset_run_serves_every_tree_from_its_stack() {
 }
 
 /// ★ Under the coset order a revived run's successor that is not encoded
-/// refuses the prove, named by its cause, on each path — the knob off, the
-/// run's factors built on the host (counted as a grouped host fallback: a
-/// tree held as its stack is a card codeword), the card declining the encode
-/// (counted). The natural order under the same forcing re-encodes, folds and
-/// proves its unforced bytes.
+/// refuses the prove, named by its cause, on each path — the knob off, the card
+/// declining the encode (counted). The natural order under the same forcing
+/// re-encodes, folds and proves its unforced bytes.
+///
+/// A revived run whose factors the host built (the card declined the opening;
+/// counted as a grouped host fallback, a tree held as its stack being a card
+/// codeword) encodes its successor on the host from the combined message the
+/// rounds bound, re-encodes nothing, and proves the bytes the run proves whole.
 #[test]
 fn a_revived_grouped_coset_run_refuses_an_unencoded_successor_by_cause() {
     let _serial = serial();
@@ -360,17 +363,13 @@ fn a_revived_grouped_coset_run_refuses_an_unencoded_successor_by_cause() {
     let natural = config(LeafOrder::Natural);
     let stack = Stack::run_of_three();
     let (_, natural_whole) = stack.try_prove(&natural, None).unwrap();
+    let (_, coset_whole) = stack.try_prove(&coset, None).unwrap();
     type Force = fn(bool);
-    let paths: [(&str, Force, UnencodedSuccessor); 3] = [
+    let paths: [(&str, Force, UnencodedSuccessor); 2] = [
         (
             "the knob off",
             |on| gpu::force_encode_successor(on.then_some(false)),
             UnencodedSuccessor::KnobOff,
-        ),
-        (
-            "the run's factors on the host",
-            gpu::force_shared_open_declined,
-            UnencodedSuccessor::HostFactors,
         ),
         (
             "the card declining the encode",
@@ -380,7 +379,7 @@ fn a_revived_grouped_coset_run_refuses_an_unencoded_successor_by_cause() {
     ];
     for (name, force, cause) in paths {
         let label = format!("{name}, revived at drop 4");
-        let (declines, host) = (gpu::encode_declines(), gpu::grouped_host_chains());
+        let declines = gpu::encode_declines();
         let before = Counts::now();
         force(true);
         let refused = stack.try_prove(&coset, Some(4));
@@ -399,18 +398,45 @@ fn a_revived_grouped_coset_run_refuses_an_unencoded_successor_by_cause() {
             bytes(&natural_proof) == bytes(&natural_whole),
             "{label}: the natural order's bytes"
         );
-        match cause {
-            UnencodedSuccessor::CardDeclined => assert!(
+        if cause == UnencodedSuccessor::CardDeclined {
+            assert!(
                 gpu::encode_declines() > declines,
                 "{label}: the decline counted"
-            ),
-            UnencodedSuccessor::HostFactors => assert!(
-                gpu::grouped_host_chains() >= host + 2,
-                "{label}: the grouped host fallback counted for the coset run and the natural one"
-            ),
-            UnencodedSuccessor::KnobOff => {}
+            );
         }
     }
+    // The run's factors on the host: its successor is encoded there.
+    let label = "the run's factors on the host, revived at drop 4";
+    let (host, encodes) = (gpu::grouped_host_chains(), gpu::coset_host_encodes());
+    let before = Counts::now();
+    gpu::force_shared_open_declined(true);
+    let encoded = stack.try_prove(&coset, Some(4));
+    let natural_proof = stack.try_prove(&natural, Some(4));
+    gpu::force_shared_open_declined(false);
+    let moved = before.since();
+    let (roots, encoded) =
+        encoded.unwrap_or_else(|e| panic!("{label}: the host encodes the successor: {e:?}"));
+    assert!(
+        gpu::grouped_host_chains() >= host + 2,
+        "{label}: the grouped host fallback counted for the coset run and the natural one"
+    );
+    assert_eq!(
+        gpu::coset_host_encodes() - encodes,
+        stack.chains(),
+        "{label}: one host encode a chain"
+    );
+    assert_eq!(moved.reencoded, 0, "{label}: nothing re-encoded");
+    stack.verify(&roots, &encoded, &coset, label);
+    assert!(
+        bytes(&encoded) == bytes(&coset_whole),
+        "{label}: the run's whole bytes"
+    );
+    let (_, natural_proof) =
+        natural_proof.unwrap_or_else(|e| panic!("{label}: the natural order folds: {e:?}"));
+    assert!(
+        bytes(&natural_proof) == bytes(&natural_whole),
+        "{label}: the natural order's bytes"
+    );
     // Every forcing undone: the revived coset run proves again, from its stack.
     let before = Counts::now();
     let (roots, again) = stack.try_prove(&coset, Some(4)).unwrap();

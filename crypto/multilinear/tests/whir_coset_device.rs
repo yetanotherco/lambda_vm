@@ -348,16 +348,17 @@ fn revived_coset_stack(log_blowup: usize) {
 
 /// ★ Under the coset order a successor that is not encoded from the bound
 /// message refuses the prove, named by its cause, on each path — the knob off,
-/// the factors kept on the host (the card declined the opening: the shared one
-/// and the uploaded one both), the card declining the encode — for a stack
-/// committed on the card and one revived over its columns. Each path is shown
-/// taken by its own counter where it has one. The natural order under the same
-/// forcing folds and proves its whole tree's bytes.
+/// the card declining the encode — for a stack committed on the card and one
+/// revived over its columns. Each path is shown taken by its own counter where
+/// it has one. The natural order under the same forcing folds and proves its
+/// whole tree's bytes.
 ///
-/// And the fallback that still encodes: with only the shared opening declined,
-/// the factors are built from the host's tables and uploaded to the card, so
-/// the successor IS encoded and the coset prove passes with its whole tree's
-/// bytes (the host fallback counted all the same).
+/// And the two fallbacks that still encode, each passing with the whole tree's
+/// bytes and the host fallback counted: the factors kept on the host (the card
+/// declined the opening: the shared one and the uploaded one both), whose
+/// successor is encoded on the host from the message they bound (one host
+/// encode a chain); and only the shared opening declined, whose host tables are
+/// uploaded to the card, so the card encodes.
 #[test]
 fn an_unencoded_successor_refuses_the_coset_prove_by_cause() {
     let _serial = serial();
@@ -366,19 +367,11 @@ fn an_unencoded_successor_refuses_the_coset_prove_by_cause() {
     let stack = Stack::new(18);
     let (_, natural_whole) = stack.prove(&natural, None);
     type Force = fn(bool);
-    let paths: [(&str, Force, UnencodedSuccessor); 3] = [
+    let paths: [(&str, Force, UnencodedSuccessor); 2] = [
         (
             "the knob off",
             |on| multilinear::gpu::force_encode_successor(on.then_some(false)),
             UnencodedSuccessor::KnobOff,
-        ),
-        (
-            "the factors kept on the host",
-            |on| {
-                multilinear::gpu::force_shared_open_declined(on);
-                multilinear::gpu::force_device_open_declined(on);
-            },
-            UnencodedSuccessor::HostFactors,
         ),
         (
             "the card declining the encode",
@@ -414,18 +407,50 @@ fn an_unencoded_successor_refuses_the_coset_prove_by_cause() {
                     multilinear::gpu::encode_declines() > declines,
                     "{label}: the decline counted"
                 ),
-                UnencodedSuccessor::HostFactors => assert!(
-                    multilinear::gpu::open_host_fallbacks() > host,
-                    "{label}: the host fallback counted"
-                ),
-                UnencodedSuccessor::KnobOff => {}
+                UnencodedSuccessor::HostFactors | UnencodedSuccessor::KnobOff => {}
             }
+            assert_eq!(
+                multilinear::gpu::open_host_fallbacks(),
+                host,
+                "{label}: the factors on the card"
+            );
         }
     }
     // Every forcing undone: the coset stack proves again, retired as whole.
     let (_, again) = stack.prove(&coset, Some(4));
     let (_, whole) = stack.prove(&coset, None);
     assert_eq!(bytes!(&again), bytes!(&whole));
+    // The factors kept on the host: the successor is encoded there, from the
+    // message they bound, and the coset prove passes with the same bytes.
+    let chains = stack.layout.num_polys() as u64;
+    for drop in [None, Some(4)] {
+        let label = format!("the factors kept on the host, drop {drop:?}");
+        let (host, encodes) = (
+            multilinear::gpu::open_host_fallbacks(),
+            multilinear::gpu::coset_host_encodes(),
+        );
+        multilinear::gpu::force_shared_open_declined(true);
+        multilinear::gpu::force_device_open_declined(true);
+        let encoded = stack.try_prove(&coset, drop);
+        multilinear::gpu::force_device_open_declined(false);
+        multilinear::gpu::force_shared_open_declined(false);
+        let (_, encoded) =
+            encoded.unwrap_or_else(|e| panic!("{label}: the host encodes the successor: {e:?}"));
+        assert!(
+            multilinear::gpu::open_host_fallbacks() > host,
+            "{label}: the host fallback counted"
+        );
+        assert_eq!(
+            multilinear::gpu::coset_host_encodes() - encodes,
+            chains,
+            "{label}: one host encode a chain"
+        );
+        assert_eq!(
+            bytes!(&encoded),
+            bytes!(&whole),
+            "{label}: the whole tree's bytes"
+        );
+    }
     // Only the shared opening declined: the host's tables go to the card, the
     // successor is encoded, and the coset prove passes with the same bytes.
     for drop in [None, Some(4)] {

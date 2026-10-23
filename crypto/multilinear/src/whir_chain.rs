@@ -81,8 +81,9 @@ pub enum UnencodedSuccessor {
     /// was chosen.
     KnobOff,
     /// The opening's factors were built on the host — the card declined the
-    /// opening (`gpu::open_host_fallbacks`) — and only factors on the card
-    /// encode.
+    /// opening (`gpu::open_host_fallbacks`). Not returned by a prove: the
+    /// successor is then encoded on the host from the message those factors
+    /// bound (`gpu::coset_host_encodes`).
     HostFactors,
     /// The card was asked for the encode and declined it
     /// (`gpu::encode_declines`).
@@ -1414,6 +1415,14 @@ where
         matches!(self, Self::Device(_))
     }
 
+    /// The message these rounds bound, when the host holds it.
+    fn host_message(&self) -> Option<&Mle<E>> {
+        match self {
+            Self::Host { message, .. } => Some(message),
+            _ => None,
+        }
+    }
+
     /// The successor a `levels`-level fold of `codeword` would make, encoded
     /// from the message these rounds bound — on a device, when the factors and
     /// the codeword are both there, unless `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0`.
@@ -1835,15 +1844,23 @@ where
                 }
                 // ★ Under the coset order a round-0 codeword on the card, or
                 // held as its stack, is never folded: its successor is encoded
-                // from the bound message or the prove is refused, by cause. A
-                // codeword the host holds (a prover with no card) folds.
+                // from the bound message — on the host when the host built the
+                // factors — or the prove is refused, by cause. A codeword the
+                // host holds (a prover with no card) folds.
                 None if config.format.leaves == LeafOrder::Coset && held.codeword().on_device() => {
-                    return Err(Error::CosetSuccessorNotEncoded {
-                        cause: UnencodedSuccessor::of(
-                            crate::gpu::encode_successor_in_effect(),
-                            factors.on_card(),
-                        ),
-                    });
+                    match factors.host_message() {
+                        Some(message) if crate::gpu::encode_successor_in_effect() => {
+                            encode_successor_on_host::<F, E>(message, &current_domain, k)?
+                        }
+                        _ => {
+                            return Err(Error::CosetSuccessorNotEncoded {
+                                cause: UnencodedSuccessor::of(
+                                    crate::gpu::encode_successor_in_effect(),
+                                    factors.on_card(),
+                                ),
+                            });
+                        }
+                    }
                 }
                 None => fold_held::<F, F, E>(held.codeword(), &current_domain, alphas)?,
             },
@@ -1864,18 +1881,26 @@ where
                 // ★ The same rule as a polynomial's own round 0: under the
                 // coset order a run whose round-0 codewords are on the card is
                 // never folded — its successor is encoded from the combined
-                // bound message, or the prove is refused by cause (the knob
-                // off; the run's factors built on the host; the card declining
-                // the encode). A run whose codewords the host holds folds.
+                // bound message, on the host when the host built the run's
+                // factors, or the prove is refused by cause (the knob off; the
+                // card declining the encode). A run whose codewords the host
+                // holds folds.
                 None if config.format.leaves == LeafOrder::Coset
                     && held.iter().any(|c| c.codeword().on_device()) =>
                 {
-                    return Err(Error::CosetSuccessorNotEncoded {
-                        cause: UnencodedSuccessor::of(
-                            crate::gpu::encode_successor_in_effect(),
-                            factors.on_card(),
-                        ),
-                    });
+                    match factors.host_message() {
+                        Some(message) if crate::gpu::encode_successor_in_effect() => {
+                            encode_successor_on_host::<F, E>(message, &current_domain, k)?
+                        }
+                        _ => {
+                            return Err(Error::CosetSuccessorNotEncoded {
+                                cause: UnencodedSuccessor::of(
+                                    crate::gpu::encode_successor_in_effect(),
+                                    factors.on_card(),
+                                ),
+                            });
+                        }
+                    }
                 }
                 None => fold_grouped::<F, E, H>(held, &current_domain, alphas, rho)?,
             },
@@ -2044,6 +2069,32 @@ where
     })?;
     let (folded, folded_domain) = fold_codeword_k::<F, C, N>(values, domain, alphas)?;
     Ok((Codeword::Host(folded), folded_domain))
+}
+
+/// ★ The successor of a coset-ordered round 0 whose factors the host built (the
+/// card declined the opening): the message the rounds bound there, lifted and
+/// encoded over the `levels`-times folded domain — the fold's values without
+/// reading the codeword, so a round 0 held as its stack takes it too. A run's
+/// message is its combined one, `Σ_p eq(ρ, p)·f_p` bound, so this is its
+/// successor `Σ_p eq(ρ, p)·Fold_α(C_p)`. Counted and said.
+fn encode_successor_on_host<F, E>(
+    message: &Mle<E>,
+    domain: &Domain<F>,
+    levels: usize,
+) -> Result<(Codeword<E>, Domain<F>), Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: Send + Sync,
+    FieldElement<E>: Send + Sync,
+{
+    let mut folded_domain = domain.clone();
+    for _ in 0..levels {
+        folded_domain = folded_domain.squared()?;
+    }
+    let values = encode::<F, E>(&lift_coefficients(message), &folded_domain)?;
+    crate::gpu::note_coset_host_encode(levels, message.num_vars());
+    Ok((Codeword::Host(values), folded_domain))
 }
 
 /// Round 0's successor in a grouped chain: each round-0 codeword folded by the

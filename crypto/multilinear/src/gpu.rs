@@ -109,6 +109,11 @@ static COSET_OPENINGS: AtomicU64 = AtomicU64::new(0);
 /// all: a plan the kernels do not take, the card declining, or a fold. Each is
 /// today's cost paid where the lever was meant to save it.
 static COSET_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+/// Coset-ordered round-0 successors encoded on the HOST, from the message the
+/// host's factors bound: the card declined the opening (or the stack is under
+/// its sumcheck threshold), and a round 0 on the card is never folded under
+/// that order. The same bytes as the card's encode; a host NTT's time instead.
+static COSET_HOST_ENCODES: AtomicU64 = AtomicU64::new(0);
 /// ★ Stacked openings whose codeword the device holds but whose factors the
 /// device did not build from the shares.
 ///
@@ -460,6 +465,21 @@ fn note_coset_fallback() {
     COSET_FALLBACKS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// [`COSET_HOST_ENCODES`].
+pub fn coset_host_encodes() -> u64 {
+    COSET_HOST_ENCODES.load(Ordering::Relaxed)
+}
+
+/// Called where a coset-ordered round 0's successor is encoded on the host:
+/// counted, and said.
+pub(crate) fn note_coset_host_encode(levels: usize, num_vars: usize) {
+    let count = COSET_HOST_ENCODES.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!(
+        "[whir] a coset round-0 successor encoded on the HOST from the bound message \
+         ({levels}-level fold, message 2^{num_vars}); coset host encodes {count}"
+    );
+}
+
 /// Whether a coset-ordered round-0 commitment is revived over its stack (its
 /// openings evaluated coset by coset) instead of re-encoded: the default under
 /// the coset order; `LAMBDA_VM_WHIR_COSET_OPENINGS=0` or a test's override
@@ -669,6 +689,7 @@ pub fn reset_call_counters() {
     ENCODE_DECLINES.store(0, Ordering::Relaxed);
     COSET_OPENINGS.store(0, Ordering::Relaxed);
     COSET_FALLBACKS.store(0, Ordering::Relaxed);
+    COSET_HOST_ENCODES.store(0, Ordering::Relaxed);
     OPEN_HOST_FALLBACKS.store(0, Ordering::Relaxed);
     GROUPED_CARD_CHAINS.store(0, Ordering::Relaxed);
     GROUPED_HOST_CHAINS.store(0, Ordering::Relaxed);
