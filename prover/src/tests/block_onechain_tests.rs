@@ -24,15 +24,28 @@ use stark::proof::options::{BaseFormat, ProofOptions};
 
 /// A stack of 2^10 and `group_polys` polynomials a group under `base`, so a
 /// small program spans several groups, argued per `argue` and opened per
-/// `group`.
+/// `group`. A card declines to open a stack this small (its sumcheck
+/// threshold is 2^12), so on a card build a coset round 0 here encodes its
+/// successor on the host ([`multilinear::gpu::coset_host_encodes`]).
 fn format(
     base: BaseFormat,
     group_polys: usize,
     group: GroupFold,
     argue: ArgueFormat,
 ) -> BlockFormat {
+    format_at(base, group_polys, group, argue, 10)
+}
+
+/// [`format`] at a stack of `2^stack_vars`.
+fn format_at(
+    base: BaseFormat,
+    group_polys: usize,
+    group: GroupFold,
+    argue: ArgueFormat,
+    stack_vars: usize,
+) -> BlockFormat {
     let mut zf = ZfFormat::DEFAULT.with_base(base);
-    zf.whir_stack = StackVars::new(10).expect("a valid stack");
+    zf.whir_stack = StackVars::new(stack_vars).expect("a valid stack");
     BlockFormat {
         zf,
         group_polys,
@@ -333,11 +346,20 @@ fn an_indexed_coset_block_is_refused_by_a_natural_verifier() {
         block_whir::verify_block_whir(proof, &elf, &opts, format).unwrap_or(false)
     };
     for (blowup, other) in [(4, 2), (2, 4)] {
+        let encodes = multilinear::gpu::coset_host_encodes();
         let coset = prove(&elf, &at(blowup, LeafOrder::Coset), MaxRowsConfig::small());
         assert!(
             grouped_widths(&coset).iter().any(|&w| w >= 2),
             "a grouped chain under the coset order at blowup {blowup}"
         );
+        // On a card the 2^10 stack's openings fall to the host, and each coset
+        // round 0 encodes its successor there: counted, the prove goes on.
+        if cfg!(feature = "cuda") {
+            assert!(
+                multilinear::gpu::coset_host_encodes() > encodes,
+                "the host encodes counted at blowup {blowup}"
+            );
+        }
         assert!(
             verify(&coset, &at(blowup, LeafOrder::Coset)),
             "the control at blowup {blowup}"
@@ -388,11 +410,20 @@ fn a_composed_block_is_refused_one_setting_away() {
         block_whir::verify_block_whir(proof, &elf, &opts, format).unwrap_or(false)
     };
     let composed = at(GroupFold::Indexed, LeafOrder::Coset, 2);
+    let encodes = multilinear::gpu::coset_host_encodes();
     let proof = prove(&elf, &composed, MaxRowsConfig::small());
     assert!(
         grouped_widths(&proof).iter().any(|&w| w >= 2),
         "a grouped chain in the composed block"
     );
+    // On a card the 2^10 stack's openings fall to the host: each coset round
+    // 0 encodes its successor there, counted, and the prove goes on.
+    if cfg!(feature = "cuda") {
+        assert!(
+            multilinear::gpu::coset_host_encodes() > encodes,
+            "the host encodes counted"
+        );
+    }
     assert!(verify(&proof, &composed), "the composed format's control");
     for (label, other) in [
         ("blowup 4", at(GroupFold::Indexed, LeafOrder::Coset, 4)),
@@ -417,6 +448,44 @@ fn a_composed_block_is_refused_one_setting_away() {
         !verify(&neighbour, &composed),
         "the composed verifier must refuse a block in the natural order"
     );
+}
+
+/// ★ The defaults' block at a stack the card opens (2^12, its sumcheck
+/// threshold): one chain a run under the coset order, at blowup 4 and under the
+/// composed format at blowup 2, proves and verifies, and on a card build no
+/// round-0 successor is encoded on the host — the 2^10 tests above take that
+/// fallback; a block at a card's stack size never does.
+#[test]
+fn a_coset_block_at_a_card_sized_stack_encodes_no_successor_on_the_host() {
+    use multilinear::whir_chain::LeafOrder;
+    let elf = asm_elf_bytes("all_instructions_64");
+    let opts = ProofOptions::default_test_options();
+    for blowup in [4, 2] {
+        let mut format = format_at(
+            crate::hash_pin::BLOCK_BASE,
+            block_whir::BLOCK_GROUP_POLYS,
+            GroupFold::Indexed,
+            ArgueFormat::BATCHED,
+            12,
+        );
+        format.zf.whir_blowup = blowup;
+        format.zf.whir_leaves = LeafOrder::Coset;
+        let encodes = multilinear::gpu::coset_host_encodes();
+        let proof = prove(&elf, &format, MaxRowsConfig::small());
+        assert!(
+            grouped_widths(&proof).iter().any(|&w| w >= 2),
+            "a grouped chain at blowup {blowup}"
+        );
+        assert!(
+            block_whir::verify_block_whir(&proof, &elf, &opts, &format).unwrap_or(false),
+            "the block verifies at blowup {blowup}"
+        );
+        assert_eq!(
+            multilinear::gpu::coset_host_encodes(),
+            encodes,
+            "no host encode at a stack the card opens, blowup {blowup}"
+        );
+    }
 }
 
 /// The round trip and the cross-mode refusals at each budget of `budgets`
