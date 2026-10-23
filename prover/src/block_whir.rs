@@ -964,13 +964,19 @@ fn lt_concat() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_LT_CONCAT").is_ok_and(|v| v.trim() == "1")
 }
 
-/// `LAMBDA_VM_BLOCK_REST_SLIDE=1`: the streamed finish builds each of the rest's
-/// tables as soon as the byte gate admits it, while earlier ones still build,
-/// instead of in waves that each last as long as their slowest table
-/// ([`WindowedTraceBuilder::slide_rest`]); off by default. The tables and their
-/// order are the same.
+/// The streamed finish builds each of the rest's tables as soon as the byte
+/// gate admits it, while earlier ones still build, instead of in waves that
+/// each last as long as their slowest table
+/// ([`WindowedTraceBuilder::slide_rest`]): the default.
+/// `LAMBDA_VM_BLOCK_REST_SLIDE=0` builds in waves. The tables and their order
+/// are the same.
 fn rest_slide() -> bool {
-    std::env::var("LAMBDA_VM_BLOCK_REST_SLIDE").is_ok_and(|v| v.trim() == "1")
+    parse_rest_slide(std::env::var("LAMBDA_VM_BLOCK_REST_SLIDE").ok().as_deref())
+}
+
+/// [`rest_slide`] of the knob's value: anything but `0` slides.
+fn parse_rest_slide(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
 }
 
 /// The most window walkers `LAMBDA_VM_BLOCK_WALKERS` takes: each walker holds
@@ -6956,6 +6962,23 @@ mod air_input_tests {
                 "heights {:?}",
                 &bad[..bad.len().min(4)]
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod rest_slide_knob_tests {
+    use super::parse_rest_slide;
+
+    /// `LAMBDA_VM_BLOCK_REST_SLIDE`: unset (or anything but `0`) slides; `0`
+    /// builds the rest in waves.
+    #[test]
+    fn the_slide_is_the_default_and_0_builds_in_waves() {
+        for value in [None, Some("1"), Some(""), Some(" 1 ")] {
+            assert!(parse_rest_slide(value), "{value:?}");
+        }
+        for value in ["0", " 0 "] {
+            assert!(!parse_rest_slide(Some(value)), "{value}");
         }
     }
 }
