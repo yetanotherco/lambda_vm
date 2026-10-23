@@ -883,11 +883,6 @@ impl InputLayer {
             low,
         )
     }
-
-    /// Bytes the layer holds: both sides over the whole cube.
-    pub fn bytes(&self) -> u64 {
-        (self.p.len() + self.q.len()) as u64 * 8
-    }
 }
 
 /// An input layer's plan on the card (D-BATCH M1-2): each side's range of

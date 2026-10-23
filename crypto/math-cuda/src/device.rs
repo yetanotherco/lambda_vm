@@ -757,6 +757,8 @@ pub fn reserve(bytes: u64) -> Option<DeviceReservation> {
 /// - `input_layer_tree_impl`'s carry (`reserve(eager)`) is SPECULATIVE: its
 ///   `None` picks the lazy tree, still on the device;
 /// - a prefetch's (`input_layer_tree_deferred`) refusal only means no prefetch;
+/// - a kept input layer's tree (`truncated_tree`, `LAMBDA_VM_ARGUE_INPUT_REAL`)
+///   is also speculative: its `None` builds today's tree instead;
 /// - `reserve_room`'s two callers keep the work on the device. `take_turn` opens
 ///   unpromised and counts its own refusals (`room_turn_refusals`); the group
 ///   commit's retention room makes the commit transient, so its leaf pass is

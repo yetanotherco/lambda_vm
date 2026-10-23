@@ -3866,6 +3866,8 @@ pub struct GruenSession {
     /// without its padding: the whole layer, written again, whose rounds run
     /// in step and are compared with the kept one's.
     whole: Option<WholeLayer>,
+    /// The whole layer's room, once a kept layer that differed finishes on it.
+    _held: Option<math_cuda::device::DeviceReservation>,
 }
 
 /// The whole input layer beside a kept one, and the room it was promised.
@@ -3930,6 +3932,7 @@ impl DeviceTree {
             lambda,
             pending: None,
             whole,
+            _held: None,
         })
     }
 
@@ -4044,7 +4047,9 @@ impl GruenSession {
                 // Counted, and the layer finished on the whole one: the
                 // proof is today's either way.
                 crate::gkr_input_real::note_checked(true);
-                self.layer = whole.layer;
+                let WholeLayer { layer, _room } = whole;
+                self.layer = layer;
+                self._held = Some(_room);
                 sums = want;
             }
         }
