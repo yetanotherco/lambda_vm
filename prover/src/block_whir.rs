@@ -215,7 +215,7 @@ pub struct BlockFormat {
     /// carries the other format's messages in [`BlockWhirProof::argues`].
     pub argue: ArgueFormat,
     /// How each group's stacked polynomials are opened: one chain per run of
-    /// at most four ([`GroupFold::Indexed`], production; D-ONECHAIN, W-14), or
+    /// at most four ([`GroupFold::Indexed`], production), or
     /// one chain each ([`GroupFold::PerPoly`]). A caller constant like the rest
     /// of the format, bound into the statement through the fold word.
     pub group: GroupFold,

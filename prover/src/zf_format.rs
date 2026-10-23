@@ -132,9 +132,9 @@ impl std::fmt::Display for WhirBlowup {
     }
 }
 
-// A grouped chain (D-ONECHAIN) is today's chain at `n + m` variables over
+// A grouped chain is today's chain at `n + m` variables over
 // `H_{n+m+lb}`, which exists only within the field's two-adicity: at the widest
-// stack, the widest accepted blowup and the widest index, it must (REV-B2-B A-1).
+// stack, the widest accepted blowup and the widest index, it must.
 // The production blowup is the widest the knob accepts.
 const _: () = assert!(
     WHIR_BLOWUPS[0] == 1 << PRODUCTION_WHIR_LOG_BLOWUP && WHIR_BLOWUPS[1] < WHIR_BLOWUPS[0]

@@ -1267,7 +1267,7 @@ fn a_one_round_grouped_chain_compares_its_folds_with_the_final_value() {
 /// four at blowup 2 round-trip; a verifier at blowup 4 refuses them over the
 /// same roots, and a verifier at blowup 2 refuses a stack opened at blowup 4
 /// (every domain and tree depth differs by one); and at blowup 2 the two modes
-/// refuse each other's proofs, as at blowup 4 (B1-5).
+/// refuse each other's proofs, as at blowup 4.
 #[test]
 fn an_indexed_stack_at_one_blowup_is_refused_at_the_other() {
     let at = |log_blowup: usize, group: GroupFold| ChainConfig {

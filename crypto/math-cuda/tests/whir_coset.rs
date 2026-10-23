@@ -8,7 +8,7 @@
 //! retired stack is revived with) and with the host algorithm
 //! ([`CosetPlan::evaluate_on_host`], pinned against `encode(lift_coefficients)`
 //! in the module's own tests). The measurement arm times both at the
-//! production shape and prints one `J5 …` line per reading.
+//! production shape and prints one `COSET EVAL …` line per reading.
 
 use std::time::Instant;
 
@@ -148,15 +148,15 @@ fn coset_blocks_at(log_blowup: usize, count: usize) {
             mismatches(&device, &host),
             mismatches(&device, &queued),
         );
-        // The blowup-4 line is the one the J5 read-out parses; blowup 2's names
-        // its rate at the end.
+        // The blowup-4 line names no rate; blowup 2's names its rate at the
+        // end.
         let rate = if log_blowup == LOG_BLOWUP {
             String::new()
         } else {
             format!(" blowup_log={log_blowup}")
         };
         println!(
-            "J5 PARITY n={num_vars} cosets={} values={} vs_codeword={vs_codeword} vs_host={vs_host} vs_queued={vs_queued}{rate}",
+            "COSET EVAL PARITY n={num_vars} cosets={} values={} vs_codeword={vs_codeword} vs_host={vs_host} vs_queued={vs_queued}{rate}",
             plan.classes().len(),
             device.len()
         );
@@ -183,7 +183,7 @@ fn summary(arm: &str, ms: &mut [f64]) {
     ms.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
     let at = |p: f64| ms[((ms.len() - 1) as f64 * p).round() as usize];
     println!(
-        "J5 SUMMARY arm={arm} reps={} median_ms={:.3} min_ms={:.3} p10_ms={:.3} p90_ms={:.3} max_ms={:.3}",
+        "COSET EVAL SUMMARY arm={arm} reps={} median_ms={:.3} min_ms={:.3} p10_ms={:.3} p90_ms={:.3} max_ms={:.3}",
         ms.len(),
         at(0.5),
         ms[0],
@@ -209,23 +209,25 @@ fn peak_mib(run: impl FnOnce()) -> f64 {
 /// re-encode as a retired stack is revived (`encode_codeword_resident` on
 /// resident columns, then a synchronize) against (B) the plan built from the
 /// queries and the cosets evaluated (then a synchronize), interleaved A B A B,
-/// `J5_WARM` warm-ups then `J5_REPS` timed each; the same for a group of three
-/// polynomials one after another (A3, B3); B's phases; both arms' peak pool
-/// bytes; and the check: B's values equal A's codeword at every block's leaves.
+/// `COSET_EVAL_WARM` warm-ups then `COSET_EVAL_REPS` timed each; the same for
+/// a group of three polynomials one after another (A3, B3); B's phases; both
+/// arms' peak pool bytes; and the check: B's values equal A's codeword at
+/// every block's leaves.
 ///
-/// `J5_LOG` (27), `J5_QUERIES` (114), `J5_WARM` (3), `J5_REPS` (20).
+/// `COSET_EVAL_LOG` (27), `COSET_EVAL_QUERIES` (114), `COSET_EVAL_WARM` (3),
+/// `COSET_EVAL_REPS` (20).
 #[test]
 #[ignore = "measurement arm: a minute on a card; run on the box"]
-fn j5_coset_bench() {
-    let num_vars = env_usize("J5_LOG", 27);
-    let count = env_usize("J5_QUERIES", 114);
-    let warm = env_usize("J5_WARM", 3);
-    let reps = env_usize("J5_REPS", 20);
+fn coset_eval_bench() {
+    let num_vars = env_usize("COSET_EVAL_LOG", 27);
+    let count = env_usize("COSET_EVAL_QUERIES", 114);
+    let warm = env_usize("COSET_EVAL_WARM", 3);
+    let reps = env_usize("COSET_EVAL_REPS", 20);
     let stacks: Vec<_> = (0..3).map(|k| stack(num_vars, 100 + k)).collect();
     let sets: Vec<Vec<u64>> = (0..3).map(|k| queries(num_vars, count, 200 + k)).collect();
     let plan0 = CosetPlan::new(num_vars, LOG_BLOWUP, LOG_FOLD, KEPT, &sets[0]).expect("plan");
     println!(
-        "J5 SHAPE n={num_vars} blowup_log={LOG_BLOWUP} fold={LOG_FOLD} kept={KEPT} queries={count} cosets={} coset_len={} device_mib_b={:.1} codeword_mib_a={:.1}",
+        "COSET EVAL SHAPE n={num_vars} blowup_log={LOG_BLOWUP} fold={LOG_FOLD} kept={KEPT} queries={count} cosets={} coset_len={} device_mib_b={:.1} codeword_mib_a={:.1}",
         plan0.classes().len(),
         plan0.coset_len(),
         plan0.device_bytes() as f64 / (1 << 20) as f64,
@@ -259,7 +261,7 @@ fn j5_coset_bench() {
         let tb3 = time(&|| (0..3).for_each(cosets_one));
         let label = if rep < warm { "warm" } else { "timed" };
         println!(
-            "J5 REP {label} rep={rep} a_ms={ta:.3} b_ms={tb:.3} a3_ms={ta3:.3} b3_ms={tb3:.3}"
+            "COSET EVAL REP {label} rep={rep} a_ms={ta:.3} b_ms={tb:.3} a3_ms={ta3:.3} b3_ms={tb3:.3}"
         );
         if rep >= warm {
             a.push(ta);
@@ -291,7 +293,7 @@ fn j5_coset_bench() {
         v[v.len() / 2]
     };
     println!(
-        "J5 SPLIT plan_ms={:.3} assemble_ms={:.3} tiles_ms={:.3} rest_ms={:.3} transform_ms={:.3}",
+        "COSET EVAL SPLIT plan_ms={:.3} assemble_ms={:.3} tiles_ms={:.3} rest_ms={:.3} transform_ms={:.3}",
         median(&mut phases[0]),
         median(&mut phases[1]),
         median(&mut phases[2]),
@@ -301,7 +303,7 @@ fn j5_coset_bench() {
 
     let peak_a = peak_mib(|| encode_one(0));
     let peak_b = peak_mib(|| cosets_one(0));
-    println!("J5 MEM peak_mib_a={peak_a:.1} peak_mib_b={peak_b:.1}");
+    println!("COSET EVAL MEM peak_mib_a={peak_a:.1} peak_mib_b={peak_b:.1}");
 
     let device = evaluate_resident(store, parts, &plan0, None)
         .expect("cosets")
@@ -310,7 +312,7 @@ fn j5_coset_bench() {
     let gathered = reencoded_at_blocks(store, parts, num_vars, &plan0);
     let differ = mismatches(&device, &gathered);
     println!(
-        "J5 CHECK positions={} mismatches={differ} cosets={} queries={count}",
+        "COSET EVAL CHECK positions={} mismatches={differ} cosets={} queries={count}",
         device.len(),
         plan0.classes().len()
     );
