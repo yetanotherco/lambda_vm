@@ -906,6 +906,7 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// last window's start (`memory`, `registers`, that window's first cycle
     /// `cycles`) and the walk's stamps, so [`Self::finish`] walks the last
     /// window as though this builder had walked every window before it.
+    #[cfg(feature = "parallel")]
     fn install_walked(
         &mut self,
         mut memory: MemoryState,
@@ -923,6 +924,7 @@ impl<'a> WindowedTraceBuilder<'a> {
     }
 
     /// The bytes the walk's carried memory state takes on the heap.
+    #[cfg(feature = "parallel")]
     pub(crate) fn state_bytes(&self) -> usize {
         self.memory_state.heap_bytes()
     }
@@ -930,6 +932,7 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// The accumulating half alone, with the run's initial image: what a run
     /// walked from its entries ([`parallel::walk_windows`]) absorbs its windows
     /// with and builds the finish's state from.
+    #[cfg(feature = "parallel")]
     fn accumulator_and_image(&mut self) -> (Accumulator<'_>, &PagedMem<u8>) {
         (
             Accumulator {
@@ -2656,9 +2659,11 @@ impl Traces {
 mod head_tests;
 
 // The serial stage of a run walked a window per thread.
+#[cfg(feature = "parallel")]
 mod lean_pass;
 
 // A run's windows walked from their entries, on several threads.
+#[cfg(feature = "parallel")]
 pub(crate) mod parallel;
 
 #[cfg(test)]

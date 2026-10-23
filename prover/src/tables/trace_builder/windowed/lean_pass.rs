@@ -25,7 +25,6 @@ use std::sync::Arc;
 use executor::vm::instruction::execution::{BLAKE3_ABSORB_CV_OUT_DWORD, BLAKE3_BLOCK_BYTES};
 use executor::vm::logs::Log;
 use executor::vm::memory::MemorySnapshot;
-#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 use super::super::{MemoryState, RegisterState, clock};
@@ -605,11 +604,8 @@ impl LeanPass {
                 }
             }
         };
-        let pages = memory.cells.pages_mut();
-        #[cfg(feature = "parallel")]
-        pages.collect::<Vec<_>>().into_par_iter().for_each(fill);
-        #[cfg(not(feature = "parallel"))]
-        pages.for_each(fill);
+        let pages: Vec<_> = memory.cells.pages_mut().collect();
+        pages.into_par_iter().for_each(fill);
         memory
     }
 

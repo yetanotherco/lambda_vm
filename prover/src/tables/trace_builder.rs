@@ -213,6 +213,7 @@ impl MemoryState {
 
     /// Whether a read found a byte the state does not hold, since the last
     /// call; clears the mark.
+    #[cfg(feature = "parallel")]
     fn take_missing(&self) -> bool {
         self.missing.swap(false, Relaxed)
     }
