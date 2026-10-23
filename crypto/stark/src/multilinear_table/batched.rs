@@ -384,6 +384,14 @@ enum BinTree<E: IsField> {
     Built(Box<multilinear::gkr::FractionTree<E>>),
 }
 
+/// A bin's tree as its build left it: built, or queued on the card with its
+/// output unread (`LAMBDA_VM_ARGUE_ROUND_SLOT`), finalized once every tree of
+/// the bin is queued.
+enum Pending<E: IsField> {
+    Ready(BinTree<E>),
+    Queued(multilinear::logup::PrefetchedTree<E>),
+}
+
 /// [`multi_prove_batched`] on the host or the card, with faults.
 #[doc(hidden)]
 pub fn prove_batched_on<F, E, T, H>(
@@ -515,14 +523,36 @@ where
     let mut bus_outputs: Vec<Option<(FieldElement<E>, FieldElement<E>)>> = vec![None; tables.len()];
     let mut claims: Vec<Option<GkrClaim<E>>> = vec![None; tables.len()];
     let mut gkr = Vec::with_capacity(plan.bins.len());
+    // Under the round slot the columns' trees of a bin are queued one after
+    // another and their outputs read once all are (each tree has its stream).
+    let queue = multilinear::round_slot::argue_round_slot()
+        != multilinear::round_slot::RoundSlotSetting::Off;
+    let host_built = |t: usize| -> Result<BinTree<E>, MlError> {
+        let factors = tables[t].trace.factors()?;
+        Ok(BinTree::Built(Box::new(
+            multilinear::gkr::FractionTree::build(logup::input_layer(&interactions[t], &factors)?)?,
+        )))
+    };
     for bin in &plan.bins {
-        let trees: Vec<BinTree<E>> = bin
+        let pending: Vec<Pending<E>> = bin
             .iter()
-            .map(|&t| -> Result<BinTree<E>, MlError> {
+            .map(|&t| -> Result<Pending<E>, MlError> {
                 let (trace, interactions) = (&tables[t].trace, &interactions[t]);
                 if at == Where::Host {
-                    return Ok(BinTree::Host(host_tree(interactions, trace)?));
+                    return Ok(Pending::Ready(BinTree::Host(host_tree(
+                        interactions,
+                        trace,
+                    )?)));
                 }
+                let columns_tree = || {
+                    if queue {
+                        logup::resident_tree_from_columns_deferred(interactions, trace)
+                            .map(Pending::Queued)
+                    } else {
+                        logup::resident_tree_from_columns(interactions, trace)
+                            .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
+                    }
+                };
                 // Where today's argue builds it: written from the base columns
                 // with no lift (`LAMBDA_VM_ARGUE_NO_LIFT`), else from the
                 // lifted factors on the card, else here — and a big host tree
@@ -530,31 +560,42 @@ where
                 let started = std::time::Instant::now();
                 let on_card = (multilinear::gpu::argue_no_lift()
                     && trace.device_factors().is_none())
-                .then(|| logup::resident_tree_from_columns(interactions, trace))
+                .then(columns_tree)
                 .flatten()
                 .or_else(|| {
                     let resident = trace.reside_from_columns();
                     let from_columns = (multilinear::gpu::argue_gkr_input() && resident.is_some())
-                        .then(|| logup::resident_tree_from_columns(interactions, trace))
+                        .then(columns_tree)
                         .flatten();
                     from_columns.or_else(|| {
-                        resident.and_then(|resident| logup::resident_tree(interactions, resident))
+                        resident
+                            .and_then(|resident| logup::resident_tree(interactions, resident))
+                            .map(|tree| Pending::Ready(BinTree::Built(Box::new(tree))))
                     })
                 });
                 let tree = match on_card {
                     Some(tree) => tree,
-                    None => {
-                        let factors = trace.factors()?;
-                        multilinear::gkr::FractionTree::build(logup::input_layer(
-                            interactions,
-                            &factors,
-                        )?)?
-                    }
+                    None => Pending::Ready(host_built(t)?),
                 };
                 split.trees += started.elapsed().as_secs_f64();
-                Ok(BinTree::Built(Box::new(tree)))
+                Ok(tree)
             })
             .collect::<Result<_, _>>()?;
+        // The queued trees' outputs, now that the bin's every tree is queued;
+        // one that cannot be read is built here, before anything is absorbed.
+        let started = std::time::Instant::now();
+        let trees: Vec<BinTree<E>> = pending
+            .into_iter()
+            .zip(bin)
+            .map(|(tree, &t)| match tree {
+                Pending::Ready(tree) => Ok(tree),
+                Pending::Queued(queued) => match queued.into_tree() {
+                    Some(tree) => Ok(BinTree::Built(Box::new(tree))),
+                    None => host_built(t),
+                },
+            })
+            .collect::<Result<_, MlError>>()?;
+        split.trees += started.elapsed().as_secs_f64();
         let hosts: Vec<Option<gkr_lockstep::HostLayers<'_, E>>> = trees
             .iter()
             .map(|tree| match tree {

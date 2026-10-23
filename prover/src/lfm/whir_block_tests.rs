@@ -2554,6 +2554,14 @@ fn the_whir_block_tree_on_a_real_block() {
         multilinear::gkr_input_real::input_real_in_effect(),
         multilinear::gkr_input_real::counts().line()
     );
+    // The argue's round sums through a slot (`LAMBDA_VM_ARGUE_ROUND_SLOT`):
+    // rounds read from it, waits that fell back to the stream, today's second
+    // launches left, and under `check` the rounds compared with today's.
+    println!(
+        "W3 ARGUE ROUND SLOT: {} · {}",
+        multilinear::round_slot::round_slot_in_effect(),
+        multilinear::round_slot::counts_line()
+    );
     // The precomputed trees the run downloaded on cache misses, by path, and
     // the staging pairs' waits (I-COPIES L1): the recursion's LFM proofs are
     // where they happen.

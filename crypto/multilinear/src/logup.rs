@@ -266,6 +266,42 @@ pub fn resident_tree_from_columns<F: IsField + 'static, E: IsField + 'static>(
     crate::gkr::FractionTree::from_device(tree).ok()
 }
 
+/// [`resident_tree_from_columns`] with its output fraction left unread
+/// (`LAMBDA_VM_ARGUE_ROUND_SLOT`): a caller that builds several trees queues
+/// them all before it waits for any, then finalizes each with
+/// [`PrefetchedTree::into_tree`] — before anything is absorbed, so a tree whose
+/// output cannot be read is built here instead.
+pub fn resident_tree_from_columns_deferred<F: IsField + 'static, E: IsField + 'static>(
+    interactions: &[Interaction<E>],
+    trace: &crate::constraint_argument::TraceData<F, E>,
+) -> Option<PrefetchedTree<E>> {
+    if interactions.is_empty() {
+        return None;
+    }
+    let (store, first) = trace.resident_shared()?;
+    if trace.num_columns() == 0 {
+        return None;
+    }
+    let rows = 1usize << trace.num_vars();
+    let sources: Vec<_> = trace
+        .kinds()
+        .iter()
+        .map(crate::constraint_argument::FactorKind::source)
+        .collect();
+    let plan = input_plan(interactions, &sources, rows)?;
+    let device = crate::gpu::input_layer_tree_from_columns_deferred(
+        store,
+        first,
+        trace.num_columns(),
+        rows,
+        &plan,
+    )?;
+    Some(PrefetchedTree {
+        device,
+        _marker: core::marker::PhantomData,
+    })
+}
+
 /// The input layer and the tree above it, built where the factors already are.
 ///
 /// The layer is `interactions × rows` fractions — the biggest thing a table's

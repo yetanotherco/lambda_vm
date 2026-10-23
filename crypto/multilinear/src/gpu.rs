@@ -702,6 +702,8 @@ pub fn reset_call_counters() {
     ROOM_SIZINGS.store(0, Ordering::Relaxed);
     ROOMS_TURN_SIZED.store(0, Ordering::Relaxed);
     crate::gkr_input_real::reset_counts();
+    #[cfg(feature = "cuda")]
+    math_cuda::round_slot::reset_counts();
 }
 
 /// A sumcheck's round proofs, the challenges they drew, and what every slot
@@ -3476,6 +3478,7 @@ impl DeviceTree {
         let Ok(mut session) = session else {
             return None;
         };
+        session.use_slot(crate::round_slot::device_setting());
         // Today's session beside it, when the card has room for its `eq` table.
         let shadow = match lowered.as_ref() {
             Some(lowered) => {
@@ -3921,7 +3924,8 @@ impl DeviceTree {
             }
             tree.layer_gruen(layer, &raw_point, low)
         };
-        let layer = session.ok()?;
+        let mut layer = session.ok()?;
+        layer.use_slot(crate::round_slot::device_setting());
         let whole = (layer.truncated()
             && crate::gkr_input_real::argue_input_real()
                 == crate::gkr_input_real::InputReal::Check)
@@ -4685,7 +4689,7 @@ where
         rows,
         interactions,
         lifted_writer(factors, numerators, denominators),
-        false,
+        Build::Eager,
     )
 }
 
@@ -4728,6 +4732,34 @@ pub fn input_layer_tree_from_columns(
     rows: usize,
     plan: &crate::logup::InputPlan,
 ) -> Option<DeviceTree> {
+    tree_from_columns(resident, first, width, rows, plan, Build::Eager)
+}
+
+/// [`input_layer_tree_from_columns`] with the output fraction left unread, so
+/// its kernels stay queued and the next tree's go in behind them
+/// (`LAMBDA_VM_ARGUE_ROUND_SLOT`: a bin's trees without a wait each). The
+/// output is read at the consume site, [`DeviceTree::output`]. A refused
+/// promise still falls to the host, counted, as the eager build's does.
+#[cfg(feature = "cuda")]
+pub fn input_layer_tree_from_columns_deferred(
+    resident: std::sync::Arc<ResidentColumns>,
+    first: usize,
+    width: usize,
+    rows: usize,
+    plan: &crate::logup::InputPlan,
+) -> Option<DeviceTree> {
+    tree_from_columns(resident, first, width, rows, plan, Build::Deferred)
+}
+
+#[cfg(feature = "cuda")]
+fn tree_from_columns(
+    resident: std::sync::Arc<ResidentColumns>,
+    first: usize,
+    width: usize,
+    rows: usize,
+    plan: &crate::logup::InputPlan,
+    build: Build,
+) -> Option<DeviceTree> {
     if !resident.0.is_run(first, width) || plan.interactions() == 0 {
         return None;
     }
@@ -4749,7 +4781,7 @@ pub fn input_layer_tree_from_columns(
         let view = resident.0.view(first, width);
         math_cuda::gkr::input_from_columns(&writer_stream, &view, rows, &uploaded, padding).ok()
     });
-    let tree = input_layer_tree_impl(stream, rows, interactions, write, false)?;
+    let tree = input_layer_tree_impl(stream, rows, interactions, write, build)?;
     INPUT_COLUMNS_TREES.fetch_add(1, Ordering::Relaxed);
     crate::whir_split::bump(&crate::whir_split::TREE_FROM_COLUMNS);
     Some(tree)
@@ -4791,7 +4823,7 @@ where
         rows,
         interactions,
         lifted_writer(factors, numerators, denominators),
-        true,
+        Build::Prefetch,
     )
 }
 
@@ -4810,9 +4842,24 @@ fn note_gkr_tree_refusal(bytes: u64, cells: usize) {
     );
 }
 
-/// `defer` skips the one output read (the sync), leaving it for the consume
-/// site; everything else is identical, so the eager caller is byte-for-byte the
-/// path it always was.
+/// When a tree's output fraction is read, and whether a refusal is a host
+/// fallback.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Build {
+    /// Read at the build: the eager consume path.
+    Eager,
+    /// Left for the consume site, so a bin's trees are queued without a wait
+    /// each (`LAMBDA_VM_ARGUE_ROUND_SLOT`); a refusal still falls to the host.
+    Deferred,
+    /// Left for the consume site of a tree built ahead of its turn; a refusal
+    /// only means no prefetch.
+    Prefetch,
+}
+
+/// `build` says when the output fraction is read: at once, or at the consume
+/// site (the one device sync left to whoever asks first); everything else is
+/// identical, so the eager caller is byte-for-byte the path it always was.
 ///
 /// A layer with padding is kept without it under `LAMBDA_VM_ARGUE_INPUT_REAL`
 /// ([`crate::gkr_input_real`]) when the card promises that tree, and otherwise
@@ -4823,7 +4870,7 @@ fn input_layer_tree_impl(
     rows: usize,
     interactions: usize,
     write: InputWriter,
-    defer: bool,
+    build: Build,
 ) -> Option<DeviceTree> {
     use crate::gkr_input_real::{self as input_real, InputReal};
 
@@ -4834,14 +4881,14 @@ fn input_layer_tree_impl(
         && !HAND_BACK_FORCED.load(Ordering::Relaxed)
         && input_real::argue_input_real() != InputReal::Off;
     let kept = if wanted {
-        truncated_tree(&stream, real, full, &write, defer)
+        truncated_tree(&stream, real, full, &write, build)
     } else {
         None
     };
     let tree = match kept {
         Some(tree) => Some(tree),
         None => {
-            let tree = carried_or_handed_back(stream, rows, interactions, write, defer);
+            let tree = carried_or_handed_back(stream, rows, interactions, write, build);
             if wanted && tree.is_some() {
                 input_real::note_decline();
             }
@@ -4869,7 +4916,7 @@ fn truncated_tree(
     real: usize,
     full: usize,
     write: &InputWriter,
-    defer: bool,
+    build: Build,
 ) -> Option<DeviceTree> {
     let room = math_cuda::device::reserve(math_cuda::gkr::truncated_peak_bytes(real, full))?;
     let num_vars = full.trailing_zeros() as usize;
@@ -4889,7 +4936,7 @@ fn truncated_tree(
     tree_sync!(stream);
     crate::whir_split::add_tick(&crate::whir_split::TREE_FOLD, t);
     let output = std::sync::OnceLock::new();
-    if !defer {
+    if build == Build::Eager {
         let t = crate::whir_split::tick();
         let _ = output.set(tree.output().ok()?);
         crate::whir_split::add_tick(&crate::whir_split::TREE_OUTPUT, t);
@@ -4926,7 +4973,7 @@ fn carried_or_handed_back(
     rows: usize,
     interactions: usize,
     write: InputWriter,
-    defer: bool,
+    build: Build,
 ) -> Option<DeviceTree> {
     let slots = interactions.next_power_of_two();
     let full = slots * rows;
@@ -4954,7 +5001,7 @@ fn carried_or_handed_back(
         tree_sync!(stream);
         crate::whir_split::add_tick(&crate::whir_split::TREE_FOLD, t);
         let output = std::sync::OnceLock::new();
-        if !defer {
+        if build == Build::Eager {
             let t = crate::whir_split::tick();
             let _ = output.set(tree.output().ok()?);
             crate::whir_split::add_tick(&crate::whir_split::TREE_OUTPUT, t);
@@ -4978,12 +5025,12 @@ fn carried_or_handed_back(
     //
     // ⛔ ITS REFUSAL IS A HOST FALLBACK on the consume path: `logup::resident_tree`
     // gets `None` and the table's factors and whole tree are built on the host.
-    // So it is counted, here where it is refused, and only when `!defer`: a
+    // So it is counted, here where it is refused, unless this is a prefetch: a
     // prefetch that is refused only means no prefetch, and the consume site asks
     // again.
     let promise = math_cuda::gkr::padded_peak_bytes(real, full);
     let Some(room) = math_cuda::device::reserve(promise) else {
-        if !defer {
+        if build != Build::Prefetch {
             note_gkr_tree_refusal(promise, full);
         }
         return None;
@@ -5001,7 +5048,7 @@ fn carried_or_handed_back(
     tree_sync!(stream);
     crate::whir_split::add_tick(&crate::whir_split::TREE_FOLD, t);
     let output = std::sync::OnceLock::new();
-    if !defer {
+    if build == Build::Eager {
         let t = crate::whir_split::tick();
         let _ = output.set(tree.output().ok()?);
         crate::whir_split::add_tick(&crate::whir_split::TREE_OUTPUT, t);
@@ -5044,6 +5091,17 @@ where
 
 #[cfg(not(feature = "cuda"))]
 pub fn input_layer_tree_from_columns(
+    _resident: std::sync::Arc<ResidentColumns>,
+    _first: usize,
+    _width: usize,
+    _rows: usize,
+    _plan: &crate::logup::InputPlan,
+) -> Option<DeviceTree> {
+    None
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn input_layer_tree_from_columns_deferred(
     _resident: std::sync::Arc<ResidentColumns>,
     _first: usize,
     _width: usize,

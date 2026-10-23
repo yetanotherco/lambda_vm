@@ -969,3 +969,117 @@ fn the_card_proves_the_host_references_bytes() {
         assert_eq!(host.2, card.2, "a={a} cap={cap}: the next challenge moved");
     }
 }
+
+/// ★ The batched argue on the card with the rounds' sums through a slot
+/// (`LAMBDA_VM_ARGUE_ROUND_SLOT`: the GKR ladder's rounds, and a bin's trees
+/// queued before their outputs are read) proves the host reference's bytes,
+/// with the transcript in the same state after; under `check` every round is
+/// compared with today's and none differs. Each GKR round through a slot is
+/// one second launch fewer than today's on the card; the fused zerocheck's
+/// rounds keep theirs.
+///
+/// ```text
+/// cargo test --release -p stark --features cuda,multilinear/cuda --lib -- \
+///     multilinear_table::batched::tests::the_round_slot_proves_the_host_references_bytes --exact --nocapture
+/// ```
+#[test]
+fn the_round_slot_proves_the_host_references_bytes() {
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+    use multilinear::round_slot::{self as slot, RoundSlotSetting};
+
+    let airs = airs();
+    let cfg = batched(27);
+    let cols = columns(12, 1);
+    let run = |at: Where, setting: RoundSlotSetting| {
+        slot::force_argue_round_slot(Some(setting));
+        let committed = commit(tables(&airs, &cols, false), &cfg);
+        let mut transcript = DefaultTranscript::<Ext>::new(SEED);
+        let proof = prove_batched_on(
+            &committed,
+            &cfg,
+            &mut transcript,
+            None,
+            ProverFaults::default(),
+            at,
+        )
+        .unwrap_or_else(|e| panic!("{at:?} {setting:?}: {e:?}"));
+        verify(&committed, &proof, &cfg).unwrap_or_else(|e| panic!("{at:?} {setting:?}: {e:?}"));
+        (
+            bincode::serialize(&proof).expect("bytes"),
+            transcript.state(),
+            transcript.sample_field_element(),
+        )
+    };
+    let host = run(Where::Host, RoundSlotSetting::Off);
+    // Today's on the card: every round's sums by a second launch.
+    let before = slot_counts();
+    let today = run(Where::Device, RoundSlotSetting::Off);
+    let after = slot_counts();
+    slot::force_argue_round_slot(None);
+    assert!(host.0 == today.0, "Off: the canonical bytes differ");
+    assert_eq!(host.1, today.1, "Off: the transcripts parted");
+    let today_seconds = after[3] - before[3];
+    assert_eq!(after[0], before[0], "off: no round through a slot");
+    for setting in [RoundSlotSetting::On, RoundSlotSetting::Check] {
+        let before = slot_counts();
+        let card = run(Where::Device, setting);
+        let after = slot_counts();
+        slot::force_argue_round_slot(None);
+        assert!(host.0 == card.0, "{setting:?}: the canonical bytes differ");
+        assert_eq!(host.1, card.1, "{setting:?}: the transcripts parted");
+        assert_eq!(host.2, card.2, "{setting:?}: the next challenge moved");
+        let rounds = after[0] - before[0];
+        let seconds = after[3] - before[3];
+        eprintln!(
+            "batched argue, round slot {setting:?}: {rounds} rounds through slots, {seconds} second \
+             launches ({today_seconds} today), {} compared, {} differing; {} bytes",
+            after[4] - before[4],
+            after[5] - before[5],
+            card.0.len()
+        );
+        if a_device() {
+            assert!(
+                rounds > 0,
+                "{setting:?}: the card's rounds went through slots"
+            );
+            assert_eq!(after[2], before[2], "{setting:?}: no slot declined");
+            if setting == RoundSlotSetting::On {
+                assert_eq!(
+                    seconds + rounds,
+                    today_seconds,
+                    "on: each GKR round through a slot is one second launch fewer"
+                );
+                assert!(
+                    seconds > 0,
+                    "on: the fused zerocheck kept today's second launch"
+                );
+            } else {
+                assert_eq!(
+                    seconds, today_seconds,
+                    "check: today's second launch beside every round"
+                );
+                assert_eq!(after[4] - before[4], rounds, "check: every round compared");
+                assert_eq!(after[5], before[5], "check: none differed");
+            }
+        }
+    }
+}
+
+/// The round slots' counters: rounds, fall-backs, declines, second launches,
+/// rounds compared, differing.
+fn slot_counts() -> [u64; 6] {
+    #[cfg(feature = "cuda")]
+    {
+        let c = math_cuda::round_slot::counts();
+        [
+            c.slot_rounds,
+            c.fall_backs,
+            c.declines,
+            c.second_launches,
+            c.checked,
+            c.mismatches,
+        ]
+    }
+    #[cfg(not(feature = "cuda"))]
+    [0; 6]
+}

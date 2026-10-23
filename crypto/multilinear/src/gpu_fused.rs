@@ -683,6 +683,9 @@ where
             Ok(Some(session)) => session,
             _ => return None,
         };
+        // No round slot here: through one the zerocheck's launches ran slower
+        // on whole blocks than with today's second launch, unlike the GKR
+        // rounds'.
 
         let from = |limbs: &[u64]| ext3_from_raw::<E>(limbs);
         let side = d + 1;
