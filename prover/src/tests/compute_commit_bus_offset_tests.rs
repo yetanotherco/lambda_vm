@@ -191,8 +191,13 @@ fn test_prover_tuples_are_independent_of_the_ecall_split() {
         &[&[1], &[2], &[3], &[4], &[5], &[6], &[7], &[8], &[9]],
     ];
 
+    // The last start index is the highest one a run can actually reach: the
+    // executor caps the committed output at `MAX_PUBLIC_OUTPUT_TOTAL_SIZE`, so the
+    // running commit index never leaves the low megabyte. A value near `2^32` would
+    // exercise arithmetic no chip ever sees.
+    let top = executor::vm::memory::MAX_PUBLIC_OUTPUT_TOTAL_SIZE - 16;
     for (case, commits) in splits.iter().enumerate() {
-        for &start_index in &[0u64, 1, 7, 8, 4_294_967_290] {
+        for &start_index in &[0u64, 1, 7, 8, top] {
             let concatenated: Vec<u8> = commits.concat();
             let prover = prover_offset(commits, start_index, &z, &alpha)
                 .expect("no fingerprint collision on the prover side");
