@@ -16,11 +16,11 @@
 ///   DMA memcpy and DMA memset: byte count. 0 for every other syscall, Keccak
 ///   included.
 ///
-/// The row count is carried rather than recomputed downstream because it is not a
-/// function of the byte count: a row is eight bytes or one, and the schedule reads
-/// `src % 8` and `dst % 8` to decide. The executor is the only place that holds
-/// `src`, `dst` and `count` at once, so it derives the count there and the CLI's
-/// accelerator report just sums it.
+/// The row count is carried rather than recomputed downstream so that trace sizing
+/// and the CLI's accelerator report share one formula, `copy_trace_rows`, which the
+/// executor evaluates where `src`, `dst` and `count` are all known. Today a row's
+/// width follows from the remaining count alone (eight bytes, or one for the last
+/// seven), so the CLI report just sums the carried counts.
 #[derive(Debug, Clone)]
 pub struct Log {
     /// PC before instruction execution (use this to look up the instruction)

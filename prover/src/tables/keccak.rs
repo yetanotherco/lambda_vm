@@ -164,7 +164,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // 1. ECALL receiver (shared bus, per spec keccak:c:output)
     // Payload: [ts_lo, ts_hi, syscall_lo32, syscall_hi32] in DWordWL [lo, hi]
-    // ordering, matching the CPU ECALL sender shared with HALT/COMMIT.
+    // ordering, matching the CPU ECALL sender shared with HALT/COPY/ECSM/HINT.
     interactions.push(BusInteraction::receiver(
         BusId::Ecall,
         Multiplicity::Column(cols::MU),

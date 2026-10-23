@@ -39,7 +39,7 @@ impl BuildHasher for U64BuildHasher {
 pub type U64HashMap<V> = HashMap<u64, V, U64BuildHasher>;
 
 /// Total cap on public output bytes across all `commit_public_output` calls.
-/// The COMMIT AIR concatenates calls via the running `x254` index, so this
+/// The COPY chip's `write` rows concatenate calls via the running `x254` index, so this
 /// is enforced as a running-total budget rather than a per-call limit.
 pub const MAX_PUBLIC_OUTPUT_TOTAL_SIZE: u64 = 1024 * 1024;
 /// Maximum size of the private input memory region (in bytes). 512 MiB so a
@@ -60,7 +60,7 @@ pub const PRIVATE_INPUT_LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
 pub struct Memory {
     cells: U64HashMap<[u8; 4]>,
     /// Bytes committed to public output via `commit_public_output`. The
-    /// COMMIT AIR doesn't write to a fixed memory region (it streams bytes
+    /// COPY chip's `write` rows don't write to a fixed memory region (it streams bytes
     /// onto the Commit bus by `index`), so this buffer is purely the
     /// executor's view used by `read_return_value` and CLI display.
     public_output: Vec<u8>,
@@ -202,8 +202,8 @@ impl Memory {
     }
 
     /// Append `length` bytes from guest memory starting at `address` to the
-    /// public output. The COMMIT AIR concatenates calls via the running
-    /// `x254` index, and the trace builder accumulates `commit_ops` into
+    /// public output. The COPY chip's `write` rows concatenate calls via the
+    /// running `x254` index, and the trace builder collects their bytes into
     /// `VmProof.public_output`; this method maintains the executor's view
     /// of the same byte stream so `read_return_value` matches.
     pub fn commit_public_output(&mut self, address: u64, length: u64) -> Result<(), MemoryError> {

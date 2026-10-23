@@ -101,11 +101,10 @@ fn count_table_lengths_matches_traces() {
 }
 
 /// Runs one Rust DMA guest and asserts the sizing pass matches the built traces.
-/// Each ecall has two hand-maintained replays — `collect_dma_*_ops` for
-/// generation and `replay_dma_*_for_sizing` for counting — and they must agree,
-/// so the fixtures cover a single chunk plus the multi-chunk / overlapping /
-/// near-`MAX_DATA_ROWS` cases of `dma_memcpy_cases`, and the same schedule
-/// driven through the memset table.
+/// Sizing replays each ecall through `replay_copy_for_sizing`, which delegates to
+/// the same `collect_copy_ops` trace generation uses; the fixtures cover a single
+/// chunk plus the multi-chunk and overlapping cases of `dma_memcpy_cases`, and the
+/// same schedule driven through memset.
 fn assert_dma_fixture_counts(elf_name: &str, syscall_number: u64) {
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()

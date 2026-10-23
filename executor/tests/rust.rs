@@ -274,7 +274,7 @@ fn test_commit() {
 fn test_ef_io_demo_concatenates_writes() {
     // Demo guest reads its private input via EF `read_input`, then emits it
     // back as the public output via TWO `write_output` calls (split in halves).
-    // The COMMIT AIR concatenates the two calls; the executor's
+    // The COPY chip's `write` rows concatenate the two calls; the executor's
     // `commit_public_output` appends in the same order.
     let input: Vec<u8> = b"hello world!".to_vec();
     run_program_and_check_public_output(

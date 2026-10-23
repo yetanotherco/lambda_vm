@@ -1,7 +1,7 @@
 //! COPY table — one streaming copy primitive for `memcpy`/`memmove`, `memset`
 //! and the `write` syscall.
 //!
-//! Replaces the COMMIT table, and the DMA/DMA_SET pair that preceded it. A row copies `1` or `8`
+//! Replaces the COMMIT table. A row copies `1` or `8`
 //! bytes from `src` to `dst` and chains through [`BusId::CopyNext`] until the row
 //! where `count == step`.
 //!
