@@ -123,6 +123,73 @@ pub enum ProvingError {
     /// compute path, so there is no host arm to continue on; the message names
     /// the table, the shape and the live device posture.
     DevicePath(String),
+    /// Under a thread's device cap ([`cap_device_bytes`]), a table whose device
+    /// set alone is over it: refused before any device work, so the caller can
+    /// prove it later without the cap. `bytes` is the table's larger device
+    /// set (its main commit's or its rounds').
+    OverDeviceCap {
+        table: String,
+        bytes: u64,
+        cap: u64,
+    },
+}
+
+thread_local! {
+    /// This thread's device cap: what `multi_prove` admits its tables against
+    /// instead of the card's whole budget. `None` (the default) is the budget.
+    static DEVICE_CAP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Cap the device bytes this thread's `multi_prove` admits its tables against
+/// at `bytes` until the guard drops, which puts the previous cap back. For a
+/// proof run beside another on the card: it holds a reservation of `bytes` and
+/// must stay inside it. A table whose device set alone is over the cap is
+/// refused ([`ProvingError::OverDeviceCap`]) before any device work, rather
+/// than admitted alone past it as an uncapped prove admits it.
+pub fn cap_device_bytes(bytes: u64) -> DeviceCapGuard {
+    let previous = DEVICE_CAP.with(|c| c.replace(Some(bytes)));
+    DeviceCapGuard {
+        previous,
+        _this_thread: std::marker::PhantomData,
+    }
+}
+
+/// This thread's device cap, if one is set ([`cap_device_bytes`]).
+pub fn device_cap() -> Option<u64> {
+    DEVICE_CAP.with(std::cell::Cell::get)
+}
+
+/// Puts the thread's previous device cap back when it drops. Not `Send`: the
+/// cap belongs to the thread that set it.
+pub struct DeviceCapGuard {
+    previous: Option<u64>,
+    _this_thread: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for DeviceCapGuard {
+    fn drop(&mut self) {
+        DEVICE_CAP.with(|c| c.set(self.previous));
+    }
+}
+
+/// The first table whose device set (the larger of its two phases') is over
+/// `cap`, refused by name.
+fn refuse_over_cap(names: &[String], phases: [&[u64]; 2], cap: u64) -> Result<(), ProvingError> {
+    for (idx, name) in names.iter().enumerate() {
+        let bytes = phases
+            .iter()
+            .filter_map(|p| p.get(idx).copied())
+            .max()
+            .unwrap_or(0);
+        if bytes > cap {
+            return Err(ProvingError::OverDeviceCap {
+                table: name.clone(),
+                bytes,
+                cap,
+            });
+        }
+    }
+    Ok(())
 }
 
 impl From<FFTError> for ProvingError {
@@ -1093,6 +1160,10 @@ fn run_admitted<T: Send>(
     // failing test's own block.
     let first_panic: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>> =
         std::sync::Mutex::new(None);
+    // The drivers draw their streams in the spawner's class: a proof run in the
+    // background stays there on every table's thread.
+    #[cfg(feature = "cuda")]
+    let class = math_cuda::stream_class::current();
     // A poisoned lock is itself a panic we are mid-way through reporting, so
     // read through the poison rather than panicking about it and losing the
     // message a second time.
@@ -1102,6 +1173,8 @@ fn run_admitted<T: Send>(
     std::thread::scope(|scope| {
         for _ in 0..workers.max(1).min(order.len().max(1)) {
             scope.spawn(|| {
+                #[cfg(feature = "cuda")]
+                let _class = math_cuda::stream_class::enter(class);
                 loop {
                     let pos = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if pos >= order.len() {
@@ -1151,6 +1224,26 @@ fn run_admitted<T: Send>(
         .into_iter()
         .map(|m| m.into_inner().unwrap())
         .collect()
+}
+
+/// [`run_admitted`] under a gate of `budget`, for the tests of what its
+/// drivers inherit.
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn run_admitted_for_tests<T: Send>(
+    order: &[usize],
+    estimates: &[u64],
+    budget: u64,
+    workers: usize,
+    task: impl Fn(usize) -> T + Sync,
+) -> Vec<Option<T>> {
+    run_admitted(
+        order,
+        estimates,
+        &VramGate::new(budget),
+        workers,
+        |idx| format!("table {idx}"),
+        task,
+    )
 }
 
 /// Prefix a string panic payload with the table's name so the re-raised
@@ -4523,6 +4616,9 @@ pub trait IsStarkProver<
             .unwrap_or(u64::MAX);
         #[cfg(not(feature = "cuda"))]
         let vram_budget = u64::MAX;
+        // A proof beside another on the card admits against its own cap.
+        let cap = device_cap();
+        let vram_budget = cap.map_or(vram_budget, |cap| vram_budget.min(cap));
 
         // NOTE: an earlier revision published prove-wide pinned-staging size
         // hints here so worker slabs allocated once at final size. Measured on
@@ -4592,6 +4688,19 @@ pub trait IsStarkProver<
             .map(|s| table_walk_weight(s.main_cols, 0, s.n * s.blowup))
             .collect();
         let main_walk_order = heaviest_first(&main_walk_weights);
+        // Under a cap, every table's device set in both phases is held to it
+        // before the first commit: a table over it is refused here, by name,
+        // with nothing on the card yet.
+        if let Some(cap) = cap {
+            let rounds: Vec<u64> = table_shapes
+                .iter()
+                .zip(&leaf_layouts)
+                .map(|(s, l)| {
+                    crate::device_set::table_device_set_rpl(*s, l.rows_per_leaf()).total()
+                })
+                .collect();
+            refuse_over_cap(&table_names, [&main_estimates, &rounds], cap)?;
+        }
         eprintln!(
             "[prover] table walk R1 (walk weight, largest first): {}",
             describe_walk(&main_walk_order, &main_walk_weights, &table_names)
