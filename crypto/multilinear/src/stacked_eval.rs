@@ -517,13 +517,13 @@ where
         };
         let transient = room.is_none();
         // ★ A coset-ordered round 0 is revived over its stack, not re-encoded:
-        // each opening evaluates the cosets its queries fall in. Only where
-        // the stack is resident and the chain is a polynomial's own: a grouped
-        // run re-encodes its codewords on the card. Either way its successor
-        // must then be encoded from the bound message; the chain refuses a
-        // fold (`Error::CosetSuccessorNotEncoded`).
+        // each opening evaluates the cosets its queries fall in, a polynomial's
+        // own chain and every tree of a grouped run alike (both open a tree
+        // through `open_many_capped`). Only where the stack is resident. The
+        // successor must then be encoded from the bound message, a run's from
+        // its combined one; the chain refuses a fold
+        // (`Error::CosetSuccessorNotEncoded`).
         let from_stack = config.format.leaves == crate::whir_commit::LeafOrder::Coset
-            && config.format.group == crate::whir_chain::GroupFold::PerPoly
             && crate::gpu::coset_openings_in_effect();
         let mut commitments = Vec::with_capacity(retired.len());
         for (poly, retired) in retired.into_iter().enumerate() {
