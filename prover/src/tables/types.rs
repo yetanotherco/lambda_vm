@@ -354,12 +354,11 @@ pub enum BusId {
     Bit = 30,
 
     // =========================================================================
-    // DMA memcpy accelerator
+    // Copy accelerator
     // =========================================================================
-    // IDs 29 and 32 are reserved for the removed DmaNext and DmaSetNext buses:
-    // the DMA and DMA_SET tables they chained are both replaced by COPY, which
-    // chains over [`BusId::CopyNext`] and carries the functionality selectors
-    // inside the tuple rather than separating the paths by bus id.
+    // IDs 29 and 32 are unused. The copy primitive chains over a single
+    // [`BusId::CopyNext`] and carries the functionality selectors inside the tuple,
+    // rather than giving each of its three operations a bus of its own.
 
     // =========================================================================
     // Continuations
@@ -375,11 +374,11 @@ pub enum BusId {
     /// `(timestamp, src_incr, dst_incr, count_decr, is_set, is_write)` to the next
     /// row and receives `(timestamp, src, dst, count, is_set, is_write)` from the
     /// previous one. The functionality selectors travel inside the tuple, so a chain
-    /// cannot change operation half way through it — the guarantee that the three
-    /// removed DmaNext/DmaSetNext/CommitNextByte buses used to give structurally.
+    /// cannot change operation half way through it — a guarantee that separating the
+    /// operations by bus id would otherwise have to carry structurally.
     CopyNext = 33,
-    // ID 34 is reserved for the removed CommitDefer bus: the COMMIT chip is gone and
-    // COPY receives the `write` ECALL and reads its operand registers itself.
+    // ID 34 is unused. COPY receives the `write` ECALL and reads its operand
+    // registers itself, so nothing defers the commit to a second chip.
 }
 
 impl BusId {

@@ -435,7 +435,7 @@ dropped the "chain is complete" property both rely on.
 
 Registers must also carry across epochs: epoch *i+1* must start from epoch *i*'s
 final register file. Unlike memory, the register file is **small and fixed** (34
-registers / 67 word-addresses, all present every epoch), so it needs no L2G /
+registers / 68 word-addresses, all present every epoch), so it needs no L2G /
 global telescoping — we bind the whole snapshot directly.
 
 **Mechanism (no new bus).** The REGISTER table is the register analog of PAGE — it
