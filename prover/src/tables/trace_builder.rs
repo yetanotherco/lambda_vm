@@ -2100,7 +2100,7 @@ pub(crate) fn collect_bitwise_from_mul(
 /// Collects bitwise lookups from DVRM operations.
 ///
 /// Generates: IS_HALF (×20: n, d, r, n_sub_r, q) and ZERO (×2) per raw op, plus
-/// MSB16 (up to ×3) and NEG ZERO (up to ×4) per unique signed op per chunk.
+/// MSB16 (up to ×3) and NEG ZERO (up to ×4) per row of each chunk whose sign bit is set.
 ///
 /// DVRM-A1 (IS_HALF[n]) and DVRM-A2 (IS_HALF[d]) are range-checked by the DVRM
 /// table itself (n/d IS_HALF senders in dvrm::bus_interactions), so their lookups
@@ -3588,7 +3588,7 @@ fn build_traces<I: ImageSource + Sync>(
     // used to split them into instances so multiplicities match the per-instance sends.
     // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]. PAGE does a
     // batched ARE_BYTES[init, fini] per row (skipped in continuation epochs, which the L2G
-    // table owns). COPY sends IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL;
+    // table owns). COPY sends IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES;
     // HINT sends ARE_BYTES for its 32 output cells.
     // We never concatenate the lookups into one giant `Vec<BitwiseOperation>` (~140 M ops /
     // ~560 MB at 10-tx whose only consumer is the multiplicity count). Each collector bumps
