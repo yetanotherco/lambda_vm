@@ -6657,7 +6657,10 @@ mod walkers_knob_tests {
             );
         }
         for value in ["5", "8", "16", "17", "-1", "auto", "4x", "1.5"] {
-            assert!(parse_walkers(Some(value), StoreKind::Pages).is_err(), "{value}");
+            assert!(
+                parse_walkers(Some(value), StoreKind::Pages).is_err(),
+                "{value}"
+            );
         }
         for value in [None, Some(""), Some("0")] {
             assert_eq!(parse_walkers(value, StoreKind::Words).ok(), Some(0));
