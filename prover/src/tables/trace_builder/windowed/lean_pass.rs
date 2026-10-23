@@ -25,12 +25,15 @@ use std::sync::Arc;
 use executor::vm::instruction::execution::{BLAKE3_ABSORB_CV_OUT_DWORD, BLAKE3_BLOCK_BYTES};
 use executor::vm::logs::Log;
 use executor::vm::memory::MemorySnapshot;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use super::super::{MemoryState, RegisterState, clock};
 use crate::Error;
-use crate::paged_mem::PagedMem;
+use crate::paged_mem::{PageMut, PagedMem};
 use crate::tables::cpu::{CpuOp, CpuOperation};
 use crate::tables::decode::DecodeTable;
+use crate::tables::page::DEFAULT_PAGE_SIZE;
 
 /// The low bits of a cell: the window that last touched the byte.
 const WINDOW_BITS: u32 = 24;
@@ -558,7 +561,7 @@ impl LeanPass {
     /// byte the pass stamped with its value now and its timestamp. The walk
     /// sets a cell only by writing it (a load writes the bytes it read), so
     /// these are its pages, its set cells and its values; a cell it never set
-    /// holds `(0, 0)` as the walk's do.
+    /// holds `(0, 0)` as the walk's do. The state's pages are filled at once.
     pub(crate) fn walked_state(
         &self,
         now: &MemorySnapshot,
@@ -567,24 +570,46 @@ impl LeanPass {
     ) -> MemoryState {
         let mut memory = MemoryState::from_pages(image);
         memory.lean = lean;
-        let mut values = vec![0u8; PAGE];
-        for (number, page) in self.bytes.cells.iter_pages() {
-            if !page.iter().any(|&c| c >> WINDOW_BITS > 0) {
-                continue;
+        // The pass's pages holding a stamped byte, by address. A 64 KiB page
+        // of the pass sits in one page of the state.
+        let mut stamped: Vec<(u64, &[u64; PAGE])> = self
+            .bytes
+            .cells
+            .iter_pages()
+            .filter(|(_, page)| page.iter().any(|&c| c >> WINDOW_BITS > 0))
+            .map(|(number, page)| (number << PAGE_BITS, page))
+            .collect();
+        stamped.sort_unstable_by_key(|&(base, _)| base);
+        for &(base, _) in &stamped {
+            memory
+                .cells
+                .page_index_or_insert(PagedMem::<(u8, u64)>::page_of(base).0);
+        }
+        let fill = |mut state: PageMut<'_, (u8, u64)>| {
+            let from = stamped.partition_point(|&(base, _)| base < state.base());
+            let to = from
+                + stamped[from..]
+                    .partition_point(|&(base, _)| base - state.base() < DEFAULT_PAGE_SIZE as u64);
+            if from == to {
+                return;
             }
-            let base = number << PAGE_BITS;
-            now.read(base, &mut values);
-            // A 64 KiB page of the pass sits in one page of the state.
-            let (state_page, _) = PagedMem::<(u8, u64)>::page_of(base);
-            let index = memory.cells.page_index_or_insert(state_page);
-            let at = (base - state_page) as usize;
-            for (off, &c) in page.iter().enumerate() {
-                let ts = c >> WINDOW_BITS;
-                if ts > 0 {
-                    memory.cells.page_set(index, at + off, (values[off], ts));
+            let mut values = vec![0u8; PAGE];
+            for &(base, page) in &stamped[from..to] {
+                now.read(base, &mut values);
+                let at = (base - state.base()) as usize;
+                for (off, &c) in page.iter().enumerate() {
+                    let ts = c >> WINDOW_BITS;
+                    if ts > 0 {
+                        state.set(at + off, (values[off], ts));
+                    }
                 }
             }
-        }
+        };
+        let pages = memory.cells.pages_mut();
+        #[cfg(feature = "parallel")]
+        pages.collect::<Vec<_>>().into_par_iter().for_each(fill);
+        #[cfg(not(feature = "parallel"))]
+        pages.for_each(fill);
         memory
     }
 

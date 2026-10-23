@@ -73,6 +73,14 @@ impl<T: Copy> PagedMem<T> {
         self.pages.retain(|(base, _)| keep(*base));
     }
 
+    /// Each allocated page, to be written: distinct pages can be written at
+    /// once, from several threads.
+    pub fn pages_mut(&mut self) -> impl Iterator<Item = PageMut<'_, T>> {
+        self.pages
+            .iter_mut()
+            .map(|(base, page)| PageMut { base: *base, page })
+    }
+
     /// Value at `addr`, or `fill` if never `set`.
     #[inline]
     pub fn get(&self, addr: u64) -> T {
@@ -230,6 +238,27 @@ impl<T: Copy> PagedMem<T> {
                     })
                 })
         })
+    }
+}
+
+/// One allocated page of a [`PagedMem`], to be written
+/// ([`PagedMem::pages_mut`]).
+pub struct PageMut<'a, T> {
+    base: u64,
+    page: &'a mut Page<T>,
+}
+
+impl<T: Copy> PageMut<'_, T> {
+    /// The page's base address.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// Sets offset `off` to `val`, as [`PagedMem::page_set`] does.
+    #[inline]
+    pub fn set(&mut self, off: usize, val: T) {
+        self.page.data[off] = val;
+        self.page.occupied[off / WORD_BITS] |= 1u64 << (off % WORD_BITS);
     }
 }
 
