@@ -55,6 +55,8 @@ pub mod hint_tests;
 #[cfg(test)]
 pub mod ir_stats_dump;
 #[cfg(test)]
+pub mod is_wh_tests;
+#[cfg(test)]
 pub mod keccak_rnd_tests;
 #[cfg(test)]
 pub mod keccak_tests;

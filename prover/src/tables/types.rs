@@ -356,7 +356,7 @@ pub enum BusId {
     // =========================================================================
     // Copy accelerator
     // =========================================================================
-    // IDs 29 and 32 are unused. The copy primitive chains over a single
+    // ID 29 is unused (32 is IS_WH, below). The copy primitive chains over a single
     // [`BusId::CopyNext`] and carries the functionality selectors inside the tuple,
     // rather than giving each of its three operations a bus of its own.
 
@@ -366,6 +366,15 @@ pub enum BusId {
     /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
     /// boundary claims, matched across epochs by the final aggregation LogUp.
     GlobalMemory = 31,
+
+    // =========================================================================
+    // Address range checks
+    // =========================================================================
+    /// `IS_WH[Word, Half]`: range check that the top 48 bits of a `DWordWHH`
+    /// are a valid `(Word, Half)` pair. Callers send it through the `IS_WHH`
+    /// template; the IS_WH table receives it. ID 29 (the removed EC_SCALAR
+    /// `ServeK` bus) stays unused.
+    IsWh = 32,
 
     // =========================================================================
     // Unified copy primitive
@@ -408,6 +417,7 @@ impl BusId {
             BusId::Ecdas => "Ecdas",
             BusId::Bit => "Bit",
             BusId::GlobalMemory => "GlobalMemory",
+            BusId::IsWh => "IsWh",
         }
     }
 }
@@ -439,6 +449,7 @@ impl TryFrom<u64> for BusId {
             28 => Ok(BusId::Ecdas),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
+            32 => Ok(BusId::IsWh),
             33 => Ok(BusId::CopyNext),
             other => Err(other),
         }

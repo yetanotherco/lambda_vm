@@ -2085,6 +2085,7 @@ mod tests {
                     ("ecsm", c.ecsm),
                     ("ecdas", c.ecdas),
                     ("hint", c.hint),
+                    ("is_wh", c.is_wh),
                 ]
             })
             .collect();

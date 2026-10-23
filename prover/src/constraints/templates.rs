@@ -109,6 +109,7 @@ impl core::ops::Deref for AddTerms {
 /// - Constants: `AddOperand::constant(42)` → lo=42, hi=0
 /// - Word → DWordWL: `AddOperand::from_word(col)` → lo=col, hi=0
 /// - DWordHL → DWordWL: `AddOperand::from_dword_hl(col)` → repack 4 halves
+/// - DWordWHH → DWordWL: `AddOperand::from_dword_whh(col)` → repack 2 halves + word
 /// - DWordBL → DWordWL: `AddOperand::from_dword_bl(col)` → repack 8 bytes
 /// - Expressions: `AddOperand::linear(...)` → arbitrary linear combinations
 #[derive(Debug, Clone, Copy)]
@@ -182,6 +183,29 @@ impl AddOperand {
                     column: start_column + 3,
                 },
             ]),
+        }
+    }
+
+    /// DWordWHH → DWordWL: repack the two low halves into a word; the high
+    /// word is already a single column.
+    /// lo = h[0] + 2^16 * h[1]
+    /// hi = w[2]
+    pub fn from_dword_whh(start_column: usize) -> Self {
+        AddOperand::Linear {
+            lo: AddTerms::of(&[
+                AddLinearTerm::Column {
+                    coefficient: 1,
+                    column: start_column,
+                },
+                AddLinearTerm::Column {
+                    coefficient: 1 << 16,
+                    column: start_column + 1,
+                },
+            ]),
+            hi: AddTerms::of(&[AddLinearTerm::Column {
+                coefficient: 1,
+                column: start_column + 2,
+            }]),
         }
     }
 

@@ -232,6 +232,22 @@ fn emit_add_pair_linear_unconditional() {
 }
 
 #[test]
+fn emit_add_pair_conditional_whh_sum() {
+    // DWordBL lhs + constant, DWordWHH sum: the KECCAK state_ptr shape.
+    emit_body!(Body, 2, |b| {
+        emit_add_pair(
+            b,
+            0,
+            &[0],
+            &AddOperand::from_dword_bl(1),
+            &AddOperand::constant(192),
+            &AddOperand::from_dword_whh(9),
+        )
+    });
+    check_add_pair_case("add_pair_conditional_whh_sum", &Body, true);
+}
+
+#[test]
 fn emit_add_pair_multi_cond_bytes() {
     // Multi-column condition (flag sum), Word + Constant operands, and a
     // DWordBL byte-repacked sum — the remaining AddOperand variants.

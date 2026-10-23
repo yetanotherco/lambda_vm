@@ -36,7 +36,8 @@ fn run_rust_elf(name: &str) -> (Elf, ExecutionResult) {
     (elf, result)
 }
 
-/// The claim every drop-forgery below makes, in one place.
+/// The claim every drop-forgery below makes, in one place (the IS_WH range
+/// forgeries in `is_wh_tests` make it too).
 ///
 /// `multi_verify_views` returns `false` from about ten places, so
 /// `assert!(!accepted)` on its own would pass just as happily if the forged
@@ -44,11 +45,11 @@ fn run_rust_elf(name: &str) -> (Elf, ExecutionResult) {
 /// check — the opposite of what these tests say they demonstrate. Moving the
 /// target onto the sum the forgery actually produced is what separates them: if
 /// the same proof then verifies, the balance was the only objection.
-fn assert_only_the_bus_rejected(outcome: &BusOutcome, what: &str) {
-    assert!(!outcome.accepted, "dropping {what} must not verify");
+pub(crate) fn assert_only_the_bus_rejected(outcome: &BusOutcome, what: &str) {
+    assert!(!outcome.accepted, "{what} must not verify");
     assert_ne!(
         outcome.contribution_sum, outcome.target,
-        "dropping {what} left the bus balanced, so the rejection came from \
+        "{what} left the bus balanced, so the rejection came from \
          elsewhere and the bus did not notice the forgery at all"
     );
     assert!(
@@ -99,6 +100,7 @@ fn every_table_participates_in_the_bus() {
         ecsm: 1,
         ecdas: 1,
         hint: 1,
+        is_wh: 1,
     };
     let airs = VmAirs::new(
         &elf,
@@ -126,7 +128,7 @@ fn every_table_participates_in_the_bus() {
 }
 
 /// The tables a prover can declare away, under the names the AIRs carry. The
-/// always-present ones (BITWISE, DECODE, KECCAK_RC, REGISTER, HALT, the PAGEs,
+/// always-present ones (BITWISE, DECODE, KECCAK_RC, COPY, REGISTER, HALT, the PAGEs,
 /// L2G) have no `TableCounts` field, and they legitimately contribute zero when
 /// the run never reaches them — KECCAK_RC does exactly that in a program with no
 /// keccak, which is the padding this change is about and cannot be dropped.
@@ -156,6 +158,7 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
         ecsm,
         ecdas,
         hint,
+        is_wh,
     } = counts;
     [
         ("CPU", cpu),
@@ -177,6 +180,7 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
         ("ECSM", ecsm),
         ("ECDAS", ecdas),
         ("HINT", hint),
+        ("IS_WH", is_wh),
     ]
     .into_iter()
     .map(|(name, _count)| name)
@@ -371,12 +375,13 @@ fn dropping_a_used_table_through_the_real_verifier_is_rejected() {
 /// PAGE, REGISTER, GLOBAL_MEMORY — are exactly the mandatory ones, and nothing
 /// enforced that this stays true.
 ///
-/// One exception, by bus: `ARE_BYTES` byte checks the spec gives no `cond`
-/// (default 1) — the μ bounds of the dedup tables (spec #1017), SHIFT's
-/// `shift[0..1]` bytes and KECCAK_RND's θ/ρ bytes. A padding row sends them as
-/// `ARE_BYTES[0, 0]`, which is in range — the test checks this by requiring each
-/// value to vanish on an all-zero row (columns only, no nonzero constant term) —
-/// and their only counterparty is BITWISE, whose multiplicity columns are
+/// One exception, by bus: `ARE_BYTES` and `IS_B20` range checks the spec gives
+/// no `cond` (default 1) — the μ bounds of the dedup tables (spec #1017, an
+/// `IS_B20[μ]` on IS_WH), SHIFT's `shift[0..1]` bytes and KECCAK_RND's θ/ρ
+/// bytes. A padding row sends them as `ARE_BYTES[0, 0]` / `IS_B20[0]`, which is
+/// in range — the test checks this by requiring each value to vanish on an
+/// all-zero row (columns only, no nonzero constant term) — and their only
+/// counterparty is BITWISE, whose multiplicity columns are
 /// free witnesses, so the contribution is absorbed whichever way an unused chip
 /// went; and an optional table with no ops is never shipped
 /// (`chunk_and_generate_optional`/`generate_optional` return no table), so the
@@ -385,11 +390,11 @@ fn dropping_a_used_table_through_the_real_verifier_is_rejected() {
 #[test]
 fn no_optional_table_uses_a_constant_multiplicity() {
     use crate::tables::{
-        branch, bytewise, cpu32, dvrm, ecdas, ecsm, eq, hint, keccak, keccak_rnd, load, lt, memw,
-        memw_aligned, mul, shift, store,
+        branch, bytewise, cpu32, dvrm, ecdas, ecsm, eq, hint, is_wh, keccak, keccak_rnd, load, lt,
+        memw, memw_aligned, mul, shift, store,
     };
     use stark::lookup::{BusValue, LinearTerm};
-    let optional: [(&str, Vec<stark::lookup::BusInteraction>); 17] = [
+    let optional: [(&str, Vec<stark::lookup::BusInteraction>); 18] = [
         ("LT", lt::bus_interactions()),
         ("MEMW", memw::bus_interactions()),
         ("MEMW_A", memw_aligned::bus_interactions()),
@@ -407,6 +412,7 @@ fn no_optional_table_uses_a_constant_multiplicity() {
         ("ECSM", ecsm::bus_interactions()),
         ("ECDAS", ecdas::bus_interactions()),
         ("HINT", hint::bus_interactions()),
+        ("IS_WH", is_wh::bus_interactions()),
     ];
     for (name, interactions) in optional {
         assert!(
@@ -414,13 +420,15 @@ fn no_optional_table_uses_a_constant_multiplicity() {
             "{name} declares no bus interactions"
         );
         for (i, interaction) in interactions.iter().enumerate() {
+            use crate::tables::types::BusId;
             let zero_on_padding = interaction.values.iter().all(|value| match value {
                 BusValue::Packed { .. } => true,
                 BusValue::Linear(terms) => terms
                     .iter()
                     .all(|term| !matches!(term, LinearTerm::Constant(c) if *c != 0)),
             });
-            let byte_check = interaction.bus_id == u64::from(crate::tables::types::BusId::AreBytes)
+            let byte_check = (interaction.bus_id == u64::from(BusId::AreBytes)
+                || interaction.bus_id == u64::from(BusId::IsB20))
                 && interaction.is_sender
                 && zero_on_padding;
             assert!(
@@ -529,7 +537,7 @@ fn omitting_a_table_whose_ops_ran_fails_the_bus_balance() {
         "validate deliberately lets this through — the bus is what rejects it"
     );
 
-    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "MUL");
+    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "dropping MUL");
 }
 
 /// What `validate` still refuses: a proof with no CPU describes no execution,
@@ -557,8 +565,8 @@ fn validate_still_requires_cpu_and_the_register_file() {
 }
 
 /// The counts ride in the proof, so they are the prover's to choose, and the
-/// sub-proof cross-check constrains only their *sum*. The five accelerators are
-/// not chunked — `generate_optional` emits one table or none — so any count
+/// sub-proof cross-check constrains only their *sum*. The five accelerators and
+/// IS_WH are not chunked — `generate_optional` emits one table or none — so any count
 /// above 1 describes a table set no prover can build, and the sum alone does not
 /// catch it: lower another count by the same amount and the total still matches.
 /// This pins the per-field shape.
@@ -583,12 +591,13 @@ fn an_accelerator_count_above_one_is_rejected() {
     // Named setters rather than a match with a catch-all: a wrong field would
     // otherwise pass the assertion below while testing the wrong count.
     type SetCount = fn(&mut TableCounts);
-    let inflate: [(&str, SetCount); 5] = [
+    let inflate: [(&str, SetCount); 6] = [
         ("keccak", |c| c.keccak = 2),
         ("keccak_rnd", |c| c.keccak_rnd = 2),
         ("ecsm", |c| c.ecsm = 2),
         ("ecdas", |c| c.ecdas = 2),
         ("hint", |c| c.hint = 2),
+        ("is_wh", |c| c.is_wh = 2),
     ];
     for (name, set_to_two) in inflate {
         let mut counts = honest.clone();
@@ -599,8 +608,8 @@ fn an_accelerator_count_above_one_is_rejected() {
         );
     }
 
-    // The chunked chips keep taking any count: this is a cap on the five, not a
-    // cap on chunking.
+    // The chunked chips keep taking any count: this is a cap on the five
+    // accelerators and IS_WH, not a cap on chunking.
     let mut many_mul = honest.clone();
     many_mul.mul = 7;
     assert!(many_mul.validate().is_ok(), "chunked chips still chunk");
@@ -637,9 +646,9 @@ fn counts_that_wrap_have_no_total() {
 
 /// The accelerators are the ones a run most often never reaches, and each cost a
 /// four-row sub-proof regardless. A program with no keccak, no EC and no hint
-/// ecall now carries none of the five.
+/// ecall now carries none of the five, nor the IS_WH table KECCAK feeds.
 #[test]
-fn a_run_without_accelerators_omits_all_five() {
+fn a_run_without_accelerators_omits_all_five_and_is_wh() {
     let (elf, logs, _instructions) = run_asm_elf("xori");
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
@@ -651,6 +660,8 @@ fn a_run_without_accelerators_omits_all_five() {
         ("ecsm", counts.ecsm),
         ("ecdas", counts.ecdas),
         ("hint", counts.hint),
+        // Not an accelerator, but only KECCAK feeds it today.
+        ("is_wh", counts.is_wh),
     ] {
         assert_eq!(
             count, 0,
@@ -685,7 +696,7 @@ fn omitting_a_used_accelerator_fails_the_bus_balance() {
     );
 
     traces.hints.clear();
-    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "HINT");
+    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "dropping HINT");
 }
 
 /// The dispatch above is CPU-to-chip. KECCAK_RND is reached from KECCAK, not
@@ -708,7 +719,34 @@ fn omitting_a_chip_dispatched_by_another_chip_fails_the_bus_balance() {
     );
 
     traces.keccak_rnds.clear();
-    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "KECCAK_RND");
+    assert_only_the_bus_rejected(
+        &weigh_the_bus(&elf, &mut traces, true),
+        "dropping KECCAK_RND",
+    );
+}
+
+/// IS_WH is reached from a chip's range checks rather than from a dispatch: it
+/// receives the `IS_WH` half of every `IS_WHH` send (today KECCAK's
+/// `state_ptr`). Dropping it leaves those sends unmatched — and unlike the
+/// BITWISE range checks, whose receiver multiplicities are free witnesses, no
+/// other table receives `IS_WH`, so nothing can absorb them.
+#[test]
+fn omitting_the_is_wh_table_fails_the_bus_balance() {
+    let (elf, logs, _instructions) = run_asm_elf("test_keccak");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        !traces.is_whs.is_empty(),
+        "test_keccak must exercise IS_WH for this to be a forgery"
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "the honest proof must verify first, or the negative below proves nothing"
+    );
+
+    traces.is_whs.clear();
+    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "dropping IS_WH");
 }
 
 /// The committed output is the one bus target that is not zero: the verifier
@@ -741,5 +779,5 @@ fn dropping_the_committed_output_fails_the_bus_balance() {
         outcome.target, honest_target,
         "clearing the public output must move the target"
     );
-    assert_only_the_bus_rejected(&outcome, "the committed output");
+    assert_only_the_bus_rejected(&outcome, "dropping the committed output");
 }
