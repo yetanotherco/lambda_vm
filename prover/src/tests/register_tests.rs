@@ -21,7 +21,7 @@ fn test_generate_register_trace_empty() {
     let final_state = FinalRegisterStateMap::new();
     let trace = generate_register_trace(&final_state, &register_init_from_entry_point(entry_point));
 
-    // Should have power-of-2 rows >= 67 (x0-x31, x254, x255)
+    // Should have power-of-2 rows >= 68 (x0-x31, x254, x255)
     assert!(trace.num_rows() >= NUM_REGISTER_ADDRESSES);
     assert!(trace.num_rows().is_power_of_two());
 
@@ -32,24 +32,25 @@ fn test_generate_register_trace_empty() {
     assert_eq!(*trace.main_table.get(0, cols::FINI), FE::zero());
     assert_eq!(*trace.main_table.get(0, cols::TIMESTAMP_LO), FE::from(1u64));
 
-    // Check x254 row (row 64 = addr 508)
+    // Check x254 rows (row 64 = addr 508, row 65 = addr 509)
     assert_eq!(*trace.main_table.get(64, cols::OFFSET), FE::from(508u64));
     assert_eq!(*trace.main_table.get(64, cols::INIT), FE::zero());
     assert_eq!(*trace.main_table.get(64, cols::FINI), FE::zero());
+    assert_eq!(*trace.main_table.get(65, cols::OFFSET), FE::from(509u64));
 
-    // Check x255 rows (row 65 = addr 510, row 66 = addr 511)
-    assert_eq!(*trace.main_table.get(65, cols::OFFSET), FE::from(510u64));
+    // Check x255 rows (row 66 = addr 510, row 67 = addr 511)
+    assert_eq!(*trace.main_table.get(66, cols::OFFSET), FE::from(510u64));
     assert_eq!(
-        *trace.main_table.get(65, cols::INIT),
+        *trace.main_table.get(66, cols::INIT),
         FE::from(entry_point & 0xFFFF_FFFF)
     );
     assert_eq!(
-        *trace.main_table.get(65, cols::FINI),
+        *trace.main_table.get(66, cols::FINI),
         FE::from(entry_point & 0xFFFF_FFFF)
     ); // fini=init when never accessed
-    assert_eq!(*trace.main_table.get(66, cols::OFFSET), FE::from(511u64));
+    assert_eq!(*trace.main_table.get(67, cols::OFFSET), FE::from(511u64));
     assert_eq!(
-        *trace.main_table.get(66, cols::INIT),
+        *trace.main_table.get(67, cols::INIT),
         FE::from(entry_point >> 32)
     );
 }
@@ -102,10 +103,10 @@ fn test_fini_from_trace_reads_every_register() {
     // One entry per real register Word address, in register_word_address_list order
     // (positions 0..63 are addresses 0..63, so addr a is at index a for a < 64).
     assert_eq!(fini.len(), NUM_REGISTER_ADDRESSES);
-    // Accessed register reflects its written value; PC (x255, addr 510 = index 65)
+    // Accessed register reflects its written value; PC (x255, addr 510 = index 66)
     // reflects entry point; x0 (addr 0 = index 0) ends at 0.
     assert_eq!(fini[10], 0x42);
-    assert_eq!(fini[65], 0x1000);
+    assert_eq!(fini[66], 0x1000);
     assert_eq!(fini[0], 0);
 }
 

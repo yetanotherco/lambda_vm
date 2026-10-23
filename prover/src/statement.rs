@@ -117,7 +117,6 @@ pub(crate) fn absorb_statement_with_digest(
         ecsm,
         ecdas,
         hint,
-        commit,
         is_wh,
     } = table_counts;
     for count in [
@@ -140,7 +139,6 @@ pub(crate) fn absorb_statement_with_digest(
         ecsm,
         ecdas,
         hint,
-        commit,
         is_wh,
     ] {
         t.append_bytes(&(count as u64).to_le_bytes());

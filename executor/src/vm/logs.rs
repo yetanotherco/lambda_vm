@@ -9,8 +9,18 @@
 /// For ECALL instructions, these fields are repurposed (since decode sets read_register1/2=false,
 /// write_register=false, so src/dst are unconstrained):
 /// - `src1_val` = syscall number (from x17): 64=Commit, 93=Halt, etc.
-/// - `src2_val` = buf_addr (x11) for Commit, 0 otherwise
-/// - `dst_val` = count (x12) for Commit, 0 otherwise
+/// - `src2_val` = Commit: buf_addr (x11); Keccak: state_addr; ECSM: addr_xG;
+///   Hint: input addr; DMA memcpy and DMA memset: the number of COPY rows the
+///   call produces. 0 for every other syscall.
+/// - `dst_val` = Commit: count (x12); ECSM: addr_k; Hint: output addr;
+///   DMA memcpy and DMA memset: byte count. 0 for every other syscall, Keccak
+///   included.
+///
+/// The row count is carried rather than recomputed downstream so that trace sizing
+/// and the CLI's accelerator report share one formula, `copy_trace_rows`, which the
+/// executor evaluates where `src`, `dst` and `count` are all known. Today a row's
+/// width follows from the remaining count alone (eight bytes, or one for the last
+/// seven), so the CLI report just sums the carried counts.
 #[derive(Debug, Clone)]
 pub struct Log {
     /// PC before instruction execution (use this to look up the instruction)
@@ -21,9 +31,9 @@ pub struct Log {
     /// For ECALL: syscall number from x17.
     pub src1_val: u64,
     /// Value of src2 register before execution (if used by the instruction).
-    /// For ECALL Commit: buf_addr from x11.
+    /// For ECALL: see the per-syscall table above.
     pub src2_val: u64,
     /// Value of dst register after execution (if used by the instruction).
-    /// For ECALL Commit: count from x12.
+    /// For ECALL: see the per-syscall table above.
     pub dst_val: u64,
 }

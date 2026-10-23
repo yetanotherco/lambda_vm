@@ -495,8 +495,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // DVRM-C18 (SIGN): MSB16[sign_n; n[3]] when signed=1
-    // Multiplicity: Column(SIGNED) = 0 or 1 per unique row.
-    // The trace builder deduplicates MSB16 lookups per unique op.
+    // Multiplicity: Column(SIGNED) = 0 or 1 per row.
+    // The trace builder counts MSB16 once per row, so an op split over two rows
+    // by `MU_MAX` sends it twice.
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
         BusId::Msb16,

@@ -39,7 +39,7 @@
 //!
 //! The x254 commit index is carried across epochs by that same register binding,
 //! so a continuation epoch indexes its commits from the carried value: both the
-//! COMMIT trace (`current_commit_index` seeded from x254) and the verifier's
+//! COPY trace (`current_commit_index` seeded from x254) and the verifier's
 //! `compute_commit_bus_offset` (a `start_index` parameter) count from it, and the
 //! driver concatenates each epoch's committed bytes into the run-wide output.
 //!
@@ -1904,7 +1904,7 @@ mod tests {
     // `test_commit_split` issues two Commit syscalls, one early and one late, so a
     // small epoch puts the second commit in a later epoch. That epoch starts with
     // x254 > 0 (the carried commit index), which exercises the cross-epoch commit
-    // indexing: both the COMMIT trace and the verifier's `compute_commit_bus_offset`
+    // indexing: both the COPY trace and the verifier's `compute_commit_bus_offset`
     // index from the carried x254 rather than 0. Regression test for that fix.
     #[test]
     fn test_commit_across_epochs_verifies() {
@@ -2013,6 +2013,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_dma_memcpy_across_continuation_epochs() {
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .to_path_buf();
+        let elf_bytes = std::fs::read(
+            workspace_root.join("executor/program_artifacts/rust/dma_memcpy_min.elf"),
+        )
+        .expect("dma_memcpy_min.elf not found — build its make target");
+        let opts = ProofOptions::default_test_options();
+
+        let bundle = prove_continuation(&elf_bytes, &[], 6, &opts)
+            .expect("DMA continuation proof generation");
+        assert!(
+            bundle.num_epochs() > 1,
+            "64-cycle epochs must split the DMA guest"
+        );
+
+        let output = verify_continuation(&elf_bytes, &bundle, &opts)
+            .expect("DMA continuation verification")
+            .expect("honest DMA continuation must verify");
+        assert_eq!(
+            output, b"DMA copies eight-byte rows and a short tail",
+            "continuation output must match the copied bytes"
+        );
+    }
+
     /// Each epoch drops the chips it never reaches, and it decides that on its
     /// own: a table missing from one epoch still shows up in another that does
     /// use it. The skip is not a property of the run, it is a property of the
@@ -2057,7 +2085,6 @@ mod tests {
                     ("ecsm", c.ecsm),
                     ("ecdas", c.ecdas),
                     ("hint", c.hint),
-                    ("commit", c.commit),
                     ("is_wh", c.is_wh),
                 ]
             })

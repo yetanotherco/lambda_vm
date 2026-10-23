@@ -7,7 +7,7 @@ use crate::tables::bitwise::{
     NUM_ROWS as BITWISE_ROWS, bus_interactions as bitwise_buses, cols::NUM_COLUMNS as BITWISE_COLS,
 };
 use crate::tables::branch::{bus_interactions as branch_buses, cols::NUM_COLUMNS as BRANCH_COLS};
-use crate::tables::commit::{bus_interactions as commit_buses, cols::NUM_COLUMNS as COMMIT_COLS};
+use crate::tables::copy::{bus_interactions as copy_buses, cols::NUM_COLUMNS as COPY_COLS};
 use crate::tables::cpu::{bus_interactions as cpu_buses, cols::NUM_COLUMNS as CPU_COLS};
 use crate::tables::decode::{bus_interactions as decode_buses, cols::NUM_COLUMNS as DECODE_COLS};
 use crate::tables::dvrm::{bus_interactions as dvrm_buses, cols::NUM_COLUMNS as DVRM_COLS};
@@ -178,9 +178,9 @@ fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
             1,
         ),
         (
-            lengths.commit_padded_rows,
-            COMMIT_COLS as u64,
-            aux_cols(commit_buses().len()),
+            lengths.copy_padded_rows,
+            COPY_COLS as u64,
+            aux_cols(copy_buses().len()),
             1,
         ),
         // BITWISE / DECODE / PAGE / REGISTER take the preprocessed-trace commit

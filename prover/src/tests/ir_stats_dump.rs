@@ -122,7 +122,6 @@ fn dump_ir_stats() {
     stats(&create_dvrm_air(&opts), "DVRM");
     stats(&create_branch_air(&opts), "BRANCH");
     stats(&create_halt_air(&opts), "HALT");
-    stats(&create_commit_air(&opts), "COMMIT");
     stats(&create_page_air(&opts, 0x1000), "PAGE");
     stats(&create_register_air(&opts), "REGISTER");
     stats(&create_keccak_air(&opts), "KECCAK");

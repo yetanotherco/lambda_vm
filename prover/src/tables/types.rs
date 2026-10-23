@@ -307,11 +307,11 @@ pub enum BusId {
     // =========================================================================
     /// Instruction decode lookup
     Decode = 18,
-    /// System call handling (CPU → HALT/COMMIT for all ECALLs)
+    /// System call handling (CPU → HALT/COPY/KECCAK/ECSM/HINT for all ECALLs)
     Ecall = 19,
-    /// COMMIT self-referencing recursive bus (row N → row N+1)
-    CommitNextByte = 20,
-    /// COMMIT output bus: verifier computes the receiver contribution externally
+    // ID 20 is reserved for the removed CommitNextByte bus: COMMIT's per-byte
+    // recursion moved to COPY, which chains over [`BusId::CopyNext`].
+    /// Commit output bus (sent by COPY's commit rows): verifier computes the receiver contribution externally
     /// from `VmProof.public_output` using the shared LogUp challenges
     Commit = 21,
     /// Keccak core ↔ round chip: (timestamp, round, state[200 bytes])
@@ -354,6 +354,13 @@ pub enum BusId {
     Bit = 30,
 
     // =========================================================================
+    // Copy accelerator
+    // =========================================================================
+    // ID 29 is unused (32 is IS_WH, below). The copy primitive chains over a single
+    // [`BusId::CopyNext`] and carries the functionality selectors inside the tuple,
+    // rather than giving each of its three operations a bus of its own.
+
+    // =========================================================================
     // Continuations
     // =========================================================================
     /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
@@ -368,6 +375,19 @@ pub enum BusId {
     /// template; the IS_WH table receives it. ID 29 (the removed EC_SCALAR
     /// `ServeK` bus) stays unused.
     IsWh = 32,
+
+    // =========================================================================
+    // Unified copy primitive
+    // =========================================================================
+    /// COPY self-referential streaming bus. A row sends
+    /// `(timestamp, src_incr, dst_incr, count_decr, is_set, is_write)` to the next
+    /// row and receives `(timestamp, src, dst, count, is_set, is_write)` from the
+    /// previous one. The functionality selectors travel inside the tuple, so a chain
+    /// cannot change operation half way through it — a guarantee that separating the
+    /// operations by bus id would otherwise have to carry structurally.
+    CopyNext = 33,
+    // ID 34 is unused. COPY receives the `write` ECALL and reads its operand
+    // registers itself, so nothing defers the commit to a second chip.
 }
 
 impl BusId {
@@ -386,8 +406,8 @@ impl BusId {
             BusId::Branch => "Branch",
             BusId::Decode => "Decode",
             BusId::Ecall => "Ecall",
-            BusId::CommitNextByte => "CommitNextByte",
             BusId::Commit => "Commit",
+            BusId::CopyNext => "CopyNext",
             BusId::Keccak => "Keccak",
             BusId::KeccakRc => "KeccakRc",
             BusId::ByteAlu => "ByteAlu",
@@ -419,7 +439,6 @@ impl TryFrom<u64> for BusId {
             17 => Ok(BusId::Branch),
             18 => Ok(BusId::Decode),
             19 => Ok(BusId::Ecall),
-            20 => Ok(BusId::CommitNextByte),
             21 => Ok(BusId::Commit),
             22 => Ok(BusId::Keccak),
             23 => Ok(BusId::KeccakRc),
@@ -431,6 +450,7 @@ impl TryFrom<u64> for BusId {
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
             32 => Ok(BusId::IsWh),
+            33 => Ok(BusId::CopyNext),
             other => Err(other),
         }
     }
