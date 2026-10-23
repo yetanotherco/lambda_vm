@@ -1,0 +1,883 @@
+{"operations":
+ [{"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs": {"type": "var", "index": 25},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"value": 1, "type": "const"}},
+    "lhs": {"type": "var", "index": 5}}},
+  {"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs":
+      {"type": "mul",
+       "rhs":
+       {"type": "add",
+        "rhs":
+        {"type": "mul",
+         "rhs": {"type": "var", "index": 5},
+         "lhs": {"value": 18446744069414584320, "type": "const"}},
+        "lhs": {"type": "var", "index": 25}},
+       "lhs": {"type": "var", "index": 0}},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"type": "var", "index": 13}},
+    "lhs": {"type": "var", "index": 12}}},
+  {"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs":
+      {"type": "mul",
+       "rhs":
+       {"type": "add",
+        "rhs":
+        {"type": "mul",
+         "rhs": {"type": "var", "index": 5},
+         "lhs": {"value": 18446744069414584320, "type": "const"}},
+        "lhs": {"type": "var", "index": 25}},
+       "lhs": {"type": "var", "index": 1}},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"type": "var", "index": 14}},
+    "lhs": {"type": "var", "index": 12}}},
+  {"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs":
+      {"type": "mul",
+       "rhs":
+       {"type": "add",
+        "rhs":
+        {"type": "mul",
+         "rhs": {"type": "var", "index": 5},
+         "lhs": {"value": 18446744069414584320, "type": "const"}},
+        "lhs": {"type": "var", "index": 25}},
+       "lhs": {"type": "var", "index": 2}},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"type": "var", "index": 15}},
+    "lhs": {"type": "var", "index": 12}}},
+  {"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs":
+      {"type": "mul",
+       "rhs":
+       {"type": "add",
+        "rhs":
+        {"type": "mul",
+         "rhs": {"type": "var", "index": 5},
+         "lhs": {"value": 18446744069414584320, "type": "const"}},
+        "lhs": {"type": "var", "index": 25}},
+       "lhs": {"type": "var", "index": 3}},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"type": "var", "index": 16}},
+    "lhs": {"type": "var", "index": 12}}},
+  {"assert":
+   {"type": "mul", "rhs": {"type": "var", "index": 17}, "lhs": {"type": "var", "index": 12}}},
+  {"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs":
+      {"type": "mul", "rhs": {"type": "var", "index": 5}, "lhs": {"type": "var", "index": 0}},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"type": "var", "index": 18}},
+    "lhs": {"type": "var", "index": 12}}},
+  {"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs":
+      {"type": "mul", "rhs": {"type": "var", "index": 5}, "lhs": {"type": "var", "index": 1}},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"type": "var", "index": 19}},
+    "lhs": {"type": "var", "index": 12}}},
+  {"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs":
+      {"type": "mul", "rhs": {"type": "var", "index": 5}, "lhs": {"type": "var", "index": 2}},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"type": "var", "index": 20}},
+    "lhs": {"type": "var", "index": 12}}},
+  {"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs":
+      {"type": "mul", "rhs": {"type": "var", "index": 5}, "lhs": {"type": "var", "index": 3}},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"type": "var", "index": 21}},
+    "lhs": {"type": "var", "index": 12}}},
+  {"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs": {"type": "var", "index": 22},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"value": 1, "type": "const"}},
+    "lhs": {"type": "var", "index": 22}}},
+  {"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs": {"type": "var", "index": 23},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"value": 1, "type": "const"}},
+    "lhs": {"type": "var", "index": 23}}},
+  {"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs": {"type": "var", "index": 24},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"value": 1, "type": "const"}},
+    "lhs": {"type": "var", "index": 24}}},
+  {"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs":
+      {"type": "add",
+       "rhs":
+       {"type": "mul",
+        "rhs": {"type": "var", "index": 24},
+        "lhs": {"value": 18446744069414584320, "type": "const"}},
+       "lhs":
+       {"type": "add",
+        "rhs":
+        {"type": "mul",
+         "rhs": {"type": "var", "index": 23},
+         "lhs": {"value": 18446744069414584320, "type": "const"}},
+        "lhs":
+        {"type": "add",
+         "rhs":
+         {"type": "mul",
+          "rhs": {"type": "var", "index": 22},
+          "lhs": {"value": 18446744069414584320, "type": "const"}},
+         "lhs": {"value": 1, "type": "const"}}}},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"value": 1, "type": "const"}},
+    "lhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs": {"type": "var", "index": 24},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs":
+     {"type": "add",
+      "rhs":
+      {"type": "mul",
+       "rhs": {"type": "var", "index": 23},
+       "lhs": {"value": 18446744069414584320, "type": "const"}},
+      "lhs":
+      {"type": "add",
+       "rhs":
+       {"type": "mul",
+        "rhs": {"type": "var", "index": 22},
+        "lhs": {"value": 18446744069414584320, "type": "const"}},
+       "lhs": {"value": 1, "type": "const"}}}}}},
+  {"assert":
+   {"type": "add",
+    "rhs":
+    {"type": "mul",
+     "rhs":
+     {"type": "mul",
+      "rhs": {"value": 65536, "type": "const"},
+      "lhs":
+      {"type": "add",
+       "rhs":
+       {"type": "mul",
+        "rhs":
+        {"type": "add",
+         "rhs":
+         {"type": "mul",
+          "rhs":
+          {"type": "add",
+           "rhs":
+           {"type": "mul",
+            "rhs": {"type": "var", "index": 24},
+            "lhs": {"value": 18446744069414584320, "type": "const"}},
+           "lhs":
+           {"type": "add",
+            "rhs":
+            {"type": "mul",
+             "rhs": {"type": "var", "index": 23},
+             "lhs": {"value": 18446744069414584320, "type": "const"}},
+            "lhs":
+            {"type": "add",
+             "rhs":
+             {"type": "mul",
+              "rhs": {"type": "var", "index": 22},
+              "lhs": {"value": 18446744069414584320, "type": "const"}},
+             "lhs": {"value": 1, "type": "const"}}}},
+          "lhs":
+          {"type": "mul",
+           "rhs": {"type": "var", "index": 10},
+           "lhs": {"value": 65535, "type": "const"}}},
+         "lhs":
+         {"type": "add",
+          "rhs":
+          {"type": "mul",
+           "rhs":
+           {"type": "add",
+            "rhs": {"type": "var", "index": 17},
+            "lhs": {"type": "var", "index": 21}},
+           "lhs": {"type": "var", "index": 24}},
+          "lhs":
+          {"type": "add",
+           "rhs":
+           {"type": "mul",
+            "rhs":
+            {"type": "add",
+             "rhs": {"type": "var", "index": 16},
+             "lhs": {"type": "var", "index": 20}},
+            "lhs": {"type": "var", "index": 23}},
+           "lhs":
+           {"type": "mul",
+            "rhs":
+            {"type": "add",
+             "rhs": {"type": "var", "index": 15},
+             "lhs": {"type": "var", "index": 19}},
+            "lhs": {"type": "var", "index": 22}}}}},
+        "lhs": {"type": "var", "index": 5}},
+       "lhs":
+       {"type": "mul",
+        "rhs":
+        {"type": "add",
+         "rhs":
+         {"type": "mul", "rhs": {"type": "var", "index": 13}, "lhs": {"type": "var", "index": 23}},
+         "lhs":
+         {"type": "mul",
+          "rhs":
+          {"type": "add", "rhs": {"type": "var", "index": 18}, "lhs": {"type": "var", "index": 14}},
+          "lhs": {"type": "var", "index": 22}}},
+        "lhs":
+        {"type": "add",
+         "rhs":
+         {"type": "mul",
+          "rhs": {"type": "var", "index": 5},
+          "lhs": {"value": 18446744069414584320, "type": "const"}},
+         "lhs": {"type": "var", "index": 25}}}}},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "lhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs":
+      {"type": "add",
+       "rhs":
+       {"type": "mul",
+        "rhs":
+        {"type": "add",
+         "rhs":
+         {"type": "mul",
+          "rhs":
+          {"type": "add", "rhs": {"type": "var", "index": 17}, "lhs": {"type": "var", "index": 21}},
+          "lhs":
+          {"type": "add",
+           "rhs":
+           {"type": "mul",
+            "rhs": {"type": "var", "index": 24},
+            "lhs": {"value": 18446744069414584320, "type": "const"}},
+           "lhs":
+           {"type": "add",
+            "rhs":
+            {"type": "mul",
+             "rhs": {"type": "var", "index": 23},
+             "lhs": {"value": 18446744069414584320, "type": "const"}},
+            "lhs":
+            {"type": "add",
+             "rhs":
+             {"type": "mul",
+              "rhs": {"type": "var", "index": 22},
+              "lhs": {"value": 18446744069414584320, "type": "const"}},
+             "lhs": {"value": 1, "type": "const"}}}}},
+         "lhs":
+         {"type": "add",
+          "rhs":
+          {"type": "mul",
+           "rhs":
+           {"type": "add",
+            "rhs": {"type": "var", "index": 16},
+            "lhs": {"type": "var", "index": 20}},
+           "lhs": {"type": "var", "index": 24}},
+          "lhs":
+          {"type": "add",
+           "rhs":
+           {"type": "mul",
+            "rhs":
+            {"type": "add",
+             "rhs": {"type": "var", "index": 15},
+             "lhs": {"type": "var", "index": 19}},
+            "lhs": {"type": "var", "index": 23}},
+           "lhs":
+           {"type": "mul",
+            "rhs":
+            {"type": "add",
+             "rhs": {"type": "var", "index": 14},
+             "lhs": {"type": "var", "index": 18}},
+            "lhs": {"type": "var", "index": 22}}}}},
+        "lhs": {"type": "var", "index": 5}},
+       "lhs":
+       {"type": "mul",
+        "rhs":
+        {"type": "mul", "rhs": {"type": "var", "index": 13}, "lhs": {"type": "var", "index": 22}},
+        "lhs":
+        {"type": "add",
+         "rhs":
+         {"type": "mul",
+          "rhs": {"type": "var", "index": 5},
+          "lhs": {"value": 18446744069414584320, "type": "const"}},
+         "lhs": {"type": "var", "index": 25}}}},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"type": "var", "index": 8}}}},
+  {"assert":
+   {"type": "add",
+    "rhs":
+    {"type": "mul",
+     "rhs":
+     {"type": "mul",
+      "rhs": {"value": 65536, "type": "const"},
+      "lhs":
+      {"type": "add",
+       "rhs":
+       {"type": "mul",
+        "rhs":
+        {"type": "add",
+         "rhs":
+         {"type": "mul",
+          "rhs":
+          {"type": "add",
+           "rhs":
+           {"type": "add",
+            "rhs":
+            {"type": "mul",
+             "rhs": {"type": "var", "index": 24},
+             "lhs": {"value": 18446744069414584320, "type": "const"}},
+            "lhs":
+            {"type": "add",
+             "rhs":
+             {"type": "mul",
+              "rhs": {"type": "var", "index": 23},
+              "lhs": {"value": 18446744069414584320, "type": "const"}},
+             "lhs":
+             {"type": "add",
+              "rhs":
+              {"type": "mul",
+               "rhs": {"type": "var", "index": 22},
+               "lhs": {"value": 18446744069414584320, "type": "const"}},
+              "lhs": {"value": 1, "type": "const"}}}},
+           "lhs":
+           {"type": "add",
+            "rhs": {"type": "var", "index": 24},
+            "lhs": {"type": "var", "index": 23}}},
+          "lhs":
+          {"type": "mul",
+           "rhs": {"type": "var", "index": 10},
+           "lhs": {"value": 65535, "type": "const"}}},
+         "lhs":
+         {"type": "mul",
+          "rhs":
+          {"type": "add", "rhs": {"type": "var", "index": 17}, "lhs": {"type": "var", "index": 21}},
+          "lhs": {"type": "var", "index": 22}}},
+        "lhs": {"type": "var", "index": 5}},
+       "lhs":
+       {"type": "mul",
+        "rhs":
+        {"type": "add",
+         "rhs":
+         {"type": "mul",
+          "rhs": {"type": "var", "index": 13},
+          "lhs":
+          {"type": "add",
+           "rhs":
+           {"type": "mul",
+            "rhs": {"type": "var", "index": 24},
+            "lhs": {"value": 18446744069414584320, "type": "const"}},
+           "lhs":
+           {"type": "add",
+            "rhs":
+            {"type": "mul",
+             "rhs": {"type": "var", "index": 23},
+             "lhs": {"value": 18446744069414584320, "type": "const"}},
+            "lhs":
+            {"type": "add",
+             "rhs":
+             {"type": "mul",
+              "rhs": {"type": "var", "index": 22},
+              "lhs": {"value": 18446744069414584320, "type": "const"}},
+             "lhs": {"value": 1, "type": "const"}}}}},
+         "lhs":
+         {"type": "add",
+          "rhs":
+          {"type": "mul",
+           "rhs":
+           {"type": "add",
+            "rhs": {"type": "var", "index": 18},
+            "lhs": {"type": "var", "index": 14}},
+           "lhs": {"type": "var", "index": 24}},
+          "lhs":
+          {"type": "add",
+           "rhs":
+           {"type": "mul",
+            "rhs":
+            {"type": "add",
+             "rhs": {"type": "var", "index": 19},
+             "lhs": {"type": "var", "index": 15}},
+            "lhs": {"type": "var", "index": 23}},
+           "lhs":
+           {"type": "mul",
+            "rhs":
+            {"type": "add",
+             "rhs": {"type": "var", "index": 20},
+             "lhs": {"type": "var", "index": 16}},
+            "lhs": {"type": "var", "index": 22}}}}},
+        "lhs":
+        {"type": "add",
+         "rhs":
+         {"type": "mul",
+          "rhs": {"type": "var", "index": 5},
+          "lhs": {"value": 18446744069414584320, "type": "const"}},
+         "lhs": {"type": "var", "index": 25}}}}},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "lhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs":
+      {"type": "add",
+       "rhs":
+       {"type": "mul",
+        "rhs":
+        {"type": "add",
+         "rhs":
+         {"type": "mul",
+          "rhs":
+          {"type": "add",
+           "rhs":
+           {"type": "add",
+            "rhs":
+            {"type": "mul",
+             "rhs": {"type": "var", "index": 24},
+             "lhs": {"value": 18446744069414584320, "type": "const"}},
+            "lhs":
+            {"type": "add",
+             "rhs":
+             {"type": "mul",
+              "rhs": {"type": "var", "index": 23},
+              "lhs": {"value": 18446744069414584320, "type": "const"}},
+             "lhs":
+             {"type": "add",
+              "rhs":
+              {"type": "mul",
+               "rhs": {"type": "var", "index": 22},
+               "lhs": {"value": 18446744069414584320, "type": "const"}},
+              "lhs": {"value": 1, "type": "const"}}}},
+           "lhs": {"type": "var", "index": 24}},
+          "lhs":
+          {"type": "mul",
+           "rhs": {"type": "var", "index": 10},
+           "lhs": {"value": 65535, "type": "const"}}},
+         "lhs":
+         {"type": "add",
+          "rhs":
+          {"type": "mul",
+           "rhs":
+           {"type": "add",
+            "rhs": {"type": "var", "index": 17},
+            "lhs": {"type": "var", "index": 21}},
+           "lhs": {"type": "var", "index": 23}},
+          "lhs":
+          {"type": "mul",
+           "rhs":
+           {"type": "add",
+            "rhs": {"type": "var", "index": 16},
+            "lhs": {"type": "var", "index": 20}},
+           "lhs": {"type": "var", "index": 22}}}},
+        "lhs": {"type": "var", "index": 5}},
+       "lhs":
+       {"type": "mul",
+        "rhs":
+        {"type": "add",
+         "rhs":
+         {"type": "mul", "rhs": {"type": "var", "index": 13}, "lhs": {"type": "var", "index": 24}},
+         "lhs":
+         {"type": "add",
+          "rhs":
+          {"type": "mul",
+           "rhs":
+           {"type": "add",
+            "rhs": {"type": "var", "index": 18},
+            "lhs": {"type": "var", "index": 14}},
+           "lhs": {"type": "var", "index": 23}},
+          "lhs":
+          {"type": "mul",
+           "rhs":
+           {"type": "add",
+            "rhs": {"type": "var", "index": 19},
+            "lhs": {"type": "var", "index": 15}},
+           "lhs": {"type": "var", "index": 22}}}},
+        "lhs":
+        {"type": "add",
+         "rhs":
+         {"type": "mul",
+          "rhs": {"type": "var", "index": 5},
+          "lhs": {"value": 18446744069414584320, "type": "const"}},
+         "lhs": {"type": "var", "index": 25}}}},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"type": "var", "index": 9}}}},
+  {"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs": {"type": "var", "index": 5},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"value": 1, "type": "const"}},
+    "lhs": {"type": "var", "index": 5}}},
+  {"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs": {"type": "var", "index": 6},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"value": 1, "type": "const"}},
+    "lhs": {"type": "var", "index": 6}}},
+  {"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs": {"type": "var", "index": 7},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"value": 1, "type": "const"}},
+    "lhs": {"type": "var", "index": 7}}},
+  {"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs": {"type": "var", "index": 12},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"value": 1, "type": "const"}},
+    "lhs": {"type": "var", "index": 12}}},
+  {"assert":
+   {"type": "mul",
+    "rhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs": {"type": "var", "index": 25},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"value": 1, "type": "const"}},
+    "lhs": {"type": "var", "index": 25}}},
+  {"assert":
+   {"type": "mul",
+    "rhs": {"type": "var", "index": 10},
+    "lhs":
+    {"type": "add",
+     "rhs":
+     {"type": "mul",
+      "rhs": {"type": "var", "index": 6},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"value": 1, "type": "const"}}}},
+  {"interact":
+   {"multiplicity":
+    {"type": "mul",
+     "rhs": {"type": "var", "index": 6},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "message": [{"type": "var", "index": 3}, {"type": "var", "index": 10}],
+    "channel": "MSB16"}},
+  {"interact":
+   {"multiplicity":
+    {"type": "mul",
+     "rhs":
+     {"type": "add",
+      "rhs":
+      {"type": "mul",
+       "rhs": {"type": "var", "index": 5},
+       "lhs": {"value": 18446744069414584320, "type": "const"}},
+      "lhs": {"type": "var", "index": 25}},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "message":
+    [{"value": 0, "type": "const"},
+     {"type": "var", "index": 4},
+     {"value": 15, "type": "const"},
+     {"type": "var", "index": 11}],
+    "channel": "BYTE_ALU"}},
+  {"interact":
+   {"multiplicity":
+    {"type": "mul",
+     "rhs": {"type": "var", "index": 5},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "message":
+    [{"value": 0, "type": "const"},
+     {"type": "add",
+      "rhs":
+      {"type": "mul",
+       "rhs": {"type": "var", "index": 4},
+       "lhs": {"value": 18446744069414584320, "type": "const"}},
+      "lhs":
+      {"type": "add",
+       "rhs":
+       {"type": "mul",
+        "rhs":
+        {"type": "mul", "rhs": {"type": "var", "index": 12}, "lhs": {"value": 16, "type": "const"}},
+        "lhs": {"value": 18446744069414584320, "type": "const"}},
+       "lhs": {"value": 256, "type": "const"}}},
+     {"value": 15, "type": "const"},
+     {"type": "var", "index": 11}],
+    "channel": "BYTE_ALU"}},
+  {"interact":
+   {"multiplicity":
+    {"type": "mul",
+     "rhs": {"type": "var", "index": 25},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "message": [{"type": "var", "index": 11}, {"type": "var", "index": 12}],
+    "channel": "ZERO"}},
+  {"interact":
+   {"multiplicity":
+    {"type": "mul",
+     "rhs":
+     {"type": "add",
+      "rhs":
+      {"type": "mul",
+       "rhs": {"type": "var", "index": 12},
+       "lhs": {"value": 18446744069414584320, "type": "const"}},
+      "lhs": {"value": 1, "type": "const"}},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "message":
+    [{"type": "var", "index": 0},
+     {"type": "var", "index": 11},
+     {"type": "var", "index": 13},
+     {"type": "var", "index": 18}],
+    "channel": "HWSL"}},
+  {"interact":
+   {"multiplicity":
+    {"type": "mul",
+     "rhs":
+     {"type": "add",
+      "rhs":
+      {"type": "mul",
+       "rhs": {"type": "var", "index": 12},
+       "lhs": {"value": 18446744069414584320, "type": "const"}},
+      "lhs": {"value": 1, "type": "const"}},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "message":
+    [{"type": "var", "index": 1},
+     {"type": "var", "index": 11},
+     {"type": "var", "index": 14},
+     {"type": "var", "index": 19}],
+    "channel": "HWSL"}},
+  {"interact":
+   {"multiplicity":
+    {"type": "mul",
+     "rhs":
+     {"type": "add",
+      "rhs":
+      {"type": "mul",
+       "rhs": {"type": "var", "index": 12},
+       "lhs": {"value": 18446744069414584320, "type": "const"}},
+      "lhs": {"value": 1, "type": "const"}},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "message":
+    [{"type": "var", "index": 2},
+     {"type": "var", "index": 11},
+     {"type": "var", "index": 15},
+     {"type": "var", "index": 20}],
+    "channel": "HWSL"}},
+  {"interact":
+   {"multiplicity":
+    {"type": "mul",
+     "rhs":
+     {"type": "add",
+      "rhs":
+      {"type": "mul",
+       "rhs": {"type": "var", "index": 12},
+       "lhs": {"value": 18446744069414584320, "type": "const"}},
+      "lhs": {"value": 1, "type": "const"}},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "message":
+    [{"type": "var", "index": 3},
+     {"type": "var", "index": 11},
+     {"type": "var", "index": 16},
+     {"type": "var", "index": 21}],
+    "channel": "HWSL"}},
+  {"interact":
+   {"multiplicity":
+    {"type": "mul",
+     "rhs":
+     {"type": "add",
+      "rhs":
+      {"type": "mul",
+       "rhs": {"type": "var", "index": 12},
+       "lhs": {"value": 18446744069414584320, "type": "const"}},
+      "lhs": {"value": 1, "type": "const"}},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "message":
+    [{"type": "mul", "rhs": {"type": "var", "index": 10}, "lhs": {"value": 65535, "type": "const"}},
+     {"type": "var", "index": 11},
+     {"type": "var", "index": 17},
+     {"type": "add",
+      "rhs":
+      {"type": "mul",
+       "rhs": {"type": "var", "index": 17},
+       "lhs": {"value": 18446744069414584320, "type": "const"}},
+      "lhs":
+      {"type": "mul",
+       "rhs": {"type": "var", "index": 10},
+       "lhs": {"value": 65535, "type": "const"}}}],
+    "channel": "HWSL"}},
+  {"interact":
+   {"multiplicity":
+    {"type": "mul",
+     "rhs": {"type": "var", "index": 25},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "message":
+    [{"value": 0, "type": "const"},
+     {"type": "var", "index": 4},
+     {"type": "add",
+      "rhs":
+      {"type": "mul",
+       "rhs":
+       {"type": "mul", "rhs": {"type": "var", "index": 7}, "lhs": {"value": 32, "type": "const"}},
+       "lhs": {"value": 18446744069414584320, "type": "const"}},
+      "lhs": {"value": 48, "type": "const"}},
+     {"type": "add",
+      "rhs":
+      {"type": "mul",
+       "rhs":
+       {"type": "mul", "rhs": {"type": "var", "index": 24}, "lhs": {"value": 16, "type": "const"}},
+       "lhs": {"value": 18446744069414584320, "type": "const"}},
+      "lhs":
+      {"type": "add",
+       "rhs":
+       {"type": "mul",
+        "rhs":
+        {"type": "mul", "rhs": {"type": "var", "index": 23}, "lhs": {"value": 32, "type": "const"}},
+        "lhs": {"value": 18446744069414584320, "type": "const"}},
+       "lhs":
+       {"type": "add",
+        "rhs":
+        {"type": "mul",
+         "rhs":
+         {"type": "mul",
+          "rhs": {"type": "var", "index": 22},
+          "lhs": {"value": 48, "type": "const"}},
+         "lhs": {"value": 18446744069414584320, "type": "const"}},
+        "lhs": {"value": 48, "type": "const"}}}}],
+    "channel": "BYTE_ALU"}},
+  {"interact":
+   {"multiplicity": {"type": "var", "index": 25},
+    "message":
+    [{"type": "add",
+      "rhs":
+      {"type": "mul", "rhs": {"type": "var", "index": 1}, "lhs": {"value": 65536, "type": "const"}},
+      "lhs": {"type": "var", "index": 0}},
+     {"type": "add",
+      "rhs":
+      {"type": "mul", "rhs": {"type": "var", "index": 3}, "lhs": {"value": 65536, "type": "const"}},
+      "lhs": {"type": "var", "index": 2}},
+     {"type": "add",
+      "rhs":
+      {"type": "mul",
+       "rhs": {"type": "var", "index": 27},
+       "lhs": {"value": 65536, "type": "const"}},
+      "lhs":
+      {"type": "add",
+       "rhs":
+       {"type": "mul", "rhs": {"type": "var", "index": 26}, "lhs": {"value": 256, "type": "const"}},
+       "lhs": {"type": "var", "index": 4}}},
+     {"type": "var", "index": 28},
+     {"type": "add",
+      "rhs":
+      {"type": "mul", "rhs": {"type": "var", "index": 5}, "lhs": {"value": 64, "type": "const"}},
+      "lhs":
+      {"type": "add",
+       "rhs":
+       {"type": "mul", "rhs": {"type": "var", "index": 6}, "lhs": {"value": 32, "type": "const"}},
+       "lhs":
+       {"type": "add", "rhs": {"type": "var", "index": 7}, "lhs": {"value": 5, "type": "const"}}}},
+     {"type": "var", "index": 8},
+     {"type": "var", "index": 9}],
+    "channel": "ALU"}},
+  {"interact":
+   {"multiplicity":
+    {"type": "mul",
+     "rhs": {"value": 1, "type": "const"},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "message": [{"type": "var", "index": 4}, {"type": "var", "index": 26}],
+    "channel": "ARE_BYTES"}},
+  {"interact":
+   {"multiplicity":
+    {"type": "mul",
+     "rhs": {"type": "var", "index": 25},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "message": [{"type": "var", "index": 27}],
+    "channel": "IS_HALF"}},
+  {"interact":
+   {"multiplicity":
+    {"type": "mul",
+     "rhs": {"type": "var", "index": 25},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "message": [{"type": "var", "index": 0}],
+    "channel": "IS_HALF"}},
+  {"interact":
+   {"multiplicity":
+    {"type": "mul",
+     "rhs": {"type": "var", "index": 25},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "message": [{"type": "var", "index": 1}],
+    "channel": "IS_HALF"}},
+  {"interact":
+   {"multiplicity":
+    {"type": "mul",
+     "rhs": {"type": "var", "index": 25},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "message": [{"type": "var", "index": 2}],
+    "channel": "IS_HALF"}},
+  {"interact":
+   {"multiplicity":
+    {"type": "mul",
+     "rhs": {"type": "var", "index": 25},
+     "lhs": {"value": 18446744069414584320, "type": "const"}},
+    "message": [{"type": "var", "index": 3}],
+    "channel": "IS_HALF"}}],
+ "name": "shift",
+ "columns": 29}
