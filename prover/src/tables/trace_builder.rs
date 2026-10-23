@@ -29,6 +29,7 @@ use std::collections::HashMap;
 #[cfg(feature = "disk-spill")]
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use executor::elf::Elf;
 use executor::vm::instruction::decoding::Instruction;
@@ -98,6 +99,7 @@ use compact_eq::CompactEq;
 pub(crate) use finish::{Emitted, RegenFamily, RegenJob, RestHeader, RestRegen};
 #[cfg(test)]
 pub(crate) use windowed::DECODE_TRACE_DELAY;
+pub(crate) use windowed::parallel;
 pub use windowed::{
     Accumulator, ChunkJob, RegenBuilder, SetupStamps, StreamTable, StreamedChunk, WalkedWindow,
     Walker, WindowStamps, WindowedTraceBuilder,
@@ -130,10 +132,18 @@ struct MemoryState {
     /// [`Self::page_or_insert`], which leaves the page it allocated here, so an
     /// index here is never one an allocation moved.
     hot: (u64, usize),
+    /// Set when a read finds an [`ABSENT`] timestamp. Only a window's state
+    /// holds such cells (the bytes its entries did not seed), so a run walked
+    /// whole never sets it.
+    missing: AtomicBool,
 }
 
 /// No page: page bases are multiples of the page size, so never odd.
 const NO_PAGE: (u64, usize) = (1, 0);
+
+/// The timestamp of a byte a window's state does not hold: a window walked
+/// from its entries reads one only if the entries miss a byte it touches.
+const ABSENT: u64 = u64::MAX;
 
 impl MemoryState {
     fn new() -> Self {
@@ -141,6 +151,7 @@ impl MemoryState {
             cells: PagedMem::new((0, 0)),
             lean: false,
             hot: NO_PAGE,
+            missing: AtomicBool::new(false),
         }
     }
 
@@ -158,6 +169,7 @@ impl MemoryState {
             cells,
             lean: false,
             hot: NO_PAGE,
+            missing: AtomicBool::new(false),
         }
     }
 
@@ -168,6 +180,7 @@ impl MemoryState {
             cells: image.map((0, 0), |value| (value, 0)),
             lean: false,
             hot: NO_PAGE,
+            missing: AtomicBool::new(false),
         }
     }
 
@@ -190,7 +203,22 @@ impl MemoryState {
 
     /// Read a byte from memory. Returns (value, timestamp) or (0, 0) if never written.
     fn read_byte(&self, address: u64) -> MemoryCell {
-        self.cells.get(address)
+        let cell = self.cells.get(address);
+        if cell.1 == ABSENT {
+            self.missing.store(true, Relaxed);
+        }
+        cell
+    }
+
+    /// Whether a read found a byte the state does not hold, since the last
+    /// call; clears the mark.
+    fn take_missing(&self) -> bool {
+        self.missing.swap(false, Relaxed)
+    }
+
+    /// Whether a read found a byte the state does not hold (the mark kept).
+    fn is_missing(&self) -> bool {
+        self.missing.load(Relaxed)
     }
 
     /// Write a byte to memory with the given timestamp.
@@ -241,13 +269,20 @@ impl MemoryState {
         let mut values = [0u32; 8];
         let mut timestamps = [0u64; 8];
         if let Some((base, off)) = self.one_page(base_address, count) {
-            // A page never allocated reads (0, 0) throughout, as `read_byte`.
+            // A page never allocated reads the fill throughout, as `read_byte`.
             if let Some(index) = self.page(base) {
                 for i in 0..count {
                     let (val, ts) = self.cells.page_get(index, off + i);
                     values[i] = val as u32;
                     timestamps[i] = ts;
                 }
+            } else {
+                let (val, ts) = self.cells.fill();
+                values[..count].fill(val as u32);
+                timestamps[..count].fill(ts);
+            }
+            if timestamps[..count].contains(&ABSENT) {
+                self.missing.store(true, Relaxed);
             }
             return (values, timestamps);
         }
@@ -277,6 +312,7 @@ impl MemoryState {
 }
 
 /// Register state tracker for generating MEMW register traces.
+#[derive(Clone)]
 struct RegisterState {
     /// Register file: (value, last_write_timestamp)
     regs: [RegisterCell; 32],
@@ -1171,9 +1207,10 @@ fn walk_cpu_ops<const REST: bool>(
         }
 
         // Collect ECSM ecall operations (memory I/O + the two table row sets)
-        if op.ecall_ecsm() {
-            let (ecsm_memw, ecsm_op, ecdas_rows) =
-                collect_ecsm_ops(op, memory_state, register_state);
+        if op.ecall_ecsm()
+            && let Some((ecsm_memw, ecsm_op, ecdas_rows)) =
+                collect_ecsm_ops(op, memory_state, register_state)
+        {
             memw.extend_ops(ecsm_memw);
             if REST {
                 ecsm_ops.push(ecsm_op);
@@ -1344,7 +1381,11 @@ fn collect_store_op_from_cpu(op: CpuOp<'_>, memory_state: &mut MemoryState) -> M
     memw_op
 }
 
-/// Collects all MEMW ops and the ECSM / ECDAS table ops for one ECSM ecall.
+/// Collects all MEMW ops and the ECSM / ECDAS table ops for one ECSM ecall;
+/// `None`, with nothing collected, when an operand byte is one the memory state
+/// does not hold (a window walked from entries that miss it: the window is
+/// refused, and its witness is not computed from operands that are not the
+/// run's).
 ///
 /// Timestamp scheme: `x11` register read and `xG` memory reads at `T`;
 /// `x12` register read and `k` memory reads at `T + 1`; `x10` register read and
@@ -1356,11 +1397,11 @@ fn collect_ecsm_ops(
     op: CpuOp<'_>,
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
-) -> (
+) -> Option<(
     Vec<MemwOperation>,
     ecsm::EcsmOperation,
     Vec<ecdas::EcdasOperation>,
-) {
+)> {
     let t = op.timestamp;
     let addr_xr = register_state.read(10).0;
     let addr_xg = register_state.read(11).0;
@@ -1372,6 +1413,9 @@ fn collect_ecsm_ops(
     for i in 0..32 {
         xg[i] = memory_state.read_byte(addr_xg.wrapping_add(i as u64)).0;
         k[i] = memory_state.read_byte(addr_k.wrapping_add(i as u64)).0;
+    }
+    if memory_state.is_missing() {
+        return None;
     }
 
     let mut witness = ::ecsm::compute_witness(&k, &xg)
@@ -1471,7 +1515,7 @@ fn collect_ecsm_ops(
         witness,
     };
 
-    (memw_ops, ecsm_op, ecdas_ops)
+    Some((memw_ops, ecsm_op, ecdas_ops))
 }
 
 /// Collects the memory operations for a `Hint` ecall.
@@ -7680,7 +7724,8 @@ mod ecsm_steps_tests {
                 super::CpuOp::new(&decode, &op),
                 &mut memory_state,
                 &mut register_state,
-            );
+            )
+            .expect("the operands are held");
             let fresh = ::ecsm::compute_witness(k, &gx).expect("a valid scalar and point");
             assert!(ecsm_op.witness.steps.is_empty(), "scalar {i}: steps kept");
             assert_eq!(ecdas_ops.len(), fresh.steps.len(), "scalar {i}");

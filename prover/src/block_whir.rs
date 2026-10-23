@@ -44,7 +44,7 @@ use crate::multilinear_prove::{
 use crate::statement::{self, MULTILINEAR_BLOCK_TAG};
 use crate::tables::gpack::{self, TraceForm};
 use crate::tables::trace_builder::{
-    ChunkJob, CutPadding, StreamTable, Traces, WindowStamps, WindowedTraceBuilder,
+    ChunkJob, CutPadding, StreamTable, Traces, WindowStamps, WindowedTraceBuilder, parallel,
 };
 use crate::test_utils::{E, F};
 use crate::zf_format::ZfFormat;
@@ -940,6 +940,31 @@ fn lt_concat() -> bool {
 /// order are the same.
 fn rest_slide() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_REST_SLIDE").is_ok_and(|v| v.trim() == "1")
+}
+
+/// `LAMBDA_VM_BLOCK_WALKERS`: unset, empty or `0` walks the run's windows on
+/// one thread (the default); `1` to `16` walks them on that many threads, each
+/// window from the bytes it touches as they stood before it
+/// ([`parallel::walk_windows`]). The tables and their order are the same.
+/// Anything else refuses the prove.
+fn block_walkers() -> Result<usize, Error> {
+    parse_walkers(std::env::var("LAMBDA_VM_BLOCK_WALKERS").ok().as_deref())
+}
+
+/// [`block_walkers`] of the knob's value.
+fn parse_walkers(value: Option<&str>) -> Result<usize, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(0),
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=16).contains(n))
+            .ok_or_else(|| {
+                Error::Prover(format!(
+                    "LAMBDA_VM_BLOCK_WALKERS={v}: 0 (one walker), or 1 to 16 walkers"
+                ))
+            }),
+    }
 }
 
 /// The rows the rest's layout transposes at once ([`BlockOptions::rest_layout_bytes`]):
@@ -3995,21 +4020,29 @@ fn prove_streamed(
     let waits = &waits;
     let tag = block_statement_tag(&format.zf.base);
     crate::with_block_hash!(format.zf.base, |H| {
+        let walkers = block_walkers()?;
         let (block, built, laid, executed) = std::thread::scope(|scope| {
             use std::sync::atomic::Ordering::Relaxed;
-            // The executor, a window at a time, two windows ahead of the walk.
-            let (ltx, lrx) = std::sync::mpsc::sync_channel::<Vec<executor::vm::logs::Log>>(2);
+            // The executor, a window at a time, two windows ahead of the walk;
+            // with walkers, each window with the memory at its start.
+            let (ltx, lrx) = std::sync::mpsc::sync_channel::<(
+                Vec<executor::vm::logs::Log>,
+                Option<executor::vm::memory::MemorySnapshot>,
+            )>(2);
             let executor = scope.spawn(move || -> Result<f64, Error> {
                 if let Some(ledger) = ledger {
                     ledger.thread("executor");
                 }
                 let mut executor = Executor::new(program, private_inputs.to_vec())
                     .map_err(|e| Error::Execution(format!("{e}")))?;
+                let mut at_start = (walkers > 0).then(|| executor.memory().snapshot());
                 while let Some(logs) = executor
                     .resume_with_limit(window)
                     .map_err(|e| Error::Execution(format!("{e}")))?
                 {
                     let logs = logs.to_vec();
+                    let next = (walkers > 0).then(|| executor.memory().snapshot());
+                    let start = std::mem::replace(&mut at_start, next);
                     if let Some(ledger) = ledger {
                         // The executor keeps a window of logs of its own.
                         let bytes = memlog::logs_bytes(&logs);
@@ -4019,7 +4052,7 @@ fn prove_streamed(
                             .store(executor.memory().heap_bytes() + bytes, Relaxed);
                     }
                     let t = Instant::now();
-                    if ltx.send(logs).is_err() {
+                    if ltx.send((logs, start)).is_err() {
                         break;
                     }
                     ProducerWaits::add(&waits.executor_send, t);
@@ -4090,7 +4123,45 @@ fn prove_streamed(
                 // The walk on its own thread, doing nothing but walk; this
                 // thread appends each walked window, routes it and hands its
                 // chunks out as jobs (the layout thread generates them).
-                let last = {
+                let last = if walkers > 0 {
+                    // The windows walked from their entries on `walkers`
+                    // threads, absorbed here in order as below.
+                    let report =
+                        parallel::walk_windows(&mut builder, lrx, walkers, |accumulator, walked| {
+                            if let Some(ledger) = ledger {
+                                ledger.walked.fetch_sub(walked.heap_bytes(), Relaxed);
+                                ledger.logs.fetch_sub(
+                                    walked.cycles() * size_of::<executor::vm::logs::Log>(),
+                                    Relaxed,
+                                );
+                            }
+                            let jobs = match recorder {
+                                Some(recorder) => {
+                                    let (jobs, added) = accumulator.absorb_counted(walked);
+                                    recorder.window(added, &jobs);
+                                    jobs
+                                }
+                                None => accumulator.absorb(walked),
+                            };
+                            for job in jobs {
+                                streamed += 1;
+                                if let Some(ledger) = ledger {
+                                    ledger.jobs.fetch_add(job.op_bytes(), Relaxed);
+                                }
+                                let t = Instant::now();
+                                if btx.send(Built::Job(Box::new(job))).is_err() {
+                                    return Err(Error::Prover("the layout thread stopped".into()));
+                                }
+                                ProducerWaits::add(&waits.accumulator_send, t);
+                            }
+                            if let Some(ledger) = ledger {
+                                ledger.builder.store(accumulator.held_bytes(), Relaxed);
+                            }
+                            Ok(())
+                        })?;
+                    eprintln!("{}", report.line());
+                    report.last
+                } else {
                     let (mut walker, mut accumulator) = builder.split();
                     std::thread::scope(|inner| -> Result<Vec<executor::vm::logs::Log>, Error> {
                         let (wtx, wrx) = std::sync::mpsc::sync_channel(2);
@@ -4104,7 +4175,7 @@ fn prove_streamed(
                             let mut held: Option<Vec<executor::vm::logs::Log>> = None;
                             loop {
                                 let t = Instant::now();
-                                let Ok(logs) = lrx.recv() else {
+                                let Ok((logs, _)) = lrx.recv() else {
                                     break;
                                 };
                                 ProducerWaits::add(&waits.walker_recv, t);
@@ -6526,5 +6597,29 @@ mod packer_tests {
         assert!(counted > 0);
         assert_eq!(counted, cells[1..].iter().sum::<u64>());
         assert_eq!(group_queue::arming_cells(Some(rule), &stats, 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod walkers_knob_tests {
+    use super::parse_walkers;
+
+    /// `LAMBDA_VM_BLOCK_WALKERS`: unset, empty or 0 is one walker (the
+    /// default path); 1 to 16 that many; any other word refuses the prove.
+    #[test]
+    fn the_walkers_knob_takes_0_to_16_and_refuses_anything_else() {
+        for (value, walkers) in [
+            (None, 0),
+            (Some(""), 0),
+            (Some("0"), 0),
+            (Some(" 4 "), 4),
+            (Some("1"), 1),
+            (Some("16"), 16),
+        ] {
+            assert_eq!(parse_walkers(value).ok(), Some(walkers), "{value:?}");
+        }
+        for value in ["17", "-1", "auto", "4x", "1.5"] {
+            assert!(parse_walkers(Some(value)).is_err(), "{value}");
+        }
     }
 }

@@ -61,6 +61,18 @@ impl<T: Copy> PagedMem<T> {
         (addr & !mask, (addr & mask) as usize)
     }
 
+    /// What a cell never `set` reads.
+    #[inline]
+    pub fn fill(&self) -> T {
+        self.fill
+    }
+
+    /// Keeps only the pages whose base `keep` accepts; the rest are dropped,
+    /// their cells reading `fill` again. Moves page indices.
+    pub fn retain_pages(&mut self, mut keep: impl FnMut(u64) -> bool) {
+        self.pages.retain(|(base, _)| keep(*base));
+    }
+
     /// Value at `addr`, or `fill` if never `set`.
     #[inline]
     pub fn get(&self, addr: u64) -> T {

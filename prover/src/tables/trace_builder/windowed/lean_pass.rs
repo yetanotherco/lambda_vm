@@ -24,9 +24,11 @@ use std::sync::Arc;
 
 use executor::vm::instruction::execution::{BLAKE3_ABSORB_CV_OUT_DWORD, BLAKE3_BLOCK_BYTES};
 use executor::vm::logs::Log;
+use executor::vm::memory::MemorySnapshot;
 
-use super::super::{RegisterState, clock};
+use super::super::{MemoryState, RegisterState, clock};
 use crate::Error;
+use crate::paged_mem::PagedMem;
 use crate::tables::cpu::{CpuOp, CpuOperation};
 use crate::tables::decode::DecodeTable;
 
@@ -155,7 +157,23 @@ impl Cells {
         *slot as usize
     }
 
+    /// Every page touched, with its page number.
+    fn iter_pages(&self) -> impl Iterator<Item = (u64, &[u64; PAGE])> + '_ {
+        let low = self.low.iter().enumerate().map(|(n, &i)| (n as u64, i));
+        let high = self
+            .high
+            .iter()
+            .enumerate()
+            .map(|(n, &i)| (LAST_PAGE - n as u64, i));
+        let other = self.other.iter().map(|(&n, &i)| (n, i));
+        low.chain(high)
+            .chain(other)
+            .filter(|&(_, i)| i != NO_PAGE)
+            .map(|(n, i)| (n, &*self.pages[i as usize]))
+    }
+
     /// The cell of `address`, [`FILL`] for a page never touched.
+    #[cfg(test)]
     fn get(&self, address: u64) -> u64 {
         let number = address >> PAGE_BITS;
         let slot = if number < DIRECTORY_PAGES {
@@ -524,8 +542,50 @@ impl LeanPass {
 
     /// The window's entries: each byte's address and its timestamp before the
     /// window, in the order the window first accessed them.
+    #[cfg(test)]
     pub(crate) fn entries(&self) -> &[(u64, u64)] {
         &self.bytes.entries
+    }
+
+    /// The window's entries, moved out (the pass's list starts empty).
+    pub(crate) fn take_entries(&mut self) -> Vec<(u64, u64)> {
+        std::mem::take(&mut self.bytes.entries)
+    }
+
+    /// The memory state the walk holds now, built from the pass's timestamps,
+    /// the executor's memory now (`now`) and the run's initial image: the
+    /// image's pages and cells (each byte's value, timestamp 0), then every
+    /// byte the pass stamped with its value now and its timestamp. The walk
+    /// sets a cell only by writing it (a load writes the bytes it read), so
+    /// these are its pages, its set cells and its values; a cell it never set
+    /// holds `(0, 0)` as the walk's do.
+    pub(crate) fn walked_state(
+        &self,
+        now: &MemorySnapshot,
+        image: &PagedMem<u8>,
+        lean: bool,
+    ) -> MemoryState {
+        let mut memory = MemoryState::from_pages(image);
+        memory.lean = lean;
+        let mut values = vec![0u8; PAGE];
+        for (number, page) in self.bytes.cells.iter_pages() {
+            if !page.iter().any(|&c| c >> WINDOW_BITS > 0) {
+                continue;
+            }
+            let base = number << PAGE_BITS;
+            now.read(base, &mut values);
+            // A 64 KiB page of the pass sits in one page of the state.
+            let (state_page, _) = PagedMem::<(u8, u64)>::page_of(base);
+            let index = memory.cells.page_index_or_insert(state_page);
+            let at = (base - state_page) as usize;
+            for (off, &c) in page.iter().enumerate() {
+                let ts = c >> WINDOW_BITS;
+                if ts > 0 {
+                    memory.cells.page_set(index, at + off, (values[off], ts));
+                }
+            }
+        }
+        memory
     }
 
     /// The register cells now, as the walk's.
@@ -535,12 +595,14 @@ impl LeanPass {
 
     /// The last-access timestamp of the byte at `address` (0 if never
     /// stamped).
+    #[cfg(test)]
     pub(crate) fn timestamp(&self, address: u64) -> u64 {
         self.bytes.cells.get(address) >> WINDOW_BITS
     }
 
     /// Whether rows are found through a dense pc index (else by the decode
     /// table's search).
+    #[cfg(test)]
     pub(crate) fn dense_rows(&self) -> bool {
         matches!(self.decode.rows, Rows::Dense { .. })
     }

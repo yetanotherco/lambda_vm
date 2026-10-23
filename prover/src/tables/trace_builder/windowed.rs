@@ -902,6 +902,49 @@ impl<'a> WindowedTraceBuilder<'a> {
         })
     }
 
+    /// Hands the builder the state a run walked from its entries holds at its
+    /// last window's start (`memory`, `registers`, that window's first cycle
+    /// `cycles`) and the walk's stamps, so [`Self::finish`] walks the last
+    /// window as though this builder had walked every window before it.
+    fn install_walked(
+        &mut self,
+        mut memory: MemoryState,
+        registers: RegisterState,
+        cycles: usize,
+        windows: usize,
+        walk_secs: f64,
+    ) {
+        memory.lean = self.lean.memory;
+        self.memory_state = memory;
+        self.register_state = registers;
+        self.cycles = cycles;
+        self.stamps.windows += windows;
+        self.stamps.walk += walk_secs;
+    }
+
+    /// The accumulating half alone, with the run's initial image: what a run
+    /// walked from its entries ([`parallel::walk_windows`]) absorbs its windows
+    /// with and builds the finish's state from.
+    fn accumulator_and_image(&mut self) -> (Accumulator<'_>, &PagedMem<u8>) {
+        (
+            Accumulator {
+                lean: self.lean,
+                stream_memw_lt: self.stream_memw_lt,
+                max_rows: &self.max_rows,
+                decode: &self.decode,
+                kept: self.kept.as_mut(),
+                windows: &mut self.windows,
+                segments: &mut self.segments,
+                emitted: &mut self.emitted,
+                counted: &mut self.counted,
+                route_secs: &mut self.stamps.route,
+                handout_secs: &mut self.stamps.generate,
+                handout: &mut self.stamps.handout,
+            },
+            &self.image,
+        )
+    }
+
     /// The builder in its two halves, to run on two threads: the [`Walker`]
     /// walks each window (the state it carries is the walk's), the
     /// [`Accumulator`] keeps each walked window, routes it and hands out the
@@ -950,6 +993,11 @@ impl WalkedWindow {
     pub fn heap_bytes(&self) -> usize {
         super::vec_heap_bytes(&self.cpu_ops) + self.walk.heap_bytes()
     }
+
+    /// Its cycles.
+    pub fn cycles(&self) -> usize {
+        self.cpu_ops.len()
+    }
 }
 
 /// The walk half of a split builder ([`WindowedTraceBuilder::split`]).
@@ -972,48 +1020,75 @@ pub struct Walker<'b> {
 impl Walker<'_> {
     /// Walks the next window (not the run's last) into fresh lists.
     pub fn walk(&mut self, logs: &[Log]) -> Result<WalkedWindow, Error> {
-        // As a whole-run build: only the last cycle may halt.
-        if logs.iter().any(|log| log.next_pc == 0) {
-            return Err(Error::HaltInNonFinalEpoch);
-        }
         let t = std::time::Instant::now();
-        let mut cpu_ops = Vec::with_capacity(logs.len());
-        // Without `lookups`, the accumulator counts them (`absorb`).
-        let mut walk = if walk_sized() {
-            WalkOutputs::for_walk_sized(logs.len(), self.lookups, self.sizes)
-        } else {
-            WalkOutputs::for_walk(logs.len(), self.lookups)
-        };
-        // The walk is a left fold over the CPU ops: walking each batch right
-        // after collecting it gives the window's lists, with the batch's ops
-        // still in cache instead of read back from the whole window's list.
-        let batch = match self.batch {
-            0 => logs.len().max(1),
-            n => n,
-        };
-        for part in logs.chunks(batch) {
-            let from = cpu_ops.len();
-            super::collect_cpu_ops_into(part, self.decode, *self.cycles + from, &mut cpu_ops)?;
-            collect_ops_from_cpu_into(
-                &cpu_ops[from..],
-                self.decode,
-                self.memory_state,
-                self.register_state,
-                &mut walk,
-                self.lookups,
-            );
-        }
+        let walked = walk_window(
+            self.decode,
+            self.lookups,
+            self.batch,
+            self.sizes,
+            self.memory_state,
+            self.register_state,
+            *self.cycles,
+            logs,
+        )?;
         *self.cycles += logs.len();
-        *self.sizes = WalkSizes::of(&walk, logs.len());
         *self.walk_secs += t.elapsed().as_secs_f64();
         *self.windows += 1;
-        Ok(WalkedWindow { cpu_ops, walk })
+        Ok(walked)
     }
 
     /// The bytes the walk's carried memory state takes on the heap.
     pub fn state_bytes(&self) -> usize {
         self.memory_state.heap_bytes()
     }
+}
+
+/// One window (not the run's last) walked from `memory` and `registers` into
+/// fresh lists, its cycles numbered from `first`: [`Walker::walk`]'s body, and
+/// what a window walked from its entries runs.
+#[allow(clippy::too_many_arguments)]
+fn walk_window(
+    decode: &DecodeTable,
+    lookups: bool,
+    batch: usize,
+    sizes: &mut WalkSizes,
+    memory: &mut MemoryState,
+    registers: &mut RegisterState,
+    first: usize,
+    logs: &[Log],
+) -> Result<WalkedWindow, Error> {
+    // As a whole-run build: only the last cycle may halt.
+    if logs.iter().any(|log| log.next_pc == 0) {
+        return Err(Error::HaltInNonFinalEpoch);
+    }
+    let mut cpu_ops = Vec::with_capacity(logs.len());
+    // Without `lookups`, the accumulator counts them (`absorb`).
+    let mut walk = if walk_sized() {
+        WalkOutputs::for_walk_sized(logs.len(), lookups, sizes)
+    } else {
+        WalkOutputs::for_walk(logs.len(), lookups)
+    };
+    // The walk is a left fold over the CPU ops: walking each batch right
+    // after collecting it gives the window's lists, with the batch's ops
+    // still in cache instead of read back from the whole window's list.
+    let batch = match batch {
+        0 => logs.len().max(1),
+        n => n,
+    };
+    for part in logs.chunks(batch) {
+        let from = cpu_ops.len();
+        super::collect_cpu_ops_into(part, decode, first + from, &mut cpu_ops)?;
+        collect_ops_from_cpu_into(
+            &cpu_ops[from..],
+            decode,
+            memory,
+            registers,
+            &mut walk,
+            lookups,
+        );
+    }
+    *sizes = WalkSizes::of(&walk, logs.len());
+    Ok(WalkedWindow { cpu_ops, walk })
 }
 
 /// The accumulating half of a split builder ([`WindowedTraceBuilder::split`]).
@@ -2575,10 +2650,11 @@ impl Traces {
 #[cfg(test)]
 mod head_tests;
 
-// The serial stage of a run walked a window per thread. Only its tests use it
-// until the parallel walk does.
-#[cfg_attr(not(test), allow(dead_code))]
+// The serial stage of a run walked a window per thread.
 mod lean_pass;
+
+// A run's windows walked from their entries, on several threads.
+pub(crate) mod parallel;
 
 #[cfg(test)]
 mod regen_tests;

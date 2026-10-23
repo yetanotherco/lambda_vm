@@ -16,7 +16,7 @@ use crate::test_utils::asm_elf_bytes;
 
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
 
-fn run(name: &str) -> (Elf, Vec<Log>) {
+pub(crate) fn run(name: &str) -> (Elf, Vec<Log>) {
     let program = Elf::load(&asm_elf_bytes(name)).expect("the ELF loads");
     let logs = Executor::new(&program, Vec::new())
         .expect("the executor starts")
@@ -26,7 +26,7 @@ fn run(name: &str) -> (Elf, Vec<Log>) {
     (program, logs)
 }
 
-fn whole(program: &Elf, logs: &[Log], max_rows: &MaxRowsConfig) -> Traces {
+pub(crate) fn whole(program: &Elf, logs: &[Log], max_rows: &MaxRowsConfig) -> Traces {
     Traces::from_elf_and_logs(
         program,
         logs,
@@ -145,7 +145,7 @@ fn same_list(what: &str, a: &[Table], b: &[Table]) {
     }
 }
 
-fn same_traces(a: &Traces, b: &Traces) {
+pub(crate) fn same_traces(a: &Traces, b: &Traces) {
     same_list("CPU", &a.cpus, &b.cpus);
     same_list("MEMW_R", &a.memw_registers, &b.memw_registers);
     same_list("MEMW_A", &a.memw_aligneds, &b.memw_aligneds);
