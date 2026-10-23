@@ -371,11 +371,11 @@ enum Commands {
         #[arg(long)]
         digest: bool,
 
-        /// How each group's stacked polynomials are opened: one chain per
-        /// polynomial (`per-poly`, production) or one per run of up to four
-        /// (`indexed`). A format choice: `verify-block` must be given the
+        /// How each group's stacked polynomials are opened: one chain per run
+        /// of up to four (`indexed`, production) or one per polynomial
+        /// (`per-poly`). A format choice: `verify-block` must be given the
         /// same one; the proof file does not carry it.
-        #[arg(long, value_parser = ["per-poly", "indexed"], default_value = "per-poly")]
+        #[arg(long, value_parser = ["per-poly", "indexed"], default_value = "indexed")]
         group: String,
 
         /// The WHIR base code's blowup: 4 (production) or 2, its query count
@@ -384,11 +384,11 @@ enum Commands {
         #[arg(long, value_parser = ["4", "2"], default_value = "4")]
         blowup: String,
 
-        /// Where the WHIR round-0 trees put their leaves: in the codeword's
-        /// order (`natural`, production) or each query's coset together
-        /// (`coset`). A format choice: `verify-block` must be given the same
+        /// Where the WHIR round-0 trees put their leaves: each query's coset
+        /// together (`coset`, production) or in the codeword's order
+        /// (`natural`). A format choice: `verify-block` must be given the same
         /// one; the proof file does not carry it.
-        #[arg(long, value_parser = ["natural", "coset"], default_value = "natural")]
+        #[arg(long, value_parser = ["natural", "coset"], default_value = "coset")]
         leaves: String,
     },
 
@@ -408,7 +408,7 @@ enum Commands {
 
         /// The group opening the block was proved with (`prove-block
         /// --group`): the verifier's constant, never read from the proof.
-        #[arg(long, value_parser = ["per-poly", "indexed"], default_value = "per-poly")]
+        #[arg(long, value_parser = ["per-poly", "indexed"], default_value = "indexed")]
         group: String,
 
         /// The WHIR blowup the block was proved with (`prove-block
@@ -418,7 +418,7 @@ enum Commands {
 
         /// The round-0 leaf order the block was proved with (`prove-block
         /// --leaves`): the verifier's constant, never read from the proof.
-        #[arg(long, value_parser = ["natural", "coset"], default_value = "natural")]
+        #[arg(long, value_parser = ["natural", "coset"], default_value = "coset")]
         leaves: String,
     },
 
@@ -1885,7 +1885,7 @@ mod tests {
         );
     }
 
-    /// Both block commands take the group opening, per polynomial unless
+    /// Both block commands take the group opening, one chain per run unless
     /// told otherwise, and nothing but its two words.
     #[test]
     fn the_block_commands_take_the_group_opening() {
@@ -1899,7 +1899,7 @@ mod tests {
                 }
                 _ => None,
             };
-            assert_eq!(group(cmd).as_deref(), Some("per-poly"), "the default");
+            assert_eq!(group(cmd).as_deref(), Some("indexed"), "the default");
             for word in ["per-poly", "indexed"] {
                 let args = [cmd, &["--group", word]].concat();
                 assert_eq!(group(&args).as_deref(), Some(word));
@@ -1952,7 +1952,7 @@ mod tests {
         );
     }
 
-    /// Both block commands take the round-0 leaf order, natural unless told
+    /// Both block commands take the round-0 leaf order, the coset order unless told
     /// otherwise, and nothing but its two words; each word reads to the order
     /// it names.
     #[test]
@@ -1968,7 +1968,7 @@ mod tests {
                 }
                 _ => None,
             };
-            assert_eq!(leaves(cmd).as_deref(), Some("natural"), "the default");
+            assert_eq!(leaves(cmd).as_deref(), Some("coset"), "the default");
             for (word, want) in [("natural", LeafOrder::Natural), ("coset", LeafOrder::Coset)] {
                 let args = [cmd, &["--leaves", word]].concat();
                 assert_eq!(leaves(&args).as_deref(), Some(word));

@@ -2,9 +2,9 @@
 //! `--blowup 2` prints `whir_blowup=2` on the one banner line (and Q 229 on the
 //! schedule line), the default and `--blowup 4` name no blowup (Q 114), and the
 //! format's environment knob for the blowup is refused before any banner. So
-//! for the round-0 leaf order: `--leaves coset` prints `whir_leaves=coset`
-//! (after the blowup when both are set), the default and `--leaves natural`
-//! name no order, and its environment knob is refused before any banner. The
+//! for the round-0 leaf order: `--leaves natural` prints `whir_leaves=natural`
+//! (after the blowup when both are set), the default and `--leaves coset` name
+//! no order, and its environment knob is refused before any banner. The
 //! banner is printed before the files are read, so a missing file is enough.
 
 use std::process::Command;
@@ -93,11 +93,11 @@ fn the_block_commands_banner_states_the_leaf_order_they_run_under() {
     for (name, base) in &commands {
         for (flags, tail) in [
             (&[][..], None),
-            (&["--leaves", "natural"][..], None),
-            (&["--leaves", "coset"][..], Some(" whir_leaves=coset")),
+            (&["--leaves", "coset"][..], None),
+            (&["--leaves", "natural"][..], Some(" whir_leaves=natural")),
             (
-                &["--leaves", "coset", "--blowup", "2"][..],
-                Some(" whir_blowup=2 whir_leaves=coset"),
+                &["--leaves", "natural", "--blowup", "2"][..],
+                Some(" whir_blowup=2 whir_leaves=natural"),
             ),
         ] {
             let mut args = base.clone();

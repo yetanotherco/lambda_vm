@@ -243,14 +243,14 @@ fn count_knob(name: &str) -> Result<Option<usize>, String> {
     }
 }
 
-/// `LAMBDA_VM_WHIR_GROUP`'s reading: unset or `per-poly` is one chain per stacked
-/// polynomial ([`GroupFold::PerPoly`], production); `indexed` one chain per
-/// run of up to four ([`GroupFold::Indexed`]); anything else an error. A
-/// format choice: the block's verifier must be given the same one.
+/// `LAMBDA_VM_WHIR_GROUP`'s reading: unset or `indexed` is one chain per run
+/// of up to four stacked polynomials ([`GroupFold::Indexed`], production);
+/// `per-poly` one chain per polynomial ([`GroupFold::PerPoly`]); anything else
+/// an error. A format choice: the block's verifier must be given the same one.
 pub fn group_setting(value: Option<&str>) -> Result<GroupFold, String> {
     match value.map(str::trim) {
-        None | Some("per-poly") => Ok(GroupFold::PerPoly),
-        Some("indexed") => Ok(GroupFold::Indexed),
+        None | Some("indexed") => Ok(GroupFold::Indexed),
+        Some("per-poly") => Ok(GroupFold::PerPoly),
         Some(other) => Err(format!("LAMBDA_VM_WHIR_GROUP={other}: per-poly or indexed")),
     }
 }
@@ -267,15 +267,15 @@ pub fn blowup_setting(value: Option<&str>) -> Result<WhirBlowup, String> {
     }
 }
 
-/// The CLI's `--leaves` reading: unset or `natural` is the production round-0
-/// leaf order ([`LeafOrder::Natural`]), `coset` the coset order
-/// ([`LeafOrder::Coset`], Poseidon1 trees only); anything else an error. A
+/// The CLI's `--leaves` reading: unset or `coset` is the production round-0
+/// leaf order ([`LeafOrder::Coset`], Poseidon1 trees only), `natural` the
+/// codeword's own order ([`LeafOrder::Natural`]); anything else an error. A
 /// format choice: the block's verifier must be given the same one, and the
 /// proof file does not carry it.
 pub fn leaves_setting(value: Option<&str>) -> Result<LeafOrder, String> {
     match value.map(str::trim) {
-        None | Some("natural") => Ok(LeafOrder::Natural),
-        Some("coset") => Ok(LeafOrder::Coset),
+        None | Some("coset") => Ok(LeafOrder::Coset),
+        Some("natural") => Ok(LeafOrder::Natural),
         Some(word) => Err(format!("--leaves {word}: natural or coset")),
     }
 }
@@ -2440,7 +2440,7 @@ pub fn verify_whir_block_tree_proof(
     elf_bytes: &[u8],
     proof: &WhirBlockTreeProof,
 ) -> Result<(), String> {
-    verify_whir_block_tree_proof_grouped(elf_bytes, proof, GroupFold::PerPoly)
+    verify_whir_block_tree_proof_grouped(elf_bytes, proof, BlockFormat::production().group)
 }
 
 /// [`verify_whir_block_tree_proof`] for a block whose groups were opened per
@@ -2582,20 +2582,20 @@ mod tests {
         );
     }
 
-    /// `LAMBDA_VM_WHIR_GROUP` reads two words, unset is production's per
-    /// polynomial, and anything else is refused rather than defaulted.
+    /// `LAMBDA_VM_WHIR_GROUP` reads two words, unset is production's one chain
+    /// per run, and anything else is refused rather than defaulted.
     #[test]
     fn the_group_opening_reads_two_words() {
-        assert_eq!(group_setting(None), Ok(GroupFold::PerPoly));
-        assert_eq!(BlockFormat::production().group, GroupFold::PerPoly);
+        assert_eq!(group_setting(None), Ok(GroupFold::Indexed));
+        assert_eq!(BlockFormat::production().group, GroupFold::Indexed);
         assert_eq!(group_setting(Some("per-poly")), Ok(GroupFold::PerPoly));
         assert_eq!(group_setting(Some(" indexed ")), Ok(GroupFold::Indexed));
         for word in ["index", "Indexed", "1", ""] {
             assert!(group_setting(Some(word)).is_err(), "`{word}` is refused");
         }
         assert_eq!(
-            BlockFormat::production_with(GroupFold::Indexed).group,
-            GroupFold::Indexed
+            BlockFormat::production_with(GroupFold::PerPoly).group,
+            GroupFold::PerPoly
         );
     }
 

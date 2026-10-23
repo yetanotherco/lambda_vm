@@ -15,12 +15,12 @@
 //!
 //! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration:
 //! `cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27 whir_grind=query
-//! whir_grind_bits=18`. Each lever was measured net positive on block runs before it became the
-//! default. Every knob keeps its OFF spelling (`cap=off`, `whir_cap=off`,
-//! `fri=pair`, `one_row=0`, `whir_folds=uniform4`, `whir_stack=25`, `whir_grind=all`,
-//! `whir_grind_bits=20`, `whir_blowup=4`, `whir_leaves=natural` — the WHIR blowup's and the leaf
-//! order's defaults are their offs), so setting all ten to off reproduces [`ZfFormat::LEGACY`] — the
-//! format before any lever, byte for byte — for rollback and for A/B arms. The crypto crates' own defaults
+//! whir_grind_bits=18`, the block's round-0 trees in the coset order. Each lever was measured net
+//! positive on block runs before it became the default. Every knob keeps its OFF spelling
+//! (`cap=off`, `whir_cap=off`, `fri=pair`, `one_row=0`, `whir_folds=uniform4`, `whir_stack=25`,
+//! `whir_grind=all`, `whir_grind_bits=20`, `whir_blowup=4` — the WHIR blowup's default is its off —
+//! `whir_leaves=natural`), so setting all ten to off reproduces [`ZfFormat::LEGACY`] — the format
+//! before any lever, byte for byte — for rollback and for A/B arms. The crypto crates' own defaults
 //! (`stark::proof::options::ProofFormat::DEFAULT`,
 //! `multilinear::whir_chain::ChainFormat::DEFAULT`) stay the legacy format: a
 //! library value built without a format is the legacy one, and the production
@@ -54,7 +54,7 @@
 //! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27 whir_grind=query
 //! whir_grind_bits=18`. Its absence in a log is then a fact about the run, not an ambiguity. The WHIR blowup
 //! and the leaf order are the two words printed only off their defaults (` whir_blowup=2`,
-//! ` whir_leaves=coset`), so a default run's banner is the banner every earlier run printed.
+//! ` whir_leaves=natural`).
 
 use std::sync::OnceLock;
 
@@ -78,10 +78,10 @@ pub const ENV_WHIR_STACK: &str = "LAMBDA_VM_ZF_WHIR_STACK";
 pub const ENV_WHIR_GRIND: &str = "LAMBDA_VM_ZF_WHIR_GRIND";
 pub const ENV_WHIR_GRIND_BITS: &str = "LAMBDA_VM_ZF_WHIR_GRIND_BITS";
 pub const ENV_WHIR_BLOWUP: &str = "LAMBDA_VM_ZF_WHIR_BLOWUP";
-/// Where the WHIR round-0 trees put their leaves: `natural` (the default) or
-/// `coset` (block `j` at `bitrev(j)`, so a prover evaluates its openings from
-/// the polynomial instead of re-encoding it). A proof format: the roots, the
-/// paths and the in-guest walks follow it. Poseidon1 trees only.
+/// Where the block's WHIR round-0 trees put their leaves: `coset` (the
+/// default: block `j` at `bitrev(j)`, so a prover evaluates its openings from
+/// the polynomial instead of re-encoding it) or `natural`. A proof format: the
+/// roots, the paths and the in-guest walks follow it. Poseidon1 trees only.
 pub const ENV_WHIR_LEAVES: &str = "LAMBDA_VM_ZF_WHIR_LEAVES";
 
 /// The uniform WHIR schedule's fold, as production configures it
@@ -311,7 +311,11 @@ impl ZfFormat {
     /// s, FAST 320). `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20` is its rollback.
     /// `whir_blowup` stays 4, the legacy rate: blowup 2
     /// (`LAMBDA_VM_ZF_WHIR_BLOWUP=2`, [`WHIR_BLOWUPS`]) is opt-in and has not
-    /// been measured as a default.
+    /// been measured as a default. `whir_leaves` is the coset order: the block's
+    /// round-0 trees put each query's coset together, so a revived group's
+    /// openings are evaluated from its stack instead of re-encoding it
+    /// (`LAMBDA_VM_ZF_WHIR_LEAVES=natural` is its rollback). It moves the block's
+    /// roots, paths and in-guest walks, not a bit count.
     pub const DEFAULT: Self = Self {
         cap: CapPolicy::Auto,
         whir_cap: CapPolicy::Auto,
@@ -323,7 +327,7 @@ impl ZfFormat {
         whir_grind_bits: PRODUCTION_WHIR_GRIND_BITS,
         whir_blowup: 1 << PRODUCTION_WHIR_LOG_BLOWUP,
         base: crate::hash_pin::BLOCK_BASE,
-        whir_leaves: LeafOrder::Natural,
+        whir_leaves: LeafOrder::Coset,
     };
 
     /// The legacy format: every lever off. What all ten knobs at their
@@ -585,9 +589,9 @@ impl ZfFormat {
         } else {
             format!(" base={:?}/c{}", self.base.hash, self.base.arity4_cap)
         } + match self.whir_leaves {
-            // Printed only when set, so the default banner is today's.
-            LeafOrder::Natural => "",
-            LeafOrder::Coset => " whir_leaves=coset",
+            // Printed only off the default (the coset order).
+            LeafOrder::Coset => "",
+            LeafOrder::Natural => " whir_leaves=natural",
         }
     }
 
@@ -640,7 +644,11 @@ impl ZfFormat {
             // The block's own constant (`BlockFormat::group`), set where the
             // block builds its config: every other path opens per polynomial.
             group: multilinear::whir_chain::GroupFold::PerPoly,
-            leaves: self.whir_leaves,
+            // The block's too (`BlockFormat::chain_config` stamps
+            // `whir_leaves`): the coset order is Poseidon1's alone, and the
+            // other chains this config serves (the W-LFM proofs over RPX, the
+            // epochs) keep the natural order.
+            leaves: LeafOrder::Natural,
         }
     }
 
@@ -802,7 +810,7 @@ mod tests {
                 whir_grind_bits: 18,
                 whir_blowup: 4,
                 base: crate::hash_pin::BLOCK_BASE,
-                whir_leaves: LeafOrder::Natural,
+                whir_leaves: LeafOrder::Coset,
             }
         );
         assert_eq!(
@@ -814,29 +822,38 @@ mod tests {
         assert!(f.unimplemented_levers().is_empty());
     }
 
-    /// The round-0 leaf order: natural unless set, `coset` in any case and
-    /// spacing, nothing else accepted. Coset moves the chain format, its fold
-    /// word and the banner (which prints the knob only when set); and it is
-    /// refused by name under a base whose trees are not Poseidon1.
+    /// The block's round-0 leaf order: the coset order unless set, `natural`
+    /// or `coset` in any case and spacing, nothing else accepted. The order
+    /// moves the block's chain config, its fold word and the banner (which
+    /// prints the knob only off the default); every other chain this format
+    /// serves stays natural (`chain_format`); and the coset order is refused
+    /// by name under a base whose trees are not Poseidon1.
     #[test]
     fn the_leaf_order_knob_selects_the_coset_order_on_poseidon1_alone() {
-        assert_eq!(parse(&[]).unwrap().whir_leaves, LeafOrder::Natural);
-        assert_eq!(
-            parse(&[(ENV_WHIR_LEAVES, "natural")]).unwrap(),
-            ZfFormat::DEFAULT
-        );
+        assert_eq!(parse(&[]).unwrap().whir_leaves, LeafOrder::Coset);
         let coset = parse(&[(ENV_WHIR_LEAVES, " Coset ")]).unwrap();
-        assert_eq!(coset.whir_leaves, LeafOrder::Coset);
-        assert_eq!(coset.chain_format().leaves, LeafOrder::Coset);
+        assert_eq!(coset, ZfFormat::DEFAULT);
+        let natural = parse(&[(ENV_WHIR_LEAVES, "natural")]).unwrap();
+        assert_eq!(natural.whir_leaves, LeafOrder::Natural);
+        assert_eq!(coset.chain_format().leaves, LeafOrder::Natural);
+        assert_eq!(natural.chain_format(), coset.chain_format());
         assert!(!coset.is_legacy());
         assert_eq!(
-            coset.banner(),
-            format!("{} whir_leaves=coset", ZfFormat::DEFAULT.banner())
+            natural.banner(),
+            format!("{} whir_leaves=natural", ZfFormat::DEFAULT.banner())
         );
-        let cfg = |f: &ZfFormat| crate::multilinear_prove::chain_config_under(f, &[(1, 27)]);
+        let block = |f: ZfFormat| {
+            crate::block_whir::BlockFormat {
+                zf: f,
+                ..crate::block_whir::BlockFormat::production()
+            }
+            .chain_config(&[(1, 27)])
+        };
+        assert_eq!(block(coset).format.leaves, LeafOrder::Coset);
+        assert_eq!(block(natural).format.leaves, LeafOrder::Natural);
         assert_eq!(
-            cfg(&coset).fold_word(),
-            cfg(&ZfFormat::DEFAULT).fold_word()
+            block(coset).fold_word(),
+            block(natural).fold_word()
                 | multilinear::whir_chain::FOLD_WORD_TAG
                 | multilinear::whir_chain::FOLD_WORD_COSET
         );
@@ -851,13 +868,13 @@ mod tests {
             "{err}"
         );
         assert_eq!(
-            ZfFormat::DEFAULT.with_base(BaseFormat::RPX).check_leaves(),
+            natural.with_base(BaseFormat::RPX).check_leaves(),
             Ok(())
         );
     }
 
-    /// Every knob keeps its OFF spelling, and all seven at off are the legacy
-    /// format (every lever off): the rollback and A/B arm.
+    /// Every knob keeps its OFF spelling, and all of them at off are the
+    /// legacy format (every lever off): the rollback and A/B arm.
     #[test]
     fn the_off_spellings_parse_to_the_legacy_format() {
         let f = parse(&[
@@ -869,6 +886,7 @@ mod tests {
             (ENV_WHIR_STACK, "25"),
             (ENV_WHIR_GRIND, "all"),
             (ENV_WHIR_GRIND_BITS, "20"),
+            (ENV_WHIR_LEAVES, "natural"),
         ])
         .unwrap();
         assert_eq!(f, ZfFormat::LEGACY);
@@ -876,7 +894,7 @@ mod tests {
         assert_eq!(
             f.banner(),
             "ZF FORMAT: cap=off whir_cap=off fri=pair one_row=0 whir_folds=uniform4 whir_stack=25 \
-             whir_grind=all whir_grind_bits=20"
+             whir_grind=all whir_grind_bits=20 whir_leaves=natural"
         );
         assert!(f.unimplemented_levers().is_empty());
         assert!(f.proof_format().is_legacy());
@@ -1118,7 +1136,7 @@ mod tests {
         assert_eq!(
             f.banner(),
             "ZF FORMAT: cap=auto whir_cap=2 fri=dp one_row=auto whir_folds=first6 whir_stack=26 \
-             whir_grind=all whir_grind_bits=18 whir_blowup=2"
+             whir_grind=all whir_grind_bits=18 whir_blowup=2 whir_leaves=natural"
         );
         // Every banner value is a spelling its knob accepts, back to the same
         // format.
@@ -1138,6 +1156,7 @@ mod tests {
             (ENV_WHIR_GRIND, fields["whir_grind"]),
             (ENV_WHIR_GRIND_BITS, fields["whir_grind_bits"]),
             (ENV_WHIR_BLOWUP, fields["whir_blowup"]),
+            (ENV_WHIR_LEAVES, fields["whir_leaves"]),
         ])
         .unwrap();
         assert_eq!(back, f);

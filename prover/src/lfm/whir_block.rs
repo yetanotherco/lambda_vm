@@ -1167,7 +1167,7 @@ pub fn verify_block_tree(
     statement: BlockStatement<'_>,
     top: &super::proof::LfmProof,
 ) -> Result<(), String> {
-    verify_block_tree_grouped(elf_bytes, statement, top, GroupFold::PerPoly)
+    verify_block_tree_grouped(elf_bytes, statement, top, BlockFormat::production().group)
 }
 
 /// [`verify_block_tree`] for a block whose groups' stacked polynomials were

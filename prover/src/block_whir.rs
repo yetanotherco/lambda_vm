@@ -214,10 +214,10 @@ pub struct BlockFormat {
     /// ([`ArgueFormat::Batched`], D-BATCH's format on the block). The proof
     /// carries the other format's messages in [`BlockWhirProof::argues`].
     pub argue: ArgueFormat,
-    /// How each group's stacked polynomials are opened: one chain each
-    /// ([`GroupFold::PerPoly`], production), or one chain per run of at most
-    /// four ([`GroupFold::Indexed`], D-ONECHAIN; W-14). A caller constant like
-    /// the rest of the format, bound into the statement through the fold word.
+    /// How each group's stacked polynomials are opened: one chain per run of
+    /// at most four ([`GroupFold::Indexed`], production; D-ONECHAIN, W-14), or
+    /// one chain each ([`GroupFold::PerPoly`]). A caller constant like the rest
+    /// of the format, bound into the statement through the fold word.
     pub group: GroupFold,
 }
 
@@ -303,9 +303,11 @@ thread_local! {
 
 impl BlockFormat {
     /// The process's WHIR format (as [`crate::multilinear_prove::chain_config`]
-    /// reads it), [`BLOCK_GROUP_POLYS`], [`BLOCK_MAX_GROUPS`], and each group's
+    /// reads it), [`BLOCK_GROUP_POLYS`], [`BLOCK_MAX_GROUPS`], each group's
     /// tables argued together ([`ArgueFormat::BATCHED`]; Mauro 10-02: "batch the
-    /// constraints"). `ArgueFormat::PerTable` stays a format to measure against.
+    /// constraints"), and one WHIR chain per run of a group's stacked
+    /// polynomials ([`GroupFold::Indexed`]). `ArgueFormat::PerTable` and
+    /// [`GroupFold::PerPoly`] stay formats to measure against.
     pub fn production() -> Self {
         Self {
             zf: *ZfFormat::global(),
@@ -313,7 +315,7 @@ impl BlockFormat {
             max_groups: BLOCK_MAX_GROUPS,
             prepared: true,
             argue: ArgueFormat::BATCHED,
-            group: GroupFold::PerPoly,
+            group: GroupFold::Indexed,
         }
     }
 
@@ -329,11 +331,14 @@ impl BlockFormat {
     }
 
     /// The chain's config over `shapes`: the WHIR format's, with this format's
-    /// argue and group fold. Every side of a block builds its config here.
+    /// argue, group fold and round-0 leaf order (the block's alone:
+    /// `ZfFormat::chain_format` leaves every other chain natural). Every side
+    /// of a block builds its config here.
     pub fn chain_config(&self, shapes: &[(usize, usize)]) -> ChainConfig {
         let mut config = chain_config_under(&self.zf, shapes);
         config.format.argue = self.argue;
         config.format.group = self.group;
+        config.format.leaves = self.zf.whir_leaves;
         config
     }
 }
