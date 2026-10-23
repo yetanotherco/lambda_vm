@@ -7,5 +7,8 @@ pub mod ef_io;
 #[cfg(target_arch = "riscv64")]
 pub mod entrypoint;
 pub mod keccak;
+// Host model of the `fast-memcpy` routine in `entrypoint.rs`, swept natively.
+#[cfg(test)]
+mod memcpy_model;
 pub mod random;
 pub mod syscalls;

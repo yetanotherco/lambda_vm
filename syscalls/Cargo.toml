@@ -25,6 +25,12 @@ critical-section = { version = "1.2", optional = true }
 # `src/allocator.rs` for the measurements behind that choice. Select dlmalloc when the
 # execution's cumulative allocation isn't bounded per block.
 dlmalloc-alloc = ["dep:dlmalloc", "dep:critical-section"]
+# Guest `memcpy` override: a strong `memcpy` next to `_start` that moves 32 bytes an
+# iteration, in place of compiler_builtins' weak one. See `src/entrypoint.rs` for what it
+# does, the C contract it keeps (and the one the library routine happened to exceed), and
+# the tests that sweep it. The ethrex guest turns it on; every other guest keeps the library
+# routine.
+fast-memcpy = []
 
 [dev-dependencies]
 keccak = "0.1"

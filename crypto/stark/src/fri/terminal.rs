@@ -9,6 +9,9 @@ use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::polynomial::Polynomial;
 
+use crate::fri::schedule::{FRI_SCHEDULE_DMAX, FriFormat, FriFormatError};
+use crate::proof::options::ProofOptions;
+
 /// The FRI early-termination fold layout.
 ///
 /// Derived identically by the CPU prover (`commit_phase_from_evaluations`), the
@@ -16,11 +19,16 @@ use math::polynomial::Polynomial;
 /// Keeping the arithmetic in one place is load-bearing: the three callers must
 /// agree exactly or proofs fail to verify, and a CPU/GPU disagreement would
 /// surface only on GPU machines.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// The committed layers follow a fold schedule (`crate::fri::schedule`): layer
+/// `j` folds by `2^{schedule[j]}`. Today's layout ([`Self::new`]) is the
+/// all-ones schedule, built through the same constructor as every other format.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FriFoldLayout {
     /// Folds from the LDE codeword down to the terminal codeword.
     pub(crate) total_folds: u32,
-    /// Committed (Merkle-rooted) FRI layers = `total_folds - 1`, or 0 when there
+    /// Committed (Merkle-rooted) FRI layers = `schedule.len()`. Row-pair
+    /// layout: `total_folds - 1` under the all-ones schedule, or 0 when there
     /// is no fold or only a single final fold.
     pub(crate) num_committed: usize,
     /// Terminal codeword length = `2^(blowup_log + effective_k)`.
@@ -28,10 +36,24 @@ pub(crate) struct FriFoldLayout {
     /// Terminal polynomial log-degree bound actually used, `min(k, trace_bits)`.
     /// This is the verifier's `expected_k` and the prover's `effective_log_degree`.
     pub(crate) effective_k: u32,
+    /// Fold exponent of each committed layer, first committed layer first.
+    /// Invariant (checked by every constructor): `(one_row ? 0 : 1) +
+    /// Σ schedule == total_folds` whenever `total_folds >= 1`, and empty
+    /// otherwise; every entry is in `1..=FRI_SCHEDULE_DMAX`.
+    pub(crate) schedule: Vec<u8>,
+    /// Whether the DEEP codeword itself is committed (one-row openings): then
+    /// the chain starts at the LDE size and there is no uncommitted fold 0.
+    pub(crate) one_row: bool,
+    /// Today's FRI encoding ([`FriFormat::is_legacy`]): pair-leaf layer trees
+    /// and one sibling value per committed layer per query. `false` = group
+    /// leaves (`H::Batched` over `2^d` values) and the full group per layer —
+    /// decided by the format, never by the schedule's values, so a `Dp`
+    /// schedule that happens to be all ones still uses the group encoding.
+    pub(crate) legacy_encoding: bool,
 }
 
 impl FriFoldLayout {
-    /// Derive the layout from the LDE codeword size.
+    /// Today's layout, derived from the LDE codeword size.
     ///
     /// * `lde_log`    — log2 of the LDE (deep-composition) codeword length.
     /// * `blowup_log` — log2 of the LDE blowup factor.
@@ -42,15 +64,155 @@ impl FriFoldLayout {
     /// size for traces too small to fold that far (the `.min(lde_log)`).
     /// Computing `blowup_log + k` in `u32` (both small) sidesteps the
     /// `1 << (blowup_log + k)` overflow an out-of-range `k` would otherwise cause.
+    ///
+    /// This is [`Self::for_format`] at [`FriFormat::LEGACY`]: pair layers,
+    /// row-pair openings, the all-ones schedule.
     pub(crate) fn new(lde_log: u32, blowup_log: u32, k: u32) -> Self {
         let terminal_log = (blowup_log + k).min(lde_log);
+        let schedule = FriFormat::LEGACY.schedule(lde_log, terminal_log);
+        // The all-ones schedule covers the committed folds by construction.
+        Self::assemble(lde_log, blowup_log, terminal_log, false, schedule)
+    }
+
+    /// The layout under an explicit proof format. `total_folds`,
+    /// `terminal_len` and `effective_k` do not depend on the format; only the
+    /// split of the folds into committed layers does.
+    ///
+    /// `None` only for a schedule override that does not cover the committed
+    /// folds exactly (the DP and the all-ones schedules land on the terminal
+    /// by construction).
+    pub(crate) fn for_format(
+        lde_log: u32,
+        blowup_log: u32,
+        k: u32,
+        fmt: &FriFormat,
+    ) -> Option<Self> {
+        let terminal_log = (blowup_log + k).min(lde_log);
+        let schedule = fmt.schedule(lde_log, terminal_log);
+        let mut layout = Self::assemble(lde_log, blowup_log, terminal_log, fmt.one_row, schedule);
+        layout.legacy_encoding = fmt.is_legacy();
+        layout.schedule_is_consistent().then_some(layout)
+    }
+
+    /// The layout of a table proved under `options` over an LDE of
+    /// `2^lde_log` with blowup `2^blowup_log`, whose trace trees use the
+    /// resolved leaf layout `one_row`: what the prover and the host verifier
+    /// both build. The format comes from `options` and the table's AIR — a
+    /// verifier-side constant — never from a proof.
+    pub(crate) fn for_options(
+        lde_log: u32,
+        blowup_log: u32,
+        options: &ProofOptions,
+        one_row: bool,
+    ) -> Result<Self, FriFormatError> {
+        let fmt = FriFormat::from_options(options, one_row);
+        Self::for_format(
+            lde_log,
+            blowup_log,
+            u32::from(options.fri_final_poly_log_degree),
+            &fmt,
+        )
+        .ok_or(FriFormatError::ScheduleOverrideMismatch)
+    }
+
+    /// The layout for a caller-supplied schedule, or `None` if the schedule
+    /// does not cover exactly the committed folds (or has an exponent outside
+    /// `1..=FRI_SCHEDULE_DMAX`). The encoding is the group encoding unless
+    /// the schedule is today's (row pair, all ones), where it is legacy.
+    #[cfg(test)]
+    pub(crate) fn from_schedule(
+        lde_log: u32,
+        blowup_log: u32,
+        k: u32,
+        one_row: bool,
+        schedule: Vec<u8>,
+    ) -> Option<Self> {
+        let terminal_log = (blowup_log + k).min(lde_log);
+        let mut layout = Self::assemble(lde_log, blowup_log, terminal_log, one_row, schedule);
+        layout.legacy_encoding = !one_row && layout.schedule.iter().all(|&d| d == 1);
+        layout.schedule_is_consistent().then_some(layout)
+    }
+
+    /// Whether this layout uses today's FRI encoding (see
+    /// [`Self::legacy_encoding`]). The device FRI arms branch on this: today's
+    /// pair loop, or its group-leaf twin.
+    pub(crate) fn is_legacy(&self) -> bool {
+        self.legacy_encoding
+    }
+
+    /// Log2 length of committed layer `j` (0-based): the chain start minus the
+    /// bits the earlier committed layers consumed.
+    pub(crate) fn layer_log_len(&self, lde_log: u32, j: usize) -> u32 {
+        let consumed: u32 = self.schedule[..j].iter().map(|&d| u32::from(d)).sum();
+        crate::fri::schedule::fri_chain_start(lde_log, self.one_row) - consumed
+    }
+
+    /// Depth of committed layer `j`'s tree: its length over `2^{d_j}` leaves.
+    pub(crate) fn layer_depth(&self, lde_log: u32, j: usize) -> u32 {
+        self.layer_log_len(lde_log, j) - u32::from(self.schedule[j])
+    }
+
+    /// Folding challenges a proof of this layout draws: one per committed
+    /// layer plus the final fold's for row pairs (fold 0 consumes the first),
+    /// one per committed layer for one row (layer 0, the input tree, is
+    /// committed before any challenge); none when nothing folds.
+    pub(crate) fn num_zetas(&self) -> usize {
+        if self.total_folds == 0 {
+            0
+        } else {
+            self.num_committed + usize::from(!self.one_row)
+        }
+    }
+
+    /// Depth of every committed layer's tree, in layer order.
+    pub(crate) fn layer_depths(&self, lde_log: u32) -> Vec<usize> {
+        (0..self.num_committed)
+            .map(|j| self.layer_depth(lde_log, j) as usize)
+            .collect()
+    }
+
+    /// Opened values per query in the flat `layers_evaluations_sym` vector:
+    /// one per layer (legacy) or every layer's full group.
+    pub(crate) fn opened_values_per_query(&self) -> usize {
+        if self.legacy_encoding {
+            self.num_committed
+        } else {
+            self.schedule.iter().map(|&d| 1usize << d).sum()
+        }
+    }
+
+    fn assemble(
+        lde_log: u32,
+        blowup_log: u32,
+        terminal_log: u32,
+        one_row: bool,
+        schedule: Vec<u8>,
+    ) -> Self {
         let total_folds = lde_log - terminal_log;
         Self {
             total_folds,
-            num_committed: total_folds.saturating_sub(1) as usize,
+            num_committed: schedule.len(),
             terminal_len: 1usize << terminal_log,
             effective_k: terminal_log - blowup_log,
+            schedule,
+            one_row,
+            legacy_encoding: !one_row,
         }
+    }
+
+    /// The constructor invariant (see [`Self::schedule`]).
+    fn schedule_is_consistent(&self) -> bool {
+        let entries_ok = self
+            .schedule
+            .iter()
+            .all(|&d| d >= 1 && u32::from(d) <= FRI_SCHEDULE_DMAX);
+        let covered: u64 = self.schedule.iter().map(|&d| u64::from(d)).sum();
+        let expected = if self.total_folds == 0 {
+            0
+        } else {
+            u64::from(self.total_folds) - u64::from(!self.one_row)
+        };
+        entries_ok && covered == expected
     }
 }
 

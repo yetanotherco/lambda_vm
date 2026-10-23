@@ -1,0 +1,99 @@
+################################################################################
+# SUPERSEDED -- DO NOT CITE THIS BOARD
+#
+# This is the PRE-PHASE-2 board (49 checks), run against chip_model.py when it
+# still modelled a WITNESSED add2 carry column and a 13-cell socket prefix. Its
+# census figures (main 3,533 / 3,037, cell-equiv 5,606 / 4,822) are therefore
+# NOT the built chip's and contradict the current numbers.
+#
+# CURRENT BOARD OF RECORD:  run-chip-gate.log  (75 checks, both round counts,
+#                           transcribed from the committed chip b693eece)
+# Census of record:         CHIP-GATE.md section 3
+#
+# Kept only as the evidence behind ORACLE.md section 0's 49-check claim.
+################################################################################
+
+==============================================================================
+BLAKE3-behind-LFM_HASH  --  z3 GATE  (Option A socket)
+==============================================================================
+
+--- MAIN THEOREMS (symbolic, BV) -- want UNSAT ---
+  [PASS    ] T1  G quarter-round, free inputs (covers every G) -> unsat  (want unsat)  400.1s
+  [PASS    ] T2  message schedule, all 7 rounds (placement/tag/LE/perm) -> unsat  (want unsat)
+  [PASS    ] T3  framing @rounds=0 (init state/feed-forward/window) -> unsat  (want unsat)
+  per-theorem discrimination controls -- want SAT:
+  [PASS    ]     T2-ctl swap_a_b                          -> sat    (want sat)
+  [PASS    ]     T2-ctl tag_changed                       -> sat    (want sat)
+  [PASS    ]     T2-ctl tag_omitted                       -> sat    (want sat)
+  [PASS    ]     T2-ctl tag_slot_moved                    -> sat    (want sat)
+  [PASS    ]     T2-ctl lanes_big_endian                  -> sat    (want sat)
+  [PASS    ]     T2-ctl msg_perm_swapped                  -> sat    (want sat)
+  [PASS    ]     T3-ctl cv_zero                           -> sat    (want sat)
+  [PASS    ]     T3-ctl truncate_high_half                -> sat    (want sat)
+  [PASS    ]     T3-ctl drop_ff_xor                       -> sat    (want sat)
+
+--- T4  FULL PIPELINE, CONCRETE, vs the anchored KATs ---
+  [PASS    ] T4  full 7-round pipeline == anchored KAT    -> sat    (want sat)  12.1s
+  [PASS    ] T4  full 7-round pipeline EXCLUDES a wrong digest -> unsat  (want unsat)  2.8s
+  [PASS    ] T4  full 6-round pipeline == anchored KAT    -> sat    (want sat)  9.6s
+  [PASS    ] T4  full 6-round pipeline EXCLUDES a wrong digest -> unsat  (want unsat)  2.4s
+
+--- NEGATIVE CONTROLS -- want SAT (an UNSAT here means the gate is BLIND) ---
+  logic bugs, symbolic at G level:
+  [PASS    ] NC  rot_wrong_amount                         -> sat    (want sat)
+  [PASS    ] NC  swap_g_operand                           -> sat    (want sat)
+  framing + wiring bugs, against the FULL 7-round pipeline, concrete:
+  [PASS    ] NC  swap_a_b                                 -> sat    (want sat)  12.0s
+  [PASS    ] NC  tag_changed                              -> sat    (want sat)  2.8s
+  [PASS    ] NC  tag_omitted                              -> sat    (want sat)  12.3s
+  [PASS    ] NC  truncate_high_half                       -> sat    (want sat)  2.9s
+  [PASS    ] NC  flags_parent                             -> sat    (want sat)  13.0s
+  [PASS    ] NC  flags_no_root                            -> sat    (want sat)  2.8s
+  [PASS    ] NC  block_len_64                             -> sat    (want sat)  13.0s
+  [PASS    ] NC  block_len_32                             -> sat    (want sat)  2.8s
+  [PASS    ] NC  counter_one                              -> sat    (want sat)  12.7s
+  [PASS    ] NC  cv_zero                                  -> sat    (want sat)  2.9s
+  [PASS    ] NC  lanes_big_endian                         -> sat    (want sat)  13.2s
+  [PASS    ] NC  tag_slot_moved                           -> sat    (want sat)  3.0s
+  [PASS    ] NC  msg_perm_swapped                         -> sat    (want sat)  12.7s
+  [PASS    ] NC  rounds_6_not_7                           -> sat    (want sat)  2.4s
+  [PASS    ] NC  drop_ff_xor                              -> sat    (want sat)  12.8s
+  [PASS    ] NC  swap_g_operand (full pipeline)           -> sat    (want sat)  2.9s
+
+--- DOCUMENTED BV BLINDNESS (why the FIELD domain is mandatory) ---
+  [PASS    ] BV  drop_carry_bool is INVISIBLE in BV (see WA4 for the field verdict) -> unsat  (want unsat)  19.6s
+
+--- OPTIONAL TAIL TRUNCATION (last-round diagonal X4/B2 omitted) ---
+  [PASS    ] TT  tail-truncated 7-round pipeline == anchored KAT -> sat    (want sat)  13.8s
+  [PASS    ] TT  tail-truncated pipeline EXCLUDES a wrong digest -> unsat  (want unsat)  2.9s
+      saves 112 cell-equiv of 5606 (2.0%)
+
+--- NON-VACUITY ---
+  [PASS    ] NV  honest system satisfiable @rounds=7 (not vacuous) -> sat    (want sat)  24.2s
+
+--- WIDTH AUDIT (FIELD, mod p) -- bound necessity; BV cannot see these ---
+  [PASS    ] WA1 lane decomposition, AreBytes PRESENT     -> unsat  (want unsat)
+  [PASS    ] WA1 lane decomposition, AreBytes DROPPED     -> sat    (want sat)
+  [PASS    ] WA2 lane < 2^32 forced, AreBytes PRESENT     -> unsat  (want unsat)
+  [PASS    ] WA2 lane < 2^32 forced, AreBytes DROPPED     -> sat    (want sat)
+  [PASS    ] WA3 shift SLL bound PRESENT (r=9)            -> unsat  (want unsat)
+  [PASS    ] WA3 shift SLL bound DROPPED (r=9)            -> sat    (want sat)
+  [PASS    ] WA4 add3 carry booleanity PRESENT            -> unsat  (want unsat)
+  [PASS    ] WA4 add3 carry booleanity DROPPED            -> sat    (want sat)
+  [PASS    ] WA5 tail case: rotation WORD value still pinned -> unsat  (want unsat)
+  [PASS    ] WA5 tail case: rotation BYTES not pinned (hazard is real) -> sat    (want sat)
+  [PASS    ] WA6 no-wrap side condition (worst 2^34 < p)  -> ok     (want ok)
+
+--- COST CENSUS (derived from the gated model, not hand-counted) ---
+  7-round: main= 3533  sends= 1382  aux= 2073  cell-equiv= 5606
+  6-round: main= 3037  sends= 1190  aux= 1785  cell-equiv= 4822
+      rotr_shift                1344
+      xor_out                    912
+      add3                       672
+      add2                       560
+      lane_bytes(MB)              32
+      digest_out_felts+in_felts+MU    13
+
+==============================================================================
+GATE VERDICT: PASS
+==============================================================================

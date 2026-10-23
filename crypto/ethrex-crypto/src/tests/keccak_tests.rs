@@ -54,6 +54,20 @@ fn keccak_sponge_matches_trusted_permutation() {
 }
 
 #[test]
+fn keccak_sponge_every_length_to_three_blocks() {
+    // The final block is absorbed lane by lane, so every remainder length (whole
+    // lanes, a partial lane of 1..=7 bytes, the pad byte landing in either) is
+    // worth a case. A pattern with no short period, so a byte landing in the wrong
+    // position of its lane changes the hash.
+    let input: Vec<u8> = (0..3 * 136 + 2)
+        .map(|i: u32| (i.wrapping_mul(0x9E37_79B9) >> 24) as u8)
+        .collect();
+    for n in 0..=input.len() {
+        check_keccak(&input[..n]);
+    }
+}
+
+#[test]
 fn keccak_sponge_known_answer_vectors() {
     // Vectors from the Ethereum Yellow Paper / EIP-155. These use Keccak-256
     // (0x01 padding), NOT SHA3-256 (0x06 padding). Any sponge framing bug

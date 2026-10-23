@@ -1,0 +1,446 @@
+//! D-ONECHAIN B1 at the block: one WHIR chain per run of a group's stacked
+//! polynomials ([`GroupFold::Indexed`]) through the block's frame, prover and
+//! verifier (REV-B2-JUDGE B1-1 (a), B1-5). The chain-level gates are
+//! `multilinear`'s `whir_group_tests`, and on the card its
+//! `whir_group_device`.
+//!
+//! On either build: a card build runs a grouped round 0 on the card where it
+//! takes the stack, and on the host where it does not.
+
+use crate::block_whir::{
+    self, BlockFormat, BlockOptions, BlockRefusal, BlockWhirProof, Deviations,
+    prove_block_whir_with,
+};
+use crate::tables::MaxRowsConfig;
+use crate::test_utils::asm_elf_bytes;
+use crate::zf_format::ZfFormat;
+use multilinear::stacked_eval::index_chains;
+use multilinear::whir_chain::{
+    ArgueFormat, GroupFold, MAX_INDEX_POLYS, MAX_INDEX_VARS, RoundOpenings, StackVars,
+    check_index_domain, index_vars,
+};
+use stark::multilinear_table::batched::VerifierChecks;
+use stark::proof::options::{BaseFormat, ProofOptions};
+
+/// A stack of 2^10 and `group_polys` polynomials a group under `base`, so a
+/// small program spans several groups, argued per `argue` and opened per
+/// `group`.
+fn format(
+    base: BaseFormat,
+    group_polys: usize,
+    group: GroupFold,
+    argue: ArgueFormat,
+) -> BlockFormat {
+    let mut zf = ZfFormat::DEFAULT.with_base(base);
+    zf.whir_stack = StackVars::new(10).expect("a valid stack");
+    BlockFormat {
+        zf,
+        group_polys,
+        max_groups: block_whir::BLOCK_MAX_GROUPS,
+        prepared: true,
+        argue,
+        group,
+    }
+}
+
+/// The production format, opened per `group`: one group holds a small program.
+fn production(group: GroupFold) -> BlockFormat {
+    BlockFormat {
+        zf: ZfFormat::DEFAULT,
+        group_polys: block_whir::BLOCK_GROUP_POLYS,
+        max_groups: block_whir::BLOCK_MAX_GROUPS,
+        prepared: true,
+        argue: ArgueFormat::PerTable,
+        group,
+    }
+}
+
+/// `block_whir_tests`' small-program options at `max_rows`: groups retire and
+/// revive between the phases (3 binary levels dropped).
+fn options(max_rows: MaxRowsConfig) -> BlockOptions {
+    BlockOptions {
+        max_rows,
+        keccak_rnd_rows_log2: 16,
+        ecdas_rows_log2: block_whir::BLOCK_ECDAS_ROWS_LOG2,
+        keccak_rows_log2: block_whir::BLOCK_KECCAK_ROWS_LOG2,
+        ecsm_rows_log2: block_whir::BLOCK_ECSM_ROWS_LOG2,
+        drop_levels: multilinear::whir_commit::TreeDrop::uniform(3),
+        window_log2: None,
+        stream_keccak_rnd: false,
+        stream_memw_lt: false,
+        drop_streamed_ops: false,
+        layout_workers: 0,
+        layout_ahead: Some(2),
+        pack_rest_as_laid_out: false,
+        narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
+        upload_ahead: true,
+        memlog: false,
+        finish_keccak_rnd_chunks: true,
+        finish_cuts: true,
+        finish_stream: true,
+        rest_layout_bytes: Some(1 << 20),
+        pack_finished: true,
+        gpack: true,
+        spill: block_whir::BlockSpillPolicy::Off,
+        regen: None,
+    }
+}
+
+fn prove(elf: &[u8], format: &BlockFormat, max_rows: MaxRowsConfig) -> BlockWhirProof {
+    prove_block_whir_with(
+        elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        format,
+        &options(max_rows),
+        &Deviations::default(),
+    )
+    .expect("prove")
+    .0
+}
+
+/// The width of every grouped chain's run in the proof, groups and prepared
+/// stacks alike: its round-0 blocks a query.
+fn grouped_widths(proof: &BlockWhirProof) -> Vec<usize> {
+    proof
+        .proof
+        .columns
+        .iter()
+        .chain(&proof.prepared)
+        .flat_map(|stack| &stack.polys)
+        .filter_map(|chain| match &chain.rounds.first()?.openings {
+            RoundOpenings::BaseGrouped(g) => g.current.first().map(Vec::len),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Each chain's width in one stack's opening, in proof order: a grouped
+/// chain's round-0 blocks a query, 1 for a per-polynomial chain.
+fn chain_widths<F, E>(stack: &multilinear::stacked_eval::StackedProof<F, E>) -> Vec<usize>
+where
+    F: math::field::traits::IsField,
+    E: math::field::traits::IsField,
+{
+    stack
+        .polys
+        .iter()
+        .map(|chain| match chain.rounds.first().map(|r| &r.openings) {
+            Some(RoundOpenings::BaseGrouped(g)) => g.current.first().map_or(0, Vec::len),
+            _ => 1,
+        })
+        .collect()
+}
+
+/// REV-B2-JUDGE B1-1 (a), REV-B2-A's frame probe under `Indexed`: a table
+/// stated at 2^27 rows alone in its group (the frame admits it, exempt from
+/// `group_polys`) stacks into one polynomial per column — 38 for the CPU — and
+/// the verifier's split cuts them into nine runs of four and one of two, each
+/// within `MAX_INDEX_VARS` index variables and the two-adicity.
+#[test]
+fn a_wide_singleton_group_splits_into_runs_of_four() {
+    let elf = asm_elf_bytes("sub");
+    let indexed = production(GroupFold::Indexed);
+    let proof = prove(
+        &elf,
+        &production(GroupFold::PerPoly),
+        MaxRowsConfig::default(),
+    );
+    let opts = ProofOptions::default_test_options();
+    let honest = block_whir::block_frame(proof.statement(), &elf, &opts, &indexed).expect("frame");
+    let chunked: Vec<std::ops::Range<usize>> =
+        block_whir::chunked_table_ranges(&proof.table_counts)
+            .iter()
+            .map(|(_, r, _)| r.clone())
+            .collect();
+    let (t, width) = honest
+        .shapes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !chunked.iter().any(|r| r.contains(i)))
+        .map(|(i, &(w, _))| (i, w))
+        .max_by_key(|&(_, w)| w)
+        .expect("a table outside the chunked families");
+    let n = proof.table_num_vars.len();
+    let mut heights = proof.table_num_vars.clone();
+    heights[t] = block_whir::BLOCK_MAX_TABLE_VARS as u8;
+    let groups: Vec<Vec<u32>> = vec![
+        vec![t as u32],
+        (0..n as u32).filter(|&i| i as usize != t).collect(),
+    ];
+    let statement = block_whir::BlockStatement {
+        table_num_vars: &heights,
+        groups: &groups,
+        ..proof.statement()
+    };
+    let frame = block_whir::block_frame(statement, &elf, &opts, &indexed)
+        .expect("the verifier's frame admits the shape");
+    assert_eq!(frame.config.format.group, GroupFold::Indexed);
+    let layout = &frame.stack_layouts[0];
+    assert_eq!(layout.n_stack(), block_whir::BLOCK_MAX_TABLE_VARS);
+    let polys = layout.num_polys();
+    println!(
+        "ONECHAIN B1-1a: table {t} ({}) width {width} stated at 2^{}: group 0 stacks into \
+         {polys} polynomials",
+        honest.airs.air_refs()[t].name(),
+        block_whir::BLOCK_MAX_TABLE_VARS
+    );
+    assert_eq!(polys, width, "one 2^27 polynomial per column");
+    let runs: Vec<usize> = index_chains(polys, frame.config.format.group)
+        .iter()
+        .map(|r| r.len())
+        .collect();
+    let mut want = vec![MAX_INDEX_POLYS; polys / MAX_INDEX_POLYS];
+    if !polys.is_multiple_of(MAX_INDEX_POLYS) {
+        want.push(polys % MAX_INDEX_POLYS);
+    }
+    assert_eq!(runs, want);
+    if width == 38 {
+        assert_eq!(runs, [vec![4; 9], vec![2]].concat());
+    }
+    for &run in &runs {
+        assert!(index_vars(run) <= MAX_INDEX_VARS);
+        check_index_domain(
+            layout.n_stack(),
+            index_vars(run),
+            frame.config.log_blowup,
+            32,
+        )
+        .expect("the virtual domain exists");
+    }
+}
+
+/// REV-B2-JUDGE B1-5 at the block, and the grouped chain's round trip
+/// through it: at up to two, three and four polynomials a group, under the
+/// block's base (Poseidon1's 4-ary capped trees), an `Indexed` block proves and
+/// verifies with grouped chains — each group's chains exactly the verifier's
+/// split of its stack, runs of at most `MAX_INDEX_POLYS` whatever the group
+/// budget is (the budget bounds a group of several tables; a table that alone
+/// needs more is a group of its own, and its runs are of four) — runs of two,
+/// three and four each occur, its phase-A roots are the per-polynomial
+/// block's (B2-sep), and neither mode's proof verifies under the other's
+/// verifier — refused by the STATEMENT: the two modes' statement bytes differ
+/// in one bit, the fold word's bit 47, so the transcript parts at the first
+/// absorb and the first group's argue refuses, before any opening's shape is
+/// read (the shapes' own refusals, `ChainCount` and the per-polynomial count,
+/// are `whir_group_tests`'). Each group's tables argued one by one.
+#[test]
+fn an_indexed_block_round_trips_and_refuses_the_other_mode() {
+    let seen = round_trips_and_refuses_the_other_mode(ArgueFormat::PerTable, 2..=MAX_INDEX_POLYS);
+    // Runs of two, three and four each round-tripped and each was refused
+    // across the modes: the three budgets pack the program into all of them.
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        (2..=MAX_INDEX_POLYS).collect::<Vec<_>>(),
+        "a grouped run of every width from two to {MAX_INDEX_POLYS}"
+    );
+}
+
+/// [`an_indexed_block_round_trips_and_refuses_the_other_mode`] under the
+/// argue production runs, each group's tables argued together
+/// (`ArgueFormat::BATCHED`), at the production budget of three polynomials a
+/// group: the grouped opening takes its points and values from whichever
+/// argue ran, and this is the pairing a default would ship. The same round
+/// trip, the same equal roots, the statements one bit apart, and both
+/// cross-mode refusals at the statement, never at an opening's shape — over
+/// runs of two, three and four.
+#[test]
+fn an_indexed_block_round_trips_under_the_batched_argue() {
+    let seen = round_trips_and_refuses_the_other_mode(
+        ArgueFormat::BATCHED,
+        block_whir::BLOCK_GROUP_POLYS..=block_whir::BLOCK_GROUP_POLYS,
+    );
+    // The production budget packs the program into runs of every width: the
+    // tables of a group, and two tables alone in theirs split into fours.
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        (2..=MAX_INDEX_POLYS).collect::<Vec<_>>(),
+        "a grouped run of every width under the batched argue"
+    );
+}
+
+/// The round trip and the cross-mode refusals at each budget of `budgets`
+/// polynomials a group, under `argue`; returns the grouped run widths seen.
+fn round_trips_and_refuses_the_other_mode(
+    argue: ArgueFormat,
+    budgets: std::ops::RangeInclusive<usize>,
+) -> std::collections::BTreeSet<usize> {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let opts = ProofOptions::default_test_options();
+    let traced = |proof: &BlockWhirProof, format: &BlockFormat| {
+        block_whir::verify_block_whir_traced(proof, &elf, &opts, format, false, VerifierChecks::ALL)
+            .expect("the statement frames under either mode")
+    };
+    let base = crate::hash_pin::BLOCK_BASE;
+    let mut seen = std::collections::BTreeSet::new();
+    for group_polys in budgets {
+        let indexed = format(base, group_polys, GroupFold::Indexed, argue);
+        let per_poly = format(base, group_polys, GroupFold::PerPoly, argue);
+        let a = prove(&elf, &indexed, MaxRowsConfig::small());
+        let b = prove(&elf, &per_poly, MaxRowsConfig::small());
+        let widths = grouped_widths(&a);
+        println!(
+            "ONECHAIN B1-5 {base:?} group_polys {group_polys}: {} groups, grouped runs \
+                 {widths:?}",
+            a.proof.columns.len()
+        );
+        assert!(
+            widths.iter().any(|&w| w >= 2),
+            "{base:?} {group_polys}: no grouped chain"
+        );
+        // Each group's chains are the verifier's split of its stack, exactly:
+        // runs of at most `MAX_INDEX_POLYS`, whatever `group_polys` is. The
+        // budget bounds a group of SEVERAL tables; a table that alone needs
+        // more is a group of its own (the frame's rule and the packing's).
+        let framed = block_whir::block_frame(a.statement(), &elf, &opts, &indexed).expect("frame");
+        assert_eq!(a.proof.columns.len(), framed.stack_layouts.len());
+        assert_eq!(b.proof.columns.len(), framed.stack_layouts.len());
+        for (g, layout) in framed.stack_layouts.iter().enumerate() {
+            let polys = layout.num_polys();
+            let got = chain_widths(&a.proof.columns[g]);
+            println!(
+                "ONECHAIN B1-5 {base:?} group_polys {group_polys} group {g}: {} tables, \
+                 {polys} polynomials, chains {got:?}",
+                framed.sizes[g]
+            );
+            let split: Vec<usize> = index_chains(polys, GroupFold::Indexed)
+                .iter()
+                .map(|run| run.len())
+                .collect();
+            assert_eq!(
+                got, split,
+                "{base:?} {group_polys} group {g}: the proof's chains are the split's"
+            );
+            assert!(
+                got.iter().all(|w| (1..=MAX_INDEX_POLYS).contains(w)),
+                "{base:?} {group_polys} group {g}: a run of at most {MAX_INDEX_POLYS}"
+            );
+            assert!(
+                polys <= group_polys || framed.sizes[g] == 1,
+                "{base:?} {group_polys} group {g}: {polys} polynomials over {} tables — only a \
+                 table alone may need more than the group budget",
+                framed.sizes[g]
+            );
+            assert_eq!(
+                chain_widths(&b.proof.columns[g]),
+                vec![1; polys],
+                "{base:?} {group_polys} group {g}: one chain a polynomial under PerPoly"
+            );
+        }
+        for (k, stack) in a.prepared.iter().enumerate() {
+            let got = chain_widths(stack);
+            println!(
+                "ONECHAIN B1-5 {base:?} group_polys {group_polys} prepared stack {k}: chains \
+                 {got:?}"
+            );
+            assert!(got.iter().all(|w| (1..=MAX_INDEX_POLYS).contains(w)));
+        }
+        seen.extend(widths.iter().copied());
+        assert!(grouped_widths(&b).is_empty());
+        println!(
+            "ONECHAIN B1-5 {base:?} group_polys {group_polys}: phase-A roots {} (Indexed), {} \
+             (PerPoly), equal: {}",
+            a.proof.roots.len(),
+            b.proof.roots.len(),
+            a.proof.roots == b.proof.roots
+        );
+        assert_same_roots(&elf, &a, &b, &indexed);
+        let (own_a, own_b) = (traced(&a, &indexed), traced(&b, &per_poly));
+        println!(
+            "ONECHAIN B1-5 {base:?} group_polys {group_polys}: Indexed under Indexed {own_a:?}, \
+             PerPoly under PerPoly {own_b:?}"
+        );
+        assert!(own_a.is_ok(), "{base:?} {group_polys}");
+        assert!(own_b.is_ok(), "{base:?} {group_polys}");
+
+        // The statement: one bit apart, the fold word's 47.
+        let frame = |format: &BlockFormat| {
+            block_whir::block_frame(a.statement(), &elf, &opts, format).expect("frame")
+        };
+        let tag = block_whir::block_statement_tag(&base);
+        let digest = crate::statement::elf_digest(&elf);
+        let (sa, sb) = (
+            block_whir::block_statement_bytes(
+                a.statement(),
+                &tag,
+                &digest,
+                &frame(&indexed).config,
+            ),
+            block_whir::block_statement_bytes(
+                a.statement(),
+                &tag,
+                &digest,
+                &frame(&per_poly).config,
+            ),
+        );
+        assert_eq!(sa.len(), sb.len());
+        let differ: Vec<(usize, u8)> = sa
+            .iter()
+            .zip(&sb)
+            .enumerate()
+            .filter(|(_, (x, y))| x != y)
+            .map(|(i, (x, y))| (i, x ^ y))
+            .collect();
+        println!(
+            "ONECHAIN B1-5 {base:?} group_polys {group_polys}: statements of {} bytes differ at \
+             (byte, xor) {differ:?}",
+            sa.len()
+        );
+        assert_eq!(differ.len(), 1, "{base:?} {group_polys}: {differ:?}");
+        assert_eq!(differ[0].1, 0x80, "bit 47 is byte 5's top bit");
+
+        for (label, proof, format) in [
+            ("Indexed under PerPoly", &a, &per_poly),
+            ("PerPoly under Indexed", &b, &indexed),
+        ] {
+            match traced(proof, format) {
+                Err(BlockRefusal::Proof(e)) => {
+                    println!("ONECHAIN B1-5 {base:?} {group_polys} {label}: refused with {e:?}");
+                    assert!(
+                        !matches!(
+                            e,
+                            multilinear::Error::QueryCountMismatch { .. }
+                                | multilinear::Error::GroupedShape(_)
+                                | multilinear::Error::ColumnOpeningRejected { .. }
+                        ),
+                        "{base:?} {group_polys} {label}: refused at an opening's shape or \
+                             chain, not by the statement: {e:?}"
+                    );
+                }
+                other => panic!("{base:?} {group_polys} {label}: {other:?}"),
+            }
+        }
+    }
+    println!("ONECHAIN B1-5 {argue:?} run widths seen: {seen:?}");
+    seen
+}
+
+/// The two modes' phase-A roots are one list (B2-sep). On a mismatch, names the
+/// first differing root's group, polynomial and tables, then fails: a
+/// difference is a design finding, not a test to adjust.
+fn assert_same_roots(elf: &[u8], a: &BlockWhirProof, b: &BlockWhirProof, format: &BlockFormat) {
+    let Some(first) = (0..a.proof.roots.len().max(b.proof.roots.len()))
+        .find(|&i| a.proof.roots.get(i) != b.proof.roots.get(i))
+    else {
+        return;
+    };
+    let opts = ProofOptions::default_test_options();
+    let frame = block_whir::block_frame(a.statement(), elf, &opts, format).expect("frame");
+    let mut at = first;
+    let mut g = 0;
+    while g < frame.stack_layouts.len() && at >= frame.stack_layouts[g].num_polys() {
+        at -= frame.stack_layouts[g].num_polys();
+        g += 1;
+    }
+    let tables: Vec<String> = a.groups.get(g).map_or_else(Vec::new, |group| {
+        group
+            .iter()
+            .map(|&t| format!("{t} {}", frame.airs.air_refs()[t as usize].name()))
+            .collect()
+    });
+    panic!(
+        "phase A's roots differ first at root {first} of {}: group {g}, polynomial {at} \
+         (tables {tables:?})",
+        a.proof.roots.len()
+    );
+}

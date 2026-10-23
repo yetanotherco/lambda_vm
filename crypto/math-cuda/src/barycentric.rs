@@ -197,6 +197,12 @@ pub fn barycentric_base_on_device(
 /// `compute_and_invert_denoms_ext3_dev`. `inv_offset_u64` is the start
 /// of this eval point's block (in u64s), so the kernel reads
 /// `inv_denoms_dev[inv_offset_u64 .. inv_offset_u64 + 3*n]`.
+///
+/// The sums run on the row-chunked multi kernel at one point
+/// ([`barycentric_base_chunked_with_dev_inv_denoms`], `num_cols × chunks`
+/// blocks); under `LAMBDA_VM_DEEP_INV_LEGACY=1` ([`crate::deep_inv`]) on one
+/// block per column ([`barycentric_base_one_block_with_dev_inv_denoms`]). The
+/// same sums, added in a different order.
 pub fn barycentric_base_on_device_with_dev_inv_denoms(
     stream: &Arc<CudaStream>,
     main_handle: &GpuLdeBase,
@@ -208,6 +214,41 @@ pub fn barycentric_base_on_device_with_dev_inv_denoms(
 ) -> Result<Vec<u64>> {
     #[cfg(feature = "test-faults")]
     crate::faults::check_sticky(&crate::faults::FAULT_BARYCENTRIC_STICKY)?;
+    if crate::deep_inv::rowwise_enabled() {
+        crate::deep_inv::count_chunked_ood_sum();
+        return barycentric_base_chunked_with_dev_inv_denoms(
+            stream,
+            main_handle,
+            row_stride,
+            coset_points_dev,
+            inv_denoms_dev,
+            inv_offset_u64,
+            n,
+        );
+    }
+    barycentric_base_one_block_with_dev_inv_denoms(
+        stream,
+        main_handle,
+        row_stride,
+        coset_points_dev,
+        inv_denoms_dev,
+        inv_offset_u64,
+        n,
+    )
+}
+
+/// [`barycentric_base_on_device_with_dev_inv_denoms`]'s legacy path: one
+/// block per column over all `n` rows. Public so the parity tests can run it
+/// beside the chunked kernel whatever the process setting says.
+pub fn barycentric_base_one_block_with_dev_inv_denoms(
+    stream: &Arc<CudaStream>,
+    main_handle: &GpuLdeBase,
+    row_stride: usize,
+    coset_points_dev: &CudaSlice<u64>,
+    inv_denoms_dev: &CudaSlice<u64>,
+    inv_offset_u64: usize,
+    n: usize,
+) -> Result<Vec<u64>> {
     main_handle.wait_ready_on(stream)?;
     assert!(coset_points_dev.len() >= n);
     let inv_end = inv_offset_u64
@@ -304,7 +345,9 @@ pub fn barycentric_ext3_on_device(
     Ok(out)
 }
 
-/// Ext3 counterpart of [`barycentric_base_on_device_with_dev_inv_denoms`].
+/// Ext3 counterpart of [`barycentric_base_on_device_with_dev_inv_denoms`], and
+/// the one the R3 composition-parts OOD calls: 1–2 columns, which one block per
+/// column would run as 1–2 blocks on the whole card.
 pub fn barycentric_ext3_on_device_with_dev_inv_denoms(
     stream: &Arc<CudaStream>,
     aux_handle: &GpuLdeExt3,
@@ -316,6 +359,39 @@ pub fn barycentric_ext3_on_device_with_dev_inv_denoms(
 ) -> Result<Vec<u64>> {
     #[cfg(feature = "test-faults")]
     crate::faults::check_sticky(&crate::faults::FAULT_BARYCENTRIC_STICKY)?;
+    if crate::deep_inv::rowwise_enabled() {
+        crate::deep_inv::count_chunked_ood_sum();
+        return barycentric_ext3_chunked_with_dev_inv_denoms(
+            stream,
+            aux_handle,
+            row_stride,
+            coset_points_dev,
+            inv_denoms_dev,
+            inv_offset_u64,
+            n,
+        );
+    }
+    barycentric_ext3_one_block_with_dev_inv_denoms(
+        stream,
+        aux_handle,
+        row_stride,
+        coset_points_dev,
+        inv_denoms_dev,
+        inv_offset_u64,
+        n,
+    )
+}
+
+/// Ext3 counterpart of [`barycentric_base_one_block_with_dev_inv_denoms`].
+pub fn barycentric_ext3_one_block_with_dev_inv_denoms(
+    stream: &Arc<CudaStream>,
+    aux_handle: &GpuLdeExt3,
+    row_stride: usize,
+    coset_points_dev: &CudaSlice<u64>,
+    inv_denoms_dev: &CudaSlice<u64>,
+    inv_offset_u64: usize,
+    n: usize,
+) -> Result<Vec<u64>> {
     aux_handle.wait_ready_on(stream)?;
     assert!(coset_points_dev.len() >= n);
     let inv_end = inv_offset_u64
@@ -358,6 +434,80 @@ pub fn barycentric_ext3_on_device_with_dev_inv_denoms(
     Ok(out)
 }
 
+/// [`barycentric_base_on_device_with_dev_inv_denoms`]'s sums from the
+/// row-chunked multi kernel at one point — `num_cols × chunks` blocks
+/// instead of `num_cols`. The same sums, added in a different order.
+pub fn barycentric_base_chunked_with_dev_inv_denoms(
+    stream: &Arc<CudaStream>,
+    main_handle: &GpuLdeBase,
+    row_stride: usize,
+    coset_points_dev: &CudaSlice<u64>,
+    inv_denoms_dev: &CudaSlice<u64>,
+    inv_offset_u64: usize,
+    n: usize,
+) -> Result<Vec<u64>> {
+    main_handle.wait_ready_on(stream)?;
+    assert!(coset_points_dev.len() >= n);
+    let inv_end = inv_offset_u64
+        .checked_add(3 * n)
+        .expect("barycentric inv_denoms range overflow");
+    assert!(inv_end <= inv_denoms_dev.len());
+    let num_cols = main_handle.m;
+    if num_cols == 0 || n == 0 {
+        return Ok(vec![0; 3 * num_cols]);
+    }
+    let be = backend()?;
+    launch_multi(
+        stream,
+        &be.barycentric_base_strided_multi,
+        main_handle.buf.as_ref(),
+        main_handle.lde_size,
+        num_cols,
+        row_stride,
+        &coset_points_dev.slice(0..n),
+        &inv_denoms_dev.slice(inv_offset_u64..inv_end),
+        n,
+        1,
+        bary_num_chunks_filled(num_cols, n),
+    )
+}
+
+/// Ext3 counterpart of [`barycentric_base_chunked_with_dev_inv_denoms`].
+pub fn barycentric_ext3_chunked_with_dev_inv_denoms(
+    stream: &Arc<CudaStream>,
+    aux_handle: &GpuLdeExt3,
+    row_stride: usize,
+    coset_points_dev: &CudaSlice<u64>,
+    inv_denoms_dev: &CudaSlice<u64>,
+    inv_offset_u64: usize,
+    n: usize,
+) -> Result<Vec<u64>> {
+    aux_handle.wait_ready_on(stream)?;
+    assert!(coset_points_dev.len() >= n);
+    let inv_end = inv_offset_u64
+        .checked_add(3 * n)
+        .expect("barycentric inv_denoms range overflow");
+    assert!(inv_end <= inv_denoms_dev.len());
+    let num_cols = aux_handle.m;
+    if num_cols == 0 || n == 0 {
+        return Ok(vec![0; 3 * num_cols]);
+    }
+    let be = backend()?;
+    launch_multi(
+        stream,
+        &be.barycentric_ext3_strided_multi,
+        aux_handle.buf.as_ref(),
+        aux_handle.lde_size,
+        num_cols,
+        row_stride,
+        &coset_points_dev.slice(0..n),
+        &inv_denoms_dev.slice(inv_offset_u64..inv_end),
+        n,
+        1,
+        bary_num_chunks_filled(num_cols, n),
+    )
+}
+
 include!(concat!(env!("OUT_DIR"), "/bary_consts.rs"));
 
 /// Row-chunk count for the multi kernels: enough `cols * chunks` blocks to
@@ -367,6 +517,93 @@ fn bary_num_chunks(num_cols: usize, n: usize) -> usize {
     let by_occupancy = (2048 / num_cols.max(1)).max(1);
     let by_rows = (n / 8192).max(1);
     by_occupancy.min(by_rows).min(64)
+}
+
+/// [`bary_num_chunks`] without its 64-chunk cap, which left a
+/// launch of a few columns at a fraction of a wave (4 × 64 blocks on 170
+/// multiprocessors). The occupancy and row floors are unchanged, so a chunk
+/// still covers at least 8192 rows; the combine pass folds at most 2048
+/// partials per column.
+fn bary_num_chunks_filled(num_cols: usize, n: usize) -> usize {
+    let by_occupancy = (2048 / num_cols.max(1)).max(1);
+    let by_rows = (n / 8192).max(1);
+    by_occupancy.min(by_rows)
+}
+
+/// The chunk count the multi kernels launch with: [`bary_num_chunks_filled`],
+/// or [`bary_num_chunks`] under `LAMBDA_VM_DEEP_INV_LEGACY=1`.
+fn multi_num_chunks(num_cols: usize, n: usize) -> usize {
+    if crate::deep_inv::rowwise_enabled() {
+        bary_num_chunks_filled(num_cols, n)
+    } else {
+        bary_num_chunks(num_cols, n)
+    }
+}
+
+/// One multi-point launch over `num_cols` resident columns plus the combine
+/// pass: the body of both `*_multi_on_device` functions, and of the chunked
+/// single-point path, which is this at `k_points = 1` over the point's slice
+/// of the inverse buffer.
+#[allow(clippy::too_many_arguments)]
+fn launch_multi(
+    stream: &Arc<CudaStream>,
+    kernel: &cudarc::driver::CudaFunction,
+    columns: &CudaSlice<u64>,
+    col_stride: usize,
+    num_cols: usize,
+    row_stride: usize,
+    points_view: &cudarc::driver::CudaView<'_, u64>,
+    inv_view: &cudarc::driver::CudaView<'_, u64>,
+    n: usize,
+    k_points: usize,
+    num_chunks: usize,
+) -> Result<Vec<u64>> {
+    let be = backend()?;
+    let total = k_points * num_cols;
+    let mut partials = stream.alloc_zeros::<u64>(total * num_chunks * 3)?;
+    let mut out_dev = stream.alloc_zeros::<u64>(3 * total)?;
+    let col_stride_u64 = col_stride as u64;
+    let row_stride_u64 = row_stride as u64;
+    let n_u64 = n as u64;
+    let k_u64 = k_points as u64;
+    let chunks_u64 = num_chunks as u64;
+    let total_u64 = total as u64;
+    let cfg = LaunchConfig {
+        grid_dim: (num_cols as u32, num_chunks as u32, 1),
+        block_dim: (BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(kernel)
+            .arg(columns)
+            .arg(&col_stride_u64)
+            .arg(&row_stride_u64)
+            .arg(points_view)
+            .arg(inv_view)
+            .arg(&n_u64)
+            .arg(&k_u64)
+            .arg(&chunks_u64)
+            .arg(&mut partials)
+            .launch(cfg)?;
+    }
+    let combine_cfg = LaunchConfig {
+        grid_dim: (total.div_ceil(BLOCK_DIM as usize) as u32, 1, 1),
+        block_dim: (BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.barycentric_combine_partials)
+            .arg(&partials)
+            .arg(&chunks_u64)
+            .arg(&total_u64)
+            .arg(&mut out_dev)
+            .launch(combine_cfg)?;
+    }
+    let out = stream.clone_dtoh(&out_dev)?;
+    stream.synchronize()?;
+    Ok(out)
 }
 
 /// Multi-eval-point counterpart of
@@ -394,55 +631,19 @@ pub fn barycentric_base_multi_on_device(
         return Ok(vec![0; 3 * k_points * num_cols]);
     }
     let be = backend()?;
-    let num_chunks = bary_num_chunks(num_cols, n);
-    let total = k_points * num_cols;
-    let mut partials = stream.alloc_zeros::<u64>(total * num_chunks * 3)?;
-    let mut out_dev = stream.alloc_zeros::<u64>(3 * total)?;
-    let points_view = coset_points_dev.slice(0..n);
-    let inv_view = inv_denoms_dev.slice(0..k_points * 3 * n);
-
-    let col_stride_u64 = main_handle.lde_size as u64;
-    let row_stride_u64 = row_stride as u64;
-    let n_u64 = n as u64;
-    let k_u64 = k_points as u64;
-    let chunks_u64 = num_chunks as u64;
-    let total_u64 = total as u64;
-    let cfg = LaunchConfig {
-        grid_dim: (num_cols as u32, num_chunks as u32, 1),
-        block_dim: (BLOCK_DIM, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    unsafe {
-        stream
-            .launch_builder(&be.barycentric_base_strided_multi)
-            .arg(main_handle.buf.as_ref())
-            .arg(&col_stride_u64)
-            .arg(&row_stride_u64)
-            .arg(&points_view)
-            .arg(&inv_view)
-            .arg(&n_u64)
-            .arg(&k_u64)
-            .arg(&chunks_u64)
-            .arg(&mut partials)
-            .launch(cfg)?;
-    }
-    let combine_cfg = LaunchConfig {
-        grid_dim: (total.div_ceil(BLOCK_DIM as usize) as u32, 1, 1),
-        block_dim: (BLOCK_DIM, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    unsafe {
-        stream
-            .launch_builder(&be.barycentric_combine_partials)
-            .arg(&partials)
-            .arg(&chunks_u64)
-            .arg(&total_u64)
-            .arg(&mut out_dev)
-            .launch(combine_cfg)?;
-    }
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
-    Ok(out)
+    launch_multi(
+        stream,
+        &be.barycentric_base_strided_multi,
+        main_handle.buf.as_ref(),
+        main_handle.lde_size,
+        num_cols,
+        row_stride,
+        &coset_points_dev.slice(0..n),
+        &inv_denoms_dev.slice(0..k_points * 3 * n),
+        n,
+        k_points,
+        multi_num_chunks(num_cols, n),
+    )
 }
 
 /// Ext3 counterpart of [`barycentric_base_multi_on_device`].
@@ -464,55 +665,19 @@ pub fn barycentric_ext3_multi_on_device(
         return Ok(vec![0; 3 * k_points * num_cols]);
     }
     let be = backend()?;
-    let num_chunks = bary_num_chunks(num_cols, n);
-    let total = k_points * num_cols;
-    let mut partials = stream.alloc_zeros::<u64>(total * num_chunks * 3)?;
-    let mut out_dev = stream.alloc_zeros::<u64>(3 * total)?;
-    let points_view = coset_points_dev.slice(0..n);
-    let inv_view = inv_denoms_dev.slice(0..k_points * 3 * n);
-
-    let col_stride_u64 = aux_handle.lde_size as u64;
-    let row_stride_u64 = row_stride as u64;
-    let n_u64 = n as u64;
-    let k_u64 = k_points as u64;
-    let chunks_u64 = num_chunks as u64;
-    let total_u64 = total as u64;
-    let cfg = LaunchConfig {
-        grid_dim: (num_cols as u32, num_chunks as u32, 1),
-        block_dim: (BLOCK_DIM, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    unsafe {
-        stream
-            .launch_builder(&be.barycentric_ext3_strided_multi)
-            .arg(aux_handle.buf.as_ref())
-            .arg(&col_stride_u64)
-            .arg(&row_stride_u64)
-            .arg(&points_view)
-            .arg(&inv_view)
-            .arg(&n_u64)
-            .arg(&k_u64)
-            .arg(&chunks_u64)
-            .arg(&mut partials)
-            .launch(cfg)?;
-    }
-    let combine_cfg = LaunchConfig {
-        grid_dim: (total.div_ceil(BLOCK_DIM as usize) as u32, 1, 1),
-        block_dim: (BLOCK_DIM, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    unsafe {
-        stream
-            .launch_builder(&be.barycentric_combine_partials)
-            .arg(&partials)
-            .arg(&chunks_u64)
-            .arg(&total_u64)
-            .arg(&mut out_dev)
-            .launch(combine_cfg)?;
-    }
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
-    Ok(out)
+    launch_multi(
+        stream,
+        &be.barycentric_ext3_strided_multi,
+        aux_handle.buf.as_ref(),
+        aux_handle.lde_size,
+        num_cols,
+        row_stride,
+        &coset_points_dev.slice(0..n),
+        &inv_denoms_dev.slice(0..k_points * 3 * n),
+        n,
+        k_points,
+        multi_num_chunks(num_cols, n),
+    )
 }
 
 /// Gather full rows from a device-resident base-field LDE handle. `rows` are LDE
@@ -597,7 +762,31 @@ pub fn gather_rows_ext3_on_device(
 
 #[cfg(test)]
 mod tests {
-    use super::bary_num_chunks;
+    use super::{bary_num_chunks, bary_num_chunks_filled};
+
+    /// The default count lifts the 64-chunk cap and nothing else: where the cap did
+    /// not bind the two agree, and at production shapes the filled count is the
+    /// occupancy or rows bound the cap hid.
+    #[test]
+    fn bary_num_chunks_filled_lifts_only_the_cap() {
+        for (cols, n) in [
+            (100, 1 << 14),
+            (256, 1 << 17),
+            (0, 0),
+            (usize::MAX, 1 << 20),
+            (1, 0),
+        ] {
+            assert_eq!(bary_num_chunks_filled(cols, n), bary_num_chunks(cols, n));
+        }
+        // The R3 parts OOD (1–2 columns at 2^22 rows): 64 → 512 blocks.
+        assert_eq!(bary_num_chunks(1, 1 << 22), 64);
+        assert_eq!(bary_num_chunks_filled(1, 1 << 22), 512);
+        assert_eq!(bary_num_chunks_filled(2, 1 << 22), 512);
+        // Occupancy-bound: 2048 / 5 columns.
+        assert_eq!(bary_num_chunks_filled(5, 1 << 22), 409);
+        // Rows-bound: 2^20 / 8192.
+        assert_eq!(bary_num_chunks_filled(4, 1 << 20), 128);
+    }
 
     /// Pins which of the three terms binds, per regime. Pure arithmetic — the
     /// kernels' parity across chunk counts is covered by

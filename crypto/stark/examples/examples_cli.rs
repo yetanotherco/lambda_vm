@@ -576,6 +576,7 @@ fn prove_multi_table_lookup() -> Result<Vec<u8>, String> {
         &mut DefaultTranscript::<Gl3>::new(&[]),
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
+        stark::residency_mode::ResidencyMode::Retain,
     )
     .map_err(|e| format!("prove failed: {e:?}"))?;
     ser(&multi_proof)

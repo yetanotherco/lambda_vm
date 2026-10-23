@@ -12,6 +12,11 @@ pub enum SyscallNumbers {
     KeccakPermute = 0,
     Print = 1,
     Panic = 2,
+    // Placeholder discriminant. The actual syscall value is BLAKE3_SYSCALL_NUMBER.
+    Blake3Compress = 3,
+    // Placeholder discriminant. The actual syscall value is
+    // BLAKE3_ABSORB_SYSCALL_NUMBER.
+    Blake3Absorb = 4,
     Commit = 64,
     Halt = 93,
     // Placeholder discriminant. The actual syscall value is ECSM_SYSCALL_NUMBER.
@@ -26,6 +31,113 @@ pub enum SyscallNumbers {
 /// Cannot be an enum discriminant because it exceeds isize::MAX.
 pub const KECCAK_SYSCALL_NUMBER: u64 = u64::MAX - 1;
 const KECCAK_STATE_BYTES: u64 = 25 * 8;
+
+/// Syscall number for the BLAKE3 6-round compression accelerator
+/// (u64::MAX - 2 = 0xFFFF_FFFF_FFFF_FFFD).
+///
+/// This is the **6-round internal variant** of the BLAKE3 compression function
+/// (`thoughts/blake3/blake3-chip/DESIGN.md`), intended for in-house Merkle /
+/// Fiat–Shamir use — it is NOT standard 7-round BLAKE3 and its security rests
+/// on the named 6-round assumption recorded in the design.
+///
+/// ABI: `x10` = 8-byte-aligned pointer to a 176-byte state region laid out as
+/// consecutive little-endian dwords at `addr + 8k`:
+///
+/// | dword k | contents                                   |
+/// |---------|--------------------------------------------|
+/// | 0..=3   | `h[0..8]` chaining value (2 u32 words/dword) |
+/// | 4..=11  | `m[0..16]` message block                     |
+/// | 12      | `t` counter (`t_lo = low u32 → v[12]`, `t_hi = high u32 → v[13]`) |
+/// | 13      | `block_len` (low u32) \| `flags` (high u32)  |
+/// | 14..=21 | `out[0..16]` — written by the syscall        |
+pub const BLAKE3_SYSCALL_NUMBER: u64 = u64::MAX - 2;
+/// Bytes of the BLAKE3 state region: 112 input + 64 output.
+const BLAKE3_STATE_BYTES: u64 = 22 * 8;
+/// Dword offset of `out[0..16]` inside the BLAKE3 state region.
+const BLAKE3_OUT_DWORDS: u64 = 14;
+
+/// Syscall number for the BLAKE3 6-round **chained absorb** accelerator
+/// (u64::MAX - 3 = 0xFFFF_FFFF_FFFF_FFFC).
+///
+/// Same 6-round internal compression as [`BLAKE3_SYSCALL_NUMBER`], but one ecall
+/// folds a run of `num_blocks` consecutive 64-byte message blocks into the
+/// chaining value instead of one. That is the whole point: a guest hashing a
+/// 1 KiB message pays one ecall and one marshaling round-trip rather than
+/// sixteen, and the prover receives one `Ecall` bus tuple per absorb rather than
+/// one per compression.
+///
+/// ABI:
+///
+/// | register | contents |
+/// |----------|----------|
+/// | `x10` | 8-byte-aligned pointer to the 64-byte control region |
+/// | `x11` | 8-byte-aligned pointer to `num_blocks * 64` message bytes |
+/// | `x12` | `num_blocks`, in `1..=`[`BLAKE3_ABSORB_MAX_BLOCKS`] |
+/// | `x13` | `first_flags`, the flag word of the run's FIRST block (`< 2^32`) |
+///
+/// Control region, as consecutive little-endian dwords at `ctrl + 8k`:
+///
+/// | dword k | contents |
+/// |---------|----------|
+/// | 0..=3   | `cv_in[0..8]` — the incoming chaining value (read) |
+/// | 4..=7   | `cv_out[0..8]` — the outgoing chaining value (written) |
+///
+/// `cv_in` and `cv_out` are disjoint on purpose: every memory access of one
+/// absorb happens at a single timestamp, and the chip reads `cv_in` and writes
+/// `cv_out` through SEPARATE `Memw` interactions (one gated on the group's first
+/// row, one on its last). Two separate interactions at one timestamp on one
+/// address are a pair the MEMW consistency argument cannot order, so the two
+/// halves have to be disjoint — and for the same reason the control and message
+/// regions must not overlap ([`ExecutionError::Blake3AbsorbRegionOverlap`]).
+///
+/// Note this is a consequence of the chip's interaction layout, NOT a blanket
+/// property of the machine: a single COMBINED read+write interaction on one
+/// address at one timestamp is fine, and is exactly what keccak does for its 25
+/// lanes and what the single-compression BLAKE3 mode does for its output region
+/// (the `old_out` columns). Stated broadly the rule would imply keccak is
+/// broken, which it is not.
+///
+/// The block schedule this applies — `t = 0`, `block_len = 64` on every block,
+/// `first_flags` on block 0 and `0` on every later block — is a SECOND statement
+/// of the flag framing that `crypto`'s `Blake3Chain` owns (this crate cannot
+/// call it: `executor` does not depend on `crypto/crypto`). It is therefore
+/// parity-gated against `Blake3Chain` over exhaustive message lengths rather
+/// than trusted; see [`blake3_absorb_chain_6round`].
+pub const BLAKE3_ABSORB_SYSCALL_NUMBER: u64 = u64::MAX - 3;
+/// Bytes of one BLAKE3 message block.
+pub const BLAKE3_BLOCK_BYTES: u64 = 64;
+/// Dwords in the absorb control region: 4 for `cv_in`, 4 for `cv_out`.
+pub const BLAKE3_ABSORB_CTRL_DWORDS: u64 = 8;
+/// Dword offset of `cv_out` inside the absorb control region.
+pub const BLAKE3_ABSORB_CV_OUT_DWORD: u64 = 4;
+/// Largest `num_blocks` one absorb ecall accepts — 1 024 blocks, 64 KiB of
+/// message.
+///
+/// A guest with more to hash calls again; the chain is stateless across calls
+/// because the chaining value travels through the control region.
+///
+/// Three things the cap has to do, in increasing order of how easy they are to
+/// get wrong:
+///
+/// 1. **Soundness.** The chip counts a group's rows down from `num_blocks` in a
+///    single field element, so the count must stay far below the modulus for
+///    "the group has exactly `num_blocks` rows" to follow from "the counter
+///    reaches 1".
+/// 2. **Address arithmetic.** `num_blocks * 64` must not wrap.
+/// 3. ★ **Trace height.** Every other accelerator is one CPU cycle to one chip
+///    row, so an epoch's table heights are implicitly bounded by its cycle
+///    budget — epochs split on cycles. This ecall is the first to break that
+///    ratio: it is ONE cycle and up to `BLAKE3_ABSORB_MAX_BLOCKS` BLAKE3 rows,
+///    and the BLAKE3 table has no entry in `prover::tables::max_rows` at all.
+///    At 3 219 columns a row is ~26 KiB of trace, so an unbounded absorb near
+///    an epoch boundary could demand a table height nothing sized for.
+///
+/// 1 024 is chosen for (3), and it is free: the guest cost of an absorb is flat
+/// in message length past ~4 blocks (measured 552 cycles at both 256 B and
+/// 1 KiB, 558 at 4 KiB), and real absorbs — verifier leaves, transcript
+/// segments — are KiB-class. So capping at 64 KiB costs nothing measurable and
+/// bounds one ecall's trace to ~26 MiB instead of ~1.7 GiB.
+pub const BLAKE3_ABSORB_MAX_BLOCKS: u64 = 1 << 10;
 
 /// Syscall number for the ECSM (elliptic-curve scalar multiply) accelerator.
 ///
@@ -87,6 +199,8 @@ impl TryFrom<u64> for SyscallNumbers {
             64 => Ok(SyscallNumbers::Commit),
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
+            v if v == BLAKE3_SYSCALL_NUMBER => Ok(SyscallNumbers::Blake3Compress),
+            v if v == BLAKE3_ABSORB_SYSCALL_NUMBER => Ok(SyscallNumbers::Blake3Absorb),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
             v if v == HINT_SYSCALL_NUMBER => Ok(SyscallNumbers::Hint),
             _ => Err(()),
@@ -98,6 +212,7 @@ impl TryFrom<u64> for SyscallNumbers {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Accelerator {
     Keccak,
+    Blake3,
     Ecsm,
 }
 
@@ -108,6 +223,11 @@ impl SyscallNumbers {
     pub fn accelerator(self) -> Option<Accelerator> {
         match self {
             SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
+            SyscallNumbers::Blake3Compress => Some(Accelerator::Blake3),
+            // Both BLAKE3 syscalls drive the same chip, so they count as one
+            // accelerator — a counter that split them would report "BLAKE3
+            // calls" that no longer track BLAKE3 rows.
+            SyscallNumbers::Blake3Absorb => Some(Accelerator::Blake3),
             SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
             SyscallNumbers::Print
             | SyscallNumbers::Panic
@@ -517,6 +637,141 @@ impl Instruction {
                         }
                         src2_val = state_addr;
                     }
+                    SyscallNumbers::Blake3Compress => {
+                        // BLAKE3 6-round compression on a 176-byte region at the
+                        // address in x10 (layout: see BLAKE3_SYSCALL_NUMBER docs).
+                        let state_addr = registers.read(10)?;
+                        if !state_addr.is_multiple_of(8) {
+                            return Err(ExecutionError::UnalignedBlake3StateAddress(state_addr));
+                        }
+                        state_addr
+                            .checked_add(BLAKE3_STATE_BYTES - 1)
+                            .ok_or(ExecutionError::Blake3StateAddressOverflow(state_addr))?;
+
+                        // Input: 14 dwords = h[8] | m[16] | t | (block_len, flags),
+                        // each dword two little-endian u32 words.
+                        let mut words = [0u32; 28];
+                        for k in 0..14 {
+                            let dw = memory.load_doubleword(state_addr + (k as u64) * 8)?;
+                            words[2 * k] = dw as u32;
+                            words[2 * k + 1] = (dw >> 32) as u32;
+                        }
+                        let h: [u32; 8] = words[0..8].try_into().unwrap();
+                        let m: [u32; 16] = words[8..24].try_into().unwrap();
+                        let t = (words[24] as u64) | ((words[25] as u64) << 32);
+                        let block_len = words[26];
+                        let flags = words[27];
+
+                        let out = blake3_compress_6round(&h, &m, t, block_len, flags);
+                        for k in 0..8 {
+                            let dw = (out[2 * k] as u64) | ((out[2 * k + 1] as u64) << 32);
+                            memory.store_doubleword(
+                                state_addr + (BLAKE3_OUT_DWORDS + k as u64) * 8,
+                                dw,
+                            )?;
+                        }
+                        src2_val = state_addr;
+                    }
+                    SyscallNumbers::Blake3Absorb => {
+                        // Chained absorb: fold `num_blocks` consecutive 64-byte
+                        // blocks into the chaining value in one ecall. Layout and
+                        // register roles: see BLAKE3_ABSORB_SYSCALL_NUMBER.
+                        let ctrl_addr = registers.read(10)?;
+                        let msg_addr = registers.read(11)?;
+                        let num_blocks = registers.read(12)?;
+                        let first_flags = registers.read(13)?;
+
+                        if !ctrl_addr.is_multiple_of(8) {
+                            return Err(ExecutionError::UnalignedBlake3AbsorbAddress(ctrl_addr));
+                        }
+                        if !msg_addr.is_multiple_of(8) {
+                            return Err(ExecutionError::UnalignedBlake3AbsorbAddress(msg_addr));
+                        }
+                        if num_blocks == 0 || num_blocks > BLAKE3_ABSORB_MAX_BLOCKS {
+                            return Err(ExecutionError::Blake3AbsorbBlockCountOutOfRange(
+                                num_blocks,
+                            ));
+                        }
+                        // The chip's flags column is one 32-bit word.
+                        if first_flags > u32::MAX as u64 {
+                            return Err(ExecutionError::Blake3AbsorbFlagsOutOfRange(first_flags));
+                        }
+
+                        let ctrl_bytes = BLAKE3_ABSORB_CTRL_DWORDS * 8;
+                        // Unreachable today — the cap above bounds this by
+                        // 2^16 · 64 = 4 MiB — and kept anyway, so that raising
+                        // BLAKE3_ABSORB_MAX_BLOCKS cannot silently turn a
+                        // multiply into a wrap. The tests reach the address
+                        // overflow below, not this arm.
+                        let msg_bytes = num_blocks
+                            .checked_mul(BLAKE3_BLOCK_BYTES)
+                            .ok_or(ExecutionError::Blake3AbsorbAddressOverflow(msg_addr))?;
+                        // The LAST addressable byte of each region, kept rather
+                        // than discarded: the overlap test below is written on
+                        // these, so it cannot overflow on a guest-chosen address.
+                        // (`end = addr + bytes` would: a region ending exactly at
+                        // 2^64 wraps to 0, which panics in a debug build and in
+                        // release silently reports "no overlap" for regions that
+                        // do overlap.)
+                        let ctrl_last = ctrl_addr
+                            .checked_add(ctrl_bytes - 1)
+                            .ok_or(ExecutionError::Blake3AbsorbAddressOverflow(ctrl_addr))?;
+                        let msg_last = msg_addr
+                            .checked_add(msg_bytes - 1)
+                            .ok_or(ExecutionError::Blake3AbsorbAddressOverflow(msg_addr))?;
+
+                        // Every access of one absorb carries the same timestamp,
+                        // so an address touched by both regions would be accessed
+                        // twice at that timestamp and the MEMW consistency
+                        // argument could not order the pair. Reject rather than
+                        // emit a trace the prover cannot close.
+                        if ctrl_addr <= msg_last && msg_addr <= ctrl_last {
+                            return Err(ExecutionError::Blake3AbsorbRegionOverlap);
+                        }
+
+                        // cv_in: dwords 0..4 of the control region.
+                        let mut cv = [0u32; 8];
+                        for k in 0..4u64 {
+                            let dw = memory.load_doubleword(ctrl_addr + k * 8)?;
+                            cv[2 * k as usize] = dw as u32;
+                            cv[2 * k as usize + 1] = (dw >> 32) as u32;
+                        }
+
+                        for i in 0..num_blocks {
+                            let block_addr = msg_addr + i * BLAKE3_BLOCK_BYTES;
+                            let mut m = [0u32; 16];
+                            for k in 0..8u64 {
+                                let dw = memory.load_doubleword(block_addr + k * 8)?;
+                                m[2 * k as usize] = dw as u32;
+                                m[2 * k as usize + 1] = (dw >> 32) as u32;
+                            }
+                            cv = blake3_absorb_step_6round(
+                                &cv,
+                                &m,
+                                if i == 0 { first_flags as u32 } else { 0 },
+                            );
+                        }
+
+                        // cv_out: dwords 4..8 of the control region.
+                        for k in 0..4u64 {
+                            let dw = (cv[2 * k as usize] as u64)
+                                | ((cv[2 * k as usize + 1] as u64) << 32);
+                            memory.store_doubleword(
+                                ctrl_addr + (BLAKE3_ABSORB_CV_OUT_DWORD + k) * 8,
+                                dw,
+                            )?;
+                        }
+
+                        // Logged for the CPU row the way the other accelerators
+                        // log theirs. Both are inert today: `EcallEbreak`'s
+                        // decode writes no register, and `CpuOperation::from_log`
+                        // reads `dst_val` only under the Commit classification.
+                        // They are here for the absorb classification the chip
+                        // will add, which — like ECSM and HINT — will recover
+                        // x10..x13 from the register state rather than the log.
+                        src2_val = ctrl_addr;
+                        dst_val = msg_addr;
+                    }
                     SyscallNumbers::Ecsm => {
                         // ECSM(-11): k×G on secp256k1.
                         // x10 = addr to write xR, x11 = addr of xG, x12 = addr of k.
@@ -762,6 +1017,20 @@ pub enum ExecutionError {
     UnalignedKeccakStateAddress(u64),
     #[error("Keccak state address range overflows: {0:#018x}")]
     KeccakStateAddressOverflow(u64),
+    #[error("Unaligned BLAKE3 state address: {0:#018x}")]
+    UnalignedBlake3StateAddress(u64),
+    #[error("BLAKE3 state address range overflows: {0:#018x}")]
+    Blake3StateAddressOverflow(u64),
+    #[error("Unaligned BLAKE3 absorb address: {0:#018x}")]
+    UnalignedBlake3AbsorbAddress(u64),
+    #[error("BLAKE3 absorb address range overflows: {0:#018x}")]
+    Blake3AbsorbAddressOverflow(u64),
+    #[error("BLAKE3 absorb block count out of range: {0}")]
+    Blake3AbsorbBlockCountOutOfRange(u64),
+    #[error("BLAKE3 absorb first_flags exceeds 32 bits: {0:#018x}")]
+    Blake3AbsorbFlagsOutOfRange(u64),
+    #[error("BLAKE3 absorb control and message regions overlap")]
+    Blake3AbsorbRegionOverlap,
     #[error("ECSM address range overflows the lower 32-bit limb")]
     EcsmAddressOverflow,
     #[error("ECSM xG and k operand ranges overlap")]
@@ -854,4 +1123,149 @@ pub fn keccak_f1600(state: &mut [u64; 25]) {
         // ι (iota)
         state[0] ^= rc;
     }
+}
+
+// =============================================================================
+// BLAKE3 6-round compression (internal variant)
+// =============================================================================
+//
+// A Rust port of the validated oracle `thoughts/blake3/blake3-oracle/blake3_ref.py`
+// with `rounds = 6` fixed. This is the **6-round internal variant** — NOT
+// standard BLAKE3 (7 rounds); its security rests on the named 6-round
+// assumption recorded in `thoughts/blake3/blake3-chip/DESIGN.md`. Differentially
+// tested against the oracle's canonical 6-round vectors (pinned in
+// `thoughts/blake3/blake3-oracle/canonical_6round_vectors.json`, themselves
+// validated against the official `blake3` crate).
+
+/// The BLAKE3 IV (identical to SHA-256's initial state). `IV[0..4]` seeds
+/// `v[8..12]` of the compression working state.
+pub const BLAKE3_IV: [u32; 8] = [
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+];
+
+/// The BLAKE3 message-schedule permutation, applied between rounds
+/// (`m'[i] = m[MSG_PERMUTATION[i]]`).
+pub const BLAKE3_MSG_PERMUTATION: [usize; 16] =
+    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
+
+/// Rounds of the internal variant. 6, per the design; standard BLAKE3 is 7.
+pub const BLAKE3_ROUNDS: usize = 6;
+
+/// The BLAKE3 quarter-round G (spec §2.1).
+#[inline]
+fn blake3_g(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
+    v[a] = v[a].wrapping_add(v[b]).wrapping_add(mx);
+    v[d] = (v[d] ^ v[a]).rotate_right(16);
+    v[c] = v[c].wrapping_add(v[d]);
+    v[b] = (v[b] ^ v[c]).rotate_right(12);
+    v[a] = v[a].wrapping_add(v[b]).wrapping_add(my);
+    v[d] = (v[d] ^ v[a]).rotate_right(8);
+    v[c] = v[c].wrapping_add(v[d]);
+    v[b] = (v[b] ^ v[c]).rotate_right(7);
+}
+
+/// The BLAKE3 compression function `f` at 6 rounds (spec §2.2, oracle §2.4).
+///
+/// State init: `v[0..8] = h`, `v[8..12] = IV[0..4]`, `v[12] = t as u32`,
+/// `v[13] = (t >> 32) as u32`, `v[14] = block_len`, `v[15] = flags`. Six
+/// rounds of 8 G-calls (4 columns then 4 diagonals), permuting the message
+/// schedule between rounds (`r < rounds - 1`, i.e. 5 permutes — the trailing
+/// permute is never consumed). Feed-forward: `out[i] = v[i] ^ v[i+8]`,
+/// `out[i+8] = v[i+8] ^ h[i]`. The truncated chaining value is `out[0..8]`.
+pub fn blake3_compress_6round(
+    h: &[u32; 8],
+    m: &[u32; 16],
+    t: u64,
+    block_len: u32,
+    flags: u32,
+) -> [u32; 16] {
+    let mut v: [u32; 16] = [
+        h[0],
+        h[1],
+        h[2],
+        h[3],
+        h[4],
+        h[5],
+        h[6],
+        h[7],
+        BLAKE3_IV[0],
+        BLAKE3_IV[1],
+        BLAKE3_IV[2],
+        BLAKE3_IV[3],
+        t as u32,
+        (t >> 32) as u32,
+        block_len,
+        flags,
+    ];
+
+    let mut m = *m;
+    for r in 0..BLAKE3_ROUNDS {
+        // Mix the columns.
+        blake3_g(&mut v, 0, 4, 8, 12, m[0], m[1]);
+        blake3_g(&mut v, 1, 5, 9, 13, m[2], m[3]);
+        blake3_g(&mut v, 2, 6, 10, 14, m[4], m[5]);
+        blake3_g(&mut v, 3, 7, 11, 15, m[6], m[7]);
+        // Mix the diagonals.
+        blake3_g(&mut v, 0, 5, 10, 15, m[8], m[9]);
+        blake3_g(&mut v, 1, 6, 11, 12, m[10], m[11]);
+        blake3_g(&mut v, 2, 7, 8, 13, m[12], m[13]);
+        blake3_g(&mut v, 3, 4, 9, 14, m[14], m[15]);
+        // Permute between rounds; the permute after the last round is never
+        // consumed (oracle: `r < rounds - 1`).
+        if r < BLAKE3_ROUNDS - 1 {
+            let prev = m;
+            for (i, &p) in BLAKE3_MSG_PERMUTATION.iter().enumerate() {
+                m[i] = prev[p];
+            }
+        }
+    }
+
+    let mut out = [0u32; 16];
+    for i in 0..8 {
+        out[i] = v[i] ^ v[i + 8];
+        out[i + 8] = v[i + 8] ^ h[i];
+    }
+    out
+}
+
+/// One block of a chained absorb: compress `m` into `cv` under the absorb
+/// schedule and return the truncated chaining value.
+///
+/// The schedule — `t = 0`, `block_len = 64` — is the absorb ABI's, applied to
+/// every block of a run. It is the interior shape of `crypto`'s `Blake3Chain`
+/// framing, restated here because `executor` does not depend on `crypto`;
+/// [`blake3_absorb_chain_6round`] is where that restatement is gated.
+pub fn blake3_absorb_step_6round(cv: &[u32; 8], m: &[u32; 16], flags: u32) -> [u32; 8] {
+    let out = blake3_compress_6round(cv, m, 0, BLAKE3_BLOCK_BYTES as u32, flags);
+    let mut next = [0u32; 8];
+    next.copy_from_slice(&out[..8]);
+    next
+}
+
+/// ★ The absorb ecall's semantics, as a pure function over whole blocks.
+///
+/// `first_flags` lands on block 0 and every later block carries `0`. The syscall
+/// handler is this loop reading its blocks out of VM memory, and the prover's
+/// trace builder is this loop again over one row per block — so this is the
+/// single object all three agree on, and the one a parity test can drive.
+///
+/// **This is a second framing and is treated as one.** `crypto`'s `Blake3Chain`
+/// owns the flag schedule (`block_flags`: `CHUNK_START` on the first block,
+/// `CHUNK_END | ROOT` and the true byte count on the last). This function
+/// restates the *interior* of that schedule — full blocks, no flags after the
+/// first — because `executor` cannot call `crypto`. What makes the restatement
+/// safe is not that it looks right: it is that a guest's `Blake3Chain` drives
+/// this for every block but its last, and the parity tests check the composite
+/// against `Blake3Chain` over exhaustive message lengths. A drift in either the
+/// flags or the `block_len` moves the digest and fails those tests.
+pub fn blake3_absorb_chain_6round(
+    cv_in: &[u32; 8],
+    blocks: &[[u32; 16]],
+    first_flags: u32,
+) -> [u32; 8] {
+    let mut cv = *cv_in;
+    for (i, m) in blocks.iter().enumerate() {
+        cv = blake3_absorb_step_6round(&cv, m, if i == 0 { first_flags } else { 0 });
+    }
+    cv
 }

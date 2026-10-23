@@ -37,6 +37,27 @@ pub fn verify_merkle_path_from_leaf_hash<B>(
 where
     B: IsMerkleTreeBackend,
 {
+    if B::ARITY == 4 {
+        // Three siblings per level, in child order around the node's own slot
+        // (`MerkleTree`'s arity-4 docs).
+        if !merkle_path.len().is_multiple_of(3) {
+            return false;
+        }
+        for siblings in merkle_path.chunks_exact(3) {
+            // The node's own slot, then its three siblings around it in order.
+            let at = index % 4;
+            let [s0, s1, s2] = [&siblings[0], &siblings[1], &siblings[2]].map(Clone::clone);
+            let children = match at {
+                0 => [hashed_value, s0, s1, s2],
+                1 => [s0, hashed_value, s1, s2],
+                2 => [s0, s1, hashed_value, s2],
+                _ => [s0, s1, s2, hashed_value],
+            };
+            hashed_value = B::hash_four(&children);
+            index /= 4;
+        }
+        return root_hash == &hashed_value;
+    }
     for sibling_node in merkle_path.iter() {
         if index.is_multiple_of(2) {
             hashed_value = B::hash_new_parent(&hashed_value, sibling_node);
