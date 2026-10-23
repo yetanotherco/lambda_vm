@@ -546,19 +546,22 @@ fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
-) -> (
-    MemwBuckets,
-    Vec<LoadOperation>,
-    Vec<LtOperation>,
-    Vec<ShiftOperation>,
-    Vec<BitwiseOperation>,
-    Vec<KeccakOperation>,
-    Vec<cpu32::Cpu32Operation>,
-    Vec<ecsm::EcsmOperation>,
-    Vec<ecdas::EcdasOperation>,
-    Vec<copy::CopyOperation>,
-    Vec<hint::HintOperation>,
-) {
+) -> Result<
+    (
+        MemwBuckets,
+        Vec<LoadOperation>,
+        Vec<LtOperation>,
+        Vec<ShiftOperation>,
+        Vec<BitwiseOperation>,
+        Vec<KeccakOperation>,
+        Vec<cpu32::Cpu32Operation>,
+        Vec<ecsm::EcsmOperation>,
+        Vec<ecdas::EcdasOperation>,
+        Vec<copy::CopyOperation>,
+        Vec<hint::HintOperation>,
+    ),
+    Error,
+> {
     let mut memw = MemwBuckets::with_register_capacity(cpu_ops.len() * 3);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
     let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
@@ -612,7 +615,7 @@ fn collect_ops_from_cpu(
                 index,
                 op.commit_count,
                 register_state,
-            ));
+            )?);
             let (write_memw, rows) = collect_copy_ops(
                 copy::Functionality::Write,
                 op.timestamp,
@@ -623,10 +626,15 @@ fn collect_ops_from_cpu(
             );
             memw.extend_ops(write_memw);
             copy_ops.extend(rows);
-            let count = u32::try_from(op.commit_count).expect("commit_count exceeds u32 range");
+            let count = u32::try_from(op.commit_count).map_err(|_| {
+                Error::Prover(format!(
+                    "commit_count {} exceeds u32 range",
+                    op.commit_count
+                ))
+            })?;
             current_commit_index = current_commit_index
                 .checked_add(count)
-                .expect("commit index exceeds u32 range");
+                .ok_or_else(|| Error::Prover("commit index exceeds u32 range".to_string()))?;
             debug_assert_eq!(
                 current_commit_index,
                 register_state.read_index().0,
@@ -688,7 +696,7 @@ fn collect_ops_from_cpu(
                 dst,
                 count,
                 register_state,
-            ));
+            )?);
             let (mm_memw, rows) = collect_copy_ops(
                 copy::Functionality::Copy,
                 op.timestamp,
@@ -720,7 +728,7 @@ fn collect_ops_from_cpu(
                 dst,
                 count,
                 register_state,
-            ));
+            )?);
             let (memset_memw, rows) = collect_copy_ops(
                 copy::Functionality::Set,
                 op.timestamp,
@@ -789,7 +797,7 @@ fn collect_ops_from_cpu(
         "COPY should move exactly the committed byte count"
     );
 
-    (
+    Ok((
         memw,
         load_ops,
         lt_ops,
@@ -801,7 +809,7 @@ fn collect_ops_from_cpu(
         ecdas_ops,
         copy_ops,
         hint_ops,
-    )
+    ))
 }
 
 /// Collects a LOAD operation and corresponding MEMW read from CpuOperation.
@@ -1054,7 +1062,7 @@ fn collect_copy_register_ops(
     dst: u64,
     count: u64,
     register_state: &mut RegisterState,
-) -> Vec<MemwOperation> {
+) -> Result<Vec<MemwOperation>, Error> {
     let is_write = functionality == copy::Functionality::Write;
     let mut ops = Vec::with_capacity(4);
 
@@ -1073,15 +1081,24 @@ fn collect_copy_register_ops(
     if is_write {
         // `dst` is the running commit index in x254, and `dst_res = dst + count`.
         let (old_index, old_ts) = register_state.read_index();
-        // Hard, not `debug_assert`: a mismatch here produces a trace that is merely
-        // unprovable, surfacing as an opaque Memw bus imbalance in a release build.
-        // Panicking names the cause instead.
-        assert_eq!(
-            u64::from(old_index),
-            dst,
-            "the commit index in x254 must be the `write` destination"
-        );
-        let new_index = u32::try_from(dst + count).expect("commit index exceeds u32 range");
+        // Checked in release, not `debug_assert`: a mismatch here produces a trace
+        // that is merely unprovable, surfacing as an opaque Memw bus imbalance. An
+        // error names the cause instead, and does it without taking the process
+        // down -- these are the prover's own invariants, and a caller proving one
+        // run should not lose the others to a panic.
+        if u64::from(old_index) != dst {
+            return Err(Error::Prover(format!(
+                "the commit index in x254 ({old_index}) must be the `write` \
+                 destination ({dst})"
+            )));
+        }
+        let new_index = u32::try_from(dst + count).map_err(|_| {
+            Error::Prover(format!(
+                "commit index {} exceeds u32 range; the COMMIT bus carries it in one \
+                 32-bit limb",
+                dst + count
+            ))
+        })?;
         ops.push(
             MemwOperation::new(
                 true,
@@ -1101,7 +1118,11 @@ fn collect_copy_register_ops(
         // x10 carries the file descriptor in and the byte count out. Only stdout is
         // supported, so the AIR pins the old value to 1.
         let (fd, fd_ts) = register_state.read(10);
-        assert_eq!(fd, 1, "ECALL write: x10 (fd) must be 1, got {fd}");
+        if fd != 1 {
+            return Err(Error::Prover(format!(
+                "ECALL write: x10 (fd) must be 1, got {fd}"
+            )));
+        }
         ops.push(
             MemwOperation::new(true, 2 * 10, pack_register_value(count), timestamp, 2, true)
                 .with_old(pack_register_value(1), [fd_ts, fd_ts, 0, 0, 0, 0, 0, 0]),
@@ -1112,7 +1133,7 @@ fn collect_copy_register_ops(
         ops.push(read_back(10, dst, register_state));
     }
 
-    ops
+    Ok(ops)
 }
 
 /// Replays one ecall through the unified copy primitive.
@@ -2386,7 +2407,7 @@ pub(crate) fn epoch_touched_cells<I: ImageSource>(
 
     let mut memory_state = MemoryState::from_image(initial_image);
     let mut register_state = RegisterState::from_init(register_init);
-    let _ = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+    let _ = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state)?;
 
     Ok(touched_cells_from_memory_state(&memory_state))
 }
@@ -3942,7 +3963,8 @@ fn build_traces<I: ImageSource + Sync>(
     let ecsms = ecsms_slot.expect(PHASE5_RAN)?;
     let ecdases = ecdases_slot.expect(PHASE5_RAN)?;
     let hints = hints_slot.expect(PHASE5_RAN)?;
-    let copy_trace = copy_slot.expect(PHASE5_RAN);
+    #[allow(unused_mut)]
+    let mut copy_trace = copy_slot.expect(PHASE5_RAN);
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
     // so spill them here before returning.
@@ -3964,6 +3986,12 @@ fn build_traces<I: ImageSource + Sync>(
             .main_table
             .spill_to_disk()
             .map_err(|e| Error::Prover(format!("disk-spill halt: {e}")))?;
+        // COPY joined this list when it became a fixed table: it carries one row per
+        // eight committed bytes, so it is not small on an output-heavy run.
+        copy_trace
+            .main_table
+            .spill_to_disk()
+            .map_err(|e| Error::Prover(format!("disk-spill copy: {e}")))?;
         for page in &mut pages {
             page.main_table
                 .spill_to_disk()
@@ -4196,7 +4224,7 @@ pub fn count_table_lengths(
                 dst,
                 count,
                 &mut register_state,
-            ) {
+            )? {
                 partition_memw(
                     &reg_op,
                     &mut memw_by_width,
@@ -5041,7 +5069,7 @@ impl Traces {
             ecdas_ops,
             hint_ops,
             copy_ops,
-        ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+        ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state)?;
         #[cfg(feature = "instruments")]
         drop(__sp);
 
@@ -5154,7 +5182,7 @@ impl Traces {
             ecdas_ops,
             hint_ops,
             copy_ops,
-        ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+        ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state)?;
 
         let ops = collect_all_ops(
             cpu_ops,
