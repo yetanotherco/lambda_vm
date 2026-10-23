@@ -311,11 +311,17 @@ fn prove_asm_with(name: &str, rewrite: impl FnOnce(&mut Traces)) -> bool {
         false,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        // The prover commits to its own REGISTER trace. These rewrites leave the
+        // final register file halted, so this is the root the verifier recomputes.
+        crate::test_utils::trace_register_commitment(
+            &options,
+            &crate::tables::register::register_init_from_entry_point(program.entry_point),
+            &traces,
+        ),
     );
     let runtime_page_ranges = traces.runtime_page_ranges();
     let num_private_input_pages = traces

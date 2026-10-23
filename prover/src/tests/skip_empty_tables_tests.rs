@@ -108,11 +108,15 @@ fn every_table_participates_in_the_bus() {
         true,
         &traces.page_configs,
         &table_counts,
+        &vec![4; table_counts.cpu],
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(
+            &ProofOptions::default_test_options(),
+            &elf,
+            &traces.public_output_bytes,
+        ),
     );
 
     let without_bus: Vec<&str> = airs
@@ -342,11 +346,16 @@ fn dropping_a_used_table_through_the_real_verifier_is_rejected() {
         false,
         &page_configs,
         &vm_proof.table_counts,
+        &crate::cpu_heights_from_proofs(
+            stark::proof::view::MultiProofView::Owned(&vm_proof.proof),
+            &vm_proof.table_counts,
+            true,
+        )
+        .unwrap(),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(&opts, &elf, &vm_proof.public_output),
     );
     let mul_at = airs
         .air_refs()

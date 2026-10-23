@@ -121,8 +121,7 @@ pub struct MemwOperation {
     /// Previous values at the addresses (filled by memory model). Same element
     /// domain as `value` (byte or 32-bit register half) → `[u32; 8]`.
     pub old: [u32; 8],
-    /// Previous timestamps at the addresses (filled by memory model). Timestamps
-    /// can reach u64::MAX (HALT), so these stay `[u64; 8]`.
+    /// Previous timestamps at the addresses (filled by memory model).
     pub old_timestamp: [u64; 8],
 }
 

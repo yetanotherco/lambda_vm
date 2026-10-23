@@ -105,7 +105,7 @@ fn stats(air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>, la
 fn dump_ir_stats() {
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
 
-    stats(&create_cpu_air(&opts), "CPU");
+    stats(&create_cpu_air(&opts, 0), "CPU");
     stats(&create_bitwise_air(&opts), "BITWISE");
     stats(&create_lt_air(&opts), "LT");
     stats(&create_shift_air(&opts), "SHIFT");
@@ -123,7 +123,7 @@ fn dump_ir_stats() {
     stats(&create_branch_air(&opts), "BRANCH");
     stats(&create_halt_air(&opts), "HALT");
     stats(&create_page_air(&opts, 0x1000), "PAGE");
-    stats(&create_register_air(&opts), "REGISTER");
+    stats(&create_register_air(&opts, 0), "REGISTER");
     stats(&create_keccak_air(&opts), "KECCAK");
     stats(&create_keccak_rnd_air(&opts), "KECCAK_RND");
     stats(&create_keccak_rc_air(&opts), "KECCAK_RC");

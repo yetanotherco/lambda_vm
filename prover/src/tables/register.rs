@@ -7,16 +7,23 @@
 //! ## Token Model
 //!
 //! - **REG-C1**: Receives initial token `(1, address, ts=1, init)` - balances MEMW's send on first access
-//! - **REG-C2**: Sends final token `(1, address, timestamp, fini)` - balances MEMW's receive on last access
+//! - **REG-C2**: Sends final token `(1, address, timestamp, fini)` - balances MEMW's receive on last access.
+//!   For the PC (x255) the timestamp is the verifier-known `final_pc_ts` instead
+//!   of the `timestamp` column (spec `halt.typ`).
 //!
 //! ## Columns
 //!
 //! | Column | Type | Description |
 //! |--------|------|-------------|
-//! | offset | RowIndex | Byte offset within register space |
-//! | init | Word | Initial value (0 for all registers at start) |
-//! | fini | Word | Final value after execution |
-//! | timestamp | DWordWL | Final timestamp (1 if never accessed) |
+//! | offset | RowIndex | Word address within register space (preprocessed) |
+//! | init | Word | Initial value (preprocessed) |
+//! | fini | Word | Final value (preprocessed) |
+//! | is_pc | Bit | 1 on the two x255 rows (preprocessed) |
+//! | timestamp | DWordWL | Final timestamp (1 if never accessed; unused on x255 rows) |
+//!
+//! OFFSET, INIT, FINI and IS_PC are preprocessed, so the verifier knows both register
+//! files. A monolithic proof (and the final continuation epoch) pins FINI to the
+//! halted state ([`halted_fini`]); a non-final epoch's FINI is the next epoch's INIT.
 
 use std::collections::HashMap;
 
@@ -51,20 +58,18 @@ pub const WORDS_PER_REGISTER: usize = 2;
 /// x0-x31 use addresses 0..63, x254 uses 508..509, x255 uses addresses 510..511.
 pub const NUM_REGISTER_ADDRESSES: usize = NUM_REGISTERS * WORDS_PER_REGISTER;
 
-/// Number of preprocessed columns (OFFSET, INIT) for the monolithic prover.
-/// OFFSET encodes the Word address, INIT holds the initial value.
-/// Program-dependent: x255 init = ELF entry point.
-pub const NUM_PREPROCESSED_COLS: usize = 2;
-
-/// Number of preprocessed columns (OFFSET, INIT, FINI) for continuation epochs.
-/// A continuation epoch additionally preprocesses FINI so the epoch's final
-/// register file becomes a verifier-known public value (`R_{i+1}`): the verifier
-/// recomputes the commitment from it, the REG-C2 Memory-bus token forces it to
-/// equal the true final registers, and the next epoch reuses the same `R_{i+1}`
-/// as its preprocessed INIT — binding `init(epoch i+1) == fini(epoch i)` with no
-/// extra bus. The monolithic prover keeps FINI as a main-trace column (it has no
-/// verifier-known final state), using `NUM_PREPROCESSED_COLS` instead.
-pub const NUM_PREPROCESSED_COLS_WITH_FINI: usize = 3;
+/// Number of preprocessed columns (OFFSET, INIT, FINI, IS_PC). OFFSET encodes the
+/// Word address, INIT the initial value and FINI the final one, so both register
+/// files are verifier-known public values: the verifier recomputes the commitment
+/// from them and the REG-C2 Memory-bus token forces FINI to equal the true final
+/// registers. IS_PC selects the x255 rows, whose final token REG-C2 sends at the
+/// verifier-known final PC timestamp.
+///
+/// A continuation epoch preprocesses FINI = `R_{i+1}` and the next epoch reuses it
+/// as its INIT, binding `init(epoch i+1) == fini(epoch i)` with no extra bus. A
+/// monolithic proof (and the final epoch) pins FINI to the halted state (see
+/// [`halted_fini`]).
+pub const NUM_PREPROCESSED_COLS: usize = 4;
 
 // =========================================================================
 // Column indices for REGISTER table
@@ -74,20 +79,23 @@ pub mod cols {
     /// offset: Row index / byte address within register space
     pub const OFFSET: usize = 0;
 
-    /// init: Initial byte value (0 for all registers)
+    /// init: Initial Word value (preprocessed)
     pub const INIT: usize = 1;
 
-    /// fini: Final byte value after execution
+    /// fini: Final Word value (preprocessed)
     pub const FINI: usize = 2;
 
+    /// is_pc: 1 on the x255 (PC) rows, 0 elsewhere (preprocessed)
+    pub const IS_PC: usize = 3;
+
     /// timestamp[0]: Final timestamp low word (1 if never accessed, matching REG-C1 init)
-    pub const TIMESTAMP_LO: usize = 3;
+    pub const TIMESTAMP_LO: usize = 4;
 
     /// timestamp[1]: Final timestamp high word
-    pub const TIMESTAMP_HI: usize = 4;
+    pub const TIMESTAMP_HI: usize = 5;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 5;
+    pub const NUM_COLUMNS: usize = 6;
 }
 
 // =========================================================================
@@ -172,6 +180,39 @@ pub(crate) fn register_init_from_entry_point(entry_point: u64) -> Vec<u32> {
         .collect()
 }
 
+/// The final register file of every run that halts, as the verifier knows it
+/// (`fini_from_trace` order): HALT zeroizes x1-x31 (x10 is read as 0), x0 is never
+/// written, x254 counts the committed bytes, and the PC ends on the padding value
+/// `pc = 1`.
+///
+/// Pinning FINI is what stops the PC chain from ending anywhere but `pc = 1`.
+/// HALT's `pc` column is free, so with a free FINI a prover could cancel HALT's
+/// consume/emit and keep executing past the exit ecall, ending the chain on the
+/// last post-exit `next_pc` (see `tests/halt_pc_forgery_poc.rs`).
+///
+/// The final PC timestamp is pinned too (REG-C2 consumes x255 at the
+/// verifier-known `final_pc_ts`, spec `halt.typ`), but the value alone already
+/// suffices: no real row writes `next_pc = 1` (instruction addresses are even
+/// and BRANCH clears the LSB), so a token with value 1 can only come from
+/// HALT's emit or a padding row after it.
+pub fn halted_fini(committed_bytes: u32) -> Vec<u32> {
+    let mut fini = vec![0u32; NUM_REGISTER_ADDRESSES];
+    fini[X254_INDEX] = committed_bytes;
+    fini[PC_LO_INDEX] = super::cpu::CPU_PADDING_PC as u32;
+    fini
+}
+
+/// REGISTER preprocessed commitment for a monolithic proof: OFFSET, INIT from the
+/// entry point, and FINI pinned to [`halted_fini`].
+pub fn halted_commitment(
+    options: &ProofOptions,
+    entry_point: u64,
+    committed_bytes: u32,
+) -> Commitment {
+    let init = register_init_from_entry_point(entry_point);
+    compute_precomputed_commitment(options, &init, &halted_fini(committed_bytes))
+}
+
 /// Build the register init map from an epoch's boundary register snapshot: the
 /// executor `Registers` (x1-x31, including SP) plus the program counter (x255).
 /// x0 and the synthetic commit index (x254) are zero in the naive version.
@@ -249,6 +290,7 @@ pub fn generate_register_trace(
         };
 
         table.set_word(row, cols::FINI, fini_value);
+        table.set_bool(row, cols::IS_PC, is_pc_address(word_addr));
         table.set_dword_wl(row, cols::TIMESTAMP_LO, timestamp);
     }
 
@@ -299,34 +341,15 @@ pub fn fini_from_final_state(final_state: &FinalRegisterStateMap, init: &[u32]) 
 // Preprocessed commitment
 // =========================================================================
 
-/// Computes the Merkle root commitment over the LDE of REGISTER precomputed columns.
-///
-/// Program-dependent: x255 (PC) init = entry_point.
-/// OFFSET encodes the Word address (0..63 for x0-x31, 508-509 for x254, 510-511 for x255).
-/// INIT holds the initial value (SP=STACK_TOP, PC=entry_point, rest=0).
-pub fn compute_precomputed_commitment(options: &ProofOptions, init: &[u32]) -> Commitment {
-    let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
-    let addr_list = register_word_address_list();
-
-    let mut offset_col = crate::tables::types::zeroed_fe_vec(num_rows);
-    let mut init_col = crate::tables::types::zeroed_fe_vec(num_rows);
-
-    for i in 0..NUM_REGISTER_ADDRESSES {
-        offset_col[i] = FE::from(addr_list[i]);
-        init_col[i] = FE::from(init.get(i).copied().unwrap_or(0) as u64);
-    }
-
-    commit_register_columns(options, vec![offset_col, init_col])
-}
-
-/// Continuation variant: commits OFFSET + INIT + FINI, so the verifier recomputes
-/// the commitment from the public `init` (`R_i`) and `fini` (`R_{i+1}`) and the
-/// proof's FINI column is locked to `R_{i+1}`. `fini` is the vector produced by
-/// `fini_from_trace` (entry `i` = the register at `register_word_address_list()[i]`).
-/// Used by continuation epochs with `NUM_PREPROCESSED_COLS_WITH_FINI`; must match
-/// the column order of the REGISTER trace (OFFSET, INIT, FINI), and FINI on padding
-/// rows is 0 (as the trace builds it).
-pub fn compute_precomputed_commitment_with_fini(
+/// Computes the Merkle root commitment over the LDE of the REGISTER preprocessed
+/// columns: OFFSET (the Word address: 0..63 for x0-x31, 508-509 for x254, 510-511 for
+/// x255), INIT, FINI and IS_PC, so the verifier recomputes it from the public `init`
+/// and `fini` and the proof's FINI column is locked to `fini`. `fini` is the vector
+/// produced by `fini_from_trace` (entry `i` = the register at
+/// `register_word_address_list()[i]`). Must match the column order of the REGISTER
+/// trace (OFFSET, INIT, FINI, IS_PC), and FINI and IS_PC on padding rows are 0 (as
+/// the trace builds them).
+pub fn compute_precomputed_commitment(
     options: &ProofOptions,
     init: &[u32],
     fini: &[u32],
@@ -338,19 +361,20 @@ pub fn compute_precomputed_commitment_with_fini(
     let mut offset_col = crate::tables::types::zeroed_fe_vec(num_rows);
     let mut init_col = crate::tables::types::zeroed_fe_vec(num_rows);
     let mut fini_col = crate::tables::types::zeroed_fe_vec(num_rows);
+    let mut is_pc_col = crate::tables::types::zeroed_fe_vec(num_rows);
 
     for i in 0..NUM_REGISTER_ADDRESSES {
         offset_col[i] = FE::from(addr_list[i]);
         init_col[i] = FE::from(init.get(i).copied().unwrap_or(0) as u64);
         fini_col[i] = FE::from(fini[i] as u64);
+        is_pc_col[i] = FE::from(u64::from(is_pc_address(addr_list[i])));
     }
 
-    commit_register_columns(options, vec![offset_col, init_col, fini_col])
+    commit_register_columns(options, vec![offset_col, init_col, fini_col, is_pc_col])
 }
 
 /// LDE + bit-reverse + Merkle-commit the given preprocessed columns (in column
-/// order). Shared by the monolithic (OFFSET, INIT) and continuation
-/// (OFFSET, INIT, FINI) preprocessed commitments.
+/// order).
 fn commit_register_columns(options: &ProofOptions, columns: Vec<Vec<FE>>) -> Commitment {
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
     let polys: Vec<Polynomial<FE>> = columns
@@ -376,13 +400,6 @@ fn commit_register_columns(options: &ProofOptions, columns: Vec<Vec<FE>>) -> Com
     root
 }
 
-/// Returns the preprocessed commitment for the REGISTER table.
-///
-/// Program-dependent (entry_point varies per ELF), so not globally cached.
-pub fn preprocessed_commitment(options: &ProofOptions, init: &[u32]) -> Commitment {
-    compute_precomputed_commitment(options, init)
-}
-
 // =========================================================================
 // Bus interactions
 // =========================================================================
@@ -392,10 +409,15 @@ pub fn preprocessed_commitment(options: &ProofOptions, init: &[u32]) -> Commitme
 /// ## Bus Interactions
 ///
 /// - REG-C1: memory[1, address, 1, init] - receiver, multiplicity -1
-/// - REG-C2: memory[1, address, timestamp, fini] - sender, multiplicity 1
+/// - REG-C2: memory[1, address, timestamp, fini] - sender, multiplicity `1 - is_pc`
+/// - REG-C2 (PC): memory[1, address, final_pc_ts, fini] - sender, multiplicity `is_pc`
+///
+/// `final_pc_ts` is where the last CPU row writes `next_pc`
+/// ([`super::cpu::final_pc_timestamp`]). The verifier derives it from the CPU
+/// table heights, so the PC chain's end is verifier-known (spec `halt.typ`).
 ///
 /// Note: is_register=1 (constant) to distinguish from memory (is_register=0).
-pub fn bus_interactions() -> Vec<BusInteraction> {
+pub fn bus_interactions(final_pc_ts: u64) -> Vec<BusInteraction> {
     // Address is just the offset in register space.
     // Stored in low word, high word is 0
     let address_lo = BusValue::Packed {
@@ -430,11 +452,29 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
             ],
         ),
+        // REG-C2 (PC): memory[1, address, final_pc_ts, fini] - send the final PC
+        // token at the verifier-known timestamp. Balances the last CPU row's
+        // inline-PC write.
+        BusInteraction::sender(
+            BusId::Memory,
+            Multiplicity::Column(cols::IS_PC),
+            vec![
+                BusValue::constant(1),
+                address_lo.clone(),
+                address_hi.clone(),
+                BusValue::constant(final_pc_ts),
+                BusValue::constant(0),
+                BusValue::Packed {
+                    start_column: cols::FINI,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
         // REG-C2: memory[1, address, timestamp, fini] - send final token
         // Balances MEMW's last receive on this address
         BusInteraction::sender(
             BusId::Memory,
-            Multiplicity::One,
+            Multiplicity::Negated(cols::IS_PC),
             vec![
                 // is_register = 1
                 BusValue::constant(1),
@@ -465,6 +505,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // =========================================================================
 // Helper functions
 // =========================================================================
+
+/// Whether `word_addr` is one of the two x255 (PC) Word addresses.
+fn is_pc_address(word_addr: u64) -> bool {
+    word_addr == 510 || word_addr == 511
+}
 
 /// Compute the base address for a register index.
 pub fn register_base_address(reg_idx: u8) -> u64 {

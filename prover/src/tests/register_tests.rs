@@ -83,8 +83,8 @@ fn test_generate_register_trace_with_access() {
 
 #[test]
 fn test_bus_interactions() {
-    let interactions = bus_interactions();
-    assert_eq!(interactions.len(), 2); // C1, C2
+    let interactions = bus_interactions(0);
+    assert_eq!(interactions.len(), 3); // C1, C2 (PC), C2
 }
 
 #[test]
@@ -111,7 +111,7 @@ fn test_fini_from_trace_reads_every_register() {
 }
 
 #[test]
-fn test_precomputed_commitment_with_fini_binds_fini() {
+fn test_precomputed_commitment_binds_fini() {
     let opts = ProofOptions::default_test_options();
     let init = register_init_from_entry_point(0x1000);
     // Fini vectors in register_word_address_list order (index = address for a < 64).
@@ -121,18 +121,15 @@ fn test_precomputed_commitment_with_fini_binds_fini() {
     let mut fini_b = fini_a.clone();
     fini_b[10] = 0x43; // a different final value at one address
 
-    let root_a = compute_precomputed_commitment_with_fini(&opts, &init, &fini_a);
-    let root_a2 = compute_precomputed_commitment_with_fini(&opts, &init, &fini_a);
-    let root_b = compute_precomputed_commitment_with_fini(&opts, &init, &fini_b);
+    let root_a = compute_precomputed_commitment(&opts, &init, &fini_a);
+    let root_a2 = compute_precomputed_commitment(&opts, &init, &fini_a);
+    let root_b = compute_precomputed_commitment(&opts, &init, &fini_b);
 
     // Deterministic, and sensitive to every fini value: a tampered R_{i+1} yields a
     // different preprocessed root, so a trace whose FINI != the committed R_{i+1}
     // fails the verifier's preprocessed-root check.
     assert_eq!(root_a, root_a2);
     assert_ne!(root_a, root_b);
-
-    // The 3-column (with-fini) commitment differs from the 2-column monolithic one.
-    assert_ne!(root_a, compute_precomputed_commitment(&opts, &init));
 }
 
 /// `fini_from_final_state` must return exactly what `fini_from_trace` reads off
@@ -172,5 +169,52 @@ fn fini_from_final_state_matches_trace() {
     assert_eq!(
         fini_from_final_state(&empty, &init),
         fini_from_trace(&trace)
+    );
+}
+
+/// IS_PC (preprocessed) marks exactly the two x255 rows.
+#[test]
+fn test_is_pc_marks_only_the_pc_rows() {
+    let trace = generate_register_trace(
+        &FinalRegisterStateMap::new(),
+        &register_init_from_entry_point(0x1000),
+    );
+    for row in 0..trace.num_rows() {
+        let offset = trace.main_table.get(row, cols::OFFSET).to_raw();
+        let is_pc = row < NUM_REGISTER_ADDRESSES && (offset == 510 || offset == 511);
+        assert_eq!(
+            *trace.main_table.get(row, cols::IS_PC),
+            FE::from(u64::from(is_pc)),
+            "row {row} (offset {offset})"
+        );
+    }
+}
+
+/// REG-C2 splits on IS_PC: x255 is finalized at the verifier's `final_pc_ts`,
+/// every other register at its TIMESTAMP column (spec `halt.typ`).
+#[test]
+fn test_pc_final_token_uses_verifier_timestamp() {
+    use stark::lookup::Multiplicity;
+    let final_pc_ts = 4 * 1024 + 1;
+    let interactions = bus_interactions(final_pc_ts);
+    let pc_fini = interactions
+        .iter()
+        .find(|i| matches!(i.multiplicity, Multiplicity::Column(c) if c == cols::IS_PC))
+        .expect("x255 final token");
+    assert!(pc_fini.is_sender);
+    assert!(
+        format!("{:?}", pc_fini.values[3]).contains(&format!("Constant({final_pc_ts})")),
+        "x255 final timestamp is the constant final_pc_ts: {:?}",
+        pc_fini.values[3]
+    );
+    let gp_fini = interactions
+        .iter()
+        .find(|i| matches!(i.multiplicity, Multiplicity::Negated(c) if c == cols::IS_PC))
+        .expect("general register final token");
+    assert!(
+        format!("{:?}", gp_fini.values[3])
+            .contains(&format!("start_column: {}", cols::TIMESTAMP_LO)),
+        "{:?}",
+        gp_fini.values[3]
     );
 }

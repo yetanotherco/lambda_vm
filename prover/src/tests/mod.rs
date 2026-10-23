@@ -37,6 +37,8 @@ pub mod cpu32_tests;
 #[cfg(test)]
 pub mod cpu_tests;
 #[cfg(test)]
+pub mod cpu_timestamp_tests;
+#[cfg(test)]
 pub mod decode_layout_tests;
 #[cfg(test)]
 pub mod decode_tests;
@@ -50,6 +52,8 @@ pub mod ecdas_tests;
 pub mod ecsm_tests;
 #[cfg(test)]
 pub mod eq_tests;
+#[cfg(test)]
+pub mod halt_pc_forgery_poc;
 #[cfg(test)]
 pub mod hint_tests;
 #[cfg(test)]
@@ -90,6 +94,8 @@ pub mod page_layout_tests;
 pub mod page_offset_forgery_poc;
 #[cfg(test)]
 pub mod page_tests;
+#[cfg(test)]
+pub mod pc_double_read_poc;
 #[cfg(test)]
 pub mod prove_elfs_tests;
 #[cfg(test)]

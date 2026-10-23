@@ -219,6 +219,35 @@ pub fn is_halfword_sender_columns(interactions: &[BusInteraction]) -> Vec<usize>
 }
 
 // =============================================================================
+// REGISTER Commitment Helpers
+// =============================================================================
+
+/// REGISTER commitment for a monolithic proof of `elf` that committed
+/// `public_output`: FINI pinned to the halted state, as the production prover and
+/// verifier build it.
+pub fn halted_register_commitment(
+    options: &ProofOptions,
+    elf: &Elf,
+    public_output: &[u8],
+) -> stark::config::Commitment {
+    let committed_bytes = u32::try_from(public_output.len()).expect("public output fits in u32");
+    crate::tables::register::halted_commitment(options, elf.entry_point, committed_bytes)
+}
+
+/// REGISTER commitment matching `traces`: INIT `init` and FINI as the REGISTER
+/// trace holds it. This is what a prover commits for its own trace (a non-final
+/// continuation epoch does it honestly; a forged run gets a root the halted
+/// verifier does not recompute).
+pub fn trace_register_commitment(
+    options: &ProofOptions,
+    init: &[u32],
+    traces: &crate::tables::trace_builder::Traces,
+) -> stark::config::Commitment {
+    let fini = crate::tables::register::fini_from_trace(&traces.register);
+    crate::tables::register::compute_precomputed_commitment(options, init, &fini)
+}
+
+// =============================================================================
 // ELF Execution Helpers
 // =============================================================================
 
@@ -657,9 +686,33 @@ fn build_air<CS: ConstraintSet<F, E> + Clone + Send + Sync + 'static>(
     constraint_set: CS,
     name: &str,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), CS> {
+    build_air_maybe_cached(
+        num_columns,
+        interactions,
+        proof_options,
+        step_size,
+        constraint_set,
+        name,
+        true,
+    )
+}
+
+/// [`build_air`], bypassing [`air_prototype_cache`] when `cache` is false. For
+/// AIRs whose name embeds a value derived from proof-declared heights, so a
+/// verifier fed many proofs cannot grow the never-evicted cache with one entry
+/// per distinct value.
+fn build_air_maybe_cached<CS: ConstraintSet<F, E> + Clone + Send + Sync + 'static>(
+    num_columns: usize,
+    interactions: Vec<BusInteraction>,
+    proof_options: &ProofOptions,
+    step_size: usize,
+    constraint_set: CS,
+    name: &str,
+    cache: bool,
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), CS> {
     type Proto<CS> = AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), CS>;
     let key = air_proto_key(name, proof_options);
-    {
+    if cache {
         let cache = air_prototype_cache().lock().unwrap();
         if let Some(proto) = cache.get(&key).and_then(|p| p.downcast_ref::<Proto<CS>>()) {
             return proto.clone();
@@ -679,22 +732,32 @@ fn build_air<CS: ConstraintSet<F, E> + Clone + Send + Sync + 'static>(
     // calls `constraint_program()`.
     #[cfg(not(target_arch = "riscv64"))]
     let _ = air.constraint_program();
-    air_prototype_cache()
-        .lock()
-        .unwrap()
-        .insert(key, Box::new(air.clone()));
+    if cache {
+        air_prototype_cache()
+            .lock()
+            .unwrap()
+            .insert(key, Box::new(air.clone()));
+    }
     air
 }
 
-/// Create CPU AIR with all constraints and bus interactions.
-pub fn create_cpu_air(proof_options: &ProofOptions) -> ConcreteVmAir<CpuConstraints> {
-    build_air(
+/// Create CPU AIR with all constraints and bus interactions, for a CPU table
+/// whose timestamps start at `ts_base` (see [`crate::tables::cpu::timestamp_bases`]).
+/// Not preprocessed: callers add the `TIMESTAMP` commitment with `with_preprocessed`.
+///
+/// Only the bases an honest prover produces (multiples of a full table,
+/// `4·max_rows::CPU`, at most 2^11 of them) are cached; any other base is built
+/// fresh, so proof-declared heights cannot grow the prototype cache.
+pub fn create_cpu_air(proof_options: &ProofOptions, ts_base: u64) -> ConcreteVmAir<CpuConstraints> {
+    let full_table = crate::tables::cpu::TIMESTAMP_STRIDE * crate::tables::max_rows::CPU as u64;
+    build_air_maybe_cached(
         cpu_cols::NUM_COLUMNS,
-        cpu_bus_interactions(),
+        cpu_bus_interactions(ts_base),
         proof_options,
         1,
         CpuConstraints,
-        "CPU",
+        &format!("CPU@{ts_base}"),
+        ts_base.is_multiple_of(full_table),
     )
 }
 
@@ -967,18 +1030,26 @@ pub fn create_page_air(
     )
 }
 
-/// Create REGISTER AIR with bus interactions.
+/// Create REGISTER AIR with bus interactions; the final PC token is consumed at
+/// `final_pc_ts` (see [`crate::tables::cpu::final_pc_timestamp`]).
 ///
 /// The REGISTER table provides initial and final tokens for register accesses
 /// on the Memory bus (is_register=1).
-pub fn create_register_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
-    build_air(
+///
+/// Never cached: `final_pc_ts` changes with every proof's CPU row count, and the
+/// table is small enough to build per proof.
+pub fn create_register_air(
+    proof_options: &ProofOptions,
+    final_pc_ts: u64,
+) -> ConcreteVmAir<EmptyConstraints> {
+    build_air_maybe_cached(
         register_cols::NUM_COLUMNS,
-        register_bus_interactions(),
+        register_bus_interactions(final_pc_ts),
         proof_options,
         1,
         EmptyConstraints,
-        "REGISTER",
+        &format!("REGISTER@{final_pc_ts}"),
+        false,
     )
 }
 

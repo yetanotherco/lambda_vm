@@ -118,19 +118,25 @@ pub(crate) fn weigh_the_bus_with(
     let _ = env_logger::builder().is_test(true).try_init();
     let proof_options = ProofOptions::default_test_options();
 
-    // Create all AIRs including PAGE and REGISTER tables
+    // Create all AIRs including PAGE and REGISTER tables. REGISTER FINI is read
+    // off the trace, not pinned to the halted state: a forgery that drops the
+    // committed output would otherwise also fail the REGISTER preprocessed root
+    // (x254 != output length), and the bus balance is what is being weighed here.
     let table_counts = traces.table_counts();
+    let register_init = crate::tables::register::register_init_from_entry_point(elf.entry_point);
+    let register_commitment =
+        crate::test_utils::trace_register_commitment(&proof_options, &register_init, traces);
     let airs = VmAirs::new(
         elf,
         &proof_options,
         minimal_bitwise,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(traces),
         None,
         true,
         None,
-        None,
-        None,
+        register_commitment,
     );
 
     // Build air_trace_pairs for all tables
@@ -218,11 +224,15 @@ fn prove_vm_minimal(elf_bytes: &[u8], private_inputs: &[u8], max_rows: &MaxRowsC
         true,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(
+            &proof_options,
+            &elf,
+            &traces.public_output_bytes,
+        ),
     );
     let runtime_page_ranges = traces.runtime_page_ranges();
     let proof = multi_prove_ram(
@@ -263,11 +273,20 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         true,
         &page_configs,
         &vm_proof.table_counts,
+        &crate::cpu_heights_from_proofs(
+            stark::proof::view::MultiProofView::Owned(&vm_proof.proof),
+            &vm_proof.table_counts,
+            true,
+        )
+        .unwrap(),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(
+            &proof_options,
+            &elf,
+            &vm_proof.public_output,
+        ),
     );
     let air_refs = airs.air_refs();
     let views: Vec<StarkProofView<F, E, ()>> = vm_proof
@@ -1754,11 +1773,12 @@ fn test_prove_commit_forged_index_rejected() {
 /// The high word of the commit index.
 ///
 /// `copy:c:read_dst` writes the full `DWordWL` of `dst_res` back to x254, but the
-/// `Commit` bus carries the index as `dst[0]` alone and the trace builder pins x254's
-/// high word to zero rather than a constraint doing it. That makes the high half the
-/// one place where the register file and the COMMIT bus could drift apart, so it is
-/// worth pinning that a forged high word is caught — by the REGISTER side, since
-/// nothing in COPY looks at it.
+/// `Commit` bus carries the index as `dst[0]` alone, which makes the high half the
+/// one place where the register file and the COMMIT bus could drift apart. The
+/// verifier pins x254's final high word to zero (`register::halted_fini`), but this
+/// harness commits the trace's own FINI, so what refuses the forged high word here
+/// is COPY's `copy:c:dst_res_is_write` (the `ADD`'s high carry is no longer a bit)
+/// and the MEMW bus, where the forged x254 update no longer matches the honest one.
 #[test]
 fn test_prove_commit_forged_index_high_word_rejected() {
     use crate::tables::copy::cols as mm_cols;
@@ -2339,11 +2359,15 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         true,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(
+            &proof_options,
+            &elf,
+            &traces.public_output_bytes,
+        ),
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -2360,11 +2384,15 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         true,
         &wrong_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(
+            &proof_options,
+            &elf,
+            &traces.public_output_bytes,
+        ),
     );
     let verifier_air_refs = verifier_airs.air_refs();
     let views: Vec<StarkProofView<F, E, ()>> =
@@ -3096,11 +3124,15 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         true,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(
+            &proof_options,
+            &elf,
+            &traces.public_output_bytes,
+        ),
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -3117,11 +3149,15 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         true,
         &verifier_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(
+            &proof_options,
+            &elf,
+            &traces.public_output_bytes,
+        ),
     );
     let verifier_air_refs = verifier_airs.air_refs();
     let views: Vec<StarkProofView<F, E, ()>> =
@@ -3173,11 +3209,15 @@ fn test_deep_stack_missing_pages_rejected() {
         true,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(
+            &proof_options,
+            &elf,
+            &traces.public_output_bytes,
+        ),
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -3193,11 +3233,15 @@ fn test_deep_stack_missing_pages_rejected() {
         true,
         &wrong_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(
+            &proof_options,
+            &elf,
+            &traces.public_output_bytes,
+        ),
     );
     let verifier_air_refs = verifier_airs.air_refs();
     let views: Vec<StarkProofView<F, E, ()>> =
@@ -3284,11 +3328,15 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         true,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(
+            &proof_options,
+            &elf,
+            &traces.public_output_bytes,
+        ),
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -3305,11 +3353,15 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         true,
         &verifier_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(
+            &proof_options,
+            &elf,
+            &traces.public_output_bytes,
+        ),
     );
     let verifier_air_refs = verifier_airs.air_refs();
     let views: Vec<StarkProofView<F, E, ()>> =
@@ -3498,11 +3550,11 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         true,
         &[],
         &zero_counts,
+        &[],
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(&proof_options, &elf, &[]),
     );
 
     let verifier_air_refs = airs.air_refs();
@@ -3987,11 +4039,11 @@ fn test_prove_first_epoch_without_halt() {
         true,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         false,
         None,
-        None,
-        None,
+        crate::test_utils::trace_register_commitment(&proof_options, &register_init, &traces),
     );
 
     let multi_proof = multi_prove_ram(
@@ -4076,11 +4128,11 @@ fn test_prove_second_epoch_from_snapshot() {
         true,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         false,
-        Some(&register_init),
         None,
-        None,
+        crate::test_utils::trace_register_commitment(&proof_options, &register_init, &traces),
     );
 
     let multi_proof = multi_prove_ram(
@@ -4172,11 +4224,11 @@ fn test_epoch_proof_commits_l2g() {
         true,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         false,
         None,
-        None,
-        None,
+        crate::test_utils::trace_register_commitment(&proof_options, &register_init, &traces),
     );
 
     // Inert L2G AIR: commits the trace columns, but no bus and no constraints.
@@ -4324,22 +4376,21 @@ fn test_continuation_pipeline_end_to_end() {
         .unwrap();
 
         let table_counts = traces.table_counts();
-        let register_init_arg = if i == 0 {
-            None
-        } else {
-            Some(register_inits[i].as_slice())
-        };
         let airs = VmAirs::new(
             &elf,
             &proof_options,
             true,
             &traces.page_configs,
             &table_counts,
+            &crate::cpu_heights_from_traces(&traces),
             None,
             is_final,
-            register_init_arg,
             None,
-            None,
+            crate::test_utils::trace_register_commitment(
+                &proof_options,
+                &register_inits[i],
+                &traces,
+            ),
         );
 
         let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundaries[i]);
@@ -4472,11 +4523,11 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
         true,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         false,
         None,
-        None,
-        None,
+        crate::test_utils::trace_register_commitment(&proof_options, &register_init, &traces),
     );
 
     // L2G air on the epoch-local Memory bus (the bookend that replaces PAGE).
