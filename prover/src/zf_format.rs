@@ -867,10 +867,7 @@ mod tests {
             err.contains("Poseidon1") && err.contains(ENV_WHIR_LEAVES),
             "{err}"
         );
-        assert_eq!(
-            natural.with_base(BaseFormat::RPX).check_leaves(),
-            Ok(())
-        );
+        assert_eq!(natural.with_base(BaseFormat::RPX).check_leaves(), Ok(()));
     }
 
     /// Every knob keeps its OFF spelling, and all of them at off are the
