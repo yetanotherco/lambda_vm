@@ -2575,6 +2575,11 @@ impl Traces {
 #[cfg(test)]
 mod head_tests;
 
+// The serial stage of a run walked a window per thread. Only its tests use it
+// until the parallel walk does.
+#[cfg_attr(not(test), allow(dead_code))]
+mod lean_pass;
+
 #[cfg(test)]
 mod regen_tests;
 
