@@ -823,9 +823,12 @@ fn the_p1_partition_keeps_every_chip_under_its_height() {
 
 /// ★ The heights hold on the median mix, as emitted: the plan's rows are the
 /// emitted ones ([`assert_planned`]: groups 0 (prepared, the carrier) and 1
-/// (heavy) alone, and a leaf of seven heavy groups — past the socket and the
-/// extension ALU, a leaf the partition never builds, its rows still the sum),
-/// and every leaf the plan builds stays under every chip's height.
+/// (heavy) alone, and a leaf of the heavy groups from 2 on, as many as take its
+/// planned rows past a height — a leaf the partition never builds, its rows
+/// still the sum), and every leaf the plan builds stays under every chip's
+/// height. One chain a polynomial reaches a height at seven heavy groups; one
+/// chain a run (the production opening) verifies fewer chains a group and
+/// takes more.
 #[test]
 fn the_p1_leaves_stay_under_their_heights_on_the_median_mix() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
@@ -852,8 +855,17 @@ fn the_p1_leaves_stay_under_their_heights_on_the_median_mix() {
             "leaf {leaf:?}"
         );
     }
-    // The rows are the emitted ones.
-    let lists = [vec![0usize], vec![1], (2..9).collect(), (9..n).collect()];
+    // The rows are the emitted ones. The third leaf: the heavy groups from 2
+    // on, up to the first whose planned rows pass a height.
+    let past = (3..n)
+        .find(|&end| !sums(&loads, &(2..end).collect::<Vec<_>>(), front).under(P1_LEAF_HEIGHTS))
+        .expect("the heavy groups from 2 on pass a height before the last group");
+    let lists = [
+        vec![0usize],
+        vec![1],
+        (2..past).collect(),
+        (past..n).collect(),
+    ];
     let probe = plan.with_partition(BlockPartition::new(lists.to_vec(), n).expect("covers once"));
     let mut target = None;
     for (k, list) in lists.iter().enumerate().take(3) {
@@ -866,10 +878,14 @@ fn the_p1_leaves_stay_under_their_heights_on_the_median_mix() {
             &mut target,
         );
         if k == 2 {
-            println!("P1 SEVEN HEAVY GROUPS: {emitted:?} against {P1_LEAF_HEIGHTS:?}");
+            println!(
+                "P1 HEAVY GROUPS PAST A HEIGHT: {} groups {emitted:?} against {P1_LEAF_HEIGHTS:?}",
+                list.len()
+            );
             assert!(
                 !emitted.under(P1_LEAF_HEIGHTS),
-                "seven heavy groups: {emitted:?}"
+                "{} heavy groups: {emitted:?}",
+                list.len()
             );
         }
     }
