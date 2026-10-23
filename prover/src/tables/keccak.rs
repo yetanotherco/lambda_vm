@@ -455,12 +455,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
-/// The KECCAK core table's 51 transition constraints as a single [`ConstraintSet`]:
+/// The KECCAK core table's 52 transition constraints as a single [`ConstraintSet`]:
 /// - idx 0-49: for `lane_idx ∈ 0..25`, the `ADD` carry pair (gated on `μ`)
 ///   enforcing `state_ptr[lane] = addr + 8·lane_idx` (`addr` DWordBL,
 ///   `state_ptr` DWordHL);
 /// - idx 50:   `μ · carry_1 = 0` (top-lane no-overflow), where `carry_1` is the
-///   high carry of `addr + 192 = state_ptr[24]`.
+///   high carry of `addr + 192 = state_ptr[24]`;
+/// - idx 51:   `μ · (1 − μ) = 0` (MuIsBit).
 #[derive(Clone, Copy)]
 pub struct KeccakConstraints;
 
@@ -507,5 +508,14 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
         let carry_1 = (addr_hi + carry_0 - ptr_hi) * inv_2_32;
         let mu = b.main(0, cols::MU);
         b.emit_base(50, mu * carry_1);
+
+        // idx 51: MuIsBit — μ·(1−μ). Every other constraint and bus send is
+        // weighted by μ, so μ ≠ 0 is indistinguishable from μ = 1 at the
+        // constraint level, while on the bus a μ = −1 row inverts a range check
+        // (carrier). KECCAK does not deduplicate (one row per hash, μ ∈ {0,1}),
+        // so the bit constraint is honest and forbids μ = −1.
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        b.emit_base(51, mu.clone() * (one - mu));
     }
 }

@@ -23,15 +23,16 @@
 //! ## Bus Interactions
 //! - Sender: MSB16 (×2 for lhs_msb, rhs_msb)
 //! - Sender: IS_HALFWORD (×6: ×4 for lhs_sub_rhs, ×1 for lhs[1], ×1 for rhs[1])
+//! - Sender: ARE_BYTES (×1 for the μ multiplicity bound)
 //! - Receiver: ALU (all less-than lookups — CPU SLT/BLT/BGE dispatch and the
 //!   internal `memw`/`memw_aligned`/`dvrm` timestamp / |r|<|d| checks)
 
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use std::collections::HashMap;
-
-use super::types::{BusId, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
+use super::types::{
+    BusId, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op, dedup_rows,
+};
 
 // =========================================================================
 // Column indices for LT table
@@ -154,18 +155,15 @@ impl LtOperation {
 
 /// Generates the LT trace table from a list of operations.
 ///
-/// Duplicate operations (same lhs, rhs, signed) are merged into a single row
-/// with their multiplicities summed. The table is then padded to the next power of 2.
+/// Duplicate operations (same lhs, rhs, signed, invert) are merged into a single
+/// row with their multiplicities summed, split at
+/// [`MU_MAX`](crate::tables::types::MU_MAX) (see
+/// [`dedup_rows`]). The table is then padded
+/// to the next power of 2.
 pub fn generate_lt_trace(
     operations: &[LtOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    // Deduplicate operations: (lhs, rhs, signed) -> multiplicity
-    let mut op_map: HashMap<LtOperation, u64> = HashMap::new();
-    for op in operations {
-        *op_map.entry(op.clone()).or_insert(0) += 1;
-    }
-
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let unique_ops = dedup_rows(operations);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
@@ -305,6 +303,24 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::RHS_1,
                 packing: Packing::Direct,
             }],
+        ),
+        // IS_BYTE[μ] = ARE_BYTES[μ, 0] | 1. Every lookup here fires with μ, so μ
+        // itself must be bounded and non-negative. Otherwise a μ = −1 twin of an
+        // honest row cancels it on the ALU bus while *receiving* its range
+        // lookups, with `sub_0` free up to 2^32: it absorbs an out-of-range
+        // IS_HALFWORD sent by any row, another LT row included (forged
+        // `5 < 3 = 1`). Multiplicity 1 (the spec's default `cond`), so padding
+        // rows send ARE_BYTES[0, 0] too. See `types::MU_MAX`.
+        BusInteraction::sender(
+            BusId::AreBytes,
+            Multiplicity::One,
+            vec![
+                BusValue::Packed {
+                    start_column: cols::MU,
+                    packing: Packing::Direct,
+                },
+                BusValue::constant(0),
+            ],
         ),
         // ALU[lhs, rhs, opsel(LT) + 32*signed + 64*invert] -> out  (receiver).
         // Every LT lookup arrives here: the CPU dispatches SLT/BLT/BGE on the

@@ -113,20 +113,14 @@ impl EqOperation {
 
 /// Generates the EQ trace from a list of operations.
 ///
-/// Duplicate operations are merged into a single row with summed multiplicities,
-/// then padded to the next power of two (minimum 4).
+/// One row per operation (no deduplication), each with `μ = 1`, then padded to
+/// the next power of two (minimum 4). Keeping `μ` a bit lets `MuIsBit`
+/// (`μ·(1−μ) = 0`) pin it: a free `μ = −1` would invert every bus send (a
+/// carrier), and a `μ = 2` would over-answer the ALU lookup.
 pub fn generate_eq_trace(
     operations: &[EqOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    use std::collections::HashMap;
-
-    let mut op_map: HashMap<EqOperation, u64> = HashMap::new();
-    for op in operations {
-        *op_map.entry(op.clone()).or_insert(0) += 1;
-    }
-
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
-    let num_rows = unique_ops.len().next_power_of_two().max(4);
+    let num_rows = operations.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
@@ -134,7 +128,7 @@ pub fn generate_eq_trace(
     );
     let table = &mut trace.main_table;
 
-    for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
+    for (row_idx, op) in operations.iter().enumerate() {
         // a, b as DWordWL (2 words each)
         table.set_dword_wl(row_idx, cols::A_0, op.a);
         table.set_dword_wl(row_idx, cols::B_0, op.b);
@@ -147,7 +141,7 @@ pub fn generate_eq_trace(
         table.set_dword_hl(row_idx, cols::DIFF_0, diff);
 
         table.set_bool(row_idx, cols::EQ, op.compute_eq());
-        table.set_u64(row_idx, cols::MU, *multiplicity);
+        table.set_u64(row_idx, cols::MU, 1);
     }
 
     trace
@@ -249,7 +243,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// The EQ table's transition constraints as a single [`ConstraintSet`]:
 /// - idx 0,1: `ADD` pair `b + diff = a` (unconditional);
 /// - idx 2:   `IS_BIT(invert)` (unconditional);
-/// - idx 3:   `res = eq XOR invert`.
+/// - idx 3:   `res = eq XOR invert`;
+/// - idx 4:   `IS_BIT(μ)` — μ is a bit (no dedup), so it cannot invert the bus.
 #[derive(Clone, Copy)]
 pub struct EqConstraints;
 
@@ -272,5 +267,9 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EqConstraints {
         let invert = b.main(0, cols::INVERT);
         let two = b.const_base(2);
         b.emit_base(3, res - (eq.clone() + invert.clone() - two * eq * invert));
+        // IS_BIT(μ): the table does not deduplicate, so μ ∈ {0, 1}. Without this a
+        // μ = −1 row would invert every bus send (carrier) and μ = 2 would
+        // over-answer the ALU lookup.
+        emit_is_bit(b, 4, cols::MU, None);
     }
 }

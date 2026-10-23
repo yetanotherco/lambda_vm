@@ -312,7 +312,8 @@ attack and why X blocks it.
 ### Design X
 
 `MU` gates **every** L2G interaction (matches the standard table pattern —
-LT/MUL/MEMW each gate all their interactions with one multiplicity column).
+LT/MUL/MEMW gate their lookups with their multiplicity columns or sums of them; the
+only constant-1 sends are the `ARE_BYTES` checks that bound LT's and MUL's own μ).
 
 The crucial consequence — which we first mistook for redundancy — is that gating
 the **Memory bus bookend** with `MU` forces `MU = 1` on every *touched* cell:
