@@ -3692,7 +3692,7 @@ fn test_prove_private_input_different_values() {
 
 /// End-to-end: EF zkVM IO interface — demo guest reads its private input via
 /// `read_input` and emits it back through TWO `write_output` calls. The
-/// running `x254` index of COPY's `write` rows concatenates them; the resulting proof's
+/// running `x254` index of COPY's commit rows concatenates them; the resulting proof's
 /// `public_output` must equal the original input.
 #[test]
 fn test_prove_ef_io_demo_concatenates() {

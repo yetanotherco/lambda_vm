@@ -311,7 +311,7 @@ pub enum BusId {
     Ecall = 19,
     // ID 20 is reserved for the removed CommitNextByte bus: COMMIT's per-byte
     // recursion moved to COPY, which chains over [`BusId::CopyNext`].
-    /// Commit output bus (sent by COPY's `write` rows): verifier computes the receiver contribution externally
+    /// Commit output bus (sent by COPY's commit rows): verifier computes the receiver contribution externally
     /// from `VmProof.public_output` using the shared LogUp challenges
     Commit = 21,
     /// Keccak core ↔ round chip: (timestamp, round, state[200 bytes])
