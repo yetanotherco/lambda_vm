@@ -87,6 +87,15 @@ inline unsigned long long atomicAdd(unsigned long long *p, unsigned long long v)
     return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST);
 }
 
+inline unsigned int atomicAdd(unsigned int *p, unsigned int v) {
+    return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST);
+}
+
+// A launch's last block learns it is last from a ticket the others took after a fence; on the
+// host every thread's stores are fenced the same way.
+inline void __threadfence() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+inline void __threadfence_system() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+
 inline unsigned long long atomicMin(unsigned long long *p, unsigned long long v) {
     unsigned long long old = __atomic_load_n(p, __ATOMIC_SEQ_CST);
     while (v < old &&
@@ -123,6 +132,7 @@ static inline uint64_t __brevll(uint64_t x) {
 // multiple of 32, as the warp kernels require.
 inline void simt_launch(unsigned grid, unsigned block, const std::function<void()> &kernel) {
     cuda_host_grid_dim.x = grid;
+    cuda_host_grid_dim.y = 1;
     cuda_host_block_dim.x = block;
     for (unsigned b = 0; b < grid; ++b) {
         std::vector<std::unique_ptr<SimtWarp>> warps;

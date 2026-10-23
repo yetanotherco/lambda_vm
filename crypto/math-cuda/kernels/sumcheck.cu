@@ -272,6 +272,69 @@ extern "C" __global__ void sum_partials_ext3(const uint64_t *__restrict__ d_part
     }
 }
 
+// A round's sums without the second launch (`LAMBDA_VM_ARGUE_ROUND_SLOT`): every block of a `_slot`
+// kernel calls this once its partials are written (`rows × gridDim.x` of them, row `r`'s at
+// `(r·gridDim.x + b)·3`). The last block to finish — the ticket says which — sums each row's
+// partials in `sum_partials_ext3`'s order exactly (256 lanes, lane `v` adding partials `v, v + 256,
+// …` from zero, then the halving tree), so the sums are the limbs today's second launch writes;
+// then it puts them in `d_slot[0 .. 3·rows)`, resets the ticket for the next launch, and writes
+// `seq` to `d_slot[96]` last, behind a system fence: a host that reads `seq` there finds the sums
+// before it.
+//
+// `d_slot` is pinned host memory mapped into the card (`crate::device::MappedSlot`). The shared
+// buffer needs `max(blockDim.x, 256)·3 + 1` u64.
+__device__ void slot_sums(const uint64_t *d_partials, uint32_t rows, unsigned int *d_ticket,
+                          uint64_t *d_slot, uint64_t seq) {
+    extern __shared__ uint64_t shared[];
+    const uint32_t lanes = 256;
+    uint64_t *last = shared + 3 * (blockDim.x > lanes ? blockDim.x : lanes);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        // This block's partials, out before its ticket.
+        __threadfence();
+        unsigned int ticket = atomicAdd(d_ticket, 1u);
+        *last = ticket == gridDim.x * gridDim.y - 1;
+    }
+    __syncthreads();
+    if (!*last) return;
+    // Every other block's partials, seen after its ticket.
+    __threadfence();
+    const uint64_t blocks = gridDim.x;
+    for (uint32_t row = 0; row < rows; row++) {
+        const volatile uint64_t *base = d_partials + (uint64_t)row * blocks * 3;
+        for (uint32_t v = threadIdx.x; v < lanes; v += blockDim.x) {
+            Fe3 acc = ext3::make(0, 0, 0);
+            for (uint64_t i = v; i < blocks; i += lanes) {
+                acc = ext3::add(acc, ext3::make(base[i * 3], base[i * 3 + 1], base[i * 3 + 2]));
+            }
+            shared[v * 3 + 0] = acc.a;
+            shared[v * 3 + 1] = acc.b;
+            shared[v * 3 + 2] = acc.c;
+        }
+        __syncthreads();
+        for (uint32_t width = lanes / 2; width > 0; width >>= 1) {
+            for (uint32_t v = threadIdx.x; v < width; v += blockDim.x) {
+                Fe3 sum = ext3::add(load_ext(shared + v * 3), load_ext(shared + (v + width) * 3));
+                shared[v * 3 + 0] = sum.a;
+                shared[v * 3 + 1] = sum.b;
+                shared[v * 3 + 2] = sum.c;
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            d_slot[row * 3 + 0] = shared[0];
+            d_slot[row * 3 + 1] = shared[1];
+            d_slot[row * 3 + 2] = shared[2];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        *d_ticket = 0;
+        __threadfence_system();
+        *(volatile uint64_t *)(d_slot + 96) = seq;
+    }
+}
+
 // The program's value at every row, written out rather than summed: the LogUp
 // input layer is one of these per interaction per side.
 //
@@ -1068,20 +1131,21 @@ __device__ __forceinline__ Fe3 gkr_cell(const uint64_t *f, int k, uint64_t i, ui
 // `gkr_round_gruen_real` is the same round over a layer kept without its padding (see `gkr_cell`):
 // `stored` is the run of the upper halves' cells held before this round's fold. A cell past it is
 // read as the padding and a folded cell past it is not written — it is the padding again.
-template <bool REAL>
+template <bool REAL, bool SLOT>
 __device__ __forceinline__ void gkr_round_gruen_body(
     uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t half, uint64_t quarter,
     uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1, uint64_t l2,
     const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
-    uint32_t want_h0, uint64_t stored, uint64_t *__restrict__ d_partials);
+    uint32_t want_h0, uint64_t stored, uint64_t *__restrict__ d_partials, unsigned int *d_ticket,
+    uint64_t *d_slot, uint64_t seq);
 
 extern "C" __global__ __launch_bounds__(256) void gkr_round_gruen(
     uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t half, uint64_t quarter,
     uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1, uint64_t l2,
     const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
     uint32_t want_h0, uint64_t *__restrict__ d_partials) {
-    gkr_round_gruen_body<false>(p, q, half, quarter, fold, s0, s1, s2, l0, l1, l2, e_hi, e_lo,
-                                low, want_h0, 0, d_partials);
+    gkr_round_gruen_body<false, false>(p, q, half, quarter, fold, s0, s1, s2, l0, l1, l2, e_hi,
+                                       e_lo, low, want_h0, 0, d_partials, nullptr, nullptr, 0);
 }
 
 extern "C" __global__ __launch_bounds__(256) void gkr_round_gruen_real(
@@ -1089,16 +1153,38 @@ extern "C" __global__ __launch_bounds__(256) void gkr_round_gruen_real(
     uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1, uint64_t l2,
     const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
     uint32_t want_h0, uint64_t stored, uint64_t *__restrict__ d_partials) {
-    gkr_round_gruen_body<true>(p, q, half, quarter, fold, s0, s1, s2, l0, l1, l2, e_hi, e_lo, low,
-                               want_h0, stored, d_partials);
+    gkr_round_gruen_body<true, false>(p, q, half, quarter, fold, s0, s1, s2, l0, l1, l2, e_hi,
+                                      e_lo, low, want_h0, stored, d_partials, nullptr, nullptr, 0);
 }
 
-template <bool REAL>
+// The two rounds again with their sums through a slot (`slot_sums`): no second launch.
+extern "C" __global__ __launch_bounds__(256) void gkr_round_gruen_slot(
+    uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t half, uint64_t quarter,
+    uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1, uint64_t l2,
+    const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
+    uint32_t want_h0, uint64_t *__restrict__ d_partials, unsigned int *d_ticket, uint64_t *d_slot,
+    uint64_t seq) {
+    gkr_round_gruen_body<false, true>(p, q, half, quarter, fold, s0, s1, s2, l0, l1, l2, e_hi,
+                                      e_lo, low, want_h0, 0, d_partials, d_ticket, d_slot, seq);
+}
+
+extern "C" __global__ __launch_bounds__(256) void gkr_round_gruen_real_slot(
+    uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t half, uint64_t quarter,
+    uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1, uint64_t l2,
+    const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
+    uint32_t want_h0, uint64_t stored, uint64_t *__restrict__ d_partials, unsigned int *d_ticket,
+    uint64_t *d_slot, uint64_t seq) {
+    gkr_round_gruen_body<true, true>(p, q, half, quarter, fold, s0, s1, s2, l0, l1, l2, e_hi, e_lo,
+                                     low, want_h0, stored, d_partials, d_ticket, d_slot, seq);
+}
+
+template <bool REAL, bool SLOT>
 __device__ __forceinline__ void gkr_round_gruen_body(
     uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t half, uint64_t quarter,
     uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1, uint64_t l2,
     const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
-    uint32_t want_h0, uint64_t stored, uint64_t *__restrict__ d_partials) {
+    uint32_t want_h0, uint64_t stored, uint64_t *__restrict__ d_partials, unsigned int *d_ticket,
+    uint64_t *d_slot, uint64_t seq) {
     Fe3 s = ext3::make(s0, s1, s2);
     Fe3 lambda = ext3::make(l0, l1, l2);
     uint64_t *factors[4] = {p, p + half * 3, q, q + half * 3};
@@ -1171,6 +1257,7 @@ __device__ __forceinline__ void gkr_round_gruen_body(
         }
         __syncthreads();
     }
+    if (SLOT) slot_sums(d_partials, rows, d_ticket, d_slot, seq);
 }
 
 // The rounds' end: each half bound to the last challenge `s` (with `fold`) from its `2·cells` cube
