@@ -1443,6 +1443,11 @@ pub struct BlockStamps {
     /// A streamed build's `BLOCK GROUP QUEUE` line ([`group_queue::line`],
     /// printed as phase A ends, not in [`Self::report`]).
     pub group_queue: Option<String>,
+    /// A streamed prove's phase B in unix seconds, (start, end), and the order
+    /// it took the groups in: what a sampler's samples and another thread's
+    /// stamps are placed against. Empty without a streamed prove.
+    pub phase_b_unix: Option<(f64, f64)>,
+    pub phase_b_order: Vec<usize>,
 }
 
 /// A streamed build's layout, for the readout ([`BlockStamps::layout`]).
@@ -1797,6 +1802,21 @@ impl BlockStamps {
             self.host_widens.0,
             self.host_widens.1 as f64 / 1e9,
         ));
+        if let Some((start, end)) = self.phase_b_unix {
+            let spans: Vec<String> = self
+                .phase_b_order
+                .iter()
+                .filter_map(|&g| {
+                    self.groups
+                        .get(g)
+                        .map(|s| format!("{g}@{:.3}-{:.3}", s.start_b, s.end_b))
+                })
+                .collect();
+            out.push_str(&format!(
+                "BLOCK PHASE-B SPAN: unix {start:.3} to {end:.3} · groups in phase B's order (group@start-end, seconds into phase B): {}\n",
+                spans.join(" ")
+            ));
+        }
         out.push_str(&format!(
             "BLOCK PHASES: execute {:.2} · build {:.2} · prep {:.2} · A {:.2} (wait {:.2} upload {:.2} paid {:.2} commit {:.2} retire {:.2}) · B {:.2} (argue {:.2} open {:.2} tax {:.2} = upload {:.2} + encode {:.2})\n",
             self.execute,
@@ -3095,6 +3115,11 @@ pub(crate) fn prove_traces(
             Some(f) => f,
             None => &identity,
         };
+        if probe_first_groups()?.is_some() {
+            return Err(Error::Prover(
+                "W3_PROBE_FIRST_GROUPS orders a streamed prove's phase B only".into(),
+            ));
+        }
         let (proof, argues, prepared_openings, groups) =
             multilinear_block::block_prove_on_forks::<_, _, _, H>(
                 block,
@@ -5476,6 +5501,18 @@ fn prove_streamed(
             Some(order) => order(laid.groups.len()),
             None => led_order(&classes, &group_cells, regen_lead),
         };
+        // `W3_PROBE_FIRST_GROUPS`, a measurement's: these groups first.
+        let order = match probe_first_groups()? {
+            None => order,
+            Some(_) if classes.iter().any(Option::is_some) => {
+                return Err(Error::Prover(
+                    "W3_PROBE_FIRST_GROUPS: a group is rebuilt in phase B, whose classes go in \
+                     group order"
+                        .into(),
+                ));
+            }
+            Some(first) => put_first(&first, order).map_err(Error::Prover)?,
+        };
         // Each class's regenerator deposits in its rank order, its groups'
         // order: an order that takes a class's groups otherwise could wait on a
         // deposit its window does not admit yet, so it is refused rather than
@@ -5495,6 +5532,8 @@ fn prove_streamed(
         // Phase B starts: an early start's windows go to their phase-B sizes.
         early_gate.store(true, std::sync::atomic::Ordering::Release);
         let phase_b_start = Instant::now();
+        let phase_b_unix = stark::prove_split::epoch_secs();
+        stamps.phase_b_order = order.clone();
         let (proof, argues, prepared_openings, groups) =
             multilinear_block::block_prove_in_order::<_, _, _, H>(
                 block,
@@ -5509,6 +5548,7 @@ fn prove_streamed(
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
+        stamps.phase_b_unix = Some((phase_b_unix, stark::prove_split::epoch_secs()));
         if let Some((drops, window_of, run, rest_window, rest_run)) = live {
             let recipes = recorder.map_or(0, |r| r.recipes().0.len());
             let mut lines = vec![regen::dropped_line(regen_mode, no_disk, &drops, recipes)];
@@ -6679,6 +6719,49 @@ mod spill_policy_tests {
     }
 }
 
+/// `W3_PROBE_FIRST_GROUPS=g,g,…`, a measurement knob unset in production:
+/// phase B takes these groups first, in this order, then the others in its own.
+/// Every order proves the same bytes ([`multilinear_block::block_prove_in_order`]).
+/// A word that is not a list of group indices is an error.
+fn probe_first_groups() -> Result<Option<Vec<usize>>, Error> {
+    let Ok(value) = std::env::var("W3_PROBE_FIRST_GROUPS") else {
+        return Ok(None);
+    };
+    value
+        .split(',')
+        .map(|g| g.trim().parse::<usize>())
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+        .map_err(|_| {
+            Error::Prover(format!(
+                "W3_PROBE_FIRST_GROUPS={value}: group indices, comma-separated"
+            ))
+        })
+}
+
+/// `first`, then the rest of `order` in its order. Refuses a group `order`
+/// does not hold or one named twice, so the result is a permutation of `order`.
+fn put_first(first: &[usize], order: Vec<usize>) -> Result<Vec<usize>, String> {
+    let mut taken = vec![false; order.len()];
+    for &g in first {
+        match taken.get_mut(g) {
+            None => {
+                return Err(format!(
+                    "W3_PROBE_FIRST_GROUPS: no group {g} of {}",
+                    order.len()
+                ));
+            }
+            Some(t) if *t => return Err(format!("W3_PROBE_FIRST_GROUPS: group {g} named twice")),
+            Some(t) => *t = true,
+        }
+    }
+    Ok(first
+        .iter()
+        .copied()
+        .chain(order.into_iter().filter(|&g| !taken[g]))
+        .collect())
+}
+
 /// Phase B's order when live regeneration rebuilds tables: the groups it
 /// rebuilds nothing of first, then the first `lead` groups of the streamed
 /// chunks' class (class 0), then the others of both classes interleaved by
@@ -6722,7 +6805,21 @@ fn led_order(classes: &[Option<usize>], cells: &[u64], lead: usize) -> Vec<usize
 
 #[cfg(test)]
 mod led_order_tests {
-    use super::{led_order, multilinear_block};
+    use super::{led_order, multilinear_block, put_first};
+
+    /// The probe's groups go first in the order named, the rest keep phase B's
+    /// order; a group out of range or named twice is refused.
+    #[test]
+    fn named_groups_go_first_and_the_rest_keep_their_order() {
+        assert_eq!(
+            put_first(&[3, 1], vec![0, 1, 2, 3, 4]),
+            Ok(vec![3, 1, 0, 2, 4])
+        );
+        assert_eq!(put_first(&[], vec![2, 0, 1]), Ok(vec![2, 0, 1]));
+        assert_eq!(put_first(&[0, 2], vec![2, 1, 0]), Ok(vec![0, 2, 1]));
+        assert!(put_first(&[5], vec![0, 1, 2]).is_err());
+        assert!(put_first(&[1, 1], vec![0, 1, 2]).is_err());
+    }
 
     const S: Option<usize> = Some(0);
     const R: Option<usize> = Some(1);
