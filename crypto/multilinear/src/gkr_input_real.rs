@@ -41,9 +41,9 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 /// How a tree keeps its input layer on the card.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputReal {
-    /// With its padding, as before. The default.
+    /// With its padding, as before.
     Off,
-    /// Without it.
+    /// Without it. The default.
     On,
     /// Without it, and compared round by round with the whole layer.
     Check,
