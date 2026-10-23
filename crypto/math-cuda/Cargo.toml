@@ -21,7 +21,9 @@ license.workspace = true
 #   * This replaces the fragile per-script `sed` pin in scripts/gpu_test.sh.
 # To move the floor (e.g. to use a newer driver-API symbol), bump this one
 # feature deliberately — see crypto/math-cuda/build.rs and README "GPU Tests".
-cudarc = { version = "0.19", default-features = false, features = [
+# The version is pinned exactly: 0.19.10 is the first with
+# `CudaContext::new_stream_with_priority` (the stream classes).
+cudarc = { version = "=0.19.10", default-features = false, features = [
     "driver",
     "nvrtc",
     "std",

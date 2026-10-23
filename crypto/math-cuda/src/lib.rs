@@ -55,6 +55,7 @@ pub mod p1w16;
 pub mod round_slot;
 pub mod rpx;
 pub mod rpx_paths;
+pub mod stream_class;
 pub mod sumcheck;
 pub mod whir;
 pub mod whir_coset;

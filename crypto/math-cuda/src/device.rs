@@ -171,7 +171,9 @@ const STREAM_POOL_SIZE: usize = 32;
 
 pub struct Backend {
     pub ctx: Arc<CudaContext>,
-    streams: Vec<Arc<CudaStream>>,
+    /// The stream pool, and the background pool beside it when
+    /// `LAMBDA_VM_STREAM_CLASSES` asks for one ([`crate::stream_class`]).
+    streams: crate::stream_class::StreamPools<Arc<CudaStream>>,
     /// Per-rayon-worker pinned staging buffers. Indexed by
     /// `rayon::current_thread_index()` (0 for non-rayon callers). Each slot
     /// grows lazily on first use, idle slots stay at zero allocation.
@@ -187,7 +189,6 @@ pub struct Backend {
     staging_pairs: StagingPool,
     /// Free-list of pre-created events for [`Backend::take_event`].
     event_pool: Mutex<Vec<cudarc::driver::CudaEvent>>,
-    next: AtomicUsize,
     /// VRAM budget (bytes) for admission control. See
     /// [`detect_vram_budget_bytes`].
     vram_budget_bytes: u64,
@@ -731,6 +732,12 @@ pub fn reserve(bytes: u64) -> Option<DeviceReservation> {
     backend().ok()?.reserve(bytes)
 }
 
+/// [`reserve`] that never asks the retention for its spare bytes: a caller
+/// beside another proof's work, whose cache it must not take, waits instead.
+pub fn reserve_without_eviction(bytes: u64) -> Option<DeviceReservation> {
+    backend().ok()?.reserve_with(bytes, false)
+}
+
 /// Argue-surface device fallbacks: the reservation refusals in math-cuda's
 /// `sumcheck`, `gkr` and `columns`, and the GKR tree's whole-tree promise in
 /// `multilinear::gpu`, counted where each one's `reserve` returns `None` and its
@@ -1015,9 +1022,38 @@ impl Backend {
         let sumcheck = ctx.load_module(Ptx::from_binary(SUMCHECK_CUBIN.to_vec()))?;
         let whir_fold = ctx.load_module(Ptx::from_binary(WHIR_FOLD_CUBIN.to_vec()))?;
 
+        // The stream classes (`LAMBDA_VM_STREAM_CLASSES`): off, every stream as
+        // it always was; otherwise a background pool beside the pool, under
+        // `priority` the pool at the device's greatest priority and the
+        // background at its least.
+        let classes = crate::stream_class::setting();
+        let (foreground_priority, background_priority) = match classes {
+            crate::stream_class::StreamClasses::Priority => {
+                ctx.bind_to_thread()?;
+                let (least, greatest) = cudarc::driver::result::stream::get_priority_range()?;
+                (Some(greatest), Some(least))
+            }
+            _ => (None, None),
+        };
+        let make_stream = |priority: Option<i32>| match priority {
+            Some(p) => ctx.new_stream_with_priority(p),
+            None => ctx.new_stream(),
+        };
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
-            streams.push(ctx.new_stream()?);
+            streams.push(make_stream(foreground_priority)?);
+        }
+        let mut background = Vec::new();
+        if classes.split() {
+            for _ in 0..crate::stream_class::BACKGROUND_STREAMS {
+                background.push(make_stream(background_priority)?);
+            }
+            eprintln!(
+                "[gpu] stream classes: {classes:?} · {STREAM_POOL_SIZE} streams at priority {} · {} background streams at priority {}",
+                foreground_priority.unwrap_or(0),
+                background.len(),
+                background_priority.unwrap_or(0),
+            );
         }
         // One slot per rayon worker. `current_thread_index()` returns
         // `0..current_num_threads()`, and non-rayon callers (None) map to slot 0,
@@ -1053,7 +1089,7 @@ impl Backend {
         };
         // Separate "utility" stream for twiddle uploads and other bookkeeping;
         // not part of the pool that callers rotate through.
-        let util_stream = ctx.new_stream()?;
+        let util_stream = make_stream(foreground_priority)?;
 
         // Cache is indexed by log_n. Valid range is [0, TWO_ADICITY] since
         // Goldilocks has roots of unity for orders 2^0..=2^TWO_ADICITY only.
@@ -1294,13 +1330,12 @@ impl Backend {
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,
-            streams,
+            streams: crate::stream_class::StreamPools::new(streams, background),
             pinned_staging,
             pinned_hashes,
             staging_pairs: StagingPool::default(),
             event_pool,
             util_stream,
-            next: AtomicUsize::new(0),
             vram_budget_bytes,
             reserved: AtomicU64::new(0),
         })
@@ -1380,7 +1415,13 @@ impl Backend {
     /// has a host path. The budget binds only when several proofs share a
     /// card: one of them is enough to fill it.
     pub fn reserve(&self, bytes: u64) -> Option<DeviceReservation> {
-        let mut evicted = false;
+        self.reserve_with(bytes, true)
+    }
+
+    /// [`Self::reserve`], asking the retention for spare bytes on a miss only
+    /// when `evict`.
+    fn reserve_with(&self, bytes: u64, evict: bool) -> Option<DeviceReservation> {
+        let mut evicted = !evict;
         let mut held = self.reserved.load(Ordering::Relaxed);
         loop {
             if held.saturating_add(bytes) > self.vram_budget_bytes {
@@ -1429,10 +1470,11 @@ impl Backend {
     }
 
     /// Round-robin over the stream pool. Concurrent callers get different
-    /// streams so their kernel launches overlap on the GPU.
+    /// streams so their kernel launches overlap on the GPU. A thread marked
+    /// background draws from the background pool when one exists
+    /// ([`crate::stream_class`]).
     pub fn next_stream(&self) -> Arc<CudaStream> {
-        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.streams.len();
-        self.streams[idx].clone()
+        self.streams.next()
     }
 
     /// Per-rayon-worker pinned staging buffer. Returns the slot for the
