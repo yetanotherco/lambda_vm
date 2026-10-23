@@ -7,7 +7,7 @@
 //! per-constraint eval matrix is bit-for-bit identical to the CPU reference
 //! oracle `eval_device_program`. The oracle is pinned bit-for-bit to the
 //! compiled prover folder by `tests::constraint_program_device_tests`, so
-//! GPU == oracle closes the chain GPU == folder across all 26 tables.
+//! GPU == oracle closes the chain GPU == folder across all 27 tables.
 //!
 //! Complements the synthetic all-ops coverage in
 //! `stark`'s `tests/gpu_constraint_interp.rs`: this exercises the kernel on the

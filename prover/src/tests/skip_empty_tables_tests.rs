@@ -128,7 +128,7 @@ fn every_table_participates_in_the_bus() {
 }
 
 /// The tables a prover can declare away, under the names the AIRs carry. The
-/// always-present ones (BITWISE, DECODE, KECCAK_RC, REGISTER, HALT, the PAGEs,
+/// always-present ones (BITWISE, DECODE, KECCAK_RC, COPY, REGISTER, HALT, the PAGEs,
 /// L2G) have no `TableCounts` field, and they legitimately contribute zero when
 /// the run never reaches them — KECCAK_RC does exactly that in a program with no
 /// keccak, which is the padding this change is about and cannot be dropped.
@@ -565,8 +565,8 @@ fn validate_still_requires_cpu_and_the_register_file() {
 }
 
 /// The counts ride in the proof, so they are the prover's to choose, and the
-/// sub-proof cross-check constrains only their *sum*. The five accelerators are
-/// not chunked — `generate_optional` emits one table or none — so any count
+/// sub-proof cross-check constrains only their *sum*. The five accelerators and
+/// IS_WH are not chunked — `generate_optional` emits one table or none — so any count
 /// above 1 describes a table set no prover can build, and the sum alone does not
 /// catch it: lower another count by the same amount and the total still matches.
 /// This pins the per-field shape.
@@ -608,8 +608,8 @@ fn an_accelerator_count_above_one_is_rejected() {
         );
     }
 
-    // The chunked chips keep taking any count: this is a cap on the five, not a
-    // cap on chunking.
+    // The chunked chips keep taking any count: this is a cap on the five
+    // accelerators and IS_WH, not a cap on chunking.
     let mut many_mul = honest.clone();
     many_mul.mul = 7;
     assert!(many_mul.validate().is_ok(), "chunked chips still chunk");

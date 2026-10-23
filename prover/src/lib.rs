@@ -171,7 +171,7 @@ impl TableCounts {
     ///
     /// What keeps a zero count honest is the LogUp bus, not this check. A chip
     /// influences the run only through its bus interactions, and none of the
-    /// nineteen optional chips carries boundary constraints of its own, so one
+    /// eighteen optional chips carries boundary constraints of its own, so one
     /// with no rows contributes zero to the bus and removing it changes nothing.
     /// (The mandatory tables do constrain boundaries — that is part of why they
     /// are mandatory.) A prover that omits a table whose operations *did*
