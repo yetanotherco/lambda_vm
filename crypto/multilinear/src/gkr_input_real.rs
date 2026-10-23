@@ -14,7 +14,8 @@
 //!
 //! # What the knob changes
 //!
-//! Set, a tree whose input layer has padding writes only the real fractions,
+//! On — the default; `0` writes the padding as before — a tree whose input
+//! layer has padding writes only the real fractions,
 //! folds the level above from them with the padding read as `0/1` (the fold a
 //! tree that hands its layer back already runs), and **keeps** them. Its Gruen
 //! rounds then read a cell past the stored run as `0/1` and write no folded
@@ -48,18 +49,19 @@ pub enum InputReal {
     Check,
 }
 
-/// The setting `LAMBDA_VM_ARGUE_INPUT_REAL` names: unset, empty or `0` off,
-/// `1` on, `check` on and compared. Anything else is off, said once.
+/// The setting `LAMBDA_VM_ARGUE_INPUT_REAL` names: `0` off, unset, empty or
+/// `1` on, `check` on and compared. Anything else is on, said once.
 pub fn input_real_setting(value: Option<&str>) -> InputReal {
     match value {
-        None | Some("") | Some("0") => InputReal::Off,
-        Some("1") => InputReal::On,
+        Some("0") => InputReal::Off,
+        None | Some("") | Some("1") => InputReal::On,
         Some("check") => InputReal::Check,
         Some(other) => {
             eprintln!(
-                "[gkr] LAMBDA_VM_ARGUE_INPUT_REAL={other} is not 0, 1 or check; keeping the padding"
+                "[gkr] LAMBDA_VM_ARGUE_INPUT_REAL={other} is not 0, 1 or check; keeping each input layer \
+                 without its padding (the default)"
             );
-            InputReal::Off
+            InputReal::On
         }
     }
 }
@@ -82,11 +84,12 @@ pub fn argue_input_real() -> InputReal {
                 eprintln!(
                     "★ ARGUE INPUT REAL: {}",
                     match set {
-                        InputReal::Off => {
-                            "off (the default; LAMBDA_VM_ARGUE_INPUT_REAL=1 keeps each input layer without \
-                             its padding, =check also compares it with the whole layer)"
+                        InputReal::Off => "off (each input layer written with its padding)",
+                        InputReal::On => {
+                            "on (the default: each input layer kept without its padding; \
+                             LAMBDA_VM_ARGUE_INPUT_REAL=0 writes the padding, =check also compares with the \
+                             whole layer)"
                         }
-                        InputReal::On => "on (each input layer kept without its padding)",
                         InputReal::Check => {
                             "check (each input layer kept without its padding and compared round by round \
                              with the whole layer)"
@@ -265,25 +268,26 @@ mod tests {
 
     #[test]
     fn the_knob_reads_its_variable() {
-        assert_eq!(input_real_setting(None), InputReal::Off);
-        assert_eq!(input_real_setting(Some("")), InputReal::Off);
+        assert_eq!(input_real_setting(None), InputReal::On);
+        assert_eq!(input_real_setting(Some("")), InputReal::On);
         assert_eq!(input_real_setting(Some("0")), InputReal::Off);
         assert_eq!(input_real_setting(Some("1")), InputReal::On);
         assert_eq!(input_real_setting(Some("check")), InputReal::Check);
-        assert_eq!(input_real_setting(Some("on")), InputReal::Off);
-        assert_eq!(input_real_setting(Some("2")), InputReal::Off);
+        assert_eq!(input_real_setting(Some("on")), InputReal::On);
+        assert_eq!(input_real_setting(Some("2")), InputReal::On);
     }
 
-    /// ★ The default keeps the padding: today's trees, byte for byte.
+    /// ★ The default keeps each input layer without its padding — the same
+    /// proof bytes, which the card tests show — and only `0` writes it.
     #[test]
-    fn the_knob_is_off_unless_its_variable_says_otherwise() {
+    fn the_knob_is_on_unless_its_variable_is_zero() {
         assert_eq!(
             argue_input_real(),
             input_real_setting(std::env::var("LAMBDA_VM_ARGUE_INPUT_REAL").ok().as_deref())
         );
         if std::env::var_os("LAMBDA_VM_ARGUE_INPUT_REAL").is_none() {
-            assert_eq!(argue_input_real(), InputReal::Off);
-            assert_eq!(input_real_in_effect(), "off");
+            assert_eq!(argue_input_real(), InputReal::On);
+            assert_eq!(input_real_in_effect(), "on");
         }
     }
 
