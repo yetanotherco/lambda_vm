@@ -2595,6 +2595,12 @@ fn the_whir_block_tree_on_a_real_block() {
         multilinear::gpu::fused_fold_calls(),
         multilinear::gpu::encode_declines()
     );
+    // Coset-ordered round-0 successors encoded on the host because the card
+    // declined the opening: 0 on a run whose openings all went to the card.
+    println!(
+        "W3 WHIR HOST ENCODES: {}",
+        multilinear::gpu::coset_host_encodes()
+    );
     // How each group's stacked polynomials were opened (`format.group`): one
     // chain a polynomial, or one a run of up to four whose round 0 ran on the
     // card, or fell to the host over the card's codewords (a fallback, each of

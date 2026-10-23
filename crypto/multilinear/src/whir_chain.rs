@@ -3666,6 +3666,98 @@ mod tests {
         }
     }
 
+    /// ★ A coset round 0 whose factors the host built encodes its successor
+    /// there ([`encode_successor_on_host`]): the bytes of the host's fold, for a
+    /// polynomial's chain and for runs of 2, 3 and 4 (the run's combined bound
+    /// message), each call counted. The factors are the host's here because the
+    /// stack is under the card's sumcheck threshold, as in a test format.
+    #[test]
+    fn the_host_encoded_successor_is_the_host_fold_for_a_polynomial_and_a_run() {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as E;
+        type EE = FieldElement<E>;
+        let bytes = |c: &Codeword<E>| -> Vec<u8> {
+            c.host()
+                .expect("on the host")
+                .iter()
+                .flat_map(|v| v.as_bytes())
+                .collect()
+        };
+        let num_vars = 11;
+        let cfg = first(6, 4);
+        let k = cfg.schedule(num_vars)[0];
+        let weight = |seed: u64| -> Mle<E> {
+            Mle::new(
+                (0..1u64 << num_vars)
+                    .map(|i| EE::from((i + seed).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 7))
+                    .collect(),
+            )
+            .unwrap()
+        };
+        for width in 1..=MAX_INDEX_POLYS {
+            let polys: Vec<Mle<F>> = (0..width)
+                .map(|p| pseudo_mle(num_vars, 29 + 17 * p as u64))
+                .collect();
+            let stacks: Vec<Stacked<'_, F>> = polys
+                .iter()
+                .map(|f| Stacked {
+                    parts: vec![(f as &dyn HostColumn<F>, 0)],
+                    resident: None,
+                    num_vars,
+                })
+                .collect();
+            let committed: Vec<(CodewordCommitment<F, KeccakWhir>, Domain<F>)> = stacks
+                .iter()
+                .map(|s| commit_stacked::<F, KeccakWhir>(s, &cfg, true).unwrap())
+                .collect();
+            let domain = committed[0].1.clone();
+            let held: Vec<&CodewordCommitment<F, KeccakWhir>> =
+                committed.iter().map(|(c, _)| c).collect();
+            let index = if width == 1 { 0 } else { index_vars(width) };
+            let mut factors = if width == 1 {
+                Factors::<F, E>::new(&polys[0], weight(1)).unwrap()
+            } else {
+                Factors::<F, E>::Lockstep {
+                    parts: polys
+                        .iter()
+                        .enumerate()
+                        .map(|(p, f)| {
+                            let message = Mle::new(
+                                f.evals().iter().map(|v| (*v).to_extension::<E>()).collect(),
+                            )
+                            .unwrap();
+                            (weight(1 + p as u64), message)
+                        })
+                        .collect(),
+                    index_vars: index,
+                }
+            };
+            let mut transcript = DefaultTranscript::<E>::new(b"whir-chain-host-encode");
+            let (_, challenges) = factors.rounds(k, &mut transcript).unwrap();
+            let (alphas, rho) = challenges.split_at(k);
+            assert_eq!(rho.len(), index, "width {width}: the index bound last");
+            let (folded, folded_domain) = if width == 1 {
+                fold_held::<F, F, E>(held[0].codeword(), &domain, alphas).unwrap()
+            } else {
+                fold_grouped::<F, E, KeccakWhir>(&held, &domain, alphas, rho).unwrap()
+            };
+            let before = crate::gpu::coset_host_encodes();
+            let message = factors
+                .host_message()
+                .expect("under the threshold: the host bound the message");
+            let (encoded, at) = encode_successor_on_host::<F, E>(message, &domain, k).unwrap();
+            assert!(
+                crate::gpu::coset_host_encodes() > before,
+                "width {width}: the host encode counted"
+            );
+            assert_eq!(at.size(), folded_domain.size(), "width {width}: the domain");
+            assert_eq!(
+                bytes(&encoded),
+                bytes(&folded),
+                "width {width}: the host encode is the fold"
+            );
+        }
+    }
+
     /// The grouped round 0's successor — each round-0 codeword folded by the
     /// data challenges, the folds combined with `eq(ρ, p)` ([`fold_grouped`])
     /// — is the encoding of the message the lockstep rounds leave bound
