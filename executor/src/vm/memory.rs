@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
+use std::sync::Arc;
 
 /// Fast hasher for u64 keys - uses the key directly as the hash value.
 /// This avoids the overhead of SipHash for integer keys.
@@ -144,16 +145,21 @@ impl Page {
 /// [`DIRECTORY_PAGES`], in `high[LAST_PAGE - n]` when it is among the top
 /// [`DIRECTORY_PAGES`], and in `other` otherwise; the directories grow to the
 /// furthest page touched.
+///
+/// A page is shared behind an [`Arc`], so a clone of the directories (a
+/// [`MemorySnapshot`]) shares every page, and a write copies a page that a
+/// snapshot still holds before changing it ([`Arc::make_mut`]): a snapshot
+/// keeps reading the bytes of its moment.
 #[derive(Clone, Default)]
 struct Pages {
-    low: Vec<Option<Box<Page>>>,
-    high: Vec<Option<Box<Page>>>,
-    other: std::collections::BTreeMap<u64, Box<Page>>,
+    low: Vec<Option<Arc<Page>>>,
+    high: Vec<Option<Arc<Page>>>,
+    other: std::collections::BTreeMap<u64, Arc<Page>>,
 }
 
 impl std::fmt::Debug for Pages {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let count = |d: &[Option<Box<Page>>]| d.iter().filter(|p| p.is_some()).count();
+        let count = |d: &[Option<Arc<Page>>]| d.iter().filter(|p| p.is_some()).count();
         f.debug_struct("Pages")
             .field("low", &count(&self.low))
             .field("high", &count(&self.high))
@@ -173,7 +179,7 @@ impl Pages {
             .filter(|p| p.is_some())
             .count()
             + self.other.len();
-        (self.low.capacity() + self.high.capacity()) * std::mem::size_of::<Option<Box<Page>>>()
+        (self.low.capacity() + self.high.capacity()) * std::mem::size_of::<Option<Arc<Page>>>()
             + pages * page
     }
 
@@ -188,23 +194,51 @@ impl Pages {
         }
     }
 
+    /// Page `number` to write, allocated on first touch, and copied first if
+    /// a snapshot shares it.
     #[inline]
     fn page_mut(&mut self, number: u64) -> &mut Page {
-        fn slot(directory: &mut Vec<Option<Box<Page>>>, index: usize) -> &mut Page {
+        fn slot(directory: &mut Vec<Option<Arc<Page>>>, index: usize) -> &mut Page {
             if directory.len() <= index {
                 directory.resize_with(index + 1, || None);
             }
-            directory[index].get_or_insert_with(|| Box::new(Page::new()))
+            Arc::make_mut(directory[index].get_or_insert_with(|| Arc::new(Page::new())))
         }
         if number < DIRECTORY_PAGES {
             slot(&mut self.low, number as usize)
         } else if LAST_PAGE - number < DIRECTORY_PAGES {
             slot(&mut self.high, (LAST_PAGE - number) as usize)
         } else {
-            self.other
-                .entry(number)
-                .or_insert_with(|| Box::new(Page::new()))
+            Arc::make_mut(
+                self.other
+                    .entry(number)
+                    .or_insert_with(|| Arc::new(Page::new())),
+            )
         }
+    }
+
+    /// The bytes of the pages this store holds that `now` no longer shares:
+    /// what keeping this store as a snapshot costs once `now` has written them.
+    fn bytes_apart_from(&self, now: &Pages) -> usize {
+        let page = std::mem::size_of::<Page>() + PAGE_SIZE + PAGE_SIZE / 4 / 64 * 8;
+        let apart = |mine: &Arc<Page>, theirs: Option<&Arc<Page>>| {
+            theirs.is_none_or(|theirs| !Arc::ptr_eq(mine, theirs))
+        };
+        let directory = |mine: &[Option<Arc<Page>>], theirs: &[Option<Arc<Page>>]| {
+            mine.iter()
+                .enumerate()
+                .filter(|(i, p)| {
+                    p.as_ref()
+                        .is_some_and(|p| apart(p, theirs.get(*i).and_then(Option::as_ref)))
+                })
+                .count()
+        };
+        let other = self
+            .other
+            .iter()
+            .filter(|(n, p)| apart(p, now.other.get(n)))
+            .count();
+        (directory(&self.low, &now.low) + directory(&self.high, &now.high) + other) * page
     }
 
     /// The bytes at `address..` into `out`; the range must not wrap.
@@ -324,6 +358,17 @@ impl Memory {
             Store::Words(cells) => cells.capacity() * (std::mem::size_of::<(u64, [u8; 4])>() + 1),
         };
         store + self.public_output.capacity()
+    }
+
+    /// The memory as it is now, kept while the run goes on: the pages are
+    /// shared, and a later write copies a page the snapshot holds before
+    /// changing it, so the snapshot keeps reading this moment's bytes. Cheap
+    /// for the pages store (one count per page); the words store copies its
+    /// map.
+    pub fn snapshot(&self) -> MemorySnapshot {
+        MemorySnapshot {
+            store: self.store.clone(),
+        }
     }
 
     pub fn load_byte(&self, address: u64) -> u8 {
@@ -481,6 +526,39 @@ impl Memory {
     }
 }
 
+/// The memory at one moment of a run ([`Memory::snapshot`]).
+#[derive(Debug, Clone)]
+pub struct MemorySnapshot {
+    store: Store,
+}
+
+impl MemorySnapshot {
+    /// The bytes at `address..` into `out`, as they were at the snapshot; the
+    /// range must not wrap.
+    pub fn read(&self, address: u64, out: &mut [u8]) {
+        self.store.read(address, out);
+    }
+
+    /// The byte at `address`, as it was at the snapshot.
+    pub fn load_byte(&self, address: u64) -> u8 {
+        let mut byte = [0u8; 1];
+        self.store.read(address, &mut byte);
+        byte[0]
+    }
+
+    /// The bytes this snapshot keeps alive that `memory` no longer shares (for
+    /// the words store, its whole map).
+    pub fn bytes_apart_from(&self, memory: &Memory) -> usize {
+        match (&self.store, &memory.store) {
+            (Store::Pages(mine), Store::Pages(now)) => mine.bytes_apart_from(now),
+            (Store::Words(cells), _) => {
+                cells.capacity() * (std::mem::size_of::<(u64, [u8; 4])>() + 1)
+            }
+            (Store::Pages(mine), Store::Words(_)) => mine.heap_bytes(),
+        }
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum MemoryError {
     #[error("Unaligned memory access")]
@@ -527,5 +605,76 @@ mod tests {
             )
             .unwrap();
         assert_eq!(data, inputs);
+    }
+
+    /// Addresses in the low directory, across a page boundary, in the high
+    /// directory (the stack's end of the space) and in neither.
+    const SPOTS: [u64; 4] = [0x1000, (1 << PAGE_BITS) - 2, u64::MAX - 0x100, 1 << 40];
+
+    fn read8(read: impl Fn(u64, &mut [u8]), address: u64) -> u64 {
+        let mut bytes = [0u8; 8];
+        read(address, &mut bytes);
+        u64::from_le_bytes(bytes)
+    }
+
+    // A snapshot reads the bytes of its moment while the memory is written on:
+    // over both stores, in both directories and outside them, across a page
+    // boundary, for bytes overwritten and for pages first written later.
+    #[test]
+    fn a_snapshot_reads_the_bytes_of_its_moment() {
+        for kind in [StoreKind::Pages, StoreKind::Words] {
+            let mut memory = Memory::with_store(kind);
+            for (i, &at) in SPOTS.iter().enumerate() {
+                memory
+                    .store_doubleword(at, 0x1111 * (i as u64 + 1))
+                    .unwrap();
+            }
+            let first = memory.snapshot();
+            for (i, &at) in SPOTS.iter().enumerate() {
+                memory
+                    .store_doubleword(at, 0xAAAA * (i as u64 + 1))
+                    .unwrap();
+                memory.store_byte(at.wrapping_add(8 << PAGE_BITS), 0x5A);
+            }
+            let second = memory.snapshot();
+            memory.store_byte(SPOTS[0], 0x77);
+            for (i, &at) in SPOTS.iter().enumerate() {
+                let fresh = at.wrapping_add(8 << PAGE_BITS);
+                assert_eq!(
+                    read8(|a, out| first.read(a, out), at),
+                    0x1111 * (i as u64 + 1),
+                    "{kind:?} at {at:#x}"
+                );
+                assert_eq!(first.load_byte(fresh), 0, "{kind:?} at {fresh:#x}");
+                assert_eq!(second.load_byte(fresh), 0x5A, "{kind:?} at {fresh:#x}");
+                assert_eq!(
+                    read8(|a, out| second.read(a, out), at),
+                    0xAAAA * (i as u64 + 1),
+                    "{kind:?} at {at:#x}"
+                );
+            }
+            assert_eq!(memory.load_byte(SPOTS[0]), 0x77, "{kind:?}");
+            assert_eq!(second.load_byte(SPOTS[0]), 0xAA, "{kind:?}");
+        }
+    }
+
+    // A snapshot costs the pages written after it, and nothing for the pages
+    // it still shares or the pages first written after it.
+    #[test]
+    fn a_snapshot_costs_the_pages_written_after_it() {
+        let page = std::mem::size_of::<Page>() + PAGE_SIZE + PAGE_SIZE / 4 / 64 * 8;
+        let mut memory = Memory::with_store(StoreKind::Pages);
+        for &at in &SPOTS {
+            memory.store_byte(at, 1);
+        }
+        let snapshot = memory.snapshot();
+        assert_eq!(snapshot.bytes_apart_from(&memory), 0);
+        memory.store_byte(SPOTS[0] + 1, 2);
+        memory.store_byte(SPOTS[0] + 2, 3);
+        memory.store_byte(1 << 50, 4);
+        assert_eq!(snapshot.bytes_apart_from(&memory), page);
+        memory.store_byte(SPOTS[2], 5);
+        memory.store_byte(SPOTS[3], 6);
+        assert_eq!(snapshot.bytes_apart_from(&memory), 3 * page);
     }
 }
