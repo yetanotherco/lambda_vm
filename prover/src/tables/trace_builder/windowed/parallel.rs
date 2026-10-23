@@ -18,10 +18,11 @@
 //!   handed to the finish ([`super::lean_pass::LeanPass::walked_state`]).
 //!
 //! The threads: the executor (the caller's) sends each window with its
-//! snapshot; one thread runs the pass and hands out each window as a job, a
-//! window behind (the run's last window is the finish's); `walkers` threads
-//! walk the jobs; the calling thread absorbs the walked windows strictly in
-//! order. At most `walkers + 2` windows are handed out and not yet absorbed.
+//! snapshot; one thread runs the pass and hands out each window as a job as it
+//! arrives, but the one that halts, which is the run's last and the finish's;
+//! `walkers` threads walk the jobs; the calling thread absorbs the walked
+//! windows strictly in order. At most `walkers + 2` windows are handed out and
+//! not yet absorbed.
 
 use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -279,6 +280,8 @@ struct PassEnd {
     first: usize,
     windows: usize,
     busy: f64,
+    /// Of `busy`, the finish's state.
+    state_secs: f64,
     entries: usize,
     most_entries: usize,
 }
@@ -290,6 +293,8 @@ pub struct ParallelWalk {
     pub walkers: usize,
     pub windows: usize,
     pub pass_secs: f64,
+    /// Of the pass's, the seconds building the finish's state.
+    pub finish_state_secs: f64,
     /// The walkers' busy seconds, summed.
     pub walk_secs: f64,
     pub entries: usize,
@@ -303,7 +308,7 @@ pub struct ParallelWalk {
 impl ParallelWalk {
     pub fn line(&self) -> String {
         format!(
-            "BLOCK WALKERS: {} · pass busy {:.2}s · entries {} (most {} in one window) · walkers busy {:.2}s (summed) · reorder held at most {} · window states {:.2} GiB · {} windows walked from their entries",
+            "BLOCK WALKERS: {} · pass busy {:.2}s · entries {} (most {} in one window) · walkers busy {:.2}s (summed) · reorder held at most {} · window states {:.2} GiB · {} windows walked from their entries · the finish's state built in {:.2}s",
             self.walkers,
             self.pass_secs,
             self.entries,
@@ -312,6 +317,7 @@ impl ParallelWalk {
             self.held_most,
             self.state_bytes as f64 / (1u64 << 30) as f64,
             self.windows,
+            self.finish_state_secs,
         )
     }
 }
@@ -490,6 +496,7 @@ fn walk_numbered(
         first,
         windows,
         busy,
+        state_secs,
         entries,
         most_entries,
     } = end;
@@ -501,6 +508,7 @@ fn walk_numbered(
         walkers,
         windows,
         pass_secs: busy,
+        finish_state_secs: state_secs,
         walk_secs,
         entries,
         most_entries,
@@ -509,10 +517,11 @@ fn walk_numbered(
     })
 }
 
-/// The pass's thread: each window but the last passed and handed out as a
-/// job (numbered `number(k)`), a permit taken for each; what follows each job
-/// sent once the next window is passed (or, after the run's last window, the
-/// finish's state).
+/// The pass's thread: each window passed and handed out as a job (numbered
+/// `number(k)`) as it arrives, a permit taken for each; what follows each job
+/// sent once the next window is passed. The window that halts is the run's
+/// last: it is not handed out, and the job before it is followed by the
+/// finish's state.
 #[allow(clippy::too_many_arguments)]
 fn pass_thread(
     decode: Arc<DecodeTable>,
@@ -528,18 +537,37 @@ fn pass_thread(
         Error::Prover(WALKERS_STOPPED.into())
     }
     let mut pass = LeanPass::new(decode, start_registers)?;
-    let mut held: Option<(Arc<Vec<Log>>, Arc<MemorySnapshot>)> = None;
+    let mut last: Option<(Arc<Vec<Log>>, Arc<MemoryState>, RegisterState)> = None;
     let mut waiting: Option<SyncSender<After>> = None;
     let (mut k, mut first, mut busy, mut entries, mut most) = (0u32, 0usize, 0.0, 0usize, 0usize);
+    let (mut sent, mut state_secs) = (false, 0.0);
     for (logs, start) in windows {
+        sent = true;
         let start = Arc::new(start.ok_or_else(|| {
             Error::Prover("the executor sent a window without its memory".into())
         })?);
-        let Some((logs, start)) = held.replace((Arc::new(logs), start)) else {
-            continue;
-        };
+        if last.is_some() {
+            return Err(Error::Prover(
+                "the executor sent a window after the one that halts".into(),
+            ));
+        }
         let t = Instant::now();
         let registers = pass.registers();
+        // The run's last window: the walk's state at its start is the
+        // finish's.
+        if logs.last().is_some_and(|log| log.next_pc == 0) {
+            let state = Arc::new(pass.walked_state(&start, image, lean));
+            state_secs = t.elapsed().as_secs_f64();
+            busy += state_secs;
+            if let Some(after) = waiting.take() {
+                let _ = after.send(After::Finish {
+                    registers: registers.clone(),
+                    state: Arc::clone(&state),
+                });
+            }
+            last = Some((Arc::new(logs), state, registers));
+            continue;
+        }
         pass.begin(k)?;
         pass.pass(&logs, first)?;
         let window_entries = Arc::new(pass.take_entries());
@@ -562,7 +590,7 @@ fn pass_thread(
             job: WindowJob {
                 window: number(k),
                 first,
-                logs,
+                logs: Arc::new(logs),
                 start,
                 registers,
                 entries: window_entries,
@@ -575,18 +603,13 @@ fn pass_thread(
         k += 1;
     }
     drop(jobs);
-    let (last, last_start) =
-        held.ok_or_else(|| Error::Execution("the run executed no cycle".to_string()))?;
-    let t = Instant::now();
-    let state = Arc::new(pass.walked_state(&last_start, image, lean));
-    let registers = pass.registers();
-    busy += t.elapsed().as_secs_f64();
-    if let Some(after) = waiting.take() {
-        let _ = after.send(After::Finish {
-            registers: registers.clone(),
-            state: Arc::clone(&state),
+    let Some((last, state, registers)) = last else {
+        return Err(if sent {
+            Error::Prover("the executor stopped before the run halted".into())
+        } else {
+            Error::Execution("the run executed no cycle".to_string())
         });
-    }
+    };
     Ok(PassEnd {
         last,
         state,
@@ -594,6 +617,7 @@ fn pass_thread(
         first,
         windows: k as usize,
         busy,
+        state_secs,
         entries,
         most_entries: most,
     })
