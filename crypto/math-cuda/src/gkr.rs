@@ -527,6 +527,9 @@ pub struct GruenLayer {
     sums: CudaSlice<u64>,
     /// Rounds run so far.
     done: usize,
+    /// The rounds' sums through a slot (`LAMBDA_VM_ARGUE_ROUND_SLOT`):
+    /// reduced by the round kernel's last block, read from pinned host memory.
+    slot: Option<crate::round_slot::SlotRounds>,
 }
 
 impl GruenLayer {
@@ -605,7 +608,16 @@ impl GruenLayer {
             partials,
             sums,
             done: 0,
+            slot: None,
         })
+    }
+
+    /// The rounds' sums through a slot from here on (`crate::round_slot`)
+    /// when `mode` asks for one and one can be had; `false` keeps today's
+    /// second launch and read-back.
+    pub fn use_slot(&mut self, mode: crate::round_slot::RoundSlot) -> bool {
+        self.slot = crate::round_slot::SlotRounds::open(&self.stream, mode);
+        self.slot.is_some()
     }
 
     /// The rounds this layer runs on the card, `J`.
@@ -673,16 +685,24 @@ impl GruenLayer {
         // stored run covers it, the padding is spent and today's kernel reads
         // every cell.
         let cube = if fold_by.is_some() { 4 } else { 2 } * quarter;
-        let kernel = if stored < cube {
-            &be.gkr_round_gruen_real
-        } else {
-            &be.gkr_round_gruen
+        let kernel = match (stored < cube, self.slot.is_some()) {
+            (true, false) => &be.gkr_round_gruen_real,
+            (false, false) => &be.gkr_round_gruen,
+            (true, true) => &be.gkr_round_gruen_real_slot,
+            (false, true) => &be.gkr_round_gruen_slot,
         };
         let config = LaunchConfig {
             grid_dim: (grid, 1, 1),
             block_dim: (block, 1, 1),
-            shared_mem_bytes: block * 3 * 8,
+            shared_mem_bytes: if self.slot.is_some() {
+                crate::round_slot::shared_bytes(block)
+            } else {
+                block * 3 * 8
+            },
         };
+        // Today's second launch, unless the slot's last block does its work.
+        let second = self.slot.as_ref().is_none_or(|slot| slot.checking());
+        let mut slot_args = self.slot.as_mut().map(|slot| slot.launch());
         unsafe {
             let mut launch = self.stream.launch_builder(kernel);
             launch
@@ -704,18 +724,25 @@ impl GruenLayer {
             if stored < cube {
                 launch.arg(&stored);
             }
-            launch.arg(&mut self.partials).launch(config)?;
-            let reduce_block = 256u32;
-            self.stream
-                .launch_builder(&be.sum_partials_ext3)
-                .arg(&self.partials)
-                .arg(&(grid as u64))
-                .arg(&mut self.sums)
-                .launch(LaunchConfig {
-                    grid_dim: (rows, 1, 1),
-                    block_dim: (reduce_block, 1, 1),
-                    shared_mem_bytes: reduce_block * 3 * 8,
-                })?;
+            launch.arg(&mut self.partials);
+            if let Some((ticket, dev, seq)) = slot_args.as_mut() {
+                launch.arg(&mut **ticket).arg(&*dev).arg(&*seq);
+            }
+            launch.launch(config)?;
+            if second {
+                crate::round_slot::note_second_launch();
+                let reduce_block = 256u32;
+                self.stream
+                    .launch_builder(&be.sum_partials_ext3)
+                    .arg(&self.partials)
+                    .arg(&(grid as u64))
+                    .arg(&mut self.sums)
+                    .launch(LaunchConfig {
+                        grid_dim: (rows, 1, 1),
+                        block_dim: (reduce_block, 1, 1),
+                        shared_mem_bytes: reduce_block * 3 * 8,
+                    })?;
+            }
         }
         self.stored = stored_after_round(self.stored, quarter as usize);
         self.done += 1;
@@ -725,11 +752,17 @@ impl GruenLayer {
     /// The sums a [`round_enqueue`](Self::round_enqueue) queued, `rows` of
     /// them, three u64 each.
     pub fn round_collect(&self, rows: u32) -> Result<Vec<u64>> {
-        let sums = self
-            .stream
-            .clone_dtoh(&self.sums.slice(0..rows as usize * 3))?;
-        self.stream.synchronize()?;
-        Ok(sums)
+        let today = || -> Result<Vec<u64>> {
+            let sums = self
+                .stream
+                .clone_dtoh(&self.sums.slice(0..rows as usize * 3))?;
+            self.stream.synchronize()?;
+            Ok(sums)
+        };
+        match self.slot.as_ref() {
+            Some(slot) => slot.collect(rows as usize, today),
+            None => today(),
+        }
     }
 
     /// After the last card round: the four halves bound to its challenge

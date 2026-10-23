@@ -397,6 +397,10 @@ pub struct Backend {
     // (`crate::gkr::DeviceFractionTree::from_truncated_input`).
     pub gkr_round_gruen_real: CudaFunction,
     pub gkr_gruen_finish_real: CudaFunction,
+    // The GKR round kernels whose last block reduces the sums into a slot
+    // (`crate::round_slot`).
+    pub gkr_round_gruen_slot: CudaFunction,
+    pub gkr_round_gruen_real_slot: CudaFunction,
     // D-BATCH M1-2's input layer from the base columns (`crate::gkr::input_from_columns`).
     pub gkr_input_from_columns: CudaFunction,
     pub sumcheck_fold_ext3: CudaFunction,
@@ -1263,6 +1267,8 @@ impl Backend {
             gkr_gruen_finish: sumcheck.load_function("gkr_gruen_finish")?,
             gkr_round_gruen_real: sumcheck.load_function("gkr_round_gruen_real")?,
             gkr_gruen_finish_real: sumcheck.load_function("gkr_gruen_finish_real")?,
+            gkr_round_gruen_slot: sumcheck.load_function("gkr_round_gruen_slot")?,
+            gkr_round_gruen_real_slot: sumcheck.load_function("gkr_round_gruen_real_slot")?,
             gkr_input_from_columns: sumcheck.load_function("gkr_input_from_columns")?,
             sumcheck_fold_ext3: sumcheck.load_function("sumcheck_fold_ext3")?,
             mle_fold_base_ext3: sumcheck.load_function("mle_fold_base_ext3")?,

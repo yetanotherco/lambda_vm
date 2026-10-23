@@ -282,6 +282,7 @@ impl<'f> FusedZerocheck<'f> {
     /// [`reduce`](Self::reduce)'s launch, not waited for.
     fn reduce_enqueue(&mut self, rows: usize, grid: u32) -> Result<()> {
         let be = backend()?;
+        crate::round_slot::note_second_launch();
         let reduce_block = 256u32;
         unsafe {
             self.stream
