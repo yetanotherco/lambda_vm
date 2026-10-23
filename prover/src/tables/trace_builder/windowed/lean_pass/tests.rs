@@ -12,6 +12,7 @@ use executor::vm::memory::MemorySnapshot;
 
 use super::super::super::{MemoryState, RegisterState, WalkSizes};
 use super::super::{WalkedWindow, Walker, WindowedTraceBuilder};
+use super::split::{Back, Front};
 use super::{LeanPass, Rows, UNTOUCHED};
 use crate::tables::MaxRowsConfig;
 use crate::tables::decode::DecodeTable;
@@ -427,6 +428,44 @@ fn the_pass_without_its_memory_keeps_the_same_registers() {
             assert_eq!(a.regs[r], b.regs[r], "{name}: x{r}");
         }
         assert_eq!(a.pc_register, b.pc_register, "{name}: pc");
+    }
+}
+
+/// The pass split over two threads (a measurement's arm) records the pass's
+/// entries, in order, and keeps its registers, at every window.
+#[test]
+fn the_split_pass_is_the_pass() {
+    for (name, elf) in programs() {
+        for window in window_lengths(cycles_of(&elf)) {
+            let builder =
+                WindowedTraceBuilder::new(&elf, &[], &MaxRowsConfig::small()).expect("the builder");
+            let decode = Arc::clone(&builder.decode);
+            let mut pass =
+                LeanPass::new(Arc::clone(&decode), &builder.register_state).expect("a pass");
+            let mut front = Front::new(decode, &builder.register_state).expect("a front");
+            let mut back = Back::new();
+            let (mut first, mut accesses) = (0, Vec::new());
+            for (k, (logs, _)) in windows(&elf, window).iter().enumerate() {
+                let k = u32::try_from(k).expect("few windows");
+                pass.begin(k).expect("a window");
+                back.begin(k).expect("a window");
+                pass.pass(logs, first).expect("the pass");
+                accesses.clear();
+                front.pass(logs, first, &mut accesses).expect("the front");
+                back.apply(&accesses);
+                first += logs.len();
+                assert_eq!(
+                    back.entries(),
+                    pass.entries(),
+                    "{name}/{window}, window {k}"
+                );
+                assert_eq!(
+                    register_differences(&front.registers(), &pass.registers()),
+                    0,
+                    "{name}/{window}, window {k}"
+                );
+            }
+        }
     }
 }
 

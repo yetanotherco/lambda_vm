@@ -547,4 +547,6 @@ impl LeanPass {
 }
 
 #[cfg(test)]
+pub(crate) mod split;
+#[cfg(test)]
 mod tests;
