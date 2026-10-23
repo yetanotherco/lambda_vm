@@ -1034,6 +1034,29 @@ __device__ __forceinline__ Fe3 gkr_h(const Fe3 &a, const Fe3 &b, const Fe3 &c, c
     return ext3::add(ext3::add(ext3::mul(a, d), ext3::mul(b, c)), ext3::mul(lambda, cd));
 }
 
+// An input layer kept without its padding (`crate::gkr::DeviceFractionTree::from_truncated_input`):
+// the upper halves `p_hi` and `q_hi` (factors 1 and 3) hold only their first `stored` cells, and
+// every cell from there on is the padding's fraction — `0` in `p`, `1` in `q`. The padding is the
+// tail of the layer (the interaction slot is the high bits of a cell's index, and fewer than half
+// the slots are padding), so it lies in the upper halves only, as one run to their end. A fold of
+// two padding cells gives the padding back, so after a fold the stored run is the shorter of the
+// one before and the new half. `REAL` is false for a layer stored whole, and then every cell is
+// read and written as before.
+//
+// The constants are the limbs the padded layer is written with (`ext3::zero()`, `ext3::one()`,
+// `gkr_input_from_columns`) and a fold of two of them writes the same limbs back, so a round over
+// the stored cells reads raw-identical values to one over the whole layer.
+template <bool REAL>
+__device__ __forceinline__ bool gkr_stored(int k, uint64_t i, uint64_t stored) {
+    return !REAL || !(k & 1) || i < stored;
+}
+
+template <bool REAL>
+__device__ __forceinline__ Fe3 gkr_cell(const uint64_t *f, int k, uint64_t i, uint64_t stored) {
+    if (gkr_stored<REAL>(k, i, stored)) return load_ext(f + i * 3);
+    return k < 2 ? ext3::zero() : ext3::one();
+}
+
 // One round over `quarter` cube indices. The four halves are `p`, `p + half`, `q`, `q + half`
 // (`half` ext3 cells each). With `fold`, they still hold the previous round's cube, twice as long,
 // and each is bound to `s` on the way in — `f(x) + s·(f(x + 2Q) − f(x))` at `x` and `x + Q` — and
@@ -1041,11 +1064,41 @@ __device__ __forceinline__ Fe3 gkr_h(const Fe3 &a, const Fe3 &b, const Fe3 &c, c
 // one else touches them. Then `h` at `t = 1` (`hi`), `t = 2` (`2·hi − lo`) and, with `want_h0`,
 // `t = 0` (`lo`), each weighted by `e_hi[x >> low]·e_lo[x mod 2^low]`. Block partials go to
 // `d_partials[(row·gridDim.x + block)·3]`, rows `H(1), H(2), H(0)`.
+//
+// `gkr_round_gruen_real` is the same round over a layer kept without its padding (see `gkr_cell`):
+// `stored` is the run of the upper halves' cells held before this round's fold. A cell past it is
+// read as the padding and a folded cell past it is not written — it is the padding again.
+template <bool REAL>
+__device__ __forceinline__ void gkr_round_gruen_body(
+    uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t half, uint64_t quarter,
+    uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1, uint64_t l2,
+    const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
+    uint32_t want_h0, uint64_t stored, uint64_t *__restrict__ d_partials);
+
 extern "C" __global__ __launch_bounds__(256) void gkr_round_gruen(
     uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t half, uint64_t quarter,
     uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1, uint64_t l2,
     const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
     uint32_t want_h0, uint64_t *__restrict__ d_partials) {
+    gkr_round_gruen_body<false>(p, q, half, quarter, fold, s0, s1, s2, l0, l1, l2, e_hi, e_lo,
+                                low, want_h0, 0, d_partials);
+}
+
+extern "C" __global__ __launch_bounds__(256) void gkr_round_gruen_real(
+    uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t half, uint64_t quarter,
+    uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1, uint64_t l2,
+    const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
+    uint32_t want_h0, uint64_t stored, uint64_t *__restrict__ d_partials) {
+    gkr_round_gruen_body<true>(p, q, half, quarter, fold, s0, s1, s2, l0, l1, l2, e_hi, e_lo, low,
+                               want_h0, stored, d_partials);
+}
+
+template <bool REAL>
+__device__ __forceinline__ void gkr_round_gruen_body(
+    uint64_t *__restrict__ p, uint64_t *__restrict__ q, uint64_t half, uint64_t quarter,
+    uint32_t fold, uint64_t s0, uint64_t s1, uint64_t s2, uint64_t l0, uint64_t l1, uint64_t l2,
+    const uint64_t *__restrict__ e_hi, const uint64_t *__restrict__ e_lo, uint32_t low,
+    uint32_t want_h0, uint64_t stored, uint64_t *__restrict__ d_partials) {
     Fe3 s = ext3::make(s0, s1, s2);
     Fe3 lambda = ext3::make(l0, l1, l2);
     uint64_t *factors[4] = {p, p + half * 3, q, q + half * 3};
@@ -1058,21 +1111,25 @@ extern "C" __global__ __launch_bounds__(256) void gkr_round_gruen(
         for (int k = 0; k < 4; k++) {
             uint64_t *f = factors[k];
             if (fold) {
-                Fe3 a = load_ext(f + x * 3);
-                Fe3 b = load_ext(f + (x + quarter) * 3);
-                Fe3 c = load_ext(f + (x + 2 * quarter) * 3);
-                Fe3 d = load_ext(f + (x + 3 * quarter) * 3);
+                Fe3 a = gkr_cell<REAL>(f, k, x, stored);
+                Fe3 b = gkr_cell<REAL>(f, k, x + quarter, stored);
+                Fe3 c = gkr_cell<REAL>(f, k, x + 2 * quarter, stored);
+                Fe3 d = gkr_cell<REAL>(f, k, x + 3 * quarter, stored);
                 lo[k] = ext3::add(a, ext3::mul(s, ext3::sub(c, a)));
                 hi[k] = ext3::add(b, ext3::mul(s, ext3::sub(d, b)));
-                f[x * 3 + 0] = lo[k].a;
-                f[x * 3 + 1] = lo[k].b;
-                f[x * 3 + 2] = lo[k].c;
-                f[(x + quarter) * 3 + 0] = hi[k].a;
-                f[(x + quarter) * 3 + 1] = hi[k].b;
-                f[(x + quarter) * 3 + 2] = hi[k].c;
+                if (gkr_stored<REAL>(k, x, stored)) {
+                    f[x * 3 + 0] = lo[k].a;
+                    f[x * 3 + 1] = lo[k].b;
+                    f[x * 3 + 2] = lo[k].c;
+                }
+                if (gkr_stored<REAL>(k, x + quarter, stored)) {
+                    f[(x + quarter) * 3 + 0] = hi[k].a;
+                    f[(x + quarter) * 3 + 1] = hi[k].b;
+                    f[(x + quarter) * 3 + 2] = hi[k].c;
+                }
             } else {
-                lo[k] = load_ext(f + x * 3);
-                hi[k] = load_ext(f + (x + quarter) * 3);
+                lo[k] = gkr_cell<REAL>(f, k, x, stored);
+                hi[k] = gkr_cell<REAL>(f, k, x + quarter, stored);
             }
         }
         Fe3 w = ext3::mul(load_ext(e_hi + (x >> low) * 3), load_ext(e_lo + (x & mask) * 3));
@@ -1120,10 +1177,37 @@ extern "C" __global__ __launch_bounds__(256) void gkr_round_gruen(
 // down to `cells`, written in place and to `out[(k·cells + y)·3]`, halves in the order `p_lo, p_hi,
 // q_lo, q_hi` — what the host tail starts from. Thread `y` reads cells `y` and `y + cells` and
 // writes cell `y` only.
+//
+// `gkr_gruen_finish_real` is the same over a layer kept without its padding: `stored` is the run of
+// the upper halves' cells held (see `gkr_cell`). Every cell of `out` is written.
+template <bool REAL>
+__device__ __forceinline__ void gkr_gruen_finish_body(uint64_t *__restrict__ p,
+                                                      uint64_t *__restrict__ q, uint64_t half,
+                                                      uint64_t cells, uint32_t fold, uint64_t s0,
+                                                      uint64_t s1, uint64_t s2, uint64_t stored,
+                                                      uint64_t *__restrict__ out);
+
 extern "C" __global__ void gkr_gruen_finish(uint64_t *__restrict__ p, uint64_t *__restrict__ q,
                                             uint64_t half, uint64_t cells, uint32_t fold,
                                             uint64_t s0, uint64_t s1, uint64_t s2,
                                             uint64_t *__restrict__ out) {
+    gkr_gruen_finish_body<false>(p, q, half, cells, fold, s0, s1, s2, 0, out);
+}
+
+extern "C" __global__ void gkr_gruen_finish_real(uint64_t *__restrict__ p,
+                                                 uint64_t *__restrict__ q, uint64_t half,
+                                                 uint64_t cells, uint32_t fold, uint64_t s0,
+                                                 uint64_t s1, uint64_t s2, uint64_t stored,
+                                                 uint64_t *__restrict__ out) {
+    gkr_gruen_finish_body<true>(p, q, half, cells, fold, s0, s1, s2, stored, out);
+}
+
+template <bool REAL>
+__device__ __forceinline__ void gkr_gruen_finish_body(uint64_t *__restrict__ p,
+                                                      uint64_t *__restrict__ q, uint64_t half,
+                                                      uint64_t cells, uint32_t fold, uint64_t s0,
+                                                      uint64_t s1, uint64_t s2, uint64_t stored,
+                                                      uint64_t *__restrict__ out) {
     Fe3 s = ext3::make(s0, s1, s2);
     uint64_t total = 4 * cells;
     for (uint64_t task = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; task < total;
@@ -1131,13 +1215,15 @@ extern "C" __global__ void gkr_gruen_finish(uint64_t *__restrict__ p, uint64_t *
         uint64_t k = task / cells;
         uint64_t y = task - k * cells;
         uint64_t *f = (k < 2 ? p : q) + (k & 1) * half * 3;
-        Fe3 v = load_ext(f + y * 3);
+        Fe3 v = gkr_cell<REAL>(f, (int)k, y, stored);
         if (fold) {
-            Fe3 hi = load_ext(f + (y + cells) * 3);
+            Fe3 hi = gkr_cell<REAL>(f, (int)k, y + cells, stored);
             v = ext3::add(v, ext3::mul(s, ext3::sub(hi, v)));
-            f[y * 3 + 0] = v.a;
-            f[y * 3 + 1] = v.b;
-            f[y * 3 + 2] = v.c;
+            if (gkr_stored<REAL>((int)k, y, stored)) {
+                f[y * 3 + 0] = v.a;
+                f[y * 3 + 1] = v.b;
+                f[y * 3 + 2] = v.c;
+            }
         }
         uint64_t *at = out + task * 3;
         at[0] = v.a;

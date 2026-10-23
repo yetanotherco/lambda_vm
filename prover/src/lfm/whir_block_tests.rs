@@ -2538,6 +2538,14 @@ fn the_whir_block_tree_on_a_real_block() {
             multilinear::gpu::coset_fallbacks(),
         );
     }
+    // Each table's input layer kept on the card without its padding
+    // (`LAMBDA_VM_ARGUE_INPUT_REAL`), and under `check` how many were compared
+    // round by round with the whole layer.
+    println!(
+        "W3 ARGUE INPUT REAL: {} · {}",
+        multilinear::gkr_input_real::input_real_in_effect(),
+        multilinear::gkr_input_real::counts().line()
+    );
     // The precomputed trees the run downloaded on cache misses, by path, and
     // the staging pairs' waits (I-COPIES L1): the recursion's LFM proofs are
     // where they happen.

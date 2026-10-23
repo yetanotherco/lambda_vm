@@ -367,6 +367,12 @@ pub(crate) fn inverse_lefts<F: IsField>(rhos: &[FieldElement<F>]) -> Vec<Option<
 /// generic rounds without a card. Returns the rounds, their challenges and the
 /// five factors (`eq` first) over `2^low` cells, as `gpu::DeviceTree::prove_layer`
 /// hands them back.
+///
+/// The upper halves `halves[1]` (`p_hi`) and `halves[3]` (`q_hi`) may stop
+/// short of `2^m` cells, as an input layer kept without its padding does
+/// (`crate::gkr_input_real`): every cell past the end is the padding's `0`
+/// in `p` and `1` in `q`, a fold keeps only the cells below the run held
+/// before it, and the run is never longer than the cube still live.
 #[cfg(test)]
 pub(crate) fn host_rounds<F, T>(
     halves: [Vec<FieldElement<F>>; 4],
@@ -390,6 +396,15 @@ where
         .collect();
     let lefts = inverse_lefts(&point[..rounds]);
     let mut f = halves;
+    let padding = [
+        FieldElement::<F>::zero(),
+        FieldElement::zero(),
+        FieldElement::one(),
+        FieldElement::one(),
+    ];
+    let cell = |g: &[FieldElement<F>], k: usize, i: usize| -> FieldElement<F> {
+        g.get(i).cloned().unwrap_or_else(|| padding[k].clone())
+    };
     let mut chain = Chain::new(claim).expect("a field with 2 and 3 invertible");
     let mut proofs = Vec::new();
     let mut challenges: Vec<FieldElement<F>> = Vec::new();
@@ -397,11 +412,15 @@ where
     for j in 0..rounds {
         let quarter = 1usize << (m - j - 1);
         if let Some(s) = challenges.last() {
-            for g in f.iter_mut() {
-                for x in 0..2 * quarter {
-                    let folded = &g[x] + s * &(&g[x + 2 * quarter] - &g[x]);
-                    g[x] = folded;
-                }
+            for (k, g) in f.iter_mut().enumerate() {
+                let folded: Vec<FieldElement<F>> = (0..g.len().min(2 * quarter))
+                    .map(|x| {
+                        let lo = cell(g, k, x);
+                        let hi = cell(g, k, x + 2 * quarter);
+                        &lo + s * &(&hi - &lo)
+                    })
+                    .collect();
+                *g = folded;
             }
         }
         let want_h0 = lefts[j].is_none();
@@ -412,13 +431,13 @@ where
         );
         for x in 0..quarter {
             let w = &e_hi[j][x >> low] * &e_lo[x & ((1 << low) - 1)];
-            let lo: [&FieldElement<F>; 4] = std::array::from_fn(|k| &f[k][x]);
-            let hi: [&FieldElement<F>; 4] = std::array::from_fn(|k| &f[k][x + quarter]);
-            let two: [FieldElement<F>; 4] = std::array::from_fn(|k| hi[k] + hi[k] - lo[k]);
-            h1 += &w * h(hi);
+            let lo: [FieldElement<F>; 4] = std::array::from_fn(|k| cell(&f[k], k, x));
+            let hi: [FieldElement<F>; 4] = std::array::from_fn(|k| cell(&f[k], k, x + quarter));
+            let two: [FieldElement<F>; 4] = std::array::from_fn(|k| &hi[k] + &hi[k] - &lo[k]);
+            h1 += &w * h([&hi[0], &hi[1], &hi[2], &hi[3]]);
             h2 += &w * h([&two[0], &two[1], &two[2], &two[3]]);
             if want_h0 {
-                h0 += &w * h(lo);
+                h0 += &w * h([&lo[0], &lo[1], &lo[2], &lo[3]]);
             }
         }
         let message = chain
@@ -441,18 +460,19 @@ where
         challenges.push(z);
     }
     let cells = 1usize << low;
-    if let Some(s) = challenges.last() {
-        for g in f.iter_mut() {
-            for y in 0..cells {
-                let folded = &g[y] + s * &(&g[y + cells] - &g[y]);
-                g[y] = folded;
-            }
-        }
-    }
     let eq: Vec<FieldElement<F>> = e_lo.iter().map(|v| chain.kappa() * v).collect();
     let mut factors = vec![crate::mle::Mle::new(eq).expect("a cube")];
-    for g in f {
-        factors.push(crate::mle::Mle::new(g[..cells].to_vec()).expect("a cube"));
+    for (k, g) in f.iter().enumerate() {
+        let bound: Vec<FieldElement<F>> = (0..cells)
+            .map(|y| match challenges.last() {
+                Some(s) => {
+                    let lo = cell(g, k, y);
+                    &lo + s * &(&cell(g, k, y + cells) - &lo)
+                }
+                None => cell(g, k, y),
+            })
+            .collect();
+        factors.push(crate::mle::Mle::new(bound).expect("a cube"));
     }
     (proofs, challenges, factors)
 }
@@ -592,6 +612,122 @@ mod tests {
         let want = today(&halves, &point, &lambda, 1, &mut a);
         let got = host_rounds(halves, &point, &lambda, claim, 1, &mut b);
         assert_eq!(values(&got), values(&want));
+    }
+
+    /// An input layer of `interactions` rounded up to a power of two, `rows` a
+    /// slot, the slot in the high bits: random fractions with the padding
+    /// written out as `pad_p / pad_q` (`0/1` for a real one), its point, `λ`,
+    /// the claim the level above makes of it, and how many cells of each upper
+    /// half are real.
+    fn input_layer(
+        interactions: usize,
+        rows: usize,
+        pad: (FE, FE),
+        seed: u64,
+    ) -> ([Vec<FE>; 4], Vec<FE>, FE, FE, usize) {
+        let full = interactions.next_power_of_two() * rows;
+        let m = full.trailing_zeros() as usize - 1;
+        let (mut halves, point, lambda, _) = layer(m, seed);
+        let half = 1usize << m;
+        let stored = interactions * rows - half;
+        for x in stored..half {
+            halves[1][x] = pad.0;
+            halves[3][x] = pad.1;
+        }
+        let eq = crate::eq::eq_evals(&point);
+        let claim = (0..half).fold(FE::zero(), |acc, x| {
+            let [a, b, c, d] = [&halves[0][x], &halves[1][x], &halves[2][x], &halves[3][x]];
+            acc + &eq[x] * (a * d + b * c + &lambda * &(c * d))
+        });
+        (halves, point, lambda, claim, stored)
+    }
+
+    /// Today's rounds over the whole layer against the device algorithm over
+    /// its upper halves cut at the real fractions.
+    fn kept_against_today(
+        interactions: usize,
+        rows: usize,
+        pad: (FE, FE),
+        low: usize,
+        seed: u64,
+    ) -> (crate::gpu::LayerRounds<Ext3>, crate::gpu::LayerRounds<Ext3>, bool) {
+        let (halves, point, lambda, claim, stored) = input_layer(interactions, rows, pad, seed);
+        let mut kept = halves.clone();
+        kept[1].truncate(stored);
+        kept[3].truncate(stored);
+        let mut a = DefaultTranscript::<Ext3>::new(b"gruen");
+        let mut b = DefaultTranscript::<Ext3>::new(b"gruen");
+        let want = today(&halves, &point, &lambda, low, &mut a);
+        let got = host_rounds(kept, &point, &lambda, claim, low, &mut b);
+        let same_transcript = a.state() == b.state();
+        (want, got, same_transcript)
+    }
+
+    /// ★ An input layer kept without its padding — the upper halves stopping
+    /// at the real fractions, the rest read as `0/1` — sends today's rounds
+    /// over the whole layer, draws today's challenges and hands the tail
+    /// today's factors, at every split of card rounds and host tail. The
+    /// shapes put the padding's start anywhere from one cell into the upper
+    /// halves to one cell before their end, and from one fold before the slot
+    /// bits are spent to every round (`low = 0`).
+    #[test]
+    fn a_layer_kept_without_its_padding_sends_todays_rounds() {
+        let shapes = [
+            (5usize, 1usize), // one real cell in each upper half
+            (7, 1),           // one padding cell
+            (3, 2),
+            (5, 4),
+            (7, 8),
+            (20, 16), // a CPU table's slots, few rows
+            (9, 64),
+            (33, 4),
+            (1031, 1), // a Keccak-round table's slots
+            (2047, 1),
+            (1025, 2),
+        ];
+        for (n, &(interactions, rows)) in shapes.iter().enumerate() {
+            let m = (interactions.next_power_of_two() * rows).trailing_zeros() as usize - 1;
+            for low in [0, 1, 2, 5, m] {
+                let what = format!("{interactions} interactions × {rows} rows (m {m}), low {low}");
+                let padding = (FE::zero(), FE::one());
+                let (want, got, same) =
+                    kept_against_today(interactions, rows, padding, low, 0x5EED + n as u64);
+                assert_eq!(values(&got), values(&want), "{what}: rounds or factors differ");
+                assert_eq!(got.1, want.1, "{what}: the challenges differ");
+                assert!(same, "{what}: the transcripts parted");
+            }
+        }
+    }
+
+    /// The same with `H(0)` summed on the card every round.
+    #[test]
+    fn a_kept_layer_with_a_direct_h0_sends_todays_rounds() {
+        force_gkr_gruen_direct_h0(true);
+        let outcome = std::panic::catch_unwind(|| {
+            for (interactions, rows) in [(5usize, 4usize), (1031, 1)] {
+                let (want, got, same) =
+                    kept_against_today(interactions, rows, (FE::zero(), FE::one()), 1, 0xD1);
+                assert_eq!(values(&got), values(&want));
+                assert!(same);
+            }
+        });
+        force_gkr_gruen_direct_h0(false);
+        outcome.unwrap();
+    }
+
+    /// ⛔ The comparison above can fail: a layer whose padding is not `0/1` —
+    /// what a kept layer read with the wrong constant would stand for — sends
+    /// other rounds than the kept one.
+    #[test]
+    fn padding_that_is_not_zero_over_one_changes_the_rounds() {
+        for pad in [(FE::zero(), FE::zero()), (FE::one(), FE::one())] {
+            let (want, got, _) = kept_against_today(20, 16, pad, 2, 0xBAD);
+            assert_ne!(
+                values(&got).0,
+                values(&want).0,
+                "the padding's value must reach the rounds"
+            );
+        }
     }
 
     /// ⛔ The comparison above can fail: a claim off by one changes the rounds

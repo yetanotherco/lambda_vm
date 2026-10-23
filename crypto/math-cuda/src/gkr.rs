@@ -23,6 +23,21 @@ struct DeviceLayer {
     p: Arc<CudaSlice<u64>>,
     q: Arc<CudaSlice<u64>>,
     num_vars: usize,
+    /// The cells `p` and `q` hold: the whole cube, `2^num_vars`, except for an
+    /// input layer kept without its padding
+    /// ([`DeviceFractionTree::from_truncated_input`]), whose cells from here
+    /// on are the padding's `0/1`.
+    real: usize,
+}
+
+impl DeviceLayer {
+    fn whole(&self) -> bool {
+        self.real == 1usize << self.num_vars
+    }
+}
+
+fn invalid() -> cudarc::driver::DriverError {
+    cudarc::driver::DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE)
 }
 
 /// The whole tree, `layers[0]` the output fraction and layer `layers.len()`
@@ -140,6 +155,7 @@ impl DeviceFractionTree {
             p: Arc::new(p),
             q: Arc::new(q),
             num_vars: elements.trailing_zeros() as usize,
+            real: elements,
         };
         let layers = fold_upwards(&stream, be, &input.p, &input.q, elements, elements)?;
         Ok(Self {
@@ -196,6 +212,54 @@ impl DeviceFractionTree {
         })
     }
 
+    /// The same truncated input layer, **kept**: the first fold reads its
+    /// padding as the `0/1` it is, as [`from_padded_input`](Self::from_padded_input)'s
+    /// does, and the layer's own Gruen rounds read it that way too
+    /// ([`layer_gruen`](Self::layer_gruen)), so it is never written. That is
+    /// the cells of the padding left out of the write, the first fold and the
+    /// input layer's first rounds, which are as large as the layer.
+    ///
+    /// Only the Gruen rounds read a layer kept this way; today's session over
+    /// it ([`layer_sumcheck`](Self::layer_sumcheck)) is refused, and its caller
+    /// writes the whole layer again.
+    ///
+    /// **The caller holds the room** — [`truncated_peak_bytes`] — because a
+    /// caller that has to write the whole layer for today's session does so
+    /// after this tree is gone. A shape no count rounded up to a power of two
+    /// gives is refused before anything runs.
+    pub fn from_truncated_input(
+        stream: Arc<CudaStream>,
+        p: CudaSlice<u64>,
+        q: CudaSlice<u64>,
+        real: usize,
+        num_vars: usize,
+    ) -> Result<Self> {
+        let full = 1usize.checked_shl(num_vars as u32).ok_or_else(invalid)?;
+        let rounded_up = real <= full && real > full / 2;
+        if p.len() != real * 3 || q.len() != real * 3 || !rounded_up {
+            return Err(invalid());
+        }
+        let be = backend()?;
+        crate::argue_probe::note_device(
+            crate::argue_probe::Surface::Gkr,
+            truncated_peak_bytes(real, full),
+        );
+        let input = DeviceLayer {
+            p: Arc::new(p),
+            q: Arc::new(q),
+            num_vars,
+            real,
+        };
+        let layers = fold_upwards(&stream, be, &input.p, &input.q, real, full)?;
+        Ok(Self {
+            stream,
+            layers,
+            input: Some(input),
+            input_num_vars: num_vars,
+            _room: None,
+        })
+    }
+
     /// Every level plus the input layer, whether or not this tree holds it.
     pub fn num_layers(&self) -> usize {
         self.layers.len() + 1
@@ -211,6 +275,12 @@ impl DeviceFractionTree {
     /// input layer, or the caller has to hand it back first.
     pub fn holds_input(&self) -> bool {
         self.input.is_some()
+    }
+
+    /// Whether the input layer it holds was kept without its padding
+    /// ([`from_truncated_input`](Self::from_truncated_input)).
+    pub fn input_truncated(&self) -> bool {
+        self.input.as_ref().is_some_and(|input| !input.whole())
     }
 
     /// The output fraction `(p, q)`, the one the bus balance is read off.
@@ -266,6 +336,11 @@ impl DeviceFractionTree {
                 cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
             ))?,
         };
+        // This session reads every cell of the halves: a layer kept without
+        // its padding is the Gruen rounds' alone.
+        if !level.whole() {
+            return Err(invalid());
+        }
         sumcheck_over_layer(
             &self.stream,
             &level.p,
@@ -333,6 +408,7 @@ fn fold_upwards(
             p: Arc::new(p_out),
             q: Arc::new(q_out),
             num_vars,
+            real: half,
         });
     }
     layers.reverse();
@@ -392,6 +468,23 @@ pub fn padded_peak_bytes(real: usize, full: usize) -> u64 {
     ((2 * real + full).max(2 * full)) as u64 * 24
 }
 
+/// What a tree built by [`DeviceFractionTree::from_truncated_input`] holds at
+/// once: the truncated input layer, kept, and every level above it (`full − 1`
+/// cells of each side) — against `4·full` cells for a tree that carries its
+/// padding. Also covers the whole layer written again for today's session
+/// once the tree is gone.
+pub fn truncated_peak_bytes(real: usize, full: usize) -> u64 {
+    (2 * real + 2 * full) as u64 * 24
+}
+
+/// The run of an upper half's cells a layer kept without its padding still
+/// holds after a round over `quarter` indices: the fold leaves a half of
+/// `2·quarter` cells, and a cell past the run held before it folds two padding
+/// cells into the padding again.
+pub fn stored_after_round(stored: usize, quarter: usize) -> usize {
+    stored.min(2 * quarter)
+}
+
 /// Blocks a Gruen round launches at most; past it the grid-stride loop takes
 /// over. A few blocks an SM on a 170-SM card, and the partials stay small.
 const GRUEN_MAX_GRID: u32 = 2048;
@@ -414,6 +507,13 @@ pub struct GruenLayer {
     q_at: u64,
     /// Cells in each half: `2^m`.
     half: usize,
+    /// The run of cells the upper halves `p_hi`, `q_hi` hold before the next
+    /// fold — every cell of the cube they hold now, for a layer stored whole.
+    /// Past it is the padding of a layer kept without it
+    /// ([`DeviceFractionTree::from_truncated_input`]), read as `0/1`.
+    stored: usize,
+    /// Whether the layer was opened without its padding.
+    truncated: bool,
     /// The point's limbs, `m` ext3 values.
     point: Vec<u64>,
     /// `L`: the variables left to the host, `2^L` cells.
@@ -430,15 +530,17 @@ pub struct GruenLayer {
 }
 
 impl GruenLayer {
-    /// Over one layer's halves: `p` and `q` of `2^num_vars` cells each, the
-    /// point `m = num_vars − 1` ext3 values, and at most `low` variables left
-    /// to the host (fewer when the layer is smaller).
+    /// Over one layer's halves: `p` and `q` of `2^num_vars` cells each — or
+    /// the first `real` of them, more than half, for an input layer kept
+    /// without its padding — the point `m = num_vars − 1` ext3 values, and at
+    /// most `low` variables left to the host (fewer when the layer is smaller).
     #[allow(clippy::too_many_arguments)]
     fn new(
         stream: &Arc<CudaStream>,
         p: &Arc<CudaSlice<u64>>,
         q: &Arc<CudaSlice<u64>>,
         num_vars: usize,
+        real: usize,
         point: &[u64],
         low: usize,
     ) -> Result<Self> {
@@ -446,8 +548,9 @@ impl GruenLayer {
         let m = num_vars - 1;
         assert_eq!(point.len(), m * 3, "the point spans the halves");
         let half = 1usize << m;
-        assert_eq!(p.len(), 2 * half * 3, "p spans the layer");
-        assert_eq!(q.len(), 2 * half * 3, "q spans the layer");
+        if p.len() != real * 3 || q.len() != real * 3 || real <= half || real > 2 * half {
+            return Err(invalid());
+        }
         let low = low.min(m);
         let rounds = m - low;
 
@@ -493,6 +596,8 @@ impl GruenLayer {
             p_at,
             q_at,
             half,
+            stored: real - half,
+            truncated: real < 2 * half,
             point: point.to_vec(),
             low,
             rounds,
@@ -506,6 +611,11 @@ impl GruenLayer {
     /// The rounds this layer runs on the card, `J`.
     pub fn rounds(&self) -> usize {
         self.rounds
+    }
+
+    /// Whether the layer was opened without its padding.
+    pub fn truncated(&self) -> bool {
+        self.truncated
     }
 
     /// The variables left to the host, `L`: the halves come back over `2^L`.
@@ -558,9 +668,24 @@ impl GruenLayer {
         let half = self.half as u64;
         let low = self.low as u32;
         let want = u32::from(want_h0);
+        let stored = self.stored as u64;
+        // The cube the upper halves hold coming into this round; once their
+        // stored run covers it, the padding is spent and today's kernel reads
+        // every cell.
+        let cube = if fold_by.is_some() { 4 } else { 2 } * quarter;
+        let kernel = if stored < cube {
+            &be.gkr_round_gruen_real
+        } else {
+            &be.gkr_round_gruen
+        };
+        let config = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: block * 3 * 8,
+        };
         unsafe {
-            self.stream
-                .launch_builder(&be.gkr_round_gruen)
+            let mut launch = self.stream.launch_builder(kernel);
+            launch
                 .arg(&self.p_at)
                 .arg(&self.q_at)
                 .arg(&half)
@@ -575,13 +700,11 @@ impl GruenLayer {
                 .arg(&e_hi)
                 .arg(&e_lo)
                 .arg(&low)
-                .arg(&want)
-                .arg(&mut self.partials)
-                .launch(LaunchConfig {
-                    grid_dim: (grid, 1, 1),
-                    block_dim: (block, 1, 1),
-                    shared_mem_bytes: block * 3 * 8,
-                })?;
+                .arg(&want);
+            if stored < cube {
+                launch.arg(&stored);
+            }
+            launch.arg(&mut self.partials).launch(config)?;
             let reduce_block = 256u32;
             self.stream
                 .launch_builder(&be.sum_partials_ext3)
@@ -594,6 +717,7 @@ impl GruenLayer {
                     shared_mem_bytes: reduce_block * 3 * 8,
                 })?;
         }
+        self.stored = stored_after_round(self.stored, quarter as usize);
         self.done += 1;
         Ok(rows)
     }
@@ -627,9 +751,17 @@ impl GruenLayer {
         let s = fold_by.copied().unwrap_or([0; 3]);
         let fold = u32::from(fold_by.is_some());
         let half = self.half as u64;
+        let stored = self.stored as u64;
+        // The cube the halves hold: twice the cells with a fold to run.
+        let cube = if fold_by.is_some() { 2 * cells } else { cells };
+        let kernel = if stored < cube {
+            &be.gkr_gruen_finish_real
+        } else {
+            &be.gkr_gruen_finish
+        };
         unsafe {
-            self.stream
-                .launch_builder(&be.gkr_gruen_finish)
+            let mut launch = self.stream.launch_builder(kernel);
+            launch
                 .arg(&self.p_at)
                 .arg(&self.q_at)
                 .arg(&half)
@@ -637,13 +769,15 @@ impl GruenLayer {
                 .arg(&fold)
                 .arg(&s[0])
                 .arg(&s[1])
-                .arg(&s[2])
-                .arg(&mut out)
-                .launch(LaunchConfig {
-                    grid_dim: ((4 * cells).div_ceil(256).min(4096) as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+                .arg(&s[2]);
+            if stored < cube {
+                launch.arg(&stored);
+            }
+            launch.arg(&mut out).launch(LaunchConfig {
+                grid_dim: ((4 * cells).div_ceil(256).min(4096) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
         }
         let values = self.stream.clone_dtoh(&out)?;
         self.stream.synchronize()?;
@@ -655,6 +789,9 @@ impl GruenLayer {
     /// table, factors 1..5 the halves where they lie. Run its round after this
     /// layer's round `j` has folded the halves, with
     /// [`SumcheckSession::fold_first`] keeping its `eq` in step.
+    ///
+    /// Refused for a layer opened without its padding: today's session reads
+    /// every cell of the halves.
     pub fn shadow(
         &self,
         nodes: &[u64],
@@ -662,6 +799,9 @@ impl GruenLayer {
         num_slots: usize,
         root_slot: u32,
     ) -> Result<SumcheckSession> {
+        if self.truncated {
+            return Err(invalid());
+        }
         let eq = Arc::new(crate::sumcheck::eq_table_ext3(
             &self.stream,
             &self.point,
@@ -718,14 +858,35 @@ impl DeviceFractionTree {
                 cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
             ))?,
         };
-        GruenLayer::new(&self.stream, &level.p, &level.q, level.num_vars, point, low)
+        GruenLayer::new(
+            &self.stream,
+            &level.p,
+            &level.q,
+            level.num_vars,
+            level.real,
+            point,
+            low,
+        )
     }
 }
 
 impl InputLayer {
     /// The input layer's Gruen rounds, the ones that end GKR.
     pub fn gruen(&self, point: &[u64], low: usize) -> Result<GruenLayer> {
-        GruenLayer::new(&self.stream, &self.p, &self.q, self.num_vars, point, low)
+        GruenLayer::new(
+            &self.stream,
+            &self.p,
+            &self.q,
+            self.num_vars,
+            1usize << self.num_vars,
+            point,
+            low,
+        )
+    }
+
+    /// Bytes the layer holds: both sides over the whole cube.
+    pub fn bytes(&self) -> u64 {
+        (self.p.len() + self.q.len()) as u64 * 8
     }
 }
 
@@ -822,4 +983,73 @@ pub fn input_from_columns(
             })?;
     }
     Ok((p, q))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Where the padding of an upper half starts, and that it runs to the end.
+    fn padding_start(pad: &[bool]) -> usize {
+        let start = pad.iter().position(|&p| p).unwrap_or(pad.len());
+        assert!(pad[start..].iter().all(|&p| p), "the padding is one run to the end");
+        start
+    }
+
+    /// ★ The run a kept layer's upper halves hold is exact: worked out cell
+    /// by cell (a folded cell is padding exactly when both cells it folds
+    /// are), the padding is one run to the end of the live half after every
+    /// fold, starting where [`stored_after_round`] says — so a kernel that
+    /// reads the run and the constants past it reads every cell the whole
+    /// layer would. And a round reads its cube through the kept kernel
+    /// exactly while padding is left in it.
+    #[test]
+    fn the_stored_run_is_where_the_padding_starts_after_every_fold() {
+        for m in 1..=12usize {
+            let half = 1usize << m;
+            for stored in [1, 2, half / 3 + 1, half / 2, half / 2 + 1, half - 1, half] {
+                if stored == 0 || stored > half {
+                    continue;
+                }
+                let mut pad: Vec<bool> = (0..half).map(|i| i >= stored).collect();
+                let mut run = stored;
+                for j in 0..m {
+                    let what = format!("m {m}, stored {stored}, round {j}");
+                    let quarter = 1usize << (m - j - 1);
+                    // The cube the halves hold coming into round `j`: round
+                    // `j > 0` folds the previous round's on the way in.
+                    let cube = if j > 0 { 4 * quarter } else { 2 * quarter };
+                    assert_eq!(pad.len(), cube, "{what}: the live half");
+                    let start = padding_start(&pad);
+                    assert_eq!(run.min(cube), start, "{what}: the run held coming in");
+                    assert_eq!(run < cube, start < cube, "{what}: the kept kernel exactly while padding is left");
+                    if j > 0 {
+                        pad = (0..2 * quarter)
+                            .map(|x| pad[x] && pad[x + 2 * quarter])
+                            .collect();
+                    }
+                    run = stored_after_round(run, quarter);
+                    assert_eq!(run, padding_start(&pad), "{what}: the run held after it");
+                }
+            }
+        }
+    }
+
+    /// The room a kept tree promises: the kept layer and every level above
+    /// it — what carrying it costs when there is no padding to leave out.
+    #[test]
+    fn a_kept_tree_promises_its_layer_and_the_levels_above() {
+        let full = 1usize << 20;
+        assert_eq!(truncated_peak_bytes(full, full), (4 * full) as u64 * 24);
+        // A CPU table: 20 of 32 slots real, 2^21 rows.
+        let (rows, slots, interactions) = (1usize << 21, 32usize, 20usize);
+        let (real, full) = (interactions * rows, slots * rows);
+        assert_eq!(truncated_peak_bytes(real, full), (2 * real + 2 * full) as u64 * 24);
+        assert!(truncated_peak_bytes(real, full) < (4 * full) as u64 * 24);
+        // It covers the kept layer plus every level above (full − 1 cells a
+        // side), and the whole layer written again once the tree is gone.
+        let levels = 2 * (full - 1);
+        assert!(truncated_peak_bytes(real, full) >= (2 * real + levels) as u64 * 24);
+        assert!(truncated_peak_bytes(real, full) >= (2 * full) as u64 * 24);
+    }
 }

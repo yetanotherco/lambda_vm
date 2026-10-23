@@ -701,6 +701,7 @@ pub fn reset_call_counters() {
     ROOM_COMMIT_REFUSALS.store(0, Ordering::Relaxed);
     ROOM_SIZINGS.store(0, Ordering::Relaxed);
     ROOMS_TURN_SIZED.store(0, Ordering::Relaxed);
+    crate::gkr_input_real::reset_counts();
 }
 
 /// A sumcheck's round proofs, the challenges they drew, and what every slot
@@ -3042,9 +3043,15 @@ pub struct DeviceTree {
     /// Taken when the input layer's sumcheck comes: every level above it is
     /// spent by then, and letting them go is what makes room for it.
     tree: std::sync::Mutex<Option<math_cuda::gkr::DeviceFractionTree>>,
-    /// Writes the input layer again, for a tree that did not keep it.
+    /// Writes the input layer again, for a tree that did not keep it — or
+    /// kept it without its padding, for today's layer session, which reads
+    /// every cell.
     #[allow(clippy::type_complexity)]
     rebuild: Option<Box<dyn Fn() -> Option<math_cuda::gkr::InputLayer> + Send + Sync>>,
+    /// Whether the tree keeps its input layer without its padding
+    /// ([`crate::gkr_input_real`]): its Gruen rounds open the kept layer, and
+    /// only today's session writes it again.
+    input_truncated: bool,
     num_layers: usize,
     input_num_vars: usize,
     /// The output fraction, read off the top level.
@@ -3188,6 +3195,7 @@ where
     Some(DeviceTree {
         tree: std::sync::Mutex::new(Some(tree)),
         rebuild: None,
+        input_truncated: false,
         num_layers,
         input_num_vars,
         output: output_cell,
@@ -3309,7 +3317,8 @@ impl DeviceTree {
         let rebuilds = input_layer && self.rebuild.is_some();
         let t = tick();
         let session = if rebuilds {
-            // The one the tree gave back. Everything above it has been proved,
+            // The one the tree gave back, or kept without its padding, which
+            // this session would read. Everything above it has been proved,
             // so the levels go first and the layer is written where they were.
             let num_vars = self.input_num_vars.checked_sub(1)?;
             if num_vars * 3 != raw_point.len() {
@@ -3317,6 +3326,9 @@ impl DeviceTree {
             }
             drop(self.tree.lock().ok()?.take());
             let rebuilt = (self.rebuild.as_ref()?)()?;
+            if self.input_truncated {
+                crate::gkr_input_real::note_rebuild();
+            }
             rebuilt.sumcheck(
                 &raw_point,
                 &lowered.nodes,
@@ -3441,7 +3453,9 @@ impl DeviceTree {
         let low = tail.max(1).trailing_zeros() as usize;
         add_tick(&whir_split::GKR_LOWER, t);
         let input_layer = layer + 1 == self.num_layers;
-        let rebuilds = input_layer && self.rebuild.is_some();
+        // A layer kept without its padding is opened where it lies; the
+        // cross-check's shadow declines it (today's session reads every cell).
+        let rebuilds = input_layer && self.rebuild.is_some() && !self.input_truncated;
         let t = tick();
         let session = if rebuilds {
             let num_vars = self.input_num_vars.checked_sub(1)?;
@@ -3665,6 +3679,8 @@ impl DeviceTree {
             ))?);
         }
         let input_layer = layer + 1 == self.num_layers;
+        // A layer kept without its padding is written whole again too: this
+        // session reads every cell.
         let session = if input_layer && self.rebuild.is_some() {
             let num_vars = self.input_num_vars.checked_sub(1)?;
             if num_vars * 3 != raw_point.len() {
@@ -3673,6 +3689,9 @@ impl DeviceTree {
             drop(self.tree.lock().ok()?.take());
             let rebuilt = (self.rebuild.as_ref()?)()?;
             whir_split_bump_rebuild();
+            if self.input_truncated {
+                crate::gkr_input_real::note_rebuild();
+            }
             rebuilt.sumcheck(
                 &raw_point,
                 &lowered.nodes,
@@ -3843,6 +3862,17 @@ pub struct GruenSession {
     lambda: [u64; 3],
     /// A round queued by [`Self::enqueue`] and not yet read back: its rows.
     pending: Option<u32>,
+    /// Under `LAMBDA_VM_ARGUE_INPUT_REAL=check`, for an input layer kept
+    /// without its padding: the whole layer, written again, whose rounds run
+    /// in step and are compared with the kept one's.
+    whole: Option<WholeLayer>,
+}
+
+/// The whole input layer beside a kept one, and the room it was promised.
+#[cfg(feature = "cuda")]
+struct WholeLayer {
+    layer: math_cuda::gkr::GruenLayer,
+    _room: math_cuda::device::DeviceReservation,
 }
 
 /// A Gruen session the build could not open. Never constructed.
@@ -3871,7 +3901,8 @@ impl DeviceTree {
         let lambda = ext3_raw(lambda)?;
         let low = tail.max(1).trailing_zeros() as usize;
         let input_layer = layer + 1 == self.num_layers;
-        let session = if input_layer && self.rebuild.is_some() {
+        // A layer kept without its padding is opened where it lies.
+        let session = if input_layer && self.rebuild.is_some() && !self.input_truncated {
             let num_vars = self.input_num_vars.checked_sub(1)?;
             if num_vars * 3 != raw_point.len() {
                 return None;
@@ -3888,11 +3919,42 @@ impl DeviceTree {
             }
             tree.layer_gruen(layer, &raw_point, low)
         };
+        let layer = session.ok()?;
+        let whole = (layer.truncated()
+            && crate::gkr_input_real::argue_input_real() == crate::gkr_input_real::InputReal::Check)
+            .then(|| self.whole_beside(&raw_point, low))
+            .flatten();
         Some(GruenSession {
-            layer: session.ok()?,
+            layer,
             lambda,
             pending: None,
+            whole,
         })
+    }
+
+    /// Under `check`: the input layer written whole again beside the kept one
+    /// and opened for today's Gruen rounds — or `None`, counted, when the card
+    /// has no room for it or the write fails, and the kept layer proves alone.
+    fn whole_beside(&self, raw_point: &[u64], low: usize) -> Option<WholeLayer> {
+        let skipped = || {
+            crate::gkr_input_real::note_check_skipped();
+            None
+        };
+        let Some(rebuild) = self.rebuild.as_ref() else {
+            return skipped();
+        };
+        // The layer, and the session's `eq` levels and partials beside it.
+        let m = self.input_num_vars.saturating_sub(1);
+        let (low, rounds) = (low.min(m), m - low.min(m));
+        let bytes = (2u64 << self.input_num_vars) * 24
+            + ((1u64 << low) + (1u64 << rounds) + 3 * 2048 + 3) * 24;
+        let Some(room) = math_cuda::device::reserve(bytes) else {
+            return skipped();
+        };
+        let Some(layer) = rebuild().and_then(|whole| whole.gruen(raw_point, low).ok()) else {
+            return skipped();
+        };
+        Some(WholeLayer { layer, _room: room })
     }
 }
 
@@ -3941,6 +4003,12 @@ impl GruenSession {
                 .layer
                 .round_enqueue(fold_by.as_ref(), &self.lambda, want_h0)
                 .map_err(|_| failed())?;
+            if let Some(whole) = self.whole.as_mut() {
+                whole
+                    .layer
+                    .round_enqueue(fold_by.as_ref(), &self.lambda, want_h0)
+                    .map_err(|_| failed())?;
+            }
             self.pending = Some(rows);
         }
         Ok(())
@@ -3958,12 +4026,27 @@ impl GruenSession {
     {
         self.enqueue(previous, want_h0)?;
         let rows = self.pending.take().unwrap_or(0);
-        let sums = self
-            .layer
-            .round_collect(rows)
-            .map_err(|_| crate::Error::DeviceFailed {
-                stage: "gruen round",
-            })?;
+        let failed = || crate::Error::DeviceFailed {
+            stage: "gruen round",
+        };
+        let mut sums = self.layer.round_collect(rows).map_err(|_| failed())?;
+        if let Some(whole) = self.whole.take() {
+            let want = whole.layer.round_collect(rows).map_err(|_| failed())?;
+            if crate::gkr_input_real::check_fault()
+                && let Some(limb) = sums.first_mut()
+            {
+                *limb = limb.wrapping_add(1);
+            }
+            if sums == want {
+                self.whole = Some(whole);
+            } else {
+                // Counted, and the layer finished on the whole one: the
+                // proof is today's either way.
+                crate::gkr_input_real::note_checked(true);
+                self.layer = whole.layer;
+                sums = want;
+            }
+        }
         SUMCHECK_ROUNDS.fetch_add(1, Ordering::Relaxed);
         Ok(sums.chunks_exact(3).map(ext3_from_raw::<E>).collect())
     }
@@ -3984,7 +4067,15 @@ impl GruenSession {
             Some(r) => Some(ext3_raw(r).ok_or_else(failed)?),
             None => None,
         };
-        let values = self.layer.finish(fold_by.as_ref()).map_err(|_| failed())?;
+        let mut values = self.layer.finish(fold_by.as_ref()).map_err(|_| failed())?;
+        if let Some(mut whole) = self.whole.take() {
+            let want = whole.layer.finish(fold_by.as_ref()).map_err(|_| failed())?;
+            let differed = values != want;
+            crate::gkr_input_real::note_checked(differed);
+            if differed {
+                values = want;
+            }
+        }
         let cells = 1usize << self.layer.low();
         if values.len() != 4 * cells * 3 {
             return Err(failed());
@@ -4716,8 +4807,110 @@ fn note_gkr_tree_refusal(bytes: u64, cells: usize) {
 /// `defer` skips the one output read (the sync), leaving it for the consume
 /// site; everything else is identical, so the eager caller is byte-for-byte the
 /// path it always was.
+///
+/// A layer with padding is kept without it under `LAMBDA_VM_ARGUE_INPUT_REAL`
+/// ([`crate::gkr_input_real`]) when the card promises that tree, and otherwise
+/// built as before.
 #[cfg(feature = "cuda")]
 fn input_layer_tree_impl(
+    stream: std::sync::Arc<math_cuda::CudaStream>,
+    rows: usize,
+    interactions: usize,
+    write: InputWriter,
+    defer: bool,
+) -> Option<DeviceTree> {
+    use crate::gkr_input_real::{self as input_real, InputReal};
+
+    let full = interactions.next_power_of_two() * rows;
+    let real = interactions * rows;
+    let padded = real < full;
+    let wanted = padded
+        && !HAND_BACK_FORCED.load(Ordering::Relaxed)
+        && input_real::argue_input_real() != InputReal::Off;
+    let kept = if wanted {
+        truncated_tree(&stream, real, full, &write, defer)
+    } else {
+        None
+    };
+    let tree = match kept {
+        Some(tree) => Some(tree),
+        None => {
+            let tree = carried_or_handed_back(stream, rows, interactions, write, defer);
+            if wanted && tree.is_some() {
+                input_real::note_decline();
+            }
+            tree
+        }
+    };
+    if padded && tree.is_some() {
+        input_real::note_padded_tree();
+    }
+    tree
+}
+
+/// The tree over an input layer kept without its padding
+/// ([`math_cuda::gkr::DeviceFractionTree::from_truncated_input`]): the real
+/// fractions written, the level above folded from them with the padding read
+/// as `0/1`, and kept for the layer's Gruen rounds. Today's layer session
+/// writes the whole layer again (`rebuild`), as a tree that handed it back
+/// does, inside the same promise.
+///
+/// `None` before anything is written when the card will not promise it, and
+/// whenever the build fails: the caller then builds today's tree.
+#[cfg(feature = "cuda")]
+fn truncated_tree(
+    stream: &std::sync::Arc<math_cuda::CudaStream>,
+    real: usize,
+    full: usize,
+    write: &InputWriter,
+    defer: bool,
+) -> Option<DeviceTree> {
+    let room = math_cuda::device::reserve(math_cuda::gkr::truncated_peak_bytes(real, full))?;
+    let num_vars = full.trailing_zeros() as usize;
+    let t = crate::whir_split::tick();
+    let (p, q) = write(false)?;
+    tree_sync!(stream);
+    crate::whir_split::add_tick(&crate::whir_split::TREE_WRITE, t);
+    let t = crate::whir_split::tick();
+    let tree =
+        math_cuda::gkr::DeviceFractionTree::from_truncated_input(stream.clone(), p, q, real, num_vars)
+            .ok()?;
+    tree_sync!(stream);
+    crate::whir_split::add_tick(&crate::whir_split::TREE_FOLD, t);
+    let output = std::sync::OnceLock::new();
+    if !defer {
+        let t = crate::whir_split::tick();
+        let _ = output.set(tree.output().ok()?);
+        crate::whir_split::add_tick(&crate::whir_split::TREE_OUTPUT, t);
+    }
+    let num_layers = tree.num_layers();
+    let (write, stream) = (write.clone(), stream.clone());
+    let rebuild = move || {
+        let (p, q) = write(true)?;
+        Some(math_cuda::gkr::InputLayer::new(
+            stream.clone(),
+            p,
+            q,
+            num_vars,
+        ))
+    };
+    crate::gkr_input_real::note_kept((full - real) as u64);
+    TREE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(DeviceTree {
+        tree: std::sync::Mutex::new(Some(tree)),
+        rebuild: Some(Box::new(rebuild)),
+        input_truncated: true,
+        num_layers,
+        input_num_vars: num_vars,
+        output,
+        _room: Some(room),
+    })
+}
+
+/// Today's tree: the input layer carried with its padding, or handed back and
+/// written again for its last sumcheck when the card cannot carry it.
+#[cfg(feature = "cuda")]
+fn carried_or_handed_back(
     stream: std::sync::Arc<math_cuda::CudaStream>,
     rows: usize,
     interactions: usize,
@@ -4761,6 +4954,7 @@ fn input_layer_tree_impl(
         return Some(DeviceTree {
             tree: std::sync::Mutex::new(Some(tree)),
             rebuild: None,
+            input_truncated: false,
             num_layers,
             input_num_vars,
             output,
@@ -4817,6 +5011,7 @@ fn input_layer_tree_impl(
     Some(DeviceTree {
         tree: std::sync::Mutex::new(Some(tree)),
         rebuild: Some(Box::new(rebuild)),
+        input_truncated: false,
         num_layers,
         input_num_vars: num_vars,
         output,
