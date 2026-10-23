@@ -435,7 +435,7 @@ dropped the "chain is complete" property both rely on.
 
 Registers must also carry across epochs: epoch *i+1* must start from epoch *i*'s
 final register file. Unlike memory, the register file is **small and fixed** (34
-registers / 67 word-addresses, all present every epoch), so it needs no L2G /
+registers / 68 word-addresses, all present every epoch), so it needs no L2G /
 global telescoping — we bind the whole snapshot directly.
 
 **Mechanism (no new bus).** The REGISTER table is the register analog of PAGE — it
@@ -474,13 +474,13 @@ has no verifier-known final state) and preprocesses 2 columns, not 3.
 
 ### Commit index (x254)
 
-The COMMIT chip's running output index lives in a synthetic single-word register
-**x254** (word-address 508), so it rides the **same** register binding above —
+The COPY chip's running output index lives in the synthetic register **x254**
+(word-addresses 508-509), so it rides the **same** register binding above —
 epoch *i*'s `FINI[x254]` becomes epoch *i+1*'s `INIT[x254]`, pinned by the two
 locks like any register. Each epoch therefore indexes its committed bytes from the
 *carried* value, not from `0`:
 
-- the COMMIT trace seeds `current_commit_index` from x254
+- the COPY trace seeds `current_commit_index` from x254
   (`register_state.read_index()` in `trace_builder.rs`), with a debug-assert
   pinning the two in sync every step;
 - the verifier's commit-bus offset (`compute_commit_bus_offset`'s `start_index`)

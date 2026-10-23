@@ -155,6 +155,7 @@ fn all_table_programs_match_folders() {
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
 
     check_air(&create_cpu_air(&opts), "CPU");
+    check_air(&create_copy_air(&opts), "copy");
     check_air(&create_bitwise_air(&opts), "BITWISE");
     check_air(&create_lt_air(&opts), "LT");
     check_air(&create_shift_air(&opts), "SHIFT");
@@ -171,7 +172,6 @@ fn all_table_programs_match_folders() {
     check_air(&create_dvrm_air(&opts), "DVRM");
     check_air(&create_branch_air(&opts), "BRANCH");
     check_air(&create_halt_air(&opts), "HALT");
-    check_air(&create_commit_air(&opts), "COMMIT");
     check_air(&create_page_air(&opts, 0x1000), "PAGE");
     check_air(&create_register_air(&opts), "REGISTER");
     check_air(&create_keccak_air(&opts), "KECCAK");

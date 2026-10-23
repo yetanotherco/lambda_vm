@@ -99,7 +99,6 @@ fn every_table_participates_in_the_bus() {
         ecsm: 1,
         ecdas: 1,
         hint: 1,
-        commit: 1,
     };
     let airs = VmAirs::new(
         &elf,
@@ -157,7 +156,6 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
         ecsm,
         ecdas,
         hint,
-        commit,
     } = counts;
     [
         ("CPU", cpu),
@@ -179,7 +177,6 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
         ("ECSM", ecsm),
         ("ECDAS", ecdas),
         ("HINT", hint),
-        ("COMMIT", commit),
     ]
     .into_iter()
     .map(|(name, _count)| name)
@@ -190,8 +187,8 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
 /// but a chip whose bus footprint cancelled against itself would contribute
 /// zero however many rows it carried, and dropping *that* would move the sum by
 /// nothing. The chained chips are the candidates — ECDAS receives an
-/// accumulator state and sends the updated one back on the same bus, COMMIT
-/// telescopes on `CommitNextByte`, KECCAK_RND chains rounds — and each is
+/// accumulator state and sends the updated one back on the same bus, COPY
+/// telescopes on `CopyNext`, KECCAK_RND chains rounds — and each is
 /// supposed to be anchored by a term that does not telescope away with it.
 ///
 /// The anchor is structural, but it is *not* the range checks. Whether a term
@@ -204,7 +201,7 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
 /// What anchors a chip is a term on a bus whose *other* participants all have
 /// constrained multiplicities, because then nobody is free to absorb it. The
 /// dispatch buses are those: ECDAS receives and re-sends on `BusId::Ecdas`,
-/// COMMIT receives on `Ecall` and telescopes on `CommitNextByte`, KECCAK_RND
+/// COPY receives on `Ecall` and telescopes on `CopyNext`, KECCAK_RND
 /// chains rounds on `BusId::Keccak`, and in each case the counterparty is a
 /// chip whose own constraints fix what it may put there. Drop the chip and that
 /// term has no receiver and no witness anywhere that can be lowered to hide it.
@@ -376,10 +373,10 @@ fn dropping_a_used_table_through_the_real_verifier_is_rejected() {
 #[test]
 fn no_optional_table_uses_a_constant_multiplicity() {
     use crate::tables::{
-        branch, bytewise, commit, cpu32, dvrm, ecdas, ecsm, eq, hint, keccak, keccak_rnd, load, lt,
-        memw, memw_aligned, mul, shift, store,
+        branch, bytewise, cpu32, dvrm, ecdas, ecsm, eq, hint, keccak, keccak_rnd, load, lt, memw,
+        memw_aligned, mul, shift, store,
     };
-    let optional: [(&str, Vec<stark::lookup::BusInteraction>); 18] = [
+    let optional: [(&str, Vec<stark::lookup::BusInteraction>); 17] = [
         ("LT", lt::bus_interactions()),
         ("MEMW", memw::bus_interactions()),
         ("MEMW_A", memw_aligned::bus_interactions()),
@@ -397,7 +394,6 @@ fn no_optional_table_uses_a_constant_multiplicity() {
         ("ECSM", ecsm::bus_interactions()),
         ("ECDAS", ecdas::bus_interactions()),
         ("HINT", hint::bus_interactions()),
-        ("COMMIT", commit::bus_interactions()),
     ];
     for (name, interactions) in optional {
         assert!(
@@ -539,7 +535,7 @@ fn validate_still_requires_cpu_and_the_register_file() {
 }
 
 /// The counts ride in the proof, so they are the prover's to choose, and the
-/// sub-proof cross-check constrains only their *sum*. The six accelerators are
+/// sub-proof cross-check constrains only their *sum*. The five accelerators are
 /// not chunked — `generate_optional` emits one table or none — so any count
 /// above 1 describes a table set no prover can build, and the sum alone does not
 /// catch it: lower another count by the same amount and the total still matches.
@@ -565,13 +561,12 @@ fn an_accelerator_count_above_one_is_rejected() {
     // Named setters rather than a match with a catch-all: a wrong field would
     // otherwise pass the assertion below while testing the wrong count.
     type SetCount = fn(&mut TableCounts);
-    let inflate: [(&str, SetCount); 6] = [
+    let inflate: [(&str, SetCount); 5] = [
         ("keccak", |c| c.keccak = 2),
         ("keccak_rnd", |c| c.keccak_rnd = 2),
         ("ecsm", |c| c.ecsm = 2),
         ("ecdas", |c| c.ecdas = 2),
         ("hint", |c| c.hint = 2),
-        ("commit", |c| c.commit = 2),
     ];
     for (name, set_to_two) in inflate {
         let mut counts = honest.clone();
@@ -582,7 +577,7 @@ fn an_accelerator_count_above_one_is_rejected() {
         );
     }
 
-    // The chunked chips keep taking any count: this is a cap on the six, not a
+    // The chunked chips keep taking any count: this is a cap on the five, not a
     // cap on chunking.
     let mut many_mul = honest.clone();
     many_mul.mul = 7;
@@ -620,9 +615,9 @@ fn counts_that_wrap_have_no_total() {
 
 /// The accelerators are the ones a run most often never reaches, and each cost a
 /// four-row sub-proof regardless. A program with no keccak, no EC and no hint
-/// ecall now carries none of the six.
+/// ecall now carries none of the five.
 #[test]
-fn a_run_without_accelerators_omits_all_six() {
+fn a_run_without_accelerators_omits_all_five() {
     let (elf, logs, _instructions) = run_asm_elf("xori");
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
@@ -634,7 +629,6 @@ fn a_run_without_accelerators_omits_all_six() {
         ("ecsm", counts.ecsm),
         ("ecdas", counts.ecdas),
         ("hint", counts.hint),
-        ("commit", counts.commit),
     ] {
         assert_eq!(
             count, 0,
@@ -695,19 +689,21 @@ fn omitting_a_chip_dispatched_by_another_chip_fails_the_bus_balance() {
     assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "KECCAK_RND");
 }
 
-/// COMMIT is the one newly-optional table whose bus target is not zero: the
-/// verifier computes it from the public output the prover supplies
-/// (`compute_expected_commit_bus_balance_view`), and nothing requires
-/// `commit > 0` when that output is non-empty. Before this change the COMMIT
-/// sub-proof was structurally mandatory; now its presence is a number the
-/// prover picks, and the balance is the only thing standing behind it.
+/// The committed output is the one bus target that is not zero: the verifier
+/// computes it from the `public_output` the prover supplies
+/// (`compute_expected_commit_bus_balance_view`).
+///
+/// There is no COMMIT table to omit any more — the `write` syscall is served by
+/// COPY, which is mandatory — so the forgery left is to keep the rows that send
+/// the committed bytes and drop the output they claim. That moves the verifier's
+/// target while the sum stays put, and the two sides have to disagree.
 #[test]
-fn omitting_the_commit_table_fails_the_bus_balance() {
+fn dropping_the_committed_output_fails_the_bus_balance() {
     let (elf, logs, _instructions) = run_asm_elf("test_commit_4");
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
     assert!(
-        !traces.commits.is_empty() && !traces.public_output_bytes.is_empty(),
+        !traces.public_output_bytes.is_empty(),
         "test_commit_4 must commit output for this to be a forgery"
     );
 
@@ -716,29 +712,12 @@ fn omitting_the_commit_table_fails_the_bus_balance() {
         "the honest proof must verify first, or the negative below proves nothing"
     );
 
-    traces.commits.clear();
-    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "COMMIT");
-}
-
-/// The variant the test above does not cover: a prover who drops COMMIT can
-/// also drop the output it committed, and that moves the verifier's *target*
-/// rather than the sum — the balance is recomputed for an empty output. The
-/// CPU's commit ecalls are still in the trace with no receiver, so the two
-/// sides still have to disagree.
-#[test]
-fn omitting_the_commit_table_and_its_output_fails_the_bus_balance() {
-    let (elf, logs, _instructions) = run_asm_elf("test_commit_4");
-    let mut traces =
-        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
     let honest_target = weigh_the_bus(&elf, &mut traces, false).target;
-
-    traces.commits.clear();
     traces.public_output_bytes.clear();
     let outcome = weigh_the_bus(&elf, &mut traces, true);
     assert_ne!(
         outcome.target, honest_target,
-        "clearing the public output must move the target, or this test is the \
-         previous one over again"
+        "clearing the public output must move the target"
     );
-    assert_only_the_bus_rejected(&outcome, "COMMIT together with its output");
+    assert_only_the_bus_rejected(&outcome, "the committed output");
 }
