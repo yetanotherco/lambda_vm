@@ -109,8 +109,11 @@
 //! One consequence of that last column divergence is worth stating here rather than
 //! leaving for a reader to find: the `Commit` bus carries the index as `dst[0]`
 //! alone, while the verifier enumerates `start_index + i` over a `u64`. The two
-//! agree only while the running commit index stays below `2^32`, and `x254`'s high
-//! word is pinned to zero by the trace builder rather than by a constraint.
+//! agree only while the running commit index stays below `2^32`. COPY puts no
+//! constraint on `x254`'s high word, but the verifier pins the run's final register
+//! file (`register::halted_fini`: x254 is the output length, high word 0) and refuses
+//! an output of `2^32` bytes or more, so a run whose index carried into the high word
+//! does not verify.
 //!
 //! What keeps that safe is not the prover's own range check -- that is a backstop
 //! for a bug, and it is unreachable. It is the executor: `commit_public_output`
