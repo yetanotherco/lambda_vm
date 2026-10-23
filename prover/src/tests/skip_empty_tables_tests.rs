@@ -107,6 +107,7 @@ fn every_table_participates_in_the_bus() {
         true,
         &traces.page_configs,
         &table_counts,
+        &vec![4; table_counts.cpu],
         None,
         true,
         None,
@@ -344,6 +345,12 @@ fn dropping_a_used_table_through_the_real_verifier_is_rejected() {
         false,
         &page_configs,
         &vm_proof.table_counts,
+        &crate::cpu_heights_from_proofs(
+            stark::proof::view::MultiProofView::Owned(&vm_proof.proof),
+            &vm_proof.table_counts,
+            true,
+        )
+        .unwrap(),
         None,
         true,
         None,

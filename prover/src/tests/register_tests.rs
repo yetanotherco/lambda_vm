@@ -82,8 +82,8 @@ fn test_generate_register_trace_with_access() {
 
 #[test]
 fn test_bus_interactions() {
-    let interactions = bus_interactions();
-    assert_eq!(interactions.len(), 2); // C1, C2
+    let interactions = bus_interactions(0);
+    assert_eq!(interactions.len(), 3); // C1, C2 (PC), C2
 }
 
 #[test]
@@ -168,5 +168,52 @@ fn fini_from_final_state_matches_trace() {
     assert_eq!(
         fini_from_final_state(&empty, &init),
         fini_from_trace(&trace)
+    );
+}
+
+/// IS_PC (preprocessed) marks exactly the two x255 rows.
+#[test]
+fn test_is_pc_marks_only_the_pc_rows() {
+    let trace = generate_register_trace(
+        &FinalRegisterStateMap::new(),
+        &register_init_from_entry_point(0x1000),
+    );
+    for row in 0..trace.num_rows() {
+        let offset = trace.main_table.get(row, cols::OFFSET).to_raw();
+        let is_pc = row < NUM_REGISTER_ADDRESSES && (offset == 510 || offset == 511);
+        assert_eq!(
+            *trace.main_table.get(row, cols::IS_PC),
+            FE::from(u64::from(is_pc)),
+            "row {row} (offset {offset})"
+        );
+    }
+}
+
+/// REG-C2 splits on IS_PC: x255 is finalized at the verifier's `final_pc_ts`,
+/// every other register at its TIMESTAMP column (spec `halt.typ`).
+#[test]
+fn test_pc_final_token_uses_verifier_timestamp() {
+    use stark::lookup::Multiplicity;
+    let final_pc_ts = 4 * 1024 + 1;
+    let interactions = bus_interactions(final_pc_ts);
+    let pc_fini = interactions
+        .iter()
+        .find(|i| matches!(i.multiplicity, Multiplicity::Column(c) if c == cols::IS_PC))
+        .expect("x255 final token");
+    assert!(pc_fini.is_sender);
+    assert!(
+        format!("{:?}", pc_fini.values[3]).contains(&format!("Constant({final_pc_ts})")),
+        "x255 final timestamp is the constant final_pc_ts: {:?}",
+        pc_fini.values[3]
+    );
+    let gp_fini = interactions
+        .iter()
+        .find(|i| matches!(i.multiplicity, Multiplicity::Negated(c) if c == cols::IS_PC))
+        .expect("general register final token");
+    assert!(
+        format!("{:?}", gp_fini.values[3])
+            .contains(&format!("start_column: {}", cols::TIMESTAMP_LO)),
+        "{:?}",
+        gp_fini.values[3]
     );
 }

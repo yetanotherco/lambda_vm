@@ -1376,7 +1376,7 @@ fn collect_commit_memw_ops(
 
 /// Collects HALT finalization MEMW operations for all 33 registers.
 ///
-/// Per spec (halt.toml): at timestamp 2^64-1, HALT finalizes the GP registers:
+/// Per spec (halt.toml): at timestamp 2^32-1, HALT finalizes the GP registers:
 /// - x1-x9, x11-x31: write 0 (zeroize)
 /// - x10: read (verify exit code = 0; if x10 ≠ 0, proof fails via bus mismatch)
 ///
@@ -1387,7 +1387,7 @@ fn collect_commit_memw_ops(
 /// the finalized GP register values.
 fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
     let mut ops = Vec::with_capacity(32);
-    let ts = u64::MAX;
+    let ts = halt::HALT_TIMESTAMP;
 
     // x1-x9: write 0
     for i in 1..=9u8 {
@@ -1400,7 +1400,7 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
         register_state.write(i, 0, ts);
     }
 
-    // x10: read with old=0 at ts=2^64-1 (enforce exit_code=0)
+    // x10: read with old=0 at ts=2^32-1 (enforce exit_code=0)
     // Per spec halt:c:read_zero_exit_code: old=0 enforces x10 was 0 at halt.
     // Non-zero exit code → bus imbalance → proof failure.
     {
@@ -1425,7 +1425,7 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
     }
 
     // x255 (PC) is finalized via the inline-PC `memory` bus + REGISTER table, not
-    // via a MEMW write at 2^64-1. See `collect_halt_ops` doc and the PC finalization
+    // via a MEMW write at 2^32-1. See `collect_halt_ops` doc and the PC finalization
     // in the caller.
 
     ops
@@ -3055,7 +3055,7 @@ fn collect_all_ops(
     register_state: &mut RegisterState,
     is_final: bool,
 ) -> CollectedOps {
-    // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
+    // HALT finalization: 33 register MEMW operations at timestamp 2^32-1.
     // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
     // Only the final epoch terminates; intermediate epochs keep their boundary
     // register state (no zeroizing) so it can seed the next epoch.
@@ -3419,8 +3419,10 @@ fn build_traces<I: ImageSource + Sync>(
         // pc=1 and chain the inline-PC `memory` tokens with a +4 timestamp cadence
         // starting from the HALT chip's emit_pc at `halt_timestamp + 1`; the last
         // padding write therefore lands at `halt_timestamp + 4*num_padding_rows + 1`
-        // (= `halt_timestamp + 1` when there is no padding). The REGISTER final token
-        // must match that last write to balance the memory argument.
+        // (= `halt_timestamp + 1` when there is no padding), which is the
+        // verifier-known `cpu::final_pc_timestamp` REGISTER consumes x255 at. Only
+        // the value 1 reaches the bus (as FINI); REGISTER does not read the x255
+        // rows' timestamp columns.
         register_state.write_pc(1, halt_op.timestamp + 4 * num_padding_rows as u64 + 1);
         (halt_op.timestamp, halt_op.next_pc)
     } else {
@@ -4189,7 +4191,8 @@ impl Traces {
     /// `main_area` — for apples-to-apples comparison with other zkVMs.
     ///
     /// Preprocessed columns (committed in a separate PCS round during setup, not at
-    /// proving time) are excluded: BITWISE (11), DECODE (5), REGISTER (3), PAGE (2).
+    /// proving time) are excluded: BITWISE (11), DECODE (5), REGISTER (4), PAGE (2),
+    /// CPU (1, `TIMESTAMP`).
     pub fn total_field_elements(&self) -> u64 {
         use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
         use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
@@ -4258,7 +4261,7 @@ impl Traces {
 
         let mut total: u64 = 0;
         for t in cpus {
-            total += (t.num_rows() * CPU_COLS) as u64;
+            total += (t.num_rows() * (CPU_COLS - super::cpu::NUM_PRECOMPUTED_COLS)) as u64;
         }
         total += (bitwise.num_rows() * (BITWISE_COLS - BITWISE_PRECOMPUTED)) as u64;
         for t in lts {
@@ -4340,7 +4343,7 @@ impl Traces {
             n.div_ceil(2)
         }
 
-        let n_cpu = aux_cols(super::cpu::bus_interactions().len());
+        let n_cpu = aux_cols(super::cpu::bus_interactions(0).len());
         let n_bitwise = aux_cols(super::bitwise::bus_interactions().len());
         let n_lt = aux_cols(super::lt::bus_interactions().len());
         let n_shift = aux_cols(super::shift::bus_interactions().len());
@@ -4353,7 +4356,7 @@ impl Traces {
         let n_branch = aux_cols(super::branch::bus_interactions().len());
         let n_halt = aux_cols(super::halt::bus_interactions().len());
         let n_commit = aux_cols(super::commit::bus_interactions().len());
-        let n_register = aux_cols(super::register::bus_interactions().len());
+        let n_register = aux_cols(super::register::bus_interactions(0).len());
         // page::bus_interactions count is constant regardless of page_base.
         let n_page = aux_cols(super::page::bus_interactions(0).len());
         let n_memw_r = aux_cols(super::memw_register::bus_interactions().len());
@@ -4813,6 +4816,21 @@ impl Traces {
         #[cfg(feature = "instruments")]
         drop(__sp);
 
+        Ok(Self::collect_epoch_from_cpu_ops(
+            cpu_ops,
+            initial_image,
+            register_init,
+            is_final,
+        ))
+    }
+
+    /// Phase 2 of [`Self::collect_epoch`], over already-built CPU operations.
+    fn collect_epoch_from_cpu_ops<I: ImageSource + Sync>(
+        cpu_ops: Vec<CpuOperation>,
+        initial_image: &I,
+        register_init: &[u32],
+        is_final: bool,
+    ) -> CollectedEpoch {
         // Phase 2: Collect + route all ops
         let mut memory_state = MemoryState::from_image(initial_image);
         let mut register_state = RegisterState::from_init(register_init);
@@ -4855,11 +4873,39 @@ impl Traces {
         #[cfg(feature = "instruments")]
         drop(__sp);
 
-        Ok(CollectedEpoch {
+        CollectedEpoch {
             ops,
             memory_state,
             register_state,
-        })
+        }
+    }
+
+    /// Monolithic traces built from caller-supplied CPU operations, in the given
+    /// row order and with their own timestamps. Lets soundness tests feed the
+    /// trace builder a run no honest prover would produce.
+    #[cfg(test)]
+    pub(crate) fn from_elf_and_cpu_ops(
+        elf: &Elf,
+        cpu_ops: Vec<CpuOperation>,
+        max_rows: &super::MaxRowsConfig,
+    ) -> Result<Self, Error> {
+        let initial_image = build_initial_image(elf, &[]);
+        let register_init = register::register_init_from_entry_point(elf.entry_point);
+        let artifacts = DecodeArtifacts::from_elf(elf)?;
+        let collected =
+            Self::collect_epoch_from_cpu_ops(cpu_ops, &initial_image, &register_init, true);
+        Self::build_from_collected(
+            &artifacts,
+            collected,
+            Some(&initial_image),
+            &register_init,
+            max_rows,
+            &[],
+            true,
+            false,
+            #[cfg(feature = "disk-spill")]
+            StorageMode::Ram,
+        )
     }
 
     /// The epoch-local half of an epoch's trace build: table generation

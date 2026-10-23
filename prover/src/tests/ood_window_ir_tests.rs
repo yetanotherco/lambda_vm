@@ -89,7 +89,7 @@ fn assert_ood_window_matches_ir(
 fn all_table_windows_match_captured_ir() {
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
 
-    assert_ood_window_matches_ir(&create_cpu_air(&opts), true, "CPU");
+    assert_ood_window_matches_ir(&create_cpu_air(&opts, 0), true, "CPU");
     assert_ood_window_matches_ir(&create_bitwise_air(&opts), true, "BITWISE");
     assert_ood_window_matches_ir(&create_lt_air(&opts), true, "LT");
     assert_ood_window_matches_ir(&create_shift_air(&opts), true, "SHIFT");
@@ -108,7 +108,7 @@ fn all_table_windows_match_captured_ir() {
     assert_ood_window_matches_ir(&create_halt_air(&opts), true, "HALT");
     assert_ood_window_matches_ir(&create_commit_air(&opts), true, "COMMIT");
     assert_ood_window_matches_ir(&create_page_air(&opts, 0x1000), true, "PAGE");
-    assert_ood_window_matches_ir(&create_register_air(&opts), true, "REGISTER");
+    assert_ood_window_matches_ir(&create_register_air(&opts, 0), true, "REGISTER");
     assert_ood_window_matches_ir(&create_keccak_air(&opts), true, "KECCAK");
     assert_ood_window_matches_ir(&create_keccak_rnd_air(&opts), true, "KECCAK_RND");
     assert_ood_window_matches_ir(&create_keccak_rc_air(&opts), true, "KECCAK_RC");

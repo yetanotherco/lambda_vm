@@ -459,8 +459,8 @@ use stark::constraints::builder::{ConstraintSet, num_base_from_meta};
 
 #[test]
 fn test_cpu_bit_flag_columns_count() {
-    // 10 top-level flags + pc_double_read + prev_pc_timestamp_borrow + non_padding.
-    assert_eq!(BIT_FLAG_COLUMNS.len(), 12);
+    // 10 top-level flags + pc_double_read.
+    assert_eq!(BIT_FLAG_COLUMNS.len(), 11);
 }
 
 #[test]
