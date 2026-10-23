@@ -21,6 +21,22 @@ use tikv_jemalloc_ctl::{epoch, stats};
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// ...with the shipped binary's purge policy, so this binary is the production
+// allocator *configuration* and not just the production allocator. The reason
+// and the numbers are at `bin/cli/src/main.rs`. `prover/tests/jemalloc_conf.rs`
+// asserts that this export pattern is read, but it does so against its own copy
+// in its own process — nothing checks the copy below.
+//
+// It moves nothing this file asserts — `stats::allocated` is live bytes, which
+// the decay timers do not touch; a resident-memory assertion added here later
+// would read the wrong configuration without it.
+const NEVER_PURGE: &[u8] = b"dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
+
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: Option<&'static core::ffi::c_char> =
+    Some(unsafe { &*(NEVER_PURGE.as_ptr() as *const core::ffi::c_char) });
+
 fn allocated_bytes() -> usize {
     epoch::advance().ok();
     stats::allocated::read().unwrap_or(0)
