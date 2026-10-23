@@ -637,7 +637,7 @@ fn copy_constraints_count_and_indices() {
     use crate::tables::copy::CopyConstraints;
     use stark::constraints::builder::ConstraintSet;
     let meta = CopyConstraints.meta();
-    assert_eq!(meta.len(), 39);
+    assert_eq!(meta.len(), 40);
     // Dense, idx-ordered.
     for (i, m) in meta.iter().enumerate() {
         assert_eq!(m.constraint_idx, i);
@@ -729,6 +729,9 @@ fn a_wide_row_needs_eight_bytes_remaining() {
 /// row still reads and writes PAGE-backed cells. The executor refuses the operand
 /// range outright (`src.checked_add(n)`), so this is the acceptance-set gap those
 /// constraints close.
+///
+/// The gate stops short of the zero-length row, which moves nothing and sends its
+/// increments nowhere; rejecting it there would refuse a call the executor accepts.
 #[test]
 fn a_chain_may_not_wrap_the_address_space() {
     let air = air();
@@ -762,8 +765,8 @@ fn a_chain_may_not_wrap_the_address_space() {
         "a row whose destination walks past 2^64 must be rejected"
     );
 
-    // The gate is `mu`, not `mu - end`: the executor rejects a copy that ends on
-    // `2^64` too, because `checked_add` returns `None` there.
+    // The gate reaches the last row of a real chain: the executor rejects a copy
+    // that ends on `2^64` too, because `checked_add` returns `None` there.
     let wrapping_end = generate_copy_trace(&[row_of_width(
         Functionality::Copy,
         8,
@@ -793,6 +796,49 @@ fn a_chain_may_not_wrap_the_address_space() {
         validate_busless(&air, &legal),
         "a chain ending exactly at the top of the address space must be accepted"
     );
+
+    // ... and the zero-length call is exempt, because it moves no byte and its
+    // increments reach no successor. The executor accepts it -- `checked_add(0)`
+    // never overflows -- so gating on plain `mu` here would refuse an honest call.
+    let empty_at_the_top = generate_copy_trace(&chain(Functionality::Copy, u64::MAX, 0x2000, 0));
+    assert!(
+        validate_busless(&air, &empty_at_the_top),
+        "a zero-length copy with a pointer at u64::MAX must be accepted"
+    );
+}
+
+/// The `memset` gap may not wrap either.
+///
+/// `copy:c:set_gap` is a plain `ADD` too, and the two constraints above do not reach
+/// it: one-byte rows never push `src` or `dst` past `2^64`, so a short `memset` with
+/// `src = 2^64 - 4` and `dst = 4` walks an entirely legal chain over an operand pair
+/// the executor rejects (`DmaMemsetBadGap`).
+#[test]
+fn the_memset_gap_may_not_wrap_the_address_space() {
+    let air = air();
+    let wrapping_src = u64::MAX - 3;
+    let wrapped_dst = 4u64;
+
+    // Zero-length, and then every length a one-byte row can carry without pushing
+    // `src` itself over the top.
+    for count in 0..=3u64 {
+        let trace =
+            generate_copy_trace(&chain(Functionality::Set, wrapping_src, wrapped_dst, count));
+        assert!(
+            !validate_busless(&air, &trace),
+            "a memset of {count} bytes whose gap wraps 2^64 must be rejected"
+        );
+    }
+
+    // The same shape with a gap that does not wrap is accepted, so it is the
+    // wraparound being rejected and not the memset path itself.
+    for count in 0..=3u64 {
+        let trace = generate_copy_trace(&chain(Functionality::Set, 0x1000, 0x1008, count));
+        assert!(
+            validate_busless(&air, &trace),
+            "an honest memset of {count} bytes must be accepted"
+        );
+    }
 }
 
 /// `end` must match `count` in BOTH limbs.

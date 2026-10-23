@@ -97,21 +97,28 @@
 //! column each. `mu_com`/`mu_com_wide` are the COMMIT-bus gate the spec does not
 //! need because it writes the committed bytes through `MEMW` in domain `2·is_write`.
 //!
-//! A fourth divergence is not representational: constraints 37 and 38 pin the carry
-//! out of `src + step` and `dst + step` to zero on active rows. The spec has neither
-//! -- its `ADD` template range-checks both carries as bits and stops there -- and
-//! without them the chip accepts chains that wrap the address space, which the
-//! executor refuses outright. Extra constraints only ever narrow the acceptance set,
-//! so this is soundness-safe; it narrows it to the executor's.
+//! A fourth divergence is not representational: constraints 37, 38 and 39 pin the
+//! carry out of `src + step`, `dst + step` and the `memset` gap `src + 8` to zero.
+//! The spec has none of the three -- its `ADD` template range-checks both carries as
+//! bits and stops there, and the `ADDNW` template that used to say otherwise is gone
+//! from the spec entirely -- and without them the chip accepts operands that wrap the
+//! address space, which the executor refuses outright. Extra constraints only ever
+//! narrow the acceptance set, so this is soundness-safe; it narrows it to the
+//! executor's.
 //!
-//! One consequence of that last column divergence is worth stating here rather than leaving
-//! for a reader to find: the `Commit` bus carries the index as `dst[0]` alone, while
-//! the verifier enumerates `start_index + i` over a `u64`. The two agree only while
-//! the running commit index stays below `2^32`, and `x254`'s high word is pinned to
-//! zero by the trace builder rather than by a constraint. Past `2^32` committed bytes
-//! the prover panics ("commit index exceeds u32 range") instead of producing a bad
-//! proof, so this is a completeness cliff, not a soundness one — and it is the thing
-//! that goes away when the domain-2 write lands.
+//! One consequence of that last column divergence is worth stating here rather than
+//! leaving for a reader to find: the `Commit` bus carries the index as `dst[0]`
+//! alone, while the verifier enumerates `start_index + i` over a `u64`. The two
+//! agree only while the running commit index stays below `2^32`, and `x254`'s high
+//! word is pinned to zero by the trace builder rather than by a constraint.
+//!
+//! What keeps that safe is not the prover's own range check -- that is a backstop
+//! for a bug, and it is unreachable. It is the executor: `commit_public_output`
+//! caps the total committed output at `MAX_PUBLIC_OUTPUT_TOTAL_SIZE`, one mebibyte,
+//! so the index of an honest run stays four orders of magnitude below `2^32`. A run
+//! that tried to pass the cap fails in the executor, long before any trace exists.
+//! Raising that cap is what would make this a live question, and the domain-2 write
+//! is what retires it.
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
@@ -159,8 +166,8 @@ pub mod cols {
     pub const SRC_0: usize = 10;
     pub const SRC_1: usize = 11;
     /// `src + step`, four halfwords. The `ADD` leaves the carry out of the high limb
-    /// free; constraints 37 and 38 pin it to zero on active rows, so a chain cannot
-    /// walk past the top of the address space. See the end of `eval`.
+    /// free; constraints 37 and 38 pin it to zero on every row that moves a byte, so
+    /// a chain cannot walk past the top of the address space. See the end of `eval`.
     pub const SRC_INCR_0: usize = 12;
 
     pub const DST_0: usize = 16;
@@ -958,40 +965,60 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CopyConstraints {
         // `mu_com` restricts it to `write` rows and `mu_com_wide` to wide ones.
         b.emit_base(
             35,
-            b.main(0, cols::MU_COM) - (mu.clone() - borrow_1) * b.main(0, cols::IS_WRITE),
+            b.main(0, cols::MU_COM) - (mu.clone() - borrow_1.clone()) * b.main(0, cols::IS_WRITE),
         );
         let mu_com = b.main(0, cols::MU_COM);
         b.emit_base(36, b.main(0, cols::MU_COM_WIDE) - mu_com * (one - single));
 
-        // No chain may wrap the address space. The two `ADD`s above leave the carry
-        // out of `src + step` and `dst + step` free -- that is the spec's `ADD`, and
-        // the `ADDNW` the DMA chip used for exactly this is gone. Unconstrained, a
-        // chain walks off the top of the address space and resumes at 0: every row
-        // still reads and writes PAGE-backed cells at consistent timestamps, so the
-        // memory argument balances and no byte value is forged, but the verifier
-        // accepts a copy the executor refuses (`src.checked_add(n)` and
-        // `dst.checked_add(n)` in `execution.rs`). An acceptance set wider than the
-        // VM's is the one thing a proof of execution may not have.
+        // Nothing a row computes may wrap the address space. All three `ADD`s in this
+        // chip leave the carry out of the high limb free -- that is the spec's `ADD`
+        // template, and the `ADDNW` that used to carry this is gone from the spec
+        // entirely. Unconstrained, a chain walks off the top of the address space and
+        // resumes at 0: every row still reads and writes PAGE-backed cells at
+        // consistent timestamps, so the memory argument balances and no byte value is
+        // forged, but the verifier accepts a copy the executor refuses outright
+        // (`src.checked_add(n)` / `dst.checked_add(n)` for the positions,
+        // `src.checked_add(DMA_MEMSET_GAP) != Some(dst)` for the gap, all in
+        // `execution.rs`). An acceptance set wider than the VM's is the one thing a
+        // proof of execution may not have.
         //
-        // Gating on `mu` and not `mu - end` is what matches the executor: it rejects
-        // a copy ending exactly on `2^64` too, since `checked_add` returns `None`
-        // there. Padding rows carry `mu = 0` and are unaffected.
+        // The gate is `mu - count_borrows[1]`, not `mu`: the borrow is set exactly on
+        // the zero-length row, where no byte moves and `src_incr`/`dst_incr` go
+        // nowhere -- `copy:c:send_next_chunk` carries `mu - end` and that row is
+        // `end`. Gating on plain `mu` would reject a zero-length call whose pointer
+        // sits at the very top of memory, which the executor accepts. On every row
+        // that moves a byte the two gates agree, including the last one, which is
+        // what keeps the parity with `checked_add`: a copy may not finish on `2^64`
+        // either. Padding rows carry `mu = 0` and are unaffected.
         //
-        // Neither constraint is in the spec; see the divergence note at the top.
+        // None of the three is in the spec; see the divergence note at the top.
+        let active = mu - borrow_1;
         let src_carry_hi = add_pair_carry_hi(
             b,
             &AddOperand::dword(cols::SRC_0),
             &step,
             &AddOperand::from_dword_hl(cols::SRC_INCR_0),
         );
-        b.emit_base(37, mu.clone() * src_carry_hi);
+        b.emit_base(37, active.clone() * src_carry_hi);
         let dst_carry_hi = add_pair_carry_hi(
             b,
             &AddOperand::dword(cols::DST_0),
             &step,
             &AddOperand::from_dword_hl(cols::DST_INCR_0),
         );
-        b.emit_base(38, mu * dst_carry_hi);
+        b.emit_base(38, active * dst_carry_hi);
+        // The gap of `copy:c:set_gap` may not wrap either, and neither constraint
+        // above catches it: one-byte rows never push `src` or `dst` past `2^64`, so a
+        // `memset` with `src = 2^64 - 4`, `dst = 4` walks a legal chain over an
+        // illegal operand pair. `is_set` is the right gate -- it is what turns the
+        // `ADD` itself on.
+        let gap_carry_hi = add_pair_carry_hi(
+            b,
+            &AddOperand::dword(cols::SRC_0),
+            &AddOperand::constant(DMA_MEMSET_GAP as i64),
+            &AddOperand::dword(cols::DST_0),
+        );
+        b.emit_base(39, is_set * gap_carry_hi);
     }
 
     /// `restrict_end` multiplies `end`, `1 - count_borrows[1]` and a `count` limb,
