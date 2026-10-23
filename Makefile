@@ -3,7 +3,7 @@ compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-s
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
-test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-blake3-host-kat test-rpx-host-kat test-p1w16-host-kat test-ntt-cm-host-kat test-whir-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
+test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-blake3-host-kat test-rpx-host-kat test-p1w16-host-kat test-ntt-cm-host-kat test-whir-host-kat test-gkr-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
@@ -575,6 +575,7 @@ test: compile-programs test-syscalls test-ethrex-crypto
 	$(MAKE) test-rpx-host-kat
 	$(MAKE) test-ntt-cm-host-kat
 	$(MAKE) test-whir-host-kat
+	$(MAKE) test-gkr-host-kat
 
 # === Quick test shortcuts ===
 
@@ -709,6 +710,20 @@ test-whir-host-kat:
 	$(CXX) $(HOST_KAT_CXXFLAGS) \
 	    -o target/host_kat/whir_host_kat $(HOST_KAT_DIR)/whir_host_kat.cpp
 	./target/host_kat/whir_host_kat
+
+# Known-answer tests for the GKR layer rounds over an input layer kept without
+# its padding (`sumcheck.cu`, `LAMBDA_VM_ARGUE_INPUT_REAL`), run on the HOST
+# through the SIMT shim, every thread of a block a real thread so the block
+# reductions run as written: the kept layer's rounds and finish against today's
+# kernels over the whole layer (raw-identical), today's kernels against a copy
+# of their source from before the change, and both against a written-out
+# reference. Arithmetic and indexing only; execution stays with
+# `test-math-cuda`.
+test-gkr-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) -pthread \
+	    -o target/host_kat/gkr_host_kat $(HOST_KAT_DIR)/gkr_host_kat.cpp
+	./target/host_kat/gkr_host_kat
 
 # SECOND-SOURCE validation of the 6-round vectors the KAT above trusts.
 #
