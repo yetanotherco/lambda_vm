@@ -51,8 +51,9 @@
 //! Real rows carry `MU = 1`; the power-of-two padding rows carry `MU = 0`. Every
 //! interaction uses `Multiplicity::Column(MU)`, so padding rows fire nothing —
 //! we never rely on token self-cancellation (this is the standard pattern used
-//! by every variable-length table). `MU` is self-enforced: dropping a real row
-//! (`MU = 0`) breaks its telescoping link → bus imbalance.
+//! by every variable-length table). `MU` is a bit (`MU·(1−MU) = 0` on the
+//! epoch-local air), and dropping a real row (`MU = 0`) breaks its telescoping
+//! link → bus imbalance.
 
 use std::collections::HashMap;
 

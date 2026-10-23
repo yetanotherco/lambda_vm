@@ -59,7 +59,9 @@ pub unsafe extern "C" fn write_output(output: *const u8, size: usize) {
     unsafe {
         asm!(
             "ecall",
-            in("a0") 1usize, // fd = 1 (stdout) — required by the COMMIT chip
+            // fd = 1 (stdout) in, byte count out — the COPY chip proves both halves,
+            // so `a0` must be declared clobbered rather than preserved.
+            inout("a0") 1usize => _,
             in("a1") output,
             in("a2") size,
             in("a7") SyscallNumbers::Commit as usize,

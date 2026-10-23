@@ -7,11 +7,13 @@ pub mod bitwise_tests;
 #[cfg(test)]
 pub mod branch_bus_tests;
 #[cfg(test)]
+pub mod branch_carrier_poc;
+#[cfg(test)]
 pub mod branch_constraints_tests;
 #[cfg(test)]
-pub mod bytewise_tests;
+pub mod branch_multiplicity_poc;
 #[cfg(test)]
-pub mod commit_tests;
+pub mod bytewise_tests;
 #[cfg(test)]
 pub mod compute_commit_bus_offset_tests;
 #[cfg(test)]
@@ -26,6 +28,8 @@ pub mod constraint_set_tests_a;
 pub mod constraint_set_tests_b;
 #[cfg(test)]
 pub mod constraints_tests;
+#[cfg(test)]
+pub mod copy_tests;
 #[cfg(all(test, feature = "disk-spill"))]
 pub mod count_table_lengths_drift_tests;
 #[cfg(test)]
@@ -57,11 +61,15 @@ pub mod ir_stats_dump;
 #[cfg(test)]
 pub mod keccak_rnd_tests;
 #[cfg(test)]
+pub mod keccak_tests;
+#[cfg(test)]
 pub mod load_tests;
 #[cfg(test)]
 pub mod local_to_global_bus_tests;
 #[cfg(test)]
 pub mod lt_bus_tests;
+#[cfg(test)]
+pub mod lt_multiplicity_poc;
 #[cfg(test)]
 pub mod lt_tests;
 #[cfg(test)]
@@ -71,7 +79,11 @@ pub mod memw_register_tests;
 #[cfg(test)]
 pub mod memw_tests;
 #[cfg(test)]
+pub mod mul_mu_carrier_poc;
+#[cfg(test)]
 pub mod mul_tests;
+#[cfg(test)]
+pub mod multiplicity_forgery_poc;
 #[cfg(test)]
 pub mod ood_window_ir_tests;
 #[cfg(test)]

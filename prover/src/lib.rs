@@ -51,7 +51,7 @@ use crate::tables::trace_builder::Traces;
 use crate::tables::trace_builder::count_table_lengths;
 use crate::tables::types::BusId;
 use crate::test_utils::{
-    E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
+    E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_copy_air,
     create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ecdas_air,
     create_ecsm_air, create_eq_air, create_halt_air, create_hint_air, create_keccak_air,
     create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
@@ -81,18 +81,19 @@ pub struct RuntimePageRange {
 }
 
 /// Number of tables that contribute exactly one sub-proof regardless of
-/// `TableCounts`: bitwise, decode, halt, keccak_rc, register. The accelerator
-/// chips are counted instead — a run that never calls one carries no table for
-/// it.
+/// `TableCounts`: bitwise, decode, halt, keccak_rc, register, copy. The other
+/// accelerator chips are counted instead — a run that never calls one carries no
+/// table for it. COPY stays fixed because it receives the `write` ECALL itself, so
+/// any run that produces output reaches it.
 ///
 /// HALT is the exception, and the reason this is not simply "always": a
 /// continuation epoch carries it only when it is the final one, so `verify_epoch`
 /// sizes non-final epochs with `FIXED_TABLE_COUNT - 1`. Any caller computing an
 /// expected sub-proof count for a continuation epoch must do the same.
-pub const FIXED_TABLE_COUNT: usize = 5;
+pub const FIXED_TABLE_COUNT: usize = 6;
 
 /// How many sub-proofs each counted table contributes. Chunked chips report
-/// their chunk count; the six accelerators are not chunked and report 0 or 1
+/// their chunk count; the five accelerators are not chunked and report 0 or 1
 /// (see `validate`). The verifier needs this to reconstruct matching AIRs.
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct TableCounts {
@@ -119,7 +120,6 @@ pub struct TableCounts {
     pub ecsm: usize,
     pub ecdas: usize,
     pub hint: usize,
-    pub commit: usize,
 }
 
 impl TableCounts {
@@ -151,7 +151,6 @@ impl TableCounts {
             self.ecsm,
             self.ecdas,
             self.hint,
-            self.commit,
         ]
         .into_iter()
         .try_fold(0usize, usize::checked_add)
@@ -211,7 +210,6 @@ impl TableCounts {
             ("ecsm", self.ecsm),
             ("ecdas", self.ecdas),
             ("hint", self.hint),
-            ("commit", self.commit),
         ];
         for (name, count) in at_most_one {
             if count > 1 {
@@ -276,12 +274,14 @@ pub struct GuestInput {
 /// 4-byte magic identifying a lambda-vm recursion input blob ("LVMR").
 pub const RECURSION_INPUT_MAGIC: [u8; 4] = *b"LVMR";
 
-/// Wire-format version of the recursion input blob. v3: `TableCounts` gained the
-/// six accelerator fields, which moves every field after it in the archive. v2:
-/// rkyv pointer_width_64 (64-bit rel-ptrs) — v1 archives use 32-bit offsets.
+/// Wire-format version of the recursion input blob. v4: `TableCounts` lost its
+/// `commit` field when COPY absorbed the COMMIT table, which shortens the
+/// archive. v3: `TableCounts` gained the six accelerator fields, which moves
+/// every field after it in the archive. v2: rkyv pointer_width_64 (64-bit
+/// rel-ptrs) — v1 archives use 32-bit offsets.
 /// Any change to a type reachable from `GuestInput` belongs here: the guest
 /// reads the archive in place, so a stale blob is misread rather than rejected.
-pub const RECURSION_INPUT_VERSION: u32 = 3;
+pub const RECURSION_INPUT_VERSION: u32 = 4;
 
 /// Required alignment (bytes) of the archive's first byte in guest memory.
 pub const RECURSION_INPUT_ALIGN: usize = 16;
@@ -572,10 +572,11 @@ type AirTracePair<'a> = (
     &'a (),
 );
 
-/// Sub-proof index of the first CPU table: [`VmAirs::air_refs`] puts the four
-/// fixed tables, HALT (when included) and the accelerator tables first.
-fn cpu_start(include_halt: bool, accelerator_counts: [usize; 6]) -> usize {
-    4 + usize::from(include_halt) + accelerator_counts.iter().sum::<usize>()
+/// Sub-proof index of the first CPU table: [`VmAirs::air_refs`] puts the five
+/// fixed tables (BITWISE, DECODE, KECCAK_RC, COPY, REGISTER), HALT (when included)
+/// and the accelerator tables first.
+fn cpu_start(include_halt: bool, accelerator_counts: [usize; 5]) -> usize {
+    5 + usize::from(include_halt) + accelerator_counts.iter().sum::<usize>()
 }
 
 /// [`cpu_start`] for a proof's declared `table_counts`.
@@ -583,7 +584,6 @@ pub(crate) fn cpu_proof_start(include_halt: bool, table_counts: &TableCounts) ->
     cpu_start(
         include_halt,
         [
-            table_counts.commit,
             table_counts.keccak,
             table_counts.keccak_rnd,
             table_counts.ecsm,
@@ -625,13 +625,13 @@ pub(crate) struct VmAirs {
     pub dvrms: Vec<VmAir>,
     pub branches: Vec<VmAir>,
     pub halt: VmAir,
-    pub commits: Vec<VmAir>,
     pub keccaks: Vec<VmAir>,
     pub keccak_rnds: Vec<VmAir>,
     pub keccak_rc: VmAir,
     pub ecsms: Vec<VmAir>,
     pub ecdases: Vec<VmAir>,
     pub hints: Vec<VmAir>,
+    pub copy: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
@@ -663,7 +663,6 @@ impl VmAirs {
                 self.muls.len(),
                 self.dvrms.len(),
                 self.branches.len(),
-                self.commits.len(),
                 self.keccaks.len(),
                 self.keccak_rnds.len(),
                 self.ecsms.len(),
@@ -686,7 +685,6 @@ impl VmAirs {
                 traces.muls.len(),
                 traces.dvrms.len(),
                 traces.branches.len(),
-                traces.commits.len(),
                 traces.keccaks.len(),
                 traces.keccak_rnds.len(),
                 traces.ecsms.len(),
@@ -705,13 +703,11 @@ impl VmAirs {
             (self.bitwise.as_ref(), &mut traces.bitwise, &()),
             (self.decode.as_ref(), &mut traces.decode, &()),
             (self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()),
+            (self.copy.as_ref(), &mut traces.copy, &()),
             (self.register.as_ref(), &mut traces.register, &()),
         ];
         if self.include_halt {
             pairs.push((self.halt.as_ref(), &mut traces.halt, &()));
-        }
-        for (air, trace) in self.commits.iter().zip(traces.commits.iter_mut()) {
-            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.keccaks.iter().zip(traces.keccaks.iter_mut()) {
             pairs.push((air.as_ref(), trace, &()));
@@ -792,13 +788,11 @@ impl VmAirs {
             self.bitwise.as_ref(),
             self.decode.as_ref(),
             self.keccak_rc.as_ref(),
+            self.copy.as_ref(),
             self.register.as_ref(),
         ];
         if self.include_halt {
             refs.push(self.halt.as_ref());
-        }
-        for air in &self.commits {
-            refs.push(air.as_ref());
         }
         for air in &self.keccaks {
             refs.push(air.as_ref());
@@ -821,7 +815,6 @@ impl VmAirs {
             cpu_start(
                 self.include_halt,
                 [
-                    self.commits.len(),
                     self.keccaks.len(),
                     self.keccak_rnds.len(),
                     self.ecsms.len(),
@@ -1015,12 +1008,6 @@ impl VmAirs {
             })
             .collect();
         let halt: VmAir = Box::new(create_halt_air(proof_options));
-        let commits: Vec<_> = (0..table_counts.commit)
-            .map(|i| {
-                Box::new(create_commit_air(proof_options).with_name(&format!("COMMIT[{i}]")))
-                    as VmAir
-            })
-            .collect();
         let keccaks: Vec<_> = (0..table_counts.keccak)
             .map(|i| {
                 Box::new(create_keccak_air(proof_options).with_name(&format!("KECCAK[{i}]")))
@@ -1053,6 +1040,7 @@ impl VmAirs {
                 Box::new(create_hint_air(proof_options).with_name(&format!("HINT[{i}]"))) as VmAir
             })
             .collect();
+        let copy: VmAir = Box::new(create_copy_air(proof_options));
         let register: VmAir = Box::new(
             create_register_air(proof_options, final_pc_ts)
                 .with_preprocessed(register_commitment, register::NUM_PREPROCESSED_COLS),
@@ -1156,13 +1144,13 @@ impl VmAirs {
             dvrms,
             branches,
             halt,
-            commits,
             keccaks,
             keccak_rnds,
             keccak_rc,
             ecsms,
             ecdases,
             hints,
+            copy,
             register,
             pages,
             memw_registers,
@@ -1180,6 +1168,11 @@ impl VmAirs {
 // =============================================================================
 
 /// Compute the bus balance offset for the COMMIT[index, value] bus.
+///
+/// The COPY chip commits eight bytes per row but sends them as eight
+/// `(index, value)` pairs, one per byte, so this rebuild is independent of the
+/// prover's row schedule — which it has to be: the schedule restarts at every
+/// commit ECALL and the verifier sees only the concatenated `public_output`.
 ///
 /// For each public output byte at index `i` with value `v`:
 ///   `fingerprint = z - (BusId::Commit * α^0 + i * α^1 + v * α^2)`

@@ -49,14 +49,14 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 /// x0-x31 (32 GPRs), x254 (synthetic commit index), x255 (PC register).
 pub const NUM_REGISTERS: usize = 34;
 
-/// Most register accesses are 64-bit = 2 Words of 32 bits each.
-/// The COMMIT spec adds a synthetic single-word x254 entry at address 508.
+/// Every register access is 64-bit = 2 Words of 32 bits each, x254 included: the
+/// COPY chip reads it through the same `REG` template as x10, so the two share one
+/// interaction and therefore one access width.
 pub const WORDS_PER_REGISTER: usize = 2;
 
 /// Total number of register Word addresses.
-/// x0-x31 use addresses 0..63, x254 uses address 508, x255 uses addresses 510..511.
-/// -1 because x254 is single-word (1 address instead of 2).
-pub const NUM_REGISTER_ADDRESSES: usize = NUM_REGISTERS * WORDS_PER_REGISTER - 1;
+/// x0-x31 use addresses 0..63, x254 uses 508..509, x255 uses addresses 510..511.
+pub const NUM_REGISTER_ADDRESSES: usize = NUM_REGISTERS * WORDS_PER_REGISTER;
 
 /// Number of preprocessed columns (OFFSET, INIT, FINI, IS_PC). OFFSET encodes the
 /// Word address, INIT the initial value and FINI the final one, so both register
@@ -120,30 +120,34 @@ pub type FinalRegisterStateMap = HashMap<u64, FinalRegisterWordState>;
 
 /// Returns the Word addresses for all register table rows.
 ///
-/// x0-x31 use addresses 0..63, x254 uses address 508, x255 uses 510..511.
+/// x0-x31 use addresses 0..63, x254 uses 508..509, x255 uses 510..511.
 pub(crate) fn register_word_address_list() -> [u64; NUM_REGISTER_ADDRESSES] {
     let mut addrs = [0u64; NUM_REGISTER_ADDRESSES];
     // x0-x31: addresses 0..63
     for (i, addr) in addrs.iter_mut().enumerate().take(64) {
         *addr = i as u64;
     }
-    // x254: synthetic commit index (single-word)
+    // x254: synthetic commit index, addresses 508, 509
     addrs[64] = 508;
+    addrs[65] = 509;
     // x255: addresses 510, 511
-    addrs[65] = 510;
-    addrs[66] = 511;
+    addrs[66] = 510;
+    addrs[67] = 511;
     addrs
 }
 
 // Positions of the non-general-purpose registers within a register-init vector
 // (indexed in `register_word_address_list` order). x0-x31 occupy positions 0..63
 // (position `i` is word address `i`), so register `r`'s two words are at `2r`, `2r+1`.
-/// Position of x254 (synthetic commit index, word address 508).
+/// Position of x254 (synthetic commit index) low word (word address 508).
 pub(crate) const X254_INDEX: usize = 64;
+/// Position of x254 high word (word address 509).
+#[cfg(test)]
+pub(crate) const X254_HI_INDEX: usize = 65;
 /// Position of x255 (PC) low word (word address 510).
-pub(crate) const PC_LO_INDEX: usize = 65;
+pub(crate) const PC_LO_INDEX: usize = 66;
 /// Position of x255 (PC) high word (word address 511).
-pub(crate) const PC_HI_INDEX: usize = 66;
+pub(crate) const PC_HI_INDEX: usize = 67;
 
 /// Compute the initial value for a register Word address.
 ///
@@ -152,7 +156,7 @@ pub(crate) const PC_HI_INDEX: usize = 66;
 /// and supply their own boundary register snapshot instead.
 ///
 /// - SP (x2) words at offset 4,5 hold STACK_TOP
-/// - x254 at offset 508 is the synthetic commit index, initialized to 0
+/// - x254 at offsets 508,509 is the synthetic commit index, initialized to 0
 /// - PC (x255) words at offset 510,511 hold entry_point
 /// - All others are 0
 fn init_value_for_address(word_addr: u64, entry_point: u64) -> u32 {
@@ -232,10 +236,11 @@ pub(crate) fn register_init_from_snapshot(registers: &Registers, pc: u64) -> Vec
         init[base + 1] = (value >> 32) as u32;
     }
     // x254 synthetic commit index, hardcoded to 0 in this test-only helper, so it
-    // is only correct for an epoch with no preceding COMMIT. The production path
+    // is only correct for an epoch with no preceding `write`. The production path
     // carries x254 across epochs via the previous epoch's bound FINI vector, not
     // this snapshot helper.
     init[X254_INDEX] = 0;
+    init[X254_HI_INDEX] = 0;
     init[PC_LO_INDEX] = (pc & 0xFFFF_FFFF) as u32;
     init[PC_HI_INDEX] = (pc >> 32) as u32;
     init
@@ -245,7 +250,7 @@ pub(crate) fn register_init_from_snapshot(registers: &Registers, pc: u64) -> Vec
 ///
 /// Creates a table with NUM_REGISTER_ADDRESSES rows.
 /// Each row represents one Word address in register space.
-/// x0-x31 at addresses 0..63, x254 at 508, x255 (PC) at 510..511.
+/// x0-x31 at addresses 0..63, x254 at 508..509, x255 (PC) at 510..511.
 ///
 /// ## Arguments
 ///
@@ -337,7 +342,7 @@ pub fn fini_from_final_state(final_state: &FinalRegisterStateMap, init: &[u32]) 
 // =========================================================================
 
 /// Computes the Merkle root commitment over the LDE of the REGISTER preprocessed
-/// columns: OFFSET (the Word address: 0..63 for x0-x31, 508 for x254, 510-511 for
+/// columns: OFFSET (the Word address: 0..63 for x0-x31, 508-509 for x254, 510-511 for
 /// x255), INIT, FINI and IS_PC, so the verifier recomputes it from the public `init`
 /// and `fini` and the proof's FINI column is locked to `fini`. `fini` is the vector
 /// produced by `fini_from_trace` (entry `i` = the register at
@@ -518,7 +523,7 @@ pub fn register_base_address(reg_idx: u8) -> u64 {
 /// Compute the Word addresses used by a register.
 pub fn register_word_addresses(reg_idx: u8) -> Vec<u64> {
     match reg_idx {
-        254 => vec![508],
+        254 => vec![508, 509],
         255 => vec![510, 511],
         _ => {
             let base = 2 * reg_idx as u64;

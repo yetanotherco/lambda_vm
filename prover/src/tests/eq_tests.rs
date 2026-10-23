@@ -73,8 +73,9 @@ fn test_trace_dword_split() {
 }
 
 #[test]
-fn test_multiplicity_aggregation() {
-    // Same op three times + one distinct → 2 unique rows, padded to 4.
+fn test_no_dedup_one_row_per_op() {
+    // No deduplication: each op gets its own row with μ = 1 (μ is kept a bit so
+    // MuIsBit can pin it). Three identical ops + one distinct → 4 rows.
     let ops = vec![
         EqOperation::new(5, 5, false),
         EqOperation::new(9, 8, false),
@@ -84,15 +85,15 @@ fn test_multiplicity_aggregation() {
     let trace = generate_eq_trace(&ops);
     assert_eq!(trace.main_table.height, 4);
 
-    let mut found = false;
+    let mut fives = 0;
     for row_idx in 0..4 {
         let row = trace.main_table.get_row(row_idx);
+        assert_eq!(row[cols::MU], FE::from(1u64), "every real row has μ = 1");
         if row[cols::A_0] == FE::from(5u64) && row[cols::B_0] == FE::from(5u64) {
-            assert_eq!(row[cols::MU], FE::from(3u64));
-            found = true;
+            fives += 1;
         }
     }
-    assert!(found, "expected the (5,5) row with multiplicity 3");
+    assert_eq!(fives, 3, "the three (5,5) ops each get their own row");
 }
 
 #[test]
@@ -122,4 +123,29 @@ fn test_bus_interactions_shape() {
     assert!(!alu[0].is_sender, "ALU is a receiver for EQ");
     // [a, b, flags, res, 0] — the ALU output is DWordWL ([res, 0]).
     assert_eq!(alu[0].values.len(), 5);
+}
+
+/// Soundness regression: μ must be a bit (spec `IS_BIT[μ]`). EQ does not
+/// deduplicate, so real rows have μ = 1 and padding rows μ = 0; μ = 2 or −1
+/// must be rejected by MuIsBit (idx 4).
+#[test]
+fn test_mu_is_bit_constrained() {
+    use crate::tables::eq::EqConstraints;
+    use crate::test_utils::{busless_air, validate_busless};
+
+    let honest = generate_eq_trace(&[EqOperation::new(5, 3, false), EqOperation::new(7, 7, true)]);
+    let air = busless_air(cols::NUM_COLUMNS, EqConstraints);
+    assert!(
+        validate_busless(&air, &honest),
+        "honest trace must validate"
+    );
+
+    for bad in [FE::from(2u64), -FE::one()] {
+        let mut t = honest.clone();
+        t.main_table.set(0, cols::MU, bad);
+        assert!(
+            !validate_busless(&air, &t),
+            "μ ∉ {{0,1}} must be rejected by MuIsBit"
+        );
+    }
 }
