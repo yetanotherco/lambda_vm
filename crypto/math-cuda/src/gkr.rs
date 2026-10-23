@@ -992,7 +992,10 @@ mod tests {
     /// Where the padding of an upper half starts, and that it runs to the end.
     fn padding_start(pad: &[bool]) -> usize {
         let start = pad.iter().position(|&p| p).unwrap_or(pad.len());
-        assert!(pad[start..].iter().all(|&p| p), "the padding is one run to the end");
+        assert!(
+            pad[start..].iter().all(|&p| p),
+            "the padding is one run to the end"
+        );
         start
     }
 
@@ -1022,7 +1025,11 @@ mod tests {
                     assert_eq!(pad.len(), cube, "{what}: the live half");
                     let start = padding_start(&pad);
                     assert_eq!(run.min(cube), start, "{what}: the run held coming in");
-                    assert_eq!(run < cube, start < cube, "{what}: the kept kernel exactly while padding is left");
+                    assert_eq!(
+                        run < cube,
+                        start < cube,
+                        "{what}: the kept kernel exactly while padding is left"
+                    );
                     if j > 0 {
                         pad = (0..2 * quarter)
                             .map(|x| pad[x] && pad[x + 2 * quarter])
@@ -1044,7 +1051,10 @@ mod tests {
         // A CPU table: 20 of 32 slots real, 2^21 rows.
         let (rows, slots, interactions) = (1usize << 21, 32usize, 20usize);
         let (real, full) = (interactions * rows, slots * rows);
-        assert_eq!(truncated_peak_bytes(real, full), (2 * real + 2 * full) as u64 * 24);
+        assert_eq!(
+            truncated_peak_bytes(real, full),
+            (2 * real + 2 * full) as u64 * 24
+        );
         assert!(truncated_peak_bytes(real, full) < (4 * full) as u64 * 24);
         // It covers the kept layer plus every level above (full − 1 cells a
         // side), and the whole layer written again once the tree is gone.

@@ -56,7 +56,9 @@ pub fn input_real_setting(value: Option<&str>) -> InputReal {
         Some("1") => InputReal::On,
         Some("check") => InputReal::Check,
         Some(other) => {
-            eprintln!("[gkr] LAMBDA_VM_ARGUE_INPUT_REAL={other} is not 0, 1 or check; keeping the padding");
+            eprintln!(
+                "[gkr] LAMBDA_VM_ARGUE_INPUT_REAL={other} is not 0, 1 or check; keeping the padding"
+            );
             InputReal::Off
         }
     }

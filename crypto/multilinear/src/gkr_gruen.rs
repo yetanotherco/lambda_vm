@@ -630,10 +630,8 @@ mod tests {
         let (mut halves, point, lambda, _) = layer(m, seed);
         let half = 1usize << m;
         let stored = interactions * rows - half;
-        for x in stored..half {
-            halves[1][x] = pad.0;
-            halves[3][x] = pad.1;
-        }
+        halves[1][stored..].fill(pad.0);
+        halves[3][stored..].fill(pad.1);
         let eq = crate::eq::eq_evals(&point);
         let claim = (0..half).fold(FE::zero(), |acc, x| {
             let [a, b, c, d] = [&halves[0][x], &halves[1][x], &halves[2][x], &halves[3][x]];
@@ -650,7 +648,11 @@ mod tests {
         pad: (FE, FE),
         low: usize,
         seed: u64,
-    ) -> (crate::gpu::LayerRounds<Ext3>, crate::gpu::LayerRounds<Ext3>, bool) {
+    ) -> (
+        crate::gpu::LayerRounds<Ext3>,
+        crate::gpu::LayerRounds<Ext3>,
+        bool,
+    ) {
         let (halves, point, lambda, claim, stored) = input_layer(interactions, rows, pad, seed);
         let mut kept = halves.clone();
         kept[1].truncate(stored);
@@ -692,7 +694,11 @@ mod tests {
                 let padding = (FE::zero(), FE::one());
                 let (want, got, same) =
                     kept_against_today(interactions, rows, padding, low, 0x5EED + n as u64);
-                assert_eq!(values(&got), values(&want), "{what}: rounds or factors differ");
+                assert_eq!(
+                    values(&got),
+                    values(&want),
+                    "{what}: rounds or factors differ"
+                );
                 assert_eq!(got.1, want.1, "{what}: the challenges differ");
                 assert!(same, "{what}: the transcripts parted");
             }

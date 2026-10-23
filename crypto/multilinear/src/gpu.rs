@@ -3921,7 +3921,8 @@ impl DeviceTree {
         };
         let layer = session.ok()?;
         let whole = (layer.truncated()
-            && crate::gkr_input_real::argue_input_real() == crate::gkr_input_real::InputReal::Check)
+            && crate::gkr_input_real::argue_input_real()
+                == crate::gkr_input_real::InputReal::Check)
             .then(|| self.whole_beside(&raw_point, low))
             .flatten();
         Some(GruenSession {
@@ -4872,9 +4873,14 @@ fn truncated_tree(
     tree_sync!(stream);
     crate::whir_split::add_tick(&crate::whir_split::TREE_WRITE, t);
     let t = crate::whir_split::tick();
-    let tree =
-        math_cuda::gkr::DeviceFractionTree::from_truncated_input(stream.clone(), p, q, real, num_vars)
-            .ok()?;
+    let tree = math_cuda::gkr::DeviceFractionTree::from_truncated_input(
+        stream.clone(),
+        p,
+        q,
+        real,
+        num_vars,
+    )
+    .ok()?;
     tree_sync!(stream);
     crate::whir_split::add_tick(&crate::whir_split::TREE_FOLD, t);
     let output = std::sync::OnceLock::new();
