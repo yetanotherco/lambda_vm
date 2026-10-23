@@ -45,9 +45,6 @@ use crate::tables::branch::{
 use crate::tables::bytewise::{
     bus_interactions as bytewise_bus_interactions, cols as bytewise_cols,
 };
-use crate::tables::commit::{
-    CommitConstraints, bus_interactions as commit_bus_interactions, cols as commit_cols,
-};
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
 };
@@ -921,15 +918,18 @@ pub fn create_hint_air(proof_options: &ProofOptions) -> ConcreteVmAir<HintConstr
     )
 }
 
-/// Create COMMIT AIR with constraints and bus interactions.
-pub fn create_commit_air(proof_options: &ProofOptions) -> ConcreteVmAir<CommitConstraints> {
+/// Create the unified COPY AIR: one streaming copy primitive for memcpy/memmove,
+/// memset and the `write` syscall, selected by the decoded functionality columns.
+pub fn create_copy_air(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<crate::tables::copy::CopyConstraints> {
     build_air(
-        commit_cols::NUM_COLUMNS,
-        commit_bus_interactions(),
+        crate::tables::copy::cols::NUM_COLUMNS,
+        crate::tables::copy::bus_interactions(),
         proof_options,
         1,
-        CommitConstraints,
-        "COMMIT",
+        crate::tables::copy::CopyConstraints,
+        "COPY",
     )
 }
 

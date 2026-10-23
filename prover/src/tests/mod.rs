@@ -15,8 +15,6 @@ pub mod branch_multiplicity_poc;
 #[cfg(test)]
 pub mod bytewise_tests;
 #[cfg(test)]
-pub mod commit_tests;
-#[cfg(test)]
 pub mod compute_commit_bus_offset_tests;
 #[cfg(test)]
 pub mod constraint_emit_tests;
@@ -30,6 +28,8 @@ pub mod constraint_set_tests_a;
 pub mod constraint_set_tests_b;
 #[cfg(test)]
 pub mod constraints_tests;
+#[cfg(test)]
+pub mod copy_tests;
 #[cfg(all(test, feature = "disk-spill"))]
 pub mod count_table_lengths_drift_tests;
 #[cfg(test)]

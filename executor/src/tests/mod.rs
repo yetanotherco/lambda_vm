@@ -1,5 +1,8 @@
+pub mod commit_ecall_tests;
+pub mod dma_tests;
 pub mod ecsm_tests;
 pub mod flamegraph_tests;
 pub mod hint_tests;
 pub mod keccak_tests;
 pub mod memory_tests;
+pub mod syscall_tests;

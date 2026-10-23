@@ -322,6 +322,26 @@ fn add_operand_hi<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     }
 }
 
+/// The high carry of an `emit_add_pair` relation as a bare expression: `1` exactly
+/// when `lhs + rhs` overflows 64 bits, `0` otherwise, given the same operands the
+/// `ADD` itself was emitted with.
+///
+/// `emit_add_pair` only range-checks that carry as a bit, which is what the spec's
+/// `ADD` template does and which leaves wraparound provable. A caller that must
+/// forbid the wraparound multiplies this by its gate and emits the product as a
+/// constraint of its own, the way `ADDNW` used to.
+pub fn add_pair_carry_hi<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &B,
+    lhs: &AddOperand,
+    rhs: &AddOperand,
+    sum: &AddOperand,
+) -> B::Expr {
+    let inv_2_32 = b.const_base(INV_SHIFT_32);
+    let carry_0 = (add_operand_lo(b, lhs) + add_operand_lo(b, rhs) - add_operand_lo(b, sum))
+        * inv_2_32.clone();
+    (add_operand_hi(b, lhs) + add_operand_hi(b, rhs) + carry_0 - add_operand_hi(b, sum)) * inv_2_32
+}
+
 /// The ADD carry pair, emitted from ONE body at `idx` and `idx + 1`:
 ///
 /// ```text

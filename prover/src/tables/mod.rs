@@ -24,7 +24,7 @@ pub mod types;
 pub mod bitwise;
 pub mod branch;
 pub mod bytewise;
-pub mod commit;
+pub mod copy;
 pub mod cpu;
 pub mod cpu32;
 pub mod decode;
