@@ -102,6 +102,19 @@ pub(crate) fn weigh_the_bus(
     traces: &mut Traces,
     recheck_with_moved_target: bool,
 ) -> BusOutcome {
+    weigh_the_bus_with(elf, traces, recheck_with_moved_target, true)
+}
+
+/// [`weigh_the_bus`] with the BITWISE table picked by `minimal_bitwise`: pass
+/// `false` for traces from `Traces::from_elf_and_logs`, whose BITWISE is the
+/// full preprocessed table. A forgery that leaves a range check out of range
+/// needs that one: the minimal table's rows are the prover's to choose.
+pub(crate) fn weigh_the_bus_with(
+    elf: &Elf,
+    traces: &mut Traces,
+    recheck_with_moved_target: bool,
+    minimal_bitwise: bool,
+) -> BusOutcome {
     let _ = env_logger::builder().is_test(true).try_init();
     let proof_options = ProofOptions::default_test_options();
 
@@ -116,7 +129,7 @@ pub(crate) fn weigh_the_bus(
     let airs = VmAirs::new(
         elf,
         &proof_options,
-        true,
+        minimal_bitwise,
         &traces.page_configs,
         &table_counts,
         &crate::cpu_heights_from_traces(traces),
@@ -3437,6 +3450,7 @@ fn test_verify_rejects_zero_table_counts() {
             ecsm: 0,
             ecdas: 0,
             hint: 0,
+            is_wh: 0,
         },
         ..vm_proof
     };
@@ -3527,6 +3541,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         ecsm: 0,
         ecdas: 0,
         hint: 0,
+        is_wh: 0,
     };
     let airs = VmAirs::new(
         &elf,

@@ -174,7 +174,7 @@ fn cpu_proof_start_matches_air_refs_layout() {
     let options = opts();
     let honest = craft_proof(&elf, |_| {}).expect("honest proof");
     for include_halt in [false, true] {
-        for mask in 0u8..32 {
+        for mask in 0u8..64 {
             let mut counts = honest.table_counts.clone();
             let bit = |i: u8| usize::from(mask >> i & 1);
             counts.keccak = bit(0);
@@ -182,6 +182,7 @@ fn cpu_proof_start_matches_air_refs_layout() {
             counts.ecsm = bit(2);
             counts.ecdas = bit(3);
             counts.hint = bit(4);
+            counts.is_wh = bit(5);
             let airs = VmAirs::new(
                 &program,
                 &options,
@@ -200,7 +201,7 @@ fn cpu_proof_start_matches_air_refs_layout() {
                 assert_eq!(
                     refs[start + k].name(),
                     format!("CPU[{k}]"),
-                    "halt={include_halt} accelerators={mask:05b}"
+                    "halt={include_halt} accelerators={mask:06b}"
                 );
             }
         }

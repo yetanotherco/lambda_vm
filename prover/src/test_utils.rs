@@ -66,6 +66,7 @@ use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as hal
 use crate::tables::hint::{
     HintConstraints, bus_interactions as hint_bus_interactions, cols as hint_cols,
 };
+use crate::tables::is_wh::{bus_interactions as is_wh_bus_interactions, cols as is_wh_cols};
 use crate::tables::keccak::{
     KeccakConstraints, bus_interactions as keccak_bus_interactions, cols as keccak_cols,
 };
@@ -978,6 +979,18 @@ pub fn create_hint_air(proof_options: &ProofOptions) -> ConcreteVmAir<HintConstr
         1,
         HintConstraints,
         "HINT",
+    )
+}
+
+/// Create IS_WH AIR (range check of `DWordWHH` top 48 bits; bus interactions only).
+pub fn create_is_wh_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
+    build_air(
+        is_wh_cols::NUM_COLUMNS,
+        is_wh_bus_interactions(),
+        proof_options,
+        1,
+        EmptyConstraints,
+        "IS_WH",
     )
 }
 

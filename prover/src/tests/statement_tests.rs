@@ -28,6 +28,7 @@ fn sample_counts() -> TableCounts {
         ecsm: 1,
         ecdas: 1,
         hint: 1,
+        is_wh: 1,
     }
 }
 
@@ -96,6 +97,7 @@ fn each_count_mut(counts: &mut TableCounts) -> Vec<(&'static str, &mut usize)> {
         ecsm,
         ecdas,
         hint,
+        is_wh,
     } = counts;
     vec![
         ("cpu", cpu),
@@ -117,6 +119,7 @@ fn each_count_mut(counts: &mut TableCounts) -> Vec<(&'static str, &mut usize)> {
         ("ecsm", ecsm),
         ("ecdas", ecdas),
         ("hint", hint),
+        ("is_wh", is_wh),
     ]
 }
 
@@ -133,7 +136,7 @@ fn state_depends_on_every_table_count() {
         .into_iter()
         .map(|(name, _)| name)
         .collect();
-    assert_eq!(names.len(), 19, "every count must be probed");
+    assert_eq!(names.len(), 20, "every count must be probed");
 
     for name in names {
         let mut counts = sample_counts();

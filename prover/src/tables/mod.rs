@@ -10,6 +10,7 @@
 //! - **DECODE**: Instruction decode table
 //! - **BRANCH**: Branch target calculation table
 //! - **HALT**: Single-row halt table
+//! - **IS_WH**: Range check for the top 48 bits of `DWordWHH` addresses (one row per distinct pair)
 //!
 //! ## Memory Tables
 //!
@@ -35,6 +36,7 @@ pub mod eq;
 pub mod global_memory;
 pub mod halt;
 pub mod hint;
+pub mod is_wh;
 pub mod keccak;
 pub mod keccak_rc;
 pub mod keccak_rnd;

@@ -4,7 +4,7 @@
 //! sends input state to the round chip via the Keccak bus, and receives the output
 //! state after 24 rounds.
 //!
-//! ## Column layout (~511 columns)
+//! ## Column layout (486 columns)
 //!
 //! | Group          | Size | Description                                    |
 //! |----------------|------|------------------------------------------------|
@@ -12,7 +12,7 @@
 //! | addr           |    8 | State address as DWordBL (8 bytes)             |
 //! | input_state    |  200 | Input state bytes [5][5][8]                    |
 //! | output_state   |  200 | Output state bytes [5][5][8]                   |
-//! | state_ptr      |  100 | Per-lane DWordHL addresses [25][4]             |
+//! | state_ptr      |   75 | Per-lane DWordWHH addresses [25][3]            |
 //! | mu             |    1 | Multiplicity flag                              |
 
 use executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
@@ -21,6 +21,7 @@ use stark::trace::TraceTable;
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
+use super::is_wh::{IsWhKey, is_whh};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::constraints::templates::{AddOperand, INV_SHIFT_32};
 
@@ -41,12 +42,12 @@ pub mod cols {
     // output_state[5][5][8] = 200 bytes
     pub const OUTPUT_STATE: usize = INPUT_STATE + 200; // 210
 
-    // state_ptr[25][4] = 100 halfwords (DWordHL per lane)
+    // state_ptr[25][3] = 75 columns (DWordWHH per lane: half_lo, half_mid, word_hi)
     pub const STATE_PTR: usize = OUTPUT_STATE + 200; // 410
 
-    pub const MU: usize = STATE_PTR + 100; // 510
+    pub const MU: usize = STATE_PTR + 75; // 485
 
-    pub const NUM_COLUMNS: usize = MU + 1; // 511
+    pub const NUM_COLUMNS: usize = MU + 1; // 486
 
     // -------------------------------------------------------------------------
     // Index helpers
@@ -69,10 +70,10 @@ pub mod cols {
         OUTPUT_STATE + (x + 5 * y) * 8 + byte
     }
 
-    /// Index into state_ptr[lane_idx][halfword] (DWordHL = 4 halfwords)
+    /// Index into state_ptr[lane_idx][limb] (DWordWHH = [half_lo, half_mid, word_hi])
     #[inline]
-    pub const fn state_ptr(lane_idx: usize, hw: usize) -> usize {
-        STATE_PTR + lane_idx * 4 + hw
+    pub const fn state_ptr(lane_idx: usize, limb: usize) -> usize {
+        STATE_PTR + lane_idx * 3 + limb
     }
 }
 
@@ -86,6 +87,20 @@ pub struct KeccakOperation {
     pub state_addr: u64,
     pub input: [u64; 25],
     pub output: [u64; 25],
+}
+
+/// The `IS_WH` sends of the KECCAK table: one per lane of every call, the top
+/// 48 bits of `state_ptr[lane] = state_addr + 8·lane` (`keccak:c:range_state_ptr`).
+pub fn is_wh_keys(ops: &[KeccakOperation]) -> impl Iterator<Item = IsWhKey> + '_ {
+    ops.iter().flat_map(|op| {
+        (0..25u64).map(move |lane_idx| {
+            let ptr = op
+                .state_addr
+                .checked_add(lane_idx * 8)
+                .expect("keccak state address range must be validated by the executor");
+            IsWhKey::of_dword(ptr)
+        })
+    })
 }
 
 // =========================================================================
@@ -133,7 +148,7 @@ pub fn generate_keccak_trace(
                 .state_addr
                 .checked_add(lane_idx as u64 * 8)
                 .expect("keccak state address range must be validated by the executor");
-            table.set_dword_hl(row_idx, cols::state_ptr(lane_idx, 0), ptr);
+            table.set_dword_whh(row_idx, cols::state_ptr(lane_idx, 0), ptr);
         }
 
         // mu = 1 (real row)
@@ -141,7 +156,7 @@ pub fn generate_keccak_trace(
     }
 
     // Padding rows: state_ptr[lane][0] = 8 * lane_idx (per spec keccak.toml pad).
-    // Halfwords 1..3 stay zero since 8*24 = 192 fits in the low halfword.
+    // half_mid and word_hi stay zero since 8*24 = 192 fits in half_lo.
     // mu = 0 gates all bus interactions and the ADD constraint, so these values
     // only need to satisfy the pad requirement, not reconstruct a real address.
     for row_idx in n..num_rows {
@@ -160,7 +175,7 @@ pub fn generate_keccak_trace(
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let syscall_lo = KECCAK_SYSCALL_NUMBER & 0xFFFF_FFFF;
     let syscall_hi = KECCAK_SYSCALL_NUMBER >> 32;
-    let mut interactions = Vec::with_capacity(160);
+    let mut interactions = Vec::with_capacity(84);
 
     // 1. ECALL receiver (shared bus, per spec keccak:c:output)
     // Payload: [ts_lo, ts_hi, syscall_lo32, syscall_hi32] in DWordWL [lo, hi]
@@ -324,18 +339,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // 4. IS_HALF range checks on state_ptr (100 interactions)
+    // 4. IS_WHH range checks on state_ptr (keccak:c:range_state_ptr): IS_WH on the
+    // top 48 bits and IS_HALF on half_lo, 50 interactions. μ is a bit (idx 51 below),
+    // as the template's `cond: Bit` requires.
     for lane_idx in 0..25 {
-        for hw in 0..4 {
-            interactions.push(BusInteraction::sender(
-                BusId::IsHalfword,
-                Multiplicity::Column(cols::MU),
-                vec![BusValue::Packed {
-                    start_column: cols::state_ptr(lane_idx, hw),
-                    packing: Packing::Direct,
-                }],
-            ));
-        }
+        interactions.extend(is_whh(
+            cols::state_ptr(lane_idx, 0),
+            Multiplicity::Column(cols::MU),
+        ));
     }
 
     // 5. Alignment: addr[0] & 7 = 0, which enforces addr % 8 == 0.
@@ -385,7 +396,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         let x = lane_idx % 5;
         let y = lane_idx / 5;
 
-        // Address as DWordWL: lo32 = h0 + 2^16*h1, hi32 = h2 + 2^16*h3
+        // Address as DWordWL: lo32 = half_lo + 2^16*half_mid, hi32 = word_hi
         let addr_lo = BusValue::linear(vec![
             LinearTerm::Column {
                 coefficient: 1,
@@ -396,16 +407,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 column: cols::state_ptr(lane_idx, 1),
             },
         ]);
-        let addr_hi = BusValue::linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::state_ptr(lane_idx, 2),
-            },
-            LinearTerm::Column {
-                coefficient: 65536,
-                column: cols::state_ptr(lane_idx, 3),
-            },
-        ]);
+        let addr_hi = BusValue::Packed {
+            start_column: cols::state_ptr(lane_idx, 2),
+            packing: Packing::Direct,
+        };
 
         let mut values = Vec::with_capacity(24);
         // old[0..8] = input_state bytes (the value being read)
@@ -458,7 +463,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// The KECCAK core table's 52 transition constraints as a single [`ConstraintSet`]:
 /// - idx 0-49: for `lane_idx ∈ 0..25`, the `ADD` carry pair (gated on `μ`)
 ///   enforcing `state_ptr[lane] = addr + 8·lane_idx` (`addr` DWordBL,
-///   `state_ptr` DWordHL);
+///   `state_ptr` DWordWHH);
 /// - idx 50:   `μ · carry_1 = 0` (top-lane no-overflow), where `carry_1` is the
 ///   high carry of `addr + 192 = state_ptr[24]`;
 /// - idx 51:   `μ · (1 − μ) = 0` (MuIsBit).
@@ -482,7 +487,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
                 &[cols::MU],
                 &AddOperand::from_dword_bl(cols::ADDR),
                 &AddOperand::constant(offset),
-                &AddOperand::from_dword_hl(cols::state_ptr(lane_idx, 0)),
+                &AddOperand::from_dword_whh(cols::state_ptr(lane_idx, 0)),
             );
         }
 
@@ -498,9 +503,8 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
             + b.main(0, cols::addr(5)) * c256
             + b.main(0, cols::addr(6)) * c65536.clone()
             + b.main(0, cols::addr(7)) * c16777216;
-        let ptr_lo =
-            b.main(0, cols::state_ptr(24, 0)) + b.main(0, cols::state_ptr(24, 1)) * c65536.clone();
-        let ptr_hi = b.main(0, cols::state_ptr(24, 2)) + b.main(0, cols::state_ptr(24, 3)) * c65536;
+        let ptr_lo = b.main(0, cols::state_ptr(24, 0)) + b.main(0, cols::state_ptr(24, 1)) * c65536;
+        let ptr_hi = b.main(0, cols::state_ptr(24, 2));
 
         let inv_2_32 = b.const_base(INV_SHIFT_32);
         let c192 = b.const_base(192);

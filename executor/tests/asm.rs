@@ -880,11 +880,10 @@ fn test_sub_underflow() {
 
 // ==================== Keccak Precompile ====================
 
-#[test]
-fn test_keccak() {
-    // Runs keccak-f[1600] on a zeroed state and commits the 200-byte result.
-    // Expected output is the FIPS-202 zero-input KAT.
-    let elf_data = std::fs::read("./program_artifacts/asm/test_keccak.elf").unwrap();
+/// Runs `name`, which applies keccak-f[1600] to a zeroed state and commits the
+/// 200-byte result, and checks the output against the FIPS-202 zero-input KAT.
+fn assert_keccak_zero_state_kat(name: &str) {
+    let elf_data = std::fs::read(format!("./program_artifacts/asm/{name}.elf")).unwrap();
     let program = Elf::load(&elf_data).unwrap();
     let executor = Executor::new(&program, vec![]).expect("Failed to create executor");
     let result = executor.run().expect("Failed to run program");
@@ -922,6 +921,17 @@ fn test_keccak() {
     }
     assert_eq!(result.return_values.memory_values, expected_bytes);
     assert_eq!(result.return_values.register_values.0, 0);
+}
+
+#[test]
+fn test_keccak() {
+    assert_keccak_zero_state_kat("test_keccak");
+}
+
+/// Same KAT with the state straddling a 64 KiB boundary.
+#[test]
+fn test_keccak_64k() {
+    assert_keccak_zero_state_kat("test_keccak_64k");
 }
 
 #[test]

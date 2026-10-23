@@ -91,10 +91,10 @@
 //! Three divergences in the columns from the spec's 34, all representational and all
 //! recorded in `shape_tests`: the spec types `timestamp` as a `Word` where this code uses a
 //! `DWordWL`; it types the three increments and `dst_res` as `DWordWHH`
-//! (`Half, Half, Word`) where this code uses `DWordHL` (four `Half`s). `IS_WHH`
-//! decomposes into an `IS_WH` chip this prover does not have; four `IS_HALF`
-//! lookups prove the identical bound with the primitive it does have, at one extra
-//! column each. `mu_com`/`mu_com_wide` are the COMMIT-bus gate the spec does not
+//! (`Half, Half, Word`) where this code uses `DWordHL` (four `Half`s). Four `IS_HALF`
+//! lookups prove the same bound `IS_WHH` would, at one extra column each; moving these
+//! four to `IS_WHH` and the `IS_WH` table that KECCAK's `state_ptr` already uses would
+//! drop those columns. `mu_com`/`mu_com_wide` are the COMMIT-bus gate the spec does not
 //! need because it writes the committed bytes through `MEMW` in domain `2·is_write`.
 //!
 //! A fourth divergence is not representational: constraints 37, 38 and 39 pin the
@@ -1044,9 +1044,10 @@ mod shape_tests {
     ///   `COPY_NEXT` propagates it), so it carries no information.
     /// - `src_incr`, `dst_incr`, `count_decr` and `dst_res` are `DWordWHH`
     ///   (`Half, Half, Word`) in the spec and `DWordHL` (four `Half`s) here (+4).
-    ///   The spec range-checks them with `IS_WHH`, which decomposes into the `IS_WH`
-    ///   chip; this prover has no such chip, and four `IS_HALF` lookups prove exactly
-    ///   the same bound with the primitive it does have.
+    ///   The spec range-checks them with `IS_WHH`, which sends their top 48 bits to
+    ///   the `IS_WH` table. This chip keeps four `IS_HALF` lookups instead, which prove
+    ///   the same bound at one extra column each; moving them to `IS_WHH`, as KECCAK's
+    ///   `state_ptr` already is, would drop those four columns.
     /// - `mu_com` and `mu_com_wide` (+2) gate the COMMIT bus. The spec has no such
     ///   bus: it writes committed bytes through `MEMW` in domain `2 · is_write` and
     ///   lets the verifier initialise and finalise that domain in the memory
