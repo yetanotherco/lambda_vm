@@ -450,11 +450,52 @@ fn a_composed_block_is_refused_one_setting_away() {
     );
 }
 
-/// ★ The defaults' block at a stack the card opens (2^12, its sumcheck
+/// The smallest stack a card opens, in variables: its sumcheck threshold
+/// (`multilinear::gpu`'s 2^12). A smaller one's openings fall to the host.
+const CARD_OPEN_VARS: usize = 12;
+
+/// Every stack the block opens, its groups' then its prepared ones, as the
+/// verifier frames them: the stack's height in variables and its chains.
+fn stack_chains(elf: &[u8], proof: &BlockWhirProof, format: &BlockFormat) -> Vec<(usize, usize)> {
+    let opts = ProofOptions::default_test_options();
+    let frame = block_whir::block_frame(proof.statement(), elf, &opts, format).expect("frame");
+    let columns = block_whir::prepared_tables(&frame.airs, &frame.page_configs, format)
+        .expect("prepared tables");
+    let prepared = block_whir::group_stacks(columns, proof.statement().groups)
+        .expect("prepared stacks")
+        .iter()
+        .map(|stack| {
+            stark::multilinear_table::global_layout(&stack.shapes(), frame.config.format.stack)
+                .expect("prepared layout")
+                .n_stack()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(frame.stack_layouts.len(), proof.proof.columns.len());
+    assert_eq!(prepared.len(), proof.prepared.len());
+    frame
+        .stack_layouts
+        .iter()
+        .map(|layout| layout.n_stack())
+        .chain(prepared)
+        .zip(
+            proof
+                .proof
+                .columns
+                .iter()
+                .chain(&proof.prepared)
+                .map(|stack| stack.polys.len()),
+        )
+        .collect()
+}
+
+/// ★ The defaults' block at a stack cap the card opens (2^12, its sumcheck
 /// threshold): one chain a run under the coset order, at blowup 4 and under the
 /// composed format at blowup 2, proves and verifies, and on a card build no
-/// round-0 successor is encoded on the host — the 2^10 tests above take that
-/// fallback; a block at a card's stack size never does.
+/// chain of a stack of 2^12 or more encodes its round-0 successor on the host.
+/// A cap is not a floor: a stack of fewer cells is lower (this program has one
+/// at 2^10), the card declines its openings and each of its chains may encode
+/// once on the host (the 2^10 tests above), so the count is bounded by those
+/// chains, printed, and is 0 when there are none.
 #[test]
 fn a_coset_block_at_a_card_sized_stack_encodes_no_successor_on_the_host() {
     use multilinear::whir_chain::LeafOrder;
@@ -466,24 +507,47 @@ fn a_coset_block_at_a_card_sized_stack_encodes_no_successor_on_the_host() {
             block_whir::BLOCK_GROUP_POLYS,
             GroupFold::Indexed,
             ArgueFormat::BATCHED,
-            12,
+            CARD_OPEN_VARS,
         );
         format.zf.whir_blowup = blowup;
         format.zf.whir_leaves = LeafOrder::Coset;
         let encodes = multilinear::gpu::coset_host_encodes();
         let proof = prove(&elf, &format, MaxRowsConfig::small());
-        assert!(
-            grouped_widths(&proof).iter().any(|&w| w >= 2),
-            "a grouped chain at blowup {blowup}"
-        );
+        let host = multilinear::gpu::coset_host_encodes() - encodes;
         assert!(
             block_whir::verify_block_whir(&proof, &elf, &opts, &format).unwrap_or(false),
             "the block verifies at blowup {blowup}"
         );
-        assert_eq!(
-            multilinear::gpu::coset_host_encodes(),
-            encodes,
-            "no host encode at a stack the card opens, blowup {blowup}"
+        let stacks = stack_chains(&elf, &proof, &format);
+        let below: usize = stacks
+            .iter()
+            .filter(|&&(vars, _)| vars < CARD_OPEN_VARS)
+            .map(|&(_, chains)| chains)
+            .sum();
+        println!(
+            "ONECHAIN CARD-SIZED blowup {blowup}: stacks (vars, chains) {stacks:?}; {below} \
+             chains below 2^{CARD_OPEN_VARS}; host encodes {host}"
+        );
+        // Not vacuous: a grouped chain at a stack the card opens.
+        let grouped_at_size = proof
+            .proof
+            .columns
+            .iter()
+            .chain(&proof.prepared)
+            .zip(&stacks)
+            .any(|(stack, &(vars, _))| {
+                vars >= CARD_OPEN_VARS && chain_widths(stack).iter().any(|&w| w >= 2)
+            });
+        assert!(
+            grouped_at_size,
+            "a grouped chain at a stack of 2^{CARD_OPEN_VARS} or more, blowup {blowup}"
+        );
+        // A chain encodes its successor at most once, at round 0; the card
+        // opens every stack of 2^12 or more, so only the chains below may.
+        assert!(
+            host <= below as u64,
+            "no host encode at a stack the card opens, blowup {blowup}: {host} host encodes, \
+             {below} chains below 2^{CARD_OPEN_VARS}"
         );
     }
 }
