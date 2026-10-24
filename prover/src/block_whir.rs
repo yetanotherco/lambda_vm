@@ -979,14 +979,15 @@ fn parse_rest_slide(value: Option<&str>) -> bool {
     value.map(str::trim) != Some("0")
 }
 
-/// `LAMBDA_VM_BLOCK_CARD_FILL`: unset, empty or `off` builds every table on the
-/// host (the default); `on` holds each KECCAK_RND table the finish cuts as the
-/// keccak operations its rows come from, and the card fills its columns from
-/// them as its group uploads it
-/// ([`WindowedTraceBuilder::card_fill_keccak_rnd`]); without a card, or where
-/// the card declines the room, a host reader fills them on the host. The
-/// tables' words, and so the proof's bytes, are the same. Anything else
-/// refuses the prove.
+/// `LAMBDA_VM_BLOCK_CARD_FILL`: `on` holds each KECCAK_RND table the finish
+/// cuts as the keccak operations its rows come from, and the card fills its
+/// columns from them as its group uploads it
+/// ([`WindowedTraceBuilder::card_fill_keccak_rnd`]); `off` builds every table on
+/// the host. Unset or empty: on in a build with the card's kernels (the
+/// `cuda` feature), off in one without, where every fill from records would be
+/// the host's. Where the card declines the room, a host reader fills them on
+/// the host. The tables' words, and so the proof's bytes, are the same.
+/// Anything else refuses the prove.
 pub(crate) fn block_card_fill() -> Result<bool, Error> {
     parse_card_fill(std::env::var("LAMBDA_VM_BLOCK_CARD_FILL").ok().as_deref())
 }
@@ -994,10 +995,12 @@ pub(crate) fn block_card_fill() -> Result<bool, Error> {
 /// [`block_card_fill`]'s reading of its variable.
 fn parse_card_fill(value: Option<&str>) -> Result<bool, Error> {
     match value.map(str::trim) {
-        None | Some("" | "off") => Ok(false),
+        None | Some("") => Ok(cfg!(feature = "cuda")),
+        Some("off") => Ok(false),
         Some("on") => Ok(true),
         Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_BLOCK_CARD_FILL={v}: off (the host builds every table) or on"
+            "LAMBDA_VM_BLOCK_CARD_FILL={v}: on (the card fills KECCAK_RND, the default with a card) \
+             or off (the host builds every table)"
         ))),
     }
 }
@@ -7008,14 +7011,15 @@ mod walkers_knob_tests {
         }
     }
 
-    /// `LAMBDA_VM_BLOCK_CARD_FILL`: unset, empty or `off` builds every table
-    /// on the host (the default path); `on` has the card fill KECCAK_RND; any
-    /// other word refuses the prove.
+    /// `LAMBDA_VM_BLOCK_CARD_FILL`: `on` has the card fill KECCAK_RND, `off`
+    /// builds every table on the host; unset or empty is on with the card's
+    /// kernels and off without; any other word refuses the prove.
     #[test]
     fn the_card_fill_knob_takes_off_and_on_and_refuses_anything_else() {
+        let default = cfg!(feature = "cuda");
         for (value, on) in [
-            (None, false),
-            (Some(""), false),
+            (None, default),
+            (Some(""), default),
             (Some("off"), false),
             (Some(" off "), false),
             (Some("on"), true),

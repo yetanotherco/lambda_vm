@@ -1671,6 +1671,12 @@ fn regenerated(
     o.drop_streamed_ops = true;
     o.spill = policy;
     o.regen = Some(mode);
+    // KECCAK_RND built on the host unless a test asks otherwise: its tables
+    // are then droppable, and these tests rebuild them with LT's.
+    let deviations = Deviations {
+        card_fill: deviations.card_fill.or(Some(false)),
+        ..deviations
+    };
     prove_block_whir_with(
         elf,
         &[],
