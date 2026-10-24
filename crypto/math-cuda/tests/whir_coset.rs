@@ -98,13 +98,18 @@ fn production_stack(num_vars: usize, seed: u64) -> (DeviceColumns, Vec<(usize, u
 }
 
 /// [`stack`]'s columns with a zero tail of 15 %: thirteen whole columns and
-/// six tenths of the fourteenth.
+/// six tenths of the fourteenth, a tile of junk after it in the store (not in
+/// the stack).
 fn tail_stack(num_vars: usize, seed: u64) -> (DeviceColumns, Vec<(usize, usize)>) {
     let mut rng = Rng(seed);
     let column = 1usize << (num_vars - 4);
-    let columns: Vec<Vec<u64>> = (0..14)
+    let columns: Vec<Vec<u64>> = (0..15)
         .map(|k| {
-            let len = if k == 13 { column * 6 / 10 } else { column };
+            let len = match k {
+                13 => column * 6 / 10,
+                14 => 256,
+                _ => column,
+            };
             (0..len).map(|_| rng.next() % P).collect()
         })
         .collect();

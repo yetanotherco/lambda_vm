@@ -307,8 +307,28 @@ fn a_revived_coset_stack_at_blowup_two_proves_the_whole_trees_bytes_from_the_sta
 /// at blowup `2^log_blowup`.
 fn revived_coset_stack(log_blowup: usize) {
     // Short columns among the tall: tiles that hold several columns, or a
-    // column and zeros, which the stack read in place reads value by value.
-    let short = |n: usize| vec![n, n - 1, 3, 5, 4, 7, 6, 3, 8, n - 2, 3, 3, 6, n - 3, 5];
+    // column and zeros, which the stack read in place reads value by value
+    // (a tall column last, so no tile reaches past the store's end).
+    let short = |n: usize| {
+        vec![
+            n,
+            n - 1,
+            3,
+            5,
+            4,
+            7,
+            6,
+            3,
+            8,
+            n - 2,
+            3,
+            3,
+            6,
+            n - 3,
+            5,
+            n - 3,
+        ]
+    };
     for (n_stack, cap, short_columns) in [
         (18usize, CapPolicy::Auto, false),
         (18, CapPolicy::Off, false),
