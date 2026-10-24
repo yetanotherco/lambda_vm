@@ -2731,6 +2731,66 @@ impl ChunkJob {
         }
     }
 
+    /// The chunk filled here, packed in `form` as its ops make it, with the
+    /// digest of the records phase A would have held it as
+    /// (`multilinear::records::digest_of`): a CPU chunk cut with its logs
+    /// ([`RegenBuilder::keep_cpu_logs`]), any full MEMW_R chunk. `None` for
+    /// any other. What a regenerator deposits for a chunk dropped as its
+    /// records, checked by that digest.
+    pub fn regenerate(self, form: TraceForm) -> (Option<[u64; 2]>, StreamedChunk) {
+        let (table, index) = (self.table, self.index);
+        let (digest, trace) = match self.ops {
+            ChunkOps::CpuRecords { records, spent } => {
+                let digest = multilinear::records::digest_of(&records);
+                let trace = cpu::generate_cpu_trace_segments_as(
+                    &spent.slices(),
+                    records.decode_table(),
+                    form,
+                );
+                (Some(digest), trace)
+            }
+            ChunkOps::MemwRegisterRecords(records) => {
+                let digest = multilinear::records::digest_of(&records);
+                let rows = records.into_rows();
+                let trace = memw_register::generate_memw_register_trace_from_rows_segments_as(
+                    &rows.slices(),
+                    form,
+                );
+                (Some(digest), trace)
+            }
+            ChunkOps::MemwRegister(rows) => match RegisterRowRecords::new(rows) {
+                Ok(records) => {
+                    let digest = multilinear::records::digest_of(&records);
+                    let rows = records.into_rows();
+                    let trace = memw_register::generate_memw_register_trace_from_rows_segments_as(
+                        &rows.slices(),
+                        form,
+                    );
+                    (Some(digest), trace)
+                }
+                Err(rows) => (
+                    None,
+                    ChunkJob {
+                        table,
+                        index,
+                        ops: ChunkOps::MemwRegister(rows),
+                    }
+                    .generate_as(form)
+                    .trace,
+                ),
+            },
+            ops => (None, ChunkJob { table, index, ops }.generate_as(form).trace),
+        };
+        (
+            digest,
+            StreamedChunk {
+                table,
+                index,
+                trace,
+            },
+        )
+    }
+
     /// Whether the card fills it from the records it holds
     /// ([`WindowedTraceBuilder::card_fill_streamed`]).
     pub fn is_records(&self) -> bool {
@@ -2895,6 +2955,9 @@ pub struct RegenBuilder {
     lt: Tail<super::LtOperation>,
     shift: Tail<super::ShiftOperation>,
     store: Tail<store::StoreOperation>,
+    /// [`Self::keep_cpu_logs`]: the CPU tail's logs, in step with it, and the
+    /// DECODE rows a CPU chunk's records read.
+    logs: Option<(Tail<Log>, Arc<CardDecode>)>,
     /// Chunks of each streamed table cut so far.
     cut: StreamSkip,
     /// A test's slicer bug: the first op of this table's list is dropped.
@@ -2930,6 +2993,7 @@ impl RegenBuilder {
             lt: Tail::new(),
             shift: Tail::new(),
             store: Tail::new(),
+            logs: None,
             cut: StreamSkip::default(),
             #[cfg(test)]
             drop_one: None,
@@ -2949,15 +3013,53 @@ impl RegenBuilder {
         self.cycles
     }
 
+    /// Each CPU chunk is cut with the logs of its cycles too, as phase A held
+    /// a CPU chunk as its records ([`WindowedTraceBuilder::card_fill_streamed`]),
+    /// so the chunk's records can be digested again ([`ChunkJob::regenerate`]).
+    /// Before the first window only; windows then come by [`Self::push_owned`].
+    pub fn keep_cpu_logs(mut self) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "keep_cpu_logs after a window was walked".to_string(),
+            ));
+        }
+        let decode = CardDecode::new(Arc::clone(&self.decode)).ok_or_else(|| {
+            Error::Prover("keep_cpu_logs: a program with no instruction".to_string())
+        })?;
+        self.logs = Some((Tail::new(), Arc::new(decode)));
+        Ok(self)
+    }
+
     /// The bytes the walk's carried memory state takes on the heap.
     pub fn state_bytes(&self) -> usize {
         self.memory_state.heap_bytes()
     }
 
+    /// [`Self::push`] of logs it may keep ([`Self::keep_cpu_logs`]).
+    pub fn push_owned(&mut self, logs: Vec<Log>) -> Result<Vec<ChunkJob>, Error> {
+        if self.logs.is_none() {
+            return self.push(&logs);
+        }
+        let logs = Arc::new(logs);
+        self.push_window(&logs, Some(Arc::clone(&logs)))
+    }
+
     /// Walks the run's next window (its last one included) and returns every
     /// chunk of the streamed tables it completes, in the hand-out's order
-    /// ([`StreamTable::ALL`], then by index).
+    /// ([`StreamTable::ALL`], then by index). A builder that keeps its CPU
+    /// logs takes its windows by [`Self::push_owned`]; one pushed here puts
+    /// them out of step, and its CPU chunks are cut without them.
     pub fn push(&mut self, logs: &[Log]) -> Result<Vec<ChunkJob>, Error> {
+        self.push_window(logs, None)
+    }
+
+    /// [`Self::push`]'s body: `kept`, the same logs shared, when the CPU tail's
+    /// logs are kept.
+    fn push_window(
+        &mut self,
+        logs: &[Log],
+        kept: Option<Arc<Vec<Log>>>,
+    ) -> Result<Vec<ChunkJob>, Error> {
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut cpu_ops = super::collect_cpu_ops_from(logs, &self.decode, self.cycles)?;
         self.cycles += logs.len();
@@ -3006,6 +3108,11 @@ impl RegenBuilder {
                 self.drop_one = None;
             }
         }
+        match (&mut self.logs, kept) {
+            (Some((tail, _)), Some(logs)) if logs.len() == cpu_ops.len() => tail.push_shared(logs),
+            // Out of step for good: the CPU chunks go without their logs.
+            (held, _) => *held = None,
+        }
         self.cpu.push(cpu_ops);
         self.register_rows.push(register_rows);
         self.aligned.push(aligned);
@@ -3037,10 +3144,27 @@ impl RegenBuilder {
             }};
         }
         while m.cpu > 0 && self.cpu.len >= m.cpu {
+            let ops = self.cpu.take(m.cpu);
+            // With the logs kept, the chunk carries the records phase A held
+            // it as, when they are in step with its ops.
+            let records = self.logs.as_mut().and_then(|(tail, decode)| {
+                let logs = tail.take_segments(m.cpu);
+                let first_cycle = e.cpu * m.cpu;
+                logs_in_step(&ops, &logs, first_cycle, &self.decode)
+                    .then(|| CpuLogRecords::new(logs, first_cycle as u64, Arc::clone(decode)))
+                    .flatten()
+            });
+            let ops = match records {
+                Some(records) => ChunkOps::CpuRecords {
+                    records,
+                    spent: ops,
+                },
+                None => ChunkOps::Cpu(ops, Arc::clone(&self.decode)),
+            };
             jobs.push(ChunkJob {
                 table: StreamTable::Cpu,
                 index: e.cpu,
-                ops: ChunkOps::Cpu(self.cpu.take(m.cpu), Arc::clone(&self.decode)),
+                ops,
             });
             e.cpu += 1;
         }

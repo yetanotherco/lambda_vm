@@ -1398,6 +1398,30 @@ fn parse_card_fill(value: Option<&str>) -> Result<CardFill, Error> {
     }
 }
 
+/// `LAMBDA_VM_BLOCK_RECORDS_DROP`: `park` (and unset or empty) lets live
+/// regeneration park and drop a streamed chunk held as its records like any
+/// chunk, phase B rebuilding its packed columns checked by its records'
+/// digest; `keep` holds such a chunk on the host to the prove's end, with no
+/// rank. Anything else refuses the prove. The proof's bytes are the same.
+pub(crate) fn records_keep() -> Result<bool, Error> {
+    parse_records_drop(
+        std::env::var("LAMBDA_VM_BLOCK_RECORDS_DROP")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`records_keep`]'s reading of its variable: whether records are kept.
+fn parse_records_drop(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "park") => Ok(false),
+        Some("keep") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_BLOCK_RECORDS_DROP={v}: park (records drop like any chunk) or keep"
+        ))),
+    }
+}
+
 /// The most window walkers `LAMBDA_VM_BLOCK_WALKERS` takes: each walker holds
 /// a window's state and walked lists, and this is the most whose memory was
 /// measured on the largest blocks.
@@ -3156,6 +3180,9 @@ pub(crate) struct Deviations {
     /// The room rule the streamed chunks held as records are admitted by,
     /// instead of the host's resident set against its pressure line.
     pub records_room: Option<crate::tables::trace_builder::RecordsRoom>,
+    /// Whether streamed chunks held as records stay on the host instead of
+    /// parking and dropping, instead of the knob ([`records_keep`]).
+    pub records_keep: Option<bool>,
     /// The trace alone: phase A drains each closed group as it comes instead
     /// of committing it, and the prove stops after the trace with
     /// [`HOST_ONLY`] ([`trace_block_host_only`]).
@@ -4899,10 +4926,20 @@ fn prove_streamed(
         Some(mode) => mode,
         None => regen::regen_mode()?,
     };
+    // A streamed chunk held as its records parks and drops like any chunk,
+    // unless records are kept: then it has no recipe and no rank.
+    let keep_records = deviations.records_keep.map_or_else(records_keep, Ok)?;
     let regen_recorder = regen::recorder(
         regen_mode,
         stream_form == TraceForm::Narrow && !options.stream_keccak_rnd && !options.stream_memw_lt,
     )
+    .map(|recorder| {
+        if keep_records {
+            recorder.keep_records()
+        } else {
+            recorder
+        }
+    })
     .map(std::sync::Arc::new);
     let recorder = regen_recorder.as_deref();
     // Live regeneration's recorder: the rest's tables it can build again are
@@ -7937,7 +7974,29 @@ mod packer_tests {
 mod walkers_knob_tests {
     use executor::vm::memory::StoreKind;
 
-    use super::{CardFill, Error, parse_card_fill, parse_walkers};
+    use super::{CardFill, Error, parse_card_fill, parse_records_drop, parse_walkers};
+
+    /// `LAMBDA_VM_BLOCK_RECORDS_DROP`: unset, empty or `park` parks and drops
+    /// records chunks like any chunk; `keep` keeps them; any other word
+    /// refuses the prove.
+    #[test]
+    fn the_records_drop_knob_takes_park_and_keep_and_refuses_anything_else() {
+        for (value, keep) in [
+            (None, false),
+            (Some(""), false),
+            (Some(" park "), false),
+            (Some("keep"), true),
+        ] {
+            assert_eq!(parse_records_drop(value).ok(), Some(keep), "{value:?}");
+        }
+        for value in ["on", "off", "Keep", "drop", "park,keep"] {
+            let refused = parse_records_drop(Some(value));
+            assert!(
+                matches!(&refused, Err(Error::Prover(m)) if m.contains("LAMBDA_VM_BLOCK_RECORDS_DROP")),
+                "{value}: {refused:?}"
+            );
+        }
+    }
 
     /// `LAMBDA_VM_BLOCK_WALKERS`: unset or empty is four walkers (the
     /// default); 0 one walker (the rollback); 1 to 4 that many; any other

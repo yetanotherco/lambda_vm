@@ -562,6 +562,10 @@ pub(crate) struct Recorder {
     /// Whether the layout's threads digest each chunk as they generate it
     /// (the shadow; live regeneration digests what it drops, at the drop).
     digests: bool,
+    /// Whether a chunk held as records stays on the host, with no rank
+    /// (`LAMBDA_VM_BLOCK_RECORDS_DROP=keep`), instead of parking and dropping
+    /// as its records like any chunk.
+    keep_records: bool,
 }
 
 #[derive(Default)]
@@ -571,8 +575,9 @@ struct Recorded {
     windows: usize,
     recipes: BTreeMap<(usize, usize), Recipe>,
     /// Each recipe's chunk, by its place in the hand-out; `None` for a chunk
-    /// held as the records its rows come from (`ChunkJob::is_records`), which
-    /// is never dropped and has no recipe.
+    /// held as the records its rows come from (`ChunkJob::is_records`) when
+    /// those are kept ([`Recorder::keep_records`]): such a chunk is never
+    /// dropped and has no recipe.
     by_order: Vec<Option<(StreamTable, usize)>>,
     /// Digests for a chunk with no recipe, and chunks of a table no recipe
     /// can hold.
@@ -591,6 +596,14 @@ impl Recorder {
             digests,
             ..Self::default()
         }
+    }
+
+    /// Chunks held as records keep their place in the hand-out but get no
+    /// recipe and no rank: they are never dropped, and no regenerator waits on
+    /// their fate.
+    pub(crate) fn keep_records(mut self) -> Self {
+        self.keep_records = true;
+        self
     }
 
     /// The `k`-th table of the rest laid out is `family`'s `j`-th
@@ -639,9 +652,9 @@ impl Recorder {
 
     /// The chunk handed out `order`-th, when one was and phase B can rebuild
     /// it: phase A places the streamed chunks first, in hand-out order, so it
-    /// is the table at block index `order`. A chunk held as its records is
-    /// never dropped: `None`, so it has no rank and no regenerator waits on
-    /// its fate.
+    /// is the table at block index `order`. A chunk held as its records when
+    /// those are kept ([`Self::keep_records`]) is never dropped: `None`, so it
+    /// has no rank and no regenerator waits on its fate.
     pub(crate) fn chunk_at(&self, order: usize) -> Option<(StreamTable, usize)> {
         self.lock().by_order.get(order).copied().flatten()
     }
@@ -662,8 +675,8 @@ impl Recorder {
             r.ends[t].push(end);
         }
         for job in jobs {
-            // Held as its records: kept, in its place in the hand-out.
-            if job.is_records() {
+            // Held as its records and kept: in its place in the hand-out.
+            if job.is_records() && self.keep_records {
                 r.by_order.push(None);
                 continue;
             }
@@ -1654,16 +1667,19 @@ pub(crate) fn run_live(
                                 panic!("a generator dies outside its catch (a test's fault)");
                             }
                             let (table, index) = (job.table, job.index);
+                            // A chunk dropped as its records is rebuilt as
+                            // them too: their digest checks its deposit.
                             let built = catch_unwind(AssertUnwindSafe(|| {
-                                let mut trace = job.generate_as(form).trace;
+                                let (records, chunk) = job.regenerate(form);
+                                let mut trace = chunk.trace;
                                 if trace.narrow_main().is_none() {
                                     trace.pack_main_narrow();
                                 }
                                 // Moved out, not copied.
-                                trace.take_narrow_main()
+                                trace.take_narrow_main().map(|packed| (records, packed))
                             }));
-                            let packed = match built {
-                                Ok(Some(packed)) => packed,
+                            let (records, packed) = match built {
+                                Ok(Some(built)) => built,
                                 Ok(None) => {
                                     let why =
                                         format!("{table:?}[{index}]: the columns did not pack");
@@ -1686,7 +1702,17 @@ pub(crate) fn run_live(
                                 packed
                             };
                             let bytes = packed.data().len() as u64;
-                            let out = guard.slot.deposit(packed);
+                            let out = match (guard.slot.is_records(), records) {
+                                (false, _) => guard.slot.deposit(packed),
+                                (true, Some(digest)) => guard.slot.deposit_checked(packed, digest),
+                                (true, None) => {
+                                    let why = format!(
+                                        "{table:?}[{index}]: dropped as records, not rebuilt as them"
+                                    );
+                                    guard.slot.fail(&why);
+                                    Err(RegenError::Failed(why))
+                                }
+                            };
                             // Deposited, refused or closed: the slot is settled
                             // either way (a closed window settles every waiter).
                             guard.settled = true;
@@ -1752,7 +1778,7 @@ pub(crate) fn run_live(
                     break;
                 }
                 report.windows += 1;
-                let jobs = match catch_unwind(AssertUnwindSafe(|| builder.push(&logs))) {
+                let jobs = match catch_unwind(AssertUnwindSafe(|| builder.push_owned(logs))) {
                     Ok(Ok(jobs)) => jobs,
                     Ok(Err(e)) => {
                         stop = Some(format!("the regeneration walk: {e}"));
@@ -1975,7 +2001,14 @@ impl LiveRun {
                     Ok(program) => program,
                     Err(e) => return failed(format!("the regenerator's ELF: {e}"), &dropped),
                 };
-                match RegenBuilder::new(&program, &private_input, &max_rows) {
+                // A CPU chunk dropped as its logs is checked by them: the
+                // walk keeps each window's logs for its chunks.
+                let cpu_logs = dropped
+                    .iter()
+                    .any(|((table, _), slot)| *table == StreamTable::Cpu && slot.is_records());
+                match RegenBuilder::new(&program, &private_input, &max_rows)
+                    .and_then(|b| if cpu_logs { b.keep_cpu_logs() } else { Ok(b) })
+                {
                     Ok(builder) => {
                         let setup = cpu_since(cpu0);
                         let mut report = run_live(
@@ -2644,7 +2677,7 @@ pub(crate) fn dropped_line(
     format!(
         "BLOCK REGEN dropped: {mode:?}{} · {} chunks {:.2} GiB (drop-back {} chunks {:.2} GiB) · \
          {armed} · {recipes} recipes · {} refused (no longer on the host) · {} held (their group \
-         dropped another class)",
+         dropped another class) · {} dropped as their records, {:.2} GiB of records",
         if no_disk { " (no disk)" } else { "" },
         report.tables,
         report.bytes as f64 / GIB,
@@ -2652,6 +2685,8 @@ pub(crate) fn dropped_line(
         report.back_bytes as f64 / GIB,
         report.refused_late,
         report.held,
+        report.records.0,
+        report.records.1 as f64 / GIB,
     )
 }
 

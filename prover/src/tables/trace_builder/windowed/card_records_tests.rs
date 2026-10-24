@@ -423,61 +423,173 @@ fn the_cards_decode_rows_find_the_hosts_rows() {
     }
 }
 
-/// ★ A chunk held as records has no recipe and no rank: the regeneration
-/// recorder keeps its place in the hand-out, so every other chunk's rank is
-/// its block index still, but names no chunk there, so no regenerator drops
-/// it or waits on its fate.
+/// ★ A chunk held as records parks and drops like any chunk: the regeneration
+/// recorder gives it a recipe and a rank, its block index. With records kept
+/// (`LAMBDA_VM_BLOCK_RECORDS_DROP=keep`) it has neither: the recorder keeps its
+/// place in the hand-out, so every other chunk's rank is still its block
+/// index, but names no chunk there, so no regenerator drops it or waits on its
+/// fate.
 #[test]
-fn a_chunk_held_as_records_has_no_recipe_and_no_rank() {
+fn a_chunk_held_as_records_has_a_rank_unless_records_are_kept() {
     use crate::block_whir::regen::Recorder;
     let max_rows = MaxRowsConfig::small();
     let (program, logs) = run("test_keccak_multi");
-    for (room, admitted) in [(always(), None), (for_first(3, 1000), Some(3))] {
-        let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows)
-            .and_then(WindowedTraceBuilder::drop_streamed_ops)
-            .and_then(|b| b.card_fill_streamed(room, true, true))
-            .expect("the builder");
-        let recorder = Recorder::new(false);
-        let mut handed: Vec<(StreamTable, usize, bool)> = Vec::new();
+    for keep in [false, true] {
+        for (room, admitted) in [(always(), None), (for_first(3, 1000), Some(3))] {
+            let what = format!("keep {keep}, admitted {admitted:?}");
+            let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows)
+                .and_then(WindowedTraceBuilder::drop_streamed_ops)
+                .and_then(|b| b.card_fill_streamed(room, true, true))
+                .expect("the builder");
+            let recorder = if keep {
+                Recorder::new(false).keep_records()
+            } else {
+                Recorder::new(false)
+            };
+            let mut handed: Vec<(StreamTable, usize, bool)> = Vec::new();
+            {
+                let (mut walker, mut accumulator) = builder.split();
+                let body = logs.len() - 1;
+                for w in logs[..body - body % 32].chunks(32) {
+                    let walked = walker.walk_owned(w.to_vec()).expect("a window");
+                    let (jobs, added) = accumulator.absorb_counted(walked);
+                    recorder.window(added, &jobs);
+                    handed.extend(jobs.iter().map(|j| (j.table, j.index, j.is_records())));
+                }
+            }
+            let held = handed.iter().filter(|(_, _, r)| *r).count();
+            assert!(held > 0, "{what}: {held} of {}", handed.len());
+            if let Some(admitted) = admitted {
+                assert!(
+                    held == admitted && handed.len() > held,
+                    "{what}: {held} of {}",
+                    handed.len()
+                );
+            }
+            for (t, &(table, index, records)) in handed.iter().enumerate() {
+                let want = (!(records && keep)).then_some((table, index));
+                assert_eq!(recorder.chunk_at(t), want, "{what}: block index {t}");
+            }
+            assert_eq!(recorder.chunk_at(handed.len()), None);
+            let (recipes, stray) = recorder.recipes();
+            assert_eq!(stray, 0);
+            let ranked: Vec<(StreamTable, usize, usize)> = handed
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, _, records))| !(*records && keep))
+                .map(|(t, &(table, index, _))| (table, index, t))
+                .collect();
+            let recorded: Vec<(StreamTable, usize, usize)> = recipes
+                .iter()
+                .map(|r| (r.table, r.index, r.order))
+                .collect();
+            assert_eq!(recorded, ranked, "{what}: a recipe at its block index");
+        }
+    }
+}
+
+/// ★ A chunk dropped as its records comes back as them: walked again from the
+/// same logs, with the CPU logs kept, every CPU and MEMW_R chunk phase A held
+/// as records is rebuilt with records of the same digest, and the packed
+/// columns made from them are the host fill of phase A's records. A records
+/// slot takes those columns; with one log changed in the replay, the digest
+/// moves and the slot refuses the deposit.
+#[test]
+fn a_chunk_dropped_as_records_is_rebuilt_as_them() {
+    use std::collections::HashMap;
+
+    use super::RegenBuilder;
+    use crate::tables::gpack::TraceForm;
+    use stark::regen::{RegenError, RegenWindow};
+
+    let max_rows = MaxRowsConfig::small();
+    for name in ["all_instructions_64", "test_keccak_multi"] {
+        let (program, logs) = run(name);
+        let window = 7;
+        let body = logs.len() - 1;
+        let cut = body - body % window;
+        // Phase A's records, by chunk.
+        let mut held: HashMap<(StreamTable, usize), multilinear::records::Records> = HashMap::new();
         {
+            let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows)
+                .and_then(WindowedTraceBuilder::drop_streamed_ops)
+                .and_then(|b| b.card_fill_streamed(always(), true, true))
+                .expect("the builder");
             let (mut walker, mut accumulator) = builder.split();
-            let body = logs.len() - 1;
-            for w in logs[..body - body % 32].chunks(32) {
+            for w in logs[..cut].chunks(window) {
                 let walked = walker.walk_owned(w.to_vec()).expect("a window");
-                let (jobs, added) = accumulator.absorb_counted(walked);
-                recorder.window(added, &jobs);
-                handed.extend(jobs.iter().map(|j| (j.table, j.index, j.is_records())));
+                for job in accumulator.absorb(walked) {
+                    let (table, index) = (job.table, job.index);
+                    if let Some(records) = job.generate().trace.take_records_main() {
+                        held.insert((table, index), records);
+                    }
+                }
             }
         }
-        let held = handed.iter().filter(|(_, _, r)| *r).count();
-        assert!(held > 0, "{held} of {}", handed.len());
-        if let Some(admitted) = admitted {
-            assert!(
-                held == admitted && handed.len() > held,
-                "{held} of {}",
-                handed.len()
+        assert!(held.len() > 2, "{name}: {} chunks held", held.len());
+        // The replay, every window (the last one included), with one log
+        // changed or not.
+        let replay = |tamper: Option<usize>| {
+            let mut regen = RegenBuilder::new(&program, &[], &max_rows)
+                .and_then(RegenBuilder::keep_cpu_logs)
+                .expect("the regenerator");
+            let mut rebuilt = HashMap::new();
+            let mut at = 0usize;
+            for w in logs.chunks(window) {
+                let mut w = w.to_vec();
+                if let Some(k) = tamper.filter(|&k| (at..at + w.len()).contains(&k)) {
+                    w[k - at].dst_val ^= 1;
+                }
+                at += w.len();
+                for job in regen.push_owned(w).expect("a window") {
+                    let (table, index) = (job.table, job.index);
+                    let (digest, chunk) = job.regenerate(TraceForm::Narrow);
+                    let mut trace = chunk.trace;
+                    trace.pack_main_narrow();
+                    rebuilt.insert((table, index), (digest, trace.take_narrow_main()));
+                }
+            }
+            rebuilt
+        };
+        let rebuilt = replay(None);
+        let (slots, _producer) = RegenWindow::new(1 << 30);
+        for (rank, (key, records)) in held.iter().enumerate() {
+            let what = format!("{name} {key:?}");
+            let (digest, packed) = rebuilt.get(key).cloned().expect("rebuilt");
+            let packed = packed.expect("packed");
+            assert_eq!(
+                digest,
+                Some(records.digest()),
+                "{what}: the records' digest"
             );
+            let want = records
+                .host_fill()
+                .expect("the host fills phase A's records");
+            assert_eq!(
+                (packed.widths(), packed.data()),
+                (want.widths(), want.data()),
+                "{what}: the packed columns"
+            );
+            let slot = slots.slot_for_records(records, rank as u64);
+            slot.deposit_checked(packed, digest.expect("a digest"))
+                .unwrap_or_else(|e| panic!("{what}: {e:?}"));
         }
-        for (t, &(table, index, records)) in handed.iter().enumerate() {
-            let want = (!records).then_some((table, index));
-            assert_eq!(recorder.chunk_at(t), want, "block index {t}");
-        }
-        assert_eq!(recorder.chunk_at(handed.len()), None);
-        let (recipes, stray) = recorder.recipes();
-        assert_eq!(stray, 0);
-        let kept: Vec<(StreamTable, usize, usize)> = handed
+        // One log changed in the first CPU chunk held: its records' digest
+        // moves, and its slot refuses the deposit.
+        let (&(table, index), records) = held
             .iter()
-            .enumerate()
-            .filter(|(_, (_, _, records))| !records)
-            .map(|(t, &(table, index, _))| (table, index, t))
-            .collect();
-        let recorded: Vec<(StreamTable, usize, usize)> = recipes
-            .iter()
-            .map(|r| (r.table, r.index, r.order))
-            .collect();
+            .filter(|((t, _), _)| *t == StreamTable::Cpu)
+            .min_by_key(|((_, i), _)| *i)
+            .expect("a CPU chunk held");
+        let bent = replay(Some(index * max_rows.cpu + 1));
+        let (digest, packed) = bent.get(&(table, index)).cloned().expect("rebuilt");
+        let digest = digest.expect("a digest");
+        assert_ne!(digest, records.digest(), "{name}: one log changed");
+        let slot = slots.slot_for_records(records, held.len() as u64);
         assert_eq!(
-            recorded, kept,
-            "a recipe a chunk not held, at its block index"
+            slot.deposit_checked(packed.expect("packed"), digest),
+            Err(RegenError::Mismatch),
+            "{name}: the changed log's chunk"
         );
     }
 }

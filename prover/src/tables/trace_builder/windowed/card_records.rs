@@ -85,6 +85,11 @@ impl CpuLogRecords {
     pub(crate) fn into_trace(self) -> Table {
         held(Records(Arc::new(self)))
     }
+
+    /// The host's DECODE table its CPU ops are read with.
+    pub(crate) fn decode_table(&self) -> &DecodeTable {
+        &self.decode.table
+    }
 }
 
 impl std::fmt::Debug for CpuLogRecords {
@@ -163,6 +168,11 @@ impl RegisterRowRecords {
     /// The table held as these records.
     pub(crate) fn into_trace(self) -> Table {
         held(Records(Arc::new(self)))
+    }
+
+    /// The rows back.
+    pub(crate) fn into_rows(self) -> Segments<RegRow> {
+        self.rows
     }
 }
 

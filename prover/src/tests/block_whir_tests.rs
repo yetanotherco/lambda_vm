@@ -4897,14 +4897,15 @@ fn cpu_and_memw_r_filled_from_records_move_no_byte() {
     }
 }
 
-/// ★ A streamed chunk held as its records is never dropped and no regenerator
-/// waits on it: with live regeneration dropping every table it can (the
-/// streamed chunks' regenerator started as early as their fates are known),
-/// every dropped chunk comes back with its digest, none is missing, fewer
-/// streamed chunks drop than without the records, and the proof is the one
-/// without regeneration.
+/// ★ With records kept (`LAMBDA_VM_BLOCK_RECORDS_DROP=keep`), a streamed chunk
+/// held as its records is never dropped and no regenerator waits on it: with
+/// live regeneration dropping every table it can (the streamed chunks'
+/// regenerator started as early as their fates are known), every dropped
+/// chunk comes back with its digest, none is missing, fewer streamed chunks
+/// drop than without the records, and the proof is the one without
+/// regeneration.
 #[test]
-fn streamed_records_chunks_are_never_dropped() {
+fn streamed_records_chunks_kept_are_never_dropped() {
     use crate::block_whir::BlockSpillPolicy;
     use crate::block_whir::regen::RegenMode;
 
@@ -4950,7 +4951,10 @@ fn streamed_records_chunks_are_never_dropped() {
         &format,
         RegenMode::Always,
         BlockSpillPolicy::Off,
-        streamed_records(true, true),
+        Deviations {
+            records_keep: Some(true),
+            ..streamed_records(true, true)
+        },
     )
     .expect("prove");
     let c = stamps.windows.card_fill;
@@ -5008,4 +5012,108 @@ fn a_wrong_cpu_records_table_is_refused_by_the_verifier() {
         !verify(&proof, &elf, &format),
         "a proof over a wrong CPU table verified"
     );
+}
+
+/// ★ A streamed chunk held as its records parks and drops like any chunk (the
+/// default, `LAMBDA_VM_BLOCK_RECORDS_DROP=park`): with live regeneration
+/// dropping every table it can, as many streamed chunks drop as without the
+/// records, those held as records dropped as them; each comes back as packed
+/// columns checked by its rebuilt records' digest, none is missing or
+/// mismatched, and the proof is the one without regeneration and the one
+/// without the records. Without regeneration's drops, the parked records come
+/// back as they were.
+#[test]
+fn streamed_records_chunks_drop_as_records_and_come_back() {
+    use crate::block_whir::BlockSpillPolicy;
+    use crate::block_whir::regen::RegenMode;
+
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let readout = |stamps: &crate::block_whir::BlockStamps| {
+        let r = stamps.regen.clone().expect("live regeneration's readout");
+        assert_eq!(
+            (r.mismatches, r.failed, r.missing),
+            (0, 0, 0),
+            "{:?}",
+            r.lines
+        );
+        assert_eq!(r.regenerated, r.dropped, "{:?}", r.lines);
+        assert!(r.error.is_none(), "{:?}", r.lines);
+        r
+    };
+    let as_records = |r: &crate::block_whir::regen::RegenStamps| -> usize {
+        r.lines
+            .iter()
+            .find_map(|l| {
+                let at = l.find(" dropped as their records")?;
+                l[..at].rsplit(' ').next()?.parse().ok()
+            })
+            .expect("the dropped line counts the records")
+    };
+    let streamed = |r: &crate::block_whir::regen::RegenStamps| r.dropped - r.rest_dropped;
+    let (plain, _) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Off,
+        BlockSpillPolicy::Off,
+        streamed_records(true, true),
+    )
+    .expect("prove");
+    let (built, stamps) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Always,
+        BlockSpillPolicy::Off,
+        Deviations::default(),
+    )
+    .expect("prove");
+    let all = readout(&stamps);
+    assert_eq!(as_records(&all), 0, "{:?}", all.lines);
+    let (parked, stamps) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Always,
+        BlockSpillPolicy::Off,
+        streamed_records(true, true),
+    )
+    .expect("prove");
+    let c = stamps.windows.card_fill;
+    assert!(c.cpu[0] > 0 && c.memw_r[0] > 0, "{c:?}");
+    let some = readout(&stamps);
+    assert_eq!(
+        streamed(&some),
+        streamed(&all),
+        "every streamed chunk drops"
+    );
+    assert_eq!(some.recipes, all.recipes, "a recipe for every chunk");
+    assert_eq!(
+        as_records(&some),
+        c.cpu[0] + c.memw_r[0],
+        "every records chunk dropped as its records: {:?}",
+        some.lines
+    );
+    assert!(verify(&parked, &elf, &format));
+    // Live regeneration that never arms: every records chunk parks and comes
+    // back as it was.
+    let (never, stamps) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Auto,
+        BlockSpillPolicy::Off,
+        streamed_records(true, true),
+    )
+    .expect("prove");
+    assert!(stamps.windows.card_fill.cpu[0] > 0);
+    assert!(verify(&never, &elf, &format));
+    assert_eq!(parked.groups, plain.groups, "the partition");
+    if crypto::grinding::deterministic() {
+        assert_eq!(bytes(&parked), bytes(&plain), "the proof");
+        assert_eq!(bytes(&built), bytes(&plain), "the proof");
+        assert_eq!(bytes(&never), bytes(&plain), "the proof");
+    }
 }
