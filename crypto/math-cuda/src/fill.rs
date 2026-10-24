@@ -487,6 +487,27 @@ impl RecordsInput<'_> {
     }
 }
 
+/// Test-only fault: with the `test-faults` feature, a table filled from its
+/// records is filled this many rows late (plus
+/// `LAMBDA_VM_TEST_FAULT_CARD_FILL_SKIP`, read at the first fill): other words
+/// than the host fill's, which the card tests and a proof's verifier must
+/// catch.
+#[cfg(feature = "test-faults")]
+pub static FAULT_RECORDS_SKIP: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "test-faults")]
+fn fault_records_skip() -> usize {
+    static FROM_ENV: OnceLock<usize> = OnceLock::new();
+    let from_env = *FROM_ENV.get_or_init(|| {
+        std::env::var("LAMBDA_VM_TEST_FAULT_CARD_FILL_SKIP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    });
+    from_env + FAULT_RECORDS_SKIP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `records`' table into `dst` (`rows × cols` words, column-major), all on
 /// `stream`: the records copied up as the widen path copies packed bytes and
 /// the family's kernel launched, the copy freed in stream order, so a reader
@@ -507,6 +528,8 @@ pub(crate) fn fill_col_major_into(
     let m = module()?;
     match records {
         RecordsInput::KeccakRnd { ops, skip, rows } => {
+            #[cfg(feature = "test-faults")]
+            let skip = skip + fault_records_skip();
             let nops = u32::try_from(ops.len()).map_err(|_| crate::invalid_value())?;
             let ops_dev = upload(stream, ops)?;
             launch_keccak_rnd(stream, &m.keccak_rnd_in, &ops_dev, nops, skip, rows, dst)
