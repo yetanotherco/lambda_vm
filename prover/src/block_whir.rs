@@ -1422,6 +1422,32 @@ fn parse_records_drop(value: Option<&str>) -> Result<bool, Error> {
     }
 }
 
+/// Whether the streamed CPU and MEMW_R chunks may be held as their records,
+/// and why not when they may not. They need the card asked for at least one of
+/// the two families (`asked`), and G-pack's narrow chunks of a build that drops
+/// its streamed ops (`narrow_dropping`). And they need a way off the host:
+/// parked records drop only under live regeneration, so without it (a store,
+/// or regeneration off) every one admitted would stay resident to the prove's
+/// end, which no room rule bounds on a block that arms. Records kept on purpose
+/// (`LAMBDA_VM_BLOCK_RECORDS_DROP=keep`, `keep_records`) are undroppable by
+/// design: the A/B control.
+fn records_admission(
+    asked: bool,
+    narrow_dropping: bool,
+    keep_records: bool,
+    live_regen: bool,
+) -> Result<(), &'static str> {
+    if !asked {
+        Err("off")
+    } else if !narrow_dropping {
+        Err("off (not a narrow build that drops its streamed ops)")
+    } else if !keep_records && !live_regen {
+        Err("off (parked records drop only under live regeneration, and it is off)")
+    } else {
+        Ok(())
+    }
+}
+
 /// The most window walkers `LAMBDA_VM_BLOCK_WALKERS` takes: each walker holds
 /// a window's state and walked lists, and this is the most whose memory was
 /// measured on the largest blocks.
@@ -5170,39 +5196,39 @@ fn prove_streamed(
                 }
             }
         };
-        // The streamed chunks held as records: G-pack's narrow chunks only,
-        // from a build that drops its streamed ops, admitted while the host
-        // has room for them by the purge rule's own test (its resident set,
-        // the chunk and the regeneration window's ceiling under the pressure
-        // line) and live regeneration has not armed. Once a chunk is refused,
-        // every later one is filled on the host: what is never dropped is a
-        // prefix admitted with room.
-        let records_room = ((card_fill.cpu || card_fill.memw_r)
-            && options.drop_streamed_ops
-            && stream_form == TraceForm::Narrow)
-            .then(|| match &deviations.records_room {
-                Some(room) => std::sync::Arc::clone(room),
-                None => {
-                    let line = no_disk_room(true, target);
-                    let armed = live_regen.clone();
-                    std::sync::Arc::new(move |bytes: usize| {
-                        !armed.as_ref().is_some_and(|regen| regen.is_armed())
-                            && crate::alloc_purge::has_room(
-                                line,
-                                crate::lfm::program_budget::resident_bytes()
-                                    .map(|resident| resident.saturating_add(bytes as u64)),
-                            )
-                    }) as crate::tables::trace_builder::RecordsRoom
-                }
-            });
+        // The streamed chunks held as records ([`records_admission`]):
+        // G-pack's narrow chunks only, from a build that drops its streamed
+        // ops, with live regeneration to drop them (or kept on purpose),
+        // admitted while the host has room for them by the purge rule's own
+        // test (its resident set, the chunk and the regeneration window's
+        // ceiling under the pressure line) and live regeneration has not
+        // armed. Once a chunk is refused, every later one is filled on the
+        // host: what is never dropped is a prefix admitted with room.
+        let admission = records_admission(
+            card_fill.cpu || card_fill.memw_r,
+            options.drop_streamed_ops && stream_form == TraceForm::Narrow,
+            keep_records,
+            live_regen.is_some(),
+        );
+        let records_room = admission.is_ok().then(|| match &deviations.records_room {
+            Some(room) => std::sync::Arc::clone(room),
+            None => {
+                let line = no_disk_room(true, target);
+                let armed = live_regen.clone();
+                std::sync::Arc::new(move |bytes: usize| {
+                    !armed.as_ref().is_some_and(|regen| regen.is_armed())
+                        && crate::alloc_purge::has_room(
+                            line,
+                            crate::lfm::program_budget::resident_bytes()
+                                .map(|resident| resident.saturating_add(bytes as u64)),
+                        )
+                }) as crate::tables::trace_builder::RecordsRoom
+            }
+        });
         eprintln!(
             "BLOCK CARD FILL: families {} · streamed chunks as records: {}",
             card_fill.name(),
-            match (card_fill.cpu || card_fill.memw_r, records_room.is_some()) {
-                (false, _) => "off",
-                (true, true) => "while the host has room",
-                (true, false) => "off (not a narrow build that drops its streamed ops)",
-            }
+            admission.err().unwrap_or("while the host has room")
         );
         let (block, built, laid, executed) = std::thread::scope(|scope| {
             use std::sync::atomic::Ordering::Relaxed;
@@ -7974,7 +8000,38 @@ mod packer_tests {
 mod walkers_knob_tests {
     use executor::vm::memory::StoreKind;
 
-    use super::{CardFill, Error, parse_card_fill, parse_records_drop, parse_walkers};
+    use super::{
+        CardFill, Error, parse_card_fill, parse_records_drop, parse_walkers, records_admission,
+    };
+
+    /// Streamed chunks are held as records only with live regeneration to drop
+    /// them, or kept on purpose: never with a store or with regeneration off
+    /// and parking, where none would ever leave the host. And never unless the
+    /// card was asked and the build is narrow and drops its streamed ops.
+    #[test]
+    fn records_need_live_regeneration_unless_kept() {
+        for (asked, narrow_dropping, keep, live, admitted) in [
+            (true, true, false, true, true),
+            (true, true, true, true, true),
+            (true, true, true, false, true),
+            (true, true, false, false, false),
+            (true, false, false, true, false),
+            (true, false, true, true, false),
+            (false, true, false, true, false),
+            (false, true, true, true, false),
+        ] {
+            assert_eq!(
+                records_admission(asked, narrow_dropping, keep, live).is_ok(),
+                admitted,
+                "asked {asked}, narrow and dropping {narrow_dropping}, keep {keep}, live {live}"
+            );
+        }
+        assert!(
+            records_admission(true, true, false, false)
+                .is_err_and(|why| why.contains("live regeneration")),
+            "the line says why"
+        );
+    }
 
     /// `LAMBDA_VM_BLOCK_RECORDS_DROP`: unset, empty or `park` parks and drops
     /// records chunks like any chunk; `keep` keeps them; any other word

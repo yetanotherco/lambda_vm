@@ -4855,8 +4855,10 @@ fn cpu_and_memw_r_filled_from_records_move_no_byte() {
                 let what = format!(
                     "{name}, {workers} workers, cpu {cpu} memw_r {memw_r} keccak_rnd {keccak_rnd}"
                 );
+                // Regeneration is off here, and parked records need it: kept.
                 let (card, stamps) = proved(Deviations {
                     card_fill: Some(keccak_rnd),
+                    records_keep: Some(true),
                     ..streamed_records(cpu, memw_r)
                 });
                 let c = stamps.windows.card_fill;
@@ -4916,12 +4918,17 @@ fn streamed_records_chunks_kept_are_never_dropped() {
             .expect("serialize")
             .to_vec()
     };
+    // Records without regeneration: kept (parked records need live
+    // regeneration).
     let (plain, _) = regenerated(
         &elf,
         &format,
         RegenMode::Off,
         BlockSpillPolicy::Off,
-        streamed_records(true, true),
+        Deviations {
+            records_keep: Some(true),
+            ..streamed_records(true, true)
+        },
     )
     .expect("prove");
     let readout = |stamps: &crate::block_whir::BlockStamps| {
@@ -5000,6 +5007,8 @@ fn a_wrong_cpu_records_table_is_refused_by_the_verifier() {
         &o,
         &Deviations {
             card_fill_streamed_fault: 1,
+            // Regeneration is off here, and parked records need it: kept.
+            records_keep: Some(true),
             ..streamed_records(true, false)
         },
     )
@@ -5012,6 +5021,66 @@ fn a_wrong_cpu_records_table_is_refused_by_the_verifier() {
         !verify(&proof, &elf, &format),
         "a proof over a wrong CPU table verified"
     );
+}
+
+/// ★ Parked records need live regeneration: with a store and regeneration off,
+/// or regeneration off and no store, not one streamed chunk is held as its
+/// records, even with the room rule admitting every one: the streamed card
+/// fill is never set up, so no chunk is even handed to it, and each is built
+/// packed on the host, droppable as today. Records kept on purpose
+/// (`LAMBDA_VM_BLOCK_RECORDS_DROP=keep`) are still held there: the A/B
+/// control. The proofs are one.
+#[test]
+fn parked_records_need_live_regeneration() {
+    use crate::block_whir::BlockSpillPolicy;
+    use crate::block_whir::regen::RegenMode;
+
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let none_held = |policy: BlockSpillPolicy| {
+        let (proof, stamps) = regenerated(
+            &elf,
+            &format,
+            RegenMode::Off,
+            policy,
+            streamed_records(true, true),
+        )
+        .expect("prove");
+        let c = stamps.windows.card_fill;
+        assert_eq!(
+            (c.cpu, c.memw_r, c.records_bytes),
+            ([0, 0], [0, 0], 0),
+            "{policy:?}: chunks handed to the streamed card fill with no live regeneration: {c:?}"
+        );
+        assert!(verify(&proof, &elf, &format), "{policy:?}");
+        proof
+    };
+    let stored = none_held(BlockSpillPolicy::Always);
+    let held = none_held(BlockSpillPolicy::Off);
+    let (kept, stamps) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Off,
+        BlockSpillPolicy::Off,
+        Deviations {
+            records_keep: Some(true),
+            ..streamed_records(true, true)
+        },
+    )
+    .expect("prove");
+    let c = stamps.windows.card_fill;
+    assert!(c.cpu[0] > 0 && c.memw_r[0] > 0, "kept: {c:?}");
+    assert!(verify(&kept, &elf, &format));
+    assert_eq!(stored.groups, kept.groups, "the partition");
+    if crypto::grinding::deterministic() {
+        assert_eq!(bytes(&stored), bytes(&kept), "the proof");
+        assert_eq!(bytes(&held), bytes(&kept), "the proof");
+    }
 }
 
 /// ★ A streamed chunk held as its records parks and drops like any chunk (the
@@ -5056,12 +5125,17 @@ fn streamed_records_chunks_drop_as_records_and_come_back() {
             .expect("the dropped line counts the records")
     };
     let streamed = |r: &crate::block_whir::regen::RegenStamps| r.dropped - r.rest_dropped;
+    // Records without regeneration: kept (parked records need live
+    // regeneration).
     let (plain, _) = regenerated(
         &elf,
         &format,
         RegenMode::Off,
         BlockSpillPolicy::Off,
-        streamed_records(true, true),
+        Deviations {
+            records_keep: Some(true),
+            ..streamed_records(true, true)
+        },
     )
     .expect("prove");
     let (built, stamps) = regenerated(
