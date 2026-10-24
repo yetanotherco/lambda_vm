@@ -1816,6 +1816,41 @@ pub fn set_staging_pairs_override(on: Option<bool>) {
     STAGING_PAIRS_OVERRIDE.with(|o| o.set(on));
 }
 
+thread_local! {
+    /// The calling thread's [`grid_cap`].
+    static GRID_CAP: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The most blocks a long kernel launched from the calling thread may take,
+/// its work walked by a grid-stride loop: `None` (the default) launches the
+/// full grid. Set by [`with_grid_cap`] around work that runs beside
+/// latency-bound kernels, so that it holds at most that many blocks resident
+/// and the others find SMs free. The values are the same at any grid.
+pub fn grid_cap() -> Option<u32> {
+    GRID_CAP.with(|c| c.get())
+}
+
+/// `full` blocks, cut to the calling thread's [`grid_cap`] (at least one).
+pub fn capped_grid(full: u32) -> u32 {
+    match grid_cap() {
+        Some(cap) => full.min(cap.max(1)),
+        None => full,
+    }
+}
+
+/// Runs `f` with the calling thread's [`grid_cap`] set to `cap`, the previous
+/// cap restored after (also on a panic), so calls nest.
+pub fn with_grid_cap<R>(cap: Option<u32>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u32>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GRID_CAP.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(GRID_CAP.with(|c| c.replace(cap)));
+    f()
+}
+
 /// Bytes in one staging buffer. A pair holds two.
 pub const STAGED_CHUNK_BYTES: usize = 32 << 20;
 
@@ -2651,5 +2686,33 @@ mod staging_report_tests {
             line.ends_with(" | shared slabs pinned 4.00 GiB in 2 slot(s), 1 busy"),
             "{line}"
         );
+    }
+}
+
+#[cfg(test)]
+mod grid_cap_tests {
+    use super::{capped_grid, grid_cap, with_grid_cap};
+
+    /// No cap: the full grid. A cap cuts it, never below one block, nests,
+    /// and is restored after its closure, a panic included.
+    #[test]
+    fn a_grid_cap_cuts_the_grid_nests_and_is_restored() {
+        assert_eq!((grid_cap(), capped_grid(65_536)), (None, 65_536));
+        with_grid_cap(Some(85), || {
+            assert_eq!(capped_grid(65_536), 85);
+            assert_eq!(capped_grid(12), 12, "a grid under the cap keeps its size");
+            with_grid_cap(Some(0), || {
+                assert_eq!(capped_grid(65_536), 1, "at least one block")
+            });
+            with_grid_cap(None, || assert_eq!(capped_grid(65_536), 65_536));
+            assert_eq!(grid_cap(), Some(85), "the outer cap restored");
+        });
+        assert_eq!(grid_cap(), None);
+        let caught = std::panic::catch_unwind(|| with_grid_cap(Some(3), || panic!("inside")));
+        assert!(caught.is_err());
+        assert_eq!(grid_cap(), None, "restored after a panic");
+        std::thread::spawn(|| assert_eq!(grid_cap(), None, "a new thread starts uncapped"))
+            .join()
+            .expect("thread");
     }
 }
