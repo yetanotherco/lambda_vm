@@ -1421,6 +1421,7 @@ pub(crate) fn verify_block_tree_as(
         BLOCK_FAN_IN,
         &super::proof::aggregation_wrap_options(),
         top,
+        LEAF_P1_CAP,
     )
 }
 
@@ -1447,6 +1448,36 @@ pub(crate) fn verify_block_tree_under(
         fan_in,
         wrap_opts,
         top,
+        LEAF_P1_CAP,
+    )
+}
+
+/// [`verify_block_tree_under`] with the leaves partitioned by the rule under a
+/// leaf cap of `leaf_cap` socket rows ([`WhirBlockPlan::derive_capped`]): a
+/// small block spans several leaves only under a cap far below
+/// [`LEAF_P1_CAP`]. Test-only.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_block_tree_capped(
+    elf_bytes: &[u8],
+    proof_options: &crate::ProofOptions,
+    format: &BlockFormat,
+    statement: BlockStatement<'_>,
+    fan_in: usize,
+    wrap_opts: &crate::ProofOptions,
+    top: &super::proof::LfmProof,
+    leaf_cap: usize,
+) -> Result<(), String> {
+    verify_block_tree_with(
+        elf_bytes,
+        proof_options,
+        format,
+        statement,
+        None,
+        fan_in,
+        wrap_opts,
+        top,
+        leaf_cap,
     )
 }
 
@@ -1460,8 +1491,9 @@ fn verify_block_tree_with(
     fan_in: usize,
     wrap_opts: &crate::ProofOptions,
     top: &super::proof::LfmProof,
+    leaf_cap: usize,
 ) -> Result<(), String> {
-    let plan = WhirBlockPlan::derive_with(
+    let plan = WhirBlockPlan::derive_capped(
         elf_bytes,
         proof_options,
         format,
@@ -1469,6 +1501,7 @@ fn verify_block_tree_with(
         num_leaves,
         fan_in,
         None,
+        leaf_cap,
     )?;
     let artifacts = plan.derive_top(wrap_opts)?;
     if !super::proof::verify_against_artifacts_under::<crate::hash_pin::BlockFamily>(

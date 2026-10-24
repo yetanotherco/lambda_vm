@@ -1372,6 +1372,114 @@ fn the_whir_block_tree_proves_to_the_derived_top() {
     }
 }
 
+/// ★ The leaf scale is the verifier's, both ways, on a small block whose
+/// groups each need a leaf of their own under a leaf cap of the heaviest
+/// group's socket rows ([`WhirBlockPlan::derive_capped`]): `n` leaves at the
+/// single heights. At [`LeafScale::DoubleFrom`]`(n)` the plan doubles them,
+/// to fewer leaves; at `DoubleFrom(n + 1)` it keeps the single partition.
+/// Both trees prove, and the block's verifier, which derives the partition
+/// from the statement under ITS scale:
+/// - refuses the doubled tree under the single heights, and the single tree
+///   under `DoubleFrom(n)`: the cross-mode refusals;
+/// - refuses the doubled tree under `DoubleFrom(n + 1)`: a prover cannot
+///   double below the threshold;
+/// - accepts each tree under its own scale, and the single tree under
+///   `DoubleFrom(n + 1)`: below the threshold the tree is the single one.
+///
+/// The refusals come first, each the one a verifier-side mutant turns red
+/// (one that always doubles, one that never does, one that doubles from one
+/// leaf fewer). Against its own derived top the doubled tree verifies: the
+/// refusal is the derived program's identity.
+#[test]
+#[ignore = "proves two trees over a small block; box tier"]
+fn the_leaf_scale_is_the_verifiers_both_ways() {
+    use super::whir_block::{LeafScale, verify_block_tree_capped};
+    super::device_permit::arm(1);
+    let format = small_format();
+    let (elf, proof) = small_block("test_commit_4", &format);
+    let opts = ProofOptions::default_test_options();
+    let wrap = aggregation_wrap_options();
+    let probe = plan_of(&elf, &proof, &format, Some(1));
+    let (loads, front) = probe.chip_loads();
+    let cap = front.hash + loads.iter().map(|l| l.hash).max().expect("groups");
+    let at = |leaf_scale: LeafScale| BlockFormat {
+        leaf_scale,
+        ..format
+    };
+    let plan_at = |scale: LeafScale| {
+        WhirBlockPlan::derive_capped(
+            &elf,
+            &opts,
+            &at(scale),
+            proof.statement(),
+            None,
+            BLOCK_FAN_IN,
+            None,
+            cap,
+        )
+        .expect("the plan derives")
+    };
+    let single = plan_at(LeafScale::Fixed);
+    let n = single.partition().num_leaves();
+    assert!(n >= 2, "{n} leaves at a cap of {cap} socket rows");
+    let doubled = plan_at(LeafScale::DoubleFrom(n));
+    let m = doubled.partition().num_leaves();
+    let bound = doubled.leaf_bound().expect("the rule's partition");
+    assert!(
+        bound.doubled && bound.single_leaves == n && m < n,
+        "doubled from {n}: {m} leaves, {bound:?}"
+    );
+    let below = plan_at(LeafScale::DoubleFrom(n + 1));
+    assert_eq!(below.partition(), single.partition(), "below the threshold");
+    println!(
+        "   LEAF SCALE: {} groups · cap {cap} · {n} single leaves {:?} · {m} doubled {:?}",
+        single.num_groups(),
+        single.partition().leaves(),
+        doubled.partition().leaves()
+    );
+    let (top_single, _) = compose(&single, &proof, "SINGLE").expect("the single tree proves");
+    let (top_doubled, _) = compose(&doubled, &proof, "DOUBLED").expect("the doubled tree proves");
+    let verify = |scale: LeafScale, top: &LfmProof| {
+        verify_block_tree_capped(
+            &elf,
+            &opts,
+            &at(scale),
+            proof.statement(),
+            BLOCK_FAN_IN,
+            &wrap,
+            top,
+            cap,
+        )
+    };
+    assert!(
+        verify(LeafScale::Fixed, &top_doubled).is_err(),
+        "the doubled tree under the single heights"
+    );
+    assert!(
+        verify(LeafScale::DoubleFrom(n), &top_single).is_err(),
+        "the single tree under doubled leaves from {n}"
+    );
+    assert!(
+        verify(LeafScale::DoubleFrom(n + 1), &top_doubled).is_err(),
+        "the doubled tree below the threshold {}",
+        n + 1
+    );
+    verify(LeafScale::Fixed, &top_single).expect("the single tree under its own scale");
+    verify(LeafScale::DoubleFrom(n), &top_doubled).expect("the doubled tree under its own scale");
+    verify(LeafScale::DoubleFrom(n + 1), &top_single)
+        .expect("below the threshold the single tree is the verifier's");
+    let own = doubled.derive_top(&wrap).expect("its own top derives");
+    assert!(
+        super::proof::verify_against_artifacts_under::<BlockFamily>(
+            &own,
+            &top_doubled.proof,
+            &top_doubled.public_words,
+            &wrap
+        ),
+        "against its own top the doubled tree verifies"
+    );
+}
+
 // ============================== the real block ============================
 
 /// A node builder that stops leaves an error in every slot it had not
@@ -2494,7 +2602,8 @@ fn a_failed_program_fails_every_program_above_it_without_a_hang() {
 /// artifacts, the base verified on the host, and the top checked by the block's
 /// verifier against the top program it derives from the ELF and the statement.
 /// Reads `BLOCK_WHIR_ELF`, `BLOCK_WHIR_INPUT`, `W3_LEAVES` (the rule's count
-/// when unset), `W3_SIBLINGS` and `W3_FAN_IN` ([`BLOCK_FAN_IN`] when unset).
+/// when unset), `W3_SIBLINGS`, `W3_FAN_IN` ([`BLOCK_FAN_IN`] when unset) and
+/// `W3_CROSS_SCALE` (unset: no cross-scale verify).
 /// Prints `W3 …` lines.
 #[test]
 #[ignore = "a real block and its recursion: box only"]
@@ -2784,6 +2893,67 @@ fn the_whir_block_tree_on_a_real_block() {
         t.elapsed().as_secs_f64()
     );
     verdict.expect("the block's verifier accepts the top");
+
+    // `W3_CROSS_SCALE=<T>`, off the clock: the top verified again under the
+    // other leaf scale — the single heights when the run's format doubles
+    // from some threshold, doubled from `T` when it is fixed. Refused when
+    // that scale derives another partition; accepted when it derives the same
+    // one (below the threshold).
+    if let Ok(word) = std::env::var("W3_CROSS_SCALE") {
+        use super::whir_block::LeafScale;
+        let t: usize = word
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("W3_CROSS_SCALE is a leaf count, got `{word}`"));
+        assert!(
+            leaves.is_none(),
+            "W3_CROSS_SCALE: a forced leaf count has no scale"
+        );
+        let other = BlockFormat {
+            leaf_scale: match format.leaf_scale {
+                LeafScale::Fixed => LeafScale::DoubleFrom(t),
+                LeafScale::DoubleFrom(_) => LeafScale::Fixed,
+            },
+            ..format
+        };
+        let clock = std::time::Instant::now();
+        let other_plan = WhirBlockPlan::derive(&elf, &opts, &other, proof.statement(), None)
+            .expect("the other scale's plan derives");
+        let (same, other_leaves) = (
+            other_plan.partition() == plan.partition(),
+            other_plan.partition().num_leaves(),
+        );
+        drop(other_plan);
+        let crossed = verify_block_tree_under(
+            &elf,
+            &opts,
+            &other,
+            proof.statement(),
+            None,
+            fan_in,
+            &wrap,
+            top,
+        );
+        println!(
+            "W3 CROSS SCALE: the top under {}: {} · that scale's partition is {} ({other_leaves} leaves against {}) · as expected {} in {:.2}s",
+            other.leaf_scale,
+            if crossed.is_ok() {
+                "ACCEPTED"
+            } else {
+                "REJECTED"
+            },
+            if same { "the same" } else { "another" },
+            plan.partition().num_leaves(),
+            crossed.is_ok() == same,
+            clock.elapsed().as_secs_f64()
+        );
+        assert_eq!(
+            crossed.is_ok(),
+            same,
+            "under {}: accepted exactly when it derives the run's partition",
+            other.leaf_scale
+        );
+    }
 }
 
 // ========================= the batched argue (N-4) ========================
