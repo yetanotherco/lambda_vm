@@ -48,13 +48,15 @@ impl Columns<'_> {
     }
 }
 
-/// A table's columns as they go up: as they are, or packed (each column at the
-/// bytes its words need, [`crate::narrow`]) and widened on the card.
+/// A table's columns as they go up: as they are, packed (each column at the
+/// bytes its words need, [`crate::narrow`]) and widened on the card, or as the
+/// records its rows come from and filled on the card ([`crate::fill`]).
 #[derive(Clone, Copy)]
 pub enum TableUpload<'a> {
     /// The columns, every one the table's height.
     Wide(&'a [&'a [u64]]),
     Narrow(crate::narrow::NarrowInput<'a>),
+    Records(crate::fill::RecordsInput<'a>),
 }
 
 impl TableUpload<'_> {
@@ -63,6 +65,7 @@ impl TableUpload<'_> {
         match self {
             Self::Wide(columns) => columns.iter().map(|c| c.len()).sum(),
             Self::Narrow(packed) => packed.rows() * packed.cols(),
+            Self::Records(records) => records.rows() * records.cols(),
         }
     }
 }
@@ -115,8 +118,9 @@ impl DeviceColumns {
     /// [`Self::upload`] of whole tables, each as it is held: a packed one
     /// crosses the bus at its packed bytes and is widened on the card, column
     /// by column, into the run its columns take — the same words, at the same
-    /// offsets, as its widened columns uploaded. `None` as for [`Self::upload`],
-    /// or when a packed table is too big for one launch.
+    /// offsets, as its widened columns uploaded; one held as records crosses it
+    /// at their bytes and is filled there, into the same run. `None` as for
+    /// [`Self::upload`], or when a packed table is too big for one launch.
     pub fn upload_tables(tables: &[TableUpload<'_>]) -> Option<Self> {
         let total: usize = tables.iter().map(TableUpload::cells).sum();
         if total == 0
@@ -131,13 +135,15 @@ impl DeviceColumns {
             crate::device::note_device_fallback();
             return None;
         };
-        // The packed bytes sit on the card only while their table widens, one
-        // table at a time in stream order: promised for the largest of them.
+        // The packed bytes (or records) sit on the card only while their
+        // table widens (or fills), one table at a time in stream order:
+        // promised for the largest of them.
         let staging = tables
             .iter()
             .map(|table| match table {
                 TableUpload::Wide(_) => 0,
                 TableUpload::Narrow(packed) => packed.bytes() as u64,
+                TableUpload::Records(records) => records.bytes() as u64,
             })
             .max()
             .unwrap_or(0);
@@ -174,6 +180,13 @@ impl DeviceColumns {
                         &stream, be, *packed, rows, cols, &mut slab,
                     )
                     .ok()?;
+                    spans.extend((0..cols).map(|k| (at + k * rows, rows)));
+                    at += rows * cols;
+                }
+                TableUpload::Records(records) => {
+                    let (rows, cols) = (records.rows(), records.cols());
+                    let mut slab = buffer.slice_mut(at..at + rows * cols);
+                    crate::fill::fill_col_major_into(&stream, *records, &mut slab).ok()?;
                     spans.extend((0..cols).map(|k| (at + k * rows, rows)));
                     at += rows * cols;
                 }

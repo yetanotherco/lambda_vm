@@ -18,7 +18,8 @@
 //      zero.
 //   3. KECCAK_RND: a table cut into its first op, holding every round of the
 //      second and zero rows after it, and one cut at both ends: every row's
-//      fifteen column groups, by digest.
+//      fifteen column groups, by digest; the same through the entry that reads
+//      the records a table held as its keccak operations uploads.
 //   Every cell of each table starts as a sentinel, so a cell no thread writes
 //   is a mismatch, and threads past the table must leave a guard alone.
 //
@@ -160,7 +161,10 @@ void test_cpu() {
     check_words("CPU with an absent pc", refused, want.data(), height, cols);
 }
 
-void test_keccak_rnd() {
+// Every KECCAK_RND case through `fill(case, out)`, one of the kernel's
+// entries, against the digests.
+template <typename Fill>
+void check_keccak_rnd(const char *name, Fill fill) {
     const uint64_t cols = keccak_cols::NUM_COLUMNS;
     CHECK(KAT_KECCAK_GROUP_END[KAT_KECCAK_GROUPS - 1] == cols, "the groups end at the last column");
     size_t digest = 0;
@@ -168,12 +172,9 @@ void test_keccak_rnd() {
         const KatKeccakCase cs = KAT_KECCAK_CASES[k];
         auto out = table(cs.rows * cols);
         for (unsigned section = 0; section < FILL_KECCAK_SECTIONS; ++section) {
-            each_row(cs.rows, section, [&] {
-                fill_keccak_rnd(KAT_KECCAK_OPS + cs.first_op, cs.nops, cs.skip, cs.rows,
-                                out.data());
-            });
+            each_row(cs.rows, section, [&] { fill(cs, out.data()); });
         }
-        CHECK(guard_intact(out, cs.rows * cols), "KECCAK_RND case %d: a thread past the table wrote",
+        CHECK(guard_intact(out, cs.rows * cols), "%s case %d: a thread past the table wrote", name,
               k);
         int bad = 0;
         for (uint64_t r = 0; r < cs.rows; ++r) {
@@ -183,7 +184,7 @@ void test_keccak_rnd() {
                 const uint64_t got = fnv1a(out.data() + start * cs.rows + r, end - start, cs.rows);
                 if (got != KAT_KECCAK_DIGESTS[digest]) {
                     if (bad++ < 8) {
-                        std::printf("  KECCAK_RND case %d row %llu columns [%u, %u) differ\n", k,
+                        std::printf("  %s case %d row %llu columns [%u, %u) differ\n", name, k,
                                     (unsigned long long)r, start, end);
                     }
                 }
@@ -191,10 +192,28 @@ void test_keccak_rnd() {
                 start = end;
             }
         }
-        CHECK(bad == 0, "KECCAK_RND case %d: %d row groups differ", k, bad);
+        CHECK(bad == 0, "%s case %d: %d row groups differ", name, k, bad);
     }
     CHECK(digest == sizeof(KAT_KECCAK_DIGESTS) / sizeof(KAT_KECCAK_DIGESTS[0]),
           "every digest read");
+}
+
+void test_keccak_rnd() {
+    check_keccak_rnd("KECCAK_RND", [](const KatKeccakCase &cs, uint64_t *out) {
+        fill_keccak_rnd(KAT_KECCAK_OPS + cs.first_op, cs.nops, cs.skip, cs.rows, out);
+    });
+    // The records a table held as its keccak operations uploads: the same
+    // calls without their outputs, the same words.
+    std::vector<KeccakOpInC> ops;
+    for (const KeccakOpC &op : KAT_KECCAK_OPS) {
+        KeccakOpInC in{};
+        in.timestamp = op.timestamp;
+        for (int i = 0; i < 25; ++i) in.input[i] = op.input[i];
+        ops.push_back(in);
+    }
+    check_keccak_rnd("KECCAK_RND from records", [&](const KatKeccakCase &cs, uint64_t *out) {
+        fill_keccak_rnd_in(ops.data() + cs.first_op, cs.nops, cs.skip, cs.rows, out);
+    });
 }
 
 }  // namespace

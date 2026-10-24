@@ -125,6 +125,15 @@ pub struct KeccakOpC {
     pub output: [u64; 25],
 }
 
+/// The same call as a table held as its keccak operations carries it
+/// (`multilinear::records::KeccakRndOp`): the fields its rows read.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeccakOpInC {
+    pub timestamp: u64,
+    pub input: [u64; 25],
+}
+
 const _: () = {
     assert!(size_of::<LogC>() == 40);
     assert!(offset_of!(LogC, dst_val) == 32);
@@ -139,6 +148,8 @@ const _: () = {
     assert!(offset_of!(DecodeRunC, len) == 12);
     assert!(size_of::<KeccakOpC>() == 408);
     assert!(offset_of!(KeccakOpC, output) == 208);
+    assert!(size_of::<KeccakOpInC>() == 208);
+    assert!(offset_of!(KeccakOpInC, input) == 8);
 };
 
 // SAFETY: each is `#[repr(C)]` plain data with no padding the kernels read
@@ -149,6 +160,7 @@ unsafe impl DeviceRepr for RegRowC {}
 unsafe impl DeviceRepr for DecodeEntryC {}
 unsafe impl DeviceRepr for DecodeRunC {}
 unsafe impl DeviceRepr for KeccakOpC {}
+unsafe impl DeviceRepr for KeccakOpInC {}
 
 impl DecodeRunC {
     /// The DECODE row of `pc` in `runs` (ascending and disjoint), as the CPU
@@ -179,6 +191,7 @@ struct Module {
     memw_r: CudaFunction,
     cpu: CudaFunction,
     keccak_rnd: CudaFunction,
+    keccak_rnd_in: CudaFunction,
 }
 
 fn module() -> Result<&'static Module> {
@@ -192,6 +205,7 @@ fn module() -> Result<&'static Module> {
         memw_r: module.load_function("fill_memw_r")?,
         cpu: module.load_function("fill_cpu_from_logs")?,
         keccak_rnd: module.load_function("fill_keccak_rnd")?,
+        keccak_rnd_in: module.load_function("fill_keccak_rnd_in")?,
         _module: module,
     };
     Ok(MODULE.get_or_init(|| m))
@@ -403,11 +417,27 @@ pub fn fill_keccak_rnd_into(
     let clock = Clock::start(stream)?;
     let records = upload(stream, ops)?;
     clock.uploaded.record(stream)?;
+    launch_keccak_rnd(stream, &m.keccak_rnd, &records, nops, skip, rows, dst)?;
+    clock.done.record(stream)?;
+    clock.finish(size_of_val(ops))
+}
+
+/// `fill_keccak_rnd`'s launch (or `fill_keccak_rnd_in`'s, as `function` says)
+/// over records already on the card.
+fn launch_keccak_rnd<T: DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    function: &CudaFunction,
+    records: &CudaSlice<T>,
+    nops: u32,
+    skip: usize,
+    rows: usize,
+    dst: &mut CudaViewMut<u64>,
+) -> Result<()> {
     let (skip_u64, rows_u64) = (skip as u64, rows as u64);
     unsafe {
         stream
-            .launch_builder(&m.keccak_rnd)
-            .arg(&records)
+            .launch_builder(function)
+            .arg(records)
             .arg(&nops)
             .arg(&skip_u64)
             .arg(&rows_u64)
@@ -418,8 +448,70 @@ pub fn fill_keccak_rnd_into(
                 shared_mem_bytes: 0,
             })?;
     }
-    clock.done.record(stream)?;
-    clock.finish(size_of_val(ops))
+    Ok(())
+}
+
+/// A table's records as they go up for the card to fill its columns from
+/// them ([`crate::columns::TableUpload::Records`]).
+#[derive(Clone, Copy, Debug)]
+pub enum RecordsInput<'a> {
+    /// KECCAK_RND's rows `[skip, skip + rows)` of the table `ops` make, 24
+    /// rows an op; rows past the last op zero.
+    KeccakRnd {
+        ops: &'a [KeccakOpInC],
+        skip: usize,
+        rows: usize,
+    },
+}
+
+impl RecordsInput<'_> {
+    /// Rows of the table.
+    pub fn rows(&self) -> usize {
+        match self {
+            Self::KeccakRnd { rows, .. } => *rows,
+        }
+    }
+
+    /// Columns of the table.
+    pub fn cols(&self) -> usize {
+        match self {
+            Self::KeccakRnd { .. } => KECCAK_RND_COLUMNS,
+        }
+    }
+
+    /// The records' bytes.
+    pub fn bytes(&self) -> usize {
+        match self {
+            Self::KeccakRnd { ops, .. } => size_of_val(*ops),
+        }
+    }
+}
+
+/// `records`' table into `dst` (`rows × cols` words, column-major), all on
+/// `stream`: the records copied up as the widen path copies packed bytes and
+/// the family's kernel launched, the copy freed in stream order, so a reader
+/// on the same stream needs no further ordering.
+pub(crate) fn fill_col_major_into(
+    stream: &Arc<CudaStream>,
+    records: RecordsInput<'_>,
+    dst: &mut CudaViewMut<u64>,
+) -> Result<()> {
+    ensure_eq!(
+        dst.len(),
+        records.rows() * records.cols(),
+        "the table's words"
+    );
+    if records.rows() == 0 {
+        return Ok(());
+    }
+    let m = module()?;
+    match records {
+        RecordsInput::KeccakRnd { ops, skip, rows } => {
+            let nops = u32::try_from(ops.len()).map_err(|_| crate::invalid_value())?;
+            let ops_dev = upload(stream, ops)?;
+            launch_keccak_rnd(stream, &m.keccak_rnd_in, &ops_dev, nops, skip, rows, dst)
+        }
+    }
 }
 
 /// Today's path, timed as the fills are: `packed`'s bytes, offsets and widths

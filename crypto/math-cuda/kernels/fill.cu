@@ -98,6 +98,15 @@ struct KeccakOpC {
 static_assert(sizeof(KeccakOpC) == 408, "KeccakOpC is 408 bytes");
 static_assert(offsetof(KeccakOpC, output) == 208, "KeccakOpC field order");
 
+// The same call as a table held as its records carries it
+// (`multilinear::records::KeccakRndOp`): the fields its rows read, no output.
+struct KeccakOpInC {
+    uint64_t timestamp;
+    uint64_t input[25];
+};
+static_assert(sizeof(KeccakOpInC) == 208, "KeccakOpInC is 208 bytes");
+static_assert(offsetof(KeccakOpInC, input) == 8, "KeccakOpInC field order");
+
 // ---------------------------------------------------------------------------
 // The setters (`types.rs`, `VmTable`)
 // ---------------------------------------------------------------------------
@@ -471,9 +480,11 @@ __device__ __forceinline__ void halfword_shift(uint64_t v, uint32_t n, uint64_t 
 // round `r` at row `24k + r`), as a table of `rows` rows; rows past the last
 // op are zero (μ = 0). An op the slice cuts writes only its rows inside. Grid:
 // x a run of rows, one thread a row, so a column's stores coalesce; y the
-// column section (`FILL_KECCAK_SECTIONS`).
-extern "C" __global__ void fill_keccak_rnd(const KeccakOpC *ops, uint32_t nops, uint64_t skip,
-                                           uint64_t rows, uint64_t *out) {
+// column section (`FILL_KECCAK_SECTIONS`). `Op` is either record: the rows
+// read its timestamp and input alone.
+template <typename Op>
+__device__ __forceinline__ void fill_keccak_rnd_rows(const Op *ops, uint32_t nops, uint64_t skip,
+                                                     uint64_t rows, uint64_t *out) {
     namespace c = keccak_cols;
     uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) return;
@@ -557,4 +568,15 @@ extern "C" __global__ void fill_keccak_rnd(const KeccakOpC *ops, uint32_t nops, 
         w.dword_bl(c::RC, rc);
         w.word(c::MU, 1);
     }
+}
+
+extern "C" __global__ void fill_keccak_rnd(const KeccakOpC *ops, uint32_t nops, uint64_t skip,
+                                           uint64_t rows, uint64_t *out) {
+    fill_keccak_rnd_rows(ops, nops, skip, rows, out);
+}
+
+// The same, over the records a table held as its keccak operations uploads.
+extern "C" __global__ void fill_keccak_rnd_in(const KeccakOpInC *ops, uint32_t nops,
+                                              uint64_t skip, uint64_t rows, uint64_t *out) {
+    fill_keccak_rnd_rows(ops, nops, skip, rows, out);
 }
