@@ -402,6 +402,14 @@ enum Commands {
         /// carry it.
         #[arg(long, value_parser = leaf_double_from_word, default_value = "10")]
         leaf_double_from: String,
+
+        /// How the recursion's leaves check each chain's queries: `v1`
+        /// (production) or `lean` (round 0's values four to a word, paths
+        /// walked on rotated hints, and the tail rounds wholly in their caps
+        /// checked at every leaf once). A format choice: `verify-block` must
+        /// be given the same one; the proof file does not carry it.
+        #[arg(long, value_parser = ["v1", "lean"], default_value = "v1")]
+        leaf_query: String,
     },
 
     /// Verify a block proof produced by `prove-block`
@@ -438,6 +446,11 @@ enum Commands {
         /// proof.
         #[arg(long, value_parser = leaf_double_from_word, default_value = "10")]
         leaf_double_from: String,
+
+        /// The leaves' query check the block was proved with (`prove-block
+        /// --leaf-query`): the verifier's constant, never read from the proof.
+        #[arg(long, value_parser = ["v1", "lean"], default_value = "v1")]
+        leaf_query: String,
     },
 
     /// Count main-trace and aux-trace field elements without proving
@@ -541,6 +554,7 @@ fn main() -> ExitCode {
             blowup,
             leaves,
             leaf_double_from,
+            leaf_query,
         } => cmd_prove_block(
             elf,
             input,
@@ -552,6 +566,7 @@ fn main() -> ExitCode {
                 blowup: &blowup,
                 leaves: &leaves,
                 leaf_double_from: &leaf_double_from,
+                leaf_query: &leaf_query,
             },
         ),
         Commands::VerifyBlock {
@@ -562,6 +577,7 @@ fn main() -> ExitCode {
             blowup,
             leaves,
             leaf_double_from,
+            leaf_query,
         } => cmd_verify_block(
             proof,
             elf,
@@ -571,6 +587,7 @@ fn main() -> ExitCode {
                 blowup: &blowup,
                 leaves: &leaves,
                 leaf_double_from: &leaf_double_from,
+                leaf_query: &leaf_query,
             },
         ),
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
@@ -663,13 +680,14 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// The block commands' format choices, the words of `--group`, `--blowup`,
-/// `--leaves` and `--leaf-double-from`: `verify-block` must be given the ones
-/// `prove-block` was, and the proof file carries none of them.
+/// `--leaves`, `--leaf-double-from` and `--leaf-query`: `verify-block` must be
+/// given the ones `prove-block` was, and the proof file carries none of them.
 struct BlockChoices<'a> {
     group: &'a str,
     blowup: &'a str,
     leaves: &'a str,
     leaf_double_from: &'a str,
+    leaf_query: &'a str,
 }
 
 /// `--leaf-double-from`'s words: `off` or a leaf count
@@ -691,6 +709,18 @@ fn block_leaf_scale(word: &str) -> Result<prover::lfm::whir_block::LeafScale, St
     leaf_scale_setting(Some(word))
 }
 
+/// The leaves' query check of `--leaf-query`: the caller's, so the format's
+/// own environment knob is refused rather than silently outranked.
+fn block_leaf_query(word: &str) -> Result<prover::lfm::whir_chain::LeafQuery, String> {
+    use prover::lfm::whir_block::{LEAF_QUERY_ENV, leaf_query_setting};
+    if std::env::var_os(LEAF_QUERY_ENV).is_some() {
+        return Err(format!(
+            "{LEAF_QUERY_ENV} is the harness's knob: give the CLI --leaf-query instead"
+        ));
+    }
+    leaf_query_setting(Some(word))
+}
+
 fn cmd_prove_block(
     elf_path: PathBuf,
     input_path: Option<PathBuf>,
@@ -707,6 +737,7 @@ fn cmd_prove_block(
         blowup,
         leaves,
         leaf_double_from,
+        leaf_query,
     } = choices;
 
     // The group opening is the caller's constant, given on the command line
@@ -737,6 +768,15 @@ fn cmd_prove_block(
         }
     };
     eprintln!("BLOCK LEAF SCALE: {leaf_scale}");
+    // So is the leaves' query check.
+    let leaf_query = match block_leaf_query(leaf_query) {
+        Ok(query) => query,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("BLOCK LEAF QUERY: {leaf_query:?}");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
         Err(e) => {
@@ -767,6 +807,7 @@ fn cmd_prove_block(
     };
     eprintln!("BLOCK GROUP OPENING: {group}");
     cfg.format.leaf_scale = leaf_scale;
+    cfg.format.leaf_query = leaf_query;
     assert_eq!(
         (cfg.format.zf.whir_blowup, cfg.format.zf.whir_leaves),
         (blowup.factor(), order),
@@ -842,6 +883,7 @@ fn cmd_verify_block(
         blowup,
         leaves,
         leaf_double_from,
+        leaf_query,
     } = choices;
 
     let fold = match group_setting(Some(group)) {
@@ -865,6 +907,13 @@ fn cmd_verify_block(
     // environment's knob, which this refuses.
     let leaf_scale = match block_leaf_scale(leaf_double_from) {
         Ok(scale) => scale,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let leaf_query = match block_leaf_query(leaf_query) {
+        Ok(query) => query,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::FAILURE;
@@ -907,10 +956,12 @@ fn cmd_verify_block(
     eprintln!("BLOCK WHIR BLOWUP: {blowup}");
     eprintln!("BLOCK WHIR LEAVES: {leaves}");
     eprintln!("BLOCK LEAF SCALE: {leaf_scale}");
+    eprintln!("BLOCK LEAF QUERY: {leaf_query:?}");
     eprintln!("Verifying block proof...");
     let start = Instant::now();
-    let result =
-        verify_whir_block_tree_proof_at(&elf_data, &proof, fold, blowup, order, leaf_scale);
+    let result = verify_whir_block_tree_proof_at(
+        &elf_data, &proof, fold, blowup, order, leaf_scale, leaf_query,
+    );
     let verify_elapsed = start.elapsed();
     match result {
         Ok(()) => {
@@ -2147,6 +2198,45 @@ mod tests {
         assert_eq!(
             prover::lfm::whir_block::leaf_scale_setting(Some("10")),
             Ok(LeafScale::DEFAULT),
+            "the flag's default is production's"
+        );
+    }
+
+    /// Both block commands take the leaves' query check, production's `v1`
+    /// unless told otherwise, and nothing but `v1` or `lean`; each word reads
+    /// to the check it names.
+    #[test]
+    fn the_block_commands_take_the_leaf_query() {
+        use prover::lfm::whir_chain::LeafQuery;
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            let query = |args: &[&str]| match parse(args).map(|cli| cli.command) {
+                Ok(
+                    Commands::ProveBlock { leaf_query, .. }
+                    | Commands::VerifyBlock { leaf_query, .. },
+                ) => Some(leaf_query),
+                _ => None,
+            };
+            assert_eq!(query(cmd).as_deref(), Some("v1"), "the default");
+            for (word, want) in [("v1", LeafQuery::V1), ("lean", LeafQuery::Lean)] {
+                let args = [cmd, &["--leaf-query", word]].concat();
+                assert_eq!(query(&args).as_deref(), Some(word));
+                assert_eq!(
+                    prover::lfm::whir_block::leaf_query_setting(Some(word)),
+                    Ok(want),
+                    "{word} reads"
+                );
+            }
+            for word in ["", "V1", "lean2", "on"] {
+                let args = [cmd, &["--leaf-query", word]].concat();
+                assert!(parse(&args).is_err(), "--leaf-query {word:?} is refused");
+            }
+        }
+        assert_eq!(
+            prover::lfm::whir_block::leaf_query_setting(Some("v1")),
+            Ok(LeafQuery::default()),
             "the flag's default is production's"
         );
     }

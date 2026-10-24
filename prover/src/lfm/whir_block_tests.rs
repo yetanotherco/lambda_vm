@@ -207,6 +207,9 @@ fn the_groups_phase_b_hands_over_build_every_leafs_arena() {
         (at_blowup_4(small_format()), "all_instructions_64"),
         (at_blowup_4(small_batched()), "all_instructions_64"),
         (at_blowup_4(small_batched()), "test_keccak"),
+        // At blowup 2, the shipped rate: the lean leaf holds this format's
+        // widest groups (0.82 of a leaf), where V1's do not.
+        (lean_format(small_format()), "all_instructions_64"),
     ] {
         let elf = asm_elf_bytes(name);
         let opts = ProofOptions::default_test_options();
@@ -1561,6 +1564,133 @@ fn the_leaf_scale_is_the_verifiers_both_ways() {
         ),
         "against its own top the doubled tree verifies"
     );
+}
+
+// ===================== the lean query check over a block =====================
+
+/// `format` with its leaves checking each chain's queries the lean way
+/// ([`LeafQuery::Lean`](super::whir_chain::LeafQuery::Lean)).
+fn lean_format(format: BlockFormat) -> BlockFormat {
+    BlockFormat {
+        leaf_query: super::whir_chain::LeafQuery::Lean,
+        ..format
+    }
+}
+
+/// ★ Under the lean query check every leaf of a small block executes over the
+/// honest proof, per polynomial and with grouped round-0 trees, and the
+/// leaves' shares cancel; its leaf programs are not V1's (fewer `Select`s);
+/// and a round-0 Merkle sibling or value tampered at query 1 is refused by the
+/// leaf holding the group.
+#[test]
+#[ignore = "executes block leaves over small block proofs; box tier"]
+fn lean_block_leaves_execute_and_refuse_a_tampered_witness() {
+    use super::instr::Instr;
+    use multilinear::whir_chain::RoundOpenings;
+    let indexed = indexed_format(crate::hash_pin::BLOCK_BASE, ArgueFormat::PerTable);
+    for (format, name) in [
+        (small_format(), "test_commit_4"),
+        (indexed, "all_instructions_64"),
+    ] {
+        let lean = lean_format(format);
+        let (elf, proof) = small_block(name, &lean);
+        let plan = plan_of(&elf, &proof, &lean, Some(2));
+        let words = leaves_words(&plan, &proof);
+        let layout = plan.child_layout();
+        let sum = words
+            .iter()
+            .fold(FEE::zero(), |acc, w| acc + ext_of(&w[layout.sum()]));
+        assert_eq!(sum, FEE::zero(), "{name}: the leaves' shares cancel");
+        let v1 = plan_of(&elf, &proof, &format, Some(2));
+        let selects = |p: &WhirBlockPlan| {
+            let program = p.leaf_program(0).expect("the leaf emits");
+            program
+                .instrs
+                .iter()
+                .filter(|i| matches!(i, Instr::Select { .. }))
+                .count()
+        };
+        assert!(
+            selects(&plan) < selects(&v1),
+            "{name}: lean {} Selects against V1 {}",
+            selects(&plan),
+            selects(&v1)
+        );
+
+        let g = 0;
+        let k = (0..plan.partition().num_leaves())
+            .find(|&k| plan.partition().leaf(k).contains(&g))
+            .expect("a leaf holds the group");
+        run_leaf(&plan, &proof, k, LeafChecks::ALL).expect("the honest leaf executes");
+        for value in [false, true] {
+            let mut forged = proof.clone();
+            match &mut forged.proof.columns[g].polys[0].rounds[0].openings {
+                RoundOpenings::Base(p) if value => p.current[1].values[0] += FE::one(),
+                RoundOpenings::Base(p) => p.current[1].proof.merkle_path[0][0] ^= 1,
+                RoundOpenings::BaseGrouped(p) if value => p.current[1][0].values[0] += FE::one(),
+                RoundOpenings::BaseGrouped(p) => p.current[1][0].proof.merkle_path[0][0] ^= 1,
+                RoundOpenings::Extension(_) => unreachable!("round 0 is base-valued"),
+            }
+            assert!(
+                run_leaf(&plan, &forged, k, LeafChecks::ALL).is_err(),
+                "{name}: a round-0 {} at query 1",
+                if value { "value" } else { "sibling" }
+            );
+        }
+    }
+}
+
+/// ★ The leaves' query check is the verifier's, both ways, on proved trees: a
+/// tree proved under `Lean` is refused by a `V1` verifier and a `V1` tree by a
+/// `Lean` one, and each verifies under its own check. Each refusal is the one
+/// a verifier-side mutant turns red (one that always takes the lean leaf, one
+/// that never does).
+#[test]
+#[ignore = "proves two trees over a small block; box tier"]
+fn the_leaf_query_is_the_verifiers_both_ways() {
+    use super::whir_block::{LEAF_P1_CAP, verify_block_tree_capped};
+    use super::whir_chain::LeafQuery;
+    super::device_permit::arm(1);
+    let format = small_format();
+    let (elf, proof) = small_block("test_commit_4", &format);
+    let opts = ProofOptions::default_test_options();
+    let wrap = aggregation_wrap_options();
+    let at = |leaf_query: LeafQuery| BlockFormat {
+        leaf_query,
+        ..format
+    };
+    let plan_at = |query: LeafQuery| plan_of(&elf, &proof, &at(query), None);
+    let (v1, lean) = (plan_at(LeafQuery::V1), plan_at(LeafQuery::Lean));
+    println!(
+        "   LEAF QUERY: {} groups · V1 {:?} · lean {:?}",
+        v1.num_groups(),
+        v1.partition().leaves(),
+        lean.partition().leaves()
+    );
+    let (top_v1, _) = compose(&v1, &proof, "V1").expect("the V1 tree proves");
+    let (top_lean, _) = compose(&lean, &proof, "LEAN").expect("the lean tree proves");
+    let verify = |query: LeafQuery, top: &LfmProof| {
+        verify_block_tree_capped(
+            &elf,
+            &opts,
+            &at(query),
+            proof.statement(),
+            BLOCK_FAN_IN,
+            &wrap,
+            top,
+            LEAF_P1_CAP,
+        )
+    };
+    assert!(
+        verify(LeafQuery::V1, &top_lean).is_err(),
+        "the lean tree under V1"
+    );
+    assert!(
+        verify(LeafQuery::Lean, &top_v1).is_err(),
+        "the V1 tree under lean"
+    );
+    verify(LeafQuery::V1, &top_v1).expect("the V1 tree under its own check");
+    verify(LeafQuery::Lean, &top_lean).expect("the lean tree under its own check");
 }
 
 // ============================== the real block ============================

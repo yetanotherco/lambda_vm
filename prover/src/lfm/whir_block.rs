@@ -1436,12 +1436,14 @@ pub fn verify_block_tree_grouped(
 }
 
 /// [`verify_block_tree`] at production's format with the caller's NAMED
-/// choices: its group opening, its WHIR blowup, its round-0 leaf order and its
-/// leaf scale (`verify-block --group / --blowup / --leaves /
-/// --leaf-double-from`), every other preset pinned as before. All four are the
-/// verifier's constants; the proof carries none of them. A caller cannot hand
-/// in a format of its own: `verify_block_tree_as` is crate-internal. The coset
-/// order is refused by name under a base whose trees do not take it.
+/// choices: its group opening, its WHIR blowup, its round-0 leaf order, its
+/// leaf scale and its leaves' query check (`verify-block --group / --blowup /
+/// --leaves / --leaf-double-from / --leaf-query`), every other preset pinned as
+/// before. All five are the verifier's constants; the proof carries none of
+/// them. A caller cannot hand in a format of its own: `verify_block_tree_as`
+/// is crate-internal. The coset order is refused by name under a base whose
+/// trees do not take it.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_block_tree_at(
     elf_bytes: &[u8],
     statement: BlockStatement<'_>,
@@ -1450,11 +1452,13 @@ pub fn verify_block_tree_at(
     blowup: crate::zf_format::WhirBlowup,
     leaves: multilinear::whir_chain::LeafOrder,
     leaf_scale: LeafScale,
+    leaf_query: LeafQuery,
 ) -> Result<(), String> {
     let mut format = BlockFormat::production_with(group);
     format.zf.whir_blowup = blowup.factor();
     format.zf.whir_leaves = leaves;
     format.leaf_scale = leaf_scale;
+    format.leaf_query = leaf_query;
     format.zf.check_leaves()?;
     verify_block_tree_as(elf_bytes, statement, top, &format)
 }

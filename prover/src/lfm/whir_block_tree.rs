@@ -36,6 +36,7 @@ use super::whir_block::{
     BLOCK_FAN_IN, LeafScale, WhirBlockPlan, artifacts_of, block_leaf_arena, group_arena_words,
     leaf_arena, leaf_scale_from_env,
 };
+use super::whir_chain::LeafQuery;
 use super::word::LfmWord;
 use crate::hash_pin::{BlockFamily, ProofFamily};
 
@@ -2504,16 +2505,17 @@ pub fn verify_whir_block_tree_proof_grouped(
 }
 
 /// [`verify_whir_block_tree_proof`] at production's format with the caller's
-/// named choices, its group opening, its WHIR blowup, its round-0 leaf order
-/// and its leaf scale ([`super::whir_block::verify_block_tree_at`]); the file
-/// carries none of them. No public entry point takes a format of the caller's
-/// own.
+/// named choices, its group opening, its WHIR blowup, its round-0 leaf order,
+/// its leaf scale and its leaves' query check
+/// ([`super::whir_block::verify_block_tree_at`]); the file carries none of
+/// them. No public entry point takes a format of the caller's own.
 ///
 /// ```no_run
 /// use lambda_vm_prover::lfm::whir_block::LeafScale;
 /// use lambda_vm_prover::lfm::whir_block_tree::{
 ///     WhirBlockTreeProof, verify_whir_block_tree_proof_at,
 /// };
+/// use lambda_vm_prover::lfm::whir_chain::LeafQuery;
 /// use lambda_vm_prover::zf_format::WhirBlowup;
 /// use multilinear::whir_chain::{GroupFold, LeafOrder};
 ///
@@ -2525,6 +2527,7 @@ pub fn verify_whir_block_tree_proof_grouped(
 ///         WhirBlowup::Two,
 ///         LeafOrder::Coset,
 ///         LeafScale::DoubleFrom(12),
+///         LeafQuery::Lean,
 ///     )
 /// }
 /// ```
@@ -2542,6 +2545,7 @@ pub fn verify_whir_block_tree_proof_at(
     blowup: WhirBlowup,
     leaves: LeafOrder,
     leaf_scale: LeafScale,
+    leaf_query: LeafQuery,
 ) -> Result<(), String> {
     let top = LfmProof {
         proof: proof.top_proof.clone(),
@@ -2555,6 +2559,7 @@ pub fn verify_whir_block_tree_proof_at(
         blowup,
         leaves,
         leaf_scale,
+        leaf_query,
     )
 }
 
@@ -2570,7 +2575,8 @@ mod tests {
     /// declared crate-internal. From outside the crate the same is checked by
     /// [`verify_whir_block_tree_proof_at`]'s `compile_fail` doc test. The
     /// verifiers of named choices (`…_at`) take each choice typed: the group
-    /// opening, the WHIR blowup, the round-0 leaf order and the leaf scale.
+    /// opening, the WHIR blowup, the round-0 leaf order, the leaf scale and
+    /// the leaves' query check.
     #[test]
     fn no_public_tree_verifier_takes_a_block_format() {
         let block = include_str!("whir_block.rs");
@@ -2588,7 +2594,13 @@ mod tests {
                     "{file}: the public verifier {name} takes a BlockFormat"
                 );
                 if name.ends_with("_at") {
-                    for choice in ["GroupFold", "WhirBlowup", "LeafOrder", "LeafScale"] {
+                    for choice in [
+                        "GroupFold",
+                        "WhirBlowup",
+                        "LeafOrder",
+                        "LeafScale",
+                        "LeafQuery",
+                    ] {
                         assert!(
                             params.contains(choice),
                             "{file}: {name} takes its {choice} as a named choice"
