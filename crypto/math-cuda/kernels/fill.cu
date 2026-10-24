@@ -204,14 +204,13 @@ constexpr uint32_t BRANCH = 19;
 constexpr uint32_t ECALL = 20;
 constexpr uint32_t NEXT_PC_0 = 21;
 constexpr uint32_t RVD_0 = 23;
-constexpr uint32_t PREV_PC_TIMESTAMP_BORROW = 25;
-constexpr uint32_t PC_DOUBLE_READ = 26;
-constexpr uint32_t RV1_0 = 27;
-constexpr uint32_t RV2_0 = 29;
-constexpr uint32_t ARG2_0 = 31;
-constexpr uint32_t RES_0 = 33;
-constexpr uint32_t BRANCH_COND = 37;
-constexpr uint32_t NUM_COLUMNS = 38;
+constexpr uint32_t PC_DOUBLE_READ = 25;
+constexpr uint32_t RV1_0 = 26;
+constexpr uint32_t RV2_0 = 28;
+constexpr uint32_t ARG2_0 = 30;
+constexpr uint32_t RES_0 = 32;
+constexpr uint32_t BRANCH_COND = 36;
+constexpr uint32_t NUM_COLUMNS = 37;
 }  // namespace cpu_cols
 
 // `alu_op::EQ` / `alu_op::LT` (`types.rs`).
@@ -259,12 +258,12 @@ __device__ __forceinline__ bool branch_taken(uint8_t alu_flags, uint64_t rv1, ui
 
 }  // namespace fill
 
-// Rows `[0, n)` from `logs` (cycle `first_cycle + row`, timestamp
-// `4·(first_cycle + row) + 4`), each read with its DECODE entry; rows
-// `[n, height)` the CPU padding rows. A log whose pc has no DECODE row counts
-// into `missing` and leaves its row zero: the caller refuses the table. One
-// thread a row.
-extern "C" __global__ void fill_cpu_from_logs(const LogC *logs, uint64_t n, uint64_t first_cycle,
+// Rows `[0, n)` from `logs`, each read with its DECODE entry; rows
+// `[n, height)` the CPU padding rows. Every row's TIMESTAMP is the table's own
+// preprocessed `4·(row + 1)` (`cpu.rs`, `local_timestamp`). A log whose pc has
+// no DECODE row counts into `missing` and leaves its row zero: the caller
+// refuses the table. One thread a row.
+extern "C" __global__ void fill_cpu_from_logs(const LogC *logs, uint64_t n,
                                               const DecodeEntryC *entries,
                                               const DecodeRunC *runs, uint32_t nruns,
                                               uint64_t height, uint64_t *out,
@@ -273,13 +272,12 @@ extern "C" __global__ void fill_cpu_from_logs(const LogC *logs, uint64_t n, uint
     uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= height) return;
     const fill::RowWriter w{out, height, row};
+    const uint64_t timestamp = 4 * (row + 1);
 
     if (row >= n) {
-        // pc = next_pc = 1, every flag 0, the timestamps continuing the +4
-        // cadence from the last real row.
-        uint64_t last_ts = n > 0 ? 4 * (first_cycle + n - 1) + 4 : 0;
+        // pc = next_pc = 1, every flag 0.
         w.zeros(0, c::NUM_COLUMNS);
-        w.word(c::TIMESTAMP, last_ts + 4 * (row - n + 1));
+        w.word(c::TIMESTAMP, timestamp);
         w.word(c::PC_0, FILL_CPU_PADDING_PC);
         w.word(c::NEXT_PC_0, FILL_CPU_PADDING_PC);
         return;
@@ -293,7 +291,6 @@ extern "C" __global__ void fill_cpu_from_logs(const LogC *logs, uint64_t n, uint
         return;
     }
     const DecodeEntryC e = entries[at];
-    uint64_t timestamp = 4 * (first_cycle + row) + 4;
     uint64_t length = 2 * (uint64_t)e.half_instruction_length;
     bool word_instr = e.word_instr != 0;
 
@@ -357,10 +354,8 @@ extern "C" __global__ void fill_cpu_from_logs(const LogC *logs, uint64_t n, uint
     w.dword_wl(c::ARG2_0, arg2);
     w.dword_hl(c::RES_0, res);
     w.word(c::BRANCH_COND, branch_cond);
-    // The inline pc read's columns.
-    bool pc_double_read = live && e.read_register1 && e.rs1 == 255;
-    w.word(c::PC_DOUBLE_READ, pc_double_read);
-    w.word(c::PREV_PC_TIMESTAMP_BORROW, !pc_double_read && (timestamp & 0xFFFFFFFFull) < 3);
+    // The inline pc read's column.
+    w.word(c::PC_DOUBLE_READ, live && e.read_register1 && e.rs1 == 255);
 }
 
 // ---------------------------------------------------------------------------

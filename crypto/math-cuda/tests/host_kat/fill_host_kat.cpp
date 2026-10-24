@@ -13,9 +13,9 @@
 // WHAT IT COVERS:
 //   1. MEMW_R: thirteen register rows, then zero rows, every word.
 //   2. CPU: 29 logs over 24 decode entries in three runs (every op class the
-//      fill branches on, each entry in turn, a timestamp whose low word wraps
-//      to zero), then padding rows, every word; and a log whose pc no run
-//      holds, counted as missing with its row left zero.
+//      fill branches on, each entry in turn), then padding rows, every word;
+//      and a log whose pc no run holds, counted as missing with its row left
+//      zero.
 //   3. KECCAK_RND: a table cut into its first op, holding every round of the
 //      second and zero rows after it, and one cut at both ends: every row's
 //      fifteen column groups, by digest.
@@ -138,7 +138,7 @@ void test_cpu() {
     auto out = table(height * cols);
     unsigned long long missing = 0;
     each_row(height, 0, [&] {
-        fill_cpu_from_logs(KAT_CPU_LOGS, KAT_CPU_N, KAT_CPU_FIRST_CYCLE, KAT_CPU_ENTRIES,
+        fill_cpu_from_logs(KAT_CPU_LOGS, KAT_CPU_N, KAT_CPU_ENTRIES,
                            KAT_CPU_RUNS, KAT_CPU_RUNS_N, height, out.data(), &missing);
     });
     CHECK(missing == 0, "CPU: %llu logs missing their decode row", missing);
@@ -153,7 +153,7 @@ void test_cpu() {
     auto refused = table(height * cols);
     missing = 0;
     each_row(height, 0, [&] {
-        fill_cpu_from_logs(logs.data(), KAT_CPU_N, KAT_CPU_FIRST_CYCLE, KAT_CPU_ENTRIES,
+        fill_cpu_from_logs(logs.data(), KAT_CPU_N, KAT_CPU_ENTRIES,
                            KAT_CPU_RUNS, KAT_CPU_RUNS_N, height, refused.data(), &missing);
     });
     CHECK(missing == 1, "CPU: an absent pc counted %llu times, not once", missing);

@@ -38,7 +38,7 @@ const FILL_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fill.cubin")
 /// MEMW_R's columns (`memw_register::cols::NUM_COLUMNS`).
 pub const MEMW_R_COLUMNS: usize = 10;
 /// CPU's columns (`cpu::cols::NUM_COLUMNS`).
-pub const CPU_COLUMNS: usize = 38;
+pub const CPU_COLUMNS: usize = 37;
 /// KECCAK_RND's columns (`keccak_rnd::cols::NUM_COLUMNS`).
 pub const KECCAK_RND_COLUMNS: usize = 1480;
 /// Rows a keccak operation fills.
@@ -329,14 +329,13 @@ impl CardDecode {
 }
 
 /// CPU's `height` rows into `dst` (`height × CPU_COLUMNS` words,
-/// column-major): one a log, cycle `first_cycle + i` for log `i`, read with
-/// its entry of `decode`, then the padding rows. Refused when a log's pc has
+/// column-major): one a log, read with its entry of `decode`, then the padding
+/// rows, every row's timestamp the table's own `4·(row + 1)`. Refused when a log's pc has
 /// no DECODE row (the host fill's `MissingInstruction`). All on `stream`;
 /// returns once the kernel is done.
 pub fn fill_cpu_from_logs_into(
     stream: &Arc<CudaStream>,
     logs: &[LogC],
-    first_cycle: u64,
     decode: &CardDecode,
     height: usize,
     dst: &mut CudaViewMut<u64>,
@@ -361,7 +360,6 @@ pub fn fill_cpu_from_logs_into(
             .launch_builder(&m.cpu)
             .arg(&records)
             .arg(&n)
-            .arg(&first_cycle)
             .arg(&decode.entries)
             .arg(&decode.runs)
             .arg(&decode.nruns)

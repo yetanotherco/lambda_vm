@@ -376,8 +376,9 @@ pub(crate) const HOST_KAT_VECTORS: &str = "crypto/math-cuda/tests/host_kat/fill_
 const KAT_MEMW_R_ROWS: usize = 13;
 const KAT_MEMW_R_HEIGHT: usize = 16;
 /// The known-answer CPU table: three runs of eight instructions, every op
-/// class among them, and logs that take each in turn from a cycle whose
-/// timestamp's low word wraps to zero within the table, then padding rows.
+/// class among them, and logs that take each in turn, then padding rows. The
+/// ops carry the run's timestamps from a cycle well into the run; the table's
+/// own are its rows' `4·(row + 1)` whatever the ops carry.
 const KAT_CPU_LOGS: usize = 29;
 const KAT_CPU_HEIGHT: usize = 32;
 const KAT_CPU_FIRST_CYCLE: u64 = (1 << 30) - 20;
@@ -507,11 +508,11 @@ pub(crate) fn host_kat_vectors() -> String {
     let absent = runs[0].first_pc + 2;
     assert_eq!(decode.row(absent), None);
     s += &format!(
-        "// CPU: {} decode entries in {} runs; {KAT_CPU_LOGS} logs from cycle {KAT_CPU_FIRST_CYCLE}, each\n\
-         // entry in turn, then padding rows to {KAT_CPU_HEIGHT}. KAT_CPU_ABSENT_PC is no entry's.\n\
+        "// CPU: {} decode entries in {} runs; {KAT_CPU_LOGS} logs (their ops from cycle\n\
+         // {KAT_CPU_FIRST_CYCLE}), each entry in turn, then padding rows to {KAT_CPU_HEIGHT}; every row's\n\
+         // timestamp the table's own 4·(row + 1). KAT_CPU_ABSENT_PC is no entry's.\n\
          inline constexpr uint64_t KAT_CPU_N = {KAT_CPU_LOGS};\n\
          inline constexpr uint64_t KAT_CPU_HEIGHT = {KAT_CPU_HEIGHT};\n\
-         inline constexpr uint64_t KAT_CPU_FIRST_CYCLE = {KAT_CPU_FIRST_CYCLE}ull;\n\
          inline constexpr uint64_t KAT_CPU_ABSENT_PC = {absent}ull;\n\
          inline constexpr uint32_t KAT_CPU_ENTRIES_N = {};\n\
          inline constexpr uint32_t KAT_CPU_RUNS_N = {};\n\

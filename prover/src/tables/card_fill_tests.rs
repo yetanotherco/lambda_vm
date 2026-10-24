@@ -80,7 +80,6 @@ enum Records<'a> {
     MemwR(Vec<RegRowC>),
     Cpu {
         logs: Vec<LogC>,
-        first_cycle: u64,
         decode: &'a CardDecode,
     },
     KeccakRnd {
@@ -95,11 +94,9 @@ impl Records<'_> {
         let dst = &mut out.slice_mut(..);
         match self {
             Records::MemwR(records) => fill::fill_memw_r_into(stream, records, rows, dst),
-            Records::Cpu {
-                logs,
-                first_cycle,
-                decode,
-            } => fill::fill_cpu_from_logs_into(stream, logs, *first_cycle, decode, rows, dst),
+            Records::Cpu { logs, decode } => {
+                fill::fill_cpu_from_logs_into(stream, logs, decode, rows, dst)
+            }
             Records::KeccakRnd { ops, skip } => {
                 fill::fill_keccak_rnd_into(stream, ops, *skip, rows, dst)
             }
@@ -128,21 +125,13 @@ impl Records<'_> {
                 records[at].val0 ^= 1;
                 Records::MemwR(records)
             }
-            Records::Cpu {
-                logs,
-                first_cycle,
-                decode,
-            } => {
+            Records::Cpu { logs, decode } => {
                 let mut logs = logs.clone();
                 let at = (logs.len() / 2..logs.len() - 1)
                     .find(|&i| logs[i].current_pc != logs[i + 1].current_pc)
                     .expect("two logs at different pcs");
                 logs[at].current_pc = logs[at + 1].current_pc;
-                Records::Cpu {
-                    logs,
-                    first_cycle: *first_cycle,
-                    decode,
-                }
+                Records::Cpu { logs, decode }
             }
             Records::KeccakRnd { ops, skip } => {
                 let mut ops = ops.clone();
@@ -622,7 +611,6 @@ fn the_card_fills_the_streamed_tables_as_the_host_does() {
         host: Box::new(|form| generate_cpu_trace_segments_as(&cpu_parts, real_decode, form)),
         records: Records::Cpu {
             logs: real.logs.iter().map(inputs::log_record).collect(),
-            first_cycle: real.first_cycle,
             decode: &real_card_decode,
         },
         timed: true,
@@ -680,7 +668,6 @@ fn the_card_fills_the_streamed_tables_as_the_host_does() {
                 host: Box::new(|form| inputs::cpu_host(&ops, &decode, form)),
                 records: Records::Cpu {
                     logs: logs.iter().map(inputs::log_record).collect(),
-                    first_cycle: inputs::CPU_FIRST_CYCLE,
                     decode: &card_decode,
                 },
                 timed: true,
@@ -712,7 +699,6 @@ fn the_card_fills_the_streamed_tables_as_the_host_does() {
     let refused = fill::fill_cpu_from_logs_into(
         &stream,
         &logs,
-        inputs::CPU_FIRST_CYCLE,
         &card_decode,
         refusal_rows,
         &mut out.slice_mut(..),
@@ -746,7 +732,6 @@ fn the_card_fills_the_streamed_tables_as_the_host_does() {
             host: Box::new(|form| inputs::cpu_host(&ops, &decode, form)),
             records: Records::Cpu {
                 logs: logs.iter().map(inputs::log_record).collect(),
-                first_cycle: inputs::CPU_FIRST_CYCLE,
                 decode: &card_decode,
             },
             timed: false,
