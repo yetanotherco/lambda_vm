@@ -500,7 +500,10 @@ where
             domain,
         } = self;
         // The openings' turn, held from here to the last opening: the codewords
-        // come back one at a time and the chain works beside each.
+        // come back one at a time and the chain works beside each. The block
+        // prover can revive a group while the next group's argument holds its
+        // own reservations (its phase-B overlap); a room refused then is
+        // counted, and each codeword promises its own working set instead.
         let room = if retired.is_empty() {
             None
         } else {

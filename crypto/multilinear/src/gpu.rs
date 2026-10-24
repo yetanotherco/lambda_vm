@@ -1065,6 +1065,64 @@ pub fn reserve_budget() -> u64 {
     0
 }
 
+/// While it lives, this thread's device calls draw their streams from the
+/// background pool ([`math_cuda::stream_class`]), when one exists; nothing
+/// without a device. It belongs to the thread that took it.
+#[cfg(feature = "cuda")]
+pub struct BackgroundStreams(#[allow(dead_code)] math_cuda::stream_class::ClassGuard);
+
+#[cfg(not(feature = "cuda"))]
+pub struct BackgroundStreams;
+
+/// Marks this thread's stream draws as background work until the guard drops.
+#[cfg(feature = "cuda")]
+pub fn background_streams() -> BackgroundStreams {
+    BackgroundStreams(math_cuda::stream_class::enter(
+        math_cuda::stream_class::StreamClass::Background,
+    ))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn background_streams() -> BackgroundStreams {
+    BackgroundStreams
+}
+
+/// Stream draws so far, `(foreground pool, background pool)`
+/// ([`math_cuda::stream_class::draws`]); `(0, 0)` without a device.
+#[cfg(feature = "cuda")]
+pub fn stream_draws() -> (u64, u64) {
+    math_cuda::stream_class::draws()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn stream_draws() -> (u64, u64) {
+    (0, 0)
+}
+
+/// The argument's device fallbacks so far
+/// ([`math_cuda::device::device_fallbacks`]); 0 without a device.
+#[cfg(feature = "cuda")]
+pub fn argue_device_fallbacks() -> u64 {
+    math_cuda::device::device_fallbacks()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn argue_device_fallbacks() -> u64 {
+    0
+}
+
+/// The card's drain-and-trims so far ([`math_cuda::device::trims`]): each
+/// waits for every stream; 0 without a device.
+#[cfg(feature = "cuda")]
+pub fn device_trims() -> u64 {
+    math_cuda::device::trims()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn device_trims() -> u64 {
+    0
+}
+
 /// Whether a group's room is sized to the turns it covers — its commits', two
 /// in flight, and one chain's opening, as the kernels that run them allocate —
 /// rather than one base codeword. `true` unless `LAMBDA_VM_NO_WHIR_ROOM_RESIZE`

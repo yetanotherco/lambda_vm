@@ -661,10 +661,21 @@ fn trim_default_mempool() {
 /// taken needs the pool empty first, or it is measuring the pool's retention
 /// instead of the caller's — see `a_group_holds_only_its_codewords_before_any_open`.
 pub fn drain_and_trim() -> Result<()> {
+    TRIMS.fetch_add(1, Ordering::Relaxed);
     let be = backend()?;
     be.ctx.synchronize()?;
     trim_default_mempool();
     Ok(())
+}
+
+/// Calls to [`drain_and_trim`] this process has made. Each one waits for every
+/// stream of the context, so work running on two threads at once stalls
+/// together on it. Monotone: a reader brackets the span it cares about.
+static TRIMS: AtomicU64 = AtomicU64::new(0);
+
+/// [`TRIMS`]: the [`drain_and_trim`] calls so far.
+pub fn trims() -> u64 {
+    TRIMS.load(Ordering::Relaxed)
 }
 
 /// ★ Bytes the default memory pool has handed out and not taken back: `(now,
