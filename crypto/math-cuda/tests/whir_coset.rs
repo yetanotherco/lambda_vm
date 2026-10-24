@@ -9,11 +9,17 @@
 //! ([`CosetPlan::evaluate_on_host`], pinned against `encode(lift_coefficients)`
 //! in the module's own tests). The measurement arm times both at the
 //! production shape and prints one `COSET EVAL …` line per reading.
+//!
+//! The stack read where it lies (`evaluate_slices` / `coset_openings` with
+//! `in_place`) is compared with the assembled stack word for word, raw: it
+//! changes what the tile kernel reads, not its arithmetic.
 
 use std::time::Instant;
 
 use math_cuda::columns::DeviceColumns;
-use math_cuda::whir_coset::{CosetPlan, StackSlices, coset_openings, evaluate_resident};
+use math_cuda::whir_coset::{
+    CosetPlan, StackSlices, coset_openings, evaluate_resident, evaluate_slices,
+};
 
 const P: u64 = 0xFFFF_FFFF_0000_0001;
 /// Production geometry: blowup 4, first fold 6, 256 leaves under a kept node.
@@ -51,6 +57,63 @@ fn stack(num_vars: usize, seed: u64) -> (DeviceColumns, Vec<(usize, usize)>, Vec
     (store, parts, columns)
 }
 
+/// A stack laid out as `StackedLayout::build` lays the block prover's: two
+/// tall columns, then up to 340 of heights `2^4`…`2^(num_vars-4)` (most of
+/// them short, under a 256-value tile), each at a multiple of its height with
+/// the cursor only growing (so alignment gaps), stopping at 85 % of the stack
+/// (a zero tail of at least 15 %); every fifth column 5 values short of its
+/// height (an end mid-tile). The store holds a junk column before each column
+/// and a tile of junk after the last, none of it in the stack, so a read past
+/// a part's end shows as a wrong value. Returns the store and the parts.
+fn production_stack(num_vars: usize, seed: u64) -> (DeviceColumns, Vec<(usize, usize)>) {
+    let mut rng = Rng(seed);
+    let cap = (1usize << num_vars) * 85 / 100;
+    let mut heights = vec![num_vars - 2, num_vars - 3];
+    heights.extend((0..340).map(|_| {
+        if rng.next().is_multiple_of(4) {
+            4 + (rng.next() % (num_vars as u64 - 7)) as usize
+        } else {
+            4 + (rng.next() % 5) as usize
+        }
+    }));
+    let mut columns: Vec<Vec<u64>> = Vec::new();
+    let mut parts = Vec::new();
+    let mut cursor = 0usize;
+    for (i, &h) in heights.iter().enumerate() {
+        let size = 1usize << h;
+        let offset = cursor.next_multiple_of(size);
+        if offset + size > cap {
+            break;
+        }
+        cursor = offset + size;
+        let len = if i % 5 == 4 { size - 5 } else { size };
+        columns.push((0..1 + rng.next() % 37).map(|_| rng.next() % P).collect());
+        parts.push((columns.len(), offset));
+        columns.push((0..len).map(|_| rng.next() % P).collect());
+    }
+    columns.push((0..256).map(|_| rng.next() % P).collect());
+    let refs: Vec<&[u64]> = columns.iter().map(Vec::as_slice).collect();
+    let store = DeviceColumns::upload(&refs).expect("device columns (needs a GPU)");
+    (store, parts)
+}
+
+/// [`stack`]'s columns with a zero tail of 15 %: thirteen whole columns and
+/// six tenths of the fourteenth.
+fn tail_stack(num_vars: usize, seed: u64) -> (DeviceColumns, Vec<(usize, usize)>) {
+    let mut rng = Rng(seed);
+    let column = 1usize << (num_vars - 4);
+    let columns: Vec<Vec<u64>> = (0..14)
+        .map(|k| {
+            let len = if k == 13 { column * 6 / 10 } else { column };
+            (0..len).map(|_| rng.next() % P).collect()
+        })
+        .collect();
+    let refs: Vec<&[u64]> = columns.iter().map(Vec::as_slice).collect();
+    let store = DeviceColumns::upload(&refs).expect("device columns (needs a GPU)");
+    let parts: Vec<(usize, usize)> = (0..14).map(|k| (k, k * column)).collect();
+    (store, parts)
+}
+
 /// The stacked polynomial on the host, its zero tail included.
 fn whole(columns: &[Vec<u64>], num_vars: usize) -> Vec<u64> {
     let mut whole = columns.concat();
@@ -70,17 +133,8 @@ fn queries_at(num_vars: usize, log_blowup: usize, count: usize, seed: u64) -> Ve
 }
 
 /// The re-encoded codeword's values at every block's leaves, in the blocks'
-/// order: block `q`'s leaf `r` value `t` at `(q·2^kept + r)·2^fold + t`.
-fn reencoded_at_blocks(
-    store: &DeviceColumns,
-    parts: &[(usize, usize)],
-    num_vars: usize,
-    plan: &CosetPlan,
-) -> Vec<u64> {
-    reencoded_at_blocks_at(store, parts, num_vars, LOG_BLOWUP, plan)
-}
-
-/// [`reencoded_at_blocks`] for a codeword of blowup `2^log_blowup`.
+/// order: block `q`'s leaf `r` value `t` at `(q·2^kept + r)·2^fold + t`, for a
+/// codeword of blowup `2^log_blowup`.
 fn reencoded_at_blocks_at(
     store: &DeviceColumns,
     parts: &[(usize, usize)],
@@ -172,29 +226,152 @@ fn coset_blocks_at(log_blowup: usize, count: usize) {
     }
 }
 
+/// The tiles a stack of `2^num_vars` values folds in: `2^tile_bits` values
+/// each, as many bits as fold below the kept coset, eight at most.
+fn tiles(num_vars: usize) -> u64 {
+    let tile_bits = (num_vars - LOG_FOLD - KEPT).min(8);
+    1 << (num_vars - tile_bits)
+}
+
+/// ★ The stack read where it lies is the assembled stack: the cosets equal
+/// word for word, raw (the same arithmetic over the same words), and equal
+/// the re-encoded codeword at every block's leaves; the tiles' kinds add up.
+/// At blowups 4 and 2, stacks of `2^16` (4-value tiles), `2^20` (64) and
+/// `2^24` (256, two rest bits), three layouts each: [`stack`]'s, a
+/// production-like one ([`production_stack`]: short columns, ends mid-tile,
+/// alignment gaps, junk between the columns in the store) and a 15 % zero
+/// tail ([`tail_stack`]).
+#[test]
+fn coset_blocks_read_in_place_equal_the_assembled_stack() {
+    for (log_blowup, count) in [(LOG_BLOWUP, 114usize), (1, 229)] {
+        for (num_vars, seed) in [(16usize, 21u64), (20, 22), (24, 23)] {
+            let (bench, bench_parts, _) = stack(num_vars, seed);
+            let (production, production_parts) = production_stack(num_vars, seed);
+            let (tail, tail_parts) = tail_stack(num_vars, seed);
+            for (shape, store, parts) in [
+                ("bench", &bench, &bench_parts),
+                ("production", &production, &production_parts),
+                ("tail", &tail, &tail_parts),
+            ] {
+                let label = format!("n {num_vars} blowup 2^{log_blowup} {shape}");
+                let leaves = queries_at(num_vars, log_blowup, count, seed);
+                let plan =
+                    CosetPlan::new(num_vars, log_blowup, LOG_FOLD, KEPT, &leaves).expect("plan");
+                let slices = StackSlices::from_resident(store, parts, num_vars, log_blowup)
+                    .expect("stack slices");
+                let (assembled, none) =
+                    evaluate_slices(&slices, &plan, false, None).expect("assembled");
+                assert_eq!(none, None, "{label}: assembled, no tile kinds");
+                let assembled = assembled.to_host().expect("read back");
+                let mut split = Vec::new();
+                let (in_place, kinds) =
+                    evaluate_slices(&slices, &plan, true, Some(&mut split)).expect("in place");
+                assert_eq!(split.len(), 4, "{label}: four phases timed: {split:?}");
+                let in_place = in_place.to_host().expect("read back");
+                let kinds = kinds.unwrap_or_else(|| panic!("{label}: the parts must place"));
+                let resident = evaluate_resident(store, parts, &plan, None)
+                    .expect("resident")
+                    .to_host()
+                    .expect("read back");
+                let gathered = reencoded_at_blocks_at(store, parts, num_vars, log_blowup, &plan);
+                let raw = in_place
+                    .iter()
+                    .zip(&assembled)
+                    .filter(|(a, b)| a != b)
+                    .count();
+                let vs_codeword = mismatches(&in_place, &gathered);
+                println!(
+                    "COSET EVAL INPLACE n={num_vars} blowup_log={log_blowup} shape={shape} tiles_full={} tiles_zero={} tiles_mixed={} raw_vs_assembled={raw} vs_codeword={vs_codeword}",
+                    kinds.full, kinds.zero, kinds.mixed
+                );
+                assert_eq!(in_place.len(), assembled.len(), "{label}: lengths");
+                assert_eq!(
+                    (raw, vs_codeword),
+                    (0, 0),
+                    "{label}: the stack read in place differs"
+                );
+                assert_eq!(assembled, resident, "{label}: the two assembled paths");
+                assert_eq!(
+                    kinds.full + kinds.zero + kinds.mixed,
+                    tiles(num_vars),
+                    "{label}: every tile has one kind"
+                );
+                if shape != "bench" {
+                    assert!(kinds.zero > 0, "{label}: a zero tail: {kinds:?}");
+                }
+                if shape == "production" {
+                    assert!(kinds.mixed > 0, "{label}: mixed tiles: {kinds:?}");
+                }
+            }
+        }
+    }
+}
+
+/// ★ A round-0 tree's openings with the stack read where it lies are the
+/// assembled stack's: the same subtrees' nodes, byte for byte, and the same
+/// queried values; only the in-place run reports tile kinds.
+#[test]
+fn coset_openings_read_in_place_are_the_assembled_stacks() {
+    for (num_vars, seed) in [(20usize, 31u64), (24, 32)] {
+        let (store, parts) = production_stack(num_vars, seed);
+        let leaves = queries(num_vars, 114, seed);
+        let plan = CosetPlan::new(num_vars, LOG_BLOWUP, LOG_FOLD, KEPT, &leaves).expect("plan");
+        let slices =
+            StackSlices::from_resident(&store, &parts, num_vars, LOG_BLOWUP).expect("slices");
+        let hash = math_cuda::DeviceHash::Poseidon1;
+        let assembled = coset_openings(&slices, &plan, &leaves, hash, false).expect("assembled");
+        let in_place = coset_openings(&slices, &plan, &leaves, hash, true).expect("in place");
+        println!(
+            "COSET EVAL OPENINGS n={num_vars} nodes_equal={} values_equal={} in_place={:?}",
+            in_place.nodes == assembled.nodes,
+            in_place.values == assembled.values,
+            in_place.in_place
+        );
+        assert_eq!(assembled.in_place, None, "n {num_vars}: assembled");
+        assert!(in_place.in_place.is_some(), "n {num_vars}: read in place");
+        assert_eq!(in_place.leaves, assembled.leaves, "n {num_vars}: leaves");
+        assert!(
+            in_place.nodes == assembled.nodes,
+            "n {num_vars}: the subtrees' nodes differ"
+        );
+        assert_eq!(
+            in_place.values, assembled.values,
+            "n {num_vars}: the queried values"
+        );
+    }
+}
+
 /// ★ The long kernels' grids cut to 1, 3 or 85 blocks (`device::with_grid_cap`,
 /// as a background thread runs them beside latency-bound kernels): the same
-/// cosets, raw, as the full grid, and the same openings' subtrees and values.
-/// At blowups 4 and 2, `2^20` and `2^24`.
+/// words, raw, as the full grid, the stack assembled and read in place, and
+/// the same openings' subtrees and values. At blowups 4 and 2, `2^20` and
+/// `2^24`, the production-like stack.
 #[test]
 fn coset_kernels_under_a_grid_cap_give_the_full_grids_words() {
     use math_cuda::device::{grid_cap, with_grid_cap};
     for (log_blowup, count) in [(LOG_BLOWUP, 114usize), (1, 229)] {
         for (num_vars, seed) in [(20usize, 51u64), (24, 52)] {
-            let (store, parts, _) = stack(num_vars, seed);
+            let (store, parts) = production_stack(num_vars, seed);
             let leaves = queries_at(num_vars, log_blowup, count, seed);
             let plan = CosetPlan::new(num_vars, log_blowup, LOG_FOLD, KEPT, &leaves).expect("plan");
             let slices =
                 StackSlices::from_resident(&store, &parts, num_vars, log_blowup).expect("slices");
+            let hash = math_cuda::DeviceHash::Poseidon1;
             let run = || {
-                let values = evaluate_resident(&store, &parts, &plan, None)
-                    .expect("cosets")
+                let assembled = evaluate_resident(&store, &parts, &plan, None)
+                    .expect("assembled")
                     .to_host()
                     .expect("read back");
-                let opened =
-                    coset_openings(&slices, &plan, &leaves, math_cuda::DeviceHash::Poseidon1)
-                        .expect("openings");
-                (values, opened.nodes, opened.values)
+                let (in_place, kinds) =
+                    evaluate_slices(&slices, &plan, true, None).expect("in place");
+                assert!(kinds.is_some(), "read in place");
+                let opened = coset_openings(&slices, &plan, &leaves, hash, true).expect("openings");
+                (
+                    assembled,
+                    in_place.to_host().expect("read back"),
+                    opened.nodes,
+                    opened.values,
+                )
             };
             assert_eq!(grid_cap(), None, "no cap outside with_grid_cap");
             let full = run();
@@ -205,22 +382,59 @@ fn coset_kernels_under_a_grid_cap_give_the_full_grids_words() {
                     run()
                 });
                 assert_eq!(grid_cap(), None, "{label}: the cap restored");
-                let raw = capped.0.iter().zip(&full.0).filter(|(x, y)| x != y).count();
+                let raw = |a: &[u64], b: &[u64]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+                let (assembled, in_place) = (raw(&capped.0, &full.0), raw(&capped.1, &full.1));
                 println!(
-                    "COSET EVAL CAPPED n={num_vars} blowup_log={log_blowup} cap={cap} values_vs_full={raw} nodes_equal={} opened_equal={}",
-                    capped.1 == full.1,
-                    capped.2 == full.2
+                    "COSET EVAL CAPPED n={num_vars} blowup_log={log_blowup} cap={cap} assembled_vs_full={assembled} in_place_vs_full={in_place} nodes_equal={} values_equal={}",
+                    capped.2 == full.2,
+                    capped.3 == full.3
                 );
                 assert_eq!(
-                    (capped.0.len(), raw),
-                    (full.0.len(), 0),
+                    (capped.0.len(), capped.1.len(), assembled, in_place),
+                    (full.0.len(), full.1.len(), 0, 0),
                     "{label}: the cosets differ from the full grid's"
                 );
-                assert!(capped.1 == full.1, "{label}: the subtrees' nodes differ");
-                assert_eq!(capped.2, full.2, "{label}: the queried values differ");
+                assert!(capped.2 == full.2, "{label}: the subtrees' nodes differ");
+                assert_eq!(capped.3, full.3, "{label}: the queried values differ");
             }
         }
     }
+}
+
+/// ★ Parts the in-place kernels cannot place (two columns overlapping in the
+/// stack: no stacked layout makes them, a stand-in for whatever might) are
+/// assembled after all, the in-place request reporting no tile kinds — what
+/// the caller counts as assembled after all — with the assembled values.
+#[test]
+fn parts_the_kernels_cannot_place_are_assembled_after_all() {
+    let num_vars = 20;
+    let (store, _, _) = stack(num_vars, 41);
+    let column = 1usize << (num_vars - 4);
+    let parts = [(0usize, 0usize), (1, column - 7), (2, 3 * column)];
+    let leaves = queries(num_vars, 114, 41);
+    let plan = CosetPlan::new(num_vars, LOG_BLOWUP, LOG_FOLD, KEPT, &leaves).expect("plan");
+    let slices = StackSlices::from_resident(&store, &parts, num_vars, LOG_BLOWUP).expect("slices");
+    assert!(
+        slices.parts_in_place().is_none(),
+        "overlapping parts refused"
+    );
+    let (asked, kinds) = evaluate_slices(&slices, &plan, true, None).expect("asked in place");
+    let (off, _) = evaluate_slices(&slices, &plan, false, None).expect("assembled");
+    let opened = coset_openings(
+        &slices,
+        &plan,
+        &leaves,
+        math_cuda::DeviceHash::Poseidon1,
+        true,
+    )
+    .expect("openings");
+    assert_eq!(kinds, None, "no tile kinds: assembled");
+    assert_eq!(opened.in_place, None, "the openings assembled too");
+    assert_eq!(
+        asked.to_host().expect("read back"),
+        off.to_host().expect("read back"),
+        "the assembled values"
+    );
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -259,14 +473,17 @@ fn peak_mib(run: impl FnOnce()) -> f64 {
 /// first fold 6, 256 leaves under a kept node, 114 queries) — (A) today's
 /// re-encode as a retired stack is revived (`encode_codeword_resident` on
 /// resident columns, then a synchronize) against (B) the plan built from the
-/// queries and the cosets evaluated (then a synchronize), interleaved A B A B,
-/// `COSET_EVAL_WARM` warm-ups then `COSET_EVAL_REPS` timed each; the same for
-/// a group of three polynomials one after another (A3, B3); B's phases; both
-/// arms' peak pool bytes; and the check: B's values equal A's codeword at
-/// every block's leaves.
+/// queries and the cosets evaluated from the assembled stack, and (B1) from
+/// the stack read where it lies (each then a synchronize), interleaved
+/// A B B1, `COSET_EVAL_WARM` warm-ups then `COSET_EVAL_REPS` timed each; the
+/// same for a group of three polynomials one after another (A3, B3, B13); B's
+/// and B1's phases; the arms' peak pool bytes; and the checks: B's and B1's
+/// values equal A's codeword at every block's leaves, B1's equal B's raw.
 ///
 /// `COSET_EVAL_LOG` (27), `COSET_EVAL_QUERIES` (114), `COSET_EVAL_WARM` (3),
-/// `COSET_EVAL_REPS` (20).
+/// `COSET_EVAL_REPS` (20), `COSET_EVAL_BLOWUP` (the blowup's log, 2),
+/// `COSET_EVAL_STACK` (`bench`: [`stack`]'s fifteen columns; `production`:
+/// [`production_stack`]).
 #[test]
 #[ignore = "measurement arm: a minute on a card; run on the box"]
 fn coset_eval_bench() {
@@ -274,28 +491,54 @@ fn coset_eval_bench() {
     let count = env_usize("COSET_EVAL_QUERIES", 114);
     let warm = env_usize("COSET_EVAL_WARM", 3);
     let reps = env_usize("COSET_EVAL_REPS", 20);
-    let stacks: Vec<_> = (0..3).map(|k| stack(num_vars, 100 + k)).collect();
-    let sets: Vec<Vec<u64>> = (0..3).map(|k| queries(num_vars, count, 200 + k)).collect();
-    let plan0 = CosetPlan::new(num_vars, LOG_BLOWUP, LOG_FOLD, KEPT, &sets[0]).expect("plan");
+    let log_blowup = env_usize("COSET_EVAL_BLOWUP", LOG_BLOWUP);
+    let shape = std::env::var("COSET_EVAL_STACK").unwrap_or_else(|_| "bench".into());
+    let stacks: Vec<(DeviceColumns, Vec<(usize, usize)>)> = (0..3)
+        .map(|k| match shape.as_str() {
+            "bench" => {
+                let (store, parts, _) = stack(num_vars, 100 + k);
+                (store, parts)
+            }
+            "production" => production_stack(num_vars, 100 + k),
+            other => panic!("COSET_EVAL_STACK={other}: bench or production"),
+        })
+        .collect();
+    let sets: Vec<Vec<u64>> = (0..3)
+        .map(|k| queries_at(num_vars, log_blowup, count, 200 + k))
+        .collect();
+    let plan0 = CosetPlan::new(num_vars, log_blowup, LOG_FOLD, KEPT, &sets[0]).expect("plan");
+    let slices: Vec<StackSlices> = stacks
+        .iter()
+        .map(|(store, parts)| {
+            StackSlices::from_resident(store, parts, num_vars, log_blowup).expect("slices")
+        })
+        .collect();
     println!(
-        "COSET EVAL SHAPE n={num_vars} blowup_log={LOG_BLOWUP} fold={LOG_FOLD} kept={KEPT} queries={count} cosets={} coset_len={} device_mib_b={:.1} codeword_mib_a={:.1}",
+        "COSET EVAL SHAPE n={num_vars} blowup_log={log_blowup} fold={LOG_FOLD} kept={KEPT} queries={count} cosets={} coset_len={} device_mib_b={:.1} codeword_mib_a={:.1} stack={shape} parts={}",
         plan0.classes().len(),
         plan0.coset_len(),
         plan0.device_bytes() as f64 / (1 << 20) as f64,
-        ((8usize << num_vars) + (8usize << (num_vars + LOG_BLOWUP))) as f64 / (1 << 20) as f64,
+        ((8usize << num_vars) + (8usize << (num_vars + log_blowup))) as f64 / (1 << 20) as f64,
+        stacks[0].1.len(),
     );
 
     let encode_one = |k: usize| {
-        let (store, parts, _) = &stacks[k];
+        let (store, parts) = &stacks[k];
         let codeword =
-            math_cuda::whir::encode_codeword_resident(store, parts, num_vars, LOG_BLOWUP, false)
+            math_cuda::whir::encode_codeword_resident(store, parts, num_vars, log_blowup, false)
                 .expect("re-encode");
         codeword.synchronize().expect("re-encode done");
     };
     let cosets_one = |k: usize| {
-        let (store, parts, _) = &stacks[k];
-        let plan = CosetPlan::new(num_vars, LOG_BLOWUP, LOG_FOLD, KEPT, &sets[k]).expect("plan");
+        let (store, parts) = &stacks[k];
+        let plan = CosetPlan::new(num_vars, log_blowup, LOG_FOLD, KEPT, &sets[k]).expect("plan");
         let values = evaluate_resident(store, parts, &plan, None).expect("cosets");
+        values.synchronize().expect("cosets done");
+    };
+    let in_place_one = |k: usize| {
+        let plan = CosetPlan::new(num_vars, log_blowup, LOG_FOLD, KEPT, &sets[k]).expect("plan");
+        let (values, kinds) = evaluate_slices(&slices[k], &plan, true, None).expect("cosets");
+        assert!(kinds.is_some(), "B1 read the stack in place");
         values.synchronize().expect("cosets done");
     };
     let time = |f: &dyn Fn()| {
@@ -304,68 +547,103 @@ fn coset_eval_bench() {
         start.elapsed().as_secs_f64() * 1e3
     };
 
-    let (mut a, mut b, mut a3, mut b3) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut arms: Vec<Vec<f64>> = vec![Vec::new(); 6];
     for rep in 0..warm + reps {
         let ta = time(&|| encode_one(0));
         let tb = time(&|| cosets_one(0));
+        let tb1 = time(&|| in_place_one(0));
         let ta3 = time(&|| (0..3).for_each(encode_one));
         let tb3 = time(&|| (0..3).for_each(cosets_one));
+        let tb13 = time(&|| (0..3).for_each(in_place_one));
         let label = if rep < warm { "warm" } else { "timed" };
         println!(
-            "COSET EVAL REP {label} rep={rep} a_ms={ta:.3} b_ms={tb:.3} a3_ms={ta3:.3} b3_ms={tb3:.3}"
+            "COSET EVAL REP {label} rep={rep} a_ms={ta:.3} b_ms={tb:.3} a3_ms={ta3:.3} b3_ms={tb3:.3} b1_ms={tb1:.3} b13_ms={tb13:.3}"
         );
         if rep >= warm {
-            a.push(ta);
-            b.push(tb);
-            a3.push(ta3);
-            b3.push(tb3);
+            for (arm, t) in arms.iter_mut().zip([ta, tb, ta3, tb3, tb1, tb13]) {
+                arm.push(t);
+            }
         }
     }
-    summary("A", &mut a);
-    summary("B", &mut b);
-    summary("A3", &mut a3);
-    summary("B3", &mut b3);
+    for (name, arm) in ["A", "B", "A3", "B3", "B1", "B13"]
+        .iter()
+        .zip(arms.iter_mut())
+    {
+        summary(name, arm);
+    }
 
-    // B's phases, each synchronized (so they sum to a little more than B).
-    let (store, parts, _) = &stacks[0];
-    let mut phases: Vec<Vec<f64>> = vec![Vec::new(); 5];
-    for _ in 0..5 {
-        let start = Instant::now();
-        let plan = CosetPlan::new(num_vars, LOG_BLOWUP, LOG_FOLD, KEPT, &sets[0]).expect("plan");
-        phases[0].push(start.elapsed().as_secs_f64() * 1e3);
-        let mut split = Vec::new();
-        evaluate_resident(store, parts, &plan, Some(&mut split)).expect("cosets");
-        for (i, (_, ms)) in split.iter().enumerate() {
-            phases[i + 1].push(*ms);
-        }
-    }
+    // B's and B1's phases, each synchronized (so they sum to a little more
+    // than the arm). B1's assemble is its parts' placement only; its tiles
+    // include the tile map.
     let median = |v: &mut Vec<f64>| {
         v.sort_by(|x, y| x.partial_cmp(y).expect("finite"));
         v[v.len() / 2]
     };
-    println!(
-        "COSET EVAL SPLIT plan_ms={:.3} assemble_ms={:.3} tiles_ms={:.3} rest_ms={:.3} transform_ms={:.3}",
-        median(&mut phases[0]),
-        median(&mut phases[1]),
-        median(&mut phases[2]),
-        median(&mut phases[3]),
-        median(&mut phases[4]),
-    );
+    for in_place in [false, true] {
+        let mut phases: Vec<Vec<f64>> = vec![Vec::new(); 5];
+        for _ in 0..5 {
+            let start = Instant::now();
+            let plan =
+                CosetPlan::new(num_vars, log_blowup, LOG_FOLD, KEPT, &sets[0]).expect("plan");
+            phases[0].push(start.elapsed().as_secs_f64() * 1e3);
+            let mut split = Vec::new();
+            if in_place {
+                evaluate_slices(&slices[0], &plan, true, Some(&mut split)).expect("cosets");
+            } else {
+                let (store, parts) = &stacks[0];
+                evaluate_resident(store, parts, &plan, Some(&mut split)).expect("cosets");
+            }
+            for (i, (_, ms)) in split.iter().enumerate() {
+                phases[i + 1].push(*ms);
+            }
+        }
+        // B's line keeps its words; B1's names its arm at the end.
+        let tag = if in_place { " arm=B1" } else { "" };
+        println!(
+            "COSET EVAL SPLIT plan_ms={:.3} assemble_ms={:.3} tiles_ms={:.3} rest_ms={:.3} transform_ms={:.3}{tag}",
+            median(&mut phases[0]),
+            median(&mut phases[1]),
+            median(&mut phases[2]),
+            median(&mut phases[3]),
+            median(&mut phases[4]),
+        );
+    }
 
     let peak_a = peak_mib(|| encode_one(0));
     let peak_b = peak_mib(|| cosets_one(0));
-    println!("COSET EVAL MEM peak_mib_a={peak_a:.1} peak_mib_b={peak_b:.1}");
+    let peak_b1 = peak_mib(|| in_place_one(0));
+    println!(
+        "COSET EVAL MEM peak_mib_a={peak_a:.1} peak_mib_b={peak_b:.1} peak_mib_b1={peak_b1:.1}"
+    );
 
+    let (store, parts) = &stacks[0];
     let device = evaluate_resident(store, parts, &plan0, None)
         .expect("cosets")
         .to_host()
         .expect("read back");
-    let gathered = reencoded_at_blocks(store, parts, num_vars, &plan0);
+    let (in_place, kinds) = evaluate_slices(&slices[0], &plan0, true, None).expect("cosets");
+    let in_place = in_place.to_host().expect("read back");
+    let kinds = kinds.expect("B1 read the stack in place");
+    let gathered = reencoded_at_blocks_at(store, parts, num_vars, log_blowup, &plan0);
     let differ = mismatches(&device, &gathered);
     println!(
         "COSET EVAL CHECK positions={} mismatches={differ} cosets={} queries={count}",
         device.len(),
         plan0.classes().len()
     );
+    let differ_b1 = mismatches(&in_place, &gathered);
+    let raw = in_place.iter().zip(&device).filter(|(a, b)| a != b).count();
+    println!(
+        "COSET EVAL CHECK B1 positions={} mismatches={differ_b1} raw_vs_b={raw} tiles_full={} tiles_zero={} tiles_mixed={}",
+        in_place.len(),
+        kinds.full,
+        kinds.zero,
+        kinds.mixed
+    );
     assert_eq!(differ, 0, "the cosets differ from the re-encoded codeword");
+    assert_eq!(
+        (differ_b1, raw, in_place.len()),
+        (0, 0, device.len()),
+        "the stack read in place differs"
+    );
 }

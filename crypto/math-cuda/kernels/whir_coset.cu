@@ -139,6 +139,164 @@ coset_fold_tiles(const uint64_t *__restrict__ f, uint64_t num_tiles, uint32_t le
     }
 }
 
+// The stack read where it lies: its parts (columns), sorted by their offset in
+// the stack and disjoint, are `part_len[p]` values at `part_off[p]` in the stack
+// and at `part_at[p]` in the store's buffer `data`; every other value is zero.
+//
+// A tile's map entry is the part that holds all of it, `COSET_TILE_ZERO` when
+// no part touches it, or `COSET_TILE_MIXED` (shorter columns, a column's end,
+// zeros) when its values are looked up one by one.
+#define COSET_TILE_ZERO 0xffffffffu
+#define COSET_TILE_MIXED 0xfffffffeu
+
+// The number of parts whose offset is at most `e`: the last of them is the only
+// one that can hold `e`.
+__device__ __forceinline__ uint32_t coset_parts_upto(const uint64_t *__restrict__ part_off,
+                                                     uint32_t nparts, uint64_t e) {
+    uint32_t lo = 0, hi = nparts;
+    while (lo < hi) {
+        const uint32_t mid = (lo + hi) >> 1;
+        if (part_off[mid] <= e) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+// One thread a tile of `2^tile_bits` values, the grid striding over them.
+extern "C" __global__ void coset_tile_map(const uint64_t *__restrict__ part_off,
+                                          const uint64_t *__restrict__ part_len, uint32_t nparts,
+                                          uint32_t tile_bits, uint64_t num_tiles,
+                                          uint32_t *__restrict__ map) {
+    for (uint64_t tile = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; tile < num_tiles;
+         tile += (uint64_t)gridDim.x * blockDim.x) {
+        const uint64_t start = tile << tile_bits;
+        const uint64_t end = start + (1ull << tile_bits);
+        const uint32_t upto = coset_parts_upto(part_off, nparts, start);
+        uint32_t kind = COSET_TILE_ZERO;
+        if (upto > 0) {
+            const uint32_t p = upto - 1;
+            const uint64_t past = part_off[p] + part_len[p];
+            if (past >= end) kind = p;
+            else if (past > start) kind = COSET_TILE_MIXED;
+        }
+        // The next part, past `start`, starting before the tile's end.
+        if (kind == COSET_TILE_ZERO && upto < nparts && part_off[upto] < end)
+            kind = COSET_TILE_MIXED;
+        map[tile] = kind;
+    }
+}
+
+// `coset_fold_tiles` over the stack read where it lies (the map above): a tile
+// one part holds is read from the store; a zero tile folds to zero for every
+// class (`f0 + γ·(f1 − f0)` at `f0 = f1 = 0` is the word 0), so its outputs are
+// written as zeros and its levels skipped; a mixed tile is read value by value.
+// The same words as `coset_fold_tiles` over the assembled stack.
+extern "C" __global__ void __launch_bounds__(256)
+coset_fold_tiles_parts(const uint64_t *__restrict__ data, const uint32_t *__restrict__ map,
+                       const uint64_t *__restrict__ part_off, const uint64_t *__restrict__ part_len,
+                       const uint64_t *__restrict__ part_at, uint32_t nparts, uint64_t num_tiles,
+                       uint32_t levels, const uint32_t *__restrict__ count,
+                       const uint32_t *__restrict__ offset, const uint32_t *__restrict__ parent,
+                       const uint64_t *__restrict__ gamma, uint32_t total, uint32_t buf_len,
+                       uint64_t *__restrict__ slab) {
+    extern __shared__ uint64_t coset_smem[];
+    __shared__ uint32_t s_count[COSET_MAX_TILE_LEVELS];
+    __shared__ uint32_t s_offset[COSET_MAX_TILE_LEVELS];
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t bdim = blockDim.x;
+    if (tid < levels) {
+        s_count[tid] = count[tid];
+        s_offset[tid] = offset[tid];
+    }
+    __syncthreads();
+    const uint32_t last_count = s_count[levels - 1];
+
+    uint64_t *s_gamma = coset_smem;
+    uint64_t *buf0 = s_gamma + total;
+    uint64_t *buf1 = buf0 + buf_len;
+    uint64_t *fin = buf1 + buf_len;
+    uint32_t *s_parent = (uint32_t *)(fin + (uint64_t)last_count * COSET_TILES_PER_BLOCK);
+    for (uint32_t x = tid; x < total; x += bdim) {
+        s_gamma[x] = gamma[x];
+        s_parent[x] = parent[x];
+    }
+
+    const uint32_t tile = 1u << levels;
+    // A pass a group of tiles, the grid striding over the groups, as in
+    // `coset_fold_tiles`.
+    for (uint64_t first = (uint64_t)blockIdx.x * COSET_TILES_PER_BLOCK; first < num_tiles;
+         first += (uint64_t)gridDim.x * COSET_TILES_PER_BLOCK) {
+        for (uint32_t i = 0; i < COSET_TILES_PER_BLOCK; ++i) {
+            const uint64_t at = first + i;
+            if (at >= num_tiles) break;  // the same for every thread of the block
+            const uint32_t kind = map[at];  // the same for every thread of the block
+            if (kind == COSET_TILE_ZERO) {
+                for (uint32_t k = tid; k < last_count; k += bdim)
+                    fin[(uint64_t)k * COSET_TILES_PER_BLOCK + i] = 0;
+                continue;
+            }
+            const uint64_t base = at << levels;
+            if (kind == COSET_TILE_MIXED) {
+                for (uint32_t x = tid; x < tile; x += bdim) {
+                    const uint64_t e = base + x;
+                    const uint32_t upto = coset_parts_upto(part_off, nparts, e);
+                    uint64_t v = 0;
+                    if (upto > 0) {
+                        const uint32_t p = upto - 1;
+                        if (e < part_off[p] + part_len[p])
+                            v = data[part_at[p] + (e - part_off[p])];
+                    }
+                    buf0[x] = v;
+                }
+            } else {
+                const uint64_t *src = data + part_at[kind] + (base - part_off[kind]);
+                for (uint32_t x = tid; x < tile; x += bdim) buf0[x] = src[x];
+            }
+            // The previous folded tile's last level read buf0's partner; the
+            // barrier at that level's end ordered it before this write.
+            __syncthreads();
+            uint64_t *in = buf0;
+            uint64_t *out = buf1;
+            uint32_t width = tile;
+            for (uint32_t t = 0; t < levels; ++t) {
+                const uint32_t cnt = s_count[t];
+                const uint32_t off = s_offset[t];
+                const uint32_t log_half = levels - 1 - t;
+                const uint32_t half = 1u << log_half;
+                const uint32_t outputs = cnt << log_half;
+                const bool last = t + 1 == levels;
+                for (uint32_t o = tid; o < outputs; o += bdim) {
+                    const uint32_t k = o >> log_half;
+                    const uint32_t j = o & (half - 1);
+                    const uint64_t *row = in + (uint64_t)s_parent[off + k] * width + 2 * j;
+                    const uint64_t r = coset_fold(row[0], row[1], s_gamma[off + k]);
+                    if (last) {
+                        fin[(uint64_t)k * COSET_TILES_PER_BLOCK + i] = r;
+                    } else {
+                        out[o] = r;
+                    }
+                }
+                __syncthreads();
+                uint64_t *swap = in;
+                in = out;
+                out = swap;
+                width = half;
+            }
+        }
+        // A zero tile's outputs were written without a barrier after them.
+        __syncthreads();
+
+        for (uint32_t x = tid; x < last_count * COSET_TILES_PER_BLOCK; x += bdim) {
+            const uint32_t k = x / COSET_TILES_PER_BLOCK;
+            const uint64_t at = first + x % COSET_TILES_PER_BLOCK;
+            if (at < num_tiles) slab[(uint64_t)k * num_tiles + at] = fin[x];
+        }
+        // The next pass's tiles write `fin` again.
+        __syncthreads();
+    }
+}
+
 // Folds the bits the tile kernel left (`rest` ≤ 5 of them) per coset: one
 // warp a value, lane `l` holding slab entry `h·2^rest + l` of the coset's
 // class, the pairs a level folds `2^l` lanes apart.

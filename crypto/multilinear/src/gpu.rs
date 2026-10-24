@@ -6274,9 +6274,14 @@ impl CosetSource {
             kept,
             &raw,
         )?;
-        let opened =
-            math_cuda::whir_coset::coset_openings(&self.0, &plan, &raw, hash.into_math_cuda())
-                .ok()?;
+        let opened = math_cuda::whir_coset::coset_openings(
+            &self.0,
+            &plan,
+            &raw,
+            hash.into_math_cuda(),
+            false,
+        )
+        .ok()?;
         let slots = raw
             .iter()
             .map(|&leaf| plan.slot_of(leaf))

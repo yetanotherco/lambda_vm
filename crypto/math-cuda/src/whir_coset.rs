@@ -58,6 +58,8 @@ const BLOCK: u32 = 256;
 struct Module {
     _module: Arc<CudaModule>,
     fold_tiles: CudaFunction,
+    fold_tiles_parts: CudaFunction,
+    tile_map: CudaFunction,
     fold_rest: CudaFunction,
     mobius_level: CudaFunction,
     chunk: CudaFunction,
@@ -76,6 +78,8 @@ fn module() -> Result<&'static Module> {
         .load_module(Ptx::from_binary(WHIR_COSET_CUBIN.to_vec()))?;
     let m = Module {
         fold_tiles: module.load_function("coset_fold_tiles")?,
+        fold_tiles_parts: module.load_function("coset_fold_tiles_parts")?,
+        tile_map: module.load_function("coset_tile_map")?,
         fold_rest: module.load_function("coset_fold_rest")?,
         mobius_level: module.load_function("coset_mobius_level")?,
         chunk: module.load_function("coset_chunk")?,
@@ -497,19 +501,153 @@ pub fn evaluate_resident(
     }
     laps.lap("assemble", &stream)?;
     let len = plan.classes.len() * plan.coset_len();
-    let out = evaluate_from(&stream, m, f, plan, &mut laps, 0, len)?;
+    let out = evaluate_from(&stream, m, Tiles::Assembled(f), plan, &mut laps, 0, len)?;
     Ok(CosetValues {
         buffer: out,
         stream,
     })
 }
 
-/// The cosets from the assembled stack `f` (spent), into a buffer of
-/// `out_len` values laid out by `stride` (`coset_leaf_order`), on `stream`.
+/// [`evaluate_resident`] over a [`StackSlices`]: the stack read where it lies
+/// when `in_place` and its parts allow ([`StackSlices::parts_in_place`]; the
+/// kinds of its tiles returned), assembled into a fresh buffer otherwise
+/// (`None`). The same values either way, word for word.
+pub fn evaluate_slices(
+    stack: &StackSlices,
+    plan: &CosetPlan,
+    in_place: bool,
+    split: Option<&mut Vec<(&'static str, f64)>>,
+) -> Result<(CosetValues, Option<TileKinds>)> {
+    ensure!(plan.num_vars == stack.num_vars && plan.log_blowup == stack.log_blowup);
+    let be = backend()?;
+    let m = module()?;
+    let stream = be.next_stream();
+    let mut laps = Laps {
+        split,
+        clock: std::time::Instant::now(),
+    };
+    let parts = if in_place {
+        stack.parts_in_place()
+    } else {
+        None
+    };
+    let (tiles, kinds) = match &parts {
+        Some(parts) => (
+            Tiles::InPlace {
+                data: stack.buffer.as_ref(),
+                parts,
+            },
+            Some(parts.tile_kinds(plan.num_vars, plan.tile_levels)),
+        ),
+        None => (Tiles::Assembled(stack.assemble(&stream)?), None),
+    };
+    laps.lap("assemble", &stream)?;
+    let len = plan.classes.len() * plan.coset_len();
+    let out = evaluate_from(&stream, m, tiles, plan, &mut laps, 0, len)?;
+    Ok((
+        CosetValues {
+            buffer: out,
+            stream,
+        },
+        kinds,
+    ))
+}
+
+/// What the tile kernel reads: the assembled stack (spent by it), or the stack
+/// where it lies, by its parts.
+enum Tiles<'a> {
+    Assembled(CudaSlice<u64>),
+    InPlace {
+        data: &'a CudaSlice<u64>,
+        parts: &'a StackParts,
+    },
+}
+
+/// A stack's tiles by kind ([`StackParts::tile_kinds`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TileKinds {
+    /// Tiles one part holds all of: read straight from the store.
+    pub full: u64,
+    /// Tiles no part touches: folded to zero without being read.
+    pub zero: u64,
+    /// Tiles of shorter columns, a column's end or zeros: read value by value.
+    pub mixed: u64,
+}
+
+/// A stack's parts as the in-place kernels read them: sorted by their offset
+/// in the stack, disjoint, the empty ones dropped; part `p` is `len[p]` values
+/// at `off[p]` in the stack and at `at[p]` in the store's buffer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StackParts {
+    off: Vec<u64>,
+    len: Vec<u64>,
+    at: Vec<u64>,
+}
+
+impl StackParts {
+    /// `parts` — `(element offset in the buffer, elements, offset in the
+    /// stack)` — of a `2^num_vars`-value stack in a buffer of `buffer_len`
+    /// elements. `None` for parts the kernels cannot place: overlapping, past
+    /// the stack or past the buffer.
+    pub fn new(
+        parts: &[(usize, usize, usize)],
+        num_vars: usize,
+        buffer_len: usize,
+    ) -> Option<Self> {
+        let n = 1u64 << num_vars;
+        let mut sorted: Vec<(u64, u64, u64)> = parts
+            .iter()
+            .filter(|&&(_, len, _)| len > 0)
+            .map(|&(at, len, off)| (off as u64, len as u64, at as u64))
+            .collect();
+        sorted.sort_unstable();
+        let mut end = 0u64;
+        for &(off, len, at) in &sorted {
+            if off < end || off.checked_add(len)? > n || at.checked_add(len)? > buffer_len as u64 {
+                return None;
+            }
+            end = off + len;
+        }
+        // The map keeps two words for its kinds.
+        (sorted.len() < u32::MAX as usize - 1).then(|| Self {
+            off: sorted.iter().map(|p| p.0).collect(),
+            len: sorted.iter().map(|p| p.1).collect(),
+            at: sorted.iter().map(|p| p.2).collect(),
+        })
+    }
+
+    /// How many of the stack's `2^tile_bits`-value tiles each kind takes, from
+    /// the parts alone (no tile is visited): the tiles whole inside a part, the
+    /// tiles no part touches, and the rest.
+    pub fn tile_kinds(&self, num_vars: usize, tile_bits: usize) -> TileKinds {
+        let tile = 1u64 << tile_bits;
+        let tiles = 1u64 << (num_vars - tile_bits);
+        let (mut full, mut touched, mut reached) = (0u64, 0u64, 0u64);
+        for (&off, &len) in self.off.iter().zip(&self.len) {
+            let end = off + len;
+            full += (end / tile).saturating_sub(off.div_ceil(tile));
+            // Sorted and disjoint: the touched spans, merged as they come.
+            let (from, to) = ((off / tile).max(reached), end.div_ceil(tile));
+            if to > from {
+                touched += to - from;
+                reached = to;
+            }
+        }
+        TileKinds {
+            full,
+            zero: tiles - touched,
+            mixed: touched - full,
+        }
+    }
+}
+
+/// The cosets from the stack `tiles` reads (an assembled one is spent), into a
+/// buffer of `out_len` values laid out by `stride` (`coset_leaf_order`), on
+/// `stream`.
 fn evaluate_from(
     stream: &Arc<CudaStream>,
     m: &Module,
-    f: CudaSlice<u64>,
+    tiles_from: Tiles<'_>,
     plan: &CosetPlan,
     laps: &mut Laps<'_>,
     stride: u64,
@@ -530,27 +668,81 @@ fn evaluate_from(
     // The long kernels' grids are cut to the calling thread's cap, if any
     // (`device::grid_cap`); each strides over its work, the same values.
     let capped = crate::device::capped_grid;
-    unsafe {
-        stream
-            .launch_builder(&m.fold_tiles)
-            .arg(&f)
-            .arg(&tiles_u64)
-            .arg(&levels_u32)
-            .arg(&count)
-            .arg(&offset)
-            .arg(&parents)
-            .arg(&gammas)
-            .arg(&total_u32)
-            .arg(&buf_u32)
-            .arg(&mut slab)
-            .launch(LaunchConfig {
-                grid_dim: (capped(tiles.div_ceil(TILES_PER_BLOCK) as u32), 1, 1),
-                block_dim: (BLOCK, 1, 1),
-                shared_mem_bytes: plan.tile_shared_bytes() as u32,
-            })?;
+    let tile_grid = LaunchConfig {
+        grid_dim: (capped(tiles.div_ceil(TILES_PER_BLOCK) as u32), 1, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: plan.tile_shared_bytes() as u32,
+    };
+    match tiles_from {
+        Tiles::Assembled(f) => {
+            unsafe {
+                stream
+                    .launch_builder(&m.fold_tiles)
+                    .arg(&f)
+                    .arg(&tiles_u64)
+                    .arg(&levels_u32)
+                    .arg(&count)
+                    .arg(&offset)
+                    .arg(&parents)
+                    .arg(&gammas)
+                    .arg(&total_u32)
+                    .arg(&buf_u32)
+                    .arg(&mut slab)
+                    .launch(tile_grid)?;
+            }
+            // Spent; the free is stream-ordered.
+            drop(f);
+        }
+        Tiles::InPlace { data, parts } => {
+            // A stack with no part (all zeros) still uploads one word a
+            // table: a zero-length upload is not an allocation.
+            let upload = |v: &[u64]| {
+                if v.is_empty() {
+                    htod_or_trim(stream, &[0u64])
+                } else {
+                    htod_or_trim(stream, v)
+                }
+            };
+            let (off, len, at) = (upload(&parts.off)?, upload(&parts.len)?, upload(&parts.at)?);
+            let nparts = parts.off.len() as u32;
+            let tile_bits = plan.tile_levels as u32;
+            // SAFETY: the map kernel writes every tile's entry.
+            let mut map = unsafe { alloc_or_trim::<u32>(stream, tiles) }?;
+            unsafe {
+                stream
+                    .launch_builder(&m.tile_map)
+                    .arg(&off)
+                    .arg(&len)
+                    .arg(&nparts)
+                    .arg(&tile_bits)
+                    .arg(&tiles_u64)
+                    .arg(&mut map)
+                    .launch(LaunchConfig {
+                        grid_dim: (capped(tiles.div_ceil(BLOCK as usize) as u32), 1, 1),
+                        block_dim: (BLOCK, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+                stream
+                    .launch_builder(&m.fold_tiles_parts)
+                    .arg(data)
+                    .arg(&map)
+                    .arg(&off)
+                    .arg(&len)
+                    .arg(&at)
+                    .arg(&nparts)
+                    .arg(&tiles_u64)
+                    .arg(&levels_u32)
+                    .arg(&count)
+                    .arg(&offset)
+                    .arg(&parents)
+                    .arg(&gammas)
+                    .arg(&total_u32)
+                    .arg(&buf_u32)
+                    .arg(&mut slab)
+                    .launch(tile_grid)?;
+            }
+        }
     }
-    // Spent; the free is stream-ordered.
-    drop(f);
     laps.lap("tiles", stream)?;
 
     let cosets = plan.classes.len();
@@ -739,6 +931,12 @@ impl StackSlices {
         )
     }
 
+    /// The parts as the in-place kernels read them, or `None` when they cannot
+    /// place them ([`StackParts::new`]): the caller assembles the stack.
+    pub fn parts_in_place(&self) -> Option<StackParts> {
+        StackParts::new(&self.parts, self.num_vars, self.buffer.len())
+    }
+
     fn assemble(&self, stream: &Arc<CudaStream>) -> Result<CudaSlice<u64>> {
         // SAFETY: `copy_slices` writes every element (zeros, then the parts).
         let mut f = unsafe { alloc_or_trim::<u64>(stream, 1 << self.num_vars) }?;
@@ -757,6 +955,9 @@ pub struct CosetOpenings {
     pub leaves: usize,
     /// `2^fold` values a query, in the order the queries were given.
     pub values: Vec<u64>,
+    /// The stack's tiles by kind when it was read where it lies; `None` when
+    /// it was assembled (not asked for, or parts the kernels cannot place).
+    pub in_place: Option<TileKinds>,
 }
 
 /// The kept blocks' subtrees and the queried blocks' values of a round-0
@@ -765,12 +966,14 @@ pub struct CosetOpenings {
 /// commit's own kernels (so each block's subtree is the committed one, which
 /// the caller checks against its kept node), and the queried blocks gathered
 /// from the same buffer. `queried` are leaf indices, each in one of the plan's
-/// cosets. Poseidon1 trees only.
+/// cosets. Poseidon1 trees only. `in_place`: the stack read where it lies
+/// ([`evaluate_slices`]); the same words either way.
 pub fn coset_openings(
     stack: &StackSlices,
     plan: &CosetPlan,
     queried: &[u64],
     hash: crate::DeviceHash,
+    in_place: bool,
 ) -> Result<CosetOpenings> {
     ensure!(hash == crate::DeviceHash::Poseidon1);
     ensure!(plan.num_vars == stack.num_vars && plan.log_blowup == stack.log_blowup);
@@ -785,7 +988,21 @@ pub fn coset_openings(
         at.push(((q << plan.kept) | r) as u64);
     }
 
-    let f = stack.assemble(&stream)?;
+    let parts = if in_place {
+        stack.parts_in_place()
+    } else {
+        None
+    };
+    let (tiles, kinds) = match &parts {
+        Some(parts) => (
+            Tiles::InPlace {
+                data: stack.buffer.as_ref(),
+                parts,
+            },
+            Some(parts.tile_kinds(plan.num_vars, plan.tile_levels)),
+        ),
+        None => (Tiles::Assembled(stack.assemble(&stream)?), None),
+    };
     let mut laps = Laps {
         split: None,
         clock: std::time::Instant::now(),
@@ -793,7 +1010,7 @@ pub fn coset_openings(
     let out = evaluate_from(
         &stream,
         m,
-        f,
+        tiles,
         plan,
         &mut laps,
         leaves as u64,
@@ -849,6 +1066,7 @@ pub fn coset_openings(
         nodes: nodes_host,
         leaves,
         values: values_host,
+        in_place: kinds,
     })
 }
 
@@ -992,10 +1210,181 @@ mod tests {
             let tiles = plan.tiles();
             let mut slab = vec![0u64; plan.slab_rows() * tiles];
             fold_tiles(plan, values, &mut slab, cap);
+            finish(plan, &slab, stride, out_len, cap)
+        }
+
+        /// [`kernels`] over the stack read where it lies: `data` the store's
+        /// buffer, `parts` its parts. Returns the cosets and the tile map.
+        pub fn kernels_in_place(
+            plan: &CosetPlan,
+            parts: &StackParts,
+            data: &[u64],
+            cap: Option<usize>,
+        ) -> (Vec<u64>, Vec<u32>) {
+            let tiles = plan.tiles();
+            let map = tile_map(parts, plan.tile_levels, tiles, cap);
+            let mut slab = vec![0u64; plan.slab_rows() * tiles];
+            fold_tiles_parts(plan, data, &map, parts, &mut slab, cap);
+            let len = plan.classes.len() * plan.coset_len();
+            (finish(plan, &slab, 0, len, cap), map)
+        }
+
+        pub const ZERO: u32 = 0xffff_ffff;
+        pub const MIXED: u32 = 0xffff_fffe;
+
+        fn parts_upto(off: &[u64], e: u64) -> usize {
+            let (mut lo, mut hi) = (0usize, off.len());
+            while lo < hi {
+                let mid = (lo + hi) >> 1;
+                if off[mid] <= e {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        }
+
+        /// `coset_tile_map`, one thread a tile, the grid striding over them.
+        /// An entry no thread writes stays `UNWRITTEN`.
+        pub fn tile_map(
+            parts: &StackParts,
+            tile_bits: usize,
+            num_tiles: usize,
+            cap: Option<usize>,
+        ) -> Vec<u32> {
+            const UNWRITTEN: u32 = 0xdead_beef;
+            let threads = grid_of(num_tiles.div_ceil(BLOCK as usize), cap) * BLOCK as usize;
+            let mut map = vec![UNWRITTEN; num_tiles];
+            for thread in 0..threads {
+                for tile in (thread..num_tiles).step_by(threads) {
+                    let tile = tile as u64;
+                    let start = tile << tile_bits;
+                    let end = start + (1 << tile_bits);
+                    let upto = parts_upto(&parts.off, start);
+                    let mut kind = ZERO;
+                    if upto > 0 {
+                        let p = upto - 1;
+                        let past = parts.off[p] + parts.len[p];
+                        if past >= end {
+                            kind = p as u32;
+                        } else if past > start {
+                            kind = MIXED;
+                        }
+                    }
+                    if kind == ZERO && upto < parts.off.len() && parts.off[upto] < end {
+                        kind = MIXED;
+                    }
+                    map[tile as usize] = kind;
+                }
+            }
+            map
+        }
+
+        /// `coset_fold_tiles_parts`, a block's tiles in turn as in
+        /// [`fold_tiles`].
+        fn fold_tiles_parts(
+            plan: &CosetPlan,
+            data: &[u64],
+            map: &[u32],
+            parts: &StackParts,
+            slab: &mut [u64],
+            cap: Option<usize>,
+        ) {
+            const TILES: usize = TILES_PER_BLOCK;
+            let levels = plan.tile_levels;
+            let num_tiles = plan.tiles();
+            let buf_len = plan.buf_len;
+            let last_count = plan.level_count[levels - 1] as usize;
+            let grid = grid_of(num_tiles.div_ceil(TILES), cap);
+            for block in 0..grid {
+                // A block's shared memory, kept across its passes.
+                let mut bufs = [vec![0u64; buf_len], vec![0u64; buf_len]];
+                let mut fin = vec![0u64; last_count * TILES];
+                let tile = 1usize << levels;
+                for first in (block * TILES..num_tiles).step_by(grid * TILES) {
+                    for i in 0..TILES {
+                        let at = first + i;
+                        if at >= num_tiles {
+                            break;
+                        }
+                        let kind = map[at];
+                        if kind == ZERO {
+                            for k in 0..last_count {
+                                fin[k * TILES + i] = 0;
+                            }
+                            continue;
+                        }
+                        let base = (at as u64) << levels;
+                        if kind == MIXED {
+                            for x in 0..tile {
+                                let e = base + x as u64;
+                                let upto = parts_upto(&parts.off, e);
+                                let mut v = 0;
+                                if upto > 0 {
+                                    let p = upto - 1;
+                                    if e < parts.off[p] + parts.len[p] {
+                                        v = data[(parts.at[p] + (e - parts.off[p])) as usize];
+                                    }
+                                }
+                                bufs[0][x] = v;
+                            }
+                        } else {
+                            let p = kind as usize;
+                            let src = (parts.at[p] + (base - parts.off[p])) as usize;
+                            bufs[0][..tile].copy_from_slice(&data[src..src + tile]);
+                        }
+                        let (mut inp, mut out) = (0usize, 1usize);
+                        let mut width = tile;
+                        for t in 0..levels {
+                            let cnt = plan.level_count[t] as usize;
+                            let off = plan.level_offset[t] as usize;
+                            let log_half = levels - 1 - t;
+                            let half = 1usize << log_half;
+                            let outputs = cnt << log_half;
+                            let last = t + 1 == levels;
+                            let mut wrote = vec![0u64; buf_len];
+                            for o in 0..outputs {
+                                let k = o >> log_half;
+                                let j = o & (half - 1);
+                                let row = plan.parents[off + k] as usize * width + 2 * j;
+                                let r =
+                                    fold(bufs[inp][row], bufs[inp][row + 1], plan.gammas[off + k]);
+                                if last {
+                                    fin[k * TILES + i] = r;
+                                } else {
+                                    wrote[o] = r;
+                                }
+                            }
+                            if !last {
+                                bufs[out][..outputs].copy_from_slice(&wrote[..outputs]);
+                            }
+                            std::mem::swap(&mut inp, &mut out);
+                            width = half;
+                        }
+                    }
+                    for x in 0..last_count * TILES {
+                        let k = x / TILES;
+                        let at = first + x % TILES;
+                        if at < num_tiles {
+                            slab[k * num_tiles + at] = fin[x];
+                        }
+                    }
+                }
+            }
+        }
+
+        fn finish(
+            plan: &CosetPlan,
+            slab: &[u64],
+            stride: u64,
+            out_len: usize,
+            cap: Option<usize>,
+        ) -> Vec<u64> {
             let cosets = plan.classes.len();
             let len = plan.coset_len();
             let mut g = vec![0u64; cosets * len];
-            fold_rest(plan, &slab, &mut g, cap);
+            fold_rest(plan, slab, &mut g, cap);
             let cl = plan.chunk_levels();
             let pairs = cosets * len / 2;
             for level in cl..plan.log_coset {
@@ -1279,6 +1668,211 @@ mod tests {
             let q = plan.block_of(leaf).expect("block");
             assert!(plan.block_leaves(q).contains(&leaf));
         }
+    }
+
+    /// A stack's parts as a store holds them: columns of the given heights
+    /// placed as `StackedLayout::build` does (each at a multiple of its
+    /// height, the cursor only growing), `short` values cut off every third
+    /// column's end (a column ending mid-tile), then laid in the buffer in
+    /// another order with junk between (a read past a part shows). Returns
+    /// `(buffer offset, elements, stack offset)` parts and the buffer.
+    fn store_layout(
+        num_vars: usize,
+        heights: &[usize],
+        short: usize,
+        seed: u64,
+    ) -> (Vec<(usize, usize, usize)>, Vec<u64>) {
+        let mut rng = Rng(seed);
+        let mut placed = Vec::new();
+        let mut cursor = 0usize;
+        for (i, &h) in heights.iter().enumerate() {
+            let len = 1usize << h;
+            let off = cursor.next_multiple_of(len);
+            if off + len > 1 << num_vars {
+                break;
+            }
+            cursor = off + len;
+            let len = if i % 3 == 2 {
+                len - short.min(len - 1)
+            } else {
+                len
+            };
+            placed.push((len, off));
+        }
+        let mut order: Vec<usize> = (0..placed.len()).collect();
+        for i in (1..order.len()).rev() {
+            order.swap(i, rng.next() as usize % (i + 1));
+        }
+        let mut data = Vec::new();
+        let mut parts = Vec::new();
+        for &i in &order {
+            let (len, off) = placed[i];
+            for _ in 0..rng.next() % 5 {
+                data.push(rng.next() % P);
+            }
+            parts.push((data.len(), len, off));
+            data.extend((0..len).map(|_| rng.next() % P));
+        }
+        data.push(rng.next() % P);
+        (parts, data)
+    }
+
+    /// The stack `parts` make out of `data`, zeros between.
+    fn assembled(num_vars: usize, parts: &[(usize, usize, usize)], data: &[u64]) -> Vec<u64> {
+        let mut f = vec![0u64; 1 << num_vars];
+        for &(at, len, off) in parts {
+            f[off..off + len].copy_from_slice(&data[at..at + len]);
+        }
+        f
+    }
+
+    /// Each tile's kind by looking at every value of it.
+    fn kinds_by_hand(num_vars: usize, tile_bits: usize, parts: &StackParts) -> Vec<u32> {
+        let owner = |e: u64| {
+            (0..parts.off.len()).find(|&p| parts.off[p] <= e && e < parts.off[p] + parts.len[p])
+        };
+        (0..1u64 << (num_vars - tile_bits))
+            .map(|tile| {
+                let owners: Vec<Option<usize>> = (tile << tile_bits..(tile + 1) << tile_bits)
+                    .map(owner)
+                    .collect();
+                if owners.iter().all(Option::is_none) {
+                    emulate::ZERO
+                } else if owners.iter().all(|o| *o == owners[0]) {
+                    owners[0].unwrap() as u32
+                } else {
+                    emulate::MIXED
+                }
+            })
+            .collect()
+    }
+
+    /// The stack read where it lies gives the assembled stack's words, raw,
+    /// and the tile map gives each tile the kind its values have, the counts
+    /// `tile_kinds` says without visiting a tile. Both paths give the same
+    /// words, and the same map, with their grids cut to 1, 2 or 7 blocks.
+    fn in_place_is_the_assembled_stack(
+        plan: &CosetPlan,
+        parts: &[(usize, usize, usize)],
+        data: &[u64],
+        what: &str,
+    ) -> TileKinds {
+        let n = plan.num_vars;
+        let placed = StackParts::new(parts, n, data.len()).expect("the parts place");
+        let (got, map) = emulate::kernels_in_place(plan, &placed, data, None);
+        let whole = assembled(n, parts, data);
+        let reference = emulate::kernels(plan, &whole);
+        assert_eq!(
+            got, reference,
+            "{what}: in place and assembled, word for word"
+        );
+        for cap in [1, 2, 7] {
+            let (capped, capped_map) = emulate::kernels_in_place(plan, &placed, data, Some(cap));
+            assert_eq!(capped, got, "{what}: in place, {cap} blocks a kernel");
+            assert_eq!(capped_map, map, "{what}: the map at {cap} blocks");
+            assert_eq!(
+                emulate::kernels_capped(plan, &whole, Some(cap)),
+                reference,
+                "{what}: assembled, {cap} blocks a kernel"
+            );
+        }
+        assert_eq!(
+            map,
+            kinds_by_hand(n, plan.tile_levels, &placed),
+            "{what}: the map"
+        );
+        let kinds = placed.tile_kinds(n, plan.tile_levels);
+        let count = |want: &dyn Fn(u32) -> bool| map.iter().filter(|&&k| want(k)).count() as u64;
+        assert_eq!(
+            kinds,
+            TileKinds {
+                full: count(&|k| k < emulate::MIXED),
+                zero: count(&|k| k == emulate::ZERO),
+                mixed: count(&|k| k == emulate::MIXED),
+            },
+            "{what}: the kinds counted from the parts"
+        );
+        kinds
+    }
+
+    /// The production tile (8 bits), with and without rest bits, at blowups 4
+    /// and 2, and a 5-bit tile, over the layouts the stacks have: columns down
+    /// to a value, columns ending mid-tile, alignment gaps, a zero tail; one
+    /// column; no column.
+    #[test]
+    fn the_stack_read_in_place_is_the_assembled_stack() {
+        let mut rng = Rng(31);
+        for (num_vars, log_blowup, log_fold, kept) in [(12, 2, 2, 2), (16, 1, 2, 3), (11, 2, 3, 3)]
+        {
+            let num_leaves = 1u64 << (num_vars + log_blowup - log_fold);
+            let leaves: Vec<u64> = (0..19).map(|_| rng.next() % num_leaves).collect();
+            let plan = CosetPlan::new(num_vars, log_blowup, log_fold, kept, &leaves).expect("plan");
+            let tb = plan.tile_levels;
+            assert!(tb >= 3, "{num_vars}: tile bits {tb}");
+            // Production-like: tall columns first, then shorter ones down to a
+            // value, the cursor stopping ≈ 15 % short of the stack's end.
+            let mut heights = vec![num_vars - 2, num_vars - 3];
+            heights.extend((0..40).map(|i| (num_vars - 4).saturating_sub(i % (num_vars - 3))));
+            let (mut parts, data) = store_layout(num_vars, &heights, 7, rng.next());
+            let cap = (1usize << num_vars) * 85 / 100;
+            parts.retain(|&(_, _, off)| off < cap);
+            let kinds = in_place_is_the_assembled_stack(&plan, &parts, &data, "production-like");
+            assert!(
+                kinds.full > 0 && kinds.zero > 0 && kinds.mixed > 0,
+                "{kinds:?}"
+            );
+            // Shortened columns at unaligned ends, sub-tile columns only.
+            let small: Vec<usize> = (0..300).map(|i| [0, 1, 2, 5, 3][i % 5]).collect();
+            let (parts, data) = store_layout(num_vars, &small, 1, rng.next());
+            in_place_is_the_assembled_stack(&plan, &parts, &data, "sub-tile columns");
+            // One column, the whole stack.
+            let (parts, data) = store_layout(num_vars, &[num_vars], 0, rng.next());
+            let kinds = in_place_is_the_assembled_stack(&plan, &parts, &data, "one column");
+            assert_eq!((kinds.zero, kinds.mixed), (0, 0));
+            // Columns meeting inside a tile and at a tile's edge, and one a
+            // value short of its last tile's end, a tile of junk after it.
+            let t = 1usize << tb;
+            let parts = [
+                (0, t + 3, 0),
+                (t + 3, t - 3, t + 3),
+                (2 * t, t, 2 * t),
+                (3 * t, 2 * t - 1, 4 * t),
+            ];
+            let data: Vec<u64> = (0..6 * t).map(|_| rng.next() % P).collect();
+            in_place_is_the_assembled_stack(&plan, &parts, &data, "columns meeting");
+            // No column: every tile zero, every coset value zero.
+            let kinds = in_place_is_the_assembled_stack(&plan, &[], &[], "no column");
+            assert_eq!((kinds.full, kinds.mixed), (0, 0));
+        }
+    }
+
+    /// The parts the in-place kernels cannot place are refused (the caller
+    /// assembles the stack); empty ones are dropped and the rest sorted.
+    #[test]
+    fn parts_the_in_place_kernels_cannot_place_are_refused() {
+        let n = 10;
+        assert!(
+            StackParts::new(&[(0, 8, 0), (8, 8, 4)], n, 64).is_none(),
+            "overlapping"
+        );
+        assert!(
+            StackParts::new(&[(0, 8, 1020)], n, 64).is_none(),
+            "past the stack"
+        );
+        assert!(
+            StackParts::new(&[(60, 8, 0)], n, 64).is_none(),
+            "past the buffer"
+        );
+        assert!(
+            StackParts::new(&[(0, 8, 0), (8, 8, 8)], n, 16).is_some(),
+            "adjacent"
+        );
+        let placed =
+            StackParts::new(&[(40, 8, 512), (0, 0, 4), (8, 4, 16)], n, 64).expect("placed");
+        assert_eq!(
+            (placed.off, placed.len, placed.at),
+            (vec![16, 512], vec![4, 8], vec![8, 40])
+        );
     }
 
     #[test]
