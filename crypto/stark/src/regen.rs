@@ -31,6 +31,14 @@
 //!   window ([`RegenWindow::close`], the prove's end) wakes every waiter and
 //!   every depositor. A take never blocks: its taker waited for the slot first.
 //!
+//! - A table held as the records its rows come from
+//!   ([`multilinear::records`]) has no packed columns on the host to digest.
+//!   Its slot ([`RegenWindow::slot_for_records`]) keeps the records' digest
+//!   and shape instead, and its deposit
+//!   ([`RegenSlot::deposit_checked`]) is the packed columns the regenerator
+//!   made from records it rebuilt, checked by those records' digest and the
+//!   columns' shape. What is checked is the input the columns follow from.
+//!
 //! #1013's `stark::regen` (814a4b656), over the block's committed form instead
 //! of a trace's `NarrowMain`: the window, its pacing and its failure semantics
 //! are the same. Nothing is dropped unless a caller opens a window and drops
@@ -79,13 +87,19 @@ impl std::fmt::Display for RegenError {
     }
 }
 
-/// Dropped packed columns' shape and digest: what their deposit must be.
+/// Dropped packed columns' shape and digest, or dropped records' shape and
+/// digest: what their deposit must be.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Want {
     rows: usize,
+    /// The packed columns' widths; for records, empty (their deposit's widths
+    /// are the host fill's, known once it is made).
     widths: Vec<u8>,
+    /// The bytes dropped: the packed columns', or the records'.
     len: usize,
     digest: [u64; 2],
+    /// `Some(columns)` for a table dropped as its records.
+    records: Option<usize>,
 }
 
 impl Want {
@@ -95,15 +109,32 @@ impl Want {
             widths: packed.widths().to_vec(),
             len: packed.data().len(),
             digest: digest_of(packed),
+            records: None,
         }
     }
 
-    /// The shape alone: rows, column widths and bytes. Always checked, so a
-    /// deposit can never be widened into a buffer of another size.
+    fn of_records(records: &multilinear::records::Records) -> Self {
+        Self {
+            rows: records.rows(),
+            widths: Vec::new(),
+            len: records.bytes(),
+            digest: records.digest(),
+            records: Some(records.cols()),
+        }
+    }
+
+    /// The shape alone: rows, column widths and bytes for packed columns;
+    /// rows and columns for records. Always checked, so a deposit can never be
+    /// widened into a buffer of another size.
     fn same_shape(&self, packed: &NarrowColumns) -> bool {
-        self.rows == packed.rows()
-            && self.widths == packed.widths()
-            && self.len == packed.data().len()
+        match self.records {
+            None => {
+                self.rows == packed.rows()
+                    && self.widths == packed.widths()
+                    && self.len == packed.data().len()
+            }
+            Some(cols) => self.rows == packed.rows() && cols == packed.cols(),
+        }
     }
 }
 
@@ -116,6 +147,9 @@ enum SlotState {
 
 struct Slot {
     rank: u64,
+    /// The bytes it reserves: what was dropped until its deposit, then the
+    /// deposit's.
+    len: u64,
     state: SlotState,
     /// Set once the state leaves `Waiting`: the lock-free half of
     /// [`RegenSlot::is_ready`].
@@ -266,10 +300,41 @@ impl RegenWindow {
         let id = shared.slots.len();
         shared.slots.push(Slot {
             rank,
+            len: packed.data().len() as u64,
             state: SlotState::Waiting,
             settled: Arc::clone(&settled),
         });
         shared.live.insert((rank, id), packed.data().len() as u64);
+        RegenSlot {
+            window: Arc::clone(self),
+            id,
+            rank,
+            want,
+            settled,
+        }
+    }
+
+    /// A slot for a table held as `records`, about to be dropped: it keeps
+    /// their digest and shape, and reserves their bytes until its deposit
+    /// ([`RegenSlot::deposit_checked`]), then the deposit's. `rank` orders it
+    /// as for [`Self::slot`].
+    pub fn slot_for_records(
+        self: &Arc<Self>,
+        records: &multilinear::records::Records,
+        rank: u64,
+    ) -> RegenSlot {
+        let want = Want::of_records(records);
+        let len = want.len as u64;
+        let settled = Arc::new(AtomicBool::new(false));
+        let mut shared = lock(&self.shared);
+        let id = shared.slots.len();
+        shared.slots.push(Slot {
+            rank,
+            len,
+            state: SlotState::Waiting,
+            settled: Arc::clone(&settled),
+        });
+        shared.live.insert((rank, id), len);
         RegenSlot {
             window: Arc::clone(self),
             id,
@@ -393,7 +458,7 @@ impl std::fmt::Debug for RegenSlot {
             .field("id", &self.id)
             .field("rank", &self.rank)
             .field("rows", &self.want.rows)
-            .field("cols", &self.want.widths.len())
+            .field("cols", &self.cols())
             .field("bytes", &self.want.len)
             .finish_non_exhaustive()
     }
@@ -428,7 +493,7 @@ impl RegenSlot {
 
     /// Columns dropped.
     pub fn cols(&self) -> usize {
-        self.want.widths.len()
+        self.want.records.unwrap_or(self.want.widths.len())
     }
 
     /// Packed bytes dropped.
@@ -441,9 +506,17 @@ impl RegenSlot {
         self.want.len == 0
     }
 
-    /// The digest taken when the columns were dropped.
+    /// The digest taken when the columns were dropped: the packed columns',
+    /// or the records' ([`Self::is_records`]).
     pub fn digest(&self) -> [u64; 2] {
         self.want.digest
+    }
+
+    /// Whether the table was dropped as its records
+    /// ([`RegenWindow::slot_for_records`]): its deposit is
+    /// [`Self::deposit_checked`].
+    pub fn is_records(&self) -> bool {
+        self.want.records.is_some()
     }
 
     /// Its window.
@@ -458,12 +531,37 @@ impl RegenSlot {
     /// refused) and return [`RegenError::Mismatch`]; a closed window returns
     /// [`RegenError::Closed`]; a slot already settled refuses a second deposit.
     pub fn deposit(&self, packed: NarrowColumns) -> Result<(), RegenError> {
+        // A table dropped as its records is checked by the records its
+        // columns were made from.
+        let matches = !self.is_records()
+            && if self.window.verifies() {
+                Want::of(&packed) == self.want
+            } else {
+                self.want.same_shape(&packed)
+            };
+        self.settle_deposit(packed, matches)
+    }
+
+    /// [`Self::deposit`] for a table dropped as its records: `packed` made by
+    /// the host fill from records whose digest is `records_digest`, checked
+    /// against the dropped records' digest and against their shape. Anything
+    /// else fails the slot with [`RegenError::Mismatch`], as does this call on
+    /// a slot of packed columns.
+    pub fn deposit_checked(
+        &self,
+        packed: NarrowColumns,
+        records_digest: [u64; 2],
+    ) -> Result<(), RegenError> {
+        let matches = self.is_records()
+            && self.want.same_shape(&packed)
+            && (!self.window.verifies() || records_digest == self.want.digest);
+        self.settle_deposit(packed, matches)
+    }
+
+    /// A deposit whose check gave `matches`: held once the window admits its
+    /// rank, or the slot failed.
+    fn settle_deposit(&self, packed: NarrowColumns, matches: bool) -> Result<(), RegenError> {
         let window = &self.window;
-        let matches = if window.verifies() {
-            Want::of(&packed) == self.want
-        } else {
-            self.want.same_shape(&packed)
-        };
         let t = Instant::now();
         let mut shared = lock(&window.shared);
         if !matches!(shared.slots[self.id].state, SlotState::Waiting) {
@@ -476,7 +574,7 @@ impl RegenSlot {
             window.changed.notify_all();
             return Err(RegenError::Mismatch);
         }
-        let len = self.want.len as u64;
+        let len = packed.data().len() as u64;
         let key = (self.rank, self.id);
         loop {
             if let Some(why) = &shared.closed {
@@ -496,6 +594,12 @@ impl RegenSlot {
                 .unwrap_or_else(|e| e.into_inner());
         }
         shared.deposit_wait_ns += t.elapsed().as_nanos() as u64;
+        // A records slot reserved the records' bytes: from now on, the
+        // deposit's.
+        shared.slots[self.id].len = len;
+        if let Some(reserved) = shared.live.get_mut(&key) {
+            *reserved = len;
+        }
         shared.settle(self.id, SlotState::Ready(packed));
         shared.parked += len;
         shared.high_water = shared.high_water.max(shared.parked);
@@ -550,7 +654,8 @@ impl RegenSlot {
         let state = std::mem::replace(&mut shared.slots[self.id].state, SlotState::Taken);
         match state {
             SlotState::Ready(packed) => {
-                shared.parked = shared.parked.saturating_sub(self.want.len as u64);
+                let len = shared.slots[self.id].len;
+                shared.parked = shared.parked.saturating_sub(len);
                 shared.live.remove(&(self.rank, self.id));
                 shared.taken += 1;
                 drop(shared);
@@ -973,6 +1078,95 @@ mod tests {
         assert_eq!(
             slot.take(),
             Err(RegenError::Failed("the walk refused window 3".to_string()))
+        );
+    }
+
+    /// Records of a table of `rows` × 3: KECCAK_RND-shaped ops whose words
+    /// depend on `seed` (only their shape and digest matter here).
+    #[derive(Debug)]
+    struct Shaped {
+        rows: usize,
+        ops: Vec<multilinear::records::KeccakRndOp>,
+    }
+
+    impl multilinear::records::TableRecords for Shaped {
+        fn rows(&self) -> usize {
+            self.rows
+        }
+
+        fn cols(&self) -> usize {
+            3
+        }
+
+        fn fill(&self) -> multilinear::records::RecordsFill<'_> {
+            multilinear::records::RecordsFill::KeccakRnd {
+                ops: &self.ops,
+                skip: 0,
+            }
+        }
+
+        fn host_fill(&self) -> Option<NarrowColumns> {
+            None
+        }
+    }
+
+    fn records(rows: usize, seed: u64) -> multilinear::records::Records {
+        let ops = (0..4)
+            .map(|k| multilinear::records::KeccakRndOp {
+                timestamp: seed + k,
+                input: [seed; 25],
+            })
+            .collect();
+        multilinear::records::Records(Arc::new(Shaped { rows, ops }))
+    }
+
+    /// ★ A table dropped as its records takes back the packed columns made
+    /// from records with the same digest, of the dropped table's rows and
+    /// columns, and only through the checked deposit: records with another
+    /// digest, columns of another shape, a plain deposit, or a checked one on
+    /// a slot of packed columns all fail their slot. The window reserves the
+    /// records' bytes until the deposit, then the deposit's.
+    #[test]
+    fn a_records_slot_takes_columns_checked_by_their_records() {
+        let (window, _producer) = RegenWindow::new(1 << 30);
+        let held = records(100, 7);
+        let columns = packed(100, 1);
+        let slot = window.slot_for_records(&held, 0);
+        assert!(slot.is_records());
+        assert_eq!(slot.digest(), held.digest());
+        assert_eq!(
+            (slot.rows(), slot.cols(), slot.len()),
+            (100, 3, held.bytes())
+        );
+        slot.deposit_checked(columns.clone(), records(100, 7).digest())
+            .expect("the same records' columns");
+        assert_eq!(window.parked(), columns.data().len() as u64);
+        assert_eq!(slot.take().expect("taken"), columns);
+        assert_eq!(window.parked(), 0);
+        for (what, deposit) in [
+            ("other records", (packed(100, 1), records(100, 8).digest())),
+            ("another height", (packed(99, 1), held.digest())),
+        ] {
+            let slot = window.slot_for_records(&held, 1);
+            assert_eq!(
+                slot.deposit_checked(deposit.0, deposit.1),
+                Err(RegenError::Mismatch),
+                "{what}"
+            );
+            assert_eq!(slot.take(), Err(RegenError::Mismatch), "{what}");
+        }
+        let slot = window.slot_for_records(&held, 2);
+        assert_eq!(
+            slot.deposit(packed(100, 1)),
+            Err(RegenError::Mismatch),
+            "a plain deposit"
+        );
+        let plain = window.slot(&columns, 3);
+        assert!(!plain.is_records());
+        assert_eq!(
+            plain.deposit_checked(columns.clone(), held.digest()),
+            Err(RegenError::Mismatch),
+            "a checked deposit on packed columns' slot"
         );
     }
 }
