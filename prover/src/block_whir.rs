@@ -3641,7 +3641,6 @@ struct RestLaid<'a> {
 /// A reads none of them). `sink`: send each table to the packer as it is laid
 /// out, the first in AIR order first, and hand back none.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn lay_out_rest<'a>(
     mut traces: Box<Traces>,
     program: &Elf,

@@ -405,6 +405,22 @@ fn rebuild(rows: &[Vec<FieldElement<GoldilocksField>>], width: usize) -> Table {
     TraceTable::new_main(rows.iter().flatten().copied().collect(), width, 1)
 }
 
+/// The whole-run BITWISE without the lookups of the KECCAK_RND rows `split`
+/// leaves out, and how many rows that is. A padding row sends KECCAK_RND's byte
+/// checks as `ARE_BYTES[0, 0]` (`keccak_rnd::ARE_BYTES_PER_ROW` a row, main's
+/// multiplicity fix), and the whole run counts those of its whole padded table.
+fn split_bitwise(t: &Traces, split: &[Table]) -> (Table, usize) {
+    use crate::tables::{bitwise, keccak_rnd};
+    let height = |tables: &[Table]| tables.iter().map(|t| t.main_table.height).sum::<usize>();
+    let left_out = height(&t.keccak_rnds) - height(split);
+    let mut table = t.bitwise.clone();
+    let (row, col) = (bitwise::row_index(0, 0, 0), bitwise::cols::MU_ARE_BYTES);
+    let count = table.main_table.get_row(row)[col];
+    let lookups = FieldElement::from((left_out * keccak_rnd::ARE_BYTES_PER_ROW) as u64);
+    table.main_table.set(row, col, count - lookups);
+    (table, left_out)
+}
+
 /// A slice of KECCAK_RND rows built from the ops that reach it is that slice of
 /// the whole table, wherever the slice cuts an op's 24 rows.
 #[test]
@@ -440,16 +456,20 @@ fn keccak_rnd_rows_are_slices_of_the_whole_table() {
 }
 
 /// ★ With KECCAK_RND cut into chunks, the windowed build streams them and is the
-/// whole-run build with KECCAK_RND split the same way, table for table; at
-/// one-cycle windows it did stream some.
+/// whole-run build with KECCAK_RND split the same way, table for table, BITWISE
+/// without the left-out rows' lookups ([`split_bitwise`]); at one-cycle windows
+/// it did stream some.
 #[test]
 fn windowed_streams_keccak_rnd_as_the_split_whole_run_table() {
     let max_rows = MaxRowsConfig::small();
+    let mut left_out_any = false;
     for name in ["test_keccak", "test_keccak_multi"] {
         let (program, logs) = run(name);
         let mut reference = whole(&program, &logs, &max_rows);
         for per in [32usize, 64, 128] {
             let split = split_keccak_rnd(&reference, per);
+            let (bitwise, left_out) = split_bitwise(&reference, &split);
+            left_out_any |= left_out > 0;
             for window in [1, 7, 33] {
                 let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows)
                     .expect("the builder")
@@ -481,11 +501,17 @@ fn windowed_streams_keccak_rnd_as_the_split_whole_run_table() {
                 // Every other table is the whole-run one.
                 let keccak =
                     std::mem::replace(&mut reference.keccak_rnds, traces.keccak_rnds.clone());
+                let whole_bitwise = std::mem::replace(&mut reference.bitwise, bitwise.clone());
                 same_traces(&reference, &traces);
                 reference.keccak_rnds = keccak;
+                reference.bitwise = whole_bitwise;
             }
         }
     }
+    assert!(
+        left_out_any || padding() == CutPadding::WholeRun,
+        "no split left a KECCAK_RND table out"
+    );
 }
 
 /// With KECCAK, ECSM, ECDAS and COPY built as their cuts at the finish, the
@@ -556,15 +582,19 @@ fn windowed_builds_the_cut_tables_as_the_split_whole_run_tables() {
 
 /// With KECCAK_RND built as its tables at the finish alone, the windowed build
 /// hands none out and is the whole-run build with KECCAK_RND split the same
-/// way, table for table — the split's copy without the copy.
+/// way, table for table, BITWISE without the left-out rows' lookups
+/// ([`split_bitwise`]) — the split's copy without the copy.
 #[test]
 fn windowed_builds_keccak_rnd_at_finish_as_the_split_whole_run_table() {
     let max_rows = MaxRowsConfig::small();
+    let mut left_out_any = false;
     for name in ["test_keccak", "test_keccak_multi"] {
         let (program, logs) = run(name);
         let mut reference = whole(&program, &logs, &max_rows);
         for per in [32usize, 64, 128] {
             let split = split_keccak_rnd(&reference, per);
+            let (bitwise, left_out) = split_bitwise(&reference, &split);
+            left_out_any |= left_out > 0;
             for window in [1, 33] {
                 let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows)
                     .expect("the builder")
@@ -589,11 +619,17 @@ fn windowed_builds_keccak_rnd_at_finish_as_the_split_whole_run_table() {
                 );
                 let keccak =
                     std::mem::replace(&mut reference.keccak_rnds, traces.keccak_rnds.clone());
+                let whole_bitwise = std::mem::replace(&mut reference.bitwise, bitwise.clone());
                 same_traces(&reference, &traces);
                 reference.keccak_rnds = keccak;
+                reference.bitwise = whole_bitwise;
             }
         }
     }
+    assert!(
+        left_out_any || padding() == CutPadding::WholeRun,
+        "no split left a KECCAK_RND table out"
+    );
     assert!(
         WindowedTraceBuilder::new(&run("test_keccak").0, &[], &max_rows)
             .expect("the builder")
