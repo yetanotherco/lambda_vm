@@ -5014,7 +5014,7 @@ fn prove_streamed(
                             std::sync::Arc::clone(&plan.window),
                             producer,
                             plan.dropped,
-                            regen::regen_generators(),
+                            regen::rest_generators(),
                             deviations.rest_faults,
                         ))
                     }

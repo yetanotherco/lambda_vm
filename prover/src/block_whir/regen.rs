@@ -398,10 +398,30 @@ pub(crate) fn regen_generators() -> usize {
 }
 
 fn parse_generators(value: Option<&str>) -> usize {
+    parse_count(value).unwrap_or(REGEN_GENERATORS)
+}
+
+/// Generator threads of the rest's regenerator alone:
+/// `LAMBDA_VM_BLOCK_REGEN_REST_GENERATORS` (1..=16), unset
+/// [`regen_generators`]'s. The streamed chunks' regenerator runs beside phase
+/// A's finish, the rest's only beside phase B, so the two can be sized apart.
+pub(crate) fn rest_generators() -> usize {
+    parse_rest_generators(
+        std::env::var("LAMBDA_VM_BLOCK_REGEN_REST_GENERATORS")
+            .ok()
+            .as_deref(),
+        regen_generators(),
+    )
+}
+
+fn parse_rest_generators(value: Option<&str>, shared: usize) -> usize {
+    parse_count(value).unwrap_or(shared)
+}
+
+fn parse_count(value: Option<&str>) -> Option<usize> {
     value
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| (1..=16).contains(n))
-        .unwrap_or(REGEN_GENERATORS)
 }
 
 /// Packed columns' shape and digest ([`stark::regen::digest_of`], the spill
@@ -2909,6 +2929,22 @@ mod tests {
         for bad in ["", "0", "17", "-1", "many"] {
             assert_eq!(parse_generators(Some(bad)), REGEN_GENERATORS, "{bad:?}");
         }
+    }
+
+    /// `LAMBDA_VM_BLOCK_REGEN_REST_GENERATORS`: a count from 1 to 16 for the
+    /// rest's regenerator alone; unset or unreadable, the shared count, so
+    /// nothing changes until it is set.
+    #[test]
+    fn the_rest_generators_default_to_the_shared_count() {
+        for shared in [1, 3, REGEN_GENERATORS, 16] {
+            assert_eq!(parse_rest_generators(None, shared), shared);
+            for bad in ["", "0", "17", "-1", "many"] {
+                assert_eq!(parse_rest_generators(Some(bad), shared), shared, "{bad:?}");
+            }
+        }
+        assert_eq!(parse_rest_generators(Some("4"), 3), 4);
+        assert_eq!(parse_rest_generators(Some(" 5 "), 6), 5);
+        assert_eq!(parse_rest_generators(Some("16"), 3), 16);
     }
 
     /// While the finish runs the early window keeps its frontier whatever the
