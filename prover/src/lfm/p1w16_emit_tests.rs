@@ -206,13 +206,12 @@ fn the_rotated_hints_walk_a_child_order_path_to_merkle4s_root() {
         let leaves: Vec<[FE; 4]> = (0..n).map(|i| digest(depth as u64 + 31, i)).collect();
         let tree = Merkle4::new(&leaves).expect("non-empty");
         let root = tree.root().to_vec();
-        for index in 0..n {
+        for (index, &leaf) in leaves.iter().enumerate() {
             let path = child_order_path(depth, &tree.path(index).expect("leaf"));
             assert_eq!(path.len(), path_hints(depth));
-            let (program, got) =
-                rotated_walk(depth, index, leaves[index], path.clone(), |b, a, bits| {
-                    hint_path_rotated(b, a, 0, bits)
-                });
+            let (program, got) = rotated_walk(depth, index, leaf, path.clone(), |b, a, bits| {
+                hint_path_rotated(b, a, 0, bits)
+            });
             assert_eq!(got, root, "depth {depth} index {index}");
             assert_eq!(
                 count(&program, |i| matches!(
@@ -231,7 +230,7 @@ fn the_rotated_hints_walk_a_child_order_path_to_merkle4s_root() {
             );
             // Swapped: each hint reads `alt` on a clear bit and `index` on a set
             // one.
-            let (_, swapped) = rotated_walk(depth, index, leaves[index], path, |b, a, bits| {
+            let (_, swapped) = rotated_walk(depth, index, leaf, path, |b, a, bits| {
                 let mut hints = Vec::new();
                 let mut w = 0u32;
                 for pair in bits.chunks(2) {

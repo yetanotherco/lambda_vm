@@ -197,7 +197,7 @@ fn a_lean_chain_refuses_a_tampered_tail_block() {
         let shape = lean(&f.shape);
         let program = p1_chain_program(&shape);
         let honest = arena_at(&f, &f.proof, &shape).expect("laid out");
-        assert!(execute(&program, &[honest.clone()], &SOCKET).is_ok());
+        assert!(execute(&program, std::slice::from_ref(&honest), &SOCKET).is_ok());
         for r in tails(&shape) {
             let at = tail_block_at(&shape, r);
             for leaf in [0, shape.current_leaves(r) - 1] {
@@ -237,7 +237,7 @@ fn a_tail_compare_at_the_wrong_slot_refuses_an_honest_proof() {
         let arena = arena_at(&f, &f.proof, &shape).expect("laid out");
         let faulted = tail_faults::with_slot_off(|| p1_chain_program(&shape));
         assert!(
-            execute(&faulted, &[arena.clone()], &SOCKET).is_err(),
+            execute(&faulted, std::slice::from_ref(&arena), &SOCKET).is_err(),
             "S={num_vars}: the neighbouring slot must be refused"
         );
         assert!(execute(&p1_chain_program(&shape), &[arena], &SOCKET).is_ok());
@@ -382,7 +382,7 @@ fn a_lean_chain_refuses_a_round_zero_lane_off() {
         let shape = lean(&f.shape);
         let program = p1_chain_program(&shape);
         let honest = arena_at(&f, &f.proof, &shape).expect("laid out");
-        assert!(execute(&program, &[honest.clone()], &SOCKET).is_ok());
+        assert!(execute(&program, std::slice::from_ref(&honest), &SOCKET).is_ok());
         let words = shape.round0_block_words(1usize << shape.schedule[0]);
         for q in [0, shape.num_queries - 1] {
             for word in [0, words - 1] {
@@ -452,7 +452,7 @@ fn a_lean_chain_refuses_a_path_word_off() {
         tampered += 1;
         let program = p1_chain_program(&shape);
         let honest = arena_at(&f, &f.proof, &shape).expect("laid out");
-        assert!(execute(&program, &[honest.clone()], &SOCKET).is_ok());
+        assert!(execute(&program, std::slice::from_ref(&honest), &SOCKET).is_ok());
         let words = shape.round0_block_words(1usize << shape.schedule[0]);
         let path = round0_block_at(&shape, 0) + words;
         for at in [path, path + shape.current_path(0) - 1] {
