@@ -286,6 +286,12 @@ pub(crate) fn lfm_fill_executed(
 }
 
 impl LfmFilled {
+    /// The filled traces, for a caller that warms their domains before the
+    /// prove ([`super::domain_warm`]).
+    pub(crate) fn traces(&self) -> &LfmTraces {
+        &self.traces
+    }
+
     /// The card half of [`lfm_prove_with_residency`]: prove the filled traces
     /// against `artifacts`, which must be built for the hasher they were
     /// filled with — a mismatch is refused ([`LfmProveError::HasherMismatch`])
@@ -318,6 +324,11 @@ impl LfmFilled {
             exec_split,
         } = self;
         same_hasher(artifacts.hasher, hasher)?;
+        // The domains and twiddles this proof's tables need, built before it
+        // takes the card rather than under it (`LFM_WARM_DOMAINS`).
+        if super::domain_warm::on() {
+            super::domain_warm::warm(&traces, options);
+        }
         let t = Instant::now();
         let waited_before = super::device_permit::waited_secs();
         let proof = prove_traces_under::<Fam>(

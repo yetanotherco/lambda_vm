@@ -1951,7 +1951,17 @@ pub fn prove_whir_block_tree(
                                     program.program.hasher(<BlockFamily as ProofFamily>::SOCKET),
                                 )
                                 .map_err(|e| format!("early leaf {k}: {e:?}"))?;
-                                Ok((filled, arena, started, t.elapsed().as_secs_f64()))
+                                let secs = t.elapsed().as_secs_f64();
+                                // Its tables' domains and twiddles, warm before
+                                // the tree's first card hold (`LFM_WARM_DOMAINS`).
+                                if super::domain_warm::on() {
+                                    super::domain_warm::warm(
+                                        filled.traces(),
+                                        &super::proof::aggregation_wrap_options(),
+                                    );
+                                    super::domain_warm::note_early(t0.elapsed().as_secs_f64());
+                                }
+                                Ok((filled, arena, started, secs))
                             });
                             early = Some(EarlyLeaf {
                                 leaf: k,

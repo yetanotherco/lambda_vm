@@ -31,6 +31,7 @@ pub mod compiler;
 pub mod constraints;
 pub mod deep;
 pub mod device_permit;
+pub mod domain_warm;
 pub mod edsl;
 pub mod epoch;
 pub mod epoch_verify;

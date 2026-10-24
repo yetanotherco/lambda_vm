@@ -2508,6 +2508,10 @@ fn the_whir_block_tree_on_a_real_block() {
         }
         None => println!("W3 EARLY LEAF: none (W3_LEAF_DURING_PHASE_B {early_on})"),
     }
+    // The recursion proofs' domains and twiddles built before their card holds
+    // (`LFM_WARM_DOMAINS`): how many lengths, how long, and when the early
+    // leaf's were warm on the tree's clock.
+    println!("W3 WARM DOMAINS: {}", super::domain_warm::line());
     // Off the clock: what the device declined, and the card's peaks as the
     // ledger and the memory pool count them (not total − free, which reads a
     // retaining pool's blocks as used).
