@@ -21,7 +21,11 @@
 /// executor evaluates where `src`, `dst` and `count` are all known. Today a row's
 /// width follows from the remaining count alone (eight bytes, or one for the last
 /// seven), so the CLI report just sums the carried counts.
+///
+/// `#[repr(C)]`: five `u64`s in this order and no padding, so a window's logs
+/// can cross to a card as they lie (the prover's card fill of the CPU table).
 #[derive(Debug, Clone)]
+#[repr(C)]
 pub struct Log {
     /// PC before instruction execution (use this to look up the instruction)
     pub current_pc: u64,
@@ -37,3 +41,13 @@ pub struct Log {
     /// For ECALL: see the per-syscall table above.
     pub dst_val: u64,
 }
+
+const _: () = {
+    assert!(std::mem::size_of::<Log>() == 40);
+    assert!(std::mem::align_of::<Log>() == 8);
+    assert!(std::mem::offset_of!(Log, current_pc) == 0);
+    assert!(std::mem::offset_of!(Log, next_pc) == 8);
+    assert!(std::mem::offset_of!(Log, src1_val) == 16);
+    assert!(std::mem::offset_of!(Log, src2_val) == 24);
+    assert!(std::mem::offset_of!(Log, dst_val) == 32);
+};

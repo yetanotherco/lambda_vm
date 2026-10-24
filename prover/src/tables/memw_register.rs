@@ -104,19 +104,40 @@ pub mod cols {
 /// - `old0/old1` = `old[0]`/`old[1]`
 /// - `old_ts_lo` = `old_timestamp[0] & 0xFFFF_FFFF` (the two words share old_timestamp,
 ///   enforced by `is_register_op`; the upper limb is TIMESTAMP_1 = timestamp>>32)
+///
+/// `#[repr(C)]`, its fields in this order with the one spare byte a named
+/// zero, so its 32 bytes are all set and a chunk's rows can cross to a card as
+/// they lie (`multilinear::records::RegisterRow`, the card's MEMW_R fill).
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 pub(crate) struct RegRow {
-    /// Register index 0..=255 (`base_address / 2`); u16 keeps the struct at
-    /// 32 bytes — it is the largest persisted array of the walk.
-    address: u16,
     timestamp: u64,
     val0: u32,
     val1: u32,
     old0: u32,
     old1: u32,
     old_ts_lo: u32,
+    /// Register index 0..=255 (`base_address / 2`); u16 keeps the struct at
+    /// 32 bytes — it is the largest persisted array of the walk.
+    address: u16,
     is_read: bool,
+    /// Always 0.
+    pad: u8,
 }
+
+const _: () = {
+    assert!(std::mem::size_of::<RegRow>() == 32);
+    assert!(std::mem::align_of::<RegRow>() == 8);
+    assert!(std::mem::offset_of!(RegRow, timestamp) == 0);
+    assert!(std::mem::offset_of!(RegRow, val0) == 8);
+    assert!(std::mem::offset_of!(RegRow, val1) == 12);
+    assert!(std::mem::offset_of!(RegRow, old0) == 16);
+    assert!(std::mem::offset_of!(RegRow, old1) == 20);
+    assert!(std::mem::offset_of!(RegRow, old_ts_lo) == 24);
+    assert!(std::mem::offset_of!(RegRow, address) == 28);
+    assert!(std::mem::offset_of!(RegRow, is_read) == 30);
+    assert!(std::mem::offset_of!(RegRow, pad) == 31);
+};
 
 impl RegRow {
     /// Build a `RegRow` from pre-decomposed register-access fields.
@@ -156,6 +177,7 @@ impl RegRow {
             old1,
             old_ts_lo: (old_ts & 0xFFFF_FFFF) as u32,
             is_read,
+            pad: 0,
         }
     }
 
