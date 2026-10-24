@@ -31,7 +31,9 @@
 //! so its rows stand even if the real block's capture fails. Then come CPU
 //! and MEMW_R, their real chunks before their synthetic sets, so the host
 //! fill's widths are learned from real rows as in a prove. A CPU fill with
-//! one log at a pc no DECODE row holds must be refused (`CARD FILL REFUSAL`).
+//! one log at a pc no DECODE row holds must be refused (`CARD FILL REFUSAL`),
+//! and on every CPU case a fault of column 0 (the table's preprocessed
+//! timestamp) alone on the card must be flagged there alone (`col0_fault`).
 //! The loaded cases repeat the first KECCAK_RND set's and the real chunks'
 //! uploads beside four threads copying 1 GiB buffers (a walker's memory
 //! traffic), as `CARD FILL LOADED` lines. `CARD FILL VERDICT` closes the run.
@@ -263,10 +265,12 @@ impl HostLoad {
 }
 
 /// What a case found: its words that differ (today's against the host, the
-/// card's against the host, the card's against today's) and its mutant's.
+/// card's against the host, the card's against today's), its mutant's, and
+/// for CPU whether a fault of column 0 alone was flagged there alone.
 struct Found {
     mismatches: usize,
     mutant: usize,
+    col0: Option<bool>,
 }
 
 /// A card buffer of `cells` words, each `poison` (so a cell no kernel writes
@@ -367,6 +371,7 @@ fn run_case(case: &Case, stream: &Arc<CudaStream>, poison: &[u64], load: bool) -
         return Found {
             mismatches: 0,
             mutant: 1,
+            col0: None,
         };
     }
 
@@ -381,6 +386,18 @@ fn run_case(case: &Case, stream: &Arc<CudaStream>, poison: &[u64], load: bool) -
     let b_host = inputs::mismatches(&want, &b, case.rows);
     let b_a = inputs::mismatches(&a, &b, case.rows);
     drop((a, b));
+
+    // CPU's column 0 (the preprocessed TIMESTAMP) faulted alone on the card,
+    // one row: the comparison flags that word and no other.
+    let col0 = (case.family == "CPU").then(|| {
+        let row = 1;
+        let bad = want[row] ^ 4;
+        stream
+            .memcpy_htod(&[bad], &mut card.slice_mut(row..row + 1))
+            .expect("fault column 0");
+        let m = inputs::mismatches(&want, &download(stream, &card), case.rows);
+        m.count == 1 && m.first == Some((0, row, want[row], bad))
+    });
 
     // The mutant: one record changed must show.
     repoison(stream, poison, &mut card);
@@ -408,6 +425,9 @@ fn run_case(case: &Case, stream: &Arc<CudaStream>, poison: &[u64], load: bool) -
     if let Some(bytes) = case.records.minimal_bytes() {
         line += &format!(" minimal_bytes={bytes}");
     }
+    if let Some(flagged) = col0 {
+        line += &format!(" col0_fault={}", if flagged { "ok" } else { "FAIL" });
+    }
     if case.timed {
         let (mut a, mut b) = (Reps::default(), Reps::default());
         for rep in 0..WARMUPS + REPS {
@@ -434,6 +454,7 @@ fn run_case(case: &Case, stream: &Arc<CudaStream>, poison: &[u64], load: bool) -
     Found {
         mismatches: a_host.count + b_host.count + b_a.count,
         mutant: mutant.count,
+        col0,
     }
 }
 
@@ -745,14 +766,24 @@ fn the_card_fills_the_streamed_tables_as_the_host_does() {
 
     let found = found.into_inner();
     let (mismatches, blind) = tally(&found);
+    let col0_missed: Vec<&String> = found
+        .iter()
+        .filter(|(_, f)| f.col0 == Some(false))
+        .map(|(name, _)| name)
+        .collect();
     println!(
-        "CARD FILL VERDICT: identity={} mismatches={mismatches} mutants={} refusal={} cases={}",
+        "CARD FILL VERDICT: identity={} mismatches={mismatches} mutants={} refusal={} col0={} cases={}",
         if mismatches == 0 { "ok" } else { "FAIL" },
         if blind.is_empty() { "ok" } else { "FAIL" },
         if refused { "ok" } else { "FAIL" },
+        if col0_missed.is_empty() { "ok" } else { "FAIL" },
         found.len()
     );
     assert_eq!(mismatches, 0, "a card fill differs from the host's");
     assert!(blind.is_empty(), "mutants the comparison missed: {blind:?}");
     assert!(refused, "a log with no DECODE row was filled");
+    assert!(
+        col0_missed.is_empty(),
+        "a fault of CPU column 0 not flagged there alone: {col0_missed:?}"
+    );
 }
