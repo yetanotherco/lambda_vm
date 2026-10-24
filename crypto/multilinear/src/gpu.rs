@@ -4399,6 +4399,9 @@ struct RecordsUp<'a> {
     registers: Vec<&'a [math_cuda::fill::RegRowC]>,
     aligned: Vec<&'a [math_cuda::fill::AlignedRowC]>,
     loads: Vec<&'a [math_cuda::fill::LoadOpC]>,
+    stores: Vec<&'a [math_cuda::fill::StoreOpC]>,
+    shifts: Vec<&'a [math_cuda::fill::ShiftOpC]>,
+    memws: Vec<&'a [math_cuda::fill::MemwOpC]>,
 }
 
 #[cfg(feature = "cuda")]
@@ -4406,8 +4409,10 @@ impl<'a> RecordsUp<'a> {
     /// `records`' pieces as the card's structs; `None` when a CPU table's
     /// DECODE rows cannot go up.
     fn of(records: &'a crate::records::Records) -> Option<Self> {
-        use crate::records::{AlignedRow, CpuLog, LoadOp, RecordsFill, RegisterRow};
-        use math_cuda::fill::{AlignedRowC, LoadOpC, LogC, RegRowC};
+        use crate::records::{
+            AlignedRow, CpuLog, LoadOp, MemwOp, RecordsFill, RegisterRow, ShiftOp, StoreOp,
+        };
+        use math_cuda::fill::{AlignedRowC, LoadOpC, LogC, MemwOpC, RegRowC, ShiftOpC, StoreOpC};
         const _: () = {
             use std::mem::{align_of, offset_of, size_of};
             assert!(size_of::<CpuLog>() == size_of::<LogC>());
@@ -4431,6 +4436,24 @@ impl<'a> RecordsUp<'a> {
             assert!(offset_of!(LoadOp, width) == offset_of!(LoadOpC, width));
             assert!(offset_of!(LoadOp, signed) == offset_of!(LoadOpC, is_signed));
             assert!(offset_of!(LoadOp, res) == offset_of!(LoadOpC, res));
+            assert!(size_of::<StoreOp>() == size_of::<StoreOpC>());
+            assert!(align_of::<StoreOp>() == align_of::<StoreOpC>());
+            assert!(offset_of!(StoreOp, value) == offset_of!(StoreOpC, value));
+            assert!(offset_of!(StoreOp, write2) == offset_of!(StoreOpC, write2));
+            assert!(offset_of!(StoreOp, write8) == offset_of!(StoreOpC, write8));
+            assert!(size_of::<ShiftOp>() == size_of::<ShiftOpC>());
+            assert!(align_of::<ShiftOp>() == align_of::<ShiftOpC>());
+            assert!(offset_of!(ShiftOp, in_halves) == offset_of!(ShiftOpC, in_halves));
+            assert!(offset_of!(ShiftOp, shift) == offset_of!(ShiftOpC, shift));
+            assert!(offset_of!(ShiftOp, signed) == offset_of!(ShiftOpC, is_signed));
+            assert!(offset_of!(ShiftOp, word_instr) == offset_of!(ShiftOpC, word_instr));
+            assert!(size_of::<MemwOp>() == size_of::<MemwOpC>());
+            assert!(align_of::<MemwOp>() == align_of::<MemwOpC>());
+            assert!(offset_of!(MemwOp, old_timestamp) == offset_of!(MemwOpC, old_timestamp));
+            assert!(offset_of!(MemwOp, value) == offset_of!(MemwOpC, value));
+            assert!(offset_of!(MemwOp, old) == offset_of!(MemwOpC, old));
+            assert!(offset_of!(MemwOp, is_register) == offset_of!(MemwOpC, is_register));
+            assert!(offset_of!(MemwOp, is_read) == offset_of!(MemwOpC, is_read));
         };
         /// `pieces` read as the card's struct `C`.
         ///
@@ -4453,6 +4476,9 @@ impl<'a> RecordsUp<'a> {
             registers: Vec::new(),
             aligned: Vec::new(),
             loads: Vec::new(),
+            stores: Vec::new(),
+            shifts: Vec::new(),
+            memws: Vec::new(),
         };
         match &fill {
             RecordsFill::KeccakRnd { .. } => {}
@@ -4469,6 +4495,9 @@ impl<'a> RecordsUp<'a> {
                 up.aligned = unsafe { cast::<AlignedRow, AlignedRowC>(rows) }
             }
             RecordsFill::Load { ops } => up.loads = unsafe { cast::<LoadOp, LoadOpC>(ops) },
+            RecordsFill::Store { ops } => up.stores = unsafe { cast::<StoreOp, StoreOpC>(ops) },
+            RecordsFill::Shift { ops } => up.shifts = unsafe { cast::<ShiftOp, ShiftOpC>(ops) },
+            RecordsFill::Memw { ops } => up.memws = unsafe { cast::<MemwOp, MemwOpC>(ops) },
         }
         up.fill = fill;
         Some(up)
@@ -4516,6 +4545,18 @@ fn records_input<'a>(up: &'a RecordsUp<'a>) -> Option<math_cuda::fill::RecordsIn
         },
         RecordsFill::Load { .. } => RecordsInput::Load {
             records: &up.loads,
+            rows: up.rows,
+        },
+        RecordsFill::Store { .. } => RecordsInput::Store {
+            records: &up.stores,
+            rows: up.rows,
+        },
+        RecordsFill::Shift { .. } => RecordsInput::Shift {
+            records: &up.shifts,
+            rows: up.rows,
+        },
+        RecordsFill::Memw { .. } => RecordsInput::Memw {
+            records: &up.memws,
             rows: up.rows,
         },
     };

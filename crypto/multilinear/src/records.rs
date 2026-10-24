@@ -127,6 +127,49 @@ pub struct LoadOp {
     pub res: [u8; 8],
 }
 
+/// One STORE op as its fill reads it (the prover's store op, field for field):
+/// the base address, the timestamp, the value, and the width flags (0 or 1).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreOp {
+    pub base_address: u64,
+    pub timestamp: u64,
+    pub value: u64,
+    pub write2: u8,
+    pub write4: u8,
+    pub write8: u8,
+}
+
+/// One SHIFT op as its fill reads it (the prover's shift op, field for
+/// field): the full shift amount, the input as four 16-bit halves, the
+/// amount's low byte, and flags 0 or 1.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShiftOp {
+    pub shift_amount: u64,
+    pub in_halves: [u16; 4],
+    pub shift: u8,
+    pub direction: u8,
+    pub signed: u8,
+    pub word_instr: u8,
+}
+
+/// One MEMW op as its fill reads it (the prover's MEMW op, field for field):
+/// the base address, the timestamp, the eight old timestamps, the eight value
+/// and old elements, and the flags and width.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemwOp {
+    pub base_address: u64,
+    pub timestamp: u64,
+    pub old_timestamp: [u64; 8],
+    pub value: [u32; 8],
+    pub old: [u32; 8],
+    pub is_register: u8,
+    pub width: u8,
+    pub is_read: u8,
+}
+
 /// One DECODE row as CPU's fill reads it: the pc, the extended immediate,
 /// then the decoded fields as bytes (flags 0 or 1).
 #[repr(C)]
@@ -182,6 +225,12 @@ const _: () = {
     assert!(size_of::<LoadOp>() == 32);
     assert!(offset_of!(LoadOp, signed) == 17);
     assert!(offset_of!(LoadOp, res) == 18);
+    assert!(size_of::<StoreOp>() == 32);
+    assert!(offset_of!(StoreOp, write8) == 26);
+    assert!(size_of::<ShiftOp>() == 24);
+    assert!(offset_of!(ShiftOp, word_instr) == 19);
+    assert!(size_of::<MemwOp>() == 152);
+    assert!(offset_of!(MemwOp, is_read) == 146);
 };
 
 /// A program's DECODE rows as CPU's fill reads them, shared by every CPU
@@ -321,6 +370,12 @@ pub enum RecordsFill<'a> {
     MemwA { rows: Vec<&'a [AlignedRow]> },
     /// LOAD's rows: one an op of the pieces in order, then zero rows.
     Load { ops: Vec<&'a [LoadOp]> },
+    /// STORE's rows: one an op of the pieces in order, then zero rows.
+    Store { ops: Vec<&'a [StoreOp]> },
+    /// SHIFT's rows: one an op of the pieces in order, then padding rows.
+    Shift { ops: Vec<&'a [ShiftOp]> },
+    /// MEMW's rows: one an op of the pieces in order, then zero rows.
+    Memw { ops: Vec<&'a [MemwOp]> },
 }
 
 impl RecordsFill<'_> {
@@ -333,6 +388,9 @@ impl RecordsFill<'_> {
             Self::MemwR { rows } => rows.iter().map(|p| std::mem::size_of_val(*p)).sum(),
             Self::MemwA { rows } => rows.iter().map(|p| std::mem::size_of_val(*p)).sum(),
             Self::Load { ops } => ops.iter().map(|p| std::mem::size_of_val(*p)).sum(),
+            Self::Store { ops } => ops.iter().map(|p| std::mem::size_of_val(*p)).sum(),
+            Self::Shift { ops } => ops.iter().map(|p| std::mem::size_of_val(*p)).sum(),
+            Self::Memw { ops } => ops.iter().map(|p| std::mem::size_of_val(*p)).sum(),
         }
     }
 
@@ -344,6 +402,9 @@ impl RecordsFill<'_> {
             Self::MemwR { rows } => rows.iter().map(|p| p.len()).sum(),
             Self::MemwA { rows } => rows.iter().map(|p| p.len()).sum(),
             Self::Load { ops } => ops.iter().map(|p| p.len()).sum(),
+            Self::Store { ops } => ops.iter().map(|p| p.len()).sum(),
+            Self::Shift { ops } => ops.iter().map(|p| p.len()).sum(),
+            Self::Memw { ops } => ops.iter().map(|p| p.len()).sum(),
         }
     }
 
@@ -415,6 +476,55 @@ impl RecordsFill<'_> {
                     each(op.timestamp);
                     each(u64::from(op.width) | u64::from(op.signed) << 8);
                     each(u64::from_le_bytes(op.res));
+                }
+            }
+            Self::Store { ops } => {
+                each(5);
+                for op in ops.iter().flat_map(|piece| piece.iter()) {
+                    each(op.base_address);
+                    each(op.timestamp);
+                    each(op.value);
+                    each(
+                        u64::from(op.write2)
+                            | u64::from(op.write4) << 8
+                            | u64::from(op.write8) << 16,
+                    );
+                }
+            }
+            Self::Shift { ops } => {
+                each(6);
+                for op in ops.iter().flat_map(|piece| piece.iter()) {
+                    each(op.shift_amount);
+                    each(
+                        op.in_halves
+                            .iter()
+                            .enumerate()
+                            .fold(0, |w, (i, &h)| w | u64::from(h) << (16 * i)),
+                    );
+                    each(
+                        u64::from(op.shift)
+                            | u64::from(op.direction) << 8
+                            | u64::from(op.signed) << 16
+                            | u64::from(op.word_instr) << 24,
+                    );
+                }
+            }
+            Self::Memw { ops } => {
+                each(7);
+                for op in ops.iter().flat_map(|piece| piece.iter()) {
+                    each(op.base_address);
+                    each(op.timestamp);
+                    op.old_timestamp.iter().for_each(|&t| each(t));
+                    for pair in [&op.value, &op.old] {
+                        for two in pair.chunks_exact(2) {
+                            each(u64::from(two[0]) | u64::from(two[1]) << 32);
+                        }
+                    }
+                    each(
+                        u64::from(op.is_register)
+                            | u64::from(op.width) << 8
+                            | u64::from(op.is_read) << 16,
+                    );
                 }
             }
         }
@@ -674,13 +784,16 @@ mod tests {
         assert!(DecodeRecords::new(entries, past).is_none());
     }
 
-    /// CPU, MEMW_R, MEMW_A or LOAD records in pieces.
+    /// CPU, MEMW_R or a row family's records in pieces.
     #[derive(Debug)]
     enum Pieces {
         Cpu(Vec<Vec<CpuLog>>, u64, Arc<DecodeRecords>),
         MemwR(Vec<Vec<RegisterRow>>),
         MemwA(Vec<Vec<AlignedRow>>),
         Load(Vec<Vec<LoadOp>>),
+        Store(Vec<Vec<StoreOp>>),
+        Shift(Vec<Vec<ShiftOp>>),
+        Memw(Vec<Vec<MemwOp>>),
     }
 
     impl TableRecords for Pieces {
@@ -694,6 +807,9 @@ mod tests {
                 Self::MemwR(_) => 10,
                 Self::MemwA(_) => 29,
                 Self::Load(_) => 18,
+                Self::Store(_) => 16,
+                Self::Shift(_) => 29,
+                Self::Memw(_) => 49,
             }
         }
 
@@ -711,6 +827,15 @@ mod tests {
                     rows: pieces.iter().map(Vec::as_slice).collect(),
                 },
                 Self::Load(pieces) => RecordsFill::Load {
+                    ops: pieces.iter().map(Vec::as_slice).collect(),
+                },
+                Self::Store(pieces) => RecordsFill::Store {
+                    ops: pieces.iter().map(Vec::as_slice).collect(),
+                },
+                Self::Shift(pieces) => RecordsFill::Shift {
+                    ops: pieces.iter().map(Vec::as_slice).collect(),
+                },
+                Self::Memw(pieces) => RecordsFill::Memw {
                     ops: pieces.iter().map(Vec::as_slice).collect(),
                 },
             }
@@ -870,6 +995,139 @@ mod tests {
                 assert_ne!(load(cut(&moved, &[1])), whole, "op {at}, field {field}");
             }
         }
+    }
+
+    /// ★ A STORE, SHIFT or MEMW table's digest reads every field of every op, in
+    /// order, whatever pieces they lie in: one bit moved in any field (each
+    /// flag, half, element and old timestamp apart), or an op fewer, moves it.
+    #[test]
+    fn the_op_records_digest_reads_every_field_and_not_the_pieces() {
+        let mut rng = 0x5EED_u64;
+        let mut next = move || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            rng ^ rng >> 29
+        };
+        // The digest of `ops` is the same however they are cut, and moves with
+        // an op fewer or any one field of any op flipped (`flip` flips field
+        // `k`, and says `false` past the last).
+        fn each_field<T: Clone>(
+            ops: &[T],
+            digest: impl Fn(Vec<Vec<T>>) -> [u64; 2],
+            flip: impl Fn(&mut T, usize) -> bool,
+            what: &str,
+        ) {
+            let whole = digest(cut(ops, &[]));
+            assert_eq!(digest(cut(ops, &[1])), whole, "{what}: the pieces");
+            assert_eq!(
+                digest(cut(ops, &[0, 2, ops.len()])),
+                whole,
+                "{what}: the pieces"
+            );
+            assert_ne!(digest(cut(&ops[1..], &[])), whole, "{what}: an op fewer");
+            for at in 0..ops.len() {
+                let mut k = 0;
+                loop {
+                    let mut moved = ops.to_vec();
+                    if !flip(&mut moved[at], k) {
+                        break;
+                    }
+                    assert_ne!(
+                        digest(cut(&moved, &[2])),
+                        whole,
+                        "{what}: op {at}, field {k}"
+                    );
+                    k += 1;
+                }
+                assert!(k > 3, "{what}: {k} fields");
+            }
+        }
+        let stores: Vec<StoreOp> = (0..4u8)
+            .map(|i| StoreOp {
+                base_address: next(),
+                timestamp: next(),
+                value: next(),
+                write2: u8::from(i == 1),
+                write4: u8::from(i == 2),
+                write8: u8::from(i == 3),
+            })
+            .collect();
+        each_field(
+            &stores,
+            |p| Records(Arc::new(Pieces::Store(p))).digest(),
+            |op, k| {
+                match k {
+                    0 => op.base_address ^= 1 << 63,
+                    1 => op.timestamp ^= 1,
+                    2 => op.value ^= 1 << 40,
+                    3 => op.write2 ^= 1,
+                    4 => op.write4 ^= 1,
+                    5 => op.write8 ^= 1,
+                    _ => return false,
+                }
+                true
+            },
+            "STORE",
+        );
+        let shifts: Vec<ShiftOp> = (0..4u8)
+            .map(|i| ShiftOp {
+                shift_amount: next(),
+                in_halves: [next() as u16, next() as u16, next() as u16, next() as u16],
+                shift: next() as u8,
+                direction: i & 1,
+                signed: (i >> 1) & 1,
+                word_instr: u8::from(i == 3),
+            })
+            .collect();
+        each_field(
+            &shifts,
+            |p| Records(Arc::new(Pieces::Shift(p))).digest(),
+            |op, k| {
+                match k {
+                    0 => op.shift_amount ^= 1 << 33,
+                    1..=4 => op.in_halves[k - 1] ^= 1 << 15,
+                    5 => op.shift ^= 0x80,
+                    6 => op.direction ^= 1,
+                    7 => op.signed ^= 1,
+                    8 => op.word_instr ^= 1,
+                    _ => return false,
+                }
+                true
+            },
+            "SHIFT",
+        );
+        let memws: Vec<MemwOp> = (0..4u8)
+            .map(|i| MemwOp {
+                base_address: next(),
+                timestamp: next(),
+                old_timestamp: std::array::from_fn(|_| next()),
+                value: std::array::from_fn(|_| next() as u32),
+                old: std::array::from_fn(|_| next() as u32),
+                is_register: i & 1,
+                width: 1 << i,
+                is_read: (i >> 1) & 1,
+            })
+            .collect();
+        each_field(
+            &memws,
+            |p| Records(Arc::new(Pieces::Memw(p))).digest(),
+            |op, k| {
+                match k {
+                    0 => op.base_address ^= 1,
+                    1 => op.timestamp ^= 1 << 63,
+                    2..=9 => op.old_timestamp[k - 2] ^= 1 << (k * 7),
+                    10..=17 => op.value[k - 10] ^= 1 << 31,
+                    18..=25 => op.old[k - 18] ^= 1,
+                    26 => op.is_register ^= 1,
+                    27 => op.width ^= 0x80,
+                    28 => op.is_read ^= 1,
+                    _ => return false,
+                }
+                true
+            },
+            "MEMW",
+        );
     }
 
     /// A fill's bytes and count are its pieces' summed. (Two fills compare
