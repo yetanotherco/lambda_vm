@@ -136,14 +136,17 @@ pub struct GroupStamps {
     pub encode: f64,
     pub open: f64,
     /// Phase B: when the group's turn began and ended, seconds since phase B
-    /// began (its columns back, up, argued, opened and let go).
+    /// began (its columns back, up, argued, opened and let go). Under
+    /// [`PhaseBOverlap::On`] a group's turn ends once the next group's
+    /// argument does, so the turns overlap.
     pub start_b: f64,
     pub end_b: f64,
     /// Host bytes kept of the group's trees between the phases.
     pub tree_bytes: usize,
     /// The device ledger's peak promise through the group's argue — the
-    /// argue's own and the next group's columns uploaded beside it. Bytes; 0
-    /// without a device.
+    /// argue's own and the next group's columns uploaded beside it, and under
+    /// [`PhaseBOverlap::On`] the previous group's openings beside it too
+    /// (`transition_reserved`). Bytes; 0 without a device.
     pub argue_reserved: u64,
     /// The ledger's promise just before the group's argue (its own columns
     /// on the card), and the ledger's peak through its revive and openings
@@ -151,10 +154,30 @@ pub struct GroupStamps {
     /// what the revive itself added (the openings' room). Bytes; 0 without a
     /// device. Phase B's overlap reads them: group g's openings beside group
     /// g + 1's argue would hold about `open_reserved[g] + argue_reserved[g+1]
-    /// − argue_base[g+1]`.
+    /// − argue_base[g+1]`. When the openings ran beside the next group's
+    /// argue, the two share one window: `open_reserved` is that window's peak
+    /// (the next group's `transition_reserved`), and `open_room` is 0.
     pub argue_base: u64,
     pub open_reserved: u64,
     pub open_room: u64,
+    /// Of the group's openings (`encode` + `open`), the seconds phase B's
+    /// driver waited for: all of them when it ran them itself; beside the next
+    /// group's argue ([`PhaseBOverlap::On`]), what outlasted that argue and
+    /// the upload beside it.
+    pub open_paid: f64,
+    /// The group's openings ran beside the next group's argue.
+    pub overlapped: bool,
+    /// Under [`PhaseBOverlap::On`], the group's openings ran alone because an
+    /// earlier transition saw the card refuse a promise.
+    pub serial_after_refusal: bool,
+    /// The ledger's peak through the group's argue with the previous group's
+    /// openings beside it (and the next group's upload); 0 when no openings
+    /// ran beside it. Bytes.
+    pub transition_reserved: u64,
+    /// Stream draws while the group's openings ran, `(foreground pool,
+    /// background pool)`. Beside an argue the foreground count holds the
+    /// argue's draws too; alone, only the openings'.
+    pub open_draws: (u64, u64),
     /// Phase A's ledger: the promise just before the group's commit (its own
     /// columns on the card, and the previous group's while it packs) and the
     /// peak through the commit (the next group's columns, uploaded beside it,
@@ -1559,6 +1582,63 @@ impl Default for ArgueDeviation {
     }
 }
 
+/// Whether phase B opens each group beside the next group's argue
+/// ([`BlockCommitted::with_phase_b_overlap`]). The proof is the same byte for
+/// byte either way: each group proves on its own fork `S_post ‖ g`, so only
+/// when its openings run moves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PhaseBOverlap {
+    /// One group at a time: its argue, then its openings.
+    #[default]
+    Off,
+    /// A group's openings on a thread of their own, drawing the card's
+    /// background streams, while the driver argues the next group; at most one
+    /// group's openings in flight, the last group's opened alone. After a
+    /// transition in which the card refused a promise, the rest of phase B goes
+    /// one group at a time.
+    On,
+}
+
+/// How a test disturbs phase B's overlap ([`PhaseBOverlap::On`]): each failure
+/// must come back as the prove's error — never a panic, never another proof —
+/// and a refusal must turn the rest of phase B serial. Places are positions in
+/// phase B's order. The production prover takes the default: none.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OverlapFaults {
+    /// The openings of the group at this place fail, on whichever thread.
+    pub open_fails: Option<usize>,
+    /// The argue of the group at this place fails.
+    pub argue_fails: Option<usize>,
+    /// The opening thread of the group at this place panics (test builds).
+    pub open_panics: Option<usize>,
+    /// The opening thread waits this long before each group's openings.
+    pub open_stall: Option<std::time::Duration>,
+    /// The transition that argues the group at this place reads as one in
+    /// which the card refused a promise.
+    pub refusal_at: Option<usize>,
+}
+
+/// Every count of a promise the card refused, a device fallback, or a wait on
+/// every stream at once, summed: a transition of phase B's overlap in which it
+/// rose turns the rest of phase B serial. The revive's room and an opening's
+/// turn refused, the GKR trees and other argue work the card refused, openings
+/// whose factors were built on the host, and drain-and-trims. Each is 0
+/// without a device.
+fn phase_b_refusals() -> u64 {
+    use multilinear::gpu;
+    [
+        gpu::room_revive_refusals(),
+        gpu::room_turn_refusals(),
+        gpu::gkr_tree_refusals(),
+        gpu::argue_device_fallbacks(),
+        gpu::open_host_fallbacks(),
+        gpu::device_trims(),
+    ]
+    .into_iter()
+    .fold(0u64, u64::saturating_add)
+}
+
 /// What phase B proves: the [`MultiProof`] (its `tables` empty under the
 /// batched argue), the groups' batched argues (one per group under the batched
 /// argue, none under the per-table one), the prepared openings in the
@@ -1590,6 +1670,10 @@ where
     spill: Option<BlockSpill>,
     /// Each table taken out of its group in phase A: spilled, or parked.
     spilled: Vec<Option<Out>>,
+    /// Phase B's overlap ([`Self::with_phase_b_overlap`]), and a test's faults
+    /// in it.
+    overlap: PhaseBOverlap,
+    overlap_faults: OverlapFaults,
 }
 
 impl<'a, F, E> BlockCommitted<'a, F, E>
@@ -1978,7 +2062,23 @@ where
             mem,
             spill,
             spilled,
+            overlap: PhaseBOverlap::Off,
+            overlap_faults: OverlapFaults::default(),
         })
+    }
+
+    /// Phase B opens each group beside the next group's argue, or not
+    /// ([`PhaseBOverlap`]); `Off` unless set here. The proof is the same.
+    pub fn with_phase_b_overlap(mut self, overlap: PhaseBOverlap) -> Self {
+        self.overlap = overlap;
+        self
+    }
+
+    /// A test's faults in phase B's overlap ([`OverlapFaults`]).
+    #[doc(hidden)]
+    pub fn with_overlap_faults(mut self, faults: OverlapFaults) -> Self {
+        self.overlap_faults = faults;
+        self
     }
 
     /// Every group's roots, in group order — what the transcript absorbs.
@@ -2387,7 +2487,8 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
-        + Clone,
+        + Clone
+        + Send,
 {
     // The batched argue's messages are not a `MultiProof`'s: its callers take
     // them from `block_prove_on_forks`.
@@ -2432,7 +2533,8 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
-        + Clone,
+        + Clone
+        + Send,
 {
     block_prove_on_forks_observed::<F, E, T, H>(
         committed,
@@ -2478,7 +2580,7 @@ pub fn block_prove_on_forks_observed<F, E, T, H>(
     deviations: &[PreparedDeviation],
     fork_of: &dyn Fn(usize) -> usize,
     argue: &ArgueDeviation,
-    on_group: &dyn Fn(GroupOpened<'_, F, E>),
+    on_group: &(dyn Fn(GroupOpened<'_, F, E>) + Sync),
 ) -> Result<BlockProved<F, E>, MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -2488,7 +2590,8 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
-        + Clone,
+        + Clone
+        + Send,
 {
     let order: Vec<usize> = (0..committed.sizes.len()).collect();
     block_prove_in_order::<F, E, T, H>(
@@ -2577,23 +2680,221 @@ pub fn interleaved_order(classes: &[Option<usize>], weights: &[u64]) -> Vec<usiz
     order
 }
 
-/// A group's tables, mutably, and another group's (`next`), each a contiguous
-/// run of `tables` that does not meet the other.
-fn group_and_next<X>(
-    tables: &mut [X],
-    (at, size): (usize, usize),
-    next: Option<(usize, usize)>,
-) -> (&mut [X], Option<&[X]>) {
-    match next {
-        None => (&mut tables[at..at + size], None),
-        Some((first, len)) if first >= at + size => {
-            let (head, tail) = tables.split_at_mut(first);
-            (&mut head[at..at + size], Some(&tail[..len]))
+/// A group argued and not yet opened: what its openings read, all of it its
+/// own — its fork, its kept tree tops, its columns on the card and the claims
+/// its argue settled on — and its share of the proof so far.
+struct Argued<F, E, T>
+where
+    F: IsFFTField + IsPrimeField + 'static,
+    E: IsField,
+{
+    group: usize,
+    /// Its place in phase B's order.
+    place: usize,
+    /// Its first table, and how many it has.
+    at: usize,
+    size: usize,
+    fork: T,
+    /// Taken by its openings.
+    retired: Option<RetiredStack<F>>,
+    store: Store,
+    tree_tops: usize,
+    points: Vec<Vec<FieldElement<E>>>,
+    values: Vec<FieldElement<E>>,
+    proofs: Vec<TableProof<E>>,
+    argue: Option<BatchedArgue<E>>,
+}
+
+/// A group's openings done: its opening, its prepared one when it has one,
+/// and what they cost.
+struct Opened<F: IsField, E: IsField> {
+    opening: StackedProof<F, E>,
+    prepared: Option<StackedProof<F, E>>,
+    encode: f64,
+    open: f64,
+    /// What the revive added to the ledger, and the ledger's peak through the
+    /// openings: read only when the openings had the ledger's window to
+    /// themselves (0 and `None` otherwise).
+    open_room: u64,
+    open_reserved: Option<u64>,
+    /// Stream draws while they ran, `(foreground pool, background pool)`.
+    draws: (u64, u64),
+}
+
+/// A group's openings on its own fork: its stack revived over its columns (on
+/// the card when its store holds them), opened at the points and values its
+/// argue settled on, then its prepared stack when it has one. Returns them,
+/// and the revived stack for the caller to let go.
+///
+/// It reads the group's own tables, fork, claims and kept tree tops, nothing
+/// another group proves, so phase B may run it on a thread of its own beside
+/// the next group's argue ([`PhaseBOverlap::On`]): nothing it calls may read a
+/// setting the driver's thread holds per thread. `own_window`: the ledger's
+/// window is the openings' alone (one group at a time), so it is opened here
+/// and its peak read. `fails`: a test's failed opening.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn open_group<F, E, T, H>(
+    argued: &mut Argued<F, E, T>,
+    group: &[CommittedTable<'_, F, E>],
+    prepared: &[BlockPrepared<'_, F, H>],
+    deviations: &[PreparedDeviation],
+    config: &ChainConfig,
+    own_window: bool,
+    fails: bool,
+) -> Result<(Opened<F, E>, StackedCommitment<F, H>), MlError>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
+        + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>,
+{
+    if fails {
+        return Err(MlError::DeviceFailed {
+            stage: "a test's failed opening",
+        });
+    }
+    let retired = argued.retired.take().ok_or(MlError::QueryCountMismatch {
+        expected: 1,
+        got: 0,
+    })?;
+    let draws = multilinear::gpu::stream_draws();
+    let handles = group_columns(group);
+    let columns: Vec<&ColumnOf<'_, _>> = handles.iter().collect();
+    let store = argued.store.as_ref();
+    let t = Instant::now();
+    if own_window {
+        multilinear::gpu::reset_reserved_window();
+    }
+    let before_revive = own_window.then(multilinear::gpu::ledger_reserved);
+    let stacked = retired.revive::<H, _>(
+        &columns,
+        store.map(|store| (&**store, ColumnsAt::From(0))),
+        config,
+    )?;
+    let encode = t.elapsed().as_secs_f64();
+    let open_room = before_revive.map_or(0, |before| {
+        multilinear::gpu::ledger_reserved().saturating_sub(before)
+    });
+    let t = Instant::now();
+    let opening = stacked_eval::prove::<F, E, T, H, _>(
+        &stacked,
+        &columns,
+        store.map(|store| (&**store, 0)),
+        &Claimed::PerColumn(&argued.points),
+        &argued.values,
+        config,
+        &mut argued.fork,
+    )?;
+    // The group's prepared tables, in table order: each opened at its own
+    // point for its own prefix, on this fork.
+    let (at, points, values) = (argued.at, &argued.points, &argued.values);
+    let firsts: Vec<usize> = group
+        .iter()
+        .scan(0usize, |first, table| {
+            let at = *first;
+            *first += table.num_committed_columns();
+            Some(at)
+        })
+        .collect();
+    let prepared_opening = match prepared.iter().position(|p| p.group == argued.group) {
+        Some(k) => {
+            let p = &prepared[k];
+            let (mut at_points, mut at_values) =
+                prepared_claims(&p.tables, at, &firsts, points, values);
+            if let Some(d) = deviations.iter().find(|d| d.open == k) {
+                // Each block's columns sit at its table's place in the stack.
+                let mut column = 0usize;
+                for &(table, n) in &p.tables {
+                    if let Some(&(_, other)) = d.at_point_of.iter().find(|(t, _)| *t == table) {
+                        let local = other.checked_sub(at).filter(|&l| l < firsts.len()).ok_or(
+                            MlError::UnknownPolynomial {
+                                index: other,
+                                len: firsts.len(),
+                            },
+                        )?;
+                        for point in &mut at_points[column..column + n] {
+                            *point = points[firsts[local]].clone();
+                        }
+                    }
+                    column += n;
+                }
+                if d.consistent {
+                    at_values = p
+                        .columns
+                        .iter()
+                        .zip(&at_points)
+                        .map(|(c, point)| c.evaluate_in(point))
+                        .collect::<Result<_, _>>()?;
+                }
+            }
+            Some(stacked_eval::prove::<F, E, T, H, _>(
+                p.commitment,
+                p.columns,
+                None,
+                &Claimed::PerColumn(&at_points),
+                &at_values,
+                config,
+                &mut argued.fork,
+            )?)
         }
-        Some((first, len)) => {
-            let (head, tail) = tables.split_at_mut(at);
-            (&mut tail[..size], Some(&head[first..first + len]))
+        None => None,
+    };
+    let open = t.elapsed().as_secs_f64();
+    let open_reserved = own_window.then(multilinear::gpu::reserved_window_peak);
+    let after = multilinear::gpu::stream_draws();
+    Ok((
+        Opened {
+            opening,
+            prepared: prepared_opening,
+            encode,
+            open,
+            open_room,
+            open_reserved,
+            draws: (
+                after.0.saturating_sub(draws.0),
+                after.1.saturating_sub(draws.1),
+            ),
+        },
+        stacked,
+    ))
+}
+
+/// Lets a group go once its openings are done: its tables' columns off the
+/// card and out of their widened form — under a spill its packed columns too,
+/// which nothing reads after its openings — its store, and its kept tree tops
+/// out of the memory log.
+fn release_group<F, E>(
+    group: &mut [CommittedTable<'_, F, E>],
+    g: usize,
+    store: Store,
+    tree_tops: usize,
+    spilling: bool,
+    mem: Option<&BlockMem>,
+) where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    for table in group.iter_mut() {
+        table.clear_resident();
+        table.drop_widened();
+        // While a spill is on, a finished group's packed columns go:
+        // nothing reads them after its opening.
+        if spilling
+            && let Some(packed) = table.take_narrow_for_spill()
+            && let Some(mem) = mem
+        {
+            mem.held_narrow.fetch_sub(packed.data().len(), Relaxed);
         }
+    }
+    drop(store);
+    if let Some(mem) = mem {
+        mem.tree_tops.fetch_sub(tree_tops, Relaxed);
+        mem.mark(&format!("phase B group {g} end"));
     }
 }
 
@@ -2604,6 +2905,12 @@ fn group_and_next<X>(
 /// any order; only when each group's columns are needed moves. The next
 /// group's columns go up beside this group's argue in `order` too. An `order`
 /// that is not a permutation of the groups is refused.
+///
+/// Under [`PhaseBOverlap::On`] ([`BlockCommitted::with_phase_b_overlap`]) each
+/// group's openings run on a thread of their own beside the next group's
+/// argue, which keeps each fork's own sequence — argue, openings, prepared
+/// opening — so the proof is the same again. `on_group` is then called on that
+/// thread, as each group's openings end, in `order` all the same.
 #[allow(clippy::too_many_arguments)]
 #[doc(hidden)]
 pub fn block_prove_in_order<F, E, T, H>(
@@ -2614,7 +2921,7 @@ pub fn block_prove_in_order<F, E, T, H>(
     deviations: &[PreparedDeviation],
     fork_of: &dyn Fn(usize) -> usize,
     argue: &ArgueDeviation,
-    on_group: &dyn Fn(GroupOpened<'_, F, E>),
+    on_group: &(dyn Fn(GroupOpened<'_, F, E>) + Sync),
     order: &[usize],
 ) -> Result<BlockProved<F, E>, MlError>
 where
@@ -2625,7 +2932,8 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>
-        + Clone,
+        + Clone
+        + Send,
 {
     let BlockCommitted {
         mut tables,
@@ -2636,6 +2944,8 @@ where
         mem,
         spill,
         mut spilled,
+        overlap,
+        overlap_faults,
     } = committed;
     let n = sizes.len();
     let mut seen = vec![false; n];
@@ -2678,6 +2988,12 @@ where
     // card idles through the argument's host glue, and a group's store is a
     // few GiB beside the argument's working set, not beside its codewords.
     let mut pre_uploaded: Option<Store> = None;
+    // Under the overlap: the group argued last, whose openings run beside the
+    // next group's argue; and whether a transition saw the card refuse a
+    // promise, after which every group opens alone.
+    let overlapping = overlap == PhaseBOverlap::On;
+    let mut prev: Option<Argued<F, E, T>> = None;
+    let mut latched = false;
     // The spilled tables read back in phase B's order, two groups' bytes ahead
     // of their uploads.
     let prefetch = spill.as_ref().and_then(|_| {
@@ -2738,11 +3054,6 @@ where
                 }
             }
         }
-        let (group, next) = group_and_next(
-            &mut tables,
-            (at, size),
-            next_g.map(|next| (starts[next], sizes[next])),
-        );
         let retired = retired[g].take().ok_or(MlError::QueryCountMismatch {
             expected: n,
             got: order.len(),
@@ -2751,11 +3062,11 @@ where
         let t = Instant::now();
         let store = match pre_uploaded.take() {
             Some(store) => store,
-            None => upload_group(group),
+            None => upload_group(&tables[at..at + size]),
         };
         if let Some(store) = &store {
             let mut first = 0usize;
-            for table in group.iter_mut() {
+            for table in tables[at..at + size].iter_mut() {
                 table.set_resident(store.clone(), first);
                 first += table.num_committed_columns();
             }
@@ -2764,61 +3075,128 @@ where
 
         // The group's tables, one after another, each leaving its columns
         // claimed at its own point — or, batched, all of them in one argue —
-        // with the next group's upload beside them.
+        // with the next group's upload beside them, and under the overlap the
+        // previous group's openings too.
         let t = Instant::now();
         stamps[g].argue_base = multilinear::gpu::ledger_reserved();
         multilinear::gpu::reset_reserved_window();
+        let refusals_before = prev.as_ref().map(|_| phase_b_refusals());
         let mut points: Vec<Vec<FieldElement<E>>> = Vec::new();
         let mut values: Vec<FieldElement<E>> = Vec::new();
         let mut proofs: Vec<TableProof<E>> = Vec::new();
         let mut batched_argue: Option<BatchedArgue<E>> = None;
-        let group_ref: &[CommittedTable<'_, F, E>] = group;
-        let (argued, next_store, joined) = std::thread::scope(|scope| {
-            let uploader = next.map(|next| scope.spawn(move || upload_group(next)));
-            let argued = (|| -> Result<(), MlError> {
-                match config.format.argue {
-                    ArgueFormat::PerTable => {
-                        for table in group_ref.iter() {
-                            let (proof, point) = prove(table, &z, &alpha, &beta, &mut fork, None)?;
-                            for _ in 0..table.num_committed_columns() {
-                                points.push(point.clone());
-                            }
-                            values.extend(proof.constraint.reduce.column_values.iter().cloned());
-                            proofs.push(proof);
+        let all: &[CommittedTable<'_, F, E>] = &tables;
+        let group_ref = &all[at..at + size];
+        let next = next_g.map(|next| &all[starts[next]..starts[next] + sizes[next]]);
+        let roots_ref = &roots;
+        let (argue_result, argue_end, next_store, joined, opened, open_paid) =
+            std::thread::scope(|scope| {
+                let uploader = next.map(|next| scope.spawn(move || upload_group(next)));
+                let opener = prev.as_mut().map(|earlier| {
+                    let its_tables = &all[earlier.at..earlier.at + earlier.size];
+                    scope.spawn(move || -> Result<Opened<F, E>, MlError> {
+                        // Every stream this thread draws is a background one,
+                        // so the argue's kernels are dispatched first.
+                        let _background = multilinear::gpu::background_streams();
+                        if let Some(stall) = overlap_faults.open_stall {
+                            std::thread::sleep(stall);
                         }
-                    }
-                    ArgueFormat::Batched { bin_log_cells } => {
-                        let faults = match argue.group {
-                            Some(faulty) if faulty == g => argue.faults,
-                            _ => ProverFaults::default(),
-                        };
-                        let (proof, reduced) = batched::prove_argue(
-                            group_ref,
-                            &z,
-                            &alpha,
-                            &beta,
-                            bin_log_cells,
-                            &mut fork,
-                            faults,
-                            argue.at,
+                        #[cfg(any(test, feature = "test-utils"))]
+                        if overlap_faults.open_panics == Some(earlier.place) {
+                            panic!("a test's opening thread panics");
+                        }
+                        let fails = overlap_faults.open_fails == Some(earlier.place);
+                        let (opened, stacked) = open_group::<F, E, T, H>(
+                            earlier, its_tables, prepared, deviations, config, false, fails,
                         )?;
-                        for (table, claim) in group_ref.iter().zip(reduced) {
-                            for _ in 0..table.num_committed_columns() {
-                                points.push(claim.point.clone());
-                            }
-                            values.extend(claim.column_values);
-                        }
-                        batched_argue = Some(proof);
+                        on_group(GroupOpened {
+                            group: earlier.group,
+                            roots: roots_ref,
+                            argue: earlier.argue.as_ref(),
+                            tables: &earlier.proofs,
+                            opening: &opened.opening,
+                            prepared: opened.prepared.as_ref(),
+                        });
+                        drop(stacked);
+                        Ok(opened)
+                    })
+                });
+                let argue_result = (|| -> Result<(), MlError> {
+                    if overlap_faults.argue_fails == Some(p) {
+                        return Err(MlError::DeviceFailed {
+                            stage: "a test's failed argue",
+                        });
                     }
-                }
-                Ok(())
-            })();
-            let argue_end = Instant::now();
-            let next_store = uploader.map(|handle| handle.join());
-            (argued, next_store, argue_end.elapsed().as_secs_f64())
-        });
-        argued?;
-        stamps[g].argue = t.elapsed().as_secs_f64() - joined;
+                    match config.format.argue {
+                        ArgueFormat::PerTable => {
+                            for table in group_ref.iter() {
+                                let (proof, point) =
+                                    prove(table, &z, &alpha, &beta, &mut fork, None)?;
+                                for _ in 0..table.num_committed_columns() {
+                                    points.push(point.clone());
+                                }
+                                values
+                                    .extend(proof.constraint.reduce.column_values.iter().cloned());
+                                proofs.push(proof);
+                            }
+                        }
+                        ArgueFormat::Batched { bin_log_cells } => {
+                            let faults = match argue.group {
+                                Some(faulty) if faulty == g => argue.faults,
+                                _ => ProverFaults::default(),
+                            };
+                            let (proof, reduced) = batched::prove_argue(
+                                group_ref,
+                                &z,
+                                &alpha,
+                                &beta,
+                                bin_log_cells,
+                                &mut fork,
+                                faults,
+                                argue.at,
+                            )?;
+                            for (table, claim) in group_ref.iter().zip(reduced) {
+                                for _ in 0..table.num_committed_columns() {
+                                    points.push(claim.point.clone());
+                                }
+                                values.extend(claim.column_values);
+                            }
+                            batched_argue = Some(proof);
+                        }
+                    }
+                    Ok(())
+                })();
+                let argue_end = Instant::now();
+                let next_store = uploader.map(|handle| handle.join());
+                let joined = argue_end.elapsed().as_secs_f64();
+                // What of the previous group's openings outlasted the argue
+                // and the upload: the overlap's cost on this thread.
+                let waited = Instant::now();
+                let opened = opener.map(|handle| handle.join());
+                (
+                    argue_result,
+                    argue_end,
+                    next_store,
+                    joined,
+                    opened,
+                    waited.elapsed().as_secs_f64(),
+                )
+            });
+        // The previous group's openings answer first: their error is the one
+        // one group at a time would have met first. A panic on their thread
+        // is refused, never resumed.
+        let opened = match opened {
+            None => None,
+            Some(Ok(Ok(opened))) => Some(opened),
+            Some(Ok(Err(e))) => return Err(e),
+            Some(Err(_)) => {
+                return Err(MlError::DeviceFailed {
+                    stage: "the previous group's openings",
+                });
+            }
+        };
+        argue_result?;
+        stamps[g].argue = argue_end.saturating_duration_since(t).as_secs_f64();
         stamps[g].argue_reserved = multilinear::gpu::reserved_window_peak();
         if let (Some(next_store), Some(next)) = (next_store, next_g) {
             // The wait for the upload after the argument ended is the next
@@ -2828,113 +3206,101 @@ where
                 stage: "uploading the next group's columns",
             })?);
         }
-
-        let handles = group_columns(group);
-        let columns: Vec<&ColumnOf<'_, _>> = handles.iter().collect();
-        let tree_tops = retired.tree_bytes();
-        let t = Instant::now();
-        multilinear::gpu::reset_reserved_window();
-        let before_revive = multilinear::gpu::ledger_reserved();
-        let stacked = retired.revive::<H, _>(
-            &columns,
-            store.as_ref().map(|store| (&**store, ColumnsAt::From(0))),
-            config,
-        )?;
-        stamps[g].encode = t.elapsed().as_secs_f64();
-        stamps[g].open_room = multilinear::gpu::ledger_reserved().saturating_sub(before_revive);
-        let t = Instant::now();
-        let opening = stacked_eval::prove::<F, E, T, H, _>(
-            &stacked,
-            &columns,
-            store.as_ref().map(|store| (&**store, 0)),
-            &Claimed::PerColumn(&points),
-            &values,
-            config,
-            &mut fork,
-        )?;
-        // The group's prepared tables, in table order: each opened at its own
-        // point for its own prefix, on this fork.
-        let firsts: Vec<usize> = group
-            .iter()
-            .scan(0usize, |first, table| {
-                let at = *first;
-                *first += table.num_committed_columns();
-                Some(at)
-            })
-            .collect();
-        if let Some(k) = prepared.iter().position(|p| p.group == g) {
-            let p = &prepared[k];
-            let (mut at_points, mut at_values) =
-                prepared_claims(&p.tables, at, &firsts, &points, &values);
-            if let Some(d) = deviations.iter().find(|d| d.open == k) {
-                // Each block's columns sit at its table's place in the stack.
-                let mut column = 0usize;
-                for &(table, n) in &p.tables {
-                    if let Some(&(_, other)) = d.at_point_of.iter().find(|(t, _)| *t == table) {
-                        let local = other.checked_sub(at).filter(|&l| l < firsts.len()).ok_or(
-                            MlError::UnknownPolynomial {
-                                index: other,
-                                len: firsts.len(),
-                            },
-                        )?;
-                        for point in &mut at_points[column..column + n] {
-                            *point = points[firsts[local]].clone();
-                        }
-                    }
-                    column += n;
-                }
-                if d.consistent {
-                    at_values = p
-                        .columns
-                        .iter()
-                        .zip(&at_points)
-                        .map(|(c, point)| c.evaluate_in(point))
-                        .collect::<Result<_, _>>()?;
-                }
+        if let (Some(opened), Some(earlier)) = (opened, prev.take()) {
+            // The previous group's openings ran beside this argue: one window
+            // on the ledger for both.
+            let h = earlier.group;
+            let window = stamps[g].argue_reserved;
+            stamps[g].transition_reserved = window;
+            let s = &mut stamps[h];
+            s.encode = opened.encode;
+            s.open = opened.open;
+            s.open_room = opened.open_room;
+            s.open_reserved = window;
+            s.open_paid = open_paid;
+            s.overlapped = true;
+            s.open_draws = opened.draws;
+            group_tables[h] = earlier.proofs;
+            group_argue[h] = earlier.argue;
+            group_opening[h] = Some(opened.opening);
+            group_prepared[h] = opened.prepared;
+            release_group(
+                &mut tables[earlier.at..earlier.at + earlier.size],
+                h,
+                earlier.store,
+                earlier.tree_tops,
+                spill.is_some(),
+                mem.as_deref(),
+            );
+            stamps[h].end_b = entered.elapsed().as_secs_f64();
+            // A transition in which the card refused a promise turns the rest
+            // of phase B serial: the work went where it goes without the
+            // overlap, and no later transition risks it again.
+            if refusals_before.is_some_and(|before| phase_b_refusals() > before)
+                || overlap_faults.refusal_at == Some(p)
+            {
+                latched = true;
             }
-            group_prepared[g] = Some(stacked_eval::prove::<F, E, T, H, _>(
-                p.commitment,
-                p.columns,
-                None,
-                &Claimed::PerColumn(&at_points),
-                &at_values,
-                config,
-                &mut fork,
-            )?);
         }
-        stamps[g].open = t.elapsed().as_secs_f64();
-        stamps[g].open_reserved = multilinear::gpu::reserved_window_peak();
+
+        let tree_tops = retired.tree_bytes();
+        let mut argued = Argued {
+            group: g,
+            place: p,
+            at,
+            size,
+            fork,
+            retired: Some(retired),
+            store,
+            tree_tops,
+            points,
+            values,
+            proofs,
+            argue: batched_argue,
+        };
+        if overlapping && !latched && next_g.is_some() {
+            // Opened beside the next group's argue.
+            prev = Some(argued);
+            continue;
+        }
+        stamps[g].serial_after_refusal = overlapping && latched && next_g.is_some();
+        let paid = Instant::now();
+        let (opened, stacked) = open_group::<F, E, T, H>(
+            &mut argued,
+            &tables[at..at + size],
+            prepared,
+            deviations,
+            config,
+            true,
+            overlap_faults.open_fails == Some(p),
+        )?;
+        stamps[g].encode = opened.encode;
+        stamps[g].open_room = opened.open_room;
+        stamps[g].open = opened.open;
+        stamps[g].open_reserved = opened.open_reserved.unwrap_or(0);
+        stamps[g].open_paid = paid.elapsed().as_secs_f64();
+        stamps[g].open_draws = opened.draws;
         on_group(GroupOpened {
             group: g,
             roots: &roots,
-            argue: batched_argue.as_ref(),
-            tables: &proofs,
-            opening: &opening,
-            prepared: group_prepared[g].as_ref(),
+            argue: argued.argue.as_ref(),
+            tables: &argued.proofs,
+            opening: &opened.opening,
+            prepared: opened.prepared.as_ref(),
         });
-        group_tables[g] = proofs;
-        group_argue[g] = batched_argue;
-        group_opening[g] = Some(opening);
+        group_tables[g] = argued.proofs;
+        group_argue[g] = argued.argue;
+        group_opening[g] = Some(opened.opening);
+        group_prepared[g] = opened.prepared;
         drop(stacked);
-        drop(columns);
-        drop(handles);
-        for table in group.iter_mut() {
-            table.clear_resident();
-            table.drop_widened();
-            // While a spill is on, a finished group's packed columns go:
-            // nothing reads them after its opening.
-            if spill.is_some()
-                && let Some(packed) = table.take_narrow_for_spill()
-                && let Some(mem) = &mem
-            {
-                mem.held_narrow.fetch_sub(packed.data().len(), Relaxed);
-            }
-        }
-        drop(store);
-        if let Some(mem) = &mem {
-            mem.tree_tops.fetch_sub(tree_tops, Relaxed);
-            mem.mark(&format!("phase B group {g} end"));
-        }
+        release_group(
+            &mut tables[at..at + size],
+            g,
+            argued.store,
+            argued.tree_tops,
+            spill.is_some(),
+            mem.as_deref(),
+        );
         stamps[g].end_b = entered.elapsed().as_secs_f64();
     }
     // The tables go with this function: a memory log stops holding them.
@@ -3517,23 +3883,5 @@ mod spill_tests {
         );
         assert_eq!(super::rebuilt_last(&[false; 4]), vec![0, 1, 2, 3]);
         assert_eq!(super::rebuilt_last(&[true; 3]), vec![0, 1, 2]);
-    }
-
-    /// A group and another one, before it or after it, as two slices that do
-    /// not meet.
-    #[test]
-    fn a_group_and_the_next_are_disjoint_slices() {
-        let mut tables: Vec<u32> = (0..10).collect();
-        let (group, next) = super::group_and_next(&mut tables, (2, 3), Some((7, 2)));
-        assert_eq!((&*group, next), (&[2, 3, 4][..], Some(&[7, 8][..])));
-        let (group, next) = super::group_and_next(&mut tables, (6, 4), Some((0, 2)));
-        assert_eq!((&*group, next), (&[6, 7, 8, 9][..], Some(&[0, 1][..])));
-        let (group, next) = super::group_and_next(&mut tables, (0, 5), Some((5, 5)));
-        assert_eq!(
-            (&*group, next),
-            (&[0, 1, 2, 3, 4][..], Some(&[5, 6, 7, 8, 9][..]))
-        );
-        let (group, next) = super::group_and_next(&mut tables, (3, 1), None);
-        assert_eq!((&*group, next), (&[3][..], None));
     }
 }
