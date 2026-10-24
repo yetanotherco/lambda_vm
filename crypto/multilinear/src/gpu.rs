@@ -114,6 +114,18 @@ static COSET_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// its sumcheck threshold), and a round 0 on the card is never folded under
 /// that order. The same bytes as the card's encode; a host NTT's time instead.
 static COSET_HOST_ENCODES: AtomicU64 = AtomicU64::new(0);
+/// Coset openings that read the stack where it lies in the store's buffer
+/// (`LAMBDA_VM_WHIR_COSET_INPLACE=1`): no stack assembled, its zero tiles
+/// folded unread. Among [`COSET_OPENINGS`].
+static COSET_INPLACE_OPENS: AtomicU64 = AtomicU64::new(0);
+/// ⚠ Coset openings asked to read the stack in place whose parts the kernels
+/// could not place: the stack assembled after all, today's cost.
+static COSET_INPLACE_ASSEMBLED: AtomicU64 = AtomicU64::new(0);
+/// The in-place openings' tiles no part touches (folded to zero unread), and
+/// their mixed tiles (shorter columns, a column's end: read value by value),
+/// summed over the openings.
+static COSET_ZERO_TILES: AtomicU64 = AtomicU64::new(0);
+static COSET_MIXED_TILES: AtomicU64 = AtomicU64::new(0);
 /// ★ Stacked openings whose codeword the device holds but whose factors the
 /// device did not build from the shares.
 ///
@@ -520,6 +532,62 @@ pub fn force_coset_openings(on: Option<bool>) {
     );
 }
 
+/// [`COSET_INPLACE_OPENS`].
+pub fn coset_inplace_opens() -> u64 {
+    COSET_INPLACE_OPENS.load(Ordering::Relaxed)
+}
+
+/// [`COSET_INPLACE_ASSEMBLED`].
+pub fn coset_inplace_assembled() -> u64 {
+    COSET_INPLACE_ASSEMBLED.load(Ordering::Relaxed)
+}
+
+/// [`COSET_ZERO_TILES`] and [`COSET_MIXED_TILES`].
+pub fn coset_inplace_tiles() -> (u64, u64) {
+    (
+        COSET_ZERO_TILES.load(Ordering::Relaxed),
+        COSET_MIXED_TILES.load(Ordering::Relaxed),
+    )
+}
+
+/// Whether a coset opening reads the stack where it lies instead of
+/// assembling it: `LAMBDA_VM_WHIR_COSET_INPLACE=1` or a test's override. Off
+/// by default. The same words either way.
+pub fn coset_inplace_in_effect() -> bool {
+    match COSET_INPLACE_FORCED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| {
+                matches!(
+                    std::env::var("LAMBDA_VM_WHIR_COSET_INPLACE")
+                        .ok()
+                        .as_deref()
+                        .map(str::trim),
+                    Some("1")
+                )
+            })
+        }
+    }
+}
+
+static COSET_INPLACE_FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides `LAMBDA_VM_WHIR_COSET_INPLACE` for the whole process. `None`
+/// restores the environment's setting. Not for production callers.
+#[doc(hidden)]
+pub fn force_coset_inplace(on: Option<bool>) {
+    COSET_INPLACE_FORCED.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
 /// Whether a chain's first successor is encoded from its bound message (the
 /// default; `LAMBDA_VM_WHIR_ENCODE_SUCCESSOR=0` or a test's override turns it
 /// off). `false` in a build without a device.
@@ -690,6 +758,10 @@ pub fn reset_call_counters() {
     COSET_OPENINGS.store(0, Ordering::Relaxed);
     COSET_FALLBACKS.store(0, Ordering::Relaxed);
     COSET_HOST_ENCODES.store(0, Ordering::Relaxed);
+    COSET_INPLACE_OPENS.store(0, Ordering::Relaxed);
+    COSET_INPLACE_ASSEMBLED.store(0, Ordering::Relaxed);
+    COSET_ZERO_TILES.store(0, Ordering::Relaxed);
+    COSET_MIXED_TILES.store(0, Ordering::Relaxed);
     OPEN_HOST_FALLBACKS.store(0, Ordering::Relaxed);
     GROUPED_CARD_CHAINS.store(0, Ordering::Relaxed);
     GROUPED_HOST_CHAINS.store(0, Ordering::Relaxed);
@@ -6274,14 +6346,26 @@ impl CosetSource {
             kept,
             &raw,
         )?;
+        let in_place = coset_inplace_in_effect();
         let opened = math_cuda::whir_coset::coset_openings(
             &self.0,
             &plan,
             &raw,
             hash.into_math_cuda(),
-            false,
+            in_place,
         )
         .ok()?;
+        match opened.in_place {
+            Some(kinds) => {
+                COSET_INPLACE_OPENS.fetch_add(1, Ordering::Relaxed);
+                COSET_ZERO_TILES.fetch_add(kinds.zero, Ordering::Relaxed);
+                COSET_MIXED_TILES.fetch_add(kinds.mixed, Ordering::Relaxed);
+            }
+            None if in_place => {
+                COSET_INPLACE_ASSEMBLED.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {}
+        }
         let slots = raw
             .iter()
             .map(|&leaf| plan.slot_of(leaf))

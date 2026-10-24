@@ -185,7 +185,15 @@ struct Stack {
 
 impl Stack {
     fn new(n_stack: usize) -> Self {
-        let heights = [n_stack, n_stack - 1, n_stack - 1, n_stack - 2, n_stack - 3];
+        Self::with_heights(
+            n_stack,
+            &[n_stack, n_stack - 1, n_stack - 1, n_stack - 2, n_stack - 3],
+        )
+    }
+
+    /// Columns of `2^h` values for each `h` of `heights`, stacked in that
+    /// order.
+    fn with_heights(n_stack: usize, heights: &[usize]) -> Self {
         let columns: Vec<Mle<F>> = heights
             .iter()
             .enumerate()
@@ -206,7 +214,7 @@ impl Stack {
             .map(|(c, p)| c.evaluate_in(p).unwrap())
             .collect();
         Self {
-            layout: StackedLayout::build(&heights, n_stack).unwrap(),
+            layout: StackedLayout::build(heights, n_stack).unwrap(),
             columns,
             points,
             values,
@@ -278,8 +286,8 @@ impl Stack {
 /// ★ THE LEVER'S PARITY. A coset-ordered stack retired to a kept top of 16 or
 /// 256 leaves and revived over its resident columns proves the whole tree's
 /// bytes: with its openings evaluated coset by coset from the stack (served
-/// from the stack, none fallen back) and with them read from a re-encoded
-/// codeword. At stacks whose cosets fold 4 and 6 bits, uncapped and under the
+/// from the stack, none fallen back; the stack assembled, and read where it
+/// lies) and with them read from a re-encoded codeword. At stacks whose cosets fold 4 and 6 bits, uncapped and under the
 /// production cap.
 #[test]
 fn a_revived_coset_stack_proves_the_whole_trees_bytes_from_the_stack_or_a_reencode() {
@@ -298,36 +306,72 @@ fn a_revived_coset_stack_at_blowup_two_proves_the_whole_trees_bytes_from_the_sta
 /// [`a_revived_coset_stack_proves_the_whole_trees_bytes_from_the_stack_or_a_reencode`]
 /// at blowup `2^log_blowup`.
 fn revived_coset_stack(log_blowup: usize) {
-    for (n_stack, cap) in [
-        (18usize, CapPolicy::Auto),
-        (18, CapPolicy::Off),
-        (20, CapPolicy::Auto),
+    // Short columns among the tall: tiles that hold several columns, or a
+    // column and zeros, which the stack read in place reads value by value.
+    let short = |n: usize| vec![n, n - 1, 3, 5, 4, 7, 6, 3, 8, n - 2, 3, 3, 6, n - 3, 5];
+    for (n_stack, cap, short_columns) in [
+        (18usize, CapPolicy::Auto, false),
+        (18, CapPolicy::Off, false),
+        (20, CapPolicy::Auto, false),
+        (18, CapPolicy::Auto, true),
     ] {
         let cfg = config_at(LeafOrder::Coset, cap, log_blowup);
-        let stack = Stack::new(n_stack);
+        let stack = if short_columns {
+            Stack::with_heights(n_stack, &short(n_stack))
+        } else {
+            Stack::new(n_stack)
+        };
         let (roots, whole) = stack.prove(&cfg, None);
         stack.verify(&roots, &whole, &cfg);
         for drop in [2usize, 4] {
-            let label = format!("2^{n_stack} {cap} drop {drop} blowup 2^{log_blowup}");
-            multilinear::gpu::force_coset_openings(Some(true));
-            let served = multilinear::gpu::coset_openings();
-            let fell_back = multilinear::gpu::coset_fallbacks();
-            let (again, from_stack) = stack.prove(&cfg, Some(drop));
-            assert_eq!(again, roots, "{label}: roots");
-            assert!(
-                multilinear::gpu::coset_openings() > served,
-                "{label}: the openings must have been served from the stack"
+            let label = format!(
+                "2^{n_stack} {cap} drop {drop} blowup 2^{log_blowup} short columns {short_columns}"
             );
-            assert_eq!(
-                multilinear::gpu::coset_fallbacks(),
-                fell_back,
-                "{label}: nothing re-encoded"
-            );
-            assert_eq!(
-                bytes!(&from_stack),
-                bytes!(&whole),
-                "{label}: from the stack"
-            );
+            // From the stack assembled, then from the stack read where it
+            // lies (the third polynomial's zero tail folded unread).
+            for in_place in [false, true] {
+                let label = format!("{label} in place {in_place}");
+                multilinear::gpu::force_coset_openings(Some(true));
+                multilinear::gpu::force_coset_inplace(Some(in_place));
+                let served = multilinear::gpu::coset_openings();
+                let fell_back = multilinear::gpu::coset_fallbacks();
+                let read_in_place = multilinear::gpu::coset_inplace_opens();
+                let assembled = multilinear::gpu::coset_inplace_assembled();
+                let (zero, _) = multilinear::gpu::coset_inplace_tiles();
+                let (again, from_stack) = stack.prove(&cfg, Some(drop));
+                assert_eq!(again, roots, "{label}: roots");
+                let opened = multilinear::gpu::coset_openings() - served;
+                assert!(
+                    opened > 0,
+                    "{label}: the openings must have been served from the stack"
+                );
+                assert_eq!(
+                    multilinear::gpu::coset_fallbacks(),
+                    fell_back,
+                    "{label}: nothing re-encoded"
+                );
+                assert_eq!(
+                    multilinear::gpu::coset_inplace_opens() - read_in_place,
+                    if in_place { opened } else { 0 },
+                    "{label}: every opening read the stack in place, or none"
+                );
+                assert_eq!(
+                    multilinear::gpu::coset_inplace_assembled(),
+                    assembled,
+                    "{label}: no stack assembled after all"
+                );
+                assert_eq!(
+                    multilinear::gpu::coset_inplace_tiles().0 > zero,
+                    in_place,
+                    "{label}: zero tiles folded unread only in place"
+                );
+                assert_eq!(
+                    bytes!(&from_stack),
+                    bytes!(&whole),
+                    "{label}: from the stack"
+                );
+            }
+            multilinear::gpu::force_coset_inplace(None);
             multilinear::gpu::force_coset_openings(Some(false));
             let served = multilinear::gpu::coset_openings();
             let (_, reencoded) = stack.prove(&cfg, Some(drop));
