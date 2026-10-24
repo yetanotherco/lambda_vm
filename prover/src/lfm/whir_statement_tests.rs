@@ -69,8 +69,9 @@ fn counts() -> TableCounts {
         ecsm: 1,
         ecdas: 1,
         hint: 1,
-        commit: 1,
+        copy: 1,
         blake3: 1,
+        is_wh: 1,
     }
 }
 

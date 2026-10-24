@@ -53,9 +53,7 @@ use stark::traits::AIR;
 use crate::statement::{self, MULTILINEAR_TAG};
 use crate::tables::trace_builder::Traces;
 use crate::test_utils::{E, F};
-use crate::{
-    Error, FIXED_TABLE_COUNT, MaxRowsConfig, ProofOptions, RuntimePageRange, TableCounts, VmAirs,
-};
+use crate::{Error, FIXED_TABLE_COUNT, MaxRowsConfig, ProofOptions, RuntimePageRange, TableCounts};
 
 /// One table's height and main width — the shape the verifier needs to rebuild
 /// its layout, and all it needs.
@@ -322,17 +320,18 @@ pub fn prove_with_options_and_inputs(
         .count();
     let public_output = traces.public_output_bytes.clone();
 
-    let airs = VmAirs::new(
+    let inputs = crate::BlockAirInputs::new(
+        proof_options,
+        &program,
+        crate::cpu_heights_from_traces(&traces),
+        &public_output,
+    )?;
+    let airs = crate::block_airs(
         &program,
         proof_options,
-        false,
         &traces.page_configs,
         &table_counts,
-        None,
-        true,
-        None,
-        None,
-        None,
+        &inputs,
     );
 
     let mut pairs = airs.air_trace_pairs(&mut traces);
@@ -516,17 +515,26 @@ pub fn verify_with_options(
         )));
     }
 
-    let airs = VmAirs::new(
+    // The CPU heights the proof states fix the CPU timestamps and the final PC
+    // timestamp; REGISTER's FINI is the halted file of the public output.
+    let cpu_start = crate::cpu_proof_start(true, &proof.table_counts);
+    let cpu_heights: Vec<usize> = cpu_start
+        .checked_add(proof.table_counts.cpu)
+        .and_then(|end| proof.table_num_vars.get(cpu_start..end))
+        .ok_or_else(|| {
+            Error::InvalidTableCounts("the proof states fewer heights than CPU tables".into())
+        })?
+        .iter()
+        .map(|&vars| 1usize << vars.min(63))
+        .collect();
+    let inputs =
+        crate::BlockAirInputs::new(proof_options, &program, cpu_heights, &proof.public_output)?;
+    let airs = crate::block_airs(
         &program,
         proof_options,
-        false,
         &page_configs,
         &proof.table_counts,
-        None,
-        true,
-        None,
-        None,
-        None,
+        &inputs,
     );
     let air_refs = airs.air_refs();
     if air_refs.len() != proof.proof.tables.len() {

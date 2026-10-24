@@ -143,7 +143,7 @@ fn tamper_with(
     }
 }
 
-const PROGRAMS: [&str; 10] = [
+const PROGRAMS: [&str; 12] = [
     "sub",
     "all_instructions_64",
     "lw_sw_offset_odd",
@@ -154,6 +154,8 @@ const PROGRAMS: [&str; 10] = [
     "test_blake3_absorb",
     "test_commit_split",
     "test_ecsm",
+    "test_copy_ecalls",
+    "test_copy_overlaps",
 ];
 
 /// ★ Walked from their entries, at every window length (one cycle, less than a
@@ -343,7 +345,8 @@ fn each_check_catches_what_it_guards() {
 
 /// The bytes each value-only reader reads in a walked window: HINT's input,
 /// ECSM's operands, KECCAK's and BLAKE3's states, the absorb's control block
-/// and message, COMMIT's buffer.
+/// and message. (The bytes COPY moves, the committed output's among them, are
+/// read and written through MEMW ops like any load's.)
 fn value_reads(window: &WalkedWindow) -> Vec<(&'static str, u64, u64)> {
     let w = &window.walk;
     let mut out = Vec::new();
@@ -366,7 +369,6 @@ fn value_reads(window: &WalkedWindow) -> Vec<(&'static str, u64, u64)> {
         out.push(("absorb control", o.ctrl_addr, 32));
         out.push(("absorb message", o.msg_addr, 64 * o.blocks.len() as u64));
     }
-    out.extend(w.commit_ops.iter().map(|o| ("COMMIT buffer", o.address, 1)));
     out
 }
 
@@ -467,7 +469,6 @@ fn a_dropped_entry_a_value_only_reader_reads_is_refused() {
         "BLAKE3 state",
         "absorb control",
         "absorb message",
-        "COMMIT buffer",
     ] {
         assert!(
             seen.contains_key(reader),
@@ -592,6 +593,8 @@ fn windows_walked_on_threads_build_the_whole_run_tables() {
         "test_keccak_multi",
         "test_ecsm",
         "test_commit_split",
+        "test_copy_ecalls",
+        "test_copy_overlaps",
     ] {
         let (program, logs) = run(name);
         let reference = whole(&program, &logs, &max_rows);

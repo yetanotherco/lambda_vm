@@ -19,7 +19,9 @@ use stark::proof::options::BaseFormat;
 /// The median 25475471's tables (ULTRA mc12's BLOCK CENSUS, #1013), AIR order
 /// after the fixed tables: `(kind, [(rows, count)])`, and its 198 pages.
 const MEDIAN_MIX: &[(&str, &[(usize, usize)])] = &[
-    ("COMMIT", &[(256, 1)]),
+    // COMMIT's table then; COPY sits in its place now, and the old guest wrote its
+    // 160-byte output through it in one table of this height.
+    ("COPY", &[(256, 1)]),
     ("KECCAK", &[(1 << 17, 1)]),
     ("KECCAK_RND", &[(1 << 16, 35), (1 << 15, 1)]),
     ("ECSM", &[(2048, 1)]),
@@ -82,8 +84,9 @@ pub(super) fn median_statement(
         ecsm: 0,
         ecdas: 0,
         hint: 0,
-        commit: 0,
+        copy: 0,
         blake3: 0,
+        is_wh: 0,
     };
     let mut rows: Vec<usize> = vec![32; crate::FIXED_TABLE_COUNT];
     for &(kind, runs) in MEDIAN_MIX {
@@ -99,7 +102,7 @@ pub(super) fn median_statement(
         let n: usize = runs.iter().map(|&(_, c)| c).sum();
         rows.extend(runs.iter().flat_map(|&(r, c)| std::iter::repeat_n(r, c)));
         let slot = match kind {
-            "COMMIT" => &mut counts.commit,
+            "COPY" => &mut counts.copy,
             "KECCAK" => &mut counts.keccak,
             "KECCAK_RND" => &mut counts.keccak_rnd,
             "ECSM" => &mut counts.ecsm,
@@ -140,11 +143,11 @@ pub(super) fn median_statement(
         false,
         &page_configs,
         &counts,
+        &vec![4; counts.cpu],
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(opts, &elf, &[]).preprocessed(),
     );
     // The fixed tables at their preprocessed columns' heights, so group 0
     // emits too (HALT, which has none, stays at the placeholder).

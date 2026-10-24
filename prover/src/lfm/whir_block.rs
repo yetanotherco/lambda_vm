@@ -1388,6 +1388,8 @@ enum Route {
     ConstMle(Vec<Vec<FE>>),
     Page(Vec<Vec<FE>>),
     Prepared(usize),
+    /// A CPU table's TIMESTAMP, by its closed form.
+    Timestamp,
 }
 
 fn route_of(
@@ -1408,6 +1410,13 @@ fn route_of(
             crate::tables::page::preprocessed_columns(config)
         };
         return Ok(Route::Page(columns));
+    }
+    // A CPU table's TIMESTAMP is checked by its closed form, by name and with its
+    // AIR's one preprocessed column: never materialised (2^21 rows a table).
+    if air.name().starts_with(super::whir_epoch::CPU_NAME_PREFIX)
+        && air.num_precomputed_columns() == crate::tables::cpu::NUM_PRECOMPUTED_COLS
+    {
+        return Ok(Route::Timestamp);
     }
     let columns = air.precomputed_columns();
     if columns.is_empty() {
@@ -1610,7 +1619,8 @@ fn emit_leaf_over(
         let plans: Vec<PreprocessedPlan<'_>> = routes
             .iter()
             .zip(&views)
-            .map(|(route, view)| match route {
+            .enumerate()
+            .map(|(index, (route, view))| match route {
                 Route::None => PreprocessedPlan {
                     settled: 0,
                     route: PreprocessedRoute::None,
@@ -1633,6 +1643,12 @@ fn emit_leaf_over(
                 Route::Prepared(settled) => PreprocessedPlan {
                     settled: *settled,
                     route: PreprocessedRoute::None,
+                },
+                Route::Timestamp => PreprocessedPlan {
+                    settled: 0,
+                    route: PreprocessedRoute::Timestamp {
+                        num_vars: shapes[index].num_vars,
+                    },
                 },
             })
             .collect();

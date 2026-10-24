@@ -129,11 +129,16 @@ fn vm_round_trip_elf(
         false,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(
+            &options,
+            &program,
+            &traces.public_output_bytes,
+        )
+        .preprocessed(),
     );
     let mut pairs = airs.air_trace_pairs(&mut traces);
     let shapes: Vec<(usize, usize)> = pairs
@@ -398,6 +403,7 @@ fn epochs_round_trip(name: &str, log: u32) -> (usize, Vec<String>) {
             );
             let reg_fini = register::fini_from_trace(&traces.register);
             let table_counts = traces.table_counts();
+            let cpu_heights = crate::cpu_heights_from_traces(&traces);
             let public_output = traces.public_output_bytes.clone();
             let build_airs = || {
                 (
@@ -406,6 +412,7 @@ fn epochs_round_trip(name: &str, log: u32) -> (usize, Vec<String>) {
                         &opts,
                         &[],
                         &table_counts,
+                        &cpu_heights,
                         &register_init,
                         &reg_fini,
                         is_final,

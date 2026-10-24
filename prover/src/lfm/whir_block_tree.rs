@@ -2020,10 +2020,11 @@ pub fn prove_whir_block_tree(
             .collect();
         sink.line(&format!("W3 LT HEIGHTS: {lt:?}"));
         sink.line(&format!(
-            "W3 CHUNKED: {} (cuts KECCAK 2^{} · ECSM 2^{})",
+            "W3 CHUNKED: {} (cuts KECCAK 2^{} · ECSM 2^{} · COPY 2^{})",
             block_whir::chunked_census(&proof.table_counts, &proof.table_num_vars),
             options.keccak_rows_log2,
             options.ecsm_rows_log2,
+            options.copy_rows_log2,
         ));
         // Each group's tables by AIR, in the group's order: which tables the
         // card waited for, and where the layout's chunks went.
@@ -2337,8 +2338,9 @@ pub fn prove_whir_block_tree(
 /// The proof file's first bytes (the STARK block tree's file shares them).
 const PROOF_MAGIC: [u8; 8] = *b"LVMBLKTR";
 
-/// The proof file's layout version.
-const PROOF_VERSION: u32 = 1;
+/// The proof file's layout version. 2: the archived `TableCounts` gained
+/// `is_wh`, so a version-1 file is a different layout.
+const PROOF_VERSION: u32 = 2;
 
 /// Which tree a proof file holds: the STARK block tree (0) or this one. A
 /// verifier refuses the other's file by its tag, before reading it as its own.
@@ -2621,8 +2623,9 @@ mod tests {
             ecsm: 1,
             ecdas: 1,
             hint: 0,
-            commit: 1,
+            copy: 1,
             blake3: 0,
+            is_wh: 0,
         };
         let statement = block_whir::OwnedBlockStatement {
             table_num_vars: vec![21, 16, 6],

@@ -2259,8 +2259,9 @@ fn host_statement_challenges(f: &StatementFixture) -> (ExtFE, ExtFE) {
         ecsm: c[16],
         ecdas: c[17],
         hint: c[18],
-        commit: c[19],
+        copy: c[19],
         blake3: c[20],
+        is_wh: c[21],
     };
     let ranges: Vec<RuntimePageRange> = shape
         .page_ranges
@@ -4352,7 +4353,7 @@ fn the_emitted_lde_matches_productions_transform() {
 }
 
 /// ★ The whole derivation, against production's own
-/// `compute_precomputed_commitment_with_fini`, across the blowup sweep.
+/// `compute_precomputed_commitment`, across the blowup sweep.
 ///
 /// Two register files per blowup and they do different jobs. The REAL fixture's
 /// file is what the target runs on; a SYNTHETIC one where all 67 entries are
@@ -4371,9 +4372,8 @@ fn the_register_derivation_matches_production() {
             let arenas = register_arenas(&init, &fini);
             let exec = super::executor::execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
                 .unwrap_or_else(|e| panic!("blowup {blowup} / {what}: execution failed: {e:?}"));
-            let expected = crate::tables::register::compute_precomputed_commitment_with_fini(
-                &opts, &init, &fini,
-            );
+            let expected =
+                crate::tables::register::compute_precomputed_commitment(&opts, &init, &fini);
             assert_eq!(
                 digest_bytes(&exec.public_words),
                 expected,
@@ -4644,7 +4644,7 @@ fn the_register_derivation_proves_and_verifies() {
 
     assert_eq!(
         digest_bytes(&proved.public_words),
-        crate::tables::register::compute_precomputed_commitment_with_fini(&inner, &init, &fini),
+        crate::tables::register::compute_precomputed_commitment(&inner, &init, &fini),
         "the proved root must equal the fixture epoch's own REGISTER commitment"
     );
     assert!(

@@ -21,7 +21,7 @@ fn test_generate_register_trace_empty() {
     let final_state = FinalRegisterStateMap::new();
     let trace = generate_register_trace(&final_state, &register_init_from_entry_point(entry_point));
 
-    // Should have power-of-2 rows >= 67 (x0-x31, x254, x255)
+    // Should have power-of-2 rows >= 68 (x0-x31, x254, x255)
     assert!(trace.num_rows() >= NUM_REGISTER_ADDRESSES);
     assert!(trace.num_rows().is_power_of_two());
 
@@ -32,24 +32,25 @@ fn test_generate_register_trace_empty() {
     assert_eq!(*trace.main_table.get(0, cols::FINI), FE::zero());
     assert_eq!(*trace.main_table.get(0, cols::TIMESTAMP_LO), FE::from(1u64));
 
-    // Check x254 row (row 64 = addr 508)
+    // Check x254 rows (row 64 = addr 508, row 65 = addr 509)
     assert_eq!(*trace.main_table.get(64, cols::OFFSET), FE::from(508u64));
     assert_eq!(*trace.main_table.get(64, cols::INIT), FE::zero());
     assert_eq!(*trace.main_table.get(64, cols::FINI), FE::zero());
+    assert_eq!(*trace.main_table.get(65, cols::OFFSET), FE::from(509u64));
 
-    // Check x255 rows (row 65 = addr 510, row 66 = addr 511)
-    assert_eq!(*trace.main_table.get(65, cols::OFFSET), FE::from(510u64));
+    // Check x255 rows (row 66 = addr 510, row 67 = addr 511)
+    assert_eq!(*trace.main_table.get(66, cols::OFFSET), FE::from(510u64));
     assert_eq!(
-        *trace.main_table.get(65, cols::INIT),
+        *trace.main_table.get(66, cols::INIT),
         FE::from(entry_point & 0xFFFF_FFFF)
     );
     assert_eq!(
-        *trace.main_table.get(65, cols::FINI),
+        *trace.main_table.get(66, cols::FINI),
         FE::from(entry_point & 0xFFFF_FFFF)
     ); // fini=init when never accessed
-    assert_eq!(*trace.main_table.get(66, cols::OFFSET), FE::from(511u64));
+    assert_eq!(*trace.main_table.get(67, cols::OFFSET), FE::from(511u64));
     assert_eq!(
-        *trace.main_table.get(66, cols::INIT),
+        *trace.main_table.get(67, cols::INIT),
         FE::from(entry_point >> 32)
     );
 }
@@ -82,8 +83,8 @@ fn test_generate_register_trace_with_access() {
 
 #[test]
 fn test_bus_interactions() {
-    let interactions = bus_interactions();
-    assert_eq!(interactions.len(), 2); // C1, C2
+    let interactions = bus_interactions(0);
+    assert_eq!(interactions.len(), 3); // C1, C2 (PC), C2
 }
 
 #[test]
@@ -102,15 +103,15 @@ fn test_fini_from_trace_reads_every_register() {
     // One entry per real register Word address, in register_word_address_list order
     // (positions 0..63 are addresses 0..63, so addr a is at index a for a < 64).
     assert_eq!(fini.len(), NUM_REGISTER_ADDRESSES);
-    // Accessed register reflects its written value; PC (x255, addr 510 = index 65)
+    // Accessed register reflects its written value; PC (x255, addr 510 = index 66)
     // reflects entry point; x0 (addr 0 = index 0) ends at 0.
     assert_eq!(fini[10], 0x42);
-    assert_eq!(fini[65], 0x1000);
+    assert_eq!(fini[66], 0x1000);
     assert_eq!(fini[0], 0);
 }
 
 #[test]
-fn test_precomputed_commitment_with_fini_binds_fini() {
+fn test_precomputed_commitment_binds_fini() {
     let opts = ProofOptions::default_test_options();
     let init = register_init_from_entry_point(0x1000);
     // Fini vectors in register_word_address_list order (index = address for a < 64).
@@ -120,50 +121,45 @@ fn test_precomputed_commitment_with_fini_binds_fini() {
     let mut fini_b = fini_a.clone();
     fini_b[10] = 0x43; // a different final value at one address
 
-    let root_a = compute_precomputed_commitment_with_fini(&opts, &init, &fini_a);
-    let root_a2 = compute_precomputed_commitment_with_fini(&opts, &init, &fini_a);
-    let root_b = compute_precomputed_commitment_with_fini(&opts, &init, &fini_b);
+    let root_a = compute_precomputed_commitment(&opts, &init, &fini_a);
+    let root_a2 = compute_precomputed_commitment(&opts, &init, &fini_a);
+    let root_b = compute_precomputed_commitment(&opts, &init, &fini_b);
 
     // Deterministic, and sensitive to every fini value: a tampered R_{i+1} yields a
     // different preprocessed root, so a trace whose FINI != the committed R_{i+1}
     // fails the verifier's preprocessed-root check.
     assert_eq!(root_a, root_a2);
     assert_ne!(root_a, root_b);
-
-    // The 3-column (with-fini) commitment differs from the 2-column monolithic one.
-    assert_ne!(root_a, compute_precomputed_commitment(&opts, &init));
 }
 
 /// The columns the multilinear verifier checks are the ones the univariate
 /// verifier's root commits, and the declared count is theirs.
 ///
-/// ⚠ THREE SEPARATE THINGS COULD DRIFT and each has its own assertion here:
-/// the count constant against the columns function, the columns function
-/// against the commitment's own construction (extending the monolithic pair
-/// rather than re-deriving it), and FINI's position in the column order. The
-/// count is the one a caller writes down — `VmAirs::new` declares
-/// `NUM_PREPROCESSED_COLS_WITH_FINI` beside a closure that must produce exactly
-/// that many, and a mismatch there is a verifier checking a prefix of what it
-/// thinks it checks.
+/// ⚠ TWO SEPARATE THINGS COULD DRIFT and each has its own assertion here:
+/// the count constant against the columns function, and each column's
+/// position in the order. The count is the one a caller writes down —
+/// `VmAirs::new` declares `NUM_PREPROCESSED_COLS` beside a closure that must
+/// produce exactly that many, and a mismatch there is a verifier checking a
+/// prefix of what it thinks it checks.
 #[test]
-fn the_with_fini_columns_are_what_the_with_fini_commitment_holds() {
+fn the_preprocessed_columns_are_what_the_commitment_holds() {
     let init = register_init_from_entry_point(0x1000);
     let mut fini = vec![0u32; NUM_REGISTER_ADDRESSES];
     fini[10] = 0x42;
     fini[X254_INDEX] = 9;
 
-    let columns = preprocessed_columns_with_fini(&init, &fini);
+    let columns = preprocessed_columns(&init, &fini);
     assert_eq!(
         columns.len(),
-        NUM_PREPROCESSED_COLS_WITH_FINI,
+        NUM_PREPROCESSED_COLS,
         "the declared preprocessed count and the columns built for it disagree"
     );
 
-    // OFFSET and INIT are the monolithic pair, unchanged: the continuation
-    // variant EXTENDS it, so the two paths cannot commit different addresses.
-    let monolithic = preprocessed_columns(&init);
-    assert_eq!(monolithic.len(), NUM_PREPROCESSED_COLS);
-    assert_eq!(&columns[..NUM_PREPROCESSED_COLS], &monolithic[..]);
+    // INIT is `init`, in the register word-address order.
+    let init_col = &columns[cols::INIT];
+    for (k, &word) in init.iter().enumerate() {
+        assert_eq!(init_col[k], FE::from(u64::from(word)), "INIT row {k}");
+    }
 
     // FINI is last, and it is `fini` — read at two addresses that differ, so a
     // column of zeros or a duplicated INIT fails.
@@ -215,5 +211,52 @@ fn fini_from_final_state_matches_trace() {
     assert_eq!(
         fini_from_final_state(&empty, &init),
         fini_from_trace(&trace)
+    );
+}
+
+/// IS_PC (preprocessed) marks exactly the two x255 rows.
+#[test]
+fn test_is_pc_marks_only_the_pc_rows() {
+    let trace = generate_register_trace(
+        &FinalRegisterStateMap::new(),
+        &register_init_from_entry_point(0x1000),
+    );
+    for row in 0..trace.num_rows() {
+        let offset = trace.main_table.get(row, cols::OFFSET).to_raw();
+        let is_pc = row < NUM_REGISTER_ADDRESSES && (offset == 510 || offset == 511);
+        assert_eq!(
+            *trace.main_table.get(row, cols::IS_PC),
+            FE::from(u64::from(is_pc)),
+            "row {row} (offset {offset})"
+        );
+    }
+}
+
+/// REG-C2 splits on IS_PC: x255 is finalized at the verifier's `final_pc_ts`,
+/// every other register at its TIMESTAMP column (spec `halt.typ`).
+#[test]
+fn test_pc_final_token_uses_verifier_timestamp() {
+    use stark::lookup::Multiplicity;
+    let final_pc_ts = 4 * 1024 + 1;
+    let interactions = bus_interactions(final_pc_ts);
+    let pc_fini = interactions
+        .iter()
+        .find(|i| matches!(i.multiplicity, Multiplicity::Column(c) if c == cols::IS_PC))
+        .expect("x255 final token");
+    assert!(pc_fini.is_sender);
+    assert!(
+        format!("{:?}", pc_fini.values[3]).contains(&format!("Constant({final_pc_ts})")),
+        "x255 final timestamp is the constant final_pc_ts: {:?}",
+        pc_fini.values[3]
+    );
+    let gp_fini = interactions
+        .iter()
+        .find(|i| matches!(i.multiplicity, Multiplicity::Negated(c) if c == cols::IS_PC))
+        .expect("general register final token");
+    assert!(
+        format!("{:?}", gp_fini.values[3])
+            .contains(&format!("start_column: {}", cols::TIMESTAMP_LO)),
+        "{:?}",
+        gp_fini.values[3]
     );
 }

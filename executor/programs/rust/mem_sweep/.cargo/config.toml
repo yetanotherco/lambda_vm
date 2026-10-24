@@ -6,9 +6,8 @@ rustflags = [
   "-C", "passes=lower-atomic",
   # compiler_builtins turns its `mem-unaligned` setting on for x86, aarch64 and bpf only,
   # so on RISC-V its `memmove` reassembles every misaligned word with shifts; this VM
-  # executes an unaligned doubleword access as one instruction. Only compiler_builtins
-  # reads the name, in its own build script, with no stability guarantee: a bump of the
-  # Makefile's pinned nightly can turn this into a silent no-op, which
-  # `executor/tests/rust.rs::test_mem_sweep` catches by counting memmove's instructions.
+  # executes an unaligned doubleword access as one instruction. With the copy
+  # accelerator's stubs linked, `memmove` is not the library's, so the setting reaches
+  # only the library routines this guest still takes (`memcmp`).
   "--cfg", "feature=\"mem-unaligned\""
 ]

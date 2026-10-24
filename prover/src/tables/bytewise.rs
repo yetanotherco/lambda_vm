@@ -20,7 +20,7 @@ use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
 use super::gpack::{TraceForm, WidthHint, generate_main};
-use super::types::{BusId, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
+use super::types::{BusId, GoldilocksExtension, GoldilocksField, VmTable, alu_op, dedup_rows};
 
 // =========================================================================
 // Column indices for BYTEWISE table
@@ -93,8 +93,10 @@ impl BytewiseOperation {
 
 /// Generates the BYTEWISE trace from a list of operations.
 ///
-/// Duplicate operations are merged with summed multiplicities, then padded to
-/// the next power of two (minimum 4).
+/// Duplicate operations are merged with summed multiplicities, split at
+/// [`MU_MAX`](crate::tables::types::MU_MAX) (see
+/// [`dedup_rows`]), then padded to the next
+/// power of two (minimum 4).
 pub fn generate_bytewise_trace(
     operations: &[BytewiseOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
@@ -109,14 +111,7 @@ pub fn generate_bytewise_trace_as(
     operations: &[BytewiseOperation],
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    use super::trace_hash::{OpMap, trace_hash_state};
-
-    let mut op_map: OpMap<BytewiseOperation, u64> = OpMap::with_hasher(trace_hash_state());
-    for op in operations {
-        *op_map.entry(op.clone()).or_insert(0) += 1;
-    }
-
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let unique_ops = dedup_rows(operations);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
         for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
@@ -137,6 +132,7 @@ pub fn generate_bytewise_trace_as(
 
 /// All bus interactions for the BYTEWISE table:
 /// - **Sends** `BYTE_ALU[op, a[i], b[i]] -> res[i]` for each of the 8 bytes.
+/// - **Sends** `ARE_BYTES[μ, 0]` to bound the multiplicity.
 /// - **Receives** `ALU[a, b, op] -> res` (operands packed DWordBL -> 2 words).
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(9);
@@ -165,6 +161,23 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ],
         ));
     }
+
+    // IS_BYTE[μ] = ARE_BYTES[μ, 0] | 1. Bounds μ to a byte and keeps it
+    // non-negative: the eight BYTE_ALU sends above are weighted by μ, so a free
+    // μ = −1 would invert them and let the row hold an out-of-range byte.
+    // Multiplicity 1 (the spec's default `cond`), so padding rows send
+    // ARE_BYTES[0, 0] too. See `types::MU_MAX`.
+    interactions.push(BusInteraction::sender(
+        BusId::AreBytes,
+        Multiplicity::One,
+        vec![
+            BusValue::Packed {
+                start_column: cols::MU,
+                packing: Packing::Direct,
+            },
+            BusValue::constant(0),
+        ],
+    ));
 
     // ALU[a, b, op] -> res (receiver). a/b/res are DWordBL (8 bytes) packed
     // into 2 words each, matching the CPU's DWordWL operands.

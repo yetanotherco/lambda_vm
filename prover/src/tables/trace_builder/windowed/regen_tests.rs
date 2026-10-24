@@ -89,7 +89,8 @@ fn the_regeneration_walk_is_the_walk_on_its_streamed_lists() {
                     full_reg,
                     &mut full,
                     false,
-                );
+                )
+                .expect("the walk");
                 let mut lite = WalkOutputs::for_walk(cpu_ops.len(), false);
                 collect_streamed_ops_from_cpu_into(
                     &cpu_ops,
@@ -97,7 +98,8 @@ fn the_regeneration_walk_is_the_walk_on_its_streamed_lists() {
                     lite_mem,
                     lite_reg,
                     &mut lite,
-                );
+                )
+                .expect("the walk");
                 assert_eq!(
                     streamed_lists(&cpu_ops, &full),
                     streamed_lists(&cpu_ops, &lite),
@@ -105,7 +107,7 @@ fn the_regeneration_walk_is_the_walk_on_its_streamed_lists() {
                 );
                 let rest = |w: &WalkOutputs| {
                     w.bitwise_ops.len()
-                        + w.commit_ops.len()
+                        + w.copy_ops.len()
                         + w.keccak_ops.len()
                         + w.blake3_ops.len()
                         + w.blake3_absorb_ops.len()

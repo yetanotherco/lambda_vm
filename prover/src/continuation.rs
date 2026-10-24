@@ -39,7 +39,7 @@
 //!
 //! The x254 commit index is carried across epochs by that same register binding,
 //! so a continuation epoch indexes its commits from the carried value: both the
-//! COMMIT trace (`current_commit_index` seeded from x254) and the verifier's
+//! COPY trace (`current_commit_index` seeded from x254) and the verifier's
 //! `compute_commit_bus_offset` (a `start_index` parameter) count from it, and the
 //! driver concatenates each epoch's committed bytes into the run-wide output.
 //!
@@ -1813,6 +1813,7 @@ pub(crate) fn build_epoch_airs(
     opts: &ProofOptions,
     page_configs: &[PageConfig],
     table_counts: &TableCounts,
+    cpu_heights: &[usize],
     register_init: &[u32],
     reg_fini: &[u32],
     is_final: bool,
@@ -1822,24 +1823,20 @@ pub(crate) fn build_epoch_airs(
     // final register file is a verifier-known public value bound by the REG-C2
     // Memory-bus token; reusing the same R_{i+1} as the next epoch's INIT binds
     // init(epoch i+1) == fini(epoch i).
-    let register_preprocessed = Some(crate::RegisterPreprocessed {
-        commitment: register::compute_precomputed_commitment_with_fini(
-            opts,
-            register_init,
-            reg_fini,
-        ),
+    let register_preprocessed = crate::RegisterPreprocessed {
+        commitment: register::compute_precomputed_commitment(opts, register_init, reg_fini),
         init: register_init,
         fini: reg_fini,
-    });
+    };
     VmAirs::new(
         elf,
         opts,
         false,
         page_configs,
         table_counts,
+        cpu_heights,
         decode_commitment,
         is_final,
-        None,
         None,
         register_preprocessed,
     )
@@ -1895,6 +1892,8 @@ fn prep_epoch(
     let reg_fini = register::fini_from_trace(&traces.register);
 
     let table_counts = traces.table_counts();
+    let cpu_heights = crate::cpu_heights_from_traces(&traces);
+    crate::tables::cpu::validate_heights(&cpu_heights)?;
     let public_output = traces.public_output_bytes.clone();
     let runtime_page_ranges = traces.runtime_page_ranges();
 
@@ -1903,6 +1902,7 @@ fn prep_epoch(
         opts,
         &[],
         &table_counts,
+        &cpu_heights,
         register_init,
         &reg_fini,
         is_final,
@@ -2081,6 +2081,18 @@ pub(crate) fn reconstruct_epoch_airs(
         return Ok(None);
     }
 
+    // Every CPU timestamp of the epoch, and the final PC timestamp, follow from
+    // the CPU heights; reject an epoch over the per-epoch row bound before they
+    // size anything.
+    let Some(cpu_heights) =
+        crate::cpu_heights_from_proofs(epoch.per_table_proof(), &table_counts, is_final)
+    else {
+        return Ok(None);
+    };
+    if crate::tables::cpu::validate_heights(&cpu_heights).is_err() {
+        return Ok(None);
+    }
+
     let reg_fini = epoch.reg_fini()?;
     let runtime_page_ranges = epoch.runtime_page_ranges()?;
 
@@ -2089,6 +2101,7 @@ pub(crate) fn reconstruct_epoch_airs(
         opts,
         &[],
         &table_counts,
+        &cpu_heights,
         register_init,
         &reg_fini,
         is_final,
@@ -2675,7 +2688,29 @@ pub fn prove_continuation_keeping_decode(
         epoch_size_log2,
         opts,
         base_prep_ahead(),
+        &MaxRowsConfig::default(),
     )
+}
+
+/// [`prove_continuation`] with explicit per-table row limits, so an epoch can be
+/// split over several CPU tables (tests use [`MaxRowsConfig::small`]).
+#[cfg(test)]
+pub(crate) fn prove_continuation_with_max_rows(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    opts: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+) -> Result<ContinuationProof, Error> {
+    prove_continuation_scheduled(
+        elf_bytes,
+        private_inputs,
+        epoch_size_log2,
+        opts,
+        base_prep_ahead(),
+        max_rows,
+    )
+    .map(|(bundle, _)| bundle)
 }
 
 /// [`prove_continuation_keeping_decode`] with the preparation's schedule named
@@ -2690,6 +2725,7 @@ pub(crate) fn prove_continuation_scheduled(
     epoch_size_log2: u32,
     opts: &ProofOptions,
     prep_ahead: bool,
+    max_rows: &MaxRowsConfig,
 ) -> Result<(ContinuationProof, Commitment), Error> {
     // The observer a caller installed for this thread, if any. It sees the
     // pipeline and changes nothing in it.
@@ -2702,6 +2738,14 @@ pub(crate) fn prove_continuation_scheduled(
             "epoch_size_log2 must be at least 2 (4 cycles)".to_string(),
         ));
     }
+    // An epoch over the per-epoch CPU row bound fails here, not after its run.
+    if epoch_size_log2 > crate::tables::cpu::MAX_EPOCH_SIZE_LOG2 {
+        return Err(Error::InvalidContinuationEpochSize(format!(
+            "epoch_size_log2 {epoch_size_log2} exceeds the maximum {}",
+            crate::tables::cpu::MAX_EPOCH_SIZE_LOG2
+        )));
+    }
+    crate::tables::cpu::validate_max_rows(max_rows.cpu)?;
     let epoch_size = 1usize.checked_shl(epoch_size_log2).ok_or_else(|| {
         Error::InvalidContinuationEpochSize(format!(
             "epoch_size_log2 {epoch_size_log2} is too large for this platform"
@@ -2923,7 +2967,7 @@ pub(crate) fn prove_continuation_scheduled(
                     // only image consumers in the build) are skipped.
                     None::<&std::collections::HashMap<u64, u8>>,
                     &job.register_init,
-                    &MaxRowsConfig::default(),
+                    max_rows,
                     private_inputs,
                     job.is_final,
                     true,
@@ -3433,6 +3477,21 @@ fn verify_continuation_view(
         let l2g_root = epoch.l2g_root();
         let epoch_public_output = epoch.public_output();
 
+        // The final epoch's `reg_fini` has no next epoch to bind it, so pin it to
+        // the halted register file (as the monolithic verifier does): this ends the
+        // PC chain on `pc = 1`, so execution cannot continue past the exit ecall.
+        // x254 counts every byte committed across the run.
+        if is_final {
+            let Ok(committed_bytes) =
+                u32::try_from(public_output.len() + epoch_public_output.len())
+            else {
+                return Ok(None);
+            };
+            if epoch.reg_fini()? != register::halted_fini(committed_bytes) {
+                return Ok(None);
+            }
+        }
+
         if !verify_epoch(
             &elf,
             elf_bytes,
@@ -3573,6 +3632,10 @@ pub(crate) mod test_fault {
 }
 
 #[cfg(test)]
+#[path = "tests/halt_continuation_poc.rs"]
+mod halt_continuation_poc;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::asm_elf_bytes;
@@ -3675,7 +3738,7 @@ mod tests {
     // `test_commit_split` issues two Commit syscalls, one early and one late, so a
     // small epoch puts the second commit in a later epoch. That epoch starts with
     // x254 > 0 (the carried commit index), which exercises the cross-epoch commit
-    // indexing: both the COMMIT trace and the verifier's `compute_commit_bus_offset`
+    // indexing: both the COPY trace and the verifier's `compute_commit_bus_offset`
     // index from the carried x254 rather than 0. Regression test for that fix.
     #[test]
     fn test_commit_across_epochs_verifies() {
@@ -3821,6 +3884,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_dma_memcpy_across_continuation_epochs() {
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .to_path_buf();
+        let elf_bytes = std::fs::read(
+            workspace_root.join("executor/program_artifacts/rust/dma_memcpy_min.elf"),
+        )
+        .expect("dma_memcpy_min.elf not found — build its make target");
+        let opts = ProofOptions::default_test_options();
+
+        let bundle = prove_continuation(&elf_bytes, &[], 6, &opts)
+            .expect("DMA continuation proof generation");
+        assert!(
+            bundle.num_epochs() > 1,
+            "64-cycle epochs must split the DMA guest"
+        );
+
+        let output = verify_continuation(&elf_bytes, &bundle, &opts)
+            .expect("DMA continuation verification")
+            .expect("honest DMA continuation must verify");
+        assert_eq!(
+            output, b"DMA copies eight-byte rows and a short tail",
+            "continuation output must match the copied bytes"
+        );
+    }
+
     /// Each epoch drops the chips it never reaches, and it decides that on its
     /// own: a table missing from one epoch still shows up in another that does
     /// use it. The skip is not a property of the run, it is a property of the
@@ -3865,7 +3956,7 @@ mod tests {
                     ("ecsm", c.ecsm),
                     ("ecdas", c.ecdas),
                     ("hint", c.hint),
-                    ("commit", c.commit),
+                    ("is_wh", c.is_wh),
                 ]
             })
             .collect();
@@ -4132,6 +4223,105 @@ mod tests {
         ));
     }
 
+    /// `2^30` cycles would put the epoch's last CPU row at timestamp `2^32`;
+    /// refused before the (empty) ELF is even loaded.
+    #[test]
+    fn test_continuation_rejects_epoch_over_cpu_row_bound() {
+        let max = crate::tables::cpu::MAX_EPOCH_SIZE_LOG2;
+        assert!((1u64 << max) <= crate::tables::cpu::MAX_CPU_ROWS);
+        assert!(matches!(
+            prove_continuation(&[], &[], max + 1, &ProofOptions::default_test_options()),
+            Err(Error::InvalidContinuationEpochSize(_))
+        ));
+    }
+
+    /// A CPU chunk size the verifier would refuse fails before execution.
+    #[test]
+    fn test_continuation_rejects_invalid_cpu_max_rows() {
+        for cpu in [0, 6, crate::tables::cpu::MAX_TABLE_ROWS * 2] {
+            let max_rows = MaxRowsConfig {
+                cpu,
+                ..MaxRowsConfig::small()
+            };
+            assert!(matches!(
+                prove_continuation_with_max_rows(
+                    &[],
+                    &[],
+                    4,
+                    &ProofOptions::default_test_options(),
+                    &max_rows
+                ),
+                Err(Error::InvalidTableCounts(_))
+            ));
+        }
+    }
+
+    /// Epochs split over several CPU tables: every table after the first sends
+    /// its timestamps from a non-zero base, the intermediate epochs (no HALT) read
+    /// their CPU heights from a shifted sub-proof index, and REGISTER consumes x255
+    /// at `4·N + 1` over all of the epoch's tables.
+    #[test]
+    fn test_continuation_with_several_cpu_tables_per_epoch_verifies() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_instructions_64");
+        let max_rows = MaxRowsConfig::small();
+        let epoch_size_log2 = max_rows.cpu.trailing_zeros() + 1;
+        let opts = ProofOptions::default_test_options();
+        let bundle =
+            prove_continuation_with_max_rows(&elf_bytes, &[], epoch_size_log2, &opts, &max_rows)
+                .unwrap();
+        assert!(
+            bundle.epochs.len() >= 2,
+            "need an intermediate epoch, got {} epochs",
+            bundle.epochs.len()
+        );
+        for epoch in &bundle.epochs[..bundle.epochs.len() - 1] {
+            assert!(
+                epoch.table_counts.cpu >= 2,
+                "every intermediate epoch spans several CPU tables"
+            );
+        }
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &opts)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Hostile CPU heights in an intermediate epoch (no HALT, so its CPU
+    /// sub-proofs start one index earlier): heights `validate_heights` refuses
+    /// and a valid but wrong height are both rejected, without panicking.
+    #[test]
+    fn test_continuation_rejects_hostile_epoch_cpu_heights() {
+        let elf_bytes = asm_elf_bytes("all_instructions_64");
+        let max_rows = MaxRowsConfig::small();
+        let epoch_size_log2 = max_rows.cpu.trailing_zeros() + 1;
+        let opts = ProofOptions::default_test_options();
+        let mut bundle =
+            prove_continuation_with_max_rows(&elf_bytes, &[], epoch_size_log2, &opts, &max_rows)
+                .unwrap();
+        // Epoch 0 must be intermediate (no HALT) for `cpu_proof_start(false, ..)`.
+        assert!(bundle.epochs.len() >= 2, "need an intermediate epoch");
+        let cpu = crate::cpu_proof_start(false, &bundle.epochs[0].table_counts);
+        assert_eq!(
+            bundle.epochs[0].proof.proofs[cpu].trace_length,
+            max_rows.cpu
+        );
+        for height in [6, 2 * crate::tables::cpu::MAX_TABLE_ROWS, 2 * max_rows.cpu] {
+            bundle.epochs[0].proof.proofs[cpu].trace_length = height;
+            assert!(
+                !matches!(verify_continuation(&elf_bytes, &bundle, &opts), Ok(Some(_))),
+                "height {height}"
+            );
+        }
+        bundle.epochs[0].proof.proofs[cpu].trace_length = max_rows.cpu;
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &opts)
+                .unwrap()
+                .is_some()
+        );
+    }
+
     // ---- Standalone (split) prover/verifier ----
 
     /// Preparing ahead of the prover moves each epoch's host preparation onto
@@ -4151,10 +4341,24 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_commit_split");
         let opts = ProofOptions::default_test_options();
-        let (on_prover, decode_on_prover) =
-            prove_continuation_scheduled(&elf_bytes, &[], 4, &opts, false).unwrap();
-        let (ahead, decode_ahead) =
-            prove_continuation_scheduled(&elf_bytes, &[], 4, &opts, true).unwrap();
+        let (on_prover, decode_on_prover) = prove_continuation_scheduled(
+            &elf_bytes,
+            &[],
+            4,
+            &opts,
+            false,
+            &MaxRowsConfig::default(),
+        )
+        .unwrap();
+        let (ahead, decode_ahead) = prove_continuation_scheduled(
+            &elf_bytes,
+            &[],
+            4,
+            &opts,
+            true,
+            &MaxRowsConfig::default(),
+        )
+        .unwrap();
         assert!(
             ahead.num_epochs() > 1,
             "16-cycle epochs must split the run, or the pipeline is not exercised"

@@ -267,7 +267,7 @@ fn census(air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>, l
 fn the_zerocheck_programs_and_their_live_sets() {
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
 
-    census(&create_cpu_air(&opts), "CPU");
+    census(&create_cpu_air(&opts, 0), "CPU");
     census(&create_bitwise_air(&opts), "BITWISE");
     census(&create_lt_air(&opts), "LT");
     census(&create_shift_air(&opts), "SHIFT");
@@ -284,9 +284,9 @@ fn the_zerocheck_programs_and_their_live_sets() {
     census(&create_branch_air(&opts), "BRANCH");
     census(&create_halt_air(&opts), "HALT");
     census(&create_hint_air(&opts), "HINT");
-    census(&create_commit_air(&opts), "COMMIT");
+    census(&create_copy_air(&opts), "COPY");
     census(&create_page_air(&opts, 0x1000), "PAGE");
-    census(&create_register_air(&opts), "REGISTER");
+    census(&create_register_air(&opts, 0), "REGISTER");
     census(&create_keccak_air(&opts), "KECCAK");
     census(&create_keccak_rnd_air(&opts), "KECCAK_RND");
     census(&create_keccak_rc_air(&opts), "KECCAK_RC");
@@ -306,7 +306,7 @@ pub(crate) type VmAir = Box<dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInp
 pub(crate) fn vm_airs() -> Vec<(VmAir, &'static str)> {
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
     vec![
-        (Box::new(create_cpu_air(&opts)), "CPU"),
+        (Box::new(create_cpu_air(&opts, 0)), "CPU"),
         (Box::new(create_bitwise_air(&opts)), "BITWISE"),
         (Box::new(create_lt_air(&opts)), "LT"),
         (Box::new(create_shift_air(&opts)), "SHIFT"),
@@ -323,9 +323,9 @@ pub(crate) fn vm_airs() -> Vec<(VmAir, &'static str)> {
         (Box::new(create_branch_air(&opts)), "BRANCH"),
         (Box::new(create_halt_air(&opts)), "HALT"),
         (Box::new(create_hint_air(&opts)), "HINT"),
-        (Box::new(create_commit_air(&opts)), "COMMIT"),
+        (Box::new(create_copy_air(&opts)), "COPY"),
         (Box::new(create_page_air(&opts, 0x1000)), "PAGE"),
-        (Box::new(create_register_air(&opts)), "REGISTER"),
+        (Box::new(create_register_air(&opts, 0)), "REGISTER"),
         (Box::new(create_keccak_air(&opts)), "KECCAK"),
         (Box::new(create_keccak_rnd_air(&opts)), "KECCAK_RND"),
         (Box::new(create_keccak_rc_air(&opts)), "KECCAK_RC"),

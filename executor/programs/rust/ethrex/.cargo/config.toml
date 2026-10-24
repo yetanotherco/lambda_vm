@@ -5,12 +5,10 @@ rustflags = [
   # compiler_builtins turns its `mem-unaligned` setting on for x86, aarch64 and bpf only,
   # so on RISC-V its `memmove` reassembles every misaligned word with shifts; this VM
   # executes an unaligned doubleword access as one instruction. Only compiler_builtins
-  # reads the name, in its own build script, with no stability guarantee: a bump of the
-  # Makefile's pinned nightly can turn this into a silent no-op, which
-  # `executor/tests/rust.rs::test_mem_sweep` catches by counting memmove's instructions
-  # in the sweep guest, which carries the same flag, and
-  # `test_ethrex_links_the_swept_memory_routines` checks that this guest's memmove is
-  # the sweep guest's.
+  # reads the name, in its own build script, with no stability guarantee. With the copy
+  # accelerator's stubs as `memcpy`, `memmove` and `memset`, it reaches only the routines
+  # this guest still takes from the library (`memcmp`), and the library `memmove` of a
+  # build with syscalls' `fast-memcpy` feature.
   "--cfg", "feature=\"mem-unaligned\""
 ]
 

@@ -539,9 +539,9 @@ pub fn stmt_arena_halves() -> u32 {
 pub fn epoch_statement_shape() -> super::statement_replay::EpochStatementShape {
     super::statement_replay::EpochStatementShape {
         public_output_len: STMT_PUBLIC_OUTPUT_LEN,
-        // Twenty-one: fourteen split families, six accelerators, BLAKE3.
+        // Twenty-two: fourteen split families, six accelerators, BLAKE3, IS_WH.
         table_counts: [
-            3, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            3, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
         ],
         num_private_input_pages: 2,
         fri_final_poly_log_degree: 7,
@@ -1192,7 +1192,7 @@ pub struct RegisterDerivationShape {
     /// Rows per Merkle leaf of the inner REGISTER tree: the inner table's leaf
     /// layout (`stark::leaf_layout::LeafLayout::rows_per_leaf`) — 2 today, 1
     /// under one-row openings (S2). One emitter, two constants; the host twin
-    /// is `register::compute_precomputed_commitment_with_fini_layout`.
+    /// is `register::compute_precomputed_commitment_with`.
     pub rows_per_leaf: usize,
 }
 
@@ -1225,7 +1225,7 @@ impl RegisterDerivationShape {
 /// from the PUBLIC `register_word_addresses` rather than hand-copied, so only
 /// the ORDER is restated here. Nothing pins that order locally and nothing
 /// needs to: the derived root is compared against production's own
-/// `compute_precomputed_commitment_with_fini`, and any disagreement about which
+/// `compute_precomputed_commitment`, and any disagreement about which
 /// address sits in which row moves the root.
 fn register_offsets() -> Vec<u64> {
     use crate::tables::register::{NUM_REGISTER_ADDRESSES, register_word_addresses};
@@ -1244,7 +1244,7 @@ fn register_offsets() -> Vec<u64> {
 }
 
 /// Derives the next epoch's REGISTER preprocessed commitment from `reg_fini` —
-/// `register::compute_precomputed_commitment_with_fini`, emitted.
+/// `register::compute_precomputed_commitment`, emitted.
 ///
 /// Two arenas, one base word per register word address (the R1e packing rule):
 ///
@@ -1332,12 +1332,12 @@ pub fn emit_register_commitment(
 ) -> super::edsl::WrapDigest {
     use super::edsl;
     use super::lde::coset_lde;
-    use crate::tables::register::{NUM_PREPROCESSED_COLS_WITH_FINI, NUM_REGISTER_ADDRESSES};
+    use crate::tables::register::{NUM_PREPROCESSED_COLS, NUM_REGISTER_ADDRESSES};
     use math::fft::bit_reversing::reverse_index;
 
     assert_eq!(
-        NUM_PREPROCESSED_COLS_WITH_FINI, 3,
-        "the derivation commits OFFSET ‖ INIT ‖ FINI; a fourth preprocessed \
+        NUM_PREPROCESSED_COLS, 4,
+        "the derivation commits OFFSET ‖ INIT ‖ FINI ‖ IS_PC; a fifth preprocessed \
          column changes the leaf layout and the arena schema together"
     );
     assert_eq!(
@@ -1353,7 +1353,7 @@ pub fn emit_register_commitment(
     let num_rows = shape.num_rows();
     let coset_offset = FE::from(shape.coset_offset);
 
-    // Padding rows are zero in all three columns, exactly as `zeroed_fe_vec`
+    // Padding rows are zero in all four columns, exactly as `zeroed_fe_vec`
     // leaves them: production writes only the first NUM_REGISTER_ADDRESSES.
     let zero = b.felt_const(FE::zero());
     let offsets = register_offsets();
@@ -1367,24 +1367,33 @@ pub fn emit_register_commitment(
     };
     let init_col = column(init);
     let fini_col = column(fini);
+    // IS_PC (main's final-PC pin): 1 on x255's two words, fixed like OFFSET.
+    let is_pc_col: Vec<FE> = (0..num_rows)
+        .map(|r| {
+            offsets.get(r).map_or(FE::zero(), |&a| {
+                FE::from(u64::from(crate::tables::register::is_pc_address(a)))
+            })
+        })
+        .collect();
 
-    // OFFSET is fixed, so its extension is interned constants rather than an
-    // emitted transform — and it is taken from PRODUCTION's own transform, not
-    // from `lde`'s. That is deliberate: the three columns land in one tree, so
-    // a root that matches production pins the emitter against the very function
-    // it is emitting, inside the same hash.
-    let offset_lde: Vec<_> = {
+    // OFFSET and IS_PC are fixed, so their extensions are interned constants
+    // rather than an emitted transform — and they are taken from PRODUCTION's own
+    // transform, not from `lde`'s. That is deliberate: the four columns land in
+    // one tree, so a root that matches production pins the emitter against the
+    // very function it is emitting, inside the same hash.
+    let fixed_lde = |b: &mut LfmBuilder, column: &[FE], what: &str| -> Vec<_> {
         use math::polynomial::Polynomial;
         use stark::prover::evaluate_polynomial_on_lde_domain;
-        let poly =
-            Polynomial::interpolate_fft::<crate::tables::types::GoldilocksField>(&offset_col)
-                .expect("the OFFSET column interpolates");
+        let poly = Polynomial::interpolate_fft::<crate::tables::types::GoldilocksField>(column)
+            .unwrap_or_else(|_| panic!("the {what} column interpolates"));
         evaluate_polynomial_on_lde_domain(&poly, shape.blowup, num_rows, &coset_offset)
-            .expect("the OFFSET polynomial extends")
+            .unwrap_or_else(|_| panic!("the {what} polynomial extends"))
             .into_iter()
             .map(|v| b.felt_const(v))
             .collect()
     };
+    let offset_lde = fixed_lde(b, &offset_col, "OFFSET");
+    let is_pc_lde = fixed_lde(b, &is_pc_col, "IS_PC");
     let init_lde = coset_lde(b, &init_col, shape.blowup, coset_offset);
     let fini_lde = coset_lde(b, &fini_col, shape.blowup, coset_offset);
 
@@ -1399,10 +1408,15 @@ pub fn emit_register_commitment(
     let lde_rows = shape.lde_rows();
     let leaves: Vec<_> = (0..shape.leaves())
         .map(|leaf| {
-            let mut values = Vec::with_capacity(rows_per_leaf * NUM_PREPROCESSED_COLS_WITH_FINI);
+            let mut values = Vec::with_capacity(rows_per_leaf * NUM_PREPROCESSED_COLS);
             for k in 0..rows_per_leaf {
                 let row = reverse_index(rows_per_leaf * leaf + k, lde_rows as u64);
-                values.extend([offset_lde[row], init_lde[row], fini_lde[row]]);
+                values.extend([
+                    offset_lde[row],
+                    init_lde[row],
+                    fini_lde[row],
+                    is_pc_lde[row],
+                ]);
             }
             edsl::wrap_leaf_hash(b, &values)
         })

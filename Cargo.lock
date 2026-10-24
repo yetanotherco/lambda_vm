@@ -607,6 +607,7 @@ dependencies = [
  "ecsm",
  "k256",
  "lambda-vm-syscalls",
+ "proptest",
  "rustc-demangle",
  "serde",
  "serde_json",

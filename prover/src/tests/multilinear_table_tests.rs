@@ -257,7 +257,7 @@ fn layout_dyn<'a>(
 /// proof**, verified by `multi_verify` — which is what checks the bus balance
 /// against what the statement owes.
 ///
-/// The COMMIT table sends the program's public output on a bus whose
+/// The COPY table sends the program's public output on a bus whose
 /// counterparty is not another table but the statement, so the tables only sum
 /// to zero for a program that outputs nothing. `compute_commit_bus_offset` is
 /// the same quantity the univariate verifier demands.
@@ -280,11 +280,12 @@ fn prove_and_verify_all_tables(elf: Elf, logs: &[Log]) -> Vec<String> {
         true,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(&options, &elf, &traces.public_output_bytes)
+            .preprocessed(),
     );
     let pairs = airs.air_trace_pairs(&mut traces);
 
@@ -474,7 +475,7 @@ fn every_live_table_is_proved_and_verified() {
 /// ⚠ AND IT IS NOT THE FULL TABLE SET, which is what the old `>= 20` bound and
 /// its "expected the full table set" message both claimed. Fifteen tables are
 /// argued, and six counted families are absent: MEMW (the unaligned one; only
-/// MEMW_A and MEMW_R appear), LOAD, STORE, BRANCH, EQ and COMMIT — plus every
+/// MEMW_A and MEMW_R appear), LOAD, STORE, BRANCH, EQ and COPY — plus every
 /// accelerator. Since #977 an absent table means a table with NO ROWS, so this
 /// says the `all_instructions_64` fixture executes no branch, no load, no store
 /// and no `eq`, which is a narrower program than its name suggests.
@@ -608,7 +609,7 @@ fn a_program_using_a_precompile_is_proved_and_verified() {
     // in the prefix above, so matching it here would let a run that reaches no
     // precompile satisfy a check named for one — which is exactly how the
     // software guest passed as a precompile test for as long as it did.
-    for family in ["KECCAK", "KECCAK_RND", "COMMIT"] {
+    for family in ["KECCAK", "KECCAK_RND", "COPY"] {
         assert!(
             argues(&argued, family),
             "{family} must be argued — it is what this case exists for, and \
@@ -623,16 +624,18 @@ fn a_program_using_a_precompile_is_proved_and_verified() {
 /// suite — and it is the one the precompile case above used to prove.
 ///
 /// `executor/programs/rust/keccak` hashes with `tiny-keccak` in guest code, so
-/// it reaches no accelerator and argues the RV64 core broadly instead: 21
+/// it reaches no hash accelerator and argues the RV64 core broadly instead: 20
 /// tables, including MEMW, LOAD, STORE, BRANCH and EQ — the five families
 /// `the_whole_instruction_set_is_proved_and_verified` does NOT reach despite its
 /// name. A Rust guest doing ordinary work exercises more of the VM than the asm
 /// fixture named for the instruction set, which is worth keeping a case for.
 ///
-/// It also carries public output (COMMIT[0]) and two PAGE tables, one of them
-/// the stack page — the only case here that does either.
+/// It also carries public output and its copies (COPY[0]) and two PAGE tables,
+/// one of them the stack page — the only case here that does either.
 ///
-/// MEASURED at `413b3a3b7`, box, CPU-only, no campaign env.
+/// MEASURED at `413b3a3b7`, box, CPU-only, no campaign env; re-measured when its
+/// `memcpy`, `memmove` and `memset` moved to the copy accelerator (laptop,
+/// CPU-only): COMMIT[0] became COPY[0], and the guest no longer reaches MUL.
 #[test]
 fn a_software_hash_guest_argues_the_widest_table_set() {
     let argued = prove_and_verify_rust_guest("keccak");
@@ -644,14 +647,13 @@ fn a_software_hash_guest_argues_the_widest_table_set() {
             "KECCAK_RC",
             "REGISTER",
             "HALT",
-            "COMMIT[0]",
+            "COPY[0]",
             "CPU[0]",
             "LT[0]",
             "SHIFT[0]",
             "MEMW[0]",
             "MEMW_A[0]",
             "LOAD[0]",
-            "MUL[0]",
             "BRANCH[0]",
             "PAGE:0x0",
             "PAGE:0xfffffffffffc0000",

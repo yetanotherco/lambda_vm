@@ -630,8 +630,10 @@ mod keccak_tests {
         // θ/ρ halfword shifts are enforced by inline μ-gated identities on the
         // keccak_rnd chip, so no HWSL lookups are emitted (was 24 * 120).
         assert_eq!(hwsl, 0, "Hwsl count");
-        assert_eq!(is_half, 100, "IsHalf count");
-        assert_eq!(ops.len(), 105 + 24 * 1028, "Total bitwise ops");
+        // IS_HALF only on each lane's state_ptr half_lo; the top 48 bits go to
+        // IS_WH (IS_WHH template), whose own checks the IS_WH collector counts.
+        assert_eq!(is_half, 25, "IsHalf count");
+        assert_eq!(ops.len(), 30 + 24 * 1028, "Total bitwise ops");
     }
 
     #[test]
@@ -729,8 +731,8 @@ mod keccak_tests {
     fn test_keccak_bus_interaction_counts() {
         assert_eq!(
             keccak::bus_interactions().len(),
-            134,
-            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 100 IS_HALF + 1 BYTE_ALU alignment + 4 ARE_BYTES addr pairs + 1 Keccak send + 1 Keccak recv"
+            84,
+            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 25 IS_WHH (25 IS_WH + 25 IS_HALF) + 1 BYTE_ALU alignment + 4 ARE_BYTES addr pairs + 1 Keccak send + 1 Keccak recv"
         );
         assert_eq!(
             keccak_rnd::bus_interactions().len(),
@@ -749,7 +751,11 @@ mod keccak_tests {
 
     #[test]
     fn test_keccak_column_counts() {
-        assert_eq!(core_cols::NUM_COLUMNS, 511, "KECCAK core columns");
+        assert_eq!(
+            core_cols::NUM_COLUMNS,
+            486,
+            "KECCAK core columns (state_ptr DWordWHH)"
+        );
         assert_eq!(
             rnd_cols::NUM_COLUMNS,
             1480,
@@ -763,13 +769,13 @@ mod keccak_tests {
         use stark::constraints::builder::ConstraintSet;
         assert_eq!(
             keccak::KeccakConstraints.meta().len(),
-            51,
-            "KECCAK core: 25 ADD pairs + no-overflow"
+            52,
+            "KECCAK core: 25 ADD pairs + no-overflow + MuIsBit"
         );
         assert_eq!(
             keccak_rnd::KeccakRndConstraints.meta().len(),
-            140,
-            "KECCAK_RND: 20 IS_BIT(μ; Cxz_right_bit) + 20 θ + 100 ρ inline shift identities"
+            141,
+            "KECCAK_RND: 20 IS_BIT(Cxz_right_bit) + 20 θ + 100 ρ inline shift identities + MuIsBit"
         );
     }
 }

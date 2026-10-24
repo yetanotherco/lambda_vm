@@ -14,8 +14,9 @@
 //! - Shift decomposition (ALU-bus shift amount): `shift_b1` (idx 26, Byte = shift[1]), `shift_h1` (idx 27, Half = shift[2]), `shift_high` (idx 28, Word = shift[3])
 //! - Multiplicity: `μ`
 //!
-//! ## Bus Interactions (18 total)
-//! - Senders: MSB16, BYTE_ALU[AND] (×3), ZERO, HWSL (×5), ARE_BYTES (×2), IS_HALFWORD (×5)
+//! ## Bus Interactions (17 total)
+//! - Senders: MSB16, BYTE_ALU[AND] (×3), ZERO, HWSL (×5), ARE_BYTES (×1:
+//!   `[shift[0], shift[1]]`), IS_HALFWORD (×5)
 //! - Receiver: ALU (from CPU)
 
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
@@ -216,13 +217,12 @@ impl ShiftOperation {
         let left = !self.direction;
         let right = self.direction;
 
-        // is_negative is the MSB of in[3] BUT gated by `signed`. The SHIFT
-        // AIR constrains IS_NEGATIVE via the MSB16 bus (SHIFT-C14) only when
-        // `signed = 1` — for `signed = 0` IS_NEGATIVE is free, so we set it
-        // to zero. This makes `extension = 65535 * is_negative = 0` for SRL,
-        // so the extension contribution in `shifted_half` naturally
-        // vanishes (zero fill) — matching RISC-V SRL semantics regardless of
-        // the top-bit value of the input.
+        // is_negative is the MSB of in[3] BUT gated by `signed` (SIGN template):
+        // MSB16[in[3]] → is_negative when `signed = 1` (SHIFT-C14) and
+        // `(1 - signed) * is_negative = 0` (idx 21) otherwise. This makes
+        // `extension = 65535 * is_negative = 0` for SRL, so the extension
+        // contribution in `shifted_half` vanishes (zero fill) — matching RISC-V
+        // SRL semantics regardless of the top-bit value of the input.
         let is_negative = self.signed && (self.in_halves[3] >> 15) & 1 == 1;
         let extension: u16 = if is_negative { 0xFFFF } else { 0 };
 
@@ -437,7 +437,8 @@ pub(crate) fn generate_shift_trace_segments_as(
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(15);
 
-    // SHIFT-C14: MSB16[in[3]] → is_negative | signed
+    // SHIFT-C14: MSB16[in[3]] → is_negative | signed (SIGN template; its
+    // `(1 - signed) * is_negative = 0` half is constraint idx 21)
     interactions.push(BusInteraction::sender(
         BusId::Msb16,
         Multiplicity::Column(cols::SIGNED),
@@ -684,32 +685,25 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // Range checks for the low-word high bits (so the in2 low-word decomposition
-    // is unique → SHIFT_AMOUNT is forced to `arg2 & 0xFF`). SHIFT_AMOUNT is also
-    // byte-checked implicitly via the BYTE_ALU[AND, shift, mask] lookups; we still emit
-    // the explicit ARE_BYTES[shift[0]] below to match the spec's `IS_BYTE[shift[0]]`
-    // (defense-in-depth, redundant with BYTE_ALU[AND]). SHIFT_HIGH (the high word) needs
-    // no check: IS_WORD is assumed (it equals the CPU's well-formed arg2 high word
-    // on the bus), matching the spec's `shift[3]`.
+    // is unique → SHIFT_AMOUNT is forced to `arg2 & 0xFF`). The spec's
+    // `IS_BYTE[shift[0]]` and `IS_BYTE[shift[1]]` (cond 1) are batched into one
+    // ARE_BYTES[shift[0], shift[1]] | 1, so padding rows send ARE_BYTES[0, 0] too.
+    // SHIFT_AMOUNT is also byte-checked implicitly via the BYTE_ALU[AND, shift, mask]
+    // lookups (defense-in-depth). SHIFT_HIGH (the high word) needs no check: IS_WORD
+    // is assumed (it equals the CPU's well-formed arg2 high word on the bus),
+    // matching the spec's `shift[3]`.
     interactions.push(BusInteraction::sender(
         BusId::AreBytes,
-        Multiplicity::Column(cols::MU),
-        vec![
-            BusValue::Packed {
-                start_column: cols::SHIFT_B1,
-                packing: Packing::Direct,
-            },
-            BusValue::constant(0),
-        ],
-    ));
-    interactions.push(BusInteraction::sender(
-        BusId::AreBytes,
-        Multiplicity::Column(cols::MU),
+        Multiplicity::One,
         vec![
             BusValue::Packed {
                 start_column: cols::SHIFT_AMOUNT,
                 packing: Packing::Direct,
             },
-            BusValue::constant(0),
+            BusValue::Packed {
+                start_column: cols::SHIFT_B1,
+                packing: Packing::Direct,
+            },
         ],
     ));
     interactions.push(BusInteraction::sender(
@@ -741,14 +735,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 /// Total number of SHIFT transition constraints.
-pub const NUM_SHIFT_CONSTRAINTS: usize = 19;
+pub const NUM_SHIFT_CONSTRAINTS: usize = 22;
 
 // =========================================================================
 // Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
 //
 // One body against the generic `ConstraintBuilder` serves the compiled prover
-// folder, the verifier folder and IR capture. Constraint indices 0..19.
+// folder, the verifier folder and IR capture. Constraint indices 0..22.
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
@@ -908,6 +902,35 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for ShiftConstraints {
             let one = b.one();
             b.emit_base(16 + off, flag.clone() * (one - flag));
         }
+
+        // idx 19: ZbsIsBit — zbs * (1 - zbs). The only other anchor on zbs is
+        // `ZERO[bit_shift] → zbs | μ`, which vanishes on a μ = 0 padding row; there
+        // a free zbs = 2 turns the five HWSL senders' `1 - zbs` into −1, so the row
+        // *provides* arbitrary HWSL tuples and cancels a real row's forged ones
+        // (`SLL 1, 1 = 0` verified).
+        let zbs = b.main(0, cols::ZBS);
+        let one = b.one();
+        b.emit_base(19, zbs.clone() * (one - zbs));
+
+        // idx 20: MuIsBit — μ * (1 - μ). SHIFT never deduplicates (one row per op),
+        // and idx 0 only pins μ = 1 when direction = 1. For a left shift a free μ
+        // scales the output (`left = μ - direction`), and μ = −1 turns every
+        // μ-gated lookup into a provider.
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        b.emit_base(20, mu.clone() * (one - mu));
+
+        // idx 21: UnsignedIsNotNegative — (1 - signed) * is_negative, the second
+        // half of the spec's SIGN template (the first is the MSB16 lookup, which
+        // pins `is_negative` to the real MSB only when `signed = 1`). Without it,
+        // `shifted_half` fills with `extension = 65535 * is_negative` without
+        // gating on `signed`, so an unsigned right shift (SRL) could set
+        // `is_negative = 1` and forge a sign-filled result (e.g.
+        // `srl 0, 16 = 0xFFFF_0000_0000_0000`).
+        let signed = b.main(0, cols::SIGNED);
+        let is_negative = b.main(0, cols::IS_NEGATIVE);
+        let one = b.one();
+        b.emit_base(21, (one - signed) * is_negative);
     }
 }
 
@@ -996,18 +1019,15 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
         ));
 
         // Range checks (match the ALU-bus in2 reconstruction): ARE_BYTES[bits
-        // 8-15] + IS_HALF[bits 16-31]. The high word (bits 32-63, SHIFT_HIGH) is
-        // the spec's `shift[3]` Word; IS_WORD is assumed via its bus equality
-        // with the CPU's well-formed arg2 high word, so it needs no check.
-        bitwise_ops.push(BitwiseOperation::single_byte(
-            BitwiseOperationType::AreBytes,
-            ((op.shift_amount >> 8) & 0xFF) as u8,
-        ));
-        // ARE_BYTES[shift[0]] — spec IS_BYTE[shift[0]] (defense-in-depth,
-        // redundant with the BYTE_ALU[AND, shift, mask] lookups above).
-        bitwise_ops.push(BitwiseOperation::single_byte(
+        // 0-7, bits 8-15] + IS_HALF[bits 16-31]. The high word (bits 32-63,
+        // SHIFT_HIGH) is the spec's `shift[3]` Word; IS_WORD is assumed via its bus
+        // equality with the CPU's well-formed arg2 high word, so it needs no check.
+        // Padding rows' ARE_BYTES[0, 0] are counted by
+        // `trace_builder::shift_padding_are_bytes`, which knows the chunking.
+        bitwise_ops.push(BitwiseOperation::byte_op(
             BitwiseOperationType::AreBytes,
             op.shift,
+            ((op.shift_amount >> 8) & 0xFF) as u8,
         ));
         let half = ((op.shift_amount >> 16) & 0xFFFF) as u16;
         bitwise_ops.push(BitwiseOperation::halfword(

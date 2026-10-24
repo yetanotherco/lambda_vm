@@ -97,7 +97,7 @@ fn differences(a: &WalkedWindow, b: &WalkedWindow) -> Vec<&'static str> {
         ("shift", same(&x.shift_ops, &y.shift_ops)),
         ("bitwise", same(&x.bitwise_ops, &y.bitwise_ops)),
         ("cpu32", same(&x.cpu32_ops, &y.cpu32_ops)),
-        ("commit", same(&x.commit_ops, &y.commit_ops)),
+        ("copy", same(&x.copy_ops, &y.copy_ops)),
         ("keccak", same(&x.keccak_ops, &y.keccak_ops)),
         ("blake3", same(&x.blake3_ops, &y.blake3_ops)),
         (

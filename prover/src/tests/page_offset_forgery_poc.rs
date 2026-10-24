@@ -181,11 +181,17 @@ fn craft_proof(
         false,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        // As the production prover: FINI pinned to the halted register file.
+        crate::test_utils::halted_register_commitment(
+            &options,
+            &program,
+            &traces.public_output_bytes,
+        )
+        .preprocessed(),
     );
 
     let runtime_page_ranges = traces.runtime_page_ranges();
@@ -693,11 +699,17 @@ fn craft_proof_with_duplicate_page(
         false,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        // As the production prover: FINI pinned to the halted register file.
+        crate::test_utils::halted_register_commitment(
+            &options,
+            &program,
+            &traces.public_output_bytes,
+        )
+        .preprocessed(),
     );
 
     let mut transcript = crate::hash_pin::block_transcript(&[]);

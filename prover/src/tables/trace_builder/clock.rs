@@ -168,11 +168,15 @@ mod tests {
         let halt = ops.last().expect("ops").timestamp;
         assert_eq!(halt, CLOCK_LIMIT - 4);
         // The trace's last padded row writes the PC at the final PC token.
+        // TIMESTAMP is the table's own clock `4·(row + 1)`; the AIR's base, four
+        // times the rows before the table, puts it on the run's clock.
         let trace = cpu::generate_cpu_trace(&ops, &artifacts.decode);
         assert_eq!(trace.num_rows(), n + padding);
-        let last_row = *trace
-            .get_main(trace.num_rows() - 1, cpu::cols::TIMESTAMP)
-            .value();
+        let base = cpu::TIMESTAMP_STRIDE * first as u64;
+        let last_row = base
+            + *trace
+                .get_main(trace.num_rows() - 1, cpu::cols::TIMESTAMP)
+                .value();
         let final_pc = final_pc_timestamp(halt, padding);
         assert_eq!(last_row + 1, final_pc);
         assert!(final_pc >= CLOCK_LIMIT);

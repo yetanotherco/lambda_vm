@@ -1159,19 +1159,15 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
         false,
         &[],
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         is_final,
         None,
-        None,
-        Some(crate::RegisterPreprocessed {
-            commitment: register::compute_precomputed_commitment_with_fini(
-                &opts,
-                &register_init,
-                &reg_fini,
-            ),
+        crate::RegisterPreprocessed {
+            commitment: register::compute_precomputed_commitment(&opts, &register_init, &reg_fini),
             init: &register_init,
             fini: &reg_fini,
-        }),
+        },
     );
     let l2g_air = crate::continuation::l2g_memory_air(&opts, label);
     let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundary);

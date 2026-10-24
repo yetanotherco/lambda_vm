@@ -256,7 +256,8 @@ fn the_counted_lookups_are_the_listed_ones() {
                 &mut register_state,
                 &mut out,
                 lookups,
-            );
+            )
+            .expect("the walk");
             out
         };
         let (listed, lean) = (walk(true), walk(false));
@@ -324,7 +325,8 @@ fn the_one_pass_routing_is_the_routing() {
             &mut register_state,
             &mut walk,
             true,
-        );
+        )
+        .expect("the walk");
         let show = |s: RoutedSegments| {
             let RoutedSegments {
                 branch_ops,
@@ -402,7 +404,8 @@ fn the_in_place_routing_is_the_appended_routing() {
                     &mut register_state,
                     &mut walk,
                     true,
-                );
+                )
+                .expect("the walk");
                 appended.append(route_ops_one_pass(ops, decode, &walk.cpu32_ops));
                 ops.iter()
                     .for_each(|op| decode.op(op).count_bitwise_into(&mut counted));

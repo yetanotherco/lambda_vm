@@ -7,6 +7,8 @@
 
 use stark::lookup::{BusInteraction, Multiplicity};
 
+use crate::tables::types::FE;
+
 use super::*;
 
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
@@ -32,28 +34,90 @@ pub(super) fn shape_and_words(t: &Table) -> (usize, usize, Vec<u64>) {
 }
 
 /// `Ok` when every interaction of `interactions` has multiplicity zero on
-/// every row of `table`: the table adds nothing to any bus. Each multiplicity
-/// must be one column, as the four cut families' are; another kind is an
-/// error, never read as zero.
+/// every row of `table`: the table adds nothing to any bus but its padding
+/// rows' byte checks. A multiplicity is read as the four call families' one
+/// column, COPY's difference of two columns, or COPY's linear form of columns
+/// and constants; another kind is an error, never read as zero.
+///
+/// The one exception: a byte check of multiplicity 1 whose values vanish on a
+/// row of zeros (KECCAK_RND's θ/ρ bytes, main's multiplicity fix) is sent by
+/// every row, padding included, as `ARE_BYTES[0, 0]`. Its only counterparty is
+/// BITWISE, which counts it per table the build makes
+/// (`keccak_rnd_padding_rows`), so a table left out takes its sends with it.
 pub(super) fn carries_nothing(
     table: &Table,
     interactions: &[BusInteraction],
 ) -> Result<(), String> {
+    use stark::lookup::{BusValue, LinearTerm};
     let (cols, rows, words) = shape_and_words(table);
+    let fe = |row: usize, column: usize| FE::from(words[row * cols + column]);
     for (i, interaction) in interactions.iter().enumerate() {
-        let Multiplicity::Column(column) = &interaction.multiplicity else {
-            return Err(format!(
-                "interaction {i}: its multiplicity is not one column"
-            ));
+        let zero_on_padding = interaction.values.iter().all(|value| match value {
+            BusValue::Packed { .. } => true,
+            BusValue::Linear(terms) => terms
+                .iter()
+                .all(|term| !matches!(term, LinearTerm::Constant(c) if *c != 0)),
+        });
+        if interaction.bus_id == u64::from(crate::tables::types::BusId::AreBytes)
+            && interaction.is_sender
+            && matches!(interaction.multiplicity, Multiplicity::One)
+            && zero_on_padding
+        {
+            continue;
+        }
+        let read: Vec<usize> = match &interaction.multiplicity {
+            Multiplicity::Column(c) => vec![*c],
+            Multiplicity::Diff(a, b) => vec![*a, *b],
+            Multiplicity::Linear(terms) => terms
+                .iter()
+                .filter_map(|t| match t {
+                    LinearTerm::Column { column, .. }
+                    | LinearTerm::ColumnUnsigned { column, .. } => Some(*column),
+                    LinearTerm::Constant(_) => None,
+                })
+                .collect(),
+            _ => {
+                return Err(format!(
+                    "interaction {i}: its multiplicity is not a column, a difference or a \
+                     linear form"
+                ));
+            }
         };
-        if *column >= cols {
+        if let Some(&column) = read.iter().find(|&&c| c >= cols) {
             return Err(format!(
                 "interaction {i}: multiplicity column {column} of {cols}"
             ));
         }
-        if let Some(row) = (0..rows).find(|row| words[row * cols + column] != 0) {
+        let at = |row: usize| -> FE {
+            match &interaction.multiplicity {
+                Multiplicity::Column(c) => fe(row, *c),
+                Multiplicity::Diff(a, b) => fe(row, *a) - fe(row, *b),
+                Multiplicity::Linear(terms) => terms.iter().fold(FE::zero(), |acc, t| {
+                    acc + match t {
+                        LinearTerm::Column {
+                            coefficient,
+                            column,
+                        } => {
+                            let c = FE::from(coefficient.unsigned_abs());
+                            let c = if *coefficient < 0 { -c } else { c };
+                            c * fe(row, *column)
+                        }
+                        LinearTerm::ColumnUnsigned {
+                            coefficient,
+                            column,
+                        } => FE::from(*coefficient) * fe(row, *column),
+                        LinearTerm::Constant(k) => {
+                            let k_fe = FE::from(k.unsigned_abs());
+                            if *k < 0 { -k_fe } else { k_fe }
+                        }
+                    }
+                }),
+                _ => unreachable!("refused above"),
+            }
+        };
+        if let Some(row) = (0..rows).find(|&row| at(row) != FE::zero()) {
             return Err(format!(
-                "interaction {i}: multiplicity column {column} is not zero at row {row}"
+                "interaction {i}: its multiplicity is not zero at row {row}"
             ));
         }
     }
@@ -264,13 +328,23 @@ fn a_cut_one_table_short_of_the_real_rows_is_caught() {
     let long = is_today_without_its_padding_tables(&today[..6], &today, &interactions)
         .expect_err("a table of padding rows kept");
     assert_eq!(long, "table 5, the last kept, is padding alone");
-    // A multiplicity the check cannot read as a column is an error, not a zero.
+    // A multiplicity the check cannot read as a column, a difference or a linear
+    // form is an error, not a zero.
     let mut unread = keccak_rnd::bus_interactions();
     unread[0].multiplicity = Multiplicity::One;
     assert!(
         carries_nothing(&today[7], &unread)
             .expect_err("a constant multiplicity")
-            .contains("not one column")
+            .contains("is not a column, a difference or a linear form")
+    );
+    // A linear form with a constant term is read, not assumed zero: `1 - 0` on a
+    // padding row is a send.
+    let mut constant = keccak_rnd::bus_interactions();
+    constant[0].multiplicity = Multiplicity::Linear(vec![stark::lookup::LinearTerm::Constant(1)]);
+    assert!(
+        carries_nothing(&today[7], &constant)
+            .expect_err("a constant term")
+            .contains("is not zero at row 0")
     );
     carries_nothing(&today[7], &interactions).expect("a table of padding rows alone");
 }

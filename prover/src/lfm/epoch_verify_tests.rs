@@ -913,13 +913,14 @@ fn the_preprocessed_commitments_of_a_real_epoch() {
     );
     // The REGISTER slot, checked by its column count rather than assumed from its
     // index: the derivation commits OFFSET ‖ INIT ‖ FINI.
-    let register = e.legs.iter().position(|l| {
-        l.num_precomputed_cols == crate::tables::register::NUM_PREPROCESSED_COLS_WITH_FINI
-    });
+    let register = e
+        .legs
+        .iter()
+        .position(|l| l.num_precomputed_cols == crate::tables::register::NUM_PREPROCESSED_COLS);
     println!(
-        "  the sub-proof whose preprocessed width is NUM_PREPROCESSED_COLS_WITH_FINI \
+        "  the sub-proof whose preprocessed width is NUM_PREPROCESSED_COLS \
          ({}): index {:?}",
-        crate::tables::register::NUM_PREPROCESSED_COLS_WITH_FINI,
+        crate::tables::register::NUM_PREPROCESSED_COLS,
         register
     );
     // Every preprocessed sub-proof's commitment must actually be present, or the

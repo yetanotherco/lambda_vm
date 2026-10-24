@@ -17,10 +17,11 @@
 //! `artifacts_are_invariant_across_trace_length`), so a table's file covers every
 //! blowup factor and every epoch size.
 //!
-//! ⚠️  But four tables are PARAMETERIZED, so this emits ONE REPRESENTATIVE, not
+//! ⚠️  But six tables are PARAMETERIZED, so this emits ONE REPRESENTATIVE, not
 //! the complete set: `PAGE` and `GLOBAL_MEMORY` fold a page base into constant
-//! bus terms, and both `L2G` tables fold an epoch label. Their files are the
-//! artifact at `test_utils::PAGE_TEST_BASE` / `EPOCH_TEST_LABEL` only. A real
+//! bus terms, both `L2G` tables fold an epoch label, `CPU` its table's
+//! timestamp base and `REGISTER` the final PC timestamp. Their files are the
+//! artifact at `test_utils::PAGE_TEST_BASE` / `EPOCH_TEST_LABEL` / base 0 only. A real
 //! continuation proof needs one artifact per distinct page base and per distinct
 //! epoch label — see
 //! `constraint_artifact_tests::parameterized_airs_vary_per_parameter_value`.

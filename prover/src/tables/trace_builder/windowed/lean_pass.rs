@@ -357,6 +357,36 @@ fn ecall(memory: &mut impl Accesses, regs: &mut Registers, op: CpuOp<'_>, ts: u6
             memory.access(buf.wrapping_add(k), 1, Some(ts));
         }
     }
+    // memcpy / memmove and memset through COPY (`collect_copy_register_ops`,
+    // `collect_copy_ops`): x10, x11 and x12 read back at T; a copy reads every
+    // source byte at T before it writes the destination at T + 1, a memset writes
+    // each row's destination at T and reads its source at T + 1, row by row.
+    if op.ecall_dma_memcpy() || op.ecall_dma_memset() {
+        let (dst, src, count) = (regs.value(10), regs.value(11), regs.value(12));
+        for (reg, value) in [(10u8, dst), (11, src), (12, count)] {
+            regs.write(reg, value, ts);
+        }
+        if op.ecall_dma_memcpy() {
+            memory.access(src, count as usize, Some(ts));
+            memory.access(dst, count as usize, Some(ts + 1));
+        } else {
+            // The executor's own row schedule: which bytes a row holds decides
+            // which end at T and which at T + 1.
+            let mut offset = 0u64;
+            while offset < count {
+                let width = usize::from(executor::vm::instruction::execution::copy_row_width(
+                    src,
+                    dst,
+                    offset,
+                    count - offset,
+                    false,
+                ));
+                memory.access(dst.wrapping_add(offset), width, Some(ts));
+                memory.access(src.wrapping_add(offset), width, Some(ts + 1));
+                offset += width as u64;
+            }
+        }
+    }
     if op.ecall_keccak() {
         let state = op.keccak_state_addr();
         regs.write(10, state, ts);

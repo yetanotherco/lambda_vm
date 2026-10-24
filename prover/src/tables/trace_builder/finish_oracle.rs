@@ -71,7 +71,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         branch_ops,
         mul_ops,
         dvrm_ops,
-        commit_ops,
+        copy_ops,
         keccak_ops,
         blake3_ops,
         blake3_absorb_ops,
@@ -152,11 +152,18 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("p4_bitwise_collect");
 
-    let public_output_bytes: Vec<u8> = commit_ops
-        .iter()
-        .filter(|op| !op.end)
-        .map(|op| op.value)
-        .collect();
+    // The committed bytes are read off COPY's `write` rows, in `dst` (global byte
+    // index) order; a zero-length `write`'s row moves none.
+    let public_output_bytes: Vec<u8> = {
+        let mut rows: Vec<&copy::CopyOperation> = copy_ops
+            .iter()
+            .filter(|op| op.functionality == copy::Functionality::Write && op.count != 0)
+            .collect();
+        rows.sort_by_key(|op| op.dst);
+        rows.iter()
+            .flat_map(|op| op.value[..op.width as usize].iter().copied())
+            .collect()
+    };
 
     // CPU padding rows send ARE_BYTES with all-zero values.
     // Add corresponding ops so the bitwise table multiplicities balance.
@@ -181,7 +188,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     // chunk size used to split them into instances so multiplicities match the per-instance
     // sends. MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]. PAGE does a
     // batched ARE_BYTES[init, fini] per row (skipped in continuation epochs, which the L2G
-    // table owns). COMMIT sends AreBytes+IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL;
+    // table owns). COPY sends IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL;
     // HINT sends ARE_BYTES for its 32 output cells.
     // We never concatenate the lookups into one giant `Vec<BitwiseOperation>` (~140 M ops /
     // ~560 MB at 10-tx whose only consumer is the multiplicity count). Each collector bumps
@@ -198,6 +205,10 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     // lookups grows with the run. MUL and DVRM deduplicate per instance, so each of their
     // slices is one instance. The in-walk lookups and MEMW_R are split in the parallel path
     // below; the rest stay one collector each.
+    let branch_segments = branch_ops.segments();
+    let bytewise_segments = bytewise_ops.segments();
+    // IS_WH's rows, shared by its BITWISE lookups and its table.
+    let is_wh_rows = is_wh::dedup_is_wh_rows(keccak_ops.parts().flat_map(keccak::is_wh_keys));
     let mut collectors: Vec<Collector> = Vec::new();
     if p4_sliced() {
         // LT's segments slice by slice; a compact one through a temporary of a
@@ -208,7 +219,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
                 Part::Ops(ops) => {
                     for slice in ops.chunks(lt_slice) {
                         collectors.push(Box::new(move |h| {
-                            h.add_ops(&collect_bitwise_from_lt(slice))
+                            h.add_ops(&collect_bitwise_from_lt_ops(slice))
                         }));
                     }
                 }
@@ -217,7 +228,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
                         collectors.push(Box::new(move |h| {
                             let mut slice = Vec::new();
                             compact.expand_into(start, start + lt_slice, &mut slice);
-                            h.add_ops(&collect_bitwise_from_lt(&slice))
+                            h.add_ops(&collect_bitwise_from_lt_ops(&slice))
                         }));
                     }
                 }
@@ -247,7 +258,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             let branch_ops = &branch_ops;
             collectors.push(Box::new(move |h| {
                 let slice = branch_ops.range(k * branch_slice, (k + 1) * branch_slice);
-                h.add_ops(&collect_bitwise_from_branch(&slice))
+                h.add_ops(&collect_bitwise_from_branch_ops(&slice))
             }));
         }
         let shift_slice = p4_slice_len(P4Source::Shift, mul_chunk, dvrm_chunk);
@@ -311,12 +322,12 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             Box::new(|h: &mut bitwise::BitwiseHistogram| {
                 for part in &lt_ops.parts {
                     match *part {
-                        Part::Ops(ops) => h.add_ops(&collect_bitwise_from_lt(ops)),
+                        Part::Ops(ops) => h.add_ops(&collect_bitwise_from_lt_ops(ops)),
                         Part::Compact(compact) => {
                             for start in (0..compact.len()).step_by(1 << 20) {
                                 let mut slice = Vec::new();
                                 compact.expand_into(start, start + (1 << 20), &mut slice);
-                                h.add_ops(&collect_bitwise_from_lt(&slice));
+                                h.add_ops(&collect_bitwise_from_lt_ops(&slice));
                             }
                         }
                     }
@@ -338,7 +349,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             Box::new(|h| {
                 for k in 0..branch_ops.len().div_ceil(1 << 20) {
                     let slice = branch_ops.range(k << 20, (k + 1) << 20);
-                    h.add_ops(&collect_bitwise_from_branch(&slice))
+                    h.add_ops(&collect_bitwise_from_branch_ops(&slice))
                 }
             }),
             Box::new(|h| {
@@ -381,7 +392,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     collectors.extend([
         // Small lists, one block each at a block's size: whole.
         Box::new(|h: &mut bitwise::BitwiseHistogram| {
-            h.add_ops(&collect_bitwise_from_commit(&commit_ops.whole()))
+            h.add_ops(&collect_bitwise_from_copy(&copy_ops.whole()))
         }) as Collector,
         Box::new(|h| {
             if !strip_blake3_side_effects() {
@@ -395,6 +406,48 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops.whole()))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ]);
+    // The per-row lookups (`types::MU_MAX`): the μ bound every row of a
+    // deduplicating table sends, padding rows included, and the byte checks SHIFT's
+    // and KECCAK_RND's padding rows send, over exactly the tables this build
+    // generates, a collector a table (KECCAK_RND padded as the whole run).
+    for (start, end) in list_chunks(lt_ops.len(), max_rows.lt) {
+        let lt_ops = &lt_ops;
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&lt_row_lookups(lt_ops.range(start, end).iter()))
+        }));
+    }
+    for (start, end) in list_chunks(branch_segments.len(), max_rows.branch) {
+        let branch_segments = &branch_segments;
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&branch_row_lookups(&branch_segments.range(start, end)))
+        }));
+    }
+    for (start, end) in list_chunks(bytewise_segments.len(), max_rows.bytewise) {
+        let bytewise_segments = &bytewise_segments;
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&bytewise_row_lookups(&bytewise_segments.range(start, end)))
+        }));
+    }
+    let shift_padding: usize = list_chunks(shift_ops.len(), max_rows.shift)
+        .iter()
+        .map(|&(start, end)| padding_rows_of(end - start))
+        .sum::<usize>()
+        + if skip.tails {
+            skip.shift * padding_rows_of(max_rows.shift)
+        } else {
+            0
+        };
+    let keccak_rnd_padding = keccak_rnd::ARE_BYTES_PER_ROW
+        * keccak_rnd_padding_rows(keccak_ops.len(), skip.keccak_rnd_rows, CutPadding::WholeRun);
+    collectors.push(Box::new(move |h| {
+        h.bump_n(
+            BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, 0, 0),
+            (shift_padding + keccak_rnd_padding) as u64,
+        )
+    }));
+    collectors.push(Box::new(|h| {
+        is_wh::collect_bitwise_from_is_wh(&is_wh_rows, h)
+    }));
     if let Some(image) = initial_image
         && !l2g_memory_bookend
     {
@@ -729,10 +782,21 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         decode::count_rows(&mut decode, rows.chain(padding));
         packed_if(pack, decode)
     };
-    let gen_commits = || {
+    let gen_copies = || {
+        if skip.copy_rows > 0 {
+            return cut_tables(
+                &copy_ops,
+                skip.copy_rows,
+                CutPadding::WholeRun,
+                pack,
+                form,
+                copy::rows_written_packed,
+                copy::generate_copy_rows_as,
+            );
+        }
         generate_optional(
-            &commit_ops.whole(),
-            packed_by(pack, |ops| commit::generate_commit_trace_as(ops, form)),
+            &copy_ops.whole(),
+            copy::generate_copy_trace,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -884,7 +948,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     let (mut loads_slot, mut lts_slot, mut shifts_slot, mut muls_slot) = (None, None, None, None);
     let (mut dvrms_slot, mut branches_slot, mut bitwise_slot, mut decode_slot) =
         (None, None, None, None);
-    let (mut commits_slot, mut keccaks_slot, mut keccak_rnds_slot, mut keccak_rc_slot) =
+    let (mut copies_slot, mut keccaks_slot, mut keccak_rnds_slot, mut keccak_rc_slot) =
         (None, None, None, None);
     let mut blake3_slot = None;
     let (mut pages_slot, mut register_slot, mut halt_slot) = (None, None, None);
@@ -928,7 +992,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             spawn_into!(keccak_rnds_slot, gen_keccak_rnds);
             spawn_into!(keccak_rc_slot, gen_keccak_rc);
             spawn_into!(blake3_slot, gen_blake3);
-            spawn_into!(commits_slot, gen_commits);
+            spawn_into!(copies_slot, gen_copies);
             spawn_into!(register_slot, gen_register);
             spawn_into!(halt_slot, gen_halt);
             spawn_into!(eqs_slot, gen_eqs);
@@ -952,7 +1016,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         branches_slot = Some(gen_branches());
         bitwise_slot = Some(gen_bitwise());
         decode_slot = Some(gen_decode());
-        commits_slot = Some(gen_commits());
+        copies_slot = Some(gen_copies());
         keccaks_slot = Some(gen_keccaks());
         keccak_rnds_slot = Some(gen_keccak_rnds());
         keccak_rc_slot = Some(gen_keccak_rc());
@@ -989,7 +1053,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     let mut bitwise = bitwise_slot.expect(PHASE5_RAN);
     #[allow(unused_mut)]
     let mut decode = decode_slot.expect(PHASE5_RAN);
-    let commits = commits_slot.expect(PHASE5_RAN)?;
+    let copies = copies_slot.expect(PHASE5_RAN)?;
     let keccaks = keccaks_slot.expect(PHASE5_RAN)?;
     let keccak_rnds = keccak_rnds_slot.expect(PHASE5_RAN)?;
     let keccak_rc_trace = keccak_rc_slot.expect(PHASE5_RAN);
@@ -1003,6 +1067,12 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     let ecsms = ecsms_slot.expect(PHASE5_RAN)?;
     let ecdases = ecdases_slot.expect(PHASE5_RAN)?;
     let hints = hints_slot.expect(PHASE5_RAN)?;
+    let is_whs = generate_optional(
+        &is_wh_rows,
+        packed_by(pack, is_wh::generate_is_wh_trace),
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
     // so spill them here before returning.
@@ -1060,7 +1130,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         public_output_bytes,
         branches,
         halt: halt_trace,
-        commits,
+        copies,
         keccaks,
         keccak_rnds,
         blake3: blake3_trace,
@@ -1069,6 +1139,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         ecsms,
         ecdases,
         hints,
+        is_whs,
         memw_registers,
         local_to_global,
         touched_memory_cells,

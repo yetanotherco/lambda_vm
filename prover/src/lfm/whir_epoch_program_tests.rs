@@ -219,7 +219,7 @@ fn preprocessed_rows() -> usize {
     let init: Vec<u32> = (0..crate::tables::register::NUM_REGISTER_ADDRESSES)
         .map(|i| (i as u32).wrapping_mul(2_654_435_761) | 1)
         .collect();
-    let register_columns = crate::tables::register::preprocessed_columns_with_fini(&init, &init);
+    let register_columns = crate::tables::register::preprocessed_columns(&init, &init);
     let register = super::preprocessed::const_mle_rows(
         &register_columns
             .iter()

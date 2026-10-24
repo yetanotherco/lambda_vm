@@ -44,8 +44,9 @@ use crate::{Error, TableCounts};
 /// Domain tag for a multilinear continuation epoch.
 ///
 /// Distinct from both the univariate epoch tag and the monolithic multilinear
-/// one: no two of the three may ever share a transcript prefix.
-pub(crate) const MULTILINEAR_EPOCH_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_CONTINUATION_EPOCH_V1";
+/// one: no two of the three may ever share a transcript prefix. V2: the count
+/// list gained `is_wh`.
+pub(crate) const MULTILINEAR_EPOCH_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_CONTINUATION_EPOCH_V2";
 
 /// One epoch's proof and everything a standalone verifier re-binds.
 ///
@@ -773,7 +774,7 @@ pub(crate) fn decode_table_index(
 /// `reg_fini` are bound by REGISTER's preprocessed COLUMNS, not by anything
 /// here: the roots commit those columns before a challenge exists, and
 /// `check_preprocessed` ties the verifier's own pair to them at the reduced
-/// point. See `register::preprocessed_columns_with_fini`. Absorbing them would
+/// point. See `register::preprocessed_columns`. Absorbing them would
 /// add no binding and move every pinned constant.
 ///
 /// ★ The length is accumulated beside the absorbs, never written as a constant:
@@ -1856,12 +1857,15 @@ where
     let reg_fini = register::fini_from_trace(&traces.register);
     let table_counts = traces.table_counts();
     let public_output = traces.public_output_bytes.clone();
+    let cpu_heights = crate::cpu_heights_from_traces(&traces);
+    crate::tables::cpu::validate_heights(&cpu_heights)?;
 
     let airs = crate::continuation::build_epoch_airs(
         elf,
         opts,
         &[],
         &table_counts,
+        &cpu_heights,
         register_init,
         &reg_fini,
         is_final,
@@ -2067,12 +2071,15 @@ pub(crate) fn prep_epoch_ahead(
     let reg_fini = register::fini_from_trace(&traces.register);
     let table_counts = traces.table_counts();
     let public_output = traces.public_output_bytes.clone();
+    let cpu_heights = crate::cpu_heights_from_traces(&traces);
+    crate::tables::cpu::validate_heights(&cpu_heights)?;
 
     let airs = crate::continuation::build_epoch_airs(
         elf,
         opts,
         &[],
         &table_counts,
+        &cpu_heights,
         &register_init,
         &reg_fini,
         is_final,
@@ -2899,6 +2906,23 @@ impl WhirEpochAirs {
     }
 }
 
+/// The CPU tables' heights an epoch proof states, at the CPU tables' positions
+/// (`crate::cpu_proof_start`), checked by `tables::cpu::validate_heights`.
+pub(crate) fn epoch_cpu_heights(epoch: &EpochProof, is_final: bool) -> Result<Vec<usize>, Error> {
+    let start = crate::cpu_proof_start(is_final, &epoch.table_counts);
+    let heights: Vec<usize> = start
+        .checked_add(epoch.table_counts.cpu)
+        .and_then(|end| epoch.table_num_vars.get(start..end))
+        .ok_or_else(|| {
+            Error::InvalidTableCounts("the epoch states fewer heights than CPU tables".into())
+        })?
+        .iter()
+        .map(|&vars| 1usize << vars.min(63))
+        .collect();
+    crate::tables::cpu::validate_heights(&heights)?;
+    Ok(heights)
+}
+
 /// The AIR set an epoch's tables are argued against.
 ///
 /// ★ ONE DERIVATION, TWO CALLERS. [`verify_epoch_bookend`] builds its
@@ -2928,12 +2952,18 @@ pub(crate) fn epoch_airs_for(
     label: u64,
     decode_commitment: Option<Commitment>,
 ) -> WhirEpochAirs {
+    // An epoch whose stated CPU heights are out of bounds is refused by
+    // `epoch_cpu_heights` before its verify gets here; any other caller holds an
+    // honest epoch, so the fallback (the smallest table) never builds a proof's AIRs.
+    let cpu_heights =
+        epoch_cpu_heights(epoch, is_final).unwrap_or_else(|_| vec![4; epoch.table_counts.cpu]);
     WhirEpochAirs {
         airs: crate::continuation::build_epoch_airs(
             elf,
             opts,
             &[],
             &epoch.table_counts,
+            &cpu_heights,
             register_init,
             &epoch.reg_fini,
             is_final,
@@ -2970,6 +3000,9 @@ where
 {
     // ⛔ A measurement-only run's epoch proofs carry no argue.
     crate::argue_measure::refuse_consumers("an epoch verify")?;
+    // The CPU heights fix the epoch's timestamps and its final PC timestamp: in
+    // bounds before they size anything.
+    epoch_cpu_heights(epoch, is_final)?;
     // ★ THE SAME DERIVATION THE LEVEL-0 DRIVER USES. `None` is this side's
     // answer for DECODE's preprocessed commitment, unchanged.
     let air_set = epoch_airs_for(elf, opts, epoch, register_init, is_final, label, None);

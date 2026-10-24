@@ -442,6 +442,37 @@ pub fn offset_ramp_constants() -> Vec<LfmWord> {
     vec![ext_word(&FEE::from(2u64))]
 }
 
+/// CPU's preprocessed TIMESTAMP (main's #1025), `4·(i + 1)` in every CPU table,
+/// at `point`: `4·ramp + 4`, the identity ramp ([`emit_offset_ramp`]) scaled
+/// and shifted — the extension of a constant column is the constant, so the
+/// `+ 4` needs no fold. A table's own base `4·S_k` is a constant of its AIR's
+/// bus values, never of the column, so one form serves every CPU table.
+pub fn emit_timestamp_ramp(b: &mut LfmBuilder, point: &[Ext]) -> Ext {
+    let ramp = emit_offset_ramp(b, point);
+    let stride = b.ext_const(&FEE::from(crate::tables::cpu::TIMESTAMP_STRIDE));
+    b.emul_add(stride, ramp, stride)
+}
+
+/// INSTRUCTIONS [`emit_timestamp_ramp`] emits, CONST-FREE: the ramp's and one
+/// `MulAdd`.
+pub const fn timestamp_ramp_rows(num_vars: usize) -> usize {
+    offset_ramp_rows(num_vars) + 1
+}
+
+/// The constants [`emit_timestamp_ramp`] interns: the ramp's `2` and the stride.
+pub fn timestamp_ramp_constants() -> Vec<LfmWord> {
+    vec![
+        ext_word(&FEE::from(2u64)),
+        ext_word(&FEE::from(crate::tables::cpu::TIMESTAMP_STRIDE)),
+    ]
+}
+
+/// The host's closed form of [`emit_timestamp_ramp`], for the differential.
+pub fn timestamp_ramp_at(point: &[FEE]) -> FEE {
+    let stride = FEE::from(crate::tables::cpu::TIMESTAMP_STRIDE);
+    &offset_ramp_at(point) * &stride + &stride
+}
+
 /// The host's own closed form, for the differential.
 ///
 /// ⚠ A THIRD DERIVATION, deliberately: the test compares the EMITTED value

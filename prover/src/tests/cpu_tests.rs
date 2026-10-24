@@ -2,10 +2,15 @@
 //!
 //! Unit tests for the reworked `CpuOperation::from_log` (arg2 multiplex, res,
 //! rvd, branch decision, word-instruction delegation), `generate_cpu_trace`
-//! (column layout, padding, word-row masking), and `collect_bitwise_ops`.
+//! (column layout, padding, word-row masking), `collect_bitwise_ops`, and the
+//! preprocessed timestamp layout (`timestamp_bases`, `validate_heights`).
 
-use crate::tables::cpu::{CPU_PADDING_PC, CpuOp, CpuOperation, cols, generate_cpu_trace};
+use crate::tables::cpu::{
+    CPU_PADDING_PC, CpuOp, CpuOperation, MAX_CPU_ROWS, MAX_TABLE_ROWS, cols, final_pc_timestamp,
+    generate_cpu_trace, table_heights, timestamp_bases, validate_heights,
+};
 use crate::tables::decode::DecodeTable;
+use crate::tables::max_rows;
 use crate::tables::types::DecodeEntry;
 
 use executor::vm::{
@@ -272,7 +277,7 @@ fn test_trace_width_and_real_row() {
     });
     let trace = generate_cpu_trace(&ops, &decode);
     assert_eq!(trace.main_table.width, cols::NUM_COLUMNS);
-    assert_eq!(cols::NUM_COLUMNS, 38);
+    assert_eq!(cols::NUM_COLUMNS, 37);
     assert_eq!(trace.main_table.height, 4);
     let row = trace.main_table.get_row(0);
     assert_eq!(row[cols::PC_0], (PC).into());
@@ -388,4 +393,222 @@ fn test_collect_bitwise_ops_word_row_zeroed() {
     assert_eq!(ops[0].y, 0, "rs2 zeroed");
     assert_eq!(ops[1].x, 0, "rd zeroed");
     assert_eq!(ops[1].y, 2, "half_instruction_length retained");
+}
+
+// =========================================================================
+// Preprocessed timestamp
+// =========================================================================
+
+/// TIMESTAMP is the preprocessed `4·(row + 1)` on real and padding rows,
+/// whatever timestamp the operations carry (a chunk's ops carry `base + 4·(row + 1)`).
+#[test]
+fn test_trace_timestamp_is_preprocessed_column() {
+    let (mut ops, decode) = ops4(Instruction::Arith {
+        dst: 3,
+        src1: 1,
+        src2: 2,
+        op: ArithOp::Add,
+    });
+    ops.truncate(3);
+    for (i, op) in ops.iter_mut().enumerate() {
+        op.timestamp = 1000 + 7 * i as u64;
+    }
+    let trace = generate_cpu_trace(&ops, &decode);
+    assert_eq!(trace.main_table.height, 4);
+    for row in 0..4 {
+        assert_eq!(
+            *trace.main_table.get(row, cols::TIMESTAMP),
+            (4 * (row as u64 + 1)).into(),
+            "row {row}"
+        );
+    }
+}
+
+#[test]
+fn test_timestamp_bases_are_cumulative_heights() {
+    assert_eq!(timestamp_bases(&[]), Vec::<u64>::new());
+    assert_eq!(timestamp_bases(&[8]), vec![0]);
+    assert_eq!(timestamp_bases(&[32, 32, 8]), vec![0, 128, 256]);
+    // Consecutive tables continue the cadence: the last row of table k is at
+    // base_k + 4·h_k, the first row of table k+1 at base_{k+1} + 4 = that + 4.
+    let heights = [16, 4];
+    let bases = timestamp_bases(&heights);
+    assert_eq!(bases[0] + 4 * heights[0] as u64 + 4, bases[1] + 4);
+}
+
+#[test]
+fn test_final_pc_timestamp_follows_last_row() {
+    assert_eq!(final_pc_timestamp(4), 17);
+    assert_eq!(final_pc_timestamp(MAX_CPU_ROWS), (1 << 32) - 3);
+}
+
+#[test]
+fn test_validate_heights_accepts_honest_layouts() {
+    assert!(validate_heights(&[4]).is_ok());
+    assert!(validate_heights(&[max_rows::CPU, max_rows::CPU, 64]).is_ok());
+    // The block's 2^21-row tables, and the tallest a prover may cut.
+    assert!(validate_heights(&[1 << 21, 1 << 21, 1 << 20]).is_ok());
+    assert!(validate_heights(&[MAX_TABLE_ROWS, 4]).is_ok());
+    // Largest layout under the bound: (2^11 - 1) full tables + one of 2^18 rows.
+    let mut heights = vec![max_rows::CPU; (1 << 11) - 1];
+    heights.push(max_rows::CPU / 2);
+    assert!(validate_heights(&heights).is_ok());
+}
+
+#[test]
+fn test_validate_heights_rejects_bad_heights() {
+    for bad in [0, 1, 2, 3, 12, MAX_TABLE_ROWS * 2] {
+        assert!(validate_heights(&[bad]).is_err(), "height {bad}");
+    }
+    assert!(validate_heights(&[max_rows::CPU, 6]).is_err());
+}
+
+/// `2^30` rows would put the last row at `4·2^30 = 2^32`, outside a `Word`
+/// and past HALT's `2^32 - 1`.
+#[test]
+fn test_validate_heights_rejects_epoch_over_row_bound() {
+    let heights = vec![max_rows::CPU; 1 << 11];
+    assert_eq!(heights.iter().sum::<usize>() as u64, MAX_CPU_ROWS + 1);
+    assert!(validate_heights(&heights).is_err());
+}
+
+/// `table_heights` mirrors the trace builder's chunking: full chunks, then the
+/// remainder padded to a power of two, at least 4.
+#[test]
+fn test_table_heights_matches_chunking() {
+    assert_eq!(table_heights(0, 32), Vec::<usize>::new());
+    assert_eq!(table_heights(1, 32), vec![4]);
+    assert_eq!(table_heights(5, 32), vec![8]);
+    assert_eq!(table_heights(32, 32), vec![32]);
+    assert_eq!(table_heights(33, 32), vec![32, 4]);
+    assert_eq!(table_heights(70, 32), vec![32, 32, 8]);
+    // One cycle over the bound: exactly 2^11 full tables of 2^19 rows.
+    let rows = 1usize << 30;
+    assert!(validate_heights(&table_heights(rows, max_rows::CPU)).is_err());
+    assert!(validate_heights(&table_heights(rows - (1 << 18), max_rows::CPU)).is_ok());
+}
+
+/// Every bus message's values at one row whose columns hold distinct values.
+fn messages_at_a_row(
+    interactions: &[stark::lookup::BusInteraction],
+) -> Vec<Vec<crate::tables::types::FE>> {
+    let row = |c: usize| crate::tables::types::FE::from(c as u64 + 1);
+    interactions
+        .iter()
+        .map(|i| {
+            i.values
+                .iter()
+                .flat_map(|v| v.combine_from::<crate::tables::types::GoldilocksField, _>(row))
+                .collect()
+        })
+        .collect()
+}
+
+/// ⛔ Each CPU table's AIR sends its own timestamp base, cached or not.
+///
+/// The prototype cache serves the bases an honest prover produces. A cache
+/// keyed by less than the base would hand every table the first one's bus
+/// values, and two tables' clocks would overlap. Each base is asked for twice
+/// (the second answer comes from the cache when the base is cached) and must
+/// send what the interactions built fresh at that base send, never base 0's.
+#[test]
+fn every_cpu_air_sends_its_own_timestamp_base() {
+    use crate::tables::cpu::{TIMESTAMP_STRIDE, bus_interactions};
+    use stark::traits::AIR;
+
+    let opts = stark::proof::options::ProofOptions::default_test_options();
+    let zero = messages_at_a_row(&bus_interactions(0));
+    let full = TIMESTAMP_STRIDE * max_rows::CPU as u64;
+    for base in [
+        0,
+        full,
+        2 * full,
+        TIMESTAMP_STRIDE << 21,
+        (3 * TIMESTAMP_STRIDE) << 21,
+        24,
+    ] {
+        let fresh = messages_at_a_row(&bus_interactions(base));
+        for _ in 0..2 {
+            let air = crate::test_utils::create_cpu_air(&opts, base);
+            assert_eq!(
+                messages_at_a_row(air.bus_interactions()),
+                fresh,
+                "base {base}: the AIR sends another base's messages"
+            );
+        }
+        assert_eq!(fresh != zero, base != 0, "base {base} moves no message");
+    }
+}
+
+/// ⛔ The CPU and REGISTER AIRs hand the verifier the columns it checks.
+///
+/// The multilinear verifier checks a table's preprocessed openings against
+/// `precomputed_columns()`, and an AIR given only a root (`with_preprocessed`)
+/// returns none, so its TIMESTAMP or its FINI would be free main trace. Every
+/// CPU table must return its own height's `4·(row + 1)` column, and REGISTER
+/// its four columns over the halted file.
+#[test]
+fn the_cpu_and_register_airs_expose_the_columns_the_verifier_checks() {
+    use crate::tables::{cpu, register};
+
+    let opts = stark::proof::options::ProofOptions::default_test_options();
+    let program =
+        executor::elf::Elf::load(&crate::test_utils::asm_elf_bytes("all_instructions_64"))
+            .expect("the ELF loads");
+    let heights = vec![16, 8, 4];
+    let counts = crate::TableCounts {
+        cpu: heights.len(),
+        lt: 0,
+        memw: 0,
+        memw_aligned: 0,
+        load: 0,
+        mul: 0,
+        dvrm: 0,
+        shift: 0,
+        branch: 0,
+        memw_register: 0,
+        eq: 0,
+        bytewise: 0,
+        store: 0,
+        cpu32: 0,
+        keccak: 0,
+        keccak_rnd: 0,
+        ecsm: 0,
+        ecdas: 0,
+        hint: 0,
+        copy: 0,
+        blake3: 0,
+        is_wh: 0,
+    };
+    let output = [7u8; 5];
+    let inputs = crate::BlockAirInputs::new(&opts, &program, heights.clone(), &output)
+        .expect("honest heights");
+    let airs = crate::block_airs(&program, &opts, &[], &counts, &inputs);
+    let refs = airs.air_refs();
+    let start = crate::cpu_proof_start(true, &counts);
+    for (k, &height) in heights.iter().enumerate() {
+        let air = refs[start + k];
+        assert_eq!(air.name(), format!("CPU[{k}]"));
+        assert_eq!(air.num_precomputed_columns(), cpu::NUM_PRECOMPUTED_COLS);
+        assert_eq!(
+            air.precomputed_columns(),
+            vec![cpu::timestamp_column(height)],
+            "CPU[{k}]: the verifier would check another TIMESTAMP"
+        );
+    }
+    let register_air = refs
+        .iter()
+        .find(|air| air.name() == "REGISTER")
+        .expect("REGISTER is in the block");
+    let init = register::register_init_from_entry_point(program.entry_point);
+    let fini = register::halted_fini(output.len() as u32);
+    assert_eq!(
+        register_air.num_precomputed_columns(),
+        register::NUM_PREPROCESSED_COLS
+    );
+    assert_eq!(
+        register_air.precomputed_columns(),
+        register::preprocessed_columns(&init, &fini),
+        "REGISTER: the verifier would check another FINI"
+    );
 }

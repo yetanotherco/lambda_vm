@@ -25,11 +25,12 @@ critical-section = { version = "1.2", optional = true }
 # `src/allocator.rs` for the measurements behind that choice. Select dlmalloc when the
 # execution's cumulative allocation isn't bounded per block.
 dlmalloc-alloc = ["dep:dlmalloc", "dep:critical-section"]
-# Guest `memcpy` override: a strong `memcpy` next to `_start` that moves 32 bytes an
-# iteration, in place of compiler_builtins' weak one. See `src/entrypoint.rs` for what it
-# does, the C contract it keeps (and the one the library routine happened to exceed), and
-# the tests that sweep it. The ethrex guest turns it on; every other guest keeps the library
-# routine.
+# Software memory routines instead of the copy accelerator. By default the runtime's
+# `memcpy`, `memmove` and `memset` hand every copy to the COPY accelerator (strong
+# globals next to `_start`). With this feature the runtime defines none of the three
+# stubs: `memcpy` is a software routine that moves 32 bytes an iteration, and `memmove`
+# and `memset` are compiler_builtins'. See `src/entrypoint.rs` for what it does, the C
+# contract it keeps, and the tests that sweep it. No guest in this tree turns it on.
 fast-memcpy = []
 
 [dev-dependencies]

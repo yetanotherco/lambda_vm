@@ -87,6 +87,7 @@ fn small_block_cut(
         ecdas_rows_log2: block_whir::BLOCK_ECDAS_ROWS_LOG2,
         keccak_rows_log2: block_whir::BLOCK_KECCAK_ROWS_LOG2,
         ecsm_rows_log2: block_whir::BLOCK_ECSM_ROWS_LOG2,
+        copy_rows_log2: block_whir::BLOCK_COPY_ROWS_LOG2,
         drop_levels: multilinear::whir_commit::TreeDrop::uniform(3),
         window_log2: None,
         stream_keccak_rnd: false,
@@ -455,6 +456,7 @@ fn dense_block_with(
             ecdas_rows_log2: block_whir::BLOCK_ECDAS_ROWS_LOG2,
             keccak_rows_log2: block_whir::BLOCK_KECCAK_ROWS_LOG2,
             ecsm_rows_log2: block_whir::BLOCK_ECSM_ROWS_LOG2,
+            copy_rows_log2: block_whir::BLOCK_COPY_ROWS_LOG2,
             drop_levels: multilinear::whir_commit::TreeDrop::uniform(3),
             window_log2: None,
             stream_keccak_rnd: false,
@@ -878,31 +880,37 @@ fn the_whir_block_tree_verifies_a_split_ecdas() {
     );
 }
 
-/// ★ KECCAK and ECSM cut through the block's recursion: test_keccak_multi's
-/// three permutations and test_ecsm_multi's three scalar multiplications, one
-/// row a table (three tables each at the default: the three calls, the padding
-/// row's table not built), prove as
+/// ★ KECCAK, ECSM and COPY cut through the block's recursion:
+/// test_keccak_multi's three permutations and test_ecsm_multi's three scalar
+/// multiplications, one row a table (three tables each at the default: the
+/// three calls, the padding row's table not built), and test_copy_ecalls'
+/// 17 COPY rows, one row a table (17 tables, calls cut inside), prove as
 /// blocks whose trees the verifier derives and accepts. Each statement with
 /// its first table stated over its cap ([`block_whir::BLOCK_KECCAK_MAX_VARS`],
-/// [`block_whir::BLOCK_ECSM_MAX_VARS`]) is refused before any program is
-/// derived.
+/// [`block_whir::BLOCK_ECSM_MAX_VARS`], [`block_whir::BLOCK_COPY_MAX_VARS`])
+/// is refused before any program is derived.
 #[test]
-#[ignore = "proves two small blocks and their trees; box tier"]
+#[ignore = "proves three small blocks and their trees; box tier"]
 fn the_whir_block_tree_verifies_split_keccak_and_ecsm() {
     super::device_permit::arm(1);
     let format = small_format();
     let opts = ProofOptions::default_test_options();
     let wrap = aggregation_wrap_options();
-    for (guest, name) in [("test_keccak_multi", "KECCAK"), ("test_ecsm_multi", "ECSM")] {
+    for (guest, name, tables) in [
+        ("test_keccak_multi", "KECCAK", 3),
+        ("test_ecsm_multi", "ECSM", 3),
+        ("test_copy_ecalls", "COPY", 17),
+    ] {
         let (elf, proof) = small_block_cut(guest, &format, |o| match name {
             "KECCAK" => o.keccak_rows_log2 = 0,
+            "COPY" => o.copy_rows_log2 = 0,
             _ => o.ecsm_rows_log2 = 0,
         });
         let (_, range, cap) = block_whir::chunked_table_ranges(&proof.table_counts)
             .into_iter()
             .find(|(n, ..)| *n == name)
             .expect("the table's range");
-        assert_eq!(range.len(), 3, "{name}: one row a table");
+        assert_eq!(range.len(), tables, "{name}: one row a table");
         let plan = plan_of(&elf, &proof, &format, None);
         let (top, _) =
             compose(&plan, &proof, &format!("{name} TREE")).expect("the honest tree proves");
@@ -929,8 +937,8 @@ fn the_whir_block_tree_verifies_split_keccak_and_ecsm() {
             "a {name} table stated over its cap must be refused"
         );
         println!(
-            "WHIR BLOCK TREE {name} SPLIT: {} groups, 3 {name} tables, accepted; a {name} over its \
-             cap refused ({})",
+            "WHIR BLOCK TREE {name} SPLIT: {} groups, {tables} {name} tables, accepted; a {name} \
+             over its cap refused ({})",
             plan.num_groups(),
             refused.err().unwrap_or_default()
         );

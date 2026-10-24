@@ -191,7 +191,7 @@ fn the_register_derivation_matches_its_host_twin_at_both_layouts() {
             let arenas = vec![column(&init), column(&fini)];
             let exec = super::executor::execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
                 .unwrap_or_else(|e| panic!("blowup {blowup} {layout:?}: {e:?}"));
-            let host = crate::tables::register::compute_precomputed_commitment_with_fini_layout(
+            let host = crate::tables::register::compute_precomputed_commitment_with(
                 &opts, &init, &fini, layout,
             );
             assert_eq!(
@@ -202,9 +202,7 @@ fn the_register_derivation_matches_its_host_twin_at_both_layouts() {
             if layout == LeafLayout::RowPair {
                 assert_eq!(
                     host,
-                    crate::tables::register::compute_precomputed_commitment_with_fini(
-                        &opts, &init, &fini
-                    ),
+                    crate::tables::register::compute_precomputed_commitment(&opts, &init, &fini),
                     "row pairs are today's commitment"
                 );
             }

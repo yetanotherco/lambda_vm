@@ -21,7 +21,7 @@ use crate::test_utils::asm_elf_bytes;
 
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
 
-fn run(name: &str) -> (Elf, Vec<Log>) {
+pub(super) fn run(name: &str) -> (Elf, Vec<Log>) {
     let program = Elf::load(&asm_elf_bytes(name)).expect("the ELF loads");
     let logs = Executor::new(&program, Vec::new())
         .expect("the executor starts")
@@ -62,7 +62,7 @@ fn contents(t: &Traces) -> Vec<(String, String)> {
         ("STORE", &t.stores),
         ("SHIFT", &t.shifts),
         ("CPU32", &t.cpu32s),
-        ("COMMIT", &t.commits),
+        ("COPY", &t.copies),
         ("KECCAK", &t.keccaks),
         ("KECCAK_RND", &t.keccak_rnds),
         ("ECSM", &t.ecsms),
@@ -154,7 +154,7 @@ fn same(what: &str, oracle: &Traces, plan: &Traces) {
 
 /// A windowed build over windows of `window` cycles, `configure` applied, its
 /// streamed chunks put back.
-fn windowed(
+pub(super) fn windowed(
     program: &Elf,
     logs: &[Log],
     max_rows: &MaxRowsConfig,
@@ -293,7 +293,7 @@ fn the_plan_builds_the_oracles_windowed_tables() {
             Box::new(|b| {
                 b.keccak_rnd_chunks_at_finish(32)
                     .expect("rows")
-                    .cuts_at_finish(2, 4, 2)
+                    .cuts_at_finish(2, 4, 2, 2)
                     .expect("rows")
                     .cut_padding(CutPadding::WholeRun)
                     .pack_finished_tables()
@@ -360,7 +360,7 @@ fn the_tables_are_the_same_with_an_index_mark_every_three_ops() {
             Box::new(|b| {
                 b.keccak_rnd_chunks_at_finish(32)
                     .expect("rows")
-                    .cuts_at_finish(2, 4, 2)
+                    .cuts_at_finish(2, 4, 2, 2)
                     .expect("rows")
                     .pack_finished_tables()
                     .generate_packed()
@@ -494,7 +494,7 @@ fn the_header_is_the_tables_counts_and_a_wrong_one_is_refused() {
             &plan.emit_all().expect("the tables"),
         );
         // Each family miscounted by one, up or down (where it has a table).
-        for field in 0..21 {
+        for field in 0..22 {
             for up in [true, false] {
                 let CollectedEpoch {
                     ops,
@@ -531,8 +531,9 @@ fn the_header_is_the_tables_counts_and_a_wrong_one_is_refused() {
                     16 => &mut wrong.ecsm,
                     17 => &mut wrong.ecdas,
                     18 => &mut wrong.hint,
-                    19 => &mut wrong.commit,
-                    _ => &mut wrong.blake3,
+                    19 => &mut wrong.copy,
+                    20 => &mut wrong.blake3,
+                    _ => &mut wrong.is_wh,
                 };
                 if !up && *slot == 0 {
                     continue;
@@ -549,8 +550,9 @@ fn the_header_is_the_tables_counts_and_a_wrong_one_is_refused() {
 
 /// The four families a block cuts at a fixed number of rows: each one's
 /// tables in a build and its bus interactions.
-fn cut_families(t: &Traces) -> [(&'static str, &[Table], Vec<stark::lookup::BusInteraction>); 4] {
+fn cut_families(t: &Traces) -> [(&'static str, &[Table], Vec<stark::lookup::BusInteraction>); 5] {
     [
+        ("COPY", &t.copies, copy::bus_interactions()),
         ("KECCAK", &t.keccaks, keccak::bus_interactions()),
         ("KECCAK_RND", &t.keccak_rnds, keccak_rnd::bus_interactions()),
         ("ECSM", &t.ecsms, ecsm::bus_interactions()),
@@ -558,9 +560,9 @@ fn cut_families(t: &Traces) -> [(&'static str, &[Table], Vec<stark::lookup::BusI
     ]
 }
 
-/// [`contents`] without the four cut families' tables and counts.
+/// [`contents`] without the five cut families' tables and counts.
 fn contents_but_the_cut_families(t: &Traces) -> Vec<(String, String)> {
-    let cut = ["KECCAK", "KECCAK_RND", "ECSM", "ECDAS"];
+    let cut = ["COPY", "KECCAK", "KECCAK_RND", "ECSM", "ECDAS"];
     contents(t)
         .into_iter()
         .filter(|(name, _)| {
@@ -573,14 +575,14 @@ fn contents_but_the_cut_families(t: &Traces) -> Vec<(String, String)> {
 }
 
 /// The block's windowed build with every family cut: KECCAK_RND at 32 rows,
-/// KECCAK, ECSM and ECDAS at `cuts`, wide (`packed` false) or packed, written
+/// KECCAK, ECSM, ECDAS and COPY at `cuts`, wide (`packed` false) or packed, written
 /// packed and with the streamed ops dropped, the cut tables padded as
 /// `padding`.
 fn cut_build(
     program: &Elf,
     logs: &[Log],
     window: usize,
-    cuts: (usize, usize, usize),
+    cuts: (usize, usize, usize, usize),
     packed: bool,
     padding: CutPadding,
 ) -> Traces {
@@ -588,7 +590,7 @@ fn cut_build(
         let b = b
             .keccak_rnd_chunks_at_finish(32)
             .expect("rows")
-            .cuts_at_finish(cuts.0, cuts.1, cuts.2)
+            .cuts_at_finish(cuts.0, cuts.1, cuts.2, cuts.3)
             .expect("rows")
             .cut_padding(padding);
         if packed {
@@ -606,12 +608,15 @@ fn cut_build(
 /// pads the whole run, whatever the settings say — without the cut families'
 /// tables of padding rows alone: each family's tables are the frozen build's
 /// first ones word for word, every table left out has all its bus
-/// multiplicities at zero, the last one kept holds a real row, and every
-/// other table of the build (BITWISE's counts and KECCAK_RC's among them) is
-/// the frozen build's.
+/// multiplicities at zero but its padding byte checks, the last one kept holds
+/// a real row, and every other table of the build (KECCAK_RC's among them) is
+/// the frozen build's. BITWISE's counts are too, but one: KECCAK_RND's θ/ρ byte
+/// checks have multiplicity 1 (main's multiplicity fix), so each padding row
+/// sends them as `ARE_BYTES[0, 0]`, and the frozen build's BITWISE answers the
+/// left-out tables' rows as well — `ARE_BYTES_PER_ROW` a row, in that one cell.
 #[test]
 fn a_build_cut_at_the_last_real_row_is_the_oracles_without_its_padding_tables() {
-    let mut left_out = [0usize; 4];
+    let mut left_out = [0usize; 5];
     for name in [
         "all_instructions_64",
         "test_keccak",
@@ -619,15 +624,17 @@ fn a_build_cut_at_the_last_real_row_is_the_oracles_without_its_padding_tables() 
         "test_ecsm",
         "test_ecsm_multi",
         "test_ecsm_split",
+        "test_copy_ecalls",
     ] {
         let (program, logs) = run(name);
-        for cuts in [(1, 1, 1), (2, 2, 16), (2, 4, 2)] {
+        for cuts in [(1, 1, 1, 1), (2, 2, 16, 4), (2, 4, 2, 2)] {
             for (window, packed) in [(7, true), (1000, true), (1000, false)] {
                 let what = format!("{name} cuts {cuts:?} window {window} packed {packed}");
                 let build =
                     || cut_build(&program, &logs, window, cuts, packed, CutPadding::LastTable);
                 let frozen = oracle(build);
                 let last = build();
+                let mut keccak_rnd_rows_left_out = 0usize;
                 for (f, ((family, kept, interactions), (_, today, _))) in cut_families(&last)
                     .into_iter()
                     .zip(cut_families(&frozen))
@@ -636,6 +643,12 @@ fn a_build_cut_at_the_last_real_row_is_the_oracles_without_its_padding_tables() 
                     is_today_without_its_padding_tables(kept, today, &interactions)
                         .unwrap_or_else(|e| panic!("{what}: {family}: {e}"));
                     left_out[f] += today.len() - kept.len();
+                    if family == "KECCAK_RND" {
+                        keccak_rnd_rows_left_out += today[kept.len()..]
+                            .iter()
+                            .map(|t| t.num_rows())
+                            .sum::<usize>();
+                    }
                 }
                 let (a, b) = (
                     contents_but_the_cut_families(&frozen),
@@ -643,7 +656,30 @@ fn a_build_cut_at_the_last_real_row_is_the_oracles_without_its_padding_tables() 
                 );
                 assert_eq!(a.len(), b.len(), "{what}: the other tables");
                 for ((table, x), (_, y)) in a.iter().zip(&b) {
-                    assert_eq!(x, y, "{what}: {table}");
+                    if table != "BITWISE" {
+                        assert_eq!(x, y, "{what}: {table}");
+                    }
+                }
+                let ((cols, rows, frozen_words), (_, _, words)) = (
+                    shape_and_words(&frozen.bitwise),
+                    shape_and_words(&last.bitwise),
+                );
+                assert_eq!(
+                    (rows, frozen_words.len()),
+                    (rows, words.len()),
+                    "{what}: BITWISE"
+                );
+                let cell = bitwise::row_index(0, 0, 0) * cols + bitwise::cols::MU_ARE_BYTES;
+                for (i, (x, y)) in frozen_words.iter().zip(&words).enumerate() {
+                    if i == cell {
+                        assert_eq!(
+                            *x - *y,
+                            (keccak_rnd::ARE_BYTES_PER_ROW * keccak_rnd_rows_left_out) as u64,
+                            "{what}: BITWISE's ARE_BYTES[0, 0]"
+                        );
+                    } else {
+                        assert_eq!(x, y, "{what}: BITWISE word {i}");
+                    }
                 }
             }
         }
@@ -677,19 +713,23 @@ fn cut_shapes(t: &Traces) -> Vec<(&'static str, usize, Vec<usize>)> {
 /// with a real row; `run` is the whole run padded, table for table as listed
 /// here and word for word the frozen build's. test_keccak_multi is 3
 /// permutations: 3 KECCAK rows (4 padded) and 72 KECCAK_RND rows (128
-/// padded). test_ecsm_multi is 3 scalar multiplications: 3 ECSM rows (4
-/// padded) and 42 ECDAS steps (64 padded).
+/// padded), and its 200-byte `write` is 25 COPY rows (32 padded).
+/// test_ecsm_multi is 3 scalar multiplications: 3 ECSM rows (4 padded) and 42
+/// ECDAS steps (64 padded), and its three 32-byte `write`s are 12 COPY rows
+/// (16 padded).
 #[test]
 fn the_knob_at_run_builds_the_whole_runs_tables_on_pinned_programs() {
     let unset = CutPadding::parse(None).expect("an unset variable");
     let run_word = CutPadding::parse(Some("run")).expect("the word run");
     let keccak_last = [
+        ("COPY", 13, 2),
         ("KECCAK", 2, 2),
         ("KECCAK_RND", 3, 32),
         ("ECSM", 0, 0),
         ("ECDAS", 0, 0),
     ];
     let ecsm_last = [
+        ("COPY", 6, 2),
         ("KECCAK", 0, 0),
         ("KECCAK_RND", 0, 0),
         ("ECSM", 2, 2),
@@ -704,6 +744,7 @@ fn the_knob_at_run_builds_the_whole_runs_tables_on_pinned_programs() {
             "test_keccak_multi",
             run_word,
             [
+                ("COPY", 16, 2),
                 ("KECCAK", 2, 2),
                 ("KECCAK_RND", 4, 32),
                 ("ECSM", 0, 0),
@@ -714,6 +755,7 @@ fn the_knob_at_run_builds_the_whole_runs_tables_on_pinned_programs() {
             "test_ecsm_multi",
             run_word,
             [
+                ("COPY", 8, 2),
                 ("KECCAK", 0, 0),
                 ("KECCAK_RND", 0, 0),
                 ("ECSM", 2, 2),
@@ -722,7 +764,7 @@ fn the_knob_at_run_builds_the_whole_runs_tables_on_pinned_programs() {
         ),
     ] {
         let (program, logs) = run(name);
-        let build = || cut_build(&program, &logs, 1000, (2, 2, 16), true, padding);
+        let build = || cut_build(&program, &logs, 1000, (2, 2, 16, 2), true, padding);
         let built = build();
         let want: Vec<(&str, usize, Vec<usize>)> = want
             .into_iter()

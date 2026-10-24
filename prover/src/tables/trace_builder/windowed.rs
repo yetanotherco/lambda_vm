@@ -165,9 +165,9 @@ pub struct WindowedTraceBuilder<'a> {
     /// [`Self::keccak_rnd_chunks_at_finish`]: rows per KECCAK_RND table `finish`
     /// builds, 0 for one table.
     finish_keccak_rnd_rows: usize,
-    /// [`Self::cuts_at_finish`]: rows per KECCAK, ECSM and ECDAS table `finish`
-    /// builds, 0 for one table each.
-    finish_cut_rows: (usize, usize, usize),
+    /// [`Self::cuts_at_finish`]: rows per KECCAK, ECSM, ECDAS and COPY table
+    /// `finish` builds, 0 for one table each.
+    finish_cut_rows: (usize, usize, usize, usize),
     /// [`Self::pack_finished_tables`].
     pack_finished: bool,
     /// [`Self::generate_packed`].
@@ -365,7 +365,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             kept: None,
             lean,
             finish_keccak_rnd_rows: 0,
-            finish_cut_rows: (0, 0, 0),
+            finish_cut_rows: (0, 0, 0, 0),
             pack_finished: false,
             gpack: false,
             cut_padding: CutPadding::from_env()?,
@@ -459,8 +459,9 @@ impl<'a> WindowedTraceBuilder<'a> {
         Ok(self)
     }
 
-    /// `finish` builds KECCAK, ECSM and ECDAS as the tables of `keccak`, `ecsm`
-    /// and `ecdas` rows the block's split makes of each whole table — each cut
+    /// `finish` builds KECCAK, ECSM, ECDAS and COPY as the tables of `keccak`,
+    /// `ecsm`, `ecdas` and `copy` rows the block's split makes of each whole
+    /// table — each cut
     /// built from the ops that reach it, and packed as it is built with
     /// [`Self::pack_finished_tables`] — instead of one wide table each that the
     /// split then copies apart. The words are the same. Each a power of two.
@@ -471,15 +472,21 @@ impl<'a> WindowedTraceBuilder<'a> {
         keccak: usize,
         ecsm: usize,
         ecdas: usize,
+        copy: usize,
     ) -> Result<Self, Error> {
-        for (name, rows) in [("KECCAK", keccak), ("ECSM", ecsm), ("ECDAS", ecdas)] {
+        for (name, rows) in [
+            ("KECCAK", keccak),
+            ("ECSM", ecsm),
+            ("ECDAS", ecdas),
+            ("COPY", copy),
+        ] {
             if !rows.is_power_of_two() {
                 return Err(Error::Prover(format!(
                     "{name} cut at {rows} rows: a power of two is needed"
                 )));
             }
         }
-        self.finish_cut_rows = (keccak, ecsm, ecdas);
+        self.finish_cut_rows = (keccak, ecsm, ecdas, copy);
         Ok(self)
     }
 
@@ -777,7 +784,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             &mut self.register_state,
             &mut walk,
             true,
-        );
+        )?;
         let route = if self.lean.route {
             route_ops_one_pass
         } else {
@@ -819,13 +826,14 @@ impl<'a> WindowedTraceBuilder<'a> {
         } else {
             emitted
         };
-        let (keccak_rows, ecsm_rows, ecdas_rows) = finish_cut_rows;
+        let (keccak_rows, ecsm_rows, ecdas_rows, copy_rows) = finish_cut_rows;
         let emitted = StreamSkip {
             pack: pack_finished,
             gpack: pack_finished && gpack,
             keccak_rows,
             ecsm_rows,
             ecdas_rows,
+            copy_rows,
             cut_padding,
             ..emitted
         };
@@ -1093,7 +1101,7 @@ fn walk_window(
             registers,
             &mut walk,
             lookups,
-        );
+        )?;
     }
     *sizes = WalkSizes::of(&walk, logs.len());
     Ok(WalkedWindow { cpu_ops, walk })
@@ -1661,7 +1669,7 @@ struct Kept {
 /// window into a [`BlockVec`] (blocks of its table's chunk, or 64 MiB).
 pub(super) struct KeptRest {
     bitwise_ops: BlockVec<super::BitwiseOperation>,
-    commit_ops: BlockVec<super::CommitOperation>,
+    copy_ops: BlockVec<super::copy::CopyOperation>,
     keccak_ops: BlockVec<super::keccak::KeccakOperation>,
     blake3_ops: BlockVec<super::Blake3Operation>,
     blake3_absorb_ops: BlockVec<super::blake3::Blake3AbsorbOperation>,
@@ -1674,8 +1682,12 @@ pub(super) struct KeptRest {
 
 /// ECDAS rows a block of the kept ECDAS ops holds: the block's ECDAS cut
 /// (`block_whir::BLOCK_ECDAS_ROWS_LOG2`), so a cut is a block; ≈ 91 MiB of
-/// compact rows, the one list whose blocks pass 64 MiB.
+/// compact rows, one of the two lists whose blocks pass 64 MiB.
 pub(super) const ECDAS_BLOCK_ROWS: usize = 1 << 17;
+
+/// COPY rows a block of the kept COPY ops holds: the block's COPY cut
+/// (`block_whir::BLOCK_COPY_ROWS_LOG2`), so a cut is a block (48 MiB of rows).
+pub(super) const COPY_BLOCK_ROWS: usize = 1 << 20;
 
 impl KeptRest {
     fn new(m: &crate::tables::MaxRowsConfig) -> Self {
@@ -1684,7 +1696,7 @@ impl KeptRest {
         }
         Self {
             bitwise_ops: list(usize::MAX),
-            commit_ops: list(usize::MAX),
+            copy_ops: BlockVec::new(COPY_BLOCK_ROWS),
             keccak_ops: list(usize::MAX),
             blake3_ops: list(usize::MAX),
             blake3_absorb_ops: list(usize::MAX),
@@ -1700,7 +1712,7 @@ impl KeptRest {
     fn from_walk(walk: &mut WalkOutputs) -> Self {
         Self {
             bitwise_ops: BlockVec::from_vec(std::mem::take(&mut walk.bitwise_ops)),
-            commit_ops: BlockVec::from_vec(std::mem::take(&mut walk.commit_ops)),
+            copy_ops: BlockVec::from_vec(std::mem::take(&mut walk.copy_ops)),
             keccak_ops: BlockVec::from_vec(std::mem::take(&mut walk.keccak_ops)),
             blake3_ops: BlockVec::from_vec(std::mem::take(&mut walk.blake3_ops)),
             blake3_absorb_ops: BlockVec::from_vec(std::mem::take(&mut walk.blake3_absorb_ops)),
@@ -1733,7 +1745,7 @@ impl KeptRest {
         };
         [
             of("bitwise", &self.bitwise_ops),
-            of("commit", &self.commit_ops),
+            of("copy", &self.copy_ops),
             of("keccak", &self.keccak_ops),
             of("blake3", &self.blake3_ops),
             of("blake3_absorb", &self.blake3_absorb_ops),
@@ -1833,13 +1845,13 @@ impl Kept {
             lt_ops,
             shift_ops,
             bitwise_ops,
-            commit_ops,
             keccak_ops,
             blake3_ops,
             blake3_absorb_ops,
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
+            copy_ops,
             hint_ops,
         } = walk;
         self.cpu.push(cpu_ops);
@@ -1851,7 +1863,7 @@ impl Kept {
         self.shift.push(shift_ops);
         let rest = &mut self.rest;
         rest.bitwise_ops.extend(bitwise_ops);
-        rest.commit_ops.extend(commit_ops);
+        rest.copy_ops.extend(copy_ops);
         rest.keccak_ops.extend(keccak_ops);
         rest.blake3_ops.extend(blake3_ops);
         rest.blake3_absorb_ops.extend(blake3_absorb_ops);
@@ -2003,8 +2015,12 @@ fn tail_jobs(
         for part in ops.slices() {
             counted
                 .histogram
-                .add_ops(&super::collect_bitwise_from_lt(part))
+                .add_ops(&super::collect_bitwise_from_lt_ops(part))
         }
+        // The chunk is one LT table: its rows' μ bounds (`types::MU_MAX`).
+        counted.histogram.add_ops(&super::lt_row_lookups(
+            ops.slices().into_iter().flat_map(|part| part.iter()),
+        ));
     });
     take_chunks!(
         StreamTable::Shift,
@@ -2141,7 +2157,7 @@ fn concatenate(windows: Vec<WalkedWindow>) -> (Vec<super::CpuOperation>, WalkOut
     let mut lt = Vec::with_capacity(n);
     let mut shift = Vec::with_capacity(n);
     let mut bitwise = Vec::with_capacity(n);
-    let mut commit = Vec::with_capacity(n);
+    let mut copy = Vec::with_capacity(n);
     let mut keccak = Vec::with_capacity(n);
     let mut blake3 = Vec::with_capacity(n);
     let mut blake3_absorb = Vec::with_capacity(n);
@@ -2158,7 +2174,7 @@ fn concatenate(windows: Vec<WalkedWindow>) -> (Vec<super::CpuOperation>, WalkOut
         lt.push(walk.lt_ops);
         shift.push(walk.shift_ops);
         bitwise.push(walk.bitwise_ops);
-        commit.push(walk.commit_ops);
+        copy.push(walk.copy_ops);
         keccak.push(walk.keccak_ops);
         blake3.push(walk.blake3_ops);
         blake3_absorb.push(walk.blake3_absorb_ops);
@@ -2186,13 +2202,13 @@ fn concatenate(windows: Vec<WalkedWindow>) -> (Vec<super::CpuOperation>, WalkOut
         lt_ops: lt,
         shift_ops: shift,
         bitwise_ops: bitwise,
-        commit_ops: cat(commit),
         keccak_ops: cat(keccak),
         blake3_ops: cat(blake3),
         blake3_absorb_ops: cat(blake3_absorb),
         cpu32_ops: cat(cpu32),
         ecsm_ops: cat(ecsm),
         ecdas_ops: cat(ecdas),
+        copy_ops: cat(copy),
         hint_ops: cat(hint),
     };
     (cpu, walk)
@@ -2323,7 +2339,7 @@ fn assemble(
     } = walk;
     let KeptRest {
         bitwise_ops,
-        commit_ops,
+        copy_ops,
         keccak_ops,
         blake3_ops,
         blake3_absorb_ops,
@@ -2386,7 +2402,7 @@ fn assemble(
         branch_ops,
         mul_ops,
         dvrm_ops,
-        commit_ops,
+        copy_ops,
         keccak_ops,
         blake3_ops,
         blake3_absorb_ops,
@@ -2510,7 +2526,7 @@ impl RegenBuilder {
             &mut self.memory_state,
             &mut self.register_state,
             &mut walk,
-        );
+        )?;
         // STORE's segment, as the routing filters it out of the CPU ops.
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut stores: Vec<store::StoreOperation> = cpu_ops
@@ -2681,6 +2697,16 @@ mod block_tests {
         assert_eq!(
             super::ECDAS_BLOCK_ROWS,
             1usize << crate::block_whir::BLOCK_ECDAS_ROWS_LOG2
+        );
+    }
+
+    /// The kept COPY ops' blocks are the block proof's COPY cut, so a cut is
+    /// one block.
+    #[test]
+    fn the_copy_block_is_the_blocks_copy_cut() {
+        assert_eq!(
+            super::COPY_BLOCK_ROWS,
+            1usize << crate::block_whir::BLOCK_COPY_ROWS_LOG2
         );
     }
 

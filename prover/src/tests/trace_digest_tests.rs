@@ -72,7 +72,7 @@ fn trace_digests() {
                 ("STORE", &t.stores, false),
                 ("SHIFT", &t.shifts, false),
                 ("CPU32", &t.cpu32s, false),
-                ("COMMIT", &t.commits, false),
+                ("COPY", &t.copies, false),
                 ("KECCAK", &t.keccaks, false),
                 ("KECCAK_RND", &t.keccak_rnds, false),
                 ("ECSM", &t.ecsms, false),

@@ -26,6 +26,7 @@
 //! ## Bus Interactions
 //! - Sender: MSB16 (×2 for sign extraction)
 //! - Sender: IS_HALF (×16 for lhs/rhs input and lo/hi output range checks)
+//! - Sender: ARE_BYTES (×1: `[μ_lo, μ_hi]`, the batched multiplicity bounds)
 //! - Sender: IS_B20 (×4 for carry range checks)
 //! - Receiver: ALU (×2 for lo and hi results — every MUL lookup, CPU
 //!   MUL/MULH dispatch and dvrm's internal `d*q` consistency)
@@ -37,7 +38,7 @@ use super::trace_hash::{OpMap, trace_hash_state};
 
 use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{
-    BusId, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
+    BusId, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128, MU_MAX,
     NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48, NEG_INV_2_64, NEG_INV_2_80, NEG_INV_2_96,
     NEG_INV_2_112, NEG_INV_2_128, SHIFT_16, VmTable, alu_op,
 };
@@ -282,6 +283,44 @@ impl MulOperation {
 // Trace generation
 // =========================================================================
 
+/// Deduplicates MUL operations into trace rows: `(lhs, lhs_signed, rhs,
+/// rhs_signed) -> (μ_lo, μ_hi)`, splitting an op over several rows when a count
+/// exceeds [`MU_MAX`]. Shared by trace generation and the BITWISE collector so
+/// the per-row lookups they count cannot drift apart.
+///
+/// `μ_lo` and `μ_hi` are each range-checked to a byte by `IS_BYTE[μ_lo]` and
+/// `IS_BYTE[μ_hi]`, batched into one `ARE_BYTES[μ_lo, μ_hi]` with multiplicity 1.
+/// The bound is what makes `μ_lo + μ_hi = 0` imply `μ_lo = μ_hi = 0`: without it
+/// a `μ_lo = 1, μ_hi = −1` row receives a lookup while sending none of its range
+/// checks.
+pub fn dedup_mul_rows(
+    operations: &[(MulOperation, bool)],
+) -> Vec<(MulOperation, MulMultiplicities)> {
+    let mut op_map: OpMap<MulOperation, MulMultiplicities> = OpMap::with_hasher(trace_hash_state());
+    for (op, wants_hi) in operations {
+        let entry = op_map.entry(op.clone()).or_default();
+        if *wants_hi {
+            entry.mu_hi += 1;
+        } else {
+            entry.mu_lo += 1;
+        }
+    }
+
+    let mut rows = Vec::with_capacity(op_map.len());
+    for (op, mut left) in op_map {
+        while left.mu_lo > 0 || left.mu_hi > 0 {
+            let row = MulMultiplicities {
+                mu_lo: left.mu_lo.min(MU_MAX),
+                mu_hi: left.mu_hi.min(MU_MAX),
+            };
+            left.mu_lo -= row.mu_lo;
+            left.mu_hi -= row.mu_hi;
+            rows.push((op.clone(), row));
+        }
+    }
+    rows
+}
+
 /// Generates the MUL trace table from a list of operations.
 ///
 /// Operations are deduplicated by (lhs, lhs_signed, rhs, rhs_signed).
@@ -303,19 +342,7 @@ pub fn generate_mul_trace_as(
     operations: &[(MulOperation, bool)],
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    // Deduplicate: (lhs, lhs_signed, rhs, rhs_signed) -> (mu_lo, mu_hi)
-    let mut op_map: OpMap<MulOperation, MulMultiplicities> = OpMap::with_hasher(trace_hash_state());
-
-    for (op, wants_hi) in operations {
-        let entry = op_map.entry(op.clone()).or_default();
-        if *wants_hi {
-            entry.mu_hi += 1;
-        } else {
-            entry.mu_lo += 1;
-        }
-    }
-
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    let unique_ops = dedup_mul_rows(operations);
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
         for (row_idx, (op, multiplicities)) in unique_ops.iter().enumerate() {
@@ -363,6 +390,7 @@ pub fn generate_mul_trace_as(
 /// The MUL table:
 /// - **Sends** MSB16 lookups for sign bit extraction (×2)
 /// - **Sends** IS_HALF lookups for lhs/rhs input and lo/hi output range checks (×16)
+/// - **Sends** ARE_BYTES[μ_lo, μ_hi] to bound the multiplicities
 /// - **Sends** IS_B20 lookups for carry range checks (×4)
 /// - **Receives** MUL lookups from CPU table (×2: lo and hi)
 pub fn bus_interactions() -> Vec<BusInteraction> {
@@ -398,6 +426,30 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
             BusValue::Packed {
                 start_column: cols::RHS_IS_NEGATIVE,
+                packing: Packing::Direct,
+            },
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // IS_BYTE[μ_lo], IS_BYTE[μ_hi] = ARE_BYTES[μ_lo, μ_hi] | 1.
+    // Every check below fires with μ_lo + μ_hi, so the multiplicities themselves
+    // must be bounded and non-negative. Otherwise μ_lo = 1, μ_hi = −1 receives a
+    // `lo` lookup with all range checks off (forged product),
+    // and an honest μ_hi = 1 copy of the row cancels the stray −1.
+    // Both checks share the spec's default `cond` (1), so they batch into one
+    // interaction; padding rows send ARE_BYTES[0, 0]. See `MU_MAX`.
+    // -------------------------------------------------------------------------
+    interactions.push(BusInteraction::sender(
+        BusId::AreBytes,
+        Multiplicity::One,
+        vec![
+            BusValue::Packed {
+                start_column: cols::MU_LO,
+                packing: Packing::Direct,
+            },
+            BusValue::Packed {
+                start_column: cols::MU_HI,
                 packing: Packing::Direct,
             },
         ],

@@ -789,6 +789,15 @@ pub(crate) struct BitwiseHistogram {
     counters: Box<[u64]>,
 }
 
+/// Cell-by-cell equality, so a test can compare a collector against the
+/// lookups it should have counted.
+#[cfg(test)]
+impl PartialEq for BitwiseHistogram {
+    fn eq(&self, other: &Self) -> bool {
+        self.counters == other.counters
+    }
+}
+
 impl BitwiseHistogram {
     /// Allocate a zeroed histogram (80 MiB).
     // No `Default` impl on purpose: `new()` allocates 80 MiB, so a stray

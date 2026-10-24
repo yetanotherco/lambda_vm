@@ -24,11 +24,13 @@ pub mod block_whir_tests;
 #[cfg(test)]
 pub mod branch_bus_tests;
 #[cfg(test)]
+pub mod branch_carrier_poc;
+#[cfg(test)]
 pub mod branch_constraints_tests;
 #[cfg(test)]
-pub mod bytewise_tests;
+pub mod branch_multiplicity_poc;
 #[cfg(test)]
-pub mod commit_tests;
+pub mod bytewise_tests;
 #[cfg(test)]
 pub mod compute_commit_bus_offset_tests;
 #[cfg(test)]
@@ -45,12 +47,16 @@ pub mod constraint_set_tests_a;
 pub mod constraint_set_tests_b;
 #[cfg(test)]
 pub mod constraints_tests;
+#[cfg(test)]
+pub mod copy_tests;
 #[cfg(all(test, feature = "disk-spill"))]
 pub mod count_table_lengths_drift_tests;
 #[cfg(test)]
 pub mod cpu32_tests;
 #[cfg(test)]
 pub mod cpu_tests;
+#[cfg(test)]
+pub mod cpu_timestamp_tests;
 #[cfg(test)]
 pub mod decode_layout_tests;
 #[cfg(test)]
@@ -72,14 +78,19 @@ pub mod eq_tests;
 #[cfg(test)]
 pub mod gpack_tests;
 #[cfg(test)]
+pub mod halt_pc_forgery_poc;
+#[cfg(test)]
 pub mod hash_pin_enumeration;
 #[cfg(test)]
 pub mod hint_tests;
 #[cfg(test)]
 pub mod ir_stats_dump;
 #[cfg(test)]
+pub mod is_wh_tests;
+#[cfg(test)]
 pub mod keccak_rnd_tests;
 #[cfg(test)]
+pub mod keccak_tests;
 pub mod lean_program_census;
 #[cfg(test)]
 pub mod load_tests;
@@ -87,6 +98,8 @@ pub mod load_tests;
 pub mod local_to_global_bus_tests;
 #[cfg(test)]
 pub mod lt_bus_tests;
+#[cfg(test)]
+pub mod lt_multiplicity_poc;
 #[cfg(test)]
 pub mod lt_tests;
 #[cfg(test)]
@@ -96,6 +109,8 @@ pub mod memw_register_tests;
 #[cfg(test)]
 pub mod memw_tests;
 #[cfg(test)]
+pub mod mul_mu_carrier_poc;
+#[cfg(test)]
 pub mod mul_tests;
 #[cfg(test)]
 pub mod multilinear_bench_tests;
@@ -103,6 +118,7 @@ pub mod multilinear_continuation_tests;
 pub mod multilinear_prove_tests;
 #[cfg(test)]
 pub mod multilinear_table_tests;
+pub mod multiplicity_forgery_poc;
 #[cfg(test)]
 pub mod ood_window_ir_tests;
 #[cfg(test)]
@@ -113,6 +129,8 @@ pub mod page_layout_tests;
 pub mod page_offset_forgery_poc;
 #[cfg(test)]
 pub mod page_tests;
+#[cfg(test)]
+pub mod pc_double_read_poc;
 #[cfg(test)]
 pub mod prove_elfs_tests;
 #[cfg(test)]

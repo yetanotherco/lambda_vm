@@ -49,7 +49,8 @@ use crate::tables::trace_builder::{
 use crate::test_utils::{E, F};
 use crate::zf_format::ZfFormat;
 use crate::{
-    Error, FIXED_TABLE_COUNT, MaxRowsConfig, ProofOptions, RuntimePageRange, TableCounts, VmAirs,
+    BlockAirInputs, Error, FIXED_TABLE_COUNT, MaxRowsConfig, ProofOptions, RuntimePageRange,
+    TableCounts, VmAirs, block_airs,
 };
 use stark::config::CommitmentHash;
 use stark::proof::options::{BaseFormat, CapPolicy};
@@ -67,6 +68,20 @@ pub const BLOCK_GROUP_POLYS: usize = 3;
 /// The most KECCAK_RND tables a block statement may declare: a bound on what
 /// the verifier builds before anything is checked, far above any block.
 pub const BLOCK_MAX_KECCAK_RND: usize = 1 << 12;
+
+/// The most COPY tables a block statement may declare: a bound on what the
+/// verifier builds before anything is checked, far above any block (a p90
+/// mainnet block makes 17 at 2^20 rows).
+pub const BLOCK_MAX_COPY: usize = 1 << 12;
+
+/// The rows each COPY table holds at most — a prover's choice, under the
+/// format's cap [`BLOCK_COPY_MAX_VARS`]. COPY is one row per eight bytes a
+/// copy, memset or `write` moves (a row per byte for the last seven), so a
+/// median mainnet block makes millions, which one table would pad to the next
+/// power of two. A call's rows may straddle two tables: they chain only
+/// through the CopyNext bus, keyed by the call's timestamp and its running
+/// `(src, dst, count)`. At 2^20 rows a table is 41 columns of 2^20.
+pub const BLOCK_COPY_ROWS_LOG2: usize = 20;
 
 /// The rows each KECCAK_RND table holds at most — a prover's choice, under
 /// the format's cap [`BLOCK_KECCAK_RND_MAX_VARS`]: 2^16 is today's tallest, so
@@ -130,6 +145,17 @@ pub const BLOCK_KECCAK_MAX_VARS: usize = 18;
 /// ECSM table stack into more than one polynomial of a 2^27 stack.
 pub const BLOCK_ECSM_MAX_VARS: usize = 17;
 
+/// The tallest COPY table a block statement may state, in variables: a
+/// verifier constant ([`check_chunked_heights`]), the block's chunk height
+/// (`BlockOptions::production`'s 2^21).
+pub const BLOCK_COPY_MAX_VARS: usize = 21;
+
+/// The tallest CPU table a block statement may state, in variables: a
+/// verifier constant ([`block_cpu_heights`]), the block's chunk height
+/// (`BlockOptions::production`'s 2^21). The CPU tables' total stays under the
+/// clock's bound (`tables::cpu::validate_heights`).
+pub const BLOCK_CPU_MAX_VARS: usize = 21;
+
 /// The tallest table a block statement may state, in variables: a verifier
 /// constant ([`check_table_heights`]). A group stacks at `want.min(cap).max(tallest)`
 /// variables, so one taller table would make its chain taller than the 2^27
@@ -142,6 +168,7 @@ const _: () = assert!(BLOCK_KECCAK_RND_ROWS_LOG2 <= BLOCK_KECCAK_RND_MAX_VARS);
 const _: () = assert!(BLOCK_ECDAS_ROWS_LOG2 <= BLOCK_ECDAS_MAX_VARS);
 const _: () = assert!(BLOCK_KECCAK_ROWS_LOG2 <= BLOCK_KECCAK_MAX_VARS);
 const _: () = assert!(BLOCK_ECSM_ROWS_LOG2 <= BLOCK_ECSM_MAX_VARS);
+const _: () = assert!(BLOCK_COPY_ROWS_LOG2 <= BLOCK_COPY_MAX_VARS);
 
 /// Tree levels a group keeps OFF the host between its commit and its opening,
 /// for a codeword on the host: a query re-hashes `2^4` of its codeword's cosets
@@ -272,7 +299,7 @@ const _: () = {
 };
 
 /// The block statement's leading tag under `base`'s geometry:
-/// `LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V1/P1W16/C<h>`, the effective cap:
+/// `LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V2/P1W16/C<h>`, the effective cap:
 /// `C0` uncapped (`Off` and `Fixed(0)`), `C<h>` at a fixed height and `Cauto`
 /// under `Auto`, so no two geometries share a tag (REV-P1-JUDGE F2). The hash
 /// part is the block family's (`hash_pin::BLOCK_BASE`, Poseidon1 at width
@@ -296,7 +323,7 @@ pub fn block_statement_tag(base: &BaseFormat) -> Vec<u8> {
 #[cfg(test)]
 thread_local! {
     /// Test only: on this thread, a statement takes the untagged
-    /// `LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V1` (the tag's mutation).
+    /// `LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V2` (the tag's mutation).
     /// Thread-local, so a test that sets it moves no other test's statement.
     pub(crate) static P1_TAG_OMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -357,6 +384,9 @@ pub struct BlockOptions {
     /// ECSM's tables are cut at 2^`ecsm_rows_log2` rows
     /// ([`BLOCK_ECSM_ROWS_LOG2`] in production).
     pub ecsm_rows_log2: usize,
+    /// COPY's tables are cut at 2^`copy_rows_log2` rows
+    /// ([`BLOCK_COPY_ROWS_LOG2`] in production).
+    pub copy_rows_log2: usize,
     /// The bottom levels each committed tree drops until its opening, on the
     /// card and on the host. Production: [`tree_drop_from_env`].
     pub drop_levels: multilinear::whir_commit::TreeDrop,
@@ -874,6 +904,7 @@ impl BlockOptions {
             ecdas_rows_log2: BLOCK_ECDAS_ROWS_LOG2,
             keccak_rows_log2: BLOCK_KECCAK_ROWS_LOG2,
             ecsm_rows_log2: BLOCK_ECSM_ROWS_LOG2,
+            copy_rows_log2: BLOCK_COPY_ROWS_LOG2,
             drop_levels: tree_drop_from_env(),
             window_log2: Some(BLOCK_WINDOW_LOG2),
             stream_keccak_rnd: false,
@@ -1077,10 +1108,11 @@ pub(crate) fn upload_ahead_from_env() -> Option<bool> {
     }
 }
 
-/// `BLOCK_WHIR_KECCAK_LOG2=k` (0..=[`BLOCK_KECCAK_MAX_VARS`]) and
-/// `BLOCK_WHIR_ECSM_LOG2=k` (0..=[`BLOCK_ECSM_MAX_VARS`]): the real-block
-/// tests' KECCAK and ECSM cuts, to force a split on a block whose tables fit
-/// one; unset leaves the production ones.
+/// `BLOCK_WHIR_KECCAK_LOG2=k` (0..=[`BLOCK_KECCAK_MAX_VARS`]),
+/// `BLOCK_WHIR_ECSM_LOG2=k` (0..=[`BLOCK_ECSM_MAX_VARS`]) and
+/// `BLOCK_WHIR_COPY_LOG2=k` (0..=[`BLOCK_COPY_MAX_VARS`]): the real-block
+/// tests' KECCAK, ECSM and COPY cuts, to force a split on a block whose tables
+/// fit one; unset leaves the production ones.
 pub(crate) fn chunk_cuts_from_env(options: &mut BlockOptions) {
     for (name, cap, rows_log2) in [
         (
@@ -1092,6 +1124,11 @@ pub(crate) fn chunk_cuts_from_env(options: &mut BlockOptions) {
             "BLOCK_WHIR_ECSM_LOG2",
             BLOCK_ECSM_MAX_VARS,
             &mut options.ecsm_rows_log2,
+        ),
+        (
+            "BLOCK_WHIR_COPY_LOG2",
+            BLOCK_COPY_MAX_VARS,
+            &mut options.copy_rows_log2,
         ),
     ] {
         if let Ok(v) = std::env::var(name) {
@@ -1594,12 +1631,41 @@ impl BlockStamps {
     }
 }
 
+/// The CPU tables' heights a block statement states, at the CPU tables'
+/// positions (`crate::cpu_proof_start`), each at most [`BLOCK_CPU_MAX_VARS`]
+/// variables. [`BlockAirInputs::new`] then checks them against the clock.
+pub(crate) fn block_cpu_heights(
+    counts: &TableCounts,
+    table_num_vars: &[u8],
+) -> Result<Vec<usize>, Error> {
+    let start = crate::cpu_proof_start(true, counts);
+    let stated = start
+        .checked_add(counts.cpu)
+        .and_then(|end| table_num_vars.get(start..end))
+        .ok_or_else(|| {
+            Error::InvalidTableCounts("the statement states fewer heights than CPU tables".into())
+        })?;
+    stated
+        .iter()
+        .enumerate()
+        .map(|(k, &vars)| {
+            if usize::from(vars) > BLOCK_CPU_MAX_VARS {
+                return Err(Error::InvalidTableCounts(format!(
+                    "CPU[{k}] states 2^{vars} rows — a block takes at most 2^{BLOCK_CPU_MAX_VARS}"
+                )));
+            }
+            Ok(1usize << vars)
+        })
+        .collect()
+}
+
 /// The counts a block statement may declare: [`TableCounts::validate`], with
-/// KECCAK, KECCAK_RND, ECSM and ECDAS chunked (at most [`BLOCK_MAX_KECCAK`],
-/// [`BLOCK_MAX_KECCAK_RND`], [`BLOCK_MAX_ECSM`] and [`BLOCK_MAX_ECDAS`]
-/// tables).
+/// COPY, KECCAK, KECCAK_RND, ECSM and ECDAS chunked (at most
+/// [`BLOCK_MAX_COPY`], [`BLOCK_MAX_KECCAK`], [`BLOCK_MAX_KECCAK_RND`],
+/// [`BLOCK_MAX_ECSM`] and [`BLOCK_MAX_ECDAS`] tables).
 pub fn validate_block_counts(counts: &TableCounts) -> Result<(), Error> {
     for (name, count, max) in [
+        ("copy", counts.copy, BLOCK_MAX_COPY),
         ("keccak", counts.keccak, BLOCK_MAX_KECCAK),
         ("keccak_rnd", counts.keccak_rnd, BLOCK_MAX_KECCAK_RND),
         ("ecsm", counts.ecsm, BLOCK_MAX_ECSM),
@@ -1612,6 +1678,7 @@ pub fn validate_block_counts(counts: &TableCounts) -> Result<(), Error> {
         }
     }
     let mut rest = counts.clone();
+    rest.copy = rest.copy.min(1);
     rest.keccak = rest.keccak.min(1);
     rest.keccak_rnd = rest.keccak_rnd.min(1);
     rest.ecsm = rest.ecsm.min(1);
@@ -1621,17 +1688,19 @@ pub fn validate_block_counts(counts: &TableCounts) -> Result<(), Error> {
 
 /// The proof-order index range of each chunked table, with its height cap in
 /// variables. The order is [`VmAirs::air_refs`]'s: the [`FIXED_TABLE_COUNT`]
-/// fixed tables, then COMMIT, KECCAK, KECCAK_RND, ECSM, ECDAS, … (pinned
+/// fixed tables, then COPY, KECCAK, KECCAK_RND, ECSM, ECDAS, … (pinned
 /// against the AIR names by `chunked_table_ranges_name_the_chunked_airs`).
 /// Counts whose total passed [`TableCounts::total`] cannot overflow these sums.
 pub(crate) fn chunked_table_ranges(
     counts: &TableCounts,
-) -> [(&'static str, std::ops::Range<usize>, usize); 4] {
-    let keccak = FIXED_TABLE_COUNT + counts.commit;
+) -> [(&'static str, std::ops::Range<usize>, usize); 5] {
+    let copy = FIXED_TABLE_COUNT;
+    let keccak = copy + counts.copy;
     let keccak_rnd = keccak + counts.keccak;
     let ecsm = keccak_rnd + counts.keccak_rnd;
     let ecdas = ecsm + counts.ecsm;
     [
+        ("COPY", copy..keccak, BLOCK_COPY_MAX_VARS),
         ("KECCAK", keccak..keccak_rnd, BLOCK_KECCAK_MAX_VARS),
         ("KECCAK_RND", keccak_rnd..ecsm, BLOCK_KECCAK_RND_MAX_VARS),
         ("ECSM", ecsm..ecdas, BLOCK_ECSM_MAX_VARS),
@@ -1655,10 +1724,10 @@ pub(crate) fn check_table_heights(table_num_vars: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-/// Every chunked table under its cap, against the statement's heights: KECCAK
-/// at most [`BLOCK_KECCAK_MAX_VARS`] variables, KECCAK_RND
-/// [`BLOCK_KECCAK_RND_MAX_VARS`], ECSM [`BLOCK_ECSM_MAX_VARS`] and ECDAS
-/// [`BLOCK_ECDAS_MAX_VARS`]. Run once the heights are known to be one per
+/// Every chunked table under its cap, against the statement's heights: COPY
+/// at most [`BLOCK_COPY_MAX_VARS`] variables, KECCAK
+/// [`BLOCK_KECCAK_MAX_VARS`], KECCAK_RND [`BLOCK_KECCAK_RND_MAX_VARS`], ECSM
+/// [`BLOCK_ECSM_MAX_VARS`] and ECDAS [`BLOCK_ECDAS_MAX_VARS`]. Run once the heights are known to be one per
 /// table.
 pub(crate) fn check_chunked_heights(
     counts: &TableCounts,
@@ -1817,8 +1886,20 @@ fn first_pieces(table: TraceTable<F, E>, rows: usize, pieces: usize) -> Vec<Trac
 fn table_of<'a>(
     air: &'a dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
     trace: &mut TraceTable<F, E>,
+    shape: (usize, usize),
+    release_rows: bool,
+) -> Result<CommittedTable<'a, F, E>, Error> {
+    table_of_checked(air, trace, shape, release_rows, true)
+}
+
+/// [`table_of`], its preprocessed-column check `check`ed or not (a test's
+/// [`Deviations::unchecked_preprocessed`]).
+fn table_of_checked<'a>(
+    air: &'a dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+    trace: &mut TraceTable<F, E>,
     (width, num_vars): (usize, usize),
     release_rows: bool,
+    check: bool,
 ) -> Result<CommittedTable<'a, F, E>, Error> {
     let layout = layout_of(air, width, num_vars)
         .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?;
@@ -1830,7 +1911,7 @@ fn table_of<'a>(
         trace.main_table = Table::new(Vec::new(), 0);
     }
     for (col, expected) in air.precomputed_columns().iter().enumerate() {
-        if columns.get(col) != Some(expected) {
+        if check && columns.get(col) != Some(expected) {
             return Err(Error::Prover(format!(
                 "{}: preprocessed column {col} is not what the program implies",
                 air.name(),
@@ -2309,6 +2390,13 @@ pub(crate) struct Deviations {
     /// A pause as phase A takes each closed group, so that at a test's size
     /// the packer closes groups faster than phase A takes them.
     pub group_take_pause: Option<std::time::Duration>,
+    /// On the whole-run path, the traces edited after their cuts and before
+    /// the proof, as a prover of other tables would.
+    pub tamper_traces: Option<fn(&mut Traces)>,
+    /// On the whole-run path, the tables committed without the prover's own
+    /// check of their preprocessed columns against the program's, so a table
+    /// whose program columns were edited reaches the verifier.
+    pub unchecked_preprocessed: bool,
 }
 
 /// A prepared stack committed wrongly, tables by AIR index.
@@ -2479,8 +2567,12 @@ fn prove_block_whir_inner(
     split_ecdas(&mut traces, options.ecdas_rows_log2, padding);
     split_keccak(&mut traces, options.keccak_rows_log2, padding);
     split_ecsm(&mut traces, options.ecsm_rows_log2, padding);
+    split_copy(&mut traces, options.copy_rows_log2, padding);
     if deviations.omit_first_keccak_rnd && !traces.keccak_rnds.is_empty() {
         traces.keccak_rnds.remove(0);
+    }
+    if let Some(tamper) = deviations.tamper_traces {
+        tamper(&mut traces);
     }
     stamps.prep = t.elapsed().as_secs_f64();
     let proof = prove_traces(
@@ -2534,6 +2626,18 @@ pub(crate) fn split_keccak(traces: &mut Traces, rows_log2: usize, padding: CutPa
         .collect();
 }
 
+/// Cuts every COPY table into tables of at most `2^rows_log2` rows, as many as
+/// `padding` keeps ([`split_cut`]): a cut may fall inside one call, whose rows
+/// chain through the CopyNext bus alone ([`BLOCK_COPY_ROWS_LOG2`]).
+pub(crate) fn split_copy(traces: &mut Traces, rows_log2: usize, padding: CutPadding) {
+    let rows = 1usize << rows_log2;
+    let mu = crate::tables::copy::cols::MU;
+    traces.copies = std::mem::take(&mut traces.copies)
+        .into_iter()
+        .flat_map(|table| split_cut(table, rows, mu, padding))
+        .collect();
+}
+
 /// Cuts every ECSM table into tables of at most `2^rows_log2` rows, as many as
 /// `padding` keeps ([`split_cut`]): a row is one whole scalar multiplication,
 /// so a cut falls between calls ([`BLOCK_ECSM_ROWS_LOG2`]).
@@ -2574,17 +2678,18 @@ pub(crate) fn prove_traces(
         .count();
     let public_output = traces.public_output_bytes.clone();
 
-    let airs = VmAirs::new(
+    let inputs = BlockAirInputs::new(
+        proof_options,
+        program,
+        crate::cpu_heights_from_traces(traces),
+        &public_output,
+    )?;
+    let airs = block_airs(
         program,
         proof_options,
-        false,
         &traces.page_configs,
         &table_counts,
-        None,
-        true,
-        None,
-        None,
-        None,
+        &inputs,
     );
 
     let prepared_columns = prepared_tables(&airs, &traces.page_configs, format)?;
@@ -2639,6 +2744,7 @@ pub(crate) fn prove_traces(
             &groups,
         );
         let t = Instant::now();
+        let check_preprocessed = !deviations.unchecked_preprocessed;
         let (block, produced) = std::thread::scope(|scope| {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let producer = scope.spawn(move || -> Result<f64, Error> {
@@ -2647,7 +2753,9 @@ pub(crate) fn prove_traces(
                     let t = Instant::now();
                     let tables = group
                         .into_par_iter()
-                        .map(|((air, trace, _), shape)| table_of(air, trace, shape, release_rows))
+                        .map(|((air, trace, _), shape)| {
+                            table_of_checked(air, trace, shape, release_rows, check_preprocessed)
+                        })
                         .collect::<Result<Vec<_>, Error>>()?;
                     busy += t.elapsed().as_secs_f64();
                     if tx.send(tables).is_err() {
@@ -2773,7 +2881,18 @@ pub(crate) fn prove_traces(
 struct StreamAirs {
     /// The form the streamed chunks are written in (G-pack, `tables::gpack`).
     form: TraceForm,
-    cpu: crate::VmAir,
+    /// One CPU AIR a streamed CPU chunk, built on first use: chunk `k` is the
+    /// block's CPU table `k`, every one before it full, so its timestamps start
+    /// at `4·k·cpu_rows` (`tables::cpu::timestamp_bases`) and its preprocessed
+    /// TIMESTAMP is the column of its height. A CPU AIR is per table since main's
+    /// preprocessed timestamp, and the argue reads the AIR a chunk was laid out
+    /// with. In pages of [`CPU_AIR_PAGE`], each allocated on first use, so a
+    /// short chunk height does not allocate a slot for every table the row
+    /// bound allows up front.
+    cpus: Vec<std::sync::OnceLock<Box<[std::sync::OnceLock<crate::VmAir>]>>>,
+    /// The CPU chunk height (`MaxRowsConfig::cpu`).
+    cpu_rows: usize,
+    opts: ProofOptions,
     memw_register: crate::VmAir,
     memw_aligned: crate::VmAir,
     memw: crate::VmAir,
@@ -2786,12 +2905,21 @@ struct StreamAirs {
 
 type DynAir = dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
 
+/// CPU AIR slots per page of [`StreamAirs`]'s CPU tables.
+const CPU_AIR_PAGE: usize = 256;
+
 impl StreamAirs {
-    fn new(opts: &ProofOptions, form: TraceForm) -> Self {
+    fn new(opts: &ProofOptions, form: TraceForm, cpu_rows: usize) -> Self {
         use crate::test_utils::*;
+        // As many CPU tables as a run's rows allow (`tables::cpu::MAX_CPU_ROWS`).
+        let most = (crate::tables::cpu::MAX_CPU_ROWS as usize).div_ceil(cpu_rows.max(1));
         Self {
             form,
-            cpu: Box::new(create_cpu_air(opts)),
+            cpus: (0..most.div_ceil(CPU_AIR_PAGE))
+                .map(|_| std::sync::OnceLock::new())
+                .collect(),
+            cpu_rows,
+            opts: opts.clone(),
             memw_register: Box::new(create_memw_register_air(opts)),
             memw_aligned: Box::new(create_memw_aligned_air(opts)),
             memw: Box::new(create_memw_air(opts)),
@@ -2803,9 +2931,43 @@ impl StreamAirs {
         }
     }
 
-    fn of(&self, table: StreamTable) -> &DynAir {
-        match table {
-            StreamTable::Cpu => self.cpu.as_ref(),
+    /// The AIR streamed chunk `index` of `table`, `height` rows, is laid out
+    /// with: the family's, or CPU table `index`'s own.
+    fn of_chunk(&self, table: StreamTable, index: usize, height: usize) -> Result<&DynAir, Error> {
+        if let Some(air) = self.of(table) {
+            return Ok(air);
+        }
+        let page = self.cpus.get(index / CPU_AIR_PAGE).ok_or_else(|| {
+            Error::Prover(format!("CPU chunk {index} is past the run's row bound"))
+        })?;
+        let page = page.get_or_init(|| {
+            (0..CPU_AIR_PAGE)
+                .map(|_| std::sync::OnceLock::new())
+                .collect()
+        });
+        Ok(page[index % CPU_AIR_PAGE]
+            .get_or_init(|| {
+                let ts_base = crate::tables::cpu::TIMESTAMP_STRIDE * (index * self.cpu_rows) as u64;
+                Box::new(
+                    crate::test_utils::create_cpu_air(&self.opts, ts_base)
+                        .with_name(&format!("CPU[{index}]"))
+                        .with_lazy_preprocessed_columns(
+                            crate::tables::cpu::lazy_timestamp_commitment(&self.opts, height),
+                            crate::tables::cpu::NUM_PRECOMPUTED_COLS,
+                            std::sync::Arc::new(move || {
+                                vec![crate::tables::cpu::timestamp_column(height)]
+                            }),
+                        ),
+                )
+            })
+            .as_ref())
+    }
+
+    /// The family's AIR, for every streamed family but CPU, whose AIR is a
+    /// table's own ([`Self::of_chunk`]).
+    fn of(&self, table: StreamTable) -> Option<&DynAir> {
+        Some(match table {
+            StreamTable::Cpu => return None,
             StreamTable::MemwRegister => self.memw_register.as_ref(),
             StreamTable::MemwAligned => self.memw_aligned.as_ref(),
             StreamTable::Memw => self.memw.as_ref(),
@@ -2814,7 +2976,7 @@ impl StreamAirs {
             StreamTable::Shift => self.shift.as_ref(),
             StreamTable::Store => self.store.as_ref(),
             StreamTable::KeccakRnd => self.keccak_rnd.as_ref(),
-        }
+        })
     }
 }
 
@@ -3066,10 +3228,11 @@ fn lay_out_chunk<'a>(
     );
     // Written packed (G-pack): laid out narrow from its packed columns, with
     // no transposition.
+    let air = airs.of_chunk(chunk.table, chunk.index, height)?;
     let table = if chunk.trace.narrow_main().is_some() {
-        table_of_narrow(airs.of(chunk.table), &mut chunk.trace, shape)
+        table_of_narrow(air, &mut chunk.trace, shape)
     } else {
-        table_of(airs.of(chunk.table), &mut chunk.trace, shape, true)
+        table_of(air, &mut chunk.trace, shape, true)
     };
     if let Some(ledger) = ledger {
         ledger.laying.fetch_sub(rows, Relaxed);
@@ -3463,20 +3626,14 @@ fn lay_out_rest<'a>(
         .filter(|c| c.is_private_input)
         .count();
     let public_output = traces.public_output_bytes.clone();
-    let airs = run_airs.get_or_init(|| {
-        VmAirs::new(
-            program,
-            opts,
-            false,
-            &traces.page_configs,
-            &table_counts,
-            None,
-            true,
-            None,
-            None,
-            None,
-        )
-    });
+    let inputs = BlockAirInputs::new(
+        opts,
+        program,
+        crate::cpu_heights_from_traces(&traces),
+        &public_output,
+    )?;
+    let airs = run_airs
+        .get_or_init(|| block_airs(program, opts, &traces.page_configs, &table_counts, &inputs));
     marks.push(("airs", at()));
     let prepared = if prepared_now {
         let prepared = prepared_tables(airs, &traces.page_configs, format)?;
@@ -3662,18 +3819,19 @@ fn lay_out_rest_streamed<'a>(
         .iter()
         .filter(|c| c.is_private_input)
         .count();
+    let inputs = BlockAirInputs::new(
+        opts,
+        program,
+        header.cpu_heights.clone(),
+        &header.public_output_bytes,
+    )?;
     let airs = run_airs.get_or_init(|| {
-        VmAirs::new(
+        block_airs(
             program,
             opts,
-            false,
             &header.page_configs,
             &header.table_counts,
-            None,
-            true,
-            None,
-            None,
-            None,
+            &inputs,
         )
     });
     marks.push(("airs", at()));
@@ -3838,7 +3996,7 @@ fn prove_streamed(
     gpack::reset_counts();
     // A new block: no memory pressure seen yet (`alloc_purge`).
     crate::alloc_purge::clear_memory_pressure();
-    let stream_airs = StreamAirs::new(opts, stream_form);
+    let stream_airs = StreamAirs::new(opts, stream_form, options.max_rows.cpu);
     // Regeneration (`BlockOptions::regen`): its recorder, when phase A can feed
     // it — its chunks generated packed, and none of KECCAK_RND's or of the
     // MEMW-derived LT ops streamed (chunks no regenerator cuts).
@@ -4105,6 +4263,7 @@ fn prove_streamed(
                         1usize << options.keccak_rows_log2,
                         1usize << options.ecsm_rows_log2,
                         1usize << options.ecdas_rows_log2,
+                        1usize << options.copy_rows_log2,
                     )?;
                 }
                 if options.pack_finished {
@@ -4450,6 +4609,7 @@ fn prove_streamed(
                     split_ecdas(&mut rest, options.ecdas_rows_log2, padding);
                     split_keccak(&mut rest, options.keccak_rows_log2, padding);
                     split_ecsm(&mut rest, options.ecsm_rows_log2, padding);
+                    split_copy(&mut rest, options.copy_rows_log2, padding);
                 }
                 if deviations.omit_first_keccak_rnd && options.stream_keccak_rnd {
                     return Err(Error::Prover(
@@ -5513,17 +5673,19 @@ pub(crate) fn block_frame(
     check_table_heights(statement.table_num_vars)?;
     check_chunked_heights(statement.table_counts, statement.table_num_vars)?;
 
-    let airs = VmAirs::new(
+    let cpu_heights = block_cpu_heights(statement.table_counts, statement.table_num_vars)?;
+    let inputs = BlockAirInputs::new(
+        proof_options,
+        &program,
+        cpu_heights,
+        statement.public_output,
+    )?;
+    let airs = block_airs(
         &program,
         proof_options,
-        false,
         &page_configs,
         statement.table_counts,
-        None,
-        true,
-        None,
-        None,
-        None,
+        &inputs,
     );
     let air_refs = airs.air_refs();
     if air_refs.len() != num_tables {
@@ -6520,8 +6682,8 @@ mod packer_tests {
 
     fn packs_alike() {
         let opts = ProofOptions::default_test_options();
-        let airs = StreamAirs::new(&opts, TraceForm::Wide);
-        let air = airs.of(StreamTable::Lt);
+        let airs = StreamAirs::new(&opts, TraceForm::Wide, 1 << 21);
+        let air = airs.of(StreamTable::Lt).expect("LT's AIR is the family's");
         // Tables of 4, 8 and 16 rows, in an order that makes uneven groups.
         let heights: Vec<usize> = (0..60).map(|k| [3, 5, 12, 2][k * 7 % 4]).collect();
         let pack = |out: group_queue::Out<_>| -> Vec<Vec<usize>> {
@@ -6670,6 +6832,86 @@ mod walkers_knob_tests {
             assert!(
                 matches!(&refused, Err(Error::Prover(m)) if m.contains("pages store")),
                 "{value}: {refused:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod air_input_tests {
+    use super::*;
+
+    /// A block statement's CPU heights are read at the CPU tables' positions,
+    /// each at most 2^21 rows.
+    #[test]
+    fn a_block_statement_states_cpu_tables_of_at_most_2_21_rows() {
+        let mut counts = crate::TableCounts {
+            cpu: 2,
+            lt: 0,
+            memw: 0,
+            memw_aligned: 0,
+            load: 0,
+            mul: 0,
+            dvrm: 0,
+            shift: 0,
+            branch: 0,
+            memw_register: 0,
+            eq: 0,
+            bytewise: 0,
+            store: 0,
+            cpu32: 0,
+            keccak: 0,
+            keccak_rnd: 0,
+            ecsm: 0,
+            ecdas: 0,
+            hint: 0,
+            copy: 3,
+            blake3: 1,
+            is_wh: 1,
+        };
+        let start = crate::cpu_proof_start(true, &counts);
+        let mut vars = vec![5u8; start + counts.cpu + 4];
+        vars[start] = 21;
+        vars[start + 1] = 2;
+        assert_eq!(
+            block_cpu_heights(&counts, &vars).expect("in bounds"),
+            vec![1 << 21, 4]
+        );
+        vars[start + 1] = 22;
+        assert!(matches!(
+            block_cpu_heights(&counts, &vars),
+            Err(Error::InvalidTableCounts(_))
+        ));
+        counts.cpu = vars.len();
+        assert!(matches!(
+            block_cpu_heights(&counts, &vars),
+            Err(Error::InvalidTableCounts(_))
+        ));
+    }
+
+    /// A block's AIR inputs refuse CPU heights the clock cannot take, and a
+    /// public output whose byte count leaves x254's word, before either sizes
+    /// anything; the block's own 2^21-row tables are taken.
+    #[test]
+    fn block_air_inputs_refuse_what_the_clock_cannot_take() {
+        let opts = ProofOptions::default_test_options();
+        let program = Elf::load(&crate::test_utils::asm_elf_bytes("all_instructions_64"))
+            .expect("the ELF loads");
+        let take = |heights: Vec<usize>| BlockAirInputs::new(&opts, &program, heights, &[]);
+        assert!(take(vec![1 << 21, 1 << 21, 4]).is_ok());
+        assert!(take(vec![crate::tables::cpu::MAX_TABLE_ROWS]).is_ok());
+        let past_the_clock = vec![1 << 21; 1 << 9];
+        for bad in [
+            vec![3],
+            vec![6],
+            vec![1 << 21, 12],
+            vec![crate::tables::cpu::MAX_TABLE_ROWS * 2],
+            past_the_clock,
+        ] {
+            assert!(
+                matches!(take(bad.clone()), Err(Error::InvalidTableCounts(_))),
+                "heights {:?}",
+                &bad[..bad.len().min(4)]
             );
         }
     }

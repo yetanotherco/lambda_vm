@@ -89,6 +89,7 @@ fn traces(program: &str, padding: CutPadding) -> (Elf, Vec<u8>, Traces) {
             1 << o.keccak_rows_log2,
             1 << o.ecsm_rows_log2,
             1 << o.ecdas_rows_log2,
+            1 << o.copy_rows_log2,
         )
         .expect("rows")
         .cut_padding(padding);

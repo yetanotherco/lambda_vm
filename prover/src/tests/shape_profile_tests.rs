@@ -23,11 +23,16 @@ fn profile_for(program: &str) -> SegmentProfile {
         true,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(
+            &proof_options,
+            &elf,
+            &traces.public_output_bytes,
+        )
+        .preprocessed(),
     );
 
     let pairs = airs.air_trace_pairs(&mut traces);

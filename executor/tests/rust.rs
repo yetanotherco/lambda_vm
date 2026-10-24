@@ -1,6 +1,10 @@
 use executor::{
     elf::{Elf, SymbolTable},
-    vm::execution::{Executor, ReturnValues},
+    vm::execution::{ExecutionResult, Executor, ReturnValues},
+    vm::instruction::{
+        decoding::Instruction,
+        execution::{DMA_MEMCPY_SYSCALL_NUMBER, DMA_MEMSET_SYSCALL_NUMBER},
+    },
 };
 use std::ops::Range;
 
@@ -118,6 +122,112 @@ fn test_vector() {
     );
 }
 
+fn run_guest(path: &str) -> ExecutionResult {
+    let elf_data = std::fs::read(path).unwrap();
+    let program = Elf::load(&elf_data).unwrap();
+    Executor::new(&program, vec![]).unwrap().run().unwrap()
+}
+
+/// DMA ecalls the guest actually executed. Zero means the copies were served by
+/// `compiler_builtins` rather than by the accelerated `memcpy`.
+fn dma_ecall_count(result: &ExecutionResult) -> usize {
+    result
+        .logs
+        .iter()
+        .filter(|log| {
+            log.src1_val == DMA_MEMCPY_SYSCALL_NUMBER
+                && matches!(
+                    result.instructions.get(&log.current_pc),
+                    Some(Instruction::EcallEbreak)
+                )
+        })
+        .count()
+}
+
+#[test]
+fn test_dma_memcpy() {
+    let result = run_guest("./program_artifacts/rust/dma_memcpy_min.elf");
+
+    assert_eq!(
+        result.return_values.memory_values,
+        b"DMA copies eight-byte rows and a short tail"
+    );
+    assert!(
+        dma_ecall_count(&result) > 0,
+        "the strong memcpy symbol must execute at least one DMA ecall"
+    );
+}
+
+#[test]
+fn test_dma_memcpy_cases() {
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/dma_memcpy_cases.elf",
+        b"dma-cases-ok".to_vec(),
+        vec![],
+    );
+}
+
+/// The guests above declare `memcpy` themselves, which leaves the symbol
+/// undefined in their objects and forces the linker to resolve it. This guest
+/// never names `memcpy`: its copies are the ones the compiler emits, which is
+/// the case that silently degrades if the strong definition ever stops winning
+/// symbol resolution — the guest keeps producing the right output and only the
+/// ecall count drops to zero.
+#[test]
+fn test_dma_memcpy_compiler_emitted_copies() {
+    let result = run_guest("./program_artifacts/rust/dma_memcpy_implicit.elf");
+
+    assert_eq!(result.return_values.memory_values, b"dma-implicit-ok");
+    assert!(
+        dma_ecall_count(&result) > 0,
+        "compiler-emitted copies must reach the DMA ecall; a zero count means the \
+         guest fell back to the weak compiler_builtins memcpy"
+    );
+}
+
+/// `memmove` shares the copy ecall with `memcpy`, so the only thing distinguishing it
+/// is the stub's backward chunking when the ranges overlap with `dst` above `src`.
+/// The guest walks both directions across the 256-byte chunk boundary; without this
+/// the symbol was exercised only in `prove_elfs_tests`, where a failure reads as a
+/// proving bug rather than an execution one.
+#[test]
+fn test_dma_memmove_cases() {
+    let elf_data = std::fs::read("./program_artifacts/rust/dma_memmove_cases.elf").unwrap();
+    let program = Elf::load(&elf_data).unwrap();
+    let result = Executor::new(&program, vec![]).unwrap().run().unwrap();
+
+    assert_eq!(result.return_values.memory_values, b"dma-memmove-ok");
+    assert!(
+        result.logs.iter().any(|log| {
+            log.src1_val == DMA_MEMCPY_SYSCALL_NUMBER
+                && matches!(
+                    result.instructions.get(&log.current_pc),
+                    Some(Instruction::EcallEbreak)
+                )
+        }),
+        "the strong memmove symbol must execute at least one copy ecall"
+    );
+}
+
+#[test]
+fn test_dma_memset_cases() {
+    let elf_data = std::fs::read("./program_artifacts/rust/dma_memset_cases.elf").unwrap();
+    let program = Elf::load(&elf_data).unwrap();
+    let result = Executor::new(&program, vec![]).unwrap().run().unwrap();
+
+    assert_eq!(result.return_values.memory_values, b"dma-memset-ok");
+    assert!(
+        result.logs.iter().any(|log| {
+            log.src1_val == DMA_MEMSET_SYSCALL_NUMBER
+                && matches!(
+                    result.instructions.get(&log.current_pc),
+                    Some(Instruction::EcallEbreak)
+                )
+        }),
+        "the strong memset symbol must execute at least one DMA ecall"
+    );
+}
+
 #[test]
 fn test_hashmap() {
     run_program_and_check_output("./program_artifacts/rust/hashmap.elf", 3, vec![]);
@@ -164,18 +274,10 @@ fn test_commit() {
 const ETHREX_ELF: &str = "./program_artifacts/rust/ethrex.elf";
 const MEM_SWEEP_ELF: &str = "./program_artifacts/rust/mem_sweep.elf";
 
-/// How the runtime's `memcpy` (syscalls' `fast-memcpy` feature) starts: `mv t0, a0`
-/// and `li t1, 32`. compiler_builtins' `memcpy` does not.
-const FAST_MEMCPY_HEAD: [u32; 2] = [0x0005_0293, 0x0200_0313];
-
-/// The most instructions `test_mem_sweep` may spend inside the library's `memmove`.
-/// Built with compiler_builtins' `mem-unaligned` setting (the sweep guest's
-/// `.cargo/config.toml`) it spends 4,026,828; without it 5,975,778,
-/// reassembling every misaligned word with shifts (both measured at the Makefile's
-/// pinned nightly). Only compiler_builtins reads that setting's name, with no
-/// stability guarantee, so a toolchain bump can silently drop it: this bound is
-/// what notices.
-const SWEEP_MEMMOVE_MAX: u64 = 5_000_000;
+/// `ecall`. The copy accelerator's `memcpy`, `memmove` and `memset` stubs (syscalls'
+/// `entrypoint.rs`) each contain one; compiler_builtins' routines and the
+/// `fast-memcpy` software `memcpy` contain none.
+const ECALL: u32 = 0x0000_0073;
 
 /// The address range and the instruction words of the function that starts at `pc`.
 fn function_at(program: &Elf, symbols: &SymbolTable, pc: u64) -> Option<(Range<u64>, Vec<u32>)> {
@@ -231,33 +333,36 @@ fn body_of(elf_bytes: &[u8], name: &str) -> (Range<u64>, Vec<u32>) {
         .unwrap_or_else(|| panic!("`{name}` jumps to {target:#x}, where no function starts"))
 }
 
-/// In-VM sweep of the memory routines the guest links (`memcpy` is the runtime's
-/// own, from syscalls' `fast-memcpy`; `memmove`, `memset` and `memcmp` are the
-/// library's, built with the ethrex guest's flags). The guest compares every result
-/// with values recomputed from the index and commits `OK` plus its case counts, or
-/// `FAIL` plus the first failing case. Counts, in order: memcpy at every length
-/// 0..=1100 and offsets mod 8; memcpy at lengths 0..=160 and offsets mod 16; memcpy
-/// large lengths, lengths up to a page and the compiler's own copies; memcpy onto
-/// itself and between touching regions; memmove overlapping both ways; memset and
-/// memcmp.
+/// In-VM sweep of the memory routines the guest links (`memcpy`, `memmove` and
+/// `memset` are the runtime's copy-accelerator stubs; `memcmp` is the library's,
+/// built with the ethrex guest's flags). The guest compares every result with values
+/// recomputed from the index and commits `OK` plus its case counts, or `FAIL` plus
+/// the first failing case. Counts, in order: memcpy at every length 0..=1100 and
+/// offsets mod 8; memcpy at lengths 0..=160 and offsets mod 16; memcpy large lengths,
+/// lengths up to a page and the compiler's own copies; memcpy onto itself and between
+/// touching regions; memmove overlapping both ways; memset and memcmp.
 #[test]
 fn test_mem_sweep() {
     let elf = std::fs::read(MEM_SWEEP_ELF).unwrap();
-    let (_, memcpy) = function_in(&elf, "memcpy");
-    assert_eq!(
-        memcpy[..2],
-        FAST_MEMCPY_HEAD,
-        "the sweep guest does not link the runtime's memcpy"
-    );
-    let (memmove, _) = body_of(&elf, "memmove");
+    // The stubs' own ECALLs are the only instructions inside them that read a7.
+    let stubs = ["memcpy", "memmove", "memset"].map(|name| {
+        let (range, words) = function_in(&elf, name);
+        assert!(
+            words.contains(&ECALL),
+            "the sweep guest does not link the runtime's `{name}` stub"
+        );
+        range
+    });
     let program = Elf::load(&elf).unwrap();
     let mut executor = Executor::new(&program, vec![]).expect("Failed to run program");
-    let mut in_memmove = 0u64;
+    let (mut copy_calls, mut set_calls) = (0u64, 0u64);
     while let Some(logs) = executor.resume().expect("Failed to run program") {
-        in_memmove += logs
-            .iter()
-            .filter(|log| memmove.contains(&log.current_pc))
-            .count() as u64;
+        for log in logs.iter() {
+            if stubs.iter().any(|r| r.contains(&log.current_pc)) {
+                copy_calls += u64::from(log.src1_val == DMA_MEMCPY_SYSCALL_NUMBER);
+                set_calls += u64::from(log.src1_val == DMA_MEMSET_SYSCALL_NUMBER);
+            }
+        }
     }
     let out = executor
         .finish()
@@ -285,25 +390,23 @@ fn test_mem_sweep() {
     // 201 x 8 x 19; 301 x 8 x 2 memset + 64 + 64 lengths x 64 x 7 memcmp.
     assert_eq!(counts, [70_464, 41_216, 1_832, 7_224, 30_552, 33_552]);
     assert!(
-        in_memmove <= SWEEP_MEMMOVE_MAX,
-        "the sweep spent {in_memmove} instructions inside memmove (at most \
-         {SWEEP_MEMMOVE_MAX}): compiler_builtins' `mem-unaligned` setting is not in effect"
+        copy_calls > 0 && set_calls > 0,
+        "the sweep made {copy_calls} copy and {set_calls} memset ecalls: the copy \
+         accelerator's stubs did not run"
     );
 }
 
-/// The guest every block proof is about links the very `memcpy` and `memmove` that
-/// `test_mem_sweep` exercises: the same instruction words in both ELFs.
+/// The guest every block proof is about links the very `memcpy`, `memmove` and
+/// `memset` that `test_mem_sweep` exercises: the same instruction words in both ELFs.
 #[test]
 fn test_ethrex_links_the_swept_memory_routines() {
     let ethrex = std::fs::read(ETHREX_ELF).unwrap();
     let sweep = std::fs::read(MEM_SWEEP_ELF).unwrap();
-    let (_, memcpy) = function_in(&ethrex, "memcpy");
-    assert_eq!(
-        memcpy[..2],
-        FAST_MEMCPY_HEAD,
-        "the ethrex guest does not link the runtime's memcpy"
-    );
-    for name in ["memcpy", "memmove"] {
+    for name in ["memcpy", "memmove", "memset"] {
+        assert!(
+            function_in(&ethrex, name).1.contains(&ECALL),
+            "the ethrex guest does not link the runtime's `{name}` stub"
+        );
         assert_eq!(
             body_of(&ethrex, name).1,
             body_of(&sweep, name).1,
@@ -316,7 +419,7 @@ fn test_ethrex_links_the_swept_memory_routines() {
 fn test_ef_io_demo_concatenates_writes() {
     // Demo guest reads its private input via EF `read_input`, then emits it
     // back as the public output via TWO `write_output` calls (split in halves).
-    // The COMMIT AIR concatenates the two calls; the executor's
+    // The COPY chip's commit rows concatenate the two calls; the executor's
     // `commit_public_output` appends in the same order.
     let input: Vec<u8> = b"hello world!".to_vec();
     run_program_and_check_public_output(

@@ -50,7 +50,7 @@ use super::keccak_host::BYTES_PER_HALF;
 use super::transcript_replay::TranscriptReplay;
 
 /// Counts `TableCounts` absorbs: fourteen split-table families, the six
-/// accelerator chips, and the 0-or-1 BLAKE3 presence count. The guest must
+/// accelerator chips, the 0-or-1 BLAKE3 presence count and the 0-or-1 IS_WH one. The guest must
 /// absorb exactly what the host's `statement::absorb_statement_with_digest`
 /// does — one count too few and every challenge downstream diverges, so this
 /// tracks that encoding, not a structural property of the machine.
@@ -60,7 +60,7 @@ use super::transcript_replay::TranscriptReplay;
 /// challenge equality in `algebraic_transcript`'s replay test, plus the
 /// hand-written `[u64; NUM_TABLE_COUNTS]` literal it builds — which fails to
 /// compile when this number moves and the literal does not.
-pub const NUM_TABLE_COUNTS: usize = 21;
+pub const NUM_TABLE_COUNTS: usize = 22;
 
 /// The shape-static half of the statement — emitted as program constants.
 #[derive(Debug, Clone)]

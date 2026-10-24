@@ -260,6 +260,53 @@ fn test_add_operand_from_dword_hl() {
 }
 
 #[test]
+fn test_add_operand_from_dword_whh() {
+    // Test DWordWHH → DWordWL (repack 2 halves → lo word, high word as is)
+    let op = AddOperand::from_dword_whh(4);
+    match op {
+        AddOperand::Linear { lo, hi } => {
+            assert_eq!(lo.len(), 2);
+            assert_eq!(hi.len(), 1);
+
+            // lo = h[0] + 2^16 * h[1]
+            match &lo[0] {
+                AddLinearTerm::Column {
+                    coefficient,
+                    column,
+                } => {
+                    assert_eq!(*coefficient, 1);
+                    assert_eq!(*column, 4);
+                }
+                _ => panic!("Expected Column"),
+            }
+            match &lo[1] {
+                AddLinearTerm::Column {
+                    coefficient,
+                    column,
+                } => {
+                    assert_eq!(*coefficient, 1 << 16);
+                    assert_eq!(*column, 5);
+                }
+                _ => panic!("Expected Column"),
+            }
+
+            // hi = w[2], unscaled: the word is the most significant limb
+            match &hi[0] {
+                AddLinearTerm::Column {
+                    coefficient,
+                    column,
+                } => {
+                    assert_eq!(*coefficient, 1);
+                    assert_eq!(*column, 6);
+                }
+                _ => panic!("Expected Column"),
+            }
+        }
+        _ => panic!("Expected Linear variant"),
+    }
+}
+
+#[test]
 fn test_add_operand_from_dword_bl() {
     // Test DWordBL → DWordWL (repack 8 bytes → 2 words)
     let op = AddOperand::from_dword_bl(0);
@@ -459,8 +506,8 @@ use stark::constraints::builder::{ConstraintSet, num_base_from_meta};
 
 #[test]
 fn test_cpu_bit_flag_columns_count() {
-    // 10 top-level flags + pc_double_read + prev_pc_timestamp_borrow + non_padding.
-    assert_eq!(BIT_FLAG_COLUMNS.len(), 12);
+    // 10 top-level flags + pc_double_read.
+    assert_eq!(BIT_FLAG_COLUMNS.len(), 11);
 }
 
 #[test]

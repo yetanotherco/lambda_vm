@@ -10,6 +10,7 @@
 //! - **DECODE**: Instruction decode table
 //! - **BRANCH**: Branch target calculation table
 //! - **HALT**: Single-row halt table
+//! - **IS_WH**: Range check for the top 48 bits of `DWordWHH` addresses (one row per distinct pair)
 //!
 //! ## Memory Tables
 //!
@@ -27,7 +28,7 @@ pub mod bitwise;
 pub mod blake3;
 pub mod branch;
 pub mod bytewise;
-pub mod commit;
+pub mod copy;
 pub mod cpu;
 pub mod cpu32;
 pub mod decode;
@@ -38,6 +39,7 @@ pub mod eq;
 pub mod global_memory;
 pub mod halt;
 pub mod hint;
+pub mod is_wh;
 pub mod keccak;
 pub mod keccak_rc;
 pub mod keccak_rnd;
@@ -85,30 +87,32 @@ pub const STATIC_BLOWUP_FACTORS_P1: &[u8] = &[4];
 ///
 /// Effective width = main_cols + 3 × bus_interactions (extension field = 3× cost).
 /// MEMW (effective width 127) at 2^19 is the baseline; other tables are scaled
-/// proportionally: max_rows = (127 × 2^19) / effective_width, rounded to 2^N.
+/// proportionally: max_rows = (127 × 2^19) / effective_width, rounded to 2^N and
+/// capped at 2^20.
 /// (* MEMW_A formula gives 2^20, but set to 2^19 to match MEMW chunk geometry;
 ///    benchmarks show better parallel throughput with smaller chunks.)
+/// († MUL formula gives 2^19; kept at 2^20, not re-tuned since its width grew.)
 ///
 /// | Table   | Main | Bus | Eff.width | Max rows |
 /// |---------|------|-----|-----------|----------|
 /// | MEMW    |  49  |  26 |    127    |  2^19    |
 /// | MEMW_A  |  29  |  20 |     89    |  2^19 *  |
-/// | CPU     |  74  |  40 |    194    |  2^19    |
-/// | DVRM    |  34  |  34 |    136    |  2^19    |
-/// | MUL     |  26  |  16 |     74    |  2^20    |
-/// | LT      |  15  |   9 |     42    |  2^20    |
-/// | SHIFT   |  27  |  15 |     72    |  2^20    |
+/// | CPU     |  37  |  20 |     97    |  2^19    |
+/// | DVRM    |  34  |  35 |    139    |  2^19    |
+/// | MUL     |  26  |  25 |    101    |  2^20 †  |
+/// | LT      |  17  |  10 |     47    |  2^20    |
+/// | SHIFT   |  29  |  17 |     80    |  2^20    |
 /// | LOAD    |  18  |   5 |     33    |  2^20    |
 /// | BRANCH  |  14  |   6 |     32    |  2^20    |
 /// | MEMW_R  |  10  |   7 |     31    |  2^20    |
 pub mod max_rows {
-    pub const CPU: usize = 1 << 19; // 524,288   — eff. width 194
+    pub const CPU: usize = 1 << 19; // 524,288   — eff. width 97
     pub const MEMW: usize = 1 << 19; // 524,288  — eff. width 127 (baseline)
     pub const MEMW_A: usize = 1 << 19; // 524,288 — eff. width 89
-    pub const DVRM: usize = 1 << 19; // 524,288  — eff. width 136
-    pub const MUL: usize = 1 << 20; // 1,048,576 — eff. width 74
-    pub const LT: usize = 1 << 20; // 1,048,576  — eff. width 42
-    pub const SHIFT: usize = 1 << 20; // 1,048,576 — eff. width 72
+    pub const DVRM: usize = 1 << 19; // 524,288  — eff. width 139
+    pub const MUL: usize = 1 << 20; // 1,048,576 — eff. width 101
+    pub const LT: usize = 1 << 20; // 1,048,576  — eff. width 47
+    pub const SHIFT: usize = 1 << 20; // 1,048,576 — eff. width 80
     pub const LOAD: usize = 1 << 20; // 1,048,576 — eff. width 33
     pub const BRANCH: usize = 1 << 20; // 1,048,576 — eff. width 32
     pub const MEMW_R: usize = 1 << 20; // 1,048,576 — eff. width 31

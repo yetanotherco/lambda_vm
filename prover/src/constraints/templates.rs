@@ -109,6 +109,7 @@ impl core::ops::Deref for AddTerms {
 /// - Constants: `AddOperand::constant(42)` → lo=42, hi=0
 /// - Word → DWordWL: `AddOperand::from_word(col)` → lo=col, hi=0
 /// - DWordHL → DWordWL: `AddOperand::from_dword_hl(col)` → repack 4 halves
+/// - DWordWHH → DWordWL: `AddOperand::from_dword_whh(col)` → repack 2 halves + word
 /// - DWordBL → DWordWL: `AddOperand::from_dword_bl(col)` → repack 8 bytes
 /// - Expressions: `AddOperand::linear(...)` → arbitrary linear combinations
 #[derive(Debug, Clone, Copy)]
@@ -182,6 +183,29 @@ impl AddOperand {
                     column: start_column + 3,
                 },
             ]),
+        }
+    }
+
+    /// DWordWHH → DWordWL: repack the two low halves into a word; the high
+    /// word is already a single column.
+    /// lo = h[0] + 2^16 * h[1]
+    /// hi = w[2]
+    pub fn from_dword_whh(start_column: usize) -> Self {
+        AddOperand::Linear {
+            lo: AddTerms::of(&[
+                AddLinearTerm::Column {
+                    coefficient: 1,
+                    column: start_column,
+                },
+                AddLinearTerm::Column {
+                    coefficient: 1 << 16,
+                    column: start_column + 1,
+                },
+            ]),
+            hi: AddTerms::of(&[AddLinearTerm::Column {
+                coefficient: 1,
+                column: start_column + 2,
+            }]),
         }
     }
 
@@ -320,6 +344,26 @@ fn add_operand_hi<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         AddOperand::DWordWL { start_column } => b.main(0, *start_column + 1),
         AddOperand::Linear { hi, .. } => add_terms_expr(b, hi),
     }
+}
+
+/// The high carry of an `emit_add_pair` relation as a bare expression: `1` exactly
+/// when `lhs + rhs` overflows 64 bits, `0` otherwise, given the same operands the
+/// `ADD` itself was emitted with.
+///
+/// `emit_add_pair` only range-checks that carry as a bit, which is what the spec's
+/// `ADD` template does and which leaves wraparound provable. A caller that must
+/// forbid the wraparound multiplies this by its gate and emits the product as a
+/// constraint of its own, the way `ADDNW` used to.
+pub fn add_pair_carry_hi<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &B,
+    lhs: &AddOperand,
+    rhs: &AddOperand,
+    sum: &AddOperand,
+) -> B::Expr {
+    let inv_2_32 = b.const_base(INV_SHIFT_32);
+    let carry_0 = (add_operand_lo(b, lhs) + add_operand_lo(b, rhs) - add_operand_lo(b, sum))
+        * inv_2_32.clone();
+    (add_operand_hi(b, lhs) + add_operand_hi(b, rhs) + carry_0 - add_operand_hi(b, sum)) * inv_2_32
 }
 
 /// The ADD carry pair, emitted from ONE body at `idx` and `idx + 1`:

@@ -100,7 +100,7 @@ fn tables(t: &Traces) -> Vec<(String, &Table)> {
         ("STORE", &t.stores),
         ("SHIFT", &t.shifts),
         ("CPU32", &t.cpu32s),
-        ("COMMIT", &t.commits),
+        ("COPY", &t.copies),
         ("KECCAK", &t.keccaks),
         ("KECCAK_RND", &t.keccak_rnds),
         ("ECSM", &t.ecsms),

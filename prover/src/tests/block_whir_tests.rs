@@ -49,6 +49,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         ecdas_rows_log2: block_whir::BLOCK_ECDAS_ROWS_LOG2,
         keccak_rows_log2: block_whir::BLOCK_KECCAK_ROWS_LOG2,
         ecsm_rows_log2: block_whir::BLOCK_ECSM_ROWS_LOG2,
+        copy_rows_log2: block_whir::BLOCK_COPY_ROWS_LOG2,
         drop_levels: multilinear::whir_commit::TreeDrop::uniform(3),
         window_log2: None,
         stream_keccak_rnd: false,
@@ -1053,11 +1054,12 @@ fn a_packed_table_with_a_wrong_preprocessed_column_is_refused() {
         false,
         &traces.page_configs,
         &counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(&opts, &program, &traces.public_output_bytes)
+            .preprocessed(),
     );
     let refs = airs.air_refs();
     let pairs = airs.air_trace_pairs(&mut traces);
@@ -1216,6 +1218,129 @@ fn a_block_missing_an_instance_is_refused_on_the_bus() {
         honest.table_counts.keccak_rnd
     );
     assert!(!verify(&short, &elf, &format));
+}
+
+type Felt = FieldElement<crate::test_utils::F>;
+
+/// The deviations alone: a block proved without the prover's own check of its
+/// preprocessed columns verifies, so each refusal below is its tamper's.
+#[test]
+fn a_block_proved_without_the_provers_column_check_verifies() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let o = options(MaxRowsConfig::small(), 16);
+    let proof = prove_with(
+        &elf,
+        &format,
+        &o,
+        &Deviations {
+            unchecked_preprocessed: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        proof.table_counts.cpu >= 2,
+        "{} CPU tables",
+        proof.table_counts.cpu
+    );
+    assert!(verify(&proof, &elf, &format));
+}
+
+/// ⛔ A CPU table's TIMESTAMP is the verifier's column (main's preprocessed
+/// clock): a table with one timestamp moved, the clock a prover could
+/// otherwise set row by row, is refused.
+#[test]
+fn a_block_with_a_moved_cpu_timestamp_is_refused() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let o = options(MaxRowsConfig::small(), 16);
+    let moved = prove_with(
+        &elf,
+        &format,
+        &o,
+        &Deviations {
+            unchecked_preprocessed: true,
+            tamper_traces: Some(|traces| {
+                let ts = crate::tables::cpu::cols::TIMESTAMP;
+                let table = &mut traces.cpus[1].main_table;
+                let value = *table.get(1, ts);
+                table.set(1, ts, value + Felt::from(4u64));
+            }),
+            ..Default::default()
+        },
+    );
+    assert!(!verify(&moved, &elf, &format));
+}
+
+/// ⛔ REGISTER's FINI is the halted file (main's final-register pin): a
+/// block whose final register file is another one is refused.
+#[test]
+fn a_block_with_another_final_register_file_is_refused() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let o = options(MaxRowsConfig::small(), 16);
+    let other = prove_with(
+        &elf,
+        &format,
+        &o,
+        &Deviations {
+            unchecked_preprocessed: true,
+            tamper_traces: Some(|traces| {
+                let fini = crate::tables::register::cols::FINI;
+                let table = &mut traces.register.main_table;
+                let value = *table.get(2, fini);
+                table.set(2, fini, value + Felt::one());
+            }),
+            ..Default::default()
+        },
+    );
+    assert!(!verify(&other, &elf, &format));
+}
+
+/// ⛔ KECCAK's IS_WH messages need the table that receives them: a block
+/// proved without it (its statement then counts none) is refused on the bus.
+#[test]
+fn a_block_without_its_is_wh_table_is_refused() {
+    let elf = asm_elf_bytes("test_keccak");
+    let format = many_groups();
+    let o = options(MaxRowsConfig::small(), 16);
+    let honest = prove(&elf, &format, &o);
+    assert_eq!(honest.table_counts.is_wh, 1);
+    assert!(verify(&honest, &elf, &format));
+    let short = prove_with(
+        &elf,
+        &format,
+        &o,
+        &Deviations {
+            tamper_traces: Some(|traces| traces.is_whs.clear()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(short.table_counts.is_wh, 0);
+    assert!(!verify(&short, &elf, &format));
+}
+
+/// ⛔ KECCAK's μ is a bit (main's multiplicity fix): a row at μ = −1 would
+/// receive its IS_WH and IS_HALF messages instead of sending them, and could
+/// cancel forged sends. A block with one is refused.
+#[test]
+fn a_block_with_a_negative_keccak_multiplicity_is_refused() {
+    let elf = asm_elf_bytes("test_keccak");
+    let format = many_groups();
+    let o = options(MaxRowsConfig::small(), 16);
+    let negative = prove_with(
+        &elf,
+        &format,
+        &o,
+        &Deviations {
+            tamper_traces: Some(|traces| {
+                let mu = crate::tables::keccak::cols::MU;
+                traces.keccaks[0].main_table.set(0, mu, -Felt::one());
+            }),
+            ..Default::default()
+        },
+    );
+    assert!(!verify(&negative, &elf, &format));
 }
 
 fn streamed(
@@ -2559,7 +2684,16 @@ fn the_prepared_set_is_decode_and_the_dense_pages() {
     ];
     let opts = ProofOptions::default_test_options();
     let airs = crate::VmAirs::new(
-        &program, &opts, false, &configs, &counts, None, true, None, None, None,
+        &program,
+        &opts,
+        false,
+        &configs,
+        &counts,
+        &vec![4; counts.cpu],
+        None,
+        true,
+        None,
+        crate::test_utils::halted_register_commitment(&opts, &program, &[]).preprocessed(),
     );
     let prepared =
         block_whir::prepared_tables(&airs, &configs, &one_group()).expect("the prepared set");
@@ -2865,8 +2999,9 @@ fn chunked_counts() -> crate::TableCounts {
         ecsm: 2,
         ecdas: 3,
         hint: 1,
-        commit: 1,
+        copy: 2,
         blake3: 0,
+        is_wh: 0,
     }
 }
 
@@ -2884,23 +3019,26 @@ fn an_inflated_ecdas_count_is_refused() {
     assert!(block_whir::validate_block_counts(&counts).is_err());
 }
 
-/// ★ KECCAK and ECSM are chunked in the block: any count up to
-/// [`block_whir::BLOCK_MAX_KECCAK`] / [`block_whir::BLOCK_MAX_ECSM`] passes,
-/// one more is refused before the verifier builds an AIR off it. Every other
-/// verifier keeps both to one table ([`crate::TableCounts::validate`]).
+/// ★ COPY, KECCAK and ECSM are chunked in the block: any count up to
+/// [`block_whir::BLOCK_MAX_COPY`] / [`block_whir::BLOCK_MAX_KECCAK`] /
+/// [`block_whir::BLOCK_MAX_ECSM`] passes, one more is refused before the
+/// verifier builds an AIR off it. Every other verifier keeps them to one table
+/// ([`crate::TableCounts::validate`]).
 ///
 /// Mutations (laptop): the bound dropped and `KECCAK: MAX + 1` passes; the
 /// one-table bound left on KECCAK or ECSM and `2` is refused.
 #[test]
 fn keccak_and_ecsm_counts_are_bounded_by_the_block() {
     type Field = fn(&mut crate::TableCounts) -> &mut usize;
-    let tables: [(&str, usize, Field); 2] = [
+    let tables: [(&str, usize, Field); 3] = [
+        ("COPY", block_whir::BLOCK_MAX_COPY, |c| &mut c.copy),
         ("KECCAK", block_whir::BLOCK_MAX_KECCAK, |c| &mut c.keccak),
         ("ECSM", block_whir::BLOCK_MAX_ECSM, |c| &mut c.ecsm),
     ];
     for (name, max, field) in tables {
         let mut single = chunked_counts();
-        (single.keccak, single.keccak_rnd, single.ecsm, single.ecdas) = (1, 1, 1, 1);
+        (single.copy, single.keccak, single.keccak_rnd) = (1, 1, 1);
+        (single.ecsm, single.ecdas) = (1, 1);
         assert!(single.validate().is_ok());
         *field(&mut single) = 2;
         assert!(
@@ -2921,21 +3059,23 @@ fn keccak_and_ecsm_counts_are_bounded_by_the_block() {
 }
 
 /// ★ The statement's heights are capped for the chunked tables, and only
-/// theirs: a KECCAK table over [`block_whir::BLOCK_KECCAK_MAX_VARS`], a
-/// KECCAK_RND table over [`block_whir::BLOCK_KECCAK_RND_MAX_VARS`], an ECSM
-/// table over [`block_whir::BLOCK_ECSM_MAX_VARS`] and an ECDAS table over
+/// theirs: a COPY table over [`block_whir::BLOCK_COPY_MAX_VARS`], a KECCAK
+/// table over [`block_whir::BLOCK_KECCAK_MAX_VARS`], a KECCAK_RND table over
+/// [`block_whir::BLOCK_KECCAK_RND_MAX_VARS`], an ECSM table over
+/// [`block_whir::BLOCK_ECSM_MAX_VARS`] and an ECDAS table over
 /// [`block_whir::BLOCK_ECDAS_MAX_VARS`] are refused; every other table far over
-/// every cap passes. The controls next to the ranges (COMMIT before KECCAK,
-/// HINT after ECDAS) are what an off-by-one in the ranges would cap instead;
-/// each table at its own cap passing pins which cap each range carries.
+/// every cap passes. The controls next to the ranges (HALT before COPY, HINT
+/// after ECDAS) are what an off-by-one in the ranges would cap instead; each
+/// table at its own cap passing pins which cap each range carries.
 #[test]
 fn the_block_caps_the_chunked_tables_heights() {
     let counts = chunked_counts();
     let n = counts.total().expect("fits") + crate::FIXED_TABLE_COUNT;
-    assert_eq!(n, 19);
+    assert_eq!(n, 20);
     let check = |vars: &[u8]| block_whir::check_chunked_heights(&counts, vars);
     let honest = vec![10u8; n];
     assert!(check(&honest).is_ok());
+    let copy_cap = block_whir::BLOCK_COPY_MAX_VARS as u8;
     let (keccak_cap, keccak_rnd_cap, ecsm_cap, ecdas_cap) = (
         block_whir::BLOCK_KECCAK_MAX_VARS as u8,
         block_whir::BLOCK_KECCAK_RND_MAX_VARS as u8,
@@ -2943,20 +3083,23 @@ fn the_block_caps_the_chunked_tables_heights() {
         block_whir::BLOCK_ECDAS_MAX_VARS as u8,
     );
     let mut at_caps = honest.clone();
-    at_caps[6..8].fill(keccak_cap);
-    at_caps[8..10].fill(keccak_rnd_cap);
-    at_caps[10..12].fill(ecsm_cap);
-    at_caps[12..15].fill(ecdas_cap);
+    at_caps[5..7].fill(copy_cap);
+    at_caps[7..9].fill(keccak_cap);
+    at_caps[9..11].fill(keccak_rnd_cap);
+    at_caps[11..13].fill(ecsm_cap);
+    at_caps[13..16].fill(ecdas_cap);
     assert!(check(&at_caps).is_ok(), "a table at its cap passes");
     for (what, idx, vars) in [
-        ("ECDAS[2] over its cap", 14, ecdas_cap + 1),
-        ("ECDAS[0] over its cap", 12, ecdas_cap + 1),
-        ("ECSM[1] over its cap", 11, ecsm_cap + 1),
-        ("ECSM[0] over its cap", 10, ecsm_cap + 1),
-        ("KECCAK_RND[1] over its cap", 9, keccak_rnd_cap + 1),
-        ("KECCAK_RND[0] over its cap", 8, keccak_rnd_cap + 1),
-        ("KECCAK[1] over its cap", 7, keccak_cap + 1),
-        ("KECCAK[0] over its cap", 6, keccak_cap + 1),
+        ("ECDAS[2] over its cap", 15, ecdas_cap + 1),
+        ("ECDAS[0] over its cap", 13, ecdas_cap + 1),
+        ("ECSM[1] over its cap", 12, ecsm_cap + 1),
+        ("ECSM[0] over its cap", 11, ecsm_cap + 1),
+        ("KECCAK_RND[1] over its cap", 10, keccak_rnd_cap + 1),
+        ("KECCAK_RND[0] over its cap", 9, keccak_rnd_cap + 1),
+        ("KECCAK[1] over its cap", 8, keccak_cap + 1),
+        ("KECCAK[0] over its cap", 7, keccak_cap + 1),
+        ("COPY[1] over its cap", 6, copy_cap + 1),
+        ("COPY[0] over its cap", 5, copy_cap + 1),
     ] {
         let mut stated = honest.clone();
         stated[idx] = vars;
@@ -2964,12 +3107,7 @@ fn the_block_caps_the_chunked_tables_heights() {
         assert!(refused.is_err(), "the block must refuse {what}");
         println!("BLOCK WHIR refuses {what}: {:?}", refused.err());
     }
-    for (what, idx) in [
-        ("COMMIT", 5),
-        ("HINT", 15),
-        ("CPU[0]", 16),
-        ("MEMW_R[0]", 18),
-    ] {
+    for (what, idx) in [("HALT", 4), ("HINT", 16), ("CPU[0]", 17), ("MEMW_R[0]", 19)] {
         let mut stated = honest.clone();
         stated[idx] = 22;
         assert!(
@@ -2980,17 +3118,19 @@ fn the_block_caps_the_chunked_tables_heights() {
 }
 
 /// ★ Every chunked table's cap is the tallest power of two at which its
-/// columns fill at most one polynomial of the format's 2^27 stack: KECCAK
-/// 511 × 2^18, KECCAK_RND 1,480 × 2^16, ECSM 667 × 2^17, ECDAS 521 × 2^17. One
-/// doubling past a cap would stack the table into two polynomials.
+/// columns fill at most one polynomial of the format's 2^27 stack: COPY
+/// 41 × 2^21, KECCAK 511 × 2^18, KECCAK_RND 1,480 × 2^16, ECSM 667 × 2^17,
+/// ECDAS 521 × 2^17. One doubling past a cap would stack the table into two
+/// polynomials.
 ///
 /// Mutation (laptop): the KECCAK or the ECSM cap lifted, and this test fails
 /// (the caps test reads the constants, so it cannot see a lifted cap).
 #[test]
 fn every_chunked_cap_is_the_tallest_table_one_stacked_polynomial_holds() {
-    use crate::tables::{ecdas, ecsm, keccak, keccak_rnd};
+    use crate::tables::{copy, ecdas, ecsm, keccak, keccak_rnd};
     let stack = ZfFormat::DEFAULT.whir_stack.get();
     let widths = [
+        ("COPY", copy::cols::NUM_COLUMNS),
         ("KECCAK", keccak::cols::NUM_COLUMNS),
         ("KECCAK_RND", keccak_rnd::cols::NUM_COLUMNS),
         ("ECSM", ecsm::cols::NUM_COLUMNS),
@@ -3076,11 +3216,16 @@ fn chunked_table_ranges_name_the_chunked_airs() {
         false,
         &page_configs,
         &counts,
+        &vec![4; counts.cpu],
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(
+            &ProofOptions::default_test_options(),
+            &program,
+            &[],
+        )
+        .preprocessed(),
     );
     let names: Vec<String> = airs
         .air_refs()
@@ -3090,7 +3235,7 @@ fn chunked_table_ranges_name_the_chunked_airs() {
     let ranges = block_whir::chunked_table_ranges(&counts);
     assert_eq!(
         ranges.each_ref().map(|(table, ..)| *table),
-        ["KECCAK", "KECCAK_RND", "ECSM", "ECDAS"],
+        ["COPY", "KECCAK", "KECCAK_RND", "ECSM", "ECDAS"],
         "the chunked tables in AIR order"
     );
     for (table, range, _) in ranges {
@@ -3269,6 +3414,101 @@ fn a_split_ecdas_call_is_keyed_on_the_bus() {
     println!(
         "BLOCK WHIR ECDAS SPLIT NEGATIVE: table 0 row {a} and table 1 row {b} swapped calls, refused"
     );
+}
+
+/// ★ COPY cut inside a call: test_copy_ecalls' 17 COPY rows (a 21-byte
+/// memcpy's seven, a memset's four, a zero-length call, an overlapping
+/// two-byte copy and a three-byte `write`) at one, two and four rows a table:
+/// 17, 9 and 5 tables at the default (the tables of padding rows alone are not
+/// built), and every proof verifies; the production cut leaves the guest one
+/// table, and so does the streamed build at two rows a table.
+#[test]
+fn copy_split_into_chunks_proves_and_verifies() {
+    let format = many_groups();
+    let elf = asm_elf_bytes("test_copy_ecalls");
+    for (rows_log2, tables) in [(0, 17), (1, 9), (2, 5)] {
+        let mut o = options(MaxRowsConfig::default(), 16);
+        o.copy_rows_log2 = rows_log2;
+        let proof = prove(&elf, &format, &o);
+        assert_eq!(
+            proof.table_counts.copy, tables,
+            "17 rows in 2^{rows_log2}-row tables"
+        );
+        assert!(
+            verify(&proof, &elf, &format),
+            "COPY: {tables} tables verify"
+        );
+        println!("BLOCK WHIR COPY CHUNKED: {tables} tables of 2^{rows_log2} rows, accepted");
+    }
+    let mut o = streamed(MaxRowsConfig::small(), 16, 4);
+    o.copy_rows_log2 = 1;
+    let proof = prove(&elf, &format, &o);
+    assert_eq!(proof.table_counts.copy, 9, "COPY streamed");
+    assert!(verify(&proof, &elf, &format), "COPY streamed");
+    let (_, _, traces) = split_traces("test_copy_ecalls", |traces| {
+        block_whir::split_copy(
+            traces,
+            block_whir::BLOCK_COPY_ROWS_LOG2,
+            CutPadding::default(),
+        );
+    });
+    assert_eq!(traces.copies.len(), 1, "COPY: production cut");
+}
+
+/// ★ A COPY cut may fall inside one call, whose rows reach each other only
+/// through the CopyNext bus, keyed by the call's timestamp and its running
+/// `(src, dst, count)`. At one row a table, the 21-byte memcpy's first two
+/// rows are tables 0 and 1.
+///
+/// - Control: the two rows swapped as whole rows across the two tables are
+///   the same multiset of rows, and verify.
+/// - Negative: the second row's source moved by eight, its successor alike so
+///   the row's own `ADD` still holds: the first row's CopyNext send no longer
+///   meets it, and the block is refused.
+#[test]
+fn split_copy_chains_are_keyed_on_the_bus() {
+    use crate::tables::copy::cols;
+    use crate::tables::types::FE;
+    let build = || {
+        split_traces("test_copy_ecalls", |traces| {
+            block_whir::split_copy(traces, 0, CutPadding::default());
+            assert_eq!(traces.copies.len(), 17, "COPY: one row a table");
+        })
+    };
+    {
+        let (_, _, traces) = build();
+        let get = |t: usize, col: usize| *traces.copies[t].main_table.get(0, col);
+        assert_eq!(get(0, cols::FIRST), FE::one(), "table 0 starts the memcpy");
+        assert_eq!(get(1, cols::FIRST), FE::zero(), "table 1 continues it");
+        assert_eq!(get(0, cols::COUNT_0), FE::from(21u64));
+        assert_eq!(get(1, cols::COUNT_0), FE::from(13u64));
+    }
+    assert!(
+        traces_block_accepts(build, |_| {}),
+        "COPY: the honest split verifies"
+    );
+    assert!(
+        traces_block_accepts(build, |traces| {
+            for col in 0..cols::NUM_COLUMNS {
+                let x = *traces.copies[0].main_table.get(0, col);
+                let y = *traces.copies[1].main_table.get(0, col);
+                traces.copies[0].main_table.set(0, col, y);
+                traces.copies[1].main_table.set(0, col, x);
+            }
+        }),
+        "COPY: rows of one call swapped whole across tables are the same rows: accepted"
+    );
+    println!("BLOCK WHIR COPY SPLIT CONTROL: whole rows swapped across tables, accepted");
+    assert!(
+        !traces_block_accepts(build, |traces| {
+            for col in [cols::SRC_0, cols::SRC_INCR_0] {
+                let v = *traces.copies[1].main_table.get(0, col);
+                traces.copies[1].main_table.set(0, col, v + FE::from(8u64));
+            }
+        }),
+        "COPY: a continuation row's source moved across a cut must be refused"
+    );
+    println!("BLOCK WHIR COPY SPLIT NEGATIVE: a moved continuation source, refused");
 }
 
 /// The two call tables the block cuts between calls, with their guest (three
@@ -3737,10 +3977,11 @@ fn block_whir_on_a_real_block() {
     };
     println!("BLOCK SHAPE DIGEST: {shape:016x}");
     println!(
-        "BLOCK CHUNKED: {} (cuts KECCAK 2^{} · ECSM 2^{})",
+        "BLOCK CHUNKED: {} (cuts KECCAK 2^{} · ECSM 2^{} · COPY 2^{})",
         block_whir::chunked_census(&proof.table_counts, &proof.table_num_vars),
         options.keccak_rows_log2,
         options.ecsm_rows_log2,
+        options.copy_rows_log2,
     );
     // The proof's bytes: two processes prove the same ones under
     // LAMBDA_VM_FIXED_TRACE_HASH=1 and LAMBDA_VM_DETERMINISTIC_GRIND=1.

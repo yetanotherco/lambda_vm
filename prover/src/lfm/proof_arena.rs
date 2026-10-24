@@ -429,7 +429,7 @@ pub fn page_commitments(archive: &FixtureArchive) -> Vec<(u64, Commitment)> {
 // ============ the cross-epoch REGISTER boundary ============
 
 /// Epoch `i`'s `(register_init, reg_fini)` — the pair
-/// `register::compute_precomputed_commitment_with_fini` turns into that epoch's
+/// `register::compute_precomputed_commitment` turns into that epoch's
 /// preprocessed REGISTER commitment.
 ///
 /// INIT is the VERIFIER's derivation, never a bundled value: epoch 0's comes

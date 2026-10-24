@@ -890,6 +890,10 @@ pub enum PreprocessedRoute<'a> {
         offset: &'a [FE],
         init: Option<&'a [FE]>,
     },
+    /// A CPU table's TIMESTAMP (main's preprocessed timestamp): the column
+    /// `4·(i + 1)` of `2^num_vars` rows, whose extension is `4 + 4·Σ_k 2^k·r_k`
+    /// ([`super::preprocessed::emit_timestamp_ramp`]) — no opening, no fold.
+    Timestamp { num_vars: usize },
 }
 
 /// One table's preprocessed plan: what a prepared opening settled, and how
@@ -1076,6 +1080,25 @@ pub(crate) fn emit_preprocessed_leg(
             }
             return;
         }
+        PreprocessedRoute::Timestamp { num_vars } => {
+            assert_eq!(
+                plan.settled, 0,
+                "a CPU table's TIMESTAMP is checked by its closed form, not settled by an opening"
+            );
+            assert_eq!(
+                *num_vars,
+                verdict.point.len(),
+                "the TIMESTAMP column is as tall as its table"
+            );
+            let targets = preprocessed_targets(
+                slot_of,
+                shape.kinds,
+                crate::tables::cpu::NUM_PRECOMPUTED_COLS,
+            );
+            let timestamp = super::preprocessed::emit_timestamp_ramp(b, &verdict.point);
+            b.assert_eq_ext(timestamp, verdict.column_values[targets[0]]);
+            return;
+        }
         PreprocessedRoute::ConstMle(columns) => columns,
     };
 
@@ -1188,6 +1211,13 @@ fn preprocessed_leg_cost(plan: &PreprocessedPlan<'_>, leg: &mut Cost) {
                 }
             }
             leg.ops(columns * ASSERT_EQ_ROWS);
+        }
+        PreprocessedRoute::Timestamp { num_vars } => {
+            leg.ops(super::preprocessed::timestamp_ramp_rows(*num_vars));
+            for word in super::preprocessed::timestamp_ramp_constants() {
+                leg.constant_word(word);
+            }
+            leg.ops(crate::tables::cpu::NUM_PRECOMPUTED_COLS * ASSERT_EQ_ROWS);
         }
         PreprocessedRoute::ConstMle(columns) => {
             let remaining = &columns[plan.settled..];
@@ -1374,8 +1404,12 @@ struct EpochPlan<'a> {
     sizes: Vec<usize>,
     layouts: Vec<TableLayout<'a, GoldilocksField, GoldilocksExtension>>,
     buses: Vec<Vec<InteractionShape<GoldilocksExtension>>>,
-    /// Each table's preprocessed columns, owned, empty for a table with none.
+    /// Each table's preprocessed columns, owned, empty for a table with none
+    /// and for a CPU table, whose TIMESTAMP takes the closed form ([`Self::timestamp`]).
     preprocessed: Vec<Vec<Vec<FE>>>,
+    /// Each table's TIMESTAMP height in variables, for a CPU table (by name, with
+    /// its AIR's one preprocessed column); `None` for every other table.
+    timestamp: Vec<Option<usize>>,
     /// Each table's name, which is what selects its preprocessed route.
     names: Vec<String>,
     group_layouts: Vec<StackedLayout>,
@@ -1398,6 +1432,9 @@ pub const BITWISE_NAME: &str = "BITWISE";
 pub(crate) const DECODE_NAME: &str = "DECODE";
 pub(crate) const KECCAK_RC_NAME: &str = "KECCAK_RC";
 pub(crate) const REGISTER_NAME: &str = "REGISTER";
+/// What every CPU table's name starts with (`CPU[k]`): its TIMESTAMP takes the
+/// closed-form route.
+pub(crate) const CPU_NAME_PREFIX: &str = "CPU[";
 
 impl<'a> EpochPlan<'a> {
     fn build(epoch: &WhirRealEpoch, airs: EpochAirs<'a>) -> Self {
@@ -1455,9 +1492,30 @@ impl<'a> EpochPlan<'a> {
                     .expect("the bus probes")
                 })
                 .collect();
-        let preprocessed: Vec<Vec<Vec<FE>>> =
-            airs.iter().map(|air| air.precomputed_columns()).collect();
         let names: Vec<String> = airs.iter().map(|air| air.name().to_string()).collect();
+        // A CPU table's TIMESTAMP is checked by its closed form: its column is
+        // never materialised here (2^21 rows a table on a production epoch).
+        let timestamp: Vec<Option<usize>> = airs
+            .iter()
+            .zip(&names)
+            .zip(&epoch.proof.table_num_vars)
+            .map(|((air, name), &vars)| {
+                (name.starts_with(CPU_NAME_PREFIX)
+                    && air.num_precomputed_columns() == crate::tables::cpu::NUM_PRECOMPUTED_COLS)
+                    .then_some(usize::from(vars))
+            })
+            .collect();
+        let preprocessed: Vec<Vec<Vec<FE>>> = airs
+            .iter()
+            .zip(&timestamp)
+            .map(|(air, ts)| {
+                if ts.is_some() {
+                    Vec::new()
+                } else {
+                    air.precomputed_columns()
+                }
+            })
+            .collect();
 
         // ⛔ The refusal, before anything is emitted.
         for (index, (name, columns)) in names.iter().zip(&preprocessed).enumerate() {
@@ -1508,6 +1566,7 @@ impl<'a> EpochPlan<'a> {
             layouts,
             buses,
             preprocessed,
+            timestamp,
             names,
             group_layouts,
             group_domains,
@@ -1543,7 +1602,14 @@ impl<'a> EpochPlan<'a> {
             .iter()
             .zip(views)
             .zip(&self.preprocessed)
-            .map(|((name, view), columns)| {
+            .zip(&self.timestamp)
+            .map(|(((name, view), columns), timestamp)| {
+                if let Some(num_vars) = *timestamp {
+                    return PreprocessedPlan {
+                        settled: 0,
+                        route: PreprocessedRoute::Timestamp { num_vars },
+                    };
+                }
                 if columns.is_empty() {
                     return PreprocessedPlan {
                         settled: 0,

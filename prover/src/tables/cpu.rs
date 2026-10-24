@@ -1,7 +1,7 @@
 //! CPU table for the 64-bit VM.
 //!
 //! The CPU table is the central execution table. Following `spec/src/cpu.toml`
-//! it is narrow (~39 columns): there are no per-opcode one-hot ALU selectors and
+//! it is narrow (37 columns): there are no per-opcode one-hot ALU selectors and
 //! no `*_ext_bit`/`arg1` columns. Instead each row carries:
 //! - top-level flags `ALU/ADD/SUB/MEMORY/BRANCH/ECALL` (+ `word_instr`),
 //! - the packed `alu_flags`/`mem_flags` bytes (the chips unpack them), and
@@ -26,20 +26,194 @@
 
 use super::decode::DecodeTable;
 use super::gpack::{TraceForm, WidthHint, generate_main};
-use super::types::{BusId, DecodeEntry, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
+use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::Error;
 use executor::vm::{
     instruction::{decoding::Instruction, execution::SyscallNumbers},
     logs::Log,
     memory::U64HashMap,
 };
+use math::polynomial::Polynomial;
+use stark::config::Commitment;
+use stark::leaf_layout::LeafLayout;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
+use stark::proof::options::ProofOptions;
+use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::TraceTable;
 
 /// PC value used for CPU padding rows. Per spec this is an odd address
 /// (unreachable during normal execution); the DECODE table contains a matching
 /// padding entry at this PC (all flags 0, `half_instruction_length = 0`).
 pub const CPU_PADDING_PC: u64 = 1;
+
+/// Number of preprocessed columns: `TIMESTAMP` (column 0).
+///
+/// Row `i` of every CPU table holds `4·(i + 1)`, as spec `config.toml` defines
+/// the `Timestamp` type. An epoch (or a monolithic proof) splits its CPU rows
+/// over several tables, so table `k` adds the constant `4·S_k` to every
+/// timestamp it sends, where `S_k` is the total height of tables `0..k` (see
+/// [`timestamp_bases`]). The verifier reads the heights off the proof, so every
+/// CPU timestamp is verifier-known.
+pub const NUM_PRECOMPUTED_COLS: usize = 1;
+
+/// Timestamp slots per CPU row (spec `memory.typ`, granularity aside).
+pub const TIMESTAMP_STRIDE: u64 = 4;
+
+/// Maximum number of CPU rows (padding included) in an epoch or a monolithic
+/// proof. The last row's accesses reach `4·N + 2`, which must stay below the
+/// HALT timestamp `2^32 - 1` (spec `streaming.typ`: an epoch should not exceed
+/// `2^30` cycles; `N = 2^30` would put the last timestamp at `2^32`).
+pub const MAX_CPU_ROWS: u64 = (1 << 30) - 1;
+
+/// Tallest CPU table, `log2`: the largest uniform chunk a prover may cut
+/// (`LAMBDA_VM_MAX_ROWS_LOG2` takes at most 26; the block proves 2^21-row CPU
+/// tables). Main bounds a table by `max_rows::CPU`, the heights its static
+/// timestamp roots cover; here every root is computed for its height, so the
+/// bound is the prover's range. The clock's own bound is [`MAX_CPU_ROWS`], over
+/// all tables together.
+pub const MAX_TABLE_ROWS_LOG2: u32 = 26;
+
+/// Tallest CPU table, in rows.
+pub const MAX_TABLE_ROWS: usize = 1 << MAX_TABLE_ROWS_LOG2;
+
+/// Largest continuation epoch, `log2` of its cycle count: `2^29` is the largest
+/// power of two within [`MAX_CPU_ROWS`].
+pub const MAX_EPOCH_SIZE_LOG2: u32 = 29;
+
+/// Timestamp the final PC token is written at: the last CPU row (`4·N`) emits
+/// `next_pc` at `4·N + 1`. Spec `halt.typ`: the verifier knows it.
+pub fn final_pc_timestamp(total_rows: u64) -> u64 {
+    TIMESTAMP_STRIDE * total_rows + 1
+}
+
+/// The constant each CPU table adds to its preprocessed timestamps:
+/// `4·(h_0 + … + h_{k-1})` for table `k`.
+pub fn timestamp_bases(heights: &[usize]) -> Vec<u64> {
+    heights
+        .iter()
+        .scan(0u64, |rows, &h| {
+            let base = TIMESTAMP_STRIDE * *rows;
+            *rows += h as u64;
+            Some(base)
+        })
+        .collect()
+}
+
+/// Checks the CPU table heights of an epoch or monolithic proof: each a power
+/// of two in `[4, MAX_TABLE_ROWS]` and at most [`MAX_CPU_ROWS`] in total.
+pub fn validate_heights(heights: &[usize]) -> Result<(), Error> {
+    let mut total: u64 = 0;
+    for &h in heights {
+        if !h.is_power_of_two() || !(4..=MAX_TABLE_ROWS).contains(&h) {
+            return Err(Error::InvalidTableCounts(format!(
+                "CPU table height must be a power of two in [4, {MAX_TABLE_ROWS}], got {h}"
+            )));
+        }
+        total += h as u64;
+    }
+    if total > MAX_CPU_ROWS {
+        return Err(Error::InvalidTableCounts(format!(
+            "{total} CPU rows exceed the per-epoch maximum {MAX_CPU_ROWS}"
+        )));
+    }
+    Ok(())
+}
+
+/// The CPU table heights the trace builder produces for `rows` executed cycles
+/// split into chunks of `max_rows_cpu`: full chunks, then the last one padded to
+/// a power of two (at least 4). Lets the prover check [`validate_heights`] right
+/// after execution, before building any trace.
+pub fn table_heights(rows: usize, max_rows_cpu: usize) -> Vec<usize> {
+    (0..rows)
+        .step_by(max_rows_cpu.max(1))
+        .map(|start| (rows - start).min(max_rows_cpu).next_power_of_two().max(4))
+        .collect()
+}
+
+/// Checks a prover's CPU chunk size before execution: every CPU table but the
+/// last has exactly `max_rows_cpu` rows, so it must be a height
+/// [`validate_heights`] accepts. Fails before the run instead of after the
+/// trace build.
+pub fn validate_max_rows(max_rows_cpu: usize) -> Result<(), Error> {
+    validate_heights(&[max_rows_cpu])
+}
+
+/// The `TIMESTAMP` column of a CPU table of `height` rows: `4·(i + 1)`.
+///
+/// What the multilinear verifier reads ([`stark::traits::AIR::precomputed_columns`]):
+/// it checks the table's claimed opening of column 0 against this column's value
+/// at the reduced point (the recursion's leaf through the column's closed form,
+/// `4 + 4·Σ_k 2^k·r_k`). The block never reads a timestamp root.
+pub fn timestamp_column(height: usize) -> Vec<FE> {
+    (0..height as u64)
+        .map(|i| FE::from(TIMESTAMP_STRIDE * (i + 1)))
+        .collect()
+}
+
+/// The preprocessed `TIMESTAMP` commitment of a CPU table of `height` rows,
+/// for the univariate verifier: computed under the block path's pin on first
+/// use, for both leaf layouts ([`LeafLayout`]). Main ships a table of static
+/// roots for its own hash; under this branch's pin they would be other bytes,
+/// so none is carried, and the multilinear path never asks for one.
+pub fn lazy_timestamp_commitment(
+    options: &ProofOptions,
+    height: usize,
+) -> stark::lookup::LazyCommitment {
+    debug_assert!(
+        height.is_power_of_two(),
+        "CPU table height {height} must be checked by validate_heights first"
+    );
+    let (o, one_row) = (options.clone(), options.clone());
+    stark::lookup::LazyCommitment::deferred(move || {
+        compute_timestamp_commitment_with(&o, height, LeafLayout::RowPair)
+    })
+    .with_one_row(move || {
+        Some(compute_timestamp_commitment_with(
+            &one_row,
+            height,
+            LeafLayout::Row,
+        ))
+    })
+}
+
+/// The preprocessed `TIMESTAMP` commitment of a CPU table of `height` rows: the
+/// column `4·(i + 1)`, low-degree extended and committed exactly as the prover
+/// commits a table's precomputed columns (row-pair leaves).
+pub fn timestamp_commitment(options: &ProofOptions, height: usize) -> Commitment {
+    compute_timestamp_commitment_with(options, height, LeafLayout::RowPair)
+}
+
+/// [`timestamp_commitment`] under an explicit trace-tree leaf layout.
+pub fn compute_timestamp_commitment_with(
+    options: &ProofOptions,
+    height: usize,
+    layout: LeafLayout,
+) -> Commitment {
+    commit_timestamp_column(options, &timestamp_column(height), layout)
+}
+
+/// Commits a CPU `TIMESTAMP` column as the prover commits a table's precomputed
+/// columns, under the block path's pin. Soundness tests use it to commit a
+/// forged column.
+pub(crate) fn commit_timestamp_column(
+    options: &ProofOptions,
+    column: &[FE],
+    layout: LeafLayout,
+) -> Commitment {
+    let poly = Polynomial::interpolate_fft::<GoldilocksField>(column)
+        .expect("FFT interpolation failed for CPU timestamp column");
+    let lde = evaluate_polynomial_on_lde_domain(
+        &poly,
+        options.blowup_factor as usize,
+        column.len(),
+        &FE::from(options.coset_offset),
+    )
+    .expect("LDE evaluation failed for CPU timestamp column");
+    crate::lfm::commit::commit_lde_columns_with(&[lde], layout)
+}
+
+/// Smallest CPU table height is `2^2` (`generate_cpu_trace` pads to at least 4).
+pub const MIN_LOG_HEIGHT: u32 = 2;
 
 // =========================================================================
 // Column indices for the CPU table
@@ -51,7 +225,8 @@ pub mod cols {
     // Input columns (from DECODE)
     // -------------------------------------------------------------------------
 
-    /// timestamp: Timestamp for memory argument coordination.
+    /// timestamp: Timestamp for memory argument coordination. Preprocessed: row
+    /// `i` holds `4·(i + 1)` (spec type `Timestamp`); see [`super::NUM_PRECOMPUTED_COLS`].
     pub const TIMESTAMP: usize = 0;
 
     /// pc: program counter (DWordWL, 2 words).
@@ -111,36 +286,33 @@ pub mod cols {
     // Auxiliary columns
     // -------------------------------------------------------------------------
 
-    /// prev_pc_timestamp_borrow: borrow bit for the inline-PC `timestamp - 3`
-    /// subtraction (fires when `timestamp_lo < 3` and `pc_double_read = 0`).
-    pub const PREV_PC_TIMESTAMP_BORROW: usize = 25;
     /// pc_double_read: PC is read as a general register (`rs1 = 255`) this cycle
     /// (AUIPC/JAL) (Bit).
-    pub const PC_DOUBLE_READ: usize = 26;
+    pub const PC_DOUBLE_READ: usize = 25;
 
     /// rv1: value of register rs1 (DWordWL, 2 words).
-    pub const RV1_0: usize = 27;
-    pub const RV1_1: usize = 28;
+    pub const RV1_0: usize = 26;
+    pub const RV1_1: usize = 27;
 
     /// rv2: value of register rs2 (DWordWL, 2 words).
-    pub const RV2_0: usize = 29;
-    pub const RV2_1: usize = 30;
+    pub const RV2_0: usize = 28;
+    pub const RV2_1: usize = 29;
 
     /// arg2: multiplexed second ALU argument (DWordWL, 2 words).
-    pub const ARG2_0: usize = 31;
-    pub const ARG2_1: usize = 32;
+    pub const ARG2_0: usize = 30;
+    pub const ARG2_1: usize = 31;
 
     /// res: ALU result (DWordHL, 4 halves → 2 words via `cast`).
-    pub const RES_0: usize = 33;
-    pub const RES_1: usize = 34;
-    pub const RES_2: usize = 35;
-    pub const RES_3: usize = 36;
+    pub const RES_0: usize = 32;
+    pub const RES_1: usize = 33;
+    pub const RES_2: usize = 34;
+    pub const RES_3: usize = 35;
 
     /// branch_cond: whether the branch/jump is taken (Bit).
-    pub const BRANCH_COND: usize = 37;
+    pub const BRANCH_COND: usize = 36;
 
     /// Total number of columns.
-    pub const NUM_COLUMNS: usize = 38;
+    pub const NUM_COLUMNS: usize = 37;
 
     /// res half columns as an array (DWordHL).
     pub const RES: [usize; 4] = [RES_0, RES_1, RES_2, RES_3];
@@ -175,8 +347,8 @@ pub struct CpuOperation {
     pub res: u64,
     /// An ECALL's operands from its log: `[x11, x12]` for COMMIT (buffer
     /// address, byte count), `[x10, 0]` for KECCAK and BLAKE3 (state address),
-    /// zero otherwise. ECSM, HINT and BLAKE3 absorb read theirs from the
-    /// register state in the trace builder.
+    /// zero otherwise. ECSM, HINT, BLAKE3 absorb and the two copy ecalls read
+    /// theirs from the register state in the trace builder.
     ///
     /// The rest of what a row needs (the decode, `arg2`, the branch decision,
     /// the ECALL's syscall) is a function of these fields: [`CpuOp`]'s methods,
@@ -350,6 +522,20 @@ impl<'a> CpuOp<'a> {
     #[inline]
     pub fn ecall_hint(&self) -> bool {
         self.ecall_of(executor::vm::instruction::execution::HINT_SYSCALL_NUMBER)
+    }
+
+    /// Whether this ECALL is a DMA memcpy (also serving `memmove`). Operands are
+    /// recovered from x10/x11/x12 in the trace builder.
+    #[inline]
+    pub fn ecall_dma_memcpy(&self) -> bool {
+        self.ecall_of(executor::vm::instruction::execution::DMA_MEMCPY_SYSCALL_NUMBER)
+    }
+
+    /// Whether this ECALL is a DMA memset. Operands are recovered from
+    /// x10/x11/x12 in the trace builder.
+    #[inline]
+    pub fn ecall_dma_memset(&self) -> bool {
+        self.ecall_of(executor::vm::instruction::execution::DMA_MEMSET_SYSCALL_NUMBER)
     }
 
     /// Collects the BITWISE-table range-check lookups generated by this row, so
@@ -565,6 +751,11 @@ impl CpuOperation {
 // Trace generation
 // =========================================================================
 
+/// Preprocessed `TIMESTAMP` of `row`: `4·(row + 1)`.
+fn local_timestamp(row: usize) -> u64 {
+    TIMESTAMP_STRIDE * (row as u64 + 1)
+}
+
 /// Generates the CPU trace table from a list of operations, each read with
 /// its entry of `decode`.
 ///
@@ -620,7 +811,10 @@ fn fill_cpu_rows<T: VmTable>(
         // suppressed (CPU32 owns them); only the PC-advancing columns are set.
         let effective = |flag: bool| !word && flag;
 
-        table.set_u64(row_idx, cols::TIMESTAMP, op.timestamp);
+        // Preprocessed: the table-local `4·(row + 1)`, whatever `op.timestamp` is.
+        // The rest of the trace builder sends `op.timestamp`, which an honest
+        // build makes `base + 4·(row + 1)` (see `timestamp_bases`).
+        table.set_u64(row_idx, cols::TIMESTAMP, local_timestamp(row_idx));
         table.set_dword_wl(row_idx, cols::PC_0, op.decode.pc);
 
         // rs1/rs2/rd and read/write flags are only present on non-word rows.
@@ -693,31 +887,21 @@ fn fill_cpu_rows<T: VmTable>(
 
         table.set_bool(row_idx, cols::BRANCH_COND, op.branch_cond());
 
-        // Inline-PC coordination columns.
+        // Inline-PC coordination column.
         let pc_double_read = !word && f.read_register1 && f.rs1 == 255;
-        let ts_lo = op.timestamp & 0xFFFF_FFFF;
-        let prev_pc_ts_borrow = !pc_double_read && ts_lo < 3;
         table.set_bool(row_idx, cols::PC_DOUBLE_READ, pc_double_read);
-        table.set_bool(row_idx, cols::PREV_PC_TIMESTAMP_BORROW, prev_pc_ts_borrow);
     }
 
     // Padding rows: pc = next_pc = 1 (odd, unreachable), half_instruction_length = 0 so
     // next_pc = pc + 0 = pc, all flags 0. The DECODE table has the matching padding
     // entry at pc = 1. Per spec, padding rows participate in the inline-PC `memory`
     // chain: each reads pc=1 at `timestamp - 3` and writes pc=1 at `timestamp + 1`,
-    // so their timestamps must continue the +4 cadence from the last real row (the
-    // halting ECALL). pc_double_read and prev_pc_timestamp_borrow stay 0, giving
-    // prev_ts = timestamp - 3. The first padding read (timestamp = last_ts + 4) then
-    // lands on last_ts + 1, where the HALT chip's emit_pc deposited pc = 1.
-    let last_ts = segments
-        .iter()
-        .rev()
-        .find_map(|s| s.last())
-        .map(|op| op.timestamp)
-        .unwrap_or(0);
+    // continuing the preprocessed +4 cadence from the last real row (the halting
+    // ECALL). pc_double_read stays 0, giving prev_ts = timestamp - 3. The first
+    // padding read then lands on the halting row's timestamp + 1, where the HALT
+    // chip's emit_pc deposited pc = 1.
     for row_idx in n..num_rows {
-        let j = (row_idx - n + 1) as u64;
-        table.set_u64(row_idx, cols::TIMESTAMP, last_ts + 4 * j);
+        table.set_u64(row_idx, cols::TIMESTAMP, local_timestamp(row_idx));
         table.set_u64(row_idx, cols::PC_0, CPU_PADDING_PC);
         table.set_u64(row_idx, cols::NEXT_PC_0, CPU_PADDING_PC);
     }
@@ -791,8 +975,27 @@ fn res_cast_wl() -> BusValue {
     }
 }
 
-/// Returns the bus interactions for the CPU table.
-pub fn bus_interactions() -> Vec<BusInteraction> {
+/// `timestamp + ts_base + offset` as linear terms.
+fn timestamp_terms(ts_base: u64, offset: i64) -> Vec<LinearTerm> {
+    let base = i64::try_from(ts_base).expect("CPU timestamp base fits in i64");
+    vec![
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::TIMESTAMP,
+        },
+        LinearTerm::Constant(base + offset),
+    ]
+}
+
+/// `timestamp + ts_base + offset`: a timestamp slot of this row as one bus
+/// element (the low word; the high word is 0, CPU timestamps fit in 32 bits).
+fn timestamp_slot(ts_base: u64, offset: i64) -> BusValue {
+    BusValue::linear(timestamp_terms(ts_base, offset))
+}
+
+/// Returns the bus interactions for a CPU table whose timestamps start at
+/// `ts_base` (`4·S_k` for table `k`, see [`timestamp_bases`]).
+pub fn bus_interactions(ts_base: u64) -> Vec<BusInteraction> {
     use super::types::packed_decode_shrunk as pd;
 
     let mut interactions = Vec::with_capacity(24);
@@ -864,10 +1067,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::Cpu32,
         Multiplicity::Column(cols::WORD_INSTR),
         vec![
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP,
-                packing: Packing::Direct,
-            },
+            timestamp_slot(ts_base, 0),
             BusValue::constant(0), // timestamp_hi (CPU timestamps fit in 32 bits)
             BusValue::Packed {
                 start_column: cols::PC_0,
@@ -889,14 +1089,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         cols::RS1,
         cols::RV1_0,
         cols::RV1_1,
-        0,
+        timestamp_slot(ts_base, 0),
     ));
     interactions.push(memw_register_read(
         cols::READ_REGISTER2,
         cols::RS2,
         cols::RV2_0,
         cols::RV2_1,
-        1,
+        timestamp_slot(ts_base, 1),
     ));
     // Register write of rvd at timestamp+2 (16 elements, no `old`).
     interactions.push(BusInteraction::sender(
@@ -923,14 +1123,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusValue::constant(0),
             BusValue::constant(0),
             BusValue::constant(0),
-            // timestamp+2
-            BusValue::linear(vec![
-                LinearTerm::Column {
-                    coefficient: 1,
-                    column: cols::TIMESTAMP,
-                },
-                LinearTerm::Constant(2),
-            ]),
+            timestamp_slot(ts_base, 2),
             BusValue::constant(0),
             BusValue::constant(1), // write2 (register access = 2 words)
             BusValue::constant(0),
@@ -946,10 +1139,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::MemoryOp,
         Multiplicity::Column(cols::MEMORY),
         vec![
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP,
-                packing: Packing::Direct,
-            },
+            timestamp_slot(ts_base, 0),
             BusValue::constant(0), // timestamp_hi
             res_cast_wl(),         // address (2 words)
             BusValue::Packed {
@@ -972,29 +1162,22 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // previous timestamp, write next_pc at timestamp+1. x255 lives at addresses
     // 510/511. Padding rows participate too (they carry PC=1 and chain their
     // timestamps); the HALT chip's consume_pc/emit_pc bridges the last real write
-    // to the padding chain. See `docs/cpu-rework-deviations.md` (D-PAD).
+    // to the padding chain.
+    //
+    // The timestamp is preprocessed, so `timestamp - 3` never underflows (the
+    // first row of an epoch reads the REGISTER init token at 1) and
+    // `pc_double_read` needs no constraint beyond IS_BIT (spec `cpu.typ`): with
+    // it set, the read lands on this row's own `rs1 = x255` read at `timestamp`,
+    // and nothing else writes x255 there.
     // -------------------------------------------------------------------------
     let pc_mult = Multiplicity::One;
-    // prev_ts_lo = timestamp - 3*(1 - pc_double_read) + 2^32 * borrow
-    let prev_ts_lo = BusValue::linear(vec![
-        LinearTerm::Column {
-            coefficient: 1,
-            column: cols::TIMESTAMP,
-        },
-        LinearTerm::Constant(-3),
-        LinearTerm::Column {
-            coefficient: 3,
-            column: cols::PC_DOUBLE_READ,
-        },
-        LinearTerm::Column {
-            coefficient: 1i64 << 32,
-            column: cols::PREV_PC_TIMESTAMP_BORROW,
-        },
-    ]);
-    let prev_ts_hi = BusValue::linear(vec![LinearTerm::Column {
-        coefficient: -1,
-        column: cols::PREV_PC_TIMESTAMP_BORROW,
-    }]);
+    // prev_ts = ts_base + timestamp - 3*(1 - pc_double_read)
+    let mut prev_ts_terms = timestamp_terms(ts_base, -3);
+    prev_ts_terms.push(LinearTerm::Column {
+        coefficient: 3,
+        column: cols::PC_DOUBLE_READ,
+    });
+    let prev_ts = BusValue::linear(prev_ts_terms);
     for i in 0..2u64 {
         let pc_col = if i == 0 { cols::PC_0 } else { cols::PC_1 };
         let next_pc_col = if i == 0 {
@@ -1010,8 +1193,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(1),
                 BusValue::constant(510 + i),
                 BusValue::constant(0),
-                prev_ts_lo.clone(),
-                prev_ts_hi.clone(),
+                prev_ts.clone(),
+                BusValue::constant(0),
                 BusValue::Packed {
                     start_column: pc_col,
                     packing: Packing::Direct,
@@ -1026,13 +1209,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(1),
                 BusValue::constant(510 + i),
                 BusValue::constant(0),
-                BusValue::linear(vec![
-                    LinearTerm::Column {
-                        coefficient: 1,
-                        column: cols::TIMESTAMP,
-                    },
-                    LinearTerm::Constant(1),
-                ]),
+                timestamp_slot(ts_base, 1),
                 BusValue::constant(0),
                 BusValue::Packed {
                     start_column: next_pc_col,
@@ -1126,17 +1303,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // -------------------------------------------------------------------------
-    // ECALL: system-call bus (HALT/COMMIT/KECCAK receive). mult = ECALL.
+    // ECALL: system-call bus (HALT/COPY/KECCAK/ECSM/HINT receive). mult = ECALL.
     // ECALL[timestamp, rv1].
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
         BusId::Ecall,
         Multiplicity::Column(cols::ECALL),
         vec![
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP,
-                packing: Packing::Direct,
-            },
+            timestamp_slot(ts_base, 0),
             BusValue::constant(0),
             BusValue::Packed {
                 start_column: cols::RV1_0,
@@ -1156,7 +1330,7 @@ fn memw_register_read(
     rs_col: usize,
     rv_lo_col: usize,
     rv_hi_col: usize,
-    ts_offset: i64,
+    ts: BusValue,
 ) -> BusInteraction {
     let value_lo = || BusValue::Packed {
         start_column: rv_lo_col,
@@ -1165,20 +1339,6 @@ fn memw_register_read(
     let value_hi = || BusValue::Packed {
         start_column: rv_hi_col,
         packing: Packing::Direct,
-    };
-    let ts = if ts_offset == 0 {
-        BusValue::Packed {
-            start_column: cols::TIMESTAMP,
-            packing: Packing::Direct,
-        }
-    } else {
-        BusValue::linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::TIMESTAMP,
-            },
-            LinearTerm::Constant(ts_offset),
-        ])
     };
     BusInteraction::sender(
         BusId::Memw,

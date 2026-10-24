@@ -7,7 +7,7 @@ use crate::tables::bitwise::{
     NUM_ROWS as BITWISE_ROWS, bus_interactions as bitwise_buses, cols::NUM_COLUMNS as BITWISE_COLS,
 };
 use crate::tables::branch::{bus_interactions as branch_buses, cols::NUM_COLUMNS as BRANCH_COLS};
-use crate::tables::commit::{bus_interactions as commit_buses, cols::NUM_COLUMNS as COMMIT_COLS};
+use crate::tables::copy::{bus_interactions as copy_buses, cols::NUM_COLUMNS as COPY_COLS};
 use crate::tables::cpu::{bus_interactions as cpu_buses, cols::NUM_COLUMNS as CPU_COLS};
 use crate::tables::decode::{bus_interactions as decode_buses, cols::NUM_COLUMNS as DECODE_COLS};
 use crate::tables::dvrm::{bus_interactions as dvrm_buses, cols::NUM_COLUMNS as DVRM_COLS};
@@ -108,8 +108,8 @@ fn aux_cols(bus_count: usize) -> u64 {
 /// consumer sums or sorts — and it does not track `air_trace_pairs`.
 ///
 /// Note this list models only the tables `TableLengths` carries: there is no
-/// entry for eq, bytewise, store, cpu32, keccak, keccak_rnd, ecsm, ecdas or
-/// hint, so a run dominated by one of those is under-estimated.
+/// entry for eq, bytewise, store, cpu32, keccak, keccak_rnd, ecsm, ecdas, hint
+/// or is_wh, so a run dominated by one of those is under-estimated.
 fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
     let bitwise_rows = BITWISE_ROWS as u64;
     let register_rows = NUM_REGISTER_ADDRESSES.next_power_of_two() as u64;
@@ -120,8 +120,8 @@ fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
         (
             lengths.cpu_padded_rows,
             CPU_COLS as u64,
-            aux_cols(cpu_buses().len()),
-            1,
+            aux_cols(cpu_buses(0).len()),
+            2, // TIMESTAMP is preprocessed: see the note above BITWISE
         ),
         (
             lengths.memw_padded_rows,
@@ -178,15 +178,15 @@ fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
             1,
         ),
         (
-            lengths.commit_padded_rows,
-            COMMIT_COLS as u64,
-            aux_cols(commit_buses().len()),
+            lengths.copy_padded_rows,
+            COPY_COLS as u64,
+            aux_cols(copy_buses().len()),
             1,
         ),
-        // BITWISE / DECODE / PAGE / REGISTER take the preprocessed-trace commit
-        // path: it extracts ALL columns into the LDE and builds two Merkle trees
-        // (precomputed_tree + mult_tree), so main_cols = full NUM_COLUMNS and
-        // main_trees = 2.
+        // BITWISE / DECODE / PAGE / REGISTER, and CPU above, take the
+        // preprocessed-trace commit path: it extracts ALL columns into the LDE and
+        // builds two Merkle trees (precomputed_tree + mult_tree), so main_cols =
+        // full NUM_COLUMNS and main_trees = 2.
         (
             bitwise_rows,
             BITWISE_COLS as u64,
@@ -203,7 +203,7 @@ fn table_specs(lengths: &TableLengths) -> Vec<TableSpec> {
         (
             register_rows,
             REGISTER_COLS as u64,
-            aux_cols(register_buses().len()),
+            aux_cols(register_buses(0).len()),
             2,
         ),
     ];

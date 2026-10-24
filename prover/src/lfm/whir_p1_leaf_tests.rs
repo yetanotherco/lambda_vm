@@ -96,7 +96,7 @@ fn the_p1_whir_transcript_replays_the_hosts_stream() {
         crypto::hash::rpx::digest_to_commitment(&core::array::from_fn::<_, 4, _>(|k| felt(seed, k)))
     };
     let mut calls = vec![
-        Call::Bytes(b"LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V1/P1W16/C2".to_vec()),
+        Call::Bytes(b"LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V2/P1W16/C2".to_vec()),
         Call::Bytes(Vec::new()),
         Call::Bytes(vec![7; 8]),
         Call::Bytes(vec![1, 2, 3]),

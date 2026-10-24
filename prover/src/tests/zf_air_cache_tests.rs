@@ -73,7 +73,7 @@ fn the_air_prototype_cache_keys_the_proof_format() {
     // CPU (a constraint-bearing AIR): the default first, then the rest.
     for _round in 0..2 {
         for format in formats().into_iter().rev() {
-            let air = create_cpu_air(&options(format));
+            let air = create_cpu_air(&options(format), 0);
             assert_eq!(
                 air.options().format,
                 format,

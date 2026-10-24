@@ -139,11 +139,16 @@ fn shapes() {
             false,
             &traces.page_configs,
             &table_counts,
+            &crate::cpu_heights_from_traces(&traces),
             None,
             true,
             None,
-            None,
-            None,
+            crate::test_utils::halted_register_commitment(
+                &options(),
+                &elf,
+                &traces.public_output_bytes,
+            )
+            .preprocessed(),
         );
         let pairs = airs.air_trace_pairs(&mut traces);
 
@@ -1900,8 +1905,9 @@ fn the_per_branch_term_is_the_table_kind_count() {
         ecsm: 0,
         ecdas: 0,
         hint: 0,
-        commit: 0,
+        copy: 0,
         blake3: 0,
+        is_wh: 0,
     };
     let kinds = crate::statement::table_count_values(&zero).len();
     assert_eq!(
@@ -2670,17 +2676,19 @@ fn phases() {
     let trace_build = start.elapsed();
 
     let table_counts = traces.table_counts();
+
     let airs = crate::VmAirs::new(
         &elf,
         &opts,
         false,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(&opts, &elf, &traces.public_output_bytes)
+            .preprocessed(),
     );
     let pairs = airs.air_trace_pairs(&mut traces);
     // The table's own shape, the way `multilinear_prove::shapes_of` reads it:
@@ -2889,11 +2897,16 @@ fn commit_phases() {
         false,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(
+            &options(),
+            &elf,
+            &traces.public_output_bytes,
+        )
+        .preprocessed(),
     );
     let pairs = airs.air_trace_pairs(&mut traces);
 
@@ -3099,11 +3112,16 @@ fn constraint_program_sizes() {
         false,
         &traces.page_configs,
         &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(
+            &options(),
+            &elf,
+            &traces.public_output_bytes,
+        )
+        .preprocessed(),
     );
     let pairs = airs.air_trace_pairs(&mut traces);
     // What each table would need resident on a device: its factor tables, which
@@ -3194,11 +3212,13 @@ fn whir_epoch_shapes() {
             );
             let reg_fini = crate::tables::register::fini_from_trace(&traces.register);
             let table_counts = traces.table_counts();
+            let cpu_heights = crate::cpu_heights_from_traces(&traces);
             let airs = crate::continuation::build_epoch_airs(
                 &elf,
                 &opts,
                 &[],
                 &table_counts,
+                &cpu_heights,
                 &prepared.register_init,
                 &reg_fini,
                 prepared.is_final,
@@ -3428,11 +3448,13 @@ fn whir_table_shapes() {
             );
             let reg_fini = crate::tables::register::fini_from_trace(&traces.register);
             let table_counts = traces.table_counts();
+            let cpu_heights = crate::cpu_heights_from_traces(&traces);
             let airs = crate::continuation::build_epoch_airs(
                 &elf,
                 &opts,
                 &[],
                 &table_counts,
+                &cpu_heights,
                 &prepared.register_init,
                 &reg_fini,
                 prepared.is_final,
@@ -3562,11 +3584,13 @@ fn whir_bus_shapes() {
             );
             let reg_fini = crate::tables::register::fini_from_trace(&traces.register);
             let table_counts = traces.table_counts();
+            let cpu_heights = crate::cpu_heights_from_traces(&traces);
             let airs = crate::continuation::build_epoch_airs(
                 &elf,
                 &opts,
                 &[],
                 &table_counts,
+                &cpu_heights,
                 &prepared.register_init,
                 &reg_fini,
                 prepared.is_final,

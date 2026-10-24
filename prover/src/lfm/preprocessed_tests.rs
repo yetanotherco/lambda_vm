@@ -184,7 +184,7 @@ fn const_mle_fixtures() -> Vec<(&'static str, Vec<Vec<FE>>)> {
         ),
         (
             "REGISTER",
-            crate::tables::register::preprocessed_columns_with_fini(&init, &fini),
+            crate::tables::register::preprocessed_columns(&init, &fini),
         ),
     ]
 }
@@ -544,6 +544,159 @@ fn the_offset_ramp_is_cheaper_than_the_fold_it_replaces() {
         "the ramp costs {closed} rows against a {rows}-row fold, which is not the \
          saving this leg exists for"
     );
+}
+
+// =============================================================================
+// The TIMESTAMP ramp — CPU's preprocessed clock, `4·(row + 1)`
+// =============================================================================
+
+/// The timestamp leg alone, like [`ramp_only_program`]: the control arm
+/// publishes the leading coordinate, so the publish cancels out of the delta.
+fn timestamp_only_program(num_vars: usize, leg: bool) -> LfmProgram {
+    let mut b = LfmBuilder::new().with_wrap_hash(super::edsl::WrapHash::production());
+    let arena = b.declare_arena(num_vars as u32);
+    let point: Vec<_> = (0..num_vars)
+        .map(|i| b.hint_word(arena, i as u32).as_ext())
+        .collect();
+    let out = if leg {
+        super::preprocessed::emit_timestamp_ramp(&mut b, &point)
+    } else {
+        point[0]
+    };
+    b.public(out.as_cell());
+    let program = compile(b.finish());
+    validate(&program).expect("the timestamp leg must be admissible");
+    program
+}
+
+/// ★★ The emitted clock equals the host's fold over `cpu::timestamp_column` —
+/// the column the univariate verifier commits and the multilinear one opens —
+/// at every height a CPU table takes, smallest to a real chunk's.
+#[test]
+fn the_timestamp_ramp_computes_what_the_hosts_cpu_fold_computes() {
+    for num_vars in [2usize, 5, 12] {
+        let column = crate::tables::cpu::timestamp_column(1 << num_vars);
+        let mle = Mle::new(column).expect("a power-of-two column");
+        let program = timestamp_only_program(num_vars, true);
+        for seed in [0x7135_0001u64, 0x7135_0002, 0x7135_0003] {
+            let point = sample_point_n(seed ^ num_vars as u64, num_vars);
+            let arenas = vec![point.iter().map(ext_word).collect::<Vec<_>>()];
+            let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+                .expect("the timestamp leg executes");
+            assert_eq!(exec.public_words.len(), 1, "the leg publishes one value");
+            let got = word_as_ext(&exec.public_words[0].1).expect("an extension value");
+
+            let folded = mle
+                .evaluate_in::<GoldilocksExtension>(&point)
+                .expect("the column has num_vars variables");
+            let closed = super::preprocessed::timestamp_ramp_at(&point);
+            // The bare identity ramp is what a leg that dropped the scale and
+            // shift would return; at a random point the clock is not that.
+            assert_ne!(
+                got,
+                super::preprocessed::offset_ramp_at(&point),
+                "{num_vars} vars, seed {seed:#x}: the clock is the bare row ramp"
+            );
+            assert_eq!(
+                got, folded,
+                "{num_vars} vars, seed {seed:#x}: the EMITTED clock disagrees with the host's fold"
+            );
+            assert_eq!(
+                got, closed,
+                "{num_vars} vars, seed {seed:#x}: the emitted clock disagrees with its closed form"
+            );
+        }
+    }
+}
+
+/// The clock's bit order is the page ramp's, and a reversed point reads a
+/// different value off the real column.
+#[test]
+fn the_timestamp_ramp_is_wrong_under_the_reversed_bit_order() {
+    let num_vars = 10;
+    let mle = Mle::new(crate::tables::cpu::timestamp_column(1 << num_vars))
+        .expect("a power-of-two column");
+    let point = sample_point_n(0x7135_00a0, num_vars);
+    let reversed: Vec<FEE> = point.iter().rev().cloned().collect();
+    let folded = mle
+        .evaluate_in::<GoldilocksExtension>(&point)
+        .expect("the column has num_vars variables");
+    assert_eq!(super::preprocessed::timestamp_ramp_at(&point), folded);
+    assert_ne!(
+        super::preprocessed::timestamp_ramp_at(&reversed),
+        folded,
+        "a reversed point must give a different value"
+    );
+}
+
+/// ⛔ The check is load-bearing: a CPU column with ONE timestamp moved (a
+/// prover's free clock at one row) folds to another value, so the emitted
+/// closed form refuses its opening, at every row the move can land on.
+#[test]
+fn a_cpu_column_with_one_timestamp_moved_is_not_the_clock() {
+    let num_vars = 6;
+    let program = timestamp_only_program(num_vars, true);
+    let point = sample_point_n(0x7135_00b0, num_vars);
+    let arenas = vec![point.iter().map(ext_word).collect::<Vec<_>>()];
+    let exec = execute(&program, &arenas, &crate::hash_pin::BLOCK_HASHER)
+        .expect("the timestamp leg executes");
+    let emitted = word_as_ext(&exec.public_words[0].1).expect("an extension value");
+    for row in [0, 1, 37, (1 << num_vars) - 1] {
+        let mut column = crate::tables::cpu::timestamp_column(1 << num_vars);
+        column[row] += FE::from(crate::tables::cpu::TIMESTAMP_STRIDE);
+        let moved = Mle::new(column)
+            .expect("a power-of-two column")
+            .evaluate_in::<GoldilocksExtension>(&point)
+            .expect("the column has num_vars variables");
+        assert_ne!(
+            emitted, moved,
+            "row {row}: a moved timestamp opens to the clock's value"
+        );
+    }
+}
+
+/// The leg costs the ramp's rows plus one, and interns exactly the constants
+/// its form names.
+#[test]
+fn the_timestamp_ramp_emits_its_closed_form() {
+    for num_vars in [2usize, 5, 18] {
+        let with = timestamp_only_program(num_vars, true);
+        let without = timestamp_only_program(num_vars, false);
+        let with_consts = const_rows(&with);
+        let without_consts = const_rows(&without);
+        let measured = (with.instrs.len() - without.instrs.len()) - (with_consts - without_consts);
+        assert_eq!(
+            measured,
+            super::preprocessed::timestamp_ramp_rows(num_vars),
+            "{num_vars} vars: the emitted operation count must equal the closed form"
+        );
+
+        let named = super::preprocessed::timestamp_ramp_constants();
+        let interned: Vec<super::word::LfmWord> = with
+            .instrs
+            .iter()
+            .filter_map(|instr| match instr {
+                super::instr::Instr::Const { value, .. } => Some(*value),
+                _ => None,
+            })
+            .filter(|word| {
+                !without.instrs.iter().any(|instr| {
+                    matches!(instr, super::instr::Instr::Const { value, .. } if value == word)
+                })
+            })
+            .collect();
+        for word in &interned {
+            assert!(
+                named.contains(word),
+                "{num_vars} vars: the clock interns {word:?}, which the form does not name"
+            );
+        }
+        assert_eq!(
+            interned.len(),
+            named.len(),
+            "{num_vars} vars: the interned pool and the named pool must be the same set"
+        );
+    }
 }
 
 // =============================================================================

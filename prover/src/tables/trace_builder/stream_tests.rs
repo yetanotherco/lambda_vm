@@ -80,7 +80,7 @@ fn air_order(t: &Traces) -> Vec<Option<&Table>> {
         slot(&t.halt),
     ];
     for list in [
-        &t.commits,
+        &t.copies,
         &t.keccaks,
         &t.keccak_rnds,
         &t.ecsms,
@@ -93,6 +93,7 @@ fn air_order(t: &Traces) -> Vec<Option<&Table>> {
         out.push(slot(&t.blake3));
     }
     for list in [
+        &t.is_whs,
         &t.cpus,
         &t.lts,
         &t.shifts,
@@ -139,7 +140,7 @@ fn configs() -> Vec<(&'static str, Configure)> {
             Box::new(|b| {
                 b.keccak_rnd_chunks_at_finish(32)
                     .expect("rows")
-                    .cuts_at_finish(2, 4, 2)
+                    .cuts_at_finish(2, 4, 2, 2)
                     .expect("rows")
                     .pack_finished_tables()
                     .generate_packed()
@@ -179,7 +180,7 @@ fn configs() -> Vec<(&'static str, Configure)> {
 fn cut(b: WindowedTraceBuilder<'_>, padding: CutPadding) -> WindowedTraceBuilder<'_> {
     b.keccak_rnd_chunks_at_finish(32)
         .expect("rows")
-        .cuts_at_finish(1, 1, 16)
+        .cuts_at_finish(1, 1, 16, 1)
         .expect("rows")
         .cut_padding(padding)
         .pack_finished_tables()
@@ -315,10 +316,16 @@ fn streamed_keeping(
 /// The AIR positions of a build's KECCAK_RND tables and of its LT tables
 /// (`air_order`'s layout).
 fn regen_ranges(t: &Traces) -> [std::ops::Range<usize>; 2] {
-    let kr = 5 + t.commits.len() + t.keccaks.len();
+    let kr = 5 + t.copies.len() + t.keccaks.len();
     let kr_end = kr + t.keccak_rnds.len();
     let blake3 = usize::from(t.table_counts().blake3 == 1);
-    let lt = kr_end + t.ecsms.len() + t.ecdases.len() + t.hints.len() + blake3 + t.cpus.len();
+    let lt = kr_end
+        + t.ecsms.len()
+        + t.ecdases.len()
+        + t.hints.len()
+        + blake3
+        + t.is_whs.len()
+        + t.cpus.len();
     [kr..kr_end, lt..lt + t.lts.len()]
 }
 
@@ -475,7 +482,7 @@ fn the_streamed_tables_are_the_airs_in_order() {
         let configure: Configure = Box::new(|b| {
             b.keccak_rnd_chunks_at_finish(32)
                 .expect("rows")
-                .cuts_at_finish(2, 4, 2)
+                .cuts_at_finish(2, 4, 2, 2)
                 .expect("rows")
                 .pack_finished_tables()
                 .generate_packed()
@@ -496,11 +503,16 @@ fn the_streamed_tables_are_the_airs_in_order() {
             false,
             &header.page_configs,
             &header.table_counts,
+            &header.cpu_heights,
             None,
             true,
             None,
-            None,
-            None,
+            crate::test_utils::halted_register_commitment(
+                &opts,
+                &program,
+                &header.public_output_bytes,
+            )
+            .preprocessed(),
         );
         let refs = airs.air_refs();
         assert_eq!(refs.len(), got.len(), "{name}: one table an AIR");
@@ -526,7 +538,7 @@ fn a_one_byte_budget_streams_the_finish() {
     let done = within(120, || {
         let (program, logs) = run("test_ecsm_multi");
         let configure: Configure = Box::new(|b| {
-            b.cuts_at_finish(2, 4, 2)
+            b.cuts_at_finish(2, 4, 2, 2)
                 .expect("rows")
                 .pack_finished_tables()
                 .drop_streamed_ops()
@@ -808,7 +820,7 @@ fn a_miscounted_header_is_refused_by_the_stream() {
     let (builder, last) = pushed(&program, &logs, &max_rows, 1000, &|b| b);
     let (header, _, _) = streamed(builder, last, usize::MAX);
     let counts = header.table_counts;
-    let wrong: Vec<crate::TableCounts> = (0..21)
+    let wrong: Vec<crate::TableCounts> = (0..22)
         .map(|f| {
             let mut c = counts.clone();
             let field = [
@@ -831,12 +843,13 @@ fn a_miscounted_header_is_refused_by_the_stream() {
                 &mut c.ecsm,
                 &mut c.ecdas,
                 &mut c.hint,
-                &mut c.commit,
+                &mut c.copy,
                 &mut c.blake3,
+                &mut c.is_wh,
             ]
             .into_iter()
             .nth(f)
-            .expect("21 fields");
+            .expect("22 fields");
             *field += 1;
             c
         })

@@ -15,9 +15,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# `fast-memcpy`: the runtime's 32-bytes-an-iteration `memcpy` instead of
-# compiler_builtins' (see syscalls/src/entrypoint.rs for its contract).
-lambda-vm-syscalls = { path = "../../../../syscalls", features = ["fast-memcpy"] }
+# The runtime's `memcpy`, `memmove` and `memset` are the copy accelerator's stubs
+# (syscalls/src/entrypoint.rs). The `fast-memcpy` feature would keep them in software.
+lambda-vm-syscalls = { path = "../../../../syscalls" }
 # LambdaVM crypto provider (keccak + ECSM-accelerated ecrecover), defined in the
 # lambda_vm repo and injected in src/main.rs — so crypto changes stay in our repo
 # and don't require an ethrex PR.

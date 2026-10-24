@@ -591,9 +591,10 @@ fn a_nonce_that_did_not_grind_is_rejected() {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PrepSource {
     /// A function of `ProofOptions` alone: BITWISE, KECCAK_RC, or PAGE's
-    /// shared zero-init root.
+    /// shared zero-init root; or of the options and the table's height, which
+    /// the statement carries: a CPU table's TIMESTAMP.
     Constant(Commitment),
-    /// REGISTER: `compute_precomputed_commitment_with_fini(options, INIT, FINI)`.
+    /// REGISTER: `compute_precomputed_commitment(options, INIT, FINI)`.
     Register(Commitment),
     /// A function of the inner ELF: DECODE, or an ELF-data page's root.
     ElfDependent(Commitment),
@@ -639,23 +640,19 @@ fn prep_source(
     elf: &executor::elf::Elf,
     register_init: &[u32],
     reg_fini: &[u32],
+    height: usize,
     layout: stark::leaf_layout::LeafLayout,
 ) -> PrepSource {
-    use crate::tables::{bitwise, decode, keccak_rc, page, register};
+    use crate::tables::{bitwise, cpu, decode, keccak_rc, page, register};
 
     if Some(root) == bitwise::preprocessed_commitment_for(opts, layout)
         || Some(root) == keccak_rc::preprocessed_commitment_for(opts, layout)
         || Some(root) == page::zero_init_preprocessed_commitment_for(opts, layout)
+        || root == cpu::compute_timestamp_commitment_with(opts, height, layout)
     {
         return PrepSource::Constant(root);
     }
-    if root
-        == register::compute_precomputed_commitment_with_fini_layout(
-            opts,
-            register_init,
-            reg_fini,
-            layout,
-        )
+    if root == register::compute_precomputed_commitment_with(opts, register_init, reg_fini, layout)
     {
         return PrepSource::Register(root);
     }
@@ -666,9 +663,10 @@ fn prep_source(
     }
     panic!(
         "a preprocessed sub-proof carries a root matching none of production's \
-         candidate sources (BITWISE, KECCAK_RC, PAGE zero-init, REGISTER-with-FINI, \
-         DECODE-from-ELF). The machine has no binding for it, so it must not be \
-         hinted: extend the taxonomy (assembly ledger entry 7) rather than this list"
+         candidate sources (BITWISE, KECCAK_RC, PAGE zero-init, CPU TIMESTAMP, \
+         REGISTER-with-FINI, DECODE-from-ELF). The machine has no binding for it, \
+         so it must not be hinted: extend the taxonomy (assembly ledger entry 7) \
+         rather than this list"
     );
 }
 
@@ -942,19 +940,19 @@ impl EpochFront {
             false,
             &[],
             &table_counts,
+            &crate::cpu_heights_from_traces(&traces),
             None,
             is_final,
             None,
-            None,
-            Some(crate::RegisterPreprocessed {
-                commitment: register::compute_precomputed_commitment_with_fini(
+            crate::RegisterPreprocessed {
+                commitment: register::compute_precomputed_commitment(
                     &opts,
                     &register_init,
                     &reg_fini,
                 ),
                 init: &register_init,
                 fini: &reg_fini,
-            }),
+            },
         );
         let decode_root = crate::tables::decode::commitment_from_elf(&elf, &opts)
             .expect("the DECODE commitment must compute");
@@ -1174,7 +1172,15 @@ fn harvest_real_epoch(
                 .unwrap_or_else(|| panic!("table {idx}: no precomputed root at {layout:?}"));
             transcript.append_bytes(&prep);
             transcript.append_bytes(v.lde_trace_main_merkle_root());
-            let source = prep_source(prep, opts, elf, &register_init, &reg_fini, layout);
+            let source = prep_source(
+                prep,
+                opts,
+                elf,
+                &register_init,
+                &reg_fini,
+                v.trace_length(),
+                layout,
+            );
             match source {
                 PrepSource::Register(_) => register_layout = layout,
                 PrepSource::ElfDependent(root) => absorbed_decode_root = root,

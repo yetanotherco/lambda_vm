@@ -21,6 +21,10 @@ pub(crate) struct RestHeader {
     pub(crate) page_configs: Vec<PageConfig>,
     pub(crate) public_output_bytes: Vec<u8>,
     pub(crate) num_blake3_ops: usize,
+    /// The CPU tables' heights, in order: what fixes each one's timestamp base
+    /// and the final PC timestamp (`tables::cpu::timestamp_bases`), so a block's
+    /// AIRs can be built before its tables are.
+    pub(crate) cpu_heights: Vec<usize>,
 }
 
 impl RestHeader {
@@ -31,7 +35,7 @@ impl RestHeader {
 }
 
 /// [`crate::TableCounts`] field by field, to compare two.
-pub(super) fn counts_of(c: &crate::TableCounts) -> [usize; 21] {
+pub(super) fn counts_of(c: &crate::TableCounts) -> [usize; 22] {
     [
         c.cpu,
         c.lt,
@@ -52,8 +56,9 @@ pub(super) fn counts_of(c: &crate::TableCounts) -> [usize; 21] {
         c.ecsm,
         c.ecdas,
         c.hint,
-        c.commit,
+        c.copy,
         c.blake3,
+        c.is_wh,
     ]
 }
 
@@ -136,7 +141,7 @@ pub(super) struct FinishPlan<'a> {
     branch_ops: CompactBranch,
     mul_ops: BlockVec<(MulOperation, bool)>,
     dvrm_ops: BlockVec<(DvrmOperation, bool)>,
-    commit_ops: BlockVec<CommitOperation>,
+    copy_ops: BlockVec<copy::CopyOperation>,
     keccak_ops: BlockVec<KeccakOperation>,
     blake3_ops: BlockVec<Blake3Operation>,
     blake3_absorb_ops: BlockVec<blake3::Blake3AbsorbOperation>,
@@ -147,6 +152,9 @@ pub(super) struct FinishPlan<'a> {
     ecsm_ops: BlockVec<ecsm::EcsmOperation>,
     ecdas_ops: BlockVec<ecdas::CompactEcdasOp>,
     hint_ops: BlockVec<hint::HintOperation>,
+    /// IS_WH's rows ([`is_wh::dedup_is_wh_rows`] over KECCAK's state addresses),
+    /// shared by its BITWISE lookups and its table.
+    is_wh_rows: Vec<(is_wh::IsWhKey, u64)>,
     bitwise_histogram: bitwise::BitwiseHistogram,
     num_padding_rows: usize,
     halt_timestamp: u64,
@@ -191,7 +199,7 @@ impl<'a> FinishPlan<'a> {
             branch_ops,
             mul_ops,
             dvrm_ops,
-            commit_ops,
+            copy_ops,
             keccak_ops,
             blake3_ops,
             blake3_absorb_ops,
@@ -269,11 +277,20 @@ impl<'a> FinishPlan<'a> {
         #[cfg(feature = "instruments")]
         let __sp = stark::instruments::span("p4_bitwise_collect");
 
-        let public_output_bytes: Vec<u8> = commit_ops
-            .iter()
-            .filter(|op| !op.end)
-            .map(|op| op.value)
-            .collect();
+        // The committed bytes flow through the COPY chip, so the public output is read
+        // off its `write` rows. A zero-length `write` contributes a row that moves no
+        // bytes; `count != 0` is exactly the `mu - count_borrows[1]` gate the AIR uses.
+        // `dst` is the COMMIT-domain address, the running global byte index.
+        let public_output_bytes: Vec<u8> = {
+            let mut rows: Vec<&copy::CopyOperation> = copy_ops
+                .iter()
+                .filter(|op| op.functionality == copy::Functionality::Write && op.count != 0)
+                .collect();
+            rows.sort_by_key(|op| op.dst);
+            rows.iter()
+                .flat_map(|op| op.value[..op.width as usize].iter().copied())
+                .collect()
+        };
 
         // CPU padding rows send ARE_BYTES with all-zero values.
         // Add corresponding ops so the bitwise table multiplicities balance.
@@ -290,8 +307,14 @@ impl<'a> FinishPlan<'a> {
             };
 
         let streamed_last_ecall = pre.as_ref().and_then(|pre| pre.last_ecall);
+        // IS_WH's rows from the `IS_WH` sends of every `IS_WHH` caller (today only
+        // KECCAK's state pointers), deduplicated once and shared by its BITWISE
+        // lookups and its table, so the two read the same rows by construction.
+        let is_wh_rows = is_wh::dedup_is_wh_rows(keccak_ops.parts().flat_map(keccak::is_wh_keys));
         let bitwise_histogram = {
             let lt_ops = lt.segments();
+            let branch_segments = branch_ops.segments();
+            let bytewise_segments = bytewise_ops.segments();
             // The per-source bitwise collectors are all pure functions of their inputs, and the
             // BITWISE multiplicities are order-independent (they ride a permutation-invariant bus),
             // so every source can be collected in parallel and the per-worker histograms summed in
@@ -301,7 +324,7 @@ impl<'a> FinishPlan<'a> {
             // chunk size used to split them into instances so multiplicities match the per-instance
             // sends. MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]. PAGE does a
             // batched ARE_BYTES[init, fini] per row (skipped in continuation epochs, which the L2G
-            // table owns). COMMIT sends AreBytes+IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL;
+            // table owns). COPY sends IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL;
             // HINT sends ARE_BYTES for its 32 output cells.
             // We never concatenate the lookups into one giant `Vec<BitwiseOperation>` (~140 M ops /
             // ~560 MB at 10-tx whose only consumer is the multiplicity count). Each collector bumps
@@ -328,7 +351,7 @@ impl<'a> FinishPlan<'a> {
                         Part::Ops(ops) => {
                             for slice in ops.chunks(lt_slice) {
                                 collectors.push(Box::new(move |h| {
-                                    h.add_ops(&collect_bitwise_from_lt(slice))
+                                    h.add_ops(&collect_bitwise_from_lt_ops(slice))
                                 }));
                             }
                         }
@@ -337,7 +360,7 @@ impl<'a> FinishPlan<'a> {
                                 collectors.push(Box::new(move |h| {
                                     let mut slice = Vec::new();
                                     compact.expand_into(start, start + lt_slice, &mut slice);
-                                    h.add_ops(&collect_bitwise_from_lt(&slice))
+                                    h.add_ops(&collect_bitwise_from_lt_ops(&slice))
                                 }));
                             }
                         }
@@ -367,7 +390,7 @@ impl<'a> FinishPlan<'a> {
                     let branch_ops = &branch_ops;
                     collectors.push(Box::new(move |h| {
                         let slice = branch_ops.range(k * branch_slice, (k + 1) * branch_slice);
-                        h.add_ops(&collect_bitwise_from_branch(&slice))
+                        h.add_ops(&collect_bitwise_from_branch_ops(&slice))
                     }));
                 }
                 let shift_slice = p4_slice_len(P4Source::Shift, mul_chunk, dvrm_chunk);
@@ -433,12 +456,12 @@ impl<'a> FinishPlan<'a> {
                     Box::new(|h: &mut bitwise::BitwiseHistogram| {
                         for part in &lt_ops.parts {
                             match *part {
-                                Part::Ops(ops) => h.add_ops(&collect_bitwise_from_lt(ops)),
+                                Part::Ops(ops) => h.add_ops(&collect_bitwise_from_lt_ops(ops)),
                                 Part::Compact(compact) => {
                                     for start in (0..compact.len()).step_by(1 << 20) {
                                         let mut slice = Vec::new();
                                         compact.expand_into(start, start + (1 << 20), &mut slice);
-                                        h.add_ops(&collect_bitwise_from_lt(&slice));
+                                        h.add_ops(&collect_bitwise_from_lt_ops(&slice));
                                     }
                                 }
                             }
@@ -460,7 +483,7 @@ impl<'a> FinishPlan<'a> {
                     Box::new(|h| {
                         for k in 0..branch_ops.len().div_ceil(1 << 20) {
                             let slice = branch_ops.range(k << 20, (k + 1) << 20);
-                            h.add_ops(&collect_bitwise_from_branch(&slice))
+                            h.add_ops(&collect_bitwise_from_branch_ops(&slice))
                         }
                     }),
                     Box::new(|h| {
@@ -500,23 +523,69 @@ impl<'a> FinishPlan<'a> {
                     }),
                 ]);
             }
+            // COPY's rows are millions at a block's size: a collector a block of
+            // them, each counted straight into its histogram.
+            for part in copy_ops.parts() {
+                collectors.push(Box::new(move |h| count_bitwise_from_copy(part, h)));
+            }
             collectors.extend([
                 // Small lists, one block each at a block's size: whole.
                 Box::new(|h: &mut bitwise::BitwiseHistogram| {
-                    h.add_ops(&collect_bitwise_from_commit(&commit_ops.whole()))
-                }) as Collector,
-                Box::new(|h| {
                     if !strip_blake3_side_effects() {
                         h.add_ops(&collect_bitwise_from_blake3(
                             &blake3_ops.whole(),
                             &blake3_absorb_ops.whole(),
                         ));
                     }
-                }),
+                }) as Collector,
                 Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops.whole()))),
                 Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops.whole()))),
                 Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
             ]);
+            // The per-row lookups (`types::MU_MAX`): the μ bound every row of a
+            // deduplicating table sends, padding rows included, and the byte checks
+            // SHIFT's and KECCAK_RND's padding rows send, over exactly the tables
+            // this build generates, a collector a table: the chunks of the lists here
+            // ([`list_chunks`]); with only the tails kept, the streamed chunks' were
+            // counted as they were handed out (their full chunks' padding here).
+            for (start, end) in list_chunks(lt_ops.len(), max_rows.lt) {
+                let lt_ops = &lt_ops;
+                collectors.push(Box::new(move |h| {
+                    h.add_ops(&lt_row_lookups(lt_ops.range(start, end).iter()))
+                }));
+            }
+            for (start, end) in list_chunks(branch_segments.len(), max_rows.branch) {
+                let branch_segments = &branch_segments;
+                collectors.push(Box::new(move |h| {
+                    h.add_ops(&branch_row_lookups(&branch_segments.range(start, end)))
+                }));
+            }
+            for (start, end) in list_chunks(bytewise_segments.len(), max_rows.bytewise) {
+                let bytewise_segments = &bytewise_segments;
+                collectors.push(Box::new(move |h| {
+                    h.add_ops(&bytewise_row_lookups(&bytewise_segments.range(start, end)))
+                }));
+            }
+            let shift_padding: usize = list_chunks(shift_ops.len(), max_rows.shift)
+                .iter()
+                .map(|&(start, end)| padding_rows_of(end - start))
+                .sum::<usize>()
+                + if skip.tails {
+                    skip.shift * padding_rows_of(max_rows.shift)
+                } else {
+                    0
+                };
+            let keccak_rnd_padding = keccak_rnd::ARE_BYTES_PER_ROW
+                * keccak_rnd_padding_rows(keccak_ops.len(), skip.keccak_rnd_rows, skip.cut_padding);
+            collectors.push(Box::new(move |h| {
+                h.bump_n(
+                    BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, 0, 0),
+                    (shift_padding + keccak_rnd_padding) as u64,
+                )
+            }));
+            collectors.push(Box::new(|h| {
+                is_wh::collect_bitwise_from_is_wh(&is_wh_rows, h)
+            }));
             if let Some(image) = initial_image
                 && !l2g_memory_bookend
             {
@@ -669,6 +738,24 @@ impl<'a> FinishPlan<'a> {
                 usize::from(n > 0)
             }
         };
+        // The CPU tables' heights, as `chunk_and_generate_skipping` cuts them: with
+        // only the tails kept, the streamed chunks (full, `max_rows.cpu` rows) and
+        // then the list's; else the list's chunks past the streamed ones.
+        let cpu_heights: Vec<usize> = {
+            let height = |len: usize| len.next_power_of_two().max(4);
+            let max = max_rows.cpu.max(1);
+            let chunks: Vec<usize> = cpu_ops.chunks(max).map(|c| height(c.len())).collect();
+            if skip.cpu == 0 && chunks.is_empty() {
+                // An empty list is one empty table (CPU is not optional).
+                vec![height(0)]
+            } else if skip.cpu > 0 && tails {
+                std::iter::repeat_n(height(max), skip.cpu)
+                    .chain(chunks)
+                    .collect()
+            } else {
+                chunks
+            }
+        };
         let table_counts = crate::TableCounts {
             cpu: chunked(cpu_ops.len(), max_rows.cpu, skip.cpu, tails, false)?,
             lt: chunked(lt.segments().len(), max_rows.lt, skip.lt, tails, true)?,
@@ -701,9 +788,17 @@ impl<'a> FinishPlan<'a> {
             ecsm: accelerator(ecsm_ops.len(), skip.ecsm_rows),
             ecdas: accelerator(ecdas_ops.len(), skip.ecdas_rows),
             hint: usize::from(!hint_ops.is_empty()),
-            commit: usize::from(!commit_ops.is_empty()),
+            copy: accelerator(copy_ops.len(), skip.copy_rows),
             blake3: usize::from(num_blake3_ops > 0),
+            is_wh: usize::from(!is_wh_rows.is_empty()),
         };
+        if cpu_heights.len() != table_counts.cpu {
+            return Err(Error::InvalidTableCounts(format!(
+                "{} CPU heights for {} CPU tables",
+                cpu_heights.len(),
+                table_counts.cpu
+            )));
+        }
         // The families cut at a fixed number of rows: the tables counted, and
         // how many of them hold a real row.
         let cut: Vec<String> = [
@@ -726,6 +821,7 @@ impl<'a> FinishPlan<'a> {
                 ecdas_ops.len(),
                 table_counts.ecdas,
             ),
+            ("COPY", skip.copy_rows, copy_ops.len(), table_counts.copy),
         ]
         .into_iter()
         .filter(|&(_, rows, _, _)| rows > 0)
@@ -767,7 +863,7 @@ impl<'a> FinishPlan<'a> {
             branch_ops,
             mul_ops,
             dvrm_ops,
-            commit_ops,
+            copy_ops,
             keccak_ops,
             blake3_ops,
             blake3_absorb_ops,
@@ -778,6 +874,7 @@ impl<'a> FinishPlan<'a> {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            is_wh_rows,
             bitwise_histogram,
             num_padding_rows,
             halt_timestamp,
@@ -788,6 +885,7 @@ impl<'a> FinishPlan<'a> {
                 page_configs,
                 public_output_bytes,
                 num_blake3_ops,
+                cpu_heights,
             },
             cut_line,
         })
@@ -836,7 +934,7 @@ impl<'a> FinishPlan<'a> {
             branch_ops,
             mul_ops,
             dvrm_ops,
-            commit_ops,
+            copy_ops,
             keccak_ops,
             blake3_ops,
             blake3_absorb_ops,
@@ -847,6 +945,7 @@ impl<'a> FinishPlan<'a> {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            is_wh_rows,
             bitwise_histogram,
             num_padding_rows,
             halt_timestamp,
@@ -1074,10 +1173,21 @@ impl<'a> FinishPlan<'a> {
             decode::count_rows(&mut decode, rows.chain(padding));
             packed_if(pack, decode)
         };
-        let gen_commits = || {
+        let gen_copies = || {
+            if skip.copy_rows > 0 {
+                return cut_tables(
+                    &copy_ops,
+                    skip.copy_rows,
+                    skip.cut_padding,
+                    pack,
+                    form,
+                    copy::rows_written_packed,
+                    copy::generate_copy_rows_as,
+                );
+            }
             generate_optional(
-                &commit_ops.whole(),
-                packed_by(pack, |ops| commit::generate_commit_trace_as(ops, form)),
+                &copy_ops.whole(),
+                copy::generate_copy_trace,
                 #[cfg(feature = "disk-spill")]
                 storage_mode,
             )
@@ -1221,7 +1331,7 @@ impl<'a> FinishPlan<'a> {
             (None, None, None, None);
         let (mut dvrms_slot, mut branches_slot, mut bitwise_slot, mut decode_slot) =
             (None, None, None, None);
-        let (mut commits_slot, mut keccaks_slot, mut keccak_rnds_slot, mut keccak_rc_slot) =
+        let (mut copies_slot, mut keccaks_slot, mut keccak_rnds_slot, mut keccak_rc_slot) =
             (None, None, None, None);
         let mut blake3_slot = None;
         let (mut pages_slot, mut register_slot, mut halt_slot) = (None, None, None);
@@ -1265,7 +1375,7 @@ impl<'a> FinishPlan<'a> {
                 spawn_into!(keccak_rnds_slot, gen_keccak_rnds);
                 spawn_into!(keccak_rc_slot, gen_keccak_rc);
                 spawn_into!(blake3_slot, gen_blake3);
-                spawn_into!(commits_slot, gen_commits);
+                spawn_into!(copies_slot, gen_copies);
                 spawn_into!(register_slot, gen_register);
                 spawn_into!(halt_slot, gen_halt);
                 spawn_into!(eqs_slot, gen_eqs);
@@ -1289,7 +1399,7 @@ impl<'a> FinishPlan<'a> {
             branches_slot = Some(gen_branches());
             bitwise_slot = Some(gen_bitwise());
             decode_slot = Some(gen_decode());
-            commits_slot = Some(gen_commits());
+            copies_slot = Some(gen_copies());
             keccaks_slot = Some(gen_keccaks());
             keccak_rnds_slot = Some(gen_keccak_rnds());
             keccak_rc_slot = Some(gen_keccak_rc());
@@ -1326,7 +1436,7 @@ impl<'a> FinishPlan<'a> {
         let mut bitwise = bitwise_slot.expect(PHASE5_RAN);
         #[allow(unused_mut)]
         let mut decode = decode_slot.expect(PHASE5_RAN);
-        let commits = commits_slot.expect(PHASE5_RAN)?;
+        let copies = copies_slot.expect(PHASE5_RAN)?;
         let keccaks = keccaks_slot.expect(PHASE5_RAN)?;
         let keccak_rnds = keccak_rnds_slot.expect(PHASE5_RAN)?;
         let keccak_rc_trace = keccak_rc_slot.expect(PHASE5_RAN);
@@ -1340,6 +1450,13 @@ impl<'a> FinishPlan<'a> {
         let ecsms = ecsms_slot.expect(PHASE5_RAN)?;
         let ecdases = ecdases_slot.expect(PHASE5_RAN)?;
         let hints = hints_slot.expect(PHASE5_RAN)?;
+        // IS_WH: one table of its rows, none when nothing sent `IS_WH`.
+        let is_whs = generate_optional(
+            &is_wh_rows,
+            packed_by(pack, is_wh::generate_is_wh_trace),
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?;
 
         // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
         // so spill them here before returning.
@@ -1384,6 +1501,7 @@ impl<'a> FinishPlan<'a> {
             page_configs,
             public_output_bytes,
             num_blake3_ops,
+            cpu_heights: _,
         } = header;
         let traces = Traces {
             cpus,
@@ -1402,7 +1520,7 @@ impl<'a> FinishPlan<'a> {
             public_output_bytes,
             branches,
             halt: halt_trace,
-            commits,
+            copies,
             keccaks,
             keccak_rnds,
             blake3: blake3_trace,
@@ -1411,6 +1529,7 @@ impl<'a> FinishPlan<'a> {
             ecsms,
             ecdases,
             hints,
+            is_whs,
             memw_registers,
             local_to_global,
             touched_memory_cells,
@@ -1468,19 +1587,20 @@ pub(crate) struct Emitted {
 /// The rest's families in AIR order (`VmAirs::air_refs`), each with its
 /// columns at eight bytes a cell: what a family's first table is estimated
 /// at, before one of them has been built.
-const FAMILIES: [(&str, usize); 27] = [
+const FAMILIES: [(&str, usize); 28] = [
     ("BITWISE", bitwise::cols::NUM_COLUMNS),
     ("DECODE", decode::cols::NUM_COLUMNS),
     ("KECCAK_RC", keccak_rc::cols::NUM_COLUMNS),
     ("REGISTER", register::cols::NUM_COLUMNS),
     ("HALT", halt::cols::NUM_COLUMNS),
-    ("COMMIT", commit::cols::NUM_COLUMNS),
+    ("COPY", copy::cols::NUM_COLUMNS),
     ("KECCAK", keccak::cols::NUM_COLUMNS),
     ("KECCAK_RND", keccak_rnd::cols::NUM_COLUMNS),
     ("ECSM", ecsm::cols::NUM_COLUMNS),
     ("ECDAS", ecdas::cols::NUM_COLUMNS),
     ("HINT", hint::cols::NUM_COLUMNS),
     ("BLAKE3", blake3::cols::NUM_COLUMNS),
+    ("IS_WH", is_wh::cols::NUM_COLUMNS),
     ("CPU", cpu::cols::NUM_COLUMNS),
     ("LT", lt::cols::NUM_COLUMNS),
     ("SHIFT", shift::cols::NUM_COLUMNS),
@@ -1676,7 +1796,7 @@ impl<'a> FinishPlan<'a> {
             branch_ops,
             mul_ops,
             dvrm_ops,
-            commit_ops,
+            copy_ops,
             keccak_ops,
             blake3_ops,
             blake3_absorb_ops,
@@ -1687,6 +1807,7 @@ impl<'a> FinishPlan<'a> {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            is_wh_rows,
             bitwise_histogram,
             num_padding_rows,
             halt_timestamp,
@@ -1778,16 +1899,19 @@ impl<'a> FinishPlan<'a> {
             }),
         });
 
-        // COMMIT, KECCAK, KECCAK_RND, ECSM, ECDAS, HINT, BLAKE3.
-        let commit_ops = Arc::new(commit_ops);
-        units.extend(optional_unit(family("COMMIT"), commit_ops.len(), || {
-            Box::new(move || {
-                Ok(packed_if(
-                    pack,
-                    commit::generate_commit_trace_as(&commit_ops.whole(), form),
-                ))
-            })
-        }));
+        // COPY, KECCAK, KECCAK_RND, ECSM, ECDAS, HINT, BLAKE3.
+        let copy_ops = Arc::new(copy_ops);
+        units.extend(cut_units(
+            family("COPY"),
+            &copy_ops,
+            skip.copy_rows,
+            skip.cut_padding,
+            pack,
+            form,
+            Arc::new(copy::generate_copy_rows_as),
+            |ops| Box::new(move || Ok(copy::generate_copy_trace(&ops.whole()))),
+        )?);
+        drop(copy_ops);
         let keccak_ops = Arc::new(keccak_ops);
         units.extend(cut_units(
             family("KECCAK"),
@@ -1870,6 +1994,9 @@ impl<'a> FinishPlan<'a> {
                 }),
             });
         }
+        units.extend(optional_unit(family("IS_WH"), is_wh_rows.len(), || {
+            Box::new(move || Ok(packed_if(pack, is_wh::generate_is_wh_trace(&is_wh_rows))))
+        }));
 
         // CPU … CPU32.
         units.extend(chunked_units(
@@ -2333,8 +2460,9 @@ fn check_units(units: &[Unit<'_>], counts: &crate::TableCounts) -> Result<(), Er
         ecsm: of("ECSM"),
         ecdas: of("ECDAS"),
         hint: of("HINT"),
-        commit: of("COMMIT"),
+        copy: of("COPY"),
         blake3: of("BLAKE3"),
+        is_wh: of("IS_WH"),
     };
     let fixed = ["BITWISE", "DECODE", "KECCAK_RC", "REGISTER", "HALT"];
     if counts_of(&units_counts) != counts_of(counts) || fixed.iter().any(|f| of(f) != 1) {

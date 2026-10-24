@@ -677,7 +677,7 @@ fn epoch_chunk_multiplier() {
         let fixed = get("BITWISE")
             + get("DECODE")
             + get("REGISTER")
-            + get("COMMIT")
+            + get("COPY")
             + get("HALT")
             + get("KECCAK")
             + get("KECCAK_RND")
@@ -717,7 +717,7 @@ fn epoch_chunk_multiplier() {
 /// ```text
 ///   14 split-table families (>= 1 chunk each)
 /// + FIXED_TABLE_COUNT       (5 final, 4 intermediate — HALT only on the last)
-/// + up to 6 accelerators    (COMMIT, KECCAK, KECCAK_RND, ECSM, ECDAS, HINT —
+/// + up to 6 accelerators    (COPY, KECCAK, KECCAK_RND, ECSM, ECDAS, HINT —
 ///                            one each, and only when the workload reaches it)
 /// + 1 L2G_MEMORY
 /// ```
@@ -774,7 +774,7 @@ fn continuation_epoch_constraint_leg() {
     // 0-or-1 count, and it is not in `TableCounts::total`'s accelerator group
     // either, so the counts below are the blake3-free shape and a blake3-using
     // epoch is one higher.
-    let accelerators = ["COMMIT", "KECCAK", "KECCAK_RND", "ECSM", "ECDAS", "HINT"];
+    let accelerators = ["COPY", "KECCAK", "KECCAK_RND", "ECSM", "ECDAS", "HINT"];
     // The list is a census OF the constant, so it must not be able to drift from
     // it silently — the failure this pin previously had. It is `always_on` and
     // not the eleven that the constant counts, which is exactly the assertion
@@ -929,7 +929,7 @@ fn continuation_epoch_chunk_counts_measured() {
         // Intermediate epoch: 9 fixed tables (no HALT) + 1 L2G_MEMORY.
         let fixed = get("BITWISE")
             + get("DECODE")
-            + get("COMMIT")
+            + get("COPY")
             + get("KECCAK")
             + get("KECCAK_RND")
             + get("KECCAK_RC")
@@ -1065,11 +1065,13 @@ fn artifacts_are_invariant_across_trace_length() {
     }
 }
 
-/// The four PARAMETERIZED tables produce a different program per parameter
+/// The six PARAMETERIZED tables produce a different program per parameter
 /// value.
 ///
 /// `PAGE` / `GLOBAL_MEMORY` fold a page base into constant bus terms; the two
-/// `L2G` tables fold an epoch label. This test does not assert that away — it
+/// `L2G` tables fold an epoch label; `CPU` folds its table's timestamp base and
+/// `REGISTER` the final PC timestamp (main's preprocessed clock and final
+/// register pin). This test does not assert that away — it
 /// characterizes it, because it is a real property of the current constraints
 /// and the recursion machine has to plan around it.
 ///
@@ -1114,6 +1116,16 @@ fn parameterized_airs_vary_per_parameter_value() {
             ConstraintArtifact::capture(&crate::continuation::l2g_memory_air(&opts, 1)),
             ConstraintArtifact::capture(&crate::continuation::l2g_memory_air(&opts, 7)),
         ),
+        (
+            "CPU",
+            ConstraintArtifact::capture(&create_cpu_air(&opts, 0)),
+            ConstraintArtifact::capture(&create_cpu_air(&opts, 4 << 21)),
+        ),
+        (
+            "REGISTER",
+            ConstraintArtifact::capture(&create_register_air(&opts, 17)),
+            ConstraintArtifact::capture(&create_register_air(&opts, (4 << 21) + 1)),
+        ),
     ];
 
     println!("\nparameterized tables: how two parameter values differ");
@@ -1151,10 +1163,14 @@ fn parameterized_airs_vary_per_parameter_value() {
         // that specific explanation is inferred, not verified, so the bound
         // below is deliberately loose. What is being pinned is only that the
         // delta stays local rather than the algebra changing shape.
+        //
+        // CPU's base enters at each timestamp offset it sends (0, +1, +2 and the
+        // previous PC's −3), so it may intern one constant per offset.
+        let constants = if *label == "CPU" { 4 } else { 1 };
         let node_delta = a.nodes.len().abs_diff(b.nodes.len());
         let const_delta = a.base_consts.len().abs_diff(b.base_consts.len());
         assert!(
-            node_delta <= 4 && const_delta <= 1,
+            node_delta <= 4 * constants && const_delta <= constants,
             "[{label}] two parameter values changed the program by {node_delta} nodes and \
              {const_delta} constants — too much to be the parameter's own interned constant and \
              its enclosing ops; the variation is structural, not just parametric"
@@ -1285,8 +1301,8 @@ fn production_airs_accept_a_precaptured_program() {
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
 
     // Build the artifact from one instance, install it into a fresh one.
-    let artifact = ConstraintArtifact::capture(&create_cpu_air(&opts));
-    let air = create_cpu_air(&opts).with_precaptured(artifact.program());
+    let artifact = ConstraintArtifact::capture(&create_cpu_air(&opts, 0));
+    let air = create_cpu_air(&opts, 0).with_precaptured(artifact.program());
 
     let supplied = air
         .precaptured_constraint_program()

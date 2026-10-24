@@ -90,7 +90,7 @@ fn register_read_messages(ts: u64) -> (Vec<FE>, Vec<FE>) {
     use crate::tables::cpu;
     let (reg, lo, hi) = (1u64, 42u32, 7u32);
 
-    let cpu_read = cpu::bus_interactions()
+    let cpu_read = cpu::bus_interactions(0)
         .into_iter()
         .find(|i| {
             let read = i.columns_read();

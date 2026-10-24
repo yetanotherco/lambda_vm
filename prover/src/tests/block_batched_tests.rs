@@ -55,6 +55,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         ecdas_rows_log2: block_whir::BLOCK_ECDAS_ROWS_LOG2,
         keccak_rows_log2: block_whir::BLOCK_KECCAK_ROWS_LOG2,
         ecsm_rows_log2: block_whir::BLOCK_ECSM_ROWS_LOG2,
+        copy_rows_log2: block_whir::BLOCK_COPY_ROWS_LOG2,
         drop_levels: multilinear::whir_commit::TreeDrop::uniform(3),
         window_log2: None,
         stream_keccak_rnd: false,
@@ -477,11 +478,16 @@ fn canonical_rows(program: &executor::elf::Elf, traces: &mut crate::tables::trac
         false,
         &traces.page_configs,
         &counts,
+        &crate::cpu_heights_from_traces(traces),
         None,
         true,
         None,
-        None,
-        None,
+        crate::test_utils::halted_register_commitment(
+            &ProofOptions::default_test_options(),
+            program,
+            &traces.public_output_bytes,
+        )
+        .preprocessed(),
     );
     for (air, trace, _) in airs.air_trace_pairs(traces) {
         if air.num_precomputed_columns() > 0 {

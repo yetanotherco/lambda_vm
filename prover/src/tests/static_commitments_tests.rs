@@ -1,6 +1,6 @@
 //! Drift-detection and lookup-dispatch tests for the static preprocessed-table
-//! commitments shipped in `bitwise`, `keccak_rc`, and `page` (the shared
-//! zero-init page commitment).
+//! commitments shipped in `bitwise`, `keccak_rc`, `page` (the shared
+//! zero-init page commitment) and `cpu` (the per-height TIMESTAMP column).
 //!
 //! - The drift tests recompute the commitment for every blowup in
 //!   `STATIC_BLOWUP_FACTORS` (the list shared with the generator binary) and
@@ -477,13 +477,17 @@ fn the_air_commitment_sources_serve_both_layouts() {
     assert_ne!(supplied.get_for(LeafLayout::Row), Some([7u8; 32]));
     // REGISTER (program-dependent): both computed.
     let init: Vec<u32> = (0..crate::tables::register::NUM_REGISTER_ADDRESSES as u32).collect();
-    let r = crate::tables::register::lazy_commitment(&options, &init);
+    let fini: Vec<u32> = init.iter().map(|w| w ^ 0x5a5a).collect();
+    let row_pair = crate::tables::register::compute_precomputed_commitment(&options, &init, &fini);
+    let r = crate::tables::register::lazy_commitment(&options, row_pair, &init, &fini);
+    assert_eq!(r.get_for(LeafLayout::RowPair), Some(row_pair));
     assert_eq!(
         r.get_for(LeafLayout::Row),
         Some(
             crate::tables::register::compute_precomputed_commitment_with(
                 &options,
                 &init,
+                &fini,
                 LeafLayout::Row
             )
         )

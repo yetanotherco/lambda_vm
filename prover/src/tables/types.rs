@@ -307,11 +307,11 @@ pub enum BusId {
     // =========================================================================
     /// Instruction decode lookup
     Decode = 18,
-    /// System call handling (CPU → HALT/COMMIT for all ECALLs)
+    /// System call handling (CPU → HALT/COPY/KECCAK/ECSM/HINT for all ECALLs)
     Ecall = 19,
-    /// COMMIT self-referencing recursive bus (row N → row N+1)
-    CommitNextByte = 20,
-    /// COMMIT output bus: verifier computes the receiver contribution externally
+    // ID 20 is reserved for the removed CommitNextByte bus: COMMIT's per-byte
+    // recursion moved to COPY, which chains over [`BusId::CopyNext`].
+    /// Commit output bus (sent by COPY's commit rows): verifier computes the receiver contribution externally
     /// from `VmProof.public_output` using the shared LogUp challenges
     Commit = 21,
     /// Keccak core ↔ round chip: (timestamp, round, state[200 bytes])
@@ -381,6 +381,29 @@ pub enum BusId {
     /// ID 35 rather than 29: 29 is a gap left by a removed bus and reusing it
     /// would make a stale artifact decode as this one.
     Blake3Absorb = 35,
+
+    // =========================================================================
+    // Unified copy primitive
+    // =========================================================================
+    /// COPY self-referential streaming bus. A row sends
+    /// `(timestamp, src_incr, dst_incr, count_decr, is_set, is_write)` to the next
+    /// row and receives `(timestamp, src, dst, count, is_set, is_write)` from the
+    /// previous one. The functionality selectors travel inside the tuple, so a chain
+    /// cannot change operation half way through it — a guarantee that separating the
+    /// operations by bus id would otherwise have to carry structurally.
+    ///
+    /// ID 36: 32–35 are the LFM and BLAKE3 absorb buses, and 20 and 29 are gaps
+    /// left by removed buses, which a stale artifact would decode as this one.
+    CopyNext = 36,
+
+    // =========================================================================
+    // Address range checks
+    // =========================================================================
+    /// `IS_WH[Word, Half]`: range check that the top 48 bits of a `DWordWHH`
+    /// are a valid `(Word, Half)` pair. Callers send it through the `IS_WHH`
+    /// template; the IS_WH table receives it. Main numbers it 32, which the LFM
+    /// buses hold here; 37 is the next free ID (20 and 29 stay unused).
+    IsWh = 37,
 }
 
 impl BusId {
@@ -399,8 +422,8 @@ impl BusId {
             BusId::Branch => "Branch",
             BusId::Decode => "Decode",
             BusId::Ecall => "Ecall",
-            BusId::CommitNextByte => "CommitNextByte",
             BusId::Commit => "Commit",
+            BusId::CopyNext => "CopyNext",
             BusId::Keccak => "Keccak",
             BusId::KeccakRc => "KeccakRc",
             BusId::ByteAlu => "ByteAlu",
@@ -414,6 +437,7 @@ impl BusId {
             BusId::LfmRange => "LfmRange",
             BusId::LfmPublic => "LfmPublic",
             BusId::Blake3Absorb => "Blake3Absorb",
+            BusId::IsWh => "IsWh",
         }
     }
 }
@@ -435,7 +459,6 @@ impl TryFrom<u64> for BusId {
             17 => Ok(BusId::Branch),
             18 => Ok(BusId::Decode),
             19 => Ok(BusId::Ecall),
-            20 => Ok(BusId::CommitNextByte),
             21 => Ok(BusId::Commit),
             22 => Ok(BusId::Keccak),
             23 => Ok(BusId::KeccakRc),
@@ -450,6 +473,8 @@ impl TryFrom<u64> for BusId {
             33 => Ok(BusId::LfmRange),
             34 => Ok(BusId::LfmPublic),
             35 => Ok(BusId::Blake3Absorb),
+            36 => Ok(BusId::CopyNext),
+            37 => Ok(BusId::IsWh),
             other => Err(other),
         }
     }
@@ -503,6 +528,63 @@ pub const NEG_INV_2_96: u64 = 1;
 pub const NEG_INV_2_112: u64 = 18446462594437939201;
 /// -(2^-128) mod p = p - 2^(-128)
 pub const NEG_INV_2_128: u64 = 18446744065119617026;
+
+// =========================================================================
+// Multiplicity bound of the deduplicated tables
+// =========================================================================
+
+/// Largest per-row multiplicity of a deduplicated table (LT, BYTEWISE, MUL, DVRM,
+/// BRANCH): each `μ` is range-checked to a byte by `IS_BYTE[μ]` (an `ARE_BYTES`
+/// send with multiplicity 1, the spec's default `cond`), so a row holds at most
+/// this many lookups. The bound is what keeps μ non-negative: without it a
+/// `μ = −1` twin of an honest row cancels it on the ALU bus while *receiving*
+/// its range lookups, which absorbs another row's out-of-range limb (a forged
+/// `5 < 3 = 1` verified).
+///
+/// The bound is sent with multiplicity 1, not μ. A `μ < 0` row then leaves `+1`
+/// on an out-of-range tuple, which nothing can cancel as long as no ARE_BYTES
+/// sender carries a negative weight (each one is `1` or a bit-constrained μ).
+/// Weighted by μ, the bound was itself that negative weight, and a real BRANCH
+/// row with a non-canonical `next_pc_low_1 = p−1` cancelled it
+/// (`branch_carrier_poc`).
+///
+/// It is `u8::MAX` so the BITWISE collectors can send each μ as a byte.
+pub const MU_MAX: u64 = u8::MAX as u64;
+
+/// Deduplicates operations into trace rows: `op -> μ`, splitting an op over
+/// several rows when its count exceeds [`MU_MAX`]. Shared by trace generation
+/// and the BITWISE collectors of LT, BYTEWISE and BRANCH so the per-row lookups
+/// they count cannot drift apart.
+///
+/// The map hashes with the process's one state (`tables::trace_hash`), so the
+/// rows come out in one order for one operation list: a streamed chunk built
+/// again is the chunk it was.
+pub fn dedup_rows<T: std::hash::Hash + Eq + Clone>(operations: &[T]) -> Vec<(T, u64)> {
+    dedup_rows_of(operations.iter())
+}
+
+/// [`dedup_rows`] over the operations an iterator yields, one after another (a
+/// chunk handed out as the window parts it lies in).
+pub fn dedup_rows_of<'a, T: std::hash::Hash + Eq + Clone + 'a>(
+    operations: impl Iterator<Item = &'a T>,
+) -> Vec<(T, u64)> {
+    use super::trace_hash::{OpMap, trace_hash_state};
+
+    let mut op_map: OpMap<T, u64> = OpMap::with_hasher(trace_hash_state());
+    for op in operations {
+        *op_map.entry(op.clone()).or_insert(0) += 1;
+    }
+
+    let mut rows = Vec::with_capacity(op_map.len());
+    for (op, mut left) in op_map {
+        while left > 0 {
+            let mu = left.min(MU_MAX);
+            left -= mu;
+            rows.push((op.clone(), mu));
+        }
+    }
+    rows
+}
 
 // =========================================================================
 // ALU operation descriptors

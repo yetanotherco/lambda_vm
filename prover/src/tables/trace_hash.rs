@@ -1,6 +1,7 @@
 //! The hash state of the tables that deduplicate their operations through a
-//! `HashMap` and lay their rows out in its iteration order: LT, EQ, BYTEWISE,
-//! BRANCH, MUL and DVRM.
+//! `HashMap` and lay their rows out in its iteration order: LT, BYTEWISE,
+//! BRANCH, MUL and DVRM (EQ keeps one row an operation since main's
+//! multiplicity fix).
 //!
 //! Every such map in the process hashes with one state, so a table's row order
 //! is a function of its operation list: two builds of the same run in one

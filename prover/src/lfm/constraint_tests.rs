@@ -335,36 +335,56 @@ fn the_differential_rejects_a_perturbed_constraint_value() {
 /// this test is to compare the emitter against the DESIGN's prediction and
 /// report where they differ, which a self-consistent recomputation cannot do.
 const DESIGN_INSTR: &[(&str, usize)] = &[
-    ("CPU", 489),
+    // 489 → 483: main's preprocessed CPU timestamp (#1025) replaced the
+    // timestamp's step constraints with a fixed column and a per-table base.
+    ("CPU", 483),
     ("BITWISE", 112),
-    ("LT", 116),
-    ("SHIFT", 321),
-    ("EQ", 88),
-    ("BYTEWISE", 138),
+    // LT, SHIFT, EQ, BYTEWISE, LOAD, MUL, DVRM, KECCAK and KECCAK_RND: main's
+    // multiplicity fix (#1016) bounds each deduplicating table's μ with a byte
+    // check of multiplicity 1, makes the others' μ a bit, and gives SHIFT's and
+    // KECCAK_RND's byte checks multiplicity 1: the emitter's counts, as measured
+    // after it (LT 116 → 125, SHIFT 321 → 318, EQ 88 → 90, BYTEWISE 138 → 147,
+    // LOAD 162 → 163, MUL 320 → 330, DVRM 423 → 433, KECCAK 3_146 → 3_148,
+    // KECCAK_RND 12_998 → 12_980).
+    ("LT", 125),
+    ("SHIFT", 318),
+    ("EQ", 90),
+    ("BYTEWISE", 147),
     ("STORE", 149),
     ("CPU32", 414),
     ("MEMW", 448),
     ("MEMW_A", 311),
     ("MEMW_R", 153),
-    ("LOAD", 162),
+    ("LOAD", 163),
     ("DECODE", 18),
-    ("MUL", 320),
-    ("DVRM", 423),
+    ("MUL", 330),
+    ("DVRM", 433),
     ("BRANCH", 108),
-    ("HALT", 701),
-    ("COMMIT", 359),
+    // 701 → 700: main's halt pin (#1020).
+    ("HALT", 700),
+    // COPY replaced COMMIT (main's #984) after the design table was written: the
+    // emitter's own count, as measured, not the design's prediction.
+    ("COPY", 660),
     ("PAGE", 41),
-    ("REGISTER", 29),
-    ("KECCAK", 3_146),
+    // 29 → 38: main's halt pin (#1020) added the IS_PC column and the final PC
+    // token at the verifier's timestamp.
+    ("REGISTER", 38),
+    // 3_148 → 2_874: main's IS_WH (#1022) moved KECCAK's state pointers to
+    // `DWordWHH`, their top 48 bits to the IS_WH table.
+    ("KECCAK", 2_874),
     // 14_016 → 12_998: main replaced the θ/ρ HWSL lookups with inline μ-gated
     // linear identities in `KeccakRndConstraints`, which nets −1018 constraint
     // arithmetic rows (the same change whose receiver-side multiplicity drop is
     // reconciled in `keccak_adapter::bitwise_ops_for`).
-    ("KECCAK_RND", 12_998),
+    ("KECCAK_RND", 12_980),
     ("KECCAK_RC", 26),
+    // Main's IS_WH table (#1022): the emitter's count, as measured.
+    ("IS_WH", 42),
     ("ECSM", 19_264),
     ("ECDAS", 22_718),
-    ("HINT", 418), // main's new receiver AIR for the `hint` ecall.
+    // main's new receiver AIR for the `hint` ecall; 418 → 419 when its syscall
+    // number moved from `-31` to `-32` (#984), a constant in its Ecall receive.
+    ("HINT", 419),
     ("L2G_GLOBAL", 27),
     ("L2G_MEMORY", 65),
     ("GLOBAL_MEMORY", 25),
@@ -1524,7 +1544,7 @@ fn continuation_epoch_constraint_leg_cost() {
     const FIXED: &[&str] = &[
         "BITWISE",
         "DECODE",
-        "COMMIT",
+        "COPY",
         "KECCAK",
         "KECCAK_RND",
         "KECCAK_RC",
@@ -1596,8 +1616,21 @@ fn continuation_epoch_constraint_leg_cost() {
     // identities in `KeccakRndConstraints`, netting −1018 constraint arithmetic
     // rows — the exact same delta the per-AIR census records for KECCAK_RND
     // (14_016 → 12_998). No other table moved; this is not a blind re-bless.
+    //
+    // 62_375 → 62_676 (+301): COPY took COMMIT's place in `FIXED` (#984), at 660
+    // unfused rows against COMMIT's 359. No other table in the sum moved.
+    //
+    // 62_676 → 62_698 (+22): main's multiplicity fix (#1016), the per-AIR census's
+    // deltas summed (LT +9, SHIFT −3, EQ +2, BYTEWISE +9, LOAD +1, MUL +10,
+    // DVRM +10, KECCAK +2, KECCAK_RND −18).
+    //
+    // 62_698 → 62_424 (−274): main's IS_WH (#1022), KECCAK 3_148 → 2_874 (IS_WH
+    // itself is not in the sum).
+    //
+    // 62_424 → 62_427 (+3): main's halt pin and preprocessed CPU timestamp
+    // (#1020, #1025), CPU −6 and REGISTER +9 (HALT is not in the sum).
     assert_eq!(
-        design_intermediate, 62_375,
+        design_intermediate, 62_427,
         "the design's intermediate-epoch budget no longer reproduces"
     );
     assert!(

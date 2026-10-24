@@ -283,7 +283,7 @@ use stark::traits::AIR;
 
 /// The tags, copied so the byte totals are exact. A drift here fails the
 /// measured arm below, which is where it should fail.
-const EPOCH_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_CONTINUATION_EPOCH_V1";
+const EPOCH_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_CONTINUATION_EPOCH_V2";
 const GLOBAL_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_CONTINUATION_GLOBAL_V1";
 /// `absorb_table_counts` writes one `u64` per sharded table kind.
 const TABLE_COUNT_WORDS: usize = 14;
@@ -392,6 +392,7 @@ fn continuation_transcript_counts(
             );
             let reg_fini = crate::tables::register::fini_from_trace(&traces.register);
             let table_counts = traces.table_counts();
+            let cpu_heights = crate::cpu_heights_from_traces(&traces);
             let public_output = traces.public_output_bytes.clone();
             // ⚠ `build_epoch_airs` eagerly computes the REGISTER preprocessed
             // commitment — a keccak Merkle build the multilinear verifier never
@@ -404,6 +405,7 @@ fn continuation_transcript_counts(
                 opts,
                 &[],
                 &table_counts,
+                &cpu_heights,
                 &prepared.register_init,
                 &reg_fini,
                 prepared.is_final,
