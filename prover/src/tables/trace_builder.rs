@@ -7294,6 +7294,17 @@ pub(crate) mod build_stamps {
         }
     }
 
+    /// Seconds since the build's start while it records, else `None`.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn since_start() -> Option<f64> {
+        if !ON.load(Ordering::Relaxed) {
+            return None;
+        }
+        LOG.lock()
+            .ok()
+            .and_then(|log| log.as_ref().map(|(t0, _)| t0.elapsed().as_secs_f64()))
+    }
+
     /// Stops recording and hands back the marks.
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn take() -> Vec<(String, f64)> {

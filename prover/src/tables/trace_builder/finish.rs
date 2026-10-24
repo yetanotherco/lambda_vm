@@ -2803,10 +2803,23 @@ fn emit_units(
 }
 
 /// A table built on the pool: its AIR position, its number among the rest's
-/// tables, its family, the bytes it was estimated at, and the table or its
-/// error.
+/// tables, its family, the bytes it was estimated at, the table or its error,
+/// and the seconds its job took.
 #[cfg(feature = "parallel")]
-type Built = (usize, usize, usize, usize, Result<Table, Error>);
+type Built = (usize, usize, usize, usize, Result<Table, Error>, f64);
+
+/// A family's tables built by [`emit_units_sliding`], for the build's marks:
+/// how many, when the first started and the last was built (seconds since the
+/// marks' start), their jobs' seconds summed and their bytes.
+#[cfg(feature = "parallel")]
+#[derive(Clone, Copy, Default)]
+struct FamilyBuild {
+    tables: usize,
+    first_started: Option<f64>,
+    last_built: f64,
+    busy: f64,
+    bytes: usize,
+}
 
 /// [`emit_streamed_units`]' loop without waves: each table starts building on
 /// the pool as soon as the gate admits its estimated bytes, while earlier ones
@@ -2839,6 +2852,7 @@ fn emit_units_sliding(
     // The estimated bytes of the tables building now.
     let mut building_bytes = 0usize;
     let mut units = units.into_iter().enumerate().peekable();
+    let mut families = [FamilyBuild::default(); FAMILIES.len()];
     rayon::in_place_scope_fifo(|scope| {
         loop {
             while let Some(table) = ready.get_mut(next_send).and_then(Option::take) {
@@ -2873,15 +2887,22 @@ fn emit_units_sliding(
                 match unit {
                     Unit::Streamed { .. } => ready[position] = Some(None),
                     Unit::Build { family, job, .. } => {
+                        if let Some(f) = families.get_mut(family)
+                            && f.first_started.is_none()
+                        {
+                            f.first_started = build_stamps::since_start();
+                        }
                         let (tx, number) = (tx.clone(), next_table);
                         scope.spawn_fifo(move |_| {
+                            let t = std::time::Instant::now();
                             let table = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
                                 .unwrap_or_else(|_| {
                                     Err(Error::Prover(format!(
                                         "the rest's table {number} panicked while building"
                                     )))
                                 });
-                            let _ = tx.send((position, number, family, est_now, table));
+                            let secs = t.elapsed().as_secs_f64();
+                            let _ = tx.send((position, number, family, est_now, table, secs));
                         });
                         next_table += 1;
                         building += 1;
@@ -2905,14 +2926,33 @@ fn emit_units_sliding(
                 rx.recv()
                     .map_err(|_| Error::Prover("the rest's builders stopped".into()))?
             };
-            let (position, number, family, est, table) = built;
+            let (position, number, family, est, table, secs) = built;
             building -= 1;
             building_bytes = building_bytes.saturating_sub(est);
             let table = table?;
             let bytes = table_bytes(&table);
             gate.resize(number, bytes);
             estimates.learn(family, &table, bytes);
+            if let Some(f) = families.get_mut(family) {
+                f.tables += 1;
+                f.last_built = build_stamps::since_start().unwrap_or(0.0);
+                f.busy += secs;
+                f.bytes += bytes;
+            }
             ready[position] = Some(Some(table));
+        }
+        // Each family's span, its jobs' seconds summed (threads busy) and its
+        // bytes: a measurement.
+        for (f, &(name, _)) in families.iter().zip(&FAMILIES) {
+            if let Some(first) = f.first_started {
+                build_stamps::mark(&format!(
+                    "p5 {name} {} built {first:.2}-{:.2} busy {:.2}s {:.2}GiB,",
+                    f.tables,
+                    f.last_built,
+                    f.busy,
+                    f.bytes as f64 / (1u64 << 30) as f64
+                ));
+            }
         }
         build_stamps::mark("p5 end");
         Ok(())
