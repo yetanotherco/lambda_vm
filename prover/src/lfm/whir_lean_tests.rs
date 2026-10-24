@@ -1,7 +1,9 @@
 //! Gates for the leaf's cheaper query check ([`LeafQuery::Lean`]) on Poseidon1
 //! chains: the tail rounds checked at every leaf once
-//! ([`ChainShape::tail_round`]) and round 0's values four a word
-//! ([`ChainShape::round0_packed`]), against the host's own proofs.
+//! ([`ChainShape::tail_round`]), round 0's values four a word
+//! ([`ChainShape::round0_packed`]) and the paths walked in three `Select`s a
+//! level on rotated hints ([`ChainShape::paths_rotated`]), against the host's
+//! own proofs.
 //!
 //! The fixtures are `whir_p1_leaf_tests`' small chains with enough queries that
 //! their last trees, lying wholly in their caps, take [`TAIL_QUERIES_A_LEAF`]
@@ -396,4 +398,72 @@ fn a_lean_chain_refuses_a_round_zero_lane_off() {
             }
         }
     }
+}
+
+/// ★ Under `Lean` every walked 4-ary level hints its siblings rotated on its
+/// `b1` (three `HintOn` rows) and places them with `walk4`'s three `Select`s,
+/// two fewer than the child-order walk; the socket rows stay the closed
+/// form's.
+#[test]
+fn a_lean_chain_walks_each_level_in_three_selects() {
+    use super::instr::Instr;
+    let count = |p: &super::compiler::LfmProgram, f: fn(&Instr) -> bool| {
+        p.instrs.iter().filter(|i| f(i)).count()
+    };
+    let entry = SpongeEntry::fresh_for(WrapHash::Poseidon1);
+    let mut cases = tail_cases();
+    cases.push(untailed());
+    let mut walked = 0;
+    for (num_vars, cfg) in cases {
+        let f = fixture(num_vars, cfg);
+        let shape = lean(&f.shape);
+        assert!(shape.paths_rotated() && !f.shape.paths_rotated());
+        let (v1, lean) = (p1_chain_program(&f.shape), p1_chain_program(&shape));
+        let hint_ons = count(&lean, |i| matches!(i, Instr::HintOn { .. }));
+        // A chain whose trees all lie in their caps walks no level.
+        assert_eq!(hint_ons % 3, 0, "S={num_vars}: three a walked level");
+        walked += hint_ons;
+        assert_eq!(count(&v1, |i| matches!(i, Instr::HintOn { .. })), 0);
+        if (0..shape.rounds()).all(|r| !shape.tail_round(r)) {
+            let selects = |p| count(p, |i| matches!(i, Instr::Select { .. }));
+            assert_eq!(
+                selects(&v1) - selects(&lean),
+                2 * hint_ons / 3,
+                "S={num_vars}: two Selects fewer a walked level"
+            );
+        }
+        assert_eq!(hash16_rows(&lean), chain_perms(&shape, entry));
+    }
+    assert!(walked > 0, "some case walks a level");
+}
+
+/// ★ A sibling one off in a lean arena (the first and the last word of round
+/// 0's first path) moves the walked root and has no execution.
+#[test]
+fn a_lean_chain_refuses_a_path_word_off() {
+    let mut tampered = 0;
+    for (num_vars, cfg) in tail_cases().into_iter().chain([untailed()]) {
+        let f = fixture(num_vars, cfg);
+        let shape = lean(&f.shape);
+        // Round 0's tree wholly in its cap walks no level.
+        if shape.current_path(0) == 0 {
+            continue;
+        }
+        tampered += 1;
+        let program = p1_chain_program(&shape);
+        let honest = arena_at(&f, &f.proof, &shape).expect("laid out");
+        assert!(execute(&program, &[honest.clone()], &SOCKET).is_ok());
+        let words = shape.round0_block_words(1usize << shape.schedule[0]);
+        let path = round0_block_at(&shape, 0) + words;
+        for at in [path, path + shape.current_path(0) - 1] {
+            let mut forged = honest.clone();
+            forged[at][2] += FE::from(1u64);
+            assert!(
+                execute(&program, &[forged], &SOCKET).is_err(),
+                "S={num_vars}: path word {} one off must be refused",
+                at - path
+            );
+        }
+    }
+    assert!(tampered > 0, "some case walks round 0");
 }

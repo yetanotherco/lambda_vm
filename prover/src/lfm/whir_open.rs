@@ -86,9 +86,17 @@
 //! committer's zero fill is another leaf, which the root refuses. The
 //! obligation above holds unchanged: the felts folded are the unpacked lanes of
 //! the words hashed.
+//!
+//! Its paths stay in the arena in the proof's child order until their walk,
+//! which hints each level's siblings in hint order — the executor picks the
+//! word on the level's `b1` (`Instr::HintOn`) — and places them with
+//! [`super::p1w16_emit::walk4`]'s three `Select`s ([`Siblings::Rotated`]).
+//! Which word a hint reads is witness: every placement is still a `Select` on
+//! an index bit, so the node hashed is the one the index names.
 
 use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
 use super::edsl::{self, WrapDigest};
+use super::instr::ArenaId;
 
 /// Base felts a cubic extension element decomposes to.
 const FELTS_PER_EXT: usize = 3;
@@ -303,6 +311,19 @@ pub fn emit_verify_opening(
 /// the tree's root, and its one entry point walks, muxes and compares.
 pub use super::merkle_cap::CapCells;
 
+/// An opening's authentication path as the leaf takes it.
+#[derive(Clone, Copy)]
+pub enum Siblings<'a> {
+    /// Hinted with the round's other wires, in the proof's child order
+    /// ([`super::p1w16_emit::walk4_child`] at arity 4).
+    Child(&'a [WrapDigest]),
+    /// Left in `arena` from word `at`, in the proof's child order, and hinted
+    /// at the walk in hint order (`LeafQuery::Lean`,
+    /// [`super::p1w16_emit::hint_path_rotated`]) for
+    /// [`super::p1w16_emit::walk4`]'s three `Select`s a level. Arity 4 only.
+    Rotated { arena: ArenaId, at: u32 },
+}
+
 /// How one tree's openings are authenticated in-guest: against its root
 /// lanes (no cap — today's emission, instruction for instruction), or
 /// against its authenticated [`CapCells`].
@@ -331,15 +352,40 @@ impl TreeAuth {
         b: &mut LfmBuilder,
         values: BlockValues<'_>,
         index_bits: &[Bit],
-        siblings: &[WrapDigest],
+        siblings: Siblings<'_>,
     ) {
-        match self {
-            TreeAuth::Root(lanes) => emit_verify_opening(b, values, index_bits, siblings, lanes),
-            TreeAuth::Cap(cap) => {
+        if let Siblings::Rotated { .. } = siblings {
+            assert_eq!(b.wrap_hash().arity(), 4, "a rotated path is 4-ary");
+        }
+        match (self, siblings) {
+            (TreeAuth::Root(lanes), Siblings::Child(siblings)) => {
+                emit_verify_opening(b, values, index_bits, siblings, lanes)
+            }
+            (TreeAuth::Root(lanes), Siblings::Rotated { arena, at }) => {
+                let leaf = emit_block_leaf(b, values);
+                let hints = super::p1w16_emit::hint_path_rotated(b, arena, at, index_bits);
+                let walked = super::p1w16_emit::walk4(b, leaf, index_bits, &hints);
+                edsl::assert_digest_eq_lanes(b, walked, std::slice::from_ref(lanes));
+            }
+            (TreeAuth::Cap(cap), siblings) => {
                 // The cap checks the path's length against the index and its
                 // height at the builder's arity.
                 let leaf = emit_block_leaf(b, values);
-                cap.verify_path_child(b, leaf, index_bits, siblings);
+                match siblings {
+                    Siblings::Child(siblings) => {
+                        cap.verify_path_child(b, leaf, index_bits, siblings)
+                    }
+                    Siblings::Rotated { arena, at } => {
+                        let walked = index_bits.len().saturating_sub(cap.mux_bits());
+                        let hints = super::p1w16_emit::hint_path_rotated(
+                            b,
+                            arena,
+                            at,
+                            &index_bits[..walked],
+                        );
+                        cap.verify_path(b, leaf, index_bits, &hints);
+                    }
+                }
             }
         }
     }

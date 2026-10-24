@@ -9,7 +9,7 @@ use crypto::hash::{poseidon1_w8, poseidon1_w16};
 use super::builder::{Felt, LfmBuilder};
 use super::compiler::compile;
 use super::edsl::WrapDigest;
-use super::executor::execute_serial;
+use super::executor::{execute, execute_serial};
 use super::hash::HasherKind;
 use super::p1w16_emit::*;
 use super::word::{LfmWord, base_word};
@@ -145,6 +145,115 @@ fn the_walk_and_the_tree_reach_merkle4s_root() {
             root.to_vec(),
             "tree, depth {depth}"
         );
+    }
+}
+
+/// ZisK's path for a leaf in the WHIR leaf arena's CHILD order: per level its
+/// three siblings as listed, at an odd top only the partner (the first).
+fn child_order_path(depth: usize, path: &[[FE; zisk::SIBLING_FELTS]]) -> Vec<LfmWord> {
+    let triples = sibling_triples(path);
+    let mut words = Vec::new();
+    for (level, t) in triples.iter().enumerate() {
+        if depth % 2 == 1 && level + 1 == triples.len() {
+            words.push(t[0]);
+        } else {
+            words.extend_from_slice(t);
+        }
+    }
+    words
+}
+
+/// A 4-ary walk over a path held in child order and hinted by `hint`: the
+/// leaf, the index's bits, then `walk4`; the program and the walked root.
+fn rotated_walk(
+    depth: usize,
+    index: usize,
+    leaf: LfmWord,
+    path: Vec<LfmWord>,
+    hint: impl Fn(&mut LfmBuilder, super::instr::ArenaId, &[super::builder::Bit]) -> Vec<WrapDigest>,
+) -> (super::compiler::LfmProgram, Vec<FE>) {
+    let mut b = LfmBuilder::new();
+    let a_leaf = b.declare_arena(1);
+    let a_idx = b.declare_arena(1);
+    let a_path = b.declare_arena(path.len() as u32);
+    let leaf_cell = WrapDigest::from_cell(b.hint_word(a_leaf, 0));
+    let idx = b.hint_felt(a_idx, 0);
+    let bits = b.bit_dec(idx, depth);
+    let hints = hint(&mut b, a_path, &bits);
+    let walked = walk4(&mut b, leaf_cell, &bits, &hints);
+    b.public(walked.cells()[0]);
+    let program = compile(b.finish());
+    super::validator::validate(&program).expect("admissible");
+    let arenas = [vec![leaf], vec![base_word(FE::from(index as u64))], path];
+    let serial = execute_serial(&program, &arenas, &HasherKind::Poseidon1W16).expect("executes");
+    let levels = execute(&program, &arenas, &HasherKind::Poseidon1W16).expect("executes");
+    assert_eq!(serial.public_words, levels.public_words, "both schedules");
+    let root = serial.public_words.iter().flat_map(|(_, w)| *w).collect();
+    (program, root)
+}
+
+/// ★ The executor's rotation turns a child-order path into `walk4`'s hint
+/// order: every leaf of trees of even and odd depth reaches `Merkle4`'s root
+/// with three `Select`s a full level (one at an odd top), and with the
+/// rotation swapped (`alt` on a clear bit) no leaf below a full level does.
+#[test]
+fn the_rotated_hints_walk_a_child_order_path_to_merkle4s_root() {
+    let count = |p: &super::compiler::LfmProgram, f: fn(&super::instr::Instr) -> bool| {
+        p.instrs.iter().filter(|i| f(i)).count()
+    };
+    for depth in 0usize..=5 {
+        let n = 1usize << depth;
+        let leaves: Vec<[FE; 4]> = (0..n).map(|i| digest(depth as u64 + 31, i)).collect();
+        let tree = Merkle4::new(&leaves).expect("non-empty");
+        let root = tree.root().to_vec();
+        for index in 0..n {
+            let path = child_order_path(depth, &tree.path(index).expect("leaf"));
+            assert_eq!(path.len(), path_hints(depth));
+            let (program, got) =
+                rotated_walk(depth, index, leaves[index], path.clone(), |b, a, bits| {
+                    hint_path_rotated(b, a, 0, bits)
+                });
+            assert_eq!(got, root, "depth {depth} index {index}");
+            assert_eq!(
+                count(&program, |i| matches!(
+                    i,
+                    super::instr::Instr::Select { .. }
+                )),
+                path_hints(depth),
+                "three Selects a full level, one at an odd top"
+            );
+            assert_eq!(
+                count(&program, |i| matches!(
+                    i,
+                    super::instr::Instr::HintOn { .. }
+                )),
+                3 * (depth / 2)
+            );
+            // Swapped: each hint reads `alt` on a clear bit and `index` on a set
+            // one.
+            let (_, swapped) = rotated_walk(depth, index, leaves[index], path, |b, a, bits| {
+                let mut hints = Vec::new();
+                let mut w = 0u32;
+                for pair in bits.chunks(2) {
+                    if let [_, b1] = pair {
+                        for k in 0..3 {
+                            let c = b.hint_word_on(a, w + (k + 2) % 3, *b1, w + k);
+                            hints.push(WrapDigest::from_cell(c));
+                        }
+                        w += 3;
+                    } else {
+                        hints.push(WrapDigest::from_cell(b.hint_word(a, w)));
+                    }
+                }
+                hints
+            });
+            if depth >= 2 {
+                assert_ne!(
+                    swapped, root,
+                    "depth {depth} index {index}: the rotation is read"
+                );
+            }
+        }
     }
 }
 

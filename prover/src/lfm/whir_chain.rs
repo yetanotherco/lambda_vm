@@ -95,8 +95,8 @@ use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
 use super::edsl::WrapDigest;
 use super::whir_fold::{FoldEmission, RoundFold, fold_rows_for, lean_prepare_rows};
 use super::whir_open::{
-    BlockValues, CapCells, TreeAuth, cap_check_perms, cap_check_rows, verify_opening_perms_capped,
-    verify_opening_rows_capped,
+    BlockValues, CapCells, Siblings, TreeAuth, cap_check_perms, cap_check_rows,
+    verify_opening_perms_capped, verify_opening_rows_capped,
 };
 use super::whir_poly::{
     emit_eq_eval, emit_sumcheck_round, eq_eval_rows_again, sumcheck_round_rows,
@@ -113,7 +113,7 @@ pub(crate) const SUMCHECK_DEGREE: usize = 2;
 /// path.
 pub struct QueryOpening<'a> {
     pub values: BlockValues<'a>,
-    pub siblings: &'a [WrapDigest],
+    pub siblings: Siblings<'a>,
 }
 
 /// A round's nonce wires, one per slot the arena carries
@@ -299,6 +299,14 @@ impl ChainShape {
     /// ([`LeafQuery::Lean`] on a 4-ary tree): hashed as the leaf hash's rate
     /// words and unpacked into the felts the fold reads.
     pub fn round0_packed(&self) -> bool {
+        self.query == LeafQuery::Lean && self.arity == 4
+    }
+
+    /// Whether the openings' paths stay in the arena until their walk, which
+    /// hints each 4-ary level's siblings in hint order on its `b1` bit and
+    /// places them with three `Select`s ([`LeafQuery::Lean`] on a 4-ary tree,
+    /// [`Siblings::Rotated`]). The arena keeps the proof's child order.
+    pub fn paths_rotated(&self) -> bool {
         self.query == LeafQuery::Lean && self.arity == 4
     }
 
@@ -1729,6 +1737,30 @@ pub fn chain_shape_rows(shape: &ChainShape) -> usize {
 // Nothing about them changed but their visibility and `round_words` losing an
 // `impl` block: the chain suite is the control that says so.
 
+/// An opening's path as [`RoundStorage`] holds it.
+enum PathStore {
+    /// Hinted with the round's other wires, in the proof's child order.
+    Hinted(Vec<WrapDigest>),
+    /// Left in the arena from word `at`, for its walk to hint
+    /// ([`ChainShape::paths_rotated`]).
+    Arena {
+        arena: super::instr::ArenaId,
+        at: u32,
+    },
+}
+
+impl PathStore {
+    fn siblings(&self) -> Siblings<'_> {
+        match self {
+            PathStore::Hinted(path) => Siblings::Child(path),
+            PathStore::Arena { arena, at } => Siblings::Rotated {
+                arena: *arena,
+                at: *at,
+            },
+        }
+    }
+}
+
 /// A current block's wires, in the field its round holds them in.
 pub enum CurrentBlock {
     Base(Vec<Felt>),
@@ -1761,8 +1793,8 @@ impl CurrentBlock {
 pub struct RoundStorage {
     shape: ChainShape,
     sumchecks: Vec<Vec<Vec<Ext>>>,
-    currents: Vec<Vec<(CurrentBlock, Vec<WrapDigest>)>>,
-    nexts: Vec<Vec<(Vec<Ext>, Vec<WrapDigest>)>>,
+    currents: Vec<Vec<(CurrentBlock, PathStore)>>,
+    nexts: Vec<Vec<(Vec<Ext>, PathStore)>>,
     roots: Vec<Option<super::builder::Cell>>,
     oods: Vec<Option<Ext>>,
     nonces: Vec<RoundNonces>,
@@ -1788,8 +1820,8 @@ impl RoundStorage {
         shape: &ChainShape,
     ) -> Self {
         let mut sumchecks: Vec<Vec<Vec<Ext>>> = Vec::new();
-        let mut currents: Vec<Vec<(CurrentBlock, Vec<WrapDigest>)>> = Vec::new();
-        let mut nexts: Vec<Vec<(Vec<Ext>, Vec<WrapDigest>)>> = Vec::new();
+        let mut currents: Vec<Vec<(CurrentBlock, PathStore)>> = Vec::new();
+        let mut nexts: Vec<Vec<(Vec<Ext>, PathStore)>> = Vec::new();
         let mut roots: Vec<Option<super::builder::Cell>> = Vec::new();
         let mut oods: Vec<Option<Ext>> = Vec::new();
         let mut nonces: Vec<RoundNonces> = Vec::new();
@@ -1802,6 +1834,20 @@ impl RoundStorage {
                 let cell = b.hint_word(arena, *at);
                 *at += 1;
                 cell
+            };
+            // A path of `words` words: hinted now, or left for its walk.
+            let next_path = |b: &mut LfmBuilder, at: &mut u32, words: usize| {
+                if shape.paths_rotated() {
+                    let path = PathStore::Arena { arena, at: *at };
+                    *at += words as u32;
+                    path
+                } else {
+                    PathStore::Hinted(
+                        (0..words)
+                            .map(|_| WrapDigest::from_cell(next_word(b, at)))
+                            .collect(),
+                    )
+                }
             };
             let k = shape.schedule[r];
             let sumcheck: Vec<Vec<Ext>> = (0..shape.messages(r))
@@ -1842,7 +1888,7 @@ impl RoundStorage {
             } else {
                 shape.num_queries * shape.trees_at(r)
             };
-            let current: Vec<(CurrentBlock, Vec<WrapDigest>)> = (0..openings)
+            let current: Vec<(CurrentBlock, PathStore)> = (0..openings)
                 .map(|_| {
                     let values = if r == 0 && shape.round0_packed() {
                         // Four values a word: the leaf hash takes the words,
@@ -1870,12 +1916,10 @@ impl RoundStorage {
                             (0..block).map(|_| next_word(b, &mut at).as_ext()).collect(),
                         )
                     };
-                    let path: Vec<WrapDigest> = if shape.tail_round(r) {
-                        Vec::new()
+                    let path = if shape.tail_round(r) {
+                        PathStore::Hinted(Vec::new())
                     } else {
-                        (0..depth)
-                            .map(|_| WrapDigest::from_cell(next_word(b, &mut at)))
-                            .collect()
+                        next_path(b, &mut at, depth)
                     };
                     (values, path)
                 })
@@ -1898,14 +1942,12 @@ impl RoundStorage {
                     } else {
                         shape.num_queries
                     };
-                    let next: Vec<(Vec<Ext>, Vec<WrapDigest>)> = (0..next_openings)
+                    let next: Vec<(Vec<Ext>, PathStore)> = (0..next_openings)
                         .map(|_| {
                             let values: Vec<Ext> = (0..next_block)
                                 .map(|_| next_word(b, &mut at).as_ext())
                                 .collect();
-                            let path: Vec<WrapDigest> = (0..next_depth)
-                                .map(|_| WrapDigest::from_cell(next_word(b, &mut at)))
-                                .collect();
+                            let path = next_path(b, &mut at, next_depth);
                             (values, path)
                         })
                         .collect();
@@ -1957,7 +1999,7 @@ impl RoundStorage {
                     .iter()
                     .map(|(values, path)| QueryOpening {
                         values: values.as_block(),
-                        siblings: path,
+                        siblings: path.siblings(),
                     })
                     .collect()
             })
@@ -1970,7 +2012,7 @@ impl RoundStorage {
                     .iter()
                     .map(|(values, path)| QueryOpening {
                         values: BlockValues::Ext(values),
-                        siblings: path,
+                        siblings: path.siblings(),
                     })
                     .collect()
             })

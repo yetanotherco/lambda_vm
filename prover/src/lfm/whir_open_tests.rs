@@ -600,7 +600,12 @@ fn capped_program(depth: usize, c: usize, n: usize) -> LfmProgram {
             .collect();
         let index = b.hint_felt(arena, at + (block + depth - c) as u32);
         let bits = b.bit_dec(index, depth);
-        tree.verify_opening(&mut b, BlockValues::Ext(&values), &bits, &siblings);
+        tree.verify_opening(
+            &mut b,
+            BlockValues::Ext(&values),
+            &bits,
+            super::whir_open::Siblings::Child(&siblings),
+        );
     }
     b.public(root);
     let program = compile(b.finish());

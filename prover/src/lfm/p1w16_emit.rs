@@ -35,12 +35,19 @@
 //! proof carries them, and spends two more `Select`s a full level placing
 //! them: its arena needs no leaf index (the WHIR leaf's, whose arena is filled
 //! from the proof alone).
+//!
+//! [`hint_path_rotated`] keeps the arena in child order and [`walk4`]'s three
+//! `Select`s: the EXECUTOR reads each level's hints in hint order, choosing the
+//! arena word on the level's `b1` (`Instr::Hint`'s alternative index). Which
+//! word a hint reads is witness, so this binds nothing the walk's `Select`s do
+//! not.
 
 use crate::tables::types::FE;
 use crypto::hash::poseidon1_w8 as w8;
 
 use super::builder::{Bit, Cell, Felt, LfmBuilder};
 use super::edsl::WrapDigest;
+use super::instr::ArenaId;
 
 /// Felts of rate in one width-16 block.
 pub const RATE_FELTS: usize = 12;
@@ -246,6 +253,38 @@ pub fn tree_root4(b: &mut LfmBuilder, leaves: &[WrapDigest]) -> WrapDigest {
             .collect();
     }
     WrapDigest::from_cell(level[0])
+}
+
+/// Hints a 4-ary path that `arena` holds in CHILD order from word `at` (as the
+/// proof carries it, [`walk4_child`]'s layout) in [`hint_order`], for
+/// [`walk4`] over `bits`: per full level the executor reads the siblings
+/// `(s0, s1, s2)` when the level's `b1` is 0 and `(s2, s0, s1)` when it is 1
+/// (the partner, then the other pair); at an odd top the one word, the
+/// partner either way. The bits must be written before the hints.
+pub fn hint_path_rotated(
+    b: &mut LfmBuilder,
+    arena: ArenaId,
+    at: u32,
+    bits: &[Bit],
+) -> Vec<WrapDigest> {
+    let mut hints = Vec::with_capacity(path_hints(bits.len()));
+    let mut word = at;
+    for pair in bits.chunks(2) {
+        match pair {
+            [_, b1] => {
+                for k in 0..3 {
+                    let cell = b.hint_word_on(arena, word + k, *b1, word + (k + 2) % 3);
+                    hints.push(WrapDigest::from_cell(cell));
+                }
+                word += 3;
+            }
+            _ => {
+                hints.push(WrapDigest::from_cell(b.hint_word(arena, word)));
+                word += 1;
+            }
+        }
+    }
+    hints
 }
 
 /// Host side: ZisK's path for leaf `index` (per level, its three siblings in

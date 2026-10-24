@@ -163,6 +163,11 @@ impl CapCells {
         self.height
     }
 
+    /// Index bits the cap node's mux reads: an opening walks the others.
+    pub fn mux_bits(&self) -> usize {
+        self.mux_bits
+    }
+
     /// ★ Authenticate EVERY leaf of a tree that lies wholly in this cap (no
     /// level walked: the cap is the leaf level), as a REFUSAL: leaf `j`'s
     /// digest must equal cap node `j`, which is what [`Self::verify_path`]
