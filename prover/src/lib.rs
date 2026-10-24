@@ -1092,6 +1092,30 @@ impl VmAirs {
         pairs
     }
 
+    /// Refuses a table set whose CPU tables are not where [`cpu_proof_start`]
+    /// reads their heights for `table_counts`: a verifier takes each CPU table's
+    /// height, and so its timestamp base and the final PC timestamp, at that
+    /// position, so the two must agree in every build, not only under
+    /// `debug_assert`.
+    pub(crate) fn check_cpu_position(&self, table_counts: &TableCounts) -> Result<(), Error> {
+        let refs = self.air_refs();
+        let start = cpu_proof_start(self.include_halt, table_counts);
+        let in_place = self.cpus.len() == table_counts.cpu
+            && start
+                .checked_add(self.cpus.len())
+                .is_some_and(|end| end <= refs.len())
+            && self.cpus.iter().enumerate().all(|(k, cpu)| {
+                std::ptr::addr_eq(refs[start + k] as *const _, cpu.as_ref() as *const _)
+            });
+        if in_place {
+            Ok(())
+        } else {
+            Err(Error::InvalidTableCounts(format!(
+                "the CPU tables are not at sub-proof {start}, where their heights are read"
+            )))
+        }
+    }
+
     /// Collect AIR references for [`Verifier::multi_verify`].
     pub fn air_refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
@@ -2106,6 +2130,8 @@ fn verify_proof_parts(
         page_commitments,
         RegisterFiles::halted(proof_options, program.entry_point, committed_bytes).preprocessed(),
     );
+    // The CPU heights were read at `cpu_proof_start`: the tables must be there.
+    airs.check_cpu_position(table_counts)?;
 
     // Recompute the COMMIT output bus offset from the public output.
     // If public_output was tampered, the recomputed offset won't match the

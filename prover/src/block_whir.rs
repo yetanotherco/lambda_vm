@@ -5687,6 +5687,8 @@ pub(crate) fn block_frame(
         statement.table_counts,
         &inputs,
     );
+    // The CPU heights were read at `cpu_proof_start`: the tables must be there.
+    airs.check_cpu_position(statement.table_counts)?;
     let air_refs = airs.air_refs();
     if air_refs.len() != num_tables {
         return Err(Error::InvalidTableCounts(format!(

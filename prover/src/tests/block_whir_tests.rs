@@ -2640,6 +2640,40 @@ fn a_restated_table_height_is_refused() {
     assert!(!verify(&proof, &elf, &one_group()));
 }
 
+/// ⛔ A CPU table's stated height is what its timestamp base and the final PC
+/// timestamp are built from: restated (and so absorbed again by the verifier,
+/// the statement re-bound), within every bound, a full CPU table halved or the
+/// last one doubled, the proof is refused; past the block's 2^21 cap it is
+/// refused before anything is built.
+#[test]
+fn a_restated_cpu_table_height_is_refused() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let honest = prove(&elf, &format, &options(MaxRowsConfig::small(), 16));
+    assert!(verify(&honest, &elf, &format));
+    let start = crate::cpu_proof_start(true, &honest.table_counts);
+    let cpus = honest.table_counts.cpu;
+    assert!(cpus >= 2, "{cpus} CPU tables");
+    let last = start + cpus - 1;
+    for (what, at, vars) in [
+        (
+            "a full table halved",
+            start,
+            honest.table_num_vars[start] - 1,
+        ),
+        (
+            "the last table doubled",
+            last,
+            honest.table_num_vars[last] + 1,
+        ),
+        ("a table past the block's cap", start, 22),
+    ] {
+        let mut restated = honest.clone();
+        restated.table_num_vars[at] = vars;
+        assert!(!verify(&restated, &elf, &format), "{what}: accepted");
+    }
+}
+
 /// A root the layouts do not claim is refused before anything is drawn.
 #[test]
 fn an_extra_root_is_refused() {

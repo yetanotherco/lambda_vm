@@ -1085,7 +1085,7 @@ fn walk_cpu_ops<const REST: bool>(
         // Collect register operations (M1, M3, M5)
         collect_register_ops_from_cpu(op, register_state, memw);
 
-        // The `write` syscall: the COPY chip receives the ECALL, reads the operand
+        // The commit syscall (ecall 64): the COPY chip receives the ECALL, reads the operand
         // registers, advances x254 and moves the bytes into the COMMIT domain.
         if op.ecall_commit() {
             let index = u64::from(current_commit_index);
@@ -4331,7 +4331,7 @@ pub struct Traces {
     pub halt: TraceTable<GoldilocksField, GoldilocksExtension>,
 
     /// Unified COPY tables: one streaming copy primitive for memcpy/memmove,
-    /// memset and the `write` syscall's bytes, selected by decoded functionality
+    /// memset and the commit syscall's bytes, selected by decoded functionality
     /// columns. Empty when the run neither commits nor copies; a block proof cuts
     /// the rows into tables of a fixed height (`block_whir::split_copy`).
     pub copies: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,

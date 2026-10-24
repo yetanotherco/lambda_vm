@@ -630,10 +630,9 @@ fn the_block_register_sends_the_final_pc_token_at_its_clocks_end() {
     use crate::tables::register;
 
     let opts = stark::proof::options::ProofOptions::default_test_options();
-    let program = executor::elf::Elf::load(&crate::test_utils::asm_elf_bytes(
-        "all_instructions_64",
-    ))
-    .expect("the ELF loads");
+    let program =
+        executor::elf::Elf::load(&crate::test_utils::asm_elf_bytes("all_instructions_64"))
+            .expect("the ELF loads");
     let stale = messages_at_a_row(&register::bus_interactions(0));
     let mut seen = Vec::new();
     for heights in [vec![16, 8, 4], vec![1 << 21, 4]] {
@@ -653,8 +652,50 @@ fn the_block_register_sends_the_final_pc_token_at_its_clocks_end() {
             messages_at_a_row(&register::bus_interactions(final_pc_timestamp(rows))),
             "{heights:?}: REGISTER sends another final PC timestamp than its CPU tables end at"
         );
-        assert_ne!(sent, stale, "{heights:?}: REGISTER sends the final PC token at 0");
+        assert_ne!(
+            sent, stale,
+            "{heights:?}: REGISTER sends the final PC token at 0"
+        );
         seen.push(sent);
     }
-    assert_ne!(seen[0], seen[1], "two blocks' REGISTERs send one final PC timestamp");
+    assert_ne!(
+        seen[0], seen[1],
+        "two blocks' REGISTERs send one final PC timestamp"
+    );
+}
+
+/// ⛔ The CPU tables' position is checked in every build, not only under
+/// `debug_assert`: a table set read with counts that place the CPU tables
+/// elsewhere (one more COPY table, one fewer CPU table, or HALT counted) is
+/// refused with an error, and the counts it was built from pass.
+#[test]
+fn the_cpu_tables_are_refused_where_their_heights_are_not_read() {
+    let opts = stark::proof::options::ProofOptions::default_test_options();
+    let program =
+        executor::elf::Elf::load(&crate::test_utils::asm_elf_bytes("all_instructions_64"))
+            .expect("the ELF loads");
+    let counts = cpu_only_counts(2);
+    let inputs =
+        crate::BlockAirInputs::new(&opts, &program, vec![8, 4], &[]).expect("honest heights");
+    let airs = crate::block_airs(&program, &opts, &[], &counts, &inputs);
+    assert!(airs.check_cpu_position(&counts).is_ok());
+    let mut shifted = counts.clone();
+    shifted.copy = 1;
+    let mut fewer = counts.clone();
+    fewer.cpu = 1;
+    let mut wider = counts.clone();
+    wider.blake3 = 1;
+    for (what, other) in [
+        ("a COPY table", shifted),
+        ("one CPU table", fewer),
+        ("BLAKE3", wider),
+    ] {
+        assert!(
+            matches!(
+                airs.check_cpu_position(&other),
+                Err(crate::Error::InvalidTableCounts(_))
+            ),
+            "counts with {what} read the CPU tables where they are not"
+        );
+    }
 }

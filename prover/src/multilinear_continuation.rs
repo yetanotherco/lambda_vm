@@ -3006,6 +3006,8 @@ where
     // ★ THE SAME DERIVATION THE LEVEL-0 DRIVER USES. `None` is this side's
     // answer for DECODE's preprocessed commitment, unchanged.
     let air_set = epoch_airs_for(elf, opts, epoch, register_init, is_final, label, None);
+    // The CPU heights were read at `cpu_proof_start`: the tables must be there.
+    air_set.airs.check_cpu_position(&epoch.table_counts)?;
     let air_refs = air_set.refs();
     // By NAME, and exactly one — the same rule the prover applied.
     let decode_at = decode_table_index(&air_refs)?;

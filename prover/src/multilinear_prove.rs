@@ -536,6 +536,8 @@ pub fn verify_with_options(
         &proof.table_counts,
         &inputs,
     );
+    // The CPU heights were read at `cpu_proof_start`: the tables must be there.
+    airs.check_cpu_position(&proof.table_counts)?;
     let air_refs = airs.air_refs();
     if air_refs.len() != proof.proof.tables.len() {
         return Err(Error::InvalidTableCounts(format!(

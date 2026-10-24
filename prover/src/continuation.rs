@@ -2107,6 +2107,10 @@ pub(crate) fn reconstruct_epoch_airs(
         is_final,
         decode_commitment,
     );
+    // The CPU heights were read at `cpu_proof_start`: the tables must be there.
+    if airs.check_cpu_position(&table_counts).is_err() {
+        return Ok(None);
+    }
     let l2g_air = Box::new(l2g_memory_air(opts, label))
         as Box<dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>>;
     Ok(Some(EpochReconstruction {
