@@ -1141,6 +1141,7 @@ fn held_as_records_the_finishs_keccak_rnd_tables_are_its_tables() {
                                     );
                                     ops.len()
                                 }
+                                other => panic!("{what}: KECCAK_RND at {k} held as {other:?}"),
                             };
                             assert_eq!(records.bytes(), 208 * ops, "{what}: 208 B an op");
                             held += 1;

@@ -17,6 +17,77 @@ use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use crate::Result;
 use crate::device::{DeviceReservation, alloc_or_trim, backend};
 
+/// `LAMBDA_VM_CARD_UPLOAD_TIMES=1`: each packed table's copy and widen, and
+/// each records table's copy and fill, in a group's upload is timed by events
+/// on its stream and summed ([`upload_kernel_times`]). Read once; unset, no
+/// event is made. A measurement; the store is the same.
+fn timed_uploads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LAMBDA_VM_CARD_UPLOAD_TIMES").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The tables timed and their summed nanoseconds: packed (copy and widen),
+/// records (copy and fill).
+static WIDEN_TABLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WIDEN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FILL_TABLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FILL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Under `LAMBDA_VM_CARD_UPLOAD_TIMES=1`, the tables whose upload was timed
+/// since the process started and their card seconds:
+/// `((packed tables, copy and widen s), (records tables, copy and fill s))`.
+/// Zeros otherwise.
+pub fn upload_kernel_times() -> ((u64, f64), (u64, f64)) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = |ns: &std::sync::atomic::AtomicU64| ns.load(Relaxed) as f64 * 1e-9;
+    (
+        (WIDEN_TABLES.load(Relaxed), s(&WIDEN_NS)),
+        (FILL_TABLES.load(Relaxed), s(&FILL_NS)),
+    )
+}
+
+/// One table's upload timed on its stream: the events either side of it.
+struct TableClock {
+    records: bool,
+    start: cudarc::driver::CudaEvent,
+    done: cudarc::driver::CudaEvent,
+}
+
+impl TableClock {
+    /// Events on `stream`, the first recorded now; `None` when uploads are not
+    /// timed or an event cannot be made.
+    fn start(stream: &Arc<CudaStream>, records: bool) -> Option<Self> {
+        if !timed_uploads() {
+            return None;
+        }
+        let flags = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+        let ctx = stream.context();
+        let clock = Self {
+            records,
+            start: ctx.new_event(flags).ok()?,
+            done: ctx.new_event(flags).ok()?,
+        };
+        clock.start.record(stream).ok()?;
+        Some(clock)
+    }
+
+    /// Adds the span to the totals, once the stream ran it.
+    fn add(self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Ok(ms) = self.start.elapsed_ms(&self.done) else {
+            return;
+        };
+        let ns = (f64::from(ms) * 1e6) as u64;
+        let (tables, total) = if self.records {
+            (&FILL_TABLES, &FILL_NS)
+        } else {
+            (&WIDEN_TABLES, &WIDEN_NS)
+        };
+        tables.fetch_add(1, Relaxed);
+        total.fetch_add(ns, Relaxed);
+    }
+}
+
 /// Where a set of columns is: still here, or already there.
 pub enum Columns<'a> {
     Host(&'a [&'a [u64]]),
@@ -163,6 +234,8 @@ impl DeviceColumns {
         let mut buffer = unsafe { alloc_or_trim::<u64>(&stream, total) }.ok()?;
         let mut spans = Vec::new();
         let mut at = 0usize;
+        let mut checks = crate::fill::FillChecks::default();
+        let mut clocks = Vec::new();
         for table in tables {
             match table {
                 TableUpload::Wide(columns) => {
@@ -176,23 +249,38 @@ impl DeviceColumns {
                 TableUpload::Narrow(packed) => {
                     let (rows, cols) = (packed.rows(), packed.cols());
                     let mut slab = buffer.slice_mut(at..at + rows * cols);
+                    let clock = TableClock::start(&stream, false);
                     crate::narrow::widen_col_major_into(
                         &stream, be, *packed, rows, cols, &mut slab,
                     )
                     .ok()?;
+                    clocks.extend(clock.filter(|c| c.done.record(&stream).is_ok()));
                     spans.extend((0..cols).map(|k| (at + k * rows, rows)));
                     at += rows * cols;
                 }
                 TableUpload::Records(records) => {
                     let (rows, cols) = (records.rows(), records.cols());
                     let mut slab = buffer.slice_mut(at..at + rows * cols);
-                    crate::fill::fill_col_major_into(&stream, *records, &mut slab).ok()?;
+                    let clock = TableClock::start(&stream, true);
+                    crate::fill::fill_col_major_into(&stream, *records, &mut slab, &mut checks)
+                        .ok()?;
+                    clocks.extend(clock.filter(|c| c.done.record(&stream).is_ok()));
                     spans.extend((0..cols).map(|k| (at + k * rows, rows)));
                     at += rows * cols;
                 }
             }
         }
         stream.synchronize().ok()?;
+        clocks.into_iter().for_each(TableClock::add);
+        // A fill whose records it refused (a CPU log at a pc with no DECODE
+        // row): the card declines the group, and its readers take the host's
+        // columns. The host fill refuses the same log, so that table reads as
+        // no columns and the proof is one the verifier refuses. An honest run
+        // never gets here: the walk refused such a log before any chunk.
+        if !checks.passed(&stream).ok()? {
+            crate::device::note_device_fallback();
+            return None;
+        }
         Some(Self {
             stream,
             buffer: Arc::new(buffer),

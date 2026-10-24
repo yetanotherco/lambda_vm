@@ -306,6 +306,8 @@ pub struct CardDecode {
     entries: CudaSlice<DecodeEntryC>,
     runs: CudaSlice<DecodeRunC>,
     nruns: u32,
+    /// What [`Self::resident`] promised the backend for it.
+    _room: Option<crate::device::DeviceReservation>,
 }
 
 impl CardDecode {
@@ -338,7 +340,26 @@ impl CardDecode {
             entries: stream.clone_htod(entries)?,
             runs: stream.clone_htod(runs)?,
             nruns,
+            _room: None,
         })
+    }
+
+    /// [`Self::upload`] for every stream's use, under a promise of its bytes
+    /// to the backend held as long as it is: uploaded on a stream of the pool
+    /// and waited for, so a fill on any stream reads it. Refused when the
+    /// backend declines the room.
+    pub fn resident(entries: &[DecodeEntryC], runs: &[DecodeRunC]) -> Result<Self> {
+        let be = backend()?;
+        let bytes = (size_of_val(entries) + size_of_val(runs)) as u64;
+        let Some(room) = be.reserve(bytes) else {
+            crate::device::note_device_fallback();
+            return Err(crate::invalid_value());
+        };
+        let stream = be.next_stream();
+        let mut decode = Self::upload(&stream, entries, runs)?;
+        stream.synchronize()?;
+        decode._room = Some(room);
+        Ok(decode)
     }
 }
 
@@ -453,7 +474,7 @@ fn launch_keccak_rnd<T: DeviceRepr>(
 
 /// A table's records as they go up for the card to fill its columns from
 /// them ([`crate::columns::TableUpload::Records`]).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub enum RecordsInput<'a> {
     /// KECCAK_RND's rows `[skip, skip + rows)` of the table `ops` make, 24
     /// rows an op; rows past the last op zero.
@@ -462,13 +483,43 @@ pub enum RecordsInput<'a> {
         skip: usize,
         rows: usize,
     },
+    /// CPU's `rows` rows: one a log of `logs`' pieces in order, read with its
+    /// row of `decode` at the table's own timestamps; then the padding rows.
+    Cpu {
+        logs: &'a [&'a [LogC]],
+        decode: &'a CardDecode,
+        rows: usize,
+    },
+    /// MEMW_R's `rows` rows: `records`' pieces in order, then zero rows.
+    MemwR {
+        records: &'a [&'a [RegRowC]],
+        rows: usize,
+    },
+}
+
+impl std::fmt::Debug for RecordsInput<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let family = match self {
+            Self::KeccakRnd { .. } => "KECCAK_RND",
+            Self::Cpu { .. } => "CPU",
+            Self::MemwR { .. } => "MEMW_R",
+        };
+        write!(
+            f,
+            "{family} records: {} rows, {} bytes",
+            self.rows(),
+            self.bytes()
+        )
+    }
 }
 
 impl RecordsInput<'_> {
     /// Rows of the table.
     pub fn rows(&self) -> usize {
         match self {
-            Self::KeccakRnd { rows, .. } => *rows,
+            Self::KeccakRnd { rows, .. } | Self::Cpu { rows, .. } | Self::MemwR { rows, .. } => {
+                *rows
+            }
         }
     }
 
@@ -476,15 +527,84 @@ impl RecordsInput<'_> {
     pub fn cols(&self) -> usize {
         match self {
             Self::KeccakRnd { .. } => KECCAK_RND_COLUMNS,
+            Self::Cpu { .. } => CPU_COLUMNS,
+            Self::MemwR { .. } => MEMW_R_COLUMNS,
         }
     }
 
-    /// The records' bytes.
+    /// The records' bytes (a CPU table's decode table aside: it is on the
+    /// card already).
     pub fn bytes(&self) -> usize {
         match self {
             Self::KeccakRnd { ops, .. } => size_of_val(*ops),
+            Self::Cpu { logs, .. } => logs.iter().map(|piece| size_of_val(*piece)).sum(),
+            Self::MemwR { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
         }
     }
+
+    /// The records' count: logs, rows or ops.
+    fn len(&self) -> usize {
+        match self {
+            Self::KeccakRnd { ops, .. } => ops.len(),
+            Self::Cpu { logs, .. } => logs.iter().map(|piece| piece.len()).sum(),
+            Self::MemwR { records, .. } => records.iter().map(|piece| piece.len()).sum(),
+        }
+    }
+}
+
+/// What the fills of one upload check once the stream's work is done
+/// ([`Self::passed`]): a CPU log whose pc has no DECODE row.
+#[derive(Default)]
+pub(crate) struct FillChecks {
+    missing: Option<CudaSlice<u64>>,
+}
+
+impl FillChecks {
+    /// The counter of logs with no DECODE row, zeroed on `stream` at first use.
+    fn missing(&mut self, stream: &Arc<CudaStream>) -> Result<&mut CudaSlice<u64>> {
+        if self.missing.is_none() {
+            self.missing = Some(stream.alloc_zeros::<u64>(1)?);
+        }
+        self.missing.as_mut().ok_or_else(crate::invalid_value)
+    }
+
+    /// Whether every fill's check passed, read after `stream` ran them: every
+    /// CPU log's pc found its DECODE row (the host fill's
+    /// `MissingInstruction` otherwise).
+    pub(crate) fn passed(&self, stream: &Arc<CudaStream>) -> Result<bool> {
+        let Some(missing) = &self.missing else {
+            return Ok(true);
+        };
+        let missing = stream.clone_dtoh(missing)?;
+        stream.synchronize()?;
+        Ok(missing.first() == Some(&0))
+    }
+}
+
+/// `pieces` on the card, one after another in one buffer: each a pageable
+/// copy on `stream`, as [`upload`] copies one slice. No record uploads one
+/// default record so the kernel gets a pointer; it reads none.
+fn upload_pieces<T: DeviceRepr + Default>(
+    stream: &Arc<CudaStream>,
+    pieces: &[&[T]],
+) -> Result<CudaSlice<T>> {
+    let n: usize = pieces.iter().map(|piece| piece.len()).sum();
+    if n == 0 {
+        return upload(stream, &[]);
+    }
+    if let [piece] = pieces {
+        return upload(stream, piece);
+    }
+    // SAFETY: every element is written by the copies below, which cover
+    // `0..n` piece by piece.
+    let mut records = unsafe { crate::device::alloc_or_trim::<T>(stream, n) }?;
+    let mut at = 0usize;
+    for piece in pieces.iter().filter(|piece| !piece.is_empty()) {
+        let mut view = records.slice_mut(at..at + piece.len());
+        stream.memcpy_htod(*piece, &mut view)?;
+        at += piece.len();
+    }
+    Ok(records)
 }
 
 /// Test-only fault: with the `test-faults` feature, a table filled from its
@@ -508,20 +628,65 @@ fn fault_records_skip() -> usize {
     from_env + FAULT_RECORDS_SKIP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Test-only fault: with the `test-faults` feature, a CPU table filled from
+/// its records has two of its columns swapped, as a kernel that wrote each
+/// into the other's place would: other words than the host fill's, which the
+/// card tests and a proof's verifier must catch. The pair is
+/// `LAMBDA_VM_TEST_FAULT_CARD_FILL_SWAP=<a>,<b>` (read at the first fill), or
+/// else what this holds (`1 + a · CPU_COLUMNS + b`; 0 for none).
+#[cfg(feature = "test-faults")]
+pub static FAULT_CPU_SWAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "test-faults")]
+fn fault_cpu_swap() -> Option<(usize, usize)> {
+    static FROM_ENV: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    let from_env = *FROM_ENV.get_or_init(|| {
+        let value = std::env::var("LAMBDA_VM_TEST_FAULT_CARD_FILL_SWAP").ok()?;
+        let (a, b) = value.trim().split_once(',')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    });
+    let held = FAULT_CPU_SWAP.load(std::sync::atomic::Ordering::Relaxed);
+    from_env
+        .or_else(|| {
+            held.checked_sub(1)
+                .map(|k| (k / CPU_COLUMNS, k % CPU_COLUMNS))
+        })
+        .filter(|&(a, b)| a != b && a < CPU_COLUMNS && b < CPU_COLUMNS)
+}
+
+/// Columns `a` and `b` of the `rows`-row table in `dst` swapped, on `stream`.
+#[cfg(feature = "test-faults")]
+fn swap_columns(
+    stream: &Arc<CudaStream>,
+    dst: &mut CudaViewMut<u64>,
+    rows: usize,
+    (a, b): (usize, usize),
+) -> Result<()> {
+    let column_a = stream.clone_dtod(&dst.slice(a * rows..(a + 1) * rows))?;
+    let column_b = stream.clone_dtod(&dst.slice(b * rows..(b + 1) * rows))?;
+    stream.memcpy_dtod(&column_b, &mut dst.slice_mut(a * rows..(a + 1) * rows))?;
+    stream.memcpy_dtod(&column_a, &mut dst.slice_mut(b * rows..(b + 1) * rows))?;
+    Ok(())
+}
+
 /// `records`' table into `dst` (`rows × cols` words, column-major), all on
-/// `stream`: the records copied up as the widen path copies packed bytes and
-/// the family's kernel launched, the copy freed in stream order, so a reader
-/// on the same stream needs no further ordering.
+/// `stream`: the records copied up as the widen path copies packed bytes
+/// (piece by piece into one buffer) and the family's kernel launched, the copy
+/// freed in stream order, so a reader on the same stream needs no further
+/// ordering. What the kernel checks is counted into `checks`, read once the
+/// stream's work is done ([`FillChecks::passed`]).
 pub(crate) fn fill_col_major_into(
     stream: &Arc<CudaStream>,
     records: RecordsInput<'_>,
     dst: &mut CudaViewMut<u64>,
+    checks: &mut FillChecks,
 ) -> Result<()> {
     ensure_eq!(
         dst.len(),
         records.rows() * records.cols(),
         "the table's words"
     );
+    ensure!(records.len() <= records.rows() || matches!(records, RecordsInput::KeccakRnd { .. }));
     if records.rows() == 0 {
         return Ok(());
     }
@@ -533,6 +698,56 @@ pub(crate) fn fill_col_major_into(
             let nops = u32::try_from(ops.len()).map_err(|_| crate::invalid_value())?;
             let ops_dev = upload(stream, ops)?;
             launch_keccak_rnd(stream, &m.keccak_rnd_in, &ops_dev, nops, skip, rows, dst)
+        }
+        RecordsInput::Cpu { logs, decode, rows } => {
+            let n = records.len() as u64;
+            let logs_dev = upload_pieces(stream, logs)?;
+            let height = rows as u64;
+            let missing = checks.missing(stream)?;
+            unsafe {
+                stream
+                    .launch_builder(&m.cpu)
+                    .arg(&logs_dev)
+                    .arg(&n)
+                    .arg(&decode.entries)
+                    .arg(&decode.runs)
+                    .arg(&decode.nruns)
+                    .arg(&height)
+                    .arg(&mut *dst)
+                    .arg(missing)
+                    .launch(LaunchConfig {
+                        grid_dim: (row_grid(rows, CPU_BLOCK)?, 1, 1),
+                        block_dim: (CPU_BLOCK, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            #[cfg(feature = "test-faults")]
+            if let Some(pair) = fault_cpu_swap() {
+                swap_columns(stream, dst, rows, pair)?;
+            }
+            Ok(())
+        }
+        RecordsInput::MemwR {
+            records: pieces,
+            rows,
+        } => {
+            let n = records.len() as u64;
+            let rows_dev = upload_pieces(stream, pieces)?;
+            let height = rows as u64;
+            unsafe {
+                stream
+                    .launch_builder(&m.memw_r)
+                    .arg(&rows_dev)
+                    .arg(&n)
+                    .arg(&height)
+                    .arg(&mut *dst)
+                    .launch(LaunchConfig {
+                        grid_dim: (row_grid(rows, MEMW_R_BLOCK)?, 1, 1),
+                        block_dim: (MEMW_R_BLOCK, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            Ok(())
         }
     }
 }

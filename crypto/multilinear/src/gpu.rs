@@ -4386,9 +4386,80 @@ pub enum TableColumns<'a, F: math::field::traits::IsField> {
     Records(&'a crate::records::Records),
 }
 
-/// A table's records as the card's fill takes them.
+/// A table's records as the card's fill reads them, before they go up: the
+/// fill, and a CPU table's DECODE rows on the card ([`records_input`] borrows
+/// both).
 #[cfg(feature = "cuda")]
-fn records_input(records: &crate::records::Records) -> math_cuda::fill::RecordsInput<'_> {
+struct RecordsUp<'a> {
+    rows: usize,
+    cols: usize,
+    fill: crate::records::RecordsFill<'a>,
+    decode: Option<std::sync::Arc<math_cuda::fill::CardDecode>>,
+    logs: Vec<&'a [math_cuda::fill::LogC]>,
+    registers: Vec<&'a [math_cuda::fill::RegRowC]>,
+}
+
+#[cfg(feature = "cuda")]
+impl<'a> RecordsUp<'a> {
+    /// `records`' pieces as the card's structs; `None` when a CPU table's
+    /// DECODE rows cannot go up.
+    fn of(records: &'a crate::records::Records) -> Option<Self> {
+        use crate::records::{CpuLog, RecordsFill, RegisterRow};
+        use math_cuda::fill::{LogC, RegRowC};
+        const _: () = {
+            use std::mem::{align_of, offset_of, size_of};
+            assert!(size_of::<CpuLog>() == size_of::<LogC>());
+            assert!(align_of::<CpuLog>() == align_of::<LogC>());
+            assert!(offset_of!(CpuLog, src2_val) == offset_of!(LogC, src2_val));
+            assert!(offset_of!(CpuLog, dst_val) == offset_of!(LogC, dst_val));
+            assert!(size_of::<RegisterRow>() == size_of::<RegRowC>());
+            assert!(align_of::<RegisterRow>() == align_of::<RegRowC>());
+            assert!(offset_of!(RegisterRow, old_ts_lo) == offset_of!(RegRowC, old_ts_lo));
+            assert!(offset_of!(RegisterRow, address) == offset_of!(RegRowC, address));
+            assert!(offset_of!(RegisterRow, is_read) == offset_of!(RegRowC, is_read));
+            assert!(offset_of!(RegisterRow, pad) == offset_of!(RegRowC, pad));
+        };
+        let fill = records.fill();
+        let (decode, logs, registers) = match &fill {
+            RecordsFill::KeccakRnd { .. } => (None, Vec::new(), Vec::new()),
+            RecordsFill::Cpu { logs, decode, .. } => (
+                Some(decode.on_card()?),
+                logs.iter()
+                    // SAFETY: both are `#[repr(C)]`, five `u64`s in the same
+                    // order (asserted above).
+                    .map(|p| unsafe {
+                        core::slice::from_raw_parts(p.as_ptr() as *const LogC, p.len())
+                    })
+                    .collect(),
+                Vec::new(),
+            ),
+            RecordsFill::MemwR { rows } => (
+                None,
+                Vec::new(),
+                rows.iter()
+                    // SAFETY: both are `#[repr(C)]` with the same fields in
+                    // the same order (asserted above).
+                    .map(|p| unsafe {
+                        core::slice::from_raw_parts(p.as_ptr() as *const RegRowC, p.len())
+                    })
+                    .collect(),
+            ),
+        };
+        Some(Self {
+            rows: records.rows(),
+            cols: records.cols(),
+            fill,
+            decode,
+            logs,
+            registers,
+        })
+    }
+}
+
+/// A table's records as the card's fill takes them; `None` where the card
+/// fills no table of that shape.
+#[cfg(feature = "cuda")]
+fn records_input<'a>(up: &'a RecordsUp<'a>) -> Option<math_cuda::fill::RecordsInput<'a>> {
     use crate::records::{KeccakRndOp, RecordsFill};
     use math_cuda::fill::{KeccakOpInC, RecordsInput};
     const _: () = {
@@ -4398,7 +4469,7 @@ fn records_input(records: &crate::records::Records) -> math_cuda::fill::RecordsI
             std::mem::offset_of!(KeccakRndOp, input) == std::mem::offset_of!(KeccakOpInC, input)
         );
     };
-    match records.fill() {
+    let input = match &up.fill {
         RecordsFill::KeccakRnd { ops, skip } => RecordsInput::KeccakRnd {
             // SAFETY: both are `#[repr(C)]` with the same fields in the same
             // order (a timestamp, then 25 lanes, all `u64`), so the same size,
@@ -4406,17 +4477,34 @@ fn records_input(records: &crate::records::Records) -> math_cuda::fill::RecordsI
             ops: unsafe {
                 core::slice::from_raw_parts(ops.as_ptr() as *const KeccakOpInC, ops.len())
             },
-            skip,
-            rows: records.rows(),
+            skip: *skip,
+            rows: up.rows,
         },
-    }
+        // The CPU table writes its own timestamps: the first cycle is the
+        // records' (their digest and host fill), not the card's.
+        RecordsFill::Cpu { .. } => RecordsInput::Cpu {
+            logs: &up.logs,
+            decode: up.decode.as_deref()?,
+            rows: up.rows,
+        },
+        RecordsFill::MemwR { .. } => RecordsInput::MemwR {
+            records: &up.registers,
+            rows: up.rows,
+        },
+    };
+    // A KECCAK_RND table's records are ops, 24 rows each, cut at `skip`.
+    let fits = input.cols() == up.cols
+        && (matches!(input, RecordsInput::KeccakRnd { .. }) || up.fill.len() <= up.rows);
+    fits.then_some(input)
 }
 
 /// [`upload_columns`] of whole tables, each as it is held: a narrow one crosses
 /// the bus at its packed bytes and is widened on the card into the run its
 /// columns take, and one held as records crosses it at its records' bytes and
 /// is filled there from them, so the store holds the same words at the same
-/// places as if its field elements had been uploaded.
+/// places as if its field elements had been uploaded. `None` (the card
+/// declines, and every reader takes the host's columns) also when a table's
+/// records are not a table the card fills, or its fill refused them.
 #[cfg(feature = "cuda")]
 pub fn upload_tables<F>(tables: &[TableColumns<'_, F>]) -> Option<ResidentColumns>
 where
@@ -4445,23 +4533,35 @@ where
             TableColumns::Narrow(_) | TableColumns::Records(_) => Vec::new(),
         })
         .collect();
+    let ups: Vec<Option<RecordsUp<'_>>> = tables
+        .iter()
+        .map(|table| match table {
+            TableColumns::Records(records) => RecordsUp::of(records).map(Some),
+            TableColumns::Wide(_) | TableColumns::Narrow(_) => Some(None),
+        })
+        .collect::<Option<_>>()?;
     let uploads: Vec<TableUpload<'_>> = tables
         .iter()
         .zip(&wide)
-        .map(|(table, raw)| match table {
-            TableColumns::Wide(_) => TableUpload::Wide(raw),
-            TableColumns::Narrow(packed) => {
-                TableUpload::Narrow(math_cuda::narrow::NarrowInput::new(
-                    packed.data(),
-                    packed.offsets(),
-                    packed.widths(),
-                    packed.rows(),
-                    packed.cols(),
-                ))
-            }
-            TableColumns::Records(records) => TableUpload::Records(records_input(records)),
+        .zip(&ups)
+        .map(|((table, raw), up)| {
+            Some(match (table, up) {
+                (TableColumns::Wide(_), _) => TableUpload::Wide(raw),
+                (TableColumns::Narrow(packed), _) => {
+                    TableUpload::Narrow(math_cuda::narrow::NarrowInput::new(
+                        packed.data(),
+                        packed.offsets(),
+                        packed.widths(),
+                        packed.rows(),
+                        packed.cols(),
+                    ))
+                }
+                (TableColumns::Records(_), up) => {
+                    TableUpload::Records(records_input(up.as_ref()?)?)
+                }
+            })
         })
-        .collect();
+        .collect::<Option<_>>()?;
     let store = math_cuda::columns::DeviceColumns::upload_tables(&uploads)?;
     crate::records::note_card_fills(
         tables
