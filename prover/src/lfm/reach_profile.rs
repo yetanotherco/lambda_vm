@@ -193,7 +193,7 @@ pub fn profile(program: &LfmProgram) -> ReachProfile {
 
     for (i, instr) in program.instrs.iter().enumerate() {
         let (mut hd, mut id) = (0u32, 0u32);
-        for r in instr.reads() {
+        for r in instr.schedule_reads() {
             let w = writer[r.0 as usize];
             if w == NO_WRITER {
                 unwritten_reads += 1;

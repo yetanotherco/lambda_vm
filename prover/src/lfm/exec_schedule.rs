@@ -162,7 +162,9 @@ pub fn build_with_merge(program: &LfmProgram, merge: u32) -> LevelSchedule {
 
     for (i, instr) in program.instrs.iter().enumerate() {
         scratch.clear();
-        instr.reads_into(&mut scratch);
+        // A `HintOn`'s bit orders it after the bit's writer, though no
+        // multiplicity counts it ([`Instr::schedule_reads_into`]).
+        instr.schedule_reads_into(&mut scratch);
         let mut d = 0u32;
         for r in &scratch {
             // ⚠ `get`, not `[]`, and the reason is a real program rather than
@@ -316,7 +318,7 @@ impl ChipRows {
             Instr::Blake3(_) => &mut self.blake3,
             // Pack and Unpack are one chip: both open an `LFM_LANES` row.
             Instr::Pack { .. } | Instr::Unpack { .. } => &mut self.lanes,
-            Instr::Hint { .. } => &mut self.hint,
+            Instr::Hint { .. } | Instr::HintOn { .. } => &mut self.hint,
             Instr::Public { .. } => &mut self.public,
         };
         let row = *c;
@@ -502,7 +504,7 @@ mod tests {
 
         let (mut checked, mut hash_checked) = (0u64, 0u64);
         for (i, instr) in program.instrs.iter().enumerate() {
-            for r in instr.reads() {
+            for r in instr.schedule_reads() {
                 let w = writer[r.0 as usize];
                 if w == u32::MAX {
                     continue; // unwritten; the executor raises ReadBeforeWrite

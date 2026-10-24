@@ -353,6 +353,7 @@ pub fn compile(source: LfmProgramSource) -> LfmProgram {
             | Instr::BaseAlu { out, mult, .. }
             | Instr::ExtAlu { out, mult, .. }
             | Instr::Hint { out, mult, .. }
+            | Instr::HintOn { out, mult, .. }
             | Instr::Pack { out, mult, .. } => {
                 *mult = take(*out, &mut written, &mut read_counts);
             }
@@ -661,7 +662,9 @@ fn emit_column_groups(instrs: &[Instr], _public_len: u32) -> LfmColumnGroups {
                 }
                 blake3.set(r, l::MU, FE::one());
             }
-            Instr::Hint { out, mult, .. } => {
+            // A `HintOn` is a hint row: which arena word it read is the
+            // executor's, not the row's.
+            Instr::Hint { out, mult, .. } | Instr::HintOn { out, mult, .. } => {
                 use layout::hint as l;
                 let r = hint.open_row();
                 hint.set(r, l::OUT_ADDR, fe(out.0));

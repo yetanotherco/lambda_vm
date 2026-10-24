@@ -180,6 +180,8 @@ mod fri_group_tests;
 #[cfg(test)]
 mod fri_tests;
 #[cfg(test)]
+mod hint_on_tests;
+#[cfg(test)]
 mod join_tests;
 #[cfg(test)]
 mod keccak_probe;

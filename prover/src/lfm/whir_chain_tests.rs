@@ -824,7 +824,12 @@ pub(super) fn perm_rows(program: &LfmProgram) -> usize {
 }
 
 pub(super) fn hint_rows(program: &LfmProgram) -> usize {
-    count_rows(program, |i| matches!(i, super::instr::Instr::Hint { .. }))
+    count_rows(program, |i| {
+        matches!(
+            i,
+            super::instr::Instr::Hint { .. } | super::instr::Instr::HintOn { .. }
+        )
+    })
 }
 
 /// Rows the chain PROGRAM carries that are not the chain's own cost.

@@ -687,6 +687,23 @@ impl LfmBuilder {
         Cell(out)
     }
 
+    /// [`Self::hint_word`] reading arena word `alt` instead when `bit` is 1
+    /// ([`Instr::HintOn`]). The bit is not read: it costs no row and adds
+    /// nothing to its multiplicity, and it must be written before this hint
+    /// (the validator checks).
+    pub fn hint_word_on(&mut self, arena: ArenaId, index: u32, bit: Bit, alt: u32) -> Cell {
+        let out = self.alloc();
+        self.instrs.push(Instr::HintOn {
+            arena,
+            index,
+            alt,
+            bit: bit.0,
+            out,
+            mult: 0,
+        });
+        Cell(out)
+    }
+
     pub fn hint_felt(&mut self, arena: ArenaId, index: u32) -> Felt {
         Felt(self.hint_word(arena, index).0)
     }

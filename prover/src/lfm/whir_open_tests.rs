@@ -162,7 +162,7 @@ fn histogram(program: &LfmProgram) -> String {
             Instr::Select { .. } => 3,
             Instr::BitDec { .. } => 4,
             Instr::Hash { .. } | Instr::Hash16(_) => 5,
-            Instr::Hint { .. } => 6,
+            Instr::Hint { .. } | Instr::HintOn { .. } => 6,
             Instr::Pack { .. } => 7,
             Instr::Unpack { .. } => 8,
             Instr::Public { .. } => 9,

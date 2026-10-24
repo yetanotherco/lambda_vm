@@ -144,7 +144,9 @@ fn check_writes_and_reads(program: &LfmProgram) -> Result<(), LfmViolation> {
     }
     for (idx, instr) in program.instrs.iter().enumerate() {
         let min_write = instr.writes().iter().map(|a| a.0).min();
-        for Addr(r) in instr.reads() {
+        // A `HintOn`'s bit is held to the same order as a read, though it is
+        // not one (`Instr::schedule_reads_into`).
+        for Addr(r) in instr.schedule_reads() {
             if !*written
                 .get(r as usize)
                 .ok_or(LfmViolation::AddressOutOfRange { addr: r })?
@@ -189,6 +191,7 @@ fn check_multiplicities(program: &LfmProgram) -> Result<(), LfmViolation> {
             | Instr::BaseAlu { out, mult, .. }
             | Instr::ExtAlu { out, mult, .. }
             | Instr::Hint { out, mult, .. }
+            | Instr::HintOn { out, mult, .. }
             | Instr::Pack { out, mult, .. } => check(*out, *mult)?,
             Instr::Unpack { outs, mults, .. } => {
                 for i in 0..4 {
@@ -283,7 +286,14 @@ fn check_multiplicities(program: &LfmProgram) -> Result<(), LfmViolation> {
 fn check_arenas(program: &LfmProgram) -> Result<(), LfmViolation> {
     let lens = &program.arena_schema.lens;
     for instr in &program.instrs {
-        if let Instr::Hint { arena, index, .. } = instr {
+        let (arena, indices) = match instr {
+            Instr::Hint { arena, index, .. } => (arena, [Some(index), None]),
+            Instr::HintOn {
+                arena, index, alt, ..
+            } => (arena, [Some(index), Some(alt)]),
+            _ => continue,
+        };
+        for index in indices.into_iter().flatten() {
             let ok = lens.get(*arena as usize).is_some_and(|&len| *index < len);
             if !ok {
                 return Err(LfmViolation::ArenaOutOfBounds {
@@ -599,7 +609,7 @@ fn partition_counts(instrs: &[Instr]) -> PartitionCounts {
             Instr::KeccakF(_) => c.keccak += 1,
             Instr::Blake3(_) => c.blake3 += 1,
             Instr::Pack { .. } | Instr::Unpack { .. } => c.lanes += 1,
-            Instr::Hint { .. } => c.hint += 1,
+            Instr::Hint { .. } | Instr::HintOn { .. } => c.hint += 1,
             Instr::Public { .. } => c.public += 1,
         }
     }

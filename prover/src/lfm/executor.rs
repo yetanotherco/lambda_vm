@@ -927,7 +927,25 @@ fn step(
             }
             Instr::Hint {
                 arena, index, out, ..
+            }
+            | Instr::HintOn {
+                arena, index, out, ..
             } => {
+                // A `HintOn` reads `alt` when its bit is 1: the bit was written
+                // before it (a schedule dependency, not a read).
+                let index = match instr {
+                    Instr::HintOn { alt, bit, .. } => {
+                        let v = m.read_base(*bit)?;
+                        if v == FE::one() {
+                            alt
+                        } else if v == FE::zero() {
+                            index
+                        } else {
+                            return Err(LfmExecError::NonBooleanBit(bit.0));
+                        }
+                    }
+                    _ => index,
+                };
                 let words =
                     m.arenas
                         .get(*arena as usize)
@@ -1384,12 +1402,12 @@ impl<'p, 'a, H: LfmHasher + Sync> StreamedExecution<'p, 'a, H> {
         let mut scratch: Vec<Addr> = Vec::with_capacity(32);
         for (i, instr) in program.instrs.iter().enumerate() {
             scratch.clear();
-            instr.reads_into(&mut scratch);
+            instr.schedule_reads_into(&mut scratch);
             let mut n = scratch
                 .iter()
                 .map(|r| addr_need.get(r.0 as usize).copied().unwrap_or(0))
                 .fold(0u64, |a, b| a | b);
-            if let Instr::Hint { arena, .. } = instr {
+            if let Instr::Hint { arena, .. } | Instr::HintOn { arena, .. } = instr {
                 // An arena past the schema reads as no group: the executor
                 // rejects the read itself, as it does unstreamed.
                 n |= group_of.get(*arena as usize).map_or(0, |&g| 1u64 << g);

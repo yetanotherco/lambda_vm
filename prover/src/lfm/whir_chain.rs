@@ -2573,7 +2573,7 @@ impl ChipRows {
                 Instr::BaseAlu { .. } => &mut rows.balu,
                 Instr::ExtAlu { .. } => &mut rows.xalu,
                 Instr::Pack { .. } | Instr::Unpack { .. } => &mut rows.lanes,
-                Instr::Hint { .. } => &mut rows.hint,
+                Instr::Hint { .. } | Instr::HintOn { .. } => &mut rows.hint,
                 Instr::BitDec { .. } => &mut rows.bitdec,
                 Instr::Const { .. } => &mut rows.consts,
                 Instr::Public { .. } => &mut rows.public,

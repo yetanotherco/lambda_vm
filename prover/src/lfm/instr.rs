@@ -279,6 +279,23 @@ pub enum Instr {
         out: Addr,
         mult: u64,
     },
+    /// A `Hint` whose arena word is `index` when the cell at `bit` holds 0
+    /// and `alt` when it holds 1: the same `LFM_HINT` row.
+    ///
+    /// Which word is executor-only, like a hint's index: the row carries the
+    /// output address and multiplicity and nothing else, and a hinted value is
+    /// free witness, so the choice changes no constraint. The bit is therefore
+    /// a SCHEDULE dependency ([`Instr::schedule_reads_into`]) and never a read
+    /// ([`Instr::reads_into`], whose recount sets the bit's multiplicity): a
+    /// bus read the chip does not make would unbalance it.
+    HintOn {
+        arena: ArenaId,
+        index: u32,
+        alt: u32,
+        bit: Addr,
+        out: Addr,
+        mult: u64,
+    },
     /// Assemble a word from four base cells (unused lanes take the shared
     /// zero-constant cell). The lane↔word coupling is enforced purely by the
     /// `LFM_LANES` chip's bus tokens — no constraints.
@@ -340,6 +357,7 @@ impl Instr {
             | Instr::BaseAlu { out: a, .. }
             | Instr::ExtAlu { out: a, .. }
             | Instr::Hint { out: a, .. }
+            | Instr::HintOn { out: a, .. }
             | Instr::Pack { out: a, .. } => out.push(*a),
             Instr::Unpack { outs, .. } => out.extend_from_slice(outs),
             Instr::KeccakF(k) => {
@@ -378,7 +396,7 @@ impl Instr {
     /// Does NOT clear `out`.
     pub fn reads_into(&self, out: &mut Vec<Addr>) {
         match self {
-            Instr::Const { .. } | Instr::Hint { .. } => {}
+            Instr::Const { .. } | Instr::Hint { .. } | Instr::HintOn { .. } => {}
             Instr::BaseAlu { op, a, b, c, .. } => {
                 out.push(*a);
                 out.push(*b);
@@ -430,6 +448,25 @@ impl Instr {
     pub fn reads(&self) -> Vec<Addr> {
         let mut v = Vec::new();
         self.reads_into(&mut v);
+        v
+    }
+
+    /// The addresses whose cells must be written before this instruction
+    /// runs: [`Self::reads_into`], plus a [`Instr::HintOn`]'s bit, which the
+    /// executor reads to pick the arena word and the machine never reads. For
+    /// schedules only; a multiplicity counts [`Self::reads_into`]. Does NOT
+    /// clear `out`.
+    pub fn schedule_reads_into(&self, out: &mut Vec<Addr>) {
+        self.reads_into(out);
+        if let Instr::HintOn { bit, .. } = self {
+            out.push(*bit);
+        }
+    }
+
+    /// [`Self::schedule_reads_into`] into a fresh vector.
+    pub fn schedule_reads(&self) -> Vec<Addr> {
+        let mut v = Vec::new();
+        self.schedule_reads_into(&mut v);
         v
     }
 }
