@@ -37,6 +37,10 @@ const FILL_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fill.cubin")
 
 /// MEMW_R's columns (`memw_register::cols::NUM_COLUMNS`).
 pub const MEMW_R_COLUMNS: usize = 10;
+/// MEMW_A's columns (`memw_aligned::cols::NUM_COLUMNS`).
+pub const MEMW_A_COLUMNS: usize = 29;
+/// LOAD's columns (`load::cols::NUM_COLUMNS`).
+pub const LOAD_COLUMNS: usize = 18;
 /// CPU's columns (`cpu::cols::NUM_COLUMNS`).
 pub const CPU_COLUMNS: usize = 37;
 /// KECCAK_RND's columns (`keccak_rnd::cols::NUM_COLUMNS`).
@@ -48,7 +52,7 @@ pub const KECCAK_RND_ROWS_PER_OP: usize = 24;
 /// (`FILL_KECCAK_SECTIONS`).
 const KECCAK_SECTIONS: u32 = 3;
 /// Threads a block for the row kernels.
-const MEMW_R_BLOCK: u32 = 256;
+const ROW_BLOCK: u32 = 256;
 const CPU_BLOCK: u32 = 256;
 const KECCAK_BLOCK: u32 = 128;
 
@@ -134,6 +138,35 @@ pub struct KeccakOpInC {
     pub input: [u64; 25],
 }
 
+/// One MEMW_A row (the prover's `AlignedRow`): the base address, timestamp and
+/// shared old timestamp, the value and old value packed a word each, the
+/// width, and flags 0 or 1.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AlignedRowC {
+    pub base_address: u64,
+    pub timestamp: u64,
+    pub old_timestamp: u64,
+    pub value: u64,
+    pub old: u64,
+    pub width: u8,
+    pub is_read: u8,
+    pub is_register: u8,
+}
+
+/// One LOAD op (the prover's `LoadOperation`): the base address, the
+/// timestamp, the width, whether it sign-extends (0 or 1) and the result's
+/// bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadOpC {
+    pub base_address: u64,
+    pub timestamp: u64,
+    pub width: u8,
+    pub is_signed: u8,
+    pub res: [u8; 8],
+}
+
 const _: () = {
     assert!(size_of::<LogC>() == 40);
     assert!(offset_of!(LogC, dst_val) == 32);
@@ -150,17 +183,25 @@ const _: () = {
     assert!(offset_of!(KeccakOpC, output) == 208);
     assert!(size_of::<KeccakOpInC>() == 208);
     assert!(offset_of!(KeccakOpInC, input) == 8);
+    assert!(size_of::<AlignedRowC>() == 48);
+    assert!(offset_of!(AlignedRowC, width) == 40);
+    assert!(offset_of!(AlignedRowC, is_register) == 42);
+    assert!(size_of::<LoadOpC>() == 32);
+    assert!(offset_of!(LoadOpC, is_signed) == 17);
+    assert!(offset_of!(LoadOpC, res) == 18);
 };
 
-// SAFETY: each is `#[repr(C)]` plain data with no padding the kernels read
-// (`RegRowC::pad` is a named field), so its bytes on the card are the struct
-// the kernel declares.
+// SAFETY: each is `#[repr(C)]` plain data whose padding no kernel reads
+// (`RegRowC::pad` is a named field; `AlignedRowC` and `LoadOpC` end in
+// padding), so its bytes on the card are the struct the kernel declares.
 unsafe impl DeviceRepr for LogC {}
 unsafe impl DeviceRepr for RegRowC {}
 unsafe impl DeviceRepr for DecodeEntryC {}
 unsafe impl DeviceRepr for DecodeRunC {}
 unsafe impl DeviceRepr for KeccakOpC {}
 unsafe impl DeviceRepr for KeccakOpInC {}
+unsafe impl DeviceRepr for AlignedRowC {}
+unsafe impl DeviceRepr for LoadOpC {}
 
 impl DecodeRunC {
     /// The DECODE row of `pc` in `runs` (ascending and disjoint), as the CPU
@@ -189,6 +230,8 @@ pub struct FillTimes {
 struct Module {
     _module: Arc<CudaModule>,
     memw_r: CudaFunction,
+    memw_a: CudaFunction,
+    load: CudaFunction,
     cpu: CudaFunction,
     keccak_rnd: CudaFunction,
     keccak_rnd_in: CudaFunction,
@@ -203,6 +246,8 @@ fn module() -> Result<&'static Module> {
     let module = be.ctx.load_module(Ptx::from_binary(FILL_CUBIN.to_vec()))?;
     let m = Module {
         memw_r: module.load_function("fill_memw_r")?,
+        memw_a: module.load_function("fill_memw_a")?,
+        load: module.load_function("fill_load")?,
         cpu: module.load_function("fill_cpu_from_logs")?,
         keccak_rnd: module.load_function("fill_keccak_rnd")?,
         keccak_rnd_in: module.load_function("fill_keccak_rnd_in")?,
@@ -291,8 +336,8 @@ pub fn fill_memw_r_into(
             .arg(&height_u64)
             .arg(dst)
             .launch(LaunchConfig {
-                grid_dim: (row_grid(height, MEMW_R_BLOCK)?, 1, 1),
-                block_dim: (MEMW_R_BLOCK, 1, 1),
+                grid_dim: (row_grid(height, ROW_BLOCK)?, 1, 1),
+                block_dim: (ROW_BLOCK, 1, 1),
                 shared_mem_bytes: 0,
             })?;
     }
@@ -495,6 +540,16 @@ pub enum RecordsInput<'a> {
         records: &'a [&'a [RegRowC]],
         rows: usize,
     },
+    /// MEMW_A's `rows` rows: `records`' pieces in order, then zero rows.
+    MemwA {
+        records: &'a [&'a [AlignedRowC]],
+        rows: usize,
+    },
+    /// LOAD's `rows` rows: `records`' pieces in order, then zero rows.
+    Load {
+        records: &'a [&'a [LoadOpC]],
+        rows: usize,
+    },
 }
 
 impl std::fmt::Debug for RecordsInput<'_> {
@@ -503,6 +558,8 @@ impl std::fmt::Debug for RecordsInput<'_> {
             Self::KeccakRnd { .. } => "KECCAK_RND",
             Self::Cpu { .. } => "CPU",
             Self::MemwR { .. } => "MEMW_R",
+            Self::MemwA { .. } => "MEMW_A",
+            Self::Load { .. } => "LOAD",
         };
         write!(
             f,
@@ -517,9 +574,11 @@ impl RecordsInput<'_> {
     /// Rows of the table.
     pub fn rows(&self) -> usize {
         match self {
-            Self::KeccakRnd { rows, .. } | Self::Cpu { rows, .. } | Self::MemwR { rows, .. } => {
-                *rows
-            }
+            Self::KeccakRnd { rows, .. }
+            | Self::Cpu { rows, .. }
+            | Self::MemwR { rows, .. }
+            | Self::MemwA { rows, .. }
+            | Self::Load { rows, .. } => *rows,
         }
     }
 
@@ -529,6 +588,8 @@ impl RecordsInput<'_> {
             Self::KeccakRnd { .. } => KECCAK_RND_COLUMNS,
             Self::Cpu { .. } => CPU_COLUMNS,
             Self::MemwR { .. } => MEMW_R_COLUMNS,
+            Self::MemwA { .. } => MEMW_A_COLUMNS,
+            Self::Load { .. } => LOAD_COLUMNS,
         }
     }
 
@@ -539,6 +600,8 @@ impl RecordsInput<'_> {
             Self::KeccakRnd { ops, .. } => size_of_val(*ops),
             Self::Cpu { logs, .. } => logs.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::MemwR { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
+            Self::MemwA { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
+            Self::Load { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
         }
     }
 
@@ -548,6 +611,8 @@ impl RecordsInput<'_> {
             Self::KeccakRnd { ops, .. } => ops.len(),
             Self::Cpu { logs, .. } => logs.iter().map(|piece| piece.len()).sum(),
             Self::MemwR { records, .. } => records.iter().map(|piece| piece.len()).sum(),
+            Self::MemwA { records, .. } => records.iter().map(|piece| piece.len()).sum(),
+            Self::Load { records, .. } => records.iter().map(|piece| piece.len()).sum(),
         }
     }
 }
@@ -731,25 +796,51 @@ pub(crate) fn fill_col_major_into(
             records: pieces,
             rows,
         } => {
-            let n = records.len() as u64;
-            let rows_dev = upload_pieces(stream, pieces)?;
-            let height = rows as u64;
-            unsafe {
-                stream
-                    .launch_builder(&m.memw_r)
-                    .arg(&rows_dev)
-                    .arg(&n)
-                    .arg(&height)
-                    .arg(&mut *dst)
-                    .launch(LaunchConfig {
-                        grid_dim: (row_grid(rows, MEMW_R_BLOCK)?, 1, 1),
-                        block_dim: (MEMW_R_BLOCK, 1, 1),
-                        shared_mem_bytes: 0,
-                    })?;
-            }
-            Ok(())
+            let records_dev = upload_pieces(stream, pieces)?;
+            launch_rows(stream, &m.memw_r, &records_dev, records.len(), rows, dst)
+        }
+        RecordsInput::MemwA {
+            records: pieces,
+            rows,
+        } => {
+            let records_dev = upload_pieces(stream, pieces)?;
+            launch_rows(stream, &m.memw_a, &records_dev, records.len(), rows, dst)
+        }
+        RecordsInput::Load {
+            records: pieces,
+            rows,
+        } => {
+            let records_dev = upload_pieces(stream, pieces)?;
+            launch_rows(stream, &m.load, &records_dev, records.len(), rows, dst)
         }
     }
+}
+
+/// A one-record-a-row family's fill over the `n` records on the card into
+/// `dst`'s `rows` rows (zero past the records), on `stream`.
+fn launch_rows<T: DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    function: &CudaFunction,
+    records: &CudaSlice<T>,
+    n: usize,
+    rows: usize,
+    dst: &mut CudaViewMut<u64>,
+) -> Result<()> {
+    let (n, height) = (n as u64, rows as u64);
+    unsafe {
+        stream
+            .launch_builder(function)
+            .arg(records)
+            .arg(&n)
+            .arg(&height)
+            .arg(&mut *dst)
+            .launch(LaunchConfig {
+                grid_dim: (row_grid(rows, ROW_BLOCK)?, 1, 1),
+                block_dim: (ROW_BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    Ok(())
 }
 
 /// Today's path, timed as the fills are: `packed`'s bytes, offsets and widths

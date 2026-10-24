@@ -107,6 +107,37 @@ struct KeccakOpInC {
 static_assert(sizeof(KeccakOpInC) == 208, "KeccakOpInC is 208 bytes");
 static_assert(offsetof(KeccakOpInC, input) == 8, "KeccakOpInC field order");
 
+// One MEMW_A row (`memw_aligned.rs`, `AlignedRow`): the access's base address,
+// timestamp and shared old timestamp, its value and old value packed in a
+// word each (eight bytes for a memory access, the two 32-bit halves for a
+// register access), its width, and flags 0 or 1.
+struct AlignedRowC {
+    uint64_t base_address;
+    uint64_t timestamp;
+    uint64_t old_timestamp;
+    uint64_t value;
+    uint64_t old;
+    uint8_t width;
+    uint8_t is_read;
+    uint8_t is_register;
+};
+static_assert(sizeof(AlignedRowC) == 48, "AlignedRowC is 48 bytes");
+static_assert(offsetof(AlignedRowC, width) == 40, "AlignedRowC field order");
+static_assert(offsetof(AlignedRowC, is_register) == 42, "AlignedRowC field order");
+
+// One LOAD op (`load.rs`, `LoadOperation`): the base address, the timestamp,
+// the width, whether it sign-extends (0 or 1) and the result's eight bytes.
+struct LoadOpC {
+    uint64_t base_address;
+    uint64_t timestamp;
+    uint8_t width;
+    uint8_t is_signed;
+    uint8_t res[8];
+};
+static_assert(sizeof(LoadOpC) == 32, "LoadOpC is 32 bytes");
+static_assert(offsetof(LoadOpC, is_signed) == 17, "LoadOpC field order");
+static_assert(offsetof(LoadOpC, res) == 18, "LoadOpC field order");
+
 // ---------------------------------------------------------------------------
 // The setters (`types.rs`, `VmTable`)
 // ---------------------------------------------------------------------------
@@ -185,6 +216,113 @@ extern "C" __global__ void fill_memw_r(const RegRowC *rows, uint64_t n, uint64_t
     w.word(c::OLD_TIMESTAMP_LO, r.old_ts_lo);
     w.word(c::MU_READ, r.is_read != 0);
     w.word(c::MU_WRITE, r.is_read == 0);
+}
+
+// ---------------------------------------------------------------------------
+// MEMW_A (`memw_aligned.rs`, `generate_memw_aligned_trace_segments_as`)
+// ---------------------------------------------------------------------------
+
+namespace memw_a_cols {
+constexpr uint32_t IS_REGISTER = 0;
+constexpr uint32_t BASE_ADDRESS = 1;  // DWordWHH: 3 columns
+constexpr uint32_t VALUE = 4;         // 8 columns
+constexpr uint32_t TIMESTAMP_0 = 12;
+constexpr uint32_t WRITE2 = 14;
+constexpr uint32_t WRITE4 = 15;
+constexpr uint32_t WRITE8 = 16;
+constexpr uint32_t OLD = 17;  // 8 columns
+constexpr uint32_t OLD_TIMESTAMP_0 = 25;
+constexpr uint32_t MU_READ = 27;
+constexpr uint32_t MU_WRITE = 28;
+constexpr uint32_t NUM_COLUMNS = 29;
+}  // namespace memw_a_cols
+
+namespace fill {
+
+// `AlignedRow::unpack` into eight columns from `col`: a register access's
+// two 32-bit halves (the rest zero), or a memory access's eight bytes.
+__device__ __forceinline__ void aligned_elements(const RowWriter &w, uint32_t col, uint64_t packed,
+                                                 bool is_register) {
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+        uint64_t element = is_register ? (i < 2 ? (packed >> (32 * i)) & 0xFFFFFFFFull : 0)
+                                       : (packed >> (8 * i)) & 0xFFull;
+        w.word(col + i, element);
+    }
+}
+
+}  // namespace fill
+
+// Rows `[0, n)` from `rows`, rows `[n, height)` zero. One thread a row.
+extern "C" __global__ void fill_memw_a(const AlignedRowC *rows, uint64_t n, uint64_t height,
+                                       uint64_t *out) {
+    namespace c = memw_a_cols;
+    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= height) return;
+    const fill::RowWriter w{out, height, row};
+    if (row >= n) {
+        w.zeros(0, c::NUM_COLUMNS);
+        return;
+    }
+    const AlignedRowC r = rows[row];
+    const bool is_register = r.is_register != 0;
+    w.word(c::IS_REGISTER, is_register);
+    // `set_dword_whh`: the low and middle halves, then the high word.
+    w.word(c::BASE_ADDRESS, r.base_address & 0xFFFFull);
+    w.word(c::BASE_ADDRESS + 1, (r.base_address >> 16) & 0xFFFFull);
+    w.word(c::BASE_ADDRESS + 2, r.base_address >> 32);
+    fill::aligned_elements(w, c::VALUE, r.value, is_register);
+    w.dword_wl(c::TIMESTAMP_0, r.timestamp);
+    w.word(c::WRITE2, r.width == 2);
+    w.word(c::WRITE4, r.width == 4);
+    w.word(c::WRITE8, r.width == 8);
+    fill::aligned_elements(w, c::OLD, r.old, is_register);
+    w.dword_wl(c::OLD_TIMESTAMP_0, r.old_timestamp);
+    w.word(c::MU_READ, r.is_read != 0);
+    w.word(c::MU_WRITE, r.is_read == 0);
+}
+
+// ---------------------------------------------------------------------------
+// LOAD (`load.rs`, `generate_load_trace_segments_as`)
+// ---------------------------------------------------------------------------
+
+namespace load_cols {
+constexpr uint32_t BASE_ADDRESS_0 = 0;
+constexpr uint32_t TIMESTAMP_0 = 2;
+constexpr uint32_t READ2 = 4;
+constexpr uint32_t READ4 = 5;
+constexpr uint32_t READ8 = 6;
+constexpr uint32_t SIGNED = 7;
+constexpr uint32_t RES = 8;  // 8 columns
+constexpr uint32_t SIGN_BIT = 16;
+constexpr uint32_t MU = 17;
+constexpr uint32_t NUM_COLUMNS = 18;
+}  // namespace load_cols
+
+// Rows `[0, n)` from `ops`, rows `[n, height)` zero. One thread a row.
+extern "C" __global__ void fill_load(const LoadOpC *ops, uint64_t n, uint64_t height,
+                                     uint64_t *out) {
+    namespace c = load_cols;
+    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= height) return;
+    const fill::RowWriter w{out, height, row};
+    if (row >= n) {
+        w.zeros(0, c::NUM_COLUMNS);
+        return;
+    }
+    const LoadOpC op = ops[row];
+    w.dword_wl(c::BASE_ADDRESS_0, op.base_address);
+    w.dword_wl(c::TIMESTAMP_0, op.timestamp);
+    w.word(c::READ2, op.width == 2);
+    w.word(c::READ4, op.width == 4);
+    w.word(c::READ8, op.width == 8);
+    w.word(c::SIGNED, op.is_signed != 0);
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) w.word(c::RES + i, op.res[i]);
+    // `compute_sign_bit`: the top bit of the highest byte read.
+    const uint32_t top = op.width == 2 ? 1 : (op.width == 4 ? 3 : (op.width == 8 ? 7 : 0));
+    w.word(c::SIGN_BIT, (op.res[top] >> 7) & 1);
+    w.word(c::MU, 1);
 }
 
 // ---------------------------------------------------------------------------
