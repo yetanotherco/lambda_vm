@@ -691,8 +691,17 @@ fn the_card_fills_the_streamed_tables_as_the_host_does() {
 
     // A log whose pc no DECODE row holds: the fill is refused, as the host
     // fill's `MissingInstruction`.
-    let absent = decode.entries()[0].pc + 2;
-    assert_eq!(decode.row(absent), None, "pcs are 4 apart");
+    // The first instruction's pc + 2, unless the host finds a row there (a
+    // 2-byte instruction); then the pc past the last run's end.
+    let (last_pc, _, last_len) = *decode.runs().last().expect("a program");
+    let absent = [
+        decode.entries()[0].pc + 2,
+        last_pc + 4 * u64::from(last_len),
+    ]
+    .into_iter()
+    .find(|&pc| decode.row(pc).is_none())
+    .expect("a pc no DECODE row holds");
+    assert_eq!(decode.row(absent), None);
     let refusal_rows = 1 << 12;
     let mut logs: Vec<LogC> = inputs::cpu_logs(seed, refusal_rows, &decode)
         .iter()
