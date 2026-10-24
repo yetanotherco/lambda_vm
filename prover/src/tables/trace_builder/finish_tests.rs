@@ -398,7 +398,7 @@ fn plan_of<'a>(
     memory_state: &'a MemoryState,
     register_state: RegisterState,
     artifacts: &'a DecodeArtifacts,
-    image: &HashMap<u64, u8>,
+    image: &'a HashMap<u64, u8>,
     register_init: &'a [u32],
     max_rows: &'a MaxRowsConfig,
 ) -> FinishPlan<'a> {

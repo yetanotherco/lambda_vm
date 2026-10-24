@@ -1350,6 +1350,14 @@ fn lt_concat() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_LT_CONCAT").is_ok_and(|v| v.trim() == "1")
 }
 
+/// `LAMBDA_VM_BLOCK_P4_BESIDE=1`: the streamed finish counts the BITWISE
+/// lookups in BITWISE's own table's job, so the slide starts the tables after
+/// it while it counts ([`WindowedTraceBuilder::p4_beside`]); off by default.
+/// The tables are the same.
+fn p4_beside() -> bool {
+    std::env::var("LAMBDA_VM_BLOCK_P4_BESIDE").is_ok_and(|v| v.trim() == "1")
+}
+
 /// The streamed finish builds each of the rest's tables as soon as the byte
 /// gate admits it, while earlier ones still build, instead of in waves that
 /// each last as long as their slowest table
@@ -5478,6 +5486,9 @@ fn prove_streamed(
                 }
                 if p4_direct {
                     builder = builder.p4_lookups_direct();
+                }
+                if p4_beside() {
+                    builder = builder.p4_beside();
                 }
                 if rest_slide() {
                     builder = builder.slide_rest();

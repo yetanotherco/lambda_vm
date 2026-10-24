@@ -5796,6 +5796,11 @@ pub struct StreamSkip {
     /// (`LAMBDA_VM_BLOCK_P4_LOOKUPS` unset or `direct` on the block). The
     /// multiplicities are the same.
     pub p4_direct: bool,
+    /// The streamed finish counts the BITWISE lookups (phase 4) in BITWISE's
+    /// own table's job, beside the rest's builds, instead of before any of
+    /// them (`LAMBDA_VM_BLOCK_P4_BESIDE=1` on the block). The tables are the
+    /// same; a finish that builds every table at once counts first, as ever.
+    pub p4_beside: bool,
     /// How the tables cut at `keccak_rnd_rows`, `keccak_rows`, `ecsm_rows`,
     /// `ecdas_rows` and `copy_rows` are padded ([`CutPadding`]): the table
     /// phase's counts, its

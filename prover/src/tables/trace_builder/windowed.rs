@@ -805,6 +805,14 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// The streamed finish counts the BITWISE lookups beside the rest's
+    /// builds, in BITWISE's own table's job ([`StreamSkip::p4_beside`]). The
+    /// tables are the same.
+    pub fn p4_beside(mut self) -> Self {
+        self.emitted.p4_beside = true;
+        self
+    }
+
     /// Drop each streamed chunk's ops once the chunk is handed out, instead of
     /// keeping every walked window to the run's end (see the module docs): the
     /// builder then holds less than a chunk of each streamed table's ops, plus

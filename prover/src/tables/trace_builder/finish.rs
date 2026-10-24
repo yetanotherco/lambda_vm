@@ -155,7 +155,7 @@ pub(super) struct FinishPlan<'a> {
     /// IS_WH's rows ([`is_wh::dedup_is_wh_rows`] over KECCAK's state addresses),
     /// shared by its BITWISE lookups and its table.
     is_wh_rows: Vec<(is_wh::IsWhKey, u64)>,
-    bitwise_histogram: bitwise::BitwiseHistogram,
+    bitwise: BitwiseCount<'a>,
     num_padding_rows: usize,
     halt_timestamp: u64,
     halt_next_pc: u64,
@@ -163,6 +163,706 @@ pub(super) struct FinishPlan<'a> {
     header: RestHeader,
     /// [`Self::cut_line`].
     cut_line: Option<String>,
+}
+
+/// The lists phase 4 counts the BITWISE lookups of ([`count_bitwise`]).
+#[derive(Clone, Copy)]
+struct P4Lists<'s> {
+    lt: &'s LtLists,
+    shift_ops: &'s BlockVec<ShiftOperation>,
+    store_ops: &'s BlockVec<store::StoreOperation>,
+    memw_aligned_ops: &'s [memw_aligned::AlignedRow],
+    memw_register_rows: &'s [RegRow],
+    branch_ops: &'s CompactBranch,
+    mul_ops: &'s BlockVec<(MulOperation, bool)>,
+    dvrm_ops: &'s BlockVec<(DvrmOperation, bool)>,
+    eq_ops: &'s CompactEq,
+    bytewise_ops: &'s CompactBytewise,
+    keccak_ops: &'s BlockVec<KeccakOperation>,
+    ecdas_ops: &'s BlockVec<ecdas::CompactEcdasOp>,
+    copy_ops: &'s BlockVec<copy::CopyOperation>,
+    blake3_ops: &'s BlockVec<Blake3Operation>,
+    blake3_absorb_ops: &'s BlockVec<blake3::Blake3AbsorbOperation>,
+    ecsm_ops: &'s BlockVec<ecsm::EcsmOperation>,
+    hint_ops: &'s BlockVec<hint::HintOperation>,
+    is_wh_rows: &'s [(is_wh::IsWhKey, u64)],
+    max_rows: &'s crate::tables::MaxRowsConfig,
+    num_padding_rows: usize,
+    /// The byte checks SHIFT's and KECCAK_RND's padding rows send
+    /// ([`padding_byte_checks`]).
+    padding_byte_checks: u64,
+    /// How the count runs ([`P4Mode`]).
+    mode: P4Mode,
+}
+
+/// How phase 4 counts: the per-row lookups on the pool and how
+/// ([`StreamSkip::p4_rows`], [`StreamSkip::p4_by`]), and LT's and KECCAK's
+/// lookups straight into the histograms ([`StreamSkip::p4_direct`]).
+#[derive(Clone, Copy)]
+struct P4Mode {
+    rows_on_pool: bool,
+    by: RowCount,
+    direct: bool,
+}
+
+impl P4Mode {
+    fn of(skip: &StreamSkip) -> Self {
+        Self {
+            rows_on_pool: skip.p4_rows,
+            by: skip.p4_by,
+            direct: skip.p4_direct,
+        }
+    }
+}
+
+/// PAGE's BITWISE lookups, from the initial image and the memory state.
+type PageCount<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Send + Sync + 'a>;
+
+/// Phase 4: the BITWISE histogram of every source, the in-walk lookups
+/// (`bitwise_ops`) and PAGE's (`page`) with them, on top of what the windows
+/// counted (`pre`). With `own_threads`, the buckets run on threads of their
+/// own instead of the pool.
+fn count_bitwise(
+    lists: P4Lists<'_>,
+    bitwise_ops: &BlockVec<BitwiseOperation>,
+    page: Option<&(dyn Fn(&mut bitwise::BitwiseHistogram) + Sync)>,
+    pre: Option<PreCounted>,
+    #[cfg_attr(not(feature = "parallel"), allow(unused_variables))] own_threads: bool,
+) -> bitwise::BitwiseHistogram {
+    let P4Lists {
+        lt,
+        shift_ops,
+        store_ops,
+        memw_aligned_ops,
+        memw_register_rows,
+        branch_ops,
+        mul_ops,
+        dvrm_ops,
+        eq_ops,
+        bytewise_ops,
+        keccak_ops,
+        ecdas_ops,
+        copy_ops,
+        blake3_ops,
+        blake3_absorb_ops,
+        ecsm_ops,
+        hint_ops,
+        is_wh_rows,
+        max_rows,
+        num_padding_rows,
+        padding_byte_checks,
+        mode: P4Mode {
+            rows_on_pool,
+            by,
+            direct,
+        },
+    } = lists;
+    let lt_ops = lt.segments();
+    let branch_segments = branch_ops.segments();
+    let bytewise_segments = bytewise_ops.segments();
+    // The per-source bitwise collectors are all pure functions of their inputs, and the
+    // BITWISE multiplicities are order-independent (they ride a permutation-invariant bus),
+    // so every source can be collected in parallel and the per-worker histograms summed in
+    // any order.
+    //
+    // MUL/DVRM dedup their per-unique bit-gated lookups PER CHIP INSTANCE, so pass the same
+    // chunk size used to split them into instances so multiplicities match the per-instance
+    // sends. MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]. PAGE does a
+    // batched ARE_BYTES[init, fini] per row (skipped in continuation epochs, which the L2G
+    // table owns). COPY sends IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL;
+    // HINT sends ARE_BYTES for its 32 output cells.
+    // We never concatenate the lookups into one giant `Vec<BitwiseOperation>` (~140 M ops /
+    // ~560 MB at 10-tx whose only consumer is the multiplicity count). Each collector bumps
+    // the `BitwiseHistogram` it is handed: the heavy sources (MEMW_R one-per-row, PAGE
+    // one-per-byte, padding) count directly with no per-source Vec at all, and the small
+    // sources fold their transient `collect_*` Vec in and drop it. The histogram is a
+    // commutative monoid, so per-worker histograms tree-reduce to multiplicities that are
+    // independent of accumulation order.
+    type Collector<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + 'a>;
+    let mul_chunk = max_rows.mul;
+    let dvrm_chunk = max_rows.dvrm;
+    // The sources that are a sum over their ops are cut into slices of whole ops, so phase 4's
+    // buckets share them (a whole source was one bucket's long pole) and no slice's list of
+    // lookups grows with the run. MUL and DVRM deduplicate per instance, so each of their
+    // slices is one instance. The in-walk lookups and MEMW_R are split in the parallel path
+    // below; the rest stay one collector each.
+    let mut collectors: Vec<Collector> = Vec::new();
+    // Where each source's collectors start in `collectors`, in order, so the
+    // parallel path can say what each source cost (the `BLOCK P4 ROWS` line).
+    let mut starts: Vec<(&'static str, usize)> = Vec::new();
+    if p4_sliced() {
+        // LT's segments slice by slice; a compact one through a temporary of a
+        // slice's ops at a time.
+        starts.push(("LT", collectors.len()));
+        // Counted straight into the histogram (`skip.p4_direct`), or
+        // through each slice's list of lookups, as before.
+        let lt_lookups = move |slice: &[LtOperation], h: &mut bitwise::BitwiseHistogram| {
+            if direct {
+                count_bitwise_from_lt_ops(slice, h)
+            } else {
+                h.add_ops(&collect_bitwise_from_lt_ops(slice))
+            }
+        };
+        let lt_slice = p4_slice_len(P4Source::Lt, mul_chunk, dvrm_chunk);
+        for part in &lt_ops.parts {
+            match *part {
+                Part::Ops(ops) => {
+                    for slice in ops.chunks(lt_slice) {
+                        collectors.push(Box::new(move |h| lt_lookups(slice, h)));
+                    }
+                }
+                Part::Compact(compact) => {
+                    for start in (0..compact.len()).step_by(lt_slice) {
+                        collectors.push(Box::new(move |h| {
+                            let mut slice = Vec::new();
+                            compact.expand_into(start, start + lt_slice, &mut slice);
+                            lt_lookups(&slice, h)
+                        }));
+                    }
+                }
+            }
+        }
+        // MUL and DVRM deduplicate per instance: their slices are the
+        // instances of the concatenation (copied only where one straddles two
+        // blocks). The other sources are sums over their ops: block by block.
+        starts.push(("MUL", collectors.len()));
+        let mul_slice = p4_slice_len(P4Source::Mul, mul_chunk, dvrm_chunk);
+        for k in 0..mul_ops.len().div_ceil(mul_slice) {
+            let mul_ops = &mul_ops;
+            collectors.push(Box::new(move |h| {
+                let slice = mul_ops.range(k * mul_slice, (k + 1) * mul_slice);
+                h.add_ops(&collect_bitwise_from_mul(&slice, mul_chunk))
+            }));
+        }
+        starts.push(("DVRM", collectors.len()));
+        let dvrm_slice = p4_slice_len(P4Source::Dvrm, mul_chunk, dvrm_chunk);
+        for k in 0..dvrm_ops.len().div_ceil(dvrm_slice) {
+            let dvrm_ops = &dvrm_ops;
+            collectors.push(Box::new(move |h| {
+                let slice = dvrm_ops.range(k * dvrm_slice, (k + 1) * dvrm_slice);
+                h.add_ops(&collect_bitwise_from_dvrm(&slice, dvrm_chunk))
+            }));
+        }
+        starts.push(("BRANCH", collectors.len()));
+        let branch_slice = p4_slice_len(P4Source::Branch, mul_chunk, dvrm_chunk);
+        for k in 0..branch_ops.len().div_ceil(branch_slice.max(1)) {
+            let branch_ops = &branch_ops;
+            collectors.push(Box::new(move |h| {
+                let slice = branch_ops.range(k * branch_slice, (k + 1) * branch_slice);
+                h.add_ops(&collect_bitwise_from_branch_ops(&slice))
+            }));
+        }
+        starts.push(("SHIFT", collectors.len()));
+        let shift_slice = p4_slice_len(P4Source::Shift, mul_chunk, dvrm_chunk);
+        for slice in shift_ops.parts().flat_map(|part| part.chunks(shift_slice)) {
+            collectors.push(Box::new(move |h| {
+                h.add_ops(&shift::collect_bitwise_from_shift(slice))
+            }));
+        }
+        starts.push(("BYTEWISE", collectors.len()));
+        let bytewise_slice = p4_slice_len(P4Source::Bytewise, mul_chunk, dvrm_chunk);
+        for k in 0..bytewise_ops.len().div_ceil(bytewise_slice.max(1)) {
+            let bytewise_ops = &bytewise_ops;
+            collectors.push(Box::new(move |h| {
+                for op in bytewise_ops.range(k * bytewise_slice, (k + 1) * bytewise_slice) {
+                    h.add_ops(&op.collect_bitwise_ops());
+                }
+            }));
+        }
+        starts.push(("EQ", collectors.len()));
+        let eq_slice = p4_slice_len(P4Source::Eq, mul_chunk, dvrm_chunk);
+        for k in 0..eq_ops.len().div_ceil(eq_slice.max(1)) {
+            let eq_ops = &eq_ops;
+            collectors.push(Box::new(move |h| {
+                for op in eq_ops.range(k * eq_slice, (k + 1) * eq_slice) {
+                    h.add_ops(&op.collect_bitwise_ops());
+                }
+            }));
+        }
+        starts.push(("STORE", collectors.len()));
+        let store_slice = p4_slice_len(P4Source::Store, mul_chunk, dvrm_chunk);
+        for slice in store_ops.parts().flat_map(|part| part.chunks(store_slice)) {
+            collectors.push(Box::new(move |h| {
+                for op in slice {
+                    h.add_ops(&op.collect_bitwise_ops());
+                }
+            }));
+        }
+        starts.push(("MEMW_A", collectors.len()));
+        for slice in
+            memw_aligned_ops.chunks(p4_slice_len(P4Source::MemwAligned, mul_chunk, dvrm_chunk))
+        {
+            collectors.push(Box::new(move |h| {
+                h.add_ops(&collect_bitwise_from_memw_aligned(slice))
+            }));
+        }
+        starts.push(("KECCAK", collectors.len()));
+        let keccak_slice = p4_slice_len(P4Source::Keccak, mul_chunk, dvrm_chunk);
+        for slice in keccak_ops
+            .parts()
+            .flat_map(|part| part.chunks(keccak_slice))
+        {
+            collectors.push(Box::new(move |h| {
+                if direct {
+                    count_bitwise_from_keccak(slice, h)
+                } else {
+                    h.add_ops(&collect_bitwise_from_keccak(slice))
+                }
+            }));
+        }
+        starts.push(("ECDAS", collectors.len()));
+        let ecdas_slice = p4_slice_len(P4Source::Ecdas, mul_chunk, dvrm_chunk);
+        for slice in ecdas_ops.parts().flat_map(|part| part.chunks(ecdas_slice)) {
+            collectors.push(Box::new(move |h| {
+                h.add_ops(&collect_bitwise_from_compact_ecdas(slice))
+            }));
+        }
+    } else {
+        for (k, name) in [
+            "LT", "MUL", "DVRM", "BRANCH", "SHIFT", "BYTEWISE", "EQ", "STORE", "MEMW_A", "KECCAK",
+            "ECDAS",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            starts.push((name, collectors.len() + k));
+        }
+        // `LAMBDA_VM_P4_SLICED=0`: every source one collector, as before the slices (the A/B's
+        // control). The same multiplicities: the histogram is a commutative sum.
+        collectors.extend([
+            Box::new(|h: &mut bitwise::BitwiseHistogram| {
+                for part in &lt_ops.parts {
+                    match *part {
+                        Part::Ops(ops) => h.add_ops(&collect_bitwise_from_lt_ops(ops)),
+                        Part::Compact(compact) => {
+                            for start in (0..compact.len()).step_by(1 << 20) {
+                                let mut slice = Vec::new();
+                                compact.expand_into(start, start + (1 << 20), &mut slice);
+                                h.add_ops(&collect_bitwise_from_lt_ops(&slice));
+                            }
+                        }
+                    }
+                }
+            }) as Collector,
+            // MUL and DVRM deduplicate per instance: instance by instance.
+            Box::new(|h| {
+                for k in 0..mul_ops.len().div_ceil(mul_chunk.max(1)) {
+                    let slice = mul_ops.range(k * mul_chunk, (k + 1) * mul_chunk);
+                    h.add_ops(&collect_bitwise_from_mul(&slice, mul_chunk))
+                }
+            }),
+            Box::new(|h| {
+                for k in 0..dvrm_ops.len().div_ceil(dvrm_chunk.max(1)) {
+                    let slice = dvrm_ops.range(k * dvrm_chunk, (k + 1) * dvrm_chunk);
+                    h.add_ops(&collect_bitwise_from_dvrm(&slice, dvrm_chunk))
+                }
+            }),
+            Box::new(|h| {
+                for k in 0..branch_ops.len().div_ceil(1 << 20) {
+                    let slice = branch_ops.range(k << 20, (k + 1) << 20);
+                    h.add_ops(&collect_bitwise_from_branch_ops(&slice))
+                }
+            }),
+            Box::new(|h| {
+                for part in shift_ops.parts() {
+                    h.add_ops(&shift::collect_bitwise_from_shift(part))
+                }
+            }),
+            Box::new(|h| {
+                for k in 0..bytewise_ops.len().div_ceil(1 << 20) {
+                    for op in bytewise_ops.range(k << 20, (k + 1) << 20) {
+                        h.add_ops(&op.collect_bitwise_ops());
+                    }
+                }
+            }),
+            Box::new(|h| {
+                for k in 0..eq_ops.len().div_ceil(1 << 20) {
+                    for op in eq_ops.range(k << 20, (k + 1) << 20) {
+                        h.add_ops(&op.collect_bitwise_ops());
+                    }
+                }
+            }),
+            Box::new(|h| {
+                for op in store_ops.iter() {
+                    h.add_ops(&op.collect_bitwise_ops());
+                }
+            }),
+            Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(memw_aligned_ops))),
+            Box::new(|h| {
+                for part in keccak_ops.parts() {
+                    h.add_ops(&collect_bitwise_from_keccak(part))
+                }
+            }),
+            Box::new(|h| {
+                for part in ecdas_ops.parts() {
+                    h.add_ops(&collect_bitwise_from_compact_ecdas(part))
+                }
+            }),
+        ]);
+    }
+    // COPY's rows are millions at a block's size: a collector a block of
+    // them, each counted straight into its histogram.
+    starts.push(("COPY", collectors.len()));
+    for part in copy_ops.parts() {
+        collectors.push(Box::new(move |h| count_bitwise_from_copy(part, h)));
+    }
+    for (k, name) in ["BLAKE3", "ECSM", "HINT", "PADDING"]
+        .into_iter()
+        .enumerate()
+    {
+        starts.push((name, collectors.len() + k));
+    }
+    collectors.extend([
+        // Small lists, one block each at a block's size: whole.
+        Box::new(|h: &mut bitwise::BitwiseHistogram| {
+            if !strip_blake3_side_effects() {
+                h.add_ops(&collect_bitwise_from_blake3(
+                    &blake3_ops.whole(),
+                    &blake3_absorb_ops.whole(),
+                ));
+            }
+        }) as Collector,
+        Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops.whole()))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops.whole()))),
+        Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
+    ]);
+    // The per-row lookups (`types::MU_MAX`): the μ bound every row of a
+    // deduplicating table sends, padding rows included, and the byte checks
+    // SHIFT's and KECCAK_RND's padding rows send, over exactly the tables
+    // this build generates, a collector a table: the chunks of the lists here
+    // ([`list_chunks`]); with only the tails kept, the streamed chunks' were
+    // counted as they were handed out (their full chunks' padding here).
+    // With `skip.p4_rows` they are counted on the whole pool instead
+    // (`count_row_lookups`, below).
+    starts.push(("LT_ROWS", collectors.len()));
+    for (start, end) in list_chunks(lt_ops.len(), max_rows.lt)
+        .into_iter()
+        .filter(|_| !rows_on_pool)
+    {
+        let lt_ops = &lt_ops;
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&lt_row_lookups(lt_ops.range(start, end).iter()))
+        }));
+    }
+    starts.push(("BRANCH_ROWS", collectors.len()));
+    for (start, end) in list_chunks(branch_segments.len(), max_rows.branch)
+        .into_iter()
+        .filter(|_| !rows_on_pool)
+    {
+        let branch_segments = &branch_segments;
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&branch_row_lookups(&branch_segments.range(start, end)))
+        }));
+    }
+    starts.push(("BYTEWISE_ROWS", collectors.len()));
+    for (start, end) in list_chunks(bytewise_segments.len(), max_rows.bytewise)
+        .into_iter()
+        .filter(|_| !rows_on_pool)
+    {
+        let bytewise_segments = &bytewise_segments;
+        collectors.push(Box::new(move |h| {
+            h.add_ops(&bytewise_row_lookups(&bytewise_segments.range(start, end)))
+        }));
+    }
+    let count_rows = || {
+        rows_on_pool
+            .then(|| count_row_lookups(&lt_ops, &branch_segments, &bytewise_segments, max_rows, by))
+    };
+    starts.push(("PADDING", collectors.len()));
+    collectors.push(Box::new(move |h| {
+        h.bump_n(
+            BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, 0, 0),
+            padding_byte_checks,
+        )
+    }));
+    starts.push(("IS_WH", collectors.len()));
+    collectors.push(Box::new(|h| {
+        is_wh::collect_bitwise_from_is_wh(is_wh_rows, h)
+    }));
+    starts.push(("PAGE", collectors.len()));
+    if let Some(page) = page {
+        collectors.push(Box::new(move |h| page(h)));
+    }
+    let (mut base, counted_iw, counted_reg) = match pre {
+        Some(pre) => (pre.histogram, pre.bitwise_ops, pre.memw_register_rows),
+        None => (bitwise::BitwiseHistogram::new(), 0, 0),
+    };
+    // The in-walk lookups past the counted ones, block by block.
+    let mut skip_iw = counted_iw;
+    let uncounted_iw: Vec<&[BitwiseOperation]> = bitwise_ops
+        .parts()
+        .filter_map(|part| {
+            let from = skip_iw.min(part.len());
+            skip_iw -= from;
+            (from < part.len()).then(|| &part[from..])
+        })
+        .collect();
+    let uncounted_reg = &memw_register_rows[counted_reg..];
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        // Cap concurrent 80 MiB histograms at `cap` to bound peak memory. The two dominant
+        // sources — the in-walk lookups and MEMW_R (each tens of millions of items) — are
+        // split into ~`cap` row-range slices so they parallelize INTERNALLY instead of each
+        // pinning one core while the rest idle. Every unit (whole collectors + the heavy
+        // slices) is round-robined into exactly `cap` buckets, one histogram each, so the
+        // split heavy work is spread across buckets rather than piled into one.
+        // add_ops/bump/merge form a commutative monoid, so any partition yields
+        // byte-identical multiplicities (same as the serial fallback below).
+        let cap = rayon::current_num_threads().clamp(1, 8);
+        let mut units: Vec<(&'static str, Collector)> =
+            Vec::with_capacity(collectors.len() + 2 * cap);
+        let iw_total: usize = uncounted_iw.iter().map(|part| part.len()).sum();
+        let iw_chunk = iw_total.div_ceil(cap).max(1);
+        for slice in uncounted_iw.iter().flat_map(|part| part.chunks(iw_chunk)) {
+            units.push(("IN_WALK", Box::new(move |h| h.add_ops(slice))));
+        }
+        let reg_chunk = uncounted_reg.len().div_ceil(cap).max(1);
+        for slice in uncounted_reg.chunks(reg_chunk) {
+            units.push((
+                "MEMW_R",
+                Box::new(move |h| memw_register::collect_bitwise_from_memw_register(slice, h)),
+            ));
+        }
+        let mut at = 0usize;
+        for (k, unit) in collectors.into_iter().enumerate() {
+            while at + 1 < starts.len() && starts[at + 1].1 <= k {
+                at += 1;
+            }
+            let name = starts.get(at).filter(|s| s.1 <= k).map_or("OTHER", |s| s.0);
+            units.push((name, unit));
+        }
+
+        let mut buckets: Vec<Vec<(&'static str, Collector)>> =
+            (0..cap).map(|_| Vec::new()).collect();
+        for (i, unit) in units.into_iter().enumerate() {
+            buckets[i % cap].push(unit);
+        }
+        // The row counts on the pool beside the buckets; the line says how
+        // long the buckets took beside them, and what each source cost.
+        type Run = (
+            bitwise::BitwiseHistogram,
+            Vec<(&'static str, f64)>,
+            f64,
+            f64,
+        );
+        let run_bucket = |bucket: &Vec<(&'static str, Collector)>| -> Run {
+            let begun = std::time::Instant::now();
+            let mut h = bitwise::BitwiseHistogram::new();
+            let mut by: Vec<(&'static str, f64)> = Vec::new();
+            for (name, f) in bucket {
+                let t = std::time::Instant::now();
+                f(&mut h);
+                add_source_seconds(&mut by, name, t.elapsed().as_secs_f64());
+            }
+            let wall = begun.elapsed().as_secs_f64();
+            (h, by, wall, wall)
+        };
+        let merge_runs = |(mut a, mut by, most, least): Run, (b, more, m, l): Run| -> Run {
+            a.merge(&b);
+            for (name, secs) in more {
+                add_source_seconds(&mut by, name, secs);
+            }
+            (a, by, most.max(m), least.min(l))
+        };
+        let run_bucket = &run_bucket;
+        let buckets = &buckets;
+        // On the pool, or beside the rest's builds on threads of their own, so
+        // the pool's queue of builds cannot hold the buckets back.
+        let run_buckets = |own: bool| {
+            let started = std::time::Instant::now();
+            let reduced = if own {
+                std::thread::scope(|scope| {
+                    let running: Vec<_> = buckets
+                        .iter()
+                        .map(|bucket| scope.spawn(move || run_bucket(bucket)))
+                        .collect();
+                    running
+                        .into_iter()
+                        .map(|t| t.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+                        .reduce(merge_runs)
+                })
+            } else {
+                buckets.par_iter().map(run_bucket).reduce_with(merge_runs)
+            };
+            (reduced, started.elapsed().as_secs_f64())
+        };
+        let (reduced, rows) = if own_threads {
+            std::thread::scope(|scope| {
+                let counting = scope.spawn(count_rows);
+                let reduced = run_buckets(true);
+                let rows = counting
+                    .join()
+                    .unwrap_or_else(|e| std::panic::resume_unwind(e));
+                (reduced, rows)
+            })
+        } else {
+            rayon::join(|| run_buckets(false), count_rows)
+        };
+        let (reduced, collectors) = reduced;
+        let reduced = reduced.map(|(h, by, most, least)| {
+            if rows.is_some() {
+                add_to_row_scan_line(&format!(
+                    " · beside it, phase 4's other collectors in {collectors:.2} s on {cap} \
+                     buckets (the longest {most:.2} s, the shortest {least:.2} s) · by source, \
+                     summed over the buckets: {}",
+                    by.iter()
+                        .map(|(name, secs)| format!("{name} {secs:.2} s"))
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                ));
+                add_to_row_scan_line(if direct {
+                    " · LT's and KECCAK's lookups counted directly"
+                } else {
+                    " · LT's and KECCAK's lookups through lists"
+                });
+            }
+            h
+        });
+        if let Some(reduced) = reduced {
+            base.merge(&reduced);
+        }
+        if let Some(rows) = rows {
+            rows.bump_into(&mut base);
+        }
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        for part in &uncounted_iw {
+            base.add_ops(part);
+        }
+        memw_register::collect_bitwise_from_memw_register(uncounted_reg, &mut base);
+        for f in &collectors {
+            f(&mut base);
+        }
+        if let Some(rows) = count_rows() {
+            rows.bump_into(&mut base);
+        }
+    }
+    if rows_on_pool {
+        build_stamps::mark("p4 rows pool");
+    }
+    base
+}
+
+/// The BITWISE histogram, counted in [`FinishPlan::new`] or, beside the
+/// rest's builds ([`StreamSkip::p4_beside`]), left for BITWISE's own table to
+/// count: with it what phase 4 reads that the plan does not keep.
+enum BitwiseCount<'a> {
+    Counted(bitwise::BitwiseHistogram),
+    Beside(Box<P4Pending<'a>>),
+}
+
+struct P4Pending<'a> {
+    bitwise_ops: BlockVec<BitwiseOperation>,
+    page: Option<PageCount<'a>>,
+    pre: Option<PreCounted>,
+}
+
+/// The lists phase 4 reads, each shared with the units that build its
+/// tables ([`FinishPlan::units_keeping`]).
+#[derive(Clone)]
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+struct P4Shared {
+    lt: std::sync::Arc<LtLists>,
+    shift_ops: std::sync::Arc<BlockVec<ShiftOperation>>,
+    store_ops: std::sync::Arc<BlockVec<store::StoreOperation>>,
+    memw_aligned_ops: std::sync::Arc<Vec<memw_aligned::AlignedRow>>,
+    memw_register_rows: std::sync::Arc<Vec<RegRow>>,
+    branch_ops: std::sync::Arc<CompactBranch>,
+    mul_ops: std::sync::Arc<BlockVec<(MulOperation, bool)>>,
+    dvrm_ops: std::sync::Arc<BlockVec<(DvrmOperation, bool)>>,
+    eq_ops: std::sync::Arc<CompactEq>,
+    bytewise_ops: std::sync::Arc<CompactBytewise>,
+    keccak_ops: std::sync::Arc<BlockVec<KeccakOperation>>,
+    ecdas_ops: std::sync::Arc<BlockVec<ecdas::CompactEcdasOp>>,
+    copy_ops: std::sync::Arc<BlockVec<copy::CopyOperation>>,
+    blake3_ops: std::sync::Arc<BlockVec<Blake3Operation>>,
+    blake3_absorb_ops: std::sync::Arc<BlockVec<blake3::Blake3AbsorbOperation>>,
+    ecsm_ops: std::sync::Arc<BlockVec<ecsm::EcsmOperation>>,
+    hint_ops: std::sync::Arc<BlockVec<hint::HintOperation>>,
+    is_wh_rows: std::sync::Arc<Vec<(is_wh::IsWhKey, u64)>>,
+}
+
+impl P4Shared {
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    fn lists<'s>(
+        &'s self,
+        max_rows: &'s crate::tables::MaxRowsConfig,
+        num_padding_rows: usize,
+        padding_byte_checks: u64,
+        mode: P4Mode,
+    ) -> P4Lists<'s> {
+        P4Lists {
+            lt: &self.lt,
+            shift_ops: &self.shift_ops,
+            store_ops: &self.store_ops,
+            memw_aligned_ops: &self.memw_aligned_ops,
+            memw_register_rows: &self.memw_register_rows,
+            branch_ops: &self.branch_ops,
+            mul_ops: &self.mul_ops,
+            dvrm_ops: &self.dvrm_ops,
+            eq_ops: &self.eq_ops,
+            bytewise_ops: &self.bytewise_ops,
+            keccak_ops: &self.keccak_ops,
+            ecdas_ops: &self.ecdas_ops,
+            copy_ops: &self.copy_ops,
+            blake3_ops: &self.blake3_ops,
+            blake3_absorb_ops: &self.blake3_absorb_ops,
+            ecsm_ops: &self.ecsm_ops,
+            hint_ops: &self.hint_ops,
+            is_wh_rows: &self.is_wh_rows,
+            max_rows,
+            num_padding_rows,
+            padding_byte_checks,
+            mode,
+        }
+    }
+}
+
+impl P4Pending<'_> {
+    /// The histogram, counted now over `lists` (`own_threads` as
+    /// [`count_bitwise`]).
+    fn count(self, lists: P4Lists<'_>, own_threads: bool) -> bitwise::BitwiseHistogram {
+        let Self {
+            bitwise_ops,
+            page,
+            pre,
+        } = self;
+        let page = page.as_deref().map(|p| p as _);
+        count_bitwise(lists, &bitwise_ops, page, pre, own_threads)
+    }
+}
+
+/// The byte checks SHIFT's and KECCAK_RND's padding rows send: the tables of
+/// the lists here ([`list_chunks`]) and, with only the tails kept, SHIFT's
+/// streamed chunks' full tables.
+fn padding_byte_checks(
+    shift_ops: usize,
+    keccak_ops: usize,
+    max_rows: &crate::tables::MaxRowsConfig,
+    skip: &StreamSkip,
+) -> u64 {
+    let shift_padding: usize = list_chunks(shift_ops, max_rows.shift)
+        .iter()
+        .map(|&(start, end)| padding_rows_of(end - start))
+        .sum::<usize>()
+        + if skip.tails {
+            skip.shift * padding_rows_of(max_rows.shift)
+        } else {
+            0
+        };
+    let keccak_rnd_padding = keccak_rnd::ARE_BYTES_PER_ROW
+        * keccak_rnd_padding_rows(keccak_ops, skip.keccak_rnd_rows, skip.cut_padding);
+    (shift_padding + keccak_rnd_padding) as u64
+}
+
+/// BITWISE's job: the histogram as counted, or what to count it from.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+enum BitwiseJob<'a> {
+    Counted(bitwise::BitwiseHistogram),
+    Beside(Box<P4Pending<'a>>, P4Shared),
 }
 
 impl<'a> FinishPlan<'a> {
@@ -173,7 +873,7 @@ impl<'a> FinishPlan<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new<I: ImageSource + Sync>(
         ops: CollectedOps,
-        initial_image: Option<&I>,
+        initial_image: Option<&'a I>,
         memory_state: &'a MemoryState,
         register_init: &'a [u32],
         decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
@@ -311,500 +1011,59 @@ impl<'a> FinishPlan<'a> {
         // KECCAK's state pointers), deduplicated once and shared by its BITWISE
         // lookups and its table, so the two read the same rows by construction.
         let is_wh_rows = is_wh::dedup_is_wh_rows(keccak_ops.parts().flat_map(keccak::is_wh_keys));
-        let bitwise_histogram = {
-            let lt_ops = lt.segments();
-            let branch_segments = branch_ops.segments();
-            let bytewise_segments = bytewise_ops.segments();
-            // The per-source bitwise collectors are all pure functions of their inputs, and the
-            // BITWISE multiplicities are order-independent (they ride a permutation-invariant bus),
-            // so every source can be collected in parallel and the per-worker histograms summed in
-            // any order.
-            //
-            // MUL/DVRM dedup their per-unique bit-gated lookups PER CHIP INSTANCE, so pass the same
-            // chunk size used to split them into instances so multiplicities match the per-instance
-            // sends. MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]. PAGE does a
-            // batched ARE_BYTES[init, fini] per row (skipped in continuation epochs, which the L2G
-            // table owns). COPY sends IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL;
-            // HINT sends ARE_BYTES for its 32 output cells.
-            // We never concatenate the lookups into one giant `Vec<BitwiseOperation>` (~140 M ops /
-            // ~560 MB at 10-tx whose only consumer is the multiplicity count). Each collector bumps
-            // the `BitwiseHistogram` it is handed: the heavy sources (MEMW_R one-per-row, PAGE
-            // one-per-byte, padding) count directly with no per-source Vec at all, and the small
-            // sources fold their transient `collect_*` Vec in and drop it. The histogram is a
-            // commutative monoid, so per-worker histograms tree-reduce to multiplicities that are
-            // independent of accumulation order.
-            type Collector<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + 'a>;
-            let mul_chunk = max_rows.mul;
-            let dvrm_chunk = max_rows.dvrm;
-            // The sources that are a sum over their ops are cut into slices of whole ops, so phase 4's
-            // buckets share them (a whole source was one bucket's long pole) and no slice's list of
-            // lookups grows with the run. MUL and DVRM deduplicate per instance, so each of their
-            // slices is one instance. The in-walk lookups and MEMW_R are split in the parallel path
-            // below; the rest stay one collector each.
-            let mut collectors: Vec<Collector> = Vec::new();
-            // Where each source's collectors start in `collectors`, in order, so the
-            // parallel path can say what each source cost (the `BLOCK P4 ROWS` line).
-            let mut starts: Vec<(&'static str, usize)> = Vec::new();
-            if p4_sliced() {
-                // LT's segments slice by slice; a compact one through a temporary of a
-                // slice's ops at a time.
-                starts.push(("LT", collectors.len()));
-                // Counted straight into the histogram (`skip.p4_direct`), or
-                // through each slice's list of lookups, as before.
-                let direct = skip.p4_direct;
-                let lt_lookups = move |slice: &[LtOperation], h: &mut bitwise::BitwiseHistogram| {
-                    if direct {
-                        count_bitwise_from_lt_ops(slice, h)
-                    } else {
-                        h.add_ops(&collect_bitwise_from_lt_ops(slice))
-                    }
-                };
-                let lt_slice = p4_slice_len(P4Source::Lt, mul_chunk, dvrm_chunk);
-                for part in &lt_ops.parts {
-                    match *part {
-                        Part::Ops(ops) => {
-                            for slice in ops.chunks(lt_slice) {
-                                collectors.push(Box::new(move |h| lt_lookups(slice, h)));
-                            }
-                        }
-                        Part::Compact(compact) => {
-                            for start in (0..compact.len()).step_by(lt_slice) {
-                                collectors.push(Box::new(move |h| {
-                                    let mut slice = Vec::new();
-                                    compact.expand_into(start, start + lt_slice, &mut slice);
-                                    lt_lookups(&slice, h)
-                                }));
-                            }
-                        }
-                    }
-                }
-                // MUL and DVRM deduplicate per instance: their slices are the
-                // instances of the concatenation (copied only where one straddles two
-                // blocks). The other sources are sums over their ops: block by block.
-                starts.push(("MUL", collectors.len()));
-                let mul_slice = p4_slice_len(P4Source::Mul, mul_chunk, dvrm_chunk);
-                for k in 0..mul_ops.len().div_ceil(mul_slice) {
-                    let mul_ops = &mul_ops;
-                    collectors.push(Box::new(move |h| {
-                        let slice = mul_ops.range(k * mul_slice, (k + 1) * mul_slice);
-                        h.add_ops(&collect_bitwise_from_mul(&slice, mul_chunk))
-                    }));
-                }
-                starts.push(("DVRM", collectors.len()));
-                let dvrm_slice = p4_slice_len(P4Source::Dvrm, mul_chunk, dvrm_chunk);
-                for k in 0..dvrm_ops.len().div_ceil(dvrm_slice) {
-                    let dvrm_ops = &dvrm_ops;
-                    collectors.push(Box::new(move |h| {
-                        let slice = dvrm_ops.range(k * dvrm_slice, (k + 1) * dvrm_slice);
-                        h.add_ops(&collect_bitwise_from_dvrm(&slice, dvrm_chunk))
-                    }));
-                }
-                starts.push(("BRANCH", collectors.len()));
-                let branch_slice = p4_slice_len(P4Source::Branch, mul_chunk, dvrm_chunk);
-                for k in 0..branch_ops.len().div_ceil(branch_slice.max(1)) {
-                    let branch_ops = &branch_ops;
-                    collectors.push(Box::new(move |h| {
-                        let slice = branch_ops.range(k * branch_slice, (k + 1) * branch_slice);
-                        h.add_ops(&collect_bitwise_from_branch_ops(&slice))
-                    }));
-                }
-                starts.push(("SHIFT", collectors.len()));
-                let shift_slice = p4_slice_len(P4Source::Shift, mul_chunk, dvrm_chunk);
-                for slice in shift_ops.parts().flat_map(|part| part.chunks(shift_slice)) {
-                    collectors.push(Box::new(move |h| {
-                        h.add_ops(&shift::collect_bitwise_from_shift(slice))
-                    }));
-                }
-                starts.push(("BYTEWISE", collectors.len()));
-                let bytewise_slice = p4_slice_len(P4Source::Bytewise, mul_chunk, dvrm_chunk);
-                for k in 0..bytewise_ops.len().div_ceil(bytewise_slice.max(1)) {
-                    let bytewise_ops = &bytewise_ops;
-                    collectors.push(Box::new(move |h| {
-                        for op in bytewise_ops.range(k * bytewise_slice, (k + 1) * bytewise_slice) {
-                            h.add_ops(&op.collect_bitwise_ops());
-                        }
-                    }));
-                }
-                starts.push(("EQ", collectors.len()));
-                let eq_slice = p4_slice_len(P4Source::Eq, mul_chunk, dvrm_chunk);
-                for k in 0..eq_ops.len().div_ceil(eq_slice.max(1)) {
-                    let eq_ops = &eq_ops;
-                    collectors.push(Box::new(move |h| {
-                        for op in eq_ops.range(k * eq_slice, (k + 1) * eq_slice) {
-                            h.add_ops(&op.collect_bitwise_ops());
-                        }
-                    }));
-                }
-                starts.push(("STORE", collectors.len()));
-                let store_slice = p4_slice_len(P4Source::Store, mul_chunk, dvrm_chunk);
-                for slice in store_ops.parts().flat_map(|part| part.chunks(store_slice)) {
-                    collectors.push(Box::new(move |h| {
-                        for op in slice {
-                            h.add_ops(&op.collect_bitwise_ops());
-                        }
-                    }));
-                }
-                starts.push(("MEMW_A", collectors.len()));
-                for slice in memw_aligned_ops.chunks(p4_slice_len(
-                    P4Source::MemwAligned,
-                    mul_chunk,
-                    dvrm_chunk,
-                )) {
-                    collectors.push(Box::new(move |h| {
-                        h.add_ops(&collect_bitwise_from_memw_aligned(slice))
-                    }));
-                }
-                starts.push(("KECCAK", collectors.len()));
-                let keccak_slice = p4_slice_len(P4Source::Keccak, mul_chunk, dvrm_chunk);
-                for slice in keccak_ops
-                    .parts()
-                    .flat_map(|part| part.chunks(keccak_slice))
-                {
-                    collectors.push(Box::new(move |h| {
-                        if direct {
-                            count_bitwise_from_keccak(slice, h)
-                        } else {
-                            h.add_ops(&collect_bitwise_from_keccak(slice))
-                        }
-                    }));
-                }
-                starts.push(("ECDAS", collectors.len()));
-                let ecdas_slice = p4_slice_len(P4Source::Ecdas, mul_chunk, dvrm_chunk);
-                for slice in ecdas_ops.parts().flat_map(|part| part.chunks(ecdas_slice)) {
-                    collectors.push(Box::new(move |h| {
-                        h.add_ops(&collect_bitwise_from_compact_ecdas(slice))
-                    }));
-                }
-            } else {
-                for (k, name) in [
-                    "LT", "MUL", "DVRM", "BRANCH", "SHIFT", "BYTEWISE", "EQ", "STORE", "MEMW_A",
-                    "KECCAK", "ECDAS",
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    starts.push((name, collectors.len() + k));
-                }
-                // `LAMBDA_VM_P4_SLICED=0`: every source one collector, as before the slices (the A/B's
-                // control). The same multiplicities: the histogram is a commutative sum.
-                collectors.extend([
-                    Box::new(|h: &mut bitwise::BitwiseHistogram| {
-                        for part in &lt_ops.parts {
-                            match *part {
-                                Part::Ops(ops) => h.add_ops(&collect_bitwise_from_lt_ops(ops)),
-                                Part::Compact(compact) => {
-                                    for start in (0..compact.len()).step_by(1 << 20) {
-                                        let mut slice = Vec::new();
-                                        compact.expand_into(start, start + (1 << 20), &mut slice);
-                                        h.add_ops(&collect_bitwise_from_lt_ops(&slice));
-                                    }
-                                }
-                            }
-                        }
-                    }) as Collector,
-                    // MUL and DVRM deduplicate per instance: instance by instance.
-                    Box::new(|h| {
-                        for k in 0..mul_ops.len().div_ceil(mul_chunk.max(1)) {
-                            let slice = mul_ops.range(k * mul_chunk, (k + 1) * mul_chunk);
-                            h.add_ops(&collect_bitwise_from_mul(&slice, mul_chunk))
-                        }
-                    }),
-                    Box::new(|h| {
-                        for k in 0..dvrm_ops.len().div_ceil(dvrm_chunk.max(1)) {
-                            let slice = dvrm_ops.range(k * dvrm_chunk, (k + 1) * dvrm_chunk);
-                            h.add_ops(&collect_bitwise_from_dvrm(&slice, dvrm_chunk))
-                        }
-                    }),
-                    Box::new(|h| {
-                        for k in 0..branch_ops.len().div_ceil(1 << 20) {
-                            let slice = branch_ops.range(k << 20, (k + 1) << 20);
-                            h.add_ops(&collect_bitwise_from_branch_ops(&slice))
-                        }
-                    }),
-                    Box::new(|h| {
-                        for part in shift_ops.parts() {
-                            h.add_ops(&shift::collect_bitwise_from_shift(part))
-                        }
-                    }),
-                    Box::new(|h| {
-                        for k in 0..bytewise_ops.len().div_ceil(1 << 20) {
-                            for op in bytewise_ops.range(k << 20, (k + 1) << 20) {
-                                h.add_ops(&op.collect_bitwise_ops());
-                            }
-                        }
-                    }),
-                    Box::new(|h| {
-                        for k in 0..eq_ops.len().div_ceil(1 << 20) {
-                            for op in eq_ops.range(k << 20, (k + 1) << 20) {
-                                h.add_ops(&op.collect_bitwise_ops());
-                            }
-                        }
-                    }),
-                    Box::new(|h| {
-                        for op in store_ops.iter() {
-                            h.add_ops(&op.collect_bitwise_ops());
-                        }
-                    }),
-                    Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
-                    Box::new(|h| {
-                        for part in keccak_ops.parts() {
-                            h.add_ops(&collect_bitwise_from_keccak(part))
-                        }
-                    }),
-                    Box::new(|h| {
-                        for part in ecdas_ops.parts() {
-                            h.add_ops(&collect_bitwise_from_compact_ecdas(part))
-                        }
-                    }),
-                ]);
-            }
-            // COPY's rows are millions at a block's size: a collector a block of
-            // them, each counted straight into its histogram.
-            starts.push(("COPY", collectors.len()));
-            for part in copy_ops.parts() {
-                collectors.push(Box::new(move |h| count_bitwise_from_copy(part, h)));
-            }
-            for (k, name) in ["BLAKE3", "ECSM", "HINT", "PADDING"]
-                .into_iter()
-                .enumerate()
-            {
-                starts.push((name, collectors.len() + k));
-            }
-            collectors.extend([
-                // Small lists, one block each at a block's size: whole.
-                Box::new(|h: &mut bitwise::BitwiseHistogram| {
-                    if !strip_blake3_side_effects() {
-                        h.add_ops(&collect_bitwise_from_blake3(
-                            &blake3_ops.whole(),
-                            &blake3_absorb_ops.whole(),
-                        ));
-                    }
-                }) as Collector,
-                Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops.whole()))),
-                Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops.whole()))),
-                Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
-            ]);
-            // The per-row lookups (`types::MU_MAX`): the μ bound every row of a
-            // deduplicating table sends, padding rows included, and the byte checks
-            // SHIFT's and KECCAK_RND's padding rows send, over exactly the tables
-            // this build generates, a collector a table: the chunks of the lists here
-            // ([`list_chunks`]); with only the tails kept, the streamed chunks' were
-            // counted as they were handed out (their full chunks' padding here).
-            // With `skip.p4_rows` they are counted on the whole pool instead
-            // (`count_row_lookups`, below).
-            let rows_on_pool = skip.p4_rows;
-            starts.push(("LT_ROWS", collectors.len()));
-            for (start, end) in list_chunks(lt_ops.len(), max_rows.lt)
-                .into_iter()
-                .filter(|_| !rows_on_pool)
-            {
-                let lt_ops = &lt_ops;
-                collectors.push(Box::new(move |h| {
-                    h.add_ops(&lt_row_lookups(lt_ops.range(start, end).iter()))
-                }));
-            }
-            starts.push(("BRANCH_ROWS", collectors.len()));
-            for (start, end) in list_chunks(branch_segments.len(), max_rows.branch)
-                .into_iter()
-                .filter(|_| !rows_on_pool)
-            {
-                let branch_segments = &branch_segments;
-                collectors.push(Box::new(move |h| {
-                    h.add_ops(&branch_row_lookups(&branch_segments.range(start, end)))
-                }));
-            }
-            starts.push(("BYTEWISE_ROWS", collectors.len()));
-            for (start, end) in list_chunks(bytewise_segments.len(), max_rows.bytewise)
-                .into_iter()
-                .filter(|_| !rows_on_pool)
-            {
-                let bytewise_segments = &bytewise_segments;
-                collectors.push(Box::new(move |h| {
-                    h.add_ops(&bytewise_row_lookups(&bytewise_segments.range(start, end)))
-                }));
-            }
-            let count_rows = || {
-                rows_on_pool.then(|| {
-                    count_row_lookups(
-                        &lt_ops,
-                        &branch_segments,
-                        &bytewise_segments,
-                        max_rows,
-                        skip.p4_by,
-                    )
-                })
-            };
-            let shift_padding: usize = list_chunks(shift_ops.len(), max_rows.shift)
-                .iter()
-                .map(|&(start, end)| padding_rows_of(end - start))
-                .sum::<usize>()
-                + if skip.tails {
-                    skip.shift * padding_rows_of(max_rows.shift)
-                } else {
-                    0
-                };
-            let keccak_rnd_padding = keccak_rnd::ARE_BYTES_PER_ROW
-                * keccak_rnd_padding_rows(keccak_ops.len(), skip.keccak_rnd_rows, skip.cut_padding);
-            starts.push(("PADDING", collectors.len()));
-            collectors.push(Box::new(move |h| {
-                h.bump_n(
-                    BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, 0, 0),
-                    (shift_padding + keccak_rnd_padding) as u64,
-                )
-            }));
-            starts.push(("IS_WH", collectors.len()));
-            collectors.push(Box::new(|h| {
-                is_wh::collect_bitwise_from_is_wh(&is_wh_rows, h)
-            }));
-            starts.push(("PAGE", collectors.len()));
-            if let Some(image) = initial_image
-                && !l2g_memory_bookend
-            {
-                collectors.push(Box::new(move |h| {
+        // PAGE's lookups, from the initial image (a continuation epoch's L2G
+        // table owns them).
+        let page = initial_image
+            .filter(|_| !l2g_memory_bookend)
+            .map(|image| -> PageCount<'a> {
+                Box::new(move |h: &mut bitwise::BitwiseHistogram| {
                     collect_bitwise_from_page(image, memory_state, l2g_memory_bookend, h)
-                }));
-            }
-            let (mut base, counted_iw, counted_reg) = match pre {
-                Some(pre) => (pre.histogram, pre.bitwise_ops, pre.memw_register_rows),
-                None => (bitwise::BitwiseHistogram::new(), 0, 0),
-            };
-            // The in-walk lookups past the counted ones, block by block.
-            let mut skip_iw = counted_iw;
-            let uncounted_iw: Vec<&[BitwiseOperation]> = bitwise_ops
-                .parts()
-                .filter_map(|part| {
-                    let from = skip_iw.min(part.len());
-                    skip_iw -= from;
-                    (from < part.len()).then(|| &part[from..])
                 })
-                .collect();
-            let uncounted_reg = &memw_register_rows[counted_reg..];
-
-            #[cfg(feature = "parallel")]
-            {
-                use rayon::prelude::*;
-                // Cap concurrent 80 MiB histograms at `cap` to bound peak memory. The two dominant
-                // sources — the in-walk lookups and MEMW_R (each tens of millions of items) — are
-                // split into ~`cap` row-range slices so they parallelize INTERNALLY instead of each
-                // pinning one core while the rest idle. Every unit (whole collectors + the heavy
-                // slices) is round-robined into exactly `cap` buckets, one histogram each, so the
-                // split heavy work is spread across buckets rather than piled into one.
-                // add_ops/bump/merge form a commutative monoid, so any partition yields
-                // byte-identical multiplicities (same as the serial fallback below).
-                let cap = rayon::current_num_threads().clamp(1, 8);
-                let mut units: Vec<(&'static str, Collector)> =
-                    Vec::with_capacity(collectors.len() + 2 * cap);
-                let iw_total: usize = uncounted_iw.iter().map(|part| part.len()).sum();
-                let iw_chunk = iw_total.div_ceil(cap).max(1);
-                for slice in uncounted_iw.iter().flat_map(|part| part.chunks(iw_chunk)) {
-                    units.push(("IN_WALK", Box::new(move |h| h.add_ops(slice))));
-                }
-                let reg_chunk = uncounted_reg.len().div_ceil(cap).max(1);
-                for slice in uncounted_reg.chunks(reg_chunk) {
-                    units.push((
-                        "MEMW_R",
-                        Box::new(move |h| {
-                            memw_register::collect_bitwise_from_memw_register(slice, h)
-                        }),
-                    ));
-                }
-                let mut at = 0usize;
-                for (k, unit) in collectors.into_iter().enumerate() {
-                    while at + 1 < starts.len() && starts[at + 1].1 <= k {
-                        at += 1;
-                    }
-                    let name = starts.get(at).filter(|s| s.1 <= k).map_or("OTHER", |s| s.0);
-                    units.push((name, unit));
-                }
-
-                let mut buckets: Vec<Vec<(&'static str, Collector)>> =
-                    (0..cap).map(|_| Vec::new()).collect();
-                for (i, unit) in units.into_iter().enumerate() {
-                    buckets[i % cap].push(unit);
-                }
-                // The row counts on the pool beside the buckets; the line says how
-                // long the buckets took beside them, and what each source cost.
-                type Run = (
-                    bitwise::BitwiseHistogram,
-                    Vec<(&'static str, f64)>,
-                    f64,
-                    f64,
-                );
-                let (reduced, rows) = rayon::join(
-                    || {
-                        let started = std::time::Instant::now();
-                        let reduced = buckets
-                            .par_iter()
-                            .map(|bucket| -> Run {
-                                let begun = std::time::Instant::now();
-                                let mut h = bitwise::BitwiseHistogram::new();
-                                let mut by: Vec<(&'static str, f64)> = Vec::new();
-                                for (name, f) in bucket {
-                                    let t = std::time::Instant::now();
-                                    f(&mut h);
-                                    add_source_seconds(&mut by, name, t.elapsed().as_secs_f64());
-                                }
-                                let wall = begun.elapsed().as_secs_f64();
-                                (h, by, wall, wall)
-                            })
-                            .reduce_with(|(mut a, mut by, most, least), (b, more, m, l)| {
-                                a.merge(&b);
-                                for (name, secs) in more {
-                                    add_source_seconds(&mut by, name, secs);
-                                }
-                                (a, by, most.max(m), least.min(l))
-                            });
-                        (reduced, started.elapsed().as_secs_f64())
-                    },
-                    count_rows,
-                );
-                let (reduced, collectors) = reduced;
-                let reduced = reduced.map(|(h, by, most, least)| {
-                    if rows.is_some() {
-                        add_to_row_scan_line(&format!(
-                            " · beside it, phase 4's other collectors in {collectors:.2} s on {cap} \
-                             buckets (the longest {most:.2} s, the shortest {least:.2} s) · by source, \
-                             summed over the buckets: {}",
-                            by.iter()
-                                .map(|(name, secs)| format!("{name} {secs:.2} s"))
-                                .collect::<Vec<_>>()
-                                .join(" · ")
-                        ));
-                        add_to_row_scan_line(if skip.p4_direct {
-                            " · LT's and KECCAK's lookups counted directly"
-                        } else {
-                            " · LT's and KECCAK's lookups through lists"
-                        });
-                    }
-                    h
-                });
-                if let Some(reduced) = reduced {
-                    base.merge(&reduced);
-                }
-                if let Some(rows) = rows {
-                    rows.bump_into(&mut base);
-                }
-            }
-            #[cfg(not(feature = "parallel"))]
-            {
-                for part in &uncounted_iw {
-                    base.add_ops(part);
-                }
-                memw_register::collect_bitwise_from_memw_register(uncounted_reg, &mut base);
-                for f in &collectors {
-                    f(&mut base);
-                }
-                if let Some(rows) = count_rows() {
-                    rows.bump_into(&mut base);
-                }
-            }
-            if rows_on_pool {
-                build_stamps::mark("p4 rows pool");
-            }
-            base
+            });
+        let bitwise = if skip.p4_beside {
+            // Counted by BITWISE's own table, beside the rest's builds: the
+            // in-walk lookups wait for it.
+            BitwiseCount::Beside(Box::new(P4Pending {
+                bitwise_ops,
+                page,
+                pre,
+            }))
+        } else {
+            let lists = P4Lists {
+                lt: &lt,
+                shift_ops: &shift_ops,
+                store_ops: &store_ops,
+                memw_aligned_ops: &memw_aligned_ops,
+                memw_register_rows: &memw_register_rows,
+                branch_ops: &branch_ops,
+                mul_ops: &mul_ops,
+                dvrm_ops: &dvrm_ops,
+                eq_ops: &eq_ops,
+                bytewise_ops: &bytewise_ops,
+                keccak_ops: &keccak_ops,
+                ecdas_ops: &ecdas_ops,
+                copy_ops: &copy_ops,
+                blake3_ops: &blake3_ops,
+                blake3_absorb_ops: &blake3_absorb_ops,
+                ecsm_ops: &ecsm_ops,
+                hint_ops: &hint_ops,
+                is_wh_rows: &is_wh_rows,
+                max_rows,
+                num_padding_rows,
+                padding_byte_checks: padding_byte_checks(
+                    shift_ops.len(),
+                    keccak_ops.len(),
+                    max_rows,
+                    skip,
+                ),
+                mode: P4Mode::of(skip),
+            };
+            let page = page.as_deref().map(|p| p as _);
+            let histogram = count_bitwise(lists, &bitwise_ops, page, pre, false);
+            // The in-walk lookups have been counted into the histogram; free them now.
+            drop(bitwise_ops);
+            BitwiseCount::Counted(histogram)
         };
-        // The in-walk lookups have been counted into the histogram; free them now.
-        drop(bitwise_ops);
         #[cfg(feature = "instruments")]
         drop(__sp);
         build_stamps::mark("p4 bitwise");
@@ -1010,7 +1269,7 @@ impl<'a> FinishPlan<'a> {
             ecdas_ops,
             hint_ops,
             is_wh_rows,
-            bitwise_histogram,
+            bitwise,
             num_padding_rows,
             halt_timestamp,
             halt_next_pc,
@@ -1081,7 +1340,7 @@ impl<'a> FinishPlan<'a> {
             ecdas_ops,
             hint_ops,
             is_wh_rows,
-            bitwise_histogram,
+            bitwise,
             num_padding_rows,
             halt_timestamp,
             halt_next_pc,
@@ -1089,6 +1348,41 @@ impl<'a> FinishPlan<'a> {
             header,
             cut_line: _,
         } = self;
+        let bitwise_histogram = match bitwise {
+            BitwiseCount::Counted(histogram) => histogram,
+            BitwiseCount::Beside(pending) => pending.count(
+                P4Lists {
+                    lt: &lt,
+                    shift_ops: &shift_ops,
+                    store_ops: &store_ops,
+                    memw_aligned_ops: &memw_aligned_ops,
+                    memw_register_rows: &memw_register_rows,
+                    branch_ops: &branch_ops,
+                    mul_ops: &mul_ops,
+                    dvrm_ops: &dvrm_ops,
+                    eq_ops: &eq_ops,
+                    bytewise_ops: &bytewise_ops,
+                    keccak_ops: &keccak_ops,
+                    ecdas_ops: &ecdas_ops,
+                    copy_ops: &copy_ops,
+                    blake3_ops: &blake3_ops,
+                    blake3_absorb_ops: &blake3_absorb_ops,
+                    ecsm_ops: &ecsm_ops,
+                    hint_ops: &hint_ops,
+                    is_wh_rows: &is_wh_rows,
+                    max_rows,
+                    num_padding_rows,
+                    padding_byte_checks: padding_byte_checks(
+                        shift_ops.len(),
+                        keccak_ops.len(),
+                        max_rows,
+                        &skip,
+                    ),
+                    mode: P4Mode::of(&skip),
+                },
+                false,
+            ),
+        };
         let lt_ops = lt.segments();
 
         // =====================================================================
@@ -1946,7 +2240,7 @@ impl<'a> FinishPlan<'a> {
             ecdas_ops,
             hint_ops,
             is_wh_rows,
-            bitwise_histogram,
+            bitwise,
             num_padding_rows,
             halt_timestamp,
             halt_next_pc,
@@ -1971,6 +2265,8 @@ impl<'a> FinishPlan<'a> {
             TraceForm::Wide
         };
         let tails = skip.tails;
+        let byte_checks = padding_byte_checks(shift_ops.len(), keccak_ops.len(), max_rows, &skip);
+        let p4_mode = P4Mode::of(&skip);
         let mut units: Vec<Unit<'a>> = Vec::new();
         let mut regen = keep.then_some(RestRegen {
             keccak_ops: None,
@@ -1981,15 +2277,54 @@ impl<'a> FinishPlan<'a> {
             form,
         });
         let cpu_ops = Arc::new(cpu_ops);
+        // The lists phase 4 reads, shared by their units and, when it counts
+        // beside them ([`StreamSkip::p4_beside`]), BITWISE's.
+        let shared = P4Shared {
+            lt: Arc::new(lt),
+            shift_ops: Arc::new(shift_ops),
+            store_ops: Arc::new(store_ops),
+            memw_aligned_ops: Arc::new(memw_aligned_ops),
+            memw_register_rows: Arc::new(memw_register_rows),
+            branch_ops: Arc::new(branch_ops),
+            mul_ops: Arc::new(mul_ops),
+            dvrm_ops: Arc::new(dvrm_ops),
+            eq_ops: Arc::new(eq_ops),
+            bytewise_ops: Arc::new(bytewise_ops),
+            keccak_ops: Arc::new(keccak_ops),
+            ecdas_ops: Arc::new(ecdas_ops),
+            copy_ops: Arc::new(copy_ops),
+            blake3_ops: Arc::new(blake3_ops),
+            blake3_absorb_ops: Arc::new(blake3_absorb_ops),
+            ecsm_ops: Arc::new(ecsm_ops),
+            hint_ops: Arc::new(hint_ops),
+            is_wh_rows: Arc::new(is_wh_rows),
+        };
 
-        // BITWISE, DECODE, KECCAK_RC, REGISTER, HALT.
+        // BITWISE, DECODE, KECCAK_RC, REGISTER, HALT. Counted beside the rest's
+        // builds, BITWISE's job counts its multiplicities first: the slide
+        // starts the tables after it meanwhile.
+        let job = match bitwise {
+            BitwiseCount::Counted(histogram) => BitwiseJob::Counted(histogram),
+            BitwiseCount::Beside(pending) => BitwiseJob::Beside(pending, shared.clone()),
+        };
         units.push(Unit::Build {
             family: family("BITWISE"),
             rows: bitwise::NUM_ROWS,
             job: Box::new(move || {
-                let mut bitwise = bitwise::generate_bitwise_trace();
-                bitwise_histogram.fill_multiplicities(&mut bitwise);
-                Ok(packed_if(pack, bitwise))
+                let histogram = match job {
+                    BitwiseJob::Counted(histogram) => histogram,
+                    BitwiseJob::Beside(pending, shared) => {
+                        let histogram = pending.count(
+                            shared.lists(max_rows, num_padding_rows, byte_checks, p4_mode),
+                            true,
+                        );
+                        build_stamps::mark("p4 bitwise beside");
+                        histogram
+                    }
+                };
+                let mut table = bitwise::generate_bitwise_trace();
+                histogram.fill_multiplicities(&mut table);
+                Ok(packed_if(pack, table))
             }),
         });
         {
@@ -2006,7 +2341,7 @@ impl<'a> FinishPlan<'a> {
                 }),
             });
         }
-        let num_keccak = keccak_ops.len();
+        let num_keccak = shared.keccak_ops.len();
         units.push(Unit::Build {
             family: family("KECCAK_RC"),
             rows: 64,
@@ -2038,7 +2373,7 @@ impl<'a> FinishPlan<'a> {
         });
 
         // COPY, KECCAK, KECCAK_RND, ECSM, ECDAS, HINT, BLAKE3.
-        let copy_ops = Arc::new(copy_ops);
+        let copy_ops = Arc::clone(&shared.copy_ops);
         units.extend(cut_units(
             family("COPY"),
             &copy_ops,
@@ -2050,7 +2385,7 @@ impl<'a> FinishPlan<'a> {
             |ops| Box::new(move || Ok(copy::generate_copy_trace(&ops.whole()))),
         )?);
         drop(copy_ops);
-        let keccak_ops = Arc::new(keccak_ops);
+        let keccak_ops = Arc::clone(&shared.keccak_ops);
         units.extend(cut_units(
             family("KECCAK"),
             &keccak_ops,
@@ -2067,7 +2402,7 @@ impl<'a> FinishPlan<'a> {
             regen.keccak_ops = Some(Arc::clone(&keccak_ops));
         }
         drop(keccak_ops);
-        let ecsm_ops = Arc::new(ecsm_ops);
+        let ecsm_ops = Arc::clone(&shared.ecsm_ops);
         units.extend(cut_units(
             family("ECSM"),
             &ecsm_ops,
@@ -2079,7 +2414,7 @@ impl<'a> FinishPlan<'a> {
             |ops| Box::new(move || Ok(ecsm::generate_ecsm_trace(&ops.whole()))),
         )?);
         drop(ecsm_ops);
-        let ecdas_ops = Arc::new(ecdas_ops);
+        let ecdas_ops = Arc::clone(&shared.ecdas_ops);
         units.extend(cut_units(
             family("ECDAS"),
             &ecdas_ops,
@@ -2104,7 +2439,7 @@ impl<'a> FinishPlan<'a> {
             },
         )?);
         drop(ecdas_ops);
-        let hint_ops = Arc::new(hint_ops);
+        let hint_ops = Arc::clone(&shared.hint_ops);
         units.extend(optional_unit(family("HINT"), hint_ops.len(), || {
             Box::new(move || {
                 Ok(packed_if(
@@ -2116,6 +2451,10 @@ impl<'a> FinishPlan<'a> {
         // BLAKE3 is a table of the proof only when it has ops (`VmAirs`'
         // `include_blake3` from the counts), whatever the build makes of it
         // otherwise. Read off the ops, so a miscounted header is refused below.
+        let (blake3_ops, blake3_absorb_ops) = (
+            Arc::clone(&shared.blake3_ops),
+            Arc::clone(&shared.blake3_absorb_ops),
+        );
         let num_blake3 = blake3_ops.len() + blake3_absorb_ops.len();
         if num_blake3 > 0 {
             let rows = rows_of(num_blake3);
@@ -2133,6 +2472,7 @@ impl<'a> FinishPlan<'a> {
                 }),
             });
         }
+        let is_wh_rows = Arc::clone(&shared.is_wh_rows);
         units.extend(optional_unit(family("IS_WH"), is_wh_rows.len(), || {
             Box::new(move || Ok(packed_if(pack, is_wh::generate_is_wh_trace(&is_wh_rows))))
         }));
@@ -2156,7 +2496,7 @@ impl<'a> FinishPlan<'a> {
             },
         )?);
         drop(cpu_ops);
-        let lt = Arc::new(lt);
+        let lt = Arc::clone(&shared.lt);
         units.extend(lt_units(&lt, max_rows.lt, &skip, pack, form)?);
         if let Some(regen) = regen.as_mut() {
             regen.lt = Some(Arc::clone(&lt));
@@ -2164,7 +2504,7 @@ impl<'a> FinishPlan<'a> {
         drop(lt);
         units.extend(segmented_units(
             family("SHIFT"),
-            shift_ops,
+            Arc::clone(&shared.shift_ops),
             max_rows.shift,
             skip.shift,
             tails,
@@ -2174,7 +2514,7 @@ impl<'a> FinishPlan<'a> {
         )?);
         units.extend(vec_units(
             family("MEMW"),
-            memw_ops,
+            Arc::new(memw_ops),
             max_rows.memw,
             skip.memw,
             tails,
@@ -2183,7 +2523,7 @@ impl<'a> FinishPlan<'a> {
         )?);
         units.extend(vec_units(
             family("MEMW_A"),
-            memw_aligned_ops,
+            Arc::clone(&shared.memw_aligned_ops),
             max_rows.memw_aligned,
             skip.memw_aligned,
             tails,
@@ -2197,7 +2537,7 @@ impl<'a> FinishPlan<'a> {
         )?);
         units.extend(vec_units(
             family("LOAD"),
-            load_ops,
+            Arc::new(load_ops),
             max_rows.load,
             skip.load,
             tails,
@@ -2206,7 +2546,7 @@ impl<'a> FinishPlan<'a> {
         )?);
         units.extend(segmented_units(
             family("MUL"),
-            mul_ops,
+            Arc::clone(&shared.mul_ops),
             max_rows.mul,
             0,
             false,
@@ -2216,7 +2556,7 @@ impl<'a> FinishPlan<'a> {
         )?);
         units.extend(segmented_units(
             family("DVRM"),
-            dvrm_ops,
+            Arc::clone(&shared.dvrm_ops),
             max_rows.dvrm,
             0,
             false,
@@ -2226,7 +2566,7 @@ impl<'a> FinishPlan<'a> {
         )?);
         units.extend(segmented_units(
             family("BRANCH"),
-            branch_ops,
+            Arc::clone(&shared.branch_ops),
             max_rows.branch,
             0,
             false,
@@ -2251,7 +2591,7 @@ impl<'a> FinishPlan<'a> {
         }));
         units.extend(vec_units(
             family("MEMW_R"),
-            memw_register_rows,
+            Arc::clone(&shared.memw_register_rows),
             max_rows.memw_register,
             skip.memw_register,
             tails,
@@ -2265,7 +2605,7 @@ impl<'a> FinishPlan<'a> {
         )?);
         units.extend(segmented_units(
             family("EQ"),
-            eq_ops,
+            Arc::clone(&shared.eq_ops),
             max_rows.eq,
             0,
             false,
@@ -2273,7 +2613,7 @@ impl<'a> FinishPlan<'a> {
         )?);
         units.extend(segmented_units(
             family("BYTEWISE"),
-            bytewise_ops,
+            Arc::clone(&shared.bytewise_ops),
             max_rows.bytewise,
             0,
             false,
@@ -2283,7 +2623,7 @@ impl<'a> FinishPlan<'a> {
         )?);
         units.extend(segmented_units(
             family("STORE"),
-            store_ops,
+            Arc::clone(&shared.store_ops),
             max_rows.store,
             skip.store,
             tails,
@@ -2293,7 +2633,7 @@ impl<'a> FinishPlan<'a> {
         )?);
         units.extend(segmented_units(
             family("CPU32"),
-            cpu32_ops,
+            Arc::new(cpu32_ops),
             max_rows.cpu32,
             0,
             false,
@@ -2420,7 +2760,7 @@ impl RestRegen {
 #[allow(clippy::too_many_arguments)]
 fn vec_units<'a, T: Send + Sync + 'a>(
     family: usize,
-    ops: Vec<T>,
+    ops: std::sync::Arc<Vec<T>>,
     max: usize,
     skip: usize,
     tails: bool,
@@ -2428,7 +2768,6 @@ fn vec_units<'a, T: Send + Sync + 'a>(
     generate: impl Fn(&[T]) -> Table + Send + Sync + 'a,
 ) -> Result<Vec<Unit<'a>>, Error> {
     let len = ops.len();
-    let ops = std::sync::Arc::new(ops);
     let generate = std::sync::Arc::new(generate);
     chunked_units(family, len, max, skip, tails, optional, |start, end| {
         let ops = std::sync::Arc::clone(&ops);
@@ -2466,16 +2805,15 @@ impl<C: delta::Codec> SegmentList<C::Op> for delta::DeltaStream<C> {
 
 /// A family's units from a list read as segments ([`chunk_and_generate_segmented`]
 /// over them); an empty list makes no table.
-fn segmented_units<'a, T: Clone + Send + Sync + 'a>(
+fn segmented_units<'a, T: Clone + Send + Sync + 'a, S: SegmentList<T> + 'a>(
     family: usize,
-    ops: impl SegmentList<T> + 'a,
+    ops: std::sync::Arc<S>,
     max: usize,
     skip: usize,
     tails: bool,
     generate: impl Fn(&[T]) -> Table + Send + Sync + 'a,
 ) -> Result<Vec<Unit<'a>>, Error> {
     let len = ops.list_len();
-    let ops = std::sync::Arc::new(ops);
     let generate = std::sync::Arc::new(generate);
     chunked_units(family, len, max, skip, tails, true, |start, end| {
         let ops = std::sync::Arc::clone(&ops);

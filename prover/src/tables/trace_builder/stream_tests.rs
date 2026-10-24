@@ -1243,3 +1243,126 @@ fn a_records_fault_moves_every_keccak_rnd_table_with_a_row() {
     }
     assert!(moved > 0, "no KECCAK_RND table held as records");
 }
+
+/// ★ Counted beside the rest's builds ([`StreamSkip::p4_beside`]), BITWISE's
+/// multiplicities are the same: the streamed finish, in waves and sliding, at
+/// budgets of one byte and none, and the monolithic finish with the knob, hand
+/// on the tables the monolithic finish builds without it, word for word. The
+/// programs reach PAGE's lookups (test_dense_pages), KECCAK, ECSM and ECDAS,
+/// COPY (test_copy_ecalls, and the committed bytes of test_commit_split) and
+/// BLAKE3, and the last window's in-walk lookups.
+#[test]
+fn bitwise_counted_beside_the_rest_builds_the_same_tables() {
+    let max_rows = MaxRowsConfig::small();
+    let configs: [(&str, Configure); 2] = [
+        (
+            "dropped",
+            Box::new(|b| b.drop_streamed_ops().expect("before any window")),
+        ),
+        (
+            "cut at the last real row",
+            Box::new(|b| cut(b, CutPadding::LastTable)),
+        ),
+    ];
+    let words = |t: &Traces| -> Vec<_> {
+        air_order(t)
+            .into_iter()
+            .map(|t| t.map(shape_and_words))
+            .collect()
+    };
+    for name in [
+        "all_instructions_64",
+        "test_keccak_multi",
+        "test_ecsm_multi",
+        "test_blake3_absorb",
+        "test_commit_split",
+        "test_copy_ecalls",
+        "test_dense_pages",
+    ] {
+        let (program, logs) = run(name);
+        for window in [7, 1000] {
+            for (config, configure) in &configs {
+                let what = format!("{name} window {window} {config}");
+                let (builder, last) =
+                    pushed(&program, &logs, &max_rows, window, configure.as_ref());
+                let want = words(&builder.finish(last).expect("the monolithic finish"));
+                let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                    configure(b).p4_beside()
+                });
+                let whole = words(&builder.finish(last).expect("the monolithic finish"));
+                assert!(
+                    whole == want,
+                    "{what}: the monolithic finish, counted beside"
+                );
+                for slide in [false, true] {
+                    for budget in [1usize, usize::MAX] {
+                        let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                            let b = configure(b).p4_beside();
+                            if slide { b.slide_rest() } else { b }
+                        });
+                        let (_, got, _) = streamed(builder, last, budget);
+                        let got: Vec<_> = got
+                            .iter()
+                            .enumerate()
+                            .map(|(k, e)| {
+                                assert_eq!(e.position, k, "{what}: position {k}");
+                                e.table.as_ref().map(shape_and_words)
+                            })
+                            .collect();
+                        assert!(
+                            got == want,
+                            "{what}, slide {slide}, budget {budget}: the tables in AIR order"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The knob leaves the count to BITWISE's own table: a plan made with it
+/// holds what phase 4 reads instead of a histogram, and one made without it
+/// holds the histogram.
+#[test]
+fn with_the_knob_the_plan_leaves_the_count_to_bitwise() {
+    let (program, logs) = run("test_keccak_multi");
+    let max_rows = MaxRowsConfig::small();
+    let artifacts = DecodeArtifacts::from_elf(&program).expect("the artifacts");
+    let image = build_initial_image(&program, &[]);
+    let register_init = register::register_init_from_entry_point(program.entry_point);
+    for beside in [false, true] {
+        let CollectedEpoch {
+            ops,
+            memory_state,
+            register_state,
+        } = Traces::collect_epoch(&artifacts, &image, &register_init, &logs, true)
+            .expect("collected");
+        let skip = StreamSkip {
+            p4_beside: beside,
+            ..StreamSkip::default()
+        };
+        let plan = super::FinishPlan::new(
+            ops,
+            Some(&image),
+            &memory_state,
+            &register_init,
+            artifacts.decode_trace.clone(),
+            &artifacts.decode,
+            register_state,
+            &max_rows,
+            #[cfg(feature = "disk-spill")]
+            StorageMode::Ram,
+            &[],
+            true,
+            false,
+            &skip,
+            None,
+        )
+        .expect("the plan");
+        assert_eq!(
+            matches!(plan.bitwise, super::BitwiseCount::Beside(_)),
+            beside,
+            "the knob {beside}"
+        );
+    }
+}
