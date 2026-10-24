@@ -138,6 +138,50 @@ static_assert(sizeof(LoadOpC) == 32, "LoadOpC is 32 bytes");
 static_assert(offsetof(LoadOpC, is_signed) == 17, "LoadOpC field order");
 static_assert(offsetof(LoadOpC, res) == 18, "LoadOpC field order");
 
+// One STORE op (`store.rs`, `StoreOperation`): the base address, the
+// timestamp, the value, and the width flags (0 or 1; none for one byte).
+struct StoreOpC {
+    uint64_t base_address;
+    uint64_t timestamp;
+    uint64_t value;
+    uint8_t write2;
+    uint8_t write4;
+    uint8_t write8;
+};
+static_assert(sizeof(StoreOpC) == 32, "StoreOpC is 32 bytes");
+static_assert(offsetof(StoreOpC, write2) == 24, "StoreOpC field order");
+
+// One SHIFT op (`shift.rs`, `ShiftOperation`): the full shift amount, the input
+// as four 16-bit halves, the amount's low byte, and flags 0 or 1.
+struct ShiftOpC {
+    uint64_t shift_amount;
+    uint16_t in_halves[4];
+    uint8_t shift;
+    uint8_t direction;
+    uint8_t is_signed;
+    uint8_t word_instr;
+};
+static_assert(sizeof(ShiftOpC) == 24, "ShiftOpC is 24 bytes");
+static_assert(offsetof(ShiftOpC, in_halves) == 8, "ShiftOpC field order");
+static_assert(offsetof(ShiftOpC, word_instr) == 19, "ShiftOpC field order");
+
+// One MEMW op (`memw.rs`, `MemwOperation`): the base address, the timestamp,
+// the eight old timestamps, the eight value and old elements (a memory byte
+// or a 32-bit register half each), and the flags and width.
+struct MemwOpC {
+    uint64_t base_address;
+    uint64_t timestamp;
+    uint64_t old_timestamp[8];
+    uint32_t value[8];
+    uint32_t old[8];
+    uint8_t is_register;
+    uint8_t width;
+    uint8_t is_read;
+};
+static_assert(sizeof(MemwOpC) == 152, "MemwOpC is 152 bytes");
+static_assert(offsetof(MemwOpC, value) == 80, "MemwOpC field order");
+static_assert(offsetof(MemwOpC, is_register) == 144, "MemwOpC field order");
+
 // ---------------------------------------------------------------------------
 // The setters (`types.rs`, `VmTable`)
 // ---------------------------------------------------------------------------
@@ -323,6 +367,204 @@ extern "C" __global__ void fill_load(const LoadOpC *ops, uint64_t n, uint64_t he
     const uint32_t top = op.width == 2 ? 1 : (op.width == 4 ? 3 : (op.width == 8 ? 7 : 0));
     w.word(c::SIGN_BIT, (op.res[top] >> 7) & 1);
     w.word(c::MU, 1);
+}
+
+// ---------------------------------------------------------------------------
+// STORE (`store.rs`, `generate_store_trace_segments_as`)
+// ---------------------------------------------------------------------------
+
+namespace store_cols {
+constexpr uint32_t BASE_ADDRESS_0 = 0;
+constexpr uint32_t TIMESTAMP_0 = 2;
+constexpr uint32_t WRITE2 = 4;
+constexpr uint32_t WRITE4 = 5;
+constexpr uint32_t WRITE8 = 6;
+constexpr uint32_t VALUE = 7;  // 8 columns
+constexpr uint32_t MU = 15;
+constexpr uint32_t NUM_COLUMNS = 16;
+}  // namespace store_cols
+
+// Rows `[0, n)` from `ops`, rows `[n, height)` zero. One thread a row.
+extern "C" __global__ void fill_store(const StoreOpC *ops, uint64_t n, uint64_t height,
+                                      uint64_t *out) {
+    namespace c = store_cols;
+    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= height) return;
+    const fill::RowWriter w{out, height, row};
+    if (row >= n) {
+        w.zeros(0, c::NUM_COLUMNS);
+        return;
+    }
+    const StoreOpC op = ops[row];
+    w.dword_wl(c::BASE_ADDRESS_0, op.base_address);
+    w.dword_wl(c::TIMESTAMP_0, op.timestamp);
+    w.word(c::WRITE2, op.write2 != 0);
+    w.word(c::WRITE4, op.write4 != 0);
+    w.word(c::WRITE8, op.write8 != 0);
+    w.dword_bl(c::VALUE, op.value);
+    w.word(c::MU, 1);
+}
+
+// ---------------------------------------------------------------------------
+// SHIFT (`shift.rs`, `generate_shift_trace_segments_as` and
+// `ShiftOperation::compute_aux`)
+// ---------------------------------------------------------------------------
+
+namespace shift_cols {
+constexpr uint32_t IN_0 = 0;  // 4 columns
+constexpr uint32_t SHIFT_AMOUNT = 4;
+constexpr uint32_t DIRECTION = 5;
+constexpr uint32_t SIGNED = 6;
+constexpr uint32_t WORD_INSTR = 7;
+constexpr uint32_t OUT_0 = 8;  // 2 columns
+constexpr uint32_t IS_NEGATIVE = 10;
+constexpr uint32_t BIT_SHIFT = 11;
+constexpr uint32_t ZBS = 12;
+constexpr uint32_t X_0 = 13;  // 5 columns
+constexpr uint32_t Y_0 = 18;  // 4 columns
+constexpr uint32_t LIMB_SHIFT_RAW_0 = 22;  // 3 columns
+constexpr uint32_t MU = 25;
+constexpr uint32_t SHIFT_B1 = 26;
+constexpr uint32_t SHIFT_H1 = 27;
+constexpr uint32_t SHIFT_HIGH = 28;
+constexpr uint32_t NUM_COLUMNS = 29;
+}  // namespace shift_cols
+
+// Rows `[0, n)` from `ops`, rows `[n, height)` padding (ZBS 1, every other
+// column zero). One thread a row.
+extern "C" __global__ void fill_shift(const ShiftOpC *ops, uint64_t n, uint64_t height,
+                                      uint64_t *out) {
+    namespace c = shift_cols;
+    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= height) return;
+    const fill::RowWriter w{out, height, row};
+    if (row >= n) {
+        w.zeros(0, c::NUM_COLUMNS);
+        w.word(c::ZBS, 1);
+        return;
+    }
+    const ShiftOpC op = ops[row];
+    const bool left = op.direction == 0;
+    const bool right = !left;
+    const bool is_negative = op.is_signed != 0 && ((op.in_halves[3] >> 15) & 1) == 1;
+    const uint16_t extension = is_negative ? 0xFFFF : 0;
+    const uint8_t bit_shift =
+        left ? (uint8_t)(op.shift & 15) : (uint8_t)((uint16_t)(256 - (uint16_t)op.shift) & 15);
+    const bool zbs = bit_shift == 0;
+    // `hwsl`: (half << z) & 0xFFFF; `hwslc`: half >> (16 - z), 0 at z = 0.
+    uint16_t x[5] = {0, 0, 0, 0, 0};
+    uint16_t y[4] = {0, 0, 0, 0};
+    if (zbs) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            if (left) {
+                x[i] = op.in_halves[i];
+            } else {
+                y[i] = op.in_halves[i];
+            }
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            x[i] = (uint16_t)((uint32_t)op.in_halves[i] << bit_shift);
+            y[i] = (uint16_t)(op.in_halves[i] >> (16 - bit_shift));
+        }
+        x[4] = (uint16_t)((uint32_t)extension << bit_shift);
+    }
+    // `limb_shift`: one-hot of (shift >> 4) & mask.
+    const int limb = op.word_instr != 0 ? ((op.shift >> 4) & 1) : ((op.shift >> 4) & 3);
+    // `compute_shifted`, 16-bit wrapping sums.
+    uint16_t shifted[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        uint16_t v = 0;
+        if (left && limb <= i) {
+            const int k = i - limb;
+            v = (uint16_t)(v + (k == 0 ? x[0] : (uint16_t)(x[k] + y[k - 1])));
+        }
+        if (right) {
+            if (limb <= 3 - i) {
+                const int k = i + limb;
+                v = (uint16_t)(v + (uint16_t)(y[k] + x[k + 1]));
+            } else {
+                v = (uint16_t)(v + extension);
+            }
+        }
+        shifted[i] = v;
+    }
+    w.dword_hl(c::IN_0, (uint64_t)op.in_halves[0] | (uint64_t)op.in_halves[1] << 16 |
+                            (uint64_t)op.in_halves[2] << 32 | (uint64_t)op.in_halves[3] << 48);
+    w.word(c::SHIFT_AMOUNT, op.shift);
+    w.word(c::SHIFT_B1, (op.shift_amount >> 8) & 0xFFull);
+    w.word(c::SHIFT_H1, (op.shift_amount >> 16) & 0xFFFFull);
+    w.word(c::SHIFT_HIGH, op.shift_amount >> 32);
+    w.word(c::DIRECTION, op.direction != 0);
+    w.word(c::SIGNED, op.is_signed != 0);
+    w.word(c::WORD_INSTR, op.word_instr != 0);
+    w.word(c::OUT_0, (uint64_t)shifted[0] | (uint64_t)shifted[1] << 16);
+    w.word(c::OUT_0 + 1, (uint64_t)shifted[2] | (uint64_t)shifted[3] << 16);
+    w.word(c::IS_NEGATIVE, is_negative);
+    w.word(c::BIT_SHIFT, bit_shift);
+    w.word(c::ZBS, zbs);
+#pragma unroll
+    for (int i = 0; i < 5; ++i) w.word(c::X_0 + i, x[i]);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) w.word(c::Y_0 + i, y[i]);
+#pragma unroll
+    for (int i = 0; i < 3; ++i) w.word(c::LIMB_SHIFT_RAW_0 + i, limb == i);
+    w.word(c::MU, 1);
+}
+
+// ---------------------------------------------------------------------------
+// MEMW (`memw.rs`, `generate_memw_trace_segments_as`)
+// ---------------------------------------------------------------------------
+
+namespace memw_cols {
+constexpr uint32_t IS_REGISTER = 0;
+constexpr uint32_t BASE_ADDRESS_0 = 1;
+constexpr uint32_t VALUE = 3;  // 8 columns
+constexpr uint32_t TIMESTAMP_0 = 11;
+constexpr uint32_t WRITE2 = 13;
+constexpr uint32_t WRITE4 = 14;
+constexpr uint32_t WRITE8 = 15;
+constexpr uint32_t OLD = 16;    // 8 columns
+constexpr uint32_t CARRY = 24;  // 7 columns
+constexpr uint32_t OLD_TIMESTAMP = 31;  // 8 × 2 columns
+constexpr uint32_t MU_READ = 47;
+constexpr uint32_t MU_WRITE = 48;
+constexpr uint32_t NUM_COLUMNS = 49;
+}  // namespace memw_cols
+
+// Rows `[0, n)` from `ops`, rows `[n, height)` zero. One thread a row.
+extern "C" __global__ void fill_memw(const MemwOpC *ops, uint64_t n, uint64_t height,
+                                     uint64_t *out) {
+    namespace c = memw_cols;
+    uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= height) return;
+    const fill::RowWriter w{out, height, row};
+    if (row >= n) {
+        w.zeros(0, c::NUM_COLUMNS);
+        return;
+    }
+    const MemwOpC &op = ops[row];
+    w.word(c::IS_REGISTER, op.is_register != 0);
+    w.dword_wl(c::BASE_ADDRESS_0, op.base_address);
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) w.word(c::VALUE + i, op.value[i]);
+    w.dword_wl(c::TIMESTAMP_0, op.timestamp);
+    w.word(c::WRITE2, op.width == 2);
+    w.word(c::WRITE4, op.width == 4);
+    w.word(c::WRITE8, op.width == 8);
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) w.word(c::OLD + i, op.old[i]);
+    // carry[i]: the low word plus i + 1 reaches 2^32.
+    const uint64_t lo = op.base_address & 0xFFFFFFFFull;
+#pragma unroll
+    for (uint32_t i = 0; i < 7; ++i) w.word(c::CARRY + i, lo + i + 1 >= (1ull << 32));
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) w.dword_wl(c::OLD_TIMESTAMP + 2 * i, op.old_timestamp[i]);
+    w.word(c::MU_READ, op.is_read != 0);
+    w.word(c::MU_WRITE, op.is_read == 0);
 }
 
 // ---------------------------------------------------------------------------

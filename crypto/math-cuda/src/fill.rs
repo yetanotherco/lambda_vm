@@ -41,6 +41,12 @@ pub const MEMW_R_COLUMNS: usize = 10;
 pub const MEMW_A_COLUMNS: usize = 29;
 /// LOAD's columns (`load::cols::NUM_COLUMNS`).
 pub const LOAD_COLUMNS: usize = 18;
+/// STORE's columns (`store::cols::NUM_COLUMNS`).
+pub const STORE_COLUMNS: usize = 16;
+/// SHIFT's columns (`shift::cols::NUM_COLUMNS`).
+pub const SHIFT_COLUMNS: usize = 29;
+/// MEMW's columns (`memw::cols::NUM_COLUMNS`).
+pub const MEMW_COLUMNS: usize = 49;
 /// CPU's columns (`cpu::cols::NUM_COLUMNS`).
 pub const CPU_COLUMNS: usize = 37;
 /// KECCAK_RND's columns (`keccak_rnd::cols::NUM_COLUMNS`).
@@ -167,6 +173,48 @@ pub struct LoadOpC {
     pub res: [u8; 8],
 }
 
+/// One STORE op (the prover's `StoreOperation`): the base address, the
+/// timestamp, the value, and the width flags (0 or 1; none for one byte).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreOpC {
+    pub base_address: u64,
+    pub timestamp: u64,
+    pub value: u64,
+    pub write2: u8,
+    pub write4: u8,
+    pub write8: u8,
+}
+
+/// One SHIFT op (the prover's `ShiftOperation`): the full shift amount, the
+/// input as four 16-bit halves, the amount's low byte, and flags 0 or 1.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShiftOpC {
+    pub shift_amount: u64,
+    pub in_halves: [u16; 4],
+    pub shift: u8,
+    pub direction: u8,
+    pub is_signed: u8,
+    pub word_instr: u8,
+}
+
+/// One MEMW op (the prover's `MemwOperation`): the base address, the
+/// timestamp, the eight old timestamps, the eight value and old elements, and
+/// the flags and width.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemwOpC {
+    pub base_address: u64,
+    pub timestamp: u64,
+    pub old_timestamp: [u64; 8],
+    pub value: [u32; 8],
+    pub old: [u32; 8],
+    pub is_register: u8,
+    pub width: u8,
+    pub is_read: u8,
+}
+
 const _: () = {
     assert!(size_of::<LogC>() == 40);
     assert!(offset_of!(LogC, dst_val) == 32);
@@ -189,10 +237,18 @@ const _: () = {
     assert!(size_of::<LoadOpC>() == 32);
     assert!(offset_of!(LoadOpC, is_signed) == 17);
     assert!(offset_of!(LoadOpC, res) == 18);
+    assert!(size_of::<StoreOpC>() == 32);
+    assert!(offset_of!(StoreOpC, write2) == 24);
+    assert!(size_of::<ShiftOpC>() == 24);
+    assert!(offset_of!(ShiftOpC, in_halves) == 8);
+    assert!(offset_of!(ShiftOpC, word_instr) == 19);
+    assert!(size_of::<MemwOpC>() == 152);
+    assert!(offset_of!(MemwOpC, value) == 80);
+    assert!(offset_of!(MemwOpC, is_register) == 144);
 };
 
 // SAFETY: each is `#[repr(C)]` plain data whose padding no kernel reads
-// (`RegRowC::pad` is a named field; `AlignedRowC` and `LoadOpC` end in
+// (`RegRowC::pad` is a named field; the row families' structs end in
 // padding), so its bytes on the card are the struct the kernel declares.
 unsafe impl DeviceRepr for LogC {}
 unsafe impl DeviceRepr for RegRowC {}
@@ -202,6 +258,9 @@ unsafe impl DeviceRepr for KeccakOpC {}
 unsafe impl DeviceRepr for KeccakOpInC {}
 unsafe impl DeviceRepr for AlignedRowC {}
 unsafe impl DeviceRepr for LoadOpC {}
+unsafe impl DeviceRepr for StoreOpC {}
+unsafe impl DeviceRepr for ShiftOpC {}
+unsafe impl DeviceRepr for MemwOpC {}
 
 impl DecodeRunC {
     /// The DECODE row of `pc` in `runs` (ascending and disjoint), as the CPU
@@ -232,6 +291,9 @@ struct Module {
     memw_r: CudaFunction,
     memw_a: CudaFunction,
     load: CudaFunction,
+    store: CudaFunction,
+    shift: CudaFunction,
+    memw: CudaFunction,
     cpu: CudaFunction,
     keccak_rnd: CudaFunction,
     keccak_rnd_in: CudaFunction,
@@ -248,6 +310,9 @@ fn module() -> Result<&'static Module> {
         memw_r: module.load_function("fill_memw_r")?,
         memw_a: module.load_function("fill_memw_a")?,
         load: module.load_function("fill_load")?,
+        store: module.load_function("fill_store")?,
+        shift: module.load_function("fill_shift")?,
+        memw: module.load_function("fill_memw")?,
         cpu: module.load_function("fill_cpu_from_logs")?,
         keccak_rnd: module.load_function("fill_keccak_rnd")?,
         keccak_rnd_in: module.load_function("fill_keccak_rnd_in")?,
@@ -550,6 +615,21 @@ pub enum RecordsInput<'a> {
         records: &'a [&'a [LoadOpC]],
         rows: usize,
     },
+    /// STORE's `rows` rows: `records`' pieces in order, then zero rows.
+    Store {
+        records: &'a [&'a [StoreOpC]],
+        rows: usize,
+    },
+    /// SHIFT's `rows` rows: `records`' pieces in order, then padding rows.
+    Shift {
+        records: &'a [&'a [ShiftOpC]],
+        rows: usize,
+    },
+    /// MEMW's `rows` rows: `records`' pieces in order, then zero rows.
+    Memw {
+        records: &'a [&'a [MemwOpC]],
+        rows: usize,
+    },
 }
 
 impl std::fmt::Debug for RecordsInput<'_> {
@@ -560,6 +640,9 @@ impl std::fmt::Debug for RecordsInput<'_> {
             Self::MemwR { .. } => "MEMW_R",
             Self::MemwA { .. } => "MEMW_A",
             Self::Load { .. } => "LOAD",
+            Self::Store { .. } => "STORE",
+            Self::Shift { .. } => "SHIFT",
+            Self::Memw { .. } => "MEMW",
         };
         write!(
             f,
@@ -578,7 +661,10 @@ impl RecordsInput<'_> {
             | Self::Cpu { rows, .. }
             | Self::MemwR { rows, .. }
             | Self::MemwA { rows, .. }
-            | Self::Load { rows, .. } => *rows,
+            | Self::Load { rows, .. }
+            | Self::Store { rows, .. }
+            | Self::Shift { rows, .. }
+            | Self::Memw { rows, .. } => *rows,
         }
     }
 
@@ -590,6 +676,9 @@ impl RecordsInput<'_> {
             Self::MemwR { .. } => MEMW_R_COLUMNS,
             Self::MemwA { .. } => MEMW_A_COLUMNS,
             Self::Load { .. } => LOAD_COLUMNS,
+            Self::Store { .. } => STORE_COLUMNS,
+            Self::Shift { .. } => SHIFT_COLUMNS,
+            Self::Memw { .. } => MEMW_COLUMNS,
         }
     }
 
@@ -602,6 +691,9 @@ impl RecordsInput<'_> {
             Self::MemwR { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::MemwA { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
             Self::Load { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
+            Self::Store { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
+            Self::Shift { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
+            Self::Memw { records, .. } => records.iter().map(|piece| size_of_val(*piece)).sum(),
         }
     }
 
@@ -613,6 +705,9 @@ impl RecordsInput<'_> {
             Self::MemwR { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::MemwA { records, .. } => records.iter().map(|piece| piece.len()).sum(),
             Self::Load { records, .. } => records.iter().map(|piece| piece.len()).sum(),
+            Self::Store { records, .. } => records.iter().map(|piece| piece.len()).sum(),
+            Self::Shift { records, .. } => records.iter().map(|piece| piece.len()).sum(),
+            Self::Memw { records, .. } => records.iter().map(|piece| piece.len()).sum(),
         }
     }
 }
@@ -812,6 +907,27 @@ pub(crate) fn fill_col_major_into(
         } => {
             let records_dev = upload_pieces(stream, pieces)?;
             launch_rows(stream, &m.load, &records_dev, records.len(), rows, dst)
+        }
+        RecordsInput::Store {
+            records: pieces,
+            rows,
+        } => {
+            let records_dev = upload_pieces(stream, pieces)?;
+            launch_rows(stream, &m.store, &records_dev, records.len(), rows, dst)
+        }
+        RecordsInput::Shift {
+            records: pieces,
+            rows,
+        } => {
+            let records_dev = upload_pieces(stream, pieces)?;
+            launch_rows(stream, &m.shift, &records_dev, records.len(), rows, dst)
+        }
+        RecordsInput::Memw {
+            records: pieces,
+            rows,
+        } => {
+            let records_dev = upload_pieces(stream, pieces)?;
+            launch_rows(stream, &m.memw, &records_dev, records.len(), rows, dst)
         }
     }
 }
