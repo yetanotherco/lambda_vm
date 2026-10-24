@@ -3898,6 +3898,18 @@ mod spill_tests {
                 "rank {rank} kept"
             );
         }
+        // Asked for exactly one table's bytes: that table and not the next;
+        // asked for none: nothing.
+        let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30], false).partial();
+        let _producer = regen.take_producer(0);
+        regen.parked(parked(0));
+        regen.parked(parked(1));
+        assert!(regen.arm());
+        assert_eq!(regen.drop_back(0), 0, "nothing asked");
+        assert_eq!(regen.drop_back(len), len, "one table's bytes");
+        regen.close_drops();
+        assert!(matches!(regen.await_rank(0, 0).0, RankDecision::Dropped(_)));
+        assert!(matches!(regen.await_rank(0, 1).0, RankDecision::Kept));
         // Settled: the candidates left are kept, and so is a table parked
         // after, at once (a waiter returns before phase A's end); their fates
         // are known from now on.
