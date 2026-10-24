@@ -148,9 +148,12 @@ where
 
 /// REV-B2-JUDGE B1-1 (a), REV-B2-A's frame probe under `Indexed`: a table
 /// stated at 2^27 rows alone in its group (the frame admits it, exempt from
-/// `group_polys`) stacks into one polynomial per column — 38 for the CPU — and
-/// the verifier's split cuts them into nine runs of four and one of two, each
-/// within `MAX_INDEX_VARS` index variables and the two-adicity.
+/// `group_polys`) stacks into one polynomial per column, and the verifier's
+/// split cuts them into runs of four and one of the rest, each within
+/// `MAX_INDEX_VARS` index variables and the two-adicity. The table is the
+/// widest outside the chunked families and the CPU's: a CPU table stated past
+/// `BLOCK_CPU_MAX_VARS` (2^21 rows, the block's chunk height) is refused by
+/// the frame, which this checks first on the widest CPU table.
 #[test]
 fn a_wide_singleton_group_splits_into_runs_of_four() {
     let elf = asm_elf_bytes("sub");
@@ -167,21 +170,49 @@ fn a_wide_singleton_group_splits_into_runs_of_four() {
             .iter()
             .map(|(_, r, _)| r.clone())
             .collect();
-    let (t, width) = honest
-        .shapes
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !chunked.iter().any(|r| r.contains(i)))
-        .map(|(i, &(w, _))| (i, w))
-        .max_by_key(|&(_, w)| w)
-        .expect("a table outside the chunked families");
+    let cpu_start = crate::cpu_proof_start(true, &proof.table_counts);
+    let cpus = cpu_start..cpu_start + proof.table_counts.cpu;
+    let widest = |keep: &dyn Fn(usize) -> bool| {
+        honest
+            .shapes
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| keep(i) && !chunked.iter().any(|r| r.contains(&i)))
+            .map(|(i, &(w, _))| (i, w))
+            .max_by_key(|&(_, w)| w)
+    };
+    // Table `t` stated at 2^27 rows, alone in its group.
     let n = proof.table_num_vars.len();
-    let mut heights = proof.table_num_vars.clone();
-    heights[t] = block_whir::BLOCK_MAX_TABLE_VARS as u8;
-    let groups: Vec<Vec<u32>> = vec![
-        vec![t as u32],
-        (0..n as u32).filter(|&i| i as usize != t).collect(),
-    ];
+    let singleton = |t: usize| {
+        let mut heights = proof.table_num_vars.clone();
+        heights[t] = block_whir::BLOCK_MAX_TABLE_VARS as u8;
+        let groups: Vec<Vec<u32>> = vec![
+            vec![t as u32],
+            (0..n as u32).filter(|&i| i as usize != t).collect(),
+        ];
+        (heights, groups)
+    };
+    let (cpu, _) = widest(&|i| cpus.contains(&i)).expect("a CPU table");
+    let (heights, groups) = singleton(cpu);
+    let statement = block_whir::BlockStatement {
+        table_num_vars: &heights,
+        groups: &groups,
+        ..proof.statement()
+    };
+    assert!(
+        matches!(
+            block_whir::block_frame(statement, &elf, &opts, &indexed),
+            Err(crate::Error::InvalidTableCounts(m)) if m.starts_with("CPU[")
+        ),
+        "a CPU table stated at 2^27 rows is refused by the frame"
+    );
+    let (t, width) = widest(&|i| !cpus.contains(&i))
+        .expect("a table outside the chunked families and the CPU's");
+    assert!(
+        width > MAX_INDEX_POLYS,
+        "table {t} is {width} columns wide: one run"
+    );
+    let (heights, groups) = singleton(t);
     let statement = block_whir::BlockStatement {
         table_num_vars: &heights,
         groups: &groups,
@@ -209,9 +240,6 @@ fn a_wide_singleton_group_splits_into_runs_of_four() {
         want.push(polys % MAX_INDEX_POLYS);
     }
     assert_eq!(runs, want);
-    if width == 38 {
-        assert_eq!(runs, [vec![4; 9], vec![2]].concat());
-    }
     for &run in &runs {
         assert!(index_vars(run) <= MAX_INDEX_VARS);
         check_index_domain(
