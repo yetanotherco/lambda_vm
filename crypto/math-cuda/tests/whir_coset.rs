@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use math_cuda::columns::DeviceColumns;
 use math_cuda::whir_coset::{
-    CosetPlan, StackSlices, coset_openings, evaluate_resident, evaluate_slices,
+    CosetPlan, StackParts, StackSlices, coset_openings, evaluate_resident, evaluate_slices,
 };
 
 const P: u64 = 0xFFFF_FFFF_0000_0001;
@@ -58,35 +58,22 @@ fn stack(num_vars: usize, seed: u64) -> (DeviceColumns, Vec<(usize, usize)>, Vec
 }
 
 /// A stack laid out as `StackedLayout::build` lays the block prover's: two
-/// tall columns, then up to 340 of heights `2^4`…`2^(num_vars-4)` (most of
-/// them short, under a 256-value tile), each at a multiple of its height with
-/// the cursor only growing (so alignment gaps), stopping at 85 % of the stack
-/// (a zero tail of at least 15 %); every fifth column 5 values short of its
-/// height (an end mid-tile). The store holds a junk column before each column
-/// and a tile of junk after the last, none of it in the stack, so a read past
-/// a part's end shows as a wrong value. Returns the store and the parts.
+/// tall columns (3/8 of the stack), then about 340 more, three in four short
+/// (`2^4`…`2^8` values, under a 256-value tile) and the rest `2^9`…
+/// `2^(num_vars-6)`, as many as fit in 94 % of the stack; taller first, every
+/// seventh pair out of order, each at a multiple of its height with the
+/// cursor only growing (so alignment gaps); then the room left up to 94 %
+/// filled, taller columns first (a zero tail of 6 % or more, as the block's
+/// stacks have). Every fifth column is 5 values short of its height (an end
+/// mid-tile). The store holds a junk column before each column and a tile of
+/// junk after the last, none of it in the stack, so a read past a part's end
+/// shows as a wrong value. Returns the store and the parts.
 fn production_stack(num_vars: usize, seed: u64) -> (DeviceColumns, Vec<(usize, usize)>) {
     let mut rng = Rng(seed);
-    let cap = (1usize << num_vars) * 85 / 100;
-    let mut heights = vec![num_vars - 2, num_vars - 3];
-    heights.extend((0..340).map(|_| {
-        if rng.next().is_multiple_of(4) {
-            4 + (rng.next() % (num_vars as u64 - 7)) as usize
-        } else {
-            4 + (rng.next() % 5) as usize
-        }
-    }));
+    let placed = production_layout(num_vars, &mut rng);
     let mut columns: Vec<Vec<u64>> = Vec::new();
     let mut parts = Vec::new();
-    let mut cursor = 0usize;
-    for (i, &h) in heights.iter().enumerate() {
-        let size = 1usize << h;
-        let offset = cursor.next_multiple_of(size);
-        if offset + size > cap {
-            break;
-        }
-        cursor = offset + size;
-        let len = if i % 5 == 4 { size - 5 } else { size };
+    for (offset, len) in placed {
         columns.push((0..1 + rng.next() % 37).map(|_| rng.next() % P).collect());
         parts.push((columns.len(), offset));
         columns.push((0..len).map(|_| rng.next() % P).collect());
@@ -95,6 +82,53 @@ fn production_stack(num_vars: usize, seed: u64) -> (DeviceColumns, Vec<(usize, u
     let refs: Vec<&[u64]> = columns.iter().map(Vec::as_slice).collect();
     let store = DeviceColumns::upload(&refs).expect("device columns (needs a GPU)");
     (store, parts)
+}
+
+/// [`production_stack`]'s columns: `(offset in the stack, length)`, in the
+/// order placed.
+fn production_layout(num_vars: usize, rng: &mut Rng) -> Vec<(usize, usize)> {
+    let cap = (1usize << num_vars) * 94 / 100;
+    let mut room = cap - (3usize << (num_vars - 3));
+    let mut heights = Vec::new();
+    for _ in 0..338 {
+        let h = if rng.next().is_multiple_of(4) {
+            9 + (rng.next() % (num_vars as u64 - 14)) as usize
+        } else {
+            4 + (rng.next() % 5) as usize
+        };
+        if (1usize << h) <= room {
+            room -= 1 << h;
+            heights.push(h);
+        }
+    }
+    heights.sort_unstable_by(|a, b| b.cmp(a));
+    for i in (0..heights.len().saturating_sub(1)).step_by(7) {
+        heights.swap(i, i + 1);
+    }
+    let heights: Vec<usize> = [num_vars - 2, num_vars - 3]
+        .into_iter()
+        .chain(heights)
+        .collect();
+    let mut placed = Vec::new();
+    let mut cursor = 0usize;
+    for (i, &h) in heights.iter().enumerate() {
+        let size = 1usize << h;
+        let offset = cursor.next_multiple_of(size);
+        if offset + size > cap {
+            continue;
+        }
+        cursor = offset + size;
+        placed.push((offset, if i % 5 == 4 { size - 5 } else { size }));
+    }
+    for h in (4..=num_vars - 4).rev() {
+        let size = 1usize << h;
+        while cursor.next_multiple_of(size) + size <= cap {
+            let offset = cursor.next_multiple_of(size);
+            cursor = offset + size;
+            placed.push((offset, size));
+        }
+    }
+    placed
 }
 
 /// [`stack`]'s columns with a zero tail of 15 %: thirteen whole columns and
@@ -236,6 +270,61 @@ fn coset_blocks_at(log_blowup: usize, count: usize) {
 fn tiles(num_vars: usize) -> u64 {
     let tile_bits = (num_vars - LOG_FOLD - KEPT).min(8);
     1 << (num_vars - tile_bits)
+}
+
+/// The production-like layouts the card tests and the measurement use (no
+/// card needed): about 340 columns or more, 85-94 % of the stack filled,
+/// alignment gaps, and tiles of every kind at the plan's tile width.
+#[test]
+fn the_production_like_stacks_have_every_tile_kind() {
+    for (num_vars, seed) in [
+        (16usize, 21u64),
+        (20, 22),
+        (24, 23),
+        (20, 31),
+        (24, 32),
+        (27, 100),
+    ] {
+        let placed = production_layout(num_vars, &mut Rng(seed));
+        let n = 1usize << num_vars;
+        let filled: usize = placed.iter().map(|&(_, len)| len).sum();
+        let mut sorted = placed.clone();
+        sorted.sort_unstable();
+        let (mut gaps, mut end) = (0usize, 0usize);
+        for &(offset, len) in &sorted {
+            assert!(offset >= end, "n {num_vars}: columns overlap");
+            gaps += offset - end;
+            end = offset + len;
+        }
+        let parts: Vec<(usize, usize, usize)> = placed
+            .iter()
+            .map(|&(offset, len)| (offset, len, offset))
+            .collect();
+        let tile_bits = (num_vars - LOG_FOLD - KEPT).min(8);
+        let kinds = StackParts::new(&parts, num_vars, n)
+            .expect("the parts place")
+            .tile_kinds(num_vars, tile_bits);
+        println!(
+            "COSET EVAL LAYOUT n={num_vars} seed={seed} parts={} fill={:.3} gaps={:.4} tiles_full={} tiles_zero={} tiles_mixed={}",
+            placed.len(),
+            filled as f64 / n as f64,
+            gaps as f64 / n as f64,
+            kinds.full,
+            kinds.zero,
+            kinds.mixed
+        );
+        assert!(
+            placed.len() >= 150,
+            "n {num_vars}: {} columns",
+            placed.len()
+        );
+        assert!(
+            (n * 85 / 100..=n * 94 / 100).contains(&filled),
+            "n {num_vars}: {filled} filled"
+        );
+        assert!(gaps > 0, "n {num_vars}: no alignment gap");
+        assert!(kinds.zero > 0 && kinds.mixed > 0, "n {num_vars}: {kinds:?}");
+    }
 }
 
 /// ★ The stack read where it lies is the assembled stack: the cosets equal
