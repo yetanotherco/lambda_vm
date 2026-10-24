@@ -217,7 +217,7 @@ fn the_card_fills_row_family_chunks_from_their_rows_as_the_host_does() {
 /// A MEMW chunk the card fills from its ops as the host does (no small
 /// program makes four MEMW ops): sixteen random ops, memory and register
 /// accesses at every width, reads and writes, low words about to carry, old
-/// timestamps up to the HALT's, in three window parts.
+/// timestamps up to 2^64 - 1, in three window parts.
 #[test]
 fn the_card_fills_a_memw_chunk_from_its_ops_as_the_host_does() {
     use super::card_records::RowRecords;

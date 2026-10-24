@@ -22,15 +22,20 @@ use executor::vm::instruction::decoding::Instruction;
 use executor::vm::instruction::execution::keccak_f1600;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
-use math_cuda::fill::{AlignedRowC, DecodeEntryC, DecodeRunC, KeccakOpC, LoadOpC, LogC};
+use math_cuda::fill::{
+    AlignedRowC, DecodeEntryC, DecodeRunC, KeccakOpC, LoadOpC, LogC, MemwOpC, ShiftOpC, StoreOpC,
+};
 
 use super::cpu::{CpuOperation, generate_cpu_trace_as};
 use super::decode::{DecodeTable, instructions_from_elf};
 use super::gpack::{Trace, TraceForm};
 use super::keccak_rnd::{self, KeccakRoundOperation, generate_keccak_rnd_rows_as};
 use super::load::{self, LoadOperation};
+use super::memw::{self, MemwOperation};
 use super::memw_aligned::{self, AlignedRow};
 use super::memw_register::{RegRow, generate_memw_register_trace_from_rows_as};
+use super::shift::{self, ShiftOperation};
+use super::store::{self, StoreOperation};
 
 /// The synthetic sets' seeds.
 pub(crate) const SEEDS: [u64; 3] = [1, 2, 3];
@@ -325,6 +330,154 @@ pub(crate) fn load_record(op: &LoadOperation) -> LoadOpC {
     }
 }
 
+/// A store op's record: the card's struct, field for field.
+pub(crate) fn store_record(op: &StoreOperation) -> StoreOpC {
+    let r = &store::card_ops(std::slice::from_ref(op))[0];
+    StoreOpC {
+        base_address: r.base_address,
+        timestamp: r.timestamp,
+        value: r.value,
+        write2: r.write2,
+        write4: r.write4,
+        write8: r.write8,
+    }
+}
+
+/// A shift op's record: the card's struct, field for field.
+pub(crate) fn shift_record(op: &ShiftOperation) -> ShiftOpC {
+    let r = &shift::card_ops(std::slice::from_ref(op))[0];
+    ShiftOpC {
+        shift_amount: r.shift_amount,
+        in_halves: r.in_halves,
+        shift: r.shift,
+        direction: r.direction,
+        is_signed: r.signed,
+        word_instr: r.word_instr,
+    }
+}
+
+/// A MEMW op's record: the card's struct, field for field.
+pub(crate) fn memw_record(op: &MemwOperation) -> MemwOpC {
+    let r = &memw::card_ops(std::slice::from_ref(op))[0];
+    MemwOpC {
+        base_address: r.base_address,
+        timestamp: r.timestamp,
+        old_timestamp: r.old_timestamp,
+        value: r.value,
+        old: r.old,
+        is_register: r.is_register,
+        width: r.width,
+        is_read: r.is_read,
+    }
+}
+
+/// `n` store ops from `seed`: widths 1, 2, 4 and 8 in turn, the values random.
+pub(crate) fn store_ops(seed: u64, n: usize) -> Vec<StoreOperation> {
+    let mut rng = seed;
+    (0..n)
+        .map(|i| {
+            StoreOperation::new(
+                splitmix(&mut rng),
+                8 + splitmix(&mut rng) % (1 << 40),
+                splitmix(&mut rng),
+                1 << (i % 4),
+            )
+        })
+        .collect()
+}
+
+/// The shift amounts of [`shift_ops`]: every bit shift and limb shift edge,
+/// at 32 and 64 bits, and amounts whose high bits are set.
+const SHIFT_AMOUNTS: [u64; 16] = [
+    0,
+    1,
+    4,
+    15,
+    16,
+    17,
+    31,
+    32,
+    33,
+    47,
+    48,
+    63,
+    64 + 7,
+    255,
+    0x1_0000_0103,
+    u64::MAX - 1,
+];
+
+/// Every direction, signedness and width at each of [`SHIFT_AMOUNTS`], the
+/// values from `seed` (one in two with its top bit set), the first `n`.
+pub(crate) fn shift_ops(seed: u64, n: usize) -> Vec<ShiftOperation> {
+    let mut rng = seed;
+    let mut ops = Vec::new();
+    for amount in SHIFT_AMOUNTS {
+        for k in 0..8u32 {
+            let value = splitmix(&mut rng) ^ (u64::from(k % 2) << 63);
+            ops.push(ShiftOperation::new(
+                value,
+                amount,
+                k & 1 == 1,
+                k & 2 == 2,
+                k & 4 == 4,
+            ));
+        }
+    }
+    ops.truncate(n);
+    ops
+}
+
+/// `n` MEMW ops from `seed`: memory and register accesses (bytes or 32-bit
+/// halves) at every width, reads and writes, low words about to carry, old
+/// timestamps up to 2^64 - 1.
+pub(crate) fn memw_ops(seed: u64, n: usize) -> Vec<MemwOperation> {
+    let mut rng = seed;
+    (0..n)
+        .map(|i| {
+            let is_register = i % 3 == 1;
+            let element = |w: u64| {
+                if is_register {
+                    w as u32
+                } else {
+                    (w & 0xFF) as u32
+                }
+            };
+            let base_address = (splitmix(&mut rng) & !0xFFFF_FFFF) | (0xFFFF_FFF8 + (i % 8) as u64);
+            let timestamp = splitmix(&mut rng) >> 1;
+            let mut old_timestamp: [u64; 8] = std::array::from_fn(|_| splitmix(&mut rng) >> 2);
+            if i == 5 {
+                old_timestamp[3] = u64::MAX;
+            }
+            MemwOperation {
+                base_address,
+                timestamp,
+                old_timestamp,
+                value: std::array::from_fn(|_| element(splitmix(&mut rng))),
+                old: std::array::from_fn(|_| element(splitmix(&mut rng))),
+                is_register,
+                width: 1 << (i % 4),
+                is_read: i % 2 == 0,
+            }
+        })
+        .collect()
+}
+
+/// STORE's host fill of `ops`, in `form`.
+pub(crate) fn store_host(ops: &[StoreOperation], form: TraceForm) -> Trace {
+    store::generate_store_trace_segments_as(&[ops], form)
+}
+
+/// SHIFT's host fill of `ops`, in `form`.
+pub(crate) fn shift_host(ops: &[ShiftOperation], form: TraceForm) -> Trace {
+    shift::generate_shift_trace_segments_as(&[ops], form)
+}
+
+/// MEMW's host fill of `ops`, in `form`.
+pub(crate) fn memw_host(ops: &[MemwOperation], form: TraceForm) -> Trace {
+    memw::generate_memw_trace_segments_as(&[ops], form)
+}
+
 /// `n` aligned rows from `seed`: memory and register accesses, reads and
 /// writes, of widths 1, 2, 4 and 8 in turn, the values random (a register
 /// access's two 32-bit halves, a memory access's eight bytes).
@@ -469,6 +622,13 @@ const KAT_MEMW_A_ROWS: usize = 13;
 const KAT_MEMW_A_HEIGHT: usize = 16;
 const KAT_LOAD_OPS: usize = 19;
 const KAT_LOAD_HEIGHT: usize = 32;
+/// The known-answer STORE, SHIFT and MEMW tables: ops, then padding rows.
+const KAT_STORE_OPS: usize = 11;
+const KAT_STORE_HEIGHT: usize = 16;
+const KAT_SHIFT_OPS: usize = 123;
+const KAT_SHIFT_HEIGHT: usize = 128;
+const KAT_MEMW_OPS: usize = 13;
+const KAT_MEMW_HEIGHT: usize = 16;
 /// The known-answer KECCAK_RND tables, `(first op, ops, skip, rows)` of
 /// [`KAT_KECCAK_OPS`] ops: cut into the first op, every round of the second,
 /// zero rows after; and cut at both ends.
@@ -638,6 +798,88 @@ pub(crate) fn host_kat_vectors() -> String {
     s += &c_list(&u64s(words), 6);
     s += "};\n\n";
 
+    // STORE.
+    let ops = store_ops(0x5354_4F52, KAT_STORE_OPS);
+    let words = col_major(&store_host(&ops, TraceForm::Wide));
+    assert_eq!(
+        words.len(),
+        KAT_STORE_HEIGHT * math_cuda::fill::STORE_COLUMNS
+    );
+    s += &format!(
+        "// STORE: {KAT_STORE_OPS} ops, then zero rows to {KAT_STORE_HEIGHT}.\n\
+         inline constexpr uint64_t KAT_STORE_N = {KAT_STORE_OPS};\n\
+         inline constexpr uint64_t KAT_STORE_HEIGHT = {KAT_STORE_HEIGHT};\n\
+         inline const StoreOpC KAT_STORE_OPS[KAT_STORE_N] = {{\n"
+    );
+    for c in ops.iter().map(store_record) {
+        s += &format!(
+            "    {{{}ull, {}ull, {}ull, {}, {}, {}}},\n",
+            c.base_address, c.timestamp, c.value, c.write2, c.write4, c.write8
+        );
+    }
+    s += "};\n// Column-major: column c's rows from c * KAT_STORE_HEIGHT.\n";
+    s += "inline const uint64_t KAT_STORE_WORDS[] = {\n";
+    s += &c_list(&u64s(words), 6);
+    s += "};\n\n";
+
+    // SHIFT.
+    let ops = shift_ops(0x5348_4946, KAT_SHIFT_OPS);
+    let words = col_major(&shift_host(&ops, TraceForm::Wide));
+    assert_eq!(
+        words.len(),
+        KAT_SHIFT_HEIGHT * math_cuda::fill::SHIFT_COLUMNS
+    );
+    s += &format!(
+        "// SHIFT: {KAT_SHIFT_OPS} ops (every direction, signedness and width at each edge amount),\n\
+         // then padding rows (ZBS 1) to {KAT_SHIFT_HEIGHT}.\n\
+         inline constexpr uint64_t KAT_SHIFT_N = {KAT_SHIFT_OPS};\n\
+         inline constexpr uint64_t KAT_SHIFT_HEIGHT = {KAT_SHIFT_HEIGHT};\n\
+         inline const ShiftOpC KAT_SHIFT_OPS[KAT_SHIFT_N] = {{\n"
+    );
+    for c in ops.iter().map(shift_record) {
+        s += &format!(
+            "    {{{}ull, {{{}}}, {}, {}, {}, {}}},\n",
+            c.shift_amount,
+            c.in_halves.map(|h| h.to_string()).join(", "),
+            c.shift,
+            c.direction,
+            c.is_signed,
+            c.word_instr
+        );
+    }
+    s += "};\n// Column-major: column c's rows from c * KAT_SHIFT_HEIGHT.\n";
+    s += "inline const uint64_t KAT_SHIFT_WORDS[] = {\n";
+    s += &c_list(&u64s(words), 6);
+    s += "};\n\n";
+
+    // MEMW.
+    let ops = memw_ops(0x4D45_4D57, KAT_MEMW_OPS);
+    let words = col_major(&memw_host(&ops, TraceForm::Wide));
+    assert_eq!(words.len(), KAT_MEMW_HEIGHT * math_cuda::fill::MEMW_COLUMNS);
+    s += &format!(
+        "// MEMW: {KAT_MEMW_OPS} ops, then zero rows to {KAT_MEMW_HEIGHT}.\n\
+         inline constexpr uint64_t KAT_MEMW_N = {KAT_MEMW_OPS};\n\
+         inline constexpr uint64_t KAT_MEMW_HEIGHT = {KAT_MEMW_HEIGHT};\n\
+         inline const MemwOpC KAT_MEMW_OPS[KAT_MEMW_N] = {{\n"
+    );
+    for c in ops.iter().map(memw_record) {
+        s += &format!(
+            "    {{{}ull, {}ull,\n     {{{}}},\n     {{{}}},\n     {{{}}}, {}, {}, {}}},\n",
+            c.base_address,
+            c.timestamp,
+            u64s(c.old_timestamp).join(", "),
+            c.value.map(|v| format!("{v}u")).join(", "),
+            c.old.map(|v| format!("{v}u")).join(", "),
+            c.is_register,
+            c.width,
+            c.is_read
+        );
+    }
+    s += "};\n// Column-major: column c's rows from c * KAT_MEMW_HEIGHT.\n";
+    s += "inline const uint64_t KAT_MEMW_WORDS[] = {\n";
+    s += &c_list(&u64s(words), 6);
+    s += "};\n\n";
+
     // CPU.
     let decode = kat_decode();
     let (entries, runs) = decode_records(&decode);
@@ -768,6 +1010,9 @@ mod tests {
         assert_eq!(f::MEMW_R_COLUMNS, memw_register::cols::NUM_COLUMNS);
         assert_eq!(f::MEMW_A_COLUMNS, memw_aligned::cols::NUM_COLUMNS);
         assert_eq!(f::LOAD_COLUMNS, load::cols::NUM_COLUMNS);
+        assert_eq!(f::STORE_COLUMNS, store::cols::NUM_COLUMNS);
+        assert_eq!(f::SHIFT_COLUMNS, shift::cols::NUM_COLUMNS);
+        assert_eq!(f::MEMW_COLUMNS, memw::cols::NUM_COLUMNS);
         assert_eq!(f::CPU_COLUMNS, cpu::cols::NUM_COLUMNS);
         assert_eq!(f::KECCAK_RND_COLUMNS, keccak_rnd::cols::NUM_COLUMNS);
         assert_eq!(std::mem::size_of::<Log>(), std::mem::size_of::<LogC>());
@@ -907,6 +1152,70 @@ mod tests {
         assert_eq!(bytes[16..26], [2, 1, 9, 8, 7, 6, 5, 4, 3, 2]);
         let unsigned = LoadOperation::new(0, 8, 1, false, [0; 8]);
         assert_eq!(field_bytes(&unsigned, 26)[16..18], [1, 0]);
+    }
+
+    /// A store, shift and MEMW op's record: its fields, and its field bytes as
+    /// uploaded (the rest is padding no kernel reads).
+    #[test]
+    fn the_op_records_encode_field_for_field() {
+        let store = StoreOperation::new(0x1122_3344_5566_7788, 0x3_0000_0010, u64::MAX - 2, 4);
+        assert_eq!(
+            store_record(&store),
+            StoreOpC {
+                base_address: 0x1122_3344_5566_7788,
+                timestamp: 0x3_0000_0010,
+                value: u64::MAX - 2,
+                write2: 0,
+                write4: 1,
+                write8: 0,
+            }
+        );
+        let bytes = field_bytes(&store, 27);
+        assert_eq!(bytes[16..24], (u64::MAX - 2).to_le_bytes());
+        assert_eq!(bytes[24..27], [0, 1, 0]);
+        let shift = ShiftOperation::new(0x8001_0203_0405_0607, 0x1_0000_0123, true, true, false);
+        assert_eq!(
+            shift_record(&shift),
+            ShiftOpC {
+                shift_amount: 0x1_0000_0123,
+                in_halves: [0x0607, 0x0405, 0x0203, 0x8001],
+                shift: 0x23,
+                direction: 1,
+                is_signed: 1,
+                word_instr: 0,
+            }
+        );
+        let bytes = field_bytes(&shift, 20);
+        assert_eq!(bytes[..8], 0x1_0000_0123u64.to_le_bytes());
+        assert_eq!(bytes[8..10], [0x07, 0x06]);
+        assert_eq!(bytes[16..20], [0x23, 1, 1, 0]);
+        let memw = &memw_ops(9, 2)[1];
+        let c = memw_record(memw);
+        assert_eq!(
+            (c.base_address, c.timestamp, c.old_timestamp),
+            (memw.base_address, memw.timestamp, memw.old_timestamp)
+        );
+        assert_eq!((c.value, c.old), (memw.value, memw.old));
+        assert_eq!(
+            (c.is_register, c.width, c.is_read),
+            (
+                u8::from(memw.is_register),
+                memw.width,
+                u8::from(memw.is_read)
+            )
+        );
+        let bytes = field_bytes(memw, 147);
+        assert_eq!(bytes[16..24], memw.old_timestamp[0].to_le_bytes());
+        assert_eq!(bytes[80..84], memw.value[0].to_le_bytes());
+        assert_eq!(bytes[112..116], memw.old[0].to_le_bytes());
+        assert_eq!(
+            bytes[144..147],
+            [
+                u8::from(memw.is_register),
+                memw.width,
+                u8::from(memw.is_read)
+            ]
+        );
     }
 
     /// A log's record: its five words in order.

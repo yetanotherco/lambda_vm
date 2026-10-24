@@ -16,6 +16,13 @@
 //      writes, every width), then zero rows, every word.
 //   1b. LOAD: nineteen ops (every width, signed or not, sign bits set and
 //      clear), then zero rows, every word.
+//   1c. STORE: eleven ops at every width, then zero rows, every word.
+//   1d. SHIFT: 123 ops, every direction, signedness and width at sixteen edge
+//      amounts (bit shift 0, limb shifts, 32 and 64 bits, high amount bits),
+//      then padding rows (ZBS 1), every word.
+//   1e. MEMW: thirteen ops (memory and register, every width, reads and
+//      writes, low words about to carry, an old timestamp of 2^64 - 1), then
+//      zero rows, every word.
 //   2. CPU: 29 logs over 24 decode entries in three runs (every op class the
 //      fill branches on, each entry in turn), then padding rows, every word;
 //      and a log whose pc no run holds, counted as missing with its row left
@@ -153,6 +160,30 @@ void test_load() {
     check_words("LOAD", out, KAT_LOAD_WORDS, height, cols);
 }
 
+void test_store() {
+    const uint64_t height = KAT_STORE_HEIGHT;
+    const uint64_t cols = store_cols::NUM_COLUMNS;
+    auto out = table(height * cols);
+    each_row(height, 0, [&] { fill_store(KAT_STORE_OPS, KAT_STORE_N, height, out.data()); });
+    check_words("STORE", out, KAT_STORE_WORDS, height, cols);
+}
+
+void test_shift() {
+    const uint64_t height = KAT_SHIFT_HEIGHT;
+    const uint64_t cols = shift_cols::NUM_COLUMNS;
+    auto out = table(height * cols);
+    each_row(height, 0, [&] { fill_shift(KAT_SHIFT_OPS, KAT_SHIFT_N, height, out.data()); });
+    check_words("SHIFT", out, KAT_SHIFT_WORDS, height, cols);
+}
+
+void test_memw() {
+    const uint64_t height = KAT_MEMW_HEIGHT;
+    const uint64_t cols = memw_cols::NUM_COLUMNS;
+    auto out = table(height * cols);
+    each_row(height, 0, [&] { fill_memw(KAT_MEMW_OPS, KAT_MEMW_N, height, out.data()); });
+    check_words("MEMW", out, KAT_MEMW_WORDS, height, cols);
+}
+
 void test_cpu() {
     const uint64_t height = KAT_CPU_HEIGHT;
     const uint64_t cols = cpu_cols::NUM_COLUMNS;
@@ -242,6 +273,9 @@ int main() {
     test_memw_r();
     test_memw_a();
     test_load();
+    test_store();
+    test_shift();
+    test_memw();
     test_cpu();
     test_keccak_rnd();
     std::printf("fill host KAT: %d checks, %d failures\n", g_checks, g_failures);
