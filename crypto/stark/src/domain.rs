@@ -74,8 +74,17 @@ impl<F: IsFFTField> Domain<F> {
     where
         A: AIR<Field = F> + ?Sized,
     {
-        let blowup_factor = air.options().blowup_factor as usize;
-        let coset_offset = FieldElement::from(air.options().coset_offset);
+        Self::from_options(
+            air.options().blowup_factor as usize,
+            air.options().coset_offset,
+            trace_length,
+        )
+    }
+
+    /// [`Domain::new`] from what it reads of the AIR: its blowup factor and
+    /// coset offset.
+    pub fn from_options(blowup_factor: usize, coset_offset: u64, trace_length: usize) -> Self {
+        let coset_offset = FieldElement::from(coset_offset);
         let root_order = trace_length.trailing_zeros();
         let trace_primitive_root = F::get_primitive_root_of_unity(root_order as u64).unwrap();
         let trace_roots_of_unity = get_powers_of_primitive_root_coset(

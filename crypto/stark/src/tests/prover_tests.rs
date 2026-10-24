@@ -442,6 +442,56 @@ fn test_multi_prove_dedups_shared_domain_params() {
     );
 }
 
+/// ★ A warmed domain is the entry a later prove's lookup finds, and it is the
+/// domain a cold build gives, value for value; a length no trace has warms
+/// nothing. The key (blowup 2, coset offset 7, 32 rows) is this test's alone.
+#[test]
+fn a_warmed_domain_is_the_one_a_prove_finds() {
+    use crate::prover::{domain_and_twiddles, warm_domain_twiddles};
+    let options = ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 3,
+        coset_offset: 7,
+        grinding_factor: 1,
+        fri_final_poly_log_degree: 7,
+        format: crate::proof::options::ProofFormat::DEFAULT,
+    };
+    let air = FibonacciAIR::<GoldilocksField>::new(&options);
+    assert!(!warm_domain_twiddles::<GoldilocksField>(2, 7, 0), "no rows");
+    assert!(
+        !warm_domain_twiddles::<GoldilocksField>(2, 7, 24),
+        "not a power of two"
+    );
+    assert!(warm_domain_twiddles::<GoldilocksField>(2, 7, 32), "built");
+    assert!(
+        !warm_domain_twiddles::<GoldilocksField>(2, 7, 32),
+        "already there"
+    );
+
+    domain_cache_stats::reset();
+    let (first, _) = domain_and_twiddles(&air, 32);
+    let (again, _) = domain_and_twiddles(&air, 32);
+    assert_eq!(
+        domain_cache_stats::get(),
+        (2, 0),
+        "both lookups hit the warmed entry"
+    );
+    assert!(std::sync::Arc::ptr_eq(&first, &again));
+
+    let cold = Domain::new(&air, 32);
+    assert_eq!(
+        first.lde_roots_of_unity_coset,
+        cold.lde_roots_of_unity_coset
+    );
+    assert_eq!(first.trace_roots_of_unity, cold.trace_roots_of_unity);
+    assert_eq!(first.trace_primitive_root, cold.trace_primitive_root);
+    assert_eq!(first.coset_offset, cold.coset_offset);
+    assert_eq!(
+        (first.blowup_factor, first.interpolation_domain_size),
+        (cold.blowup_factor, cold.interpolation_domain_size)
+    );
+}
+
 /// Differential test for the DEEP composition polynomial "direct 2N" evaluation.
 ///
 /// After this PR, `compute_deep_composition_poly_evaluations` evaluates the DEEP

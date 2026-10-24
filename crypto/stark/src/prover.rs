@@ -819,24 +819,62 @@ where
     FieldElement<F>: Send + Sync,
     A: AIR<Field = F> + ?Sized,
 {
+    let (d, t, _) = cached_domain_and_twiddles::<F>(
+        air.options().blowup_factor as usize,
+        air.options().coset_offset,
+        trace_length,
+    );
+    (d, t)
+}
+
+/// Fills the process-wide domain and twiddle cache for a trace of
+/// `trace_length` rows under `blowup_factor` and `coset_offset` — what the first
+/// prove of that shape builds before its first round — so a prove that comes
+/// later finds it there. True when it built the entry; false when it was
+/// already there, or for a length no trace has (zero, or not a power of two).
+/// Call it from a plain thread, not a rayon worker (see the pre-fill below).
+pub fn warm_domain_twiddles<F>(blowup_factor: usize, coset_offset: u64, trace_length: usize) -> bool
+where
+    F: IsFFTField + 'static,
+    FieldElement<F>: Send + Sync,
+{
+    trace_length.is_power_of_two()
+        && cached_domain_and_twiddles::<F>(blowup_factor, coset_offset, trace_length).2
+}
+
+/// [`domain_and_twiddles`] by the three values its entry is keyed by, and
+/// whether this call built the entry.
+fn cached_domain_and_twiddles<F>(
+    blowup_factor: usize,
+    coset_offset: u64,
+    trace_length: usize,
+) -> (Arc<Domain<F>>, Arc<LdeTwiddles<F>>, bool)
+where
+    F: IsFFTField + 'static,
+    FieldElement<F>: Send + Sync,
+{
     type Entry<F> = (Arc<Domain<F>>, Arc<LdeTwiddles<F>>);
     let key = (
         std::any::TypeId::of::<F>(),
         trace_length,
-        air.options().blowup_factor as usize,
-        air.options().coset_offset,
+        blowup_factor,
+        coset_offset,
     );
     {
         let cache = domain_twiddle_cache().lock().unwrap();
         if let Some(e) = cache.get(&key).and_then(|b| b.downcast_ref::<Entry<F>>()) {
             #[cfg(test)]
             crate::tests::domain_cache_stats::record(true);
-            return e.clone();
+            return (e.0.clone(), e.1.clone(), false);
         }
     }
     #[cfg(test)]
     crate::tests::domain_cache_stats::record(false);
-    let d = Arc::new(Domain::new(air, trace_length));
+    let d = Arc::new(Domain::from_options(
+        blowup_factor,
+        coset_offset,
+        trace_length,
+    ));
     let t = Arc::new(LdeTwiddles::new(&d));
     // Pre-fill every lazy domain-derived cache from this setup thread, so no
     // rayon worker ever runs — or blocks waiting on — an initializer
@@ -851,10 +889,10 @@ where
     // loser would pin ITS per-instance vectors in the pointer-keyed device
     // caches for the process lifetime, duplicating VRAM. The winner stays.
     if let Some(e) = cache.get(&key).and_then(|b| b.downcast_ref::<Entry<F>>()) {
-        return e.clone();
+        return (e.0.clone(), e.1.clone(), false);
     }
     cache.insert(key, Box::new((d.clone(), t.clone())));
-    (d, t)
+    (d, t, true)
 }
 
 /// Explicit `TABLE_PARALLELISM` override, honoured by both `k` values below so
