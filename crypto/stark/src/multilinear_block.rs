@@ -178,6 +178,11 @@ pub struct GroupStamps {
     /// background pool)`. Beside an argue the foreground count holds the
     /// argue's draws too; alone, only the openings'.
     pub open_draws: (u64, u64),
+    /// Phase B's driver thread over the group's turn on it (from the turn's
+    /// start to the next turn's), `(CPU ns, run-queue delay ns)` from its
+    /// schedstat, when [`BlockCommitted::with_sched_stamps`] asks for them
+    /// and the file reads; `None` otherwise.
+    pub sched_b: Option<(u64, u64)>,
     /// Phase A's ledger: the promise just before the group's commit (its own
     /// columns on the card, and the previous group's while it packs) and the
     /// peak through the commit (the next group's columns, uploaded beside it,
@@ -1680,6 +1685,9 @@ where
     /// in it.
     overlap: PhaseBOverlap,
     overlap_faults: OverlapFaults,
+    /// Phase B stamps its driver thread's schedstat a group turn
+    /// ([`Self::with_sched_stamps`]).
+    sched: bool,
 }
 
 impl<'a, F, E> BlockCommitted<'a, F, E>
@@ -2070,7 +2078,16 @@ where
             spilled,
             overlap: PhaseBOverlap::Off,
             overlap_faults: OverlapFaults::default(),
+            sched: false,
         })
+    }
+
+    /// Phase B reads its driver thread's CPU time and run-queue delay from
+    /// `/proc/thread-self/schedstat` at each group turn ([`GroupStamps::sched_b`]);
+    /// off unless set here. A report: the proof is the same.
+    pub fn with_sched_stamps(mut self, on: bool) -> Self {
+        self.sched = on;
+        self
     }
 
     /// Phase B opens each group beside the next group's argue, or not
@@ -2223,6 +2240,19 @@ where
     let t = Instant::now();
     let retired = stacked.retire(drop_levels, config)?;
     Ok((roots, retired, commit, t.elapsed().as_secs_f64()))
+}
+
+/// The calling thread's CPU time and run-queue delay so far, in ns, from
+/// `/proc/thread-self/schedstat` (Linux); `None` where the file does not read.
+/// A kernel without scheduler statistics prints zeros.
+fn thread_schedstat() -> Option<(u64, u64)> {
+    parse_schedstat(&std::fs::read_to_string("/proc/thread-self/schedstat").ok()?)
+}
+
+/// A schedstat line's first two fields: CPU ns and run-queue delay ns.
+fn parse_schedstat(text: &str) -> Option<(u64, u64)> {
+    let mut fields = text.split_whitespace().map(|w| w.parse::<u64>().ok());
+    Some((fields.next()??, fields.next()??))
 }
 
 /// `LAMBDA_VM_BLOCK_COMMIT_OFF_POOL`: phase A commits each group's pairs of
@@ -2952,6 +2982,7 @@ where
         mut spilled,
         overlap,
         overlap_faults,
+        sched,
     } = committed;
     let n = sizes.len();
     let mut seen = vec![false; n];
@@ -3031,8 +3062,19 @@ where
             .unwrap_or(0);
         (!reads.is_empty()).then(|| Prefetch::start(reads, 2 * widest.max(1)))
     });
+    // The driver thread's schedstat at the start of the turn under way, and
+    // its group: each turn's share is closed at the next turn's start.
+    let mut turn_sched: Option<((u64, u64), usize)> = None;
     for (p, &g) in order.iter().enumerate() {
         stamps[g].start_b = entered.elapsed().as_secs_f64();
+        if sched {
+            let now = thread_schedstat();
+            if let (Some((then, h)), Some(now)) = (turn_sched, now) {
+                stamps[h].sched_b =
+                    Some((now.0.saturating_sub(then.0), now.1.saturating_sub(then.1)));
+            }
+            turn_sched = now.map(|now| (now, g));
+        }
         let (at, size) = (starts[g], sizes[g]);
         let next_g = order.get(p + 1).copied();
         let mut fork = group_fork::<E, T>(transcript, fork_of(g));
@@ -3311,6 +3353,9 @@ where
             mem.as_deref(),
         );
         stamps[g].end_b = entered.elapsed().as_secs_f64();
+    }
+    if sched && let (Some((then, h)), Some(now)) = (turn_sched, thread_schedstat()) {
+        stamps[h].sched_b = Some((now.0.saturating_sub(then.0), now.1.saturating_sub(then.1)));
     }
     // The tables go with this function: a memory log stops holding them.
     if let Some(mem) = &mem {
@@ -3645,6 +3690,18 @@ mod spill_tests {
         let back = from_store(main).expect("converts back");
         assert_eq!(back.data().as_ptr(), at, "back");
         assert_eq!(back, copy);
+    }
+
+    /// A schedstat line reads as its CPU and run-queue delay nanoseconds; a
+    /// line that is not one reads as nothing.
+    #[test]
+    fn a_schedstat_line_reads_as_cpu_and_run_queue_delay() {
+        use super::parse_schedstat;
+        assert_eq!(parse_schedstat("123456 7890 42\n"), Some((123456, 7890)));
+        assert_eq!(parse_schedstat("0 0 0\n"), Some((0, 0)));
+        assert_eq!(parse_schedstat("123456\n"), None);
+        assert_eq!(parse_schedstat("cpu wait\n"), None);
+        assert_eq!(parse_schedstat(""), None);
     }
 
     /// Two classes rebuilt (N3): the plain groups first, then each class in

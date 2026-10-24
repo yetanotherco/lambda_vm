@@ -1802,6 +1802,73 @@ fn the_phase_b_overlap_knob_reads_one_as_on() {
     assert_eq!(phase_b_overlap_from(Some("2")), Off);
 }
 
+/// `LAMBDA_VM_BLOCK_SCHEDSTAT`: `1` on, anything else off.
+#[test]
+fn the_schedstat_knob_reads_one_as_on() {
+    use crate::block_whir::phase_b_sched_from;
+    assert!(!phase_b_sched_from(None));
+    assert!(!phase_b_sched_from(Some("0")));
+    assert!(phase_b_sched_from(Some("1")));
+    assert!(phase_b_sched_from(Some(" 1 ")));
+    assert!(!phase_b_sched_from(Some("on")));
+}
+
+/// The driver thread's schedstat readout, from stamps alone: each turn's CPU
+/// and run-queue delay in the tenth of phase B it began in, the first three
+/// tenths summed; unreadable or all zeros is said as unavailable, never as 0;
+/// with the knob off, no line.
+#[test]
+fn the_schedstat_readout_counts_turns_by_tenth_and_says_unavailable() {
+    use stark::multilinear_block::GroupStamps;
+    let turn = |start_b: f64, sched_b: Option<(u64, u64)>| GroupStamps {
+        start_b,
+        sched_b,
+        ..GroupStamps::default()
+    };
+    let ms = 1_000_000u64;
+    let stamps = |groups: Vec<GroupStamps>, on: bool| {
+        block_whir::BlockStamps {
+            groups,
+            phase_b: 10.0,
+            phase_b_sched: on,
+            ..Default::default()
+        }
+        .report()
+    };
+    let read = stamps(
+        vec![
+            turn(0.5, Some((400 * ms, 300 * ms))),
+            turn(2.5, Some((500 * ms, 100 * ms))),
+            turn(9.9, Some((600 * ms, 20 * ms))),
+        ],
+        true,
+    );
+    assert!(
+        read.contains(
+            "BLOCK PHASE-B SCHED: the driver thread over 3 group turns · CPU 1.500 s · run-queue \
+             delay 0.420 s · first three tenths of phase B: CPU 0.900 s, run-queue delay 0.400 s · \
+             by tenth (a turn in the tenth it began) CPU [0.40, 0.00, 0.50, 0.00, 0.00, 0.00, 0.00, \
+             0.00, 0.00, 0.60] · run-queue delay [0.30, 0.00, 0.10, 0.00, 0.00, 0.00, 0.00, 0.00, \
+             0.00, 0.02]\n"
+        ),
+        "{read}"
+    );
+    let none = stamps(vec![turn(0.5, None), turn(2.5, None)], true);
+    assert!(
+        none.contains(
+            "BLOCK PHASE-B SCHED: unavailable (/proc/thread-self/schedstat did not read)\n"
+        ),
+        "{none}"
+    );
+    let zeros = stamps(vec![turn(0.5, Some((0, 0)))], true);
+    assert!(
+        zeros.contains("BLOCK PHASE-B SCHED: unavailable (schedstat reads zeros"),
+        "{zeros}"
+    );
+    let off = stamps(vec![turn(0.5, Some((400 * ms, 300 * ms)))], false);
+    assert!(!off.contains("BLOCK PHASE-B SCHED"), "{off}");
+}
+
 /// The overlap's readout, on and off, from stamps alone: the per-group `paid`,
 /// the opening helper, the measured transitions on the phase-B ledger and the
 /// overlap's own line; off, every line as it was and the overlap line `off`.

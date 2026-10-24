@@ -1084,8 +1084,7 @@ pub(crate) fn phase_b_overlap_from_env() -> multilinear_block::PhaseBOverlap {
 
 /// [`phase_b_overlap_from_env`]'s reading of its variable: `1` is on,
 /// `pinned` on with the openings' read-backs through pinned staging; another
-/// word is read as off, and
-/// said once.
+/// word is read as off, and said once.
 pub(crate) fn phase_b_overlap_from(value: Option<&str>) -> multilinear_block::PhaseBOverlap {
     use multilinear_block::PhaseBOverlap;
     match value.map(str::trim) {
@@ -1105,6 +1104,18 @@ pub(crate) fn phase_b_overlap_from(value: Option<&str>) -> multilinear_block::Ph
 /// Phase B's overlap as [`BlockOptions::phase_b_overlap`] asks for it.
 fn phase_b_overlap(options: &BlockOptions) -> multilinear_block::PhaseBOverlap {
     options.phase_b_overlap
+}
+
+/// `LAMBDA_VM_BLOCK_SCHEDSTAT=1`: phase B reads its driver thread's CPU time
+/// and run-queue delay at each group turn and the readout prints them by
+/// tenth of phase B ([`BlockStamps::phase_b_sched`]). A report, off by default.
+pub(crate) fn phase_b_sched_from_env() -> bool {
+    phase_b_sched_from(std::env::var("LAMBDA_VM_BLOCK_SCHEDSTAT").ok().as_deref())
+}
+
+/// [`phase_b_sched_from_env`]'s reading: `1` on, anything else off.
+pub(crate) fn phase_b_sched_from(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
 }
 
 /// `LAMBDA_VM_BLOCK_GPACK`: [`BlockOptions::gpack`]'s production value, on
@@ -1494,6 +1505,9 @@ pub struct BlockStamps {
     /// staging, the stream's own way)`, and the bytes the pinned buffers held
     /// at its end.
     pub background_readbacks: (u64, u64, u64),
+    /// Phase B stamped its driver thread's schedstat a group turn
+    /// ([`phase_b_sched_from_env`]; each group's [`GroupStamps::sched_b`]).
+    pub phase_b_sched: bool,
 }
 
 /// A streamed build's layout, for the readout ([`BlockStamps::layout`]).
@@ -1811,6 +1825,9 @@ impl BlockStamps {
             multilinear::gpu::open_host_fallbacks(),
         ));
         out.push_str(&self.overlap_line());
+        if self.phase_b_sched {
+            out.push_str(&self.sched_line());
+        }
         // Phase A's ledger and its upload: what each group's upload took, what
         // the committer paid of it, and what the commit promised beside it.
         let hidden = sum(|g| g.upload_a - g.upload_paid);
@@ -1919,6 +1936,59 @@ impl BlockStamps {
     /// argue (whose foreground count holds the argue's draws too) and alone
     /// (theirs only); the card's drain-and-trims. Off, every opening runs
     /// alone.
+    /// Phase B's driver thread over its group turns
+    /// ([`GroupStamps::sched_b`]): its CPU time and run-queue delay in all and
+    /// by tenth of phase B (a turn counted in the tenth it started in), and
+    /// the first three tenths', when the regenerators are busiest; or why
+    /// there is nothing to print. A delay that rises where the card idles
+    /// says the thread was runnable and not running: CPU contention.
+    fn sched_line(&self) -> String {
+        let turns: Vec<(f64, u64, u64)> = self
+            .groups
+            .iter()
+            .filter_map(|g| g.sched_b.map(|(cpu, wait)| (g.start_b, cpu, wait)))
+            .collect();
+        if turns.is_empty() {
+            return "BLOCK PHASE-B SCHED: unavailable (/proc/thread-self/schedstat did not read)\n"
+                .to_string();
+        }
+        if turns.iter().all(|&(_, cpu, wait)| cpu == 0 && wait == 0) {
+            return "BLOCK PHASE-B SCHED: unavailable (schedstat reads zeros: the kernel keeps no \
+                    scheduler statistics)\n"
+                .to_string();
+        }
+        let ns = 1e-9;
+        let mut cpu = [0.0f64; 10];
+        let mut wait = [0.0f64; 10];
+        for &(start, c, w) in &turns {
+            let tenth = if self.phase_b > 0.0 {
+                ((start / self.phase_b * 10.0) as usize).min(9)
+            } else {
+                0
+            };
+            cpu[tenth] += c as f64 * ns;
+            wait[tenth] += w as f64 * ns;
+        }
+        let list = |v: &[f64]| {
+            v.iter()
+                .map(|x| format!("{x:.2}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "BLOCK PHASE-B SCHED: the driver thread over {} group turns · CPU {:.3} s · run-queue delay \
+             {:.3} s · first three tenths of phase B: CPU {:.3} s, run-queue delay {:.3} s · by tenth \
+             (a turn in the tenth it began) CPU [{}] · run-queue delay [{}]\n",
+            turns.len(),
+            cpu.iter().sum::<f64>(),
+            wait.iter().sum::<f64>(),
+            cpu[..3].iter().sum::<f64>(),
+            wait[..3].iter().sum::<f64>(),
+            list(&cpu),
+            list(&wait),
+        )
+    }
+
     fn overlap_line(&self) -> String {
         let beside = || self.groups.iter().filter(|g| g.overlapped);
         let alone = || self.groups.iter().filter(|g| !g.overlapped);
@@ -3253,12 +3323,15 @@ pub(crate) fn prove_traces(
         }
         stamps.phase_b_overlap = options.phase_b_overlap != multilinear_block::PhaseBOverlap::Off;
         stamps.phase_b_pinned = options.phase_b_overlap == multilinear_block::PhaseBOverlap::Pinned;
+        let phase_b_sched = phase_b_sched_from_env();
+        stamps.phase_b_sched = phase_b_sched;
         let readbacks_before = multilinear::gpu::background_readbacks();
         let (proof, argues, prepared_openings, groups) =
             multilinear_block::block_prove_on_forks::<_, _, _, H>(
                 block
                     .with_phase_b_overlap(phase_b_overlap(options))
-                    .with_overlap_faults(deviations.overlap_faults),
+                    .with_overlap_faults(deviations.overlap_faults)
+                    .with_sched_stamps(phase_b_sched),
                 &config,
                 &mut transcript,
                 &openings,
@@ -5678,12 +5751,15 @@ fn prove_streamed(
         stamps.phase_b_order = order.clone();
         stamps.phase_b_overlap = options.phase_b_overlap != multilinear_block::PhaseBOverlap::Off;
         stamps.phase_b_pinned = options.phase_b_overlap == multilinear_block::PhaseBOverlap::Pinned;
+        let phase_b_sched = phase_b_sched_from_env();
+        stamps.phase_b_sched = phase_b_sched;
         let readbacks_before = multilinear::gpu::background_readbacks();
         let (proof, argues, prepared_openings, groups) =
             multilinear_block::block_prove_in_order::<_, _, _, H>(
                 block
                     .with_phase_b_overlap(phase_b_overlap(options))
-                    .with_overlap_faults(deviations.overlap_faults),
+                    .with_overlap_faults(deviations.overlap_faults)
+                    .with_sched_stamps(phase_b_sched),
                 &config,
                 &mut transcript,
                 &openings,
