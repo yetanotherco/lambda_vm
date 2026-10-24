@@ -1914,8 +1914,10 @@ impl BlockStamps {
     fn overlap_line(&self) -> String {
         let beside = || self.groups.iter().filter(|g| g.overlapped);
         let alone = || self.groups.iter().filter(|g| !g.overlapped);
-        let opened = beside().map(|g| g.encode + g.open).sum::<f64>();
-        let paid = beside().map(|g| g.open_paid).sum::<f64>();
+        // Summed from +0.0: an empty f64 sum is -0.0, which prints a sign.
+        let sum = |values: &mut dyn Iterator<Item = f64>| values.fold(0.0, |a, b| a + b);
+        let opened = sum(&mut beside().map(|g| g.encode + g.open));
+        let paid = sum(&mut beside().map(|g| g.open_paid));
         let draws = |groups: &mut dyn Iterator<Item = &GroupStamps>| {
             groups.fold((0u64, 0u64), |(f, b), g| {
                 (f + g.open_draws.0, b + g.open_draws.1)
@@ -1939,7 +1941,7 @@ impl BlockStamps {
                 .filter(|g| g.serial_after_refusal)
                 .count(),
             opened - paid,
-            alone().map(|g| g.open_paid).sum::<f64>(),
+            sum(&mut alone().map(|g| g.open_paid)),
             self.groups.iter().map(|g| g.argue).sum::<f64>(),
             peak >> 20,
             multilinear::gpu::reserve_budget() >> 20,

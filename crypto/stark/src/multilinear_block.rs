@@ -1619,11 +1619,12 @@ pub struct OverlapFaults {
     pub refusal_at: Option<usize>,
 }
 
-/// Every count of a promise the card refused, a device fallback, or a wait on
-/// every stream at once, summed: a transition of phase B's overlap in which it
-/// rose turns the rest of phase B serial. The revive's room and an opening's
-/// turn refused, the GKR trees and other argue work the card refused, openings
-/// whose factors were built on the host, and drain-and-trims. Each is 0
+/// Every count of a promise the card refused, or of a wait on every stream at
+/// once, summed: a transition of phase B's overlap in which it rose turns the
+/// rest of phase B serial. The revive's room and an opening's turn refused,
+/// the GKR trees and other argue work the card refused, and drain-and-trims.
+/// Openings whose factors were built on the host are not among them: a small
+/// stack declines the card by policy, with no refusal behind it. Each is 0
 /// without a device.
 fn phase_b_refusals() -> u64 {
     use multilinear::gpu;
@@ -1632,7 +1633,6 @@ fn phase_b_refusals() -> u64 {
         gpu::room_turn_refusals(),
         gpu::gkr_tree_refusals(),
         gpu::argue_device_fallbacks(),
-        gpu::open_host_fallbacks(),
         gpu::device_trims(),
     ]
     .into_iter()
