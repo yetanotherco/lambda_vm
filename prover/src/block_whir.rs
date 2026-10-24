@@ -1309,29 +1309,92 @@ fn parse_rest_slide(value: Option<&str>) -> bool {
     value.map(str::trim) != Some("0")
 }
 
-/// `LAMBDA_VM_BLOCK_CARD_FILL`: `on` holds each KECCAK_RND table the finish
-/// cuts as the keccak operations its rows come from, and the card fills its
-/// columns from them as its group uploads it
-/// ([`WindowedTraceBuilder::card_fill_keccak_rnd`]); `off` builds every table on
-/// the host. Unset or empty: on in a build with the card's kernels (the
-/// `cuda` feature), off in one without, where every fill from records would be
-/// the host's. Where the card declines the room, a host reader fills them on
-/// the host. The tables' words, and so the proof's bytes, are the same.
-/// Anything else refuses the prove.
-pub(crate) fn block_card_fill() -> Result<bool, Error> {
+/// The families whose tables the card fills from the records their rows come
+/// from ([`block_card_fill`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CardFill {
+    /// Each KECCAK_RND table the finish cuts, from its keccak operations
+    /// ([`WindowedTraceBuilder::card_fill_keccak_rnd`]).
+    pub(crate) keccak_rnd: bool,
+    /// Each full streamed CPU chunk, from the executor's logs of its cycles,
+    /// and each full MEMW_R chunk, from its register rows, while the host has
+    /// room ([`WindowedTraceBuilder::card_fill_streamed`]).
+    pub(crate) cpu: bool,
+    pub(crate) memw_r: bool,
+}
+
+impl CardFill {
+    /// The families the card fills.
+    const NAMES: [&'static str; 3] = ["keccak_rnd", "cpu", "memw_r"];
+
+    /// Unset or empty: KECCAK_RND in a build with the card's kernels (the
+    /// `cuda` feature), nothing in one without, where every fill from records
+    /// would be the host's. CPU and MEMW_R only ever by an explicit word.
+    const DEFAULT: Self = Self {
+        keccak_rnd: cfg!(feature = "cuda"),
+        cpu: false,
+        memw_r: false,
+    };
+
+    fn name(self) -> String {
+        let on = [self.keccak_rnd, self.cpu, self.memw_r];
+        let names: Vec<&str> = Self::NAMES
+            .iter()
+            .zip(on)
+            .filter_map(|(name, on)| on.then_some(*name))
+            .collect();
+        if names.is_empty() {
+            "off".to_string()
+        } else {
+            names.join(",")
+        }
+    }
+}
+
+/// `LAMBDA_VM_BLOCK_CARD_FILL`: a comma list of `keccak_rnd`, `cpu` and
+/// `memw_r` (each at most once) has the card fill those families' tables from
+/// the records their rows come from as their groups upload them ([`CardFill`]);
+/// `on` is every family, `off` none (the host builds every table). Unset or
+/// empty is [`CardFill::DEFAULT`]: KECCAK_RND in a build with the card's
+/// kernels, nothing without. Where the card declines the room, a host reader
+/// fills them on the host. The tables' words, and so the proof's bytes, are
+/// the same. Anything else refuses the prove.
+pub(crate) fn block_card_fill() -> Result<CardFill, Error> {
     parse_card_fill(std::env::var("LAMBDA_VM_BLOCK_CARD_FILL").ok().as_deref())
 }
 
 /// [`block_card_fill`]'s reading of its variable.
-fn parse_card_fill(value: Option<&str>) -> Result<bool, Error> {
+fn parse_card_fill(value: Option<&str>) -> Result<CardFill, Error> {
+    let refused = |v: &str| {
+        Error::Prover(format!(
+            "LAMBDA_VM_BLOCK_CARD_FILL={v}: off (the host builds every table), on (the card \
+             fills every family it can) or a comma list of {}",
+            CardFill::NAMES.join(", ")
+        ))
+    };
     match value.map(str::trim) {
-        None | Some("") => Ok(cfg!(feature = "cuda")),
-        Some("off") => Ok(false),
-        Some("on") => Ok(true),
-        Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_BLOCK_CARD_FILL={v}: on (the card fills KECCAK_RND, the default with a card) \
-             or off (the host builds every table)"
-        ))),
+        None | Some("") => Ok(CardFill::DEFAULT),
+        Some("off") => Ok(CardFill::default()),
+        Some("on") => Ok(CardFill {
+            keccak_rnd: true,
+            cpu: true,
+            memw_r: true,
+        }),
+        Some(v) => {
+            let mut fill = CardFill::default();
+            for name in v.split(',').map(str::trim) {
+                let family = match name {
+                    "keccak_rnd" => &mut fill.keccak_rnd,
+                    "cpu" => &mut fill.cpu,
+                    "memw_r" => &mut fill.memw_r,
+                    _ => return Err(refused(v)),
+                };
+                if std::mem::replace(family, true) {
+                    return Err(refused(v));
+                }
+            }
+            Ok(fill)
+        }
     }
 }
 
@@ -1654,6 +1717,10 @@ pub struct BlockStamps {
     /// Tables filled from their records ([`block_card_fill`]) during the
     /// prove: `(on the card, on the host)`.
     pub records_fills: (u64, u64),
+    /// Under `LAMBDA_VM_CARD_UPLOAD_TIMES=1`, the group uploads' tables timed
+    /// on the card during the prove (`multilinear::records::upload_times`):
+    /// `((packed tables, copy and widen s), (records tables, copy and fill s))`.
+    pub upload_times: ((u64, f64), (u64, f64)),
     /// With [`BlockOptions::memlog`]: every memory term when the proof is
     /// done, bytes; empty without.
     pub mem_terms: Vec<(&'static str, usize)>,
@@ -1900,13 +1967,29 @@ impl BlockStamps {
                 l.packed_rest.0,
                 l.packed_rest.1 as f64 / (1u64 << 30) as f64,
             ));
+            let c = &self.windows.card_fill;
+            let ((widens, widen_s), (fills, fill_s)) = self.upload_times;
             out.push_str(&format!(
                 "BLOCK CARD FILL: KECCAK_RND {} tables held as their records, {:.2} MiB · filled \
-                 from records on the card {} · on the host {}\n",
+                 from records on the card {} · on the host {} · CPU chunks {} as records, {} \
+                 filled on the host · MEMW_R chunks {} as records, {} filled on the host · \
+                 streamed records {:.2} GiB · room ran out at {} · CPU logs out of step {} · \
+                 card upload (timed) packed {widens} tables {widen_s:.3} s, records {fills} \
+                 tables {fill_s:.3} s\n",
                 l.records_rest.0,
                 l.records_rest.1 as f64 / (1u64 << 20) as f64,
                 self.records_fills.0,
                 self.records_fills.1,
+                c.cpu[0],
+                c.cpu[1],
+                c.memw_r[0],
+                c.memw_r[1],
+                c.records_bytes as f64 / (1u64 << 30) as f64,
+                c.room_out
+                    .map_or("never".to_string(), |(table, index)| format!(
+                        "{table:?}[{index}]"
+                    )),
+                c.out_of_step,
             ));
             let (on, [direct, narrowed, again, wide]) = l.gpack;
             out.push_str(&format!(
@@ -2569,11 +2652,14 @@ pub(crate) fn table_of_narrow<'a>(
         .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))
 }
 
-/// [`table_of_narrow`] for a trace the finish holds as the records its rows
-/// come from ([`WindowedTraceBuilder::card_fill_keccak_rnd`]): its records
-/// become the table's, and the card fills its columns from them as its group
-/// uploads it. A table with preprocessed columns is refused: their check reads
-/// the columns, which only the fill makes.
+/// [`table_of_narrow`] for a trace held as the records its rows come from (a
+/// finish's KECCAK_RND table, [`WindowedTraceBuilder::card_fill_keccak_rnd`];
+/// a streamed CPU or MEMW_R chunk,
+/// [`WindowedTraceBuilder::card_fill_streamed`]): its records become the
+/// table's, and the card fills its columns from them as its group uploads it.
+/// A table whose AIR's preprocessed columns are not the leading columns its
+/// records fill from the row index alone is refused
+/// (`multilinear::records::TableRecords::row_index_columns`).
 pub(crate) fn table_of_records<'a>(
     air: &'a dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
     trace: &mut TraceTable<F, E>,
@@ -2593,10 +2679,19 @@ pub(crate) fn table_of_records<'a>(
             records.rows()
         )));
     }
-    if !air.precomputed_columns().is_empty() {
+    // The AIR's preprocessed columns must be the ones the fill writes from the
+    // row index alone: the check of them reads the columns, which only the
+    // fill makes, so a count the records do not declare is refused.
+    let preprocessed = if air.is_preprocessed() {
+        air.num_precomputed_columns()
+    } else {
+        0
+    };
+    if preprocessed != records.row_index_columns() {
         return Err(Error::Prover(format!(
-            "{}: a table with preprocessed columns is not held as records",
+            "{}: {preprocessed} preprocessed columns, its records fill {} from the row index",
             air.name(),
+            records.row_index_columns(),
         )));
     }
     CommittedTable::from_records(layout, records)
@@ -3049,6 +3144,18 @@ pub(crate) struct Deviations {
     /// prover's own checks cannot tell it from the committed one.
     #[cfg(test)]
     pub card_fill_records_fault: usize,
+    /// With the streamed CPU chunks held as records, each one's logs read
+    /// from this many cycles late
+    /// ([`WindowedTraceBuilder::card_fill_streamed_fault`]): one wrong table,
+    /// the same at both uploads and to any host reader.
+    #[cfg(test)]
+    pub card_fill_streamed_fault: u64,
+    /// Whether the card fills the streamed CPU and MEMW_R chunks from their
+    /// records (`[cpu, memw_r]`), instead of the knob.
+    pub card_fill_streamed: Option<[bool; 2]>,
+    /// The room rule the streamed chunks held as records are admitted by,
+    /// instead of the host's resident set against its pressure line.
+    pub records_room: Option<crate::tables::trace_builder::RecordsRoom>,
     /// The trace alone: phase A drains each closed group as it comes instead
     /// of committing it, and the prove stops after the trace with
     /// [`HOST_ONLY`] ([`trace_block_host_only`]).
@@ -3547,6 +3654,7 @@ pub(crate) fn prove_traces(
         let routes_before = multilinear::whir_commit::top_path_routes();
         let widens_before = multilinear::narrow::host_widens();
         let fills_before = multilinear::records::fills();
+        let times_before = multilinear::records::upload_times();
         let identity = |g: usize| g;
         let fork_of: &dyn Fn(usize) -> usize = match &deviations.fork_of {
             Some(f) => f,
@@ -3610,6 +3718,11 @@ pub(crate) fn prove_traces(
         stamps.records_fills = (
             fills_after.0 - fills_before.0,
             fills_after.1 - fills_before.1,
+        );
+        let ((widens, widen_s), (fills, fill_s)) = multilinear::records::upload_times();
+        stamps.upload_times = (
+            (widens - times_before.0.0, widen_s - times_before.0.1),
+            (fills - times_before.1.0, fill_s - times_before.1.1),
         );
         stamps.groups = groups;
         (proof, argues, prepared_openings)
@@ -3965,6 +4078,8 @@ fn lay_out_chunk<'a>(
         ops
     });
     let mut chunk = job.generate_as(airs.form);
+    // A chunk held as its records is never dropped: it has no recipe to
+    // digest for.
     if let (Some(recorder), Some(packed)) =
         (recorder.filter(|r| r.digests()), chunk.trace.narrow_main())
     {
@@ -3981,10 +4096,13 @@ fn lay_out_chunk<'a>(
         chunk.trace.main_table.width,
         height.trailing_zeros() as usize,
     );
-    // Written packed (G-pack): laid out narrow from its packed columns, with
-    // no transposition.
+    // Held as its records: the card fills its columns as its group uploads
+    // it. Written packed (G-pack): laid out narrow from its packed columns,
+    // with no transposition.
     let air = airs.of_chunk(chunk.table, chunk.index, height)?;
-    let table = if chunk.trace.narrow_main().is_some() {
+    let table = if chunk.trace.records_main().is_some() {
+        table_of_records(air, &mut chunk.trace, shape)
+    } else if chunk.trace.narrow_main().is_some() {
         table_of_narrow(air, &mut chunk.trace, shape)
     } else {
         table_of(air, &mut chunk.trace, shape, true)
@@ -4772,6 +4890,7 @@ fn prove_streamed(
     // The tables filled from their records over the whole prove: phase A's
     // commits and phase B's arguments alike.
     let fills_before = multilinear::records::fills();
+    let times_before = multilinear::records::upload_times();
     let stream_airs = StreamAirs::new(opts, stream_form, options.max_rows.cpu);
     // Regeneration (`BlockOptions::regen`): its recorder, when phase A can feed
     // it — its chunks generated packed, and none of KECCAK_RND's or of the
@@ -4998,7 +5117,56 @@ fn prove_streamed(
     crate::with_block_hash!(format.zf.base, |H| {
         let walkers = block_walkers()?;
         let p4_rows = block_p4_rows()?;
-        let card_fill = deviations.card_fill.map_or_else(block_card_fill, Ok)?;
+        let card_fill = match (deviations.card_fill, deviations.card_fill_streamed) {
+            (Some(keccak_rnd), Some([cpu, memw_r])) => CardFill {
+                keccak_rnd,
+                cpu,
+                memw_r,
+            },
+            (keccak_rnd, streamed) => {
+                let knob = block_card_fill()?;
+                let [cpu, memw_r] = streamed.unwrap_or([knob.cpu, knob.memw_r]);
+                CardFill {
+                    keccak_rnd: keccak_rnd.unwrap_or(knob.keccak_rnd),
+                    cpu,
+                    memw_r,
+                }
+            }
+        };
+        // The streamed chunks held as records: G-pack's narrow chunks only,
+        // from a build that drops its streamed ops, admitted while the host
+        // has room for them by the purge rule's own test (its resident set,
+        // the chunk and the regeneration window's ceiling under the pressure
+        // line) and live regeneration has not armed. Once a chunk is refused,
+        // every later one is filled on the host: what is never dropped is a
+        // prefix admitted with room.
+        let records_room = ((card_fill.cpu || card_fill.memw_r)
+            && options.drop_streamed_ops
+            && stream_form == TraceForm::Narrow)
+            .then(|| match &deviations.records_room {
+                Some(room) => std::sync::Arc::clone(room),
+                None => {
+                    let line = no_disk_room(true, target);
+                    let armed = live_regen.clone();
+                    std::sync::Arc::new(move |bytes: usize| {
+                        !armed.as_ref().is_some_and(|regen| regen.is_armed())
+                            && crate::alloc_purge::has_room(
+                                line,
+                                crate::lfm::program_budget::resident_bytes()
+                                    .map(|resident| resident.saturating_add(bytes as u64)),
+                            )
+                    }) as crate::tables::trace_builder::RecordsRoom
+                }
+            });
+        eprintln!(
+            "BLOCK CARD FILL: families {} · streamed chunks as records: {}",
+            card_fill.name(),
+            match (card_fill.cpu || card_fill.memw_r, records_room.is_some()) {
+                (false, _) => "off",
+                (true, true) => "while the host has room",
+                (true, false) => "off (not a narrow build that drops its streamed ops)",
+            }
+        );
         let (block, built, laid, executed) = std::thread::scope(|scope| {
             use std::sync::atomic::Ordering::Relaxed;
             // The executor, a window at a time, two windows ahead of the walk;
@@ -5090,12 +5258,20 @@ fn prove_streamed(
                 if rest_slide() {
                     builder = builder.slide_rest();
                 }
-                if card_fill {
+                if card_fill.keccak_rnd {
                     builder = builder.card_fill_keccak_rnd();
                     #[cfg(test)]
                     if deviations.card_fill_records_fault > 0 {
                         builder =
                             builder.card_fill_records_fault(deviations.card_fill_records_fault);
+                    }
+                }
+                if let Some(room) = records_room.clone() {
+                    builder = builder.card_fill_streamed(room, card_fill.cpu, card_fill.memw_r)?;
+                    #[cfg(test)]
+                    if deviations.card_fill_streamed_fault > 0 {
+                        builder =
+                            builder.card_fill_streamed_fault(deviations.card_fill_streamed_fault);
                     }
                 }
                 if let Some(ledger) = ledger {
@@ -5181,13 +5357,15 @@ fn prove_streamed(
                                 };
                                 ProducerWaits::add(&waits.walker_recv, t);
                                 if let Some(w) = held.replace(logs) {
-                                    let walked = walker.walk(&w)?;
+                                    let bytes = memlog::logs_bytes(&w);
+                                    // The logs go with the window when the
+                                    // card fills its CPU chunks from them.
+                                    let walked = walker.walk_owned(w)?;
                                     if let Some(ledger) = ledger {
                                         ledger.walk.store(walker.state_bytes(), Relaxed);
-                                        ledger.logs.fetch_sub(memlog::logs_bytes(&w), Relaxed);
+                                        ledger.logs.fetch_sub(bytes, Relaxed);
                                         ledger.walked.fetch_add(walked.heap_bytes(), Relaxed);
                                     }
-                                    drop(w);
                                     let t = Instant::now();
                                     if wtx.send(walked).is_err() {
                                         break;
@@ -6314,6 +6492,11 @@ fn prove_streamed(
         stamps.records_fills = (
             fills_after.0 - fills_before.0,
             fills_after.1 - fills_before.1,
+        );
+        let ((widens, widen_s), (fills, fill_s)) = multilinear::records::upload_times();
+        stamps.upload_times = (
+            (widens - times_before.0.0, widen_s - times_before.0.1),
+            (fills - times_before.1.0, fill_s - times_before.1.1),
         );
         stamps.groups = groups;
         if let Some(ledger) = ledger {
@@ -7754,7 +7937,7 @@ mod packer_tests {
 mod walkers_knob_tests {
     use executor::vm::memory::StoreKind;
 
-    use super::{Error, parse_card_fill, parse_walkers};
+    use super::{CardFill, Error, parse_card_fill, parse_walkers};
 
     /// `LAMBDA_VM_BLOCK_WALKERS`: unset or empty is four walkers (the
     /// default); 0 one walker (the rollback); 1 to 4 that many; any other
@@ -7795,23 +7978,62 @@ mod walkers_knob_tests {
         }
     }
 
-    /// `LAMBDA_VM_BLOCK_CARD_FILL`: `on` has the card fill KECCAK_RND, `off`
-    /// builds every table on the host; unset or empty is on with the card's
-    /// kernels and off without; any other word refuses the prove.
+    /// `LAMBDA_VM_BLOCK_CARD_FILL`: a comma list of `keccak_rnd`, `cpu` and
+    /// `memw_r` has the card fill those families, `on` every one, `off` none;
+    /// unset or empty is KECCAK_RND with the card's kernels and nothing
+    /// without; any other word, a family twice or an empty item refuses the
+    /// prove.
     #[test]
-    fn the_card_fill_knob_takes_off_and_on_and_refuses_anything_else() {
-        let default = cfg!(feature = "cuda");
-        for (value, on) in [
+    fn the_card_fill_knob_takes_off_on_and_families_and_refuses_anything_else() {
+        let fill = |keccak_rnd, cpu, memw_r| CardFill {
+            keccak_rnd,
+            cpu,
+            memw_r,
+        };
+        let default = fill(cfg!(feature = "cuda"), false, false);
+        for (value, want) in [
             (None, default),
             (Some(""), default),
-            (Some("off"), false),
-            (Some(" off "), false),
-            (Some("on"), true),
-            (Some(" on\n"), true),
+            (Some(" "), default),
+            (Some("off"), fill(false, false, false)),
+            (Some(" off "), fill(false, false, false)),
+            (Some("on"), fill(true, true, true)),
+            (Some(" on\n"), fill(true, true, true)),
+            (Some("keccak_rnd"), fill(true, false, false)),
+            (Some("cpu"), fill(false, true, false)),
+            (Some("memw_r"), fill(false, false, true)),
+            (Some("cpu,memw_r"), fill(false, true, true)),
+            (Some("keccak_rnd,cpu,memw_r"), fill(true, true, true)),
+            (Some(" memw_r , keccak_rnd "), fill(true, false, true)),
         ] {
-            assert_eq!(parse_card_fill(value).ok(), Some(on), "{value:?}");
+            assert_eq!(parse_card_fill(value).ok(), Some(want), "{value:?}");
         }
-        for value in ["1", "0", "ON", "Off", "yes", "true", "on,off", "kr"] {
+        assert_eq!(fill(false, false, false).name(), "off");
+        // ★ The default never holds a CPU or MEMW_R chunk as records, with a
+        // card or without: those reach it only by their own decision.
+        assert_eq!(
+            CardFill::DEFAULT,
+            fill(cfg!(feature = "cuda"), false, false),
+            "unset: KECCAK_RND alone with a card, nothing without"
+        );
+        assert_eq!(fill(true, false, true).name(), "keccak_rnd,memw_r");
+        assert_eq!(fill(true, true, true).name(), "keccak_rnd,cpu,memw_r");
+        for value in [
+            "1",
+            "0",
+            "ON",
+            "Off",
+            "yes",
+            "true",
+            "on,off",
+            "kr",
+            "cpu,cpu",
+            "cpu,",
+            ",memw_r",
+            "CPU",
+            "keccak_rnd,on",
+            "cpu memw_r",
+        ] {
             let refused = parse_card_fill(Some(value));
             assert!(
                 matches!(&refused, Err(Error::Prover(m)) if m.contains("LAMBDA_VM_BLOCK_CARD_FILL")),
@@ -8210,5 +8432,107 @@ mod drop_tests {
             purges.line(),
             "BLOCK DROP: partial · 1 purges of the dropped tables' pages, 0.25 s, 4.00 GiB returned"
         );
+    }
+}
+
+#[cfg(test)]
+mod records_layout_tests {
+    use std::sync::Arc;
+
+    use multilinear::narrow::NarrowColumns;
+    use multilinear::records::{KeccakRndOp, Records, RecordsFill, TableRecords};
+    use stark::proof::options::ProofOptions;
+
+    use super::{E, F, TraceTable, table_of_records};
+
+    /// A table's shape, held as records that fill `prefix` leading columns
+    /// from the row index.
+    #[derive(Debug)]
+    struct Shaped {
+        rows: usize,
+        cols: usize,
+        prefix: usize,
+    }
+
+    impl TableRecords for Shaped {
+        fn rows(&self) -> usize {
+            self.rows
+        }
+
+        fn cols(&self) -> usize {
+            self.cols
+        }
+
+        fn fill(&self) -> RecordsFill<'_> {
+            const NONE: &[KeccakRndOp] = &[];
+            RecordsFill::KeccakRnd { ops: NONE, skip: 0 }
+        }
+
+        fn row_index_columns(&self) -> usize {
+            self.prefix
+        }
+
+        fn host_fill(&self) -> Option<NarrowColumns> {
+            None
+        }
+    }
+
+    fn laid_out(
+        air: &super::DynAir,
+        (rows, cols): (usize, usize),
+        prefix: usize,
+    ) -> Result<(), crate::Error> {
+        let records = Records(Arc::new(Shaped { rows, cols, prefix }));
+        let mut trace =
+            TraceTable::<F, E>::try_from_records_main(records, 1).expect("a records trace");
+        table_of_records(air, &mut trace, (cols, rows.trailing_zeros() as usize)).map(|_| ())
+    }
+
+    /// ★ A table held as records is laid out only for an AIR whose
+    /// preprocessed columns are the ones its records fill from the row index:
+    /// CPU's TIMESTAMP, none for MEMW_R, all nine of KECCAK_RC's for a records
+    /// table that declares them. Any other count is refused, either way.
+    #[test]
+    fn records_are_laid_out_only_for_their_row_index_columns() {
+        use crate::tables::{cpu, keccak_rc, memw_register};
+        use crate::test_utils::{create_cpu_air, create_keccak_rc_air, create_memw_register_air};
+        let opts = ProofOptions::default_test_options();
+        // A streamed CPU chunk's AIR, as the block builds it: its TIMESTAMP
+        // column preprocessed.
+        let height = 1usize << 4;
+        let cpu = create_cpu_air(&opts, 0).with_lazy_preprocessed_columns(
+            cpu::lazy_timestamp_commitment(&opts, height),
+            cpu::NUM_PRECOMPUTED_COLS,
+            Arc::new(move || vec![cpu::timestamp_column(height)]),
+        );
+        let memw_r = create_memw_register_air(&opts);
+        let rc =
+            create_keccak_rc_air(&opts).with_preprocessed([0; 32], keccak_rc::NUM_PRECOMPUTED_COLS);
+        let shape = |cols| (height, cols);
+        assert!(
+            laid_out(
+                &cpu,
+                shape(cpu::cols::NUM_COLUMNS),
+                cpu::NUM_PRECOMPUTED_COLS
+            )
+            .is_ok()
+        );
+        assert!(laid_out(&memw_r, shape(memw_register::cols::NUM_COLUMNS), 0).is_ok());
+        for wrong in [0, 2] {
+            let refused = laid_out(&cpu, shape(cpu::cols::NUM_COLUMNS), wrong);
+            assert!(
+                matches!(&refused, Err(crate::Error::Prover(m)) if m.contains("preprocessed")),
+                "CPU, {wrong} declared: {refused:?}"
+            );
+        }
+        let rc_shape = (keccak_rc::NUM_ROWS, keccak_rc::cols::NUM_COLUMNS);
+        assert!(laid_out(&rc, rc_shape, keccak_rc::NUM_PRECOMPUTED_COLS).is_ok());
+        for wrong in [0, keccak_rc::NUM_PRECOMPUTED_COLS - 1] {
+            let refused = laid_out(&rc, rc_shape, wrong);
+            assert!(
+                matches!(&refused, Err(crate::Error::Prover(m)) if m.contains("preprocessed")),
+                "KECCAK_RC, {wrong} declared: {refused:?}"
+            );
+        }
     }
 }

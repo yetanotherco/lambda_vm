@@ -4787,3 +4787,225 @@ fn a_wrong_records_table_is_refused_by_the_verifier() {
         "a proof over a wrong KECCAK_RND table verified"
     );
 }
+
+/// Every streamed CPU and MEMW_R chunk held as records
+/// ([`Deviations::card_fill_streamed`]), the room rule admitting every one.
+fn streamed_records(cpu: bool, memw_r: bool) -> Deviations {
+    Deviations {
+        card_fill_streamed: Some([cpu, memw_r]),
+        records_room: Some(std::sync::Arc::new(|_| true)),
+        ..Deviations::default()
+    }
+}
+
+/// ★ CPU and MEMW_R chunks filled from their records (the
+/// `LAMBDA_VM_BLOCK_CARD_FILL` knob's `cpu` and `memw_r`) move no byte: every
+/// full streamed chunk of those families is handed out as its logs or rows,
+/// the card fills each from them at its phase-A and its phase-B upload (on a
+/// host without one, a host reader fills it there), and the proof verifies
+/// with the same partition, tables and statement, its bytes equal under the
+/// deterministic grind; each family alone, both, and both beside KECCAK_RND's;
+/// laid out inline and on workers; for programs whose chunks lie in several
+/// windows.
+#[test]
+fn cpu_and_memw_r_filled_from_records_move_no_byte() {
+    let format = many_groups();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    for name in ["all_instructions_64", "test_keccak_multi"] {
+        let elf = asm_elf_bytes(name);
+        for workers in [0usize, 3] {
+            let proved = |deviations: Deviations| {
+                let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+                o.layout_workers = workers;
+                o.drop_streamed_ops = true;
+                let (proof, stamps) = prove_block_whir_with(
+                    &elf,
+                    &[],
+                    &ProofOptions::default_test_options(),
+                    &format,
+                    &o,
+                    &deviations,
+                )
+                .expect("prove");
+                assert!(verify(&proof, &elf, &format), "{name}, {workers} workers");
+                (proof, stamps)
+            };
+            let (host, host_stamps) = proved(Deviations {
+                card_fill: Some(false),
+                card_fill_streamed: Some([false, false]),
+                ..Deviations::default()
+            });
+            let off = host_stamps.windows.card_fill;
+            assert_eq!(
+                (off.cpu, off.memw_r, off.records_bytes),
+                ([0, 0], [0, 0], 0),
+                "knob off"
+            );
+            assert_eq!(host_stamps.records_fills, (0, 0), "knob off");
+            for (cpu, memw_r, keccak_rnd) in [
+                (true, false, false),
+                (false, true, false),
+                (true, true, false),
+                (true, true, true),
+            ] {
+                let what = format!(
+                    "{name}, {workers} workers, cpu {cpu} memw_r {memw_r} keccak_rnd {keccak_rnd}"
+                );
+                let (card, stamps) = proved(Deviations {
+                    card_fill: Some(keccak_rnd),
+                    ..streamed_records(cpu, memw_r)
+                });
+                let c = stamps.windows.card_fill;
+                assert_eq!(c.out_of_step, 0, "{what}: {c:?}");
+                assert_eq!(c.room_out, None, "{what}: {c:?}");
+                assert_eq!((c.cpu[1], c.memw_r[1]), (0, 0), "{what}: {c:?}");
+                assert_eq!(c.cpu[0] > 0, cpu, "{what}: {c:?}");
+                assert_eq!(c.memw_r[0] > 0, memw_r, "{what}: {c:?}");
+                let held = (c.cpu[0] + c.memw_r[0] + stamps.layout.records_rest.0) as u64;
+                let (on_card, on_host) = stamps.records_fills;
+                if cfg!(feature = "cuda") {
+                    // At its commit and at its argument on the card; at this
+                    // size a commit under the card's floor encodes on the host
+                    // from the host's fill, once a table.
+                    assert!(
+                        (held..=2 * held).contains(&on_card) && on_host <= held,
+                        "{what}: {on_card} on the card, {on_host} on the host, of {held} held"
+                    );
+                } else {
+                    assert_eq!(
+                        (on_card, on_host),
+                        (0, held),
+                        "{what}: each on the host once"
+                    );
+                }
+                assert_eq!(host.groups, card.groups, "{what}: the partition");
+                assert_eq!(host.table_num_vars, card.table_num_vars, "{what}");
+                assert_eq!(
+                    format!("{:?}", host.table_counts),
+                    format!("{:?}", card.table_counts),
+                    "{what}"
+                );
+                if crypto::grinding::deterministic() {
+                    assert_eq!(bytes(&host), bytes(&card), "{what}: the proof");
+                }
+            }
+        }
+    }
+}
+
+/// ★ A streamed chunk held as its records is never dropped and no regenerator
+/// waits on it: with live regeneration dropping every table it can (the
+/// streamed chunks' regenerator started as early as their fates are known),
+/// every dropped chunk comes back with its digest, none is missing, fewer
+/// streamed chunks drop than without the records, and the proof is the one
+/// without regeneration.
+#[test]
+fn streamed_records_chunks_are_never_dropped() {
+    use crate::block_whir::BlockSpillPolicy;
+    use crate::block_whir::regen::RegenMode;
+
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let (plain, _) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Off,
+        BlockSpillPolicy::Off,
+        streamed_records(true, true),
+    )
+    .expect("prove");
+    let readout = |stamps: &crate::block_whir::BlockStamps| {
+        let r = stamps.regen.clone().expect("live regeneration's readout");
+        assert_eq!(
+            (r.mismatches, r.failed, r.missing),
+            (0, 0, 0),
+            "{:?}",
+            r.lines
+        );
+        assert_eq!(r.regenerated, r.dropped, "{:?}", r.lines);
+        assert!(r.error.is_none(), "{:?}", r.lines);
+        r
+    };
+    let (built, stamps) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Always,
+        BlockSpillPolicy::Off,
+        Deviations::default(),
+    )
+    .expect("prove");
+    let all = readout(&stamps);
+    assert!(verify(&built, &elf, &format));
+    let (held, stamps) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Always,
+        BlockSpillPolicy::Off,
+        streamed_records(true, true),
+    )
+    .expect("prove");
+    let c = stamps.windows.card_fill;
+    assert!(c.cpu[0] > 0 && c.memw_r[0] > 0, "{c:?}");
+    let some = readout(&stamps);
+    let streamed = |r: &crate::block_whir::regen::RegenStamps| r.dropped - r.rest_dropped;
+    assert!(
+        streamed(&some) < streamed(&all),
+        "records chunks dropped: {} of {} without records",
+        streamed(&some),
+        streamed(&all)
+    );
+    assert_eq!(
+        some.recipes + c.cpu[0] + c.memw_r[0],
+        all.recipes,
+        "no recipe for a records chunk"
+    );
+    assert_eq!(held.groups, plain.groups, "the partition");
+    assert!(verify(&held, &elf, &format));
+    if crypto::grinding::deterministic() {
+        assert_eq!(bytes(&held), bytes(&plain), "the proof");
+        assert_eq!(bytes(&built), bytes(&plain), "the proof");
+    }
+}
+
+/// ★ A wrong CPU table held as records is refused by the verifier: with its
+/// logs read a cycle late ([`Deviations::card_fill_streamed_fault`]), every
+/// fill of them (the card's at both uploads, or a host reader's) writes the
+/// same wrong table, so the prover's own checks of what it committed pass and
+/// it makes a proof, and the unchanged verifier refuses it.
+#[test]
+fn a_wrong_cpu_records_table_is_refused_by_the_verifier() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.layout_workers = 3;
+    o.drop_streamed_ops = true;
+    let (proof, stamps) = prove_block_whir_with(
+        &elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        &format,
+        &o,
+        &Deviations {
+            card_fill_streamed_fault: 1,
+            ..streamed_records(true, false)
+        },
+    )
+    .unwrap_or_else(|e| panic!("the prover refused ({e:?}): the verifier was never asked"));
+    assert!(
+        stamps.windows.card_fill.cpu[0] > 0,
+        "no CPU chunk held as records"
+    );
+    assert!(
+        !verify(&proof, &elf, &format),
+        "a proof over a wrong CPU table verified"
+    );
+}
