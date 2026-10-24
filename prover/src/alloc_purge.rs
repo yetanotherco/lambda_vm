@@ -648,6 +648,13 @@ impl Drop for Watermark {
     }
 }
 
+/// Purge every arena now, whatever [`ALLOC_PURGE_ENV`] says: for a caller
+/// that has just freed memory it must see leave the process (a block's
+/// partial drops). `None` when the build cannot purge.
+pub fn purge_now() -> Option<Purge> {
+    purge_all_arenas()
+}
+
 /// Purge every arena through the hooks, timed, with the resident bytes
 /// before and after.
 fn purge_all_arenas() -> Option<Purge> {

@@ -462,10 +462,16 @@ impl BlockSpill {
     ///
     /// With live regeneration it arms it first ([`BlockRegen::arm`]): every
     /// parked table phase B can rebuild is dropped, and only the others go to
-    /// the store; with no store, nothing else leaves.
+    /// the store; with no store, nothing else leaves. Partial drops
+    /// ([`BlockRegen::partial`]) drop back parked tables, in rank order, only
+    /// until `need` bytes are on their way.
     pub fn hand_off(&self, need: u64, mem: Option<Arc<BlockMem>>) -> bool {
         if let Some(regen) = &self.regen {
             regen.arm();
+            // Partial drops hand back only what the hand-off asks for.
+            if regen.is_partial() {
+                regen.drop_back(need);
+            }
         }
         let Some(store) = self.store.clone() else {
             return self.regen.is_some();
@@ -638,6 +644,9 @@ pub struct BlockRegen {
     /// takes, in that class's rank order.
     windows: Vec<Arc<RegenWindow>>,
     always: bool,
+    /// Each table is dropped only when the policy wants it out, armed or not
+    /// ([`Self::partial`]).
+    partial: bool,
     started: Instant,
     inner: Arc<std::sync::Mutex<RegenState>>,
     /// Wakes [`Self::await_rank`] at each decision and when the decisions
@@ -675,6 +684,9 @@ struct RegenState {
     dropped: Vec<((usize, u64), RegenSlot, u64, bool)>,
     /// Drops that found their table gone from the host (handed to the store).
     refused_late: usize,
+    /// Partial drops: the candidates were settled ([`BlockRegen::settle`]),
+    /// and a table not dropped from now on is kept at once.
+    settled: bool,
     /// Tables phase B could rebuild that stay, their group dropping another
     /// class ([`drop_one_class`]).
     held: usize,
@@ -796,6 +808,7 @@ impl BlockRegen {
             droppable,
             windows,
             always,
+            partial: false,
             started: Instant::now(),
             inner,
             decided,
@@ -827,14 +840,32 @@ impl BlockRegen {
         self.always
     }
 
+    /// Partial drops: arming drops back nothing and does not make later tables
+    /// drop. Each committed table is dropped only when the policy wants it out
+    /// as it is installed ([`Self::drop_one`]), and the parked ones only as far
+    /// as a hand-off asks ([`Self::drop_back`]). The rest stay on the host.
+    pub fn partial(mut self) -> Self {
+        self.partial = true;
+        self
+    }
+
+    /// Whether drops are partial ([`Self::partial`]).
+    pub fn is_partial(&self) -> bool {
+        self.partial
+    }
+
     /// Arm: from now on every droppable table is dropped, and every parked one
-    /// is dropped back, in rank order. Returns whether this call armed.
+    /// is dropped back, in rank order; partial drops ([`Self::partial`]) only
+    /// note when. Returns whether this call armed.
     pub fn arm(&self) -> bool {
         let mut state = self.lock();
         if state.armed.is_some() {
             return false;
         }
         state.armed = Some(self.started.elapsed().as_secs_f64());
+        if self.partial {
+            return true;
+        }
         let mut candidates = std::mem::take(&mut state.candidates);
         candidates.sort_by_key(|p| p.rank);
         for parked in candidates {
@@ -848,15 +879,69 @@ impl BlockRegen {
         self.lock().mem = mem;
     }
 
-    /// A parked droppable table: dropped now when armed or `always`, else a
-    /// drop-back candidate.
+    /// A parked droppable table: dropped now when armed (not partial) or
+    /// `always`, else a drop-back candidate.
     fn parked(&self, parked: Arc<Parked>) {
         let mut state = self.lock();
-        if self.always || state.armed.is_some() {
+        if self.always || (state.armed.is_some() && !self.partial) {
             Self::queue(&state, parked, false);
+        } else if self.partial && state.settled {
+            if let Some(rank) = parked.rank {
+                state.kept.insert(rank);
+            }
+            drop(state);
+            self.decided.notify_all();
         } else {
             state.candidates.push(parked);
         }
+    }
+
+    /// Partial drops: every parked candidate kept from now on, and every table
+    /// not dropped later kept as it is parked, so a regenerator started before
+    /// phase A's end learns each table's fate as it comes
+    /// ([`Self::drops_all_from_now`]). Called once the last drop-back is past
+    /// (the walk's end, after its hand-off). Nothing for drops that are not
+    /// partial.
+    pub fn settle(&self) {
+        if !self.partial {
+            return;
+        }
+        let mut state = self.lock();
+        let candidates = std::mem::take(&mut state.candidates);
+        for parked in candidates {
+            if let Some(rank) = parked.rank {
+                state.kept.insert(rank);
+            }
+        }
+        state.settled = true;
+        drop(state);
+        self.decided.notify_all();
+    }
+
+    /// A parked droppable table the policy wants out: dropped now.
+    fn drop_one(&self, parked: Arc<Parked>) {
+        Self::queue(&self.lock(), parked, false);
+    }
+
+    /// Partial drops: the parked candidates dropped back, in rank order, until
+    /// `need` bytes are on their way (all of them for `u64::MAX`). Returns the
+    /// bytes it sent.
+    pub fn drop_back(&self, need: u64) -> u64 {
+        let mut state = self.lock();
+        let mut candidates = std::mem::take(&mut state.candidates);
+        candidates.sort_by_key(|p| p.rank);
+        let mut sent = 0u64;
+        let mut rest = Vec::new();
+        for parked in candidates {
+            if sent < need {
+                sent = sent.saturating_add(parked.len);
+                Self::queue(&state, parked, true);
+            } else {
+                rest.push(parked);
+            }
+        }
+        state.candidates = rest;
+        sent
     }
 
     fn queue(state: &RegenState, parked: Arc<Parked>, back: bool) {
@@ -889,11 +974,14 @@ impl BlockRegen {
         self.decided.notify_all();
     }
 
-    /// Whether every table phase B can rebuild that phase A still commits will
-    /// be dropped (armed, or `always`): a regenerator may start before phase
-    /// A's end and take each table's fate from [`Self::await_rank`].
+    /// Whether the fate of every table phase B can rebuild that phase A still
+    /// commits is known as it is installed: dropped (armed, or `always`), or
+    /// under partial drops once settled ([`Self::settle`]), dropped or kept. A
+    /// regenerator may then start before phase A's end and take each table's
+    /// fate from [`Self::await_rank`].
     pub fn drops_all_from_now(&self) -> bool {
-        self.always || self.is_armed()
+        let state = self.lock();
+        self.always || (state.armed.is_some() && !self.partial) || (self.partial && state.settled)
     }
 
     /// Class `class`'s first producer, for a regenerator that starts before
@@ -1110,8 +1198,21 @@ where
                 state: std::sync::Mutex::new(ParkedState::Resident(packed)),
             });
             *slot = Some(Out::Parked(Arc::clone(&parked)));
-            if !regen.always() && (spill.wanted)(spill.kept.load(Relaxed), cells, len as u64) {
+            let wanted =
+                !regen.always() && (spill.wanted)(spill.kept.load(Relaxed), cells, len as u64);
+            if wanted {
                 regen.arm();
+            }
+            if regen.is_partial() && !regen.always() {
+                // Out only while the policy wants it out; else kept, and a
+                // candidate for a hand-off's drop-back.
+                if wanted {
+                    regen.drop_one(parked);
+                } else {
+                    spill.kept.fetch_add(len as u64, Relaxed);
+                    regen.parked(parked);
+                }
+                continue;
             }
             if !regen.always() && !regen.is_armed() {
                 spill.kept.fetch_add(len as u64, Relaxed);
@@ -3313,6 +3414,97 @@ mod spill_tests {
         let (decision, waited) = waiter.join().expect("joins");
         assert!(matches!(decision, RankDecision::Stopped));
         assert!(waited < Duration::from_secs(2), "waited {waited:?}");
+    }
+
+    /// Partial drops: arming drops back nothing and later tables are not
+    /// dropped on their own; a table the policy wants out drops, and a
+    /// hand-off's drop-back takes the parked candidates in rank order only
+    /// until its bytes are on their way. Once settled, what stays is kept, so
+    /// a regenerator started early learns every fate as it comes.
+    #[test]
+    fn partial_drops_take_only_what_is_asked() {
+        use super::{BlockRegen, Parked, ParkedState, RankDecision};
+        use std::sync::Arc;
+        let words: Vec<u64> = (0..2 * 1024u64).map(|i| i * 7919 % 50_000).collect();
+        let packed = || NarrowColumns::pack_row_major(&words, 2).expect("packs");
+        let len = packed().data().len() as u64;
+        let parked = |rank: u64| {
+            Arc::new(Parked {
+                len,
+                rank: Some((0, rank)),
+                state: std::sync::Mutex::new(ParkedState::Resident(packed())),
+            })
+        };
+        let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30], false).partial();
+        assert!(regen.is_partial());
+        let _producer = regen.take_producer(0);
+        // Parked before and after arming: candidates either way.
+        regen.parked(parked(0));
+        regen.parked(parked(3));
+        assert!(regen.arm());
+        assert!(!regen.arm(), "arms once");
+        assert!(!regen.drops_all_from_now());
+        regen.parked(parked(1));
+        regen.parked(parked(2));
+        // The policy wants this one out.
+        regen.drop_one(parked(4));
+        // A hand-off asking for one table and a byte: the two lowest ranks.
+        assert_eq!(regen.drop_back(len + 1), 2 * len);
+        regen.close_drops();
+        let report = regen.report();
+        assert_eq!(report.tables, 3, "{report:?}");
+        assert_eq!(report.back_tables, 2, "{report:?}");
+        for rank in [0, 1, 4] {
+            assert!(
+                matches!(regen.await_rank(0, rank).0, RankDecision::Dropped(_)),
+                "rank {rank} dropped"
+            );
+        }
+        for rank in [2, 3] {
+            assert!(
+                matches!(regen.await_rank(0, rank).0, RankDecision::Kept),
+                "rank {rank} kept"
+            );
+        }
+        // Settled: the candidates left are kept, and so is a table parked
+        // after, at once (a waiter returns before phase A's end); their fates
+        // are known from now on.
+        let fate = |regen: &BlockRegen, rank: u64| {
+            let regen = regen.clone();
+            let waiter = std::thread::spawn(move || regen.await_rank(0, rank).0);
+            let t = std::time::Instant::now();
+            while !waiter.is_finished() {
+                assert!(
+                    t.elapsed() < std::time::Duration::from_secs(5),
+                    "rank {rank}'s fate is not known"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            waiter.join().expect("joins")
+        };
+        let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30], false).partial();
+        let _producer = regen.take_producer(0);
+        regen.parked(parked(0));
+        assert!(regen.arm());
+        assert!(!regen.drops_all_from_now(), "not before it settles");
+        regen.settle();
+        assert!(regen.drops_all_from_now());
+        assert!(matches!(fate(&regen, 0), RankDecision::Kept));
+        regen.parked(parked(1));
+        assert!(matches!(fate(&regen, 1), RankDecision::Kept));
+        regen.drop_one(parked(2));
+        assert!(matches!(fate(&regen, 2), RankDecision::Dropped(_)));
+        assert_eq!(regen.drop_back(u64::MAX), 0, "nothing left to drop back");
+        regen.close_drops();
+        // Not partial: arming drops back every candidate and every later one.
+        let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30], false);
+        let _producer = regen.take_producer(0);
+        regen.parked(parked(0));
+        assert!(regen.arm());
+        assert!(regen.drops_all_from_now());
+        regen.parked(parked(1));
+        regen.close_drops();
+        assert_eq!(regen.report().tables, 2);
     }
 
     /// The rebuilt groups go last, each set in group order; nothing rebuilt is

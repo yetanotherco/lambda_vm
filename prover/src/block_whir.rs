@@ -746,6 +746,137 @@ impl HostReading {
         self.hwm
             .max(self.charged.saturating_sub(self.inactive_file))
     }
+
+    /// What the host holds now: the cgroup's working set and the allocator's
+    /// resident bytes (`allocator`), the larger. Unlike [`Self::bytes`] it
+    /// falls when a purge hands freed pages back.
+    fn now_bytes(&self, allocator: Option<u64>) -> u64 {
+        self.charged
+            .saturating_sub(self.inactive_file)
+            .max(allocator.unwrap_or(0))
+    }
+}
+
+/// The host's bytes a drop decision weighs: its peak ([`HostReading::bytes`]),
+/// or, under partial drops once they have armed (`now`), what it holds now
+/// ([`HostReading::now_bytes`]): a dropped table's pages, once purged, leave
+/// the reading, and later tables may stay.
+fn decision_bytes(reading: &HostReading, allocator: Option<u64>, now: bool) -> u64 {
+    if now {
+        reading.now_bytes(allocator)
+    } else {
+        reading.bytes()
+    }
+}
+
+/// `LAMBDA_VM_BLOCK_DROP`: unset, empty or `all` drops, once live
+/// regeneration arms, every table phase B can rebuild, those already parked
+/// with them (as before); `partial` drops each only while the policy wants it
+/// out, on what the host holds now, and purges the dropped tables' pages so
+/// the reading falls ([`multilinear_block::BlockRegen::partial`],
+/// [`DropPurges`]). Anything else refuses the prove. The proof is the same.
+fn block_drop() -> Result<DropMode, Error> {
+    parse_drop(std::env::var("LAMBDA_VM_BLOCK_DROP").ok().as_deref())
+}
+
+/// What live regeneration drops once armed ([`block_drop`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DropMode {
+    All,
+    Partial,
+}
+
+fn parse_drop(value: Option<&str>) -> Result<DropMode, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "all") => Ok(DropMode::All),
+        Some("partial") => Ok(DropMode::Partial),
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_BLOCK_DROP={v}: all or partial"
+        ))),
+    }
+}
+
+/// The dropped bytes after which partial drops purge ([`DropPurges`]).
+const DROP_PURGE_BYTES: u64 = 4 << 30;
+/// The least time between two of their purges.
+const DROP_PURGE_SPACING: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Partial drops' purges: once [`DROP_PURGE_BYTES`] have been dropped since the
+/// last purge, and that one was [`DROP_PURGE_SPACING`] ago, a purge on a thread
+/// of its own hands the allocator's freed pages back, so the host's reading
+/// falls by the dropped tables. The committer that decides never waits on it.
+struct DropPurges {
+    purge: fn() -> Option<crate::alloc_purge::Purge>,
+    pending: std::sync::atomic::AtomicU64,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    last: std::sync::Mutex<Option<Instant>>,
+    count: std::sync::atomic::AtomicUsize,
+    micros: std::sync::atomic::AtomicU64,
+    returned: std::sync::atomic::AtomicU64,
+}
+
+impl DropPurges {
+    fn new(purge: fn() -> Option<crate::alloc_purge::Purge>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            purge,
+            pending: Default::default(),
+            running: Default::default(),
+            last: std::sync::Mutex::new(None),
+            count: Default::default(),
+            micros: Default::default(),
+            returned: Default::default(),
+        })
+    }
+
+    /// A table of `bytes` the policy dropped. Returns the purge's thread when
+    /// this drop started one.
+    fn dropped(self: &std::sync::Arc<Self>, bytes: u64) -> Option<std::thread::JoinHandle<()>> {
+        use std::sync::atomic::Ordering::{AcqRel, Relaxed, Release};
+        let pending = self.pending.fetch_add(bytes, Relaxed).saturating_add(bytes);
+        if pending < DROP_PURGE_BYTES {
+            return None;
+        }
+        let spaced = self
+            .last
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none_or(|t| t.elapsed() >= DROP_PURGE_SPACING);
+        if !spaced || self.running.swap(true, AcqRel) {
+            return None;
+        }
+        self.pending.store(0, Relaxed);
+        let me = std::sync::Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("block-drop-purge".to_string())
+            .spawn(move || {
+                if let Some(purge) = (me.purge)() {
+                    me.count.fetch_add(1, Relaxed);
+                    me.micros.fetch_add((purge.secs * 1e6) as u64, Relaxed);
+                    let returned = purge.resident_before.saturating_sub(purge.resident_after);
+                    me.returned.fetch_add(returned as u64, Relaxed);
+                }
+                *me.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+                me.running.store(false, Release);
+            });
+        match spawned {
+            Ok(handle) => Some(handle),
+            Err(_) => {
+                self.running.store(false, Release);
+                None
+            }
+        }
+    }
+
+    /// The `BLOCK DROP` line.
+    fn line(&self) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        format!(
+            "BLOCK DROP: partial · {} purges of the dropped tables' pages, {:.2} s, {:.2} GiB returned",
+            self.count.load(Relaxed),
+            self.micros.load(Relaxed) as f64 / 1e6,
+            self.returned.load(Relaxed) as f64 / (1u64 << 30) as f64
+        )
+    }
 }
 
 /// `auto`'s reserve beside the host's bytes: what the block still needs once
@@ -4173,6 +4304,7 @@ fn prove_streamed(
     // the host (`always`: every one). The streamed chunks are placed first, in
     // hand-out order, so the table at block index `t` is the `t`-th chunk
     // handed out when there was one.
+    let drop_mode = block_drop()?;
     let live_regen = regen_recorder
         .as_ref()
         .filter(|_| regen_mode.live())
@@ -4193,6 +4325,10 @@ fn prove_streamed(
                 },
                 regen_mode == regen::RegenMode::Always,
             )
+        })
+        .map(|regen| match drop_mode {
+            DropMode::Partial => regen.partial(),
+            DropMode::All => regen,
         });
     if let (Some(regen), Some(pause)) = (&live_regen, deviations.streamed_drop_delay) {
         regen.delay_drops(0, pause);
@@ -4286,10 +4422,14 @@ fn prove_streamed(
     // on it and the purge's pressure is noted from it (`note_pressure_past`).
     // Once live regeneration has armed, its phase-B reserve counts. While
     // closed groups may wait behind one another, their cells count as
-    // committed ([`group_queue::arming_cells`]).
+    // committed ([`group_queue::arming_cells`]). Partial drops, once armed,
+    // weigh what the host holds now, and purge what they dropped.
+    let drop_purges = (drop_mode == DropMode::Partial && live_regen.is_some())
+        .then(|| DropPurges::new(crate::alloc_purge::purge_now));
     let wanted: std::sync::Arc<multilinear_block::SpillWanted> = {
         let host_most = std::sync::Arc::clone(&host_most);
         let armed = live_regen.clone();
+        let purges = drop_purges.clone();
         let reserve = regen::regen_reserve_bytes();
         let per_g = spill_reserve_per_g();
         let waiting = std::sync::Arc::clone(&queue_stats);
@@ -4303,14 +4443,21 @@ fn prove_streamed(
                 }
             }
             note_pressure_past(reading.bytes(), target);
-            let extra = if armed.as_ref().is_some_and(|r| r.is_armed()) {
-                reserve
-            } else {
-                0
-            };
-            spill_wanted(decide, target, per_g, kept, cells, bytes, || {
-                reading.bytes().saturating_add(extra)
-            })
+            let is_armed = armed.as_ref().is_some_and(|r| r.is_armed());
+            let extra = if is_armed { reserve } else { 0 };
+            let now = purges.is_some() && is_armed;
+            let allocator = now
+                .then(crate::alloc_purge::stats)
+                .flatten()
+                .map(|s| s.resident as u64);
+            let host = decision_bytes(&reading, allocator, now);
+            let out = spill_wanted(decide, target, per_g, kept, cells, bytes, || {
+                host.saturating_add(extra)
+            });
+            if out && let Some(purges) = &purges {
+                purges.dropped(bytes);
+            }
+            out
         })
     };
     let spill = match policy {
@@ -4634,6 +4781,12 @@ fn prove_streamed(
                             if started { "started" } else { "not started" },
                         );
                     }
+                }
+                // Partial drops: the last drop-back is past, so every table's
+                // fate is known as phase A commits it from here, and the early
+                // regenerator may start.
+                if let Some(regen) = walk_spill.as_ref().and_then(|spill| spill.regen.as_ref()) {
+                    regen.settle();
                 }
                 // The table phase's marks, for `finish` alone.
                 crate::tables::trace_builder::build_stamps::start();
@@ -5346,6 +5499,9 @@ fn prove_streamed(
         if let Some((drops, window_of, run, rest_window, rest_run)) = live {
             let recipes = recorder.map_or(0, |r| r.recipes().0.len());
             let mut lines = vec![regen::dropped_line(regen_mode, no_disk, &drops, recipes)];
+            if let Some(purges) = &drop_purges {
+                lines.push(purges.line());
+            }
             let rest_report = rest_run.map(regen::RestRun::join);
             let offset = run.as_ref().map(|run| {
                 phase_b_start
@@ -7131,5 +7287,158 @@ mod rest_slide_knob_tests {
         for value in ["0", " 0 "] {
             assert!(!parse_rest_slide(Some(value)), "{value}");
         }
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    use super::{DROP_PURGE_BYTES, DropMode, DropPurges, HostReading, decision_bytes, parse_drop};
+    use crate::alloc_purge::Purge;
+
+    const G: u64 = 1 << 30;
+
+    /// `LAMBDA_VM_BLOCK_DROP`: unset, empty or `all` drops everything once
+    /// armed; `partial` only what the policy wants out; any other word refuses.
+    #[test]
+    fn the_drop_knob_takes_all_and_partial_and_refuses_anything_else() {
+        for (value, mode) in [
+            (None, DropMode::All),
+            (Some(""), DropMode::All),
+            (Some("all"), DropMode::All),
+            (Some(" partial "), DropMode::Partial),
+        ] {
+            assert_eq!(parse_drop(value).ok(), Some(mode), "{value:?}");
+        }
+        for value in ["some", "1", "on", "partly"] {
+            assert!(parse_drop(Some(value)).is_err(), "{value}");
+        }
+    }
+
+    /// Partial drops, once armed, weigh what the host holds now: after a purge
+    /// hands the dropped tables' pages back, the reading falls (the working
+    /// set and the allocator's resident bytes both did), while the peak the
+    /// rule weighs otherwise stays where it was.
+    #[test]
+    fn after_a_purge_the_partial_reading_falls_and_the_peak_does_not() {
+        let before = HostReading {
+            hwm: 66 * G,
+            charged: 65 * G,
+            inactive_file: G,
+        };
+        let after = HostReading {
+            hwm: 66 * G,
+            charged: 49 * G,
+            inactive_file: G,
+        };
+        assert_eq!(decision_bytes(&before, Some(60 * G), true), 64 * G);
+        assert_eq!(decision_bytes(&after, Some(44 * G), true), 48 * G);
+        // The allocator's resident bytes count when the cgroup reads lower.
+        assert_eq!(decision_bytes(&after, Some(55 * G), true), 55 * G);
+        // Not partial, or not armed: the peak, purge or not.
+        for (reading, allocator) in [(&before, Some(60 * G)), (&after, Some(44 * G))] {
+            assert_eq!(decision_bytes(reading, allocator, false), 66 * G);
+        }
+    }
+
+    /// A jemalloc control of type `T` at `name`: written with `new` when
+    /// given, the old value returned.
+    fn mallctl<T: Copy + Default>(name: &std::ffi::CStr, new: Option<T>) -> Option<T> {
+        let mut old = T::default();
+        let mut old_len = std::mem::size_of::<T>();
+        let mut new = new;
+        let (new_ptr, new_len) = match new.as_mut() {
+            Some(v) => (
+                v as *mut T as *mut std::ffi::c_void,
+                std::mem::size_of::<T>(),
+            ),
+            None => (std::ptr::null_mut(), 0),
+        };
+        // SAFETY: `name` is NUL-terminated; the old and new pointers point at a
+        // `T` of the control's type, with their lengths.
+        let rc = unsafe {
+            tikv_jemalloc_sys::mallctl(
+                name.as_ptr(),
+                &mut old as *mut T as *mut std::ffi::c_void,
+                &mut old_len,
+                new_ptr,
+                new_len,
+            )
+        };
+        (rc == 0).then_some(old)
+    }
+
+    /// The allocator's resident bytes, the reading's other half, fall when a
+    /// purge hands back a freed gigabyte. The lib's test build runs jemalloc;
+    /// the calling thread's arena is set to keep its dirty pages until purged,
+    /// as the block's posture keeps them (`dirty_decay_ms:-1`), for the length
+    /// of the test.
+    #[test]
+    fn a_purge_hands_freed_pages_back_to_the_reading() {
+        let resident = || {
+            crate::alloc_purge::stats()
+                .expect("jemalloc's stats")
+                .resident as u64
+        };
+        let arena: u32 = mallctl(c"thread.arena", None).expect("the thread's arena");
+        let decay = std::ffi::CString::new(format!("arena.{arena}.dirty_decay_ms"))
+            .expect("a control name");
+        let was: isize = mallctl(&decay, Some(-1isize)).expect("the arena's decay");
+        let mut blocks: Vec<Vec<u8>> = (0..256).map(|_| vec![0u8; 4 << 20]).collect();
+        for block in &mut blocks {
+            for page in block.chunks_mut(4096) {
+                page[0] = 1;
+            }
+        }
+        std::hint::black_box(&blocks);
+        let held = resident();
+        drop(blocks);
+        let freed = resident();
+        let purge = crate::alloc_purge::purge_now().expect("the test build purges");
+        let purged = resident();
+        mallctl(&decay, Some(was));
+        assert!(
+            freed + G / 2 > held,
+            "the freed pages left at once: {held} → {freed} bytes"
+        );
+        assert!(
+            purged + G / 2 < freed,
+            "resident {freed} → {purged} bytes ({purge:?})"
+        );
+    }
+
+    static PURGES: AtomicUsize = AtomicUsize::new(0);
+
+    fn counted() -> Option<Purge> {
+        PURGES.fetch_add(1, Relaxed);
+        Some(Purge {
+            secs: 0.25,
+            resident_before: (10 * G) as usize,
+            resident_after: (6 * G) as usize,
+        })
+    }
+
+    /// A purge starts once the dropped bytes reach the threshold, on a thread
+    /// of its own, and no second one within the spacing; its line counts it.
+    #[test]
+    fn partial_drops_purge_past_their_bytes_and_their_spacing() {
+        let purges = DropPurges::new(counted);
+        let start = PURGES.load(Relaxed);
+        assert!(purges.dropped(DROP_PURGE_BYTES / 2).is_none());
+        assert!(purges.dropped(DROP_PURGE_BYTES / 2 - 1).is_none());
+        purges
+            .dropped(1)
+            .expect("the threshold starts a purge")
+            .join()
+            .expect("the purge");
+        assert_eq!(PURGES.load(Relaxed) - start, 1);
+        // Past the bytes again, but within the spacing: none.
+        assert!(purges.dropped(DROP_PURGE_BYTES).is_none());
+        assert_eq!(PURGES.load(Relaxed) - start, 1);
+        assert_eq!(
+            purges.line(),
+            "BLOCK DROP: partial · 1 purges of the dropped tables' pages, 0.25 s, 4.00 GiB returned"
+        );
     }
 }
