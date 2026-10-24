@@ -1079,3 +1079,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakRndConstraint
         b.emit_base(idx, mu.clone() * (one - mu));
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "keccak_rnd_card_tests.rs"]
+mod card_tests;

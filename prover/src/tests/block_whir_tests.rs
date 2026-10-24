@@ -4112,3 +4112,159 @@ fn a_split_table_is_its_rows_in_order() {
         }
     }
 }
+
+/// ★ KECCAK_RND filled from its records ([`Deviations::card_fill`], the
+/// `LAMBDA_VM_BLOCK_CARD_FILL` knob) moves no byte: the streamed finish holds
+/// every KECCAK_RND table as its keccak operations, the card fills each from
+/// them at its phase-A and its phase-B upload (on a host without one, a host
+/// reader fills it there), and the proof verifies with the same partition,
+/// tables and statement, its bytes equal under the deterministic grind. The
+/// inline layout's finish is not streamed and holds none.
+#[test]
+fn keccak_rnd_filled_from_records_moves_no_byte() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    for workers in [0usize, 3] {
+        let proved = |card_fill: bool| {
+            let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+            o.layout_workers = workers;
+            let (proof, stamps) = prove_block_whir_with(
+                &elf,
+                &[],
+                &ProofOptions::default_test_options(),
+                &format,
+                &o,
+                &Deviations {
+                    card_fill: Some(card_fill),
+                    ..Deviations::default()
+                },
+            )
+            .expect("prove");
+            assert!(
+                verify(&proof, &elf, &format),
+                "card fill {card_fill}, {workers} workers"
+            );
+            (proof, stamps)
+        };
+        let (host, host_stamps) = proved(false);
+        let (card, stamps) = proved(true);
+        let what = format!("{workers} workers");
+        assert_eq!(host_stamps.layout.records_rest.0, 0, "{what}: knob off");
+        assert_eq!(host_stamps.records_fills, (0, 0), "{what}: knob off");
+        let tables = card.table_counts.keccak_rnd;
+        assert!(tables > 1, "{what}: {tables} KECCAK_RND tables");
+        let held = stamps.layout.records_rest.0;
+        if workers == 0 {
+            assert_eq!(held, 0, "{what}: the inline finish holds none");
+        } else {
+            assert_eq!(held, tables, "{what}: every KECCAK_RND table held");
+            assert_eq!(stamps.layout.records_rest.1 % 208, 0, "{what}: 208 B an op");
+            let (on_card, on_host) = stamps.records_fills;
+            if cfg!(feature = "cuda") {
+                let held = held as u64;
+                assert!(
+                    (held..=2 * held).contains(&on_card) && on_host == 0,
+                    "{what}: {on_card} on the card, {on_host} on the host, not each on the \
+                     card at its uploads"
+                );
+            } else {
+                assert_eq!(
+                    (on_card, on_host),
+                    (0, held as u64),
+                    "{what}: each filled on the host once"
+                );
+            }
+        }
+        assert_eq!(host.groups, card.groups, "{what}: the partition");
+        assert_eq!(host.table_num_vars, card.table_num_vars, "{what}");
+        assert_eq!(
+            format!("{:?}", host.table_counts),
+            format!("{:?}", card.table_counts),
+            "{what}"
+        );
+        if crypto::grinding::deterministic() {
+            assert_eq!(bytes(&host), bytes(&card), "{what}: the proof");
+        }
+    }
+}
+
+/// ★ A KECCAK_RND table held as its records is never dropped: with live
+/// regeneration dropping every table it can, the rest's regenerator builds
+/// LT's tables again and no KECCAK_RND table (it builds both without the
+/// records), and the proof is the one without regeneration.
+#[test]
+fn keccak_rnd_held_as_records_is_never_dropped() {
+    use crate::block_whir::BlockSpillPolicy;
+    use crate::block_whir::regen::RegenMode;
+
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let card = |card_fill: bool| Deviations {
+        card_fill: Some(card_fill),
+        ..Deviations::default()
+    };
+    let (plain, _) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Off,
+        BlockSpillPolicy::Off,
+        card(true),
+    )
+    .expect("prove");
+    let rest_line = |stamps: &crate::block_whir::BlockStamps| {
+        let r = stamps.regen.as_ref().expect("live regeneration's readout");
+        assert_eq!((r.mismatches, r.failed), (0, 0), "{:?}", r.lines);
+        assert_eq!(r.rest_regenerated, r.rest_dropped, "{:?}", r.lines);
+        assert!(r.rest_dropped > 0, "no rest table dropped: {:?}", r.lines);
+        r.lines
+            .iter()
+            .find(|l| l.starts_with("BLOCK REGEN rest: "))
+            .cloned()
+            .expect("the rest's line")
+    };
+    let (built, stamps) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Always,
+        BlockSpillPolicy::Off,
+        card(false),
+    )
+    .expect("prove");
+    let line = rest_line(&stamps);
+    assert!(
+        !line.contains("KECCAK_RND 0 ·"),
+        "built, so dropped: {line}"
+    );
+    assert!(verify(&built, &elf, &format));
+    let (held, stamps) = regenerated(
+        &elf,
+        &format,
+        RegenMode::Always,
+        BlockSpillPolicy::Off,
+        card(true),
+    )
+    .expect("prove");
+    assert!(stamps.layout.records_rest.0 > 0, "no table held as records");
+    let line = rest_line(&stamps);
+    assert!(
+        line.contains("KECCAK_RND 0 · LT "),
+        "held, never dropped: {line}"
+    );
+    assert!(!line.contains("LT 0 built"), "LT dropped and back: {line}");
+    assert_eq!(held.groups, plain.groups, "the partition");
+    assert!(verify(&held, &elf, &format));
+    if crypto::grinding::deterministic() {
+        assert_eq!(bytes(&held), bytes(&plain), "the proof");
+        assert_eq!(bytes(&built), bytes(&plain), "the proof");
+    }
+}

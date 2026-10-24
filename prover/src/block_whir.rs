@@ -2495,6 +2495,9 @@ pub(crate) struct Deviations {
     /// check of their preprocessed columns against the program's, so a table
     /// whose program columns were edited reaches the verifier.
     pub unchecked_preprocessed: bool,
+    /// Whether the card fills KECCAK_RND from its records, instead of the
+    /// knob ([`block_card_fill`]).
+    pub card_fill: Option<bool>,
 }
 
 /// A prepared stack committed wrongly, tables by AIR index.
@@ -4340,7 +4343,7 @@ fn prove_streamed(
     let tag = block_statement_tag(&format.zf.base);
     crate::with_block_hash!(format.zf.base, |H| {
         let walkers = block_walkers()?;
-        let card_fill = block_card_fill()?;
+        let card_fill = deviations.card_fill.map_or_else(block_card_fill, Ok)?;
         let (block, built, laid, executed) = std::thread::scope(|scope| {
             use std::sync::atomic::Ordering::Relaxed;
             // The executor, a window at a time, two windows ahead of the walk;
