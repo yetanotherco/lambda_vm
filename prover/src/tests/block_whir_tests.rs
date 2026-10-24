@@ -4117,7 +4117,8 @@ fn a_split_table_is_its_rows_in_order() {
 /// `LAMBDA_VM_BLOCK_CARD_FILL` knob) moves no byte: the streamed finish holds
 /// every KECCAK_RND table as its keccak operations, the card fills each from
 /// them at its phase-A and its phase-B upload (on a host without one, a host
-/// reader fills it there), and the proof verifies with the same partition,
+/// reader fills it there; at this test's size the commit's own encode is the
+/// host's, under the card's floor), and the proof verifies with the same partition,
 /// tables and statement, its bytes equal under the deterministic grind. The
 /// inline layout's finish is not streamed and holds none.
 #[test]
@@ -4166,11 +4167,15 @@ fn keccak_rnd_filled_from_records_moves_no_byte() {
             assert_eq!(stamps.layout.records_rest.1 % 208, 0, "{what}: 208 B an op");
             let (on_card, on_host) = stamps.records_fills;
             if cfg!(feature = "cuda") {
+                // Each table's group goes up at its commit and at its argument,
+                // filled on the card each time. At this size a commit is under
+                // the card's floor (a codeword of 2^12, `gpu::COMMIT_THRESHOLD`)
+                // and encodes on the host from the host's fill, once a table.
                 let held = held as u64;
                 assert!(
-                    (held..=2 * held).contains(&on_card) && on_host == 0,
+                    (held..=2 * held).contains(&on_card) && on_host <= held,
                     "{what}: {on_card} on the card, {on_host} on the host, not each on the \
-                     card at its uploads"
+                     card at both its uploads"
                 );
             } else {
                 assert_eq!(

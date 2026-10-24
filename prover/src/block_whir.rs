@@ -4146,6 +4146,9 @@ fn prove_streamed(
     gpack::reset_counts();
     // A new block: no memory pressure seen yet (`alloc_purge`).
     crate::alloc_purge::clear_memory_pressure();
+    // The tables filled from their records over the whole prove: phase A's
+    // commits and phase B's arguments alike.
+    let fills_before = multilinear::records::fills();
     let stream_airs = StreamAirs::new(opts, stream_form, options.max_rows.cpu);
     // Regeneration (`BlockOptions::regen`): its recorder, when phase A can feed
     // it — its chunks generated packed, and none of KECCAK_RND's or of the
@@ -5291,7 +5294,6 @@ fn prove_streamed(
         let paths_before = multilinear::whir_commit::top_path_counts();
         let routes_before = multilinear::whir_commit::top_path_routes();
         let widens_before = multilinear::narrow::host_widens();
-        let fills_before = multilinear::records::fills();
         let identity = |g: usize| g;
         let fork_of: &dyn Fn(usize) -> usize = match &deviations.fork_of {
             Some(f) => f,
