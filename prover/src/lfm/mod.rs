@@ -252,6 +252,8 @@ mod whir_gkr_tests;
 #[cfg(test)]
 mod whir_global_tests;
 #[cfg(test)]
+mod whir_lean_tests;
+#[cfg(test)]
 mod whir_leg_tests;
 #[cfg(test)]
 mod whir_onechain_tests;

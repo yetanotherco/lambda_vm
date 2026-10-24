@@ -42,7 +42,7 @@ type E = GoldilocksExtension;
 
 const SOCKET: HasherKind = HasherKind::Poseidon1W16;
 
-fn p1_builder() -> LfmBuilder {
+pub(super) fn p1_builder() -> LfmBuilder {
     LfmBuilder::new().with_wrap_hash(WrapHash::Poseidon1)
 }
 
@@ -337,7 +337,7 @@ fn the_child_order_walk_reaches_the_hosts_root() {
 
 // ================================= the chain ===============================
 
-fn pseudo_mle(num_vars: usize, seed: u64) -> Mle<F> {
+pub(super) fn pseudo_mle(num_vars: usize, seed: u64) -> Mle<F> {
     let vals = (0..1usize << num_vars)
         .map(|i| {
             let mixed = (i as u64)
@@ -349,7 +349,7 @@ fn pseudo_mle(num_vars: usize, seed: u64) -> Mle<F> {
     Mle::new(vals).expect("a cube")
 }
 
-fn point(num_vars: usize, seed: u64) -> Vec<FEE> {
+pub(super) fn point(num_vars: usize, seed: u64) -> Vec<FEE> {
     (0..num_vars)
         .map(|i| {
             FEE::new([
@@ -363,7 +363,7 @@ fn point(num_vars: usize, seed: u64) -> Vec<FEE> {
 
 /// A small chain config at arity 4: blowup 4, folds of 4, `cap4` the 4-ary
 /// cap policy (`ChainFormat::arity4_cap`).
-fn p1_config(num_queries: usize, grind: u8, cap4: CapPolicy) -> ChainConfig {
+pub(super) fn p1_config(num_queries: usize, grind: u8, cap4: CapPolicy) -> ChainConfig {
     ChainConfig {
         log_blowup: 2,
         log_folding: 4,
@@ -376,19 +376,30 @@ fn p1_config(num_queries: usize, grind: u8, cap4: CapPolicy) -> ChainConfig {
     }
 }
 
-struct Fixture {
-    cfg: ChainConfig,
-    proof: ChainProof<F, E>,
-    z: Vec<FEE>,
-    y: FEE,
-    root_bytes: [u8; 32],
-    domain: Domain<F>,
-    shape: ChainShape,
+pub(super) struct Fixture {
+    pub(super) cfg: ChainConfig,
+    pub(super) proof: ChainProof<F, E>,
+    pub(super) z: Vec<FEE>,
+    pub(super) y: FEE,
+    pub(super) root_bytes: [u8; 32],
+    pub(super) domain: Domain<F>,
+    pub(super) shape: ChainShape,
 }
 
 /// Proves one chain over `P1Whir` and checks the host verifier accepts it.
-fn fixture(num_vars: usize, cfg: ChainConfig) -> Fixture {
-    let f = pseudo_mle(num_vars, 11);
+pub(super) fn fixture(num_vars: usize, cfg: ChainConfig) -> Fixture {
+    fixture_over(pseudo_mle(num_vars, 11), num_vars, cfg)
+}
+
+/// [`fixture`] over a constant polynomial: every codeword is constant, so the
+/// blocks a tree opens are equal.
+pub(super) fn constant_fixture(num_vars: usize, cfg: ChainConfig) -> Fixture {
+    let f = Mle::new(vec![FE::from(7u64); 1usize << num_vars]).expect("a cube");
+    fixture_over(f, num_vars, cfg)
+}
+
+/// [`fixture`] over the polynomial `f`.
+fn fixture_over(f: Mle<F>, num_vars: usize, cfg: ChainConfig) -> Fixture {
     let z = point(num_vars, 0);
     let y = f.evaluate_in::<E>(&z).expect("f takes its own point");
     let (commitment, domain) = commit::<F, P1Whir>(&f, &cfg, true).expect("the polynomial commits");
@@ -411,14 +422,14 @@ fn fixture(num_vars: usize, cfg: ChainConfig) -> Fixture {
     }
 }
 
-fn host_accepts(f: &Fixture, proof: &ChainProof<F, E>) -> bool {
+pub(super) fn host_accepts(f: &Fixture, proof: &ChainProof<F, E>) -> bool {
     let mut t = P1Transcript::new();
     verify::<F, E, _, P1Whir>(proof, &f.root_bytes, &f.z, f.y, &f.domain, &f.cfg, &mut t).is_ok()
 }
 
 /// The chain program for `shape` under Poseidon1: `z`, `y`, the root and the
 /// final value hinted, then the rounds, as `whir_chain_tests::chain_program`.
-fn p1_chain_program(shape: &ChainShape) -> LfmProgram {
+pub(super) fn p1_chain_program(shape: &ChainShape) -> LfmProgram {
     let mut b = p1_builder();
     let mut total = (shape.num_vars + 3) as u32;
     let first_round = total;
@@ -463,7 +474,7 @@ fn p1_chain_arena(f: &Fixture, proof: &ChainProof<F, E>) -> Vec<LfmWord> {
     words
 }
 
-fn hash16_rows(program: &LfmProgram) -> usize {
+pub(super) fn hash16_rows(program: &LfmProgram) -> usize {
     program
         .instrs
         .iter()
@@ -614,7 +625,7 @@ fn a_tampered_p1_chain_cannot_execute() {
 
 /// [`p1_config`] with its round-0 trees in `leaves`' order, round 0 folding
 /// `first` variables when given.
-fn p1_ordered_config(
+pub(super) fn p1_ordered_config(
     num_queries: usize,
     grind: u8,
     cap4: CapPolicy,

@@ -28,6 +28,7 @@ fn one_group(argue: ArgueFormat) -> BlockFormat {
         argue,
         group: multilinear::whir_chain::GroupFold::PerPoly,
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
+        leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
     }
 }
 
@@ -44,6 +45,7 @@ fn many_groups(argue: ArgueFormat) -> BlockFormat {
         argue,
         group: multilinear::whir_chain::GroupFold::PerPoly,
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
+        leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
     }
 }
 
@@ -668,6 +670,7 @@ fn the_card_argues_the_hosts_bytes() {
         argue: BATCHED,
         group: multilinear::whir_chain::GroupFold::PerPoly,
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
+        leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
     };
     for name in ["all_instructions_64", "test_keccak", "test_ecsm"] {
         let (program, elf, mut traces) = fixed_traces(name, &MaxRowsConfig::default(), 16);

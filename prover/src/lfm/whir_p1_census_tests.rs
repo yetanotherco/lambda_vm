@@ -1089,6 +1089,74 @@ fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
     );
 }
 
+/// ★ The lean leaf's census on the median mix at blowup 2 (the production
+/// rate): each group's emitted chip rows under [`LeafQuery::Lean`] against
+/// `V1`, the same statement and partition rule. The tail rounds cut every
+/// group's socket, hint and select rows and leave the leaf's front as it is.
+/// Prints `LEAN CENSUS` lines: the per-group deltas by chip (min, median,
+/// max) — the measured deltas the packing replay takes.
+#[test]
+fn the_lean_leaf_cuts_every_groups_rows_on_the_median_mix() {
+    use super::whir_chain::LeafQuery;
+    let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
+    let opts = super::proof::block_base_options();
+    let at = |leaf_query: LeafQuery| {
+        let mut format = p1_format();
+        format.zf.whir_blowup = 2;
+        BlockFormat {
+            leaf_query,
+            ..format
+        }
+    };
+    let owned = median_statement(&elf_bytes, &opts, &at(LeafQuery::V1));
+    let plan = |query: LeafQuery| {
+        WhirBlockPlan::derive(&elf_bytes, &opts, &at(query), owned.view(), None)
+            .expect("the plan derives")
+    };
+    let (v1, lean) = (plan(LeafQuery::V1), plan(LeafQuery::Lean));
+    let ((v1_loads, v1_front), (lean_loads, lean_front)) = (v1.chip_loads(), lean.chip_loads());
+    assert_eq!(v1_front, lean_front, "the leaf's front is the same");
+    assert_eq!(v1_loads.len(), lean_loads.len());
+    let deltas: Vec<[i64; 10]> = v1_loads
+        .iter()
+        .zip(lean_loads)
+        .map(|(a, b)| {
+            let (a, b) = (a.to_array(), b.to_array());
+            core::array::from_fn(|c| b[c] as i64 - a[c] as i64)
+        })
+        .collect();
+    for (g, d) in deltas.iter().enumerate() {
+        assert!(
+            d[0] < 0 && d[1] < 0 && d[5] < 0,
+            "group {g}: socket {} select {} hint {} — the tail rounds cut all three",
+            d[0],
+            d[1],
+            d[5]
+        );
+    }
+    for (c, name) in ChipRows::NAMES.iter().enumerate() {
+        let mut col: Vec<i64> = deltas.iter().map(|d| d[c]).collect();
+        col.sort_unstable();
+        let v1_median = {
+            let mut v: Vec<usize> = v1_loads.iter().map(|l| l.to_array()[c]).collect();
+            v.sort_unstable();
+            v[v.len() / 2]
+        };
+        println!(
+            "LEAN CENSUS {name}: per group min {} median {} max {} (V1 median {v1_median})",
+            col[0],
+            col[col.len() / 2],
+            col[col.len() - 1]
+        );
+    }
+    println!(
+        "LEAN CENSUS LEAVES: V1 {} · lean {} ({} groups)",
+        v1.partition().num_leaves(),
+        lean.partition().num_leaves(),
+        v1.num_groups()
+    );
+}
+
 /// ★ The heights hold on the median mix, as emitted: the plan's rows are the
 /// emitted ones ([`assert_planned`]: groups 0 (prepared, the carrier) and 1
 /// (heavy) alone, and a leaf of the heavy groups from 2 on, as many as take its

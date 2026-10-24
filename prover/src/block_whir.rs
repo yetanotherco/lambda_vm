@@ -241,6 +241,10 @@ pub struct BlockFormat {
     /// block proof does not read it — and, like the rest, a constant the
     /// prover and the verifier each hold.
     pub leaf_scale: crate::lfm::whir_block::LeafScale,
+    /// How the recursion's leaf checks each chain's queries
+    /// ([`crate::lfm::whir_chain::LeafQuery`]): the recursion's alone, like
+    /// [`Self::leaf_scale`].
+    pub leaf_query: crate::lfm::whir_chain::LeafQuery,
     /// How each group's tables argue: one argument per table
     /// ([`ArgueFormat::PerTable`], production), or one per group — a lockstep
     /// GKR per bin of its trees and one constraint sumcheck over its tables
@@ -343,7 +347,10 @@ impl BlockFormat {
     /// [`GroupFold::PerPoly`] stay formats to measure against. The leaves'
     /// scale is the environment's (`LAMBDA_VM_WHIR_LEAF_DOUBLE_FROM`; unset,
     /// [`LeafScale::DEFAULT`](crate::lfm::whir_block::LeafScale::DEFAULT),
-    /// doubled from 10 leaves; `off`, every leaf at the single heights).
+    /// doubled from 10 leaves; `off`, every leaf at the single heights). The
+    /// leaves' query check is the environment's too
+    /// (`LAMBDA_VM_WHIR_LEAF_QUERY`; unset,
+    /// [`LeafQuery::V1`](crate::lfm::whir_chain::LeafQuery::V1)).
     pub fn production() -> Self {
         Self {
             zf: *ZfFormat::global(),
@@ -351,6 +358,7 @@ impl BlockFormat {
             max_groups: BLOCK_MAX_GROUPS,
             prepared: true,
             leaf_scale: crate::lfm::whir_block::process_leaf_scale(),
+            leaf_query: crate::lfm::whir_block::process_leaf_query(),
             argue: ArgueFormat::BATCHED,
             group: GroupFold::Indexed,
         }

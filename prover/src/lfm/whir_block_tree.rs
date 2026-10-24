@@ -327,6 +327,7 @@ impl WhirTreeConfig {
         // The leaves' scale first: the production format reads the same knob
         // and refuses what it cannot take, which this returns as an error.
         let leaf_scale = leaf_scale_from_env()?;
+        let leaf_query = super::whir_block::leaf_query_from_env()?;
         let leaves = count_knob("W3_LEAVES")?;
         let siblings = count_knob("W3_SIBLINGS")?.unwrap_or(3);
         let fan_in = count_knob("W3_FAN_IN")?.unwrap_or(BLOCK_FAN_IN);
@@ -349,6 +350,7 @@ impl WhirTreeConfig {
         let format = BlockFormat {
             argue,
             leaf_scale,
+            leaf_query,
             ..BlockFormat::production_with(group_setting(
                 std::env::var("LAMBDA_VM_WHIR_GROUP").ok().as_deref(),
             )?)
@@ -2130,6 +2132,7 @@ pub fn prove_whir_block_tree(
         plan.prepared().len()
     ));
     sink.line(&leaf_scale_line(format.leaf_scale, &plan));
+    sink.line(&format!("W3 LEAF QUERY: {:?}", format.leaf_query));
     // Each leaf's chips, real / padded rows: how far each sits from its next
     // doubling, and which one doubled when the in-guest work moves.
     // (The leaves emitted beside the base: the others do not exist yet.)

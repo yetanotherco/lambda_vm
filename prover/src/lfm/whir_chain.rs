@@ -88,6 +88,7 @@ use multilinear::whir_chain::{
 };
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
+use stark::config::Commitment;
 
 use super::algebraic_commit::commitment_to_digest;
 use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
@@ -160,6 +161,10 @@ pub struct ChainRoundWires<'a> {
 /// the schedule moves both sides together rather than only one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChainShape {
+    /// How the recursion leaf checks this chain's queries
+    /// ([`LeafQuery`]): [`LeafQuery::V1`] for every chain but a block leaf's
+    /// under its format's `leaf_query`.
+    pub query: LeafQuery,
     /// Variables folded in each round.
     pub schedule: Vec<usize>,
     /// `log2` of the domain each round starts at: `D_0 = num_vars +
@@ -192,6 +197,25 @@ pub struct ChainShape {
     pub leaves: LeafOrder,
 }
 
+/// How a block's recursion leaf checks a chain's queries: a verifier
+/// constant (`BlockFormat::leaf_query`) the prover's arena and the leaf
+/// program both follow, never read from a proof.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LeafQuery {
+    /// Every round's queries opened and folded one by one. The default.
+    #[default]
+    V1,
+    /// As [`Self::V1`], except the chain's tail rounds
+    /// ([`ChainShape::tail_round`]): a round whose current tree lies wholly in
+    /// its cap and has fewer leaves than the queries is checked at EVERY leaf
+    /// once, each leaf's block hashed against its cap node, folded at its
+    /// constant position and compared with the successor block (or the final
+    /// value). A superset of the sampled positions, so a leaf accepts only
+    /// what the host verifier's query checks for those rounds accept. The
+    /// rounds' query draws stay in the transcript, their bits unused.
+    Lean,
+}
+
 impl ChainShape {
     pub fn new(config: &ChainConfig, num_vars: usize) -> Self {
         Self::new_at(config, num_vars, 2)
@@ -210,6 +234,7 @@ impl ChainShape {
         let caps = config.tree_caps_at(num_vars, arity);
         debug_assert_eq!(caps.len(), schedule.len(), "one cap height per tree");
         Self {
+            query: LeafQuery::V1,
             schedule,
             domain_log,
             num_vars,
@@ -230,6 +255,37 @@ impl ChainShape {
 
     pub fn rounds(&self) -> usize {
         self.schedule.len()
+    }
+
+    /// ★ Whether round `r` is a tail round under [`LeafQuery::Lean`]: checked
+    /// at every leaf of its current tree once instead of at each query. Round
+    /// `r ≥ 1`, and it and every later round have a single current tree lying
+    /// wholly in its 4-ary cap (no walked level, `mux_bits` = the depth) with
+    /// fewer leaves than the queries: a suffix of the chain, so a tail round's
+    /// successor is a tail round too. Derived from the shape alone, so the
+    /// arena, the leaf and the cost model agree.
+    pub fn tail_round(&self, r: usize) -> bool {
+        self.query == LeafQuery::Lean
+            && r >= 1
+            && r < self.rounds()
+            && (r..self.rounds()).all(|t| self.tail_shaped(t))
+    }
+
+    /// Round `r`'s current tree on its own: one tree, at arity 4, capped, its
+    /// every leaf a cap node, and fewer leaves than queries.
+    fn tail_shaped(&self, r: usize) -> bool {
+        let depth = self.current_depth(r);
+        let c = self.caps[r];
+        self.arity == 4
+            && self.trees_at(r) == 1
+            && c > 0
+            && super::merkle_cap::mux_bits(depth, c, 4) == depth
+            && (1usize << depth) < self.num_queries
+    }
+
+    /// Leaves of round `r`'s current tree: the blocks a tail round checks.
+    pub fn current_leaves(&self, r: usize) -> usize {
+        1usize << self.current_depth(r)
     }
 
     /// The chains a stack of `num_polys` polynomials is opened by, each a range
@@ -410,18 +466,25 @@ impl ChainShape {
 /// [`chain_grind_perms`]; [`chain_perms`] is the sum of the three.
 pub fn chain_opening_perms(shape: &ChainShape) -> usize {
     let mut per_query = 0;
+    // A tail round ([`ChainShape::tail_round`]) hashes each leaf's block once
+    // (no walked level) and opens no successor a query.
+    let mut tail = 0;
     for r in 0..shape.rounds() {
-        per_query += shape.trees_at(r)
-            * shape.opening_perms(
-                shape.current_felts(r),
-                shape.current_depth(r),
-                shape.caps[r],
-            );
+        let current = shape.opening_perms(
+            shape.current_felts(r),
+            shape.current_depth(r),
+            shape.caps[r],
+        );
+        if shape.tail_round(r) {
+            tail += shape.current_leaves(r) * current;
+            continue;
+        }
+        per_query += shape.trees_at(r) * current;
         if let Some(depth) = shape.next_depth(r) {
             per_query += shape.opening_perms(3 << shape.schedule[r + 1], depth, shape.caps[r + 1]);
         }
     }
-    shape.num_queries * per_query + chain_cap_perms(shape)
+    shape.num_queries * per_query + tail + chain_cap_perms(shape)
 }
 
 /// PERMUTATIONS the chain's cap checks cost: each capped tree's cap hashed up
@@ -446,6 +509,20 @@ pub fn chain_query_rows(shape: &ChainShape) -> usize {
             1usize << shape.schedule[r]
         };
         let depth = shape.current_depth(r);
+        if shape.tail_round(r) {
+            // A tail round ([`emit_tail_phase`]): the draws, then per leaf its
+            // block's leaf, the compare with its cap node (both cells
+            // unpacked, four lowered asserts), the fold at its constant
+            // position and `folded == claimed`.
+            let leaf = super::whir_open::block_leaf_rows(felts, unpacks) + 2 + 2 * 4;
+            per_round += shape.num_queries
+                + shape.current_leaves(r)
+                    * (leaf + fold_rows_for(1usize << shape.schedule[r], depth) + 2);
+            if FoldEmission::current() == FoldEmission::Lean {
+                per_round += lean_prepare_rows(shape.schedule[r]);
+            }
+            continue;
+        }
         // The index draw, the current opening (one a tree), the trees' blocks
         // combined (a grouped round 0), and the fold.
         let mut q = 1
@@ -969,19 +1046,35 @@ fn emit_chain(
             ),
         };
 
-        emit_query_phase(
-            b,
-            transcript,
-            round,
-            shape,
-            r,
-            &current_domain,
-            data,
-            &current_trees,
-            if r == 0 { combine_eqs } else { &[] },
-            next_tree.as_ref(),
-            final_value,
-        );
+        if shape.tail_round(r) {
+            let next_blocks = rounds.get(r + 1).map(|next| next.current);
+            emit_tail_phase(
+                b,
+                transcript,
+                round,
+                shape,
+                r,
+                &current_domain,
+                data,
+                &current_trees,
+                next_blocks,
+                final_value,
+            );
+        } else {
+            emit_query_phase(
+                b,
+                transcript,
+                round,
+                shape,
+                r,
+                &current_domain,
+                data,
+                &current_trees,
+                if r == 0 { combine_eqs } else { &[] },
+                next_tree.as_ref(),
+                final_value,
+            );
+        }
 
         if let Some(tree) = next_tree {
             current_trees = vec![tree];
@@ -1403,6 +1496,124 @@ fn emit_query_phase(
     }
 }
 
+/// ★ A tail round's check ([`ChainShape::tail_round`], [`LeafQuery::Lean`]):
+/// the query draws, as [`emit_query_phase`] makes them, then EVERY leaf of the
+/// current tree at once.
+///
+/// Each leaf's block is hashed and must equal its cap node: the tree lies
+/// wholly in its cap, already authenticated against the root as the round
+/// before's successor, so the positions are program constants and no node is
+/// muxed. Each block folds at its constant position, and the fold must equal
+/// the successor's value at that position — successor block `i mod 2^d'`,
+/// slot `i >> d'`, read from the successor tail round's own hinted blocks
+/// (`next_blocks`), which that round authenticates the same way — or the
+/// final value at the last round.
+///
+/// Every sampled position is one of these, so the leaf accepts only what the
+/// host's checks at the sampled positions accept; an honest proof passes at
+/// every position (WHIR's completeness is perfect). The draws stay where the
+/// host's transcript takes them, and their bits go unused.
+#[allow(clippy::too_many_arguments)]
+fn emit_tail_phase(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    round: &ChainRoundWires<'_>,
+    shape: &ChainShape,
+    r: usize,
+    current_domain: &Domain<GoldilocksField>,
+    alphas: &[Ext],
+    current_trees: &[TreeAuth],
+    next_blocks: Option<&[QueryOpening<'_>]>,
+    final_value: Ext,
+) {
+    let depth = shape.current_depth(r);
+    let leaves = shape.current_leaves(r);
+    assert!(shape.tail_round(r), "round {r} is not a tail round");
+    assert_eq!(
+        round.current.len(),
+        leaves,
+        "a tail round hints every leaf once"
+    );
+    assert!(
+        round.next.is_empty(),
+        "a tail round opens no successor block a query"
+    );
+    for _ in 0..shape.num_queries {
+        let _ = transcript.sample_u64_pow2(b, depth);
+    }
+    let fold = RoundFold::prepare(b, alphas);
+    let [TreeAuth::Cap(cap)] = current_trees else {
+        panic!("a tail round's one current tree is capped")
+    };
+    let digests: Vec<WrapDigest> = round
+        .current
+        .iter()
+        .map(|block| super::whir_open::emit_block_leaf(b, block.values))
+        .collect();
+    cap.verify_every_leaf(b, &digests);
+    let next = match (next_blocks, shape.next_depth(r)) {
+        (Some(blocks), Some(next_depth)) => {
+            debug_assert!(
+                shape.tail_round(r + 1),
+                "a tail round's successor is a tail round"
+            );
+            assert_eq!(
+                blocks.len(),
+                1usize << next_depth,
+                "the successor's every leaf"
+            );
+            Some((blocks, next_depth))
+        }
+        (None, None) => None,
+        _ => panic!("round {r}: successor blocks exactly where the schedule has a successor"),
+    };
+    for (i, block) in round.current.iter().enumerate() {
+        let bits: Vec<Bit> = (0..depth).map(|t| b.bit_const((i >> t) & 1 == 1)).collect();
+        let folded = fold.fold(b, &block_ext(block.values), current_domain, &bits);
+        let claimed = match next {
+            Some((blocks, next_depth)) => {
+                let successor = &blocks[i % (1usize << next_depth)];
+                let slot = i >> next_depth;
+                #[cfg(test)]
+                let slot = if tail_faults::slot_off() {
+                    slot ^ 1
+                } else {
+                    slot
+                };
+                block_ext(successor.values)[slot]
+            }
+            None => final_value,
+        };
+        b.assert_eq_ext(folded, claimed);
+    }
+}
+
+/// Test only: a tail round's compare reads the successor's NEIGHBOURING slot,
+/// so an honest proof has no execution — the compare is live and reads the
+/// slot the position names. Thread-local, as [`onechain_faults`] is.
+#[cfg(test)]
+pub(crate) mod tail_faults {
+    std::thread_local! {
+        static SLOT_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(crate) fn slot_off() -> bool {
+        SLOT_OFF.with(std::cell::Cell::get)
+    }
+
+    /// Runs `f` with the fault on, restoring it after.
+    pub(crate) fn with_slot_off<R>(f: impl FnOnce() -> R) -> R {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SLOT_OFF.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(SLOT_OFF.with(|c| c.replace(true)));
+        f()
+    }
+}
+
 /// The bits round `r`'s current trees are walked on for a query of index bits
 /// `bits` (low first): the index itself, or at round 0 under
 /// [`LeafOrder::Coset`] the position the order puts the block at, the index
@@ -1587,8 +1798,13 @@ impl RoundStorage {
             // felts where the committer hashed sixteen and the root would never
             // match — which is exactly how this test first failed.
             // A grouped round 0: one block and path a tree, query-major.
-            let current: Vec<(CurrentBlock, Vec<WrapDigest>)> = (0..shape.num_queries
-                * shape.trees_at(r))
+            // A tail round: every leaf's block once, in leaf order, no path.
+            let openings = if shape.tail_round(r) {
+                shape.current_leaves(r)
+            } else {
+                shape.num_queries * shape.trees_at(r)
+            };
+            let current: Vec<(CurrentBlock, Vec<WrapDigest>)> = (0..openings)
                 .map(|_| {
                     let values = if r == 0 {
                         let felts: Vec<Felt> = (0..block)
@@ -1604,9 +1820,13 @@ impl RoundStorage {
                             (0..block).map(|_| next_word(b, &mut at).as_ext()).collect(),
                         )
                     };
-                    let path: Vec<WrapDigest> = (0..depth)
-                        .map(|_| WrapDigest::from_cell(next_word(b, &mut at)))
-                        .collect();
+                    let path: Vec<WrapDigest> = if shape.tail_round(r) {
+                        Vec::new()
+                    } else {
+                        (0..depth)
+                            .map(|_| WrapDigest::from_cell(next_word(b, &mut at)))
+                            .collect()
+                    };
                     (values, path)
                 })
                 .collect();
@@ -1622,7 +1842,13 @@ impl RoundStorage {
                         .collect();
                     let next_depth = shape.path_words(next_depth, shape.caps[r + 1]);
                     let next_block = 1usize << shape.schedule[r + 1];
-                    let next: Vec<(Vec<Ext>, Vec<WrapDigest>)> = (0..shape.num_queries)
+                    // A tail round opens no successor block a query.
+                    let next_openings = if shape.tail_round(r) {
+                        0
+                    } else {
+                        shape.num_queries
+                    };
+                    let next: Vec<(Vec<Ext>, Vec<WrapDigest>)> = (0..next_openings)
                         .map(|_| {
                             let values: Vec<Ext> = (0..next_block)
                                 .map(|_| next_word(b, &mut at).as_ext())
@@ -1733,8 +1959,13 @@ pub fn round_words(shape: &ChainShape, r: usize) -> u32 {
     let mut n = (2 * shape.messages(r) + nonces) as u32;
     let depth = shape.current_path(r);
     let block = 1usize << k;
-    // A grouped round 0 opens each of its trees at every query.
-    n += (shape.num_queries * shape.trees_at(r) * (block + depth)) as u32;
+    if shape.tail_round(r) {
+        // A tail round: every leaf's block once, in leaf order, and no path.
+        n += (shape.current_leaves(r) * block) as u32;
+    } else {
+        // A grouped round 0 opens each of its trees at every query.
+        n += (shape.num_queries * shape.trees_at(r) * (block + depth)) as u32;
+    }
     if r == 0 {
         // W1: tree 0's cap words, a grouped round 0's trees' each.
         n += (shape.trees * shape.cap_words(shape.current_depth(0), shape.caps[0])) as u32;
@@ -1744,8 +1975,12 @@ pub fn round_words(shape: &ChainShape, r: usize) -> u32 {
         // its block and path.
         let c = shape.caps[r + 1];
         n += 2 + shape.cap_words(next_depth, c) as u32;
-        let next_block = 1usize << shape.schedule[r + 1];
-        n += (shape.num_queries * (next_block + shape.path_words(next_depth, c))) as u32;
+        // A tail round reads its successor's blocks where that tail round
+        // hints them, so it opens none a query.
+        if !shape.tail_round(r) {
+            let next_block = 1usize << shape.schedule[r + 1];
+            n += (shape.num_queries * (next_block + shape.path_words(next_depth, c))) as u32;
+        }
     }
     n
 }
@@ -1761,6 +1996,21 @@ pub fn push_round_words(
     shape: &ChainShape,
     proof: &ChainProof<GoldilocksField, GoldilocksExtension>,
 ) {
+    // A proof [`try_push_round_words`] cannot lay out leaves the arena short,
+    // and its length (a verifier constant) refuses it.
+    let _ = try_push_round_words(words, shape, proof);
+}
+
+/// [`push_round_words`], refusing a proof whose tail round
+/// ([`ChainShape::tail_round`]) misses a leaf's block: every leaf of a tail
+/// tree is opened hundreds of times by an honest proof, so a missing one is a
+/// completeness failure (probability ≈ 4·(3/4)^(2Q)), and the words written
+/// before it stand.
+pub fn try_push_round_words(
+    words: &mut Vec<LfmWord>,
+    shape: &ChainShape,
+    proof: &ChainProof<GoldilocksField, GoldilocksExtension>,
+) -> Result<(), String> {
     for (r, round) in proof.rounds.iter().enumerate() {
         for sc in &round.sumcheck {
             for e in &sc.evaluations {
@@ -1783,7 +2033,11 @@ pub fn push_round_words(
             cap: shape.caps[r],
             owner: r == 0,
         };
-        push_openings(words, shape, round, true, current);
+        if shape.tail_round(r) {
+            push_tail_blocks(words, shape, proof, r)?;
+        } else {
+            push_openings(words, shape, round, true, current);
+        }
         if let Some(next_depth) = shape.next_depth(r) {
             words.push(commitment_to_digest(
                 round.next_root.as_ref().expect("a successor root"),
@@ -1796,9 +2050,111 @@ pub fn push_round_words(
                 cap: shape.caps[r + 1],
                 owner: true,
             };
-            push_openings(words, shape, round, false, next);
+            if shape.tail_round(r) {
+                // The successor's cap, for its tail round to authenticate; its
+                // blocks are that round's own.
+                for node in tail_cap(shape, round, r + 1)? {
+                    words.push(commitment_to_digest(&node));
+                }
+            } else {
+                push_openings(words, shape, round, false, next);
+            }
         }
     }
+    Ok(())
+}
+
+/// The successor openings round `r` carries, extension-valued at every round.
+fn next_openings(
+    round: &ChainRound<GoldilocksField, GoldilocksExtension>,
+) -> &[multilinear::whir_commit::CosetOpening<GoldilocksExtension>] {
+    match &round.openings {
+        RoundOpenings::Base(p) => &p.next,
+        RoundOpenings::Extension(p) => &p.next,
+        RoundOpenings::BaseGrouped(p) => &p.next,
+    }
+}
+
+/// Tail round `t`'s tree's cap: the end of the first successor path of the
+/// round before (`round`), its owner (W1). Every leaf of a tail tree is a cap
+/// node, so the cap is the leaves' digests in leaf order.
+fn tail_cap(
+    shape: &ChainShape,
+    round: &ChainRound<GoldilocksField, GoldilocksExtension>,
+    t: usize,
+) -> Result<Vec<Commitment>, String> {
+    let owner = next_openings(round)
+        .first()
+        .ok_or_else(|| format!("tail round {t}: no successor opening carries its cap"))?;
+    let (siblings, cap) = super::merkle_cap::child_path_to_cap(
+        &owner.proof.merkle_path,
+        shape.current_depth(t),
+        shape.caps[t],
+        shape.arity,
+        true,
+    )?;
+    match cap {
+        Some(cap) if siblings.is_empty() && cap.len() == shape.current_leaves(t) => Ok(cap),
+        _ => Err(format!(
+            "tail round {t}: the owner path is not a cap over every leaf"
+        )),
+    }
+}
+
+/// ★ Tail round `r`'s blocks, one a leaf in leaf order ([`ChainShape::tail_round`]).
+///
+/// The proof opens the tree at sampled positions only, and the host keeps no
+/// position. Each distinct opened block — round `r − 1`'s successor openings
+/// and round `r`'s own — is placed by its leaf hash among the cap's nodes, which
+/// are the leaves' digests: no index is needed, and the arena stays a function
+/// of the proof. A leaf no opening hits is a completeness failure, refused.
+/// The leaf checks every placed block against its cap node, so a misplaced one
+/// has no execution.
+fn push_tail_blocks(
+    words: &mut Vec<LfmWord>,
+    shape: &ChainShape,
+    proof: &ChainProof<GoldilocksField, GoldilocksExtension>,
+    r: usize,
+) -> Result<(), String> {
+    use crypto::merkle_tree::traits::IsMerkleTreeBackend;
+    type Leaf = <crate::hash_pin::BlockWhirHash as multilinear::whir_hash::WhirHash>::Backend<
+        GoldilocksExtension,
+    >;
+    let before = &proof.rounds[r - 1];
+    let cap = tail_cap(shape, before, r)?;
+    let current: &[multilinear::whir_commit::CosetOpening<GoldilocksExtension>] =
+        match &proof.rounds[r].openings {
+            RoundOpenings::Extension(p) => &p.current,
+            _ => {
+                return Err(format!(
+                    "tail round {r}: its openings are not extension-valued"
+                ));
+            }
+        };
+    let block = 1usize << shape.schedule[r];
+    let mut placed: Vec<Option<&[math::field::element::FieldElement<GoldilocksExtension>]>> =
+        vec![None; cap.len()];
+    for opening in next_openings(before).iter().chain(current) {
+        if opening.values.len() != block {
+            return Err(format!(
+                "tail round {r}: a block of {} values",
+                opening.values.len()
+            ));
+        }
+        let digest = Leaf::hash_data(&opening.values);
+        for (slot, node) in placed.iter_mut().zip(&cap) {
+            if slot.is_none() && *node == digest {
+                *slot = Some(&opening.values);
+            }
+        }
+    }
+    for (j, slot) in placed.iter().enumerate() {
+        let values = slot.ok_or_else(|| format!("tail round {r}: no opening of leaf {j}"))?;
+        for v in values {
+            words.push(ext_word(v));
+        }
+    }
+    Ok(())
 }
 
 /// One side's tree, as its openings' paths are laid out: its index bits, its

@@ -48,6 +48,7 @@ fn small_format() -> BlockFormat {
         argue: ArgueFormat::PerTable,
         group: multilinear::whir_chain::GroupFold::PerPoly,
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
+        leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
     }
 }
 
@@ -465,6 +466,7 @@ fn dense_format() -> BlockFormat {
         argue: ArgueFormat::PerTable,
         group: multilinear::whir_chain::GroupFold::PerPoly,
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
+        leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
     }
 }
 
@@ -1418,6 +1420,28 @@ fn the_whir_block_tree_proves_to_the_derived_top() {
             "a tree that verifies a group twice and another never is refused"
         ),
     }
+}
+
+/// The leaf query knob reads `v1` (or nothing) and `lean`, and refuses
+/// anything else with an error; the production format holds what the
+/// environment says.
+#[test]
+fn the_leaf_query_knob_reads_v1_or_lean() {
+    use super::whir_block::{LEAF_QUERY_ENV, leaf_query_from_env, leaf_query_setting};
+    use super::whir_chain::LeafQuery;
+    for v1 in [None, Some(""), Some(" v1 ")] {
+        assert_eq!(leaf_query_setting(v1), Ok(LeafQuery::V1), "{v1:?}");
+    }
+    assert_eq!(leaf_query_setting(Some("lean")), Ok(LeafQuery::Lean));
+    for bad in ["Lean", "on", "1", "v2"] {
+        let err = leaf_query_setting(Some(bad)).expect_err(bad);
+        assert!(err.contains(LEAF_QUERY_ENV), "{err}");
+    }
+    assert_eq!(
+        Ok(BlockFormat::production().leaf_query),
+        leaf_query_from_env(),
+        "the production format holds the environment's check"
+    );
 }
 
 /// ★ The leaf scale is the verifier's, both ways, on a small block whose

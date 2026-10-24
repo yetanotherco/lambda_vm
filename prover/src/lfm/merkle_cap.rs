@@ -163,6 +163,24 @@ impl CapCells {
         self.height
     }
 
+    /// ★ Authenticate EVERY leaf of a tree that lies wholly in this cap (no
+    /// level walked: the cap is the leaf level), as a REFUSAL: leaf `j`'s
+    /// digest must equal cap node `j`, which is what [`Self::verify_path`]
+    /// muxes for index `j` with no walked bits. The positions are program
+    /// constants, so no node is muxed.
+    pub fn verify_every_leaf(&self, b: &mut LfmBuilder, leaves: &[WrapDigest]) {
+        assert_eq!(
+            leaves.len(),
+            self.cap.len(),
+            "one digest a leaf of a tree lying wholly in its cap"
+        );
+        for (leaf, node) in leaves.iter().zip(&self.cap) {
+            for (x, y) in leaf.iter().zip(node.iter()) {
+                edsl::assert_word_eq(b, *x, *y);
+            }
+        }
+    }
+
     /// ★ Authenticate one opening against this cap, as a REFUSAL: `leaf` is the
     /// opened leaf's digest, `index_bits` the tree's WHOLE leaf index (low
     /// first, `D` bits) and `siblings` the path to the cap ([`path_hints`]

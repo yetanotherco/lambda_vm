@@ -59,7 +59,7 @@ use super::builder::{Cell, Ext, LfmBuilder};
 use super::compiler::{LfmProgram, compile};
 use super::per_table_aggregator::DerivedChild;
 use super::registry::LfmArtifacts;
-use super::whir_chain::{ChainShape, ChipRows};
+use super::whir_chain::{ChainShape, ChipRows, LeafQuery};
 use super::whir_epoch::{
     BITWISE_NAME, DECODE_NAME, GroupChainWires, KECCAK_RC_NAME, PreprocessedPlan,
     PreprocessedRoute, REGISTER_NAME, TableWires, emit_expected, emit_group_walk_chains,
@@ -236,6 +236,35 @@ pub fn leaf_scale_from_env() -> Result<LeafScale, String> {
 pub(crate) fn process_leaf_scale() -> LeafScale {
     static SCALE: std::sync::OnceLock<LeafScale> = std::sync::OnceLock::new();
     *SCALE.get_or_init(|| leaf_scale_from_env().unwrap_or_else(|e| panic!("{e}")))
+}
+
+/// [`leaf_query_from_env`]'s knob: unset or `v1` is [`LeafQuery::V1`], `lean`
+/// is [`LeafQuery::Lean`].
+pub const LEAF_QUERY_ENV: &str = "LAMBDA_VM_WHIR_LEAF_QUERY";
+
+/// A value of [`LEAF_QUERY_ENV`]: unset, empty or `v1` is [`LeafQuery::V1`];
+/// `lean` is [`LeafQuery::Lean`]; anything else is an error.
+pub fn leaf_query_setting(value: Option<&str>) -> Result<LeafQuery, String> {
+    match value.map(str::trim) {
+        None | Some("") | Some("v1") => Ok(LeafQuery::V1),
+        Some("lean") => Ok(LeafQuery::Lean),
+        Some(v) => Err(format!(
+            "{LEAF_QUERY_ENV} must be `v1` or `lean`, got `{v}`"
+        )),
+    }
+}
+
+/// The environment's leaf query check ([`LEAF_QUERY_ENV`]). A format knob: the
+/// block's verifier must be given the same one.
+pub fn leaf_query_from_env() -> Result<LeafQuery, String> {
+    leaf_query_setting(std::env::var(LEAF_QUERY_ENV).ok().as_deref())
+}
+
+/// [`leaf_query_from_env`], read once per process: what
+/// [`BlockFormat::production`] holds, refused as [`process_leaf_scale`] refuses.
+pub(crate) fn process_leaf_query() -> LeafQuery {
+    static QUERY: std::sync::OnceLock<LeafQuery> = std::sync::OnceLock::new();
+    *QUERY.get_or_init(|| leaf_query_from_env().unwrap_or_else(|e| panic!("{e}")))
 }
 
 /// The leaf that subtracts the COMMIT-bus target.
@@ -681,6 +710,8 @@ pub struct WhirBlockPlan {
     /// What the partition held its leaves under (`None` under a fixed leaf
     /// count, which bounds no chip).
     leaf_bound: Option<LeafBound>,
+    /// How the leaves check each chain's queries: the format's.
+    leaf_query: LeafQuery,
     /// Children a node verifies.
     fan_in: usize,
     /// A digest of the statement run: the block's identity, published by every
@@ -867,7 +898,10 @@ impl WhirBlockPlan {
             let group_shapes: Vec<(usize, usize)> = list.iter().map(|&t| frame.shapes[t]).collect();
             let (_, group_of) = group_columns(&group_shapes);
             let layout = &frame.stack_layouts[g];
-            let chain = ChainShape::new_at(config, layout.n_stack(), arity);
+            let chain = ChainShape {
+                query: format.leaf_query,
+                ..ChainShape::new_at(config, layout.n_stack(), arity)
+            };
             let opening = stacked_verify_cost(layout, &group_of, &chain, entry).perms();
             let prepared_perms: usize = prepared
                 .iter()
@@ -879,7 +913,10 @@ impl WhirBlockPlan {
                         .enumerate()
                         .flat_map(|(k, &(_, _, n))| std::iter::repeat_n(k, n))
                         .collect();
-                    let chain = ChainShape::new_at(config, p.layout.n_stack(), arity);
+                    let chain = ChainShape {
+                        query: format.leaf_query,
+                        ..ChainShape::new_at(config, p.layout.n_stack(), arity)
+                    };
                     stacked_verify_cost(&p.layout, &group_of, &chain, entry).perms()
                 })
                 .sum();
@@ -902,6 +939,7 @@ impl WhirBlockPlan {
             front: ChipRows::default(),
             partition,
             leaf_bound: None,
+            leaf_query: format.leaf_query,
             fan_in,
             id,
         };
@@ -969,7 +1007,10 @@ impl WhirBlockPlan {
     /// The chain shape of a stack of `n_stack` variables, at the base's tree
     /// arity.
     pub fn chain_shape(&self, n_stack: usize) -> ChainShape {
-        ChainShape::new_at(&self.frame.config, n_stack, self.wrap_hash.arity())
+        ChainShape {
+            query: self.leaf_query,
+            ..ChainShape::new_at(&self.frame.config, n_stack, self.wrap_hash.arity())
+        }
     }
 
     pub fn carrier(&self) -> usize {
@@ -2210,7 +2251,7 @@ fn push_chains(
         let shape = shape.run(run.len());
         words.push(super::word::ext_word(&chain.final_value));
         let before = words.len();
-        super::whir_chain::push_round_words(words, &shape, chain);
+        super::whir_chain::try_push_round_words(words, &shape, chain)?;
         if words.len() - before != super::whir_chain::RoundStorage::words(&shape) as usize {
             return Err("a chain whose rounds are not its shape's".to_string());
         }
