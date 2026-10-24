@@ -54,6 +54,11 @@ impl<'a> NarrowInput<'a> {
     pub fn bytes(&self) -> usize {
         self.data.len()
     }
+
+    /// The packed bytes, the columns' offsets and their widths.
+    pub(crate) fn parts(&self) -> (&'a [u8], &'a [u64], &'a [u8]) {
+        (self.data, self.offsets, self.widths)
+    }
 }
 
 /// Upload `t`'s packed columns and widen them into `dst` (`rows × cols`

@@ -38,6 +38,7 @@ pub mod deep_inv;
 pub mod device;
 #[cfg(feature = "test-faults")]
 pub mod faults;
+pub mod fill;
 pub mod fri;
 pub mod gkr;
 pub mod grinding;

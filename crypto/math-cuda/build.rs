@@ -222,6 +222,9 @@ fn main() {
     }
 
     compile_kernel("arith.cu", "arith.cubin", have_nvcc, &[]);
+    // The table fills from records (`src/fill.rs`), loaded on first use, never
+    // by the backend. Pinned on the host by `tests/host_kat/fill_host_kat.cpp`.
+    compile_kernel("fill.cu", "fill.cubin", have_nvcc, &[]);
     compile_kernel("ntt.cu", "ntt.cubin", have_nvcc, &[]);
     // The column-major LDE engine (`src/lde_cm.rs`). Pinned on the host by
     // `tests/host_kat/ntt_cm_host_kat.cpp` (`make test-ntt-cm-host-kat`).
