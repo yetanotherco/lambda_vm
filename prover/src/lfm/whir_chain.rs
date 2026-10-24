@@ -1587,7 +1587,13 @@ fn emit_tail_phase(
         .iter()
         .map(|block| super::whir_open::emit_block_leaf(b, block.values))
         .collect();
-    cap.verify_every_leaf(b, &digests);
+    #[cfg(test)]
+    let unchecked = tail_faults::leaves_unchecked();
+    #[cfg(not(test))]
+    let unchecked = false;
+    if !unchecked {
+        cap.verify_every_leaf(b, &digests);
+    }
     let next = match (next_blocks, shape.next_depth(r)) {
         (Some(blocks), Some(next_depth)) => {
             debug_assert!(
@@ -1625,28 +1631,48 @@ fn emit_tail_phase(
     }
 }
 
-/// Test only: a tail round's compare reads the successor's NEIGHBOURING slot,
-/// so an honest proof has no execution — the compare is live and reads the
-/// slot the position names. Thread-local, as [`onechain_faults`] is.
+/// Test only, two faults. `slot_off`: a tail round's compare reads the
+/// successor's NEIGHBOURING slot, so an honest proof has no execution — the
+/// compare is live and reads the slot the position names. `leaves_unchecked`:
+/// a tail round's blocks are not compared with their cap nodes, so blocks
+/// that only fold consistently execute — the cap compare is what binds them.
+/// Thread-local, as [`onechain_faults`] is.
 #[cfg(test)]
 pub(crate) mod tail_faults {
     std::thread_local! {
         static SLOT_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static LEAVES_UNCHECKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     pub(crate) fn slot_off() -> bool {
         SLOT_OFF.with(std::cell::Cell::get)
     }
 
+    pub(crate) fn leaves_unchecked() -> bool {
+        LEAVES_UNCHECKED.with(std::cell::Cell::get)
+    }
+
     /// Runs `f` with the fault on, restoring it after.
     pub(crate) fn with_slot_off<R>(f: impl FnOnce() -> R) -> R {
-        struct Restore(bool);
+        with(&SLOT_OFF, f)
+    }
+
+    /// Runs `f` with the tail leaves' cap compare off, restoring it after.
+    pub(crate) fn with_leaves_unchecked<R>(f: impl FnOnce() -> R) -> R {
+        with(&LEAVES_UNCHECKED, f)
+    }
+
+    fn with<R>(
+        fault: &'static std::thread::LocalKey<std::cell::Cell<bool>>,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        struct Restore(&'static std::thread::LocalKey<std::cell::Cell<bool>>, bool);
         impl Drop for Restore {
             fn drop(&mut self) {
-                SLOT_OFF.with(|c| c.set(self.0));
+                self.0.with(|c| c.set(self.1));
             }
         }
-        let _restore = Restore(SLOT_OFF.with(|c| c.replace(true)));
+        let _restore = Restore(fault, fault.with(|c| c.replace(true)));
         f()
     }
 }

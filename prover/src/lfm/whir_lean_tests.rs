@@ -221,6 +221,35 @@ fn a_lean_chain_refuses_a_tampered_tail_block() {
     }
 }
 
+/// ★ Every tail round's blocks replaced by blocks of the final value: they fold
+/// to the final value at every position, so every tail round's fold compare
+/// holds, and only the cap compare refuses them — with it off (a test fault)
+/// the forgery executes.
+#[test]
+fn a_lean_chain_refuses_tail_blocks_that_only_fold_consistently() {
+    for (num_vars, cfg) in tail_cases() {
+        let f = fixture(num_vars, cfg);
+        let shape = lean(&f.shape);
+        let mut forged = arena_at(&f, &f.proof, &shape).expect("laid out");
+        for r in tails(&shape) {
+            let at = tail_block_at(&shape, r);
+            let words = shape.current_leaves(r) << shape.schedule[r];
+            for w in &mut forged[at..at + words] {
+                *w = ext_word(&f.proof.final_value);
+            }
+        }
+        let program = p1_chain_program(&shape);
+        assert!(
+            execute(&program, std::slice::from_ref(&forged), &SOCKET).is_err(),
+            "S={num_vars}: blocks off their cap nodes must be refused"
+        );
+        let unchecked = tail_faults::with_leaves_unchecked(|| p1_chain_program(&shape));
+        execute(&unchecked, &[forged], &SOCKET).unwrap_or_else(|e| {
+            panic!("S={num_vars}: without the cap compare the forgery folds consistently: {e:?}")
+        });
+    }
+}
+
 /// ★ The tail compare is live and reads the slot its position names: comparing
 /// with the neighbouring slot of the successor block, an honest proof has no
 /// execution.
