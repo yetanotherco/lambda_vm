@@ -595,6 +595,25 @@ impl<'a> CpuOp<'a> {
     }
 }
 
+/// Executor logs as the card's CPU fill reads them
+/// (`multilinear::records::CpuLog`): the same bytes.
+pub(crate) fn card_logs(logs: &[Log]) -> &[multilinear::records::CpuLog] {
+    use multilinear::records::CpuLog;
+    use std::mem::{align_of, offset_of, size_of};
+    const _: () = {
+        assert!(size_of::<Log>() == size_of::<CpuLog>());
+        assert!(align_of::<Log>() == align_of::<CpuLog>());
+        assert!(offset_of!(Log, current_pc) == offset_of!(CpuLog, current_pc));
+        assert!(offset_of!(Log, next_pc) == offset_of!(CpuLog, next_pc));
+        assert!(offset_of!(Log, src1_val) == offset_of!(CpuLog, src1_val));
+        assert!(offset_of!(Log, src2_val) == offset_of!(CpuLog, src2_val));
+        assert!(offset_of!(Log, dst_val) == offset_of!(CpuLog, dst_val));
+    };
+    // SAFETY: both are `#[repr(C)]`, five `u64`s in the same order (asserted
+    // above), so the same size, alignment and offsets.
+    unsafe { std::slice::from_raw_parts(logs.as_ptr() as *const CpuLog, logs.len()) }
+}
+
 impl CpuOperation {
     /// Creates a CpuOperation from an executor Log and its instruction's
     /// DecodeEntry, the entry of DECODE row `decode_row`.

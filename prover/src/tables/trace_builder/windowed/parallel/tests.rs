@@ -63,6 +63,7 @@ fn walked_from_entries(
         lookups: !builder.lean.lookups,
         batch: builder.walk_batch,
         key: 0x5eed_1234_abcd_0042,
+        keep_logs: builder.keeps_logs(),
     });
     let mut pass = LeanPass::new(Arc::clone(&builder.decode), &builder.register_state)?;
     let mut executor =

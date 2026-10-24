@@ -161,6 +161,7 @@ impl Setup {
         Walker {
             decode: &self.decode,
             lookups: self.lookups,
+            keep_logs: false,
             batch: self.batch,
             sizes: &mut sizes,
             memory_state: memory,

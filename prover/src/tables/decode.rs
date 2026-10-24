@@ -264,6 +264,47 @@ impl DecodeTable {
         })
     }
 
+    /// The table as the card's CPU fill reads it
+    /// (`multilinear::records::DecodeRecords`): each entry's pc, immediate and
+    /// decoded fields as bytes, in row order, and the runs. `None` for a
+    /// program with no instruction.
+    pub(crate) fn card_records(&self) -> Option<multilinear::records::DecodeRecords> {
+        use multilinear::records::{DecodeRecords, DecodeRow, DecodeRun};
+        let entries = self
+            .entries
+            .iter()
+            .map(|e| {
+                let f = &e.fields;
+                DecodeRow {
+                    pc: e.pc,
+                    imm: e.imm,
+                    read_register1: u8::from(f.read_register1),
+                    read_register2: u8::from(f.read_register2),
+                    write_register: u8::from(f.write_register),
+                    word_instr: u8::from(f.word_instr),
+                    alu: u8::from(f.alu),
+                    add: u8::from(f.add),
+                    sub: u8::from(f.sub),
+                    memory: u8::from(f.memory),
+                    branch: u8::from(f.branch),
+                    ecall: u8::from(f.ecall),
+                    rs1: f.rs1,
+                    rs2: f.rs2,
+                    rd: f.rd,
+                    half_instruction_length: f.half_instruction_length,
+                    alu_flags: f.alu_flags,
+                    mem_flags: f.mem_flags,
+                }
+            })
+            .collect();
+        let runs = self
+            .runs
+            .iter()
+            .map(|&(first_pc, row, len)| DecodeRun { first_pc, row, len })
+            .collect();
+        DecodeRecords::new(entries, runs)
+    }
+
     /// The entry of DECODE row `row` (a row [`Self::row`] returned).
     #[inline]
     pub fn entry(&self, row: u32) -> &DecodeEntry {

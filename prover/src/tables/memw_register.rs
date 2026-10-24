@@ -139,6 +139,30 @@ const _: () = {
     assert!(std::mem::offset_of!(RegRow, pad) == 31);
 };
 
+/// Register rows as the card's MEMW_R fill reads them
+/// (`multilinear::records::RegisterRow`): the same bytes.
+pub(crate) fn card_rows(rows: &[RegRow]) -> &[multilinear::records::RegisterRow] {
+    use multilinear::records::RegisterRow;
+    use std::mem::{align_of, offset_of, size_of};
+    const _: () = {
+        assert!(size_of::<RegRow>() == size_of::<RegisterRow>());
+        assert!(align_of::<RegRow>() == align_of::<RegisterRow>());
+        assert!(offset_of!(RegRow, timestamp) == offset_of!(RegisterRow, timestamp));
+        assert!(offset_of!(RegRow, val0) == offset_of!(RegisterRow, val0));
+        assert!(offset_of!(RegRow, val1) == offset_of!(RegisterRow, val1));
+        assert!(offset_of!(RegRow, old0) == offset_of!(RegisterRow, old0));
+        assert!(offset_of!(RegRow, old1) == offset_of!(RegisterRow, old1));
+        assert!(offset_of!(RegRow, old_ts_lo) == offset_of!(RegisterRow, old_ts_lo));
+        assert!(offset_of!(RegRow, address) == offset_of!(RegisterRow, address));
+        assert!(offset_of!(RegRow, is_read) == offset_of!(RegisterRow, is_read));
+        assert!(offset_of!(RegRow, pad) == offset_of!(RegisterRow, pad));
+    };
+    // SAFETY: both are `#[repr(C)]` with the same fields in the same order
+    // (asserted above); `is_read` is a `bool`, 0 or 1, read as a `u8`, and
+    // `pad` is always written.
+    unsafe { std::slice::from_raw_parts(rows.as_ptr() as *const RegisterRow, rows.len()) }
+}
+
 impl RegRow {
     /// Build a `RegRow` from pre-decomposed register-access fields.
     ///

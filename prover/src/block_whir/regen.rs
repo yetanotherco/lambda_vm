@@ -570,8 +570,10 @@ struct Recorded {
     ends: [Vec<usize>; 8],
     windows: usize,
     recipes: BTreeMap<(usize, usize), Recipe>,
-    /// Each recipe's chunk, by its place in the hand-out.
-    by_order: Vec<(StreamTable, usize)>,
+    /// Each recipe's chunk, by its place in the hand-out; `None` for a chunk
+    /// held as the records its rows come from (`ChunkJob::is_records`), which
+    /// is never dropped and has no recipe.
+    by_order: Vec<Option<(StreamTable, usize)>>,
     /// Digests for a chunk with no recipe, and chunks of a table no recipe
     /// can hold.
     stray: usize,
@@ -635,11 +637,13 @@ impl Recorder {
         self.digests
     }
 
-    /// The chunk handed out `order`-th, when one was: phase A places the
-    /// streamed chunks first, in hand-out order, so it is the table at block
-    /// index `order`.
+    /// The chunk handed out `order`-th, when one was and phase B can rebuild
+    /// it: phase A places the streamed chunks first, in hand-out order, so it
+    /// is the table at block index `order`. A chunk held as its records is
+    /// never dropped: `None`, so it has no rank and no regenerator waits on
+    /// its fate.
     pub(crate) fn chunk_at(&self, order: usize) -> Option<(StreamTable, usize)> {
-        self.lock().by_order.get(order).copied()
+        self.lock().by_order.get(order).copied().flatten()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Recorded> {
@@ -658,6 +662,11 @@ impl Recorder {
             r.ends[t].push(end);
         }
         for job in jobs {
+            // Held as its records: kept, in its place in the hand-out.
+            if job.is_records() {
+                r.by_order.push(None);
+                continue;
+            }
             let Some(t) = slot(job.table) else {
                 r.stray += 1;
                 continue;
@@ -665,8 +674,9 @@ impl Recorder {
             let ops = job.op_count();
             let start = job.index * ops;
             let first = first_window(&r.ends[t], start);
-            let order = r.recipes.len();
-            r.by_order.push((job.table, job.index));
+            // Its place in the hand-out, the chunks held as records counted.
+            let order = r.by_order.len();
+            r.by_order.push(Some((job.table, job.index)));
             r.recipes.insert(
                 (t, job.index),
                 Recipe {

@@ -85,6 +85,48 @@ use crate::tables::{
 
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
 
+mod card_records;
+use card_records::{CardDecode, CpuLogRecords, RegisterRowRecords};
+
+/// Whether the host has room to hold a chunk of so many bytes as records
+/// ([`WindowedTraceBuilder::card_fill_streamed`]).
+pub type RecordsRoom = Arc<dyn Fn(usize) -> bool + Send + Sync>;
+
+/// [`WindowedTraceBuilder::card_fill_streamed`]: the program's DECODE rows
+/// as the card reads them when CPU chunks are held as logs, whether MEMW_R
+/// chunks are held as rows, and the room rule.
+struct StreamedCardFill {
+    cpu: Option<Arc<CardDecode>>,
+    memw_r: bool,
+    room: RecordsRoom,
+    /// A test's fault ([`WindowedTraceBuilder::card_fill_streamed_fault`]):
+    /// each CPU chunk's records start this many cycles late.
+    #[cfg(test)]
+    fault: u64,
+}
+
+impl StreamedCardFill {
+    /// Whether a chunk of `bytes` of records may be held: the room rule says
+    /// so, and said so for every chunk before it (once a chunk is refused,
+    /// every later one is filled on the host, so what is never dropped is the
+    /// prefix admitted with room). Notes the first refused chunk.
+    fn admits(
+        &self,
+        bytes: usize,
+        chunk: (StreamTable, usize),
+        stamps: &mut CardFillStamps,
+    ) -> bool {
+        if stamps.room_out.is_some() {
+            return false;
+        }
+        let room = (self.room)(bytes);
+        if !room {
+            stamps.room_out = Some(chunk);
+        }
+        room
+    }
+}
+
 /// The tables a windowed build streams: those whose op lists grow in
 /// execution order from their first element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -189,6 +231,8 @@ pub struct WindowedTraceBuilder<'a> {
     /// [`Self::card_fill_records_fault`].
     #[cfg(test)]
     card_fill_fault: usize,
+    /// [`Self::card_fill_streamed`].
+    card_fill_streamed: Option<StreamedCardFill>,
 }
 
 /// Where a builder's creation spent its time, seconds: the initial image and
@@ -293,6 +337,22 @@ pub struct WindowStamps {
     /// `generate` table by table, under
     /// [`WindowedTraceBuilder::drop_streamed_ops`].
     pub handout: HandoutStamps,
+    /// [`WindowedTraceBuilder::card_fill_streamed`]'s chunks.
+    pub card_fill: CardFillStamps,
+}
+
+/// The CPU and MEMW_R chunks handed out under
+/// [`WindowedTraceBuilder::card_fill_streamed`]: per family, `[as records,
+/// filled on the host]`; the records' bytes; the first chunk the room rule
+/// sent to the host; and the CPU chunks whose logs were not the ops' (each
+/// filled on the host).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CardFillStamps {
+    pub cpu: [usize; 2],
+    pub memw_r: [usize; 2],
+    pub records_bytes: usize,
+    pub room_out: Option<(StreamTable, usize)>,
+    pub out_of_step: usize,
 }
 
 /// The hand-out under [`WindowedTraceBuilder::drop_streamed_ops`], per streamed
@@ -384,6 +444,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             card_fill: false,
             #[cfg(test)]
             card_fill_fault: 0,
+            card_fill_streamed: None,
         })
     }
 
@@ -432,8 +493,13 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// the caller can generate it on another thread while this one walks the
     /// next window. The chunks are the same.
     pub fn push_jobs(&mut self, logs: &[Log]) -> Result<Vec<ChunkJob>, Error> {
+        let keeps = self.keeps_logs();
         let (mut walker, mut accumulator) = self.split();
-        let walked = walker.walk(logs)?;
+        let walked = if keeps {
+            walker.walk_owned(logs.to_vec())?
+        } else {
+            walker.walk(logs)?
+        };
         Ok(accumulator.absorb(walked))
     }
 
@@ -559,6 +625,71 @@ impl<'a> WindowedTraceBuilder<'a> {
     pub(crate) fn card_fill_records_fault(mut self, rows: usize) -> Self {
         self.card_fill_fault = rows;
         self
+    }
+
+    /// With [`Self::drop_streamed_ops`], hand out each full chunk of CPU
+    /// (with `cpu`) and MEMW_R (with `memw_r`) as the records its rows come
+    /// from, for the card to fill its columns as its group uploads it: a CPU
+    /// chunk as the executor's logs of its cycles (each walked window then
+    /// keeps its logs, [`WalkedWindow::keep_logs`]), a MEMW_R chunk as its
+    /// register rows. Chunks are held so while `room` says the host has room
+    /// for their records' bytes, and from the first it refuses on are filled
+    /// here as without it. Before the first window only. The words are the
+    /// same.
+    pub fn card_fill_streamed(
+        mut self,
+        room: RecordsRoom,
+        cpu: bool,
+        memw_r: bool,
+    ) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "card_fill_streamed after a window was walked".to_string(),
+            ));
+        }
+        let Some(kept) = self.kept.as_mut() else {
+            return Err(Error::Prover(
+                "card_fill_streamed: the card fills the chunks of a build that drops its streamed \
+                 ops"
+                .to_string(),
+            ));
+        };
+        let cpu = if cpu {
+            let decode = CardDecode::new(Arc::clone(&self.decode)).ok_or_else(|| {
+                Error::Prover("card_fill_streamed: a program with no instruction".to_string())
+            })?;
+            kept.logs = Some(Tail::new());
+            Some(Arc::new(decode))
+        } else {
+            None
+        };
+        self.card_fill_streamed = Some(StreamedCardFill {
+            cpu,
+            memw_r,
+            room,
+            #[cfg(test)]
+            fault: 0,
+        });
+        Ok(self)
+    }
+
+    /// A test's fault: with [`Self::card_fill_streamed`], each CPU chunk held
+    /// as its logs reads them from `cycles` cycles late (each row's timestamp
+    /// that much later), the same wrong table however it is filled.
+    #[cfg(test)]
+    pub(crate) fn card_fill_streamed_fault(mut self, cycles: u64) -> Self {
+        if let Some(card) = self.card_fill_streamed.as_mut() {
+            card.fault = cycles;
+        }
+        self
+    }
+
+    /// Whether each walked window keeps its logs ([`Self::card_fill_streamed`]
+    /// with CPU).
+    pub fn keeps_logs(&self) -> bool {
+        self.card_fill_streamed
+            .as_ref()
+            .is_some_and(|card| card.cpu.is_some())
     }
 
     /// Keep the LT ops derived from the MEMW and MEMW_A ops this builder drops
@@ -825,7 +956,11 @@ impl<'a> WindowedTraceBuilder<'a> {
         };
         self.segments
             .append(route(&cpu_ops, &self.decode, &walk.cpu32_ops));
-        let last = WalkedWindow { cpu_ops, walk };
+        let last = WalkedWindow {
+            cpu_ops,
+            walk,
+            logs: None,
+        };
         super::build_stamps::mark("p0 last window");
         let Self {
             decode,
@@ -995,6 +1130,8 @@ impl<'a> WindowedTraceBuilder<'a> {
                 route_secs: &mut self.stamps.route,
                 handout_secs: &mut self.stamps.generate,
                 handout: &mut self.stamps.handout,
+                card: self.card_fill_streamed.as_ref(),
+                card_stamps: &mut self.stamps.card_fill,
             },
             &self.image,
         )
@@ -1011,6 +1148,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             Walker {
                 decode: &self.decode,
                 lookups: !self.lean.lookups,
+                keep_logs: self.keeps_logs(),
                 batch: self.walk_batch,
                 sizes: &mut self.walk_sizes,
                 memory_state: &mut self.memory_state,
@@ -1032,21 +1170,35 @@ impl<'a> WindowedTraceBuilder<'a> {
                 route_secs: &mut self.stamps.route,
                 handout_secs: &mut self.stamps.generate,
                 handout: &mut self.stamps.handout,
+                card: self.card_fill_streamed.as_ref(),
+                card_stamps: &mut self.stamps.card_fill,
             },
         )
     }
 }
 
-/// One window, walked: its CPU ops and what the walk emitted for them.
+/// One window, walked: its CPU ops and what the walk emitted for them, and,
+/// for a build whose CPU chunks the card fills
+/// ([`WindowedTraceBuilder::card_fill_streamed`]), the executor's logs it was
+/// walked from.
 pub struct WalkedWindow {
     cpu_ops: Vec<super::CpuOperation>,
     walk: WalkOutputs,
+    logs: Option<Arc<Vec<Log>>>,
 }
 
 impl WalkedWindow {
-    /// The bytes its lists take on the heap (capacities).
+    /// The bytes its lists take on the heap (capacities), its logs included.
     pub fn heap_bytes(&self) -> usize {
-        super::vec_heap_bytes(&self.cpu_ops) + self.walk.heap_bytes()
+        super::vec_heap_bytes(&self.cpu_ops)
+            + self.walk.heap_bytes()
+            + self.logs.as_deref().map_or(0, super::vec_heap_bytes)
+    }
+
+    /// Keeps `logs`, the logs it was walked from, for the CPU chunks its
+    /// cycles fall in ([`WindowedTraceBuilder::card_fill_streamed`]).
+    pub fn keep_logs(&mut self, logs: Arc<Vec<Log>>) {
+        self.logs = Some(logs);
     }
 
     /// Its cycles.
@@ -1061,6 +1213,8 @@ pub struct Walker<'b> {
     decode: &'b DecodeTable,
     /// List the in-walk lookups (`false` under [`WalkLean::lookups`]).
     lookups: bool,
+    /// Keep each window's logs ([`WindowedTraceBuilder::keeps_logs`]).
+    keep_logs: bool,
     /// The cycles collected and walked at a time (`0`: the whole window).
     batch: usize,
     /// The last window's list lengths ([`walk_sized`]).
@@ -1089,6 +1243,17 @@ impl Walker<'_> {
         *self.cycles += logs.len();
         *self.walk_secs += t.elapsed().as_secs_f64();
         *self.windows += 1;
+        Ok(walked)
+    }
+
+    /// [`Self::walk`] of logs it may keep: a build whose CPU chunks the card
+    /// fills keeps them with the window ([`WindowedTraceBuilder::keeps_logs`]);
+    /// any other lets them go here.
+    pub fn walk_owned(&mut self, logs: Vec<Log>) -> Result<WalkedWindow, Error> {
+        let mut walked = self.walk(&logs)?;
+        if self.keep_logs {
+            walked.keep_logs(Arc::new(logs));
+        }
         Ok(walked)
     }
 
@@ -1143,7 +1308,11 @@ fn walk_window(
         )?;
     }
     *sizes = WalkSizes::of(&walk, logs.len());
-    Ok(WalkedWindow { cpu_ops, walk })
+    Ok(WalkedWindow {
+        cpu_ops,
+        walk,
+        logs: None,
+    })
 }
 
 /// The accumulating half of a split builder ([`WindowedTraceBuilder::split`]).
@@ -1163,6 +1332,9 @@ pub struct Accumulator<'b> {
     route_secs: &'b mut f64,
     handout_secs: &'b mut f64,
     handout: &'b mut HandoutStamps,
+    /// [`WindowedTraceBuilder::card_fill_streamed`].
+    card: Option<&'b StreamedCardFill>,
+    card_stamps: &'b mut CardFillStamps,
 }
 
 impl Accumulator<'_> {
@@ -1170,11 +1342,7 @@ impl Accumulator<'_> {
     /// or tails, the routed segments and what was counted ahead (lists at
     /// their capacities).
     pub fn held_bytes(&self) -> usize {
-        let windows: usize = self
-            .windows
-            .iter()
-            .map(|w| super::vec_heap_bytes(&w.cpu_ops) + w.walk.heap_bytes())
-            .sum();
+        let windows: usize = self.windows.iter().map(WalkedWindow::heap_bytes).sum();
         self.kept.as_deref().map_or(0, Kept::heap_bytes)
             + windows
             + self.segments.heap_bytes()
@@ -1279,6 +1447,7 @@ impl Accumulator<'_> {
                 self.emitted,
                 self.counted,
                 self.handout,
+                self.card.map(|card| (card, &mut *self.card_stamps)),
             );
             *self.handout_secs += t.elapsed().as_secs_f64();
             jobs
@@ -1289,6 +1458,8 @@ impl Accumulator<'_> {
                 &mut self.counted.histogram,
             );
             self.counted.memw_register_rows += window.walk.memw.register_rows.len();
+            // Every chunk of a run that keeps its windows is filled here.
+            window.logs = None;
             self.windows.push(window);
             *self.route_secs += t.elapsed().as_secs_f64();
             let t = std::time::Instant::now();
@@ -1561,9 +1732,14 @@ impl<T: Clone> Tail<T> {
     }
 
     fn push(&mut self, part: Vec<T>) {
+        self.push_shared(Arc::new(part));
+    }
+
+    /// [`Self::push`] of a part held elsewhere too.
+    fn push_shared(&mut self, part: Arc<Vec<T>>) {
         if !part.is_empty() {
             self.len += part.len();
-            self.parts.push_back(Arc::new(part));
+            self.parts.push_back(part);
         }
     }
 
@@ -1691,6 +1867,10 @@ impl<T: Clone> Tail<T> {
 /// The run so far under [`WindowedTraceBuilder::drop_streamed_ops`].
 struct Kept {
     cpu: Tail<super::CpuOperation>,
+    /// The CPU tail's logs, in step with it, while
+    /// [`WindowedTraceBuilder::card_fill_streamed`] holds CPU chunks as logs;
+    /// `None` without, and from a window that came without its logs on.
+    logs: Option<Tail<Log>>,
     register_rows: Tail<super::RegRow>,
     aligned: Tail<memw_aligned::AlignedRow>,
     general: Tail<super::MemwOperation>,
@@ -1800,6 +1980,7 @@ impl Kept {
     fn new(decode: DecodeTrace, max_rows: &crate::tables::MaxRowsConfig) -> Self {
         Self {
             cpu: Tail::new(),
+            logs: None,
             register_rows: Tail::new(),
             aligned: Tail::new(),
             general: Tail::new(),
@@ -1815,6 +1996,7 @@ impl Kept {
     /// and DECODE.
     fn heap_bytes(&self) -> usize {
         self.cpu.heap_bytes()
+            + self.logs.as_ref().map_or(0, Tail::heap_bytes)
             + self.register_rows.heap_bytes()
             + self.aligned.heap_bytes()
             + self.general.heap_bytes()
@@ -1834,6 +2016,10 @@ impl Kept {
     fn heap_parts(&self) -> Vec<(String, usize)> {
         let mut parts = vec![
             ("kept cpu".to_string(), self.cpu.heap_bytes()),
+            (
+                "kept logs".to_string(),
+                self.logs.as_ref().map_or(0, Tail::heap_bytes),
+            ),
             ("kept memw_r".to_string(), self.register_rows.heap_bytes()),
             ("kept memw_a".to_string(), self.aligned.heap_bytes()),
             ("kept memw".to_string(), self.general.heap_bytes()),
@@ -1856,6 +2042,10 @@ impl Kept {
         let mut parts = vec![
             ("kept cpu".to_string(), self.cpu.largest_bytes()),
             (
+                "kept logs".to_string(),
+                self.logs.as_ref().map_or(0, Tail::largest_bytes),
+            ),
+            (
                 "kept memw_r".to_string(),
                 self.register_rows.largest_bytes(),
             ),
@@ -1875,9 +2065,22 @@ impl Kept {
         parts
     }
 
-    /// A walked window's lists, appended in run order.
+    /// A walked window's lists, appended in run order; its logs to the CPU
+    /// tail's, when they are kept. A window without them, or with other than
+    /// one log a CPU op, puts the logs out of step for good: every CPU chunk
+    /// from then on is filled on the host.
     fn append(&mut self, window: WalkedWindow) {
-        let WalkedWindow { cpu_ops, walk } = window;
+        let WalkedWindow {
+            cpu_ops,
+            walk,
+            logs,
+        } = window;
+        if let Some(tail) = self.logs.as_mut() {
+            match logs {
+                Some(logs) if logs.len() == cpu_ops.len() => tail.push_shared(logs),
+                _ => self.logs = None,
+            }
+        }
         let WalkOutputs {
             memw,
             load_ops,
@@ -1918,6 +2121,7 @@ impl Kept {
     fn into_run(self) -> (Vec<super::CpuOperation>, WalkOutputs, KeptRest, Table) {
         let Kept {
             cpu,
+            logs: _,
             register_rows,
             aligned,
             general,
@@ -1940,10 +2144,132 @@ impl Kept {
     }
 }
 
+/// Whether the CPU ops `ops` of the chunk from cycle `first_cycle` on are the
+/// ones the walk made of `logs`, checked at each end of each of the logs'
+/// window parts: the same count, each checked op's cycle the log's place and
+/// its instruction the log's pc. The logs are kept beside the ops' tail, so a
+/// window that came without its logs, or in the wrong place, shows here.
+fn logs_in_step(
+    ops: &Segments<super::CpuOperation>,
+    logs: &Segments<Log>,
+    first_cycle: usize,
+    decode: &DecodeTable,
+) -> bool {
+    if ops.len() != logs.len() {
+        return false;
+    }
+    let ops: Vec<&[super::CpuOperation]> = ops.slices();
+    let op_at = |mut i: usize| {
+        for part in &ops {
+            if i < part.len() {
+                return part.get(i);
+            }
+            i -= part.len();
+        }
+        None
+    };
+    let mut at = 0usize;
+    for piece in logs.slices() {
+        let ends = [0, piece.len().saturating_sub(1)];
+        for k in ends.into_iter().filter(|&k| k < piece.len()) {
+            let i = at + k;
+            let Some(op) = op_at(i) else {
+                return false;
+            };
+            let cycle = (first_cycle + i) as u64;
+            if op.timestamp != 4 * cycle + 4
+                || decode.entry(op.decode_row).pc != piece[k].current_pc
+            {
+                return false;
+            }
+        }
+        at += piece.len();
+    }
+    true
+}
+
+/// A full CPU chunk's ops as handed out: the records the card fills it from
+/// (`logs`, its cycles' logs, in step with the ops) while the host has room,
+/// its ops otherwise. A chunk held as records carries its spent ops for the
+/// thread that lays it out to let go of.
+fn cpu_chunk_ops(
+    ops: Segments<super::CpuOperation>,
+    logs: Option<Segments<Log>>,
+    index: usize,
+    rows: usize,
+    decode_table: &Arc<DecodeTable>,
+    card: Option<(&StreamedCardFill, &mut CardFillStamps)>,
+) -> ChunkOps {
+    let Some((card, stamps)) = card else {
+        return ChunkOps::Cpu(ops, Arc::clone(decode_table));
+    };
+    let Some(decode) = card.cpu.as_ref() else {
+        return ChunkOps::Cpu(ops, Arc::clone(decode_table));
+    };
+    let first_cycle = index * rows;
+    let records = match logs {
+        Some(logs) if logs_in_step(&ops, &logs, first_cycle, decode_table) => card
+            .admits(logs.op_bytes(), (StreamTable::Cpu, index), stamps)
+            .then(|| {
+                #[cfg(test)]
+                let first_cycle = first_cycle + card.fault as usize;
+                CpuLogRecords::new(logs, first_cycle as u64, Arc::clone(decode))
+            })
+            .flatten(),
+        _ => {
+            stamps.out_of_step += 1;
+            None
+        }
+    };
+    match records {
+        Some(records) => {
+            stamps.cpu[0] += 1;
+            stamps.records_bytes += multilinear::records::TableRecords::bytes(&records);
+            ChunkOps::CpuRecords {
+                records,
+                spent: ops,
+            }
+        }
+        None => {
+            stamps.cpu[1] += 1;
+            ChunkOps::Cpu(ops, Arc::clone(decode_table))
+        }
+    }
+}
+
+/// A full MEMW_R chunk's rows as handed out: as the records the card fills it
+/// from while the host has room, to be filled on the host otherwise.
+fn memw_register_chunk_ops(
+    rows: Segments<super::RegRow>,
+    index: usize,
+    card: Option<(&StreamedCardFill, &mut CardFillStamps)>,
+) -> ChunkOps {
+    let Some((card, stamps)) = card.filter(|(card, _)| card.memw_r) else {
+        return ChunkOps::MemwRegister(rows);
+    };
+    let bytes = rows.op_bytes();
+    if !card.admits(bytes, (StreamTable::MemwRegister, index), stamps) {
+        stamps.memw_r[1] += 1;
+        return ChunkOps::MemwRegister(rows);
+    }
+    match RegisterRowRecords::new(rows) {
+        Ok(records) => {
+            stamps.memw_r[0] += 1;
+            stamps.records_bytes += bytes;
+            ChunkOps::MemwRegisterRecords(records)
+        }
+        Err(rows) => {
+            stamps.memw_r[1] += 1;
+            ChunkOps::MemwRegister(rows)
+        }
+    }
+}
+
 /// [`chunk_jobs`] under [`WindowedTraceBuilder::drop_streamed_ops`]: every full
 /// chunk taken out of the tails, and what the table phase reads from its ops
 /// counted as it leaves (`counted`, and DECODE in `kept`), each timed into
-/// `stamps`.
+/// `stamps`. With `card` ([`WindowedTraceBuilder::card_fill_streamed`]), CPU
+/// and MEMW_R chunks go out as records while the host has room.
 #[allow(clippy::too_many_arguments)]
 fn tail_jobs(
     m: &crate::tables::MaxRowsConfig,
@@ -1954,6 +2280,7 @@ fn tail_jobs(
     e: &mut StreamSkip,
     counted: &mut PreCounted,
     stamps: &mut HandoutStamps,
+    mut card: Option<(&StreamedCardFill, &mut CardFillStamps)>,
 ) -> Vec<ChunkJob> {
     use std::time::Instant;
     let mut jobs = Vec::new();
@@ -1995,29 +2322,50 @@ fn tail_jobs(
         {
             counted.last_ecall = Some((op.timestamp, op.next_pc));
         }
+        // The chunk's logs leave the logs' tail with its ops.
+        let logs = kept.logs.as_mut().map(|tail| tail.take_segments(m.cpu));
+        let ops = cpu_chunk_ops(
+            ops,
+            logs,
+            e.cpu,
+            m.cpu,
+            decode_table,
+            card.as_mut().map(|(c, s)| (*c, &mut **s)),
+        );
         stamps.note(StreamTable::Cpu, taken, t.elapsed().as_secs_f64(), copied);
         jobs.push(ChunkJob {
             table: StreamTable::Cpu,
             index: e.cpu,
-            ops: ChunkOps::Cpu(ops, Arc::clone(decode_table)),
+            ops,
         });
         e.cpu += 1;
     }
-    take_chunks!(
-        StreamTable::MemwRegister,
-        MemwRegister,
-        kept.register_rows,
-        m.memw_register,
-        e.memw_register,
-        |ops| {
-            for rows in ops.slices() {
-                super::memw_register::collect_bitwise_from_memw_register(
-                    rows,
-                    &mut counted.histogram,
-                )
-            }
+    while kept.register_rows.len >= m.memw_register {
+        let t = Instant::now();
+        let (rows, copied) = kept.register_rows.take_counted(m.memw_register);
+        let taken = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        for part in rows.slices() {
+            super::memw_register::collect_bitwise_from_memw_register(part, &mut counted.histogram)
         }
-    );
+        let ops = memw_register_chunk_ops(
+            rows,
+            e.memw_register,
+            card.as_mut().map(|(c, s)| (*c, &mut **s)),
+        );
+        stamps.note(
+            StreamTable::MemwRegister,
+            taken,
+            t.elapsed().as_secs_f64(),
+            copied,
+        );
+        jobs.push(ChunkJob {
+            table: StreamTable::MemwRegister,
+            index: e.memw_register,
+            ops,
+        });
+        e.memw_register += 1;
+    }
     take_chunks!(
         StreamTable::MemwAligned,
         MemwAligned,
@@ -2204,7 +2552,7 @@ fn concatenate(windows: Vec<WalkedWindow>) -> (Vec<super::CpuOperation>, WalkOut
     let mut ecsm = Vec::with_capacity(n);
     let mut ecdas = Vec::with_capacity(n);
     let mut hint = Vec::with_capacity(n);
-    for WalkedWindow { cpu_ops, walk } in windows {
+    for WalkedWindow { cpu_ops, walk, .. } in windows {
         cpu.push(cpu_ops);
         register_rows.push(walk.memw.register_rows);
         aligned.push(walk.memw.aligned);
@@ -2265,7 +2613,16 @@ pub struct ChunkJob {
 enum ChunkOps {
     /// The ops and the decode they are read with.
     Cpu(Segments<super::CpuOperation>, Arc<DecodeTable>),
+    /// The logs of its cycles, for the card to fill it from
+    /// ([`WindowedTraceBuilder::card_fill_streamed`]), and its ops, spent: let
+    /// go of where it is laid out.
+    CpuRecords {
+        records: CpuLogRecords,
+        spent: Segments<super::CpuOperation>,
+    },
     MemwRegister(Segments<super::RegRow>),
+    /// Its rows, for the card to fill it from.
+    MemwRegisterRecords(RegisterRowRecords),
     MemwAligned(Segments<memw_aligned::AlignedRow>),
     Memw(Segments<super::MemwOperation>),
     Load(Segments<super::LoadOperation>),
@@ -2285,7 +2642,13 @@ impl ChunkJob {
         use super::vec_heap_bytes as b;
         match &self.ops {
             ChunkOps::Cpu(ops, _) => ops.op_bytes(),
+            ChunkOps::CpuRecords { records, spent } => {
+                multilinear::records::TableRecords::bytes(records) + spent.op_bytes()
+            }
             ChunkOps::MemwRegister(ops) => ops.op_bytes(),
+            ChunkOps::MemwRegisterRecords(records) => {
+                multilinear::records::TableRecords::bytes(records)
+            }
             ChunkOps::MemwAligned(ops) => ops.op_bytes(),
             ChunkOps::Memw(ops) => ops.op_bytes(),
             ChunkOps::Load(ops) => ops.op_bytes(),
@@ -2301,7 +2664,11 @@ impl ChunkJob {
     pub fn op_count(&self) -> usize {
         match &self.ops {
             ChunkOps::Cpu(ops, _) => ops.len(),
+            ChunkOps::CpuRecords { spent, .. } => spent.len(),
             ChunkOps::MemwRegister(ops) => ops.len(),
+            ChunkOps::MemwRegisterRecords(records) => {
+                multilinear::records::TableRecords::rows(records)
+            }
             ChunkOps::MemwAligned(ops) => ops.len(),
             ChunkOps::Memw(ops) => ops.len(),
             ChunkOps::Load(ops) => ops.len(),
@@ -2320,9 +2687,16 @@ impl ChunkJob {
     /// packed as it is written (G-pack, `tables::gpack`), the bytes
     /// `TraceTable::pack_main_narrow` gives the 64-bit one.
     pub fn generate_as(self, form: TraceForm) -> StreamedChunk {
-        let trace = match &self.ops {
+        let trace = match self.ops {
+            // Held as its records; its spent ops go here, off the walk's
+            // threads.
+            ChunkOps::CpuRecords { records, spent } => {
+                drop(spent);
+                records.into_trace()
+            }
+            ChunkOps::MemwRegisterRecords(records) => records.into_trace(),
             ChunkOps::Cpu(ops, decode) => {
-                cpu::generate_cpu_trace_segments_as(&ops.slices(), decode, form)
+                cpu::generate_cpu_trace_segments_as(&ops.slices(), &decode, form)
             }
             ChunkOps::MemwRegister(ops) => {
                 memw_register::generate_memw_register_trace_from_rows_segments_as(
@@ -2337,7 +2711,7 @@ impl ChunkJob {
             ChunkOps::Load(ops) => load::generate_load_trace_segments_as(&ops.slices(), form),
             ChunkOps::Lt(ops) => lt::generate_lt_trace_segments_as(&ops.slices(), form),
             ChunkOps::Shift(ops) => shift::generate_shift_trace_segments_as(&ops.slices(), form),
-            ChunkOps::Store(ops) => store::generate_store_trace_as(ops, form),
+            ChunkOps::Store(ops) => store::generate_store_trace_as(&ops, form),
             ChunkOps::KeccakRnd { ops, skip, rows } => {
                 let ops: Vec<keccak_rnd::KeccakRoundOperation> = ops
                     .iter()
@@ -2347,7 +2721,7 @@ impl ChunkJob {
                         output: op.output,
                     })
                     .collect();
-                keccak_rnd::generate_keccak_rnd_rows_as(&ops, *skip, *rows, form)
+                keccak_rnd::generate_keccak_rnd_rows_as(&ops, skip, rows, form)
             }
         };
         StreamedChunk {
@@ -2355,6 +2729,15 @@ impl ChunkJob {
             index: self.index,
             trace,
         }
+    }
+
+    /// Whether the card fills it from the records it holds
+    /// ([`WindowedTraceBuilder::card_fill_streamed`]).
+    pub fn is_records(&self) -> bool {
+        matches!(
+            self.ops,
+            ChunkOps::CpuRecords { .. } | ChunkOps::MemwRegisterRecords(_)
+        )
     }
 }
 
@@ -2732,6 +3115,12 @@ impl Traces {
 
 #[cfg(test)]
 mod head_tests;
+
+#[cfg(test)]
+mod card_records_tests;
+
+#[cfg(all(test, feature = "cuda"))]
+mod card_records_card_tests;
 
 // The serial stage of a run walked a window per thread.
 #[cfg(feature = "parallel")]

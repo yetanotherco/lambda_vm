@@ -73,6 +73,8 @@ struct WalkSettings {
     batch: usize,
     /// The run's key for [`cell_hash`].
     key: u64,
+    /// Keep each window's logs with it ([`WindowedTraceBuilder::keeps_logs`]).
+    keep_logs: bool,
 }
 
 /// One byte's cell hashed for the windows' boundary sums, under the run's
@@ -150,7 +152,7 @@ impl WindowWalker {
         let seeded = self.seed(job, image)?;
         self.registers = job.registers.clone();
         let s = &*self.settings;
-        let walked = walk_window(
+        let mut walked = walk_window(
             &s.decode,
             s.lookups,
             s.batch,
@@ -160,6 +162,9 @@ impl WindowWalker {
             job.first,
             &job.logs,
         )?;
+        if s.keep_logs {
+            walked.keep_logs(Arc::clone(&job.logs));
+        }
         if self.memory.take_missing() {
             return Err(Error::Prover(format!(
                 "window {}: the walk read a byte its entries do not hold",
@@ -425,6 +430,7 @@ fn walk_numbered(
         lookups: !builder.lean.lookups,
         batch: builder.walk_batch,
         key: std::collections::hash_map::RandomState::new().hash_one(0u64),
+        keep_logs: builder.keeps_logs(),
     });
     let key = settings.key;
     let start_registers = builder.register_state.clone();
