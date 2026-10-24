@@ -3,19 +3,20 @@
 //! ([`ChainShape::tail_round`]), against the host's own proofs.
 //!
 //! The fixtures are `whir_p1_leaf_tests`' small chains with enough queries that
-//! their last trees, lying wholly in their caps, have fewer leaves than
-//! queries.
+//! their last trees, lying wholly in their caps, take [`TAIL_QUERIES_A_LEAF`]
+//! queries a leaf.
 
 use multilinear::whir_chain::{CapPolicy, ChainConfig, ChainProof, LeafOrder, RoundOpenings};
 
-use crate::tables::types::{FEE, GoldilocksExtension, GoldilocksField};
+use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
 use super::algebraic_commit::commitment_to_digest;
 use super::edsl::WrapHash;
 use super::executor::execute;
 use super::hash::HasherKind;
 use super::whir_chain::{
-    ChainShape, LeafQuery, chain_perms, round_words, tail_faults, try_push_round_words,
+    ChainShape, LeafQuery, TAIL_QUERIES_A_LEAF, chain_perms, round_words, tail_faults,
+    try_push_round_words,
 };
 use super::whir_p1_leaf_tests::{
     Fixture, fixture, hash16_rows, host_accepts, p1_chain_program, p1_config, p1_ordered_config,
@@ -51,20 +52,20 @@ fn arena_at(
     Ok(words)
 }
 
-/// Chains with tail rounds: uniform folds of 4 at the C2 cap (rounds 1 and 2
-/// at 12 queries, round 2 alone at 6), and the production's first fold of 6
-/// under the production cap (its last round).
+/// Chains with tail rounds: uniform folds of 4 at the C2 cap (rounds 1 and 2,
+/// 8 and 4 leaves, at 192 queries; round 2 alone at 96), and the production's
+/// first fold of 6 under the production cap (its last round).
 fn tail_cases() -> Vec<(usize, ChainConfig)> {
     vec![
-        (9, p1_config(12, 0, CapPolicy::Fixed(2))),
-        (9, p1_config(6, 6, CapPolicy::Fixed(2))),
+        (9, p1_config(192, 0, CapPolicy::Fixed(2))),
+        (9, p1_config(96, 6, CapPolicy::Fixed(2))),
         (
             10,
-            p1_ordered_config(8, 0, CapPolicy::Auto, Some(6), LeafOrder::Coset),
+            p1_ordered_config(96, 0, CapPolicy::Auto, Some(6), LeafOrder::Coset),
         ),
         (
             11,
-            p1_ordered_config(20, 6, CapPolicy::Auto, Some(6), LeafOrder::Coset),
+            p1_ordered_config(100, 6, CapPolicy::Auto, Some(6), LeafOrder::Coset),
         ),
     ]
 }
@@ -96,8 +97,15 @@ fn tail_block_at(shape: &ChainShape, r: usize) -> usize {
     prefix + before as usize + 2 * shape.messages(r) + nonces
 }
 
+/// Fewer than [`TAIL_QUERIES_A_LEAF`] queries a leaf of any tree: a lean
+/// chain with no tail round.
+fn untailed() -> (usize, ChainConfig) {
+    (9, p1_config(12, 0, CapPolicy::Fixed(2)))
+}
+
 /// ★ Under `Lean` the tail rule picks a suffix of rounds ≥ 1, every one of
-/// them wholly in its cap with fewer leaves than queries, and none under `V1`.
+/// them wholly in its cap with [`TAIL_QUERIES_A_LEAF`] queries a leaf, and
+/// none under `V1`.
 #[test]
 fn the_tail_rounds_are_a_capped_suffix_and_only_under_lean() {
     for (num_vars, cfg) in tail_cases() {
@@ -116,16 +124,23 @@ fn the_tail_rounds_are_a_capped_suffix_and_only_under_lean() {
         );
         assert!(tails.windows(2).all(|w| w[1] == w[0] + 1), "contiguous");
         for &r in &tails {
-            assert!(lean.current_leaves(r) < lean.num_queries);
+            assert!(TAIL_QUERIES_A_LEAF * lean.current_leaves(r) <= lean.num_queries);
             assert_eq!(lean.current_path(r), 0, "no walked level");
         }
     }
-    // Fewer queries than a tail tree's leaves: no tail round.
-    let few = lean(&ChainShape::new_at(
-        &p1_config(3, 0, CapPolicy::Fixed(2)),
-        9,
+    // One query short of round 1's bound (8 leaves): round 2 alone is a tail.
+    let (num_vars, cfg) = tail_cases().remove(0);
+    let short = lean(&ChainShape::new_at(
+        &ChainConfig {
+            num_queries: cfg.num_queries - 1,
+            ..cfg
+        },
+        num_vars,
         4,
     ));
+    assert_eq!(tails(&short), vec![2], "8 leaves need 192 queries");
+    let (num_vars, cfg) = untailed();
+    let few = lean(&ChainShape::new_at(&cfg, num_vars, 4));
     assert!((0..few.rounds()).all(|r| !few.tail_round(r)));
 }
 
@@ -173,7 +188,7 @@ fn a_lean_chain_refuses_a_tampered_tail_block() {
             for leaf in [0, shape.current_leaves(r) - 1] {
                 let mut forged = honest.clone();
                 let word = at + leaf * (1usize << shape.schedule[r]);
-                forged[word][1] += crate::tables::types::FE::from(1u64);
+                forged[word][1] += FE::from(1u64);
                 assert!(
                     execute(&program, &[forged], &SOCKET).is_err(),
                     "S={num_vars}: tail round {r}'s leaf {leaf} one lane off must be refused"
@@ -280,7 +295,7 @@ fn a_lean_arena_refuses_a_proof_missing_a_tail_leaf() {
 /// lean chain executes.
 #[test]
 fn equal_tail_blocks_are_each_placed() {
-    let cfg = p1_config(12, 0, CapPolicy::Fixed(2));
+    let cfg = p1_config(96, 0, CapPolicy::Fixed(2));
     let f = super::whir_p1_leaf_tests::constant_fixture(9, cfg);
     let shape = lean(&f.shape);
     let program = p1_chain_program(&shape);

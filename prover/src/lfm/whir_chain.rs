@@ -207,14 +207,25 @@ pub enum LeafQuery {
     V1,
     /// As [`Self::V1`], except the chain's tail rounds
     /// ([`ChainShape::tail_round`]): a round whose current tree lies wholly in
-    /// its cap and has fewer leaves than the queries is checked at EVERY leaf
-    /// once, each leaf's block hashed against its cap node, folded at its
-    /// constant position and compared with the successor block (or the final
-    /// value). A superset of the sampled positions, so a leaf accepts only
-    /// what the host verifier's query checks for those rounds accept. The
-    /// rounds' query draws stay in the transcript, their bits unused.
+    /// its cap, with at least [`TAIL_QUERIES_A_LEAF`] queries a leaf, is
+    /// checked at EVERY leaf once, each leaf's block hashed against its cap
+    /// node, folded at its constant position and compared with the successor
+    /// block (or the final value). A superset of the sampled positions, so a
+    /// leaf accepts only what the host verifier's query checks for those
+    /// rounds accept. The rounds' query draws stay in the transcript, their
+    /// bits unused.
     Lean,
 }
+
+/// Queries a tail tree's leaf ([`ChainShape::tail_round`]) needs at least.
+///
+/// The arena takes a tail tree's every block from the proof, which opens the
+/// tree at `2Q` uniform positions (the round before's successor openings and
+/// the round's own). A tree of `L` leaves misses one with probability at most
+/// `L · (1 − 1/L)^(2Q) ≤ L · e^(−2Q/L)`; at `Q ≥ 24 L` that is `L · e^(−48)`,
+/// below `2^−63` for every tree of at most 64 leaves. A miss leaves an honest
+/// proof without an arena (completeness, never soundness).
+pub const TAIL_QUERIES_A_LEAF: usize = 24;
 
 impl ChainShape {
     pub fn new(config: &ChainConfig, num_vars: usize) -> Self {
@@ -261,9 +272,9 @@ impl ChainShape {
     /// at every leaf of its current tree once instead of at each query. Round
     /// `r ≥ 1`, and it and every later round have a single current tree lying
     /// wholly in its 4-ary cap (no walked level, `mux_bits` = the depth) with
-    /// fewer leaves than the queries: a suffix of the chain, so a tail round's
-    /// successor is a tail round too. Derived from the shape alone, so the
-    /// arena, the leaf and the cost model agree.
+    /// at least [`TAIL_QUERIES_A_LEAF`] queries a leaf: a suffix of the chain,
+    /// so a tail round's successor is a tail round too. Derived from the shape
+    /// alone, so the arena, the leaf and the cost model agree.
     pub fn tail_round(&self, r: usize) -> bool {
         self.query == LeafQuery::Lean
             && r >= 1
@@ -272,7 +283,7 @@ impl ChainShape {
     }
 
     /// Round `r`'s current tree on its own: one tree, at arity 4, capped, its
-    /// every leaf a cap node, and fewer leaves than queries.
+    /// every leaf a cap node, and [`TAIL_QUERIES_A_LEAF`] queries a leaf.
     fn tail_shaped(&self, r: usize) -> bool {
         let depth = self.current_depth(r);
         let c = self.caps[r];
@@ -280,7 +291,7 @@ impl ChainShape {
             && self.trees_at(r) == 1
             && c > 0
             && super::merkle_cap::mux_bits(depth, c, 4) == depth
-            && (1usize << depth) < self.num_queries
+            && TAIL_QUERIES_A_LEAF << depth <= self.num_queries
     }
 
     /// Leaves of round `r`'s current tree: the blocks a tail round checks.
