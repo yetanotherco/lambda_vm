@@ -379,16 +379,25 @@ fn gib_knob(var: &str, default: f64) -> u64 {
     (gib * GIB) as u64
 }
 
-/// The regenerators' generator threads when nothing is set.
-///
-/// With 3, the large block on a 118 GiB host (92.36 GiB dropped) kept phase B
-/// waiting 1.4-2.2 s for the rest's tables; with 6 it never waited, and the
-/// whole block took 1.44 s less with the argue's round slot on (RTX 5090,
-/// Ryzen 9950X). The median drops nothing and does not move.
-pub(crate) const REGEN_GENERATORS: usize = 6;
+/// The streamed chunks' regenerator's generator threads when nothing is set.
+/// It runs beside phase A's finish, where more threads slow the finish.
+pub(crate) const REGEN_GENERATORS: usize = 3;
 
-/// Generator threads of the regenerator: `LAMBDA_VM_BLOCK_REGEN_GENERATORS`
-/// (1..=16), unset [`REGEN_GENERATORS`].
+/// The rest's regenerator's generator threads when nothing is set. It runs
+/// only beside phase B.
+///
+/// On a 118 GiB host the large block drops 92.36 GiB in phase A. With both
+/// regenerators on 3 threads, phase B waited 1.4-2.2 s for the rest's tables;
+/// with both on 6 it never waited, and the whole block took 1.44 s less with
+/// the argue's round slot on. With the streamed one on 3 and the rest's on 4
+/// it never waited either, and took a further 0.62 s less than both on 6:
+/// phase A 0.33 s and the argue 0.28 s, with fewer threads beside them; 5 and
+/// 6 for the rest gained less (RTX 5090, Ryzen 9950X). The median block drops
+/// nothing.
+pub(crate) const REGEN_REST_GENERATORS: usize = 4;
+
+/// Generator threads of the streamed chunks' regenerator:
+/// `LAMBDA_VM_BLOCK_REGEN_GENERATORS` (1..=16), unset [`REGEN_GENERATORS`].
 pub(crate) fn regen_generators() -> usize {
     parse_generators(
         std::env::var("LAMBDA_VM_BLOCK_REGEN_GENERATORS")
@@ -401,21 +410,25 @@ fn parse_generators(value: Option<&str>) -> usize {
     parse_count(value).unwrap_or(REGEN_GENERATORS)
 }
 
-/// Generator threads of the rest's regenerator alone:
-/// `LAMBDA_VM_BLOCK_REGEN_REST_GENERATORS` (1..=16), unset
-/// [`regen_generators`]'s. The streamed chunks' regenerator runs beside phase
-/// A's finish, the rest's only beside phase B, so the two can be sized apart.
+/// Generator threads of the rest's regenerator:
+/// `LAMBDA_VM_BLOCK_REGEN_REST_GENERATORS` (1..=16); unset, the count
+/// `LAMBDA_VM_BLOCK_REGEN_GENERATORS` sets, so that knob alone still sets both;
+/// neither set, [`REGEN_REST_GENERATORS`].
 pub(crate) fn rest_generators() -> usize {
     parse_rest_generators(
         std::env::var("LAMBDA_VM_BLOCK_REGEN_REST_GENERATORS")
             .ok()
             .as_deref(),
-        regen_generators(),
+        std::env::var("LAMBDA_VM_BLOCK_REGEN_GENERATORS")
+            .ok()
+            .as_deref(),
     )
 }
 
-fn parse_rest_generators(value: Option<&str>, shared: usize) -> usize {
-    parse_count(value).unwrap_or(shared)
+fn parse_rest_generators(rest: Option<&str>, shared: Option<&str>) -> usize {
+    parse_count(rest)
+        .or_else(|| parse_count(shared))
+        .unwrap_or(REGEN_REST_GENERATORS)
 }
 
 fn parse_count(value: Option<&str>) -> Option<usize> {
@@ -2918,10 +2931,10 @@ mod tests {
     }
 
     /// `LAMBDA_VM_BLOCK_REGEN_GENERATORS`: a count from 1 to 16, else the
-    /// default, 6.
+    /// streamed regenerator's default, 3.
     #[test]
     fn the_generators_read_their_knob() {
-        assert_eq!(REGEN_GENERATORS, 6);
+        assert_eq!(REGEN_GENERATORS, 3);
         assert_eq!(parse_generators(None), REGEN_GENERATORS);
         assert_eq!(parse_generators(Some("1")), 1);
         assert_eq!(parse_generators(Some(" 3 ")), 3);
@@ -2932,19 +2945,32 @@ mod tests {
     }
 
     /// `LAMBDA_VM_BLOCK_REGEN_REST_GENERATORS`: a count from 1 to 16 for the
-    /// rest's regenerator alone; unset or unreadable, the shared count, so
-    /// nothing changes until it is set.
+    /// rest's regenerator alone; unset or unreadable, the count
+    /// `LAMBDA_VM_BLOCK_REGEN_GENERATORS` sets; neither, the default, 4.
     #[test]
-    fn the_rest_generators_default_to_the_shared_count() {
-        for shared in [1, 3, REGEN_GENERATORS, 16] {
-            assert_eq!(parse_rest_generators(None, shared), shared);
-            for bad in ["", "0", "17", "-1", "many"] {
-                assert_eq!(parse_rest_generators(Some(bad), shared), shared, "{bad:?}");
-            }
+    fn the_rest_generators_read_their_knob_then_the_shared_one() {
+        assert_eq!(REGEN_REST_GENERATORS, 4);
+        assert_eq!(parse_rest_generators(None, None), REGEN_REST_GENERATORS);
+        for bad in ["", "0", "17", "-1", "many"] {
+            assert_eq!(
+                parse_rest_generators(Some(bad), None),
+                REGEN_REST_GENERATORS,
+                "{bad:?}"
+            );
+            assert_eq!(
+                parse_rest_generators(None, Some(bad)),
+                REGEN_REST_GENERATORS,
+                "{bad:?}"
+            );
+            assert_eq!(parse_rest_generators(Some(bad), Some("6")), 6, "{bad:?}");
         }
-        assert_eq!(parse_rest_generators(Some("4"), 3), 4);
-        assert_eq!(parse_rest_generators(Some(" 5 "), 6), 5);
-        assert_eq!(parse_rest_generators(Some("16"), 3), 16);
+        assert_eq!(
+            parse_rest_generators(None, Some("6")),
+            6,
+            "the shared knob alone sets both"
+        );
+        assert_eq!(parse_rest_generators(Some("5"), Some("3")), 5);
+        assert_eq!(parse_rest_generators(Some(" 16 "), None), 16);
     }
 
     /// While the finish runs the early window keeps its frontier whatever the
