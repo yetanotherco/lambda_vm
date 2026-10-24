@@ -995,14 +995,23 @@ fn the_derive_knobs_read_their_values_and_refuse_nonsense() {
     assert!(parse_derive_hold(Some("all")).is_err());
 }
 
-/// The leaf scale's knob reads `off` (or nothing) as the single heights and a
-/// positive count as the threshold, refuses anything else with an error, and
-/// the production format holds what the environment says.
+/// The leaf scale's knob reads nothing as the default (doubled from 10
+/// leaves), `off` as the single heights and a positive count as the
+/// threshold, refuses anything else with an error, and the production format
+/// holds what the environment says.
 #[test]
 fn the_leaf_scale_knob_reads_off_or_a_count() {
     use super::whir_block::{LeafScale, leaf_scale_from_env, leaf_scale_setting};
-    for unset in [None, Some(""), Some(" "), Some("off"), Some(" off ")] {
-        assert_eq!(leaf_scale_setting(unset), Ok(LeafScale::Fixed), "{unset:?}");
+    assert_eq!(LeafScale::DEFAULT, LeafScale::DoubleFrom(10));
+    for unset in [None, Some(""), Some(" ")] {
+        assert_eq!(
+            leaf_scale_setting(unset),
+            Ok(LeafScale::DEFAULT),
+            "{unset:?}"
+        );
+    }
+    for off in [Some("off"), Some(" off ")] {
+        assert_eq!(leaf_scale_setting(off), Ok(LeafScale::Fixed), "{off:?}");
     }
     assert_eq!(
         leaf_scale_setting(Some("12")),

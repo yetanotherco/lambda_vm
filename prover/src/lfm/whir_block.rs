@@ -164,16 +164,30 @@ const _: () = {
 /// top are the verifier's own whichever scale applies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeafScale {
-    /// Every leaf under [`P1_LEAF_HEIGHTS`]. The default.
+    /// Every leaf under [`P1_LEAF_HEIGHTS`]: the format before the doubling,
+    /// and its rollback (`off`).
     Fixed,
     /// The leaves under [`P1_LEAF_HEIGHTS`]; if that takes `T` leaves or more,
     /// partitioned again under [`P1_LEAF_HEIGHTS_2X`]. Below `T` the partition,
     /// the tree and the proof are [`Self::Fixed`]'s, byte for byte. Doubling
     /// saves node children, which a small tree has few of, while its leaves
-    /// pad more and its first leaf starts later (measured on one RTX 5090:
-    /// −2.57 s of recursion on a large block's 18 leaves, +0.33 s on a median
-    /// block's 9).
+    /// pad more and its first leaf starts later (measured on one RTX 5090 with
+    /// the leaves forced to double: −2.57 s of recursion on a large block's 18
+    /// leaves, +0.33 s on a median block's 9).
     DoubleFrom(usize),
+}
+
+/// The threshold of [`LeafScale::DEFAULT`]: the fewest leaves at the single
+/// heights from which a block's leaves double.
+pub const LEAF_DOUBLE_FROM_DEFAULT: usize = 10;
+
+impl LeafScale {
+    /// ★ The default: doubled from [`LEAF_DOUBLE_FROM_DEFAULT`] leaves.
+    /// Measured on one RTX 5090, two runs an arm: a large block's recursion
+    /// −2.81 s at blowup 2 (18 leaves → 9, three node levels → two) and
+    /// −2.52 s at blowup 4 (11 → 5); a median block (9 / 5 leaves) stays under
+    /// the threshold, so its proof is [`Self::Fixed`]'s byte for byte.
+    pub const DEFAULT: Self = Self::DoubleFrom(LEAF_DOUBLE_FROM_DEFAULT);
 }
 
 impl std::fmt::Display for LeafScale {
@@ -185,16 +199,18 @@ impl std::fmt::Display for LeafScale {
     }
 }
 
-/// [`leaf_scale_from_env`]'s knob: unset or `off` is [`LeafScale::Fixed`],
-/// a count `T` is [`LeafScale::DoubleFrom`]`(T)`.
+/// [`leaf_scale_from_env`]'s knob: unset is [`LeafScale::DEFAULT`], `off` is
+/// [`LeafScale::Fixed`], a count `T` is [`LeafScale::DoubleFrom`]`(T)`.
 pub const LEAF_DOUBLE_FROM_ENV: &str = "LAMBDA_VM_WHIR_LEAF_DOUBLE_FROM";
 
 /// A value of [`LEAF_DOUBLE_FROM_ENV`] (or the CLI's `--leaf-double-from`):
-/// unset, empty or `off` is [`LeafScale::Fixed`]; a positive count `T` is
-/// [`LeafScale::DoubleFrom`]`(T)`; anything else is an error.
+/// unset or empty is [`LeafScale::DEFAULT`]; `off` is [`LeafScale::Fixed`]; a
+/// positive count `T` is [`LeafScale::DoubleFrom`]`(T)`; anything else is an
+/// error.
 pub fn leaf_scale_setting(value: Option<&str>) -> Result<LeafScale, String> {
     match value.map(str::trim) {
-        None | Some("") | Some("off") => Ok(LeafScale::Fixed),
+        None | Some("") => Ok(LeafScale::DEFAULT),
+        Some("off") => Ok(LeafScale::Fixed),
         Some(v) => v
             .parse::<usize>()
             .ok()

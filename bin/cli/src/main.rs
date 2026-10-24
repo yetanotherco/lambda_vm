@@ -394,11 +394,12 @@ enum Commands {
         #[arg(long, value_parser = ["natural", "coset"], default_value = "coset")]
         leaves: String,
 
-        /// The recursion's leaf scale: `off` (production) keeps every leaf at
-        /// the single chip heights; a count `T` doubles them when the single
-        /// heights take `T` leaves or more. A format choice: `verify-block`
-        /// must be given the same one; the proof file does not carry it.
-        #[arg(long, value_parser = leaf_double_from_word, default_value = "off")]
+        /// The recursion's leaf scale: a count `T` (production 10) doubles the
+        /// leaves' chip heights when the single heights take `T` leaves or
+        /// more; `off` keeps every leaf at the single heights. A format choice:
+        /// `verify-block` must be given the same one; the proof file does not
+        /// carry it.
+        #[arg(long, value_parser = leaf_double_from_word, default_value = "10")]
         leaf_double_from: String,
     },
 
@@ -434,7 +435,7 @@ enum Commands {
         /// The leaf scale the block was proved with (`prove-block
         /// --leaf-double-from`): the verifier's constant, never read from the
         /// proof.
-        #[arg(long, value_parser = leaf_double_from_word, default_value = "off")]
+        #[arg(long, value_parser = leaf_double_from_word, default_value = "10")]
         leaf_double_from: String,
     },
 
@@ -2099,9 +2100,9 @@ mod tests {
         );
     }
 
-    /// Both block commands take the leaf scale, `off` unless told otherwise,
-    /// and nothing but `off` or a leaf count; each word reads to the scale it
-    /// names.
+    /// Both block commands take the leaf scale, production's threshold of 10
+    /// unless told otherwise, and nothing but `off` or a leaf count; each word
+    /// reads to the scale it names.
     #[test]
     fn the_block_commands_take_the_leaf_scale() {
         use prover::lfm::whir_block::LeafScale;
@@ -2120,7 +2121,7 @@ mod tests {
                 ) => Some(leaf_double_from),
                 _ => None,
             };
-            assert_eq!(scale(cmd).as_deref(), Some("off"), "the default");
+            assert_eq!(scale(cmd).as_deref(), Some("10"), "the default");
             for (word, want) in [
                 ("off", LeafScale::Fixed),
                 ("12", LeafScale::DoubleFrom(12)),
@@ -2143,9 +2144,9 @@ mod tests {
             }
         }
         assert_eq!(
-            prover::lfm::whir_block::leaf_scale_setting(Some("off")),
-            Ok(LeafScale::Fixed),
-            "the default is the single heights"
+            prover::lfm::whir_block::leaf_scale_setting(Some("10")),
+            Ok(LeafScale::DEFAULT),
+            "the flag's default is production's"
         );
     }
 

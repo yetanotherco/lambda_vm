@@ -341,7 +341,8 @@ impl BlockFormat {
     /// polynomials ([`GroupFold::Indexed`]). `ArgueFormat::PerTable` and
     /// [`GroupFold::PerPoly`] stay formats to measure against. The leaves'
     /// scale is the environment's (`LAMBDA_VM_WHIR_LEAF_DOUBLE_FROM`; unset,
-    /// [`LeafScale::Fixed`](crate::lfm::whir_block::LeafScale::Fixed)).
+    /// [`LeafScale::DEFAULT`](crate::lfm::whir_block::LeafScale::DEFAULT),
+    /// doubled from 10 leaves; `off`, every leaf at the single heights).
     pub fn production() -> Self {
         Self {
             zf: *ZfFormat::global(),
