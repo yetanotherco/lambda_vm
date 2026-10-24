@@ -12,6 +12,10 @@
 //
 // WHAT IT COVERS:
 //   1. MEMW_R: thirteen register rows, then zero rows, every word.
+//   1a. MEMW_A: thirteen aligned rows (memory and register accesses, reads and
+//      writes, every width), then zero rows, every word.
+//   1b. LOAD: nineteen ops (every width, signed or not, sign bits set and
+//      clear), then zero rows, every word.
 //   2. CPU: 29 logs over 24 decode entries in three runs (every op class the
 //      fill branches on, each entry in turn), then padding rows, every word;
 //      and a log whose pc no run holds, counted as missing with its row left
@@ -133,6 +137,22 @@ void test_memw_r() {
     check_words("MEMW_R", out, KAT_MEMW_R_WORDS, height, cols);
 }
 
+void test_memw_a() {
+    const uint64_t height = KAT_MEMW_A_HEIGHT;
+    const uint64_t cols = memw_a_cols::NUM_COLUMNS;
+    auto out = table(height * cols);
+    each_row(height, 0, [&] { fill_memw_a(KAT_MEMW_A_ROWS, KAT_MEMW_A_N, height, out.data()); });
+    check_words("MEMW_A", out, KAT_MEMW_A_WORDS, height, cols);
+}
+
+void test_load() {
+    const uint64_t height = KAT_LOAD_HEIGHT;
+    const uint64_t cols = load_cols::NUM_COLUMNS;
+    auto out = table(height * cols);
+    each_row(height, 0, [&] { fill_load(KAT_LOAD_OPS, KAT_LOAD_N, height, out.data()); });
+    check_words("LOAD", out, KAT_LOAD_WORDS, height, cols);
+}
+
 void test_cpu() {
     const uint64_t height = KAT_CPU_HEIGHT;
     const uint64_t cols = cpu_cols::NUM_COLUMNS;
@@ -220,6 +240,8 @@ void test_keccak_rnd() {
 
 int main() {
     test_memw_r();
+    test_memw_a();
+    test_load();
     test_cpu();
     test_keccak_rnd();
     std::printf("fill host KAT: %d checks, %d failures\n", g_checks, g_failures);

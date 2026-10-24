@@ -22,12 +22,14 @@ use executor::vm::instruction::decoding::Instruction;
 use executor::vm::instruction::execution::keccak_f1600;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
-use math_cuda::fill::{DecodeEntryC, DecodeRunC, KeccakOpC, LogC};
+use math_cuda::fill::{AlignedRowC, DecodeEntryC, DecodeRunC, KeccakOpC, LoadOpC, LogC};
 
 use super::cpu::{CpuOperation, generate_cpu_trace_as};
 use super::decode::{DecodeTable, instructions_from_elf};
 use super::gpack::{Trace, TraceForm};
 use super::keccak_rnd::{self, KeccakRoundOperation, generate_keccak_rnd_rows_as};
+use super::load::{self, LoadOperation};
+use super::memw_aligned::{self, AlignedRow};
 use super::memw_register::{RegRow, generate_memw_register_trace_from_rows_as};
 
 /// The synthetic sets' seeds.
@@ -296,6 +298,86 @@ pub(crate) fn program_decode() -> DecodeTable {
 // The host fills, in the card's layout
 // =========================================================================
 
+/// An aligned row's record: the card's struct, field for field.
+pub(crate) fn aligned_record(row: &AlignedRow) -> AlignedRowC {
+    let r = &memw_aligned::card_rows(std::slice::from_ref(row))[0];
+    AlignedRowC {
+        base_address: r.base_address,
+        timestamp: r.timestamp,
+        old_timestamp: r.old_timestamp,
+        value: r.value,
+        old: r.old,
+        width: r.width,
+        is_read: r.is_read,
+        is_register: r.is_register,
+    }
+}
+
+/// A load op's record: the card's struct, field for field.
+pub(crate) fn load_record(op: &LoadOperation) -> LoadOpC {
+    let r = &load::card_ops(std::slice::from_ref(op))[0];
+    LoadOpC {
+        base_address: r.base_address,
+        timestamp: r.timestamp,
+        width: r.width,
+        is_signed: r.signed,
+        res: r.res,
+    }
+}
+
+/// `n` aligned rows from `seed`: memory and register accesses, reads and
+/// writes, of widths 1, 2, 4 and 8 in turn, the values random (a register
+/// access's two 32-bit halves, a memory access's eight bytes).
+pub(crate) fn memw_a_rows(seed: u64, n: usize) -> Vec<AlignedRow> {
+    let mut rng = seed;
+    (0..n)
+        .map(|i| {
+            let width = 1u8 << (i % 4);
+            let is_register = i % 3 == 1;
+            let timestamp = 8 + splitmix(&mut rng) % (1 << 40);
+            let old_timestamp = splitmix(&mut rng) % timestamp;
+            AlignedRow::from_parts(
+                splitmix(&mut rng) & !7,
+                timestamp,
+                old_timestamp,
+                splitmix(&mut rng),
+                splitmix(&mut rng),
+                width,
+                splitmix(&mut rng) & 1 == 1,
+                is_register,
+            )
+        })
+        .collect()
+}
+
+/// `n` load ops from `seed`: widths 1, 2, 4 and 8 in turn, signed or not, the
+/// result's bytes random (so each width's sign bit is set in some op and clear
+/// in another).
+pub(crate) fn load_ops(seed: u64, n: usize) -> Vec<LoadOperation> {
+    let mut rng = seed;
+    (0..n)
+        .map(|i| {
+            LoadOperation::new(
+                splitmix(&mut rng),
+                8 + splitmix(&mut rng) % (1 << 40),
+                1 << (i % 4),
+                (i / 4) % 2 == 1,
+                splitmix(&mut rng).to_le_bytes(),
+            )
+        })
+        .collect()
+}
+
+/// MEMW_A's host fill of `rows`, in `form`.
+pub(crate) fn memw_a_host(rows: &[AlignedRow], form: TraceForm) -> Trace {
+    memw_aligned::generate_memw_aligned_trace_segments_as(&[rows], form)
+}
+
+/// LOAD's host fill of `ops`, in `form`.
+pub(crate) fn load_host(ops: &[LoadOperation], form: TraceForm) -> Trace {
+    load::generate_load_trace_segments_as(&[ops], form)
+}
+
 /// MEMW_R's host fill of `rows`, in `form`.
 pub(crate) fn memw_r_host(rows: &[RegRow], form: TraceForm) -> Trace {
     generate_memw_register_trace_from_rows_as(rows, form)
@@ -382,6 +464,11 @@ const KAT_MEMW_R_HEIGHT: usize = 16;
 const KAT_CPU_LOGS: usize = 29;
 const KAT_CPU_HEIGHT: usize = 32;
 const KAT_CPU_FIRST_CYCLE: u64 = (1 << 30) - 20;
+/// The known-answer MEMW_A and LOAD tables: rows, then zero rows.
+const KAT_MEMW_A_ROWS: usize = 13;
+const KAT_MEMW_A_HEIGHT: usize = 16;
+const KAT_LOAD_OPS: usize = 19;
+const KAT_LOAD_HEIGHT: usize = 32;
 /// The known-answer KECCAK_RND tables, `(first op, ops, skip, rows)` of
 /// [`KAT_KECCAK_OPS`] ops: cut into the first op, every round of the second,
 /// zero rows after; and cut at both ends.
@@ -492,6 +579,62 @@ pub(crate) fn host_kat_vectors() -> String {
     }
     s += "};\n// Column-major: column c's rows from c * KAT_MEMW_R_HEIGHT.\n";
     s += "inline const uint64_t KAT_MEMW_R_WORDS[] = {\n";
+    s += &c_list(&u64s(words), 6);
+    s += "};\n\n";
+
+    // MEMW_A.
+    let rows = memw_a_rows(0x4D45_4D41, KAT_MEMW_A_ROWS);
+    let words = col_major(&memw_a_host(&rows, TraceForm::Wide));
+    assert_eq!(
+        words.len(),
+        KAT_MEMW_A_HEIGHT * math_cuda::fill::MEMW_A_COLUMNS
+    );
+    s += &format!(
+        "// MEMW_A: {KAT_MEMW_A_ROWS} rows, then zero rows to {KAT_MEMW_A_HEIGHT}.\n\
+         inline constexpr uint64_t KAT_MEMW_A_N = {KAT_MEMW_A_ROWS};\n\
+         inline constexpr uint64_t KAT_MEMW_A_HEIGHT = {KAT_MEMW_A_HEIGHT};\n\
+         inline const AlignedRowC KAT_MEMW_A_ROWS[KAT_MEMW_A_N] = {{\n"
+    );
+    for c in rows.iter().map(aligned_record) {
+        s += &format!(
+            "    {{{}ull, {}ull, {}ull, {}ull, {}ull, {}, {}, {}}},\n",
+            c.base_address,
+            c.timestamp,
+            c.old_timestamp,
+            c.value,
+            c.old,
+            c.width,
+            c.is_read,
+            c.is_register
+        );
+    }
+    s += "};\n// Column-major: column c's rows from c * KAT_MEMW_A_HEIGHT.\n";
+    s += "inline const uint64_t KAT_MEMW_A_WORDS[] = {\n";
+    s += &c_list(&u64s(words), 6);
+    s += "};\n\n";
+
+    // LOAD.
+    let ops = load_ops(0x4C4F_4144, KAT_LOAD_OPS);
+    let words = col_major(&load_host(&ops, TraceForm::Wide));
+    assert_eq!(words.len(), KAT_LOAD_HEIGHT * math_cuda::fill::LOAD_COLUMNS);
+    s += &format!(
+        "// LOAD: {KAT_LOAD_OPS} ops, then zero rows to {KAT_LOAD_HEIGHT}.\n\
+         inline constexpr uint64_t KAT_LOAD_N = {KAT_LOAD_OPS};\n\
+         inline constexpr uint64_t KAT_LOAD_HEIGHT = {KAT_LOAD_HEIGHT};\n\
+         inline const LoadOpC KAT_LOAD_OPS[KAT_LOAD_N] = {{\n"
+    );
+    for c in ops.iter().map(load_record) {
+        s += &format!(
+            "    {{{}ull, {}ull, {}, {}, {{{}}}}},\n",
+            c.base_address,
+            c.timestamp,
+            c.width,
+            c.is_signed,
+            c.res.map(|b| b.to_string()).join(", ")
+        );
+    }
+    s += "};\n// Column-major: column c's rows from c * KAT_LOAD_HEIGHT.\n";
+    s += "inline const uint64_t KAT_LOAD_WORDS[] = {\n";
     s += &c_list(&u64s(words), 6);
     s += "};\n\n";
 
@@ -623,6 +766,8 @@ mod tests {
     fn the_card_layouts_are_the_prover_tables() {
         use math_cuda::fill as f;
         assert_eq!(f::MEMW_R_COLUMNS, memw_register::cols::NUM_COLUMNS);
+        assert_eq!(f::MEMW_A_COLUMNS, memw_aligned::cols::NUM_COLUMNS);
+        assert_eq!(f::LOAD_COLUMNS, load::cols::NUM_COLUMNS);
         assert_eq!(f::CPU_COLUMNS, cpu::cols::NUM_COLUMNS);
         assert_eq!(f::KECCAK_RND_COLUMNS, keccak_rnd::cols::NUM_COLUMNS);
         assert_eq!(std::mem::size_of::<Log>(), std::mem::size_of::<LogC>());
@@ -638,6 +783,16 @@ mod tests {
             std::slice::from_raw_parts((value as *const T).cast::<u8>(), std::mem::size_of::<T>())
         }
         .to_vec()
+    }
+
+    /// The first `n` bytes of `value` as the card receives them: `T`'s fields
+    /// up to its trailing padding.
+    fn field_bytes<T>(value: &T, n: usize) -> Vec<u8> {
+        assert!(n <= std::mem::size_of::<T>());
+        // SAFETY: `T` is `#[repr(C)]` and its first `n` bytes are fields with
+        // no padding between them (asserted by the callers' offsets), so every
+        // byte read is initialized.
+        unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), n) }.to_vec()
     }
 
     /// A register row's record: its fields, and its 32 bytes as uploaded.
@@ -676,6 +831,82 @@ mod tests {
         assert_eq!(bytes_of(&c), bytes);
         let write = RegRow::new(0, 9, 0, 0, 0, 0, 8, false).card_record();
         assert_eq!((write.is_read, write.address, write.old_ts_lo), (0, 0, 8));
+    }
+
+    /// An aligned row's record: its fields, and its first 43 bytes as
+    /// uploaded (the rest is padding no kernel reads).
+    #[test]
+    fn an_aligned_row_encodes_field_for_field() {
+        let row = AlignedRow::from_parts(
+            0x1122_3344_5566_7788,
+            0x3_0000_0010,
+            0x2_FFFF_FFF0,
+            0x0102_0304_0506_0708,
+            u64::MAX,
+            4,
+            true,
+            false,
+        );
+        let c = aligned_record(&row);
+        let want = AlignedRowC {
+            base_address: 0x1122_3344_5566_7788,
+            timestamp: 0x3_0000_0010,
+            old_timestamp: 0x2_FFFF_FFF0,
+            value: 0x0102_0304_0506_0708,
+            old: u64::MAX,
+            width: 4,
+            is_read: 1,
+            is_register: 0,
+        };
+        assert_eq!(c, want);
+        let bytes = field_bytes(&row, 43);
+        let words: Vec<u64> = bytes[..40]
+            .chunks_exact(8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            words,
+            [
+                0x1122_3344_5566_7788,
+                0x3_0000_0010,
+                0x2_FFFF_FFF0,
+                0x0102_0304_0506_0708,
+                u64::MAX
+            ]
+        );
+        assert_eq!(bytes[40..43], [4, 1, 0]);
+        let register = AlignedRow::from_parts(0, 9, 8, 0, 0, 8, false, true);
+        assert_eq!(field_bytes(&register, 43)[40..43], [8, 0, 1]);
+    }
+
+    /// A load op's record: its fields, and its first 26 bytes as uploaded
+    /// (the rest is padding no kernel reads).
+    #[test]
+    fn a_load_op_encodes_field_for_field() {
+        let op = LoadOperation::new(
+            0xFF00_0000_0000_0008,
+            0x1_0000_0004,
+            2,
+            true,
+            [9, 8, 7, 6, 5, 4, 3, 2],
+        );
+        let c = load_record(&op);
+        assert_eq!(
+            c,
+            LoadOpC {
+                base_address: 0xFF00_0000_0000_0008,
+                timestamp: 0x1_0000_0004,
+                width: 2,
+                is_signed: 1,
+                res: [9, 8, 7, 6, 5, 4, 3, 2],
+            }
+        );
+        let bytes = field_bytes(&op, 26);
+        assert_eq!(bytes[..8], 0xFF00_0000_0000_0008u64.to_le_bytes());
+        assert_eq!(bytes[8..16], 0x1_0000_0004u64.to_le_bytes());
+        assert_eq!(bytes[16..26], [2, 1, 9, 8, 7, 6, 5, 4, 3, 2]);
+        let unsigned = LoadOperation::new(0, 8, 1, false, [0; 8]);
+        assert_eq!(field_bytes(&unsigned, 26)[16..18], [1, 0]);
     }
 
     /// A log's record: its five words in order.
