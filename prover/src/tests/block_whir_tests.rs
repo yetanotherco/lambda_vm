@@ -74,6 +74,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         gpack: true,
         spill: crate::block_whir::BlockSpillPolicy::Off,
         regen: None,
+        phase_b_overlap: false,
     }
 }
 
@@ -1601,34 +1602,38 @@ fn the_shadow_stays_off_where_it_cannot_rebuild_the_chunks() {
 /// its own fork `S_post ‖ g`, so taking the groups reversed, odd ones first, or
 /// a group's spilled columns read back out of group order, proves the bytes of
 /// group order under the deterministic grind, with the same partition, and
-/// verifies; an order that is not a permutation of the groups is refused.
+/// verifies; an order that is not a permutation of the groups is refused. So
+/// does each group's openings run beside the next group's argue (phase B's
+/// overlap), in group order, reversed, and reversed with the columns spilled.
 #[test]
 fn phase_b_in_any_order_proves_the_same_bytes() {
     use crate::block_whir::BlockSpillPolicy;
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
-    let proved = |order: Option<fn(usize) -> Vec<usize>>, spill: BlockSpillPolicy| {
-        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-        o.spill = spill;
-        prove_block_whir_with(
-            &elf,
-            &[],
-            &ProofOptions::default_test_options(),
-            &format,
-            &o,
-            &Deviations {
-                phase_b_order: order,
-                ..Deviations::default()
-            },
-        )
-        .map(|(proof, _)| proof)
-    };
+    let proved =
+        |order: Option<fn(usize) -> Vec<usize>>, spill: BlockSpillPolicy, overlap: bool| {
+            let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+            o.spill = spill;
+            o.phase_b_overlap = overlap;
+            prove_block_whir_with(
+                &elf,
+                &[],
+                &ProofOptions::default_test_options(),
+                &format,
+                &o,
+                &Deviations {
+                    phase_b_order: order,
+                    ..Deviations::default()
+                },
+            )
+            .map(|(proof, _)| proof)
+        };
     let bytes = |p: &BlockWhirProof| {
         rkyv::to_bytes::<rkyv::rancor::Error>(p)
             .expect("serialize")
             .to_vec()
     };
-    let in_order = proved(None, BlockSpillPolicy::Off).expect("prove");
+    let in_order = proved(None, BlockSpillPolicy::Off, false).expect("prove");
     assert!(
         in_order.groups.len() > 3,
         "{} groups",
@@ -1637,12 +1642,30 @@ fn phase_b_in_any_order_proves_the_same_bytes() {
     let reversed: fn(usize) -> Vec<usize> = |n| (0..n).rev().collect();
     let odd_first: fn(usize) -> Vec<usize> =
         |n| (1..n).step_by(2).chain((0..n).step_by(2)).collect();
-    for (what, order, spill) in [
-        ("reversed", reversed, BlockSpillPolicy::Off),
-        ("odd first", odd_first, BlockSpillPolicy::Off),
-        ("reversed, spilled", reversed, BlockSpillPolicy::Always),
+    for (what, order, spill, overlap) in [
+        ("reversed", Some(reversed), BlockSpillPolicy::Off, false),
+        ("odd first", Some(odd_first), BlockSpillPolicy::Off, false),
+        (
+            "reversed, spilled",
+            Some(reversed),
+            BlockSpillPolicy::Always,
+            false,
+        ),
+        ("in order, overlapped", None, BlockSpillPolicy::Off, true),
+        (
+            "reversed, overlapped",
+            Some(reversed),
+            BlockSpillPolicy::Off,
+            true,
+        ),
+        (
+            "reversed, spilled, overlapped",
+            Some(reversed),
+            BlockSpillPolicy::Always,
+            true,
+        ),
     ] {
-        let proof = proved(Some(order), spill).expect("prove");
+        let proof = proved(order, spill, overlap).expect("prove");
         assert_eq!(proof.groups, in_order.groups, "{what}: the partition");
         assert!(verify(&proof, &elf, &format), "{what}");
         if crypto::grinding::deterministic() {
@@ -1652,11 +1675,250 @@ fn phase_b_in_any_order_proves_the_same_bytes() {
     let twice: fn(usize) -> Vec<usize> = |n| std::iter::repeat_n(0, n).collect();
     let short: fn(usize) -> Vec<usize> = |n| (1..n).collect();
     for (what, order) in [("a group twice", twice), ("a group left out", short)] {
-        assert!(
-            proved(Some(order), BlockSpillPolicy::Off).is_err(),
-            "{what}: proved"
-        );
+        for overlap in [false, true] {
+            assert!(
+                proved(Some(order), BlockSpillPolicy::Off, overlap).is_err(),
+                "{what}: proved"
+            );
+        }
     }
+}
+
+/// Phase B's overlap on a streamed block: an opening or an argue that fails
+/// beside the other, or a panic on the opening thread, is the prove's error,
+/// never a panic; a refusal keeps its transition's overlap and turns the rest
+/// serial, with the proof's bytes unchanged, and the readout counts each.
+#[test]
+fn phase_b_overlap_failures_are_the_proves_error_and_a_refusal_turns_it_serial() {
+    use stark::multilinear_block::OverlapFaults;
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.phase_b_overlap = true;
+    let run = |faults: OverlapFaults| {
+        prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                overlap_faults: faults,
+                ..Deviations::default()
+            },
+        )
+    };
+    for (what, faults, stage) in [
+        (
+            "an opening fails",
+            OverlapFaults {
+                open_fails: Some(1),
+                ..OverlapFaults::default()
+            },
+            "a test's failed opening",
+        ),
+        (
+            "an argue fails",
+            OverlapFaults {
+                argue_fails: Some(2),
+                ..OverlapFaults::default()
+            },
+            "a test's failed argue",
+        ),
+        (
+            "the opening thread panics",
+            OverlapFaults {
+                open_panics: Some(1),
+                ..OverlapFaults::default()
+            },
+            "the previous group's openings",
+        ),
+    ] {
+        match run(faults) {
+            Err(e) => assert!(format!("{e:?}").contains(stage), "{what}: {e:?}"),
+            Ok(_) => panic!("{what}: proved"),
+        }
+    }
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let (plain, stamps) = run(OverlapFaults::default()).expect("prove");
+    let n = stamps.groups.len();
+    assert!(n > 3, "{n} groups");
+    assert_eq!(stamps.groups.iter().filter(|g| g.overlapped).count(), n - 1);
+    let (latched, stamps) = run(OverlapFaults {
+        refusal_at: Some(2),
+        ..OverlapFaults::default()
+    })
+    .expect("prove");
+    assert!(verify(&latched, &elf, &format));
+    if crypto::grinding::deterministic() {
+        assert_eq!(bytes(&latched), bytes(&plain), "a refusal: the proof");
+    }
+    let report = stamps.report();
+    let counted = format!(
+        "BLOCK PHASE-B OVERLAP: on · transitions overlapped 2 of {} (serial after a refusal {})",
+        n - 1,
+        n - 3
+    );
+    assert!(report.contains(&counted), "{counted}\n{report}");
+}
+
+/// `LAMBDA_VM_PHASE_B_OVERLAP`: `1` on; unset, `0` or any other word off.
+#[test]
+fn the_phase_b_overlap_knob_reads_one_as_on() {
+    use crate::block_whir::phase_b_overlap_from;
+    assert!(!phase_b_overlap_from(None));
+    assert!(!phase_b_overlap_from(Some("0")));
+    assert!(phase_b_overlap_from(Some("1")));
+    assert!(phase_b_overlap_from(Some(" 1 ")));
+    assert!(!phase_b_overlap_from(Some("on")));
+    assert!(!phase_b_overlap_from(Some("2")));
+}
+
+/// The overlap's readout, on and off, from stamps alone: the per-group `paid`,
+/// the opening helper, the measured transitions on the phase-B ledger and the
+/// overlap's own line; off, every line as it was and the overlap line `off`.
+#[test]
+fn the_phase_b_overlap_readout_names_its_transitions() {
+    use stark::multilinear_block::GroupStamps;
+    let gib = 1u64 << 30;
+    let groups = vec![
+        GroupStamps {
+            argue: 0.5,
+            encode: 0.01,
+            open: 0.09,
+            open_paid: 0.02,
+            overlapped: true,
+            open_draws: (40, 7),
+            ..GroupStamps::default()
+        },
+        GroupStamps {
+            argue: 0.4,
+            encode: 0.02,
+            open: 0.08,
+            open_paid: 0.0,
+            overlapped: true,
+            transition_reserved: 20 * gib,
+            open_draws: (30, 5),
+            ..GroupStamps::default()
+        },
+        GroupStamps {
+            argue: 0.3,
+            encode: 0.01,
+            open: 0.05,
+            open_paid: 0.06,
+            transition_reserved: 21 * gib,
+            open_draws: (6, 0),
+            ..GroupStamps::default()
+        },
+    ];
+    let on = block_whir::BlockStamps {
+        groups: groups.clone(),
+        phase_b_overlap: true,
+        ..Default::default()
+    }
+    .report();
+    assert!(on.contains("encode 0.010 open 0.090 paid 0.020\n"), "{on}");
+    assert!(
+        on.contains("+ one upload helper + one opening helper\n"),
+        "{on}"
+    );
+    assert!(
+        on.contains("open(g) beside argue(g+1) [20480, 21504] MiB measured ·"),
+        "{on}"
+    );
+    assert!(
+        on.contains(
+            "BLOCK PHASE-B OVERLAP: on · transitions overlapped 2 of 2 (serial after a refusal 0) · \
+             openings beside an argue 0.200 s, hidden 0.180 s, paid 0.020 s + alone 0.060 s · \
+             argue 1.200 s · transition ledger peak max 21504 MiB"
+        ),
+        "{on}"
+    );
+    assert!(
+        on.contains(
+            "openings' stream draws beside an argue background 12 / foreground 70 (the argue's \
+             too), alone background 0 / foreground 6 · trims 0\n"
+        ),
+        "{on}"
+    );
+    let off = block_whir::BlockStamps {
+        groups,
+        ..Default::default()
+    }
+    .report();
+    assert!(off.contains("encode 0.010 open 0.090\n"), "{off}");
+    assert!(off.contains("+ one upload helper\n"), "{off}");
+    assert!(!off.contains(" measured"), "{off}");
+    assert!(
+        off.contains("BLOCK PHASE-B OVERLAP: off · transitions overlapped 2 of 2"),
+        "{off}"
+    );
+}
+
+/// ★ On a card with a background pool (`LAMBDA_VM_STREAM_CLASSES=equal` or
+/// `priority`), every stream the openings beside an argue draw is a
+/// background one: as many as the same group's openings drew alone, all of
+/// them foreground, with the overlap off. A device call they made from
+/// another thread would draw a foreground stream and show here as fewer.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "box: needs a card and LAMBDA_VM_STREAM_CLASSES=equal"]
+fn phase_b_overlap_openings_draw_background_streams() {
+    assert!(
+        math_cuda::stream_class::setting().split(),
+        "run with LAMBDA_VM_STREAM_CLASSES=equal or priority"
+    );
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let mut format = many_groups();
+    // Codewords of 2^16 and more: the card's, not the host's.
+    format.zf.whir_stack = StackVars::new(14).expect("a valid stack");
+    let run = |overlap: bool| {
+        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+        o.phase_b_overlap = overlap;
+        prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations::default(),
+        )
+        .expect("prove")
+        .1
+    };
+    let (alone, beside) = (run(false), run(true));
+    assert!(alone.groups.len() > 2, "{} groups", alone.groups.len());
+    let drawn: u64 = alone.groups.iter().map(|g| g.open_draws.0).sum();
+    println!(
+        "PHASE-B DRAWS: alone {:?} · beside {:?}",
+        alone
+            .groups
+            .iter()
+            .map(|g| g.open_draws)
+            .collect::<Vec<_>>(),
+        beside
+            .groups
+            .iter()
+            .map(|g| g.open_draws)
+            .collect::<Vec<_>>()
+    );
+    assert!(drawn > 0, "no opening drew a stream: nothing to compare");
+    let mut compared = 0;
+    for (g, (a, b)) in alone.groups.iter().zip(&beside.groups).enumerate() {
+        assert_eq!(a.open_draws.1, 0, "group {g}: a background draw alone");
+        if b.overlapped {
+            assert_eq!(
+                b.open_draws.1, a.open_draws.0,
+                "group {g}: beside an argue, the openings' draws"
+            );
+            compared += usize::from(a.open_draws.0 > 0);
+        }
+    }
+    assert!(compared > 0, "no overlapped group drew a stream");
 }
 
 /// A streamed prove under live regeneration `mode` and the spill `policy`,

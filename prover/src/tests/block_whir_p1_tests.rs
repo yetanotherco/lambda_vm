@@ -62,6 +62,7 @@ fn options(drop_levels: usize) -> BlockOptions {
         gpack: true,
         spill: block_whir::BlockSpillPolicy::Off,
         regen: None,
+        phase_b_overlap: false,
     }
 }
 

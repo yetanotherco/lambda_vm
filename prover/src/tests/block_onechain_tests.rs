@@ -99,6 +99,7 @@ fn options(max_rows: MaxRowsConfig) -> BlockOptions {
         gpack: true,
         spill: block_whir::BlockSpillPolicy::Off,
         regen: None,
+        phase_b_overlap: false,
     }
 }
 

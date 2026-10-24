@@ -521,6 +521,10 @@ pub struct BlockOptions {
     /// `LAMBDA_VM_BLOCK_SPILL` are both unset (with the spill `off`: no disk).
     /// The proof's bytes are the same under every mode.
     pub regen: Option<regen::RegenMode>,
+    /// Phase B opens each group on a thread of its own beside the next
+    /// group's argue ([`multilinear_block::PhaseBOverlap`]); the proof's bytes
+    /// are the same. Production: [`phase_b_overlap_from_env`], off by default.
+    pub phase_b_overlap: bool,
 }
 
 /// When a block spills its held tables ([`BlockOptions::spill`]): the policy
@@ -1065,7 +1069,39 @@ impl BlockOptions {
             gpack: gpack_from_env(),
             spill: production_spill(),
             regen: regen::production_regen(),
+            phase_b_overlap: phase_b_overlap_from_env(),
         }
+    }
+}
+
+/// `LAMBDA_VM_PHASE_B_OVERLAP`: [`BlockOptions::phase_b_overlap`]'s
+/// production value, `1` on and `0` (or unset) off.
+pub(crate) fn phase_b_overlap_from_env() -> bool {
+    phase_b_overlap_from(std::env::var("LAMBDA_VM_PHASE_B_OVERLAP").ok().as_deref())
+}
+
+/// [`phase_b_overlap_from_env`]'s reading of its variable: a word other than
+/// `0` or `1` is read as off, and said once.
+pub(crate) fn phase_b_overlap_from(value: Option<&str>) -> bool {
+    match value.map(str::trim) {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(other) => {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                eprintln!("LAMBDA_VM_PHASE_B_OVERLAP={other}: 0 or 1 — read as off");
+            });
+            false
+        }
+    }
+}
+
+/// Phase B's overlap as [`BlockOptions::phase_b_overlap`] asks for it.
+fn phase_b_overlap(options: &BlockOptions) -> multilinear_block::PhaseBOverlap {
+    if options.phase_b_overlap {
+        multilinear_block::PhaseBOverlap::On
+    } else {
+        multilinear_block::PhaseBOverlap::Off
     }
 }
 
@@ -1448,6 +1484,8 @@ pub struct BlockStamps {
     /// stamps are placed against. Empty without a streamed prove.
     pub phase_b_unix: Option<(f64, f64)>,
     pub phase_b_order: Vec<usize>,
+    /// Phase B ran with its overlap on ([`BlockOptions::phase_b_overlap`]).
+    pub phase_b_overlap: bool,
 }
 
 /// A streamed build's layout, for the readout ([`BlockStamps::layout`]).
@@ -1550,7 +1588,7 @@ impl BlockStamps {
         );
         for (g, s) in self.groups.iter().enumerate() {
             out.push_str(&format!(
-                "BLOCK GROUP {g}: tables {} · polys {} · cells {:.1} M || A wait {:.3} upload {:.3} paid {:.3} commit {:.3} retire {:.3} from@{:.2} done@{:.2} || B upload {:.3} argue {:.3} encode {:.3} open {:.3}\n",
+                "BLOCK GROUP {g}: tables {} · polys {} · cells {:.1} M || A wait {:.3} upload {:.3} paid {:.3} commit {:.3} retire {:.3} from@{:.2} done@{:.2} || B upload {:.3} argue {:.3} encode {:.3} open {:.3}{}\n",
                 s.tables,
                 s.polys,
                 s.cells as f64 / 1e6,
@@ -1565,6 +1603,12 @@ impl BlockStamps {
                 s.argue,
                 s.encode,
                 s.open,
+                // Under the overlap: what of the openings phase B waited for.
+                if self.phase_b_overlap {
+                    format!(" paid {:.3}", s.open_paid)
+                } else {
+                    String::new()
+                },
             ));
         }
         if !self.build_marks.is_empty() {
@@ -1683,11 +1727,16 @@ impl BlockStamps {
         }
         let ((card_calls, card_secs), (host_calls, host_secs)) = self.top_routes;
         out.push_str(&format!(
-            "BLOCK RECOMMIT: 0 (a revived commitment builds no tree) · first-round paths from kept tops: {} calls · {} leaves re-hashed · on the card {card_calls} calls in {card_secs:.3} s · on the host (fallback) {host_calls} calls in {host_secs:.3} s · dropped {} · phase B on one thread + one upload helper\n",
+            "BLOCK RECOMMIT: 0 (a revived commitment builds no tree) · first-round paths from kept tops: {} calls · {} leaves re-hashed · on the card {card_calls} calls in {card_secs:.3} s · on the host (fallback) {host_calls} calls in {host_secs:.3} s · dropped {} · phase B on one thread + one upload helper{}\n",
             self.top_paths.0,
             self.top_paths.1,
             self.drop_levels
                 .map_or("-".to_string(), |d| d.to_string()),
+            if self.phase_b_overlap {
+                " + one opening helper"
+            } else {
+                ""
+            },
         ));
         if host_calls > 0 {
             out.push_str(&format!(
@@ -1724,24 +1773,36 @@ impl BlockStamps {
                 )
             })
             .collect();
-        let overlap: Vec<String> = self
-            .groups
-            .windows(2)
-            .map(|w| {
-                let both = w[0].open_reserved + w[1].argue_reserved.saturating_sub(w[1].argue_base);
-                format!("{}", mib(both))
-            })
-            .collect();
+        // Under the overlap the two ran at once: each transition's own window
+        // (in group order of the argue), measured.
+        let overlap: Vec<String> = if self.phase_b_overlap {
+            self.groups
+                .iter()
+                .filter(|g| g.transition_reserved > 0)
+                .map(|g| format!("{}", mib(g.transition_reserved)))
+                .collect()
+        } else {
+            self.groups
+                .windows(2)
+                .map(|w| {
+                    let both =
+                        w[0].open_reserved + w[1].argue_reserved.saturating_sub(w[1].argue_base);
+                    format!("{}", mib(both))
+                })
+                .collect()
+        };
         out.push_str(&format!(
-            "BLOCK PHASE-B LEDGER: budget {} MiB · per group base/argue/room/open [{}] MiB · open(g) beside argue(g+1) [{}] MiB · revive room refusals {} · turn refusals {} · GKR tree refusals {} · openings on the host {}\n",
+            "BLOCK PHASE-B LEDGER: budget {} MiB · per group base/argue/room/open [{}] MiB · open(g) beside argue(g+1) [{}] MiB{} · revive room refusals {} · turn refusals {} · GKR tree refusals {} · openings on the host {}\n",
             mib(multilinear::gpu::reserve_budget()),
             per_group.join(", "),
             overlap.join(", "),
+            if self.phase_b_overlap { " measured" } else { "" },
             multilinear::gpu::room_revive_refusals(),
             multilinear::gpu::room_turn_refusals(),
             multilinear::gpu::gkr_tree_refusals(),
             multilinear::gpu::open_host_fallbacks(),
         ));
+        out.push_str(&self.overlap_line());
         // Phase A's ledger and its upload: what each group's upload took, what
         // the committer paid of it, and what the commit promised beside it.
         let hidden = sum(|g| g.upload_a - g.upload_paid);
@@ -1839,6 +1900,51 @@ impl BlockStamps {
             out.push_str(&format!("BLOCK SPILL: {spill}\n"));
         }
         out
+    }
+
+    /// Phase B's overlap ([`BlockOptions::phase_b_overlap`]), on or off: the
+    /// transitions whose openings ran beside the next argue and those that ran
+    /// alone after a refusal; the openings' seconds beside an argue, how many
+    /// of them the driver still waited for (paid) and the rest (hidden), and
+    /// the seconds of the openings run alone; the argues' seconds; the largest
+    /// transition's ledger peak; the openings' stream draws by pool, beside an
+    /// argue (whose foreground count holds the argue's draws too) and alone
+    /// (theirs only); the card's drain-and-trims. Off, every opening runs
+    /// alone.
+    fn overlap_line(&self) -> String {
+        let beside = || self.groups.iter().filter(|g| g.overlapped);
+        let alone = || self.groups.iter().filter(|g| !g.overlapped);
+        let opened = beside().map(|g| g.encode + g.open).sum::<f64>();
+        let paid = beside().map(|g| g.open_paid).sum::<f64>();
+        let draws = |groups: &mut dyn Iterator<Item = &GroupStamps>| {
+            groups.fold((0u64, 0u64), |(f, b), g| {
+                (f + g.open_draws.0, b + g.open_draws.1)
+            })
+        };
+        let (beside_f, beside_b) = draws(&mut beside());
+        let (alone_f, alone_b) = draws(&mut alone());
+        let peak = self
+            .groups
+            .iter()
+            .map(|g| g.transition_reserved)
+            .max()
+            .unwrap_or(0);
+        format!(
+            "BLOCK PHASE-B OVERLAP: {} · transitions overlapped {} of {} (serial after a refusal {}) · openings beside an argue {opened:.3} s, hidden {:.3} s, paid {paid:.3} s + alone {:.3} s · argue {:.3} s · transition ledger peak max {} MiB (budget {} MiB) · openings' stream draws beside an argue background {beside_b} / foreground {beside_f} (the argue's too), alone background {alone_b} / foreground {alone_f} · trims {}\n",
+            if self.phase_b_overlap { "on" } else { "off" },
+            beside().count(),
+            self.groups.len().saturating_sub(1),
+            self.groups
+                .iter()
+                .filter(|g| g.serial_after_refusal)
+                .count(),
+            opened - paid,
+            alone().map(|g| g.open_paid).sum::<f64>(),
+            self.groups.iter().map(|g| g.argue).sum::<f64>(),
+            peak >> 20,
+            multilinear::gpu::reserve_budget() >> 20,
+            multilinear::gpu::device_trims(),
+        )
     }
 }
 
@@ -2596,6 +2702,8 @@ pub(crate) struct Deviations {
     /// Under the batched argue: a group argued with faults, or every group
     /// argued on the host ([`multilinear_block::ArgueDeviation`]).
     pub argue: multilinear_block::ArgueDeviation,
+    /// Faults in phase B's overlap ([`multilinear_block::OverlapFaults`]).
+    pub overlap_faults: multilinear_block::OverlapFaults,
     /// Between the phases, the first narrow table's width map made wrong, so
     /// phase B widens other words than were committed
     /// ([`BlockCommitted::fault_narrow_width_map`]).
@@ -3120,9 +3228,12 @@ pub(crate) fn prove_traces(
                 "W3_PROBE_FIRST_GROUPS orders a streamed prove's phase B only".into(),
             ));
         }
+        stamps.phase_b_overlap = options.phase_b_overlap;
         let (proof, argues, prepared_openings, groups) =
             multilinear_block::block_prove_on_forks::<_, _, _, H>(
-                block,
+                block
+                    .with_phase_b_overlap(phase_b_overlap(options))
+                    .with_overlap_faults(deviations.overlap_faults),
                 &config,
                 &mut transcript,
                 &openings,
@@ -5534,9 +5645,12 @@ fn prove_streamed(
         let phase_b_start = Instant::now();
         let phase_b_unix = stark::prove_split::epoch_secs();
         stamps.phase_b_order = order.clone();
+        stamps.phase_b_overlap = options.phase_b_overlap;
         let (proof, argues, prepared_openings, groups) =
             multilinear_block::block_prove_in_order::<_, _, _, H>(
-                block,
+                block
+                    .with_phase_b_overlap(phase_b_overlap(options))
+                    .with_overlap_faults(deviations.overlap_faults),
                 &config,
                 &mut transcript,
                 &openings,
