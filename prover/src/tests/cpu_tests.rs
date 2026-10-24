@@ -556,30 +556,7 @@ fn the_cpu_and_register_airs_expose_the_columns_the_verifier_checks() {
         executor::elf::Elf::load(&crate::test_utils::asm_elf_bytes("all_instructions_64"))
             .expect("the ELF loads");
     let heights = vec![16, 8, 4];
-    let counts = crate::TableCounts {
-        cpu: heights.len(),
-        lt: 0,
-        memw: 0,
-        memw_aligned: 0,
-        load: 0,
-        mul: 0,
-        dvrm: 0,
-        shift: 0,
-        branch: 0,
-        memw_register: 0,
-        eq: 0,
-        bytewise: 0,
-        store: 0,
-        cpu32: 0,
-        keccak: 0,
-        keccak_rnd: 0,
-        ecsm: 0,
-        ecdas: 0,
-        hint: 0,
-        copy: 0,
-        blake3: 0,
-        is_wh: 0,
-    };
+    let counts = cpu_only_counts(heights.len());
     let output = [7u8; 5];
     let inputs = crate::BlockAirInputs::new(&opts, &program, heights.clone(), &output)
         .expect("honest heights");
@@ -611,4 +588,73 @@ fn the_cpu_and_register_airs_expose_the_columns_the_verifier_checks() {
         register::preprocessed_columns(&init, &fini),
         "REGISTER: the verifier would check another FINI"
     );
+}
+
+/// A block's counts with `cpu` CPU tables and no other chunked or optional one.
+fn cpu_only_counts(cpu: usize) -> crate::TableCounts {
+    crate::TableCounts {
+        cpu,
+        lt: 0,
+        memw: 0,
+        memw_aligned: 0,
+        load: 0,
+        mul: 0,
+        dvrm: 0,
+        shift: 0,
+        branch: 0,
+        memw_register: 0,
+        eq: 0,
+        bytewise: 0,
+        store: 0,
+        cpu32: 0,
+        keccak: 0,
+        keccak_rnd: 0,
+        ecsm: 0,
+        ecdas: 0,
+        hint: 0,
+        copy: 0,
+        blake3: 0,
+        is_wh: 0,
+    }
+}
+
+/// ⛔ The block's REGISTER sends the final PC token at its own clock's end.
+///
+/// REGISTER's name is a label; what binds the final PC is the constant its bus
+/// interactions carry, `final_pc_timestamp(Σ CPU rows)`. Blocks of different CPU
+/// heights must each send their own, as the interactions built fresh at that
+/// timestamp do. A REGISTER built at another block's timestamp, or at 0, would
+/// let the run's last PC token land where the CPU tables do not end.
+#[test]
+fn the_block_register_sends_the_final_pc_token_at_its_clocks_end() {
+    use crate::tables::register;
+
+    let opts = stark::proof::options::ProofOptions::default_test_options();
+    let program = executor::elf::Elf::load(&crate::test_utils::asm_elf_bytes(
+        "all_instructions_64",
+    ))
+    .expect("the ELF loads");
+    let stale = messages_at_a_row(&register::bus_interactions(0));
+    let mut seen = Vec::new();
+    for heights in [vec![16, 8, 4], vec![1 << 21, 4]] {
+        let counts = cpu_only_counts(heights.len());
+        let inputs = crate::BlockAirInputs::new(&opts, &program, heights.clone(), &[])
+            .expect("honest heights");
+        let airs = crate::block_airs(&program, &opts, &[], &counts, &inputs);
+        let refs = airs.air_refs();
+        let register_air = refs
+            .iter()
+            .find(|air| air.name() == "REGISTER")
+            .expect("REGISTER is in the block");
+        let rows: u64 = heights.iter().map(|&h| h as u64).sum();
+        let sent = messages_at_a_row(register_air.bus_interactions());
+        assert_eq!(
+            sent,
+            messages_at_a_row(&register::bus_interactions(final_pc_timestamp(rows))),
+            "{heights:?}: REGISTER sends another final PC timestamp than its CPU tables end at"
+        );
+        assert_ne!(sent, stale, "{heights:?}: REGISTER sends the final PC token at 0");
+        seen.push(sent);
+    }
+    assert_ne!(seen[0], seen[1], "two blocks' REGISTERs send one final PC timestamp");
 }
