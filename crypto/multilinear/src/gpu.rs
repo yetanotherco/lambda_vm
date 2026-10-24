@@ -4397,6 +4397,8 @@ struct RecordsUp<'a> {
     decode: Option<std::sync::Arc<math_cuda::fill::CardDecode>>,
     logs: Vec<&'a [math_cuda::fill::LogC]>,
     registers: Vec<&'a [math_cuda::fill::RegRowC]>,
+    aligned: Vec<&'a [math_cuda::fill::AlignedRowC]>,
+    loads: Vec<&'a [math_cuda::fill::LoadOpC]>,
 }
 
 #[cfg(feature = "cuda")]
@@ -4404,8 +4406,8 @@ impl<'a> RecordsUp<'a> {
     /// `records`' pieces as the card's structs; `None` when a CPU table's
     /// DECODE rows cannot go up.
     fn of(records: &'a crate::records::Records) -> Option<Self> {
-        use crate::records::{CpuLog, RecordsFill, RegisterRow};
-        use math_cuda::fill::{LogC, RegRowC};
+        use crate::records::{AlignedRow, CpuLog, LoadOp, RecordsFill, RegisterRow};
+        use math_cuda::fill::{AlignedRowC, LoadOpC, LogC, RegRowC};
         const _: () = {
             use std::mem::{align_of, offset_of, size_of};
             assert!(size_of::<CpuLog>() == size_of::<LogC>());
@@ -4418,41 +4420,58 @@ impl<'a> RecordsUp<'a> {
             assert!(offset_of!(RegisterRow, address) == offset_of!(RegRowC, address));
             assert!(offset_of!(RegisterRow, is_read) == offset_of!(RegRowC, is_read));
             assert!(offset_of!(RegisterRow, pad) == offset_of!(RegRowC, pad));
+            assert!(size_of::<AlignedRow>() == size_of::<AlignedRowC>());
+            assert!(align_of::<AlignedRow>() == align_of::<AlignedRowC>());
+            assert!(offset_of!(AlignedRow, old) == offset_of!(AlignedRowC, old));
+            assert!(offset_of!(AlignedRow, width) == offset_of!(AlignedRowC, width));
+            assert!(offset_of!(AlignedRow, is_read) == offset_of!(AlignedRowC, is_read));
+            assert!(offset_of!(AlignedRow, is_register) == offset_of!(AlignedRowC, is_register));
+            assert!(size_of::<LoadOp>() == size_of::<LoadOpC>());
+            assert!(align_of::<LoadOp>() == align_of::<LoadOpC>());
+            assert!(offset_of!(LoadOp, width) == offset_of!(LoadOpC, width));
+            assert!(offset_of!(LoadOp, signed) == offset_of!(LoadOpC, is_signed));
+            assert!(offset_of!(LoadOp, res) == offset_of!(LoadOpC, res));
         };
+        /// `pieces` read as the card's struct `C`.
+        ///
+        /// SAFETY (the callers'): `R` and `C` are `#[repr(C)]` with the same
+        /// fields in the same order (asserted above), so the same size,
+        /// alignment and offsets.
+        unsafe fn cast<'p, R, C>(pieces: &[&'p [R]]) -> Vec<&'p [C]> {
+            pieces
+                .iter()
+                .map(|p| unsafe { core::slice::from_raw_parts(p.as_ptr() as *const C, p.len()) })
+                .collect()
+        }
         let fill = records.fill();
-        let (decode, logs, registers) = match &fill {
-            RecordsFill::KeccakRnd { .. } => (None, Vec::new(), Vec::new()),
-            RecordsFill::Cpu { logs, decode, .. } => (
-                Some(decode.on_card()?),
-                logs.iter()
-                    // SAFETY: both are `#[repr(C)]`, five `u64`s in the same
-                    // order (asserted above).
-                    .map(|p| unsafe {
-                        core::slice::from_raw_parts(p.as_ptr() as *const LogC, p.len())
-                    })
-                    .collect(),
-                Vec::new(),
-            ),
-            RecordsFill::MemwR { rows } => (
-                None,
-                Vec::new(),
-                rows.iter()
-                    // SAFETY: both are `#[repr(C)]` with the same fields in
-                    // the same order (asserted above).
-                    .map(|p| unsafe {
-                        core::slice::from_raw_parts(p.as_ptr() as *const RegRowC, p.len())
-                    })
-                    .collect(),
-            ),
-        };
-        Some(Self {
+        let mut up = Self {
             rows: records.rows(),
             cols: records.cols(),
-            fill,
-            decode,
-            logs,
-            registers,
-        })
+            fill: RecordsFill::KeccakRnd { ops: &[], skip: 0 },
+            decode: None,
+            logs: Vec::new(),
+            registers: Vec::new(),
+            aligned: Vec::new(),
+            loads: Vec::new(),
+        };
+        match &fill {
+            RecordsFill::KeccakRnd { .. } => {}
+            RecordsFill::Cpu { logs, decode, .. } => {
+                up.decode = Some(decode.on_card()?);
+                // SAFETY: five `u64`s in the same order (asserted above).
+                up.logs = unsafe { cast::<CpuLog, LogC>(logs) };
+            }
+            // SAFETY: the same fields in the same order (asserted above).
+            RecordsFill::MemwR { rows } => {
+                up.registers = unsafe { cast::<RegisterRow, RegRowC>(rows) }
+            }
+            RecordsFill::MemwA { rows } => {
+                up.aligned = unsafe { cast::<AlignedRow, AlignedRowC>(rows) }
+            }
+            RecordsFill::Load { ops } => up.loads = unsafe { cast::<LoadOp, LoadOpC>(ops) },
+        }
+        up.fill = fill;
+        Some(up)
     }
 }
 
@@ -4489,6 +4508,14 @@ fn records_input<'a>(up: &'a RecordsUp<'a>) -> Option<math_cuda::fill::RecordsIn
         },
         RecordsFill::MemwR { .. } => RecordsInput::MemwR {
             records: &up.registers,
+            rows: up.rows,
+        },
+        RecordsFill::MemwA { .. } => RecordsInput::MemwA {
+            records: &up.aligned,
+            rows: up.rows,
+        },
+        RecordsFill::Load { .. } => RecordsInput::Load {
+            records: &up.loads,
             rows: up.rows,
         },
     };

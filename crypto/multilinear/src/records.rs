@@ -97,6 +97,36 @@ pub struct RegisterRow {
     pub pad: u8,
 }
 
+/// One MEMW_A row as its fill reads it (the prover's aligned row, field for
+/// field): the base address, timestamp and shared old timestamp, the value
+/// and old value packed a word each (eight bytes for a memory access, the two
+/// 32-bit halves for a register access), the width, and flags 0 or 1.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AlignedRow {
+    pub base_address: u64,
+    pub timestamp: u64,
+    pub old_timestamp: u64,
+    pub value: u64,
+    pub old: u64,
+    pub width: u8,
+    pub is_read: u8,
+    pub is_register: u8,
+}
+
+/// One LOAD op as its fill reads it (the prover's load op, field for field):
+/// the base address, the timestamp, the width, whether it sign-extends (0 or
+/// 1) and the result's bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadOp {
+    pub base_address: u64,
+    pub timestamp: u64,
+    pub width: u8,
+    pub signed: u8,
+    pub res: [u8; 8],
+}
+
 /// One DECODE row as CPU's fill reads it: the pc, the extended immediate,
 /// then the decoded fields as bytes (flags 0 or 1).
 #[repr(C)]
@@ -146,6 +176,12 @@ const _: () = {
     assert!(offset_of!(DecodeRow, mem_flags) == 31);
     assert!(size_of::<DecodeRun>() == 16);
     assert!(offset_of!(DecodeRun, len) == 12);
+    assert!(size_of::<AlignedRow>() == 48);
+    assert!(offset_of!(AlignedRow, width) == 40);
+    assert!(offset_of!(AlignedRow, is_register) == 42);
+    assert!(size_of::<LoadOp>() == 32);
+    assert!(offset_of!(LoadOp, signed) == 17);
+    assert!(offset_of!(LoadOp, res) == 18);
 };
 
 /// A program's DECODE rows as CPU's fill reads them, shared by every CPU
@@ -281,6 +317,10 @@ pub enum RecordsFill<'a> {
     },
     /// MEMW_R's rows: the pieces in order, then zero rows.
     MemwR { rows: Vec<&'a [RegisterRow]> },
+    /// MEMW_A's rows: the pieces in order, then zero rows.
+    MemwA { rows: Vec<&'a [AlignedRow]> },
+    /// LOAD's rows: one an op of the pieces in order, then zero rows.
+    Load { ops: Vec<&'a [LoadOp]> },
 }
 
 impl RecordsFill<'_> {
@@ -291,6 +331,8 @@ impl RecordsFill<'_> {
             Self::KeccakRnd { ops, .. } => std::mem::size_of_val(*ops),
             Self::Cpu { logs, .. } => logs.iter().map(|p| std::mem::size_of_val(*p)).sum(),
             Self::MemwR { rows } => rows.iter().map(|p| std::mem::size_of_val(*p)).sum(),
+            Self::MemwA { rows } => rows.iter().map(|p| std::mem::size_of_val(*p)).sum(),
+            Self::Load { ops } => ops.iter().map(|p| std::mem::size_of_val(*p)).sum(),
         }
     }
 
@@ -300,6 +342,8 @@ impl RecordsFill<'_> {
             Self::KeccakRnd { ops, .. } => ops.len(),
             Self::Cpu { logs, .. } => logs.iter().map(|p| p.len()).sum(),
             Self::MemwR { rows } => rows.iter().map(|p| p.len()).sum(),
+            Self::MemwA { rows } => rows.iter().map(|p| p.len()).sum(),
+            Self::Load { ops } => ops.iter().map(|p| p.len()).sum(),
         }
     }
 
@@ -346,6 +390,31 @@ impl RecordsFill<'_> {
                             | u64::from(row.is_read) << 48
                             | u64::from(row.pad) << 56,
                     );
+                }
+            }
+            // The fields alone: these records end in padding.
+            Self::MemwA { rows } => {
+                each(3);
+                for row in rows.iter().flat_map(|piece| piece.iter()) {
+                    each(row.base_address);
+                    each(row.timestamp);
+                    each(row.old_timestamp);
+                    each(row.value);
+                    each(row.old);
+                    each(
+                        u64::from(row.width)
+                            | u64::from(row.is_read) << 8
+                            | u64::from(row.is_register) << 16,
+                    );
+                }
+            }
+            Self::Load { ops } => {
+                each(4);
+                for op in ops.iter().flat_map(|piece| piece.iter()) {
+                    each(op.base_address);
+                    each(op.timestamp);
+                    each(u64::from(op.width) | u64::from(op.signed) << 8);
+                    each(u64::from_le_bytes(op.res));
                 }
             }
         }
@@ -605,11 +674,13 @@ mod tests {
         assert!(DecodeRecords::new(entries, past).is_none());
     }
 
-    /// CPU or MEMW_R records in pieces.
+    /// CPU, MEMW_R, MEMW_A or LOAD records in pieces.
     #[derive(Debug)]
     enum Pieces {
         Cpu(Vec<Vec<CpuLog>>, u64, Arc<DecodeRecords>),
         MemwR(Vec<Vec<RegisterRow>>),
+        MemwA(Vec<Vec<AlignedRow>>),
+        Load(Vec<Vec<LoadOp>>),
     }
 
     impl TableRecords for Pieces {
@@ -621,6 +692,8 @@ mod tests {
             match self {
                 Self::Cpu(..) => 38,
                 Self::MemwR(_) => 10,
+                Self::MemwA(_) => 29,
+                Self::Load(_) => 18,
             }
         }
 
@@ -633,6 +706,12 @@ mod tests {
                 },
                 Self::MemwR(pieces) => RecordsFill::MemwR {
                     rows: pieces.iter().map(Vec::as_slice).collect(),
+                },
+                Self::MemwA(pieces) => RecordsFill::MemwA {
+                    rows: pieces.iter().map(Vec::as_slice).collect(),
+                },
+                Self::Load(pieces) => RecordsFill::Load {
+                    ops: pieces.iter().map(Vec::as_slice).collect(),
                 },
             }
         }
@@ -725,6 +804,74 @@ mod tests {
         }
     }
 
+    /// ★ A MEMW_A or LOAD table's digest reads every field of every row, in
+    /// order, whatever pieces they lie in: one bit moved in any field (each
+    /// result byte apart), or a row fewer, moves it.
+    #[test]
+    fn the_row_records_digest_reads_every_field_and_not_the_pieces() {
+        let aligned: Vec<AlignedRow> = (0..5u64)
+            .map(|i| AlignedRow {
+                base_address: 0x8000 + 8 * i,
+                timestamp: 4 * i + 8,
+                old_timestamp: 4 * i + 1,
+                value: i.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                old: !i,
+                width: 8,
+                is_read: (i % 2) as u8,
+                is_register: (i % 3 == 0) as u8,
+            })
+            .collect();
+        let memw_a = |pieces| Records(Arc::new(Pieces::MemwA(pieces))).digest();
+        let whole = memw_a(cut(&aligned, &[]));
+        assert_eq!(memw_a(cut(&aligned, &[2])), whole);
+        assert_eq!(memw_a(cut(&aligned, &[0, 1, 5])), whole);
+        assert_ne!(memw_a(cut(&aligned[..4], &[])), whole, "a row fewer");
+        for at in 0..aligned.len() {
+            for field in 0..8 {
+                let mut moved = aligned.clone();
+                let row = &mut moved[at];
+                match field {
+                    0 => row.base_address ^= 1 << 63,
+                    1 => row.timestamp ^= 1,
+                    2 => row.old_timestamp ^= 1 << 32,
+                    3 => row.value ^= 1 << (at % 64),
+                    4 => row.old ^= 1 << 63,
+                    5 => row.width ^= 0x80,
+                    6 => row.is_read ^= 1,
+                    _ => row.is_register ^= 1,
+                }
+                assert_ne!(memw_a(cut(&moved, &[3])), whole, "row {at}, field {field}");
+            }
+        }
+        let ops: Vec<LoadOp> = (0..5u64)
+            .map(|i| LoadOp {
+                base_address: 0x9000 + i,
+                timestamp: 4 * i + 8,
+                width: 1 << (i % 4),
+                signed: (i % 2) as u8,
+                res: (i * 0x0102_0304_0506_0708).to_le_bytes(),
+            })
+            .collect();
+        let load = |pieces| Records(Arc::new(Pieces::Load(pieces))).digest();
+        let whole = load(cut(&ops, &[]));
+        assert_eq!(load(cut(&ops, &[4])), whole);
+        assert_ne!(load(cut(&ops[1..], &[])), whole, "an op fewer");
+        for at in 0..ops.len() {
+            for field in 0..12 {
+                let mut moved = ops.clone();
+                let op = &mut moved[at];
+                match field {
+                    0 => op.base_address ^= 1 << 40,
+                    1 => op.timestamp ^= 1 << 63,
+                    2 => op.width ^= 0x80,
+                    3 => op.signed ^= 1,
+                    byte => op.res[byte - 4] ^= 1 << (byte % 8),
+                }
+                assert_ne!(load(cut(&moved, &[1])), whole, "op {at}, field {field}");
+            }
+        }
+    }
+
     /// A fill's bytes and count are its pieces' summed. (Two fills compare
     /// equal only when their pieces lie alike; their digests match however
     /// the pieces lie.)
@@ -745,5 +892,15 @@ mod tests {
         assert_eq!((memw_r.len(), memw_r.bytes()), (3, 96));
         assert!(!memw_r.is_empty());
         assert!(RecordsFill::MemwR { rows: Vec::new() }.is_empty());
+        let aligned = [AlignedRow::default(); 3];
+        let memw_a = RecordsFill::MemwA {
+            rows: vec![&aligned[..2], &aligned[2..]],
+        };
+        assert_eq!((memw_a.len(), memw_a.bytes()), (3, 144));
+        let ops = [LoadOp::default(); 5];
+        let load = RecordsFill::Load {
+            ops: vec![&ops[..1], &ops[1..3], &ops[3..]],
+        };
+        assert_eq!((load.len(), load.bytes()), (5, 160));
     }
 }
