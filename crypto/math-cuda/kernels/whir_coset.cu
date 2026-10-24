@@ -88,48 +88,54 @@ coset_fold_tiles(const uint64_t *__restrict__ f, uint64_t num_tiles, uint32_t le
     }
 
     const uint32_t tile = 1u << levels;
-    const uint64_t first = (uint64_t)blockIdx.x * COSET_TILES_PER_BLOCK;
-    for (uint32_t i = 0; i < COSET_TILES_PER_BLOCK; ++i) {
-        const uint64_t at = first + i;
-        if (at >= num_tiles) break;  // the same for every thread of the block
-        const uint64_t *src = f + at * tile;
-        // The previous tile's last level read buf0's partner; the barrier at
-        // that level's end ordered it before this write.
-        for (uint32_t x = tid; x < tile; x += bdim) buf0[x] = src[x];
-        __syncthreads();
-        uint64_t *in = buf0;
-        uint64_t *out = buf1;
-        uint32_t width = tile;
-        for (uint32_t t = 0; t < levels; ++t) {
-            const uint32_t cnt = s_count[t];
-            const uint32_t off = s_offset[t];
-            const uint32_t log_half = levels - 1 - t;
-            const uint32_t half = 1u << log_half;
-            const uint32_t outputs = cnt << log_half;
-            const bool last = t + 1 == levels;
-            for (uint32_t o = tid; o < outputs; o += bdim) {
-                const uint32_t k = o >> log_half;
-                const uint32_t j = o & (half - 1);
-                const uint64_t *row = in + (uint64_t)s_parent[off + k] * width + 2 * j;
-                const uint64_t r = coset_fold(row[0], row[1], s_gamma[off + k]);
-                if (last) {
-                    fin[(uint64_t)k * COSET_TILES_PER_BLOCK + i] = r;
-                } else {
-                    out[o] = r;
-                }
-            }
+    // A pass a group of tiles, the grid striding over the groups: one pass a
+    // block at the full grid, more under a cap.
+    for (uint64_t first = (uint64_t)blockIdx.x * COSET_TILES_PER_BLOCK; first < num_tiles;
+         first += (uint64_t)gridDim.x * COSET_TILES_PER_BLOCK) {
+        for (uint32_t i = 0; i < COSET_TILES_PER_BLOCK; ++i) {
+            const uint64_t at = first + i;
+            if (at >= num_tiles) break;  // the same for every thread of the block
+            const uint64_t *src = f + at * tile;
+            // The previous tile's last level read buf0's partner; the barrier at
+            // that level's end ordered it before this write.
+            for (uint32_t x = tid; x < tile; x += bdim) buf0[x] = src[x];
             __syncthreads();
-            uint64_t *swap = in;
-            in = out;
-            out = swap;
-            width = half;
+            uint64_t *in = buf0;
+            uint64_t *out = buf1;
+            uint32_t width = tile;
+            for (uint32_t t = 0; t < levels; ++t) {
+                const uint32_t cnt = s_count[t];
+                const uint32_t off = s_offset[t];
+                const uint32_t log_half = levels - 1 - t;
+                const uint32_t half = 1u << log_half;
+                const uint32_t outputs = cnt << log_half;
+                const bool last = t + 1 == levels;
+                for (uint32_t o = tid; o < outputs; o += bdim) {
+                    const uint32_t k = o >> log_half;
+                    const uint32_t j = o & (half - 1);
+                    const uint64_t *row = in + (uint64_t)s_parent[off + k] * width + 2 * j;
+                    const uint64_t r = coset_fold(row[0], row[1], s_gamma[off + k]);
+                    if (last) {
+                        fin[(uint64_t)k * COSET_TILES_PER_BLOCK + i] = r;
+                    } else {
+                        out[o] = r;
+                    }
+                }
+                __syncthreads();
+                uint64_t *swap = in;
+                in = out;
+                out = swap;
+                width = half;
+            }
         }
-    }
 
-    for (uint32_t x = tid; x < last_count * COSET_TILES_PER_BLOCK; x += bdim) {
-        const uint32_t k = x / COSET_TILES_PER_BLOCK;
-        const uint64_t at = first + x % COSET_TILES_PER_BLOCK;
-        if (at < num_tiles) slab[(uint64_t)k * num_tiles + at] = fin[x];
+        for (uint32_t x = tid; x < last_count * COSET_TILES_PER_BLOCK; x += bdim) {
+            const uint32_t k = x / COSET_TILES_PER_BLOCK;
+            const uint64_t at = first + x % COSET_TILES_PER_BLOCK;
+            if (at < num_tiles) slab[(uint64_t)k * num_tiles + at] = fin[x];
+        }
+        // The next pass's tiles write `fin` again.
+        __syncthreads();
     }
 }
 
@@ -144,19 +150,21 @@ coset_fold_rest(const uint64_t *__restrict__ slab, uint64_t num_tiles, uint32_t 
                 uint32_t cosets, const uint32_t *__restrict__ slab_of,
                 const uint64_t *__restrict__ rest_gamma, uint32_t log_free,
                 uint64_t *__restrict__ g) {
-    const uint64_t warp = ((uint64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const uint32_t lane = threadIdx.x & 31;
-    if (warp >= ((uint64_t)cosets << log_free)) return;  // whole warps only
-    const uint64_t q = warp >> log_free;
-    const uint64_t h = warp & ((1ull << log_free) - 1);
-    const uint64_t *src = slab + (uint64_t)slab_of[q] * num_tiles + (h << rest);
-    uint64_t v = lane < (1u << rest) ? src[lane] : 0;
-    for (uint32_t l = 0; l < rest; ++l) {
-        const uint64_t partner =
-            (uint64_t)__shfl_down_sync(0xffffffffu, (unsigned long long)v, 1u << l);
-        if ((lane & ((2u << l) - 1)) == 0) v = coset_fold(v, partner, rest_gamma[q * rest + l]);
+    // Whole warps stride over the values (blockDim a multiple of 32).
+    for (uint64_t warp = ((uint64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+         warp < ((uint64_t)cosets << log_free); warp += ((uint64_t)gridDim.x * blockDim.x) >> 5) {
+        const uint64_t q = warp >> log_free;
+        const uint64_t h = warp & ((1ull << log_free) - 1);
+        const uint64_t *src = slab + (uint64_t)slab_of[q] * num_tiles + (h << rest);
+        uint64_t v = lane < (1u << rest) ? src[lane] : 0;
+        for (uint32_t l = 0; l < rest; ++l) {
+            const uint64_t partner =
+                (uint64_t)__shfl_down_sync(0xffffffffu, (unsigned long long)v, 1u << l);
+            if ((lane & ((2u << l) - 1)) == 0) v = coset_fold(v, partner, rest_gamma[q * rest + l]);
+        }
+        if (lane == 0) g[warp] = v;
     }
-    if (lane == 0) g[warp] = v;
 }
 
 // One level of the Möbius transform over every coset's `2^log_size` values,

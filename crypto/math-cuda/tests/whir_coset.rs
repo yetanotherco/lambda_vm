@@ -13,7 +13,7 @@
 use std::time::Instant;
 
 use math_cuda::columns::DeviceColumns;
-use math_cuda::whir_coset::{CosetPlan, evaluate_resident};
+use math_cuda::whir_coset::{CosetPlan, StackSlices, coset_openings, evaluate_resident};
 
 const P: u64 = 0xFFFF_FFFF_0000_0001;
 /// Production geometry: blowup 4, first fold 6, 256 leaves under a kept node.
@@ -168,6 +168,57 @@ fn coset_blocks_at(log_blowup: usize, count: usize) {
         for &leaf in &leaves {
             let q = plan.block_of(leaf).expect("a block");
             assert!(plan.block_leaves(q).contains(&leaf));
+        }
+    }
+}
+
+/// ★ The long kernels' grids cut to 1, 3 or 85 blocks (`device::with_grid_cap`,
+/// as a background thread runs them beside latency-bound kernels): the same
+/// cosets, raw, as the full grid, and the same openings' subtrees and values.
+/// At blowups 4 and 2, `2^20` and `2^24`.
+#[test]
+fn coset_kernels_under_a_grid_cap_give_the_full_grids_words() {
+    use math_cuda::device::{grid_cap, with_grid_cap};
+    for (log_blowup, count) in [(LOG_BLOWUP, 114usize), (1, 229)] {
+        for (num_vars, seed) in [(20usize, 51u64), (24, 52)] {
+            let (store, parts, _) = stack(num_vars, seed);
+            let leaves = queries_at(num_vars, log_blowup, count, seed);
+            let plan = CosetPlan::new(num_vars, log_blowup, LOG_FOLD, KEPT, &leaves).expect("plan");
+            let slices =
+                StackSlices::from_resident(&store, &parts, num_vars, log_blowup).expect("slices");
+            let run = || {
+                let values = evaluate_resident(&store, &parts, &plan, None)
+                    .expect("cosets")
+                    .to_host()
+                    .expect("read back");
+                let opened =
+                    coset_openings(&slices, &plan, &leaves, math_cuda::DeviceHash::Poseidon1)
+                        .expect("openings");
+                (values, opened.nodes, opened.values)
+            };
+            assert_eq!(grid_cap(), None, "no cap outside with_grid_cap");
+            let full = run();
+            for cap in [1u32, 3, 85] {
+                let label = format!("n {num_vars} blowup 2^{log_blowup}, {cap} blocks");
+                let capped = with_grid_cap(Some(cap), || {
+                    assert_eq!(grid_cap(), Some(cap));
+                    run()
+                });
+                assert_eq!(grid_cap(), None, "{label}: the cap restored");
+                let raw = capped.0.iter().zip(&full.0).filter(|(x, y)| x != y).count();
+                println!(
+                    "COSET EVAL CAPPED n={num_vars} blowup_log={log_blowup} cap={cap} values_vs_full={raw} nodes_equal={} opened_equal={}",
+                    capped.1 == full.1,
+                    capped.2 == full.2
+                );
+                assert_eq!(
+                    (capped.0.len(), raw),
+                    (full.0.len(), 0),
+                    "{label}: the cosets differ from the full grid's"
+                );
+                assert!(capped.1 == full.1, "{label}: the subtrees' nodes differ");
+                assert_eq!(capped.2, full.2, "{label}: the queried values differ");
+            }
         }
     }
 }

@@ -527,6 +527,9 @@ fn evaluate_from(
     let levels_u32 = plan.tile_levels as u32;
     let total_u32 = plan.gammas.len() as u32;
     let buf_u32 = plan.buf_len as u32;
+    // The long kernels' grids are cut to the calling thread's cap, if any
+    // (`device::grid_cap`); each strides over its work, the same values.
+    let capped = crate::device::capped_grid;
     unsafe {
         stream
             .launch_builder(&m.fold_tiles)
@@ -541,7 +544,7 @@ fn evaluate_from(
             .arg(&buf_u32)
             .arg(&mut slab)
             .launch(LaunchConfig {
-                grid_dim: (tiles.div_ceil(TILES_PER_BLOCK) as u32, 1, 1),
+                grid_dim: (capped(tiles.div_ceil(TILES_PER_BLOCK) as u32), 1, 1),
                 block_dim: (BLOCK, 1, 1),
                 shared_mem_bytes: plan.tile_shared_bytes() as u32,
             })?;
@@ -578,7 +581,7 @@ fn evaluate_from(
             .arg(&log_len)
             .arg(&mut g)
             .launch(LaunchConfig {
-                grid_dim: ((warps * 32).div_ceil(BLOCK as u64) as u32, 1, 1),
+                grid_dim: (capped((warps * 32).div_ceil(BLOCK as u64) as u32), 1, 1),
                 block_dim: (BLOCK, 1, 1),
                 shared_mem_bytes: 0,
             })?;
@@ -911,6 +914,14 @@ mod tests {
             got.iter().map(|&v| canonical(v)).collect::<Vec<_>>(),
             "the kernels' emulation and the host algorithm"
         );
+        // The long kernels cut to 1, 2 or 7 blocks give the full grid's words.
+        for cap in [1, 2, 7] {
+            assert_eq!(
+                emulate::kernels_capped(&plan, &values, Some(cap)),
+                emulated,
+                "{cap} blocks a kernel"
+            );
+        }
         for (q, block) in got.chunks_exact(n).enumerate() {
             for (r, leaf) in plan.block_leaves(q).into_iter().enumerate() {
                 for t in 0..1usize << log_fold {
@@ -944,8 +955,19 @@ mod tests {
         use super::super::*;
 
         pub fn kernels(plan: &CosetPlan, values: &[u64]) -> Vec<u64> {
+            kernels_capped(plan, values, None)
+        }
+
+        /// [`kernels`] with the long kernels' grids cut to `cap` blocks
+        /// (`device::capped_grid`), each striding over its work.
+        pub fn kernels_capped(plan: &CosetPlan, values: &[u64], cap: Option<usize>) -> Vec<u64> {
             let len = plan.classes.len() * plan.coset_len();
-            kernels_into(plan, values, 0, len)
+            kernels_into(plan, values, 0, len, cap)
+        }
+
+        /// The blocks a capped launch takes: `full`, or `cap` (at least one).
+        fn grid_of(full: usize, cap: Option<usize>) -> usize {
+            cap.map_or(full, |c| full.min(c.max(1)))
         }
 
         /// [`kernels`] into the strided layout `coset_openings` hashes:
@@ -955,19 +977,25 @@ mod tests {
             let leaves = (plan.classes.len() << plan.kept).next_power_of_two().max(2);
             let block = 1usize << (plan.log_coset - plan.kept);
             (
-                kernels_into(plan, values, leaves as u64, leaves * block),
+                kernels_into(plan, values, leaves as u64, leaves * block, None),
                 leaves,
             )
         }
 
-        fn kernels_into(plan: &CosetPlan, values: &[u64], stride: u64, out_len: usize) -> Vec<u64> {
+        fn kernels_into(
+            plan: &CosetPlan,
+            values: &[u64],
+            stride: u64,
+            out_len: usize,
+            cap: Option<usize>,
+        ) -> Vec<u64> {
             let tiles = plan.tiles();
             let mut slab = vec![0u64; plan.slab_rows() * tiles];
-            fold_tiles(plan, values, &mut slab);
+            fold_tiles(plan, values, &mut slab, cap);
             let cosets = plan.classes.len();
             let len = plan.coset_len();
             let mut g = vec![0u64; cosets * len];
-            fold_rest(plan, &slab, &mut g);
+            fold_rest(plan, &slab, &mut g, cap);
             let cl = plan.chunk_levels();
             let pairs = cosets * len / 2;
             for level in cl..plan.log_coset {
@@ -982,7 +1010,7 @@ mod tests {
             out
         }
 
-        fn fold_tiles(plan: &CosetPlan, f: &[u64], slab: &mut [u64]) {
+        fn fold_tiles(plan: &CosetPlan, f: &[u64], slab: &mut [u64], cap: Option<usize>) {
             const TILES: usize = TILES_PER_BLOCK;
             let levels = plan.tile_levels;
             let num_tiles = plan.tiles();
@@ -993,92 +1021,95 @@ mod tests {
             let fin_at = total + 2 * buf_len;
             let parent_at_bytes = 8 * (fin_at + last_count * TILES);
             assert_eq!(parent_at_bytes + 4 * total, plan.tile_shared_bytes());
-            let grid = num_tiles.div_ceil(TILES);
+            let grid = grid_of(num_tiles.div_ceil(TILES), cap);
             for block in 0..grid {
+                // A block's shared memory, kept across its passes.
                 let mut bufs = [vec![0u64; buf_len], vec![0u64; buf_len]];
                 let mut fin = vec![0u64; last_count * TILES];
                 let tile = 1usize << levels;
-                let first = block * TILES;
-                for i in 0..TILES {
-                    let at = first + i;
-                    if at >= num_tiles {
-                        break;
-                    }
-                    bufs[0][..tile].copy_from_slice(&f[at * tile..(at + 1) * tile]);
-                    let (mut inp, mut out) = (0usize, 1usize);
-                    let mut width = tile;
-                    for t in 0..levels {
-                        let cnt = plan.level_count[t] as usize;
-                        let off = plan.level_offset[t] as usize;
-                        let log_half = levels - 1 - t;
-                        let half = 1usize << log_half;
-                        let outputs = cnt << log_half;
-                        let last = t + 1 == levels;
-                        let mut wrote = vec![0u64; buf_len];
-                        for o in 0..outputs {
-                            let k = o >> log_half;
-                            let j = o & (half - 1);
-                            let row = plan.parents[off + k] as usize * width + 2 * j;
-                            let r = fold(bufs[inp][row], bufs[inp][row + 1], plan.gammas[off + k]);
-                            if last {
-                                fin[k * TILES + i] = r;
-                            } else {
-                                wrote[o] = r;
+                for first in (block * TILES..num_tiles).step_by(grid * TILES) {
+                    for i in 0..TILES {
+                        let at = first + i;
+                        if at >= num_tiles {
+                            break;
+                        }
+                        bufs[0][..tile].copy_from_slice(&f[at * tile..(at + 1) * tile]);
+                        let (mut inp, mut out) = (0usize, 1usize);
+                        let mut width = tile;
+                        for t in 0..levels {
+                            let cnt = plan.level_count[t] as usize;
+                            let off = plan.level_offset[t] as usize;
+                            let log_half = levels - 1 - t;
+                            let half = 1usize << log_half;
+                            let outputs = cnt << log_half;
+                            let last = t + 1 == levels;
+                            let mut wrote = vec![0u64; buf_len];
+                            for o in 0..outputs {
+                                let k = o >> log_half;
+                                let j = o & (half - 1);
+                                let row = plan.parents[off + k] as usize * width + 2 * j;
+                                let r =
+                                    fold(bufs[inp][row], bufs[inp][row + 1], plan.gammas[off + k]);
+                                if last {
+                                    fin[k * TILES + i] = r;
+                                } else {
+                                    wrote[o] = r;
+                                }
                             }
+                            if !last {
+                                bufs[out][..outputs].copy_from_slice(&wrote[..outputs]);
+                            }
+                            std::mem::swap(&mut inp, &mut out);
+                            width = half;
                         }
-                        if !last {
-                            bufs[out][..outputs].copy_from_slice(&wrote[..outputs]);
-                        }
-                        std::mem::swap(&mut inp, &mut out);
-                        width = half;
                     }
-                }
-                for x in 0..last_count * TILES {
-                    let k = x / TILES;
-                    let at = first + x % TILES;
-                    if at < num_tiles {
-                        slab[k * num_tiles + at] = fin[x];
+                    for x in 0..last_count * TILES {
+                        let k = x / TILES;
+                        let at = first + x % TILES;
+                        if at < num_tiles {
+                            slab[k * num_tiles + at] = fin[x];
+                        }
                     }
                 }
             }
         }
 
-        fn fold_rest(plan: &CosetPlan, slab: &[u64], g: &mut [u64]) {
+        fn fold_rest(plan: &CosetPlan, slab: &[u64], g: &mut [u64], cap: Option<usize>) {
             let rest = plan.rest_levels;
             let num_tiles = plan.tiles();
             let log_free = plan.log_coset;
             let warps = plan.classes.len() << log_free;
-            let threads = (warps * 32).div_ceil(BLOCK as usize) * BLOCK as usize;
-            for warp in 0..threads / 32 {
-                if warp >= warps {
-                    continue;
-                }
-                let q = warp >> log_free;
-                let h = warp & ((1 << log_free) - 1);
-                let src = plan.slab_of[q] as usize * num_tiles + (h << rest);
-                let mut v: Vec<u64> = (0..32)
-                    .map(|lane| {
-                        if lane < 1 << rest {
-                            slab[src + lane]
-                        } else {
-                            0
-                        }
-                    })
-                    .collect();
-                for l in 0..rest {
-                    let snap = v.clone();
-                    for lane in 0..32 {
-                        let partner = if lane + (1 << l) < 32 {
-                            snap[lane + (1 << l)]
-                        } else {
-                            snap[lane]
-                        };
-                        if lane & ((2 << l) - 1) == 0 {
-                            v[lane] = fold(snap[lane], partner, plan.rest_gammas[q * rest + l]);
+            let threads = grid_of((warps * 32).div_ceil(BLOCK as usize), cap) * BLOCK as usize;
+            let launched = threads / 32;
+            for first in 0..launched {
+                for warp in (first..warps).step_by(launched) {
+                    let q = warp >> log_free;
+                    let h = warp & ((1 << log_free) - 1);
+                    let src = plan.slab_of[q] as usize * num_tiles + (h << rest);
+                    let mut v: Vec<u64> = (0..32)
+                        .map(|lane| {
+                            if lane < 1 << rest {
+                                slab[src + lane]
+                            } else {
+                                0
+                            }
+                        })
+                        .collect();
+                    for l in 0..rest {
+                        let snap = v.clone();
+                        for lane in 0..32 {
+                            let partner = if lane + (1 << l) < 32 {
+                                snap[lane + (1 << l)]
+                            } else {
+                                snap[lane]
+                            };
+                            if lane & ((2 << l) - 1) == 0 {
+                                v[lane] = fold(snap[lane], partner, plan.rest_gammas[q * rest + l]);
+                            }
                         }
                     }
+                    g[warp] = v[0];
                 }
-                g[warp] = v[0];
             }
         }
 
