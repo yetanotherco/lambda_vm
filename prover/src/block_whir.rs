@@ -522,9 +522,11 @@ pub struct BlockOptions {
     /// The proof's bytes are the same under every mode.
     pub regen: Option<regen::RegenMode>,
     /// Phase B opens each group on a thread of its own beside the next
-    /// group's argue ([`multilinear_block::PhaseBOverlap`]); the proof's bytes
-    /// are the same. Production: [`phase_b_overlap_from_env`], off by default.
-    pub phase_b_overlap: bool,
+    /// group's argue, and under `Pinned` the openings' thread reads back
+    /// through pinned staging ([`multilinear_block::PhaseBOverlap`]); the
+    /// proof's bytes are the same. Production: [`phase_b_overlap_from_env`],
+    /// off by default.
+    pub phase_b_overlap: multilinear_block::PhaseBOverlap,
 }
 
 /// When a block spills its held tables ([`BlockOptions::spill`]): the policy
@@ -1076,33 +1078,33 @@ impl BlockOptions {
 
 /// `LAMBDA_VM_PHASE_B_OVERLAP`: [`BlockOptions::phase_b_overlap`]'s
 /// production value, `1` on and `0` (or unset) off.
-pub(crate) fn phase_b_overlap_from_env() -> bool {
+pub(crate) fn phase_b_overlap_from_env() -> multilinear_block::PhaseBOverlap {
     phase_b_overlap_from(std::env::var("LAMBDA_VM_PHASE_B_OVERLAP").ok().as_deref())
 }
 
-/// [`phase_b_overlap_from_env`]'s reading of its variable: a word other than
-/// `0` or `1` is read as off, and said once.
-pub(crate) fn phase_b_overlap_from(value: Option<&str>) -> bool {
+/// [`phase_b_overlap_from_env`]'s reading of its variable: `1` is on,
+/// `pinned` on with the openings' read-backs through pinned staging; another
+/// word is read as off, and
+/// said once.
+pub(crate) fn phase_b_overlap_from(value: Option<&str>) -> multilinear_block::PhaseBOverlap {
+    use multilinear_block::PhaseBOverlap;
     match value.map(str::trim) {
-        None | Some("0") => false,
-        Some("1") => true,
+        None | Some("0") => PhaseBOverlap::Off,
+        Some("1") => PhaseBOverlap::On,
+        Some("pinned") => PhaseBOverlap::Pinned,
         Some(other) => {
             static SAID: std::sync::Once = std::sync::Once::new();
             SAID.call_once(|| {
-                eprintln!("LAMBDA_VM_PHASE_B_OVERLAP={other}: 0 or 1 — read as off");
+                eprintln!("LAMBDA_VM_PHASE_B_OVERLAP={other}: 0, 1 or pinned — read as off");
             });
-            false
+            PhaseBOverlap::Off
         }
     }
 }
 
 /// Phase B's overlap as [`BlockOptions::phase_b_overlap`] asks for it.
 fn phase_b_overlap(options: &BlockOptions) -> multilinear_block::PhaseBOverlap {
-    if options.phase_b_overlap {
-        multilinear_block::PhaseBOverlap::On
-    } else {
-        multilinear_block::PhaseBOverlap::Off
-    }
+    options.phase_b_overlap
 }
 
 /// `LAMBDA_VM_BLOCK_GPACK`: [`BlockOptions::gpack`]'s production value, on
@@ -1486,6 +1488,12 @@ pub struct BlockStamps {
     pub phase_b_order: Vec<usize>,
     /// Phase B ran with its overlap on ([`BlockOptions::phase_b_overlap`]).
     pub phase_b_overlap: bool,
+    /// Its openings' thread read back through pinned staging (`Pinned`).
+    pub phase_b_pinned: bool,
+    /// The openings' threads' read-backs during phase B, `(through pinned
+    /// staging, the stream's own way)`, and the bytes the pinned buffers held
+    /// at its end.
+    pub background_readbacks: (u64, u64, u64),
 }
 
 /// A streamed build's layout, for the readout ([`BlockStamps::layout`]).
@@ -1932,8 +1940,12 @@ impl BlockStamps {
             .max()
             .unwrap_or(0);
         format!(
-            "BLOCK PHASE-B OVERLAP: {} · transitions overlapped {} of {} (serial after a refusal {}) · openings beside an argue {opened:.3} s, hidden {:.3} s, paid {paid:.3} s + alone {:.3} s · argue {:.3} s · transition ledger peak max {} MiB (budget {} MiB) · openings' stream draws beside an argue background {beside_b} / foreground {beside_f} (the argue's too), alone background {alone_b} / foreground {alone_f} · trims {}\n",
-            if self.phase_b_overlap { "on" } else { "off" },
+            "BLOCK PHASE-B OVERLAP: {} · transitions overlapped {} of {} (serial after a refusal {}) · openings beside an argue {opened:.3} s, hidden {:.3} s, paid {paid:.3} s + alone {:.3} s · argue {:.3} s · transition ledger peak max {} MiB (budget {} MiB) · openings' stream draws beside an argue background {beside_b} / foreground {beside_f} (the argue's too), alone background {alone_b} / foreground {alone_f} · trims {}{}\n",
+            match (self.phase_b_overlap, self.phase_b_pinned) {
+                (_, true) => "pinned",
+                (true, false) => "on",
+                (false, false) => "off",
+            },
             beside().count(),
             self.groups.len().saturating_sub(1),
             self.groups
@@ -1946,6 +1958,15 @@ impl BlockStamps {
             peak >> 20,
             multilinear::gpu::reserve_budget() >> 20,
             multilinear::gpu::device_trims(),
+            if self.phase_b_overlap {
+                let (pinned, pageable, bytes) = self.background_readbacks;
+                format!(
+                    " · the openings' read-backs pinned {pinned} / pageable {pageable} ({:.1} MiB pinned)",
+                    bytes as f64 / (1u64 << 20) as f64
+                )
+            } else {
+                String::new()
+            },
         )
     }
 }
@@ -3230,7 +3251,9 @@ pub(crate) fn prove_traces(
                 "W3_PROBE_FIRST_GROUPS orders a streamed prove's phase B only".into(),
             ));
         }
-        stamps.phase_b_overlap = options.phase_b_overlap;
+        stamps.phase_b_overlap = options.phase_b_overlap != multilinear_block::PhaseBOverlap::Off;
+        stamps.phase_b_pinned = options.phase_b_overlap == multilinear_block::PhaseBOverlap::Pinned;
+        let readbacks_before = multilinear::gpu::background_readbacks();
         let (proof, argues, prepared_openings, groups) =
             multilinear_block::block_prove_on_forks::<_, _, _, H>(
                 block
@@ -3245,6 +3268,12 @@ pub(crate) fn prove_traces(
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
+        let readbacks_after = multilinear::gpu::background_readbacks();
+        stamps.background_readbacks = (
+            readbacks_after.0 - readbacks_before.0,
+            readbacks_after.1 - readbacks_before.1,
+            readbacks_after.2,
+        );
         let paths_after = multilinear::whir_commit::top_path_counts();
         stamps.top_paths = (
             paths_after.0 - paths_before.0,
@@ -5647,7 +5676,9 @@ fn prove_streamed(
         let phase_b_start = Instant::now();
         let phase_b_unix = stark::prove_split::epoch_secs();
         stamps.phase_b_order = order.clone();
-        stamps.phase_b_overlap = options.phase_b_overlap;
+        stamps.phase_b_overlap = options.phase_b_overlap != multilinear_block::PhaseBOverlap::Off;
+        stamps.phase_b_pinned = options.phase_b_overlap == multilinear_block::PhaseBOverlap::Pinned;
+        let readbacks_before = multilinear::gpu::background_readbacks();
         let (proof, argues, prepared_openings, groups) =
             multilinear_block::block_prove_in_order::<_, _, _, H>(
                 block
@@ -5665,6 +5696,12 @@ fn prove_streamed(
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
         stamps.phase_b_unix = Some((phase_b_unix, stark::prove_split::epoch_secs()));
+        let readbacks_after = multilinear::gpu::background_readbacks();
+        stamps.background_readbacks = (
+            readbacks_after.0 - readbacks_before.0,
+            readbacks_after.1 - readbacks_before.1,
+            readbacks_after.2,
+        );
         if let Some((drops, window_of, run, rest_window, rest_run)) = live {
             let recipes = recorder.map_or(0, |r| r.recipes().0.len());
             let mut lines = vec![regen::dropped_line(regen_mode, no_disk, &drops, recipes)];

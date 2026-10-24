@@ -1597,6 +1597,12 @@ pub enum PhaseBOverlap {
     /// transition in which the card refused a promise, the rest of phase B goes
     /// one group at a time.
     On,
+    /// As [`Self::On`], and the openings' thread reads back from the card
+    /// through a pinned buffer with a blocking-sync event wait
+    /// ([`multilinear::gpu::pinned_readbacks`]): its read-backs leave the
+    /// driver's pageable path, where the argument's waited on them. The
+    /// argument's own read-backs are unchanged.
+    Pinned,
 }
 
 /// How a test disturbs phase B's overlap ([`PhaseBOverlap::On`]): each failure
@@ -2991,7 +2997,10 @@ where
     // Under the overlap: the group argued last, whose openings run beside the
     // next group's argue; and whether a transition saw the card refuse a
     // promise, after which every group opens alone.
-    let overlapping = overlap == PhaseBOverlap::On;
+    let overlapping = overlap != PhaseBOverlap::Off;
+    // Under `Pinned`, the openings' thread (a background-class one) reads back
+    // through pinned staging; this thread, the argument's, does not.
+    let _pinned = (overlap == PhaseBOverlap::Pinned).then(multilinear::gpu::pinned_readbacks);
     let mut prev: Option<Argued<F, E, T>> = None;
     let mut latched = false;
     // The spilled tables read back in phase B's order, two groups' bytes ahead

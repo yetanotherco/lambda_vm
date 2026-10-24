@@ -1087,6 +1087,40 @@ pub fn background_streams() -> BackgroundStreams {
     BackgroundStreams
 }
 
+/// While it lives, every background-class thread ([`background_streams`])
+/// reads back from the card through a pinned buffer with a blocking-sync event
+/// wait ([`math_cuda::readback`]); nothing without a device.
+#[cfg(feature = "cuda")]
+pub struct PinnedReadbacks(#[allow(dead_code)] math_cuda::readback::PinnedReadbacks);
+
+#[cfg(not(feature = "cuda"))]
+pub struct PinnedReadbacks;
+
+/// Turns pinned read-backs on until the guard drops.
+#[cfg(feature = "cuda")]
+pub fn pinned_readbacks() -> PinnedReadbacks {
+    PinnedReadbacks(math_cuda::readback::pinned())
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn pinned_readbacks() -> PinnedReadbacks {
+    PinnedReadbacks
+}
+
+/// Background-class read-backs so far, `(pinned, pageable)`, and the bytes
+/// the pinned buffers hold now ([`math_cuda::readback`]); zeros without a
+/// device.
+#[cfg(feature = "cuda")]
+pub fn background_readbacks() -> (u64, u64, u64) {
+    let (pinned, pageable) = math_cuda::readback::background_copies();
+    (pinned, pageable, math_cuda::readback::pinned_bytes())
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn background_readbacks() -> (u64, u64, u64) {
+    (0, 0, 0)
+}
+
 /// Stream draws so far, `(foreground pool, background pool)`
 /// ([`math_cuda::stream_class::draws`]); `(0, 0)` without a device.
 #[cfg(feature = "cuda")]

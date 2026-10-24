@@ -80,7 +80,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         gpack: true,
         spill: crate::block_whir::BlockSpillPolicy::Off,
         regen: None,
-        phase_b_overlap: false,
+        phase_b_overlap: stark::multilinear_block::PhaseBOverlap::Off,
     }
 }
 

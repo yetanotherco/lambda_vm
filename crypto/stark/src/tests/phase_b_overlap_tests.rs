@@ -359,9 +359,10 @@ fn stamps(proved: &BlockProved<Fp, Ext>) -> &[GroupStamps] {
 
 /// ★ The overlap moves no byte: under either argue format, with each group's
 /// openings beside the next group's argue, the groups taken in order,
-/// reversed, or odd ones first, the proof is the one phase B proves one group
-/// at a time in group order — the bytes it proved before the overlap existed
-/// ([`BEFORE_THE_OVERLAP`]) — and it verifies. Every group but the last one
+/// reversed, or odd ones first, and with the openings' read-backs through
+/// pinned staging ([`PhaseBOverlap::Pinned`]), the proof is the one phase B
+/// proves one group at a time in group order — the bytes it proved before the
+/// overlap existed ([`BEFORE_THE_OVERLAP`]) — and it verifies. Every group but the last one
 /// taken opened beside an argue; the last opened alone.
 #[test]
 fn the_overlap_proves_the_bytes_of_one_group_at_a_time() {
@@ -378,12 +379,14 @@ fn the_overlap_proves_the_bytes_of_one_group_at_a_time() {
         let serial = serial.expect("one group at a time");
         assert_eq!(digest(&serial), before, "{argue:?}: one group at a time");
         verify(argue, &serial).expect("one group at a time verifies");
-        for (what, order) in [
-            ("in order", in_order()),
-            ("reversed", reversed.clone()),
-            ("odd first", odd_first.clone()),
+        for (what, order, overlap) in [
+            ("in order", in_order(), PhaseBOverlap::On),
+            ("reversed", reversed.clone(), PhaseBOverlap::On),
+            ("odd first", odd_first.clone(), PhaseBOverlap::On),
+            ("in order, pinned", in_order(), PhaseBOverlap::Pinned),
+            ("reversed, pinned", reversed.clone(), PhaseBOverlap::Pinned),
         ] {
-            let (proved, _) = prove(argue, PhaseBOverlap::On, &order, OverlapFaults::default());
+            let (proved, _) = prove(argue, overlap, &order, OverlapFaults::default());
             let proved = proved.unwrap_or_else(|e| panic!("{argue:?} {what}: {e:?}"));
             assert_eq!(
                 bytes(&proved),

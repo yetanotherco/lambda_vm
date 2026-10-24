@@ -74,7 +74,7 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         gpack: true,
         spill: crate::block_whir::BlockSpillPolicy::Off,
         regen: None,
-        phase_b_overlap: false,
+        phase_b_overlap: stark::multilinear_block::PhaseBOverlap::Off,
     }
 }
 
@@ -1610,30 +1610,32 @@ fn phase_b_in_any_order_proves_the_same_bytes() {
     use crate::block_whir::BlockSpillPolicy;
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
-    let proved =
-        |order: Option<fn(usize) -> Vec<usize>>, spill: BlockSpillPolicy, overlap: bool| {
-            let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-            o.spill = spill;
-            o.phase_b_overlap = overlap;
-            prove_block_whir_with(
-                &elf,
-                &[],
-                &ProofOptions::default_test_options(),
-                &format,
-                &o,
-                &Deviations {
-                    phase_b_order: order,
-                    ..Deviations::default()
-                },
-            )
-            .map(|(proof, _)| proof)
-        };
+    use stark::multilinear_block::PhaseBOverlap::{Off, On, Pinned};
+    let proved = |order: Option<fn(usize) -> Vec<usize>>,
+                  spill: BlockSpillPolicy,
+                  overlap: stark::multilinear_block::PhaseBOverlap| {
+        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+        o.spill = spill;
+        o.phase_b_overlap = overlap;
+        prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                phase_b_order: order,
+                ..Deviations::default()
+            },
+        )
+        .map(|(proof, _)| proof)
+    };
     let bytes = |p: &BlockWhirProof| {
         rkyv::to_bytes::<rkyv::rancor::Error>(p)
             .expect("serialize")
             .to_vec()
     };
-    let in_order = proved(None, BlockSpillPolicy::Off, false).expect("prove");
+    let in_order = proved(None, BlockSpillPolicy::Off, Off).expect("prove");
     assert!(
         in_order.groups.len() > 3,
         "{} groups",
@@ -1643,26 +1645,33 @@ fn phase_b_in_any_order_proves_the_same_bytes() {
     let odd_first: fn(usize) -> Vec<usize> =
         |n| (1..n).step_by(2).chain((0..n).step_by(2)).collect();
     for (what, order, spill, overlap) in [
-        ("reversed", Some(reversed), BlockSpillPolicy::Off, false),
-        ("odd first", Some(odd_first), BlockSpillPolicy::Off, false),
+        ("reversed", Some(reversed), BlockSpillPolicy::Off, Off),
+        ("odd first", Some(odd_first), BlockSpillPolicy::Off, Off),
         (
             "reversed, spilled",
             Some(reversed),
             BlockSpillPolicy::Always,
-            false,
+            Off,
         ),
-        ("in order, overlapped", None, BlockSpillPolicy::Off, true),
+        ("in order, overlapped", None, BlockSpillPolicy::Off, On),
         (
             "reversed, overlapped",
             Some(reversed),
             BlockSpillPolicy::Off,
-            true,
+            On,
         ),
         (
             "reversed, spilled, overlapped",
             Some(reversed),
             BlockSpillPolicy::Always,
-            true,
+            On,
+        ),
+        ("in order, pinned", None, BlockSpillPolicy::Off, Pinned),
+        (
+            "reversed, spilled, pinned",
+            Some(reversed),
+            BlockSpillPolicy::Always,
+            Pinned,
         ),
     ] {
         let proof = proved(order, spill, overlap).expect("prove");
@@ -1675,7 +1684,7 @@ fn phase_b_in_any_order_proves_the_same_bytes() {
     let twice: fn(usize) -> Vec<usize> = |n| std::iter::repeat_n(0, n).collect();
     let short: fn(usize) -> Vec<usize> = |n| (1..n).collect();
     for (what, order) in [("a group twice", twice), ("a group left out", short)] {
-        for overlap in [false, true] {
+        for overlap in [Off, On, Pinned] {
             assert!(
                 proved(Some(order), BlockSpillPolicy::Off, overlap).is_err(),
                 "{what}: proved"
@@ -1694,7 +1703,7 @@ fn phase_b_overlap_failures_are_the_proves_error_and_a_refusal_turns_it_serial()
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
     let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-    o.phase_b_overlap = true;
+    o.phase_b_overlap = stark::multilinear_block::PhaseBOverlap::On;
     let run = |faults: OverlapFaults| {
         prove_block_whir_with(
             &elf,
@@ -1775,16 +1784,22 @@ fn phase_b_overlap_failures_are_the_proves_error_and_a_refusal_turns_it_serial()
     assert!(report.contains(&counted), "{counted}\n{report}");
 }
 
-/// `LAMBDA_VM_PHASE_B_OVERLAP`: `1` on; unset, `0` or any other word off.
+/// `LAMBDA_VM_PHASE_B_OVERLAP`: `1` on, `pinned` on with the openings'
+/// read-backs through pinned staging; unset, `0` or any other word off.
 #[test]
 fn the_phase_b_overlap_knob_reads_one_as_on() {
     use crate::block_whir::phase_b_overlap_from;
-    assert!(!phase_b_overlap_from(None));
-    assert!(!phase_b_overlap_from(Some("0")));
-    assert!(phase_b_overlap_from(Some("1")));
-    assert!(phase_b_overlap_from(Some(" 1 ")));
-    assert!(!phase_b_overlap_from(Some("on")));
-    assert!(!phase_b_overlap_from(Some("2")));
+    use stark::multilinear_block::PhaseBOverlap::{Off, On, Pinned};
+    assert_eq!(phase_b_overlap_from(None), Off);
+    assert_eq!(phase_b_overlap_from(Some("0")), Off);
+    assert_eq!(phase_b_overlap_from(Some("1")), On);
+    assert_eq!(phase_b_overlap_from(Some(" 1 ")), On);
+    assert_eq!(phase_b_overlap_from(Some("pinned")), Pinned);
+    assert_eq!(phase_b_overlap_from(Some(" pinned ")), Pinned);
+    assert_eq!(phase_b_overlap_from(Some("on")), Off);
+    assert_eq!(phase_b_overlap_from(Some("Pinned")), Off);
+    assert_eq!(phase_b_overlap_from(Some("blocking")), Off);
+    assert_eq!(phase_b_overlap_from(Some("2")), Off);
 }
 
 /// The overlap's readout, on and off, from stamps alone: the per-group `paid`,
@@ -1850,9 +1865,33 @@ fn the_phase_b_overlap_readout_names_its_transitions() {
     assert!(
         on.contains(
             "openings' stream draws beside an argue background 12 / foreground 70 (the argue's \
-             too), alone background 0 / foreground 6 · trims 0\n"
+             too), alone background 0 / foreground 6 · trims 0 · "
         ),
         "{on}"
+    );
+    assert!(
+        on.contains(
+            "· trims 0 · the openings' read-backs pinned 0 / pageable 0 (0.0 MiB pinned)\n"
+        ),
+        "{on}"
+    );
+    let pinned = block_whir::BlockStamps {
+        groups: groups.clone(),
+        phase_b_overlap: true,
+        phase_b_pinned: true,
+        background_readbacks: (5887, 0, 3 << 20),
+        ..Default::default()
+    }
+    .report();
+    assert!(
+        pinned.contains("BLOCK PHASE-B OVERLAP: pinned · transitions overlapped 2 of 2"),
+        "{pinned}"
+    );
+    assert!(
+        pinned.contains(
+            "· trims 0 · the openings' read-backs pinned 5887 / pageable 0 (3.0 MiB pinned)\n"
+        ),
+        "{pinned}"
     );
     let off = block_whir::BlockStamps {
         groups,
@@ -1887,7 +1926,11 @@ fn phase_b_overlap_openings_draw_background_streams() {
     format.zf.whir_stack = StackVars::new(14).expect("a valid stack");
     let run = |overlap: bool| {
         let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-        o.phase_b_overlap = overlap;
+        o.phase_b_overlap = if overlap {
+            stark::multilinear_block::PhaseBOverlap::On
+        } else {
+            stark::multilinear_block::PhaseBOverlap::Off
+        };
         prove_block_whir_with(
             &elf,
             &[],
@@ -1928,6 +1971,66 @@ fn phase_b_overlap_openings_draw_background_streams() {
         }
     }
     assert!(compared > 0, "no overlapped group drew a stream");
+}
+
+/// ★ On a card, `pinned` sends every read-back of the openings' threads
+/// through pinned staging, none the stream's own way, and the proof is the
+/// overlap's own bytes and verifies. With the overlap on but not pinned, the
+/// openings read back the stream's own way and none takes the pinned path.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "box: needs a card"]
+fn pinned_openings_read_back_through_pinned_staging() {
+    use stark::multilinear_block::PhaseBOverlap::{On, Pinned};
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let mut format = many_groups();
+    // Codewords of 2^16 and more: the card's, not the host's.
+    format.zf.whir_stack = StackVars::new(14).expect("a valid stack");
+    let run = |overlap| {
+        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+        o.phase_b_overlap = overlap;
+        prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations::default(),
+        )
+        .expect("prove")
+    };
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let (on_proof, on) = run(On);
+    let (pinned_proof, pinned) = run(Pinned);
+    assert!(
+        pinned.groups.iter().any(|g| g.overlapped),
+        "no transition overlapped"
+    );
+    let (on_pinned, on_pageable, _) = on.background_readbacks;
+    assert!(
+        on_pinned == 0 && on_pageable > 0,
+        "on: the openings' read-backs {:?}",
+        on.background_readbacks
+    );
+    let (pinned_pinned, pinned_pageable, _) = pinned.background_readbacks;
+    assert!(
+        pinned_pinned > 0 && pinned_pageable == 0,
+        "pinned: the openings' read-backs {:?}",
+        pinned.background_readbacks
+    );
+    let report = pinned.report();
+    assert!(
+        report.contains("BLOCK PHASE-B OVERLAP: pinned ·"),
+        "{report}"
+    );
+    assert!(verify(&pinned_proof, &elf, &format), "pinned");
+    if crypto::grinding::deterministic() {
+        assert_eq!(bytes(&pinned_proof), bytes(&on_proof), "the proof");
+    }
 }
 
 /// A streamed prove under live regeneration `mode` and the spill `policy`,
