@@ -70,7 +70,7 @@ pub fn barycentric_base(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -127,7 +127,7 @@ pub fn barycentric_ext3(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -183,7 +183,7 @@ pub fn barycentric_base_on_device(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -286,7 +286,7 @@ pub fn barycentric_base_one_block_with_dev_inv_denoms(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -340,7 +340,7 @@ pub fn barycentric_ext3_on_device(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -429,7 +429,7 @@ pub fn barycentric_ext3_one_block_with_dev_inv_denoms(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -601,7 +601,7 @@ fn launch_multi(
             .arg(&mut out_dev)
             .launch(combine_cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -716,7 +716,7 @@ pub fn gather_rows_base_on_device(
             .arg(&mut out)
             .launch(cfg)?;
     }
-    let host = stream.clone_dtoh(&out)?;
+    let host = crate::readback::clone_dtoh(stream, &out)?;
     stream.synchronize()?;
     Ok(host)
 }
@@ -755,7 +755,7 @@ pub fn gather_rows_ext3_on_device(
             .arg(&mut out)
             .launch(cfg)?;
     }
-    let host = stream.clone_dtoh(&out)?;
+    let host = crate::readback::clone_dtoh(stream, &out)?;
     stream.synchronize()?;
     Ok(host)
 }

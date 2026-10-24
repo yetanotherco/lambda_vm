@@ -183,12 +183,10 @@ impl OpeningSession {
     /// The weight's and the message's live cube, `len` ext3 values each, read
     /// back — for the parity tests against the lean opening.
     pub fn tables_to_host(&self) -> Result<(Vec<u64>, Vec<u64>)> {
-        let weight = self
-            .stream
-            .clone_dtoh(&self.weight.slice(0..self.len * 3))?;
-        let message = self
-            .stream
-            .clone_dtoh(&self.message.slice(0..self.len * 3))?;
+        let weight =
+            crate::readback::clone_dtoh(&self.stream, &self.weight.slice(0..self.len * 3))?;
+        let message =
+            crate::readback::clone_dtoh(&self.stream, &self.message.slice(0..self.len * 3))?;
         self.stream.synchronize()?;
         Ok((weight, message))
     }
@@ -1245,7 +1243,7 @@ impl LeanRound0 {
                     shared_mem_bytes: LEAN_BLOCK * 3 * 8,
                 })?;
         }
-        let sums = self.stream.clone_dtoh(&self.sums.slice(0..num_t * 3))?;
+        let sums = crate::readback::clone_dtoh(&self.stream, &self.sums.slice(0..num_t * 3))?;
         self.stream.synchronize()?;
         Ok(sums)
     }
@@ -1296,7 +1294,7 @@ impl LeanRound0 {
                     shared_mem_bytes: LEAN_BLOCK * 3 * 8,
                 })?;
         }
-        let sums = self.stream.clone_dtoh(&self.sums.slice(0..num_t * 3))?;
+        let sums = crate::readback::clone_dtoh(&self.stream, &self.sums.slice(0..num_t * 3))?;
         self.stream.synchronize()?;
         Ok(sums)
     }
@@ -1418,7 +1416,7 @@ impl LeanRound0 {
         let be = backend()?;
         // The fault moves the weight's first entry for the comparison only.
         let kept = if TILE_CHECK_FAULT.load(Relaxed) {
-            let kept = self.stream.clone_dtoh(&weight.slice(0..3))?;
+            let kept = crate::readback::clone_dtoh(&self.stream, &weight.slice(0..3))?;
             self.stream.synchronize()?;
             let mut moved = kept.clone();
             moved[0] = moved[0].wrapping_add(1) % 0xFFFF_FFFF_0000_0001;
@@ -1457,7 +1455,7 @@ impl LeanRound0 {
                 .arg(&mut differing)
                 .launch(config)?;
         }
-        let count = self.stream.clone_dtoh(&differing)?;
+        let count = crate::readback::clone_dtoh(&self.stream, &differing)?;
         self.stream.synchronize()?;
         if let Some(kept) = kept {
             self.stream

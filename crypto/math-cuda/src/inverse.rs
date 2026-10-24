@@ -138,7 +138,7 @@ fn launch_invert_total(
     #[cfg(any(debug_assertions, feature = "test-faults"))]
     {
         let mut host = [0u64; 3];
-        stream.memcpy_dtoh(&out.slice(0..3), &mut host)?;
+        crate::readback::memcpy_dtoh(stream, &out.slice(0..3), &mut host)?;
         stream.synchronize()?;
         assert_ne!(
             host, [0u64; 3],
@@ -444,7 +444,7 @@ pub fn invert_denoms_rowwise_dev(
     #[cfg(any(debug_assertions, feature = "test-faults"))]
     {
         let mut host = [0u32; 1];
-        stream.memcpy_dtoh(&zero_flag, &mut host)?;
+        crate::readback::memcpy_dtoh(stream, &zero_flag, &mut host)?;
         stream.synchronize()?;
         assert_eq!(
             host[0], 0,

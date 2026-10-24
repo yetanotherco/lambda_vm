@@ -132,7 +132,7 @@ pub fn permute_many(variant: usize, states: &[u64]) -> Result<Vec<u64>> {
             .arg(&mut out)
             .launch(cfg(n))?;
     }
-    let host = stream.clone_dtoh(&out)?;
+    let host = crate::readback::clone_dtoh(&stream, &out)?;
     stream.synchronize()?;
     Ok(host)
 }
@@ -160,7 +160,7 @@ pub fn leaves_coset(variant: usize, codeword: &[u64], block: u64, ext3: bool) ->
             .arg(&mut out)
             .launch(cfg(num_leaves))?;
     }
-    let host = stream.clone_dtoh(&out)?;
+    let host = crate::readback::clone_dtoh(&stream, &out)?;
     stream.synchronize()?;
     Ok(host)
 }
@@ -181,7 +181,7 @@ pub fn merkle_level4(variant: usize, children: &[u64]) -> Result<Vec<u64>> {
             .arg(&n)
             .launch(cfg(n))?;
     }
-    let host = stream.clone_dtoh(&out)?;
+    let host = crate::readback::clone_dtoh(&stream, &out)?;
     stream.synchronize()?;
     Ok(host)
 }
@@ -213,7 +213,7 @@ pub fn grind(
                 shared_mem_bytes: 0,
             })?;
     }
-    let host = stream.clone_dtoh(&result)?;
+    let host = crate::readback::clone_dtoh(&stream, &result)?;
     stream.synchronize()?;
     Ok((host[0] != u64::MAX).then_some(host[0]))
 }
@@ -413,7 +413,7 @@ pub fn zisk_leaves_coset(codeword: &[u64], block: u64, ext3: bool) -> Result<Vec
             .arg(&mut out)
             .launch(cfg(num_leaves))?;
     }
-    let host = stream.clone_dtoh(&out)?;
+    let host = crate::readback::clone_dtoh(&stream, &out)?;
     stream.synchronize()?;
     Ok(host)
 }
@@ -451,7 +451,7 @@ pub fn zisk_leaves_rows(
             .arg(&mut out)
             .launch(cfg(num_leaves))?;
     }
-    let host = stream.clone_dtoh(&out)?;
+    let host = crate::readback::clone_dtoh(&stream, &out)?;
     stream.synchronize()?;
     Ok(host)
 }
@@ -472,7 +472,7 @@ pub fn w8_permute_many(variant: usize, states: &[u64]) -> Result<Vec<u64>> {
             .arg(&mut out)
             .launch(cfg(n))?;
     }
-    let host = stream.clone_dtoh(&out)?;
+    let host = crate::readback::clone_dtoh(&stream, &out)?;
     stream.synchronize()?;
     Ok(host)
 }
@@ -505,7 +505,7 @@ pub fn w8_grind(
                 shared_mem_bytes: 0,
             })?;
     }
-    let host = stream.clone_dtoh(&result)?;
+    let host = crate::readback::clone_dtoh(&stream, &result)?;
     stream.synchronize()?;
     Ok((host[0] != u64::MAX).then_some(host[0]))
 }

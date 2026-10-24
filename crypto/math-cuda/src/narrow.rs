@@ -159,7 +159,7 @@ pub fn widen_col_major_to_host(
         cols,
         &mut out.slice_mut(..),
     )?;
-    let words = stream.clone_dtoh(&out)?;
+    let words = crate::readback::clone_dtoh(&stream, &out)?;
     stream.synchronize()?;
     Ok(words)
 }
@@ -185,7 +185,7 @@ pub fn widen_to_host(
         cols,
         &mut out.slice_mut(..),
     )?;
-    let words = stream.clone_dtoh(&out)?;
+    let words = crate::readback::clone_dtoh(&stream, &out)?;
     stream.synchronize()?;
     Ok(words)
 }
@@ -248,7 +248,7 @@ pub(crate) fn pack_col_major_on_stream(
             .arg(&mut max_dev)
             .launch(cfg)?;
     }
-    let maxes = stream.clone_dtoh(&max_dev)?;
+    let maxes = crate::readback::clone_dtoh(stream, &max_dev)?;
     stream.synchronize()?;
     let widths: Vec<u8> = maxes.into_iter().map(width_of).collect();
     let mut offsets = Vec::with_capacity(cols);
@@ -276,7 +276,7 @@ pub(crate) fn pack_col_major_on_stream(
             .arg(&mut out)
             .launch(cfg)?;
     }
-    let data = stream.clone_dtoh(&out)?;
+    let data = crate::readback::clone_dtoh(stream, &out)?;
     stream.synchronize()?;
     Ok((widths, data))
 }

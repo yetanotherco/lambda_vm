@@ -975,7 +975,7 @@ impl DeviceCodeword {
     /// Every limb, read back — one per value for a base codeword, three for an
     /// extension one. For the parity tests; a chain only ever gathers cosets.
     pub fn to_host(&self) -> Result<Vec<u64>> {
-        let values = self.stream.clone_dtoh(self.buffer.as_ref())?;
+        let values = crate::readback::clone_dtoh(&self.stream, self.buffer.as_ref())?;
         self.stream.synchronize()?;
         Ok(values)
     }
@@ -990,7 +990,7 @@ impl DeviceCodeword {
     /// The first value, which is what the last fold leaves behind.
     pub fn first(&self) -> Result<[u64; 3]> {
         let limbs = if self.base { 1 } else { 3 };
-        let head = self.stream.clone_dtoh(&self.buffer.slice(0..limbs))?;
+        let head = crate::readback::clone_dtoh(&self.stream, &self.buffer.slice(0..limbs))?;
         self.stream.synchronize()?;
         Ok(if self.base {
             [head[0], 0, 0]
@@ -1434,7 +1434,7 @@ impl DeviceCodeword {
     /// second leaf-hash pass over the whole codeword ([`with_tree`](Self::with_tree)).
     pub fn commit(&self, log_folding: usize, hash: crate::DeviceHash) -> Result<[u8; 32]> {
         self.with_tree(log_folding, hash, |nodes, _| {
-            let head = self.stream.clone_dtoh(&nodes.slice(0..32))?;
+            let head = crate::readback::clone_dtoh(&self.stream, &nodes.slice(0..32))?;
             self.stream.synchronize()?;
             let mut root = [0u8; 32];
             root.copy_from_slice(&head);
@@ -1446,7 +1446,7 @@ impl DeviceCodeword {
     /// here needs, and what the parity test compares against.
     pub fn nodes_to_host(&self, log_folding: usize, hash: crate::DeviceHash) -> Result<Vec<u8>> {
         self.with_tree(log_folding, hash, |nodes, _| {
-            let out = self.stream.clone_dtoh(nodes)?;
+            let out = crate::readback::clone_dtoh(&self.stream, nodes)?;
             self.stream.synchronize()?;
             Ok(out)
         })
@@ -1476,7 +1476,7 @@ impl DeviceCodeword {
                     "{nodes} nodes are not whole top levels of a tree of {num_leaves} leaves"
                 );
             }
-            let out = self.stream.clone_dtoh(&tree.slice(0..nodes * 32))?;
+            let out = crate::readback::clone_dtoh(&self.stream, &tree.slice(0..nodes * 32))?;
             self.stream.synchronize()?;
             Ok(out)
         })
@@ -1536,7 +1536,7 @@ impl DeviceCodeword {
                 )
             };
             let paths = gather_paths(hash, nodes, num_leaves, positions, &self.stream)?;
-            let cap = self.stream.clone_dtoh(&nodes.slice(start..end))?;
+            let cap = crate::readback::clone_dtoh(&self.stream, &nodes.slice(start..end))?;
             self.stream.synchronize()?;
             Ok((paths, cap))
         })
@@ -1571,7 +1571,7 @@ impl DeviceCodeword {
                 .arg(&mut out)
                 .launch(LaunchConfig::for_num_elems(total as u32))?;
         }
-        let values = self.stream.clone_dtoh(&out)?;
+        let values = crate::readback::clone_dtoh(&self.stream, &out)?;
         self.stream.synchronize()?;
         Ok(values)
     }
@@ -1675,7 +1675,7 @@ impl DeviceCodeword {
             }
         }
         build_inner_tree_levels(self.stream.as_ref(), be, &mut nodes, leaves, hash)?;
-        let out = self.stream.clone_dtoh(&nodes)?;
+        let out = crate::readback::clone_dtoh(&self.stream, &nodes)?;
         self.stream.synchronize()?;
         Ok(out)
     }
@@ -2381,7 +2381,7 @@ pub fn commit_codeword_to_host(
     hash: crate::DeviceHash,
 ) -> Result<(Vec<u64>, Vec<u8>)> {
     let (codeword, _root) = commit_codeword(evals, log_blowup, log_folding, true, hash)?;
-    let values = codeword.stream.clone_dtoh(codeword.buffer.as_ref())?;
+    let values = crate::readback::clone_dtoh(&codeword.stream, codeword.buffer.as_ref())?;
     codeword.stream.synchronize()?;
     let nodes = codeword.nodes_to_host(log_folding, hash)?;
     Ok((values, nodes))
@@ -2454,7 +2454,7 @@ pub fn fold_codeword_base(
         current = next;
     }
 
-    let out = stream.clone_dtoh(&current)?;
+    let out = crate::readback::clone_dtoh(&stream, &current)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -2713,7 +2713,7 @@ pub fn fold_codeword_ext3(
         half /= 2;
     }
 
-    let out = stream.clone_dtoh(&current)?;
+    let out = crate::readback::clone_dtoh(&stream, &current)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -2767,7 +2767,7 @@ pub fn commit_codeword_ext3(
     }
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes, num_leaves, hash)?;
 
-    let out = stream.clone_dtoh(&nodes)?;
+    let out = crate::readback::clone_dtoh(&stream, &nodes)?;
     stream.synchronize()?;
     Ok(out)
 }

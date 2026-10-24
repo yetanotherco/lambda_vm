@@ -52,6 +52,7 @@ pub mod ntt;
 pub mod nvtx;
 pub mod p1_stark;
 pub mod p1w16;
+pub mod readback;
 pub mod round_slot;
 pub mod rpx;
 pub mod rpx_paths;
@@ -200,7 +201,7 @@ pub fn gl_neg_u64(a: &[u64]) -> Result<Vec<u64>> {
             .launch(cfg)?;
     }
 
-    let out = stream.clone_dtoh(&c_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &c_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -230,7 +231,7 @@ pub fn ext3_mul_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
             .arg(&n_u64)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&c_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &c_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -259,7 +260,7 @@ pub fn ext3_sub_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
             .arg(&n_u64)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&c_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &c_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -288,7 +289,7 @@ pub fn ext3_add_u64(a: &[u64], b: &[u64]) -> Result<Vec<u64>> {
             .arg(&n_u64)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&c_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &c_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -321,7 +322,7 @@ where
             .launch(cfg)?;
     }
 
-    let out = stream.clone_dtoh(&c_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &c_dev)?;
     stream.synchronize()?;
     Ok(out)
 }

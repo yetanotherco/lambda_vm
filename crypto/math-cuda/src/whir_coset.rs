@@ -445,7 +445,7 @@ impl CosetValues {
 
     /// Every block, read back.
     pub fn to_host(&self) -> Result<Vec<u64>> {
-        let values = self.stream.clone_dtoh(&self.buffer)?;
+        let values = crate::readback::clone_dtoh(&self.stream, &self.buffer)?;
         self.stream.synchronize()?;
         Ok(values)
     }
@@ -1038,7 +1038,7 @@ pub fn coset_openings(
         }
     }
     crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes, leaves, hash)?;
-    let nodes_host = stream.clone_dtoh(&nodes)?;
+    let nodes_host = crate::readback::clone_dtoh(&stream, &nodes)?;
 
     let index_dev = htod_or_trim(&stream, &at)?;
     // SAFETY: the gather writes every value it is sized for.
@@ -1059,7 +1059,7 @@ pub fn coset_openings(
                 .launch(LaunchConfig::for_num_elems((queried.len() * block) as u32))?;
         }
     }
-    let mut values_host = stream.clone_dtoh(&values)?;
+    let mut values_host = crate::readback::clone_dtoh(&stream, &values)?;
     stream.synchronize()?;
     values_host.truncate(queried.len() * block);
     Ok(CosetOpenings {

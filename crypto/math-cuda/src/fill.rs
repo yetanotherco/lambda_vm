@@ -388,7 +388,7 @@ pub fn fill_cpu_from_logs_into(
     }
     clock.done.record(stream)?;
     let times = clock.finish(size_of_val(logs))?;
-    let missing = stream.clone_dtoh(&missing)?;
+    let missing = crate::readback::clone_dtoh(stream, &missing)?;
     stream.synchronize()?;
     ensure_eq!(missing[0], 0, "every log's pc has a DECODE row");
     Ok(times)

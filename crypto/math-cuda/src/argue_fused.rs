@@ -301,7 +301,7 @@ impl<'f> FusedZerocheck<'f> {
 
     /// The `rows` sums a queued launch left, read back once the stream is idle.
     pub fn collect(&self, rows: usize) -> Result<Vec<u64>> {
-        let out = self.stream.clone_dtoh(&self.sums.slice(0..rows * 3))?;
+        let out = crate::readback::clone_dtoh(&self.stream, &self.sums.slice(0..rows * 3))?;
         self.stream.synchronize()?;
         Ok(out)
     }
@@ -397,7 +397,7 @@ impl<'f> FusedZerocheck<'f> {
                 })?;
         }
         let t = self.reduce(points.len(), grid)?;
-        let violation = self.stream.clone_dtoh(&self.violation)?;
+        let violation = crate::readback::clone_dtoh(&self.stream, &self.violation)?;
         self.stream.synchronize()?;
         Ok((t, (violation[0] != u64::MAX).then_some(violation[0])))
     }
@@ -609,7 +609,7 @@ impl<'f> FusedZerocheck<'f> {
                     shared_mem_bytes: 0,
                 })?;
         }
-        let flat = self.stream.clone_dtoh(&out)?;
+        let flat = crate::readback::clone_dtoh(&self.stream, &out)?;
         self.stream.synchronize()?;
         Ok(flat.chunks_exact(span).map(<[u64]>::to_vec).collect())
     }
@@ -618,9 +618,8 @@ impl<'f> FusedZerocheck<'f> {
     pub fn bus_values(&self) -> Result<Vec<u64>> {
         let q = self.rows / 4;
         let at = self.width * q * 3;
-        let out = self
-            .stream
-            .clone_dtoh(&self.folded.slice(at..at + self.len * 3))?;
+        let out =
+            crate::readback::clone_dtoh(&self.stream, &self.folded.slice(at..at + self.len * 3))?;
         self.stream.synchronize()?;
         Ok(out)
     }

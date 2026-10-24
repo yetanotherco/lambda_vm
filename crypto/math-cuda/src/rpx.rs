@@ -111,7 +111,7 @@ pub fn leaves_base(
         num_rows as u64,
         &mut out_dev.as_view_mut(),
     )?;
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -161,7 +161,7 @@ pub fn leaves_ext3(
         num_rows as u64,
         &mut out_dev.as_view_mut(),
     )?;
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -352,7 +352,7 @@ fn leaves_row_major_row_pair_inner(
             &mut out_dev.as_view_mut(),
         )?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -736,7 +736,7 @@ pub fn build_merkle_tree_on_device_with(hashed_leaves: &[u8], walk: TreeWalk) ->
 
     build_inner_tree_levels_with(stream.as_ref(), be, &mut nodes_dev, leaves_len, walk)?;
 
-    let out = stream.clone_dtoh(&nodes_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &nodes_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -803,7 +803,7 @@ pub fn build_comp_poly_tree_from_slabs_dev_rpl(
     }
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
     let mut root = [0u8; 32];
-    stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+    crate::readback::memcpy_dtoh(stream, &nodes_dev.slice(0..32), &mut root)?;
     stream.synchronize()?;
     Ok(crate::lde::GpuMerkleTree {
         nodes: Arc::new(nodes_dev),
@@ -914,7 +914,7 @@ pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
 
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
 
-    let out = stream.clone_dtoh(&nodes_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &nodes_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -946,7 +946,7 @@ pub fn permute_probe(states: &[[u64; STATE_FELTS]]) -> Result<Vec<[u64; STATE_FE
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let flat_out = stream.clone_dtoh(&out_dev)?;
+    let flat_out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(flat_out
         .chunks_exact(STATE_FELTS)
@@ -1066,7 +1066,7 @@ pub fn permute_warp_probe(states: &[[u64; STATE_FELTS]]) -> Result<Vec<[u64; STA
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let flat_out = stream.clone_dtoh(&out_dev)?;
+    let flat_out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(flat_out
         .chunks_exact(STATE_FELTS)
@@ -1117,7 +1117,7 @@ pub fn permute_chain_probe(
             .arg(&mut out_dev)
             .launch(rpx_launch_cfg(n_u64))?;
     }
-    let flat_out = stream.clone_dtoh(&out_dev)?;
+    let flat_out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(flat_out
         .chunks_exact(STATE_FELTS)
@@ -1239,7 +1239,7 @@ pub fn limb_probe(a: &[u64], b: &[u64]) -> Result<Vec<[u64; 3]>> {
             .arg(&mut out_dev)
             .launch(rpx_launch_cfg(n_u64))?;
     }
-    let flat = stream.clone_dtoh(&out_dev)?;
+    let flat = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(flat.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect())
 }

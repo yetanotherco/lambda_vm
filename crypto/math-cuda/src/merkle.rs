@@ -72,7 +72,7 @@ pub fn keccak_leaves_base(
         num_rows as u64,
         &mut out_dev.as_view_mut(),
     )?;
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -123,7 +123,7 @@ pub fn keccak_leaves_ext3(
         num_rows as u64,
         &mut out_dev.as_view_mut(),
     )?;
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -379,7 +379,7 @@ pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
         crate::DeviceHash::Keccak256,
     )?;
 
-    let out = stream.clone_dtoh(&nodes_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &nodes_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -487,7 +487,7 @@ pub fn read_cap_dev(
         nodes_dev.len()
     );
     let mut host = vec![0u8; end - start];
-    stream.memcpy_dtoh(&nodes_dev.slice(start..end), &mut host)?;
+    crate::readback::memcpy_dtoh(stream, &nodes_dev.slice(start..end), &mut host)?;
     stream.synchronize()?;
     Ok(host)
 }
@@ -654,7 +654,7 @@ pub fn build_comp_poly_tree_from_slabs_dev_rpl(
         crate::DeviceHash::Keccak256,
     )?;
     let mut root = [0u8; 32];
-    stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+    crate::readback::memcpy_dtoh(stream, &nodes_dev.slice(0..32), &mut root)?;
     stream.synchronize()?;
     Ok(crate::lde::GpuMerkleTree {
         nodes: Arc::new(nodes_dev),
@@ -685,7 +685,7 @@ pub fn build_comp_poly_tree_from_evals_ext3_keep_rpl(
     let (nodes_dev, num_leaves, stream) =
         build_comp_poly_tree_nodes_dev(parts_interleaved, rows_per_leaf)?;
     let mut root = [0u8; 32];
-    stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+    crate::readback::memcpy_dtoh(&stream, &nodes_dev.slice(0..32), &mut root)?;
     stream.synchronize()?;
     Ok(crate::lde::GpuMerkleTree {
         nodes: Arc::new(nodes_dev),
@@ -742,7 +742,7 @@ pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
         crate::DeviceHash::Keccak256,
     )?;
 
-    let out = stream.clone_dtoh(&nodes_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &nodes_dev)?;
     stream.synchronize()?;
     Ok(out)
 }

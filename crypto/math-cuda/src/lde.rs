@@ -1220,7 +1220,7 @@ fn coset_lde_row_major_inner_col_major(
     )?;
     build_inner_tree_levels_for(hash, stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
     let mut root = [0u8; 32];
-    stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+    crate::readback::memcpy_dtoh(&stream, &nodes_dev.slice(0..32), &mut root)?;
     let ready = be.take_event()?;
     ready.event().record(&stream)?;
     let tree = GpuMerkleTree {
@@ -1474,7 +1474,7 @@ pub fn row_major_leaves(
         rows_per_leaf,
         &mut out_dev.as_view_mut(),
     )?;
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -1581,7 +1581,7 @@ fn coset_lde_row_major_inner(
     // The Merkle tree stays resident on device; query openings gather paths
     // from it (see merkle::gather_merkle_paths_dev).
     let mut root = [0u8; 32];
-    stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+    crate::readback::memcpy_dtoh(&stream, &nodes_dev.slice(0..32), &mut root)?;
 
     // Transpose row-major buf into column-major for the handle, in place.
     // Downstream kernels (DEEP, barycentric) expect buf[c * lde_size + r].
@@ -1831,7 +1831,7 @@ fn download_precomputed_then<X>(
     let started = std::time::Instant::now();
     if !crate::device::tree_download_staged() {
         let mut bytes = vec![0u8; n_bytes];
-        stream.memcpy_dtoh(&nodes_dev, &mut bytes)?;
+        crate::readback::memcpy_dtoh(stream, &nodes_dev, &mut bytes)?;
         drop(nodes_dev);
         let took = started.elapsed();
         let x = then()?;
@@ -2004,7 +2004,7 @@ pub fn coset_lde_row_major_split_trees_rpl(
     let mult_tree = {
         let nodes_dev = mult_nodes_dev;
         let mut root = [0u8; 32];
-        stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+        crate::readback::memcpy_dtoh(&stream, &nodes_dev.slice(0..32), &mut root)?;
         GpuMerkleTree {
             nodes: Arc::new(nodes_dev),
             leaves_len: num_leaves,
@@ -2129,7 +2129,7 @@ fn coset_lde_row_major_split_trees_col_major(
     let mult_tree = {
         let nodes_dev = mult_nodes_dev;
         let mut root = [0u8; 32];
-        stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+        crate::readback::memcpy_dtoh(stream, &nodes_dev.slice(0..32), &mut root)?;
         GpuMerkleTree {
             nodes: Arc::new(nodes_dev),
             leaves_len: num_leaves,
@@ -2440,7 +2440,7 @@ pub fn coset_lde_base(evals: &[u64], blowup_factor: usize, weights: &[u64]) -> R
     }
     run_ntt_body(stream.as_ref(), &mut buf, fwd_tw.as_ref(), lde_u64, log_lde)?;
 
-    let out = stream.clone_dtoh(&buf)?;
+    let out = crate::readback::clone_dtoh(&stream, &buf)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -3737,7 +3737,7 @@ pub mod lde_bench {
         stream.synchronize()?;
         let inner_ms = ms(t2);
         let mut root = [0u8; 32];
-        stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+        crate::readback::memcpy_dtoh(&stream, &nodes_dev.slice(0..32), &mut root)?;
         drop(nodes_dev);
 
         let (mut stage_ms, mut lde_ms, mut transpose_ms) = (0.0, 0.0, 0.0);

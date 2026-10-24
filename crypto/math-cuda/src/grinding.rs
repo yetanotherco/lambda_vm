@@ -523,12 +523,12 @@ fn search_queue(
                     .ok()?,
             };
         }
-        let host = stream.clone_dtoh(&state_dev).ok()?;
+        let host = crate::readback::clone_dtoh(&stream, &state_dev).ok()?;
         stream.synchronize().ok()?;
         if host[0] != u64::MAX {
             let counts = match counts_dev.as_ref() {
                 Some(counts) => {
-                    let c = stream.clone_dtoh(counts).ok()?;
+                    let c = crate::readback::clone_dtoh(&stream, counts).ok()?;
                     stream.synchronize().ok()?;
                     c
                 }
@@ -613,7 +613,7 @@ fn search(arm: Arm, inner: &[u64; 4], grinding_factor: u8, knobs: Knobs) -> Opti
                 .launch(cfg)
                 .ok()?;
         }
-        let host = stream.clone_dtoh(&result_dev).ok()?;
+        let host = crate::readback::clone_dtoh(&stream, &result_dev).ok()?;
         stream.synchronize().ok()?;
         if host[0] != u64::MAX {
             return Some(host[0]);
@@ -735,10 +735,10 @@ pub fn search_counted(
                 .launch(cfg)
                 .ok()?;
         }
-        let host = stream.clone_dtoh(&result_dev).ok()?;
+        let host = crate::readback::clone_dtoh(&stream, &result_dev).ok()?;
         stream.synchronize().ok()?;
         if host[0] != u64::MAX {
-            let counts = stream.clone_dtoh(&counts_dev).ok()?;
+            let counts = crate::readback::clone_dtoh(&stream, &counts_dev).ok()?;
             stream.synchronize().ok()?;
             return Some(GrindCounts {
                 nonce: host[0],

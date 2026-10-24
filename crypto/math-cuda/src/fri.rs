@@ -305,8 +305,7 @@ impl FriCommitState {
         // This pageable copy drains the stream (including any evals DMA above),
         // so the pending wait after it is instant — one block covers both.
         let mut root = [0u8; 32];
-        self.stream
-            .memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+        crate::readback::memcpy_dtoh(&self.stream, &nodes_dev.slice(0..32), &mut root)?;
         let layer_evals = match pending {
             Some(p) => {
                 let mut v = vec![0u64; n_evals];
@@ -443,8 +442,7 @@ impl FriCommitState {
         };
         // The pageable root copy drains the stream, the evals DMA included.
         let mut root = [0u8; 32];
-        self.stream
-            .memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+        crate::readback::memcpy_dtoh(&self.stream, &nodes_dev.slice(0..32), &mut root)?;
         let layer_evals = match pending {
             Some(p) => {
                 let mut v = vec![0u64; n_evals];
@@ -472,7 +470,7 @@ impl FriCommitState {
         for &z in zeta_powers {
             self.fold_once(be, z)?;
         }
-        let out = self.stream.clone_dtoh(self.current.as_ref())?;
+        let out = crate::readback::clone_dtoh(&self.stream, self.current.as_ref())?;
         self.stream.synchronize()?;
         Ok(out)
     }
@@ -575,7 +573,7 @@ pub fn build_fri_group_tree_from_evals_ext3(
     let evals_dev = stream.clone_htod(evals)?;
     let nodes_dev =
         commit_group_leaves(&stream, be, hash, &evals_dev, num_leaves, 1u64 << group_log)?;
-    let out = stream.clone_dtoh(&nodes_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &nodes_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -619,7 +617,7 @@ pub fn gather_ext3_at(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }

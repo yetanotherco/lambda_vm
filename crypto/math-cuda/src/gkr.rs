@@ -290,8 +290,8 @@ impl DeviceFractionTree {
             .first()
             .or(self.input.as_ref())
             .expect("a tree has a top");
-        let p = self.stream.clone_dtoh(&top.p.slice(0..3))?;
-        let q = self.stream.clone_dtoh(&top.q.slice(0..3))?;
+        let p = crate::readback::clone_dtoh(&self.stream, &top.p.slice(0..3))?;
+        let q = crate::readback::clone_dtoh(&self.stream, &top.q.slice(0..3))?;
         self.stream.synchronize()?;
         Ok(([p[0], p[1], p[2]], [q[0], q[1], q[2]]))
     }
@@ -307,8 +307,8 @@ impl DeviceFractionTree {
         let level = self.layers.get(layer).ok_or(cudarc::driver::DriverError(
             cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
         ))?;
-        let p = self.stream.clone_dtoh(&level.p.slice(0..level.p.len()))?;
-        let q = self.stream.clone_dtoh(&level.q.slice(0..level.q.len()))?;
+        let p = crate::readback::clone_dtoh(&self.stream, &level.p.slice(0..level.p.len()))?;
+        let q = crate::readback::clone_dtoh(&self.stream, &level.q.slice(0..level.q.len()))?;
         self.stream.synchronize()?;
         Ok((p, q))
     }
@@ -753,9 +753,8 @@ impl GruenLayer {
     /// them, three u64 each.
     pub fn round_collect(&self, rows: u32) -> Result<Vec<u64>> {
         let today = || -> Result<Vec<u64>> {
-            let sums = self
-                .stream
-                .clone_dtoh(&self.sums.slice(0..rows as usize * 3))?;
+            let sums =
+                crate::readback::clone_dtoh(&self.stream, &self.sums.slice(0..rows as usize * 3))?;
             self.stream.synchronize()?;
             Ok(sums)
         };
@@ -812,7 +811,7 @@ impl GruenLayer {
                 shared_mem_bytes: 0,
             })?;
         }
-        let values = self.stream.clone_dtoh(&out)?;
+        let values = crate::readback::clone_dtoh(&self.stream, &out)?;
         self.stream.synchronize()?;
         Ok(values)
     }

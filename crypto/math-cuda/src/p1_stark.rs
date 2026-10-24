@@ -357,7 +357,7 @@ pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
         stream.memcpy_htod(hashed_leaves, &mut slice)?;
     }
     build_inner_tree_levels(stream.as_ref(), &mut nodes_dev, leaves_len)?;
-    let out = stream.clone_dtoh(&nodes_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &nodes_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -398,7 +398,7 @@ pub fn build_comp_poly_tree_from_slabs_dev_rpl(
     }
     build_inner_tree_levels(stream.as_ref(), &mut nodes_dev, num_leaves)?;
     let mut root = [0u8; 32];
-    stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+    crate::readback::memcpy_dtoh(stream, &nodes_dev.slice(0..32), &mut root)?;
     stream.synchronize()?;
     Ok(crate::lde::GpuMerkleTree {
         nodes: Arc::new(nodes_dev),
@@ -466,7 +466,7 @@ pub fn build_fri_tree_from_evals_ext3(evals: &[u64], group: usize) -> Result<Vec
         )?;
     }
     build_inner_tree_levels(stream.as_ref(), &mut nodes_dev, num_leaves)?;
-    let out = stream.clone_dtoh(&nodes_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &nodes_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -493,7 +493,7 @@ pub fn leaves_cols(
         rows_per_leaf,
         &mut out.as_view_mut(),
     )?;
-    let host = stream.clone_dtoh(&out)?;
+    let host = crate::readback::clone_dtoh(&stream, &out)?;
     stream.synchronize()?;
     Ok(host)
 }

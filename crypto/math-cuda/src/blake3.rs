@@ -118,7 +118,7 @@ pub fn leaves_base(
         num_rows as u64,
         &mut out_dev.as_view_mut(),
     )?;
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -168,7 +168,7 @@ pub fn leaves_ext3(
         num_rows as u64,
         &mut out_dev.as_view_mut(),
     )?;
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -364,7 +364,7 @@ fn leaves_row_major_row_pair_inner(
             &mut out_dev.as_view_mut(),
         )?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -584,7 +584,7 @@ pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
 
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, leaves_len)?;
 
-    let out = stream.clone_dtoh(&nodes_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &nodes_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -651,7 +651,7 @@ pub fn build_comp_poly_tree_from_slabs_dev_rpl(
     }
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
     let mut root = [0u8; 32];
-    stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+    crate::readback::memcpy_dtoh(stream, &nodes_dev.slice(0..32), &mut root)?;
     stream.synchronize()?;
     Ok(crate::lde::GpuMerkleTree {
         nodes: Arc::new(nodes_dev),
@@ -764,7 +764,7 @@ pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
 
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
 
-    let out = stream.clone_dtoh(&nodes_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &nodes_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -844,7 +844,7 @@ pub fn compress_probe(inputs: &[CompressInput], rounds: ProbeRounds) -> Result<V
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let flat = stream.clone_dtoh(&out_dev)?;
+    let flat = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(flat
         .chunks_exact(16)
@@ -877,7 +877,7 @@ pub fn device_rounds() -> Result<u32> {
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out[0])
 }
@@ -907,7 +907,7 @@ pub fn serialize_felts(vals: &[u64]) -> Result<Vec<u32>> {
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -951,7 +951,7 @@ pub fn chain_probe(words: &[u32]) -> Result<[u8; 32]> {
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     let mut digest = [0u8; 32];
     digest.copy_from_slice(&out);
@@ -989,7 +989,7 @@ pub fn blocks_of_felts(vals: &[u64]) -> Result<Vec<u32>> {
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &out_dev)?;
     stream.synchronize()?;
     Ok(out)
 }

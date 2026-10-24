@@ -225,7 +225,7 @@ impl DeviceColumns {
 
     /// Every column back on the host, in upload order: what a test compares.
     pub fn download(&self) -> Result<Vec<Vec<u64>>> {
-        let all = self.stream.clone_dtoh(&*self.buffer)?;
+        let all = crate::readback::clone_dtoh(&self.stream, &*self.buffer)?;
         self.stream.synchronize()?;
         Ok(self
             .spans

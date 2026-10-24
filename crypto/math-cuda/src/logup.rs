@@ -452,7 +452,8 @@ pub fn logup_aux_resident(
     let t_accum_done = std::time::Instant::now();
 
     // L = table_contribution = S[n-1] (sum of all term columns, all rows).
-    let l_host: Vec<u64> = stream.clone_dtoh(&row_sum.slice((num_rows - 1) * 3..num_rows * 3))?;
+    let l_host: Vec<u64> =
+        crate::readback::clone_dtoh(stream, &row_sum.slice((num_rows - 1) * 3..num_rows * 3))?;
     stream.synchronize()?;
     if timing {
         let t_end = std::time::Instant::now();

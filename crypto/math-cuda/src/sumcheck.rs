@@ -488,7 +488,7 @@ impl SumcheckSession {
     /// The answer of the round [`round_enqueue`](Self::round_enqueue) queued:
     /// three u64 per interpolation node, read back once the stream is idle.
     pub fn round_collect(&self, num_t: usize) -> Result<Vec<u64>> {
-        let sums = self.stream.clone_dtoh(&self.sums.slice(0..num_t * 3))?;
+        let sums = crate::readback::clone_dtoh(&self.stream, &self.sums.slice(0..num_t * 3))?;
         self.stream.synchronize()?;
         if crate::argue_probe::busy_probe_enabled() {
             BUSY_EVENTS.with(|cell| -> Result<()> {
@@ -623,7 +623,7 @@ impl SumcheckSession {
                     shared_mem_bytes: 0,
                 })?;
         }
-        let flat = self.stream.clone_dtoh(&out)?;
+        let flat = crate::readback::clone_dtoh(&self.stream, &out)?;
         self.stream.synchronize()?;
         Ok(flat.chunks_exact(span).map(<[u64]>::to_vec).collect())
     }
@@ -687,10 +687,10 @@ impl SumcheckSession {
         let mut out = Vec::with_capacity(self.width);
         for k in 0..self.width {
             let at = k * self.stride * 3;
-            out.push(
-                self.stream
-                    .clone_dtoh(&factors.slice(at..at + self.len * 3))?,
-            );
+            out.push(crate::readback::clone_dtoh(
+                &self.stream,
+                &factors.slice(at..at + self.len * 3),
+            )?);
         }
         self.stream.synchronize()?;
         Ok(out)
@@ -799,7 +799,7 @@ pub fn evaluate_mle_ext3(table: &[u64], point: &[u64]) -> Result<[u64; 3]> {
     let mut values = crate::device::htod_or_trim(&stream, table)?;
     let stride = 1u64 << vars;
     fold_to_one(&stream, be, &mut values, stride, point)?;
-    let out = stream.clone_dtoh(&values.slice(0..3))?;
+    let out = crate::readback::clone_dtoh(&stream, &values.slice(0..3))?;
     stream.synchronize()?;
     Ok([out[0], out[1], out[2]])
 }
@@ -831,7 +831,7 @@ pub fn evaluate_mle_base(table: &[u64], point: &[u64]) -> Result<[u64; 3]> {
     }
     drop(base);
     fold_to_one(&stream, be, &mut values, half as u64, &point[3..])?;
-    let out = stream.clone_dtoh(&values.slice(0..3))?;
+    let out = crate::readback::clone_dtoh(&stream, &values.slice(0..3))?;
     stream.synchronize()?;
     Ok([out[0], out[1], out[2]])
 }
@@ -1745,7 +1745,7 @@ pub fn evaluate_resident_ext3(
     );
     let be = backend()?;
     fold_to_one(stream, be, values, len as u64, point)?;
-    let out = stream.clone_dtoh(&values.slice(0..3))?;
+    let out = crate::readback::clone_dtoh(stream, &values.slice(0..3))?;
     stream.synchronize()?;
     Ok([out[0], out[1], out[2]])
 }

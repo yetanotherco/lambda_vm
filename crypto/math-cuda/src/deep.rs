@@ -392,7 +392,7 @@ fn into_fri_order(
 impl GpuDeepCodeword {
     /// The codeword on host (FRI order, ext3 interleaved), for parity tests.
     pub fn download(&self) -> Result<Vec<u64>> {
-        let out = self.stream.clone_dtoh(&self.buf)?;
+        let out = crate::readback::clone_dtoh(&self.stream, &self.buf)?;
         self.stream.synchronize()?;
         Ok(out)
     }
@@ -541,7 +541,7 @@ pub fn deep_composition_ext3_fused_keep(
     #[cfg(any(debug_assertions, feature = "test-faults"))]
     {
         let mut host = [0u32; 1];
-        stream.memcpy_dtoh(&zero_flag, &mut host)?;
+        crate::readback::memcpy_dtoh(stream, &zero_flag, &mut host)?;
         stream.synchronize()?;
         assert_eq!(host[0], 0, "fused DEEP: a zero denominator has no inverse");
     }

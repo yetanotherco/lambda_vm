@@ -114,7 +114,7 @@ fn ntt_inplace(input: &[u64], forward: bool) -> Result<Vec<u64>> {
         }
     }
 
-    let out = stream.clone_dtoh(&x_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &x_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
@@ -301,7 +301,7 @@ pub fn pointwise_mul(x: &[u64], w: &[u64]) -> Result<Vec<u64>> {
             .launch(LaunchConfig::for_num_elems(n as u32))?;
     }
 
-    let out = stream.clone_dtoh(&x_dev)?;
+    let out = crate::readback::clone_dtoh(&stream, &x_dev)?;
     stream.synchronize()?;
     Ok(out)
 }
