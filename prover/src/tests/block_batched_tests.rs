@@ -460,7 +460,8 @@ fn fixed_traces(
         &mut traces,
         keccak_rnd_log2,
         crate::tables::trace_builder::CutPadding::default(),
-    );
+    )
+    .expect("the split");
     (program, elf, traces)
 }
 

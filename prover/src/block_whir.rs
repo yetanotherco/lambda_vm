@@ -1922,6 +1922,26 @@ fn table_of_checked<'a>(
         .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))
 }
 
+/// The CPU tables' heights of a rest the finish built after a streamed walk. A
+/// CPU chunk the walk streamed is still a placeholder here, with no rows; its
+/// height is the streamed chunk's, `cpu_rows` (a streamed CPU chunk is always
+/// full, `MaxRowsConfig::cpu` rows), the height [`StreamAirs`] lays it out with.
+/// The finish puts the placeholders first; one after a built table is refused.
+fn rest_cpu_heights(traces: &Traces, cpu_rows: usize) -> Result<Vec<usize>, Error> {
+    let streamed = traces.cpus.iter().take_while(|t| t.num_rows() == 0).count();
+    if traces.cpus[streamed..].iter().any(|t| t.num_rows() == 0) {
+        return Err(Error::Prover(
+            "a streamed CPU chunk's placeholder after a built CPU table".to_string(),
+        ));
+    }
+    Ok(traces
+        .cpus
+        .iter()
+        .enumerate()
+        .map(|(k, t)| if k < streamed { cpu_rows } else { t.num_rows() })
+        .collect())
+}
+
 /// [`table_of`] for a trace the finish packed as it built it
 /// ([`BlockOptions::pack_finished`]): its packed columns become the table's,
 /// held narrow from the start, with no column of field elements made; the
@@ -2563,7 +2583,7 @@ fn prove_block_whir_inner(
 
     let t = Instant::now();
     let padding = CutPadding::from_env()?;
-    split_keccak_rnd(&mut traces, options.keccak_rnd_rows_log2, padding);
+    split_keccak_rnd(&mut traces, options.keccak_rnd_rows_log2, padding)?;
     split_ecdas(&mut traces, options.ecdas_rows_log2, padding);
     split_keccak(&mut traces, options.keccak_rows_log2, padding);
     split_ecsm(&mut traces, options.ecsm_rows_log2, padding);
@@ -2591,14 +2611,33 @@ fn prove_block_whir_inner(
 }
 
 /// Cuts every KECCAK_RND table into tables of at most `2^rows_log2` rows, as
-/// many as `padding` keeps ([`split_cut`]).
-pub(crate) fn split_keccak_rnd(traces: &mut Traces, rows_log2: usize, padding: CutPadding) {
+/// many as `padding` keeps ([`split_cut`]). A padding row sends
+/// `ARE_BYTES[0, 0]` (`keccak_rnd::ARE_BYTES_PER_ROW` times), and BITWISE
+/// counted those of the whole padded table, so the rows of the tables the cut
+/// leaves out (padding rows alone) are taken back off its multiplicity.
+pub(crate) fn split_keccak_rnd(
+    traces: &mut Traces,
+    rows_log2: usize,
+    padding: CutPadding,
+) -> Result<(), Error> {
     let rows = 1usize << rows_log2;
     let mu = crate::tables::keccak_rnd::cols::MU;
+    let before: usize = traces.keccak_rnds.iter().map(|t| t.num_rows()).sum();
     traces.keccak_rnds = std::mem::take(&mut traces.keccak_rnds)
         .into_iter()
         .flat_map(|table| split_cut(table, rows, mu, padding))
         .collect();
+    let after: usize = traces.keccak_rnds.iter().map(|t| t.num_rows()).sum();
+    let left_out = before - after;
+    crate::tables::bitwise::take_back_multiplicity(
+        &mut traces.bitwise,
+        crate::tables::bitwise::BitwiseOperation::byte_op(
+            crate::tables::bitwise::BitwiseOperationType::AreBytes,
+            0,
+            0,
+        ),
+        (left_out * crate::tables::keccak_rnd::ARE_BYTES_PER_ROW) as u64,
+    )
 }
 
 /// Cuts every ECDAS table into tables of at most `2^rows_log2` rows, as many
@@ -3602,6 +3641,7 @@ struct RestLaid<'a> {
 /// A reads none of them). `sink`: send each table to the packer as it is laid
 /// out, the first in AIR order first, and hand back none.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn lay_out_rest<'a>(
     mut traces: Box<Traces>,
     program: &Elf,
@@ -3613,6 +3653,7 @@ fn lay_out_rest<'a>(
     sink: Option<std::sync::mpsc::Sender<RestDone<'a>>>,
     budget: Option<usize>,
     ledger: Option<&memlog::Ledger>,
+    cpu_rows: usize,
 ) -> Result<RestLaid<'a>, Error> {
     let t = Instant::now();
     let at = || start.elapsed().as_secs_f64();
@@ -3629,7 +3670,7 @@ fn lay_out_rest<'a>(
     let inputs = BlockAirInputs::new(
         opts,
         program,
-        crate::cpu_heights_from_traces(&traces),
+        rest_cpu_heights(&traces, cpu_rows)?,
         &public_output,
     )?;
     let airs = run_airs
@@ -4602,7 +4643,7 @@ fn prove_streamed(
                 let finish_marks = crate::tables::trace_builder::build_stamps::take();
                 // The builder's own rule (it read the same variable).
                 let padding = CutPadding::from_env()?;
-                split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2, padding);
+                split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2, padding)?;
                 // Cut at the finish already, and held packed: a packed table
                 // has no rows for `split_rows` to copy.
                 if !options.finish_cuts {
@@ -4686,6 +4727,7 @@ fn prove_streamed(
                         sink,
                         options.rest_layout_bytes,
                         ledger,
+                        options.max_rows.cpu,
                     ),
                     RestIn::Stream(stream) => lay_out_rest_streamed(
                         stream,

@@ -280,7 +280,7 @@ fn the_kept_tree_depth_moves_no_byte_of_the_proof() {
         stark::storage_mode::StorageMode::Ram,
     )
     .expect("the traces build");
-    block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default());
+    block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default()).expect("the split");
     let mut proved = |drop_levels: usize| {
         let mut o = options(MaxRowsConfig::small(), 16);
         o.drop_levels = multilinear::whir_commit::TreeDrop::uniform(drop_levels);
@@ -340,7 +340,7 @@ fn narrow_storage_moves_no_byte_of_the_proof() {
         stark::storage_mode::StorageMode::Ram,
     )
     .expect("the traces build");
-    block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default());
+    block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default()).expect("the split");
     for argue in [ArgueFormat::PerTable, ArgueFormat::BATCHED] {
         let format = BlockFormat {
             argue,
@@ -416,7 +416,7 @@ fn uploading_ahead_moves_no_byte_of_the_proof() {
         stark::storage_mode::StorageMode::Ram,
     )
     .expect("the traces build");
-    block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default());
+    block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default()).expect("the split");
     for argue in [ArgueFormat::PerTable, ArgueFormat::BATCHED] {
         let format = BlockFormat {
             argue,
@@ -3332,7 +3332,7 @@ fn split_traces(
         stark::storage_mode::StorageMode::Ram,
     )
     .expect("the traces build");
-    block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default());
+    block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default()).expect("the split");
     cut(&mut traces);
     (program, elf, traces)
 }

@@ -199,6 +199,27 @@ impl NarrowColumns {
         (self.rows, self.widths, self.data)
     }
 
+    /// The word at `row` of column `c`.
+    pub fn get(&self, row: usize, c: usize) -> u64 {
+        let w = self.widths[c] as usize;
+        let at = self.offsets[c] as usize + row * w;
+        let mut word = [0u8; 8];
+        word[..w].copy_from_slice(&self.data[at..at + w]);
+        u64::from_le_bytes(word)
+    }
+
+    /// Writes `value` at `row` of column `c` when it fits the column's width;
+    /// `false` (nothing written) when it does not.
+    pub fn set(&mut self, row: usize, c: usize, value: u64) -> bool {
+        let w = self.widths[c] as usize;
+        if width_of(value) as usize > w {
+            return false;
+        }
+        let at = self.offsets[c] as usize + row * w;
+        self.data[at..at + w].copy_from_slice(&value.to_le_bytes()[..w]);
+        true
+    }
+
     /// Column `c`'s words.
     pub fn column(&self, c: usize) -> Vec<u64> {
         let w = self.widths[c] as usize;

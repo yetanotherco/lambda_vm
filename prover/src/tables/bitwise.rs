@@ -687,6 +687,44 @@ pub fn update_multiplicities(
     }
 }
 
+/// Takes `count` lookups of `op` back off the multiplicity columns: lookups the
+/// histogram counted for rows a later cut leaves out of the proof (KECCAK_RND's
+/// padding rows in the tables a block's split drops). The trace may be held
+/// packed. Refuses a count above the multiplicity it would take from.
+pub(crate) fn take_back_multiplicity(
+    trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    op: BitwiseOperation,
+    count: u64,
+) -> Result<(), crate::Error> {
+    if count == 0 {
+        return Ok(());
+    }
+    #[cfg(feature = "cuda")]
+    trace.clear_main_rowmajor_dev();
+    let row = row_index(op.x, op.y, op.z);
+    let col = mu_column(op.lookup_type);
+    let short = |have: u64| {
+        crate::Error::Prover(format!(
+            "BITWISE {:?}[{}, {}, {}] counts {have}, {count} cannot be taken back",
+            op.lookup_type, op.x, op.y, op.z
+        ))
+    };
+    if let Some(packed) = trace.narrow_main_mut() {
+        let have = packed.get(row, col);
+        if have < count || !packed.set(row, col, have - count) {
+            return Err(short(have));
+        }
+        return Ok(());
+    }
+    let current = trace.main_table.get_row(row)[col];
+    let have = current.canonical();
+    if have < count {
+        return Err(short(have));
+    }
+    trace.main_table.set_fe(row, col, current - FE::from(count));
+    Ok(())
+}
+
 /// Number of distinct BITWISE lookup types (one multiplicity column each).
 /// Derived from [`BitwiseOperationType::ALL`], which the compile-time guard
 /// below keeps in lockstep with [`lookup_type_index`].

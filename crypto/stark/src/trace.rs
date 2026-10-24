@@ -316,6 +316,12 @@ where
         self.narrow_main.as_ref()
     }
 
+    /// The packed main trace, to edit in place (a cell rewritten within its
+    /// column's width).
+    pub fn narrow_main_mut(&mut self) -> Option<&mut multilinear::narrow::NarrowColumns> {
+        self.narrow_main.as_mut()
+    }
+
     /// Takes the packed main trace out, leaving the table's shape.
     pub fn take_narrow_main(&mut self) -> Option<multilinear::narrow::NarrowColumns> {
         self.narrow_main.take()
