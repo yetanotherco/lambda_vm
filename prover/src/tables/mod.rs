@@ -60,6 +60,10 @@ pub mod trace_hash;
 /// The card fill's records, synthetic sets and host known-answer vectors.
 #[cfg(test)]
 mod card_fill_inputs;
+/// The card's table fills against the host's, word for word, and timed: a
+/// box test (`--ignored`), with a card.
+#[cfg(all(test, feature = "cuda", feature = "parallel"))]
+mod card_fill_tests;
 
 pub use types::BusId;
 

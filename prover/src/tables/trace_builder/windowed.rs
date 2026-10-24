@@ -2319,6 +2319,26 @@ impl ChunkJob {
     }
 }
 
+#[cfg(all(test, feature = "cuda", feature = "parallel"))]
+impl ChunkJob {
+    /// A CPU chunk's ops, window part by window part, and the decode they are
+    /// read with: what [`Self::generate_as`] fills it from.
+    pub(crate) fn cpu_parts(&self) -> Option<(Vec<&[super::CpuOperation]>, &DecodeTable)> {
+        match &self.ops {
+            ChunkOps::Cpu(ops, decode) => Some((ops.slices(), decode)),
+            _ => None,
+        }
+    }
+
+    /// A MEMW_R chunk's register rows, window part by window part.
+    pub(crate) fn register_rows(&self) -> Option<Vec<&[super::RegRow]>> {
+        match &self.ops {
+            ChunkOps::MemwRegister(ops) => Some(ops.slices()),
+            _ => None,
+        }
+    }
+}
+
 /// The walk's lists and the routing's segments as the whole-run
 /// [`collect_all_ops`](super::collect_all_ops) returns them, HALT finalization
 /// included (the run's end).
