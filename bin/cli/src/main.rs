@@ -381,10 +381,11 @@ enum Commands {
         #[arg(long, value_parser = ["per-poly", "indexed"], default_value = "indexed")]
         group: String,
 
-        /// The WHIR base code's blowup: 4 (production) or 2, its query count
-        /// from the code's own rule. A format choice: `verify-block` must be
-        /// given the same one; the proof file does not carry it.
-        #[arg(long, value_parser = ["4", "2"], default_value = "4")]
+        /// The WHIR base code's blowup: 2 (production) or 4 (the legacy rate),
+        /// its query count from the code's own rule. A format choice:
+        /// `verify-block` must be given the same one; the proof file does not
+        /// carry it.
+        #[arg(long, value_parser = ["2", "4"], default_value = "2")]
         blowup: String,
 
         /// Where the WHIR round-0 trees put their leaves: each query's coset
@@ -424,7 +425,7 @@ enum Commands {
 
         /// The WHIR blowup the block was proved with (`prove-block
         /// --blowup`): the verifier's constant, never read from the proof.
-        #[arg(long, value_parser = ["4", "2"], default_value = "4")]
+        #[arg(long, value_parser = ["2", "4"], default_value = "2")]
         blowup: String,
 
         /// The round-0 leaf order the block was proved with (`prove-block
@@ -2023,7 +2024,7 @@ mod tests {
         }
     }
 
-    /// Both block commands take the WHIR blowup, 4 unless told otherwise, and
+    /// Both block commands take the WHIR blowup, 2 unless told otherwise, and
     /// nothing but its two words; each word reads to the blowup it names.
     #[test]
     fn the_block_commands_take_the_blowup() {
@@ -2037,7 +2038,7 @@ mod tests {
                 }
                 _ => None,
             };
-            assert_eq!(blowup(cmd).as_deref(), Some("4"), "the default");
+            assert_eq!(blowup(cmd).as_deref(), Some("2"), "the default");
             for (word, want) in [
                 ("4", prover::zf_format::WhirBlowup::Four),
                 ("2", prover::zf_format::WhirBlowup::Two),

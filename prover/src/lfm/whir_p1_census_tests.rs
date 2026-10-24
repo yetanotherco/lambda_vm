@@ -1090,12 +1090,17 @@ fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
 /// still the sum), and every leaf the plan builds stays under every chip's
 /// height. One chain a polynomial reaches a height at seven heavy groups; one
 /// chain a run (the production opening) verifies fewer chains a group and
-/// takes more.
+/// takes more. At the single heights ([`LeafScale::Fixed`]): at the default
+/// blowup 2 the median mix takes enough leaves that the production scale
+/// doubles them, and the doubled partition is the next test's.
 #[test]
 fn the_p1_leaves_stay_under_their_heights_on_the_median_mix() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
     let opts = super::proof::block_base_options();
-    let format = p1_format();
+    let format = BlockFormat {
+        leaf_scale: LeafScale::Fixed,
+        ..p1_format()
+    };
     let owned = median_statement(&elf_bytes, &opts, &format);
     let plan = WhirBlockPlan::derive_with(
         &elf_bytes,

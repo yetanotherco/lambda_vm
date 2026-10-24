@@ -139,7 +139,7 @@ fn a_block_ground_at_18_bits_is_refused_by_a_verifier_at_20() {
             c20.num_queries,
             c20.grind.query
         ),
-        (114, 18, 112, 20)
+        (229, 18, 225, 20)
     );
     let elf = asm_elf_bytes("sub");
     let options = options(MaxRowsConfig::small(), 3);

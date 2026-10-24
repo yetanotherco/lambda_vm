@@ -174,7 +174,8 @@ fn the_current_guests_epoch_zero_stacks_as_the_box_printed() {
         .map(|l| l.num_polys() * l.n_stack().div_ceil(config.log_folding))
         .sum();
     assert_eq!(rounds, 28, "rounds 28");
-    assert_eq!(config.num_queries, 114, "Q 114");
+    // The default's blowup 2 at 27 variables (the box printed Q 114 at blowup 4).
+    assert_eq!(config.num_queries, 229, "Q 229");
 }
 
 /// The per-table half, from `bs2-table-costs-2026-09-19.log`: 34 tables'

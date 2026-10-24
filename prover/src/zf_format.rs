@@ -15,10 +15,10 @@
 //!
 //! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration:
 //! `cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27 whir_grind=query
-//! whir_grind_bits=18`, the block's round-0 trees in the coset order. Each lever was measured net
-//! positive on block runs before it became the default. Every knob keeps its OFF spelling
-//! (`cap=off`, `whir_cap=off`, `fri=pair`, `one_row=0`, `whir_folds=uniform4`, `whir_stack=25`,
-//! `whir_grind=all`, `whir_grind_bits=20`, `whir_blowup=4` — the WHIR blowup's default is its off —
+//! whir_grind_bits=18`, the WHIR base code at blowup 2, the block's round-0 trees in the coset order.
+//! Each lever was measured net positive on block runs before it became the default. Every knob keeps
+//! its OFF spelling (`cap=off`, `whir_cap=off`, `fri=pair`, `one_row=0`, `whir_folds=uniform4`,
+//! `whir_stack=25`, `whir_grind=all`, `whir_grind_bits=20`, `whir_blowup=4`,
 //! `whir_leaves=natural`), so setting all ten to off reproduces [`ZfFormat::LEGACY`] — the format
 //! before any lever, byte for byte — for rollback and for A/B arms. The crypto crates' own defaults
 //! (`stark::proof::options::ProofFormat::DEFAULT`,
@@ -53,7 +53,7 @@
 //! **The banner prints on every setting, including the default**:
 //! `ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27 whir_grind=query
 //! whir_grind_bits=18`. Its absence in a log is then a fact about the run, not an ambiguity. The WHIR blowup
-//! and the leaf order are the two words printed only off their defaults (` whir_blowup=2`,
+//! and the leaf order are the two words printed only off their defaults (` whir_blowup=4`,
 //! ` whir_leaves=natural`).
 
 use std::sync::OnceLock;
@@ -90,11 +90,15 @@ pub const ENV_WHIR_LEAVES: &str = "LAMBDA_VM_ZF_WHIR_LEAVES";
 pub const PRODUCTION_WHIR_LOG_FOLDING: usize = 4;
 
 /// The WHIR chains' `log2` inverse rate at the default
-/// ([`ZfFormat::whir_blowup`], `multilinear_prove::chain_config_under`): blowup 4.
-pub const PRODUCTION_WHIR_LOG_BLOWUP: usize = 2;
+/// ([`ZfFormat::whir_blowup`], `multilinear_prove::chain_config_under`): blowup 2.
+pub const PRODUCTION_WHIR_LOG_BLOWUP: usize = 1;
 
-/// The WHIR base code blowups `LAMBDA_VM_ZF_WHIR_BLOWUP` accepts: 4 (the default, today's
-/// format) and 2. The query count follows from the rate by the code's own rule
+/// The WHIR chains' `log2` inverse rate in the legacy format: blowup 4, the
+/// widest the knob accepts and the default's rollback (`LAMBDA_VM_ZF_WHIR_BLOWUP=4`).
+pub const LEGACY_WHIR_LOG_BLOWUP: usize = 2;
+
+/// The WHIR base code blowups `LAMBDA_VM_ZF_WHIR_BLOWUP` accepts: 4 (the legacy
+/// format, the default's rollback) and 2 (the default). The query count follows from the rate by the code's own rule
 /// (`multilinear::query_count::num_queries`): at the default fold schedule and
 /// 18 query-grind bits, blowup 2 charges Q 229 at every stack of 23 variables or
 /// more (seven rounds) and 228 below (five), where blowup 4 charges 114. Every
@@ -110,9 +114,9 @@ pub const WHIR_BLOWUPS: [u8; 2] = [4, 2];
 /// among [`WHIR_BLOWUPS`] and nothing else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WhirBlowup {
-    /// Blowup 4, rate 1/4: the default and the legacy format.
+    /// Blowup 4, rate 1/4: the legacy format, the default's rollback.
     Four,
-    /// Blowup 2, rate 1/2.
+    /// Blowup 2, rate 1/2: the default.
     Two,
 }
 
@@ -135,14 +139,16 @@ impl std::fmt::Display for WhirBlowup {
 // A grouped chain is today's chain at `n + m` variables over
 // `H_{n+m+lb}`, which exists only within the field's two-adicity: at the widest
 // stack, the widest accepted blowup and the widest index, it must.
-// The production blowup is the widest the knob accepts.
+// The legacy blowup is the widest the knob accepts, the production one the other.
 const _: () = assert!(
-    WHIR_BLOWUPS[0] == 1 << PRODUCTION_WHIR_LOG_BLOWUP && WHIR_BLOWUPS[1] < WHIR_BLOWUPS[0]
+    WHIR_BLOWUPS[0] == 1 << LEGACY_WHIR_LOG_BLOWUP
+        && WHIR_BLOWUPS[1] == 1 << PRODUCTION_WHIR_LOG_BLOWUP
+        && WHIR_BLOWUPS[1] < WHIR_BLOWUPS[0]
 );
 // `multilinear::stacked_eval` refuses any other config at run time.
 const _: () = assert!(
     multilinear::whir_chain::StackVars::WIDEST
-        + PRODUCTION_WHIR_LOG_BLOWUP
+        + LEGACY_WHIR_LOG_BLOWUP
         + multilinear::whir_chain::MAX_INDEX_VARS
         <= <math::field::goldilocks::GoldilocksField as math::field::traits::IsFFTField>::TWO_ADICITY
             as usize
@@ -195,7 +201,7 @@ pub struct ZfFormat {
     /// How many bits each of those grinds spends.
     pub whir_grind_bits: u8,
     /// The WHIR base code's blowup, one of [`WHIR_BLOWUPS`]: every base chain's
-    /// codeword is this many times its polynomial. 4 at the default and in the
+    /// codeword is this many times its polynomial. 2 at the default, 4 in the
     /// legacy format.
     pub whir_blowup: u8,
     /// Where the WHIR round-0 trees put their leaves ([`ENV_WHIR_LEAVES`]).
@@ -309,9 +315,12 @@ impl ZfFormat {
     /// conjectured (Johnson) minimum stays 130.393 bits per polynomial (128.393
     /// under `GroupFold::Indexed`), at the unground fold (WHIR block base −0.90
     /// s, FAST 320). `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20` is its rollback.
-    /// `whir_blowup` stays 4, the legacy rate: blowup 2
-    /// (`LAMBDA_VM_ZF_WHIR_BLOWUP=2`, [`WHIR_BLOWUPS`]) is opt-in and has not
-    /// been measured as a default. `whir_leaves` is the coset order: the block's
+    /// `whir_blowup` is 2: the base code at rate 1/2, Q 229 (228 below 23
+    /// variables) at the same conjectured 128 bits, the base proof x1.78. It
+    /// halves the card's commit and costs recursion leaves; measured faster once
+    /// the host stopped binding the commit phase (KECCAK_RND filled on the card:
+    /// whole block -2.46 s median, -1.94 s large). `LAMBDA_VM_ZF_WHIR_BLOWUP=4` is
+    /// its rollback. `whir_leaves` is the coset order: the block's
     /// round-0 trees put each query's coset together, so a revived group's
     /// openings are evaluated from its stack instead of re-encoding it
     /// (`LAMBDA_VM_ZF_WHIR_LEAVES=natural` is its rollback). It moves the block's
@@ -342,7 +351,7 @@ impl ZfFormat {
         whir_stack: StackVars::LEGACY,
         whir_grind: WhirGrind::All,
         whir_grind_bits: LEGACY_WHIR_GRIND_BITS,
-        whir_blowup: 1 << PRODUCTION_WHIR_LOG_BLOWUP,
+        whir_blowup: 1 << LEGACY_WHIR_LOG_BLOWUP,
         base: crate::hash_pin::BLOCK_BASE,
         whir_leaves: LeafOrder::Natural,
     };
@@ -365,7 +374,7 @@ impl ZfFormat {
             && self.whir_stack == StackVars::LEGACY
             && self.whir_grind == WhirGrind::All
             && self.whir_grind_bits == LEGACY_WHIR_GRIND_BITS
-            && self.whir_blowup == 1 << PRODUCTION_WHIR_LOG_BLOWUP
+            && self.whir_blowup == 1 << LEGACY_WHIR_LOG_BLOWUP
             && self.whir_leaves == LeafOrder::Natural
             && self.base == crate::hash_pin::BLOCK_BASE
     }
@@ -808,7 +817,7 @@ mod tests {
                 whir_stack: StackVars::new(27).unwrap(),
                 whir_grind: WhirGrind::Query,
                 whir_grind_bits: 18,
-                whir_blowup: 4,
+                whir_blowup: 2,
                 base: crate::hash_pin::BLOCK_BASE,
                 whir_leaves: LeafOrder::Coset,
             }
@@ -883,6 +892,7 @@ mod tests {
             (ENV_WHIR_STACK, "25"),
             (ENV_WHIR_GRIND, "all"),
             (ENV_WHIR_GRIND_BITS, "20"),
+            (ENV_WHIR_BLOWUP, "4"),
             (ENV_WHIR_LEAVES, "natural"),
         ])
         .unwrap();
@@ -891,7 +901,7 @@ mod tests {
         assert_eq!(
             f.banner(),
             "ZF FORMAT: cap=off whir_cap=off fri=pair one_row=0 whir_folds=uniform4 whir_stack=25 \
-             whir_grind=all whir_grind_bits=20 whir_leaves=natural"
+             whir_grind=all whir_grind_bits=20 whir_blowup=4 whir_leaves=natural"
         );
         assert!(f.unimplemented_levers().is_empty());
         assert!(f.proof_format().is_legacy());
@@ -1126,14 +1136,14 @@ mod tests {
             whir_stack: StackVars::new(26).unwrap(),
             whir_grind: WhirGrind::All,
             whir_grind_bits: 18,
-            whir_blowup: 2,
+            whir_blowup: 4,
             base: crate::hash_pin::BLOCK_BASE,
             whir_leaves: LeafOrder::Natural,
         };
         assert_eq!(
             f.banner(),
             "ZF FORMAT: cap=auto whir_cap=2 fri=dp one_row=auto whir_folds=first6 whir_stack=26 \
-             whir_grind=all whir_grind_bits=18 whir_blowup=2 whir_leaves=natural"
+             whir_grind=all whir_grind_bits=18 whir_blowup=4 whir_leaves=natural"
         );
         // Every banner value is a spelling its knob accepts, back to the same
         // format.
@@ -1289,21 +1299,21 @@ mod tests {
         );
         assert_eq!(
             (c.rounds(16), c.num_queries),
-            (4, 114),
+            (4, 228),
             "charged at 16 variables"
         );
         // What the widest table alone would charge: three rounds, one query fewer.
         let widest_alone = ChainConfig::with_security_folds(
-            2,
+            PRODUCTION_WHIR_LOG_BLOWUP,
             PRODUCTION_WHIR_LOG_FOLDING,
             ZfFormat::DEFAULT.whir_folds,
             14,
             128,
             ZfFormat::DEFAULT.whir_grind_bits(),
         );
-        assert_eq!(widest_alone.num_queries, 113);
+        assert_eq!(widest_alone.num_queries, 227);
         // At the production shapes the charge moves nothing, at every accepted
-        // stack: the widest table stands at or above the cap, and Q is 114 at
+        // stack: the widest table stands at or above the cap, and Q is 229 at
         // every production height.
         for n in WHIR_STACKS {
             let f = ZfFormat {
@@ -1316,7 +1326,7 @@ mod tests {
             ] {
                 assert_eq!(
                     chain_config_under(&f, shapes).num_queries,
-                    114,
+                    229,
                     "stack {n}, shapes {shapes:?}"
                 );
             }
@@ -1411,6 +1421,7 @@ mod tests {
             ZfFormat {
                 whir_stack: ZfFormat::DEFAULT.whir_stack,
                 whir_grind_bits: ZfFormat::DEFAULT.whir_grind_bits,
+                whir_blowup: ZfFormat::DEFAULT.whir_blowup,
                 ..first6
             }
             .whir_schedule_line()
@@ -1453,12 +1464,16 @@ mod tests {
             chain_config_under(&ZfFormat::DEFAULT, &[(1, 25)])
         );
         assert_eq!(production.format, ZfFormat::DEFAULT.chain_format());
-        assert_eq!((production.rounds(25), production.num_queries), (6, 114));
+        assert_eq!((production.rounds(25), production.num_queries), (6, 229));
         assert_eq!(production.schedule(25), vec![6, 4, 4, 4, 4, 3]);
         assert_eq!(
-            (production.log_blowup, production.log_folding),
-            (today.log_blowup, today.log_folding),
-            "the blowup does not move with the format"
+            production.log_folding, today.log_folding,
+            "the fold does not move with the format"
+        );
+        assert_eq!(
+            (today.log_blowup, production.log_blowup),
+            (LEGACY_WHIR_LOG_BLOWUP, PRODUCTION_WHIR_LOG_BLOWUP),
+            "the legacy format's blowup 4, the default's 2"
         );
         // P2: the default grinds before the queries alone, the legacy format
         // before all three challenges; the default at 18 bits, the legacy at 20.
@@ -1468,76 +1483,82 @@ mod tests {
             let f = parse(&[(ENV_WHIR_FOLDS, name)]).unwrap();
             let c = chain_config_under(&f, &[(1, 25)]);
             assert_eq!(c.format.folds, f.whir_folds);
-            assert_eq!((c.rounds(25), c.num_queries), (rounds25, 114), "{name}");
+            assert_eq!((c.rounds(25), c.num_queries), (rounds25, 229), "{name}");
             assert_eq!(
                 (c.log_blowup, c.log_folding, c.grind),
-                (today.log_blowup, today.log_folding, f.whir_grind_bits())
+                (
+                    production.log_blowup,
+                    today.log_folding,
+                    f.whir_grind_bits()
+                )
             );
             assert_ne!(c.fold_word(), today.fold_word());
         }
     }
 
-    /// ★ `LAMBDA_VM_ZF_WHIR_BLOWUP`: blowup 4 is the default and the legacy
-    /// format's, and the default banner does not name it. Blowup 2 moves the
-    /// chains' rate and the query count the rule charges for it, and nothing
-    /// else: not the WHIR format fields, not the univariate options the
-    /// recursion's proofs are built from.
+    /// ★ `LAMBDA_VM_ZF_WHIR_BLOWUP`: blowup 2 is the default and the default
+    /// banner does not name it; blowup 4 is the legacy format's and the
+    /// default's rollback. Blowup 4 moves the chains' rate and the query count
+    /// the rule charges for it, and nothing else: not the WHIR format fields,
+    /// not the univariate options the recursion's proofs are built from.
     #[test]
     fn the_blowup_knob_moves_the_rate_and_the_rule_s_queries_only() {
         use crate::multilinear_prove::chain_config_under;
         assert_eq!(WHIR_BLOWUPS, [4, 2]);
-        assert_eq!(ZfFormat::DEFAULT.whir_blowup, 4);
+        assert_eq!(ZfFormat::DEFAULT.whir_blowup, 2);
         assert_eq!(ZfFormat::LEGACY.whir_blowup, 4);
         assert_eq!(
             ZfFormat::DEFAULT.whir_log_blowup(),
             PRODUCTION_WHIR_LOG_BLOWUP
         );
-        assert_eq!(parse(&[(ENV_WHIR_BLOWUP, "4")]).unwrap(), ZfFormat::DEFAULT);
+        assert_eq!(ZfFormat::LEGACY.whir_log_blowup(), LEGACY_WHIR_LOG_BLOWUP);
+        assert_eq!(parse(&[(ENV_WHIR_BLOWUP, "2")]).unwrap(), ZfFormat::DEFAULT);
         assert!(!ZfFormat::DEFAULT.banner().contains("whir_blowup"));
 
-        let half = parse(&[(ENV_WHIR_BLOWUP, "2")]).unwrap();
-        assert_eq!(half.whir_log_blowup(), 1);
-        assert!(half.unimplemented_levers().is_empty());
-        assert!(!half.is_legacy());
+        let four = parse(&[(ENV_WHIR_BLOWUP, "4")]).unwrap();
+        assert_eq!(four.whir_log_blowup(), 2);
+        assert!(four.unimplemented_levers().is_empty());
+        assert!(!four.is_legacy());
         assert!(
-            half.banner().ends_with(" whir_grind_bits=18 whir_blowup=2"),
+            four.banner().ends_with(" whir_grind_bits=18 whir_blowup=4"),
             "{}",
-            half.banner()
+            four.banner()
         );
         assert_eq!(
             ZfFormat {
-                whir_blowup: 4,
-                ..half
+                whir_blowup: 2,
+                ..four
             },
             ZfFormat::DEFAULT,
             "the knob moves the blowup and nothing else"
         );
-        assert_eq!(half.chain_format(), ZfFormat::DEFAULT.chain_format());
-        assert_eq!(half.proof_format(), ZfFormat::DEFAULT.proof_format());
+        assert_eq!(four.chain_format(), ZfFormat::DEFAULT.chain_format());
+        assert_eq!(four.proof_format(), ZfFormat::DEFAULT.proof_format());
         let lfm = || stark::proof::options::GoldilocksCubicProofOptions::with_blowup(4).unwrap();
         assert_eq!(
-            format!("{:?}", half.options(lfm())),
+            format!("{:?}", four.options(lfm())),
             format!("{:?}", ZfFormat::DEFAULT.options(lfm())),
             "the recursion's proofs do not read the WHIR rate"
         );
-        assert!(half.whir_schedule_line().contains(" q=229 "));
+        assert!(four.whir_schedule_line().contains(" q=114 "));
+        assert!(ZfFormat::DEFAULT.whir_schedule_line().contains(" q=229 "));
 
         for n in WHIR_STACKS {
             let stack = StackVars::new(n).unwrap();
-            let four = ZfFormat {
+            let wide = ZfFormat {
                 whir_stack: stack,
-                ..ZfFormat::DEFAULT
+                ..four
             };
             let two = ZfFormat {
                 whir_stack: stack,
-                ..half
+                ..ZfFormat::DEFAULT
             };
             for shapes in [
                 &[(1usize, n)][..],
                 &[(1, 27)][..],
                 &[(64, 21), (1480, 16), (8, 20)][..],
             ] {
-                let c4 = chain_config_under(&four, shapes);
+                let c4 = chain_config_under(&wide, shapes);
                 let c2 = chain_config_under(&two, shapes);
                 assert_eq!(
                     (c4.log_blowup, c4.num_queries, c2.log_blowup, c2.num_queries),
@@ -1560,8 +1581,8 @@ mod tests {
         // 27, six from 23) and 228 below (five rounds), where blowup 4 charges
         // 114 throughout.
         for n in 15..=27 {
-            let c4 = chain_config_under(&ZfFormat::DEFAULT, &[(1, n)]);
-            let c2 = chain_config_under(&half, &[(1, n)]);
+            let c4 = chain_config_under(&four, &[(1, n)]);
+            let c2 = chain_config_under(&ZfFormat::DEFAULT, &[(1, n)]);
             let worst = (1..=n).map(|m| c2.rounds(m)).max().unwrap();
             assert_eq!(
                 c2.num_queries,
@@ -1585,13 +1606,13 @@ mod tests {
         let process = *ZfFormat::global();
         assert_eq!(process, ZfFormat::DEFAULT);
         assert_eq!(ZfFormat::install(process).copied(), Ok(process));
-        let half = ZfFormat {
-            whir_blowup: 2,
+        let four = ZfFormat {
+            whir_blowup: 4,
             ..process
         };
-        let refused = ZfFormat::install(half).expect_err("the process format is already out");
+        let refused = ZfFormat::install(four).expect_err("the process format is already out");
         assert!(refused.contains("read before it could be set"), "{refused}");
-        assert!(refused.contains(" whir_blowup=2"), "{refused}");
+        assert!(refused.contains(" whir_blowup=4"), "{refused}");
         assert_eq!(*ZfFormat::global(), process, "the refusal changed nothing");
     }
 
@@ -1602,7 +1623,8 @@ mod tests {
             [WhirBlowup::Four.factor(), WhirBlowup::Two.factor()],
             WHIR_BLOWUPS
         );
-        assert_eq!(WhirBlowup::Four.factor(), ZfFormat::DEFAULT.whir_blowup);
+        assert_eq!(WhirBlowup::Two.factor(), ZfFormat::DEFAULT.whir_blowup);
+        assert_eq!(WhirBlowup::Four.factor(), ZfFormat::LEGACY.whir_blowup);
         assert_eq!(
             (WhirBlowup::Four.to_string(), WhirBlowup::Two.to_string()),
             ("4".to_string(), "2".to_string())
@@ -1775,7 +1797,7 @@ mod tests {
                 let c = crate::multilinear_prove::chain_config_under(&at, &[(1, n)]);
                 assert_eq!((c.grind, c.format.nonces), (bits, nonces), "{v} at {n}");
                 assert_eq!(
-                    c.num_queries, 114,
+                    c.num_queries, 229,
                     "{v} at {n}: Q reads the query grind alone"
                 );
             }
@@ -1797,9 +1819,10 @@ mod tests {
     /// exactly as it was before P2, spelled out here as a literal rather than
     /// derived through the code under test: blowup 2^2, fold 4 under first6,
     /// Q 112, 20-bit grinds before all three challenges, the auto cap, stack 27,
-    /// three nonces a round. The default differs from it in the grind (placed
-    /// before the queries alone, at 18 bits), its Q (114) and the nonce layout,
-    /// and in nothing else.
+    /// three nonces a round, at the legacy blowup 4 (`LAMBDA_VM_ZF_WHIR_BLOWUP=4`).
+    /// The default differs from it in the grind (placed before the queries
+    /// alone, at 18 bits), its rate (blowup 2) and Q (229) and the nonce
+    /// layout, and in nothing else.
     #[test]
     fn the_grind_opt_out_is_the_production_config_before_p2() {
         let before_p2 = ChainConfig {
@@ -1822,7 +1845,12 @@ mod tests {
                 leaves: multilinear::whir_chain::LeafOrder::Natural,
             },
         };
-        let opt_out = parse(&[(ENV_WHIR_GRIND, "all"), (ENV_WHIR_GRIND_BITS, "20")]).unwrap();
+        let opt_out = parse(&[
+            (ENV_WHIR_GRIND, "all"),
+            (ENV_WHIR_GRIND_BITS, "20"),
+            (ENV_WHIR_BLOWUP, "4"),
+        ])
+        .unwrap();
         for shapes in [
             &[(1usize, 25usize)][..],
             &[(1, 27)][..],
@@ -1836,7 +1864,8 @@ mod tests {
             assert_eq!(
                 crate::multilinear_prove::chain_config_under(&ZfFormat::DEFAULT, shapes),
                 ChainConfig {
-                    num_queries: 114,
+                    log_blowup: PRODUCTION_WHIR_LOG_BLOWUP,
+                    num_queries: 229,
                     grind: GrindBits {
                         folding: 0,
                         ood: 0,
@@ -1875,10 +1904,12 @@ mod tests {
     }
 
     /// The default's 18 grind bits trade two grind bits for two queries against
-    /// `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20` (the opt-out, the legacy bits) and
-    /// move nothing else: Q 112 → 114 at every production height (15 to 27
-    /// variables, every accepted stack, the block's shapes), 111 → 113 below a
-    /// fourth round, under either placement.
+    /// `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20` (the opt-out, the legacy bits) at
+    /// blowup 4, where the trade was sized, and move nothing else: Q 112 → 114
+    /// at every production height (15 to 27 variables, every accepted stack,
+    /// the block's shapes), 111 → 113 below a fourth round, under either
+    /// placement. At the default's blowup 2 the same two bits buy four queries
+    /// at every production height.
     #[test]
     fn the_grind_bits_knob_trades_two_bits_for_two_queries() {
         use crate::multilinear_prove::chain_config_under;
@@ -1893,9 +1924,15 @@ mod tests {
             parse(&[(ENV_WHIR_GRIND_BITS, "18")]).unwrap(),
             ZfFormat::DEFAULT
         );
-        assert!(ZfFormat::DEFAULT.whir_schedule_line().contains(" q=114 "));
+        let four = ZfFormat {
+            whir_blowup: 4,
+            ..ZfFormat::DEFAULT
+        };
+        assert!(four.whir_schedule_line().contains(" q=114 "));
+        assert!(ZfFormat::DEFAULT.whir_schedule_line().contains(" q=229 "));
 
-        // The opt-out: 20 bits, Q 112, nothing else moved.
+        // The opt-out: 20 bits, Q 112 at blowup 4 (225 at the default's 2),
+        // nothing else moved.
         let f = parse(&[(ENV_WHIR_GRIND_BITS, "20")]).unwrap();
         assert!(f.unimplemented_levers().is_empty());
         assert!(!f.is_legacy());
@@ -1914,7 +1951,15 @@ mod tests {
         );
         assert_eq!(f.chain_format(), ZfFormat::DEFAULT.chain_format());
         assert_eq!(f.proof_format(), ZfFormat::DEFAULT.proof_format());
-        assert!(f.whir_schedule_line().contains(" q=112 "));
+        assert!(
+            ZfFormat {
+                whir_blowup: 4,
+                ..f
+            }
+            .whir_schedule_line()
+            .contains(" q=112 ")
+        );
+        assert!(f.whir_schedule_line().contains(" q=225 "));
 
         for (placement, bits18, bits20) in [
             (
@@ -1930,10 +1975,11 @@ mod tests {
         ] {
             let at18 = ZfFormat {
                 whir_grind: placement,
-                ..ZfFormat::DEFAULT
+                ..four
             };
             let at20 = ZfFormat {
                 whir_grind: placement,
+                whir_blowup: 4,
                 ..f
             };
             for n in WHIR_STACKS {
@@ -1998,6 +2044,22 @@ mod tests {
                 .num_queries
             };
             assert_eq!((q(18), q(20)), (114, 112), "{n} variables");
+            let at_default = |bits| {
+                ChainConfig::with_security_folds(
+                    PRODUCTION_WHIR_LOG_BLOWUP,
+                    PRODUCTION_WHIR_LOG_FOLDING,
+                    ZfFormat::DEFAULT.whir_folds,
+                    n,
+                    128,
+                    GrindBits::query_only(bits),
+                )
+                .num_queries
+            };
+            assert_eq!(
+                at_default(18),
+                at_default(20) + 4,
+                "{n} variables at blowup 2"
+            );
         }
     }
 }

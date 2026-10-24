@@ -1785,15 +1785,19 @@ fn the_prepared_opening_is_the_schedule_the_shape_implies() {
         want,
         "the fold schedule the chain runs"
     );
-    // The query count follows the process's grind bits: 114 at the default's
-    // 18, 112 at `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20`. Two more queries a round
-    // cost one more squeeze each of the six rounds (four candidates a squeeze).
-    let (queries, squeezes) = if crate::zf_format::ZfFormat::global().whir_grind_bits
-        == crate::zf_format::LEGACY_WHIR_GRIND_BITS
-    {
-        (112, 202)
-    } else {
-        (114, 208)
+    // The query count follows the process's rate and grind bits: 229 at the
+    // default's blowup 2 and 18 bits, 225 at `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20`;
+    // 114 and 112 at `LAMBDA_VM_ZF_WHIR_BLOWUP=4`. Each round squeezes its
+    // queries four candidates at a time, over six rounds.
+    let process = crate::zf_format::ZfFormat::global();
+    let (queries, squeezes) = match (
+        process.whir_blowup,
+        process.whir_grind_bits == crate::zf_format::LEGACY_WHIR_GRIND_BITS,
+    ) {
+        (4, true) => (112, 202),
+        (4, false) => (114, 208),
+        (_, true) => (225, 376),
+        (_, false) => (229, 382),
     };
     assert_eq!(
         config.num_queries, queries,

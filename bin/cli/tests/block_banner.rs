@@ -1,6 +1,6 @@
 //! The block commands' `ZF FORMAT` banner states the format they run under:
-//! `--blowup 2` prints `whir_blowup=2` on the one banner line (and Q 229 on the
-//! schedule line), the default and `--blowup 4` name no blowup (Q 114), and the
+//! `--blowup 4` prints `whir_blowup=4` on the one banner line (and Q 114 on the
+//! schedule line), the default and `--blowup 2` name no blowup (Q 229), and the
 //! format's environment knob for the blowup is refused before any banner. So
 //! for the round-0 leaf order: `--leaves natural` prints `whir_leaves=natural`
 //! (after the blowup when both are set), the default and `--leaves coset` name
@@ -45,9 +45,9 @@ fn the_block_commands_banner_states_the_blowup_they_run_under() {
     ];
     for (name, base) in &commands {
         for (flag, blowup_word, q) in [
-            (None, None, " q=114 "),
-            (Some("4"), None, " q=114 "),
-            (Some("2"), Some(" whir_blowup=2"), " q=229 "),
+            (None, None, " q=229 "),
+            (Some("2"), None, " q=229 "),
+            (Some("4"), Some(" whir_blowup=4"), " q=114 "),
         ] {
             let mut args = base.clone();
             if let Some(f) = flag {
@@ -66,7 +66,7 @@ fn the_block_commands_banner_states_the_blowup_they_run_under() {
             assert_eq!(schedules.len(), 1, "{tag}: one schedule line\n{stdout}");
             assert!(schedules[0].contains(q), "{tag}: {}", schedules[0]);
         }
-        let (ok, stdout, stderr) = run(base, &[("LAMBDA_VM_ZF_WHIR_BLOWUP", "2")]);
+        let (ok, stdout, stderr) = run(base, &[("LAMBDA_VM_ZF_WHIR_BLOWUP", "4")]);
         assert!(!ok, "{name}: the environment knob is refused");
         assert!(
             lines(&stdout, "ZF FORMAT:").is_empty(),
@@ -96,8 +96,8 @@ fn the_block_commands_banner_states_the_leaf_order_they_run_under() {
             (&["--leaves", "coset"][..], None),
             (&["--leaves", "natural"][..], Some(" whir_leaves=natural")),
             (
-                &["--leaves", "natural", "--blowup", "2"][..],
-                Some(" whir_blowup=2 whir_leaves=natural"),
+                &["--leaves", "natural", "--blowup", "4"][..],
+                Some(" whir_blowup=4 whir_leaves=natural"),
             ),
         ] {
             let mut args = base.clone();

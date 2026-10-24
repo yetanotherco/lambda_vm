@@ -256,14 +256,14 @@ pub fn group_setting(value: Option<&str>) -> Result<GroupFold, String> {
     }
 }
 
-/// The CLI's `--blowup` reading: unset or `4` is the production WHIR base code
-/// ([`WhirBlowup::Four`]), `2` is blowup 2 ([`WhirBlowup::Two`]); anything else
-/// an error. A format choice: the block's verifier must be given the same one,
-/// and the proof file does not carry it.
+/// The CLI's `--blowup` reading: unset or `2` is the production WHIR base code
+/// ([`WhirBlowup::Two`]), `4` is the legacy blowup ([`WhirBlowup::Four`]);
+/// anything else an error. A format choice: the block's verifier must be given
+/// the same one, and the proof file does not carry it.
 pub fn blowup_setting(value: Option<&str>) -> Result<WhirBlowup, String> {
     match value.map(str::trim) {
-        None | Some("4") => Ok(WhirBlowup::Four),
-        Some("2") => Ok(WhirBlowup::Two),
+        None | Some("2") => Ok(WhirBlowup::Two),
+        Some("4") => Ok(WhirBlowup::Four),
         Some(word) => Err(format!("--blowup {word}: 4 or 2")),
     }
 }
