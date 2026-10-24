@@ -457,14 +457,26 @@ fn a_warmed_domain_is_the_one_a_prove_finds() {
         format: crate::proof::options::ProofFormat::DEFAULT,
     };
     let air = FibonacciAIR::<GoldilocksField>::new(&options);
-    assert!(!warm_domain_twiddles::<GoldilocksField>(2, 7, 0), "no rows");
-    assert!(
-        !warm_domain_twiddles::<GoldilocksField>(2, 7, 24),
+    assert_eq!(
+        warm_domain_twiddles::<GoldilocksField>(2, 7, 0),
+        None,
+        "no rows"
+    );
+    assert_eq!(
+        warm_domain_twiddles::<GoldilocksField>(2, 7, 24),
+        None,
         "not a power of two"
     );
-    assert!(warm_domain_twiddles::<GoldilocksField>(2, 7, 32), "built");
-    assert!(
-        !warm_domain_twiddles::<GoldilocksField>(2, 7, 32),
+    // The entry's tables: the LDE coset (n·blowup) and trace roots (n), the
+    // two-half sets (n and n·blowup) and the coset weights (n), 8 bytes each.
+    assert_eq!(
+        warm_domain_twiddles::<GoldilocksField>(2, 7, 32),
+        Some(32 * (2 * 2 + 3) * 8),
+        "built"
+    );
+    assert_eq!(
+        warm_domain_twiddles::<GoldilocksField>(2, 7, 32),
+        None,
         "already there"
     );
 

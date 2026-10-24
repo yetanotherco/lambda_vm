@@ -65,6 +65,13 @@ pub struct Domain<F: IsFFTField> {
 }
 
 impl<F: IsFFTField> Domain<F> {
+    /// The bytes its two root tables hold (the values built on first use come
+    /// later and are not counted).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        (self.lde_roots_of_unity_coset.capacity() + self.trace_roots_of_unity.capacity())
+            * std::mem::size_of::<FieldElement<F>>()
+    }
+
     /// Builds the interpolation and LDE domains used by the prover.
     ///
     /// - Interpolation domain: the `trace_length` roots of unity (must be a power of 2).

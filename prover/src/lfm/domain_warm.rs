@@ -19,6 +19,10 @@ use crate::tables::types::GoldilocksField;
 
 static BUILT: AtomicU64 = AtomicU64::new(0);
 static BUILD_NS: AtomicU64 = AtomicU64::new(0);
+/// The bytes the built entries hold, and how many of them were built by the
+/// time the early leaf's lengths were warm (the ones a base peak can carry).
+static BYTES: AtomicU64 = AtomicU64::new(0);
+static EARLY_BYTES: AtomicU64 = AtomicU64::new(0);
 /// When the early leaf's lengths were warmed, in seconds on the tree's clock
 /// (the bits of an `f64`; `u64::MAX` for never).
 static EARLY_AT: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -73,16 +77,18 @@ fn lengths(traces: &LfmTraces) -> Vec<usize> {
 /// Call it from a plain thread, never a rayon worker.
 pub(crate) fn warm(traces: &LfmTraces, options: &ProofOptions) -> usize {
     let t = std::time::Instant::now();
-    let built = lengths(traces)
+    let built: Vec<u64> = lengths(traces)
         .into_iter()
-        .filter(|&n| {
+        .filter_map(|n| {
             stark::prover::warm_domain_twiddles::<GoldilocksField>(
                 options.blowup_factor as usize,
                 options.coset_offset,
                 n,
             )
         })
-        .count();
+        .collect();
+    BYTES.fetch_add(built.iter().sum::<u64>(), Ordering::Relaxed);
+    let built = built.len();
     BUILT.fetch_add(built as u64, Ordering::Relaxed);
     BUILD_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     built
@@ -90,6 +96,7 @@ pub(crate) fn warm(traces: &LfmTraces, options: &ProofOptions) -> usize {
 
 /// The early leaf's lengths are warm, `at` seconds into the tree's clock.
 pub(crate) fn note_early(at: f64) {
+    EARLY_BYTES.store(BYTES.load(Ordering::Relaxed), Ordering::Relaxed);
     EARLY_AT.store(at.to_bits(), Ordering::Relaxed);
 }
 
@@ -100,15 +107,18 @@ pub fn line() -> String {
             .to_string();
     }
     let early = EARLY_AT.load(Ordering::Relaxed);
+    let gib = |b: &AtomicU64| b.load(Ordering::Relaxed) as f64 / (1u64 << 30) as f64;
     format!(
-        "on · {} lengths built in {:.3} s · the early leaf's by {}",
+        "on · {} lengths built in {:.3} s · the early leaf's by {} · {:.3} GiB built, {:.3} GiB by the early leaf's",
         BUILT.load(Ordering::Relaxed),
         BUILD_NS.load(Ordering::Relaxed) as f64 / 1e9,
         if early == u64::MAX {
             "never".to_string()
         } else {
             format!("{:.2}s", f64::from_bits(early))
-        }
+        },
+        gib(&BYTES),
+        gib(&EARLY_BYTES),
     )
 }
 
@@ -144,12 +154,27 @@ mod tests {
         let hasher = super::super::registry::build_artifacts(&program, &opts).hasher;
         let filled =
             super::super::proof::lfm_execute_and_fill(&program, &arenas, hasher).expect("filled");
-        let n = lengths(filled.traces())
+        let warmed: Vec<usize> = lengths(filled.traces())
             .into_iter()
             .filter(|l| l.is_power_of_two())
-            .count();
+            .collect();
+        let n = warmed.len();
         assert!(n > 0, "a proof has tables");
+        // Each entry holds n·(2·blowup + 3) field elements (the LDE coset and
+        // trace roots, the two-half sets, the coset weights), 8 bytes each.
+        let want: u64 = warmed.iter().map(|&l| (l * (2 * 8 + 3) * 8) as u64).sum();
+        let before = BYTES.load(Ordering::Relaxed);
         assert_eq!(warm(filled.traces(), &opts), n, "every length built once");
+        assert_eq!(
+            BYTES.load(Ordering::Relaxed) - before,
+            want,
+            "their bytes counted"
+        );
         assert_eq!(warm(filled.traces(), &opts), 0, "then found");
+        assert_eq!(
+            BYTES.load(Ordering::Relaxed) - before,
+            want,
+            "found ones count nothing"
+        );
     }
 }

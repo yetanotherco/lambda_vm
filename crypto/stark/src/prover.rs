@@ -723,6 +723,15 @@ pub(crate) fn coset_weights<F: IsFFTField>(
 }
 
 impl<F: IsFFTField> LdeTwiddles<F> {
+    /// The bytes its production tables hold once built: the two two-half sets
+    /// and the coset weights (the sets built on first use come later and are
+    /// not counted).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.two_half_inv.heap_bytes()
+            + self.two_half_fwd.heap_bytes()
+            + self.coset_weights.capacity() * std::mem::size_of::<FieldElement<F>>()
+    }
+
     /// Construct twiddles and coset weights for a domain of the given size and blowup factor.
     pub(crate) fn new(domain: &Domain<F>) -> Self {
         let domain_size = domain.interpolation_domain_size;
@@ -830,16 +839,25 @@ where
 /// Fills the process-wide domain and twiddle cache for a trace of
 /// `trace_length` rows under `blowup_factor` and `coset_offset` — what the first
 /// prove of that shape builds before its first round — so a prove that comes
-/// later finds it there. True when it built the entry; false when it was
-/// already there, or for a length no trace has (zero, or not a power of two).
-/// Call it from a plain thread, not a rayon worker (see the pre-fill below).
-pub fn warm_domain_twiddles<F>(blowup_factor: usize, coset_offset: u64, trace_length: usize) -> bool
+/// later finds it there. The bytes the new entry holds when it built it;
+/// `None` when it was already there, or for a length no trace has (zero, or
+/// not a power of two). Call it from a plain thread, not a rayon worker (see
+/// the pre-fill below).
+pub fn warm_domain_twiddles<F>(
+    blowup_factor: usize,
+    coset_offset: u64,
+    trace_length: usize,
+) -> Option<u64>
 where
     F: IsFFTField + 'static,
     FieldElement<F>: Send + Sync,
 {
-    trace_length.is_power_of_two()
-        && cached_domain_and_twiddles::<F>(blowup_factor, coset_offset, trace_length).2
+    if !trace_length.is_power_of_two() {
+        return None;
+    }
+    let (domain, twiddles, built) =
+        cached_domain_and_twiddles::<F>(blowup_factor, coset_offset, trace_length);
+    built.then(|| (domain.heap_bytes() + twiddles.heap_bytes()) as u64)
 }
 
 /// [`domain_and_twiddles`] by the three values its entry is keyed by, and
