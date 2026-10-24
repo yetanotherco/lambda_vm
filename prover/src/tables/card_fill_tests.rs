@@ -13,11 +13,13 @@
 //! changed) must then differ from the host, which shows the comparison sees
 //! the records. Timed cases repeat both paths 3 + 20 times and print the
 //! median, min and max of the host fill, the uploads and the kernels. Each
-//! case prints one `CARD FILL <family> <input> key=value …` line, then
-//! `CARD FILL VERDICT`.
+//! case prints one `CARD FILL <family> <input> key=value …` line (KECCAK_RND's
+//! with `minimal_bytes`, its records without the output the kernel never
+//! reads).
 //!
 //! The inputs ([`super::card_fill_inputs`]):
-//! - three seeded sets a family;
+//! - three seeded sets a family, CPU's over the decode table of the guest at
+//!   `BLOCK_WHIR_ELF`;
 //! - real chunks of the block at `BLOCK_WHIR_ELF` / `BLOCK_WHIR_INPUT`. The run
 //!   is executed and walked with one walker (the split builder, as the
 //!   streamed prove does) through window 65. The CPU chunk is chunk 32: the
@@ -25,10 +27,14 @@
 //!   first full register chunk handed out after window 64;
 //! - one padded table a family, identity only.
 //!
-//! The real chunks run first, so the host fill's widths are learned from real
-//! rows as in a prove. The loaded cases then repeat the real chunks' and the
-//! first KECCAK_RND set's uploads beside four threads copying 1 GiB buffers (a
-//! walker's memory traffic), as `CARD FILL LOADED` lines.
+//! KECCAK_RND runs first, then prints its own `CARD FILL VERDICT KECCAK_RND`,
+//! so its rows stand even if the real block's capture fails. Then come CPU
+//! and MEMW_R, their real chunks before their synthetic sets, so the host
+//! fill's widths are learned from real rows as in a prove. A CPU fill with
+//! one log at a pc no DECODE row holds must be refused (`CARD FILL REFUSAL`).
+//! The loaded cases repeat the first KECCAK_RND set's and the real chunks'
+//! uploads beside four threads copying 1 GiB buffers (a walker's memory
+//! traffic), as `CARD FILL LOADED` lines. `CARD FILL VERDICT` closes the run.
 //!
 //! ```text
 //! BLOCK_WHIR_ELF=…/ethrex_3e8f1ce1.elf BLOCK_WHIR_INPUT=…/block.bin \
@@ -51,6 +57,7 @@ use math_cuda::{CudaSlice, CudaStream};
 use super::card_fill_inputs::{self as inputs, CHUNK_ROWS, KECCAK_RND_ROWS, KECCAK_RND_SKIP};
 use super::cpu::generate_cpu_trace_segments_as;
 use super::gpack::{Trace, TraceForm};
+use super::keccak_rnd::KeccakRoundOperation;
 use super::memw_register::generate_memw_register_trace_from_rows_segments_as;
 use super::trace_builder::{ChunkJob, StreamTable, WindowedTraceBuilder};
 
@@ -98,6 +105,17 @@ impl Records<'_> {
             }
         }
         .expect("the card's fill")
+    }
+
+    /// The bytes the records would take without what the kernel never reads
+    /// (a keccak op's output): KECCAK_RND's only.
+    fn minimal_bytes(&self) -> Option<usize> {
+        match self {
+            Records::KeccakRnd { ops, .. } => {
+                Some(ops.len() * std::mem::offset_of!(KeccakOpC, output))
+            }
+            _ => None,
+        }
     }
 
     /// The records with one changed where it moves a word: a register row's
@@ -398,6 +416,9 @@ fn run_case(case: &Case, stream: &Arc<CudaStream>, poison: &[u64], load: bool) -
         mutant.count,
         case.timed,
     );
+    if let Some(bytes) = case.records.minimal_bytes() {
+        line += &format!(" minimal_bytes={bytes}");
+    }
     if case.timed {
         let (mut a, mut b) = (Reps::default(), Reps::default());
         for rep in 0..WARMUPS + REPS {
@@ -434,14 +455,12 @@ struct RealChunks {
     logs: Vec<Log>,
     first_cycle: u64,
     memw_r: ChunkJob,
-    elf: Vec<u8>,
 }
 
-fn real_chunks() -> RealChunks {
-    let elf = std::fs::read(std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF")).unwrap();
+fn real_chunks(elf: &[u8]) -> RealChunks {
     let input =
         std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT")).unwrap();
-    let program = Elf::load(&elf).expect("the ELF loads");
+    let program = Elf::load(elf).expect("the ELF loads");
     let options = crate::block_whir::BlockOptions::production();
     let window = 1usize << options.window_log2.expect("the block streams");
     assert_eq!(2 * window, CHUNK_ROWS, "a CPU chunk is two windows");
@@ -490,7 +509,6 @@ fn real_chunks() -> RealChunks {
         logs,
         first_cycle: (REAL_FIRST_WINDOW * window) as u64,
         memw_r,
-        elf,
     }
 }
 
@@ -502,28 +520,89 @@ fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// KECCAK_RND's table of `ops` (the synthetic sets' rows and cut).
+fn keccak_case(input: String, ops: &[KeccakRoundOperation], timed: bool) -> Case<'_> {
+    Case {
+        family: "KECCAK_RND",
+        input,
+        rows: KECCAK_RND_ROWS,
+        cols: fill::KECCAK_RND_COLUMNS,
+        host: Box::new(move |form| {
+            inputs::keccak_rnd_host(ops, KECCAK_RND_SKIP, KECCAK_RND_ROWS, form)
+        }),
+        records: Records::KeccakRnd {
+            ops: ops.iter().map(inputs::keccak_record).collect(),
+            skip: KECCAK_RND_SKIP,
+        },
+        timed,
+    }
+}
+
+/// What the cases in `found` add up to: the words that differ, and the cases
+/// whose mutant showed nothing.
+fn tally(found: &[(String, Found)]) -> (usize, Vec<&String>) {
+    let mismatches = found.iter().map(|(_, f)| f.mismatches).sum();
+    let blind = found
+        .iter()
+        .filter(|(_, f)| f.mutant == 0)
+        .map(|(name, _)| name)
+        .collect();
+    (mismatches, blind)
+}
+
 /// Every family's card fill is the host fill's words, on synthetic and real
 /// rows, and both paths are timed (the module docs).
 #[test]
 #[ignore = "card: a box test (BLOCK_WHIR_ELF, BLOCK_WHIR_INPUT)"]
 fn the_card_fills_the_streamed_tables_as_the_host_does() {
+    let elf_path = std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF names the guest");
+    let elf = std::fs::read(&elf_path).unwrap_or_else(|e| panic!("{elf_path}: {e}"));
+    // The synthetic CPU sets are drawn over this guest's decode table.
+    println!(
+        "CARD FILL ENV elf_sha256={} decode_source=BLOCK_WHIR_ELF reps={REPS} warmups={WARMUPS}",
+        sha256(&elf)
+    );
     let be = math_cuda::device::backend().expect("a card");
     let stream = be.next_stream();
     let poison = vec![0x5A5A_5A5A_5A5A_5A5Au64; KECCAK_RND_ROWS * fill::KECCAK_RND_COLUMNS];
-    let mut found = Vec::new();
-    let mut run = |case: &Case, load: bool| {
+    // Each case's findings (a loaded case finds nothing).
+    let found = std::cell::RefCell::new(Vec::new());
+    let run = |case: &Case, load: bool| {
         let f = run_case(case, &stream, &poison, load);
         if !load {
-            found.push((format!("{} {}", case.family, case.input), f));
+            found
+                .borrow_mut()
+                .push((format!("{} {}", case.family, case.input), f));
         }
     };
+    let seed = inputs::SEEDS[0];
 
-    // The real chunks first.
-    let real = real_chunks();
-    println!(
-        "CARD FILL ENV elf_sha256={} reps={REPS} warmups={WARMUPS}",
-        sha256(&real.elf)
-    );
+    // KECCAK_RND first: its rows stand even if the real block's capture fails.
+    let sets: Vec<_> = inputs::SEEDS
+        .iter()
+        .map(|&s| inputs::keccak_ops(s, inputs::KECCAK_RND_OPS))
+        .collect();
+    for (s, ops) in inputs::SEEDS.iter().zip(&sets) {
+        run(&keccak_case(format!("seed{s}"), ops, true), false);
+    }
+    let short = inputs::keccak_ops(seed, PADDED_KECCAK_OPS);
+    run(&keccak_case("padded".into(), &short, false), false);
+    run(&keccak_case(format!("seed{seed}"), &sets[0], true), true);
+    drop((sets, short));
+    {
+        let found = found.borrow();
+        let (mismatches, blind) = tally(&found);
+        println!(
+            "CARD FILL VERDICT KECCAK_RND: identity={} mismatches={mismatches} mutants={} cases={}",
+            if mismatches == 0 { "ok" } else { "FAIL" },
+            if blind.is_empty() { "ok" } else { "FAIL" },
+            found.len()
+        );
+    }
+
+    // The real chunks, before the synthetic sets, so the host fill's widths
+    // are learned from real rows as in a prove.
+    let real = real_chunks(&elf);
     let (cpu_parts, real_decode) = real.cpu.cpu_parts().expect("a CPU chunk");
     let real_ops: usize = cpu_parts.iter().map(|s| s.len()).sum();
     assert_eq!(real_ops, CHUNK_ROWS);
@@ -550,6 +629,11 @@ fn the_card_fills_the_streamed_tables_as_the_host_does() {
     };
     run(&real_cpu, false);
     let reg_parts = real.memw_r.register_rows().expect("a MEMW_R chunk");
+    assert_eq!(
+        reg_parts.iter().map(|s| s.len()).sum::<usize>(),
+        CHUNK_ROWS,
+        "a full register chunk"
+    );
     let real_memw_r = Case {
         family: "MEMW_R",
         input: "real".into(),
@@ -565,23 +649,18 @@ fn the_card_fills_the_streamed_tables_as_the_host_does() {
         ),
         timed: true,
     };
-    assert_eq!(
-        reg_parts.iter().map(|s| s.len()).sum::<usize>(),
-        CHUNK_ROWS,
-        "a full register chunk"
-    );
     run(&real_memw_r, false);
 
-    // The synthetic sets.
+    // The synthetic sets, over the guest's decode table.
     let decode = inputs::program_decode();
     let (entries, runs) = inputs::decode_records(&decode);
     let card_decode = CardDecode::upload(&stream, &entries, &runs).expect("the decode");
-    for seed in inputs::SEEDS {
-        let rows = inputs::memw_r_rows(seed, CHUNK_ROWS);
+    for s in inputs::SEEDS {
+        let rows = inputs::memw_r_rows(s, CHUNK_ROWS);
         run(
             &Case {
                 family: "MEMW_R",
-                input: format!("seed{seed}"),
+                input: format!("seed{s}"),
                 rows: CHUNK_ROWS,
                 cols: fill::MEMW_R_COLUMNS,
                 host: Box::new(|form| inputs::memw_r_host(&rows, form)),
@@ -590,12 +669,12 @@ fn the_card_fills_the_streamed_tables_as_the_host_does() {
             },
             false,
         );
-        let logs = inputs::cpu_logs(seed, CHUNK_ROWS, &decode);
+        let logs = inputs::cpu_logs(s, CHUNK_ROWS, &decode);
         let ops = inputs::cpu_ops(&logs, inputs::CPU_FIRST_CYCLE, &decode);
         run(
             &Case {
                 family: "CPU",
-                input: format!("seed{seed}"),
+                input: format!("seed{s}"),
                 rows: CHUNK_ROWS,
                 cols: fill::CPU_COLUMNS,
                 host: Box::new(|form| inputs::cpu_host(&ops, &decode, form)),
@@ -608,28 +687,31 @@ fn the_card_fills_the_streamed_tables_as_the_host_does() {
             },
             false,
         );
-        let ops = inputs::keccak_ops(seed, inputs::KECCAK_RND_OPS);
-        run(
-            &Case {
-                family: "KECCAK_RND",
-                input: format!("seed{seed}"),
-                rows: KECCAK_RND_ROWS,
-                cols: fill::KECCAK_RND_COLUMNS,
-                host: Box::new(|form| {
-                    inputs::keccak_rnd_host(&ops, KECCAK_RND_SKIP, KECCAK_RND_ROWS, form)
-                }),
-                records: Records::KeccakRnd {
-                    ops: ops.iter().map(inputs::keccak_record).collect(),
-                    skip: KECCAK_RND_SKIP,
-                },
-                timed: true,
-            },
-            false,
-        );
     }
 
+    // A log whose pc no DECODE row holds: the fill is refused, as the host
+    // fill's `MissingInstruction`.
+    let absent = decode.entries()[0].pc + 2;
+    assert_eq!(decode.row(absent), None, "pcs are 4 apart");
+    let refusal_rows = 1 << 12;
+    let mut logs: Vec<LogC> = inputs::cpu_logs(seed, refusal_rows, &decode)
+        .iter()
+        .map(inputs::log_record)
+        .collect();
+    logs[1234].current_pc = absent;
+    let mut out = poisoned(&stream, &poison, refusal_rows * fill::CPU_COLUMNS);
+    let refused = fill::fill_cpu_from_logs_into(
+        &stream,
+        &logs,
+        inputs::CPU_FIRST_CYCLE,
+        &card_decode,
+        refusal_rows,
+        &mut out.slice_mut(..),
+    )
+    .is_err();
+    println!("CARD FILL REFUSAL CPU absent_pc={absent} refused={refused}");
+
     // Padded tables, identity only.
-    let seed = inputs::SEEDS[0];
     let short = CHUNK_ROWS - PADDED_SHORT;
     let rows = inputs::memw_r_rows(seed, short);
     run(
@@ -662,59 +744,21 @@ fn the_card_fills_the_streamed_tables_as_the_host_does() {
         },
         false,
     );
-    let ops = inputs::keccak_ops(seed, PADDED_KECCAK_OPS);
-    run(
-        &Case {
-            family: "KECCAK_RND",
-            input: "padded".into(),
-            rows: KECCAK_RND_ROWS,
-            cols: fill::KECCAK_RND_COLUMNS,
-            host: Box::new(|form| {
-                inputs::keccak_rnd_host(&ops, KECCAK_RND_SKIP, KECCAK_RND_ROWS, form)
-            }),
-            records: Records::KeccakRnd {
-                ops: ops.iter().map(inputs::keccak_record).collect(),
-                skip: KECCAK_RND_SKIP,
-            },
-            timed: false,
-        },
-        false,
-    );
 
-    // The uploads beside the host's memory traffic.
+    // The real chunks' uploads beside the host's memory traffic.
     run(&real_cpu, true);
     run(&real_memw_r, true);
-    let ops = inputs::keccak_ops(seed, inputs::KECCAK_RND_OPS);
-    run(
-        &Case {
-            family: "KECCAK_RND",
-            input: format!("seed{seed}"),
-            rows: KECCAK_RND_ROWS,
-            cols: fill::KECCAK_RND_COLUMNS,
-            host: Box::new(|form| {
-                inputs::keccak_rnd_host(&ops, KECCAK_RND_SKIP, KECCAK_RND_ROWS, form)
-            }),
-            records: Records::KeccakRnd {
-                ops: ops.iter().map(inputs::keccak_record).collect(),
-                skip: KECCAK_RND_SKIP,
-            },
-            timed: true,
-        },
-        true,
-    );
 
-    let mismatches: usize = found.iter().map(|(_, f)| f.mismatches).sum();
-    let blind: Vec<&String> = found
-        .iter()
-        .filter(|(_, f)| f.mutant == 0)
-        .map(|(name, _)| name)
-        .collect();
+    let found = found.into_inner();
+    let (mismatches, blind) = tally(&found);
     println!(
-        "CARD FILL VERDICT: identity={} mismatches={mismatches} mutants={} cases={}",
+        "CARD FILL VERDICT: identity={} mismatches={mismatches} mutants={} refusal={} cases={}",
         if mismatches == 0 { "ok" } else { "FAIL" },
         if blind.is_empty() { "ok" } else { "FAIL" },
+        if refused { "ok" } else { "FAIL" },
         found.len()
     );
     assert_eq!(mismatches, 0, "a card fill differs from the host's");
     assert!(blind.is_empty(), "mutants the comparison missed: {blind:?}");
+    assert!(refused, "a log with no DECODE row was filled");
 }
