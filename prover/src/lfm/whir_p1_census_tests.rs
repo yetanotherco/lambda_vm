@@ -1092,9 +1092,11 @@ fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
 /// ★ The lean leaf's census on the median mix at blowup 2 (the production
 /// rate): each group's emitted chip rows under [`LeafQuery::Lean`] against
 /// `V1`, the same statement and partition rule. The tail rounds cut every
-/// group's socket, hint and select rows and leave the leaf's front as it is.
-/// Prints `LEAN CENSUS` lines: the per-group deltas by chip (min, median,
-/// max) — the measured deltas the packing replay takes.
+/// group's socket, hint and select rows, round 0's packed words its hint rows
+/// again, and the leaf's front stays as it is. Prints `LEAN CENSUS` lines: the
+/// per-group deltas by chip (min, median, max) — the measured deltas the
+/// packing replay takes — and the tail rounds of the production chain at each
+/// stack height.
 #[test]
 fn the_lean_leaf_cuts_every_groups_rows_on_the_median_mix() {
     use super::whir_chain::LeafQuery;
@@ -1155,6 +1157,17 @@ fn the_lean_leaf_cuts_every_groups_rows_on_the_median_mix() {
         lean.partition().num_leaves(),
         v1.num_groups()
     );
+    for n_stack in 16..=24 {
+        let shape = lean.chain_shape(n_stack);
+        let tails: Vec<(usize, usize)> = (0..shape.rounds())
+            .filter(|&r| shape.tail_round(r))
+            .map(|r| (r, shape.current_leaves(r)))
+            .collect();
+        println!(
+            "LEAN CENSUS TAILS n_stack {n_stack}: {} queries, (round, leaves) {tails:?}",
+            shape.num_queries
+        );
+    }
 }
 
 /// ★ The heights hold on the median mix, as emitted: the plan's rows are the

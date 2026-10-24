@@ -49,6 +49,41 @@ fn the_leaf_hash_is_the_tagged_linear_hash() {
     }
 }
 
+/// `values` four a word, in order, the last word's lanes past them `fill`.
+fn packed_words(values: &[FE], fill: FE) -> Vec<LfmWord> {
+    values
+        .chunks(4)
+        .map(|lanes| core::array::from_fn(|j| lanes.get(j).copied().unwrap_or(fill)))
+        .collect()
+}
+
+/// [`leaf_hash_words`] over `words` hinted, published.
+fn run_word_leaf(words: Vec<LfmWord>, felts: usize) -> Vec<FE> {
+    let mut b = LfmBuilder::new();
+    let a = b.declare_arena(words.len() as u32);
+    let cells: Vec<_> = (0..words.len() as u32).map(|i| b.hint_word(a, i)).collect();
+    let d = leaf_hash_words(&mut b, &cells, felts);
+    b.public(d.cells()[0]);
+    run(b, &[words])
+}
+
+/// ★ The leaf hash over values four a word is the same tagged linear hash, at
+/// lengths on and off a word and a block; a lane past the last value that is
+/// not zero gives another digest.
+#[test]
+fn the_word_leaf_hash_is_the_tagged_linear_hash() {
+    for n in [0usize, 1, 2, 3, 4, 5, 11, 12, 13, 16, 24, 25, 36, 41, 64] {
+        let values: Vec<FE> = (0..n).map(|i| felt(n as u64 + 99, i)).collect();
+        let host = zisk::linear_hash(&values).to_vec();
+        let got = run_word_leaf(packed_words(&values, FE::zero()), n);
+        assert_eq!(got, host, "{n} felts");
+        if n % 4 != 0 {
+            let junk = run_word_leaf(packed_words(&values, FE::from(1u64)), n);
+            assert_ne!(junk, host, "{n} felts: a nonzero lane past the last value");
+        }
+    }
+}
+
 fn digest(seed: u64, i: usize) -> [FE; 4] {
     core::array::from_fn(|k| felt(seed, 4 * i + k))
 }

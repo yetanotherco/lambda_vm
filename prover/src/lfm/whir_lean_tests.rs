@@ -1,6 +1,7 @@
 //! Gates for the leaf's cheaper query check ([`LeafQuery::Lean`]) on Poseidon1
 //! chains: the tail rounds checked at every leaf once
-//! ([`ChainShape::tail_round`]), against the host's own proofs.
+//! ([`ChainShape::tail_round`]) and round 0's values four a word
+//! ([`ChainShape::round0_packed`]), against the host's own proofs.
 //!
 //! The fixtures are `whir_p1_leaf_tests`' small chains with enough queries that
 //! their last trees, lying wholly in their caps, take [`TAIL_QUERIES_A_LEAF`]
@@ -18,6 +19,7 @@ use super::whir_chain::{
     ChainShape, LeafQuery, TAIL_QUERIES_A_LEAF, chain_perms, round_words, tail_faults,
     try_push_round_words,
 };
+use super::whir_chain_tests::hint_rows;
 use super::whir_p1_leaf_tests::{
     Fixture, fixture, hash16_rows, host_accepts, p1_chain_program, p1_config, p1_ordered_config,
 };
@@ -95,6 +97,17 @@ fn tail_block_at(shape: &ChainShape, r: usize) -> usize {
     let before: u32 = (0..r).map(|t| round_words(shape, t)).sum();
     let nonces = shape.carries(r).iter().filter(|&&c| c).count();
     prefix + before as usize + 2 * shape.messages(r) + nonces
+}
+
+/// The arena offset of round 0's block at query `q`: the fixture's prefix,
+/// round 0's sumcheck words and nonces, the owner's cap, then per query its
+/// block (four values a word under `Lean`) and its path.
+fn round0_block_at(shape: &ChainShape, q: usize) -> usize {
+    let prefix = shape.num_vars + 3;
+    let nonces = shape.carries(0).iter().filter(|&&c| c).count();
+    let cap = shape.cap_words(shape.current_depth(0), shape.caps[0]);
+    let words = shape.round0_block_words(1usize << shape.schedule[0]);
+    prefix + 2 * shape.messages(0) + nonces + cap + q * (words + shape.current_path(0))
 }
 
 /// Fewer than [`TAIL_QUERIES_A_LEAF`] queries a leaf of any tree: a lean
@@ -301,4 +314,86 @@ fn equal_tail_blocks_are_each_placed() {
     let program = p1_chain_program(&shape);
     let arena = arena_at(&f, &f.proof, &shape).expect("every leaf placed");
     execute(&program, &[arena], &SOCKET).expect("the lean chain executes");
+}
+
+/// ★ Under `Lean` round 0's blocks arrive four values a word, in order, the
+/// last word zero-filled; with no tail round the lean chain executes, costs
+/// the V1 chain's socket rows, and hints `Q · (block − ⌈block / 4⌉)` fewer
+/// words.
+#[test]
+fn a_lean_round_zero_block_arrives_four_values_a_word() {
+    let mut cases = tail_cases();
+    cases.push(untailed());
+    for (num_vars, cfg) in cases {
+        let f = fixture(num_vars, cfg);
+        let shape = lean(&f.shape);
+        assert!(shape.round0_packed() && !f.shape.round0_packed());
+        let block = 1usize << shape.schedule[0];
+        let arena = arena_at(&f, &f.proof, &shape).expect("laid out");
+        let RoundOpenings::Base(p) = &f.proof.rounds[0].openings else {
+            panic!("round 0 is base-valued")
+        };
+        for q in [0, shape.num_queries - 1] {
+            let at = round0_block_at(&shape, q);
+            let lanes: Vec<_> = arena[at..at + block.div_ceil(4)]
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
+            assert_eq!(
+                lanes[..block],
+                p.current[q].values[..],
+                "S={num_vars} q={q}"
+            );
+            assert!(lanes[block..].iter().all(|v| *v == FE::zero()));
+        }
+    }
+    let (num_vars, cfg) = untailed();
+    let f = fixture(num_vars, cfg);
+    let shape = lean(&f.shape);
+    assert!((0..shape.rounds()).all(|r| !shape.tail_round(r)));
+    let program = p1_chain_program(&shape);
+    let arena = arena_at(&f, &f.proof, &shape).expect("laid out");
+    execute(&program, &[arena], &SOCKET).expect("the lean chain executes");
+    let v1 = p1_chain_program(&f.shape);
+    assert_eq!(
+        hash16_rows(&program),
+        hash16_rows(&v1),
+        "packing costs no permutation"
+    );
+    let block = 1usize << shape.schedule[0];
+    assert_eq!(
+        hint_rows(&v1) - hint_rows(&program),
+        shape.num_queries * (block - block.div_ceil(4)),
+        "round 0's hinted words"
+    );
+}
+
+/// ★ A round-0 value one off in any lane of a block's first or last word, at
+/// the first or last query, misses its leaf and has no execution.
+#[test]
+fn a_lean_chain_refuses_a_round_zero_lane_off() {
+    let mut cases = tail_cases();
+    cases.push(untailed());
+    for (num_vars, cfg) in cases {
+        let f = fixture(num_vars, cfg);
+        let shape = lean(&f.shape);
+        let program = p1_chain_program(&shape);
+        let honest = arena_at(&f, &f.proof, &shape).expect("laid out");
+        assert!(execute(&program, &[honest.clone()], &SOCKET).is_ok());
+        let words = shape.round0_block_words(1usize << shape.schedule[0]);
+        for q in [0, shape.num_queries - 1] {
+            for word in [0, words - 1] {
+                for lane in 0..4 {
+                    let mut forged = honest.clone();
+                    forged[round0_block_at(&shape, q) + word][lane] += FE::from(1u64);
+                    assert!(
+                        execute(&program, &[forged], &SOCKET).is_err(),
+                        "S={num_vars}: query {q}'s word {word} lane {lane} one off must be \
+                         refused"
+                    );
+                }
+            }
+        }
+    }
 }

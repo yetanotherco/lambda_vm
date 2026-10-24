@@ -72,8 +72,22 @@
 //! order, three siblings a 4-ary level and one at an uncapped odd top
 //! ([`super::merkle_cap::child_path_to_cap`] lays the arena out). The `Pack`
 //! pin above holds the same way: the leaf packs every value lane.
+//!
+//! # Under the lean query
+//!
+//! A lean leaf (`LeafQuery::Lean`) hints round 0's base values four to a word
+//! ([`BlockValues::BaseWords`]): the leaf hash takes the words as its rate
+//! words ([`super::p1w16_emit::leaf_hash_words`]) and the fold reads the felts
+//! each word's `Unpack` writes. The pin moves from `Pack` to `Unpack`, which
+//! receives the word token and sends each lane as a `base_token`
+//! `(addr, v, 0, 0, 0)` from the same value columns (`chips::lanes`): every
+//! felt the fold lifts is a base cell and a lane of a hashed word. A word's
+//! lanes past the block's last value are hashed as given, so anything but the
+//! committer's zero fill is another leaf, which the root refuses. The
+//! obligation above holds unchanged: the felts folded are the unpacked lanes of
+//! the words hashed.
 
-use super::builder::{Bit, Ext, Felt, LfmBuilder};
+use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
 use super::edsl::{self, WrapDigest};
 
 /// Base felts a cubic extension element decomposes to.
@@ -99,6 +113,14 @@ pub enum BlockValues<'a> {
     /// Round 0's current codeword, before any extension challenge has touched
     /// it — `RoundOpenings::Base` on the host.
     Base(&'a [Felt]),
+    /// [`Self::Base`] as a lean leaf hints it (`LeafQuery::Lean`): the
+    /// values four a hinted word, which the leaf hash takes as its rate words,
+    /// and the felts each word's `Unpack` writes, which the fold reads (the
+    /// module doc's "Under the lean query").
+    BaseWords {
+        words: &'a [Cell],
+        felts: &'a [Felt],
+    },
     /// Every successor block, and every current block after round 0.
     Ext(&'a [Ext]),
 }
@@ -108,6 +130,7 @@ impl BlockValues<'_> {
     pub fn len(&self) -> usize {
         match self {
             BlockValues::Base(v) => v.len(),
+            BlockValues::BaseWords { felts, .. } => felts.len(),
             BlockValues::Ext(v) => v.len(),
         }
     }
@@ -120,6 +143,7 @@ impl BlockValues<'_> {
     pub fn felts(&self) -> usize {
         match self {
             BlockValues::Base(v) => v.len(),
+            BlockValues::BaseWords { felts, .. } => felts.len(),
             BlockValues::Ext(v) => FELTS_PER_EXT * v.len(),
         }
     }
@@ -218,6 +242,14 @@ pub const fn cap_check_rows(cap: usize) -> usize {
 pub fn emit_block_leaf(b: &mut LfmBuilder, values: BlockValues<'_>) -> WrapDigest {
     match values {
         BlockValues::Base(felts) => edsl::wrap_leaf_hash(b, felts),
+        BlockValues::BaseWords { words, felts } => {
+            assert_eq!(
+                b.wrap_hash(),
+                edsl::WrapHash::Poseidon1,
+                "packed round-0 words hash under the Poseidon1 leaf"
+            );
+            super::p1w16_emit::leaf_hash_words(b, words, felts.len())
+        }
         BlockValues::Ext(cells) => {
             let mut felts = Vec::with_capacity(FELTS_PER_EXT * cells.len());
             for value in cells {

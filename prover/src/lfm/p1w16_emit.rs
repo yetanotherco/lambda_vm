@@ -109,6 +109,31 @@ pub fn leaf_hash(b: &mut LfmBuilder, felts: &[Felt]) -> WrapDigest {
     WrapDigest::from_cell(carry)
 }
 
+/// [`leaf_hash`] over `felts` felts arriving as WORDS, four a word in order,
+/// the last zero-filled: each word is the rate word [`leaf_hash`] would pack
+/// from the same four felts, so the digest is the same — the same width tag
+/// and twelve-felt block schedule, three words a block, constant zero words
+/// past the last. A word's lanes past `felts` are hashed as given, so anything
+/// but zero there gives a digest no committer computed.
+pub fn leaf_hash_words(b: &mut LfmBuilder, words: &[Cell], felts: usize) -> WrapDigest {
+    assert_eq!(
+        words.len(),
+        felts.div_ceil(4),
+        "four felts a word, the last zero-filled"
+    );
+    if felts == 0 {
+        return WrapDigest::from_cell(zero_cell(b));
+    }
+    let tag = crypto::hash::poseidon1_stark::leaf_capacity(felts);
+    let mut carry = b.digest_const(tag).as_cell();
+    for block in words.chunks(RATE_FELTS / 4) {
+        let rate: [Cell; 3] =
+            core::array::from_fn(|k| block.get(k).copied().unwrap_or_else(|| zero_cell(b)));
+        carry = b.hash16([rate[0], rate[1], rate[2], carry])[0];
+    }
+    WrapDigest::from_cell(carry)
+}
+
 /// One 4-ary node: the four children, permuted, truncated to cell 0.
 pub fn node4(b: &mut LfmBuilder, children: [Cell; 4]) -> Cell {
     b.hash16(children)[0]

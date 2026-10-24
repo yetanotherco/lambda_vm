@@ -205,7 +205,8 @@ pub enum LeafQuery {
     /// Every round's queries opened and folded one by one. The default.
     #[default]
     V1,
-    /// As [`Self::V1`], except the chain's tail rounds
+    /// As [`Self::V1`], except round 0's base values arrive four to a hinted
+    /// word ([`ChainShape::round0_packed`]) and the chain's tail rounds
     /// ([`ChainShape::tail_round`]): a round whose current tree lies wholly in
     /// its cap, with at least [`TAIL_QUERIES_A_LEAF`] queries a leaf, is
     /// checked at EVERY leaf once, each leaf's block hashed against its cap
@@ -292,6 +293,23 @@ impl ChainShape {
             && c > 0
             && super::merkle_cap::mux_bits(depth, c, 4) == depth
             && TAIL_QUERIES_A_LEAF << depth <= self.num_queries
+    }
+
+    /// Whether round 0's base values arrive four to a hinted word
+    /// ([`LeafQuery::Lean`] on a 4-ary tree): hashed as the leaf hash's rate
+    /// words and unpacked into the felts the fold reads.
+    pub fn round0_packed(&self) -> bool {
+        self.query == LeafQuery::Lean && self.arity == 4
+    }
+
+    /// Hinted words one round-0 block of `block` values takes: one a value, or
+    /// four values a word when packed.
+    pub fn round0_block_words(&self, block: usize) -> usize {
+        if self.round0_packed() {
+            block.div_ceil(4)
+        } else {
+            block
+        }
     }
 
     /// Leaves of round `r`'s current tree: the blocks a tail round checks.
@@ -1295,7 +1313,7 @@ fn emit_combine(b: &mut LfmBuilder, eqs: &[Ext], blocks: &[QueryOpening<'_>]) ->
     let felts: Vec<&[Felt]> = blocks
         .iter()
         .map(|block| match block.values {
-            BlockValues::Base(felts) => felts,
+            BlockValues::Base(felts) | BlockValues::BaseWords { felts, .. } => felts,
             BlockValues::Ext(_) => panic!("a grouped round 0's blocks are base-field"),
         })
         .collect();
@@ -1651,7 +1669,9 @@ fn folded_block(b: &mut LfmBuilder, blocks: &[QueryOpening<'_>], eqs: &[Ext]) ->
 /// those lanes; [`super::whir_open`]'s module doc carries that obligation.
 fn block_ext(values: BlockValues<'_>) -> Vec<Ext> {
     match values {
-        BlockValues::Base(felts) => felts.iter().map(|f| f.as_ext()).collect(),
+        BlockValues::Base(felts) | BlockValues::BaseWords { felts, .. } => {
+            felts.iter().map(|f| f.as_ext()).collect()
+        }
         BlockValues::Ext(cells) => cells.to_vec(),
     }
 }
@@ -1712,6 +1732,12 @@ pub fn chain_shape_rows(shape: &ChainShape) -> usize {
 /// A current block's wires, in the field its round holds them in.
 pub enum CurrentBlock {
     Base(Vec<Felt>),
+    /// Round 0's base values hinted four a word, and the felts their
+    /// `Unpack`s write ([`ChainShape::round0_packed`]).
+    BaseWords {
+        words: Vec<Cell>,
+        felts: Vec<Felt>,
+    },
     Ext(Vec<Ext>),
 }
 
@@ -1719,6 +1745,7 @@ impl CurrentBlock {
     fn as_block(&self) -> BlockValues<'_> {
         match self {
             CurrentBlock::Base(v) => BlockValues::Base(v),
+            CurrentBlock::BaseWords { words, felts } => BlockValues::BaseWords { words, felts },
             CurrentBlock::Ext(v) => BlockValues::Ext(v),
         }
     }
@@ -1817,7 +1844,19 @@ impl RoundStorage {
             };
             let current: Vec<(CurrentBlock, Vec<WrapDigest>)> = (0..openings)
                 .map(|_| {
-                    let values = if r == 0 {
+                    let values = if r == 0 && shape.round0_packed() {
+                        // Four values a word: the leaf hash takes the words,
+                        // the fold the felts their `Unpack`s write.
+                        let words: Vec<Cell> = (0..shape.round0_block_words(block))
+                            .map(|_| next_word(b, &mut at))
+                            .collect();
+                        let felts: Vec<Felt> = words
+                            .iter()
+                            .flat_map(|w| b.unpack(*w))
+                            .take(block)
+                            .collect();
+                        CurrentBlock::BaseWords { words, felts }
+                    } else if r == 0 {
                         let felts: Vec<Felt> = (0..block)
                             .map(|_| {
                                 let f = b.hint_felt(arena, at);
@@ -1974,8 +2013,14 @@ pub fn round_words(shape: &ChainShape, r: usize) -> u32 {
         // A tail round: every leaf's block once, in leaf order, and no path.
         n += (shape.current_leaves(r) * block) as u32;
     } else {
-        // A grouped round 0 opens each of its trees at every query.
-        n += (shape.num_queries * shape.trees_at(r) * (block + depth)) as u32;
+        // A grouped round 0 opens each of its trees at every query; round 0's
+        // base values four a word when packed.
+        let words = if r == 0 {
+            shape.round0_block_words(block)
+        } else {
+            block
+        };
+        n += (shape.num_queries * shape.trees_at(r) * (words + depth)) as u32;
     }
     if r == 0 {
         // W1: tree 0's cap words, a grouped round 0's trees' each.
@@ -2201,7 +2246,7 @@ fn push_openings(
         0
     };
     if shape.arity == 4 {
-        push_openings4(words, round, current, tree);
+        push_openings4(words, round, current, tree, shape.round0_packed());
         return;
     }
     fn side<V>(
@@ -2292,19 +2337,39 @@ fn push_openings(
     }
 }
 
+/// Round 0's base block: a `(v, 0, 0, 0)` word a value, or four values a word,
+/// the last zero-filled, when `packed` ([`ChainShape::round0_packed`]).
+fn push_base_block(words: &mut Vec<LfmWord>, values: &[FE], packed: bool) {
+    if packed {
+        for lanes in values.chunks(4) {
+            let mut word = [FE::zero(); 4];
+            word[..lanes.len()].copy_from_slice(lanes);
+            words.push(word);
+        }
+    } else {
+        words.extend(
+            values
+                .iter()
+                .map(|v| [*v, FE::zero(), FE::zero(), FE::zero()]),
+        );
+    }
+}
+
 /// [`push_openings`] at arity 4: the owner's cap, then per opening its block
-/// and its path in child order, cut to the cap.
+/// and its path in child order, cut to the cap. Only a current base side is
+/// ever `packed`.
 fn push_openings4(
     words: &mut Vec<LfmWord>,
     round: &ChainRound<GoldilocksField, GoldilocksExtension>,
     current: bool,
     tree: PathSide,
+    packed: bool,
 ) {
     fn side<V>(
         words: &mut Vec<LfmWord>,
         openings: &[multilinear::whir_commit::CosetOpening<V>],
         tree: PathSide,
-        value_word: impl Fn(&math::field::element::FieldElement<V>) -> LfmWord,
+        block: impl Fn(&mut Vec<LfmWord>, &[math::field::element::FieldElement<V>]),
     ) where
         V: math::field::traits::IsField,
     {
@@ -2331,27 +2396,28 @@ fn push_openings4(
             }
         }
         for (opening, (path, _)) in openings.iter().zip(&laid) {
-            for v in &opening.values {
-                words.push(value_word(v));
-            }
+            block(words, &opening.values);
             for node in path {
                 words.push(commitment_to_digest(node));
             }
         }
     }
+    let ext_block = |words: &mut Vec<LfmWord>, values: &[FEE]| {
+        words.extend(values.iter().map(ext_word));
+    };
     match &round.openings {
         RoundOpenings::Base(p) => {
             if current {
-                side(words, &p.current, tree, |v| {
-                    [*v, FE::zero(), FE::zero(), FE::zero()]
+                side(words, &p.current, tree, |words, values| {
+                    push_base_block(words, values, packed)
                 });
             } else {
-                side(words, &p.next, tree, ext_word);
+                side(words, &p.next, tree, ext_block);
             }
         }
         RoundOpenings::Extension(p) => {
             let openings = if current { &p.current } else { &p.next };
-            side(words, openings, tree, ext_word);
+            side(words, openings, tree, ext_block);
         }
         // See `push_openings`: the trees' caps in tree order, then per query
         // each tree's block and path.
@@ -2384,16 +2450,14 @@ fn push_openings4(
                 }
                 for (row, laid_row) in p.current.iter().zip(&laid) {
                     for (opening, (path, _)) in row.iter().zip(laid_row) {
-                        for v in &opening.values {
-                            words.push([*v, FE::zero(), FE::zero(), FE::zero()]);
-                        }
+                        push_base_block(words, &opening.values, packed);
                         for node in path {
                             words.push(commitment_to_digest(node));
                         }
                     }
                 }
             } else {
-                side(words, &p.next, tree, ext_word);
+                side(words, &p.next, tree, ext_block);
             }
         }
     }

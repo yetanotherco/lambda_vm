@@ -36,7 +36,7 @@ use super::instr::Instr;
 use super::validator::validate;
 use super::whir_chain::onechain_steps::{self, Step};
 use super::whir_chain::{
-    ChainShape, RoundStorage, chain_opening_perms, onechain_faults, push_round_words,
+    ChainShape, LeafQuery, RoundStorage, chain_opening_perms, onechain_faults, push_round_words,
 };
 use super::whir_chain_tests::{Recording, const_rows, hint_rows, perm_rows};
 use super::whir_stacked::{StackedChainWires, emit_stacked_verify_chains, stacked_verify_cost};
@@ -963,6 +963,64 @@ fn every_slots_round_zero_value_is_pinned_to_its_low_lane() {
                  {refusal:?}",
                 f.name
             );
+        }
+    }
+}
+
+/// The arena word and lane of value `t` of tree `p`'s block at query `q` in
+/// chain 0, under [`LeafQuery::Lean`]: [`round0_value_at`]'s layout with each
+/// block four values a word.
+fn round0_lane_at(f: &Fixture, q: usize, p: usize, t: usize) -> (usize, usize) {
+    let at = Arena::new(f);
+    let runs = f.shape.chains(f.layout.num_polys());
+    let shape = f.shape.run(runs[0].len());
+    assert!(shape.round0_packed(), "a lean P1 shape");
+    let nonces = shape.carries(0).iter().filter(|&&c| c).count();
+    let caps = shape.trees * shape.cap_words(shape.current_depth(0), shape.caps[0]);
+    let words = shape.round0_block_words(1usize << shape.schedule[0]);
+    let word = at.chain_at[0] as usize
+        + runs[0].len()
+        + 1
+        + 2 * shape.messages(0)
+        + nonces
+        + caps
+        + (q * shape.trees + p) * (words + shape.current_path(0))
+        + t / 4;
+    (word, t % 4)
+}
+
+/// ★ Under [`LeafQuery::Lean`] a grouped round 0's blocks arrive four values a
+/// word: every Poseidon1 case executes on the proof the host accepts, with
+/// fewer hinted words and the same socket rows as under V1, and a value one
+/// off in any lane of any slot's tree has no execution.
+#[test]
+fn grouped_round_zero_words_under_the_lean_query_execute_and_refuse_a_lane_off() {
+    for case in cases().into_iter().filter(|c| c.base == Base::P1) {
+        let mut f = fixture(&case);
+        let v1 = program(&f);
+        f.shape.query = LeafQuery::Lean;
+        let lean = program(&f);
+        let honest = arena(&f, &f.proof);
+        machine_runs(&f, &lean, honest.clone())
+            .unwrap_or_else(|e| panic!("{}: the machine refused an accepted proof: {e}", f.name));
+        assert!(
+            hint_rows(&lean) < hint_rows(&v1),
+            "{}: fewer hinted words",
+            f.name
+        );
+        let block = 1usize << f.shape.schedule[0];
+        let trees = f.shape.chains(f.layout.num_polys())[0].len();
+        for p in 0..trees {
+            for t in [0, 1, 2, 3, block - 1] {
+                let (word, lane) = round0_lane_at(&f, 1, p, t);
+                let mut forged = honest.clone();
+                forged[word][lane] += FE::one();
+                assert!(
+                    execute(&lean, &[forged], &socket(f.base)).is_err(),
+                    "{} slot {p}: value {t} one off must have no execution",
+                    f.name
+                );
+            }
         }
     }
 }
