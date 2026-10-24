@@ -4487,6 +4487,11 @@ pub struct StreamSkip {
     /// the card fills the columns from them. The words are the same. Such a
     /// table is never dropped, so phase B never builds KECCAK_RND again.
     pub card_fill: bool,
+    /// A test's fault: with [`Self::card_fill`], each KECCAK_RND table's
+    /// records start this many rows late, so every fill of them (the card's at
+    /// both uploads, a host reader's) writes the same wrong table.
+    #[cfg(test)]
+    pub card_fill_fault: usize,
     /// The streamed tables' op lists hold only the ops past their streamed
     /// chunks (a windowed build that drops each chunk's ops as it hands the
     /// chunk out, [`WindowedTraceBuilder::drop_streamed_ops`]), and

@@ -186,6 +186,9 @@ pub struct WindowedTraceBuilder<'a> {
     slide_rest: bool,
     /// [`Self::card_fill_keccak_rnd`].
     card_fill: bool,
+    /// [`Self::card_fill_records_fault`].
+    #[cfg(test)]
+    card_fill_fault: usize,
 }
 
 /// Where a builder's creation spent its time, seconds: the initial image and
@@ -379,6 +382,8 @@ impl<'a> WindowedTraceBuilder<'a> {
             },
             slide_rest: false,
             card_fill: false,
+            #[cfg(test)]
+            card_fill_fault: 0,
         })
     }
 
@@ -544,6 +549,15 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// of building its columns. The words are the same.
     pub fn card_fill_keccak_rnd(mut self) -> Self {
         self.card_fill = true;
+        self
+    }
+
+    /// A test's fault ([`StreamSkip::card_fill_fault`]): with
+    /// [`Self::card_fill_keccak_rnd`], each KECCAK_RND table's records start
+    /// `rows` rows late, the same wrong table however they are filled.
+    #[cfg(test)]
+    pub(crate) fn card_fill_records_fault(mut self, rows: usize) -> Self {
+        self.card_fill_fault = rows;
         self
     }
 
@@ -827,6 +841,8 @@ impl<'a> WindowedTraceBuilder<'a> {
             gpack,
             cut_padding,
             card_fill,
+            #[cfg(test)]
+            card_fill_fault,
             ..
         } = self;
         // Chunks at the finish alone: none were handed out.
@@ -844,6 +860,8 @@ impl<'a> WindowedTraceBuilder<'a> {
             pack: pack_finished,
             gpack: pack_finished && gpack,
             card_fill: pack_finished && card_fill,
+            #[cfg(test)]
+            card_fill_fault,
             keccak_rows,
             ecsm_rows,
             ecdas_rows,

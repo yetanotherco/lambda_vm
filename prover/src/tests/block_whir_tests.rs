@@ -4268,3 +4268,39 @@ fn keccak_rnd_held_as_records_is_never_dropped() {
         assert_eq!(bytes(&built), bytes(&plain), "the proof");
     }
 }
+
+/// ★ A wrong KECCAK_RND table held as records is refused by the verifier: with
+/// its records starting a row late ([`Deviations::card_fill_records_fault`]),
+/// every fill of them (the card's at both uploads, or a host reader's) writes
+/// the same wrong table, so the prover's own checks of what it committed pass
+/// and it makes a proof, and the unchanged verifier refuses it. (A fill that
+/// differs between the phases is the prover's to refuse first: its opening
+/// re-hashes what phase A committed.)
+#[test]
+fn a_wrong_records_table_is_refused_by_the_verifier() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.layout_workers = 3;
+    let (proof, stamps) = prove_block_whir_with(
+        &elf,
+        &[],
+        &ProofOptions::default_test_options(),
+        &format,
+        &o,
+        &Deviations {
+            card_fill: Some(true),
+            card_fill_records_fault: 1,
+            ..Deviations::default()
+        },
+    )
+    .unwrap_or_else(|e| panic!("the prover refused ({e:?}): the verifier was never asked"));
+    assert!(
+        stamps.layout.records_rest.0 > 0,
+        "no KECCAK_RND table held as records"
+    );
+    assert!(
+        !verify(&proof, &elf, &format),
+        "a proof over a wrong KECCAK_RND table verified"
+    );
+}

@@ -2372,6 +2372,10 @@ fn keccak_rnd_units<'a>(
             .collect()
     };
     let card_fill = skip.card_fill && pack;
+    #[cfg(test)]
+    let fault = skip.card_fill_fault;
+    #[cfg(not(test))]
+    let fault = 0;
     // Rows `skip..skip + rows` of the table `ops` make: as records for the
     // card, or built here.
     let build = move |ops: &[KeccakOperation], skip: usize, rows: usize| -> Table {
@@ -2381,7 +2385,7 @@ fn keccak_rnd_units<'a>(
                     timestamp: op.timestamp,
                     input: op.input,
                 }),
-                skip,
+                skip + fault,
                 rows,
             )
             .into_trace()

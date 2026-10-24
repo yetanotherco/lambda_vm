@@ -2498,6 +2498,12 @@ pub(crate) struct Deviations {
     /// Whether the card fills KECCAK_RND from its records, instead of the
     /// knob ([`block_card_fill`]).
     pub card_fill: Option<bool>,
+    /// With the card fill, each KECCAK_RND table's records start this many
+    /// rows late ([`WindowedTraceBuilder::card_fill_records_fault`]): one
+    /// wrong table, the same at both uploads and to any host reader, so the
+    /// prover's own checks cannot tell it from the committed one.
+    #[cfg(test)]
+    pub card_fill_records_fault: usize,
 }
 
 /// A prepared stack committed wrongly, tables by AIR index.
@@ -4434,6 +4440,11 @@ fn prove_streamed(
                 }
                 if card_fill {
                     builder = builder.card_fill_keccak_rnd();
+                    #[cfg(test)]
+                    if deviations.card_fill_records_fault > 0 {
+                        builder =
+                            builder.card_fill_records_fault(deviations.card_fill_records_fault);
+                    }
                 }
                 if let Some(ledger) = ledger {
                     ledger.image.store(builder.image_bytes(), Relaxed);

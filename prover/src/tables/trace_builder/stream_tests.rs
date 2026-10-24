@@ -1029,3 +1029,40 @@ fn held_as_records_the_finishs_keccak_rnd_tables_are_its_tables() {
     }
     assert!(held > 0, "some KECCAK_RND table was held as records");
 }
+
+/// The records fault a block test plants ([`WindowedTraceBuilder::card_fill_records_fault`])
+/// moves the records themselves: every KECCAK_RND table with a real row is
+/// then another table than the finish builds without it, however it is
+/// filled.
+#[test]
+fn a_records_fault_moves_every_keccak_rnd_table_with_a_row() {
+    let (program, logs) = run("test_keccak_multi");
+    let max_rows = MaxRowsConfig::small();
+    let host = |b| cut(b, CutPadding::LastTable);
+    let faulty = |b| {
+        cut(b, CutPadding::LastTable)
+            .card_fill_keccak_rnd()
+            .card_fill_records_fault(1)
+    };
+    let (builder, last) = pushed(&program, &logs, &max_rows, 7, &host);
+    let (want, _) = streamed_keeping(builder, last, false);
+    let (builder, last) = pushed(&program, &logs, &max_rows, 7, &faulty);
+    let (got, _) = streamed_keeping(builder, last, false);
+    let mut moved = 0usize;
+    for (g, w) in got.iter().zip(&want) {
+        let (Some(g), Some(w)) = (&g.table, &w.table) else {
+            continue;
+        };
+        let Some(records) = g.records_main() else {
+            continue;
+        };
+        let filled = records.host_fill().expect("the host fills it");
+        let filled = Some((filled.widths().to_vec(), filled.data().to_vec()));
+        assert!(
+            first_difference(&filled, &packed_bytes(w)).is_some(),
+            "a KECCAK_RND table the fault left as it was"
+        );
+        moved += 1;
+    }
+    assert!(moved > 0, "no KECCAK_RND table held as records");
+}
