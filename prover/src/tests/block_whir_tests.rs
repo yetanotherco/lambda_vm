@@ -1708,6 +1708,24 @@ fn phase_b_overlap_failures_are_the_proves_error_and_a_refusal_turns_it_serial()
             },
         )
     };
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    // First the overlap with no fault: every group but the last opened beside
+    // an argue, so the faults below meet the opening thread where they aim.
+    let (plain, stamps) = run(OverlapFaults::default()).expect("prove");
+    let n = stamps.groups.len();
+    assert!(n > 3, "{n} groups");
+    assert_eq!(
+        stamps.groups.iter().filter(|g| g.overlapped).count(),
+        n - 1,
+        "every group but the last opened beside an argue\n{}",
+        stamps.report()
+    );
+    // The panic at place 0: the opening thread's first openings, in the first
+    // transition, before any refusal could turn the rest serial.
     for (what, faults, stage) in [
         (
             "an opening fails",
@@ -1728,7 +1746,7 @@ fn phase_b_overlap_failures_are_the_proves_error_and_a_refusal_turns_it_serial()
         (
             "the opening thread panics",
             OverlapFaults {
-                open_panics: Some(1),
+                open_panics: Some(0),
                 ..OverlapFaults::default()
             },
             "the previous group's openings",
@@ -1739,15 +1757,6 @@ fn phase_b_overlap_failures_are_the_proves_error_and_a_refusal_turns_it_serial()
             Ok(_) => panic!("{what}: proved"),
         }
     }
-    let bytes = |p: &BlockWhirProof| {
-        rkyv::to_bytes::<rkyv::rancor::Error>(p)
-            .expect("serialize")
-            .to_vec()
-    };
-    let (plain, stamps) = run(OverlapFaults::default()).expect("prove");
-    let n = stamps.groups.len();
-    assert!(n > 3, "{n} groups");
-    assert_eq!(stamps.groups.iter().filter(|g| g.overlapped).count(), n - 1);
     let (latched, stamps) = run(OverlapFaults {
         refusal_at: Some(2),
         ..OverlapFaults::default()
