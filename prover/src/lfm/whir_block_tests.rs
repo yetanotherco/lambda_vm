@@ -2544,10 +2544,10 @@ fn the_whir_block_tree_on_a_real_block() {
     // re-encoded after all.
     if crate::zf_format::ZfFormat::global().whir_leaves == multilinear::whir_chain::LeafOrder::Coset
     {
-        // Then the openings that read the stack where it lies
-        // (`LAMBDA_VM_WHIR_COSET_INPLACE`), those asked to whose parts the
-        // kernels could not place (assembled after all), and their tiles
-        // folded to zero unread and read value by value.
+        // Then the openings that read the stack where it lies (the default;
+        // `LAMBDA_VM_WHIR_COSET_INPLACE=0` assembles), those asked to whose
+        // parts the kernels could not place (assembled after all), and their
+        // tiles folded to zero unread and read value by value.
         let (zero, mixed) = multilinear::gpu::coset_inplace_tiles();
         println!(
             "W3 WHIR COSET: round-0 leaves in the coset order · openings from the stack {} · re-encoded {} · in place {} ({}) · assembled after all {} · tiles zero {} · mixed {}",

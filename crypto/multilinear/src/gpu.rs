@@ -115,8 +115,8 @@ static COSET_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// that order. The same bytes as the card's encode; a host NTT's time instead.
 static COSET_HOST_ENCODES: AtomicU64 = AtomicU64::new(0);
 /// Coset openings that read the stack where it lies in the store's buffer
-/// (`LAMBDA_VM_WHIR_COSET_INPLACE=1`): no stack assembled, its zero tiles
-/// folded unread. Among [`COSET_OPENINGS`].
+/// (the default; `LAMBDA_VM_WHIR_COSET_INPLACE=0` assembles): no stack
+/// assembled, its zero tiles folded unread. Among [`COSET_OPENINGS`].
 static COSET_INPLACE_OPENS: AtomicU64 = AtomicU64::new(0);
 /// ⚠ Coset openings asked to read the stack in place whose parts the kernels
 /// could not place: the stack assembled after all, today's cost.
@@ -551,8 +551,14 @@ pub fn coset_inplace_tiles() -> (u64, u64) {
 }
 
 /// Whether a coset opening reads the stack where it lies instead of
-/// assembling it: `LAMBDA_VM_WHIR_COSET_INPLACE=1` or a test's override. Off
-/// by default. The same words either way.
+/// assembling it unless told otherwise: [`coset_inplace_in_effect`]'s answer
+/// with `LAMBDA_VM_WHIR_COSET_INPLACE` unset.
+const COSET_INPLACE_DEFAULT: bool = true;
+
+/// Whether a coset opening reads the stack where it lies instead of
+/// assembling it: [`COSET_INPLACE_DEFAULT`] (on);
+/// `LAMBDA_VM_WHIR_COSET_INPLACE=0` assembles, `=1` reads in place, a test's
+/// override wins. The same words either way.
 pub fn coset_inplace_in_effect() -> bool {
     match COSET_INPLACE_FORCED.load(Ordering::Relaxed) {
         1 => true,
@@ -560,15 +566,22 @@ pub fn coset_inplace_in_effect() -> bool {
         _ => {
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *ON.get_or_init(|| {
-                matches!(
+                coset_inplace_from(
                     std::env::var("LAMBDA_VM_WHIR_COSET_INPLACE")
                         .ok()
-                        .as_deref()
-                        .map(str::trim),
-                    Some("1")
+                        .as_deref(),
                 )
             })
         }
+    }
+}
+
+/// [`coset_inplace_in_effect`] for the variable's value `word`.
+fn coset_inplace_from(word: Option<&str>) -> bool {
+    match word.map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => COSET_INPLACE_DEFAULT,
     }
 }
 
@@ -7098,6 +7111,21 @@ mod tests {
     use math::field::goldilocks::{GOLDILOCKS_PRIME as P, GoldilocksField as Gl};
 
     type FE = FieldElement<Ext3>;
+
+    /// A coset opening reads the stack where it lies by default: unset (or
+    /// any other word) reads in place, `0` assembles, `1` reads in place; with
+    /// the variable unset the knob says so.
+    #[test]
+    fn a_coset_opening_reads_its_stack_in_place_by_default() {
+        assert!(coset_inplace_from(None), "unset: in place");
+        assert!(!coset_inplace_from(Some("0")), "0: assembled");
+        assert!(coset_inplace_from(Some(" 1 ")), "1: in place");
+        assert!(coset_inplace_from(Some("yes")), "another word: the default");
+        if std::env::var_os("LAMBDA_VM_WHIR_COSET_INPLACE").is_none() {
+            force_coset_inplace(None);
+            assert!(coset_inplace_in_effect());
+        }
+    }
 
     /// ★ A value read back from the card is serialized canonically whatever
     /// representative the card left: a limb `v + p` and the limb `v` give the
