@@ -33,7 +33,8 @@ use super::proof::{
     take_prove_split,
 };
 use super::whir_block::{
-    BLOCK_FAN_IN, WhirBlockPlan, artifacts_of, block_leaf_arena, group_arena_words, leaf_arena,
+    BLOCK_FAN_IN, LeafScale, WhirBlockPlan, artifacts_of, block_leaf_arena, group_arena_words,
+    leaf_arena, leaf_scale_from_env,
 };
 use super::word::LfmWord;
 use crate::hash_pin::{BlockFamily, ProofFamily};
@@ -280,6 +281,26 @@ pub fn leaves_setting(value: Option<&str>) -> Result<LeafOrder, String> {
     }
 }
 
+/// `W3 LEAF SCALE`: the format's leaf scale, the leaf count at the single
+/// heights and whether the partition doubled them; a fixed leaf count
+/// (`W3_LEAVES`) bounds no chip, so no scale applies.
+pub fn leaf_scale_line(scale: LeafScale, plan: &WhirBlockPlan) -> String {
+    let leaves = plan.partition().num_leaves();
+    match plan.leaf_bound() {
+        None => {
+            format!("W3 LEAF SCALE: {scale} · {leaves} leaves forced (W3_LEAVES): no scale applies")
+        }
+        Some(bound) if bound.doubled => format!(
+            "W3 LEAF SCALE: {scale} · {} leaves at the single heights · doubled to {leaves} leaves",
+            bound.single_leaves
+        ),
+        Some(bound) => format!(
+            "W3 LEAF SCALE: {scale} · {} leaves at the single heights · not doubled",
+            bound.single_leaves
+        ),
+    }
+}
+
 /// How many leaf programs are emitted at once beside phase B by default
 /// (`W3_LEAF_EMITTERS`). One thread a leaf, all started at the statement, took
 /// the host from phase B's first groups (measured on a 16-core host with one
@@ -303,6 +324,9 @@ impl WhirTreeConfig {
     /// harness always read. A value a knob cannot take is an error (the
     /// `BLOCK_WHIR_*` readers of [`crate::block_whir`] keep their own refusals).
     pub fn from_env() -> Result<Self, String> {
+        // The leaves' scale first: the production format reads the same knob
+        // and refuses what it cannot take, which this returns as an error.
+        let leaf_scale = leaf_scale_from_env()?;
         let leaves = count_knob("W3_LEAVES")?;
         let siblings = count_knob("W3_SIBLINGS")?.unwrap_or(3);
         let fan_in = count_knob("W3_FAN_IN")?.unwrap_or(BLOCK_FAN_IN);
@@ -324,6 +348,7 @@ impl WhirTreeConfig {
         };
         let format = BlockFormat {
             argue,
+            leaf_scale,
             ..BlockFormat::production_with(group_setting(
                 std::env::var("LAMBDA_VM_WHIR_GROUP").ok().as_deref(),
             )?)
@@ -2101,6 +2126,7 @@ pub fn prove_whir_block_tree(
         plan.partition().leaves(),
         plan.prepared().len()
     ));
+    sink.line(&leaf_scale_line(format.leaf_scale, &plan));
     // Each leaf's chips, real / padded rows: how far each sits from its next
     // doubling, and which one doubled when the in-guest work moves.
     // (The leaves emitted beside the base: the others do not exist yet.)
@@ -2472,11 +2498,13 @@ pub fn verify_whir_block_tree_proof_grouped(
 }
 
 /// [`verify_whir_block_tree_proof`] at production's format with the caller's
-/// named choices, its group opening, its WHIR blowup and its round-0 leaf
-/// order ([`super::whir_block::verify_block_tree_at`]); the file carries none
-/// of them. No public entry point takes a format of the caller's own.
+/// named choices, its group opening, its WHIR blowup, its round-0 leaf order
+/// and its leaf scale ([`super::whir_block::verify_block_tree_at`]); the file
+/// carries none of them. No public entry point takes a format of the caller's
+/// own.
 ///
 /// ```no_run
+/// use lambda_vm_prover::lfm::whir_block::LeafScale;
 /// use lambda_vm_prover::lfm::whir_block_tree::{
 ///     WhirBlockTreeProof, verify_whir_block_tree_proof_at,
 /// };
@@ -2490,6 +2518,7 @@ pub fn verify_whir_block_tree_proof_grouped(
 ///         GroupFold::Indexed,
 ///         WhirBlowup::Two,
 ///         LeafOrder::Coset,
+///         LeafScale::DoubleFrom(12),
 ///     )
 /// }
 /// ```
@@ -2506,6 +2535,7 @@ pub fn verify_whir_block_tree_proof_at(
     group: GroupFold,
     blowup: WhirBlowup,
     leaves: LeafOrder,
+    leaf_scale: LeafScale,
 ) -> Result<(), String> {
     let top = LfmProof {
         proof: proof.top_proof.clone(),
@@ -2518,6 +2548,7 @@ pub fn verify_whir_block_tree_proof_at(
         group,
         blowup,
         leaves,
+        leaf_scale,
     )
 }
 
@@ -2533,7 +2564,7 @@ mod tests {
     /// declared crate-internal. From outside the crate the same is checked by
     /// [`verify_whir_block_tree_proof_at`]'s `compile_fail` doc test. The
     /// verifiers of named choices (`…_at`) take each choice typed: the group
-    /// opening, the WHIR blowup and the round-0 leaf order.
+    /// opening, the WHIR blowup, the round-0 leaf order and the leaf scale.
     #[test]
     fn no_public_tree_verifier_takes_a_block_format() {
         let block = include_str!("whir_block.rs");
@@ -2551,7 +2582,7 @@ mod tests {
                     "{file}: the public verifier {name} takes a BlockFormat"
                 );
                 if name.ends_with("_at") {
-                    for choice in ["GroupFold", "WhirBlowup", "LeafOrder"] {
+                    for choice in ["GroupFold", "WhirBlowup", "LeafOrder", "LeafScale"] {
                         assert!(
                             params.contains(choice),
                             "{file}: {name} takes its {choice} as a named choice"

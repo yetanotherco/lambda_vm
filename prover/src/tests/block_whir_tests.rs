@@ -24,6 +24,7 @@ fn one_group() -> BlockFormat {
         prepared: true,
         argue: ArgueFormat::PerTable,
         group: multilinear::whir_chain::GroupFold::PerPoly,
+        leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
     }
 }
 
@@ -39,6 +40,7 @@ fn many_groups() -> BlockFormat {
         prepared: true,
         argue: ArgueFormat::PerTable,
         group: multilinear::whir_chain::GroupFold::PerPoly,
+        leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
     }
 }
 

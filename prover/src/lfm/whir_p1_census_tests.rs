@@ -614,7 +614,10 @@ fn whir_onechain_census() {
 
 // ======================== the leaves' chip heights ========================
 
-use super::whir_block::{CARRIER, P1_LEAF_HEIGHTS, leaf_partition_rows};
+use super::whir_block::{
+    CARRIER, LeafScale, P1_LEAF_HEIGHTS, P1_LEAF_HEIGHTS_2X, leaf_partition_rows,
+    scaled_leaf_partition,
+};
 use super::whir_chain::ChipRows;
 
 fn p1_format() -> BlockFormat {
@@ -821,6 +824,262 @@ fn the_p1_partition_keeps_every_chip_under_its_height() {
             P1_LEAF_HEIGHTS
         )
         .is_err()
+    );
+}
+
+/// The doubling rule at its threshold, on the census's group shapes: `loads`
+/// built of two prepared groups, four heavy ones and as many full ones as
+/// take the single heights to `leaves` leaves.
+fn loads_at(leaves: usize) -> Vec<ChipRows> {
+    (1..1024)
+        .map(|full| [vec![PREPARED; 2], vec![HEAVY; 4], vec![FULL; full]].concat())
+        .find(|loads| {
+            leaf_partition_rows(loads, FRONT, P1_LEAF_HEIGHTS)
+                .expect("fits")
+                .num_leaves()
+                == leaves
+        })
+        .expect("some count of full groups takes that many leaves")
+}
+
+/// ★ [`LeafScale::DoubleFrom`]`(T)` keeps the single partition while the
+/// single heights take `T - 1` leaves, and from `T` partitions again under the
+/// doubled heights, to fewer leaves (about half). [`LeafScale::Fixed`] never
+/// doubles, and a threshold one above the count does not either.
+#[test]
+fn the_leaves_double_from_their_threshold() {
+    let scaled = |loads: &[ChipRows], scale: LeafScale| {
+        scaled_leaf_partition(loads, FRONT, scale, P1_LEAF_HEIGHTS, P1_LEAF_HEIGHTS_2X)
+            .expect("partitions")
+    };
+    for t in [10usize, 12, 18] {
+        let under = loads_at(t - 1);
+        let single = leaf_partition_rows(&under, FRONT, P1_LEAF_HEIGHTS).expect("fits");
+        let (partition, bound) = scaled(&under, LeafScale::DoubleFrom(t));
+        assert_eq!(
+            partition,
+            single,
+            "{} leaves keep the single partition",
+            t - 1
+        );
+        assert_eq!(
+            (bound.single_leaves, bound.heights, bound.doubled),
+            (t - 1, P1_LEAF_HEIGHTS, false)
+        );
+
+        let at = loads_at(t);
+        let single = leaf_partition_rows(&at, FRONT, P1_LEAF_HEIGHTS).expect("fits");
+        assert_eq!(single.num_leaves(), t);
+        let (partition, bound) = scaled(&at, LeafScale::DoubleFrom(t));
+        assert_eq!(
+            partition,
+            leaf_partition_rows(&at, FRONT, P1_LEAF_HEIGHTS_2X).expect("fits doubled"),
+            "{t} leaves partition again under the doubled heights"
+        );
+        assert_eq!(
+            (bound.single_leaves, bound.heights, bound.doubled),
+            (t, P1_LEAF_HEIGHTS_2X, true)
+        );
+        assert!(
+            partition.num_leaves() <= t.div_ceil(2) + 1,
+            "{t} single leaves double to {}",
+            partition.num_leaves()
+        );
+        assert_eq!(scaled(&at, LeafScale::Fixed).0, single, "fixed at {t}");
+        assert_eq!(
+            scaled(&at, LeafScale::DoubleFrom(t + 1)).0,
+            single,
+            "a threshold of {} at {t} leaves",
+            t + 1
+        );
+    }
+}
+
+/// ★ Every doubled leaf stays under every doubled height, whichever chip
+/// binds, and some are past a single height (the doubling is real). Groups a
+/// single leaf holds are refused under either scale when one is past a single
+/// height, even if a doubled leaf would hold it; and doubled heights below
+/// the single ones are refused.
+#[test]
+fn every_doubled_leaf_stays_under_the_doubled_heights() {
+    let doubled = |loads: &[ChipRows]| {
+        let (partition, bound) = scaled_leaf_partition(
+            loads,
+            FRONT,
+            LeafScale::DoubleFrom(1),
+            P1_LEAF_HEIGHTS,
+            P1_LEAF_HEIGHTS_2X,
+        )
+        .expect("partitions");
+        assert!(bound.doubled);
+        partition
+    };
+    for loads in [
+        loads_at(12),
+        loads_at(18),
+        [vec![PREPARED; 2], vec![HEAVY; 8], vec![FULL; 68]].concat(),
+    ] {
+        let partition = doubled(&loads);
+        for leaf in partition.leaves() {
+            assert!(
+                sums(&loads, leaf, FRONT).under(P1_LEAF_HEIGHTS_2X),
+                "leaf {leaf:?} past a doubled height"
+            );
+        }
+        assert!(
+            partition
+                .leaves()
+                .iter()
+                .any(|leaf| !sums(&loads, leaf, FRONT).under(P1_LEAF_HEIGHTS)),
+            "some doubled leaf is past a single height"
+        );
+        let hashes: usize = loads.iter().map(|l| l.hash).sum();
+        assert!(partition.num_leaves() >= hashes.div_ceil(P1_LEAF_HEIGHTS_2X.hash - FRONT.hash));
+    }
+    // Each chip binds a doubled leaf: four groups that fit one doubled leaf
+    // in every other chip are split by the one each is heavy in.
+    let light = ChipRows {
+        xalu: 50_000,
+        lanes: 50_000,
+        bitdec: 1_000,
+        consts: 100,
+        ..rows(50_000, 50_000, 50_000, 50_000)
+    };
+    for heavy in [
+        ChipRows {
+            hash: 200_000,
+            ..light
+        },
+        ChipRows {
+            select: 900_000,
+            ..light
+        },
+        ChipRows {
+            balu: 900_000,
+            ..light
+        },
+        ChipRows {
+            xalu: 1_900_000,
+            ..light
+        },
+        ChipRows {
+            lanes: 900_000,
+            ..light
+        },
+        ChipRows {
+            hint: 900_000,
+            ..light
+        },
+        ChipRows {
+            bitdec: 30_000,
+            ..light
+        },
+        ChipRows {
+            consts: 7_000,
+            ..light
+        },
+    ] {
+        let set = [heavy; 4];
+        let partition = doubled(&set);
+        assert_eq!(partition.num_leaves(), 2, "{heavy:?} four times");
+        for leaf in partition.leaves() {
+            assert!(
+                sums(&set, leaf, FRONT).under(P1_LEAF_HEIGHTS_2X),
+                "{heavy:?}"
+            );
+        }
+    }
+    // Refusals: a group past a single height, under either scale; doubled
+    // heights below the single ones.
+    let past = rows(1_000, 1_200_000, 0, 0);
+    assert!(past.plus(FRONT).under(P1_LEAF_HEIGHTS_2X));
+    for scale in [LeafScale::Fixed, LeafScale::DoubleFrom(1)] {
+        assert!(
+            scaled_leaf_partition(
+                &[FULL, past],
+                FRONT,
+                scale,
+                P1_LEAF_HEIGHTS,
+                P1_LEAF_HEIGHTS_2X
+            )
+            .is_err(),
+            "{scale}"
+        );
+    }
+    let lower = ChipRows {
+        xalu: P1_LEAF_HEIGHTS.xalu - 1,
+        ..P1_LEAF_HEIGHTS_2X
+    };
+    assert!(
+        scaled_leaf_partition(
+            &[FULL],
+            FRONT,
+            LeafScale::DoubleFrom(1),
+            P1_LEAF_HEIGHTS,
+            lower
+        )
+        .is_err()
+    );
+}
+
+/// ★ The plan doubles the median mix's leaves from its threshold and not
+/// below it, through [`WhirBlockPlan::derive`]: at [`LeafScale::Fixed`] the
+/// single heights take `n` leaves; at `DoubleFrom(n + 1)` the partition is the
+/// same one, so every leaf program, every node and the top are too (a leaf's
+/// program is a function of the plan's other fields, which the scale does not
+/// move, and its groups); at `DoubleFrom(n)` fewer leaves, each under the
+/// doubled heights by its planned rows, so another tree — the one a prover
+/// cannot make the verifier derive below the threshold.
+#[test]
+fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
+    let opts = super::proof::block_base_options();
+    let at = |leaf_scale: LeafScale| BlockFormat {
+        leaf_scale,
+        ..p1_format()
+    };
+    let owned = median_statement(&elf_bytes, &opts, &at(LeafScale::Fixed));
+    let plan = |scale: LeafScale| {
+        WhirBlockPlan::derive(&elf_bytes, &opts, &at(scale), owned.view(), None)
+            .expect("the plan derives")
+    };
+    let single = plan(LeafScale::Fixed);
+    let n = single.partition().num_leaves();
+    assert!(n >= 2, "the median mix takes {n} leaves");
+    let bound = single.leaf_bound().expect("the rule's partition");
+    assert_eq!(
+        (bound.single_leaves, bound.heights, bound.doubled),
+        (n, P1_LEAF_HEIGHTS, false)
+    );
+
+    let below = plan(LeafScale::DoubleFrom(n + 1));
+    assert_eq!(below.partition(), single.partition());
+    assert_eq!(below.chip_loads(), single.chip_loads());
+    assert_eq!(below.costs(), single.costs());
+    assert_eq!(below.id(), single.id());
+    assert!(!below.leaf_bound().expect("bounded").doubled);
+
+    let doubled = plan(LeafScale::DoubleFrom(n));
+    let bound = doubled.leaf_bound().expect("the rule's partition");
+    assert_eq!(
+        (bound.single_leaves, bound.heights, bound.doubled),
+        (n, P1_LEAF_HEIGHTS_2X, true)
+    );
+    let m = doubled.partition().num_leaves();
+    assert!(m < n, "{n} single leaves double to {m}");
+    let (loads, front) = doubled.chip_loads();
+    for leaf in doubled.partition().leaves() {
+        assert!(
+            sums(loads, leaf, front).under(P1_LEAF_HEIGHTS_2X),
+            "leaf {leaf:?}"
+        );
+    }
+    assert_ne!(doubled.levels(), single.levels());
+    println!(
+        "LEAF SCALE MEDIAN MIX: {} groups · {n} single leaves · {m} doubled · node levels {} → {}",
+        single.num_groups(),
+        single.levels().len(),
+        doubled.levels().len()
     );
 }
 

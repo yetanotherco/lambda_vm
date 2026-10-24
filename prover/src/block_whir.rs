@@ -235,6 +235,11 @@ pub struct BlockFormat {
     /// the recursion needs — or evaluated by the host verifier. Off exists to
     /// measure what the openings cost the base.
     pub prepared: bool,
+    /// How big the recursion's leaves are
+    /// ([`crate::lfm::whir_block::LeafScale`]): the recursion's alone — the
+    /// block proof does not read it — and, like the rest, a constant the
+    /// prover and the verifier each hold.
+    pub leaf_scale: crate::lfm::whir_block::LeafScale,
     /// How each group's tables argue: one argument per table
     /// ([`ArgueFormat::PerTable`], production), or one per group — a lockstep
     /// GKR per bin of its trees and one constraint sumcheck over its tables
@@ -334,13 +339,16 @@ impl BlockFormat {
     /// tables argued together ([`ArgueFormat::BATCHED`]; Mauro 10-02: "batch the
     /// constraints"), and one WHIR chain per run of a group's stacked
     /// polynomials ([`GroupFold::Indexed`]). `ArgueFormat::PerTable` and
-    /// [`GroupFold::PerPoly`] stay formats to measure against.
+    /// [`GroupFold::PerPoly`] stay formats to measure against. The leaves'
+    /// scale is the environment's (`LAMBDA_VM_WHIR_LEAF_DOUBLE_FROM`; unset,
+    /// [`LeafScale::Fixed`](crate::lfm::whir_block::LeafScale::Fixed)).
     pub fn production() -> Self {
         Self {
             zf: *ZfFormat::global(),
             group_polys: BLOCK_GROUP_POLYS,
             max_groups: BLOCK_MAX_GROUPS,
             prepared: true,
+            leaf_scale: crate::lfm::whir_block::process_leaf_scale(),
             argue: ArgueFormat::BATCHED,
             group: GroupFold::Indexed,
         }

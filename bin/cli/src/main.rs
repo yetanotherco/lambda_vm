@@ -393,6 +393,13 @@ enum Commands {
         /// one; the proof file does not carry it.
         #[arg(long, value_parser = ["natural", "coset"], default_value = "coset")]
         leaves: String,
+
+        /// The recursion's leaf scale: `off` (production) keeps every leaf at
+        /// the single chip heights; a count `T` doubles them when the single
+        /// heights take `T` leaves or more. A format choice: `verify-block`
+        /// must be given the same one; the proof file does not carry it.
+        #[arg(long, value_parser = leaf_double_from_word, default_value = "off")]
+        leaf_double_from: String,
     },
 
     /// Verify a block proof produced by `prove-block`
@@ -423,6 +430,12 @@ enum Commands {
         /// --leaves`): the verifier's constant, never read from the proof.
         #[arg(long, value_parser = ["natural", "coset"], default_value = "coset")]
         leaves: String,
+
+        /// The leaf scale the block was proved with (`prove-block
+        /// --leaf-double-from`): the verifier's constant, never read from the
+        /// proof.
+        #[arg(long, value_parser = leaf_double_from_word, default_value = "off")]
+        leaf_double_from: String,
     },
 
     /// Count main-trace and aux-trace field elements without proving
@@ -525,6 +538,7 @@ fn main() -> ExitCode {
             group,
             blowup,
             leaves,
+            leaf_double_from,
         } => cmd_prove_block(
             elf,
             input,
@@ -535,6 +549,7 @@ fn main() -> ExitCode {
                 group: &group,
                 blowup: &blowup,
                 leaves: &leaves,
+                leaf_double_from: &leaf_double_from,
             },
         ),
         Commands::VerifyBlock {
@@ -544,6 +559,7 @@ fn main() -> ExitCode {
             group,
             blowup,
             leaves,
+            leaf_double_from,
         } => cmd_verify_block(
             proof,
             elf,
@@ -552,6 +568,7 @@ fn main() -> ExitCode {
                 group: &group,
                 blowup: &blowup,
                 leaves: &leaves,
+                leaf_double_from: &leaf_double_from,
             },
         ),
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
@@ -643,13 +660,33 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The block commands' format choices, the words of `--group`, `--blowup` and
-/// `--leaves`: `verify-block` must be given the ones `prove-block` was, and
-/// the proof file carries none of them.
+/// The block commands' format choices, the words of `--group`, `--blowup`,
+/// `--leaves` and `--leaf-double-from`: `verify-block` must be given the ones
+/// `prove-block` was, and the proof file carries none of them.
 struct BlockChoices<'a> {
     group: &'a str,
     blowup: &'a str,
     leaves: &'a str,
+    leaf_double_from: &'a str,
+}
+
+/// `--leaf-double-from`'s words: `off` or a leaf count
+/// (`whir_block::leaf_scale_setting`).
+fn leaf_double_from_word(word: &str) -> Result<String, String> {
+    prover::lfm::whir_block::leaf_scale_setting(Some(word))?;
+    Ok(word.to_string())
+}
+
+/// The leaf scale of `--leaf-double-from`: the caller's, so the format's own
+/// environment knob is refused rather than silently outranked.
+fn block_leaf_scale(word: &str) -> Result<prover::lfm::whir_block::LeafScale, String> {
+    use prover::lfm::whir_block::{LEAF_DOUBLE_FROM_ENV, leaf_scale_setting};
+    if std::env::var_os(LEAF_DOUBLE_FROM_ENV).is_some() {
+        return Err(format!(
+            "{LEAF_DOUBLE_FROM_ENV} is the harness's knob: give the CLI --leaf-double-from instead"
+        ));
+    }
+    leaf_scale_setting(Some(word))
 }
 
 fn cmd_prove_block(
@@ -667,6 +704,7 @@ fn cmd_prove_block(
         group,
         blowup,
         leaves,
+        leaf_double_from,
     } = choices;
 
     // The group opening is the caller's constant, given on the command line
@@ -688,6 +726,15 @@ fn cmd_prove_block(
     };
     eprintln!("BLOCK WHIR BLOWUP: {blowup}");
     eprintln!("BLOCK WHIR LEAVES: {leaves}");
+    // So is the leaves' scale: the tree's format below takes the flag's.
+    let leaf_scale = match block_leaf_scale(leaf_double_from) {
+        Ok(scale) => scale,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("BLOCK LEAF SCALE: {leaf_scale}");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
         Err(e) => {
@@ -717,6 +764,7 @@ fn cmd_prove_block(
         }
     };
     eprintln!("BLOCK GROUP OPENING: {group}");
+    cfg.format.leaf_scale = leaf_scale;
     assert_eq!(
         (cfg.format.zf.whir_blowup, cfg.format.zf.whir_leaves),
         (blowup.factor(), order),
@@ -791,6 +839,7 @@ fn cmd_verify_block(
         group,
         blowup,
         leaves,
+        leaf_double_from,
     } = choices;
 
     let fold = match group_setting(Some(group)) {
@@ -805,6 +854,15 @@ fn cmd_verify_block(
     // reads it.
     let (blowup, order) = match install_block_format(blowup, leaves) {
         Ok(choices) => choices,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // So is the leaves' scale, before the production format below reads the
+    // environment's knob, which this refuses.
+    let leaf_scale = match block_leaf_scale(leaf_double_from) {
+        Ok(scale) => scale,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::FAILURE;
@@ -846,9 +904,11 @@ fn cmd_verify_block(
     eprintln!("BLOCK GROUP OPENING: {group}");
     eprintln!("BLOCK WHIR BLOWUP: {blowup}");
     eprintln!("BLOCK WHIR LEAVES: {leaves}");
+    eprintln!("BLOCK LEAF SCALE: {leaf_scale}");
     eprintln!("Verifying block proof...");
     let start = Instant::now();
-    let result = verify_whir_block_tree_proof_at(&elf_data, &proof, fold, blowup, order);
+    let result =
+        verify_whir_block_tree_proof_at(&elf_data, &proof, fold, blowup, order, leaf_scale);
     let verify_elapsed = start.elapsed();
     match result {
         Ok(()) => {
@@ -2036,6 +2096,56 @@ mod tests {
             prover::lfm::whir_block_tree::leaves_setting(None),
             Ok(prover::zf_format::ZfFormat::DEFAULT.whir_leaves),
             "unset is the production order"
+        );
+    }
+
+    /// Both block commands take the leaf scale, `off` unless told otherwise,
+    /// and nothing but `off` or a leaf count; each word reads to the scale it
+    /// names.
+    #[test]
+    fn the_block_commands_take_the_leaf_scale() {
+        use prover::lfm::whir_block::LeafScale;
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            let scale = |args: &[&str]| match parse(args).map(|cli| cli.command) {
+                Ok(
+                    Commands::ProveBlock {
+                        leaf_double_from, ..
+                    }
+                    | Commands::VerifyBlock {
+                        leaf_double_from, ..
+                    },
+                ) => Some(leaf_double_from),
+                _ => None,
+            };
+            assert_eq!(scale(cmd).as_deref(), Some("off"), "the default");
+            for (word, want) in [
+                ("off", LeafScale::Fixed),
+                ("12", LeafScale::DoubleFrom(12)),
+                ("10", LeafScale::DoubleFrom(10)),
+            ] {
+                let args = [cmd, &["--leaf-double-from", word]].concat();
+                assert_eq!(scale(&args).as_deref(), Some(word));
+                assert_eq!(
+                    prover::lfm::whir_block::leaf_scale_setting(Some(word)),
+                    Ok(want),
+                    "{word} reads"
+                );
+            }
+            for word in ["0", "on", "twelve", "-3"] {
+                let args = [cmd, &["--leaf-double-from", word]].concat();
+                assert!(
+                    parse(&args).is_err(),
+                    "--leaf-double-from {word} is refused"
+                );
+            }
+        }
+        assert_eq!(
+            prover::lfm::whir_block::leaf_scale_setting(Some("off")),
+            Ok(LeafScale::Fixed),
+            "the default is the single heights"
         );
     }
 

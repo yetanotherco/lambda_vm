@@ -47,6 +47,7 @@ fn small_format() -> BlockFormat {
         prepared: true,
         argue: ArgueFormat::PerTable,
         group: multilinear::whir_chain::GroupFold::PerPoly,
+        leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
     }
 }
 
@@ -437,6 +438,7 @@ fn dense_format() -> BlockFormat {
         prepared: true,
         argue: ArgueFormat::PerTable,
         group: multilinear::whir_chain::GroupFold::PerPoly,
+        leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
     }
 }
 
@@ -991,6 +993,38 @@ fn the_derive_knobs_read_their_values_and_refuse_nonsense() {
     assert_eq!(parse_derive_hold(None), Ok(false));
     assert_eq!(parse_derive_hold(Some("level")), Ok(true));
     assert!(parse_derive_hold(Some("all")).is_err());
+}
+
+/// The leaf scale's knob reads `off` (or nothing) as the single heights and a
+/// positive count as the threshold, refuses anything else with an error, and
+/// the production format holds what the environment says.
+#[test]
+fn the_leaf_scale_knob_reads_off_or_a_count() {
+    use super::whir_block::{LeafScale, leaf_scale_from_env, leaf_scale_setting};
+    for unset in [None, Some(""), Some(" "), Some("off"), Some(" off ")] {
+        assert_eq!(leaf_scale_setting(unset), Ok(LeafScale::Fixed), "{unset:?}");
+    }
+    assert_eq!(
+        leaf_scale_setting(Some("12")),
+        Ok(LeafScale::DoubleFrom(12))
+    );
+    assert_eq!(
+        leaf_scale_setting(Some(" 10 ")),
+        Ok(LeafScale::DoubleFrom(10))
+    );
+    assert_eq!(leaf_scale_setting(Some("1")), Ok(LeafScale::DoubleFrom(1)));
+    for bad in ["0", "-1", "twelve", "on", "12 leaves", "OFF"] {
+        let err = leaf_scale_setting(Some(bad)).expect_err(bad);
+        assert!(
+            err.contains(super::whir_block::LEAF_DOUBLE_FROM_ENV),
+            "{err}"
+        );
+    }
+    assert_eq!(
+        Ok(BlockFormat::production().leaf_scale),
+        leaf_scale_from_env(),
+        "the production format holds the environment's scale"
+    );
 }
 
 /// ★ The verifier's lean derive ([`WhirBlockPlan::derive_top_in`]: each

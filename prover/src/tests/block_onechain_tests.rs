@@ -53,6 +53,7 @@ fn format_at(
         prepared: true,
         argue,
         group,
+        leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
     }
 }
 
@@ -65,6 +66,7 @@ fn production(group: GroupFold) -> BlockFormat {
         prepared: true,
         argue: ArgueFormat::PerTable,
         group,
+        leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
     }
 }
 

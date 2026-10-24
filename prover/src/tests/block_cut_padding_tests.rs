@@ -38,6 +38,7 @@ fn many_groups(argue: ArgueFormat) -> BlockFormat {
         prepared: true,
         argue,
         group: multilinear::whir_chain::GroupFold::PerPoly,
+        leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
     }
 }
 

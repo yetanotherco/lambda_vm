@@ -104,11 +104,123 @@ pub const P1_LEAF_HEIGHTS: ChipRows = ChipRows {
     accel: 0,
 };
 
+/// The socket rows of a doubled leaf ([`LeafScale::DoubleFrom`]): twice
+/// [`LEAF_P1_CAP`].
+pub const LEAF_P1_CAP_2X: usize = 2 * LEAF_P1_CAP;
+
+/// [`P1_LEAF_HEIGHTS`] with every bounded chip twice as tall: the heights a
+/// block's leaves are held under when [`LeafScale::DoubleFrom`] doubles them.
+/// The same rule packs about twice the groups a leaf, so about half the leaves
+/// and half the children for the nodes to verify: 18 leaves → 9 on a large
+/// block at blowup 2, and one node level fewer. A leaf's card time follows its
+/// padded heights, so the leaves' own work stays about the same.
+pub const P1_LEAF_HEIGHTS_2X: ChipRows = ChipRows {
+    hash: LEAF_P1_CAP_2X,
+    select: 1 << 21,
+    balu: 1 << 21,
+    xalu: 1 << 22,
+    lanes: 1 << 21,
+    hint: 1 << 21,
+    bitdec: 1 << 16,
+    consts: 1 << 14,
+    public: usize::MAX,
+    accel: 0,
+};
+
 // The conjectured LFM bits stay at 128 or above only while a Poseidon1 leaf's
 // socket and bit-dec tables stay at 2^19 rows or fewer (REV-P1W-JUDGE V3: the
-// calculator reads 128.005 for the socket and 128.51 for bit-dec at 2^20). A
-// wider chip re-runs the calculator before this bound moves.
-const _: () = assert!(P1_LEAF_HEIGHTS.hash <= 1 << 19 && P1_LEAF_HEIGHTS.bitdec <= 1 << 19);
+// calculator reads 128.005 for the socket and 128.51 for bit-dec at 2^20), at
+// either leaf scale. A wider chip re-runs the calculator before this bound
+// moves.
+const _: () = assert!(
+    P1_LEAF_HEIGHTS.hash <= 1 << 19
+        && P1_LEAF_HEIGHTS.bitdec <= 1 << 19
+        && P1_LEAF_HEIGHTS_2X.hash <= 1 << 19
+        && P1_LEAF_HEIGHTS_2X.bitdec <= 1 << 19
+);
+
+// The doubled heights are the single ones doubled, chip by chip: neither set
+// moves without the other.
+const _: () = {
+    let (one, two) = (P1_LEAF_HEIGHTS, P1_LEAF_HEIGHTS_2X);
+    assert!(
+        two.hash == 2 * one.hash
+            && two.select == 2 * one.select
+            && two.balu == 2 * one.balu
+            && two.xalu == 2 * one.xalu
+            && two.lanes == 2 * one.lanes
+            && two.hint == 2 * one.hint
+            && two.bitdec == 2 * one.bitdec
+            && two.consts == 2 * one.consts
+            && two.public == one.public
+            && two.accel == one.accel
+    );
+};
+
+/// How big a block's leaves are ([`BlockFormat::leaf_scale`]): a format
+/// constant the prover and the verifier each hold, never read from a proof.
+/// Both derive the partition from the statement under it
+/// ([`WhirBlockPlan::derive`]), so the leaf count, every tree program and the
+/// top are the verifier's own whichever scale applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeafScale {
+    /// Every leaf under [`P1_LEAF_HEIGHTS`]. The default.
+    Fixed,
+    /// The leaves under [`P1_LEAF_HEIGHTS`]; if that takes `T` leaves or more,
+    /// partitioned again under [`P1_LEAF_HEIGHTS_2X`]. Below `T` the partition,
+    /// the tree and the proof are [`Self::Fixed`]'s, byte for byte. Doubling
+    /// saves node children, which a small tree has few of, while its leaves
+    /// pad more and its first leaf starts later (measured on one RTX 5090:
+    /// −2.57 s of recursion on a large block's 18 leaves, +0.33 s on a median
+    /// block's 9).
+    DoubleFrom(usize),
+}
+
+impl std::fmt::Display for LeafScale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixed => f.write_str("fixed"),
+            Self::DoubleFrom(t) => write!(f, "doubled from {t} leaves"),
+        }
+    }
+}
+
+/// [`leaf_scale_from_env`]'s knob: unset or `off` is [`LeafScale::Fixed`],
+/// a count `T` is [`LeafScale::DoubleFrom`]`(T)`.
+pub const LEAF_DOUBLE_FROM_ENV: &str = "LAMBDA_VM_WHIR_LEAF_DOUBLE_FROM";
+
+/// A value of [`LEAF_DOUBLE_FROM_ENV`] (or the CLI's `--leaf-double-from`):
+/// unset, empty or `off` is [`LeafScale::Fixed`]; a positive count `T` is
+/// [`LeafScale::DoubleFrom`]`(T)`; anything else is an error.
+pub fn leaf_scale_setting(value: Option<&str>) -> Result<LeafScale, String> {
+    match value.map(str::trim) {
+        None | Some("") | Some("off") => Ok(LeafScale::Fixed),
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|&t| t >= 1)
+            .map(LeafScale::DoubleFrom)
+            .ok_or_else(|| {
+                format!("{LEAF_DOUBLE_FROM_ENV} must be `off` or a leaf count, got `{v}`")
+            }),
+    }
+}
+
+/// The environment's leaf scale ([`LEAF_DOUBLE_FROM_ENV`]). A format knob:
+/// the block's verifier must be given the same one.
+pub fn leaf_scale_from_env() -> Result<LeafScale, String> {
+    leaf_scale_setting(std::env::var(LEAF_DOUBLE_FROM_ENV).ok().as_deref())
+}
+
+/// [`leaf_scale_from_env`], read once per process: what
+/// [`BlockFormat::production`] holds. A value it cannot take is refused here,
+/// as `LFM_WHIR_SHARE_INVERSE`'s is ([`share_inverse`]); the harness reads the
+/// knob first ([`super::whir_block_tree::WhirTreeConfig::from_env`]) and
+/// returns that refusal as an error.
+pub(crate) fn process_leaf_scale() -> LeafScale {
+    static SCALE: std::sync::OnceLock<LeafScale> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| leaf_scale_from_env().unwrap_or_else(|e| panic!("{e}")))
+}
 
 /// The leaf that subtracts the COMMIT-bus target.
 pub const CARRIER: usize = 0;
@@ -359,6 +471,57 @@ pub fn leaf_partition_rows(
     Err("no partition admits every group".to_string())
 }
 
+/// What a plan's leaf partition held its leaves under: the leaf count at the
+/// single heights, and the heights every leaf of the partition is under — the
+/// doubled ones when the format's [`LeafScale`] doubled them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeafBound {
+    pub single_leaves: usize,
+    pub heights: ChipRows,
+    pub doubled: bool,
+}
+
+/// ★ The leaf partition under `scale`: [`leaf_partition_rows`] at `heights`,
+/// and when [`LeafScale::DoubleFrom`]`(t)` and that takes `t` leaves or more,
+/// [`leaf_partition_rows`] again at `doubled`. Pure, so the prover and the
+/// verifier derive one partition from one statement; below `t` it is the one
+/// at `heights`, unchanged. Refuses what [`leaf_partition_rows`] refuses at
+/// `heights`, so every group a doubled leaf holds fits a single one too, and
+/// a `doubled` lower than `heights` in any chip.
+pub fn scaled_leaf_partition(
+    loads: &[ChipRows],
+    front: ChipRows,
+    scale: LeafScale,
+    heights: ChipRows,
+    doubled: ChipRows,
+) -> Result<(BlockPartition, LeafBound), String> {
+    if !heights.under(doubled) {
+        return Err(format!(
+            "the doubled heights {doubled:?} are below {heights:?}"
+        ));
+    }
+    let single = leaf_partition_rows(loads, front, heights)?;
+    let single_leaves = single.num_leaves();
+    Ok(match scale {
+        LeafScale::DoubleFrom(t) if single_leaves >= t => (
+            leaf_partition_rows(loads, front, doubled)?,
+            LeafBound {
+                single_leaves,
+                heights: doubled,
+                doubled: true,
+            },
+        ),
+        LeafScale::Fixed | LeafScale::DoubleFrom(_) => (
+            single,
+            LeafBound {
+                single_leaves,
+                heights,
+                doubled: false,
+            },
+        ),
+    })
+}
+
 /// The workers [`chip_loads_by_emission`] emits on at most.
 const PROBE_WORKERS: usize = 16;
 
@@ -499,6 +662,9 @@ pub struct WhirBlockPlan {
     loads: Vec<ChipRows>,
     front: ChipRows,
     partition: BlockPartition,
+    /// What the partition held its leaves under (`None` under a fixed leaf
+    /// count, which bounds no chip).
+    leaf_bound: Option<LeafBound>,
     /// Children a node verifies.
     fan_in: usize,
     /// A digest of the statement run: the block's identity, published by every
@@ -521,8 +687,9 @@ pub struct TreeProgram {
 
 impl WhirBlockPlan {
     /// Derive the plan over `num_leaves` leaves (when `None`, the fewest that
-    /// keep every chip of every leaf under [`P1_LEAF_HEIGHTS`]:
-    /// [`leaf_partition_rows`]), or refuse a statement the host verifier
+    /// keep every chip of every leaf under [`P1_LEAF_HEIGHTS`], or under
+    /// [`P1_LEAF_HEIGHTS_2X`] where `format`'s [`LeafScale`] doubles them:
+    /// [`scaled_leaf_partition`]), or refuse a statement the host verifier
     /// refuses or whose group no leaf holds.
     pub fn derive(
         elf_bytes: &[u8],
@@ -569,8 +736,9 @@ impl WhirBlockPlan {
     }
 
     /// [`Self::derive_with`] under a leaf cap of `leaf_cap` socket rows (the
-    /// partition's `hash` height); everything but the tests' refusals and
-    /// censuses runs at [`LEAF_P1_CAP`].
+    /// partition's `hash` height; twice that, at most [`LEAF_P1_CAP_2X`], for
+    /// doubled leaves); everything but the tests' refusals and censuses runs
+    /// at [`LEAF_P1_CAP`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn derive_capped(
         elf_bytes: &[u8],
@@ -717,11 +885,13 @@ impl WhirBlockPlan {
             loads: Vec::new(),
             front: ChipRows::default(),
             partition,
+            leaf_bound: None,
             fan_in,
             id,
         };
-        // Every chip's rows by group, emitted; the partition bounds them all (a
-        // fixed leaf count, the tests', bounds none).
+        // Every chip's rows by group, emitted; the partition bounds them all,
+        // at the format's leaf scale (a fixed leaf count, the tests', bounds
+        // none).
         (plan.loads, plan.front) = chip_loads_by_emission(&plan)?;
         plan.partition = match num_leaves {
             None => {
@@ -729,7 +899,19 @@ impl WhirBlockPlan {
                     hash: leaf_cap,
                     ..P1_LEAF_HEIGHTS
                 };
-                leaf_partition_rows(&plan.loads, plan.front, heights)?
+                let doubled = ChipRows {
+                    hash: (2 * leaf_cap).min(LEAF_P1_CAP_2X),
+                    ..P1_LEAF_HEIGHTS_2X
+                };
+                let (partition, bound) = scaled_leaf_partition(
+                    &plan.loads,
+                    plan.front,
+                    format.leaf_scale,
+                    heights,
+                    doubled,
+                )?;
+                plan.leaf_bound = Some(bound);
+                partition
             }
             Some(_) => leaf_partition(&plan.costs, num_leaves, leaf_cap)?,
         };
@@ -738,6 +920,13 @@ impl WhirBlockPlan {
 
     pub fn partition(&self) -> &BlockPartition {
         &self.partition
+    }
+
+    /// What the partition held its leaves under — the leaf count at the
+    /// single heights and the heights every leaf is under — or `None` under a
+    /// fixed leaf count, which bounds no chip.
+    pub fn leaf_bound(&self) -> Option<LeafBound> {
+        self.leaf_bound
     }
 
     /// Each group's in-guest cost, in socket rows.
@@ -1159,9 +1348,9 @@ pub fn top_claims(plan: &WhirBlockPlan, words: &[(u32, LfmWord)]) -> bool {
 /// ([`super::proof::block_base_options`]), the block format
 /// ([`BlockFormat::production`], whose base is the block family's,
 /// `hash_pin::BLOCK_BASE`, never read from the proof), the tree's options
-/// ([`super::proof::aggregation_wrap_options`]), the plan's leaf rule and its
-/// fan-in ([`BLOCK_FAN_IN`]). A caller who could pass weaker ones would choose
-/// the programs the top is checked against.
+/// ([`super::proof::aggregation_wrap_options`]), the plan's leaf rule at the
+/// format's leaf scale and its fan-in ([`BLOCK_FAN_IN`]). A caller who could
+/// pass weaker ones would choose the programs the top is checked against.
 pub fn verify_block_tree(
     elf_bytes: &[u8],
     statement: BlockStatement<'_>,
@@ -1190,12 +1379,12 @@ pub fn verify_block_tree_grouped(
 }
 
 /// [`verify_block_tree`] at production's format with the caller's NAMED
-/// choices: its group opening, its WHIR blowup and its round-0 leaf order
-/// (`verify-block --group / --blowup / --leaves`), every other preset pinned
-/// as before. All three are the verifier's constants; the proof carries none
-/// of them. A caller cannot hand in a format of its own:
-/// `verify_block_tree_as` is crate-internal. The coset order is refused by
-/// name under a base whose trees do not take it.
+/// choices: its group opening, its WHIR blowup, its round-0 leaf order and its
+/// leaf scale (`verify-block --group / --blowup / --leaves /
+/// --leaf-double-from`), every other preset pinned as before. All four are the
+/// verifier's constants; the proof carries none of them. A caller cannot hand
+/// in a format of its own: `verify_block_tree_as` is crate-internal. The coset
+/// order is refused by name under a base whose trees do not take it.
 pub fn verify_block_tree_at(
     elf_bytes: &[u8],
     statement: BlockStatement<'_>,
@@ -1203,10 +1392,12 @@ pub fn verify_block_tree_at(
     group: GroupFold,
     blowup: crate::zf_format::WhirBlowup,
     leaves: multilinear::whir_chain::LeafOrder,
+    leaf_scale: LeafScale,
 ) -> Result<(), String> {
     let mut format = BlockFormat::production_with(group);
     format.zf.whir_blowup = blowup.factor();
     format.zf.whir_leaves = leaves;
+    format.leaf_scale = leaf_scale;
     format.zf.check_leaves()?;
     verify_block_tree_as(elf_bytes, statement, top, &format)
 }
