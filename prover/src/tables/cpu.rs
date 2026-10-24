@@ -314,6 +314,29 @@ impl<'a> CpuOp<'a> {
         }
     }
 
+    /// Whether this ECALL is a P1w16Permute syscall.
+    #[inline]
+    pub fn ecall_p1w16(&self) -> bool {
+        self.ecall_of(executor::vm::instruction::execution::P1W16_SYSCALL_NUMBER)
+    }
+
+    /// For P1w16Permute ECALLs: state address from x10.
+    #[inline]
+    pub fn p1w16_state_addr(&self) -> u64 {
+        if self.ecall_p1w16() {
+            self.ecall_args[0]
+        } else {
+            0
+        }
+    }
+
+    /// Whether this ECALL is an Fp3Mac syscall. Its operands (x10, x11) are
+    /// recovered from the register state in the trace builder, like HINT's.
+    #[inline]
+    pub fn ecall_fp3mac(&self) -> bool {
+        self.ecall_of(executor::vm::instruction::execution::FP3MAC_SYSCALL_NUMBER)
+    }
+
     /// Whether this ECALL is a Blake3Compress syscall.
     #[inline]
     pub fn ecall_blake3(&self) -> bool {
@@ -425,6 +448,7 @@ impl CpuOperation {
             [log.src2_val, log.dst_val]
         } else if log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER
             || log.src1_val == executor::vm::instruction::execution::BLAKE3_SYSCALL_NUMBER
+            || log.src1_val == executor::vm::instruction::execution::P1W16_SYSCALL_NUMBER
         {
             [log.src2_val, 0]
         } else {

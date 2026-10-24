@@ -38,6 +38,16 @@ const BLAKE3_SYSCALL_NUMBER: usize = usize::MAX - 2;
 #[cfg(target_arch = "riscv64")]
 const BLAKE3_ABSORB_SYSCALL_NUMBER: usize = usize::MAX - 3;
 
+/// Syscall number for the width-16 Poseidon1 permutation (u64::MAX - 5).
+/// Must match `executor::...::execution::P1W16_SYSCALL_NUMBER`.
+#[cfg(target_arch = "riscv64")]
+const P1W16_SYSCALL_NUMBER: usize = usize::MAX - 5;
+
+/// Syscall number for the cubic-extension multiply-add (u64::MAX - 7).
+/// Must match `executor::...::execution::FP3MAC_SYSCALL_NUMBER`.
+#[cfg(target_arch = "riscv64")]
+const FP3MAC_SYSCALL_NUMBER: usize = usize::MAX - 7;
+
 /// Syscall number for the ECSM secp256k1 scalar-multiply accelerator (-11 as usize).
 #[cfg(target_arch = "riscv64")]
 const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
@@ -181,6 +191,47 @@ pub fn keccak_permute(state: &mut [u64; 25]) {
 #[cfg(not(target_arch = "riscv64"))]
 /// Apply the Keccak-f[1600] permutation to a 25-element u64 state in-place.
 pub fn keccak_permute(_state: &mut [u64; 25]) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Apply the width-16 Poseidon1 permutation to a Goldilocks state in place.
+/// Every word must be a canonical Goldilocks element (`< p`), or the ecall
+/// faults.
+pub fn p1w16_permute(state: &mut [u64; 16]) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") state.as_mut_ptr(),
+            in("a7") P1W16_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Apply the width-16 Poseidon1 permutation to a Goldilocks state in place.
+pub fn p1w16_permute(_state: &mut [u64; 16]) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+#[cfg(target_arch = "riscv64")]
+/// `acc ← acc·al + x` in `Fp[t]/(t³ − 2)`, with `state = [acc0, acc1, acc2,
+/// al0, al1, al2]` updated in place. Every word must be a canonical
+/// Goldilocks element (`< p`), or the ecall faults.
+pub fn fp3mac(state: &mut [u64; 6], x: &[u64; 3]) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") state.as_mut_ptr(),
+            in("a1") x.as_ptr(),
+            in("a7") FP3MAC_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// `acc ← acc·al + x` in `Fp[t]/(t³ − 2)`, with `state` updated in place.
+pub fn fp3mac(_state: &mut [u64; 6], _x: &[u64; 3]) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

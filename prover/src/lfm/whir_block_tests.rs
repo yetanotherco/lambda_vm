@@ -37,7 +37,7 @@ use super::word::{LfmWord, base_word, word_as_ext};
 
 /// A stack of 2^10 and two polynomials a group: a small program spans several
 /// groups, which is the block's shape at a size a test can prove.
-fn small_format() -> BlockFormat {
+pub(super) fn small_format() -> BlockFormat {
     let mut zf = ZfFormat::DEFAULT;
     zf.whir_stack = StackVars::new(10).expect("a valid stack");
     BlockFormat {
@@ -59,7 +59,7 @@ fn other_format() -> BlockFormat {
     }
 }
 
-fn small_block(name: &str, format: &BlockFormat) -> (Vec<u8>, BlockWhirProof) {
+pub(super) fn small_block(name: &str, format: &BlockFormat) -> (Vec<u8>, BlockWhirProof) {
     small_block_at(name, format, block_whir::BLOCK_ECDAS_ROWS_LOG2)
 }
 
@@ -121,7 +121,7 @@ fn small_block_cut(
     (elf, proof)
 }
 
-fn plan_of(
+pub(super) fn plan_of(
     elf: &[u8],
     proof: &BlockWhirProof,
     format: &BlockFormat,

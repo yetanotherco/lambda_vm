@@ -71,6 +71,8 @@ fn counts() -> TableCounts {
         hint: 1,
         commit: 1,
         blake3: 1,
+        p1w16: 0,
+        fp3mac: 0,
     }
 }
 

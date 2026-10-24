@@ -54,6 +54,7 @@ use super::dvrm::{self, DvrmOperation};
 use super::ecdas;
 use super::ecsm;
 use super::eq;
+use super::fp3mac::{self, Fp3MacOperation};
 use super::gpack::TraceForm;
 use super::halt;
 use super::hint;
@@ -67,6 +68,7 @@ use super::memw::{self, MemwOperation};
 use super::memw_aligned;
 use super::memw_register::{self, RegRow};
 use super::mul::{self, MulOperation};
+use super::p1w16::{self, P1w16Operation};
 use super::page::{self, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
@@ -810,6 +812,8 @@ fn collect_ops_from_cpu(
     Vec<ecsm::EcsmOperation>,
     Vec<ecdas::EcdasOperation>,
     Vec<hint::HintOperation>,
+    Vec<P1w16Operation>,
+    Vec<Fp3MacOperation>,
 ) {
     let mut out = WalkOutputs::with_capacity(cpu_ops.len());
     collect_ops_from_cpu_into(
@@ -834,6 +838,8 @@ fn collect_ops_from_cpu(
         ecsm_ops,
         ecdas_ops,
         hint_ops,
+        p1w16_ops,
+        fp3mac_ops,
     } = out;
     (
         memw,
@@ -849,6 +855,8 @@ fn collect_ops_from_cpu(
         ecsm_ops,
         ecdas_ops,
         hint_ops,
+        p1w16_ops,
+        fp3mac_ops,
     )
 }
 
@@ -870,6 +878,8 @@ pub(crate) struct WalkOutputs {
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
     hint_ops: Vec<hint::HintOperation>,
+    p1w16_ops: Vec<P1w16Operation>,
+    fp3mac_ops: Vec<Fp3MacOperation>,
 }
 
 impl WalkOutputs {
@@ -895,6 +905,8 @@ impl WalkOutputs {
             ecsm_ops: Vec::new(),
             ecdas_ops: Vec::new(),
             hint_ops: Vec::new(),
+            p1w16_ops: Vec::new(),
+            fp3mac_ops: Vec::new(),
         }
     }
 
@@ -939,6 +951,8 @@ impl WalkOutputs {
                 .sum::<usize>()
             + vec_heap_bytes(&self.ecdas_ops)
             + vec_heap_bytes(&self.hint_ops)
+            + vec_heap_bytes(&self.p1w16_ops)
+            + vec_heap_bytes(&self.fp3mac_ops)
     }
 }
 
@@ -1034,6 +1048,8 @@ fn walk_cpu_ops<const REST: bool>(
         ecsm_ops,
         ecdas_ops,
         hint_ops,
+        p1w16_ops,
+        fp3mac_ops,
     } = out;
     // This call's commit rows start here; earlier calls' are already in the list.
     let commit_ops_before = commit_ops.len();
@@ -1226,6 +1242,104 @@ fn walk_cpu_ops<const REST: bool>(
             memw.extend_ops(hint_memw);
             if REST {
                 hint_ops.push(hint_op);
+            }
+        }
+
+        // Collect P1w16Permute ECALL operations: the 16-lane state, in place.
+        if op.ecall_p1w16() {
+            let state_addr = op.p1w16_state_addr();
+            let mut input = [0u64; p1w16::LANES];
+            for (i, lane) in input.iter_mut().enumerate() {
+                let addr = state_addr
+                    .checked_add(i as u64 * 8)
+                    .expect("p1w16 state address range must be validated by the executor");
+                let mut val = 0u64;
+                for b in 0..8 {
+                    let byte_addr = addr
+                        .checked_add(b as u64)
+                        .expect("p1w16 state address range must be validated by the executor");
+                    let (byte_val, _ts) = memory_state.read_byte(byte_addr);
+                    val |= (byte_val as u64) << (b * 8);
+                }
+                *lane = val;
+            }
+            let output = executor::vm::instruction::execution::p1w16_permute(input);
+            memw.extend_ops(collect_lane_memw_ops(
+                op.timestamp,
+                state_addr,
+                &input,
+                &output,
+                memory_state,
+                register_state,
+            ));
+            if REST {
+                p1w16_ops.push(P1w16Operation {
+                    timestamp: op.timestamp,
+                    state_addr,
+                    input,
+                    output,
+                });
+            }
+        }
+
+        // Collect Fp3Mac ECALL operations: x10 and x11 read, then the nine
+        // words at one timestamp, `acc` rewritten in place.
+        if op.ecall_fp3mac() {
+            let t = op.timestamp;
+            let state_addr = register_state.read(10).0;
+            let cell_addr = register_state.read(11).0;
+            let mut fop = Fp3MacOperation {
+                timestamp: t,
+                state_addr,
+                cell_addr,
+                input: [0; fp3mac::WORDS],
+                output: [0; 3],
+            };
+            for w in 0..fp3mac::WORDS {
+                let addr = fop.word_addr(w);
+                fop.input[w] = (0..8).fold(0u64, |v, b| {
+                    v | (memory_state.read_byte(addr + b as u64).0 as u64) << (8 * b)
+                });
+            }
+            fop.output = executor::vm::instruction::execution::fp3mac(
+                core::array::from_fn(|i| fop.input[i]),
+                [fop.input[6], fop.input[7], fop.input[8]],
+            );
+            for (reg, value) in [(10u8, state_addr), (11, cell_addr)] {
+                let reg_value = pack_register_value(value);
+                let (_old_val, old_ts) = register_state.read(reg);
+                memw.extend_ops([
+                    MemwOperation::new(true, 2 * reg as u64, reg_value, t, 2, true)
+                        .with_old(reg_value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+                ]);
+                register_state.write(reg, value, t);
+            }
+            let mut word_ops = Vec::with_capacity(fp3mac::WORDS);
+            for w in 0..fp3mac::WORDS {
+                let addr = fop.word_addr(w);
+                let (old, new) = (fop.input[w], fop.word_out(w));
+                let mut old_bytes = [0u32; 8];
+                let mut old_timestamps = [0u64; 8];
+                let mut value_bytes = [0u32; 8];
+                for b in 0..8 {
+                    old_bytes[b] = ((old >> (8 * b)) & 0xFF) as u32;
+                    value_bytes[b] = ((new >> (8 * b)) & 0xFF) as u32;
+                    old_timestamps[b] = memory_state.read_byte(addr + b as u64).1;
+                }
+                word_ops.push(
+                    MemwOperation::new(false, addr, value_bytes, t, 8, true)
+                        .with_old(old_bytes, old_timestamps),
+                );
+            }
+            for w in 0..fp3mac::WORDS {
+                let (addr, new) = (fop.word_addr(w), fop.word_out(w));
+                for b in 0..8 {
+                    memory_state.write_byte(addr + b as u64, ((new >> (8 * b)) & 0xFF) as u8, t);
+                }
+            }
+            memw.extend_ops(word_ops);
+            if REST {
+                fp3mac_ops.push(fop);
             }
         }
 
@@ -2062,6 +2176,126 @@ fn collect_keccak_memw_ops(
     }
 
     memw_ops
+}
+
+/// The MEMW operations of an in-place lane-state ecall (P1W16): the x10 read,
+/// then one combined read+write per 8-byte lane at `ts` (old = `input`, value =
+/// `output`), exactly as [`collect_keccak_memw_ops`] does for KECCAK's 25 lanes.
+fn collect_lane_memw_ops(
+    ts: u64,
+    state_addr: u64,
+    input: &[u64],
+    output: &[u64],
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+) -> Vec<MemwOperation> {
+    let mut memw_ops = Vec::with_capacity(1 + input.len());
+    {
+        let reg_value = pack_register_value(state_addr);
+        let reg_addr = 2 * 10u64;
+        let (_old_val, old_ts) = register_state.read(10);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, ts, 2, true)
+            .with_old(reg_value, old_timestamps);
+        memw_ops.push(memw_op);
+        register_state.write(10, state_addr, ts);
+    }
+    for (lane_idx, (&in_lane, &out_lane)) in input.iter().zip(output).enumerate() {
+        let lane_addr = state_addr
+            .checked_add(lane_idx as u64 * 8)
+            .expect("lane state address range must be validated by the executor");
+        let mut old_bytes = [0u32; 8];
+        let mut old_timestamps = [0u64; 8];
+        for b in 0..8 {
+            old_bytes[b] = ((in_lane >> (b * 8)) & 0xFF) as u32;
+            let (_old_val, old_ts) = memory_state.read_byte(lane_addr + b as u64);
+            old_timestamps[b] = old_ts;
+        }
+        let mut value_bytes = [0u32; 8];
+        for (b, byte) in value_bytes.iter_mut().enumerate() {
+            *byte = ((out_lane >> (b * 8)) & 0xFF) as u32;
+        }
+        memw_ops.push(
+            MemwOperation::new(false, lane_addr, value_bytes, ts, 8, true)
+                .with_old(old_bytes, old_timestamps),
+        );
+        for (b, &val) in value_bytes.iter().enumerate() {
+            memory_state.write_byte(lane_addr + b as u64, val as u8, ts);
+        }
+    }
+    memw_ops
+}
+
+/// BITWISE lookups sent by the P1W16 table, in `p1w16::bus_interactions`'s
+/// pairing: the alignment AND, IS_HALF on the 64 pointer halfwords, and
+/// ARE_BYTES on the address, input and output bytes in adjacent pairs.
+pub(crate) fn collect_bitwise_from_p1w16(ops: &[P1w16Operation]) -> Vec<BitwiseOperation> {
+    let mut out = Vec::with_capacity(ops.len() * (1 + 4 * p1w16::LANES + 4 + 8 * p1w16::LANES));
+    for op in ops {
+        out.push(BitwiseOperation::byte_op(
+            BitwiseOperationType::ByteAluAnd,
+            (op.state_addr & 0xFF) as u8,
+            7,
+        ));
+        for lane in 0..p1w16::LANES {
+            let ptr = op
+                .state_addr
+                .checked_add(lane as u64 * 8)
+                .expect("p1w16 state address range must be validated by the executor");
+            for shift in [0, 16, 32, 48] {
+                out.push(is_half_op(((ptr >> shift) & 0xFFFF) as u16));
+            }
+        }
+        let mut bytes = Vec::with_capacity(8 + 16 * p1w16::LANES);
+        bytes.extend(op.state_addr.to_le_bytes());
+        for w in op.input.iter().chain(&op.output) {
+            bytes.extend(w.to_le_bytes());
+        }
+        for pair in bytes.chunks_exact(2) {
+            out.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::AreBytes,
+                pair[0],
+                pair[1],
+            ));
+        }
+    }
+    out
+}
+
+/// BITWISE lookups sent by the FP3MAC table, in `fp3mac::bus_interactions`'s
+/// pairing: the two alignment ANDs, IS_HALF on the 36 pointer halfwords, and
+/// ARE_BYTES on the addresses, input and output bytes in adjacent pairs.
+pub(crate) fn collect_bitwise_from_fp3mac(ops: &[Fp3MacOperation]) -> Vec<BitwiseOperation> {
+    let mut out = Vec::with_capacity(ops.len() * (2 + 4 * fp3mac::WORDS + 56));
+    for op in ops {
+        for addr in [op.state_addr, op.cell_addr] {
+            out.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::ByteAluAnd,
+                (addr & 0xFF) as u8,
+                7,
+            ));
+        }
+        for w in 0..fp3mac::WORDS {
+            let ptr = op.word_addr(w);
+            for shift in [0, 16, 32, 48] {
+                out.push(is_half_op(((ptr >> shift) & 0xFFFF) as u16));
+            }
+        }
+        let mut bytes = Vec::with_capacity(16 + 8 * (fp3mac::WORDS + 3));
+        bytes.extend(op.state_addr.to_le_bytes());
+        bytes.extend(op.cell_addr.to_le_bytes());
+        for w in op.input.iter().chain(&op.output) {
+            bytes.extend(w.to_le_bytes());
+        }
+        for pair in bytes.chunks_exact(2) {
+            out.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::AreBytes,
+                pair[0],
+                pair[1],
+            ));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -4010,6 +4244,11 @@ pub struct Traces {
     /// makes no hint ecall.
     pub hints: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
+    /// P1W16 table (one row per width-16 Poseidon1 ecall). Empty when the run
+    /// makes no such call.
+    pub p1w16s: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    pub fp3macs: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+
     /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     /// Local-to-global boundary table for continuation epochs. Empty unless the
@@ -4065,6 +4304,9 @@ struct CollectedOps {
     ecdas_ops: BlockVec<ecdas::CompactEcdasOp>,
     // Non-constraining hint ecall.
     hint_ops: BlockVec<hint::HintOperation>,
+    // Width-16 Poseidon1 ecall.
+    p1w16_ops: BlockVec<P1w16Operation>,
+    fp3mac_ops: BlockVec<Fp3MacOperation>,
 }
 
 /// How many leading chunks of each streamed table a windowed build already
@@ -5398,6 +5640,8 @@ fn collect_all_ops(
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
     hint_ops: Vec<hint::HintOperation>,
+    p1w16_ops: Vec<P1w16Operation>,
+    fp3mac_ops: Vec<Fp3MacOperation>,
     register_state: &mut RegisterState,
     is_final: bool,
 ) -> CollectedOps {
@@ -5479,6 +5723,8 @@ fn collect_all_ops(
                 .collect(),
         ),
         hint_ops: BlockVec::from_vec(hint_ops),
+        p1w16_ops: BlockVec::from_vec(p1w16_ops),
+        fp3mac_ops: BlockVec::from_vec(fp3mac_ops),
     }
 }
 
@@ -5947,6 +6193,8 @@ impl Traces {
             ecsms,
             ecdases,
             hints,
+            p1w16s,
+            fp3macs,
             memw_registers,
             local_to_global,
             touched_memory_cells: _,
@@ -5972,6 +6220,8 @@ impl Traces {
             ecsms,
             ecdases,
             hints,
+            p1w16s,
+            fp3macs,
             memw_registers,
             eqs,
             bytewises,
@@ -6094,6 +6344,7 @@ impl Traces {
         use super::ecdas::cols::NUM_COLUMNS as ECDAS_COLS;
         use super::ecsm::cols::NUM_COLUMNS as ECSM_COLS;
         use super::eq::cols::NUM_COLUMNS as EQ_COLS;
+        use super::fp3mac::cols::NUM_COLUMNS as FP3MAC_COLS;
         use super::halt::cols::NUM_COLUMNS as HALT_COLS;
         use super::hint::cols::NUM_COLUMNS as HINT_COLS;
         use super::keccak::cols::NUM_COLUMNS as KECCAK_COLS;
@@ -6106,6 +6357,7 @@ impl Traces {
         use super::memw_aligned::cols::NUM_COLUMNS as MEMW_A_COLS;
         use super::memw_register::cols::NUM_COLUMNS as MEMW_R_COLS;
         use super::mul::cols::NUM_COLUMNS as MUL_COLS;
+        use super::p1w16::cols::NUM_COLUMNS as P1W16_COLS;
         use super::page::NUM_PREPROCESSED_COLS as PAGE_PREPROCESSED;
         use super::page::cols::NUM_COLUMNS as PAGE_COLS;
         use super::register::NUM_PREPROCESSED_COLS as REGISTER_PREPROCESSED;
@@ -6137,6 +6389,8 @@ impl Traces {
             ecsms,
             ecdases,
             hints,
+            p1w16s,
+            fp3macs,
             memw_registers,
             eqs,
             bytewises,
@@ -6222,6 +6476,12 @@ impl Traces {
         for t in hints {
             total += (t.num_rows() * HINT_COLS) as u64;
         }
+        for t in p1w16s {
+            total += (t.num_rows() * P1W16_COLS) as u64;
+        }
+        for t in fp3macs {
+            total += (t.num_rows() * FP3MAC_COLS) as u64;
+        }
         total
     }
 
@@ -6265,6 +6525,8 @@ impl Traces {
         let n_ecsm = aux_cols(super::ecsm::bus_interactions().len());
         let n_ecdas = aux_cols(super::ecdas::bus_interactions().len());
         let n_hint = aux_cols(super::hint::bus_interactions().len());
+        let n_p1w16 = aux_cols(super::p1w16::bus_interactions().len());
+        let n_fp3mac = aux_cols(super::fp3mac::bus_interactions().len());
 
         let Traces {
             cpus,
@@ -6290,6 +6552,8 @@ impl Traces {
             ecsms,
             ecdases,
             hints,
+            p1w16s,
+            fp3macs,
             memw_registers,
             eqs,
             bytewises,
@@ -6373,6 +6637,12 @@ impl Traces {
         for t in hints {
             total += (t.num_rows() * n_hint) as u64;
         }
+        for t in p1w16s {
+            total += (t.num_rows() * n_p1w16) as u64;
+        }
+        for t in fp3macs {
+            total += (t.num_rows() * n_fp3mac) as u64;
+        }
         total
     }
 
@@ -6398,6 +6668,8 @@ impl Traces {
             ecsm: self.ecsms.len(),
             ecdas: self.ecdases.len(),
             hint: self.hints.len(),
+            p1w16: self.p1w16s.len(),
+            fp3mac: self.fp3macs.len(),
             commit: self.commits.len(),
             // 0 or 1: the table is carried only when the workload used it. The
             // six above read their own `Vec` length; this one cannot, because a
@@ -6710,6 +6982,8 @@ impl Traces {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            p1w16_ops,
+            fp3mac_ops,
         ) = collect_ops_from_cpu(
             &cpu_ops,
             &artifacts.decode,
@@ -6738,6 +7012,8 @@ impl Traces {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            p1w16_ops,
+            fp3mac_ops,
             &mut register_state,
             is_final,
         );
@@ -6839,6 +7115,8 @@ impl Traces {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            p1w16_ops,
+            fp3mac_ops,
         ) = collect_ops_from_cpu(
             &cpu_ops,
             &decode_table,
@@ -6862,6 +7140,8 @@ impl Traces {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            p1w16_ops,
+            fp3mac_ops,
             &mut register_state,
             true,
         );

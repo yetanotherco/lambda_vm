@@ -29,7 +29,7 @@ use crate::{RuntimePageRange, TableCounts};
 /// called V4, so keeping either suffix would have let proofs from the two
 /// branches share a transcript prefix — the exact thing this tag prevents. The
 /// merged encoding appends all seven counts and is V5.
-pub(crate) const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V5";
+pub(crate) const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V7";
 
 /// Canonical full-ELF identity digest — exactly what [`absorb_statement`] binds
 /// into the transcript. The recursion attestation folds the same digest into
@@ -267,7 +267,7 @@ pub(crate) fn absorb_statement_padding(
 /// exhaustive destructure in [`table_count_values`] fails when a field is added
 /// to [`TableCounts`], and that function's return type fails when the new field
 /// is pushed into the array without bumping this constant.
-pub(crate) const NUM_TABLE_KINDS: usize = 21;
+pub(crate) const NUM_TABLE_KINDS: usize = 23;
 
 /// Every per-table count, in declared order.
 ///
@@ -297,6 +297,8 @@ pub(crate) fn table_count_values(table_counts: &TableCounts) -> [u64; NUM_TABLE_
         hint,
         commit,
         blake3,
+        p1w16,
+        fp3mac,
     } = table_counts;
     [
         cpu as u64,
@@ -326,6 +328,9 @@ pub(crate) fn table_count_values(table_counts: &TableCounts) -> [u64; NUM_TABLE_
         // binding it is what stops prover and verifier building different AIR
         // sets from the same bytes (see `TableCounts::blake3`).
         blake3 as u64,
+        // 0 or 1: the width-16 Poseidon1 table (`TableCounts::p1w16`).
+        p1w16 as u64,
+        fp3mac as u64,
     ]
 }
 
@@ -366,7 +371,7 @@ pub(crate) const MULTILINEAR_BLOCK_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_BLOCK_STA
 /// different encodings of the same statement, and the merged one appends both
 /// additions. The GLOBAL tag stays at V2 — the cross-epoch statement binds no
 /// per-table counts, so nothing in its encoding moved.
-pub(crate) const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V5";
+pub(crate) const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V7";
 pub(crate) const CONTINUATION_GLOBAL_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_GLOBAL_V2";
 
 /// Statement bound into the cross-epoch **global** proof's transcript before

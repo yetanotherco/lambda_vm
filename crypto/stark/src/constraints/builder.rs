@@ -464,6 +464,69 @@ impl<F: IsField, E: IsField> ConstraintBuilder<F, E> for MetaBuilder {
 }
 
 // =============================================================================
+// NextRowReads — the columns a body reads at a later row
+// =============================================================================
+
+/// Records the trace columns a [`ConstraintSet`] body reads at frame offset
+/// `≥ 1`, which the verifier must open at `g·z`. Like [`MetaBuilder`] it does
+/// no field work, so it also runs where IR capture does not (the guest).
+#[derive(Default)]
+pub struct NextRowReads {
+    main: core::cell::RefCell<std::collections::BTreeSet<usize>>,
+    aux: core::cell::RefCell<std::collections::BTreeSet<usize>>,
+}
+
+impl NextRowReads {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Full-width `[main | aux]` indices, sorted.
+    pub fn into_columns(self, main_width: usize) -> Vec<usize> {
+        let main = self.main.into_inner();
+        let aux = self.aux.into_inner();
+        main.into_iter()
+            .chain(aux.into_iter().map(|c| main_width + c))
+            .collect()
+    }
+}
+
+impl<F: IsField, E: IsField> ConstraintBuilder<F, E> for NextRowReads {
+    type Expr = Nil;
+    type ExprE = Nil;
+
+    fn main(&self, offset: usize, col: usize) -> Nil {
+        if offset > 0 {
+            self.main.borrow_mut().insert(col);
+        }
+        Nil
+    }
+    fn aux(&self, offset: usize, col: usize) -> Nil {
+        if offset > 0 {
+            self.aux.borrow_mut().insert(col);
+        }
+        Nil
+    }
+    fn challenge(&self, _idx: usize) -> Nil {
+        Nil
+    }
+    fn alpha_pow(&self, _idx: usize) -> Nil {
+        Nil
+    }
+    fn table_offset(&self) -> Nil {
+        Nil
+    }
+    fn const_base(&self, _v: u64) -> Nil {
+        Nil
+    }
+    fn const_signed(&self, _v: i64) -> Nil {
+        Nil
+    }
+    fn emit_base_rows(&mut self, _constraint_idx: usize, _rows: RowDomain, _e: Nil) {}
+    fn emit_ext_rows(&mut self, _constraint_idx: usize, _rows: RowDomain, _e: Nil) {}
+}
+
+// =============================================================================
 // Shared AIR plumbing: run a ConstraintSet through the folders
 // =============================================================================
 

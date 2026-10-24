@@ -1203,6 +1203,77 @@ fn test_trace_ood_next_row_window_matches_captured_ir() {
     assert_ood_window_matches_ir(&busless, true, "busless");
 }
 
+/// `col0' = col0 + 1` on every row but the last.
+#[derive(Clone)]
+struct Increment;
+
+impl crate::constraints::builder::ConstraintSet<F, E> for Increment {
+    fn eval<B: crate::constraints::builder::ConstraintBuilder<F, E>>(&self, b: &mut B) {
+        let e = b.main(1, 0) - b.main(0, 0) - b.one();
+        b.emit_base_rows(0, crate::constraints::builder::RowDomain::except_last(1), e);
+    }
+}
+
+/// A wrapped constraint set that reads a main column at the next row gets that
+/// column opened at `g·z`, next to the accumulator, and its proofs verify.
+#[test_log::test]
+fn test_next_row_main_reads_are_opened_and_verify() {
+    let opts = ProofOptions::default_test_options();
+    for with_bus in [false, true] {
+        let interactions = if with_bus {
+            vec![
+                BusInteraction::sender(
+                    TEST_BUS,
+                    Multiplicity::Column(1),
+                    Packing::Direct.columns(&[0]),
+                ),
+                BusInteraction::receiver(
+                    TEST_BUS,
+                    Multiplicity::Column(1),
+                    Packing::Direct.columns(&[0]),
+                ),
+            ]
+        } else {
+            vec![]
+        };
+        let air = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, (), _>::new(
+            2,
+            AuxiliaryTraceBuildData { interactions },
+            &opts,
+            1,
+            Increment,
+        );
+        let (main, aux) = air.trace_layout();
+        let expected = if with_bus {
+            vec![0, main + aux - 1]
+        } else {
+            vec![0]
+        };
+        assert_eq!(air.trace_ood_next_row_columns(), expected);
+        assert_ood_window_matches_ir(&air, true, "increment");
+
+        let n = 16u64;
+        let mut trace = TraceTable::from_columns_main(
+            vec![(0..n).map(FE::from).collect(), vec![FE::one(); n as usize]],
+            1,
+        );
+        let proof = multi_prove_ram(
+            vec![(&air, &mut trace, &())],
+            &mut DefaultTranscript::<E>::new(&[]),
+        )
+        .expect("proving");
+        assert!(
+            Verifier::multi_verify(
+                &[&air],
+                &proof,
+                &mut DefaultTranscript::<E>::new(&[]),
+                &FieldElement::zero()
+            ),
+            "with_bus={with_bus}"
+        );
+    }
+}
+
 /// The g·z pruning actually shrinks the proof: a LogUp table opens every column
 /// at z (the current-row block) but only the accumulator at the next row.
 #[test_log::test]

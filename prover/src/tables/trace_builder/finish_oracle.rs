@@ -82,6 +82,8 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         ecsm_ops,
         ecdas_ops,
         hint_ops,
+        p1w16_ops,
+        fp3mac_ops,
     } = ops;
 
     // =====================================================================
@@ -393,6 +395,8 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops.whole()))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops.whole()))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_p1w16(&p1w16_ops.whole()))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_fp3mac(&fp3mac_ops.whole()))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ]);
     if let Some(image) = initial_image
@@ -878,6 +882,22 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             storage_mode,
         )
     };
+    let gen_p1w16s = || {
+        generate_optional(
+            &p1w16_ops.whole(),
+            packed_by(pack, p1w16::generate_p1w16_trace),
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_fp3macs = || {
+        generate_optional(
+            &fp3mac_ops.whole(),
+            packed_by(pack, fp3mac::generate_fp3mac_trace),
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
 
     let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =
         (None, None, None, None);
@@ -892,6 +912,8 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         (None, None, None, None);
     let (mut ecsms_slot, mut ecdases_slot) = (None, None);
     let mut hints_slot = None;
+    let mut p1w16s_slot = None;
+    let mut fp3macs_slot = None;
 
     #[cfg(feature = "disk-spill")]
     let sequential = storage_mode == StorageMode::Disk || cfg!(not(feature = "parallel"));
@@ -938,6 +960,8 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             spawn_into!(ecsms_slot, gen_ecsms);
             spawn_into!(ecdases_slot, gen_ecdases);
             spawn_into!(hints_slot, gen_hints);
+            spawn_into!(p1w16s_slot, gen_p1w16s);
+            spawn_into!(fp3macs_slot, gen_fp3macs);
         });
     } else {
         cpus_slot = Some(gen_cpus());
@@ -967,6 +991,8 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         ecsms_slot = Some(gen_ecsms());
         ecdases_slot = Some(gen_ecdases());
         hints_slot = Some(gen_hints());
+        p1w16s_slot = Some(gen_p1w16s());
+        fp3macs_slot = Some(gen_fp3macs());
     }
 
     build_stamps::mark("p5 end");
@@ -1003,6 +1029,8 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     let ecsms = ecsms_slot.expect(PHASE5_RAN)?;
     let ecdases = ecdases_slot.expect(PHASE5_RAN)?;
     let hints = hints_slot.expect(PHASE5_RAN)?;
+    let p1w16s = p1w16s_slot.expect(PHASE5_RAN)?;
+    let fp3macs = fp3macs_slot.expect(PHASE5_RAN)?;
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
     // so spill them here before returning.
@@ -1069,6 +1097,8 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         ecsms,
         ecdases,
         hints,
+        p1w16s,
+        fp3macs,
         memw_registers,
         local_to_global,
         touched_memory_cells,

@@ -1649,6 +1649,138 @@ fn test_prove_hint_min_inconsistent_output_rejected() {
     );
 }
 
+/// The `p1w16_precompile` guest's ELF.
+fn p1w16_guest_elf() -> Vec<u8> {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    std::fs::read(workspace_root.join("executor/program_artifacts/rust/p1w16_precompile.elf"))
+        .expect("p1w16_precompile.elf not found — run `make compile-programs-rust`")
+}
+
+/// The width-16 Poseidon1 ecall end to end: the P1W16 table proves the guest's
+/// five chained permutations, and the committed lanes are the host's.
+#[test]
+fn test_prove_p1w16_precompile_rust_guest() {
+    let elf_bytes = p1w16_guest_elf();
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "p1w16_precompile rust guest should verify"
+    );
+    assert_eq!(proof.table_counts.p1w16, 1);
+    const P: u64 = 0xFFFF_FFFF_0000_0001;
+    let mut state: [u64; 16] = core::array::from_fn(|i| match i % 4 {
+        0 => 0,
+        1 => 1,
+        2 => P - 1,
+        _ => (i as u64) * 0x0123_4567_89AB_CDEF % P,
+    });
+    for _ in 0..5 {
+        state = executor::vm::instruction::execution::p1w16_permute(state);
+    }
+    let expected: Vec<u8> = state.iter().flat_map(|w| w.to_le_bytes()).collect();
+    assert_eq!(proof.public_output, expected);
+}
+
+/// Soundness: an output byte of a P1W16 row changed after the build is refused
+/// (the rounds no longer reach it, and its Memw write no longer balances).
+#[test]
+fn test_prove_p1w16_forged_output_rejected() {
+    use crate::tables::p1w16::cols as p1w16_cols;
+    let elf_bytes = p1w16_guest_elf();
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let result = Executor::new(&elf, vec![])
+        .expect("Failed to create executor")
+        .run()
+        .expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert_eq!(traces.p1w16s.len(), 1);
+    let orig = *traces.p1w16s[0].main_table.get(0, p1w16_cols::output(3, 0));
+    let forged = orig + FieldElement::<GoldilocksField>::one();
+    traces.p1w16s[0]
+        .main_table
+        .set(0, p1w16_cols::output(3, 0), forged);
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a forged P1W16 output byte"
+    );
+}
+
+/// The `fp3mac_precompile` guest's ELF.
+fn fp3mac_guest_elf() -> Vec<u8> {
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    std::fs::read(workspace_root.join("executor/program_artifacts/rust/fp3mac_precompile.elf"))
+        .expect("fp3mac_precompile.elf not found — run `make compile-programs-rust`")
+}
+
+/// The cubic-extension multiply-add ecall end to end: the FP3MAC table proves
+/// the guest's Horner, and the committed accumulator is the host's.
+#[test]
+fn test_prove_fp3mac_precompile_rust_guest() {
+    let elf_bytes = fp3mac_guest_elf();
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "fp3mac_precompile rust guest should verify"
+    );
+    assert_eq!(proof.table_counts.fp3mac, 1);
+    const P: u64 = 0xFFFF_FFFF_0000_0001;
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = seed;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (z ^ (z >> 31)) % P
+    };
+    let mut state: [u64; 6] = [0, 0, 0, next(), next(), next()];
+    let edges: [[u64; 3]; 3] = [[0, 1, P - 1], [P - 1, P - 1, P - 1], [0xFFFF_FFFF, 0, 1]];
+    for k in 0..48 {
+        let x = if k < edges.len() {
+            edges[k]
+        } else {
+            [next(), next(), next()]
+        };
+        let acc = executor::vm::instruction::execution::fp3mac(state, x);
+        state[..3].copy_from_slice(&acc);
+    }
+    let expected: Vec<u8> = state[..3].iter().flat_map(|w| w.to_le_bytes()).collect();
+    assert_eq!(proof.public_output, expected);
+}
+
+/// Soundness: an output byte of an FP3MAC row changed after the build is
+/// refused (the product no longer holds, and its Memw write no longer balances).
+#[test]
+fn test_prove_fp3mac_forged_output_rejected() {
+    use crate::tables::fp3mac::cols as fp3mac_cols;
+    let elf_bytes = fp3mac_guest_elf();
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let result = Executor::new(&elf, vec![])
+        .expect("Failed to create executor")
+        .run()
+        .expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert_eq!(traces.fp3macs.len(), 1);
+    let orig = *traces.fp3macs[0]
+        .main_table
+        .get(5, fp3mac_cols::output(1, 0));
+    let forged = orig + FieldElement::<GoldilocksField>::one();
+    traces.fp3macs[0]
+        .main_table
+        .set(5, fp3mac_cols::output(1, 0), forged);
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a forged FP3MAC output byte"
+    );
+}
+
 /// Load `hint_min` and build its minimal traces (for the operand-forgery tests below).
 fn hint_min_traces() -> (Elf, Traces) {
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -3067,6 +3199,8 @@ fn test_verify_rejects_zero_table_counts() {
             hint: 0,
             commit: 0,
             blake3: 0,
+            p1w16: 0,
+            fp3mac: 0,
         },
         ..vm_proof
     };
@@ -3161,6 +3295,8 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         hint: 0,
         commit: 0,
         blake3: 0,
+        p1w16: 0,
+        fp3mac: 0,
     };
     let airs = VmAirs::new(
         &elf,
@@ -4485,6 +4621,8 @@ fn the_blake3_count_is_bound_into_the_statement() {
         hint: 1,
         commit: 1,
         blake3: 1,
+        p1w16: 0,
+        fp3mac: 0,
     };
 
     let challenge_for = |counts: &crate::TableCounts| {
@@ -4549,6 +4687,8 @@ fn a_blake3_count_above_one_is_rejected() {
         hint: 1,
         commit: 1,
         blake3: 1,
+        p1w16: 0,
+        fp3mac: 0,
     };
     assert!(counts.validate().is_ok(), "1 is the honest maximum");
     counts.blake3 = 0;

@@ -1670,6 +1670,8 @@ pub(super) struct KeptRest {
     /// Held compact (their carries in 16 bits), widened as each is read.
     ecdas_ops: BlockVec<super::ecdas::CompactEcdasOp>,
     hint_ops: BlockVec<super::hint::HintOperation>,
+    p1w16_ops: BlockVec<super::p1w16::P1w16Operation>,
+    fp3mac_ops: BlockVec<super::fp3mac::Fp3MacOperation>,
 }
 
 /// ECDAS rows a block of the kept ECDAS ops holds: the block's ECDAS cut
@@ -1692,6 +1694,8 @@ impl KeptRest {
             ecsm_ops: list(usize::MAX),
             ecdas_ops: BlockVec::new(ECDAS_BLOCK_ROWS),
             hint_ops: list(usize::MAX),
+            p1w16_ops: list(usize::MAX),
+            fp3mac_ops: list(usize::MAX),
         }
     }
 
@@ -1713,12 +1717,14 @@ impl KeptRest {
                     .collect(),
             ),
             hint_ops: BlockVec::from_vec(std::mem::take(&mut walk.hint_ops)),
+            p1w16_ops: BlockVec::from_vec(std::mem::take(&mut walk.p1w16_ops)),
+            fp3mac_ops: BlockVec::from_vec(std::mem::take(&mut walk.fp3mac_ops)),
         }
     }
 
     /// Each list's (name, heap bytes, largest single allocation). ECSM's
     /// counts the steps' buffer each op's witness owns as well.
-    fn sizes(&self) -> [(&'static str, usize, usize); 9] {
+    fn sizes(&self) -> [(&'static str, usize, usize); 11] {
         fn of<T>(name: &'static str, list: &BlockVec<T>) -> (&'static str, usize, usize) {
             (name, list.heap_bytes(), list.largest_bytes())
         }
@@ -1741,6 +1747,8 @@ impl KeptRest {
             ecsm,
             of("ecdas", &self.ecdas_ops),
             of("hint", &self.hint_ops),
+            of("p1w16", &self.p1w16_ops),
+            of("fp3mac", &self.fp3mac_ops),
         ]
     }
 }
@@ -1841,6 +1849,8 @@ impl Kept {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            p1w16_ops,
+            fp3mac_ops,
         } = walk;
         self.cpu.push(cpu_ops);
         self.register_rows.push(memw.register_rows);
@@ -1860,6 +1870,8 @@ impl Kept {
         rest.ecdas_ops
             .extend(ecdas_ops.iter().map(super::ecdas::CompactEcdasOp::from_op));
         rest.hint_ops.extend(hint_ops);
+        rest.p1w16_ops.extend(p1w16_ops);
+        rest.fp3mac_ops.extend(fp3mac_ops);
     }
 
     /// The run's lists with the handed-out ops left out (the streamed tables'
@@ -2149,6 +2161,8 @@ fn concatenate(windows: Vec<WalkedWindow>) -> (Vec<super::CpuOperation>, WalkOut
     let mut ecsm = Vec::with_capacity(n);
     let mut ecdas = Vec::with_capacity(n);
     let mut hint = Vec::with_capacity(n);
+    let mut p1w16 = Vec::with_capacity(n);
+    let mut fp3mac = Vec::with_capacity(n);
     for WalkedWindow { cpu_ops, walk } in windows {
         cpu.push(cpu_ops);
         register_rows.push(walk.memw.register_rows);
@@ -2166,6 +2180,8 @@ fn concatenate(windows: Vec<WalkedWindow>) -> (Vec<super::CpuOperation>, WalkOut
         ecsm.push(walk.ecsm_ops);
         ecdas.push(walk.ecdas_ops);
         hint.push(walk.hint_ops);
+        p1w16.push(walk.p1w16_ops);
+        fp3mac.push(walk.fp3mac_ops);
     }
     let ((cpu, (register_rows, aligned)), ((general, bitwise), (load, (lt, shift)))) = join(
         || (cat(cpu), join(|| cat(register_rows), || cat(aligned))),
@@ -2194,6 +2210,8 @@ fn concatenate(windows: Vec<WalkedWindow>) -> (Vec<super::CpuOperation>, WalkOut
         ecsm_ops: cat(ecsm),
         ecdas_ops: cat(ecdas),
         hint_ops: cat(hint),
+        p1w16_ops: cat(p1w16),
+        fp3mac_ops: cat(fp3mac),
     };
     (cpu, walk)
 }
@@ -2331,6 +2349,8 @@ fn assemble(
         ecsm_ops,
         ecdas_ops,
         hint_ops,
+        p1w16_ops,
+        fp3mac_ops,
     } = rest;
     let MemwBuckets {
         register_rows: mut memw_register_rows,
@@ -2397,6 +2417,8 @@ fn assemble(
         ecsm_ops,
         ecdas_ops,
         hint_ops,
+        p1w16_ops,
+        fp3mac_ops,
     }
 }
 

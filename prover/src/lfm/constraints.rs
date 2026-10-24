@@ -761,6 +761,10 @@ pub struct QuotientShape {
     /// composition evaluation is split into. Also shape: the verifier rejects a
     /// proof whose part count disagrees with the AIR.
     pub num_composition_parts: usize,
+    /// End-row exemptions in transition-constraint index order. The STARK
+    /// zerofier for constraint `i` is `(ζ^N - 1)^-1` times the product of
+    /// `(ζ - g^(N-j))` for each exempted final row `j`.
+    pub transition_end_exemptions: Vec<usize>,
     /// The AIR's boundary constraints.
     pub boundary: Vec<BoundaryTerm>,
 }
@@ -780,13 +784,12 @@ pub struct QuotientEval {
 ///
 /// # One division, not one per constraint
 ///
-/// Every production constraint applies to every row (`RowDomain::ALL`, measured
-/// across all 28 tables), so `end_exemptions` is zero everywhere and all of an
-/// AIR's constraints share the zerofier `Z = ζ^N − 1`. That lets the division
-/// factor out of the β-power sum:
+/// Constraints with no end exemptions share the zerofier `Z = ζ^N − 1`. For
+/// each constraint with exemptions, its exemption polynomial is applied before
+/// the common division:
 ///
 /// ```text
-///   Σ_c β^c·C_c/Z  =  (Σ_c β^c·C_c)/Z
+///   Σ_c β^c·C_c·P_c(ζ)/Z  =  (Σ_c β^c·C_c·P_c(ζ))/Z
 /// ```
 ///
 /// one division per AIR rather than one per constraint. The boundary terms do
@@ -833,6 +836,11 @@ pub fn emit_quotient(
         "the supplied parts must match the AIR's part count, which is shape and \
          never read off the proof"
     );
+    assert_eq!(
+        constraint_evals.len(),
+        shape.transition_end_exemptions.len(),
+        "transition exemption metadata must match the AIR constraint count"
+    );
 
     let one = b.ext_const(&FEE::one());
 
@@ -865,7 +873,27 @@ pub fn emit_quotient(
         let quotient = b.emul(numerator, den_inv);
         terms.push(b.emul(quotient, zerofier));
     }
-    terms.extend(constraint_evals.iter().rev().copied());
+    let generator =
+        <GoldilocksField as math::field::traits::IsFFTField>::get_primitive_root_of_unity(
+            shape.log2_trace_length as u64,
+        )
+        .expect("trace length has a primitive root");
+    for (eval, &exemptions) in constraint_evals
+        .iter()
+        .zip(&shape.transition_end_exemptions)
+        .rev()
+    {
+        let mut corrected = *eval;
+        let decrement = generator.pow((1u64 << shape.log2_trace_length) - 1);
+        let mut root = decrement;
+        for _ in 0..exemptions {
+            let root_ext = b.felt_const(root).as_ext();
+            let factor = b.esub(zeta, root_ext);
+            corrected = b.emul(corrected, factor);
+            root *= decrement;
+        }
+        terms.push(corrected);
+    }
 
     let mut acc = terms[0];
     for t in &terms[1..] {

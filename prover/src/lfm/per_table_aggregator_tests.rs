@@ -1067,6 +1067,7 @@ pub(super) fn child_shape(c: &RealChild) -> super::per_table_aggregator::ChildSh
         num_public_words: c.public_words.len(),
         fri_final_poly_log_degree: c.opts.fri_final_poly_log_degree,
         statement_tag: super::statement::LFM_STATEMENT_TAG,
+        kind: super::per_table_aggregator::ChildKind::Lfm,
         tables: c
             .tables
             .iter()

@@ -191,11 +191,15 @@ impl TableVerifyShape {
     /// `trees` (its arity and arity-4 cap, `TreeGeometry::of::<H>()`): the
     /// tree heights and path shapes that configuration's prover lays out, and
     /// the host's `StarkCaps` under it as the cross-check.
-    pub fn derive_with(
-        air: &super::epoch::DynVmAir<'_>,
+    pub fn derive_with<PI>(
+        air: &super::epoch::DynVmAir<'_, PI>,
         trace_length: usize,
         trees: stark::config::TreeGeometry,
-    ) -> Result<(Self, Analysis), String> {
+    ) -> Result<(Self, Analysis), String>
+    where
+        PI: rkyv::Archive + Clone,
+        <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, stark::proof::view::PiDeserializer>,
+    {
         use stark::verifier::IsStarkVerifier;
         if !trace_length.is_power_of_two() {
             return Err(format!("trace length {trace_length} is not a power of two"));
@@ -204,8 +208,14 @@ impl TableVerifyShape {
         let layout = stark::verifier::Verifier::<
             crate::tables::types::GoldilocksField,
             crate::tables::types::GoldilocksExtension,
-            (),
+            PI,
         >::ood_layout(air);
+        // Keep the machine-side DEEP shape tied to the AIR's declared read set
+        // at offset 1, exactly as the STARK verifier's OodLayout is. In
+        // particular, Field VM AIRs read main columns at `g·z`; those openings
+        // are authenticated by DEEP along with the LogUp accumulator.
+        let next_row_columns = air.trace_ood_next_row_columns();
+        debug_assert_eq!(layout.next_row_cols(), next_row_columns.as_slice());
         let artifact = stark::constraint_ir::ConstraintArtifact::capture(air);
 
         let (main_width, aux_width) = air.trace_layout();
@@ -241,7 +251,7 @@ impl TableVerifyShape {
             step_size: layout.step_size(),
             num_eval_points: artifact.shape.transition_offsets.len() * layout.step_size(),
             num_total_cols,
-            next_row_cols: layout.next_row_cols().to_vec(),
+            next_row_cols: next_row_columns,
             num_composition_parts: num_parts,
             log2_trace_length,
         };
@@ -270,6 +280,11 @@ impl TableVerifyShape {
             quotient: QuotientShape {
                 log2_trace_length,
                 num_composition_parts: num_parts,
+                transition_end_exemptions: artifact
+                    .constraints_meta()
+                    .iter()
+                    .map(|m| m.end_exemptions)
+                    .collect(),
                 boundary: boundary_terms(has_aux_trace, num_total_cols),
             },
             fri: FriShape::for_layout(opts, log2_lde_length, leaf_layout).with_trees(trees),

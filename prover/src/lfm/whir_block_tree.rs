@@ -2623,6 +2623,8 @@ mod tests {
             hint: 0,
             commit: 1,
             blake3: 0,
+            p1w16: 0,
+            fp3mac: 0,
         };
         let statement = block_whir::OwnedBlockStatement {
             table_num_vars: vec![21, 16, 6],

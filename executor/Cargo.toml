@@ -12,6 +12,10 @@ ecsm = { path = "../crypto/ecsm" }
 # `Hint` ecall — same k256 arithmetic the guest verifies against. Production code:
 # `compute_hint` runs in every proving execution of a hint-using guest.
 k256 = { version = "0.13", default-features = false, features = ["arithmetic", "expose-field"] }
+# Host-side width-16 Poseidon1 for the `P1w16Permute` ecall: the same
+# permutation the prover's chip constrains.
+crypto = { path = "../crypto/crypto" }
+math = { path = "../crypto/math" }
 
 [dev-dependencies]
 # Test-only: the guest-side syscall crate re-declares the `hint` selectors as `usize`

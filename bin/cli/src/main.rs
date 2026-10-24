@@ -1111,7 +1111,7 @@ fn cmd_execute(
                     Some(Accelerator::Keccak) => keccak_calls += 1,
                     Some(Accelerator::Blake3) => blake3_calls += 1,
                     Some(Accelerator::Ecsm) => ecsm_calls += 1,
-                    None => {}
+                    Some(Accelerator::P1w16 | Accelerator::Fp3Mac) | None => {}
                 }
             }
             if cycle_budget.is_some_and(|budget| cycle_count >= budget) {

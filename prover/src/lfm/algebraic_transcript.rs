@@ -705,13 +705,15 @@ mod tests {
             hint: 1,
             commit: 1,
             blake3: 1,
+            p1w16: 1,
+            fp3mac: 1,
         };
         // ⚠ Written out rather than taken from `table_count_values`, on purpose:
         // the point of this test is that the MACHINE side reproduces the host
         // encoding, so the machine's array must be an independent statement of
         // it. Sharing the helper would compare the host with itself.
         let count_array: [u64; NUM_TABLE_COUNTS] = [
-            11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 1, 1, 1, 1, 1, 1, 1,
+            11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 1, 1, 1, 1, 1, 1, 1, 1, 1,
         ];
         const PAGES: usize = 6;
         const FPLD: u8 = 3;

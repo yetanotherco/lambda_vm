@@ -1083,6 +1083,8 @@ pub(crate) mod onechain_steps {
         Fold { round: usize, query: usize },
         /// The weight and the final check.
         Final,
+        /// A leaf's part outside the chains: front, walk, prepared, tail.
+        Part(&'static str),
     }
 
     /// [`Step::Opening`].

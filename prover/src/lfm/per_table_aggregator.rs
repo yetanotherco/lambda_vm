@@ -39,6 +39,44 @@
 //! emit-time constant. Those are [`emit_chain_bindings`], and they are the whole
 //! reason a tree of these proves something a bag of them does not.
 
+#[cfg(test)]
+thread_local! {
+    static TABLE_LEG_RANGES: std::cell::RefCell<Option<Vec<(usize, usize, usize)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Instruction ranges emitted for each table leg, used by the hybrid-node
+/// refusal diagnostic. The recorder is inert outside this test helper.
+#[cfg(test)]
+pub(crate) fn record_table_legs<R>(f: impl FnOnce() -> R) -> (R, Vec<(usize, usize, usize)>) {
+    let previous = TABLE_LEG_RANGES.with(|ranges| ranges.replace(Some(Vec::new())));
+    let result = f();
+    let ranges = TABLE_LEG_RANGES
+        .with(|ranges| ranges.replace(previous))
+        .unwrap_or_default();
+    (result, ranges)
+}
+
+#[cfg(test)]
+fn record_table_leg_start(index: usize, start: usize) {
+    TABLE_LEG_RANGES.with(|ranges| {
+        if let Some(ranges) = ranges.borrow_mut().as_mut() {
+            ranges.push((index, start, start));
+        }
+    });
+}
+
+#[cfg(test)]
+fn record_table_leg_end(index: usize, end: usize) {
+    TABLE_LEG_RANGES.with(|ranges| {
+        if let Some(ranges) = ranges.borrow_mut().as_mut() {
+            let range = ranges.last_mut().expect("table leg start was recorded");
+            assert_eq!(range.0, index);
+            range.2 = end;
+        }
+    });
+}
+
 use stark::config::Commitment;
 
 use crate::tables::types::{FE, FEE};
@@ -103,27 +141,47 @@ pub struct ChildShape<'a> {
     /// [`LFM_STATEMENT_TAG`] for the legacy pin. A program constant, like the
     /// id.
     pub statement_tag: &'static [u8],
+    /// Which public statement and bus closure this proof uses.
+    pub kind: ChildKind<'a>,
     /// The child's sub-proofs, in proof order.
     pub tables: Vec<ChildTable<'a>>,
 }
 
+pub enum ChildKind<'a> {
+    Lfm,
+    Hybrid {
+        program_id_roots: &'a [Commitment],
+        segments: &'a [crate::field_vm::air::FvmPublicInputs],
+    },
+}
+
 /// One sub-proof's shapes in a [`DerivedChild`].
-struct DerivedTable {
-    challenge: TableChallengeShape,
-    verify: TableVerifyShape,
-    analysis: Analysis,
-    precomputed_root: Option<Commitment>,
+pub(super) struct DerivedTable {
+    pub(super) challenge: TableChallengeShape,
+    pub(super) verify: TableVerifyShape,
+    pub(super) analysis: Analysis,
+    pub(super) precomputed_root: Option<Commitment>,
 }
 
 /// A child's shapes derived from its ARTIFACTS — its program's AIR set and
 /// heights — with no proof of it: what a verifier needs to derive a node's
 /// program from the programs below it. [`Self::shape`] is the emitter's view.
 pub struct DerivedChild {
-    program_id: Commitment,
-    num_public_words: usize,
-    fri_final_poly_log_degree: u8,
-    statement_tag: &'static [u8],
-    tables: Vec<DerivedTable>,
+    pub(super) program_id: Commitment,
+    pub(super) num_public_words: usize,
+    pub(super) fri_final_poly_log_degree: u8,
+    pub(super) statement_tag: &'static [u8],
+    pub(super) kind: OwnedChildKind,
+    pub(super) tables: Vec<DerivedTable>,
+}
+
+pub(super) enum OwnedChildKind {
+    Lfm,
+    #[cfg(all(test, feature = "parallel"))]
+    Hybrid {
+        program_id_roots: Vec<Commitment>,
+        segments: Vec<crate::field_vm::air::FvmPublicInputs>,
+    },
 }
 
 impl DerivedChild {
@@ -191,6 +249,7 @@ impl DerivedChild {
             num_public_words,
             fri_final_poly_log_degree: opts.fri_final_poly_log_degree,
             statement_tag: Fam::STATEMENT_TAG,
+            kind: OwnedChildKind::Lfm,
             tables,
         })
     }
@@ -202,6 +261,17 @@ impl DerivedChild {
             num_public_words: self.num_public_words,
             fri_final_poly_log_degree: self.fri_final_poly_log_degree,
             statement_tag: self.statement_tag,
+            kind: match &self.kind {
+                OwnedChildKind::Lfm => ChildKind::Lfm,
+                #[cfg(all(test, feature = "parallel"))]
+                OwnedChildKind::Hybrid {
+                    program_id_roots,
+                    segments,
+                } => ChildKind::Hybrid {
+                    program_id_roots,
+                    segments,
+                },
+            },
             tables: self
                 .tables
                 .iter()
@@ -349,6 +419,35 @@ pub fn emit_lfm_statement_tagged(
     t.append_const_bytes(&[fri_final_poly_log_degree]);
 }
 
+/// Replay `field_vm::prove::absorb_statement` for one hinted public cell per
+/// word. A cell is `[addr, c0, c1, c2]`; each lane is appended as its own
+/// eight-byte call, matching the host transcript's call boundaries.
+pub fn emit_fvm_statement(
+    t: &mut TranscriptReplay,
+    program_id: &[Commitment],
+    public: &[HintedPublicWord],
+    segments: &[crate::field_vm::air::FvmPublicInputs],
+) {
+    t.append_const_bytes(&(program_id.len() as u64).to_le_bytes());
+    for root in program_id {
+        t.append_const_bytes(root);
+    }
+    t.append_const_bytes(&(public.len() as u64).to_le_bytes());
+    for cell in public {
+        assert_eq!(cell.halves.len(), 8, "one public cell occupies one word");
+        for lane in 0..4 {
+            t.append_halves_misaligned(&cell.halves[2 * lane..2 * lane + 2]);
+        }
+    }
+    t.append_const_bytes(&(segments.len() as u64).to_le_bytes());
+    for pi in segments {
+        t.append_const_bytes(&(pi.last_row as u64).to_le_bytes());
+        for word in pi.first.iter().chain(&pi.last) {
+            t.append_const_bytes(&word.to_le_bytes());
+        }
+    }
+}
+
 /// The `LfmPublic` balance the leg's LogUp closure must reach — the machine twin
 /// of `proof::expected_public_balance`:
 /// `Σ_i 1/(z − (LfmPublic + index_i·α + Σ_l lane_l·α^{2+l}))`, with each division
@@ -386,6 +485,58 @@ pub fn emit_public_balance(
         });
     }
     acc.unwrap_or_else(|| b.ext_const(&FEE::zero()))
+}
+
+/// The Field VM's public-cell and segment-state LogUp target. The first sum
+/// binds public memory; the second binds the public start and halt states.
+pub fn emit_fvm_public_balance(
+    b: &mut LfmBuilder,
+    public: &[HintedPublicWord],
+    z: Ext,
+    alpha: Ext,
+) -> Ext {
+    let public_bus = b.ext_const(&FEE::from(
+        crate::tables::types::BusId::FieldVmPublic as u64,
+    ));
+    let one = b.ext_const(&FEE::one());
+    let a1 = alpha;
+    let a2 = b.emul(a1, alpha);
+    let a3 = b.emul(a2, alpha);
+    let a4 = b.emul(a3, alpha);
+    let mut public_sum: Option<Ext> = None;
+    for cell in public {
+        assert_eq!(cell.lanes.len(), 4, "one public cell occupies one word");
+        let mut fp = public_bus;
+        for (lane, power) in cell.lanes.iter().zip([a1, a2, a3, a4]) {
+            let term = b.emul_base(power, *lane);
+            fp = b.eadd(fp, term);
+        }
+        let fingerprint = b.esub(z, fp);
+        let term = b.ediv(one, fingerprint);
+        public_sum = Some(match public_sum {
+            Some(sum) => b.eadd(sum, term),
+            None => term,
+        });
+    }
+
+    fn state_fingerprint(b: &mut LfmBuilder, words: &[u64], z: Ext, alpha: Ext) -> Ext {
+        let mut power = alpha;
+        let mut token = b.ext_const(&FEE::from(crate::tables::types::BusId::FieldVmState as u64));
+        for word in words {
+            let value = b.felt_const(FE::from(*word));
+            let term = b.emul_base(power, value);
+            token = b.eadd(token, term);
+            power = b.emul(power, alpha);
+        }
+        b.esub(z, token)
+    }
+    let start = state_fingerprint(b, &crate::field_vm::air::start_words(), z, alpha);
+    let halt = state_fingerprint(b, &crate::field_vm::air::halt_words(), z, alpha);
+    let start_inv = b.ediv(one, start);
+    let halt_inv = b.ediv(one, halt);
+    let state = b.esub(start_inv, halt_inv);
+    let public_sum = public_sum.unwrap_or_else(|| b.ext_const(&FEE::zero()));
+    b.eadd(public_sum, state)
 }
 
 // ============================== the verify leg ============================
@@ -469,14 +620,23 @@ pub fn emit_leg(b: &mut LfmBuilder, child: &ChildShape<'_>, a: &LegArenas) -> Le
 
     // ---- the statement, over the child's claimed published words ----
     let publics = hint_public_words(b, a.publics, child.num_public_words);
-    let mut t = TranscriptReplay::new(&[]);
-    emit_lfm_statement_tagged(
-        &mut t,
-        child.statement_tag,
-        child.program_id,
-        &publics,
-        child.fri_final_poly_log_degree,
-    );
+    let mut t = match &child.kind {
+        ChildKind::Lfm => TranscriptReplay::new(&[]),
+        ChildKind::Hybrid { .. } => TranscriptReplay::new(crate::field_vm::prove::DOMAIN_TAG),
+    };
+    match &child.kind {
+        ChildKind::Lfm => emit_lfm_statement_tagged(
+            &mut t,
+            child.statement_tag,
+            child.program_id,
+            &publics,
+            child.fri_final_poly_log_degree,
+        ),
+        ChildKind::Hybrid {
+            program_id_roots,
+            segments,
+        } => emit_fvm_statement(&mut t, program_id_roots, &publics, segments),
+    }
 
     // ---- Phase A: preprocessed roots as AIR-set constants, main roots hinted.
     let main_cells: Vec<RootCells> = (0..n)
@@ -508,6 +668,8 @@ pub fn emit_leg(b: &mut LfmBuilder, child: &ChildShape<'_>, a: &LegArenas) -> Le
     // ---- one fork per sub-proof, with the full verification legs ----
     let mut contributions: Vec<Ext> = Vec::new();
     for (i, table) in child.tables.iter().enumerate() {
+        #[cfg(test)]
+        record_table_leg_start(i, b.instrs().len());
         let c = table.challenge;
         let arenas = &a.per_table[i];
         let aux = arenas.aux_root.map(|id| RootCells::hint(b, id, 0));
@@ -562,6 +724,8 @@ pub fn emit_leg(b: &mut LfmBuilder, child: &ChildShape<'_>, a: &LegArenas) -> Le
             },
             &arenas.legs,
         );
+        #[cfg(test)]
+        record_table_leg_end(i, b.instrs().len());
     }
 
     // ---- the closure, against the PUBLIC balance ----
@@ -569,7 +733,10 @@ pub fn emit_leg(b: &mut LfmBuilder, child: &ChildShape<'_>, a: &LegArenas) -> Le
     // Every other LFM bus balances to zero internally; `LfmPublic` is the one
     // whose target is the claimed words, which is what makes this the binding
     // between "the proof verifies" and "it published THESE words".
-    let target = emit_public_balance(b, &publics, z, alpha);
+    let target = match &child.kind {
+        ChildKind::Lfm => emit_public_balance(b, &publics, z, alpha),
+        ChildKind::Hybrid { .. } => emit_fvm_public_balance(b, &publics, z, alpha),
+    };
     let shape = super::logup::LogUpShape {
         num_contributing_tables: contributions.len(),
         num_output_bytes: 0,

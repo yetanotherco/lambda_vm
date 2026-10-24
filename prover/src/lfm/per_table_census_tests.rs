@@ -443,6 +443,11 @@ fn table_shape(
             quotient: QuotientShape {
                 log2_trace_length,
                 num_composition_parts: num_parts,
+                transition_end_exemptions: artifact
+                    .constraints_meta()
+                    .iter()
+                    .map(|m| m.end_exemptions)
+                    .collect(),
                 boundary: boundary_terms(has_aux_trace, num_total_cols),
             },
             fri,

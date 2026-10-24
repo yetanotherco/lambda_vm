@@ -416,6 +416,20 @@ pub struct LfmExecution {
     pub split: ExecSplit,
 }
 
+impl LfmExecution {
+    /// An execution of a `num_addrs`-cell program that wrote nothing: what a
+    /// pass reading only the program's shape takes in place of a run.
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) fn unwritten(num_addrs: usize) -> Self {
+        LfmExecution {
+            records: LfmRecords::default(),
+            public_words: Vec::new(),
+            memory: WriteOnceMemory::new(num_addrs),
+            split: ExecSplit::default(),
+        }
+    }
+}
+
 struct Machine<'a> {
     memory: WriteOnceMemory,
     /// The arenas by id. A streamed execution ([`StreamedExecution`]) leaves an
@@ -1098,6 +1112,60 @@ pub fn execute(
     hasher: &(impl LfmHasher + Sync),
 ) -> Result<LfmExecution, LfmExecError> {
     execute_inner(program, arenas, hasher, default_schedule(), 1)
+}
+
+/// Test diagnostic: run serially and retain write-once memory if an instruction
+/// refuses, so a caller can inspect transcript challenge cells produced before
+/// the failure. The normal executor path and its return type are unchanged.
+#[cfg(test)]
+pub(crate) fn execute_with_memory_on_failure(
+    program: &LfmProgram,
+    arenas: &[Vec<LfmWord>],
+    hasher: &(impl LfmHasher + Sync),
+) -> Result<LfmExecution, (LfmExecError, WriteOnceMemory)> {
+    if arenas.len() != program.arena_schema.lens.len() {
+        return Err((
+            LfmExecError::ArenaCountMismatch {
+                expected: program.arena_schema.lens.len(),
+                found: arenas.len(),
+            },
+            WriteOnceMemory::new(program.num_addrs as usize),
+        ));
+    }
+    for (i, (arena, &len)) in arenas.iter().zip(&program.arena_schema.lens).enumerate() {
+        if arena.len() != len as usize {
+            return Err((
+                LfmExecError::ArenaLenMismatch {
+                    arena: i as u32,
+                    expected: len,
+                    found: arena.len(),
+                },
+                WriteOnceMemory::new(program.num_addrs as usize),
+            ));
+        }
+    }
+    let mut m = Machine {
+        memory: WriteOnceMemory::new(program.num_addrs as usize),
+        arenas: arenas.iter().map(Vec::as_slice).collect(),
+    };
+    let mut records = LfmRecords::with_capacity(&program.groups, program.hash16());
+    let mut public_words = Vec::with_capacity(program.groups.public.real_rows);
+    for instr in &program.instrs {
+        if let Err(error) = step(
+            &mut m,
+            &mut records,
+            &mut public_words,
+            instr,
+            hasher,
+            Sink::Push,
+        ) {
+            return Err((error, m.memory));
+        }
+    }
+    // This helper is used only on the expected-refusal branch. If it succeeds,
+    // delegate to the production executor so its normal completion checks run.
+    execute_serial(program, arenas, hasher)
+        .map_err(|error| (error, WriteOnceMemory::new(program.num_addrs as usize)))
 }
 
 /// `LFM_EXEC_PARALLEL=0` selects the serial reference; unset or `1` selects the

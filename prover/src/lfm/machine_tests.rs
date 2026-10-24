@@ -2261,6 +2261,8 @@ fn host_statement_challenges(f: &StatementFixture) -> (ExtFE, ExtFE) {
         hint: c[18],
         commit: c[19],
         blake3: c[20],
+        p1w16: 0,
+        fp3mac: 0,
     };
     let ranges: Vec<RuntimePageRange> = shape
         .page_ranges
@@ -2342,9 +2344,11 @@ fn epoch_statement_cursor_is_the_output_len_alone() {
     // fourteen-count one: six accelerator counts (+48) and the trailing
     // `is_final` byte (+1). Both terms are named in the doc above, because 264
     // is the sum of a change that moves NO shift and one that moves it by one.
-    assert_eq!(shape.byte_len(), 264 + STMT_PUBLIC_OUTPUT_LEN + 16 * r);
+    // 272 since `TableCounts::p1w16` appended one more count (+8, no shift),
+    // 280 since `TableCounts::fp3mac` did the same.
+    assert_eq!(shape.byte_len(), 280 + STMT_PUBLIC_OUTPUT_LEN + 16 * r);
     for l in 0..8usize {
-        let total = 264 + l + 16 * r;
+        let total = 280 + l + 16 * r;
         assert_eq!(
             total % keccak_host::BYTES_PER_HALF,
             l % keccak_host::BYTES_PER_HALF,

@@ -55,7 +55,7 @@ use crate::block_whir::{
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
 use super::block_node::{BlockLayout, BlockNodeInputs};
-use super::builder::{Cell, Ext, LfmBuilder};
+use super::builder::{Cell, Ext, Felt, LfmBuilder};
 use super::compiler::{LfmProgram, compile};
 use super::per_table_aggregator::DerivedChild;
 use super::registry::LfmArtifacts;
@@ -140,6 +140,114 @@ pub fn emit_share(b: &mut LfmBuilder, p: Ext, q: Ext, inverse: bool) -> Ext {
         b.emul(p, inv)
     } else {
         b.ediv(p, q)
+    }
+}
+
+/// A Field VM proof's owed bus sum (`field_vm::whir::expected`), emitted: each
+/// public cell's `1/(z − (BUS + addr·α + Σ v_k·α^{k+1}))` on FIELD_VM_PUBLIC,
+/// plus the start state's inverse fingerprint minus the halt state's on
+/// FIELD_VM_STATE.
+pub(crate) fn emit_field_vm_expected(
+    b: &mut LfmBuilder,
+    public: &[(u64, FvmValue)],
+    first: &[u64],
+    last: &[u64],
+    z: Ext,
+    alpha: Ext,
+) -> Ext {
+    use crate::tables::types::BusId;
+    let one = b.ext_const(&FEE::one());
+    let mut powers = vec![alpha];
+    let longest = 4.max(first.len()).max(last.len());
+    while powers.len() < longest {
+        let next = b.emul(*powers.last().expect("one power"), alpha);
+        powers.push(next);
+    }
+    let fingerprint = |b: &mut LfmBuilder, bus: BusId, values: &[FE]| -> Ext {
+        let bus = b.ext_const(&FEE::from(bus as u64));
+        let mut term = b.esub(z, bus);
+        for (k, v) in values.iter().enumerate() {
+            let c = b.ext_const(&(-v.to_extension::<crate::tables::types::GoldilocksExtension>()));
+            term = b.emul_add(c, powers[k], term);
+        }
+        term
+    };
+    let mut sum = b.ext_const(&FEE::zero());
+    for (addr, value) in public {
+        let term = match value {
+            FvmValue::Const(value) => {
+                let mut values = vec![FE::from(*addr)];
+                values.extend_from_slice(value);
+                fingerprint(b, BusId::FieldVmPublic, &values)
+            }
+            FvmValue::Lanes(lanes) => {
+                let mut term = fingerprint(b, BusId::FieldVmPublic, &[FE::from(*addr)]);
+                for (k, lane) in lanes.iter().enumerate() {
+                    let scaled = b.emul_base(powers[k + 1], *lane);
+                    term = b.esub(term, scaled);
+                }
+                term
+            }
+        };
+        let inverse = b.ediv(one, term);
+        sum = b.eadd(sum, inverse);
+    }
+    let words = |w: &[u64]| -> Vec<FE> { w.iter().map(|&x| FE::from(x)).collect() };
+    let start = fingerprint(b, BusId::FieldVmState, &words(first));
+    let start = b.ediv(one, start);
+    let halt = fingerprint(b, BusId::FieldVmState, &words(last));
+    let halt = b.ediv(one, halt);
+    let sum = b.eadd(sum, start);
+    b.esub(sum, halt)
+}
+
+/// A Field VM public cell's value in its leaf's expected bus sum: a program
+/// constant, or lanes the leaf computes or reads.
+#[derive(Clone, Copy)]
+pub(crate) enum FvmValue {
+    Const([FE; 3]),
+    Lanes([Felt; 3]),
+}
+
+impl WhirBlockPlan {
+    /// A one-leaf plan over a proof that is not a Lambda VM block but is in the
+    /// block's WHIR format (the Field VM's): its frame, statement calls,
+    /// groups, prepared stacks and bus target come from the caller.
+    /// `runtime_calls` are the statement calls (eight big-endian bytes, one
+    /// felt) the leaf absorbs from the values it reads, not as constants:
+    /// the coordinates of the target's non-constant public cells, in order.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn for_proof(
+        frame: BlockFrame,
+        statement_calls: Vec<Vec<u8>>,
+        runtime_calls: Vec<usize>,
+        groups: Vec<Vec<usize>>,
+        prepared: Vec<PlannedPrepared>,
+        target: LeafTarget,
+    ) -> Self {
+        let mut stated = statement_calls.concat();
+        for &call in &runtime_calls {
+            stated.extend_from_slice(&(call as u64).to_le_bytes());
+        }
+        let id = crate::statement::elf_digest(&stated);
+        let costs = vec![0; groups.len()];
+        let partition = partition_groups(&costs, 1);
+        Self {
+            frame,
+            statement_calls,
+            runtime_calls,
+            wrap_hash: <crate::hash_pin::BlockFamily as crate::hash_pin::ProofFamily>::WRAP,
+            public_output: Vec::new(),
+            groups,
+            prepared,
+            costs,
+            loads: Vec::new(),
+            front: ChipRows::default(),
+            partition,
+            fan_in: BLOCK_FAN_IN,
+            id,
+            target,
+        }
     }
 }
 
@@ -478,20 +586,23 @@ impl PlannedPrepared {
 /// Every program of a block's tree, derived from the trusted ELF, the options,
 /// the format and the statement. See the module docs.
 pub struct WhirBlockPlan {
-    frame: BlockFrame,
+    pub(crate) frame: BlockFrame,
     /// The statement's `append_bytes` calls: the base's sponge (ZisK's)
     /// binds each call's length, so the leaves replay them call by call.
     statement_calls: Vec<Vec<u8>>,
+    /// The statement calls a Field VM leaf absorbs at run time
+    /// ([`WhirBlockPlan::for_proof`]); none for a block.
+    runtime_calls: Vec<usize>,
     /// The tree's wrap hash, the block proof family's (`hash_pin::BlockFamily`):
     /// the leaves replay the base's transcript in it and the nodes their
     /// children's LFM proofs.
     wrap_hash: super::edsl::WrapHash,
     public_output: Vec<u8>,
     /// The statement's groups: AIR indices in each group's order.
-    groups: Vec<Vec<usize>>,
+    pub(crate) groups: Vec<Vec<usize>>,
     /// The prepared tables, in the proof's table order (the order their roots
     /// are absorbed and their openings carried).
-    prepared: Vec<PlannedPrepared>,
+    pub(crate) prepared: Vec<PlannedPrepared>,
     /// Each group's in-guest cost, in permutations.
     costs: Vec<usize>,
     /// Each group's rows in every bounded chip, and the per-leaf front's
@@ -504,6 +615,84 @@ pub struct WhirBlockPlan {
     /// A digest of the statement run: the block's identity, published by every
     /// leaf and node.
     id: [u8; 32],
+    /// What the carrier leaf's bus sum is owed.
+    pub(crate) target: LeafTarget,
+}
+
+/// The carrier leaf's bus target: the block's COMMIT bus (its public output),
+/// or a Field VM proof's public cells and state endpoints.
+#[derive(Clone, Debug)]
+pub(crate) enum LeafTarget {
+    Commit,
+    #[cfg_attr(not(test), allow(dead_code))]
+    FieldVm {
+        /// Each public cell's address and value, in statement order.
+        public: Vec<(u64, FvmCell)>,
+        /// The first segment's first state and the last segment's last.
+        first: Vec<u64>,
+        last: Vec<u64>,
+        /// A checksum-bound proof's binding, checked and published by the leaf.
+        binding: Option<FvmBinding>,
+    },
+}
+
+/// A Field VM public cell's value as its leaf takes it: a program constant,
+/// an input the leaf reads from its arena and publishes, or the binding's `α`,
+/// which the leaf computes.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum FvmCell {
+    Const([FE; 3]),
+    Input,
+    Alpha,
+}
+
+/// A checksum-bound Field VM proof's binding: how many of the proof's roots
+/// precede CKSUM's group. The leaf reads the guest's crossing digest
+/// `c_bin`, computes `α` from it and those roots ([`emit_field_vm_binding`]),
+/// closes `α` and `s` as public cells and publishes `(c_bin, α, s)` before the
+/// bus sum.
+#[derive(Clone, Debug)]
+pub(crate) struct FvmBinding {
+    pub(crate) roots: usize,
+}
+
+/// `cksum::binding_alpha(c_bin, cksum::field_roots_digest(roots))` over the
+/// leaf's carried roots: `α` and its lanes.
+pub(crate) fn emit_field_vm_binding(
+    b: &mut LfmBuilder,
+    roots: &[Cell],
+    c_bin: Cell,
+) -> (Ext, [Felt; 3]) {
+    use crate::field_vm::cksum;
+    let zero = b.digest_const([FE::zero(); 4]).as_cell();
+    let tag = b
+        .digest_const([
+            FE::from(cksum::ROOTS_TAG),
+            FE::from(roots.len() as u64),
+            FE::zero(),
+            FE::zero(),
+        ])
+        .as_cell();
+    let mut state = [zero, zero, zero, tag];
+    for chunk in roots.chunks(3) {
+        for (i, lane) in state.iter_mut().take(3).enumerate() {
+            *lane = chunk.get(i).copied().unwrap_or(zero);
+        }
+        state = b.hash16(state);
+    }
+    let tag = b
+        .digest_const([
+            FE::from(u32::from_le_bytes(*b"CKSM") as u64),
+            FE::zero(),
+            FE::zero(),
+            FE::zero(),
+        ])
+        .as_cell();
+    let out = b.hash16([c_bin, state[0], zero, tag]);
+    let lanes = b.unpack(out[0]);
+    let alpha = b.pack_ext(lanes[0], lanes[1], lanes[2]);
+    (alpha, [lanes[0], lanes[1], lanes[2]])
 }
 
 /// Every program of a block's tree with its artifacts and derived shape, level
@@ -613,8 +802,12 @@ impl WhirBlockPlan {
                     .to_string(),
             );
         }
-        let columns = prepared_tables(&frame.airs, &frame.page_configs, format)
-            .map_err(|e| format!("prepared tables: {e:?}"))?;
+        let columns = prepared_tables(
+            frame.airs.vm().expect("a block plan holds the VM's AIRs"),
+            &frame.page_configs,
+            format,
+        )
+        .map_err(|e| format!("prepared tables: {e:?}"))?;
         let config = &frame.config;
         let stacks = group_stacks(columns, statement.groups)
             .map_err(|e| format!("prepared stacks: {e:?}"))?;
@@ -709,6 +902,7 @@ impl WhirBlockPlan {
         let mut plan = Self {
             frame,
             statement_calls,
+            runtime_calls: Vec::new(),
             wrap_hash,
             public_output: statement.public_output.to_vec(),
             groups,
@@ -719,6 +913,7 @@ impl WhirBlockPlan {
             partition,
             fan_in,
             id,
+            target: LeafTarget::Commit,
         };
         // Every chip's rows by group, emitted; the partition bounds them all (a
         // fixed leaf count, the tests', bounds none).
@@ -939,12 +1134,30 @@ impl WhirBlockPlan {
         window: Option<usize>,
     ) -> Result<LfmArtifacts, String> {
         let words = self.child_layout().total();
+        self.derive_top_with(wrap_opts, window, |k| {
+            derived_of(
+                &artifacts_of(&self.leaf_program(k)?, wrap_opts),
+                wrap_opts,
+                words,
+            )
+        })
+    }
+
+    /// [`Self::derive_top_in`] over the leaf shapes `leaf` derives, leaf by
+    /// index: the nodes above are the plan's, over whatever proves a leaf.
+    pub(crate) fn derive_top_with(
+        &self,
+        wrap_opts: &crate::ProofOptions,
+        window: Option<usize>,
+        leaf: impl Fn(usize) -> Result<DerivedChild, String> + Sync + Send,
+    ) -> Result<LfmArtifacts, String> {
+        let words = self.child_layout().total();
         let derive = |program: LfmProgram| -> Result<DerivedChild, String> {
             let artifacts = artifacts_of(&program, wrap_opts);
             derived_of(&artifacts, wrap_opts, words)
         };
         let leaves: Vec<usize> = (0..self.partition.num_leaves()).collect();
-        let mut below = map_in_windows(&leaves, window, |&k| derive(self.leaf_program(k)?))?;
+        let mut below = map_in_windows(&leaves, window, |&k| leaf(k))?;
         let shape = self.levels();
         for (lv, arities) in shape.iter().enumerate() {
             let top = lv + 1 == shape.len();
@@ -1416,6 +1629,10 @@ fn route_of(
     match air.name() {
         BITWISE_NAME => Ok(Route::Bitwise),
         KECCAK_RC_NAME | REGISTER_NAME => Ok(Route::ConstMle(columns)),
+        // The Field VM's MEM: its ADDR is the identity ramp, the page OFFSET's
+        // closed form; CKSUM's crossing columns are an arbitrary constant MLE.
+        "FIELD_VM_MEM" => Ok(Route::Page(columns)),
+        "FIELD_VM_CKSUM" => Ok(Route::ConstMle(columns)),
         DECODE_NAME => Err("DECODE is not prepared".to_string()),
         other => Err(format!(
             "table {table} ({other}) carries {} preprocessed columns and no route covers them",
@@ -1433,6 +1650,42 @@ struct Front {
     alpha: Ext,
     beta: Ext,
     state: Cell,
+    field_vm: Option<FvmFront>,
+}
+
+/// A Field VM leaf's read and computed values: its public cells for the bus
+/// target, the inputs it publishes, and the binding's `(c_bin, α, s)`.
+struct FvmFront {
+    public: Vec<(u64, FvmValue)>,
+    inputs: Vec<Cell>,
+    bound: Option<[Cell; 3]>,
+}
+
+/// A Field VM leaf's arena prefix, before the roots: `c_bin` when bound, then
+/// each input cell of the target (its coordinates as an ext word).
+fn emit_field_vm_inputs(
+    b: &mut LfmBuilder,
+    plan: &WhirBlockPlan,
+    arena: super::instr::ArenaId,
+    at: &mut u32,
+) -> Option<(Option<Cell>, Vec<Option<Cell>>)> {
+    let LeafTarget::FieldVm {
+        public, binding, ..
+    } = &plan.target
+    else {
+        return None;
+    };
+    let mut hint = |b: &mut LfmBuilder| {
+        let cell = b.hint_word(arena, *at);
+        *at += 1;
+        cell
+    };
+    let c_bin = binding.as_ref().map(|_| hint(b));
+    let cells = public
+        .iter()
+        .map(|(_, cell)| matches!(cell, FvmCell::Input).then(|| hint(b)))
+        .collect();
+    Some((c_bin, cells))
 }
 
 /// The front every leaf replays: every group's roots (hinted), the statement
@@ -1450,6 +1703,7 @@ fn emit_front(
         .iter()
         .map(StackedLayout::num_polys)
         .sum();
+    let read = emit_field_vm_inputs(b, plan, arena, at);
     let carried: Vec<Cell> = (0..num_roots)
         .map(|_| {
             let cell = b.hint_word(arena, *at);
@@ -1457,11 +1711,69 @@ fn emit_front(
             cell
         })
         .collect();
+    let field_vm = read.map(|(c_bin, cells)| {
+        let LeafTarget::FieldVm {
+            public, binding, ..
+        } = &plan.target
+        else {
+            unreachable!("inputs are a Field VM leaf's")
+        };
+        let computed = binding.as_ref().map(|binding| {
+            let c_bin = c_bin.expect("a bound leaf reads c_bin");
+            let (alpha, lanes) = emit_field_vm_binding(b, &carried[..binding.roots], c_bin);
+            (c_bin, alpha, lanes)
+        });
+        let mut values = Vec::with_capacity(public.len());
+        let mut inputs = Vec::new();
+        let mut s = None;
+        for ((addr, cell), read) in public.iter().zip(cells) {
+            let value = match cell {
+                FvmCell::Const(v) => FvmValue::Const(*v),
+                FvmCell::Input => {
+                    let cell = read.expect("an input is read");
+                    let lanes = b.unpack(cell);
+                    let zero = b.felt_const(FE::zero());
+                    b.assert_eq(lanes[3], zero);
+                    if *addr == crate::field_vm::cksum::CKSUM_ADDR {
+                        s = Some(cell);
+                    } else {
+                        inputs.push(cell);
+                    }
+                    FvmValue::Lanes([lanes[0], lanes[1], lanes[2]])
+                }
+                FvmCell::Alpha => {
+                    FvmValue::Lanes(computed.as_ref().expect("α is a bound leaf's").2)
+                }
+            };
+            values.push((*addr, value));
+        }
+        FvmFront {
+            public: values,
+            inputs,
+            bound: computed.map(|(c_bin, alpha, _)| {
+                [c_bin, alpha.as_cell(), s.expect("a bound leaf closes s")]
+            }),
+        }
+    });
     let mut transcript = WhirTranscript::for_builder(b);
     // ZisK's sponge binds each call's length: the statement call by call.
-    for call in &plan.statement_calls {
-        transcript.absorb_const_bytes(call);
+    let mut runtime = field_vm
+        .iter()
+        .flat_map(|f| &f.public)
+        .filter_map(|(_, v)| match v {
+            FvmValue::Lanes(lanes) => Some(*lanes),
+            FvmValue::Const(_) => None,
+        })
+        .flatten();
+    for (i, call) in plan.statement_calls.iter().enumerate() {
+        if plan.runtime_calls.binary_search(&i).is_ok() {
+            let lane = runtime.next().expect("a value for each runtime call");
+            transcript.absorb_byte_felts(b, call.len(), &[lane]);
+        } else {
+            transcript.absorb_const_bytes(call);
+        }
     }
+    assert!(runtime.next().is_none(), "a runtime call for each value");
     let derived: Vec<LfmWord> = plan
         .prepared
         .iter()
@@ -1480,6 +1792,7 @@ fn emit_front(
         alpha,
         beta,
         state,
+        field_vm,
     }
 }
 
@@ -1571,11 +1884,19 @@ fn emit_leaf_over(
     let frame = &plan.frame;
     let config = &frame.config;
     let refs = frame.airs.air_refs();
-    let first_page = first_page_index(&frame.airs).map_err(|e| format!("{e:?}"))?;
+    let first_page = match frame.airs.vm() {
+        Some(vm) => first_page_index(vm).map_err(|e| format!("{e:?}"))?,
+        None => usize::MAX,
+    };
     let arena = b.declare_arena(0);
     let mut at = 0u32;
 
     // ---- 1. the front.
+    #[cfg(test)]
+    super::whir_chain::onechain_steps::mark(
+        b,
+        super::whir_chain::onechain_steps::Step::Part("front"),
+    );
     let Front {
         carried,
         transcript,
@@ -1583,6 +1904,7 @@ fn emit_leaf_over(
         alpha,
         beta,
         state,
+        field_vm,
     } = emit_front(b, plan, arena, &mut at);
     if let Some(m) = marks.as_deref_mut() {
         m.front = b.instrs().len();
@@ -1646,6 +1968,11 @@ fn emit_leaf_over(
 
         let mut fork = transcript.clone();
         fork.absorb_const_bytes(&(g as u64).to_le_bytes());
+        #[cfg(test)]
+        super::whir_chain::onechain_steps::mark(
+            b,
+            super::whir_chain::onechain_steps::Step::Part("walk"),
+        );
         let walk = match batched_cap(config) {
             None => {
                 let store: Vec<TableWires> = shapes
@@ -1722,6 +2049,11 @@ fn emit_leaf_over(
 
         // Its prepared stack, against the derived roots: each table's block at
         // that table's point.
+        #[cfg(test)]
+        super::whir_chain::onechain_steps::mark(
+            b,
+            super::whir_chain::onechain_steps::Step::Part("prepared"),
+        );
         for p in plan.prepared.iter().filter(|p| p.group == g) {
             let shape = plan.chain_shape(p.layout.n_stack());
             let held = hint_group_chains_shaped(b, arena, &mut at, p.layout.num_polys(), &shape);
@@ -1773,6 +2105,11 @@ fn emit_leaf_over(
 
     // ---- 3. the leaf's share of the bus: Σ p/q, less the COMMIT-bus target on
     // the carrier (commits are indexed from 0 in a block).
+    #[cfg(test)]
+    super::whir_chain::onechain_steps::mark(
+        b,
+        super::whir_chain::onechain_steps::Step::Part("tail"),
+    );
     let mut sum: Option<Ext> = None;
     let inverse = share_inverse();
     for (p, q) in &outputs {
@@ -1787,7 +2124,12 @@ fn emit_leaf_over(
     }
     let mut sum = sum.unwrap_or_else(|| b.ext_const(&FEE::zero()));
     if carrier && checks.target {
-        let target = emit_expected(b, &plan.public_output, 0, z, alpha);
+        let target = match (&plan.target, &field_vm) {
+            (LeafTarget::FieldVm { first, last, .. }, Some(f)) => {
+                emit_field_vm_expected(b, &f.public, first, last, z, alpha)
+            }
+            _ => emit_expected(b, &plan.public_output, 0, z, alpha),
+        };
         sum = b.esub(sum, target);
     }
 
@@ -1800,6 +2142,11 @@ fn emit_leaf_over(
     for half in out_halves(&plan.public_output) {
         let felt = b.felt_const(half);
         b.public(felt.as_cell());
+    }
+    if let Some(f) = &field_vm {
+        for &cell in f.inputs.iter().chain(f.bound.iter().flatten()) {
+            b.public(cell);
+        }
     }
     b.public(sum.as_cell());
     b.set_arena_len(arena, at);
@@ -1816,12 +2163,26 @@ pub fn block_leaf_arena(
     proof: &BlockWhirProof,
     k: usize,
 ) -> Result<Vec<Vec<LfmWord>>, String> {
+    plan_leaf_arena(plan, k, &proof.proof, &proof.argues, &proof.prepared)
+}
+
+/// [`block_leaf_arena`] over any proof in the block's WHIR format: its multi
+/// proof, batched argues and prepared openings.
+pub(crate) fn plan_leaf_arena(
+    plan: &WhirBlockPlan,
+    k: usize,
+    proof: &stark::multilinear_table::MultiProof<GoldilocksField, GoldilocksExtension>,
+    argues: &[stark::multilinear_table::BatchedArgue<GoldilocksExtension>],
+    prepared_openings: &[multilinear::stacked_eval::StackedProof<
+        GoldilocksField,
+        GoldilocksExtension,
+    >],
+) -> Result<Vec<Vec<LfmWord>>, String> {
     let mut groups = Vec::with_capacity(plan.partition.leaf(k).len());
     for &g in plan.partition.leaf(k) {
         let start = plan.group_start(g);
         let tables = match batched_cap(&plan.frame.config) {
             None => proof
-                .proof
                 .tables
                 .get(start..start + plan.groups[g].len())
                 .ok_or("the proof is short of tables")?,
@@ -1829,15 +2190,13 @@ pub fn block_leaf_arena(
         };
         let prepared = match plan.prepared.iter().position(|p| p.group == g) {
             Some(index) => Some(
-                proof
-                    .prepared
+                prepared_openings
                     .get(index)
                     .ok_or("the proof is short of prepared openings")?,
             ),
             None => None,
         };
         let opening = proof
-            .proof
             .columns
             .get(g)
             .ok_or("the proof is short of openings")?;
@@ -1845,12 +2204,12 @@ pub fn block_leaf_arena(
             plan,
             g,
             tables,
-            proof.argues.get(g),
+            argues.get(g),
             opening,
             prepared,
         )?);
     }
-    Ok(leaf_arena(&proof.proof.roots, groups))
+    Ok(leaf_arena(&proof.roots, groups))
 }
 
 /// A leaf's arena from the block's roots and its groups' words

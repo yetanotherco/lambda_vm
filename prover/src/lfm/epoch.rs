@@ -56,10 +56,10 @@ use super::transcript_replay::{ByteString, TranscriptReplay};
 
 /// A sub-proof's AIR as the shape derivations read it: the block's VM AIRs and
 /// the LFM chips alike.
-pub type DynVmAir<'a> = dyn stark::traits::AIR<
+pub type DynVmAir<'a, PI = ()> = dyn stark::traits::AIR<
         Field = crate::tables::types::GoldilocksField,
         FieldExtension = GoldilocksExtension,
-        PublicInputs = (),
+        PublicInputs = PI,
     > + 'a;
 
 /// The grinding prefix, `crypto/stark/src/grinding.rs`'s `PREFIX`.
@@ -312,12 +312,16 @@ impl TableChallengeShape {
     /// `ood_blocks_well_formed`, the `L` presence to `has_trace_interaction`.
     ///
     /// `trace_length` must be a power of two; the caller bounds it.
-    pub fn derive(
-        air: &DynVmAir<'_>,
+    pub fn derive<PI>(
+        air: &DynVmAir<'_, PI>,
         index: usize,
         num_tables: usize,
         trace_length: usize,
-    ) -> Self {
+    ) -> Self
+    where
+        PI: rkyv::Archive + Clone,
+        <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, stark::proof::view::PiDeserializer>,
+    {
         use stark::verifier::IsStarkVerifier;
         debug_assert!(trace_length.is_power_of_two(), "a power-of-two trace");
         let opts = air.options();
@@ -326,7 +330,7 @@ impl TableChallengeShape {
         let layout = stark::verifier::Verifier::<
             crate::tables::types::GoldilocksField,
             GoldilocksExtension,
-            (),
+            PI,
         >::ood_layout(air);
         Self {
             index,
@@ -435,6 +439,17 @@ pub struct TableChallenges {
     /// felt would readmit the standalone driver's aliasing (ledger entry 5),
     /// where `ι` and `ι + 2^(n−1)` are the same query.
     pub iota_bits: Vec<Vec<Bit>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The first rounds' emitted cells, for a failing verifier's memory dump.
+    static TEST_TABLE_CHALLENGE_CELLS: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_table_challenge_cells() -> Vec<(u64, u64)> {
+    TEST_TABLE_CHALLENGE_CELLS.with(|cells| std::mem::take(&mut *cells.borrow_mut()))
 }
 
 /// Fork the shared transcript for table `index` — `verifier.rs:1263-1266`.
@@ -710,6 +725,8 @@ fn emit_p1_grinding_check(
     use super::p1w16_emit::{Lane, w8_permute_lanes};
 
     assert_eq!(seed.len(), 1, "a Poseidon1 transcript state is ONE cell");
+    #[cfg(test)]
+    super::fn_scope::begin(b, format!("p1_grind_{factor}"));
     let [s0, s1, s2, s3] = b.unpack(seed[0]);
     let prefix = FE::from(u64::from_be_bytes(GRINDING_PREFIX));
     let fac = FE::from(u64::from(factor) << 56);
@@ -739,6 +756,8 @@ fn emit_p1_grinding_check(
     for bit in &bits[64 - factor as usize..] {
         b.assert_eq(Felt(bit.addr()), zero);
     }
+    #[cfg(test)]
+    super::fn_scope::end(b);
 }
 
 fn emit_algebraic_grinding_check(
@@ -905,6 +924,8 @@ pub fn emit_table_challenges(
 
     // ---- Round 3: z, then both OOD blocks COLUMN-major, then the parts.
     let z = emit_z_ood(b, t, shape);
+    #[cfg(test)]
+    TEST_TABLE_CHALLENGE_CELLS.with(|cells| cells.borrow_mut().push((beta.addr().0, z.addr().0)));
     for (dims, block) in [
         (shape.ood_current_dims, absorbs.ood_current),
         (shape.ood_next_dims, absorbs.ood_next),

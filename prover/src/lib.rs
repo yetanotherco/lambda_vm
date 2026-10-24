@@ -23,6 +23,7 @@ pub mod constraints;
 pub mod continuation;
 #[cfg(feature = "debug-checks")]
 mod debug_report;
+pub mod field_vm;
 pub mod hash_pin;
 #[cfg(feature = "instruments")]
 pub mod instruments;
@@ -81,10 +82,11 @@ use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_blake3_air, create_branch_air, create_bytewise_air,
     create_commit_air, create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air,
-    create_ecdas_air, create_ecsm_air, create_eq_air, create_halt_air, create_hint_air,
-    create_keccak_air, create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air,
-    create_memw_air, create_memw_aligned_air, create_memw_register_air, create_mul_air,
-    create_page_air, create_register_air, create_shift_air, create_store_air,
+    create_ecdas_air, create_ecsm_air, create_eq_air, create_fp3mac_air, create_halt_air,
+    create_hint_air, create_keccak_air, create_keccak_rc_air, create_keccak_rnd_air,
+    create_load_air, create_lt_air, create_memw_air, create_memw_aligned_air,
+    create_memw_register_air, create_mul_air, create_p1w16_air, create_page_air,
+    create_register_air, create_shift_air, create_store_air,
 };
 
 // Re-exported for downstream hosts and verifier guests (e.g. the in-VM
@@ -206,6 +208,11 @@ pub struct TableCounts {
     /// an attacker nothing, but an unbounded count would let a malformed proof
     /// make the verifier build arbitrarily many AIRs before any other check.
     pub blake3: usize,
+    /// P1W16 tables (width-16 Poseidon1 permutations): 0 or 1, like the
+    /// accelerators above, by the same Ecall-bus argument — its receiver is
+    /// the only one carrying `P1W16_SYSCALL_NUMBER`.
+    pub p1w16: usize,
+    pub fp3mac: usize,
 }
 
 impl TableCounts {
@@ -239,6 +246,8 @@ impl TableCounts {
             self.hint,
             self.commit,
             self.blake3,
+            self.p1w16,
+            self.fp3mac,
         ]
         .into_iter()
         .try_fold(0usize, usize::checked_add)
@@ -307,6 +316,8 @@ impl TableCounts {
             ("hint", self.hint),
             ("commit", self.commit),
             ("blake3", self.blake3),
+            ("p1w16", self.p1w16),
+            ("fp3mac", self.fp3mac),
         ];
         for (name, count) in at_most_one {
             if count > 1 {
@@ -712,6 +723,8 @@ pub(crate) struct VmAirs {
     pub ecsms: Vec<VmAir>,
     pub ecdases: Vec<VmAir>,
     pub hints: Vec<VmAir>,
+    pub p1w16s: Vec<VmAir>,
+    pub fp3macs: Vec<VmAir>,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
@@ -782,6 +795,8 @@ impl VmAirs {
                 self.ecsms.len(),
                 self.ecdases.len(),
                 self.hints.len(),
+                self.p1w16s.len(),
+                self.fp3macs.len(),
                 self.pages.len(),
                 self.memw_registers.len(),
                 self.eqs.len(),
@@ -805,6 +820,8 @@ impl VmAirs {
                 traces.ecsms.len(),
                 traces.ecdases.len(),
                 traces.hints.len(),
+                traces.p1w16s.len(),
+                traces.fp3macs.len(),
                 traces.pages.len(),
                 traces.memw_registers.len(),
                 traces.eqs.len(),
@@ -839,6 +856,12 @@ impl VmAirs {
             pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.hints.iter().zip(traces.hints.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.p1w16s.iter().zip(traces.p1w16s.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.fp3macs.iter().zip(traces.fp3macs.iter_mut()) {
             pairs.push((air.as_ref(), trace, &()));
         }
         // ★ BLAKE3 closes the accelerator group rather than keeping the slot it
@@ -936,6 +959,12 @@ impl VmAirs {
             refs.push(air.as_ref());
         }
         for air in &self.hints {
+            refs.push(air.as_ref());
+        }
+        for air in &self.p1w16s {
+            refs.push(air.as_ref());
+        }
+        for air in &self.fp3macs {
             refs.push(air.as_ref());
         }
         // The same slot as `air_trace_pairs`: these two orders ARE the proof's
@@ -1162,6 +1191,17 @@ impl VmAirs {
                 Box::new(create_hint_air(proof_options).with_name(&format!("HINT[{i}]"))) as VmAir
             })
             .collect();
+        let p1w16s: Vec<_> = (0..table_counts.p1w16)
+            .map(|i| {
+                Box::new(create_p1w16_air(proof_options).with_name(&format!("P1W16[{i}]"))) as VmAir
+            })
+            .collect();
+        let fp3macs: Vec<_> = (0..table_counts.fp3mac)
+            .map(|i| {
+                Box::new(create_fp3mac_air(proof_options).with_name(&format!("FP3MAC[{i}]")))
+                    as VmAir
+            })
+            .collect();
         let register: VmAir = if let Some(RegisterPreprocessed {
             commitment,
             init,
@@ -1318,6 +1358,8 @@ impl VmAirs {
             ecsms,
             ecdases,
             hints,
+            p1w16s,
+            fp3macs,
             register,
             pages,
             memw_registers,

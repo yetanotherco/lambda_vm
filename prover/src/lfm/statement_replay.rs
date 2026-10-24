@@ -49,6 +49,16 @@ use super::builder::{Ext, Felt, LfmBuilder};
 use super::keccak_host::BYTES_PER_HALF;
 use super::transcript_replay::TranscriptReplay;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_PHASE_A_CHALLENGE_CELLS: std::cell::RefCell<Option<(u64, u64)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_phase_a_challenge_cells() -> Option<(u64, u64)> {
+    TEST_PHASE_A_CHALLENGE_CELLS.with(|cells| cells.borrow_mut().take())
+}
+
 /// Counts `TableCounts` absorbs: fourteen split-table families, the six
 /// accelerator chips, and the 0-or-1 BLAKE3 presence count. The guest must
 /// absorb exactly what the host's `statement::absorb_statement_with_digest`
@@ -60,7 +70,7 @@ use super::transcript_replay::TranscriptReplay;
 /// challenge equality in `algebraic_transcript`'s replay test, plus the
 /// hand-written `[u64; NUM_TABLE_COUNTS]` literal it builds — which fails to
 /// compile when this number moves and the literal does not.
-pub const NUM_TABLE_COUNTS: usize = 21;
+pub const NUM_TABLE_COUNTS: usize = 23;
 
 /// The shape-static half of the statement — emitted as program constants.
 #[derive(Debug, Clone)]
@@ -247,5 +257,8 @@ pub fn replay_phase_a(
     }
     let z = t.sample_ext(b);
     let alpha = t.sample_ext(b);
+    #[cfg(test)]
+    TEST_PHASE_A_CHALLENGE_CELLS
+        .with(|cells| *cells.borrow_mut() = Some((z.addr().0, alpha.addr().0)));
     (z, alpha)
 }

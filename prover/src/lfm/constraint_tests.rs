@@ -368,6 +368,8 @@ const DESIGN_INSTR: &[(&str, usize)] = &[
     ("L2G_GLOBAL", 27),
     ("L2G_MEMORY", 65),
     ("GLOBAL_MEMORY", 25),
+    ("P1W16", 10_177), // not in §8.1: the emitter's own count.
+    ("FP3MAC", 1_658), // not in §8.1: the emitter's own count.
 ];
 
 /// ★ What the emitter actually costs per AIR, against the design's table.
@@ -1056,6 +1058,11 @@ pub(super) fn open_sub_proof(
         quotient: QuotientShape {
             log2_trace_length: trace_length.trailing_zeros(),
             num_composition_parts: claimed_parts.len(),
+            transition_end_exemptions: artifact
+                .constraints_meta()
+                .iter()
+                .map(|m| m.end_exemptions)
+                .collect(),
             boundary,
         },
         artifact,
@@ -1425,6 +1432,11 @@ fn quotient_rows(artifact: &ConstraintArtifact, log2_trace_length: u32) -> usize
     let quotient = QuotientShape {
         log2_trace_length,
         num_composition_parts: num_parts,
+        transition_end_exemptions: artifact
+            .constraints_meta()
+            .iter()
+            .map(|m| m.end_exemptions)
+            .collect(),
         // Every table with bus interactions carries the framework's single
         // acc[0] = 0 constraint on the last aux column, and no production table
         // declares any other boundary constraint.

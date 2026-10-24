@@ -22,6 +22,14 @@ instruments = ["stark/instruments"]
 nvtx = ["cuda", "instruments", "stark/nvtx"]
 profile-markers = ["stark/profile-markers"]
 disk-spill = ["stark/disk-spill"]
+# Field VM at constraint degree 3, proved at blowup 2.
+fvm-d3 = []
+# Field VM at constraint degree 4, proved at blowup 4.
+fvm-d4 = []
+# Field VM with 2 general-purpose registers.
+fvm-narrow = []
+# Field VM with a single general-purpose register.
+fvm-n1 = []
 # The BLAKE3 round count, for the `LFM_HASH` arm and — since the P-a flip — for
 # the commitment backends the whole prover commits under. Off = 7 rounds
 # (standard BLAKE3, externally anchored); on = the 6-round A6R variant, which is
