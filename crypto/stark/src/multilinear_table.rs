@@ -456,6 +456,16 @@ where
         self.trace.restore_narrow(packed)
     }
 
+    /// The records out, for the spill (see [`TraceData::take_records_for_spill`]).
+    pub(crate) fn take_records_for_spill(&mut self) -> Option<multilinear::records::Records> {
+        self.trace.take_records_for_spill()
+    }
+
+    /// Puts spilled records back (see [`TraceData::restore_records`]).
+    pub(crate) fn restore_records(&mut self, records: multilinear::records::Records) -> bool {
+        self.trace.restore_records(records)
+    }
+
     /// Whether the packed columns are out in a spill store's slot.
     pub fn is_spilled(&self) -> bool {
         self.trace.is_spilled()

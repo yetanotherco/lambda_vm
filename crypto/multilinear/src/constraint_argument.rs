@@ -484,6 +484,36 @@ impl<F: IsField + 'static, E: IsField + 'static> TraceData<F, E> {
         self.is_spilled() && self.install_narrow(packed)
     }
 
+    /// The records out of a table held as its records, for a block's spill to
+    /// park or drop: the table is spilled until [`Self::restore_records`] puts
+    /// them back or [`Self::restore_narrow`] installs packed columns made from
+    /// them. `None`, nothing changed, for a table held otherwise.
+    pub fn take_records_for_spill(&mut self) -> Option<Records> {
+        if !matches!(self.columns, Held::Records { .. }) {
+            return None;
+        }
+        match std::mem::replace(&mut self.columns, Held::Spilled) {
+            Held::Records { records, .. } => Some(records),
+            _ => None,
+        }
+    }
+
+    /// Puts a spilled table's records back. Refused (`false`, nothing
+    /// changed) unless the table is spilled and `records` have its shape.
+    pub fn restore_records(&mut self, records: Records) -> bool {
+        if !self.is_spilled()
+            || records.cols() != self.num_columns
+            || records.rows() != 1usize << self.num_vars
+        {
+            return false;
+        }
+        self.columns = Held::Records {
+            records,
+            widened: std::sync::OnceLock::new(),
+        };
+        true
+    }
+
     /// Holds the columns as `packed` from here on, letting the field elements
     /// go. Refused (`false`, nothing changed) unless `packed` has the table's
     /// shape and `F` is Goldilocks, whose elements are their raw words — the
@@ -1411,6 +1441,40 @@ mod tests {
         held.data.drop_widened();
         assert_eq!(held.data.records(), Some(&records), "still the records");
         assert_eq!(held.columns(), columns.as_slice());
+    }
+
+    /// A table held as its records gives them up to a spill and takes back
+    /// only records of its shape, and only while spilled; packed columns made
+    /// from them install in their place.
+    #[test]
+    fn records_leave_for_the_spill_and_come_back() {
+        let columns = satisfying(4);
+        let packed = || NarrowColumns::pack_columns(&columns).unwrap();
+        let held = Records(std::sync::Arc::new(HostFilled(packed())));
+        let mut table = CommittedTrace::<F, F>::commit(columns.clone(), &config()).unwrap();
+        table.data =
+            TraceData::new_records(held.clone(), table.data.kinds().to_vec(), Vec::new()).unwrap();
+        assert!(!table.data.restore_records(held.clone()), "not spilled");
+        let out = table.data.take_records_for_spill().expect("records out");
+        assert_eq!(out, held);
+        assert!(table.data.is_spilled());
+        assert!(table.data.take_records_for_spill().is_none(), "already out");
+        let other: Vec<Vec<u64>> = (0..3).map(|_| vec![1; 8]).collect();
+        let raw: Vec<&[u64]> = other.iter().map(Vec::as_slice).collect();
+        let taller = Records(std::sync::Arc::new(HostFilled(
+            NarrowColumns::pack(&raw).unwrap(),
+        )));
+        assert!(!table.data.restore_records(taller), "another shape");
+        assert!(table.data.restore_records(out), "its own records");
+        assert_eq!(table.data.records(), Some(&held));
+        assert_eq!(table.columns(), columns.as_slice());
+        table.data.take_records_for_spill().expect("records out");
+        assert!(
+            table.data.restore_narrow(packed()),
+            "packed columns made from them"
+        );
+        assert!(table.data.narrow().is_some());
+        assert_eq!(table.columns(), columns.as_slice());
     }
 
     /// Records are held only for a table of a power of two rows, with columns,

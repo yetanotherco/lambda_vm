@@ -410,41 +410,48 @@ impl Records {
     /// packed columns' digest, `stark::regen::digest_of`, does the same for a
     /// packed table).
     pub fn digest(&self) -> [u64; 2] {
-        const K: [u64; 4] = [
-            0x9e37_79b9_7f4a_7c15,
-            0xc2b2_ae3d_27d4_eb4f,
-            0x1656_67b1_9e37_79f9,
-            0x85eb_ca77_c2b2_ae63,
-        ];
-        let mut lanes = [
-            self.rows() as u64,
-            self.cols() as u64,
-            self.bytes() as u64,
-            0x243f_6a88_85a3_08d3,
-        ];
-        let mut i = 0usize;
-        self.fill().words(|w| {
-            let l = i % 4;
-            lanes[l] = (lanes[l] ^ w).wrapping_mul(K[l]).rotate_left(31);
-            i += 1;
-        });
-        // MurmurHash3's finalizer, so every input bit reaches every output bit.
-        let fmix = |mut h: u64| {
-            h ^= h >> 33;
-            h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-            h ^= h >> 33;
-            h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-            h ^ (h >> 33)
-        };
-        [
-            fmix(lanes[0] ^ lanes[2].rotate_left(23)),
-            fmix(lanes[1] ^ lanes[3].rotate_left(41)),
-        ]
+        digest_of(self.0.as_ref())
     }
 
     pub fn host_fill(&self) -> Option<NarrowColumns> {
         self.0.host_fill()
     }
+}
+
+/// [`Records::digest`] of records not (yet) shared: a regenerator that
+/// rebuilt a table's records digests them before it fills the table from
+/// them.
+pub fn digest_of(records: &dyn TableRecords) -> [u64; 2] {
+    const K: [u64; 4] = [
+        0x9e37_79b9_7f4a_7c15,
+        0xc2b2_ae3d_27d4_eb4f,
+        0x1656_67b1_9e37_79f9,
+        0x85eb_ca77_c2b2_ae63,
+    ];
+    let mut lanes = [
+        records.rows() as u64,
+        records.cols() as u64,
+        records.bytes() as u64,
+        0x243f_6a88_85a3_08d3,
+    ];
+    let mut i = 0usize;
+    records.fill().words(|w| {
+        let l = i % 4;
+        lanes[l] = (lanes[l] ^ w).wrapping_mul(K[l]).rotate_left(31);
+        i += 1;
+    });
+    // MurmurHash3's finalizer, so every input bit reaches every output bit.
+    let fmix = |mut h: u64| {
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        h ^ (h >> 33)
+    };
+    [
+        fmix(lanes[0] ^ lanes[2].rotate_left(23)),
+        fmix(lanes[1] ^ lanes[3].rotate_left(41)),
+    ]
 }
 
 impl PartialEq for Records {
