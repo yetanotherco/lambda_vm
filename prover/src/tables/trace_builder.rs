@@ -4481,6 +4481,12 @@ pub struct StreamSkip {
     /// it generates it, with no 64-bit copy (G-pack, [`super::gpack`]), instead
     /// of building it at 8 bytes a cell and packing it. The bytes are the same.
     pub gpack: bool,
+    /// With [`Self::pack`] and KECCAK_RND cut at `keccak_rnd_rows`: each
+    /// KECCAK_RND table the build makes holds the keccak operations its rows
+    /// come from instead of its columns (`keccak_rnd::KeccakRndRecords`), and
+    /// the card fills the columns from them. The words are the same. Such a
+    /// table is never dropped, so phase B never builds KECCAK_RND again.
+    pub card_fill: bool,
     /// The streamed tables' op lists hold only the ops past their streamed
     /// chunks (a windowed build that drops each chunk's ops as it hands the
     /// chunk out, [`WindowedTraceBuilder::drop_streamed_ops`]), and

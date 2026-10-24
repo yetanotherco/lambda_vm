@@ -899,3 +899,133 @@ fn a_miscounted_header_is_refused_by_the_stream() {
         );
     }
 }
+
+/// A table's packed columns: widths and bytes.
+fn packed_bytes(t: &Table) -> Option<(Vec<u8>, Vec<u8>)> {
+    t.narrow_main()
+        .map(|p| (p.widths().to_vec(), p.data().to_vec()))
+}
+
+/// Where two tables' packed columns first differ, for a short failure.
+fn first_difference(
+    a: &Option<(Vec<u8>, Vec<u8>)>,
+    b: &Option<(Vec<u8>, Vec<u8>)>,
+) -> Option<String> {
+    match (a, b) {
+        (Some((wa, da)), Some((wb, db))) => {
+            if let Some(c) = (0..wa.len().max(wb.len())).find(|&c| wa.get(c) != wb.get(c)) {
+                return Some(format!("column {c}'s width"));
+            }
+            (0..da.len().max(db.len()))
+                .find(|&i| da.get(i) != db.get(i))
+                .map(|i| format!("byte {i} of {}", da.len()))
+        }
+        (None, None) => None,
+        _ => Some("one is packed, the other not".into()),
+    }
+}
+
+/// ★ With the card filling KECCAK_RND ([`WindowedTraceBuilder::card_fill_keccak_rnd`]),
+/// the streamed finish hands on each KECCAK_RND table as the keccak operations
+/// its rows come from, and those records' host fill is the table the finish
+/// builds without it, packed byte for byte: every cut (into an op at either
+/// end, and padding rows alone) under both padding rules, windows of 7 and
+/// 1000 cycles. Every other table is the same, the records are 208 bytes an
+/// op of the table, and phase B is left nothing of KECCAK_RND to build again
+/// (LT's jobs are the same).
+#[test]
+fn held_as_records_the_finishs_keccak_rnd_tables_are_its_tables() {
+    use super::RegenFamily;
+    let mut held = 0usize;
+    for name in [
+        "test_keccak_multi",
+        "all_instructions_64",
+        "test_ecsm_multi",
+    ] {
+        let (program, logs) = run(name);
+        for padding in [CutPadding::LastTable, CutPadding::WholeRun] {
+            for window in [7, 1000] {
+                let what = format!("{name} {padding:?} window {window}");
+                let max_rows = MaxRowsConfig::small();
+                let host = move |b| cut(b, padding);
+                let card = move |b| cut(b, padding).card_fill_keccak_rnd();
+                let (builder, last) = pushed(&program, &logs, &max_rows, window, &host);
+                let whole = builder.finish(last).expect("the monolithic finish");
+                let [kr, _] = regen_ranges(&whole);
+                let (builder, last) = pushed(&program, &logs, &max_rows, window, &host);
+                let (want, want_regen) = streamed_keeping(builder, last, true);
+                let (builder, last) = pushed(&program, &logs, &max_rows, window, &card);
+                let (got, got_regen) = streamed_keeping(builder, last, true);
+                assert_eq!(got.len(), want.len(), "{what}: the tables");
+                for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(g.position, w.position, "{what}: position {k}");
+                    let (Some(g), Some(w)) = (&g.table, &w.table) else {
+                        assert!(g.table.is_none() && w.table.is_none(), "{what}: slot {k}");
+                        continue;
+                    };
+                    match g.records_main() {
+                        Some(records) => {
+                            assert!(kr.contains(&k), "{what}: records at {k}, not KECCAK_RND's");
+                            let filled = records.host_fill().expect("the host fills it");
+                            let filled = Some((filled.widths().to_vec(), filled.data().to_vec()));
+                            assert_eq!(
+                                first_difference(&filled, &packed_bytes(w)),
+                                None,
+                                "{what}: KECCAK_RND at {k}, filled from its records"
+                            );
+                            assert_eq!(
+                                (g.main_table.width, g.main_table.height),
+                                (w.main_table.width, w.main_table.height),
+                                "{what}: KECCAK_RND at {k}'s shape"
+                            );
+                            let ops = match records.fill() {
+                                multilinear::records::RecordsFill::KeccakRnd { ops, skip } => {
+                                    assert!(
+                                        skip < 24 || ops.is_empty(),
+                                        "{what}: cut within its first op, if any"
+                                    );
+                                    ops.len()
+                                }
+                            };
+                            assert_eq!(records.bytes(), 208 * ops, "{what}: 208 B an op");
+                            held += 1;
+                        }
+                        None => {
+                            assert!(!kr.contains(&k), "{what}: KECCAK_RND at {k} built");
+                            assert_eq!(
+                                first_difference(&packed_bytes(g), &packed_bytes(w)),
+                                None,
+                                "{what}: table {k}"
+                            );
+                            assert!(
+                                shape_and_words(g) == shape_and_words(w),
+                                "{what}: table {k}'s words"
+                            );
+                        }
+                    }
+                }
+                let mut got_regen = got_regen.expect("the lists kept");
+                let mut want_regen = want_regen.expect("the lists kept");
+                assert!(
+                    got_regen
+                        .take(RegenFamily::KeccakRnd)
+                        .expect("no jobs")
+                        .is_empty(),
+                    "{what}: KECCAK_RND left to phase B"
+                );
+                let lt_jobs = |r: &mut super::RestRegen| -> Vec<_> {
+                    r.take(RegenFamily::Lt)
+                        .expect("LT's jobs")
+                        .into_iter()
+                        .map(|job| job.map(|job| packed_bytes(&job().expect("LT again"))))
+                        .collect()
+                };
+                assert!(
+                    lt_jobs(&mut got_regen) == lt_jobs(&mut want_regen),
+                    "{what}: LT's jobs"
+                );
+            }
+        }
+    }
+    assert!(held > 0, "some KECCAK_RND table was held as records");
+}

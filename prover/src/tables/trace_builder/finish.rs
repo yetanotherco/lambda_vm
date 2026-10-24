@@ -1626,8 +1626,11 @@ fn family(name: &str) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-/// The bytes a table's main trace takes: packed, or eight a cell.
+/// The bytes a table's main trace takes: packed, as records, or eight a cell.
 fn table_bytes(table: &Table) -> usize {
+    if let Some(records) = table.records_main() {
+        return records.bytes();
+    }
     table.narrow_main().map_or_else(
         || table.main_table.width * table.main_table.height * std::mem::size_of::<u64>(),
         |packed| packed.data().len(),
@@ -1924,7 +1927,8 @@ impl<'a> FinishPlan<'a> {
             |ops| Box::new(move || Ok(keccak::generate_keccak_trace(&ops.whole()))),
         )?);
         units.extend(keccak_rnd_units(&keccak_ops, &skip, pack, form)?);
-        if let Some(regen) = regen.as_mut() {
+        // Tables held as their records are never dropped: nothing to keep.
+        if let Some(regen) = regen.as_mut().filter(|_| !(skip.card_fill && pack)) {
             regen.keccak_ops = Some(Arc::clone(&keccak_ops));
         }
         drop(keccak_ops);
@@ -2250,6 +2254,8 @@ impl RestRegen {
     /// second take of the family is refused.
     pub(crate) fn take(&mut self, family: RegenFamily) -> Result<Vec<Option<RegenJob>>, Error> {
         let units: Vec<Unit<'static>> = match family {
+            // Its tables are held as their records and never dropped.
+            RegenFamily::KeccakRnd if self.skip.card_fill && self.pack => Vec::new(),
             RegenFamily::KeccakRnd => {
                 let ops = self
                     .keccak_ops
@@ -2346,7 +2352,8 @@ fn segmented_units<'a, T: Clone + Send + Sync + 'a>(
 /// KECCAK_RND's units ([`keccak_rnd_chunks`]' tables, as many as
 /// [`StreamSkip::cut_padding`] counts, or the whole table wide without
 /// chunks): a chunk's round ops are derived from the KECCAK ops that reach it
-/// as the chunk is built.
+/// as the chunk is built. With [`StreamSkip::card_fill`] a cut table holds
+/// those ops instead (`keccak_rnd::KeccakRndRecords`), for the card to fill.
 fn keccak_rnd_units<'a>(
     keccak_ops: &std::sync::Arc<BlockVec<KeccakOperation>>,
     skip: &StreamSkip,
@@ -2363,6 +2370,28 @@ fn keccak_rnd_units<'a>(
                 output: op.output,
             })
             .collect()
+    };
+    let card_fill = skip.card_fill && pack;
+    // Rows `skip..skip + rows` of the table `ops` make: as records for the
+    // card, or built here.
+    let build = move |ops: &[KeccakOperation], skip: usize, rows: usize| -> Table {
+        let records = card_fill.then(|| {
+            keccak_rnd::KeccakRndRecords::new(
+                ops.iter().map(|op| multilinear::records::KeccakRndOp {
+                    timestamp: op.timestamp,
+                    input: op.input,
+                }),
+                skip,
+                rows,
+            )
+            .into_trace()
+        });
+        records.flatten().unwrap_or_else(|| {
+            packed_if(
+                pack,
+                keccak_rnd::generate_keccak_rnd_rows_as(&rounds(ops), skip, rows, form),
+            )
+        })
     };
     if n == 0 {
         return Ok(Vec::new());
@@ -2388,12 +2417,7 @@ fn keccak_rnd_units<'a>(
         return Ok(vec![Unit::Build {
             family: f,
             rows: total,
-            job: Box::new(move || {
-                Ok(packed_if(
-                    pack,
-                    keccak_rnd::generate_keccak_rnd_rows_as(&rounds(&ops.whole()), 0, total, form),
-                ))
-            }),
+            job: Box::new(move || Ok(build(&ops.whole(), 0, total))),
         }]);
     }
     let chunks = skip.cut_padding.tables(n * 24, rows);
@@ -2413,15 +2437,7 @@ fn keccak_rnd_units<'a>(
                 family: f,
                 rows,
                 job: Box::new(move || {
-                    Ok(packed_if(
-                        pack,
-                        keccak_rnd::generate_keccak_rnd_rows_as(
-                            &rounds(&ops.range(first, end)),
-                            c * rows - first * 24,
-                            rows,
-                            form,
-                        ),
-                    ))
+                    Ok(build(&ops.range(first, end), c * rows - first * 24, rows))
                 }) as Job<'a>,
             }
         })

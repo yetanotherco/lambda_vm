@@ -979,6 +979,29 @@ fn parse_rest_slide(value: Option<&str>) -> bool {
     value.map(str::trim) != Some("0")
 }
 
+/// `LAMBDA_VM_BLOCK_CARD_FILL`: unset, empty or `off` builds every table on the
+/// host (the default); `on` holds each KECCAK_RND table the finish cuts as the
+/// keccak operations its rows come from, and the card fills its columns from
+/// them as its group uploads it
+/// ([`WindowedTraceBuilder::card_fill_keccak_rnd`]); without a card, or where
+/// the card declines the room, a host reader fills them on the host. The
+/// tables' words, and so the proof's bytes, are the same. Anything else
+/// refuses the prove.
+pub(crate) fn block_card_fill() -> Result<bool, Error> {
+    parse_card_fill(std::env::var("LAMBDA_VM_BLOCK_CARD_FILL").ok().as_deref())
+}
+
+/// [`block_card_fill`]'s reading of its variable.
+fn parse_card_fill(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "off") => Ok(false),
+        Some("on") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_BLOCK_CARD_FILL={v}: off (the host builds every table) or on"
+        ))),
+    }
+}
+
 /// The most window walkers `LAMBDA_VM_BLOCK_WALKERS` takes: each walker holds
 /// a window's state and walked lists, and this is the most whose memory was
 /// measured on the largest blocks.
@@ -1255,6 +1278,9 @@ pub struct BlockStamps {
     /// card.
     pub narrow: multilinear_block::Narrowing,
     pub host_widens: (u64, u64),
+    /// Tables filled from their records ([`block_card_fill`]) during the
+    /// prove: `(on the card, on the host)`.
+    pub records_fills: (u64, u64),
     /// With [`BlockOptions::memlog`]: every memory term when the proof is
     /// done, bytes; empty without.
     pub mem_terms: Vec<(&'static str, usize)>,
@@ -1288,6 +1314,10 @@ pub struct LayoutStamps {
     /// The rest's tables laid out narrow from the finish's packed columns
     /// ([`BlockOptions::pack_finished`]): how many, and their packed bytes.
     pub packed_rest: (usize, usize),
+    /// The rest's tables laid out as the records their rows come from, for
+    /// the card to fill ([`block_card_fill`]): how many, and the records'
+    /// bytes.
+    pub records_rest: (usize, usize),
     /// Each table of the rest in AIR order: its name, when its layout ended
     /// (seconds since the prove started) and its group.
     pub rest_tables: Vec<(String, f64, usize)>,
@@ -1474,6 +1504,14 @@ impl BlockStamps {
                 "BLOCK REST PACKED: {} tables laid out narrow from the finish, {:.2} GiB\n",
                 l.packed_rest.0,
                 l.packed_rest.1 as f64 / (1u64 << 30) as f64,
+            ));
+            out.push_str(&format!(
+                "BLOCK CARD FILL: KECCAK_RND {} tables held as their records, {:.2} MiB · filled \
+                 from records on the card {} · on the host {}\n",
+                l.records_rest.0,
+                l.records_rest.1 as f64 / (1u64 << 20) as f64,
+                self.records_fills.0,
+                self.records_fills.1,
             ));
             let (on, [direct, narrowed, again, wide]) = l.gpack;
             out.push_str(&format!(
@@ -1985,6 +2023,40 @@ pub(crate) fn table_of_narrow<'a>(
         }
     }
     CommittedTable::from_narrow(layout, packed)
+        .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))
+}
+
+/// [`table_of_narrow`] for a trace the finish holds as the records its rows
+/// come from ([`WindowedTraceBuilder::card_fill_keccak_rnd`]): its records
+/// become the table's, and the card fills its columns from them as its group
+/// uploads it. A table with preprocessed columns is refused: their check reads
+/// the columns, which only the fill makes.
+pub(crate) fn table_of_records<'a>(
+    air: &'a dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+    trace: &mut TraceTable<F, E>,
+    (width, num_vars): (usize, usize),
+) -> Result<CommittedTable<'a, F, E>, Error> {
+    let layout = layout_of(air, width, num_vars)
+        .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))?;
+    let records = trace
+        .take_records_main()
+        .ok_or_else(|| Error::Prover(format!("{}: no records", air.name())))?;
+    trace.main_table = Table::new(Vec::new(), 0);
+    if records.cols() != width || records.rows() != 1usize << num_vars {
+        return Err(Error::Prover(format!(
+            "{}: records of {} × {}, the table is {width} × 2^{num_vars}",
+            air.name(),
+            records.cols(),
+            records.rows()
+        )));
+    }
+    if !air.precomputed_columns().is_empty() {
+        return Err(Error::Prover(format!(
+            "{}: a table with preprocessed columns is not held as records",
+            air.name(),
+        )));
+    }
+    CommittedTable::from_records(layout, records)
         .map_err(|e| Error::Prover(format!("{}: {e:?}", air.name())))
 }
 
@@ -2861,6 +2933,7 @@ pub(crate) fn prove_traces(
         let paths_before = multilinear::whir_commit::top_path_counts();
         let routes_before = multilinear::whir_commit::top_path_routes();
         let widens_before = multilinear::narrow::host_widens();
+        let fills_before = multilinear::records::fills();
         let identity = |g: usize| g;
         let fork_of: &dyn Fn(usize) -> usize = match &deviations.fork_of {
             Some(f) => f,
@@ -2900,6 +2973,11 @@ pub(crate) fn prove_traces(
         stamps.host_widens = (
             widens_after.0 - widens_before.0,
             widens_after.1 - widens_before.1,
+        );
+        let fills_after = multilinear::records::fills();
+        stamps.records_fills = (
+            fills_after.0 - fills_before.0,
+            fills_after.1 - fills_before.1,
         );
         stamps.groups = groups;
         (proof, argues, prepared_openings)
@@ -3637,6 +3715,8 @@ struct RestLaid<'a> {
     busy: f64,
     /// [`LayoutStamps::packed_rest`].
     packed_rest: (usize, usize),
+    /// [`LayoutStamps::records_rest`].
+    records_rest: (usize, usize),
     /// Each table's AIR index and when its layout ended (seconds since the
     /// prove started), in AIR order.
     laid_at: Vec<(usize, f64)>,
@@ -3708,6 +3788,8 @@ fn lay_out_rest<'a>(
     let laid_at = std::sync::Mutex::new(Vec::with_capacity(built.len()));
     let narrow_tables = std::sync::atomic::AtomicUsize::new(0);
     let narrow_bytes = std::sync::atomic::AtomicUsize::new(0);
+    let records_tables = std::sync::atomic::AtomicUsize::new(0);
+    let records_bytes = std::sync::atomic::AtomicUsize::new(0);
     let lay_out = |(i, ((_, trace, _), air)): (usize, ((_, &mut TraceTable<F, E>, _), _))| {
         let t = Instant::now();
         let shape = (
@@ -3715,7 +3797,12 @@ fn lay_out_rest<'a>(
             trace.main_table.height.trailing_zeros() as usize,
         );
         let rows = ledger.map_or(0, |_| memlog::rows_bytes(trace));
-        let laid = if let Some(packed) = trace.narrow_main() {
+        let laid = if let Some(records) = trace.records_main() {
+            use std::sync::atomic::Ordering::Relaxed;
+            records_tables.fetch_add(1, Relaxed);
+            records_bytes.fetch_add(records.bytes(), Relaxed);
+            table_of_records(air, trace, shape)
+        } else if let Some(packed) = trace.narrow_main() {
             use std::sync::atomic::Ordering::Relaxed;
             narrow_tables.fetch_add(1, Relaxed);
             narrow_bytes.fetch_add(packed.data().len(), Relaxed);
@@ -3828,6 +3915,7 @@ fn lay_out_rest<'a>(
         slowest,
         busy: t.elapsed().as_secs_f64(),
         packed_rest: (narrow_tables.into_inner(), narrow_bytes.into_inner()),
+        records_rest: (records_tables.into_inner(), records_bytes.into_inner()),
         laid_at: {
             let mut laid_at = laid_at.into_inner().unwrap_or_default();
             laid_at.sort_unstable_by_key(|&(i, _)| i);
@@ -3889,6 +3977,7 @@ fn lay_out_rest_streamed<'a>(
     let mut timed: Vec<(usize, f64)> = Vec::new();
     let mut laid_at: Vec<(usize, f64)> = Vec::new();
     let (mut narrow_tables, mut narrow_bytes) = (0usize, 0usize);
+    let (mut records_tables, mut records_bytes) = (0usize, 0usize);
     let mut k = 0usize;
     for crate::tables::trace_builder::Emitted { position, table } in tables {
         order.admit(position, table.as_ref().map(|t| t.main_table.width))?;
@@ -3904,7 +3993,12 @@ fn lay_out_rest_streamed<'a>(
             trace.main_table.height.trailing_zeros() as usize,
         );
         let rows = memlog::rows_bytes(&trace);
-        let laid = if let Some(packed) = trace.narrow_main() {
+        let laid = if let Some(records) = trace.records_main() {
+            // Never dropped, so never one phase B builds again.
+            records_tables += 1;
+            records_bytes += records.bytes();
+            table_of_records(refs[position], &mut trace, shape)
+        } else if let Some(packed) = trace.narrow_main() {
             narrow_tables += 1;
             narrow_bytes += packed.data().len();
             // A table phase B can build again from the kept lists (N3): its
@@ -3969,6 +4063,7 @@ fn lay_out_rest_streamed<'a>(
         slowest,
         busy,
         packed_rest: (narrow_tables, narrow_bytes),
+        records_rest: (records_tables, records_bytes),
         laid_at,
     })
 }
@@ -4245,6 +4340,7 @@ fn prove_streamed(
     let tag = block_statement_tag(&format.zf.base);
     crate::with_block_hash!(format.zf.base, |H| {
         let walkers = block_walkers()?;
+        let card_fill = block_card_fill()?;
         let (block, built, laid, executed) = std::thread::scope(|scope| {
             use std::sync::atomic::Ordering::Relaxed;
             // The executor, a window at a time, two windows ahead of the walk;
@@ -4332,6 +4428,9 @@ fn prove_streamed(
                 }
                 if rest_slide() {
                     builder = builder.slide_rest();
+                }
+                if card_fill {
+                    builder = builder.card_fill_keccak_rnd();
                 }
                 if let Some(ledger) = ledger {
                     ledger.image.store(builder.image_bytes(), Relaxed);
@@ -4785,6 +4884,7 @@ fn prove_streamed(
                     slowest,
                     busy: rest_busy,
                     packed_rest,
+                    records_rest,
                     laid_at,
                 } = rest;
                 let names: std::collections::HashMap<String, usize> = refs
@@ -4892,6 +4992,7 @@ fn prove_streamed(
                         slowest,
                         ahead_most,
                         packed_rest,
+                        records_rest,
                         rest_tables,
                         gpack: (false, [0; 4]),
                     },
@@ -5176,6 +5277,7 @@ fn prove_streamed(
         let paths_before = multilinear::whir_commit::top_path_counts();
         let routes_before = multilinear::whir_commit::top_path_routes();
         let widens_before = multilinear::narrow::host_widens();
+        let fills_before = multilinear::records::fills();
         let identity = |g: usize| g;
         let fork_of: &dyn Fn(usize) -> usize = match &deviations.fork_of {
             Some(f) => f,
@@ -5463,6 +5565,11 @@ fn prove_streamed(
         stamps.host_widens = (
             widens_after.0 - widens_before.0,
             widens_after.1 - widens_before.1,
+        );
+        let fills_after = multilinear::records::fills();
+        stamps.records_fills = (
+            fills_after.0 - fills_before.0,
+            fills_after.1 - fills_before.1,
         );
         stamps.groups = groups;
         if let Some(ledger) = ledger {
@@ -6846,7 +6953,7 @@ mod packer_tests {
 mod walkers_knob_tests {
     use executor::vm::memory::StoreKind;
 
-    use super::{Error, parse_walkers};
+    use super::{Error, parse_card_fill, parse_walkers};
 
     /// `LAMBDA_VM_BLOCK_WALKERS`: unset, empty or 0 is one walker (the
     /// default path); 1 to 4 that many; any other word refuses the prove, and
@@ -6880,6 +6987,30 @@ mod walkers_knob_tests {
             let refused = parse_walkers(Some(value), StoreKind::Words);
             assert!(
                 matches!(&refused, Err(Error::Prover(m)) if m.contains("pages store")),
+                "{value}: {refused:?}"
+            );
+        }
+    }
+
+    /// `LAMBDA_VM_BLOCK_CARD_FILL`: unset, empty or `off` builds every table
+    /// on the host (the default path); `on` has the card fill KECCAK_RND; any
+    /// other word refuses the prove.
+    #[test]
+    fn the_card_fill_knob_takes_off_and_on_and_refuses_anything_else() {
+        for (value, on) in [
+            (None, false),
+            (Some(""), false),
+            (Some("off"), false),
+            (Some(" off "), false),
+            (Some("on"), true),
+            (Some(" on\n"), true),
+        ] {
+            assert_eq!(parse_card_fill(value).ok(), Some(on), "{value:?}");
+        }
+        for value in ["1", "0", "ON", "Off", "yes", "true", "on,off", "kr"] {
+            let refused = parse_card_fill(Some(value));
+            assert!(
+                matches!(&refused, Err(Error::Prover(m)) if m.contains("LAMBDA_VM_BLOCK_CARD_FILL")),
                 "{value}: {refused:?}"
             );
         }

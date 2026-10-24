@@ -331,6 +331,77 @@ pub fn generate_keccak_rnd_rows_as(
     })
 }
 
+/// A KECCAK_RND table held as the keccak operations its rows come from
+/// (`multilinear::records`), about 208 bytes an op against about 1,480 a row
+/// packed: rows `skip..skip + rows` of the table the ops make, as
+/// [`generate_keccak_rnd_rows`] builds them. The card fills the columns from
+/// the ops; a host reader gets this module's fill of them.
+#[derive(Debug)]
+pub struct KeccakRndRecords {
+    ops: Vec<multilinear::records::KeccakRndOp>,
+    skip: usize,
+    rows: usize,
+}
+
+impl KeccakRndRecords {
+    /// Rows `skip..skip + rows` of the table `ops` make. Each op's rows read
+    /// its timestamp and input alone (`fill_op`), so those are what is kept.
+    pub fn new(
+        ops: impl IntoIterator<Item = multilinear::records::KeccakRndOp>,
+        skip: usize,
+        rows: usize,
+    ) -> Self {
+        Self {
+            ops: ops.into_iter().collect(),
+            skip,
+            rows,
+        }
+    }
+
+    /// The table held as these records. `None` where a trace cannot be held
+    /// so (not reached: KECCAK_RND has columns, and its field is Goldilocks).
+    pub fn into_trace(self) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+        TraceTable::try_from_records_main(
+            multilinear::records::Records(std::sync::Arc::new(self)),
+            1,
+        )
+        .ok()
+    }
+}
+
+impl multilinear::records::TableRecords for KeccakRndRecords {
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn cols(&self) -> usize {
+        cols::NUM_COLUMNS
+    }
+
+    fn fill(&self) -> multilinear::records::RecordsFill<'_> {
+        multilinear::records::RecordsFill::KeccakRnd {
+            ops: &self.ops,
+            skip: self.skip,
+        }
+    }
+
+    fn host_fill(&self) -> Option<multilinear::narrow::NarrowColumns> {
+        let ops: Vec<KeccakRoundOperation> = self
+            .ops
+            .iter()
+            .map(|op| KeccakRoundOperation {
+                timestamp: op.timestamp,
+                input: op.input,
+                output: [0; 25],
+            })
+            .collect();
+        let mut trace = generate_keccak_rnd_rows_as(&ops, self.skip, self.rows, TraceForm::Narrow);
+        // Written packed, except in a build that holds every trace wide.
+        trace.pack_main_narrow();
+        trace.take_narrow_main()
+    }
+}
+
 /// One op's 24 rows, from row `first_row` on.
 #[allow(clippy::needless_range_loop)]
 fn fill_op<T: VmTable>(table: &mut T, op: &KeccakRoundOperation, first_row: usize) {

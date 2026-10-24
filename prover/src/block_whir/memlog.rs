@@ -412,15 +412,14 @@ pub(crate) fn logs_bytes(logs: &Vec<executor::vm::logs::Log>) -> usize {
     crate::tables::trace_builder::vec_heap_bytes(logs)
 }
 
-/// A committed table's columns as held on the host: packed, or eight bytes a
-/// cell.
+/// A committed table's columns as held on the host: packed, as records, or
+/// eight bytes a cell.
 pub(crate) fn table_bytes(
     table: &stark::multilinear_table::CommittedTable<'_, super::F, super::E>,
 ) -> usize {
-    match table.narrow() {
-        Some(packed) => packed.data().len(),
-        None => (table.num_committed_columns() << table.num_vars()) * std::mem::size_of::<u64>(),
-    }
+    table.compact_bytes().unwrap_or_else(|| {
+        (table.num_committed_columns() << table.num_vars()) * std::mem::size_of::<u64>()
+    })
 }
 
 /// A group's tables as held.
@@ -430,8 +429,12 @@ pub(crate) fn group_bytes(
     group.iter().map(table_bytes).sum()
 }
 
-/// A trace table's main columns as held: eight bytes a cell, or packed.
+/// A trace table's main columns as held: eight bytes a cell, packed, or as
+/// records.
 pub(crate) fn rows_bytes(trace: &stark::trace::TraceTable<super::F, super::E>) -> usize {
+    if let Some(records) = trace.records_main() {
+        return records.bytes();
+    }
     trace.narrow_main().map_or_else(
         || trace.main_table.width * trace.main_table.height * std::mem::size_of::<u64>(),
         |packed| packed.data().len(),

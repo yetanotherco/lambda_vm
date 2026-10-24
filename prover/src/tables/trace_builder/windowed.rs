@@ -184,6 +184,8 @@ pub struct WindowedTraceBuilder<'a> {
     setup: SetupStamps,
     /// [`Self::slide_rest`].
     slide_rest: bool,
+    /// [`Self::card_fill_keccak_rnd`].
+    card_fill: bool,
 }
 
 /// Where a builder's creation spent its time, seconds: the initial image and
@@ -376,6 +378,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 decode: decode_secs,
             },
             slide_rest: false,
+            card_fill: false,
         })
     }
 
@@ -532,6 +535,15 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// The tables and their order are the same.
     pub fn slide_rest(mut self) -> Self {
         self.slide_rest = true;
+        self
+    }
+
+    /// With [`Self::pack_finished_tables`] and KECCAK_RND cut at the finish,
+    /// `finish` holds each KECCAK_RND table as the keccak operations its rows
+    /// come from, for the card to fill ([`StreamSkip::card_fill`]), instead
+    /// of building its columns. The words are the same.
+    pub fn card_fill_keccak_rnd(mut self) -> Self {
+        self.card_fill = true;
         self
     }
 
@@ -814,6 +826,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             pack_finished,
             gpack,
             cut_padding,
+            card_fill,
             ..
         } = self;
         // Chunks at the finish alone: none were handed out.
@@ -830,6 +843,7 @@ impl<'a> WindowedTraceBuilder<'a> {
         let emitted = StreamSkip {
             pack: pack_finished,
             gpack: pack_finished && gpack,
+            card_fill: pack_finished && card_fill,
             keccak_rows,
             ecsm_rows,
             ecdas_rows,
