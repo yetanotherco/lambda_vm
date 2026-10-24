@@ -101,29 +101,58 @@ pub mod cols {
 // Trace generation
 // =========================================================================
 
-/// A single MEMW operation to be added to the trace.
+/// A single MEMW operation to be added to the trace. `#[repr(C)]`, its fields
+/// ordered so it stays 152 bytes: a chunk's ops are the records the card fills
+/// its MEMW table from ([`card_ops`]).
+#[repr(C)]
 #[derive(Debug, Clone)]
 pub struct MemwOperation {
-    /// Whether this is a register access (true) or memory access (false)
-    pub is_register: bool,
     /// Base address (64-bit)
     pub base_address: u64,
+    /// Timestamp of this access
+    pub timestamp: u64,
+    /// Previous timestamps at the addresses (filled by memory model).
+    pub old_timestamp: [u64; 8],
     /// Values to write. Each element is one memory byte (0-255) or, for register
     /// accesses, a 32-bit half of the register word — both fit in u32, so this is
     /// `[u32; 8]` rather than `[u64; 8]` to halve the struct's footprint (the walk
     /// materializes tens of millions of these; it is memory-bandwidth-bound).
     pub value: [u32; 8],
-    /// Timestamp of this access
-    pub timestamp: u64,
+    /// Previous values at the addresses (filled by memory model). Same element
+    /// domain as `value` (byte or 32-bit register half) → `[u32; 8]`.
+    pub old: [u32; 8],
+    /// Whether this is a register access (true) or memory access (false)
+    pub is_register: bool,
     /// Access width: 1, 2, 4, or 8 bytes
     pub width: u8,
     /// Whether this is a read (true) or write (false)
     pub is_read: bool,
-    /// Previous values at the addresses (filled by memory model). Same element
-    /// domain as `value` (byte or 32-bit register half) → `[u32; 8]`.
-    pub old: [u32; 8],
-    /// Previous timestamps at the addresses (filled by memory model).
-    pub old_timestamp: [u64; 8],
+}
+
+// The walk keeps one per unaligned access: keep it at 152 bytes.
+const _: () = assert!(std::mem::size_of::<MemwOperation>() == 152);
+
+/// MEMW ops as the card's MEMW fill reads them (`multilinear::records::MemwOp`):
+/// the same bytes.
+pub(crate) fn card_ops(ops: &[MemwOperation]) -> &[multilinear::records::MemwOp] {
+    use multilinear::records::MemwOp;
+    use std::mem::{align_of, offset_of, size_of};
+    const _: () = {
+        assert!(size_of::<MemwOperation>() == size_of::<MemwOp>());
+        assert!(align_of::<MemwOperation>() == align_of::<MemwOp>());
+        assert!(offset_of!(MemwOperation, base_address) == offset_of!(MemwOp, base_address));
+        assert!(offset_of!(MemwOperation, timestamp) == offset_of!(MemwOp, timestamp));
+        assert!(offset_of!(MemwOperation, old_timestamp) == offset_of!(MemwOp, old_timestamp));
+        assert!(offset_of!(MemwOperation, value) == offset_of!(MemwOp, value));
+        assert!(offset_of!(MemwOperation, old) == offset_of!(MemwOp, old));
+        assert!(offset_of!(MemwOperation, is_register) == offset_of!(MemwOp, is_register));
+        assert!(offset_of!(MemwOperation, width) == offset_of!(MemwOp, width));
+        assert!(offset_of!(MemwOperation, is_read) == offset_of!(MemwOp, is_read));
+    };
+    // SAFETY: both are `#[repr(C)]` with the same fields in the same order
+    // (asserted above); the flags are `bool`s, 0 or 1, read as `u8`s, and no
+    // reader looks at the padding after them.
+    unsafe { std::slice::from_raw_parts(ops.as_ptr() as *const MemwOp, ops.len()) }
 }
 
 impl MemwOperation {

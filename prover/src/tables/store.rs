@@ -55,7 +55,9 @@ pub mod cols {
 // =========================================================================
 
 /// A single STORE operation. Exactly one of `write2/write4/write8` is set, or
-/// none for a single-byte store.
+/// none for a single-byte store. `#[repr(C)]`: a chunk's ops are the records
+/// the card fills its STORE table from ([`card_ops`]).
+#[repr(C)]
 #[derive(Debug, Clone, Default, Hash, PartialEq, Eq)]
 pub struct StoreOperation {
     pub base_address: u64,
@@ -64,6 +66,30 @@ pub struct StoreOperation {
     pub write2: bool,
     pub write4: bool,
     pub write8: bool,
+}
+
+// The walk keeps one per store: keep it at 32 bytes.
+const _: () = assert!(std::mem::size_of::<StoreOperation>() == 32);
+
+/// STORE ops as the card's STORE fill reads them
+/// (`multilinear::records::StoreOp`): the same bytes.
+pub(crate) fn card_ops(ops: &[StoreOperation]) -> &[multilinear::records::StoreOp] {
+    use multilinear::records::StoreOp;
+    use std::mem::{align_of, offset_of, size_of};
+    const _: () = {
+        assert!(size_of::<StoreOperation>() == size_of::<StoreOp>());
+        assert!(align_of::<StoreOperation>() == align_of::<StoreOp>());
+        assert!(offset_of!(StoreOperation, base_address) == offset_of!(StoreOp, base_address));
+        assert!(offset_of!(StoreOperation, timestamp) == offset_of!(StoreOp, timestamp));
+        assert!(offset_of!(StoreOperation, value) == offset_of!(StoreOp, value));
+        assert!(offset_of!(StoreOperation, write2) == offset_of!(StoreOp, write2));
+        assert!(offset_of!(StoreOperation, write4) == offset_of!(StoreOp, write4));
+        assert!(offset_of!(StoreOperation, write8) == offset_of!(StoreOp, write8));
+    };
+    // SAFETY: both are `#[repr(C)]` with the same fields in the same order
+    // (asserted above); the flags are `bool`s, 0 or 1, read as `u8`s, and no
+    // reader looks at the padding after them.
+    unsafe { std::slice::from_raw_parts(ops.as_ptr() as *const StoreOp, ops.len()) }
 }
 
 impl StoreOperation {
@@ -107,9 +133,19 @@ pub fn generate_store_trace_as(
     operations: &[StoreOperation],
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let num_rows = operations.len().next_power_of_two().max(4);
+    generate_store_trace_segments_as(&[operations], form)
+}
+
+/// [`generate_store_trace_as`] over `segments`, the operations one after
+/// another.
+pub(crate) fn generate_store_trace_segments_as(
+    segments: &[&[StoreOperation]],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let len: usize = segments.iter().map(|s| s.len()).sum();
+    let num_rows = len.next_power_of_two().max(4);
     generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
-        for (row_idx, op) in operations.iter().enumerate() {
+        for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
             table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
             table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
             table.set_bool(row_idx, cols::WRITE2, op.write2);

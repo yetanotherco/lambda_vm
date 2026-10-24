@@ -44,7 +44,8 @@ use crate::multilinear_prove::{
 use crate::statement::{self, MULTILINEAR_BLOCK_TAG};
 use crate::tables::gpack::{self, TraceForm};
 use crate::tables::trace_builder::{
-    ChunkJob, CutPadding, StreamTable, Traces, WindowStamps, WindowedTraceBuilder, parallel,
+    ChunkJob, CutPadding, RowFamilies, StreamTable, Traces, WindowStamps, WindowedTraceBuilder,
+    parallel,
 };
 use crate::test_utils::{E, F};
 use crate::zf_format::ZfFormat;
@@ -1321,16 +1322,32 @@ pub(crate) struct CardFill {
     /// room ([`WindowedTraceBuilder::card_fill_streamed`]).
     pub(crate) cpu: bool,
     pub(crate) memw_r: bool,
-    /// Each full streamed MEMW_A chunk, from its aligned rows, and each full
-    /// LOAD chunk, from its ops, under the same room rule
-    /// ([`WindowedTraceBuilder::card_fill_streamed_rows`]).
-    pub(crate) memw_a: bool,
-    pub(crate) load: bool,
+    /// Each full streamed chunk of these families, from its rows (MEMW_A's
+    /// aligned rows, LOAD's, STORE's, MEMW's and SHIFT's ops), under the same
+    /// room rule ([`WindowedTraceBuilder::card_fill_streamed_rows`]).
+    pub(crate) rows: RowFamilies,
 }
 
 impl CardFill {
     /// The families the card fills.
-    const NAMES: [&'static str; 5] = ["keccak_rnd", "cpu", "memw_r", "memw_a", "load"];
+    const NAMES: [&'static str; 8] = [
+        "keccak_rnd",
+        "cpu",
+        "memw_r",
+        "memw_a",
+        "load",
+        "store",
+        "memw",
+        "shift",
+    ];
+
+    /// Every family.
+    const EVERY: Self = Self {
+        keccak_rnd: true,
+        cpu: true,
+        memw_r: true,
+        rows: RowFamilies::ALL,
+    };
 
     /// Unset or empty: KECCAK_RND in a build with the card's kernels (the
     /// `cuda` feature), nothing in one without, where every fill from records
@@ -1340,23 +1357,31 @@ impl CardFill {
         keccak_rnd: cfg!(feature = "cuda"),
         cpu: false,
         memw_r: false,
-        memw_a: false,
-        load: false,
+        rows: RowFamilies::NONE,
     };
 
     /// Whether any streamed family is asked of the card.
     fn streamed(self) -> bool {
-        self.cpu || self.memw_r || self.memw_a || self.load
+        self.cpu || self.memw_r || self.rows.any()
     }
 
-    fn name(self) -> String {
-        let on = [
-            self.keccak_rnd,
-            self.cpu,
-            self.memw_r,
-            self.memw_a,
-            self.load,
-        ];
+    /// Each family's flag, in [`Self::NAMES`] order.
+    fn flags(&mut self) -> [&mut bool; 8] {
+        let rows = &mut self.rows;
+        [
+            &mut self.keccak_rnd,
+            &mut self.cpu,
+            &mut self.memw_r,
+            &mut rows.memw_a,
+            &mut rows.load,
+            &mut rows.store,
+            &mut rows.memw,
+            &mut rows.shift,
+        ]
+    }
+
+    fn name(mut self) -> String {
+        let on = self.flags().map(|on| *on);
         let names: Vec<&str> = Self::NAMES
             .iter()
             .zip(on)
@@ -1371,7 +1396,8 @@ impl CardFill {
 }
 
 /// `LAMBDA_VM_BLOCK_CARD_FILL`: a comma list of `keccak_rnd`, `cpu`, `memw_r`,
-/// `memw_a` and `load` (each at most once) has the card fill those families' tables from
+/// `memw_a`, `load`, `store`, `memw` and `shift` (each at most once) has the
+/// card fill those families' tables from
 /// the records their rows come from as their groups upload them ([`CardFill`]);
 /// `on` is every family, `off` none (the host builds every table). Unset or
 /// empty is [`CardFill::DEFAULT`]: KECCAK_RND in a build with the card's
@@ -1394,25 +1420,14 @@ fn parse_card_fill(value: Option<&str>) -> Result<CardFill, Error> {
     match value.map(str::trim) {
         None | Some("") => Ok(CardFill::DEFAULT),
         Some("off") => Ok(CardFill::default()),
-        Some("on") => Ok(CardFill {
-            keccak_rnd: true,
-            cpu: true,
-            memw_r: true,
-            memw_a: true,
-            load: true,
-        }),
+        Some("on") => Ok(CardFill::EVERY),
         Some(v) => {
             let mut fill = CardFill::default();
             for name in v.split(',').map(str::trim) {
-                let family = match name {
-                    "keccak_rnd" => &mut fill.keccak_rnd,
-                    "cpu" => &mut fill.cpu,
-                    "memw_r" => &mut fill.memw_r,
-                    "memw_a" => &mut fill.memw_a,
-                    "load" => &mut fill.load,
-                    _ => return Err(refused(v)),
+                let Some(at) = CardFill::NAMES.iter().position(|n| *n == name) else {
+                    return Err(refused(v));
                 };
-                if std::mem::replace(family, true) {
+                if std::mem::replace(fill.flags()[at], true) {
                     return Err(refused(v));
                 }
             }
@@ -2049,7 +2064,9 @@ impl BlockStamps {
                  streamed records {:.2} GiB · room ran out at {} · CPU logs out of step {} · \
                  card upload (timed) packed {widens} tables {widen_s:.3} s, records {fills} \
                  tables {fill_s:.3} s · MEMW_A chunks {} as records, {} filled on the host · \
-                 LOAD chunks {} as records, {} filled on the host\n",
+                 LOAD chunks {} as records, {} filled on the host · STORE chunks {} as records, \
+                 {} filled on the host · MEMW chunks {} as records, {} filled on the host · \
+                 SHIFT chunks {} as records, {} filled on the host\n",
                 l.records_rest.0,
                 l.records_rest.1 as f64 / (1u64 << 20) as f64,
                 self.records_fills.0,
@@ -2068,6 +2085,12 @@ impl BlockStamps {
                 c.memw_a[1],
                 c.load[0],
                 c.load[1],
+                c.store[0],
+                c.store[1],
+                c.memw[0],
+                c.memw[1],
+                c.shift[0],
+                c.shift[1],
             ));
             let (on, [direct, narrowed, again, wide]) = l.gpack;
             out.push_str(&format!(
@@ -3223,8 +3246,8 @@ pub(crate) struct Deviations {
     #[cfg(test)]
     pub card_fill_records_fault: usize,
     /// With the streamed CPU chunks held as records, each one's logs read
-    /// from this many cycles late, and with MEMW_A or LOAD chunks held as
-    /// their rows, each row's timestamp that much later
+    /// from this many cycles late, and with row families' chunks held as
+    /// their rows, each row's timestamp that much later (a SHIFT op's input)
     /// ([`WindowedTraceBuilder::card_fill_streamed_fault`]): one wrong table,
     /// the same at both uploads and to any host reader.
     #[cfg(test)]
@@ -3232,10 +3255,9 @@ pub(crate) struct Deviations {
     /// Whether the card fills the streamed CPU and MEMW_R chunks from their
     /// records (`[cpu, memw_r]`), instead of the knob.
     pub card_fill_streamed: Option<[bool; 2]>,
-    /// Whether the card fills the streamed MEMW_A and LOAD chunks from their
-    /// rows (`[memw_a, load]`), instead of the knob; with both of the above
-    /// set and this unset, neither.
-    pub card_fill_rows: Option<[bool; 2]>,
+    /// Which row families' streamed chunks the card fills from their rows,
+    /// instead of the knob; with both of the above set and this unset, none.
+    pub card_fill_rows: Option<RowFamilies>,
     /// The room rule the streamed chunks held as records are admitted by,
     /// instead of the host's resident set against its pressure line.
     pub records_room: Option<crate::tables::trace_builder::RecordsRoom>,
@@ -5218,26 +5240,20 @@ fn prove_streamed(
             deviations.card_fill_streamed,
             deviations.card_fill_rows,
         ) {
-            (Some(keccak_rnd), Some([cpu, memw_r]), rows) => {
-                let [memw_a, load] = rows.unwrap_or([false, false]);
-                CardFill {
-                    keccak_rnd,
-                    cpu,
-                    memw_r,
-                    memw_a,
-                    load,
-                }
-            }
+            (Some(keccak_rnd), Some([cpu, memw_r]), rows) => CardFill {
+                keccak_rnd,
+                cpu,
+                memw_r,
+                rows: rows.unwrap_or(RowFamilies::NONE),
+            },
             (keccak_rnd, streamed, rows) => {
                 let knob = block_card_fill()?;
                 let [cpu, memw_r] = streamed.unwrap_or([knob.cpu, knob.memw_r]);
-                let [memw_a, load] = rows.unwrap_or([knob.memw_a, knob.load]);
                 CardFill {
                     keccak_rnd: keccak_rnd.unwrap_or(knob.keccak_rnd),
                     cpu,
                     memw_r,
-                    memw_a,
-                    load,
+                    rows: rows.unwrap_or(knob.rows),
                 }
             }
         };
@@ -5376,9 +5392,8 @@ fn prove_streamed(
                 }
                 if let Some(room) = records_room.clone() {
                     builder = builder.card_fill_streamed(room, card_fill.cpu, card_fill.memw_r)?;
-                    if card_fill.memw_a || card_fill.load {
-                        builder =
-                            builder.card_fill_streamed_rows(card_fill.memw_a, card_fill.load)?;
+                    if card_fill.rows.any() {
+                        builder = builder.card_fill_streamed_rows(card_fill.rows)?;
                     }
                     #[cfg(test)]
                     if deviations.card_fill_streamed_fault > 0 {
@@ -8050,7 +8065,8 @@ mod walkers_knob_tests {
     use executor::vm::memory::StoreKind;
 
     use super::{
-        CardFill, Error, parse_card_fill, parse_records_drop, parse_walkers, records_admission,
+        CardFill, Error, RowFamilies, parse_card_fill, parse_records_drop, parse_walkers,
+        records_admission,
     };
 
     /// Streamed chunks are held as records only with live regeneration to drop
@@ -8143,8 +8159,9 @@ mod walkers_knob_tests {
         }
     }
 
-    /// `LAMBDA_VM_BLOCK_CARD_FILL`: a comma list of `keccak_rnd`, `cpu` and
-    /// `memw_r` has the card fill those families, `on` every one, `off` none;
+    /// `LAMBDA_VM_BLOCK_CARD_FILL`: a comma list of `keccak_rnd`, `cpu`,
+    /// `memw_r` and the row families has the card fill those families, `on`
+    /// every one, `off` none;
     /// unset or empty is KECCAK_RND with the card's kernels and nothing
     /// without; any other word, a family twice or an empty item refuses the
     /// prove.
@@ -8154,20 +8171,19 @@ mod walkers_knob_tests {
             keccak_rnd,
             cpu,
             memw_r,
-            memw_a: false,
-            load: false,
+            rows: RowFamilies::NONE,
         };
-        let every = CardFill {
-            keccak_rnd: true,
-            cpu: true,
-            memw_r: true,
-            memw_a: true,
-            load: true,
+        let every = CardFill::EVERY;
+        let rows = |rows| CardFill {
+            rows,
+            ..fill(false, false, false)
         };
-        let rows = |memw_a, load| CardFill {
+        let some = |memw_a, load, store, memw, shift| RowFamilies {
             memw_a,
             load,
-            ..fill(false, false, false)
+            store,
+            memw,
+            shift,
         };
         let default = fill(cfg!(feature = "cuda"), false, false);
         for (value, want) in [
@@ -8178,9 +8194,16 @@ mod walkers_knob_tests {
             (Some(" off "), fill(false, false, false)),
             (Some("on"), every),
             (Some(" on\n"), every),
-            (Some("memw_a"), rows(true, false)),
-            (Some("load"), rows(false, true)),
-            (Some("load,memw_a"), rows(true, true)),
+            (Some("memw_a"), rows(some(true, false, false, false, false))),
+            (Some("load"), rows(some(false, true, false, false, false))),
+            (Some("store"), rows(some(false, false, true, false, false))),
+            (Some("memw"), rows(some(false, false, false, true, false))),
+            (Some("shift"), rows(some(false, false, false, false, true))),
+            (
+                Some("load,memw_a"),
+                rows(some(true, true, false, false, false)),
+            ),
+            (Some("shift,store,memw,load,memw_a"), rows(RowFamilies::ALL)),
             (Some("keccak_rnd"), fill(true, false, false)),
             (Some("cpu"), fill(false, true, false)),
             (Some("memw_r"), fill(false, false, true)),
@@ -8200,8 +8223,19 @@ mod walkers_knob_tests {
         );
         assert_eq!(fill(true, false, true).name(), "keccak_rnd,memw_r");
         assert_eq!(fill(true, true, true).name(), "keccak_rnd,cpu,memw_r");
-        assert_eq!(every.name(), "keccak_rnd,cpu,memw_r,memw_a,load");
-        assert_eq!(rows(false, true).name(), "load");
+        assert_eq!(
+            every.name(),
+            "keccak_rnd,cpu,memw_r,memw_a,load,store,memw,shift"
+        );
+        assert_eq!(
+            parse_card_fill(Some(&every.name())).ok(),
+            Some(every),
+            "the name reads back"
+        );
+        assert_eq!(
+            rows(some(false, true, false, false, true)).name(),
+            "load,shift"
+        );
         for value in [
             "1",
             "0",
@@ -8220,6 +8254,9 @@ mod walkers_knob_tests {
             "memw_a,memw_a",
             "MEMW_A",
             "loads",
+            "store,shift,store",
+            "stores",
+            "memw_w",
         ] {
             let refused = parse_card_fill(Some(value));
             assert!(

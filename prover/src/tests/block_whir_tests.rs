@@ -7,7 +7,7 @@ use crate::block_whir::{
     verify_block_whir,
 };
 use crate::tables::MaxRowsConfig;
-use crate::tables::trace_builder::CutPadding;
+use crate::tables::trace_builder::{CutPadding, RowFamilies};
 use crate::test_utils::{E, asm_elf_bytes};
 use crate::zf_format::ZfFormat;
 use math::field::element::FieldElement;
@@ -5211,135 +5211,175 @@ fn streamed_records_chunks_drop_as_records_and_come_back() {
     }
 }
 
-/// The chunk heights the MEMW_A and LOAD records tests run at: chunks of four
+/// The chunk heights the row families' records tests run at: chunks of four
 /// rows, so that the small programs fill several.
 fn rows_max() -> MaxRowsConfig {
     MaxRowsConfig {
         memw_aligned: 1 << 2,
         load: 1 << 2,
+        store: 1 << 2,
+        memw: 1 << 2,
+        shift: 1 << 2,
         ..MaxRowsConfig::small()
     }
 }
 
-/// Every streamed MEMW_A and LOAD chunk held as its rows
-/// ([`Deviations::card_fill_rows`], `[memw_a, load]`), no CPU or MEMW_R chunk,
-/// the room rule admitting every one.
-fn row_records(memw_a: bool, load: bool) -> Deviations {
+/// Every streamed chunk of the row families in `rows` held as its rows
+/// ([`Deviations::card_fill_rows`]), no CPU or MEMW_R chunk, the room rule
+/// admitting every one.
+fn row_records(rows: RowFamilies) -> Deviations {
     Deviations {
-        card_fill_rows: Some([memw_a, load]),
+        card_fill_rows: Some(rows),
         ..streamed_records(false, false)
     }
 }
 
-/// ★ MEMW_A and LOAD chunks filled from their rows (the
-/// `LAMBDA_VM_BLOCK_CARD_FILL` knob's `memw_a` and `load`) move no byte: every
-/// full streamed chunk of those families is handed out as its rows, the card
-/// fills each from them at its phase-A and its phase-B upload (on a host
-/// without one, a host reader fills it there), and the proof verifies with
-/// the same partition, tables and statement, its bytes equal under the
-/// deterministic grind; each family alone, both, and every streamed family
-/// beside KECCAK_RND's; laid out inline and on workers; chunks of four rows,
-/// from a program that loads and stores at every width.
+/// The row family alone whose name ([`ROW_NAMES`]) is `name`.
+fn row_family(name: &str) -> RowFamilies {
+    let mut rows = RowFamilies::NONE;
+    let flag = match name {
+        "memw_a" => &mut rows.memw_a,
+        "load" => &mut rows.load,
+        "store" => &mut rows.store,
+        "memw" => &mut rows.memw,
+        "shift" => &mut rows.shift,
+        _ => panic!("no row family {name}"),
+    };
+    *flag = true;
+    rows
+}
+
+/// The row families' names, in [`row_counts`]' order.
+const ROW_NAMES: [&str; 5] = ["memw_a", "load", "store", "memw", "shift"];
+
+/// Each row family's `[as records, on the host]`, in [`ROW_NAMES`]' order.
+fn row_counts(c: &crate::tables::trace_builder::CardFillStamps) -> [[usize; 2]; 5] {
+    [c.memw_a, c.load, c.store, c.memw, c.shift]
+}
+
+/// ★ The row families' chunks filled from their rows (the
+/// `LAMBDA_VM_BLOCK_CARD_FILL` knob's `memw_a`, `load`, `store`, `memw` and
+/// `shift`) move no byte: every full streamed chunk of those families is
+/// handed out as its rows, the card fills each from them at its phase-A and
+/// its phase-B upload (on a host without one, a host reader fills it there),
+/// and the proof verifies with the same partition, tables and statement, its
+/// bytes equal under the deterministic grind; the row families alone and
+/// beside every other family; chunks of four rows, from a program that loads
+/// and stores at every width (laid out inline and on workers) and one that
+/// stores and shifts. (No small program makes four MEMW ops; a real block's
+/// MEMW chunks are the card test's and the gate's.)
 #[test]
-fn memw_a_and_load_filled_from_their_rows_move_no_byte() {
+fn row_families_filled_from_their_rows_move_no_byte() {
     let format = many_groups();
     let bytes = |p: &BlockWhirProof| {
         rkyv::to_bytes::<rkyv::rancor::Error>(p)
             .expect("serialize")
             .to_vec()
     };
-    let name = "all_loadstore_32";
-    let elf = asm_elf_bytes(name);
-    for workers in [0usize, 3] {
-        let proved = |deviations: Deviations| {
-            let mut o = streamed(rows_max(), 5, 3);
-            o.layout_workers = workers;
-            o.drop_streamed_ops = true;
-            let (proof, stamps) = prove_block_whir_with(
-                &elf,
-                &[],
-                &ProofOptions::default_test_options(),
-                &format,
-                &o,
-                &deviations,
-            )
-            .expect("prove");
-            assert!(verify(&proof, &elf, &format), "{name}, {workers} workers");
-            (proof, stamps)
-        };
-        let (host, host_stamps) = proved(Deviations {
-            card_fill: Some(false),
-            card_fill_streamed: Some([false, false]),
-            card_fill_rows: Some([false, false]),
-            ..Deviations::default()
-        });
-        let off = host_stamps.windows.card_fill;
-        assert_eq!(
-            (off.memw_a, off.load, off.records_bytes),
-            ([0, 0], [0, 0], 0),
-            "knob off"
-        );
-        assert_eq!(host_stamps.records_fills, (0, 0), "knob off");
-        for (memw_a, load, rest) in [
-            (true, false, false),
-            (false, true, false),
-            (true, true, false),
-            (true, true, true),
-        ] {
-            let what =
-                format!("{name}, {workers} workers, memw_a {memw_a} load {load}, the rest {rest}");
-            // Regeneration is off here, and parked records need it: kept.
-            let (card, stamps) = proved(Deviations {
-                card_fill: Some(rest),
-                card_fill_streamed: Some([rest, rest]),
-                records_keep: Some(true),
-                ..row_records(memw_a, load)
+    // Each program, its layouts, and the families it fills a chunk of.
+    for (name, layouts, fills) in [
+        (
+            "all_loadstore_32",
+            &[0usize, 3][..],
+            &["memw_a", "load", "store"][..],
+        ),
+        (
+            "test_ecsm_multi",
+            &[3][..],
+            &["memw_a", "store", "shift"][..],
+        ),
+    ] {
+        let elf = asm_elf_bytes(name);
+        for &workers in layouts {
+            let proved = |deviations: Deviations| {
+                let mut o = streamed(rows_max(), 5, 3);
+                o.layout_workers = workers;
+                o.drop_streamed_ops = true;
+                let (proof, stamps) = prove_block_whir_with(
+                    &elf,
+                    &[],
+                    &ProofOptions::default_test_options(),
+                    &format,
+                    &o,
+                    &deviations,
+                )
+                .expect("prove");
+                assert!(verify(&proof, &elf, &format), "{name}, {workers} workers");
+                (proof, stamps)
+            };
+            let (host, host_stamps) = proved(Deviations {
+                card_fill: Some(false),
+                card_fill_streamed: Some([false, false]),
+                card_fill_rows: Some(RowFamilies::NONE),
+                ..Deviations::default()
             });
-            let c = stamps.windows.card_fill;
-            assert_eq!(c.room_out, None, "{what}: {c:?}");
-            assert_eq!((c.memw_a[1], c.load[1]), (0, 0), "{what}: {c:?}");
-            assert_eq!(c.memw_a[0] > 0, memw_a, "{what}: {c:?}");
-            assert_eq!(c.load[0] > 0, load, "{what}: {c:?}");
-            let held =
-                (c.cpu[0] + c.memw_r[0] + c.memw_a[0] + c.load[0] + stamps.layout.records_rest.0)
-                    as u64;
-            let (on_card, on_host) = stamps.records_fills;
-            if cfg!(feature = "cuda") {
-                // At its commit and at its argument on the card; at this
-                // size a commit under the card's floor encodes on the host
-                // from the host's fill, once a table.
-                assert!(
-                    (held..=2 * held).contains(&on_card) && on_host <= held,
-                    "{what}: {on_card} on the card, {on_host} on the host, of {held} held"
-                );
-            } else {
-                assert_eq!(
-                    (on_card, on_host),
-                    (0, held),
-                    "{what}: each on the host once"
-                );
-            }
-            assert_eq!(host.groups, card.groups, "{what}: the partition");
-            assert_eq!(host.table_num_vars, card.table_num_vars, "{what}");
-            assert_eq!(
-                format!("{:?}", host.table_counts),
-                format!("{:?}", card.table_counts),
-                "{what}"
+            let off = host_stamps.windows.card_fill;
+            assert!(
+                row_counts(&off).iter().all(|f| *f == [0, 0]) && off.records_bytes == 0,
+                "knob off: {off:?}"
             );
-            if crypto::grinding::deterministic() {
-                assert_eq!(bytes(&host), bytes(&card), "{what}: the proof");
+            assert_eq!(host_stamps.records_fills, (0, 0), "knob off");
+            for rest in [false, true] {
+                let what = format!("{name}, {workers} workers, the rest {rest}");
+                // Regeneration is off here, and parked records need it: kept.
+                let (card, stamps) = proved(Deviations {
+                    card_fill: Some(rest),
+                    card_fill_streamed: Some([rest, rest]),
+                    records_keep: Some(true),
+                    ..row_records(RowFamilies::ALL)
+                });
+                let c = stamps.windows.card_fill;
+                assert_eq!(c.room_out, None, "{what}: {c:?}");
+                for (family, counts) in ROW_NAMES.iter().zip(row_counts(&c)) {
+                    assert_eq!(counts[1], 0, "{what}: {family} on the host: {c:?}");
+                    assert_eq!(
+                        counts[0] > 0,
+                        fills.contains(family),
+                        "{what}: {family} held: {c:?}"
+                    );
+                }
+                let rows: usize = row_counts(&c).iter().map(|f| f[0]).sum();
+                let held = (c.cpu[0] + c.memw_r[0] + rows + stamps.layout.records_rest.0) as u64;
+                let (on_card, on_host) = stamps.records_fills;
+                if cfg!(feature = "cuda") {
+                    // At its commit and at its argument on the card; at this
+                    // size a commit under the card's floor encodes on the host
+                    // from the host's fill, once a table.
+                    assert!(
+                        (held..=2 * held).contains(&on_card) && on_host <= held,
+                        "{what}: {on_card} on the card, {on_host} on the host, of {held} held"
+                    );
+                } else {
+                    assert_eq!(
+                        (on_card, on_host),
+                        (0, held),
+                        "{what}: each on the host once"
+                    );
+                }
+                assert_eq!(host.groups, card.groups, "{what}: the partition");
+                assert_eq!(host.table_num_vars, card.table_num_vars, "{what}");
+                assert_eq!(
+                    format!("{:?}", host.table_counts),
+                    format!("{:?}", card.table_counts),
+                    "{what}"
+                );
+                if crypto::grinding::deterministic() {
+                    assert_eq!(bytes(&host), bytes(&card), "{what}: the proof");
+                }
             }
         }
     }
 }
 
-/// ★ MEMW_A and LOAD chunks held as their rows park and drop like any chunk:
-/// with live regeneration dropping every table it can, as many streamed chunks
-/// drop as without the records, those held as rows dropped as them, each come
-/// back as packed columns checked by its rebuilt rows' digest, none missing or
-/// mismatched. Kept (`LAMBDA_VM_BLOCK_RECORDS_DROP=keep`), none drops and none
-/// has a recipe; with no live regeneration and not kept, none is held. The
-/// proofs are the one without regeneration.
+/// ★ The row families' chunks held as their rows park and drop like any
+/// chunk: with live regeneration dropping every table it can, as many
+/// streamed chunks drop as without the records, those held as rows dropped
+/// as them, each come back as packed columns checked by its rebuilt rows'
+/// digest, none missing or mismatched. Kept
+/// (`LAMBDA_VM_BLOCK_RECORDS_DROP=keep`), none drops and none has a recipe;
+/// with no live regeneration and not kept, none is held. The proofs are the
+/// one without regeneration. (MEMW_A, LOAD and STORE chunks: the rebuild is
+/// the families' one path.)
 #[test]
 fn row_records_chunks_drop_as_records_and_come_back() {
     use crate::block_whir::BlockSpillPolicy;
@@ -5374,6 +5414,9 @@ fn row_records_chunks_drop_as_records_and_come_back() {
             .expect("the dropped line counts the records")
     };
     let streamed = |r: &RegenStamps| r.dropped - r.rest_dropped;
+    let held_rows = |c: &crate::tables::trace_builder::CardFillStamps| -> [usize; 5] {
+        row_counts(c).map(|f| f[0])
+    };
     let proved = |mode, deviations| {
         regenerated_at(
             &elf,
@@ -5389,14 +5432,16 @@ fn row_records_chunks_drop_as_records_and_come_back() {
         records_keep: Some(true),
         ..deviations
     };
-    let (plain, _) = proved(RegenMode::Off, kept(row_records(true, true)));
+    let all_rows = || row_records(RowFamilies::ALL);
+    let (plain, _) = proved(RegenMode::Off, kept(all_rows()));
     let (built, stamps) = proved(RegenMode::Always, Deviations::default());
     let all = readout(&stamps);
     assert_eq!(as_records(&all), 0, "{:?}", all.lines);
     // Parked, the default.
-    let (parked, stamps) = proved(RegenMode::Always, row_records(true, true));
+    let (parked, stamps) = proved(RegenMode::Always, all_rows());
     let c = stamps.windows.card_fill;
-    assert!(c.memw_a[0] > 0 && c.load[0] > 0, "{c:?}");
+    let rows = held_rows(&c);
+    assert!(rows[0] > 0 && rows[1] > 0 && rows[2] > 0, "{c:?}");
     let some = readout(&stamps);
     assert_eq!(
         streamed(&some),
@@ -5406,15 +5451,16 @@ fn row_records_chunks_drop_as_records_and_come_back() {
     assert_eq!(some.recipes, all.recipes, "a recipe for every chunk");
     assert_eq!(
         as_records(&some),
-        c.memw_a[0] + c.load[0],
+        rows.iter().sum::<usize>(),
         "every records chunk dropped as its records: {:?}",
         some.lines
     );
     assert!(verify(&parked, &elf, &format));
     // Kept: never dropped, no recipe.
-    let (held, stamps) = proved(RegenMode::Always, kept(row_records(true, true)));
+    let (held, stamps) = proved(RegenMode::Always, kept(all_rows()));
     let c = stamps.windows.card_fill;
-    assert!(c.memw_a[0] > 0 && c.load[0] > 0, "kept: {c:?}");
+    let rows = held_rows(&c);
+    assert!(rows[0] > 0 && rows[1] > 0 && rows[2] > 0, "kept: {c:?}");
     let none = readout(&stamps);
     assert!(
         streamed(&none) < streamed(&all),
@@ -5423,20 +5469,19 @@ fn row_records_chunks_drop_as_records_and_come_back() {
         streamed(&all)
     );
     assert_eq!(
-        none.recipes + c.memw_a[0] + c.load[0],
+        none.recipes + rows.iter().sum::<usize>(),
         all.recipes,
         "no recipe for a kept records chunk"
     );
     assert!(verify(&held, &elf, &format));
     // No live regeneration, not kept: none held.
-    let (unheld, stamps) = proved(RegenMode::Off, row_records(true, true));
+    let (unheld, stamps) = proved(RegenMode::Off, all_rows());
     let c = stamps.windows.card_fill;
-    assert_eq!(
-        (c.memw_a[0], c.load[0], c.records_bytes),
-        (0, 0, 0),
+    assert!(
+        held_rows(&c).iter().all(|&n| n == 0) && c.records_bytes == 0,
         "records held with no live regeneration: {c:?}"
     );
-    assert!(c.memw_a[1] > 0 && c.load[1] > 0, "{c:?}");
+    assert!(c.memw_a[1] > 0 && c.load[1] > 0 && c.store[1] > 0, "{c:?}");
     assert!(verify(&unheld, &elf, &format));
     assert_eq!(parked.groups, plain.groups, "the partition");
     if crypto::grinding::deterministic() {
@@ -5451,17 +5496,23 @@ fn row_records_chunks_drop_as_records_and_come_back() {
     }
 }
 
-/// ★ A wrong MEMW_A or LOAD table held as rows is refused by the verifier:
-/// with each row's timestamp a cycle later
-/// ([`Deviations::card_fill_streamed_fault`]), every fill of them (the card's
+/// ★ A wrong row family's table held as rows is refused by the verifier: with
+/// each row a cycle later (a SHIFT op's input moved by one;
+/// [`Deviations::card_fill_streamed_fault`]), every fill of them (the card's
 /// at both uploads, or a host reader's) writes the same wrong table, so the
-/// prover makes a proof, and the unchanged verifier refuses it.
+/// prover makes a proof, and the unchanged verifier refuses it. Each family
+/// alone that a small program fills.
 #[test]
 fn a_wrong_row_records_table_is_refused_by_the_verifier() {
-    let elf = asm_elf_bytes("all_loadstore_32");
     let format = many_groups();
-    for (memw_a, load) in [(true, false), (false, true)] {
-        let what = format!("memw_a {memw_a}, load {load}");
+    for (name, family) in [
+        ("all_loadstore_32", "memw_a"),
+        ("all_loadstore_32", "load"),
+        ("all_loadstore_32", "store"),
+        ("test_ecsm_multi", "shift"),
+    ] {
+        let elf = asm_elf_bytes(name);
+        let what = format!("{name}, {family}");
         let mut o = streamed(rows_max(), 5, 3);
         o.layout_workers = 3;
         o.drop_streamed_ops = true;
@@ -5475,14 +5526,21 @@ fn a_wrong_row_records_table_is_refused_by_the_verifier() {
                 card_fill_streamed_fault: 1,
                 // Regeneration is off here, and parked records need it: kept.
                 records_keep: Some(true),
-                ..row_records(memw_a, load)
+                ..row_records(row_family(family))
             },
         )
         .unwrap_or_else(|e| {
             panic!("{what}: the prover refused ({e:?}): the verifier was never asked")
         });
         let c = stamps.windows.card_fill;
-        assert!(c.memw_a[0] + c.load[0] > 0, "{what}: no chunk held as rows");
+        let at = ROW_NAMES
+            .iter()
+            .position(|n| *n == family)
+            .expect("a family");
+        assert!(
+            row_counts(&c)[at][0] > 0,
+            "{what}: no chunk held as rows: {c:?}"
+        );
         assert!(
             !verify(&proof, &elf, &format),
             "{what}: a proof over a wrong table verified"

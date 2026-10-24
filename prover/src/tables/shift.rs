@@ -104,21 +104,48 @@ pub mod cols {
 // Trace generation
 // =========================================================================
 
-/// A single SHIFT operation (hashable for deduplication).
+/// A single SHIFT operation (hashable for deduplication). `#[repr(C)]`, its
+/// fields ordered so it stays 24 bytes: a chunk's ops are the records the card
+/// fills its SHIFT table from ([`card_ops`]).
+#[repr(C)]
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct ShiftOperation {
+    /// Full shift amount `arg2` (the unified ALU bus carries this as in2).
+    pub shift_amount: u64,
     /// Input value as 4 halfwords (DWordHL)
     pub in_halves: [u16; 4],
     /// Shift amount low byte (used by the computation; effective = mod 32/64).
     pub shift: u8,
-    /// Full shift amount `arg2` (the unified ALU bus carries this as in2).
-    pub shift_amount: u64,
     /// 0 = left, 1 = right
     pub direction: bool,
     /// Whether arithmetic (signed) right shift
     pub signed: bool,
     /// Whether 32-bit (word) instruction
     pub word_instr: bool,
+}
+
+// The walk keeps one per shift: keep it at 24 bytes.
+const _: () = assert!(std::mem::size_of::<ShiftOperation>() == 24);
+
+/// SHIFT ops as the card's SHIFT fill reads them
+/// (`multilinear::records::ShiftOp`): the same bytes.
+pub(crate) fn card_ops(ops: &[ShiftOperation]) -> &[multilinear::records::ShiftOp] {
+    use multilinear::records::ShiftOp;
+    use std::mem::{align_of, offset_of, size_of};
+    const _: () = {
+        assert!(size_of::<ShiftOperation>() == size_of::<ShiftOp>());
+        assert!(align_of::<ShiftOperation>() == align_of::<ShiftOp>());
+        assert!(offset_of!(ShiftOperation, shift_amount) == offset_of!(ShiftOp, shift_amount));
+        assert!(offset_of!(ShiftOperation, in_halves) == offset_of!(ShiftOp, in_halves));
+        assert!(offset_of!(ShiftOperation, shift) == offset_of!(ShiftOp, shift));
+        assert!(offset_of!(ShiftOperation, direction) == offset_of!(ShiftOp, direction));
+        assert!(offset_of!(ShiftOperation, signed) == offset_of!(ShiftOp, signed));
+        assert!(offset_of!(ShiftOperation, word_instr) == offset_of!(ShiftOp, word_instr));
+    };
+    // SAFETY: both are `#[repr(C)]` with the same fields in the same order
+    // (asserted above); the flags are `bool`s, 0 or 1, read as `u8`s, and no
+    // reader looks at the padding after them.
+    unsafe { std::slice::from_raw_parts(ops.as_ptr() as *const ShiftOp, ops.len()) }
 }
 
 impl ShiftOperation {

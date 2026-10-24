@@ -1,4 +1,5 @@
-//! CPU and MEMW_R chunks, and MEMW_A and LOAD chunks, handed out as the
+//! CPU and MEMW_R chunks, and the row families' (MEMW_A, LOAD, STORE, MEMW,
+//! SHIFT), handed out as the
 //! records their rows come from ([`WindowedTraceBuilder::card_fill_streamed`],
 //! [`WindowedTraceBuilder::card_fill_streamed_rows`]): their host fill is the
 //! table the build makes without it, whatever windows, walkers and room; the
@@ -14,21 +15,42 @@ use math::field::element::FieldElement;
 
 use super::super::super::types::GoldilocksField;
 use super::{
-    CardFillStamps, ChunkJob, RecordsRoom, StreamTable, StreamedChunk, Table, WalkedWindow,
-    WindowedTraceBuilder,
+    CardFillStamps, ChunkJob, RecordsRoom, RowFamilies, StreamTable, StreamedChunk, Table,
+    WalkedWindow, WindowedTraceBuilder,
 };
 use crate::tables::MaxRowsConfig;
 use crate::tables::trace_builder::Traces;
 use crate::tests::windowed_builder_tests::{run, same_traces, whole};
 
-/// The chunk heights the row families' tests run at: MEMW_A and LOAD chunks
-/// of four rows, so that the small programs fill several.
+/// The chunk heights the row families' tests run at: chunks of four rows, so
+/// that the small programs fill several.
 fn rows_max() -> MaxRowsConfig {
     MaxRowsConfig {
         memw_aligned: 1 << 2,
         load: 1 << 2,
+        store: 1 << 2,
+        memw: 1 << 2,
+        shift: 1 << 2,
         ..MaxRowsConfig::small()
     }
+}
+
+/// Whether `table` is a row family's.
+fn row_table(table: StreamTable) -> bool {
+    matches!(
+        table,
+        StreamTable::MemwAligned
+            | StreamTable::Load
+            | StreamTable::Store
+            | StreamTable::Memw
+            | StreamTable::Shift
+    )
+}
+
+/// Every family's `[as records, on the host]`: CPU, MEMW_R, then the row
+/// families.
+fn families(s: &CardFillStamps) -> [[usize; 2]; 7] {
+    [s.cpu, s.memw_r, s.memw_a, s.load, s.store, s.memw, s.shift]
 }
 
 /// A room rule that admits every chunk.
@@ -86,7 +108,7 @@ enum Walk {
 }
 
 /// The run of `program` by windows of `window` cycles, its CPU and MEMW_R
-/// chunks (with `rows`, its MEMW_A and LOAD chunks too) handed out as records
+/// chunks (with `rows`, every row family's too) handed out as records
 /// while `room` admits them and each records chunk then filled on the host,
 /// with the chunks put back; how many chunks were records; and the builder's
 /// stamps.
@@ -104,7 +126,7 @@ fn held(
         .and_then(|b| b.card_fill_streamed(room, true, true))
         .and_then(|b| {
             if rows {
-                b.card_fill_streamed_rows(true, true)
+                b.card_fill_streamed_rows(RowFamilies::ALL)
             } else {
                 Ok(b)
             }
@@ -179,8 +201,7 @@ fn held(
                 chunk.table, chunk.index
             );
             if held {
-                let row_family =
-                    matches!(chunk.table, StreamTable::MemwAligned | StreamTable::Load);
+                let row_family = row_table(chunk.table);
                 assert!(
                     matches!(chunk.table, StreamTable::Cpu | StreamTable::MemwRegister)
                         || (rows && row_family),
@@ -203,17 +224,18 @@ fn held(
 /// in the window parts it was cut from (windows of 1, 7, 32 and 33 cycles,
 /// walked by the builder or on 1 and 4 threads), fills on the host to the
 /// table the whole-run build makes; every other table is the same, and no
-/// MEMW_A or LOAD chunk is held unless asked.
+/// row family's chunk is held unless asked.
 #[test]
 fn cpu_and_memw_r_chunks_held_as_records_are_the_runs_tables() {
     chunks_held_as_records_are_the_runs_tables(false);
 }
 
-/// ★ The same with every full MEMW_A and LOAD chunk held as its rows too
+/// ★ The same with every full chunk of the row families held as its rows too
 /// ([`WindowedTraceBuilder::card_fill_streamed_rows`]; chunks of four rows,
-/// and two programs that load more): 48 B an aligned row, 32 a load.
+/// and programs that load, store and shift more): 48 B an aligned row, 32 a
+/// load or a store, 152 a MEMW op, 24 a shift.
 #[test]
-fn memw_a_and_load_chunks_held_as_records_are_the_runs_tables() {
+fn row_family_chunks_held_as_records_are_the_runs_tables() {
     chunks_held_as_records_are_the_runs_tables(true);
 }
 
@@ -226,7 +248,7 @@ fn chunks_held_as_records_are_the_runs_tables(rows: bool) {
     let mut walks = vec![Walk::Own];
     #[cfg(feature = "parallel")]
     walks.extend([Walk::Threads(1), Walk::Threads(4)]);
-    let mut held_most = [0usize; 4];
+    let mut held_most = [0usize; 7];
     let names = [
         "all_instructions_64",
         "test_keccak_multi",
@@ -242,10 +264,10 @@ fn chunks_held_as_records_are_the_runs_tables(rows: bool) {
                 let (traces, records, stamps) =
                     held(&program, &logs, &max_rows, window, walk, always(), rows);
                 same_traces(&reference, &traces);
-                let families = [stamps.cpu, stamps.memw_r, stamps.memw_a, stamps.load];
+                let families = families(&stamps);
                 assert!(families.iter().all(|f| f[1] == 0), "{what}: {stamps:?}");
                 if !rows {
-                    assert_eq!(stamps.memw_a[0] + stamps.load[0], 0, "{what}");
+                    assert!(families[2..].iter().all(|f| f[0] == 0), "{what}");
                 }
                 assert_eq!(stamps.out_of_step, 0, "{what}");
                 assert_eq!(stamps.room_out, None, "{what}");
@@ -262,14 +284,81 @@ fn chunks_held_as_records_are_the_runs_tables(rows: bool) {
                     stamps.cpu[0] * max_rows.cpu * 40
                         + stamps.memw_r[0] * max_rows.memw_register * 32
                         + stamps.memw_a[0] * max_rows.memw_aligned * 48
-                        + stamps.load[0] * max_rows.load * 32,
-                    "{what}: 40 B a cycle, 32 a register row, 48 an aligned row, 32 a load"
+                        + stamps.load[0] * max_rows.load * 32
+                        + stamps.store[0] * max_rows.store * 32
+                        + stamps.memw[0] * max_rows.memw * 152
+                        + stamps.shift[0] * max_rows.shift * 24,
+                    "{what}: 40 B a cycle, 32 a register row, 48 an aligned row, 32 a load or \
+                     store, 152 a MEMW op, 24 a shift"
                 );
             }
         }
     }
-    let asked = if rows { 4 } else { 2 };
-    assert!(held_most[..asked].iter().all(|&n| n > 1), "{held_most:?}");
+    // No small program makes four MEMW ops: every other family fills several.
+    let asked: &[usize] = if rows { &[0, 1, 2, 3, 4, 6] } else { &[0, 1] };
+    assert!(asked.iter().all(|&k| held_most[k] > 1), "{held_most:?}");
+}
+
+/// Each row family asked alone is the only one held as rows: the others are
+/// filled on the host, uncounted, and the tables are the run's.
+#[test]
+fn a_row_family_asked_alone_is_the_only_one_held() {
+    let max_rows = rows_max();
+    let (program, logs) = run("test_blake3");
+    let reference = whole(&program, &logs, &max_rows);
+    let alone = |k: usize| {
+        let mut rows = RowFamilies::NONE;
+        *[
+            &mut rows.memw_a,
+            &mut rows.load,
+            &mut rows.store,
+            &mut rows.memw,
+            &mut rows.shift,
+        ][k] = true;
+        rows
+    };
+    for k in 0..5 {
+        let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows)
+            .and_then(WindowedTraceBuilder::drop_streamed_ops)
+            .and_then(|b| b.card_fill_streamed(always(), false, false))
+            .and_then(|b| b.card_fill_streamed_rows(alone(k)))
+            .expect("the builder");
+        let body = logs.len() - 1;
+        let cut = body - body % 8;
+        let mut chunks = Vec::new();
+        {
+            let (mut walker, mut accumulator) = builder.split();
+            for w in logs[..cut].chunks(8) {
+                let walked = walker.walk_owned(w.to_vec()).expect("a window");
+                chunks.extend(
+                    accumulator
+                        .absorb(walked)
+                        .into_iter()
+                        .map(|job| unheld(job.generate()).0),
+                );
+            }
+        }
+        let stamps = builder.stamps().card_fill;
+        let mut traces = builder.finish(&logs[cut..]).expect("the last window");
+        traces
+            .insert_streamed(chunks)
+            .expect("every chunk has a placeholder");
+        same_traces(&reference, &traces);
+        let rows = &families(&stamps)[2..];
+        for (j, counts) in rows.iter().enumerate() {
+            if j == k {
+                // test_blake3 makes no four MEMW ops.
+                assert_eq!(counts[0] > 0, j != 3, "family {k}: {stamps:?}");
+            } else {
+                assert_eq!(
+                    *counts,
+                    [0, 0],
+                    "family {k}: family {j} counted: {stamps:?}"
+                );
+            }
+        }
+        assert_eq!(stamps.cpu, [0, 0], "{stamps:?}");
+    }
 }
 
 /// ★ A window's logs swapped with the next window's (one length, so the
@@ -319,7 +408,7 @@ fn cpu_logs_out_of_step_with_the_ops_are_filled_on_the_host() {
 /// names that chunk, and the tables are the run's.
 #[test]
 fn from_the_first_chunk_without_room_every_chunk_is_filled_on_the_host() {
-    let sum = |s: &CardFillStamps, k: usize| s.cpu[k] + s.memw_r[k] + s.memw_a[k] + s.load[k];
+    let sum = |s: &CardFillStamps, k: usize| families(s).iter().map(|f| f[k]).sum::<usize>();
     for rows in [false, true] {
         let (name, max_rows) = if rows {
             ("test_blake3", rows_max())
@@ -332,7 +421,10 @@ fn from_the_first_chunk_without_room_every_chunk_is_filled_on_the_host() {
         let chunks = sum(&all, 0);
         assert!(chunks > 4, "{all:?}");
         if rows {
-            assert!(all.memw_a[0] > 0 && all.load[0] > 0, "{all:?}");
+            assert!(
+                families(&all)[2..].iter().filter(|f| f[0] > 0).count() >= 2,
+                "{all:?}"
+            );
         }
         for admitted in [0, 1, 3, chunks - 1] {
             let what = format!("rows {rows}, {admitted} admitted");
@@ -529,7 +621,7 @@ fn a_chunk_held_as_records_has_a_rank_unless_records_are_kept() {
                 .and_then(|b| b.card_fill_streamed(room, true, true))
                 .and_then(|b| {
                     if rows {
-                        b.card_fill_streamed_rows(true, true)
+                        b.card_fill_streamed_rows(RowFamilies::ALL)
                     } else {
                         Ok(b)
                     }
@@ -553,9 +645,9 @@ fn a_chunk_held_as_records_has_a_rank_unless_records_are_kept() {
             }
             let held = handed.iter().filter(|(_, _, r)| *r).count();
             assert!(held > 0, "{what}: {held} of {}", handed.len());
-            let row_held = handed.iter().any(|&(table, _, records)| {
-                records && matches!(table, StreamTable::MemwAligned | StreamTable::Load)
-            });
+            let row_held = handed
+                .iter()
+                .any(|&(table, _, records)| records && row_table(table));
             if !rows || admitted.is_none() {
                 assert_eq!(row_held, rows, "{what}");
             }
@@ -589,11 +681,11 @@ fn a_chunk_held_as_records_has_a_rank_unless_records_are_kept() {
 }
 
 /// ★ A chunk dropped as its records comes back as them: walked again from the
-/// same logs, with the CPU logs kept, every CPU, MEMW_R, MEMW_A and LOAD chunk
+/// same logs, with the CPU logs kept, every CPU, MEMW_R and row family's chunk
 /// phase A held as records is rebuilt with records of the same digest, and the
 /// packed columns made from them are the host fill of phase A's records. A
 /// records slot takes those columns; with one log changed in the replay, the
-/// digest moves and the slot refuses the deposit, as a MEMW_A or LOAD slot
+/// digest moves and the slot refuses the deposit, as a row family's slot
 /// refuses another chunk's columns. A chunk not dropped as records is rebuilt
 /// with no digest.
 #[test]
@@ -605,8 +697,9 @@ fn a_chunk_dropped_as_records_is_rebuilt_as_them() {
     use stark::regen::{RegenError, RegenWindow};
 
     let max_rows = rows_max();
-    // Each row family's chunks offered another's columns.
-    let mut crossed = [0usize; 2];
+    // MEMW_A's, LOAD's, STORE's and SHIFT's chunks offered another's columns
+    // (no small program makes four MEMW ops).
+    let mut crossed = [0usize; 4];
     for name in ["all_instructions_64", "test_keccak_multi", "test_blake3"] {
         let (program, logs) = run(name);
         let window = 7;
@@ -618,7 +711,7 @@ fn a_chunk_dropped_as_records_is_rebuilt_as_them() {
             let mut builder = WindowedTraceBuilder::new(&program, &[], &max_rows)
                 .and_then(WindowedTraceBuilder::drop_streamed_ops)
                 .and_then(|b| b.card_fill_streamed(always(), true, true))
-                .and_then(|b| b.card_fill_streamed_rows(true, true))
+                .and_then(|b| b.card_fill_streamed_rows(RowFamilies::ALL))
                 .expect("the builder");
             let (mut walker, mut accumulator) = builder.split();
             for w in logs[..cut].chunks(window) {
@@ -696,11 +789,16 @@ fn a_chunk_dropped_as_records_is_rebuilt_as_them() {
             Err(RegenError::Mismatch),
             "{name}: the changed log's chunk"
         );
-        // Another chunk's columns, and their digest, offered to a MEMW_A or
-        // LOAD records slot.
-        for (family, crossed) in [StreamTable::MemwAligned, StreamTable::Load]
-            .into_iter()
-            .zip(&mut crossed)
+        // Another chunk's columns, and their digest, offered to a row family's
+        // records slot.
+        for (family, crossed) in [
+            StreamTable::MemwAligned,
+            StreamTable::Load,
+            StreamTable::Store,
+            StreamTable::Shift,
+        ]
+        .into_iter()
+        .zip(&mut crossed)
         {
             let mut keys: Vec<_> = held.keys().filter(|(t, _)| *t == family).collect();
             keys.sort_by_key(|(_, index)| *index);

@@ -353,8 +353,8 @@ pub(crate) use windowed::DECODE_TRACE_DELAY;
 #[cfg(feature = "parallel")]
 pub(crate) use windowed::parallel;
 pub use windowed::{
-    Accumulator, CardFillStamps, ChunkJob, RecordsRoom, RegenBuilder, SetupStamps, StreamTable,
-    StreamedChunk, WalkedWindow, Walker, WindowStamps, WindowedTraceBuilder,
+    Accumulator, CardFillStamps, ChunkJob, RecordsRoom, RegenBuilder, RowFamilies, SetupStamps,
+    StreamTable, StreamedChunk, WalkedWindow, Walker, WindowStamps, WindowedTraceBuilder,
 };
 
 // =============================================================================
