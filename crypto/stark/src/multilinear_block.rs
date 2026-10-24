@@ -263,8 +263,8 @@ impl BlockMem {
         FieldElement<E>: AsBytes + Sync + Send,
     {
         for table in tables.into_iter().filter(|t| !t.is_spilled()) {
-            match table.narrow() {
-                Some(packed) => self.held_narrow.fetch_add(packed.data().len(), Relaxed),
+            match table.compact_bytes() {
+                Some(bytes) => self.held_narrow.fetch_add(bytes, Relaxed),
                 None => self.held_wide.fetch_add(wide_bytes(table), Relaxed),
             };
         }
@@ -283,8 +283,8 @@ impl BlockMem {
         // A spilled table's bytes left the count when they were spilled, or
         // when phase B let them go after its group.
         for table in tables.into_iter().filter(|t| !t.is_spilled()) {
-            match table.narrow() {
-                Some(packed) => self.held_narrow.fetch_sub(packed.data().len(), Relaxed),
+            match table.compact_bytes() {
+                Some(bytes) => self.held_narrow.fetch_sub(bytes, Relaxed),
                 None => self.held_wide.fetch_sub(wide_bytes(table), Relaxed),
             };
         }
@@ -1257,8 +1257,8 @@ where
     Ok(())
 }
 
-/// A table's committed columns as held on the host: packed, or eight bytes a
-/// cell.
+/// A table's committed columns as held on the host: packed, as records, or
+/// eight bytes a cell.
 fn held_bytes<F, E>(table: &CommittedTable<'_, F, E>) -> usize
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -1266,14 +1266,13 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    table
-        .narrow()
-        .map_or_else(|| wide_bytes(table), |packed| packed.data().len())
+    table.compact_bytes().unwrap_or_else(|| wide_bytes(table))
 }
 
 /// A group's columns put on the card for its commit: a group of wide tables
-/// as their field elements, one with a table held narrow (built packed) as
-/// [`upload_group`] puts it — packed, and widened on the card.
+/// as their field elements, one with a table held narrow (built packed) or as
+/// records as [`upload_group`] puts it — packed and widened on the card, or
+/// filled there from the records.
 fn upload_for_commit<F, E>(group: &[CommittedTable<'_, F, E>]) -> Store
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -1281,7 +1280,7 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    if group.iter().any(|t| t.narrow().is_some()) {
+    if group.iter().any(|t| t.compact_bytes().is_some()) {
         return upload_group(group);
     }
     let columns: Vec<&Mle<F>> = group.iter().flat_map(|t| t.columns()).collect();
@@ -1799,7 +1798,7 @@ where
                 )?;
             }
             // Which tables were committed wide (a packer's, from here on).
-            let was_wide: Vec<bool> = group.iter().map(|t| t.narrow().is_none()).collect();
+            let was_wide: Vec<bool> = group.iter().map(|t| t.compact_bytes().is_none()).collect();
             packing =
                 narrow_group(&mut group, store, narrow, &mut stamp, mem.clone()).map(|handle| {
                     Packing {
@@ -2172,8 +2171,9 @@ where
                 .iter()
                 .map(|table| {
                     let width = table.num_committed_columns();
-                    // A table built packed is held narrow already.
-                    let run = (table.narrow().is_none()
+                    // A table built packed is held narrow already, and one
+                    // held as records keeps them.
+                    let run = (table.compact_bytes().is_none()
                         && (width << table.num_vars()) >= min_cells)
                         .then_some((first, width));
                     first += width;

@@ -340,6 +340,35 @@ where
         Ok(Self { layout, trace })
     }
 
+    /// [`Self::from_narrow`] over columns held as the records their rows come
+    /// from ([`multilinear::records`]): the card fills them as the group
+    /// uploads them. The same layouts only.
+    pub fn from_records(
+        layout: TableLayout<'a, F, E>,
+        records: multilinear::records::Records,
+    ) -> Result<Self, MlError> {
+        let in_order = layout
+            .column_keys()
+            .iter()
+            .enumerate()
+            .all(|(i, key)| key.main && key.col as usize == i);
+        if !in_order || layout.num_columns() != records.cols() {
+            return Err(MlError::QueryCountMismatch {
+                expected: layout.num_columns(),
+                got: records.cols(),
+            });
+        }
+        if records.rows() != 1usize << layout.num_vars() {
+            return Err(MlError::NotPowerOfTwo(records.rows()));
+        }
+        let trace = TraceData::new_records(
+            records,
+            layout.kinds().to_vec(),
+            layout.shape().public_tables()?,
+        )?;
+        Ok(Self { layout, trace })
+    }
+
     /// The structure alone — what the verifier holds.
     pub fn layout(&self) -> &TableLayout<'a, F, E> {
         &self.layout
@@ -403,9 +432,10 @@ where
 
     /// The columns as they go to the card: their field elements, or packed.
     pub(crate) fn upload_view(&self) -> multilinear::gpu::TableColumns<'_, F> {
-        match self.trace.narrow() {
-            Some(packed) => multilinear::gpu::TableColumns::Narrow(packed),
-            None => multilinear::gpu::TableColumns::Wide(self.trace.columns()),
+        match (self.trace.narrow(), self.trace.records()) {
+            (Some(packed), _) => multilinear::gpu::TableColumns::Narrow(packed),
+            (None, Some(records)) => multilinear::gpu::TableColumns::Records(records),
+            (None, None) => multilinear::gpu::TableColumns::Wide(self.trace.columns()),
         }
     }
 
@@ -445,6 +475,21 @@ where
     /// The packed columns, when the table holds them narrow.
     pub fn narrow(&self) -> Option<&multilinear::narrow::NarrowColumns> {
         self.trace.narrow()
+    }
+
+    /// The records the columns are filled from, when the table holds them so.
+    pub fn records(&self) -> Option<&multilinear::records::Records> {
+        self.trace.records()
+    }
+
+    /// The bytes the table's columns take on the host as it holds them, when
+    /// that is less than eight a cell: packed, or as records.
+    pub fn compact_bytes(&self) -> Option<usize> {
+        match (self.trace.narrow(), self.trace.records()) {
+            (Some(packed), _) => Some(packed.data().len()),
+            (None, Some(records)) => Some(records.bytes()),
+            (None, None) => None,
+        }
     }
 
     /// A test's hook: the packed columns, to break them.

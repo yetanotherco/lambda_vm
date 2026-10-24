@@ -56,6 +56,11 @@ where
     /// no data, only its width and height. Only the WHIR block prover packs a
     /// trace, and it takes the packed columns as they are.
     pub(crate) narrow_main: Option<multilinear::narrow::NarrowColumns>,
+    /// The main trace held as the records its rows come from
+    /// ([`Self::from_records_main`]): `main_table` then holds no data, only
+    /// its width and height. Only the WHIR block prover takes such a trace;
+    /// the card fills its columns from the records.
+    pub(crate) records_main: Option<multilinear::records::Records>,
 }
 
 /// Device-resident row-major main trace, pre-uploaded ahead of the prove.
@@ -194,6 +199,7 @@ where
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
             narrow_main: None,
+            records_main: None,
         }
     }
 
@@ -225,6 +231,7 @@ where
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
             narrow_main: None,
+            records_main: None,
         }
     }
 
@@ -249,6 +256,7 @@ where
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
             narrow_main: None,
+            records_main: None,
         }
     }
 
@@ -309,6 +317,39 @@ where
         trace.main_table.height = packed.rows();
         trace.narrow_main = Some(packed);
         Ok(trace)
+    }
+
+    /// A trace held as the records its rows come from: `records`' rows and
+    /// columns, with no column of words made on the host. `Err` gives
+    /// `records` back where a trace cannot be held so: not Goldilocks, or no
+    /// columns.
+    pub fn try_from_records_main(
+        records: multilinear::records::Records,
+        step_size: usize,
+    ) -> Result<Self, multilinear::records::Records>
+    where
+        F: 'static,
+    {
+        if std::any::TypeId::of::<F>()
+            != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
+            || records.cols() == 0
+        {
+            return Err(records);
+        }
+        let mut trace = Self::new_main(Vec::new(), records.cols(), step_size);
+        trace.main_table.height = records.rows();
+        trace.records_main = Some(records);
+        Ok(trace)
+    }
+
+    /// The records the main trace is held as, when it is.
+    pub fn records_main(&self) -> Option<&multilinear::records::Records> {
+        self.records_main.as_ref()
+    }
+
+    /// Takes the records out, leaving the table's shape.
+    pub fn take_records_main(&mut self) -> Option<multilinear::records::Records> {
+        self.records_main.take()
     }
 
     /// The packed main trace, when [`Self::pack_main_narrow`] packed it.
