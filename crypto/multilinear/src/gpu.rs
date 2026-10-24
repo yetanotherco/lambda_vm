@@ -4284,18 +4284,47 @@ where
     None
 }
 
-/// A table's columns as they go to the card: field elements, or packed narrow
-/// ([`crate::narrow::NarrowColumns`]) and widened there.
+/// A table's columns as they go to the card: field elements, packed narrow
+/// ([`crate::narrow::NarrowColumns`]) and widened there, or the records the
+/// rows come from ([`crate::records`]) and filled there.
 #[derive(Clone, Copy)]
 pub enum TableColumns<'a, F: math::field::traits::IsField> {
     Wide(&'a [crate::mle::Mle<F>]),
     Narrow(&'a crate::narrow::NarrowColumns),
+    Records(&'a crate::records::Records),
+}
+
+/// A table's records as the card's fill takes them.
+#[cfg(feature = "cuda")]
+fn records_input(records: &crate::records::Records) -> math_cuda::fill::RecordsInput<'_> {
+    use crate::records::{KeccakRndOp, RecordsFill};
+    use math_cuda::fill::{KeccakOpInC, RecordsInput};
+    const _: () = {
+        assert!(std::mem::size_of::<KeccakRndOp>() == std::mem::size_of::<KeccakOpInC>());
+        assert!(std::mem::align_of::<KeccakRndOp>() == std::mem::align_of::<KeccakOpInC>());
+        assert!(
+            std::mem::offset_of!(KeccakRndOp, input) == std::mem::offset_of!(KeccakOpInC, input)
+        );
+    };
+    match records.fill() {
+        RecordsFill::KeccakRnd { ops, skip } => RecordsInput::KeccakRnd {
+            // SAFETY: both are `#[repr(C)]` with the same fields in the same
+            // order (a timestamp, then 25 lanes, all `u64`), so the same size,
+            // alignment and offsets (asserted above).
+            ops: unsafe {
+                core::slice::from_raw_parts(ops.as_ptr() as *const KeccakOpInC, ops.len())
+            },
+            skip,
+            rows: records.rows(),
+        },
+    }
 }
 
 /// [`upload_columns`] of whole tables, each as it is held: a narrow one crosses
 /// the bus at its packed bytes and is widened on the card into the run its
-/// columns take, so the store holds the same words at the same places as if
-/// its field elements had been uploaded.
+/// columns take, and one held as records crosses it at its records' bytes and
+/// is filled there from them, so the store holds the same words at the same
+/// places as if its field elements had been uploaded.
 #[cfg(feature = "cuda")]
 pub fn upload_tables<F>(tables: &[TableColumns<'_, F>]) -> Option<ResidentColumns>
 where
@@ -4321,7 +4350,7 @@ where
                     core::slice::from_raw_parts(column.evals().as_ptr() as *const u64, column.len())
                 })
                 .collect(),
-            TableColumns::Narrow(_) => Vec::new(),
+            TableColumns::Narrow(_) | TableColumns::Records(_) => Vec::new(),
         })
         .collect();
     let uploads: Vec<TableUpload<'_>> = tables
@@ -4338,9 +4367,17 @@ where
                     packed.cols(),
                 ))
             }
+            TableColumns::Records(records) => TableUpload::Records(records_input(records)),
         })
         .collect();
-    math_cuda::columns::DeviceColumns::upload_tables(&uploads).map(ResidentColumns)
+    let store = math_cuda::columns::DeviceColumns::upload_tables(&uploads)?;
+    crate::records::note_card_fills(
+        tables
+            .iter()
+            .filter(|t| matches!(t, TableColumns::Records(_)))
+            .count(),
+    );
+    Some(ResidentColumns(store))
 }
 
 #[cfg(not(feature = "cuda"))]

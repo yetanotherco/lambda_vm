@@ -24,6 +24,7 @@ pub mod narrow;
 pub mod poly;
 pub mod program;
 pub mod query_count;
+pub mod records;
 pub mod round_slot;
 pub mod selector;
 pub mod stacked_eval;
