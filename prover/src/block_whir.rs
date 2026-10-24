@@ -769,12 +769,13 @@ fn decision_bytes(reading: &HostReading, allocator: Option<u64>, now: bool) -> u
     }
 }
 
-/// `LAMBDA_VM_BLOCK_DROP`: unset, empty or `all` drops, once live
-/// regeneration arms, every table phase B can rebuild, those already parked
-/// with them (as before); `partial` drops each only while the policy wants it
-/// out, on what the host holds now, and purges the dropped tables' pages so
-/// the reading falls ([`multilinear_block::BlockRegen::partial`],
-/// [`DropPurges`]). Anything else refuses the prove. The proof is the same.
+/// `LAMBDA_VM_BLOCK_DROP`: unset, empty or `partial` (the default) drops,
+/// once live regeneration arms, each table phase B can rebuild only while the
+/// policy wants it out, on what the host holds now, and purges the dropped
+/// tables' pages so the reading falls
+/// ([`multilinear_block::BlockRegen::partial`], [`DropPurges`]); `all` drops
+/// every such table, those already parked with them (the old default, kept
+/// as the rollback). Anything else refuses the prove. The proof is the same.
 fn block_drop() -> Result<DropMode, Error> {
     parse_drop(std::env::var("LAMBDA_VM_BLOCK_DROP").ok().as_deref())
 }
@@ -788,8 +789,8 @@ enum DropMode {
 
 fn parse_drop(value: Option<&str>) -> Result<DropMode, Error> {
     match value.map(str::trim) {
-        None | Some("" | "all") => Ok(DropMode::All),
-        Some("partial") => Ok(DropMode::Partial),
+        None | Some("" | "partial") => Ok(DropMode::Partial),
+        Some("all") => Ok(DropMode::All),
         Some(v) => Err(Error::Prover(format!(
             "LAMBDA_VM_BLOCK_DROP={v}: all or partial"
         ))),
@@ -7299,15 +7300,17 @@ mod drop_tests {
 
     const G: u64 = 1 << 30;
 
-    /// `LAMBDA_VM_BLOCK_DROP`: unset, empty or `all` drops everything once
-    /// armed; `partial` only what the policy wants out; any other word refuses.
+    /// `LAMBDA_VM_BLOCK_DROP`: unset, empty or `partial` drops only what the
+    /// policy wants out once armed (the default); `all` everything; any other
+    /// word refuses.
     #[test]
-    fn the_drop_knob_takes_all_and_partial_and_refuses_anything_else() {
+    fn the_drop_knob_defaults_to_partial_takes_all_and_refuses_anything_else() {
         for (value, mode) in [
-            (None, DropMode::All),
-            (Some(""), DropMode::All),
-            (Some("all"), DropMode::All),
+            (None, DropMode::Partial),
+            (Some(""), DropMode::Partial),
             (Some(" partial "), DropMode::Partial),
+            (Some("all"), DropMode::All),
+            (Some(" all "), DropMode::All),
         ] {
             assert_eq!(parse_drop(value).ok(), Some(mode), "{value:?}");
         }
