@@ -1,8 +1,9 @@
 //! A streamed CPU or MEMW_R chunk held as the records its rows come from
 //! (`multilinear::records`), for the card to fill its columns as its group
 //! uploads it: a CPU chunk as the executor's logs of its cycles, a MEMW_R
-//! chunk as its register rows, each in the window parts the chunk was cut
-//! from, shared and never copied. A host reader gets the host fill of the same
+//! chunk as its register rows, a MEMW_A or LOAD chunk as its rows or ops
+//! ([`RowRecords`]), each in the window parts the chunk was cut from, shared
+//! and never copied. A host reader gets the host fill of the same
 //! rows, which writes the same words.
 
 use std::sync::Arc;
@@ -11,11 +12,13 @@ use executor::vm::logs::Log;
 use multilinear::narrow::NarrowColumns;
 use multilinear::records::{DecodeRecords, Records, RecordsFill, TableRecords};
 
-use super::{Segments, Table};
+use super::{Segments, StreamTable, Table};
 use crate::tables::decode::DecodeTable;
 use crate::tables::gpack::TraceForm;
+use crate::tables::load::LoadOperation;
+use crate::tables::memw_aligned::AlignedRow;
 use crate::tables::memw_register::RegRow;
-use crate::tables::{cpu, memw_register};
+use crate::tables::{cpu, load, memw_aligned, memw_register};
 
 /// The program's DECODE table for the CPU chunks held as logs: the host's,
 /// which a host reader fills with, and its rows as the card reads them.
@@ -219,5 +222,163 @@ impl TableRecords for RegisterRowRecords {
         // Written packed, except in a build that holds every trace wide.
         trace.pack_main_narrow();
         trace.take_narrow_main()
+    }
+}
+
+/// A streamed family whose full chunks may be held as their rows, one record a
+/// row, the walk's own structs read in place by the card (MEMW_A's aligned
+/// rows, LOAD's ops): the records as the card reads them, and the host fill of
+/// the same rows.
+pub(crate) trait RowFamily: Sized + Send + Sync + 'static {
+    const TABLE: StreamTable;
+    const COLUMNS: usize;
+    /// The family's records as the card's fill reads them.
+    fn fill(pieces: Vec<&[Self]>) -> RecordsFill<'_>;
+    /// The host fill of the pieces' rows, in `form`: the table the chunk is
+    /// without records.
+    fn host_fill(pieces: &[&[Self]], form: TraceForm) -> Table;
+    /// A test's fault: the same row, its timestamp `cycles` later.
+    #[cfg(test)]
+    fn later(&self, cycles: u64) -> Self;
+}
+
+impl RowFamily for AlignedRow {
+    const TABLE: StreamTable = StreamTable::MemwAligned;
+    const COLUMNS: usize = memw_aligned::cols::NUM_COLUMNS;
+
+    fn fill(pieces: Vec<&[Self]>) -> RecordsFill<'_> {
+        RecordsFill::MemwA {
+            rows: pieces.into_iter().map(memw_aligned::card_rows).collect(),
+        }
+    }
+
+    fn host_fill(pieces: &[&[Self]], form: TraceForm) -> Table {
+        memw_aligned::generate_memw_aligned_trace_segments_as(pieces, form)
+    }
+
+    #[cfg(test)]
+    fn later(&self, cycles: u64) -> Self {
+        AlignedRow::later(*self, cycles)
+    }
+}
+
+impl RowFamily for LoadOperation {
+    const TABLE: StreamTable = StreamTable::Load;
+    const COLUMNS: usize = load::cols::NUM_COLUMNS;
+
+    fn fill(pieces: Vec<&[Self]>) -> RecordsFill<'_> {
+        RecordsFill::Load {
+            ops: pieces.into_iter().map(load::card_ops).collect(),
+        }
+    }
+
+    fn host_fill(pieces: &[&[Self]], form: TraceForm) -> Table {
+        load::generate_load_trace_segments_as(pieces, form)
+    }
+
+    #[cfg(test)]
+    fn later(&self, cycles: u64) -> Self {
+        Self {
+            timestamp: self.timestamp + cycles,
+            ..self.clone()
+        }
+    }
+}
+
+/// A full chunk of a [`RowFamily`] held as its rows.
+pub(crate) struct RowRecords<T: RowFamily> {
+    rows: Segments<T>,
+}
+
+impl<T: RowFamily> RowRecords<T> {
+    /// The chunk `rows` make. Refused (the rows given back) unless they are a
+    /// whole table: a chunk of another height goes to the host's fill, which
+    /// pads it.
+    pub(crate) fn new(rows: Segments<T>) -> Result<Self, Segments<T>> {
+        if whole_table(rows.len()) {
+            Ok(Self { rows })
+        } else {
+            Err(rows)
+        }
+    }
+
+    /// A test's fault: the same rows in one piece, each one's timestamp
+    /// `cycles` later.
+    #[cfg(test)]
+    pub(crate) fn later(self, cycles: u64) -> Self {
+        let pieces = self.rows.slices();
+        let rows = pieces.iter().flat_map(|piece| piece.iter());
+        Self {
+            rows: Segments::one(rows.map(|row| row.later(cycles)).collect()),
+        }
+    }
+}
+
+impl<T: RowFamily> std::fmt::Debug for RowRecords<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} rows: {} in {} pieces",
+            T::TABLE,
+            self.rows.len(),
+            self.rows.parts.len()
+        )
+    }
+}
+
+impl<T: RowFamily> TableRecords for RowRecords<T> {
+    fn rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn cols(&self) -> usize {
+        T::COLUMNS
+    }
+
+    fn fill(&self) -> RecordsFill<'_> {
+        T::fill(self.rows.slices())
+    }
+
+    fn bytes(&self) -> usize {
+        self.rows.op_bytes()
+    }
+
+    fn host_fill(&self) -> Option<NarrowColumns> {
+        let mut trace = T::host_fill(&self.rows.slices(), TraceForm::Narrow);
+        // Written packed, except in a build that holds every trace wide.
+        trace.pack_main_narrow();
+        trace.take_narrow_main()
+    }
+}
+
+/// A chunk held as the rows of a [`RowFamily`], as the hand-out carries it:
+/// what it weighs, the table it becomes, and the table a regenerator rebuilds
+/// with the digest of the records it would have been held as.
+pub(crate) trait RowChunk: Send + std::fmt::Debug {
+    fn op_bytes(&self) -> usize;
+    fn op_count(&self) -> usize;
+    /// The table held as these records.
+    fn into_trace(self: Box<Self>) -> Table;
+    /// With `digest`, the records' digest (`multilinear::records::digest_of`);
+    /// and the table's host fill in `form`.
+    fn regenerate(self: Box<Self>, form: TraceForm, digest: bool) -> (Option<[u64; 2]>, Table);
+}
+
+impl<T: RowFamily> RowChunk for RowRecords<T> {
+    fn op_bytes(&self) -> usize {
+        self.rows.op_bytes()
+    }
+
+    fn op_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn into_trace(self: Box<Self>) -> Table {
+        held(Records(Arc::new(*self)))
+    }
+
+    fn regenerate(self: Box<Self>, form: TraceForm, digest: bool) -> (Option<[u64; 2]>, Table) {
+        let digest = digest.then(|| multilinear::records::digest_of(&*self));
+        (digest, T::host_fill(&self.rows.slices(), form))
     }
 }

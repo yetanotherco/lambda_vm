@@ -86,7 +86,9 @@ use crate::tables::{
 type Table = TraceTable<GoldilocksField, GoldilocksExtension>;
 
 mod card_records;
-use card_records::{CardDecode, CpuLogRecords, RegisterRowRecords};
+use card_records::{
+    CardDecode, CpuLogRecords, RegisterRowRecords, RowChunk, RowFamily, RowRecords,
+};
 
 /// Whether the host has room to hold a chunk of so many bytes as records
 /// ([`WindowedTraceBuilder::card_fill_streamed`]).
@@ -94,13 +96,17 @@ pub type RecordsRoom = Arc<dyn Fn(usize) -> bool + Send + Sync>;
 
 /// [`WindowedTraceBuilder::card_fill_streamed`]: the program's DECODE rows
 /// as the card reads them when CPU chunks are held as logs, whether MEMW_R
-/// chunks are held as rows, and the room rule.
+/// chunks are held as rows, whether MEMW_A and LOAD chunks are
+/// ([`WindowedTraceBuilder::card_fill_streamed_rows`]), and the room rule.
 struct StreamedCardFill {
     cpu: Option<Arc<CardDecode>>,
     memw_r: bool,
+    memw_a: bool,
+    load: bool,
     room: RecordsRoom,
     /// A test's fault ([`WindowedTraceBuilder::card_fill_streamed_fault`]):
-    /// each CPU chunk's records start this many cycles late.
+    /// each CPU chunk's records start this many cycles late, each MEMW_A or
+    /// LOAD row's timestamp is that much later.
     #[cfg(test)]
     fault: u64,
 }
@@ -341,7 +347,7 @@ pub struct WindowStamps {
     pub card_fill: CardFillStamps,
 }
 
-/// The CPU and MEMW_R chunks handed out under
+/// The CPU, MEMW_R, MEMW_A and LOAD chunks handed out under
 /// [`WindowedTraceBuilder::card_fill_streamed`]: per family, `[as records,
 /// filled on the host]`; the records' bytes; the first chunk the room rule
 /// sent to the host; and the CPU chunks whose logs were not the ops' (each
@@ -350,6 +356,8 @@ pub struct WindowStamps {
 pub struct CardFillStamps {
     pub cpu: [usize; 2],
     pub memw_r: [usize; 2],
+    pub memw_a: [usize; 2],
+    pub load: [usize; 2],
     pub records_bytes: usize,
     pub room_out: Option<(StreamTable, usize)>,
     pub out_of_step: usize,
@@ -666,6 +674,8 @@ impl<'a> WindowedTraceBuilder<'a> {
         self.card_fill_streamed = Some(StreamedCardFill {
             cpu,
             memw_r,
+            memw_a: false,
+            load: false,
             room,
             #[cfg(test)]
             fault: 0,
@@ -673,9 +683,31 @@ impl<'a> WindowedTraceBuilder<'a> {
         Ok(self)
     }
 
+    /// With [`Self::card_fill_streamed`], also hand out each full chunk of
+    /// MEMW_A (with `memw_a`) and LOAD (with `load`) as its rows, the walk's
+    /// own structs, for the card to fill its columns from, under the same room
+    /// rule. Before the first window only. The words are the same.
+    pub fn card_fill_streamed_rows(mut self, memw_a: bool, load: bool) -> Result<Self, Error> {
+        if self.cycles > 0 {
+            return Err(Error::Prover(
+                "card_fill_streamed_rows after a window was walked".to_string(),
+            ));
+        }
+        let Some(card) = self.card_fill_streamed.as_mut() else {
+            return Err(Error::Prover(
+                "card_fill_streamed_rows: card_fill_streamed first".to_string(),
+            ));
+        };
+        card.memw_a = memw_a;
+        card.load = load;
+        Ok(self)
+    }
+
     /// A test's fault: with [`Self::card_fill_streamed`], each CPU chunk held
     /// as its logs reads them from `cycles` cycles late (each row's timestamp
-    /// that much later), the same wrong table however it is filled.
+    /// that much later), and each MEMW_A or LOAD chunk held as its rows
+    /// ([`Self::card_fill_streamed_rows`]) has each row's timestamp that much
+    /// later: the same wrong table however it is filled.
     #[cfg(test)]
     pub(crate) fn card_fill_streamed_fault(mut self, cycles: u64) -> Self {
         if let Some(card) = self.card_fill_streamed.as_mut() {
@@ -2237,6 +2269,69 @@ fn cpu_chunk_ops(
     }
 }
 
+/// A full chunk of a [`RowFamily`] as handed out (`wanted`: the family is held
+/// as records, [`WindowedTraceBuilder::card_fill_streamed_rows`]): as its rows
+/// for the card to fill it from while the host has room, as `plain` makes it
+/// otherwise. `counter` is the family's `[as records, on the host]`.
+fn row_chunk_ops<T: RowFamily>(
+    rows: Segments<T>,
+    index: usize,
+    card: Option<(&StreamedCardFill, &mut CardFillStamps)>,
+    wanted: fn(&StreamedCardFill) -> bool,
+    counter: fn(&mut CardFillStamps) -> &mut [usize; 2],
+    plain: fn(Segments<T>) -> ChunkOps,
+) -> ChunkOps {
+    let Some((card, stamps)) = card.filter(|(card, _)| wanted(card)) else {
+        return plain(rows);
+    };
+    let bytes = rows.op_bytes();
+    if !card.admits(bytes, (T::TABLE, index), stamps) {
+        counter(stamps)[1] += 1;
+        return plain(rows);
+    }
+    match RowRecords::new(rows) {
+        Ok(records) => {
+            #[cfg(test)]
+            let records = match card.fault {
+                0 => records,
+                cycles => records.later(cycles),
+            };
+            counter(stamps)[0] += 1;
+            stamps.records_bytes += bytes;
+            ChunkOps::Rows(Box::new(records))
+        }
+        Err(rows) => {
+            counter(stamps)[1] += 1;
+            plain(rows)
+        }
+    }
+}
+
+/// [`ChunkJob::regenerate`] of a [`RowFamily`]'s chunk cut from the regeneration
+/// walk: a whole table with the digest of the rows phase A would have held it
+/// as; any other filled as `plain` makes it, with none.
+fn row_regenerate<T: RowFamily>(
+    rows: Segments<T>,
+    form: TraceForm,
+    plain: fn(Segments<T>) -> ChunkOps,
+    table: StreamTable,
+    index: usize,
+) -> (Option<[u64; 2]>, Table) {
+    match RowRecords::new(rows) {
+        Ok(records) => (Box::new(records) as Box<dyn RowChunk>).regenerate(form, true),
+        Err(rows) => (
+            None,
+            ChunkJob {
+                table,
+                index,
+                ops: plain(rows),
+            }
+            .generate_as(form)
+            .trace,
+        ),
+    }
+}
+
 /// A full MEMW_R chunk's rows as handed out: as the records the card fills it
 /// from while the host has room, to be filled on the host otherwise.
 fn memw_register_chunk_ops(
@@ -2288,7 +2383,11 @@ fn tail_jobs(
         ($table:expr, $variant:ident, $tail:expr, $max:expr, $done:expr) => {
             take_chunks!($table, $variant, $tail, $max, $done, |ops| {})
         };
-        ($table:expr, $variant:ident, $tail:expr, $max:expr, $done:expr, |$ops:ident| $count:block) => {{
+        ($table:expr, $variant:ident, $tail:expr, $max:expr, $done:expr, |$ops:ident| $count:block) => {
+            take_chunks!($table, $tail, $max, $done, |$ops| $count, |ops, _| ChunkOps::$variant(ops))
+        };
+        // `$hold`: the chunk's ops as handed out, from its ops and index.
+        ($table:expr, $tail:expr, $max:expr, $done:expr, |$ops:ident| $count:block, $hold:expr) => {{
             let max = $max;
             while $tail.len >= max {
                 let t = Instant::now();
@@ -2296,11 +2395,12 @@ fn tail_jobs(
                 let taken = t.elapsed().as_secs_f64();
                 let t = Instant::now();
                 $count
+                let ops = $hold($ops, $done);
                 stamps.note($table, taken, t.elapsed().as_secs_f64(), copied);
                 jobs.push(ChunkJob {
                     table: $table,
                     index: $done,
-                    ops: ChunkOps::$variant($ops),
+                    ops,
                 });
                 $done += 1;
             }
@@ -2368,7 +2468,6 @@ fn tail_jobs(
     }
     take_chunks!(
         StreamTable::MemwAligned,
-        MemwAligned,
         kept.aligned,
         m.memw_aligned,
         e.memw_aligned,
@@ -2381,7 +2480,15 @@ fn tail_jobs(
                     counted.memw_aligned_lt.extend(&lt);
                 }
             }
-        }
+        },
+        |rows, index| row_chunk_ops(
+            rows,
+            index,
+            card.as_mut().map(|(c, s)| (*c, &mut **s)),
+            |c| c.memw_a,
+            |s| &mut s.memw_a,
+            ChunkOps::MemwAligned,
+        )
     );
     take_chunks!(
         StreamTable::Memw,
@@ -2397,7 +2504,21 @@ fn tail_jobs(
             }
         }
     );
-    take_chunks!(StreamTable::Load, Load, kept.load, m.load, e.load);
+    take_chunks!(
+        StreamTable::Load,
+        kept.load,
+        m.load,
+        e.load,
+        |ops| {},
+        |ops, index| row_chunk_ops(
+            ops,
+            index,
+            card.as_mut().map(|(c, s)| (*c, &mut **s)),
+            |c| c.load,
+            |s| &mut s.load,
+            ChunkOps::Load,
+        )
+    );
     take_chunks!(StreamTable::Lt, Lt, kept.lt, m.lt, e.lt, |ops| {
         for part in ops.slices() {
             counted
@@ -2623,6 +2744,9 @@ enum ChunkOps {
     MemwRegister(Segments<super::RegRow>),
     /// Its rows, for the card to fill it from.
     MemwRegisterRecords(RegisterRowRecords),
+    /// A MEMW_A or LOAD chunk's rows, for the card to fill it from
+    /// ([`WindowedTraceBuilder::card_fill_streamed_rows`]).
+    Rows(Box<dyn RowChunk>),
     MemwAligned(Segments<memw_aligned::AlignedRow>),
     Memw(Segments<super::MemwOperation>),
     Load(Segments<super::LoadOperation>),
@@ -2649,6 +2773,7 @@ impl ChunkJob {
             ChunkOps::MemwRegisterRecords(records) => {
                 multilinear::records::TableRecords::bytes(records)
             }
+            ChunkOps::Rows(records) => records.op_bytes(),
             ChunkOps::MemwAligned(ops) => ops.op_bytes(),
             ChunkOps::Memw(ops) => ops.op_bytes(),
             ChunkOps::Load(ops) => ops.op_bytes(),
@@ -2669,6 +2794,7 @@ impl ChunkJob {
             ChunkOps::MemwRegisterRecords(records) => {
                 multilinear::records::TableRecords::rows(records)
             }
+            ChunkOps::Rows(records) => records.op_count(),
             ChunkOps::MemwAligned(ops) => ops.len(),
             ChunkOps::Memw(ops) => ops.len(),
             ChunkOps::Load(ops) => ops.len(),
@@ -2695,6 +2821,7 @@ impl ChunkJob {
                 records.into_trace()
             }
             ChunkOps::MemwRegisterRecords(records) => records.into_trace(),
+            ChunkOps::Rows(records) => records.into_trace(),
             ChunkOps::Cpu(ops, decode) => {
                 cpu::generate_cpu_trace_segments_as(&ops.slices(), &decode, form)
             }
@@ -2731,34 +2858,40 @@ impl ChunkJob {
         }
     }
 
-    /// The chunk filled here, packed in `form` as its ops make it, with the
-    /// digest of the records phase A would have held it as
-    /// (`multilinear::records::digest_of`): a CPU chunk cut with its logs
-    /// ([`RegenBuilder::keep_cpu_logs`]), any full MEMW_R chunk. `None` for
-    /// any other. What a regenerator deposits for a chunk dropped as its
-    /// records, checked by that digest.
-    pub fn regenerate(self, form: TraceForm) -> (Option<[u64; 2]>, StreamedChunk) {
+    /// The chunk filled here, packed in `form` as its ops make it, and, with
+    /// `as_records` (it was dropped as its records), the digest of the records
+    /// phase A held it as (`multilinear::records::digest_of`): a CPU chunk cut
+    /// with its logs ([`RegenBuilder::keep_cpu_logs`]), any full MEMW_R,
+    /// MEMW_A or LOAD chunk. `None` for any other, and for every chunk without
+    /// `as_records`: no chunk pays for a digest no slot checks. What a
+    /// regenerator deposits for a chunk dropped as its records, checked by
+    /// that digest.
+    pub fn regenerate(
+        self,
+        form: TraceForm,
+        as_records: bool,
+    ) -> (Option<[u64; 2]>, StreamedChunk) {
         let (table, index) = (self.table, self.index);
         let (digest, trace) = match self.ops {
             ChunkOps::CpuRecords { records, spent } => {
-                let digest = multilinear::records::digest_of(&records);
+                let digest = as_records.then(|| multilinear::records::digest_of(&records));
                 let trace = cpu::generate_cpu_trace_segments_as(
                     &spent.slices(),
                     records.decode_table(),
                     form,
                 );
-                (Some(digest), trace)
+                (digest, trace)
             }
             ChunkOps::MemwRegisterRecords(records) => {
-                let digest = multilinear::records::digest_of(&records);
+                let digest = as_records.then(|| multilinear::records::digest_of(&records));
                 let rows = records.into_rows();
                 let trace = memw_register::generate_memw_register_trace_from_rows_segments_as(
                     &rows.slices(),
                     form,
                 );
-                (Some(digest), trace)
+                (digest, trace)
             }
-            ChunkOps::MemwRegister(rows) => match RegisterRowRecords::new(rows) {
+            ChunkOps::MemwRegister(rows) if as_records => match RegisterRowRecords::new(rows) {
                 Ok(records) => {
                     let digest = multilinear::records::digest_of(&records);
                     let rows = records.into_rows();
@@ -2779,6 +2912,13 @@ impl ChunkJob {
                     .trace,
                 ),
             },
+            ChunkOps::Rows(records) => records.regenerate(form, as_records),
+            ChunkOps::MemwAligned(rows) if as_records => {
+                row_regenerate(rows, form, ChunkOps::MemwAligned, table, index)
+            }
+            ChunkOps::Load(ops) if as_records => {
+                row_regenerate(ops, form, ChunkOps::Load, table, index)
+            }
             ops => (None, ChunkJob { table, index, ops }.generate_as(form).trace),
         };
         (
@@ -2796,7 +2936,7 @@ impl ChunkJob {
     pub fn is_records(&self) -> bool {
         matches!(
             self.ops,
-            ChunkOps::CpuRecords { .. } | ChunkOps::MemwRegisterRecords(_)
+            ChunkOps::CpuRecords { .. } | ChunkOps::MemwRegisterRecords(_) | ChunkOps::Rows(_)
         )
     }
 }

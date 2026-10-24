@@ -1,6 +1,6 @@
-//! ★ The card fills a streamed CPU or MEMW_R chunk from its records
-//! ([`super::card_records`]) with the words the host fill writes, at the
-//! places its group's store holds them: chunks whose logs or rows lie in
+//! ★ The card fills a streamed CPU, MEMW_R, MEMW_A or LOAD chunk from its
+//! records ([`super::card_records`]) with the words the host fill writes, at
+//! the places its group's store holds them: chunks whose logs or rows lie in
 //! many window parts, alone and among a group's other tables, and, with
 //! `BLOCK_WHIR_ELF` and `BLOCK_WHIR_INPUT`, a real block's chunks at the
 //! production height. A CPU log at a pc with no DECODE row declines the group,
@@ -31,20 +31,28 @@ fn always() -> RecordsRoom {
     Arc::new(|_| true)
 }
 
-/// Every full CPU and MEMW_R chunk the run of `program` hands out as records,
-/// by windows of `window` cycles, from the hand-out of window `from` on and
-/// through `windows` windows walked (all of them: `None`):
-/// `(family, index, records)`.
+/// Every full CPU and MEMW_R chunk (with `rows`, MEMW_A and LOAD chunk too)
+/// the run of `program` hands out as records, by windows of `window` cycles,
+/// from the hand-out of window `from` on and through `windows` windows walked
+/// (all of them: `None`): `(family, index, records)`.
 fn records_chunks(
     program: &Elf,
     input: &[u8],
     max_rows: &MaxRowsConfig,
     window: usize,
     (from, windows): (usize, Option<usize>),
+    rows: bool,
 ) -> Vec<(StreamTable, usize, Records)> {
     let mut builder = WindowedTraceBuilder::new(program, input, max_rows)
         .and_then(WindowedTraceBuilder::drop_streamed_ops)
         .and_then(|b| b.card_fill_streamed(always(), true, true))
+        .and_then(|b| {
+            if rows {
+                b.card_fill_streamed_rows(true, true)
+            } else {
+                Ok(b)
+            }
+        })
         .expect("the builder");
     let mut executor = Executor::new(program, input.to_vec()).expect("the executor starts");
     let mut held = Vec::new();
@@ -134,7 +142,7 @@ fn the_card_fills_cpu_and_memw_r_chunks_from_their_records_as_the_host_does() {
         let (program, _) = run(name);
         for window in [1, 7, 33] {
             for (table, index, records) in
-                records_chunks(&program, &[], &max_rows, window, (0, None))
+                records_chunks(&program, &[], &max_rows, window, (0, None), false)
             {
                 check(
                     &format!("{name}, window {window}, {table:?}[{index}]"),
@@ -147,13 +155,47 @@ fn the_card_fills_cpu_and_memw_r_chunks_from_their_records_as_the_host_does() {
     assert!(filled[0] > 0 && filled[1] > 0, "{filled:?}");
 }
 
+/// MEMW_A and LOAD chunks of four rows, so that the small programs fill
+/// several, their rows in one window part or many.
+#[test]
+fn the_card_fills_memw_a_and_load_chunks_from_their_rows_as_the_host_does() {
+    let max_rows = MaxRowsConfig {
+        memw_aligned: 1 << 2,
+        load: 1 << 2,
+        ..MaxRowsConfig::small()
+    };
+    // [MEMW_A, LOAD]: chunks filled, and those in more than one piece.
+    let mut filled = [[0usize; 2]; 2];
+    for name in ["test_keccak_multi", "all_loadstore_32", "test_blake3"] {
+        let (program, _) = run(name);
+        for window in [1, 7, 33] {
+            for (table, index, records) in
+                records_chunks(&program, &[], &max_rows, window, (0, None), true)
+            {
+                let (family, pieces) = match records.fill() {
+                    multilinear::records::RecordsFill::MemwA { rows } => (0, rows.len()),
+                    multilinear::records::RecordsFill::Load { ops } => (1, ops.len()),
+                    _ => continue,
+                };
+                check(
+                    &format!("{name}, window {window}, {table:?}[{index}]"),
+                    &records,
+                );
+                filled[family][0] += 1;
+                filled[family][1] += usize::from(pieces > 1);
+            }
+        }
+    }
+    assert!(filled.iter().all(|f| f[0] > 0 && f[1] > 0), "{filled:?}");
+}
+
 /// Among a wide table, a packed one and each other, the filled tables'
 /// columns sit where their widened columns would, and the others are as
 /// uploaded.
 #[test]
 fn the_card_fills_cpu_and_memw_r_in_place_among_a_groups_tables() {
     let (program, _) = run("test_keccak_multi");
-    let chunks = records_chunks(&program, &[], &MaxRowsConfig::small(), 7, (0, None));
+    let chunks = records_chunks(&program, &[], &MaxRowsConfig::small(), 7, (0, None), false);
     let cpu = &chunks
         .iter()
         .find(|(t, ..)| *t == StreamTable::Cpu)
@@ -243,7 +285,7 @@ fn a_cpu_log_at_a_pc_with_no_decode_row_declines_the_group() {
 fn two_cpu_columns_swapped_are_caught() {
     use std::sync::atomic::Ordering::Relaxed;
     let (program, _) = run("test_keccak_multi");
-    let chunks = records_chunks(&program, &[], &MaxRowsConfig::small(), 7, (0, None));
+    let chunks = records_chunks(&program, &[], &MaxRowsConfig::small(), 7, (0, None), false);
     let (_, index, cpu) = chunks
         .iter()
         .find(|(t, ..)| *t == StreamTable::Cpu)
@@ -277,7 +319,14 @@ fn the_card_fills_a_real_blocks_cpu_and_memw_r_chunks_as_the_host_does() {
     let options = crate::block_whir::BlockOptions::production();
     let window = 1usize << options.window_log2.expect("the block streams");
     let t = std::time::Instant::now();
-    let chunks = records_chunks(&program, &input, &options.max_rows, window, (64, Some(66)));
+    let chunks = records_chunks(
+        &program,
+        &input,
+        &options.max_rows,
+        window,
+        (64, Some(66)),
+        false,
+    );
     let cpu = chunks
         .iter()
         .find(|(t, i, _)| *t == StreamTable::Cpu && *i == 32)
@@ -345,4 +394,78 @@ fn the_card_fills_a_real_blocks_cpu_and_memw_r_chunks_as_the_host_does() {
     );
     println!("CARD FILL REAL absent pc at log {at}: declined by the card");
     println!("CARD FILL REAL VERDICT PASS");
+}
+
+/// The real block's first MEMW_A and LOAD chunks held as their rows, at the
+/// production height (each in the window parts of several windows), filled on
+/// the card as on the host.
+#[test]
+#[ignore = "card: a box test (BLOCK_WHIR_ELF, BLOCK_WHIR_INPUT)"]
+fn the_card_fills_a_real_blocks_memw_a_and_load_chunks_as_the_host_does() {
+    let elf =
+        std::fs::read(std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF")).expect("the ELF");
+    let input =
+        std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT")).expect("input");
+    let program = Elf::load(&elf).expect("the ELF loads");
+    let options = crate::block_whir::BlockOptions::production();
+    let window = 1usize << options.window_log2.expect("the block streams");
+    let t = std::time::Instant::now();
+    let mut builder = WindowedTraceBuilder::new(&program, &input, &options.max_rows)
+        .and_then(WindowedTraceBuilder::drop_streamed_ops)
+        .and_then(|b| b.card_fill_streamed(always(), false, false))
+        .and_then(|b| b.card_fill_streamed_rows(true, true))
+        .expect("the builder");
+    let mut executor = Executor::new(&program, input.clone()).expect("the executor starts");
+    let (mut walker, mut accumulator) = builder.split();
+    // The first chunk of each family: MEMW_A, LOAD.
+    let mut first: [Option<(StreamTable, usize, Records)>; 2] = [None, None];
+    let mut walked = 0usize;
+    let mut ahead: Option<Vec<Log>> = None;
+    while let Some(logs) = executor.resume_with_limit(window).expect("the run") {
+        if let Some(previous) = ahead.replace(logs.to_vec()) {
+            let w = walker.walk_owned(previous).expect("a window");
+            for job in accumulator.absorb(w) {
+                let (table, index) = (job.table, job.index);
+                let at = match table {
+                    StreamTable::MemwAligned => 0,
+                    StreamTable::Load => 1,
+                    _ => continue,
+                };
+                if first[at].is_some() || !job.is_records() {
+                    continue;
+                }
+                let mut chunk = job.generate();
+                first[at] = chunk
+                    .trace
+                    .take_records_main()
+                    .map(|records| (table, index, records));
+            }
+            walked += 1;
+        }
+        if first.iter().all(Option::is_some) {
+            break;
+        }
+    }
+    let [Some(memw_a), Some(load)] = first else {
+        panic!("{walked} windows walked: no MEMW_A or no LOAD chunk held as rows");
+    };
+    for (table, index, records) in [&memw_a, &load] {
+        let pieces = match records.fill() {
+            multilinear::records::RecordsFill::MemwA { rows } => rows.len(),
+            multilinear::records::RecordsFill::Load { ops } => ops.len(),
+            _ => 0,
+        };
+        println!(
+            "CARD FILL REAL ROWS capture_secs={:.2} windows={walked} {table:?}[{index}] rows={} pieces={pieces}",
+            t.elapsed().as_secs_f64(),
+            records.rows()
+        );
+        let t = std::time::Instant::now();
+        check(&format!("real {table:?}[{index}]"), records);
+        println!(
+            "CARD FILL REAL ROWS {table:?}[{index}] identity 0 words differ secs={:.2}",
+            t.elapsed().as_secs_f64()
+        );
+    }
+    println!("CARD FILL REAL ROWS VERDICT PASS");
 }

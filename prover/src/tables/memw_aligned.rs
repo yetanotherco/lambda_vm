@@ -96,7 +96,9 @@ pub mod cols {
 /// access's bytes share one old timestamp ([`MemwOperation`]'s
 /// `old_timestamp[0]`), and its eight value (old) elements fit one `u64`: eight
 /// bytes for a memory access, the two 32-bit register halves (the rest zero)
-/// for a register access that missed MEMW_R.
+/// for a register access that missed MEMW_R. `#[repr(C)]`: a chunk's rows are
+/// the records the card fills its MEMW_A table from ([`card_rows`]).
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct AlignedRow {
     base_address: u64,
@@ -196,6 +198,39 @@ impl AlignedRow {
         self.is_register
     }
 
+    /// A row of these fields, the value and old value packed as the row keeps
+    /// them (a test's: the walk makes its rows with [`Self::from_memw`]).
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        base_address: u64,
+        timestamp: u64,
+        old_timestamp: u64,
+        value: u64,
+        old: u64,
+        width: u8,
+        is_read: bool,
+        is_register: bool,
+    ) -> Self {
+        Self {
+            base_address,
+            timestamp,
+            old_timestamp,
+            value,
+            old,
+            width,
+            is_read,
+            is_register,
+        }
+    }
+
+    /// A test's fault: the same row, its timestamp `cycles` later.
+    #[cfg(test)]
+    pub(crate) fn later(mut self, cycles: u64) -> Self {
+        self.timestamp += cycles;
+        self
+    }
+
     /// [`MemwOperation::write_flags`].
     #[inline]
     pub(crate) fn write_flags(&self) -> (bool, bool, bool) {
@@ -209,6 +244,29 @@ impl AlignedRow {
 }
 
 const _: () = assert!(std::mem::size_of::<AlignedRow>() == 48);
+
+/// Aligned rows as the card's MEMW_A fill reads them
+/// (`multilinear::records::AlignedRow`): the same bytes.
+pub(crate) fn card_rows(rows: &[AlignedRow]) -> &[multilinear::records::AlignedRow] {
+    use multilinear::records::AlignedRow as Card;
+    use std::mem::{align_of, offset_of, size_of};
+    const _: () = {
+        assert!(size_of::<AlignedRow>() == size_of::<Card>());
+        assert!(align_of::<AlignedRow>() == align_of::<Card>());
+        assert!(offset_of!(AlignedRow, base_address) == offset_of!(Card, base_address));
+        assert!(offset_of!(AlignedRow, timestamp) == offset_of!(Card, timestamp));
+        assert!(offset_of!(AlignedRow, old_timestamp) == offset_of!(Card, old_timestamp));
+        assert!(offset_of!(AlignedRow, value) == offset_of!(Card, value));
+        assert!(offset_of!(AlignedRow, old) == offset_of!(Card, old));
+        assert!(offset_of!(AlignedRow, width) == offset_of!(Card, width));
+        assert!(offset_of!(AlignedRow, is_read) == offset_of!(Card, is_read));
+        assert!(offset_of!(AlignedRow, is_register) == offset_of!(Card, is_register));
+    };
+    // SAFETY: both are `#[repr(C)]` with the same fields in the same order
+    // (asserted above); the flags are `bool`s, 0 or 1, read as `u8`s, and no
+    // reader looks at the padding after them.
+    unsafe { std::slice::from_raw_parts(rows.as_ptr() as *const Card, rows.len()) }
+}
 
 #[cfg(test)]
 pub(crate) fn generate_memw_aligned_trace(

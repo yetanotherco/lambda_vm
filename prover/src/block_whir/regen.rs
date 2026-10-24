@@ -1669,8 +1669,9 @@ pub(crate) fn run_live(
                             let (table, index) = (job.table, job.index);
                             // A chunk dropped as its records is rebuilt as
                             // them too: their digest checks its deposit.
+                            let as_records = guard.slot.is_records();
                             let built = catch_unwind(AssertUnwindSafe(|| {
-                                let (records, chunk) = job.regenerate(form);
+                                let (records, chunk) = job.regenerate(form, as_records);
                                 let mut trace = chunk.trace;
                                 if trace.narrow_main().is_none() {
                                     trace.pack_main_narrow();

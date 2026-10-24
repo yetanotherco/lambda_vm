@@ -73,7 +73,9 @@ pub mod cols {
 // Trace generation
 // =========================================================================
 
-/// A single LOAD operation to be added to the trace.
+/// A single LOAD operation to be added to the trace. `#[repr(C)]`: a chunk's
+/// ops are the records the card fills its LOAD table from ([`card_ops`]).
+#[repr(C)]
 #[derive(Debug, Clone)]
 pub struct LoadOperation {
     /// Base address (64-bit)
@@ -90,6 +92,26 @@ pub struct LoadOperation {
 
 // The walk keeps one per load: keep it at 32 bytes.
 const _: () = assert!(std::mem::size_of::<LoadOperation>() == 32);
+
+/// LOAD ops as the card's LOAD fill reads them (`multilinear::records::LoadOp`):
+/// the same bytes.
+pub(crate) fn card_ops(ops: &[LoadOperation]) -> &[multilinear::records::LoadOp] {
+    use multilinear::records::LoadOp;
+    use std::mem::{align_of, offset_of, size_of};
+    const _: () = {
+        assert!(size_of::<LoadOperation>() == size_of::<LoadOp>());
+        assert!(align_of::<LoadOperation>() == align_of::<LoadOp>());
+        assert!(offset_of!(LoadOperation, base_address) == offset_of!(LoadOp, base_address));
+        assert!(offset_of!(LoadOperation, timestamp) == offset_of!(LoadOp, timestamp));
+        assert!(offset_of!(LoadOperation, width) == offset_of!(LoadOp, width));
+        assert!(offset_of!(LoadOperation, signed) == offset_of!(LoadOp, signed));
+        assert!(offset_of!(LoadOperation, res) == offset_of!(LoadOp, res));
+    };
+    // SAFETY: both are `#[repr(C)]` with the same fields in the same order
+    // (asserted above); `signed` is a `bool`, 0 or 1, read as a `u8`, and no
+    // reader looks at the padding after `res`.
+    unsafe { std::slice::from_raw_parts(ops.as_ptr() as *const LoadOp, ops.len()) }
+}
 
 impl LoadOperation {
     /// Create a new LOAD operation.
