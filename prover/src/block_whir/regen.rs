@@ -379,14 +379,29 @@ fn gib_knob(var: &str, default: f64) -> u64 {
     (gib * GIB) as u64
 }
 
+/// The regenerators' generator threads when nothing is set.
+///
+/// With 3, the large block on a 118 GiB host (92.36 GiB dropped) kept phase B
+/// waiting 1.4-2.2 s for the rest's tables; with 6 it never waited, and the
+/// whole block took 1.44 s less with the argue's round slot on (RTX 5090,
+/// Ryzen 9950X). The median drops nothing and does not move.
+pub(crate) const REGEN_GENERATORS: usize = 6;
+
 /// Generator threads of the regenerator: `LAMBDA_VM_BLOCK_REGEN_GENERATORS`
-/// (1..=16), unset 3 (#1013's).
+/// (1..=16), unset [`REGEN_GENERATORS`].
 pub(crate) fn regen_generators() -> usize {
-    std::env::var("LAMBDA_VM_BLOCK_REGEN_GENERATORS")
-        .ok()
+    parse_generators(
+        std::env::var("LAMBDA_VM_BLOCK_REGEN_GENERATORS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_generators(value: Option<&str>) -> usize {
+    value
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| (1..=16).contains(n))
-        .unwrap_or(3)
+        .unwrap_or(REGEN_GENERATORS)
 }
 
 /// Packed columns' shape and digest ([`stark::regen::digest_of`], the spill
@@ -2880,6 +2895,20 @@ mod tests {
         assert_eq!(parse_lead(Some("65")), REGEN_LEAD);
         assert_eq!(parse_lead(Some("-1")), REGEN_LEAD);
         assert_eq!(parse_lead(Some("many")), REGEN_LEAD);
+    }
+
+    /// `LAMBDA_VM_BLOCK_REGEN_GENERATORS`: a count from 1 to 16, else the
+    /// default, 6.
+    #[test]
+    fn the_generators_read_their_knob() {
+        assert_eq!(REGEN_GENERATORS, 6);
+        assert_eq!(parse_generators(None), REGEN_GENERATORS);
+        assert_eq!(parse_generators(Some("1")), 1);
+        assert_eq!(parse_generators(Some(" 3 ")), 3);
+        assert_eq!(parse_generators(Some("16")), 16);
+        for bad in ["", "0", "17", "-1", "many"] {
+            assert_eq!(parse_generators(Some(bad)), REGEN_GENERATORS, "{bad:?}");
+        }
     }
 
     /// While the finish runs the early window keeps its frontier whatever the
