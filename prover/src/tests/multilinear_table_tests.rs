@@ -218,18 +218,25 @@ fn a_broken_eq_row_is_rejected() {
 }
 
 /// The multiplicity column is what the buses weigh by, so perturbing it moves
-/// the table's share of the bus — the quantity a multi-table proof sums.
+/// the table's share of the bus — the quantity a multi-table proof sums. EQ
+/// does not deduplicate and constrains μ to a bit, so the perturbation that
+/// still argues takes a row's μ from 1 to 0; a μ of 2 is refused.
 #[test]
 fn the_multiplicity_column_moves_the_bus_share() {
     let trace = generate_eq_trace(&eq_operations());
     let honest = argue_eq(trace.columns_main()).unwrap();
 
     let mut columns = trace.columns_main();
-    columns[eq::cols::MU][1] += FieldElement::<Fp>::one();
+    assert_eq!(columns[eq::cols::MU][1], FieldElement::<Fp>::one());
+    columns[eq::cols::MU][1] = FieldElement::<Fp>::zero();
     let tampered = argue_eq(columns).unwrap();
 
     let share = |(p, q): (ExtE, ExtE)| p * q.inv().unwrap();
     assert_ne!(share(honest), share(tampered));
+
+    let mut columns = trace.columns_main();
+    columns[eq::cols::MU][1] += FieldElement::<Fp>::one();
+    assert!(argue_eq(columns).is_err(), "a μ of 2 is not a bit");
 }
 
 // ---------------------------------------------------------------
