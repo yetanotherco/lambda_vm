@@ -190,6 +190,24 @@ impl RegRow {
     }
 }
 
+#[cfg(test)]
+impl RegRow {
+    /// The row as the card's MEMW_R fill reads it, field for field.
+    pub(crate) fn card_record(&self) -> math_cuda::fill::RegRowC {
+        math_cuda::fill::RegRowC {
+            timestamp: self.timestamp,
+            val0: self.val0,
+            val1: self.val1,
+            old0: self.old0,
+            old1: self.old1,
+            old_ts_lo: self.old_ts_lo,
+            address: self.address,
+            is_read: u8::from(self.is_read),
+            pad: 0,
+        }
+    }
+}
+
 /// Generates the MEMW_R trace table from register operations.
 ///
 /// Thin wrapper over [`generate_memw_register_trace_from_rows`] (via

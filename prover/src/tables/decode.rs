@@ -212,6 +212,19 @@ pub struct DecodeTable {
     runs: Vec<(u64, u32, u32)>,
 }
 
+#[cfg(test)]
+impl DecodeTable {
+    /// The entries, in pc order: entry `r` is DECODE row `r`.
+    pub(crate) fn entries(&self) -> &[DecodeEntry] {
+        &self.entries
+    }
+
+    /// The runs of pcs 4 apart, ascending: `(first pc, its row, number of pcs)`.
+    pub(crate) fn runs(&self) -> &[(u64, u32, u32)] {
+        &self.runs
+    }
+}
+
 impl DecodeTable {
     /// The table of `instructions`, each decoded as the DECODE trace decodes
     /// it (length 4).

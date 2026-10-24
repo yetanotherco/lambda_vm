@@ -57,6 +57,10 @@ pub mod store;
 pub mod trace_builder;
 pub mod trace_hash;
 
+/// The card fill's records, synthetic sets and host known-answer vectors.
+#[cfg(test)]
+mod card_fill_inputs;
+
 pub use types::BusId;
 
 /// Blowup factors for which we ship static preprocessed-table commitments
