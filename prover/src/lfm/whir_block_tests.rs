@@ -1517,8 +1517,11 @@ fn a_stopped_node_builder_fails_every_empty_slot() {
 /// [`build_levels`] over a toy tree whose programs are their texts (`L3` a
 /// leaf, `N(..)` / `T(..)` a node over its children's): each node's build
 /// sleeps longer the earlier it is in its level, so on a pool the level's
-/// nodes finish in reverse. Returns every slot's content and the order the
-/// builds finished in.
+/// nodes tend to finish in reverse. On a pool, each even node of level 0
+/// finishes only after the odd node after it: the sleeps alone do not order
+/// them, since a sleep can overrun the 4 ms between two neighbours (on a
+/// loaded macOS host a 28 ms sleep took 38 ms, and the level then finished in
+/// order). Returns every slot's content and the order the builds finished in.
 #[allow(clippy::type_complexity)]
 fn toy_tree(
     leaves: usize,
@@ -1545,6 +1548,11 @@ fn toy_tree(
         .map(|l| l.arities.iter().map(|_| Published::new()).collect())
         .collect();
     let finished = std::sync::Mutex::new(Vec::new());
+    // Level 0's builds that have finished, for the even nodes to wait on.
+    let done = (
+        std::sync::Mutex::new(vec![false; shape[0].arities.len()]),
+        std::sync::Condvar::new(),
+    );
     let pool = threads.map(|n| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
@@ -1562,7 +1570,27 @@ fn toy_tree(
         |lv, j, kids: &[&String], top, ()| {
             let late = shape[lv].arities.len() - j;
             std::thread::sleep(std::time::Duration::from_millis(4 * late as u64));
-            finished.lock().expect("the log").push((lv, j));
+            if lv == 0 {
+                let (marks, landed) = &done;
+                let mut marks = marks.lock().expect("the marks");
+                // Its odd neighbour is handed out next, to another thread, and
+                // never waits: no two even nodes wait at once. Bounded, so a
+                // neighbour that never comes fails the order check, not the
+                // run.
+                if threads.is_some() && j % 2 == 0 && j + 1 < marks.len() {
+                    marks = landed
+                        .wait_timeout_while(marks, std::time::Duration::from_secs(10), |m| {
+                            !m[j + 1]
+                        })
+                        .expect("the marks")
+                        .0;
+                }
+                finished.lock().expect("the log").push((lv, j));
+                marks[j] = true;
+                landed.notify_all();
+            } else {
+                finished.lock().expect("the log").push((lv, j));
+            }
             if fail_at == Some((lv, j)) {
                 return Err(format!("node ({lv}, {j}) does not build"));
             }
