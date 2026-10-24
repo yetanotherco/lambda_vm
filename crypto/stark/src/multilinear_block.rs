@@ -384,6 +384,10 @@ struct Parked {
 
 enum ParkedState {
     Resident(multilinear::narrow::NarrowColumns),
+    /// A table held as the records its rows come from
+    /// ([`multilinear::records`]): live regeneration drops it as them, into a
+    /// records slot ([`RegenWindow::slot_for_records`]).
+    ResidentRecords(multilinear::records::Records),
     Spilled(SpilledMain),
     /// Dropped after its digest: phase B's regenerator deposits it again.
     Dropped(RegenSlot),
@@ -780,6 +784,9 @@ pub struct DropReport {
     /// and the budget arming used, in main cells committed.
     pub keep_below: Option<u64>,
     pub budget: Option<u64>,
+    /// Of `tables` and `bytes`, those dropped as the records their rows come
+    /// from (their records' bytes).
+    pub records: (usize, u64),
 }
 
 /// One class's regeneration for phase B ([`BlockRegen::into_plan`]): its
@@ -1162,6 +1169,7 @@ impl BlockRegen {
                 c.1 += bytes;
             }
         }
+        let records = state.dropped.iter().filter(|d| d.1.is_records());
         DropReport {
             armed: state.armed,
             tables: state.dropped.len(),
@@ -1177,6 +1185,7 @@ impl BlockRegen {
             keep_back: state.keep_back,
             keep_below: self.keep_below.filter(|_| self.partial),
             budget: state.budget,
+            records: (records.clone().count(), records.map(|d| d.2).sum()),
         }
     }
 
@@ -1221,19 +1230,26 @@ fn drop_parked(
     rank: u64,
     mem: Option<&BlockMem>,
 ) -> Option<RegenSlot> {
-    let packed = {
+    let held = {
         let mut state = parked.state.lock().unwrap_or_else(|e| e.into_inner());
         match std::mem::replace(&mut *state, ParkedState::Lost) {
-            ParkedState::Resident(packed) => packed,
+            held @ (ParkedState::Resident(_) | ParkedState::ResidentRecords(_)) => held,
             other => {
                 *state = other;
                 return None;
             }
         }
     };
-    let slot = window.slot(&packed, rank);
-    let len = packed.data().len();
-    drop(packed);
+    // Records are digested as they lie; their slot takes the packed columns
+    // the regenerator makes from records it rebuilt.
+    let (slot, len) = match &held {
+        ParkedState::Resident(packed) => (window.slot(packed, rank), packed.data().len()),
+        ParkedState::ResidentRecords(records) => {
+            (window.slot_for_records(records, rank), records.bytes())
+        }
+        _ => return None,
+    };
+    drop(held);
     *parked.state.lock().unwrap_or_else(|e| e.into_inner()) = ParkedState::Dropped(slot.clone());
     if let Some(mem) = mem {
         mem.held_narrow.fetch_sub(len, Relaxed);
@@ -1282,10 +1298,11 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    // A group's tables drop in one class only ([`drop_one_class`]).
+    // A group's tables drop in one class only ([`drop_one_class`]). A table
+    // held as its records drops as them, and is kept where it has no rank.
     let mut ranks: Vec<Option<(usize, u64)>> = (0..tables.len())
         .map(|k| {
-            tables[k].narrow()?;
+            tables[k].compact_bytes()?;
             spill.regen.as_ref()?.rank_of(first + k)
         })
         .collect();
@@ -1304,11 +1321,13 @@ where
     for (k, (table, slot)) in tables.iter_mut().zip(out.iter_mut()).enumerate() {
         let table_cells = (table.num_committed_columns() as u64) << table.num_vars();
         let cells = spill.cells.fetch_add(table_cells, Relaxed) + table_cells;
-        let Some(len) = table.narrow().map(|packed| packed.data().len()) else {
+        let Some(len) = table.compact_bytes() else {
             continue;
         };
         let rank = ranks[k];
-        if g < SPILL_RESIDENT_GROUPS && rank.is_none() {
+        // Records never go to the store: without a rank they stay.
+        let records = table.records().is_some();
+        if (g < SPILL_RESIDENT_GROUPS || records) && rank.is_none() {
             spill.kept.fetch_add(len as u64, Relaxed);
             continue;
         }
@@ -1316,13 +1335,17 @@ where
             table: first + k,
             reason: "its packed parts did not move to the store and back",
         };
-        let packed = table.take_narrow_for_spill().ok_or_else(failed)?;
         if let (Some(regen), Some(_)) = (&spill.regen, rank) {
+            let held = if records {
+                ParkedState::ResidentRecords(table.take_records_for_spill().ok_or_else(failed)?)
+            } else {
+                ParkedState::Resident(table.take_narrow_for_spill().ok_or_else(failed)?)
+            };
             let parked = Arc::new(Parked {
                 len: len as u64,
                 cells,
                 rank,
-                state: std::sync::Mutex::new(ParkedState::Resident(packed)),
+                state: std::sync::Mutex::new(held),
             });
             *slot = Some(Out::Parked(Arc::clone(&parked)));
             let wanted =
@@ -1347,6 +1370,7 @@ where
             regen.parked(parked);
             continue;
         }
+        let packed = table.take_narrow_for_spill().ok_or_else(failed)?;
         let spill_now = spill.store.is_some()
             && (spill.wanted)(spill.kept.load(Relaxed), cells, len as u64)
             && !spill.handing.load(std::sync::atomic::Ordering::SeqCst)
@@ -1420,6 +1444,15 @@ where
                             return Err(MlError::SpillFailed {
                                 table: index,
                                 reason: "the parked columns do not have the table's shape",
+                            });
+                        }
+                        continue;
+                    }
+                    ParkedState::ResidentRecords(records) => {
+                        if !table.restore_records(records) {
+                            return Err(MlError::SpillFailed {
+                                table: index,
+                                reason: "the parked records do not have the table's shape",
                             });
                         }
                         continue;
@@ -4275,6 +4308,80 @@ mod spill_tests {
         let (order, _, report) = run(None, None, true);
         assert!(order.is_empty());
         assert_eq!((report.budget, report.keep_below), (None, None));
+    }
+
+    /// ★ A parked table held as its records drops as them: its slot keeps the
+    /// records' digest and shape and takes only a checked deposit, the drop
+    /// report counts it among the records, and a records table not dropped
+    /// leaves its parking as it came.
+    #[test]
+    fn a_parked_records_table_drops_as_its_records() {
+        use super::{BlockRegen, Parked, ParkedState, RankDecision, drop_parked};
+        use multilinear::records::{KeccakRndOp, Records, RecordsFill, TableRecords};
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct Ops(Vec<KeccakRndOp>);
+        impl TableRecords for Ops {
+            fn rows(&self) -> usize {
+                1024
+            }
+            fn cols(&self) -> usize {
+                2
+            }
+            fn fill(&self) -> RecordsFill<'_> {
+                RecordsFill::KeccakRnd {
+                    ops: &self.0,
+                    skip: 0,
+                }
+            }
+            fn host_fill(&self) -> Option<NarrowColumns> {
+                None
+            }
+        }
+        let records = |seed: u64| {
+            Records(Arc::new(Ops(vec![
+                KeccakRndOp {
+                    timestamp: seed,
+                    input: [seed; 25],
+                };
+                3
+            ])))
+        };
+        let held = records(5);
+        let parked = Arc::new(Parked {
+            len: held.bytes() as u64,
+            rank: Some((0, 4)),
+            state: std::sync::Mutex::new(ParkedState::ResidentRecords(held.clone())),
+        });
+        let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30], true);
+        let _producer = regen.take_producer(0);
+        regen.parked(Arc::clone(&parked));
+        let RankDecision::Dropped(slot) = regen.await_rank(0, 4).0 else {
+            panic!("dropped");
+        };
+        assert!(slot.is_records());
+        assert_eq!(
+            (slot.digest(), slot.rows(), slot.cols()),
+            (held.digest(), 1024, 2)
+        );
+        assert!(parked.dropped().is_some(), "its slot in its place");
+        let words: Vec<u64> = (0..2 * 1024u64).map(|i| i * 7919 % 50_000).collect();
+        let packed = NarrowColumns::pack_row_major(&words, 2).expect("packs");
+        slot.deposit_checked(packed, records(5).digest())
+            .expect("columns from the same records");
+        regen.close_drops();
+        let report = regen.report();
+        assert_eq!(
+            (report.tables, report.records),
+            (1, (1, held.bytes() as u64))
+        );
+        // Not dropped: a second drop of the same parking finds nothing held.
+        let window = &regen.windows()[0];
+        assert!(
+            drop_parked(window, &parked, 4, None).is_none(),
+            "dropped once"
+        );
     }
 
     /// The rebuilt groups go last, each set in group order; nothing rebuilt is
