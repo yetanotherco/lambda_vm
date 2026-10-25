@@ -1584,12 +1584,31 @@ pub fn backend_entries() -> u64 {
 ///
 /// Returns `Err` when CUDA initialisation fails (no driver, no GPU, PTX load
 /// failure). Initialisation is retried on the next call until one succeeds —
-/// only a successful `Backend` is cached. The race window where two threads
-/// init concurrently is harmless: at most one extra `Backend::init()` runs
-/// and the loser is dropped.
+/// only a successful `Backend` is cached. One initialisation runs at a time:
+/// a caller that finds another initialising waits for it rather than
+/// building a second context.
 pub fn backend() -> Result<&'static Backend> {
     BACKEND_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    backend_once()
+}
+
+/// Sets the backend up ahead of its first use ([`backend`]), without counting
+/// as a device entry: a prove that will reach the card starts it as the
+/// prove starts, on a thread of its own, so its first upload does not wait for
+/// the context, the modules and the staging pools. A failure is left for the
+/// first use to meet.
+pub fn set_up_backend() {
+    let _ = backend_once();
+}
+
+/// [`backend`] without the entry count.
+fn backend_once() -> Result<&'static Backend> {
     static BACKEND: OnceLock<Backend> = OnceLock::new();
+    static INIT: Mutex<()> = Mutex::new(());
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    let _init = INIT.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(b) = BACKEND.get() {
         return Ok(b);
     }

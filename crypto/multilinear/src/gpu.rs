@@ -1052,6 +1052,16 @@ pub fn ledger_reserved() -> u64 {
     0
 }
 
+/// Sets the device up ahead of its first use, without counting as a device
+/// entry ([`math_cuda::device::set_up_backend`]); nothing without a device.
+#[cfg(feature = "cuda")]
+pub fn set_up_device() {
+    math_cuda::device::set_up_backend();
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn set_up_device() {}
+
 /// What the ledger may promise in all; 0 without a device.
 #[cfg(feature = "cuda")]
 pub fn reserve_budget() -> u64 {

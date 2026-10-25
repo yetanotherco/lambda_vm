@@ -1263,6 +1263,33 @@ fn block_p4_rows() -> Result<P4Rows, Error> {
     parse_p4_rows(std::env::var("LAMBDA_VM_BLOCK_P4_ROWS").ok().as_deref())
 }
 
+/// `LAMBDA_VM_BLOCK_CARD_EARLY`: `1` sets the card up (its context, its
+/// modules and its staging pools) on a thread of its own as the streamed prove
+/// starts, so the first group's upload does not wait for it; unset, empty or
+/// `0` (the default) sets it up at the card's first use, as before. Anything
+/// else refuses the prove. The proof is the same.
+fn block_card_early() -> Result<bool, Error> {
+    parse_card_early(std::env::var("LAMBDA_VM_BLOCK_CARD_EARLY").ok().as_deref())
+}
+
+fn parse_card_early(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_BLOCK_CARD_EARLY={v}: 1 (the card set up as the prove starts) or 0"
+        ))),
+    }
+}
+
+/// The card's setup on a thread of its own ([`block_card_early`]); nothing
+/// without the card's kernels.
+fn set_up_card() {
+    if cfg!(feature = "cuda") {
+        std::thread::spawn(multilinear::gpu::set_up_device);
+    }
+}
+
 /// How the finish counts the per-row lookups ([`block_p4_rows`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum P4Rows {
@@ -5122,6 +5149,9 @@ fn prove_streamed(
     let commit_config = format.chain_config(&[]);
     let cap = commit_config.format.stack;
     let start = Instant::now();
+    if block_card_early()? {
+        set_up_card();
+    }
     // A memory log (`BlockOptions::memlog`): its sampler runs until the
     // function returns.
     let logged = options.memlog.then(|| memlog::Ledger::new(start));
@@ -8398,7 +8428,7 @@ mod air_input_tests {
 
 #[cfg(test)]
 mod p4_rows_knob_tests {
-    use super::{P4Rows, parse_p4_rows};
+    use super::{P4Rows, parse_card_early, parse_p4_rows};
 
     /// `LAMBDA_VM_BLOCK_P4_ROWS`: unset, empty or `pool` counts the per-row
     /// lookups on the pool (the default); `off` does not; any other word
@@ -8418,6 +8448,22 @@ mod p4_rows_knob_tests {
         }
         for value in ["1", "on", "POOL", "pools", "rows", "part", "PARTS"] {
             assert!(parse_p4_rows(Some(value)).is_err(), "{value}");
+        }
+    }
+
+    /// `LAMBDA_VM_BLOCK_CARD_EARLY`: off unless `1`; any other word refuses.
+    #[test]
+    fn the_card_early_knob_is_off_by_default_and_on_at_1() {
+        for (value, on) in [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some(" 1 "), true),
+        ] {
+            assert_eq!(parse_card_early(value).ok(), Some(on), "{value:?}");
+        }
+        for value in ["on", "true", "2", "yes"] {
+            assert!(parse_card_early(Some(value)).is_err(), "{value}");
         }
     }
 }
