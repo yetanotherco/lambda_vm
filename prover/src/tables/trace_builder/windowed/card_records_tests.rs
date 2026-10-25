@@ -332,6 +332,54 @@ fn only_a_whole_table_is_held_as_records() {
     assert!(RegisterRowRecords::new(Segments::one(vec![row; 8])).is_ok());
 }
 
+/// ★ A CPU chunk held as its logs is laid out for the CPU AIR the block lays a
+/// streamed chunk out with: the records declare the preprocessed TIMESTAMP
+/// column the fill writes from the row index, so the layout's check of it
+/// passes. A MEMW_R chunk declares none, as its AIR has none.
+#[test]
+fn records_chunks_are_laid_out_for_their_tables_airs() {
+    use super::Segments;
+    use super::card_records::{CardDecode, CpuLogRecords, RegisterRowRecords};
+    use crate::tables::cpu;
+    use crate::test_utils::{create_cpu_air, create_memw_register_air};
+    use multilinear::records::{Records, TableRecords};
+    use stark::proof::options::ProofOptions;
+
+    let (program, logs) = run("all_instructions_64");
+    let builder =
+        WindowedTraceBuilder::new(&program, &[], &MaxRowsConfig::small()).expect("the builder");
+    let decode = Arc::new(CardDecode::new(Arc::clone(&builder.decode)).expect("a program"));
+    let opts = ProofOptions::default_test_options();
+    let height = 32usize;
+    let cpu_air = create_cpu_air(&opts, 0).with_lazy_preprocessed_columns(
+        cpu::lazy_timestamp_commitment(&opts, height),
+        cpu::NUM_PRECOMPUTED_COLS,
+        Arc::new(move || vec![cpu::timestamp_column(height)]),
+    );
+    type Air = dyn stark::traits::AIR<
+            Field = GoldilocksField,
+            FieldExtension = crate::tables::types::GoldilocksExtension,
+            PublicInputs = (),
+        >;
+    let lay_out = |records: Records, air: &Air| {
+        let cols = records.cols();
+        let rows = records.rows();
+        let mut trace = Table::try_from_records_main(records, 1).expect("a records trace");
+        crate::block_whir::table_of_records(air, &mut trace, (cols, rows.trailing_zeros() as usize))
+            .map(|_| ())
+    };
+    let cpu_records = CpuLogRecords::new(Segments::one(logs[..height].to_vec()), 0, decode)
+        .expect("a whole table");
+    assert_eq!(cpu_records.row_index_columns(), cpu::NUM_PRECOMPUTED_COLS);
+    lay_out(Records(Arc::new(cpu_records)), &cpu_air).expect("CPU laid out");
+    let row = crate::tables::memw_register::RegRow::new(0, 9, 0, 0, 0, 0, 8, false);
+    let Ok(memw_r) = RegisterRowRecords::new(Segments::one(vec![row; 8])) else {
+        panic!("8 rows are a whole table");
+    };
+    assert_eq!(memw_r.row_index_columns(), 0);
+    lay_out(Records(Arc::new(memw_r)), &create_memw_register_air(&opts)).expect("MEMW_R laid out");
+}
+
 /// The card's DECODE rows find every pc's row as the host's table does, and
 /// no row for a pc the program has none at.
 #[test]

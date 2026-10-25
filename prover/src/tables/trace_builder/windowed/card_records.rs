@@ -120,6 +120,12 @@ impl TableRecords for CpuLogRecords {
         self.logs.op_bytes()
     }
 
+    /// TIMESTAMP, `4·(row + 1)`: the fill writes it from the row index, as the
+    /// CPU table's preprocessed column.
+    fn row_index_columns(&self) -> usize {
+        cpu::NUM_PRECOMPUTED_COLS
+    }
+
     /// The CPU ops the walk made of these logs, filled as the host fills a
     /// streamed CPU chunk. `None` when a log's pc has no DECODE row (the walk
     /// refused it already) or a cycle is past the clock's range.
