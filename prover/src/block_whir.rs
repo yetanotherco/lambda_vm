@@ -833,17 +833,28 @@ const KEEP_CELLS_ENV: &str = "LAMBDA_VM_BLOCK_KEEP_CELLS_G";
 /// arms, the tables phase B can rebuild that were committed in the last that
 /// many cells before it are dropped back, in rank order. The arming point
 /// moves between runs (the host's reading when the forecast crosses), and the
-/// budget moves with it. Unset, empty or `off`: none. Anything else refuses
-/// the prove. The proof is the same.
+/// budget moves with it. Unset or empty: [`BLOCK_KEEP_BELOW`] (the default); a
+/// G-cell count above 0: that margin; `off`: none, arming drops back nothing
+/// (the rollback). Anything else refuses the prove. The proof is the same.
 fn block_keep_below() -> Result<Option<u64>, Error> {
     parse_keep_below(std::env::var(KEEP_BELOW_ENV).ok().as_deref())
 }
 
 const KEEP_BELOW_ENV: &str = "LAMBDA_VM_BLOCK_KEEP_BACK_G";
 
+/// Partial drops' keep budget relative to the arming point by default, in main
+/// cells below those committed at arming ([`block_keep_below`]): about what
+/// the streamed layout eight chunks ahead commits before arming beyond what it
+/// does six ahead (1.08 and 1.34 G cells in two runs of the large block), so a
+/// phase A that commits sooner keeps no more through phase B than it would
+/// have, wherever the run arms. A block that never arms (the median) is
+/// untouched.
+pub const BLOCK_KEEP_BELOW: u64 = 1_300_000_000;
+
 fn parse_keep_below(value: Option<&str>) -> Result<Option<u64>, Error> {
     match value.map(str::trim) {
-        None | Some("" | "off") => Ok(None),
+        None | Some("") => Ok(Some(BLOCK_KEEP_BELOW)),
+        Some("off") => Ok(None),
         Some(v) => v
             .parse::<f64>()
             .ok()
@@ -7764,8 +7775,8 @@ mod drop_tests {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
     use super::{
-        DROP_PURGE_BYTES, DropMode, DropPurges, HostReading, decision_bytes, parse_drop,
-        parse_keep_below, parse_keep_cells,
+        BLOCK_KEEP_BELOW, DROP_PURGE_BYTES, DropMode, DropPurges, HostReading, decision_bytes,
+        parse_drop, parse_keep_below, parse_keep_cells,
     };
     use crate::alloc_purge::Purge;
 
@@ -7814,14 +7825,21 @@ mod drop_tests {
         }
     }
 
-    /// `LAMBDA_VM_BLOCK_KEEP_BACK_G`: unset, empty or `off` is no budget
-    /// relative to the arming point; a G-cell count above 0 is the margin in
-    /// main cells; any other word refuses.
+    /// `LAMBDA_VM_BLOCK_KEEP_BACK_G`: unset or empty is the default margin,
+    /// 1.3 G cells below the arming point; `off` is none (the rollback); a
+    /// G-cell count above 0 is that margin in main cells; any other word
+    /// refuses.
     #[test]
-    fn the_relative_keep_budget_is_off_by_default_and_takes_g_cells_above_0() {
-        for value in [None, Some(""), Some(" off ")] {
-            assert_eq!(parse_keep_below(value).ok(), Some(None), "{value:?}");
+    fn the_relative_keep_budget_defaults_to_1_3_g_cells_and_off_rolls_back() {
+        assert_eq!(BLOCK_KEEP_BELOW, 1_300_000_000);
+        for value in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                parse_keep_below(value).ok(),
+                Some(Some(BLOCK_KEEP_BELOW)),
+                "{value:?}"
+            );
         }
+        assert_eq!(parse_keep_below(Some(" off ")).ok(), Some(None));
         for (value, cells) in [("1.3", 1_300_000_000u64), (" 2 ", 2_000_000_000)] {
             assert_eq!(
                 parse_keep_below(Some(value)).ok(),
