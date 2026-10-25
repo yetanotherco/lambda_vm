@@ -1151,13 +1151,14 @@ fn parse_card_fill(value: Option<&str>) -> Result<bool, Error> {
 /// measured on the largest blocks.
 const MAX_WALKERS: usize = 4;
 
-/// `LAMBDA_VM_BLOCK_WALKERS`: unset, empty or `0` walks the run's windows on
-/// one thread (the default); `1` to [`MAX_WALKERS`] walks them on that many
-/// threads, each window from the bytes it touches as they stood before it
-/// ([`parallel::walk_windows`]). The tables and their order are the same.
-/// Anything else refuses the prove, and so do walkers with the executor's
-/// words store (`LAMBDA_VM_EXEC_MEMORY=words`), whose every window's snapshot
-/// copies the whole map.
+/// `LAMBDA_VM_BLOCK_WALKERS`: unset or empty walks the run's windows on
+/// [`MAX_WALKERS`] threads (the default), each window from the bytes it
+/// touches as they stood before it ([`parallel::walk_windows`]); `1` to
+/// [`MAX_WALKERS`] on that many; `0` on one thread, the walk before the
+/// walkers (the rollback). The tables and their order are the same. Anything
+/// else refuses the prove, and so does a count with the executor's words
+/// store (`LAMBDA_VM_EXEC_MEMORY=words`), whose every window's snapshot copies
+/// the whole map; with that store, unset walks on one thread.
 fn block_walkers() -> Result<usize, Error> {
     parse_walkers(
         std::env::var("LAMBDA_VM_BLOCK_WALKERS").ok().as_deref(),
@@ -1171,7 +1172,9 @@ fn parse_walkers(
     store: executor::vm::memory::StoreKind,
 ) -> Result<usize, Error> {
     let walkers = match value.map(str::trim) {
-        None | Some("" | "0") => return Ok(0),
+        None | Some("") if store == executor::vm::memory::StoreKind::Words => return Ok(0),
+        None | Some("") => return Ok(MAX_WALKERS),
+        Some("0") => return Ok(0),
         Some(v) => v
             .parse::<usize>()
             .ok()
@@ -7140,14 +7143,16 @@ mod walkers_knob_tests {
 
     use super::{Error, parse_card_fill, parse_walkers};
 
-    /// `LAMBDA_VM_BLOCK_WALKERS`: unset, empty or 0 is one walker (the
-    /// default path); 1 to 4 that many; any other word refuses the prove, and
-    /// so do walkers with the executor's words store.
+    /// `LAMBDA_VM_BLOCK_WALKERS`: unset or empty is four walkers (the
+    /// default); 0 one walker (the rollback); 1 to 4 that many; any other
+    /// word refuses the prove, and so does a count with the executor's words
+    /// store, with which unset is one walker.
     #[test]
-    fn the_walkers_knob_takes_0_to_4_and_refuses_anything_else() {
+    fn the_walkers_knob_defaults_to_4_takes_0_to_4_and_refuses_anything_else() {
         for (value, walkers) in [
-            (None, 0),
-            (Some(""), 0),
+            (None, 4),
+            (Some(""), 4),
+            (Some(" "), 4),
             (Some("0"), 0),
             (Some("1"), 1),
             (Some(" 3 "), 3),
