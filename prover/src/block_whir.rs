@@ -1117,6 +1117,17 @@ fn spill_wanted(
 }
 
 impl BlockOptions {
+    /// Whether the finish streams the rest under its byte gate
+    /// ([`Self::finish_stream`]): it needs the layout thread, the finish's
+    /// cuts and KECCAK_RND streamed or built as its tables.
+    pub(crate) fn rest_streams(&self) -> bool {
+        self.finish_stream
+            && self.layout_workers > 0
+            && self.finish_cuts
+            && (self.stream_keccak_rnd
+                || (self.finish_keccak_rnd_chunks && self.keccak_rnd_rows_log2 >= 5))
+    }
+
     /// Every chunked table at 2^21 rows, KECCAK_RND at 2^16, ECDAS at 2^17,
     /// KECCAK at 2^18, ECSM at 2^17, windows of 2^20 cycles.
     pub fn production() -> Self {
@@ -1274,8 +1285,22 @@ fn lt_concat() -> bool {
 /// ([`WindowedTraceBuilder::slide_rest`]): the default.
 /// `LAMBDA_VM_BLOCK_REST_SLIDE=0` builds in waves. The tables and their order
 /// are the same.
-fn rest_slide() -> bool {
+pub(crate) fn rest_slide() -> bool {
     parse_rest_slide(std::env::var("LAMBDA_VM_BLOCK_REST_SLIDE").ok().as_deref())
+}
+
+/// How the rest's layout bytes ([`BlockOptions::rest_layout_bytes`]) bound
+/// the rest, for the harnesses' `BLOCK REST LAYOUT CONFIG` line: waves of
+/// them where the rest is laid out in waves, and the streamed finish's gate
+/// where it slides ([`rest_slide`]), which has no waves.
+pub(crate) fn rest_layout_label(options: &BlockOptions, slide: bool) -> String {
+    let mib = |b: usize| format!("{} MiB", b >> 20);
+    match (options.rest_streams() && slide, options.rest_layout_bytes) {
+        (true, Some(b)) => format!("a gate of {}, sliding (no waves)", mib(b)),
+        (true, None) => "no gate, sliding (no waves)".to_string(),
+        (false, Some(b)) => format!("waves of {}", mib(b)),
+        (false, None) => "waves of all at once".to_string(),
+    }
 }
 
 /// [`rest_slide`] of the knob's value: anything but `0` slides.
@@ -5199,12 +5224,7 @@ fn prove_streamed(
                 }
                 // The rest streamed: the header to the layout thread first,
                 // then each table as its wave is built, under the byte gate.
-                let streams = options.finish_stream
-                    && options.layout_workers > 0
-                    && options.finish_cuts
-                    && (options.stream_keccak_rnd
-                        || (options.finish_keccak_rnd_chunks && options.keccak_rnd_rows_log2 >= 5))
-                    && !deviations.omit_first_keccak_rnd;
+                let streams = options.rest_streams() && !deviations.omit_first_keccak_rnd;
                 if streams {
                     let keep = live_recorder.is_some();
                     // The streamed chunks' regenerator: its thread waits
@@ -7797,7 +7817,7 @@ mod p4_rows_knob_tests {
 
 #[cfg(test)]
 mod rest_slide_knob_tests {
-    use super::{parse_rest_build, parse_rest_slide};
+    use super::{BlockOptions, parse_rest_build, parse_rest_slide, rest_layout_label};
 
     /// `BLOCK_WHIR_REST_BUILD`: unset is no cap beyond the gate (production);
     /// a positive MiB count is the cap in bytes; anything else is an error.
@@ -7822,6 +7842,34 @@ mod rest_slide_knob_tests {
         for value in ["0", " 0 "] {
             assert!(!parse_rest_slide(Some(value)), "{value}");
         }
+    }
+
+    /// The layout line says waves only where the rest is laid out in waves:
+    /// the streamed finish that slides has a gate and no waves.
+    #[test]
+    fn the_layout_line_says_waves_only_where_the_rest_builds_in_waves() {
+        let mut options = BlockOptions::production();
+        options.finish_stream = true;
+        options.finish_cuts = true;
+        assert!(options.rest_streams());
+        assert_eq!(
+            rest_layout_label(&options, true),
+            "a gate of 2048 MiB, sliding (no waves)"
+        );
+        assert_eq!(rest_layout_label(&options, false), "waves of 2048 MiB");
+        options.rest_layout_bytes = None;
+        assert_eq!(
+            rest_layout_label(&options, true),
+            "no gate, sliding (no waves)"
+        );
+        assert_eq!(rest_layout_label(&options, false), "waves of all at once");
+        options.rest_layout_bytes = Some(4 << 30);
+        options.finish_stream = false;
+        assert!(!options.rest_streams());
+        assert_eq!(rest_layout_label(&options, true), "waves of 4096 MiB");
+        options.finish_stream = true;
+        options.layout_workers = 0;
+        assert_eq!(rest_layout_label(&options, true), "waves of 4096 MiB");
     }
 }
 

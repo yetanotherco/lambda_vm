@@ -1779,10 +1779,8 @@ pub fn prove_whir_block_tree(
     sink.line(&format!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead));
     sink.line(&finish_idle_line());
     sink.line(&format!(
-        "BLOCK REST LAYOUT CONFIG: waves of {} · KECCAK_RND built as its tables {} · finish packed {} · building at most {}",
-        options
-            .rest_layout_bytes
-            .map_or("all at once".to_string(), |b| format!("{} MiB", b >> 20)),
+        "BLOCK REST LAYOUT CONFIG: {} · KECCAK_RND built as its tables {} · finish packed {} · building at most {}",
+        block_whir::rest_layout_label(options, block_whir::rest_slide()),
         options.finish_keccak_rnd_chunks,
         options.pack_finished,
         options

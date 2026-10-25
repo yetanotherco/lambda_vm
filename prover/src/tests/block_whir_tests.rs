@@ -4380,10 +4380,8 @@ fn block_whir_on_a_real_block() {
     // tables, the finish's tables packed as they are built.
     crate::block_whir::rest_layout_from_env(&mut options);
     println!(
-        "BLOCK REST LAYOUT CONFIG: waves of {} · KECCAK_RND built as its tables {} · finish packed {}",
-        options
-            .rest_layout_bytes
-            .map_or("all at once".to_string(), |b| format!("{} MiB", b >> 20)),
+        "BLOCK REST LAYOUT CONFIG: {} · KECCAK_RND built as its tables {} · finish packed {}",
+        crate::block_whir::rest_layout_label(&options, crate::block_whir::rest_slide()),
         options.finish_keccak_rnd_chunks,
         options.pack_finished,
     );
