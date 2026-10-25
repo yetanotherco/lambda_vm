@@ -82,6 +82,11 @@ fn build_traces(ops: &[KeccakAdapterOperation]) -> [TraceTable<F, E>; 4] {
 
     let mut hist = bitwise::BitwiseHistogram::new();
     hist.add_ops(&keccak_adapter::bitwise_ops_for(ops));
+    // The round table's padding rows send its byte checks as `ARE_BYTES[0, 0]`.
+    hist.bump_n(
+        bitwise::BitwiseOperation::byte_op(bitwise::BitwiseOperationType::AreBytes, 0, 0),
+        keccak_rnd::padding_are_bytes(ops.len()),
+    );
     let mut bw = bitwise::generate_bitwise_trace();
     hist.fill_multiplicities(&mut bw);
 

@@ -468,6 +468,16 @@ pub(super) fn build_traces_walked(
 
     let mut histogram = bitwise::BitwiseHistogram::new();
     histogram.add_ops(&keccak_adapter::bitwise_ops_for(&keccak_ops));
+    // A KECCAK_RND padding row sends the round's byte checks as `ARE_BYTES[0, 0]`
+    // (`keccak_rnd::ARE_BYTES_PER_ROW` a row): each chunk's padding rows. A
+    // program without keccak ops has one empty chunk, which counts none: the
+    // chip is not instantiated then ([`super::airs::ChipSet::keccak`]).
+    for ops in program.chunking.split(&round_ops) {
+        histogram.bump_n(
+            bitwise::BitwiseOperation::byte_op(bitwise::BitwiseOperationType::AreBytes, 0, 0),
+            keccak_rnd::padding_are_bytes(ops.len()),
+        );
+    }
     // `LFM_BLAKE3` is a BITWISE consumer on every row — ~1,248 lookups per
     // compression. Unconditional, unlike the socket's below: the chip is a
     // member of the fixed set, so its lookups are a property of the program,
