@@ -1048,7 +1048,10 @@ fn the_lean_derive_is_the_held_derives_top_at_every_window() {
     let (elf, proof) = small_block("test_commit_4", &format);
     let opts = ProofOptions::default_test_options();
     let wrap = aggregation_wrap_options();
-    let groups = plan_of(&elf, &proof, &format, None).num_groups();
+    // The group count is the statement's, whatever the leaf count. Under the
+    // chip bound (`None`) the plan refuses this block at blowup 2: its group 0
+    // spends more lanes rows than a single leaf holds.
+    let groups = plan_of(&elf, &proof, &format, Some(1)).num_groups();
     let leaves = groups.min(5);
     assert!(
         leaves >= 3,
@@ -1399,12 +1402,23 @@ fn the_whir_block_tree_proves_to_the_derived_top() {
 /// (one that always doubles, one that never does, one that doubles from one
 /// leaf fewer). Against its own derived top the doubled tree verifies: the
 /// refusal is the derived program's identity.
+///
+/// At blowup 4, the rate this block's shape is sized at: at blowup 2 the
+/// small format's group 0 spends more lanes rows than a single leaf holds
+/// (1,051,383 against 1,048,482 at Q 229), so every scale's partition refuses
+/// the block.
 #[test]
 #[ignore = "proves two trees over a small block; box tier"]
 fn the_leaf_scale_is_the_verifiers_both_ways() {
     use super::whir_block::{LeafScale, verify_block_tree_capped};
     super::device_permit::arm(1);
-    let format = small_format();
+    let format = BlockFormat {
+        zf: ZfFormat {
+            whir_blowup: 4,
+            ..small_format().zf
+        },
+        ..small_format()
+    };
     let (elf, proof) = small_block("test_commit_4", &format);
     let opts = ProofOptions::default_test_options();
     let wrap = aggregation_wrap_options();
