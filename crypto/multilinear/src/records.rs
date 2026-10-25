@@ -531,6 +531,30 @@ impl RecordsFill<'_> {
     }
 }
 
+/// What a records holder handed back to the OS as it let its records go
+/// ([`TableRecords::return_pages`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PagesReturned {
+    /// Buffers this holder was the last to hold: their pages handed back (or
+    /// tried, see `failed`).
+    pub buffers: usize,
+    /// Buffers another holder still holds: left as they are.
+    pub shared: usize,
+    /// Bytes of whole pages handed back.
+    pub bytes: u64,
+    /// Buffers whose pages the OS would not take back (logged once).
+    pub failed: usize,
+}
+
+impl std::ops::AddAssign for PagesReturned {
+    fn add_assign(&mut self, other: Self) {
+        self.buffers += other.buffers;
+        self.shared += other.shared;
+        self.bytes += other.bytes;
+        self.failed += other.failed;
+    }
+}
+
 /// A table's records: its shape, what the card's fill reads, and the host's
 /// fill of the same columns.
 pub trait TableRecords: Send + Sync + std::fmt::Debug {
@@ -554,6 +578,14 @@ pub trait TableRecords: Send + Sync + std::fmt::Debug {
     /// cannot (the table then reads as no columns, a proof the verifier
     /// refuses).
     fn host_fill(&self) -> Option<NarrowColumns>;
+
+    /// Hands the pages of the buffers this holder is the last to hold back to
+    /// the OS, as its records are let go: nothing reads them after, their
+    /// holder drops them next ([`Records::return_pages`]). Buffers another
+    /// holder still holds stay as they are. The default returns nothing.
+    fn return_pages(&mut self) -> PagesReturned {
+        PagesReturned::default()
+    }
 }
 
 /// A table's records, shared: two are equal when they fill the same table
@@ -594,6 +626,17 @@ impl Records {
 
     pub fn host_fill(&self) -> Option<NarrowColumns> {
         self.0.host_fill()
+    }
+
+    /// Lets the records go, first handing their buffers' pages back to the
+    /// OS where this is the records' last handle
+    /// ([`TableRecords::return_pages`]); another handle still holding them
+    /// returns nothing.
+    pub fn return_pages(mut self) -> PagesReturned {
+        match Arc::get_mut(&mut self.0) {
+            Some(records) => records.return_pages(),
+            None => PagesReturned::default(),
+        }
     }
 }
 
