@@ -657,6 +657,68 @@ fn a_stopped_packer_stops_the_emitter() {
     }
 }
 
+/// ★ With the deduplicating tables' per-row lookups counted on the pool
+/// ([`StreamSkip::p4_rows`]), the finish builds the tables it builds without
+/// it, word for word (BITWISE's multiplicities among them): the monolithic
+/// finish, and the streamed one in waves and sliding, at budgets of one byte
+/// and none. The programs reach LT, BRANCH and BYTEWISE over several chunks.
+#[test]
+fn the_row_lookups_counted_on_the_pool_build_the_same_tables() {
+    let max_rows = MaxRowsConfig::small();
+    let words = |t: &Traces| -> Vec<_> {
+        air_order(t)
+            .into_iter()
+            .map(|t| t.map(shape_and_words))
+            .collect()
+    };
+    for name in [
+        "all_instructions_64",
+        "test_keccak_multi",
+        "test_memw_split_ts",
+        "test_copy_ecalls",
+        "test_dense_pages",
+    ] {
+        let (program, logs) = run(name);
+        for window in [7, 1000] {
+            let what = format!("{name} window {window}");
+            let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                b.drop_streamed_ops().expect("before any window")
+            });
+            let want = words(&builder.finish(last).expect("the monolithic finish"));
+            let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                b.drop_streamed_ops()
+                    .expect("before any window")
+                    .p4_rows_on_pool()
+            });
+            let got = words(&builder.finish(last).expect("the monolithic finish"));
+            assert!(
+                got == want,
+                "{what}: the monolithic finish, rows on the pool"
+            );
+            for slide in [false, true] {
+                for budget in [1usize, usize::MAX] {
+                    let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                        let b = b
+                            .drop_streamed_ops()
+                            .expect("before any window")
+                            .p4_rows_on_pool();
+                        if slide { b.slide_rest() } else { b }
+                    });
+                    let (_, got, _) = streamed(builder, last, budget);
+                    let got: Vec<_> = got
+                        .iter()
+                        .map(|e| e.table.as_ref().map(shape_and_words))
+                        .collect();
+                    assert!(
+                        got == want,
+                        "{what}, slide {slide}, budget {budget}: the tables in AIR order"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Built as the gate admits each table: every configuration, chunked small,
 /// windows of 7 and 1000 cycles, budgets of one byte, 2 GiB and none, hands on
 /// the monolithic finish's tables word for word in AIR order, as the waves do.

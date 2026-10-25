@@ -1161,6 +1161,26 @@ fn compact_lt() -> bool {
     !std::env::var("LAMBDA_VM_BLOCK_COMPACT_LT").is_ok_and(|v| v.trim() == "0")
 }
 
+/// `LAMBDA_VM_BLOCK_P4_ROWS`: `pool` has the finish count the deduplicating
+/// tables' per-row lookups (LT, BRANCH, BYTEWISE: one `ARE_BYTES` a row of a
+/// μ-split operation, and the padding rows') on the whole pool, a chunk a
+/// task, counts only, instead of each chunk's list of lookups among phase 4's
+/// other collectors; unset, empty or `off` keeps the latter. Anything else
+/// refuses the prove. The multiplicities and the tables are the same.
+fn block_p4_rows() -> Result<bool, Error> {
+    parse_p4_rows(std::env::var("LAMBDA_VM_BLOCK_P4_ROWS").ok().as_deref())
+}
+
+fn parse_p4_rows(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "off") => Ok(false),
+        Some("pool") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_BLOCK_P4_ROWS={v}: pool (the per-row lookups counted on the pool) or off"
+        ))),
+    }
+}
+
 /// `LAMBDA_VM_BLOCK_LT_CONCAT=1`: the finish concatenates LT's ops into one
 /// list before chunking them ([`WindowedTraceBuilder::concat_lt`]), the A arm
 /// of keeping them as segments; off by default. With
@@ -4771,6 +4791,7 @@ fn prove_streamed(
     let tag = block_statement_tag(&format.zf.base);
     crate::with_block_hash!(format.zf.base, |H| {
         let walkers = block_walkers()?;
+        let p4_rows = block_p4_rows()?;
         let card_fill = deviations.card_fill.map_or_else(block_card_fill, Ok)?;
         let (block, built, laid, executed) = std::thread::scope(|scope| {
             use std::sync::atomic::Ordering::Relaxed;
@@ -4856,6 +4877,9 @@ fn prove_streamed(
                 }
                 if lt_concat() {
                     builder = builder.concat_lt();
+                }
+                if p4_rows {
+                    builder = builder.p4_rows_on_pool();
                 }
                 if rest_slide() {
                     builder = builder.slide_rest();
@@ -7626,6 +7650,29 @@ mod air_input_tests {
                 "heights {:?}",
                 &bad[..bad.len().min(4)]
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod p4_rows_knob_tests {
+    use super::parse_p4_rows;
+
+    /// `LAMBDA_VM_BLOCK_P4_ROWS`: `pool` counts the per-row lookups on the
+    /// pool; unset, empty or `off` does not; any other word refuses.
+    #[test]
+    fn the_p4_rows_knob_takes_pool_and_off_and_refuses_anything_else() {
+        for (value, on) in [
+            (None, false),
+            (Some(""), false),
+            (Some(" off "), false),
+            (Some("pool"), true),
+            (Some(" pool\n"), true),
+        ] {
+            assert_eq!(parse_p4_rows(value).ok(), Some(on), "{value:?}");
+        }
+        for value in ["1", "on", "POOL", "pools", "rows"] {
+            assert!(parse_p4_rows(Some(value)).is_err(), "{value}");
         }
     }
 }

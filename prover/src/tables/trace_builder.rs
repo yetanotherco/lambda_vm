@@ -84,6 +84,96 @@ mod compact_branch;
 mod compact_bytewise;
 mod compact_eq;
 #[cfg(test)]
+mod row_count_tests {
+    use super::*;
+    use crate::tables::types::{MU_MAX, alu_op};
+
+    /// A list as the finish keeps it: one block of `ops`.
+    fn one_block<T>(ops: &[T]) -> Segmented<'_, T> {
+        Segmented {
+            parts: vec![Part::Ops(ops)],
+        }
+    }
+
+    /// `n` ops from `make(i)` over a few hundred distinct values, each repeated
+    /// so that counts land on and around [`MU_MAX`] and its multiples.
+    fn skewed<T>(n: usize, mut make: impl FnMut(u64) -> T) -> Vec<T> {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut out = Vec::with_capacity(n);
+        let repeats = [1usize, 2, 254, 255, 256, 509, 510, 511, 600];
+        let mut k = 0u64;
+        while out.len() < n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let times = repeats[(x % repeats.len() as u64) as usize];
+            for _ in 0..times.min(n - out.len()) {
+                out.push(make(k));
+            }
+            k += 1;
+        }
+        // Interleave so a chunk's repeats are not all adjacent.
+        let len = out.len();
+        for i in 0..len {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.swap(i, (x % len as u64) as usize);
+        }
+        out
+    }
+
+    /// ★ Counted on the pool, chunk by chunk with no lists, the per-row
+    /// lookups of LT, BRANCH and BYTEWISE are the multiplicities the lists
+    /// fold into the histogram: counts on, below and past μ's split at
+    /// 255 (several rows of one op), every chunk's padding rows, BRANCH's next
+    /// pc byte, at chunk sizes that leave a short last chunk.
+    #[test]
+    fn the_per_row_lookups_counted_on_the_pool_are_the_lists() {
+        assert_eq!(MU_MAX, 255);
+        for (n, rows) in [
+            (0usize, 64usize),
+            (5, 64),
+            (3_000, 64),
+            (40_000, 1 << 12),
+            (70_000, 1 << 15),
+        ] {
+            let lt = skewed(n, |k| {
+                LtOperation::new_with_invert(k.wrapping_mul(3), k ^ 0x55, k % 3 == 0, k % 5 == 0)
+            });
+            let branch = skewed(n, |k| {
+                BranchOperation::new(
+                    0x1000 + 4 * (k % 97),
+                    k.wrapping_mul(0x1_0004),
+                    k << 9,
+                    k % 2 == 1,
+                )
+            });
+            let ops = [alu_op::AND, alu_op::OR, alu_op::XOR];
+            let bytewise = skewed(n, |k| {
+                bytewise::BytewiseOperation::new(k & 0xFF, (k >> 3) & 0xFF, ops[(k % 3) as usize])
+            });
+            let max_rows = crate::tables::MaxRowsConfig::uniform(rows);
+            let (lt_s, branch_s, bytewise_s) =
+                (one_block(&lt), one_block(&branch), one_block(&bytewise));
+            let mut lists = bitwise::BitwiseHistogram::new();
+            for (start, end) in list_chunks(lt.len(), max_rows.lt) {
+                lists.add_ops(&lt_row_lookups(lt_s.range(start, end).iter()));
+            }
+            for (start, end) in list_chunks(branch.len(), max_rows.branch) {
+                lists.add_ops(&branch_row_lookups(&branch_s.range(start, end)));
+            }
+            for (start, end) in list_chunks(bytewise.len(), max_rows.bytewise) {
+                lists.add_ops(&bytewise_row_lookups(&bytewise_s.range(start, end)));
+            }
+            let mut counted = bitwise::BitwiseHistogram::new();
+            count_row_lookups(&lt_s, &branch_s, &bytewise_s, &max_rows).bump_into(&mut counted);
+            assert!(counted == lists, "{n} ops, {rows} a chunk");
+        }
+    }
+}
+
+#[cfg(test)]
 mod cut_padding_tests;
 mod delta;
 mod finish;
@@ -3290,6 +3380,208 @@ pub(crate) fn bytewise_row_lookups(chunk: &[bytewise::BytewiseOperation]) -> Vec
     bounds
 }
 
+/// A count-only hash for [`count_row_lookups`]: the rows' order is not read
+/// there, so the trace's process-wide state ([`super::trace_hash`]) is not
+/// needed. A multiply-rotate mix, finished with a murmur3 finalizer.
+#[derive(Default, Clone, Copy)]
+struct RowHasher(u64);
+
+impl std::hash::Hasher for RowHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u8(b);
+        }
+    }
+
+    fn write_u8(&mut self, n: u8) {
+        self.write_u64(u64::from(n));
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^ (x >> 33)
+    }
+}
+
+/// The per-row lookups of the deduplicating tables' chunks, counted: how
+/// many of each, with no list of them ([`count_row_lookups`]). LT's and
+/// BYTEWISE's are `ARE_BYTES[μ]` ([`lt_row_lookups`],
+/// [`bytewise_row_lookups`]), BRANCH's `ARE_BYTES[μ, next pc's byte 1]`
+/// ([`branch_row_lookups`]), the padding rows' at μ = 0.
+struct RowCounts {
+    /// By μ.
+    single: [u64; 256],
+    /// By `μ · 256 + byte`, allocated by the first BRANCH chunk.
+    branch: Vec<u64>,
+}
+
+impl RowCounts {
+    fn new() -> Self {
+        Self {
+            single: [0; 256],
+            branch: Vec::new(),
+        }
+    }
+
+    fn branch_mut(&mut self) -> &mut [u64] {
+        if self.branch.is_empty() {
+            self.branch = vec![0; 1 << 16];
+        }
+        &mut self.branch
+    }
+
+    fn merge(mut self, other: Self) -> Self {
+        for (a, b) in self.single.iter_mut().zip(other.single) {
+            *a += b;
+        }
+        if !other.branch.is_empty() {
+            for (a, b) in self.branch_mut().iter_mut().zip(other.branch) {
+                *a += b;
+            }
+        }
+        self
+    }
+
+    /// Into `histogram`: the multiplicities the lookup lists add.
+    fn bump_into(&self, histogram: &mut bitwise::BitwiseHistogram) {
+        for (mu, &n) in self.single.iter().enumerate() {
+            if n > 0 {
+                histogram.bump_n(
+                    BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, mu as u8),
+                    n,
+                );
+            }
+        }
+        for (k, &n) in self.branch.iter().enumerate() {
+            if n > 0 {
+                histogram.bump_n(
+                    BitwiseOperation::byte_op(
+                        BitwiseOperationType::AreBytes,
+                        (k >> 8) as u8,
+                        (k & 0xFF) as u8,
+                    ),
+                    n,
+                );
+            }
+        }
+    }
+}
+
+/// [`dedup_rows_of`]'s rows of `ops` (`len` of them), counted only: `each(op,
+/// μ, rows)` for every distinct op and μ, then the number of rows.
+fn count_rows_of<'a, T: std::hash::Hash + Eq + Clone + 'a>(
+    ops: impl Iterator<Item = &'a T>,
+    len: usize,
+    mut each: impl FnMut(&T, u64, u64),
+) -> usize {
+    let mut counts: HashMap<T, u64, std::hash::BuildHasherDefault<RowHasher>> =
+        HashMap::with_capacity_and_hasher(len, Default::default());
+    for op in ops {
+        *counts.entry(op.clone()).or_insert(0) += 1;
+    }
+    let mut rows = 0u64;
+    for (op, &count) in &counts {
+        let (full, left) = (count / super::types::MU_MAX, count % super::types::MU_MAX);
+        if full > 0 {
+            each(op, super::types::MU_MAX, full);
+        }
+        if left > 0 {
+            each(op, left, 1);
+        }
+        rows += full + u64::from(left > 0);
+    }
+    rows as usize
+}
+
+/// One table's chunk of [`count_row_lookups`].
+#[derive(Clone, Copy)]
+enum RowChunk {
+    Lt(usize, usize),
+    Branch(usize, usize),
+    Bytewise(usize, usize),
+}
+
+/// The per-row lookups of every LT, BRANCH and BYTEWISE chunk of these lists
+/// ([`list_chunks`] at `max_rows`), counted on the whole pool, a chunk a task,
+/// with no list of lookups and no histogram per task: the same multiplicities
+/// as folding [`lt_row_lookups`], [`branch_row_lookups`] and
+/// [`bytewise_row_lookups`] of each chunk into the histogram.
+fn count_row_lookups(
+    lt: &Segmented<'_, LtOperation>,
+    branch: &Segmented<'_, BranchOperation>,
+    bytewise: &Segmented<'_, bytewise::BytewiseOperation>,
+    max_rows: &crate::tables::MaxRowsConfig,
+) -> RowCounts {
+    let tasks: Vec<RowChunk> = list_chunks(lt.len(), max_rows.lt)
+        .into_iter()
+        .map(|(s, e)| RowChunk::Lt(s, e))
+        .chain(
+            list_chunks(branch.len(), max_rows.branch)
+                .into_iter()
+                .map(|(s, e)| RowChunk::Branch(s, e)),
+        )
+        .chain(
+            list_chunks(bytewise.len(), max_rows.bytewise)
+                .into_iter()
+                .map(|(s, e)| RowChunk::Bytewise(s, e)),
+        )
+        .collect();
+    let count = |task: &RowChunk| -> RowCounts {
+        let mut counts = RowCounts::new();
+        match *task {
+            RowChunk::Lt(start, end) => {
+                let rows = count_rows_of(lt.range(start, end).iter(), end - start, |_, mu, n| {
+                    counts.single[mu as usize] += n
+                });
+                counts.single[0] += chunk_padding_rows(rows) as u64;
+            }
+            RowChunk::Bytewise(start, end) => {
+                let rows = count_rows_of(
+                    bytewise.range(start, end).iter(),
+                    end - start,
+                    |_, mu, n| counts.single[mu as usize] += n,
+                );
+                counts.single[0] += chunk_padding_rows(rows) as u64;
+            }
+            RowChunk::Branch(start, end) => {
+                let table = counts.branch_mut();
+                let rows =
+                    count_rows_of(branch.range(start, end).iter(), end - start, |op, mu, n| {
+                        let byte = ((op.compute_next_pc() >> 8) & 0xFF) as usize;
+                        table[((mu as usize) << 8) | byte] += n
+                    });
+                table[0] += chunk_padding_rows(rows) as u64;
+            }
+        }
+        counts
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        tasks
+            .par_iter()
+            .map(count)
+            .reduce(RowCounts::new, RowCounts::merge)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        tasks
+            .iter()
+            .map(count)
+            .fold(RowCounts::new(), RowCounts::merge)
+    }
+}
+
 /// The `(start, end)` op ranges of a list of `len` ops at `max_rows` a table, as
 /// [`chunk_and_generate_segmented`] cuts it: the tables whose per-row lookups
 /// (the μ bounds, the padding rows' byte checks) the table phase counts. The
@@ -4505,6 +4797,12 @@ pub struct StreamSkip {
     /// the segments, `LAMBDA_VM_BLOCK_LT_CONCAT=1` on the block). The tables
     /// are the same.
     pub concat_lt: bool,
+    /// Phase 4 counts the deduplicating tables' per-row lookups (LT, BRANCH,
+    /// BYTEWISE) on the whole pool, a chunk a task, counts only
+    /// ([`count_row_lookups`]), instead of each chunk's list of lookups among
+    /// its other collectors (`LAMBDA_VM_BLOCK_P4_ROWS=pool` on the block).
+    /// The multiplicities and the tables are the same.
+    pub p4_rows: bool,
     /// How the tables cut at `keccak_rnd_rows`, `keccak_rows`, `ecsm_rows`,
     /// `ecdas_rows` and `copy_rows` are padded ([`CutPadding`]): the table
     /// phase's counts, its

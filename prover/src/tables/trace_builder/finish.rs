@@ -548,24 +548,41 @@ impl<'a> FinishPlan<'a> {
             // this build generates, a collector a table: the chunks of the lists here
             // ([`list_chunks`]); with only the tails kept, the streamed chunks' were
             // counted as they were handed out (their full chunks' padding here).
-            for (start, end) in list_chunks(lt_ops.len(), max_rows.lt) {
+            // With `skip.p4_rows` they are counted on the whole pool instead
+            // (`count_row_lookups`, below).
+            let rows_on_pool = skip.p4_rows;
+            for (start, end) in list_chunks(lt_ops.len(), max_rows.lt)
+                .into_iter()
+                .filter(|_| !rows_on_pool)
+            {
                 let lt_ops = &lt_ops;
                 collectors.push(Box::new(move |h| {
                     h.add_ops(&lt_row_lookups(lt_ops.range(start, end).iter()))
                 }));
             }
-            for (start, end) in list_chunks(branch_segments.len(), max_rows.branch) {
+            for (start, end) in list_chunks(branch_segments.len(), max_rows.branch)
+                .into_iter()
+                .filter(|_| !rows_on_pool)
+            {
                 let branch_segments = &branch_segments;
                 collectors.push(Box::new(move |h| {
                     h.add_ops(&branch_row_lookups(&branch_segments.range(start, end)))
                 }));
             }
-            for (start, end) in list_chunks(bytewise_segments.len(), max_rows.bytewise) {
+            for (start, end) in list_chunks(bytewise_segments.len(), max_rows.bytewise)
+                .into_iter()
+                .filter(|_| !rows_on_pool)
+            {
                 let bytewise_segments = &bytewise_segments;
                 collectors.push(Box::new(move |h| {
                     h.add_ops(&bytewise_row_lookups(&bytewise_segments.range(start, end)))
                 }));
             }
+            let count_rows = || {
+                rows_on_pool.then(|| {
+                    count_row_lookups(&lt_ops, &branch_segments, &bytewise_segments, max_rows)
+                })
+            };
             let shift_padding: usize = list_chunks(shift_ops.len(), max_rows.shift)
                 .iter()
                 .map(|&(start, end)| padding_rows_of(end - start))
@@ -639,21 +656,30 @@ impl<'a> FinishPlan<'a> {
                 for (i, unit) in units.into_iter().enumerate() {
                     buckets[i % cap].push(unit);
                 }
-                if let Some(reduced) = buckets
-                    .par_iter()
-                    .map(|bucket| {
-                        let mut h = bitwise::BitwiseHistogram::new();
-                        for f in bucket {
-                            f(&mut h);
-                        }
-                        h
-                    })
-                    .reduce_with(|mut a, b| {
-                        a.merge(&b);
-                        a
-                    })
-                {
+                // The row counts on the pool beside the buckets.
+                let (reduced, rows) = rayon::join(
+                    || {
+                        buckets
+                            .par_iter()
+                            .map(|bucket| {
+                                let mut h = bitwise::BitwiseHistogram::new();
+                                for f in bucket {
+                                    f(&mut h);
+                                }
+                                h
+                            })
+                            .reduce_with(|mut a, b| {
+                                a.merge(&b);
+                                a
+                            })
+                    },
+                    count_rows,
+                );
+                if let Some(reduced) = reduced {
                     base.merge(&reduced);
+                }
+                if let Some(rows) = rows {
+                    rows.bump_into(&mut base);
                 }
             }
             #[cfg(not(feature = "parallel"))]
@@ -665,6 +691,12 @@ impl<'a> FinishPlan<'a> {
                 for f in &collectors {
                     f(&mut base);
                 }
+                if let Some(rows) = count_rows() {
+                    rows.bump_into(&mut base);
+                }
+            }
+            if rows_on_pool {
+                build_stamps::mark("p4 rows pool");
             }
             base
         };
