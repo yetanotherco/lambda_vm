@@ -5125,7 +5125,8 @@ fn parked_records_need_live_regeneration() {
 /// columns checked by its rebuilt records' digest, none is missing or
 /// mismatched, and the proof is the one without regeneration and the one
 /// without the records. Without regeneration's drops, the parked records come
-/// back as they were.
+/// back as they were, and phase B lets go of every records table after its
+/// group's openings; with no spill (no regeneration) none is let go.
 #[test]
 fn streamed_records_chunks_drop_as_records_and_come_back() {
     use crate::block_whir::BlockSpillPolicy;
@@ -5160,9 +5161,12 @@ fn streamed_records_chunks_drop_as_records_and_come_back() {
             .expect("the dropped line counts the records")
     };
     let streamed = |r: &crate::block_whir::regen::RegenStamps| r.dropped - r.rest_dropped;
+    let released = |stamps: &crate::block_whir::BlockStamps| -> usize {
+        stamps.groups.iter().map(|g| g.records_released).sum()
+    };
     // Records without regeneration: kept (parked records need live
     // regeneration).
-    let (plain, _) = regenerated(
+    let (plain, stamps) = regenerated(
         &elf,
         &format,
         RegenMode::Off,
@@ -5173,6 +5177,8 @@ fn streamed_records_chunks_drop_as_records_and_come_back() {
         },
     )
     .expect("prove");
+    assert!(stamps.windows.card_fill.records_bytes > 0);
+    assert_eq!(released(&stamps), 0, "no spill: no records let go");
     let (built, stamps) = regenerated(
         &elf,
         &format,
@@ -5206,6 +5212,12 @@ fn streamed_records_chunks_drop_as_records_and_come_back() {
         "every records chunk dropped as its records: {:?}",
         some.lines
     );
+    // Only the rest's records tables (KECCAK_RND's, where the card fills
+    // them) can be let go: every streamed one dropped before phase B.
+    assert!(
+        released(&stamps) <= stamps.layout.records_rest.1,
+        "a streamed records chunk let go in phase B, yet all were dropped"
+    );
     assert!(verify(&parked, &elf, &format));
     // Live regeneration that never arms: every records chunk parks and comes
     // back as it was.
@@ -5218,6 +5230,11 @@ fn streamed_records_chunks_drop_as_records_and_come_back() {
     )
     .expect("prove");
     assert!(stamps.windows.card_fill.cpu[0] > 0);
+    assert_eq!(
+        released(&stamps),
+        stamps.windows.card_fill.records_bytes + stamps.layout.records_rest.1,
+        "every records table let go after its group's openings"
+    );
     assert!(verify(&never, &elf, &format));
     assert_eq!(parked.groups, plain.groups, "the partition");
     if crypto::grinding::deterministic() {

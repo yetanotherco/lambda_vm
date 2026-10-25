@@ -2092,6 +2092,14 @@ impl BlockStamps {
                 c.shift[0],
                 c.shift[1],
             ));
+            let released = self.groups.iter().filter(|g| g.records_released > 0);
+            out.push_str(&format!(
+                "BLOCK CARD FILL released: records let go in phase B after their groups' \
+                 openings {:.3} GiB · {} groups\n",
+                released.clone().map(|g| g.records_released).sum::<usize>() as f64
+                    / (1u64 << 30) as f64,
+                released.count(),
+            ));
             let (on, [direct, narrowed, again, wide]) = l.gpack;
             out.push_str(&format!(
                 "BLOCK GPACK: G-pack {}: {direct} written packed, {narrowed} narrowed after, {again} \
