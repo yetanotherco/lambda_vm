@@ -1161,20 +1161,22 @@ fn compact_lt() -> bool {
     !std::env::var("LAMBDA_VM_BLOCK_COMPACT_LT").is_ok_and(|v| v.trim() == "0")
 }
 
-/// `LAMBDA_VM_BLOCK_P4_ROWS`: `pool` has the finish count the deduplicating
-/// tables' per-row lookups (LT, BRANCH, BYTEWISE: one `ARE_BYTES` a row of a
-/// μ-split operation, and the padding rows') on the whole pool, a chunk a
-/// task, counts only, instead of each chunk's list of lookups among phase 4's
-/// other collectors; unset, empty or `off` keeps the latter. Anything else
-/// refuses the prove. The multiplicities and the tables are the same.
+/// `LAMBDA_VM_BLOCK_P4_ROWS`: unset, empty or `pool` (the default) has the
+/// finish count the deduplicating tables' per-row lookups (LT, BRANCH,
+/// BYTEWISE: one `ARE_BYTES` a row of a μ-split operation, and the padding
+/// rows') on the whole pool, a chunk a task, counts only, each chunk's map
+/// reserved for its distinct operations; `off` builds each chunk's list of
+/// lookups among phase 4's other collectors, as before (the rollback).
+/// Anything else refuses the prove. The multiplicities and the tables are the
+/// same.
 fn block_p4_rows() -> Result<bool, Error> {
     parse_p4_rows(std::env::var("LAMBDA_VM_BLOCK_P4_ROWS").ok().as_deref())
 }
 
 fn parse_p4_rows(value: Option<&str>) -> Result<bool, Error> {
     match value.map(str::trim) {
-        None | Some("" | "off") => Ok(false),
-        Some("pool") => Ok(true),
+        None | Some("" | "pool") => Ok(true),
+        Some("off") => Ok(false),
         Some(v) => Err(Error::Prover(format!(
             "LAMBDA_VM_BLOCK_P4_ROWS={v}: pool (the per-row lookups counted on the pool) or off"
         ))),
@@ -7661,13 +7663,14 @@ mod air_input_tests {
 mod p4_rows_knob_tests {
     use super::parse_p4_rows;
 
-    /// `LAMBDA_VM_BLOCK_P4_ROWS`: `pool` counts the per-row lookups on the
-    /// pool; unset, empty or `off` does not; any other word refuses.
+    /// `LAMBDA_VM_BLOCK_P4_ROWS`: unset, empty or `pool` counts the per-row
+    /// lookups on the pool (the default); `off` does not; any other word
+    /// refuses.
     #[test]
-    fn the_p4_rows_knob_takes_pool_and_off_and_refuses_anything_else() {
+    fn the_p4_rows_knob_defaults_to_pool_takes_off_and_refuses_anything_else() {
         for (value, on) in [
-            (None, false),
-            (Some(""), false),
+            (None, true),
+            (Some(""), true),
             (Some(" off "), false),
             (Some("pool"), true),
             (Some(" pool\n"), true),
