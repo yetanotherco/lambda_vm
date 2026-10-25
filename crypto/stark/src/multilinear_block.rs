@@ -4462,6 +4462,7 @@ mod spill_tests {
         let held = records(5);
         let parked = Arc::new(Parked {
             len: held.bytes() as u64,
+            cells: 0,
             rank: Some((0, 4)),
             state: std::sync::Mutex::new(ParkedState::ResidentRecords(held.clone())),
         });
