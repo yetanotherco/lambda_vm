@@ -202,8 +202,8 @@ pub struct ChainShape {
 /// program both follow, never read from a proof.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LeafQuery {
-    /// Every round's queries opened and folded one by one. The default.
-    #[default]
+    /// Every round's queries opened and folded one by one. Selectable by name
+    /// (`v1`); the leaves' check before [`Self::Lean`].
     V1,
     /// As [`Self::V1`], except round 0's base values arrive four to a hinted
     /// word ([`ChainShape::round0_packed`]) and the chain's tail rounds
@@ -214,7 +214,8 @@ pub enum LeafQuery {
     /// block (or the final value). A superset of the sampled positions, so a
     /// leaf accepts only what the host verifier's query checks for those
     /// rounds accept. The rounds' query draws stay in the transcript, their
-    /// bits unused.
+    /// bits unused. The default.
+    #[default]
     Lean,
 }
 

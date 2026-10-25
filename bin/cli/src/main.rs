@@ -403,12 +403,13 @@ enum Commands {
         #[arg(long, value_parser = leaf_double_from_word, default_value = "10")]
         leaf_double_from: String,
 
-        /// How the recursion's leaves check each chain's queries: `v1`
-        /// (production) or `lean` (round 0's values four to a word, paths
-        /// walked on rotated hints, and the tail rounds wholly in their caps
-        /// checked at every leaf once). A format choice: `verify-block` must
-        /// be given the same one; the proof file does not carry it.
-        #[arg(long, value_parser = ["v1", "lean"], default_value = "v1")]
+        /// How the recursion's leaves check each chain's queries: `lean`
+        /// (production: round 0's values four to a word, paths walked on
+        /// rotated hints, and the tail rounds wholly in their caps checked at
+        /// every leaf once) or `v1` (every query opened and folded one by
+        /// one). A format choice: `verify-block` must be given the same one;
+        /// the proof file does not carry it.
+        #[arg(long, value_parser = ["v1", "lean"], default_value = "lean")]
         leaf_query: String,
     },
 
@@ -449,7 +450,7 @@ enum Commands {
 
         /// The leaves' query check the block was proved with (`prove-block
         /// --leaf-query`): the verifier's constant, never read from the proof.
-        #[arg(long, value_parser = ["v1", "lean"], default_value = "v1")]
+        #[arg(long, value_parser = ["v1", "lean"], default_value = "lean")]
         leaf_query: String,
     },
 
@@ -2202,7 +2203,7 @@ mod tests {
         );
     }
 
-    /// Both block commands take the leaves' query check, production's `v1`
+    /// Both block commands take the leaves' query check, production's `lean`
     /// unless told otherwise, and nothing but `v1` or `lean`; each word reads
     /// to the check it names.
     #[test]
@@ -2219,7 +2220,7 @@ mod tests {
                 ) => Some(leaf_query),
                 _ => None,
             };
-            assert_eq!(query(cmd).as_deref(), Some("v1"), "the default");
+            assert_eq!(query(cmd).as_deref(), Some("lean"), "the default");
             for (word, want) in [("v1", LeafQuery::V1), ("lean", LeafQuery::Lean)] {
                 let args = [cmd, &["--leaf-query", word]].concat();
                 assert_eq!(query(&args).as_deref(), Some(word));
@@ -2235,7 +2236,7 @@ mod tests {
             }
         }
         assert_eq!(
-            prover::lfm::whir_block::leaf_query_setting(Some("v1")),
+            prover::lfm::whir_block::leaf_query_setting(Some("lean")),
             Ok(LeafQuery::default()),
             "the flag's default is production's"
         );

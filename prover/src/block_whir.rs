@@ -350,7 +350,8 @@ impl BlockFormat {
     /// doubled from 10 leaves; `off`, every leaf at the single heights). The
     /// leaves' query check is the environment's too
     /// (`LAMBDA_VM_WHIR_LEAF_QUERY`; unset,
-    /// [`LeafQuery::V1`](crate::lfm::whir_chain::LeafQuery::V1)).
+    /// [`LeafQuery::Lean`](crate::lfm::whir_chain::LeafQuery::Lean); `v1`, the
+    /// check before it).
     pub fn production() -> Self {
         Self {
             zf: *ZfFormat::global(),

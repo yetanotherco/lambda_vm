@@ -1428,17 +1428,17 @@ fn the_whir_block_tree_proves_to_the_derived_top() {
     }
 }
 
-/// The leaf query knob reads `v1` (or nothing) and `lean`, and refuses
+/// The leaf query knob reads `lean` (or nothing) and `v1`, and refuses
 /// anything else with an error; the production format holds what the
 /// environment says.
 #[test]
 fn the_leaf_query_knob_reads_v1_or_lean() {
     use super::whir_block::{LEAF_QUERY_ENV, leaf_query_from_env, leaf_query_setting};
     use super::whir_chain::LeafQuery;
-    for v1 in [None, Some(""), Some(" v1 ")] {
-        assert_eq!(leaf_query_setting(v1), Ok(LeafQuery::V1), "{v1:?}");
+    for lean in [None, Some(""), Some("lean"), Some(" lean ")] {
+        assert_eq!(leaf_query_setting(lean), Ok(LeafQuery::Lean), "{lean:?}");
     }
-    assert_eq!(leaf_query_setting(Some("lean")), Ok(LeafQuery::Lean));
+    assert_eq!(leaf_query_setting(Some(" v1 ")), Ok(LeafQuery::V1));
     for bad in ["Lean", "on", "1", "v2"] {
         let err = leaf_query_setting(Some(bad)).expect_err(bad);
         assert!(err.contains(LEAF_QUERY_ENV), "{err}");
@@ -1448,6 +1448,24 @@ fn the_leaf_query_knob_reads_v1_or_lean() {
         leaf_query_from_env(),
         "the production format holds the environment's check"
     );
+}
+
+/// The leaves check lean by default: the type's default, the knob unset, the
+/// production format with the knob unset, and both block commands' flag
+/// (`bin/cli`). `v1` stays a named choice, and every chain outside a block
+/// leaf keeps the per-query check (`ChainShape::new`).
+#[test]
+fn the_leaves_check_lean_by_default() {
+    use super::whir_block::{LEAF_QUERY_ENV, leaf_query_setting};
+    use super::whir_chain::{ChainShape, LeafQuery};
+    assert_eq!(LeafQuery::default(), LeafQuery::Lean);
+    assert_eq!(leaf_query_setting(None), Ok(LeafQuery::Lean));
+    assert_eq!(leaf_query_setting(Some("v1")), Ok(LeafQuery::V1));
+    if std::env::var_os(LEAF_QUERY_ENV).is_none() {
+        assert_eq!(BlockFormat::production().leaf_query, LeafQuery::Lean);
+    }
+    let config = BlockFormat::production().chain_config(&[(1, 12)]);
+    assert_eq!(ChainShape::new(&config, 12).query, LeafQuery::V1);
 }
 
 /// ★ The leaf scale is the verifier's, both ways, on a small block whose

@@ -238,15 +238,17 @@ pub(crate) fn process_leaf_scale() -> LeafScale {
     *SCALE.get_or_init(|| leaf_scale_from_env().unwrap_or_else(|e| panic!("{e}")))
 }
 
-/// [`leaf_query_from_env`]'s knob: unset or `v1` is [`LeafQuery::V1`], `lean`
-/// is [`LeafQuery::Lean`].
+/// [`leaf_query_from_env`]'s knob: unset or `lean` is [`LeafQuery::Lean`] (the
+/// default), `v1` is [`LeafQuery::V1`].
 pub const LEAF_QUERY_ENV: &str = "LAMBDA_VM_WHIR_LEAF_QUERY";
 
-/// A value of [`LEAF_QUERY_ENV`]: unset, empty or `v1` is [`LeafQuery::V1`];
-/// `lean` is [`LeafQuery::Lean`]; anything else is an error.
+/// A value of [`LEAF_QUERY_ENV`]: unset or empty is the default
+/// ([`LeafQuery::Lean`]); `lean` is [`LeafQuery::Lean`], `v1` is
+/// [`LeafQuery::V1`]; anything else is an error.
 pub fn leaf_query_setting(value: Option<&str>) -> Result<LeafQuery, String> {
     match value.map(str::trim) {
-        None | Some("") | Some("v1") => Ok(LeafQuery::V1),
+        None | Some("") => Ok(LeafQuery::default()),
+        Some("v1") => Ok(LeafQuery::V1),
         Some("lean") => Ok(LeafQuery::Lean),
         Some(v) => Err(format!(
             "{LEAF_QUERY_ENV} must be `v1` or `lean`, got `{v}`"

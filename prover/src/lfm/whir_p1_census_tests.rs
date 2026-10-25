@@ -1092,8 +1092,9 @@ fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
 /// ★ Each query check's leaf programs on the median mix at blowup 2 (the
 /// production rate), pinned: the leaf count (the leaf scale's own), and the
 /// digest of the first and the last leaf (every instruction and the arena schema, as `Debug` prints
-/// them) under [`LeafQuery::V1`] and [`LeafQuery::Lean`], each named. A change
-/// of which check is the default moves neither.
+/// them) under [`LeafQuery::V1`] and [`LeafQuery::Lean`], each named; the
+/// default's first leaf is the lean one. A change of which check is the
+/// default moves neither pin.
 #[test]
 fn the_median_mix_leaves_are_pinned_under_each_query_check() {
     use super::whir_chain::LeafQuery;
@@ -1134,6 +1135,19 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
         assert_eq!(d_first, first, "{query:?}: the first leaf's program");
         assert_eq!(d_last, last, "{query:?}: the last leaf's program");
     }
+    let default = WhirBlockPlan::derive(
+        &elf_bytes,
+        &opts,
+        &at(LeafQuery::default()),
+        owned.view(),
+        None,
+    )
+    .expect("the plan derives");
+    assert_eq!(
+        program_digest(&default.leaf_program(0).expect("the leaf emits")),
+        PINS[1].2,
+        "the default's first leaf is the lean check's"
+    );
 }
 
 /// ★ The lean leaf's census on the median mix at blowup 2 (the production
