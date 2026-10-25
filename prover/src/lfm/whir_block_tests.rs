@@ -51,6 +51,22 @@ fn small_format() -> BlockFormat {
     }
 }
 
+/// `format` at blowup 4, for the tests whose blocks the leaf planner holds to a
+/// leaf's rows. The test format's 2^10 stack makes a lone wide table (BITWISE's
+/// 21 columns of 2^20 rows are 21 polynomials on their own), whose leaf rows at
+/// blowup 2 pass a leaf's room: a shape production's 2^27 stack cannot form.
+/// These tests check the leaves' and the tree's mechanics, which the rate does
+/// not change.
+fn at_blowup_4(format: BlockFormat) -> BlockFormat {
+    BlockFormat {
+        zf: ZfFormat {
+            whir_blowup: 4,
+            ..format.zf
+        },
+        ..format
+    }
+}
+
 /// The same with three polynomials a group: the same program packs into other
 /// groups, so its statement — and every leaf's state and id — differ.
 fn other_format() -> BlockFormat {
@@ -178,13 +194,17 @@ fn ext_of(word: &LfmWord) -> FEE {
 /// proof's share of that group: built from the observer's groups alone, every
 /// leaf's arena is the one the proof gives, under both argue formats, for a
 /// streamed block (the production path).
+///
+/// At blowup 4 ([`at_blowup_4`]): the test format's small stack makes a lone
+/// wide table that production cannot form, and at blowup 2 its leaf rows
+/// pass a leaf's room.
 #[test]
 #[ignore = "proves small blocks; box tier"]
 fn the_groups_phase_b_hands_over_build_every_leafs_arena() {
     for (format, name) in [
-        (small_format(), "all_instructions_64"),
-        (small_batched(), "all_instructions_64"),
-        (small_batched(), "test_keccak"),
+        (at_blowup_4(small_format()), "all_instructions_64"),
+        (at_blowup_4(small_batched()), "all_instructions_64"),
+        (at_blowup_4(small_batched()), "test_keccak"),
     ] {
         let elf = asm_elf_bytes(name);
         let opts = ProofOptions::default_test_options();
@@ -337,10 +357,14 @@ fn the_group_partition_refuses_a_gap_an_overlap_and_an_empty_leaf() {
 /// with no twelve-felt hash row — all of them publish the same id, state and
 /// output — the plan's — and their shares cancel: the block's bus, checked
 /// once over every table, closes across the leaves.
+///
+/// At blowup 4 ([`at_blowup_4`]): the test format's small stack makes a lone
+/// wide table that production cannot form, and at blowup 2 its leaf rows
+/// pass a leaf's room.
 #[test]
 #[ignore = "executes block leaves over small block proofs; box tier"]
 fn whir_block_leaves_execute_and_close_the_bus() {
-    let format = small_format();
+    let format = at_blowup_4(small_format());
     for (name, leaves) in [
         ("all_instructions_64", Some(3)),
         ("test_commit_4", Some(2)),
@@ -840,11 +864,15 @@ fn compose(
 /// whose tree the verifier accepts. The same statement with one ECDAS table
 /// stated over [`block_whir::BLOCK_ECDAS_MAX_VARS`] is refused before any
 /// program is derived.
+///
+/// At blowup 4 ([`at_blowup_4`]): the test format's small stack makes a lone
+/// wide table that production cannot form, and at blowup 2 its leaf rows
+/// pass a leaf's room.
 #[test]
 #[ignore = "proves block leaves and nodes over a small block; box tier"]
 fn the_whir_block_tree_verifies_a_split_ecdas() {
     super::device_permit::arm(1);
-    let format = small_format();
+    let format = at_blowup_4(small_format());
     let (elf, proof) = small_block_at("test_ecsm_multi", &format, 4);
     assert_eq!(proof.table_counts.ecdas, 3, "three ECDAS tables");
     let opts = ProofOptions::default_test_options();
@@ -893,11 +921,15 @@ fn the_whir_block_tree_verifies_a_split_ecdas() {
 /// its first table stated over its cap ([`block_whir::BLOCK_KECCAK_MAX_VARS`],
 /// [`block_whir::BLOCK_ECSM_MAX_VARS`], [`block_whir::BLOCK_COPY_MAX_VARS`])
 /// is refused before any program is derived.
+///
+/// At blowup 4 ([`at_blowup_4`]): the test format's small stack makes a lone
+/// wide table that production cannot form, and at blowup 2 its leaf rows
+/// pass a leaf's room.
 #[test]
 #[ignore = "proves three small blocks and their trees; box tier"]
 fn the_whir_block_tree_verifies_split_keccak_and_ecsm() {
     super::device_permit::arm(1);
-    let format = small_format();
+    let format = at_blowup_4(small_format());
     let opts = ProofOptions::default_test_options();
     let wrap = aggregation_wrap_options();
     for (guest, name, tables) in [
@@ -3024,10 +3056,14 @@ fn small_batched() -> BlockFormat {
 /// publishing the plan's id, state and output, and their shares cancel: the
 /// batched groups close the block's bus across the leaves. Each group costs the
 /// leaf less than its tables argued one by one.
+///
+/// At blowup 4 ([`at_blowup_4`]): the test format's small stack makes a lone
+/// wide table that production cannot form, and at blowup 2 its leaf rows
+/// pass a leaf's room.
 #[test]
 #[ignore = "executes block leaves over small block proofs; box tier"]
 fn batched_block_leaves_execute_and_close_the_bus() {
-    let format = small_batched();
+    let format = at_blowup_4(small_batched());
     for (name, leaves) in [
         ("all_instructions_64", Some(3)),
         ("test_commit_4", Some(2)),
@@ -3037,7 +3073,7 @@ fn batched_block_leaves_execute_and_close_the_bus() {
         let (elf, proof) = small_block(name, &format);
         assert_eq!(proof.argues.len(), proof.groups.len());
         let plan = plan_of(&elf, &proof, &format, leaves);
-        let per_table = plan_of(&elf, &proof, &small_format(), leaves);
+        let per_table = plan_of(&elf, &proof, &at_blowup_4(small_format()), leaves);
         println!(
             "WHIR BLOCK BATCHED LEAVES {name}: {} groups, costs {:?} (per table {:?}), partition {:?}",
             plan.num_groups(),
