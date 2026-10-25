@@ -1089,6 +1089,53 @@ fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
     );
 }
 
+/// ★ Each query check's leaf programs on the median mix at blowup 2 (the
+/// production rate), pinned: the leaf count (the leaf scale's own), and the
+/// digest of the first and the last leaf (every instruction and the arena schema, as `Debug` prints
+/// them) under [`LeafQuery::V1`] and [`LeafQuery::Lean`], each named. A change
+/// of which check is the default moves neither.
+#[test]
+fn the_median_mix_leaves_are_pinned_under_each_query_check() {
+    use super::whir_chain::LeafQuery;
+    use super::whir_chain_tests::program_digest;
+    const PINS: [(LeafQuery, usize, &str, &str); 2] = [
+        (
+            LeafQuery::V1,
+            5,
+            "12f9d56e4b649a7407c2da025fe64c4bb1a62acfed97ab03a48cea46a4d176bf",
+            "a48770170a7c66c828bddace9cd6bc5a7a505b39369677e32362825ca3e81442",
+        ),
+        (
+            LeafQuery::Lean,
+            9,
+            "26c7a941e43782438c479ae706651cf6113af9b9cafab9fb04e99568d19dd4b8",
+            "d69a688c1e7bc4e246a035d0ee1c3f0c48717a2c80b48da4c7bea054db475e9a",
+        ),
+    ];
+    let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
+    let opts = super::proof::block_base_options();
+    let at = |leaf_query: LeafQuery| {
+        let mut format = p1_format();
+        format.zf.whir_blowup = 2;
+        BlockFormat {
+            leaf_query,
+            ..format
+        }
+    };
+    let owned = median_statement(&elf_bytes, &opts, &at(LeafQuery::V1));
+    for (query, leaves, first, last) in PINS {
+        let plan = WhirBlockPlan::derive(&elf_bytes, &opts, &at(query), owned.view(), None)
+            .expect("the plan derives");
+        let n = plan.partition().num_leaves();
+        let digest = |k: usize| program_digest(&plan.leaf_program(k).expect("the leaf emits"));
+        let (d_first, d_last) = (digest(0), digest(n - 1));
+        println!("LEAF PINS {query:?}: {n} leaves · first {d_first} · last {d_last}");
+        assert_eq!(n, leaves, "{query:?}: leaves");
+        assert_eq!(d_first, first, "{query:?}: the first leaf's program");
+        assert_eq!(d_last, last, "{query:?}: the last leaf's program");
+    }
+}
+
 /// ★ The lean leaf's census on the median mix at blowup 2 (the production
 /// rate): each group's emitted chip rows under [`LeafQuery::Lean`] against
 /// `V1`, the same statement and partition rule. The tail rounds cut every

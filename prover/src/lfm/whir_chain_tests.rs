@@ -2833,7 +2833,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Keccak over every instruction and the arena schema, as `Debug` prints them.
-fn program_digest(program: &LfmProgram) -> String {
+pub(super) fn program_digest(program: &LfmProgram) -> String {
     use digest::Digest;
     let mut h = crypto::hash::platform_keccak::PlatformKeccak256::new();
     for instr in &program.instrs {
