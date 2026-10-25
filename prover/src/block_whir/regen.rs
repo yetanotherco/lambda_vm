@@ -2645,6 +2645,35 @@ pub(crate) fn dropped_line(
     )
 }
 
+/// The `BLOCK REGEN keep` line under partial drops: the keep budget
+/// ([`stark::multilinear_block::BlockRegen::keep_cells`]) and the arming point
+/// it is read against (the main cells committed, the candidates kept by then),
+/// and what the budget dropped back.
+pub(crate) fn keep_line(report: &stark::multilinear_block::DropReport) -> String {
+    let g = |cells: u64| cells as f64 / 1e9;
+    let budget = match report.keep_cells {
+        Some(cells) => format!(
+            "budget {:.2} G cells (LAMBDA_VM_BLOCK_KEEP_CELLS_G)",
+            g(cells)
+        ),
+        None => "budget off".to_string(),
+    };
+    let Some(at) = report.armed else {
+        return format!("BLOCK REGEN keep: {budget} · never armed");
+    };
+    let cells = report
+        .armed_cells
+        .map_or_else(|| "-".to_string(), |cells| format!("{:.2}", g(cells)));
+    format!(
+        "BLOCK REGEN keep: {budget} · armed at {at:.1} s with {cells} G cells committed and {} \
+         candidates kept, {:.2} GiB · dropped back by the budget {} chunks {:.2} GiB",
+        report.armed_kept.0,
+        report.armed_kept.1 as f64 / GIB,
+        report.keep_back.0,
+        report.keep_back.1 as f64 / GIB,
+    )
+}
+
 /// The shadow's readout once phase B is done: the `BLOCK REGEN` lines (what
 /// phase A recorded against the `streamed` chunks of `streamed_cells` cells,
 /// what the shadow did and each mismatch and failure, the first 20; the plan
@@ -2815,6 +2844,32 @@ pub(crate) fn order_taken_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The keep line says the budget, the arming point (time, G cells, the
+    /// candidates kept) and what the budget dropped back; a run that never
+    /// armed says so.
+    #[test]
+    fn the_keep_line_says_the_budget_and_the_arming_point() {
+        let report = stark::multilinear_block::DropReport {
+            armed: Some(16.04),
+            armed_cells: Some(20_724_000_000),
+            armed_kept: (477, 41 << 30),
+            keep_cells: Some(20_900_000_000),
+            keep_back: (3, 1 << 29),
+            ..Default::default()
+        };
+        assert_eq!(
+            keep_line(&report),
+            "BLOCK REGEN keep: budget 20.90 G cells (LAMBDA_VM_BLOCK_KEEP_CELLS_G) · armed at 16.0 s \
+             with 20.72 G cells committed and 477 candidates kept, 41.00 GiB · dropped back by the \
+             budget 3 chunks 0.50 GiB"
+        );
+        let off = stark::multilinear_block::DropReport::default();
+        assert_eq!(
+            keep_line(&off),
+            "BLOCK REGEN keep: budget off · never armed"
+        );
+    }
 
     /// The order line (N3): the classes in the order taken, run-length, and
     /// the rest's share of the rebuilt cells started by each tenth of phase B.

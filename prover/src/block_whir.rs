@@ -812,6 +812,33 @@ fn parse_drop(value: Option<&str>) -> Result<DropMode, Error> {
     }
 }
 
+/// `LAMBDA_VM_BLOCK_KEEP_CELLS_G`: partial drops' keep budget at arming, in G
+/// main cells committed ([`multilinear_block::BlockRegen::keep_cells`]). Once
+/// live regeneration arms, the tables phase B can rebuild that were committed
+/// past it are dropped back, in rank order, so what phase B holds no longer
+/// follows how far phase A got when the policy first wanted a table out.
+/// Unset, empty or `off` (the default): no budget. It is a constant read
+/// against today's forecast (its reserve per G cells and its target); the
+/// `BLOCK REGEN keep` line says each run's arming point. Anything else refuses
+/// the prove. The proof is the same.
+fn block_keep_cells() -> Result<Option<u64>, Error> {
+    parse_keep_cells(std::env::var(KEEP_CELLS_ENV).ok().as_deref())
+}
+
+const KEEP_CELLS_ENV: &str = "LAMBDA_VM_BLOCK_KEEP_CELLS_G";
+
+fn parse_keep_cells(value: Option<&str>) -> Result<Option<u64>, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "off") => Ok(None),
+        Some(v) => v
+            .parse::<f64>()
+            .ok()
+            .filter(|g| g.is_finite() && *g > 0.0)
+            .map(|g| Some((g * 1e9) as u64))
+            .ok_or_else(|| Error::Prover(format!("{KEEP_CELLS_ENV}={v}: off, or G cells above 0"))),
+    }
+}
+
 /// The dropped bytes after which partial drops purge ([`DropPurges`]).
 const DROP_PURGE_BYTES: u64 = 4 << 30;
 /// The least time between two of their purges.
@@ -4596,6 +4623,7 @@ fn prove_streamed(
     // hand-out order, so the table at block index `t` is the `t`-th chunk
     // handed out when there was one.
     let drop_mode = block_drop()?;
+    let keep_cells = block_keep_cells()?;
     let live_regen = regen_recorder
         .as_ref()
         .filter(|_| regen_mode.live())
@@ -4618,7 +4646,7 @@ fn prove_streamed(
             )
         })
         .map(|regen| match drop_mode {
-            DropMode::Partial => regen.partial(),
+            DropMode::Partial => regen.partial().keep_cells(keep_cells),
             DropMode::All => regen,
         });
     if let (Some(regen), Some(pause)) = (&live_regen, deviations.streamed_drop_delay) {
@@ -5827,6 +5855,7 @@ fn prove_streamed(
             let recipes = recorder.map_or(0, |r| r.recipes().0.len());
             let mut lines = vec![regen::dropped_line(regen_mode, no_disk, &drops, recipes)];
             if let Some(purges) = &drop_purges {
+                lines.push(regen::keep_line(&drops));
                 lines.push(purges.line());
             }
             let rest_report = rest_run.map(regen::RestRun::join);
@@ -7704,7 +7733,10 @@ mod rest_slide_knob_tests {
 mod drop_tests {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
-    use super::{DROP_PURGE_BYTES, DropMode, DropPurges, HostReading, decision_bytes, parse_drop};
+    use super::{
+        DROP_PURGE_BYTES, DropMode, DropPurges, HostReading, decision_bytes, parse_drop,
+        parse_keep_cells,
+    };
     use crate::alloc_purge::Purge;
 
     const G: u64 = 1 << 30;
@@ -7725,6 +7757,30 @@ mod drop_tests {
         }
         for value in ["some", "1", "on", "partly"] {
             assert!(parse_drop(Some(value)).is_err(), "{value}");
+        }
+    }
+
+    /// `LAMBDA_VM_BLOCK_KEEP_CELLS_G`: unset, empty or `off` is no keep budget
+    /// (the default); a G-cell count above 0 is the budget in main cells; any
+    /// other word refuses.
+    #[test]
+    fn the_keep_budget_is_off_by_default_and_takes_g_cells_above_0() {
+        for value in [None, Some(""), Some(" off ")] {
+            assert_eq!(parse_keep_cells(value).ok(), Some(None), "{value:?}");
+        }
+        for (value, cells) in [
+            ("20.9", 20_900_000_000u64),
+            (" 21 ", 21_000_000_000),
+            ("0.5", 500_000_000),
+        ] {
+            assert_eq!(
+                parse_keep_cells(Some(value)).ok(),
+                Some(Some(cells)),
+                "{value}"
+            );
+        }
+        for value in ["0", "-1", "on", "nan", "inf", "20.9G"] {
+            assert!(parse_keep_cells(Some(value)).is_err(), "{value}");
         }
     }
 
