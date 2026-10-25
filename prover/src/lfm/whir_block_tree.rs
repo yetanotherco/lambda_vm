@@ -419,9 +419,11 @@ impl WhirTreeConfig {
         if let Some(ahead) = block_whir::upload_ahead_from_env() {
             options.upload_ahead = ahead;
         }
-        // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 2048),
+        // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 4096),
+        // `BLOCK_WHIR_REST_BUILD=<MiB>` (production 2048),
         // `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1` and `BLOCK_WHIR_PACK_FINISHED=0|1`
-        // (production 1): the rest's layout in waves, KECCAK_RND built as its
+        // (production 1): the rest's gate (its waves where it is laid out in
+        // waves) and the bytes it builds at once, KECCAK_RND built as its
         // tables, the finish's tables packed as they are built.
         block_whir::rest_layout_from_env(&mut options);
         let node_pipe = count_knob("W3_NODE_PIPE")?

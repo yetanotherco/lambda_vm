@@ -4374,7 +4374,7 @@ fn block_whir_on_a_real_block() {
         options.upload_ahead = ahead;
     }
     println!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead);
-    // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 2048),
+    // `BLOCK_WHIR_REST_LAYOUT=all|<MiB>` (production 4096),
     // `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1` and `BLOCK_WHIR_PACK_FINISHED=0|1`
     // (production 1): the rest's layout in waves, KECCAK_RND built as its
     // tables, the finish's tables packed as they are built.
