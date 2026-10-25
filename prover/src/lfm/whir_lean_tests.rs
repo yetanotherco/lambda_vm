@@ -538,3 +538,32 @@ fn the_sampled_checks_still_run_beside_the_tail_rounds() {
         }
     }
 }
+
+/// ★ The tail rounds' fold compare is load-bearing on its own: with the cap
+/// compare off (a test fault, so the hinted tail blocks are bound to nothing
+/// else), one value of the last tail round's first block one off folds away
+/// from the final value and has no execution, while the honest arena under the
+/// same fault executes. Dropping the fold compare turns this red: it is what
+/// makes the leaf's acceptance imply the host's sampled fold checks.
+#[test]
+fn a_lean_chain_refuses_a_tail_value_off_by_its_fold() {
+    for (num_vars, cfg) in tail_cases() {
+        let f = fixture(num_vars, cfg);
+        let shape = lean(&f.shape);
+        let unchecked = tail_faults::with_leaves_unchecked(|| p1_chain_program(&shape));
+        let honest = arena_at(&f, &f.proof, &shape).expect("laid out");
+        execute(&unchecked, std::slice::from_ref(&honest), &SOCKET)
+            .unwrap_or_else(|e| panic!("S={num_vars}: the honest arena under the fault: {e:?}"));
+        let r = *tails(&shape).last().expect("a tail round");
+        assert!(
+            shape.next_depth(r).is_none(),
+            "the last tail round folds to the final value"
+        );
+        let mut forged = honest;
+        forged[tail_block_at(&shape, r)][0] += FE::from(1u64);
+        assert!(
+            execute(&unchecked, &[forged], &SOCKET).is_err(),
+            "S={num_vars}: a tail value one off must be refused by its fold"
+        );
+    }
+}
