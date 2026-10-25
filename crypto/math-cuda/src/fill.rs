@@ -735,7 +735,7 @@ impl FillChecks {
         let Some(missing) = &self.missing else {
             return Ok(true);
         };
-        let missing = stream.clone_dtoh(missing)?;
+        let missing = crate::readback::clone_dtoh(stream, missing)?;
         stream.synchronize()?;
         Ok(missing.first() == Some(&0))
     }
