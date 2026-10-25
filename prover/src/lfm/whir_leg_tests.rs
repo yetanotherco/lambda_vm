@@ -640,26 +640,31 @@ fn the_w_leg_costs_at_the_sizing_shapes() {
     if bits == PRODUCTION_WHIR_GRIND_BITS {
         // ★ THE PINS at the default's 18 bits (Q 114), both policies: two more
         // queries a chain, so every leg costs more to verify than at 20 bits
-        // (wrap 0: +619 perms under policy A, +596 under B).
+        // (wrap 0: +619 perms under policy A, +596 under B). Re-pinned when
+        // main made x254 two register words: a node child publishes every
+        // register's init and fini word, so 146 public words instead of 144,
+        // and every pin here and at 20 bits moved by +1 permutation, +29
+        // operations and +8 hints (at 144 public words the old pins come back
+        // exactly).
         check(
             &rows,
             &[
-                ("wrap 0", 40_342, 403_062, 76_608),
-                ("global wrap", 63_558, 601_451, 119_698),
-                ("L1N0", 63_603, 602_296, 119_755),
-                ("L2N0", 83_370, 777_006, 157_349),
-                ("node -1", 41_835, 413_171, 78_887),
+                ("wrap 0", 40_343, 403_091, 76_616),
+                ("global wrap", 63_559, 601_480, 119_706),
+                ("L1N0", 63_604, 602_325, 119_763),
+                ("L2N0", 83_371, 777_035, 157_357),
+                ("node -1", 41_836, 413_200, 78_895),
             ],
             "A, 18 bits",
         );
         check(
             &rows_b,
             &[
-                ("wrap 0", 38_970, 389_075, 75_113),
-                ("global wrap", 63_483, 598_273, 119_698),
-                ("L1N0", 63_528, 599_001, 119_755),
-                ("L2N0", 63_580, 599_687, 119_830),
-                ("node -1", 41_760, 409_686, 78_887),
+                ("wrap 0", 38_971, 389_104, 75_121),
+                ("global wrap", 63_484, 598_302, 119_706),
+                ("L1N0", 63_529, 599_030, 119_763),
+                ("L2N0", 63_581, 599_716, 119_838),
+                ("node -1", 41_761, 409_715, 78_895),
             ],
             "B, 18 bits",
         );
@@ -679,11 +684,11 @@ fn the_w_leg_costs_at_the_sizing_shapes() {
     // 117,853 · L2N0 62,673 / 592,698 / 117,928 · node −1 41,191 / 405,242 /
     // 77,677.
     let pins_b: [(&str, usize, usize, usize); 5] = [
-        ("wrap 0", 38_374, 383_715, 73_937),
-        ("global wrap", 62_465, 589_417, 117_756),
-        ("L1N0", 62_510, 590_145, 117_813),
-        ("L2N0", 62_562, 590_831, 117_888),
-        ("node -1", 41_119, 404_031, 77_651),
+        ("wrap 0", 38_375, 383_744, 73_945),
+        ("global wrap", 62_466, 589_446, 117_764),
+        ("L1N0", 62_511, 590_174, 117_821),
+        ("L2N0", 62_563, 590_860, 117_896),
+        ("node -1", 41_120, 404_060, 77_659),
     ];
     for (label, perms, ops, hints) in pins_b {
         let row = rows_b
@@ -718,11 +723,11 @@ fn the_w_leg_costs_at_the_sizing_shapes() {
     // 594,462 / 117,796 · L1N0 62,696 / 595,307 / 117,853 · L2N0 82,155 /
     // 767,664 / 154,805 · node −1 41,266 / 408,727 / 77,677.
     let pins: [(&str, usize, usize, usize); 5] = [
-        ("wrap 0", 39_723, 397_531, 75_406),
-        ("global wrap", 62_540, 592_595, 117_756),
-        ("L1N0", 62_585, 593_440, 117_813),
-        ("L2N0", 82_005, 765_141, 154_751),
-        ("node -1", 41_194, 407_516, 77_651),
+        ("wrap 0", 39_724, 397_560, 75_414),
+        ("global wrap", 62_541, 592_624, 117_764),
+        ("L1N0", 62_586, 593_469, 117_821),
+        ("L2N0", 82_006, 765_170, 154_759),
+        ("node -1", 41_195, 407_545, 77_659),
     ];
     for (label, perms, ops, hints) in pins {
         let row = rows
