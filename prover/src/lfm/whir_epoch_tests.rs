@@ -59,9 +59,14 @@ mod tests {
             assert_eq!(e.pc_start, Elf::load(&elf_bytes).expect("load").entry_point);
             assert_eq!(e.elf_digest, crate::statement::elf_digest(&elf_bytes));
             // `chain_config`'s constants, which `agrees_with` on the other
-            // lineage also rests on. The query count is not asserted here: it
+            // lineage also rests on: the rate is the format's (the default's
+            // unless `LAMBDA_VM_ZF_WHIR_BLOWUP` names another), read where
+            // `chain_config` reads it. The query count is not asserted here: it
             // is discharged by the epoch VERIFYING under this config above.
-            assert_eq!(e.config.log_blowup, 2);
+            assert_eq!(
+                e.config.log_blowup,
+                crate::zf_format::ZfFormat::global().whir_log_blowup()
+            );
             assert_eq!(e.config.log_folding, 4);
             assert!(e.config.num_queries > 0);
             published += usize::from(!e.public_output().is_empty());

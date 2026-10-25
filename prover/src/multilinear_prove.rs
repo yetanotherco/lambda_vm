@@ -126,7 +126,7 @@ pub fn chain_config_under(format: &crate::zf_format::ZfFormat, shapes: &[Shape])
     // reads the query grind only, so it is the same under both placements; at
     // the default 18 bits it is two above `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20`'s,
     // to buy back the bits.
-    // The rate is the format's (`LAMBDA_VM_ZF_WHIR_BLOWUP`, blowup 4 by
+    // The rate is the format's (`LAMBDA_VM_ZF_WHIR_BLOWUP`, blowup 2 by
     // default), and Q follows from it by the same rule.
     let config = ChainConfig::with_security_folds(
         format.whir_log_blowup(),

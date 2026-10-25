@@ -499,8 +499,11 @@ fn whir_p1_group_census() {
     println!("CENSUS GROUP MAX: {max:?}");
     println!("CENSUS FRONT: {front:?} · a non-carrier leaf less {target:?}");
 
-    // The plan at the production cap: every leaf, against its chips' heights.
+    // The plan at the production cap: every leaf, against its chips' heights —
+    // the partition's own (doubled when the production leaf scale doubles the
+    // median's leaves, as it does at blowup 2).
     let plan = derive();
+    let heights = plan.leaf_bound().expect("the rule's partition").heights;
     let mut target = None;
     for k in 0..plan.partition().num_leaves() {
         let leaf = plan.partition().leaf(k);
@@ -515,7 +518,7 @@ fn whir_p1_group_census() {
         );
         println!("CENSUS PLAN LEAF {k}: groups {leaf:?} · {emitted:?}");
         assert!(
-            emitted.under(P1_LEAF_HEIGHTS),
+            emitted.under(heights),
             "leaf {k} is past a chip's height: {emitted:?}"
         );
     }
@@ -573,6 +576,9 @@ fn whir_onechain_census() {
             ChipRows::from_array(core::array::from_fn(|c| m[c].max(l[c])))
         });
         let leaves = plan.partition().num_leaves();
+        // The partition's own heights: doubled when the production leaf scale
+        // doubles the median's leaves (at blowup 2).
+        let heights = plan.leaf_bound().expect("the rule's partition").heights;
         println!(
             "ONECHAIN CENSUS {label}: {} groups, {leaves} leaves, L0 socket {} (derived in {:.1} \
              s); group costs min {} median {} max {}; heaviest group {heaviest:?}; front {front:?}",
@@ -600,7 +606,7 @@ fn whir_onechain_census() {
                 leaf.len()
             );
             assert!(
-                emitted.under(P1_LEAF_HEIGHTS),
+                emitted.under(heights),
                 "{label} leaf {k} is past a chip's height: {emitted:?}"
             );
         }
@@ -1248,9 +1254,12 @@ fn whir_s6b_census() {
                 }
             }
             if base == BaseFormat::P1_WHIR && cap.is_none() {
+                // The partition's own heights: doubled when the production leaf
+                // scale doubles the median's leaves (at blowup 2).
+                let heights = plan.leaf_bound().expect("the rule's partition").heights;
                 let rows = ChipRows::of(&program);
                 assert!(
-                    rows.under(P1_LEAF_HEIGHTS),
+                    rows.under(heights),
                     "S6b leaf {k} past a bounded height: {rows:?}"
                 );
             }

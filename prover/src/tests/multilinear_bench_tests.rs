@@ -1477,18 +1477,22 @@ fn the_pinned_pair_is_the_measurement() {
     // ★ AND THE PREPARED OPENING'S TERM, re-spelled the same way. The pin
     // derives it by calling `schedule()`; this writes the arithmetic out at the
     // shape that schedule implies — six rounds over twenty-three variables at
-    // fold width four, the process's queries (112 at 20 grind bits, 114 at the
-    // default's 18), four candidates a squeeze — so the two spellings disagree
-    // if either the round structure or the shape moves.
+    // fold width four, the process's queries (229 at the default's blowup 2 and
+    // 18 grind bits, 225 at 20; 114 and 112 at `LAMBDA_VM_ZF_WHIR_BLOWUP=4`),
+    // four candidates a squeeze — so the two spellings disagree if either the
+    // round structure or the shape moves.
     // `the_prepared_opening_is_the_schedule_the_shape_implies` is what ties
     // those four numbers to the shape rather than to this comment. The runtime
     // pin applies only at 20 bits, where the bases were measured.
-    let opening_queries = if crate::zf_format::ZfFormat::global().whir_grind_bits
-        == crate::zf_format::LEGACY_WHIR_GRIND_BITS
-    {
-        112u64
-    } else {
-        114u64
+    let process = crate::zf_format::ZfFormat::global();
+    let opening_queries = match (
+        process.whir_blowup,
+        process.whir_grind_bits == crate::zf_format::LEGACY_WHIR_GRIND_BITS,
+    ) {
+        (4, true) => 112u64,
+        (4, false) => 114,
+        (_, true) => 225,
+        (_, false) => 229,
     };
     let (rounds, folded, queries) = (6u64, 23u64, 112u64);
     let grinds = 3 * rounds - 1;
