@@ -270,9 +270,11 @@ fn the_production_epoch_recount() {
             production.format,
             crate::zf_format::ZfFormat::DEFAULT.chain_format()
         );
+        // The default's blowup 2 at 18 grind bits; the record's Q 112 below is
+        // blowup 4 at 20.
         assert_eq!(
-            production.num_queries, 114,
-            "first6 keeps Q; the default's 18-bit grind buys two queries"
+            production.num_queries, 229,
+            "first6 keeps Q; the default's blowup 2 at 18 grind bits"
         );
         assert_eq!(ChainShape::new(&production, 25).rounds(), 6, "first6 at 25");
     }

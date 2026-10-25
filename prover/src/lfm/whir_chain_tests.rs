@@ -1951,11 +1951,14 @@ fn the_first_fold_production_chains_cost_what_the_design_derived() {
     });
 }
 
-/// One production chain's pinned costs at `S = 25`: the grinds' permutations,
-/// every permutation, the arena's words, and the shape rows and rows under the
-/// lean fold (the default) and the classic one (the opt-out). The permutations
-/// do not depend on the fold.
+/// One production chain's pinned costs at `S = 25`: the auto caps per tree and
+/// their permutations, the grinds' permutations, every permutation, the
+/// arena's words, and the shape rows and rows under the lean fold (the default)
+/// and the classic one (the opt-out). The permutations do not depend on the
+/// fold.
 struct ChainPins {
+    caps: &'static [usize],
+    cap_perms: usize,
     grind_perms: usize,
     opening_perms: usize,
     perms: usize,
@@ -1965,14 +1968,17 @@ struct ChainPins {
 }
 
 /// ★ THE PRODUCTION DEFAULT CHAIN — what `chain_config` builds with no knob
-/// set — is `first6` under the `Auto` cap, at blowup 2^2 and Q = 114, grinding
+/// set — is `first6` under the `Auto` cap, at blowup 2^1 and Q = 229, grinding
 /// before its queries alone: P2's `whir_grind=query`, one 18-bit grind and one
 /// nonce word a round. The legacy chain keeps its own pins above
-/// (`the_production_chain_costs…`, 185,509 / 22,828); the same chain at 20
-/// bits (`LAMBDA_VM_ZF_WHIR_GRIND_BITS=20`, Q 112) keeps the pins the default
-/// had before the bits moved ([`the_grind_bits_opt_out_chain_keeps_its_pins`]),
-/// and the opt-out of both (`whir_grind=all` at 20 bits) the pins this chain
-/// had before P2 ([`the_grind_opt_out_chain_keeps_the_pins_from_before_p2`]).
+/// (`the_production_chain_costs…`, 185,509 / 22,828). At blowup 2^2
+/// (`LAMBDA_VM_ZF_WHIR_BLOWUP=4`, Q 114) the chain keeps the pins the default
+/// had before the blowup moved
+/// ([`the_blowup_opt_out_chain_keeps_the_pins_from_before_the_flip`]); at 20
+/// bits there too (`LAMBDA_VM_ZF_WHIR_GRIND_BITS=20`, Q 112) the pins it had
+/// before the bits moved ([`the_grind_bits_opt_out_chain_keeps_its_pins`]); and
+/// the opt-out of all three (`whir_grind=all` at 20 bits) the pins it had
+/// before P2 ([`the_grind_opt_out_chain_keeps_the_pins_from_before_p2`]).
 ///
 /// The format also carries the block base's 4-ary cap
 /// ([`crate::hash_pin::BLOCK_BASE`]), under every grind knob: a 4-ary chain
@@ -1997,7 +2003,8 @@ fn the_production_default_chain_is_first6_under_the_auto_cap() {
             group: multilinear::whir_chain::GroupFold::PerPoly,
             leaves: multilinear::whir_chain::LeafOrder::Natural,
         },
-        ..config(114, 0)
+        log_blowup: 1,
+        ..config(229, 0)
     };
     assert_eq!(production, want, "the production default's chain config");
     let shape = ChainShape::new(&production, 25);
@@ -2005,25 +2012,59 @@ fn the_production_default_chain_is_first6_under_the_auto_cap() {
         assert_eq!(shape.carries(r), [false, false, true], "round {r}");
     }
     check_production_chain("DEFAULT", &shape, &DEFAULT_CHAIN_PINS);
+}
+
+/// ★ THE BLOWUP OPT-OUT'S CHAIN IS THE DEFAULT'S BEFORE THE FLIP.
+/// `LAMBDA_VM_ZF_WHIR_BLOWUP=4` builds the chain at blowup 2^2 and Q 114, 18
+/// bits, with every cost the default had before its blowup moved to 2^1: these
+/// pins are that default's, unmoved.
+#[test]
+fn the_blowup_opt_out_chain_keeps_the_pins_from_before_the_flip() {
+    let at4 = crate::multilinear_prove::chain_config_under(
+        &crate::zf_format::ZfFormat {
+            whir_blowup: 4,
+            ..crate::zf_format::ZfFormat::DEFAULT
+        },
+        &[(1, 25)],
+    );
+    let want = ChainConfig {
+        grind: GrindBits::query_only(18),
+        format: ChainFormat {
+            cap: CapPolicy::Auto,
+            folds: WhirFolds::First(FirstFold::new(6).expect("6")),
+            stack: multilinear::whir_chain::StackVars::new(27).expect("27"),
+            nonces: NonceLayout::Spent,
+            argue: multilinear::whir_chain::ArgueFormat::PerTable,
+            arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
+            group: multilinear::whir_chain::GroupFold::PerPoly,
+            leaves: multilinear::whir_chain::LeafOrder::Natural,
+        },
+        ..config(114, 0)
+    };
+    assert_eq!(at4, want, "the blowup-4 chain config");
+    let shape = ChainShape::new(&at4, 25);
+    check_production_chain("BLOWUP-4", &shape, &BLOWUP_4_CHAIN_PINS);
     // The two queries the 18-bit grind buys back cost the verifier their
     // openings (2 × 144 permutations, plus the extra queries' schedule terms):
     // the in-circuit price of two fewer grind bits on the prover.
     const {
-        assert!(DEFAULT_CHAIN_PINS.perms > GRIND_BITS_20_CHAIN_PINS.perms);
-        assert!(DEFAULT_CHAIN_PINS.grind_perms == GRIND_BITS_20_CHAIN_PINS.grind_perms);
+        assert!(BLOWUP_4_CHAIN_PINS.perms > GRIND_BITS_20_CHAIN_PINS.perms);
+        assert!(BLOWUP_4_CHAIN_PINS.grind_perms == GRIND_BITS_20_CHAIN_PINS.grind_perms);
     };
 }
 
 /// ★ THE GRIND-BITS OPT-OUT'S CHAIN IS THE DEFAULT'S BEFORE THE BITS MOVED.
-/// `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20` builds P2's chain at 20 bits and Q 112,
-/// with every cost it had then: these pins are the previous default's,
-/// unmoved. P2 and first6 under the auto cap both pay at this Q: fewer
-/// permutations than either alone, and fewer than the same chain grinding all
-/// three.
+/// `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20` at blowup 2^2
+/// (`LAMBDA_VM_ZF_WHIR_BLOWUP=4`, the rate the default had then) builds P2's
+/// chain at 20 bits and Q 112, with every cost it had then: these pins are
+/// that default's, unmoved. P2 and first6 under the auto cap both pay at this
+/// Q: fewer permutations than either alone, and fewer than the same chain
+/// grinding all three.
 #[test]
 fn the_grind_bits_opt_out_chain_keeps_its_pins() {
     let at20 = crate::multilinear_prove::chain_config_under(
         &crate::zf_format::ZfFormat {
+            whir_blowup: 4,
             whir_grind_bits: crate::zf_format::LEGACY_WHIR_GRIND_BITS,
             ..crate::zf_format::ZfFormat::DEFAULT
         },
@@ -2053,14 +2094,15 @@ fn the_grind_bits_opt_out_chain_keeps_its_pins() {
 }
 
 /// ★ THE OPT-OUT'S CHAIN IS TODAY'S. `LAMBDA_VM_ZF_WHIR_GRIND=all` with
-/// `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20` builds the production default's chain
-/// exactly as it was before P2, 20-bit grinds before all three challenges and
-/// three nonce words a round, and every cost it had then: these pins are the
-/// pre-P2 default's, unmoved.
+/// `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20` at blowup 2^2 (`LAMBDA_VM_ZF_WHIR_BLOWUP=4`)
+/// builds the production default's chain exactly as it was before P2, 20-bit
+/// grinds before all three challenges and three nonce words a round, and every
+/// cost it had then: these pins are the pre-P2 default's, unmoved.
 #[test]
 fn the_grind_opt_out_chain_keeps_the_pins_from_before_p2() {
     let opt_out = crate::multilinear_prove::chain_config_under(
         &crate::zf_format::ZfFormat {
+            whir_blowup: 4,
             whir_grind: crate::zf_format::WhirGrind::All,
             whir_grind_bits: crate::zf_format::LEGACY_WHIR_GRIND_BITS,
             ..crate::zf_format::ZfFormat::DEFAULT
@@ -2118,11 +2160,12 @@ fn check_production_chain(label: &str, shape: &ChainShape, pins: &ChainPins) {
         pins.opening_perms,
         "{label}: opening permutations"
     );
-    assert_eq!(chain_cap_perms(shape), 38, "{label}: cap permutations");
     assert_eq!(
-        shape.caps, DEFAULT_CHAIN_CAPS,
-        "{label}: the auto caps per tree"
+        chain_cap_perms(shape),
+        pins.cap_perms,
+        "{label}: cap permutations"
     );
+    assert_eq!(shape.caps, pins.caps, "{label}: the auto caps per tree");
     assert_eq!(
         RoundStorage::words(shape),
         pins.words,
@@ -2155,9 +2198,25 @@ fn check_production_chain(label: &str, shape: &ChainShape, pins: &ChainPins) {
 /// The production default chain's pins, derived by the closed forms and
 /// checked against the EMITTED program by
 /// [`the_production_chains_emit_their_closed_forms`]. P2's: one grind a round
-/// (6 × 2 permutations), one nonce word a round; Q 114 at 18 grind bits.
-const DEFAULT_CHAIN_CAPS: &[usize] = &[3, 3, 3, 3, 3, 2];
+/// (6 × 2 permutations), one nonce word a round; blowup 2^1 and Q 229 at 18
+/// grind bits, the last tree's auto cap one lower than at 2^2 (its domain a bit
+/// smaller).
 const DEFAULT_CHAIN_PINS: ChainPins = ChainPins {
+    caps: &[3, 3, 3, 3, 3, 1],
+    cap_perms: 36,
+    grind_perms: 12,
+    opening_perms: 30_951,
+    perms: 31_376,
+    words: 64_457,
+    lean: (296_872, 298_123),
+    classic: (404_477, 405_728),
+};
+
+/// The blowup opt-out's pins (blowup 2^2, Q 114 at 18 bits), which are the
+/// production default's from before the blowup moved to 2^1.
+const BLOWUP_4_CHAIN_PINS: ChainPins = ChainPins {
+    caps: &[3, 3, 3, 3, 3, 2],
+    cap_perms: 38,
     grind_perms: 12,
     opening_perms: 16_454,
     perms: 16_705,
@@ -2166,9 +2225,11 @@ const DEFAULT_CHAIN_PINS: ChainPins = ChainPins {
     classic: (205_730, 206_459),
 };
 
-/// The grind-bits opt-out's pins (20 bits, Q 112), which are the production
-/// default's from before the bits moved.
+/// The grind-bits opt-out's pins (blowup 2^2, 20 bits, Q 112), which are the
+/// production default's from before the bits moved.
 const GRIND_BITS_20_CHAIN_PINS: ChainPins = ChainPins {
+    caps: &[3, 3, 3, 3, 3, 2],
+    cap_perms: 38,
     grind_perms: 12,
     opening_perms: 16_166,
     perms: 16_411,
@@ -2180,6 +2241,8 @@ const GRIND_BITS_20_CHAIN_PINS: ChainPins = ChainPins {
 /// The opt-out's pins, which are the production default's from before P2:
 /// `3R − 1 = 17` grinds (34 permutations), three nonce words a round.
 const GRIND_ALL_CHAIN_PINS: ChainPins = ChainPins {
+    caps: &[3, 3, 3, 3, 3, 2],
+    cap_perms: 38,
     grind_perms: 34,
     opening_perms: 16_166,
     perms: 16_443,
@@ -2188,28 +2251,38 @@ const GRIND_ALL_CHAIN_PINS: ChainPins = ChainPins {
     classic: (202_690, 203_426),
 };
 
-/// ★ The production chains, EMITTED (the F1 of the three tests above), the
-/// default and the two opt-outs, under both fold emissions. `#[ignore]`d like
+/// ★ The production chains, EMITTED (the F1 of the four tests above), the
+/// default and the three opt-outs, under both fold emissions. `#[ignore]`d like
 /// its siblings: production-shape programs; laptop-safe.
 #[test]
 #[ignore = "builds production-shape chain programs; run with -- --ignored"]
 fn the_production_chains_emit_their_closed_forms() {
     use crate::zf_format::{LEGACY_WHIR_GRIND_BITS, PRODUCTION_WHIR_GRIND_BITS, WhirGrind};
-    for (label, whir_grind, whir_grind_bits, pins) in [
+    for (label, whir_blowup, whir_grind, whir_grind_bits, pins) in [
         (
             "DEFAULT",
+            2,
             WhirGrind::Query,
             PRODUCTION_WHIR_GRIND_BITS,
             &DEFAULT_CHAIN_PINS,
         ),
         (
+            "BLOWUP-4",
+            4,
+            WhirGrind::Query,
+            PRODUCTION_WHIR_GRIND_BITS,
+            &BLOWUP_4_CHAIN_PINS,
+        ),
+        (
             "GRIND-BITS-20",
+            4,
             WhirGrind::Query,
             LEGACY_WHIR_GRIND_BITS,
             &GRIND_BITS_20_CHAIN_PINS,
         ),
         (
             "GRIND-ALL",
+            4,
             WhirGrind::All,
             LEGACY_WHIR_GRIND_BITS,
             &GRIND_ALL_CHAIN_PINS,
@@ -2217,6 +2290,7 @@ fn the_production_chains_emit_their_closed_forms() {
     ] {
         let production = crate::multilinear_prove::chain_config_under(
             &crate::zf_format::ZfFormat {
+                whir_blowup,
                 whir_grind,
                 whir_grind_bits,
                 ..crate::zf_format::ZfFormat::DEFAULT
@@ -2788,9 +2862,9 @@ fn proof_digest(proof: &ChainProof<F, E>) -> (usize, String) {
 /// programs (instructions, a digest of all of them, arena words), the arenas and
 /// the host proofs' rkyv bytes at zero bits (the only width where two proves
 /// agree: a search returns any valid nonce), under `Three` with uniform grinds.
-/// Also the production chain under the opt-out, `whir_grind=all` at 20 bits, at
-/// the stacks the block reaches (25 and 27): the program the pre-P2 default
-/// emitted.
+/// Also the production chain under the opt-out, `whir_grind=all` at 20 bits
+/// and blowup 2^2, at the stacks the block reaches (25 and 27): the program the
+/// pre-P2 default emitted.
 #[test]
 fn the_legacy_nonce_layout_reproduces_the_bytes_from_before_p2() {
     const PROGRAMS: [(usize, u8, usize, u32, &str); 4] = [
@@ -2871,6 +2945,7 @@ fn the_legacy_nonce_layout_reproduces_the_bytes_from_before_p2() {
     }
 
     let opt_out = crate::zf_format::ZfFormat {
+        whir_blowup: 4,
         whir_grind: crate::zf_format::WhirGrind::All,
         whir_grind_bits: crate::zf_format::LEGACY_WHIR_GRIND_BITS,
         ..crate::zf_format::ZfFormat::DEFAULT
@@ -2906,9 +2981,9 @@ fn the_legacy_nonce_layout_reproduces_the_bytes_from_before_p2() {
 }
 
 /// I-GRIND instrument (not a gate): the emitted chain verifier's real rows per
-/// chip at every production height, under the production format at 20 grind
-/// bits (Q 112, the opt-out) and at the default's 18 (Q 114). The per-chain
-/// deltas size the recursion's table heights under each.
+/// chip at every production height, under the production format (blowup 2^1)
+/// at 20 grind bits (Q 225, the opt-out) and at the default's 18 (Q 229). The
+/// per-chain deltas size the recursion's table heights under each.
 ///
 /// cargo test -p lambda-vm-prover --lib grind_bits_chain_census -- --ignored --nocapture
 #[test]

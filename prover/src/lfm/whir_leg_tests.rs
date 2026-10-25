@@ -563,11 +563,13 @@ fn the_leg_program_round_trips_as_a_w_lfm_proof() {
 /// The child publishes a NODE schema (`SchemaLayout::node(0)`), the instrument's
 /// assumption, so the two are compared like for like.
 ///
-/// The pins follow the process's grind bits, which set Q (a W-LFM plan refuses
-/// artifacts built under another config, so one process costs one setting):
-/// at the default's 18 (Q 114) the 18-bit pins; under
-/// `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20` (Q 112, the default before the bits moved)
-/// the 20-bit pins and the design's instrument numbers, which were taken there.
+/// The pins follow the process's blowup and grind bits, which set Q (a W-LFM
+/// plan refuses artifacts built under another config, so one process costs one
+/// setting): at the default's (blowup 2, 18 bits: Q 229) the default's pins;
+/// under `LAMBDA_VM_ZF_WHIR_BLOWUP=4` (Q 114, the default before the blowup
+/// moved) the blowup-4 pins; with `LAMBDA_VM_ZF_WHIR_GRIND_BITS=20` there too
+/// (Q 112, the default before the bits moved) the 20-bit pins and the design's
+/// instrument numbers, which were taken there.
 #[test]
 fn the_w_leg_costs_at_the_sizing_shapes() {
     use crate::zf_format::{LEGACY_WHIR_GRIND_BITS, PRODUCTION_WHIR_GRIND_BITS, ZfFormat};
@@ -636,9 +638,44 @@ fn the_w_leg_costs_at_the_sizing_shapes() {
                 );
             }
         };
-    let bits = ZfFormat::global().whir_grind_bits;
+    let (blowup, bits) = (
+        ZfFormat::global().whir_blowup,
+        ZfFormat::global().whir_grind_bits,
+    );
+    if (blowup, bits) == (ZfFormat::DEFAULT.whir_blowup, PRODUCTION_WHIR_GRIND_BITS) {
+        // ★ THE PINS at the default (blowup 2, 18 bits: Q 229), both policies:
+        // about twice the queries a chain of blowup 4's, so every leg costs
+        // about 1.8 times as much to verify.
+        check(
+            &rows,
+            &[
+                ("wrap 0", 71_435, 705_121, 141_601),
+                ("global wrap", 115_327, 1_085_621, 225_174),
+                ("L1N0", 115_372, 1_086_466, 225_231),
+                ("L2N0", 152_825, 1_425_117, 298_478),
+                ("node -1", 74_193, 722_360, 145_835),
+            ],
+            "A, the default",
+        );
+        check(
+            &rows_b,
+            &[
+                ("wrap 0", 68_773, 683_452, 138_615),
+                ("global wrap", 115_252, 1_082_443, 225_174),
+                ("L1N0", 115_297, 1_083_171, 225_231),
+                ("L2N0", 115_349, 1_083_857, 225_306),
+                ("node -1", 74_118, 718_875, 145_835),
+            ],
+            "B, the default",
+        );
+        return;
+    }
+    assert_eq!(
+        blowup, 4,
+        "the sizing pins exist at the default and at blowup 4 only"
+    );
     if bits == PRODUCTION_WHIR_GRIND_BITS {
-        // ★ THE PINS at the default's 18 bits (Q 114), both policies: two more
+        // ★ THE PINS at blowup 4 and 18 bits (Q 114), both policies: two more
         // queries a chain, so every leg costs more to verify than at 20 bits
         // (wrap 0: +619 perms under policy A, +596 under B). Re-pinned when
         // main made x254 two register words: a node child publishes every
@@ -655,7 +692,7 @@ fn the_w_leg_costs_at_the_sizing_shapes() {
                 ("L2N0", 83_371, 777_035, 157_357),
                 ("node -1", 41_836, 413_200, 78_895),
             ],
-            "A, 18 bits",
+            "A, blowup 4, 18 bits",
         );
         check(
             &rows_b,
@@ -666,15 +703,15 @@ fn the_w_leg_costs_at_the_sizing_shapes() {
                 ("L2N0", 63_581, 599_716, 119_838),
                 ("node -1", 41_761, 409_715, 78_895),
             ],
-            "B, 18 bits",
+            "B, blowup 4, 18 bits",
         );
         return;
     }
     assert_eq!(
         bits, LEGACY_WHIR_GRIND_BITS,
-        "the sizing pins exist at 18 and 20 grind bits only"
+        "the sizing pins at blowup 4 exist at 18 and 20 grind bits only"
     );
-    // ★ The policy-B pins at 20 bits, same format.
+    // ★ The policy-B pins at blowup 4 and 20 bits, same format.
     //
     // Re-blessed under P2 (the chains grind before their queries only, with
     // one spent nonce a round): each chain round drops its folding and OOD
