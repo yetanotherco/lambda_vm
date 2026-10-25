@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use executor::vm::logs::Log;
 use multilinear::narrow::NarrowColumns;
-use multilinear::records::{DecodeRecords, Records, RecordsFill, TableRecords};
+use multilinear::records::{DecodeRecords, PagesReturned, Records, RecordsFill, TableRecords};
 
 use super::{Segments, StreamTable, Table};
 use crate::tables::decode::DecodeTable;
@@ -175,6 +175,10 @@ impl TableRecords for CpuLogRecords {
         trace.pack_main_narrow();
         trace.take_narrow_main()
     }
+
+    fn return_pages(&mut self) -> PagesReturned {
+        self.logs.return_pages()
+    }
 }
 
 /// A full MEMW_R chunk held as its register rows.
@@ -248,6 +252,10 @@ impl TableRecords for RegisterRowRecords {
         // Written packed, except in a build that holds every trace wide.
         trace.pack_main_narrow();
         trace.take_narrow_main()
+    }
+
+    fn return_pages(&mut self) -> PagesReturned {
+        self.rows.return_pages()
     }
 }
 
@@ -445,6 +453,10 @@ impl<T: RowFamily> TableRecords for RowRecords<T> {
         // Written packed, except in a build that holds every trace wide.
         trace.pack_main_narrow();
         trace.take_narrow_main()
+    }
+
+    fn return_pages(&mut self) -> PagesReturned {
+        self.rows.return_pages()
     }
 }
 

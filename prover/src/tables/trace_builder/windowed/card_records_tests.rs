@@ -872,3 +872,49 @@ fn a_chunk_dropped_as_records_is_rebuilt_as_them() {
     }
     assert!(crossed.iter().all(|&n| n > 0), "{crossed:?}");
 }
+
+/// ★ A records chunk let go hands back the pages of the lists it is the last
+/// holder of, and leaves a list another chunk still holds as it is (its values
+/// intact); on Linux the whole pages inside each such list go back to the OS.
+/// Through the shared handle: only its last holder hands anything back.
+#[test]
+fn a_records_chunk_hands_back_only_the_lists_it_alone_holds() {
+    use super::Segments;
+    use super::card_records::RegisterRowRecords;
+    use multilinear::records::{PagesReturned, Records};
+    let row = crate::tables::memw_register::RegRow::new(0, 9, 0, 0, 0, 0, 8, false);
+    // 2^16 rows of 32 bytes: 2 MiB a list, whole pages inside it.
+    let n = 1usize << 16;
+    let shared = Arc::new(vec![row; n]);
+    let rows = |parts: Vec<(Arc<Vec<_>>, std::ops::Range<usize>)>| {
+        let Ok(records) = RegisterRowRecords::new(Segments { parts }) else {
+            panic!("a whole table");
+        };
+        records
+    };
+    let mut held = rows(vec![
+        (Arc::new(vec![row; n]), 0..n),
+        (Arc::clone(&shared), 0..n),
+    ]);
+    let got = multilinear::records::TableRecords::return_pages(&mut held);
+    assert_eq!((got.buffers, got.shared, got.failed), (1, 1, 0), "{got:?}");
+    if cfg!(target_os = "linux") {
+        assert!(got.bytes > 0 && got.bytes <= (n * 32) as u64, "{got:?}");
+    } else {
+        assert_eq!(got.bytes, 0, "{got:?}");
+    }
+    drop(held);
+    let want = format!("{row:?}");
+    assert!(
+        shared.iter().all(|r| format!("{r:?}") == want),
+        "the shared list's values"
+    );
+
+    // Through the records' handle: a handle that is not the last returns
+    // nothing, the last one hands its lists back.
+    let records = Records(Arc::new(rows(vec![(Arc::new(vec![row; n]), 0..n)])));
+    let other = records.clone();
+    assert_eq!(records.return_pages(), PagesReturned::default());
+    let got = other.return_pages();
+    assert_eq!((got.buffers, got.shared, got.failed), (1, 0, 0), "{got:?}");
+}

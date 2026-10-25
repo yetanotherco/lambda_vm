@@ -1701,6 +1701,48 @@ fn chunk_jobs(
     jobs
 }
 
+/// Hands the whole pages inside `list`'s allocation back to the OS
+/// (`madvise(MADV_DONTNEED)` on its page-aligned interior), right before the
+/// list is freed: the bytes handed back, or the OS's errno. The range stays
+/// mapped and reads as zeros if touched again, so the allocator's free and any
+/// later reuse of it stay valid; the list's values are not read again. Only on
+/// Linux, and only for values with nothing to drop (whose free reads nothing);
+/// otherwise nothing is handed back.
+#[cfg(target_os = "linux")]
+fn return_list_pages<T>(list: &mut Vec<T>) -> Result<u64, i32> {
+    if std::mem::needs_drop::<T>() {
+        return Ok(0);
+    }
+    // SAFETY: sysconf has no preconditions.
+    let page = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+        n if n > 0 => n as usize,
+        _ => 4096,
+    };
+    let start = list.as_mut_ptr() as usize;
+    let end = start + list.capacity() * std::mem::size_of::<T>();
+    let (lo, hi) = (start.next_multiple_of(page), end / page * page);
+    if hi <= lo {
+        return Ok(0);
+    }
+    // SAFETY: [lo, hi) lies inside the list's own allocation, which the caller
+    // alone holds (`Arc::get_mut`) and frees next without reading it; `T` has
+    // nothing to drop, so freeing it reads nothing either. MADV_DONTNEED leaves the
+    // range mapped (zero-filled on the next touch), so the allocator's
+    // metadata, kept outside the allocation, and its free stay valid.
+    let rc = unsafe { libc::madvise(lo as *mut libc::c_void, hi - lo, libc::MADV_DONTNEED) };
+    if rc == 0 {
+        Ok((hi - lo) as u64)
+    } else {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+    }
+}
+
+/// Off Linux nothing is handed back.
+#[cfg(not(target_os = "linux"))]
+fn return_list_pages<T>(_list: &mut Vec<T>) -> Result<u64, i32> {
+    Ok(0)
+}
+
 /// A chunk's ops as the window parts they lie in, in run order: each part is
 /// shared with the tail (and with the chunk on its other side when it straddles
 /// a chunk boundary), so a chunk leaves the tail without a copy and its
@@ -1741,6 +1783,35 @@ impl<T> Segments<T> {
     /// The bytes its ops take (the ranges, not the parts they lie in).
     fn op_bytes(&self) -> usize {
         self.len() * std::mem::size_of::<T>()
+    }
+
+    /// Hands back to the OS the pages of each part's list this is the last
+    /// holder of ([`return_list_pages`]), as the chunk is let go: nothing reads
+    /// them after, their holder drops them next. A list another chunk still
+    /// holds stays as it is.
+    pub(crate) fn return_pages(&mut self) -> multilinear::records::PagesReturned {
+        let mut got = multilinear::records::PagesReturned::default();
+        for (list, _) in &mut self.parts {
+            let Some(list) = Arc::get_mut(list) else {
+                got.shared += 1;
+                continue;
+            };
+            got.buffers += 1;
+            match return_list_pages(list) {
+                Ok(bytes) => got.bytes += bytes,
+                Err(errno) => {
+                    got.failed += 1;
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    SAID.call_once(|| {
+                        eprintln!(
+                            "BLOCK CARD FILL released: madvise refused a records list's pages \
+                             (errno {errno}); its pages stay with the allocator"
+                        );
+                    });
+                }
+            }
+        }
+        got
     }
 
     /// The ops as one list: moved out of a sole whole part, copied otherwise.
