@@ -146,6 +146,11 @@ pub struct GroupStamps {
     /// Phase B: the bytes of records its tables held as their records, let go
     /// with the group after its openings (under a spill).
     pub records_released: usize,
+    /// Of those records, what their pages handed back to the OS came to
+    /// ([`RecordsReturner`]), and the seconds the handing back took on its
+    /// thread.
+    pub records_pages: multilinear::records::PagesReturned,
+    pub records_return_secs: f64,
     /// The device ledger's peak promise through the group's argue — the
     /// argue's own and the next group's columns uploaded beside it, and under
     /// [`PhaseBOverlap::On`] the previous group's openings beside it too
@@ -3034,17 +3039,87 @@ where
     ))
 }
 
+/// Phase B's finished groups' records, let go off the driver thread
+/// ([`release_group`]): one thread of its own hands each table's records'
+/// pages back to the OS ([`multilinear::records::Records::return_pages`]) and
+/// frees them, so phase B neither waits on that nor on the frees. Joined before
+/// phase B returns ([`Self::finish`]), and when dropped, so a prove's time and
+/// its stamps hold all of it.
+struct RecordsReturner {
+    tx: Option<std::sync::mpsc::Sender<(usize, multilinear::records::Records)>>,
+    thread: Option<std::thread::JoinHandle<Vec<(usize, multilinear::records::PagesReturned, f64)>>>,
+}
+
+impl RecordsReturner {
+    /// Its thread, started; without one (the spawn refused) records are
+    /// dropped where they are let go, nothing handed back.
+    fn start() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, multilinear::records::Records)>();
+        let thread = std::thread::Builder::new()
+            .name("records-return".to_string())
+            .spawn(move || {
+                rx.into_iter()
+                    .map(|(g, records)| {
+                        let t = Instant::now();
+                        let pages = records.return_pages();
+                        (g, pages, t.elapsed().as_secs_f64())
+                    })
+                    .collect()
+            })
+            .ok();
+        Self {
+            tx: thread.is_some().then_some(tx),
+            thread,
+        }
+    }
+
+    /// Group `g`'s records, handed to the thread (dropped here without one).
+    fn take(&self, g: usize, records: multilinear::records::Records) {
+        if let Some(tx) = &self.tx {
+            // A thread that is gone hands the records back in the error, and
+            // they drop here.
+            let _ = tx.send((g, records));
+        }
+    }
+
+    /// Waits for the thread to finish what it was handed, and adds what each
+    /// group's records came to to its stamps.
+    fn finish(mut self, stamps: &mut [GroupStamps]) {
+        self.tx = None;
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        for (g, pages, secs) in thread.join().unwrap_or_default() {
+            if let Some(stamp) = stamps.get_mut(g) {
+                stamp.records_pages += pages;
+                stamp.records_return_secs += secs;
+            }
+        }
+    }
+}
+
+impl Drop for RecordsReturner {
+    fn drop(&mut self) {
+        self.tx = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Lets a group go once its openings are done: its tables' columns off the
 /// card and out of their widened form — under a spill its packed columns too,
 /// and the records of a table held as them, which nothing reads after its
 /// openings — its store, and its kept tree tops out of the memory log. The
-/// bytes of records let go.
+/// bytes of records let go; the records themselves go to `returner`, which
+/// hands their pages back to the OS off this thread.
 fn release_group<F, E>(
     group: &mut [CommittedTable<'_, F, E>],
     g: usize,
     store: Store,
     tree_tops: usize,
     spilling: bool,
+    returner: Option<&RecordsReturner>,
     mem: Option<&BlockMem>,
 ) -> usize
 where
@@ -3066,8 +3141,13 @@ where
         let released = match table.take_narrow_for_spill() {
             Some(packed) => Some(packed.data().len()),
             None => table.take_records_for_spill().map(|records| {
-                records_released += records.bytes();
-                records.bytes()
+                let bytes = records.bytes();
+                records_released += bytes;
+                match returner {
+                    Some(returner) => returner.take(g, records),
+                    None => drop(records),
+                }
+                bytes
             }),
         };
         if let (Some(bytes), Some(mem)) = (released, mem) {
@@ -3173,6 +3253,9 @@ where
     // card idles through the argument's host glue, and a group's store is a
     // few GiB beside the argument's working set, not beside its codewords.
     let mut pre_uploaded: Option<Store> = None;
+    // The finished groups' records go to a thread of their own (under a spill,
+    // the only time phase B lets them go).
+    let returner = spill.is_some().then(RecordsReturner::start);
     // Under the overlap: the group argued last, whose openings run beside the
     // next group's argue; and whether a transition saw the card refuse a
     // promise, after which every group opens alone.
@@ -3429,6 +3512,7 @@ where
                 earlier.store,
                 earlier.tree_tops,
                 spill.is_some(),
+                returner.as_ref(),
                 mem.as_deref(),
             );
             stamps[h].end_b = entered.elapsed().as_secs_f64();
@@ -3498,12 +3582,17 @@ where
             argued.store,
             argued.tree_tops,
             spill.is_some(),
+            returner.as_ref(),
             mem.as_deref(),
         );
         stamps[g].end_b = entered.elapsed().as_secs_f64();
     }
     if sched && let (Some((then, h)), Some(now)) = (turn_sched, thread_schedstat()) {
         stamps[h].sched_b = Some((now.0.saturating_sub(then.0), now.1.saturating_sub(then.1)));
+    }
+    // Every finished group's records handed back before phase B returns.
+    if let Some(returner) = returner {
+        returner.finish(&mut stamps);
     }
     // The tables go with this function: a memory log stops holding them.
     if let Some(mem) = &mem {
@@ -3843,11 +3932,13 @@ mod spill_tests {
     /// ★ Under a spill, a finished group lets go of its tables' records as it
     /// does of their packed columns: the table is out (spilled), the records'
     /// last handle is gone, and the bytes come back as the group's records
-    /// released; packed columns go too but are not records. With no spill,
-    /// nothing is taken and nothing counts.
+    /// released; packed columns go too but are not records. With a returner the
+    /// records go to its thread, which hands their pages back and frees them
+    /// before it finishes, and what they came to lands in the group's stamps.
+    /// With no spill, nothing is taken and nothing counts.
     #[test]
     fn a_finished_group_lets_go_of_its_records_under_a_spill() {
-        use super::release_group;
+        use super::{GroupStamps, RecordsReturner, release_group};
         use crate::examples::multi_table_lookup::new_cpu_air_with_lookup;
         use crate::multilinear_air::Uniforms;
         use crate::multilinear_table::{CommittedTable, TableLayout};
@@ -3857,11 +3948,28 @@ mod spill_tests {
             element::FieldElement, extensions_goldilocks::Degree3GoldilocksExtensionField as Ext,
             goldilocks::GoldilocksField as Fp,
         };
-        use multilinear::records::{KeccakRndOp, Records, RecordsFill, TableRecords};
+        use multilinear::records::{
+            KeccakRndOp, PagesReturned, Records, RecordsFill, TableRecords,
+        };
         use std::sync::Arc;
 
+        // What these records say they handed back.
+        const RETURNED: PagesReturned = PagesReturned {
+            buffers: 1,
+            shared: 2,
+            bytes: 4096,
+            failed: 0,
+        };
+        // Records freed so far (a handle kept to watch them would keep the
+        // returner from being their last holder).
+        static FREED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         #[derive(Debug)]
         struct Ops(Vec<KeccakRndOp>);
+        impl Drop for Ops {
+            fn drop(&mut self) {
+                FREED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
         impl TableRecords for Ops {
             fn rows(&self) -> usize {
                 8
@@ -3878,6 +3986,9 @@ mod spill_tests {
             fn host_fill(&self) -> Option<NarrowColumns> {
                 None
             }
+            fn return_pages(&mut self) -> PagesReturned {
+                RETURNED
+            }
         }
         let air = new_cpu_air_with_lookup(&ProofOptions::default_test_options());
         let layout = || {
@@ -3891,17 +4002,18 @@ mod spill_tests {
             )
             .expect("a layout")
         };
-        let records = Records(Arc::new(Ops(vec![
-            KeccakRndOp {
-                timestamp: 3,
-                input: [7; 25],
-            };
-            2
-        ])));
-        let weak = Arc::downgrade(&records.0);
-        let bytes = records.bytes();
+        let ops = || {
+            Records(Arc::new(Ops(vec![
+                KeccakRndOp {
+                    timestamp: 3,
+                    input: [7; 25],
+                };
+                2
+            ])))
+        };
+        let bytes = ops().bytes();
         assert!(bytes > 0);
-        let held = || CommittedTable::from_records(layout(), records.clone()).expect("a table");
+        let held = || CommittedTable::from_records(layout(), ops()).expect("a table");
         let packed = || {
             let mut table = CommittedTable::<Fp, Ext>::new(
                 air.constraint_program(),
@@ -3923,17 +4035,45 @@ mod spill_tests {
 
         // No spill: the records stay where they are.
         let mut group = vec![held()];
-        assert_eq!(release_group(&mut group, 0, None, 0, false, None), 0);
+        assert_eq!(release_group(&mut group, 0, None, 0, false, None, None), 0);
         assert!(group[0].records().is_some() && !group[0].is_spilled());
         drop(group);
 
-        // A spill: the records go, with their last handle, and are counted;
-        // the packed table goes uncounted.
+        // A spill with no returner: the records go here, with their last
+        // handle, and are counted; the packed table goes uncounted.
         let mut group = vec![packed(), held()];
-        drop(records);
-        assert_eq!(release_group(&mut group, 0, None, 0, true, None), bytes);
+        let freed = FREED.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            release_group(&mut group, 0, None, 0, true, None, None),
+            bytes
+        );
         assert!(group.iter().all(|t| t.is_spilled()), "both tables let go");
-        assert!(weak.upgrade().is_none(), "the records' memory is freed");
+        assert_eq!(
+            FREED.load(std::sync::atomic::Ordering::SeqCst),
+            freed + 1,
+            "freed here"
+        );
+
+        // With a returner: its thread takes them, the last handle, and hands
+        // their pages back and frees them before it finishes; the group's
+        // stamps say so.
+        let mut group = vec![packed(), held()];
+        let freed = FREED.load(std::sync::atomic::Ordering::SeqCst);
+        let returner = RecordsReturner::start();
+        assert_eq!(
+            release_group(&mut group, 1, None, 0, true, Some(&returner), None),
+            bytes
+        );
+        assert!(group.iter().all(|t| t.is_spilled()), "both tables let go");
+        let mut stamps = vec![GroupStamps::default(); 2];
+        returner.finish(&mut stamps);
+        assert_eq!(
+            FREED.load(std::sync::atomic::Ordering::SeqCst),
+            freed + 1,
+            "freed there"
+        );
+        assert_eq!(stamps[1].records_pages, RETURNED, "group 1's records");
+        assert_eq!(stamps[0].records_pages, PagesReturned::default());
     }
 
     /// A schedstat line reads as its CPU and run-queue delay nanoseconds; a
