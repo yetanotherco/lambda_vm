@@ -171,8 +171,8 @@ const STREAM_POOL_SIZE: usize = 32;
 
 pub struct Backend {
     pub ctx: Arc<CudaContext>,
-    /// The stream pool, and the background pool beside it when
-    /// `LAMBDA_VM_STREAM_CLASSES` asks for one ([`crate::stream_class`]).
+    /// The stream pool, and the background pool beside it unless
+    /// `LAMBDA_VM_STREAM_CLASSES=off` ([`crate::stream_class`]).
     streams: crate::stream_class::StreamPools<Arc<CudaStream>>,
     /// Per-rayon-worker pinned staging buffers. Indexed by
     /// `rayon::current_thread_index()` (0 for non-rayon callers). Each slot

@@ -525,7 +525,7 @@ pub struct BlockOptions {
     /// group's argue, and under `Pinned` the openings' thread reads back
     /// through pinned staging ([`multilinear_block::PhaseBOverlap`]); the
     /// proof's bytes are the same. Production: [`phase_b_overlap_from_env`],
-    /// off by default.
+    /// `Pinned` by default on a card build ([`PHASE_B_OVERLAP_DEFAULT`]).
     pub phase_b_overlap: multilinear_block::PhaseBOverlap,
 }
 
@@ -1076,19 +1076,35 @@ impl BlockOptions {
     }
 }
 
+/// Phase B's overlap when `LAMBDA_VM_PHASE_B_OVERLAP` is unset: on a card
+/// build the openings beside the next group's argue, reading back through
+/// pinned staging, with the argue's streams ahead of theirs (the card's
+/// stream classes default to `priority`), which is the configuration that was
+/// timed; a host-only build keeps the openings in line, untimed beside an
+/// argue on the same cores.
+pub(crate) const PHASE_B_OVERLAP_DEFAULT: multilinear_block::PhaseBOverlap =
+    if cfg!(feature = "cuda") {
+        multilinear_block::PhaseBOverlap::Pinned
+    } else {
+        multilinear_block::PhaseBOverlap::Off
+    };
+
 /// `LAMBDA_VM_PHASE_B_OVERLAP`: [`BlockOptions::phase_b_overlap`]'s
-/// production value, `1` on and `0` (or unset) off.
+/// production value: unset [`PHASE_B_OVERLAP_DEFAULT`], `0` off, `1` on,
+/// `pinned` on with pinned read-backs.
 pub(crate) fn phase_b_overlap_from_env() -> multilinear_block::PhaseBOverlap {
     phase_b_overlap_from(std::env::var("LAMBDA_VM_PHASE_B_OVERLAP").ok().as_deref())
 }
 
-/// [`phase_b_overlap_from_env`]'s reading of its variable: `1` is on,
-/// `pinned` on with the openings' read-backs through pinned staging; another
-/// word is read as off, and said once.
+/// [`phase_b_overlap_from_env`]'s reading of its variable: unset is
+/// [`PHASE_B_OVERLAP_DEFAULT`], `0` off, `1` on, `pinned` on with the
+/// openings' read-backs through pinned staging; another word is read as off,
+/// and said once.
 pub(crate) fn phase_b_overlap_from(value: Option<&str>) -> multilinear_block::PhaseBOverlap {
     use multilinear_block::PhaseBOverlap;
     match value.map(str::trim) {
-        None | Some("0") => PhaseBOverlap::Off,
+        None => PHASE_B_OVERLAP_DEFAULT,
+        Some("0") => PhaseBOverlap::Off,
         Some("1") => PhaseBOverlap::On,
         Some("pinned") => PhaseBOverlap::Pinned,
         Some(other) => {

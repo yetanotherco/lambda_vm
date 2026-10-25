@@ -1,14 +1,15 @@
 //! Two classes of device work, so a proof run beside another can yield the card.
 //!
 //! Every caller is in the foreground unless its thread says otherwise
-//! ([`enter`]). With `LAMBDA_VM_STREAM_CLASSES` unset (or `off`) the class is
-//! read by nobody: one pool of streams serves every thread, as it always did.
-//! With `priority`, the foreground pool is created at the device's greatest
-//! stream priority and a background pool of [`BACKGROUND_STREAMS`] at its
-//! least, so the card's block scheduler starts a foreground kernel's blocks
-//! before a background kernel's pending ones; with `equal`, the background pool
-//! exists but every stream has the default priority (the control for
-//! `priority`).
+//! ([`enter`]). With `LAMBDA_VM_STREAM_CLASSES` unset (or `priority`), the
+//! foreground pool is created at the device's greatest stream priority and a
+//! background pool of [`BACKGROUND_STREAMS`] at its least, so the card's block
+//! scheduler starts a foreground kernel's blocks before a background kernel's
+//! pending ones; with `equal`, the background pool exists but every stream has
+//! the default priority (the control for `priority`); with `off` the class is
+//! read by nobody: one pool of streams serves every thread, as it did before
+//! the classes. A process with no background thread runs every kernel on the
+//! foreground pool whichever it is.
 //!
 //! The class is a property of the THREAD that draws the stream. A thread a
 //! background proof spawns must be marked again (`stark`'s per-table drivers
@@ -39,22 +40,23 @@ pub enum StreamClass {
 /// What the backend builds its streams as (`LAMBDA_VM_STREAM_CLASSES`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamClasses {
-    /// One pool for every thread (unset, `off`): today's streams.
+    /// One pool for every thread (`off`): the streams before the classes.
     Off,
     /// The foreground pool at the greatest priority, a background pool at the
-    /// least (`priority`).
+    /// least (unset, `priority`).
     Priority,
     /// A background pool, every stream at the default priority (`equal`).
     Equal,
 }
 
 impl StreamClasses {
-    /// The knob's reading: unset or `off` is [`Self::Off`], `priority` and
-    /// `equal` the two pools; anything else is an error naming the knob.
+    /// The knob's reading: unset or `priority` is [`Self::Priority`], `equal`
+    /// the two pools at one priority, `off` [`Self::Off`]; anything else is an
+    /// error naming the knob.
     pub fn parse(value: Option<&str>) -> Result<Self, String> {
         match value.map(str::trim) {
-            None | Some("off") => Ok(Self::Off),
-            Some("priority") => Ok(Self::Priority),
+            None | Some("priority") => Ok(Self::Priority),
+            Some("off") => Ok(Self::Off),
             Some("equal") => Ok(Self::Equal),
             Some(other) => Err(format!(
                 "{STREAM_CLASSES_ENV}={other}: off, priority or equal"
@@ -228,10 +230,11 @@ mod tests {
         assert_eq!(current(), StreamClass::Foreground, "an unwind restores it");
     }
 
-    /// The knob's words, and a word it does not take refused by name.
+    /// The knob's words, unset read as `priority`, and a word it does not take
+    /// refused by name.
     #[test]
     fn the_knob_reads_off_priority_and_equal() {
-        assert_eq!(StreamClasses::parse(None), Ok(StreamClasses::Off));
+        assert_eq!(StreamClasses::parse(None), Ok(StreamClasses::Priority));
         assert_eq!(StreamClasses::parse(Some("off")), Ok(StreamClasses::Off));
         assert_eq!(
             StreamClasses::parse(Some(" priority ")),

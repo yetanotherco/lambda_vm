@@ -1784,13 +1784,16 @@ fn phase_b_overlap_failures_are_the_proves_error_and_a_refusal_turns_it_serial()
     assert!(report.contains(&counted), "{counted}\n{report}");
 }
 
-/// `LAMBDA_VM_PHASE_B_OVERLAP`: `1` on, `pinned` on with the openings'
-/// read-backs through pinned staging; unset, `0` or any other word off.
+/// `LAMBDA_VM_PHASE_B_OVERLAP`: unset `pinned` on a card build and off on a
+/// host-only one, `1` on, `pinned` on with the openings' read-backs through
+/// pinned staging; `0` or any other word off.
 #[test]
 fn the_phase_b_overlap_knob_reads_one_as_on() {
-    use crate::block_whir::phase_b_overlap_from;
+    use crate::block_whir::{PHASE_B_OVERLAP_DEFAULT, phase_b_overlap_from};
     use stark::multilinear_block::PhaseBOverlap::{Off, On, Pinned};
-    assert_eq!(phase_b_overlap_from(None), Off);
+    let default = if cfg!(feature = "cuda") { Pinned } else { Off };
+    assert_eq!(PHASE_B_OVERLAP_DEFAULT, default);
+    assert_eq!(phase_b_overlap_from(None), default);
     assert_eq!(phase_b_overlap_from(Some("0")), Off);
     assert_eq!(phase_b_overlap_from(Some("1")), On);
     assert_eq!(phase_b_overlap_from(Some(" 1 ")), On);
