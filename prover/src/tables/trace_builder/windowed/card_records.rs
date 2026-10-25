@@ -96,6 +96,29 @@ impl CpuLogRecords {
     pub(crate) fn decode_table(&self) -> &DecodeTable {
         &self.decode.table
     }
+
+    /// A test's fault: the same chunk from a copy of its logs, each log's
+    /// first source value (`src1_val`, the `rv1` of nearly every row) and
+    /// written value (`dst_val`) XORed with `by`, in one piece: a CPU table
+    /// the run did not make, the same however it is filled.
+    #[cfg(test)]
+    pub(crate) fn with_register_values_xored(self, by: u64) -> Self {
+        let logs: Vec<Log> = self
+            .logs
+            .slices()
+            .iter()
+            .flat_map(|piece| piece.iter())
+            .map(|log| Log {
+                src1_val: log.src1_val ^ by,
+                dst_val: log.dst_val ^ by,
+                ..log.clone()
+            })
+            .collect();
+        Self {
+            logs: Segments::one(logs),
+            ..self
+        }
+    }
 }
 
 impl std::fmt::Debug for CpuLogRecords {

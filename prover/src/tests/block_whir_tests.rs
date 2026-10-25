@@ -5006,11 +5006,15 @@ fn streamed_records_chunks_kept_are_never_dropped() {
     }
 }
 
-/// ★ A wrong CPU table held as records is refused by the verifier: with its
-/// logs read a cycle late ([`Deviations::card_fill_streamed_fault`]), every
-/// fill of them (the card's at both uploads, or a host reader's) writes the
-/// same wrong table, so the prover's own checks of what it committed pass and
-/// it makes a proof, and the unchanged verifier refuses it.
+/// ★ A wrong CPU table held as records is refused by the verifier: with each
+/// log's register values changed in the records
+/// ([`Deviations::card_fill_streamed_fault`]), every fill of them (the card's
+/// at both uploads, or a host reader's) writes the same wrong table, so the
+/// prover's own checks of what it committed pass and it makes a proof, and the
+/// unchanged verifier refuses it. The fault is shown to bite first: against
+/// the same prove without it, the partition is the same and the committed
+/// group roots move (a fault the tables do not see would leave them equal, and
+/// the refusal below would be vacuous).
 #[test]
 fn a_wrong_cpu_records_table_is_refused_by_the_verifier() {
     let elf = asm_elf_bytes("test_keccak_multi");
@@ -5018,23 +5022,35 @@ fn a_wrong_cpu_records_table_is_refused_by_the_verifier() {
     let mut o = streamed(MaxRowsConfig::small(), 5, 3);
     o.layout_workers = 3;
     o.drop_streamed_ops = true;
-    let (proof, stamps) = prove_block_whir_with(
-        &elf,
-        &[],
-        &ProofOptions::default_test_options(),
-        &format,
-        &o,
-        &Deviations {
-            card_fill_streamed_fault: 1,
-            // Regeneration is off here, and parked records need it: kept.
-            records_keep: Some(true),
-            ..streamed_records(true, false)
-        },
-    )
-    .unwrap_or_else(|e| panic!("the prover refused ({e:?}): the verifier was never asked"));
+    let proved = |fault: u64| {
+        prove_block_whir_with(
+            &elf,
+            &[],
+            &ProofOptions::default_test_options(),
+            &format,
+            &o,
+            &Deviations {
+                card_fill_streamed_fault: fault,
+                // Regeneration is off here, and parked records need it: kept.
+                records_keep: Some(true),
+                ..streamed_records(true, false)
+            },
+        )
+        .unwrap_or_else(|e| {
+            panic!("fault {fault}: the prover refused ({e:?}): the verifier was never asked")
+        })
+    };
+    let (honest, _) = proved(0);
+    assert!(verify(&honest, &elf, &format), "the honest proof");
+    let (proof, stamps) = proved(1);
     assert!(
         stamps.windows.card_fill.cpu[0] > 0,
         "no CPU chunk held as records"
+    );
+    assert_eq!(proof.groups, honest.groups, "the partition");
+    assert_ne!(
+        proof.proof.roots, honest.proof.roots,
+        "the fault left every committed table as it was: the refusal below would be vacuous"
     );
     assert!(
         !verify(&proof, &elf, &format),
@@ -5379,7 +5395,8 @@ fn row_families_filled_from_their_rows_move_no_byte() {
 /// (`LAMBDA_VM_BLOCK_RECORDS_DROP=keep`), none drops and none has a recipe;
 /// with no live regeneration and not kept, none is held. The proofs are the
 /// one without regeneration. (MEMW_A, LOAD and STORE chunks: the rebuild is
-/// the families' one path.)
+/// the families' one path.) With no live regeneration and not kept, the
+/// streamed card fill is never set up: no chunk is handed to it.
 #[test]
 fn row_records_chunks_drop_as_records_and_come_back() {
     use crate::block_whir::BlockSpillPolicy;
@@ -5476,12 +5493,13 @@ fn row_records_chunks_drop_as_records_and_come_back() {
     assert!(verify(&held, &elf, &format));
     // No live regeneration, not kept: none held.
     let (unheld, stamps) = proved(RegenMode::Off, all_rows());
+    // The streamed card fill is never set up, so no chunk is even handed to
+    // it: every count stays zero.
     let c = stamps.windows.card_fill;
     assert!(
-        held_rows(&c).iter().all(|&n| n == 0) && c.records_bytes == 0,
-        "records held with no live regeneration: {c:?}"
+        row_counts(&c).iter().all(|f| *f == [0, 0]) && c.records_bytes == 0,
+        "chunks handed to the streamed card fill with no live regeneration: {c:?}"
     );
-    assert!(c.memw_a[1] > 0 && c.load[1] > 0 && c.store[1] > 0, "{c:?}");
     assert!(verify(&unheld, &elf, &format));
     assert_eq!(parked.groups, plain.groups, "the partition");
     if crypto::grinding::deterministic() {

@@ -3245,9 +3245,9 @@ pub(crate) struct Deviations {
     /// prover's own checks cannot tell it from the committed one.
     #[cfg(test)]
     pub card_fill_records_fault: usize,
-    /// With the streamed CPU chunks held as records, each one's logs read
-    /// from this many cycles late, and with row families' chunks held as
-    /// their rows, each row's timestamp that much later (a SHIFT op's input)
+    /// With the streamed CPU chunks held as records, each log's first source
+    /// and written values XORed with this, and with row families' chunks held as their rows,
+    /// each row's timestamp this much later (a SHIFT op's input)
     /// ([`WindowedTraceBuilder::card_fill_streamed_fault`]): one wrong table,
     /// the same at both uploads and to any host reader.
     #[cfg(test)]

@@ -139,8 +139,8 @@ struct StreamedCardFill {
     rows: RowFamilies,
     room: RecordsRoom,
     /// A test's fault ([`WindowedTraceBuilder::card_fill_streamed_fault`]):
-    /// each CPU chunk's records start this many cycles late, each MEMW_A or
-    /// LOAD row's timestamp is that much later.
+    /// each CPU log held as records has its first source and written values
+    /// XORed with it, each row family's row its timestamp that much later.
     #[cfg(test)]
     fault: u64,
 }
@@ -740,14 +740,15 @@ impl<'a> WindowedTraceBuilder<'a> {
     }
 
     /// A test's fault: with [`Self::card_fill_streamed`], each CPU chunk held
-    /// as its logs reads them from `cycles` cycles late (each row's timestamp
-    /// that much later), and each chunk held as its rows
-    /// ([`Self::card_fill_streamed_rows`]) has each row's timestamp that much
-    /// later: the same wrong table however it is filled.
+    /// as its logs has every log's first source value (`src1_val`) and
+    /// written value (`dst_val`) XORed with `by` (the CPU table writes its own
+    /// timestamps, so a late cycle would move nothing), and each chunk held as its rows
+    /// ([`Self::card_fill_streamed_rows`]) has each row's timestamp `by` later:
+    /// the same wrong table however it is filled.
     #[cfg(test)]
-    pub(crate) fn card_fill_streamed_fault(mut self, cycles: u64) -> Self {
+    pub(crate) fn card_fill_streamed_fault(mut self, by: u64) -> Self {
         if let Some(card) = self.card_fill_streamed.as_mut() {
-            card.fault = cycles;
+            card.fault = by;
         }
         self
     }
@@ -2295,9 +2296,13 @@ fn cpu_chunk_ops(
         Some(logs) if logs_in_step(&ops, &logs, first_cycle, decode_table) => card
             .admits(logs.op_bytes(), (StreamTable::Cpu, index), stamps)
             .then(|| {
+                let records = CpuLogRecords::new(logs, first_cycle as u64, Arc::clone(decode));
                 #[cfg(test)]
-                let first_cycle = first_cycle + card.fault as usize;
-                CpuLogRecords::new(logs, first_cycle as u64, Arc::clone(decode))
+                let records = records.map(|r| match card.fault {
+                    0 => r,
+                    by => r.with_register_values_xored(by),
+                });
+                records
             })
             .flatten(),
         _ => {

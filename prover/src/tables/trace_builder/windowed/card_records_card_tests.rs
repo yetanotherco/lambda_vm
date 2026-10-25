@@ -172,7 +172,9 @@ fn row_family(records: &Records) -> Option<(usize, usize)> {
 const ROW_FAMILIES: [&str; 5] = ["MEMW_A", "LOAD", "STORE", "MEMW", "SHIFT"];
 
 /// Every row family's chunks of four rows, so that the small programs fill
-/// several, their rows in one window part or many.
+/// several, their rows in one window part or many: MEMW_A's, LOAD's,
+/// STORE's and SHIFT's (no small program makes four MEMW ops; the synthetic
+/// MEMW chunk below is MEMW's).
 #[test]
 fn the_card_fills_row_family_chunks_from_their_rows_as_the_host_does() {
     let max_rows = MaxRowsConfig {
@@ -208,8 +210,13 @@ fn the_card_fills_row_family_chunks_from_their_rows_as_the_host_does() {
             }
         }
     }
+    // No small program makes four MEMW ops (the synthetic MEMW chunk below
+    // covers MEMW), and a STORE chunk is always one piece (its hand-out cuts
+    // one list).
+    let [memw_a, load, store, _memw, shift] = filled;
     assert!(
-        filled.iter().all(|f| f[0] > 0 && f[1] > 0),
+        [memw_a, load, store, shift].iter().all(|f| f[0] > 0)
+            && [memw_a, load, shift].iter().all(|f| f[1] > 0),
         "{ROW_FAMILIES:?}: {filled:?}"
     );
 }

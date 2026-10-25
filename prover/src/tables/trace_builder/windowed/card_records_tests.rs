@@ -555,6 +555,50 @@ fn records_chunks_are_laid_out_for_their_tables_airs() {
     lay_out(Records(Arc::new(memw_r)), &create_memw_register_air(&opts)).expect("MEMW_R laid out");
 }
 
+/// ★ The test fault on a CPU chunk held as its logs (register values XORed,
+/// [`WindowedTraceBuilder::card_fill_streamed_fault`]) makes a table the run
+/// did not: its host fill differs from the honest chunk's, so a block test's
+/// refusal of it is not vacuous. XORed with 0, the chunk is the honest one.
+#[test]
+fn the_cpu_records_fault_makes_a_table_the_run_did_not() {
+    use super::Segments;
+    use super::card_records::{CardDecode, CpuLogRecords};
+    use multilinear::records::Records;
+    let (program, logs) = run("test_keccak_multi");
+    let builder =
+        WindowedTraceBuilder::new(&program, &[], &MaxRowsConfig::small()).expect("the builder");
+    let decode = Arc::new(CardDecode::new(Arc::clone(&builder.decode)).expect("a program"));
+    let rows = MaxRowsConfig::small().cpu;
+    let chunk = |by: Option<u64>| {
+        let records = CpuLogRecords::new(
+            Segments::one(logs[rows..2 * rows].to_vec()),
+            rows as u64,
+            Arc::clone(&decode),
+        )
+        .expect("a whole table");
+        let records = match by {
+            Some(by) => records.with_register_values_xored(by),
+            None => records,
+        };
+        Records(Arc::new(records))
+            .host_fill()
+            .expect("the host fills it")
+    };
+    let honest = chunk(None);
+    let faulted = chunk(Some(1));
+    assert_eq!(faulted.widths().len(), honest.widths().len());
+    assert_ne!(
+        (faulted.widths(), faulted.data()),
+        (honest.widths(), honest.data()),
+        "the fault leaves the CPU table as it was"
+    );
+    let none = chunk(Some(0));
+    assert_eq!(
+        (none.widths(), none.data()),
+        (honest.widths(), honest.data())
+    );
+}
+
 /// The card's DECODE rows find every pc's row as the host's table does, and
 /// no row for a pc the program has none at.
 #[test]
