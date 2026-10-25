@@ -171,6 +171,164 @@ mod row_count_tests {
             assert!(counted == lists, "{n} ops, {rows} a chunk");
         }
     }
+
+    /// The same over lists the finish keeps in several segments, LT's middle
+    /// one compact: chunks within a segment, across segments and inside the
+    /// compact one are counted from slices, never copied whole, and still give
+    /// the lists' multiplicities. Each map is reserved for the chunk's distinct
+    /// ops, never more than for its length, and LT's chunks note the copies
+    /// `range` would have made.
+    #[test]
+    fn the_per_row_lookups_over_split_and_compact_lists_are_the_lists() {
+        for (n, rows) in [(3_000usize, 64usize), (40_000, 1 << 12), (70_000, 1 << 15)] {
+            // Compact LT ops are unsigned and not inverted (MEMW's checks).
+            let lt = skewed(n, |k| LtOperation::new(k.wrapping_mul(3), k ^ 0x55, false));
+            let branch = skewed(n, |k| {
+                BranchOperation::new(
+                    0x1000 + 4 * (k % 97),
+                    k.wrapping_mul(0x1_0004),
+                    k << 9,
+                    k % 2 == 1,
+                )
+            });
+            let ops = [alu_op::AND, alu_op::OR, alu_op::XOR];
+            let bytewise = skewed(n, |k| {
+                bytewise::BytewiseOperation::new(k & 0xFF, (k >> 3) & 0xFF, ops[(k % 3) as usize])
+            });
+            let (a, b) = (n / 3, 2 * n / 3 + 17);
+            let mut compact = CompactLt::default();
+            compact.extend(&lt[a..b]);
+            let lt_s = Segmented {
+                parts: vec![
+                    Part::Ops(&lt[..a]),
+                    Part::Compact(&compact),
+                    Part::Ops(&lt[b..]),
+                ],
+            };
+            let branch_s = Segmented {
+                parts: vec![Part::Ops(&branch[..a]), Part::Ops(&branch[a..])],
+            };
+            let bytewise_s = Segmented {
+                parts: vec![Part::Ops(&bytewise[..b]), Part::Ops(&bytewise[b..])],
+            };
+            let max_rows = crate::tables::MaxRowsConfig::uniform(rows);
+            let mut lists = bitwise::BitwiseHistogram::new();
+            for (start, end) in list_chunks(lt.len(), max_rows.lt) {
+                lists.add_ops(&lt_row_lookups(lt_s.range(start, end).iter()));
+            }
+            for (start, end) in list_chunks(branch.len(), max_rows.branch) {
+                lists.add_ops(&branch_row_lookups(&branch_s.range(start, end)));
+            }
+            for (start, end) in list_chunks(bytewise.len(), max_rows.bytewise) {
+                lists.add_ops(&bytewise_row_lookups(&bytewise_s.range(start, end)));
+            }
+            let counts = count_row_lookups(&lt_s, &branch_s, &bytewise_s, &max_rows);
+            let mut counted = bitwise::BitwiseHistogram::new();
+            counts.bump_into(&mut counted);
+            assert!(counted == lists, "{n} ops, {rows} a chunk");
+            for (k, scan) in counts.scans.iter().enumerate() {
+                assert_eq!(scan.ops, n, "kind {k}");
+                assert!(
+                    scan.reserved <= scan.by_length,
+                    "kind {k}: reserved {} by length {} ({} chunks, {} distinct)",
+                    scan.reserved,
+                    scan.by_length,
+                    scan.chunks,
+                    scan.distinct
+                );
+                assert!(scan.distinct <= scan.ops, "kind {k}");
+                // Chunks of a few dozen ops hold a handful of distinct ones, where
+                // one op is many percent; read the estimate's miss on larger ones.
+                if rows >= 1 << 12 {
+                    assert!(scan.miss <= 0.05, "kind {k}: missed by {:.3}", scan.miss);
+                    // A few hundred repeats an op: the maps hold a sliver of
+                    // what reserving whole chunks would.
+                    assert!(
+                        scan.reserved * 4 <= scan.by_length,
+                        "kind {k}: reserved {} against {} by length",
+                        scan.reserved,
+                        scan.by_length
+                    );
+                }
+            }
+            assert!(
+                counts.scans[0].copies > 0,
+                "LT's compact chunks would have been copied"
+            );
+            assert!(counts.line().starts_with("BLOCK P4 ROWS: LT "));
+        }
+    }
+
+    /// A list's ops handed over a slice at a time are the ops `range` gives,
+    /// over in-memory and compact segments, within and across them, at any
+    /// block size; the flag says when `range` copies (a range that spans
+    /// segments or lies in a compact one).
+    #[test]
+    fn a_chunk_read_a_slice_at_a_time_is_its_range() {
+        let lt: Vec<LtOperation> = (0..10_000u64)
+            .map(|k| LtOperation::new(k.wrapping_mul(7), k ^ 0x3c, false))
+            .collect();
+        let mut compact = CompactLt::default();
+        compact.extend(&lt[3_000..7_000]);
+        let list = Segmented {
+            parts: vec![
+                Part::Ops(&lt[..3_000]),
+                Part::Compact(&compact),
+                Part::Ops(&lt[7_000..]),
+            ],
+        };
+        for (start, end) in [
+            (0usize, 0usize),
+            (10, 2_000),
+            (2_500, 3_500),
+            (3_100, 6_900),
+            (6_000, 9_000),
+            (0, 10_000),
+            (7_000, 10_000),
+        ] {
+            for block in [1usize, 7, 4_096, 1 << 16] {
+                let mut got = Vec::new();
+                let copied =
+                    list.for_each_slice(start, end, block, &mut |ops| got.extend_from_slice(ops));
+                let want = list.range(start, end);
+                assert!(got == want.as_ref(), "{start}..{end} at {block}");
+                assert_eq!(
+                    copied,
+                    matches!(want, std::borrow::Cow::Owned(_)),
+                    "{start}..{end} at {block}"
+                );
+            }
+        }
+    }
+
+    /// The distinct-op estimate stays within 2 % (or 2 ops) of the count, and
+    /// never above the ops, from all-equal to all-distinct chunks.
+    #[test]
+    fn the_distinct_estimate_is_close_and_never_above_the_ops() {
+        for (n, d) in [
+            (0usize, 1usize),
+            (1, 1),
+            (100, 1),
+            (1_000, 10),
+            (5_000, 3_000),
+            (1 << 16, 1 << 12),
+            (1 << 16, 1 << 16),
+            (100_000, 99_000),
+        ] {
+            let ops: Vec<u64> = (0..n)
+                .map(|i| ((i % d) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                .collect();
+            let visit = |f: &mut Slices<'_, u64>| f(&ops);
+            let estimate = distinct_estimate(&visit, n);
+            let truth = d.min(n);
+            assert!(estimate <= n, "{n} ops: {estimate}");
+            let off = estimate.abs_diff(truth);
+            assert!(
+                off <= 2 || off as f64 <= 0.02 * truth as f64,
+                "{n} ops, {truth} distinct: estimated {estimate}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3423,6 +3581,8 @@ struct RowCounts {
     single: [u64; 256],
     /// By `μ · 256 + byte`, allocated by the first BRANCH chunk.
     branch: Vec<u64>,
+    /// What LT's, BRANCH's and BYTEWISE's chunks cost the count.
+    scans: [RowScan; 3],
 }
 
 impl RowCounts {
@@ -3430,7 +3590,18 @@ impl RowCounts {
         Self {
             single: [0; 256],
             branch: Vec::new(),
+            scans: [RowScan::default(); 3],
         }
+    }
+
+    /// The `BLOCK P4 ROWS` line: what each kind's chunks cost the count.
+    fn line(&self) -> String {
+        format!(
+            "BLOCK P4 ROWS: {} · {} · {}",
+            self.scans[0].line("LT"),
+            self.scans[1].line("BRANCH"),
+            self.scans[2].line("BYTEWISE")
+        )
     }
 
     fn branch_mut(&mut self) -> &mut [u64] {
@@ -3443,6 +3614,9 @@ impl RowCounts {
     fn merge(mut self, other: Self) -> Self {
         for (a, b) in self.single.iter_mut().zip(other.single) {
             *a += b;
+        }
+        for (a, b) in self.scans.iter_mut().zip(&other.scans) {
+            a.add(b);
         }
         if !other.branch.is_empty() {
             for (a, b) in self.branch_mut().iter_mut().zip(other.branch) {
@@ -3477,18 +3651,148 @@ impl RowCounts {
     }
 }
 
-/// [`dedup_rows_of`]'s rows of `ops` (`len` of them), counted only: `each(op,
-/// μ, rows)` for every distinct op and μ, then the number of rows.
-fn count_rows_of<'a, T: std::hash::Hash + Eq + Clone + 'a>(
-    ops: impl Iterator<Item = &'a T>,
+/// A chunk's ops as slices, handed one at a time to the closure it is given
+/// ([`Segmented::for_each_slice`]); it may be called more than once.
+type Visit<'v, T> = dyn Fn(&mut Slices<'_, T>) + 'v;
+
+/// What takes a chunk's slices ([`Visit`]).
+type Slices<'s, T> = dyn FnMut(&[T]) + 's;
+
+/// How many distinct ops `visit` hands over (`len` of them), estimated by
+/// linear counting: each op's [`RowHasher`] hash sets a bit of a bitmap of
+/// `len` bits (a power of two, at least 64), and the share of bits left clear
+/// gives the count. With at most as many distinct ops as bits, its error is a
+/// fraction of a percent; it never exceeds `len`.
+fn distinct_estimate<T: std::hash::Hash>(visit: &Visit<'_, T>, len: usize) -> usize {
+    use std::hash::BuildHasher;
+    let bits = len.next_power_of_two().max(64);
+    let mut map = vec![0u64; bits / 64];
+    let hasher = std::hash::BuildHasherDefault::<RowHasher>::default();
+    visit(&mut |ops: &[T]| {
+        for op in ops {
+            let i = (hasher.hash_one(op) as usize) & (bits - 1);
+            map[i / 64] |= 1u64 << (i % 64);
+        }
+    });
+    let set: usize = map.iter().map(|w| w.count_ones() as usize).sum();
+    let clear = bits - set;
+    if clear == 0 {
+        return len;
+    }
+    let estimate = -(bits as f64) * (clear as f64 / bits as f64).ln();
+    (estimate.ceil() as usize).min(len)
+}
+
+/// The bytes a map of `(T, u64)` reserved for `capacity` entries holds: its
+/// buckets by the map's rule (4 or 8 below 8 entries, else the power of two
+/// at or above eight sevenths of them), an entry and a control byte each.
+fn map_bytes<T>(capacity: usize) -> usize {
+    let buckets = match capacity {
+        0 => 0,
+        1..=3 => 4,
+        4..=7 => 8,
+        _ => (capacity * 8 / 7).next_power_of_two(),
+    };
+    buckets * (std::mem::size_of::<(T, u64)>() + 1)
+}
+
+/// What one kind of chunk ([`RowChunk`]) cost the count: chunks, ops, distinct
+/// ops, the estimate's largest miss, the bytes its maps reserved against what
+/// reserving a whole chunk would have, and the bytes copying the ranges would
+/// have taken ([`Segmented::range`]).
+#[derive(Clone, Copy, Default)]
+struct RowScan {
+    chunks: usize,
+    ops: usize,
+    distinct: usize,
+    /// The least and the most distinct ops per op of a chunk.
+    least: f64,
+    most: f64,
+    /// The largest |estimate − distinct| / distinct of a chunk.
+    miss: f64,
+    reserved: usize,
+    by_length: usize,
+    copies: usize,
+}
+
+impl RowScan {
+    fn add(&mut self, other: &Self) {
+        let first = self.chunks == 0;
+        self.chunks += other.chunks;
+        self.ops += other.ops;
+        self.distinct += other.distinct;
+        if other.chunks > 0 {
+            self.least = if first {
+                other.least
+            } else {
+                self.least.min(other.least)
+            };
+            self.most = self.most.max(other.most);
+        }
+        self.miss = self.miss.max(other.miss);
+        self.reserved += other.reserved;
+        self.by_length += other.by_length;
+        self.copies += other.copies;
+    }
+
+    fn line(&self, name: &str) -> String {
+        let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+        let per = |b: usize| b as f64 / (1u64 << 20) as f64 / self.chunks.max(1) as f64;
+        format!(
+            "{name} {} chunks, {:.2} M ops, {:.3} distinct an op (chunks {:.3}–{:.3}), the estimate off by at most \
+             {:.2} %; maps reserved {:.2} GiB, {:.1} MiB a chunk, against {:.2} GiB, {:.1} MiB, by length; copies \
+             not made {:.2} GiB",
+            self.chunks,
+            self.ops as f64 / 1e6,
+            self.distinct as f64 / self.ops.max(1) as f64,
+            self.least,
+            self.most,
+            self.miss * 100.0,
+            gib(self.reserved),
+            per(self.reserved),
+            gib(self.by_length),
+            per(self.by_length),
+            gib(self.copies),
+        )
+    }
+}
+
+/// The ops a count reads a slice at a time ([`Segmented::for_each_slice`]).
+const ROW_SCAN_BLOCK: usize = 1 << 16;
+
+/// [`dedup_rows_of`]'s rows of the ops `visit` hands over (`len` of them, and
+/// it may be called twice), counted only: `each(op, μ, rows)` for every
+/// distinct op and μ, then the number of rows. The map is reserved for the
+/// distinct ops [`distinct_estimate`] finds, not for the whole chunk; `scan`
+/// notes the chunk.
+fn count_rows_of<T: std::hash::Hash + Eq + Clone>(
+    visit: &Visit<'_, T>,
     len: usize,
     mut each: impl FnMut(&T, u64, u64),
+    scan: &mut RowScan,
 ) -> usize {
+    let estimate = distinct_estimate(visit, len);
+    let capacity = (estimate + estimate / 32 + 16).min(len);
     let mut counts: HashMap<T, u64, std::hash::BuildHasherDefault<RowHasher>> =
-        HashMap::with_capacity_and_hasher(len, Default::default());
-    for op in ops {
-        *counts.entry(op.clone()).or_insert(0) += 1;
-    }
+        HashMap::with_capacity_and_hasher(capacity, Default::default());
+    visit(&mut |ops: &[T]| {
+        for op in ops {
+            *counts.entry(op.clone()).or_insert(0) += 1;
+        }
+    });
+    let distinct = counts.len();
+    let ratio = distinct as f64 / len.max(1) as f64;
+    scan.add(&RowScan {
+        chunks: 1,
+        ops: len,
+        distinct,
+        least: ratio,
+        most: ratio,
+        miss: (estimate as f64 - distinct as f64).abs() / distinct.max(1) as f64,
+        reserved: map_bytes::<T>(capacity),
+        by_length: map_bytes::<T>(len),
+        copies: 0,
+    });
     let mut rows = 0u64;
     for (op, &count) in &counts {
         let (full, left) = (count / super::types::MU_MAX, count % super::types::MU_MAX);
@@ -3536,50 +3840,89 @@ fn count_row_lookups(
                 .map(|(s, e)| RowChunk::Bytewise(s, e)),
         )
         .collect();
+    // Each chunk's ops a slice at a time, never copied whole; whether
+    // `range` would have copied them is noted as bytes not copied.
+    fn visit_of<'s, T: Clone>(
+        list: &'s Segmented<'_, T>,
+        start: usize,
+        end: usize,
+        copied: &'s std::cell::Cell<bool>,
+    ) -> impl Fn(&mut Slices<'_, T>) + 's {
+        move |f: &mut Slices<'_, T>| {
+            copied.set(list.for_each_slice(start, end, ROW_SCAN_BLOCK, f));
+        }
+    }
     let count = |task: &RowChunk| -> RowCounts {
         let mut counts = RowCounts::new();
-        match *task {
+        let copied = std::cell::Cell::new(false);
+        let (kind, ops, size) = match *task {
             RowChunk::Lt(start, end) => {
-                let rows = count_rows_of(lt.range(start, end).iter(), end - start, |_, mu, n| {
-                    counts.single[mu as usize] += n
-                });
-                counts.single[0] += chunk_padding_rows(rows) as u64;
-            }
-            RowChunk::Bytewise(start, end) => {
+                let mut scan = RowScan::default();
                 let rows = count_rows_of(
-                    bytewise.range(start, end).iter(),
+                    &visit_of(lt, start, end, &copied),
                     end - start,
                     |_, mu, n| counts.single[mu as usize] += n,
+                    &mut scan,
                 );
                 counts.single[0] += chunk_padding_rows(rows) as u64;
+                counts.scans[0] = scan;
+                (0, end - start, std::mem::size_of::<LtOperation>())
+            }
+            RowChunk::Bytewise(start, end) => {
+                let mut scan = RowScan::default();
+                let rows = count_rows_of(
+                    &visit_of(bytewise, start, end, &copied),
+                    end - start,
+                    |_, mu, n| counts.single[mu as usize] += n,
+                    &mut scan,
+                );
+                counts.single[0] += chunk_padding_rows(rows) as u64;
+                counts.scans[2] = scan;
+                (
+                    2,
+                    end - start,
+                    std::mem::size_of::<bytewise::BytewiseOperation>(),
+                )
             }
             RowChunk::Branch(start, end) => {
+                let mut scan = RowScan::default();
                 let table = counts.branch_mut();
-                let rows =
-                    count_rows_of(branch.range(start, end).iter(), end - start, |op, mu, n| {
+                let rows = count_rows_of(
+                    &visit_of(branch, start, end, &copied),
+                    end - start,
+                    |op, mu, n| {
                         let byte = ((op.compute_next_pc() >> 8) & 0xFF) as usize;
                         table[((mu as usize) << 8) | byte] += n
-                    });
+                    },
+                    &mut scan,
+                );
                 table[0] += chunk_padding_rows(rows) as u64;
+                counts.scans[1] = scan;
+                (1, end - start, std::mem::size_of::<BranchOperation>())
             }
+        };
+        if copied.get() {
+            counts.scans[kind].copies += ops * size;
         }
         counts
     };
     #[cfg(feature = "parallel")]
-    {
+    let counts = {
         use rayon::prelude::*;
         tasks
             .par_iter()
             .map(count)
             .reduce(RowCounts::new, RowCounts::merge)
-    }
+    };
     #[cfg(not(feature = "parallel"))]
-    {
-        tasks
-            .iter()
-            .map(count)
-            .fold(RowCounts::new(), RowCounts::merge)
+    let counts = tasks
+        .iter()
+        .map(count)
+        .fold(RowCounts::new(), RowCounts::merge);
+    if let Ok(mut line) = ROW_SCAN_LINE.lock() {
+        *line = Some(counts.line());
     }
+    counts
 }
 
 /// The `(start, end)` op ranges of a list of `len` ops at `max_rows` a table, as
@@ -5379,6 +5722,49 @@ impl<'a, T: Clone> Segmented<'a, T> {
         self.parts.iter().map(Part::len).sum()
     }
 
+    /// Ops `start..end` of the concatenation, handed to `f` a slice at a time
+    /// with no copy of the range: an in-memory segment's ops as they lie, a
+    /// compact segment's expanded `block` ops at a time into one small buffer.
+    /// Returns whether [`Self::range`] would have copied them (they span
+    /// segments, or a compact one holds them).
+    fn for_each_slice(
+        &self,
+        start: usize,
+        end: usize,
+        block: usize,
+        f: &mut dyn FnMut(&[T]),
+    ) -> bool {
+        let (mut at, mut pieces, mut compact) = (0usize, 0usize, false);
+        let mut buf: Vec<T> = Vec::new();
+        for part in &self.parts {
+            let (lo, hi) = (at, at + part.len());
+            at = hi;
+            if lo >= end {
+                break;
+            }
+            if hi <= start {
+                continue;
+            }
+            let (a, b) = (start.max(lo) - lo, end.min(hi) - lo);
+            pieces += 1;
+            match part {
+                Part::Ops(ops) => f(&ops[a..b]),
+                Part::Compact(c) => {
+                    compact = true;
+                    let mut k = a;
+                    while k < b {
+                        let e = (k + block.max(1)).min(b);
+                        buf.clear();
+                        c.expand_into(k, e, &mut buf);
+                        f(&buf);
+                        k = e;
+                    }
+                }
+            }
+        }
+        pieces > 1 || compact
+    }
+
     /// Ops `start..end` of the concatenation: borrowed when one in-memory
     /// segment holds them, copied (or expanded) otherwise.
     fn range(&self, start: usize, end: usize) -> std::borrow::Cow<'a, [T]> {
@@ -6181,6 +6567,15 @@ fn collect_all_ops(
 /// generator finished — seconds since [`build_stamps::start`]. Off (one atomic
 /// load a mark) unless the block prover turns it on for its readout; the
 /// epoch pipeline never does.
+/// The last pool count's `BLOCK P4 ROWS` line ([`RowCounts::line`]), for the
+/// block's log to print once the finish is done.
+static ROW_SCAN_LINE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Takes the last pool count's `BLOCK P4 ROWS` line, if one ran since.
+pub(crate) fn take_row_scan_line() -> Option<String> {
+    ROW_SCAN_LINE.lock().ok().and_then(|mut line| line.take())
+}
+
 pub(crate) mod build_stamps {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};

@@ -5187,6 +5187,9 @@ fn prove_streamed(
                         g(rest_gate.budget()),
                         g(rest_gate.most()),
                     );
+                    if let Some(line) = crate::tables::trace_builder::take_row_scan_line() {
+                        eprintln!("{line}");
+                    }
                     let finish_marks = crate::tables::trace_builder::build_stamps::take();
                     let finished = start.elapsed().as_secs_f64();
                     if let Some(ledger) = ledger {
