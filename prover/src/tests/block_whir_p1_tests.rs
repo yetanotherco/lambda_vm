@@ -58,6 +58,7 @@ fn options(drop_levels: usize) -> BlockOptions {
         finish_cuts: true,
         finish_stream: true,
         rest_layout_bytes: Some(1 << 20),
+        rest_build_bytes: None,
         pack_finished: true,
         gpack: true,
         spill: block_whir::BlockSpillPolicy::Off,

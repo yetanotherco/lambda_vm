@@ -267,7 +267,18 @@ fn streamed(
     last: &[Log],
     budget: usize,
 ) -> (RestHeader, Vec<Emitted>, usize) {
-    let gate = ByteGate::new(budget);
+    streamed_capped(builder, last, budget, None)
+}
+
+/// [`streamed`] with a cap on the bytes building at once
+/// ([`ByteGate::with_build`]).
+fn streamed_capped(
+    builder: WindowedTraceBuilder<'_>,
+    last: &[Log],
+    budget: usize,
+    build: Option<usize>,
+) -> (RestHeader, Vec<Emitted>, usize) {
+    let gate = ByteGate::new(budget).with_build(build);
     let mut header = None;
     let mut out = Vec::new();
     let mut placed = 0usize;
@@ -720,8 +731,10 @@ fn the_row_lookups_counted_on_the_pool_build_the_same_tables() {
 }
 
 /// Built as the gate admits each table: every configuration, chunked small,
-/// windows of 7 and 1000 cycles, budgets of one byte, 2 GiB and none, hands on
-/// the monolithic finish's tables word for word in AIR order, as the waves do.
+/// windows of 7 and 1000 cycles, budgets of one byte, 2 GiB and none, and no
+/// budget with at most one byte building at once (one table at a time), hands
+/// on the monolithic finish's tables word for word in AIR order, as the waves
+/// do.
 #[test]
 fn the_sliding_stream_is_the_monolithic_finish_in_air_order() {
     let max_rows = MaxRowsConfig::small();
@@ -740,12 +753,18 @@ fn the_sliding_stream_is_the_monolithic_finish_in_air_order() {
                     .into_iter()
                     .map(|t| t.map(shape_and_words))
                     .collect::<Vec<_>>();
-                for budget in [1usize, 2 << 30, usize::MAX] {
-                    let what = format!("{name} window {window} {config} budget {budget}");
+                for (budget, build) in [
+                    (1usize, None),
+                    (2 << 30, None),
+                    (usize::MAX, None),
+                    (usize::MAX, Some(1)),
+                ] {
+                    let what =
+                        format!("{name} window {window} {config} budget {budget} build {build:?}");
                     let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
                         configure(b).slide_rest()
                     });
-                    let (_, got, _) = streamed(builder, last, budget);
+                    let (_, got, _) = streamed_capped(builder, last, budget, build);
                     let got: Vec<_> = got
                         .iter()
                         .enumerate()
@@ -790,6 +809,80 @@ fn sleeping_units<'a>(
             }) as Job<'a>,
         })
         .collect()
+}
+
+/// Synthetic units of one row each that sleep `ms`, counting how many build at
+/// once (`now`) and the most (`most`).
+#[cfg(feature = "parallel")]
+fn counting_units<'a>(
+    n: usize,
+    ms: u64,
+    now: &'a std::sync::atomic::AtomicUsize,
+    most: &'a std::sync::atomic::AtomicUsize,
+) -> Vec<Unit<'a>> {
+    use std::sync::atomic::Ordering::SeqCst;
+    (0..n)
+        .map(|_| Unit::Build {
+            family: 0,
+            rows: 1,
+            job: Box::new(move || {
+                most.fetch_max(now.fetch_add(1, SeqCst) + 1, SeqCst);
+                std::thread::sleep(Duration::from_millis(ms));
+                now.fetch_sub(1, SeqCst);
+                let width = FAMILIES[0].1;
+                Ok(TraceTable::new_main(
+                    crate::tables::types::zeroed_fe_vec(width),
+                    width,
+                    1,
+                ))
+            }) as Job<'a>,
+        })
+        .collect()
+}
+
+/// The build cap, sliding: under a gate that holds all `n` tables, a cap of two
+/// tables' estimated bytes starts at most two at once (counted in the jobs
+/// and in the gate's most), and the tables are still handed on in AIR order;
+/// with no cap the gate alone admits every table at once.
+#[test]
+#[cfg(feature = "parallel")]
+fn the_build_cap_bounds_the_tables_building_at_once() {
+    use std::sync::atomic::AtomicUsize;
+    let n = rayon::current_num_threads().min(6);
+    assert!(n >= 3, "a pool of at least three threads");
+    let one = FAMILIES[0].1 * 8;
+    for build in [Some(2 * one), None] {
+        let (now, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let gate = ByteGate::new(n * one).with_build(build);
+        let mut order = Vec::new();
+        emit_streamed_units(
+            Ok(counting_units(n, 150, &now, &most)),
+            &gate,
+            &mut |e: Emitted| {
+                gate.release(order.len());
+                order.push(e.position);
+                Ok(())
+            },
+            true,
+        )
+        .expect("the stream");
+        assert_eq!(
+            order,
+            (0..n).collect::<Vec<_>>(),
+            "build {build:?}: in AIR order"
+        );
+        match build {
+            Some(cap) => {
+                assert!(
+                    most.into_inner() <= 2,
+                    "build {build:?}: more than two built at once"
+                );
+                assert!(gate.building_most() <= cap, "build {build:?}");
+                assert_eq!(gate.building_most(), cap, "build {build:?}: two at once");
+            }
+            None => assert_eq!(gate.building_most(), n * one, "no cap: all at once"),
+        }
+    }
 }
 
 /// ★ Built as the gate admits each table, a slow first table does not hold

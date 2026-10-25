@@ -65,6 +65,7 @@ fn options(
         narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
         memlog: false,
         rest_layout_bytes: Some(1 << 20),
+        rest_build_bytes: None,
         spill: block_whir::BlockSpillPolicy::Off,
         regen: None,
         ..BlockOptions::production()

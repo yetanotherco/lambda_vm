@@ -18,6 +18,10 @@ use crate::Error;
 /// placed.
 pub(crate) struct ByteGate {
     budget: usize,
+    /// The bytes the sliding finish may build at once ([`Self::with_build`]).
+    build: usize,
+    /// The most bytes it built at once.
+    building_most: std::sync::atomic::AtomicUsize,
     state: Mutex<GateState>,
     changed: Condvar,
 }
@@ -67,6 +71,8 @@ impl ByteGate {
     pub(crate) fn new(budget: usize) -> Self {
         Self {
             budget,
+            build: budget,
+            building_most: std::sync::atomic::AtomicUsize::new(0),
             state: Mutex::new(GateState::default()),
             changed: Condvar::new(),
         }
@@ -155,6 +161,34 @@ impl ByteGate {
     pub(crate) fn budget(&self) -> usize {
         self.budget
     }
+
+    /// The gate with a cap on the estimated bytes the sliding finish builds at
+    /// once, apart from the bytes it holds (built and not yet placed, or
+    /// building): `None` leaves the budget alone bounding them, as before,
+    /// which the budget already implies.
+    pub(crate) fn with_build(mut self, build: Option<usize>) -> Self {
+        if let Some(build) = build {
+            self.build = build;
+        }
+        self
+    }
+
+    /// The cap on the bytes building at once ([`Self::with_build`]).
+    pub(crate) fn build(&self) -> usize {
+        self.build
+    }
+
+    /// Notes `bytes` building at once.
+    pub(crate) fn note_building(&self, bytes: usize) {
+        self.building_most
+            .fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The most estimated bytes the sliding finish built at once.
+    pub(crate) fn building_most(&self) -> usize {
+        self.building_most
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Stops the gate when dropped, however its holder stops (a packer that
@@ -172,6 +206,19 @@ mod tests {
     use super::ByteGate;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// The build cap is the budget unless one is given, and the most bytes
+    /// built at once only grows.
+    #[test]
+    fn the_build_cap_is_the_budget_unless_given() {
+        assert_eq!(ByteGate::new(10).build(), 10);
+        assert_eq!(ByteGate::new(10).with_build(None).build(), 10);
+        let gate = ByteGate::new(10).with_build(Some(4));
+        assert_eq!((gate.budget(), gate.build()), (10, 4));
+        gate.note_building(3);
+        gate.note_building(2);
+        assert_eq!(gate.building_most(), 3);
+    }
 
     /// Runs `f` on a thread of its own; `None` when it has not returned
     /// within `secs` (the thread is left behind).

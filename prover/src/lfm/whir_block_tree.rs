@@ -1779,12 +1779,15 @@ pub fn prove_whir_block_tree(
     sink.line(&format!("BLOCK UPLOAD AHEAD: {}", options.upload_ahead));
     sink.line(&finish_idle_line());
     sink.line(&format!(
-        "BLOCK REST LAYOUT CONFIG: waves of {} · KECCAK_RND built as its tables {} · finish packed {}",
+        "BLOCK REST LAYOUT CONFIG: waves of {} · KECCAK_RND built as its tables {} · finish packed {} · building at most {}",
         options
             .rest_layout_bytes
             .map_or("all at once".to_string(), |b| format!("{} MiB", b >> 20)),
         options.finish_keccak_rnd_chunks,
         options.pack_finished,
+        options
+            .rest_build_bytes
+            .map_or("the gate".to_string(), |b| format!("{} MiB", b >> 20)),
     ));
     let opts = super::proof::block_base_options();
     super::device_permit::arm(siblings);

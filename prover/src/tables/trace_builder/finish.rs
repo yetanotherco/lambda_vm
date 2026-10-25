@@ -2700,9 +2700,10 @@ fn emit_units(
 }
 
 /// A table built on the pool: its AIR position, its number among the rest's
-/// tables, its family, and the table or its error.
+/// tables, its family, the bytes it was estimated at, and the table or its
+/// error.
 #[cfg(feature = "parallel")]
-type Built = (usize, usize, usize, Result<Table, Error>);
+type Built = (usize, usize, usize, usize, Result<Table, Error>);
 
 /// [`emit_streamed_units`]' loop without waves: each table starts building on
 /// the pool as soon as the gate admits its estimated bytes, while earlier ones
@@ -2713,7 +2714,11 @@ type Built = (usize, usize, usize, Result<Table, Error>);
 /// nothing builds and every built table has been handed on, the packer holds
 /// every earlier table, so the next one may wait for its room (the lowest
 /// table not yet placed always goes). A job that panics ends the stream with
-/// an error.
+/// an error. While anything builds, a table starts only if the estimated bytes
+/// building at once stay within the gate's build cap
+/// ([`gate::ByteGate::with_build`]; by default the budget, which the gate
+/// already implies), so a larger gate can hold more built tables for the
+/// packer without building more of them at once.
 #[cfg(feature = "parallel")]
 fn emit_units_sliding(
     units: Result<Vec<Unit<'_>>, Error>,
@@ -2728,6 +2733,8 @@ fn emit_units_sliding(
     let mut ready: Vec<Option<Option<Table>>> = (0..total).map(|_| None).collect();
     let (tx, rx) = std::sync::mpsc::channel::<Built>();
     let (mut next_send, mut next_table, mut building) = (0usize, 0usize, 0usize);
+    // The estimated bytes of the tables building now.
+    let mut building_bytes = 0usize;
     let mut units = units.into_iter().enumerate().peekable();
     rayon::in_place_scope_fifo(|scope| {
         loop {
@@ -2744,14 +2751,18 @@ fn emit_units_sliding(
             // Start every table the gate admits, in order.
             let mut waiting = false;
             while let Some((position, unit)) = units.peek() {
+                let mut est_now = 0usize;
                 if let Unit::Build { family, rows, .. } = unit {
                     let est = estimates.of(*family, *rows);
                     if building == 0 && next_send == *position {
                         gate.acquire(next_table, est)?;
-                    } else if !gate.try_acquire(next_table, est)? {
+                    } else if (building > 0 && building_bytes.saturating_add(est) > gate.build())
+                        || !gate.try_acquire(next_table, est)?
+                    {
                         waiting = true;
                         break;
                     }
+                    est_now = est;
                 }
                 let Some((position, unit)) = units.next() else {
                     break;
@@ -2767,10 +2778,12 @@ fn emit_units_sliding(
                                         "the rest's table {number} panicked while building"
                                     )))
                                 });
-                            let _ = tx.send((position, number, family, table));
+                            let _ = tx.send((position, number, family, est_now, table));
                         });
                         next_table += 1;
                         building += 1;
+                        building_bytes = building_bytes.saturating_add(est_now);
+                        gate.note_building(building_bytes);
                     }
                 }
             }
@@ -2789,8 +2802,9 @@ fn emit_units_sliding(
                 rx.recv()
                     .map_err(|_| Error::Prover("the rest's builders stopped".into()))?
             };
-            let (position, number, family, table) = built;
+            let (position, number, family, est, table) = built;
             building -= 1;
+            building_bytes = building_bytes.saturating_sub(est);
             let table = table?;
             let bytes = table_bytes(&table);
             gate.resize(number, bytes);

@@ -492,7 +492,18 @@ pub struct BlockOptions {
     /// them at once holds most of the rest twice (BIG 561: ≈ 20 GiB at 4.13×,
     /// the block's high-water). The tables, their order and the groups are the
     /// same. Production: [`BLOCK_REST_LAYOUT_BYTES`].
+    ///
+    /// With the streamed finish ([`Self::finish_stream`]) the same bytes are
+    /// its byte gate's budget, and the sliding finish (the default,
+    /// `LAMBDA_VM_BLOCK_REST_SLIDE`) has no waves: it starts each table as the
+    /// gate admits it.
     pub rest_layout_bytes: Option<usize>,
+    /// With the streamed finish sliding: at most this many estimated bytes of
+    /// the rest's tables build at once, apart from the gate's budget
+    /// ([`Self::rest_layout_bytes`]), which bounds what is held (built and not
+    /// yet placed, or building). `None` (production): the budget alone, as
+    /// before. The tables, their order and the groups are the same.
+    pub rest_build_bytes: Option<usize>,
     /// With windows: the finish packs each table it builds at the bytes its
     /// columns need as the table is generated
     /// ([`WindowedTraceBuilder::pack_finished_tables`]), and the table is laid
@@ -1131,6 +1142,7 @@ impl BlockOptions {
             finish_cuts: finish_plan_from_env(),
             finish_stream: finish_stream_from_env(),
             rest_layout_bytes: Some(BLOCK_REST_LAYOUT_BYTES),
+            rest_build_bytes: None,
             pack_finished: true,
             gpack: gpack_from_env(),
             spill: production_spill(),
@@ -1350,11 +1362,30 @@ fn parse_walkers(
 /// tables keeps the cores busy while bounding the copies in flight.
 pub const BLOCK_REST_LAYOUT_BYTES: usize = 2 << 30;
 
-/// `BLOCK_WHIR_REST_LAYOUT=all|<MiB>`, `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1` and
-/// `BLOCK_WHIR_PACK_FINISHED=0|1`: the real-block tests' choice of
-/// [`BlockOptions::rest_layout_bytes`], [`BlockOptions::finish_keccak_rnd_chunks`]
+/// `BLOCK_WHIR_REST_BUILD=<MiB>`: the real-block tests' choice of
+/// [`BlockOptions::rest_build_bytes`]; unset leaves production's (no cap
+/// beyond the gate). Anything but a positive MiB count is an error.
+fn parse_rest_build(value: Option<&str>) -> Result<Option<usize>, String> {
+    match value.map(str::trim) {
+        None => Ok(None),
+        Some(mib) => match mib.parse::<usize>() {
+            Ok(mib) if mib > 0 => Ok(Some(mib << 20)),
+            _ => Err(format!("BLOCK_WHIR_REST_BUILD={mib}: a positive MiB count")),
+        },
+    }
+}
+
+/// `BLOCK_WHIR_REST_LAYOUT=all|<MiB>`, `BLOCK_WHIR_REST_BUILD=<MiB>`,
+/// `BLOCK_WHIR_KR_FINISH_CHUNKS=0|1` and `BLOCK_WHIR_PACK_FINISHED=0|1`: the
+/// real-block tests' choice of [`BlockOptions::rest_layout_bytes`],
+/// [`BlockOptions::rest_build_bytes`], [`BlockOptions::finish_keccak_rnd_chunks`]
 /// and [`BlockOptions::pack_finished`]; unset leaves the production ones.
 pub(crate) fn rest_layout_from_env(options: &mut BlockOptions) {
+    match parse_rest_build(std::env::var("BLOCK_WHIR_REST_BUILD").ok().as_deref()) {
+        Ok(Some(bytes)) => options.rest_build_bytes = Some(bytes),
+        Ok(None) => {}
+        Err(e) => panic!("{e}"),
+    }
     match std::env::var("BLOCK_WHIR_REST_LAYOUT")
         .as_deref()
         .map(str::trim)
@@ -4859,7 +4890,8 @@ fn prove_streamed(
     // placed ([`BlockOptions::finish_stream`]).
     let rest_gate = crate::tables::trace_builder::gate::ByteGate::new(
         options.rest_layout_bytes.unwrap_or(usize::MAX),
-    );
+    )
+    .with_build(options.rest_build_bytes);
     let rest_gate = &rest_gate;
     let waits = ProducerWaits::default();
     let waits = &waits;
@@ -5253,7 +5285,7 @@ fn prove_streamed(
                     eprintln!(
                         "BLOCK REST STREAM: the rest built {} under a {:.2} GiB gate, held at most \
                          {:.2} GiB (built and not yet placed) · {waits} acquisitions waited {waited:.2}s \
-                         for room (summed)",
+                         for room (summed) · building at most {} at once, {:.2} GiB the most",
                         if rest_slide() {
                             "as the gate admits each table"
                         } else {
@@ -5261,6 +5293,12 @@ fn prove_streamed(
                         },
                         g(rest_gate.budget()),
                         g(rest_gate.most()),
+                        if rest_gate.build() == rest_gate.budget() {
+                            "the gate".to_string()
+                        } else {
+                            format!("{:.2} GiB", g(rest_gate.build()))
+                        },
+                        g(rest_gate.building_most()),
                     );
                     if let Some(line) = crate::tables::trace_builder::take_row_scan_line() {
                         eprintln!("{line}");
@@ -7759,7 +7797,20 @@ mod p4_rows_knob_tests {
 
 #[cfg(test)]
 mod rest_slide_knob_tests {
-    use super::parse_rest_slide;
+    use super::{parse_rest_build, parse_rest_slide};
+
+    /// `BLOCK_WHIR_REST_BUILD`: unset is no cap beyond the gate (production);
+    /// a positive MiB count is the cap in bytes; anything else is an error.
+    #[test]
+    fn the_build_cap_word_takes_a_positive_mib_count() {
+        assert_eq!(parse_rest_build(None), Ok(None));
+        for (value, bytes) in [("2048", 2usize << 30), (" 1 ", 1 << 20)] {
+            assert_eq!(parse_rest_build(Some(value)), Ok(Some(bytes)), "{value}");
+        }
+        for value in ["", "0", "-1", "2 GiB", "all"] {
+            assert!(parse_rest_build(Some(value)).is_err(), "{value}");
+        }
+    }
 
     /// `LAMBDA_VM_BLOCK_REST_SLIDE`: unset (or anything but `0`) slides; `0`
     /// builds the rest in waves.
