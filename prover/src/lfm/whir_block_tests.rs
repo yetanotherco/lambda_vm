@@ -199,7 +199,10 @@ fn ext_of(word: &LfmWord) -> FEE {
 ///
 /// At blowup 4 ([`at_blowup_4`]): the test format's small stack makes a lone
 /// wide table that production cannot form, and at blowup 2 its leaf rows
-/// pass a leaf's room.
+/// pass a leaf's room. The lean arm stays at blowup 2, the shipped rate: the
+/// lean leaf holds the format's widest groups at 0.821 (BITWISE) and 0.802
+/// (CPU) of a leaf (`leaf_room_small_format_census`), so a rise past a leaf
+/// refuses here first.
 #[test]
 #[ignore = "proves small blocks; box tier"]
 fn the_groups_phase_b_hands_over_build_every_leafs_arena() {
@@ -1651,7 +1654,9 @@ fn the_leaf_query_is_the_verifiers_both_ways() {
     use super::whir_block::{LEAF_P1_CAP, verify_block_tree_capped};
     use super::whir_chain::LeafQuery;
     super::device_permit::arm(1);
-    let format = small_format();
+    // At blowup 4 ([`at_blowup_4`]): at blowup 2 this small format's V1
+    // groups pass a single leaf's room, so the rule's partition refuses.
+    let format = at_blowup_4(small_format());
     let (elf, proof) = small_block("test_commit_4", &format);
     let opts = ProofOptions::default_test_options();
     let wrap = aggregation_wrap_options();
