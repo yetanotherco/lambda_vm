@@ -1496,8 +1496,12 @@ pub const BLOCK_LAYOUT_WORKERS: usize = 6;
 
 /// Streamed chunks laid out (or in the making) and not yet packed, beyond the
 /// one the inline layout holds ([`BlockOptions::layout_ahead`]): one per
-/// worker of [`BLOCK_LAYOUT_WORKERS`]. `BLOCK_WHIR_LAYOUT_AHEAD` overrides it.
-pub const BLOCK_LAYOUT_AHEAD: usize = 5;
+/// worker of [`BLOCK_LAYOUT_WORKERS`] and three more, so the workers go on
+/// while the in-order packer waits for a slow chunk (one per worker held the
+/// walk back once the windows were walked on several threads). What the extra
+/// chunks would add to phase B's holding, the keep budget takes back
+/// ([`BLOCK_KEEP_BELOW`]). `BLOCK_WHIR_LAYOUT_AHEAD` overrides it.
+pub const BLOCK_LAYOUT_AHEAD: usize = 8;
 
 /// A block proved in one proof.
 ///
@@ -7373,17 +7377,17 @@ mod producer_report_tests {
         ProducerStamps, StreamTable, parse_window_log2,
     };
 
-    /// Production lays the streamed chunks out on six workers with five
-    /// chunks ahead: one permit per worker, so none idles on a permit while
-    /// the packer is up to date.
+    /// Production lays the streamed chunks out on six workers with eight
+    /// chunks ahead (nine unpacked at most): a permit per worker and three
+    /// more, so a worker goes on while the packer waits for a slow chunk.
     #[test]
-    fn production_lays_out_on_six_workers_five_ahead() {
+    fn production_lays_out_on_six_workers_eight_ahead() {
         assert_eq!(BLOCK_LAYOUT_WORKERS, 6);
-        assert_eq!(BLOCK_LAYOUT_AHEAD, 5);
+        assert_eq!(BLOCK_LAYOUT_AHEAD, 8);
         let options = BlockOptions::production();
         assert_eq!(options.layout_workers, BLOCK_LAYOUT_WORKERS);
         assert_eq!(options.layout_ahead, Some(BLOCK_LAYOUT_AHEAD));
-        assert_eq!(BLOCK_LAYOUT_AHEAD + 1, BLOCK_LAYOUT_WORKERS);
+        assert_eq!(BLOCK_LAYOUT_AHEAD + 1, BLOCK_LAYOUT_WORKERS + 3);
     }
 
     /// The window knob takes production's 2^20 only, unset is production's,
