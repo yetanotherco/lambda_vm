@@ -580,7 +580,13 @@ impl<'a> FinishPlan<'a> {
             }
             let count_rows = || {
                 rows_on_pool.then(|| {
-                    count_row_lookups(&lt_ops, &branch_segments, &bytewise_segments, max_rows)
+                    count_row_lookups(
+                        &lt_ops,
+                        &branch_segments,
+                        &bytewise_segments,
+                        max_rows,
+                        skip.p4_by,
+                    )
                 })
             };
             let shift_padding: usize = list_chunks(shift_ops.len(), max_rows.shift)
@@ -656,10 +662,12 @@ impl<'a> FinishPlan<'a> {
                 for (i, unit) in units.into_iter().enumerate() {
                     buckets[i % cap].push(unit);
                 }
-                // The row counts on the pool beside the buckets.
+                // The row counts on the pool beside the buckets; the line says
+                // how long the buckets took beside them.
                 let (reduced, rows) = rayon::join(
                     || {
-                        buckets
+                        let started = std::time::Instant::now();
+                        let reduced = buckets
                             .par_iter()
                             .map(|bucket| {
                                 let mut h = bitwise::BitwiseHistogram::new();
@@ -671,10 +679,17 @@ impl<'a> FinishPlan<'a> {
                             .reduce_with(|mut a, b| {
                                 a.merge(&b);
                                 a
-                            })
+                            });
+                        (reduced, started.elapsed().as_secs_f64())
                     },
                     count_rows,
                 );
+                let (reduced, collectors) = reduced;
+                if rows.is_some() {
+                    add_to_row_scan_line(&format!(
+                        " · beside it, phase 4's other collectors in {collectors:.2} s"
+                    ));
+                }
                 if let Some(reduced) = reduced {
                     base.merge(&reduced);
                 }

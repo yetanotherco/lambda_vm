@@ -790,6 +790,14 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// [`Self::p4_rows_on_pool`], each chunk counted by parts
+    /// ([`StreamSkip::p4_by`]). The tables are the same.
+    pub fn p4_rows_by_parts(mut self) -> Self {
+        self.emitted.p4_rows = true;
+        self.emitted.p4_by = super::RowCount::Parts;
+        self
+    }
+
     /// Drop each streamed chunk's ops once the chunk is handed out, instead of
     /// keeping every walked window to the run's end (see the module docs): the
     /// builder then holds less than a chunk of each streamed table's ops, plus

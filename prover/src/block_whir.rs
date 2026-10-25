@@ -1254,20 +1254,34 @@ fn compact_lt() -> bool {
 /// finish count the deduplicating tables' per-row lookups (LT, BRANCH,
 /// BYTEWISE: one `ARE_BYTES` a row of a μ-split operation, and the padding
 /// rows') on the whole pool, a chunk a task, counts only, each chunk's map
-/// reserved for its distinct operations; `off` builds each chunk's list of
-/// lookups among phase 4's other collectors, as before (the rollback).
-/// Anything else refuses the prove. The multiplicities and the tables are the
-/// same.
-fn block_p4_rows() -> Result<bool, Error> {
+/// reserved for its distinct operations; `parts` counts each chunk by parts of
+/// its ops instead, each part's map small enough to stay in a core's cache;
+/// `off` builds each chunk's list of lookups among phase 4's other
+/// collectors, as before (the rollback). Anything else refuses the prove. The
+/// multiplicities and the tables are the same.
+fn block_p4_rows() -> Result<P4Rows, Error> {
     parse_p4_rows(std::env::var("LAMBDA_VM_BLOCK_P4_ROWS").ok().as_deref())
 }
 
-fn parse_p4_rows(value: Option<&str>) -> Result<bool, Error> {
+/// How the finish counts the per-row lookups ([`block_p4_rows`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum P4Rows {
+    /// Each chunk's list among phase 4's collectors.
+    Off,
+    /// On the pool, one map a chunk.
+    Pool,
+    /// On the pool, each chunk by parts.
+    Parts,
+}
+
+fn parse_p4_rows(value: Option<&str>) -> Result<P4Rows, Error> {
     match value.map(str::trim) {
-        None | Some("" | "pool") => Ok(true),
-        Some("off") => Ok(false),
+        None | Some("" | "pool") => Ok(P4Rows::Pool),
+        Some("parts") => Ok(P4Rows::Parts),
+        Some("off") => Ok(P4Rows::Off),
         Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_BLOCK_P4_ROWS={v}: pool (the per-row lookups counted on the pool) or off"
+            "LAMBDA_VM_BLOCK_P4_ROWS={v}: pool (the per-row lookups counted on the pool), parts (counted \
+             by parts of each chunk) or off"
         ))),
     }
 }
@@ -5398,8 +5412,10 @@ fn prove_streamed(
                 if lt_concat() {
                     builder = builder.concat_lt();
                 }
-                if p4_rows {
-                    builder = builder.p4_rows_on_pool();
+                match p4_rows {
+                    P4Rows::Off => {}
+                    P4Rows::Pool => builder = builder.p4_rows_on_pool(),
+                    P4Rows::Parts => builder = builder.p4_rows_by_parts(),
                 }
                 if rest_slide() {
                     builder = builder.slide_rest();
@@ -8382,23 +8398,25 @@ mod air_input_tests {
 
 #[cfg(test)]
 mod p4_rows_knob_tests {
-    use super::parse_p4_rows;
+    use super::{P4Rows, parse_p4_rows};
 
     /// `LAMBDA_VM_BLOCK_P4_ROWS`: unset, empty or `pool` counts the per-row
     /// lookups on the pool (the default); `off` does not; any other word
     /// refuses.
     #[test]
     fn the_p4_rows_knob_defaults_to_pool_takes_off_and_refuses_anything_else() {
-        for (value, on) in [
-            (None, true),
-            (Some(""), true),
-            (Some(" off "), false),
-            (Some("pool"), true),
-            (Some(" pool\n"), true),
+        for (value, rows) in [
+            (None, P4Rows::Pool),
+            (Some(""), P4Rows::Pool),
+            (Some(" off "), P4Rows::Off),
+            (Some("pool"), P4Rows::Pool),
+            (Some(" pool\n"), P4Rows::Pool),
+            (Some("parts"), P4Rows::Parts),
+            (Some(" parts "), P4Rows::Parts),
         ] {
-            assert_eq!(parse_p4_rows(value).ok(), Some(on), "{value:?}");
+            assert_eq!(parse_p4_rows(value).ok(), Some(rows), "{value:?}");
         }
-        for value in ["1", "on", "POOL", "pools", "rows"] {
+        for value in ["1", "on", "POOL", "pools", "rows", "part", "PARTS"] {
             assert!(parse_p4_rows(Some(value)).is_err(), "{value}");
         }
     }
