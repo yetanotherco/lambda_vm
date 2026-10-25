@@ -639,6 +639,42 @@ impl LeanPass {
         memory
     }
 
+    /// The run's side of the windows' boundary sums
+    /// ([`super::parallel::cell_hash`]): over every byte a window touched
+    /// (the pass's cells set by a window), its cell in `state` (the state the
+    /// windows hand to the finish) less its cell at the run's start (`image`'s
+    /// value, timestamp 0), hashed under `key` and summed.
+    pub(crate) fn boundaries(&self, state: &MemoryState, image: &PagedMem<u8>, key: u64) -> u64 {
+        let pages: Vec<(u64, &[u64; PAGE])> = self
+            .bytes
+            .cells
+            .iter_pages()
+            .map(|(number, page)| (number << PAGE_BITS, page))
+            .collect();
+        pages
+            .into_par_iter()
+            .map(|(base, page)| {
+                let mut sum = 0u64;
+                for (offset, &cell) in page.iter().enumerate() {
+                    if cell == FILL {
+                        continue;
+                    }
+                    let address = base + offset as u64;
+                    let (value, ts) = state.cells.get(address);
+                    sum = sum
+                        .wrapping_add(super::parallel::cell_hash(key, address, ts, value))
+                        .wrapping_sub(super::parallel::cell_hash(
+                            key,
+                            address,
+                            0,
+                            image.get(address),
+                        ));
+                }
+                sum
+            })
+            .reduce(|| 0, u64::wrapping_add)
+    }
+
     /// The register cells now, as the walk's.
     pub(crate) fn registers(&self) -> RegisterState {
         self.registers.state()

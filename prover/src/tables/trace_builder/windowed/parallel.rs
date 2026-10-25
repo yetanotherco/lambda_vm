@@ -15,7 +15,17 @@
 //!   registers, and every byte it holds that the next window touches must hold
 //!   the next window's entry (the executor's value, the pass's timestamp);
 //! - the run's last walked window must agree, byte for byte, with the state
-//!   handed to the finish ([`super::lean_pass::LeanPass::walked_state`]).
+//!   handed to the finish ([`super::lean_pass::LeanPass::walked_state`]);
+//! - the windows' boundaries must add up ([`cell_hash`]): each window's
+//!   seeded bytes A and the same bytes at its end B, hashed and summed, give
+//!   Σ (B − A) over the run equal to the sum, over every byte a window
+//!   touched, of its cell handed to the finish less its cell at the run's
+//!   start. That catches what the exit checks cannot see: an entry's
+//!   timestamp or value wrong on a byte the window then writes, whose end is
+//!   right. (An entry wrong on a byte the window only reads ends as it was
+//!   seeded and adds nothing to the sums: the exit checks see it where the
+//!   next window touches the byte, and the verifier refuses its rows where
+//!   none does.) An entry stamped 0 must carry the image's value.
 //!
 //! The threads: the executor (the caller's) sends each window with its
 //! snapshot; one thread runs the pass and hands out each window as a job as it
@@ -25,6 +35,7 @@
 //! not yet absorbed.
 
 use std::collections::BTreeMap;
+use std::hash::BuildHasher;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -60,6 +71,36 @@ struct WalkSettings {
     decode: Arc<DecodeTable>,
     lookups: bool,
     batch: usize,
+    /// The run's key for [`cell_hash`].
+    key: u64,
+}
+
+/// One byte's cell hashed for the windows' boundary sums, under the run's
+/// `key` so that no mistake with a structure cancels out in them; one-to-one
+/// in `(timestamp, value)` for a given address. Timestamps stay below 2^40.
+#[inline]
+pub(super) fn cell_hash(key: u64, address: u64, timestamp: u64, value: u8) -> u64 {
+    // splitmix64's finalizer.
+    fn mix(mut x: u64) -> u64 {
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    }
+    mix(mix(address ^ key) ^ ((timestamp << 8) | u64::from(value)))
+}
+
+/// The windows' boundary sums against the run's: refused unless they are the
+/// same ([`cell_hash`]).
+fn check_boundaries(windows: u64, run: u64) -> Result<(), Error> {
+    if windows != run {
+        return Err(Error::Prover(format!(
+            "the windows' boundaries do not add up: the walked windows give {windows:#018x}, the \
+             bytes they touched {run:#018x}"
+        )));
+    }
+    Ok(())
 }
 
 /// One walker: its window state, kept from window to window so its pages are
@@ -97,10 +138,16 @@ impl WindowWalker {
         }
     }
 
-    /// Walks `job` from its entries into fresh lists. Refuses the window if it
-    /// read a byte its entries do not hold.
-    fn walk(&mut self, job: &WindowJob) -> Result<WalkedWindow, Error> {
-        self.seed(job);
+    /// Walks `job` from its entries into fresh lists, with its boundary sum:
+    /// its bytes at the end, hashed and summed, less the same at its start
+    /// ([`cell_hash`]). Refuses the window if it read a byte its entries do
+    /// not hold, or if an entry stamped 0 does not carry `image`'s value.
+    fn walk(
+        &mut self,
+        job: &WindowJob,
+        image: &PagedMem<u8>,
+    ) -> Result<(WalkedWindow, u64), Error> {
+        let seeded = self.seed(job, image)?;
         self.registers = job.registers.clone();
         let s = &*self.settings;
         let walked = walk_window(
@@ -119,12 +166,20 @@ impl WindowWalker {
                 job.window
             )));
         }
-        Ok(walked)
+        let key = self.settings.key;
+        let ended = job.entries.iter().fold(0u64, |sum, &(address, _)| {
+            let (value, ts) = self.memory.cells.get(address);
+            sum.wrapping_add(cell_hash(key, address, ts, value))
+        });
+        Ok((walked, ended.wrapping_sub(seeded)))
     }
 
     /// The state cleared of the last window's bytes, its pages kept if this
-    /// window or the last touched them, then seeded with `job`'s entries.
-    fn seed(&mut self, job: &WindowJob) {
+    /// window or the last touched them, then seeded with `job`'s entries; the
+    /// seeded cells hashed and summed ([`cell_hash`]). Refuses an entry
+    /// stamped 0 (no window wrote the byte before) whose value is not
+    /// `image`'s.
+    fn seed(&mut self, job: &WindowJob, image: &PagedMem<u8>) -> Result<u64, Error> {
         for &address in &self.touched {
             self.memory.write_byte(address, 0, ABSENT);
         }
@@ -138,12 +193,23 @@ impl WindowWalker {
         });
         self.memory.hot = NO_PAGE;
         self.touched.clear();
+        let (key, mut seeded) = (self.settings.key, 0u64);
         for &(address, ts) in job.entries.iter() {
-            self.memory
-                .write_byte(address, job.start.load_byte(address), ts);
+            let value = job.start.load_byte(address);
+            if ts == 0 && value != image.get(address) {
+                return Err(Error::Prover(format!(
+                    "window {}: the byte at {address:#x} has timestamp 0 but holds {value}, not the \
+                     image's {}",
+                    job.window,
+                    image.get(address)
+                )));
+            }
+            self.memory.write_byte(address, value, ts);
             self.touched.push(address);
+            seeded = seeded.wrapping_add(cell_hash(key, address, ts, value));
         }
         self.memory.take_missing();
+        Ok(seeded)
     }
 
     /// After walking window `job`: its registers must be `next_registers`,
@@ -239,9 +305,10 @@ impl WindowWalker {
         &mut self,
         job: &WindowJob,
         after: &Receiver<After>,
-    ) -> Result<(WalkedWindow, f64), Error> {
+        image: &PagedMem<u8>,
+    ) -> Result<(WalkedWindow, f64, u64), Error> {
         let t = Instant::now();
-        let walked = self.walk(job)?;
+        let (walked, boundary) = self.walk(job, image)?;
         let mut busy = t.elapsed().as_secs_f64();
         let after = after
             .recv()
@@ -256,7 +323,7 @@ impl WindowWalker {
             After::Finish { registers, state } => self.check_exit_into(job, &registers, &state)?,
         }
         busy += t.elapsed().as_secs_f64();
-        Ok((walked, busy))
+        Ok((walked, busy, boundary))
     }
 
     /// The bytes its window state takes on the heap.
@@ -284,6 +351,9 @@ struct PassEnd {
     state_secs: f64,
     entries: usize,
     most_entries: usize,
+    /// The bytes the windows touched: their cells handed to the finish less
+    /// their cells at the run's start, hashed and summed ([`cell_hash`]).
+    boundaries: u64,
 }
 
 /// What a run walked on several threads reports (the `BLOCK WALKERS` line).
@@ -354,7 +424,9 @@ fn walk_numbered(
         decode: Arc::clone(&builder.decode),
         lookups: !builder.lean.lookups,
         batch: builder.walk_batch,
+        key: std::collections::hash_map::RandomState::new().hash_one(0u64),
     });
+    let key = settings.key;
     let start_registers = builder.register_state.clone();
     let lean = builder.lean.memory;
     let (end, walk_secs, held_most, state_bytes) = {
@@ -362,8 +434,9 @@ fn walk_numbered(
         let (job_tx, job_rx) = sync_channel::<Ticket>(walkers);
         let job_rx = Mutex::new(job_rx);
         std::thread::scope(|scope| -> Result<_, Error> {
+            #[allow(clippy::type_complexity)]
             let (done_tx, done_rx) =
-                sync_channel::<(u32, usize, Result<(WalkedWindow, f64, usize), Error>)>(
+                sync_channel::<(u32, usize, Result<(WalkedWindow, f64, usize, u64), Error>)>(
                     walkers + 2,
                 );
             let (permit_tx, permit_rx) = sync_channel::<()>(walkers + 2);
@@ -374,6 +447,7 @@ fn walk_numbered(
                     &start_registers,
                     image,
                     lean,
+                    key,
                     windows,
                     number,
                     job_tx,
@@ -404,14 +478,16 @@ fn walk_numbered(
                         let window = ticket.job.window;
                         let outcome =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                walker.walk_and_check(&ticket.job, &ticket.after)
+                                walker.walk_and_check(&ticket.job, &ticket.after, image)
                             }))
                             .unwrap_or_else(|_| {
                                 Err(Error::Prover(format!(
                                     "window {window}: its walker panicked"
                                 )))
                             })
-                            .map(|(walked, busy)| (walked, busy, walker.state_bytes()));
+                            .map(|(walked, busy, boundary)| {
+                                (walked, busy, walker.state_bytes(), boundary)
+                            });
                         let failed = outcome.is_err();
                         if done_tx.send((window, w, outcome)).is_err() || failed {
                             stopped = true;
@@ -424,11 +500,13 @@ fn walk_numbered(
             // Each walker's window state as of its last window, and the most
             // they took at once.
             let (mut walk_secs, mut states, mut state_bytes) = (0.0, vec![0usize; walkers], 0);
+            // The walked windows' boundary sums, added as they come.
+            let mut boundaries = 0u64;
             // The first error from a walker or from absorbing; an absorbing
             // error is this thread's own and always wins.
             let (mut failure, mut absorbing) = (None, false);
             'windows: for (window, w, outcome) in &done_rx {
-                let (walked, busy, bytes) = match outcome {
+                let (walked, busy, bytes, boundary) = match outcome {
                     Ok(walked) => walked,
                     Err(e) => {
                         failure = Some(e);
@@ -436,6 +514,7 @@ fn walk_numbered(
                     }
                 };
                 walk_secs += busy;
+                boundaries = boundaries.wrapping_add(boundary);
                 states[w] = bytes;
                 state_bytes = state_bytes.max(states.iter().sum());
                 if window < next || held.insert(window, walked).is_some() {
@@ -485,7 +564,10 @@ fn walk_numbered(
                         end.windows
                     )))
                 }
-                (None, Ok(end)) => Ok((end, walk_secs, held_most, state_bytes)),
+                (None, Ok(end)) => {
+                    check_boundaries(boundaries, end.boundaries)?;
+                    Ok((end, walk_secs, held_most, state_bytes))
+                }
             }
         })?
     };
@@ -499,6 +581,7 @@ fn walk_numbered(
         state_secs,
         entries,
         most_entries,
+        boundaries: _,
     } = end;
     let state = Arc::try_unwrap(state)
         .map_err(|_| Error::Prover("the finish's state is still shared".into()))?;
@@ -528,6 +611,7 @@ fn pass_thread(
     start_registers: &RegisterState,
     image: &PagedMem<u8>,
     lean: bool,
+    key: u64,
     windows: Receiver<(Vec<Log>, Option<MemorySnapshot>)>,
     number: fn(u32) -> u32,
     jobs: SyncSender<Ticket>,
@@ -540,7 +624,7 @@ fn pass_thread(
     let mut last: Option<(Arc<Vec<Log>>, Arc<MemoryState>, RegisterState)> = None;
     let mut waiting: Option<SyncSender<After>> = None;
     let (mut k, mut first, mut busy, mut entries, mut most) = (0u32, 0usize, 0.0, 0usize, 0usize);
-    let (mut sent, mut state_secs) = (false, 0.0);
+    let (mut sent, mut state_secs, mut boundaries) = (false, 0.0, 0u64);
     for (logs, start) in windows {
         sent = true;
         let start = Arc::new(start.ok_or_else(|| {
@@ -557,6 +641,7 @@ fn pass_thread(
         // finish's.
         if logs.last().is_some_and(|log| log.next_pc == 0) {
             let state = Arc::new(pass.walked_state(&start, image, lean));
+            boundaries = pass.boundaries(&state, image, key);
             state_secs = t.elapsed().as_secs_f64();
             busy += state_secs;
             if let Some(after) = waiting.take() {
@@ -620,6 +705,7 @@ fn pass_thread(
         state_secs,
         entries,
         most_entries: most,
+        boundaries,
     })
 }
 

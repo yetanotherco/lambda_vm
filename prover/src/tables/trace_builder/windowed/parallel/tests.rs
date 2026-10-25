@@ -36,6 +36,11 @@ enum Tamper {
     LaterFirst(u32),
     /// Window `window` starting with x5 one larger.
     Register(u32),
+    /// The run's first entry whose byte a window before the previous one
+    /// wrote, with a value other than the image's, stamped 0 instead (none if
+    /// no entry is such). The previous window does not touch the byte, so its
+    /// exit check cannot see it.
+    ZeroEntry,
 }
 
 /// The run of `program` built by windows of `window` cycles walked from their
@@ -57,6 +62,7 @@ fn walked_from_entries(
         decode: Arc::clone(&builder.decode),
         lookups: !builder.lean.lookups,
         batch: builder.walk_batch,
+        key: 0x5eed_1234_abcd_0042,
     });
     let mut pass = LeanPass::new(Arc::clone(&builder.decode), &builder.register_state)?;
     let mut executor =
@@ -90,14 +96,16 @@ fn walked_from_entries(
         first += cycles;
     }
     let state = pass.walked_state(&last_start, &builder.image, builder.memory_state.lean);
+    let run = pass.boundaries(&state, &builder.image, settings.key);
     let registers = pass.registers();
-    tamper_with(&mut jobs, &last_start, tamper);
+    tamper_with(&mut jobs, &last_start, &builder.image, tamper);
     let mut walker = WindowWalker::new(settings);
-    let mut chunks = Vec::new();
+    let (mut chunks, mut boundaries) = (Vec::new(), 0u64);
     {
-        let (_, mut accumulator) = builder.split();
+        let (mut accumulator, image) = builder.accumulator_and_image();
         for k in 0..jobs.len() {
-            let walked = walker.walk(&jobs[k])?;
+            let (walked, boundary) = walker.walk(&jobs[k], image)?;
+            boundaries = boundaries.wrapping_add(boundary);
             match jobs.get(k + 1) {
                 Some(next) => {
                     walker.check_exit(&jobs[k], &next.registers, &next.entries, &next.start)?
@@ -112,6 +120,7 @@ fn walked_from_entries(
             );
         }
     }
+    super::check_boundaries(boundaries, run)?;
     builder.install_walked(state, registers, first, jobs.len(), 0.0);
     let mut traces = builder.finish(&last_logs)?;
     traces.insert_streamed(chunks)?;
@@ -121,6 +130,7 @@ fn walked_from_entries(
 fn tamper_with(
     jobs: &mut [WindowJob],
     last_start: &Arc<executor::vm::memory::MemorySnapshot>,
+    image: &crate::paged_mem::PagedMem<u8>,
     tamper: Tamper,
 ) {
     let at = |w: u32| w as usize;
@@ -140,6 +150,20 @@ fn tamper_with(
         }
         Tamper::LaterFirst(window) => jobs[at(window)].first += 1,
         Tamper::Register(window) => jobs[at(window)].registers.regs[5].0 += 1,
+        Tamper::ZeroEntry => {
+            let found = jobs.iter().enumerate().skip(1).find_map(|(k, job)| {
+                let before = &jobs[k - 1].entries;
+                let i = job.entries.iter().position(|&(a, ts)| {
+                    ts > 0
+                        && job.start.load_byte(a) != image.get(a)
+                        && !before.iter().any(|&(b, _)| b == a)
+                })?;
+                Some((k, i))
+            });
+            if let Some((k, i)) = found {
+                Arc::make_mut(&mut jobs[k].entries)[i].1 = 0;
+            }
+        }
     }
 }
 
@@ -265,9 +289,11 @@ fn caught(program: &Elf, reference: &Traces, window: usize, tamper: Tamper) -> &
 /// a window missing any one of its entries is refused, with no panic first
 /// (the walk reads a byte it does not hold, and ECSM computes no witness from
 /// such a byte); a window walked from a cycle off is refused (its
-/// registers end off); and an entry's timestamp moved (where a memory row
-/// keeps it), the next window's snapshot (where the window wrote a byte it
-/// touches), or a register off never builds the whole-run tables.
+/// registers end off); an entry's timestamp moved where a memory row keeps
+/// it (the window then writes the byte, so its end is right) is refused by
+/// the windows' boundary sums; and the next window's snapshot (where the
+/// window wrote a byte it touches) or a register off never builds the
+/// whole-run tables.
 #[test]
 fn each_check_catches_what_it_guards() {
     let window = 7;
@@ -315,8 +341,11 @@ fn each_check_catches_what_it_guards() {
                     window,
                     Tamper::LaterEntry { window: w, at: i },
                 );
-                assert_ne!(
-                    how, "unseen",
+                // The window's memory row keeps the moved timestamp and writes
+                // the byte, so the exit checks see nothing: the boundary sums
+                // refuse it.
+                assert_eq!(
+                    how, "refused",
                     "{name}: window {w}, entry {i} a timestamp later"
                 );
                 *seen.entry(("later entry", how)).or_default() += 1;
@@ -341,6 +370,35 @@ fn each_check_catches_what_it_guards() {
     }
     println!("caught: {seen:?}");
     assert!(seen.values().sum::<usize>() > 60, "{seen:?}");
+}
+
+/// ★ An entry stamped 0 says no window wrote the byte before, so its value
+/// must be the image's: one that holds another value is refused by that
+/// check, before the boundary sums.
+#[test]
+fn an_entry_stamped_0_must_carry_the_images_value() {
+    let mut refused = 0;
+    for name in PROGRAMS {
+        let (program, _) = run(name);
+        // A program with no such byte builds untampered.
+        if let Err(e) = walked_from_entries(
+            &program,
+            &MaxRowsConfig::small(),
+            7,
+            true,
+            Tamper::ZeroEntry,
+        ) {
+            assert!(
+                matches!(&e, Error::Prover(m) if m.contains("has timestamp 0 but holds")),
+                "{name}: {e:?}"
+            );
+            refused += 1;
+        }
+    }
+    assert!(
+        refused >= 3,
+        "only {refused} programs had a byte to stamp 0"
+    );
 }
 
 /// The bytes each value-only reader reads in a walked window: HINT's input,
