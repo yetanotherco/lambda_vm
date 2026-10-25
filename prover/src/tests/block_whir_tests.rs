@@ -5235,6 +5235,14 @@ fn streamed_records_chunks_drop_as_records_and_come_back() {
         stamps.windows.card_fill.records_bytes + stamps.layout.records_rest.1,
         "every records table let go after its group's openings"
     );
+    // Their lists' pages handed back on a thread of their own: some list let
+    // go by its last holder, none refused. (These windows are a few cycles,
+    // so a list holds no whole page: the bytes are a real block's to show.)
+    let mut pages = multilinear::records::PagesReturned::default();
+    for g in &stamps.groups {
+        pages += g.records_pages;
+    }
+    assert!(pages.buffers > 0 && pages.failed == 0, "{pages:?}");
     assert!(verify(&never, &elf, &format));
     assert_eq!(parked.groups, plain.groups, "the partition");
     if crypto::grinding::deterministic() {

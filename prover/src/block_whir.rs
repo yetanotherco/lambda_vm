@@ -2093,12 +2093,25 @@ impl BlockStamps {
                 c.shift[1],
             ));
             let released = self.groups.iter().filter(|g| g.records_released > 0);
+            let mut pages = multilinear::records::PagesReturned::default();
+            for g in &self.groups {
+                pages += g.records_pages;
+            }
             out.push_str(&format!(
                 "BLOCK CARD FILL released: records let go in phase B after their groups' \
-                 openings {:.3} GiB · {} groups\n",
+                 openings {:.3} GiB · {} groups · pages handed back to the OS {:.3} GiB of {} \
+                 buffers ({} shared, {} refused) in {:.2} s on a thread of their own\n",
                 released.clone().map(|g| g.records_released).sum::<usize>() as f64
                     / (1u64 << 30) as f64,
                 released.count(),
+                pages.bytes as f64 / (1u64 << 30) as f64,
+                pages.buffers,
+                pages.shared,
+                pages.failed,
+                self.groups
+                    .iter()
+                    .map(|g| g.records_return_secs)
+                    .sum::<f64>(),
             ));
             let (on, [direct, narrowed, again, wide]) = l.gpack;
             out.push_str(&format!(
