@@ -1,5 +1,5 @@
 //! The recursion proofs' domains and twiddles built ahead of their card holds
-//! (`LFM_WARM_DOMAINS=1`; off by default).
+//! (on by default; `LFM_WARM_DOMAINS=0` or `off` turns it off).
 //!
 //! A recursion proof builds each table length's domain and twiddles on first
 //! use, inside `multi_prove`, under the exclusive card permit: the first proof
@@ -27,9 +27,11 @@ static EARLY_BYTES: AtomicU64 = AtomicU64::new(0);
 /// (the bits of an `f64`; `u64::MAX` for never).
 static EARLY_AT: AtomicU64 = AtomicU64::new(u64::MAX);
 
-/// `LFM_WARM_DOMAINS` as given: `1` on, anything else off.
+/// `LFM_WARM_DOMAINS` as given: on unless `0` or `off`. On, the median and the
+/// large block's recursion were 0.17 s and 0.62 s shorter, with no proof byte
+/// moved and ≈ 0.2 GiB more host memory at the base's peak.
 fn setting(value: Option<&str>) -> bool {
-    value == Some("1")
+    !matches!(value.map(str::trim), Some("0" | "off"))
 }
 
 /// Whether the warm-up is on, read once.
@@ -103,7 +105,7 @@ pub(crate) fn note_early(at: f64) {
 /// What the warm-up did this process, for a harness's line.
 pub fn line() -> String {
     if !on() {
-        return "off (LFM_WARM_DOMAINS=1 builds the recursion proofs' domains and twiddles before their card holds)"
+        return "off (LFM_WARM_DOMAINS=0; the default builds the recursion proofs' domains and twiddles before their card holds)"
             .to_string();
     }
     let early = EARLY_AT.load(Ordering::Relaxed);
@@ -126,10 +128,13 @@ pub fn line() -> String {
 mod tests {
     use super::*;
 
+    /// On by default: unset, empty or `1` warms; `0` or `off` does not.
     #[test]
-    fn the_knob_is_on_only_at_one() {
-        assert!(setting(Some("1")));
-        for off in [None, Some(""), Some("0"), Some("on"), Some("true")] {
+    fn the_knob_is_on_unless_zero_or_off() {
+        for on in [None, Some(""), Some("1"), Some(" 1 ")] {
+            assert!(setting(on), "{on:?}");
+        }
+        for off in [Some("0"), Some("off"), Some(" 0 ")] {
             assert!(!setting(off), "{off:?}");
         }
     }
