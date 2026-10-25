@@ -496,3 +496,45 @@ fn a_lean_chain_refuses_a_path_word_off() {
     }
     assert!(tampered > 0, "some case walks round 0");
 }
+
+/// ★ Beside the tail rounds the sampled checks still run. The lean leaf draws
+/// every query position V1 draws (as many `BitDec` rows: the tail rounds'
+/// draws stay in the transcript, their bits unused), and the round before the
+/// first tail round still opens the tail tree at each sampled position: its
+/// successor opening one off at the first or the last query, which the host
+/// refuses, has no execution.
+#[test]
+fn the_sampled_checks_still_run_beside_the_tail_rounds() {
+    use super::instr::Instr;
+    let bitdecs = |p: &super::compiler::LfmProgram| {
+        p.instrs
+            .iter()
+            .filter(|i| matches!(i, Instr::BitDec { .. }))
+            .count()
+    };
+    for (num_vars, cfg) in tail_cases() {
+        let f = fixture(num_vars, cfg);
+        let shape = lean(&f.shape);
+        let program = p1_chain_program(&shape);
+        assert_eq!(
+            bitdecs(&program),
+            bitdecs(&p1_chain_program(&f.shape)),
+            "S={num_vars}: every query position drawn"
+        );
+        let r = tails(&shape)[0] - 1;
+        for q in [0, shape.num_queries - 1] {
+            let mut forged = f.proof.clone();
+            match &mut forged.rounds[r].openings {
+                RoundOpenings::Base(p) => p.next[q].values[0] += FEE::one(),
+                RoundOpenings::Extension(p) => p.next[q].values[0] += FEE::one(),
+                RoundOpenings::BaseGrouped(p) => p.next[q].values[0] += FEE::one(),
+            }
+            assert!(!host_accepts(&f, &forged), "S={num_vars}: the host refuses");
+            let arena = arena_at(&f, &forged, &shape).expect("the other openings place every leaf");
+            assert!(
+                execute(&program, &[arena], &SOCKET).is_err(),
+                "S={num_vars}: round {r}'s successor opening at query {q} one off must be refused"
+            );
+        }
+    }
+}
