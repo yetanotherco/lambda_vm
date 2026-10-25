@@ -143,6 +143,9 @@ pub struct GroupStamps {
     pub end_b: f64,
     /// Host bytes kept of the group's trees between the phases.
     pub tree_bytes: usize,
+    /// Phase B: the bytes of records its tables held as their records, let go
+    /// with the group after its openings (under a spill).
+    pub records_released: usize,
     /// The device ledger's peak promise through the group's argue — the
     /// argue's own and the next group's columns uploaded beside it, and under
     /// [`PhaseBOverlap::On`] the previous group's openings beside it too
@@ -3033,8 +3036,9 @@ where
 
 /// Lets a group go once its openings are done: its tables' columns off the
 /// card and out of their widened form — under a spill its packed columns too,
-/// which nothing reads after its openings — its store, and its kept tree tops
-/// out of the memory log.
+/// and the records of a table held as them, which nothing reads after its
+/// openings — its store, and its kept tree tops out of the memory log. The
+/// bytes of records let go.
 fn release_group<F, E>(
     group: &mut [CommittedTable<'_, F, E>],
     g: usize,
@@ -3042,22 +3046,32 @@ fn release_group<F, E>(
     tree_tops: usize,
     spilling: bool,
     mem: Option<&BlockMem>,
-) where
+) -> usize
+where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
     FieldElement<F>: AsBytes + Sync + Send,
     FieldElement<E>: AsBytes + Sync + Send,
 {
+    let mut records_released = 0;
     for table in group.iter_mut() {
         table.clear_resident();
         table.drop_widened();
-        // While a spill is on, a finished group's packed columns go:
-        // nothing reads them after its opening.
-        if spilling
-            && let Some(packed) = table.take_narrow_for_spill()
-            && let Some(mem) = mem
-        {
-            mem.held_narrow.fetch_sub(packed.data().len(), Relaxed);
+        // While a spill is on, a finished group's packed columns go, and so do
+        // the records of a table held as them: nothing reads either after its
+        // opening.
+        if !spilling {
+            continue;
+        }
+        let released = match table.take_narrow_for_spill() {
+            Some(packed) => Some(packed.data().len()),
+            None => table.take_records_for_spill().map(|records| {
+                records_released += records.bytes();
+                records.bytes()
+            }),
+        };
+        if let (Some(bytes), Some(mem)) = (released, mem) {
+            mem.held_narrow.fetch_sub(bytes, Relaxed);
         }
     }
     drop(store);
@@ -3065,6 +3079,7 @@ fn release_group<F, E>(
         mem.tree_tops.fetch_sub(tree_tops, Relaxed);
         mem.mark(&format!("phase B group {g} end"));
     }
+    records_released
 }
 
 /// [`block_prove_on_forks_observed`] with phase B taking the groups in
@@ -3408,7 +3423,7 @@ where
             group_argue[h] = earlier.argue;
             group_opening[h] = Some(opened.opening);
             group_prepared[h] = opened.prepared;
-            release_group(
+            stamps[h].records_released = release_group(
                 &mut tables[earlier.at..earlier.at + earlier.size],
                 h,
                 earlier.store,
@@ -3477,7 +3492,7 @@ where
         group_opening[g] = Some(opened.opening);
         group_prepared[g] = opened.prepared;
         drop(stacked);
-        release_group(
+        stamps[g].records_released = release_group(
             &mut tables[at..at + size],
             g,
             argued.store,
@@ -3823,6 +3838,102 @@ mod spill_tests {
         let back = from_store(main).expect("converts back");
         assert_eq!(back.data().as_ptr(), at, "back");
         assert_eq!(back, copy);
+    }
+
+    /// ★ Under a spill, a finished group lets go of its tables' records as it
+    /// does of their packed columns: the table is out (spilled), the records'
+    /// last handle is gone, and the bytes come back as the group's records
+    /// released; packed columns go too but are not records. With no spill,
+    /// nothing is taken and nothing counts.
+    #[test]
+    fn a_finished_group_lets_go_of_its_records_under_a_spill() {
+        use super::release_group;
+        use crate::examples::multi_table_lookup::new_cpu_air_with_lookup;
+        use crate::multilinear_air::Uniforms;
+        use crate::multilinear_table::{CommittedTable, TableLayout};
+        use crate::proof::options::ProofOptions;
+        use crate::traits::AIR;
+        use math::field::{
+            element::FieldElement, extensions_goldilocks::Degree3GoldilocksExtensionField as Ext,
+            goldilocks::GoldilocksField as Fp,
+        };
+        use multilinear::records::{KeccakRndOp, Records, RecordsFill, TableRecords};
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct Ops(Vec<KeccakRndOp>);
+        impl TableRecords for Ops {
+            fn rows(&self) -> usize {
+                8
+            }
+            fn cols(&self) -> usize {
+                5
+            }
+            fn fill(&self) -> RecordsFill<'_> {
+                RecordsFill::KeccakRnd {
+                    ops: &self.0,
+                    skip: 0,
+                }
+            }
+            fn host_fill(&self) -> Option<NarrowColumns> {
+                None
+            }
+        }
+        let air = new_cpu_air_with_lookup(&ProofOptions::default_test_options());
+        let layout = || {
+            TableLayout::<Fp, Ext>::new(
+                air.constraint_program(),
+                air.constraints_meta(),
+                air.bus_interactions(),
+                5,
+                3,
+                Uniforms::default(),
+            )
+            .expect("a layout")
+        };
+        let records = Records(Arc::new(Ops(vec![
+            KeccakRndOp {
+                timestamp: 3,
+                input: [7; 25],
+            };
+            2
+        ])));
+        let weak = Arc::downgrade(&records.0);
+        let bytes = records.bytes();
+        assert!(bytes > 0);
+        let held = || CommittedTable::from_records(layout(), records.clone()).expect("a table");
+        let packed = || {
+            let mut table = CommittedTable::<Fp, Ext>::new(
+                air.constraint_program(),
+                air.constraints_meta(),
+                air.bus_interactions(),
+                5,
+                3,
+                Uniforms::default(),
+                |col| {
+                    (0..8u64)
+                        .map(|r| FieldElement::from(r * 5 + u64::from(col)))
+                        .collect()
+                },
+            )
+            .expect("a table");
+            assert!(table.pack_on_host(), "packs");
+            table
+        };
+
+        // No spill: the records stay where they are.
+        let mut group = vec![held()];
+        assert_eq!(release_group(&mut group, 0, None, 0, false, None), 0);
+        assert!(group[0].records().is_some() && !group[0].is_spilled());
+        drop(group);
+
+        // A spill: the records go, with their last handle, and are counted;
+        // the packed table goes uncounted.
+        let mut group = vec![packed(), held()];
+        drop(records);
+        assert_eq!(release_group(&mut group, 0, None, 0, true, None), bytes);
+        assert!(group.iter().all(|t| t.is_spilled()), "both tables let go");
+        assert!(weak.upgrade().is_none(), "the records' memory is freed");
     }
 
     /// A schedstat line reads as its CPU and run-queue delay nanoseconds; a
