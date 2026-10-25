@@ -681,6 +681,9 @@ pub struct BlockRegen {
     /// Partial drops' keep budget at arming, in main cells committed
     /// ([`Self::keep_cells`]).
     keep_cells: Option<u64>,
+    /// Partial drops' keep budget relative to the arming point: this many main
+    /// cells below those committed at arming ([`Self::keep_below`]).
+    keep_below: Option<u64>,
     started: Instant,
     inner: Arc<std::sync::Mutex<RegenState>>,
     /// Wakes [`Self::await_rank`] at each decision and when the decisions
@@ -713,6 +716,8 @@ struct RegenState {
     armed_kept: (usize, u64),
     /// What the keep budget dropped back at arming (tables, bytes).
     keep_back: (usize, u64),
+    /// The budget arming used, in main cells committed, when it had one.
+    budget: Option<u64>,
     /// Each window's first producer, kept for its regenerator.
     producers: Vec<Option<RegenProducer>>,
     /// Parked droppable tables, for drop-back at arming.
@@ -771,6 +776,10 @@ pub struct DropReport {
     /// at arming (tables, bytes).
     pub keep_cells: Option<u64>,
     pub keep_back: (usize, u64),
+    /// The budget relative to the arming point ([`BlockRegen::keep_below`]),
+    /// and the budget arming used, in main cells committed.
+    pub keep_below: Option<u64>,
+    pub budget: Option<u64>,
 }
 
 /// One class's regeneration for phase B ([`BlockRegen::into_plan`]): its
@@ -858,6 +867,7 @@ impl BlockRegen {
             always,
             partial: false,
             keep_cells: None,
+            keep_below: None,
             started: Instant::now(),
             inner,
             decided,
@@ -915,6 +925,20 @@ impl BlockRegen {
         self
     }
 
+    /// Partial drops' keep budget relative to the arming point: `cells` main
+    /// cells below those committed when it arms ([`Self::arm_at`]), so the
+    /// candidates committed in the last `cells` before arming are dropped
+    /// back, in rank order. Where the arming point moves (the host's reading at
+    /// the forecast's crossing), the budget moves with it. With
+    /// [`Self::keep_cells`] too, the lower of the two holds. Arming without the
+    /// cells committed ([`Self::arm`]) uses only the absolute budget. `None`
+    /// (the default): no relative budget. Nothing for drops that are not
+    /// partial.
+    pub fn keep_below(mut self, cells: Option<u64>) -> Self {
+        self.keep_below = cells;
+        self
+    }
+
     /// Arm: from now on every droppable table is dropped, and every parked one
     /// is dropped back, in rank order; partial drops ([`Self::partial`]) note
     /// when, and drop back only what their keep budget asks
@@ -941,7 +965,15 @@ impl BlockRegen {
                 state.candidates.len(),
                 state.candidates.iter().map(|p| p.len).sum(),
             );
-            if let Some(budget) = self.keep_cells {
+            let below = self
+                .keep_below
+                .zip(cells)
+                .map(|(below, at)| at.saturating_sub(below));
+            state.budget = match (self.keep_cells, below) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            if let Some(budget) = state.budget {
                 let (mut past, within): (Vec<_>, Vec<_>) = std::mem::take(&mut state.candidates)
                     .into_iter()
                     .partition(|p| p.cells > budget);
@@ -1143,6 +1175,8 @@ impl BlockRegen {
             armed_kept: state.armed_kept,
             keep_cells: self.keep_cells.filter(|_| self.partial),
             keep_back: state.keep_back,
+            keep_below: self.keep_below.filter(|_| self.partial),
+            budget: state.budget,
         }
     }
 
@@ -4165,6 +4199,82 @@ mod spill_tests {
             (report.tables, report.keep_back, report.keep_cells),
             (6, (0, 0), None)
         );
+    }
+
+    /// The keep budget relative to the arming point
+    /// ([`super::BlockRegen::keep_below`]): arming at 60 cells with 25 below
+    /// drops back exactly the candidates committed past 35, in rank order, and
+    /// only at arming; with an absolute budget too the lower one holds; a
+    /// margin past the arming point drops back every candidate; arming without
+    /// the cells committed uses only the absolute budget; and none is today's.
+    #[test]
+    fn the_relative_keep_budget_drops_back_what_was_committed_in_its_last_cells() {
+        use super::{BlockRegen, Parked, ParkedState, RankDecision};
+        use std::sync::Arc;
+        let words: Vec<u64> = (0..2 * 1024u64).map(|i| i * 7919 % 50_000).collect();
+        let packed = || NarrowColumns::pack_row_major(&words, 2).expect("packs");
+        let len = packed().data().len() as u64;
+        let parked = |rank: u64, cells: u64| {
+            Arc::new(Parked {
+                len,
+                cells,
+                rank: Some((0, rank)),
+                state: std::sync::Mutex::new(ParkedState::Resident(packed())),
+            })
+        };
+        let committed = [(5, 10), (1, 20), (7, 30), (3, 40), (0, 50), (6, 60)];
+        // Parks them, arms (at 60 cells when `at` is set, else without the
+        // cells), parks one more past every budget; returns the drop thread's
+        // order and the report.
+        let run = |absolute: Option<u64>, below: Option<u64>, at: bool| {
+            let regen = BlockRegen::new(Arc::new(|_| None), &[1 << 30], false)
+                .partial()
+                .keep_cells(absolute)
+                .keep_below(below);
+            let _producer = regen.take_producer(0);
+            for &(r, c) in &committed {
+                regen.parked(parked(r, c));
+            }
+            assert!(if at { regen.arm_at(60) } else { regen.arm() });
+            regen.parked(parked(2, 70));
+            regen.close_drops();
+            let order: Vec<u64> = regen
+                .lock()
+                .dropped
+                .iter()
+                .map(|((_, rank), _, _, back)| {
+                    assert!(*back, "a drop-back");
+                    *rank
+                })
+                .collect();
+            let kept: Vec<u64> = (0..10)
+                .filter(|&r| matches!(regen.await_rank(0, r).0, RankDecision::Kept))
+                .collect();
+            (order, kept, regen.report())
+        };
+        // 25 below 60: past 35 are cells 40, 50, 60 (ranks 3, 0, 6), in rank
+        // order; cells 30 stays, and so does the table parked after arming.
+        let (order, kept, report) = run(None, Some(25), true);
+        assert_eq!(order, vec![0, 3, 6]);
+        assert_eq!(kept, vec![1, 2, 4, 5, 7, 8, 9]);
+        assert_eq!(
+            (report.budget, report.keep_below, report.keep_back),
+            (Some(35), Some(25), (3, 3 * len))
+        );
+        // With an absolute 45 too, the lower (35) holds; with an absolute 25,
+        // that one does (past 25: cells 30 as well).
+        assert_eq!(run(Some(45), Some(25), true).0, vec![0, 3, 6]);
+        assert_eq!(run(Some(25), Some(25), true).0, vec![0, 3, 6, 7]);
+        // A margin at or past the arming point drops back every candidate.
+        assert_eq!(run(None, Some(60), true).0, vec![0, 1, 3, 5, 6, 7]);
+        assert_eq!(run(None, Some(1_000), true).0, vec![0, 1, 3, 5, 6, 7]);
+        // Without the cells committed, only the absolute budget.
+        assert_eq!(run(None, Some(25), false).0, Vec::<u64>::new());
+        assert_eq!(run(Some(45), Some(25), false).0, vec![0, 6]);
+        // None: arming drops back nothing.
+        let (order, _, report) = run(None, None, true);
+        assert!(order.is_empty());
+        assert_eq!((report.budget, report.keep_below), (None, None));
     }
 
     /// The rebuilt groups go last, each set in group order; nothing rebuilt is

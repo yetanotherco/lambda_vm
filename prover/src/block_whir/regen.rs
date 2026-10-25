@@ -2651,12 +2651,19 @@ pub(crate) fn dropped_line(
 /// and what the budget dropped back.
 pub(crate) fn keep_line(report: &stark::multilinear_block::DropReport) -> String {
     let g = |cells: u64| cells as f64 / 1e9;
-    let budget = match report.keep_cells {
-        Some(cells) => format!(
-            "budget {:.2} G cells (LAMBDA_VM_BLOCK_KEEP_CELLS_G)",
+    let absolute = report
+        .keep_cells
+        .map(|cells| format!("{:.2} G cells (LAMBDA_VM_BLOCK_KEEP_CELLS_G)", g(cells)));
+    let below = report.keep_below.map(|cells| {
+        format!(
+            "{:.2} G cells below arming (LAMBDA_VM_BLOCK_KEEP_BACK_G)",
             g(cells)
-        ),
-        None => "budget off".to_string(),
+        )
+    });
+    let budget = match (absolute, below) {
+        (Some(a), Some(b)) => format!("budget {a} or {b}, the lower"),
+        (Some(one), None) | (None, Some(one)) => format!("budget {one}"),
+        (None, None) => "budget off".to_string(),
     };
     let Some(at) = report.armed else {
         return format!("BLOCK REGEN keep: {budget} · never armed");
@@ -2664,9 +2671,12 @@ pub(crate) fn keep_line(report: &stark::multilinear_block::DropReport) -> String
     let cells = report
         .armed_cells
         .map_or_else(|| "-".to_string(), |cells| format!("{:.2}", g(cells)));
+    let used = report.budget.map_or_else(String::new, |cells| {
+        format!(" · the budget used {:.2} G cells", g(cells))
+    });
     format!(
         "BLOCK REGEN keep: {budget} · armed at {at:.1} s with {cells} G cells committed and {} \
-         candidates kept, {:.2} GiB · dropped back by the budget {} chunks {:.2} GiB",
+         candidates kept, {:.2} GiB · dropped back by the budget {} chunks {:.2} GiB{used}",
         report.armed_kept.0,
         report.armed_kept.1 as f64 / GIB,
         report.keep_back.0,
@@ -2868,6 +2878,32 @@ mod tests {
         assert_eq!(
             keep_line(&off),
             "BLOCK REGEN keep: budget off · never armed"
+        );
+        // Relative to the arming point: the margin, and the budget it used.
+        let relative = stark::multilinear_block::DropReport {
+            armed: Some(15.0),
+            armed_cells: Some(21_100_000_000),
+            armed_kept: (488, 40 << 30),
+            keep_below: Some(1_300_000_000),
+            budget: Some(19_800_000_000),
+            keep_back: (31, 5 << 29),
+            ..Default::default()
+        };
+        assert_eq!(
+            keep_line(&relative),
+            "BLOCK REGEN keep: budget 1.30 G cells below arming (LAMBDA_VM_BLOCK_KEEP_BACK_G) · armed \
+             at 15.0 s with 21.10 G cells committed and 488 candidates kept, 40.00 GiB · dropped back by \
+             the budget 31 chunks 2.50 GiB · the budget used 19.80 G cells"
+        );
+        let both = stark::multilinear_block::DropReport {
+            keep_cells: Some(20_900_000_000),
+            keep_below: Some(1_300_000_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            keep_line(&both),
+            "BLOCK REGEN keep: budget 20.90 G cells (LAMBDA_VM_BLOCK_KEEP_CELLS_G) or 1.30 G cells \
+             below arming (LAMBDA_VM_BLOCK_KEEP_BACK_G), the lower · never armed"
         );
     }
 

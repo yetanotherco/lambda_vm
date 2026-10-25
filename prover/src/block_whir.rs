@@ -827,6 +827,32 @@ fn block_keep_cells() -> Result<Option<u64>, Error> {
 
 const KEEP_CELLS_ENV: &str = "LAMBDA_VM_BLOCK_KEEP_CELLS_G";
 
+/// `LAMBDA_VM_BLOCK_KEEP_BACK_G`: partial drops' keep budget relative to the
+/// arming point, in G main cells
+/// ([`multilinear_block::BlockRegen::keep_below`]): once live regeneration
+/// arms, the tables phase B can rebuild that were committed in the last that
+/// many cells before it are dropped back, in rank order. The arming point
+/// moves between runs (the host's reading when the forecast crosses), and the
+/// budget moves with it. Unset, empty or `off`: none. Anything else refuses
+/// the prove. The proof is the same.
+fn block_keep_below() -> Result<Option<u64>, Error> {
+    parse_keep_below(std::env::var(KEEP_BELOW_ENV).ok().as_deref())
+}
+
+const KEEP_BELOW_ENV: &str = "LAMBDA_VM_BLOCK_KEEP_BACK_G";
+
+fn parse_keep_below(value: Option<&str>) -> Result<Option<u64>, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "off") => Ok(None),
+        Some(v) => v
+            .parse::<f64>()
+            .ok()
+            .filter(|g| g.is_finite() && *g > 0.0)
+            .map(|g| Some((g * 1e9) as u64))
+            .ok_or_else(|| Error::Prover(format!("{KEEP_BELOW_ENV}={v}: off, or G cells above 0"))),
+    }
+}
+
 fn parse_keep_cells(value: Option<&str>) -> Result<Option<u64>, Error> {
     match value.map(str::trim) {
         None | Some("" | "off") => Ok(None),
@@ -4624,6 +4650,7 @@ fn prove_streamed(
     // handed out when there was one.
     let drop_mode = block_drop()?;
     let keep_cells = block_keep_cells()?;
+    let keep_below = block_keep_below()?;
     let live_regen = regen_recorder
         .as_ref()
         .filter(|_| regen_mode.live())
@@ -4646,7 +4673,10 @@ fn prove_streamed(
             )
         })
         .map(|regen| match drop_mode {
-            DropMode::Partial => regen.partial().keep_cells(keep_cells),
+            DropMode::Partial => regen
+                .partial()
+                .keep_cells(keep_cells)
+                .keep_below(keep_below),
             DropMode::All => regen,
         });
     if let (Some(regen), Some(pause)) = (&live_regen, deviations.streamed_drop_delay) {
@@ -7735,7 +7765,7 @@ mod drop_tests {
 
     use super::{
         DROP_PURGE_BYTES, DropMode, DropPurges, HostReading, decision_bytes, parse_drop,
-        parse_keep_cells,
+        parse_keep_below, parse_keep_cells,
     };
     use crate::alloc_purge::Purge;
 
@@ -7781,6 +7811,26 @@ mod drop_tests {
         }
         for value in ["0", "-1", "on", "nan", "inf", "20.9G"] {
             assert!(parse_keep_cells(Some(value)).is_err(), "{value}");
+        }
+    }
+
+    /// `LAMBDA_VM_BLOCK_KEEP_BACK_G`: unset, empty or `off` is no budget
+    /// relative to the arming point; a G-cell count above 0 is the margin in
+    /// main cells; any other word refuses.
+    #[test]
+    fn the_relative_keep_budget_is_off_by_default_and_takes_g_cells_above_0() {
+        for value in [None, Some(""), Some(" off ")] {
+            assert_eq!(parse_keep_below(value).ok(), Some(None), "{value:?}");
+        }
+        for (value, cells) in [("1.3", 1_300_000_000u64), (" 2 ", 2_000_000_000)] {
+            assert_eq!(
+                parse_keep_below(Some(value)).ok(),
+                Some(Some(cells)),
+                "{value}"
+            );
+        }
+        for value in ["0", "-1", "on", "nan", "1.3G"] {
+            assert!(parse_keep_below(Some(value)).is_err(), "{value}");
         }
     }
 
