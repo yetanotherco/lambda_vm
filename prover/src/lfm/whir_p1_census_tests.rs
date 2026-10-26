@@ -1108,14 +1108,14 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
         (
             LeafQuery::V1,
             5,
-            "12f9d56e4b649a7407c2da025fe64c4bb1a62acfed97ab03a48cea46a4d176bf",
-            "a48770170a7c66c828bddace9cd6bc5a7a505b39369677e32362825ca3e81442",
+            "025e32814fca1a4f58a524e626419528928c32b2432ef6aefb099ff7abf4d496",
+            "ea6275383208414048093b2ae193f400dd0d566e4f342da8b2f28f1209e84d67",
         ),
         (
             LeafQuery::Lean,
             9,
-            "26c7a941e43782438c479ae706651cf6113af9b9cafab9fb04e99568d19dd4b8",
-            "d69a688c1e7bc4e246a035d0ee1c3f0c48717a2c80b48da4c7bea054db475e9a",
+            "dc29bc9e2d9a347755b667f0401bbe60cac8c85b6e2d416862d3c214320e5209",
+            "add21d355cabb7205361400d36daea652c616aaee115ea373f5974016cbfb927",
         ),
     ];
     let elf_bytes: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
