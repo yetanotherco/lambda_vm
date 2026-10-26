@@ -2221,7 +2221,8 @@ fn a_hang_bound_is_ten_plain_proves_and_at_least_ten_minutes() {
 /// the start (a target of 0, no store: no disk) drops them all too; the proof
 /// is the one regeneration off proves, with the same partition, under the
 /// deterministic grind, and verifies. `auto` that never arms (a budget the
-/// block fits in) drops nothing and runs no regenerator.
+/// block fits in, and a target out of reach) drops nothing and runs no
+/// regenerator.
 #[test]
 fn live_regeneration_proves_the_same_bytes() {
     use crate::block_whir::BlockSpillPolicy;
@@ -2328,12 +2329,18 @@ fn live_regeneration_proves_the_same_bytes() {
             assert_eq!(bytes(&proof), bytes(&plain), "{what}: the proof");
         }
     }
+    // The budget decides each table; the walk's end still hands off (and
+    // arms) once the peak passes the pressure share of the host's target, so
+    // the target is out of reach and no host's memory decides it.
     let (proof, stamps) = regenerated(
         &elf,
         &format,
         RegenMode::Auto,
         BlockSpillPolicy::Budget(1 << 40),
-        Deviations::default(),
+        Deviations {
+            spill_target: Some(u64::MAX),
+            ..Deviations::default()
+        },
     )
     .expect("prove");
     let r = stamps.regen.expect("live regeneration's readout");
@@ -5224,15 +5231,31 @@ fn streamed_records_chunks_drop_as_records_and_come_back() {
     );
     assert!(verify(&parked, &elf, &format));
     // Live regeneration that never arms: every records chunk parks and comes
-    // back as it was.
+    // back as it was. `auto` arms once the host's bytes pass its target, and
+    // the walk's end hands off (and arms) once the peak passes its pressure
+    // share: a host short of room (a CI runner's) arms at once. The target is
+    // out of reach, so no host's memory decides it.
     let (never, stamps) = regenerated(
         &elf,
         &format,
         RegenMode::Auto,
         BlockSpillPolicy::Off,
-        streamed_records(true, true),
+        Deviations {
+            spill_target: Some(u64::MAX),
+            ..streamed_records(true, true)
+        },
     )
     .expect("prove");
+    let unarmed = readout(&stamps);
+    assert!(
+        unarmed.dropped == 0
+            && unarmed
+                .lines
+                .iter()
+                .any(|l| l.starts_with("BLOCK REGEN dropped: Auto") && l.contains(" never armed ")),
+        "{:?}",
+        unarmed.lines
+    );
     assert!(stamps.windows.card_fill.cpu[0] > 0);
     assert_eq!(
         released(&stamps),
