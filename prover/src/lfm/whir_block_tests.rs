@@ -227,6 +227,7 @@ fn the_groups_phase_b_hands_over_build_every_leafs_arena() {
             seen.lock().expect("lock").push(GroupMsg {
                 group: opened.group,
                 roots: opened.roots.to_vec(),
+                commit_ood: opened.commit_ood.to_vec(),
                 tables: opened.tables.to_vec(),
                 argue: opened.argue.cloned(),
                 opening: opened.opening.clone(),
@@ -272,6 +273,7 @@ fn the_groups_phase_b_hands_over_build_every_leafs_arena() {
         for k in 0..plan.partition().num_leaves() {
             let streamed = leaf_arena(
                 &seen[0].roots,
+                &seen[0].commit_ood,
                 plan.partition()
                     .leaf(k)
                     .iter()
@@ -3572,11 +3574,16 @@ fn grind_bits_group_cost_census() {
 // ======================== the Poseidon1 base (S5) =========================
 
 /// ★ The Poseidon1 leaves' front draws the host verifier's challenges:
-/// `P1Transcript` over the statement (call by call), every root, `z, α, β`,
-/// and a group fork's first draw.
+/// `P1Transcript` over the statement (call by call), every root, every
+/// commit-time answer, `z, α, β`, a group fork's first draw, and that group's
+/// commit-time point (`multilinear_block::commit_ood_point`). The host side is
+/// spelled out here, so a misplaced answer on either side is a mismatch: each
+/// of the front's mutations — the answers after the draws, the first group's
+/// answers left out — moves the draws off the host's.
 #[test]
 #[ignore = "executes a block leaf's front over a small block proof; box tier"]
 fn the_p1_block_front_draws_the_hosts_challenges() {
+    use super::whir_block::ood_faults::{self, Fault};
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     use crypto::fiat_shamir::p1_transcript::P1Transcript;
     let format = small_format();
@@ -3584,24 +3591,29 @@ fn the_p1_block_front_draws_the_hosts_challenges() {
     let plan = plan_of(&elf, &proof, &format, Some(1));
     assert_eq!(plan.wrap_hash(), super::edsl::WrapHash::Poseidon1);
     let g = plan.num_groups() - 1;
-    let program = super::whir_block::front_program(&plan, g);
-    assert!(program.hash16(), "the front's hash rows are the socket's");
-    let arena: Vec<LfmWord> = proof
+    let mut arena: Vec<LfmWord> = proof
         .proof
         .roots
         .iter()
         .map(super::algebraic_commit::commitment_to_digest)
         .collect();
-    let words: Vec<LfmWord> = execute(
-        &program,
-        &[arena],
-        &program.hasher(<BlockFamily as ProofFamily>::SOCKET),
-    )
-    .expect("the front executes")
-    .public_words
-    .iter()
-    .map(|(_, w)| *w)
-    .collect();
+    assert_eq!(proof.commit_ood.len(), proof.proof.roots.len());
+    arena.extend(proof.commit_ood.iter().map(super::word::ext_word));
+    let draws = |fault: Fault| -> Vec<FEE> {
+        let program = ood_faults::with(fault, || super::whir_block::front_program(&plan, g));
+        assert!(program.hash16(), "the front's hash rows are the socket's");
+        execute(
+            &program,
+            std::slice::from_ref(&arena),
+            &program.hasher(<BlockFamily as ProofFamily>::SOCKET),
+        )
+        .expect("the front executes")
+        .public_words
+        .iter()
+        .map(|(_, w)| ext_of(w))
+        .collect()
+    };
+    let machine = draws(Fault::None);
     let opts = ProofOptions::default_test_options();
     let frame = block_whir::block_frame(proof.statement(), &elf, &opts, &format).expect("frame");
     let derived: Vec<multilinear::whir_commit::Commitment> = plan
@@ -3622,13 +3634,41 @@ fn the_p1_block_front_draws_the_hosts_challenges() {
         &frame.config,
         &proof.groups,
     );
-    stark::multilinear_table::absorb_roots::<FEE_FIELD, _>(&mut t, &proof.proof.roots, &derived);
+    for root in proof.proof.roots.iter().chain(&derived) {
+        t.append_bytes(root);
+    }
+    for answer in &proof.commit_ood {
+        t.append_field_element(answer);
+    }
     let mut host: Vec<FEE> = (0..3).map(|_| t.sample_field_element()).collect();
     let mut fork = t.clone();
     fork.append_bytes(&(g as u64).to_le_bytes());
     host.push(fork.sample_field_element());
-    let machine: Vec<FEE> = words.iter().map(ext_of).collect();
-    assert_eq!(machine, host, "z, α, β and the fork's first draw");
+    let layout = &frame.stack_layouts[g];
+    let root_at: usize = frame.stack_layouts[..g]
+        .iter()
+        .map(multilinear::stacking::StackedLayout::num_polys)
+        .sum();
+    host.push(
+        stark::multilinear_block::commit_ood_point::<FEE_FIELD, P1Transcript>(
+            g,
+            layout,
+            &proof.proof.roots[root_at..root_at + layout.num_polys()],
+            &frame.config,
+        )
+        .expect("the group's point"),
+    );
+    assert_eq!(
+        machine, host,
+        "z, α, β, the fork's first draw and the group's point"
+    );
+    for fault in [Fault::AnswersAfterDraws, Fault::SkipFirstGroupsAnswers] {
+        assert_ne!(
+            draws(fault)[..3],
+            host[..3],
+            "{fault:?}: the front's draws must move off the host's"
+        );
+    }
 }
 
 /// ★ A Poseidon1 leaf refuses a tampered witness: a group root, a table's
@@ -3675,6 +3715,17 @@ fn a_p1_block_leaf_refuses_a_tampered_witness() {
         "a grind nonce"
     );
 
+    // A commit-time answer, first and last: every leaf absorbs every answer
+    // in its front, and a group's chains carry its own.
+    for at in [0, proof.commit_ood.len() - 1] {
+        let mut answer = proof.clone();
+        answer.commit_ood[at] += FEE::one();
+        assert!(
+            run_leaf(&plan, &answer, 0, LeafChecks::ALL).is_err(),
+            "commit-time answer {at}"
+        );
+    }
+
     let mut prepared = proof.clone();
     prepared.prepared[0].polys[0].final_value += FEE::one();
     assert!(
@@ -3688,6 +3739,30 @@ fn a_p1_block_leaf_refuses_a_tampered_witness() {
     assert!(
         run_leaf(&plan, &prepared, 0, without).is_ok(),
         "with the prepared openings left out the tamper executes"
+    );
+}
+
+/// ★ Mutation: a group's walk that reads
+/// its commit-time answers from a fresh hint rather than the cells the front
+/// absorbed hints words the block's arena does not hold: the leaf's arena is
+/// the proof's, one answer a root, read once, by the front.
+#[test]
+#[ignore = "executes block leaves over small block proofs; box tier"]
+fn a_walk_reads_its_answers_from_the_fronts_cells() {
+    use super::whir_block::ood_faults::{self, Fault};
+    let format = small_format();
+    let (elf, proof) = small_block("test_commit_4", &format);
+    let plan = plan_of(&elf, &proof, &format, Some(1));
+    let honest = leaf_program_with(&plan, 0, LeafChecks::ALL).expect("the leaf");
+    let arenas = block_leaf_arena(&plan, &proof, 0).expect("the arena");
+    assert_eq!(honest.arena_schema.lens, vec![arenas[0].len() as u32]);
+    let fresh = ood_faults::with(Fault::FreshAnswerHint, || {
+        leaf_program_with(&plan, 0, LeafChecks::ALL).expect("the mutated leaf")
+    });
+    assert_ne!(
+        fresh.arena_schema.lens,
+        vec![arenas[0].len() as u32],
+        "a walk reading its answers anew hints words the proof's arena does not hold"
     );
 }
 

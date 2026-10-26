@@ -34,6 +34,19 @@ use super::whir_chain::{
 use super::whir_poly::{
     challenge_powers_rows, emit_challenge_powers, emit_eq_eval, eq_eval_rows_again,
 };
+
+/// A stack's commit-time out-of-domain claims as wires
+/// (`stacked_eval::CommitOod`): the point over the stack, `z0^(2^j)` for
+/// `j < n_stack`, and one answer per stacked polynomial in commitment order.
+///
+/// ⛔ The answers are the CELLS the leaf's front absorbed before `(z, α, β)`,
+/// never a second hint: a chain reading another copy could open a value the
+/// transcript never bound.
+#[derive(Clone, Copy)]
+pub struct OodWires<'a> {
+    pub point: &'a [Ext],
+    pub answers: &'a [Ext],
+}
 use super::whir_transcript::{
     COORDINATES_PER_EXT, SpongeEntry, SpongeSchedule, WhirTranscript, absorb_unpack_rows,
     sample_ext_rows,
@@ -351,7 +364,7 @@ pub fn emit_stacked_verify(
     );
     let chains: Vec<StackedChainWires<'_>> = polys.iter().map(StackedPolyWires::as_chain).collect();
     emit_stacked_verify_chains(
-        b, transcript, layout, &chains, points, values, shape, domain,
+        b, transcript, layout, &chains, points, values, None, shape, domain,
     )
 }
 
@@ -362,6 +375,11 @@ pub fn emit_stacked_verify(
 /// `GroupFold::Indexed` is ONE [`emit_verify_grouped`] whose claim is the run's
 /// columns batched and whose weight is `Σ_p eq(ρ, p)·weight_at_p` read at the
 /// data challenges `at[..k0] ‖ at[k0+m..]` (REV-B2-JUDGE B1-3, B2-5).
+///
+/// With `ood` (`stacked_eval::verify_ood`): after the batching draw one more,
+/// `γ'`; polynomial `i`'s answer rides its chain's claim at `γ'^(i+1)`, and its
+/// weight gains `γ'^(i+1)·eq(point, ·)` — at the data challenges, under
+/// `eq(ρ, p)`, in a run of several.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_stacked_verify_chains(
     b: &mut LfmBuilder,
@@ -370,6 +388,7 @@ pub fn emit_stacked_verify_chains(
     chains: &[StackedChainWires<'_>],
     points: &[&[Ext]],
     values: &[Ext],
+    ood: Option<OodWires<'_>>,
     shape: &ChainShape,
     domain: &Domain<GoldilocksField>,
 ) -> Ext {
@@ -407,6 +426,24 @@ pub fn emit_stacked_verify_chains(
             weight: weights[column],
         })
         .collect();
+    // The commit-time answers' batching, drawn after the claims' as the host
+    // draws it, and each polynomial's scale `γ'^(i+1)`.
+    let ood = ood.map(|ood| {
+        assert_eq!(
+            ood.answers.len(),
+            layout.num_polys(),
+            "one answer per stacked polynomial"
+        );
+        assert_eq!(
+            ood.point.len(),
+            layout.n_stack(),
+            "the point spans the stack"
+        );
+        let gamma = transcript.sample_ext(b);
+        let mut scales = emit_challenge_powers(b, gamma, layout.num_polys() + 1);
+        scales.remove(0);
+        (ood, scales)
+    });
 
     for (chain, run) in chains.iter().zip(runs) {
         #[cfg(test)]
@@ -421,7 +458,21 @@ pub fn emit_stacked_verify_chains(
         );
         let roots: Vec<[super::builder::Felt; 4]> =
             chain.roots.iter().map(|&root| b.unpack(root)).collect();
-        let claimed = emit_claimed(b, layout, run.clone(), values, &weights);
+        let mut claimed = emit_claimed(b, layout, run.clone(), values, &weights);
+        #[cfg(test)]
+        let claim_fault = ood_faults::get() == ood_faults::Fault::ClaimWithoutAnswers;
+        #[cfg(not(test))]
+        let claim_fault = false;
+        if let Some((wires, scales)) = ood.as_ref().filter(|_| !claim_fault) {
+            for i in run.clone() {
+                claimed = b.emul_add(scales[i], wires.answers[i], claimed);
+            }
+        }
+        #[cfg(test)]
+        let weight_fault = ood_faults::get() == ood_faults::Fault::WeightWithoutAnswers;
+        #[cfg(not(test))]
+        let weight_fault = false;
+        let ood = &ood;
         if run.len() == 1 {
             let i = run.start;
             emit_verify_weighted(
@@ -433,7 +484,16 @@ pub fn emit_stacked_verify_chains(
                 claimed,
                 shape,
                 domain,
-                |b, at| emit_weight_at(b, layout, i, &claims, at),
+                |b, at| {
+                    let weight = emit_weight_at(b, layout, i, &claims, at);
+                    match ood.as_ref().filter(|_| !weight_fault) {
+                        Some((wires, scales)) => {
+                            let eq = emit_eq_eval(b, wires.point, at);
+                            b.emul_add(scales[i], eq, weight)
+                        }
+                        None => weight,
+                    }
+                },
             );
             continue;
         }
@@ -457,14 +517,27 @@ pub fn emit_stacked_verify_chains(
                 #[cfg(test)]
                 let eqs: &[Ext] = &faulted;
                 let mut total: Option<Ext> = None;
-                for (eq, poly) in eqs.iter().zip(run) {
+                for (eq, poly) in eqs.iter().zip(run.clone()) {
                     let weight = emit_weight_at(b, layout, poly, &claims, &data);
                     total = Some(match total {
                         None => b.emul(*eq, weight),
                         Some(acc) => b.emul_add(*eq, weight, acc),
                     });
                 }
-                let total = total.expect("a run of two or more");
+                let mut total = total.expect("a run of two or more");
+                // The answers' share: `eq(point, data)·Σ_p eq(ρ, p)·γ'^(i_p+1)`.
+                if let Some((wires, scales)) = ood.as_ref().filter(|_| !weight_fault) {
+                    let eq = emit_eq_eval(b, wires.point, &data);
+                    let mut scale: Option<Ext> = None;
+                    for (index, poly) in eqs.iter().zip(run) {
+                        scale = Some(match scale {
+                            None => b.emul(*index, scales[poly]),
+                            Some(acc) => b.emul_add(*index, scales[poly], acc),
+                        });
+                    }
+                    let scale = scale.expect("a run of two or more");
+                    total = b.emul_add(scale, eq, total);
+                }
                 #[cfg(test)]
                 let total = absent_slot_fault(b, &at[k0..k0 + m], eqs.len(), total);
                 total
@@ -611,6 +684,21 @@ pub fn stacked_verify_cost(
     shape: &ChainShape,
     entry: SpongeEntry,
 ) -> StackedCost {
+    stacked_verify_cost_ood(layout, group_of, shape, entry, false)
+}
+
+/// [`stacked_verify_cost`] with the stack's commit-time answers carried
+/// (`ood`, [`OodWires`]): one more draw and its `P` powers; per chain one
+/// `MulAdd` a polynomial on the claim; on the weight one `eq` over the stack
+/// and one `MulAdd`, and in a run of several `P'` more rows for the scales
+/// under `eq(ρ, p)`. Without, [`stacked_verify_cost`]'s rows.
+pub fn stacked_verify_cost_ood(
+    layout: &StackedLayout,
+    group_of: &[usize],
+    shape: &ChainShape,
+    entry: SpongeEntry,
+    ood: bool,
+) -> StackedCost {
     let columns = layout.placements().len();
     let polys = layout.num_polys();
 
@@ -621,6 +709,11 @@ pub fn stacked_verify_cost(
         schedule.absorb(COORDINATES_PER_EXT);
     }
     schedule.draw_ext();
+    if ood {
+        // `γ'` and its powers `γ'^1 ..= γ'^P` (the `1` interned).
+        ops += sample_ext_rows() + challenge_powers_rows(polys + 1);
+        schedule.draw_ext();
+    }
 
     // One chain per run of the verifier's split (B2-1): its roots' `Unpack`s,
     // its claim over the run's columns, each polynomial's weight (and, for a
@@ -642,6 +735,12 @@ pub fn stacked_verify_cost(
         if run.len() >= 2 {
             ops += run.len();
         }
+        if ood {
+            ops += run.len() + eq_eval_rows_again(layout.n_stack()) + 1;
+            if run.len() >= 2 {
+                ops += run.len();
+            }
+        }
         ops += chain_shape_rows(&chain);
         chain_sponge(&chain, &mut schedule);
         chain_perms += chain_opening_perms(&chain) + chain_grind_perms(&chain);
@@ -652,5 +751,41 @@ pub fn stacked_verify_cost(
         chain_perms,
         schedule,
         chains: runs.len(),
+    }
+}
+
+/// Test only: the leg's mutations of the commit-time answers' batching, one at
+/// a time; with any of them an honest opening must have no execution.
+/// Thread-local, so a test that sets one moves no other test's program.
+#[cfg(test)]
+pub(crate) mod ood_faults {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) enum Fault {
+        #[default]
+        None,
+        /// The chains' claims leave the answers out.
+        ClaimWithoutAnswers,
+        /// The chains' weights leave the answers' `eq` out.
+        WeightWithoutAnswers,
+    }
+
+    std::thread_local! {
+        static FAULT: std::cell::Cell<Fault> = const { std::cell::Cell::new(Fault::None) };
+    }
+
+    pub(crate) fn get() -> Fault {
+        FAULT.with(std::cell::Cell::get)
+    }
+
+    /// Runs `f` under `fault`, restoring the previous one after.
+    pub(crate) fn with<R>(fault: Fault, f: impl FnOnce() -> R) -> R {
+        struct Restore(Fault);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FAULT.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(FAULT.with(|c| c.replace(fault)));
+        f()
     }
 }

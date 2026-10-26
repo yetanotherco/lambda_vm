@@ -106,6 +106,7 @@ fn grouped_leg_stream(p1: bool, heights: &[usize], n_stack: usize) -> (usize, u6
         &chains,
         &claimed_at,
         &values,
+        None,
         &shape,
         &domain,
     );

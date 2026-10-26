@@ -242,6 +242,8 @@ mod whir_bus_tests;
 #[cfg(test)]
 mod whir_chain_tests;
 #[cfg(test)]
+mod whir_commit_ood_leg_tests;
+#[cfg(test)]
 mod whir_epoch_program_tests;
 /// Its tests, which stayed behind when the driver moved out.
 #[cfg(test)]

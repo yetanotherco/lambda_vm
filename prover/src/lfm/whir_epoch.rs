@@ -350,6 +350,22 @@ pub fn emit_roots_block(
     carried: &[Cell],
     derived: &[LfmWord],
 ) -> (Ext, Ext, Ext) {
+    emit_absorb_roots(b, transcript, carried, derived);
+    let z = transcript.sample_ext(b);
+    let alpha = transcript.sample_ext(b);
+    let beta = transcript.sample_ext(b);
+    (z, alpha, beta)
+}
+
+/// `multilinear_table::absorb_roots`, emitted: the carried roots, then the
+/// derived ones — [`emit_roots_block`] without its draws, which the block's
+/// front follows with its commit-time answers.
+pub fn emit_absorb_roots(
+    b: &mut LfmBuilder,
+    transcript: &mut WhirTranscript,
+    carried: &[Cell],
+    derived: &[LfmWord],
+) {
     for root in carried {
         transcript.absorb_digest(b, *root);
     }
@@ -357,10 +373,6 @@ pub fn emit_roots_block(
         let root = b.digest_const(*word);
         transcript.absorb_digest(b, root.as_cell());
     }
-    let z = transcript.sample_ext(b);
-    let alpha = transcript.sample_ext(b);
-    let beta = transcript.sample_ext(b);
-    (z, alpha, beta)
 }
 
 /// What [`emit_roots_block`] costs, by the shape it comes from.
@@ -1261,6 +1273,9 @@ pub struct GroupChainWires<'a> {
     pub chains: &'a [StackedChainWires<'a>],
     pub shape: &'a ChainShape,
     pub domain: &'a Domain<GoldilocksField>,
+    /// The group's commit-time answers, where its proof carries them (the
+    /// block's groups; an epoch's carry none).
+    pub ood: Option<super::whir_stacked::OodWires<'a>>,
 }
 
 /// ★ The commitment-group walk, emitted: `multi_verify`'s second loop
@@ -1302,6 +1317,7 @@ pub fn emit_group_walk(
             chains,
             shape: group.shape,
             domain: group.domain,
+            ood: None,
         })
         .collect();
     emit_group_walk_chains(b, transcript, &groups, sizes, walk)
@@ -1335,6 +1351,7 @@ pub fn emit_group_walk_chains(
             group.chains,
             &points[column_at..column_at + width],
             &walk.values[column_at..column_at + width],
+            group.ood,
             group.shape,
             group.domain,
         ));

@@ -677,6 +677,8 @@ pub(crate) fn prove_split_now() -> Option<(f64, f64, f64, f64)> {
 pub(crate) struct GroupMsg {
     pub(crate) group: usize,
     pub(crate) roots: Vec<multilinear::whir_commit::Commitment>,
+    /// Every carried polynomial's commit-time answer, in root order.
+    pub(crate) commit_ood: Vec<crate::tables::types::FEE>,
     pub(crate) tables:
         Vec<stark::multilinear_table::TableProof<crate::tables::types::GoldilocksExtension>>,
     pub(crate) argue:
@@ -1842,6 +1844,7 @@ pub fn prove_whir_block_tree(
             let _ = tx.send(GroupMsg {
                 group: opened.group,
                 roots: opened.roots.to_vec(),
+                commit_ood: opened.commit_ood.to_vec(),
                 tables: opened.tables.to_vec(),
                 argue: opened.argue.cloned(),
                 opening: opened.opening.clone(),
@@ -1939,6 +1942,7 @@ pub fn prove_whir_block_tree(
                     let mut words: Vec<Option<Vec<LfmWord>>> =
                         (0..plan.num_groups()).map(|_| None).collect();
                     let mut block_roots = Vec::new();
+                    let mut block_answers = Vec::new();
                     let mut done = 0usize;
                     while let Ok(msg) = grx.recv() {
                         done += 1;
@@ -1954,6 +1958,7 @@ pub fn prove_whir_block_tree(
                         )?);
                         if block_roots.is_empty() {
                             block_roots = msg.roots;
+                            block_answers = msg.commit_ood;
                         }
                         if early.is_some() || done >= plan.num_groups() {
                             continue;
@@ -1968,7 +1973,7 @@ pub fn prove_whir_block_tree(
                                 .iter()
                                 .map(|&g| words[g].clone().unwrap_or_default())
                                 .collect();
-                            let arena = leaf_arena(&block_roots, groups);
+                            let arena = leaf_arena(&block_roots, &block_answers, groups);
                             // This executor takes the leaf's program.
                             let slot = programs[k].wait()?;
                             slot.claim();
