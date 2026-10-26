@@ -8493,6 +8493,16 @@ mod p4_rows_knob_tests {
         }
     }
 
+    /// The finish's phase-4 defaults: the per-row lookups counted on the pool
+    /// with one map a chunk (not by parts), LT's and KECCAK's lookups counted
+    /// straight into the histograms, and the card set up at its first use.
+    #[test]
+    fn the_finish_counts_on_one_map_a_chunk_and_its_lookups_directly_by_default() {
+        assert_eq!(parse_p4_rows(None).ok(), Some(P4Rows::Pool));
+        assert_eq!(parse_p4_lookups(None).ok(), Some(true));
+        assert_eq!(parse_card_early(None).ok(), Some(false));
+    }
+
     /// `LAMBDA_VM_BLOCK_CARD_EARLY`: off unless `1`; any other word refuses.
     #[test]
     fn the_card_early_knob_is_off_by_default_and_on_at_1() {
