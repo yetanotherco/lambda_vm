@@ -2165,9 +2165,13 @@ fn regenerated_at(
     o.spill = policy;
     o.regen = Some(mode);
     // KECCAK_RND built on the host unless a test asks otherwise: its tables
-    // are then droppable, and these tests rebuild them with LT's.
+    // are then droppable, and these tests rebuild them with LT's. CPU and
+    // MEMW_R likewise (a card build's default fills them from their records):
+    // these tests drop and rebuild them as packed chunks, and the records
+    // tests ask for theirs.
     let deviations = Deviations {
         card_fill: deviations.card_fill.or(Some(false)),
+        card_fill_streamed: deviations.card_fill_streamed.or(Some([false, false])),
         ..deviations
     };
     prove_block_whir_with(
