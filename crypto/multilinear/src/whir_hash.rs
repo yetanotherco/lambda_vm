@@ -159,10 +159,14 @@ pub trait WhirHash: Copy + Clone + Default + Send + Sync + 'static {
     /// challenge field the block uses): the transcript a block proof's prover
     /// and verifier start from ([`Self::sponge`]). Its configuration is
     /// `Self::Transcript`, so a sponge of another hash cannot be named here.
+    /// Its `Default` is [`Self::sponge`]: a block's group draws its
+    /// commit-time out-of-domain point from a fresh one
+    /// (`stark::multilinear_block::commit_ood_point`).
     type Sponge: IsTranscript<Degree3GoldilocksExtensionField>
         + HasTranscriptHash<Hash = Self::Transcript>
         + Clone
-        + Send;
+        + Send
+        + Default;
 
     /// A fresh sponge: what a block proof's statement is absorbed into.
     fn sponge() -> Self::Sponge;
@@ -335,3 +339,33 @@ const _: () = {
     assert!(same(RpxWhir::NAME, RpxWhir::DEVICE.name()));
     assert!(same(P1Whir::NAME, P1Whir::DEVICE.name()));
 };
+
+#[cfg(test)]
+mod sponge_default_tests {
+    use super::{KeccakWhir, P1Whir, RpxWhir, WhirHash};
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+    use math::field::{
+        element::FieldElement, extensions_goldilocks::Degree3GoldilocksExtensionField as Ext,
+    };
+
+    /// A default sponge is a fresh one: what a block group's commit-time point
+    /// is drawn from, so both must agree draw for draw.
+    fn same<H: WhirHash>() {
+        let mut fresh = H::sponge();
+        let mut default = H::Sponge::default();
+        assert_eq!(fresh.state(), default.state());
+        for t in [&mut fresh, &mut default] {
+            t.append_bytes(b"commit-time point");
+        }
+        let a: FieldElement<Ext> = fresh.sample_field_element();
+        let b: FieldElement<Ext> = default.sample_field_element();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_default_sponge_is_a_fresh_one() {
+        same::<KeccakWhir>();
+        same::<RpxWhir>();
+        same::<P1Whir>();
+    }
+}

@@ -7,6 +7,7 @@
 
 pub mod batch;
 pub mod claim_reduce;
+pub mod commit_ood;
 pub mod constraint_argument;
 pub mod eq;
 pub mod front_loaded;
@@ -38,6 +39,8 @@ pub mod whir;
 mod whir_cap_tests;
 pub mod whir_chain;
 pub mod whir_commit;
+#[cfg(test)]
+mod whir_commit_ood_tests;
 #[cfg(test)]
 mod whir_coset_tests;
 pub mod whir_eval;
@@ -141,6 +144,10 @@ pub enum Error {
     DegenerateEvaluationPoint,
     #[error("the out-of-domain point landed inside the evaluation domain")]
     OodPointInDomain,
+    /// A stack's commit-time out-of-domain answers ([`commit_ood`]) are not one
+    /// per committed polynomial: missing or extra answers.
+    #[error("expected {expected} commit-time out-of-domain answers, got {got}")]
+    CommitOodCount { expected: usize, got: usize },
     #[error("no proof-of-work nonce found for {bits} bits")]
     GrindingFailed { bits: u8 },
     #[error("a proof-of-work nonce does not carry the required {bits} bits")]

@@ -737,12 +737,20 @@ fn weight_at<E: IsField>(
     Ok(total)
 }
 
+/// A stack's commit-time point over the stack and every polynomial's scale,
+/// as a chain's weight reads them ([`ood_scales`]).
+type OodAt<'a, E> = (&'a [FieldElement<E>], &'a [FieldElement<E>]);
+
 /// A grouped chain's weight at its `n + m` challenges in binding order
 /// (`k0` data, `m` index, the rest): `Σ_p eq(ρ, p)·weight_at_p` with each
 /// polynomial's weight read at the `n` data challenges, `at[..k0] ‖
 /// at[k0+m..]` (REV-B2-JUDGE B1-3). The index sits after the column
 /// selectors' first `k0` bits, so a selector longer than `k0` straddles it,
 /// and only the data challenges reach `weight_at`.
+///
+/// With `ood` (the commit-time point over the stack and every polynomial's
+/// scale), each polynomial's weight also carries `scale_p·eq(point, data)`
+/// ([`crate::commit_ood`]).
 #[allow(clippy::too_many_arguments)]
 fn grouped_weight_at<E: IsField>(
     layout: &StackedLayout,
@@ -750,6 +758,7 @@ fn grouped_weight_at<E: IsField>(
     k0: usize,
     points: &Claimed<'_, E>,
     weights: &[FieldElement<E>],
+    ood: Option<OodAt<'_, E>>,
     at: &[FieldElement<E>],
 ) -> Result<FieldElement<E>, Error> {
     let m = index_vars(run.len());
@@ -772,6 +781,10 @@ fn grouped_weight_at<E: IsField>(
     } else {
         rho
     };
+    let ood_eq = match ood {
+        Some((point, _)) => Some(eq_eval(point, &data)?),
+        None => None,
+    };
     let mut total = FieldElement::<E>::zero();
     for (p, poly) in run.clone().enumerate() {
         let eq = eq_index(rho, p);
@@ -781,7 +794,11 @@ fn grouped_weight_at<E: IsField>(
         } else {
             eq
         };
-        total += eq * weight_at(layout, poly, points, weights, &data)?;
+        let mut weight = weight_at(layout, poly, points, weights, &data)?;
+        if let (Some((_, scales)), Some(ood_eq)) = (ood, &ood_eq) {
+            weight += &scales[poly] * ood_eq;
+        }
+        total += eq * weight;
     }
     #[cfg(test)]
     if fault == whir_chain::grouped_faults::Fault::AbsentSlotWeightOne {
@@ -804,6 +821,148 @@ fn claimed<E: IsField>(
             acc + &weights[column] * &values[column]
         }),
     )
+}
+
+/// Where [`ood_claims`] found its column values: how many columns the card
+/// evaluated in place and how many the host did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OodCounts {
+    pub on_card: usize,
+    pub on_host: usize,
+}
+
+/// ★ A stack's commit-time out-of-domain claims as the prover holds them from
+/// its commit to its opening (WHIR's commitment step, [`crate::commit_ood`]):
+/// the point, every column's value at its share of it, and every stacked
+/// polynomial's answer.
+///
+/// The answers are what a transcript absorbs before the challenges the column
+/// claims depend on; the column values are what the opening's device rounds
+/// read the overlay's share from ([`crate::commit_ood::partial`]).
+#[derive(Clone, Debug)]
+pub struct OodClaims<E: IsField> {
+    pub z0: FieldElement<E>,
+    /// Column `c`'s value at the last `h_c` coordinates of
+    /// `ood_point(z0, n_stack)`, in placement order.
+    pub columns: Vec<FieldElement<E>>,
+    /// `F_i(ood_point(z0, n_stack))`, one per stacked polynomial, in
+    /// commitment order.
+    pub answers: Vec<FieldElement<E>>,
+}
+
+/// ★ [`OodClaims`] at `z0` from the columns where they lie: each run of
+/// equal-height columns the store holds side by side evaluated on the card in
+/// place, in one call, and every other column on the host. The answers follow
+/// from the column values ([`crate::commit_ood::answers`]).
+pub fn ood_claims<F, E, C>(
+    layout: &StackedLayout,
+    columns: &[&C],
+    resident: Option<(&crate::gpu::ResidentColumns, ColumnsAt<'_>)>,
+    z0: &FieldElement<E>,
+) -> Result<(OodClaims<E>, OodCounts), Error>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<E>: Send + Sync,
+    C: HostColumn<F>,
+{
+    let placements = layout.placements();
+    if columns.len() != placements.len() {
+        return Err(Error::QueryCountMismatch {
+            expected: placements.len(),
+            got: columns.len(),
+        });
+    }
+    let point = whir_chain::ood_point(z0, layout.n_stack());
+    let at = |c: usize| crate::commit_ood::column_point(layout, c, &point);
+    let mut values: Vec<Option<FieldElement<E>>> = vec![None; placements.len()];
+    let mut counts = OodCounts::default();
+    if let Some((store, map)) = &resident {
+        let mut c = 0usize;
+        while c < placements.len() {
+            let height = placements[c].num_vars;
+            let first = map.store_column(c);
+            let mut end = c + 1;
+            while end < placements.len()
+                && placements[end].num_vars == height
+                && map.store_column(end) == first + (end - c)
+            {
+                end += 1;
+            }
+            if let Some(run) = crate::gpu::evaluate_resident_run(store, first, end - c, at(c)) {
+                counts.on_card += run.len();
+                for (slot, value) in values[c..end].iter_mut().zip(run) {
+                    *slot = Some(value);
+                }
+            }
+            c = end;
+        }
+    }
+    let missing: Vec<usize> = (0..placements.len())
+        .filter(|&c| values[c].is_none())
+        .collect();
+    counts.on_host = missing.len();
+    let one = |&c: &usize| -> Result<(usize, FieldElement<E>), Error> {
+        Ok((c, columns[c].host().evaluate_in(at(c))?))
+    };
+    #[cfg(feature = "parallel")]
+    let host: Vec<(usize, FieldElement<E>)> =
+        missing.par_iter().map(one).collect::<Result<_, _>>()?;
+    #[cfg(not(feature = "parallel"))]
+    let host: Vec<(usize, FieldElement<E>)> = missing.iter().map(one).collect::<Result<_, _>>()?;
+    for (c, value) in host {
+        values[c] = Some(value);
+    }
+    let values: Vec<FieldElement<E>> = values
+        .into_iter()
+        .enumerate()
+        .map(|(c, value)| {
+            value.ok_or(Error::UnknownPolynomial {
+                index: c,
+                len: placements.len(),
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let answers = crate::commit_ood::answers(layout, &point, &values)?;
+    Ok((
+        OodClaims {
+            z0: z0.clone(),
+            columns: values,
+            answers,
+        },
+        counts,
+    ))
+}
+
+/// A stack's commit-time out-of-domain claims as the verifier reads them: the
+/// point, and one answer per stacked polynomial in commitment order — absorbed
+/// by the caller's transcript where they were given, before the challenges,
+/// so NOT absorbed again here.
+#[derive(Clone, Copy, Debug)]
+pub struct CommitOod<'a, E: IsField> {
+    /// The point, as the univariate value [`whir_chain::ood_point`] lifts.
+    pub z0: &'a FieldElement<E>,
+    pub answers: &'a [FieldElement<E>],
+}
+
+/// The commit-time claims' batching: after the column claims' challenge, one
+/// more, `γ`, and polynomial `i`'s answer carried at `γ^(i+1)`. Distinct
+/// powers, so a run's claims cannot cancel one another; none of them `1`, so
+/// no answer merges into the column claims' first term. Returns the point over
+/// the stack and the scales. Drawn on both sides from here.
+fn ood_scales<E, T>(
+    z0: &FieldElement<E>,
+    layout: &StackedLayout,
+    transcript: &mut T,
+) -> (Vec<FieldElement<E>>, Vec<FieldElement<E>>)
+where
+    E: IsField + 'static,
+    T: IsTranscript<E>,
+{
+    let gamma: FieldElement<E> = transcript.sample_field_element();
+    let mut scales = challenge_powers(&gamma, layout.num_polys() + 1);
+    scales.remove(0);
+    (whir_chain::ood_point(z0, layout.n_stack()), scales)
 }
 
 /// Proves that every column takes its claimed value at the shared `point`.
@@ -859,6 +1018,38 @@ where
     H: WhirHash,
     C: HostColumn<F>,
 {
+    prove_mapped_ood::<F, E, T, H, C>(
+        stacked, columns, resident, point, values, None, config, transcript,
+    )
+}
+
+/// [`prove_mapped`] with the stack's commit-time out-of-domain claims
+/// ([`OodClaims`]) batched into its chains: after the column claims'
+/// challenge, `γ` ([`ood_scales`]), and each polynomial's chain proves its
+/// column claims plus `γ^(i+1)·y_i` under its weight plus
+/// `γ^(i+1)·eq(ood_point(z0), ·)` ([`crate::commit_ood`]). The answers were
+/// absorbed where they were given, before the challenges; they are not
+/// absorbed here. `None` is [`prove_mapped`], byte for byte.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_mapped_ood<F, E, T, H, C>(
+    stacked: &StackedCommitment<F, H>,
+    columns: &[&C],
+    resident: Option<(&crate::gpu::ResidentColumns, ColumnsAt<'_>)>,
+    point: &Claimed<'_, E>,
+    values: &[FieldElement<E>],
+    ood: Option<&OodClaims<E>>,
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<StackedProof<F, E>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    H: WhirHash,
+    C: HostColumn<F>,
+{
     if let Some((_, ColumnsAt::Map(map))) = resident
         && map.len() != columns.len()
     {
@@ -874,10 +1065,38 @@ where
             got: values.len(),
         });
     }
+    if let Some(claims) = ood
+        && (claims.answers.len() != layout.num_polys()
+            || claims.columns.len() != layout.placements().len())
+    {
+        return Err(Error::CommitOodCount {
+            expected: layout.num_polys(),
+            got: claims.answers.len(),
+        });
+    }
     for value in values {
         transcript.append_field_element(value);
     }
     let weights = challenge_powers(&transcript.sample_field_element(), values.len());
+    let ood = ood.map(|claims| (claims, ood_scales(&claims.z0, layout, transcript)));
+    // Polynomial `i`'s overlay: its scale, and the table a card's first rounds
+    // read the overlay's share from.
+    let overlay_of = |i: usize| -> Result<Option<crate::commit_ood::Overlay<'_, E>>, Error> {
+        let Some((claims, (ood_at, scales))) = &ood else {
+            return Ok(None);
+        };
+        Ok(Some(crate::commit_ood::Overlay {
+            point: ood_at,
+            scale: scales[i].clone(),
+            partial: crate::commit_ood::partial(
+                layout,
+                i,
+                ood_at,
+                &claims.columns,
+                crate::commit_ood::partial_vars(layout, i),
+            )?,
+        }))
+    };
 
     // ★ THE GROUP'S TURN, TAKEN BACK for as long as its openings run — one at a
     // time, so one turn covers them all — and given back when they end. A
@@ -918,9 +1137,10 @@ where
             let i = run.start;
             // The weight goes down as its shares: a device writes them into its
             // own buffer, and the host materializes the table only if none does.
-            polys.push(whir_chain::prove_shared::<F, E, T, H>(
+            polys.push(whir_chain::prove_shared_ood::<F, E, T, H>(
                 &poly_of(i),
                 &weight_shares(layout, i, point, &weights)?,
+                overlay_of(i)?.as_ref(),
                 layout.n_stack(),
                 &stacked.commitments[i],
                 &stacked.domain,
@@ -934,11 +1154,16 @@ where
             .clone()
             .map(|i| weight_shares(layout, i, point, &weights))
             .collect::<Result<Vec<_>, Error>>()?;
+        let overlays = run
+            .clone()
+            .map(&overlay_of)
+            .collect::<Result<Option<Vec<_>>, Error>>()?;
         let commitments: Vec<&CodewordCommitment<F, H>> =
             run.map(|i| &stacked.commitments[i]).collect();
-        polys.push(whir_chain::prove_grouped_shared::<F, E, T, H>(
+        polys.push(whir_chain::prove_grouped_shared_ood::<F, E, T, H>(
             &sources,
             &shares,
+            overlays.as_deref(),
             layout.n_stack(),
             &commitments,
             &stacked.domain,
@@ -977,6 +1202,38 @@ where
 {
     verify_traced::<F, E, T, H>(
         proof, layout, roots, point, values, domain, config, transcript,
+    )
+    .map_err(Refusal::into_error)
+}
+
+/// [`verify`] with the stack's commit-time out-of-domain claims
+/// ([`CommitOod`]): after the column claims' challenge, `γ`; each chain's
+/// claim gains `γ^(i+1)·y_i` and its weight `γ^(i+1)·eq(ood_point(z0), ·)`,
+/// evaluated in closed form at the chain's final point. A count of answers
+/// other than one per polynomial is refused before anything is absorbed.
+/// `None` is [`verify`], byte for byte.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_ood<F, E, T, H>(
+    proof: &StackedProof<F, E>,
+    layout: &StackedLayout,
+    roots: &[Commitment],
+    point: &Claimed<'_, E>,
+    values: &[FieldElement<E>],
+    ood: Option<CommitOod<'_, E>>,
+    domain: &Domain<F>,
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<(), Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    verify_traced_ood::<F, E, T, H>(
+        proof, layout, roots, point, values, ood, domain, config, transcript,
     )
     .map_err(Refusal::into_error)
 }
@@ -1030,6 +1287,40 @@ where
     T: IsTranscript<E>,
     H: WhirHash,
 {
+    verify_traced_ood::<F, E, T, H>(
+        proof, layout, roots, point, values, None, domain, config, transcript,
+    )
+}
+
+/// [`verify_ood`], its refusal carrying the cause, as [`verify_traced`]'s.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_traced_ood<F, E, T, H>(
+    proof: &StackedProof<F, E>,
+    layout: &StackedLayout,
+    roots: &[Commitment],
+    point: &Claimed<'_, E>,
+    values: &[FieldElement<E>],
+    ood: Option<CommitOod<'_, E>>,
+    domain: &Domain<F>,
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<(), Refusal>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    if let Some(ood) = &ood
+        && ood.answers.len() != layout.num_polys()
+    {
+        return Err(Refusal::Before(Error::CommitOodCount {
+            expected: layout.num_polys(),
+            got: ood.answers.len(),
+        }));
+    }
     if values.len() != layout.placements().len() {
         return Err(Refusal::Before(Error::QueryCountMismatch {
             expected: layout.placements().len(),
@@ -1064,6 +1355,15 @@ where
         transcript.append_field_element(value);
     }
     let weights = challenge_powers(&transcript.sample_field_element(), values.len());
+    let ood = ood.map(|ood| (ood.answers, ood_scales(ood.z0, layout, transcript)));
+    // Polynomial `i`'s answer, at its scale, on its chain's claim.
+    let ood_claim = |i: usize| match &ood {
+        Some((answers, (_, scales))) => &scales[i] * &answers[i],
+        None => FieldElement::<E>::zero(),
+    };
+    let ood_at = ood
+        .as_ref()
+        .map(|(_, (at, scales))| (at.as_slice(), scales.as_slice()));
 
     for (chain, (eval_proof, run)) in proof.polys.iter().zip(chains).enumerate() {
         let refused = |cause: Error| Refusal::Chain {
@@ -1076,8 +1376,14 @@ where
             whir_chain::verify_weighted::<F, E, T, _, H>(
                 eval_proof,
                 &roots[i],
-                |at: &[FieldElement<E>]| weight_at(layout, i, point, &weights, at),
-                claimed(layout, i, values, &weights).map_err(Refusal::Before)?,
+                |at: &[FieldElement<E>]| {
+                    let mut weight = weight_at(layout, i, point, &weights, at)?;
+                    if let Some((ood_point, scales)) = ood_at {
+                        weight += &scales[i] * eq_eval(ood_point, at)?;
+                    }
+                    Ok(weight)
+                },
+                claimed(layout, i, values, &weights).map_err(Refusal::Before)? + ood_claim(i),
                 layout.n_stack(),
                 domain,
                 config,
@@ -1088,10 +1394,11 @@ where
         }
         // The run's claim is its polynomials' claims summed: one γ for the
         // whole group, its powers indexed by the group's columns, so no two
-        // polynomials share an exponent (D-ONECHAIN §3.2, Lemma A).
+        // polynomials share an exponent (D-ONECHAIN §3.2, Lemma A). Their
+        // commit-time answers ride along at their own powers.
         let mut claim = FieldElement::<E>::zero();
         for i in run.clone() {
-            claim += claimed(layout, i, values, &weights).map_err(Refusal::Before)?;
+            claim += claimed(layout, i, values, &weights).map_err(Refusal::Before)? + ood_claim(i);
         }
         let k0 = config
             .schedule(layout.n_stack())
@@ -1102,7 +1409,7 @@ where
             eval_proof,
             &roots[run.clone()],
             |at: &[FieldElement<E>]| {
-                grouped_weight_at(layout, run.clone(), k0, point, &weights, at)
+                grouped_weight_at(layout, run.clone(), k0, point, &weights, ood_at, at)
             },
             claim,
             layout.n_stack(),

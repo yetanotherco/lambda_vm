@@ -58,6 +58,7 @@ use math::{
 
 use crate::{
     Error,
+    commit_ood::Overlay,
     eq::{eq_eval, eq_mle},
     mle::Mle,
     narrow::HostColumn,
@@ -147,8 +148,18 @@ where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E>,
     E: IsField + Send + Sync + 'static,
 {
+    require_out_of_domain_of_size(z0, domain.log_size())
+}
+
+/// [`require_out_of_domain`] against the subgroup of order `2^log_size`: what
+/// a commit-time point is checked against (`crate::commit_ood`), and every
+/// smaller subgroup lies inside it.
+pub fn require_out_of_domain_of_size<E: IsField>(
+    z0: &FieldElement<E>,
+    log_size: usize,
+) -> Result<(), Error> {
     let mut power = z0.clone();
-    for _ in 0..domain.log_size() {
+    for _ in 0..log_size {
         power = power.square();
     }
     if power == FieldElement::<E>::one() {
@@ -238,6 +249,23 @@ fn batch_weight<E: IsField + 'static>(
             .map(|(a, b)| a + gamma * b)
             .collect(),
     )
+}
+
+/// A stacked polynomial's weight built on the host: its shares' table, plus
+/// the commit-time overlay when the opening carries one.
+fn host_weight<E: IsField + 'static>(
+    shares: &[crate::stacked_eval::WeightShare<'_, E>],
+    overlay: Option<&Overlay<'_, E>>,
+    n_stack: usize,
+) -> Result<Mle<E>, Error>
+where
+    FieldElement<E>: Send + Sync,
+{
+    let weight = crate::stacked_eval::weight_table(shares, n_stack)?;
+    match overlay {
+        Some(overlay) => overlay.add_to(&weight),
+        None => Ok(weight),
+    }
 }
 
 /// Proof-of-work bits, in the three places a prover would want to redraw.
@@ -1305,23 +1333,27 @@ where
     /// `on_device` says whether the codeword being opened is on one. When it
     /// is, the host building the tables is a fallback and is counted
     /// ([`crate::gpu::open_host_fallbacks`]); when it is not, it is the path.
+    ///
+    /// `overlay`, a commit-time out-of-domain claim (`crate::commit_ood`), is
+    /// added to the weight: by the host as a table, by a card from its rounds
+    /// ([`crate::commit_ood::PendingOverlay`]).
     fn from_shares(
         f: &Stacked<'_, F>,
         shares: &[crate::stacked_eval::WeightShare<'_, E>],
+        overlay: Option<&Overlay<'_, E>>,
         n_stack: usize,
         on_device: bool,
     ) -> Result<Self, Error> {
-        if let Some(device) = crate::gpu::open_shared(f, shares, n_stack, &Self::program()?) {
+        if let Some(device) =
+            crate::gpu::open_shared(f, shares, overlay, n_stack, &Self::program()?)
+        {
             return Ok(Self::Device(device));
         }
         if on_device {
             crate::gpu::note_open_host_fallback(n_stack);
         }
         // Only here does a stacked polynomial have to exist on the host.
-        Self::new(
-            &f.assemble()?,
-            crate::stacked_eval::weight_table(shares, n_stack)?,
-        )
+        Self::new(&f.assemble()?, host_weight(shares, overlay, n_stack)?)
     }
 
     fn num_vars(&self) -> usize {
@@ -1620,8 +1652,41 @@ where
     T: IsTranscript<E>,
     H: WhirHash,
 {
-    let factors =
-        Factors::<F, E>::from_shares(f, shares, n_stack, commitment.codeword().on_device())?;
+    prove_shared_ood::<F, E, T, H>(
+        f, shares, None, n_stack, commitment, domain, config, transcript,
+    )
+}
+
+/// [`prove_shared`] with a commit-time out-of-domain claim on the weight
+/// (`crate::commit_ood`): the chain proves its claim plus
+/// `overlay.scale·F(overlay.point)` under the weight plus
+/// `overlay.scale·eq(overlay.point, ·)`. `None` is [`prove_shared`].
+#[allow(clippy::too_many_arguments)]
+pub fn prove_shared_ood<F, E, T, H>(
+    f: &Stacked<'_, F>,
+    shares: &[crate::stacked_eval::WeightShare<'_, E>],
+    overlay: Option<&Overlay<'_, E>>,
+    n_stack: usize,
+    commitment: &CodewordCommitment<F, H>,
+    domain: &Domain<F>,
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<ChainProof<F, E>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    let factors = Factors::<F, E>::from_shares(
+        f,
+        shares,
+        overlay,
+        n_stack,
+        commitment.codeword().on_device(),
+    )?;
     prove_with_factors::<F, E, T, H>(
         f.num_vars(),
         factors,
@@ -1668,8 +1733,47 @@ where
     T: IsTranscript<E>,
     H: WhirHash,
 {
+    prove_grouped_shared_ood::<F, E, T, H>(
+        polys,
+        shares,
+        None,
+        n_stack,
+        commitments,
+        domain,
+        config,
+        transcript,
+    )
+}
+
+/// [`prove_grouped_shared`] with a commit-time out-of-domain claim on each
+/// polynomial's weight, `overlays[p]` on slot `p` (`crate::commit_ood`): the
+/// run's claim gains `Σ_p overlays[p].scale·F_p(point)`. `None` is
+/// [`prove_grouped_shared`].
+#[allow(clippy::too_many_arguments)]
+pub fn prove_grouped_shared_ood<F, E, T, H>(
+    polys: &[Stacked<'_, F>],
+    shares: &[Vec<crate::stacked_eval::WeightShare<'_, E>>],
+    overlays: Option<&[Overlay<'_, E>]>,
+    n_stack: usize,
+    commitments: &[&CodewordCommitment<F, H>],
+    domain: &Domain<F>,
+    config: &ChainConfig,
+    transcript: &mut T,
+) -> Result<ChainProof<F, E>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
     let width = commitments.len();
-    if !(2..=MAX_INDEX_POLYS).contains(&width) || polys.len() != width || shares.len() != width {
+    if !(2..=MAX_INDEX_POLYS).contains(&width)
+        || polys.len() != width
+        || shares.len() != width
+        || overlays.is_some_and(|overlays| overlays.len() != width)
+    {
         return Err(Error::GroupedShape(GroupedShape::RunWidth { polys: width }));
     }
     check_index_domain(
@@ -1678,7 +1782,14 @@ where
         config.log_blowup,
         F::TWO_ADICITY as usize,
     )?;
-    let factors = match crate::gpu::open_grouped(polys, shares, n_stack, &opening_program::<E>()?) {
+    let overlay = |p: usize| overlays.map(|overlays| &overlays[p]);
+    let factors = match crate::gpu::open_grouped(
+        polys,
+        shares,
+        overlays,
+        n_stack,
+        &opening_program::<E>()?,
+    ) {
         Some(parts) => Factors::DeviceLockstep {
             parts,
             index_vars: index_vars(width),
@@ -1695,7 +1806,8 @@ where
             let parts = polys
                 .iter()
                 .zip(shares)
-                .map(|(f, shares)| -> Result<(Mle<E>, Mle<E>), Error> {
+                .enumerate()
+                .map(|(p, (f, shares))| -> Result<(Mle<E>, Mle<E>), Error> {
                     let message = Mle::new(
                         f.assemble()?
                             .evals()
@@ -1703,7 +1815,7 @@ where
                             .map(|v| v.clone().to_extension::<E>())
                             .collect(),
                     )?;
-                    Ok((crate::stacked_eval::weight_table(shares, n_stack)?, message))
+                    Ok((host_weight(shares, overlay(p), n_stack)?, message))
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
             Factors::Lockstep {

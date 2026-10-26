@@ -3154,6 +3154,65 @@ where
     None
 }
 
+/// Store columns `first..first + width`, each at `point` (base columns, an
+/// ext3 point), evaluated where they lie: a commit-time out-of-domain claim's
+/// column values (`stacked_eval::ood_claims`). `None` when the store does not
+/// hold them as one run spanning `point`, when the run is too small to be
+/// worth the launches, or when the card refuses: the caller evaluates them on
+/// the host.
+#[cfg(feature = "cuda")]
+pub(crate) fn evaluate_resident_run<E>(
+    store: &ResidentColumns,
+    first: usize,
+    width: usize,
+    point: &[math::field::element::FieldElement<E>],
+) -> Option<Vec<math::field::element::FieldElement<E>>>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use std::any::TypeId;
+
+    if TypeId::of::<E>() != TypeId::of::<Ext3>() || point.is_empty() || width == 0 {
+        return None;
+    }
+    let rows = 1usize << point.len();
+    if !store.0.is_run(first, width)
+        || store.0.span(first).1 != rows
+        || rows.saturating_mul(width) < EVALUATE_THRESHOLD
+    {
+        return None;
+    }
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_MLE_EVAL").is_some()) {
+        return None;
+    }
+    let values = math_cuda::sumcheck::evaluate_many_base(
+        math_cuda::columns::Columns::Device {
+            store: &store.0,
+            first,
+            width,
+        },
+        &raw_point(point)?,
+    )
+    .ok()?;
+    EVALUATE_CALLS.fetch_add(values.len() as u64, Ordering::Relaxed);
+    Some(values.iter().map(|v| ext3_from_raw::<E>(v)).collect())
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn evaluate_resident_run<E>(
+    _store: &ResidentColumns,
+    _first: usize,
+    _width: usize,
+    _point: &[math::field::element::FieldElement<E>],
+) -> Option<Vec<math::field::element::FieldElement<E>>>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    None
+}
+
 /// A multilinear's value at `point`, bound variable by variable on device.
 ///
 /// `evals` may be base-field or ext3; the point is always ext3, which is what
@@ -5521,6 +5580,124 @@ where
 pub struct OpeningFactors {
     state: OpeningState,
     lowered: Lowered,
+    /// A commit-time out-of-domain claim not yet in the weight
+    /// ([`crate::commit_ood::PendingOverlay`]): its share of each round is
+    /// added on the host until its table is spent or the first group of
+    /// rounds ends, and then what is left goes into the weight where it lies
+    /// ([`OpeningFactors::settle_overlay`]).
+    overlay: Option<crate::commit_ood::PendingOverlay<OverlayField>>,
+}
+
+/// The field a pending overlay is held in on the card's side: the cubic
+/// extension, which is the only one an opening runs on a card.
+#[cfg(feature = "cuda")]
+type OverlayField = math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+
+/// `value` read as an element of [`OverlayField`]; `E` must be that field.
+#[cfg(feature = "cuda")]
+fn to_overlay_field<E>(
+    value: &math::field::element::FieldElement<E>,
+) -> Option<math::field::element::FieldElement<OverlayField>>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    Some(ext3_from_raw::<OverlayField>(&ext3_raw(value)?))
+}
+
+/// An [`crate::commit_ood::Overlay`] in [`OverlayField`], pending: `None`
+/// when `E` is not that field.
+#[cfg(feature = "cuda")]
+fn pending_overlay<E>(
+    overlay: &crate::commit_ood::Overlay<'_, E>,
+) -> Option<crate::commit_ood::PendingOverlay<OverlayField>>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    let point: Vec<_> = overlay
+        .point
+        .iter()
+        .map(to_overlay_field)
+        .collect::<Option<_>>()?;
+    let partial: Vec<_> = overlay
+        .partial
+        .iter()
+        .map(to_overlay_field)
+        .collect::<Option<_>>()?;
+    Some(crate::commit_ood::PendingOverlay::new(
+        &crate::commit_ood::Overlay {
+            point: &point,
+            scale: to_overlay_field(&overlay.scale)?,
+            partial,
+        },
+    ))
+}
+
+/// The nodes `1..=degree` in [`OverlayField`], which a pending overlay's
+/// round is evaluated at.
+#[cfg(feature = "cuda")]
+fn overlay_nodes(degree: usize) -> Vec<math::field::element::FieldElement<OverlayField>> {
+    (1..=degree)
+        .map(|node| math::field::element::FieldElement::<OverlayField>::from(node as u64))
+        .collect()
+}
+
+/// `evaluations += overlay's round at the nodes`, canonical as a card's are
+/// ([`canonical_limb`]). No overlay adds nothing.
+#[cfg(feature = "cuda")]
+fn add_overlay_round<E>(
+    overlay: Option<&crate::commit_ood::PendingOverlay<OverlayField>>,
+    evaluations: &mut [math::field::element::FieldElement<E>],
+) -> Result<(), crate::Error>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    let Some(overlay) = overlay else {
+        return Ok(());
+    };
+    let failed = |stage| crate::Error::DeviceFailed { stage };
+    let extra = overlay.round(&overlay_nodes(evaluations.len()))?;
+    for (value, extra) in evaluations.iter_mut().zip(extra) {
+        let sum = to_overlay_field(value).ok_or_else(|| failed("overlay round"))? + extra;
+        *value = ext3_from_raw::<E>(&ext3_raw(&sum).ok_or_else(|| failed("overlay round"))?);
+    }
+    Ok(())
+}
+
+/// Binds a pending overlay's next variable at the round's challenge `r`.
+#[cfg(feature = "cuda")]
+fn bind_overlay<E>(
+    overlay: Option<&mut crate::commit_ood::PendingOverlay<OverlayField>>,
+    r: &math::field::element::FieldElement<E>,
+) -> Result<(), crate::Error>
+where
+    E: math::field::traits::IsField + 'static,
+{
+    match overlay {
+        Some(overlay) => overlay.bind(&to_overlay_field(r).ok_or(crate::Error::DeviceFailed {
+            stage: "overlay challenge",
+        })?),
+        None => Ok(()),
+    }
+}
+
+/// Writes what is left of `overlay` into `session`'s weight, which must be
+/// bound at the overlay's challenges (`session.num_vars()` its point's
+/// remaining variables).
+#[cfg(feature = "cuda")]
+fn write_overlay(
+    session: &math_cuda::whir_open::OpeningSession,
+    overlay: &crate::commit_ood::PendingOverlay<OverlayField>,
+) -> Result<(), crate::Error> {
+    let failed = |stage| crate::Error::DeviceFailed { stage };
+    let (point, scale) = overlay.residual();
+    if point.len() != session.num_vars() {
+        return Err(failed("overlay width"));
+    }
+    let raw = raw_point(point).ok_or_else(|| failed("overlay point"))?;
+    let scale = ext3_raw(&scale).ok_or_else(|| failed("overlay scale"))?;
+    session
+        .add_scaled_eq(&raw, &scale)
+        .map_err(|_| failed("overlay weight"))
 }
 
 /// Where the factors are: still in share form for the first rounds, or
@@ -5826,6 +6003,7 @@ where
     Some(OpeningFactors {
         state: OpeningState::Session(session),
         lowered,
+        overlay: None,
     })
 }
 
@@ -5852,9 +6030,24 @@ impl OpeningFactors {
         }
     }
 
-    /// Writes the lean factors out, if they are still in share form.
+    /// Writes the lean factors out, if they are still in share form, with a
+    /// pending overlay in the weight: what every reader of the tables after
+    /// the rounds takes.
     fn materialize(&mut self) -> Result<&mut math_cuda::whir_open::OpeningSession, crate::Error> {
+        self.settle_overlay()?;
         materialize_state(&mut self.state)
+    }
+
+    /// ★ A pending overlay written into the weight: the factors materialised
+    /// at the variables bound so far — which are the overlay's, since every
+    /// round binds both — and what is left of it added there
+    /// ([`crate::commit_ood::PendingOverlay::residual`]). Nothing pending is a
+    /// no-op.
+    fn settle_overlay(&mut self) -> Result<(), crate::Error> {
+        if let Some(overlay) = self.overlay.take() {
+            write_overlay(materialize_state(&mut self.state)?, &overlay)?;
+        }
+        Ok(())
     }
 
     /// One group of rounds, with the host drawing each challenge.
@@ -5881,32 +6074,73 @@ impl OpeningFactors {
         let failed = |stage| crate::Error::DeviceFailed { stage };
         let mut proofs = Vec::with_capacity(group);
         let mut challenges = Vec::with_capacity(group);
+        let mut t = Vec::with_capacity(degree * 3);
+        for node in 1..=degree {
+            t.extend_from_slice(
+                &ext3_raw(&FieldElement::<E>::from(node as u64))
+                    .ok_or_else(|| failed("interpolation node"))?,
+            );
+        }
         if let OpeningState::Lean { lean, rounds } = &mut self.state {
             // The opening's rule is `w·f`, so its rounds are degree two: the
             // lean kernel evaluates that product and nothing else.
             if degree != 2 {
                 return Err(failed("lean opening degree"));
             }
-            let mut t = Vec::with_capacity(degree * 3);
-            for node in 1..=degree {
-                t.extend_from_slice(
-                    &ext3_raw(&FieldElement::<E>::from(node as u64))
-                        .ok_or_else(|| failed("interpolation node"))?,
-                );
-            }
             while proofs.len() < group && lean.bound() < *rounds && lean.num_vars() > 0 {
                 let sums = lean.round(&t).map_err(|_| failed("lean round"))?;
-                let evaluations: Vec<FieldElement<E>> =
+                let mut evaluations: Vec<FieldElement<E>> =
                     sums.chunks_exact(3).map(ext3_from_raw::<E>).collect();
+                add_overlay_round(self.overlay.as_ref(), &mut evaluations)?;
                 let r = challenge(&evaluations);
                 let raw = ext3_raw(&r).ok_or_else(|| failed("challenge"))?;
                 lean.bind(&raw);
+                bind_overlay(self.overlay.as_mut(), &r)?;
                 proofs.push(crate::sumcheck::RoundProof { evaluations });
                 challenges.push(r);
                 SUMCHECK_ROUNDS.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let left = group - proofs.len();
+        let mut left = group - proofs.len();
+        // The materialised rounds a pending overlay still has a share of: one
+        // at a time, its share added before each challenge is drawn.
+        let shared = self
+            .overlay
+            .as_ref()
+            .map_or(0, crate::commit_ood::PendingOverlay::rounds_left)
+            .min(left);
+        if shared > 0 {
+            let session = materialize_state(&mut self.state)?;
+            let lowered = &self.lowered;
+            let mut rounds = session
+                .sumcheck(
+                    &lowered.nodes,
+                    &lowered.consts,
+                    lowered.num_slots,
+                    lowered.root_slot,
+                )
+                .map_err(|_| failed("opening session"))?;
+            for _ in 0..shared {
+                let sums = rounds.round(&t).map_err(|_| failed("round"))?;
+                let mut evaluations: Vec<FieldElement<E>> =
+                    sums.chunks_exact(3).map(ext3_from_raw::<E>).collect();
+                add_overlay_round(self.overlay.as_ref(), &mut evaluations)?;
+                let r = challenge(&evaluations);
+                let raw = ext3_raw(&r).ok_or_else(|| failed("challenge"))?;
+                rounds.fold(&raw).map_err(|_| failed("fold"))?;
+                bind_overlay(self.overlay.as_mut(), &r)?;
+                proofs.push(crate::sumcheck::RoundProof { evaluations });
+                challenges.push(r);
+                SUMCHECK_ROUNDS.fetch_add(1, Ordering::Relaxed);
+            }
+            drop(rounds);
+            session.bound(shared);
+            left -= shared;
+        }
+        // The overlay's table is spent or the group is over: what is left of
+        // it goes into the weight before any other round reads it, and before
+        // the caller reads the tables.
+        self.settle_overlay()?;
         let session = materialize_state(&mut self.state)?;
         let lowered = &self.lowered;
         if left > 0 {
@@ -6137,10 +6371,14 @@ pub struct GroupedFactors(std::convert::Infallible);
 /// the card declines any one of them — before any challenge is drawn, so the
 /// caller builds the run's factors on the host instead (counted by
 /// [`note_grouped_host_fallback`] when the codewords are on the card).
+///
+/// `overlays[p]`, when given, is slot `p`'s commit-time overlay
+/// ([`open_shared`]).
 #[cfg(feature = "cuda")]
 pub(crate) fn open_grouped<F, E>(
     messages: &[crate::whir_chain::Stacked<'_, F>],
     shares: &[Vec<crate::stacked_eval::WeightShare<'_, E>>],
+    overlays: Option<&[crate::commit_ood::Overlay<'_, E>]>,
     n_stack: usize,
     program: &crate::program::Program<E>,
 ) -> Option<GroupedFactors>
@@ -6148,13 +6386,25 @@ where
     F: math::field::traits::IsField + 'static,
     E: math::field::traits::IsField + 'static,
 {
-    if messages.len() < 2 || messages.len() != shares.len() {
+    if messages.len() < 2
+        || messages.len() != shares.len()
+        || overlays.is_some_and(|overlays| overlays.len() != messages.len())
+    {
         return None;
     }
     let parts = messages
         .iter()
         .zip(shares)
-        .map(|(message, shares)| open_shared(message, shares, n_stack, program))
+        .enumerate()
+        .map(|(p, (message, shares))| {
+            open_shared(
+                message,
+                shares,
+                overlays.map(|overlays| &overlays[p]),
+                n_stack,
+                program,
+            )
+        })
         .collect::<Option<Vec<_>>>()?;
     Some(GroupedFactors { parts })
 }
@@ -6163,6 +6413,7 @@ where
 pub(crate) fn open_grouped<F, E>(
     _messages: &[crate::whir_chain::Stacked<'_, F>],
     _shares: &[Vec<crate::stacked_eval::WeightShare<'_, E>>],
+    _overlays: Option<&[crate::commit_ood::Overlay<'_, E>]>,
     _n_stack: usize,
     _program: &crate::program::Program<E>,
 ) -> Option<GroupedFactors>
@@ -6222,7 +6473,21 @@ impl GroupedFactors {
         let mut challenges = Vec::with_capacity(data_rounds + index_vars);
         for _ in 0..data_rounds {
             let mut sums = vec![FieldElement::<E>::zero(); degree];
-            for (part, session) in parts.iter_mut().zip(sessions.iter_mut()) {
+            for ((part, session), folds) in parts
+                .iter_mut()
+                .zip(sessions.iter_mut())
+                .zip(folded.iter_mut())
+            {
+                // A part's commit-time overlay whose table is spent goes into
+                // its weight before its next round: its session is let go,
+                // its tables told how far the rounds got, and a fresh session
+                // takes them from there.
+                if let Some(overlay) = part.overlay.take_if(|o| o.rounds_left() == 0) {
+                    *session = None;
+                    let tables = materialize_state(&mut part.state)?;
+                    tables.bound(core::mem::take(folds));
+                    write_overlay(tables, &overlay)?;
+                }
                 let lean = match &mut part.state {
                     OpeningState::Lean { lean, rounds }
                         if lean.bound() < *rounds && lean.num_vars() > 0 =>
@@ -6254,8 +6519,11 @@ impl GroupedFactors {
                             .map_err(|_| failed("grouped round"))?
                     }
                 };
-                for (sum, limbs) in sums.iter_mut().zip(raw.chunks_exact(3)) {
-                    *sum += ext3_from_raw::<E>(limbs);
+                let mut part_sums: Vec<FieldElement<E>> =
+                    raw.chunks_exact(3).map(ext3_from_raw::<E>).collect();
+                add_overlay_round(part.overlay.as_ref(), &mut part_sums)?;
+                for (sum, value) in sums.iter_mut().zip(part_sums) {
+                    *sum += value;
                 }
             }
             let r = challenge(&sums);
@@ -6273,6 +6541,7 @@ impl GroupedFactors {
                     (None, OpeningState::Lean { lean, .. }) => lean.bind(&raw),
                     (None, _) => return Err(failed("grouped factors")),
                 }
+                bind_overlay(part.overlay.as_mut(), &r)?;
             }
             proofs.push(crate::sumcheck::RoundProof { evaluations: sums });
             challenges.push(r);
@@ -6284,7 +6553,13 @@ impl GroupedFactors {
         let mut tables = Vec::with_capacity(parts.len());
         for (part, folds) in parts.into_iter().zip(folded) {
             let mut state = part.state;
-            materialize_state(&mut state)?.bound(folds);
+            let session = materialize_state(&mut state)?;
+            session.bound(folds);
+            // What is left of a part's overlay, into its weight before the
+            // slots are gathered: the index rounds read the weights whole.
+            if let Some(overlay) = &part.overlay {
+                write_overlay(session, overlay)?;
+            }
             match state {
                 OpeningState::Session(session) => tables.push(session),
                 _ => return Err(failed("grouped factors")),
@@ -6295,6 +6570,7 @@ impl GroupedFactors {
         let mut combined = OpeningFactors {
             state: OpeningState::Session(gathered),
             lowered,
+            overlay: None,
         };
         let (more, rho, _) = combined.rounds(index_vars, degree, &mut challenge)?;
         proofs.extend(more);
@@ -6356,10 +6632,20 @@ where
 /// The same with the weight written on device from its shares: a stacked
 /// polynomial's weight is as wide as the polynomial, and sending it would cost
 /// more than the rounds that read it.
+///
+/// `overlay`, a commit-time out-of-domain claim
+/// ([`crate::commit_ood::Overlay`]), is never written at the stack's width:
+/// its share of each of the first rounds is added on the host, from its
+/// partial table, and what is left goes into the weight once the table is
+/// spent or the first group of rounds ends, at `2^(n − bound)`
+/// ([`OpeningFactors::settle_overlay`]). The lean rounds stop where its table
+/// does. A table of no variables (a column filling the stack) is written at
+/// once, here, before any challenge is drawn.
 #[cfg(feature = "cuda")]
 pub(crate) fn open_shared<F, E>(
     message: &crate::whir_chain::Stacked<'_, F>,
     shares: &[crate::stacked_eval::WeightShare<'_, E>],
+    overlay: Option<&crate::commit_ood::Overlay<'_, E>>,
     n_stack: usize,
     program: &crate::program::Program<E>,
 ) -> Option<OpeningFactors>
@@ -6419,11 +6705,20 @@ where
             .map(|(column, offset)| (raw(column.host()), *offset))
             .collect(),
     };
+    let overlay = match overlay {
+        Some(overlay) if overlay.point.len() == n_stack && !overlay.partial.is_empty() => {
+            Some(pending_overlay(overlay)?)
+        }
+        Some(_) => return None,
+        None => None,
+    };
     // ★ The first rounds over the shares, when the device takes them: the
     // factors are then written at `2^(n − rounds)` instead of `2^n`. The same
     // values either way; a stack the lean path cannot read materialises as
     // before, before any challenge is drawn.
-    let rounds = lean_rounds().min(n_stack);
+    let rounds = lean_rounds()
+        .min(n_stack)
+        .min(overlay.as_ref().map_or(usize::MAX, |o| o.rounds_left()));
     if rounds > 0
         && let Some(lean) = lean_opening(&shares, n_stack, message, &host_parts, rounds)
     {
@@ -6435,6 +6730,7 @@ where
                 rounds,
             },
             lowered,
+            overlay,
         });
     }
     let session = match &message.resident {
@@ -6446,10 +6742,17 @@ where
         }
     }
     .ok()?;
+    // An overlay with no rounds to take a share of goes in now, while a
+    // refusal can still send the opening to the host.
+    if let Some(overlay) = overlay.as_ref().filter(|o| o.rounds_left() == 0) {
+        write_overlay(&session, overlay).ok()?;
+    }
+    let overlay = overlay.filter(|o| o.rounds_left() > 0);
     OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
     Some(OpeningFactors {
         state: OpeningState::Session(session),
         lowered,
+        overlay,
     })
 }
 
@@ -6593,6 +6896,7 @@ where
 pub(crate) fn open_shared<F, E>(
     _message: &crate::whir_chain::Stacked<'_, F>,
     _shares: &[crate::stacked_eval::WeightShare<'_, E>],
+    _overlay: Option<&crate::commit_ood::Overlay<'_, E>>,
     _n_stack: usize,
     _program: &crate::program::Program<E>,
 ) -> Option<OpeningFactors>
