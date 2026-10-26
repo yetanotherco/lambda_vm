@@ -1290,6 +1290,25 @@ fn set_up_card() {
     }
 }
 
+/// `LAMBDA_VM_BLOCK_P4_LOOKUPS`: `direct` has the finish's phase 4 count
+/// LT's per-op lookups and KECCAK's straight into its histograms; unset,
+/// empty or `lists` (the default) builds each slice's list of them first, as
+/// before. Anything else refuses the prove. The multiplicities and the tables
+/// are the same.
+fn block_p4_direct() -> Result<bool, Error> {
+    parse_p4_lookups(std::env::var("LAMBDA_VM_BLOCK_P4_LOOKUPS").ok().as_deref())
+}
+
+fn parse_p4_lookups(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "lists") => Ok(false),
+        Some("direct") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_BLOCK_P4_LOOKUPS={v}: direct (counted straight into the histograms) or lists"
+        ))),
+    }
+}
+
 /// How the finish counts the per-row lookups ([`block_p4_rows`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum P4Rows {
@@ -5301,6 +5320,7 @@ fn prove_streamed(
     crate::with_block_hash!(format.zf.base, |H| {
         let walkers = block_walkers()?;
         let p4_rows = block_p4_rows()?;
+        let p4_direct = block_p4_direct()?;
         let card_fill = match (
             deviations.card_fill,
             deviations.card_fill_streamed,
@@ -5446,6 +5466,9 @@ fn prove_streamed(
                     P4Rows::Off => {}
                     P4Rows::Pool => builder = builder.p4_rows_on_pool(),
                     P4Rows::Parts => builder = builder.p4_rows_by_parts(),
+                }
+                if p4_direct {
+                    builder = builder.p4_lookups_direct();
                 }
                 if rest_slide() {
                     builder = builder.slide_rest();
@@ -8428,7 +8451,7 @@ mod air_input_tests {
 
 #[cfg(test)]
 mod p4_rows_knob_tests {
-    use super::{P4Rows, parse_card_early, parse_p4_rows};
+    use super::{P4Rows, parse_card_early, parse_p4_lookups, parse_p4_rows};
 
     /// `LAMBDA_VM_BLOCK_P4_ROWS`: unset, empty or `pool` counts the per-row
     /// lookups on the pool (the default); `off` does not; any other word
@@ -8448,6 +8471,25 @@ mod p4_rows_knob_tests {
         }
         for value in ["1", "on", "POOL", "pools", "rows", "part", "PARTS"] {
             assert!(parse_p4_rows(Some(value)).is_err(), "{value}");
+        }
+    }
+
+    /// `LAMBDA_VM_BLOCK_P4_LOOKUPS`: unset, empty or `lists` builds each
+    /// slice's lists (the default); `direct` counts straight into the
+    /// histograms; anything else refuses.
+    #[test]
+    fn the_p4_lookups_knob_defaults_to_lists_and_takes_direct() {
+        for (value, direct) in [
+            (None, false),
+            (Some(""), false),
+            (Some(" lists "), false),
+            (Some("direct"), true),
+            (Some(" direct\n"), true),
+        ] {
+            assert_eq!(parse_p4_lookups(value).ok(), Some(direct), "{value:?}");
+        }
+        for value in ["1", "on", "DIRECT", "list", "vec"] {
+            assert!(parse_p4_lookups(Some(value)).is_err(), "{value}");
         }
     }
 

@@ -798,6 +798,13 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// `finish` counts LT's per-op lookups and KECCAK's straight into its
+    /// histograms ([`StreamSkip::p4_direct`]). The tables are the same.
+    pub fn p4_lookups_direct(mut self) -> Self {
+        self.emitted.p4_direct = true;
+        self
+    }
+
     /// Drop each streamed chunk's ops once the chunk is handed out, instead of
     /// keeping every walked window to the run's end (see the module docs): the
     /// builder then holds less than a chunk of each streamed table's ops, plus

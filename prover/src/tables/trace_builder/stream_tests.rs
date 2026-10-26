@@ -716,6 +716,17 @@ fn the_row_lookups_counted_on_the_pool_build_the_same_tables() {
                 got == want,
                 "{what}: the monolithic finish, rows on the pool by parts"
             );
+            let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                b.drop_streamed_ops()
+                    .expect("before any window")
+                    .p4_rows_by_parts()
+                    .p4_lookups_direct()
+            });
+            let got = words(&builder.finish(last).expect("the monolithic finish"));
+            assert!(
+                got == want,
+                "{what}: the monolithic finish, LT's and KECCAK's lookups counted directly"
+            );
             for slide in [false, true] {
                 for budget in [1usize, usize::MAX] {
                     let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {

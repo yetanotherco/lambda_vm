@@ -84,6 +84,373 @@ mod compact_branch;
 mod compact_bytewise;
 mod compact_eq;
 #[cfg(test)]
+mod direct_count_tests {
+    //! The direct counts of LT's and KECCAK's lookups against the lists the
+    //! finish built before them, kept here word for word as the reference.
+    use super::*;
+
+    fn reference_lt_ops(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
+        let mut bitwise_ops = Vec::with_capacity(lt_ops.len() * 8);
+
+        for op in lt_ops {
+            // MSB16 lookups for lhs[2] and rhs[2]
+            let lhs_2 = ((op.lhs >> 48) & 0xFFFF) as u16;
+            let rhs_2 = ((op.rhs >> 48) & 0xFFFF) as u16;
+
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::Msb16,
+                (lhs_2 & 0xFF) as u8,
+                (lhs_2 >> 8) as u8,
+            ));
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::Msb16,
+                (rhs_2 & 0xFF) as u8,
+                (rhs_2 >> 8) as u8,
+            ));
+
+            // IS_HALFWORD lookups for lhs_sub_rhs[0..4]
+            let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
+            for shift in [0, 16, 32, 48] {
+                let half = ((lhs_sub_rhs >> shift) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (half & 0xFF) as u8,
+                    (half >> 8) as u8,
+                ));
+            }
+
+            // IS_HALFWORD lookups for lhs[1] and rhs[1]
+            let lhs_1 = ((op.lhs >> 32) & 0xFFFF) as u16;
+            let rhs_1 = ((op.rhs >> 32) & 0xFFFF) as u16;
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (lhs_1 & 0xFF) as u8,
+                (lhs_1 >> 8) as u8,
+            ));
+            bitwise_ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (rhs_1 & 0xFF) as u8,
+                (rhs_1 >> 8) as u8,
+            ));
+        }
+
+        bitwise_ops
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn reference_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOperation> {
+        use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
+
+        let mut ops = Vec::new();
+
+        for kop in keccak_ops {
+            let state_addr = kop.state_addr;
+
+            ops.push(BitwiseOperation::byte_op(
+                BitwiseOperationType::ByteAluAnd,
+                (state_addr & 0xFF) as u8,
+                7,
+            ));
+
+            // Range-check addr bytes (paired with the ARE_BYTES sends in
+            // keccak::bus_interactions): without this the field-element value of
+            // the addr_lo / addr_hi linear combinations is unconstrained per byte.
+            // 4 paired ops matching the (addr[2i], addr[2i+1]) sender pairing.
+            for i in 0..4 {
+                let lo = ((state_addr >> (2 * i * 8)) & 0xFF) as u8;
+                let hi = ((state_addr >> ((2 * i + 1) * 8)) & 0xFF) as u8;
+                ops.push(BitwiseOperation::byte_op(
+                    BitwiseOperationType::AreBytes,
+                    lo,
+                    hi,
+                ));
+            }
+
+            // IS_HALF for state_ptr half_lo (25 per call). The top 48 bits go to
+            // IS_WH through `IS_WHH`; that table counts its own checks.
+            for lane_idx in 0..25 {
+                let ptr = state_addr
+                    .checked_add(lane_idx as u64 * 8)
+                    .expect("keccak state address range must be validated by the executor");
+                let half = (ptr & 0xFFFF) as u16;
+                ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (half & 0xFF) as u8,
+                    ((half >> 8) & 0xFF) as u8,
+                ));
+            }
+
+            // Replay keccak round computation to extract bitwise lookups
+            let mut state = kop.input;
+            for round in 0..24 {
+                // --- theta: Cxz chain BYTE_ALU[XOR] (160) ---
+                let mut cxz = [[[0u8; 8]; 4]; 5];
+                for x in 0..5 {
+                    for b in 0..8 {
+                        let v0 = ((state[x] >> (b * 8)) & 0xFF) as u8;
+                        let v1 = ((state[x + 5] >> (b * 8)) & 0xFF) as u8;
+                        cxz[x][0][b] = v0 ^ v1;
+                        ops.push(BitwiseOperation::byte_op(
+                            BitwiseOperationType::ByteAluXor,
+                            v0,
+                            v1,
+                        ));
+                    }
+                    for stage in 1..4usize {
+                        let y = stage + 1;
+                        for b in 0..8 {
+                            let prev = cxz[x][stage - 1][b];
+                            let sv = ((state[x + 5 * y] >> (b * 8)) & 0xFF) as u8;
+                            cxz[x][stage][b] = prev ^ sv;
+                            ops.push(BitwiseOperation::byte_op(
+                                BitwiseOperationType::ByteAluXor,
+                                prev,
+                                sv,
+                            ));
+                        }
+                    }
+                }
+
+                // theta: ARE_BYTES on Cxz_left (20 pairs). The rotate-by-1 shift is
+                // enforced by the keccak_rnd inline μ-gated identity, so no HWSL
+                // lookup is emitted here. Cxz_right is range-checked via IS_BIT
+                // polynomial constraints on the keccak_rnd chip (spec d75944ee).
+                let mut rotated_c = [[0u8; 8]; 5];
+                for x in 0..5 {
+                    let c = cxz[x][3];
+                    for hw in 0..4 {
+                        let halfword = (c[hw * 2] as u16) | ((c[hw * 2 + 1] as u16) << 8);
+                        let shifted = halfword << 1; // u16 wraps
+                        // ARE_BYTES for cxz_left bytes: paired (low, high) of the halfword,
+                        // matching `(cxz_left[x][2i], cxz_left[x][2i+1])` sender pairing.
+                        ops.push(BitwiseOperation::byte_op(
+                            BitwiseOperationType::AreBytes,
+                            (shifted & 0xFF) as u8,
+                            ((shifted >> 8) & 0xFF) as u8,
+                        ));
+                    }
+                    // Reconstruct rotated_c using the bit-typed Cxz_right.
+                    let mut left_bytes = [0u8; 8];
+                    let mut right_bits = [0u8; 4];
+                    for hw in 0..4 {
+                        let halfword = (c[hw * 2] as u16) | ((c[hw * 2 + 1] as u16) << 8);
+                        let shifted = halfword << 1;
+                        left_bytes[hw * 2] = (shifted & 0xFF) as u8;
+                        left_bytes[hw * 2 + 1] = ((shifted >> 8) & 0xFF) as u8;
+                        right_bits[hw] = (halfword >> 15) as u8;
+                    }
+                    for b in 0usize..8 {
+                        let right_contribution = if b.is_multiple_of(2) {
+                            right_bits[(b / 2 + 3) % 4]
+                        } else {
+                            0
+                        };
+                        rotated_c[x][b] = left_bytes[b].wrapping_add(right_contribution);
+                    }
+                }
+
+                // theta: Dxz BYTE_ALU[XOR] (40)
+                let mut d_bytes = [[0u8; 8]; 5];
+                for x in 0..5 {
+                    for b in 0..8 {
+                        let a = cxz[(x + 4) % 5][3][b];
+                        let rb = rotated_c[(x + 1) % 5][b];
+                        d_bytes[x][b] = a ^ rb;
+                        ops.push(BitwiseOperation::byte_op(
+                            BitwiseOperationType::ByteAluXor,
+                            a,
+                            rb,
+                        ));
+                    }
+                }
+
+                // theta final: BYTE_ALU[XOR] (200)
+                let mut theta_lanes = [0u64; 25];
+                for x in 0..5 {
+                    for y in 0..5 {
+                        let lane = state[x + 5 * y];
+                        let mut d_lane = 0u64;
+                        for b in 0..8 {
+                            d_lane |= (d_bytes[x][b] as u64) << (b * 8);
+                        }
+                        theta_lanes[x + 5 * y] = lane ^ d_lane;
+                        for b in 0..8 {
+                            let s = ((lane >> (b * 8)) & 0xFF) as u8;
+                            ops.push(BitwiseOperation::byte_op(
+                                BitwiseOperationType::ByteAluXor,
+                                s,
+                                d_bytes[x][b],
+                            ));
+                        }
+                    }
+                }
+
+                // rho: ARE_BYTES (200 pairs). The per-lane shift is enforced by the
+                // keccak_rnd inline μ-gated identities, so no HWSL lookup is emitted.
+                for x in 0..5 {
+                    for y in 0..5 {
+                        let rho_offset = KECCAK_RHO[x][y] as usize;
+                        let rnc_val = (rho_offset % 16) as u8;
+                        let theta_lane = theta_lanes[x + 5 * y];
+                        for hw in 0..4 {
+                            let halfword = ((theta_lane >> (hw * 16)) & 0xFFFF) as u16;
+                            let (shifted, carry) = if rnc_val == 0 {
+                                (halfword, 0u16)
+                            } else {
+                                (halfword << rnc_val, halfword >> (16 - rnc_val))
+                            };
+                            // ARE_BYTES paired as (rot_left[b], rot_right[b]) for
+                            // each byte of the halfword, matching the sender pairing
+                            // in keccak_rnd::bus_interactions.
+                            ops.push(BitwiseOperation::byte_op(
+                                BitwiseOperationType::AreBytes,
+                                (shifted & 0xFF) as u8,
+                                (carry & 0xFF) as u8,
+                            ));
+                            ops.push(BitwiseOperation::byte_op(
+                                BitwiseOperationType::AreBytes,
+                                ((shifted >> 8) & 0xFF) as u8,
+                                ((carry >> 8) & 0xFF) as u8,
+                            ));
+                        }
+                    }
+                }
+
+                // pi: compute pi_lanes
+                let mut pi_lanes = [0u64; 25];
+                for x in 0..5 {
+                    for y in 0..5 {
+                        let rotated = theta_lanes[x + 5 * y].rotate_left(KECCAK_RHO[x][y]);
+                        let dst_x = y;
+                        let dst_y = (2 * x + 3 * y) % 5;
+                        pi_lanes[dst_x + 5 * dst_y] = rotated;
+                    }
+                }
+
+                // chi: BYTE_ALU[AND] (200) + BYTE_ALU[XOR] (200)
+                let mut chi_lanes = [0u64; 25];
+                for x in 0..5 {
+                    for y in 0..5 {
+                        let not_next = !pi_lanes[(x + 1) % 5 + 5 * y];
+                        let next2 = pi_lanes[(x + 2) % 5 + 5 * y];
+                        let and_val = not_next & next2;
+                        chi_lanes[x + 5 * y] = pi_lanes[x + 5 * y] ^ and_val;
+                        for b in 0..8 {
+                            let not_byte = ((not_next >> (b * 8)) & 0xFF) as u8;
+                            let n2_byte = ((next2 >> (b * 8)) & 0xFF) as u8;
+                            ops.push(BitwiseOperation::byte_op(
+                                BitwiseOperationType::ByteAluAnd,
+                                not_byte,
+                                n2_byte,
+                            ));
+                            let pi_byte = ((pi_lanes[x + 5 * y] >> (b * 8)) & 0xFF) as u8;
+                            let and_byte = ((and_val >> (b * 8)) & 0xFF) as u8;
+                            ops.push(BitwiseOperation::byte_op(
+                                BitwiseOperationType::ByteAluXor,
+                                pi_byte,
+                                and_byte,
+                            ));
+                        }
+                    }
+                }
+
+                // iota: BYTE_ALU[XOR] (8)
+                let rc_val = KECCAK_RC[round];
+                for b in 0..8 {
+                    let chi_byte = ((chi_lanes[0] >> (b * 8)) & 0xFF) as u8;
+                    let rc_byte = ((rc_val >> (b * 8)) & 0xFF) as u8;
+                    ops.push(BitwiseOperation::byte_op(
+                        BitwiseOperationType::ByteAluXor,
+                        chi_byte,
+                        rc_byte,
+                    ));
+                }
+
+                // Update state
+                chi_lanes[0] ^= rc_val;
+                state = chi_lanes;
+            }
+        }
+
+        ops
+    }
+
+    /// A splitmix stream for the inputs.
+    fn mix(x: &mut u64) -> u64 {
+        *x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = *x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// ★ At the finish's slice (2^20 ops), LT's lookups counted straight into
+    /// the histogram are the reference lists', and so are the lists the
+    /// finish still builds on the rollback.
+    #[test]
+    fn lt_lookups_counted_directly_are_the_lists() {
+        let mut x = 7u64;
+        let edge = [
+            0u64,
+            1,
+            0xFFFF,
+            0x1_0000,
+            u64::MAX,
+            1 << 63,
+            0xFFFF_0000_FFFF_0000,
+        ];
+        let ops: Vec<LtOperation> = (0..1usize << 20)
+            .map(|k| {
+                let (a, b) = if k < edge.len() * edge.len() {
+                    (edge[k % edge.len()], edge[k / edge.len()])
+                } else {
+                    (mix(&mut x), mix(&mut x) >> (k % 64))
+                };
+                LtOperation::new_with_invert(a, b, k % 3 == 0, k % 5 == 0)
+            })
+            .collect();
+        let mut want = bitwise::BitwiseHistogram::new();
+        want.add_ops(&reference_lt_ops(&ops));
+        let mut direct = bitwise::BitwiseHistogram::new();
+        count_bitwise_from_lt_ops(&ops, &mut direct);
+        assert!(direct == want, "LT counted directly");
+        let mut lists = bitwise::BitwiseHistogram::new();
+        lists.add_ops(&collect_bitwise_from_lt_ops(&ops));
+        assert!(lists == want, "LT's lists");
+    }
+
+    /// ★ At the finish's slice (2^11 permutations), KECCAK's lookups counted
+    /// straight into the histogram are the reference lists' (every round of
+    /// every permutation replayed), and so are the rollback's lists.
+    #[test]
+    fn keccak_lookups_counted_directly_are_the_lists() {
+        let mut x = 11u64;
+        let ops: Vec<KeccakOperation> = (0..1usize << 11)
+            .map(|k| {
+                let mut input = [0u64; 25];
+                for lane in input.iter_mut() {
+                    *lane = if k == 0 { 0 } else { mix(&mut x) };
+                }
+                KeccakOperation {
+                    timestamp: k as u64,
+                    state_addr: (mix(&mut x) >> 2) & !7,
+                    input,
+                    output: [0; 25],
+                }
+            })
+            .collect();
+        let mut want = bitwise::BitwiseHistogram::new();
+        want.add_ops(&reference_keccak(&ops));
+        let mut direct = bitwise::BitwiseHistogram::new();
+        count_bitwise_from_keccak(&ops, &mut direct);
+        assert!(direct == want, "KECCAK counted directly");
+        let mut lists = bitwise::BitwiseHistogram::new();
+        lists.add_ops(&collect_bitwise_from_keccak(&ops));
+        assert!(lists == want, "KECCAK's lists");
+    }
+}
+
+#[cfg(test)]
 mod row_count_tests {
     use super::*;
     use crate::tables::types::{MU_MAX, alu_op};
@@ -3140,18 +3507,33 @@ pub(crate) fn collect_bitwise_from_lt(
 /// over the ops, so any slicing of the list counts them all.
 pub(crate) fn collect_bitwise_from_lt_ops(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(lt_ops.len() * 8);
+    for_each_lt_lookup(lt_ops, |op| bitwise_ops.push(op));
+    bitwise_ops
+}
 
+/// [`collect_bitwise_from_lt_ops`]'s lookups counted into `histogram`, with no
+/// list built: a block's LT ops are hundreds of millions, eight lookups each.
+pub(crate) fn count_bitwise_from_lt_ops(
+    lt_ops: &[LtOperation],
+    histogram: &mut bitwise::BitwiseHistogram,
+) {
+    for_each_lt_lookup(lt_ops, |op| histogram.bump(op));
+}
+
+/// Every per-op BITWISE lookup of the LT ops `lt_ops` (MSB16 and IS_HALFWORD),
+/// op by op.
+fn for_each_lt_lookup(lt_ops: &[LtOperation], mut emit: impl FnMut(BitwiseOperation)) {
     for op in lt_ops {
         // MSB16 lookups for lhs[2] and rhs[2]
         let lhs_2 = ((op.lhs >> 48) & 0xFFFF) as u16;
         let rhs_2 = ((op.rhs >> 48) & 0xFFFF) as u16;
 
-        bitwise_ops.push(BitwiseOperation::halfword(
+        emit(BitwiseOperation::halfword(
             BitwiseOperationType::Msb16,
             (lhs_2 & 0xFF) as u8,
             (lhs_2 >> 8) as u8,
         ));
-        bitwise_ops.push(BitwiseOperation::halfword(
+        emit(BitwiseOperation::halfword(
             BitwiseOperationType::Msb16,
             (rhs_2 & 0xFF) as u8,
             (rhs_2 >> 8) as u8,
@@ -3161,7 +3543,7 @@ pub(crate) fn collect_bitwise_from_lt_ops(lt_ops: &[LtOperation]) -> Vec<Bitwise
         let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
         for shift in [0, 16, 32, 48] {
             let half = ((lhs_sub_rhs >> shift) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
+            emit(BitwiseOperation::halfword(
                 BitwiseOperationType::IsHalf,
                 (half & 0xFF) as u8,
                 (half >> 8) as u8,
@@ -3171,19 +3553,17 @@ pub(crate) fn collect_bitwise_from_lt_ops(lt_ops: &[LtOperation]) -> Vec<Bitwise
         // IS_HALFWORD lookups for lhs[1] and rhs[1]
         let lhs_1 = ((op.lhs >> 32) & 0xFFFF) as u16;
         let rhs_1 = ((op.rhs >> 32) & 0xFFFF) as u16;
-        bitwise_ops.push(BitwiseOperation::halfword(
+        emit(BitwiseOperation::halfword(
             BitwiseOperationType::IsHalf,
             (lhs_1 & 0xFF) as u8,
             (lhs_1 >> 8) as u8,
         ));
-        bitwise_ops.push(BitwiseOperation::halfword(
+        emit(BitwiseOperation::halfword(
             BitwiseOperationType::IsHalf,
             (rhs_1 & 0xFF) as u8,
             (rhs_1 >> 8) as u8,
         ));
     }
-
-    bitwise_ops
 }
 
 /// LT's per-row lookup over one table's ops (one chunk): IS_BYTE[μ] | 1, every
@@ -4776,14 +5156,30 @@ pub(crate) fn collect_bitwise_from_blake3(
 /// All of these must be registered so the BITWISE table's multiplicities are correct.
 #[allow(clippy::needless_range_loop)]
 pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOperation> {
-    use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
-
     let mut ops = Vec::new();
+    for_each_keccak_lookup(keccak_ops, |op| ops.push(op));
+    ops
+}
+
+/// [`collect_bitwise_from_keccak`]'s lookups counted into `histogram`, with no
+/// list built: about five thousand a permutation.
+pub(crate) fn count_bitwise_from_keccak(
+    keccak_ops: &[KeccakOperation],
+    histogram: &mut bitwise::BitwiseHistogram,
+) {
+    for_each_keccak_lookup(keccak_ops, |op| histogram.bump(op));
+}
+
+/// Every BITWISE lookup the keccak chips send for `keccak_ops`, permutation by
+/// permutation, its rounds replayed.
+#[allow(clippy::needless_range_loop)]
+fn for_each_keccak_lookup(keccak_ops: &[KeccakOperation], mut emit: impl FnMut(BitwiseOperation)) {
+    use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
 
     for kop in keccak_ops {
         let state_addr = kop.state_addr;
 
-        ops.push(BitwiseOperation::byte_op(
+        emit(BitwiseOperation::byte_op(
             BitwiseOperationType::ByteAluAnd,
             (state_addr & 0xFF) as u8,
             7,
@@ -4796,7 +5192,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
         for i in 0..4 {
             let lo = ((state_addr >> (2 * i * 8)) & 0xFF) as u8;
             let hi = ((state_addr >> ((2 * i + 1) * 8)) & 0xFF) as u8;
-            ops.push(BitwiseOperation::byte_op(
+            emit(BitwiseOperation::byte_op(
                 BitwiseOperationType::AreBytes,
                 lo,
                 hi,
@@ -4810,7 +5206,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                 .checked_add(lane_idx as u64 * 8)
                 .expect("keccak state address range must be validated by the executor");
             let half = (ptr & 0xFFFF) as u16;
-            ops.push(BitwiseOperation::halfword(
+            emit(BitwiseOperation::halfword(
                 BitwiseOperationType::IsHalf,
                 (half & 0xFF) as u8,
                 ((half >> 8) & 0xFF) as u8,
@@ -4827,7 +5223,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                     let v0 = ((state[x] >> (b * 8)) & 0xFF) as u8;
                     let v1 = ((state[x + 5] >> (b * 8)) & 0xFF) as u8;
                     cxz[x][0][b] = v0 ^ v1;
-                    ops.push(BitwiseOperation::byte_op(
+                    emit(BitwiseOperation::byte_op(
                         BitwiseOperationType::ByteAluXor,
                         v0,
                         v1,
@@ -4839,7 +5235,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                         let prev = cxz[x][stage - 1][b];
                         let sv = ((state[x + 5 * y] >> (b * 8)) & 0xFF) as u8;
                         cxz[x][stage][b] = prev ^ sv;
-                        ops.push(BitwiseOperation::byte_op(
+                        emit(BitwiseOperation::byte_op(
                             BitwiseOperationType::ByteAluXor,
                             prev,
                             sv,
@@ -4860,7 +5256,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                     let shifted = halfword << 1; // u16 wraps
                     // ARE_BYTES for cxz_left bytes: paired (low, high) of the halfword,
                     // matching `(cxz_left[x][2i], cxz_left[x][2i+1])` sender pairing.
-                    ops.push(BitwiseOperation::byte_op(
+                    emit(BitwiseOperation::byte_op(
                         BitwiseOperationType::AreBytes,
                         (shifted & 0xFF) as u8,
                         ((shifted >> 8) & 0xFF) as u8,
@@ -4893,7 +5289,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                     let a = cxz[(x + 4) % 5][3][b];
                     let rb = rotated_c[(x + 1) % 5][b];
                     d_bytes[x][b] = a ^ rb;
-                    ops.push(BitwiseOperation::byte_op(
+                    emit(BitwiseOperation::byte_op(
                         BitwiseOperationType::ByteAluXor,
                         a,
                         rb,
@@ -4913,7 +5309,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                     theta_lanes[x + 5 * y] = lane ^ d_lane;
                     for b in 0..8 {
                         let s = ((lane >> (b * 8)) & 0xFF) as u8;
-                        ops.push(BitwiseOperation::byte_op(
+                        emit(BitwiseOperation::byte_op(
                             BitwiseOperationType::ByteAluXor,
                             s,
                             d_bytes[x][b],
@@ -4939,12 +5335,12 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                         // ARE_BYTES paired as (rot_left[b], rot_right[b]) for
                         // each byte of the halfword, matching the sender pairing
                         // in keccak_rnd::bus_interactions.
-                        ops.push(BitwiseOperation::byte_op(
+                        emit(BitwiseOperation::byte_op(
                             BitwiseOperationType::AreBytes,
                             (shifted & 0xFF) as u8,
                             (carry & 0xFF) as u8,
                         ));
-                        ops.push(BitwiseOperation::byte_op(
+                        emit(BitwiseOperation::byte_op(
                             BitwiseOperationType::AreBytes,
                             ((shifted >> 8) & 0xFF) as u8,
                             ((carry >> 8) & 0xFF) as u8,
@@ -4975,14 +5371,14 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                     for b in 0..8 {
                         let not_byte = ((not_next >> (b * 8)) & 0xFF) as u8;
                         let n2_byte = ((next2 >> (b * 8)) & 0xFF) as u8;
-                        ops.push(BitwiseOperation::byte_op(
+                        emit(BitwiseOperation::byte_op(
                             BitwiseOperationType::ByteAluAnd,
                             not_byte,
                             n2_byte,
                         ));
                         let pi_byte = ((pi_lanes[x + 5 * y] >> (b * 8)) & 0xFF) as u8;
                         let and_byte = ((and_val >> (b * 8)) & 0xFF) as u8;
-                        ops.push(BitwiseOperation::byte_op(
+                        emit(BitwiseOperation::byte_op(
                             BitwiseOperationType::ByteAluXor,
                             pi_byte,
                             and_byte,
@@ -4996,7 +5392,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
             for b in 0..8 {
                 let chi_byte = ((chi_lanes[0] >> (b * 8)) & 0xFF) as u8;
                 let rc_byte = ((rc_val >> (b * 8)) & 0xFF) as u8;
-                ops.push(BitwiseOperation::byte_op(
+                emit(BitwiseOperation::byte_op(
                     BitwiseOperationType::ByteAluXor,
                     chi_byte,
                     rc_byte,
@@ -5008,8 +5404,6 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
             state = chi_lanes;
         }
     }
-
-    ops
 }
 
 /// every address accessed during execution (ELF init + runtime stores/loads).
@@ -5396,6 +5790,12 @@ pub struct StreamSkip {
     /// map a chunk, or by parts (`LAMBDA_VM_BLOCK_P4_ROWS=parts` on the
     /// block). The multiplicities are the same.
     pub p4_by: RowCount,
+    /// Phase 4 counts LT's per-op lookups and KECCAK's straight into its
+    /// histograms ([`count_bitwise_from_lt_ops`], [`count_bitwise_from_keccak`]),
+    /// instead of building each slice's list of them first
+    /// (`LAMBDA_VM_BLOCK_P4_LOOKUPS=direct` on the block). The multiplicities
+    /// are the same.
+    pub p4_direct: bool,
     /// How the tables cut at `keccak_rnd_rows`, `keccak_rows`, `ecsm_rows`,
     /// `ecdas_rows` and `copy_rows` are padded ([`CutPadding`]): the table
     /// phase's counts, its

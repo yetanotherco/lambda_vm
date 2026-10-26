@@ -349,14 +349,22 @@ impl<'a> FinishPlan<'a> {
                 // LT's segments slice by slice; a compact one through a temporary of a
                 // slice's ops at a time.
                 starts.push(("LT", collectors.len()));
+                // Counted straight into the histogram (`skip.p4_direct`), or
+                // through each slice's list of lookups, as before.
+                let direct = skip.p4_direct;
+                let lt_lookups = move |slice: &[LtOperation], h: &mut bitwise::BitwiseHistogram| {
+                    if direct {
+                        count_bitwise_from_lt_ops(slice, h)
+                    } else {
+                        h.add_ops(&collect_bitwise_from_lt_ops(slice))
+                    }
+                };
                 let lt_slice = p4_slice_len(P4Source::Lt, mul_chunk, dvrm_chunk);
                 for part in &lt_ops.parts {
                     match *part {
                         Part::Ops(ops) => {
                             for slice in ops.chunks(lt_slice) {
-                                collectors.push(Box::new(move |h| {
-                                    h.add_ops(&collect_bitwise_from_lt_ops(slice))
-                                }));
+                                collectors.push(Box::new(move |h| lt_lookups(slice, h)));
                             }
                         }
                         Part::Compact(compact) => {
@@ -364,7 +372,7 @@ impl<'a> FinishPlan<'a> {
                                 collectors.push(Box::new(move |h| {
                                     let mut slice = Vec::new();
                                     compact.expand_into(start, start + lt_slice, &mut slice);
-                                    h.add_ops(&collect_bitwise_from_lt_ops(&slice))
+                                    lt_lookups(&slice, h)
                                 }));
                             }
                         }
@@ -453,7 +461,11 @@ impl<'a> FinishPlan<'a> {
                     .flat_map(|part| part.chunks(keccak_slice))
                 {
                     collectors.push(Box::new(move |h| {
-                        h.add_ops(&collect_bitwise_from_keccak(slice))
+                        if direct {
+                            count_bitwise_from_keccak(slice, h)
+                        } else {
+                            h.add_ops(&collect_bitwise_from_keccak(slice))
+                        }
                     }));
                 }
                 starts.push(("ECDAS", collectors.len()));
@@ -758,6 +770,11 @@ impl<'a> FinishPlan<'a> {
                                 .collect::<Vec<_>>()
                                 .join(" · ")
                         ));
+                        add_to_row_scan_line(if skip.p4_direct {
+                            " · LT's and KECCAK's lookups counted directly"
+                        } else {
+                            " · LT's and KECCAK's lookups through lists"
+                        });
                     }
                     h
                 });
