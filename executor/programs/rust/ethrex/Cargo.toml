@@ -56,3 +56,28 @@ ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev 
 # Exact pin: must match the fixture writer (tooling/ethrex-fixtures) and the
 # executor test reader so the rkyv ProgramInput layout stays consistent.
 rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
+
+# Valid jump destinations as a bitmap. Every ethrex crate of this guest is built
+# from yetanotherco/ethrex, branch lambda-vm/jumpmap: the pinned rev above plus two
+# commits. The first keeps the JUMPDEST analysis as a bitmap, so a JUMP / JUMPI
+# checks one bit instead of binary-searching the offset list; the second takes the
+# tracer's branch of the jump out of line. A jump is valid exactly when it was
+# before (the commits carry the tests that compare the two checks), and
+# ProgramInput is untouched, so the fixture writer and the native test reference
+# stay on the pin. On mainnet block 25475471 the guest executes 9.79 M fewer
+# instructions (-4.1 %). Ethrex main has carried an equivalent bitmap since
+# 3ca8bc23 (#7095); drop this patch when the pin moves past it.
+#
+# All eight crates are patched together: patching only the two that changed would
+# leave two copies of ethrex-crypto in the graph. scripts/set_ethrex_rev.sh checks
+# that the fork's base below is the pinned rev and refuses to move the pin past it.
+# ethrex-fork-base: 797df5540c7d35cafd69b6971a74b2a49c67d1dd
+[patch."https://github.com/lambdaclass/ethrex.git"]
+ethrex-common = { git = "https://github.com/yetanotherco/ethrex.git", rev = "5e70d74f2b640b61b6faeacadd6ca2e2931f27eb" }
+ethrex-crypto = { git = "https://github.com/yetanotherco/ethrex.git", rev = "5e70d74f2b640b61b6faeacadd6ca2e2931f27eb" }
+ethrex-guest-program = { git = "https://github.com/yetanotherco/ethrex.git", rev = "5e70d74f2b640b61b6faeacadd6ca2e2931f27eb" }
+ethrex-l2-common = { git = "https://github.com/yetanotherco/ethrex.git", rev = "5e70d74f2b640b61b6faeacadd6ca2e2931f27eb" }
+ethrex-levm = { git = "https://github.com/yetanotherco/ethrex.git", rev = "5e70d74f2b640b61b6faeacadd6ca2e2931f27eb" }
+ethrex-rlp = { git = "https://github.com/yetanotherco/ethrex.git", rev = "5e70d74f2b640b61b6faeacadd6ca2e2931f27eb" }
+ethrex-trie = { git = "https://github.com/yetanotherco/ethrex.git", rev = "5e70d74f2b640b61b6faeacadd6ca2e2931f27eb" }
+ethrex-vm = { git = "https://github.com/yetanotherco/ethrex.git", rev = "5e70d74f2b640b61b6faeacadd6ca2e2931f27eb" }
