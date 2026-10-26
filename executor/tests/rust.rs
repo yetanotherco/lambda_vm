@@ -279,6 +279,10 @@ const MEM_SWEEP_ELF: &str = "./program_artifacts/rust/mem_sweep.elf";
 /// `fast-memcpy` software `memcpy` contain none.
 const ECALL: u32 = 0x0000_0073;
 
+/// `ld` (opcode and funct3 bits). The runtime's `memcmp` compares doublewords with it;
+/// compiler_builtins' `memcmp` loads one byte at a time.
+const LD: u32 = 0x0000_3003;
+
 /// The address range and the instruction words of the function that starts at `pc`.
 fn function_at(program: &Elf, symbols: &SymbolTable, pc: u64) -> Option<(Range<u64>, Vec<u32>)> {
     let f = symbols.lookup(pc).filter(|f| f.address == pc)?;
@@ -334,13 +338,13 @@ fn body_of(elf_bytes: &[u8], name: &str) -> (Range<u64>, Vec<u32>) {
 }
 
 /// In-VM sweep of the memory routines the guest links (`memcpy`, `memmove` and
-/// `memset` are the runtime's copy-accelerator stubs; `memcmp` is the library's,
-/// built with the ethrex guest's flags). The guest compares every result with values
+/// `memset` are the runtime's copy-accelerator stubs; `memcmp` is the runtime's
+/// doubleword routine). The guest compares every result with values
 /// recomputed from the index and commits `OK` plus its case counts, or `FAIL` plus
 /// the first failing case. Counts, in order: memcpy at every length 0..=1100 and
 /// offsets mod 8; memcpy at lengths 0..=160 and offsets mod 16; memcpy large lengths,
 /// lengths up to a page and the compiler's own copies; memcpy onto itself and between
-/// touching regions; memmove overlapping both ways; memset and memcmp.
+/// touching regions; memmove overlapping both ways; memset; memcmp calls.
 #[test]
 fn test_mem_sweep() {
     let elf = std::fs::read(MEM_SWEEP_ELF).unwrap();
@@ -387,8 +391,19 @@ fn test_mem_sweep() {
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
     // 1101 lengths x 64; 161 lengths x 256; 6 x 16 + 2 x 4 + 428 x 4 + 16; 301 x 8 x 3;
-    // 201 x 8 x 19; 301 x 8 x 2 memset + 64 + 64 lengths x 64 x 7 memcmp.
-    assert_eq!(counts, [70_464, 41_216, 1_832, 7_224, 30_552, 33_552]);
+    // 201 x 8 x 19; 301 x 8 x 2 memset; 64 offset pairs x 31_322 memcmp calls
+    // (lengths 0..=300, see `memcmp_positions` in the guest).
+    assert_eq!(
+        counts,
+        [70_464, 41_216, 1_832, 7_224, 30_552, 4_816, 2_004_608]
+    );
+    assert!(
+        function_in(&elf, "memcmp")
+            .1
+            .iter()
+            .any(|&w| w & 0x707f == LD),
+        "the sweep guest's `memcmp` has no doubleword load: it is not the runtime's"
+    );
     assert!(
         copy_calls > 0 && set_calls > 0,
         "the sweep made {copy_calls} copy and {set_calls} memset ecalls: the copy \
@@ -396,8 +411,8 @@ fn test_mem_sweep() {
     );
 }
 
-/// The guest every block proof is about links the very `memcpy`, `memmove` and
-/// `memset` that `test_mem_sweep` exercises: the same instruction words in both ELFs.
+/// The guest every block proof is about links the very `memcpy`, `memmove`, `memset`
+/// and `memcmp` that `test_mem_sweep` exercises: the same instruction words in both ELFs.
 #[test]
 fn test_ethrex_links_the_swept_memory_routines() {
     let ethrex = std::fs::read(ETHREX_ELF).unwrap();
@@ -413,6 +428,11 @@ fn test_ethrex_links_the_swept_memory_routines() {
             "`{name}` differs between the ethrex guest and the sweep guest"
         );
     }
+    assert_eq!(
+        body_of(&ethrex, "memcmp").1,
+        body_of(&sweep, "memcmp").1,
+        "`memcmp` differs between the ethrex guest and the sweep guest"
+    );
 }
 
 #[test]

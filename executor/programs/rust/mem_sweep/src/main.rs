@@ -6,8 +6,8 @@
 //! byte `pat` never produces, and every check recomputes `pat`. So a routine cannot
 //! be used to verify itself.
 //!
-//! Public output: `OK` + six little-endian u32 case counts (memcpy mod 8, memcpy
-//! mod 16, memcpy large, memcpy same/adjacent, memmove, memset + memcmp), or `FAIL` +
+//! Public output: `OK` + seven little-endian u32 case counts (memcpy mod 8, memcpy
+//! mod 16, memcpy large, memcpy same/adjacent, memmove, memset, memcmp calls), or `FAIL` +
 //! the stage byte, length (u32), source and destination alignment, and the index
 //! (u32) of the first wrong byte relative to the destination start (negative = in
 //! the guard before it, encoded two's complement).
@@ -36,6 +36,19 @@ const LARGE_ALIGN: [usize; 4] = [0, 1, 4, 7];
 /// (source, destination) offsets only.
 const HUGE_LENS: [usize; 2] = [262149, LARGE];
 const HUGE_ALIGN: [(usize, usize); 4] = [(0, 0), (1, 0), (0, 1), (7, 4)];
+/// Lengths of the memcmp sweep.
+const MEMCMP_MAX_LEN: usize = 300;
+
+/// Where the memcmp sweep puts a differing byte in an `n`-byte operand: everywhere up
+/// to 80 bytes (every remainder mod 8 of the length and of the position, the
+/// overlapping last doubleword included), and near the start, the middle and the end
+/// above that. `memcmp_model.rs` in the runtime sweeps every position on the host.
+fn memcmp_positions(n: usize) -> Vec<usize> {
+    if n <= 80 {
+        return (0..n).collect();
+    }
+    vec![0, 1, 7, 8, 9, n / 2, n - 9, n - 8, n - 1]
+}
 
 /// Source pattern: an odd pseudo-random byte per index, with no short period.
 #[inline(always)]
@@ -135,8 +148,8 @@ fn copy_case(
     })
 }
 
-fn run() -> Result<[u32; 6], Fail> {
-    let mut counts = [0u32; 6];
+fn run() -> Result<[u32; 7], Fail> {
+    let mut counts = [0u32; 7];
     let mut src = vec![0u8; LARGE + 64];
     for (i, b) in src.iter_mut().enumerate() {
         *b = pat(i);
@@ -294,7 +307,7 @@ fn run() -> Result<[u32; 6], Fail> {
         }
     }
 
-    // 6. memset and memcmp.
+    // 6. memset.
     for n in 0..=300usize {
         for a in 0..8 {
             for &c in &[0x00u8, 0x3C] {
@@ -316,41 +329,65 @@ fn run() -> Result<[u32; 6], Fail> {
             }
         }
     }
-    let mut other = vec![0u8; 512];
-    for n in 0..=64usize {
-        for a in 0..8 {
-            for b in 0..8 {
-                // equal contents at two alignments, then one differing byte at the
-                // start, the middle and the end
-                for (i, x) in other.iter_mut().enumerate().take(b + n + 8) {
-                    *x = if i >= b && i < b + n {
-                        pat(s0 + a + (i - b))
-                    } else {
-                        POISON
-                    };
-                }
+    // 7. memcmp: every length up to MEMCMP_MAX_LEN and every pair of offsets mod 8.
+    // Operand `a` is the source pattern; operand `b` is the same pattern in `other`,
+    // with POISON (a byte `pat` never returns) right before it and right after its
+    // `n` bytes, so a load outside the operands makes equal operands compare unequal.
+    // Then one byte of `b` is flipped at the positions of `memcmp_positions`, by 0x80
+    // and by 0x01, alone and with a later difference of the opposite sense at the last
+    // byte, in both argument orders. The exact result is known: the difference of the
+    // first differing bytes as unsigned values, which compiler_builtins' and the
+    // runtime's `memcmp` both return.
+    let mut other = vec![POISON; MEMCMP_MAX_LEN + 32];
+    for a in 0..8 {
+        for b in 0..8 {
+            for (i, x) in other.iter_mut().enumerate() {
+                *x = if i < 8 + b {
+                    POISON
+                } else {
+                    pat(s0 + a + i - 8 - b)
+                };
+            }
+            // `memcmp(a, b, n) == want` and `memcmp(b, a, n) == -want`, with `b` taken
+            // from `other` as it is now
+            let agrees = |other: &[u8], n: usize, want: i32| {
                 let pa = unsafe { src.as_ptr().add(s0 + a) };
-                let pb = unsafe { other.as_ptr().add(b) };
-                if unsafe { memcmp(black_box(pa), black_box(pb), black_box(n)) } != 0 {
-                    return Err(fail(7, n, a, b, 0));
+                let pb = unsafe { other.as_ptr().add(8 + b) };
+                let cmp = |x: *const u8, y: *const u8| unsafe {
+                    memcmp(black_box(x), black_box(y), black_box(n))
+                };
+                cmp(pa, pb) == want && cmp(pb, pa) == -want
+            };
+            for n in 0..=MEMCMP_MAX_LEN {
+                for x in &mut other[8 + b + n..16 + b + n] {
+                    *x = POISON;
                 }
-                counts[5] += 1;
-                if n == 0 {
-                    continue;
+                if !agrees(&other, n, 0) {
+                    return Err(fail(7, n, a, b, -1));
                 }
-                for &at in &[0, n / 2, n - 1] {
-                    // flip the top bit of one byte: the sign of the result is known
-                    // from which side now holds the larger byte, in both argument orders
-                    let keep = other[b + at];
-                    other[b + at] = keep ^ 0x80;
-                    let want = if keep >= 0x80 { 1i32 } else { -1i32 };
-                    let ab = unsafe { memcmp(black_box(pa), black_box(pb), black_box(n)) };
-                    let ba = unsafe { memcmp(black_box(pb), black_box(pa), black_box(n)) };
-                    if ab.signum() != want || ba.signum() != -want {
-                        return Err(fail(7, n, a, b, at as isize));
+                counts[6] += 2;
+                for at in memcmp_positions(n) {
+                    let keep = other[8 + b + at];
+                    let last = other[8 + b + n - 1];
+                    for (x, later) in [(0x80u8, false), (0x01, false), (0x01, true)] {
+                        if later && at + 1 == n {
+                            continue;
+                        }
+                        other[8 + b + at] = keep ^ x;
+                        if later {
+                            other[8 + b + n - 1] = last ^ 0x80;
+                        }
+                        let want = i32::from(keep) - i32::from(keep ^ x);
+                        if !agrees(&other, n, want) {
+                            return Err(fail(7, n, a, b, at as isize));
+                        }
+                        counts[6] += 2;
+                        other[8 + b + at] = keep;
+                        other[8 + b + n - 1] = last;
                     }
-                    counts[5] += 2;
-                    other[b + at] = keep;
+                }
+                for (i, x) in other[8 + b + n..16 + b + n].iter_mut().enumerate() {
+                    *x = pat(s0 + a + n + i);
                 }
             }
         }

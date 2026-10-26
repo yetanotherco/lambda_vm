@@ -36,7 +36,8 @@ pub unsafe extern "C" fn _start() -> ! {
 //
 // It is defined here, next to `_start`, so that it lands in the object the linker always
 // takes, and it is a strong global, so it wins over compiler_builtins' weak `memcpy`.
-// `memmove`, `memset` and `memcmp` stay the library's under this feature.
+// `memmove` and `memset` stay the library's under this feature; `memcmp` is the runtime's
+// either way (below).
 //
 // Contract: the C one and no more. The two regions must not overlap, except that they may be
 // the very same region (the one overlap the compiler emits, for an object assigned to
@@ -359,4 +360,86 @@ memset:
 "#,
     syscall = const DMA_MEMSET_SYSCALL_NUMBER,
     max_bytes = const DMA_MEMCPY_MAX_BYTES,
+);
+
+// ---------------------------------------------------------------------------
+// memcmp
+//
+// compiler_builtins' `memcmp` compares one byte per iteration, 7 instructions a byte, and the
+// ethrex guest spends about 2 % of its instructions in it, almost all of it on equal bytes:
+// at the median block 93 % of the calls differ at the first byte, and the calls that find
+// their operands equal (32-, 20- and about 60-byte keys) account for 80 % of the bytes
+// compared. This routine keeps the library's answer for the first byte (the same six
+// instructions when it differs) and then compares a doubleword at a time, 6 instructions per
+// 8 bytes. A length that is not a multiple of 8 ends with one doubleword overlapping bytes
+// already found equal, so no byte loop runs for lengths of 8 or more. Every load stays inside
+// `[a, a + n)` and `[b, b + n)`; the doubleword loads may be unaligned, which this VM executes
+// as one instruction (the target spec's `+unaligned-scalar-mem`).
+//
+// Result: the difference of the first differing bytes as unsigned values, or 0, which is
+// exactly what the library returns (the C contract only fixes its sign). In a differing
+// doubleword the first differing byte is the lowest-order one (little endian), found a byte
+// at a time from the bottom.
+//
+// Unlike the three stubs above it does not depend on `fast-memcpy`. It sits next to `_start`
+// for the same reason they do: compiler_builtins defines `memcmp` weakly, so only a strong
+// global in an object the linker always takes is sure to replace it.
+//
+// Tests: `executor/programs/rust/mem_sweep` runs it in the VM at every length to 300, every
+// pair of offsets mod 8 and many differing positions, and `memcmp_model.rs` sweeps a
+// transliteration of it on the host for out-of-range loads. Change the two together.
+// ---------------------------------------------------------------------------
+
+core::arch::global_asm!(
+    r#"
+    .section .text.memcmp,"ax",@progbits
+    .p2align 2
+    .globl memcmp
+    .type memcmp,@function
+memcmp:
+    beqz a2, .Lmemcmp_equal
+    lbu a3, 0(a0)
+    lbu a4, 0(a1)
+    bne a3, a4, .Lmemcmp_byte_diff
+    li t0, 8
+    bltu a2, t0, .Lmemcmp_bytes
+    // a5 / a6: where the last doubleword of each operand starts
+    add a5, a0, a2
+    addi a5, a5, -8
+    add a6, a1, a2
+    addi a6, a6, -8
+.Lmemcmp_words:
+    ld t1, 0(a0)
+    ld t2, 0(a1)
+    bne t1, t2, .Lmemcmp_word_diff
+    addi a0, a0, 8
+    addi a1, a1, 8
+    bltu a0, a5, .Lmemcmp_words
+    ld t1, 0(a5)
+    ld t2, 0(a6)
+    bne t1, t2, .Lmemcmp_word_diff
+.Lmemcmp_equal:
+    li a0, 0
+    ret
+.Lmemcmp_word_diff:
+    andi a3, t1, 0xff
+    andi a4, t2, 0xff
+    bne a3, a4, .Lmemcmp_byte_diff
+    srli t1, t1, 8
+    srli t2, t2, 8
+    j .Lmemcmp_word_diff
+.Lmemcmp_bytes:
+    // 1 <= n < 8 and byte 0 equal: bytes 1 .. n one at a time
+    addi a0, a0, 1
+    addi a1, a1, 1
+    addi a2, a2, -1
+    beqz a2, .Lmemcmp_equal
+    lbu a3, 0(a0)
+    lbu a4, 0(a1)
+    beq a3, a4, .Lmemcmp_bytes
+.Lmemcmp_byte_diff:
+    sub a0, a3, a4
+    ret
+    .size memcmp, .-memcmp
+"#
 );
