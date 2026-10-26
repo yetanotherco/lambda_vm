@@ -212,6 +212,10 @@ pub struct VerifierChecks {
     pub reduce_shape: bool,
     /// The preprocessed columns at `r_{<n_T}`.
     pub preprocessed: bool,
+    /// A block's commit-time out-of-domain answers batched into its chains
+    /// (`multilinear_block::commit_ood_point`); off, the answers are absorbed
+    /// and counted but no chain carries them.
+    pub commit_ood: bool,
 }
 
 impl VerifierChecks {
@@ -221,6 +225,7 @@ impl VerifierChecks {
         balance: true,
         reduce_shape: true,
         preprocessed: true,
+        commit_ood: true,
     };
 }
 

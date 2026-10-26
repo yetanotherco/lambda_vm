@@ -1885,6 +1885,12 @@ pub struct BlockWhirProof {
     /// order, and `proof.tables` is empty; under [`ArgueFormat::PerTable`],
     /// empty. Which one a verifier reads is its format's, never the proof's.
     pub argues: Vec<BatchedArgue<E>>,
+    /// Every carried stacked polynomial's commit-time out-of-domain answer, in
+    /// root order: one per root of `proof.roots`, absorbed after the roots and
+    /// before the block's first challenge, and each carried into its chain
+    /// (`stark::multilinear_block::commit_ood_point`). The verifier refuses
+    /// any other count.
+    pub commit_ood: Vec<FieldElement<E>>,
 }
 
 /// Where a block's prove spent its time, for the readout. Seconds.
@@ -2083,7 +2089,7 @@ impl BlockStamps {
                 s.upload_paid,
                 s.commit,
                 s.retire,
-                s.committed_at - s.commit - s.retire,
+                s.committed_at - s.commit - s.retire - s.ood,
                 s.committed_at,
                 s.upload_b,
                 s.argue,
@@ -2097,6 +2103,17 @@ impl BlockStamps {
                 },
             ));
         }
+        // Phase A's commit-time out-of-domain answers: how many, where their
+        // columns were evaluated, and what they cost the committer.
+        let ood_max = self.groups.iter().map(|g| g.ood).fold(0.0, f64::max);
+        out.push_str(&format!(
+            "BLOCK COMMIT OOD: answers {} · columns on card {} · on host {} · seconds {:.3} (max group {:.3})\n",
+            polys,
+            self.groups.iter().map(|g| g.ood_counts.on_card).sum::<usize>(),
+            self.groups.iter().map(|g| g.ood_counts.on_host).sum::<usize>(),
+            sum(|g| g.ood),
+            ood_max,
+        ));
         if !self.build_marks.is_empty() {
             let marks: Vec<String> = self
                 .build_marks
@@ -3870,7 +3887,10 @@ pub(crate) fn prove_traces(
                 }
                 Ok(busy)
             });
-            let block = BlockCommitted::commit_streamed::<H>(
+            let block = BlockCommitted::commit_streamed::<
+                H,
+                <H as multilinear::whir_hash::WhirHash>::Sponge,
+            >(
                 rx.iter(),
                 &sizes,
                 &config,
@@ -3939,7 +3959,7 @@ pub(crate) fn prove_traces(
         let phase_b_sched = phase_b_sched_from_env();
         stamps.phase_b_sched = phase_b_sched;
         let readbacks_before = multilinear::gpu::background_readbacks();
-        let (proof, argues, prepared_openings, groups) =
+        let (proof, argues, prepared_openings, groups, commit_ood) =
             multilinear_block::block_prove_on_forks::<_, _, _, H>(
                 block
                     .with_phase_b_overlap(phase_b_overlap(options))
@@ -3994,7 +4014,7 @@ pub(crate) fn prove_traces(
             (fills - times_before.1.0, fill_s - times_before.1.1),
         );
         stamps.groups = groups;
-        (proof, argues, prepared_openings)
+        (proof, argues, prepared_openings, commit_ood)
     });
 
     Ok(BlockWhirProof {
@@ -4007,6 +4027,7 @@ pub(crate) fn prove_traces(
         groups,
         prepared: proof.2,
         argues: proof.1,
+        commit_ood: proof.3,
     })
 }
 
@@ -6217,7 +6238,10 @@ fn prove_streamed(
                 drained.at = start.elapsed().as_secs_f64();
                 Err(drained)
             } else {
-                Ok(BlockCommitted::commit_groups_logged::<H>(
+                Ok(BlockCommitted::commit_groups_logged::<
+                    H,
+                    <H as multilinear::whir_hash::WhirHash>::Sponge,
+                >(
                     groups.inspect(|group| {
                         if let Some(ledger) = ledger {
                             ledger.sent.fetch_sub(memlog::group_bytes(group), Relaxed);
@@ -6555,7 +6579,7 @@ fn prove_streamed(
         let phase_b_sched = phase_b_sched_from_env();
         stamps.phase_b_sched = phase_b_sched;
         let readbacks_before = multilinear::gpu::background_readbacks();
-        let (proof, argues, prepared_openings, groups) =
+        let (proof, argues, prepared_openings, groups, commit_ood) =
             multilinear_block::block_prove_in_order::<_, _, _, H>(
                 block
                     .with_phase_b_overlap(phase_b_overlap(options))
@@ -6851,6 +6875,7 @@ fn prove_streamed(
             groups: laid.groups,
             prepared: prepared_openings,
             argues,
+            commit_ood,
         })
     })
 }
@@ -7308,9 +7333,15 @@ pub(crate) fn verify_block_whir_traced(
             .flat_map(|c| c.roots.iter().copied())
             .collect();
         // What the tables owe: the COMMIT bus's counterparty, at the block's
-        // challenges — replayed on a fork through the roots block itself.
+        // challenges — replayed on a fork through the roots block itself,
+        // answers and all.
         let mut probe = transcript.clone();
-        stark::multilinear_table::absorb_roots::<E, _>(&mut probe, &proof.proof.roots, &derived);
+        multilinear_block::absorb_roots_and_answers::<E, _>(
+            &mut probe,
+            &proof.proof.roots,
+            &derived,
+            &proof.commit_ood,
+        );
         let z: FieldElement<E> = probe.sample_field_element();
         let alpha: FieldElement<E> = probe.sample_field_element();
         let Some(owed) = crate::compute_commit_bus_offset(&proof.public_output, 0, &z, &alpha)
@@ -7319,6 +7350,7 @@ pub(crate) fn verify_block_whir_traced(
         };
         multilinear_block::block_verify_with::<_, _, _, H>(
             &proof.proof,
+            &proof.commit_ood,
             &proof.argues,
             &proof.prepared,
             &checks,

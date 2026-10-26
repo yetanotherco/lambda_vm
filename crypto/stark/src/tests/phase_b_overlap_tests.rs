@@ -4,6 +4,9 @@
 //! order and under either argue format; the observer hears the same groups,
 //! in the same order, with the same shares; a failure on either thread is the
 //! prove's error, never a panic; a refusal turns the rest of phase B serial.
+//!
+//! The block and its verifier here are shared with
+//! [`super::block_commit_ood_tests`].
 
 use std::sync::Mutex;
 
@@ -16,7 +19,7 @@ use multilinear::{
     mle::Mle,
     stacked_eval::StackedCommitment,
     whir::Domain,
-    whir_chain::{ArgueFormat, ChainConfig, ChainFormat, GrindBits},
+    whir_chain::{ArgueFormat, ChainConfig, ChainFormat, GrindBits, GroupFold},
     whir_commit::TreeDrop,
     whir_hash::{KeccakWhir, WhirHash},
 };
@@ -32,26 +35,33 @@ use crate::multilinear_block::{
     GroupOpened, GroupStamps, Narrowing, OverlapFaults, PhaseBOverlap,
 };
 use crate::multilinear_table::{
-    CommittedTable, TableLayout, TableStatement, global_layout, global_layouts,
+    CommittedTable, TableLayout, TableStatement, batched::VerifierChecks, global_layout,
+    global_layouts,
 };
 use crate::proof::options::ProofOptions;
 use crate::traits::AIR;
 
 type FE = FieldElement<Fp>;
 type Air = AirWithBuses<Fp, Ext, NullBoundaryConstraintBuilder, (), EmptyConstraints>;
-type H = KeccakWhir;
+pub(super) type H = KeccakWhir;
 
 /// The example's three tables (CPU, ADD, MUL), this many times over: the bus
 /// balances in each copy, so it balances over the block.
 const COPIES: usize = 3;
 
 /// Tables a group: CPU | ADD MUL | CPU | ADD | MUL | CPU ADD | MUL.
-const SIZES: [usize; 7] = [1, 2, 1, 1, 1, 2, 1];
+pub(super) const SIZES: [usize; 7] = [1, 2, 1, 1, 1, 2, 1];
 
 /// The prepared stacks: a group and its tables' prefixes, `(table, columns)`.
 const PREPARED: [(usize, &[(usize, usize)]); 2] = [(1, &[(1, 1), (2, 2)]), (5, &[(6, 2), (7, 1)])];
 
 fn config(argue: ArgueFormat) -> ChainConfig {
+    config_for(argue, GroupFold::PerPoly)
+}
+
+/// The block's config under `argue`, each group's stacked polynomials opened
+/// per `group`.
+pub(super) fn config_for(argue: ArgueFormat, group: GroupFold) -> ChainConfig {
     ChainConfig {
         log_blowup: 2,
         log_folding: 2,
@@ -59,6 +69,7 @@ fn config(argue: ArgueFormat) -> ChainConfig {
         grind: GrindBits::default(),
         format: ChainFormat {
             argue,
+            group,
             ..ChainFormat::DEFAULT
         },
     }
@@ -182,8 +193,20 @@ fn prove(
     order: &[usize],
     faults: OverlapFaults,
 ) -> (Result<BlockProved<Fp, Ext>, MlError>, Vec<Heard>) {
+    prove_block(&config(argue), overlap, order, faults, &|_| {})
+}
+
+/// [`prove`] under `config`, phase A's block handed to `fault` before phase B
+/// (a test's fault in it, or nothing).
+pub(super) fn prove_block(
+    config: &ChainConfig,
+    overlap: PhaseBOverlap,
+    order: &[usize],
+    faults: OverlapFaults,
+    fault: &dyn Fn(&mut BlockCommitted<'_, Fp, Ext>),
+) -> (Result<BlockProved<Fp, Ext>, MlError>, Vec<Heard>) {
     let airs = airs();
-    let config = config(argue);
+    let config = *config;
     let columns = prepared_columns();
     let commitments = prepared_commitments(&columns, &config);
     let borrowed: Vec<Vec<&Mle<Fp>>> = columns
@@ -201,7 +224,7 @@ fn prove(
             columns,
         })
         .collect();
-    let block = BlockCommitted::commit::<H>(
+    let mut block = BlockCommitted::commit::<H, <H as WhirHash>::Sponge>(
         tables(&airs),
         &SIZES,
         &config,
@@ -212,10 +235,12 @@ fn prove(
     .expect("phase A")
     .with_phase_b_overlap(overlap)
     .with_overlap_faults(faults);
+    fault(&mut block);
     let heard: Mutex<Vec<Heard>> = Mutex::new(Vec::new());
     let on_group = |opened: GroupOpened<'_, Fp, Ext>| {
         let share = bincode::serialize(&(
             opened.roots,
+            opened.commit_ood,
             opened.argue,
             opened.tables,
             opened.opening,
@@ -245,15 +270,26 @@ fn prove(
     )
 }
 
-fn bytes(proved: &BlockProved<Fp, Ext>) -> Vec<u8> {
-    bincode::serialize(&(&proved.0, &proved.1, &proved.2)).expect("serialize")
+pub(super) fn bytes(proved: &BlockProved<Fp, Ext>) -> Vec<u8> {
+    bincode::serialize(&(&proved.0, &proved.1, &proved.2, &proved.4)).expect("serialize")
 }
 
 /// The verifier's reading of `proved`, against the shapes and the split it
 /// rebuilds itself and the prepared stacks' roots.
 fn verify(argue: ArgueFormat, proved: &BlockProved<Fp, Ext>) -> Result<(), MlError> {
+    verify_block(&config(argue), proved, &proved.4, VerifierChecks::ALL)
+}
+
+/// [`verify`] under `config`, reading `commit_ood` as the proof's commit-time
+/// answers, with the verifier's `checks`.
+pub(super) fn verify_block(
+    config: &ChainConfig,
+    proved: &BlockProved<Fp, Ext>,
+    commit_ood: &[FieldElement<Ext>],
+    checks: VerifierChecks,
+) -> Result<(), MlError> {
     let airs = airs();
-    let config = config(argue);
+    let config = *config;
     let columns = columns();
     let prepared_at = |t: usize| {
         PREPARED
@@ -299,7 +335,7 @@ fn verify(argue: ArgueFormat, proved: &BlockProved<Fp, Ext>) -> Result<(), MlErr
     let commitments = prepared_commitments(&prepared, &config);
     let roots: Vec<Vec<multilinear::whir_commit::Commitment>> =
         commitments.iter().map(StackedCommitment::roots).collect();
-    let checks: Vec<BlockPreparedCheck<'_, Fp>> = PREPARED
+    let prepared_checks: Vec<BlockPreparedCheck<'_, Fp>> = PREPARED
         .iter()
         .zip(&commitments)
         .zip(&roots)
@@ -316,9 +352,10 @@ fn verify(argue: ArgueFormat, proved: &BlockProved<Fp, Ext>) -> Result<(), MlErr
     let mut transcript = H::sponge();
     multilinear_block::block_verify_with::<Fp, Ext, _, H>(
         &proved.0,
+        commit_ood,
         &proved.1,
         &proved.2,
-        &checks,
+        &prepared_checks,
         &statements,
         &stacks,
         &domains,
@@ -327,22 +364,24 @@ fn verify(argue: ArgueFormat, proved: &BlockProved<Fp, Ext>) -> Result<(), MlErr
         &config,
         &mut transcript,
         false,
-        crate::multilinear_table::batched::VerifierChecks::ALL,
+        checks,
     )
 }
 
-fn in_order() -> Vec<usize> {
+pub(super) fn in_order() -> Vec<usize> {
     (0..SIZES.len()).collect()
 }
 
-const ARGUES: [ArgueFormat; 2] = [ArgueFormat::PerTable, ArgueFormat::BATCHED];
+pub(super) const ARGUES: [ArgueFormat; 2] = [ArgueFormat::PerTable, ArgueFormat::BATCHED];
 
 /// The block's proof in group order under each of [`ARGUES`], SHA3-256 of its
-/// serialized bytes, as phase B proved it before the overlap existed (one group
-/// at a time, at 76a950dc2): one group at a time still proves those bytes.
+/// serialized bytes with its commit-time answers, as phase B proves it one
+/// group at a time: re-pinned when every block proof gained those answers
+/// (before them, at 76a950dc2, phase B proved the bytes the overlap was first
+/// pinned against). One group at a time still proves these bytes.
 const BEFORE_THE_OVERLAP: [&str; 2] = [
-    "8914fbae3c035670b2163b7ff093bd05991fd3adaf17d558c05246330cca41fe",
-    "8dc80a06680a58b72e207af111b9a2c96563c326a4712a96658bff70829c6dc3",
+    "fef46d1082e57b1c835f97af901a8d6d6b5d8104e33f0d577af8482580284563",
+    "0fe883d9d0241ddf41a7eda3eece5adbe2b7be4af2440a6f248357cca5a3bec0",
 ];
 
 fn digest(proved: &BlockProved<Fp, Ext>) -> String {
@@ -455,7 +494,7 @@ fn the_observer_hears_the_same_shares_in_order() {
         assert_eq!(groups, reversed, "{argue:?}: the order heard");
         assert_eq!(heard, heard_serial, "{argue:?}: the shares heard");
         // Each share as the proof carries it.
-        let (proof, argues, prepared, _) = &serial;
+        let (proof, argues, prepared, _, answers) = &serial;
         let mut table = 0usize;
         let mut first_table = vec![0usize; n];
         for (g, &size) in SIZES.iter().enumerate() {
@@ -472,6 +511,7 @@ fn the_observer_hears_the_same_shares_in_order() {
             let k = PREPARED.iter().position(|(group, _)| group == g);
             let expected = bincode::serialize(&(
                 &proof.roots,
+                answers,
                 argues.get(*g).filter(|_| argue != ArgueFormat::PerTable),
                 tables,
                 &proof.columns[*g],

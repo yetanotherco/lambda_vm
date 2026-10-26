@@ -1,6 +1,7 @@
 pub mod air_tests;
 pub mod aux_opening_width_tests;
 pub mod blake3_stark_roundtrip_tests;
+pub mod block_commit_ood_tests;
 #[cfg(feature = "debug-checks")]
 pub mod bus_debug_tests;
 pub mod bus_tests;
