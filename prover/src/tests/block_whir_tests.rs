@@ -849,6 +849,9 @@ fn a_spill_budget_decides_what_goes() {
 
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
+    // The walk's end hands the parked tables to the store once the peak
+    // passes the pressure share of the host's target: out of reach, so the
+    // budget alone decides on any host.
     let spilled = |policy: BlockSpillPolicy| {
         let mut o = streamed(MaxRowsConfig::small(), 5, 3);
         o.spill = policy;
@@ -858,7 +861,10 @@ fn a_spill_budget_decides_what_goes() {
             &ProofOptions::default_test_options(),
             &format,
             &o,
-            &Deviations::default(),
+            &Deviations {
+                spill_target: Some(u64::MAX),
+                ..Deviations::default()
+            },
         )
         .expect("prove");
         assert!(verify(&proof, &elf, &format), "{policy:?}");
@@ -942,6 +948,9 @@ fn parked_tables_handed_off_at_the_walk_prove_the_same_bytes() {
 
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
+    // Without the deviation the hand-off is the forecast's, past the pressure
+    // share of the host's target: out of reach, so no host's memory hands
+    // off the run that must not.
     let proved = |spill: BlockSpillPolicy, hand_off_all: bool| {
         let mut o = streamed(MaxRowsConfig::small(), 5, 3);
         o.spill = spill;
@@ -953,6 +962,7 @@ fn parked_tables_handed_off_at_the_walk_prove_the_same_bytes() {
             &o,
             &Deviations {
                 hand_off_all,
+                spill_target: Some(u64::MAX),
                 ..Deviations::default()
             },
         )
