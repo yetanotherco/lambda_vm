@@ -6029,12 +6029,13 @@ pub struct StreamSkip {
     /// (`LAMBDA_VM_BLOCK_REST_BITWISE_LAST=1` on the block). The tables are the
     /// same; the groups they are packed into, and so the proof's bytes, are not.
     pub bitwise_last: bool,
-    /// With [`Self::bitwise_last`], the slide and only the streamed chunks'
-    /// tails kept ([`Self::tails`]), BITWISE's lookups from LT's, BRANCH's and
-    /// BYTEWISE's tables are counted from each table's rows as it is built,
-    /// instead of from their ops in phase 4, and BITWISE is built after them
-    /// (`LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES=1` on the block). The tables are
-    /// the same; their order is [`Self::bitwise_last`]'s.
+    /// With the slide and only the streamed chunks' tails kept
+    /// ([`Self::tails`]), BITWISE's lookups from LT's, BRANCH's and BYTEWISE's
+    /// tables are counted from each table's rows as it is built, instead of
+    /// from their ops in phase 4, and BITWISE is built after them and handed
+    /// on last, as [`Self::bitwise_last`] hands it (the block's default;
+    /// `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES=0` rolls it back). Elsewhere it
+    /// changes nothing. The tables are the same; their order is not.
     pub bitwise_from_tables: bool,
     /// How the tables cut at `keccak_rnd_rows`, `keccak_rows`, `ecsm_rows`,
     /// `ecdas_rows` and `copy_rows` are padded ([`CutPadding`]): the table

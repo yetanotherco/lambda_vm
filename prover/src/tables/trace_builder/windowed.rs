@@ -822,14 +822,14 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
-    /// [`Self::rest_bitwise_last`], BITWISE's lookups from LT's, BRANCH's and
-    /// BYTEWISE's tables counted from each table's rows as it is built
-    /// ([`StreamSkip::bitwise_from_tables`]) when the finish slides and keeps
-    /// only the tails. The tables are those of [`Self::rest_bitwise_last`].
-    pub fn bitwise_from_tables(self) -> Self {
-        let mut b = self.rest_bitwise_last();
-        b.emitted.bitwise_from_tables = true;
-        b
+    /// BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables counted
+    /// from each table's rows as it is built, phase 4 beside the rest's builds
+    /// and BITWISE handed on last ([`StreamSkip::bitwise_from_tables`]), when
+    /// the finish slides and keeps only the tails; otherwise the finish counts
+    /// and orders as without it.
+    pub fn bitwise_from_tables(mut self) -> Self {
+        self.emitted.bitwise_from_tables = true;
+        self
     }
 
     /// Drop each streamed chunk's ops once the chunk is handed out, instead of
@@ -1009,9 +1009,16 @@ impl<'a> WindowedTraceBuilder<'a> {
             register_state,
             max_rows,
             private_input,
-            skip,
+            mut skip,
             pre,
         } = self.finishing(logs)?;
+        // BITWISE's lookups from the tables need BITWISE last (the slide, with
+        // the `parallel` feature) and only the streamed chunks' tails kept:
+        // their full chunks were counted as they were handed out. They count
+        // phase 4's other sources beside the rest's builds.
+        let from_tables =
+            skip.bitwise_from_tables && skip.tails && slide && cfg!(feature = "parallel");
+        skip.p4_beside |= from_tables;
         let mut plan = super::finish::FinishPlan::new(
             ops,
             Some(&image),
@@ -1034,14 +1041,11 @@ impl<'a> WindowedTraceBuilder<'a> {
         }
         // Without the `parallel` feature the finish takes the waves, in AIR
         // order.
-        if skip.bitwise_last && slide && cfg!(feature = "parallel") {
+        if (skip.bitwise_last || from_tables) && slide && cfg!(feature = "parallel") {
             plan.hand_bitwise_last();
-            // BITWISE's lookups from the tables need only the streamed chunks'
-            // tails kept: their full chunks were counted as they were handed
-            // out.
-            if skip.bitwise_from_tables && skip.tails {
-                plan.count_bitwise_from_tables();
-            }
+        }
+        if from_tables {
+            plan.count_bitwise_from_tables();
         }
         let mut send = match on_header(plan.header().clone()) {
             Ok(send) => send,

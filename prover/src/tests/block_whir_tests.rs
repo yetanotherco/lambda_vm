@@ -2907,6 +2907,7 @@ fn bitwise_handed_on_last_moves_the_partition_and_verifies() {
             &o,
             &Deviations {
                 rest_bitwise_last: bitwise_last,
+                bitwise_from_tables: Some(false),
                 ..Deviations::default()
             },
         );
@@ -2940,12 +2941,12 @@ fn bitwise_handed_on_last_moves_the_partition_and_verifies() {
 }
 
 /// ★ BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables
-/// ([`Deviations::bitwise_from_tables`], as
-/// `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES=1`), counted from each table's rows as
-/// it is built, commit what BITWISE handed on last commits with phase 4's count
-/// from the ops: the same partition and the same group roots, and the proof
-/// verifies. The finish keeps only the streamed chunks' tails, as the block
-/// does.
+/// ([`Deviations::bitwise_from_tables`], the block's default), counted from
+/// each table's rows as it is built, commit what BITWISE handed on last
+/// commits with phase 4's count from the ops: the same partition and the same
+/// group roots, and the proof verifies. The default is that; the rollback
+/// (`LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES=0`) packs BITWISE first, as before.
+/// The finish keeps only the streamed chunks' tails, as the block does.
 #[test]
 fn bitwise_from_tables_commits_bitwise_lasts_tables_and_verifies() {
     let elf = asm_elf_bytes("all_instructions_64");
@@ -2963,13 +2964,14 @@ fn bitwise_from_tables_commits_bitwise_lasts_tables_and_verifies() {
         "from the ops",
         Deviations {
             rest_bitwise_last: true,
+            bitwise_from_tables: Some(false),
             ..Deviations::default()
         },
     );
     let from_tables = proved(
         "from the tables",
         Deviations {
-            bitwise_from_tables: true,
+            bitwise_from_tables: Some(true),
             ..Deviations::default()
         },
     );
@@ -2977,6 +2979,29 @@ fn bitwise_from_tables_commits_bitwise_lasts_tables_and_verifies() {
     assert_eq!(
         from_tables.proof.roots, from_ops.proof.roots,
         "the committed tables"
+    );
+    let default = proved("the default", Deviations::default());
+    assert_eq!(
+        default.groups, from_tables.groups,
+        "the default's partition"
+    );
+    assert_eq!(
+        default.proof.roots, from_tables.proof.roots,
+        "the default's tables"
+    );
+    let rollback = proved(
+        "the rollback",
+        Deviations {
+            bitwise_from_tables: Some(false),
+            ..Deviations::default()
+        },
+    );
+    let last = |p: &BlockWhirProof| p.groups.iter().flatten().last().copied();
+    assert_eq!(last(&from_tables), Some(0), "BITWISE packed last");
+    assert_ne!(last(&rollback), Some(0), "the rollback packs BITWISE first");
+    assert_ne!(
+        rollback.groups, from_tables.groups,
+        "the rollback's partition"
     );
 }
 

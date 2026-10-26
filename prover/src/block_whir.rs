@@ -1374,13 +1374,15 @@ fn block_rest_bitwise_last() -> Result<bool, Error> {
     )
 }
 
-/// `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES`: `1` hands BITWISE on last, as
-/// `LAMBDA_VM_BLOCK_REST_BITWISE_LAST=1` does, and counts its lookups from
-/// LT's, BRANCH's and BYTEWISE's tables as each is built, from the table's own
-/// rows and their multiplicities, instead of from their ops in phase 4
-/// ([`WindowedTraceBuilder::bitwise_from_tables`]). Unset, empty or `0` (the
-/// default): phase 4 counts them. Anything else refuses the prove. The tables
-/// are the same; their order is BITWISE-last's.
+/// `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES`: unset, empty or `1` (the default)
+/// counts BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables as each
+/// is built, from the table's own rows and their multiplicities, and hands
+/// BITWISE on after every other table, where the finish slides and keeps only
+/// the streamed chunks' tails ([`WindowedTraceBuilder::bitwise_from_tables`]);
+/// `0` (the rollback) has phase 4 count them from their ops and BITWISE lead
+/// the rest, as before. Anything else refuses the prove. The tables are the
+/// same either way; their order, and so the groups and the proof's bytes, are
+/// not.
 fn block_bitwise_from_tables() -> Result<bool, Error> {
     parse_bitwise_from_tables(
         std::env::var("LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES")
@@ -1391,8 +1393,8 @@ fn block_bitwise_from_tables() -> Result<bool, Error> {
 
 fn parse_bitwise_from_tables(value: Option<&str>) -> Result<bool, Error> {
     match value.map(str::trim) {
-        None | Some("" | "0") => Ok(false),
-        Some("1") => Ok(true),
+        None | Some("" | "1") => Ok(true),
+        Some("0") => Ok(false),
         Some(v) => Err(Error::Prover(format!(
             "LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES={v}: 1 (BITWISE's lookups from the tables' rows, \
              BITWISE last) or 0"
@@ -3375,9 +3377,10 @@ pub(crate) struct Deviations {
     /// `LAMBDA_VM_BLOCK_REST_BITWISE_LAST=1` asks ([`block_rest_bitwise_last`]).
     pub rest_bitwise_last: bool,
     /// BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables, BITWISE
-    /// last, as `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES=1` asks
-    /// ([`block_bitwise_from_tables`]).
-    pub bitwise_from_tables: bool,
+    /// last (`Some(true)`), or from their ops in phase 4, BITWISE first
+    /// (`Some(false)`), instead of what `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES`
+    /// says (`None`; [`block_bitwise_from_tables`]).
+    pub bitwise_from_tables: Option<bool>,
     /// `auto`'s target for the host, in bytes, instead of the machine's
     /// ([`spill_target_bytes`]): 0 makes the policy want every table out.
     pub spill_target: Option<u64>,
@@ -5421,7 +5424,10 @@ fn prove_streamed(
         let p4_rows = block_p4_rows()?;
         let p4_direct = block_p4_direct()?;
         let bitwise_last = deviations.rest_bitwise_last || block_rest_bitwise_last()?;
-        let from_tables = deviations.bitwise_from_tables || block_bitwise_from_tables()?;
+        let from_tables = match deviations.bitwise_from_tables {
+            Some(from_tables) => from_tables,
+            None => block_bitwise_from_tables()?,
+        };
         let card_fill = match (
             deviations.card_fill,
             deviations.card_fill_streamed,
@@ -8636,12 +8642,16 @@ mod p4_rows_knob_tests {
 
     /// The finish's phase-4 defaults: the per-row lookups counted on the pool
     /// with one map a chunk (not by parts), LT's and KECCAK's lookups counted
-    /// straight into the histograms, and the card set up at its first use.
+    /// straight into the histograms, the card set up at its first use, and
+    /// BITWISE's LT, BRANCH and BYTEWISE lookups from their tables, BITWISE
+    /// last; BITWISE last alone stays opt-in.
     #[test]
     fn the_finish_counts_on_one_map_a_chunk_and_its_lookups_directly_by_default() {
         assert_eq!(parse_p4_rows(None).ok(), Some(P4Rows::Pool));
         assert_eq!(parse_p4_lookups(None).ok(), Some(true));
         assert_eq!(parse_card_early(None).ok(), Some(false));
+        assert_eq!(parse_bitwise_from_tables(None).ok(), Some(true));
+        assert_eq!(parse_rest_bitwise_last(None).ok(), Some(false));
     }
 
     /// `LAMBDA_VM_BLOCK_CARD_EARLY`: off unless `1`; any other word refuses.
@@ -8677,15 +8687,17 @@ mod p4_rows_knob_tests {
         }
     }
 
-    /// `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES`: off (phase 4 counts the three
-    /// families' lookups) unless `1`; any other word refuses.
+    /// `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES`: on (BITWISE's three families'
+    /// lookups from their tables, BITWISE last) unless `0`, the rollback; any
+    /// other word refuses.
     #[test]
-    fn the_bitwise_from_tables_knob_is_off_by_default_and_on_at_1() {
+    fn the_bitwise_from_tables_knob_is_on_by_default_and_off_at_0() {
         for (value, on) in [
-            (None, false),
-            (Some(""), false),
-            (Some("0"), false),
+            (None, true),
+            (Some(""), true),
             (Some(" 1 "), true),
+            (Some("0"), false),
+            (Some(" 0\n"), false),
         ] {
             assert_eq!(parse_bitwise_from_tables(value).ok(), Some(on), "{value:?}");
         }

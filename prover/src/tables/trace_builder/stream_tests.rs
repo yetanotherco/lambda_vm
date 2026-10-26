@@ -880,7 +880,8 @@ fn with_bitwise_last_the_sliding_stream_hands_bitwise_on_last() {
 /// header that says so wherever the finish slides and keeps only the tails:
 /// every configuration (with and without the tails), windows of 7 and 1000
 /// cycles, budgets of one byte, 2 GiB and none, and one table building at
-/// once. In waves the order stays AIR order and phase 4 counts as before.
+/// once. Without the tails, and in waves, the order stays AIR order and phase
+/// 4 counts as before.
 #[test]
 fn with_bitwise_from_tables_the_stream_is_the_monolithic_finish() {
     let max_rows = MaxRowsConfig::small();
@@ -919,11 +920,10 @@ fn with_bitwise_from_tables_the_stream_is_the_monolithic_finish() {
                         if slide { b.slide_rest() } else { b }
                     });
                     let (header, got, _) = streamed_capped(builder, last, budget, build);
-                    let reordered = slide && cfg!(feature = "parallel");
+                    let reordered = slide && cfg!(feature = "parallel") && tails;
                     assert_eq!(header.bitwise_last, reordered, "{what}: BITWISE last");
                     assert_eq!(
-                        header.bitwise_from_tables,
-                        reordered && tails,
+                        header.bitwise_from_tables, reordered,
                         "{what}: counted from the tables"
                     );
                     counted_from_tables += usize::from(header.bitwise_from_tables);
