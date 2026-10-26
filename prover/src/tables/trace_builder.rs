@@ -6821,6 +6821,15 @@ fn collect_all_ops(
 /// block's log to print once the finish is done.
 static ROW_SCAN_LINE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// Adds `secs` to `name`'s seconds in `by` (the order is first seen).
+#[cfg(feature = "parallel")]
+fn add_source_seconds(by: &mut Vec<(&'static str, f64)>, name: &'static str, secs: f64) {
+    match by.iter_mut().find(|(n, _)| *n == name) {
+        Some((_, total)) => *total += secs,
+        None => by.push((name, secs)),
+    }
+}
+
 /// Adds `more` to the last pool count's `BLOCK P4 ROWS` line, if there is one.
 #[cfg(feature = "parallel")]
 fn add_to_row_scan_line(more: &str) {
