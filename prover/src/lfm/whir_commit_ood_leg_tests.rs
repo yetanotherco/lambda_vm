@@ -5,6 +5,10 @@
 //! (`multilinear_block::commit_ood_point`), an honest opening executes, a
 //! false or traded answer has no execution, and each half of the batching —
 //! the answers on the claims, their `eq` on the weights — is load-bearing.
+//!
+//! Under each of the leaf's query checks: V1 on a small chain, and V1 and
+//! lean on the production's chain shape (first fold 6, the automatic 4-ary
+//! cap, coset leaves, enough queries that the lean check's tail rounds run).
 
 use crypto::fiat_shamir::p1_transcript::P1Transcript;
 use multilinear::mle::Mle;
@@ -12,7 +16,7 @@ use multilinear::stacked_eval::{Claimed, OodClaims, StackedCommitment, StackedPr
 use multilinear::stacking::StackedLayout;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{
-    ChainConfig, ChainFormat, FirstFold, GrindBits, GroupFold, WhirFolds,
+    CapPolicy, ChainConfig, ChainFormat, FirstFold, GrindBits, GroupFold, LeafOrder, WhirFolds,
 };
 use multilinear::whir_commit::Commitment;
 use multilinear::whir_hash::P1Whir;
@@ -27,7 +31,7 @@ use super::executor::execute;
 use super::hash::HasherKind;
 use super::validator::validate;
 use super::whir_block::emit_commit_ood_point;
-use super::whir_chain::{ChainShape, RoundStorage, push_round_words};
+use super::whir_chain::{ChainShape, LeafQuery, RoundStorage, try_push_round_words};
 use super::whir_stacked::{
     OodWires, StackedChainWires, emit_stacked_verify_chains, ood_faults, stacked_verify_cost_ood,
 };
@@ -45,17 +49,56 @@ const GROUP: usize = 2;
 const HEIGHTS: [usize; 14] = [8, 9, 7, 9, 6, 9, 9, 8, 5, 9, 9, 4, 9, 7];
 const N_STACK: usize = 10;
 
-fn config(group: GroupFold) -> ChainConfig {
-    ChainConfig {
-        log_blowup: 2,
-        log_folding: 2,
-        num_queries: 3,
-        grind: GrindBits::query_only(4),
-        format: ChainFormat {
-            folds: WhirFolds::First(FirstFold::new(3).expect("a tested first fold")),
-            group,
-            ..ChainFormat::DEFAULT
+/// A chain shape and the leaf's query check over it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Case {
+    /// A small chain: first fold 3, folds of 2, three queries; V1.
+    Small,
+    /// The production's chain shape at this stack — first fold 6, folds of 4,
+    /// blowup 2, the automatic 4-ary cap, coset leaves — at 96 queries, under
+    /// the leaf's query check `LeafQuery`.
+    Production(LeafQuery),
+}
+
+const CASES: [Case; 3] = [
+    Case::Small,
+    Case::Production(LeafQuery::V1),
+    Case::Production(LeafQuery::Lean),
+];
+
+fn config(case: Case, group: GroupFold) -> ChainConfig {
+    match case {
+        Case::Small => ChainConfig {
+            log_blowup: 2,
+            log_folding: 2,
+            num_queries: 3,
+            grind: GrindBits::query_only(4),
+            format: ChainFormat {
+                folds: WhirFolds::First(FirstFold::new(3).expect("a tested first fold")),
+                group,
+                ..ChainFormat::DEFAULT
+            },
         },
+        Case::Production(_) => ChainConfig {
+            log_blowup: 1,
+            log_folding: 4,
+            num_queries: 96,
+            grind: GrindBits::query_only(4),
+            format: ChainFormat {
+                folds: WhirFolds::First(FirstFold::new(6).expect("a tested first fold")),
+                arity4_cap: CapPolicy::Auto,
+                leaves: LeafOrder::Coset,
+                group,
+                ..ChainFormat::DEFAULT
+            },
+        },
+    }
+}
+
+fn query(case: Case) -> LeafQuery {
+    match case {
+        Case::Small => LeafQuery::V1,
+        Case::Production(query) => query,
     }
 }
 
@@ -85,6 +128,7 @@ fn column(num_vars: usize, seed: u64) -> Mle<F> {
 /// A group committed and opened on the host with its answers, every column
 /// at a point of its own.
 struct Fixture {
+    case: Case,
     cfg: ChainConfig,
     layout: StackedLayout,
     points: Vec<Vec<FEE>>,
@@ -96,8 +140,8 @@ struct Fixture {
     shape: ChainShape,
 }
 
-fn fixture(group: GroupFold) -> Fixture {
-    let cfg = config(group);
+fn fixture(case: Case, group: GroupFold) -> Fixture {
+    let cfg = config(case, group);
     let layout = StackedLayout::build(&HEIGHTS, N_STACK).expect("the layout packs");
     assert_eq!(layout.num_polys(), 7, "the stack this test means");
     let columns: Vec<Mle<F>> = HEIGHTS
@@ -137,8 +181,12 @@ fn fixture(group: GroupFold) -> Fixture {
     )
     .expect("the group proves");
     Fixture {
+        case,
         cfg,
-        shape: ChainShape::new_at(&cfg, layout.n_stack(), 4),
+        shape: ChainShape {
+            query: query(case),
+            ..ChainShape::new_at(&cfg, layout.n_stack(), 4)
+        },
         layout,
         points,
         values,
@@ -284,9 +332,33 @@ fn arena(f: &Fixture, answers: &[FEE]) -> Vec<LfmWord> {
         .zip(f.shape.chains(f.layout.num_polys()))
     {
         words.push(ext_word(&chain.final_value));
-        push_round_words(&mut words, &f.shape.run(run.len()), chain);
+        try_push_round_words(&mut words, &f.shape.run(run.len()), chain)
+            .expect("the proof covers every leaf the lean check reads");
     }
     words
+}
+
+/// Every case and split, with the lean case's tail rounds asserted present:
+/// the fixtures the tests below walk.
+fn fixtures() -> Vec<Fixture> {
+    let mut out = Vec::new();
+    for case in CASES {
+        for group in GROUPS {
+            let f = fixture(case, group);
+            if case == Case::Production(LeafQuery::Lean) {
+                let runs = f.shape.chains(f.layout.num_polys());
+                assert!(
+                    runs.iter().any(|run| {
+                        let shape = f.shape.run(run.len());
+                        (0..shape.rounds()).any(|r| shape.tail_round(r))
+                    }),
+                    "{case:?} {group:?}: the lean check's tail rounds run"
+                );
+            }
+            out.push(f);
+        }
+    }
+    out
 }
 
 fn runs(program: &LfmProgram, words: Vec<LfmWord>) -> Result<Vec<FEE>, String> {
@@ -304,8 +376,8 @@ const GROUPS: [GroupFold; 2] = [GroupFold::PerPoly, GroupFold::Indexed];
 /// the root cells is the host's.
 #[test]
 fn an_opening_with_its_answers_executes_at_the_hosts_point() {
-    for group in GROUPS {
-        let f = fixture(group);
+    for f in fixtures() {
+        let group = (f.case, f.cfg.format.group);
         assert!(
             host_accepts(&f, &f.claims.answers),
             "{group:?}: the control"
@@ -320,8 +392,8 @@ fn an_opening_with_its_answers_executes_at_the_hosts_point() {
 /// their sum kept, have no execution, as the host refuses them.
 #[test]
 fn a_false_or_traded_answer_has_no_execution() {
-    for group in GROUPS {
-        let f = fixture(group);
+    for f in fixtures() {
+        let group = (f.case, f.cfg.format.group);
         let program = program(&f);
         let answers = &f.claims.answers;
         for at in 0..answers.len() {
@@ -350,8 +422,8 @@ fn a_false_or_traded_answer_has_no_execution() {
 /// each half of the batching is what the chain checks.
 #[test]
 fn each_half_of_the_batching_is_load_bearing() {
-    for group in GROUPS {
-        let f = fixture(group);
+    for f in fixtures() {
+        let group = (f.case, f.cfg.format.group);
         for fault in [
             ood_faults::Fault::ClaimWithoutAnswers,
             ood_faults::Fault::WeightWithoutAnswers,
@@ -377,11 +449,11 @@ fn hash16_rows(program: &LfmProgram) -> usize {
 /// ★ The plan prices what the leaf emits: the opening's permutations with
 /// and without its answers are the cost model's
 /// (`stacked_verify_cost_ood`), and the point's own sponge is
-/// `commit_ood_point_perms`'s, at either split.
+/// `commit_ood_point_perms`'s, at either split and either query check.
 #[test]
 fn the_answers_cost_what_the_plan_prices() {
-    for group in GROUPS {
-        let f = fixture(group);
+    for f in fixtures() {
+        let group = (f.case, f.cfg.format.group);
         let group_of: Vec<usize> = (0..HEIGHTS.len()).collect();
         let entry = SpongeEntry::fresh_for(WrapHash::Poseidon1);
         for (leg, ood) in [(Leg::Hinted, true), (Leg::Without, false)] {

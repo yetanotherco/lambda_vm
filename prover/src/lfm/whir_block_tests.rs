@@ -3583,12 +3583,21 @@ fn grind_bits_group_cost_census() {
 #[test]
 #[ignore = "executes a block leaf's front over a small block proof; box tier"]
 fn the_p1_block_front_draws_the_hosts_challenges() {
+    let format = small_format();
+    let (elf, proof) = small_block("test_commit_4", &format);
+    // The front is the same under either query check; each plan's own.
+    for format in [format, lean_format(format)] {
+        front_draws_the_hosts_challenges(&elf, &proof, &format);
+    }
+}
+
+/// [`the_p1_block_front_draws_the_hosts_challenges`] under `format`.
+fn front_draws_the_hosts_challenges(elf: &[u8], proof: &BlockWhirProof, format: &BlockFormat) {
     use super::whir_block::ood_faults::{self, Fault};
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     use crypto::fiat_shamir::p1_transcript::P1Transcript;
-    let format = small_format();
-    let (elf, proof) = small_block("test_commit_4", &format);
-    let plan = plan_of(&elf, &proof, &format, Some(1));
+    let (elf, format) = (elf.to_vec(), *format);
+    let plan = plan_of(&elf, proof, &format, Some(1));
     assert_eq!(plan.wrap_hash(), super::edsl::WrapHash::Poseidon1);
     let g = plan.num_groups() - 1;
     let mut arena: Vec<LfmWord> = proof
@@ -3660,13 +3669,54 @@ fn the_p1_block_front_draws_the_hosts_challenges() {
     );
     assert_eq!(
         machine, host,
-        "z, α, β, the fork's first draw and the group's point"
+        "{:?}: z, α, β, the fork's first draw and the group's point",
+        format.leaf_query
     );
     for fault in [Fault::AnswersAfterDraws, Fault::SkipFirstGroupsAnswers] {
         assert_ne!(
             draws(fault)[..3],
             host[..3],
-            "{fault:?}: the front's draws must move off the host's"
+            "{:?} {fault:?}: the front's draws must move off the host's",
+            format.leaf_query
+        );
+    }
+}
+
+/// ★ Under either query check, every leaf of a small block executes over the
+/// honest proof, and a commit-time answer altered — the first group's, a
+/// middle one, the last — gives every leaf no execution: each absorbs every
+/// answer in its front, and the group's chains carry its own.
+#[test]
+#[ignore = "executes block leaves over small block proofs; box tier"]
+fn every_leaf_refuses_an_altered_answer_under_either_query_check() {
+    let format = small_format();
+    let (elf, proof) = small_block("test_commit_4", &format);
+    let n = proof.commit_ood.len();
+    assert!(n >= 3, "the block carries a few polynomials");
+    for format in [format, lean_format(format)] {
+        let plan = plan_of(&elf, &proof, &format, None);
+        let leaves = plan.partition().num_leaves();
+        for k in 0..leaves {
+            run_leaf(&plan, &proof, k, LeafChecks::ALL).unwrap_or_else(|e| {
+                panic!("{:?} leaf {k}: the honest leaf: {e}", format.leaf_query)
+            });
+        }
+        for at in [0, n / 2, n - 1] {
+            let mut altered = proof.clone();
+            altered.commit_ood[at] += FEE::one();
+            for k in 0..leaves {
+                assert!(
+                    run_leaf(&plan, &altered, k, LeafChecks::ALL).is_err(),
+                    "{:?} leaf {k}: answer {at} altered executed",
+                    format.leaf_query
+                );
+            }
+        }
+        println!(
+            "COMMIT OOD LEAVES {:?}: {leaves} leaves execute; answers 0, {}, {} altered refused by each",
+            format.leaf_query,
+            n / 2,
+            n - 1
         );
     }
 }
@@ -3752,18 +3802,21 @@ fn a_walk_reads_its_answers_from_the_fronts_cells() {
     use super::whir_block::ood_faults::{self, Fault};
     let format = small_format();
     let (elf, proof) = small_block("test_commit_4", &format);
-    let plan = plan_of(&elf, &proof, &format, Some(1));
-    let honest = leaf_program_with(&plan, 0, LeafChecks::ALL).expect("the leaf");
-    let arenas = block_leaf_arena(&plan, &proof, 0).expect("the arena");
-    assert_eq!(honest.arena_schema.lens, vec![arenas[0].len() as u32]);
-    let fresh = ood_faults::with(Fault::FreshAnswerHint, || {
-        leaf_program_with(&plan, 0, LeafChecks::ALL).expect("the mutated leaf")
-    });
-    assert_ne!(
-        fresh.arena_schema.lens,
-        vec![arenas[0].len() as u32],
-        "a walk reading its answers anew hints words the proof's arena does not hold"
-    );
+    for format in [format, lean_format(format)] {
+        let plan = plan_of(&elf, &proof, &format, Some(1));
+        let honest = leaf_program_with(&plan, 0, LeafChecks::ALL).expect("the leaf");
+        let arenas = block_leaf_arena(&plan, &proof, 0).expect("the arena");
+        assert_eq!(honest.arena_schema.lens, vec![arenas[0].len() as u32]);
+        let fresh = ood_faults::with(Fault::FreshAnswerHint, || {
+            leaf_program_with(&plan, 0, LeafChecks::ALL).expect("the mutated leaf")
+        });
+        assert_ne!(
+            fresh.arena_schema.lens,
+            vec![arenas[0].len() as u32],
+            "{:?}: a walk reading its answers anew hints words the proof's arena does not hold",
+            format.leaf_query
+        );
+    }
 }
 
 // ============ D-ONECHAIN B2: the leaves over an `Indexed` block ============
