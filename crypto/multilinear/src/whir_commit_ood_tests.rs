@@ -282,3 +282,68 @@ fn a_runs_answers_cannot_trade_against_each_other() {
         "two answers of one run traded, their sum kept"
     );
 }
+
+/// No answer is carried at power one. Column 0's claim rides at
+/// `ρ^0 = 1`; were polynomial 0's answer carried at `γ^0 = 1` too, a prover
+/// could move `Δ` from the answer onto column 0's value and keep every chain's
+/// claim, proving the opening from the true polynomials. With `γ^(i+1)` the
+/// moved pair changes the claim and the opening is refused.
+#[test]
+fn an_answer_cannot_trade_against_column_zero() {
+    for group in [GroupFold::PerPoly, GroupFold::Indexed] {
+        let z0 = EE::from(0x0bad_cafe_u64);
+        let o = open::<P1Whir, _>(group, &z0, p1);
+        assert_eq!(
+            o.layout.placements()[0].poly,
+            0,
+            "column 0 lies in polynomial 0"
+        );
+        let columns: Vec<Mle<F>> = HEIGHTS
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| column(h, 5 + 31 * i as u64))
+            .collect();
+        let delta = EE::from(1234u64);
+        let mut values = o.values.clone();
+        values[0] = &values[0] + &delta;
+        let mut claims = o.claims.clone();
+        claims.answers[0] = &claims.answers[0] - &delta;
+        let cfg = config(group);
+        let stacked =
+            StackedCommitment::<F, P1Whir>::commit(o.layout.clone(), &borrow(&columns), None, &cfg)
+                .unwrap();
+        // The prover's chains run over the true polynomials; only the claims
+        // it states are moved.
+        let forged = prove_mapped_ood::<F, Ext, _, P1Whir, _>(
+            &stacked,
+            &borrow(&columns),
+            None,
+            &Claimed::PerColumn(&o.points),
+            &values,
+            Some(&claims),
+            &cfg,
+            &mut p1(),
+        );
+        let accepted = forged.is_ok_and(|proof| {
+            verify_ood::<F, Ext, _, P1Whir>(
+                &proof,
+                &o.layout,
+                &o.roots,
+                &Claimed::PerColumn(&o.points),
+                &values,
+                Some(CommitOod {
+                    z0: &z0,
+                    answers: &claims.answers,
+                }),
+                &o.domain,
+                &cfg,
+                &mut p1(),
+            )
+            .is_ok()
+        });
+        assert!(
+            !accepted,
+            "{group:?}: answer 0 traded against column 0's value"
+        );
+    }
+}

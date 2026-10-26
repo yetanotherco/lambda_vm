@@ -141,6 +141,13 @@ struct Fixture {
 }
 
 fn fixture(case: Case, group: GroupFold) -> Fixture {
+    moved_fixture(case, group, FEE::zero())
+}
+
+/// [`fixture`] with `delta` moved from polynomial 0's answer onto column 0's
+/// stated value, the opening still proved from the true polynomials: the
+/// honest fixture at a zero `delta`.
+fn moved_fixture(case: Case, group: GroupFold, delta: FEE) -> Fixture {
     let cfg = config(case, group);
     let layout = StackedLayout::build(&HEIGHTS, N_STACK).expect("the layout packs");
     assert_eq!(layout.num_polys(), 7, "the stack this test means");
@@ -155,20 +162,22 @@ fn fixture(case: Case, group: GroupFold) -> Fixture {
         .enumerate()
         .map(|(c, &h)| (0..h).map(|i| fee(0x5eed + (c * 37 + i) as u64)).collect())
         .collect();
-    let values: Vec<FEE> = columns
+    let mut values: Vec<FEE> = columns
         .iter()
         .zip(&points)
         .map(|(c, p)| c.evaluate_in::<E>(p).expect("a column takes its own point"))
         .collect();
+    values[0] += delta;
     let stacked = StackedCommitment::<F, P1Whir>::commit(layout.clone(), &borrowed, None, &cfg)
         .expect("the group commits");
     let roots = stacked.roots();
     let z0 =
         stark::multilinear_block::commit_ood_point::<E, P1Transcript>(GROUP, &layout, &roots, &cfg)
             .expect("the group's point");
-    let (claims, _) =
+    let (mut claims, _) =
         multilinear::stacked_eval::ood_claims::<F, E, _>(&layout, &borrowed, None, &z0)
             .expect("the answers");
+    claims.answers[0] = claims.answers[0] - delta;
     let proof = multilinear::stacked_eval::prove_mapped_ood::<F, E, _, P1Whir, _>(
         &stacked,
         &borrowed,
@@ -414,6 +423,34 @@ fn a_false_or_traded_answer_has_no_execution() {
             runs(&program, arena(&f, &traded)).is_err(),
             "{group:?}: two answers of one run traded"
         );
+    }
+}
+
+/// ★ No answer rides at `γ'^0`. Column 0's claim is carried at power one, so
+/// were polynomial 0's answer carried there too, `Δ` moved from the answer
+/// onto column 0's value would keep every chain's claim. With `γ'^(i+1)` the
+/// moved pair, proved by the host from the true polynomials, has no
+/// execution, as the host refuses it.
+#[test]
+fn an_answer_traded_against_column_zero_has_no_execution() {
+    for case in CASES {
+        for group in GROUPS {
+            let f = moved_fixture(case, group, fee(1234));
+            assert_eq!(
+                f.layout.placements()[0].poly,
+                0,
+                "column 0 lies in polynomial 0"
+            );
+            let host = host_accepts(&f, &f.claims.answers);
+            assert!(
+                runs(&program(&f), arena(&f, &f.claims.answers)).is_err(),
+                "{case:?} {group:?}: answer 0 traded against column 0's value executed"
+            );
+            assert!(
+                !host,
+                "{case:?} {group:?}: answer 0 traded against column 0, host"
+            );
+        }
     }
 }
 
