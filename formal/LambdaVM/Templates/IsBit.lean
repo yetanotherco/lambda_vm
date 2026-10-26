@@ -9,10 +9,22 @@ public import Clean.Gadgets.Boolean
 # IS_BIT (spec/is_bit.typ)
 
 Constraint template: when `cond ≠ 0`, `X` must lie in `{0, 1}`.
-Single constraint: `cond · X · (1 − X) = 0`.
+Single constraint: `cond · X · (1 − X) = 0`. Chips use the unconditional form `isBit`
+on their flags; `IsBit.circuit` is the general template with its meaning proven.
 -/
 
-namespace LambdaVM.IsBit
+namespace LambdaVM
+
+/-- `IS_BIT<1, X>`: `x` is a bit. -/
+@[circuit_norm]
+def isBit (x : Expression (F p)) : Circuit (F p) Unit :=
+  assertZero (x * (1 - x))
+
+-- Circuit inference does not unfold user wrappers; bridge it to its body.
+instance (x : Expression (F p)) : ExplicitCircuit (isBit x) :=
+  .of_eq (circuit' := assertZero (x * (1 - x))) rfl (by infer_explicit_circuit)
+
+namespace IsBit
 
 structure Inputs (F : Type) where
   cond : F
@@ -30,16 +42,15 @@ def circuit : FormalAssertion (F p) Inputs where
   soundness := by
     circuit_proof_start
     intro h_cond
-    simp only [mul_eq_zero, sub_eq_zero] at h_holds
-    rcases h_holds with (h | h) | h
-    · exact absurd h h_cond
-    · exact Or.inl h
-    · exact Or.inr h.symm
+    rw [mul_assoc, mul_eq_zero] at h_holds
+    exact mul_one_sub_eq_zero_iff.mp (h_holds.resolve_left h_cond)
 
   completeness := by
     circuit_proof_start
     by_cases h_cond : input_cond = 0
     · simp [h_cond]
-    · rcases h_spec h_cond with h | h <;> simp [h]
+    · rw [mul_assoc, mul_one_sub_eq_zero_iff.mpr (h_spec h_cond), mul_zero]
 
-end LambdaVM.IsBit
+end IsBit
+
+end LambdaVM

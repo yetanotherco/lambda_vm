@@ -134,9 +134,9 @@ Until then LT keeps `μ ∈ {0, 1}` (see below).
   lookups). The same pattern exists in MUL, DVRM, SHIFT, EQ and BYTEWISE.
 - `LambdaVM/Templates/` — the constraint templates of the spec (`IS_BIT`,
   `IS_BYTE`, `ARE_BYTES`, ...), with `Spec` taken from the corresponding
-  `spec/*.typ` page, not from the constraints. Templates that are only
-  interactions are plain `Circuit` helpers meant to be expanded inline in a chip;
-  each comes with a `*Check` assertion that pins down its meaning.
+  `spec/*.typ` page, not from the constraints. `isBit` is the helper every chip
+  calls on its flags; `isByte` and `areBytes` are the interaction templates as
+  helpers. Each comes with an assertion that pins down its meaning.
 
 ## Building
 

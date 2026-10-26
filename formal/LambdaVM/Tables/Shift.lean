@@ -2,6 +2,7 @@ module
 
 public import LambdaVM.Tables.Bitwise
 public import LambdaVM.Buses.Alu
+public import LambdaVM.Templates.IsBit
 public import LambdaVM.Tables.ShiftCore
 public import Mathlib.Tactic.LinearCombination
 
@@ -93,17 +94,17 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   assertZero (r.zbs * (r.y1 - r.in1 * right))
   assertZero (r.zbs * (r.y2 - r.in2 * right))
   assertZero (r.zbs * (r.y3 - r.in3 * right))
-  assertZero (r.ls0 * (1 - r.ls0))
-  assertZero (r.ls1 * (1 - r.ls1))
-  assertZero (r.ls2 * (1 - r.ls2))
-  assertZero (ls3 * (1 - ls3))
+  isBit r.ls0
+  isBit r.ls1
+  isBit r.ls2
+  isBit ls3
   assertZero (r.out0 - sh.1 - sh.2.1 * 65536)
   assertZero (r.out1 - sh.2.2.1 - sh.2.2.2 * 65536)
-  assertZero (r.direction * (1 - r.direction))
-  assertZero (r.signed * (1 - r.signed))
-  assertZero (r.wordInstr * (1 - r.wordInstr))
-  assertZero (r.zbs * (1 - r.zbs))
-  assertZero (r.mu * (1 - r.mu))
+  isBit r.direction
+  isBit r.signed
+  isBit r.wordInstr
+  isBit r.zbs
+  isBit r.mu
   assertZero ((1 - r.signed) * r.isNegative)
   -- interactions, in the order of `bus_interactions`
   Bitwise.Msb16.pullIf r.signed (r.in3, r.isNegative)
@@ -269,22 +270,22 @@ instance elaborated : ElaboratedCircuit (F p) Row unit main := by elaborate_circ
 theorem soundness :
     GeneralFormalCircuit.Soundness (F p) (Input := Row) (Output := unit) main (fun _ _ => True)
       (fun r _ _ => RowSpec r) := by
-    circuit_proof_start [main, RowSpec, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable,
+    circuit_proof_start [main, isBit, RowSpec, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable,
       Bitwise.msb16Table, Bitwise.byteAluTable, Bitwise.zeroTable, Bitwise.hwslTable,
       Bitwise.areBytesTable]
     obtain ⟨h_dm, h_zx0, h_zx1, h_zx2, h_zx3, h_zx4, h_zy0, h_zy1, h_zy2, h_zy3,
       h_ls0, h_ls1, h_ls2, h_ls3, h_out0, h_out1, h_dir, h_sg, h_w, h_zbs, h_mu, h_neg,
       h_msb, h_balL, h_balR, h_zero, h_hw0, h_hw1, h_hw2, h_hw3, h_hw4, h_lsb,
       h_ab, h_h1, h_in0, h_in1, h_in2, h_in3⟩ := h_holds
-    have hdb := isBool_of_mul_one_sub h_dir
-    have hsb := isBool_of_mul_one_sub h_sg
-    have hwb := isBool_of_mul_one_sub h_w
-    have hzb := isBool_of_mul_one_sub h_zbs
-    have hmb := isBool_of_mul_one_sub h_mu
-    have hl0b := isBool_of_mul_one_sub h_ls0
-    have hl1b := isBool_of_mul_one_sub h_ls1
-    have hl2b := isBool_of_mul_one_sub h_ls2
-    have hl3b := isBool_of_mul_one_sub h_ls3
+    have hdb := mul_one_sub_eq_zero_iff.mp h_dir
+    have hsb := mul_one_sub_eq_zero_iff.mp h_sg
+    have hwb := mul_one_sub_eq_zero_iff.mp h_w
+    have hzb := mul_one_sub_eq_zero_iff.mp h_zbs
+    have hmb := mul_one_sub_eq_zero_iff.mp h_mu
+    have hl0b := mul_one_sub_eq_zero_iff.mp h_ls0
+    have hl1b := mul_one_sub_eq_zero_iff.mp h_ls1
+    have hl2b := mul_one_sub_eq_zero_iff.mp h_ls2
+    have hl3b := mul_one_sub_eq_zero_iff.mp h_ls3
     have hleft : IsBool (input_mu - input_direction) := by
       rcases hmb with h | h <;> rcases hdb with h' | h' <;> simp_all [IsBool]
     have hzb' : IsBool (1 - input_zbs) := by
@@ -549,7 +550,7 @@ theorem soundness :
 theorem completeness :
     GeneralFormalCircuit.Completeness (F p) (Input := Row) (Output := unit) main
       (fun r _ _ => Honest r ∨ Padding r) (fun _ _ _ => True) := by
-    circuit_proof_start [main, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable, Bitwise.msb16Table,
+    circuit_proof_start [main, isBit, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable, Bitwise.msb16Table,
       Bitwise.byteAluTable, Bitwise.zeroTable, Bitwise.hwslTable, Bitwise.areBytesTable, Honest,
       Padding, shiftedOf]
     rcases h_assumptions with
@@ -642,10 +643,10 @@ theorem completeness :
       refine ⟨by simp, override_x hzb hdb hiff hx0, override_x hzb hdb hiff hx1,
         override_x hzb hdb hiff hx2, override_x hzb hdb hiff hx3, ?_,
         override_y hzb hdb hiff hy0, override_y hzb hdb hiff hy1, override_y hzb hdb hiff hy2,
-        override_y hzb hdb hiff hy3, isBool_mul_one_sub hl0b,
-        isBool_mul_one_sub hl1b, isBool_mul_one_sub hl2b, isBool_mul_one_sub hl3b, ?_, ?_,
-        isBool_mul_one_sub hdb, isBool_mul_one_sub hsb, isBool_mul_one_sub hwb,
-        isBool_mul_one_sub hzb, by simp, ?_,
+        override_y hzb hdb hiff hy3, mul_one_sub_eq_zero_iff.mpr hl0b,
+        mul_one_sub_eq_zero_iff.mpr hl1b, mul_one_sub_eq_zero_iff.mpr hl2b, mul_one_sub_eq_zero_iff.mpr hl3b, ?_, ?_,
+        mul_one_sub_eq_zero_iff.mpr hdb, mul_one_sub_eq_zero_iff.mpr hsb, mul_one_sub_eq_zero_iff.mpr hwb,
+        mul_one_sub_eq_zero_iff.mpr hzb, by simp, ?_,
         ?_, ?_, ?_, fun _ => ⟨by omega, hzbs⟩, ?_, ?_, ?_, ?_, ?_, ?_, ⟨hsA, hB1⟩, fun _ => hH1,
         fun _ => hi0, fun _ => hi1, fun _ => hi2, fun _ => hi3⟩
       · -- zbs · X[4] = 0
@@ -791,16 +792,16 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     obtain ⟨in0, in1, in2, in3, shiftAmount, direction, signed, wordInstr, out0, out1, isNegative,
       bitShift, zbs, x0, x1, x2, x3, x4, y0, y1, y2, y3, ls0, ls1, ls2, mu, shiftB1, shiftH1,
       shiftHigh⟩ := input_var
-    simp only [circuit_norm, main, Alu.channel, Bitwise.isHalfTable, Bitwise.msb16Table,
+    simp only [circuit_norm, main, isBit, Alu.channel, Bitwise.isHalfTable, Bitwise.msb16Table,
       Bitwise.byteAluTable, Bitwise.zeroTable, Bitwise.hwslTable, Bitwise.areBytesTable]
     constructor
     · intro channel h; tauto
     · intro env h
       obtain ⟨h_dm, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, h_dir, h_sg, -, h_zbs, h_mu, -⟩ := h
-      have hdb := isBool_of_mul_one_sub h_dir
-      have hsb := isBool_of_mul_one_sub h_sg
-      have hzb := isBool_of_mul_one_sub h_zbs
-      have hmb := isBool_of_mul_one_sub h_mu
+      have hdb := mul_one_sub_eq_zero_iff.mp h_dir
+      have hsb := mul_one_sub_eq_zero_iff.mp h_sg
+      have hzb := mul_one_sub_eq_zero_iff.mp h_zbs
+      have hmb := mul_one_sub_eq_zero_iff.mp h_mu
       constructorm* _ ∧ _ <;>
       · intro h1 h0
         rcases hmb with hm | hm <;> rcases hdb with hd | hd <;> rcases hzb with hz | hz <;>

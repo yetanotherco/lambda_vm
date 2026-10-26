@@ -39,9 +39,8 @@ lemma natCast_inj_of_lt {a b : ℕ} (ha : a < p) (hb : b < p) (h : (a : F p) = (
 lemma val_eq_of_eq_natCast {x : F p} {n : ℕ} (h : x = (n : F p)) (hn : n < 2^40) : x.val = n := by
   rw [h]; exact val_natCast_of_lt_two_pow_40 hn
 
-lemma isBool_of_mul_one_sub {x : F p} (h : x * (1 - x) = 0) : IsBool x := by
-  rw [mul_eq_zero, sub_eq_zero] at h
-  exact h.imp id Eq.symm
+lemma mul_one_sub_eq_zero_iff {x : F p} : x * (1 - x) = 0 ↔ IsBool x := by
+  rw [mul_eq_zero, sub_eq_zero, IsBool, eq_comm (a := (1 : F p))]
 
 lemma isBool_of_val_lt_two {x : F p} (h : x.val < 2) : IsBool x := by
   have hx : x = (x.val : F p) := (ZMod.natCast_zmod_val x).symm
@@ -80,9 +79,6 @@ lemma carry_lift {a b c : F p} (ha : a.val < 2^36) (hb : b.val < 2^36) (hc : IsB
 end LambdaVM
 
 namespace LambdaVM
-
-lemma isBool_mul_one_sub {x : F p} (h : IsBool x) : x * (1 - x) = 0 := by
-  rcases h with rfl | rfl <;> simp
 
 /-- A field element with value below 2 is `0` or `1`, together with its value. -/
 lemma eq_zero_or_one_of_val {x : F p} (h : x.val < 2) :
@@ -184,7 +180,7 @@ namespace LambdaVM
 /-- `requirement_vacuous` for the spec's form of the bit constraint, `μ·(1 − μ) = 0`. -/
 lemma requirement_vacuous' {mu : F p} (h : mu * (1 - mu) = 0) (hne1 : ¬ -mu = -1) (hne0 : ¬ mu = 0) :
     False := by
-  rcases isBool_of_mul_one_sub h with h0 | h1
+  rcases mul_one_sub_eq_zero_iff.mp h with h0 | h1
   · exact hne0 h0
   · exact hne1 (by rw [h1])
 

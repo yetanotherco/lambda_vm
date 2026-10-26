@@ -2,6 +2,7 @@ module
 
 public import LambdaVM.Tables.Bitwise
 public import LambdaVM.Buses.Alu
+public import LambdaVM.Templates.IsBit
 public import Mathlib.Tactic.LinearCombination
 
 @[expose] public section
@@ -62,12 +63,12 @@ theorem core
 
 def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   -- μ : Bit. The spec types it so; the Rust chip does not constrain it (see README).
-  assertZero (r.mu * (1 - r.mu))
+  isBit r.mu
   -- range: IS_HALF[lhs[1]], IS_HALF[rhs[1]], IS_BIT<signed>, IS_BIT<invert>
   Bitwise.IsHalf.pullIf r.mu r.lhs1
   Bitwise.IsHalf.pullIf r.mu r.rhs1
-  assertZero (r.signed * (1 - r.signed))
-  assertZero (r.invert * (1 - r.invert))
+  isBit r.signed
+  isBit r.invert
   -- defs: MSB16[lhs[2]] -> lhs_msb, MSB16[rhs[2]] -> rhs_msb
   Bitwise.Msb16.pullIf r.mu (r.lhs2, r.lhsMsb)
   Bitwise.Msb16.pullIf r.mu (r.rhs2, r.rhsMsb)
@@ -83,8 +84,8 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   -- res = lt xor invert
   assertZero (r.res + 2 * r.lt * r.invert - r.lt - r.invert)
   -- sub: IS_BIT<carry[i]>, IS_HALF[lhs_sub_rhs[i]]
-  assertZero (c0 * (1 - c0))
-  assertZero (c1 * (1 - c1))
+  isBit c0
+  isBit c1
   Bitwise.IsHalf.pullIf r.mu r.sub0
   Bitwise.IsHalf.pullIf r.mu r.sub1
   Bitwise.IsHalf.pullIf r.mu r.sub2
@@ -161,7 +162,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   requirementsChannelsLawful input_var i₀ := by
     obtain ⟨lhs0, lhs1, lhs2, rhs0, rhs1, rhs2, signed, lt, sub0, sub1, sub2, sub3,
       lhsMsb, rhsMsb, invert, res, mu⟩ := input_var
-    simp only [circuit_norm, main, Alu.channel, Bitwise.isHalfTable, Bitwise.msb16Table]
+    simp only [circuit_norm, main, isBit, Alu.channel, Bitwise.isHalfTable, Bitwise.msb16Table]
     constructor
     · intro channel h; tauto
     · intro env h
@@ -170,11 +171,11 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
         exact (requirement_vacuous' h.1 hne1 hne0).elim
 
   soundness := by
-    circuit_proof_start [main, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable, Bitwise.msb16Table]
+    circuit_proof_start [main, isBit, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable, Bitwise.msb16Table]
     obtain ⟨h_mu, h_l1, h_r1, h_s, h_i, h_lm, h_rm, h_lt, h_res, h_c0, h_c1, h_s0, h_s1, h_s2, h_s3⟩ :=
       h_holds
     -- μ ∈ {0, 1}; with μ = 0 every requirement is vacuous
-    rcases isBool_of_mul_one_sub h_mu with h0 | h1
+    rcases mul_one_sub_eq_zero_iff.mp h_mu with h0 | h1
     · subst h0; simp
     subst h1
     refine ⟨by simp, by simp, by simp, by simp, by simp, by simp, by simp, by simp, ?_⟩
@@ -184,8 +185,8 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     · -- the EQ clause does not apply: opsel(LT) + 32·s + 64·i ≠ opsel(EQ) + 64·i'
       intro i hi hflags
       exfalso
-      have hsb := isBool_of_mul_one_sub h_s
-      have hib := isBool_of_mul_one_sub h_i
+      have hsb := mul_one_sub_eq_zero_iff.mp h_s
+      have hib := mul_one_sub_eq_zero_iff.mp h_i
       have hs_2 := IsBool.val_lt_two hsb
       have hi_2 := IsBool.val_lt_two hib
       have h1 : ((4 + 32 * input_signed.val + 64 * input_invert.val : ℕ) : F p)
@@ -198,8 +199,8 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     · -- nor the SHIFT clause: opsel(SHIFT) + w + 32·s + 64·d ≡ 5 or 6 (mod 32)
       intro w s d hw hs hd hflags
       exfalso
-      have hsb := isBool_of_mul_one_sub h_s
-      have hib := isBool_of_mul_one_sub h_i
+      have hsb := mul_one_sub_eq_zero_iff.mp h_s
+      have hib := mul_one_sub_eq_zero_iff.mp h_i
       have hs_2 := IsBool.val_lt_two hsb
       have hi_2 := IsBool.val_lt_two hib
       have h1 : ((4 + 32 * input_signed.val + 64 * input_invert.val : ℕ) : F p)
@@ -223,10 +224,10 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     set c0 := (input_rhs0 + (input_sub0 + 65536 * input_sub1) - input_lhs0) * inv32 with hc0
     set c1 := (input_rhs1 + 65536 * input_rhs2 + (input_sub2 + 65536 * input_sub3) + c0
       - (input_lhs1 + 65536 * input_lhs2)) * inv32 with hc1
-    have hc0b : IsBool c0 := isBool_of_mul_one_sub h_c0
-    have hc1b : IsBool c1 := isBool_of_mul_one_sub h_c1
-    have hsb : IsBool input_signed := isBool_of_mul_one_sub h_s
-    have hib : IsBool input_invert := isBool_of_mul_one_sub h_i
+    have hc0b : IsBool c0 := mul_one_sub_eq_zero_iff.mp h_c0
+    have hc1b : IsBool c1 := mul_one_sub_eq_zero_iff.mp h_c1
+    have hsb : IsBool input_signed := mul_one_sub_eq_zero_iff.mp h_s
+    have hib : IsBool input_invert := mul_one_sub_eq_zero_iff.mp h_i
     have hc0_2 := IsBool.val_lt_two hc0b
     have hc1_2 := IsBool.val_lt_two hc1b
     have hs_2 := IsBool.val_lt_two hsb
@@ -283,7 +284,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   ProverAssumptions r _ _ := Honest r
 
   completeness := by
-    circuit_proof_start [main, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable, Bitwise.msb16Table,
+    circuit_proof_start [main, isBit, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable, Bitwise.msb16Table,
       Honest]
     obtain ⟨hmu, hsb, hib, hl0, hl1, hl2, hr0, hr1, hr2, hs0, hs1, hs2, hs3, hsum, hlm, hrm, hlt, hres⟩ :=
       h_assumptions
@@ -326,8 +327,8 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     have hres_cast : input_res = ((ltRaw input_signed.val L R + input_invert.val
         - 2 * ltRaw input_signed.val L R * input_invert.val : ℕ) : F p) := by
       rw [← ltBit_eq (IsBool.val_lt_two hib), ← hres, ZMod.natCast_zmod_val]
-    refine ⟨isBool_mul_one_sub hmu, fun _ => by omega, fun _ => by omega,
-      isBool_mul_one_sub hsb, isBool_mul_one_sub hib,
+    refine ⟨mul_one_sub_eq_zero_iff.mpr hmu, fun _ => by omega, fun _ => by omega,
+      mul_one_sub_eq_zero_iff.mpr hsb, mul_one_sub_eq_zero_iff.mpr hib,
       fun _ => ⟨by omega, hlm⟩, fun _ => ⟨by omega, hrm⟩, ?_, ?_, ?_, ?_,
       fun _ => by omega, fun _ => by omega, fun _ => by omega, fun _ => by omega⟩
     · exact lt_constraint (ZMod.natCast_zmod_val input_signed).symm

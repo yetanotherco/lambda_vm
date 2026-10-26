@@ -2,6 +2,7 @@ module
 
 public import LambdaVM.Tables.Bitwise
 public import LambdaVM.Buses.Alu
+public import LambdaVM.Templates.IsBit
 public import Mathlib.Tactic.LinearCombination
 
 @[expose] public section
@@ -56,20 +57,20 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   Bitwise.IsHalf.pullIf r.mu r.diff1
   Bitwise.IsHalf.pullIf r.mu r.diff2
   Bitwise.IsHalf.pullIf r.mu r.diff3
-  assertZero (r.invert * (1 - r.invert))
+  isBit r.invert
   -- SUB<diff; a, b> = ADD<a; b, diff>: the carries of b + diff = a are bits
   let diffLo := r.diff0 + 65536 * r.diff1
   let diffHi := r.diff2 + 65536 * r.diff3
   let c0 := (r.b0 + diffLo - r.a0) * inv32
   let c1 := (r.b1 + diffHi + c0 - r.a1) * inv32
-  assertZero (c0 * (1 - c0))
-  assertZero (c1 * (1 - c1))
+  isBit c0
+  isBit c1
   -- ZERO[Σ diff[i]] -> eq
   Bitwise.Zero.pullIf r.mu (r.diff0 + r.diff1 + r.diff2 + r.diff3, r.eq)
   -- res = eq xor invert
   assertZero (r.res + 2 * r.eq * r.invert - r.eq - r.invert)
   -- μ : Bit (no deduplication)
-  assertZero (r.mu * (1 - r.mu))
+  isBit r.mu
   -- output: ALU[a, b, opsel(EQ) + 64·invert] -> [res, 0]
   Alu.channel.pushIf r.mu ⟨r.a0, r.a1, r.b0, r.b1, 3 + 64 * r.invert, r.res, 0⟩
 
@@ -96,7 +97,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   channelsWithRequirements := [Alu.channel.toRaw]
   requirementsChannelsLawful input_var i₀ := by
     obtain ⟨a0, a1, b0, b1, invert, res, diff0, diff1, diff2, diff3, eq, mu⟩ := input_var
-    simp only [circuit_norm, main, Alu.channel, Bitwise.isHalfTable, Bitwise.zeroTable]
+    simp only [circuit_norm, main, isBit, Alu.channel, Bitwise.isHalfTable, Bitwise.zeroTable]
     constructor
     · intro channel h; tauto
     · intro env h
@@ -105,13 +106,13 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
         exact (requirement_vacuous' h.2.2.2.2 hne1 hne0).elim
 
   soundness := by
-    circuit_proof_start [main, RowSpec, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable,
+    circuit_proof_start [main, isBit, RowSpec, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable,
       Bitwise.zeroTable]
     obtain ⟨h_d0, h_d1, h_d2, h_d3, h_i, h_c0, h_c1, h_z, h_res, h_mu⟩ := h_holds
-    rcases isBool_of_mul_one_sub h_mu with h0 | h1
+    rcases mul_one_sub_eq_zero_iff.mp h_mu with h0 | h1
     · subst h0; simp
     subst h1
-    have hib : IsBool input_invert := isBool_of_mul_one_sub h_i
+    have hib : IsBool input_invert := mul_one_sub_eq_zero_iff.mp h_i
     have hi_2 := IsBool.val_lt_two hib
     have hd0 := h_d0 rfl
     have hd1 := h_d1 rfl
@@ -126,8 +127,8 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       intro ha0 ha1 hb0 hb1
       set c0 := (input_b0 + (input_diff0 + 65536 * input_diff1) - input_a0) * inv32 with hc0
       set c1 := (input_b1 + (input_diff2 + 65536 * input_diff3) + c0 - input_a1) * inv32 with hc1
-      have hc0b : IsBool c0 := isBool_of_mul_one_sub h_c0
-      have hc1b : IsBool c1 := isBool_of_mul_one_sub h_c1
+      have hc0b : IsBool c0 := mul_one_sub_eq_zero_iff.mp h_c0
+      have hc1b : IsBool c1 := mul_one_sub_eq_zero_iff.mp h_c1
       have hc0_2 := IsBool.val_lt_two hc0b
       have hval_lo : (input_b0 + (input_diff0 + 65536 * input_diff1)).val
           = input_b0.val + (input_diff0.val + 65536 * input_diff1.val) :=
@@ -195,7 +196,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   ProverAssumptions r _ _ := Honest r
 
   completeness := by
-    circuit_proof_start [main, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable, Bitwise.zeroTable,
+    circuit_proof_start [main, isBit, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable, Bitwise.zeroTable,
       Honest]
     obtain ⟨hmu, hib, ha0, ha1, hb0, hb1, hd0, hd1, hd2, hd3, hsum, heq, hres⟩ := h_assumptions
     obtain ⟨k0, hk0, e0⟩ : ∃ k0, k0 < 2 ∧
@@ -234,8 +235,8 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
         (input_b0.val + 2^32 * input_b1.val) : ℕ) : F p) := by
       rw [← hres, ZMod.natCast_zmod_val]
     refine ⟨fun _ => by omega, fun _ => by omega, fun _ => by omega, fun _ => by omega,
-      isBool_mul_one_sub hib, ?_, ?_, fun _ => ⟨by rw [hval_sum]; omega, ?_⟩, ?_,
-      isBool_mul_one_sub hmu⟩
+      mul_one_sub_eq_zero_iff.mpr hib, ?_, ?_, fun _ => ⟨by rw [hval_sum]; omega, ?_⟩, ?_,
+      mul_one_sub_eq_zero_iff.mpr hmu⟩
     · rw [hc0k]; rcases (by omega : k0 = 0 ∨ k0 = 1) with rfl | rfl <;> simp
     · rw [hc1k]; rcases (by omega : k1 = 0 ∨ k1 = 1) with rfl | rfl <;> simp
     · rw [heq_cast]
