@@ -3685,11 +3685,12 @@ fn front_draws_the_hosts_challenges(elf: &[u8], proof: &BlockWhirProof, format: 
 /// ★ Under either query check, every leaf of a small block executes over the
 /// honest proof, and a commit-time answer altered — the first group's, a
 /// middle one, the last — gives every leaf no execution: each absorbs every
-/// answer in its front, and the group's chains carry its own.
+/// answer in its front, and the group's chains carry its own. At blowup 4,
+/// as every test here whose leaves the planner holds to a leaf's rows.
 #[test]
 #[ignore = "executes block leaves over small block proofs; box tier"]
 fn every_leaf_refuses_an_altered_answer_under_either_query_check() {
-    let format = small_format();
+    let format = at_blowup_4(small_format());
     let (elf, proof) = small_block("test_commit_4", &format);
     let n = proof.commit_ood.len();
     assert!(n >= 3, "the block carries a few polynomials");
