@@ -186,7 +186,15 @@ pub(crate) fn generate_lt_trace_segments_as(
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     // Deduplicate operations: (lhs, rhs, signed) -> multiplicity, split at `MU_MAX`.
-    let unique_ops = dedup_rows_of(segments.iter().flat_map(|s| s.iter()));
+    lt_trace_of_rows(&dedup_rows_of(segments.iter().flat_map(|s| s.iter())), form)
+}
+
+/// The LT trace of `unique_ops`, the rows [`generate_lt_trace_segments_as`]
+/// deduplicates its operations into, in `form`.
+pub(crate) fn lt_trace_of_rows(
+    unique_ops: &[(LtOperation, u64)],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
         for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {

@@ -799,6 +799,151 @@ mod row_count_tests {
     }
 }
 
+/// ★ BITWISE's lookups from a table's rows ([`count_lt_table_lookups`] and
+/// its BRANCH and BYTEWISE twins) are the lookups of the table's ops: per op
+/// and per row, padding included, cell by cell, for chunks with no op, one op,
+/// rows exactly a power of two, rows padded, ops repeated past [`MU_MAX`]
+/// (split rows), and a block's chunk size.
+#[cfg(test)]
+mod table_count_tests {
+    use super::*;
+    use crate::tables::types::{MU_MAX, alu_op, dedup_rows};
+
+    /// The histogram of what `count` puts in a plane.
+    fn from_plane(count: impl FnOnce(&mut bitwise::BitwisePlane)) -> bitwise::BitwiseHistogram {
+        let mut plane = bitwise::BitwisePlane::new();
+        count(&mut plane);
+        let mut h = bitwise::BitwiseHistogram::new();
+        h.merge_plane(&plane);
+        h
+    }
+
+    /// Chunks of ops from `op(v)`: none, one, four distinct values (four
+    /// rows, no padding), five (padded to eight), one value 300 and 600
+    /// times (rows split at `MU_MAX`), and 5,000 ops over 37 values.
+    fn chunks<T: Clone>(op: impl Fn(u64) -> T) -> Vec<(String, Vec<T>)> {
+        let repeat = |v: u64, n: usize| std::iter::repeat_n(op(v), n).collect::<Vec<_>>();
+        vec![
+            ("none".into(), Vec::new()),
+            ("one".into(), vec![op(3)]),
+            ("four rows".into(), (0..4).map(&op).collect()),
+            ("five rows".into(), (0..5).map(&op).collect()),
+            ("300 of one".into(), repeat(9, 300)),
+            ("600 of one, two more".into(), {
+                let mut ops = repeat(11, 600);
+                ops.extend([op(1), op(2)]);
+                ops
+            }),
+            (
+                "5000 over 37".into(),
+                (0..5000u64)
+                    .map(|k| op(k.wrapping_mul(0x9e37) % 37))
+                    .collect(),
+            ),
+        ]
+    }
+
+    fn lt_op(v: u64) -> LtOperation {
+        LtOperation::new_with_invert(
+            v.wrapping_mul(0x1_0001_0003),
+            (v << 47) ^ 0xFFFF_0000_0000,
+            v.is_multiple_of(3),
+            v.is_multiple_of(5),
+        )
+    }
+
+    fn branch_op(v: u64) -> BranchOperation {
+        BranchOperation::new(
+            0x1000 + 4 * v,
+            v.wrapping_mul(0x1_0004),
+            v << 33,
+            v % 2 == 1,
+        )
+    }
+
+    fn bytewise_op(v: u64) -> bytewise::BytewiseOperation {
+        let ops = [alu_op::AND, alu_op::OR, alu_op::XOR];
+        bytewise::BytewiseOperation::new(v.wrapping_mul(0x0101_0307), !v, ops[(v % 3) as usize])
+    }
+
+    fn lt_want(ops: &[LtOperation]) -> bitwise::BitwiseHistogram {
+        let mut h = bitwise::BitwiseHistogram::new();
+        h.add_ops(&collect_bitwise_from_lt_ops(ops));
+        h.add_ops(&lt_row_lookups(ops.iter()));
+        h
+    }
+
+    fn branch_want(ops: &[BranchOperation]) -> bitwise::BitwiseHistogram {
+        let mut h = bitwise::BitwiseHistogram::new();
+        h.add_ops(&collect_bitwise_from_branch_ops(ops));
+        h.add_ops(&branch_row_lookups(ops));
+        h
+    }
+
+    fn bytewise_want(ops: &[bytewise::BytewiseOperation]) -> bitwise::BitwiseHistogram {
+        let mut h = bitwise::BitwiseHistogram::new();
+        for op in ops {
+            h.add_ops(&op.collect_bitwise_ops());
+        }
+        h.add_ops(&bytewise_row_lookups(ops));
+        h
+    }
+
+    #[test]
+    fn the_lookups_from_a_tables_rows_are_its_ops() {
+        const { assert!(MU_MAX < 300, "a value 300 times spans rows") };
+        for (what, ops) in chunks(lt_op) {
+            let got = from_plane(|p| count_lt_table_lookups(&dedup_rows(&ops), p));
+            assert!(got == lt_want(&ops), "LT, {what}");
+        }
+        for (what, ops) in chunks(branch_op) {
+            let got = from_plane(|p| count_branch_table_lookups(&dedup_rows(&ops), p));
+            assert!(got == branch_want(&ops), "BRANCH, {what}");
+        }
+        for (what, ops) in chunks(bytewise_op) {
+            let got = from_plane(|p| count_bytewise_table_lookups(&dedup_rows(&ops), p));
+            assert!(got == bytewise_want(&ops), "BYTEWISE, {what}");
+        }
+    }
+
+    /// At a block's chunk size (2^21 ops, LT's about half distinct as on a
+    /// block, BRANCH's a twentieth, BYTEWISE's a fifth).
+    #[test]
+    fn the_lookups_from_a_real_sized_tables_rows_are_its_ops() {
+        let n = 1usize << 21;
+        let pick =
+            |k: usize, distinct: usize| (k as u64).wrapping_mul(0x9e37_79b9) % distinct as u64;
+        let lt: Vec<LtOperation> = (0..n).map(|k| lt_op(pick(k, n * 47 / 100))).collect();
+        let got = from_plane(|p| count_lt_table_lookups(&dedup_rows(&lt), p));
+        assert!(got == lt_want(&lt), "LT");
+        drop(lt);
+        let branch: Vec<BranchOperation> = (0..n).map(|k| branch_op(pick(k, n / 20))).collect();
+        let got = from_plane(|p| count_branch_table_lookups(&dedup_rows(&branch), p));
+        assert!(got == branch_want(&branch), "BRANCH");
+        drop(branch);
+        let bytewise: Vec<bytewise::BytewiseOperation> =
+            (0..n).map(|k| bytewise_op(pick(k, n / 5))).collect();
+        let got = from_plane(|p| count_bytewise_table_lookups(&dedup_rows(&bytewise), p));
+        assert!(got == bytewise_want(&bytewise), "BYTEWISE");
+    }
+
+    /// A plane keeps a lookup off its `z = 0` cells aside, and adds it as the
+    /// histogram would.
+    #[test]
+    fn a_plane_keeps_the_lookups_past_z_0() {
+        let shift = BitwiseOperation::shift_op(BitwiseOperationType::Hwsl, 7, 9, 5);
+        let byte = BitwiseOperation::byte_op(BitwiseOperationType::ByteAluXor, 7, 9);
+        let got = from_plane(|p| {
+            p.bump_n(shift, 3);
+            p.bump_n(byte, 2);
+        });
+        let mut want = bitwise::BitwiseHistogram::new();
+        want.bump_n(shift, 3);
+        want.bump_n(byte, 2);
+        assert!(got == want);
+    }
+}
+
 #[cfg(test)]
 mod cut_padding_tests;
 mod delta;
@@ -3901,8 +4046,15 @@ pub(crate) fn collect_bitwise_from_branch_ops(
     branch_ops: &[BranchOperation],
 ) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(branch_ops.len() * 4);
-
     for op in branch_ops {
+        for_each_branch_lookup(op, |lookup| bitwise_ops.push(lookup));
+    }
+    bitwise_ops
+}
+
+/// [`collect_bitwise_from_branch_ops`]' lookups of one op, one by one.
+fn for_each_branch_lookup(op: &BranchOperation, mut emit: impl FnMut(BitwiseOperation)) {
+    {
         let next_pc = op.compute_next_pc();
         let next_pc_unmasked = op.compute_next_pc_unmasked();
 
@@ -3916,35 +4068,33 @@ pub(crate) fn collect_bitwise_from_branch_ops(
 
         // BYTE_ALU[AND, unmasked_low_byte, 254] → next_pc_low[0]
         // Verifies: next_pc_low[0] = unmasked_low_byte & 0xFE
-        bitwise_ops.push(BitwiseOperation::byte_op(
+        emit(BitwiseOperation::byte_op(
             BitwiseOperationType::ByteAluAnd,
             unmasked_low_byte,
             254, // 0xFE mask
         ));
 
         // IS_HALFWORD[next_pc_high[0]]
-        bitwise_ops.push(BitwiseOperation::halfword(
+        emit(BitwiseOperation::halfword(
             BitwiseOperationType::IsHalf,
             (next_pc_high_0 & 0xFF) as u8,
             (next_pc_high_0 >> 8) as u8,
         ));
 
         // IS_HALFWORD[next_pc_high[1]]
-        bitwise_ops.push(BitwiseOperation::halfword(
+        emit(BitwiseOperation::halfword(
             BitwiseOperationType::IsHalf,
             (next_pc_high_1 & 0xFF) as u8,
             (next_pc_high_1 >> 8) as u8,
         ));
 
         // IS_HALFWORD[next_pc_high[2]]
-        bitwise_ops.push(BitwiseOperation::halfword(
+        emit(BitwiseOperation::halfword(
             BitwiseOperationType::IsHalf,
             (next_pc_high_2 & 0xFF) as u8,
             (next_pc_high_2 >> 8) as u8,
         ));
     }
-
-    bitwise_ops
 }
 
 /// BRANCH's per-row lookup over one table's ops (one chunk): ARE_BYTES[μ,
@@ -4019,6 +4169,76 @@ pub(crate) fn bytewise_row_lookups(chunk: &[bytewise::BytewiseOperation]) -> Vec
         chunk_padding_rows(rows.len()),
     ));
     bounds
+}
+
+/// LT's BITWISE lookups from one table's rows `(op, μ)`, as
+/// [`lt::lt_trace_of_rows`] lays them out and the AIR sends them: each row's
+/// per-op lookups ([`for_each_lt_lookup`]) μ times, its IS_BYTE[μ] bound once,
+/// and the padding rows' bound. Over a chunk's deduplicated rows, the same
+/// multiplicities as [`collect_bitwise_from_lt_ops`] and [`lt_row_lookups`] of
+/// its ops: the rows are the ops' distinct values, each μ times.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) fn count_lt_table_lookups(
+    rows: &[(LtOperation, u64)],
+    plane: &mut bitwise::BitwisePlane,
+) {
+    for (op, mu) in rows {
+        for_each_lt_lookup(std::slice::from_ref(op), |lookup| plane.bump_n(lookup, *mu));
+        plane.bump_n(
+            BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, *mu as u8),
+            1,
+        );
+    }
+    plane.bump_n(
+        BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, 0),
+        chunk_padding_rows(rows.len()) as u64,
+    );
+}
+
+/// BRANCH's BITWISE lookups from one table's rows, as
+/// [`count_lt_table_lookups`] counts LT's: [`collect_bitwise_from_branch_ops`]
+/// and [`branch_row_lookups`] of its ops.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) fn count_branch_table_lookups(
+    rows: &[(BranchOperation, u64)],
+    plane: &mut bitwise::BitwisePlane,
+) {
+    for (op, mu) in rows {
+        for_each_branch_lookup(op, |lookup| plane.bump_n(lookup, *mu));
+        plane.bump_n(
+            BitwiseOperation::byte_op(
+                BitwiseOperationType::AreBytes,
+                *mu as u8,
+                ((op.compute_next_pc() >> 8) & 0xFF) as u8,
+            ),
+            1,
+        );
+    }
+    plane.bump_n(
+        BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, 0, 0),
+        chunk_padding_rows(rows.len()) as u64,
+    );
+}
+
+/// BYTEWISE's BITWISE lookups from one table's rows, as
+/// [`count_lt_table_lookups`] counts LT's: each op's BYTE_ALU lookups and
+/// [`bytewise_row_lookups`] of its ops.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) fn count_bytewise_table_lookups(
+    rows: &[(bytewise::BytewiseOperation, u64)],
+    plane: &mut bitwise::BitwisePlane,
+) {
+    for (op, mu) in rows {
+        op.for_each_bitwise_op(|lookup| plane.bump_n(lookup, *mu));
+        plane.bump_n(
+            BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, *mu as u8),
+            1,
+        );
+    }
+    plane.bump_n(
+        BitwiseOperation::single_byte(BitwiseOperationType::AreBytes, 0),
+        chunk_padding_rows(rows.len()) as u64,
+    );
 }
 
 /// A count-only hash for [`count_row_lookups`]: the rows' order is not read
@@ -5809,6 +6029,13 @@ pub struct StreamSkip {
     /// (`LAMBDA_VM_BLOCK_REST_BITWISE_LAST=1` on the block). The tables are the
     /// same; the groups they are packed into, and so the proof's bytes, are not.
     pub bitwise_last: bool,
+    /// With [`Self::bitwise_last`], the slide and only the streamed chunks'
+    /// tails kept ([`Self::tails`]), BITWISE's lookups from LT's, BRANCH's and
+    /// BYTEWISE's tables are counted from each table's rows as it is built,
+    /// instead of from their ops in phase 4, and BITWISE is built after them
+    /// (`LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES=1` on the block). The tables are
+    /// the same; their order is [`Self::bitwise_last`]'s.
+    pub bitwise_from_tables: bool,
     /// How the tables cut at `keccak_rnd_rows`, `keccak_rows`, `ecsm_rows`,
     /// `ecdas_rows` and `copy_rows` are padded ([`CutPadding`]): the table
     /// phase's counts, its
@@ -7243,6 +7470,14 @@ fn add_source_seconds(by: &mut Vec<(&'static str, f64)>, name: &'static str, sec
     }
 }
 
+/// Starts a `BLOCK P4 ROWS` line with `line`, for the walls to be added to.
+#[cfg(feature = "parallel")]
+fn start_row_scan_line(line: String) {
+    if let Ok(mut slot) = ROW_SCAN_LINE.lock() {
+        *slot = Some(line);
+    }
+}
+
 /// Adds `more` to the last pool count's `BLOCK P4 ROWS` line, if there is one.
 #[cfg(feature = "parallel")]
 fn add_to_row_scan_line(more: &str) {
@@ -7256,6 +7491,39 @@ fn add_to_row_scan_line(more: &str) {
 /// Takes the last pool count's `BLOCK P4 ROWS` line, if one ran since.
 pub(crate) fn take_row_scan_line() -> Option<String> {
     ROW_SCAN_LINE.lock().ok().and_then(|mut line| line.take())
+}
+
+/// The last BITWISE table's `BLOCK BITWISE` line (its multiplicities' digest),
+/// for the block's log, while a build records its marks.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+static BITWISE_LINE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Notes the BITWISE multiplicities `histogram` for [`take_bitwise_line`],
+/// while a build records its marks (the block's readout).
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+fn note_bitwise(histogram: &bitwise::BitwiseHistogram, from_tables: bool) {
+    if build_stamps::since_start().is_none() {
+        return;
+    }
+    let line = format!(
+        "BLOCK BITWISE: multiplicities digest {:016x} · LT's, BRANCH's and BYTEWISE's lookups \
+         counted {}",
+        histogram.digest(),
+        if from_tables {
+            "from their tables' rows"
+        } else {
+            "from their ops"
+        }
+    );
+    if let Ok(mut slot) = BITWISE_LINE.lock() {
+        *slot = Some(line);
+    }
+}
+
+/// Takes the last `BLOCK BITWISE` line, if a BITWISE table was built since.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) fn take_bitwise_line() -> Option<String> {
+    BITWISE_LINE.lock().ok().and_then(|mut line| line.take())
 }
 
 pub(crate) mod build_stamps {

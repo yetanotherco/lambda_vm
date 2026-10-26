@@ -177,7 +177,15 @@ pub fn generate_branch_trace_as(
     operations: &[BranchOperation],
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let unique_ops = dedup_rows(operations);
+    branch_trace_of_rows(&dedup_rows(operations), form)
+}
+
+/// The BRANCH trace of `unique_ops`, the rows [`generate_branch_trace_as`]
+/// deduplicates its operations into, in `form`.
+pub(crate) fn branch_trace_of_rows(
+    unique_ops: &[(BranchOperation, u64)],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
         for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {

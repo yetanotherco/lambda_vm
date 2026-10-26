@@ -29,6 +29,9 @@ pub(crate) struct RestHeader {
     /// other ([`StreamSkip::bitwise_last`], [`hand_on_order`]): the order the
     /// layout admits.
     pub(crate) bitwise_last: bool,
+    /// BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables, counted as
+    /// each is built ([`StreamSkip::bitwise_from_tables`]), BITWISE last.
+    pub(crate) bitwise_from_tables: bool,
 }
 
 impl RestHeader {
@@ -207,6 +210,9 @@ struct P4Mode {
     rows_on_pool: bool,
     by: RowCount,
     direct: bool,
+    /// LT's, BRANCH's and BYTEWISE's lookups are left to their tables' jobs
+    /// ([`StreamSkip::bitwise_from_tables`]): none of their ops is read here.
+    from_tables: bool,
 }
 
 impl P4Mode {
@@ -215,6 +221,7 @@ impl P4Mode {
             rows_on_pool: skip.p4_rows,
             by: skip.p4_by,
             direct: skip.p4_direct,
+            from_tables: false,
         }
     }
 }
@@ -255,11 +262,13 @@ fn count_bitwise(
         max_rows,
         num_padding_rows,
         padding_byte_checks,
-        mode: P4Mode {
-            rows_on_pool,
-            by,
-            direct,
-        },
+        mode:
+            P4Mode {
+                rows_on_pool,
+                by,
+                direct,
+                from_tables,
+            },
     } = lists;
     let lt_ops = lt.segments();
     let branch_segments = branch_ops.segments();
@@ -308,7 +317,7 @@ fn count_bitwise(
             }
         };
         let lt_slice = p4_slice_len(P4Source::Lt, mul_chunk, dvrm_chunk);
-        for part in &lt_ops.parts {
+        for part in lt_ops.parts.iter().filter(|_| !from_tables) {
             match *part {
                 Part::Ops(ops) => {
                     for slice in ops.chunks(lt_slice) {
@@ -349,7 +358,12 @@ fn count_bitwise(
         }
         starts.push(("BRANCH", collectors.len()));
         let branch_slice = p4_slice_len(P4Source::Branch, mul_chunk, dvrm_chunk);
-        for k in 0..branch_ops.len().div_ceil(branch_slice.max(1)) {
+        let branch_slices = if from_tables {
+            0
+        } else {
+            branch_ops.len().div_ceil(branch_slice.max(1))
+        };
+        for k in 0..branch_slices {
             let branch_ops = &branch_ops;
             collectors.push(Box::new(move |h| {
                 let slice = branch_ops.range(k * branch_slice, (k + 1) * branch_slice);
@@ -365,7 +379,12 @@ fn count_bitwise(
         }
         starts.push(("BYTEWISE", collectors.len()));
         let bytewise_slice = p4_slice_len(P4Source::Bytewise, mul_chunk, dvrm_chunk);
-        for k in 0..bytewise_ops.len().div_ceil(bytewise_slice.max(1)) {
+        let bytewise_slices = if from_tables {
+            0
+        } else {
+            bytewise_ops.len().div_ceil(bytewise_slice.max(1))
+        };
+        for k in 0..bytewise_slices {
             let bytewise_ops = &bytewise_ops;
             collectors.push(Box::new(move |h| {
                 for op in bytewise_ops.range(k * bytewise_slice, (k + 1) * bytewise_slice) {
@@ -435,7 +454,7 @@ fn count_bitwise(
         // control). The same multiplicities: the histogram is a commutative sum.
         collectors.extend([
             Box::new(|h: &mut bitwise::BitwiseHistogram| {
-                for part in &lt_ops.parts {
+                for part in lt_ops.parts.iter().filter(|_| !from_tables) {
                     match *part {
                         Part::Ops(ops) => h.add_ops(&collect_bitwise_from_lt_ops(ops)),
                         Part::Compact(compact) => {
@@ -462,7 +481,7 @@ fn count_bitwise(
                 }
             }),
             Box::new(|h| {
-                for k in 0..branch_ops.len().div_ceil(1 << 20) {
+                for k in 0..branch_ops.len().div_ceil(1 << 20) * usize::from(!from_tables) {
                     let slice = branch_ops.range(k << 20, (k + 1) << 20);
                     h.add_ops(&collect_bitwise_from_branch_ops(&slice))
                 }
@@ -473,7 +492,7 @@ fn count_bitwise(
                 }
             }),
             Box::new(|h| {
-                for k in 0..bytewise_ops.len().div_ceil(1 << 20) {
+                for k in 0..bytewise_ops.len().div_ceil(1 << 20) * usize::from(!from_tables) {
                     for op in bytewise_ops.range(k << 20, (k + 1) << 20) {
                         h.add_ops(&op.collect_bitwise_ops());
                     }
@@ -541,7 +560,7 @@ fn count_bitwise(
     starts.push(("LT_ROWS", collectors.len()));
     for (start, end) in list_chunks(lt_ops.len(), max_rows.lt)
         .into_iter()
-        .filter(|_| !rows_on_pool)
+        .filter(|_| !rows_on_pool && !from_tables)
     {
         let lt_ops = &lt_ops;
         collectors.push(Box::new(move |h| {
@@ -551,7 +570,7 @@ fn count_bitwise(
     starts.push(("BRANCH_ROWS", collectors.len()));
     for (start, end) in list_chunks(branch_segments.len(), max_rows.branch)
         .into_iter()
-        .filter(|_| !rows_on_pool)
+        .filter(|_| !rows_on_pool && !from_tables)
     {
         let branch_segments = &branch_segments;
         collectors.push(Box::new(move |h| {
@@ -561,7 +580,7 @@ fn count_bitwise(
     starts.push(("BYTEWISE_ROWS", collectors.len()));
     for (start, end) in list_chunks(bytewise_segments.len(), max_rows.bytewise)
         .into_iter()
-        .filter(|_| !rows_on_pool)
+        .filter(|_| !rows_on_pool && !from_tables)
     {
         let bytewise_segments = &bytewise_segments;
         collectors.push(Box::new(move |h| {
@@ -569,9 +588,19 @@ fn count_bitwise(
         }));
     }
     let count_rows = || {
-        rows_on_pool
+        (rows_on_pool && !from_tables)
             .then(|| count_row_lookups(&lt_ops, &branch_segments, &bytewise_segments, max_rows, by))
     };
+    // Without a row count there is no `BLOCK P4 ROWS` line to say the
+    // collectors' walls on: one that says why.
+    #[cfg(feature = "parallel")]
+    if from_tables {
+        start_row_scan_line(
+            "BLOCK P4 ROWS: none in phase 4 · LT's, BRANCH's and BYTEWISE's lookups counted from \
+             their tables' rows"
+                .to_string(),
+        );
+    }
     starts.push(("PADDING", collectors.len()));
     collectors.push(Box::new(move |h| {
         h.bump_n(
@@ -706,7 +735,7 @@ fn count_bitwise(
         };
         let (reduced, collectors) = reduced;
         let reduced = reduced.map(|(h, by, most, least)| {
-            if rows.is_some() {
+            if rows.is_some() || from_tables {
                 add_to_row_scan_line(&format!(
                     " · beside it, phase 4's other collectors in {collectors:.2} s on {cap} \
                      buckets (the longest {most:.2} s, the shortest {least:.2} s) · by source, \
@@ -744,7 +773,7 @@ fn count_bitwise(
             rows.bump_into(&mut base);
         }
     }
-    if rows_on_pool {
+    if rows_on_pool && !from_tables {
         build_stamps::mark("p4 rows pool");
     }
     base
@@ -867,6 +896,70 @@ fn padding_byte_checks(
 enum BitwiseJob<'a> {
     Counted(bitwise::BitwiseHistogram),
     Beside(Box<P4Pending<'a>>, P4Shared),
+    /// The other sources' count, sent by the finish's side count ([`Side`]),
+    /// and LT's, BRANCH's and BYTEWISE's from their tables ([`FromTables`]).
+    FromTables(
+        std::sync::mpsc::Receiver<bitwise::BitwiseHistogram>,
+        std::sync::Arc<FromTables>,
+    ),
+}
+
+/// Work the sliding finish runs on a thread of its own while it builds the
+/// rest: phase 4's count of the sources BITWISE's job does not get from the
+/// tables ([`StreamSkip::bitwise_from_tables`]). BITWISE's job waits for it on
+/// a pool thread, so it must not need the pool: its collectors run on threads
+/// of their own ([`count_bitwise`] with `own_threads`) and none of them uses
+/// the pool.
+pub(super) type Side<'a> = Box<dyn FnOnce() + Send + 'a>;
+
+/// BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables
+/// ([`StreamSkip::bitwise_from_tables`]): each table's job adds its rows'
+/// lookups as it builds the table, and BITWISE's job, built after every one
+/// of them, takes the sum. A table that adds after BITWISE took it, or a sum
+/// short of a table, is refused.
+pub(super) struct FromTables {
+    counted: std::sync::Mutex<Option<(bitwise::BitwiseHistogram, usize)>>,
+    /// The tables that add to it: LT's, BRANCH's and BYTEWISE's built units.
+    tables: std::sync::atomic::AtomicUsize,
+}
+
+impl FromTables {
+    fn new() -> Self {
+        Self {
+            counted: std::sync::Mutex::new(Some((bitwise::BitwiseHistogram::new(), 0))),
+            tables: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Adds one table's lookups.
+    fn add(&self, plane: &bitwise::BitwisePlane) -> Result<(), Error> {
+        let mut counted = self.counted.lock().unwrap_or_else(|e| e.into_inner());
+        let (histogram, tables) = counted.as_mut().ok_or_else(|| {
+            Error::Prover("a table's BITWISE lookups came after BITWISE was built".into())
+        })?;
+        histogram.merge_plane(plane);
+        *tables += 1;
+        Ok(())
+    }
+
+    /// The sum, once every table has added to it.
+    fn take(&self) -> Result<bitwise::BitwiseHistogram, Error> {
+        let (histogram, added) = self
+            .counted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or_else(|| {
+                Error::Prover("BITWISE's lookups from the tables were taken twice".into())
+            })?;
+        let tables = self.tables.load(std::sync::atomic::Ordering::Relaxed);
+        if added != tables {
+            return Err(Error::Prover(format!(
+                "BITWISE was built from {added} of the {tables} tables that send it lookups"
+            )));
+        }
+        Ok(histogram)
+    }
 }
 
 impl<'a> FinishPlan<'a> {
@@ -1285,6 +1378,7 @@ impl<'a> FinishPlan<'a> {
                 num_blake3_ops,
                 cpu_heights,
                 bitwise_last: false,
+                bitwise_from_tables: false,
             },
             cut_line,
         })
@@ -1300,6 +1394,13 @@ impl<'a> FinishPlan<'a> {
     /// multiplicities beside the rest's builds and slides.
     pub(crate) fn hand_bitwise_last(&mut self) {
         self.header.bitwise_last = true;
+    }
+
+    /// BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables as each is
+    /// built ([`RestHeader::bitwise_from_tables`]): for a finish that hands
+    /// BITWISE on last and keeps only the streamed chunks' tails.
+    pub(crate) fn count_bitwise_from_tables(&mut self) {
+        self.header.bitwise_from_tables = true;
     }
 
     /// A `BLOCK CUT PADDING` line for the readout, when the build cuts a
@@ -1944,6 +2045,7 @@ impl<'a> FinishPlan<'a> {
             num_blake3_ops,
             cpu_heights: _,
             bitwise_last: _,
+            bitwise_from_tables: _,
         } = header;
         let traces = Traces {
             cpus,
@@ -2211,15 +2313,18 @@ impl<'a> FinishPlan<'a> {
     /// the units are the tables the header counted.
     #[cfg(test)]
     pub(super) fn units(self) -> Result<Vec<Unit<'a>>, Error> {
-        self.units_keeping(false).map(|(units, _)| units)
+        self.units_keeping(false).map(|(units, _, _)| units)
     }
 
     /// [`Self::units`], and with `keep` the lists KECCAK_RND's and LT's units
-    /// read, kept for phase B to build those tables again ([`RestRegen`]).
+    /// read, kept for phase B to build those tables again ([`RestRegen`]);
+    /// with [`StreamSkip::bitwise_from_tables`], the count of phase 4's other
+    /// sources to run beside the units ([`Side`]).
+    #[allow(clippy::type_complexity)]
     pub(super) fn units_keeping(
         self,
         keep: bool,
-    ) -> Result<(Vec<Unit<'a>>, Option<RestRegen>), Error> {
+    ) -> Result<(Vec<Unit<'a>>, Option<RestRegen>, Option<Side<'a>>), Error> {
         use std::sync::Arc;
         let Self {
             memory_state,
@@ -2280,6 +2385,11 @@ impl<'a> FinishPlan<'a> {
         let tails = skip.tails;
         let byte_checks = padding_byte_checks(shift_ops.len(), keccak_ops.len(), max_rows, &skip);
         let p4_mode = P4Mode::of(&skip);
+        // BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables as each
+        // is built, the other sources counted beside the rest's builds.
+        let from_tables = (header.bitwise_from_tables
+            && matches!(bitwise, BitwiseCount::Beside(_)))
+        .then(|| Arc::new(FromTables::new()));
         let mut units: Vec<Unit<'a>> = Vec::new();
         let mut regen = keep.then_some(RestRegen {
             keccak_ops: None,
@@ -2316,14 +2426,40 @@ impl<'a> FinishPlan<'a> {
         // BITWISE, DECODE, KECCAK_RC, REGISTER, HALT. Counted beside the rest's
         // builds, BITWISE's job counts its multiplicities first: the slide
         // starts the tables after it meanwhile.
-        let job = match bitwise {
-            BitwiseCount::Counted(histogram) => BitwiseJob::Counted(histogram),
-            BitwiseCount::Beside(pending) => BitwiseJob::Beside(pending, shared.clone()),
+        // With the tables counting their own lookups, the other sources are
+        // counted beside the rest's builds and sent to BITWISE's job, built
+        // after every table.
+        let (job, side) = match (bitwise, &from_tables) {
+            (BitwiseCount::Counted(histogram), _) => (BitwiseJob::Counted(histogram), None),
+            (BitwiseCount::Beside(pending), Some(tables)) => {
+                let (sent, side_count) = std::sync::mpsc::channel();
+                let shared = shared.clone();
+                let mode = P4Mode {
+                    from_tables: true,
+                    ..p4_mode
+                };
+                let side: Side<'a> = Box::new(move || {
+                    let histogram = pending.count(
+                        shared.lists(max_rows, num_padding_rows, byte_checks, mode),
+                        true,
+                    );
+                    build_stamps::mark("p4 bitwise beside");
+                    let _ = sent.send(histogram);
+                });
+                (
+                    BitwiseJob::FromTables(side_count, Arc::clone(tables)),
+                    Some(side),
+                )
+            }
+            (BitwiseCount::Beside(pending), None) => {
+                (BitwiseJob::Beside(pending, shared.clone()), None)
+            }
         };
         units.push(Unit::Build {
             family: family("BITWISE"),
             rows: bitwise::NUM_ROWS,
             job: Box::new(move || {
+                let from = matches!(job, BitwiseJob::FromTables(..));
                 let histogram = match job {
                     BitwiseJob::Counted(histogram) => histogram,
                     BitwiseJob::Beside(pending, shared) => {
@@ -2334,7 +2470,15 @@ impl<'a> FinishPlan<'a> {
                         build_stamps::mark("p4 bitwise beside");
                         histogram
                     }
+                    BitwiseJob::FromTables(side_count, tables) => {
+                        let mut histogram = side_count.recv().map_err(|_| {
+                            Error::Prover("phase 4's other sources were never counted".into())
+                        })?;
+                        histogram.merge(&tables.take()?);
+                        histogram
+                    }
                 };
+                note_bitwise(&histogram, from);
                 let mut table = bitwise::generate_bitwise_trace();
                 histogram.fill_multiplicities(&mut table);
                 Ok(packed_if(pack, table))
@@ -2510,7 +2654,14 @@ impl<'a> FinishPlan<'a> {
         )?);
         drop(cpu_ops);
         let lt = Arc::clone(&shared.lt);
-        units.extend(lt_units(&lt, max_rows.lt, &skip, pack, form)?);
+        units.extend(lt_units(
+            &lt,
+            max_rows.lt,
+            &skip,
+            pack,
+            form,
+            from_tables.clone(),
+        )?);
         if let Some(regen) = regen.as_mut() {
             regen.lt = Some(Arc::clone(&lt));
         }
@@ -2577,16 +2728,25 @@ impl<'a> FinishPlan<'a> {
                 packed_if(pack, dvrm::generate_dvrm_trace_as(ops, form))
             },
         )?);
-        units.extend(segmented_units(
-            family("BRANCH"),
-            Arc::clone(&shared.branch_ops),
-            max_rows.branch,
-            0,
-            false,
-            move |ops: &[BranchOperation]| {
-                packed_if(pack, branch::generate_branch_trace_as(ops, form))
-            },
-        )?);
+        {
+            let tables = from_tables.clone();
+            units.extend(segmented_units_try(
+                family("BRANCH"),
+                Arc::clone(&shared.branch_ops),
+                max_rows.branch,
+                0,
+                false,
+                move |ops: &[BranchOperation]| {
+                    let rows = dedup_rows(ops);
+                    if let Some(tables) = &tables {
+                        let mut plane = bitwise::BitwisePlane::new();
+                        count_branch_table_lookups(&rows, &mut plane);
+                        tables.add(&plane)?;
+                    }
+                    Ok(packed_if(pack, branch::branch_trace_of_rows(&rows, form)))
+                },
+            )?);
+        }
         // PAGE: one a config, from the memory state.
         let page_configs = Arc::new(header.page_configs.clone());
         units.extend((0..page_configs.len()).map(|k| {
@@ -2624,16 +2784,28 @@ impl<'a> FinishPlan<'a> {
             false,
             move |ops: &[eq::EqOperation]| packed_if(pack, eq::generate_eq_trace_as(ops, form)),
         )?);
-        units.extend(segmented_units(
-            family("BYTEWISE"),
-            Arc::clone(&shared.bytewise_ops),
-            max_rows.bytewise,
-            0,
-            false,
-            move |ops: &[bytewise::BytewiseOperation]| {
-                packed_if(pack, bytewise::generate_bytewise_trace_as(ops, form))
-            },
-        )?);
+        {
+            let tables = from_tables.clone();
+            units.extend(segmented_units_try(
+                family("BYTEWISE"),
+                Arc::clone(&shared.bytewise_ops),
+                max_rows.bytewise,
+                0,
+                false,
+                move |ops: &[bytewise::BytewiseOperation]| {
+                    let rows = dedup_rows(ops);
+                    if let Some(tables) = &tables {
+                        let mut plane = bitwise::BitwisePlane::new();
+                        count_bytewise_table_lookups(&rows, &mut plane);
+                        tables.add(&plane)?;
+                    }
+                    Ok(packed_if(
+                        pack,
+                        bytewise::bytewise_trace_of_rows(&rows, form),
+                    ))
+                },
+            )?);
+        }
         units.extend(segmented_units(
             family("STORE"),
             Arc::clone(&shared.store_ops),
@@ -2657,7 +2829,19 @@ impl<'a> FinishPlan<'a> {
 
         // The units are the tables the header counted, or the build is refused.
         check_units(&units, &header.table_counts)?;
-        Ok((units, regen))
+        if let Some(tables) = &from_tables {
+            let adding = [family("LT"), family("BRANCH"), family("BYTEWISE")];
+            let built = units
+                .iter()
+                .filter(
+                    |unit| matches!(unit, Unit::Build { family, .. } if adding.contains(family)),
+                )
+                .count();
+            tables
+                .tables
+                .store(built, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok((units, regen, side))
     }
 }
 
@@ -2669,6 +2853,7 @@ fn lt_units<'a>(
     skip: &StreamSkip,
     pack: bool,
     form: TraceForm,
+    from_tables: Option<std::sync::Arc<FromTables>>,
 ) -> Result<Vec<Unit<'a>>, Error> {
     chunked_units(
         family("LT"),
@@ -2679,11 +2864,15 @@ fn lt_units<'a>(
         true,
         |start, end| {
             let lt = std::sync::Arc::clone(lt);
+            let from_tables = from_tables.clone();
             Box::new(move || {
-                Ok(packed_if(
-                    pack,
-                    lt::generate_lt_trace_as(&lt.segments().range(start, end), form),
-                ))
+                let rows = dedup_rows(&lt.segments().range(start, end));
+                if let Some(tables) = &from_tables {
+                    let mut plane = bitwise::BitwisePlane::new();
+                    count_lt_table_lookups(&rows, &mut plane);
+                    tables.add(&plane)?;
+                }
+                Ok(packed_if(pack, lt::lt_trace_of_rows(&rows, form)))
             })
         },
     )
@@ -2756,7 +2945,7 @@ impl RestRegen {
                     .lt
                     .take()
                     .ok_or_else(|| Error::Prover("LT's lists were taken already".into()))?;
-                lt_units(&lt, self.lt_rows, &self.skip, self.pack, self.form)?
+                lt_units(&lt, self.lt_rows, &self.skip, self.pack, self.form, None)?
             }
         };
         Ok(units
@@ -2826,12 +3015,26 @@ fn segmented_units<'a, T: Clone + Send + Sync + 'a, S: SegmentList<T> + 'a>(
     tails: bool,
     generate: impl Fn(&[T]) -> Table + Send + Sync + 'a,
 ) -> Result<Vec<Unit<'a>>, Error> {
+    segmented_units_try(family, ops, max, skip, tails, move |ops: &[T]| {
+        Ok(generate(ops))
+    })
+}
+
+/// [`segmented_units`] whose tables' jobs can fail.
+fn segmented_units_try<'a, T: Clone + Send + Sync + 'a, S: SegmentList<T> + 'a>(
+    family: usize,
+    ops: std::sync::Arc<S>,
+    max: usize,
+    skip: usize,
+    tails: bool,
+    generate: impl Fn(&[T]) -> Result<Table, Error> + Send + Sync + 'a,
+) -> Result<Vec<Unit<'a>>, Error> {
     let len = ops.list_len();
     let generate = std::sync::Arc::new(generate);
     chunked_units(family, len, max, skip, tails, true, |start, end| {
         let ops = std::sync::Arc::clone(&ops);
         let generate = std::sync::Arc::clone(&generate);
-        Box::new(move || Ok(generate(&ops.list_segments().range(start, end))))
+        Box::new(move || generate(&ops.list_segments().range(start, end)))
     })
 }
 
@@ -2994,7 +3197,7 @@ impl<'a> FinishPlan<'a> {
         gate: &gate::ByteGate,
         send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        emit_streamed_units(self.units(), gate, send, false, None)
+        emit_streamed_units(self.units(), gate, send, false, None, None)
     }
 
     /// [`Self::emit_streamed`], and with `keep` what phase B needs to build
@@ -3010,11 +3213,11 @@ impl<'a> FinishPlan<'a> {
     ) -> Result<Option<RestRegen>, Error> {
         // BITWISE is the rest's first table: its position is 0.
         let last = (slide && self.header.bitwise_last).then_some(0);
-        let (units, regen) = match self.units_keeping(keep) {
-            Ok((units, regen)) => (Ok(units), regen),
-            Err(e) => (Err(e), None),
+        let (units, regen, side) = match self.units_keeping(keep) {
+            Ok((units, regen, side)) => (Ok(units), regen, side),
+            Err(e) => (Err(e), None, None),
         };
-        emit_streamed_units(units, gate, send, slide, last)?;
+        emit_streamed_units(units, gate, send, slide, last, side)?;
         Ok(regen)
     }
 }
@@ -3022,24 +3225,32 @@ impl<'a> FinishPlan<'a> {
 /// [`FinishPlan::emit_streamed`] over `units`, in waves or sliding (`slide`;
 /// a build without the `parallel` feature builds one table at a time either
 /// way, so it always takes the waves), sliding with `last` handed on after
-/// every other table: an error stops the gate, so it reaches every waiter, and
-/// is returned.
-fn emit_streamed_units(
-    units: Result<Vec<Unit<'_>>, Error>,
+/// every other table and `side` run beside the builds ([`Side`]; `last` then
+/// starts only once it is due): an error stops the gate, so it reaches every
+/// waiter, and is returned.
+fn emit_streamed_units<'a>(
+    units: Result<Vec<Unit<'a>>, Error>,
     gate: &gate::ByteGate,
     send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
     slide: bool,
     last: Option<usize>,
+    side: Option<Side<'a>>,
 ) -> Result<(), Error> {
     #[cfg(feature = "parallel")]
     let result = if slide {
-        emit_units_sliding(units, gate, send, last)
+        emit_units_sliding(units, gate, send, last, side)
     } else {
+        if let Some(side) = side {
+            side();
+        }
         emit_units(units, gate, send)
     };
     #[cfg(not(feature = "parallel"))]
     let result = {
         let _ = (slide, last);
+        if let Some(side) = side {
+            side();
+        }
         emit_units(units, gate, send)
     };
     if let Err(e) = &result {
@@ -3192,15 +3403,40 @@ struct FamilyBuild {
 /// packer without building more of them at once. With `last`, that table is
 /// handed on after every other ([`hand_on_order`]) and numbered at the gate in
 /// that order; it still starts first when the gate admits it, and otherwise
-/// starts once it is due, without holding back the tables after it.
+/// starts once it is due, without holding back the tables after it. With
+/// `side` (run on a thread of its own while the tables build), `last` starts
+/// only once it is due: every other table is built by then.
 #[cfg(feature = "parallel")]
-fn emit_units_sliding(
-    units: Result<Vec<Unit<'_>>, Error>,
+fn emit_units_sliding<'a>(
+    units: Result<Vec<Unit<'a>>, Error>,
     gate: &gate::ByteGate,
     send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
     last: Option<usize>,
+    side: Option<Side<'a>>,
 ) -> Result<(), Error> {
     let units = units?;
+    let last_waits = side.is_some();
+    std::thread::scope(|threads| {
+        if let Some(side) = side {
+            // A side that panics drops what it would have sent: its reader
+            // fails instead of waiting.
+            threads.spawn(move || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(side));
+            });
+        }
+        slide_units(units, gate, send, last, last_waits)
+    })
+}
+
+/// [`emit_units_sliding`]'s loop.
+#[cfg(feature = "parallel")]
+fn slide_units(
+    units: Vec<Unit<'_>>,
+    gate: &gate::ByteGate,
+    send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
+    last: Option<usize>,
+    last_waits: bool,
+) -> Result<(), Error> {
     let total = units.len();
     let mut estimates = Estimates::new();
     // Built, not yet handed on, by AIR position (`Some(None)`: a streamed
@@ -3251,6 +3487,11 @@ fn emit_units_sliding(
                 units.push_front(unit);
             }
             while let Some((position, unit)) = units.front() {
+                // Started only once it is due ([`Side`]).
+                if last_waits && Some(*position) == last && order.get(sent) != Some(position) {
+                    aside = units.pop_front();
+                    continue;
+                }
                 let mut est_now = 0usize;
                 if let Unit::Build { family, rows, .. } = unit {
                     let est = estimates.of(*family, *rows);

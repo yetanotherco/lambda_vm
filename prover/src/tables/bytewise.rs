@@ -74,6 +74,16 @@ impl BytewiseOperation {
     /// The 8 `BYTE_ALU` lookups this op sends, for the BITWISE table's
     /// multiplicity bookkeeping (one per byte, keyed by opsel).
     pub fn collect_bitwise_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
+        let mut ops = Vec::with_capacity(8);
+        self.for_each_bitwise_op(|op| ops.push(op));
+        ops
+    }
+
+    /// [`Self::collect_bitwise_ops`]' lookups, one by one.
+    pub(crate) fn for_each_bitwise_op(
+        &self,
+        mut emit: impl FnMut(super::bitwise::BitwiseOperation),
+    ) {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
         let kind = match self.op {
             alu_op::AND => BitwiseOperationType::ByteAluAnd,
@@ -81,13 +91,11 @@ impl BytewiseOperation {
             alu_op::XOR => BitwiseOperationType::ByteAluXor,
             other => panic!("BYTEWISE only handles AND/OR/XOR, got opcode {other}"),
         };
-        (0..8)
-            .map(|i| {
-                let a = ((self.a >> (i * 8)) & 0xFF) as u8;
-                let b = ((self.b >> (i * 8)) & 0xFF) as u8;
-                BitwiseOperation::byte_op(kind, a, b)
-            })
-            .collect()
+        for i in 0..8 {
+            let a = ((self.a >> (i * 8)) & 0xFF) as u8;
+            let b = ((self.b >> (i * 8)) & 0xFF) as u8;
+            emit(BitwiseOperation::byte_op(kind, a, b));
+        }
     }
 }
 
@@ -111,7 +119,15 @@ pub fn generate_bytewise_trace_as(
     operations: &[BytewiseOperation],
     form: TraceForm,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let unique_ops = dedup_rows(operations);
+    bytewise_trace_of_rows(&dedup_rows(operations), form)
+}
+
+/// The BYTEWISE trace of `unique_ops`, the rows [`generate_bytewise_trace_as`]
+/// deduplicates its operations into, in `form`.
+pub(crate) fn bytewise_trace_of_rows(
+    unique_ops: &[(BytewiseOperation, u64)],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
         for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {

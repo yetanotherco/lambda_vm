@@ -2939,6 +2939,47 @@ fn bitwise_handed_on_last_moves_the_partition_and_verifies() {
     assert_ne!(last.groups, air.groups, "the partition did not move");
 }
 
+/// ★ BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables
+/// ([`Deviations::bitwise_from_tables`], as
+/// `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES=1`), counted from each table's rows as
+/// it is built, commit what BITWISE handed on last commits with phase 4's count
+/// from the ops: the same partition and the same group roots, and the proof
+/// verifies. The finish keeps only the streamed chunks' tails, as the block
+/// does.
+#[test]
+fn bitwise_from_tables_commits_bitwise_lasts_tables_and_verifies() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.layout_workers = 3;
+    o.drop_streamed_ops = true;
+    assert!(o.rest_streams(), "the rest streams");
+    let proved = |what: &str, deviations: Deviations| {
+        let proof = prove_with(&elf, &format, &o, &deviations);
+        assert!(verify(&proof, &elf, &format), "{what}");
+        proof
+    };
+    let from_ops = proved(
+        "from the ops",
+        Deviations {
+            rest_bitwise_last: true,
+            ..Deviations::default()
+        },
+    );
+    let from_tables = proved(
+        "from the tables",
+        Deviations {
+            bitwise_from_tables: true,
+            ..Deviations::default()
+        },
+    );
+    assert_eq!(from_tables.groups, from_ops.groups, "the partition");
+    assert_eq!(
+        from_tables.proof.roots, from_ops.proof.roots,
+        "the committed tables"
+    );
+}
+
 /// The bounded layout (D-EXEC E3): with three workers and `layout_ahead =
 /// Some(k)`, at most `k + 1` streamed chunks are laid out (or in the making)
 /// and not yet packed at once, and the groups are the inline layout's.

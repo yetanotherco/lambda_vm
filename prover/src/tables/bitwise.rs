@@ -887,6 +887,36 @@ impl BitwiseHistogram {
         }
     }
 
+    /// Add `plane`'s counts ([`BitwisePlane`]).
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn merge_plane(&mut self, plane: &BitwisePlane) {
+        for type_idx in 0..NUM_LOOKUP_TYPES {
+            let at = type_idx * PLANE_ROWS;
+            for (cell, &count) in plane.counters[at..at + PLANE_ROWS].iter().enumerate() {
+                if count != 0 {
+                    self.counters[type_idx * NUM_ROWS + cell] += count;
+                }
+            }
+        }
+        for &(op, n) in &plane.off_plane {
+            self.bump_n(op, n);
+        }
+    }
+
+    /// A digest of every count with its cell: equal digests, equal
+    /// multiplicities (a fold, for a log line that compares two builds).
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn digest(&self) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for (cell, &count) in self.counters.iter().enumerate() {
+            if count != 0 {
+                h = (h ^ (cell as u64)).wrapping_mul(0x0100_0000_01b3);
+                h = (h ^ count).wrapping_mul(0x0100_0000_01b3).rotate_left(29);
+            }
+        }
+        h
+    }
+
     /// Write the accumulated multiplicities into the BITWISE trace's MU columns.
     ///
     /// OVERWRITES each nonzero cell with its count (it does not add to what is
@@ -909,6 +939,42 @@ impl BitwiseHistogram {
                     trace.main_table.set_fe(row, mu_col, FE::from(count));
                 }
             }
+        }
+    }
+}
+
+/// Cells of one lookup type with `z = 0`: every `(x, y)`.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+const PLANE_ROWS: usize = 256 * 256;
+
+/// A table's share of the BITWISE multiplicities, counted as the table is
+/// built and added to the histogram after ([`BitwiseHistogram::merge_plane`]):
+/// the lookups with `z = 0` of every type in a dense array (5 MiB, against the
+/// histogram's 80), any other kept aside, so none is lost.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) struct BitwisePlane {
+    counters: Box<[u64]>,
+    off_plane: Vec<(BitwiseOperation, u64)>,
+}
+
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+impl BitwisePlane {
+    #[allow(clippy::new_without_default)]
+    pub(crate) fn new() -> Self {
+        Self {
+            counters: vec![0u64; PLANE_ROWS * NUM_LOOKUP_TYPES].into_boxed_slice(),
+            off_plane: Vec::new(),
+        }
+    }
+
+    /// Adds `n` occurrences of one lookup.
+    #[inline]
+    pub(crate) fn bump_n(&mut self, op: BitwiseOperation, n: u64) {
+        if op.z == 0 {
+            let idx = lookup_type_index(op.lookup_type) * PLANE_ROWS + row_index(op.x, op.y, 0);
+            self.counters[idx] += n;
+        } else {
+            self.off_plane.push((op, n));
         }
     }
 }

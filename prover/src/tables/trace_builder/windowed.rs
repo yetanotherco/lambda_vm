@@ -822,6 +822,16 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// [`Self::rest_bitwise_last`], BITWISE's lookups from LT's, BRANCH's and
+    /// BYTEWISE's tables counted from each table's rows as it is built
+    /// ([`StreamSkip::bitwise_from_tables`]) when the finish slides and keeps
+    /// only the tails. The tables are those of [`Self::rest_bitwise_last`].
+    pub fn bitwise_from_tables(self) -> Self {
+        let mut b = self.rest_bitwise_last();
+        b.emitted.bitwise_from_tables = true;
+        b
+    }
+
     /// Drop each streamed chunk's ops once the chunk is handed out, instead of
     /// keeping every walked window to the run's end (see the module docs): the
     /// builder then holds less than a chunk of each streamed table's ops, plus
@@ -1026,6 +1036,12 @@ impl<'a> WindowedTraceBuilder<'a> {
         // order.
         if skip.bitwise_last && slide && cfg!(feature = "parallel") {
             plan.hand_bitwise_last();
+            // BITWISE's lookups from the tables need only the streamed chunks'
+            // tails kept: their full chunks were counted as they were handed
+            // out.
+            if skip.bitwise_from_tables && skip.tails {
+                plan.count_bitwise_from_tables();
+            }
         }
         let mut send = match on_header(plan.header().clone()) {
             Ok(send) => send,

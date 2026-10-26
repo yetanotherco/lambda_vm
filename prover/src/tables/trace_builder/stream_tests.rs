@@ -616,6 +616,7 @@ fn a_jobs_error_reaches_every_waiter() {
                 },
                 slide,
                 None,
+                None,
             );
             (result, waiter.join().expect("the waiter"))
         });
@@ -643,8 +644,14 @@ fn a_stopped_packer_stops_the_emitter() {
                     gate.stop("the packer stopped");
                 })
             };
-            let result =
-                emit_streamed_units(Ok(units(3, None)), &gate, &mut |_| Ok(()), slide, None);
+            let result = emit_streamed_units(
+                Ok(units(3, None)),
+                &gate,
+                &mut |_| Ok(()),
+                slide,
+                None,
+                None,
+            );
             stopper.join().expect("the stopper");
             result
         });
@@ -661,6 +668,7 @@ fn a_stopped_packer_stops_the_emitter() {
             &gate,
             &mut |_| Err(Error::Prover("the layout thread stopped".into())),
             slide,
+            None,
             None,
         )
         .expect_err("the sink refused");
@@ -865,6 +873,140 @@ fn with_bitwise_last_the_sliding_stream_hands_bitwise_on_last() {
     }
 }
 
+/// ★ With BITWISE's lookups from LT's, BRANCH's and BYTEWISE's tables
+/// ([`WindowedTraceBuilder::bitwise_from_tables`]), the stream hands on the
+/// monolithic finish's tables word for word (BITWISE's multiplicities counted
+/// from the ops there), each at its AIR position, BITWISE last, under a
+/// header that says so wherever the finish slides and keeps only the tails:
+/// every configuration (with and without the tails), windows of 7 and 1000
+/// cycles, budgets of one byte, 2 GiB and none, and one table building at
+/// once. In waves the order stays AIR order and phase 4 counts as before.
+#[test]
+fn with_bitwise_from_tables_the_stream_is_the_monolithic_finish() {
+    let max_rows = MaxRowsConfig::small();
+    let mut counted_from_tables = 0usize;
+    for name in [
+        "all_instructions_64",
+        "test_keccak_multi",
+        "test_ecsm_multi",
+        "test_blake3_absorb",
+    ] {
+        let (program, logs) = run(name);
+        for window in [7, 1000] {
+            for (config, configure) in &configs() {
+                let (builder, last) =
+                    pushed(&program, &logs, &max_rows, window, configure.as_ref());
+                // Every configuration but the plain one drops the streamed
+                // chunks' ops, keeping only the tails.
+                let tails = *config != "plain";
+                let want = air_order(&builder.finish(last).expect("the monolithic finish"))
+                    .into_iter()
+                    .map(|t| t.map(shape_and_words))
+                    .collect::<Vec<_>>();
+                for (slide, budget, build) in [
+                    (true, 1usize, None),
+                    (true, 2 << 30, None),
+                    (true, usize::MAX, None),
+                    (true, usize::MAX, Some(1)),
+                    (false, usize::MAX, None),
+                ] {
+                    let what = format!(
+                        "{name} window {window} {config} slide {slide} budget {budget} build \
+                         {build:?}"
+                    );
+                    let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                        let b = configure(b).bitwise_from_tables();
+                        if slide { b.slide_rest() } else { b }
+                    });
+                    let (header, got, _) = streamed_capped(builder, last, budget, build);
+                    let reordered = slide && cfg!(feature = "parallel");
+                    assert_eq!(header.bitwise_last, reordered, "{what}: BITWISE last");
+                    assert_eq!(
+                        header.bitwise_from_tables,
+                        reordered && tails,
+                        "{what}: counted from the tables"
+                    );
+                    counted_from_tables += usize::from(header.bitwise_from_tables);
+                    let positions: Vec<usize> = got.iter().map(|e| e.position).collect();
+                    assert_eq!(
+                        positions,
+                        hand_on_order(want.len(), reordered.then_some(0)),
+                        "{what}: the hand-on order"
+                    );
+                    for e in &got {
+                        assert!(
+                            e.table.as_ref().map(shape_and_words) == want[e.position],
+                            "{what}: table {}",
+                            e.position
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        counted_from_tables > 0 || !cfg!(feature = "parallel"),
+        "no stream counted from the tables"
+    );
+}
+
+/// With BITWISE's lookups from the tables, phase B's LT jobs (from the lists
+/// kept for it) build the finish's LT tables again word for word without
+/// adding to a count BITWISE has taken: a job that did would fail.
+#[test]
+fn with_bitwise_from_tables_phase_bs_lt_jobs_build_the_tables_again() {
+    use super::RegenFamily;
+    let max_rows = MaxRowsConfig::small();
+    let mut rebuilt = 0usize;
+    for name in ["all_instructions_64", "test_keccak_multi"] {
+        let (program, logs) = run(name);
+        for window in [7, 1000] {
+            let configure: Configure = Box::new(|b| {
+                b.drop_streamed_ops()
+                    .expect("before any window")
+                    .bitwise_from_tables()
+                    .slide_rest()
+            });
+            let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                b.drop_streamed_ops().expect("before any window")
+            });
+            let lt = regen_ranges(&builder.finish(last).expect("the monolithic finish"))[1].clone();
+            let (builder, last) = pushed(&program, &logs, &max_rows, window, configure.as_ref());
+            let (got, regen) = streamed_keeping(builder, last, true);
+            let jobs = regen
+                .expect("the lists kept")
+                .take(RegenFamily::Lt)
+                .expect("LT's jobs");
+            assert_eq!(jobs.len(), lt.len(), "{name} window {window}: LT's tables");
+            for (j, job) in jobs.into_iter().enumerate() {
+                let at = lt.start + j;
+                let table = got
+                    .iter()
+                    .find(|e| e.position == at)
+                    .and_then(|e| e.table.as_ref());
+                match (job, table) {
+                    (None, None) => {}
+                    (Some(job), Some(table)) => {
+                        let again = job().expect("phase B's job builds the table again");
+                        assert_eq!(
+                            shape_and_words(&again),
+                            shape_and_words(table),
+                            "{name} window {window}: LT[{j}]"
+                        );
+                        rebuilt += 1;
+                    }
+                    (job, table) => panic!(
+                        "{name} window {window}: LT[{j}] a job {} against a table {}",
+                        job.is_some(),
+                        table.is_some()
+                    ),
+                }
+            }
+        }
+    }
+    assert!(rebuilt > 0, "no LT table built again");
+}
+
 /// Synthetic units that sleep: unit `slow` takes `long` ms, the others `short`;
 /// each notes when it starts building.
 #[cfg(feature = "parallel")]
@@ -950,6 +1092,7 @@ fn the_build_cap_bounds_the_tables_building_at_once() {
             },
             true,
             None,
+            None,
         )
         .expect("the stream");
         assert_eq!(
@@ -998,6 +1141,7 @@ fn a_slow_table_holds_back_only_the_hand_on() {
                 Ok(())
             },
             slide,
+            None,
             None,
         )
         .expect("the stream");
@@ -1058,6 +1202,7 @@ fn a_table_handed_on_last_does_not_hold_back_the_rest() {
             },
             true,
             last,
+            None,
         )
         .expect("the stream");
         assert_eq!(order, hand_on_order(n, last), "last {last:?}: the order");
@@ -1116,6 +1261,7 @@ fn a_table_handed_on_last_streams_under_a_one_byte_budget() {
             },
             true,
             Some(0),
+            None,
         );
         result.map(|()| (order, most.into_inner()))
     });
@@ -1139,7 +1285,7 @@ fn a_panicking_job_ends_the_sliding_stream() {
             rows: 1,
             job: Box::new(|| panic!("a generator bug")),
         };
-        emit_streamed_units(Ok(units), &gate, &mut |_| Ok(()), true, None)
+        emit_streamed_units(Ok(units), &gate, &mut |_| Ok(()), true, None, None)
     });
     let err = done
         .expect("a panicking job must not hang the stream")
