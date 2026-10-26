@@ -1349,14 +1349,14 @@ impl CardFill {
         rows: RowFamilies::ALL,
     };
 
-    /// Unset or empty: KECCAK_RND in a build with the card's kernels (the
-    /// `cuda` feature), nothing in one without, where every fill from records
-    /// would be the host's. The streamed families only ever by an explicit
-    /// word.
+    /// Unset or empty: KECCAK_RND, CPU and MEMW_R in a build with the card's
+    /// kernels (the `cuda` feature), nothing in one without, where every fill
+    /// from records would be the host's. The row families only ever by an
+    /// explicit word.
     const DEFAULT: Self = Self {
         keccak_rnd: cfg!(feature = "cuda"),
-        cpu: false,
-        memw_r: false,
+        cpu: cfg!(feature = "cuda"),
+        memw_r: cfg!(feature = "cuda"),
         rows: RowFamilies::NONE,
     };
 
@@ -1400,8 +1400,9 @@ impl CardFill {
 /// card fill those families' tables from
 /// the records their rows come from as their groups upload them ([`CardFill`]);
 /// `on` is every family, `off` none (the host builds every table). Unset or
-/// empty is [`CardFill::DEFAULT`]: KECCAK_RND in a build with the card's
-/// kernels, nothing without. Where the card declines the room, a host reader
+/// empty is [`CardFill::DEFAULT`]: KECCAK_RND, CPU and MEMW_R in a build with
+/// the card's kernels, nothing without; `keccak_rnd` alone is KECCAK_RND's
+/// fill only, the rollback. Where the card declines the room, a host reader
 /// fills them on the host. The tables' words, and so the proof's bytes, are
 /// the same. Anything else refuses the prove.
 pub(crate) fn block_card_fill() -> Result<CardFill, Error> {
@@ -8183,9 +8184,9 @@ mod walkers_knob_tests {
     /// `LAMBDA_VM_BLOCK_CARD_FILL`: a comma list of `keccak_rnd`, `cpu`,
     /// `memw_r` and the row families has the card fill those families, `on`
     /// every one, `off` none;
-    /// unset or empty is KECCAK_RND with the card's kernels and nothing
-    /// without; any other word, a family twice or an empty item refuses the
-    /// prove.
+    /// unset or empty is KECCAK_RND, CPU and MEMW_R with the card's kernels
+    /// and nothing without; any other word, a family twice or an empty item
+    /// refuses the prove.
     #[test]
     fn the_card_fill_knob_takes_off_on_and_families_and_refuses_anything_else() {
         let fill = |keccak_rnd, cpu, memw_r| CardFill {
@@ -8206,7 +8207,8 @@ mod walkers_knob_tests {
             memw,
             shift,
         };
-        let default = fill(cfg!(feature = "cuda"), false, false);
+        let card = cfg!(feature = "cuda");
+        let default = fill(card, card, card);
         for (value, want) in [
             (None, default),
             (Some(""), default),
@@ -8235,13 +8237,23 @@ mod walkers_knob_tests {
             assert_eq!(parse_card_fill(value).ok(), Some(want), "{value:?}");
         }
         assert_eq!(fill(false, false, false).name(), "off");
-        // ★ The default never holds a CPU or MEMW_R chunk as records, with a
-        // card or without: those reach it only by their own decision.
-        assert_eq!(
-            CardFill::DEFAULT,
-            fill(cfg!(feature = "cuda"), false, false),
-            "unset: KECCAK_RND alone with a card, nothing without"
-        );
+        // ★ Unset is exactly the gated configuration's words with a card
+        // (KECCAK_RND, CPU and MEMW_R; no row family), nothing without; the
+        // word `keccak_rnd` alone is the rollback, KECCAK_RND's fill only.
+        let gated = parse_card_fill(Some("keccak_rnd,cpu,memw_r")).ok();
+        let rollback = parse_card_fill(Some("keccak_rnd")).ok();
+        if card {
+            assert_eq!(Some(CardFill::DEFAULT), gated, "unset with a card");
+            assert_eq!(CardFill::DEFAULT.name(), "keccak_rnd,cpu,memw_r");
+        } else {
+            assert_eq!(
+                CardFill::DEFAULT,
+                fill(false, false, false),
+                "unset without a card"
+            );
+        }
+        assert_eq!(rollback, Some(fill(true, false, false)), "the rollback");
+        assert!(!CardFill::DEFAULT.rows.any(), "no row family by default");
         assert_eq!(fill(true, false, true).name(), "keccak_rnd,memw_r");
         assert_eq!(fill(true, true, true).name(), "keccak_rnd,cpu,memw_r");
         assert_eq!(
