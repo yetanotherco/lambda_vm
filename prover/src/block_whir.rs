@@ -1290,19 +1290,19 @@ fn set_up_card() {
     }
 }
 
-/// `LAMBDA_VM_BLOCK_P4_LOOKUPS`: `direct` has the finish's phase 4 count
-/// LT's per-op lookups and KECCAK's straight into its histograms; unset,
-/// empty or `lists` (the default) builds each slice's list of them first, as
-/// before. Anything else refuses the prove. The multiplicities and the tables
-/// are the same.
+/// `LAMBDA_VM_BLOCK_P4_LOOKUPS`: unset, empty or `direct` (the default) has
+/// the finish's phase 4 count LT's per-op lookups and KECCAK's straight into
+/// its histograms; `lists` builds each slice's list of them first, as before
+/// (the rollback). Anything else refuses the prove. The multiplicities and the
+/// tables are the same.
 fn block_p4_direct() -> Result<bool, Error> {
     parse_p4_lookups(std::env::var("LAMBDA_VM_BLOCK_P4_LOOKUPS").ok().as_deref())
 }
 
 fn parse_p4_lookups(value: Option<&str>) -> Result<bool, Error> {
     match value.map(str::trim) {
-        None | Some("" | "lists") => Ok(false),
-        Some("direct") => Ok(true),
+        None | Some("" | "direct") => Ok(true),
+        Some("lists") => Ok(false),
         Some(v) => Err(Error::Prover(format!(
             "LAMBDA_VM_BLOCK_P4_LOOKUPS={v}: direct (counted straight into the histograms) or lists"
         ))),
@@ -8474,14 +8474,14 @@ mod p4_rows_knob_tests {
         }
     }
 
-    /// `LAMBDA_VM_BLOCK_P4_LOOKUPS`: unset, empty or `lists` builds each
-    /// slice's lists (the default); `direct` counts straight into the
-    /// histograms; anything else refuses.
+    /// `LAMBDA_VM_BLOCK_P4_LOOKUPS`: unset, empty or `direct` counts straight
+    /// into the histograms (the default); `lists` builds each slice's lists
+    /// (the rollback); anything else refuses.
     #[test]
-    fn the_p4_lookups_knob_defaults_to_lists_and_takes_direct() {
+    fn the_p4_lookups_knob_defaults_to_direct_and_takes_lists() {
         for (value, direct) in [
-            (None, false),
-            (Some(""), false),
+            (None, true),
+            (Some(""), true),
             (Some(" lists "), false),
             (Some("direct"), true),
             (Some(" direct\n"), true),

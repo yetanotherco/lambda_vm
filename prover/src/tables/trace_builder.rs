@@ -5793,8 +5793,8 @@ pub struct StreamSkip {
     /// Phase 4 counts LT's per-op lookups and KECCAK's straight into its
     /// histograms ([`count_bitwise_from_lt_ops`], [`count_bitwise_from_keccak`]),
     /// instead of building each slice's list of them first
-    /// (`LAMBDA_VM_BLOCK_P4_LOOKUPS=direct` on the block). The multiplicities
-    /// are the same.
+    /// (`LAMBDA_VM_BLOCK_P4_LOOKUPS` unset or `direct` on the block). The
+    /// multiplicities are the same.
     pub p4_direct: bool,
     /// How the tables cut at `keccak_rnd_rows`, `keccak_rows`, `ecsm_rows`,
     /// `ecdas_rows` and `copy_rows` are padded ([`CutPadding`]): the table
