@@ -20,7 +20,7 @@ use executor::vm::logs::Log;
 
 use super::super::gate::ByteGate;
 use super::super::*;
-use super::{Emitted, FAMILIES, Job, Unit, emit_streamed_units};
+use super::{Emitted, FAMILIES, Job, Unit, emit_streamed_units, hand_on_order};
 use crate::tables::MaxRowsConfig;
 use crate::test_utils::asm_elf_bytes;
 
@@ -615,6 +615,7 @@ fn a_jobs_error_reaches_every_waiter() {
                     Ok(())
                 },
                 slide,
+                None,
             );
             (result, waiter.join().expect("the waiter"))
         });
@@ -642,7 +643,8 @@ fn a_stopped_packer_stops_the_emitter() {
                     gate.stop("the packer stopped");
                 })
             };
-            let result = emit_streamed_units(Ok(units(3, None)), &gate, &mut |_| Ok(()), slide);
+            let result =
+                emit_streamed_units(Ok(units(3, None)), &gate, &mut |_| Ok(()), slide, None);
             stopper.join().expect("the stopper");
             result
         });
@@ -659,6 +661,7 @@ fn a_stopped_packer_stops_the_emitter() {
             &gate,
             &mut |_| Err(Error::Prover("the layout thread stopped".into())),
             slide,
+            None,
         )
         .expect_err("the sink refused");
         assert!(
@@ -801,6 +804,67 @@ fn the_sliding_stream_is_the_monolithic_finish_in_air_order() {
     }
 }
 
+/// ★ With BITWISE handed on last ([`WindowedTraceBuilder::rest_bitwise_last`])
+/// and the slide, the stream hands on the monolithic finish's tables word for
+/// word, each at its AIR position, in AIR order but BITWISE (position 0),
+/// which comes after every other, under a header that says so: every
+/// configuration, windows of 7 and 1000 cycles, budgets of one byte, 2 GiB and
+/// none, and one table building at once. In waves the order stays AIR order.
+#[test]
+fn with_bitwise_last_the_sliding_stream_hands_bitwise_on_last() {
+    let max_rows = MaxRowsConfig::small();
+    for name in [
+        "all_instructions_64",
+        "test_keccak_multi",
+        "test_ecsm_multi",
+        "test_blake3_absorb",
+    ] {
+        let (program, logs) = run(name);
+        for window in [7, 1000] {
+            for (config, configure) in &configs() {
+                let (builder, last) =
+                    pushed(&program, &logs, &max_rows, window, configure.as_ref());
+                let want = air_order(&builder.finish(last).expect("the monolithic finish"))
+                    .into_iter()
+                    .map(|t| t.map(shape_and_words))
+                    .collect::<Vec<_>>();
+                for (slide, budget, build) in [
+                    (true, 1usize, None),
+                    (true, 2 << 30, None),
+                    (true, usize::MAX, None),
+                    (true, usize::MAX, Some(1)),
+                    (false, usize::MAX, None),
+                ] {
+                    let what = format!(
+                        "{name} window {window} {config} slide {slide} budget {budget} build \
+                         {build:?}"
+                    );
+                    let (builder, last) = pushed(&program, &logs, &max_rows, window, &|b| {
+                        let b = configure(b).rest_bitwise_last();
+                        if slide { b.slide_rest() } else { b }
+                    });
+                    let (header, got, _) = streamed_capped(builder, last, budget, build);
+                    let reordered = slide && cfg!(feature = "parallel");
+                    assert_eq!(header.bitwise_last, reordered, "{what}: the header");
+                    let positions: Vec<usize> = got.iter().map(|e| e.position).collect();
+                    assert_eq!(
+                        positions,
+                        hand_on_order(want.len(), reordered.then_some(0)),
+                        "{what}: the hand-on order"
+                    );
+                    for e in &got {
+                        assert!(
+                            e.table.as_ref().map(shape_and_words) == want[e.position],
+                            "{what}: table {}",
+                            e.position
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Synthetic units that sleep: unit `slow` takes `long` ms, the others `short`;
 /// each notes when it starts building.
 #[cfg(feature = "parallel")]
@@ -885,6 +949,7 @@ fn the_build_cap_bounds_the_tables_building_at_once() {
                 Ok(())
             },
             true,
+            None,
         )
         .expect("the stream");
         assert_eq!(
@@ -933,6 +998,7 @@ fn a_slow_table_holds_back_only_the_hand_on() {
                 Ok(())
             },
             slide,
+            None,
         )
         .expect("the stream");
         assert_eq!(
@@ -966,6 +1032,100 @@ fn a_slow_table_holds_back_only_the_hand_on() {
     }
 }
 
+/// ★ Handed on last (`last`: BITWISE's position, 0), a slow first table still
+/// starts first, before any table is handed on, the tables after it are handed
+/// on while it builds, and it is handed on after them; without `last` it holds
+/// back every hand-on.
+#[test]
+#[cfg(feature = "parallel")]
+fn a_table_handed_on_last_does_not_hold_back_the_rest() {
+    let n = rayon::current_num_threads().min(6);
+    assert!(n >= 2, "a pool of at least two threads");
+    let one = FAMILIES[0].1 * 8;
+    for last in [Some(0), None] {
+        let started = std::sync::Mutex::new(Vec::new());
+        let gate = ByteGate::new(n * one);
+        let t0 = std::time::Instant::now();
+        let (mut order, mut sent_at) = (Vec::new(), Vec::new());
+        emit_streamed_units(
+            Ok(sleeping_units(n, 0, 600, 20, &started)),
+            &gate,
+            &mut |e: Emitted| {
+                sent_at.push(t0.elapsed());
+                gate.release(order.len());
+                order.push(e.position);
+                Ok(())
+            },
+            true,
+            last,
+        )
+        .expect("the stream");
+        assert_eq!(order, hand_on_order(n, last), "last {last:?}: the order");
+        let started = started.into_inner().expect("the start log");
+        let slow_started = started
+            .iter()
+            .find(|&&(k, _)| k == 0)
+            .map(|&(_, at)| at.duration_since(t0))
+            .expect("the slow table started");
+        assert!(
+            slow_started < sent_at[0],
+            "last {last:?}: the slow table started at {slow_started:?}, after the first \
+             hand-on at {:?}",
+            sent_at[0]
+        );
+        if last.is_some() {
+            assert!(
+                sent_at[0] < Duration::from_millis(400),
+                "the tables after the slow one waited for it: first handed on at {:?}",
+                sent_at[0]
+            );
+            assert!(
+                sent_at[n - 1] >= Duration::from_millis(600),
+                "the slow table was handed on at {:?}, before it was built",
+                sent_at[n - 1]
+            );
+        } else {
+            assert!(
+                sent_at[0] >= Duration::from_millis(600),
+                "in AIR order the first hand-on waits for the slow table: {:?}",
+                sent_at[0]
+            );
+        }
+    }
+}
+
+/// Handed on last under a one-byte budget, the table waits aside until it is
+/// due while the others go one at a time, and the stream completes: the gate
+/// numbers the tables in the order they are handed on, so the lowest one not
+/// yet placed is always the one due (a named timeout, not a hang, if not).
+#[test]
+#[cfg(feature = "parallel")]
+fn a_table_handed_on_last_streams_under_a_one_byte_budget() {
+    use std::sync::atomic::AtomicUsize;
+    let done = within(30, || {
+        let (now, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let gate = ByteGate::new(1);
+        let mut order = Vec::new();
+        let result = emit_streamed_units(
+            Ok(counting_units(5, 5, &now, &most)),
+            &gate,
+            &mut |e: Emitted| {
+                gate.release(order.len());
+                order.push(e.position);
+                Ok(())
+            },
+            true,
+            Some(0),
+        );
+        result.map(|()| (order, most.into_inner()))
+    });
+    let (order, most) = done
+        .expect("a table handed on last must not deadlock a one-byte budget")
+        .expect("the stream");
+    assert_eq!(order, vec![1, 2, 3, 4, 0], "BITWISE last");
+    assert_eq!(most, 1, "one table at a time");
+}
+
 /// A job that panics ends the sliding stream with an error naming its table,
 /// within a timeout, instead of hanging it.
 #[test]
@@ -979,7 +1139,7 @@ fn a_panicking_job_ends_the_sliding_stream() {
             rows: 1,
             job: Box::new(|| panic!("a generator bug")),
         };
-        emit_streamed_units(Ok(units), &gate, &mut |_| Ok(()), true)
+        emit_streamed_units(Ok(units), &gate, &mut |_| Ok(()), true, None)
     });
     let err = done
         .expect("a panicking job must not hang the stream")

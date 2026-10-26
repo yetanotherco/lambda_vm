@@ -2888,6 +2888,57 @@ fn a_streamed_block_laid_out_on_three_threads_packs_the_same_groups() {
     }
 }
 
+/// ★ With BITWISE handed on last ([`Deviations::rest_bitwise_last`], as
+/// `LAMBDA_VM_BLOCK_REST_BITWISE_LAST=1`), the streamed rest is packed in AIR
+/// order but BITWISE (AIR index 0), which comes after every other table: the
+/// partition moves, the tables and their counts do not, and the proof verifies
+/// under the unchanged verifier. Without it BITWISE leads the rest, as today.
+#[test]
+fn bitwise_handed_on_last_moves_the_partition_and_verifies() {
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+    o.layout_workers = 3;
+    assert!(o.rest_streams(), "the rest streams");
+    let proved = |bitwise_last: bool| {
+        let proof = prove_with(
+            &elf,
+            &format,
+            &o,
+            &Deviations {
+                rest_bitwise_last: bitwise_last,
+                ..Deviations::default()
+            },
+        );
+        assert!(verify(&proof, &elf, &format), "bitwise_last {bitwise_last}");
+        proof
+    };
+    let air = proved(false);
+    let last = proved(true);
+    assert_eq!(
+        format!("{:?}", last.table_counts),
+        format!("{:?}", air.table_counts)
+    );
+    let flat = |p: &BlockWhirProof| p.groups.iter().flatten().copied().collect::<Vec<u32>>();
+    let (air_flat, last_flat) = (flat(&air), flat(&last));
+    let sorted = |mut v: Vec<u32>| {
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(
+        sorted(air_flat.clone()),
+        sorted(last_flat.clone()),
+        "the same tables"
+    );
+    assert_eq!(last_flat.last(), Some(&0), "BITWISE packed last");
+    assert_ne!(
+        air_flat.last(),
+        Some(&0),
+        "BITWISE packed last without the knob"
+    );
+    assert_ne!(last.groups, air.groups, "the partition did not move");
+}
+
 /// The bounded layout (D-EXEC E3): with three workers and `layout_ahead =
 /// Some(k)`, at most `k + 1` streamed chunks are laid out (or in the making)
 /// and not yet packed at once, and the groups are the inline layout's.

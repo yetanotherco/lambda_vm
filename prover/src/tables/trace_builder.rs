@@ -815,6 +815,8 @@ use blocks::{BlockVec, block_len};
 use compact_branch::CompactBranch;
 use compact_bytewise::CompactBytewise;
 use compact_eq::CompactEq;
+#[cfg(feature = "parallel")]
+pub(crate) use finish::hand_on_order;
 pub(crate) use finish::{Emitted, RegenFamily, RegenJob, RestHeader, RestRegen};
 #[cfg(test)]
 pub(crate) use windowed::DECODE_TRACE_DELAY;
@@ -5801,6 +5803,12 @@ pub struct StreamSkip {
     /// them (`LAMBDA_VM_BLOCK_P4_BESIDE=1` on the block). The tables are the
     /// same; a finish that builds every table at once counts first, as ever.
     pub p4_beside: bool,
+    /// With [`Self::p4_beside`] and the slide, the rest is handed on in AIR
+    /// order but BITWISE, which goes after every other table, so the tables
+    /// that do not read the count reach the packer while it counts
+    /// (`LAMBDA_VM_BLOCK_REST_BITWISE_LAST=1` on the block). The tables are the
+    /// same; the groups they are packed into, and so the proof's bytes, are not.
+    pub bitwise_last: bool,
     /// How the tables cut at `keccak_rnd_rows`, `keccak_rows`, `ecsm_rows`,
     /// `ecdas_rows` and `copy_rows` are padded ([`CutPadding`]): the table
     /// phase's counts, its

@@ -1358,6 +1358,32 @@ fn p4_beside() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_P4_BESIDE").is_ok_and(|v| v.trim() == "1")
 }
 
+/// `LAMBDA_VM_BLOCK_REST_BITWISE_LAST`: `1` has the streamed finish count
+/// BITWISE's multiplicities beside the rest's builds and, when it slides, hand
+/// the rest on in AIR order but BITWISE, which goes after every other table
+/// ([`WindowedTraceBuilder::rest_bitwise_last`]), so the tables that do not
+/// read the count reach the packer while it counts. Unset, empty or `0` (the
+/// default): AIR order, BITWISE first. Anything else refuses the prove. The
+/// tables are the same; the groups they are packed into, and so the proof's
+/// bytes, are not; the verifier takes any partition the statement declares.
+fn block_rest_bitwise_last() -> Result<bool, Error> {
+    parse_rest_bitwise_last(
+        std::env::var("LAMBDA_VM_BLOCK_REST_BITWISE_LAST")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_rest_bitwise_last(value: Option<&str>) -> Result<bool, Error> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_BLOCK_REST_BITWISE_LAST={v}: 1 (BITWISE handed on last, beside the count) or 0"
+        ))),
+    }
+}
+
 /// The streamed finish builds each of the rest's tables as soon as the byte
 /// gate admits it, while earlier ones still build, instead of in waves that
 /// each last as long as their slowest table
@@ -3319,6 +3345,9 @@ pub(crate) struct Deviations {
     /// phase A ends in an error with the streamed chunks' regenerator
     /// running.
     pub abort_after_finish: bool,
+    /// The rest handed on with BITWISE last, beside the count, as
+    /// `LAMBDA_VM_BLOCK_REST_BITWISE_LAST=1` asks ([`block_rest_bitwise_last`]).
+    pub rest_bitwise_last: bool,
     /// `auto`'s target for the host, in bytes, instead of the machine's
     /// ([`spill_target_bytes`]): 0 makes the policy want every table out.
     pub spill_target: Option<u64>,
@@ -4110,28 +4139,46 @@ enum RestIn {
 }
 
 /// The rest's tables as they stream in, checked against the run's AIRs: each
-/// the next AIR in order, a streamed chunk's slot or a table of that AIR's
-/// width, and every AIR reached. A table's height is checked where it is laid
+/// the next AIR in the order the finish hands them on (AIR order, or BITWISE
+/// last: [`crate::tables::trace_builder::RestHeader::bitwise_last`]), a
+/// streamed chunk's slot or a table of that AIR's width, and every AIR
+/// reached. A table's height is checked where it is laid
 /// out ([`layout_of`]).
 struct RestOrder {
     widths: Vec<usize>,
+    /// The positions in the order the finish hands them on
+    /// ([`crate::tables::trace_builder::hand_on_order`]).
+    due: Vec<usize>,
     next: usize,
 }
 
 impl RestOrder {
-    fn admit(&mut self, position: usize, width: Option<usize>) -> Result<(), Error> {
-        if position != self.next {
-            return Err(Error::Prover(format!(
-                "the rest's table {position} came where table {} was due",
-                self.next
-            )));
+    /// The rest's tables of `widths` columns, due in AIR order, or with the
+    /// first (BITWISE) after every other when `bitwise_last`.
+    fn new(widths: Vec<usize>, bitwise_last: bool) -> Self {
+        let due =
+            crate::tables::trace_builder::hand_on_order(widths.len(), bitwise_last.then_some(0));
+        Self {
+            widths,
+            due,
+            next: 0,
         }
+    }
+
+    fn admit(&mut self, position: usize, width: Option<usize>) -> Result<(), Error> {
         let want = *self.widths.get(position).ok_or_else(|| {
             Error::Prover(format!(
                 "the rest's table {position} is past the run's {} tables",
                 self.widths.len()
             ))
         })?;
+        let due = self.due.get(self.next).copied();
+        if Some(position) != due {
+            return Err(Error::Prover(format!(
+                "the rest's table {position} came where table {} was due",
+                due.map_or("none".to_string(), |d| d.to_string())
+            )));
+        }
         if let Some(width) = width
             && width != want
         {
@@ -4927,10 +4974,15 @@ fn lay_out_rest_streamed<'a>(
     });
     marks.push(("airs", at()));
     let refs = airs.air_refs();
-    let mut order = RestOrder {
-        widths: refs.iter().map(|air| air.trace_layout().0).collect(),
-        next: 0,
-    };
+    let mut order = RestOrder::new(
+        refs.iter().map(|air| air.trace_layout().0).collect(),
+        header.bitwise_last,
+    );
+    if header.bitwise_last && refs.first().map(|air| air.name()) != Some("BITWISE") {
+        return Err(Error::Prover(
+            "the rest's BITWISE goes last, but BITWISE is not the rest's first table".into(),
+        ));
+    }
     let mut timed: Vec<(usize, f64)> = Vec::new();
     let mut laid_at: Vec<(usize, f64)> = Vec::new();
     let (mut narrow_tables, mut narrow_bytes) = (0usize, 0usize);
@@ -5338,6 +5390,7 @@ fn prove_streamed(
         let walkers = block_walkers()?;
         let p4_rows = block_p4_rows()?;
         let p4_direct = block_p4_direct()?;
+        let bitwise_last = deviations.rest_bitwise_last || block_rest_bitwise_last()?;
         let card_fill = match (
             deviations.card_fill,
             deviations.card_fill_streamed,
@@ -5489,6 +5542,9 @@ fn prove_streamed(
                 }
                 if p4_beside() {
                     builder = builder.p4_beside();
+                }
+                if bitwise_last {
+                    builder = builder.rest_bitwise_last();
                 }
                 if rest_slide() {
                     builder = builder.slide_rest();
@@ -7898,10 +7954,7 @@ mod rest_order_tests {
     use super::RestOrder;
 
     fn order() -> RestOrder {
-        RestOrder {
-            widths: vec![21, 6, 38, 38, 17],
-            next: 0,
-        }
+        RestOrder::new(vec![21, 6, 38, 38, 17], false)
     }
 
     /// Every AIR in order, streamed slots among them: accepted.
@@ -7946,14 +7999,42 @@ mod rest_order_tests {
             format!("{err:?}").contains("table 3 of the rest was never laid out"),
             "{err:?}"
         );
-        let mut o = RestOrder {
-            widths: vec![21],
-            next: 0,
-        };
+        let mut o = RestOrder::new(vec![21], false);
         o.admit(0, Some(21)).expect("0");
         let err = o.admit(1, Some(6)).expect_err("past the AIRs");
         assert!(
             format!("{err:?}").contains("past the run's 1 tables"),
+            "{err:?}"
+        );
+    }
+
+    /// With BITWISE handed on last, the rest is due in AIR order but its first
+    /// table (BITWISE), which comes after every other: that order is taken, AIR
+    /// order is refused at BITWISE's turn, and without the flag BITWISE late is
+    /// refused.
+    #[test]
+    fn with_bitwise_last_the_rest_is_due_in_air_order_but_bitwise() {
+        let mut o = RestOrder::new(vec![21, 6, 38, 38, 17], true);
+        for (position, width) in [
+            (1, Some(6)),
+            (2, None),
+            (3, Some(38)),
+            (4, Some(17)),
+            (0, Some(21)),
+        ] {
+            o.admit(position, width).expect("BITWISE last");
+        }
+        o.finish().expect("every AIR reached");
+        let mut o = RestOrder::new(vec![21, 6, 38, 38, 17], true);
+        let err = o.admit(0, Some(21)).expect_err("BITWISE is due last");
+        assert!(
+            format!("{err:?}").contains("came where table 1 was due"),
+            "{err:?}"
+        );
+        let mut o = order();
+        let err = o.admit(1, Some(6)).expect_err("BITWISE is due first");
+        assert!(
+            format!("{err:?}").contains("came where table 0 was due"),
             "{err:?}"
         );
     }
@@ -8471,7 +8552,9 @@ mod air_input_tests {
 
 #[cfg(test)]
 mod p4_rows_knob_tests {
-    use super::{P4Rows, parse_card_early, parse_p4_lookups, parse_p4_rows};
+    use super::{
+        P4Rows, parse_card_early, parse_p4_lookups, parse_p4_rows, parse_rest_bitwise_last,
+    };
 
     /// `LAMBDA_VM_BLOCK_P4_ROWS`: unset, empty or `pool` counts the per-row
     /// lookups on the pool (the default); `off` does not; any other word
@@ -8536,6 +8619,23 @@ mod p4_rows_knob_tests {
         }
         for value in ["on", "true", "2", "yes"] {
             assert!(parse_card_early(Some(value)).is_err(), "{value}");
+        }
+    }
+
+    /// `LAMBDA_VM_BLOCK_REST_BITWISE_LAST`: off (AIR order, BITWISE first)
+    /// unless `1`; any other word refuses.
+    #[test]
+    fn the_bitwise_last_knob_is_off_by_default_and_on_at_1() {
+        for (value, on) in [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some(" 1 "), true),
+        ] {
+            assert_eq!(parse_rest_bitwise_last(value).ok(), Some(on), "{value:?}");
+        }
+        for value in ["on", "true", "2", "last", "BITWISE"] {
+            assert!(parse_rest_bitwise_last(Some(value)).is_err(), "{value}");
         }
     }
 }

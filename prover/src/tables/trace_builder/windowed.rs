@@ -813,6 +813,15 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// [`Self::p4_beside`], the rest handed on with BITWISE after every other
+    /// table when the finish slides ([`StreamSkip::bitwise_last`]). The tables
+    /// are the same; their order, and so the groups, are not.
+    pub fn rest_bitwise_last(mut self) -> Self {
+        self.emitted.p4_beside = true;
+        self.emitted.bitwise_last = true;
+        self
+    }
+
     /// Drop each streamed chunk's ops once the chunk is handed out, instead of
     /// keeping every walked window to the run's end (see the module docs): the
     /// builder then holds less than a chunk of each streamed table's ops, plus
@@ -993,7 +1002,7 @@ impl<'a> WindowedTraceBuilder<'a> {
             skip,
             pre,
         } = self.finishing(logs)?;
-        let plan = super::finish::FinishPlan::new(
+        let mut plan = super::finish::FinishPlan::new(
             ops,
             Some(&image),
             &memory_state,
@@ -1012,6 +1021,11 @@ impl<'a> WindowedTraceBuilder<'a> {
         )?;
         if let Some(line) = plan.cut_line() {
             eprintln!("{line}");
+        }
+        // Without the `parallel` feature the finish takes the waves, in AIR
+        // order.
+        if skip.bitwise_last && slide && cfg!(feature = "parallel") {
+            plan.hand_bitwise_last();
         }
         let mut send = match on_header(plan.header().clone()) {
             Ok(send) => send,

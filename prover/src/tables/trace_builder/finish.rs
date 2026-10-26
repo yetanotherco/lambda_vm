@@ -25,6 +25,10 @@ pub(crate) struct RestHeader {
     /// and the final PC timestamp (`tables::cpu::timestamp_bases`), so a block's
     /// AIRs can be built before its tables are.
     pub(crate) cpu_heights: Vec<usize>,
+    /// The rest is handed on in AIR order but BITWISE, which comes after every
+    /// other ([`StreamSkip::bitwise_last`], [`hand_on_order`]): the order the
+    /// layout admits.
+    pub(crate) bitwise_last: bool,
 }
 
 impl RestHeader {
@@ -1280,6 +1284,7 @@ impl<'a> FinishPlan<'a> {
                 public_output_bytes,
                 num_blake3_ops,
                 cpu_heights,
+                bitwise_last: false,
             },
             cut_line,
         })
@@ -1288,6 +1293,13 @@ impl<'a> FinishPlan<'a> {
     /// What a statement reads off the build, before any table is built.
     pub(crate) fn header(&self) -> &RestHeader {
         &self.header
+    }
+
+    /// The rest handed on with BITWISE after every other table
+    /// ([`RestHeader::bitwise_last`]): for a finish that counts BITWISE's
+    /// multiplicities beside the rest's builds and slides.
+    pub(crate) fn hand_bitwise_last(&mut self) {
+        self.header.bitwise_last = true;
     }
 
     /// A `BLOCK CUT PADDING` line for the readout, when the build cuts a
@@ -1931,6 +1943,7 @@ impl<'a> FinishPlan<'a> {
             public_output_bytes,
             num_blake3_ops,
             cpu_heights: _,
+            bitwise_last: _,
         } = header;
         let traces = Traces {
             cpus,
@@ -2981,7 +2994,7 @@ impl<'a> FinishPlan<'a> {
         gate: &gate::ByteGate,
         send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        emit_streamed_units(self.units(), gate, send, false)
+        emit_streamed_units(self.units(), gate, send, false, None)
     }
 
     /// [`Self::emit_streamed`], and with `keep` what phase B needs to build
@@ -2995,34 +3008,38 @@ impl<'a> FinishPlan<'a> {
         keep: bool,
         slide: bool,
     ) -> Result<Option<RestRegen>, Error> {
+        // BITWISE is the rest's first table: its position is 0.
+        let last = (slide && self.header.bitwise_last).then_some(0);
         let (units, regen) = match self.units_keeping(keep) {
             Ok((units, regen)) => (Ok(units), regen),
             Err(e) => (Err(e), None),
         };
-        emit_streamed_units(units, gate, send, slide)?;
+        emit_streamed_units(units, gate, send, slide, last)?;
         Ok(regen)
     }
 }
 
 /// [`FinishPlan::emit_streamed`] over `units`, in waves or sliding (`slide`;
 /// a build without the `parallel` feature builds one table at a time either
-/// way, so it always takes the waves): an error stops the gate, so it reaches
-/// every waiter, and is returned.
+/// way, so it always takes the waves), sliding with `last` handed on after
+/// every other table: an error stops the gate, so it reaches every waiter, and
+/// is returned.
 fn emit_streamed_units(
     units: Result<Vec<Unit<'_>>, Error>,
     gate: &gate::ByteGate,
     send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
     slide: bool,
+    last: Option<usize>,
 ) -> Result<(), Error> {
     #[cfg(feature = "parallel")]
     let result = if slide {
-        emit_units_sliding(units, gate, send)
+        emit_units_sliding(units, gate, send, last)
     } else {
         emit_units(units, gate, send)
     };
     #[cfg(not(feature = "parallel"))]
     let result = {
-        let _ = slide;
+        let _ = (slide, last);
         emit_units(units, gate, send)
     };
     if let Err(e) = &result {
@@ -3172,12 +3189,16 @@ struct FamilyBuild {
 /// building at once stay within the gate's build cap
 /// ([`gate::ByteGate::with_build`]; by default the budget, which the gate
 /// already implies), so a larger gate can hold more built tables for the
-/// packer without building more of them at once.
+/// packer without building more of them at once. With `last`, that table is
+/// handed on after every other ([`hand_on_order`]) and numbered at the gate in
+/// that order; it still starts first when the gate admits it, and otherwise
+/// starts once it is due, without holding back the tables after it.
 #[cfg(feature = "parallel")]
 fn emit_units_sliding(
     units: Result<Vec<Unit<'_>>, Error>,
     gate: &gate::ByteGate,
     send: &mut dyn FnMut(Emitted) -> Result<(), Error>,
+    last: Option<usize>,
 ) -> Result<(), Error> {
     let units = units?;
     let total = units.len();
@@ -3185,41 +3206,69 @@ fn emit_units_sliding(
     // Built, not yet handed on, by AIR position (`Some(None)`: a streamed
     // chunk's slot).
     let mut ready: Vec<Option<Option<Table>>> = (0..total).map(|_| None).collect();
+    // The positions in the order they are handed on: AIR order, but `last`
+    // after every other ([`hand_on_order`]).
+    let order = hand_on_order(total, last);
+    // Each table's number at the gate: its place among the tables in that
+    // order, the order the packer places and releases them in.
+    let mut numbers = vec![0usize; total];
+    let mut placed = 0usize;
+    for &position in &order {
+        if let Some(Unit::Build { .. }) = units.get(position) {
+            numbers[position] = placed;
+            placed += 1;
+        }
+    }
     let (tx, rx) = std::sync::mpsc::channel::<Built>();
-    let (mut next_send, mut next_table, mut building) = (0usize, 0usize, 0usize);
+    let (mut sent, mut building) = (0usize, 0usize);
     // The estimated bytes of the tables building now.
     let mut building_bytes = 0usize;
-    let mut units = units.into_iter().enumerate().peekable();
+    let mut units: std::collections::VecDeque<(usize, Unit<'_>)> =
+        units.into_iter().enumerate().collect();
+    // `last`'s table when the gate did not admit it as it came: the tables
+    // after it start meanwhile, and it is tried again before them, and goes
+    // once it is due.
+    let mut aside = None;
     let mut families = [FamilyBuild::default(); FAMILIES.len()];
     rayon::in_place_scope_fifo(|scope| {
         loop {
-            while let Some(table) = ready.get_mut(next_send).and_then(Option::take) {
+            while let Some(&due) = order.get(sent) {
+                let Some(table) = ready.get_mut(due).and_then(Option::take) else {
+                    break;
+                };
                 send(Emitted {
-                    position: next_send,
+                    position: due,
                     table,
                 })?;
-                next_send += 1;
+                sent += 1;
             }
-            if next_send == total {
+            if sent == total {
                 break;
             }
             // Start every table the gate admits, in order.
             let mut waiting = false;
-            while let Some((position, unit)) = units.peek() {
+            if let Some(unit) = aside.take() {
+                units.push_front(unit);
+            }
+            while let Some((position, unit)) = units.front() {
                 let mut est_now = 0usize;
                 if let Unit::Build { family, rows, .. } = unit {
                     let est = estimates.of(*family, *rows);
-                    if building == 0 && next_send == *position {
-                        gate.acquire(next_table, est)?;
+                    if building == 0 && order.get(sent) == Some(position) {
+                        gate.acquire(numbers[*position], est)?;
                     } else if (building > 0 && building_bytes.saturating_add(est) > gate.build())
-                        || !gate.try_acquire(next_table, est)?
+                        || !gate.try_acquire(numbers[*position], est)?
                     {
                         waiting = true;
+                        if Some(*position) == last {
+                            aside = units.pop_front();
+                            continue;
+                        }
                         break;
                     }
                     est_now = est;
                 }
-                let Some((position, unit)) = units.next() else {
+                let Some((position, unit)) = units.pop_front() else {
                     break;
                 };
                 match unit {
@@ -3230,7 +3279,7 @@ fn emit_units_sliding(
                         {
                             f.first_started = build_stamps::since_start();
                         }
-                        let (tx, number) = (tx.clone(), next_table);
+                        let (tx, number) = (tx.clone(), numbers[position]);
                         scope.spawn_fifo(move |_| {
                             let t = std::time::Instant::now();
                             let table = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
@@ -3242,14 +3291,13 @@ fn emit_units_sliding(
                             let secs = t.elapsed().as_secs_f64();
                             let _ = tx.send((position, number, family, est_now, table, secs));
                         });
-                        next_table += 1;
                         building += 1;
                         building_bytes = building_bytes.saturating_add(est_now);
                         gate.note_building(building_bytes);
                     }
                 }
             }
-            if ready.get(next_send).is_some_and(Option::is_some) || building == 0 {
+            if order.get(sent).is_some_and(|&due| ready[due].is_some()) || building == 0 {
                 continue;
             }
             let built = if waiting {
@@ -3295,6 +3343,17 @@ fn emit_units_sliding(
         build_stamps::mark("p5 end");
         Ok(())
     })
+}
+
+/// The order the sliding finish hands the rest's `total` positions on in: AIR
+/// order, with `last` (BITWISE's, when the finish counts it beside the rest's
+/// builds and hands it on last: [`StreamSkip::bitwise_last`]) after every other.
+pub(crate) fn hand_on_order(total: usize, last: Option<usize>) -> Vec<usize> {
+    let last = last.filter(|&p| p < total);
+    (0..total)
+        .filter(|&p| Some(p) != last)
+        .chain(last)
+        .collect()
 }
 
 #[cfg(test)]
