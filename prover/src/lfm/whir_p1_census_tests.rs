@@ -1095,6 +1095,11 @@ fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
 /// them) under [`LeafQuery::V1`] and [`LeafQuery::Lean`], each named; the
 /// default's first leaf is the lean one. A change of which check is the
 /// default moves neither pin.
+///
+/// Every leaf absorbs the ELF (its digest and its pages), and the built
+/// `poc_rodata_commit.elf` differs by the assembler that made it, so the
+/// pins are taken over a checked-in copy of it: the same bytes on every
+/// machine.
 #[test]
 fn the_median_mix_leaves_are_pinned_under_each_query_check() {
     use super::whir_chain::LeafQuery;
@@ -1113,7 +1118,7 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
             "d69a688c1e7bc4e246a035d0ee1c3f0c48717a2c80b48da4c7bea054db475e9a",
         ),
     ];
-    let elf_bytes = crate::test_utils::asm_elf_bytes("poc_rodata_commit");
+    let elf_bytes: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
     let opts = super::proof::block_base_options();
     let at = |leaf_query: LeafQuery| {
         let mut format = p1_format();
@@ -1123,9 +1128,9 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
             ..format
         }
     };
-    let owned = median_statement(&elf_bytes, &opts, &at(LeafQuery::V1));
+    let owned = median_statement(elf_bytes, &opts, &at(LeafQuery::V1));
     for (query, leaves, first, last) in PINS {
-        let plan = WhirBlockPlan::derive(&elf_bytes, &opts, &at(query), owned.view(), None)
+        let plan = WhirBlockPlan::derive(elf_bytes, &opts, &at(query), owned.view(), None)
             .expect("the plan derives");
         let n = plan.partition().num_leaves();
         let digest = |k: usize| program_digest(&plan.leaf_program(k).expect("the leaf emits"));
@@ -1136,7 +1141,7 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
         assert_eq!(d_last, last, "{query:?}: the last leaf's program");
     }
     let default = WhirBlockPlan::derive(
-        &elf_bytes,
+        elf_bytes,
         &opts,
         &at(LeafQuery::default()),
         owned.view(),
