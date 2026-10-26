@@ -3187,18 +3187,34 @@ where
     if *DISABLED.get_or_init(|| std::env::var_os("LAMBDA_VM_NO_GPU_MLE_EVAL").is_some()) {
         return None;
     }
-    let values = math_cuda::sumcheck::evaluate_many_base(
-        math_cuda::columns::Columns::Device {
-            store: &store.0,
-            first,
-            width,
-        },
-        &raw_point(point)?,
+    // The point's `eq` table in two halves, a few KiB each: each column is then
+    // read once, at the bandwidth of its base words.
+    let lo_bits = point.len().min(EQ_DOT_LO_BITS);
+    let (high, low) = point.split_at(point.len() - lo_bits);
+    let raw_table = |coordinates: &[math::field::element::FieldElement<E>]| -> Option<Vec<u64>> {
+        let mut raw = Vec::with_capacity(3 << coordinates.len());
+        for value in crate::eq::eq_evals(coordinates) {
+            raw.extend_from_slice(&ext3_raw(&value)?);
+        }
+        Some(raw)
+    };
+    let values = math_cuda::sumcheck::eq_dot_many_base(
+        &store.0,
+        first,
+        width,
+        &raw_table(high)?,
+        &raw_table(low)?,
+        lo_bits as u32,
     )
     .ok()?;
     EVALUATE_CALLS.fetch_add(values.len() as u64, Ordering::Relaxed);
     Some(values.iter().map(|v| ext3_from_raw::<E>(v)).collect())
 }
+
+/// The low half of [`evaluate_resident_run`]'s `eq` table, in variables: 2^10
+/// extension values, 24 KiB, read by every row of a column.
+#[cfg(feature = "cuda")]
+const EQ_DOT_LO_BITS: usize = 10;
 
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn evaluate_resident_run<E>(

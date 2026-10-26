@@ -236,6 +236,9 @@ jobs:
       - name: GKR host-KAT (layer rounds over an input layer kept without its padding)
         run: make test-gkr-host-kat
 
+      - name: Commit-time answers host-KAT (columns' values at one point, one pass)
+        run: make test-eq-dot-host-kat
+
       - name: Round-slot host-KAT (a round's sums reduced by its last block)
         run: make test-round-slot-host-kat
 

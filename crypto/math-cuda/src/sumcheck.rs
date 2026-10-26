@@ -978,6 +978,90 @@ pub fn evaluate_many_base(
     Ok(out)
 }
 
+/// Many resident base columns' values at ONE point, each column read once
+/// (`eq_dot_base_ext3_many`): `hi` and `lo` are the point's `eq` table in two
+/// halves, `eq(p, row) = hi[row >> lo_bits]·lo[row & (2^lo_bits − 1)]`,
+/// three u64 per value. The store's columns `first..first + width` must be one
+/// run. Returns one ext3 value per column, in order.
+///
+/// Where [`evaluate_many_base`] folds a chunk of columns level by level,
+/// writing and reading back an ext3 half of each at every level, this reads
+/// each base word once and writes a partial per (column, block): the
+/// commit-time out-of-domain answers' column values, read while the group's
+/// columns are on the card.
+pub fn eq_dot_many_base(
+    store: &crate::columns::DeviceColumns,
+    first: usize,
+    width: usize,
+    hi: &[u64],
+    lo: &[u64],
+    lo_bits: u32,
+) -> Result<Vec<[u64; 3]>> {
+    if width == 0 {
+        return Ok(Vec::new());
+    }
+    assert!(store.is_run(first, width), "the columns are one run");
+    let rows = store.span(first).1;
+    assert_eq!(lo.len(), 3 << lo_bits, "the low half spans its bits");
+    assert_eq!(
+        (hi.len() / 3) << lo_bits,
+        rows,
+        "the halves span the column"
+    );
+    let be = backend()?;
+    let stream = be.next_stream();
+    let his = (rows >> lo_bits) as u64;
+    let blocks = his.clamp(1, EQ_DOT_BLOCKS as u64) as u32;
+    let hi_dev = crate::device::htod_or_trim(&stream, hi)?;
+    let lo_dev = crate::device::htod_or_trim(&stream, lo)?;
+    let rows_arg = rows as u64;
+    let mut out = Vec::with_capacity(width);
+    for start in (0..width).step_by(EQ_DOT_MAX_COLUMNS) {
+        let columns = (width - start).min(EQ_DOT_MAX_COLUMNS);
+        // SAFETY: every partial is written by its block, every sum by the
+        // reduction, before either is read.
+        let mut partials = unsafe { alloc_or_trim::<u64>(&stream, columns * blocks as usize * 3) }?;
+        let mut sums = unsafe { alloc_or_trim::<u64>(&stream, columns * 3) }?;
+        let view = store.view(first + start, columns);
+        unsafe {
+            stream
+                .launch_builder(&be.eq_dot_base_ext3_many)
+                .arg(&view)
+                .arg(&rows_arg)
+                .arg(&lo_bits)
+                .arg(&hi_dev)
+                .arg(&lo_dev)
+                .arg(&mut partials)
+                .launch(LaunchConfig {
+                    grid_dim: (blocks, columns as u32, 1),
+                    block_dim: (BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: BLOCK_DIM * 3 * 8,
+                })?;
+            stream
+                .launch_builder(&be.sum_partials_ext3)
+                .arg(&partials)
+                .arg(&(blocks as u64))
+                .arg(&mut sums)
+                .launch(LaunchConfig {
+                    grid_dim: (columns as u32, 1, 1),
+                    block_dim: (BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: BLOCK_DIM * 3 * 8,
+                })?;
+        }
+        let host = crate::readback::clone_dtoh(&stream, &sums)?;
+        stream.synchronize()?;
+        out.extend(host.chunks_exact(3).map(|v| [v[0], v[1], v[2]]));
+    }
+    Ok(out)
+}
+
+/// Blocks [`eq_dot_many_base`] gives one column: enough to fill the card
+/// beside a run of a few columns, few enough that the partials stay small.
+const EQ_DOT_BLOCKS: u32 = 64;
+
+/// Columns one [`eq_dot_many_base`] launch takes: the grid's `y` limit.
+const EQ_DOT_MAX_COLUMNS: usize = 65_535;
+
 /// How much a batched evaluation keeps on the device at once.
 ///
 /// Small: what batching saves is the launches, and those dominate for a short

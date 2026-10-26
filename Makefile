@@ -3,7 +3,7 @@ compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-s
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
-test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-blake3-host-kat test-rpx-host-kat test-p1w16-host-kat test-ntt-cm-host-kat test-whir-host-kat test-gkr-host-kat test-round-slot-host-kat test-fill-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
+test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-blake3-host-kat test-rpx-host-kat test-p1w16-host-kat test-ntt-cm-host-kat test-whir-host-kat test-gkr-host-kat test-eq-dot-host-kat test-round-slot-host-kat test-fill-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
@@ -576,6 +576,7 @@ test: compile-programs test-syscalls test-ethrex-crypto
 	$(MAKE) test-ntt-cm-host-kat
 	$(MAKE) test-whir-host-kat
 	$(MAKE) test-gkr-host-kat
+	$(MAKE) test-eq-dot-host-kat
 	$(MAKE) test-round-slot-host-kat
 
 # === Quick test shortcuts ===
@@ -725,6 +726,18 @@ test-gkr-host-kat:
 	$(CXX) $(HOST_KAT_CXXFLAGS) -pthread \
 	    -o target/host_kat/gkr_host_kat $(HOST_KAT_DIR)/gkr_host_kat.cpp
 	./target/host_kat/gkr_host_kat
+
+# Known-answer tests for the commit-time out-of-domain answers' column values
+# (`sumcheck.cu`'s `eq_dot_base_ext3_many` and the `sum_partials_ext3` over its
+# partials), run on the HOST through the SIMT shim, against a written-out
+# reference: every column's value at the point, over shapes with blocks fewer
+# than, as many as and more than a column's hi rows. Arithmetic and indexing
+# only; execution stays with `multilinear/tests/whir_commit_ood_device.rs`.
+test-eq-dot-host-kat:
+	@mkdir -p target/host_kat
+	$(CXX) $(HOST_KAT_CXXFLAGS) -pthread \
+	    -o target/host_kat/eq_dot_host_kat $(HOST_KAT_DIR)/eq_dot_host_kat.cpp
+	./target/host_kat/eq_dot_host_kat
 
 # Known-answer tests for the round kernels whose sums leave through a slot in
 # pinned host memory (`sumcheck.cu`'s `slot_sums` and `_slot` kernels,

@@ -614,6 +614,62 @@ extern "C" __global__ void mle_fold_base_ext3_many(const uint64_t *__restrict__ 
     }
 }
 
+// Many base columns' values at ONE point, each column read once:
+//
+//   value_k = Σ_row column_k[row] · eq(p, row),
+//   eq(p, row) = hi[row >> lo_bits] · lo[row & (2^lo_bits − 1)]
+//
+// with `hi` and `lo` the point's `eq` table in two halves (its first and its
+// last `lo_bits` coordinates, the first variable the high bit), a few KiB each
+// instead of the table. The columns are base-field, laid end to end, `rows`
+// each. Block `(b, k)` takes column `k` and every `gridDim.x`-th hi row from
+// `b`: a thread sums its lo slots of one hi row against `lo` — base × ext3,
+// three products a value — and scales that by the row's `hi` once. One
+// partial per (column, block), in `sum_partials_ext3`'s layout with the
+// columns as its rows. A commit-time out-of-domain answer's column values
+// (`multilinear::stacked_eval::ood_claims`): a pass over the columns at the
+// bandwidth of their base words, where a fold writes and reads back an ext3
+// half at every level.
+extern "C" __global__ void eq_dot_base_ext3_many(const uint64_t *__restrict__ columns,
+                                                  uint64_t rows, uint32_t lo_bits,
+                                                  const uint64_t *__restrict__ hi,
+                                                  const uint64_t *__restrict__ lo,
+                                                  uint64_t *__restrict__ d_partials) {
+    const uint64_t *column = columns + (uint64_t)blockIdx.y * rows;
+    uint64_t lo_len = (uint64_t)1 << lo_bits;
+    uint64_t his = rows >> lo_bits;
+    Fe3 acc = ext3::zero();
+    for (uint64_t h = blockIdx.x; h < his; h += gridDim.x) {
+        const uint64_t *row = column + (h << lo_bits);
+        Fe3 s = ext3::zero();
+        for (uint64_t l = threadIdx.x; l < lo_len; l += blockDim.x) {
+            s = ext3::add(s, ext3::mul_base(load_ext(lo + l * 3), row[l]));
+        }
+        acc = ext3::add(acc, ext3::mul(s, load_ext(hi + h * 3)));
+    }
+    extern __shared__ uint64_t shared[];
+    shared[threadIdx.x * 3 + 0] = acc.a;
+    shared[threadIdx.x * 3 + 1] = acc.b;
+    shared[threadIdx.x * 3 + 2] = acc.c;
+    __syncthreads();
+    for (uint32_t width = blockDim.x / 2; width > 0; width >>= 1) {
+        if (threadIdx.x < width) {
+            Fe3 sum = ext3::add(load_ext(shared + threadIdx.x * 3),
+                                load_ext(shared + (threadIdx.x + width) * 3));
+            shared[threadIdx.x * 3 + 0] = sum.a;
+            shared[threadIdx.x * 3 + 1] = sum.b;
+            shared[threadIdx.x * 3 + 2] = sum.c;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        uint64_t *at = d_partials + ((uint64_t)blockIdx.y * gridDim.x + blockIdx.x) * 3;
+        at[0] = shared[0];
+        at[1] = shared[1];
+        at[2] = shared[2];
+    }
+}
+
 // The claim reduce's batched column for one offset, out of the epoch's resident
 // columns: `out[row] = Σ_m weight[m]·column[member[m]][row]`. The columns are
 // base-field and laid end to end, `rows` each, from the start of the table's run;
