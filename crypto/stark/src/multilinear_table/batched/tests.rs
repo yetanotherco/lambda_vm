@@ -1083,3 +1083,62 @@ fn slot_counts() -> [u64; 6] {
     #[cfg(not(feature = "cuda"))]
     [0; 6]
 }
+
+// ─── The ladder residual is load-bearing for a FALSE statement ──
+
+/// An unbalanced bus (one MUL multiplicity off), table 1's output numerator
+/// replaced by the value that balances it, its ladder run on the true tree:
+/// refused by step 0's residual alone, and accepted with that one check off.
+#[test]
+fn a_balancing_output_is_refused_by_the_residual_alone() {
+    let airs = airs();
+    let cfg = batched(27);
+    let mut cols = columns(3, 1);
+    cols[2][3][1] += FE::one();
+    let committed = commit(tables(&airs, &cols, false), &cfg);
+    let honest = prove(&committed, &cfg, ProverFaults::default());
+    assert_eq!(
+        verify(&committed, &honest, &cfg),
+        Err(MlError::BusImbalance),
+        "premise: the trace's bus does not balance"
+    );
+    let forged = prove(
+        &committed,
+        &cfg,
+        ProverFaults {
+            balance_with: Some(1),
+            ..ProverFaults::default()
+        },
+    );
+    assert_eq!(
+        verify(&committed, &forged, &cfg),
+        Err(MlError::LayerRelationMismatch { layer: 0 }),
+        "every check on: refused at step 0"
+    );
+    let checks = VerifierChecks {
+        residual: false,
+        ..VerifierChecks::ALL
+    };
+    assert_eq!(
+        verify_with_checks(&committed, &forged, &cfg, checks),
+        Ok(()),
+        "residual off: an unbalanced bus is accepted"
+    );
+}
+
+/// ★ Table `t`'s share of the batch is weighted `λ^{3t}`, so its three rules
+/// (zerocheck, numerator, denominator) sit at `λ^{3t}`, `λ^{3t+1}`, `λ^{3t+2}`:
+/// distinct powers across every table. At `λ^t` table 1's zerocheck would
+/// share table 0's numerator power, and a slip to it on both host sides passes
+/// every other host test.
+#[test]
+fn each_tables_share_is_weighted_lambda_cubed_to_its_index() {
+    let lambda = ExtE::from(3u64) + ExtE::from(5u64) * ExtE::from(7u64);
+    let weights = table_weights(&lambda, 6);
+    assert_eq!(weights.len(), 6);
+    let mut power = ExtE::one();
+    for (t, weight) in weights.iter().enumerate() {
+        assert_eq!(*weight, power, "table {t}: λ^{}", 3 * t);
+        power = &power * &lambda * &lambda * &lambda;
+    }
+}

@@ -195,6 +195,10 @@ pub struct ProverFaults {
     pub scaled_padding: Option<usize>,
     /// The prover plans its bins under this cap instead of the config's.
     pub bin_log_cells: Option<u8>,
+    /// This table's bus output numerator is replaced by the value
+    /// that makes `Σ p/q = 0` over every table, absorbed and sent as if true,
+    /// while its ladder runs on the TRUE tree (only step 0's residual sees it).
+    pub balance_with: Option<usize>,
 }
 
 /// Which of the batched verifier's checks run. Every one, except in the
@@ -522,6 +526,27 @@ where
         })
         .collect::<Result<_, _>>()?;
 
+    // The fault `balance_with`: the numerator that balances the bus, from every true
+    // output.
+    let fake_output: Option<(usize, FieldElement<E>)> = match faults.balance_with {
+        None => None,
+        Some(target) => {
+            let mut outputs = Vec::with_capacity(tables.len());
+            for t in 0..tables.len() {
+                let layers = host_tree(&interactions[t], &tables[t].trace)?;
+                outputs.push(gkr_lockstep::LadderTree::output(&gkr_lockstep::HostLayers(
+                    &layers,
+                )));
+            }
+            let mut rest = FieldElement::<E>::zero();
+            for (t, (p, q)) in outputs.iter().enumerate() {
+                if t != target {
+                    rest += p * q.inv().expect("q != 0");
+                }
+            }
+            Some((target, -(rest * &outputs[target].1)))
+        }
+    };
     let mut split = ArgueSplit::default();
     let gruen_layers = multilinear::gkr_gruen::gruen_layers();
     // ── G: a ladder per bin, its outputs absorbed just before it ──────────
@@ -618,7 +643,12 @@ where
             })
             .collect();
         for (&t, tree) in bin.iter().zip(&refs) {
-            let output = tree.output();
+            let mut output = tree.output();
+            if let Some((target, p)) = &fake_output
+                && *target == t
+            {
+                output.0 = p.clone();
+            }
             transcript.append_field_element(&output.0);
             transcript.append_field_element(&output.1);
             bus_outputs[t] = Some(output);

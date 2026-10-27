@@ -190,8 +190,12 @@ impl Fixture {
         let tables: Vec<CommittedTable<'_, F, E>> = self
             .airs
             .iter()
-            .map(|(air, n)| {
-                let cols = columns(*n);
+            .enumerate()
+            .map(|(t, (air, n))| {
+                let mut cols = columns(*n);
+                if t == 1 && VIOLATE_TABLE_1.with(std::cell::Cell::get) {
+                    cols[2][1] += FE::one();
+                }
                 CommittedTable::<F, E>::new(
                     air.constraint_program(),
                     air.constraints_meta(),
@@ -213,7 +217,7 @@ impl Fixture {
             &beta,
             cap,
             &mut prover,
-            ProverFaults::default(),
+            ARGUE_FAULTS.with(std::cell::Cell::get),
             Where::Host,
         )
         .expect("the tables argue")
@@ -451,7 +455,7 @@ fn with_run<R>(
             &alpha,
             &beta,
             &mut verifier,
-            VerifierChecks::ALL,
+            HOST_CHECKS.with(std::cell::Cell::get),
         )
         .map_err(|e| format!("{e:?}"))
     };
@@ -683,4 +687,71 @@ fn the_batched_leg_against_the_per_table_legs() {
             },
         );
     }
+}
+
+// ─── The leaf's two asserts, each against a forgery only it refuses ──
+
+thread_local! {
+    static ARGUE_FAULTS: std::cell::Cell<ProverFaults> = std::cell::Cell::new(ProverFaults::default());
+    static VIOLATE_TABLE_1: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static HOST_CHECKS: std::cell::Cell<VerifierChecks> = const { std::cell::Cell::new(VerifierChecks::ALL) };
+}
+
+/// The host verdict under `checks`, and whether the machine executes.
+fn run_under(checks: VerifierChecks) -> (Result<(), String>, bool) {
+    HOST_CHECKS.with(|c| c.set(checks));
+    let out = with_run(
+        27,
+        |_| {},
+        |run| (run.host.clone().map(|_| ()), run.execute().is_ok()),
+    );
+    HOST_CHECKS.with(|c| c.set(VerifierChecks::ALL));
+    out
+}
+
+/// Table 1's output numerator moved (its ladder on the true tree): only the
+/// ladder residual refuses it on the host, and the machine must refuse it.
+#[test]
+fn the_leaf_refuses_a_forgery_only_the_residual_catches() {
+    ARGUE_FAULTS.with(|f| {
+        f.set(ProverFaults {
+            balance_with: Some(1),
+            ..ProverFaults::default()
+        })
+    });
+    let (all, executes) = run_under(VerifierChecks::ALL);
+    let (inert, _) = run_under(VerifierChecks {
+        residual: false,
+        ..VerifierChecks::ALL
+    });
+    ARGUE_FAULTS.with(|f| f.set(ProverFaults::default()));
+    assert!(all.is_err(), "the host refuses it");
+    assert_eq!(inert, Ok(()), "premise: only the residual refuses it");
+    assert!(
+        !executes,
+        "the machine executed a forgery only the residual catches"
+    );
+}
+
+/// A violated constraint in table 1, argued honestly: only the constraint
+/// equation refuses it on the host, and the machine must refuse it.
+#[test]
+fn the_leaf_refuses_a_forgery_only_the_constraint_equation_catches() {
+    VIOLATE_TABLE_1.with(|v| v.set(true));
+    let (all, executes) = run_under(VerifierChecks::ALL);
+    let (inert, _) = run_under(VerifierChecks {
+        constraint: false,
+        ..VerifierChecks::ALL
+    });
+    VIOLATE_TABLE_1.with(|v| v.set(false));
+    assert!(all.is_err(), "the host refuses it");
+    assert_eq!(
+        inert,
+        Ok(()),
+        "premise: only the constraint equation refuses it"
+    );
+    assert!(
+        !executes,
+        "the machine executed a forgery only the constraint equation catches"
+    );
 }
