@@ -11,27 +11,27 @@ use crate::{prove, verify_with_options};
 
 #[test]
 fn test_page_base_for_address() {
-    // DEFAULT_PAGE_SIZE = 1 << 18 = 0x40000
+    // DEFAULT_PAGE_SIZE = 1 << 15 = 0x8000
     assert_eq!(page_base_for_address(0x00000), 0x00000);
-    assert_eq!(page_base_for_address(0x1000), 0x00000); // 0x1000 < 0x40000
-    assert_eq!(page_base_for_address(0x3FFFF), 0x00000); // last byte of first page
-    assert_eq!(page_base_for_address(0x40000), 0x40000); // start of second page
-    assert_eq!(page_base_for_address(0x40001), 0x40000); // one byte into second page
+    assert_eq!(page_base_for_address(0x1000), 0x00000); // 0x1000 < 0x8000
+    assert_eq!(page_base_for_address(0x7FFF), 0x00000); // last byte of first page
+    assert_eq!(page_base_for_address(0x8000), 0x8000); // start of second page
+    assert_eq!(page_base_for_address(0x8001), 0x8000); // one byte into second page
 }
 
 #[test]
 fn test_offset_in_page() {
-    // DEFAULT_PAGE_SIZE = 0x40000
+    // DEFAULT_PAGE_SIZE = 0x8000
     assert_eq!(offset_in_page(0x00000), 0);
     assert_eq!(offset_in_page(0x1000), 0x1000); // 4096
-    assert_eq!(offset_in_page(0x3FFFF), 0x3FFFF); // last offset in first page
-    assert_eq!(offset_in_page(0x40000), 0); // start of second page → offset 0
-    assert_eq!(offset_in_page(0x40001), 1); // one byte into second page
+    assert_eq!(offset_in_page(0x7FFF), 0x7FFF); // last offset in first page
+    assert_eq!(offset_in_page(0x8000), 0); // start of second page → offset 0
+    assert_eq!(offset_in_page(0x8001), 1); // one byte into second page
 }
 
 #[test]
 fn test_generate_page_trace_zero_init() {
-    // Use 0 as page_base (aligned to DEFAULT_PAGE_SIZE = 256KB)
+    // Use 0 as page_base (aligned to DEFAULT_PAGE_SIZE = 32KB)
     let config = PageConfig::zero_init(0);
     let final_state = FinalStateMap::new();
 
@@ -63,7 +63,7 @@ fn test_generate_page_trace_zero_init() {
 
 #[test]
 fn test_generate_page_trace_with_data() {
-    // Use 0 as page_base (aligned to DEFAULT_PAGE_SIZE = 256KB)
+    // Use 0 as page_base (aligned to DEFAULT_PAGE_SIZE = 32KB)
     let data = vec![0x01, 0x02, 0x03, 0x04];
     let config = PageConfig::with_data(0, data);
     let final_state = FinalStateMap::new();
@@ -94,7 +94,7 @@ fn test_generate_page_trace_with_data() {
 
 #[test]
 fn test_generate_page_trace_with_accesses() {
-    // Use 0 as page_base (aligned to DEFAULT_PAGE_SIZE = 256KB)
+    // Use 0 as page_base (aligned to DEFAULT_PAGE_SIZE = 32KB)
     let data = vec![0xAA, 0xBB];
     let config = PageConfig::with_data(0, data);
 
