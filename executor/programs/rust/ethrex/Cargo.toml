@@ -57,40 +57,38 @@ ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev 
 # executor test reader so the rkyv ProgramInput layout stays consistent.
 rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 
-# Valid jump destinations as a bitmap, ethrex main's unchecked memory hot path,
-# cheaper byte swaps and ordered trie roots. Every ethrex crate of this guest is
-# built from yetanotherco/ethrex, branch lambda-vm/guest-opt-b1: the pinned rev above
-# plus five commits. The first keeps
-# the JUMPDEST analysis as a bitmap, so a JUMP / JUMPI checks one bit instead of
-# binary-searching the offset list; the second takes the tracer's branch of the
-# jump out of line; the third is ethrex main's #7119 (MLOAD / MSTORE and the
-# memory accessors without the checks their callers already made). A jump is
-# valid exactly when it was before (the commits carry the tests that compare the
-# two checks), and ProgramInput is untouched, so the fixture writer and the native
-# test reference stay on the pin. On mainnet block 25475471 the guest executes
-# 10.8 M fewer instructions (-5.1 %). Ethrex main has carried an equivalent bitmap
-# since 3ca8bc23 (#7095) and #7119 since 007882a8.
-#
-# The fourth commit reverses the bytes of each 64-bit word of a U256 big-endian
-# conversion (PUSH, MLOAD / MSTORE, storage keys, CALLDATALOAD, RLP integers) in
-# three swap steps, 13 instructions, instead of LLVM's 24-instruction expansion on
-# a target without a byte-reverse instruction. The fifth builds the transactions,
-# receipts and withdrawals roots straight from their pairs in key order instead of
-# inserting them one by one into a trie. Same values and the same roots (their
-# commits carry the tests); on block 25475471 the two take the guest from 200.51 M
-# to 198.11 M instructions (-1.2 %). Upstream has neither; keep the patch until it
-# does, or until these move upstream.
+# Every ethrex crate of this guest is built from yetanotherco/ethrex, branch
+# lambda-vm/guest-opt: the pinned rev above plus guest-speed commits, none of
+# which changes a result or ProgramInput, so the fixture writer and the native test
+# reference stay on the pin (each commit carries the tests that compare it with the
+# code it replaces). In order:
+# - jump destinations as a bitmap, and the traced jump out of line; ethrex main's
+#   #7119 (MLOAD / MSTORE and the memory accessors without repeated checks);
+# - U256 big-endian conversions with a 13-instruction byte swap (no Zbb), and the
+#   transactions, receipts and withdrawals roots built from pairs in key order;
+# - from the round-12 guest work: RLP integers and lengths from their significant
+#   bytes; grouped nibble packing; witness nodes decoded in place, resident trie
+#   nodes walked by reference, branch preimages in one pass; the EVM stack
+#   allocated zeroed with single bounds checks; DIV / MOD specialised by divisor
+#   width; the jump-destination analysis made progressive and shared by Code
+#   clones (it replaces the eager bitmap), with a lock-free check inside the
+#   scanned prefix; memory expansion skipped when covered, and zero limbs of
+#   memory words not byte-swapped.
+# On mainnet block 25475471 the guest executes 203.12 M instructions without the
+# patch's later commits and 163.32 M with all of them and this repo's guest-side
+# changes. Ethrex main has carried an equivalent bitmap since 3ca8bc23 (#7095)
+# and #7119 since 007882a8; it has none of the rest.
 #
 # All eight crates are patched together: patching only the two that changed would
 # leave two copies of ethrex-crypto in the graph. scripts/set_ethrex_rev.sh checks
 # that the fork's base below is the pinned rev and refuses to move the pin past it.
 # ethrex-fork-base: 797df5540c7d35cafd69b6971a74b2a49c67d1dd
 [patch."https://github.com/lambdaclass/ethrex.git"]
-ethrex-common = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4319235801311e92050e0c6d1bb6173036c367af" }
-ethrex-crypto = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4319235801311e92050e0c6d1bb6173036c367af" }
-ethrex-guest-program = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4319235801311e92050e0c6d1bb6173036c367af" }
-ethrex-l2-common = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4319235801311e92050e0c6d1bb6173036c367af" }
-ethrex-levm = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4319235801311e92050e0c6d1bb6173036c367af" }
-ethrex-rlp = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4319235801311e92050e0c6d1bb6173036c367af" }
-ethrex-trie = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4319235801311e92050e0c6d1bb6173036c367af" }
-ethrex-vm = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4319235801311e92050e0c6d1bb6173036c367af" }
+ethrex-common = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4de7891e9e71879d21cf3d5944a8767d4255e148" }
+ethrex-crypto = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4de7891e9e71879d21cf3d5944a8767d4255e148" }
+ethrex-guest-program = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4de7891e9e71879d21cf3d5944a8767d4255e148" }
+ethrex-l2-common = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4de7891e9e71879d21cf3d5944a8767d4255e148" }
+ethrex-levm = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4de7891e9e71879d21cf3d5944a8767d4255e148" }
+ethrex-rlp = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4de7891e9e71879d21cf3d5944a8767d4255e148" }
+ethrex-trie = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4de7891e9e71879d21cf3d5944a8767d4255e148" }
+ethrex-vm = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4de7891e9e71879d21cf3d5944a8767d4255e148" }
