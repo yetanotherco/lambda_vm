@@ -270,7 +270,6 @@ fn whir_p1_leaf_census() {
         let production = BlockFormat::production();
         let format = BlockFormat {
             zf: production.zf.with_base(base),
-            max_groups: 1024,
             ..production
         };
         let owned = median_statement(&elf_bytes, &opts, &format);
@@ -331,7 +330,6 @@ fn whir_p1_leaf_census() {
         let production = BlockFormat::production();
         let format = BlockFormat {
             zf: production.zf.with_base(BaseFormat::P1_WHIR),
-            max_groups: 1024,
             ..production
         };
         let owned = median_statement(&elf_bytes, &opts, &format);
@@ -630,7 +628,6 @@ fn p1_format() -> BlockFormat {
     let production = BlockFormat::production();
     BlockFormat {
         zf: production.zf.with_base(BaseFormat::P1_WHIR),
-        max_groups: 1024,
         ..production
     }
 }
@@ -1358,7 +1355,6 @@ fn whir_s6b_census() {
     for (name, base, cap) in arms {
         let format = BlockFormat {
             zf: production.zf.with_base(base),
-            max_groups: 1024,
             ..production
         };
         let owned = median_statement(&elf_bytes, &opts, &format);

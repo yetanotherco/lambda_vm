@@ -12,6 +12,7 @@ use crate::test_utils::{E, asm_elf_bytes};
 use crate::zf_format::ZfFormat;
 use math::field::element::FieldElement;
 use multilinear::whir_chain::{ArgueFormat, StackVars};
+use stark::multilinear_block::block_groups;
 use stark::multilinear_table::batched::VerifierChecks;
 use stark::proof::options::ProofOptions;
 
@@ -3249,6 +3250,136 @@ fn the_prover_refuses_a_partition_over_the_group_maximum() {
             );
         } else {
             assert_eq!(prover, verifier);
+        }
+    }
+}
+
+/// ★ Block-wide LogUp at the group maximum, its worst case over the statements
+/// the verifier accepts: the bus balances once a block, so its support counts
+/// every group, and a group's most fractions are a table alone at
+/// 2^[`block_whir::BLOCK_MAX_TABLE_VARS`] rows times the most bus interactions
+/// any block AIR carries a row (BLAKE3's 1475). The error is
+/// (len + 1)(|supp| − 1)/|F| with len the longest bus message (204) and
+/// |F| = p³, a committed word decoding to one codeword: 136.79 bits at 1024
+/// groups, 140.79 at 64. The census reads both constants from the block's
+/// AIRs, so a wider AIR or a larger maximum fails here before it moves the
+/// figure.
+#[test]
+fn block_wide_logup_at_the_group_maximum_is_pinned() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let program = executor::elf::Elf::load(&elf).expect("the ELF loads");
+    let opts = ProofOptions::default_test_options();
+    let counts = crate::TableCounts {
+        cpu: 1,
+        lt: 1,
+        memw: 1,
+        memw_aligned: 1,
+        load: 1,
+        mul: 1,
+        dvrm: 1,
+        shift: 1,
+        branch: 1,
+        memw_register: 1,
+        eq: 1,
+        bytewise: 1,
+        store: 1,
+        cpu32: 1,
+        keccak: 1,
+        keccak_rnd: 1,
+        ecsm: 1,
+        ecdas: 1,
+        hint: 1,
+        copy: 1,
+        blake3: 1,
+        is_wh: 1,
+    };
+    let pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &program,
+        &[],
+        0,
+        1 << 20,
+    )
+    .expect("pages");
+    let inputs =
+        crate::BlockAirInputs::new(&opts, &program, vec![1 << 10], &[]).expect("the AIR inputs");
+    let airs = crate::block_airs(&program, &opts, &pages, &counts, &inputs);
+    let (fractions, len) = airs
+        .air_refs()
+        .iter()
+        .map(|air| {
+            let bus = air.bus_interactions();
+            let len = bus.iter().map(|b| b.num_bus_elements()).max().unwrap_or(0);
+            (bus.len(), len)
+        })
+        .fold((0, 0), |(f, l), (f2, l2)| (f.max(f2), l.max(l2)));
+    assert_eq!(
+        (fractions, len),
+        (1475, 204),
+        "the census: fractions a row, message length"
+    );
+    let bits = |groups: usize| {
+        let support =
+            groups as f64 * 2f64.powi(block_whir::BLOCK_MAX_TABLE_VARS as i32) * fractions as f64;
+        let field_log2 = 3.0 * (0xFFFF_FFFF_0000_0001u64 as f64).log2();
+        field_log2 - ((len as f64 + 1.0) * (support - 1.0)).log2()
+    };
+    assert_eq!(
+        format!("{:.2}", bits(block_whir::BLOCK_MAX_GROUPS)),
+        "136.79"
+    );
+    assert_eq!(format!("{:.2}", bits(64)), "140.79");
+}
+
+/// ★ The group maximum's edge on the prover's plan: tables that fill a group each, at the
+/// production stack and polynomial budget, plan into 1024 groups, which are
+/// taken, and into 1025, which are refused with the verifier's error.
+#[test]
+fn the_plan_takes_the_group_maximum_and_refuses_one_more() {
+    let stack = ZfFormat::DEFAULT.whir_stack;
+    // Three columns at 2^27 rows: three polynomials, a group to itself.
+    let full = (block_whir::BLOCK_GROUP_POLYS, stack.get());
+    for groups in [
+        block_whir::BLOCK_MAX_GROUPS,
+        block_whir::BLOCK_MAX_GROUPS + 1,
+    ] {
+        let sizes = block_groups(&vec![full; groups], stack, block_whir::BLOCK_GROUP_POLYS)
+            .expect("a plan");
+        assert_eq!(sizes.len(), groups);
+        let planned = block_whir::check_group_count(sizes.len(), block_whir::BLOCK_MAX_GROUPS);
+        if groups > block_whir::BLOCK_MAX_GROUPS {
+            let Err(crate::Error::InvalidTableCounts(why)) = planned else {
+                panic!("the plan took {groups} groups");
+            };
+            assert_eq!(why, "1025 groups — a block takes at most 1024");
+        } else {
+            assert!(planned.is_ok(), "the plan refused {groups} groups");
+        }
+    }
+}
+
+/// ★ The group maximum's edge at the verifier: a statement of 1025 groups is refused by the
+/// group maximum, before its partition is read; at 1024 the maximum lets the
+/// statement through, and the partition check refuses the forged groups.
+#[test]
+fn the_verifier_refuses_one_group_over_the_maximum() {
+    let elf = asm_elf_bytes("sub");
+    let format = one_group();
+    let mut proof = prove(&elf, &format, &options(MaxRowsConfig::default(), 16));
+    assert!(verify(&proof, &elf, &format));
+    for groups in [
+        block_whir::BLOCK_MAX_GROUPS,
+        block_whir::BLOCK_MAX_GROUPS + 1,
+    ] {
+        proof.groups = vec![vec![0]; groups];
+        let Err(crate::Error::InvalidTableCounts(why)) =
+            verify_block_whir(&proof, &elf, &ProofOptions::default_test_options(), &format)
+        else {
+            panic!("the verifier did not refuse {groups} groups");
+        };
+        if groups > block_whir::BLOCK_MAX_GROUPS {
+            assert_eq!(why, "1025 groups — a block takes at most 1024");
+        } else {
+            assert_eq!(why, "table 0 is in two groups");
         }
     }
 }

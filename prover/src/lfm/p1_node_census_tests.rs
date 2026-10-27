@@ -193,7 +193,6 @@ fn p1_node_census() {
     let production = BlockFormat::production();
     let format = BlockFormat {
         zf: production.zf.with_base(BaseFormat::P1_WHIR),
-        max_groups: 1024,
         ..production
     };
     let owned = super::whir_p1_census_tests::median_statement(&elf_bytes, &opts, &format);
