@@ -241,3 +241,118 @@ fn the_frame_refuses_a_bitwise_table_off_its_fixed_height() {
     let frame = frame_at(&bitwise_20).expect("BITWISE at its height frames");
     assert_eq!(frame.config.num_queries, 229, "BITWISE holds the count");
 }
+
+/// Format knobs a verifier's process could carry, each off the default: the
+/// WHIR blowup, grind bits and folds, the leaves' query check and scale, and
+/// the leaves' share form.
+const OFF_DEFAULT: [(&str, &str); 6] = [
+    (crate::zf_format::ENV_WHIR_BLOWUP, "4"),
+    (crate::zf_format::ENV_WHIR_GRIND_BITS, "20"),
+    (crate::zf_format::ENV_WHIR_FOLDS, "uniform4"),
+    (crate::lfm::whir_block::LEAF_QUERY_ENV, "v1"),
+    (crate::lfm::whir_block::LEAF_DOUBLE_FROM_ENV, "off"),
+    ("LFM_WHIR_SHARE_INVERSE", "0"),
+];
+
+/// ★ The block verifier reads no format from its environment. In a process of
+/// its own whose environment sets every knob in [`OFF_DEFAULT`]
+/// ([`the_pinned_presets_hold_under_an_environment_off_the_default`]), the
+/// prover's format follows the environment while the verifier's presets stay
+/// the pinned constants. So a verifier left with `LAMBDA_VM_ZF_WHIR_BLOWUP=4`
+/// still checks a proof at the production format: it verifies a production
+/// proof and refuses one made at blowup 4, whose statement binds the other
+/// rate.
+#[test]
+fn the_block_verifier_reads_no_format_from_its_environment() {
+    let name =
+        "tests::verifier_pin_tests::the_pinned_presets_hold_under_an_environment_off_the_default";
+    let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args([
+            "--exact",
+            name,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .envs(OFF_DEFAULT)
+        .output()
+        .expect("the test binary runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "the child under the knobs:\n{stdout}\n{stderr}"
+    );
+}
+
+/// Run by [`the_block_verifier_reads_no_format_from_its_environment`] in a
+/// process whose environment is [`OFF_DEFAULT`]; refuses to run anywhere else.
+#[test]
+#[ignore = "run in a process of its own by the_block_verifier_reads_no_format_from_its_environment"]
+fn the_pinned_presets_hold_under_an_environment_off_the_default() {
+    use crate::lfm::whir_block::{
+        LeafScale, pinned_verifier_presets, share_inverse, verifier_presets_at,
+    };
+    use crate::lfm::whir_chain::LeafQuery;
+    use crate::zf_format::WhirBlowup;
+    use multilinear::whir_chain::LeafOrder;
+    assert!(
+        OFF_DEFAULT
+            .iter()
+            .all(|(k, v)| std::env::var(k).as_deref() == Ok(*v)),
+        "run by its parent, under the knobs"
+    );
+    // The prover's format is the environment's.
+    let production = BlockFormat::production();
+    assert_eq!(production.zf.whir_blowup, 4);
+    assert_eq!(production.zf.whir_grind_bits, 20);
+    assert_ne!(production.zf.whir_folds, ZfFormat::DEFAULT.whir_folds);
+    assert_eq!(production.leaf_query, LeafQuery::V1);
+    assert_eq!(production.leaf_scale, LeafScale::Fixed);
+    assert!(!share_inverse());
+
+    // The verifier's is not.
+    let debug = |o: &ProofOptions| format!("{o:?}");
+    let pinned = pinned_verifier_presets(GroupFold::Indexed);
+    assert_eq!(pinned.format.zf, ZfFormat::DEFAULT);
+    assert_eq!(pinned.format.leaf_query, LeafQuery::Lean);
+    assert_eq!(pinned.format.leaf_scale, LeafScale::DEFAULT);
+    assert_eq!(pinned.format.group, GroupFold::Indexed);
+    assert!(pinned.share_inverse);
+    assert_eq!(
+        debug(&pinned.base_options),
+        debug(&crate::lfm::proof::block_base_options_under(
+            &ZfFormat::DEFAULT
+        ))
+    );
+    assert_eq!(
+        debug(&pinned.wrap_options),
+        debug(&crate::lfm::proof::aggregation_wrap_options_under(
+            &ZfFormat::DEFAULT
+        ))
+    );
+
+    // The named-choice form sets its four and pins the rest, folds and grind
+    // included.
+    let at = verifier_presets_at(
+        GroupFold::Indexed,
+        WhirBlowup::Four,
+        LeafOrder::Natural,
+        LeafScale::Fixed,
+        LeafQuery::V1,
+    )
+    .expect("named choices");
+    assert_eq!(
+        at.format.zf,
+        ZfFormat {
+            whir_blowup: 4,
+            whir_leaves: LeafOrder::Natural,
+            ..ZfFormat::DEFAULT
+        }
+    );
+    assert_eq!(
+        (at.format.leaf_scale, at.format.leaf_query),
+        (LeafScale::Fixed, LeafQuery::V1)
+    );
+    assert!(at.share_inverse);
+}

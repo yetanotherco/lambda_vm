@@ -3131,24 +3131,32 @@ fn the_whir_block_tree_on_a_real_block() {
     );
     assert!(ok, "the block proof must verify");
     let t = std::time::Instant::now();
-    // The production verifier when the run is at its presets, given the run's
-    // group opening (`LAMBDA_VM_WHIR_GROUP`) as the CLI's `verify-block --group`
-    // gives it; the fixture form only when a knob moved the tree off them.
-    let verdict =
-        if leaves.is_none() && fan_in == BLOCK_FAN_IN && argue == BlockFormat::production().argue {
-            super::whir_block::verify_block_tree_grouped(&elf, proof.statement(), top, format.group)
-        } else {
-            verify_block_tree_under(
-                &elf,
-                &opts,
-                &format,
-                proof.statement(),
-                leaves,
-                fan_in,
-                &wrap,
-                top,
-            )
-        };
+    // The production verifier when the run is at its pinned presets, given the
+    // run's group opening (`LAMBDA_VM_WHIR_GROUP`) as the CLI's `verify-block
+    // --group` gives it; the fixture form, at the run's own format, when a knob
+    // moved the tree or the format off them (the pinned verifier would refuse
+    // such a run: its format is constants, not the environment's).
+    let at_pinned = format!("{format:?}")
+        == format!("{:?}", BlockFormat::pinned_with(format.group))
+        && super::whir_block::share_inverse();
+    let verdict = if leaves.is_none()
+        && fan_in == BLOCK_FAN_IN
+        && argue == BlockFormat::pinned().argue
+        && at_pinned
+    {
+        super::whir_block::verify_block_tree_grouped(&elf, proof.statement(), top, format.group)
+    } else {
+        verify_block_tree_under(
+            &elf,
+            &opts,
+            &format,
+            proof.statement(),
+            leaves,
+            fan_in,
+            &wrap,
+            top,
+        )
+    };
     println!(
         "W3 TREE VERIFY: {} in {:.2}s (derives every program and its artifacts)",
         if verdict.is_ok() {

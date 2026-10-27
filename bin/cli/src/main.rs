@@ -897,7 +897,7 @@ fn cmd_verify_block(
     // The verifier is told the rate and the leaf order as it is told the group
     // opening, and both are installed as the process format before anything
     // reads it.
-    let (blowup, order) = match install_block_format(blowup, leaves) {
+    let (blowup, order) = match install_verify_format(blowup, leaves) {
         Ok(choices) => choices,
         Err(e) => {
             eprintln!("{e}");
@@ -980,11 +980,11 @@ fn cmd_verify_block(
     }
 }
 
-/// The block commands' process format: the environment's ZF knobs with the
+/// `prove-block`'s process format: the environment's ZF knobs with the
 /// WHIR blowup of `--blowup` (`blowup`) and the round-0 leaf order of
 /// `--leaves` (`leaves`), installed before anything reads the process format,
 /// so its banner — printed once, on stdout — and every reader of it state the
-/// blowup and the order the block is proved or verified under. The format's
+/// blowup and the order the block is proved under. The format's
 /// own environment knobs for both are refused: the flags are the caller's.
 fn install_block_format(
     blowup: &str,
@@ -1004,6 +1004,39 @@ fn install_block_format(
         whir_blowup: blowup.factor(),
         whir_leaves: leaves,
         ..ZfFormat::from_env()?
+    };
+    format.check_leaves()?;
+    ZfFormat::install(format)?;
+    Ok((blowup, leaves))
+}
+
+/// `verify-block`'s process format: [`ZfFormat::DEFAULT`] with the WHIR blowup
+/// of `--blowup` and the round-0 leaf order of `--leaves`, installed before
+/// anything reads the process format. The verifier pins every other field
+/// (`verify_whir_block_tree_proof_at` reads none of them from the process), so
+/// any ZF knob in the environment is refused rather than silently ignored.
+fn install_verify_format(
+    blowup: &str,
+    leaves: &str,
+) -> Result<(prover::zf_format::WhirBlowup, prover::zf_format::LeafOrder), String> {
+    use prover::zf_format::{ENV_KNOBS, ENV_WHIR_BLOWUP, ENV_WHIR_LEAVES, ZfFormat};
+    if let Some(&knob) = ENV_KNOBS.iter().find(|k| std::env::var_os(k).is_some()) {
+        return Err(match knob {
+            ENV_WHIR_BLOWUP => {
+                format!("{knob} is the harness's knob: give the CLI --blowup instead")
+            }
+            ENV_WHIR_LEAVES => {
+                format!("{knob} is the harness's knob: give the CLI --leaves instead")
+            }
+            _ => format!("{knob} is set: the verifier pins the format to its default; unset it"),
+        });
+    }
+    let blowup = prover::lfm::whir_block_tree::blowup_setting(Some(blowup))?;
+    let leaves = prover::lfm::whir_block_tree::leaves_setting(Some(leaves))?;
+    let format = ZfFormat {
+        whir_blowup: blowup.factor(),
+        whir_leaves: leaves,
+        ..ZfFormat::DEFAULT
     };
     format.check_leaves()?;
     ZfFormat::install(format)?;

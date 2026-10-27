@@ -84,6 +84,21 @@ pub const ENV_WHIR_BLOWUP: &str = "LAMBDA_VM_ZF_WHIR_BLOWUP";
 /// roots, the paths and the in-guest walks follow it. Poseidon1 trees only.
 pub const ENV_WHIR_LEAVES: &str = "LAMBDA_VM_ZF_WHIR_LEAVES";
 
+/// Every knob above, in banner order: what a verifier that pins its format
+/// refuses to find in its environment (`verify-block`).
+pub const ENV_KNOBS: [&str; 10] = [
+    ENV_CAP,
+    ENV_WHIR_CAP,
+    ENV_FRI,
+    ENV_ONE_ROW,
+    ENV_WHIR_FOLDS,
+    ENV_WHIR_STACK,
+    ENV_WHIR_GRIND,
+    ENV_WHIR_GRIND_BITS,
+    ENV_WHIR_BLOWUP,
+    ENV_WHIR_LEAVES,
+];
+
 /// The uniform WHIR schedule's fold, as production configures it
 /// (`multilinear_prove::chain_config`); the banner spells the default
 /// `uniform4` after it.

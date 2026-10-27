@@ -2484,13 +2484,14 @@ impl WhirBlockTreeProof {
 }
 
 /// ★ A W3 block proof file verified: [`super::whir_block::verify_block_tree`]
-/// over its claimed statement and its top proof, under the block presets,
-/// against the trusted `elf_bytes`.
+/// over its claimed statement and its top proof, under the pinned block
+/// presets (constants, never the environment's), against the trusted
+/// `elf_bytes`.
 pub fn verify_whir_block_tree_proof(
     elf_bytes: &[u8],
     proof: &WhirBlockTreeProof,
 ) -> Result<(), String> {
-    verify_whir_block_tree_proof_grouped(elf_bytes, proof, BlockFormat::production().group)
+    verify_whir_block_tree_proof_grouped(elf_bytes, proof, BlockFormat::pinned().group)
 }
 
 /// [`verify_whir_block_tree_proof`] for a block whose groups were opened per
@@ -2509,11 +2510,12 @@ pub fn verify_whir_block_tree_proof_grouped(
     super::whir_block::verify_block_tree_grouped(elf_bytes, proof.statement(), &top, group)
 }
 
-/// [`verify_whir_block_tree_proof`] at production's format with the caller's
+/// [`verify_whir_block_tree_proof`] at the pinned format with the caller's
 /// named choices, its group opening, its WHIR blowup, its round-0 leaf order,
 /// its leaf scale and its leaves' query check
 /// ([`super::whir_block::verify_block_tree_at`]); the file carries none of
-/// them. No public entry point takes a format of the caller's own.
+/// them, and the environment sets none of the rest. No public entry point
+/// takes a format of the caller's own.
 ///
 /// ```no_run
 /// use lambda_vm_prover::lfm::whir_block::LeafScale;

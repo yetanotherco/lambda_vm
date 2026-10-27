@@ -720,6 +720,10 @@ pub struct WhirBlockPlan {
     leaf_bound: Option<LeafBound>,
     /// How the leaves check each chain's queries: the format's.
     leaf_query: LeafQuery,
+    /// Whether a leaf's bus share is `p · (1/q)` ([`emit_share`]): the
+    /// process's knob for a prover ([`share_inverse`]), always on for the
+    /// pinned verifier.
+    share_inverse: bool,
     /// Children a node verifies.
     fan_in: usize,
     /// A digest of the statement run: the block's identity, published by every
@@ -804,6 +808,34 @@ impl WhirBlockPlan {
         fan_in: usize,
         prepared_roots: Option<&[(usize, Vec<Commitment>)]>,
         leaf_cap: usize,
+    ) -> Result<Self, String> {
+        Self::derive_full(
+            elf_bytes,
+            proof_options,
+            format,
+            statement,
+            num_leaves,
+            fan_in,
+            prepared_roots,
+            leaf_cap,
+            share_inverse(),
+        )
+    }
+
+    /// [`Self::derive_capped`] with the leaves' share form named
+    /// (`share_inverse`, [`emit_share`]) rather than the process's knob: the
+    /// pinned verifier's derivation.
+    #[allow(clippy::too_many_arguments)]
+    fn derive_full(
+        elf_bytes: &[u8],
+        proof_options: &crate::ProofOptions,
+        format: &BlockFormat,
+        statement: BlockStatement<'_>,
+        num_leaves: Option<usize>,
+        fan_in: usize,
+        prepared_roots: Option<&[(usize, Vec<Commitment>)]>,
+        leaf_cap: usize,
+        share_inverse: bool,
     ) -> Result<Self, String> {
         if fan_in < 2 {
             return Err(format!("a fan-in of {fan_in} closes no tree"));
@@ -949,6 +981,7 @@ impl WhirBlockPlan {
             partition,
             leaf_bound: None,
             leaf_query: format.leaf_query,
+            share_inverse,
             fan_in,
             id,
         };
@@ -1410,48 +1443,49 @@ pub fn top_claims(plan: &WhirBlockPlan, words: &[(u32, LfmWord)]) -> bool {
 /// plan and the top program from the trusted ELF and the statement, verify
 /// `top` against that program, and check it claims the block.
 ///
-/// Every preset is pinned here, none is a caller's: the base's proof options
-/// ([`super::proof::block_base_options`]), the block format
-/// ([`BlockFormat::production`], whose base is the block family's,
-/// `hash_pin::BLOCK_BASE`, never read from the proof), the tree's options
-/// ([`super::proof::aggregation_wrap_options`]), the plan's leaf rule at the
-/// format's leaf scale and its fan-in ([`BLOCK_FAN_IN`]). A caller who could
-/// pass weaker ones would choose the programs the top is checked against.
+/// Every preset is pinned here as a constant, none is a caller's or the
+/// environment's ([`pinned_verifier_presets`]): the block format
+/// ([`BlockFormat::pinned`]: [`crate::zf_format::ZfFormat::DEFAULT`]'s WHIR
+/// format, the default leaf scale, the lean leaf check, whose base is the
+/// block family's, `hash_pin::BLOCK_BASE`, never read from the proof), the
+/// base's proof options and the tree's options under that format
+/// ([`super::proof::block_base_options_under`],
+/// [`super::proof::aggregation_wrap_options_under`]), the leaves' share form
+/// (`p · (1/q)`), the plan's leaf rule at the format's leaf scale and its
+/// fan-in ([`BLOCK_FAN_IN`]). A caller, or an environment, that could set
+/// weaker ones would choose the programs the top is checked against and the
+/// security it is checked at.
 pub fn verify_block_tree(
     elf_bytes: &[u8],
     statement: BlockStatement<'_>,
     top: &super::proof::LfmProof,
 ) -> Result<(), String> {
-    verify_block_tree_grouped(elf_bytes, statement, top, BlockFormat::production().group)
+    verify_block_tree_grouped(elf_bytes, statement, top, BlockFormat::pinned().group)
 }
 
 /// [`verify_block_tree`] for a block whose groups' stacked polynomials were
-/// opened per `group` ([`BlockFormat::production_with`]): the one format
-/// choice a caller makes, and the verifier's constant — the prover's must
-/// match, the statement binds it, and nothing reads it from the proof. Every
-/// other preset is [`verify_block_tree`]'s.
+/// opened per `group` ([`BlockFormat::pinned_with`]): the one format choice a
+/// caller makes, and the verifier's constant — the prover's must match, the
+/// statement binds it, and nothing reads it from the proof. Every other preset
+/// is [`verify_block_tree`]'s.
 pub fn verify_block_tree_grouped(
     elf_bytes: &[u8],
     statement: BlockStatement<'_>,
     top: &super::proof::LfmProof,
     group: GroupFold,
 ) -> Result<(), String> {
-    verify_block_tree_as(
-        elf_bytes,
-        statement,
-        top,
-        &BlockFormat::production_with(group),
-    )
+    verify_block_tree_as(elf_bytes, statement, top, &pinned_verifier_presets(group))
 }
 
-/// [`verify_block_tree`] at production's format with the caller's NAMED
-/// choices: its group opening, its WHIR blowup, its round-0 leaf order, its
-/// leaf scale and its leaves' query check (`verify-block --group / --blowup /
-/// --leaves / --leaf-double-from / --leaf-query`), every other preset pinned as
-/// before. All five are the verifier's constants; the proof carries none of
-/// them. A caller cannot hand in a format of its own: `verify_block_tree_as`
-/// is crate-internal. The coset order is refused by name under a base whose
-/// trees do not take it.
+/// [`verify_block_tree`] at the pinned format with the caller's NAMED choices:
+/// its group opening, its WHIR blowup, its round-0 leaf order, its leaf scale
+/// and its leaves' query check (`verify-block --group / --blowup / --leaves /
+/// --leaf-double-from / --leaf-query`), every other preset pinned as before
+/// (the folds, stack, grind and caps are [`crate::zf_format::ZfFormat::DEFAULT`]'s,
+/// never the environment's). All five are the verifier's constants; the proof
+/// carries none of them. A caller cannot hand in a format of its own:
+/// `verify_block_tree_as` is crate-internal. The coset order is refused by name
+/// under a base whose trees do not take it.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_block_tree_at(
     elf_bytes: &[u8],
@@ -1463,35 +1497,78 @@ pub fn verify_block_tree_at(
     leaf_scale: LeafScale,
     leaf_query: LeafQuery,
 ) -> Result<(), String> {
-    let mut format = BlockFormat::production_with(group);
+    let presets = verifier_presets_at(group, blowup, leaves, leaf_scale, leaf_query)?;
+    verify_block_tree_as(elf_bytes, statement, top, &presets)
+}
+
+/// [`verify_block_tree_at`]'s presets: [`BlockFormat::pinned_with`] `group`
+/// with the four named choices set, the coset order refused under a base
+/// whose trees do not take it.
+pub(crate) fn verifier_presets_at(
+    group: GroupFold,
+    blowup: crate::zf_format::WhirBlowup,
+    leaves: multilinear::whir_chain::LeafOrder,
+    leaf_scale: LeafScale,
+    leaf_query: LeafQuery,
+) -> Result<VerifierPresets, String> {
+    let mut format = BlockFormat::pinned_with(group);
     format.zf.whir_blowup = blowup.factor();
     format.zf.whir_leaves = leaves;
     format.leaf_scale = leaf_scale;
     format.leaf_query = leaf_query;
     format.zf.check_leaves()?;
-    verify_block_tree_as(elf_bytes, statement, top, &format)
+    Ok(verifier_presets(format))
 }
 
-/// [`verify_block_tree`] under a block `format` of the crate's choosing.
+/// What the public block verifiers check a top against, every field a constant
+/// of the code ([`verifier_presets`]): the block format, the base's and the
+/// tree's proof options under its WHIR format, and the leaves' share form.
+pub(crate) struct VerifierPresets {
+    pub(crate) format: BlockFormat,
+    pub(crate) base_options: crate::ProofOptions,
+    pub(crate) wrap_options: crate::ProofOptions,
+    pub(crate) share_inverse: bool,
+}
+
+/// The presets for a verifier that checks under `format`: the options under
+/// `format.zf` (never the process's format) and the share form `p · (1/q)`
+/// (never `LFM_WHIR_SHARE_INVERSE`).
+pub(crate) fn verifier_presets(format: BlockFormat) -> VerifierPresets {
+    VerifierPresets {
+        base_options: super::proof::block_base_options_under(&format.zf),
+        wrap_options: super::proof::aggregation_wrap_options_under(&format.zf),
+        share_inverse: true,
+        format,
+    }
+}
+
+/// [`verify_block_tree_grouped`]'s presets: [`BlockFormat::pinned_with`]
+/// `group`.
+pub(crate) fn pinned_verifier_presets(group: GroupFold) -> VerifierPresets {
+    verifier_presets(BlockFormat::pinned_with(group))
+}
+
+/// [`verify_block_tree`] under `presets` of the crate's choosing.
 /// Crate-internal: a public caller who could pass any format would choose the
 /// programs the top is checked against ([`verify_block_tree`]); the public
-/// entry points build production's pinned format from named choices.
+/// entry points build the pinned presets from named choices.
 pub(crate) fn verify_block_tree_as(
     elf_bytes: &[u8],
     statement: BlockStatement<'_>,
     top: &super::proof::LfmProof,
-    format: &BlockFormat,
+    presets: &VerifierPresets,
 ) -> Result<(), String> {
     verify_block_tree_with(
         elf_bytes,
-        &super::proof::block_base_options(),
-        format,
+        &presets.base_options,
+        &presets.format,
         statement,
         None,
         BLOCK_FAN_IN,
-        &super::proof::aggregation_wrap_options(),
+        &presets.wrap_options,
         top,
         LEAF_P1_CAP,
+        presets.share_inverse,
     )
 }
 
@@ -1519,6 +1596,7 @@ pub(crate) fn verify_block_tree_under(
         wrap_opts,
         top,
         LEAF_P1_CAP,
+        share_inverse(),
     )
 }
 
@@ -1548,6 +1626,7 @@ pub(crate) fn verify_block_tree_capped(
         wrap_opts,
         top,
         leaf_cap,
+        share_inverse(),
     )
 }
 
@@ -1562,8 +1641,9 @@ fn verify_block_tree_with(
     wrap_opts: &crate::ProofOptions,
     top: &super::proof::LfmProof,
     leaf_cap: usize,
+    share_inverse: bool,
 ) -> Result<(), String> {
-    let plan = WhirBlockPlan::derive_capped(
+    let plan = WhirBlockPlan::derive_full(
         elf_bytes,
         proof_options,
         format,
@@ -1572,6 +1652,7 @@ fn verify_block_tree_with(
         fan_in,
         None,
         leaf_cap,
+        share_inverse,
     )?;
     let artifacts = plan.derive_top(wrap_opts)?;
     if !super::proof::verify_against_artifacts_under::<crate::hash_pin::BlockFamily>(
@@ -2240,7 +2321,7 @@ fn emit_leaf_over(
     // ---- 3. the leaf's share of the bus: Σ p/q, less the COMMIT-bus target on
     // the carrier (commits are indexed from 0 in a block).
     let mut sum: Option<Ext> = None;
-    let inverse = share_inverse();
+    let inverse = plan.share_inverse;
     for (p, q) in &outputs {
         let share = emit_share(b, *p, *q, inverse);
         sum = Some(match sum {

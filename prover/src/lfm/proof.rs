@@ -789,10 +789,16 @@ pub(crate) fn expected_public_balance(
 /// [`ZfFormat::DEFAULT`](crate::zf_format::ZfFormat::DEFAULT), the measured
 /// configuration; every knob at its off spelling gives the legacy options.
 pub fn aggregation_wrap_options() -> ProofOptions {
+    aggregation_wrap_options_under(crate::zf_format::ZfFormat::global())
+}
+
+/// [`aggregation_wrap_options`] under the format `zf` rather than the
+/// process's: what a verifier that pins its format checks the tree under.
+pub fn aggregation_wrap_options_under(zf: &crate::zf_format::ZfFormat) -> ProofOptions {
     let mut opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(4)
         .expect("blowup=4 is valid");
     opts.fri_final_poly_log_degree = 8;
-    crate::zf_format::ZfFormat::global().options(opts)
+    zf.options(opts)
 }
 
 /// The STARK block's base-epoch options: the blowup-4 preset the production
@@ -804,7 +810,12 @@ pub fn aggregation_wrap_options() -> ProofOptions {
 /// the RV64 recursion guest's verifier, which stays on the LEGACY format
 /// (its presets name it).
 pub fn block_base_options() -> ProofOptions {
-    crate::zf_format::ZfFormat::global().options(crate::recursion::Preset::Blowup4.options())
+    block_base_options_under(crate::zf_format::ZfFormat::global())
+}
+
+/// [`block_base_options`] under the format `zf` rather than the process's.
+pub fn block_base_options_under(zf: &crate::zf_format::ZfFormat) -> ProofOptions {
+    zf.options(crate::recursion::Preset::Blowup4.options())
 }
 
 #[cfg(test)]

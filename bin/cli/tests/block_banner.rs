@@ -124,3 +124,40 @@ fn the_block_commands_banner_states_the_leaf_order_they_run_under() {
         );
     }
 }
+
+/// The verifier pins the WHIR format: `verify-block` refuses every ZF knob in
+/// its environment before any banner (the grind bits and the folds here, which
+/// `prove-block` still takes as the prover's choice), naming it.
+#[test]
+fn verify_block_refuses_every_format_knob_in_its_environment() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let missing = dir.path().join("missing");
+    let missing = missing.to_str().expect("a UTF-8 path");
+    let proof = dir.path().join("block.proof");
+    let proof = proof.to_str().expect("a UTF-8 path");
+    for (knob, value) in [
+        ("LAMBDA_VM_ZF_WHIR_GRIND_BITS", "20"),
+        ("LAMBDA_VM_ZF_WHIR_FOLDS", "uniform4"),
+    ] {
+        let (ok, stdout, stderr) = run(&["verify-block", missing, missing], &[(knob, value)]);
+        assert!(!ok, "verify-block under {knob}");
+        assert!(
+            lines(&stdout, "ZF FORMAT:").is_empty(),
+            "verify-block under {knob}: no banner before the refusal\n{stdout}"
+        );
+        assert!(
+            stderr.contains(knob) && stderr.contains("pins the format"),
+            "verify-block under {knob}: the refusal names it\n{stderr}"
+        );
+        let (ok, stdout, _) = run(&["prove-block", missing, "-o", proof], &[(knob, value)]);
+        assert!(
+            !ok,
+            "prove-block under {knob}: a missing file fails the command"
+        );
+        assert_eq!(
+            lines(&stdout, "ZF FORMAT:").len(),
+            1,
+            "prove-block under {knob}: the prover takes it\n{stdout}"
+        );
+    }
+}

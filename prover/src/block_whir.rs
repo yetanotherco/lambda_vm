@@ -378,6 +378,40 @@ impl BlockFormat {
         }
     }
 
+    /// ★ The block VERIFIER's production format, every field a constant:
+    /// [`ZfFormat::DEFAULT`] (blowup, folds, stack, grind placement and bits,
+    /// the caps, the round-0 leaf order),
+    /// [`LeafScale::DEFAULT`](crate::lfm::whir_block::LeafScale::DEFAULT),
+    /// [`LeafQuery::Lean`](crate::lfm::whir_chain::LeafQuery::Lean), and
+    /// [`production`](Self::production)'s group size, group cap, argue and
+    /// group opening. Where [`production`](Self::production) is the process's
+    /// format (its environment knobs, for the prover and its experiments),
+    /// this reads nothing from the environment: a verifier's environment
+    /// cannot choose the format, and with it the security, it checks a proof
+    /// against.
+    pub fn pinned() -> Self {
+        Self {
+            zf: ZfFormat::DEFAULT,
+            group_polys: BLOCK_GROUP_POLYS,
+            max_groups: BLOCK_MAX_GROUPS,
+            prepared: true,
+            leaf_scale: crate::lfm::whir_block::LeafScale::DEFAULT,
+            leaf_query: crate::lfm::whir_chain::LeafQuery::Lean,
+            argue: ArgueFormat::BATCHED,
+            group: GroupFold::Indexed,
+        }
+    }
+
+    /// [`pinned`](Self::pinned) with each group's stacked polynomials opened
+    /// per `group`, the verifier's named choice
+    /// ([`production_with`](Self::production_with)).
+    pub fn pinned_with(group: GroupFold) -> Self {
+        Self {
+            group,
+            ..Self::pinned()
+        }
+    }
+
     /// The chain's config over `shapes`: the WHIR format's, with this format's
     /// argue, group fold and round-0 leaf order (the block's alone:
     /// `ZfFormat::chain_format` leaves every other chain natural). Every side
