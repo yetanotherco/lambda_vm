@@ -57,9 +57,10 @@ ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev 
 # executor test reader so the rkyv ProgramInput layout stays consistent.
 rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 
-# Valid jump destinations as a bitmap, and ethrex main's unchecked memory hot
-# path. Every ethrex crate of this guest is built from yetanotherco/ethrex, branch
-# lambda-vm/jumpmap-plus: the pinned rev above plus three commits. The first keeps
+# Valid jump destinations as a bitmap, ethrex main's unchecked memory hot path,
+# cheaper byte swaps and ordered trie roots. Every ethrex crate of this guest is
+# built from yetanotherco/ethrex, branch lambda-vm/guest-opt: the pinned rev above
+# plus five commits. The first keeps
 # the JUMPDEST analysis as a bitmap, so a JUMP / JUMPI checks one bit instead of
 # binary-searching the offset list; the second takes the tracer's branch of the
 # jump out of line; the third is ethrex main's #7119 (MLOAD / MSTORE and the
@@ -68,19 +69,28 @@ rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 # two checks), and ProgramInput is untouched, so the fixture writer and the native
 # test reference stay on the pin. On mainnet block 25475471 the guest executes
 # 10.8 M fewer instructions (-5.1 %). Ethrex main has carried an equivalent bitmap
-# since 3ca8bc23 (#7095) and #7119 since 007882a8; drop this patch when the pin
-# moves past them.
+# since 3ca8bc23 (#7095) and #7119 since 007882a8.
+#
+# The fourth commit reverses the bytes of each 64-bit word of a U256 big-endian
+# conversion (PUSH, MLOAD / MSTORE, storage keys, CALLDATALOAD, RLP integers) in
+# three swap steps, 13 instructions, instead of LLVM's 24-instruction expansion on
+# a target without a byte-reverse instruction. The fifth builds the transactions,
+# receipts and withdrawals roots straight from their pairs in key order instead of
+# inserting them one by one into a trie. Same values and the same roots (their
+# commits carry the tests); on block 25475471 the two take the guest from 200.51 M
+# to 198.11 M instructions (-1.2 %). Upstream has neither; keep the patch until it
+# does, or until these move upstream.
 #
 # All eight crates are patched together: patching only the two that changed would
 # leave two copies of ethrex-crypto in the graph. scripts/set_ethrex_rev.sh checks
 # that the fork's base below is the pinned rev and refuses to move the pin past it.
 # ethrex-fork-base: 797df5540c7d35cafd69b6971a74b2a49c67d1dd
 [patch."https://github.com/lambdaclass/ethrex.git"]
-ethrex-common = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4a6d927017d6b39c6ad086089d975d193d4ac399" }
-ethrex-crypto = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4a6d927017d6b39c6ad086089d975d193d4ac399" }
-ethrex-guest-program = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4a6d927017d6b39c6ad086089d975d193d4ac399" }
-ethrex-l2-common = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4a6d927017d6b39c6ad086089d975d193d4ac399" }
-ethrex-levm = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4a6d927017d6b39c6ad086089d975d193d4ac399" }
-ethrex-rlp = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4a6d927017d6b39c6ad086089d975d193d4ac399" }
-ethrex-trie = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4a6d927017d6b39c6ad086089d975d193d4ac399" }
-ethrex-vm = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4a6d927017d6b39c6ad086089d975d193d4ac399" }
+ethrex-common = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4319235801311e92050e0c6d1bb6173036c367af" }
+ethrex-crypto = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4319235801311e92050e0c6d1bb6173036c367af" }
+ethrex-guest-program = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4319235801311e92050e0c6d1bb6173036c367af" }
+ethrex-l2-common = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4319235801311e92050e0c6d1bb6173036c367af" }
+ethrex-levm = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4319235801311e92050e0c6d1bb6173036c367af" }
+ethrex-rlp = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4319235801311e92050e0c6d1bb6173036c367af" }
+ethrex-trie = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4319235801311e92050e0c6d1bb6173036c367af" }
+ethrex-vm = { git = "https://github.com/yetanotherco/ethrex.git", rev = "4319235801311e92050e0c6d1bb6173036c367af" }
