@@ -406,6 +406,11 @@ jobs:
             -p lambda-vm-prover -p stark -p crypto -p ecsm \
             --archive-file prover-tests.tar.zst
 
+      # The prover shards skip the tests listed in .config/ci-slow-tests.txt (they run in full on the project's own
+      # machines). Fails unless the filter skips exactly the listed tests and every test binary keeps a test.
+      - name: Check the slow-test list against the archive
+        run: python3 scripts/ci_slow_tests.py check prover-tests.tar.zst
+
       - name: Upload test archive
         uses: actions/upload-artifact@v4
         with:
@@ -497,13 +502,16 @@ jobs:
         # the concurrent path or VramGate's blocking path on a PR. The other
         # three shards keep the default-k coverage. An empty value on those
         # fails to parse and falls back to the default, so this is inert there.
+        # The tests listed in .config/ci-slow-tests.txt are skipped here: each took more than 45 s on a runner, and
+        # the project's own machines run them (scripts/ci_slow_tests.py; the build job checks the list).
         env:
           TABLE_PARALLELISM: ${{ matrix.partition == 1 && '6' || '' }}
         run: |
           cargo nextest run \
             --archive-file prover-tests.tar.zst \
             --partition hash:${{ matrix.partition }}/4 \
-            --test-threads=1
+            --test-threads=1 \
+            -E "$(python3 scripts/ci_slow_tests.py expr)"
 
   test-prover-comprehensive:
     name: Prover comprehensive tests
