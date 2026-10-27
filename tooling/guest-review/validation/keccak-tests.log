@@ -1,0 +1,34 @@
+   Compiling ethrex-crypto v23.0.0 (/private/tmp/lambda-vm-guest-review-20261027/vendor/ethrex/crates/common/crypto)
+warning: use of deprecated associated function `sha2::digest::generic_array::GenericArray::<T, N>::from_slice`: please upgrade to generic-array 1.x
+   --> /private/tmp/lambda-vm-guest-review-20261027/vendor/ethrex/crates/common/crypto/provider.rs:119:41
+    |
+119 |         let r_bytes = k256::FieldBytes::from_slice(&sig[..32]);
+    |                                         ^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated associated function `sha2::digest::generic_array::GenericArray::<T, N>::from_slice`: please upgrade to generic-array 1.x
+   --> /private/tmp/lambda-vm-guest-review-20261027/vendor/ethrex/crates/common/crypto/provider.rs:120:41
+    |
+120 |         let s_bytes = k256::FieldBytes::from_slice(&sig[32..]);
+    |                                         ^^^^^^^^^^
+
+warning: use of deprecated associated function `sha2::digest::generic_array::GenericArray::<T, N>::from_slice`: please upgrade to generic-array 1.x
+   --> /private/tmp/lambda-vm-guest-review-20261027/vendor/ethrex/crates/common/crypto/provider.rs:145:80
+    |
+145 |         let z = <Scalar as Reduce<k256::U256>>::reduce_bytes(k256::FieldBytes::from_slice(msg));
+    |                                                                                ^^^^^^^^^^
+
+warning: `ethrex-crypto` (lib) generated 3 warnings
+   Compiling lambda-vm-ethrex-crypto v0.1.0 (/private/tmp/lambda-vm-guest-review-20261027/crypto/ethrex-crypto)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.14s
+     Running unittests src/lib.rs (/private/tmp/pr1014-round2-checks-target/debug/deps/lambda_vm_ethrex_crypto-6decccd788b60ca2)
+
+running 4 tests
+test tests::keccak_tests::keccak_sponge_known_answer_vectors ... ok
+test tests::keccak_tests::keccak_sponge_matches_trusted_permutation ... ok
+test tests::keccak_tests::keccak_sponge_every_length_to_three_blocks ... ok
+test tests::keccak_tests::keccak_alignment_lengths_and_permutation_counts ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.61s
+

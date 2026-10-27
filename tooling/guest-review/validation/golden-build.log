@@ -1,0 +1,3 @@
+   Compiling pr1014-round2-checks v0.1.0 (/private/tmp/lambda-vm-guest-review-20261027/tooling/guest-review/checks)
+    Finished `release` profile [optimized] target(s) in 0.69s
+     Running `/private/tmp/pr1014-round2-checks-target/release/keccak_vectors`

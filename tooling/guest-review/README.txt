@@ -100,6 +100,8 @@ Generated logs, ELF files and results.json are in tooling/guest-review/out/;
 build outputs are ignored by Git. expected/ contains the previously measured
 counts, output bytes, input/source hashes and original cumulative patches for
 comparison. Do not apply those patches again to this branch.
+The completed branch validation is recorded in validation/RESULTS.txt, with
+machine-readable results, logs and checksums alongside it.
 
 The validation harness and native oracle intentionally depend on the original
 ethrex git revision alongside the optimized vendored crates. The production

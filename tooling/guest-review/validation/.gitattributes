@@ -1,0 +1,2 @@
+# Preserve raw test-run output, including final blank lines.
+*.log -whitespace

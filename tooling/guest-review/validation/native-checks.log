@@ -1,0 +1,59 @@
+   Compiling ethrex-crypto v23.0.0 (/private/tmp/lambda-vm-guest-review-20261027/vendor/ethrex/crates/common/crypto)
+   Compiling ethrex-rlp v23.0.0 (/private/tmp/lambda-vm-guest-review-20261027/vendor/ethrex/crates/common/rlp)
+   Compiling ethrex-guest-program v23.0.0 (/private/tmp/lambda-vm-guest-review-20261027/vendor/ethrex/crates/guest-program)
+   Compiling ethrex-trie v23.0.0 (/private/tmp/lambda-vm-guest-review-20261027/vendor/ethrex/crates/common/trie)
+   Compiling ethrex-common v23.0.0 (/private/tmp/lambda-vm-guest-review-20261027/vendor/ethrex/crates/common)
+   Compiling ethrex-levm v23.0.0 (/private/tmp/lambda-vm-guest-review-20261027/vendor/ethrex/crates/vm/levm)
+   Compiling ethrex-l2-common v23.0.0 (/private/tmp/lambda-vm-guest-review-20261027/vendor/ethrex/crates/l2/common)
+   Compiling ethrex-vm v23.0.0 (/private/tmp/lambda-vm-guest-review-20261027/vendor/ethrex/crates/vm)
+   Compiling pr1014-round2-checks v0.1.0 (/private/tmp/lambda-vm-guest-review-20261027/tooling/guest-review/checks)
+    Finished `release` profile [optimized] target(s) in 31.30s
+     Running unittests src/lib.rs (/private/tmp/pr1014-round2-checks-target/release/deps/pr1014_round2_checks-5cdcfa4d33f2b11b)
+
+running 31 tests
+test round12::full_width_division_add_back_cases ... ok
+test round10::borrowed_flat_key_hook_preserves_legacy_overrides_and_dirty_keys ... ok
+test round11::wide_division_matches_reference_at_correction_boundaries ... ok
+test round4::covered_memory_matches_upstream_for_boundaries_and_frame_reuse ... ok
+test round4::empty_code_keeps_the_supplied_hash_and_wire_representation ... ok
+test round4::node_ref_archive_and_shared_deserialization_match_upstream ... ok
+test round10::repeated_trie_queries_and_mutations_match_original ... ok
+test round6::in_place_branches_drop_partial_children_on_error_and_unwind ... ok
+test round12::full_width_division_all_divisor_widths_and_quotient_boundaries ... ok
+test round6::lazy_analysis_is_shared_and_safe_under_concurrent_queries ... ok
+test round10::cursor_resident_prefixes_and_database_fallbacks_match_original ... ok
+test round11::wide_division_matches_reference_for_random_full_width_numerators ... ok
+test round9::stack_pair_matches_previous_sequence_at_every_depth ... ok
+test round10::specialized_remainder_matches_full_width_reference ... ok
+test tests::bitmap_precomputed_parts_preserve_old_membership_and_wire_format ... ok
+test round9::trie_resident_and_database_paths_match_pinned_revision ... ok
+test tests::branch_writer_maximum_children_and_uncached_nodes ... ok
+test round6::lazy_queries_match_linear_scanner_before_materialization ... ok
+test round7::specialized_division_matches_full_width_reference ... ok
+test tests::branch_writer_rejects_invalid_inline_lengths ... ok
+test tests::code_serialization_preserves_unpadded_form ... ok
+test tests::rlp_lengths_match_reference_at_all_prefix_widths ... ok
+test tests::rlp_integers_match_reference ... ok
+test round9::dup_matches_pinned_stack_at_every_depth ... ok
+test tests::trie_roots_match_unmodified_revision_after_mutation ... ok
+test tests::exhaustive_short_bytecode ... ok
+test tests::scanner_push_boundaries_and_random ... ok
+test round8::jump_traces_gas_and_errors_match_original_vm ... ok
+test round4::reserved_decoder_matches_default_and_rejects_invalid_archives ... ok
+test tests::branch_encoding_matches_unchanged_trait_encoder ... ok
+test round6::lazy_queries_cover_push_and_chunk_boundaries ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running unittests src/bin/keccak_vectors.rs (/private/tmp/pr1014-round2-checks-target/release/deps/keccak_vectors-ccc6a4e3bc64f20d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests pr1014_round2_checks
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

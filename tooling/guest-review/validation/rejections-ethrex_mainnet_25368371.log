@@ -1,0 +1,4 @@
+state-root	/private/tmp/lambda-vm-guest-review-20261027/tooling/guest-review/out/elfs/branch.elf	rejected
+receipts-root	/private/tmp/lambda-vm-guest-review-20261027/tooling/guest-review/out/elfs/branch.elf	rejected
+missing-state	/private/tmp/lambda-vm-guest-review-20261027/tooling/guest-review/out/elfs/branch.elf	rejected
+missing-code	/private/tmp/lambda-vm-guest-review-20261027/tooling/guest-review/out/elfs/branch.elf	rejected

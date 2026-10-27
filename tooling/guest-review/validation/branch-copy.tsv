@@ -1,0 +1,6 @@
+ethrex_10_transfers.bin	copy_calls=2806	copy_bytes=425674	copy_rows=55381	keccak_calls=178	ecsm_calls=40
+ethrex_bench_4.bin	copy_calls=2357	copy_bytes=356056	copy_rows=46390	keccak_calls=178	ecsm_calls=16
+ethrex_empty_block.bin	copy_calls=780	copy_bytes=103869	copy_rows=13597	keccak_calls=78	ecsm_calls=0
+ethrex_mainnet_25368371.bin	copy_calls=30949	copy_bytes=4030545	copy_rows=534311	keccak_calls=10659	ecsm_calls=116
+ethrex_mainnet_25453112.bin	copy_calls=54658	copy_bytes=7351171	copy_rows=969971	keccak_calls=18807	ecsm_calls=164
+ethrex_simple_tx.bin	copy_calls=1573	copy_bytes=263892	copy_rows=33963	keccak_calls=107	ecsm_calls=4
