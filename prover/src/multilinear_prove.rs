@@ -109,11 +109,13 @@ pub fn chain_config(shapes: &[Shape]) -> ChainConfig {
 /// height charged is the larger of the widest table's `one_stack` and the
 /// height all the shapes would stack to together under the format's cap, which
 /// bounds every group's from above ([`multilinear_table::stack_height`] is
-/// monotone). At every production shape the charge does not move Q: the widest
-/// table already stands at or above the cap, and first6 keeps Q at 112 at every
-/// height from 15 to 30 (the legacy `uniform4` from 13 to 28). Q moves only
-/// where the stack crosses a round edge that no single table reaches — 7 or 15
-/// under first6, 5 or 13 under `uniform4` — which only small test programs do.
+/// monotone). At the default format (first6, blowup 2, 18 query-grind bits) Q
+/// is 229 at every height of 23 or more, 228 from 15 to 22, 227 from 8 to 14,
+/// 226 at 7 and 224 at 6 (`the_query_count_by_tallest_stack_at_the_default`).
+/// On a block the charge does not move Q: BITWISE (21 columns of 2^20 rows)
+/// stacks to 25, and the frame holds it to that height
+/// (`block_whir::check_bitwise_height`). Q moves only for a statement whose
+/// tallest stack is under 23, which only small test programs make.
 pub fn chain_config_under(format: &crate::zf_format::ZfFormat, shapes: &[Shape]) -> ChainConfig {
     let widest_table = shapes
         .iter()

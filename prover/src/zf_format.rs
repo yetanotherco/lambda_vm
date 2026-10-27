@@ -116,7 +116,8 @@ pub const LEGACY_WHIR_LOG_BLOWUP: usize = 2;
 /// format, the default's rollback) and 2 (the default). The query count follows from the rate by the code's own rule
 /// (`multilinear::query_count::num_queries`): at the default fold schedule and
 /// 18 query-grind bits, blowup 2 charges Q 229 at every stack of 23 variables or
-/// more (seven rounds) and 228 below (five), where blowup 4 charges 114. Every
+/// more (six rounds from 23, seven from 27) and 228 from 15 to 22 (five), where
+/// blowup 4 charges 114; a block's BITWISE holds its tallest stack at 25. Every
 /// phase keeps the conjectured (Johnson-regime) 128 bits: the binding phase is
 /// the unground fold at 27 variables, 130.393 → 130.344 per polynomial (128.393 →
 /// 128.344 under `GroupFold::Indexed`); the query phases move 130.907 → 130.946.
@@ -1593,8 +1594,8 @@ mod tests {
         }
         // Every height a production chain reaches: Q from the rule at the worst
         // round count up to that height, 229 from 23 variables (seven rounds at
-        // 27, six from 23) and 228 below (five rounds), where blowup 4 charges
-        // 114 throughout.
+        // 27, six from 23) and 228 from 15 to 22 (five rounds), where blowup 4
+        // charges 114 throughout.
         for n in 15..=27 {
             let c4 = chain_config_under(&four, &[(1, n)]);
             let c2 = chain_config_under(&ZfFormat::DEFAULT, &[(1, n)]);
