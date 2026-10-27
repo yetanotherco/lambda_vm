@@ -1,0 +1,5 @@
+Unmodified ethrex snapshot (followed by a separate optimization commit).
+Repository: https://github.com/lambdaclass/ethrex
+Commit: 797df5540c7d35cafd69b6971a74b2a49c67d1dd
+Exported with git archive; original licenses are in ethrex/LICENSE-MIT and ethrex/LICENSE-APACHE.
+This review branch vendors the source to keep the optimized guest reproducible from one remote branch.

@@ -1,0 +1,97 @@
+//! # ethrex Storage
+//!
+//! This crate provides persistent storage for the ethrex Ethereum client.
+//!
+//! ## Overview
+//!
+//! The storage layer handles:
+//! - Block storage (headers, bodies, receipts)
+//! - State storage (accounts, code, storage slots)
+//! - Merkle Patricia Trie management
+//! - Transaction indexing
+//! - Chain configuration
+//!
+//! ## Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────┐
+//! │                    Store                        │
+//! │  (High-level API for blockchain operations)     │
+//! └─────────────────────────────────────────────────┘
+//!                        │
+//!           ┌────────────┴────────────┐
+//!           ▼                         ▼
+//! ┌─────────────────┐       ┌─────────────────┐
+//! │  InMemoryBackend │       │  RocksDBBackend │
+//! │    (Testing)     │       │  (Production)   │
+//! └─────────────────┘       └─────────────────┘
+//! ```
+//!
+//! ## Storage Backends
+//!
+//! - **InMemory**: Fast, non-persistent storage for testing
+//! - **RocksDB**: Production-grade persistent storage (requires `rocksdb` feature)
+//!
+//! ## Usage
+//!
+//! ```ignore
+//! use ethrex_storage::{Store, EngineType};
+//!
+//! // Create a new store with RocksDB backend
+//! let store = Store::new("./data", EngineType::RocksDB)?;
+//!
+//! // Or from a genesis file
+//! let store = Store::new_from_genesis(
+//!     Path::new("./data"),
+//!     EngineType::RocksDB,
+//!     "genesis.json"
+//! ).await?;
+//!
+//! // Add a block
+//! store.add_block(block).await?;
+//!
+//! // Query state
+//! let balance = store.get_account_info(block_number, address)?.map(|a| a.balance);
+//! ```
+//!
+//! ## State Management
+//!
+//! State is stored using Merkle Patricia Tries for efficient verification:
+//! - **State Trie**: Maps account addresses to account data
+//! - **Storage Tries**: Maps storage keys to values for each contract
+//! - **Code Storage**: Separate storage for contract bytecode
+//!
+//! The store maintains a cache layer (`TrieLayerCache`) for efficient state access
+//! without requiring full trie traversal for recent blocks.
+
+pub mod api;
+pub mod backend;
+pub mod block_data_buffer;
+pub mod error;
+pub mod journal;
+mod layering;
+pub mod migrations;
+pub mod rlp;
+pub mod store;
+pub mod trie;
+pub mod utils;
+
+pub use layering::apply_prefix;
+pub use store::{
+    AccountUpdatesList, BATCH_COMMIT_THRESHOLD, DB_COMMIT_THRESHOLD,
+    DEFAULT_ROCKSDB_BLOCK_CACHE_SIZE_BYTES, EngineType, Store, StoreConfig, UpdateBatch,
+    has_valid_db, hash_address, hash_key, read_chain_id_from_db,
+};
+
+/// Store Schema Version, must be updated on any breaking change.
+///
+/// When bumping this version, add a corresponding migration function to
+/// `migrations::MIGRATIONS`. The migration framework will automatically
+/// upgrade existing databases instead of requiring a full resync.
+pub const STORE_SCHEMA_VERSION: u64 = 3;
+
+/// Name of the file storing the metadata about the database.
+///
+/// This file contains version information and is used to detect
+/// incompatible database formats on startup.
+pub const STORE_METADATA_FILENAME: &str = "metadata.json";

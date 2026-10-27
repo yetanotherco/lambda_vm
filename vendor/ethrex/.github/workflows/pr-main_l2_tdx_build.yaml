@@ -1,0 +1,70 @@
+name: L2 TDX build
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  # Work around frequent libgit2/submodule fetch flakiness in CI.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      run_tests: ${{ steps.finish.outputs.run_tests }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            run_tests:
+              - '!docs/**'
+      - name: finish
+        id: finish
+        run: echo "run_tests=${{ steps.filter.outputs.run_tests }}" >> "$GITHUB_OUTPUT"
+      - name: Print result
+        run: echo "run_tests=${{ steps.finish.outputs.run_tests }}"
+
+  build_tdx:
+    # "Test" is a required check, don't change the name
+    name: Test
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.run_tests == 'true' && always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+
+      - name: Set up Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          # crates.io 403s any User-Agent containing "curl/", which is what Nix's
+          # fetchurl sends by default, breaking crate downloads during the image
+          # build. In multi-user (daemon) mode the FOD builds run under the
+          # nix-daemon and don't see the caller's environment, so override the
+          # User-Agent via impure-env (honored because the runner is a trusted
+          # user). Use curl's glued short option `-A<value>`: a single space-free
+          # token that survives impure-env's space-separated parsing and
+          # fetchurl's unquoted word-split (curl rejects the --user-agent=value form).
+          extra_nix_config: |
+            extra-experimental-features = configurable-impure-env
+            impure-env = NIX_CURL_FLAGS=-Aethrex-ci+https://github.com/lambdaclass/ethrex
+
+      - name: Build image
+        run: |
+          sudo sysctl kernel.unprivileged_userns_apparmor_policy=0
+          sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+          cd crates/l2/tee/quote-gen
+          make image.raw || { echo "if fails run in the root of the project: make update-cargo-lock"; exit 1; }

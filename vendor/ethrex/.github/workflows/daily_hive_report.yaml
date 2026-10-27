@@ -1,0 +1,293 @@
+name: Daily Hive Report
+
+on:
+  schedule:
+    # Every day at UTC 03:00
+    - cron: "0 3 * * 1,2,3,4,5"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/daily_hive_report.yaml
+      - .github/scripts/publish_hive.sh
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  # Work around frequent libgit2/submodule fetch clakiness in CI.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  run-hive:
+    name: Hive - ${{ matrix.test.name }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - {
+              name: "Rpc Compat tests",
+              file_name: rpc-compat,
+              simulation: ethereum/rpc-compat,
+              limit: "",
+            }
+          - {
+              name: "Devp2p eth tests",
+              file_name: devp2p,
+              simulation: devp2p,
+              limit: "",
+            }
+          - {
+              name: "Engine tests",
+              file_name: engine,
+              simulation: ethereum/engine,
+              limit: "",
+            }
+          - {
+              name: "Sync tests",
+              file_name: sync,
+              simulation: ethereum/sync,
+              limit: "",
+            }
+          - {
+              name: "Consume Engine tests (Rest)",
+              file_name: consume-engine-rest,
+              simulation: ethereum/eels/consume-engine,
+              limit: ".*fork_Paris.*|.*fork_Shanghai.*|.*fork_Cancun.*",
+            }
+          - {
+              name: "Consume Engine tests (Prague)",
+              file_name: consume-engine-prague,
+              simulation: ethereum/eels/consume-engine,
+              limit: ".*fork_Prague.*",
+            }
+          - {
+              name: "Consume Engine tests (Amsterdam)",
+              file_name: consume-engine-amsterdam,
+              simulation: ethereum/eels/consume-engine,
+              limit: ".*fork_Amsterdam.*",
+            }
+          - {
+              name: "Consume RLP tests (Rest)",
+              file_name: consume-rlp-rest,
+              simulation: ethereum/eels/consume-rlp,
+              limit: ".*fork_Paris.*|.*fork_Shanghai.*|.*fork_Cancun.*",
+            }
+          - {
+              name: "Consume RLP tests (Prague)",
+              file_name: consume-rlp-prague,
+              simulation: ethereum/eels/consume-rlp,
+              limit: ".*fork_Prague.*",
+            }
+          # Lower parallelism to avoid OOM on CI (runner gets SIGTERM'd at ~68min
+          # with parallelism 4, likely due to larger BAL fixture set + bigger block bodies)
+          - {
+              name: "Consume RLP tests (Amsterdam)",
+              file_name: consume-rlp-amsterdam,
+              simulation: ethereum/eels/consume-rlp,
+              limit: ".*fork_Amsterdam.*",
+              parallelism: 2,
+            }
+          - {
+              name: "Execute Blobs tests",
+              file_name: execute-blobs,
+              simulation: ethereum/eels/execute-blobs,
+              limit: "",
+            }
+
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          large-packages: false
+
+      - name: Checkout sources
+        uses: actions/checkout@v6
+
+      # Set custom args defined in Dockerfile to pin execution-spec-tests versions
+      # See: https://github.com/ethereum/hive/blob/c2dab60f898b94afe8eeac505f60dcde59205e77/simulators/ethereum/eest/consume-rlp/Dockerfile#L4-L8
+      - name: Load Amsterdam config
+        id: amsterdam-config
+        shell: bash
+        run: |
+          echo "fixtures=$(yq -r '.fixtures' .github/config/hive/amsterdam.yaml)" >> "$GITHUB_OUTPUT"
+          echo "eels_commit=$(yq -r '.eels_commit' .github/config/hive/amsterdam.yaml)" >> "$GITHUB_OUTPUT"
+
+      - name: Load mainnet config
+        id: mainnet-config
+        shell: bash
+        run: |
+          echo "fixtures=$(yq -r '.fixtures' .github/config/hive/mainnet.yaml)" >> "$GITHUB_OUTPUT"
+          echo "eels_commit=$(yq -r '.eels_commit' .github/config/hive/mainnet.yaml)" >> "$GITHUB_OUTPUT"
+
+      - name: Determine hive flags
+        id: hive-flags
+        shell: bash
+        env:
+          SIMULATION: ${{ matrix.test.simulation }}
+          SIM_LIMIT: ${{ matrix.test.limit || '' }}
+          AMSTERDAM_FIXTURES: ${{ steps.amsterdam-config.outputs.fixtures }}
+          AMSTERDAM_EELS_COMMIT: ${{ steps.amsterdam-config.outputs.eels_commit }}
+          MAINNET_FIXTURES: ${{ steps.mainnet-config.outputs.fixtures }}
+          MAINNET_EELS_COMMIT: ${{ steps.mainnet-config.outputs.eels_commit }}
+        run: |
+          FLAGS="--sim.parallelism ${{ matrix.test.parallelism || 4 }} --sim.loglevel 1"
+          if [[ "$SIMULATION" == "ethereum/eels/consume-engine" || "$SIMULATION" == "ethereum/eels/consume-rlp" ]]; then
+            # Use fork-specific fixtures to ensure comprehensive test coverage
+            if [[ "$SIM_LIMIT" == *"fork_Amsterdam"* ]]; then
+              # Amsterdam config loaded from .github/config/hive/amsterdam.yaml
+              FLAGS+=" --sim.buildarg fixtures=$AMSTERDAM_FIXTURES"
+              FLAGS+=" --sim.buildarg branch=$AMSTERDAM_EELS_COMMIT"
+            else
+              # All other forks (Prague, Osaka, Cancun, Shanghai, Paris) use the
+              # mainnet bundle (execution-specs tests@v20.0.0), which includes
+              # comprehensive coverage including ported static tests.
+              # Config loaded from .github/config/hive/mainnet.yaml
+              FLAGS+=" --sim.buildarg fixtures=$MAINNET_FIXTURES"
+              FLAGS+=" --sim.buildarg branch=$MAINNET_EELS_COMMIT"
+            fi
+            FLAGS+=" --client.checktimelimit=180s"
+          fi
+
+          if [[ "$SIMULATION" == "ethereum/rpc-compat" ]]; then
+            FLAGS+=" --sim.buildarg branch=d08382ae5c808680e976fce4b73f4ba91647199b"
+          fi
+
+          if [[ -n "$SIM_LIMIT" ]]; then
+            # Single-quote the limit so regex metacharacters (e.g. the `|` in
+            # multi-fork limits) survive the action's shell re-evaluation of
+            # extra_flags. Matches pr-main_l1.yaml's escaping.
+            escaped_limit=${SIM_LIMIT//\'/\'\\\'\'}
+            FLAGS+=" --sim.limit '$escaped_limit'"
+          fi
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Run Hive Simulation
+        id: run-hive-action
+        uses: ethpandaops/hive-github-action@v0.5.0
+        continue-on-error: true
+        with:
+          simulator: ${{ matrix.test.simulation }}
+          client: ethrex
+          # Pin hive to ethereum/hive#1530's merge commit, which fixes the
+          # clients/ethrex/mapper.jq depositContractAddress bug from #1507:
+          # #1524 wrapped the `//` value in parens (the unparenthesized form was
+          # a jq syntax error that stopped the client from starting), and #1530
+          # restored the mainnet deposit contract address as the fallback (the
+          # zero-address default made every eip6110 deposit / eip7685 request
+          # test fail). Also gives the daily report a reproducible hive version
+          # instead of floating on the action's default.
+          hive_version: 7c4c99ebb79955f23e1952fb0282a0dadcb6e181
+          extra_flags: ${{ steps.hive-flags.outputs.flags }}
+          workflow_artifact_upload: true
+          workflow_artifact_prefix: ${{ matrix.test.file_name }}_daily
+
+  hive-report:
+    name: Generate and Save report
+    needs: run-hive
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_name: results_daily.md
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+      - name: Setup Rust Environment
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-pool: l1
+
+      - name: Download all results
+        continue-on-error: true
+        uses: actions/download-artifact@v6
+        with:
+          path: hive/workspace/logs
+          pattern: "*_daily-results.zip"
+          merge-multiple: true
+
+      - name: Flatten hive result files
+        shell: bash
+        run: |
+          shopt -s globstar nullglob
+          mkdir -p hive/workspace/logs
+          for json in hive/workspace/logs/**/*.json; do
+            base_name=$(basename "$json")
+            target="hive/workspace/logs/$base_name"
+            if [[ "$json" != "$target" ]]; then
+              mv "$json" "$target"
+            fi
+          done
+          find hive/workspace/logs -mindepth 1 -type d -exec rm -rf {} +
+
+      - name: Print failed tests
+        if: always()
+        shell: bash
+        run: |
+          shopt -s nullglob
+          found_failures=false
+          for log in hive/workspace/logs/*.log; do
+            mapfile -t failures < <(grep 'FAILED ' "$log" | sed -E 's/^.*FAILED ([^ ]+).*/\1/' || true)
+            if (( ${#failures[@]} )); then
+              found_failures=true
+              echo "Failures in $(basename "$log"):"
+              printf '  %s\n' "${failures[@]}"
+              echo
+            fi
+          done
+          if [ "$found_failures" = false ]; then
+            echo "No test failures found in logs."
+          fi
+
+      - name: Generate the hive report
+        run: cargo run --manifest-path tooling/Cargo.toml -p hive_report > results.md
+
+      - name: Upload daily result
+        uses: actions/upload-artifact@v6
+        with:
+          name: results_daily.md
+          path: |
+            results.md
+            hive_slack_blocks.json
+          if-no-files-found: error
+
+      - name: Post results in summary
+        run: |
+          echo "# Hive coverage report" >> $GITHUB_STEP_SUMMARY
+          cat results.md >> $GITHUB_STEP_SUMMARY
+
+  post-daily-report:
+    name: Post report to slack
+    needs: [hive-report]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+
+      - name: Download hive results
+        uses: actions/download-artifact@v6
+        with:
+          name: ${{ needs.hive-report.outputs.artifact_name }}
+
+      - name: Post Hive results to Slack
+        env:
+          SLACK_WEBHOOKS: >
+            ${{ github.event_name == 'schedule'
+              && secrets.ETHREX_INTERNO_SLACK_WEBHOOK
+              || secrets.TEST_CHANNEL_SLACK
+            }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          for webhook in $SLACK_WEBHOOKS; do
+            bash .github/scripts/publish_hive.sh "$webhook" hive_slack_blocks.json "$RUN_URL"
+          done
+          echo "Sending Results" >> $GITHUB_STEP_SUMMARY

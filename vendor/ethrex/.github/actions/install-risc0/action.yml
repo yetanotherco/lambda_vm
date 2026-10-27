@@ -1,0 +1,18 @@
+name: "Install RISC0"
+description: "Install RISC0 Toolchain"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install RISC0
+      shell: bash
+      run: |
+        source "$GITHUB_WORKSPACE/.github/scripts/retry.sh"
+
+        retry curl -L https://risczero.com/install -o /tmp/risc0_install.sh
+        bash /tmp/risc0_install.sh
+        retry ~/.risc0/bin/rzup install cargo-risczero 3.0.3
+        retry ~/.risc0/bin/rzup install risc0-groth16
+        retry ~/.risc0/bin/rzup install rust
+        retry ~/.risc0/bin/rzup install cpp
+        retry ~/.risc0/bin/rzup install r0vm 3.0.3
