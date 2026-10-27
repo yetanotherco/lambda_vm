@@ -3157,8 +3157,8 @@ where
 /// Store columns `first..first + width`, each at `point` (base columns, an
 /// ext3 point), evaluated where they lie: a commit-time out-of-domain claim's
 /// column values (`stacked_eval::ood_claims`). `None` when the store does not
-/// hold them as one run spanning `point`, when the run is too small to be
-/// worth the launches, or when the card refuses: the caller evaluates them on
+/// hold them as one run spanning `point`, when the run has fewer than
+/// `min_cells` cells, or when the card refuses: the caller evaluates them on
 /// the host.
 #[cfg(feature = "cuda")]
 pub(crate) fn evaluate_resident_run<E>(
@@ -3166,6 +3166,7 @@ pub(crate) fn evaluate_resident_run<E>(
     first: usize,
     width: usize,
     point: &[math::field::element::FieldElement<E>],
+    min_cells: usize,
 ) -> Option<Vec<math::field::element::FieldElement<E>>>
 where
     E: math::field::traits::IsField + 'static,
@@ -3179,7 +3180,7 @@ where
     let rows = 1usize << point.len();
     if !store.0.is_run(first, width)
         || store.0.span(first).1 != rows
-        || rows.saturating_mul(width) < EVALUATE_THRESHOLD
+        || rows.saturating_mul(width) < min_cells
     {
         return None;
     }
@@ -3222,6 +3223,7 @@ pub(crate) fn evaluate_resident_run<E>(
     _first: usize,
     _width: usize,
     _point: &[math::field::element::FieldElement<E>],
+    _min_cells: usize,
 ) -> Option<Vec<math::field::element::FieldElement<E>>>
 where
     E: math::field::traits::IsField + 'static,

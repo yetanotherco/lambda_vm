@@ -32,6 +32,8 @@ pub mod branch_multiplicity_poc;
 #[cfg(test)]
 pub mod bytewise_tests;
 #[cfg(test)]
+pub mod commit_ood_host_tests;
+#[cfg(test)]
 pub mod compute_commit_bus_offset_tests;
 #[cfg(test)]
 pub mod constraint_artifact_tests;

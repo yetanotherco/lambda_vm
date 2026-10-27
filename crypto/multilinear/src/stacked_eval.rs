@@ -877,6 +877,9 @@ where
     let at = |c: usize| crate::commit_ood::column_point(layout, c, &point);
     let mut values: Vec<Option<FieldElement<E>>> = vec![None; placements.len()];
     let mut counts = OodCounts::default();
+    // Every run the card holds is read there, however small: a resident
+    // table may be held narrow or as records, and a host read of it would
+    // widen the whole table (and keep the copy) for a few columns' values.
     if let Some((store, map)) = &resident {
         let mut c = 0usize;
         while c < placements.len() {
@@ -889,7 +892,7 @@ where
             {
                 end += 1;
             }
-            if let Some(run) = crate::gpu::evaluate_resident_run(store, first, end - c, at(c)) {
+            if let Some(run) = crate::gpu::evaluate_resident_run(store, first, end - c, at(c), 0) {
                 counts.on_card += run.len();
                 for (slot, value) in values[c..end].iter_mut().zip(run) {
                     *slot = Some(value);
@@ -902,14 +905,22 @@ where
         .filter(|&c| values[c].is_none())
         .collect();
     counts.on_host = missing.len();
-    let one = |&c: &usize| -> Result<(usize, FieldElement<E>), Error> {
-        Ok((c, columns[c].host().evaluate_in(at(c))?))
+    // ⚠ Each column's host copy is fetched HERE, on the calling thread, before
+    // the parallel map. A table held narrow or as records widens on its first
+    // host read, once, behind a `OnceLock`, and the widen is itself a parallel
+    // map. Fetched inside a job, the worker running the widen picks up a
+    // sibling job of the same table while it waits and re-enters the
+    // `OnceLock` it is initialising: the pool deadlocks
+    // (`a_narrow_tables_answers_end_and_match_its_widened_columns`).
+    let hosts: Vec<(usize, &Mle<F>)> = missing.iter().map(|&c| (c, columns[c].host())).collect();
+    let one = |&(c, column): &(usize, &Mle<F>)| -> Result<(usize, FieldElement<E>), Error> {
+        Ok((c, column.evaluate_in(at(c))?))
     };
     #[cfg(feature = "parallel")]
     let host: Vec<(usize, FieldElement<E>)> =
-        missing.par_iter().map(one).collect::<Result<_, _>>()?;
+        hosts.par_iter().map(one).collect::<Result<_, _>>()?;
     #[cfg(not(feature = "parallel"))]
-    let host: Vec<(usize, FieldElement<E>)> = missing.iter().map(one).collect::<Result<_, _>>()?;
+    let host: Vec<(usize, FieldElement<E>)> = hosts.iter().map(one).collect::<Result<_, _>>()?;
     for (c, value) in host {
         values[c] = Some(value);
     }
