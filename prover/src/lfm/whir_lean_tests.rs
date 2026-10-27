@@ -567,3 +567,36 @@ fn a_lean_chain_refuses_a_tail_value_off_by_its_fold() {
         );
     }
 }
+
+/// ★ The intermediate tail rounds' successor compare is load-bearing on its
+/// own: with the cap compare off, one value of the first tail round's first or
+/// last block one off (a round with a tail successor) folds away from its
+/// successor's slot and has no execution. No other compare reads that block
+/// (the round before checks its own successor openings, separate words).
+#[test]
+fn a_lean_chain_refuses_a_first_tail_value_off_by_its_successor_compare() {
+    let mut checked = 0;
+    for (num_vars, cfg) in tail_cases() {
+        let f = fixture(num_vars, cfg);
+        let shape = lean(&f.shape);
+        let r = tails(&shape)[0];
+        if shape.next_depth(r).is_none() {
+            continue;
+        }
+        let unchecked = tail_faults::with_leaves_unchecked(|| p1_chain_program(&shape));
+        let honest = arena_at(&f, &f.proof, &shape).expect("laid out");
+        execute(&unchecked, std::slice::from_ref(&honest), &SOCKET)
+            .unwrap_or_else(|e| panic!("S={num_vars}: the honest arena under the fault: {e:?}"));
+        for leaf in [0, shape.current_leaves(r) - 1] {
+            let mut forged = honest.clone();
+            forged[tail_block_at(&shape, r) + leaf * (1usize << shape.schedule[r])][0] +=
+                FE::from(1u64);
+            assert!(
+                execute(&unchecked, &[forged], &SOCKET).is_err(),
+                "S={num_vars}: tail round {r} leaf {leaf} one off must be refused by its successor compare"
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "some case has two tail rounds");
+}

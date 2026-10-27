@@ -5,13 +5,19 @@
 //! executor (serial, level, streamed) runs the hint after the bit's writer.
 
 use crate::tables::types::FE;
+use crypto::hash::poseidon1_stark::{self as zisk, Merkle4};
+use stark::proof::options::GoldilocksCubicProofOptions;
 
 use super::builder::{Bit, Cell, LfmBuilder};
 use super::compiler::{LfmProgram, compile};
+use super::edsl::WrapDigest;
 use super::exec_schedule;
 use super::executor::{LfmExecError, StreamedExecution, execute, execute_serial};
 use super::hash::HasherKind;
-use super::instr::{Addr, Instr};
+use super::instr::{Addr, ArenaId, Instr};
+use super::p1w16_emit::{hint_path_rotated, walk4};
+use super::proof::{LfmProof, lfm_prove, verify_against};
+use super::registry::build_artifacts_with_hasher;
 use super::validator::{LfmViolation, validate};
 use super::word::{LfmWord, base_word};
 
@@ -217,4 +223,168 @@ fn a_streamed_hint_on_waits_for_its_bits_group() {
             "order {order:?}: the serial words"
         );
     }
+}
+
+fn digest(seed: u64, i: usize) -> [FE; 4] {
+    core::array::from_fn(|j| {
+        let mut z = seed
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add((4 * i + j) as u64 + 1);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        FE::from(z ^ (z >> 31))
+    })
+}
+
+/// The path's sibling triples in child order, as `zisk` lists them.
+fn child_order(path: &[[FE; zisk::SIBLING_FELTS]]) -> Vec<LfmWord> {
+    path.iter()
+        .flat_map(|level| (0..3).map(move |k| core::array::from_fn(|j| level[4 * k + j])))
+        .collect()
+}
+
+/// How a 4-ary walk's sibling words are hinted.
+#[derive(Clone, Copy)]
+enum HintMode {
+    /// Production: `hint_path_rotated`.
+    Rotated,
+    /// Each `HintOn` with `index` and `alt` swapped.
+    Swapped,
+    /// Each `HintOn` a plain `Hint` of its `index` word.
+    Plain,
+}
+
+fn walk_hints(b: &mut LfmBuilder, a: ArenaId, bits: &[Bit], mode: HintMode) -> Vec<WrapDigest> {
+    if let HintMode::Rotated = mode {
+        return hint_path_rotated(b, a, 0, bits);
+    }
+    let mut out = Vec::new();
+    let mut w = 0u32;
+    for pair in bits.chunks(2) {
+        let [_, b1] = pair else {
+            panic!("even depth only")
+        };
+        for k in 0..3 {
+            let (index, alt) = (w + k, w + (k + 2) % 3);
+            let c = match mode {
+                HintMode::Swapped => b.hint_word_on(a, alt, *b1, index),
+                HintMode::Plain => b.hint_word(a, index),
+                HintMode::Rotated => unreachable!(),
+            };
+            out.push(WrapDigest::from_cell(c));
+        }
+        w += 3;
+    }
+    out
+}
+
+/// A 4-ary walk of `depth` levels from a hinted leaf and index, its sibling
+/// words hinted as `mode` says, publishing the walked root's first felt word.
+fn walk_program(depth: usize, mode: HintMode) -> LfmProgram {
+    let mut b = LfmBuilder::new();
+    let a_leaf = b.declare_arena(1);
+    let a_idx = b.declare_arena(1);
+    let a_path = b.declare_arena(3 * (depth / 2) as u32);
+    let leaf = WrapDigest::from_cell(b.hint_word(a_leaf, 0));
+    let idx = b.hint_felt(a_idx, 0);
+    let bits = b.bit_dec(idx, depth);
+    let h = walk_hints(&mut b, a_path, &bits, mode);
+    let walked = walk4(&mut b, leaf, &bits, &h);
+    b.public(walked.cells()[0]);
+    let program = compile(b.finish());
+    validate(&program).expect("admissible");
+    program
+}
+
+/// ★ `HintOn` at the AIR, not the executor:
+/// 1. a rotated 4-ary walk (`hint_path_rotated` + `walk4`) proves and verifies
+///    and publishes the tree's root;
+/// 2. the program with every `HintOn` a plain `Hint`, or with its `index` and
+///    `alt` swapped, is the same circuit (equal program ids), so the AIR binds
+///    neither the bit nor the arena choice;
+/// 3. so a proof of the swapped program over an arena rearranged to match
+///    verifies under the honest program's artifacts and publishes the same
+///    root: the freedom over the hint order is real and buys nothing;
+/// 4. a wrong leaf walks to another root, and the honest root claimed for
+///    that proof is refused.
+#[test]
+fn a_hint_on_is_a_hint_row_and_a_rotated_walk_proves() {
+    let depth = 4;
+    let n = 1usize << depth;
+    let leaves: Vec<[FE; 4]> = (0..n).map(|i| digest(7, i)).collect();
+    let tree = Merkle4::new(&leaves).expect("non-empty");
+    let root = tree.root();
+    // An index whose b1 bits are both set, so the rotation is live on every level.
+    let index = 0b1010;
+    let path = child_order(&tree.path(index).expect("leaf"));
+    let arenas = vec![
+        vec![leaves[index]],
+        vec![base_word(FE::from(index as u64))],
+        path.clone(),
+    ];
+
+    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup 2");
+    let rotated = walk_program(depth, HintMode::Rotated);
+    let swapped = walk_program(depth, HintMode::Swapped);
+    let plain = walk_program(depth, HintMode::Plain);
+    let art = build_artifacts_with_hasher(&rotated, &opts, SOCKET);
+    let id = |p: &LfmProgram| build_artifacts_with_hasher(p, &opts, SOCKET).program_id;
+    assert_eq!(
+        id(&swapped),
+        art.program_id,
+        "swapped index/alt: same circuit"
+    );
+    assert_eq!(id(&plain), art.program_id, "plain Hint: same circuit");
+
+    let proved = lfm_prove(&rotated, &art, &arenas, &opts).expect("honest proves");
+    assert_eq!(proved.public_words[0].1, root, "the walked root");
+    let verify = |proof: &LfmProof, public: &[(u32, LfmWord)]| {
+        verify_against(
+            &art.roots,
+            &art.program_id,
+            art.keccak_rnd_chunks,
+            &proof.proof,
+            public,
+            &opts,
+            art.hasher,
+            art.chip_set,
+        )
+    };
+    assert!(verify(&proved, &proved.public_words), "honest verifies");
+
+    // At each level with b1 = 1 the rotated program reads hint k from word
+    // (k + 2) % 3 and the swapped one from word k; with b1 = 0 the other way
+    // round. Rearrange each triple so the swapped program reads what the
+    // rotated one read.
+    let mut rearranged = path.clone();
+    for (level, t) in rearranged.chunks_exact_mut(3).enumerate() {
+        let b1 = (index >> (2 * level + 1)) & 1;
+        let orig = [t[0], t[1], t[2]];
+        for k in 0..3 {
+            let want = if b1 == 1 { orig[(k + 2) % 3] } else { orig[k] };
+            let slot = if b1 == 1 { k } else { (k + 2) % 3 };
+            t[slot] = want;
+        }
+    }
+    let arenas2 = vec![arenas[0].clone(), arenas[1].clone(), rearranged];
+    let proved2 = lfm_prove(&swapped, &art, &arenas2, &opts).expect("rearranged proves");
+    assert_eq!(proved2.public_words[0].1, root, "same root");
+    assert!(
+        verify(&proved2, &proved2.public_words),
+        "a proof of the swapped program verifies under the honest program's artifacts"
+    );
+
+    let mut bad = arenas.clone();
+    bad[0][0][0] += FE::one();
+    let proved3 = lfm_prove(&rotated, &art, &bad, &opts).expect("executes: no root compare");
+    assert_ne!(
+        proved3.public_words[0].1, root,
+        "another leaf, another root"
+    );
+    let mut claim = proved3.public_words.clone();
+    claim[0].1 = root;
+    assert!(
+        !verify(&proved3, &claim),
+        "the honest root is refused for it"
+    );
 }
