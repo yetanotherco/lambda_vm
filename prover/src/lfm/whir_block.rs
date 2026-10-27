@@ -1090,7 +1090,30 @@ impl WhirBlockPlan {
         }
         let mut b = self.leaf_builder();
         emit_block_leaf(&mut b, self, k)?;
-        finish(b)
+        let program = finish(b)?;
+        // The partition held this leaf's planned rows (the front plus its
+        // groups') under the heights; the emitted rows are held there too, so
+        // the bound on every leaf chip holds by construction, not only by the
+        // rows' additivity (checked by the census instruments).
+        if let Some(bound) = self.leaf_bound {
+            let rows = ChipRows::of(&program);
+            if !rows.under(bound.heights) {
+                return Err(format!(
+                    "leaf {k} emits {rows:?}, past the heights its partition holds it under, {:?}",
+                    bound.heights
+                ));
+            }
+        }
+        Ok(program)
+    }
+
+    /// The plan with every leaf held under `heights` instead of its
+    /// partition's: a test's tightened bound, to show the emitted rows are
+    /// checked against it ([`Self::leaf_program`]).
+    #[cfg(test)]
+    pub(crate) fn with_leaf_heights(mut self, heights: ChipRows) -> Self {
+        self.leaf_bound = self.leaf_bound.map(|bound| LeafBound { heights, ..bound });
+        self
     }
 
     /// The node over `children`, the top when `top`, emitted and validated:
@@ -1273,11 +1296,13 @@ impl WhirBlockPlan {
     }
 
     /// Replace the partition — another tree, test-only: what a prover may emit
-    /// leaves over, refused at the final check.
+    /// leaves over, refused at the final check. The derived partition's leaf
+    /// bound goes with it: the replacement's leaves are held under none.
     #[cfg(test)]
     pub(crate) fn with_partition(mut self, partition: BlockPartition) -> Self {
         assert_eq!(partition.num_units(), self.groups.len());
         self.partition = partition;
+        self.leaf_bound = None;
         self
     }
 

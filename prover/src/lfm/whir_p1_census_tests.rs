@@ -1470,3 +1470,34 @@ fn whir_s6b_census() {
         );
     }
 }
+
+/// ★ Every leaf's emitted rows are checked against the heights its partition
+/// holds it under ([`WhirBlockPlan::leaf_program`]): the median mix's leaves
+/// emit under them, and with the bound's `Select` height one below leaf 0's
+/// emitted `Select` rows, that leaf is refused by name rather than emitted.
+#[test]
+fn every_emitted_leaf_is_held_under_its_partitions_heights() {
+    let elf_bytes: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let opts = super::proof::block_base_options();
+    let format = p1_format();
+    let owned = median_statement(elf_bytes, &opts, &format);
+    let plan = WhirBlockPlan::derive(elf_bytes, &opts, &format, owned.view(), None)
+        .expect("the plan derives");
+    let bound = plan
+        .leaf_bound()
+        .expect("a derived partition bounds its leaves");
+    for k in 0..plan.partition().num_leaves() {
+        let rows = ChipRows::of(&plan.leaf_program(k).expect("the leaf emits"));
+        assert!(rows.under(bound.heights), "leaf {k}: {rows:?}");
+    }
+    let rows = ChipRows::of(&plan.leaf_program(0).expect("the leaf emits"));
+    let tight = ChipRows {
+        select: rows.select - 1,
+        ..bound.heights
+    };
+    let refused = plan
+        .with_leaf_heights(tight)
+        .leaf_program(0)
+        .expect_err("a leaf past its heights is refused");
+    assert!(refused.starts_with("leaf 0 emits"), "{refused}");
+}
