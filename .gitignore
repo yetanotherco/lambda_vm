@@ -16,3 +16,9 @@ __pycache__/
 # Profiling outputs (run_profile.sh / flamegraphs.sh) and working notes.
 reports/
 thoughts/
+
+# Guest review build and validation artifacts
+/guest-target/
+/tooling/guest-review/out/
+/executor/programs/rust/guest_validation/
+/executor/programs/rust/memcmp_validation/

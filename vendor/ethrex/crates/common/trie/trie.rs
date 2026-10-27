@@ -141,7 +141,7 @@ impl Trie {
     pub fn get(&self, pathrlp: &[u8]) -> Result<Option<ValueRLP>, TrieError> {
         let path = Nibbles::from_bytes(pathrlp);
 
-        if !self.dirty.contains(&path) && self.db().flatkeyvalue_computed(path.clone()) {
+        if !self.dirty.contains(&path) && self.db().flatkeyvalue_computed_ref(&path) {
             let Some(value_rlp) = self.db.get(path)? else {
                 return Ok(None);
             };

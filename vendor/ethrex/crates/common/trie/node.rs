@@ -155,17 +155,8 @@ use super::{ValueRLP, node_hash::NodeHash};
 ///
 /// Explicit rkyv bounds are needed because this is a recursive type, whose
 /// bounds can't be automatically resolved.
-#[derive(
-    Clone,
-    Debug,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-    rkyv::Archive,
-)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, rkyv::Serialize, rkyv::Archive)]
 #[rkyv(serialize_bounds(__S: Writer + Allocator + Sharing, __S::Error: Source))]
-#[rkyv(deserialize_bounds(__D: Pooling, __D::Error: Source))]
 #[rkyv(bytecheck(bounds(__C: ArchiveContext + SharedContext)))]
 pub enum NodeRef {
     /// The node is embedded within the reference.
@@ -179,7 +170,53 @@ pub enum NodeRef {
     Hash(NodeHash),
 }
 
+// Keep shared-pointer allocation/pooling out of the common hash-only path.
+// Archive layout, byte validation, and rkyv's pooling semantics are unchanged.
+impl<D> rkyv::Deserialize<NodeRef, D> for ArchivedNodeRef
+where
+    D: rkyv::rancor::Fallible + Pooling + ?Sized,
+    D::Error: Source,
+{
+    #[inline]
+    fn deserialize(&self, deserializer: &mut D) -> Result<NodeRef, D::Error> {
+        match self {
+            Self::Hash(hash) => Ok(NodeRef::Hash(rkyv::Deserialize::deserialize(
+                hash,
+                deserializer,
+            )?)),
+            Self::Node(node, _) => deserialize_shared_node_ref(node, deserializer),
+        }
+    }
+}
+
+#[inline(never)]
+fn deserialize_shared_node_ref<D>(
+    node: &rkyv::Archived<Arc<Node>>,
+    deserializer: &mut D,
+) -> Result<NodeRef, D::Error>
+where
+    D: rkyv::rancor::Fallible + Pooling + ?Sized,
+    D::Error: Source,
+{
+    Ok(NodeRef::Node(
+        rkyv::Deserialize::deserialize(node, deserializer)?,
+        OnceLock::new(),
+    ))
+}
+
 impl NodeRef {
+    /// Materialize the consumed path only when resolving a nonresident node.
+    pub(crate) fn get_node_mut_at(
+        &mut self,
+        db: &dyn TrieDB,
+        path: &Nibbles,
+    ) -> Result<Option<&mut Node>, TrieError> {
+        match self {
+            NodeRef::Node(node, _) => Ok(Some(Arc::make_mut(node))),
+            _ => self.get_node_mut(db, path.current()),
+        }
+    }
+
     /// Gets a shared reference to the inner node.
     /// Requires that the trie is in a consistent state, ie that all leaves being pointed are in the database.
     /// Outside of snapsync this should always be the case.
@@ -327,7 +364,8 @@ impl NodeRef {
         if let NodeRef::Node(node, hash) = &self
             && hash.get().is_none()
         {
-            node.memoize_hashes(buf, crypto);
+            // Node::compute_hash_no_alloc already memoizes its children in
+            // post-order. A separate pre-walk repeats all child-cache checks.
             let _ = hash.set(node.compute_hash_no_alloc(buf, crypto));
         }
     }
@@ -393,20 +431,113 @@ impl From<NodeHash> for ValueOrHash {
 }
 
 #[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Deserialize,
-    rkyv::Serialize,
-    rkyv::Archive,
+    Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, rkyv::Serialize, rkyv::Archive,
 )]
 /// A Node in an Ethereum Compatible Patricia Merkle Trie
 pub enum Node {
     Branch(Box<BranchNode>),
     Extension(ExtensionNode),
     Leaf(LeafNode),
+}
+
+// Construct large branches in their final allocation instead of returning a
+// full [NodeRef; 16] temporary through every recursive deserialization frame.
+// Archive layout and checked access are unchanged.
+impl<D> rkyv::Deserialize<Node, D> for ArchivedNode
+where
+    D: rkyv::rancor::Fallible + Pooling + ?Sized,
+    D::Error: Source,
+{
+    #[inline]
+    fn deserialize(&self, deserializer: &mut D) -> Result<Node, D::Error> {
+        match self {
+            Self::Branch(branch) => {
+                deserialize_branch_in_place(branch.get(), deserializer).map(Node::Branch)
+            }
+            Self::Extension(extension) => {
+                rkyv::Deserialize::deserialize(extension, deserializer).map(Node::Extension)
+            }
+            Self::Leaf(leaf) => rkyv::Deserialize::deserialize(leaf, deserializer).map(Node::Leaf),
+        }
+    }
+}
+
+struct BranchInitialization {
+    storage: Option<Box<core::mem::MaybeUninit<BranchNode>>>,
+    initialized_choices: usize,
+    initialized_value: bool,
+}
+
+impl Drop for BranchInitialization {
+    fn drop(&mut self) {
+        if let Some(storage) = self.storage.as_mut() {
+            // SAFETY: only the recorded prefix and (if flagged) value were
+            // initialized. MaybeUninit deallocates without dropping them twice.
+            unsafe {
+                let ptr = storage.as_mut_ptr();
+                let choices = core::ptr::addr_of_mut!((*ptr).choices).cast::<NodeRef>();
+                for index in 0..self.initialized_choices {
+                    core::ptr::drop_in_place(choices.add(index));
+                }
+                if self.initialized_value {
+                    core::ptr::drop_in_place(core::ptr::addr_of_mut!((*ptr).value));
+                }
+            }
+        }
+    }
+}
+
+#[inline(never)]
+fn deserialize_branch_in_place<D>(
+    branch: &branch::ArchivedBranchNode,
+    deserializer: &mut D,
+) -> Result<Box<BranchNode>, D::Error>
+where
+    D: rkyv::rancor::Fallible + Pooling + ?Sized,
+    D::Error: Source,
+{
+    let mut guard = BranchInitialization {
+        storage: Some(Box::<BranchNode>::new_uninit()),
+        initialized_choices: 0,
+        initialized_value: false,
+    };
+    let ptr = guard.storage.as_mut().unwrap().as_mut_ptr();
+    // SAFETY: the Box is properly aligned and uniquely owned. Every field is
+    // written once, with no reference to uninitialized fields. The guard drops
+    // initialized fields on an error or unwind. All fields are initialized
+    // before assume_init transfers ownership to the returned Box.
+    unsafe {
+        let choices = core::ptr::addr_of_mut!((*ptr).choices).cast::<NodeRef>();
+        macro_rules! initialize_child {
+            ($index:expr) => {{
+                choices.add($index).write(rkyv::Deserialize::deserialize(
+                    &branch.choices[$index],
+                    deserializer,
+                )?);
+                guard.initialized_choices = $index + 1;
+            }};
+        }
+        initialize_child!(0);
+        initialize_child!(1);
+        initialize_child!(2);
+        initialize_child!(3);
+        initialize_child!(4);
+        initialize_child!(5);
+        initialize_child!(6);
+        initialize_child!(7);
+        initialize_child!(8);
+        initialize_child!(9);
+        initialize_child!(10);
+        initialize_child!(11);
+        initialize_child!(12);
+        initialize_child!(13);
+        initialize_child!(14);
+        initialize_child!(15);
+        core::ptr::addr_of_mut!((*ptr).value)
+            .write(rkyv::Deserialize::deserialize(&branch.value, deserializer)?);
+        guard.initialized_value = true;
+        Ok(guard.storage.take().unwrap().assume_init())
+    }
 }
 
 impl Default for Node {
@@ -446,10 +577,48 @@ impl From<LeafNode> for Node {
 impl Node {
     /// Retrieves a value from the subtrie originating from this node given its path
     pub fn get(&self, db: &dyn TrieDB, path: Nibbles) -> Result<Option<ValueRLP>, TrieError> {
-        match self {
-            Node::Branch(n) => n.get(db, path),
-            Node::Extension(n) => n.get(db, path),
-            Node::Leaf(n) => n.get(path),
+        let mut node = self;
+        let mut offset = 0;
+        loop {
+            let remaining = &path.as_ref()[offset..];
+            match node {
+                Node::Branch(branch) => {
+                    let Some(&choice) = remaining.first().filter(|&&choice| choice < 16) else {
+                        return Ok((!branch.value.is_empty()).then(|| branch.value.clone()));
+                    };
+                    if let NodeRef::Node(child, _) = &branch.choices[choice as usize] {
+                        node = child;
+                        offset += 1;
+                    } else {
+                        // Retain resolution, missing-child errors and consumed-path semantics.
+                        let path = if offset == 0 {
+                            path
+                        } else {
+                            path.offset(offset)
+                        };
+                        return branch.get(db, path);
+                    }
+                }
+                Node::Extension(extension) => {
+                    if !remaining.starts_with(extension.prefix.as_ref()) {
+                        return Ok(None);
+                    }
+                    if let NodeRef::Node(child, _) = &extension.child {
+                        node = child;
+                        offset += extension.prefix.len();
+                    } else {
+                        let path = if offset == 0 {
+                            path
+                        } else {
+                            path.offset(offset)
+                        };
+                        return extension.get(db, path);
+                    }
+                }
+                Node::Leaf(leaf) => {
+                    return Ok((leaf.partial.as_ref() == remaining).then(|| leaf.value.clone()));
+                }
+            }
         }
     }
 

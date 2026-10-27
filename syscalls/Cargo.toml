@@ -21,6 +21,8 @@ dlmalloc = { version = "0.2.14", default-features = false, optional = true }
 critical-section = { version = "1.2", optional = true }
 
 [features]
+# Wide software comparisons; preserves the default COPY memory stubs.
+fast-memcmp = []
 # Guest allocator override. The default (no flag) is the bump allocator; see
 # `src/allocator.rs` for the measurements behind that choice. Select dlmalloc when the
 # execution's cumulative allocation isn't bounded per block.

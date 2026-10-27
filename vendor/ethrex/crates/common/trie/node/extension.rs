@@ -42,6 +42,9 @@ impl ExtensionNode {
         // If the path is prefixed by this node's prefix, delegate to its child.
         // Otherwise, no value is present.
         if path.skip_prefix(&self.prefix) {
+            if let NodeRef::Node(node, _) = &self.child {
+                return node.get(db, path);
+            }
             let child_node = self.child.get_node(db, path.current())?.ok_or_else(|| {
                 TrieError::InconsistentTree(Box::new(
                     InconsistentTreeError::ExtensionNodeChildNotFound(ExtensionNodeErrorData {
@@ -86,7 +89,7 @@ impl ExtensionNode {
         if match_index == self.prefix.len() {
             let path = path.offset(match_index);
             // Insert into child node
-            let Some(child_node) = self.child.get_node_mut(db, path.current())? else {
+            let Some(child_node) = self.child.get_node_mut_at(db, &path)? else {
                 return Err(TrieError::InconsistentTree(Box::new(
                     InconsistentTreeError::ExtensionNodeChildNotFound(ExtensionNodeErrorData {
                         node_hash: self
@@ -116,7 +119,7 @@ impl ExtensionNode {
             };
             let mut choices = BranchNode::EMPTY_CHOICES;
             let mut branch_node = if self.prefix.at(0) == 16 {
-                match new_node.get_node_mut(db, path.current())? {
+                match new_node.get_node_mut_at(db, &path)? {
                     Some(Node::Leaf(leaf)) => {
                         BranchNode::new_with_value(choices, leaf.value.clone())
                     }
@@ -186,7 +189,7 @@ impl ExtensionNode {
 
         // Check if the value is part of the child subtrie according to the prefix
         if path.skip_prefix(&self.prefix) {
-            let Some(child_node) = self.child.get_node_mut(db, path.current())? else {
+            let Some(child_node) = self.child.get_node_mut_at(db, &path)? else {
                 return Err(TrieError::InconsistentTree(Box::new(
                     InconsistentTreeError::ExtensionNodeChildNotFound(ExtensionNodeErrorData {
                         node_hash: self

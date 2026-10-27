@@ -1,0 +1,235 @@
+--- a/crypto/ethrex-crypto/src/lib.rs
++++ b/crypto/ethrex-crypto/src/lib.rs
+@@ -525,33 +525,49 @@
+     const RATE: usize = 136;
+ 
+     let mut state = [0u64; 25];
+-    let mut blocks = input.chunks_exact(RATE);
+-    for block in &mut blocks {
+-        absorb_block(&mut state, block);
++    if cfg!(target_endian = "little") && input.len() < RATE {
++        // SAFETY: the local state is initialized, writable, and disjoint from
++        // input. Its 200-byte allocation exceeds this <136-byte copy. On LE
++        // hosts these bytes are exactly Keccak's little-endian lane encoding.
++        unsafe {
++            core::ptr::copy_nonoverlapping(
++                input.as_ptr(),
++                state.as_mut_ptr().cast::<u8>(),
++                input.len(),
++            );
++        }
++        state[input.len() / 8] |= 1u64 << (8 * (input.len() % 8));
++        state[RATE / 8 - 1] |= 0x80u64 << 56;
+         permute(&mut state);
+-    }
+-
+-    // Final block with multi-rate padding, absorbed straight into the lanes: the
+-    // remainder's whole lanes from the input, its last 0..=7 bytes and the 0x01 pad
+-    // byte assembled into one lane, then the 0x80 pad bit on byte RATE - 1. The same
+-    // XORs as padding a zeroed RATE-byte copy of the remainder, without the copy:
+-    // this runs once per hash, and the guest hashes every trie node.
+-    let mut lanes = blocks.remainder().chunks_exact(8);
+-    let mut lane = 0;
+-    for chunk in &mut lanes {
+-        let mut buf = [0u8; 8];
+-        buf.copy_from_slice(chunk);
+-        state[lane] ^= u64::from_le_bytes(buf);
+-        lane += 1;
+-    }
+-    let tail = lanes.remainder();
+-    let mut last = 0x01u64 << (8 * tail.len());
+-    for (i, byte) in tail.iter().enumerate() {
+-        last |= u64::from(*byte) << (8 * i);
+-    }
+-    state[lane] ^= last;
+-    state[RATE / 8 - 1] ^= 0x80u64 << 56;
+-    permute(&mut state);
++    } else {
++        let mut blocks = input.chunks_exact(RATE);
++        for block in &mut blocks {
++            absorb_block(&mut state, block);
++            permute(&mut state);
++        }
++
++        // Final block with multi-rate padding, absorbed straight into the lanes: the
++        // remainder's whole lanes from the input, its last 0..=7 bytes and the 0x01 pad
++        // byte assembled into one lane, then the 0x80 pad bit on byte RATE - 1. The same
++        // XORs as padding a zeroed RATE-byte copy of the remainder, without the copy:
++        // this runs once per hash, and the guest hashes every trie node.
++        let mut lanes = blocks.remainder().chunks_exact(8);
++        let mut lane = 0;
++        for chunk in &mut lanes {
++            let mut buf = [0u8; 8];
++            buf.copy_from_slice(chunk);
++            state[lane] ^= u64::from_le_bytes(buf);
++            lane += 1;
++        }
++        let tail = lanes.remainder();
++        let mut last = 0x01u64 << (8 * tail.len());
++        for (i, byte) in tail.iter().enumerate() {
++            last |= u64::from(*byte) << (8 * i);
++        }
++        state[lane] ^= last;
++        state[RATE / 8 - 1] ^= 0x80u64 << 56;
++        permute(&mut state);
++    }
+ 
+     // Squeeze the first 32 bytes (four lanes) as little-endian.
+     let mut output = [0u8; 32];
+--- a/crypto/ethrex-crypto/src/tests/keccak_tests.rs
++++ b/crypto/ethrex-crypto/src/tests/keccak_tests.rs
+@@ -90,3 +90,33 @@
+         "4d741b6f1eb29cb2a9b9911c82f56fa8d73b04959d3d9d222895df6c0b28aa15",
+     );
+ }
++
++#[test]
++fn keccak_alignment_lengths_and_permutation_counts() {
++    for len in (0usize..=410).chain([544, 545, 1024, 4095, 4096, 16384]) {
++        for alignment in 0..8 {
++            for pattern in 0..4 {
++                let data: Vec<u8> = (0..len + alignment)
++                    .map(|i| match pattern {
++                        0 => 0,
++                        1 => 255,
++                        2 => ((i as u32).wrapping_mul(0x9e3779b9) >> 24) as u8,
++                        _ => i as u8,
++                    })
++                    .collect();
++                let input = &data[alignment..];
++                let mut count = 0;
++                let got = keccak256_with_permute(input, |state| {
++                    count += 1;
++                    keccak::f1600(state);
++                });
++                assert_eq!(
++                    got,
++                    keccak_hash(input),
++                    "len={len}, alignment={alignment}, pattern={pattern}"
++                );
++                assert_eq!(count, len / 136 + 1);
++            }
++        }
++    }
++}
+--- a/executor/programs/rust/ethrex/Cargo.toml
++++ b/executor/programs/rust/ethrex/Cargo.toml
+@@ -17,7 +17,7 @@
+ [dependencies]
+ # The runtime's `memcpy`, `memmove` and `memset` are the copy accelerator's stubs
+ # (syscalls/src/entrypoint.rs). The `fast-memcpy` feature would keep them in software.
+-lambda-vm-syscalls = { path = "../../../../syscalls" }
++lambda-vm-syscalls = { path = "../../../../syscalls", features = ["fast-memcmp"] }
+ # LambdaVM crypto provider (keccak + ECSM-accelerated ecrecover), defined in the
+ # lambda_vm repo and injected in src/main.rs — so crypto changes stay in our repo
+ # and don't require an ethrex PR.
+--- /dev/null
++++ b/executor/programs/rust/ethrex/src/input.rs
+@@ -0,0 +1,29 @@
++use ethrex_guest_program::l1::ProgramInput;
++use rkyv::rancor::Error;
++
++// Keep the same checked rkyv access and shared-pointer pooling as from_bytes.
++// Reserve a bounded estimate for larger witnesses to avoid repeated rehashes;
++// underestimated tables still grow normally and small inputs keep the default.
++pub fn decode_input(bytes: &[u8]) -> Result<ProgramInput, Error> {
++    use rkyv::de::Pool;
++    use rkyv::validation::{archive::ArchiveValidator, shared::SharedValidator, Validator};
++    let capacity = if bytes.len() >= 64 * 1024 {
++        (bytes.len() / 512).min(65536)
++    } else {
++        0
++    };
++    let archived = {
++        let mut validator = Validator::new(
++            ArchiveValidator::new(bytes),
++            SharedValidator::with_capacity(capacity),
++        );
++        rkyv::api::access_with_context::<rkyv::Archived<ProgramInput>, _, Error>(
++            bytes,
++            &mut validator,
++        )?
++    };
++    rkyv::api::deserialize_using::<ProgramInput, _, Error>(
++        archived,
++        &mut Pool::with_capacity(capacity),
++    )
++}
+--- a/executor/programs/rust/ethrex/src/main.rs
++++ b/executor/programs/rust/ethrex/src/main.rs
+@@ -1,8 +1,8 @@
+ use std::sync::Arc;
+ 
+-use ethrex_guest_program::l1::{ProgramInput, execution_program};
++use ethrex_guest_program::l1::execution_program;
+ use lambda_vm_ethrex_crypto::LambdaVmEcsmCrypto;
+-use rkyv::rancor::Error;
++mod input;
+ 
+ pub fn main() {
+     // Zero-copy private input: borrow the memory-mapped input region in place
+@@ -11,7 +11,7 @@
+     // a full extra copy and one large allocation (~50k cycles on a 20-tx
+     // block).
+     let input = lambda_vm_syscalls::syscalls::get_private_input_slice();
+-    let input = rkyv::from_bytes::<ProgramInput, Error>(input).unwrap();
++    let input = input::decode_input(input).unwrap();
+     // LambdaVM crypto provider, defined in the lambda_vm repo and injected here
+     // (so crypto changes don't require an ethrex PR — see `crypto/ethrex-crypto`).
+     // It accelerates trait-routed `keccak256` (via the keccak_permute precompile)
+--- a/syscalls/Cargo.toml
++++ b/syscalls/Cargo.toml
+@@ -21,6 +21,8 @@
+ critical-section = { version = "1.2", optional = true }
+ 
+ [features]
++# Wide software comparisons; preserves the default COPY memory stubs.
++fast-memcmp = []
+ # Guest allocator override. The default (no flag) is the bump allocator; see
+ # `src/allocator.rs` for the measurements behind that choice. Select dlmalloc when the
+ # execution's cumulative allocation isn't bounded per block.
+--- a/syscalls/src/entrypoint.rs
++++ b/syscalls/src/entrypoint.rs
+@@ -360,3 +360,6 @@
+     syscall = const DMA_MEMSET_SYSCALL_NUMBER,
+     max_bytes = const DMA_MEMCPY_MAX_BYTES,
+ );
++
++#[cfg(feature = "fast-memcmp")]
++core::arch::global_asm!(include_str!("memcmp.S"));
+--- /dev/null
++++ b/syscalls/src/memcmp.S
+@@ -0,0 +1,33 @@
++// Word comparisons on LambdaVM, which supports unaligned scalar loads.
++// Bounds are checked before each load; zero length reads no memory.
++.section .text.lambda_memcmp,"ax",@progbits
++.globl memcmp
++.type memcmp,@function
++memcmp:
++    li t0, 8
++    bltu a2, t0, .Lcmp_tail
++.Lcmp_word:
++    ld t1, 0(a0)
++    ld t2, 0(a1)
++    bne t1, t2, .Lcmp_byte
++    addi a0, a0, 8
++    addi a1, a1, 8
++    addi a2, a2, -8
++    bgeu a2, t0, .Lcmp_word
++.Lcmp_tail:
++    beqz a2, .Lcmp_equal
++.Lcmp_byte:
++    lbu t1, 0(a0)
++    lbu t2, 0(a1)
++    bne t1, t2, .Lcmp_diff
++    addi a0, a0, 1
++    addi a1, a1, 1
++    addi a2, a2, -1
++    bnez a2, .Lcmp_byte
++.Lcmp_equal:
++    li a0, 0
++    ret
++.Lcmp_diff:
++    sub a0, t1, t2
++    ret
++.size memcmp, .-memcmp

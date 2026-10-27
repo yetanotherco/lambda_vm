@@ -186,9 +186,30 @@ impl RLPEncode for u32 {
     }
 }
 
+/// Emit only the significant big-endian bytes of a 64-bit integer.
+#[inline]
+fn encode_u64(mut value: u64, buf: &mut dyn BufMut) {
+    if value == 0 {
+        buf.put_u8(RLP_NULL);
+    } else if value < 0x80 {
+        buf.put_u8(value as u8);
+    } else {
+        let mut bytes = [0u8; 9];
+        let mut start = bytes.len();
+        while value != 0 {
+            start -= 1;
+            bytes[start] = value as u8;
+            value >>= 8;
+        }
+        start -= 1;
+        bytes[start] = RLP_NULL + (8 - start) as u8;
+        buf.put_slice(&bytes[start..]);
+    }
+}
+
 impl RLPEncode for u64 {
     fn encode(&self, buf: &mut dyn BufMut) {
-        impl_encode(self.to_be_bytes(), buf);
+        encode_u64(*self as u64, buf);
     }
 
     #[inline]
@@ -199,7 +220,7 @@ impl RLPEncode for u64 {
 
 impl RLPEncode for usize {
     fn encode(&self, buf: &mut dyn BufMut) {
-        impl_encode(self.to_be_bytes(), buf);
+        encode_u64(*self as u64, buf);
     }
 
     #[inline]
@@ -239,11 +260,7 @@ impl RLPEncode for [u8] {
             if len < 56 {
                 buf.put_u8(RLP_NULL + len as u8);
             } else {
-                let bytes = len.to_be_bytes();
-                let start = bytes.iter().position(|&x| x != 0).unwrap();
-                let len = bytes.len() - start;
-                buf.put_u8(0xb7 + len as u8);
-                buf.put_slice(&bytes[start..]);
+                encode_long_length(len, 0xb7, buf);
             }
             buf.put_slice(self);
         }
@@ -366,16 +383,27 @@ impl<T: RLPEncode> RLPEncode for Vec<T> {
     }
 }
 
+/// Encode a nonzero long-form length without swapping unused leading bytes.
+#[inline]
+fn encode_long_length(mut len: usize, base: u8, buf: &mut dyn BufMut) {
+    let mut prefix = [0u8; size_of::<usize>() + 1];
+    let mut start = prefix.len();
+    while len != 0 {
+        start -= 1;
+        prefix[start] = len as u8;
+        len >>= 8;
+    }
+    start -= 1;
+    prefix[start] = base + (prefix.len() - start - 1) as u8;
+    buf.put_slice(&prefix[start..]);
+}
+
 #[inline]
 pub fn encode_length(total_len: usize, buf: &mut dyn BufMut) {
     if total_len < 56 {
         buf.put_u8(0xc0 + total_len as u8);
     } else {
-        let bytes = total_len.to_be_bytes();
-        let start = bytes.iter().position(|&x| x != 0).unwrap();
-        let len = bytes.len() - start;
-        buf.put_u8(0xf7 + len as u8);
-        buf.put_slice(&bytes[start..]);
+        encode_long_length(total_len, 0xf7, buf);
     }
 }
 

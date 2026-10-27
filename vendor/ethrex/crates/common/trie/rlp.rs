@@ -75,6 +75,88 @@ impl RLPEncode for BranchNode {
 }
 
 impl BranchNode {
+    /// Encode the hash preimage with reserved prefix space, returning its start.
+    /// The scratch bytes before that offset are not part of the RLP node.
+    /// This avoids collecting child references and walking them again for size.
+    pub(crate) fn encode_hash_preimage(&self, buf: &mut Vec<u8>) -> usize {
+        buf.clear();
+        // Every child occupies at most 33 bytes (a hash with its RLP prefix).
+        // Reserve the full child region once instead of checking each append.
+        const CHILD_CAPACITY: usize = 9 + 16 * 33;
+        buf.reserve(CHILD_CAPACITY);
+        let begin = buf.as_mut_ptr();
+        // SAFETY: CHILD_CAPACITY bytes are available. The first nine bytes and
+        // each child are initialized before set_len publishes them. Child hash
+        // computation cannot reallocate this scratch buffer. On a panic its
+        // length is still zero. Inline lengths are checked by slice indexing.
+        unsafe {
+            begin.write_bytes(0, 9);
+            let mut cursor = begin.add(9);
+            // The arity is fixed. Expanding the writes avoids loop bookkeeping
+            // and reduces register spills in the RISC-V guest.
+            macro_rules! write_child {
+                ($index:expr) => {{
+                    let child = &self.choices[$index];
+                    match child.compute_hash_ref(&NativeCrypto) {
+                        NodeHash::Hashed(hash) => {
+                            cursor.write(0xa0);
+                            core::ptr::copy_nonoverlapping(
+                                hash.as_bytes().as_ptr(),
+                                cursor.add(1),
+                                32,
+                            );
+                            cursor = cursor.add(33);
+                        }
+                        NodeHash::Inline((_, 0)) => {
+                            cursor.write(RLP_NULL);
+                            cursor = cursor.add(1);
+                        }
+                        NodeHash::Inline((encoded, len)) => {
+                            let encoded = &encoded[..*len as usize];
+                            core::ptr::copy_nonoverlapping(encoded.as_ptr(), cursor, encoded.len());
+                            cursor = cursor.add(encoded.len());
+                        }
+                    }
+                }};
+            }
+            write_child!(0);
+            write_child!(1);
+            write_child!(2);
+            write_child!(3);
+            write_child!(4);
+            write_child!(5);
+            write_child!(6);
+            write_child!(7);
+            write_child!(8);
+            write_child!(9);
+            write_child!(10);
+            write_child!(11);
+            write_child!(12);
+            write_child!(13);
+            write_child!(14);
+            write_child!(15);
+            buf.set_len(cursor.offset_from(begin) as usize);
+        }
+        <[u8] as RLPEncode>::encode(&self.value, buf);
+        let payload_len = buf.len() - 9;
+        if payload_len < 56 {
+            buf[8] = 0xc0 + payload_len as u8;
+            8
+        } else {
+            // Fill the length backwards; no temporary buffer or tiny memcpy.
+            let mut remaining = payload_len;
+            let mut start = 9;
+            while remaining != 0 {
+                start -= 1;
+                buf[start] = remaining as u8;
+                remaining >>= 8;
+            }
+            start -= 1;
+            buf[start] = 0xf7 + (8 - start) as u8;
+            start
+        }
+    }
+
     /// Concrete-typed sibling of `<Self as RLPEncode>::encode`, appending into a
     /// `Vec<u8>` rather than a `&mut dyn BufMut`.
     ///

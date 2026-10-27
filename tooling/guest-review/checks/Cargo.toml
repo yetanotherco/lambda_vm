@@ -1,0 +1,22 @@
+[workspace]
+[package]
+name = "pr1014-round2-checks"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ethrex-common = { path = "../../../vendor/ethrex/crates/common", default-features = false }
+ethrex-trie = { path = "../../../vendor/ethrex/crates/common/trie" }
+ethrex-crypto = { path = "../../../vendor/ethrex/crates/common/crypto", default-features = false }
+ethrex-rlp = { path = "../../../vendor/ethrex/crates/common/rlp" }
+reference-trie = { package = "ethrex-trie", git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd" }
+reference-crypto = { package = "ethrex-crypto", git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", default-features = false }
+serde_json = "1"
+
+reference-rlp = { package = "ethrex-rlp", git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd" }
+rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
+ethrex-levm = { path = "../../../vendor/ethrex/crates/vm/levm", default-features = false }
+ethrex-guest-program = { path = "../../../vendor/ethrex/crates/guest-program", default-features = false }
+reference-levm = { package = "ethrex-levm", git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", default-features = false }
+
+reference-common = { package = "ethrex-common", git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", default-features = false }

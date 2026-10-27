@@ -93,8 +93,18 @@ impl Stack {
     /// original top and `*b` the original second operand.
     #[inline]
     pub fn pop1_and_top_mut(&mut self) -> Result<(U256, &mut U256), ExceptionalHalt> {
-        let a = self.pop1()?;
-        Ok((a, self.top_mut()?))
+        if self.offset < STACK_LIMIT - 1 {
+            let offset = self.offset;
+            // SAFETY: the check above guarantees two valid, distinct stack slots.
+            #[expect(unsafe_code)]
+            let [a, b] = unsafe { &mut *self.values.as_mut_ptr().add(offset).cast::<[U256; 2]>() };
+            self.offset = offset + 1;
+            Ok((*a, b))
+        } else {
+            // Preserve the consumed operand when a one-item stack underflows.
+            let a = self.pop1()?;
+            Ok((a, self.top_mut()?))
+        }
     }
 
     /// Push a single U256 value to the stack, faster than the generic push.
@@ -194,6 +204,21 @@ impl Stack {
     /// Pushes a copy of the value at depth N
     #[inline]
     pub fn dup<const N: usize>(&mut self) -> Result<(), ExceptionalHalt> {
+        let next = self.offset.wrapping_sub(1);
+        if N < STACK_LIMIT && next < STACK_LIMIT - N - 1 {
+            // SAFETY: 1 <= offset <= STACK_LIMIT - N - 1; source and destination differ.
+            #[expect(unsafe_code)]
+            unsafe {
+                let value = *self.values.get_unchecked(self.offset + N);
+                let slot = self.values.get_unchecked_mut(next);
+                slot.0[0] = value.0[0];
+                slot.0[1] = value.0[1];
+                slot.0[2] = value.0[2];
+                slot.0[3] = value.0[3];
+            }
+            self.offset = next;
+            return Ok(());
+        }
         // Compile-time check that ensures `self.offset + N` is safe,
         // since self.offset is bounded by STACK_LIMIT
         const {
@@ -223,9 +248,13 @@ impl Stack {
 }
 
 impl Default for Stack {
+    #[expect(unsafe_code, reason = "all-zero bytes are valid for every U256 limb")]
     fn default() -> Self {
         Self {
-            values: Box::new([U256::zero(); STACK_LIMIT]),
+            // SAFETY: U256 consists of four u64 limbs; all-zero bytes are valid.
+            // Allocate directly on the heap instead of constructing and copying
+            // a 32 KiB temporary stack array into the box.
+            values: unsafe { Box::<[U256; STACK_LIMIT]>::new_zeroed().assume_init() },
             offset: STACK_LIMIT,
         }
     }

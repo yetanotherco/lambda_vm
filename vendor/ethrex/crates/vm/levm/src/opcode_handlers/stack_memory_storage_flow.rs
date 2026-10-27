@@ -470,47 +470,31 @@ fn jump(vm: &mut VM<'_>, target: usize, parent_gas_cost: u64) -> Result<(), VMEr
     // Check target address validity.
     //   - Target bytecode has to be a JUMPDEST.
     //   - Target address must not be blacklisted (aka. the JUMPDEST must not be part of a literal).
-    #[expect(clippy::as_conversions, reason = "safe")]
-    if vm
-        .current_call_frame
-        .bytecode
-        .dispatch_buf()
-        .get(target)
-        .is_some_and(|&value| {
-            value == Opcode::JUMPDEST as u8
-                && vm
-                    .current_call_frame
-                    .bytecode
-                    .jump_targets
-                    .binary_search(&(target as u32))
-                    .is_ok()
-        })
-    {
+    if vm.current_call_frame.bytecode.is_valid_jump_target(target) {
         if vm.opcode_tracer.active {
-            // Override the parent JUMP/JUMPI's gasCost so the dispatch loop
-            // doesn't roll the upcoming JUMPDEST charge into it.
-            vm.opcode_tracer.last_opcode_gas_cost = Some(parent_gas_cost);
-
-            // Capture the synthetic JUMPDEST step's state BEFORE charging its gas.
-            let synth = build_jumpdest_step(vm, target);
-
-            // Fuse: charge JUMPDEST + advance PC past it.
-            vm.current_call_frame.pc = target.wrapping_add(1);
-            vm.current_call_frame
-                .increase_consumed_gas(gas_cost::JUMPDEST)?;
-
-            vm.opcode_tracer.synthesize_step(synth);
-        } else {
-            // Hot path: fuse JUMP/JUMPI + JUMPDEST without any trace bookkeeping.
-            vm.current_call_frame.pc = target.wrapping_add(1);
-            vm.current_call_frame
-                .increase_consumed_gas(gas_cost::JUMPDEST)?;
+            return jump_traced(vm, target, parent_gas_cost);
         }
+        vm.current_call_frame.pc = target.wrapping_add(1);
+        vm.current_call_frame
+            .increase_consumed_gas(gas_cost::JUMPDEST)?;
         Ok(())
     } else {
         // Target address is invalid.
         Err(ExceptionalHalt::InvalidJump.into())
     }
+}
+
+// Keep stack/memory/return-data capture out of the ordinary jump's frame.
+#[cold]
+#[inline(never)]
+fn jump_traced(vm: &mut VM<'_>, target: usize, parent_gas_cost: u64) -> Result<(), VMError> {
+    vm.opcode_tracer.last_opcode_gas_cost = Some(parent_gas_cost);
+    let synth = build_jumpdest_step(vm, target);
+    vm.current_call_frame.pc = target.wrapping_add(1);
+    vm.current_call_frame
+        .increase_consumed_gas(gas_cost::JUMPDEST)?;
+    vm.opcode_tracer.synthesize_step(synth);
+    Ok(())
 }
 
 /// Builds a synthetic JUMPDEST trace entry. Captures gas/stack/memory/return-data

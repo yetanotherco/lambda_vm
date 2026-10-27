@@ -1,0 +1,37 @@
+{
+  "lambda_base": "c303681b353026cdd9b8009c2003903a2c15c13f",
+  "ethrex_base": "797df5540c7d35cafd69b6971a74b2a49c67d1dd",
+  "toolchain": "nightly-2026-02-01",
+  "fixtures": {
+    "ethrex_10_transfers.bin": "4d862e8537284729ff11c7bcf91c971e562dd6bbce2a1e181ba5bf48cb6b65cf",
+    "ethrex_bench_4.bin": "03ed0d175622af6ef9a981d7652ba7c86630b9473f49cae17edf649724b704e1",
+    "ethrex_empty_block.bin": "8d6f6061c71c23fad1d5dee26242d631efe0bff8d7f49422c2ba4cde9d4be919",
+    "ethrex_mainnet_25368371.bin": "573004e62e3680a00d3cdbae19dc4897e2ec60d6ec0c1d05d9ef118cb8aef17f",
+    "ethrex_mainnet_25453112.bin": "74681ded4f2981cdab2a2fc864340cd4a421b82aff472d1c5d1538a6f898d873",
+    "ethrex_simple_tx.bin": "c40bce364f22758ab7fa6fe8b45ce4c305dee5add4536ef6dca0e74e410e2729"
+  },
+  "optimized_source_sha256": {
+    "vendor/ethrex/crates/common/rlp/encode.rs": "62e94d6d37303e28a7deead9b9c6468ffdfcf12b4d5a95eebb1bd64b66ea403d",
+    "vendor/ethrex/crates/common/trie/db.rs": "4c6381133757ed3fed437a39be53a91cea33b4d4ab9e3f6e535b16a4a827814b",
+    "vendor/ethrex/crates/common/trie/nibbles.rs": "e0047caa5082e87471f2a0c35b3ef8724065837a4035ebbfc88cc5b6df2a03d4",
+    "vendor/ethrex/crates/common/trie/node.rs": "c7d7703592efae375e86285ffbb0eaa151b3dec2ba0f0bac480b8cfa4c59e00e",
+    "vendor/ethrex/crates/common/trie/node/branch.rs": "65ddb4323a7a1bb5d80142aef6cfdb17cc365f45bcf431070739f281b3b775bf",
+    "vendor/ethrex/crates/common/trie/node/extension.rs": "21aa80a7b5e2a456c5e9eccc37fb9823a29a24a6d5c4f07b2987799baed2edd0",
+    "vendor/ethrex/crates/common/trie/rlp.rs": "4e37ffe0fbc612b21b447c727ba1f3fcce2d08419716bf5d1dfcb36d73d17cb5",
+    "vendor/ethrex/crates/common/trie/trie.rs": "11143c1d7f554e9938a00610137093bfaf2618ba3d4ceb418001455851d43c0c",
+    "vendor/ethrex/crates/common/types/account.rs": "1a849284b7a05da67232968f2d4ad358d0351b860439cb67697bc15f6964b21e",
+    "vendor/ethrex/crates/common/utils.rs": "73d1f1d01e14e2614bd38942cec825d307bc17f811d6dcc1aca6cb7328b2ca53",
+    "vendor/ethrex/crates/storage/store.rs": "82a4d416dc72e7a3b71a22f85dc9287cbb741721de116018c9e852f4573b7d51",
+    "vendor/ethrex/crates/vm/levm/src/call_frame.rs": "96e442c461ab3a6c2367da3e955ca3c9e616fa29cdd0235348589f81cd49edb1",
+    "vendor/ethrex/crates/vm/levm/src/memory.rs": "f2560fb613c077042dfa8c02a9dd09f257ae059d61d2dda40dd3c9c86523a24b",
+    "vendor/ethrex/crates/vm/levm/src/opcode_handlers/arithmetic.rs": "0419a0c692f47ea2f0c2e977997addb42d1995010898747c0bafbd8456417147",
+    "vendor/ethrex/crates/vm/levm/src/opcode_handlers/stack_memory_storage_flow.rs": "80b0f05ef97a10b0d2d9248e61ac1d69c78f952acebd98746d1f5913358e83ea",
+    "vendor/ethrex/test/tests/common/code_serde_tests.rs": "6838f8ba511a912e2fd5ad772cc76dec1bdbf8a2d50f81d91d3a01861f4c2a6b",
+    "crypto/ethrex-crypto/src/lib.rs": "e08bcb50f71a373888ed6852a39b938bd538cca7922f665bdafda3f09a4e5686",
+    "crypto/ethrex-crypto/src/tests/keccak_tests.rs": "f44df3bc0c0a249f76eddd3f38689e935fcac6aa27e3581f915bce57d32f14bc",
+    "executor/programs/rust/ethrex/src/input.rs": "8c156a5eb92c3f1d9bf6e5ec74dc19784c180efdf6a8a6ea048a61c842659cde",
+    "executor/programs/rust/ethrex/src/main.rs": "335ab9a73cd1dcd0137b3943fe442032a688897874ff6c918dac475d477611f7",
+    "syscalls/src/entrypoint.rs": "2dcc49d8d435ad309aa22c7e8a865ea342e17a86b2f3c0f6bd80a26c931dd2fa",
+    "syscalls/src/memcmp.S": "569bae29c01927d34e95dbd84e8ad4b46bb3458169b46cb2778d42b9a885fe7b"
+  }
+}

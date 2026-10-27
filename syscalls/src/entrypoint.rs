@@ -360,3 +360,6 @@ memset:
     syscall = const DMA_MEMSET_SYSCALL_NUMBER,
     max_bytes = const DMA_MEMCPY_MAX_BYTES,
 );
+
+#[cfg(feature = "fast-memcmp")]
+core::arch::global_asm!(include_str!("memcmp.S"));

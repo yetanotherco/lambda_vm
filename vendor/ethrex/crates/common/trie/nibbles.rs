@@ -150,9 +150,25 @@ unsafe fn expand_bytes_to_nibbles_aarch64(bytes: &[u8], output: *mut u8) {
 unsafe fn expand_bytes_to_nibbles_scalar(bytes: &[u8], output: *mut u8) {
     // SAFETY: caller guarantees output is valid for bytes.len() * 2 bytes.
     unsafe {
-        for (i, &b) in bytes.iter().enumerate() {
+        let mut i = 0;
+        while i + 4 <= bytes.len() {
+            // Spread four bytes into four 16-bit lanes, then interleave their nibbles.
+            let mut word =
+                u32::from_le(bytes.as_ptr().add(i).cast::<u32>().read_unaligned()) as u64;
+            word = (word | (word << 16)) & 0x0000ffff0000ffff;
+            word = (word | (word << 8)) & 0x00ff00ff00ff00ff;
+            let expanded = ((word >> 4) & 0x000f000f000f000f) | ((word & 0x000f000f000f000f) << 8);
+            output
+                .add(i * 2)
+                .cast::<u64>()
+                .write_unaligned(expanded.to_le());
+            i += 4;
+        }
+        while i < bytes.len() {
+            let b = *bytes.get_unchecked(i);
             *output.add(i * 2) = b >> 4;
             *output.add(i * 2 + 1) = b & 0x0F;
+            i += 1;
         }
     }
 }
@@ -275,6 +291,21 @@ unsafe fn pack_nibble_pairs_scalar(nibbles: &[u8], output: *mut u8) {
         let mut o = 0usize;
         let mut i = 0usize;
         let n = nibbles.len();
+        while i + 8 <= n {
+            let word = u64::from_le(nibbles.as_ptr().add(i).cast::<u64>().read_unaligned());
+            // Mask high nibbles before shifting: preserve scalar u8 truncation even
+            // for callers constructing Nibbles from byte values greater than 15.
+            let mut packed =
+                ((word & 0x000f000f000f000f) << 4) | ((word >> 8) & 0x00ff00ff00ff00ff);
+            packed = (packed | (packed >> 8)) & 0x0000ffff0000ffff;
+            packed = (packed | (packed >> 16)) & 0xffffffff;
+            output
+                .add(o)
+                .cast::<u32>()
+                .write_unaligned((packed as u32).to_le());
+            i += 8;
+            o += 4;
+        }
         while i + 2 <= n {
             *output.add(o) = (*nibbles.get_unchecked(i) << 4) | *nibbles.get_unchecked(i + 1);
             i += 2;

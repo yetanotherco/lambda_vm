@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, LazyLock};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use bytes::{BufMut, Bytes};
 use ethereum_types::{H256, U256};
@@ -18,11 +19,28 @@ use ethrex_rlp::{
 use super::GenesisAccount;
 use crate::constants::{EMPTY_KECCAK_HASH, EMPTY_TRIE_HASH};
 
-/// Shared empty jump-target table. `Code::default()` and any bytecode without a
-/// `JUMPDEST` clone this (a refcount bump) instead of allocating a fresh empty
-/// `Arc` header each time. This matters because the per-tx `Code::default()`
-/// placeholder and every EOA / empty-code load would otherwise each allocate.
-static EMPTY_JUMP_TARGETS: LazyLock<Arc<[u32]>> = LazyLock::new(|| Arc::from(Vec::new()));
+// Analysis is derived from immutable bytecode and shared by every Code clone.
+// The sorted list is only needed by serialization/storage, not EVM execution.
+#[derive(Debug, Default)]
+struct JumpAnalysis {
+    targets: OnceLock<Arc<[u32]>>,
+    bitmap: OnceLock<Arc<[u64]>>,
+    progressive: Mutex<ProgressiveAnalysis>,
+}
+#[derive(Debug, Default)]
+struct ProgressiveAnalysis {
+    // First opcode not yet analyzed. A PUSH may advance beyond logical EOF.
+    next_pc: usize,
+    words: Vec<u64>,
+}
+
+static EMPTY_JUMP_ANALYSIS: LazyLock<Arc<JumpAnalysis>> = LazyLock::new(|| {
+    Arc::new(JumpAnalysis {
+        targets: OnceLock::from(Arc::from([])),
+        bitmap: OnceLock::from(Arc::from([])),
+        progressive: Mutex::default(),
+    })
+});
 
 /// Trailing STOP bytes appended to every bytecode so the dispatch loop can read
 /// the next opcode without a bounds check. 33 is the widest single-opcode advance
@@ -30,7 +48,7 @@ static EMPTY_JUMP_TARGETS: LazyLock<Arc<[u32]>> = LazyLock::new(|| Arc::from(Vec
 /// padding regardless of which opcode sits at the last real byte.
 pub const BYTECODE_PADDING: usize = 33;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub struct Code {
     // hash is only used for bytecodes stored in the DB, either for reading it from the DB
     // or with the CODEHASH opcode, which needs an account address as argument and
@@ -42,13 +60,7 @@ pub struct Code {
     bytecode: Bytes,
     /// The real bytecode length, needed for some opcodes, `bytecode` is padded with 33 STOPs to avoid checked adds on hot loop.
     bytecode_len: usize,
-    // `Arc<[u32]>` so cloning `Code` (hot: every message-call resolves and clones
-    // the callee's code) is a refcount bump instead of deep-copying the table.
-    // Serializes via serde's `rc` feature (enabled workspace-wide).
-    // The valid addresses are 32-bit because, despite EIP-3860 restricting initcode size,
-    // this does not apply to previous forks. This is tested in the EEST tests, which would
-    // panic in debug mode.
-    pub jump_targets: Arc<[u32]>,
+    analysis: Arc<JumpAnalysis>,
 }
 
 impl Code {
@@ -59,16 +71,29 @@ impl Code {
     // `code` is the logical, unpadded bytecode; `BYTECODE_PADDING` STOP bytes are
     // appended internally by `from_parts_unchecked`.
     pub fn from_bytecode_unchecked(code: Bytes, hash: H256) -> Self {
-        let jump_targets = Self::compute_jump_targets(&code);
-        Self::from_parts_unchecked(hash, &code, jump_targets)
+        if code.is_empty() {
+            return Self {
+                hash,
+                ..Self::default()
+            };
+        }
+        let bytecode_len = code.len();
+        let mut padded_code = Vec::with_capacity(bytecode_len + BYTECODE_PADDING);
+        padded_code.extend_from_slice(&code);
+        padded_code.extend_from_slice(&[0u8; BYTECODE_PADDING]);
+        Self {
+            hash,
+            bytecode: Bytes::from_owner(padded_code),
+            bytecode_len,
+            analysis: Arc::new(JumpAnalysis::default()),
+        }
     }
 
     /// `code` is the logical, unpadded bytecode; `BYTECODE_PADDING` STOP bytes are
     /// appended internally by `from_parts_unchecked`.
     pub fn from_bytecode(code: Bytes, crypto: &dyn Crypto) -> Self {
-        let jump_targets = Self::compute_jump_targets(&code);
         let hash = H256(crypto.keccak256(code.as_ref()));
-        Self::from_parts_unchecked(hash, &code, jump_targets)
+        Self::from_bytecode_unchecked(code, hash)
     }
 
     /// Builds a `Code` from precomputed parts. The caller must guarantee `hash`
@@ -87,37 +112,137 @@ impl Code {
             hash,
             bytecode: Bytes::from_owner(padded_code),
             bytecode_len,
-            jump_targets,
+            analysis: Arc::new(JumpAnalysis {
+                bitmap: OnceLock::from(Self::make_jump_bitmap(code, &jump_targets)),
+                targets: OnceLock::from(jump_targets),
+                progressive: Mutex::default(),
+            }),
         }
     }
 
-    fn compute_jump_targets(code: &[u8]) -> Arc<[u32]> {
-        debug_assert!(code.len() <= u32::MAX as usize);
-        let mut targets = Vec::new();
-        let mut i = 0;
-        while i < code.len() {
-            // TODO: we don't use the constants from the vm module to avoid a circular dependency
-            match code[i] {
-                // OP_JUMPDEST
-                0x5B => {
-                    targets.push(i as u32);
-                }
-                // OP_PUSH1..32
-                c @ 0x60..0x80 => {
-                    // OP_PUSH0
-                    i += (c - 0x5F) as usize;
-                }
-                _ => (),
-            }
-            i += 1;
-        }
-        // Share the single empty table for jumpless bytecode (very common: EOAs,
-        // tiny contracts) so we don't allocate an `Arc` header for an empty slice.
+    fn make_jump_bitmap(code: &[u8], targets: &[u32]) -> Arc<[u64]> {
         if targets.is_empty() {
-            EMPTY_JUMP_TARGETS.clone()
-        } else {
-            Arc::from(targets)
+            return EMPTY_JUMP_ANALYSIS.bitmap.get().unwrap().clone();
         }
+        let mut words = vec![0u64; code.len().div_ceil(64)];
+        for &target in targets {
+            let target = target as usize;
+            if code.get(target) == Some(&0x5b) {
+                words[target / 64] |= 1u64 << (target % 64);
+            }
+        }
+        Arc::from(words)
+    }
+
+    /// Materialize the sorted list only when a storage/serialization caller needs it.
+    pub fn jump_targets(&self) -> &[u32] {
+        self.target_table()
+    }
+
+    fn target_table(&self) -> &Arc<[u32]> {
+        self.analysis.targets.get_or_init(|| {
+            let mut targets = Vec::new();
+            for (index, &word) in self.jump_bitmap().iter().enumerate() {
+                let mut bits = word;
+                while bits != 0 {
+                    targets.push((index * 64 + bits.trailing_zeros() as usize) as u32);
+                    bits &= bits - 1;
+                }
+            }
+            Arc::from(targets)
+        })
+    }
+
+    #[inline]
+    fn jump_bitmap(&self) -> &[u64] {
+        self.analysis
+            .bitmap
+            .get_or_init(|| self.compute_jump_bitmap())
+    }
+
+    #[inline]
+    pub fn is_valid_jump_target(&self, target: usize) -> bool {
+        // Reject out-of-range and non-JUMPDEST positions before doing analysis.
+        if self.code().get(target) != Some(&0x5b) {
+            return false;
+        }
+        if let Some(bitmap) = self.analysis.bitmap.get() {
+            return bitmap
+                .get(target / 64)
+                .is_some_and(|word| word & (1u64 << (target % 64)) != 0);
+        }
+        let mut analysis = self.analysis.progressive.lock().unwrap();
+        if analysis.next_pc <= target {
+            self.analyze_through(&mut analysis, target);
+        }
+        analysis
+            .words
+            .get(target / 64)
+            .is_some_and(|word| word & (1u64 << (target % 64)) != 0)
+    }
+
+    fn compute_jump_bitmap(&self) -> Arc<[u64]> {
+        if self.is_empty() {
+            return EMPTY_JUMP_ANALYSIS.bitmap.get().unwrap().clone();
+        }
+        let mut analysis = self.analysis.progressive.lock().unwrap();
+        self.analyze_through(&mut analysis, self.len() - 1);
+        Arc::from(analysis.words.as_slice())
+    }
+
+    // Scanning and allocation are rare once the queried prefix is cached.
+    // Keep their register/stack requirements out of repeated jump lookups.
+    #[inline(never)]
+    fn analyze_through(&self, analysis: &mut ProgressiveAnalysis, target: usize) {
+        debug_assert!(target < self.len());
+        debug_assert!(self.len() <= u32::MAX as usize);
+        let start = self.dispatch_buf().as_ptr();
+        // A previous trailing PUSH may have advanced beyond EOF. Do not form
+        // a pointer from that cursor unless it is actually going to be read.
+        if analysis.next_pc > target {
+            return;
+        }
+        let mut cursor = unsafe { start.add(analysis.next_pc) };
+        let limit = unsafe { start.add(target) };
+        macro_rules! scan_opcode {
+            () => {{
+                // Constructors append 33 STOP bytes. We only read logical bytes;
+                // a truncated PUSH can advance at most 32 bytes into the padding.
+                let opcode = unsafe { *cursor };
+                if (opcode as i8) >= 0x60 {
+                    cursor = unsafe { cursor.add((opcode - 0x5e) as usize) };
+                } else {
+                    if opcode == 0x5b {
+                        let offset = cursor as usize - start as usize;
+                        if analysis.words.is_empty() {
+                            analysis.words.resize(self.len().div_ceil(64), 0);
+                        }
+                        analysis.words[offset / 64] |= 1u64 << (offset % 64);
+                    }
+                    cursor = unsafe { cursor.add(1) };
+                }
+            }};
+        }
+        // Each opcode advances by at most 33 bytes. This margin ensures all
+        // 8 opcode reads stay at or before the requested target, including PUSH32.
+        const BATCH_MARGIN: usize = 7 * 33;
+        if target >= BATCH_MARGIN {
+            let fast_limit = unsafe { start.add(target - BATCH_MARGIN) };
+            while cursor <= fast_limit {
+                scan_opcode!();
+                scan_opcode!();
+                scan_opcode!();
+                scan_opcode!();
+                scan_opcode!();
+                scan_opcode!();
+                scan_opcode!();
+                scan_opcode!();
+            }
+        }
+        while cursor <= limit {
+            scan_opcode!();
+        }
+        analysis.next_pc = cursor as usize - start as usize;
     }
 
     #[inline]
@@ -157,10 +282,45 @@ impl Code {
     ///
     /// usize - Estimated size in bytes
     pub fn size(&self) -> usize {
-        let hash_size = size_of::<H256>();
-        let bytes_size = size_of::<Bytes>();
-        let vec_size = size_of::<Arc<[u32]>>() + self.jump_targets.len() * size_of::<u32>();
-        hash_size + bytes_size + vec_size
+        // Observe allocated caches without forcing analysis of unused code.
+        let targets = self
+            .analysis
+            .targets
+            .get()
+            .map_or(0, |v| v.len() * size_of::<u32>());
+        let bitmap = self
+            .analysis
+            .bitmap
+            .get()
+            .map_or(0, |v| v.len() * size_of::<u64>());
+        let progressive =
+            self.analysis.progressive.lock().unwrap().words.capacity() * size_of::<u64>();
+        size_of::<Self>()
+            + self.bytecode.len()
+            + size_of::<JumpAnalysis>()
+            + targets
+            + bitmap
+            + progressive
+    }
+}
+
+impl PartialEq for Code {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash
+            && self.bytecode == other.bytecode
+            && self.bytecode_len == other.bytecode_len
+            && self.jump_targets() == other.jump_targets()
+            && self.jump_bitmap() == other.jump_bitmap()
+    }
+}
+impl Eq for Code {}
+impl Hash for Code {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+        self.bytecode.hash(state);
+        self.bytecode_len.hash(state);
+        self.jump_targets().hash(state);
+        self.jump_bitmap().hash(state);
     }
 }
 
@@ -182,7 +342,7 @@ impl Serialize for Code {
         CodeSerde {
             hash: self.hash,
             code: self.code_bytes(),
-            jump_targets: self.jump_targets.clone(),
+            jump_targets: self.target_table().clone(),
         }
         .serialize(serializer)
     }
@@ -263,7 +423,7 @@ impl Default for Code {
             bytecode: Bytes::from_static(&[0u8; BYTECODE_PADDING]),
             bytecode_len: 0,
             hash: *EMPTY_KECCAK_HASH,
-            jump_targets: EMPTY_JUMP_TARGETS.clone(),
+            analysis: EMPTY_JUMP_ANALYSIS.clone(),
         }
     }
 }

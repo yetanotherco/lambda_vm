@@ -1,0 +1,1527 @@
+--- a/crates/common/rlp/encode.rs
++++ b/crates/common/rlp/encode.rs
+@@ -186,9 +186,30 @@
+     }
+ }
+ 
++/// Emit only the significant big-endian bytes of a 64-bit integer.
++#[inline]
++fn encode_u64(mut value: u64, buf: &mut dyn BufMut) {
++    if value == 0 {
++        buf.put_u8(RLP_NULL);
++    } else if value < 0x80 {
++        buf.put_u8(value as u8);
++    } else {
++        let mut bytes = [0u8; 9];
++        let mut start = bytes.len();
++        while value != 0 {
++            start -= 1;
++            bytes[start] = value as u8;
++            value >>= 8;
++        }
++        start -= 1;
++        bytes[start] = RLP_NULL + (8 - start) as u8;
++        buf.put_slice(&bytes[start..]);
++    }
++}
++
+ impl RLPEncode for u64 {
+     fn encode(&self, buf: &mut dyn BufMut) {
+-        impl_encode(self.to_be_bytes(), buf);
++        encode_u64(*self as u64, buf);
+     }
+ 
+     #[inline]
+@@ -199,7 +220,7 @@
+ 
+ impl RLPEncode for usize {
+     fn encode(&self, buf: &mut dyn BufMut) {
+-        impl_encode(self.to_be_bytes(), buf);
++        encode_u64(*self as u64, buf);
+     }
+ 
+     #[inline]
+@@ -239,11 +260,7 @@
+             if len < 56 {
+                 buf.put_u8(RLP_NULL + len as u8);
+             } else {
+-                let bytes = len.to_be_bytes();
+-                let start = bytes.iter().position(|&x| x != 0).unwrap();
+-                let len = bytes.len() - start;
+-                buf.put_u8(0xb7 + len as u8);
+-                buf.put_slice(&bytes[start..]);
++                encode_long_length(len, 0xb7, buf);
+             }
+             buf.put_slice(self);
+         }
+@@ -366,16 +383,27 @@
+     }
+ }
+ 
++/// Encode a nonzero long-form length without swapping unused leading bytes.
++#[inline]
++fn encode_long_length(mut len: usize, base: u8, buf: &mut dyn BufMut) {
++    let mut prefix = [0u8; size_of::<usize>() + 1];
++    let mut start = prefix.len();
++    while len != 0 {
++        start -= 1;
++        prefix[start] = len as u8;
++        len >>= 8;
++    }
++    start -= 1;
++    prefix[start] = base + (prefix.len() - start - 1) as u8;
++    buf.put_slice(&prefix[start..]);
++}
++
+ #[inline]
+ pub fn encode_length(total_len: usize, buf: &mut dyn BufMut) {
+     if total_len < 56 {
+         buf.put_u8(0xc0 + total_len as u8);
+     } else {
+-        let bytes = total_len.to_be_bytes();
+-        let start = bytes.iter().position(|&x| x != 0).unwrap();
+-        let len = bytes.len() - start;
+-        buf.put_u8(0xf7 + len as u8);
+-        buf.put_slice(&bytes[start..]);
++        encode_long_length(total_len, 0xf7, buf);
+     }
+ }
+ 
+--- a/crates/common/trie/db.rs
++++ b/crates/common/trie/db.rs
+@@ -51,6 +51,11 @@
+ 
+     fn flatkeyvalue_computed(&self, _key: Nibbles) -> bool {
+         false
++    }
++
++    /// Borrowed lookup hook; existing backends retain their owned-key behavior.
++    fn flatkeyvalue_computed_ref(&self, key: &Nibbles) -> bool {
++        self.flatkeyvalue_computed(key.clone())
+     }
+ }
+ 
+@@ -135,6 +140,11 @@
+ }
+ 
+ impl TrieDB for InMemoryTrieDB {
++    fn flatkeyvalue_computed_ref(&self, _key: &Nibbles) -> bool {
++        // This backend has no flat-key-value storage, so no owned key is needed.
++        false
++    }
++
+     fn get(&self, key: Nibbles) -> Result<Option<Vec<u8>>, TrieError> {
+         Ok(self
+             .lock_inner()?
+--- a/crates/common/trie/nibbles.rs
++++ b/crates/common/trie/nibbles.rs
+@@ -150,9 +150,25 @@
+ unsafe fn expand_bytes_to_nibbles_scalar(bytes: &[u8], output: *mut u8) {
+     // SAFETY: caller guarantees output is valid for bytes.len() * 2 bytes.
+     unsafe {
+-        for (i, &b) in bytes.iter().enumerate() {
++        let mut i = 0;
++        while i + 4 <= bytes.len() {
++            // Spread four bytes into four 16-bit lanes, then interleave their nibbles.
++            let mut word =
++                u32::from_le(bytes.as_ptr().add(i).cast::<u32>().read_unaligned()) as u64;
++            word = (word | (word << 16)) & 0x0000ffff0000ffff;
++            word = (word | (word << 8)) & 0x00ff00ff00ff00ff;
++            let expanded = ((word >> 4) & 0x000f000f000f000f) | ((word & 0x000f000f000f000f) << 8);
++            output
++                .add(i * 2)
++                .cast::<u64>()
++                .write_unaligned(expanded.to_le());
++            i += 4;
++        }
++        while i < bytes.len() {
++            let b = *bytes.get_unchecked(i);
+             *output.add(i * 2) = b >> 4;
+             *output.add(i * 2 + 1) = b & 0x0F;
++            i += 1;
+         }
+     }
+ }
+@@ -275,6 +291,21 @@
+         let mut o = 0usize;
+         let mut i = 0usize;
+         let n = nibbles.len();
++        while i + 8 <= n {
++            let word = u64::from_le(nibbles.as_ptr().add(i).cast::<u64>().read_unaligned());
++            // Mask high nibbles before shifting: preserve scalar u8 truncation even
++            // for callers constructing Nibbles from byte values greater than 15.
++            let mut packed =
++                ((word & 0x000f000f000f000f) << 4) | ((word >> 8) & 0x00ff00ff00ff00ff);
++            packed = (packed | (packed >> 8)) & 0x0000ffff0000ffff;
++            packed = (packed | (packed >> 16)) & 0xffffffff;
++            output
++                .add(o)
++                .cast::<u32>()
++                .write_unaligned((packed as u32).to_le());
++            i += 8;
++            o += 4;
++        }
+         while i + 2 <= n {
+             *output.add(o) = (*nibbles.get_unchecked(i) << 4) | *nibbles.get_unchecked(i + 1);
+             i += 2;
+--- a/crates/common/trie/node.rs
++++ b/crates/common/trie/node.rs
+@@ -155,17 +155,8 @@
+ ///
+ /// Explicit rkyv bounds are needed because this is a recursive type, whose
+ /// bounds can't be automatically resolved.
+-#[derive(
+-    Clone,
+-    Debug,
+-    serde::Serialize,
+-    serde::Deserialize,
+-    rkyv::Serialize,
+-    rkyv::Deserialize,
+-    rkyv::Archive,
+-)]
++#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, rkyv::Serialize, rkyv::Archive)]
+ #[rkyv(serialize_bounds(__S: Writer + Allocator + Sharing, __S::Error: Source))]
+-#[rkyv(deserialize_bounds(__D: Pooling, __D::Error: Source))]
+ #[rkyv(bytecheck(bounds(__C: ArchiveContext + SharedContext)))]
+ pub enum NodeRef {
+     /// The node is embedded within the reference.
+@@ -179,7 +170,53 @@
+     Hash(NodeHash),
+ }
+ 
++// Keep shared-pointer allocation/pooling out of the common hash-only path.
++// Archive layout, byte validation, and rkyv's pooling semantics are unchanged.
++impl<D> rkyv::Deserialize<NodeRef, D> for ArchivedNodeRef
++where
++    D: rkyv::rancor::Fallible + Pooling + ?Sized,
++    D::Error: Source,
++{
++    #[inline]
++    fn deserialize(&self, deserializer: &mut D) -> Result<NodeRef, D::Error> {
++        match self {
++            Self::Hash(hash) => Ok(NodeRef::Hash(rkyv::Deserialize::deserialize(
++                hash,
++                deserializer,
++            )?)),
++            Self::Node(node, _) => deserialize_shared_node_ref(node, deserializer),
++        }
++    }
++}
++
++#[inline(never)]
++fn deserialize_shared_node_ref<D>(
++    node: &rkyv::Archived<Arc<Node>>,
++    deserializer: &mut D,
++) -> Result<NodeRef, D::Error>
++where
++    D: rkyv::rancor::Fallible + Pooling + ?Sized,
++    D::Error: Source,
++{
++    Ok(NodeRef::Node(
++        rkyv::Deserialize::deserialize(node, deserializer)?,
++        OnceLock::new(),
++    ))
++}
++
+ impl NodeRef {
++    /// Materialize the consumed path only when resolving a nonresident node.
++    pub(crate) fn get_node_mut_at(
++        &mut self,
++        db: &dyn TrieDB,
++        path: &Nibbles,
++    ) -> Result<Option<&mut Node>, TrieError> {
++        match self {
++            NodeRef::Node(node, _) => Ok(Some(Arc::make_mut(node))),
++            _ => self.get_node_mut(db, path.current()),
++        }
++    }
++
+     /// Gets a shared reference to the inner node.
+     /// Requires that the trie is in a consistent state, ie that all leaves being pointed are in the database.
+     /// Outside of snapsync this should always be the case.
+@@ -327,7 +364,8 @@
+         if let NodeRef::Node(node, hash) = &self
+             && hash.get().is_none()
+         {
+-            node.memoize_hashes(buf, crypto);
++            // Node::compute_hash_no_alloc already memoizes its children in
++            // post-order. A separate pre-walk repeats all child-cache checks.
+             let _ = hash.set(node.compute_hash_no_alloc(buf, crypto));
+         }
+     }
+@@ -393,20 +431,113 @@
+ }
+ 
+ #[derive(
+-    Debug,
+-    Clone,
+-    PartialEq,
+-    serde::Serialize,
+-    serde::Deserialize,
+-    rkyv::Deserialize,
+-    rkyv::Serialize,
+-    rkyv::Archive,
++    Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, rkyv::Serialize, rkyv::Archive,
+ )]
+ /// A Node in an Ethereum Compatible Patricia Merkle Trie
+ pub enum Node {
+     Branch(Box<BranchNode>),
+     Extension(ExtensionNode),
+     Leaf(LeafNode),
++}
++
++// Construct large branches in their final allocation instead of returning a
++// full [NodeRef; 16] temporary through every recursive deserialization frame.
++// Archive layout and checked access are unchanged.
++impl<D> rkyv::Deserialize<Node, D> for ArchivedNode
++where
++    D: rkyv::rancor::Fallible + Pooling + ?Sized,
++    D::Error: Source,
++{
++    #[inline]
++    fn deserialize(&self, deserializer: &mut D) -> Result<Node, D::Error> {
++        match self {
++            Self::Branch(branch) => {
++                deserialize_branch_in_place(branch.get(), deserializer).map(Node::Branch)
++            }
++            Self::Extension(extension) => {
++                rkyv::Deserialize::deserialize(extension, deserializer).map(Node::Extension)
++            }
++            Self::Leaf(leaf) => rkyv::Deserialize::deserialize(leaf, deserializer).map(Node::Leaf),
++        }
++    }
++}
++
++struct BranchInitialization {
++    storage: Option<Box<core::mem::MaybeUninit<BranchNode>>>,
++    initialized_choices: usize,
++    initialized_value: bool,
++}
++
++impl Drop for BranchInitialization {
++    fn drop(&mut self) {
++        if let Some(storage) = self.storage.as_mut() {
++            // SAFETY: only the recorded prefix and (if flagged) value were
++            // initialized. MaybeUninit deallocates without dropping them twice.
++            unsafe {
++                let ptr = storage.as_mut_ptr();
++                let choices = core::ptr::addr_of_mut!((*ptr).choices).cast::<NodeRef>();
++                for index in 0..self.initialized_choices {
++                    core::ptr::drop_in_place(choices.add(index));
++                }
++                if self.initialized_value {
++                    core::ptr::drop_in_place(core::ptr::addr_of_mut!((*ptr).value));
++                }
++            }
++        }
++    }
++}
++
++#[inline(never)]
++fn deserialize_branch_in_place<D>(
++    branch: &branch::ArchivedBranchNode,
++    deserializer: &mut D,
++) -> Result<Box<BranchNode>, D::Error>
++where
++    D: rkyv::rancor::Fallible + Pooling + ?Sized,
++    D::Error: Source,
++{
++    let mut guard = BranchInitialization {
++        storage: Some(Box::<BranchNode>::new_uninit()),
++        initialized_choices: 0,
++        initialized_value: false,
++    };
++    let ptr = guard.storage.as_mut().unwrap().as_mut_ptr();
++    // SAFETY: the Box is properly aligned and uniquely owned. Every field is
++    // written once, with no reference to uninitialized fields. The guard drops
++    // initialized fields on an error or unwind. All fields are initialized
++    // before assume_init transfers ownership to the returned Box.
++    unsafe {
++        let choices = core::ptr::addr_of_mut!((*ptr).choices).cast::<NodeRef>();
++        macro_rules! initialize_child {
++            ($index:expr) => {{
++                choices.add($index).write(rkyv::Deserialize::deserialize(
++                    &branch.choices[$index],
++                    deserializer,
++                )?);
++                guard.initialized_choices = $index + 1;
++            }};
++        }
++        initialize_child!(0);
++        initialize_child!(1);
++        initialize_child!(2);
++        initialize_child!(3);
++        initialize_child!(4);
++        initialize_child!(5);
++        initialize_child!(6);
++        initialize_child!(7);
++        initialize_child!(8);
++        initialize_child!(9);
++        initialize_child!(10);
++        initialize_child!(11);
++        initialize_child!(12);
++        initialize_child!(13);
++        initialize_child!(14);
++        initialize_child!(15);
++        core::ptr::addr_of_mut!((*ptr).value)
++            .write(rkyv::Deserialize::deserialize(&branch.value, deserializer)?);
++        guard.initialized_value = true;
++        Ok(guard.storage.take().unwrap().assume_init())
++    }
+ }
+ 
+ impl Default for Node {
+@@ -446,10 +577,48 @@
+ impl Node {
+     /// Retrieves a value from the subtrie originating from this node given its path
+     pub fn get(&self, db: &dyn TrieDB, path: Nibbles) -> Result<Option<ValueRLP>, TrieError> {
+-        match self {
+-            Node::Branch(n) => n.get(db, path),
+-            Node::Extension(n) => n.get(db, path),
+-            Node::Leaf(n) => n.get(path),
++        let mut node = self;
++        let mut offset = 0;
++        loop {
++            let remaining = &path.as_ref()[offset..];
++            match node {
++                Node::Branch(branch) => {
++                    let Some(&choice) = remaining.first().filter(|&&choice| choice < 16) else {
++                        return Ok((!branch.value.is_empty()).then(|| branch.value.clone()));
++                    };
++                    if let NodeRef::Node(child, _) = &branch.choices[choice as usize] {
++                        node = child;
++                        offset += 1;
++                    } else {
++                        // Retain resolution, missing-child errors and consumed-path semantics.
++                        let path = if offset == 0 {
++                            path
++                        } else {
++                            path.offset(offset)
++                        };
++                        return branch.get(db, path);
++                    }
++                }
++                Node::Extension(extension) => {
++                    if !remaining.starts_with(extension.prefix.as_ref()) {
++                        return Ok(None);
++                    }
++                    if let NodeRef::Node(child, _) = &extension.child {
++                        node = child;
++                        offset += extension.prefix.len();
++                    } else {
++                        let path = if offset == 0 {
++                            path
++                        } else {
++                            path.offset(offset)
++                        };
++                        return extension.get(db, path);
++                    }
++                }
++                Node::Leaf(leaf) => {
++                    return Ok((leaf.partial.as_ref() == remaining).then(|| leaf.value.clone()));
++                }
++            }
+         }
+     }
+ 
+--- a/crates/common/trie/node/branch.rs
++++ b/crates/common/trie/node/branch.rs
+@@ -61,6 +61,9 @@
+         if let Some(choice) = path.next_choice() {
+             // Delegate to children if present
+             let child_ref = &self.choices[choice];
++            if let NodeRef::Node(node, _) = child_ref {
++                return node.get(db, path);
++            }
+             if child_ref.is_valid() {
+                 let child_node = child_ref.get_node(db, path.current())?.ok_or_else(|| {
+                     TrieError::InconsistentTree(Box::new(
+@@ -101,7 +104,7 @@
+                 }
+                 // Insert into existing child and then update it
+                 (choice_ref, ValueOrHash::Value(value)) => {
+-                    let Some(choice_node) = choice_ref.get_node_mut(db, path.current())? else {
++                    let Some(choice_node) = choice_ref.get_node_mut_at(db, &path)? else {
+                         return Err(TrieError::InconsistentTree(Box::new(
+                             InconsistentTreeError::NodeNotFoundOnBranchNode(
+                                 choice_ref
+@@ -125,7 +128,7 @@
+                             "attempt to override proof node with external hash".to_string(),
+                         ));
+                     } else {
+-                        let Some(choice_node) = choice_ref.get_node_mut(db, path.current())? else {
++                        let Some(choice_node) = choice_ref.get_node_mut_at(db, &path)? else {
+                             return Err(TrieError::InconsistentTree(Box::new(
+                                 InconsistentTreeError::NodeNotFoundOnBranchNode(
+                                     choice_ref
+@@ -183,8 +186,7 @@
+         // Check if the value is located in a child subtrie
+         let value = if let Some(choice_index) = path.next_choice() {
+             if self.choices[choice_index].is_valid() {
+-                let Some(child_node) =
+-                    self.choices[choice_index].get_node_mut(db, path.current())?
++                let Some(child_node) = self.choices[choice_index].get_node_mut_at(db, &path)?
+                 else {
+                     return Err(TrieError::InconsistentTree(Box::new(
+                         InconsistentTreeError::NodeNotFoundOnBranchNode(
+@@ -280,9 +282,8 @@
+ 
+     /// Computes the node's hash, using the provided buffer
+     pub fn compute_hash_no_alloc(&self, buf: &mut Vec<u8>, crypto: &dyn Crypto) -> NodeHash {
+-        buf.clear();
+-        self.encode_into_vec(buf);
+-        let hash = NodeHash::from_encoded(buf, crypto);
++        let start = self.encode_hash_preimage(buf);
++        let hash = NodeHash::from_encoded(&buf[start..], crypto);
+         buf.clear();
+         hash
+     }
+--- a/crates/common/trie/node/extension.rs
++++ b/crates/common/trie/node/extension.rs
+@@ -42,6 +42,9 @@
+         // If the path is prefixed by this node's prefix, delegate to its child.
+         // Otherwise, no value is present.
+         if path.skip_prefix(&self.prefix) {
++            if let NodeRef::Node(node, _) = &self.child {
++                return node.get(db, path);
++            }
+             let child_node = self.child.get_node(db, path.current())?.ok_or_else(|| {
+                 TrieError::InconsistentTree(Box::new(
+                     InconsistentTreeError::ExtensionNodeChildNotFound(ExtensionNodeErrorData {
+@@ -86,7 +89,7 @@
+         if match_index == self.prefix.len() {
+             let path = path.offset(match_index);
+             // Insert into child node
+-            let Some(child_node) = self.child.get_node_mut(db, path.current())? else {
++            let Some(child_node) = self.child.get_node_mut_at(db, &path)? else {
+                 return Err(TrieError::InconsistentTree(Box::new(
+                     InconsistentTreeError::ExtensionNodeChildNotFound(ExtensionNodeErrorData {
+                         node_hash: self
+@@ -116,7 +119,7 @@
+             };
+             let mut choices = BranchNode::EMPTY_CHOICES;
+             let mut branch_node = if self.prefix.at(0) == 16 {
+-                match new_node.get_node_mut(db, path.current())? {
++                match new_node.get_node_mut_at(db, &path)? {
+                     Some(Node::Leaf(leaf)) => {
+                         BranchNode::new_with_value(choices, leaf.value.clone())
+                     }
+@@ -186,7 +189,7 @@
+ 
+         // Check if the value is part of the child subtrie according to the prefix
+         if path.skip_prefix(&self.prefix) {
+-            let Some(child_node) = self.child.get_node_mut(db, path.current())? else {
++            let Some(child_node) = self.child.get_node_mut_at(db, &path)? else {
+                 return Err(TrieError::InconsistentTree(Box::new(
+                     InconsistentTreeError::ExtensionNodeChildNotFound(ExtensionNodeErrorData {
+                         node_hash: self
+--- a/crates/common/trie/rlp.rs
++++ b/crates/common/trie/rlp.rs
+@@ -75,6 +75,88 @@
+ }
+ 
+ impl BranchNode {
++    /// Encode the hash preimage with reserved prefix space, returning its start.
++    /// The scratch bytes before that offset are not part of the RLP node.
++    /// This avoids collecting child references and walking them again for size.
++    pub(crate) fn encode_hash_preimage(&self, buf: &mut Vec<u8>) -> usize {
++        buf.clear();
++        // Every child occupies at most 33 bytes (a hash with its RLP prefix).
++        // Reserve the full child region once instead of checking each append.
++        const CHILD_CAPACITY: usize = 9 + 16 * 33;
++        buf.reserve(CHILD_CAPACITY);
++        let begin = buf.as_mut_ptr();
++        // SAFETY: CHILD_CAPACITY bytes are available. The first nine bytes and
++        // each child are initialized before set_len publishes them. Child hash
++        // computation cannot reallocate this scratch buffer. On a panic its
++        // length is still zero. Inline lengths are checked by slice indexing.
++        unsafe {
++            begin.write_bytes(0, 9);
++            let mut cursor = begin.add(9);
++            // The arity is fixed. Expanding the writes avoids loop bookkeeping
++            // and reduces register spills in the RISC-V guest.
++            macro_rules! write_child {
++                ($index:expr) => {{
++                    let child = &self.choices[$index];
++                    match child.compute_hash_ref(&NativeCrypto) {
++                        NodeHash::Hashed(hash) => {
++                            cursor.write(0xa0);
++                            core::ptr::copy_nonoverlapping(
++                                hash.as_bytes().as_ptr(),
++                                cursor.add(1),
++                                32,
++                            );
++                            cursor = cursor.add(33);
++                        }
++                        NodeHash::Inline((_, 0)) => {
++                            cursor.write(RLP_NULL);
++                            cursor = cursor.add(1);
++                        }
++                        NodeHash::Inline((encoded, len)) => {
++                            let encoded = &encoded[..*len as usize];
++                            core::ptr::copy_nonoverlapping(encoded.as_ptr(), cursor, encoded.len());
++                            cursor = cursor.add(encoded.len());
++                        }
++                    }
++                }};
++            }
++            write_child!(0);
++            write_child!(1);
++            write_child!(2);
++            write_child!(3);
++            write_child!(4);
++            write_child!(5);
++            write_child!(6);
++            write_child!(7);
++            write_child!(8);
++            write_child!(9);
++            write_child!(10);
++            write_child!(11);
++            write_child!(12);
++            write_child!(13);
++            write_child!(14);
++            write_child!(15);
++            buf.set_len(cursor.offset_from(begin) as usize);
++        }
++        <[u8] as RLPEncode>::encode(&self.value, buf);
++        let payload_len = buf.len() - 9;
++        if payload_len < 56 {
++            buf[8] = 0xc0 + payload_len as u8;
++            8
++        } else {
++            // Fill the length backwards; no temporary buffer or tiny memcpy.
++            let mut remaining = payload_len;
++            let mut start = 9;
++            while remaining != 0 {
++                start -= 1;
++                buf[start] = remaining as u8;
++                remaining >>= 8;
++            }
++            start -= 1;
++            buf[start] = 0xf7 + (8 - start) as u8;
++            start
++        }
++    }
++
+     /// Concrete-typed sibling of `<Self as RLPEncode>::encode`, appending into a
+     /// `Vec<u8>` rather than a `&mut dyn BufMut`.
+     ///
+--- a/crates/common/trie/trie.rs
++++ b/crates/common/trie/trie.rs
+@@ -141,7 +141,7 @@
+     pub fn get(&self, pathrlp: &[u8]) -> Result<Option<ValueRLP>, TrieError> {
+         let path = Nibbles::from_bytes(pathrlp);
+ 
+-        if !self.dirty.contains(&path) && self.db().flatkeyvalue_computed(path.clone()) {
++        if !self.dirty.contains(&path) && self.db().flatkeyvalue_computed_ref(&path) {
+             let Some(value_rlp) = self.db.get(path)? else {
+                 return Ok(None);
+             };
+--- a/crates/common/types/account.rs
++++ b/crates/common/types/account.rs
+@@ -1,5 +1,6 @@
+ use std::collections::BTreeMap;
+-use std::sync::{Arc, LazyLock};
++use std::hash::{Hash, Hasher};
++use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+ 
+ use bytes::{BufMut, Bytes};
+ use ethereum_types::{H256, U256};
+@@ -18,11 +19,28 @@
+ use super::GenesisAccount;
+ use crate::constants::{EMPTY_KECCAK_HASH, EMPTY_TRIE_HASH};
+ 
+-/// Shared empty jump-target table. `Code::default()` and any bytecode without a
+-/// `JUMPDEST` clone this (a refcount bump) instead of allocating a fresh empty
+-/// `Arc` header each time. This matters because the per-tx `Code::default()`
+-/// placeholder and every EOA / empty-code load would otherwise each allocate.
+-static EMPTY_JUMP_TARGETS: LazyLock<Arc<[u32]>> = LazyLock::new(|| Arc::from(Vec::new()));
++// Analysis is derived from immutable bytecode and shared by every Code clone.
++// The sorted list is only needed by serialization/storage, not EVM execution.
++#[derive(Debug, Default)]
++struct JumpAnalysis {
++    targets: OnceLock<Arc<[u32]>>,
++    bitmap: OnceLock<Arc<[u64]>>,
++    progressive: Mutex<ProgressiveAnalysis>,
++}
++#[derive(Debug, Default)]
++struct ProgressiveAnalysis {
++    // First opcode not yet analyzed. A PUSH may advance beyond logical EOF.
++    next_pc: usize,
++    words: Vec<u64>,
++}
++
++static EMPTY_JUMP_ANALYSIS: LazyLock<Arc<JumpAnalysis>> = LazyLock::new(|| {
++    Arc::new(JumpAnalysis {
++        targets: OnceLock::from(Arc::from([])),
++        bitmap: OnceLock::from(Arc::from([])),
++        progressive: Mutex::default(),
++    })
++});
+ 
+ /// Trailing STOP bytes appended to every bytecode so the dispatch loop can read
+ /// the next opcode without a bounds check. 33 is the widest single-opcode advance
+@@ -30,7 +48,7 @@
+ /// padding regardless of which opcode sits at the last real byte.
+ pub const BYTECODE_PADDING: usize = 33;
+ 
+-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
++#[derive(Clone, Debug)]
+ pub struct Code {
+     // hash is only used for bytecodes stored in the DB, either for reading it from the DB
+     // or with the CODEHASH opcode, which needs an account address as argument and
+@@ -42,13 +60,7 @@
+     bytecode: Bytes,
+     /// The real bytecode length, needed for some opcodes, `bytecode` is padded with 33 STOPs to avoid checked adds on hot loop.
+     bytecode_len: usize,
+-    // `Arc<[u32]>` so cloning `Code` (hot: every message-call resolves and clones
+-    // the callee's code) is a refcount bump instead of deep-copying the table.
+-    // Serializes via serde's `rc` feature (enabled workspace-wide).
+-    // The valid addresses are 32-bit because, despite EIP-3860 restricting initcode size,
+-    // this does not apply to previous forks. This is tested in the EEST tests, which would
+-    // panic in debug mode.
+-    pub jump_targets: Arc<[u32]>,
++    analysis: Arc<JumpAnalysis>,
+ }
+ 
+ impl Code {
+@@ -59,16 +71,29 @@
+     // `code` is the logical, unpadded bytecode; `BYTECODE_PADDING` STOP bytes are
+     // appended internally by `from_parts_unchecked`.
+     pub fn from_bytecode_unchecked(code: Bytes, hash: H256) -> Self {
+-        let jump_targets = Self::compute_jump_targets(&code);
+-        Self::from_parts_unchecked(hash, &code, jump_targets)
++        if code.is_empty() {
++            return Self {
++                hash,
++                ..Self::default()
++            };
++        }
++        let bytecode_len = code.len();
++        let mut padded_code = Vec::with_capacity(bytecode_len + BYTECODE_PADDING);
++        padded_code.extend_from_slice(&code);
++        padded_code.extend_from_slice(&[0u8; BYTECODE_PADDING]);
++        Self {
++            hash,
++            bytecode: Bytes::from_owner(padded_code),
++            bytecode_len,
++            analysis: Arc::new(JumpAnalysis::default()),
++        }
+     }
+ 
+     /// `code` is the logical, unpadded bytecode; `BYTECODE_PADDING` STOP bytes are
+     /// appended internally by `from_parts_unchecked`.
+     pub fn from_bytecode(code: Bytes, crypto: &dyn Crypto) -> Self {
+-        let jump_targets = Self::compute_jump_targets(&code);
+         let hash = H256(crypto.keccak256(code.as_ref()));
+-        Self::from_parts_unchecked(hash, &code, jump_targets)
++        Self::from_bytecode_unchecked(code, hash)
+     }
+ 
+     /// Builds a `Code` from precomputed parts. The caller must guarantee `hash`
+@@ -87,37 +112,137 @@
+             hash,
+             bytecode: Bytes::from_owner(padded_code),
+             bytecode_len,
+-            jump_targets,
+-        }
+-    }
+-
+-    fn compute_jump_targets(code: &[u8]) -> Arc<[u32]> {
+-        debug_assert!(code.len() <= u32::MAX as usize);
+-        let mut targets = Vec::new();
+-        let mut i = 0;
+-        while i < code.len() {
+-            // TODO: we don't use the constants from the vm module to avoid a circular dependency
+-            match code[i] {
+-                // OP_JUMPDEST
+-                0x5B => {
+-                    targets.push(i as u32);
++            analysis: Arc::new(JumpAnalysis {
++                bitmap: OnceLock::from(Self::make_jump_bitmap(code, &jump_targets)),
++                targets: OnceLock::from(jump_targets),
++                progressive: Mutex::default(),
++            }),
++        }
++    }
++
++    fn make_jump_bitmap(code: &[u8], targets: &[u32]) -> Arc<[u64]> {
++        if targets.is_empty() {
++            return EMPTY_JUMP_ANALYSIS.bitmap.get().unwrap().clone();
++        }
++        let mut words = vec![0u64; code.len().div_ceil(64)];
++        for &target in targets {
++            let target = target as usize;
++            if code.get(target) == Some(&0x5b) {
++                words[target / 64] |= 1u64 << (target % 64);
++            }
++        }
++        Arc::from(words)
++    }
++
++    /// Materialize the sorted list only when a storage/serialization caller needs it.
++    pub fn jump_targets(&self) -> &[u32] {
++        self.target_table()
++    }
++
++    fn target_table(&self) -> &Arc<[u32]> {
++        self.analysis.targets.get_or_init(|| {
++            let mut targets = Vec::new();
++            for (index, &word) in self.jump_bitmap().iter().enumerate() {
++                let mut bits = word;
++                while bits != 0 {
++                    targets.push((index * 64 + bits.trailing_zeros() as usize) as u32);
++                    bits &= bits - 1;
+                 }
+-                // OP_PUSH1..32
+-                c @ 0x60..0x80 => {
+-                    // OP_PUSH0
+-                    i += (c - 0x5F) as usize;
++            }
++            Arc::from(targets)
++        })
++    }
++
++    #[inline]
++    fn jump_bitmap(&self) -> &[u64] {
++        self.analysis
++            .bitmap
++            .get_or_init(|| self.compute_jump_bitmap())
++    }
++
++    #[inline]
++    pub fn is_valid_jump_target(&self, target: usize) -> bool {
++        // Reject out-of-range and non-JUMPDEST positions before doing analysis.
++        if self.code().get(target) != Some(&0x5b) {
++            return false;
++        }
++        if let Some(bitmap) = self.analysis.bitmap.get() {
++            return bitmap
++                .get(target / 64)
++                .is_some_and(|word| word & (1u64 << (target % 64)) != 0);
++        }
++        let mut analysis = self.analysis.progressive.lock().unwrap();
++        if analysis.next_pc <= target {
++            self.analyze_through(&mut analysis, target);
++        }
++        analysis
++            .words
++            .get(target / 64)
++            .is_some_and(|word| word & (1u64 << (target % 64)) != 0)
++    }
++
++    fn compute_jump_bitmap(&self) -> Arc<[u64]> {
++        if self.is_empty() {
++            return EMPTY_JUMP_ANALYSIS.bitmap.get().unwrap().clone();
++        }
++        let mut analysis = self.analysis.progressive.lock().unwrap();
++        self.analyze_through(&mut analysis, self.len() - 1);
++        Arc::from(analysis.words.as_slice())
++    }
++
++    // Scanning and allocation are rare once the queried prefix is cached.
++    // Keep their register/stack requirements out of repeated jump lookups.
++    #[inline(never)]
++    fn analyze_through(&self, analysis: &mut ProgressiveAnalysis, target: usize) {
++        debug_assert!(target < self.len());
++        debug_assert!(self.len() <= u32::MAX as usize);
++        let start = self.dispatch_buf().as_ptr();
++        // A previous trailing PUSH may have advanced beyond EOF. Do not form
++        // a pointer from that cursor unless it is actually going to be read.
++        if analysis.next_pc > target {
++            return;
++        }
++        let mut cursor = unsafe { start.add(analysis.next_pc) };
++        let limit = unsafe { start.add(target) };
++        macro_rules! scan_opcode {
++            () => {{
++                // Constructors append 33 STOP bytes. We only read logical bytes;
++                // a truncated PUSH can advance at most 32 bytes into the padding.
++                let opcode = unsafe { *cursor };
++                if (opcode as i8) >= 0x60 {
++                    cursor = unsafe { cursor.add((opcode - 0x5e) as usize) };
++                } else {
++                    if opcode == 0x5b {
++                        let offset = cursor as usize - start as usize;
++                        if analysis.words.is_empty() {
++                            analysis.words.resize(self.len().div_ceil(64), 0);
++                        }
++                        analysis.words[offset / 64] |= 1u64 << (offset % 64);
++                    }
++                    cursor = unsafe { cursor.add(1) };
+                 }
+-                _ => (),
++            }};
++        }
++        // Each opcode advances by at most 33 bytes. This margin ensures all
++        // 8 opcode reads stay at or before the requested target, including PUSH32.
++        const BATCH_MARGIN: usize = 7 * 33;
++        if target >= BATCH_MARGIN {
++            let fast_limit = unsafe { start.add(target - BATCH_MARGIN) };
++            while cursor <= fast_limit {
++                scan_opcode!();
++                scan_opcode!();
++                scan_opcode!();
++                scan_opcode!();
++                scan_opcode!();
++                scan_opcode!();
++                scan_opcode!();
++                scan_opcode!();
+             }
+-            i += 1;
+-        }
+-        // Share the single empty table for jumpless bytecode (very common: EOAs,
+-        // tiny contracts) so we don't allocate an `Arc` header for an empty slice.
+-        if targets.is_empty() {
+-            EMPTY_JUMP_TARGETS.clone()
+-        } else {
+-            Arc::from(targets)
+-        }
++        }
++        while cursor <= limit {
++            scan_opcode!();
++        }
++        analysis.next_pc = cursor as usize - start as usize;
+     }
+ 
+     #[inline]
+@@ -157,10 +282,45 @@
+     ///
+     /// usize - Estimated size in bytes
+     pub fn size(&self) -> usize {
+-        let hash_size = size_of::<H256>();
+-        let bytes_size = size_of::<Bytes>();
+-        let vec_size = size_of::<Arc<[u32]>>() + self.jump_targets.len() * size_of::<u32>();
+-        hash_size + bytes_size + vec_size
++        // Observe allocated caches without forcing analysis of unused code.
++        let targets = self
++            .analysis
++            .targets
++            .get()
++            .map_or(0, |v| v.len() * size_of::<u32>());
++        let bitmap = self
++            .analysis
++            .bitmap
++            .get()
++            .map_or(0, |v| v.len() * size_of::<u64>());
++        let progressive =
++            self.analysis.progressive.lock().unwrap().words.capacity() * size_of::<u64>();
++        size_of::<Self>()
++            + self.bytecode.len()
++            + size_of::<JumpAnalysis>()
++            + targets
++            + bitmap
++            + progressive
++    }
++}
++
++impl PartialEq for Code {
++    fn eq(&self, other: &Self) -> bool {
++        self.hash == other.hash
++            && self.bytecode == other.bytecode
++            && self.bytecode_len == other.bytecode_len
++            && self.jump_targets() == other.jump_targets()
++            && self.jump_bitmap() == other.jump_bitmap()
++    }
++}
++impl Eq for Code {}
++impl Hash for Code {
++    fn hash<H: Hasher>(&self, state: &mut H) {
++        self.hash.hash(state);
++        self.bytecode.hash(state);
++        self.bytecode_len.hash(state);
++        self.jump_targets().hash(state);
++        self.jump_bitmap().hash(state);
+     }
+ }
+ 
+@@ -182,7 +342,7 @@
+         CodeSerde {
+             hash: self.hash,
+             code: self.code_bytes(),
+-            jump_targets: self.jump_targets.clone(),
++            jump_targets: self.target_table().clone(),
+         }
+         .serialize(serializer)
+     }
+@@ -263,7 +423,7 @@
+             bytecode: Bytes::from_static(&[0u8; BYTECODE_PADDING]),
+             bytecode_len: 0,
+             hash: *EMPTY_KECCAK_HASH,
+-            jump_targets: EMPTY_JUMP_TARGETS.clone(),
++            analysis: EMPTY_JUMP_ANALYSIS.clone(),
+         }
+     }
+ }
+--- a/crates/common/utils.rs
++++ b/crates/common/utils.rs
+@@ -4,6 +4,54 @@
+ use hex::FromHexError;
+ 
+ pub const ZERO_U256: U256 = U256([0, 0, 0, 0]);
++
++// RV64IM has no REV8 instruction. LLVM's generic bswap lowering is longer
++// than this three-stage exchange of bytes, halfwords, and words. Other targets
++// retain the compiler's native endian conversion.
++#[inline(always)]
++fn word_from_big_endian(value: u64) -> u64 {
++    #[cfg(all(
++        target_arch = "riscv64",
++        target_endian = "little",
++        not(target_feature = "zbb")
++    ))]
++    {
++        let mut value = value;
++        // SAFETY: this pure register-only operation uses baseline RV64I shifts,
++        // masks and ORs; it accesses no memory and preserves the stack.
++        unsafe {
++            core::arch::asm!(
++                "srli {tmp}, {value}, 8",
++                "and {tmp}, {tmp}, {mask8}",
++                "and {value}, {value}, {mask8}",
++                "slli {value}, {value}, 8",
++                "or {value}, {value}, {tmp}",
++                "srli {tmp}, {value}, 16",
++                "and {tmp}, {tmp}, {mask16}",
++                "and {value}, {value}, {mask16}",
++                "slli {value}, {value}, 16",
++                "or {value}, {value}, {tmp}",
++                "srli {tmp}, {value}, 32",
++                "slli {value}, {value}, 32",
++                "or {value}, {value}, {tmp}",
++                value = inout(reg) value,
++                tmp = out(reg) _,
++                mask8 = in(reg) 0x00ff00ff00ff00ffu64,
++                mask16 = in(reg) 0x0000ffff0000ffffu64,
++                options(pure, nomem, nostack),
++            );
++        }
++        value
++    }
++    #[cfg(not(all(
++        target_arch = "riscv64",
++        target_endian = "little",
++        not(target_feature = "zbb")
++    )))]
++    {
++        u64::from_be(value)
++    }
++}
+ 
+ /// Converts a big endian slice to a u256, faster than `u256::from_big_endian`.
+ pub fn u256_from_big_endian(slice: &[u8]) -> U256 {
+@@ -15,7 +63,7 @@
+     let mut u64_bytes = [0u8; 8];
+     for i in 0..4 {
+         u64_bytes.copy_from_slice(&padded[8 * i..(8 * i + 8)]);
+-        ret[4 - i - 1] = u64::from_be_bytes(u64_bytes);
++        ret[4 - i - 1] = word_from_big_endian(u64::from_ne_bytes(u64_bytes));
+     }
+ 
+     U256(ret)
+@@ -35,7 +83,11 @@
+     let mut u64_bytes = [0u8; 8];
+     for i in 0..4 {
+         u64_bytes.copy_from_slice(&padded[8 * i..(8 * i + 8)]);
+-        ret[4 - i - 1] = u64::from_be_bytes(u64_bytes);
++        ret[4 - i - 1] = if N >= (4 - i) * 8 {
++            word_from_big_endian(u64::from_ne_bytes(u64_bytes))
++        } else {
++            u64::from_be_bytes(u64_bytes)
++        };
+     }
+ 
+     U256(ret)
+@@ -47,7 +99,53 @@
+     let mut bytes = [0u8; 32];
+ 
+     for i in 0..4 {
+-        let u64_be = value.0[4 - i - 1].to_be_bytes();
++        let u64_be = word_from_big_endian(value.0[4 - i - 1]).to_ne_bytes();
++        bytes[8 * i..(8 * i + 8)].copy_from_slice(&u64_be);
++    }
++
++    bytes
++}
++
++/// Decodes an EVM memory word, avoiding byte permutation for zero limbs.
++#[inline(always)]
++pub fn u256_from_big_endian_for_memory(value: [u8; 32]) -> U256 {
++    let mut limbs = [0u64; 4];
++    for (i, chunk) in value.chunks_exact(8).enumerate() {
++        let mut bytes = [0u8; 8];
++        bytes.copy_from_slice(chunk);
++        let word = u64::from_ne_bytes(bytes);
++        limbs[3 - i] = if cfg!(all(
++            target_arch = "riscv64",
++            target_endian = "little",
++            not(target_feature = "zbb")
++        )) && word == 0
++        {
++            0
++        } else {
++            word_from_big_endian(word)
++        };
++    }
++    U256(limbs)
++}
++
++/// Converts an EVM memory word, avoiding byte permutation for zero limbs.
++#[inline(always)]
++pub fn u256_to_big_endian_for_memory(value: U256) -> [u8; 32] {
++    let mut bytes = [0u8; 32];
++
++    for i in 0..4 {
++        let word = value.0[4 - i - 1];
++        let reversed = if cfg!(all(
++            target_arch = "riscv64",
++            target_endian = "little",
++            not(target_feature = "zbb")
++        )) && word == 0
++        {
++            0
++        } else {
++            word_from_big_endian(word)
++        };
++        let u64_be = reversed.to_ne_bytes();
+         bytes[8 * i..(8 * i + 8)].copy_from_slice(&u64_be);
+     }
+ 
+--- a/crates/storage/store.rs
++++ b/crates/storage/store.rs
+@@ -5236,11 +5236,11 @@
+ 
+ fn encode_code(code: &Code) -> Vec<u8> {
+     let mut buf =
+-        Vec::with_capacity(6 + code.len() + std::mem::size_of_val::<[u32]>(&code.jump_targets));
++        Vec::with_capacity(6 + code.len() + std::mem::size_of_val::<[u32]>(code.jump_targets()));
+     code.code().encode(&mut buf);
+     // `Arc<[u32]>` (the in-memory share) has no `RLPEncode` impl; encode through an
+     // owned `Vec` on this cold DB-write path (code is persisted once per hash).
+-    code.jump_targets.to_vec().encode(&mut buf);
++    code.jump_targets().to_vec().encode(&mut buf);
+     buf
+ }
+ 
+--- a/crates/vm/levm/src/call_frame.rs
++++ b/crates/vm/levm/src/call_frame.rs
+@@ -93,8 +93,18 @@
+     /// original top and `*b` the original second operand.
+     #[inline]
+     pub fn pop1_and_top_mut(&mut self) -> Result<(U256, &mut U256), ExceptionalHalt> {
+-        let a = self.pop1()?;
+-        Ok((a, self.top_mut()?))
++        if self.offset < STACK_LIMIT - 1 {
++            let offset = self.offset;
++            // SAFETY: the check above guarantees two valid, distinct stack slots.
++            #[expect(unsafe_code)]
++            let [a, b] = unsafe { &mut *self.values.as_mut_ptr().add(offset).cast::<[U256; 2]>() };
++            self.offset = offset + 1;
++            Ok((*a, b))
++        } else {
++            // Preserve the consumed operand when a one-item stack underflows.
++            let a = self.pop1()?;
++            Ok((a, self.top_mut()?))
++        }
+     }
+ 
+     /// Push a single U256 value to the stack, faster than the generic push.
+@@ -194,6 +204,21 @@
+     /// Pushes a copy of the value at depth N
+     #[inline]
+     pub fn dup<const N: usize>(&mut self) -> Result<(), ExceptionalHalt> {
++        let next = self.offset.wrapping_sub(1);
++        if N < STACK_LIMIT && next < STACK_LIMIT - N - 1 {
++            // SAFETY: 1 <= offset <= STACK_LIMIT - N - 1; source and destination differ.
++            #[expect(unsafe_code)]
++            unsafe {
++                let value = *self.values.get_unchecked(self.offset + N);
++                let slot = self.values.get_unchecked_mut(next);
++                slot.0[0] = value.0[0];
++                slot.0[1] = value.0[1];
++                slot.0[2] = value.0[2];
++                slot.0[3] = value.0[3];
++            }
++            self.offset = next;
++            return Ok(());
++        }
+         // Compile-time check that ensures `self.offset + N` is safe,
+         // since self.offset is bounded by STACK_LIMIT
+         const {
+@@ -223,9 +248,13 @@
+ }
+ 
+ impl Default for Stack {
++    #[expect(unsafe_code, reason = "all-zero bytes are valid for every U256 limb")]
+     fn default() -> Self {
+         Self {
+-            values: Box::new([U256::zero(); STACK_LIMIT]),
++            // SAFETY: U256 consists of four u64 limbs; all-zero bytes are valid.
++            // Allocate directly on the heap instead of constructing and copying
++            // a 32 KiB temporary stack array into the box.
++            values: unsafe { Box::<[U256; STACK_LIMIT]>::new_zeroed().assume_init() },
+             offset: STACK_LIMIT,
+         }
+     }
+--- a/crates/vm/levm/src/memory.rs
++++ b/crates/vm/levm/src/memory.rs
+@@ -8,7 +8,7 @@
+ use bytes::Bytes;
+ use ethrex_common::{
+     U256,
+-    utils::{u256_from_big_endian_const, u256_to_big_endian},
++    utils::{u256_from_big_endian_for_memory, u256_to_big_endian_for_memory},
+ };
+ 
+ /// A cheaply clonable callframe-shared memory buffer.
+@@ -106,19 +106,16 @@
+     /// Note: new_memory_size is increased to the next 32 byte multiple.
+     #[inline(always)]
+     pub fn resize(&mut self, new_memory_size: usize) -> Result<(), VMError> {
+-        if new_memory_size == 0 {
++        // A range covered by complete existing words needs no rounding or
++        // allocation. Round the current length down to preserve behavior even
++        // if a caller assigned an unaligned value to the public `len` field.
++        if new_memory_size <= (self.len() & !(WORD_SIZE_IN_BYTES_USIZE - 1)) {
+             return Ok(());
+         }
+ 
+         let new_memory_size = new_memory_size
+             .checked_next_multiple_of(WORD_SIZE_IN_BYTES_USIZE)
+             .ok_or(OutOfBounds)?;
+-
+-        let current_len = self.len();
+-
+-        if new_memory_size <= current_len {
+-            return Ok(());
+-        }
+ 
+         self.len = new_memory_size;
+ 
+@@ -214,7 +211,7 @@
+     #[inline(always)]
+     pub fn load_word(&mut self, offset: usize) -> Result<U256, VMError> {
+         let value: [u8; 32] = self.load_range_const(offset)?;
+-        Ok(u256_from_big_endian_const(value))
++        Ok(u256_from_big_endian_for_memory(value))
+     }
+ 
+     /// Stores the given data and data size at the given offset.
+@@ -308,7 +305,11 @@
+             .ok_or(OutOfBounds)?;
+ 
+         self.resize(new_size)?;
+-        self.store(&u256_to_big_endian(word), offset, WORD_SIZE_IN_BYTES_USIZE)?;
++        self.store(
++            &u256_to_big_endian_for_memory(word),
++            offset,
++            WORD_SIZE_IN_BYTES_USIZE,
++        )?;
+         Ok(())
+     }
+ 
+--- a/crates/vm/levm/src/opcode_handlers/arithmetic.rs
++++ b/crates/vm/levm/src/opcode_handlers/arithmetic.rs
+@@ -64,6 +64,171 @@
+     }
+ }
+ 
++/// EVM unsigned division specialized for native-width divisors.
++#[inline(always)]
++pub fn div_with_u64_fast_path(lhs: U256, rhs: U256) -> U256 {
++    if (rhs.0[1] | rhs.0[2] | rhs.0[3]) == 0 {
++        let divisor = rhs.0[0];
++        if divisor == 0 {
++            return U256::zero();
++        }
++        if (lhs.0[1] | lhs.0[2] | lhs.0[3]) == 0 {
++            return U256::from(lhs.0[0] / divisor);
++        }
++        if divisor.is_power_of_two() {
++            return lhs >> divisor.trailing_zeros();
++        }
++        if divisor <= u32::MAX as u64 {
++            return div_by_u32(lhs, divisor);
++        }
++        return div_by_wide_u64(lhs, divisor);
++    }
++    div_full_width_u32(lhs, rhs)
++}
++
++#[inline(never)]
++fn div_by_u32(mut value: U256, divisor: u64) -> U256 {
++    // Base-2^32 long division: remainder < divisor <= u32::MAX,
++    // so combining it with the next digit always fits in a u64.
++    let mut remainder = 0u64;
++    for word in value.0.iter_mut().rev() {
++        let high = (remainder << 32) | (*word >> 32);
++        let q_high = high / divisor;
++        remainder = high % divisor;
++        let low = (remainder << 32) | (*word & u32::MAX as u64);
++        let q_low = low / divisor;
++        remainder = low % divisor;
++        *word = (q_high << 32) | q_low;
++    }
++    value
++}
++
++/// Base-2^32 long division by a two-digit divisor, using only u64 arithmetic.
++#[inline(never)]
++fn div_by_wide_u64(value: U256, divisor: u64) -> U256 {
++    debug_assert!(divisor > u32::MAX as u64);
++    const BASE: u64 = 1u64 << 32;
++    let shift = divisor.leading_zeros();
++    let normalized = divisor << shift;
++    let high = normalized >> 32;
++    let low = normalized & (BASE - 1);
++    let mut digits = [0u32; 9];
++    let mut carry = 0u64;
++    for (i, digit) in digits[..8].iter_mut().enumerate() {
++        let raw = (value.0[i / 2] >> (32 * (i % 2))) & (BASE - 1);
++        let shifted = (raw << shift) | carry;
++        *digit = shifted as u32;
++        carry = shifted >> 32;
++    }
++    digits[8] = carry as u32;
++    let mut remainder = u64::from(digits[8]);
++    for digit in digits[..8].iter_mut().rev() {
++        let next = u64::from(*digit);
++        if remainder < high {
++            // remainder*BASE + next < high*BASE <= normalized, so q is zero.
++            remainder = (remainder << 32) | next;
++            *digit = 0;
++            continue;
++        }
++        // high >= BASE/2. The upper two numerator digits give an upper
++        // estimate; cap at one digit, then correct while the product is too big.
++        let mut quotient = (remainder / high).min(BASE - 1);
++        let mut estimate_remainder = remainder - quotient * high;
++        while estimate_remainder < BASE && quotient * low > ((estimate_remainder << 32) | next) {
++            quotient -= 1;
++            estimate_remainder += high;
++        }
++        // The exact remainder is < normalized < 2^64, so subtracting the
++        // low 64 bits of the 96-bit numerator/product yields that remainder.
++        remainder = ((remainder << 32) | next).wrapping_sub(quotient.wrapping_mul(normalized));
++        *digit = quotient as u32;
++    }
++    U256([
++        u64::from(digits[0]) | (u64::from(digits[1]) << 32),
++        u64::from(digits[2]) | (u64::from(digits[3]) << 32),
++        u64::from(digits[4]) | (u64::from(digits[5]) << 32),
++        u64::from(digits[6]) | (u64::from(digits[7]) << 32),
++    ])
++}
++
++/// Long division in base 2^32 for divisors with at least three digits.
++#[inline(never)]
++fn div_full_width_u32(lhs: U256, rhs: U256) -> U256 {
++    debug_assert!((rhs.0[1] | rhs.0[2] | rhs.0[3]) != 0);
++    if lhs < rhs {
++        return U256::zero();
++    }
++    const BASE: u64 = 1u64 << 32;
++    let mut v: [u32; 8] = core::array::from_fn(|i| (rhs.0[i / 2] >> (32 * (i % 2))) as u32);
++    let raw: [u32; 8] = core::array::from_fn(|i| (lhs.0[i / 2] >> (32 * (i % 2))) as u32);
++    let n = v
++        .iter()
++        .rposition(|&digit| digit != 0)
++        .expect("nonzero divisor")
++        + 1;
++    let len = raw
++        .iter()
++        .rposition(|&digit| digit != 0)
++        .expect("nonzero numerator")
++        + 1;
++    let shift = v[n - 1].leading_zeros();
++    let mut carry = 0u64;
++    for digit in &mut v[..n] {
++        let wide = (u64::from(*digit) << shift) | carry;
++        *digit = wide as u32;
++        carry = wide >> 32;
++    }
++    let mut u = [0u32; 9];
++    carry = 0;
++    for i in 0..len {
++        let wide = (u64::from(raw[i]) << shift) | carry;
++        u[i] = wide as u32;
++        carry = wide >> 32;
++    }
++    u[len] = carry as u32;
++    let mut q = [0u32; 8];
++    let high = u64::from(v[n - 1]);
++    let second = u64::from(v[n - 2]);
++    for j in (0..=len - n).rev() {
++        let top = (u64::from(u[j + n]) << 32) | u64::from(u[j + n - 1]);
++        let mut estimate = (top / high).min(BASE - 1);
++        let mut remainder = top - estimate * high;
++        while remainder < BASE && estimate * second > ((remainder << 32) | u64::from(u[j + n - 2]))
++        {
++            estimate -= 1;
++            remainder += high;
++        }
++        // Subtract estimate*v. Each product plus the previous carry/borrow fits u64.
++        let mut borrow = 0u64;
++        for i in 0..n {
++            let product = estimate * u64::from(v[i]) + borrow;
++            let (digit, underflow) = u[j + i].overflowing_sub(product as u32);
++            u[j + i] = digit;
++            borrow = (product >> 32) + u64::from(underflow);
++        }
++        let (last, underflow) = u[j + n].overflowing_sub(borrow as u32);
++        u[j + n] = last;
++        if underflow {
++            // The estimate was still one too large: decrement and add v back.
++            estimate -= 1;
++            let mut carry = 0u64;
++            for i in 0..n {
++                let sum = u64::from(u[j + i]) + u64::from(v[i]) + carry;
++                u[j + i] = sum as u32;
++                carry = sum >> 32;
++            }
++            u[j + n] = u[j + n].wrapping_add(carry as u32);
++        }
++        q[j] = estimate as u32;
++    }
++    U256([
++        u64::from(q[0]) | (u64::from(q[1]) << 32),
++        u64::from(q[2]) | (u64::from(q[3]) << 32),
++        u64::from(q[4]) | (u64::from(q[5]) << 32),
++        u64::from(q[6]) | (u64::from(q[7]) << 32),
++    ])
++}
++
+ /// Implementation for the `DIV` opcode.
+ pub struct OpDivHandler;
+ impl OpcodeHandler for OpDivHandler {
+@@ -72,7 +237,7 @@
+         vm.current_call_frame.increase_consumed_gas(gas_cost::DIV)?;
+ 
+         let (lhs, rhs) = vm.current_call_frame.stack.pop1_and_top_mut()?;
+-        *rhs = lhs.checked_div(*rhs).unwrap_or(U256::zero());
++        *rhs = div_with_u64_fast_path(lhs, *rhs);
+ 
+         Ok(OpcodeResult::Continue)
+     }
+@@ -114,6 +279,32 @@
+     }
+ }
+ 
++/// EVM remainder with native-width and power-of-two specializations.
++#[inline(always)]
++pub fn rem_with_u64_fast_path(lhs: U256, rhs: U256) -> U256 {
++    if (rhs.0[1] | rhs.0[2] | rhs.0[3]) == 0 {
++        let divisor = rhs.0[0];
++        if divisor == 0 {
++            return U256::zero();
++        }
++        if (lhs.0[1] | lhs.0[2] | lhs.0[3]) == 0 {
++            return U256::from(lhs.0[0] % divisor);
++        }
++        if divisor.is_power_of_two() {
++            return U256::from(lhs.0[0] & (divisor - 1));
++        }
++        if divisor <= u32::MAX as u64 {
++            let mut remainder = 0u64;
++            for &word in lhs.0.iter().rev() {
++                remainder = ((remainder << 32) | (word >> 32)) % divisor;
++                remainder = ((remainder << 32) | (word & u32::MAX as u64)) % divisor;
++            }
++            return U256::from(remainder);
++        }
++    }
++    lhs.checked_rem(rhs).unwrap_or_default()
++}
++
+ /// Implementation for the `MOD` opcode.
+ pub struct OpModHandler;
+ impl OpcodeHandler for OpModHandler {
+@@ -122,7 +313,7 @@
+         vm.current_call_frame.increase_consumed_gas(gas_cost::MOD)?;
+ 
+         let (lhs, rhs) = vm.current_call_frame.stack.pop1_and_top_mut()?;
+-        *rhs = lhs.checked_rem(*rhs).unwrap_or(U256::zero());
++        *rhs = rem_with_u64_fast_path(lhs, *rhs);
+ 
+         Ok(OpcodeResult::Continue)
+     }
+--- a/crates/vm/levm/src/opcode_handlers/stack_memory_storage_flow.rs
++++ b/crates/vm/levm/src/opcode_handlers/stack_memory_storage_flow.rs
+@@ -470,47 +470,31 @@
+     // Check target address validity.
+     //   - Target bytecode has to be a JUMPDEST.
+     //   - Target address must not be blacklisted (aka. the JUMPDEST must not be part of a literal).
+-    #[expect(clippy::as_conversions, reason = "safe")]
+-    if vm
+-        .current_call_frame
+-        .bytecode
+-        .dispatch_buf()
+-        .get(target)
+-        .is_some_and(|&value| {
+-            value == Opcode::JUMPDEST as u8
+-                && vm
+-                    .current_call_frame
+-                    .bytecode
+-                    .jump_targets
+-                    .binary_search(&(target as u32))
+-                    .is_ok()
+-        })
+-    {
++    if vm.current_call_frame.bytecode.is_valid_jump_target(target) {
+         if vm.opcode_tracer.active {
+-            // Override the parent JUMP/JUMPI's gasCost so the dispatch loop
+-            // doesn't roll the upcoming JUMPDEST charge into it.
+-            vm.opcode_tracer.last_opcode_gas_cost = Some(parent_gas_cost);
+-
+-            // Capture the synthetic JUMPDEST step's state BEFORE charging its gas.
+-            let synth = build_jumpdest_step(vm, target);
+-
+-            // Fuse: charge JUMPDEST + advance PC past it.
+-            vm.current_call_frame.pc = target.wrapping_add(1);
+-            vm.current_call_frame
+-                .increase_consumed_gas(gas_cost::JUMPDEST)?;
+-
+-            vm.opcode_tracer.synthesize_step(synth);
+-        } else {
+-            // Hot path: fuse JUMP/JUMPI + JUMPDEST without any trace bookkeeping.
+-            vm.current_call_frame.pc = target.wrapping_add(1);
+-            vm.current_call_frame
+-                .increase_consumed_gas(gas_cost::JUMPDEST)?;
+-        }
++            return jump_traced(vm, target, parent_gas_cost);
++        }
++        vm.current_call_frame.pc = target.wrapping_add(1);
++        vm.current_call_frame
++            .increase_consumed_gas(gas_cost::JUMPDEST)?;
+         Ok(())
+     } else {
+         // Target address is invalid.
+         Err(ExceptionalHalt::InvalidJump.into())
+     }
++}
++
++// Keep stack/memory/return-data capture out of the ordinary jump's frame.
++#[cold]
++#[inline(never)]
++fn jump_traced(vm: &mut VM<'_>, target: usize, parent_gas_cost: u64) -> Result<(), VMError> {
++    vm.opcode_tracer.last_opcode_gas_cost = Some(parent_gas_cost);
++    let synth = build_jumpdest_step(vm, target);
++    vm.current_call_frame.pc = target.wrapping_add(1);
++    vm.current_call_frame
++        .increase_consumed_gas(gas_cost::JUMPDEST)?;
++    vm.opcode_tracer.synthesize_step(synth);
++    Ok(())
+ }
+ 
+ /// Builds a synthetic JUMPDEST trace entry. Captures gas/stack/memory/return-data
+--- a/test/tests/common/code_serde_tests.rs
++++ b/test/tests/common/code_serde_tests.rs
+@@ -19,7 +19,7 @@
+     assert_eq!(restored.code(), code.code());
+     assert_eq!(restored.len(), code.len());
+     assert_eq!(restored.hash, code.hash);
+-    assert_eq!(restored.jump_targets, code.jump_targets);
++    assert_eq!(restored.jump_targets(), code.jump_targets());
+     // The dispatch buffer must carry the trailing padding after a round-trip.
+     assert_eq!(restored.dispatch_buf().len(), code.len() + BYTECODE_PADDING);
+     assert_eq!(restored, code);

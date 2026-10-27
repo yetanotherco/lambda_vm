@@ -8,7 +8,7 @@ use ExceptionalHalt::OutOfBounds;
 use bytes::Bytes;
 use ethrex_common::{
     U256,
-    utils::{u256_from_big_endian_const, u256_to_big_endian},
+    utils::{u256_from_big_endian_for_memory, u256_to_big_endian_for_memory},
 };
 
 /// A cheaply clonable callframe-shared memory buffer.
@@ -106,19 +106,16 @@ impl Memory {
     /// Note: new_memory_size is increased to the next 32 byte multiple.
     #[inline(always)]
     pub fn resize(&mut self, new_memory_size: usize) -> Result<(), VMError> {
-        if new_memory_size == 0 {
+        // A range covered by complete existing words needs no rounding or
+        // allocation. Round the current length down to preserve behavior even
+        // if a caller assigned an unaligned value to the public `len` field.
+        if new_memory_size <= (self.len() & !(WORD_SIZE_IN_BYTES_USIZE - 1)) {
             return Ok(());
         }
 
         let new_memory_size = new_memory_size
             .checked_next_multiple_of(WORD_SIZE_IN_BYTES_USIZE)
             .ok_or(OutOfBounds)?;
-
-        let current_len = self.len();
-
-        if new_memory_size <= current_len {
-            return Ok(());
-        }
 
         self.len = new_memory_size;
 
@@ -214,7 +211,7 @@ impl Memory {
     #[inline(always)]
     pub fn load_word(&mut self, offset: usize) -> Result<U256, VMError> {
         let value: [u8; 32] = self.load_range_const(offset)?;
-        Ok(u256_from_big_endian_const(value))
+        Ok(u256_from_big_endian_for_memory(value))
     }
 
     /// Stores the given data and data size at the given offset.
@@ -308,7 +305,11 @@ impl Memory {
             .ok_or(OutOfBounds)?;
 
         self.resize(new_size)?;
-        self.store(&u256_to_big_endian(word), offset, WORD_SIZE_IN_BYTES_USIZE)?;
+        self.store(
+            &u256_to_big_endian_for_memory(word),
+            offset,
+            WORD_SIZE_IN_BYTES_USIZE,
+        )?;
         Ok(())
     }
 

@@ -52,6 +52,11 @@ pub trait TrieDB: Send + Sync {
     fn flatkeyvalue_computed(&self, _key: Nibbles) -> bool {
         false
     }
+
+    /// Borrowed lookup hook; existing backends retain their owned-key behavior.
+    fn flatkeyvalue_computed_ref(&self, key: &Nibbles) -> bool {
+        self.flatkeyvalue_computed(key.clone())
+    }
 }
 
 // TODO: we should replace this with BackendTrieDB
@@ -135,6 +140,11 @@ impl InMemoryTrieDB {
 }
 
 impl TrieDB for InMemoryTrieDB {
+    fn flatkeyvalue_computed_ref(&self, _key: &Nibbles) -> bool {
+        // This backend has no flat-key-value storage, so no owned key is needed.
+        false
+    }
+
     fn get(&self, key: Nibbles) -> Result<Option<Vec<u8>>, TrieError> {
         Ok(self
             .lock_inner()?

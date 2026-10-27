@@ -61,6 +61,9 @@ impl BranchNode {
         if let Some(choice) = path.next_choice() {
             // Delegate to children if present
             let child_ref = &self.choices[choice];
+            if let NodeRef::Node(node, _) = child_ref {
+                return node.get(db, path);
+            }
             if child_ref.is_valid() {
                 let child_node = child_ref.get_node(db, path.current())?.ok_or_else(|| {
                     TrieError::InconsistentTree(Box::new(
@@ -101,7 +104,7 @@ impl BranchNode {
                 }
                 // Insert into existing child and then update it
                 (choice_ref, ValueOrHash::Value(value)) => {
-                    let Some(choice_node) = choice_ref.get_node_mut(db, path.current())? else {
+                    let Some(choice_node) = choice_ref.get_node_mut_at(db, &path)? else {
                         return Err(TrieError::InconsistentTree(Box::new(
                             InconsistentTreeError::NodeNotFoundOnBranchNode(
                                 choice_ref
@@ -125,7 +128,7 @@ impl BranchNode {
                             "attempt to override proof node with external hash".to_string(),
                         ));
                     } else {
-                        let Some(choice_node) = choice_ref.get_node_mut(db, path.current())? else {
+                        let Some(choice_node) = choice_ref.get_node_mut_at(db, &path)? else {
                             return Err(TrieError::InconsistentTree(Box::new(
                                 InconsistentTreeError::NodeNotFoundOnBranchNode(
                                     choice_ref
@@ -183,8 +186,7 @@ impl BranchNode {
         // Check if the value is located in a child subtrie
         let value = if let Some(choice_index) = path.next_choice() {
             if self.choices[choice_index].is_valid() {
-                let Some(child_node) =
-                    self.choices[choice_index].get_node_mut(db, path.current())?
+                let Some(child_node) = self.choices[choice_index].get_node_mut_at(db, &path)?
                 else {
                     return Err(TrieError::InconsistentTree(Box::new(
                         InconsistentTreeError::NodeNotFoundOnBranchNode(
@@ -280,9 +282,8 @@ impl BranchNode {
 
     /// Computes the node's hash, using the provided buffer
     pub fn compute_hash_no_alloc(&self, buf: &mut Vec<u8>, crypto: &dyn Crypto) -> NodeHash {
-        buf.clear();
-        self.encode_into_vec(buf);
-        let hash = NodeHash::from_encoded(buf, crypto);
+        let start = self.encode_hash_preimage(buf);
+        let hash = NodeHash::from_encoded(&buf[start..], crypto);
         buf.clear();
         hash
     }

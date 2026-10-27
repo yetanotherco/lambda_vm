@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "pr1014-guest-measure"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+executor = { path = "../../../executor" }
+ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", default-features = false }
+ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", default-features = false }
+rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", rev = "797df5540c7d35cafd69b6971a74b2a49c67d1dd", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
