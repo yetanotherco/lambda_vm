@@ -363,22 +363,15 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
     // (the pinned format at blowup 4) nor the one the environment's format
     // would give; so the top of a tree proved at blowup 4 claims another
     // block, and the verifier refuses it.
-    // The median mix states 79 groups, past this head's 64-group cap (the
-    // box twins raise it), so both sides here take the cap at 1024; nothing
-    // else moves.
-    use crate::lfm::whir_block::{BLOCK_FAN_IN, WhirBlockPlan, verifier_plan, verifier_presets};
+    use crate::lfm::whir_block::{BLOCK_FAN_IN, WhirBlockPlan, verifier_plan};
     let elf: &[u8] = include_bytes!("../lfm/testdata/poc_rodata_commit.elf");
-    let pinned_format = BlockFormat {
-        max_groups: 1024,
-        ..BlockFormat::pinned()
-    };
-    let presets = verifier_presets(pinned_format);
+    let pinned_format = pinned.format;
     let statement = crate::lfm::whir_p1_census_tests::median_statement(
         elf,
-        &presets.base_options,
+        &pinned.base_options,
         &pinned_format,
     );
-    let verifier = verifier_plan(elf, statement.view(), &presets).expect("the verifier's plan");
+    let verifier = verifier_plan(elf, statement.view(), &pinned).expect("the verifier's plan");
     let prover_at = |format: &BlockFormat| {
         WhirBlockPlan::derive_with(
             elf,
@@ -405,11 +398,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
     );
     assert_ne!(
         verifier.id(),
-        prover_at(&BlockFormat {
-            max_groups: 1024,
-            ..production
-        })
-        .id(),
+        prover_at(&production).id(),
         "the environment's format claims another block"
     );
     assert_eq!(
