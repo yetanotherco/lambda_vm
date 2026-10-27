@@ -531,3 +531,47 @@ fn a_commitment_in_another_order_is_not_proved() {
         );
     }
 }
+
+/// `sample_u64_pow2`'s bits (low first, `depth` of them), reversed as the
+/// leaf's `walk_bits` does at round 0, recomposed low first.
+fn reversed_walk(q: usize, depth: usize) -> usize {
+    let bits: Vec<bool> = (0..depth).map(|t| (q >> t) & 1 == 1).collect();
+    bits.iter()
+        .rev()
+        .enumerate()
+        .fold(0usize, |acc, (t, &b)| acc | (usize::from(b) << t))
+}
+
+/// ★ The host's coset position is the leaf walk's: the query's bits reversed
+/// and recomposed low first, at every depth to 32 (the ends, the middle and
+/// pseudo-random samples). And no alias: a bijection of `[0, 2^d)` at every
+/// depth a round-0 tree of the block can have below 2^17 leaves, checked whole.
+#[test]
+fn the_coset_position_is_the_reversed_little_endian_walk() {
+    let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+    for depth in 1..=32usize {
+        let top = (1usize << depth) - 1;
+        let mut samples = vec![0usize, 1, top, top >> 1, 1 << (depth - 1)];
+        for _ in 0..64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            samples.push((x as usize) & top);
+        }
+        for q in samples {
+            assert_eq!(
+                LeafOrder::Coset.position(q, depth),
+                reversed_walk(q, depth),
+                "q {q} depth {depth}"
+            );
+        }
+    }
+    for depth in 0..=16usize {
+        let mut seen = vec![false; 1 << depth];
+        for q in 0..1usize << depth {
+            let p = LeafOrder::Coset.position(q, depth);
+            assert!(p < 1 << depth && !seen[p], "depth {depth}: {q} -> {p}");
+            seen[p] = true;
+        }
+    }
+}

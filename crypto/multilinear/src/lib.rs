@@ -50,6 +50,8 @@ pub mod whir_hash;
 #[cfg(test)]
 mod whir_p1_tests;
 pub mod whir_round;
+#[cfg(test)]
+mod whir_run_claim_tests;
 pub mod whir_split;
 pub mod zerocheck;
 

@@ -80,6 +80,8 @@ pub mod eq_tests;
 #[cfg(test)]
 pub mod gpack_tests;
 #[cfg(test)]
+pub mod grouped_run_claim_tests;
+#[cfg(test)]
 pub mod halt_pc_forgery_poc;
 #[cfg(test)]
 pub mod hash_pin_enumeration;
