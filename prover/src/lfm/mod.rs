@@ -264,7 +264,7 @@ mod whir_onechain_tests;
 #[cfg(test)]
 mod whir_open_tests;
 #[cfg(test)]
-mod whir_p1_census_tests;
+pub(crate) mod whir_p1_census_tests;
 #[cfg(test)]
 mod whir_p1_leaf_tests;
 #[cfg(test)]

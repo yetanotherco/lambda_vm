@@ -355,4 +355,66 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         (LeafScale::Fixed, LeafQuery::V1)
     );
     assert!(at.share_inverse);
+
+    // The concrete case: a blowup-4 proof is not taken for a production block
+    // proof. Over one statement (the median mix's), the plan the verifier
+    // derives is the pinned format's, and its block id, which a top must claim
+    // (`top_claims`), is neither the one a blowup-4 prover's plan publishes
+    // (the pinned format at blowup 4) nor the one the environment's format
+    // would give; so the top of a tree proved at blowup 4 claims another
+    // block, and the verifier refuses it.
+    // The median mix states 79 groups, past this head's 64-group cap (the
+    // box twins raise it), so both sides here take the cap at 1024; nothing
+    // else moves.
+    use crate::lfm::whir_block::{BLOCK_FAN_IN, WhirBlockPlan, verifier_plan, verifier_presets};
+    let elf: &[u8] = include_bytes!("../lfm/testdata/poc_rodata_commit.elf");
+    let pinned_format = BlockFormat {
+        max_groups: 1024,
+        ..BlockFormat::pinned()
+    };
+    let presets = verifier_presets(pinned_format);
+    let statement = crate::lfm::whir_p1_census_tests::median_statement(
+        elf,
+        &presets.base_options,
+        &pinned_format,
+    );
+    let verifier = verifier_plan(elf, statement.view(), &presets).expect("the verifier's plan");
+    let prover_at = |format: &BlockFormat| {
+        WhirBlockPlan::derive_with(
+            elf,
+            &crate::lfm::proof::block_base_options_under(&format.zf),
+            format,
+            statement.view(),
+            None,
+            BLOCK_FAN_IN,
+            None,
+        )
+        .expect("the prover's plan")
+    };
+    let blowup_4 = BlockFormat {
+        zf: ZfFormat {
+            whir_blowup: 4,
+            ..ZfFormat::DEFAULT
+        },
+        ..pinned_format
+    };
+    assert_ne!(
+        verifier.id(),
+        prover_at(&blowup_4).id(),
+        "a blowup-4 tree claims another block"
+    );
+    assert_ne!(
+        verifier.id(),
+        prover_at(&BlockFormat {
+            max_groups: 1024,
+            ..production
+        })
+        .id(),
+        "the environment's format claims another block"
+    );
+    assert_eq!(
+        verifier.id(),
+        prover_at(&pinned_format).id(),
+        "a production prover's plan claims the verifier's block"
+    );
 }

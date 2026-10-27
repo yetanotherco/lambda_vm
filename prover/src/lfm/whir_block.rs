@@ -1558,18 +1558,8 @@ pub(crate) fn verify_block_tree_as(
     top: &super::proof::LfmProof,
     presets: &VerifierPresets,
 ) -> Result<(), String> {
-    verify_block_tree_with(
-        elf_bytes,
-        &presets.base_options,
-        &presets.format,
-        statement,
-        None,
-        BLOCK_FAN_IN,
-        &presets.wrap_options,
-        top,
-        LEAF_P1_CAP,
-        presets.share_inverse,
-    )
+    let plan = verifier_plan(elf_bytes, statement, presets)?;
+    verify_top_of(&plan, &presets.wrap_options, top)
 }
 
 /// [`verify_block_tree`] under presets of the caller's: the fixture formats,
@@ -1630,6 +1620,7 @@ pub(crate) fn verify_block_tree_capped(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn verify_block_tree_with(
     elf_bytes: &[u8],
@@ -1654,6 +1645,37 @@ fn verify_block_tree_with(
         leaf_cap,
         share_inverse,
     )?;
+    verify_top_of(&plan, wrap_opts, top)
+}
+
+/// The plan the public verifiers derive for `statement` under `presets`: the
+/// one whose top program and block id a top proof is checked against
+/// ([`verify_block_tree_as`]).
+pub(crate) fn verifier_plan(
+    elf_bytes: &[u8],
+    statement: BlockStatement<'_>,
+    presets: &VerifierPresets,
+) -> Result<WhirBlockPlan, String> {
+    WhirBlockPlan::derive_full(
+        elf_bytes,
+        &presets.base_options,
+        &presets.format,
+        statement,
+        None,
+        BLOCK_FAN_IN,
+        None,
+        LEAF_P1_CAP,
+        presets.share_inverse,
+    )
+}
+
+/// `top` verified against `plan`'s derived top program under `wrap_opts`, and
+/// claiming `plan`'s block.
+fn verify_top_of(
+    plan: &WhirBlockPlan,
+    wrap_opts: &crate::ProofOptions,
+    top: &super::proof::LfmProof,
+) -> Result<(), String> {
     let artifacts = plan.derive_top(wrap_opts)?;
     if !super::proof::verify_against_artifacts_under::<crate::hash_pin::BlockFamily>(
         &artifacts,
@@ -1663,7 +1685,7 @@ fn verify_block_tree_with(
     ) {
         return Err("the top proof does not verify against the derived top program".to_string());
     }
-    if !top_claims(&plan, &top.public_words) {
+    if !top_claims(plan, &top.public_words) {
         return Err("the top proof does not claim this block".to_string());
     }
     Ok(())
