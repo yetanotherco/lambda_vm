@@ -18,7 +18,7 @@
   v(10pt, weak: true)
   it
 }
-#outline(depth: 3)
+#outline(depth: 3) <outline>
 
 // chapter pages
 #show heading.where(level: 1): it => align(center + horizon)[#underline(it, offset: 10pt, extent: 5pt)]

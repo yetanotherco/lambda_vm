@@ -126,6 +126,7 @@
 }
 
 #let common-formatting(body) = {
+  set page(header: [#link(<outline>, underline([Contents]))])
   set footnote(numbering: "[1]")
   show raw.where(block: true): it => block(it, inset: 1em, width: 100%, radius: 5pt)
   show math.equation.where(block: false): box // Don't line-break inline equations by default
