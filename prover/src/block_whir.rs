@@ -245,11 +245,12 @@ pub struct BlockFormat {
     /// ([`crate::lfm::whir_chain::LeafQuery`]): the recursion's alone, like
     /// [`Self::leaf_scale`].
     pub leaf_query: crate::lfm::whir_chain::LeafQuery,
-    /// How each group's tables argue: one argument per table
-    /// ([`ArgueFormat::PerTable`], production), or one per group — a lockstep
-    /// GKR per bin of its trees and one constraint sumcheck over its tables
-    /// ([`ArgueFormat::Batched`], D-BATCH's format on the block). The proof
-    /// carries the other format's messages in [`BlockWhirProof::argues`].
+    /// How each group's tables argue: one per group — a lockstep GKR per bin
+    /// of its trees and one constraint sumcheck over its tables
+    /// ([`ArgueFormat::Batched`], production: [`ArgueFormat::BATCHED`]) — or
+    /// one argument per table ([`ArgueFormat::PerTable`], a format to measure
+    /// against). Under the batched format the proof carries each group's argue
+    /// in [`BlockWhirProof::argues`].
     pub argue: ArgueFormat,
     /// How each group's stacked polynomials are opened: one chain per run of
     /// at most four ([`GroupFold::Indexed`], production), or
