@@ -82,10 +82,11 @@
 //! receives the word token and sends each lane as a `base_token`
 //! `(addr, v, 0, 0, 0)` from the same value columns (`chips::lanes`): every
 //! felt the fold lifts is a base cell and a lane of a hashed word. A word's
-//! lanes past the block's last value are hashed as given, so anything but the
-//! committer's zero fill is another leaf, which the root refuses. The
-//! obligation above holds unchanged: the felts folded are the unpacked lanes of
-//! the words hashed.
+//! lanes past the block's last value are hashed as given: a nonzero fill is
+//! bound by the leaf hash, though no committer's zero-filled leaf matches it,
+//! and the fold never reads it. No block chain has such lanes (round 0's block
+//! is 16, 32 or 64 values). The obligation above holds unchanged: the felts
+//! folded are the unpacked lanes of the words hashed.
 //!
 //! Its paths stay in the arena in the proof's child order until their walk,
 //! which hints each level's siblings in hint order — the executor picks the
