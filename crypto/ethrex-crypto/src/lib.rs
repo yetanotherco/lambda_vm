@@ -7,7 +7,8 @@
 //!
 //! Accelerated today:
 //! - `keccak256`: a sponge over the `keccak_permute` precompile (riscv64; on
-//!   host it falls back to software keccak for tests).
+//!   host it falls back to software keccak for tests), with a bounded cache of
+//!   repeated 20-, 32- and 64-byte inputs and the empty input (`keccak_cache`).
 //! - `secp256k1_ecrecover`: the ECDSA recovery's 2-term linear combination is
 //!   evaluated through the ECSM `ecsm_mul` precompile (riscv64), reconstructing
 //!   the full point from x-only queries; on host / degenerate inputs it falls
@@ -55,9 +56,10 @@ impl Crypto for LambdaVmEcsmCrypto {
     }
 
     fn keccak256(&self, input: &[u8]) -> [u8; 32] {
-        // riscv64 guest: sponge over the keccak_permute precompile.
+        // riscv64 guest: sponge over the keccak_permute precompile, behind a bounded
+        // cache of the short inputs the guest hashes repeatedly (`keccak_cache`).
         #[cfg(target_arch = "riscv64")]
-        return keccak256_via_lambdavm(input);
+        return KECCAK_CACHE.keccak256(input, keccak256_via_lambdavm);
         // host (tests / non-guest): software keccak — the precompile syscall
         // isn't available off-target.
         #[cfg(not(target_arch = "riscv64"))]
@@ -510,6 +512,12 @@ fn point_from_xy(x: &FieldElement, y: &FieldElement) -> Option<AffinePoint> {
 }
 
 // ── Keccak-256 over the keccak_permute precompile (riscv64 guest) ───────────
+
+#[cfg(any(target_arch = "riscv64", test))]
+mod keccak_cache;
+
+#[cfg(target_arch = "riscv64")]
+static KECCAK_CACHE: keccak_cache::GuestCache = keccak_cache::GuestCache::new();
 
 /// Keccak-256 sponge with an injected permutation function.
 ///

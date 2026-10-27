@@ -5,4 +5,6 @@ pub mod ecsm_tests;
 #[cfg(test)]
 pub mod hint_tests;
 #[cfg(test)]
+pub mod keccak_cache_tests;
+#[cfg(test)]
 pub mod keccak_tests;
