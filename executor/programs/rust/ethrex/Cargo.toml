@@ -59,7 +59,7 @@ rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 
 # Valid jump destinations as a bitmap, ethrex main's unchecked memory hot path,
 # cheaper byte swaps and ordered trie roots. Every ethrex crate of this guest is
-# built from yetanotherco/ethrex, branch lambda-vm/guest-opt: the pinned rev above
+# built from yetanotherco/ethrex, branch lambda-vm/guest-opt-b1: the pinned rev above
 # plus five commits. The first keeps
 # the JUMPDEST analysis as a bitmap, so a JUMP / JUMPI checks one bit instead of
 # binary-searching the offset list; the second takes the tracer's branch of the
