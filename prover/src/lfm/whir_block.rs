@@ -2003,6 +2003,25 @@ fn emit_leaf_over(
             .iter()
             .map(|&t| route_of(plan, refs[t], t, first_page))
             .collect::<Result<_, _>>()?;
+        // BITWISE's closed form ([`super::preprocessed::emit_bitwise_preprocessed`])
+        // takes its fixed height alone. The frame refuses any other height
+        // first (`block_whir::check_bitwise_height`); this keeps the leaf's
+        // refusal an error, not the emitter's assertion, if that ever moves.
+        if let Some(shape) = routes
+            .iter()
+            .zip(&shapes)
+            .find(|(route, shape)| {
+                matches!(route, Route::Bitwise)
+                    && shape.num_vars != crate::tables::bitwise::NUM_VARS
+            })
+            .map(|(_, shape)| shape)
+        {
+            return Err(format!(
+                "group {g}: BITWISE at 2^{} rows — its table is 2^{}",
+                shape.num_vars,
+                crate::tables::bitwise::NUM_VARS
+            ));
+        }
         let views: Vec<Vec<&[FE]>> = routes
             .iter()
             .map(|route| match route {

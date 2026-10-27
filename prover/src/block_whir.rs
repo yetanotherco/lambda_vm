@@ -2667,6 +2667,28 @@ pub(crate) fn check_table_heights(table_num_vars: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+/// BITWISE's position in a block's tables: the first fixed table
+/// ([`crate::VmAirs::air_refs`]'s order).
+pub(crate) const BITWISE_TABLE: usize = 0;
+
+/// BITWISE's stated height, held to its fixed 2^20 rows
+/// ([`NUM_VARS`](crate::tables::bitwise::NUM_VARS)), the only height its
+/// preprocessed columns have. Refused by name here rather
+/// than left to the preprocessed check's dimension mismatch further on: the
+/// WHIR query count is derived from the statement's tallest stack, and
+/// BITWISE's (21 columns of 2^20 rows, 25 variables) is what holds it at the
+/// production count for every block, so the pin is a rule of its own.
+pub(crate) fn check_bitwise_height(table_num_vars: &[u8]) -> Result<(), Error> {
+    match table_num_vars.get(BITWISE_TABLE) {
+        Some(&n) if usize::from(n) == crate::tables::bitwise::NUM_VARS => Ok(()),
+        stated => Err(Error::InvalidTableCounts(format!(
+            "BITWISE states {} — its table is 2^{} rows",
+            stated.map_or("no height".to_string(), |n| format!("2^{n} rows")),
+            crate::tables::bitwise::NUM_VARS
+        ))),
+    }
+}
+
 /// Every chunked table under its cap, against the statement's heights: COPY
 /// at most [`BLOCK_COPY_MAX_VARS`] variables, KECCAK
 /// [`BLOCK_KECCAK_MAX_VARS`], KECCAK_RND [`BLOCK_KECCAK_RND_MAX_VARS`], ECSM
@@ -7124,6 +7146,7 @@ pub(crate) fn block_frame(
         )));
     }
     check_table_heights(statement.table_num_vars)?;
+    check_bitwise_height(statement.table_num_vars)?;
     check_chunked_heights(statement.table_counts, statement.table_num_vars)?;
 
     let cpu_heights = block_cpu_heights(statement.table_counts, statement.table_num_vars)?;
