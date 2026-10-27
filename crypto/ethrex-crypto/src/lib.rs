@@ -533,33 +533,49 @@ fn keccak256_with_permute<F: FnMut(&mut [u64; 25])>(input: &[u8], mut permute: F
     const RATE: usize = 136;
 
     let mut state = [0u64; 25];
-    let mut blocks = input.chunks_exact(RATE);
-    for block in &mut blocks {
-        absorb_block(&mut state, block);
+    if cfg!(target_endian = "little") && input.len() < RATE {
+        // SAFETY: the local state is initialized, writable, and disjoint from
+        // input. Its 200-byte allocation exceeds this <136-byte copy. On LE
+        // hosts these bytes are exactly Keccak's little-endian lane encoding.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                input.as_ptr(),
+                state.as_mut_ptr().cast::<u8>(),
+                input.len(),
+            );
+        }
+        state[input.len() / 8] |= 1u64 << (8 * (input.len() % 8));
+        state[RATE / 8 - 1] |= 0x80u64 << 56;
+        permute(&mut state);
+    } else {
+        let mut blocks = input.chunks_exact(RATE);
+        for block in &mut blocks {
+            absorb_block(&mut state, block);
+            permute(&mut state);
+        }
+
+        // Final block with multi-rate padding, absorbed straight into the lanes: the
+        // remainder's whole lanes from the input, its last 0..=7 bytes and the 0x01 pad
+        // byte assembled into one lane, then the 0x80 pad bit on byte RATE - 1. The same
+        // XORs as padding a zeroed RATE-byte copy of the remainder, without the copy:
+        // this runs once per hash, and the guest hashes every trie node.
+        let mut lanes = blocks.remainder().chunks_exact(8);
+        let mut lane = 0;
+        for chunk in &mut lanes {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(chunk);
+            state[lane] ^= u64::from_le_bytes(buf);
+            lane += 1;
+        }
+        let tail = lanes.remainder();
+        let mut last = 0x01u64 << (8 * tail.len());
+        for (i, byte) in tail.iter().enumerate() {
+            last |= u64::from(*byte) << (8 * i);
+        }
+        state[lane] ^= last;
+        state[RATE / 8 - 1] ^= 0x80u64 << 56;
         permute(&mut state);
     }
-
-    // Final block with multi-rate padding, absorbed straight into the lanes: the
-    // remainder's whole lanes from the input, its last 0..=7 bytes and the 0x01 pad
-    // byte assembled into one lane, then the 0x80 pad bit on byte RATE - 1. The same
-    // XORs as padding a zeroed RATE-byte copy of the remainder, without the copy:
-    // this runs once per hash, and the guest hashes every trie node.
-    let mut lanes = blocks.remainder().chunks_exact(8);
-    let mut lane = 0;
-    for chunk in &mut lanes {
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(chunk);
-        state[lane] ^= u64::from_le_bytes(buf);
-        lane += 1;
-    }
-    let tail = lanes.remainder();
-    let mut last = 0x01u64 << (8 * tail.len());
-    for (i, byte) in tail.iter().enumerate() {
-        last |= u64::from(*byte) << (8 * i);
-    }
-    state[lane] ^= last;
-    state[RATE / 8 - 1] ^= 0x80u64 << 56;
-    permute(&mut state);
 
     // Squeeze the first 32 bytes (four lanes) as little-endian.
     let mut output = [0u8; 32];
