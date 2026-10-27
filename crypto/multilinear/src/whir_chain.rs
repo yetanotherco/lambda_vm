@@ -2497,6 +2497,13 @@ where
     H: WhirHash,
 {
     check_leaf_order::<H>(&config.format)?;
+    // The domain is the caller's: held to the configuration's rate here.
+    if domain.log_size() != num_vars + config.log_blowup {
+        return Err(Error::DomainRateMismatch {
+            expected: num_vars + config.log_blowup,
+            got: domain.log_size(),
+        });
+    }
     // The run's width, and with it the index, are the caller's derivation
     // (`stacked_eval::index_chains`) — never the proof's.
     let width = roots.len();
@@ -2869,6 +2876,48 @@ mod tests {
             &mut transcript(),
         )?;
         Ok(proof)
+    }
+
+    /// ★ The verifier holds the caller's domain to the configuration's rate:
+    /// the honest proof against a domain one size smaller or one larger is
+    /// refused by name, before any opening is read; against its own it
+    /// verifies.
+    #[test]
+    fn a_domain_off_the_configured_rate_is_refused() {
+        let cfg = config(2);
+        let num_vars = 6;
+        let f = pseudo_mle(num_vars, 29);
+        let z = point(num_vars);
+        let y = f.evaluate(&z).unwrap();
+        let (commitment, domain) = commit::<F, KeccakWhir>(&f, &cfg, true).unwrap();
+        let proof =
+            prove::<F, F, _, KeccakWhir>(&f, &z, &commitment, &domain, &cfg, &mut transcript())
+                .unwrap();
+        let rate = num_vars + cfg.log_blowup;
+        assert_eq!(domain.log_size(), rate);
+        let check = |domain: &Domain<F>| {
+            verify::<F, F, _, KeccakWhir>(
+                &proof,
+                &commitment.root(),
+                &z,
+                y,
+                domain,
+                &cfg,
+                &mut transcript(),
+            )
+        };
+        for log_size in [rate - 1, rate + 1] {
+            let other = Domain::<F>::new(log_size).unwrap();
+            assert_eq!(
+                check(&other),
+                Err(Error::DomainRateMismatch {
+                    expected: rate,
+                    got: log_size
+                }),
+                "a domain of 2^{log_size} points"
+            );
+        }
+        assert_eq!(check(&domain), Ok(()), "its own domain");
     }
 
     #[test]

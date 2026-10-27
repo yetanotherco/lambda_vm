@@ -128,6 +128,11 @@ pub enum Error {
     QueryOutOfRange { index: usize, bound: usize },
     #[error("expected {expected} query openings, got {got}")]
     QueryCountMismatch { expected: usize, got: usize },
+    /// A chain's domain is not its code's: `2^(num_vars + log_blowup)` points
+    /// at the configuration's rate. A smaller one would take more words for
+    /// codewords.
+    #[error("the domain has 2^{got} points, the code 2^{expected}")]
+    DomainRateMismatch { expected: usize, got: usize },
     #[error("query {query}: the Merkle opening does not match the commitment")]
     OpeningRejected { query: usize },
     /// A tree's Merkle cap, carried by its first opening, is the wrong length
