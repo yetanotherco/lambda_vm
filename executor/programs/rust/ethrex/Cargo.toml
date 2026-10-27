@@ -58,7 +58,7 @@ ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev 
 rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 
 # Every ethrex crate of this guest is built from yetanotherco/ethrex, branch
-# lambda-vm/guest-opt: the pinned rev above plus guest-speed commits, none of
+# lambda-vm/guest-opt-b2: the pinned rev above plus guest-speed commits, none of
 # which changes a result or ProgramInput, so the fixture writer and the native test
 # reference stay on the pin (each commit carries the tests that compare it with the
 # code it replaces). In order:
