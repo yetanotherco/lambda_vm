@@ -1511,7 +1511,7 @@ fn every_emitted_leaf_is_held_under_its_partitions_heights() {
 /// builds nodes of the fan-in. On the median mix (forced leaf counts, and the rule's
 /// own partition, which doubles it to five leaves and so keeps a node level).
 #[test]
-fn the_one_top_scale_doubles_and_puts_at_most_four_leaves_under_one_top() {
+fn the_one_top_scale_doubles_and_puts_at_most_three_leaves_under_one_top() {
     use super::whir_block::{ONE_TOP_MAX_LEAVES, leaf_scale_setting, scaled_leaf_partition};
     assert_eq!(
         leaf_scale_setting(Some("one-top")),
@@ -1519,7 +1519,7 @@ fn the_one_top_scale_doubles_and_puts_at_most_four_leaves_under_one_top() {
     );
     assert_eq!(
         LeafScale::DoubledOneTop.to_string(),
-        "doubled, one top over at most 4 leaves"
+        "doubled, one top over at most 3 leaves"
     );
     // One group, one single leaf: the default keeps it, the one-top scale
     // doubles it.
@@ -1570,6 +1570,10 @@ fn the_one_top_scale_doubles_and_puts_at_most_four_leaves_under_one_top() {
         );
     }
     assert_eq!(levels(threshold, Some(4)), vec![vec![3, 1], vec![2]]);
+    assert_eq!(
+        levels(LeafScale::DoubledOneTop, Some(4)),
+        vec![vec![3, 1], vec![2]]
+    );
     assert_eq!(
         levels(LeafScale::DoubledOneTop, Some(5)),
         vec![vec![3, 2], vec![2]]

@@ -185,14 +185,17 @@ pub enum LeafScale {
     /// when that takes at most [`ONE_TOP_MAX_LEAVES`] leaves, one top over all
     /// of them: no node level between the leaves and the top. Past that count
     /// the tree is [`Self::DoubleFrom`]'s, nodes of the plan's fan-in. A top
-    /// over four doubled leaves stays within 2^19 socket rows, the LFM proofs'
+    /// over three doubled leaves stays within 2^19 socket rows, the LFM proofs'
     /// bits bound, and is refused past it ([`ONE_TOP_SOCKET_ROWS`]). The
     /// default ([`Self::DEFAULT`], `one-top`).
     DoubledOneTop,
 }
 
-/// The most leaves [`LeafScale::DoubledOneTop`] puts under one top.
-pub const ONE_TOP_MAX_LEAVES: usize = 4;
+/// The most leaves [`LeafScale::DoubledOneTop`] puts under one top. With the
+/// recursion proofs' commitment-time answers, a top over four doubled leaves
+/// takes its LANES chip past 2^19 rows (99.2 % of 2^19 without them), a padded
+/// height of 2^20; a top over three sits near 76 % of 2^19.
+pub const ONE_TOP_MAX_LEAVES: usize = 3;
 
 /// The socket rows a node with more children than the plan's fan-in may take:
 /// the LFM proofs' bits bound (socket at most 2^19 rows). Past it the node is

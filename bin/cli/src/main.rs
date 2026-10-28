@@ -396,7 +396,7 @@ enum Commands {
         leaves: String,
 
         /// The recursion's leaf scale: `one-top` (production) doubles every
-        /// leaf and puts at most four under one top; a count `T` doubles the
+        /// leaf and puts at most three under one top; a count `T` doubles the
         /// leaves' chip heights when the single heights take `T` leaves or
         /// more; `off` keeps every leaf at the single heights. A format choice:
         /// `verify-block` must be given the same one; the proof file does not
