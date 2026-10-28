@@ -2,6 +2,7 @@ module
 
 public import LambdaVM.Field
 public import LambdaVM.Templates.IsBit
+public import LambdaVM.Templates.Add
 public import LambdaVM.Tables.Bitwise
 public import LambdaVM.Templates.IsByte
 public import LambdaVM.Buses.Alu

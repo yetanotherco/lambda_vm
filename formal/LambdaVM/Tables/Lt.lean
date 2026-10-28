@@ -3,6 +3,7 @@ module
 public import LambdaVM.Tables.Bitwise
 public import LambdaVM.Buses.Alu
 public import LambdaVM.Templates.IsBit
+public import LambdaVM.Templates.Add
 public import Mathlib.Tactic.LinearCombination
 
 @[expose] public section
@@ -18,8 +19,11 @@ The carries of `rhs + lhs_sub_rhs = lhs (mod 2⁶⁴)` are virtual: `carry = (�
 -/
 
 namespace LambdaVM.LT
-open Alu (toInt64 ltRaw ltBit dword)
+open Alu (toInt64 ltRaw ltBit)
 
+/-- One LT row, fields in the column order of `lt.rs` and named as in `spec/src/lt.toml`:
+`lhs`, `rhs` as `DWordHHW` limbs (`lhs0` a word, `lhs1`, `lhs2` halves), `lhs_sub_rhs` as
+`DWordHL` halves. -/
 structure Row (F : Type) where
   lhs0 : F
   lhs1 : F
@@ -29,16 +33,20 @@ structure Row (F : Type) where
   rhs2 : F
   signed : F
   lt : F
-  sub0 : F
-  sub1 : F
-  sub2 : F
-  sub3 : F
+  lhsSubRhs0 : F
+  lhsSubRhs1 : F
+  lhsSubRhs2 : F
+  lhsSubRhs3 : F
   lhsMsb : F
   rhsMsb : F
   invert : F
   res : F
   mu : F
 deriving ProvableStruct
+
+/-- The operands as 64-bit values. -/
+def Row.lhsVal (r : Row (F p)) : ℕ := r.lhs0.val + 2^32 * (r.lhs1.val + 65536 * r.lhs2.val)
+def Row.rhsVal (r : Row (F p)) : ℕ := r.rhs0.val + 2^32 * (r.rhs1.val + 65536 * r.rhs2.val)
 
 /-- The LT chip's arithmetic on naturals: the carries of the limb-wise identity
 `rhs + (lhs − rhs mod 2⁶⁴) = lhs + c₁·2⁶⁴` decide `lhs < rhs`, and the top halves decide the signs. -/
@@ -62,7 +70,7 @@ theorem core
   split_ifs <;> omega
 
 def main (r : Var Row (F p)) : Circuit (F p) Unit := do
-  -- μ : Bit. The spec types it so; the Rust chip does not constrain it (see README).
+  -- μ : Bit here; the spec and lt.rs range-check it as a byte (see README).
   isBit r.mu
   -- range: IS_HALF[lhs[1]], IS_HALF[rhs[1]], IS_BIT<signed>, IS_BIT<invert>
   Bitwise.IsHalf.pullIf r.mu r.lhs1
@@ -74,22 +82,21 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   Bitwise.Msb16.pullIf r.mu (r.rhs2, r.rhsMsb)
   let lhsHi := r.lhs1 + 65536 * r.lhs2
   let rhsHi := r.rhs1 + 65536 * r.rhs2
-  let subLo := r.sub0 + 65536 * r.sub1
-  let subHi := r.sub2 + 65536 * r.sub3
-  let c0 := (r.rhs0 + subLo - r.lhs0) * inv32
-  let c1 := (rhsHi + subHi + c0 - lhsHi) * inv32
-  -- lt = signed·(A(1−B) + A·C + (1−B)·C) + (1−signed)·C, with C = carry[1]
-  assertZero (r.lt - (r.signed * (r.lhsMsb * (1 - r.rhsMsb) + r.lhsMsb * c1 + (1 - r.rhsMsb) * c1)
-    + (1 - r.signed) * c1))
+  let subLo := r.lhsSubRhs0 + 65536 * r.lhsSubRhs1
+  let subHi := r.lhsSubRhs2 + 65536 * r.lhsSubRhs3
+  -- virtual: carry = the ADD carries of rhs + lhs_sub_rhs = lhs, unsigned_lt = carry[1]
+  let unsignedLt := Add.carry1 ⟨r.rhs0, rhsHi⟩ ⟨subLo, subHi⟩ ⟨r.lhs0, lhsHi⟩
+  -- lt = signed·(A(1−B) + A·C + (1−B)·C) + (1−signed)·C, with C = unsigned_lt
+  assertZero (r.lt - (r.signed * (r.lhsMsb * (1 - r.rhsMsb) + r.lhsMsb * unsignedLt
+    + (1 - r.rhsMsb) * unsignedLt) + (1 - r.signed) * unsignedLt))
   -- res = lt xor invert
   assertZero (r.res + 2 * r.lt * r.invert - r.lt - r.invert)
   -- sub: IS_BIT<carry[i]>, IS_HALF[lhs_sub_rhs[i]]
-  isBit c0
-  isBit c1
-  Bitwise.IsHalf.pullIf r.mu r.sub0
-  Bitwise.IsHalf.pullIf r.mu r.sub1
-  Bitwise.IsHalf.pullIf r.mu r.sub2
-  Bitwise.IsHalf.pullIf r.mu r.sub3
+  sub ⟨r.lhs0, lhsHi⟩ ⟨r.rhs0, rhsHi⟩ ⟨subLo, subHi⟩
+  Bitwise.IsHalf.pullIf r.mu r.lhsSubRhs0
+  Bitwise.IsHalf.pullIf r.mu r.lhsSubRhs1
+  Bitwise.IsHalf.pullIf r.mu r.lhsSubRhs2
+  Bitwise.IsHalf.pullIf r.mu r.lhsSubRhs3
   -- output: ALU[lhs, rhs, opsel(LT) + 32·signed + 64·invert] -> [res, 0]
   Alu.channel.pushIf r.mu
     ⟨r.lhs0, lhsHi, r.rhs0, rhsHi, 4 + 32 * r.signed + 64 * r.invert, r.res, 0⟩
@@ -144,25 +151,28 @@ def Honest (r : Row (F p)) : Prop :=
   IsBool r.mu ∧ IsBool r.signed ∧ IsBool r.invert ∧
   r.lhs0.val < 2^32 ∧ r.lhs1.val < 2^16 ∧ r.lhs2.val < 2^16 ∧
   r.rhs0.val < 2^32 ∧ r.rhs1.val < 2^16 ∧ r.rhs2.val < 2^16 ∧
-  r.sub0.val < 2^16 ∧ r.sub1.val < 2^16 ∧ r.sub2.val < 2^16 ∧ r.sub3.val < 2^16 ∧
+  r.lhsSubRhs0.val < 2^16 ∧ r.lhsSubRhs1.val < 2^16 ∧ r.lhsSubRhs2.val < 2^16 ∧ r.lhsSubRhs3.val < 2^16 ∧
   -- lhs_sub_rhs = lhs − rhs (mod 2⁶⁴)
-  (r.rhs0.val + 2^32 * (r.rhs1.val + 65536 * r.rhs2.val)
-      + (r.sub0.val + 65536 * r.sub1.val + 2^32 * (r.sub2.val + 65536 * r.sub3.val))) % 2^64
-    = r.lhs0.val + 2^32 * (r.lhs1.val + 65536 * r.lhs2.val) ∧
+  (r.rhsVal + (r.lhsSubRhs0.val + 65536 * r.lhsSubRhs1.val
+      + 2^32 * (r.lhsSubRhs2.val + 65536 * r.lhsSubRhs3.val))) % 2^64 = r.lhsVal ∧
   r.lhsMsb.val = r.lhs2.val / 32768 ∧ r.rhsMsb.val = r.rhs2.val / 32768 ∧
-  r.lt.val = ltRaw r.signed.val (r.lhs0.val + 2^32 * (r.lhs1.val + 65536 * r.lhs2.val))
-    (r.rhs0.val + 2^32 * (r.rhs1.val + 65536 * r.rhs2.val)) ∧
-  r.res.val = ltBit r.signed.val r.invert.val (r.lhs0.val + 2^32 * (r.lhs1.val + 65536 * r.lhs2.val))
-    (r.rhs0.val + 2^32 * (r.rhs1.val + 65536 * r.rhs2.val))
+  r.lt.val = ltRaw r.signed.val r.lhsVal r.rhsVal ∧
+  r.res.val = ltBit r.signed.val r.invert.val r.lhsVal r.rhsVal
+
+/-- What an active row establishes: with range-checked low words, `res` is the comparison bit. -/
+def RowSpec (r : Row (F p)) : Prop :=
+  r.mu = 1 → r.lhs0.val < 2^32 → r.rhs0.val < 2^32 →
+    r.res = ((ltBit r.signed.val r.invert.val r.lhsVal r.rhsVal : ℕ) : F p)
 
 def circuit : GeneralFormalCircuit (F p) Row unit where
   main
-  Spec _ _ _ := True
+  Spec r _ _ := RowSpec r
   channelsWithRequirements := [Alu.channel.toRaw]
   requirementsChannelsLawful input_var i₀ := by
-    obtain ⟨lhs0, lhs1, lhs2, rhs0, rhs1, rhs2, signed, lt, sub0, sub1, sub2, sub3,
+    obtain ⟨lhs0, lhs1, lhs2, rhs0, rhs1, rhs2, signed, lt, lhsSubRhs0, lhsSubRhs1, lhsSubRhs2, lhsSubRhs3,
       lhsMsb, rhsMsb, invert, res, mu⟩ := input_var
-    simp only [circuit_norm, main, isBit, Alu.channel, Bitwise.isHalfTable, Bitwise.msb16Table]
+    simp only [circuit_norm, main, isBit, sub, add, Add.carry0, Add.carry1, Alu.channel,
+      Bitwise.isHalfTable, Bitwise.msb16Table]
     constructor
     · intro channel h; tauto
     · intro env h
@@ -171,46 +181,18 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
         exact (requirement_vacuous' h.1 hne1 hne0).elim
 
   soundness := by
-    circuit_proof_start [main, isBit, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable, Bitwise.msb16Table]
+    circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, RowSpec, Row.lhsVal, Row.rhsVal,
+      dword, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable, Bitwise.msb16Table]
     obtain ⟨h_mu, h_l1, h_r1, h_s, h_i, h_lm, h_rm, h_lt, h_res, h_c0, h_c1, h_s0, h_s1, h_s2, h_s3⟩ :=
       h_holds
     -- μ ∈ {0, 1}; with μ = 0 every requirement is vacuous
     rcases mul_one_sub_eq_zero_iff.mp h_mu with h0 | h1
     · subst h0; simp
     subst h1
-    refine ⟨by simp, by simp, by simp, by simp, by simp, by simp, by simp, by simp, ?_⟩
-    intro _ _ hl0 hlhi hr0 hrhi
-    refine ⟨?_, ?_, ?_⟩
-    rotate_left
-    · -- the EQ clause does not apply: opsel(LT) + 32·s + 64·i ≠ opsel(EQ) + 64·i'
-      intro i hi hflags
-      exfalso
-      have hsb := mul_one_sub_eq_zero_iff.mp h_s
-      have hib := mul_one_sub_eq_zero_iff.mp h_i
-      have hs_2 := IsBool.val_lt_two hsb
-      have hi_2 := IsBool.val_lt_two hib
-      have h1 : ((4 + 32 * input_signed.val + 64 * input_invert.val : ℕ) : F p)
-          = ((Alu.opselEQ + 64 * i : ℕ) : F p) := by
-        rw [← hflags]; push_cast; simp only [ZMod.natCast_zmod_val]
-      have h2 := natCast_inj_of_lt (lt_p_of_lt_two_pow_40 (by omega))
-        (lt_p_of_lt_two_pow_40 (by simp only [Alu.opselEQ]; omega)) h1
-      simp only [Alu.opselEQ] at h2
-      omega
-    · -- nor the SHIFT clause: opsel(SHIFT) + w + 32·s + 64·d ≡ 5 or 6 (mod 32)
-      intro w s d hw hs hd hflags
-      exfalso
-      have hsb := mul_one_sub_eq_zero_iff.mp h_s
-      have hib := mul_one_sub_eq_zero_iff.mp h_i
-      have hs_2 := IsBool.val_lt_two hsb
-      have hi_2 := IsBool.val_lt_two hib
-      have h1 : ((4 + 32 * input_signed.val + 64 * input_invert.val : ℕ) : F p)
-          = ((Alu.opselSHIFT + w + 32 * s + 64 * d : ℕ) : F p) := by
-        rw [← hflags]; push_cast; simp only [ZMod.natCast_zmod_val]
-      have h2 := natCast_inj_of_lt (lt_p_of_lt_two_pow_40 (by omega))
-        (lt_p_of_lt_two_pow_40 (by simp only [Alu.opselSHIFT]; omega)) h1
-      simp only [Alu.opselSHIFT] at h2
-      omega
-    intro s i hs hi hflags
+    have hsb : IsBool input_signed := mul_one_sub_eq_zero_iff.mp h_s
+    have hib : IsBool input_invert := mul_one_sub_eq_zero_iff.mp h_i
+    have hs_2 := IsBool.val_lt_two hsb
+    have hi_2 := IsBool.val_lt_two hib
     -- the pulled guarantees are now unconditional
     have hl1 := h_l1 rfl
     have hr1 := h_r1 rfl
@@ -220,100 +202,112 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     have hs1 := h_s1 rfl
     have hs2 := h_s2 rfl
     have hs3 := h_s3 rfl
-    -- the virtual carries
-    set c0 := (input_rhs0 + (input_sub0 + 65536 * input_sub1) - input_lhs0) * inv32 with hc0
-    set c1 := (input_rhs1 + 65536 * input_rhs2 + (input_sub2 + 65536 * input_sub3) + c0
-      - (input_lhs1 + 65536 * input_lhs2)) * inv32 with hc1
-    have hc0b : IsBool c0 := mul_one_sub_eq_zero_iff.mp h_c0
-    have hc1b : IsBool c1 := mul_one_sub_eq_zero_iff.mp h_c1
-    have hsb : IsBool input_signed := mul_one_sub_eq_zero_iff.mp h_s
-    have hib : IsBool input_invert := mul_one_sub_eq_zero_iff.mp h_i
-    have hc0_2 := IsBool.val_lt_two hc0b
-    have hc1_2 := IsBool.val_lt_two hc1b
-    have hs_2 := IsBool.val_lt_two hsb
-    have hi_2 := IsBool.val_lt_two hib
     -- values of the composite limbs
     have hval_lhsHi : (input_lhs1 + 65536 * input_lhs2).val = input_lhs1.val + 65536 * input_lhs2.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
     have hval_rhsHi : (input_rhs1 + 65536 * input_rhs2).val = input_rhs1.val + 65536 * input_rhs2.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-    have hval_lo : (input_rhs0 + (input_sub0 + 65536 * input_sub1)).val
-        = input_rhs0.val + (input_sub0.val + 65536 * input_sub1.val) :=
+    -- the comparison bit, from the pulled guarantees and the SUB carries
+    have key : ∀ s i : ℕ, input_signed.val = s → input_invert.val = i →
+        input_lhs0.val < 2^32 → input_rhs0.val < 2^32 →
+        input_res = ((ltBit s i (input_lhs0.val + 2^32 * (input_lhs1.val + 65536 * input_lhs2.val))
+          (input_rhs0.val + 2^32 * (input_rhs1.val + 65536 * input_rhs2.val)) : ℕ) : F p) := by
+      intro s i hsv hiv hl0 hr0
+      -- the virtual carries
+      set c0 := (input_rhs0 + (input_lhsSubRhs0 + 65536 * input_lhsSubRhs1) - input_lhs0) * inv32
+        with hc0
+      set c1 := (input_rhs1 + 65536 * input_rhs2 + (input_lhsSubRhs2 + 65536 * input_lhsSubRhs3) + c0
+        - (input_lhs1 + 65536 * input_lhs2)) * inv32 with hc1
+      have hc0b : IsBool c0 := mul_one_sub_eq_zero_iff.mp h_c0
+      have hc1b : IsBool c1 := mul_one_sub_eq_zero_iff.mp h_c1
+      have hc0_2 := IsBool.val_lt_two hc0b
+      have hc1_2 := IsBool.val_lt_two hc1b
+      have hval_lo : (input_rhs0 + (input_lhsSubRhs0 + 65536 * input_lhsSubRhs1)).val
+          = input_rhs0.val + (input_lhsSubRhs0.val + 65536 * input_lhsSubRhs1.val) :=
+        val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+      have hval_hi : (input_rhs1 + 65536 * input_rhs2 + (input_lhsSubRhs2 + 65536 * input_lhsSubRhs3)
+          + c0).val
+          = input_rhs1.val + 65536 * input_rhs2.val + (input_lhsSubRhs2.val + 65536 * input_lhsSubRhs3.val)
+            + c0.val :=
+        val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+      -- the carry identities, on naturals
+      have e0 := carry_lift (by omega) (by omega) hc0b hc0
+      rw [hval_lo] at e0
+      have e1 := carry_lift (by omega) (by omega) hc1b hc1
+      rw [hval_hi, hval_lhsHi] at e1
+      obtain ⟨hC, hA, hB, hA2, hB2, hS⟩ :=
+        core hl0 hl1 hl2 hr0 hr1 hr2 hs0 hs1 hs2 hs3 hc0_2 hc1_2 hlm hrm e0 e1
+      -- lt and res as field identities in the boolean values
+      have hlt' : input_lt = input_signed * (input_lhsMsb * (1 - input_rhsMsb) + input_lhsMsb * c1
+          + (1 - input_rhsMsb) * c1) + (1 - input_signed) * c1 := by
+        rw [← sub_eq_zero]; exact h_lt
+      have hres' : input_res = input_lt + input_invert - 2 * input_lt * input_invert := by
+        linear_combination h_res
+      rw [← ZMod.natCast_zmod_val input_signed, ← ZMod.natCast_zmod_val input_lhsMsb,
+        ← ZMod.natCast_zmod_val input_rhsMsb, ← ZMod.natCast_zmod_val c1, hsv] at hlt'
+      rw [← ZMod.natCast_zmod_val input_invert, hiv] at hres'
+      rcases (by omega : s = 0 ∨ s = 1) with rfl | rfl <;>
+      rcases (by omega : i = 0 ∨ i = 1) with rfl | rfl <;>
+      rcases (by omega : input_lhsMsb.val = 0 ∨ input_lhsMsb.val = 1) with hAv | hAv <;>
+      rcases (by omega : input_rhsMsb.val = 0 ∨ input_rhsMsb.val = 1) with hBv | hBv <;>
+      rcases (by omega : c1.val = 0 ∨ c1.val = 1) with hcv | hcv <;>
+      simp only [hAv, hBv, hcv, Nat.cast_zero, Nat.cast_one] at hlt' hA hB hC hS <;>
+      norm_num at hlt' hA hB hC hS <;>
+      first
+      | (exfalso; omega)
+      | (subst hlt'; norm_num at hres'; simp [ltBit, ltRaw, hS, hC, hres'])
+    refine ⟨fun _ hl0 hr0 => key _ _ rfl rfl hl0 hr0, by simp, by simp, by simp, by simp, by simp,
+      by simp, by simp, by simp, ?_⟩
+    intro _ _ hl0 hlhi hr0 hrhi
+    -- the flag byte, read as a natural
+    have hflagsV : (4 + 32 * input_signed + 64 * input_invert : F p).val
+        = 4 + 32 * input_signed.val + 64 * input_invert.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-    have hval_hi : (input_rhs1 + 65536 * input_rhs2 + (input_sub2 + 65536 * input_sub3) + c0).val
-        = input_rhs1.val + 65536 * input_rhs2.val + (input_sub2.val + 65536 * input_sub3.val) + c0.val :=
-      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-    -- the carry identities, on naturals
-    have e0 := carry_lift (by omega) (by omega) hc0b hc0
-    rw [hval_lo] at e0
-    have e1 := carry_lift (by omega) (by omega) hc1b hc1
-    rw [hval_hi, hval_lhsHi] at e1
-    obtain ⟨hC, hA, hB, hA2, hB2, hS⟩ :=
-      core hl0 hl1 hl2 hr0 hr1 hr2 hs0 hs1 hs2 hs3 hc0_2 hc1_2 hlm hrm e0 e1
-    -- decode the flags
-    have hsi : input_signed.val = s ∧ input_invert.val = i := by
-      have h1 : ((4 + 32 * input_signed.val + 64 * input_invert.val : ℕ) : F p)
-          = ((Alu.opselLT + 32 * s + 64 * i : ℕ) : F p) := by
-        rw [← hflags]; push_cast; simp only [ZMod.natCast_zmod_val]
-      have h2 := natCast_inj_of_lt (lt_p_of_lt_two_pow_40 (by omega))
-        (lt_p_of_lt_two_pow_40 (by simp only [Alu.opselLT]; omega)) h1
-      simp only [Alu.opselLT] at h2
-      omega
-    -- lt and res as field identities in the boolean values
-    have hlt' : input_lt = input_signed * (input_lhsMsb * (1 - input_rhsMsb) + input_lhsMsb * c1
-        + (1 - input_rhsMsb) * c1) + (1 - input_signed) * c1 := by
-      rw [← sub_eq_zero]; exact h_lt
-    have hres' : input_res = input_lt + input_invert - 2 * input_lt * input_invert := by
-      linear_combination h_res
-    rw [← ZMod.natCast_zmod_val input_signed, ← ZMod.natCast_zmod_val input_lhsMsb,
-      ← ZMod.natCast_zmod_val input_rhsMsb, ← ZMod.natCast_zmod_val c1, hsi.1] at hlt'
-    rw [← ZMod.natCast_zmod_val input_invert, hsi.2] at hres'
-    simp only [dword, hval_lhsHi, hval_rhsHi]
-    rcases (by omega : s = 0 ∨ s = 1) with rfl | rfl <;>
-    rcases (by omega : i = 0 ∨ i = 1) with rfl | rfl <;>
-    rcases (by omega : input_lhsMsb.val = 0 ∨ input_lhsMsb.val = 1) with hAv | hAv <;>
-    rcases (by omega : input_rhsMsb.val = 0 ∨ input_rhsMsb.val = 1) with hBv | hBv <;>
-    rcases (by omega : c1.val = 0 ∨ c1.val = 1) with hcv | hcv <;>
-    simp only [hAv, hBv, hcv, Nat.cast_zero, Nat.cast_one] at hlt' hA hB hC hS <;>
-    norm_num at hlt' hA hB hC hS <;>
-    first
-    | (exfalso; omega)
-    | (subst hlt'; norm_num at hres'; simp [ltBit, ltRaw, hS, hC, hres'])
+    refine ⟨?_, ?_, ?_⟩
+    · intro s i hs hi hflags
+      rw [hflagsV] at hflags; simp only [Alu.opselLT] at hflags
+      rw [key s i (by omega) (by omega) hl0 hr0, hval_lhsHi, hval_rhsHi]
+    · -- the EQ clause does not apply: opsel(LT) + 32·s + 64·i ≠ opsel(EQ) + 64·i'
+      intro i hi hflags
+      exfalso; rw [hflagsV] at hflags; simp only [Alu.opselEQ] at hflags; omega
+    · -- nor the SHIFT clause: opsel(SHIFT) + w + 32·s + 64·d ≡ 5 or 6 (mod 32)
+      intro w s d hw hs hd hflags
+      exfalso; rw [hflagsV] at hflags; simp only [Alu.opselSHIFT] at hflags; omega
 
 
   ProverAssumptions r _ _ := Honest r
 
   completeness := by
-    circuit_proof_start [main, isBit, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable, Bitwise.msb16Table,
-      Honest]
+    circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, Alu.channel, Alu.Guarantees,
+      Bitwise.isHalfTable, Bitwise.msb16Table, Honest, Row.lhsVal, Row.rhsVal]
     obtain ⟨hmu, hsb, hib, hl0, hl1, hl2, hr0, hr1, hr2, hs0, hs1, hs2, hs3, hsum, hlm, hrm, hlt, hres⟩ :=
       h_assumptions
     set L := input_lhs0.val + 2^32 * (input_lhs1.val + 65536 * input_lhs2.val) with hL
     set R := input_rhs0.val + 2^32 * (input_rhs1.val + 65536 * input_rhs2.val) with hR
     -- the honest carries
     obtain ⟨k0, hk0, e0⟩ : ∃ k0, k0 < 2 ∧
-        input_rhs0.val + (input_sub0.val + 65536 * input_sub1.val) = input_lhs0.val + k0 * 2^32 :=
-      ⟨(input_rhs0.val + (input_sub0.val + 65536 * input_sub1.val)) / 2^32, by omega, by omega⟩
+        input_rhs0.val + (input_lhsSubRhs0.val + 65536 * input_lhsSubRhs1.val) = input_lhs0.val + k0 * 2^32 :=
+      ⟨(input_rhs0.val + (input_lhsSubRhs0.val + 65536 * input_lhsSubRhs1.val)) / 2^32, by omega, by omega⟩
     obtain ⟨k1, hk1, e1⟩ : ∃ k1, k1 < 2 ∧
-        input_rhs1.val + 65536 * input_rhs2.val + (input_sub2.val + 65536 * input_sub3.val) + k0
+        input_rhs1.val + 65536 * input_rhs2.val + (input_lhsSubRhs2.val + 65536 * input_lhsSubRhs3.val) + k0
           = input_lhs1.val + 65536 * input_lhs2.val + k1 * 2^32 :=
-      ⟨(input_rhs1.val + 65536 * input_rhs2.val + (input_sub2.val + 65536 * input_sub3.val) + k0) / 2^32,
+      ⟨(input_rhs1.val + 65536 * input_rhs2.val + (input_lhsSubRhs2.val + 65536 * input_lhsSubRhs3.val) + k0) / 2^32,
         by omega, by omega⟩
-    set c0 := (input_rhs0 + (input_sub0 + 65536 * input_sub1) - input_lhs0) * inv32 with hc0
-    set c1 := (input_rhs1 + 65536 * input_rhs2 + (input_sub2 + 65536 * input_sub3) + c0
+    set c0 := (input_rhs0 + (input_lhsSubRhs0 + 65536 * input_lhsSubRhs1) - input_lhs0) * inv32 with hc0
+    set c1 := (input_rhs1 + 65536 * input_rhs2 + (input_lhsSubRhs2 + 65536 * input_lhsSubRhs3) + c0
       - (input_lhs1 + 65536 * input_lhs2)) * inv32 with hc1
     have hc0k : c0 = (k0 : F p) := by
       have h := congrArg (fun n : ℕ => (n : F p)) e0
       push_cast at h
       simp only [ZMod.natCast_zmod_val] at h
-      have h' : input_rhs0 + (input_sub0 + 65536 * input_sub1) - input_lhs0 = (k0 : F p) * 2^32 := by
+      have h' : input_rhs0 + (input_lhsSubRhs0 + 65536 * input_lhsSubRhs1) - input_lhs0 = (k0 : F p) * 2^32 := by
         linear_combination h
       rw [hc0, h', mul_assoc, two_pow_mul_inv32, mul_one]
     have hc1k : c1 = (k1 : F p) := by
       have h := congrArg (fun n : ℕ => (n : F p)) e1
       push_cast at h
       simp only [ZMod.natCast_zmod_val] at h
-      have h' : input_rhs1 + 65536 * input_rhs2 + (input_sub2 + 65536 * input_sub3) + c0
+      have h' : input_rhs1 + 65536 * input_rhs2 + (input_lhsSubRhs2 + 65536 * input_lhsSubRhs3) + c0
           - (input_lhs1 + 65536 * input_lhs2) = (k1 : F p) * 2^32 := by
         rw [hc0k]; linear_combination h
       rw [hc1, h', mul_assoc, two_pow_mul_inv32, mul_one]

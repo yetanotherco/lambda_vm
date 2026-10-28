@@ -19,9 +19,12 @@ when shifting right), `zbs = [bit_shift = 0]`, the HWSL outputs `X[i], Y[i]`, th
 -/
 
 namespace LambdaVM.SHIFT
-open Alu (dword shiftResult)
+open Alu (shiftResult)
 open ShiftCore (sll sllc limbs)
 
+/-- One SHIFT row, fields in the column order of `shift.rs` and named as in `spec/src/shift.toml`:
+`in` as four halves, `shiftAmount`, `shiftB1`, `shiftH1`, `shiftHigh` the bytes, half and high
+word of the shift operand, `ls` the stored one-hot `limb_shift`. -/
 structure Row (F : Type) where
   in0 : F
   in1 : F
@@ -495,41 +498,21 @@ theorem soundness :
       | skip
     -- what remains is the ALU push
     intro _ _ hin1lo hin1hi hin2lo hin2hi
-    have hflags_ne : ∀ (w s d : ℕ), w < 2 → s < 2 → d < 2 →
-        5 + input_wordInstr + 32 * input_signed + 64 * input_direction
-          = ((Alu.opselSHIFT + w + 32 * s + 64 * d : ℕ) : F p) →
-        input_wordInstr.val = w ∧ input_signed.val = s ∧ input_direction.val = d := by
-      intro w s d hw hs hd hflags
-      have h1 : ((5 + input_wordInstr.val + 32 * input_signed.val + 64 * input_direction.val : ℕ) : F p)
-          = ((Alu.opselSHIFT + w + 32 * s + 64 * d : ℕ) : F p) := by
-        rw [← hflags]; push_cast; simp only [ZMod.natCast_zmod_val]
-      have h2 := natCast_inj_of_lt (lt_p_of_lt_two_pow_40 (by omega))
-        (lt_p_of_lt_two_pow_40 (by simp only [Alu.opselSHIFT]; omega)) h1
-      simp only [Alu.opselSHIFT] at h2
-      omega
+    -- the flag byte, read as a natural
+    have hflagsV : (5 + input_wordInstr + 32 * input_signed + 64 * input_direction : F p).val
+        = 5 + input_wordInstr.val + 32 * input_signed.val + 64 * input_direction.val :=
+      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
     refine ⟨?_, ?_, ?_⟩
     · -- not LT: 5 + w + 32 s + 64 d ≠ 4 + 32 s' + 64 i (mod 32)
       intro s i hs hi hflags
-      exfalso
-      have h1 : ((5 + input_wordInstr.val + 32 * input_signed.val + 64 * input_direction.val : ℕ) : F p)
-          = ((Alu.opselLT + 32 * s + 64 * i : ℕ) : F p) := by
-        rw [← hflags]; push_cast; simp only [ZMod.natCast_zmod_val]
-      have h2 := natCast_inj_of_lt (lt_p_of_lt_two_pow_40 (by omega))
-        (lt_p_of_lt_two_pow_40 (by simp only [Alu.opselLT]; omega)) h1
-      simp only [Alu.opselLT] at h2
-      omega
+      exfalso; rw [hflagsV] at hflags; simp only [Alu.opselLT] at hflags; omega
     · -- not EQ
       intro i hi hflags
-      exfalso
-      have h1 : ((5 + input_wordInstr.val + 32 * input_signed.val + 64 * input_direction.val : ℕ) : F p)
-          = ((Alu.opselEQ + 64 * i : ℕ) : F p) := by
-        rw [← hflags]; push_cast; simp only [ZMod.natCast_zmod_val]
-      have h2 := natCast_inj_of_lt (lt_p_of_lt_two_pow_40 (by omega))
-        (lt_p_of_lt_two_pow_40 (by simp only [Alu.opselEQ]; omega)) h1
-      simp only [Alu.opselEQ] at h2
-      omega
+      exfalso; rw [hflagsV] at hflags; simp only [Alu.opselEQ] at hflags; omega
     · intro w s d hw hs hd hflags
-      obtain ⟨rfl, rfl, rfl⟩ := hflags_ne w s d hw hs hd hflags
+      rw [hflagsV] at hflags; simp only [Alu.opselSHIFT] at hflags
+      obtain ⟨rfl, rfl, rfl⟩ : input_wordInstr.val = w ∧ input_signed.val = s ∧
+        input_direction.val = d := by omega
       have hv1 : (input_in0 + 65536 * input_in1).val = input_in0.val + 65536 * input_in1.val :=
         val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
       have hv2 : (input_in2 + 65536 * input_in3).val = input_in2.val + 65536 * input_in3.val :=

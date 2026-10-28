@@ -39,6 +39,9 @@ lemma natCast_inj_of_lt {a b : ℕ} (ha : a < p) (hb : b < p) (h : (a : F p) = (
 lemma val_eq_of_eq_natCast {x : F p} {n : ℕ} (h : x = (n : F p)) (hn : n < 2^40) : x.val = n := by
   rw [h]; exact val_natCast_of_lt_two_pow_40 hn
 
+/-- 64-bit value of a `(lo32, hi32)` pair. -/
+def dword (lo hi : F p) : ℕ := lo.val + 2^32 * hi.val
+
 lemma mul_one_sub_eq_zero_iff {x : F p} : x * (1 - x) = 0 ↔ IsBool x := by
   rw [mul_eq_zero, sub_eq_zero, IsBool, eq_comm (a := (1 : F p))]
 

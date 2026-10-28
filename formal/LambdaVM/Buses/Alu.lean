@@ -57,25 +57,23 @@ def shiftResult (word signed direction x s : ℕ) : ℕ :=
   else if signed = 0 then x >>> k
   else sra64 x k
 
-/-- 64-bit value of a `(lo32, hi32)` pair. -/
-def dword (lo hi : F p) : ℕ := lo.val + 2^32 * hi.val
-
 /-- What a puller learns. The caller must have range-checked both words of both operands
-(the chips' `IS_WORD` assumptions). One clause per `opsel`. -/
+(the chips' `IS_WORD` assumptions). One clause per `opsel`, selected by the flag byte read
+as a natural. -/
 def Guarantees (m : Msg (F p)) : Prop :=
   m.in1Lo.val < 2^32 → m.in1Hi.val < 2^32 → m.in2Lo.val < 2^32 → m.in2Hi.val < 2^32 →
     -- LT (spec/lt.typ): flags = opsel(LT) + 32·signed + 64·invert, out = [res, 0]
-    (∀ s i : ℕ, s < 2 → i < 2 → m.flags = ((opselLT + 32 * s + 64 * i : ℕ) : F p) →
+    (∀ s i : ℕ, s < 2 → i < 2 → m.flags.val = opselLT + 32 * s + 64 * i →
       m.outHi = 0 ∧
       m.outLo = ((ltBit s i (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi) : ℕ) : F p)) ∧
     -- EQ (spec/eq.typ): flags = opsel(EQ) + 64·invert, out = [res, 0]
-    (∀ i : ℕ, i < 2 → m.flags = ((opselEQ + 64 * i : ℕ) : F p) →
+    (∀ i : ℕ, i < 2 → m.flags.val = opselEQ + 64 * i →
       m.outHi = 0 ∧
       m.outLo = ((eqBit i (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi) : ℕ) : F p)) ∧
     -- SHIFT (spec/shift.typ): flags = opsel(SHIFT) + word_instr + 32·signed + 64·direction,
     -- only the low byte of the shift amount matters
     (∀ w s d : ℕ, w < 2 → s < 2 → d < 2 →
-      m.flags = ((opselSHIFT + w + 32 * s + 64 * d : ℕ) : F p) →
+      m.flags.val = opselSHIFT + w + 32 * s + 64 * d →
       m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
       dword m.outLo m.outHi = shiftResult w s d (dword m.in1Lo m.in1Hi) (m.in2Lo.val % 256))
 

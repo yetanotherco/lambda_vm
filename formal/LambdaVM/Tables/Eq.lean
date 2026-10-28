@@ -3,6 +3,7 @@ module
 public import LambdaVM.Tables.Bitwise
 public import LambdaVM.Buses.Alu
 public import LambdaVM.Templates.IsBit
+public import LambdaVM.Templates.Add
 public import Mathlib.Tactic.LinearCombination
 
 @[expose] public section
@@ -19,8 +20,10 @@ zero iff `a = b`.
 -/
 
 namespace LambdaVM.EQ
-open Alu (eqBit dword)
+open Alu (eqBit)
 
+/-- One EQ row, fields in the column order of `eq.rs` and named as in `spec/src/eq.toml`:
+`a`, `b` as `DWordWL` words, `diff = a − b` as `DWordHL` halves. -/
 structure Row (F : Type) where
   a0 : F
   a1 : F
@@ -58,13 +61,10 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   Bitwise.IsHalf.pullIf r.mu r.diff2
   Bitwise.IsHalf.pullIf r.mu r.diff3
   isBit r.invert
-  -- SUB<diff; a, b> = ADD<a; b, diff>: the carries of b + diff = a are bits
+  -- SUB<diff; a, b>: the carries of b + diff = a are bits
   let diffLo := r.diff0 + 65536 * r.diff1
   let diffHi := r.diff2 + 65536 * r.diff3
-  let c0 := (r.b0 + diffLo - r.a0) * inv32
-  let c1 := (r.b1 + diffHi + c0 - r.a1) * inv32
-  isBit c0
-  isBit c1
+  sub ⟨r.a0, r.a1⟩ ⟨r.b0, r.b1⟩ ⟨diffLo, diffHi⟩
   -- ZERO[Σ diff[i]] -> eq
   Bitwise.Zero.pullIf r.mu (r.diff0 + r.diff1 + r.diff2 + r.diff3, r.eq)
   -- res = eq xor invert
@@ -80,16 +80,16 @@ def Honest (r : Row (F p)) : Prop :=
   r.a0.val < 2^32 ∧ r.a1.val < 2^32 ∧ r.b0.val < 2^32 ∧ r.b1.val < 2^32 ∧
   r.diff0.val < 2^16 ∧ r.diff1.val < 2^16 ∧ r.diff2.val < 2^16 ∧ r.diff3.val < 2^16 ∧
   -- diff = a − b (mod 2⁶⁴)
-  (r.b0.val + 2^32 * r.b1.val
+  (dword r.b0 r.b1
       + (r.diff0.val + 65536 * r.diff1.val + 2^32 * (r.diff2.val + 65536 * r.diff3.val))) % 2^64
-    = r.a0.val + 2^32 * r.a1.val ∧
-  r.eq.val = (if r.a0.val + 2^32 * r.a1.val = r.b0.val + 2^32 * r.b1.val then 1 else 0) ∧
-  r.res.val = eqBit r.invert.val (r.a0.val + 2^32 * r.a1.val) (r.b0.val + 2^32 * r.b1.val)
+    = dword r.a0 r.a1 ∧
+  r.eq.val = (if dword r.a0 r.a1 = dword r.b0 r.b1 then 1 else 0) ∧
+  r.res.val = eqBit r.invert.val (dword r.a0 r.a1) (dword r.b0 r.b1)
 
 /-- What an active row establishes: with range-checked operands, `res` is the equality bit. -/
 def RowSpec (r : Row (F p)) : Prop :=
   r.mu = 1 → r.a0.val < 2^32 → r.a1.val < 2^32 → r.b0.val < 2^32 → r.b1.val < 2^32 →
-    r.res = ((eqBit r.invert.val (r.a0.val + 2^32 * r.a1.val) (r.b0.val + 2^32 * r.b1.val) : ℕ) : F p)
+    r.res = ((eqBit r.invert.val (dword r.a0 r.a1) (dword r.b0 r.b1) : ℕ) : F p)
 
 def circuit : GeneralFormalCircuit (F p) Row unit where
   main
@@ -97,7 +97,8 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   channelsWithRequirements := [Alu.channel.toRaw]
   requirementsChannelsLawful input_var i₀ := by
     obtain ⟨a0, a1, b0, b1, invert, res, diff0, diff1, diff2, diff3, eq, mu⟩ := input_var
-    simp only [circuit_norm, main, isBit, Alu.channel, Bitwise.isHalfTable, Bitwise.zeroTable]
+    simp only [circuit_norm, main, isBit, sub, add, Add.carry0, Add.carry1, Alu.channel,
+      Bitwise.isHalfTable, Bitwise.zeroTable]
     constructor
     · intro channel h; tauto
     · intro env h
@@ -106,8 +107,8 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
         exact (requirement_vacuous' h.2.2.2.2 hne1 hne0).elim
 
   soundness := by
-    circuit_proof_start [main, isBit, RowSpec, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable,
-      Bitwise.zeroTable]
+    circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, RowSpec, dword, Alu.channel,
+      Alu.Guarantees, Bitwise.isHalfTable, Bitwise.zeroTable]
     obtain ⟨h_d0, h_d1, h_d2, h_d3, h_i, h_c0, h_c1, h_z, h_res, h_mu⟩ := h_holds
     rcases mul_one_sub_eq_zero_iff.mp h_mu with h0 | h1
     · subst h0; simp
@@ -160,44 +161,26 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       split_ifs <;> (try norm_num) <;> omega
     refine ⟨fun _ => key, by simp, by simp, by simp, by simp, by simp, ?_⟩
     intro _ _ ha0 ha1 hb0 hb1
+    -- the flag byte, read as a natural
+    have hflagsV : (3 + 64 * input_invert : F p).val = 3 + 64 * input_invert.val :=
+      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
     refine ⟨?_, ?_, ?_⟩
     · -- the LT clause does not apply: opsel(EQ) + 64·i ≠ opsel(LT) + 32·s + 64·i'
       intro s i hs hi hflags
-      exfalso
-      have h1 : ((3 + 64 * input_invert.val : ℕ) : F p)
-          = ((Alu.opselLT + 32 * s + 64 * i : ℕ) : F p) := by
-        rw [← hflags]; push_cast; simp only [ZMod.natCast_zmod_val]
-      have h2 := natCast_inj_of_lt (lt_p_of_lt_two_pow_40 (by omega))
-        (lt_p_of_lt_two_pow_40 (by simp only [Alu.opselLT]; omega)) h1
-      simp only [Alu.opselLT] at h2
-      omega
+      exfalso; rw [hflagsV] at hflags; simp only [Alu.opselLT] at hflags; omega
     swap
     · -- nor the SHIFT clause
       intro w s d hw hs hd hflags
-      exfalso
-      have h1 : ((3 + 64 * input_invert.val : ℕ) : F p)
-          = ((Alu.opselSHIFT + w + 32 * s + 64 * d : ℕ) : F p) := by
-        rw [← hflags]; push_cast; simp only [ZMod.natCast_zmod_val]
-      have h2 := natCast_inj_of_lt (lt_p_of_lt_two_pow_40 (by omega))
-        (lt_p_of_lt_two_pow_40 (by simp only [Alu.opselSHIFT]; omega)) h1
-      simp only [Alu.opselSHIFT] at h2
-      omega
+      exfalso; rw [hflagsV] at hflags; simp only [Alu.opselSHIFT] at hflags; omega
     intro i hi hflags
-    have hiv : input_invert.val = i := by
-      have h1 : ((3 + 64 * input_invert.val : ℕ) : F p) = ((Alu.opselEQ + 64 * i : ℕ) : F p) := by
-        rw [← hflags]; push_cast; simp only [ZMod.natCast_zmod_val]
-      have h2 := natCast_inj_of_lt (lt_p_of_lt_two_pow_40 (by omega))
-        (lt_p_of_lt_two_pow_40 (by simp only [Alu.opselEQ]; omega)) h1
-      simp only [Alu.opselEQ] at h2
-      omega
-    rw [key ha0 ha1 hb0 hb1, hiv]
-    simp only [dword]
+    rw [hflagsV] at hflags; simp only [Alu.opselEQ] at hflags
+    rw [key ha0 ha1 hb0 hb1, show input_invert.val = i by omega]
 
   ProverAssumptions r _ _ := Honest r
 
   completeness := by
-    circuit_proof_start [main, isBit, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable, Bitwise.zeroTable,
-      Honest]
+    circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, Alu.channel, Alu.Guarantees,
+      Bitwise.isHalfTable, Bitwise.zeroTable, Honest, dword]
     obtain ⟨hmu, hib, ha0, ha1, hb0, hb1, hd0, hd1, hd2, hd3, hsum, heq, hres⟩ := h_assumptions
     obtain ⟨k0, hk0, e0⟩ : ∃ k0, k0 < 2 ∧
         input_b0.val + (input_diff0.val + 65536 * input_diff1.val) = input_a0.val + k0 * 2^32 :=
@@ -229,8 +212,8 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
         input_a0.val + 2^32 * input_a1.val = input_b0.val + 2^32 * input_b1.val := by
       rw [← ZMod.val_eq_zero, hval_sum]; exact hcore
     have heq_cast : input_eq = ((if input_a0.val + 2^32 * input_a1.val
-        = input_b0.val + 2^32 * input_b1.val then 1 else 0 : ℕ) : F p) := by
-      rw [← heq, ZMod.natCast_zmod_val]
+        = input_b0.val + 2^32 * input_b1.val then 1 else 0 : ℕ) : F p) :=
+      (ZMod.natCast_zmod_val input_eq).symm.trans (congrArg (Nat.cast : ℕ → F p) heq)
     have hres_cast : input_res = ((eqBit input_invert.val (input_a0.val + 2^32 * input_a1.val)
         (input_b0.val + 2^32 * input_b1.val) : ℕ) : F p) := by
       rw [← hres, ZMod.natCast_zmod_val]

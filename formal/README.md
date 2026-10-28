@@ -11,22 +11,27 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
 
 - `LambdaVM/Field.lean` — Goldilocks as the base field (`F p`), with the size
   facts Clean's gadgets ask for. Primality comes from CompPoly's Pratt certificate.
+- `LambdaVM/Templates/` — the constraint templates of the spec as helpers the
+  chips call (`isBit`, `isByte`, `areBytes`, `add`, `sub`), each with a
+  `FormalAssertion` whose `Spec` is the template's meaning taken from its
+  `spec/*.typ` page: `IsBit.circuit`, `IsByteCheck.circuit`, `Add.circuit`.
 - `LambdaVM/Buses/` — the buses that are not static tables. `Alu.lean` is the
   unified ALU bus: message layout as in `BusId::Alu`, the caller's `IS_WORD`
   assumptions on both operands as hypotheses, and one `Guarantees` clause per
-  `opsel` (LT and EQ so far). A chip pushing with one `opsel` discharges the
-  other clauses by showing its flags cannot decode as them.
+  `opsel` (LT, EQ and SHIFT). The flag byte is read as a natural, so a chip
+  pushing with one `opsel` discharges the other clauses by `omega`.
 - `LambdaVM/Tables/` — one file per chip. `Bitwise.lean` transcribes the
   precomputed row function of `prover/src/tables/bitwise.rs` and defines each bus
   the table serves as a `StaticLookupChannel`, with the semantic `Guarantees`
   proven equivalent to table membership. `Lt.lean` is the LT chip: the row
   circuit mirrors `lt.rs` (constraints and interactions, in order), `core` is the
   arithmetic argument of `spec/lt.typ` on naturals, `Honest` is the row
-  `generate_lt_trace` produces, and the `GeneralFormalCircuit` proves that a row
-  that pulls its range checks pushes a correct ALU result (soundness) and that an
+  `generate_lt_trace` produces, `RowSpec` is what an active row establishes, and
+  the `GeneralFormalCircuit` proves that a row that pulls its range checks
+  satisfies `RowSpec` and pushes a correct ALU result (soundness) and that an
   honest row satisfies everything (completeness). `Eq.lean` is the EQ chip in the
-  same shape: SUB carries, four IS_HALF pulls, a ZERO pull on the sum of the
-  halves, `res = eq xor invert`; its `μ` is a bit, as in PR #1016.
+  same shape: the `sub` template, four IS_HALF pulls, a ZERO pull on the sum of
+  the halves, `res = eq xor invert`; its `μ` is a bit, as in the spec and `eq.rs`.
 
 - `LambdaVM/Ensembles/` — tables wired together through their channels.
   `EqLookup.lean` is the first one: `pushStatic` is the provider side of any
@@ -80,8 +85,8 @@ the interactions (bus id, signed multiplicity, message elements), and checks
 that every Lean constraint vanishes on honest traces from `generate_*_trace`,
 padding rows included.
 
-The models follow PR #1016 (`fix/multiplicity-soundness`), so the test is meant
-to run on that branch (a git worktree of it works). Result there, 2026-10-20:
+The models follow the multiplicity constraints of PR #1016, merged 2026-10-23.
+Result on that branch, 2026-10-20:
 
 - EQ: 5 constraints and 6 interactions, exact match.
 - SHIFT: 22 constraints and 17 interactions, exact match.
@@ -126,17 +131,14 @@ Until then LT keeps `μ ∈ {0, 1}` (see below).
 
 ## Known differences from the Rust prover
 
-- `LT` constrains `μ·(1 − μ) = 0`. The spec types `μ` as `Bit`; `lt.rs` has no
-  constraint on it and uses it as a deduplication count. Clean only grants a
-  channel guarantee to a pull with multiplicity exactly 1, which is the
-  faithful reading: a sender multiplicity outside `{0, 1}` is not protected by
-  the LogUp balance (two rows with `μ = 1` and `μ = −1` cancel each other's
-  lookups). The same pattern exists in MUL, DVRM, SHIFT, EQ and BYTEWISE.
-- `LambdaVM/Templates/` — the constraint templates of the spec (`IS_BIT`,
-  `IS_BYTE`, `ARE_BYTES`, ...), with `Spec` taken from the corresponding
-  `spec/*.typ` page, not from the constraints. `isBit` is the helper every chip
-  calls on its flags; `isByte` and `areBytes` are the interaction templates as
-  helpers. Each comes with an assertion that pins down its meaning.
+- `LT` constrains `μ·(1 − μ) = 0`. The spec types `μ` as `Byte` with
+  `IS_BYTE[μ]` and `lt.rs` sends `ARE_BYTES[μ, 0]`, because LT deduplicates
+  rows and `μ` is a count. Clean only grants a channel guarantee to a pull with
+  multiplicity exactly 1, so until the counted pulls above land upstream the
+  model keeps `μ` a bit. Every chip whose `μ` the spec types as `Byte` (MUL,
+  DVRM, BRANCH, BYTEWISE) will need the same treatment.
+- The `spec/` copy in this repository lags the `spec/main` branch; the spec the
+  models follow is the branch (EQ's `μ` is `Bit` with `IS_BIT[μ]` there).
 
 ## Building
 
