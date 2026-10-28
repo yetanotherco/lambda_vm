@@ -186,8 +186,8 @@ pub enum LeafScale {
     /// of them: no node level between the leaves and the top. Past that count
     /// the tree is [`Self::DoubleFrom`]'s, nodes of the plan's fan-in. A top
     /// over four doubled leaves stays within 2^19 socket rows, the LFM proofs'
-    /// bits bound, and is refused past it ([`ONE_TOP_SOCKET_ROWS`]). Opt-in
-    /// (`one-top`).
+    /// bits bound, and is refused past it ([`ONE_TOP_SOCKET_ROWS`]). The
+    /// default ([`Self::DEFAULT`], `one-top`).
     DoubledOneTop,
 }
 
@@ -199,17 +199,21 @@ pub const ONE_TOP_MAX_LEAVES: usize = 4;
 /// refused, not proved.
 pub const ONE_TOP_SOCKET_ROWS: usize = 1 << 19;
 
-/// The threshold of [`LeafScale::DEFAULT`]: the fewest leaves at the single
-/// heights from which a block's leaves double.
+/// The doubling threshold the default ran at before [`LeafScale::DoubledOneTop`]
+/// (the fewest leaves at the single heights from which a block's leaves
+/// double): `LAMBDA_VM_WHIR_LEAF_DOUBLE_FROM=10` or `--leaf-double-from 10`
+/// rolls back to it.
 pub const LEAF_DOUBLE_FROM_DEFAULT: usize = 10;
 
 impl LeafScale {
-    /// ★ The default: doubled from [`LEAF_DOUBLE_FROM_DEFAULT`] leaves.
-    /// Measured on one RTX 5090, two runs an arm: a large block's recursion
-    /// −2.81 s at blowup 2 (18 leaves → 9, three node levels → two) and
-    /// −2.52 s at blowup 4 (11 → 5); a median block (9 / 5 leaves) stays under
-    /// the threshold, so its proof is [`Self::Fixed`]'s byte for byte.
-    pub const DEFAULT: Self = Self::DoubleFrom(LEAF_DOUBLE_FROM_DEFAULT);
+    /// ★ The default: every leaf doubled, and one top over at most
+    /// [`ONE_TOP_MAX_LEAVES`] of them ([`Self::DoubledOneTop`]). Measured on one
+    /// RTX 5090 against [`Self::DoubleFrom`]`(`[`LEAF_DOUBLE_FROM_DEFAULT`]`)`,
+    /// three runs an arm: the median block's recursion −0.78 s and whole block
+    /// −0.71 s (6 single leaves → 3 doubled under one top, its level of nodes
+    /// gone); the large block, already doubled to more than four leaves, keeps
+    /// its partition, tree and proof byte for byte.
+    pub const DEFAULT: Self = Self::DoubledOneTop;
 }
 
 impl std::fmt::Display for LeafScale {

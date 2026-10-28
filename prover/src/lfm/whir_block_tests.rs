@@ -1046,7 +1046,7 @@ fn the_derive_knobs_read_their_values_and_refuse_nonsense() {
 #[test]
 fn the_leaf_scale_knob_reads_off_or_a_count() {
     use super::whir_block::{LeafScale, leaf_scale_from_env, leaf_scale_setting};
-    assert_eq!(LeafScale::DEFAULT, LeafScale::DoubleFrom(10));
+    assert_eq!(LeafScale::DEFAULT, LeafScale::DoubledOneTop);
     for unset in [None, Some(""), Some(" ")] {
         assert_eq!(
             leaf_scale_setting(unset),

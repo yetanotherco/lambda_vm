@@ -1110,9 +1110,9 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
         ),
         (
             LeafQuery::Lean,
-            9,
-            "dc29bc9e2d9a347755b667f0401bbe60cac8c85b6e2d416862d3c214320e5209",
-            "add21d355cabb7205361400d36daea652c616aaee115ea373f5974016cbfb927",
+            5,
+            "e32ea8856b351fd7633b55fa4b8d4f8d9078f6be6ef33eb8f1ec7e6d659d1f6b",
+            "00dab05204f1b9279977b36e2e29954be3b330e921fad607c73c20bff6278d90",
         ),
     ];
     let elf_bytes: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
@@ -1503,11 +1503,12 @@ fn every_emitted_leaf_is_held_under_its_partitions_heights() {
 }
 
 /// ★ The one-top scale ([`LeafScale::DoubledOneTop`]): its knob reads
-/// `one-top`; its partition is the doubled one at any leaf count, where
-/// [`LeafScale::DEFAULT`] keeps the single one below its threshold; and its
+/// `one-top` and is the default; its partition is the doubled one at any leaf
+/// count, where the threshold scale keeps the single one below its threshold;
+/// and its
 /// tree puts at most [`super::whir_block::ONE_TOP_MAX_LEAVES`] leaves under
-/// one top, past that the plan's fan-in, where the default's always builds
-/// nodes of the fan-in. On the median mix (forced leaf counts, and the rule's
+/// one top, past that the plan's fan-in, where the threshold scale always
+/// builds nodes of the fan-in. On the median mix (forced leaf counts, and the rule's
 /// own partition, which doubles it to five leaves and so keeps a node level).
 #[test]
 fn the_one_top_scale_doubles_and_puts_at_most_four_leaves_under_one_top() {
@@ -1532,7 +1533,9 @@ fn the_one_top_scale_doubles_and_puts_at_most_four_leaves_under_one_top() {
             .expect("a partition")
             .1
     };
-    assert!(!bound(LeafScale::DEFAULT).doubled);
+    let threshold = LeafScale::DoubleFrom(super::whir_block::LEAF_DOUBLE_FROM_DEFAULT);
+    assert_eq!(LeafScale::DEFAULT, LeafScale::DoubledOneTop);
+    assert!(!bound(threshold).doubled);
     assert!(bound(LeafScale::DoubledOneTop).doubled);
     assert_eq!(bound(LeafScale::DoubledOneTop).heights, P1_LEAF_HEIGHTS_2X);
 
@@ -1542,7 +1545,7 @@ fn the_one_top_scale_doubles_and_puts_at_most_four_leaves_under_one_top() {
         leaf_scale: scale,
         ..p1_format()
     };
-    let owned = median_statement(elf_bytes, &opts, &at(LeafScale::DEFAULT));
+    let owned = median_statement(elf_bytes, &opts, &at(threshold));
     let levels = |scale: LeafScale, leaves: Option<usize>| -> Vec<Vec<usize>> {
         WhirBlockPlan::derive_with(
             elf_bytes,
@@ -1566,10 +1569,7 @@ fn the_one_top_scale_doubles_and_puts_at_most_four_leaves_under_one_top() {
             "{leaves} leaves under one top"
         );
     }
-    assert_eq!(
-        levels(LeafScale::DEFAULT, Some(4)),
-        vec![vec![3, 1], vec![2]]
-    );
+    assert_eq!(levels(threshold, Some(4)), vec![vec![3, 1], vec![2]]);
     assert_eq!(
         levels(LeafScale::DoubledOneTop, Some(5)),
         vec![vec![3, 2], vec![2]]

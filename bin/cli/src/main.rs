@@ -395,12 +395,13 @@ enum Commands {
         #[arg(long, value_parser = ["natural", "coset"], default_value = "coset")]
         leaves: String,
 
-        /// The recursion's leaf scale: a count `T` (production 10) doubles the
+        /// The recursion's leaf scale: `one-top` (production) doubles every
+        /// leaf and puts at most four under one top; a count `T` doubles the
         /// leaves' chip heights when the single heights take `T` leaves or
         /// more; `off` keeps every leaf at the single heights. A format choice:
         /// `verify-block` must be given the same one; the proof file does not
         /// carry it.
-        #[arg(long, value_parser = leaf_double_from_word, default_value = "10")]
+        #[arg(long, value_parser = leaf_double_from_word, default_value = "one-top")]
         leaf_double_from: String,
 
         /// How the recursion's leaves check each chain's queries: `lean`
@@ -445,7 +446,7 @@ enum Commands {
         /// The leaf scale the block was proved with (`prove-block
         /// --leaf-double-from`): the verifier's constant, never read from the
         /// proof.
-        #[arg(long, value_parser = leaf_double_from_word, default_value = "10")]
+        #[arg(long, value_parser = leaf_double_from_word, default_value = "one-top")]
         leaf_double_from: String,
 
         /// The leaves' query check the block was proved with (`prove-block
@@ -2207,7 +2208,7 @@ mod tests {
                 ) => Some(leaf_double_from),
                 _ => None,
             };
-            assert_eq!(scale(cmd).as_deref(), Some("10"), "the default");
+            assert_eq!(scale(cmd).as_deref(), Some("one-top"), "the default");
             for (word, want) in [
                 ("off", LeafScale::Fixed),
                 ("12", LeafScale::DoubleFrom(12)),
@@ -2231,7 +2232,7 @@ mod tests {
             }
         }
         assert_eq!(
-            prover::lfm::whir_block::leaf_scale_setting(Some("10")),
+            prover::lfm::whir_block::leaf_scale_setting(Some("one-top")),
             Ok(LeafScale::DEFAULT),
             "the flag's default is production's"
         );

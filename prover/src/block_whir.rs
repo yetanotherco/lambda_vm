@@ -350,7 +350,8 @@ impl BlockFormat {
     /// [`GroupFold::PerPoly`] stay formats to measure against. The leaves'
     /// scale is the environment's (`LAMBDA_VM_WHIR_LEAF_DOUBLE_FROM`; unset,
     /// [`LeafScale::DEFAULT`](crate::lfm::whir_block::LeafScale::DEFAULT),
-    /// doubled from 10 leaves; `off`, every leaf at the single heights). The
+    /// every leaf doubled and one top over at most four of them; a count `T`,
+    /// doubled from `T` leaves; `off`, every leaf at the single heights). The
     /// leaves' query check is the environment's too
     /// (`LAMBDA_VM_WHIR_LEAF_QUERY`; unset,
     /// [`LeafQuery::Lean`](crate::lfm::whir_chain::LeafQuery::Lean); `v1`, the
