@@ -702,7 +702,9 @@ mod scan {
                     "pub fn artifacts_of(",
                     "fn derived_of(",
                     "pub fn verify_block_tree(",
-                    "fn verify_block_tree_with(",
+                    "pub(crate) fn verify_block_tree_as(",
+                    "pub(crate) fn verifier_plan(",
+                    "fn verify_top_of(",
                 ],
                 forbidden: &[],
                 sites: &[
@@ -813,6 +815,15 @@ fn the_block_path_scan_refuses_planted_regressions() {
         "#[cfg(test)]\npub fn verify_whir_block_tree_proof(",
     )
     .expect_err("a gated entry point");
+    assert!(e.contains("does not reach"), "{e}");
+    // A test gate that would hide the check of the top against the derived
+    // top program.
+    let e = planted(
+        "lfm/whir_block.rs",
+        "fn verify_top_of(",
+        "#[cfg(test)]\nfn verify_top_of(",
+    )
+    .expect_err("a gated top check");
     assert!(e.contains("does not reach"), "{e}");
     // A binary shape where the harvest takes its family's.
     let e = planted(
