@@ -28,7 +28,7 @@ fn sample_counts() -> TableCounts {
         ecsm: 1,
         ecdas: 1,
         hint: 1,
-        commit: 1,
+        is_wh: 1,
     }
 }
 
@@ -97,7 +97,7 @@ fn each_count_mut(counts: &mut TableCounts) -> Vec<(&'static str, &mut usize)> {
         ecsm,
         ecdas,
         hint,
-        commit,
+        is_wh,
     } = counts;
     vec![
         ("cpu", cpu),
@@ -119,7 +119,7 @@ fn each_count_mut(counts: &mut TableCounts) -> Vec<(&'static str, &mut usize)> {
         ("ecsm", ecsm),
         ("ecdas", ecdas),
         ("hint", hint),
-        ("commit", commit),
+        ("is_wh", is_wh),
     ]
 }
 

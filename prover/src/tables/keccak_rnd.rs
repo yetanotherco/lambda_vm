@@ -238,6 +238,22 @@ fn hwsl(halfword: u16, shift: u8) -> (u16, u16) {
     }
 }
 
+/// `ARE_BYTES` sends per KECCAK_RND row: 20 `Cxz_left` pairs and 200
+/// `(rot_left, rot_right)` pairs. The spec gives these byte checks no `cond`
+/// (default 1, spec #1017 256e3970b), so they fire on padding rows too, where
+/// every cell is 0: each padding row sends `ARE_BYTES[0, 0]` this many times.
+pub const ARE_BYTES_PER_ROW: usize = 20 + 200;
+
+/// `ARE_BYTES[0, 0]` lookups sent by the padding rows of the KECCAK_RND table
+/// built for `num_ops` keccak calls (none when the table is absent).
+pub fn padding_are_bytes(num_ops: usize) -> u64 {
+    if num_ops == 0 {
+        return 0;
+    }
+    let rows = num_ops * 24;
+    ((rows.next_power_of_two().max(4) - rows) * ARE_BYTES_PER_ROW) as u64
+}
+
 #[allow(clippy::needless_range_loop)]
 /// Generate the KECCAK_RND trace table.
 ///
@@ -604,11 +620,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // byte pairs (z=2i, z=2i+1) into ARE_BYTES interactions per the
     // implementation guidance in spec/is_byte.typ.
     // Cxz_right uses IS_BIT polynomial constraints (see `KeccakRndConstraints`).
+    // Multiplicity 1 (the spec's default `cond`, see `ARE_BYTES_PER_ROW`).
     for x in 0..5 {
         for i in 0..4 {
             interactions.push(BusInteraction::sender(
                 BusId::AreBytes,
-                Multiplicity::Column(cols::MU),
+                Multiplicity::One,
                 vec![
                     BusValue::Packed {
                         start_column: cols::cxz_left(x, 2 * i),
@@ -692,12 +709,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // --- Rho: ARE_BYTES range checks on rot_left + rot_right (200 pairs) ---
     // Spec emits 400 IS_BYTE templates (200 per side); we merge each
     // (rot_left[x][y][b], rot_right[x][y][b]) into one ARE_BYTES interaction.
+    // Multiplicity 1 (the spec's default `cond`, see `ARE_BYTES_PER_ROW`).
     for x in 0..5 {
         for y in 0..5 {
             for b in 0..8 {
                 interactions.push(BusInteraction::sender(
                     BusId::AreBytes,
-                    Multiplicity::Column(cols::MU),
+                    Multiplicity::One,
                     vec![
                         BusValue::Packed {
                             start_column: cols::rot_left(x, y, b),
@@ -834,12 +852,13 @@ fn halfword<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b.main(0, lo_col) + b.main(0, hi_col) * b.const_base(256)
 }
 
-/// The KECCAK round table's 140 transition constraints as a single
+/// The KECCAK round table's 141 transition constraints as a single
 /// [`ConstraintSet`]:
 ///
-/// * **20 IS_BIT** on the θ carry bits: for `x ∈ 0..5`, `hw ∈ 0..4`, the μ-gated
-///   `μ · Cxz_right·(1 − Cxz_right)` (degree 3). Load-bearing: it pins the θ
-///   carry to a single bit so the θ shift identity below is unique.
+/// * **20 IS_BIT** on the θ carry bits: for `x ∈ 0..5`, `hw ∈ 0..4`,
+///   `Cxz_right·(1 − Cxz_right)` (degree 2), unconditional as in the spec.
+///   Load-bearing: it pins the θ carry to a single bit so the θ shift identity
+///   below is unique.
 /// * **20 θ shift identities** (rnc = 1): for `x ∈ 0..5`, `hw ∈ 0..4`,
 ///   `μ · (in·2 − right·2¹⁶ − left)` where `in` is the `Cxz[x][3]` halfword,
 ///   `left` the `Cxz_left` byte pair and `right` the single `Cxz_right` carry
@@ -849,6 +868,7 @@ fn halfword<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
 ///   `in` is the `theta[x][y]` halfword, `left`/`right` the `rot_left`/
 ///   `rot_right` byte pairs (degree 2; the general form covers rnc = 0, which
 ///   pins right = 0, left = in).
+/// * **1 MuIsBit**: `μ · (1 − μ)` (degree 2).
 ///
 /// These identities replace the former θ/ρ HWSL bus lookups. Uniqueness of the
 /// (left, right) decomposition rests on the ARE_BYTES range checks bounding both
@@ -858,10 +878,10 @@ fn halfword<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
 pub struct KeccakRndConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakRndConstraints {
-    // The IS_BIT constraints are gated by μ (cond·x·(1−x)), so degree 3; the
-    // shift identities are μ × linear, degree 2.
+    // The IS_BIT constraints are x·(1−x) and the shift identities μ × linear,
+    // all degree 2.
     fn max_degree(&self) -> usize {
-        3
+        2
     }
 
     #[allow(clippy::needless_range_loop)]
@@ -874,7 +894,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakRndConstraint
         // (1) IS_BIT on the θ carry bits (Cxz_right).
         for x in 0..5 {
             for hw in 0..4 {
-                emit_is_bit(b, idx, cols::cxz_right_bit(x, hw), Some(cols::MU));
+                emit_is_bit(b, idx, cols::cxz_right_bit(x, hw), None);
                 idx += 1;
             }
         }
@@ -918,5 +938,14 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakRndConstraint
                 }
             }
         }
+
+        // MuIsBit — μ·(1−μ). The shift identities and every bus send except the
+        // ARE_BYTES byte checks (multiplicity 1) are weighted by μ, so μ = 2, 7
+        // or −1 would scale those sends, and μ = −1 would turn them into
+        // receives. KECCAK_RND does not deduplicate (one row per round, μ ∈
+        // {0,1}), so the bit constraint is honest.
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        b.emit_base(idx, mu.clone() * (one - mu));
     }
 }

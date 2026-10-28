@@ -1,6 +1,6 @@
 //! Drift-detection and lookup-dispatch tests for the static preprocessed-table
-//! commitments shipped in `bitwise`, `keccak_rc`, and `page` (the shared
-//! zero-init page commitment).
+//! commitments shipped in `bitwise`, `keccak_rc`, `page` (the shared
+//! zero-init page commitment) and `cpu` (the per-height TIMESTAMP column).
 //!
 //! - The drift tests recompute the commitment for every blowup in
 //!   `STATIC_BLOWUP_FACTORS` (the list shared with the generator binary) and
@@ -22,7 +22,7 @@
 
 use stark::proof::options::GoldilocksCubicProofOptions;
 
-use crate::tables::{STATIC_BLOWUP_FACTORS, bitwise, keccak_rc, page};
+use crate::tables::{STATIC_BLOWUP_FACTORS, bitwise, cpu, keccak_rc, max_rows, page};
 
 fn options_for(blowup: u8) -> stark::proof::options::ProofOptions {
     GoldilocksCubicProofOptions::with_blowup(blowup).expect("blowup must be a valid power of 2")
@@ -293,6 +293,64 @@ fn bitwise_non_three_coset_recomputes_and_differs_from_static() {
             from_wrapper_7, from_wrapper_3,
             "bitwise commitment at coset {NON_STANDARD_COSET} must differ from coset \
              {STANDARD_COSET} static value (blowup={blowup})",
+        );
+    }
+}
+
+#[test]
+fn cpu_timestamp_static_matches_recompute_for_all_heights_and_blowups() {
+    for &blowup in STATIC_BLOWUP_FACTORS {
+        let options = options_for(blowup);
+        for log_height in cpu::MIN_LOG_HEIGHT..=max_rows::CPU.trailing_zeros() {
+            let height = 1 << log_height;
+            assert_eq!(
+                cpu::static_timestamp_commitment(blowup, log_height),
+                Some(cpu::compute_timestamp_commitment(&options, height)),
+                "CPU timestamp commitment drifted for blowup={blowup}, height=2^{log_height}; \
+                 see `static_timestamp_commitment` before regenerating",
+            );
+            assert_eq!(
+                cpu::timestamp_commitment(&options, height),
+                cpu::compute_timestamp_commitment(&options, height),
+            );
+        }
+    }
+}
+
+#[test]
+fn cpu_timestamp_has_no_static_value_outside_the_cpu_height_range() {
+    for &blowup in STATIC_BLOWUP_FACTORS {
+        assert_eq!(cpu::static_timestamp_commitment(blowup, 0), None);
+        assert_eq!(cpu::static_timestamp_commitment(blowup, 1), None);
+        assert_eq!(
+            cpu::static_timestamp_commitment(blowup, max_rows::CPU.trailing_zeros() + 1),
+            None
+        );
+    }
+    assert_eq!(cpu::static_timestamp_commitment(NON_STATIC_BLOWUP, 4), None);
+}
+
+#[test]
+fn cpu_timestamp_non_static_blowup_recomputes_via_fallback() {
+    let options = options_for(NON_STATIC_BLOWUP);
+    assert_eq!(
+        cpu::timestamp_commitment(&options, 1 << 6),
+        cpu::compute_timestamp_commitment(&options, 1 << 6),
+    );
+}
+
+#[test]
+fn cpu_timestamp_non_three_coset_recomputes_and_differs_from_static() {
+    for &blowup in STATIC_BLOWUP_FACTORS {
+        let options = options_with_coset(blowup, NON_STANDARD_COSET);
+        let from_wrapper = cpu::timestamp_commitment(&options, 1 << 6);
+        assert_eq!(
+            from_wrapper,
+            cpu::compute_timestamp_commitment(&options, 1 << 6)
+        );
+        assert_ne!(
+            from_wrapper,
+            cpu::timestamp_commitment(&options_with_coset(blowup, STANDARD_COSET), 1 << 6),
         );
     }
 }

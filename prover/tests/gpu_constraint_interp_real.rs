@@ -7,7 +7,7 @@
 //! per-constraint eval matrix is bit-for-bit identical to the CPU reference
 //! oracle `eval_device_program`. The oracle is pinned bit-for-bit to the
 //! compiled prover folder by `tests::constraint_program_device_tests`, so
-//! GPU == oracle closes the chain GPU == folder across all 26 tables.
+//! GPU == oracle closes the chain GPU == folder across all 27 tables.
 //!
 //! Complements the synthetic all-ops coverage in
 //! `stark`'s `tests/gpu_constraint_interp.rs`: this exercises the kernel on the
@@ -246,7 +246,7 @@ fn check_air(air: &dyn AIR<Field = Gl, FieldExtension = Ext, PublicInputs = ()>,
 fn all_table_programs_gpu_match_cpu_oracle() {
     let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
 
-    check_air(&create_cpu_air(&opts), "CPU");
+    check_air(&create_cpu_air(&opts, 0), "CPU");
     check_air(&create_bitwise_air(&opts), "BITWISE");
     check_air(&create_lt_air(&opts), "LT");
     check_air(&create_shift_air(&opts), "SHIFT");
@@ -263,13 +263,14 @@ fn all_table_programs_gpu_match_cpu_oracle() {
     check_air(&create_dvrm_air(&opts), "DVRM");
     check_air(&create_branch_air(&opts), "BRANCH");
     check_air(&create_halt_air(&opts), "HALT");
-    check_air(&create_commit_air(&opts), "COMMIT");
     check_air(&create_page_air(&opts, 0x1000), "PAGE");
-    check_air(&create_register_air(&opts), "REGISTER");
+    check_air(&create_register_air(&opts, 0), "REGISTER");
     check_air(&create_keccak_air(&opts), "KECCAK");
     check_air(&create_keccak_rnd_air(&opts), "KECCAK_RND");
     check_air(&create_keccak_rc_air(&opts), "KECCAK_RC");
     check_air(&create_ecsm_air(&opts), "ECSM");
     check_air(&create_ecdas_air(&opts), "ECDAS");
+    check_air(&create_copy_air(&opts), "copy");
     check_air(&create_hint_air(&opts), "HINT");
+    check_air(&create_is_wh_air(&opts), "IS_WH");
 }

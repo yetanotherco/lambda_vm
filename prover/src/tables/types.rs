@@ -307,11 +307,11 @@ pub enum BusId {
     // =========================================================================
     /// Instruction decode lookup
     Decode = 18,
-    /// System call handling (CPU → HALT/COMMIT for all ECALLs)
+    /// System call handling (CPU → HALT/COPY/KECCAK/ECSM/HINT for all ECALLs)
     Ecall = 19,
-    /// COMMIT self-referencing recursive bus (row N → row N+1)
-    CommitNextByte = 20,
-    /// COMMIT output bus: verifier computes the receiver contribution externally
+    // ID 20 is reserved for the removed CommitNextByte bus: COMMIT's per-byte
+    // recursion moved to COPY, which chains over [`BusId::CopyNext`].
+    /// Commit output bus (sent by COPY's commit rows): verifier computes the receiver contribution externally
     /// from `VmProof.public_output` using the shared LogUp challenges
     Commit = 21,
     /// Keccak core ↔ round chip: (timestamp, round, state[200 bytes])
@@ -354,11 +354,40 @@ pub enum BusId {
     Bit = 30,
 
     // =========================================================================
+    // Copy accelerator
+    // =========================================================================
+    // ID 29 is unused (32 is IS_WH, below). The copy primitive chains over a single
+    // [`BusId::CopyNext`] and carries the functionality selectors inside the tuple,
+    // rather than giving each of its three operations a bus of its own.
+
+    // =========================================================================
     // Continuations
     // =========================================================================
     /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
     /// boundary claims, matched across epochs by the final aggregation LogUp.
     GlobalMemory = 31,
+
+    // =========================================================================
+    // Address range checks
+    // =========================================================================
+    /// `IS_WH[Word, Half]`: range check that the top 48 bits of a `DWordWHH`
+    /// are a valid `(Word, Half)` pair. Callers send it through the `IS_WHH`
+    /// template; the IS_WH table receives it. ID 29 (the removed EC_SCALAR
+    /// `ServeK` bus) stays unused.
+    IsWh = 32,
+
+    // =========================================================================
+    // Unified copy primitive
+    // =========================================================================
+    /// COPY self-referential streaming bus. A row sends
+    /// `(timestamp, src_incr, dst_incr, count_decr, is_set, is_write)` to the next
+    /// row and receives `(timestamp, src, dst, count, is_set, is_write)` from the
+    /// previous one. The functionality selectors travel inside the tuple, so a chain
+    /// cannot change operation half way through it — a guarantee that separating the
+    /// operations by bus id would otherwise have to carry structurally.
+    CopyNext = 33,
+    // ID 34 is unused. COPY receives the `write` ECALL and reads its operand
+    // registers itself, so nothing defers the commit to a second chip.
 }
 
 impl BusId {
@@ -377,8 +406,8 @@ impl BusId {
             BusId::Branch => "Branch",
             BusId::Decode => "Decode",
             BusId::Ecall => "Ecall",
-            BusId::CommitNextByte => "CommitNextByte",
             BusId::Commit => "Commit",
+            BusId::CopyNext => "CopyNext",
             BusId::Keccak => "Keccak",
             BusId::KeccakRc => "KeccakRc",
             BusId::ByteAlu => "ByteAlu",
@@ -388,6 +417,7 @@ impl BusId {
             BusId::Ecdas => "Ecdas",
             BusId::Bit => "Bit",
             BusId::GlobalMemory => "GlobalMemory",
+            BusId::IsWh => "IsWh",
         }
     }
 }
@@ -409,7 +439,6 @@ impl TryFrom<u64> for BusId {
             17 => Ok(BusId::Branch),
             18 => Ok(BusId::Decode),
             19 => Ok(BusId::Ecall),
-            20 => Ok(BusId::CommitNextByte),
             21 => Ok(BusId::Commit),
             22 => Ok(BusId::Keccak),
             23 => Ok(BusId::KeccakRc),
@@ -420,6 +449,8 @@ impl TryFrom<u64> for BusId {
             28 => Ok(BusId::Ecdas),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
+            32 => Ok(BusId::IsWh),
+            33 => Ok(BusId::CopyNext),
             other => Err(other),
         }
     }
@@ -473,6 +504,49 @@ pub const NEG_INV_2_96: u64 = 1;
 pub const NEG_INV_2_112: u64 = 18446462594437939201;
 /// -(2^-128) mod p = p - 2^(-128)
 pub const NEG_INV_2_128: u64 = 18446744065119617026;
+
+// =========================================================================
+// Multiplicity bound of the deduplicated tables
+// =========================================================================
+
+/// Largest per-row multiplicity of a deduplicated table (LT, BYTEWISE, MUL, DVRM,
+/// BRANCH): each `μ` is range-checked to a byte by `IS_BYTE[μ]` (an `ARE_BYTES`
+/// send with multiplicity 1, the spec's default `cond`), so a row holds at most
+/// this many lookups. The bound is what keeps μ non-negative: without it a
+/// `μ = −1` twin of an honest row cancels it on the ALU bus while *receiving*
+/// its range lookups, which absorbs another row's out-of-range limb (a forged
+/// `5 < 3 = 1` verified).
+///
+/// The bound is sent with multiplicity 1, not μ. A `μ < 0` row then leaves `+1`
+/// on an out-of-range tuple, which nothing can cancel as long as no ARE_BYTES
+/// sender carries a negative weight (each one is `1` or a bit-constrained μ).
+/// Weighted by μ, the bound was itself that negative weight, and a real BRANCH
+/// row with a non-canonical `next_pc_low_1 = p−1` cancelled it
+/// (`branch_carrier_poc`).
+///
+/// It is `u8::MAX` so the BITWISE collectors can send each μ as a byte.
+pub const MU_MAX: u64 = u8::MAX as u64;
+
+/// Deduplicates operations into trace rows: `op -> μ`, splitting an op over
+/// several rows when its count exceeds [`MU_MAX`]. Shared by trace generation
+/// and the BITWISE collectors of LT, BYTEWISE and BRANCH so the per-row lookups
+/// they count cannot drift apart.
+pub fn dedup_rows<T: std::hash::Hash + Eq + Clone>(operations: &[T]) -> Vec<(T, u64)> {
+    let mut op_map: std::collections::HashMap<T, u64> = std::collections::HashMap::new();
+    for op in operations {
+        *op_map.entry(op.clone()).or_insert(0) += 1;
+    }
+
+    let mut rows = Vec::with_capacity(op_map.len());
+    for (op, mut left) in op_map {
+        while left > 0 {
+            let mu = left.min(MU_MAX);
+            left -= mu;
+            rows.push((op.clone(), mu));
+        }
+    }
+    rows
+}
 
 // =========================================================================
 // ALU operation descriptors

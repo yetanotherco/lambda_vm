@@ -37,7 +37,6 @@ pub const BIT_FLAG_COLUMNS: &[usize] = &[
     cols::BRANCH,
     cols::ECALL,
     cols::PC_DOUBLE_READ,
-    cols::PREV_PC_TIMESTAMP_BORROW,
 ];
 
 // =========================================================================
@@ -45,7 +44,7 @@ pub const BIT_FLAG_COLUMNS: &[usize] = &[
 // =========================================================================
 
 /// Total number of CPU transition constraints (excludes bus lookups):
-/// - IS_BIT: 12
+/// - IS_BIT: 11
 /// - decode mutex: 6 (`word_instr · {MEMORY, BRANCH, ECALL, WRITE_REGISTER,
 ///   READ_REGISTER1, READ_REGISTER2}`)
 /// - ADD pair: 2, SUB pair: 2
@@ -56,7 +55,7 @@ pub const BIT_FLAG_COLUMNS: &[usize] = &[
 /// - branch_cond: 1
 /// - next_pc: 2
 /// - assumptions: 4 (MEMORY·BRANCH mutex 1 + arg2 exclusivity 2 + mem_flags IS_BIT 1)
-pub const NUM_CPU_CONSTRAINTS: usize = 12 + 6 + 2 + 2 + 2 + 4 + 2 + 2 + 1 + 2 + 4;
+pub const NUM_CPU_CONSTRAINTS: usize = 11 + 6 + 2 + 2 + 2 + 4 + 2 + 2 + 1 + 2 + 4;
 
 // =========================================================================
 // Single-body emit functions (ConstraintBuilder front-end)
@@ -355,7 +354,9 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CpuConstraints {
         emit_branch_cond(b, idx);
         idx += 1;
 
-        // idx 33,34: next_pc = pc + instruction_length.
+        // idx 33,34: next_pc = pc + instruction_length. With pc even and an even
+        // length, next_pc stays even, so no real row writes `next_pc = 1` (the final
+        // PC pinned in `register::halted_fini`).
         emit_next_pc_add_pair(b, idx);
         idx += 2;
 

@@ -93,6 +93,15 @@ an epoch. The cross-epoch chain is ordered by the **epoch number** (§3.3), so t
 GlobalMemory bus carries no timestamp at all (see §2 telescoping). `fini_timestamp`
 stays only because the epoch-local **Memory bus** needs it (matched against MEMW).
 
+The CPU timestamp is a **preprocessed** column (spec `Timestamp`): row `i` of every
+CPU table holds `4·(i + 1)`. An epoch splits its CPU rows over several tables, so
+table `k` adds `4·S_k` to every timestamp it sends, where `S_k` is the total
+height of tables `0..k`. The verifier reads the heights off the epoch proof, so
+every CPU timestamp, and the final PC timestamp `4·N + 1` (`N` = all CPU rows of
+the epoch), is verifier-known. The verifier rejects an epoch with more than
+`2^30 − 1` CPU rows: the last row's accesses reach `4·N + 2`, which must stay
+below HALT's `2^32 − 1`.
+
 ### Cross-epoch telescoping
 
 For a cell touched in epochs 1, 2, 3, the GlobalMemory bus checks:
@@ -312,7 +321,8 @@ attack and why X blocks it.
 ### Design X
 
 `MU` gates **every** L2G interaction (matches the standard table pattern —
-LT/MUL/MEMW each gate all their interactions with one multiplicity column).
+LT/MUL/MEMW gate their lookups with their multiplicity columns or sums of them; the
+only constant-1 sends are the `ARE_BYTES` checks that bound LT's and MUL's own μ).
 
 The crucial consequence — which we first mistook for redundancy — is that gating
 the **Memory bus bookend** with `MU` forces `MU = 1` on every *touched* cell:
@@ -435,14 +445,14 @@ dropped the "chain is complete" property both rely on.
 
 Registers must also carry across epochs: epoch *i+1* must start from epoch *i*'s
 final register file. Unlike memory, the register file is **small and fixed** (34
-registers / 67 word-addresses, all present every epoch), so it needs no L2G /
+registers / 68 word-addresses, all present every epoch), so it needs no L2G /
 global telescoping — we bind the whole snapshot directly.
 
 **Mechanism (no new bus).** The REGISTER table is the register analog of PAGE — it
 already puts each register's init/fini tokens on the epoch-local Memory bus
-(REG-C1 init, REG-C2 fini, matched against MEMW). For continuation epochs we
-**also preprocess the FINI column** = the epoch's final register file `R_{i+1}`
-(on top of the already-preprocessed INIT = `R_i`). "Preprocessed" means
+(REG-C1 init, REG-C2 fini, matched against MEMW). Every REGISTER table
+**preprocesses the FINI column** as well as INIT. For a continuation epoch, FINI
+is the epoch's final register file `R_{i+1}` (and INIT = `R_i`). "Preprocessed" means
 *verifier-known*: the verifier recomputes the column's commitment, so the prover
 cannot choose it. The verifier reuses the **same** `R_{i+1}` as epoch *i*'s FINI
 and epoch *i+1*'s INIT, so `init(i+1) == fini(i)` **by construction** — no equality
@@ -469,18 +479,26 @@ locks compose:
 Compose them: public `R_{i+1}` = trace FINI = real last write. So the value handed
 to the next epoch is pinned to real execution.
 
-The **monolithic prover is unchanged**: it keeps FINI as a main-trace column (it
-has no verifier-known final state) and preprocesses 2 columns, not 3.
+The **monolithic prover** preprocesses the same columns, with FINI pinned to the
+halted register file (`register::halted_fini`): x1-x31 = 0, x254 = the committed
+byte count, and the PC = 1. The final epoch's `R_{i+1}` must equal that same
+halted state. Pinning it ends the PC chain on `pc = 1`, so execution cannot
+continue past the exit ecall.
+
+REGISTER also preprocesses `IS_PC` (1 on the two x255 rows). REG-C2 sends the x255
+final token at the verifier-known final PC timestamp `4·N + 1` instead of the
+`timestamp` column (spec `halt.typ`), so both the value and the timestamp the PC
+chain ends on are verifier-known.
 
 ### Commit index (x254)
 
-The COMMIT chip's running output index lives in a synthetic single-word register
-**x254** (word-address 508), so it rides the **same** register binding above —
+The COPY chip's running output index lives in the synthetic register **x254**
+(word-addresses 508-509), so it rides the **same** register binding above —
 epoch *i*'s `FINI[x254]` becomes epoch *i+1*'s `INIT[x254]`, pinned by the two
 locks like any register. Each epoch therefore indexes its committed bytes from the
 *carried* value, not from `0`:
 
-- the COMMIT trace seeds `current_commit_index` from x254
+- the COPY trace seeds `current_commit_index` from x254
   (`register_state.read_index()` in `trace_builder.rs`), with a debug-assert
   pinning the two in sync every step;
 - the verifier's commit-bus offset (`compute_commit_bus_offset`'s `start_index`)
@@ -576,8 +594,9 @@ becomes an **explicit verifier action**:
 - **Reconstruct the output** by concatenating the per-epoch commit slices (each
   commit-bus-bound, contiguous via the x254 chain).
 - The verifier also `validate()`s `table_counts` — which since per-epoch table skipping
-  means *only* that CPU and MEMW_R are present and that no accelerator claims more than
-  one table, not that every table is there — and never trusts a prover-supplied
+  means *only* that CPU and MEMW_R are present and that no accelerator, and no IS_WH,
+  claims more than one table (for IS_WH that cap is what bounds its multiplicity sum),
+  not that every table is there — and never trusts a prover-supplied
   page config (continuation epochs have none — PAGE is skipped under the L2G
   bookend, so `page_configs` is always empty).
 
@@ -640,8 +659,10 @@ recursion/aggregation layer (deferred).
 - `prover/src/tables/global_memory.rs` — the genesis (ELF-bound for ELF/runtime pages,
   committed/private for private-input pages, §3.6) and finalization anchors.
 - `prover/src/tables/register.rs` — the REGISTER table: REG-C1/REG-C2 Memory-bus
-  tokens, the preprocessed FINI commitment (`compute_precomputed_commitment_with_fini`,
-  `NUM_PREPROCESSED_COLS_WITH_FINI`), and `fini_from_trace`.
+  tokens, the preprocessed FINI commitment (`compute_precomputed_commitment`,
+  `NUM_PREPROCESSED_COLS`), `fini_from_trace`, and the halted register
+  file that monolithic proofs and the final epoch pin FINI to (`halted_fini`,
+  `halted_commitment`).
 - `prover/src/statement.rs` — the Fiat-Shamir statement absorbers
   (`absorb_statement` with `StatementKind`, `absorb_continuation_global_statement`).
 - `prover/src/continuation.rs` — the split prover/verifier: `prove_continuation` /

@@ -33,10 +33,23 @@ const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 #[cfg(target_arch = "riscv64")]
 const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
 
-/// Syscall number for the non-constraining Hint ecall.
-/// Must match `executor::...::execution::HINT_SYSCALL_NUMBER` (u64::MAX - 30).
+/// Copy-accelerator syscall number, serving `memcpy` and `memmove` (-30 as usize).
+/// Must match the executor.
 #[cfg(target_arch = "riscv64")]
-const HINT_SYSCALL_NUMBER: usize = usize::MAX - 30;
+pub(crate) const DMA_MEMCPY_SYSCALL_NUMBER: usize = usize::MAX - 29;
+/// Maximum bytes sent in one DMA ecall. Larger `memcpy` calls are split by the
+/// strong assembly stub so continuation table height remains bounded by cycles.
+#[cfg(target_arch = "riscv64")]
+pub(crate) const DMA_MEMCPY_MAX_BYTES: usize = 256;
+
+/// `memset` syscall number (-31 as usize). Must match the executor.
+#[cfg(target_arch = "riscv64")]
+pub(crate) const DMA_MEMSET_SYSCALL_NUMBER: usize = usize::MAX - 30;
+
+/// Syscall number for the non-constraining Hint ecall (-32 as usize).
+/// Must match `executor::...::execution::HINT_SYSCALL_NUMBER` (u64::MAX - 31).
+#[cfg(target_arch = "riscv64")]
+const HINT_SYSCALL_NUMBER: usize = usize::MAX - 31;
 
 /// Hint selectors passed in `a0` (must match the executor's `HINT_*`).
 pub const HINT_FIELD_INV: usize = 0;
@@ -85,7 +98,11 @@ pub fn commit(slice: &[u8]) {
     unsafe {
         asm!(
             "ecall",
-            in("a0") 1usize,
+            // `a0` carries the file descriptor in and the byte count out, so it must
+            // be declared clobbered: with a plain `in` the compiler is entitled to
+            // assume it still holds 1 afterwards and reuse it, which would read a
+            // value the COPY chip proves is `count`.
+            inout("a0") 1usize => _,
             in("a1") slice.as_ptr(),
             in("a2") slice.len(),
             in("a7") SyscallNumbers::Commit as usize,
