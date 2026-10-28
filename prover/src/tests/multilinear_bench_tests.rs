@@ -118,20 +118,14 @@ fn shapes() {
                 continue;
             }
         };
-        let mut traces = match Traces::from_elf_and_logs(
-            &elf,
-            &logs,
-            &MaxRowsConfig::default(),
-            &inputs,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
-        ) {
-            Ok(traces) => traces,
-            Err(e) => {
-                println!("{label:<22} trace failed: {e:?}");
-                continue;
-            }
-        };
+        let mut traces =
+            match Traces::from_elf_and_logs(&elf, &logs, &MaxRowsConfig::default(), &inputs) {
+                Ok(traces) => traces,
+                Err(e) => {
+                    println!("{label:<22} trace failed: {e:?}");
+                    continue;
+                }
+            };
         let table_counts = traces.table_counts();
         let airs = crate::VmAirs::new(
             &elf,
@@ -2672,15 +2666,8 @@ fn phases() {
     let execute = start.elapsed();
 
     let start = Instant::now();
-    let mut traces = Traces::from_elf_and_logs(
-        &elf,
-        &logs,
-        &MaxRowsConfig::default(),
-        &inputs,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("traces");
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &logs, &MaxRowsConfig::default(), &inputs).expect("traces");
     let trace_build = start.elapsed();
 
     let table_counts = traces.table_counts();
@@ -2889,15 +2876,8 @@ fn commit_phases() {
         .and_then(Executor::run)
         .expect("run")
         .logs;
-    let mut traces = Traces::from_elf_and_logs(
-        &elf,
-        &logs,
-        &MaxRowsConfig::default(),
-        &inputs,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("trace");
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &logs, &MaxRowsConfig::default(), &inputs).expect("trace");
     let table_counts = traces.table_counts();
     let airs = crate::VmAirs::new(
         &elf,
@@ -3104,15 +3084,8 @@ fn constraint_program_sizes() {
         .and_then(Executor::run)
         .unwrap()
         .logs;
-    let mut traces = Traces::from_elf_and_logs(
-        &elf,
-        &logs,
-        &MaxRowsConfig::default(),
-        &inputs,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let mut traces =
+        Traces::from_elf_and_logs(&elf, &logs, &MaxRowsConfig::default(), &inputs).unwrap();
     let table_counts = traces.table_counts();
     let airs = crate::VmAirs::new(
         &elf,

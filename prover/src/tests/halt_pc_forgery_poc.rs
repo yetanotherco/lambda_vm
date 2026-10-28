@@ -149,15 +149,8 @@ fn craft_proof(
     let options = opts();
     let program = Elf::load(elf_bytes).expect("ELF load");
     let max_rows = MaxRowsConfig::default();
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        logs,
-        &max_rows,
-        &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("trace build");
+    let mut traces =
+        Traces::from_elf_and_logs(&program, logs, &max_rows, &[]).expect("trace build");
 
     apply_tamper(&mut traces, logs, tamper);
 
@@ -203,8 +196,6 @@ fn craft_proof(
     let proof = crate::hash_pin::BlockProver::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
         stark::residency_mode::ResidencyMode::Retain,
     )?;
 

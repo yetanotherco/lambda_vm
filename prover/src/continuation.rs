@@ -1233,8 +1233,6 @@ pub(crate) fn for_each_epoch(
             private_inputs,
             is_final,
             true,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
         )?;
         let __bs_build_s = multilinear::whir_split::stage_done(index, "build", __bs_build);
 
@@ -1970,8 +1968,6 @@ fn prove_prepped_epoch(
     let proof = crate::hash_pin::BlockProver::<F, E, ()>::multi_prove(
         pairs,
         &mut seed(),
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
         stark::residency_mode::ResidencyMode::Retain,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
@@ -2346,8 +2342,6 @@ fn prove_prepped_global(
             opts.fri_final_poly_log_degree,
             page_bases,
         ),
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
         stark::residency_mode::ResidencyMode::Retain,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))
@@ -2975,8 +2969,6 @@ pub(crate) fn prove_continuation_scheduled(
                     private_inputs,
                     job.is_final,
                     true,
-                    #[cfg(feature = "disk-spill")]
-                    stark::storage_mode::StorageMode::Ram,
                 )
             })) {
                 Ok(traces) => traces,

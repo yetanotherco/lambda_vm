@@ -914,8 +914,6 @@ impl EpochFront {
             &private_input,
             is_final,
             true,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
         )
         .expect("the epoch trace must build");
 

@@ -27,15 +27,7 @@ pub(crate) fn run(name: &str) -> (Elf, Vec<Log>) {
 }
 
 pub(crate) fn whole(program: &Elf, logs: &[Log], max_rows: &MaxRowsConfig) -> Traces {
-    Traces::from_elf_and_logs(
-        program,
-        logs,
-        max_rows,
-        &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("the whole-run build")
+    Traces::from_elf_and_logs(program, logs, max_rows, &[]).expect("the whole-run build")
 }
 
 /// The windowed build over windows of `window` cycles (the last window is the
@@ -958,15 +950,8 @@ fn a_windowed_build_with_a_private_input_is_the_whole_run_build() {
             .run()
             .expect("the program runs")
             .logs;
-        let reference = Traces::from_elf_and_logs(
-            &program,
-            &logs,
-            &max_rows,
-            &input,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
-        )
-        .expect("the whole-run build");
+        let reference = Traces::from_elf_and_logs(&program, &logs, &max_rows, &input)
+            .expect("the whole-run build");
         for window in [7, 33, 1000] {
             for drop in [false, true] {
                 let mut builder =
@@ -1255,15 +1240,8 @@ fn the_windowed_build_of_a_real_block_is_the_whole_run_build_every_time() {
         .expect("the block runs")
         .logs;
     let reference = {
-        let t = Traces::from_elf_and_logs(
-            &program,
-            &logs,
-            &max_rows,
-            &input,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
-        )
-        .expect("the whole-run build");
+        let t = Traces::from_elf_and_logs(&program, &logs, &max_rows, &input)
+            .expect("the whole-run build");
         table_digests(&t)
     };
     println!("DETERMINISM whole-run: {} tables", reference.len());

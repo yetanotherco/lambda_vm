@@ -1048,8 +1048,6 @@ fn a_zero_row_fixed_table_carries_some_zero_not_none() {
         &[],
         is_final,
         true,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
     )
     .expect("the epoch trace must build");
 

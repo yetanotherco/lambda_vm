@@ -151,9 +151,6 @@ fn tables(t: &LfmTraces) -> Vec<(String, &TraceTable<F, E>)> {
 }
 
 /// Total main-trace cells across every table — the census figure.
-///
-/// Counted off the backing store rather than `Table`'s `width`/`height`, which
-/// are fields on one `disk-spill` arm and methods on the other.
 fn cells(t: &LfmTraces) -> u64 {
     tables(t)
         .iter()

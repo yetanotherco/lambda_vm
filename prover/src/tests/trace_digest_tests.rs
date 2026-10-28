@@ -54,15 +54,7 @@ fn trace_digests() {
                 .run()
                 .unwrap()
                 .logs;
-            let t = Traces::from_elf_and_logs(
-                &program,
-                &logs,
-                &max_rows,
-                &[],
-                #[cfg(feature = "disk-spill")]
-                stark::storage_mode::StorageMode::Ram,
-            )
-            .unwrap();
+            let t = Traces::from_elf_and_logs(&program, &logs, &max_rows, &[]).unwrap();
             let lists: [(&str, &Vec<Table>, bool); 21] = [
                 ("CPU", &t.cpus, false),
                 ("MEMW_R", &t.memw_registers, false),

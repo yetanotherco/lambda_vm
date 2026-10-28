@@ -26,8 +26,6 @@
 //! ```
 
 use std::collections::HashMap;
-#[cfg(feature = "disk-spill")]
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
@@ -37,8 +35,6 @@ use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-#[cfg(feature = "disk-spill")]
-use stark::storage_mode::StorageMode;
 use stark::trace::TraceTable;
 
 use super::bitwise::{self, BitwiseOperation, BitwiseOperationType};
@@ -1056,18 +1052,6 @@ impl MemoryState {
         self.cells.heap_bytes()
     }
 
-    /// Number of distinct pages that contain at least one cell.
-    #[cfg(feature = "disk-spill")]
-    fn unique_page_count(&self, page_size: u64) -> u64 {
-        debug_assert!(
-            page_size.is_power_of_two(),
-            "page_size must be a power of two for the bitmask to work"
-        );
-        let mask = !(page_size - 1);
-        let pages: HashSet<u64> = self.cells.iter().map(|(a, _)| a & mask).collect();
-        pages.len() as u64
-    }
-
     /// Read a byte from memory. Returns (value, timestamp) or (0, 0) if never written.
     fn read_byte(&self, address: u64) -> MemoryCell {
         let cell = self.cells.get(address);
@@ -1497,8 +1481,7 @@ enum MemwRoute {
 }
 
 /// The single classification used everywhere a `MemwOperation` is routed to a
-/// table — the walk's [`MemwBuckets`] and the sizing pass (`count_table_lengths`)
-/// share it, so their routing cannot drift.
+/// table, so the routing cannot drift between them.
 #[inline]
 fn classify_memw(op: &MemwOperation) -> MemwRoute {
     if is_register_op(op) {
@@ -1562,8 +1545,7 @@ impl MemwBuckets {
 }
 
 /// Sink for `MemwOperation`s so `collect_register_ops_from_cpu` can feed either a plain
-/// `Vec` (the `count_table_lengths` trace-sizing pass) or the classifying
-/// [`MemwBuckets`] (the walk).
+/// `Vec` or the classifying [`MemwBuckets`] (the walk).
 trait MemwSink {
     fn push_op(&mut self, op: MemwOperation);
 
@@ -2686,30 +2668,6 @@ fn collect_copy_ops(
     }
 
     (memw_ops, rows)
-}
-
-/// Sizing-pass replay of one COPY-driven ecall.
-///
-/// Deliberately delegates to [`collect_copy_ops`] rather than re-deriving the
-/// schedule: the two used to be separate implementations pinned together by an
-/// assertion, and the schedule is now a function of `dst` as well as `count`, which
-/// is exactly the kind of thing that drifts. The cost is one allocation per ecall.
-#[cfg(feature = "disk-spill")]
-fn replay_copy_for_sizing(
-    functionality: copy::Functionality,
-    timestamp: u64,
-    src: u64,
-    dst: u64,
-    count: u64,
-    memory_state: &mut MemoryState,
-    mut visit_memw: impl FnMut(&MemwOperation),
-) -> u64 {
-    let (memw_ops, rows) =
-        collect_copy_ops(functionality, timestamp, src, dst, count, memory_state);
-    for op in &memw_ops {
-        visit_memw(op);
-    }
-    rows.len() as u64
 }
 
 /// Test hook for the schedule, so the COPY unit tests can pin it.
@@ -6401,25 +6359,12 @@ fn chunk_and_generate_skipping<T: Sync>(
     tails: bool,
     optional: bool,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     if skip == 0 {
         return if optional {
-            chunk_and_generate_optional(
-                ops,
-                max_rows,
-                generate,
-                #[cfg(feature = "disk-spill")]
-                storage_mode,
-            )
+            chunk_and_generate_optional(ops, max_rows, generate)
         } else {
-            chunk_and_generate(
-                ops,
-                max_rows,
-                generate,
-                #[cfg(feature = "disk-spill")]
-                storage_mode,
-            )
+            chunk_and_generate(ops, max_rows, generate)
         };
     }
     let chunks: Vec<&[T]> = ops.chunks(max_rows).collect();
@@ -6435,12 +6380,7 @@ fn chunk_and_generate_skipping<T: Sync>(
         chunks[skip..].to_vec()
     };
     let mut tables: Vec<_> = (0..skip).map(|_| streamed_placeholder()).collect();
-    tables.extend(generate_chunks(
-        rest,
-        generate,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?);
+    tables.extend(generate_chunks(rest, generate)?);
     Ok(tables)
 }
 
@@ -6452,19 +6392,13 @@ fn chunk_and_generate<T: Sync>(
     ops: &[T],
     max_rows: usize,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() {
         vec![&[][..]]
     } else {
         ops.chunks(max_rows).collect()
     };
-    generate_chunks(
-        op_chunks,
-        generate,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )
+    generate_chunks(op_chunks, generate)
 }
 
 /// Like [`chunk_and_generate`], but an empty `ops` yields no table at all: the
@@ -6483,19 +6417,13 @@ fn chunk_and_generate_optional<T: Sync>(
     ops: &[T],
     max_rows: usize,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() {
         vec![]
     } else {
         ops.chunks(max_rows).collect()
     };
-    generate_chunks(
-        op_chunks,
-        generate,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )
+    generate_chunks(op_chunks, generate)
 }
 
 /// Generate a single trace table for `ops`, or none at all when `ops` is empty.
@@ -6507,31 +6435,20 @@ fn chunk_and_generate_optional<T: Sync>(
 fn generate_optional<T: Sync>(
     ops: &[T],
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() { vec![] } else { vec![ops] };
-    generate_chunks(
-        op_chunks,
-        generate,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )
+    generate_chunks(op_chunks, generate)
 }
 
-/// Generate one trace table per already-chunked op slice. When `storage_mode` is
-/// `Disk`, each chunk's main table is spilled to mmap before the next chunk is
-/// built so peak heap usage stays bounded.
+/// Generate one trace table per already-chunked op slice.
 fn generate_chunks<T: Sync>(
     op_chunks: Vec<&[T]>,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     generate_chunks_with(
         op_chunks,
         |chunk: &&[T], generate: &dyn Fn(&[T]) -> TraceTable<_, _>| generate(chunk),
         generate,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
     )
 }
 
@@ -6546,22 +6463,7 @@ fn generate_chunks_with<C: Send, T>(
     ) -> TraceTable<GoldilocksField, GoldilocksExtension>
     + Sync,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
-    // Disk mode generates one chunk at a time so each spills before the next
-    // allocates, keeping trace memory bounded.
-    #[cfg(feature = "disk-spill")]
-    if storage_mode == StorageMode::Disk {
-        let mut tables = Vec::with_capacity(chunks.len());
-        for chunk in &chunks {
-            let mut t = view(chunk, &generate);
-            t.main_table
-                .spill_to_disk()
-                .map_err(|e| Error::Prover(format!("disk-spill trace: {e}")))?;
-            tables.push(t);
-        }
-        return Ok(tables);
-    }
     let generate = |chunk: C| view(&chunk, &generate);
     #[cfg(feature = "parallel")]
     let tables = chunks.into_par_iter().map(generate).collect();
@@ -6874,7 +6776,6 @@ fn chunk_and_generate_segmented<T: Clone + Sync>(
     tails: bool,
     optional: bool,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
-    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let len = ops.len();
     let max_rows = max_rows.max(1);
@@ -6909,8 +6810,6 @@ fn chunk_and_generate_segmented<T: Clone + Sync>(
             generate(&ops.range(start, end))
         },
         generate,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
     )?);
     Ok(tables)
 }
@@ -7615,7 +7514,6 @@ fn build_traces<I: ImageSource + Sync>(
     decode_table: &DecodeTable,
     register_state: RegisterState,
     max_rows: &super::MaxRowsConfig,
-    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     private_input: &[u8],
     is_final: bool,
     l2g_memory_bookend: bool,
@@ -7633,8 +7531,6 @@ fn build_traces<I: ImageSource + Sync>(
             decode_table,
             register_state,
             max_rows,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
             private_input,
             is_final,
             l2g_memory_bookend,
@@ -7651,8 +7547,6 @@ fn build_traces<I: ImageSource + Sync>(
         decode_table,
         register_state,
         max_rows,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
         private_input,
         is_final,
         l2g_memory_bookend,
@@ -7695,311 +7589,6 @@ pub(crate) fn runtime_page_ranges_of(page_configs: &[PageConfig]) -> Vec<crate::
     ranges.push(crate::RuntimePageRange { base: start, count });
 
     ranges
-}
-
-/// Padded row count after chunking, for a table that is always present: an
-/// empty op list still allocates one 4-row padded chunk.
-#[cfg(feature = "disk-spill")]
-fn padded_chunked_rows(ops_count: usize, max_rows: usize) -> u64 {
-    padded_chunked_rows_optional(ops_count, max_rows).max(4)
-}
-
-/// Padded row count after chunking, for a table left out of the proof when
-/// unused. Mirrors [`chunk_and_generate_optional`]: no ops, no rows.
-#[cfg(feature = "disk-spill")]
-fn padded_chunked_rows_optional(ops_count: usize, max_rows: usize) -> u64 {
-    // `max_rows <= 0` would loop forever. Called internally with const values > 0.
-    assert!(max_rows > 0, "max_rows must be positive");
-    let mut total: u64 = 0;
-    let mut remaining = ops_count;
-    while remaining > 0 {
-        let chunk_size = remaining.min(max_rows);
-        total += chunk_size.next_power_of_two().max(4) as u64;
-        remaining -= chunk_size;
-    }
-    total
-}
-
-/// Per-table padded row counts plus auxiliary metrics for peak-heap estimation.
-#[cfg(feature = "disk-spill")]
-#[derive(Debug, Default, Clone)]
-pub struct TableLengths {
-    pub cpu_padded_rows: u64,
-    pub memw_padded_rows: u64,
-    pub memw_aligned_padded_rows: u64,
-    pub memw_register_padded_rows: u64,
-    pub load_padded_rows: u64,
-    pub lt_padded_rows: u64,
-    pub shift_padded_rows: u64,
-    pub mul_padded_rows: u64,
-    pub dvrm_padded_rows: u64,
-    pub branch_padded_rows: u64,
-    pub copy_padded_rows: u64,
-    pub decode_rows: u64,
-    pub unique_page_count: u64,
-    pub cycle_count: u64,
-    pub unique_byte_count: u64,
-}
-
-/// Per-table row counts from `logs`, without building op vectors.
-/// Exact for tables that don't dedup; upper bound for LT, MUL, DVRM, BRANCH.
-/// Must stay in sync with `Traces::from_elf_and_logs`.
-#[cfg(feature = "disk-spill")]
-pub fn count_table_lengths(
-    elf: &Elf,
-    logs: &[Log],
-    max_rows: &super::MaxRowsConfig,
-    private_input: &[u8],
-) -> Result<TableLengths, Error> {
-    // Phase 0: ELF → instructions + DECODE row count.
-    let instructions = decode::instructions_from_elf(elf)
-        .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
-    // Mirrors the padding inside `generate_decode_trace`.
-    let decode_rows = (instructions.len() as u64 + 1).next_power_of_two().max(2);
-
-    // Memory + register state for partition predicates that need timestamps.
-    let mut memory_state = MemoryState::from_image(&build_initial_image(elf, private_input));
-    let mut register_state = RegisterState::new(elf.entry_point);
-
-    // Raw counts (pre-chunking + pre-padding).
-    let mut cpu_count = 0usize;
-    // Wide-MEMW counts bucketed by width, used by the LT-from-MEMW derivation.
-    let mut memw_by_width: [usize; 4] = [0; 4];
-    let mut memw_aligned_count = 0usize;
-    let mut memw_register_count = 0usize;
-    let mut load_count = 0usize;
-    let mut lt_count = 0usize;
-    let mut shift_count = 0usize;
-    let mut mul_count = 0usize;
-    let mut dvrm_count = 0usize;
-    let mut branch_count = 0usize;
-    let mut copy_count = 0usize;
-    // Zero, not the carried x254 the generation walk seeds from: `count_table_lengths`
-    // takes no register-init vector, so it is only usable for a whole run or a first
-    // epoch anyway. It is sound today because no row count depends on `dst` — wire a
-    // `register_init` through before that stops being true.
-    let mut current_commit_index = 0u32;
-
-    let partition_memw = |op: &MemwOperation,
-                          by_width: &mut [usize; 4],
-                          aligned: &mut usize,
-                          register: &mut usize| {
-        // Same classifier as the walk's MemwBuckets, so the sizing pass counts
-        // exactly the rows trace generation will produce.
-        match classify_memw(op) {
-            MemwRoute::Register => *register += 1,
-            MemwRoute::Aligned => *aligned += 1,
-            MemwRoute::General => {
-                let idx = match op.width {
-                    1 => 0,
-                    2 => 1,
-                    4 => 2,
-                    8 => 3,
-                    _ => return,
-                };
-                by_width[idx] += 1;
-            }
-        }
-    };
-
-    let decode = DecodeTable::from_instructions(&instructions);
-    let mut reg_memw_scratch: Vec<MemwOperation> = Vec::with_capacity(4);
-    for (i, log) in logs.iter().enumerate() {
-        let timestamp = (i as u64) * 4 + 4;
-        let row = decode
-            .row(log.current_pc)
-            .ok_or(Error::MissingInstruction(log.current_pc))?;
-        let op = CpuOperation::from_log(log, timestamp, decode.entry(row), row);
-        let cpu_op = decode.op(&op);
-        cpu_count += 1;
-
-        // Memory ops from load/store
-        if cpu_op.decode.fields.is_load() {
-            let (memw_op, _load_op) = collect_load_op_from_cpu(cpu_op, &mut memory_state);
-            partition_memw(
-                &memw_op,
-                &mut memw_by_width,
-                &mut memw_aligned_count,
-                &mut memw_register_count,
-            );
-            load_count += 1;
-        } else if cpu_op.decode.fields.is_store() {
-            let memw_op = collect_store_op_from_cpu(cpu_op, &mut memory_state);
-            partition_memw(
-                &memw_op,
-                &mut memw_by_width,
-                &mut memw_aligned_count,
-                &mut memw_register_count,
-            );
-        }
-
-        // Register accesses.
-        reg_memw_scratch.clear();
-        collect_register_ops_from_cpu(cpu_op, &mut register_state, &mut reg_memw_scratch);
-        for memw_op in &reg_memw_scratch {
-            partition_memw(
-                memw_op,
-                &mut memw_by_width,
-                &mut memw_aligned_count,
-                &mut memw_register_count,
-            );
-        }
-
-        // Every copy ecall — `write`, `memcpy`/`memmove` and `memset` — goes through
-        // the same chip, so it is sized through the same path.
-        if cpu_op.ecall_commit() || cpu_op.ecall_dma_memcpy() || cpu_op.ecall_dma_memset() {
-            let (functionality, src, dst, count) = if cpu_op.ecall_commit() {
-                (
-                    copy::Functionality::Write,
-                    cpu_op.commit_buf_addr(),
-                    u64::from(current_commit_index),
-                    cpu_op.commit_count(),
-                )
-            } else {
-                let functionality = if cpu_op.ecall_dma_memset() {
-                    copy::Functionality::Set
-                } else {
-                    copy::Functionality::Copy
-                };
-                (
-                    functionality,
-                    register_state.read(11).0,
-                    register_state.read(10).0,
-                    register_state.read(12).0,
-                )
-            };
-
-            for reg_op in collect_copy_register_ops(
-                functionality,
-                cpu_op.timestamp,
-                src,
-                dst,
-                count,
-                &mut register_state,
-            )? {
-                partition_memw(
-                    &reg_op,
-                    &mut memw_by_width,
-                    &mut memw_aligned_count,
-                    &mut memw_register_count,
-                );
-            }
-
-            let rows = replay_copy_for_sizing(
-                functionality,
-                cpu_op.timestamp,
-                src,
-                dst,
-                count,
-                &mut memory_state,
-                |memw_op| {
-                    partition_memw(
-                        memw_op,
-                        &mut memw_by_width,
-                        &mut memw_aligned_count,
-                        &mut memw_register_count,
-                    );
-                },
-            );
-            copy_count += rows as usize;
-
-            if cpu_op.ecall_commit() {
-                let delta = u32::try_from(count)
-                    .map_err(|_| Error::Execution("commit_count exceeds u32 range".into()))?;
-                current_commit_index = current_commit_index
-                    .checked_add(delta)
-                    .ok_or_else(|| Error::Execution("commit index exceeds u32 range".into()))?;
-            }
-        }
-
-        if cpu_op.ecall_hint() {
-            // Mirror `collect_hint_ops`: three register reads (a0/a1/a2) and four
-            // 8-byte output writes go through the memory argument, plus the three LT
-            // range-checks (selector < 3, in_addr and out_addr low limbs). Replaying it
-            // here keeps memory/register state in sync with generation, exactly like
-            // commit above.
-            let (hint_memw, _hint_op) =
-                collect_hint_ops(cpu_op, &mut memory_state, &mut register_state);
-            for memw_op in &hint_memw {
-                partition_memw(
-                    memw_op,
-                    &mut memw_by_width,
-                    &mut memw_aligned_count,
-                    &mut memw_register_count,
-                );
-            }
-            lt_count += 3;
-        }
-
-        // CPU-side per-instruction-kind counters (non-word; word → CPU32, B5b)
-        let f = &cpu_op.decode.fields;
-        if !f.word_instr && f.is_lt() {
-            lt_count += 1;
-        }
-        if !f.word_instr && f.is_shift() {
-            shift_count += 1;
-        }
-        if !f.word_instr && f.is_mul() {
-            mul_count += 1;
-        }
-        if !f.word_instr && f.is_divrem() {
-            dvrm_count += 1;
-        }
-        if cpu_op.branch_cond() {
-            branch_count += 1;
-        }
-    }
-
-    // HALT finalization. Halt ops fall through to wide MEMW.
-    let halt_memw_ops = collect_halt_ops(&mut register_state);
-    for memw_op in &halt_memw_ops {
-        partition_memw(
-            memw_op,
-            &mut memw_by_width,
-            &mut memw_aligned_count,
-            &mut memw_register_count,
-        );
-    }
-
-    // LT ops derived from wide-MEMW and memw_aligned ops.
-    let memw_count = memw_by_width.iter().sum::<usize>();
-    let lt_from_memw =
-        memw_by_width[0] + 2 * memw_by_width[1] + 4 * memw_by_width[2] + 8 * memw_by_width[3];
-    lt_count += lt_from_memw + memw_aligned_count;
-
-    // DVRM derives mul and lt ops.
-    mul_count += 2 * dvrm_count;
-    lt_count += dvrm_count;
-
-    let unique_page_count = memory_state.unique_page_count(page::DEFAULT_PAGE_SIZE as u64);
-    let unique_byte_count = memory_state.cells.len() as u64;
-    let cycle_count = logs.len() as u64;
-
-    Ok(TableLengths {
-        cpu_padded_rows: padded_chunked_rows(cpu_count, max_rows.cpu),
-        memw_padded_rows: padded_chunked_rows_optional(memw_count, max_rows.memw),
-        memw_aligned_padded_rows: padded_chunked_rows_optional(
-            memw_aligned_count,
-            max_rows.memw_aligned,
-        ),
-        memw_register_padded_rows: padded_chunked_rows(memw_register_count, max_rows.memw_register),
-        load_padded_rows: padded_chunked_rows_optional(load_count, max_rows.load),
-        lt_padded_rows: padded_chunked_rows_optional(lt_count, max_rows.lt),
-        shift_padded_rows: padded_chunked_rows_optional(shift_count, max_rows.shift),
-        mul_padded_rows: padded_chunked_rows_optional(mul_count, max_rows.mul),
-        dvrm_padded_rows: padded_chunked_rows_optional(dvrm_count, max_rows.dvrm),
-        branch_padded_rows: padded_chunked_rows_optional(branch_count, max_rows.branch),
-        // COPY is a counted table here: a run that neither commits nor copies has none.
-        copy_padded_rows: if copy_count == 0 {
-            0
-        } else {
-            copy_count.next_power_of_two().max(4) as u64
-        },
-        decode_rows,
-        unique_page_count,
-        cycle_count,
-        unique_byte_count,
-    })
 }
 
 impl Traces {
@@ -8686,7 +8275,6 @@ impl Traces {
         logs: &[Log],
         max_rows: &super::MaxRowsConfig,
         private_input: &[u8],
-        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<Self, Error> {
         let initial_image = build_initial_image(elf, private_input);
         let register_init = register::register_init_from_entry_point(elf.entry_point);
@@ -8699,8 +8287,6 @@ impl Traces {
             private_input,
             true,
             false,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     }
 
@@ -8726,7 +8312,6 @@ impl Traces {
         private_input: &[u8],
         is_final: bool,
         l2g_memory_bookend: bool,
-        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<Self, Error> {
         let artifacts = DecodeArtifacts::from_elf(elf)?;
         Self::from_image_and_logs_with_decode(
@@ -8738,8 +8323,6 @@ impl Traces {
             private_input,
             is_final,
             l2g_memory_bookend,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     }
 
@@ -8759,7 +8342,6 @@ impl Traces {
         private_input: &[u8],
         is_final: bool,
         l2g_memory_bookend: bool,
-        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<Self, Error> {
         let collected =
             Self::collect_epoch(artifacts, initial_image, register_init, logs, is_final)?;
@@ -8772,8 +8354,6 @@ impl Traces {
             private_input,
             is_final,
             l2g_memory_bookend,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     }
 
@@ -8906,8 +8486,6 @@ impl Traces {
             &[],
             true,
             false,
-            #[cfg(feature = "disk-spill")]
-            StorageMode::Ram,
         )
     }
 
@@ -8927,7 +8505,6 @@ impl Traces {
         private_input: &[u8],
         is_final: bool,
         l2g_memory_bookend: bool,
-        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<Self, Error> {
         // Phase 0 (cached): the pristine DECODE trace is cloned so
         // `build_traces` can fill this epoch's multiplicities.
@@ -8949,8 +8526,6 @@ impl Traces {
             &artifacts.decode,
             collected.register_state,
             max_rows,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
             private_input,
             is_final,
             l2g_memory_bookend,
@@ -9038,8 +8613,6 @@ impl Traces {
             &decode_table,
             register_state,
             max_rows,
-            #[cfg(feature = "disk-spill")]
-            StorageMode::Ram,
             &[],
             true,
             false,
@@ -9429,28 +9002,11 @@ mod segmented_tests {
         };
         for max in [1, 64, 1000, COMPACT_LT_BLOCK, 1 << 20] {
             for (skip, tails) in [(0, false), (1, false)] {
-                let whole = chunk_and_generate_skipping(
-                    &all,
-                    max,
-                    skip,
-                    tails,
-                    true,
-                    lt_table,
-                    #[cfg(feature = "disk-spill")]
-                    StorageMode::Ram,
-                )
-                .expect("whole");
-                let split = chunk_and_generate_segmented(
-                    &segmented,
-                    max,
-                    skip,
-                    tails,
-                    true,
-                    lt_table,
-                    #[cfg(feature = "disk-spill")]
-                    StorageMode::Ram,
-                )
-                .expect("segmented");
+                let whole = chunk_and_generate_skipping(&all, max, skip, tails, true, lt_table)
+                    .expect("whole");
+                let split =
+                    chunk_and_generate_segmented(&segmented, max, skip, tails, true, lt_table)
+                        .expect("segmented");
                 assert_eq!(words(&whole), words(&split), "max {max} skip {skip}");
             }
         }
@@ -9477,25 +9033,10 @@ mod segmented_tests {
                     for optional in [true, false] {
                         // With `tails`, the list is what is left past the
                         // streamed chunks: the same list either way here.
-                        let whole = chunk_and_generate_skipping(
-                            &all,
-                            max,
-                            skip,
-                            tails,
-                            optional,
-                            table_of,
-                            #[cfg(feature = "disk-spill")]
-                            StorageMode::Ram,
-                        );
+                        let whole =
+                            chunk_and_generate_skipping(&all, max, skip, tails, optional, table_of);
                         let split = chunk_and_generate_segmented(
-                            &segmented,
-                            max,
-                            skip,
-                            tails,
-                            optional,
-                            table_of,
-                            #[cfg(feature = "disk-spill")]
-                            StorageMode::Ram,
+                            &segmented, max, skip, tails, optional, table_of,
                         );
                         match (whole, split) {
                             (Ok(a), Ok(b)) => assert_eq!(
@@ -9518,28 +9059,10 @@ mod segmented_tests {
             parts: vec![Part::Ops(&[]), Part::Ops(&[])],
         };
         for optional in [true, false] {
-            let a = chunk_and_generate_skipping(
-                &[] as &[u64],
-                4,
-                0,
-                false,
-                optional,
-                table_of,
-                #[cfg(feature = "disk-spill")]
-                StorageMode::Ram,
-            )
-            .expect("whole");
-            let b = chunk_and_generate_segmented(
-                &empty,
-                4,
-                0,
-                false,
-                optional,
-                table_of,
-                #[cfg(feature = "disk-spill")]
-                StorageMode::Ram,
-            )
-            .expect("segmented");
+            let a = chunk_and_generate_skipping(&[] as &[u64], 4, 0, false, optional, table_of)
+                .expect("whole");
+            let b = chunk_and_generate_segmented(&empty, 4, 0, false, optional, table_of)
+                .expect("segmented");
             assert_eq!(words(&a), words(&b), "empty, optional {optional}");
         }
     }

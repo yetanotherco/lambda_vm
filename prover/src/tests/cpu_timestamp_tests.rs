@@ -29,15 +29,9 @@ fn craft_proof(
 ) -> Result<VmProof, stark::prover::ProvingError> {
     let options = opts();
     let program = Elf::load(elf_bytes).expect("ELF load");
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &run_logs(elf_bytes),
-        &MaxRowsConfig::small(),
-        &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("trace build");
+    let mut traces =
+        Traces::from_elf_and_logs(&program, &run_logs(elf_bytes), &MaxRowsConfig::small(), &[])
+            .expect("trace build");
     tamper(&mut traces);
 
     let table_counts = traces.table_counts();
@@ -74,8 +68,6 @@ fn craft_proof(
     let proof = crate::hash_pin::BlockProver::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
         stark::residency_mode::ResidencyMode::Retain,
     )?;
 

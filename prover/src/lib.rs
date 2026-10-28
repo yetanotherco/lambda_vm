@@ -13,8 +13,6 @@
 pub mod alloc_purge;
 /// ⛔ Measurement only: `LAMBDA_VM_ARGUE_BATCHED_MEASURE` (never a default).
 pub mod argue_measure;
-#[cfg(feature = "disk-spill")]
-pub mod auto_storage;
 // The block prover runs its phases on threads and rayon: a host prover, built
 // with `parallel` (the guests take the crate without it).
 #[cfg(feature = "parallel")]
@@ -63,8 +61,6 @@ use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use stark::prover::IsStarkProver;
-#[cfg(feature = "disk-spill")]
-use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
 use stark::verifier::IsStarkVerifier;
 
@@ -75,8 +71,6 @@ use crate::tables::decode;
 use crate::tables::page;
 use crate::tables::register;
 use crate::tables::trace_builder::Traces;
-#[cfg(feature = "disk-spill")]
-use crate::tables::trace_builder::count_table_lengths;
 use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_blake3_air, create_branch_air, create_bytewise_air,
@@ -1754,8 +1748,6 @@ pub fn count_elements(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<(u64, u
         &result.logs,
         &MaxRowsConfig::default(),
         private_inputs,
-        #[cfg(feature = "disk-spill")]
-        StorageMode::Ram,
     )?;
     Ok((
         traces.total_field_elements(),
@@ -1820,20 +1812,7 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("trace_build");
 
-    #[cfg(feature = "disk-spill")]
-    let storage_mode = {
-        let lengths = count_table_lengths(&program, &result.logs, max_rows, private_inputs)?;
-        auto_storage::decide(&lengths, proof_options.blowup_factor)
-    };
-
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &result.logs,
-        max_rows,
-        private_inputs,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows, private_inputs)?;
     debug_assert_eq!(
         traces.public_output_bytes, result.return_values.memory_values,
         "public output diverged between executor view and trace reconstruction"
@@ -1911,8 +1890,6 @@ pub fn prove_with_options_and_inputs(
     let proof = crate::hash_pin::BlockProver::multi_prove(
         pairs,
         &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
         stark::residency_mode::ResidencyMode::Retain,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;

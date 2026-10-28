@@ -453,15 +453,9 @@ fn fixed_traces(
         .run()
         .expect("the program runs")
         .logs;
-    let mut traces = crate::tables::trace_builder::Traces::from_elf_and_logs(
-        &program,
-        &logs,
-        max_rows,
-        &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("the traces build");
+    let mut traces =
+        crate::tables::trace_builder::Traces::from_elf_and_logs(&program, &logs, max_rows, &[])
+            .expect("the traces build");
     block_whir::split_keccak_rnd(
         &mut traces,
         keccak_rnd_log2,

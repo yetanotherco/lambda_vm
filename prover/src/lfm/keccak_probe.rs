@@ -118,13 +118,7 @@ fn prove_traces(
         (&bw_air, t3, &()),
     ];
     let mut t = transcript();
-    crate::hash_pin::BlockProver::multi_prove(
-        pairs,
-        &mut t,
-        #[cfg(feature = "disk-spill")]
-        Default::default(),
-        Default::default(),
-    )
+    crate::hash_pin::BlockProver::multi_prove(pairs, &mut t, Default::default())
 }
 
 fn verify_proof(

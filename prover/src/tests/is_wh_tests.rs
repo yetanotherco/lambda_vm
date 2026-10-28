@@ -277,15 +277,8 @@ fn full_traces(name: &str) -> (Vec<u8>, Elf, Traces) {
         .run()
         .expect("run")
         .logs;
-    let traces = Traces::from_elf_and_logs(
-        &program,
-        &logs,
-        &MaxRowsConfig::default(),
-        &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("trace build");
+    let traces = Traces::from_elf_and_logs(&program, &logs, &MaxRowsConfig::default(), &[])
+        .expect("trace build");
     (elf_bytes, program, traces)
 }
 
@@ -343,8 +336,6 @@ fn prove_asm_with(name: &str, rewrite: impl FnOnce(&mut Traces)) -> bool {
     let proof = crate::hash_pin::BlockProver::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
         stark::residency_mode::ResidencyMode::Retain,
     )
     .expect("prover must build the crafted proof; a prover refusal is not a verifier rejection");

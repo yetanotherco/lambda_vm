@@ -1,7 +1,5 @@
 #[cfg(test)]
 pub mod argue_stage1_tests;
-#[cfg(all(test, feature = "disk-spill"))]
-pub mod auto_storage_tests;
 #[cfg(test)]
 pub mod batched_argue_tests;
 #[cfg(test)]
@@ -51,8 +49,6 @@ pub mod constraint_set_tests_b;
 pub mod constraints_tests;
 #[cfg(test)]
 pub mod copy_tests;
-#[cfg(all(test, feature = "disk-spill"))]
-pub mod count_table_lengths_drift_tests;
 #[cfg(test)]
 pub mod cpu32_tests;
 #[cfg(test)]
@@ -67,8 +63,6 @@ pub mod decode_prepared_tests;
 pub mod decode_residency_tests;
 #[cfg(test)]
 pub mod decode_tests;
-#[cfg(all(test, feature = "disk-spill"))]
-pub mod disk_spill_tests;
 #[cfg(test)]
 pub mod dvrm_tests;
 #[cfg(test)]

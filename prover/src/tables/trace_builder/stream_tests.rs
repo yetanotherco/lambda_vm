@@ -1355,8 +1355,6 @@ fn a_miscounted_header_is_refused_by_the_stream() {
             &artifacts.decode,
             register_state,
             &max_rows,
-            #[cfg(feature = "disk-spill")]
-            StorageMode::Ram,
             &[],
             true,
             false,
@@ -1656,8 +1654,6 @@ fn with_the_knob_the_plan_leaves_the_count_to_bitwise() {
             &artifacts.decode,
             register_state,
             &max_rows,
-            #[cfg(feature = "disk-spill")]
-            StorageMode::Ram,
             &[],
             true,
             false,

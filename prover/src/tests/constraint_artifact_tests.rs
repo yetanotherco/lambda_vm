@@ -895,8 +895,6 @@ fn continuation_epoch_chunk_counts_measured() {
             &[],
             is_final,
             true,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
         )
         .expect("epoch trace build");
 

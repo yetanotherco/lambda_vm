@@ -397,12 +397,11 @@ pub(crate) fn prove_traces(
 /// [`prove_traces`] against an AIR set built for `hasher`. The traces must have
 /// been built with the same one.
 ///
-/// Storage mode comes from [`crate::auto_storage::decide_lfm`] and residency
-/// mode from [`decide_lfm_residency`] rather than parameters: both are resource
-/// decisions, invisible to the proof — spilling changes where a trace lives and
-/// recompute changes how long an LDE lives, never a byte the transcript absorbs
-/// — so threading them through the prove signature would put knobs with no wire
-/// meaning in front of every caller.
+/// Residency mode comes from [`decide_lfm_residency`] rather than a parameter:
+/// it is a resource decision, invisible to the proof — recompute changes how
+/// long an LDE lives, never a byte the transcript absorbs — so threading it
+/// through the prove signature would put a knob with no wire meaning in front
+/// of every caller.
 #[cfg(test)]
 pub(crate) fn prove_traces_with_hasher(
     artifacts: &LfmArtifacts,
@@ -421,8 +420,7 @@ pub(crate) fn prove_traces_with_hasher(
 /// legacy one is but under the family's statement tag, and the proof commits
 /// under `Fam::Stark`.
 ///
-/// Storage mode comes from [`crate::auto_storage::decide_lfm`] and residency
-/// mode is the caller's: both are resource decisions, invisible to the proof.
+/// Residency mode is the caller's: a resource decision, invisible to the proof.
 pub(crate) fn prove_traces_under<Fam: ProofFamily>(
     artifacts: &LfmArtifacts,
     traces: &mut LfmTraces,
@@ -464,8 +462,6 @@ pub(crate) fn prove_traces_under<Fam: ProofFamily>(
     stark::prover::GenericProver::<F, E, (), Fam::Stark>::multi_prove(
         airs.air_trace_pairs(traces),
         &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        crate::auto_storage::decide_lfm(),
         residency,
     )
 }

@@ -29,8 +29,6 @@ use stark::lookup::{
 use stark::proof::options::{ProofFormat, ProofOptions};
 use stark::proof::stark::MultiProof;
 use stark::prover::{IsStarkProver, ProvingError};
-#[cfg(feature = "disk-spill")]
-use stark::storage_mode::StorageMode;
 use stark::trace::TraceTable;
 use stark::traits::AIR;
 
@@ -148,8 +146,6 @@ where
     crate::hash_pin::BlockProver::<F, E, PI>::multi_prove(
         air_trace_pairs,
         transcript,
-        #[cfg(feature = "disk-spill")]
-        StorageMode::Ram,
         stark::residency_mode::ResidencyMode::Retain,
     )
 }

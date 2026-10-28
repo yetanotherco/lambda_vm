@@ -167,15 +167,8 @@ fn craft_proof(s: &Scenario, forge: Forge) -> Result<VmProof, stark::prover::Pro
             .src2_val = s.forged;
     }
 
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &logs,
-        &MaxRowsConfig::default(),
-        &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("trace build");
+    let mut traces = Traces::from_elf_and_logs(&program, &logs, &MaxRowsConfig::default(), &[])
+        .expect("trace build");
 
     if forge.rows {
         (s.forge_rows)(&mut traces, s);
@@ -223,8 +216,6 @@ fn craft_proof(s: &Scenario, forge: Forge) -> Result<VmProof, stark::prover::Pro
     let proof = crate::hash_pin::BlockProver::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
         stark::residency_mode::ResidencyMode::Retain,
     )?;
 

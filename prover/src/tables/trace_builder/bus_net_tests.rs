@@ -177,15 +177,8 @@ fn the_whole_run_tables_balance_every_inner_bus() {
     for max_rows in [MaxRowsConfig::small(), MaxRowsConfig::default()] {
         for name in PROGRAMS {
             let (program, logs) = run(name);
-            let mut traces = Traces::from_elf_and_logs(
-                &program,
-                &logs,
-                &max_rows,
-                &[],
-                #[cfg(feature = "disk-spill")]
-                StorageMode::Ram,
-            )
-            .expect("the build");
+            let mut traces =
+                Traces::from_elf_and_logs(&program, &logs, &max_rows, &[]).expect("the build");
             let left = unbalanced(&program, &mut traces);
             assert!(left.is_empty(), "{name}: {}", named(&left));
         }

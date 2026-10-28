@@ -203,17 +203,8 @@ fn the_plan_builds_the_oracles_whole_run_tables() {
     ] {
         for name in PROGRAMS {
             let (program, logs) = run(name);
-            let build = || {
-                Traces::from_elf_and_logs(
-                    &program,
-                    &logs,
-                    &max_rows,
-                    &[],
-                    #[cfg(feature = "disk-spill")]
-                    StorageMode::Ram,
-                )
-                .expect("the build")
-            };
+            let build =
+                || Traces::from_elf_and_logs(&program, &logs, &max_rows, &[]).expect("the build");
             let frozen = oracle(build);
             same(&format!("{name} whole run"), &frozen, &build());
         }
@@ -248,8 +239,6 @@ fn the_plan_builds_the_oracles_epoch_tables() {
                         &[],
                         is_final,
                         l2g,
-                        #[cfg(feature = "disk-spill")]
-                        StorageMode::Ram,
                     )
                     .expect("the build")
                 };
@@ -411,8 +400,6 @@ fn plan_of<'a>(
         &artifacts.decode,
         register_state,
         max_rows,
-        #[cfg(feature = "disk-spill")]
-        StorageMode::Ram,
         &[],
         true,
         false,
@@ -439,15 +426,7 @@ fn the_header_is_the_tables_counts_and_a_wrong_one_is_refused() {
         let image = build_initial_image(&program, &[]);
         let register_init = register::register_init_from_entry_point(program.entry_point);
         let frozen = oracle(|| {
-            Traces::from_elf_and_logs(
-                &program,
-                &logs,
-                &max_rows,
-                &[],
-                #[cfg(feature = "disk-spill")]
-                StorageMode::Ram,
-            )
-            .expect("the build")
+            Traces::from_elf_and_logs(&program, &logs, &max_rows, &[]).expect("the build")
         });
         let collect = || {
             Traces::collect_epoch(&artifacts, &image, &register_init, &logs, true)
@@ -802,8 +781,6 @@ fn the_cut_line_names_the_rule_and_the_tables_with_a_real_row() {
             &artifacts.decode,
             register_state,
             &max_rows,
-            #[cfg(feature = "disk-spill")]
-            StorageMode::Ram,
             &[],
             true,
             false,

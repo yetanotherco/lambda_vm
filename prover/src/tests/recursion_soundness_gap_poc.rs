@@ -139,15 +139,8 @@ fn custom_prove_with_statement_elf(
     let result = executor.run().expect("run failed");
 
     let max_rows = MaxRowsConfig::default();
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &result.logs,
-        &max_rows,
-        &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("trace build failed");
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, &max_rows, &[])
+        .expect("trace build failed");
 
     let table_counts = traces.table_counts();
     let airs = VmAirs::new(
@@ -187,8 +180,6 @@ fn custom_prove_with_statement_elf(
     let proof = crate::hash_pin::BlockProver::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
         stark::residency_mode::ResidencyMode::Retain,
     )
     .expect("multi_prove failed");

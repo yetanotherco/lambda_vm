@@ -3712,14 +3712,8 @@ fn prove_block_whir_inner(
 
     crate::tables::trace_builder::build_stamps::start();
     let t = Instant::now();
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &result.logs,
-        &options.max_rows,
-        private_inputs,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )?;
+    let mut traces =
+        Traces::from_elf_and_logs(&program, &result.logs, &options.max_rows, private_inputs)?;
     drop(result);
     stamps.build = t.elapsed().as_secs_f64();
     stamps.build_marks = crate::tables::trace_builder::build_stamps::take();

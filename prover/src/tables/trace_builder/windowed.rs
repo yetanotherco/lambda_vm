@@ -953,8 +953,6 @@ impl<'a> WindowedTraceBuilder<'a> {
             &decode,
             register_state,
             &max_rows,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
             private_input,
             true,
             false,
@@ -1028,8 +1026,6 @@ impl<'a> WindowedTraceBuilder<'a> {
             &decode,
             register_state,
             &max_rows,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
             private_input,
             true,
             false,

@@ -104,15 +104,9 @@ fn vm_round_trip_elf(
         .expect("executor")
         .run()
         .expect("runs");
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &result.logs,
-        &MaxRowsConfig::default(),
-        &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("traces");
+    let mut traces =
+        Traces::from_elf_and_logs(&program, &result.logs, &MaxRowsConfig::default(), &[])
+            .expect("traces");
     drop(result);
     let table_counts = traces.table_counts();
     let runtime_page_ranges = traces.runtime_page_ranges();

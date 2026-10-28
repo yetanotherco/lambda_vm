@@ -2973,15 +2973,7 @@ fn test_debug_memory_tokens_sb_sh() {
     use std::collections::HashMap;
 
     let (elf, logs, _instructions) = run_asm_elf("test_sb_sh_8");
-    let traces = Traces::from_elf_and_logs(
-        &elf,
-        &logs,
-        &Default::default(),
-        &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let traces = Traces::from_elf_and_logs(&elf, &logs, &Default::default(), &[]).unwrap();
 
     println!("DEBUG: test_sb_sh_8 Memory bus tokens (FULL)");
     println!(
@@ -4263,8 +4255,6 @@ fn test_prove_first_epoch_without_halt() {
         &[],
         false,
         false,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
     )
     .unwrap();
 
@@ -4352,8 +4342,6 @@ fn test_prove_second_epoch_from_snapshot() {
         &[],
         false,
         false,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
     )
     .unwrap();
 
@@ -4443,8 +4431,6 @@ fn test_epoch_proof_commits_l2g() {
         &[],
         false,
         false,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
     )
     .unwrap();
 
@@ -4610,8 +4596,6 @@ fn test_continuation_pipeline_end_to_end() {
             &[],
             is_final,
             false,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
         )
         .unwrap();
 
@@ -4747,8 +4731,6 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
         &[],
         false,
         true,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
     )
     .unwrap();
     let initial_memory: HashMap<u64, u64> = image.iter().map(|(&a, &v)| (a, v as u64)).collect();

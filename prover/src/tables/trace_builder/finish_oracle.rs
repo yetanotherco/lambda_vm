@@ -51,7 +51,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     decode_table: &DecodeTable,
     mut register_state: RegisterState,
     max_rows: &crate::tables::MaxRowsConfig,
-    #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     private_input: &[u8],
     is_final: bool,
     l2g_memory_bookend: bool,
@@ -579,9 +578,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     // A packing build writes each table packed as it generates it where the
     // generator can (G-pack, `StreamSkip::gpack`); `packed_by` then finds it
     // packed.
-    #[cfg(feature = "disk-spill")]
-    let gpack = pack && skip.gpack && storage_mode != StorageMode::Disk;
-    #[cfg(not(feature = "disk-spill"))]
     let gpack = pack && skip.gpack;
     let form = if gpack {
         TraceForm::Narrow
@@ -598,8 +594,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             packed_by(pack, |ops| {
                 cpu::generate_cpu_trace_as(ops, decode_table, form)
             }),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     };
     let gen_memws = || {
@@ -610,8 +604,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             skip.tails,
             true,
             packed_by(pack, |ops| memw::generate_memw_trace_as(ops, form)),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     };
     let gen_memw_aligneds = || {
@@ -624,8 +616,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             packed_by(pack, |ops| {
                 memw_aligned::generate_memw_aligned_trace_as(ops, form)
             }),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     };
     let gen_memw_registers = || {
@@ -640,8 +630,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             packed_by(pack, |ops| {
                 memw_register::generate_memw_register_trace_from_rows_as(ops, form)
             }),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     };
     let gen_loads = || {
@@ -652,8 +640,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             skip.tails,
             true,
             packed_by(pack, |ops| load::generate_load_trace_as(ops, form)),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     };
     let gen_lts = || {
@@ -664,8 +650,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             skip.tails,
             true,
             packed_by(pack, |ops| lt::generate_lt_trace_as(ops, form)),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     };
     let gen_shifts = || {
@@ -676,8 +660,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             skip.tails,
             true,
             packed_by(pack, |ops| shift::generate_shift_trace_as(ops, form)),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     };
     let gen_muls = || {
@@ -688,8 +670,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             false,
             true,
             packed_by(pack, |ops| mul::generate_mul_trace_as(ops, form)),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     };
     let gen_dvrms = || {
@@ -700,8 +680,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             false,
             true,
             packed_by(pack, |ops| dvrm::generate_dvrm_trace_as(ops, form)),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     };
     let gen_branches = || {
@@ -712,8 +690,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             false,
             true,
             packed_by(pack, |ops| branch::generate_branch_trace_as(ops, form)),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     };
     // Auxiliary ALU / memory / CPU32 dispatch chips, each filtered out of the CPU
@@ -726,8 +702,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             false,
             true,
             packed_by(pack, |ops| eq::generate_eq_trace_as(ops, form)),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     };
     let gen_bytewises = || {
@@ -738,8 +712,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             false,
             true,
             packed_by(pack, |ops| bytewise::generate_bytewise_trace_as(ops, form)),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     };
     let gen_stores = || {
@@ -750,8 +722,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             skip.tails,
             true,
             packed_by(pack, |ops| store::generate_store_trace_as(ops, form)),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     };
     let gen_cpu32s = || {
@@ -762,8 +732,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             false,
             true,
             packed_by(pack, |ops| cpu32::generate_cpu32_trace_as(ops, form)),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     };
     let gen_bitwise = || {
@@ -794,12 +762,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
                 copy::generate_copy_rows_as,
             );
         }
-        generate_optional(
-            &copy_ops.whole(),
-            copy::generate_copy_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
+        generate_optional(&copy_ops.whole(), copy::generate_copy_trace)
     };
     let gen_keccaks = || {
         if skip.keccak_rows > 0 {
@@ -813,12 +776,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
                 keccak::generate_keccak_rows_as,
             );
         }
-        generate_optional(
-            &keccak_ops.whole(),
-            keccak::generate_keccak_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
+        generate_optional(&keccak_ops.whole(), keccak::generate_keccak_trace)
     };
     let gen_keccak_rnds = || {
         let keccak_rnd_ops: Vec<KeccakRoundOperation> = keccak_ops
@@ -831,12 +789,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             .collect();
         if skip.keccak_rnd_rows == 0 {
             // Whole, it may be cut after the build: it stays wide.
-            return generate_optional(
-                &keccak_rnd_ops,
-                keccak_rnd::generate_keccak_rnd_trace,
-                #[cfg(feature = "disk-spill")]
-                storage_mode,
-            );
+            return generate_optional(&keccak_rnd_ops, keccak_rnd::generate_keccak_rnd_trace);
         }
         keccak_rnd_chunks(
             &keccak_rnd_ops,
@@ -902,12 +855,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
                 ecsm::generate_ecsm_rows_as,
             );
         }
-        generate_optional(
-            &ecsm_ops.whole(),
-            ecsm::generate_ecsm_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
+        generate_optional(&ecsm_ops.whole(), ecsm::generate_ecsm_trace)
     };
     let gen_ecdases = || {
         if skip.ecdas_rows > 0 {
@@ -923,23 +871,16 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
                 },
             );
         }
-        generate_optional(
-            &ecdas_ops.whole(),
-            |rows| {
-                let num_rows = rows.len().next_power_of_two().max(4);
-                ecdas::generate_ecdas_rows_of(rows, num_rows, TraceForm::Wide, ecdas::widen)
-            },
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
+        generate_optional(&ecdas_ops.whole(), |rows| {
+            let num_rows = rows.len().next_power_of_two().max(4);
+            ecdas::generate_ecdas_rows_of(rows, num_rows, TraceForm::Wide, ecdas::widen)
+        })
     };
     // HINT table. Absent entirely for programs that make no hint ecalls.
     let gen_hints = || {
         generate_optional(
             &hint_ops.whole(),
             packed_by(pack, |ops| hint::generate_hint_trace_as(ops, form)),
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
         )
     };
 
@@ -957,9 +898,6 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     let (mut ecsms_slot, mut ecdases_slot) = (None, None);
     let mut hints_slot = None;
 
-    #[cfg(feature = "disk-spill")]
-    let sequential = storage_mode == StorageMode::Disk || cfg!(not(feature = "parallel"));
-    #[cfg(not(feature = "disk-spill"))]
     let sequential = cfg!(not(feature = "parallel"));
 
     if !sequential {
@@ -1067,39 +1005,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     let ecsms = ecsms_slot.expect(PHASE5_RAN)?;
     let ecdases = ecdases_slot.expect(PHASE5_RAN)?;
     let hints = hints_slot.expect(PHASE5_RAN)?;
-    let is_whs = generate_optional(
-        &is_wh_rows,
-        packed_by(pack, is_wh::generate_is_wh_trace),
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-
-    // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
-    // so spill them here before returning.
-    #[cfg(feature = "disk-spill")]
-    if storage_mode == StorageMode::Disk {
-        bitwise
-            .main_table
-            .spill_to_disk()
-            .map_err(|e| Error::Prover(format!("disk-spill bitwise: {e}")))?;
-        decode
-            .main_table
-            .spill_to_disk()
-            .map_err(|e| Error::Prover(format!("disk-spill decode: {e}")))?;
-        register_trace
-            .main_table
-            .spill_to_disk()
-            .map_err(|e| Error::Prover(format!("disk-spill register: {e}")))?;
-        halt_trace
-            .main_table
-            .spill_to_disk()
-            .map_err(|e| Error::Prover(format!("disk-spill halt: {e}")))?;
-        for page in &mut pages {
-            page.main_table
-                .spill_to_disk()
-                .map_err(|e| Error::Prover(format!("disk-spill page: {e}")))?;
-        }
-    }
+    let is_whs = generate_optional(&is_wh_rows, packed_by(pack, is_wh::generate_is_wh_trace))?;
 
     // Continuation callers derive the real cross-epoch boundary from this set and
     // install its L2G trace after provenance is applied. Avoid building a

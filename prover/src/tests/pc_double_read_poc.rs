@@ -270,8 +270,6 @@ impl Crafted {
         let proof = crate::hash_pin::BlockProver::multi_prove(
             airs.air_trace_pairs(&mut self.traces),
             &mut transcript,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
             stark::residency_mode::ResidencyMode::Retain,
         )
         .map(|proof| VmProof {

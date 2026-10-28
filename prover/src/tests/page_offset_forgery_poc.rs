@@ -155,15 +155,8 @@ fn craft_proof(
     let result = executor.run().expect("run");
 
     let max_rows = MaxRowsConfig::default();
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &result.logs,
-        &max_rows,
-        private_inputs,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("trace build");
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, &max_rows, private_inputs)
+        .expect("trace build");
 
     match forge {
         Some(Tamper::RepointPrivateRow(f)) => apply_forge(&mut traces, &f),
@@ -216,8 +209,6 @@ fn craft_proof(
     let proof = crate::hash_pin::BlockProver::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
         stark::residency_mode::ResidencyMode::Retain,
     )?;
 
@@ -648,15 +639,8 @@ fn craft_proof_with_duplicate_page(
     let result = executor.run().expect("run");
 
     let max_rows = MaxRowsConfig::default();
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &result.logs,
-        &max_rows,
-        &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("trace build");
+    let mut traces =
+        Traces::from_elf_and_logs(&program, &result.logs, &max_rows, &[]).expect("trace build");
 
     inject_duplicate_zero_page(&mut traces, dup_base, consume);
 
@@ -727,8 +711,6 @@ fn craft_proof_with_duplicate_page(
     let proof = crate::hash_pin::BlockProver::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
         stark::residency_mode::ResidencyMode::Retain,
     )
     // The injected duplicate page writes only FINI, a main-trace column, and every

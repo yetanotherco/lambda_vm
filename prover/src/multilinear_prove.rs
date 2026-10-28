@@ -303,14 +303,7 @@ pub fn prove_with_options_and_inputs(
         .run()
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &result.logs,
-        max_rows,
-        private_inputs,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )?;
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows, private_inputs)?;
     drop(result);
 
     let table_counts = traces.table_counts();

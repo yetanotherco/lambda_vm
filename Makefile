@@ -890,7 +890,6 @@ check:
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
-	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill -- -D warnings -A clippy::op_ref
 	# BLAKE3 at SEVEN rounds — the standard, externally anchored arm.
 	#
 	# This pass used to be the six-round one. Six is the default now (P-a Stage 6
@@ -927,7 +926,6 @@ lint:
 	cargo fmt --check --all
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
-	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill -- -D warnings -A clippy::op_ref
 	# BLAKE3 at SEVEN rounds — the standard, externally anchored arm.
 	#
 	# This pass used to be the six-round one. Six is the default now (P-a Stage 6

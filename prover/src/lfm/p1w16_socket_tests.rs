@@ -468,8 +468,6 @@ fn socket_prove_cost_on_the_card() {
         crate::hash_pin::BlockProver::<Gl, Gl3, ()>::multi_prove(
             vec![(air, &mut trace, &())],
             &mut transcript,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
             ResidencyMode::Retain,
         )
         .expect("the bench table proves");

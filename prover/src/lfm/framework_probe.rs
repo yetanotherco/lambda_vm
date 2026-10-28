@@ -129,8 +129,6 @@ fn prove(
     crate::hash_pin::BlockProver::multi_prove(
         pairs,
         &mut t,
-        #[cfg(feature = "disk-spill")]
-        Default::default(),
         stark::residency_mode::ResidencyMode::Retain,
     )
 }
@@ -211,8 +209,6 @@ fn b0_tampered_witness_value_breaks_balance() {
     let proof = crate::hash_pin::BlockProver::multi_prove(
         pairs,
         &mut t,
-        #[cfg(feature = "disk-spill")]
-        Default::default(),
         stark::residency_mode::ResidencyMode::Retain,
     )
     .expect("locally consistent");

@@ -283,8 +283,6 @@ fn the_kept_tree_depth_moves_no_byte_of_the_proof() {
         &logs,
         &MaxRowsConfig::small(),
         &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
     )
     .expect("the traces build");
     block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default()).expect("the split");
@@ -343,8 +341,6 @@ fn narrow_storage_moves_no_byte_of_the_proof() {
         &logs,
         &MaxRowsConfig::small(),
         &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
     )
     .expect("the traces build");
     block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default()).expect("the split");
@@ -419,8 +415,6 @@ fn uploading_ahead_moves_no_byte_of_the_proof() {
         &logs,
         &MaxRowsConfig::small(),
         &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
     )
     .expect("the traces build");
     block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default()).expect("the split");
@@ -1059,8 +1053,6 @@ fn a_packed_table_with_a_wrong_preprocessed_column_is_refused() {
         &logs,
         &MaxRowsConfig::small(),
         &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
     )
     .expect("the traces build");
     let opts = ProofOptions::default_test_options();
@@ -4109,8 +4101,6 @@ fn split_traces(
         &logs,
         &MaxRowsConfig::default(),
         &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
     )
     .expect("the traces build");
     block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default()).expect("the split");
