@@ -39,15 +39,21 @@ fn parse_expr(v: &Value) -> Expr {
     match v["type"].as_str().expect("expr type") {
         "var" => Expr::Var(v["index"].as_u64().expect("var index") as usize),
         "const" => Expr::Const(v["value"].as_u64().expect("const value")),
-        "add" => Expr::Add(Box::new(parse_expr(&v["lhs"])), Box::new(parse_expr(&v["rhs"]))),
-        "mul" => Expr::Mul(Box::new(parse_expr(&v["lhs"])), Box::new(parse_expr(&v["rhs"]))),
+        "add" => Expr::Add(
+            Box::new(parse_expr(&v["lhs"])),
+            Box::new(parse_expr(&v["rhs"])),
+        ),
+        "mul" => Expr::Mul(
+            Box::new(parse_expr(&v["lhs"])),
+            Box::new(parse_expr(&v["rhs"])),
+        ),
         other => panic!("unknown expression node {other}"),
     }
 }
 
 fn eval(e: &Expr, row: &[FE]) -> FE {
     match e {
-        Expr::Var(i) => row[*i].clone(),
+        Expr::Var(i) => row[*i],
         Expr::Const(c) => FE::from(*c),
         Expr::Add(a, b) => eval(a, row) + eval(b, row),
         Expr::Mul(a, b) => eval(a, row) * eval(b, row),
@@ -67,7 +73,10 @@ struct LeanCircuit {
 }
 
 fn load_lean(name: &str) -> LeanCircuit {
-    let path = format!("{}/../formal/export/{name}.json", env!("CARGO_MANIFEST_DIR"));
+    let path = format!(
+        "{}/../formal/export/{name}.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
     let json: Value = serde_json::from_str(&text).expect("json");
     let columns = json["columns"].as_u64().expect("columns") as usize;
@@ -80,13 +89,22 @@ fn load_lean(name: &str) -> LeanCircuit {
             interacts.push(LeanInteract {
                 channel: i["channel"].as_str().expect("channel").to_string(),
                 mult: parse_expr(&i["multiplicity"]),
-                msg: i["message"].as_array().expect("message").iter().map(parse_expr).collect(),
+                msg: i["message"]
+                    .as_array()
+                    .expect("message")
+                    .iter()
+                    .map(parse_expr)
+                    .collect(),
             });
         } else {
             panic!("unexpected operation {op}");
         }
     }
-    LeanCircuit { columns, asserts, interacts }
+    LeanCircuit {
+        columns,
+        asserts,
+        interacts,
+    }
 }
 
 /// Clean channel name → Lambda VM `BusId` (see `tables/types.rs`).
@@ -110,7 +128,7 @@ fn bus_id_of(channel: &str) -> u64 {
 // =============================================================================
 
 fn multiplicity_at(m: &Multiplicity, row: &[FE]) -> FE {
-    let col = |c: usize| row[c].clone();
+    let col = |c: usize| row[c];
     match m {
         Multiplicity::One => FE::one(),
         Multiplicity::Column(c) => col(*c),
@@ -122,12 +140,14 @@ fn multiplicity_at(m: &Multiplicity, row: &[FE]) -> FE {
             let mut acc = FE::zero();
             for t in terms {
                 match *t {
-                    LinearTerm::Column { coefficient, column } => {
-                        acc += col(column) * FE::from(coefficient)
-                    }
-                    LinearTerm::ColumnUnsigned { coefficient, column } => {
-                        acc += col(column) * FE::from(coefficient)
-                    }
+                    LinearTerm::Column {
+                        coefficient,
+                        column,
+                    } => acc += col(column) * FE::from(coefficient),
+                    LinearTerm::ColumnUnsigned {
+                        coefficient,
+                        column,
+                    } => acc += col(column) * FE::from(coefficient),
                     LinearTerm::Constant(v) => acc += FE::from(v),
                 }
             }
@@ -142,12 +162,20 @@ fn multiplicity_at(m: &Multiplicity, row: &[FE]) -> FE {
 fn rust_interaction_at(i: &BusInteraction, row: &[FE]) -> (u64, FE, Vec<FE>) {
     let m = multiplicity_at(&i.multiplicity, row);
     let m = if i.is_sender { -m } else { m };
-    let elems = i.values.iter().flat_map(|v| v.combine_from(|c| row[c].clone())).collect();
+    let elems = i
+        .values
+        .iter()
+        .flat_map(|v| v.combine_from(|c| row[c]))
+        .collect();
     (i.bus_id, m, elems)
 }
 
 fn lean_interaction_at(i: &LeanInteract, row: &[FE]) -> (u64, FE, Vec<FE>) {
-    (bus_id_of(&i.channel), eval(&i.mult, row), i.msg.iter().map(|e| eval(e, row)).collect())
+    (
+        bus_id_of(&i.channel),
+        eval(&i.mult, row),
+        i.msg.iter().map(|e| eval(e, row)).collect(),
+    )
 }
 
 // =============================================================================
@@ -167,7 +195,9 @@ impl SplitMix64 {
 
 fn random_rows(num_cols: usize, seed: u64) -> Vec<Vec<FE>> {
     let mut rng = SplitMix64(seed);
-    (0..TRIALS).map(|_| (0..num_cols).map(|_| FE::from(rng.next_u64())).collect()).collect()
+    (0..TRIALS)
+        .map(|_| (0..num_cols).map(|_| FE::from(rng.next_u64())).collect())
+        .collect()
 }
 
 /// Greedy multiset matching of fingerprints; returns the unmatched indices on each side.
@@ -222,8 +252,13 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
         .iter()
         .map(|e| rows.iter().map(|r| fp(&eval(e, r))).collect())
         .collect();
-    let rust_fp: Vec<Vec<u64>> =
-        (0..n).map(|i| rows.iter().map(|r| fp(&eval_program_base(&prog, i, r))).collect()).collect();
+    let rust_fp: Vec<Vec<u64>> = (0..n)
+        .map(|i| {
+            rows.iter()
+                .map(|r| fp(&eval_program_base(&prog, i, r)))
+                .collect()
+        })
+        .collect();
     let (lean_asserts_unmatched, rust_constraints_unmatched) = unmatched(&lean_fp, &rust_fp);
 
     let lean_ifp: Vec<(u64, Vec<u64>, Vec<Vec<u64>>)> = lean
@@ -250,16 +285,27 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
         })
         .collect();
     let (li, ri) = unmatched(&lean_ifp, &rust_ifp);
-    let lean_interacts_unmatched = li.iter().map(|&i| lean.interacts[i].channel.clone()).collect();
+    let lean_interacts_unmatched = li
+        .iter()
+        .map(|&i| lean.interacts[i].channel.clone())
+        .collect();
     let rust_interacts_unmatched = ri.iter().map(|&j| interactions[j].bus_id).collect();
 
     // Every Lean constraint vanishes on the honest trace.
     for (r, row) in honest_rows.iter().enumerate() {
         for (i, e) in lean.asserts.iter().enumerate() {
-            assert_eq!(eval(e, row), FE::zero(), "[{label}] Lean assert {i} on honest row {r}");
+            assert_eq!(
+                eval(e, row),
+                FE::zero(),
+                "[{label}] Lean assert {i} on honest row {r}"
+            );
         }
         for i in 0..n {
-            assert_eq!(eval_program_base(&prog, i, row), FE::zero(), "[{label}] Rust constraint {i} on honest row {r}");
+            assert_eq!(
+                eval_program_base(&prog, i, row),
+                FE::zero(),
+                "[{label}] Rust constraint {i} on honest row {r}"
+            );
         }
     }
 
@@ -272,7 +318,10 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
     );
     println!(
         "[{label}] unmatched Lean asserts {:?}, unmatched Rust constraints {:?}, unmatched Lean interactions {:?}, unmatched Rust interactions (bus ids) {:?}",
-        lean_asserts_unmatched, rust_constraints_unmatched, lean_interacts_unmatched, rust_interacts_unmatched
+        lean_asserts_unmatched,
+        rust_constraints_unmatched,
+        lean_interacts_unmatched,
+        rust_interacts_unmatched
     );
     Report {
         lean_asserts_unmatched,
@@ -284,11 +333,20 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
 
 fn rows_of(trace: &stark::trace::TraceTable<Gl, Gl3>, num_cols: usize) -> Vec<Vec<FE>> {
     (0..trace.num_rows())
-        .map(|r| (0..num_cols).map(|c| trace.main_table.get(r, c).clone()).collect())
+        .map(|r| (0..num_cols).map(|c| *trace.main_table.get(r, c)).collect())
         .collect()
 }
 
-const EDGE: [u64; 8] = [0, 1, 0xFF, 0xFFFF, 0x7FFF_FFFF_FFFF_FFFF, 0x8000_0000_0000_0000, u64::MAX - 1, u64::MAX];
+const EDGE: [u64; 8] = [
+    0,
+    1,
+    0xFF,
+    0xFFFF,
+    0x7FFF_FFFF_FFFF_FFFF,
+    0x8000_0000_0000_0000,
+    u64::MAX - 1,
+    u64::MAX,
+];
 
 // =============================================================================
 // Tables
@@ -296,7 +354,9 @@ const EDGE: [u64; 8] = [0, 1, 0xFF, 0xFFFF, 0x7FFF_FFFF_FFFF_FFFF, 0x8000_0000_0
 
 #[test]
 fn lean_diff_lt() {
-    use crate::tables::lt::{LtConstraints, LtOperation, bus_interactions, cols, generate_lt_trace};
+    use crate::tables::lt::{
+        LtConstraints, LtOperation, bus_interactions, cols, generate_lt_trace,
+    };
     let mut rng = SplitMix64(0x17);
     let mut ops = Vec::new();
     for &a in &EDGE {
@@ -327,15 +387,31 @@ fn lean_diff_lt() {
     );
     // Known deltas: the Lean model keeps `μ·(μ − 1) = 0` (spec: `μ : Bit`), the Rust chip bounds
     // `μ` with the `ARE_BYTES[μ, 0]` send instead (PR #1016).
-    assert_eq!(report.lean_asserts_unmatched.len(), 1, "[LT] only the μ bit constraint should be Lean-only");
-    assert!(report.rust_constraints_unmatched.is_empty(), "[LT] Rust-only constraints");
-    assert!(report.lean_interacts_unmatched.is_empty(), "[LT] Lean-only interactions");
-    assert_eq!(report.rust_interacts_unmatched, vec![0], "[LT] only ARE_BYTES[μ, 0] should be Rust-only");
+    assert_eq!(
+        report.lean_asserts_unmatched.len(),
+        1,
+        "[LT] only the μ bit constraint should be Lean-only"
+    );
+    assert!(
+        report.rust_constraints_unmatched.is_empty(),
+        "[LT] Rust-only constraints"
+    );
+    assert!(
+        report.lean_interacts_unmatched.is_empty(),
+        "[LT] Lean-only interactions"
+    );
+    assert_eq!(
+        report.rust_interacts_unmatched,
+        vec![0],
+        "[LT] only ARE_BYTES[μ, 0] should be Rust-only"
+    );
 }
 
 #[test]
 fn lean_diff_eq() {
-    use crate::tables::eq::{EqConstraints, EqOperation, bus_interactions, cols, generate_eq_trace};
+    use crate::tables::eq::{
+        EqConstraints, EqOperation, bus_interactions, cols, generate_eq_trace,
+    };
     let mut rng = SplitMix64(0xE0);
     let mut ops = Vec::new();
     for &a in &EDGE {
@@ -347,7 +423,11 @@ fn lean_diff_eq() {
     }
     for _ in 0..256 {
         let a = rng.next_u64();
-        let b = if rng.next_u64() & 1 == 1 { a } else { rng.next_u64() };
+        let b = if rng.next_u64() & 1 == 1 {
+            a
+        } else {
+            rng.next_u64()
+        };
         ops.push(EqOperation::new(a, b, rng.next_u64() & 1 == 1));
     }
     let trace = generate_eq_trace(&ops);
@@ -359,17 +439,42 @@ fn lean_diff_eq() {
         cols::NUM_COLUMNS,
         &rows_of(&trace, cols::NUM_COLUMNS),
     );
-    assert!(report.lean_asserts_unmatched.is_empty() && report.rust_constraints_unmatched.is_empty(), "[EQ] constraints differ");
-    assert!(report.lean_interacts_unmatched.is_empty() && report.rust_interacts_unmatched.is_empty(), "[EQ] interactions differ");
+    assert!(
+        report.lean_asserts_unmatched.is_empty() && report.rust_constraints_unmatched.is_empty(),
+        "[EQ] constraints differ"
+    );
+    assert!(
+        report.lean_interacts_unmatched.is_empty() && report.rust_interacts_unmatched.is_empty(),
+        "[EQ] interactions differ"
+    );
 }
 
 #[test]
 fn lean_diff_shift() {
-    use crate::tables::shift::{ShiftConstraints, ShiftOperation, bus_interactions, cols, generate_shift_trace};
+    use crate::tables::shift::{
+        ShiftConstraints, ShiftOperation, bus_interactions, cols, generate_shift_trace,
+    };
     let mut rng = SplitMix64(0x5F);
     let mut ops = Vec::new();
     for &v in &EDGE {
-        for s in [0u64, 1, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64, 65, 255, 256, u64::MAX] {
+        for s in [
+            0u64,
+            1,
+            15,
+            16,
+            17,
+            31,
+            32,
+            33,
+            47,
+            48,
+            63,
+            64,
+            65,
+            255,
+            256,
+            u64::MAX,
+        ] {
             for direction in [false, true] {
                 for signed in [false, true] {
                     for word in [false, true] {
@@ -397,6 +502,12 @@ fn lean_diff_shift() {
         cols::NUM_COLUMNS,
         &rows_of(&trace, cols::NUM_COLUMNS),
     );
-    assert!(report.lean_asserts_unmatched.is_empty() && report.rust_constraints_unmatched.is_empty(), "[SHIFT] constraints differ");
-    assert!(report.lean_interacts_unmatched.is_empty() && report.rust_interacts_unmatched.is_empty(), "[SHIFT] interactions differ");
+    assert!(
+        report.lean_asserts_unmatched.is_empty() && report.rust_constraints_unmatched.is_empty(),
+        "[SHIFT] constraints differ"
+    );
+    assert!(
+        report.lean_interacts_unmatched.is_empty() && report.rust_interacts_unmatched.is_empty(),
+        "[SHIFT] interactions differ"
+    );
 }
