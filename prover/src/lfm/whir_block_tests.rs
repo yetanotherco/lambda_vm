@@ -3128,6 +3128,35 @@ fn the_whir_block_tree_on_a_real_block() {
         t.elapsed().as_secs_f64()
     );
     assert!(ok, "the block proof must verify");
+    // Off the clock: the top's rows and padded heights by chip, emitted again
+    // from its children's shapes, and its LANES rows against 2^19 — the chips a
+    // wider top must keep under the LFM proofs' bits bound.
+    {
+        use super::airs::{LFM_CHIP_NAMES, NUM_LFM_CHIPS};
+        use super::whir_chain::ChipRows;
+        let children = plan.levels().last().map_or(1, |level| level.arities[0]);
+        let below = &proofs[proofs.len() - 1 - children..proofs.len() - 1];
+        let words = plan.child_layout().total();
+        let derived: Vec<DerivedChild> = below
+            .iter()
+            .map(|(artifacts, _)| super::whir_block::derived_of(artifacts, &wrap, words))
+            .collect::<Result<_, _>>()
+            .expect("the top's children's shapes");
+        let top = plan
+            .node_program(&derived.iter().collect::<Vec<_>>(), true)
+            .expect("the top emits again");
+        let rows = ChipRows::of(&top);
+        let heights = &proofs.last().expect("a top").0.log_heights;
+        let padded: Vec<String> = (0..NUM_LFM_CHIPS)
+            .map(|c| format!("{}=2^{}", LFM_CHIP_NAMES[c], heights[c]))
+            .collect();
+        println!(
+            "W3 TOP ROWS: {children} children · {rows:?} · lanes {} / 2^19 = {:.1} % · padded {}",
+            rows.lanes,
+            100.0 * rows.lanes as f64 / (1u64 << 19) as f64,
+            padded.join(" ")
+        );
+    }
     let t = std::time::Instant::now();
     // The production verifier when the run is at its pinned presets, given the
     // run's group opening (`LAMBDA_VM_WHIR_GROUP`) as the CLI's `verify-block
