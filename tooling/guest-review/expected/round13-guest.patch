@@ -1,0 +1,64 @@
+diff --git a/vendor/ethrex/crates/vm/levm/src/vm.rs b/vendor/ethrex/crates/vm/levm/src/vm.rs
+index 7d4359d8..452963b8 100644
+--- a/vendor/ethrex/crates/vm/levm/src/vm.rs
++++ b/vendor/ethrex/crates/vm/levm/src/vm.rs
+@@ -161,18 +161,49 @@ impl Substate {
+             let mut delta = mem::take(parent);
+             mem::swap(self, &mut delta);
+ 
+-            self.selfdestruct_set.extend(delta.selfdestruct_set);
+-            self.accessed_addresses.extend(delta.accessed_addresses);
+-            for (address, slot_set) in delta.accessed_storage_slots {
+-                self.accessed_storage_slots
+-                    .entry(address)
+-                    .or_default()
+-                    .extend(slot_set);
++            // An empty destination can take ownership of the child collection.
++            // This avoids allocating and rehashing entries during checkpoint merges.
++            if self.selfdestruct_set.is_empty() {
++                self.selfdestruct_set = delta.selfdestruct_set;
++            } else {
++                self.selfdestruct_set.extend(delta.selfdestruct_set);
++            }
++            if self.accessed_addresses.is_empty() {
++                self.accessed_addresses = delta.accessed_addresses;
++            } else {
++                self.accessed_addresses.extend(delta.accessed_addresses);
++            }
++            if self.accessed_storage_slots.is_empty() {
++                self.accessed_storage_slots = delta.accessed_storage_slots;
++            } else {
++                for (address, slot_set) in delta.accessed_storage_slots {
++                    match self.accessed_storage_slots.entry(address) {
++                        std::collections::hash_map::Entry::Occupied(mut entry) => {
++                            entry.get_mut().extend(slot_set);
++                        }
++                        std::collections::hash_map::Entry::Vacant(entry) => {
++                            // Keep the existing slot table when this address is new.
++                            entry.insert(slot_set);
++                        }
++                    }
++                }
++            }
++            if self.created_accounts.is_empty() {
++                self.created_accounts = delta.created_accounts;
++            } else {
++                self.created_accounts.extend(delta.created_accounts);
+             }
+-            self.created_accounts.extend(delta.created_accounts);
+             self.refunded_gas = delta.refunded_gas;
+-            self.transient_storage.extend(delta.transient_storage);
+-            self.logs.extend(delta.logs);
++            if self.transient_storage.is_empty() {
++                self.transient_storage = delta.transient_storage;
++            } else {
++                self.transient_storage.extend(delta.transient_storage);
++            }
++            if self.logs.is_empty() {
++                self.logs = delta.logs;
++            } else {
++                self.logs.extend(delta.logs);
++            }
+         }
+     }
+ 

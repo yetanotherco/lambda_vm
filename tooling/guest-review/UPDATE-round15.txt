@@ -1,0 +1,31 @@
+Update to the Mauro review branch: rounds 13 through 15
+
+Branch: perf/guest-riscv-round12 (same shared URL; now includes round 15).
+Previous remote tip: 396378ff0fa319bb920fbb26778292fd332966ba.
+
+Changes since the previous published version:
+- Reuse child substate collections on checkpoint commit when destinations are empty.
+- Construct trie branch children directly in their final allocation during deserialization.
+- Prove eligible JUMPDEST positions locally from the preceding 32 bytes; fall back
+  to scanning on uncertainty and preserve the contiguous-prefix cursor.
+
+Fixture | published round12 | round15 | instructions saved | reduction | COPY rows before -> after
+ethrex_10_transfers.bin | 732397 | 721587 | 10810 | 1.48% | 55381 -> 55379
+ethrex_bench_4.bin | 515703 | 502835 | 12868 | 2.50% | 46390 -> 46388
+ethrex_empty_block.bin | 195901 | 186729 | 9172 | 4.68% | 13597 -> 13595
+ethrex_mainnet_25368371.bin | 16131088 | 15272897 | 858191 | 5.32% | 534311 -> 529544
+ethrex_mainnet_25453112.bin | 30326172 | 29043403 | 1282769 | 4.23% | 969971 -> 961155
+ethrex_simple_tx.bin | 288861 | 278051 | 10810 | 3.74% | 33963 -> 33961
+
+Validation: 35 native tests, four Keccak tests, 13,344 reference digest vectors,
+RISC-V checks including 1,440 additional jump-validation cases, memcmp checks,
+and eight malformed-input rejections. All six public outputs match original
+native ethrex. See validation/RESULTS.txt and validation/results.json.
+
+Publication preparation rechecked source, fixture, ELF and evidence hashes.
+The production files are byte-identical to the fully validated round-15 files.
+The historical validation record describes the pre-commit worktree accurately.
+Only this update note and the README branch label were added for publication.
+
+Reproduce: python3 tooling/guest-review/verify.py
+These are RISC-V instruction counts, not GPU proving-time measurements.

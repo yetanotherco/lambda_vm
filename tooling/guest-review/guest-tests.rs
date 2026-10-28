@@ -34,6 +34,7 @@ pub fn main() {
     check_trie();
     check_stack();
     check_scanner();
+    check_local_jump_validation();
     for lhs in [0u64, 1, 2, 255, u32::MAX as u64, u64::MAX] {
         for rhs in [0u64, 1, 2, 3, u32::MAX as u64, u64::MAX] {
             assert_eq!(div_with_u64_fast_path(black_box(lhs.into()), black_box(rhs.into())),
@@ -78,7 +79,7 @@ pub fn main() {
         }
     }
     // Output only after every assertion has completed inside the pinned RV64 VM.
-    lambda_vm_syscalls::syscalls::commit(b"R12CHECK");
+    lambda_vm_syscalls::syscalls::commit(b"R15CHECK");
 }
 
 
@@ -301,6 +302,42 @@ fn check_zero_memory_words() {
                 memory.store_word(offset,black_box(value)).unwrap();
                 assert_eq!(&memory.live_bytes()[offset..offset+32],&value.to_big_endian());
                 assert_eq!(memory.load_word(offset).unwrap(),value);
+            }
+        }
+    }
+}
+
+
+// Check the local proof in the actual RV64 executor, including unaligned
+// windows, PUSH payloads, cached far destinations and later full analysis.
+fn check_local_jump_validation() {
+    use ethrex_common::types::Code;
+    for target in [64usize, 65, 128, 129, 600] {
+        for distance in 1..=32 {
+            let threshold = 0x5f + distance as u8;
+            for opcode in [0x00, 0x5b, 0x5f, 0x60, threshold - 1, threshold, 0x7f, 0x80, 0xff] {
+                let mut bytes = vec![0u8; 1100];
+                bytes[target - distance] = opcode;
+                bytes[target] = 0x5b;
+                bytes[1000] = 0x7f;
+                bytes[1010] = 0x5b;
+                bytes[1033] = 0x5b;
+                let mut expected = Vec::new();
+                let mut pc = 0;
+                while pc < bytes.len() {
+                    let op = bytes[pc];
+                    if op == 0x5b { expected.push(pc as u32); }
+                    pc += if (0x60..=0x7f).contains(&op) { op as usize - 0x5e } else { 1 };
+                }
+                let code = Code::from_bytecode_unchecked(bytes.into(), Default::default());
+                let clone = code.clone();
+                for probe in [target, 1033, 1010, target, target - distance, 0, usize::MAX] {
+                    let want = u32::try_from(probe).ok()
+                        .is_some_and(|p| expected.binary_search(&p).is_ok());
+                    assert_eq!(code.is_valid_jump_target(black_box(probe)), want);
+                    assert_eq!(clone.is_valid_jump_target(black_box(probe)), want);
+                }
+                assert_eq!(code.jump_targets(), expected);
             }
         }
     }

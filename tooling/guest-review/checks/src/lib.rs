@@ -264,3 +264,12 @@ mod round11;
 
 #[cfg(test)]
 mod round12;
+
+#[cfg(test)]
+mod round13;
+
+#[cfg(test)]
+mod round14;
+
+#[cfg(test)]
+mod round15;

@@ -29,8 +29,10 @@ struct JumpAnalysis {
 }
 #[derive(Debug, Default)]
 struct ProgressiveAnalysis {
-    // First opcode not yet analyzed. A PUSH may advance beyond logical EOF.
+    // First opcode not yet analyzed in the contiguous prefix. A PUSH may
+    // advance beyond logical EOF. Local proofs never advance this cursor.
     next_pc: usize,
+    // Proven valid destinations, including local proofs ahead of the prefix.
     words: Vec<u64>,
 }
 
@@ -163,7 +165,7 @@ impl Code {
     #[inline]
     pub fn is_valid_jump_target(&self, target: usize) -> bool {
         // Reject out-of-range and non-JUMPDEST positions before doing analysis.
-        if self.code().get(target) != Some(&0x5b) {
+        if target >= self.bytecode_len || self.bytecode.get(target) != Some(&0x5b) {
             return false;
         }
         if let Some(bitmap) = self.analysis.bitmap.get() {
@@ -173,6 +175,24 @@ impl Code {
         }
         let mut analysis = self.analysis.progressive.lock().unwrap();
         if analysis.next_pc <= target {
+            // For a sufficiently long missing prefix, a bounded local proof
+            // can be cheaper than scanning it. Short gaps use the normal scan.
+            if target - analysis.next_pc >= 64 {
+                // A positively validated destination can be cached ahead of the
+                // fully analyzed prefix. Never cache a negative shortcut result.
+                if analysis.words.get(target / 64)
+                    .is_some_and(|word| word & (1u64 << (target % 64)) != 0)
+                {
+                    return true;
+                }
+                if self.excludes_push_data(target) {
+                    if analysis.words.is_empty() {
+                        self.allocate_jump_words(&mut analysis);
+                    }
+                    analysis.words[target / 64] |= 1u64 << (target % 64);
+                    return true;
+                }
+            }
             self.analyze_through(&mut analysis, target);
         }
         analysis
@@ -188,6 +208,33 @@ impl Code {
         let mut analysis = self.analysis.progressive.lock().unwrap();
         self.analyze_through(&mut analysis, self.len() - 1);
         Arc::from(analysis.words.as_slice())
+    }
+
+    // A PUSH immediate spans at most 32 preceding bytes. For distance d,
+    // only opcodes in [0x5f + d, 0x7f] could cover this target. Reject even
+    // candidates that might themselves be immediate data: this conservative
+    // test only proves validity; uncertain cases use the ordinary scanner.
+    #[inline]
+    fn excludes_push_data(&self, target: usize) -> bool {
+        let window = &self.code()[target - 32..target];
+        const HIGH: u64 = 0x8080_8080_8080_8080;
+        macro_rules! clear_chunk {
+            ($offset:expr, $threshold:expr) => {{
+                let word = u64::from_le_bytes(window[$offset..$offset + 8].try_into().unwrap());
+                // Setting each high bit prevents inter-byte borrows. The
+                // result's high bit tests >= threshold; !word excludes >=128.
+                ((word | HIGH).wrapping_sub($threshold) & !word & HIGH) == 0
+            }};
+        }
+        clear_chunk!(24, 0x6061_6263_6465_6667)
+            && clear_chunk!(16, 0x6869_6a6b_6c6d_6e6f)
+            && clear_chunk!(8, 0x7071_7273_7475_7677)
+            && clear_chunk!(0, 0x7879_7a7b_7c7d_7e7f)
+    }
+
+    #[inline(never)]
+    fn allocate_jump_words(&self, analysis: &mut ProgressiveAnalysis) {
+        analysis.words.resize(self.len().div_ceil(64), 0);
     }
 
     // Scanning and allocation are rare once the queried prefix is cached.
@@ -215,7 +262,7 @@ impl Code {
                     if opcode == 0x5b {
                         let offset = cursor as usize - start as usize;
                         if analysis.words.is_empty() {
-                            analysis.words.resize(self.len().div_ceil(64), 0);
+                            self.allocate_jump_words(analysis);
                         }
                         analysis.words[offset / 64] |= 1u64 << (offset % 64);
                     }

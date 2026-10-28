@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rebuild this branch and require exact round-12 cycles, outputs and COPY counts."""
+"""Rebuild this branch and require exact round-15 cycles, outputs and COPY counts."""
 import argparse
 import hashlib
 import json
@@ -87,7 +87,7 @@ def main():
     counters = read_rows(OUT / 'logs/branch-copy.tsv')
     assert actual == read_rows(HERE / 'expected/final.tsv'), 'Cycle or public-output mismatch'
     assert counters == read_rows(HERE / 'expected/final-copy.tsv'), 'Accelerator counter mismatch'
-    print('All six fixtures exactly match round 12: instructions, outputs and counters.', flush=True)
+    print('All six fixtures exactly match round 15: instructions, outputs and counters.', flush=True)
 
     run([*cargo, 'test', '--release', '--locked', *offline, '--manifest-path',
          HERE / 'checks/Cargo.toml', '--target-dir', host], 'native-checks.log')
@@ -105,7 +105,7 @@ def main():
     with (OUT / 'logs/guest-validation-copy.tsv').open('w') as err:
         rv_result = subprocess.check_output([str(runner), str(rv), str(empty)], text=True, stderr=err)
     (OUT / 'logs/guest-validation.tsv').write_text(rv_result)
-    assert rv_result.strip().split('\t')[2] == b'R12CHECK'.hex(), rv_result
+    assert rv_result.strip().split('\t')[2] == b'R15CHECK'.hex(), rv_result
 
     guest = ROOT / 'executor/programs/rust/memcmp_validation'
     (guest / 'src').mkdir(parents=True, exist_ok=True)
@@ -142,7 +142,7 @@ codegen-units = 1
                            **{key: int(value) for key, value in (item.split('=') for item in counters[name])}}
                      for name, values in actual.items()},
         'rv_validation_instructions': int(rv_result.strip().split('\t')[1]),
-        'native_tests': 31, 'keccak_tests': 4, 'keccak_golden_vectors': len(vectors) // 40,
+        'native_tests': 35, 'keccak_tests': 4, 'keccak_golden_vectors': len(vectors) // 40,
         'guest_invalid_input_rejections': 8,
         'checks': 'passed: exact counts, native oracle, native tests, Keccak, RV guest, memcmp, invalid inputs',
     }

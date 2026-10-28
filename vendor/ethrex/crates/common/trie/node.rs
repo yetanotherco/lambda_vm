@@ -189,7 +189,8 @@ where
     }
 }
 
-#[inline(never)]
+// Construct the enum at the caller; keep pooling in the pointer-only helper.
+#[inline(always)]
 fn deserialize_shared_node_ref<D>(
     node: &rkyv::Archived<Arc<Node>>,
     deserializer: &mut D,
@@ -199,9 +200,22 @@ where
     D::Error: Source,
 {
     Ok(NodeRef::Node(
-        rkyv::Deserialize::deserialize(node, deserializer)?,
+        deserialize_shared_node(node, deserializer)?,
         OnceLock::new(),
     ))
+}
+
+// Return only the shared pointer so branch children can be constructed in place.
+#[inline(never)]
+fn deserialize_shared_node<D>(
+    node: &rkyv::Archived<Arc<Node>>,
+    deserializer: &mut D,
+) -> Result<Arc<Node>, D::Error>
+where
+    D: rkyv::rancor::Fallible + Pooling + ?Sized,
+    D::Error: Source,
+{
+    rkyv::Deserialize::deserialize(node, deserializer)
 }
 
 impl NodeRef {
@@ -510,10 +524,19 @@ where
         let choices = core::ptr::addr_of_mut!((*ptr).choices).cast::<NodeRef>();
         macro_rules! initialize_child {
             ($index:expr) => {{
-                choices.add($index).write(rkyv::Deserialize::deserialize(
-                    &branch.choices[$index],
-                    deserializer,
-                )?);
+                // Construct each variant at its final address instead of copying
+                // a full Result<NodeRef> temporary into the branch.
+                match &branch.choices[$index] {
+                    ArchivedNodeRef::Hash(hash) => {
+                        choices.add($index).write(NodeRef::Hash(
+                            rkyv::Deserialize::deserialize(hash, deserializer)?,
+                        ));
+                    }
+                    ArchivedNodeRef::Node(node, _) => {
+                        let shared = deserialize_shared_node(node, deserializer)?;
+                        choices.add($index).write(NodeRef::Node(shared, OnceLock::new()));
+                    }
+                }
                 guard.initialized_choices = $index + 1;
             }};
         }

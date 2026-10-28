@@ -14,12 +14,12 @@
     "vendor/ethrex/crates/common/rlp/encode.rs": "62e94d6d37303e28a7deead9b9c6468ffdfcf12b4d5a95eebb1bd64b66ea403d",
     "vendor/ethrex/crates/common/trie/db.rs": "4c6381133757ed3fed437a39be53a91cea33b4d4ab9e3f6e535b16a4a827814b",
     "vendor/ethrex/crates/common/trie/nibbles.rs": "e0047caa5082e87471f2a0c35b3ef8724065837a4035ebbfc88cc5b6df2a03d4",
-    "vendor/ethrex/crates/common/trie/node.rs": "c7d7703592efae375e86285ffbb0eaa151b3dec2ba0f0bac480b8cfa4c59e00e",
+    "vendor/ethrex/crates/common/trie/node.rs": "31a8d860c14a93a5c26fd84862b9278fb877a5327f860ec1e41c8b2dea125029",
     "vendor/ethrex/crates/common/trie/node/branch.rs": "65ddb4323a7a1bb5d80142aef6cfdb17cc365f45bcf431070739f281b3b775bf",
     "vendor/ethrex/crates/common/trie/node/extension.rs": "21aa80a7b5e2a456c5e9eccc37fb9823a29a24a6d5c4f07b2987799baed2edd0",
     "vendor/ethrex/crates/common/trie/rlp.rs": "4e37ffe0fbc612b21b447c727ba1f3fcce2d08419716bf5d1dfcb36d73d17cb5",
     "vendor/ethrex/crates/common/trie/trie.rs": "11143c1d7f554e9938a00610137093bfaf2618ba3d4ceb418001455851d43c0c",
-    "vendor/ethrex/crates/common/types/account.rs": "1a849284b7a05da67232968f2d4ad358d0351b860439cb67697bc15f6964b21e",
+    "vendor/ethrex/crates/common/types/account.rs": "b42adeff29f2e65638e2e8ca8bf3f5a951ece899a94620a851c681016cac4b84",
     "vendor/ethrex/crates/common/utils.rs": "73d1f1d01e14e2614bd38942cec825d307bc17f811d6dcc1aca6cb7328b2ca53",
     "vendor/ethrex/crates/storage/store.rs": "82a4d416dc72e7a3b71a22f85dc9287cbb741721de116018c9e852f4573b7d51",
     "vendor/ethrex/crates/vm/levm/src/call_frame.rs": "96e442c461ab3a6c2367da3e955ca3c9e616fa29cdd0235348589f81cd49edb1",
@@ -32,6 +32,9 @@
     "executor/programs/rust/ethrex/src/input.rs": "8c156a5eb92c3f1d9bf6e5ec74dc19784c180efdf6a8a6ea048a61c842659cde",
     "executor/programs/rust/ethrex/src/main.rs": "335ab9a73cd1dcd0137b3943fe442032a688897874ff6c918dac475d477611f7",
     "syscalls/src/entrypoint.rs": "2dcc49d8d435ad309aa22c7e8a865ea342e17a86b2f3c0f6bd80a26c931dd2fa",
-    "syscalls/src/memcmp.S": "569bae29c01927d34e95dbd84e8ad4b46bb3458169b46cb2778d42b9a885fe7b"
-  }
+    "syscalls/src/memcmp.S": "569bae29c01927d34e95dbd84e8ad4b46bb3458169b46cb2778d42b9a885fe7b",
+    "vendor/ethrex/crates/vm/levm/src/vm.rs": "ff07bfebc4dee7c24221205f7abb18c9470187867a05660a6a71d9860797b8b6"
+  },
+  "previous_optimization_commit": "396378ff0fa319bb920fbb26778292fd332966ba",
+  "previous_optimization_tree": "2dd69b1266533a7cb94403e2dc7290d36aafc096"
 }
