@@ -1,6 +1,7 @@
 module
 
 public import LambdaVM.Field
+public import LambdaVM.AluOp
 
 @[expose] public section
 
@@ -23,11 +24,6 @@ structure Msg (F : Type) where
   outLo : F
   outHi : F
 deriving ProvableStruct
-
-/-- `alu_op` descriptors (`prover/src/tables/types.rs`). -/
-def opselEQ : ℕ := 3
-def opselLT : ℕ := 4
-def opselSHIFT : ℕ := 5
 
 /-- `lhs < rhs` on 64-bit values, signed (two's complement) or unsigned, as a bit. -/
 def ltRaw (signed L R : ℕ) : ℕ :=

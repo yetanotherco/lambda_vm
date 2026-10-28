@@ -15,6 +15,8 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   chips call (`isBit`, `isByte`, `areBytes`, `add`, `sub`), each with a
   `FormalAssertion` whose `Spec` is the template's meaning taken from its
   `spec/*.typ` page: `IsBit.circuit`, `IsByteCheck.circuit`, `Add.circuit`.
+- `LambdaVM/AluOp.lean` — the `alu_op` descriptors of `types.rs`, one enumeration
+  for the `opsel` of BYTE_ALU and the low bits of the ALU flag byte.
 - `LambdaVM/Buses/` — the buses that are not static tables. `Alu.lean` is the
   unified ALU bus: message layout as in `BusId::Alu`, the caller's `IS_WORD`
   assumptions on both operands as hypotheses, and one `Guarantees` clause per

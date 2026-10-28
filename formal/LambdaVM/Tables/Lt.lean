@@ -221,19 +221,18 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       have hc1b : IsBool c1 := mul_one_sub_eq_zero_iff.mp h_c1
       have hc0_2 := IsBool.val_lt_two hc0b
       have hc1_2 := IsBool.val_lt_two hc1b
-      have hval_lo : (input_rhs0 + (input_lhsSubRhs0 + 65536 * input_lhsSubRhs1)).val
-          = input_rhs0.val + (input_lhsSubRhs0.val + 65536 * input_lhsSubRhs1.val) :=
+      -- the halves of lhs_sub_rhs as words
+      have hval_subLo : (input_lhsSubRhs0 + 65536 * input_lhsSubRhs1).val
+          = input_lhsSubRhs0.val + 65536 * input_lhsSubRhs1.val :=
         val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-      have hval_hi : (input_rhs1 + 65536 * input_rhs2 + (input_lhsSubRhs2 + 65536 * input_lhsSubRhs3)
-          + c0).val
-          = input_rhs1.val + 65536 * input_rhs2.val + (input_lhsSubRhs2.val + 65536 * input_lhsSubRhs3.val)
-            + c0.val :=
+      have hval_subHi : (input_lhsSubRhs2 + 65536 * input_lhsSubRhs3).val
+          = input_lhsSubRhs2.val + 65536 * input_lhsSubRhs3.val :=
         val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
       -- the carry identities, on naturals
-      have e0 := carry_lift (by omega) (by omega) hc0b hc0
-      rw [hval_lo] at e0
-      have e1 := carry_lift (by omega) (by omega) hc1b hc1
-      rw [hval_hi, hval_lhsHi] at e1
+      obtain ⟨e0, e1⟩ := Add.carries_lift hr0 (by omega) (by omega) (by omega) hl0 (by omega)
+        hc0 hc1 hc0b hc1b
+      rw [hval_subLo] at e0
+      rw [hval_rhsHi, hval_subHi, hval_lhsHi] at e1
       obtain ⟨hC, hA, hB, hA2, hB2, hS, hU⟩ :=
         core hl0 hl1 hl2 hr0 hr1 hr2 hs0 hs1 hs2 hs3 hc0_2 hc1_2 hlm hrm e0 e1
       -- lt and res as field identities in the boolean values
@@ -266,14 +265,14 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
     refine ⟨?_, ?_, ?_⟩
     · intro s i hs hi hflags
-      rw [hflagsV] at hflags; simp only [Alu.opselLT] at hflags
+      rw [hflagsV] at hflags; simp only [opselLT] at hflags
       rw [key s i (by omega) (by omega) hl0 hr0, hval_lhsHi, hval_rhsHi]
     · -- the EQ clause does not apply: opsel(LT) + 32·s + 64·i ≠ opsel(EQ) + 64·i'
       intro i hi hflags
-      exfalso; rw [hflagsV] at hflags; simp only [Alu.opselEQ] at hflags; omega
+      exfalso; rw [hflagsV] at hflags; simp only [opselEQ] at hflags; omega
     · -- nor the SHIFT clause: opsel(SHIFT) + w + 32·s + 64·d ≡ 5 or 6 (mod 32)
       intro w s d hw hs hd hflags
-      exfalso; rw [hflagsV] at hflags; simp only [Alu.opselSHIFT] at hflags; omega
+      exfalso; rw [hflagsV] at hflags; simp only [opselSHIFT] at hflags; omega
 
 
   ProverAssumptions r _ _ := Honest r
@@ -285,33 +284,27 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       h_assumptions
     set L := input_lhs0.val + 2^32 * (input_lhs1.val + 65536 * input_lhs2.val) with hL
     set R := input_rhs0.val + 2^32 * (input_rhs1.val + 65536 * input_rhs2.val) with hR
+    -- the composite limbs as words
+    have hval_lhsHi : (input_lhs1 + 65536 * input_lhs2).val = input_lhs1.val + 65536 * input_lhs2.val :=
+      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+    have hval_rhsHi : (input_rhs1 + 65536 * input_rhs2).val = input_rhs1.val + 65536 * input_rhs2.val :=
+      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+    have hval_subLo : (input_lhsSubRhs0 + 65536 * input_lhsSubRhs1).val
+        = input_lhsSubRhs0.val + 65536 * input_lhsSubRhs1.val :=
+      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+    have hval_subHi : (input_lhsSubRhs2 + 65536 * input_lhsSubRhs3).val
+        = input_lhsSubRhs2.val + 65536 * input_lhsSubRhs3.val :=
+      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
     -- the honest carries
-    obtain ⟨k0, hk0, e0⟩ : ∃ k0, k0 < 2 ∧
-        input_rhs0.val + (input_lhsSubRhs0.val + 65536 * input_lhsSubRhs1.val) = input_lhs0.val + k0 * 2^32 :=
-      ⟨(input_rhs0.val + (input_lhsSubRhs0.val + 65536 * input_lhsSubRhs1.val)) / 2^32, by omega, by omega⟩
-    obtain ⟨k1, hk1, e1⟩ : ∃ k1, k1 < 2 ∧
-        input_rhs1.val + 65536 * input_rhs2.val + (input_lhsSubRhs2.val + 65536 * input_lhsSubRhs3.val) + k0
-          = input_lhs1.val + 65536 * input_lhs2.val + k1 * 2^32 :=
-      ⟨(input_rhs1.val + 65536 * input_rhs2.val + (input_lhsSubRhs2.val + 65536 * input_lhsSubRhs3.val) + k0) / 2^32,
-        by omega, by omega⟩
-    set c0 := (input_rhs0 + (input_lhsSubRhs0 + 65536 * input_lhsSubRhs1) - input_lhs0) * inv32 with hc0
-    set c1 := (input_rhs1 + 65536 * input_rhs2 + (input_lhsSubRhs2 + 65536 * input_lhsSubRhs3) + c0
-      - (input_lhs1 + 65536 * input_lhs2)) * inv32 with hc1
-    have hc0k : c0 = (k0 : F p) := by
-      have h := congrArg (fun n : ℕ => (n : F p)) e0
-      push_cast at h
-      simp only [ZMod.natCast_zmod_val] at h
-      have h' : input_rhs0 + (input_lhsSubRhs0 + 65536 * input_lhsSubRhs1) - input_lhs0 = (k0 : F p) * 2^32 := by
-        linear_combination h
-      rw [hc0, h', mul_assoc, two_pow_mul_inv32, mul_one]
-    have hc1k : c1 = (k1 : F p) := by
-      have h := congrArg (fun n : ℕ => (n : F p)) e1
-      push_cast at h
-      simp only [ZMod.natCast_zmod_val] at h
-      have h' : input_rhs1 + 65536 * input_rhs2 + (input_lhsSubRhs2 + 65536 * input_lhsSubRhs3) + c0
-          - (input_lhs1 + 65536 * input_lhs2) = (k1 : F p) * 2^32 := by
-        rw [hc0k]; linear_combination h
-      rw [hc1, h', mul_assoc, two_pow_mul_inv32, mul_one]
+    have hl1' : (input_rhs1 + 65536 * input_rhs2).val < 2^32 := by omega
+    have hr0' : (input_lhsSubRhs0 + 65536 * input_lhsSubRhs1).val < 2^32 := by omega
+    have hr1' : (input_lhsSubRhs2 + 65536 * input_lhsSubRhs3).val < 2^32 := by omega
+    have hs1' : (input_lhs1 + 65536 * input_lhs2).val < 2^32 := by omega
+    obtain ⟨k0, k1, hk0, hk1, e0, e1, hc0k, hc1k⟩ :=
+      Add.carries_of_sum hr0 hl1' hr0' hr1' hl0 hs1'
+        (by simp only [dword, hval_lhsHi, hval_rhsHi, hval_subLo, hval_subHi]; omega)
+    rw [hval_subLo] at e0
+    rw [hval_rhsHi, hval_subHi, hval_lhsHi] at e1
     have hA2 : input_lhsMsb.val < 2 := by omega
     have hB2 : input_rhsMsb.val < 2 := by omega
     obtain ⟨hC, hA, hB, -, -, hS, hU⟩ :=

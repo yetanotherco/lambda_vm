@@ -20,7 +20,8 @@ when shifting right), `zbs = [bit_shift = 0]`, the HWSL outputs `X[i], Y[i]`, th
 
 namespace LambdaVM.SHIFT
 open Alu (shiftResult)
-open ShiftCore (sll sllc limbs)
+open ShiftCore (limbs)
+open Bitwise (sll sllc sll_eq sllc_eq sll_of_eq sllc_of_eq)
 
 /-- One SHIFT row, fields in the column order of `shift.rs` and named as in `spec/src/shift.toml`:
 `in` as four halves, `shiftAmount`, `shiftB1`, `shiftH1`, `shiftHigh` the bytes, half and high
@@ -111,8 +112,8 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   assertZero ((1 - r.signed) * r.isNegative)
   -- interactions, in the order of `bus_interactions`
   Bitwise.Msb16.pullIf r.signed (r.in3, r.isNegative)
-  Bitwise.ByteAlu.pullIf left ⟨0, r.shiftAmount, 15, r.bitShift⟩
-  Bitwise.ByteAlu.pullIf right ⟨0, 256 - 16 * r.zbs - r.shiftAmount, 15, r.bitShift⟩
+  Bitwise.ByteAlu.pullIf left ⟨(opselAND : F p), r.shiftAmount, 15, r.bitShift⟩
+  Bitwise.ByteAlu.pullIf right ⟨(opselAND : F p), 256 - 16 * r.zbs - r.shiftAmount, 15, r.bitShift⟩
   Bitwise.Zero.pullIf r.mu (r.bitShift, r.zbs)
   Bitwise.Hwsl.pullIf (1 - r.zbs) ⟨r.in0, r.bitShift, r.x0, r.y0⟩
   Bitwise.Hwsl.pullIf (1 - r.zbs) ⟨r.in1, r.bitShift, r.x1, r.y1⟩
@@ -120,7 +121,7 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   Bitwise.Hwsl.pullIf (1 - r.zbs) ⟨r.in3, r.bitShift, r.x3, r.y3⟩
   Bitwise.Hwsl.pullIf (1 - r.zbs) ⟨extension, r.bitShift, r.x4, extension - r.x4⟩
   Bitwise.ByteAlu.pullIf r.mu
-    ⟨0, r.shiftAmount, 48 - 32 * r.wordInstr, 48 - 48 * r.ls0 - 32 * r.ls1 - 16 * r.ls2⟩
+    ⟨(opselAND : F p), r.shiftAmount, 48 - 32 * r.wordInstr, 48 - 48 * r.ls0 - 32 * r.ls1 - 16 * r.ls2⟩
   Alu.channel.pushIf r.mu
     ⟨r.in0 + 65536 * r.in1, r.in2 + 65536 * r.in3,
       r.shiftAmount + 256 * r.shiftB1 + 65536 * r.shiftH1, r.shiftHigh,
@@ -274,7 +275,7 @@ theorem soundness :
     GeneralFormalCircuit.Soundness (F p) (Input := Row) (Output := unit) main (fun _ _ => True)
       (fun r _ _ => RowSpec r) := by
     circuit_proof_start [main, isBit, RowSpec, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable,
-      Bitwise.msb16Table, Bitwise.byteAluTable, Bitwise.zeroTable, Bitwise.hwslTable,
+      Bitwise.msb16Table, Bitwise.byteAluTable, opselAND, opselOR, opselXOR, Bitwise.zeroTable, Bitwise.hwslTable,
       Bitwise.areBytesTable]
     obtain ⟨h_dm, h_zx0, h_zx1, h_zx2, h_zx3, h_zx4, h_zy0, h_zy1, h_zy2, h_zy3,
       h_ls0, h_ls1, h_ls2, h_ls3, h_out0, h_out1, h_dir, h_sg, h_w, h_zbs, h_mu, h_neg,
@@ -394,14 +395,16 @@ theorem soundness :
       · -- bit_shift ≠ 0: the lookups fix X and Y
         have hbne : input_bitShift.val ≠ 0 := by
           intro h; have := hzb_iff.mpr h; rw [hz0, ZMod.val_zero] at this; omega
-        obtain ⟨-, -, hx0v, hy0v⟩ := h_hw0 (by rw [hz0]; norm_num)
-        obtain ⟨-, -, hx1v, hy1v⟩ := h_hw1 (by rw [hz0]; norm_num)
-        obtain ⟨-, -, hx2v, hy2v⟩ := h_hw2 (by rw [hz0]; norm_num)
-        obtain ⟨-, -, hx3v, hy3v⟩ := h_hw3 (by rw [hz0]; norm_num)
-        obtain ⟨-, -, hx4v, -⟩ := h_hw4 (by rw [hz0]; norm_num)
-        rw [hext] at hx4v
+        obtain ⟨hi0', -, hx0v, hy0v⟩ := h_hw0 (by rw [hz0]; norm_num)
+        obtain ⟨hi1', -, hx1v, hy1v⟩ := h_hw1 (by rw [hz0]; norm_num)
+        obtain ⟨hi2', -, hx2v, hy2v⟩ := h_hw2 (by rw [hz0]; norm_num)
+        obtain ⟨hi3', -, hx3v, hy3v⟩ := h_hw3 (by rw [hz0]; norm_num)
+        obtain ⟨hi4', -, hx4v, -⟩ := h_hw4 (by rw [hz0]; norm_num)
+        rw [hext] at hx4v hi4'
         simp only [if_neg hbne]
-        exact ⟨hx0v, hx1v, hx2v, hx3v, hx4v, hy0v, hy1v, hy2v, hy3v⟩
+        exact ⟨sll_of_eq hi0' hx0v, sll_of_eq hi1' hx1v, sll_of_eq hi2' hx2v, sll_of_eq hi3' hx3v,
+          sll_of_eq hi4' hx4v, sllc_of_eq hi0' hy0v, sllc_of_eq hi1' hy1v, sllc_of_eq hi2' hy2v,
+          sllc_of_eq hi3' hy3v⟩
       · -- bit_shift = 0: the overrides
         have hb0 : input_bitShift.val = 0 := hzb_iff.mp (by rw [hz1, val_one_eq])
         rw [hz1] at h_zx0 h_zx1 h_zx2 h_zx3 h_zx4 h_zy0 h_zy1 h_zy2 h_zy3
@@ -505,12 +508,12 @@ theorem soundness :
     refine ⟨?_, ?_, ?_⟩
     · -- not LT: 5 + w + 32 s + 64 d ≠ 4 + 32 s' + 64 i (mod 32)
       intro s i hs hi hflags
-      exfalso; rw [hflagsV] at hflags; simp only [Alu.opselLT] at hflags; omega
+      exfalso; rw [hflagsV] at hflags; simp only [opselLT] at hflags; omega
     · -- not EQ
       intro i hi hflags
-      exfalso; rw [hflagsV] at hflags; simp only [Alu.opselEQ] at hflags; omega
+      exfalso; rw [hflagsV] at hflags; simp only [opselEQ] at hflags; omega
     · intro w s d hw hs hd hflags
-      rw [hflagsV] at hflags; simp only [Alu.opselSHIFT] at hflags
+      rw [hflagsV] at hflags; simp only [opselSHIFT] at hflags
       obtain ⟨rfl, rfl, rfl⟩ : input_wordInstr.val = w ∧ input_signed.val = s ∧
         input_direction.val = d := by omega
       have hv1 : (input_in0 + 65536 * input_in1).val = input_in0.val + 65536 * input_in1.val :=
@@ -534,7 +537,7 @@ theorem completeness :
     GeneralFormalCircuit.Completeness (F p) (Input := Row) (Output := unit) main
       (fun r _ _ => Honest r ∨ Padding r) (fun _ _ _ => True) := by
     circuit_proof_start [main, isBit, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable, Bitwise.msb16Table,
-      Bitwise.byteAluTable, Bitwise.zeroTable, Bitwise.hwslTable, Bitwise.areBytesTable, Honest,
+      Bitwise.byteAluTable, opselAND, opselOR, opselXOR, Bitwise.zeroTable, Bitwise.hwslTable, Bitwise.areBytesTable, Honest,
       Padding, shiftedOf]
     rcases h_assumptions with
       ⟨hmu, hdb, hsb, hwb, hi0, hi1, hi2, hi3, hsA, hB1, hH1, hn, hb, hzbs, hx0, hx1, hx2, hx3, hx4,
@@ -698,25 +701,25 @@ theorem completeness :
           have := hzb_iff.mpr h0
           rw [this] at h; norm_num at h
         rw [if_neg hbne] at hx0 hy0
-        exact ⟨hi0, hb16, by rw [hx0]; simp [sll, hbne], by rw [hy0]; simp [sllc, hbne]⟩
+        exact ⟨hi0, hb16, by rw [hx0]; exact sll_eq hi0, by rw [hy0]; exact sllc_eq hi0⟩
       · intro h
         have hbne : input_bitShift.val ≠ 0 := fun h0 => by
           have := hzb_iff.mpr h0
           rw [this] at h; norm_num at h
         rw [if_neg hbne] at hx1 hy1
-        exact ⟨hi1, hb16, by rw [hx1]; simp [sll, hbne], by rw [hy1]; simp [sllc, hbne]⟩
+        exact ⟨hi1, hb16, by rw [hx1]; exact sll_eq hi1, by rw [hy1]; exact sllc_eq hi1⟩
       · intro h
         have hbne : input_bitShift.val ≠ 0 := fun h0 => by
           have := hzb_iff.mpr h0
           rw [this] at h; norm_num at h
         rw [if_neg hbne] at hx2 hy2
-        exact ⟨hi2, hb16, by rw [hx2]; simp [sll, hbne], by rw [hy2]; simp [sllc, hbne]⟩
+        exact ⟨hi2, hb16, by rw [hx2]; exact sll_eq hi2, by rw [hy2]; exact sllc_eq hi2⟩
       · intro h
         have hbne : input_bitShift.val ≠ 0 := fun h0 => by
           have := hzb_iff.mpr h0
           rw [this] at h; norm_num at h
         rw [if_neg hbne] at hx3 hy3
-        exact ⟨hi3, hb16, by rw [hx3]; simp [sll, hbne], by rw [hy3]; simp [sllc, hbne]⟩
+        exact ⟨hi3, hb16, by rw [hx3]; exact sll_eq hi3, by rw [hy3]; exact sllc_eq hi3⟩
       · -- HWSL[extension, bit_shift]
         intro h
         have hbne : input_bitShift.val ≠ 0 := fun h0 => by
@@ -734,8 +737,8 @@ theorem completeness :
             rw [ZMod.natCast_zmod_val input_isNegative, ZMod.natCast_zmod_val input_x4]; try ring]
           exact val_natCast_of_lt_two_pow_40 (by omega)
         refine ⟨by rw [hext]; omega, hb16, ?_, ?_⟩
-        · rw [hext, hx4]; try simp [sll, hbne]
-        · rw [hdiff, hext, hx4, hsub]; try simp [sllc, hbne]
+        · rw [hext, hx4]; exact sll_eq (by omega)
+        · rw [hdiff, hext, hx4, hsub]; exact sllc_eq (by omega)
       · -- BYTE_ALU[AND, shift, mask]
         intro _
         have hmask : (48 - 32 * input_wordInstr).val = 48 - 32 * input_wordInstr.val := by
@@ -776,7 +779,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       bitShift, zbs, x0, x1, x2, x3, x4, y0, y1, y2, y3, ls0, ls1, ls2, mu, shiftB1, shiftH1,
       shiftHigh⟩ := input_var
     simp only [circuit_norm, main, isBit, Alu.channel, Bitwise.isHalfTable, Bitwise.msb16Table,
-      Bitwise.byteAluTable, Bitwise.zeroTable, Bitwise.hwslTable, Bitwise.areBytesTable]
+      Bitwise.byteAluTable, opselAND, opselOR, opselXOR, Bitwise.zeroTable, Bitwise.hwslTable, Bitwise.areBytesTable]
     constructor
     · intro channel h; tauto
     · intro env h

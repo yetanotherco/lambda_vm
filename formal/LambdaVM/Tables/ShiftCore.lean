@@ -1,6 +1,7 @@
 module
 
 public import LambdaVM.Buses.Alu
+public import LambdaVM.Tables.Bitwise
 
 @[expose] public section
 
@@ -14,10 +15,9 @@ the limb recombination the chip constrains equals the shift of the 64-bit value.
 
 namespace LambdaVM.ShiftCore
 open Alu (shiftResult sra64)
+open Bitwise (sll sllc)
 
 /-- `HWSL` as in BITWISE: `(h << z) mod 2^16` and `h >> (16 − z)`, with the `z = 0` convention. -/
-def sll (h z : ℕ) : ℕ := if z = 0 then h else (h <<< z) % 65536
-def sllc (h z : ℕ) : ℕ := if z = 0 then 0 else h >>> (16 - z)
 
 def limbs (a0 a1 a2 a3 : ℕ) : ℕ := a0 + 65536 * a1 + 2^32 * a2 + 2^48 * a3
 

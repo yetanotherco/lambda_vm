@@ -34,6 +34,10 @@ deriving ProvableStruct
 def main (inputs : Var Inputs (F p)) : Circuit (F p) Unit :=
   assertZero (inputs.cond * inputs.x * (1 - inputs.x))
 
+instance (inputs : Var Inputs (F p)) : ExplicitCircuit (main inputs) :=
+  .of_eq (circuit' := assertZero (inputs.cond * inputs.x * (1 - inputs.x))) rfl
+    (by infer_explicit_circuit)
+
 def circuit : FormalAssertion (F p) Inputs where
   main
 

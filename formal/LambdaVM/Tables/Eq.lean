@@ -130,18 +130,19 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       set c1 := (input_b1 + (input_diff2 + 65536 * input_diff3) + c0 - input_a1) * inv32 with hc1
       have hc0b : IsBool c0 := mul_one_sub_eq_zero_iff.mp h_c0
       have hc1b : IsBool c1 := mul_one_sub_eq_zero_iff.mp h_c1
-      have hc0_2 := IsBool.val_lt_two hc0b
-      have hval_lo : (input_b0 + (input_diff0 + 65536 * input_diff1)).val
-          = input_b0.val + (input_diff0.val + 65536 * input_diff1.val) :=
+      -- the halves of diff as words
+      have hval_lo : (input_diff0 + 65536 * input_diff1).val
+          = input_diff0.val + 65536 * input_diff1.val :=
         val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-      have hval_hi : (input_b1 + (input_diff2 + 65536 * input_diff3) + c0).val
-          = input_b1.val + (input_diff2.val + 65536 * input_diff3.val) + c0.val :=
+      have hval_hi : (input_diff2 + 65536 * input_diff3).val
+          = input_diff2.val + 65536 * input_diff3.val :=
         val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-      have e0 := carry_lift (by omega) (by omega) hc0b hc0
+      -- the carry identities, on naturals
+      obtain ⟨e0, e1⟩ := Add.carries_lift hb0 hb1 (by omega) (by omega) ha0 ha1 hc0 hc1 hc0b hc1b
       rw [hval_lo] at e0
-      have e1 := carry_lift (by omega) (by omega) hc1b hc1
       rw [hval_hi] at e1
-      have hcore := core ha0 ha1 hb0 hb1 hd0 hd1 hd2 hd3 hc0_2 (IsBool.val_lt_two hc1b) e0 e1
+      have hcore := core ha0 ha1 hb0 hb1 hd0 hd1 hd2 hd3 (IsBool.val_lt_two hc0b)
+        (IsBool.val_lt_two hc1b) e0 e1
       have hval_sum : (input_diff0 + input_diff1 + input_diff2 + input_diff3).val
           = input_diff0.val + input_diff1.val + input_diff2.val + input_diff3.val :=
         val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
@@ -167,13 +168,13 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     refine ⟨?_, ?_, ?_⟩
     · -- the LT clause does not apply: opsel(EQ) + 64·i ≠ opsel(LT) + 32·s + 64·i'
       intro s i hs hi hflags
-      exfalso; rw [hflagsV] at hflags; simp only [Alu.opselLT] at hflags; omega
+      exfalso; rw [hflagsV] at hflags; simp only [opselLT] at hflags; omega
     swap
     · -- nor the SHIFT clause
       intro w s d hw hs hd hflags
-      exfalso; rw [hflagsV] at hflags; simp only [Alu.opselSHIFT] at hflags; omega
+      exfalso; rw [hflagsV] at hflags; simp only [opselSHIFT] at hflags; omega
     intro i hi hflags
-    rw [hflagsV] at hflags; simp only [Alu.opselEQ] at hflags
+    rw [hflagsV] at hflags; simp only [opselEQ] at hflags
     rw [key ha0 ha1 hb0 hb1, show input_invert.val = i by omega]
 
   ProverAssumptions r _ _ := Honest r
@@ -182,28 +183,20 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, Alu.channel, Alu.Guarantees,
       Bitwise.isHalfTable, Bitwise.zeroTable, Honest, dword]
     obtain ⟨hmu, hib, ha0, ha1, hb0, hb1, hd0, hd1, hd2, hd3, hsum, heq, hres⟩ := h_assumptions
-    obtain ⟨k0, hk0, e0⟩ : ∃ k0, k0 < 2 ∧
-        input_b0.val + (input_diff0.val + 65536 * input_diff1.val) = input_a0.val + k0 * 2^32 :=
-      ⟨(input_b0.val + (input_diff0.val + 65536 * input_diff1.val)) / 2^32, by omega, by omega⟩
-    obtain ⟨k1, hk1, e1⟩ : ∃ k1, k1 < 2 ∧
-        input_b1.val + (input_diff2.val + 65536 * input_diff3.val) + k0 = input_a1.val + k1 * 2^32 :=
-      ⟨(input_b1.val + (input_diff2.val + 65536 * input_diff3.val) + k0) / 2^32, by omega, by omega⟩
-    set c0 := (input_b0 + (input_diff0 + 65536 * input_diff1) - input_a0) * inv32 with hc0
-    set c1 := (input_b1 + (input_diff2 + 65536 * input_diff3) + c0 - input_a1) * inv32 with hc1
-    have hc0k : c0 = (k0 : F p) := by
-      have h := congrArg (fun n : ℕ => (n : F p)) e0
-      push_cast at h
-      simp only [ZMod.natCast_zmod_val] at h
-      have h' : input_b0 + (input_diff0 + 65536 * input_diff1) - input_a0 = (k0 : F p) * 2^32 := by
-        linear_combination h
-      rw [hc0, h', mul_assoc, two_pow_mul_inv32, mul_one]
-    have hc1k : c1 = (k1 : F p) := by
-      have h := congrArg (fun n : ℕ => (n : F p)) e1
-      push_cast at h
-      simp only [ZMod.natCast_zmod_val] at h
-      have h' : input_b1 + (input_diff2 + 65536 * input_diff3) + c0 - input_a1 = (k1 : F p) * 2^32 := by
-        rw [hc0k]; linear_combination h
-      rw [hc1, h', mul_assoc, two_pow_mul_inv32, mul_one]
+    -- the halves of diff as words
+    have hval_lo : (input_diff0 + 65536 * input_diff1).val
+        = input_diff0.val + 65536 * input_diff1.val :=
+      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+    have hval_hi : (input_diff2 + 65536 * input_diff3).val
+        = input_diff2.val + 65536 * input_diff3.val :=
+      val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+    -- the honest carries
+    have hr0 : (input_diff0 + 65536 * input_diff1).val < 2^32 := by omega
+    have hr1 : (input_diff2 + 65536 * input_diff3).val < 2^32 := by omega
+    obtain ⟨k0, k1, hk0, hk1, e0, e1, hc0k, hc1k⟩ :=
+      Add.carries_of_sum hb0 hb1 hr0 hr1 ha0 ha1 (by simp only [dword, hval_lo, hval_hi]; omega)
+    rw [hval_lo] at e0
+    rw [hval_hi] at e1
     have hval_sum : (input_diff0 + input_diff1 + input_diff2 + input_diff3).val
         = input_diff0.val + input_diff1.val + input_diff2.val + input_diff3.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
