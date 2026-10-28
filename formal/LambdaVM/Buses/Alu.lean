@@ -29,12 +29,24 @@ def opselEQ : ℕ := 3
 def opselLT : ℕ := 4
 def opselSHIFT : ℕ := 5
 
-/-- Two's complement reading of a 64-bit value. -/
-def toInt64 (n : ℕ) : ℤ := if n < 2^63 then (n : ℤ) else (n : ℤ) - 2^64
-
-/-- `lhs < rhs`, signed or unsigned, as a bit. -/
+/-- `lhs < rhs` on 64-bit values, signed (two's complement) or unsigned, as a bit. -/
 def ltRaw (signed L R : ℕ) : ℕ :=
-  if signed = 1 then (if toInt64 L < toInt64 R then 1 else 0) else (if L < R then 1 else 0)
+  if signed = 1 then (if (BitVec.ofNat 64 L).slt (BitVec.ofNat 64 R) then 1 else 0)
+  else (if (BitVec.ofNat 64 L).ult (BitVec.ofNat 64 R) then 1 else 0)
+
+/-- The two comparisons on values below `2⁶⁴`, read on naturals. -/
+lemma ult_ofNat_iff {L R : ℕ} (hL : L < 2^64) (hR : R < 2^64) :
+    (BitVec.ofNat 64 L).ult (BitVec.ofNat 64 R) = true ↔ L < R := by
+  simp only [BitVec.ult_eq_decide, decide_eq_true_eq, BitVec.toNat_ofNat, Nat.mod_eq_of_lt hL,
+    Nat.mod_eq_of_lt hR]
+
+lemma slt_ofNat_iff {L R : ℕ} (hL : L < 2^64) (hR : R < 2^64) :
+    (BitVec.ofNat 64 L).slt (BitVec.ofNat 64 R) = true ↔
+      (if L < 2^63 then (L : ℤ) else (L : ℤ) - 2^64) <
+        (if R < 2^63 then (R : ℤ) else (R : ℤ) - 2^64) := by
+  simp only [BitVec.slt_eq_decide, decide_eq_true_eq, BitVec.toInt_eq_toNat_cond, BitVec.toNat_ofNat,
+    Nat.mod_eq_of_lt hL, Nat.mod_eq_of_lt hR]
+  split_ifs <;> omega
 
 /-- LT result: `(lhs < rhs) xor invert`. -/
 def ltBit (signed invert L R : ℕ) : ℕ :=

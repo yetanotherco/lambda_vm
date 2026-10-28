@@ -19,7 +19,7 @@ The carries of `rhs + lhs_sub_rhs = lhs (mod 2⁶⁴)` are virtual: `carry = (�
 -/
 
 namespace LambdaVM.LT
-open Alu (toInt64 ltRaw ltBit)
+open Alu (ltRaw ltBit)
 
 /-- One LT row, fields in the column order of `lt.rs` and named as in `spec/src/lt.toml`:
 `lhs`, `rhs` as `DWordHHW` limbs (`lhs0` a word, `lhs1`, `lhs2` halves), `lhs_sub_rhs` as
@@ -62,11 +62,12 @@ theorem core
     let L := l0 + 2^32 * (l1 + 65536 * l2)
     let R := r0 + 2^32 * (r1 + 65536 * r2)
     (c1 = 1 ↔ L < R) ∧ (A = 1 ↔ 2^63 ≤ L) ∧ (B = 1 ↔ 2^63 ≤ R) ∧ A < 2 ∧ B < 2 ∧
-    (toInt64 L < toInt64 R ↔ ((A = 1 ∧ B = 0) ∨ (A = B ∧ L < R))) := by
+    ((BitVec.ofNat 64 L).slt (BitVec.ofNat 64 R) = true ↔ ((A = 1 ∧ B = 0) ∨ (A = B ∧ L < R))) ∧
+    ((BitVec.ofNat 64 L).ult (BitVec.ofNat 64 R) = true ↔ L < R) := by
   intro L R
   subst hA hB
-  refine ⟨by omega, by omega, by omega, by omega, by omega, ?_⟩
-  simp only [toInt64]
+  refine ⟨by omega, by omega, by omega, by omega, by omega, ?_, Alu.ult_ofNat_iff (by omega) (by omega)⟩
+  rw [Alu.slt_ofNat_iff (by omega) (by omega)]
   split_ifs <;> omega
 
 def main (r : Var Row (F p)) : Circuit (F p) Unit := do
@@ -107,18 +108,16 @@ lemma ltRaw_lt_two {s L R : ℕ} : ltRaw s L R < 2 := by
 /-- On an honest row the `lt` bit is the chip's polynomial `s·Q(A, B, C) + (1 − s)·C`. -/
 lemma ltRaw_eq_poly {s A B k1 L R : ℕ} (hs : s < 2) (hA2 : A < 2) (hB2 : B < 2) (hk : k1 < 2)
     (hC : k1 = 1 ↔ L < R) (hA : A = 1 ↔ 2^63 ≤ L) (hB : B = 1 ↔ 2^63 ≤ R)
-    (hS : toInt64 L < toInt64 R ↔ ((A = 1 ∧ B = 0) ∨ (A = B ∧ L < R))) :
+    (hS : (BitVec.ofNat 64 L).slt (BitVec.ofNat 64 R) = true ↔ ((A = 1 ∧ B = 0) ∨ (A = B ∧ L < R)))
+    (hU : (BitVec.ofNat 64 L).ult (BitVec.ofNat 64 R) = true ↔ L < R) :
     ltRaw s L R = s * (A * (1 - B) + A * k1 + (1 - B) * k1) + (1 - s) * k1 := by
   unfold ltRaw
+  simp only [hS, hU]
   rcases (by omega : s = 0 ∨ s = 1) with rfl | rfl <;>
   rcases (by omega : A = 0 ∨ A = 1) with rfl | rfl <;>
   rcases (by omega : B = 0 ∨ B = 1) with rfl | rfl <;>
   rcases (by omega : k1 = 0 ∨ k1 = 1) with rfl | rfl <;>
-  norm_num at hC hA hB hS ⊢ <;>
-  first
-  | (exfalso; omega)
-  | (rw [← not_lt, hS]; omega)
-  | simp [hS, hC]
+  norm_num at hC hA hB ⊢ <;> omega
 
 lemma ltBit_eq {s i L R : ℕ} (hi : i < 2) :
     ltBit s i L R = ltRaw s L R + i - 2 * ltRaw s L R * i := by
@@ -235,7 +234,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       rw [hval_lo] at e0
       have e1 := carry_lift (by omega) (by omega) hc1b hc1
       rw [hval_hi, hval_lhsHi] at e1
-      obtain ⟨hC, hA, hB, hA2, hB2, hS⟩ :=
+      obtain ⟨hC, hA, hB, hA2, hB2, hS, hU⟩ :=
         core hl0 hl1 hl2 hr0 hr1 hr2 hs0 hs1 hs2 hs3 hc0_2 hc1_2 hlm hrm e0 e1
       -- lt and res as field identities in the boolean values
       have hlt' : input_lt = input_signed * (input_lhsMsb * (1 - input_rhsMsb) + input_lhsMsb * c1
@@ -246,16 +245,18 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       rw [← ZMod.natCast_zmod_val input_signed, ← ZMod.natCast_zmod_val input_lhsMsb,
         ← ZMod.natCast_zmod_val input_rhsMsb, ← ZMod.natCast_zmod_val c1, hsv] at hlt'
       rw [← ZMod.natCast_zmod_val input_invert, hiv] at hres'
+      -- the comparisons, on naturals
+      simp only [ltBit, ltRaw, hS, hU]
       rcases (by omega : s = 0 ∨ s = 1) with rfl | rfl <;>
       rcases (by omega : i = 0 ∨ i = 1) with rfl | rfl <;>
       rcases (by omega : input_lhsMsb.val = 0 ∨ input_lhsMsb.val = 1) with hAv | hAv <;>
       rcases (by omega : input_rhsMsb.val = 0 ∨ input_rhsMsb.val = 1) with hBv | hBv <;>
       rcases (by omega : c1.val = 0 ∨ c1.val = 1) with hcv | hcv <;>
-      simp only [hAv, hBv, hcv, Nat.cast_zero, Nat.cast_one] at hlt' hA hB hC hS <;>
-      norm_num at hlt' hA hB hC hS <;>
+      simp only [hAv, hBv, hcv, Nat.cast_zero, Nat.cast_one] at hlt' hA hB hC <;>
+      norm_num at hlt' hA hB hC <;>
       first
       | (exfalso; omega)
-      | (subst hlt'; norm_num at hres'; simp [ltBit, ltRaw, hS, hC, hres'])
+      | (subst hlt'; norm_num at hres'; simp [hAv, hBv, hC, hres'])
     refine ⟨fun _ hl0 hr0 => key _ _ rfl rfl hl0 hr0, by simp, by simp, by simp, by simp, by simp,
       by simp, by simp, by simp, ?_⟩
     intro _ _ hl0 hlhi hr0 hrhi
@@ -313,9 +314,9 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       rw [hc1, h', mul_assoc, two_pow_mul_inv32, mul_one]
     have hA2 : input_lhsMsb.val < 2 := by omega
     have hB2 : input_rhsMsb.val < 2 := by omega
-    obtain ⟨hC, hA, hB, -, -, hS⟩ :=
+    obtain ⟨hC, hA, hB, -, -, hS, hU⟩ :=
       core hl0 hl1 hl2 hr0 hr1 hr2 hs0 hs1 hs2 hs3 hk0 hk1 hlm hrm e0 e1
-    have hpoly := ltRaw_eq_poly (IsBool.val_lt_two hsb) hA2 hB2 hk1 hC hA hB hS
+    have hpoly := ltRaw_eq_poly (IsBool.val_lt_two hsb) hA2 hB2 hk1 hC hA hB hS hU
     have hlt_raw : input_lt = ((ltRaw input_signed.val L R : ℕ) : F p) := by
       rw [← hlt, ZMod.natCast_zmod_val]
     have hres_cast : input_res = ((ltRaw input_signed.val L R + input_invert.val
