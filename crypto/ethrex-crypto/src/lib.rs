@@ -532,8 +532,9 @@ static KECCAK_CACHE: keccak_cache::GuestCache = keccak_cache::GuestCache::new();
 fn keccak256_with_permute<F: FnMut(&mut [u64; 25])>(input: &[u8], mut permute: F) -> [u8; 32] {
     const RATE: usize = 136;
 
-    let mut state = [0u64; 25];
+    let mut state;
     if cfg!(target_endian = "little") && input.len() < RATE {
+        state = [0u64; 25];
         // SAFETY: the local state is initialized, writable, and disjoint from
         // input. Its 200-byte allocation exceeds this <136-byte copy. On LE
         // hosts these bytes are exactly Keccak's little-endian lane encoding.
@@ -548,7 +549,26 @@ fn keccak256_with_permute<F: FnMut(&mut [u64; 25])>(input: &[u8], mut permute: F
         state[RATE / 8 - 1] |= 0x80u64 << 56;
         permute(&mut state);
     } else {
-        let mut blocks = input.chunks_exact(RATE);
+        let rest = if let Some((first, rest)) = input.split_at_checked(RATE) {
+            // The first block absorbed into the zero state is the block itself: its
+            // lanes are written straight into the state, with the capacity lanes
+            // zero, instead of zeroing 200 bytes and then XORing the block in.
+            state = core::array::from_fn(|i| {
+                if i < RATE / 8 {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(&first[8 * i..8 * i + 8]);
+                    u64::from_le_bytes(buf)
+                } else {
+                    0
+                }
+            });
+            permute(&mut state);
+            rest
+        } else {
+            state = [0u64; 25];
+            input
+        };
+        let mut blocks = rest.chunks_exact(RATE);
         for block in &mut blocks {
             absorb_block(&mut state, block);
             permute(&mut state);
