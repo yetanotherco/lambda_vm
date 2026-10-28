@@ -15,8 +15,9 @@ use std::collections::HashMap;
 use serde_json::Value;
 use stark::constraint_ir::eval_program_base;
 use stark::constraints::builder::{CaptureBuilder, ConstraintSet, num_base_from_meta};
-use stark::lookup::{BusInteraction, LinearTerm, Multiplicity};
+use stark::lookup::BusInteraction;
 
+use super::test_rng::SplitMix64;
 use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
 
 type Gl = GoldilocksField;
@@ -127,40 +128,11 @@ fn bus_id_of(channel: &str) -> u64 {
 // Rust side: constraints and interactions evaluated on a row
 // =============================================================================
 
-fn multiplicity_at(m: &Multiplicity, row: &[FE]) -> FE {
-    let col = |c: usize| row[c];
-    match m {
-        Multiplicity::One => FE::one(),
-        Multiplicity::Column(c) => col(*c),
-        Multiplicity::Sum(a, b) => col(*a) + col(*b),
-        Multiplicity::Negated(c) => FE::one() - col(*c),
-        Multiplicity::Diff(a, b) => col(*a) - col(*b),
-        Multiplicity::Sum3(a, b, c) => col(*a) + col(*b) + col(*c),
-        Multiplicity::Linear(terms) => {
-            let mut acc = FE::zero();
-            for t in terms {
-                match *t {
-                    LinearTerm::Column {
-                        coefficient,
-                        column,
-                    } => acc += col(column) * FE::from(coefficient),
-                    LinearTerm::ColumnUnsigned {
-                        coefficient,
-                        column,
-                    } => acc += col(column) * FE::from(coefficient),
-                    LinearTerm::Constant(v) => acc += FE::from(v),
-                }
-            }
-            acc
-        }
-    }
-}
-
 /// `(bus id, signed multiplicity, bus elements)` of a Rust interaction on a row. A sender
 /// adds `+m`, a receiver `−m`; Clean's pull is `−e` and push `+e`, so the signs agree once a
 /// receiver (the table that answers the lookup, Clean's push) keeps its multiplicity.
 fn rust_interaction_at(i: &BusInteraction, row: &[FE]) -> (u64, FE, Vec<FE>) {
-    let m = multiplicity_at(&i.multiplicity, row);
+    let m = i.multiplicity.evaluate_with(|c| row[c]);
     let m = if i.is_sender { -m } else { m };
     let elems = i
         .values
@@ -181,17 +153,6 @@ fn lean_interaction_at(i: &LeanInteract, row: &[FE]) -> (u64, FE, Vec<FE>) {
 // =============================================================================
 // Matching
 // =============================================================================
-
-struct SplitMix64(u64);
-impl SplitMix64 {
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-}
 
 fn random_rows(num_cols: usize, seed: u64) -> Vec<Vec<FE>> {
     let mut rng = SplitMix64(seed);

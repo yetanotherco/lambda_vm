@@ -23,6 +23,7 @@ use stark::proof::options::GoldilocksCubicProofOptions;
 use stark::table::TableView;
 use stark::traits::{AIR, TransitionEvaluationContext};
 
+use super::test_rng::SplitMix64;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::test_utils::*;
 
@@ -33,23 +34,12 @@ type Fp3 = FieldElement<Ext3>;
 
 const TRIALS: usize = 200;
 
-/// Deterministic SplitMix64 (no `rand` dependency).
-struct SplitMix64(u64);
-impl SplitMix64 {
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    fn fp3(&mut self) -> Fp3 {
-        Fp3::new([
-            Fp::from(self.next_u64()),
-            Fp::from(self.next_u64()),
-            Fp::from(self.next_u64()),
-        ])
-    }
+fn fp3(rng: &mut SplitMix64) -> Fp3 {
+    Fp3::new([
+        Fp::from(rng.next_u64()),
+        Fp::from(rng.next_u64()),
+        Fp::from(rng.next_u64()),
+    ])
 }
 
 /// The differential for one production AIR: capture the combined program
@@ -79,13 +69,15 @@ fn check_air(air: &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>
         // Random two-step prover frame shaped like this table.
         let mk_step = |rng: &mut SplitMix64| {
             let main: Vec<Fp> = (0..n_main).map(|_| Fp::from(rng.next_u64())).collect();
-            let aux: Vec<Fp3> = (0..n_aux).map(|_| rng.fp3()).collect();
+            let aux: Vec<Fp3> = (0..n_aux).map(|_| fp3(rng)).collect();
             TableView::new(vec![main], vec![aux])
         };
         let frame = Frame::<Gl, Ext3>::new(vec![mk_step(&mut rng), mk_step(&mut rng)]);
-        let challenges = vec![rng.fp3(), rng.fp3()]; // [z, alpha]
-        let alphas: Vec<Fp3> = (0..air.max_bus_elements() + 2).map(|_| rng.fp3()).collect();
-        let offset = rng.fp3();
+        let challenges = vec![fp3(&mut rng), fp3(&mut rng)]; // [z, alpha]
+        let alphas: Vec<Fp3> = (0..air.max_bus_elements() + 2)
+            .map(|_| fp3(&mut rng))
+            .collect();
+        let offset = fp3(&mut rng);
 
         let ctx = TransitionEvaluationContext::new_prover(
             frame.as_row_frame(),
