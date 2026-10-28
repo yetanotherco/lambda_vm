@@ -6,6 +6,9 @@ pub mod block_commit_ood_tests;
 pub mod bus_debug_tests;
 pub mod bus_tests;
 pub mod cap_fri_matrix_tests;
+#[cfg(feature = "cuda")]
+pub mod commit_ood_device_tests;
+pub mod commit_ood_tests;
 pub mod commitment_tests;
 pub mod constraint_index_tests;
 pub mod device_cap_tests;

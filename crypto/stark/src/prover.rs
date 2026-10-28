@@ -47,6 +47,30 @@ use crypto::merkle_tree::traits::{IsMerkleTreeBackend, IsStreamingLeafBackend};
 
 pub use crate::commitment::{keccak_leaves_bit_reversed, keccak_leaves_row_pair_bit_reversed};
 
+/// The DEEP trace poles of a grid of `num_eval_points` points: `z·gᵏ` for
+/// every frame point, then the commitment-time answers' pole when there is
+/// one (`crate::commit_ood`), which is the grid's last point.
+fn trace_poles<F, E>(
+    z: &FieldElement<E>,
+    extra_pole: Option<&FieldElement<E>>,
+    primitive_root: &FieldElement<F>,
+    num_eval_points: usize,
+) -> Vec<FieldElement<E>>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    let frame_points = num_eval_points.saturating_sub(usize::from(extra_pole.is_some()));
+    let mut poles = Vec::with_capacity(num_eval_points);
+    let mut current = z.clone();
+    for _ in 0..frame_points {
+        poles.push(current.clone());
+        current = primitive_root * &current;
+    }
+    poles.extend(extra_pole.cloned());
+    poles
+}
+
 /// A triple of (AIR, TraceTable, PublicInputs) for proving.
 type AirTracePair<'a, Field, FieldExtension, PI> = (
     &'a dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
@@ -2921,6 +2945,7 @@ pub trait IsStarkProver<
     }
 
     /// Returns the result of the fourth round of the STARK Prove protocol.
+    #[allow(clippy::too_many_arguments)]
     fn round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         domain: &Domain<Field>,
@@ -2928,6 +2953,7 @@ pub trait IsStarkProver<
         round_2_result: &mut Round2<FieldExtension, H>,
         round_3_result: &Round3<FieldExtension>,
         z: &FieldElement<FieldExtension>,
+        commit_ood: Option<crate::commit_ood::CommitOodTable<'_, FieldExtension>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
     ) -> Result<Round4<Field, FieldExtension>, ProvingError>
     where
@@ -2974,10 +3000,49 @@ pub trait IsStarkProver<
         // Rectangular W×num_eval_points grid with the sampled powers at surviving
         // positions and zeros at pruned next-row positions, so the DEEP loop
         // below (and the GPU path) stay unchanged — zero-coefficient terms vanish.
-        let trace_term_coeffs = layout.build_trace_term_coeffs(&trace_term_powers);
+        #[allow(unused_mut)]
+        let mut trace_term_coeffs = layout.build_trace_term_coeffs(&trace_term_powers);
 
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
+
+        // The commitment-time answers' pole (`crate::commit_ood`): one more
+        // point of the rectangular grid, with minus the column's current-row
+        // coefficient and OOD value v_i on the i-th answered column, zero
+        // everywhere else, so every DEEP arm below folds each answered
+        // column's two-point quotient unchanged.
+        let mut trace_ood_columns = round_3_result.trace_ood_evaluations.columns();
+        let extra_pole = match commit_ood {
+            Some(ood) => {
+                let columns = crate::commit_ood::answered_columns(air);
+                if ood.answers.len() != columns.len() {
+                    return Err(ProvingError::WrongParameter(format!(
+                        "commitment-time answers: {} for {} answered columns",
+                        ood.answers.len(),
+                        columns.len()
+                    )));
+                }
+                for (col, (coeff_col, ood_col)) in trace_term_coeffs
+                    .iter_mut()
+                    .zip(trace_ood_columns.iter_mut())
+                    .enumerate()
+                {
+                    match col.checked_sub(columns.start) {
+                        Some(i) if columns.contains(&col) => {
+                            let at_z0 = crate::commit_ood::answer_coefficient(&coeff_col[0]);
+                            coeff_col.push(at_z0);
+                            ood_col.push(ood.answers[i].clone());
+                        }
+                        _ => {
+                            coeff_col.push(FieldElement::zero());
+                            ood_col.push(FieldElement::zero());
+                        }
+                    }
+                }
+                Some(ood.point)
+            }
+            None => None,
+        };
 
         let domain_size = domain.lde_roots_of_unity_coset.len();
 
@@ -2997,7 +3062,9 @@ pub trait IsStarkProver<
                 &round_1_result.lde_trace,
                 composition_parts,
                 round_3_result,
+                &trace_ood_columns,
                 z,
+                extra_pole,
                 domain,
                 &domain.trace_primitive_root,
                 &gammas,
@@ -3044,7 +3111,9 @@ pub trait IsStarkProver<
                 &mut round_1_result.lde_trace,
                 &mut round_2_result.lde_composition_poly_evaluations,
                 round_3_result,
+                &trace_ood_columns,
                 z,
+                extra_pole,
                 domain,
                 &domain.trace_primitive_root,
                 &gammas,
@@ -3427,7 +3496,9 @@ pub trait IsStarkProver<
         lde_trace: &LDETraceTable<Field, FieldExtension>,
         composition_parts: &[Vec<FieldElement<FieldExtension>>],
         round_3_result: &Round3<FieldExtension>,
+        trace_ood_columns: &[Vec<FieldElement<FieldExtension>>],
         z: &FieldElement<FieldExtension>,
+        extra_pole: Option<&FieldElement<FieldExtension>>,
         domain: &Domain<Field>,
         primitive_root: &FieldElement<Field>,
         composition_poly_gammas: &[FieldElement<FieldExtension>],
@@ -3445,12 +3516,7 @@ pub trait IsStarkProver<
         } else {
             trace_terms_gammas[0].len()
         };
-        let mut z_shifted = Vec::with_capacity(num_eval_points);
-        let mut current_z = z.clone();
-        for _ in 0..num_eval_points {
-            z_shifted.push(current_z.clone());
-            current_z = primitive_root * &current_z;
-        }
+        let z_shifted = trace_poles(z, extra_pole, primitive_root, num_eval_points);
         let z_scalars: Vec<FieldElement<FieldExtension>> =
             core::iter::once(z_power).chain(z_shifted).collect();
         // The rows invert their own denominators, so there is no inverse
@@ -3461,7 +3527,7 @@ pub trait IsStarkProver<
                     lde_trace,
                     parts_dev,
                     &round_3_result.composition_poly_parts_ood_evaluation,
-                    &round_3_result.trace_ood_evaluations.columns(),
+                    trace_ood_columns,
                     composition_poly_gammas,
                     trace_terms_gammas,
                     &domain.lde_roots_of_unity_coset,
@@ -3482,7 +3548,7 @@ pub trait IsStarkProver<
             lde_trace,
             parts_dev,
             &round_3_result.composition_poly_parts_ood_evaluation,
-            &round_3_result.trace_ood_evaluations.columns(),
+            trace_ood_columns,
             composition_poly_gammas,
             trace_terms_gammas,
             (&inv_dev, &stream),
@@ -3498,7 +3564,9 @@ pub trait IsStarkProver<
         lde_trace: &mut LDETraceTable<Field, FieldExtension>,
         composition_parts: &mut [Vec<FieldElement<FieldExtension>>],
         round_3_result: &Round3<FieldExtension>,
+        trace_ood_columns: &[Vec<FieldElement<FieldExtension>>],
         z: &FieldElement<FieldExtension>,
+        extra_pole: Option<&FieldElement<FieldExtension>>,
         domain: &Domain<Field>,
         primitive_root: &FieldElement<Field>,
         composition_poly_gammas: &[FieldElement<FieldExtension>],
@@ -3518,13 +3586,8 @@ pub trait IsStarkProver<
             trace_terms_gammas[0].len()
         };
 
-        // Trace poles: z_shifted[k] = primitive_root^k * z for k = 0..num_eval_points
-        let mut z_shifted = Vec::with_capacity(num_eval_points);
-        let mut current_z = z.clone();
-        for _ in 0..num_eval_points {
-            z_shifted.push(current_z.clone());
-            current_z = primitive_root * &current_z;
-        }
+        // Trace poles: z_shifted[k] = primitive_root^k * z, then the answers' pole.
+        let z_shifted = trace_poles(z, extra_pole, primitive_root, num_eval_points);
 
         // Number of main and aux columns in the LDE trace
         let num_main_cols = lde_trace.num_main_cols();
@@ -3533,7 +3596,6 @@ pub trait IsStarkProver<
 
         // OOD evaluations
         let h_ood = &round_3_result.composition_poly_parts_ood_evaluation;
-        let trace_ood_columns = round_3_result.trace_ood_evaluations.columns();
         let num_total_cols = num_main_cols + num_aux_cols;
 
         // Fully device-resident GPU fast path: build inv_denoms on device
@@ -3559,7 +3621,7 @@ pub trait IsStarkProver<
                         lde_trace.gpu_composition_parts(),
                         composition_parts,
                         h_ood,
-                        &trace_ood_columns,
+                        trace_ood_columns,
                         composition_poly_gammas,
                         trace_terms_gammas,
                         &[],
@@ -3595,7 +3657,7 @@ pub trait IsStarkProver<
                     lde_trace.gpu_composition_parts(),
                     composition_parts,
                     h_ood,
-                    &trace_ood_columns,
+                    trace_ood_columns,
                     composition_poly_gammas,
                     trace_terms_gammas,
                     &denoms,
@@ -4436,10 +4498,67 @@ pub trait IsStarkProver<
     ///
     /// The transcript must be safely initialized before passing it to this method.
     fn multi_prove(
-        #[allow(unused_mut)] mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
         residency: ResidencyMode,
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
+    {
+        Self::multi_prove_with(air_trace_pairs, transcript, residency, false)
+            .map(|(proof, _)| proof)
+    }
+
+    /// [`Self::multi_prove`] with commitment-time out-of-domain answers
+    /// ([`crate::commit_ood`]): after the last main root, `z0` is drawn and
+    /// every table's non-precomputed main columns answer at it, all absorbed
+    /// before the shared LogUp challenges, and each table's DEEP polynomial
+    /// carries its answers. Returns the proof and every table's answers, which
+    /// the verifier takes beside it ([`crate::verifier::IsStarkVerifier::multi_verify_views_bound`]).
+    #[allow(clippy::type_complexity)]
+    fn multi_prove_bound(
+        air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
+        residency: ResidencyMode,
+    ) -> Result<
+        (
+            MultiProof<Field, FieldExtension, PI>,
+            Vec<Vec<FieldElement<FieldExtension>>>,
+        ),
+        ProvingError,
+    >
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
+    {
+        let (proof, answers) =
+            Self::multi_prove_with(air_trace_pairs, transcript, residency, true)?;
+        Ok((proof, answers.unwrap_or_default()))
+    }
+
+    /// The one implementation of [`Self::multi_prove`] (`bind` false) and
+    /// [`Self::multi_prove_bound`] (`bind` true; the answers come back).
+    #[allow(clippy::type_complexity)]
+    #[doc(hidden)]
+    fn multi_prove_with(
+        #[allow(unused_mut)] mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
+        residency: ResidencyMode,
+        bind: bool,
+    ) -> Result<
+        (
+            MultiProof<Field, FieldExtension, PI>,
+            Option<Vec<Vec<FieldElement<FieldExtension>>>>,
+        ),
+        ProvingError,
+    >
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -4542,7 +4661,9 @@ pub trait IsStarkProver<
                     main_cols: trace.num_main_columns,
                     aux_cols,
                     num_parts: air.composition_poly_degree_bound(n) / n,
-                    num_eval_points: air.context().transition_offsets.len() * air.step_size(),
+                    // The answers' pole is one more DEEP point.
+                    num_eval_points: air.context().transition_offsets.len() * air.step_size()
+                        + usize::from(bind),
                 }
             })
             .collect();
@@ -4718,6 +4839,57 @@ pub trait IsStarkProver<
         if let Some(s) = crate::instruments::snap("After main commits") {
             heap_snaps.push(s);
         }
+
+        // =====================================================================
+        // Round 1: commitment-time answers (bound proofs only)
+        // =====================================================================
+        // After every root and before the shared challenges: `z0`, then every
+        // table's answers, absorbed in table order (`crate::commit_ood`).
+
+        let commit_ood: Option<(
+            FieldElement<FieldExtension>,
+            Vec<Vec<FieldElement<FieldExtension>>>,
+        )> = if bind {
+            let domain = crate::commit_ood::point_domain(air_trace_pairs.iter().zip(&domains).map(
+                |((air, _, _), d)| {
+                    (
+                        d.interpolation_domain_size,
+                        d.blowup_factor,
+                        air.context().proof_options.coset_offset,
+                    )
+                },
+            ))
+            .ok_or_else(|| {
+                ProvingError::WrongParameter(
+                    "commitment-time answers: the tables do not share one coset offset".to_string(),
+                )
+            })?;
+            let z0 = crate::commit_ood::draw_point::<Field, FieldExtension>(transcript, domain);
+            #[allow(unused_mut)]
+            let mut answers = Vec::with_capacity(num_airs);
+            for (idx, (air, trace, _)) in air_trace_pairs.iter().enumerate() {
+                answers.push(Self::commit_ood_answers(
+                    *air,
+                    trace,
+                    &domains[idx],
+                    #[cfg(feature = "cuda")]
+                    main_gpu_handles[idx].as_ref(),
+                    &z0,
+                )?);
+            }
+            #[cfg(any(test, feature = "test-utils"))]
+            if let Some((table, index)) = crate::commit_ood::faults::current().false_answer
+                && let Some(answer) = answers.get_mut(table).and_then(|a| a.get_mut(index))
+            {
+                *answer = &*answer + FieldElement::<FieldExtension>::one();
+            }
+            crate::commit_ood::absorb_answers::<Field, FieldExtension>(transcript, &answers);
+            Some((z0, answers))
+        } else {
+            None
+        };
+        // Read once, on this thread: the per-table chains below run on workers.
+        let commit_ood_deep = crate::commit_ood::deep_term_on();
 
         // =====================================================================
         // Round 1: Sample shared LogUp challenges
@@ -5147,6 +5319,14 @@ pub trait IsStarkProver<
             }
             crate::prove_split::add(&crate::prove_split::R1_ASSEMBLE, __ps_r1b);
 
+            let table_ood =
+                commit_ood
+                    .as_ref()
+                    .filter(|_| commit_ood_deep)
+                    .map(|(point, answers)| crate::commit_ood::CommitOodTable {
+                        point,
+                        answers: &answers[idx],
+                    });
             let proof = Self::prove_rounds_2_to_4(
                 *air,
                 *pub_inputs,
@@ -5154,6 +5334,7 @@ pub trait IsStarkProver<
                 &mut *tguard,
                 domain,
                 &twiddle_caches[idx],
+                table_ood,
             )?;
 
             #[cfg(feature = "instruments")]
@@ -5292,7 +5473,45 @@ pub trait IsStarkProver<
             println!("{line}");
         }
 
-        Ok(MultiProof { proofs })
+        Ok((
+            MultiProof { proofs },
+            commit_ood.map(|(_, answers)| answers),
+        ))
+    }
+
+    /// One table's commitment-time answers at `z0`: `t_c(z0)` for every
+    /// [`crate::commit_ood::answered_columns`] column. On the card from the
+    /// resident main LDE when the table has one, else on the host from the
+    /// trace; both evaluate the same polynomial, so the values are equal.
+    fn commit_ood_answers(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        #[cfg(feature = "cuda")] gpu_main: Option<&math_cuda::lde::GpuLdeBase>,
+        z0: &FieldElement<FieldExtension>,
+    ) -> Result<Vec<FieldElement<FieldExtension>>, ProvingError>
+    where
+        Field: 'static,
+        FieldExtension: 'static,
+    {
+        let columns = crate::commit_ood::answered_columns(air);
+        let (data, width) = trace.main_data_row_major();
+        #[cfg(feature = "cuda")]
+        if let Some(handle) = gpu_main
+            && let Some(values) =
+                crate::gpu_lde::try_main_values_at_gpu::<Field, FieldExtension>(handle, domain, z0)
+            && values.len() == width
+        {
+            return Ok(values[columns].to_vec());
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = domain;
+        crate::commit_ood::evaluate_trace_columns(data, width, columns, z0).ok_or_else(|| {
+            ProvingError::WrongParameter(format!(
+                "table {}: the commitment-time point lies in the trace domain",
+                air.name()
+            ))
+        })
     }
 
     /// Generate a STARK proof for a single AIR/trace.
@@ -5691,6 +5910,7 @@ pub trait IsStarkProver<
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
+        commit_ood: Option<crate::commit_ood::CommitOodTable<'_, FieldExtension>>,
     ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -5831,6 +6051,7 @@ pub trait IsStarkProver<
             &mut round_2_result,
             &round_3_result,
             &z,
+            commit_ood,
             transcript,
         )?;
 

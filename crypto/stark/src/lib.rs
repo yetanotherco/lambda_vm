@@ -1,5 +1,6 @@
 #[cfg(feature = "debug-checks")]
 pub mod bus_debug;
+pub mod commit_ood;
 pub mod commitment;
 pub mod constraint_ir;
 pub mod constraints;

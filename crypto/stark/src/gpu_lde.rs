@@ -2176,11 +2176,42 @@ where
     if !is_goldilocks_ext3_tower::<F, E>() {
         return None;
     }
+    barycentric_base_multi_on_main::<F, E>(
+        lde_trace.gpu_main()?,
+        row_stride,
+        coset_points_len,
+        coset_offset_pow_n,
+        n_inv,
+        g_n_inv,
+        z_pows,
+        ctx,
+    )
+}
+
+/// [`try_barycentric_base_on_handle_multi`] over a main LDE handle itself,
+/// before any [`LDETraceTable`] holds it (the commitment-time answers).
+#[allow(clippy::too_many_arguments)]
+fn barycentric_base_multi_on_main<F, E>(
+    main: &math_cuda::lde::GpuLdeBase,
+    row_stride: usize,
+    coset_points_len: usize,
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    z_pows: &[FieldElement<E>],
+    ctx: &R3DevContext,
+) -> Option<Vec<Vec<FieldElement<E>>>>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if !is_goldilocks_ext3_tower::<F, E>() {
+        return None;
+    }
     let k_points = z_pows.len();
     if k_points == 0 || k_points > math_cuda::barycentric::BARY_MAX_EVAL_POINTS {
         return None;
     }
-    let main = lde_trace.gpu_main()?;
     let num_cols = main.m;
     if num_cols == 0 {
         return Some(vec![Vec::new(); k_points]);
@@ -2223,6 +2254,42 @@ where
             .collect(),
     )
 }
+
+/// Every main column of a table's resident LDE at `point`, on the card: the
+/// R3 kernel over the trace-size coset subsample for one point. The
+/// commitment-time answers' card arm (`commit_ood`). `None` when the shape
+/// misses the kernel's thresholds or a call errs: the caller evaluates on the
+/// host.
+pub(crate) fn try_main_values_at_gpu<F, E>(
+    main: &math_cuda::lde::GpuLdeBase,
+    domain: &crate::domain::Domain<F>,
+    point: &FieldElement<E>,
+) -> Option<Vec<FieldElement<E>>>
+where
+    F: IsFFTField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    let dc = domain.ood_constants();
+    let n = domain.interpolation_domain_size;
+    let ctx = try_prep_r3_dev_context::<F, E>(&dc.points, std::slice::from_ref(point), None)?;
+    let values = barycentric_base_multi_on_main::<F, E>(
+        main,
+        domain.blowup_factor,
+        n,
+        &dc.offset_pow_n,
+        &dc.size_inv,
+        &dc.offset_pow_n_inv,
+        &[point.pow(n)],
+        &ctx,
+    )?
+    .pop()?;
+    COMMIT_OOD_GPU_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(values)
+}
+
+/// Tables whose commitment-time answers came off the card
+/// ([`try_main_values_at_gpu`]): the device test's proof that the card arm ran.
+pub static COMMIT_OOD_GPU_CALLS: AtomicU64 = AtomicU64::new(0);
 
 /// Aux (ext3) counterpart of [`try_barycentric_base_on_handle_multi`].
 #[allow(clippy::too_many_arguments)]

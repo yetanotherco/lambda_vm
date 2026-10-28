@@ -100,6 +100,24 @@ where
     pub rap_challenges: Vec<FieldElement<FieldExtension>>,
     /// The seed used to verify the proof-of-work nonce.
     pub grinding_seed: [u8; 32],
+    /// The commitment-time answers' DEEP term, on a bound proof
+    /// (`crate::commit_ood`).
+    pub commit_ood: Option<CommitOodDeep<FieldExtension>>,
+}
+
+/// One table's commitment-time answers as its DEEP reconstruction folds them:
+/// `Σ_i coeffs[i]·(t_{first+i}(x) − v_i)/(x − point)`, which with each
+/// answered column's quotient at `z` forms its two-point quotient.
+pub struct CommitOodDeep<FieldExtension: IsField> {
+    /// `z0`.
+    pub point: FieldElement<FieldExtension>,
+    /// The first answered column in `precomputed ‖ main ‖ aux` order.
+    pub first_col: usize,
+    /// Minus each answered column's current-row coefficient
+    /// (`crate::commit_ood::answer_coefficient`).
+    pub coeffs: Vec<FieldElement<FieldExtension>>,
+    /// `Σ_i coeffs[i]·v_i`, the same for every query.
+    pub answers_sum: FieldElement<FieldExtension>,
 }
 
 pub type DeepPolynomialEvaluations<F> = (Vec<FieldElement<F>>, Vec<FieldElement<F>>);
@@ -1446,6 +1464,20 @@ pub trait IsStarkVerifier<
             trace_term += denom * &(&base_row_sum - ood_row_sum);
         }
 
+        // The commitment-time answers' quotients (`crate::commit_ood`).
+        if let Some(ood) = &challenges.commit_ood {
+            let denom = (evaluation_point - &ood.point).inv().ok()?;
+            let mut sum = FieldElement::<FieldExtension>::zero();
+            for (i, coeff) in ood.coeffs.iter().enumerate() {
+                let col = ood.first_col + i;
+                if col >= num_base {
+                    return None;
+                }
+                sum += base_at(col) * coeff;
+            }
+            trace_term += denom * (sum - &ood.answers_sum);
+        }
+
         let number_of_parts = query_invariant_terms.number_of_parts;
         if lde_composition_poly_parts_evaluation.len() != number_of_parts {
             return None;
@@ -1598,6 +1630,28 @@ pub trait IsStarkVerifier<
             trace_term_sym += &denoms_trace_sym[row_idx] * &(&base_row_sum_sym - ood_row_sum);
         }
 
+        // The commitment-time answers' quotients (`crate::commit_ood`), at
+        // both points.
+        if let Some(ood) = &challenges.commit_ood {
+            let mut denoms = [
+                evaluation_point - &ood.point,
+                evaluation_point_sym - &ood.point,
+            ];
+            FieldElement::inplace_batch_inverse(&mut denoms).ok()?;
+            let mut sum = FieldElement::<FieldExtension>::zero();
+            let mut sum_sym = FieldElement::<FieldExtension>::zero();
+            for (i, coeff) in ood.coeffs.iter().enumerate() {
+                let col = ood.first_col + i;
+                if col >= num_base {
+                    return None;
+                }
+                sum += base_at(col) * coeff;
+                sum_sym += base_at_sym(col) * coeff;
+            }
+            trace_term += &denoms[0] * (sum - &ood.answers_sum);
+            trace_term_sym += &denoms[1] * (sum_sym - &ood.answers_sum);
+        }
+
         let number_of_parts = query_invariant_terms.number_of_parts;
         // Also rejects a per-query opening length that disagrees with the
         // proof-level `number_of_parts`, not just a regular/symmetric mismatch.
@@ -1701,6 +1755,127 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
+        Self::multi_verify_views_with(airs, proofs, None, transcript, expected_bus_balance)
+    }
+
+    /// Verifies a proof made by `multi_prove_bound`, with every table's
+    /// commitment-time answers (`crate::commit_ood`): the answer counts are
+    /// the AIRs', checked before anything is absorbed; `z0` is drawn after the
+    /// last root and every answer absorbed before the shared LogUp challenges;
+    /// each table's DEEP polynomial carries its answers.
+    fn multi_verify_views_bound<'p>(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        proofs: impl ProofViewSource<'p, Field, FieldExtension, PI>,
+        commit_ood: &[Vec<FieldElement<FieldExtension>>],
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        Self::multi_verify_views_with(
+            airs,
+            proofs,
+            Some(commit_ood),
+            transcript,
+            expected_bus_balance,
+        )
+    }
+
+    /// The commitment-time answers' step of Phase A, after every root: the
+    /// counts checked against the AIRs, `z0` drawn, every answer absorbed.
+    /// Returns `z0`, or `None` (reject) on a count or a coset offset that
+    /// disagrees. One function for the verifier and every replay of its Phase A.
+    fn absorb_commit_ood<'p>(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        proofs: &impl ProofViewSource<'p, Field, FieldExtension, PI>,
+        commit_ood: &[Vec<FieldElement<FieldExtension>>],
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> Option<FieldElement<FieldExtension>>
+    where
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
+    {
+        if commit_ood.len() != airs.len() || proofs.view_len() != airs.len() {
+            return None;
+        }
+        let mut shapes = Vec::with_capacity(airs.len());
+        for ((air, proof), answers) in airs.iter().zip(proofs.view_iter()).zip(commit_ood) {
+            if answers.len() != crate::commit_ood::answered_columns(*air).len() {
+                error!(
+                    "{} commitment-time answers for {} answered columns",
+                    answers.len(),
+                    crate::commit_ood::answered_columns(*air).len()
+                );
+                return None;
+            }
+            shapes.push((
+                proof.trace_length(),
+                air.options().blowup_factor as usize,
+                air.options().coset_offset,
+            ));
+        }
+        let domain = crate::commit_ood::point_domain(shapes)?;
+        let z0 = crate::commit_ood::draw_point::<Field, FieldExtension>(transcript, domain);
+        crate::commit_ood::absorb_answers::<Field, FieldExtension>(transcript, commit_ood);
+        Some(z0)
+    }
+
+    /// Phase A of a bound proof replayed for its shared LogUp challenges:
+    /// every table's preprocessed root (the AIR's, at its leaf layout) and main
+    /// root, then [`Self::absorb_commit_ood`], then the challenges. `None` =
+    /// reject (a layout with no preprocessed root, a count that disagrees).
+    fn replay_phase_a_bound<'p>(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        proofs: impl ProofViewSource<'p, Field, FieldExtension, PI>,
+        commit_ood: &[Vec<FieldElement<FieldExtension>>],
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> Option<Vec<FieldElement<FieldExtension>>>
+    where
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
+    {
+        if airs.len() != proofs.view_len() {
+            return None;
+        }
+        for (air, proof) in airs.iter().zip(proofs.view_iter()) {
+            if air.is_preprocessed() {
+                let layout = Self::leaf_layout(*air, proof.trace_length());
+                transcript.append_bytes(&air.precomputed_commitment_for(layout)?);
+            }
+            transcript.append_bytes(proof.lde_trace_main_merkle_root());
+        }
+        Self::absorb_commit_ood(airs, &proofs, commit_ood, transcript)?;
+        Some(
+            (0..LOGUP_NUM_CHALLENGES)
+                .map(|_| transcript.sample_field_element())
+                .collect(),
+        )
+    }
+
+    /// The one implementation of [`Self::multi_verify_views`] (`commit_ood`
+    /// `None`) and [`Self::multi_verify_views_bound`].
+    #[doc(hidden)]
+    fn multi_verify_views_with<'p>(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        proofs: impl ProofViewSource<'p, Field, FieldExtension, PI>,
+        commit_ood: Option<&[Vec<FieldElement<FieldExtension>>]>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
         if airs.len() != proofs.view_len() {
             error!(
                 "AIR count ({}) does not match proof count ({})",
@@ -1784,6 +1959,17 @@ pub trait IsStarkVerifier<
             }
         }
 
+        // The commitment-time answers (bound proofs): after every root, before
+        // the shared challenges.
+        let z0 = match commit_ood {
+            Some(answers) => match Self::absorb_commit_ood(airs, &proofs, answers, transcript) {
+                Some(z0) => Some(z0),
+                None => return false,
+            },
+            None => None,
+        };
+        let deep_term = crate::commit_ood::deep_term_on();
+
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
         // =====================================================================
@@ -1854,12 +2040,22 @@ pub trait IsStarkVerifier<
             };
 
             // Rounds 2-4: verify
+            let table_ood = match (&z0, commit_ood) {
+                (Some(point), Some(answers)) if deep_term => {
+                    Some(crate::commit_ood::CommitOodTable {
+                        point,
+                        answers: &answers[idx],
+                    })
+                }
+                _ => None,
+            };
             if !Self::verify_rounds_2_to_4(
                 *air,
                 proof,
                 &public_inputs,
                 &mut table_transcript,
                 lookup_challenges.clone(),
+                table_ood,
             ) {
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
@@ -1935,6 +2131,38 @@ pub trait IsStarkVerifier<
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: Vec<FieldElement<FieldExtension>>,
         layout: &crate::ood::OodLayout,
+    ) -> Challenges<FieldExtension>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        Self::replay_rounds_after_round_1_bound(
+            air,
+            proof,
+            public_inputs,
+            domain,
+            transcript,
+            rap_challenges,
+            layout,
+            None,
+        )
+    }
+
+    /// [`Self::replay_rounds_after_round_1`] for a table of a bound proof: the
+    /// same draws, and the DEEP coefficients of its answers (minus each
+    /// answered column's current-row one, `crate::commit_ood`) in
+    /// `Challenges::commit_ood`. The answer count is
+    /// the caller's to have checked.
+    #[allow(clippy::too_many_arguments)]
+    fn replay_rounds_after_round_1_bound(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        public_inputs: &PI,
+        domain: &VerifierDomain<Field>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+        rap_challenges: Vec<FieldElement<FieldExtension>>,
+        layout: &crate::ood::OodLayout,
+        commit_ood: Option<crate::commit_ood::CommitOodTable<'_, FieldExtension>>,
     ) -> Challenges<FieldExtension>
     where
         FieldElement<Field>: AsBytes,
@@ -2029,6 +2257,29 @@ pub trait IsStarkVerifier<
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
 
+        // Each answered column's coefficient at z0 is minus its current-row
+        // one: the column's two quotients form its one two-point quotient
+        // (`crate::commit_ood`).
+        let commit_ood = commit_ood.map(|ood| {
+            let columns = crate::commit_ood::answered_columns(air);
+            let coeffs: Vec<_> = columns
+                .clone()
+                .map(|c| crate::commit_ood::answer_coefficient(&trace_term_coeffs[c][0]))
+                .collect();
+            let answers_sum = coeffs
+                .iter()
+                .zip(ood.answers)
+                .fold(FieldElement::<FieldExtension>::zero(), |acc, (c, v)| {
+                    acc + c * v
+                });
+            CommitOodDeep {
+                point: ood.point.clone(),
+                first_col: columns.start,
+                coeffs,
+                answers_sum,
+            }
+        });
+
         // FRI commit phase. Under one-row openings (S2) the first root is the
         // input tree (the DEEP codeword itself), absorbed BEFORE any folding
         // challenge; every other root follows its challenge as today.
@@ -2094,6 +2345,7 @@ pub trait IsStarkVerifier<
             iotas,
             rap_challenges,
             grinding_seed,
+            commit_ood,
         }
     }
 
@@ -2104,6 +2356,7 @@ pub trait IsStarkVerifier<
         public_inputs: &PI,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: Vec<FieldElement<FieldExtension>>,
+        commit_ood: Option<crate::commit_ood::CommitOodTable<'_, FieldExtension>>,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -2153,7 +2406,7 @@ pub trait IsStarkVerifier<
         #[cfg(feature = "instruments")]
         let timer1 = Instant::now();
 
-        let challenges = Self::replay_rounds_after_round_1(
+        let challenges = Self::replay_rounds_after_round_1_bound(
             air,
             proof,
             public_inputs,
@@ -2161,6 +2414,7 @@ pub trait IsStarkVerifier<
             transcript,
             rap_challenges,
             &layout,
+            commit_ood,
         );
         #[cfg(any(test, feature = "test-utils"))]
         crate::fri::capture::record_challenges(&challenges.zetas, &challenges.iotas);
