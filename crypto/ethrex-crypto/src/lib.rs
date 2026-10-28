@@ -35,9 +35,7 @@ use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar, U256};
 
 // Used only by the x-only point reconstruction (riscv accelerated path + the
 // host unit tests); unused on a non-test host build.
-#[cfg(any(target_arch = "riscv64", test))]
 use k256::elliptic_curve::sec1::FromEncodedPoint;
-#[cfg(any(target_arch = "riscv64", test))]
 use k256::{EncodedPoint, FieldElement};
 
 /// LambdaVM crypto provider — inject via `Arc::new(LambdaVmEcsmCrypto)`.
@@ -148,35 +146,54 @@ where
 /// non-residue regardless of the prover-chosen hint — the hint can only save work,
 /// never steer the accept/reject outcome. Off-target it uses the software
 /// decompress directly.
-fn decompress_r(r_bytes: &FieldBytes, y_is_odd: bool) -> Option<AffinePoint> {
+///
+/// Returns R's affine coordinates, normalized, which is what the recovery uses.
+fn decompress_r_xy(r_bytes: &FieldBytes, y_is_odd: bool) -> Option<(FieldElement, FieldElement)> {
     #[cfg(target_arch = "riscv64")]
     {
-        decompress_r_with_oracle(r_bytes, y_is_odd, |rhs_be| {
+        decompress_r_xy_with_oracle(r_bytes, y_is_odd, |rhs_be| {
             get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_SQRT, rhs_be)
         })
     }
     #[cfg(not(target_arch = "riscv64"))]
     {
         use k256::elliptic_curve::point::DecompressPoint;
-        AffinePoint::decompress(r_bytes, u8::from(y_is_odd).into()).into()
+        let r: Option<AffinePoint> =
+            AffinePoint::decompress(r_bytes, u8::from(y_is_odd).into()).into();
+        affine_xy(&r?)
     }
 }
 
-/// Core of [`decompress_r`], generic over the hint source for host tests: try the
-/// hinted sqrt, then fall back to the authoritative software decompress on any
-/// failure. See [`decompress_r`] for the rationale.
-#[cfg(any(target_arch = "riscv64", test))]
+/// [`decompress_r_xy_with_oracle`] as a curve point (the host tests' view).
+#[cfg(test)]
 fn decompress_r_with_oracle<O>(r_bytes: &FieldBytes, y_is_odd: bool, hint: O) -> Option<AffinePoint>
 where
     O: FnOnce(&[u8; 32]) -> [u8; 32],
 {
-    if let Some(p) = decompress_r_hinted(r_bytes, y_is_odd, hint) {
-        return Some(p);
+    let (x, y) = decompress_r_xy_with_oracle(r_bytes, y_is_odd, hint)?;
+    point_from_xy(&x, &y)
+}
+
+/// Core of [`decompress_r_xy`], generic over the hint source for host tests: try the
+/// hinted sqrt, then fall back to the authoritative software decompress on any
+/// failure. See [`decompress_r_xy`] for the rationale.
+#[cfg(any(target_arch = "riscv64", test))]
+fn decompress_r_xy_with_oracle<O>(
+    r_bytes: &FieldBytes,
+    y_is_odd: bool,
+    hint: O,
+) -> Option<(FieldElement, FieldElement)>
+where
+    O: FnOnce(&[u8; 32]) -> [u8; 32],
+{
+    if let Some(xy) = decompress_r_hinted_xy(r_bytes, y_is_odd, hint) {
+        return Some(xy);
     }
     // Hinted root absent / malformed / wrong, OR a genuine non-residue: the software
     // decompress is authoritative — `Some` for a residue, `None` for a non-residue.
     use k256::elliptic_curve::point::DecompressPoint;
-    AffinePoint::decompress(r_bytes, u8::from(y_is_odd).into()).into()
+    let r: Option<AffinePoint> = AffinePoint::decompress(r_bytes, u8::from(y_is_odd).into()).into();
+    affine_xy(&r?)
 }
 
 /// The hint-accelerated decompress attempt: returns the point only if the hinted
@@ -184,7 +201,11 @@ where
 /// the software decompress. Never the last word — a `None` here is not a decision
 /// that R is invalid, only that the fast path did not produce a verified root.
 #[cfg(any(target_arch = "riscv64", test))]
-fn decompress_r_hinted<O>(r_bytes: &FieldBytes, y_is_odd: bool, hint: O) -> Option<AffinePoint>
+fn decompress_r_hinted_xy<O>(
+    r_bytes: &FieldBytes,
+    y_is_odd: bool,
+    hint: O,
+) -> Option<(FieldElement, FieldElement)>
 where
     O: FnOnce(&[u8; 32]) -> [u8; 32],
 {
@@ -216,9 +237,8 @@ where
     if y_odd != y_is_odd {
         y = -y;
     }
-    // Build the affine point; `from_encoded_point` re-checks it's on-curve.
-    let ep = EncodedPoint::from_affine_coordinates(&x.to_bytes(), &y.to_bytes(), false);
-    Option::from(AffinePoint::from_encoded_point(&ep))
+    // `y² == x³+7` was verified above, so `(x, y)` is R; no curve-point round trip.
+    Some((x.normalize(), y.normalize()))
 }
 
 /// Recover the uncompressed public key bytes (X‖Y, 64 bytes) from a 64-byte
@@ -239,6 +259,31 @@ where
 /// `recover_from_prehash`, which internally runs a *second* lincomb to
 /// re-verify the key — doubling the ECSM ecalls for no gain here.
 fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64], CryptoError> {
+    ecrecover_with(sig, recid, msg, decompress_r_xy, ecsm_lincomb2_xy)
+}
+
+/// [`ecsm_ecrecover`], generic over how R is decompressed and how the linear
+/// combination is evaluated, so the host tests can run the accelerated shape with
+/// software oracles. Both work on affine coordinates, which avoids converting
+/// points to and from their SEC1 encoding at every step.
+fn ecrecover_with<D, L>(
+    sig: &[u8; 64],
+    recid: u8,
+    msg: &[u8; 32],
+    decompress: D,
+    lincomb: L,
+) -> Result<[u8; 64], CryptoError>
+where
+    D: FnOnce(&FieldBytes, bool) -> Option<(FieldElement, FieldElement)>,
+    L: FnOnce(
+        &FieldElement,
+        &FieldElement,
+        &Scalar,
+        &FieldElement,
+        &FieldElement,
+        &Scalar,
+    ) -> Option<(FieldElement, FieldElement)>,
+{
     let r_bytes = <&FieldBytes>::from(&sig[..32]);
     let s_bytes = <&FieldBytes>::from(&sig[32..]);
 
@@ -257,11 +302,9 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64],
     // precompile; we don't handle it (decompression simply fails), matching the
     // trait default.
     let y_is_odd = (recid & 1) != 0;
-    let r_point: Option<AffinePoint> = decompress_r(r_bytes, y_is_odd);
-    let Some(r_point) = r_point else {
+    let Some((rx, ry)) = decompress(r_bytes, y_is_odd) else {
         return Err(CryptoError::RecoveryFailed);
     };
-    let r_proj = ProjectivePoint::from(r_point);
 
     let z = <Scalar as Reduce<U256>>::reduce_bytes(&FieldBytes::from(*msg));
     let r_inv: Option<Scalar> = scalar_inv(&r);
@@ -271,15 +314,30 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64],
     let u1 = -(r_inv * z);
     let u2 = r_inv * s;
 
-    // pk = u1·G + u2·R, accelerated via ECSM with a software fallback.
-    // The ECSM path takes affine inputs and returns the affine result directly:
-    // its inputs (G, R) and output are Z=1 points, so passing affines avoids the
-    // wasteful projective→affine inversions (`to_affine` of a Z=1 point still runs
-    // a full constant-time field inversion in k256). The rare software fallback
-    // still converts via `to_affine`.
-    let g = ProjectivePoint::GENERATOR;
-    let pk_affine = ecsm_lincomb2(&AffinePoint::GENERATOR, &u1, &r_point, &u2)
-        .unwrap_or_else(|| ProjectivePoint::lincomb(&g, &u1, &r_proj, &u2).to_affine());
+    // pk = u1·G + u2·R, accelerated via ECSM with a software fallback. The
+    // accelerated path takes and returns affine coordinates (G's are fixed, R's
+    // come from the decompression); a result it returns has been checked to be on
+    // the curve, and an affine point is never the identity.
+    if let Some((gx, gy)) = generator_xy() {
+        if let Some((xq, yq)) = lincomb(gx, gy, &u1, &rx, &ry, &u2) {
+            let mut pk_bytes = [0u8; 64];
+            pk_bytes[..32].copy_from_slice(&xq.to_bytes());
+            pk_bytes[32..].copy_from_slice(&yq.to_bytes());
+            return Ok(pk_bytes);
+        }
+    }
+
+    // Rare software fallback (degenerate scalars or points, or off-target).
+    let Some(r_point) = point_from_xy(&rx, &ry) else {
+        return Err(CryptoError::RecoveryFailed);
+    };
+    let pk_affine = ProjectivePoint::lincomb(
+        &ProjectivePoint::GENERATOR,
+        &u1,
+        &ProjectivePoint::from(r_point),
+        &u2,
+    )
+    .to_affine();
     if bool::from(pk_affine.is_identity()) {
         return Err(CryptoError::RecoveryFailed);
     }
@@ -291,6 +349,15 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64],
     Ok(pk_bytes)
 }
 
+/// The generator's affine coordinates, computed once.
+fn generator_xy() -> Option<&'static (FieldElement, FieldElement)> {
+    static GENERATOR_XY: std::sync::OnceLock<Option<(FieldElement, FieldElement)>> =
+        std::sync::OnceLock::new();
+    GENERATOR_XY
+        .get_or_init(|| affine_xy(&AffinePoint::GENERATOR))
+        .as_ref()
+}
+
 /// ECSM-accelerated 2-term linear combination `k1·P1 + k2·P2`.
 ///
 /// On riscv64 this reconstructs the full affine result from four x-only ECSM
@@ -298,22 +365,26 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64],
 /// guard trips (degenerate input or oracle inconsistency), it returns `None`
 /// so the caller uses the pure-Rust `ProjectivePoint::lincomb`.
 #[cfg(target_arch = "riscv64")]
-fn ecsm_lincomb2(
-    a1: &AffinePoint,
+fn ecsm_lincomb2_xy(
+    x1: &FieldElement,
+    y1: &FieldElement,
     k1: &Scalar,
-    a2: &AffinePoint,
+    x2: &FieldElement,
+    y2: &FieldElement,
     k2: &Scalar,
-) -> Option<AffinePoint> {
-    lincomb2_with_oracle(a1, k1, a2, k2, ecsm_oracle)
+) -> Option<(FieldElement, FieldElement)> {
+    lincomb2_xy_with_oracle(x1, y1, k1, x2, y2, k2, ecsm_oracle)
 }
 
 #[cfg(not(target_arch = "riscv64"))]
-fn ecsm_lincomb2(
-    _a1: &AffinePoint,
+fn ecsm_lincomb2_xy(
+    _x1: &FieldElement,
+    _y1: &FieldElement,
     _k1: &Scalar,
-    _a2: &AffinePoint,
+    _x2: &FieldElement,
+    _y2: &FieldElement,
     _k2: &Scalar,
-) -> Option<AffinePoint> {
+) -> Option<(FieldElement, FieldElement)> {
     None
 }
 
@@ -403,7 +474,7 @@ where
 /// then `Q = A + B` is one affine addition. All three inversions are batched.
 ///
 /// Generic over the oracle so unit tests can substitute a software stand-in.
-#[cfg(any(target_arch = "riscv64", test))]
+#[cfg(test)]
 fn lincomb2_with_oracle<O>(
     a1: &AffinePoint,
     k1: &Scalar,
@@ -414,17 +485,35 @@ fn lincomb2_with_oracle<O>(
 where
     O: Fn(&FieldElement, &Scalar) -> Option<FieldElement>,
 {
-    // Inputs are affine already (the ecrecover path lifts them from known Z=1
-    // points), so no projective→affine inversion is needed here.
     if bool::from(a1.is_identity()) || bool::from(a2.is_identity()) {
         return None;
     }
+    let (x1, y1) = affine_xy(a1)?;
+    let (x2, y2) = affine_xy(a2)?;
+    let (xq, yq) = lincomb2_xy_with_oracle(&x1, &y1, k1, &x2, &y2, k2, oracle)?;
+    point_from_xy(&xq, &yq)
+}
+
+/// [`lincomb2_with_oracle`] on affine coordinates `(x1, y1)` and `(x2, y2)` of two
+/// non-identity curve points, returning the result's normalized coordinates once
+/// they are checked to be on the curve.
+#[cfg(any(target_arch = "riscv64", test))]
+fn lincomb2_xy_with_oracle<O>(
+    x1: &FieldElement,
+    y1: &FieldElement,
+    k1: &Scalar,
+    x2: &FieldElement,
+    y2: &FieldElement,
+    k2: &Scalar,
+    oracle: O,
+) -> Option<(FieldElement, FieldElement)>
+where
+    O: Fn(&FieldElement, &Scalar) -> Option<FieldElement>,
+{
     if scalar_near_edge(k1) || scalar_near_edge(k2) {
         return None;
     }
-
-    let (x1, y1) = affine_xy(a1)?;
-    let (x2, y2) = affine_xy(a2)?;
+    let (x1, y1, x2, y2) = (*x1, *y1, *x2, *y2);
 
     let xa = oracle(&x1, k1)?;
     let xc1 = oracle(&x1, &(*k1 + Scalar::ONE))?;
@@ -454,11 +543,23 @@ where
     let xq = (lq.square() - xa - xb).normalize();
     let yq = (lq * (xa - xq) - ya).normalize();
 
-    // `point_from_xy` checks the result is on the curve as a cheap backstop:
+    // The result is checked to be on the curve (`y² == x³+7`) as a cheap backstop:
     // it rejects gross off-curve garbage and falls back to software, but
     // correctness rests on the algebra above — an on-curve-but-wrong point
     // would still pass this check.
-    point_from_xy(&xq, &yq)
+    if !is_on_curve(&xq, &yq) {
+        return None;
+    }
+    Some((xq, yq))
+}
+
+/// `y² == x³ + 7` for field elements of magnitude 1.
+#[cfg(any(target_arch = "riscv64", test))]
+fn is_on_curve(x: &FieldElement, y: &FieldElement) -> bool {
+    let seven = FieldElement::from_u64(7);
+    let rhs = x.square() * x + seven;
+    // Negate `y²` (magnitude 1), not `rhs` (magnitude 2): see `decompress_r_hinted_xy`.
+    bool::from((rhs + y.square().negate(1)).normalizes_to_zero())
 }
 
 /// Recovers `y(k·P)` from `xa = x(k·P)` and `xc = x((k+1)·P)`.
@@ -495,7 +596,6 @@ fn scalar_near_edge(k: &Scalar) -> bool {
 
 /// Affine `(x, y)` of a non-identity point as field elements, via its SEC1
 /// uncompressed encoding (k256 keeps `AffinePoint`'s coordinate fields private).
-#[cfg(any(target_arch = "riscv64", test))]
 fn affine_xy(p: &AffinePoint) -> Option<(FieldElement, FieldElement)> {
     let ep = p.to_encoded_point(false);
     let x = Option::<FieldElement>::from(FieldElement::from_bytes(ep.x()?))?;
@@ -505,7 +605,6 @@ fn affine_xy(p: &AffinePoint) -> Option<(FieldElement, FieldElement)> {
 
 /// Builds an affine curve point from coordinates, returning `None` if the point
 /// is not on the curve (`AffinePoint::from_encoded_point` validates this).
-#[cfg(any(target_arch = "riscv64", test))]
 fn point_from_xy(x: &FieldElement, y: &FieldElement) -> Option<AffinePoint> {
     let ep = EncodedPoint::from_affine_coordinates(&x.to_bytes(), &y.to_bytes(), false);
     Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&ep))

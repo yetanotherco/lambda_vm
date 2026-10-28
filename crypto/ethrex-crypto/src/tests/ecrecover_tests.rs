@@ -124,3 +124,87 @@ fn ecrecover_rejects_zero_r() {
         "expected InvalidSignature for zero r"
     );
 }
+
+/// Software stand-in for the ECSM precompile: `x(k·P)` for the point with
+/// x-coordinate `x` (parity-invariant, like the real ecall).
+fn soft_ecsm(x: &FieldElement, k: &Scalar) -> Option<FieldElement> {
+    let xn = x.normalize();
+    let y2 = (xn.square() * xn + FieldElement::from_u64(7)).normalize();
+    let y = Option::<FieldElement>::from(y2.sqrt())?;
+    let p = point_from_xy(&xn, &y.normalize())?;
+    Some(affine_xy(&(p * k).to_affine())?.0)
+}
+
+/// Software stand-in for the field square-root hint.
+fn soft_sqrt(rhs_be: &[u8; 32]) -> [u8; 32] {
+    let rhs = Option::<FieldElement>::from(FieldElement::from_bytes(&(*rhs_be).into()))
+        .expect("canonical");
+    match Option::<FieldElement>::from(rhs.sqrt()) {
+        Some(y) => y.to_bytes().into(),
+        None => [0u8; 32],
+    }
+}
+
+/// The accelerated recovery shape (R decompressed through the hint, the linear
+/// combination through x-only queries, all on affine coordinates) with software
+/// oracles, against the expected public key and against the software path
+/// `ecsm_ecrecover` takes on the host. Honest and lying hints, both parities.
+#[test]
+fn accelerated_shape_recovers_the_signing_key() {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    let mut checked = 0;
+    while checked < 300 {
+        let d = Scalar::from(next()) * Scalar::from(next()) + Scalar::from(next());
+        let kk = Scalar::from(next()) * Scalar::from(next()) + Scalar::from(next());
+        let mut msg = [0u8; 32];
+        for chunk in msg.chunks_mut(8) {
+            chunk.copy_from_slice(&next().to_le_bytes());
+        }
+        if bool::from(d.is_zero()) || bool::from(kk.is_zero()) {
+            continue;
+        }
+        // Skip the ~2^-128 nonces whose R.x needs the high-x recovery id.
+        let r_point = (ProjectivePoint::GENERATOR * kk).to_affine();
+        let rx = affine_xy(&r_point).unwrap().0;
+        if <Scalar as Reduce<U256>>::reduce_bytes(&rx.to_bytes()).to_bytes() != rx.to_bytes() {
+            continue;
+        }
+        let (sig, recid, _) = make_ecdsa_fixture(d, kk, msg);
+        let q = (ProjectivePoint::GENERATOR * d).to_affine();
+        let mut want = [0u8; 64];
+        want.copy_from_slice(&q.to_encoded_point(false).as_bytes()[1..65]);
+
+        for (lie, parity_flip) in [(false, false), (true, false), (false, true)] {
+            let recid = recid ^ u8::from(parity_flip);
+            let got = ecrecover_with(
+                &sig,
+                recid,
+                &msg,
+                |r, odd| {
+                    if lie {
+                        decompress_r_xy_with_oracle(r, odd, |_| [0x11; 32])
+                    } else {
+                        decompress_r_xy_with_oracle(r, odd, soft_sqrt)
+                    }
+                },
+                |x1, y1, k1, x2, y2, k2| lincomb2_xy_with_oracle(x1, y1, k1, x2, y2, k2, soft_ecsm),
+            );
+            let got = got.ok();
+            let software = ecsm_ecrecover(&sig, recid, &msg).ok();
+            assert_eq!(
+                got, software,
+                "round {checked} lie {lie} flip {parity_flip}"
+            );
+            if !parity_flip {
+                assert_eq!(got, Some(want), "round {checked} lie {lie}");
+            }
+        }
+        checked += 1;
+    }
+}
