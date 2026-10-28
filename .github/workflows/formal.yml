@@ -1,0 +1,54 @@
+name: Formal model
+
+on:
+  push:
+    branches: ["main"]
+    paths: ["formal/**", ".github/workflows/formal.yml"]
+  pull_request:
+    paths: ["formal/**", ".github/workflows/formal.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  lean:
+    name: Lean build and export check
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: formal
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install elan
+        run: |
+          curl https://elan.lean-lang.org/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      # Clean and CompPoly are compiled from source; Mathlib comes from its own cache below.
+      - name: Cache Lake builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            formal/.lake
+            !formal/.lake/packages/mathlib
+          key: lake-${{ hashFiles('formal/lean-toolchain', 'formal/lake-manifest.json') }}-${{ github.sha }}
+          restore-keys: |
+            lake-${{ hashFiles('formal/lean-toolchain', 'formal/lake-manifest.json') }}-
+
+      - name: Fetch Mathlib binaries
+        run: lake exe cache get
+
+      - name: Build
+        run: lake build
+
+      - name: Export is up to date
+        run: |
+          lake env lean --run LambdaVM/Export.lean
+          git diff --exit-code -- export
