@@ -2099,10 +2099,12 @@ fn without_live_regeneration_every_table_is_held() {
 /// ★ The hand-off at the walk's end arms live regeneration and moves no byte:
 /// with the target out of reach the `auto` rule never arms on its own, and the
 /// hand-off (here asked for everything, whatever the forecast) arms it before
-/// the finish: tables are dropped and rebuilt in phase B, and the proof
-/// verifies with the same partition, its bytes equal to regeneration off's
-/// under the deterministic grind. Without the deviation the forecast stays
-/// under the line, and nothing drops.
+/// the finish: every chunk parked by then is dropped and rebuilt in phase B,
+/// and the proof verifies with the same partition, its bytes equal to
+/// regeneration off's under the deterministic grind. Without the deviation the
+/// forecast stays under the line, and nothing drops. How many chunks phase A
+/// has parked when the walk ends depends on scheduling (none, under load), so
+/// the drops are required only when some were parked at arming.
 #[test]
 fn a_hand_off_at_the_walk_arms_live_regeneration_and_moves_no_byte() {
     use crate::block_whir::regen::RegenMode;
@@ -2140,10 +2142,15 @@ fn a_hand_off_at_the_walk_arms_live_regeneration_and_moves_no_byte() {
     let (handed, stamps) = proved(RegenMode::Auto, true);
     let r = stamps.regen.expect("live regeneration's readout");
     let lines = r.lines.join("\n");
-    assert!(r.dropped > 0, "the hand-off armed nothing\n{lines}");
+    assert!(
+        lines.contains("armed at"),
+        "the hand-off armed nothing\n{lines}"
+    );
+    if r.armed_kept > 0 {
+        assert!(r.dropped > 0, "the hand-off dropped nothing\n{lines}");
+    }
     assert_eq!(r.regenerated, r.dropped, "every table back\n{lines}");
     assert_eq!((r.mismatches, r.failed), (0, 0), "{lines}");
-    assert!(lines.contains("armed at"), "{lines}");
     for (what, proof) in [("unarmed", &unarmed), ("handed off", &handed)] {
         assert_eq!(proof.groups, plain.groups, "{what}: the partition");
         if crypto::grinding::deterministic() {

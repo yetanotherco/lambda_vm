@@ -2810,6 +2810,9 @@ pub struct RegenStamps {
     /// Live regeneration: the chunks phase A dropped, and their packed bytes.
     pub dropped: usize,
     pub dropped_bytes: u64,
+    /// The chunks parked as droppable when live regeneration armed, before
+    /// any drop-back: what a hand-off at that moment could drop.
+    pub armed_kept: usize,
     pub digested: usize,
     pub stray: usize,
     pub regenerated: usize,

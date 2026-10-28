@@ -6612,6 +6612,7 @@ fn prove_streamed(
                 recipes,
                 dropped: drops.tables,
                 dropped_bytes: drops.bytes,
+                armed_kept: drops.armed_kept.0,
                 regenerated: report.as_ref().map_or(0, |r| r.deposited)
                     + rest_report.as_ref().map_or(0, |r| r.deposited),
                 mismatches: report.as_ref().map_or(0, |r| r.mismatches)
