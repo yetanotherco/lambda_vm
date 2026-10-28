@@ -3,7 +3,7 @@ compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-s
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-ethrex-offline test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-profile-recursion-block recursion-profile-block-input \
-test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-blake3-host-kat test-rpx-host-kat test-p1w16-host-kat test-ntt-cm-host-kat test-whir-host-kat test-gkr-host-kat test-eq-dot-host-kat test-round-slot-host-kat test-fill-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
+test-fast test-prover test-prover-all test-prover-debug test-math-cuda test-blake3-host-kat test-rpx-host-kat test-p1w16-host-kat test-ntt-cm-host-kat test-whir-host-kat test-gkr-host-kat test-eq-dot-host-kat test-round-slot-host-kat test-fill-host-kat test-blake3-second-source test-cuda-integration test-cuda-d1 test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture \
@@ -601,11 +601,6 @@ test-prover-all: compile-recursion-elfs
 # it runs the non-ignored recursion tests that read prebuilt guest ELFs.
 test-prover-debug: compile-recursion-elfs
 	cargo test -p lambda-vm-prover --features debug-checks -- --nocapture
-
-# Disk-spill tests (stark + prover). FORCE_DISK_SPILL is required by the prover tests.
-test-disk-spill:
-	cargo test --release -p stark --features disk-spill disk_spill
-	FORCE_DISK_SPILL=1 cargo test --release -p lambda-vm-prover --features disk-spill -- disk_spill count_table_lengths
 
 # Per-target wall clock for the GPU prover targets below. A panic on a device-only
 # cliff assert can leave the prover hung rather than aborting — the panicking thread
