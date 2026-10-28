@@ -803,9 +803,8 @@ pub(crate) fn expected_public_balance(
 // Presets
 // ===========================================================================
 
-/// The wrap layer's options when the wrap feeds the AGGREGATOR: blowup 4
-/// (110 queries at the 128-bit Johnson-bound target) with the FRI terminal at
-/// degree 2^8.
+/// The wrap layer's options when the wrap feeds the AGGREGATOR: blowup 4 with
+/// [`LFM_QUERIES`] queries and the FRI terminal at degree 2^8.
 ///
 /// The choice optimizes the wrap's VERIFIER — the aggregation program pays
 /// per query per wrap, and 110 queries against blowup-4 trees nearly halve
@@ -831,10 +830,18 @@ pub fn aggregation_wrap_options() -> ProofOptions {
 pub fn aggregation_wrap_options_under(zf: &crate::zf_format::ZfFormat) -> ProofOptions {
     let mut opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(4)
         .expect("blowup=4 is valid");
+    opts.fri_number_of_queries = LFM_QUERIES;
     opts.fri_final_poly_log_degree = 8;
     zf.options(opts)
 }
 
+/// The LFM proofs' query count: two above the blowup-4 preset's 110, which
+/// the preset derives for 128 bits at the Johnson radius with a 20-bit grind
+/// (`with_params`: ⌈108 / −log2(1/2 + 1/300)⌉). Each query adds ≈ 0.99 bits
+/// there, so the two keep the query term ≈ 2 bits above 128 (≈ 130.9) — a
+/// margin bought with queries rather than grinding, which costs the LFM
+/// prover four times the nonce search for the same two bits.
+pub const LFM_QUERIES: usize = 112;
 
 /// The STARK block's base-epoch options: the blowup-4 preset the production
 /// tree proves its epochs under, with the process's
