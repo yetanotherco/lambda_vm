@@ -45,13 +45,7 @@ fn prove_on(transcript: &mut DefaultTranscript<E>) -> Result<MultiProof<F, E, ()
         (&add_air, &mut add, &()),
         (&mul_air, &mut mul, &()),
     ];
-    Prover::multi_prove(
-        pairs,
-        transcript,
-        #[cfg(feature = "disk-spill")]
-        crate::storage_mode::StorageMode::Ram,
-        ResidencyMode::Retain,
-    )
+    Prover::multi_prove(pairs, transcript, ResidencyMode::Retain)
 }
 
 /// ★ Under a cap below every table's device set the prove is refused, naming

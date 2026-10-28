@@ -223,8 +223,6 @@ pub(crate) fn prove_multi<H: StarkHash>(options: &ProofOptions) -> MultiProof<F,
     GenericProver::<F, E, (), H>::multi_prove(
         pairs,
         &mut DefaultTranscript::<E>::new(&[]),
-        #[cfg(feature = "disk-spill")]
-        crate::storage_mode::StorageMode::Ram,
         ResidencyMode::default(),
     )
     .expect("proving must succeed")

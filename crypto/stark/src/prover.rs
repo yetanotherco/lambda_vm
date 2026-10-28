@@ -13,7 +13,6 @@ use math::fft::two_half_fft::TwoHalfTwiddles;
 
 use log::info;
 use math::field::traits::{IsField, IsSubFieldOf};
-use math::spill_safe::SpillSafe;
 use math::traits::AsBytes;
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
@@ -30,8 +29,6 @@ use crate::leaf_layout::LeafLayout;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 use crate::residency_mode::ResidencyMode;
-#[cfg(feature = "disk-spill")]
-use crate::storage_mode::StorageMode;
 use crate::table::Table;
 use crate::trace::LDETraceTable;
 
@@ -108,10 +105,6 @@ pub enum ProvingError {
     /// take the other layout's root — a proof every verifier rejects — or
     /// rebuild a whole preprocessed LDE and tree behind the operator's back.
     PrecomputedCommitmentMissing(String),
-    /// I/O failure while spilling prover state (traces, LDE, Merkle trees) to disk:
-    /// out of disk space, fd exhaustion, or mmap failure.
-    #[cfg(feature = "disk-spill")]
-    DiskSpill(String),
     /// An internal FFT/LDE computation failed (e.g. domain size exceeds the
     /// field's two-adicity, or a degenerate coset offset). Distinct from
     /// `WrongParameter` because the cause is internal prover machinery, not a
@@ -980,8 +973,7 @@ where
     (d, t, true)
 }
 
-/// Explicit `TABLE_PARALLELISM` override, honoured by both `k` values below so
-/// setting it pins the scheduler and the storage estimate to the same number.
+/// Explicit `TABLE_PARALLELISM` override of the scheduler's `k` below.
 #[cfg(feature = "parallel")]
 fn parallelism_override() -> Option<usize> {
     std::env::var("TABLE_PARALLELISM")
@@ -989,7 +981,7 @@ fn parallelism_override() -> Option<usize> {
         .and_then(|s| s.parse().ok())
 }
 
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", not(feature = "cuda")))]
 fn host_cores() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -1032,44 +1024,6 @@ pub fn table_parallelism(num_airs: usize) -> usize {
     #[cfg(not(feature = "parallel"))]
     {
         let _ = num_airs;
-        1
-    }
-}
-
-/// How many tables' rounds 2-4 transients the *RAM* estimate assumes are alive
-/// at once (`auto_storage::peak_bytes` sums the transient bytes of the top-k
-/// tables, and `decide` turns that into RAM vs Disk).
-///
-/// Deliberately not `table_parallelism(num_airs)`. That is a ceiling, not a
-/// bound: on a `cuda` build what actually limits how many tables are in flight
-/// is `VramGate`'s byte budget, which this host-side estimate cannot see.
-/// Feeding an unbounded count in here would sum *every* table's transients —
-/// on many-PAGE shapes that inflates the estimate by up to +44 % (512 PAGE
-/// tables at blowup 4) and would spill proofs to disk that fit in RAM. On the
-/// shapes that reach this path today (~21 tables, one PAGE table) the top-k sum
-/// has all but saturated, so this value and `num_airs` agree to well under 1 %.
-///
-/// Kept at exactly the value it had when the scheduler shared it, so splitting
-/// the two does not move any storage decision.
-///
-/// TODO: derive this from a byte budget rather than a table count, so it
-/// tracks what `VramGate` admits instead of standing in for it.
-pub fn storage_estimate_parallelism() -> usize {
-    #[cfg(feature = "parallel")]
-    {
-        parallelism_override().unwrap_or_else(|| {
-            #[cfg(feature = "cuda")]
-            {
-                (host_cores() * 2 / 3).max(1)
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                (host_cores() / 3).max(1)
-            }
-        })
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
         1
     }
 }
@@ -1803,7 +1757,6 @@ pub trait IsStarkProver<
         precomputed: Option<(Commitment, usize)>,
         layout: LeafLayout,
         #[cfg(feature = "cuda")] device_only: bool,
-        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
         #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] residency: ResidencyMode,
     ) -> Result<MainCommitTuple<Field, H>, ProvingError>
     where
@@ -1816,8 +1769,8 @@ pub trait IsStarkProver<
         //
         // `RecomputeLde` skips both device paths: the LDE it drops after this
         // commit is recomputed on the host, so the buffer the tree was built
-        // from must be the host one. Same posture as disk-spill — the mode is
-        // for CPU proving and forces the host path per table.
+        // from must be the host one. The mode is for CPU proving and forces
+        // the host path per table.
         let rows_per_leaf = layout.rows_per_leaf();
         #[cfg(feature = "cuda")]
         if precomputed.is_none() && !residency.recomputes_main_lde() {
@@ -1886,9 +1839,6 @@ pub trait IsStarkProver<
             } else {
                 0
             };
-            #[cfg(feature = "disk-spill")]
-            let cache_ok = storage_mode != StorageMode::Disk;
-            #[cfg(not(feature = "disk-spill"))]
             let cache_ok = true;
             let cached_pre = cache_ok
                 .then(|| {
@@ -1935,8 +1885,6 @@ pub trait IsStarkProver<
                         if tree.root != expected_precomputed_root {
                             return Err(ProvingError::PrecomputedCommitmentMismatch);
                         }
-                        #[cfg(feature = "disk-spill")]
-                        Self::spill_tree(&mut tree, storage_mode, "precomputed Merkle tree")?;
                         let tree = Arc::new(tree);
                         if cache_ok {
                             precomputed_tree_cache_put::<H::Batched<Field>>(
@@ -1950,8 +1898,6 @@ pub trait IsStarkProver<
                 };
                 #[allow(unused_mut)]
                 let mut mult_tree = mult_tree;
-                #[cfg(feature = "disk-spill")]
-                Self::spill_tree(&mut mult_tree, storage_mode, "mult Merkle tree")?;
                 let mult_root = mult_tree.root;
                 let commit = TableCommit::preprocessed(
                     mult_tree,
@@ -1972,13 +1918,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
 
-        let (main_data, total_cols) = Self::expand_main_lde_row_major(
-            trace,
-            domain,
-            twiddles,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        );
+        let (main_data, total_cols) = Self::expand_main_lde_row_major(trace, domain, twiddles);
 
         #[cfg(feature = "instruments")]
         let main_lde_dur = t_sub.elapsed();
@@ -1992,8 +1932,6 @@ pub trait IsStarkProver<
                 let (mut tree, root) =
                     Self::commit_rows_bit_reversed_with(&main_data, total_cols, rows_per_leaf)
                         .ok_or(ProvingError::EmptyCommitment)?;
-                #[cfg(feature = "disk-spill")]
-                Self::spill_tree(&mut tree, storage_mode, "main Merkle tree")?;
                 TableCommit::plain(tree, root)
             }
             Some((expected_precomputed_root, num_precomputed)) => {
@@ -2001,11 +1939,7 @@ pub trait IsStarkProver<
                 // precomputed-columns tree is a pure function of (content,
                 // domain) already pinned by `expected_precomputed_root`, so it
                 // is reused from the process cache when this exact commitment
-                // was built before — across epochs and across proves. Bypassed
-                // in disk-spill Disk mode, where trees are spilled (mutated).
-                #[cfg(feature = "disk-spill")]
-                let cache_ok = storage_mode != StorageMode::Disk;
-                #[cfg(not(feature = "disk-spill"))]
+                // was built before — across epochs and across proves.
                 let cache_ok = true;
                 let precomputed_tree = match cache_ok
                     .then(|| {
@@ -2032,8 +1966,6 @@ pub trait IsStarkProver<
                         if root != expected_precomputed_root {
                             return Err(ProvingError::PrecomputedCommitmentMismatch);
                         }
-                        #[cfg(feature = "disk-spill")]
-                        Self::spill_tree(&mut tree, storage_mode, "precomputed Merkle tree")?;
                         let tree = Arc::new(tree);
                         if cache_ok {
                             precomputed_tree_cache_put::<H::Batched<Field>>(
@@ -2054,8 +1986,6 @@ pub trait IsStarkProver<
                     rows_per_leaf,
                 )
                 .ok_or(ProvingError::EmptyCommitment)?;
-                #[cfg(feature = "disk-spill")]
-                Self::spill_tree(&mut mult_tree, storage_mode, "mult Merkle tree")?;
                 TableCommit::preprocessed(
                     mult_tree,
                     mult_root,
@@ -2087,18 +2017,12 @@ pub trait IsStarkProver<
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
-        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> (Vec<FieldElement<Field>>, usize) {
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let (trace_data, total_cols) = trace.main_data_row_major();
 
         let mut main_data: Vec<FieldElement<Field>> = Vec::with_capacity(lde_size * total_cols);
         main_data.extend_from_slice(trace_data);
-
-        #[cfg(feature = "disk-spill")]
-        if storage_mode == StorageMode::Disk {
-            trace.main_table.advise_drop_cache();
-        }
 
         Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major::<Field>(
             &mut main_data,
@@ -2171,7 +2095,6 @@ pub trait IsStarkProver<
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
-        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> (Vec<FieldElement<FieldExtension>>, usize) {
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let (trace_data, total_cols) = trace.aux_data_row_major();
@@ -2179,11 +2102,6 @@ pub trait IsStarkProver<
         let mut aux_data: Vec<FieldElement<FieldExtension>> =
             Vec::with_capacity(lde_size * total_cols);
         aux_data.extend_from_slice(trace_data);
-
-        #[cfg(feature = "disk-spill")]
-        if storage_mode == StorageMode::Disk {
-            trace.aux_table.advise_drop_cache();
-        }
 
         Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<Field>(
             &mut aux_data,
@@ -2196,26 +2114,6 @@ pub trait IsStarkProver<
         .expect("row-major aux coset LDE expansion");
 
         (aux_data, total_cols)
-    }
-
-    /// Spill a committed Merkle tree to disk when `storage_mode` is `Disk`,
-    /// tagging any I/O error with `label`. No-op otherwise. Shared by every commit
-    /// site (main / preprocessed split / aux).
-    #[cfg(feature = "disk-spill")]
-    fn spill_tree<C>(
-        tree: &mut MerkleTree<H::Batched<C>>,
-        storage_mode: StorageMode,
-        label: &str,
-    ) -> Result<(), ProvingError>
-    where
-        C: IsField,
-        FieldElement<C>: AsBytes + Sync + Send,
-    {
-        if storage_mode == StorageMode::Disk {
-            tree.spill_nodes_to_disk()
-                .map_err(|e| ProvingError::DiskSpill(format!("{label}: {e}")))?;
-        }
-        Ok(())
     }
 
     /// Recompute Round1 from the trace, reusing the Merkle trees stored in commitments.
@@ -3451,8 +3349,8 @@ pub trait IsStarkProver<
 
     /// The height-`c` cap of one tree of depth `depth`.
     ///
-    /// A full host tree serves it from its heap (`MerkleTree::cap`, disk-spill
-    /// safe), after checking the tree's depth is the verifier's. A root-only
+    /// A full host tree serves it from its heap (`MerkleTree::cap`), after
+    /// checking the tree's depth is the verifier's. A root-only
     /// host tree means the nodes are device-resident: `device(c)` reads the
     /// cap off the resident tree, and `None` from it (no resident tree) is a
     /// hard error naming the tree — never a skipped cap, which would ship
@@ -4540,7 +4438,6 @@ pub trait IsStarkProver<
     fn multi_prove(
         #[allow(unused_mut)] mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
-        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
         residency: ResidencyMode,
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
     where
@@ -4549,8 +4446,6 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
         Field: Copy + 'static,
         FieldExtension: Copy + 'static,
-        <Field as IsField>::BaseType: SpillSafe,
-        <FieldExtension as IsField>::BaseType: SpillSafe,
     {
         info!("Started proof generation...");
         let __ps = crate::prove_split::begin();
@@ -4706,17 +4601,6 @@ pub trait IsStarkProver<
             describe_walk(&main_walk_order, &main_walk_weights, &table_names)
         );
 
-        // Spill main traces to mmap before Round 1 LDE.
-        #[cfg(feature = "disk-spill")]
-        if storage_mode == StorageMode::Disk {
-            crate::par::par_try_for_each_mut(&mut air_trace_pairs, |(_, trace, _)| {
-                trace
-                    .main_table
-                    .spill_to_disk()
-                    .map_err(|e| ProvingError::DiskSpill(format!("early main: {e}")))
-            })?;
-        }
-
         crate::prove_split::add(&crate::prove_split::PREPASS, __ps_prepass);
         #[cfg(feature = "instruments")]
         drop(__sp);
@@ -4796,8 +4680,6 @@ pub trait IsStarkProver<
                     layout,
                     #[cfg(feature = "cuda")]
                     device_only,
-                    #[cfg(feature = "disk-spill")]
-                    storage_mode,
                     residency,
                 )
             },
@@ -4861,15 +4743,6 @@ pub trait IsStarkProver<
         // Aux build, aux commit and rounds 2-4 run FUSED per table below (one
         // driver chains all three for its table, so tables never wait on a
         // phase barrier); only this sequential prep runs here.
-
-        // Disk-spill needs the aux columns in the host trace to spill them, so
-        // disable the GPU-resident aux build (it would keep them device-only).
-        #[cfg(all(feature = "cuda", feature = "disk-spill"))]
-        if storage_mode == StorageMode::Disk {
-            for (_, trace, _) in air_trace_pairs.iter_mut() {
-                trace.set_resident_aux_ok(false);
-            }
-        }
 
         // `RecomputeLde` already forced the main commit onto the host path;
         // keeping the aux build there too makes the mode wholly host-side, which
@@ -5008,12 +4881,6 @@ pub trait IsStarkProver<
                     handle.trace_dev = None;
                     handle.trace_rows = 0;
                 }
-            }
-            #[cfg(feature = "disk-spill")]
-            if storage_mode == StorageMode::Disk && air.has_aux_trace() {
-                trace
-                    .spill_aux_to_disk()
-                    .map_err(|e| ProvingError::DiskSpill(format!("aux trace: {e}")))?;
             }
             #[cfg(feature = "instruments")]
             drop(__sp);
@@ -5158,13 +5025,8 @@ pub trait IsStarkProver<
                         let t_sub = Instant::now();
 
                         let _ = lde_size;
-                        let (aux_data, total_cols) = Self::expand_aux_lde_row_major(
-                            trace,
-                            domain,
-                            twiddles,
-                            #[cfg(feature = "disk-spill")]
-                            storage_mode,
-                        );
+                        let (aux_data, total_cols) =
+                            Self::expand_aux_lde_row_major(trace, domain, twiddles);
                         #[allow(unused_mut)]
                         let mut aux_data = aux_data;
 
@@ -5179,8 +5041,6 @@ pub trait IsStarkProver<
                             layout.rows_per_leaf(),
                         )
                         .ok_or(ProvingError::EmptyCommitment)?;
-                        #[cfg(feature = "disk-spill")]
-                        Self::spill_tree(&mut tree, storage_mode, "aux Merkle tree")?;
                         let commit = TableCommit::plain(tree, root);
                         #[cfg(feature = "instruments")]
                         crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
@@ -5229,13 +5089,7 @@ pub trait IsStarkProver<
                 MainLdeSlot::Dropped { num_cols } => {
                     #[cfg(feature = "instruments")]
                     let __sp_recompute = crate::instruments::span("r1_main_lde_recompute_table");
-                    let recomputed = Self::expand_main_lde_row_major(
-                        &**trace,
-                        domain,
-                        twiddles,
-                        #[cfg(feature = "disk-spill")]
-                        storage_mode,
-                    );
+                    let recomputed = Self::expand_main_lde_row_major(&**trace, domain, twiddles);
                     assert_eq!(
                         recomputed.1, num_cols,
                         "recomputed main LDE width must match the committed one"
@@ -5455,18 +5309,10 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
         Field: Copy + 'static,
         FieldExtension: Copy + 'static,
-        <Field as IsField>::BaseType: SpillSafe,
-        <FieldExtension as IsField>::BaseType: SpillSafe,
     {
         let air_trace_pairs = vec![(air, trace, pub_inputs)];
-        Self::multi_prove(
-            air_trace_pairs,
-            transcript,
-            #[cfg(feature = "disk-spill")]
-            StorageMode::Ram,
-            ResidencyMode::Retain,
-        )
-        .map(|mut multi_proof| multi_proof.proofs.remove(0))
+        Self::multi_prove(air_trace_pairs, transcript, ResidencyMode::Retain)
+            .map(|mut multi_proof| multi_proof.proofs.remove(0))
     }
 
     // TODO: propagate errors instead of unwrap() in open_deep_composition_poly and FRI operations

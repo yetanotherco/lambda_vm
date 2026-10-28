@@ -1437,8 +1437,8 @@ where
         // Without `parallel`: sequential over pairs, sequential over rows.
         let interactions = &self.auxiliary_trace_build_data.interactions;
 
-        // GPU-resident aux build (Goldilocks + ext3, not disk-spill, not
-        // debug-checks): build the aux columns on device and keep them resident
+        // GPU-resident aux build (Goldilocks + ext3, not debug-checks):
+        // build the aux columns on device and keep them resident
         // for the aux LDE (no term-column download). Returns the table
         // contribution; the host set_aux + CPU accumulate below are skipped.
         #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]

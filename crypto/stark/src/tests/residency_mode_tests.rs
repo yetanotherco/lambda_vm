@@ -124,14 +124,7 @@ fn prove_under(residency: ResidencyMode) -> MultiProof<F, E, ()> {
         (&mul_air, &mut mul_trace, &()),
     ];
 
-    Prover::multi_prove(
-        pairs,
-        &mut DefaultTranscript::<E>::new(&[]),
-        #[cfg(feature = "disk-spill")]
-        crate::storage_mode::StorageMode::Ram,
-        residency,
-    )
-    .unwrap()
+    Prover::multi_prove(pairs, &mut DefaultTranscript::<E>::new(&[]), residency).unwrap()
 }
 
 fn verifies(proof: &MultiProof<F, E, ()>) -> bool {
@@ -240,14 +233,7 @@ fn recompute_lde_releases_aux_columns_and_retain_keeps_them() {
                 (&add_air, &mut add_trace, &()),
                 (&mul_air, &mut mul_trace, &()),
             ];
-            Prover::multi_prove(
-                pairs,
-                &mut DefaultTranscript::<E>::new(&[]),
-                #[cfg(feature = "disk-spill")]
-                crate::storage_mode::StorageMode::Ram,
-                residency,
-            )
-            .unwrap();
+            Prover::multi_prove(pairs, &mut DefaultTranscript::<E>::new(&[]), residency).unwrap();
         }
 
         for (name, trace) in [
