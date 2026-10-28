@@ -1,9 +1,11 @@
 use ethrex_guest_program::l1::ProgramInput;
 use rkyv::rancor::Error;
 
-// Keep the same checked rkyv access and shared-pointer pooling as from_bytes.
-// Reserve a bounded estimate for larger witnesses to avoid repeated rehashes;
-// underestimated tables still grow normally and small inputs keep the default.
+// The same checked rkyv access as from_bytes. Validation tracks every shared
+// pointer, so its table is reserved at a bounded estimate for larger witnesses to
+// avoid repeated rehashes; an underestimate still grows and small inputs keep the
+// default. The deserializer's pool is not reserved: the trie decodes its nodes,
+// the input's only shared pointers, without it.
 pub fn decode_input(bytes: &[u8]) -> Result<ProgramInput, Error> {
     use rkyv::de::Pool;
     use rkyv::validation::{Validator, archive::ArchiveValidator, shared::SharedValidator};
@@ -22,8 +24,5 @@ pub fn decode_input(bytes: &[u8]) -> Result<ProgramInput, Error> {
             &mut validator,
         )?
     };
-    rkyv::api::deserialize_using::<ProgramInput, _, Error>(
-        archived,
-        &mut Pool::with_capacity(capacity),
-    )
+    rkyv::api::deserialize_using::<ProgramInput, _, Error>(archived, &mut Pool::new())
 }
