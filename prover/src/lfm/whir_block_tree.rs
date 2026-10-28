@@ -97,7 +97,7 @@ pub const POSTURE: &[(&str, &str)] = &[
 /// The precomputed-tree cache's knob, whose posture follows the host target.
 pub const POSTURE_TREE_CACHE_KNOB: &str = "LFM_PRECOMPUTED_TREE_CACHE_CAP";
 
-/// The host target (GiB, [`block_whir::spill_target_bytes`]) from which the
+/// The host target (GiB, [`block_whir::memory_target_bytes`]) from which the
 /// posture keeps [`POSTURE`]'s 64 precomputed-tree cache entries.
 pub const POSTURE_TREE_CACHE_FULL_TARGET_GIB: u64 = 64;
 
@@ -124,7 +124,7 @@ pub fn posture_line() -> String {
             if name == POSTURE_TREE_CACHE_KNOB {
                 (
                     name,
-                    posture_tree_cache_cap(block_whir::spill_target_bytes()),
+                    posture_tree_cache_cap(block_whir::memory_target_bytes()),
                 )
             } else {
                 (name, want)
@@ -190,7 +190,7 @@ pub struct WhirTreeConfig {
     pub leaves_each: bool,
     /// `LAMBDA_VM_TREE_PROGRAM_BUDGET` (`auto` by default): how many bytes of
     /// tree programs may exist ahead of their provers
-    /// ([`super::program_budget`]), against the spill target.
+    /// ([`super::program_budget`]), against the memory target.
     pub program_budget: super::program_budget::BudgetSetting,
     /// `W3_LEAF_DURING_PHASE_B=0|1` (default 1): the first leaf whose groups
     /// phase B finished while another group was still to come executes and
@@ -1600,7 +1600,7 @@ pub(crate) fn prove_tree_pipelined(
                     },
                 )
             };
-            let target = block_whir::spill_target_bytes();
+            let target = block_whir::memory_target_bytes();
             prove_dataflow(&shape, &order, &results, siblings, !dataflow, |at, kids| {
                 let proved = prove_one(at, kids);
                 // The level's last program: its freed pages back to the OS
@@ -1808,7 +1808,7 @@ pub fn prove_whir_block_tree(
 
     // `LAMBDA_VM_ALLOC_WATERMARK`: freed pages back to the OS inside a phase,
     // only where the host is short (`alloc_purge`).
-    let watermark = crate::alloc_purge::start_watermark(block_whir::spill_target_bytes());
+    let watermark = crate::alloc_purge::start_watermark(block_whir::memory_target_bytes());
     let t0 = std::time::Instant::now();
     // The wall clock at the prove's start, to place a box's memory samples.
     sink.line(&format!(
@@ -1854,7 +1854,7 @@ pub fn prove_whir_block_tree(
         }
     };
     // The tree programs' budget (`LAMBDA_VM_TREE_PROGRAM_BUDGET`): against the
-    // spill target, which `LAMBDA_VM_BLOCK_SPILL_TARGET_GIB` moves too, `auto`'s
+    // memory target, which `LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB` moves too, `auto`'s
     // room line at `LAMBDA_VM_TREE_PROGRAM_BUDGET_SHARE` of it, the host read
     // as `LAMBDA_VM_TREE_PROGRAM_BUDGET_READING` says (less what a purge could
     // return, unless it says `resident`); `off` emits every leaf beside phase
@@ -1864,7 +1864,7 @@ pub fn prove_whir_block_tree(
         setting => Some(super::program_budget::ProgramBudget::new(
             super::program_budget::Room::of(
                 setting,
-                block_whir::spill_target_bytes(),
+                block_whir::memory_target_bytes(),
                 super::program_budget::share_from_env()?,
             ),
             super::program_budget::reading_from_env()?,

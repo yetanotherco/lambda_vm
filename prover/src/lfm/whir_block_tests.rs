@@ -127,7 +127,6 @@ fn small_block_cut(
         rest_build_bytes: None,
         pack_finished: true,
         gpack: true,
-        spill: crate::block_whir::BlockSpillPolicy::Off,
         regen: None,
         phase_b_overlap: stark::multilinear_block::PhaseBOverlap::Off,
     };
@@ -516,7 +515,6 @@ fn dense_block_with(
             rest_build_bytes: None,
             pack_finished: true,
             gpack: true,
-            spill: crate::block_whir::BlockSpillPolicy::Off,
             regen: None,
             phase_b_overlap: stark::multilinear_block::PhaseBOverlap::Off,
         },

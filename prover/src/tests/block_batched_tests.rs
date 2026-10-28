@@ -81,7 +81,6 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         rest_build_bytes: None,
         pack_finished: true,
         gpack: true,
-        spill: crate::block_whir::BlockSpillPolicy::Off,
         regen: None,
         phase_b_overlap: stark::multilinear_block::PhaseBOverlap::Off,
     }

@@ -566,19 +566,12 @@ pub struct BlockOptions {
     /// are the same. Production: on unless `LAMBDA_VM_BLOCK_GPACK=0` (the A
     /// arm: built at 8 bytes a cell, then laid out or packed as before).
     pub gpack: bool,
-    /// Whether phase A hands the committed groups' packed tables to a spill
-    /// store, which phase B reads back in group order
-    /// ([`multilinear_block::BlockSpill`]). The proof's bytes are the same.
-    /// Production: [`production_spill`], `off` when `LAMBDA_VM_BLOCK_SPILL`
-    /// and `LAMBDA_VM_BLOCK_REGEN` are both unset (no disk: live
-    /// regeneration relieves the host instead), else the spill knob as ever.
-    pub spill: BlockSpillPolicy,
     /// What phase B does with the streamed chunks ([`regen::RegenMode`]):
     /// `None` reads `LAMBDA_VM_BLOCK_REGEN` when the prove starts (unset:
     /// `off`; a value it does not know refuses the prove), `Some` is chosen.
-    /// Production: [`regen::production_regen`], `auto` when that knob and
-    /// `LAMBDA_VM_BLOCK_SPILL` are both unset (with the spill `off`: no disk).
-    /// The proof's bytes are the same under every mode.
+    /// Production: [`regen::production_regen`], `auto` when that knob is
+    /// unset. Without live regeneration every committed table is held. The
+    /// proof's bytes are the same under every mode.
     pub regen: Option<regen::RegenMode>,
     /// Phase B opens each group on a thread of its own beside the next
     /// group's argue, and under `Pinned` the openings' thread reads back
@@ -588,86 +581,19 @@ pub struct BlockOptions {
     pub phase_b_overlap: multilinear_block::PhaseBOverlap,
 }
 
-/// When a block spills its held tables ([`BlockOptions::spill`]): the policy
-/// and the rule of #1013's block pipeline (`prover/src/block.rs`,
-/// `SpillPolicy` … `spill_decision`, @ edddc6873), with #1014's reserve
-/// ([`spill_reserve_bytes`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum BlockSpillPolicy {
-    /// Every table stays in memory.
-    Off,
-    /// Every committed group past the first two spills, as far as the store's
-    /// writer queue has room (a measurement arm).
-    Always,
-    /// Keep at most this many bytes of committed packed tables; spill the
-    /// rest.
-    Budget(u64),
-    /// Spill once the host would pass the target ([`spill_target_bytes`]):
-    /// see [`spill_wanted`]. The default: a block that fits spills nothing.
-    #[default]
-    Auto,
-    /// No disk, the production default ([`production_spill`]): `off` when live
-    /// regeneration runs (a table `auto` would move off the host is dropped
-    /// when phase B can build it again, and stays otherwise), `auto` when it
-    /// cannot (its chunks not generated packed), so no block loses its relief.
-    NoDisk,
-}
-
-/// `LAMBDA_VM_BLOCK_SPILL`: `auto` (and unset) | `off` | `always` | `<GiB>` (a
-/// resident budget for committed packed tables). Anything else is `off`. As
-/// #1013's `parse_spill_policy`.
-pub fn spill_from_env() -> BlockSpillPolicy {
-    parse_spill_policy(std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref())
-}
-
-/// [`BlockOptions::production`]'s spill ([`production_spill_from`] of the two
-/// knobs).
-pub fn production_spill() -> BlockSpillPolicy {
-    production_spill_from(
-        std::env::var("LAMBDA_VM_BLOCK_REGEN").ok().as_deref(),
-        std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref(),
-    )
-}
-
-/// The production default, coupled with [`regen::production_regen_from`] as
-/// #1013's 1a9853790: both knobs unset, regeneration is `auto` and the spill
-/// [`BlockSpillPolicy::NoDisk`] (`off` whenever live regeneration runs). A knob
-/// that is set keeps
-/// the meaning it had: a set spill reads as it always did, and an unset spill
-/// beside a set regen is `auto`, as before.
-fn production_spill_from(regen: Option<&str>, spill: Option<&str>) -> BlockSpillPolicy {
-    match (regen, spill) {
-        (None, None) => BlockSpillPolicy::NoDisk,
-        (_, spill) => parse_spill_policy(spill),
-    }
-}
-
-fn parse_spill_policy(value: Option<&str>) -> BlockSpillPolicy {
-    match value.map(str::trim) {
-        Some("always") => BlockSpillPolicy::Always,
-        Some("auto") => BlockSpillPolicy::Auto,
-        Some(gib) => gib
-            .parse::<f64>()
-            .ok()
-            .filter(|g| g.is_finite() && *g >= 0.0)
-            .map_or(BlockSpillPolicy::Off, |g| {
-                BlockSpillPolicy::Budget((g * (1u64 << 30) as f64) as u64)
-            }),
-        None => BlockSpillPolicy::Auto,
-    }
-}
-
-/// `auto`'s target for the host: `LAMBDA_VM_BLOCK_SPILL_TARGET_GIB`, else the
-/// smaller of the cgroup's memory limit (v2 or v1, [`cgroup_memory`]) and
-/// `MemTotal`, less 10 GiB ([`spill_target_from`]) (#1013's
+/// The host's memory target, against which live regeneration's `auto` rule
+/// arms ([`drop_wanted`]): `LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB` (read under its
+/// old name, `LAMBDA_VM_BLOCK_SPILL_TARGET_GIB`, while the new one is unset),
+/// else the smaller of the cgroup's memory limit (v2 or v1, [`cgroup_memory`])
+/// and `MemTotal`, less 10 GiB ([`memory_target_from`]) (#1013's
 /// `spill_target_bytes` @ 035aef5d6).
-pub fn spill_target_bytes() -> u64 {
-    if let Some(gib) = std::env::var("LAMBDA_VM_BLOCK_SPILL_TARGET_GIB")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|g| g.is_finite() && *g > 0.0)
-    {
-        return (gib * (1u64 << 30) as f64) as u64;
+pub fn memory_target_bytes() -> u64 {
+    if let Some(bytes) = parse_target_gib(renamed_knob(
+        |name| std::env::var(name).ok(),
+        "LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB",
+        "LAMBDA_VM_BLOCK_SPILL_TARGET_GIB",
+    )) {
+        return bytes;
     }
     let limit = cgroup_memory(
         &std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default(),
@@ -681,14 +607,30 @@ pub fn spill_target_bytes() -> u64 {
             .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
             .map(|kib| kib << 10)
     });
-    spill_target_from(limit, mem_total)
+    memory_target_from(limit, mem_total)
 }
 
-/// The smaller of a cgroup limit and `MemTotal`, less 10 GiB; no spill
+/// A knob's value in `env` under `name`, else under `old`, the name it had
+/// while the block had a disk store: the old name is still read for one
+/// release.
+fn renamed_knob(env: impl Fn(&str) -> Option<String>, name: &str, old: &str) -> Option<String> {
+    env(name).or_else(|| env(old))
+}
+
+/// The memory target's knob in GiB as bytes; unset, or not a finite number
+/// above 0, is `None` (the machine's target).
+fn parse_target_gib(value: Option<String>) -> Option<u64> {
+    value
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|g| g.is_finite() && *g > 0.0)
+        .map(|gib| (gib * (1u64 << 30) as f64) as u64)
+}
+
+/// The smaller of a cgroup limit and `MemTotal`, less 10 GiB; no target
 /// (`u64::MAX`) when neither is known. A v1 cgroup without a limit reads a
 /// sentinel far above `MemTotal`, which the minimum discards (#1013's
 /// `spill_target_from`).
-fn spill_target_from(limit: Option<u64>, mem_total: Option<u64>) -> u64 {
+fn memory_target_from(limit: Option<u64>, mem_total: Option<u64>) -> u64 {
     const MARGIN: u64 = 10 << 30;
     match (limit, mem_total) {
         (Some(limit), Some(total)) => limit.min(total),
@@ -1018,31 +960,36 @@ impl DropPurges {
     }
 }
 
-/// `auto`'s reserve beside the host's bytes: what the block still needs once
-/// the tables committed so far (`cells` main cells) are on the host. #1014's
+/// The `auto` rule's reserve beside the host's bytes: what the block still
+/// needs once the tables committed so far (`cells` main cells) are on the host. #1014's
 /// own, inferred from the median block (BIG 565, 33.5 G cells): the finish's
 /// p5 transient (25.5 GiB at its peak) and the tree's leaf programs, which
 /// live through phase B (16.3 GiB at its end), ≈ 1.25 GiB per total G cells,
 /// or ≈ 1.65 per G cells committed so far (the streamed share ≈ 0.76); plus
 /// 6 GiB for phase B's bump and the read-back window. `per_g` is the GiB per
-/// G cells committed ([`SPILL_RESERVE_PER_G`] unless the knob retunes it,
-/// [`spill_reserve_per_g`]).
-fn spill_reserve_bytes(cells: u64, per_g: f64) -> u64 {
+/// G cells committed ([`MEMORY_RESERVE_PER_G`] unless the knob retunes it,
+/// [`memory_reserve_per_g`]).
+fn memory_reserve_bytes(cells: u64, per_g: f64) -> u64 {
     (cells as f64 / 1e9 * per_g * (1u64 << 30) as f64) as u64 + (6 << 30)
 }
 
-/// [`spill_reserve_bytes`]'s GiB per G cells committed.
-const SPILL_RESERVE_PER_G: f64 = 1.65;
+/// [`memory_reserve_bytes`]'s GiB per G cells committed.
+const MEMORY_RESERVE_PER_G: f64 = 1.65;
 
-/// `LAMBDA_VM_BLOCK_SPILL_RESERVE_PER_G`: `auto`'s reserve per G cells
-/// committed, in GiB ([`spill_reserve_bytes`]), a measurement knob for its
-/// retune (D-FINISH S4: it still budgets the finish's transient S2b removed);
-/// unset, or not a finite number ≥ 0, is [`SPILL_RESERVE_PER_G`].
-fn spill_reserve_per_g() -> f64 {
+/// `LAMBDA_VM_BLOCK_MEMORY_RESERVE_PER_G` (read under its old name,
+/// `LAMBDA_VM_BLOCK_SPILL_RESERVE_PER_G`, while the new one is unset): the
+/// `auto` rule's reserve per G cells committed, in GiB
+/// ([`memory_reserve_bytes`]), a measurement knob for its retune (D-FINISH S4:
+/// it still budgets the finish's transient S2b removed); unset, or not a finite
+/// number ≥ 0, is [`MEMORY_RESERVE_PER_G`].
+fn memory_reserve_per_g() -> f64 {
     parse_reserve_per_g(
-        std::env::var("LAMBDA_VM_BLOCK_SPILL_RESERVE_PER_G")
-            .ok()
-            .as_deref(),
+        renamed_knob(
+            |name| std::env::var(name).ok(),
+            "LAMBDA_VM_BLOCK_MEMORY_RESERVE_PER_G",
+            "LAMBDA_VM_BLOCK_SPILL_RESERVE_PER_G",
+        )
+        .as_deref(),
     )
 }
 
@@ -1050,10 +997,10 @@ fn parse_reserve_per_g(value: Option<&str>) -> f64 {
     value
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|g| g.is_finite() && *g >= 0.0)
-        .unwrap_or(SPILL_RESERVE_PER_G)
+        .unwrap_or(MEMORY_RESERVE_PER_G)
 }
 
-/// The share of `auto`'s target ([`spill_target_bytes`]) past which the block's
+/// The share of the memory target ([`memory_target_bytes`]) past which the block's
 /// memory is short for the allocator's purge ([`crate::alloc_purge`]): 85 %, a
 /// share so it follows the host's RAM.
 const PRESSURE_SHARE: (u64, u64) = (17, 20);
@@ -1064,8 +1011,8 @@ const PRESSURE_SHARE: (u64, u64) = (17, 20);
 ///
 /// ★ THE ONE WAY #1014'S PURGE DIFFERS FROM #1013'S. The module, its knob
 /// (`LAMBDA_VM_ALLOC_PURGE`, `auto` by default) and its points are #1013's;
-/// #1013 notes the pressure when its spill's queue budgets arm, and #1014's
-/// spill has no budgets, so it reads the host where the spill decides (each
+/// #1013 notes the pressure when its spill's queue budgets arm, and #1014 has
+/// no budgets, so it reads the host where live regeneration decides (each
 /// committed table) and once more at phase A's end. A block whose host stays
 /// under the share (the median: at most 86.6 GiB against 94.1 on BIG) never
 /// purges.
@@ -1090,15 +1037,15 @@ fn memory_short(host: u64, target: u64) -> bool {
 }
 
 /// What the allocator's purges at phase A's end and the base's end weigh in a
-/// block that proves with no disk ([`crate::alloc_purge::has_room`]): the
-/// pressure line of `target`, and the regeneration window's ceiling as what
-/// the block may still add. `None` for a block with a store: it purges at both
-/// whenever its memory is short, as ever.
+/// block that proves with live regeneration ([`crate::alloc_purge::has_room`]):
+/// the pressure line of `target`, and the regeneration window's ceiling as
+/// what the block may still add. `None` for a block without it: it purges at
+/// both whenever its memory is short, as ever.
 ///
 /// The pressure such a block notes comes from [`hand_off_need`]'s forecast of
-/// the finish's growth, which is the growth of tables that stay; a no-disk
-/// block drops them, and on a host with room its resident set never comes near
-/// the line the forecast crossed.
+/// the finish's growth, which is the growth of tables that stay; a block with
+/// live regeneration drops them, and on a host with room its resident set
+/// never comes near the line the forecast crossed.
 fn no_disk_room(no_disk: bool, target: u64) -> Option<crate::alloc_purge::NoDisk> {
     no_disk.then(|| crate::alloc_purge::NoDisk {
         line: pressure_line(target),
@@ -1112,13 +1059,13 @@ fn no_disk_room(no_disk: bool, target: u64) -> Option<crate::alloc_purge::NoDisk
 /// 298.4 M and full gas (660 D) 18.06 over 602.9 M, both under it.
 const FINISH_GROWTH_PER_CYCLE: f64 = 30.08 * (1u64 << 30) as f64 / 612.3e6;
 
-/// What a block hands back to its spill at the walk's end
+/// What a block hands back at the walk's end
 /// ([`multilinear_block::BlockSpill::hand_off`]), decided once there: the
 /// forecast of phase A's peak, `hwm` (the resident high-water so far) plus
 /// [`FINISH_GROWTH_PER_CYCLE`] for each of the `cycles` walked, past
 /// [`PRESSURE_SHARE`] of `target`; 0 when the forecast fits under it. The
-/// finish is still ahead, so the parked tables leave before its hump builds,
-/// and the hump reuses their pages.
+/// finish is still ahead, so the parked tables are dropped before its hump
+/// builds, and the hump reuses their pages.
 fn hand_off_need(hwm: u64, cycles: u64, target: u64) -> u64 {
     let forecast = hwm.saturating_add((FINISH_GROWTH_PER_CYCLE * cycles as f64) as u64);
     forecast.saturating_sub(pressure_line(target))
@@ -1126,7 +1073,7 @@ fn hand_off_need(hwm: u64, cycles: u64, target: u64) -> u64 {
 
 /// `LAMBDA_VM_BLOCK_HAND_OFF`: `auto` (and unset) decides the hand-off at the
 /// walk's end ([`hand_off_need`]); `off` never hands off (the parked tables
-/// stay on the host, as `auto` kept them). Anything else is `auto`.
+/// stay on the host until the rule arms). Anything else is `auto`.
 fn hand_off_from_env() -> bool {
     parse_hand_off(std::env::var("LAMBDA_VM_BLOCK_HAND_OFF").ok().as_deref())
 }
@@ -1135,33 +1082,23 @@ fn parse_hand_off(value: Option<&str>) -> bool {
     value.map(str::trim) != Some("off")
 }
 
-/// The policy's choice for one committed table of `bytes` packed bytes:
-/// `kept` the committed packed bytes kept so far, `cells` the main cells
-/// committed so far (this table's included), `host` the host's bytes
-/// ([`HostReading::bytes`]), read only by `auto` (#1013's `spill_decision`, with
-/// #1014's reserve at `per_g`, [`spill_reserve_bytes`]).
-#[allow(clippy::too_many_arguments)]
-fn spill_wanted(
-    policy: BlockSpillPolicy,
+/// The `auto` rule for one committed table of `bytes` packed bytes, whether
+/// it is to leave the host (which arms live regeneration): the host's bytes
+/// (`host`, [`HostReading::bytes`]), the reserve for the `cells` main cells
+/// committed so far (this table's included) at `per_g`
+/// ([`memory_reserve_bytes`]) and the table past `target` (#1013's
+/// `spill_decision`, with #1014's reserve).
+fn drop_wanted(
     target: u64,
     per_g: f64,
-    kept: u64,
     cells: u64,
     bytes: u64,
     host: impl FnOnce() -> u64,
 ) -> bool {
-    match policy {
-        BlockSpillPolicy::Off => false,
-        BlockSpillPolicy::Always => true,
-        BlockSpillPolicy::Budget(budget) => kept + bytes > budget,
-        // Resolved before a prove decides (`off` or `auto`); as `auto` here.
-        BlockSpillPolicy::Auto | BlockSpillPolicy::NoDisk => {
-            host()
-                .saturating_add(spill_reserve_bytes(cells, per_g))
-                .saturating_add(bytes)
-                > target
-        }
-    }
+    host()
+        .saturating_add(memory_reserve_bytes(cells, per_g))
+        .saturating_add(bytes)
+        > target
 }
 
 impl BlockOptions {
@@ -1204,7 +1141,6 @@ impl BlockOptions {
             rest_build_bytes: Some(BLOCK_REST_BUILD_BYTES),
             pack_finished: true,
             gpack: gpack_from_env(),
-            spill: production_spill(),
             regen: regen::production_regen(),
             phase_b_overlap: phase_b_overlap_from_env(),
         }
@@ -1987,11 +1923,9 @@ pub struct BlockStamps {
     /// With [`BlockOptions::memlog`]: every memory term when the proof is
     /// done, bytes; empty without.
     pub mem_terms: Vec<(&'static str, usize)>,
-    /// With [`BlockOptions::spill`]: the store's counters and the read-back's
-    /// report, or why no store opened.
-    pub spill: Option<String>,
-    /// With [`BlockOptions::spill`]: the store's counters after phase B.
-    pub spill_stats: Option<stark::spill::SpillStats>,
+    /// With live regeneration: the rule it decided by, and the largest host
+    /// reading it decided on (the `BLOCK DROPS` line).
+    pub drops: Option<String>,
     /// With [`BlockOptions::regen`] set to regenerate: what the regenerator
     /// did, and its `BLOCK REGEN` lines (printed as phase B ends, not in
     /// [`Self::report`]).
@@ -2489,8 +2423,8 @@ impl BlockStamps {
             sum(|g| g.upload_b),
             sum(|g| g.encode),
         ));
-        if let Some(spill) = &self.spill {
-            out.push_str(&format!("BLOCK SPILL: {spill}\n"));
+        if let Some(drops) = &self.drops {
+            out.push_str(&format!("BLOCK DROPS: {drops}\n"));
         }
         out
     }
@@ -3403,15 +3337,7 @@ pub(crate) struct Deviations {
     /// phase B widens other words than were committed
     /// ([`BlockCommitted::fault_narrow_width_map`]).
     pub narrow_width_map: bool,
-    /// Between the phases, one byte of the first spilled table flipped on
-    /// disk ([`BlockCommitted::fault_spilled_byte`]), so phase B reads back
-    /// other bytes than were written.
-    pub spilled_byte: bool,
-    /// Between the phases, the first spilled table's slot lost
-    /// ([`BlockCommitted::fault_lose_spilled_slot`]), so its columns never
-    /// come back.
-    pub spilled_slot_lost: bool,
-    /// At the walk's end, every parked table handed to the store, whatever the
+    /// At the walk's end, the hand-off asked for everything, whatever the
     /// forecast ([`hand_off_need`]).
     pub hand_off_all: bool,
     /// The shadow regenerator's slicer drops the first op of this table's
@@ -3457,9 +3383,9 @@ pub(crate) struct Deviations {
     /// (`Some(false)`), instead of what `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES`
     /// says (`None`; [`block_bitwise_from_tables`]).
     pub bitwise_from_tables: Option<bool>,
-    /// `auto`'s target for the host, in bytes, instead of the machine's
-    /// ([`spill_target_bytes`]): 0 makes the policy want every table out.
-    pub spill_target: Option<u64>,
+    /// The host's memory target, in bytes, instead of the machine's
+    /// ([`memory_target_bytes`]): 0 makes the `auto` rule want every table out.
+    pub memory_target: Option<u64>,
     /// How many closed groups may wait for phase A, instead of the knob
     /// ([`group_queue::setting`]).
     pub group_queue: Option<group_queue::Setting>,
@@ -5268,7 +5194,9 @@ fn prove_streamed(
     let stream_airs = StreamAirs::new(opts, stream_form, options.max_rows.cpu);
     // Regeneration (`BlockOptions::regen`): its recorder, when phase A can feed
     // it — its chunks generated packed, and none of KECCAK_RND's or of the
-    // MEMW-derived LT ops streamed (chunks no regenerator cuts).
+    // MEMW-derived LT ops streamed (chunks no regenerator cuts). The disk
+    // store's knob, which used to turn it off, refuses the prove when set.
+    regen::refuse_spill_knob(std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref())?;
     let regen_mode = match options.regen {
         Some(mode) => mode,
         None => regen::regen_mode()?,
@@ -5365,44 +5293,27 @@ fn prove_streamed(
         ledger.pool();
         ledger.line("start");
     }
-    // The spill (`BlockOptions::spill`): a store for this prove, unless the
-    // policy is off. A store that does not open leaves every table in memory.
-    // No disk is `off` beside live regeneration, else `auto`.
-    let policy = match options.spill {
-        BlockSpillPolicy::NoDisk if live_regen.is_some() => BlockSpillPolicy::Off,
-        BlockSpillPolicy::NoDisk => BlockSpillPolicy::Auto,
-        policy => policy,
-    };
+    // Live regeneration decides at each committed table whether it leaves the
+    // host: the `auto` rule against the host's memory target, and a table it
+    // would move off the host is dropped if phase B can rebuild it, else
+    // stays. Without live regeneration every table is held.
     eprintln!(
         "{}",
         regen::regen_mode_line(
             regen_mode,
-            live_regen.is_some() && policy == BlockSpillPolicy::Off,
+            live_regen.is_some(),
             std::env::var("LAMBDA_VM_BLOCK_REGEN").ok().as_deref(),
             std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref(),
         )
     );
-    let target = deviations.spill_target.unwrap_or_else(spill_target_bytes);
-    let policy_name = match policy {
-        BlockSpillPolicy::Off => "off".to_string(),
-        BlockSpillPolicy::Always => "always".to_string(),
-        BlockSpillPolicy::Budget(b) => format!("budget {:.1} GiB", b as f64 / (1u64 << 30) as f64),
-        BlockSpillPolicy::Auto | BlockSpillPolicy::NoDisk => format!(
-            "auto (target {:.1} GiB)",
-            target as f64 / (1u64 << 30) as f64
-        ),
-    };
-    // The largest host reading `auto` decided on, for the BLOCK SPILL line
+    let target = deviations.memory_target.unwrap_or_else(memory_target_bytes);
+    // The largest host reading the rule decided on, for the BLOCK DROPS line
     // (#1013's `Spill::host_most`).
     let host_most: std::sync::Arc<std::sync::Mutex<Option<HostReading>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
-    // Live regeneration with the spill off is no disk: the policy decides as
-    // `auto` does, with no store, and a table it would move off the host is
-    // dropped if phase B can rebuild it, else stays.
-    let no_disk = live_regen.is_some() && policy == BlockSpillPolicy::Off;
-    // With no disk the allocator's two boundary purges wait for the resident
-    // set to come within the regeneration window of the pressure line.
-    let room = no_disk_room(no_disk, target);
+    // With live regeneration the allocator's two boundary purges wait for the
+    // resident set to come within the regeneration window of the pressure line.
+    let room = no_disk_room(live_regen.is_some(), target);
     crate::alloc_purge::note_no_disk(room);
     // And closed groups may wait for phase A behind one another while the
     // host has that room, at most a regeneration window of them
@@ -5413,13 +5324,8 @@ fn prove_streamed(
     };
     let queue_rule = group_queue::Rule::of(queue_setting, room, regen::AHEAD_CAP);
     let queue_stats = std::sync::Arc::new(group_queue::Stats::default());
-    let decide = if no_disk {
-        BlockSpillPolicy::Auto
-    } else {
-        policy
-    };
-    // The host is read at each decision, whatever the policy: `auto` decides
-    // on it and the purge's pressure is noted from it (`note_pressure_past`).
+    // The host is read at each decision: the `auto` rule decides on it and the
+    // purge's pressure is noted from it (`note_pressure_past`).
     // Once live regeneration has armed, its phase-B reserve counts. While
     // closed groups may wait behind one another, their cells count as
     // committed ([`group_queue::arming_cells`]). Partial drops, once armed,
@@ -5431,9 +5337,9 @@ fn prove_streamed(
         let armed = live_regen.clone();
         let purges = drop_purges.clone();
         let reserve = regen::regen_reserve_bytes();
-        let per_g = spill_reserve_per_g();
+        let per_g = memory_reserve_per_g();
         let waiting = std::sync::Arc::clone(&queue_stats);
-        std::sync::Arc::new(move |kept, cells, bytes| {
+        std::sync::Arc::new(move |_kept, cells, bytes| {
             let cells = group_queue::arming_cells(queue_rule, &waiting, cells);
             let reading = HostReading::now();
             {
@@ -5451,45 +5357,16 @@ fn prove_streamed(
                 .flatten()
                 .map(|s| s.resident as u64);
             let host = decision_bytes(&reading, allocator, now);
-            let out = spill_wanted(decide, target, per_g, kept, cells, bytes, || {
-                host.saturating_add(extra)
-            });
+            let out = drop_wanted(target, per_g, cells, bytes, || host.saturating_add(extra));
             if out && let Some(purges) = &purges {
                 purges.dropped(bytes);
             }
             out
         })
     };
-    let spill = match policy {
-        BlockSpillPolicy::Off if live_regen.is_none() => None,
-        BlockSpillPolicy::Off => Some(multilinear_block::BlockSpill::new(None, 0, wanted)),
-        _ => {
-            let store_options = stark::spill::SpillOptions::default();
-            let queue = store_options.queue_bytes;
-            match stark::spill::SpillStore::open(store_options) {
-                Ok(store) => Some(multilinear_block::BlockSpill::new(
-                    Some(store),
-                    queue,
-                    wanted,
-                )),
-                Err(e) if live_regen.is_some() => {
-                    stamps.spill = Some(format!(
-                        "{policy_name} · no store ({e}); live regeneration decides with none"
-                    ));
-                    Some(multilinear_block::BlockSpill::new(None, 0, wanted))
-                }
-                Err(e) => {
-                    stamps.spill =
-                        Some(format!("{policy_name} · no store ({e}); every table held"));
-                    None
-                }
-            }
-        }
-    }
-    .map(|spill| match &live_regen {
-        Some(regen) => spill.with_regen(regen.clone()),
-        None => spill,
-    });
+    let spill = live_regen
+        .as_ref()
+        .map(|regen| multilinear_block::BlockSpill::new(wanted).with_regen(regen.clone()));
 
     // The streamed finish's byte gate: the rest's tables generated and not yet
     // placed ([`BlockOptions::finish_stream`]).
@@ -5840,8 +5717,8 @@ fn prove_streamed(
                     ledger.largest("builder", builder.largest_parts());
                 }
                 // The walk is done and the block's size known: when the
-                // finish's forecast passes the pressure share, the parked
-                // tables go to the store now, before its hump builds.
+                // finish's forecast passes the pressure share, live
+                // regeneration arms now, before its hump builds.
                 if let Some(spill) = walk_spill.as_ref().filter(|_| {
                     deviations.hand_off_all || hand_off_from_env()
                 }) {
@@ -5854,12 +5731,12 @@ fn prove_streamed(
                     };
                     if need > 0 {
                         crate::alloc_purge::note_memory_pressure();
-                        let started = spill.hand_off(need, ledger.map(|l| l.block.clone()));
+                        let armed = spill.hand_off(need);
                         let g = |b: u64| b as f64 / (1u64 << 30) as f64;
                         eprintln!(
                             "BLOCK HAND-OFF: at the walk's end ({windows_done:.2} s), VmHWM {:.2} GiB + \
                              {:.2} for {:.1} M cycles walked is past {:.2} GiB ({}/{} of the target) by {} · \
-                             parked tables to the store, oldest first: {}",
+                             live regeneration armed: {}",
                             g(hwm),
                             FINISH_GROWTH_PER_CYCLE * cycles as f64 / (1u64 << 30) as f64,
                             cycles as f64 / 1e6,
@@ -5871,7 +5748,7 @@ fn prove_streamed(
                             } else {
                                 format!("{:.2} GiB", g(need))
                             },
-                            if started { "started" } else { "not started" },
+                            if armed { "yes" } else { "no" },
                         );
                     }
                 }
@@ -6354,12 +6231,6 @@ fn prove_streamed(
         if deviations.narrow_width_map && !block.fault_narrow_width_map() {
             return Err(Error::Prover("no narrow table to break".into()));
         }
-        if deviations.spilled_byte && !block.fault_spilled_byte() {
-            return Err(Error::Prover("no spilled table to break".into()));
-        }
-        if deviations.spilled_slot_lost && !block.fault_lose_spilled_slot() {
-            return Err(Error::Prover("no spilled table to lose".into()));
-        }
         stamps.build = finished;
         stamps.streamed = (windows_done, streamed);
         stamps.prep = laid.busy;
@@ -6666,7 +6537,7 @@ fn prove_streamed(
         );
         if let Some((drops, window_of, run, rest_window, rest_run)) = live {
             let recipes = recorder.map_or(0, |r| r.recipes().0.len());
-            let mut lines = vec![regen::dropped_line(regen_mode, no_disk, &drops, recipes)];
+            let mut lines = vec![regen::dropped_line(regen_mode, &drops, recipes)];
             if let Some(purges) = &drop_purges {
                 lines.push(regen::keep_line(&drops));
                 lines.push(purges.line());
@@ -6807,55 +6678,15 @@ fn prove_streamed(
             }
             stamps.regen = Some(readout);
         }
-        if let Some((spill, store)) = spill
-            .as_ref()
-            .and_then(|spill| Some((spill, spill.store.as_ref()?)))
-        {
-            let read_back = spill
-                .prefetch
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-                .unwrap_or_else(|| "nothing to read back".to_string());
-            let stats = store.stats();
-            let g = |b: u64| b as f64 / (1u64 << 30) as f64;
-            let host = match *host_most.lock().unwrap_or_else(|e| e.into_inner()) {
-                Some(h) => format!(
-                    " · host at most {:.2} GiB (VmHWM {:.2} · charge {:.2} − inactive file {:.2})",
-                    g(h.bytes()),
-                    g(h.hwm),
-                    g(h.charged),
-                    g(h.inactive_file),
-                ),
-                None => String::new(),
-            };
-            let hand_off = match spill.hand_off_report() {
-                Some(r) => format!(
-                    " · hand-off at the walk's end: {} tables {:.2} GiB of {} in {:.2} s",
-                    r.tables,
-                    g(r.handed),
-                    if r.asked == u64::MAX {
-                        "every parked one".to_string()
-                    } else {
-                        format!("{:.2} GiB asked", g(r.asked))
-                    },
-                    r.secs
-                ),
-                None => String::new(),
-            };
-            stamps.spill = Some(format!(
-                "{policy_name} · {stats} · read-back {read_back}{host}{hand_off}"
-            ));
-            stamps.spill_stats = Some(stats);
-        } else if spill.is_some() && stamps.spill.is_none() {
+        if spill.is_some() {
             let g = |b: u64| b as f64 / (1u64 << 30) as f64;
             let host = match *host_most.lock().unwrap_or_else(|e| e.into_inner()) {
                 Some(h) => format!(" · host at most {:.2} GiB", g(h.bytes())),
                 None => String::new(),
             };
-            stamps.spill = Some(format!(
-                "{policy_name} · no store: live regeneration decides as `auto`, nothing \
-                 written{host}"
+            stamps.drops = Some(format!(
+                "live regeneration decides as `auto` (target {:.1} GiB){host}",
+                g(target)
             ));
         }
         if multilinear::whir_split::enabled() {
@@ -7431,73 +7262,68 @@ pub(crate) fn verify_block_whir_traced(
 }
 
 #[cfg(test)]
-mod spill_policy_tests {
+mod memory_target_tests {
     use super::{
-        BlockSpillPolicy, CgroupValue, HostReading, SPILL_RESERVE_PER_G, cgroup_memory,
-        hand_off_need, memory_short, no_disk_room, parse_hand_off, parse_reserve_per_g,
-        parse_spill_policy, parse_tree_drop, pressure_line, production_spill_from,
-        spill_reserve_bytes, spill_target_from, spill_wanted,
+        CgroupValue, HostReading, MEMORY_RESERVE_PER_G, cgroup_memory, drop_wanted, hand_off_need,
+        memory_reserve_bytes, memory_short, memory_target_from, no_disk_room, parse_hand_off,
+        parse_reserve_per_g, parse_target_gib, parse_tree_drop, pressure_line, renamed_knob,
     };
     use crate::alloc_purge::{NoDisk, has_room};
 
     const GIB: u64 = 1 << 30;
 
-    /// `LAMBDA_VM_BLOCK_SPILL`'s values, as #1013 reads them: `auto` (and
-    /// unset), `off`, `always`, a budget in GiB; anything else is off.
+    /// The memory target's knob and the reserve's are read under their new
+    /// names, and under the names they had with the disk store while the new
+    /// ones are unset; the target's value is GiB above 0, else the machine's.
     #[test]
-    fn the_spill_knob_reads_as_on_1013() {
-        assert_eq!(parse_spill_policy(None), BlockSpillPolicy::Auto);
-        assert_eq!(parse_spill_policy(Some("auto")), BlockSpillPolicy::Auto);
-        assert_eq!(
-            parse_spill_policy(Some(" always ")),
-            BlockSpillPolicy::Always
-        );
-        assert_eq!(parse_spill_policy(Some("off")), BlockSpillPolicy::Off);
-        assert_eq!(
-            parse_spill_policy(Some("2.5")),
-            BlockSpillPolicy::Budget(5 * GIB / 2)
-        );
-        assert_eq!(parse_spill_policy(Some("-1")), BlockSpillPolicy::Off);
-        assert_eq!(parse_spill_policy(Some("nan")), BlockSpillPolicy::Off);
-        assert_eq!(BlockSpillPolicy::default(), BlockSpillPolicy::Auto);
-    }
-
-    /// The production spill (N4b): both knobs unset is no disk (with
-    /// regeneration `auto`); a set spill reads as ever, whatever regen is; an
-    /// unset spill beside a set regen is `auto`, as before.
-    #[test]
-    fn the_production_spill_is_no_disk_only_when_both_knobs_are_unset() {
-        assert_eq!(production_spill_from(None, None), BlockSpillPolicy::NoDisk);
-        for regen in [None, Some("off"), Some("auto"), Some("bogus")] {
-            for (spill, policy) in [
-                ("auto", BlockSpillPolicy::Auto),
-                ("off", BlockSpillPolicy::Off),
-                ("always", BlockSpillPolicy::Always),
-                ("2.5", BlockSpillPolicy::Budget(5 * GIB / 2)),
-            ] {
-                assert_eq!(
-                    production_spill_from(regen, Some(spill)),
-                    policy,
-                    "{regen:?} {spill}"
-                );
+    fn the_renamed_knobs_still_read_their_old_names() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| v.to_string())
             }
-        }
-        for regen in ["off", "shadow", "auto", "always", "bogus"] {
-            assert_eq!(
-                production_spill_from(Some(regen), None),
-                BlockSpillPolicy::Auto,
-                "{regen}"
-            );
-        }
-        // Together with the regen coupling: unset/unset is no disk; either knob
-        // set alone keeps the old pair (unset regen = off, unset spill = auto).
-        use crate::block_whir::regen::{RegenMode, production_regen_from};
-        assert_eq!(production_regen_from(None, None), Some(RegenMode::Auto));
-        assert_eq!(
-            production_regen_from(None, Some("auto")),
-            Some(RegenMode::Off)
+        };
+        let (new, old) = (
+            "LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB",
+            "LAMBDA_VM_BLOCK_SPILL_TARGET_GIB",
         );
-        assert_eq!(production_regen_from(Some("auto"), None), None);
+        assert_eq!(renamed_knob(env(&[]), new, old), None);
+        assert_eq!(
+            renamed_knob(
+                env(&[("LAMBDA_VM_BLOCK_SPILL_TARGET_GIB", "108.28")]),
+                new,
+                old
+            ),
+            Some("108.28".to_string())
+        );
+        assert_eq!(
+            renamed_knob(
+                env(&[
+                    ("LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB", "54"),
+                    ("LAMBDA_VM_BLOCK_SPILL_TARGET_GIB", "108.28"),
+                ]),
+                new,
+                old
+            ),
+            Some("54".to_string()),
+            "the new name wins"
+        );
+        assert_eq!(
+            parse_target_gib(Some(" 2.5 ".to_string())),
+            Some(5 * GIB / 2)
+        );
+        for bad in [
+            None,
+            Some("0"),
+            Some("-1"),
+            Some("nan"),
+            Some("inf"),
+            Some("x"),
+        ] {
+            assert_eq!(parse_target_gib(bad.map(str::to_string)), None, "{bad:?}");
+        }
     }
 
     /// The cgroup memory files, v2 and v1, from fake `/proc/self/cgroup` texts
@@ -7605,122 +7431,60 @@ mod spill_policy_tests {
 
     /// The target is the smaller of the cgroup limit and `MemTotal`, less
     /// 10 GiB: v1's unlimited sentinel gives `MemTotal`'s, a limit above
-    /// `MemTotal` is capped, and with neither nothing spills.
+    /// `MemTotal` is capped, and with neither there is no target.
     #[test]
-    fn the_spill_target_is_the_smaller_limit_less_ten_gib() {
+    fn the_memory_target_is_the_smaller_limit_less_ten_gib() {
         let total = 62_840_956u64 << 10;
         assert_eq!(
-            spill_target_from(Some(61_774_757_888), Some(total)),
+            memory_target_from(Some(61_774_757_888), Some(total)),
             61_774_757_888 - 10 * GIB
         );
         assert_eq!(
-            spill_target_from(Some(9_223_372_036_854_771_712), Some(total)),
+            memory_target_from(Some(9_223_372_036_854_771_712), Some(total)),
             total - 10 * GIB
         );
         assert_eq!(
-            spill_target_from(Some(200 * GIB), Some(125 * GIB)),
+            memory_target_from(Some(200 * GIB), Some(125 * GIB)),
             115 * GIB
         );
-        assert_eq!(spill_target_from(None, Some(64 * GIB)), 54 * GIB);
+        assert_eq!(memory_target_from(None, Some(64 * GIB)), 54 * GIB);
         assert_eq!(
-            spill_target_from(Some(129_584_070_656), None),
+            memory_target_from(Some(129_584_070_656), None),
             129_584_070_656 - 10 * GIB
         );
-        assert_eq!(spill_target_from(Some(8 * GIB), Some(16 * GIB)), 0);
-        assert_eq!(spill_target_from(None, None), u64::MAX);
+        assert_eq!(memory_target_from(Some(8 * GIB), Some(16 * GIB)), 0);
+        assert_eq!(memory_target_from(None, None), u64::MAX);
     }
 
-    /// `auto` spills a table only once the host, its reserve and the table
-    /// would pass the target; it reads the host only then. `off` never
-    /// spills, `always` always, a budget once the kept bytes would pass it.
+    /// The `auto` rule wants a table out only once the host, its reserve and
+    /// the table would pass the target.
     #[test]
-    fn auto_spills_only_past_the_target() {
+    fn the_auto_rule_wants_a_table_out_only_past_the_target() {
         let target = 110 * GIB;
         let cells = 10_000_000_000; // 10 G cells: a reserve of 6 + 16.5 GiB
         assert_eq!(
-            spill_reserve_bytes(cells, SPILL_RESERVE_PER_G),
+            memory_reserve_bytes(cells, MEMORY_RESERVE_PER_G),
             (22.5 * GIB as f64) as u64
         );
         // The knob's retune: 0.5 GiB per G cells is 6 + 5 GiB at 10 G cells;
         // unset or not a number ≥ 0 is today's 1.65.
-        assert_eq!(spill_reserve_bytes(cells, 0.5), 11 * GIB);
+        assert_eq!(memory_reserve_bytes(cells, 0.5), 11 * GIB);
         assert_eq!(parse_reserve_per_g(Some(" 0.5 ")), 0.5);
         assert_eq!(parse_reserve_per_g(Some("0")), 0.0);
         for bad in [None, Some("-1"), Some("nan"), Some("inf"), Some("x")] {
-            assert_eq!(parse_reserve_per_g(bad), SPILL_RESERVE_PER_G, "{bad:?}");
+            assert_eq!(parse_reserve_per_g(bad), MEMORY_RESERVE_PER_G, "{bad:?}");
         }
-        let unread = || -> u64 { panic!("only auto reads the host") };
-        assert!(!spill_wanted(
-            BlockSpillPolicy::Off,
-            target,
-            SPILL_RESERVE_PER_G,
-            0,
-            cells,
-            GIB,
-            unread
-        ));
-        assert!(spill_wanted(
-            BlockSpillPolicy::Always,
-            target,
-            SPILL_RESERVE_PER_G,
-            0,
-            cells,
-            GIB,
-            unread
-        ));
-        let budget = BlockSpillPolicy::Budget(4 * GIB);
-        assert!(!spill_wanted(
-            budget,
-            target,
-            SPILL_RESERVE_PER_G,
-            3 * GIB,
-            cells,
-            GIB,
-            unread
-        ));
-        assert!(spill_wanted(
-            budget,
-            target,
-            SPILL_RESERVE_PER_G,
-            3 * GIB + 1,
-            cells,
-            GIB,
-            unread
-        ));
-        let auto = BlockSpillPolicy::Auto;
-        assert!(!spill_wanted(
-            auto,
-            target,
-            SPILL_RESERVE_PER_G,
-            0,
-            cells,
-            GIB,
-            || 86 * GIB
-        ));
-        assert!(spill_wanted(
-            auto,
-            target,
-            SPILL_RESERVE_PER_G,
-            0,
-            cells,
-            GIB,
-            || 87 * GIB
-        ));
-        assert!(!spill_wanted(
-            auto,
-            u64::MAX,
-            SPILL_RESERVE_PER_G,
-            0,
-            cells,
-            GIB,
-            || u64::MAX
-        ));
+        let wanted =
+            |target: u64, per_g: f64, host: u64| drop_wanted(target, per_g, cells, GIB, || host);
+        assert!(!wanted(target, MEMORY_RESERVE_PER_G, 86 * GIB));
+        assert!(wanted(target, MEMORY_RESERVE_PER_G, 87 * GIB));
+        assert!(!wanted(u64::MAX, MEMORY_RESERVE_PER_G, u64::MAX));
         // At 0.5 GiB per G cells the same table waits until 98 GiB is passed.
-        assert!(!spill_wanted(auto, target, 0.5, 0, cells, GIB, || 98 * GIB));
-        assert!(spill_wanted(auto, target, 0.5, 0, cells, GIB, || 99 * GIB));
+        assert!(!wanted(target, 0.5, 98 * GIB));
+        assert!(wanted(target, 0.5, 99 * GIB));
     }
 
-    /// The purge's memory pressure on #1014: the host past 85 % of `auto`'s
+    /// The purge's memory pressure on #1014: the host past 85 % of the memory
     /// target, a share of whatever host it runs on. On BIG (target 110.69 GiB,
     /// share 94.09) the median's highest reading (BIG 653, 86.64 GiB) is not
     /// short and p90's and full gas's (BIG 660, 120.05 and 105.55) are; on a
@@ -7735,13 +7499,14 @@ mod spill_policy_tests {
         assert!(!memory_short(gib(86.64), big), "the median never purges");
         assert!(memory_short(gib(120.05), big), "p90 purges");
         assert!(memory_short(gib(105.55), big), "full gas purges");
-        let small = spill_target_from(None, Some(64 * GIB));
+        let small = memory_target_from(None, Some(64 * GIB));
         assert!(!memory_short(gib(45.8), small));
         assert!(memory_short(gib(46.0), small));
         assert!(!memory_short(1024 * GIB, u64::MAX));
     }
 
-    /// What a no-disk block gives the allocator's two boundary purges to weigh:
+    /// What a block with live regeneration gives the allocator's two boundary
+    /// purges to weigh:
     /// the pressure line of its target, 85 % of it and not the target, and the
     /// regeneration window's 16 GiB. On ZEN5 (target 108.28 GiB) the line is
     /// 92.03 and the p90 block has room at both boundaries (VmRSS 66.75 and
@@ -7774,10 +7539,10 @@ mod spill_policy_tests {
         }
     }
 
-    /// A block with a store gives the purges nothing to weigh: they run
-    /// whenever its memory is short, whatever its resident set.
+    /// A block without live regeneration gives the purges nothing to weigh:
+    /// they run whenever its memory is short, whatever its resident set.
     #[test]
-    fn a_block_with_a_store_gives_the_purges_no_line() {
+    fn a_block_without_live_regeneration_gives_the_purges_no_line() {
         assert_eq!(no_disk_room(false, 54 * GIB), None);
         assert!(!has_room(no_disk_room(false, 54 * GIB), Some(GIB)));
     }
@@ -7814,7 +7579,7 @@ mod spill_policy_tests {
         );
         assert_eq!(hand_off_need(gib(30.0), windows(30), big), 0, "1×");
         assert_eq!(hand_off_need(gib(85.19), windows(584), u64::MAX), 0);
-        let small = spill_target_from(None, Some(64 * GIB));
+        let small = memory_target_from(None, Some(64 * GIB));
         assert!(hand_off_need(gib(40.0), windows(285), small) > 0);
     }
 

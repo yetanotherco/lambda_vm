@@ -27,9 +27,6 @@ rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "byt
 # Parallelization crates
 rayon = { version = "1.8.0", optional = true }
 
-# The trace spill (`spill`): O_DIRECT, O_TMPFILE, statfs, fadvise.
-libc = "0.2"
-
 # GPU backend for trace LDE — only linked when `cuda` is enabled.
 math-cuda = { path = "../math-cuda", optional = true }
 

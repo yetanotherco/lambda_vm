@@ -76,7 +76,6 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         rest_build_bytes: None,
         pack_finished: true,
         gpack: true,
-        spill: crate::block_whir::BlockSpillPolicy::Off,
         regen: None,
         phase_b_overlap: stark::multilinear_block::PhaseBOverlap::Off,
     }
@@ -782,257 +781,6 @@ fn gpack_moves_no_byte() {
     }
 }
 
-/// ★ Spilling the held tables moves no byte: with the spill on, phase A hands
-/// every group past the first two to the store, phase B reads each back once
-/// in group order, and the proof
-/// verifies with the same partition and statement as with every table held,
-/// its bytes equal under the deterministic grind.
-#[test]
-fn a_block_spilled_to_disk_proves_the_same_bytes() {
-    use crate::block_whir::BlockSpillPolicy;
-
-    let elf = asm_elf_bytes("test_keccak_multi");
-    let format = many_groups();
-    let proved = |spill: BlockSpillPolicy| {
-        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-        o.spill = spill;
-        let (proof, stamps) = prove_block_whir_with(
-            &elf,
-            &[],
-            &ProofOptions::default_test_options(),
-            &format,
-            &o,
-            &Deviations::default(),
-        )
-        .expect("prove");
-        assert!(verify(&proof, &elf, &format), "spill {spill:?}");
-        (proof, stamps)
-    };
-    let (held, held_stamps) = proved(BlockSpillPolicy::Off);
-    assert!(held_stamps.spill.is_none() && held_stamps.spill_stats.is_none());
-    assert!(
-        held.groups.len() > 2,
-        "{} groups: none past the first two",
-        held.groups.len()
-    );
-    let (spilled, stamps) = proved(BlockSpillPolicy::Always);
-    let stats = stamps.spill_stats.expect("the store's counters");
-    assert!(stats.slots > 0, "nothing spilled: {stats}");
-    assert_eq!(stats.mismatches, 0, "{stats}");
-    assert_eq!(stats.failure, None, "{stats}");
-    assert_eq!(
-        stats.reads + stats.memory_reads,
-        stats.slots,
-        "each slot read back once: {stats}"
-    );
-    assert_eq!(held.groups, spilled.groups, "the partition");
-    assert_eq!(held.table_num_vars, spilled.table_num_vars);
-    if crypto::grinding::deterministic() {
-        let bytes = |p: &BlockWhirProof| {
-            rkyv::to_bytes::<rkyv::rancor::Error>(p)
-                .expect("serialize")
-                .to_vec()
-        };
-        assert_eq!(bytes(&held), bytes(&spilled), "the proof");
-    }
-}
-
-/// The policy decides per table: a resident budget the block fits in spills
-/// nothing, one of zero spills every table past the first two groups, and
-/// both verify.
-#[test]
-fn a_spill_budget_decides_what_goes() {
-    use crate::block_whir::BlockSpillPolicy;
-
-    let elf = asm_elf_bytes("test_keccak_multi");
-    let format = many_groups();
-    // The walk's end hands the parked tables to the store once the peak
-    // passes the pressure share of the host's target: out of reach, so the
-    // budget alone decides on any host.
-    let spilled = |policy: BlockSpillPolicy| {
-        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-        o.spill = policy;
-        let (proof, stamps) = prove_block_whir_with(
-            &elf,
-            &[],
-            &ProofOptions::default_test_options(),
-            &format,
-            &o,
-            &Deviations {
-                spill_target: Some(u64::MAX),
-                ..Deviations::default()
-            },
-        )
-        .expect("prove");
-        assert!(verify(&proof, &elf, &format), "{policy:?}");
-        stamps.spill_stats.expect("the store's counters").slots
-    };
-    assert_eq!(
-        spilled(BlockSpillPolicy::Budget(1 << 40)),
-        0,
-        "a budget it fits in"
-    );
-    assert!(spilled(BlockSpillPolicy::Budget(0)) > 0, "a budget of zero");
-}
-
-/// A byte flipped in a spilled table on disk is caught by the store's digest
-/// when phase B reads it back: the prover refuses, naming the table, instead
-/// of proving over other columns.
-#[test]
-fn a_byte_flipped_in_a_spilled_table_is_refused() {
-    let elf = asm_elf_bytes("test_keccak_multi");
-    let format = many_groups();
-    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-    o.spill = crate::block_whir::BlockSpillPolicy::Always;
-    let refused = prove_block_whir_with(
-        &elf,
-        &[],
-        &ProofOptions::default_test_options(),
-        &format,
-        &o,
-        &Deviations {
-            spilled_byte: true,
-            ..Deviations::default()
-        },
-    );
-    let Err(crate::Error::Prover(why)) = refused else {
-        panic!("a flipped spilled byte was proved over");
-    };
-    assert!(
-        why.contains("SpillFailed") && why.contains("not the ones written"),
-        "{why}"
-    );
-}
-
-/// A spilled table whose columns never come back is refused when phase B
-/// reaches its group, before any reader meets it: a prover error naming the
-/// table, not a proof over empty columns.
-#[test]
-fn a_spilled_table_that_does_not_come_back_is_refused() {
-    let elf = asm_elf_bytes("test_keccak_multi");
-    let format = many_groups();
-    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-    o.spill = crate::block_whir::BlockSpillPolicy::Always;
-    let refused = prove_block_whir_with(
-        &elf,
-        &[],
-        &ProofOptions::default_test_options(),
-        &format,
-        &o,
-        &Deviations {
-            spilled_slot_lost: true,
-            ..Deviations::default()
-        },
-    );
-    let Err(crate::Error::Prover(why)) = refused else {
-        panic!("a table that never came back was proved over");
-    };
-    assert!(
-        why.contains("SpillFailed") && why.contains("still spilled"),
-        "{why}"
-    );
-}
-
-/// ★ Parked tables handed to the store at the walk's end move no byte: with a
-/// budget the block fits in, every table past the first two groups is parked
-/// on the host; the hand-off (here every parked one, whatever the forecast)
-/// moves them to the store before the finish, phase B reads each back once,
-/// and the proof verifies with the same partition, its bytes equal to the
-/// held run's under the deterministic grind.
-#[test]
-fn parked_tables_handed_off_at_the_walk_prove_the_same_bytes() {
-    use crate::block_whir::BlockSpillPolicy;
-
-    let elf = asm_elf_bytes("test_keccak_multi");
-    let format = many_groups();
-    // Without the deviation the hand-off is the forecast's, past the pressure
-    // share of the host's target: out of reach, so no host's memory hands
-    // off the run that must not.
-    let proved = |spill: BlockSpillPolicy, hand_off_all: bool| {
-        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-        o.spill = spill;
-        let (proof, stamps) = prove_block_whir_with(
-            &elf,
-            &[],
-            &ProofOptions::default_test_options(),
-            &format,
-            &o,
-            &Deviations {
-                hand_off_all,
-                spill_target: Some(u64::MAX),
-                ..Deviations::default()
-            },
-        )
-        .expect("prove");
-        assert!(
-            verify(&proof, &elf, &format),
-            "{spill:?} hand-off {hand_off_all}"
-        );
-        (proof, stamps)
-    };
-    let (held, _) = proved(BlockSpillPolicy::Off, false);
-    let (parked, parked_stamps) = proved(BlockSpillPolicy::Budget(1 << 40), false);
-    assert_eq!(
-        parked_stamps
-            .spill_stats
-            .expect("the store's counters")
-            .slots,
-        0,
-        "parked and never handed off"
-    );
-    let (handed, stamps) = proved(BlockSpillPolicy::Budget(1 << 40), true);
-    let stats = stamps.spill_stats.expect("the store's counters");
-    assert!(stats.slots > 0, "nothing handed off: {stats}");
-    assert_eq!(stats.mismatches, 0, "{stats}");
-    assert_eq!(
-        stats.reads + stats.memory_reads,
-        stats.slots,
-        "each slot read back once: {stats}"
-    );
-    let line = stamps.spill.expect("the spill's line");
-    assert!(line.contains("hand-off at the walk's end"), "{line}");
-    assert_eq!(held.groups, parked.groups, "the partition");
-    assert_eq!(held.groups, handed.groups, "the partition");
-    if crypto::grinding::deterministic() {
-        let bytes = |p: &BlockWhirProof| {
-            rkyv::to_bytes::<rkyv::rancor::Error>(p)
-                .expect("serialize")
-                .to_vec()
-        };
-        assert_eq!(bytes(&held), bytes(&parked), "the proof, parked");
-        assert_eq!(bytes(&held), bytes(&handed), "the proof, handed off");
-    }
-}
-
-/// A table the hand-off moved to the store whose columns never come back is
-/// refused when phase B reaches its group: a prover error naming the table.
-#[test]
-fn a_handed_off_table_that_does_not_come_back_is_refused() {
-    let elf = asm_elf_bytes("test_keccak_multi");
-    let format = many_groups();
-    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-    o.spill = crate::block_whir::BlockSpillPolicy::Budget(1 << 40);
-    let refused = prove_block_whir_with(
-        &elf,
-        &[],
-        &ProofOptions::default_test_options(),
-        &format,
-        &o,
-        &Deviations {
-            hand_off_all: true,
-            spilled_slot_lost: true,
-            ..Deviations::default()
-        },
-    );
-    let Err(crate::Error::Prover(why)) = refused else {
-        panic!("a handed-off table that never came back was proved over");
-    };
-    assert!(
-        why.contains("SpillFailed") && why.contains("still spilled"),
-        "{why}"
-    );
-}
-
 /// A table the finish packed is laid out narrow only if its preprocessed
 /// columns are the program's, word for word: one word changed in a packed
 /// table's first preprocessed column and the layout refuses it.
@@ -1632,23 +1380,19 @@ fn the_shadow_stays_off_where_it_cannot_rebuild_the_chunks() {
 }
 
 /// ★ Phase B's order moves no byte (D-WHIR-NODISK §2.3): each group proves on
-/// its own fork `S_post ‖ g`, so taking the groups reversed, odd ones first, or
-/// a group's spilled columns read back out of group order, proves the bytes of
-/// group order under the deterministic grind, with the same partition, and
-/// verifies; an order that is not a permutation of the groups is refused. So
-/// does each group's openings run beside the next group's argue (phase B's
-/// overlap), in group order, reversed, and reversed with the columns spilled.
+/// its own fork `S_post ‖ g`, so taking the groups reversed or odd ones first
+/// proves the bytes of group order under the deterministic grind, with the
+/// same partition, and verifies; an order that is not a permutation of the
+/// groups is refused. So does each group's openings run beside the next
+/// group's argue (phase B's overlap), in group order and reversed.
 #[test]
 fn phase_b_in_any_order_proves_the_same_bytes() {
-    use crate::block_whir::BlockSpillPolicy;
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
     use stark::multilinear_block::PhaseBOverlap::{Off, On, Pinned};
     let proved = |order: Option<fn(usize) -> Vec<usize>>,
-                  spill: BlockSpillPolicy,
                   overlap: stark::multilinear_block::PhaseBOverlap| {
         let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-        o.spill = spill;
         o.phase_b_overlap = overlap;
         prove_block_whir_with(
             &elf,
@@ -1668,7 +1412,7 @@ fn phase_b_in_any_order_proves_the_same_bytes() {
             .expect("serialize")
             .to_vec()
     };
-    let in_order = proved(None, BlockSpillPolicy::Off, Off).expect("prove");
+    let in_order = proved(None, Off).expect("prove");
     assert!(
         in_order.groups.len() > 3,
         "{} groups",
@@ -1677,37 +1421,15 @@ fn phase_b_in_any_order_proves_the_same_bytes() {
     let reversed: fn(usize) -> Vec<usize> = |n| (0..n).rev().collect();
     let odd_first: fn(usize) -> Vec<usize> =
         |n| (1..n).step_by(2).chain((0..n).step_by(2)).collect();
-    for (what, order, spill, overlap) in [
-        ("reversed", Some(reversed), BlockSpillPolicy::Off, Off),
-        ("odd first", Some(odd_first), BlockSpillPolicy::Off, Off),
-        (
-            "reversed, spilled",
-            Some(reversed),
-            BlockSpillPolicy::Always,
-            Off,
-        ),
-        ("in order, overlapped", None, BlockSpillPolicy::Off, On),
-        (
-            "reversed, overlapped",
-            Some(reversed),
-            BlockSpillPolicy::Off,
-            On,
-        ),
-        (
-            "reversed, spilled, overlapped",
-            Some(reversed),
-            BlockSpillPolicy::Always,
-            On,
-        ),
-        ("in order, pinned", None, BlockSpillPolicy::Off, Pinned),
-        (
-            "reversed, spilled, pinned",
-            Some(reversed),
-            BlockSpillPolicy::Always,
-            Pinned,
-        ),
+    for (what, order, overlap) in [
+        ("reversed", Some(reversed), Off),
+        ("odd first", Some(odd_first), Off),
+        ("in order, overlapped", None, On),
+        ("reversed, overlapped", Some(reversed), On),
+        ("in order, pinned", None, Pinned),
+        ("reversed, pinned", Some(reversed), Pinned),
     ] {
-        let proof = proved(order, spill, overlap).expect("prove");
+        let proof = proved(order, overlap).expect("prove");
         assert_eq!(proof.groups, in_order.groups, "{what}: the partition");
         assert!(verify(&proof, &elf, &format), "{what}");
         if crypto::grinding::deterministic() {
@@ -1718,10 +1440,7 @@ fn phase_b_in_any_order_proves_the_same_bytes() {
     let short: fn(usize) -> Vec<usize> = |n| (1..n).collect();
     for (what, order) in [("a group twice", twice), ("a group left out", short)] {
         for overlap in [Off, On, Pinned] {
-            assert!(
-                proved(Some(order), BlockSpillPolicy::Off, overlap).is_err(),
-                "{what}: proved"
-            );
+            assert!(proved(Some(order), overlap).is_err(), "{what}: proved");
         }
     }
 }
@@ -2136,23 +1855,15 @@ fn pinned_openings_read_back_through_pinned_staging() {
     }
 }
 
-/// A streamed prove under live regeneration `mode` and the spill `policy`,
-/// with `deviations`: its proof or why it was refused, and its stamps.
+/// A streamed prove under live regeneration `mode`, with `deviations`: its
+/// proof or why it was refused, and its stamps.
 fn regenerated(
     elf: &[u8],
     format: &BlockFormat,
     mode: block_whir::regen::RegenMode,
-    policy: crate::block_whir::BlockSpillPolicy,
     deviations: Deviations,
 ) -> Result<(BlockWhirProof, block_whir::BlockStamps), crate::Error> {
-    regenerated_at(
-        elf,
-        format,
-        mode,
-        policy,
-        deviations,
-        MaxRowsConfig::small(),
-    )
+    regenerated_at(elf, format, mode, deviations, MaxRowsConfig::small())
 }
 
 /// [`regenerated`] with chunks of `max_rows`.
@@ -2160,15 +1871,26 @@ fn regenerated_at(
     elf: &[u8],
     format: &BlockFormat,
     mode: block_whir::regen::RegenMode,
-    policy: crate::block_whir::BlockSpillPolicy,
     deviations: Deviations,
     max_rows: MaxRowsConfig,
+) -> Result<(BlockWhirProof, block_whir::BlockStamps), crate::Error> {
+    regenerated_with(elf, format, mode, deviations, max_rows, |_| {})
+}
+
+/// [`regenerated_at`] with the options changed by `tune` before the prove.
+fn regenerated_with(
+    elf: &[u8],
+    format: &BlockFormat,
+    mode: block_whir::regen::RegenMode,
+    deviations: Deviations,
+    max_rows: MaxRowsConfig,
+    tune: impl FnOnce(&mut BlockOptions),
 ) -> Result<(BlockWhirProof, block_whir::BlockStamps), crate::Error> {
     let mut o = streamed(max_rows, 5, 3);
     o.layout_workers = 3;
     o.drop_streamed_ops = true;
-    o.spill = policy;
     o.regen = Some(mode);
+    tune(&mut o);
     // KECCAK_RND built on the host unless a test asks otherwise: its tables
     // are then droppable, and these tests rebuild them with LT's. CPU and
     // MEMW_R likewise (a card build's default fills them from their records):
@@ -2222,16 +1944,15 @@ fn a_hang_bound_is_ten_plain_proves_and_at_least_ten_minutes() {
 
 /// ★ Live regeneration moves no byte (D-WHIR-NODISK N2): with `always` every
 /// streamed chunk is dropped after its group's commit and rebuilt in phase B —
-/// with no store (no disk), and with the rest spilled — and `auto` armed from
-/// the start (a target of 0, no store: no disk) drops them all too; the proof
-/// is the one regeneration off proves, with the same partition, under the
-/// deterministic grind, and verifies. `auto` that never arms (a budget the
-/// block fits in, and a target out of reach) drops nothing and runs no
-/// regenerator.
+/// with each group's openings beside the next group's argue too (phase B's
+/// overlap, and pinned) — and `auto` armed from the start (a target of 0)
+/// drops them all too; the proof is the one regeneration off proves, with the
+/// same partition, under the deterministic grind, and verifies. `auto` that
+/// never arms (a target out of reach) drops nothing and runs no regenerator.
 #[test]
 fn live_regeneration_proves_the_same_bytes() {
-    use crate::block_whir::BlockSpillPolicy;
     use crate::block_whir::regen::RegenMode;
+    use stark::multilinear_block::PhaseBOverlap::{Off, On, Pinned};
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
     let bytes = |p: &BlockWhirProof| {
@@ -2239,46 +1960,28 @@ fn live_regeneration_proves_the_same_bytes() {
             .expect("serialize")
             .to_vec()
     };
-    let (plain, plain_stamps) = regenerated(
-        &elf,
-        &format,
-        RegenMode::Off,
-        BlockSpillPolicy::Off,
-        Deviations::default(),
-    )
-    .expect("prove");
+    let (plain, plain_stamps) =
+        regenerated(&elf, &format, RegenMode::Off, Deviations::default()).expect("prove");
     assert!(plain_stamps.regen.is_none());
+    assert!(plain_stamps.drops.is_none(), "{:?}", plain_stamps.drops);
     let streamed = plain_stamps.streamed.1;
     assert!(streamed > 0);
-    for (what, mode, policy, target) in [
-        (
-            "always, no disk",
-            RegenMode::Always,
-            BlockSpillPolicy::Off,
-            None,
-        ),
-        (
-            "always, the rest spilled",
-            RegenMode::Always,
-            BlockSpillPolicy::Always,
-            None,
-        ),
-        (
-            "auto armed, no disk",
-            RegenMode::Auto,
-            BlockSpillPolicy::Off,
-            Some(0),
-        ),
+    for (what, mode, target, overlap) in [
+        ("always", RegenMode::Always, None, Off),
+        ("always, overlapped", RegenMode::Always, None, On),
+        ("always, pinned", RegenMode::Always, None, Pinned),
+        ("auto armed", RegenMode::Auto, Some(0), Off),
     ] {
-        let (proof, stamps) = regenerated(
+        let (proof, stamps) = regenerated_with(
             &elf,
             &format,
             mode,
-            policy,
             Deviations {
-                spill_target: target,
+                memory_target: target,
                 ..Deviations::default()
             },
+            MaxRowsConfig::small(),
+            |o| o.phase_b_overlap = overlap,
         )
         .unwrap_or_else(|e| panic!("{what}: {e:?}"));
         let r = stamps.regen.expect("live regeneration's readout");
@@ -2314,36 +2017,29 @@ fn live_regeneration_proves_the_same_bytes() {
             (0..proof.groups.len()).collect::<Vec<_>>(),
             "{what}: group order"
         );
-        if policy == BlockSpillPolicy::Off {
-            assert!(stamps.spill_stats.is_none(), "{what}: a store opened");
-            assert!(
-                stamps
-                    .spill
-                    .as_deref()
-                    .is_some_and(|l| l.contains("no store")),
-                "{what}: {:?}",
-                stamps.spill
-            );
-        } else {
-            let stats = stamps.spill_stats.expect("the store's counters");
-            assert!(stats.slots > 0, "{what}: the rest spilled nothing: {stats}");
-        }
+        assert!(
+            stamps
+                .drops
+                .as_deref()
+                .is_some_and(|l| l.starts_with("live regeneration decides as `auto`")),
+            "{what}: {:?}",
+            stamps.drops
+        );
         assert_eq!(proof.groups, plain.groups, "{what}: the partition");
         assert!(verify(&proof, &elf, &format), "{what}");
         if crypto::grinding::deterministic() {
             assert_eq!(bytes(&proof), bytes(&plain), "{what}: the proof");
         }
     }
-    // The budget decides each table; the walk's end still hands off (and
-    // arms) once the peak passes the pressure share of the host's target, so
-    // the target is out of reach and no host's memory decides it.
+    // The walk's end hands off (and arms) once the peak passes the pressure
+    // share of the host's target, so the target is out of reach and no
+    // host's memory decides it.
     let (proof, stamps) = regenerated(
         &elf,
         &format,
         RegenMode::Auto,
-        BlockSpillPolicy::Budget(1 << 40),
         Deviations {
-            spill_target: Some(u64::MAX),
+            memory_target: Some(u64::MAX),
             ..Deviations::default()
         },
     )
@@ -2361,12 +2057,11 @@ fn live_regeneration_proves_the_same_bytes() {
     }
 }
 
-/// The production default's spill, no disk (N4b), is `off` beside live
-/// regeneration (no store, the dropped line says so) and `auto` without it (a
-/// target of 0 spills every table it can): either way the same bytes.
+/// Without live regeneration nothing leaves the host, even where the `auto`
+/// rule would want every table out (a target of 0): there is no rule to arm,
+/// no drops line, and the proof is the same bytes.
 #[test]
-fn no_disk_is_off_beside_live_regeneration_and_auto_without_it() {
-    use crate::block_whir::BlockSpillPolicy;
+fn without_live_regeneration_every_table_is_held() {
     use crate::block_whir::regen::RegenMode;
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
@@ -2375,60 +2070,82 @@ fn no_disk_is_off_beside_live_regeneration_and_auto_without_it() {
             .expect("serialize")
             .to_vec()
     };
-    let (plain, _) = regenerated(
+    let (plain, _) =
+        regenerated(&elf, &format, RegenMode::Off, Deviations::default()).expect("prove");
+    let (held, stamps) = regenerated(
         &elf,
         &format,
         RegenMode::Off,
-        BlockSpillPolicy::Off,
-        Deviations::default(),
-    )
-    .expect("prove");
-    let (live, stamps) = regenerated(
-        &elf,
-        &format,
-        RegenMode::Always,
-        BlockSpillPolicy::NoDisk,
-        Deviations::default(),
-    )
-    .expect("prove");
-    let r = stamps.regen.expect("live regeneration's readout");
-    let lines = r.lines.join("\n");
-    assert!(r.dropped > 0 && r.regenerated == r.dropped, "{lines}");
-    assert!(lines.contains("(no disk)"), "{lines}");
-    assert!(stamps.spill_stats.is_none(), "a store opened");
-    assert!(
-        stamps
-            .spill
-            .as_deref()
-            .is_some_and(|l| l.starts_with("off") && l.contains("no store")),
-        "{:?}",
-        stamps.spill
-    );
-    let (spilled, stamps) = regenerated(
-        &elf,
-        &format,
-        RegenMode::Off,
-        BlockSpillPolicy::NoDisk,
         Deviations {
-            spill_target: Some(0),
+            memory_target: Some(0),
             ..Deviations::default()
         },
     )
     .expect("prove");
     assert!(stamps.regen.is_none());
-    let stats = stamps.spill_stats.expect("auto's store");
-    assert!(stats.slots > 0, "auto spilled nothing: {stats}");
+    assert!(stamps.drops.is_none(), "{:?}", stamps.drops);
     assert!(
-        stamps
-            .spill
-            .as_deref()
-            .is_some_and(|l| l.starts_with("auto")),
-        "{:?}",
-        stamps.spill
+        !stamps.report().contains("BLOCK DROPS"),
+        "{}",
+        stamps.report()
     );
-    for (what, proof) in [("live", &live), ("spilled", &spilled)] {
+    assert_eq!(held.groups, plain.groups, "the partition");
+    assert!(verify(&held, &elf, &format));
+    if crypto::grinding::deterministic() {
+        assert_eq!(bytes(&held), bytes(&plain), "the proof");
+    }
+}
+
+/// ★ The hand-off at the walk's end arms live regeneration and moves no byte:
+/// with the target out of reach the `auto` rule never arms on its own, and the
+/// hand-off (here asked for everything, whatever the forecast) arms it before
+/// the finish: tables are dropped and rebuilt in phase B, and the proof
+/// verifies with the same partition, its bytes equal to regeneration off's
+/// under the deterministic grind. Without the deviation the forecast stays
+/// under the line, and nothing drops.
+#[test]
+fn a_hand_off_at_the_walk_arms_live_regeneration_and_moves_no_byte() {
+    use crate::block_whir::regen::RegenMode;
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    let proved = |mode: RegenMode, hand_off_all: bool| {
+        let (proof, stamps) = regenerated(
+            &elf,
+            &format,
+            mode,
+            Deviations {
+                hand_off_all,
+                memory_target: Some(u64::MAX),
+                ..Deviations::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{mode:?} hand-off {hand_off_all}: {e:?}"));
+        assert!(
+            verify(&proof, &elf, &format),
+            "{mode:?} hand-off {hand_off_all}"
+        );
+        (proof, stamps)
+    };
+    let (plain, _) = proved(RegenMode::Off, false);
+    let (unarmed, stamps) = proved(RegenMode::Auto, false);
+    let r = stamps.regen.expect("live regeneration's readout");
+    let lines = r.lines.join("\n");
+    assert_eq!(r.dropped, 0, "{lines}");
+    assert!(lines.contains("never armed"), "{lines}");
+    let (handed, stamps) = proved(RegenMode::Auto, true);
+    let r = stamps.regen.expect("live regeneration's readout");
+    let lines = r.lines.join("\n");
+    assert!(r.dropped > 0, "the hand-off armed nothing\n{lines}");
+    assert_eq!(r.regenerated, r.dropped, "every table back\n{lines}");
+    assert_eq!((r.mismatches, r.failed), (0, 0), "{lines}");
+    assert!(lines.contains("armed at"), "{lines}");
+    for (what, proof) in [("unarmed", &unarmed), ("handed off", &handed)] {
         assert_eq!(proof.groups, plain.groups, "{what}: the partition");
-        assert!(verify(proof, &elf, &format), "{what}");
         if crypto::grinding::deterministic() {
             assert_eq!(bytes(proof), bytes(&plain), "{what}: the proof");
         }
@@ -2445,7 +2162,6 @@ fn no_disk_is_off_beside_live_regeneration_and_auto_without_it() {
 /// `a_regenerator_started_early_waits_for_each_tables_fate`.)
 #[test]
 fn regenerators_started_at_the_finishs_end_prove_the_same_bytes() {
-    use crate::block_whir::BlockSpillPolicy;
     use crate::block_whir::regen::{EarlySpawn, RegenMode};
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
@@ -2454,20 +2170,13 @@ fn regenerators_started_at_the_finishs_end_prove_the_same_bytes() {
             .expect("serialize")
             .to_vec()
     };
-    let (plain, _) = regenerated(
-        &elf,
-        &format,
-        RegenMode::Off,
-        BlockSpillPolicy::Off,
-        Deviations::default(),
-    )
-    .expect("prove");
+    let (plain, _) =
+        regenerated(&elf, &format, RegenMode::Off, Deviations::default()).expect("prove");
     for early in [EarlySpawn::Fates, EarlySpawn::Finish, EarlySpawn::Off] {
         let (proof, stamps) = regenerated(
             &elf,
             &format,
             RegenMode::Always,
-            BlockSpillPolicy::Off,
             Deviations {
                 regen_early: Some(early),
                 ..Deviations::default()
@@ -2499,7 +2208,6 @@ fn regenerators_started_at_the_finishs_end_prove_the_same_bytes() {
 /// took … streamed chunks, phase A dropped …").
 #[test]
 fn a_regenerator_up_before_the_drops_proves_the_same_bytes() {
-    use crate::block_whir::BlockSpillPolicy;
     use crate::block_whir::regen::{EarlySpawn, RegenMode};
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
@@ -2508,19 +2216,12 @@ fn a_regenerator_up_before_the_drops_proves_the_same_bytes() {
             .expect("serialize")
             .to_vec()
     };
-    let (plain, _) = regenerated(
-        &elf,
-        &format,
-        RegenMode::Off,
-        BlockSpillPolicy::Off,
-        Deviations::default(),
-    )
-    .expect("prove");
+    let (plain, _) =
+        regenerated(&elf, &format, RegenMode::Off, Deviations::default()).expect("prove");
     let (proof, stamps) = regenerated(
         &elf,
         &format,
         RegenMode::Always,
-        BlockSpillPolicy::Off,
         Deviations {
             regen_early: Some(EarlySpawn::Fates),
             streamed_drop_delay: Some(std::time::Duration::from_millis(100)),
@@ -2547,7 +2248,6 @@ fn a_regenerator_up_before_the_drops_proves_the_same_bytes() {
 /// joined) and never hangs.
 #[test]
 fn an_early_regenerator_never_hangs_a_failed_phase_a() {
-    use crate::block_whir::BlockSpillPolicy;
     use crate::block_whir::regen::{EarlySpawn, RegenMode};
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
@@ -2557,7 +2257,6 @@ fn an_early_regenerator_never_hangs_a_failed_phase_a() {
             &elf,
             &format,
             RegenMode::Always,
-            BlockSpillPolicy::Off,
             Deviations {
                 regen_early: Some(EarlySpawn::Fates),
                 streamed_drop_delay: Some(std::time::Duration::from_millis(400)),
@@ -2586,7 +2285,6 @@ fn an_early_regenerator_never_hangs_a_failed_phase_a() {
 /// rebuilt groups out of rank order is refused before it starts.
 #[test]
 fn live_regeneration_refuses_what_it_did_not_rebuild() {
-    use crate::block_whir::BlockSpillPolicy;
     use crate::block_whir::regen::{LiveFaults, RegenMode};
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
@@ -2654,7 +2352,6 @@ fn live_regeneration_refuses_what_it_did_not_rebuild() {
                 &elf,
                 &format,
                 RegenMode::Always,
-                BlockSpillPolicy::Off,
                 Deviations {
                     regen_faults: faults,
                     phase_b_order: order,
@@ -2680,19 +2377,12 @@ fn live_regeneration_refuses_what_it_did_not_rebuild() {
 /// ([`hang_bound`]).
 #[test]
 fn one_byte_windows_take_each_class_in_its_order() {
-    use crate::block_whir::BlockSpillPolicy;
     use crate::block_whir::regen::RegenMode;
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
     let started = std::time::Instant::now();
-    let (plain, _) = regenerated(
-        &elf,
-        &format,
-        RegenMode::Off,
-        BlockSpillPolicy::Off,
-        Deviations::default(),
-    )
-    .expect("prove");
+    let (plain, _) =
+        regenerated(&elf, &format, RegenMode::Off, Deviations::default()).expect("prove");
     let bound = hang_bound(started.elapsed());
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -2700,7 +2390,6 @@ fn one_byte_windows_take_each_class_in_its_order() {
             &elf,
             &format,
             RegenMode::Always,
-            BlockSpillPolicy::Off,
             Deviations {
                 regen_windows: Some((1, 1)),
                 ..Deviations::default()
@@ -2741,33 +2430,20 @@ fn one_byte_windows_take_each_class_in_its_order() {
 /// refused before phase B, never proved and never left to hang.
 #[test]
 fn a_mixed_boundary_group_drops_one_class_only() {
-    use crate::block_whir::BlockSpillPolicy;
     use crate::block_whir::regen::RegenMode;
     let elf = asm_elf_bytes("test_keccak_multi");
     let mut format = many_groups();
     format.zf.whir_stack = StackVars::new(24).expect("a valid stack");
     let started = std::time::Instant::now();
-    let (plain, plain_stamps) = regenerated(
-        &elf,
-        &format,
-        RegenMode::Off,
-        BlockSpillPolicy::Off,
-        Deviations::default(),
-    )
-    .expect("prove");
+    let (plain, plain_stamps) =
+        regenerated(&elf, &format, RegenMode::Off, Deviations::default()).expect("prove");
     let bound = hang_bound(started.elapsed());
     let streamed = plain_stamps.streamed.1;
     let (tx, rx) = std::sync::mpsc::channel();
     {
         let elf = elf.clone();
         std::thread::spawn(move || {
-            let out = regenerated(
-                &elf,
-                &format,
-                RegenMode::Always,
-                BlockSpillPolicy::Off,
-                Deviations::default(),
-            );
+            let out = regenerated(&elf, &format, RegenMode::Always, Deviations::default());
             let _ = tx.send(out.map_err(|e| format!("{e:?}")));
         });
     }
@@ -2801,7 +2477,6 @@ fn a_mixed_boundary_group_drops_one_class_only() {
 /// table's device work, never prove over it, and never hang.
 #[test]
 fn the_rest_regenerator_refuses_what_it_did_not_rebuild() {
-    use crate::block_whir::BlockSpillPolicy;
     use crate::block_whir::regen::{LiveFaults, RegenMode};
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
@@ -2839,7 +2514,6 @@ fn the_rest_regenerator_refuses_what_it_did_not_rebuild() {
                 &elf,
                 &format,
                 RegenMode::Always,
-                BlockSpillPolicy::Off,
                 Deviations {
                     rest_faults: faults,
                     ..Deviations::default()
@@ -3034,10 +2708,9 @@ fn the_bounded_layout_holds_at_most_k_plus_one_chunks_unpacked() {
 /// every byte, and under the room rule packs the groups of the channel of one
 /// and, under the deterministic grind, proves its bytes; with every byte,
 /// groups do wait behind one another, and with none they never do. A block
-/// with a store keeps the channel of one whatever the knob says.
+/// without live regeneration keeps the channel of one whatever the knob says.
 #[test]
 fn a_deeper_group_queue_moves_no_byte_of_the_proof() {
-    use crate::block_whir::BlockSpillPolicy;
     use crate::block_whir::group_queue::Setting;
     use crate::block_whir::regen::RegenMode;
     let elf = asm_elf_bytes("test_keccak_multi");
@@ -3049,23 +2722,22 @@ fn a_deeper_group_queue_moves_no_byte_of_the_proof() {
     };
     // Phase A takes a group every ten milliseconds, so the packer is ahead of
     // it in every arm.
-    let queued = |setting: Setting, policy: BlockSpillPolicy| {
+    let queued = |setting: Setting, mode: RegenMode| {
         let (proof, stamps) = regenerated(
             &elf,
             &format,
-            RegenMode::Always,
-            policy,
+            mode,
             Deviations {
                 group_queue: Some(setting),
                 group_take_pause: Some(std::time::Duration::from_millis(10)),
                 ..Deviations::default()
             },
         )
-        .unwrap_or_else(|e| panic!("{setting:?}, {policy:?}: {e:?}"));
+        .unwrap_or_else(|e| panic!("{setting:?}, {mode:?}: {e:?}"));
         let line = stamps.group_queue.expect("the queue's line");
         (proof, line)
     };
-    let (plain, line) = queued(Setting::None, BlockSpillPolicy::Off);
+    let (plain, line) = queued(Setting::None, RegenMode::Always);
     assert!(groups_of(&plain) >= 3, "{} groups", groups_of(&plain));
     assert!(verify(&plain, &elf, &format));
     assert_eq!(
@@ -3089,7 +2761,7 @@ fn a_deeper_group_queue_moves_no_byte_of_the_proof() {
         ("one byte", Setting::Bytes(1)),
         ("every byte", Setting::Bytes(u64::MAX)),
     ] {
-        let (proof, line) = queued(setting, BlockSpillPolicy::Off);
+        let (proof, line) = queued(setting, RegenMode::Always);
         same(what, &proof);
         assert!(line.contains("fixed, the host not read"), "{what}: {line}");
         let waited = !line.contains("none waited behind another");
@@ -3099,16 +2771,16 @@ fn a_deeper_group_queue_moves_no_byte_of_the_proof() {
             "{what}: {line}"
         );
     }
-    let (proof, line) = queued(Setting::Room, BlockSpillPolicy::Off);
+    let (proof, line) = queued(Setting::Room, RegenMode::Always);
     same("room", &proof);
     assert!(
         line.contains("GiB waiting while VmRSS + the group + 16.00 stays under the line"),
         "{line}"
     );
-    let (proof, line) = queued(Setting::Bytes(u64::MAX), BlockSpillPolicy::Always);
-    same("a store", &proof);
+    let (proof, line) = queued(Setting::Bytes(u64::MAX), RegenMode::Off);
+    same("regeneration off", &proof);
     assert!(
-        line.contains("the block does not prove with no disk: one closed group waits"),
+        line.contains("the block proves without live regeneration: one closed group waits"),
         "{line}"
     );
 }
@@ -4973,7 +4645,6 @@ fn keccak_rnd_filled_from_records_moves_no_byte() {
 /// records), and the proof is the one without regeneration.
 #[test]
 fn keccak_rnd_held_as_records_is_never_dropped() {
-    use crate::block_whir::BlockSpillPolicy;
     use crate::block_whir::regen::RegenMode;
 
     let elf = asm_elf_bytes("test_keccak_multi");
@@ -4987,14 +4658,7 @@ fn keccak_rnd_held_as_records_is_never_dropped() {
         card_fill: Some(card_fill),
         ..Deviations::default()
     };
-    let (plain, _) = regenerated(
-        &elf,
-        &format,
-        RegenMode::Off,
-        BlockSpillPolicy::Off,
-        card(true),
-    )
-    .expect("prove");
+    let (plain, _) = regenerated(&elf, &format, RegenMode::Off, card(true)).expect("prove");
     let rest_line = |stamps: &crate::block_whir::BlockStamps| {
         let r = stamps.regen.as_ref().expect("live regeneration's readout");
         assert_eq!((r.mismatches, r.failed), (0, 0), "{:?}", r.lines);
@@ -5006,28 +4670,15 @@ fn keccak_rnd_held_as_records_is_never_dropped() {
             .cloned()
             .expect("the rest's line")
     };
-    let (built, stamps) = regenerated(
-        &elf,
-        &format,
-        RegenMode::Always,
-        BlockSpillPolicy::Off,
-        card(false),
-    )
-    .expect("prove");
+    let (built, stamps) =
+        regenerated(&elf, &format, RegenMode::Always, card(false)).expect("prove");
     let line = rest_line(&stamps);
     assert!(
         !line.contains("KECCAK_RND 0 ·"),
         "built, so dropped: {line}"
     );
     assert!(verify(&built, &elf, &format));
-    let (held, stamps) = regenerated(
-        &elf,
-        &format,
-        RegenMode::Always,
-        BlockSpillPolicy::Off,
-        card(true),
-    )
-    .expect("prove");
+    let (held, stamps) = regenerated(&elf, &format, RegenMode::Always, card(true)).expect("prove");
     assert!(stamps.layout.records_rest.0 > 0, "no table held as records");
     let line = rest_line(&stamps);
     assert!(
@@ -5199,7 +4850,6 @@ fn cpu_and_memw_r_filled_from_records_move_no_byte() {
 /// regeneration.
 #[test]
 fn streamed_records_chunks_kept_are_never_dropped() {
-    use crate::block_whir::BlockSpillPolicy;
     use crate::block_whir::regen::RegenMode;
 
     let elf = asm_elf_bytes("test_keccak_multi");
@@ -5215,7 +4865,6 @@ fn streamed_records_chunks_kept_are_never_dropped() {
         &elf,
         &format,
         RegenMode::Off,
-        BlockSpillPolicy::Off,
         Deviations {
             records_keep: Some(true),
             ..streamed_records(true, true)
@@ -5234,21 +4883,14 @@ fn streamed_records_chunks_kept_are_never_dropped() {
         assert!(r.error.is_none(), "{:?}", r.lines);
         r
     };
-    let (built, stamps) = regenerated(
-        &elf,
-        &format,
-        RegenMode::Always,
-        BlockSpillPolicy::Off,
-        Deviations::default(),
-    )
-    .expect("prove");
+    let (built, stamps) =
+        regenerated(&elf, &format, RegenMode::Always, Deviations::default()).expect("prove");
     let all = readout(&stamps);
     assert!(verify(&built, &elf, &format));
     let (held, stamps) = regenerated(
         &elf,
         &format,
         RegenMode::Always,
-        BlockSpillPolicy::Off,
         Deviations {
             records_keep: Some(true),
             ..streamed_records(true, true)
@@ -5339,7 +4981,6 @@ fn a_wrong_cpu_records_table_is_refused_by_the_verifier() {
 /// control. The proofs are one.
 #[test]
 fn parked_records_need_live_regeneration() {
-    use crate::block_whir::BlockSpillPolicy;
     use crate::block_whir::regen::RegenMode;
 
     let elf = asm_elf_bytes("test_keccak_multi");
@@ -5349,31 +4990,19 @@ fn parked_records_need_live_regeneration() {
             .expect("serialize")
             .to_vec()
     };
-    let none_held = |policy: BlockSpillPolicy| {
-        let (proof, stamps) = regenerated(
-            &elf,
-            &format,
-            RegenMode::Off,
-            policy,
-            streamed_records(true, true),
-        )
-        .expect("prove");
-        let c = stamps.windows.card_fill;
-        assert_eq!(
-            (c.cpu, c.memw_r, c.records_bytes),
-            ([0, 0], [0, 0], 0),
-            "{policy:?}: chunks handed to the streamed card fill with no live regeneration: {c:?}"
-        );
-        assert!(verify(&proof, &elf, &format), "{policy:?}");
-        proof
-    };
-    let stored = none_held(BlockSpillPolicy::Always);
-    let held = none_held(BlockSpillPolicy::Off);
+    let (held, stamps) =
+        regenerated(&elf, &format, RegenMode::Off, streamed_records(true, true)).expect("prove");
+    let c = stamps.windows.card_fill;
+    assert_eq!(
+        (c.cpu, c.memw_r, c.records_bytes),
+        ([0, 0], [0, 0], 0),
+        "chunks handed to the streamed card fill with no live regeneration: {c:?}"
+    );
+    assert!(verify(&held, &elf, &format));
     let (kept, stamps) = regenerated(
         &elf,
         &format,
         RegenMode::Off,
-        BlockSpillPolicy::Off,
         Deviations {
             records_keep: Some(true),
             ..streamed_records(true, true)
@@ -5383,9 +5012,8 @@ fn parked_records_need_live_regeneration() {
     let c = stamps.windows.card_fill;
     assert!(c.cpu[0] > 0 && c.memw_r[0] > 0, "kept: {c:?}");
     assert!(verify(&kept, &elf, &format));
-    assert_eq!(stored.groups, kept.groups, "the partition");
+    assert_eq!(held.groups, kept.groups, "the partition");
     if crypto::grinding::deterministic() {
-        assert_eq!(bytes(&stored), bytes(&kept), "the proof");
         assert_eq!(bytes(&held), bytes(&kept), "the proof");
     }
 }
@@ -5401,7 +5029,6 @@ fn parked_records_need_live_regeneration() {
 /// group's openings; with no spill (no regeneration) none is let go.
 #[test]
 fn streamed_records_chunks_drop_as_records_and_come_back() {
-    use crate::block_whir::BlockSpillPolicy;
     use crate::block_whir::regen::RegenMode;
 
     let elf = asm_elf_bytes("test_keccak_multi");
@@ -5442,7 +5069,6 @@ fn streamed_records_chunks_drop_as_records_and_come_back() {
         &elf,
         &format,
         RegenMode::Off,
-        BlockSpillPolicy::Off,
         Deviations {
             records_keep: Some(true),
             ..streamed_records(true, true)
@@ -5451,21 +5077,14 @@ fn streamed_records_chunks_drop_as_records_and_come_back() {
     .expect("prove");
     assert!(stamps.windows.card_fill.records_bytes > 0);
     assert_eq!(released(&stamps), 0, "no spill: no records let go");
-    let (built, stamps) = regenerated(
-        &elf,
-        &format,
-        RegenMode::Always,
-        BlockSpillPolicy::Off,
-        Deviations::default(),
-    )
-    .expect("prove");
+    let (built, stamps) =
+        regenerated(&elf, &format, RegenMode::Always, Deviations::default()).expect("prove");
     let all = readout(&stamps);
     assert_eq!(as_records(&all), 0, "{:?}", all.lines);
     let (parked, stamps) = regenerated(
         &elf,
         &format,
         RegenMode::Always,
-        BlockSpillPolicy::Off,
         streamed_records(true, true),
     )
     .expect("prove");
@@ -5500,9 +5119,8 @@ fn streamed_records_chunks_drop_as_records_and_come_back() {
         &elf,
         &format,
         RegenMode::Auto,
-        BlockSpillPolicy::Off,
         Deviations {
-            spill_target: Some(u64::MAX),
+            memory_target: Some(u64::MAX),
             ..streamed_records(true, true)
         },
     )
@@ -5712,7 +5330,6 @@ fn row_families_filled_from_their_rows_move_no_byte() {
 /// streamed card fill is never set up: no chunk is handed to it.
 #[test]
 fn row_records_chunks_drop_as_records_and_come_back() {
-    use crate::block_whir::BlockSpillPolicy;
     use crate::block_whir::regen::{RegenMode, RegenStamps};
 
     let elf = asm_elf_bytes("all_loadstore_32");
@@ -5748,15 +5365,7 @@ fn row_records_chunks_drop_as_records_and_come_back() {
         row_counts(c).map(|f| f[0])
     };
     let proved = |mode, deviations| {
-        regenerated_at(
-            &elf,
-            &format,
-            mode,
-            BlockSpillPolicy::Off,
-            deviations,
-            rows_max(),
-        )
-        .expect("prove")
+        regenerated_at(&elf, &format, mode, deviations, rows_max()).expect("prove")
     };
     let kept = |deviations: Deviations| Deviations {
         records_keep: Some(true),

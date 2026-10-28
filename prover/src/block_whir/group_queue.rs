@@ -5,7 +5,7 @@
 //! packer holds the next: a card that is behind holds back the layout, the
 //! walk and the executor, and the finish behind its byte gate.
 //!
-//! With `room`, a block that proves with no disk lets closed groups wait
+//! With `room`, a block that proves with live regeneration lets closed groups wait
 //! behind one another while the host has room for them ([`Rule::Room`]): the
 //! host then builds ahead of the card. A group the rule refuses waits in the
 //! packer's hands, as every group past the first does by default, until the
@@ -82,9 +82,9 @@ pub(crate) enum Rule {
 
 impl Rule {
     /// The rule a block runs under `setting`. `no_disk` is what the purge
-    /// rule weighs for a block that proves with no disk; any other block
-    /// (`None`: one with a store, or with nothing to rebuild its tables) keeps
-    /// the channel of one under every setting.
+    /// rule weighs for a block that proves with live regeneration; any other
+    /// block (`None`: one with nothing to rebuild its tables) keeps the
+    /// channel of one under every setting.
     pub(crate) fn of(setting: Setting, no_disk: Option<NoDisk>, cap: u64) -> Option<Self> {
         let room = no_disk?;
         match setting {
@@ -112,7 +112,7 @@ impl Rule {
 }
 
 /// The main cells the rule that arms the drops weighs as committed
-/// ([`super::spill_wanted`]): `committed`, and while a rule runs, the cells of
+/// ([`super::drop_wanted`]): `committed`, and while a rule runs, the cells of
 /// the groups waiting behind the first. The first is where the channel of one
 /// holds a group, which that rule does not count either; a group's cells leave
 /// the count as phase A takes it, before its commit counts them. With no rule
@@ -160,8 +160,8 @@ pub(crate) fn line(setting: Setting, rule: Option<Rule>, stats: &Stats) -> Strin
         }
         None => {
             return format!(
-                "BLOCK GROUP QUEUE: {knob} · the block does not prove with no disk: one closed \
-                 group waits"
+                "BLOCK GROUP QUEUE: {knob} · the block proves without live regeneration: one \
+                 closed group waits"
             );
         }
         Some(Rule::Room { room, cap }) => format!(
@@ -775,7 +775,7 @@ mod tests {
     }
 
     /// The rule a block runs: none by default, none under any setting for a
-    /// block that does not prove with no disk, the purge rule's line and
+    /// block that proves without live regeneration, the purge rule's line and
     /// headroom under `room`.
     #[test]
     fn only_a_no_disk_block_runs_a_rule() {
@@ -810,7 +810,8 @@ mod tests {
         );
         assert_eq!(
             line(Setting::Room, None, &stats),
-            "BLOCK GROUP QUEUE: room · the block does not prove with no disk: one closed group waits"
+            "BLOCK GROUP QUEUE: room · the block proves without live regeneration: one closed \
+             group waits"
         );
         stats.groups.store(182, Relaxed);
         stats.most_groups.store(1, Relaxed);
@@ -961,7 +962,7 @@ mod tests {
     /// not counted, about 6 GiB higher.
     #[test]
     fn the_drops_arm_at_the_tables_built_they_arm_at_by_default() {
-        use crate::block_whir::{BlockSpillPolicy, SPILL_RESERVE_PER_G, spill_wanted};
+        use crate::block_whir::{MEMORY_RESERVE_PER_G, drop_wanted};
         let gib = |g: f64| (g * GIB) as u64;
         let target = gib(108.28);
         let group = 374_800_000u64;
@@ -971,15 +972,7 @@ mod tests {
             (0..12_000u32)
                 .map(|k| f64::from(k) / 100.0)
                 .find(|&host| {
-                    spill_wanted(
-                        BlockSpillPolicy::Auto,
-                        target,
-                        SPILL_RESERVE_PER_G,
-                        0,
-                        cells,
-                        gib(0.1),
-                        || gib(host),
-                    )
+                    drop_wanted(target, MEMORY_RESERVE_PER_G, cells, gib(0.1), || gib(host))
                 })
                 .expect("it arms under the target")
         };
@@ -1022,7 +1015,7 @@ mod tests {
     }
 
     fn on_a_64_gib_host() {
-        use crate::block_whir::{BlockSpillPolicy, SPILL_RESERVE_PER_G, spill_wanted};
+        use crate::block_whir::{MEMORY_RESERVE_PER_G, drop_wanted};
         let gib = |g: f64| (g * GIB) as u64;
         let group = Weight {
             bytes: gib(0.65),
@@ -1064,15 +1057,9 @@ mod tests {
         go.store(true, Relaxed);
         until("the fourth is refused", || stats.refused.load(Relaxed) == 1);
         let decide = |cells: u64| {
-            spill_wanted(
-                BlockSpillPolicy::Auto,
-                gib(54.0),
-                SPILL_RESERVE_PER_G,
-                0,
-                cells,
-                gib(0.1),
-                || gib(33.3),
-            )
+            drop_wanted(gib(54.0), MEMORY_RESERVE_PER_G, cells, gib(0.1), || {
+                gib(33.3)
+            })
         };
         for g in 0..5 {
             assert_eq!(rx.next(), Some(g));

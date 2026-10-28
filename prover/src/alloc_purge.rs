@@ -136,7 +136,8 @@ pub fn clear_memory_pressure() {
     note_no_disk(None);
 }
 
-/// What `auto` weighs at its points in a block that proves with no disk: the
+/// What `auto` weighs at its points in a block that proves with no disk (with
+/// live regeneration, which drops what it can rebuild): the
 /// line past which the block's memory is short (the block's pressure share of
 /// its host target) and what the block may still add past a boundary (its
 /// regeneration window's ceiling).
@@ -151,14 +152,15 @@ static NO_DISK: std::sync::Mutex<Option<NoDisk>> = std::sync::Mutex::new(None);
 
 /// The block says whether it proves with no disk (`Some`), once it knows:
 /// `auto` then purges at its points only without room ([`has_room`]). `None`,
-/// a block with a store, purges there whenever memory is short.
+/// a block without live regeneration, purges there whenever memory is short.
 pub fn note_no_disk(no_disk: Option<NoDisk>) {
     *NO_DISK.lock().unwrap_or_else(|e| e.into_inner()) = no_disk;
 }
 
 /// `LAMBDA_VM_ALLOC_PURGE_ROOM`: `auto` (unset or empty, the default) lets a
 /// no-disk block with room skip `auto`'s purges ([`has_room`]); `off` purges
-/// at them whenever memory is short, as a block with a store does.
+/// at them whenever memory is short, as a block without live regeneration
+/// does.
 pub const ROOM_ENV: &str = "LAMBDA_VM_ALLOC_PURGE_ROOM";
 
 /// What [`ROOM_ENV`] says.
@@ -178,8 +180,8 @@ pub fn parse_room(value: Option<&str>) -> Result<RoomSetting, String> {
 }
 
 /// Whether a no-disk block has room at a boundary: its resident set and its
-/// headroom together stay under its line. A block with a store has none to
-/// weigh, and neither has one whose resident set cannot be read: both purge.
+/// headroom together stay under its line. A block without live regeneration
+/// has none to weigh, and neither has one whose resident set cannot be read: both purge.
 ///
 /// The p90 block, VmRSS at phase A's end and at the base's end (ZEN5 096): on a
 /// 118 GiB host 66.8 and 68.2 GiB against a line of 92.0, room at both; on a
@@ -1082,10 +1084,10 @@ mod tests {
         assert!(!has_room(no_disk, None));
     }
 
-    /// A block with a store has no line: it purges under pressure whatever its
-    /// resident set.
+    /// A block without live regeneration has no line: it purges under pressure
+    /// whatever its resident set.
     #[test]
-    fn a_block_with_a_store_has_no_room() {
+    fn a_block_without_live_regeneration_has_no_room() {
         assert!(!has_room(None, Some(1 << 30)));
         assert!(!has_room(None, None));
     }

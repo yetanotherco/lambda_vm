@@ -3,8 +3,8 @@
 //!
 //! A block can rebuild some of its committed tables from the run itself (the
 //! streamed chunks: a replay of the windows they span). Such a table need not
-//! stay on the host, nor go to a spill file, between its group's commit and its
-//! group's turn in phase B: its packed columns
+//! stay on the host between its group's commit and its group's turn in phase
+//! B: its packed columns
 //! ([`multilinear::narrow::NarrowColumns`]) are dropped and a caller's
 //! regenerator deposits them again in phase B.
 //!
@@ -20,8 +20,8 @@
 //!   admits the depositors it held, a smaller one holds the next deposits and
 //!   never one already in.
 //! - A deposit is checked against the shape and the digest taken when the
-//!   table was dropped ([`digest_of`], the spill store's own digest of the same
-//!   parts); another table fails its slot, and the prove refuses that table
+//!   table was dropped ([`digest_of`], [`crate::narrow::NarrowMain`]'s digest of
+//!   the same parts); another table fails its slot, and the prove refuses that table
 //!   before any of its device work. The digest is not cryptographic: the
 //!   threat is a bug, not an adversary, and the kept-top check and the verifier
 //!   stay behind it.
@@ -53,9 +53,9 @@ use multilinear::narrow::NarrowColumns;
 
 const GIB: f64 = (1u64 << 30) as f64;
 
-/// The 128-bit digest of packed columns: the spill store's digest of the same
-/// rows, widths and bytes ([`crate::narrow::NarrowMain::digest`]). A fast,
-/// non-cryptographic check that columns built again are these.
+/// The 128-bit digest of packed columns: [`crate::narrow::NarrowMain::digest`]
+/// of the same rows, widths and bytes. A fast, non-cryptographic check that
+/// columns built again are these.
 pub fn digest_of(packed: &NarrowColumns) -> [u64; 2] {
     crate::narrow::digest_parts(packed.rows(), packed.widths(), packed.data())
 }
@@ -720,14 +720,14 @@ mod tests {
             .unwrap_or_else(|_| panic!("{what}: hung"))
     }
 
-    /// ★ The digest is the spill store's: packed columns and the store's
-    /// payload of the same parts digest alike, and one flipped bit, one row
-    /// fewer or another width map changes it.
+    /// ★ The digest is [`crate::narrow::NarrowMain`]'s: packed columns and a
+    /// `NarrowMain` of the same parts digest alike, and one flipped bit, one
+    /// row fewer or another width map changes it.
     #[test]
-    fn the_digest_is_the_spill_stores() {
+    fn the_digest_is_narrow_mains() {
         let a = packed(100, 1);
         let (rows, widths, data) = a.clone().into_parts();
-        let main = crate::narrow::NarrowMain::from_parts(rows, widths, data).expect("the store's");
+        let main = crate::narrow::NarrowMain::from_parts(rows, widths, data).expect("converts");
         assert_eq!(digest_of(&a), main.digest());
         assert_ne!(digest_of(&a), digest_of(&bent(&a)));
         assert_ne!(digest_of(&a), digest_of(&packed(99, 1)));

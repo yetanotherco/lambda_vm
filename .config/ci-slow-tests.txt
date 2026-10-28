@@ -21,7 +21,7 @@ lambda-vm-prover tests::block_whir_tests::a_streamed_block_with_dropped_ops_prov
 lambda-vm-prover tests::block_whir_tests::streamed_records_chunks_drop_as_records_and_come_back  # 597 s
 lambda-vm-prover tests::block_whir_tests::a_deeper_group_queue_moves_no_byte_of_the_proof  # 532 s
 lambda-vm-prover tests::block_whir_tests::parked_records_need_live_regeneration  # 483 s
-lambda-vm-prover tests::block_whir_tests::no_disk_is_off_beside_live_regeneration_and_auto_without_it  # 470 s
+lambda-vm-prover tests::block_whir_tests::without_live_regeneration_every_table_is_held  # not timed: two of the three proves of the 470 s test it replaced
 lambda-vm-prover tests::block_whir_tests::streamed_records_chunks_kept_are_never_dropped  # 460 s
 lambda-vm-prover tests::block_whir_tests::the_shadow_stays_off_where_it_cannot_rebuild_the_chunks  # 455 s
 lambda-vm-prover tests::block_whir_tests::row_families_filled_from_their_rows_move_no_byte  # 418 s
@@ -32,12 +32,10 @@ lambda-vm-prover tests::block_whir_tests::row_records_chunks_drop_as_records_and
 lambda-vm-prover tests::block_whir_tests::phase_b_overlap_failures_are_the_proves_error_and_a_refusal_turns_it_serial  # 351 s
 lambda-vm-prover tests::block_whir_tests::a_streamed_block_with_memw_lt_streamed_proves_and_verifies  # 351 s
 lambda-vm-prover lfm::machine_tests::tampered_program_id_inputs_change_the_id  # 346 s
-lambda-vm-prover tests::block_whir_tests::a_spill_budget_decides_what_goes  # 327 s
 lambda-vm-prover tests::block_whir_tests::keccak_and_ecsm_split_into_chunks_prove_and_verify  # 324 s
 lambda-vm-prover tests::block_whir_tests::a_wrong_regeneration_is_reported_never_proved  # 320 s
 lambda-vm-prover tests::block_whir_tests::a_split_ecdas_call_is_keyed_on_the_bus  # 317 s
 lambda-vm-prover tests::block_onechain_tests::an_indexed_block_round_trips_and_refuses_the_other_mode  # 305 s
-lambda-vm-prover tests::block_whir_tests::a_block_spilled_to_disk_proves_the_same_bytes  # 304 s
 lambda-vm-prover tests::block_whir_tests::a_streamed_block_with_keccak_rnd_streamed_proves_and_verifies  # 304 s
 lambda-vm-prover tests::block_whir_tests::copy_split_into_chunks_proves_and_verifies  # 304 s
 lambda-vm-prover tests::block_whir_tests::a_wrong_row_records_table_is_refused_by_the_verifier  # 302 s
@@ -50,7 +48,7 @@ lambda-vm-prover lfm::machine_tests::keccak_sponge_reference_lengths_prove_and_v
 lambda-vm-prover tests::block_whir_tests::narrow_storage_moves_no_byte_of_the_proof  # 273 s
 lambda-vm-prover tests::block_whir_tests::a_streamed_block_with_keccak_and_ecsm_chunks_proves_and_verifies  # 270 s
 lambda-vm-prover tests::block_whir_tests::keccak_rnd_held_as_records_is_never_dropped  # 270 s
-lambda-vm-prover tests::block_whir_tests::parked_tables_handed_off_at_the_walk_prove_the_same_bytes  # 269 s
+lambda-vm-prover tests::block_whir_tests::a_hand_off_at_the_walk_arms_live_regeneration_and_moves_no_byte  # not timed: three proves, as the 269 s test it replaced
 lambda-vm-prover tests::is_wh_tests::test_is_wh_noncanonical_word_is_rejected  # 258 s
 lambda-vm-prover tests::block_whir_tests::uploading_ahead_moves_no_byte_of_the_proof  # 256 s
 lambda-vm-prover lfm::blake3_socket_tests::tampering_with_the_witness_is_not_accepted  # 250 s

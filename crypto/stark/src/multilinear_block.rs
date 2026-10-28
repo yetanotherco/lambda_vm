@@ -95,9 +95,7 @@ use multilinear::{
     whir_hash::WhirHash,
 };
 
-use crate::narrow::NarrowMain;
 use crate::regen::{RegenError, RegenProducer, RegenSlot, RegenWindow};
-use crate::spill::{Prefetch, ReadPhase, SpillStore, SpilledMain};
 
 use crate::multilinear_table::{
     CommittedTable, MultiProof, TableProof, TableStatement, absorb_roots,
@@ -401,10 +399,6 @@ pub struct BlockMem {
     pub held_wide: AtomicUsize,
     /// The groups' kept tree tops.
     pub tree_tops: AtomicUsize,
-    /// Held tables' packed bytes handed to a spill store ([`BlockSpill`]):
-    /// in its writer queue until written, on disk after, and back in
-    /// `held_narrow` once phase B reads them back.
-    pub spilled: AtomicUsize,
     mark: Box<dyn Fn(&str) + Send + Sync>,
 }
 
@@ -420,7 +414,6 @@ impl BlockMem {
             held_narrow: AtomicUsize::new(0),
             held_wide: AtomicUsize::new(0),
             tree_tops: AtomicUsize::new(0),
-            spilled: AtomicUsize::new(0),
             mark: Box::new(mark),
         }
     }
@@ -455,8 +448,8 @@ impl BlockMem {
         FieldElement<F>: AsBytes + Sync + Send,
         FieldElement<E>: AsBytes + Sync + Send,
     {
-        // A spilled table's bytes left the count when they were spilled, or
-        // when phase B let them go after its group.
+        // A table whose columns are out left the count when they went: a
+        // drop, or phase B letting them go after its group.
         for table in tables.into_iter().filter(|t| !t.is_spilled()) {
             match table.compact_bytes() {
                 Some(bytes) => self.held_narrow.fetch_sub(bytes, Relaxed),
@@ -466,32 +459,20 @@ impl BlockMem {
     }
 }
 
-/// Groups phase B reads before a read-back could land: never spilled.
-const SPILL_RESIDENT_GROUPS: usize = 2;
-
-/// Whether a committed table of `bytes` packed bytes is to be spilled, given
-/// the packed bytes kept so far and the main cells committed so far (this
-/// table's included): `(kept, cells, bytes)` ([`BlockSpill::new`]).
+/// Whether a committed table of `bytes` packed bytes is to leave the host,
+/// given the packed bytes kept so far and the main cells committed so far
+/// (this table's included): `(kept, cells, bytes)` ([`BlockSpill::new`]).
 pub type SpillWanted = dyn Fn(u64, u64, u64) -> bool + Send + Sync;
 
-/// A block's spill ([`crate::spill`]). Phase A considers each committed
-/// group's packed tables as the group is installed: past the first
-/// [`SPILL_RESIDENT_GROUPS`] groups, a table the policy wants out and the
-/// store's writer queue has room for goes to `store`, so the committer never
-/// waits on the writers; any other is parked, and one hand-off
-/// ([`Self::hand_off`]) may move parked tables to `store` later in phase A.
-/// Phase B reads them back in group order, ahead of their upload, and lets
-/// each group's go after its opening.
-///
-/// With no store the policy still decides, and what it would move off the
-/// host stays parked. With live regeneration ([`Self::with_regen`]) a table
-/// phase B can rebuild leaves the host as a drop instead ([`BlockRegen`]).
+/// What a block moves off the host while phase A holds its committed tables.
+/// With live regeneration ([`Self::with_regen`]) a table phase B can rebuild
+/// is parked as its group is installed, and leaves the host as a drop
+/// ([`BlockRegen`]) once the policy (`wanted`) first wants a table out; every
+/// other table stays in its group. Phase B brings each group's parked and
+/// dropped tables back before their upload, and lets each group's packed
+/// columns go after its opening.
 #[derive(Clone)]
 pub struct BlockSpill {
-    pub store: Option<Arc<SpillStore>>,
-    /// The writer queue the store was opened with
-    /// ([`crate::spill::SpillOptions::queue_bytes`]).
-    pub queue_bytes: u64,
     /// The policy's choice for one table.
     pub wanted: Arc<SpillWanted>,
     /// Live regeneration, when it is on.
@@ -499,26 +480,11 @@ pub struct BlockSpill {
     /// Packed bytes of the committed tables kept, and main cells committed.
     kept: Arc<std::sync::atomic::AtomicU64>,
     cells: Arc<std::sync::atomic::AtomicU64>,
-    /// The read-back's report ([`Prefetch::report`]), once phase B has run.
-    pub prefetch: Arc<std::sync::Mutex<Option<String>>>,
-    /// Every table parked past the first [`SPILL_RESIDENT_GROUPS`] groups, in
-    /// the order it was parked: group order. `parked_more` wakes a hand-off
-    /// waiting for the next one, or for phase A's end (`closed`).
-    parked: Arc<std::sync::Mutex<Vec<Arc<Parked>>>>,
-    parked_more: Arc<std::sync::Condvar>,
-    closed: Arc<std::sync::atomic::AtomicBool>,
-    /// The hand-off ([`Self::hand_off`]): its thread while it runs, then its
-    /// report.
-    hand_off: Arc<std::sync::Mutex<HandOff>>,
-    /// Set while a hand-off runs: the committer parks what it would spill, so
-    /// the store keeps one producer and the committer never waits on it.
-    handing: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// A committed table's packed columns parked by the spill: held here until a
-/// hand-off ([`BlockSpill::hand_off`]) moves them to the store or live
-/// regeneration drops them, and read back from whichever holds them before the
-/// group's upload (`restore_group`).
+/// A committed table's packed columns parked for live regeneration: held here
+/// until it drops them, and read back from the host or from their
+/// regeneration slot before the group's upload (`restore_group`).
 struct Parked {
     len: u64,
     /// The main cells committed once it was, its own included
@@ -535,23 +501,13 @@ enum ParkedState {
     /// ([`multilinear::records`]): live regeneration drops it as them, into a
     /// records slot ([`RegenWindow::slot_for_records`]).
     ResidentRecords(multilinear::records::Records),
-    Spilled(SpilledMain),
     /// Dropped after its digest: phase B's regenerator deposits it again.
     Dropped(RegenSlot),
-    /// Taken and not put back (a store that refused its bytes' shape): phase B
-    /// refuses the table.
+    /// Taken and not put back: phase B refuses the table.
     Lost,
 }
 
 impl Parked {
-    /// The store's handle, once handed off.
-    fn handle(&self) -> Option<SpilledMain> {
-        match &*self.state.lock().unwrap_or_else(|e| e.into_inner()) {
-            ParkedState::Spilled(handle) => Some(handle.clone()),
-            _ => None,
-        }
-    }
-
     /// The slot it was dropped into, once dropped.
     fn dropped(&self) -> Option<RegenSlot> {
         match &*self.state.lock().unwrap_or_else(|e| e.into_inner()) {
@@ -559,71 +515,23 @@ impl Parked {
             _ => None,
         }
     }
-}
-
-/// Where a committed table's packed columns are while phase A holds them out
-/// of the table: in the store, or parked.
-#[derive(Clone)]
-enum Out {
-    Spilled(SpilledMain),
-    Parked(Arc<Parked>),
-}
-
-impl Out {
-    /// The store's handle, when the columns are there.
-    fn handle(&self) -> Option<SpilledMain> {
-        match self {
-            Self::Spilled(handle) => Some(handle.clone()),
-            Self::Parked(parked) => parked.handle(),
-        }
-    }
 
     /// The class the columns were dropped in, when they were.
     fn dropped_class(&self) -> Option<usize> {
-        match self {
-            Self::Spilled(_) => None,
-            Self::Parked(parked) => parked
-                .dropped()
-                .and_then(|_| parked.rank.map(|(class, _)| class)),
-        }
+        self.dropped()
+            .and_then(|_| self.rank.map(|(class, _)| class))
     }
 }
 
-#[derive(Default)]
-struct HandOff {
-    thread: Option<std::thread::JoinHandle<HandOffReport>>,
-    report: Option<HandOffReport>,
-    /// Phase A is over: no hand-off starts after it.
-    closed: bool,
-}
-
-/// What a hand-off did: the bytes it was asked for and handed, the tables, its
-/// seconds.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct HandOffReport {
-    pub asked: u64,
-    pub handed: u64,
-    pub tables: usize,
-    pub secs: f64,
-}
-
 impl BlockSpill {
-    /// A spill to `store`, or deciding with none (what the policy would move
-    /// off the host stays parked).
-    pub fn new(store: Option<SpillStore>, queue_bytes: u64, wanted: Arc<SpillWanted>) -> Self {
+    /// Deciding with `wanted`; nothing leaves the host until live
+    /// regeneration is on ([`Self::with_regen`]).
+    pub fn new(wanted: Arc<SpillWanted>) -> Self {
         Self {
-            store: store.map(Arc::new),
-            queue_bytes,
             wanted,
             regen: None,
             kept: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cells: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            prefetch: Arc::new(std::sync::Mutex::new(None)),
-            parked: Arc::new(std::sync::Mutex::new(Vec::new())),
-            parked_more: Arc::new(std::sync::Condvar::new()),
-            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            hand_off: Arc::new(std::sync::Mutex::new(HandOff::default())),
-            handing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -634,180 +542,34 @@ impl BlockSpill {
         self
     }
 
-    /// Hands the parked tables to the store, oldest first, until `need` bytes
-    /// have gone or phase A ends, through the store's own hand-off
-    /// ([`SpillStore::spill`]): the tables parked by then, and those parked
-    /// after, as they come (while it runs the committer parks what it would
-    /// have spilled). It runs on a thread of its own, so the caller does not
-    /// wait on the writers, and phase A's end joins it. Once only, and never
-    /// after phase A's end: `false` then (or when the thread cannot start).
-    ///
-    /// With live regeneration it arms it first ([`BlockRegen::arm`]): every
-    /// parked table phase B can rebuild is dropped, and only the others go to
-    /// the store; with no store, nothing else leaves. Partial drops
+    /// The walk's hand-off: arms live regeneration ([`BlockRegen::arm`]), so
+    /// every parked table phase B can rebuild is dropped. Partial drops
     /// ([`BlockRegen::partial`]) drop back parked tables, in rank order, only
-    /// until `need` bytes are on their way.
-    pub fn hand_off(&self, need: u64, mem: Option<Arc<BlockMem>>) -> bool {
-        if let Some(regen) = &self.regen {
-            regen.arm_at(self.cells.load(Relaxed));
-            // Partial drops hand back only what the hand-off asks for.
-            if regen.is_partial() {
-                regen.drop_back(need);
-            }
-        }
-        let Some(store) = self.store.clone() else {
-            return self.regen.is_some();
-        };
-        let mut hand_off = self.hand_off.lock().unwrap_or_else(|e| e.into_inner());
-        if hand_off.closed || hand_off.thread.is_some() || hand_off.report.is_some() {
+    /// until `need` bytes are on their way. `false` without live regeneration.
+    pub fn hand_off(&self, need: u64) -> bool {
+        let Some(regen) = &self.regen else {
             return false;
+        };
+        regen.arm_at(self.cells.load(Relaxed));
+        // Partial drops hand back only what the hand-off asks for.
+        if regen.is_partial() {
+            regen.drop_back(need);
         }
-        let (parked, parked_more, closed, handing) = (
-            Arc::clone(&self.parked),
-            Arc::clone(&self.parked_more),
-            Arc::clone(&self.closed),
-            Arc::clone(&self.handing),
-        );
-        handing.store(true, std::sync::atomic::Ordering::SeqCst);
-        let thread = std::thread::Builder::new()
-            .name("block-hand-off".to_string())
-            .spawn(move || {
-                let started = Instant::now();
-                let mut report = HandOffReport {
-                    asked: need,
-                    ..HandOffReport::default()
-                };
-                let mut next = 0usize;
-                while report.handed < need {
-                    // The next parked table, waiting for one while phase A runs.
-                    let slot = {
-                        let mut list = parked.lock().unwrap_or_else(|e| e.into_inner());
-                        loop {
-                            if let Some(slot) = list.get(next) {
-                                break Some(Arc::clone(slot));
-                            }
-                            if closed.load(std::sync::atomic::Ordering::SeqCst) {
-                                break None;
-                            }
-                            list = parked_more
-                                .wait_timeout(list, std::time::Duration::from_millis(100))
-                                .unwrap_or_else(|e| e.into_inner())
-                                .0;
-                        }
-                    };
-                    let Some(slot) = slot else {
-                        break;
-                    };
-                    next += 1;
-                    // Regeneration's: dropped, not written.
-                    if slot.rank.is_some() {
-                        continue;
-                    }
-                    let taken = std::mem::replace(
-                        &mut *slot.state.lock().unwrap_or_else(|e| e.into_inner()),
-                        ParkedState::Lost,
-                    );
-                    let packed = match taken {
-                        ParkedState::Resident(packed) => packed,
-                        other => {
-                            *slot.state.lock().unwrap_or_else(|e| e.into_inner()) = other;
-                            continue;
-                        }
-                    };
-                    // A shape the store refuses stays `Lost`: phase B refuses it.
-                    let Some(main) = to_store(packed) else {
-                        break;
-                    };
-                    let mut state = slot.state.lock().unwrap_or_else(|e| e.into_inner());
-                    match store.spill(main) {
-                        Ok(handle) => {
-                            *state = ParkedState::Spilled(handle);
-                            report.handed += slot.len;
-                            report.tables += 1;
-                            if let Some(mem) = &mem {
-                                mem.held_narrow.fetch_sub(slot.len as usize, Relaxed);
-                                mem.spilled.fetch_add(slot.len as usize, Relaxed);
-                            }
-                        }
-                        // The store failed: what is left stays parked.
-                        Err(main) => {
-                            if let Some(packed) = from_store(main) {
-                                *state = ParkedState::Resident(packed);
-                            }
-                            break;
-                        }
-                    }
-                }
-                handing.store(false, std::sync::atomic::Ordering::SeqCst);
-                report.secs = started.elapsed().as_secs_f64();
-                report
-            });
-        match thread {
-            Ok(thread) => {
-                hand_off.thread = Some(thread);
-                true
-            }
-            Err(_) => {
-                self.handing
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                false
-            }
-        }
+        true
     }
 
-    /// Phase A's end: joins a running hand-off and live regeneration's drops,
-    /// and none starts after this.
+    /// Phase A's end: joins live regeneration's drops.
     fn close_hand_off(&self) {
-        let thread = {
-            let mut hand_off = self.hand_off.lock().unwrap_or_else(|e| e.into_inner());
-            hand_off.closed = true;
-            hand_off.thread.take()
-        };
-        {
-            let _list = self.parked.lock().unwrap_or_else(|e| e.into_inner());
-            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
-            self.parked_more.notify_all();
-        }
-        if let Some(thread) = thread {
-            let report = thread
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            self.hand_off
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .report = Some(report);
-        }
         if let Some(regen) = &self.regen {
             regen.close_drops();
         }
-    }
-
-    /// What the hand-off did, once phase A's end joined it; `None` when none
-    /// ran.
-    pub fn hand_off_report(&self) -> Option<HandOffReport> {
-        self.hand_off
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .report
-    }
-
-    /// Whether `len` more bytes fit the writers' queue now. The committer is
-    /// the store's one producer, so the room it sees stays: the spill that
-    /// follows does not wait.
-    fn has_room(&self, len: u64) -> bool {
-        let Some(store) = &self.store else {
-            return false;
-        };
-        let stats = store.stats();
-        let pending = stats.bytes.saturating_sub(stats.bytes_written);
-        pending == 0 || pending + len <= self.queue_bytes
     }
 }
 
 /// Live regeneration on a block (D-WHIR-NODISK §2.1). `droppable(t)` is the
 /// rank of the table at block index `t` when phase B can rebuild its columns
 /// (a streamed chunk: its place in the hand-out), `None` otherwise. Phase A
-/// drops such a table instead of keeping or spilling it: its packed columns
+/// drops such a table instead of keeping it: its packed columns
 /// leave the host after their digest, on a thread of their own, and a
 /// [`RegenSlot`] in `window` stands for them; phase B waits on the slot before
 /// the table's group needs it (`restore_group`), and a deposit that is not
@@ -849,7 +611,7 @@ pub enum RankDecision {
     /// Dropped: its slot, which the regenerator fills.
     Dropped(RegenSlot),
     /// Not dropped, and never will be: held by its group's class
-    /// ([`drop_one_class`]), gone to the store, or phase A ended without
+    /// ([`drop_one_class`]), no longer on the host, or phase A ended without
     /// dropping it.
     Kept,
     /// Its class's window closed (the prove ended or failed) before the table
@@ -878,7 +640,7 @@ struct RegenState {
     /// Every drop, in the order made: its class and rank, its slot, its bytes
     /// and whether drop-back made it.
     dropped: Vec<((usize, u64), RegenSlot, u64, bool)>,
-    /// Drops that found their table gone from the host (handed to the store).
+    /// Drops that found their table no longer held on the host.
     refused_late: usize,
     /// Partial drops: the candidates were settled ([`BlockRegen::settle`]),
     /// and a table not dropped from now on is kept at once.
@@ -1404,40 +1166,19 @@ fn drop_parked(
     Some(slot)
 }
 
-/// Packed columns as the store's payload ([`NarrowMain`]): the same parts,
-/// the bytes moved, never copied. Both types hold the same shape checks, so
-/// columns that exist convert.
-fn to_store(packed: multilinear::narrow::NarrowColumns) -> Option<NarrowMain> {
-    let (rows, widths, data) = packed.into_parts();
-    NarrowMain::from_parts(rows, widths, data)
-}
-
-/// [`to_store`]'s inverse.
-fn from_store(main: NarrowMain) -> Option<multilinear::narrow::NarrowColumns> {
-    let (rows, widths, data) = main.into_parts();
-    multilinear::narrow::NarrowColumns::from_parts(rows, widths, data)
-}
-
-/// Considers group `g`'s narrow tables for the spill, `first` being the
+/// Considers a group's narrow tables for the spill, `first` being the
 /// first's index; where each table taken out of its group went goes in `out`.
-/// The first [`SPILL_RESIDENT_GROUPS`] groups keep theirs in place. Past them,
-/// a table the policy wants out, while no hand-off runs, and that the store's
-/// writer queue has room for goes to `store`; any other is parked
-/// ([`Parked`]): on the host until a hand-off moves it. Every table counts
-/// toward the cells committed, and every one not spilled toward the bytes
-/// kept.
-///
-/// With live regeneration a table phase B can rebuild is parked in any group
-/// and is dropped instead ([`BlockRegen`]): at once under `always`, once the
-/// policy first wants a table out (which arms it), and back at arming while
-/// parked. It counts toward the bytes kept only while it is not dropped.
+/// Every table counts toward the cells committed. A table phase B can rebuild
+/// is parked ([`Parked`]) and dropped ([`BlockRegen`]): at once under
+/// `always`, once the policy first wants a table out (which arms it), and back
+/// at arming while parked; it counts toward the bytes kept only while it is
+/// not dropped. Every other table stays in its group and counts toward the
+/// bytes kept.
 fn spill_group<F, E>(
     spill: &BlockSpill,
-    g: usize,
     first: usize,
     tables: &mut [CommittedTable<'_, F, E>],
-    out: &mut [Option<Out>],
-    mem: Option<&BlockMem>,
+    out: &mut [Option<Arc<Parked>>],
 ) -> Result<(), MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -1472,99 +1213,58 @@ where
             continue;
         };
         let rank = ranks[k];
-        // Records never go to the store: without a rank they stay.
-        let records = table.records().is_some();
-        if (g < SPILL_RESIDENT_GROUPS || records) && rank.is_none() {
+        // Only a table phase B can rebuild leaves its group.
+        let (Some(regen), Some(_)) = (&spill.regen, rank) else {
             spill.kept.fetch_add(len as u64, Relaxed);
             continue;
-        }
+        };
         let failed = || MlError::SpillFailed {
             table: first + k,
-            reason: "its packed parts did not move to the store and back",
+            reason: "its packed parts did not move out of the table",
         };
-        if let (Some(regen), Some(_)) = (&spill.regen, rank) {
-            let held = if records {
-                ParkedState::ResidentRecords(table.take_records_for_spill().ok_or_else(failed)?)
-            } else {
-                ParkedState::Resident(table.take_narrow_for_spill().ok_or_else(failed)?)
-            };
-            let parked = Arc::new(Parked {
-                len: len as u64,
-                cells,
-                rank,
-                state: std::sync::Mutex::new(held),
-            });
-            *slot = Some(Out::Parked(Arc::clone(&parked)));
-            let wanted =
-                !regen.always() && (spill.wanted)(spill.kept.load(Relaxed), cells, len as u64);
-            if wanted {
-                regen.arm_at(cells);
-            }
-            if regen.is_partial() && !regen.always() {
-                // Out only while the policy wants it out; else kept, and a
-                // candidate for a hand-off's drop-back.
-                if wanted {
-                    regen.drop_one(parked);
-                } else {
-                    spill.kept.fetch_add(len as u64, Relaxed);
-                    regen.parked(parked);
-                }
-                continue;
-            }
-            if !regen.always() && !regen.is_armed() {
-                spill.kept.fetch_add(len as u64, Relaxed);
-            }
-            regen.parked(parked);
-            continue;
-        }
-        let packed = table.take_narrow_for_spill().ok_or_else(failed)?;
-        let spill_now = spill.store.is_some()
-            && (spill.wanted)(spill.kept.load(Relaxed), cells, len as u64)
-            && !spill.handing.load(std::sync::atomic::Ordering::SeqCst)
-            && spill.has_room(len as u64);
-        let packed = match (&spill.store, spill_now) {
-            (Some(store), true) => match store.spill(to_store(packed).ok_or_else(failed)?) {
-                Ok(handle) => {
-                    if let Some(mem) = mem {
-                        mem.held_narrow.fetch_sub(len, Relaxed);
-                        mem.spilled.fetch_add(len, Relaxed);
-                    }
-                    *slot = Some(Out::Spilled(handle));
-                    continue;
-                }
-                Err(main) => from_store(main).ok_or_else(failed)?,
-            },
-            _ => packed,
+        let held = if table.records().is_some() {
+            ParkedState::ResidentRecords(table.take_records_for_spill().ok_or_else(failed)?)
+        } else {
+            ParkedState::Resident(table.take_narrow_for_spill().ok_or_else(failed)?)
         };
         let parked = Arc::new(Parked {
             len: len as u64,
             cells,
-            rank: None,
-            state: std::sync::Mutex::new(ParkedState::Resident(packed)),
+            rank,
+            state: std::sync::Mutex::new(held),
         });
-        spill
-            .parked
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(Arc::clone(&parked));
-        spill.parked_more.notify_all();
-        *slot = Some(Out::Parked(parked));
-        spill.kept.fetch_add(len as u64, Relaxed);
+        *slot = Some(Arc::clone(&parked));
+        let wanted = !regen.always() && (spill.wanted)(spill.kept.load(Relaxed), cells, len as u64);
+        if wanted {
+            regen.arm_at(cells);
+        }
+        if regen.is_partial() && !regen.always() {
+            // Out only while the policy wants it out; else kept, and a
+            // candidate for a hand-off's drop-back.
+            if wanted {
+                regen.drop_one(parked);
+            } else {
+                spill.kept.fetch_add(len as u64, Relaxed);
+                regen.parked(parked);
+            }
+            continue;
+        }
+        if !regen.always() && !regen.is_armed() {
+            spill.kept.fetch_add(len as u64, Relaxed);
+        }
+        regen.parked(parked);
     }
     Ok(())
 }
 
 /// Brings `tables`' columns back before their upload, `first` being the
-/// first's index: a parked table's from the host, or from the store when a
-/// hand-off moved them; a spilled table's from the read-back ahead when it
-/// has them, or read here; a dropped table's from its regeneration slot,
-/// waiting for its deposit. Refused when a read fails or does not match what
-/// was written, or a deposit is not what was dropped.
+/// first's index: a parked table's from the host, a dropped table's from its
+/// regeneration slot, waiting for its deposit. Refused when a deposit is not
+/// what was dropped.
 fn restore_group<F, E>(
     first: usize,
     tables: &mut [CommittedTable<'_, F, E>],
-    out: &mut [Option<Out>],
-    prefetch: Option<&Prefetch>,
+    out: &mut [Option<Arc<Parked>>],
     mem: Option<&BlockMem>,
 ) -> Result<(), MlError>
 where
@@ -1574,93 +1274,56 @@ where
     FieldElement<E>: AsBytes + Sync + Send,
 {
     for (k, (table, slot)) in tables.iter_mut().zip(out.iter_mut()).enumerate() {
-        let Some(taken) = slot.take() else {
+        let Some(parked) = slot.take() else {
             continue;
         };
         let index = first + k;
-        let handle = match taken {
-            Out::Spilled(handle) => handle,
-            Out::Parked(parked) => {
-                let state = std::mem::replace(
-                    &mut *parked.state.lock().unwrap_or_else(|e| e.into_inner()),
-                    ParkedState::Lost,
-                );
-                match state {
-                    ParkedState::Resident(packed) => {
-                        if !table.restore_narrow(packed) {
-                            return Err(MlError::SpillFailed {
-                                table: index,
-                                reason: "the parked columns do not have the table's shape",
-                            });
-                        }
-                        continue;
-                    }
-                    ParkedState::ResidentRecords(records) => {
-                        if !table.restore_records(records) {
-                            return Err(MlError::SpillFailed {
-                                table: index,
-                                reason: "the parked records do not have the table's shape",
-                            });
-                        }
-                        continue;
-                    }
-                    ParkedState::Dropped(regen) => {
-                        regen.wait();
-                        let packed = regen.take().map_err(|e| MlError::SpillFailed {
-                            table: index,
-                            reason: match e {
-                                RegenError::Mismatch => {
-                                    "the regenerated columns are not the ones dropped"
-                                }
-                                RegenError::Failed(_) => {
-                                    "the regenerator did not bring its columns back"
-                                }
-                                RegenError::Closed(_) => {
-                                    "the regeneration window closed before its columns came back"
-                                }
-                            },
-                        })?;
-                        let len = packed.data().len();
-                        if !table.restore_narrow(packed) {
-                            return Err(MlError::SpillFailed {
-                                table: index,
-                                reason: "the regenerated columns do not have the table's shape",
-                            });
-                        }
-                        if let Some(mem) = mem {
-                            mem.held_narrow.fetch_add(len, Relaxed);
-                        }
-                        continue;
-                    }
-                    ParkedState::Spilled(handle) => handle,
-                    // The table stays out, and the group's check refuses it.
-                    ParkedState::Lost => continue,
+        let state = std::mem::replace(
+            &mut *parked.state.lock().unwrap_or_else(|e| e.into_inner()),
+            ParkedState::Lost,
+        );
+        match state {
+            ParkedState::Resident(packed) => {
+                if !table.restore_narrow(packed) {
+                    return Err(MlError::SpillFailed {
+                        table: index,
+                        reason: "the parked columns do not have the table's shape",
+                    });
                 }
             }
-        };
-        let read = match prefetch.and_then(|p| p.take(ReadPhase::Fused, index)) {
-            Some(read) => read,
-            None => handle.into_narrow(),
-        };
-        let main = read.map_err(|e| MlError::SpillFailed {
-            table: index,
-            reason: match e {
-                crate::spill::SpillError::Mismatch => {
-                    "the bytes read back are not the ones written"
+            ParkedState::ResidentRecords(records) => {
+                if !table.restore_records(records) {
+                    return Err(MlError::SpillFailed {
+                        table: index,
+                        reason: "the parked records do not have the table's shape",
+                    });
                 }
-                crate::spill::SpillError::Io(_) => "the read failed",
-            },
-        })?;
-        let len = main.data().len();
-        if !from_store(main).is_some_and(|packed| table.restore_narrow(packed)) {
-            return Err(MlError::SpillFailed {
-                table: index,
-                reason: "the bytes read back do not have the table's shape",
-            });
-        }
-        if let Some(mem) = mem {
-            mem.spilled.fetch_sub(len, Relaxed);
-            mem.held_narrow.fetch_add(len, Relaxed);
+            }
+            ParkedState::Dropped(regen) => {
+                regen.wait();
+                let packed = regen.take().map_err(|e| MlError::SpillFailed {
+                    table: index,
+                    reason: match e {
+                        RegenError::Mismatch => "the regenerated columns are not the ones dropped",
+                        RegenError::Failed(_) => "the regenerator did not bring its columns back",
+                        RegenError::Closed(_) => {
+                            "the regeneration window closed before its columns came back"
+                        }
+                    },
+                })?;
+                let len = packed.data().len();
+                if !table.restore_narrow(packed) {
+                    return Err(MlError::SpillFailed {
+                        table: index,
+                        reason: "the regenerated columns do not have the table's shape",
+                    });
+                }
+                if let Some(mem) = mem {
+                    mem.held_narrow.fetch_add(len, Relaxed);
+                }
+            }
+            // The table stays out, and the group's check refuses it.
+            ParkedState::Lost => {}
         }
     }
     Ok(())
@@ -1963,8 +1626,8 @@ where
     mem: Option<Arc<BlockMem>>,
     /// The spill, when one is on, and each table's slot in it.
     spill: Option<BlockSpill>,
-    /// Each table taken out of its group in phase A: spilled, or parked.
-    spilled: Vec<Option<Out>>,
+    /// Each table taken out of its group in phase A: parked, or dropped.
+    spilled: Vec<Option<Arc<Parked>>>,
     /// Phase B's overlap ([`Self::with_phase_b_overlap`]), and a test's faults
     /// in it.
     overlap: PhaseBOverlap,
@@ -2114,7 +1777,7 @@ where
     {
         let mut tables = Vec::new();
         let mut ood = Vec::new();
-        let mut spilled: Vec<Option<Out>> = Vec::new();
+        let mut spilled: Vec<Option<Arc<Parked>>> = Vec::new();
         let mut sizes = Vec::new();
         let mut retired_groups = Vec::new();
         if let Some(regen) = spill.as_ref().and_then(|spill| spill.regen.as_ref()) {
@@ -2369,14 +2032,7 @@ where
             if packing.is_none()
                 && let Some(spill) = &spill
             {
-                spill_group(
-                    spill,
-                    stamps.len() - 1,
-                    first,
-                    &mut tables[first..],
-                    &mut spilled[first..],
-                    mem.as_deref(),
-                )?;
+                spill_group(spill, first, &mut tables[first..], &mut spilled[first..])?;
             }
         }
         if let Some(packed) = packing.take() {
@@ -2390,8 +2046,7 @@ where
                 spill.as_ref(),
             )?;
         }
-        // Phase A's end: a hand-off still writing is joined, and none starts
-        // after this, so phase B's read-back plans every handle.
+        // Phase A's end: live regeneration's drops are joined.
         if let Some(spill) = &spill {
             spill.close_hand_off();
         }
@@ -2465,7 +2120,7 @@ where
                 let classes = self.spilled[at..at + size]
                     .iter()
                     .flatten()
-                    .map(Out::dropped_class);
+                    .map(|parked| parked.dropped_class());
                 at += size;
                 one_class(classes).ok_or(g)
             })
@@ -2507,34 +2162,6 @@ where
             .iter_mut()
             .filter_map(|table| table.narrow_mut())
             .any(|packed| packed.fault_width_map())
-    }
-
-    /// A test's fault: the slot of the first table whose columns are in the
-    /// store (spilled, or parked and handed off) lost, so its columns never
-    /// come back. Returns whether such a table was there to lose.
-    #[doc(hidden)]
-    pub fn fault_lose_spilled_slot(&mut self) -> bool {
-        self.spilled
-            .iter_mut()
-            .find(|slot| slot.as_ref().and_then(Out::handle).is_some())
-            .map(Option::take)
-            .is_some()
-    }
-
-    /// A test's fault: one byte of the first spilled table flipped on disk,
-    /// once the writers are done, so phase B reads back other bytes than were
-    /// written. Returns whether a written table was there to break; `false`
-    /// outside test builds.
-    #[doc(hidden)]
-    pub fn fault_spilled_byte(&mut self) -> bool {
-        #[cfg(any(test, feature = "test-utils"))]
-        if let Some(store) = self.spill.as_ref().and_then(|spill| spill.store.as_ref()) {
-            store.flush();
-            if let Some(handle) = self.spilled.iter().flatten().find_map(Out::handle) {
-                return store.corrupt_on_disk(&handle, 0).unwrap_or(false);
-            }
-        }
-        false
     }
 }
 
@@ -2741,7 +2368,7 @@ impl Packing {
 fn install_and_spill<F, E>(
     packed: Packing,
     tables: &mut [CommittedTable<'_, F, E>],
-    spilled: &mut [Option<Out>],
+    spilled: &mut [Option<Arc<Parked>>],
     stamps: &mut [GroupStamps],
     sizes: &[usize],
     mem: Option<&BlockMem>,
@@ -2761,11 +2388,9 @@ where
     let end = first + sizes[g];
     spill_group(
         spill,
-        g,
         first,
         &mut tables[first..end],
         &mut spilled[first..end],
-        mem,
     )
 }
 
@@ -3534,34 +3159,6 @@ where
     let _pinned = (overlap == PhaseBOverlap::Pinned).then(multilinear::gpu::pinned_readbacks);
     let mut prev: Option<Argued<F, E, T>> = None;
     let mut latched = false;
-    // The spilled tables read back in phase B's order, two groups' bytes ahead
-    // of their uploads.
-    let prefetch = spill.as_ref().and_then(|_| {
-        let reads: Vec<(ReadPhase, usize, SpilledMain)> = order
-            .iter()
-            .flat_map(|&g| starts[g]..starts[g] + sizes[g])
-            .filter_map(|t| {
-                spilled[t]
-                    .as_ref()
-                    .and_then(Out::handle)
-                    .map(|handle| (ReadPhase::Fused, t, handle))
-            })
-            .collect();
-        let widest = starts
-            .iter()
-            .zip(&sizes)
-            .map(|(&start, &size)| {
-                spilled[start..start + size]
-                    .iter()
-                    .flatten()
-                    .filter_map(Out::handle)
-                    .map(|handle| handle.len() as u64)
-                    .sum::<u64>()
-            })
-            .max()
-            .unwrap_or(0);
-        (!reads.is_empty()).then(|| Prefetch::start(reads, 2 * widest.max(1)))
-    });
     // The driver thread's schedstat at the start of the turn under way, and
     // its group: each turn's share is closed at the next turn's start.
     let mut turn_sched: Option<((u64, u64), usize)> = None;
@@ -3588,7 +3185,6 @@ where
                     first,
                     &mut tables[first..first + len],
                     &mut spilled[first..first + len],
-                    prefetch.as_ref(),
                     mem.as_deref(),
                 )?;
                 // No reader of these groups meets a table whose columns are
@@ -3874,12 +3470,6 @@ where
     // The tables go with this function: a memory log stops holding them.
     if let Some(mem) = &mem {
         mem.release(tables.iter());
-    }
-    if let (Some(spill), Some(prefetch)) = (&spill, &prefetch) {
-        *spill
-            .prefetch
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prefetch.report());
     }
     let openings = group_opening
         .into_iter()
@@ -4347,11 +3937,9 @@ mod commit_ood_point_tests {
 
 #[cfg(test)]
 mod spill_tests {
-    use super::{commit_pairs_off_pool_from, from_store, to_store};
+    use super::commit_pairs_off_pool_from;
     use multilinear::narrow::NarrowColumns;
 
-    /// The packed columns move to the store's payload and back without a
-    /// copy: the same bytes at the same address.
     /// The default commits the pairs off the pool; `0` is the opt-out to the pool.
     #[test]
     fn the_commit_pairs_go_off_the_pool_by_default_and_zero_opts_out() {
@@ -4360,19 +3948,6 @@ mod spill_tests {
         assert!(commit_pairs_off_pool_from(Some("yes")));
         assert!(!commit_pairs_off_pool_from(Some("0")));
         assert!(!commit_pairs_off_pool_from(Some(" 0 ")));
-    }
-
-    #[test]
-    fn the_columns_move_to_the_store_and_back_without_a_copy() {
-        let words: Vec<u64> = (0..3 * 4096u64).map(|i| i * 0x9e37_79b9 % 70_000).collect();
-        let packed = NarrowColumns::pack_row_major(&words, 3).expect("packs");
-        let copy = packed.clone();
-        let at = packed.data().as_ptr();
-        let main = to_store(packed).expect("converts");
-        assert_eq!(main.data().as_ptr(), at, "to the store");
-        let back = from_store(main).expect("converts back");
-        assert_eq!(back.data().as_ptr(), at, "back");
-        assert_eq!(back, copy);
     }
 
     /// ★ Under a spill, a finished group lets go of its tables' records as it

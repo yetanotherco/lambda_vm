@@ -25,9 +25,8 @@ pub mod multilinear_air;
 pub mod multilinear_block;
 pub mod multilinear_logup;
 pub mod multilinear_table;
-// `narrow` and `spill` are #1013's packed-trace store, imported byte-identical
-// (#1013 is their one source of truth). Some of their parts serve #1013's
-// prover only.
+// `narrow` is #1013's packed-trace form, imported byte-identical (#1013 is
+// its one source of truth). Some of its parts serve #1013's prover only.
 #[allow(dead_code)]
 pub mod narrow;
 pub mod ood;
@@ -41,8 +40,6 @@ pub mod regen;
 pub mod residency_mode;
 #[cfg(all(feature = "cuda", any(test, feature = "test-utils")))]
 pub mod s2_device_parity;
-#[allow(dead_code)]
-pub mod spill;
 pub mod table;
 pub mod trace;
 pub mod traits;

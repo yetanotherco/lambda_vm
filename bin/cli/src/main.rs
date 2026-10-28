@@ -625,7 +625,7 @@ fn posture_plan(env: impl Fn(&str) -> Option<String>, target: impl Fn() -> u64) 
             if cap != value {
                 plan.notes.push(format!(
                     "BLOCK POSTURE: {name}={cap}, not {value}: the host target is {:.1} GiB \
-                     (LAMBDA_VM_BLOCK_SPILL_TARGET_GIB, else the cgroup or MemTotal less 10 GiB)",
+                     (LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB, else the cgroup or MemTotal less 10 GiB)",
                     target as f64 / (1u64 << 30) as f64
                 ));
             }
@@ -649,7 +649,7 @@ fn posture_plan(env: impl Fn(&str) -> Option<String>, target: impl Fn() -> u64) 
 unsafe fn apply_posture() -> Vec<String> {
     let plan = posture_plan(
         |name| std::env::var(name).ok(),
-        prover::block_whir::spill_target_bytes,
+        prover::block_whir::memory_target_bytes,
     );
     for (name, value) in &plan.set {
         // SAFETY: the caller's: no other thread exists.

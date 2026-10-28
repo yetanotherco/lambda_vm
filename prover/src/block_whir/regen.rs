@@ -15,8 +15,8 @@
 //! the one the knob's absence makes.
 //!
 //! `auto` and `always` are live regeneration (#1013's R2, its no-disk P1):
-//! phase A drops a streamed chunk instead of keeping or spilling it once the
-//! spill's policy would move a table off the host (`always`: every one), and
+//! phase A drops a streamed chunk instead of keeping it once the `auto` rule
+//! would move a table off the host (`always`: every one), and
 //! phase B's regenerator ([`run_live`]) deposits each into its slot, paced by
 //! the groups that take them ([`stark::multilinear_block::BlockRegen`]).
 
@@ -43,11 +43,10 @@ pub enum RegenMode {
     /// `shadow`: phase A records every streamed chunk's recipe, and phase B
     /// regenerates each beside the prove, checks it and throws it away.
     Shadow,
-    /// `auto`: a tier of the spill's policy. Once it would move a table off
-    /// the host, a streamed chunk is dropped instead (and the parked ones are
-    /// dropped back), and phase B rebuilds the dropped ones. With the spill
-    /// policy `off` it still decides as `auto` does, with no store: no disk.
-    /// A block that never arms drops nothing.
+    /// `auto`: once the rule against the host's memory target
+    /// ([`super::drop_wanted`]) would move a table off the host, a streamed
+    /// chunk is dropped (and the parked ones are dropped back), and phase B
+    /// rebuilds the dropped ones. A block that never arms drops nothing.
     Auto,
     /// `always`: every streamed chunk is dropped and rebuilt — the
     /// byte-identity test mode, not a policy.
@@ -62,42 +61,54 @@ impl RegenMode {
 }
 
 /// [`RegenMode`] from `LAMBDA_VM_BLOCK_REGEN` alone (unset: `off`); any other
-/// value is refused (an error, never a panic). The production default couples
-/// it to the spill knob ([`production_regen`]).
+/// value is refused (an error, never a panic). The production default is
+/// `auto` when the knob is unset ([`production_regen`]).
 pub(crate) fn regen_mode() -> Result<RegenMode, Error> {
     parse_regen_mode(std::env::var("LAMBDA_VM_BLOCK_REGEN").ok().as_deref())
 }
 
 /// [`crate::block_whir::BlockOptions::production`]'s regeneration
-/// ([`production_regen_from`] of the two knobs).
+/// ([`production_regen_from`] of the knob).
 pub(crate) fn production_regen() -> Option<RegenMode> {
-    production_regen_from(
-        std::env::var("LAMBDA_VM_BLOCK_REGEN").ok().as_deref(),
-        std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref(),
-    )
+    production_regen_from(std::env::var("LAMBDA_VM_BLOCK_REGEN").ok().as_deref())
 }
 
-/// The production default, the knobs coupled as #1013's 1a9853790: both unset,
-/// regeneration is `auto` and the spill `off` ([`super::production_spill`]): no
-/// disk, whenever `auto` arms the tables phase B can build again (the streamed
-/// chunks, KECCAK_RND's and LT's) are dropped and rebuilt in phase B, and the
-/// rest stays. A knob that is set keeps the meaning it had: a set `regen` is
-/// read when the prove starts (`None`, so a value it does not know refuses the
-/// prove), and an unset `regen` beside a set `spill` is `off`, as before.
-pub(crate) fn production_regen_from(regen: Option<&str>, spill: Option<&str>) -> Option<RegenMode> {
-    match (regen, spill) {
-        (Some(_), _) => None,
-        (None, None) => Some(RegenMode::Auto),
-        (None, Some(_)) => Some(RegenMode::Off),
+/// The production default (#1013's 1a9853790): unset, regeneration is `auto`:
+/// whenever it arms, the tables phase B can build again (the streamed chunks,
+/// KECCAK_RND's and LT's) are dropped and rebuilt in phase B, and the rest
+/// stays. A set knob is read when the prove starts (`None`, so a value it does
+/// not know refuses the prove).
+pub(crate) fn production_regen_from(regen: Option<&str>) -> Option<RegenMode> {
+    match regen {
+        Some(_) => None,
+        None => Some(RegenMode::Auto),
     }
 }
 
-/// The `BLOCK REGEN mode` line: the mode a prove runs, the two knobs as set
-/// (the production default is `auto` with the spill `off` when both are
-/// unset), and `no disk` when live regeneration runs with the spill off.
+/// `LAMBDA_VM_BLOCK_SPILL`, the knob of the block's disk store, which is gone:
+/// set, it refuses the prove. It used to switch regeneration off when
+/// `LAMBDA_VM_BLOCK_REGEN` was unset, so a run that sets it asked for an arm
+/// that no longer exists; `LAMBDA_VM_BLOCK_REGEN=off` holds every table.
+pub(crate) fn refuse_spill_knob(value: Option<&str>) -> Result<(), Error> {
+    match value {
+        None => Ok(()),
+        Some(v) => Err(Error::Prover(format!(
+            "LAMBDA_VM_BLOCK_SPILL={} is no longer read: the block has no disk store; unset it \
+             (LAMBDA_VM_BLOCK_REGEN=off holds every table in memory)",
+            v.trim()
+        ))),
+    }
+}
+
+/// The `BLOCK REGEN mode` line: the mode a prove runs, the knobs it reads at
+/// its start as set (`LAMBDA_VM_BLOCK_SPILL` only to refuse it,
+/// [`refuse_spill_knob`]; the production default is `auto` when
+/// `LAMBDA_VM_BLOCK_REGEN` is unset), and `no disk` when live regeneration
+/// runs. The line is what it was while the block had a disk store, so the
+/// read-outs that parse it read it as before.
 pub(crate) fn regen_mode_line(
     mode: RegenMode,
-    no_disk: bool,
+    live: bool,
     regen: Option<&str>,
     spill: Option<&str>,
 ) -> String {
@@ -109,7 +120,7 @@ pub(crate) fn regen_mode_line(
         "BLOCK REGEN mode: {mode:?} · {} · {}{}",
         knob("LAMBDA_VM_BLOCK_REGEN", regen),
         knob("LAMBDA_VM_BLOCK_SPILL", spill),
-        if no_disk { " · no disk" } else { "" }
+        if live { " · no disk" } else { "" }
     )
 }
 
@@ -437,8 +448,7 @@ fn parse_count(value: Option<&str>) -> Option<usize> {
         .filter(|n| (1..=16).contains(n))
 }
 
-/// Packed columns' shape and digest ([`stark::regen::digest_of`], the spill
-/// store's digest).
+/// Packed columns' shape and digest ([`stark::regen::digest_of`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Packed {
     pub(crate) digest: [u64; 2],
@@ -2663,10 +2673,9 @@ impl Drop for EarlyStart {
 }
 
 /// The `BLOCK REGEN dropped` line: what phase A dropped, of `recipes` streamed
-/// chunks.
+/// chunks (always with no disk: the line reads as it did beside a store).
 pub(crate) fn dropped_line(
     mode: RegenMode,
-    no_disk: bool,
     report: &stark::multilinear_block::DropReport,
     recipes: usize,
 ) -> String {
@@ -2676,10 +2685,9 @@ pub(crate) fn dropped_line(
         None => "never armed".to_string(),
     };
     format!(
-        "BLOCK REGEN dropped: {mode:?}{} · {} chunks {:.2} GiB (drop-back {} chunks {:.2} GiB) · \
+        "BLOCK REGEN dropped: {mode:?} (no disk) · {} chunks {:.2} GiB (drop-back {} chunks {:.2} GiB) · \
          {armed} · {recipes} recipes · {} refused (no longer on the host) · {} held (their group \
          dropped another class) · {} dropped as their records, {:.2} GiB of records",
-        if no_disk { " (no disk)" } else { "" },
         report.tables,
         report.bytes as f64 / GIB,
         report.back_tables,
@@ -2978,27 +2986,13 @@ mod tests {
         );
     }
 
-    /// ★ The production default with the knobs coupled (N4a): both unset →
-    /// `auto` (the spill tier stays `auto`); a set regen is read when the
-    /// prove starts, whatever the spill; an unset regen beside a set spill is
-    /// `off`, as before.
+    /// ★ The production default: unset → `auto`; a set regen is read when
+    /// the prove starts.
     #[test]
-    fn the_production_regen_is_auto_unless_a_knob_is_set() {
-        assert_eq!(production_regen_from(None, None), Some(RegenMode::Auto));
-        for spill in ["auto", "off", "always", "2.5"] {
-            assert_eq!(
-                production_regen_from(None, Some(spill)),
-                Some(RegenMode::Off),
-                "{spill}"
-            );
-        }
+    fn the_production_regen_is_auto_unless_its_knob_is_set() {
+        assert_eq!(production_regen_from(None), Some(RegenMode::Auto));
         for regen in ["off", "shadow", "auto", "always", "bogus"] {
-            assert_eq!(production_regen_from(Some(regen), None), None, "{regen}");
-            assert_eq!(
-                production_regen_from(Some(regen), Some("auto")),
-                None,
-                "{regen}"
-            );
+            assert_eq!(production_regen_from(Some(regen)), None, "{regen}");
         }
         // A set regen parses as it did; unset, alone, it is off.
         assert_eq!(parse_regen_mode(None).unwrap(), RegenMode::Off);
@@ -3009,9 +3003,22 @@ mod tests {
              · no disk"
         );
         assert_eq!(
-            regen_mode_line(RegenMode::Off, false, Some(" off "), Some("auto")),
-            "BLOCK REGEN mode: Off · LAMBDA_VM_BLOCK_REGEN=off · LAMBDA_VM_BLOCK_SPILL=auto"
+            regen_mode_line(RegenMode::Off, false, Some(" off "), None),
+            "BLOCK REGEN mode: Off · LAMBDA_VM_BLOCK_REGEN=off · LAMBDA_VM_BLOCK_SPILL unset"
         );
+    }
+
+    /// The disk store's knob refuses the prove when it is set, whatever its
+    /// value, and names the arm that replaces its `off`; unset, nothing.
+    #[test]
+    fn the_disk_stores_knob_refuses_the_prove_when_set() {
+        assert!(refuse_spill_knob(None).is_ok());
+        for value in ["off", "auto", "always", "2.5", ""] {
+            let Err(Error::Prover(why)) = refuse_spill_knob(Some(value)) else {
+                panic!("LAMBDA_VM_BLOCK_SPILL={value} must refuse the prove");
+            };
+            assert!(why.contains("LAMBDA_VM_BLOCK_REGEN=off"), "{why}");
+        }
     }
 
     /// `LAMBDA_VM_BLOCK_REGEN_EARLY`: at the fates unless `0` (with

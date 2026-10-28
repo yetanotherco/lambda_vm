@@ -13,7 +13,7 @@
 //! - **Room.** `auto`, the default, admits a program while the process's
 //!   resident bytes now (`VmRSS`) plus the program's bytes, and the bytes of the
 //!   programs admitted but not yet emitted, stay under the host target the
-//!   caller gives: the pipeline's spill target (`LAMBDA_VM_BLOCK_SPILL_TARGET_GIB`,
+//!   caller gives: the pipeline's memory target (`LAMBDA_VM_BLOCK_MEMORY_TARGET_GIB`,
 //!   else the cgroup's limit or `MemTotal` less 10 GiB). One knob sizes both,
 //!   and the allocator's retained pages count because `VmRSS` counts them. A
 //!   roomy host never reaches the target, so every program is emitted where it
