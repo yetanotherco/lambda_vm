@@ -181,7 +181,23 @@ pub enum LeafScale {
     /// the leaves forced to double: −2.57 s of recursion on a large block's 18
     /// leaves, +0.33 s on a median block's 9).
     DoubleFrom(usize),
+    /// Every leaf under [`P1_LEAF_HEIGHTS_2X`], whatever the leaf count, and,
+    /// when that takes at most [`ONE_TOP_MAX_LEAVES`] leaves, one top over all
+    /// of them: no node level between the leaves and the top. Past that count
+    /// the tree is [`Self::DoubleFrom`]'s, nodes of the plan's fan-in. A top
+    /// over four doubled leaves stays within 2^19 socket rows, the LFM proofs'
+    /// bits bound, and is refused past it ([`ONE_TOP_SOCKET_ROWS`]). Opt-in
+    /// (`one-top`).
+    DoubledOneTop,
 }
+
+/// The most leaves [`LeafScale::DoubledOneTop`] puts under one top.
+pub const ONE_TOP_MAX_LEAVES: usize = 4;
+
+/// The socket rows a node with more children than the plan's fan-in may take:
+/// the LFM proofs' bits bound (socket at most 2^19 rows). Past it the node is
+/// refused, not proved.
+pub const ONE_TOP_SOCKET_ROWS: usize = 1 << 19;
 
 /// The threshold of [`LeafScale::DEFAULT`]: the fewest leaves at the single
 /// heights from which a block's leaves double.
@@ -201,29 +217,37 @@ impl std::fmt::Display for LeafScale {
         match self {
             Self::Fixed => f.write_str("fixed"),
             Self::DoubleFrom(t) => write!(f, "doubled from {t} leaves"),
+            Self::DoubledOneTop => write!(
+                f,
+                "doubled, one top over at most {ONE_TOP_MAX_LEAVES} leaves"
+            ),
         }
     }
 }
 
 /// [`leaf_scale_from_env`]'s knob: unset is [`LeafScale::DEFAULT`], `off` is
-/// [`LeafScale::Fixed`], a count `T` is [`LeafScale::DoubleFrom`]`(T)`.
+/// [`LeafScale::Fixed`], a count `T` is [`LeafScale::DoubleFrom`]`(T)`,
+/// `one-top` is [`LeafScale::DoubledOneTop`].
 pub const LEAF_DOUBLE_FROM_ENV: &str = "LAMBDA_VM_WHIR_LEAF_DOUBLE_FROM";
 
 /// A value of [`LEAF_DOUBLE_FROM_ENV`] (or the CLI's `--leaf-double-from`):
 /// unset or empty is [`LeafScale::DEFAULT`]; `off` is [`LeafScale::Fixed`]; a
-/// positive count `T` is [`LeafScale::DoubleFrom`]`(T)`; anything else is an
-/// error.
+/// positive count `T` is [`LeafScale::DoubleFrom`]`(T)`; `one-top` is
+/// [`LeafScale::DoubledOneTop`]; anything else is an error.
 pub fn leaf_scale_setting(value: Option<&str>) -> Result<LeafScale, String> {
     match value.map(str::trim) {
         None | Some("") => Ok(LeafScale::DEFAULT),
         Some("off") => Ok(LeafScale::Fixed),
+        Some("one-top") => Ok(LeafScale::DoubledOneTop),
         Some(v) => v
             .parse::<usize>()
             .ok()
             .filter(|&t| t >= 1)
             .map(LeafScale::DoubleFrom)
             .ok_or_else(|| {
-                format!("{LEAF_DOUBLE_FROM_ENV} must be `off` or a leaf count, got `{v}`")
+                format!(
+                    "{LEAF_DOUBLE_FROM_ENV} must be `off`, `one-top` or a leaf count, got `{v}`"
+                )
             }),
     }
 }
@@ -536,7 +560,8 @@ pub struct LeafBound {
 
 /// ★ The leaf partition under `scale`: [`leaf_partition_rows`] at `heights`,
 /// and when [`LeafScale::DoubleFrom`]`(t)` and that takes `t` leaves or more,
-/// [`leaf_partition_rows`] again at `doubled`. Pure, so the prover and the
+/// or under [`LeafScale::DoubledOneTop`], [`leaf_partition_rows`] again at
+/// `doubled`. Pure, so the prover and the
 /// verifier derive one partition from one statement; below `t` it is the one
 /// at `heights`, unchanged. Refuses what [`leaf_partition_rows`] refuses at
 /// `heights`, so every group a doubled leaf holds fits a single one too, and
@@ -555,23 +580,29 @@ pub fn scaled_leaf_partition(
     }
     let single = leaf_partition_rows(loads, front, heights)?;
     let single_leaves = single.num_leaves();
-    Ok(match scale {
-        LeafScale::DoubleFrom(t) if single_leaves >= t => (
+    let double = match scale {
+        LeafScale::Fixed => false,
+        LeafScale::DoubleFrom(t) => single_leaves >= t,
+        LeafScale::DoubledOneTop => true,
+    };
+    Ok(if double {
+        (
             leaf_partition_rows(loads, front, doubled)?,
             LeafBound {
                 single_leaves,
                 heights: doubled,
                 doubled: true,
             },
-        ),
-        LeafScale::Fixed | LeafScale::DoubleFrom(_) => (
+        )
+    } else {
+        (
             single,
             LeafBound {
                 single_leaves,
                 heights,
                 doubled: false,
             },
-        ),
+        )
     })
 }
 
@@ -724,6 +755,9 @@ pub struct WhirBlockPlan {
     /// process's knob for a prover ([`share_inverse`]), always on for the
     /// pinned verifier.
     share_inverse: bool,
+    /// One top over every leaf when they are at most [`ONE_TOP_MAX_LEAVES`]
+    /// ([`LeafScale::DoubledOneTop`]).
+    one_top: bool,
     /// Children a node verifies.
     fan_in: usize,
     /// A digest of the statement run: the block's identity, published by every
@@ -982,6 +1016,7 @@ impl WhirBlockPlan {
             leaf_bound: None,
             leaf_query: format.leaf_query,
             share_inverse,
+            one_top: format.leaf_scale == LeafScale::DoubledOneTop,
             fan_in,
             id,
         };
@@ -1146,15 +1181,36 @@ impl WhirBlockPlan {
                 top,
             },
         );
-        finish(b)
+        let program = finish(b)?;
+        // A node wider than the plan's fan-in (one top over every leaf) is held
+        // to the LFM proofs' bits bound on its socket and bit-dec rows.
+        if children.len() > self.fan_in {
+            let rows = ChipRows::of(&program);
+            if rows.hash > ONE_TOP_SOCKET_ROWS || rows.bitdec > ONE_TOP_SOCKET_ROWS {
+                return Err(format!(
+                    "a node over {} children emits {} socket and {} bit-dec rows — at most {ONE_TOP_SOCKET_ROWS}",
+                    children.len(),
+                    rows.hash,
+                    rows.bitdec
+                ));
+            }
+        }
+        Ok(program)
     }
 
     /// The levels above the leaves: the plan's fan-in, leftovers in arity-1
     /// nodes, the last level's single node the top. A one-leaf block still gets
-    /// a top node: the bus closes there.
+    /// a top node: the bus closes there. Under [`LeafScale::DoubledOneTop`], at
+    /// most [`ONE_TOP_MAX_LEAVES`] leaves go under one top.
     pub fn levels(&self) -> Vec<super::per_table_aggregator::Level> {
         use super::per_table_aggregator::{Level, tree_shape};
-        let mut shape = tree_shape(self.partition.num_leaves(), self.fan_in);
+        let leaves = self.partition.num_leaves();
+        if self.one_top && leaves <= ONE_TOP_MAX_LEAVES {
+            return vec![Level {
+                arities: vec![leaves.max(1)],
+            }];
+        }
+        let mut shape = tree_shape(leaves, self.fan_in);
         if shape.is_empty() {
             shape.push(Level { arities: vec![1] });
         }

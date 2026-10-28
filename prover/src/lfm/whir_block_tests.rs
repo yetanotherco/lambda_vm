@@ -3184,7 +3184,7 @@ fn the_whir_block_tree_on_a_real_block() {
         let other = BlockFormat {
             leaf_scale: match format.leaf_scale {
                 LeafScale::Fixed => LeafScale::DoubleFrom(t),
-                LeafScale::DoubleFrom(_) => LeafScale::Fixed,
+                LeafScale::DoubleFrom(_) | LeafScale::DoubledOneTop => LeafScale::Fixed,
             },
             ..format
         };

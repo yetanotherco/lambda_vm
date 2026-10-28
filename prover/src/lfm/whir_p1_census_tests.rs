@@ -1501,3 +1501,81 @@ fn every_emitted_leaf_is_held_under_its_partitions_heights() {
         .expect_err("a leaf past its heights is refused");
     assert!(refused.starts_with("leaf 0 emits"), "{refused}");
 }
+
+/// ★ The one-top scale ([`LeafScale::DoubledOneTop`]): its knob reads
+/// `one-top`; its partition is the doubled one at any leaf count, where
+/// [`LeafScale::DEFAULT`] keeps the single one below its threshold; and its
+/// tree puts at most [`super::whir_block::ONE_TOP_MAX_LEAVES`] leaves under
+/// one top, past that the plan's fan-in, where the default's always builds
+/// nodes of the fan-in. On the median mix (forced leaf counts, and the rule's
+/// own partition, which doubles it to five leaves and so keeps a node level).
+#[test]
+fn the_one_top_scale_doubles_and_puts_at_most_four_leaves_under_one_top() {
+    use super::whir_block::{ONE_TOP_MAX_LEAVES, leaf_scale_setting, scaled_leaf_partition};
+    assert_eq!(
+        leaf_scale_setting(Some("one-top")),
+        Ok(LeafScale::DoubledOneTop)
+    );
+    assert_eq!(
+        LeafScale::DoubledOneTop.to_string(),
+        "doubled, one top over at most 4 leaves"
+    );
+    // One group, one single leaf: the default keeps it, the one-top scale
+    // doubles it.
+    let loads = [ChipRows {
+        hash: 1_000,
+        ..ChipRows::default()
+    }];
+    let front = ChipRows::default();
+    let bound = |scale| {
+        scaled_leaf_partition(&loads, front, scale, P1_LEAF_HEIGHTS, P1_LEAF_HEIGHTS_2X)
+            .expect("a partition")
+            .1
+    };
+    assert!(!bound(LeafScale::DEFAULT).doubled);
+    assert!(bound(LeafScale::DoubledOneTop).doubled);
+    assert_eq!(bound(LeafScale::DoubledOneTop).heights, P1_LEAF_HEIGHTS_2X);
+
+    let elf_bytes: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
+    let opts = super::proof::block_base_options();
+    let at = |scale: LeafScale| BlockFormat {
+        leaf_scale: scale,
+        ..p1_format()
+    };
+    let owned = median_statement(elf_bytes, &opts, &at(LeafScale::DEFAULT));
+    let levels = |scale: LeafScale, leaves: Option<usize>| -> Vec<Vec<usize>> {
+        WhirBlockPlan::derive_with(
+            elf_bytes,
+            &opts,
+            &at(scale),
+            owned.view(),
+            leaves,
+            super::whir_block::BLOCK_FAN_IN,
+            None,
+        )
+        .expect("the plan derives")
+        .levels()
+        .into_iter()
+        .map(|level| level.arities)
+        .collect()
+    };
+    for leaves in 1..=ONE_TOP_MAX_LEAVES {
+        assert_eq!(
+            levels(LeafScale::DoubledOneTop, Some(leaves)),
+            vec![vec![leaves]],
+            "{leaves} leaves under one top"
+        );
+    }
+    assert_eq!(
+        levels(LeafScale::DEFAULT, Some(4)),
+        vec![vec![3, 1], vec![2]]
+    );
+    assert_eq!(
+        levels(LeafScale::DoubledOneTop, Some(5)),
+        vec![vec![3, 2], vec![2]]
+    );
+    assert_eq!(
+        levels(LeafScale::DoubledOneTop, None),
+        vec![vec![3, 2], vec![2]]
+    );
+}

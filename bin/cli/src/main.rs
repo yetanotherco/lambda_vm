@@ -691,7 +691,7 @@ struct BlockChoices<'a> {
     leaf_query: &'a str,
 }
 
-/// `--leaf-double-from`'s words: `off` or a leaf count
+/// `--leaf-double-from`'s words: `off`, `one-top` or a leaf count
 /// (`whir_block::leaf_scale_setting`).
 fn leaf_double_from_word(word: &str) -> Result<String, String> {
     prover::lfm::whir_block::leaf_scale_setting(Some(word))?;
@@ -2212,6 +2212,7 @@ mod tests {
                 ("off", LeafScale::Fixed),
                 ("12", LeafScale::DoubleFrom(12)),
                 ("10", LeafScale::DoubleFrom(10)),
+                ("one-top", LeafScale::DoubledOneTop),
             ] {
                 let args = [cmd, &["--leaf-double-from", word]].concat();
                 assert_eq!(scale(&args).as_deref(), Some(word));
