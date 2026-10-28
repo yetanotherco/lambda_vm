@@ -73,10 +73,7 @@ that they are the same polynomials and the same bus interactions is mechanical:
 1. `lake env lean --run LambdaVM/Export.lean` writes `export/{lt,eq,shift}.json`:
    every `assert` as an expression tree and every `interact` with its channel,
    multiplicity and message, variables numbered in Rust column order.
-2. `diff/lean_diff.rs` is a prover test. Install it as
-   `prover/src/tests/lean_diff.rs`, add `pub mod lean_diff;` to
-   `prover/src/tests/mod.rs` and `serde_json = "1"` to the prover's
-   dev-dependencies, then run
+2. `prover/src/tests/lean_diff.rs` is the prover test that reads them:
    `cargo test -p lambda-vm-prover lean_diff -- --nocapture`.
 
 For each table the test evaluates the Lean asserts and the Rust `ConstraintSet`
@@ -86,7 +83,7 @@ that every Lean constraint vanishes on honest traces from `generate_*_trace`,
 padding rows included.
 
 The models follow the multiplicity constraints of PR #1016, merged 2026-10-23.
-Result on that branch, 2026-10-20:
+Result on `main` after that merge, 2026-10-28:
 
 - EQ: 5 constraints and 6 interactions, exact match.
 - SHIFT: 22 constraints and 17 interactions, exact match.
