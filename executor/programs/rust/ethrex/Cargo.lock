@@ -669,7 +669,7 @@ dependencies = [
 [[package]]
 name = "ethrex-common"
 version = "23.0.0"
-source = "git+https://github.com/yetanotherco/ethrex.git?rev=4de7891e9e71879d21cf3d5944a8767d4255e148#4de7891e9e71879d21cf3d5944a8767d4255e148"
+source = "git+https://github.com/yetanotherco/ethrex.git?rev=8f39b222a13c63f19b3bd83c3512ce5f7d2a2e46#8f39b222a13c63f19b3bd83c3512ce5f7d2a2e46"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -701,7 +701,7 @@ dependencies = [
 [[package]]
 name = "ethrex-crypto"
 version = "23.0.0"
-source = "git+https://github.com/yetanotherco/ethrex.git?rev=4de7891e9e71879d21cf3d5944a8767d4255e148#4de7891e9e71879d21cf3d5944a8767d4255e148"
+source = "git+https://github.com/yetanotherco/ethrex.git?rev=8f39b222a13c63f19b3bd83c3512ce5f7d2a2e46#8f39b222a13c63f19b3bd83c3512ce5f7d2a2e46"
 dependencies = [
  "ark-bn254",
  "ark-ec",
@@ -721,7 +721,7 @@ dependencies = [
 [[package]]
 name = "ethrex-guest-program"
 version = "23.0.0"
-source = "git+https://github.com/yetanotherco/ethrex.git?rev=4de7891e9e71879d21cf3d5944a8767d4255e148#4de7891e9e71879d21cf3d5944a8767d4255e148"
+source = "git+https://github.com/yetanotherco/ethrex.git?rev=8f39b222a13c63f19b3bd83c3512ce5f7d2a2e46#8f39b222a13c63f19b3bd83c3512ce5f7d2a2e46"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -740,7 +740,7 @@ dependencies = [
 [[package]]
 name = "ethrex-l2-common"
 version = "23.0.0"
-source = "git+https://github.com/yetanotherco/ethrex.git?rev=4de7891e9e71879d21cf3d5944a8767d4255e148#4de7891e9e71879d21cf3d5944a8767d4255e148"
+source = "git+https://github.com/yetanotherco/ethrex.git?rev=8f39b222a13c63f19b3bd83c3512ce5f7d2a2e46#8f39b222a13c63f19b3bd83c3512ce5f7d2a2e46"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -758,7 +758,7 @@ dependencies = [
 [[package]]
 name = "ethrex-levm"
 version = "23.0.0"
-source = "git+https://github.com/yetanotherco/ethrex.git?rev=4de7891e9e71879d21cf3d5944a8767d4255e148#4de7891e9e71879d21cf3d5944a8767d4255e148"
+source = "git+https://github.com/yetanotherco/ethrex.git?rev=8f39b222a13c63f19b3bd83c3512ce5f7d2a2e46#8f39b222a13c63f19b3bd83c3512ce5f7d2a2e46"
 dependencies = [
  "bytes",
  "derive_more",
@@ -776,7 +776,7 @@ dependencies = [
 [[package]]
 name = "ethrex-rlp"
 version = "23.0.0"
-source = "git+https://github.com/yetanotherco/ethrex.git?rev=4de7891e9e71879d21cf3d5944a8767d4255e148#4de7891e9e71879d21cf3d5944a8767d4255e148"
+source = "git+https://github.com/yetanotherco/ethrex.git?rev=8f39b222a13c63f19b3bd83c3512ce5f7d2a2e46#8f39b222a13c63f19b3bd83c3512ce5f7d2a2e46"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -786,7 +786,7 @@ dependencies = [
 [[package]]
 name = "ethrex-trie"
 version = "23.0.0"
-source = "git+https://github.com/yetanotherco/ethrex.git?rev=4de7891e9e71879d21cf3d5944a8767d4255e148#4de7891e9e71879d21cf3d5944a8767d4255e148"
+source = "git+https://github.com/yetanotherco/ethrex.git?rev=8f39b222a13c63f19b3bd83c3512ce5f7d2a2e46#8f39b222a13c63f19b3bd83c3512ce5f7d2a2e46"
 dependencies = [
  "anyhow",
  "bytes",
@@ -806,7 +806,7 @@ dependencies = [
 [[package]]
 name = "ethrex-vm"
 version = "23.0.0"
-source = "git+https://github.com/yetanotherco/ethrex.git?rev=4de7891e9e71879d21cf3d5944a8767d4255e148#4de7891e9e71879d21cf3d5944a8767d4255e148"
+source = "git+https://github.com/yetanotherco/ethrex.git?rev=8f39b222a13c63f19b3bd83c3512ce5f7d2a2e46#8f39b222a13c63f19b3bd83c3512ce5f7d2a2e46"
 dependencies = [
  "bytes",
  "derive_more",
