@@ -58,7 +58,7 @@ ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev 
 rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 
 # Every ethrex crate of this guest is built from yetanotherco/ethrex, branch
-# lambda-vm/guest-opt-4: the pinned rev above plus guest-speed commits, none of
+# lambda-vm/guest-opt-5: the pinned rev above plus guest-speed commits, none of
 # which changes a result or ProgramInput, so the fixture writer and the native test
 # reference stay on the pin (each commit carries the tests that compare it with the
 # code it replaces). In order:
@@ -77,9 +77,13 @@ rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 # - a branch's hash children decoded straight into the node; committed EVM
 #   checkpoints merged into the larger set; the RLP encoder's payload buffer
 #   started at 256 bytes; embedded witness nodes decoded without the shared-pointer
-#   pool.
+#   pool;
+# - precompile checks rejected by the address prefix; calldata zero bytes counted
+#   a word at a time; the witness state's lookup maps hashed instead of ordered;
+#   warm addresses and storage slots kept in one journaled set for the whole
+#   transaction.
 # On mainnet block 25475471 the guest executes 203.12 M instructions without the
-# patch's later commits and 150.93 M with all of them and this repo's guest-side
+# patch's later commits and 144.18 M with all of them and this repo's guest-side
 # changes. Ethrex main has carried an equivalent bitmap since 3ca8bc23 (#7095)
 # and #7119 since 007882a8; it has none of the rest.
 #
@@ -88,11 +92,11 @@ rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 # that the fork's base below is the pinned rev and refuses to move the pin past it.
 # ethrex-fork-base: 797df5540c7d35cafd69b6971a74b2a49c67d1dd
 [patch."https://github.com/lambdaclass/ethrex.git"]
-ethrex-common = { git = "https://github.com/yetanotherco/ethrex.git", rev = "5af732bc78332709ec9803fda9189741b1303625" }
-ethrex-crypto = { git = "https://github.com/yetanotherco/ethrex.git", rev = "5af732bc78332709ec9803fda9189741b1303625" }
-ethrex-guest-program = { git = "https://github.com/yetanotherco/ethrex.git", rev = "5af732bc78332709ec9803fda9189741b1303625" }
-ethrex-l2-common = { git = "https://github.com/yetanotherco/ethrex.git", rev = "5af732bc78332709ec9803fda9189741b1303625" }
-ethrex-levm = { git = "https://github.com/yetanotherco/ethrex.git", rev = "5af732bc78332709ec9803fda9189741b1303625" }
-ethrex-rlp = { git = "https://github.com/yetanotherco/ethrex.git", rev = "5af732bc78332709ec9803fda9189741b1303625" }
-ethrex-trie = { git = "https://github.com/yetanotherco/ethrex.git", rev = "5af732bc78332709ec9803fda9189741b1303625" }
-ethrex-vm = { git = "https://github.com/yetanotherco/ethrex.git", rev = "5af732bc78332709ec9803fda9189741b1303625" }
+ethrex-common = { git = "https://github.com/yetanotherco/ethrex.git", rev = "f01c0ddf4eefe9beda4503e50911ced3d843b056" }
+ethrex-crypto = { git = "https://github.com/yetanotherco/ethrex.git", rev = "f01c0ddf4eefe9beda4503e50911ced3d843b056" }
+ethrex-guest-program = { git = "https://github.com/yetanotherco/ethrex.git", rev = "f01c0ddf4eefe9beda4503e50911ced3d843b056" }
+ethrex-l2-common = { git = "https://github.com/yetanotherco/ethrex.git", rev = "f01c0ddf4eefe9beda4503e50911ced3d843b056" }
+ethrex-levm = { git = "https://github.com/yetanotherco/ethrex.git", rev = "f01c0ddf4eefe9beda4503e50911ced3d843b056" }
+ethrex-rlp = { git = "https://github.com/yetanotherco/ethrex.git", rev = "f01c0ddf4eefe9beda4503e50911ced3d843b056" }
+ethrex-trie = { git = "https://github.com/yetanotherco/ethrex.git", rev = "f01c0ddf4eefe9beda4503e50911ced3d843b056" }
+ethrex-vm = { git = "https://github.com/yetanotherco/ethrex.git", rev = "f01c0ddf4eefe9beda4503e50911ced3d843b056" }
