@@ -78,6 +78,20 @@ pub struct DeepShape {
     pub num_composition_parts: usize,
     /// `log2` of the trace length, for `g^r` and `z^P`.
     pub log2_trace_length: u32,
+    /// The columns that answered at the commitment-time point `z0`
+    /// (`stark::commit_ood`), when the sub-proof is bound: each column's
+    /// quotient at `z` becomes its two-point quotient, by the term
+    /// `−c_c·(t_c(υ) − v_i)/(υ − z0)` under its current-row coefficient `c_c`.
+    pub commit_ood: Option<CommitOodCols>,
+}
+
+/// The answered columns of a bound sub-proof, in `[precomputed | main | aux]`
+/// order: `count` columns from `first` (the main columns past the precomputed
+/// ones, `stark::commit_ood::answered_columns`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitOodCols {
+    pub first: usize,
+    pub count: usize,
 }
 
 impl DeepShape {
@@ -139,6 +153,25 @@ pub struct DeepInvariants {
     pub gamma_pow_block: Vec<Ext>,
     /// `γ^{stride}` for each OOD row's block — the base its Horner runs in.
     pub gamma_stride: Vec<Ext>,
+    /// The answers' query-invariant terms, on a bound sub-proof.
+    pub commit_ood: Option<CommitOodInvariants>,
+}
+
+/// What every query point of a bound sub-proof reuses for its answers' terms:
+/// `−(γ^s)^{first}·(H(υ) − Σ_i (γ^s)^i·v_i)/(υ − z0)`, `H(υ)` the answered
+/// columns' run of row 0's own Horner fold — the same coefficients row 0 gives
+/// those columns at `z`, negated.
+pub struct CommitOodInvariants {
+    /// `z0`.
+    pub point: Ext,
+    /// `Σ_i (γ^s)^i·v_i`.
+    pub answers_sum: Ext,
+    /// `−(γ^s)^{first}`: minus the answered run's scale inside row 0.
+    pub scale: Ext,
+    /// `(γ^s)^{first}`: where the answered run starts inside row 0.
+    pub gamma_pow_first: Ext,
+    /// `(γ^s)^{count}`: where the run after it starts, relative to it.
+    pub gamma_pow_count: Ext,
 }
 
 /// `Σ_k terms[k]·γ^k`, terms low-to-high — one `MulAdd` per term after the
@@ -188,6 +221,21 @@ pub fn emit_deep_invariants(
     zeta: Ext,
     ood_steps: &[Vec<Ext>],
     claimed_parts: &[Ext],
+) -> DeepInvariants {
+    emit_deep_invariants_bound(b, shape, gamma, zeta, ood_steps, claimed_parts, None)
+}
+
+/// [`emit_deep_invariants`] for a sub-proof whose shape carries
+/// commitment-time answers: `commit_ood` is `(z0, answers)`, the cells Phase A
+/// absorbed. Its presence must match the shape's.
+pub fn emit_deep_invariants_bound(
+    b: &mut LfmBuilder,
+    shape: &DeepShape,
+    gamma: Ext,
+    zeta: Ext,
+    ood_steps: &[Vec<Ext>],
+    claimed_parts: &[Ext],
+    commit_ood: Option<(Ext, &[Ext])>,
 ) -> DeepInvariants {
     assert_eq!(
         ood_steps.len(),
@@ -249,6 +297,39 @@ pub fn emit_deep_invariants(
     let h_sum_zpow = b.emul(folded_parts, gamma_pow_surviving);
     let z_pow = pow_const(b, zeta, shape.num_composition_parts);
 
+    assert_eq!(
+        commit_ood.is_some(),
+        shape.commit_ood.is_some(),
+        "a sub-proof's answers are present exactly when its shape answers"
+    );
+    let commit_ood = shape
+        .commit_ood
+        .zip(commit_ood)
+        .map(|(cols, (point, answers))| {
+            assert_eq!(answers.len(), cols.count, "one answer per answered column");
+            assert!(
+                cols.count > 0 && cols.first + cols.count <= shape.num_total_cols,
+                "the answered columns lie inside the row"
+            );
+            let stride = gamma_stride[0];
+            let answers_sum = horner(b, stride, answers);
+            let one = b.ext_const(&FEE::one());
+            let gamma_pow_first = match cols.first {
+                0 => one,
+                first => pow_const(b, stride, first),
+            };
+            let zero = b.ext_const(&FEE::zero());
+            let scale = b.esub(zero, gamma_pow_first);
+            let gamma_pow_count = pow_const(b, stride, cols.count);
+            CommitOodInvariants {
+                point,
+                answers_sum,
+                scale,
+                gamma_pow_first,
+                gamma_pow_count,
+            }
+        });
+
     DeepInvariants {
         ood_row_sum,
         h_sum_zpow,
@@ -257,6 +338,7 @@ pub fn emit_deep_invariants(
         gamma_pow_surviving,
         gamma_pow_block,
         gamma_stride,
+        commit_ood,
     }
 }
 
@@ -299,10 +381,35 @@ pub fn emit_deep_point(
     let point = opening.point.as_ext();
 
     let mut trace_term: Option<Ext> = None;
+    // The answered columns' run of row 0's fold, kept for their quotients.
+    let mut answered_run: Option<Ext> = None;
     for row in 0..shape.num_eval_points {
         let (cols, start, _) = shape.block(row);
         let terms: Vec<Ext> = cols.iter().map(|&c| opening.trace[c]).collect();
-        let folded = horner(b, inv.gamma_stride[row], &terms);
+        let folded = match (row, shape.commit_ood, &inv.commit_ood) {
+            // Row 0 of a bound sub-proof folds as three runs — before, the
+            // answered columns, after — `before + γ^{first}·(run +
+            // γ^{count}·after)`: the same MulAdds as one Horner, and the
+            // middle run is the answers' quotients' fold.
+            (0, Some(c), Some(ci)) => {
+                let base = inv.gamma_stride[0];
+                let run = horner(b, base, &terms[c.first..c.first + c.count]);
+                answered_run = Some(run);
+                let after = &terms[c.first + c.count..];
+                let mut acc = if after.is_empty() {
+                    run
+                } else {
+                    let tail = horner(b, base, after);
+                    b.emul_add(tail, ci.gamma_pow_count, run)
+                };
+                if c.first > 0 {
+                    let head = horner(b, base, &terms[..c.first]);
+                    acc = b.emul_add(acc, ci.gamma_pow_first, head);
+                }
+                acc
+            }
+            _ => horner(b, inv.gamma_stride[row], &terms),
+        };
         let scaled = if start == 0 {
             folded
         } else {
@@ -325,8 +432,36 @@ pub fn emit_deep_point(
     let h_denominator = b.esub(point, inv.z_pow);
     let h_den_inv = b.ediv(one, h_denominator);
 
-    let trace_term = trace_term.expect("at least one evaluation point");
+    let mut trace_term = trace_term.expect("at least one evaluation point");
+    if let Some(ci) = inv.commit_ood.as_ref().filter(|_| answers_term_on()) {
+        let run = answered_run.expect("row 0 folded the answered run");
+        let numerator = b.esub(run, ci.answers_sum);
+        let scaled = b.emul(numerator, ci.scale);
+        // υ − z0, inverted against one like every other denominator here.
+        let denominator = b.esub(point, ci.point);
+        let den_inv = b.ediv(one, denominator);
+        trace_term = b.emul_add(scaled, den_inv, trace_term);
+    }
     b.emul_add(h_numerator, h_den_inv, trace_term)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A mutation for the leg's negative tests: emit DEEP without the answers'
+    /// quotients, on this thread.
+    pub(crate) static WITHOUT_ANSWERS_TERM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether DEEP folds the answers' quotients: always, outside a test mutation.
+fn answers_term_on() -> bool {
+    #[cfg(test)]
+    {
+        !WITHOUT_ANSWERS_TERM.with(|c| c.get())
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
 }
 
 /// The two points of one query — the domain point and its symmetric partner —

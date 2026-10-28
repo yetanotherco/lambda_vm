@@ -707,6 +707,7 @@ fn deep_point_program(shape: &DeepShape, times: usize) -> LfmProgram {
         gamma_pow_surviving: next(&mut b),
         gamma_pow_block: (0..e).map(|_| next(&mut b)).collect(),
         gamma_stride: (0..e).map(|_| next(&mut b)).collect(),
+        commit_ood: None,
     };
     for _ in 0..times {
         let point = Felt(next(&mut b).as_cell().0);
@@ -744,6 +745,7 @@ fn the_deep_point_rows_are_the_auto_rules_deep_term() {
             next_row_cols: next_cols.clone(),
             num_composition_parts: parts,
             log2_trace_length: 8,
+            commit_ood: None,
         };
         let got = rows_of_one(&|times| deep_point_program(&shape, times));
         let want = deep_point_xalu_rows(

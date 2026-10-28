@@ -2387,8 +2387,9 @@ pub fn prove_whir_block_tree(
 const PROOF_MAGIC: [u8; 8] = *b"LVMBLKTR";
 
 /// The proof file's layout version. 2: the archived `TableCounts` gained
-/// `is_wh`, so a version-1 file is a different layout.
-const PROOF_VERSION: u32 = 2;
+/// `is_wh`, so a version-1 file is a different layout. 3: the top proof
+/// carries its commitment-time answers.
+const PROOF_VERSION: u32 = 3;
 
 /// Which tree a proof file holds: the STARK block tree (0) or this one. A
 /// verifier refuses the other's file by its tag, before reading it as its own.
@@ -2411,11 +2412,7 @@ pub struct WhirBlockTreeProof {
     pub public_output: Vec<u8>,
     pub num_private_input_pages: usize,
     pub groups: Vec<Vec<u32>>,
-    pub top_proof: stark::proof::stark::MultiProof<
-        crate::tables::types::GoldilocksField,
-        crate::tables::types::GoldilocksExtension,
-        (),
-    >,
+    pub top_proof: super::proof::LfmStarkProof,
     pub top_public_words: Vec<(u32, LfmWord)>,
 }
 
@@ -2708,7 +2705,10 @@ mod tests {
             .map(|i| (i, [crate::tables::types::FE::from(u64::from(i) + 7); 4]))
             .collect();
         let top = LfmProof {
-            proof: stark::proof::stark::MultiProof { proofs: vec![] },
+            proof: super::super::proof::LfmStarkProof {
+                multi: stark::proof::stark::MultiProof { proofs: vec![] },
+                commit_ood: vec![],
+            },
             public_words: words,
         };
         WhirBlockTreeProof::new(statement, top)

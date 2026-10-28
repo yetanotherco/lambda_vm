@@ -38,7 +38,7 @@ use super::word::{LfmWord, base_word};
 /// took the format's policy instead would lay the trees out uncapped and
 /// refuse the child (at six queries `auto` could coincide with it and hide
 /// that).
-fn options() -> ProofOptions {
+pub(super) fn options() -> ProofOptions {
     options_at(4)
 }
 
@@ -53,7 +53,7 @@ fn options_at(grinding: u8) -> ProofOptions {
     o
 }
 
-fn arenas() -> Vec<Vec<LfmWord>> {
+pub(super) fn arenas() -> Vec<Vec<LfmWord>> {
     arenas_salted(0)
 }
 
@@ -67,14 +67,18 @@ fn arenas_salted(salt: u64) -> Vec<Vec<LfmWord>> {
     ]
 }
 
-struct P1Child {
-    artifacts: LfmArtifacts,
-    proof: LfmProof,
-    opts: ProofOptions,
+pub(super) struct P1Child {
+    pub(super) artifacts: LfmArtifacts,
+    pub(super) proof: LfmProof,
+    pub(super) opts: ProofOptions,
 }
 
-fn p1_child() -> P1Child {
-    let opts = options();
+pub(super) fn p1_child() -> P1Child {
+    p1_child_with(options())
+}
+
+/// [`p1_child`] proved and checked at `opts`.
+pub(super) fn p1_child_with(opts: ProofOptions) -> P1Child {
     let program = trivial_program();
     let hasher = super::registry::build_artifacts(&program, &opts).hasher;
     let artifacts =
@@ -93,14 +97,14 @@ fn p1_child() -> P1Child {
     }
 }
 
-fn harvest(c: &P1Child) -> HarvestedChild {
+pub(super) fn harvest(c: &P1Child) -> HarvestedChild {
     harvest_child_under::<P1Family>(c.artifacts.clone(), c.opts.clone(), &c.proof)
         .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// One leg over the child, under `wrap`, with the child's statement tag
 /// `tag` (the family's, unless a mutation swaps it).
-fn node(c: &P1Child, tag: &'static [u8]) -> LfmProgram {
+pub(super) fn node(c: &P1Child, tag: &'static [u8]) -> LfmProgram {
     node_at(&c.artifacts, &c.opts, c.proof.public_words.len(), tag)
 }
 
@@ -122,7 +126,7 @@ fn node_at(
     compile(b.finish())
 }
 
-fn runs(program: &LfmProgram, child: &HarvestedChild) -> bool {
+pub(super) fn runs(program: &LfmProgram, child: &HarvestedChild) -> bool {
     let arenas = try_child_arena_words(child).unwrap_or_else(|e| panic!("{e}"));
     execute(program, &arenas, &HasherKind::Poseidon1W16).is_ok()
 }
@@ -130,7 +134,7 @@ fn runs(program: &LfmProgram, child: &HarvestedChild) -> bool {
 /// Whether the node refuses the child at one of its checks: the execution
 /// fails, and not at the arenas' layout or the socket (a refusal of those
 /// kinds would say nothing about the check a test isolates).
-fn refused_by_a_check(program: &LfmProgram, child: &HarvestedChild) -> bool {
+pub(super) fn refused_by_a_check(program: &LfmProgram, child: &HarvestedChild) -> bool {
     let arenas = try_child_arena_words(child).unwrap_or_else(|e| panic!("{e}"));
     match execute(program, &arenas, &HasherKind::Poseidon1W16) {
         Ok(_) => false,

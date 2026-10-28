@@ -2161,6 +2161,7 @@ fn epoch_program_with(
                     precomputed_root: prep_cells[i].as_ref(),
                     main_root: &main_cells[i],
                     rap_challenges: &[z, alpha],
+                    commit_ood: None,
                 },
                 leg_arenas,
             );

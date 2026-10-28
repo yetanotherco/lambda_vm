@@ -335,11 +335,7 @@ fn keccak_arenas(seed: u64) -> Vec<Vec<LfmWord>> {
     vec![keccak_adapter::state_to_words(&keccak_state(seed)).to_vec()]
 }
 
-type KeccakChainProof = stark::proof::stark::MultiProof<
-    crate::tables::types::GoldilocksField,
-    crate::tables::types::GoldilocksExtension,
-    (),
->;
+type KeccakChainProof = super::proof::LfmStarkProof;
 
 /// Execute + build traces, let the caller corrupt them, then prove.
 fn prove_keccak_chain_with_tamper(

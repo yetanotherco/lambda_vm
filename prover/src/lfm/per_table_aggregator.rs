@@ -49,7 +49,9 @@ use super::epoch::{RootCells, TableAbsorbs, TableChallengeShape, fork_table};
 use super::epoch_verify::{TableQueryArenas, TableVerifyShape};
 use super::instr::ArenaId;
 use super::statement::{LFM_MACHINE_VERSION, LFM_STATEMENT_TAG};
-use super::statement_replay::{PhaseAPreprocessed, PhaseATable, replay_phase_a};
+use super::statement_replay::{
+    CommitOodDomain, PhaseAPreprocessed, PhaseATable, replay_phase_a_answered,
+};
 use super::transcript_replay::{Candidate, TranscriptReplay, assert_canonical, candidate_to_felt};
 
 /// `u32` halves one lane's canonical `u64` occupies — the unit
@@ -105,6 +107,14 @@ pub struct ChildShape<'a> {
     pub statement_tag: &'static [u8],
     /// The child's sub-proofs, in proof order.
     pub tables: Vec<ChildTable<'a>>,
+}
+
+impl ChildShape<'_> {
+    /// The commitment-time answers the child's Phase A absorbs: one per
+    /// answered column of every sub-proof.
+    pub fn num_answers(&self) -> usize {
+        self.tables.iter().map(|t| t.verify.num_answers()).sum()
+    }
 }
 
 /// One sub-proof's shapes in a [`DerivedChild`].
@@ -169,7 +179,10 @@ impl DerivedChild {
             .enumerate()
             .map(|(idx, (air, h))| {
                 let rows = 1usize << h;
+                // An LFM proof is bound: every sub-proof's DEEP carries its
+                // commitment-time answers.
                 let (verify, analysis) = TableVerifyShape::derive_with(*air, rows, trees)?;
+                let verify = verify.with_commit_ood(*air);
                 let precomputed_root = if air.is_preprocessed() {
                     Some(
                         super::epoch_verify::layout_precomputed_commitment(*air, rows)
@@ -396,6 +409,8 @@ pub fn emit_public_balance(
 pub struct LegArenas {
     publics: ArenaId,
     main_roots: ArenaId,
+    /// Every sub-proof's commitment-time answers, proof order, one cell each.
+    answers: ArenaId,
     per_table: Vec<TableArenas>,
 }
 
@@ -418,6 +433,7 @@ pub fn declare_leg_arenas(b: &mut LfmBuilder, child: &ChildShape<'_>) -> LegAren
     let publics =
         b.declare_arena((LANES_PER_WORD * HALVES_PER_LANE * child.num_public_words) as u32);
     let main_roots = b.declare_arena(per_root * child.tables.len() as u32);
+    let answers = b.declare_arena(child.num_answers() as u32);
     let per_table = child
         .tables
         .iter()
@@ -440,6 +456,7 @@ pub fn declare_leg_arenas(b: &mut LfmBuilder, child: &ChildShape<'_>) -> LegAren
     LegArenas {
         publics,
         main_roots,
+        answers,
         per_table,
     }
 }
@@ -464,6 +481,16 @@ pub struct LegCells {
 /// not one either child ever made. (`per_table_census_tests::tenant_node_program`
 /// is shaped that way ON PURPOSE, as a census instrument; it is not a template.)
 pub fn emit_leg(b: &mut LfmBuilder, child: &ChildShape<'_>, a: &LegArenas) -> LegCells {
+    emit_leg_answered(b, child, a).0
+}
+
+/// [`emit_leg`], also returning the child's commitment-time point `z0`
+/// (`stark::commit_ood`) for the differential gates.
+pub(crate) fn emit_leg_answered(
+    b: &mut LfmBuilder,
+    child: &ChildShape<'_>,
+    a: &LegArenas,
+) -> (LegCells, Ext) {
     let n = child.tables.len();
     let per_root = RootCells::words_per_root(b);
 
@@ -503,7 +530,20 @@ pub fn emit_leg(b: &mut LfmBuilder, child: &ChildShape<'_>, a: &LegArenas) -> Le
             main_root: &main_halves[i][..],
         })
         .collect();
-    let (z, alpha) = replay_phase_a(&mut t, b, &phase_a);
+    // The commitment-time answers: hinted once, absorbed by Phase A after
+    // `z0`, and the same cells handed to every table's DEEP below.
+    let answers: Vec<Ext> = (0..child.num_answers() as u32)
+        .map(|k| b.hint_word(a.answers, k).as_ext())
+        .collect();
+    let domain = CommitOodDomain::over(child.tables.iter().map(|t| {
+        (
+            t.challenge.log2_trace_length,
+            t.challenge.log2_blowup,
+            t.challenge.coset_offset,
+        )
+    }));
+    let (z, alpha, z0) = replay_phase_a_answered(&mut t, b, &phase_a, &answers, domain);
+    let mut answer_at = 0usize;
 
     // ---- one fork per sub-proof, with the full verification legs ----
     let mut contributions: Vec<Ext> = Vec::new();
@@ -559,10 +599,18 @@ pub fn emit_leg(b: &mut LfmBuilder, child: &ChildShape<'_>, a: &LegArenas) -> Le
                 precomputed_root: prep_cells[i].as_ref(),
                 main_root: &main_cells[i],
                 rap_challenges: &[z, alpha],
+                commit_ood: (table.verify.num_answers() > 0).then(|| {
+                    (
+                        z0,
+                        &answers[answer_at..answer_at + table.verify.num_answers()],
+                    )
+                }),
             },
             &arenas.legs,
         );
+        answer_at += table.verify.num_answers();
     }
+    assert_eq!(answer_at, answers.len(), "every answer goes to its table");
 
     // ---- the closure, against the PUBLIC balance ----
     //
@@ -576,10 +624,13 @@ pub fn emit_leg(b: &mut LfmBuilder, child: &ChildShape<'_>, a: &LegArenas) -> Le
     };
     super::logup::emit_bus_closure(b, &shape, &contributions, target);
 
-    LegCells {
-        publics,
-        z_alpha: (z, alpha),
-    }
+    (
+        LegCells {
+            publics,
+            z_alpha: (z, alpha),
+        },
+        z0,
+    )
 }
 
 // ============================ the binding legs ============================

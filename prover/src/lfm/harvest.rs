@@ -632,6 +632,9 @@ pub(crate) struct HarvestedChild {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) opts: crate::ProofOptions,
     pub(crate) public_words: Vec<(u32, LfmWord)>,
+    /// Every sub-proof's commitment-time answers, in proof order: Phase A
+    /// absorbs them between the roots and the shared LogUp pair.
+    pub(crate) commit_ood: Vec<Vec<FEE>>,
     pub(crate) tables: Vec<HostTable>,
     pub(crate) legs: Vec<TableLegs>,
     /// The child's OWN shared LogUp pair, recovered host-side by
@@ -691,6 +694,7 @@ pub(crate) fn harvest_child_under<Fam: crate::hash_pin::ProofFamily>(
 ) -> Result<HarvestedChild, String> {
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     use stark::proof::view::MultiProofView;
+    use stark::verifier::IsStarkVerifier;
 
     // The AIR set the artifacts describe — `KECCAK_RND`/`LFM_BLAKE3` chunks, the
     // `LFM_HASH` chunks and (S2) the one-row preprocessed roots, exactly
@@ -715,17 +719,18 @@ pub(crate) fn harvest_child_under<Fam: crate::hash_pin::ProofFamily>(
         t
     };
 
+    // Phase A — every root, `z0`, every answer, then the shared LogUp pair —
+    // is the verifier's own replay, so the fork every sub-proof starts from is
+    // the one the verifier forks.
     let mut transcript = seed();
-    for (idx, air) in refs.iter().enumerate() {
-        let v = view.get(idx);
-        if air.is_preprocessed() {
-            transcript.append_bytes(&layout_precomputed_commitment(*air, v.trace_length())?);
-        }
-        transcript.append_bytes(v.lde_trace_main_merkle_root());
-    }
-    let lookup: Vec<FEE> = (0..stark::lookup::LOGUP_NUM_CHALLENGES)
-        .map(|_| transcript.sample_field_element())
-        .collect();
+    let lookup: Vec<FEE> =
+        stark::verifier::GenericVerifier::<Gl, Ext3, (), Fam::Stark>::replay_phase_a_bound(
+            &refs,
+            view,
+            &proved.proof.commit_ood,
+            &mut transcript,
+        )
+        .ok_or("the child's Phase A does not replay (a preprocessed root or an answer count)")?;
 
     let num_tables = refs.len();
     let tables = refs
@@ -753,6 +758,7 @@ pub(crate) fn harvest_child_under<Fam: crate::hash_pin::ProofFamily>(
         .enumerate()
         .zip(&tables)
         .map(|((idx, air), table)| {
+            // An LFM proof is bound: each table's DEEP carries its answers.
             build_table_legs_with(
                 *air,
                 view.get(idx),
@@ -761,6 +767,10 @@ pub(crate) fn harvest_child_under<Fam: crate::hash_pin::ProofFamily>(
                 Some(&table.iotas),
                 Fam::WRAP,
             )
+            .map(|mut legs| {
+                legs.verify = legs.verify.with_commit_ood(*air);
+                legs
+            })
         })
         .collect::<Result<Vec<_>, String>>()?;
 
@@ -769,6 +779,7 @@ pub(crate) fn harvest_child_under<Fam: crate::hash_pin::ProofFamily>(
         artifacts,
         opts,
         public_words: proved.public_words.clone(),
+        commit_ood: proved.proof.commit_ood.clone(),
         tables,
         legs,
         z_alpha: (lookup[0], lookup[1]),
@@ -792,6 +803,8 @@ pub(crate) fn try_child_arena_words(c: &HarvestedChild) -> Result<Vec<Vec<LfmWor
         &c.tables.iter().map(|h| h.main_root).collect::<Vec<_>>(),
         c.wrap,
     ));
+    // Every sub-proof's commitment-time answers, one arena, proof order.
+    arenas.push(c.commit_ood.iter().flatten().map(ext_word).collect());
     for (h, leg) in c.tables.iter().zip(&c.legs) {
         if let Some(root) = &h.aux_root {
             arenas.push(super::proof_arena::commitments_to_arena_for(

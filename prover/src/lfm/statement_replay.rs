@@ -45,6 +45,8 @@
 
 use crate::statement::CONTINUATION_EPOCH_TAG;
 
+use crate::tables::types::FE;
+
 use super::builder::{Ext, Felt, LfmBuilder};
 use super::keccak_host::BYTES_PER_HALF;
 use super::transcript_replay::TranscriptReplay;
@@ -248,4 +250,81 @@ pub fn replay_phase_a(
     let z = t.sample_ext(b);
     let alpha = t.sample_ext(b);
     (z, alpha)
+}
+
+/// The domain the commitment-time point `z0` must avoid, as the leg's shape:
+/// the largest trace domain (`log2`) and the largest LDE coset over a bound
+/// proof's sub-proofs, and their one coset offset
+/// (`stark::commit_ood::point_domain`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitOodDomain {
+    pub log2_trace_length: u32,
+    pub log2_lde_length: u32,
+    pub coset_offset: FE,
+}
+
+impl CommitOodDomain {
+    /// From each sub-proof's `(log2 trace length, log2 blowup, coset offset)`.
+    /// Panics on sub-proofs with different offsets, which the host verifier
+    /// refuses (emit-time shape, never proof data).
+    pub fn over(tables: impl IntoIterator<Item = (u32, u32, FE)>) -> Self {
+        let mut out: Option<Self> = None;
+        for (log2_trace_length, log2_blowup, coset_offset) in tables {
+            let log2_lde_length = log2_trace_length + log2_blowup;
+            out = Some(match out {
+                None => Self {
+                    log2_trace_length,
+                    log2_lde_length,
+                    coset_offset,
+                },
+                Some(d) => {
+                    assert_eq!(
+                        d.coset_offset, coset_offset,
+                        "a bound proof's sub-proofs share one coset offset"
+                    );
+                    Self {
+                        log2_trace_length: d.log2_trace_length.max(log2_trace_length),
+                        log2_lde_length: d.log2_lde_length.max(log2_lde_length),
+                        coset_offset,
+                    }
+                }
+            });
+        }
+        out.expect("a bound proof has a sub-proof")
+    }
+}
+
+/// [`replay_phase_a`] for a bound proof (`stark::commit_ood`): the roots, then
+/// `z0` (asserted outside `domain`), then every answer, then `z` and `α`.
+/// Returns `(z, α, z0)`. `answers` are the cells the per-table legs then
+/// fold, so the walk cannot read a value Phase A did not absorb.
+pub fn replay_phase_a_answered(
+    t: &mut TranscriptReplay,
+    b: &mut LfmBuilder,
+    tables: &[PhaseATable],
+    answers: &[Ext],
+    domain: CommitOodDomain,
+) -> (Ext, Ext, Ext) {
+    for table in tables {
+        match &table.preprocessed_root {
+            Some(PhaseAPreprocessed::Constant(bytes)) => t.append_const_bytes(&bytes[..]),
+            Some(PhaseAPreprocessed::Cells(prep)) => absorb_root_felts(b, t, prep),
+            None => {}
+        }
+        absorb_root_felts(b, t, table.main_root);
+    }
+    let z0 = t.sample_ext(b);
+    super::epoch::assert_z_outside_domains_raw(
+        b,
+        z0,
+        domain.log2_trace_length,
+        domain.log2_lde_length - domain.log2_trace_length,
+        domain.coset_offset,
+    );
+    for answer in answers {
+        super::epoch::append_ext_cell(b, t, *answer);
+    }
+    let z = t.sample_ext(b);
+    let alpha = t.sample_ext(b);
+    (z, alpha, z0)
 }

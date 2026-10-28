@@ -36,9 +36,39 @@ type F = GoldilocksField;
 type E = GoldilocksExtension;
 
 pub struct LfmProof {
-    pub proof: MultiProof<F, E, ()>,
+    pub proof: LfmStarkProof,
     /// The public output the execution produced, in emission order.
     pub public_words: Vec<(u32, LfmWord)>,
+}
+
+/// An LFM proof's STARK part: the multi-table proof and every table's
+/// commitment-time answers (`stark::commit_ood`), which ride beside it rather
+/// than inside it so every other STARK proof keeps its encoding.
+///
+/// Every LFM proof carries them and every LFM verifier requires them: there is
+/// no LFM format without answers.
+///
+/// Derefs to the multi-table proof, so the readers of its sub-proofs read it
+/// as before.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct LfmStarkProof {
+    pub multi: MultiProof<F, E, ()>,
+    /// Per sub-proof, in proof order: its non-precomputed main columns at the
+    /// shared point `z0`.
+    pub commit_ood: Vec<Vec<FieldElement<E>>>,
+}
+
+impl std::ops::Deref for LfmStarkProof {
+    type Target = MultiProof<F, E, ()>;
+    fn deref(&self) -> &Self::Target {
+        &self.multi
+    }
+}
+
+impl std::ops::DerefMut for LfmStarkProof {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.multi
+    }
 }
 
 /// The three phases of a prove, in seconds: the LFM interpreter, the chip
@@ -383,7 +413,7 @@ pub(crate) fn prove_traces(
     traces: &mut LfmTraces,
     public_words: &[(u32, LfmWord)],
     options: &ProofOptions,
-) -> Result<MultiProof<F, E, ()>, ProvingError> {
+) -> Result<LfmStarkProof, ProvingError> {
     prove_traces_with_hasher(
         artifacts,
         traces,
@@ -410,7 +440,7 @@ pub(crate) fn prove_traces_with_hasher(
     options: &ProofOptions,
     hasher: HasherKind,
     residency: ResidencyMode,
-) -> Result<MultiProof<F, E, ()>, ProvingError> {
+) -> Result<LfmStarkProof, ProvingError> {
     prove_traces_under::<LegacyFamily>(artifacts, traces, public_words, options, hasher, residency)
 }
 
@@ -428,7 +458,7 @@ pub(crate) fn prove_traces_under<Fam: ProofFamily>(
     options: &ProofOptions,
     hasher: HasherKind,
     residency: ResidencyMode,
-) -> Result<MultiProof<F, E, ()>, ProvingError> {
+) -> Result<LfmStarkProof, ProvingError> {
     // ⛔ THE CARD, FOR THE SECOND OF A PROOF'S TWO DEVICE PHASES. Inert unless
     // a driver has armed it, and then exclusive: `multi_prove` builds its own
     // full-budget `VramGate`, so two of them in flight would budget the card
@@ -459,11 +489,13 @@ pub(crate) fn prove_traces_under<Fam: ProofFamily>(
         public_words,
         options.fri_final_poly_log_degree,
     );
-    stark::prover::GenericProver::<F, E, (), Fam::Stark>::multi_prove(
-        airs.air_trace_pairs(traces),
-        &mut transcript,
-        residency,
-    )
+    let (multi, commit_ood) =
+        stark::prover::GenericProver::<F, E, (), Fam::Stark>::multi_prove_bound(
+            airs.air_trace_pairs(traces),
+            &mut transcript,
+            residency,
+        )?;
+    Ok(LfmStarkProof { multi, commit_ood })
 }
 
 /// The LFM wrap's [`ResidencyMode`]: `RecomputeLde` when `LAMBDA_VM_RESIDENCY`
@@ -492,7 +524,7 @@ pub(crate) fn decide_lfm_residency() -> ResidencyMode {
 /// proof or claimed-public mismatch.
 pub fn lfm_verify(
     kind: LfmProgramKind,
-    proof: &MultiProof<F, E, ()>,
+    proof: &LfmStarkProof,
     claimed_public: &[(u32, LfmWord)],
     options: &ProofOptions,
 ) -> Result<bool, LfmRegistryError> {
@@ -516,7 +548,7 @@ pub fn lfm_verify(
 /// unchanged across such an arrival because of it.
 pub fn verify_against_artifacts(
     artifacts: &LfmArtifacts,
-    proof: &MultiProof<F, E, ()>,
+    proof: &LfmStarkProof,
     claimed_public: &[(u32, LfmWord)],
     options: &ProofOptions,
 ) -> bool {
@@ -529,7 +561,7 @@ pub fn verify_against_artifacts(
 /// check or transcript draw.
 pub fn verify_against_artifacts_under<Fam: ProofFamily>(
     artifacts: &LfmArtifacts,
-    proof: &MultiProof<F, E, ()>,
+    proof: &LfmStarkProof,
     claimed_public: &[(u32, LfmWord)],
     options: &ProofOptions,
 ) -> bool {
@@ -576,7 +608,7 @@ pub fn verify_against(
     roots: &[Commitment; NUM_LFM_CHIPS],
     program_id: &Commitment,
     keccak_rnd_chunks: usize,
-    proof: &MultiProof<F, E, ()>,
+    proof: &LfmStarkProof,
     claimed_public: &[(u32, LfmWord)],
     options: &ProofOptions,
     hasher: HasherKind,
@@ -611,7 +643,7 @@ pub fn verify_against_chunked(
     blake3_roots: &[Commitment],
     program_id: &Commitment,
     keccak_rnd_chunks: usize,
-    proof: &MultiProof<F, E, ()>,
+    proof: &LfmStarkProof,
     claimed_public: &[(u32, LfmWord)],
     options: &ProofOptions,
     hasher: HasherKind,
@@ -646,7 +678,7 @@ fn verify_against_chunked_with<Fam: ProofFamily>(
     hash_roots: &[Commitment],
     program_id: &Commitment,
     keccak_rnd_chunks: usize,
-    proof: &MultiProof<F, E, ()>,
+    proof: &LfmStarkProof,
     claimed_public: &[(u32, LfmWord)],
     options: &ProofOptions,
     hasher: HasherKind,
@@ -676,7 +708,7 @@ fn verify_against_chunked_with<Fam: ProofFamily>(
     if hash_roots.first() != Some(&roots[HASH_SLOT]) {
         return false;
     }
-    let view = MultiProofView::Owned(proof);
+    let view = MultiProofView::Owned(&proof.multi);
     if view.len() != chip_set.num_airs(keccak_rnd_chunks, blake3_roots.len()) + hash_roots.len() - 1
     {
         return false;
@@ -705,20 +737,26 @@ fn verify_against_chunked_with<Fam: ProofFamily>(
         options.fri_final_poly_log_degree,
     );
 
-    // Fork the statement-bound state and replay Phase A to recover the shared
-    // LogUp challenges; the expected balance is the LfmPublic sum recomputed
-    // from the claimed words (all other LFM buses balance to zero internally).
+    // Fork the statement-bound state and replay Phase A — the roots, `z0` and
+    // every commitment-time answer — to recover the shared LogUp challenges;
+    // the expected balance is the LfmPublic sum recomputed from the claimed
+    // words (all other LFM buses balance to zero internally).
+    type Verifier<Fam> = stark::verifier::GenericVerifier<F, E, (), <Fam as ProofFamily>::Stark>;
     let mut replay = transcript.clone();
-    let Some((z, alpha)) = crate::replay_transcript_phase_a_view(&refs, view, &mut replay) else {
+    let Some(challenges) =
+        Verifier::<Fam>::replay_phase_a_bound(&refs, view, &proof.commit_ood, &mut replay)
+    else {
         return false;
     };
-    let Some(expected) = expected_public_balance(claimed_public, &z, &alpha) else {
+    let Some(expected) = expected_public_balance(claimed_public, &challenges[0], &challenges[1])
+    else {
         return false;
     };
 
-    stark::verifier::GenericVerifier::<F, E, (), Fam::Stark>::multi_verify_views(
+    Verifier::<Fam>::multi_verify_views_bound(
         &refs,
         view,
+        &proof.commit_ood,
         &mut transcript,
         &expected,
     )
@@ -796,6 +834,7 @@ pub fn aggregation_wrap_options_under(zf: &crate::zf_format::ZfFormat) -> ProofO
     opts.fri_final_poly_log_degree = 8;
     zf.options(opts)
 }
+
 
 /// The STARK block's base-epoch options: the blowup-4 preset the production
 /// tree proves its epochs under, with the process's

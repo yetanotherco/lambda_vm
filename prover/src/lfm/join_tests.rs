@@ -634,6 +634,7 @@ fn shape_for(
             next_row_cols: layout.next_row_cols().to_vec(),
             num_composition_parts: artifact.shape.composition_degree_multiplier as usize,
             log2_trace_length,
+            commit_ood: None,
         },
         trace_groups,
         merkle_depth: (log2_trace_length + log2_blowup) as usize - 1,

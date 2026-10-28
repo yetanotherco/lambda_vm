@@ -166,6 +166,8 @@ mod c5_probe;
 #[cfg(test)]
 mod card_after_prep_tests;
 #[cfg(test)]
+mod commit_ood_leg_tests;
+#[cfg(test)]
 mod constraint_tests;
 #[cfg(test)]
 mod epoch_tests;

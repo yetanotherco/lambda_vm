@@ -1662,6 +1662,7 @@ pub(super) fn deep_shape(
         next_row_cols: layout.next_row_cols().to_vec(),
         num_composition_parts: sp.claimed_parts.len(),
         log2_trace_length: sp.quotient.log2_trace_length,
+        commit_ood: None,
     };
 
     // γ, recovered from the coefficient run and CHECKED against every entry the
@@ -1923,6 +1924,7 @@ fn the_coefficient_exponent_formula_holds_at_a_wider_step() {
         next_row_cols: next_row_cols.clone(),
         num_composition_parts: 2,
         log2_trace_length: 4,
+        commit_ood: None,
     };
     let surviving = shape.num_surviving();
     assert_eq!(
@@ -2011,6 +2013,7 @@ fn deep_leg_cost() {
             next_row_cols: layout.next_row_cols().to_vec(),
             num_composition_parts: artifact.shape.composition_degree_multiplier as usize,
             log2_trace_length: 20,
+            commit_ood: None,
         };
 
         // Measure by emitting, twice, and differencing out the plumbing.

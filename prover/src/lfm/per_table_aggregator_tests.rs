@@ -393,6 +393,7 @@ pub(super) fn global_slice_program(
                 precomputed_root: prep_cells[i].as_ref(),
                 main_root: &main_cells[i],
                 rap_challenges: &[z, alpha],
+                commit_ood: None,
             },
             &a.legs,
         );
@@ -2233,10 +2234,7 @@ fn cached_stage(
     label: &str,
     prove: impl FnOnce() -> super::proof::LfmProof,
 ) -> super::proof::LfmProof {
-    type CachedProof = (
-        stark::proof::stark::MultiProof<GoldilocksField, GoldilocksExtension, ()>,
-        Vec<(u32, LfmWord)>,
-    );
+    type CachedProof = (super::proof::LfmStarkProof, Vec<(u32, LfmWord)>);
     let Some(p) = path.filter(|_| mode != CacheMode::Off) else {
         println!("   {label}: PROVED in-process, NOT cached");
         let proved = prove();

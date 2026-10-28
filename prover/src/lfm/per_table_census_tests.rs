@@ -402,6 +402,7 @@ fn table_shape(
         next_row_cols: layout.next_row_cols().to_vec(),
         num_composition_parts: num_parts,
         log2_trace_length,
+        commit_ood: None,
     };
     // The table's leaf layout (S2), resolved as the host prover resolves it.
     let leaf_layout = stark::leaf_layout::table_leaf_layout(air, trace_length);
@@ -1489,6 +1490,7 @@ fn tenant_node_program(tables: &[TableShape], legs: usize) -> LfmProgram {
                 precomputed_root: prep_cells[i].as_ref(),
                 main_root: &main_cells[i],
                 rap_challenges: &[z, alpha],
+                commit_ood: None,
             },
             &a.legs,
         );

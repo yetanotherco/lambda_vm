@@ -44,7 +44,7 @@ use super::constraints::{
     Analysis, BoundaryTerm, OodOperands, QuotientShape, emit_alpha_powers, emit_analyzed,
     emit_quotient, emit_table_offset,
 };
-use super::deep::{DeepInvariants, emit_deep_invariants};
+use super::deep::{DeepInvariants, emit_deep_invariants_bound};
 use super::edsl::WrapHash;
 use super::epoch::{RootCells, TableAbsorbs, TableChallenges, emit_reconstruct_ood};
 use super::fri::{
@@ -244,6 +244,7 @@ impl TableVerifyShape {
             next_row_cols: layout.next_row_cols().to_vec(),
             num_composition_parts: num_parts,
             log2_trace_length,
+            commit_ood: None,
         };
 
         // The table's leaf layout (S2): the host prover's and verifier's own
@@ -306,6 +307,25 @@ impl TableVerifyShape {
             return Err("the legs' tree heights differ from the host's StarkCaps".to_string());
         }
         Ok((shape, super::constraints::analyze(&artifact)))
+    }
+}
+
+impl TableVerifyShape {
+    /// This shape for a sub-proof of a bound proof (`stark::commit_ood`): its
+    /// DEEP carries the answers of `air`'s answered columns. Every LFM proof
+    /// is bound; a VM epoch's sub-proofs are not.
+    pub fn with_commit_ood(mut self, air: &super::epoch::DynVmAir<'_>) -> Self {
+        let cols = stark::commit_ood::answered_columns(air);
+        self.sub.deep.commit_ood = (!cols.is_empty()).then_some(super::deep::CommitOodCols {
+            first: cols.start,
+            count: cols.len(),
+        });
+        self
+    }
+
+    /// The answers this sub-proof's Phase A absorbs: zero when unbound.
+    pub fn num_answers(&self) -> usize {
+        self.sub.deep.commit_ood.map_or(0, |c| c.count)
     }
 }
 
@@ -374,6 +394,10 @@ pub struct TableInputs<'a> {
     /// The shared LogUp challenges, sampled once in Phase A and passed to every
     /// table (`verifier.rs:1216-1227`). Never per-table.
     pub rap_challenges: &'a [Ext],
+    /// A bound sub-proof's commitment-time point `z0` and its answers — the
+    /// cells Phase A drew and absorbed, never a second hint. Present exactly
+    /// when the shape answers.
+    pub commit_ood: Option<(Ext, &'a [Ext])>,
 }
 
 /// What one sub-proof's verification produced, for the epoch to compose.
@@ -464,13 +488,14 @@ pub fn emit_table_verification(
     b.assert_eq_ext(q.claimed, q.composition);
 
     // ---- (3) DEEP, over the same grid and the same parts.
-    let inv = emit_deep_invariants(
+    let inv = emit_deep_invariants_bound(
         b,
         &shape.sub.deep,
         challenges.gamma,
         challenges.z,
         &grid,
         absorbs.parts,
+        inputs.commit_ood,
     );
 
     // ---- the committed matrices, in DEEP column order then the parts.

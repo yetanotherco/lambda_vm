@@ -49,6 +49,18 @@ version of these checks**: on a base predating one of them the theorem of §3 ha
 and a wrap proof certifies nothing, no matter how much of §2–§6 holds. Item 8 of §7 is the
 reviewer's version of this.
 
+One more check on the same path binds the *timing* of every main trace's codeword. A committed main
+trace is close to a list of codewords in the Johnson regime, and the LogUp pair `z, α` is drawn once
+for all of a proof's tables while each table's DEEP point comes later, on its own fork; with only
+roots absorbed before `z, α`, a prover could pick each table's codeword after seeing them, and the
+one bus equation would range over the product of the lists. Every LFM proof is therefore made by
+`multi_prove_bound` and verified by `multi_verify_views_bound` (`stark::commit_ood`): after the last
+root one point `z0` is drawn outside every table's domains, every non-precomputed main column
+answers at it, every answer is absorbed before `z, α`, and each table's DEEP polynomial carries its
+answers. The proof file carries the answers beside the multi-table proof (`proof::LfmStarkProof`),
+and the node's leg absorbs them in its Phase A and folds the same cells into each table's DEEP.
+Item 12 of §7 is the reviewer's version of this.
+
 ## 2. What is vouched, and by whom
 
 | obligation | enforced by | mechanism |
@@ -446,6 +458,11 @@ one the width defects want: put the distinction in a TYPE, and the doc cannot li
     `elf_digest` — still pinned rather than following the configuration?
 11. Does every hash-adjacent helper's doc match its body (§6.8)? A "hash-agnostic" claim on a
     function that indexes a second digest cell is a defect even when nothing reaches it.
+12. Does every LFM prove go through `multi_prove_bound`, and does every LFM verify — the host
+    verifier, its separate Phase-A replay for the public balance, the tree's harvest, and the
+    node's leg — draw `z0` after the last root and absorb every commitment-time answer before
+    `z, α` (§1.1)? Is the answer count each verifier checks the AIR's, never the proof's, and does
+    the leg's DEEP read the cells its Phase A absorbed rather than a second hint?
 
 ## 8. Proven bits at the aggregation-era presets (the η re-tune, applied)
 

@@ -34,15 +34,12 @@
 //! reject.
 
 use lambda_vm_prover::lfm::programs::trivial_program;
+use lambda_vm_prover::lfm::proof::LfmStarkProof;
 use lambda_vm_prover::lfm::registry::{LfmProgramKind, build_artifacts};
 use lambda_vm_prover::lfm::word::LfmWord;
 use lambda_vm_prover::lfm::{lfm_prove, lfm_verify};
 use lambda_vm_prover::tables::types::FE;
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
-use stark::proof::stark::MultiProof;
-
-type F = lambda_vm_prover::tables::types::GoldilocksField;
-type E = lambda_vm_prover::tables::types::GoldilocksExtension;
 
 fn options() -> ProofOptions {
     GoldilocksCubicProofOptions::with_blowup(2).expect("options")
@@ -102,7 +99,7 @@ fn lfm_trivial_v0_cross_version() {
         "verify" => {
             let bytes = std::fs::read(&proof_path).expect("read proof");
             let words = std::fs::read(&words_path).expect("read words");
-            let proof = rkyv::from_bytes::<MultiProof<F, E, ()>, rkyv::rancor::Error>(&bytes)
+            let proof = rkyv::from_bytes::<LfmStarkProof, rkyv::rancor::Error>(&bytes)
                 .expect("the archive from the other ref must still deserialize");
             let public_words = rkyv::from_bytes::<Vec<(u32, LfmWord)>, rkyv::rancor::Error>(&words)
                 .expect("words deserialize");
