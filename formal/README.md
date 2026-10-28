@@ -80,7 +80,8 @@ For each table the test evaluates the Lean asserts and the Rust `ConstraintSet`
 on 64 random rows and matches them as multisets of functions, does the same for
 the interactions (bus id, signed multiplicity, message elements), and checks
 that every Lean constraint vanishes on honest traces from `generate_*_trace`,
-padding rows included.
+padding rows included; the Lean-only constraints of the documented deltas are
+skipped there.
 
 The models follow the multiplicity constraints of PR #1016, merged 2026-10-23.
 Result on `main` after that merge, 2026-10-28:
@@ -92,6 +93,10 @@ Result on `main` after that merge, 2026-10-28:
 
 The check compares polynomials, not zero sets: it caught `μ·(μ − 1)` versus
 `μ·(1 − μ)` in EQ, which is why the Lean bit constraints use the spec's form.
+
+`export/` is a committed artifact; `.github/workflows/formal.yml` builds
+`formal/`, re-runs the export and fails if it differs, on every PR that touches
+`formal/`.
 
 ## Counted pulls (`μ ∈ [0, 255]`)
 
@@ -144,9 +149,8 @@ Until then LT keeps `μ ∈ {0, 1}` (see below).
 curl https://elan.lean-lang.org/elan-init.sh -sSf | sh
 
 cd formal
-lake update            # clones Clean, Mathlib, CompPoly at the pinned revisions
-lake exe cache get     # Mathlib prebuilt binaries (without this, ~1 h of compile)
-lake build
+lake exe cache get     # clones the pinned dependencies, fetches Mathlib's prebuilt binaries
+lake build             # also compiles the export script
 ```
 
 Clean itself is compiled from source; only the modules we import are built.

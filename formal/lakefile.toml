@@ -1,5 +1,5 @@
 name = "lambda-vm-formal"
-defaultTargets = ["LambdaVM"]
+defaultTargets = ["LambdaVM", "LambdaVMExport"]
 
 [leanOptions]
 autoImplicit = false
@@ -13,3 +13,8 @@ rev = "1a6c28426372bb99af79e533aa7b9a0788eff0d7"
 
 [[lean_lib]]
 name = "LambdaVM"
+
+# The export script, so that `lake build` also compiles its dependency `Clean.Circuit.Json`.
+[[lean_lib]]
+name = "LambdaVMExport"
+roots = ["LambdaVM.Export"]

@@ -19,10 +19,6 @@ instance : Fact (p > 2^32) := by decide
 
 example : FiniteField (F p) := inferInstance
 
-end LambdaVM
-
-namespace LambdaVM
-
 /-! ## Lifting field identities on small naturals back to `ℕ` -/
 
 lemma lt_p_of_lt_two_pow_40 {n : ℕ} (h : n < 2^40) : n < p := lt_trans h (by decide)
@@ -79,10 +75,6 @@ lemma carry_lift {a b c : F p} (ha : a.val < 2^36) (hb : b.val < 2^36) (hc : IsB
   have hc2 := IsBool.val_lt_two hc
   exact natCast_inj_of_lt (lt_p_of_lt_two_pow_40 (by omega)) (lt_p_of_lt_two_pow_40 (by omega)) hcast
 
-end LambdaVM
-
-namespace LambdaVM
-
 /-- A field element with value below 2 is `0` or `1`, together with its value. -/
 lemma eq_zero_or_one_of_val {x : F p} (h : x.val < 2) :
     (x = 0 ∧ x.val = 0) ∨ (x = 1 ∧ x.val = 1) := by
@@ -91,33 +83,11 @@ lemma eq_zero_or_one_of_val {x : F p} (h : x.val < 2) :
   · right; refine ⟨rfl, ?_⟩
     rw [← Nat.cast_one]; exact val_natCast_of_lt_two_pow_40 (by norm_num)
 
-end LambdaVM
-
-namespace LambdaVM
-
-/-- A conditional interaction with a boolean multiplicity never has an active requirement. -/
-lemma requirement_vacuous {mu : F p} (h : mu * (mu - 1) = 0) (hne1 : ¬ -mu = -1) (hne0 : ¬ mu = 0) :
-    False := by
-  rcases IsBool.iff_mul_sub_one.mpr h with h0 | h1
-  · exact hne0 h0
-  · exact hne1 (by rw [h1])
-
-end LambdaVM
-
-namespace LambdaVM
-
 lemma val_one_eq : (1 : F p).val = 1 := by
   rw [← Nat.cast_one]; exact val_natCast_of_lt_two_pow_40 (by norm_num)
 
-end LambdaVM
-
-namespace LambdaVM
-
 lemma val_ofNat (n : ℕ) [n.AtLeastTwo] (h : n < 2^40) : (OfNat.ofNat n : F p).val = n := by
   rw [← Nat.cast_ofNat]; exact val_natCast_of_lt_two_pow_40 h
-
-lemma val_neg_one : (-1 : F p).val = p - 1 := by
-  rw [ZMod.neg_val, if_neg one_ne_zero, val_one_eq]
 
 lemma three_lt_p : 3 < p := by decide
 
@@ -169,19 +139,12 @@ lemma onehot_of_isBool {l0 l1 l2 : F p} (h0 : IsBool l0) (h1 : IsBool l1) (h2 : 
     | (norm_num at h3'; done)
     | (norm_num at h3'; simp only [val_neg_two] at h3'; omega)
 
-end LambdaVM
-
-namespace LambdaVM
-
 lemma eq_natCast_of_val {x : F p} {n : ℕ} (h : x.val = n) : x = (n : F p) := by
   rw [← h, ZMod.natCast_zmod_val]
 
-end LambdaVM
-
-namespace LambdaVM
-
-/-- `requirement_vacuous` for the spec's form of the bit constraint, `μ·(1 − μ) = 0`. -/
-lemma requirement_vacuous' {mu : F p} (h : mu * (1 - mu) = 0) (hne1 : ¬ -mu = -1) (hne0 : ¬ mu = 0) :
+/-- A conditional interaction whose multiplicity is a bit (`μ·(1 − μ) = 0`) never has an
+active requirement. -/
+lemma requirement_vacuous {mu : F p} (h : mu * (1 - mu) = 0) (hne1 : ¬ -mu = -1) (hne0 : ¬ mu = 0) :
     False := by
   rcases mul_one_sub_eq_zero_iff.mp h with h0 | h1
   · exact hne0 h0

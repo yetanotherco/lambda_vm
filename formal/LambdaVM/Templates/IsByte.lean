@@ -1,6 +1,7 @@
 module
 
 public import LambdaVM.Tables.Bitwise
+public import LambdaVM.Templates.IsBit
 
 @[expose] public section
 
@@ -60,7 +61,7 @@ deriving ProvableStruct
 def circuit : FormalAssertion (F p) Inputs where
   main inputs := do
     -- IS_BIT<1, cond>: in a chip this is one of the chip's own flag constraints
-    assertZero (inputs.cond * (1 - inputs.cond))
+    isBit inputs.cond
     isByte inputs.cond inputs.x
 
   Assumptions := fun { cond, .. } => IsBool cond
@@ -68,11 +69,11 @@ def circuit : FormalAssertion (F p) Inputs where
 
   requirementsChannelsLawful input_var i₀ := by
     obtain ⟨cond, x⟩ := input_var
-    simp only [circuit_norm, isByte, areBytesTable]
+    simp only [circuit_norm, isByte, isBit, areBytesTable]
     grind
 
   soundness := by
-    circuit_proof_start [isByte, areBytesTable]
+    circuit_proof_start [isByte, isBit, areBytesTable]
     obtain ⟨h_bool, h_pull⟩ := h_holds
     rw [mul_eq_zero, sub_eq_zero] at h_bool
     rcases h_bool with rfl | h1
@@ -81,7 +82,7 @@ def circuit : FormalAssertion (F p) Inputs where
       simp_all
 
   completeness := by
-    circuit_proof_start [isByte, areBytesTable]
+    circuit_proof_start [isByte, isBit, areBytesTable]
     rcases h_assumptions with rfl | rfl <;> simp_all
 
 end IsByteCheck

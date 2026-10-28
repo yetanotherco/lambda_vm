@@ -177,7 +177,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     · intro env h
       refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
       · intro hne1 hne0
-        exact (requirement_vacuous' h.1 hne1 hne0).elim
+        exact (requirement_vacuous h.1 hne1 hne0).elim
 
   soundness := by
     circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, RowSpec, Row.lhsVal, Row.rhsVal,

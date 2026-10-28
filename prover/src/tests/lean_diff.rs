@@ -291,9 +291,14 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
         .collect();
     let rust_interacts_unmatched = ri.iter().map(|&j| interactions[j].bus_id).collect();
 
-    // Every Lean constraint vanishes on the honest trace.
+    // Every Lean constraint with a Rust counterpart vanishes on the honest trace. The
+    // Lean-only ones are the documented deltas (LT's `μ·(1 − μ)` does not hold on a
+    // deduplicated Rust row with `μ > 1`).
     for (r, row) in honest_rows.iter().enumerate() {
         for (i, e) in lean.asserts.iter().enumerate() {
+            if lean_asserts_unmatched.contains(&i) {
+                continue;
+            }
             assert_eq!(
                 eval(e, row),
                 FE::zero(),
@@ -333,7 +338,7 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
 
 fn rows_of(trace: &stark::trace::TraceTable<Gl, Gl3>, num_cols: usize) -> Vec<Vec<FE>> {
     (0..trace.num_rows())
-        .map(|r| (0..num_cols).map(|c| *trace.main_table.get(r, c)).collect())
+        .map(|r| trace.main_table.get_row(r)[..num_cols].to_vec())
         .collect()
 }
 
@@ -368,7 +373,8 @@ fn lean_diff_lt() {
             }
         }
     }
-    for _ in 0..256 {
+    // 256 + 255 operations: the trace pads to 512 rows, so a padding row is checked too.
+    for _ in 0..255 {
         ops.push(LtOperation::new_with_invert(
             rng.next_u64(),
             rng.next_u64(),
@@ -385,11 +391,11 @@ fn lean_diff_lt() {
         cols::NUM_COLUMNS,
         &rows_of(&trace, cols::NUM_COLUMNS),
     );
-    // Known deltas: the Lean model keeps `μ·(μ − 1) = 0` (spec: `μ : Bit`), the Rust chip bounds
-    // `μ` with the `ARE_BYTES[μ, 0]` send instead (PR #1016).
+    // Known deltas: the Lean model keeps `μ·(1 − μ) = 0` (assert 0), the Rust chip bounds
+    // `μ` with the `ARE_BYTES[μ, 0]` send instead.
     assert_eq!(
-        report.lean_asserts_unmatched.len(),
-        1,
+        report.lean_asserts_unmatched,
+        vec![0],
         "[LT] only the μ bit constraint should be Lean-only"
     );
     assert!(
