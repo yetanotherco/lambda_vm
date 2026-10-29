@@ -314,7 +314,10 @@ fn the_point_check_finds_every_deep_point() {
     assert!(meets(&z), "z");
     assert!(meets(&(&g * &z)), "g·z");
     assert!(meets(&z.pow(3usize)), "z^P");
-    assert!(!meets(&(&g * &(&g * &z))), "g²·z is no DEEP point at two rows");
+    assert!(
+        !meets(&(&g * &(&g * &z))),
+        "g²·z is no DEEP point at two rows"
+    );
     assert!(!meets(&z.pow(2usize)), "z² is no DEEP point at three parts");
     assert!(!meets(&(&z + EE::one())), "an unrelated point");
 }

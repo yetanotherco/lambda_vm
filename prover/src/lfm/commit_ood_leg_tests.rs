@@ -322,7 +322,7 @@ fn the_leg_refuses_a_z0_at_a_deep_point() {
         // γ, ζ, the 2×3 OOD grid, the two parts, z0, the two answers.
         let values = [
             ext(3),
-            zeta.clone(),
+            zeta,
             ext(1),
             ext(2),
             ext(4),
@@ -354,12 +354,8 @@ fn the_leg_refuses_a_z0_at_a_deep_point() {
         execute(&compile(b.finish()), &[words], &HasherKind::Poseidon1W16)
     };
     let g = GoldilocksField::get_primitive_root_of_unity(3).expect("a root of order 8");
-    assert!(run(zeta.clone() + ext(1)).is_ok(), "an unrelated z0 executes");
-    for (what, z0) in [
-        ("z", zeta.clone()),
-        ("g·z", &g * &zeta),
-        ("z^P", zeta.pow(2usize)),
-    ] {
+    assert!(run(zeta + ext(1)).is_ok(), "an unrelated z0 executes");
+    for (what, z0) in [("z", zeta), ("g·z", &g * &zeta), ("z^P", zeta.pow(2usize))] {
         assert!(
             matches!(run(z0), Err(LfmExecError::DivByZero { .. })),
             "z0 = {what} must not execute"
