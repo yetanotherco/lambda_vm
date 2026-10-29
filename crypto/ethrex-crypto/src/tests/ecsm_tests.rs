@@ -181,3 +181,39 @@ fn odd_y_base_point_reconstructs_correctly() {
         .expect("odd-y base point is non-degenerate and must reconstruct correctly");
     assert_eq!(got, expected.to_affine());
 }
+
+/// The precompile's little-endian encodings: `reverse32` is the byte reversal (and
+/// its own inverse), and `scalar_le` is the reversal of the scalar's big-endian
+/// bytes, on edge values and seeded random ones.
+#[test]
+fn little_endian_encodings() {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    let mut scalars = vec![
+        Scalar::ZERO,
+        Scalar::ONE,
+        -Scalar::ONE,
+        Scalar::from(u64::MAX),
+    ];
+    for _ in 0..200 {
+        let mut bytes = [0u8; 32];
+        for chunk in bytes.chunks_exact_mut(8) {
+            chunk.copy_from_slice(&next().to_le_bytes());
+        }
+        let mut reversed = bytes;
+        reversed.reverse();
+        assert_eq!(reverse32(&bytes), reversed);
+        assert_eq!(reverse32(&reverse32(&bytes)), bytes);
+        scalars.push(<Scalar as Reduce<U256>>::reduce_bytes(&bytes.into()));
+    }
+    for k in scalars {
+        let mut want: [u8; 32] = k.to_bytes().into();
+        want.reverse();
+        assert_eq!(scalar_le(&k), want);
+    }
+}

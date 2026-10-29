@@ -389,26 +389,42 @@ fn ecsm_lincomb2_xy(
 }
 
 /// x-only scalar-mul oracle backed by the ECSM precompile: computes `x(k·P)`
-/// for the curve point P whose x-coordinate is passed in. `x` must be the
-/// x-coordinate of a curve point and `k` in `(0, N)` (N = curve order) —
-/// guaranteed by the guards in [`lincomb2_with_oracle`]. Values cross the ABI
-/// as 32-byte little-endian; `x_le` and `k_le` are distinct stack arrays so
-/// the executor's `|addr_x_le − addr_k_le| ≥ 32` assumption holds by
-/// construction.
+/// for the curve point P whose x-coordinate is passed in, as 32 little-endian
+/// bytes. `x` must be the x-coordinate of a curve point and `k` in `(0, N)`
+/// (N = curve order) — guaranteed by the guards in [`lincomb2_with_oracle`].
+/// Values cross the ABI as 32-byte little-endian; `x_le` (the caller's) and
+/// `k_le` (this function's) are distinct 32-byte arrays, so the executor's
+/// `|addr_x_le − addr_k_le| ≥ 32` assumption holds by construction.
 #[cfg(target_arch = "riscv64")]
-fn ecsm_oracle(x: &FieldElement, k: &Scalar) -> Option<FieldElement> {
-    let x_be = x.to_bytes();
-    let k_be = k.to_bytes();
-    let mut x_le = [0u8; 32];
-    let mut k_le = [0u8; 32];
-    for i in 0..32 {
-        x_le[i] = x_be[31 - i];
-        k_le[i] = k_be[31 - i];
-    }
+fn ecsm_oracle(x_le: &[u8; 32], k: &Scalar) -> Option<FieldElement> {
+    let k_le = scalar_le(k);
     let mut xr_le = [0u8; 32];
-    lambda_vm_syscalls::syscalls::ecsm_mul(&mut xr_le, &x_le, &k_le);
-    xr_le.reverse();
-    Option::from(FieldElement::from_bytes(&xr_le.into()))
+    lambda_vm_syscalls::syscalls::ecsm_mul(&mut xr_le, x_le, &k_le);
+    Option::from(FieldElement::from_bytes(&reverse32(&xr_le).into()))
+}
+
+/// The 32 bytes in reverse order (big-endian to little-endian and back), a
+/// doubleword at a time.
+#[cfg(any(target_arch = "riscv64", test))]
+fn reverse32(bytes: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (dst, src) in out.chunks_exact_mut(8).zip(bytes.rchunks_exact(8)) {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(src);
+        dst.copy_from_slice(&u64::from_be_bytes(word).to_le_bytes());
+    }
+    out
+}
+
+/// `k` as 32 little-endian bytes: its canonical value's limbs, low limb first.
+#[cfg(any(target_arch = "riscv64", test))]
+fn scalar_le(k: &Scalar) -> [u8; 32] {
+    const { assert!(core::mem::size_of::<k256::elliptic_curve::bigint::Word>() == 8) };
+    let mut out = [0u8; 32];
+    for (dst, word) in out.chunks_exact_mut(8).zip(U256::from(k).to_words()) {
+        dst.copy_from_slice(&word.to_le_bytes());
+    }
+    out
 }
 
 /// Base-field inverse `x⁻¹ mod p`.
@@ -461,7 +477,8 @@ where
 }
 
 /// Computes `k1·P1 + k2·P2` from four x-only oracle queries, or `None` if any
-/// degenerate-configuration guard trips.
+/// degenerate-configuration guard trips. The oracle takes the point's x as 32
+/// little-endian bytes, the precompile's encoding, converted once per point.
 ///
 /// The lambda-vm ECSM precompile returns only `x(k·P)`. For `A = k1·P1` with
 /// `P1 = (xp, yp)` fully known, query `xa = x(k1·P1)` and `xc = x((k1+1)·P1)`.
@@ -490,8 +507,20 @@ where
     }
     let (x1, y1) = affine_xy(a1)?;
     let (x2, y2) = affine_xy(a2)?;
-    let (xq, yq) = lincomb2_xy_with_oracle(&x1, &y1, k1, &x2, &y2, k2, oracle)?;
+    let (xq, yq) = lincomb2_xy_with_oracle(&x1, &y1, k1, &x2, &y2, k2, le_oracle(oracle))?;
     point_from_xy(&xq, &yq)
+}
+
+/// An oracle on field elements as one on the precompile's little-endian x.
+#[cfg(test)]
+fn le_oracle<O>(oracle: O) -> impl Fn(&[u8; 32], &Scalar) -> Option<FieldElement>
+where
+    O: Fn(&FieldElement, &Scalar) -> Option<FieldElement>,
+{
+    move |x_le, k| {
+        let x = Option::<FieldElement>::from(FieldElement::from_bytes(&reverse32(x_le).into()))?;
+        oracle(&x, k)
+    }
 }
 
 /// [`lincomb2_with_oracle`] on affine coordinates `(x1, y1)` and `(x2, y2)` of two
@@ -508,17 +537,19 @@ fn lincomb2_xy_with_oracle<O>(
     oracle: O,
 ) -> Option<(FieldElement, FieldElement)>
 where
-    O: Fn(&FieldElement, &Scalar) -> Option<FieldElement>,
+    O: Fn(&[u8; 32], &Scalar) -> Option<FieldElement>,
 {
     if scalar_near_edge(k1) || scalar_near_edge(k2) {
         return None;
     }
     let (x1, y1, x2, y2) = (*x1, *y1, *x2, *y2);
+    let x1_le = reverse32(&x1.to_bytes().into());
+    let x2_le = reverse32(&x2.to_bytes().into());
 
-    let xa = oracle(&x1, k1)?;
-    let xc1 = oracle(&x1, &(*k1 + Scalar::ONE))?;
-    let xb = oracle(&x2, k2)?;
-    let xc2 = oracle(&x2, &(*k2 + Scalar::ONE))?;
+    let xa = oracle(&x1_le, k1)?;
+    let xc1 = oracle(&x1_le, &(*k1 + Scalar::ONE))?;
+    let xb = oracle(&x2_le, k2)?;
+    let xc2 = oracle(&x2_le, &(*k2 + Scalar::ONE))?;
 
     let dx1 = (xa - x1).normalize();
     let dx2 = (xb - x2).normalize();
@@ -562,7 +593,8 @@ fn is_on_curve(x: &FieldElement, y: &FieldElement) -> bool {
     bool::from((rhs + y.square().negate(1)).normalizes_to_zero())
 }
 
-/// Recovers `y(k·P)` from `xa = x(k·P)` and `xc = x((k+1)·P)`.
+/// Recovers `y(k·P)` from `xa = x(k·P)` and `xc = x((k+1)·P)`, for a curve point
+/// `P = (xp, yp)`.
 /// Returns `None` if `xc` is inconsistent with the computed `lambda`
 /// (oracle misbehavior); degeneracy guards are in [`lincomb2_with_oracle`].
 #[cfg(any(target_arch = "riscv64", test))]
@@ -576,8 +608,9 @@ fn solve_y(
 ) -> Option<FieldElement> {
     let t = *xc + xa + xp;
     let xa3 = xa.square() * xa;
-    let xp3 = xp.square() * xp;
-    let lambda = (xa3 - xp3 - t * dx.square()) * inv_den;
+    // `xa³ − xp³ − t·dx²`, with `xp³ = yp² − 7` since P is on the curve: one squaring
+    // instead of a squaring and a product. Magnitude 6 going into the product (≤ 8).
+    let lambda = (xa3 + FieldElement::from_u64(7) - yp.square() - t * dx.square()) * inv_den;
     if lambda.square().normalize() != t.normalize() {
         return None;
     }

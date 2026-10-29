@@ -193,7 +193,9 @@ fn accelerated_shape_recovers_the_signing_key() {
                         decompress_r_xy_with_oracle(r, odd, soft_sqrt)
                     }
                 },
-                |x1, y1, k1, x2, y2, k2| lincomb2_xy_with_oracle(x1, y1, k1, x2, y2, k2, soft_ecsm),
+                |x1, y1, k1, x2, y2, k2| {
+                    lincomb2_xy_with_oracle(x1, y1, k1, x2, y2, k2, le_oracle(soft_ecsm))
+                },
             );
             let got = got.ok();
             let software = ecsm_ecrecover(&sig, recid, &msg).ok();
@@ -222,7 +224,9 @@ fn accelerated(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64], Cr
         recid,
         msg,
         |r, odd| decompress_r_xy_with_oracle(r, odd, soft_sqrt),
-        |x1, y1, k1, x2, y2, k2| lincomb2_xy_with_oracle(x1, y1, k1, x2, y2, k2, soft_ecsm),
+        |x1, y1, k1, x2, y2, k2| {
+            lincomb2_xy_with_oracle(x1, y1, k1, x2, y2, k2, le_oracle(soft_ecsm))
+        },
     )
 }
 
