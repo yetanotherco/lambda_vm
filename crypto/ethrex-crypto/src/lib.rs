@@ -721,8 +721,18 @@ fn keccak256_with_permute<F: FnMut(&mut [u64; 25])>(input: &[u8], mut permute: F
         }
         let tail = lanes.remainder();
         let mut last = 0x01u64 << (8 * tail.len());
-        for (i, byte) in tail.iter().enumerate() {
-            last |= u64::from(*byte) << (8 * i);
+        if !tail.is_empty() && input.len() >= 8 {
+            // The input's last eight bytes end with the tail: load them as one lane and
+            // shift out the bytes before the tail, instead of assembling the tail a byte
+            // at a time. (On a little-endian target this path only sees inputs of a
+            // full block or more.)
+            let mut word = [0u8; 8];
+            word.copy_from_slice(&input[input.len() - 8..]);
+            last |= u64::from_le_bytes(word) >> (64 - 8 * tail.len());
+        } else {
+            for (i, byte) in tail.iter().enumerate() {
+                last |= u64::from(*byte) << (8 * i);
+            }
         }
         state[lane] ^= last;
         state[RATE / 8 - 1] ^= 0x80u64 << 56;
