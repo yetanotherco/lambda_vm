@@ -538,27 +538,34 @@ pub(super) fn build_traces_walked(
     let hash_trace = |c: usize| {
         let chunk = (hash_count > 1).then(|| program.hash_chunk_group(c));
         let base = program.hash_chunking.chunk_range(g.hash.real_rows, c).start;
-        chip_trace(
-            walk,
-            chunk.as_ref().unwrap_or(&g.hash),
-            hash::num_columns(hasher),
-            |row, out| {
-                if program.hash16() {
-                    super::p1w16_socket::fill_row(
-                        super::p1w16_socket::SOCKET_FORM,
-                        records.hash16[base + row].ins,
-                        out,
-                    );
-                } else {
-                    fill_hash_row(
-                        hasher,
-                        &records.hash[base + row],
-                        hash_modes[base + row],
-                        out,
-                    )
-                }
-            },
-        )
+        let group = chunk.as_ref().unwrap_or(&g.hash);
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+        let mut trace = chip_trace(walk, group, hash::num_columns(hasher), |row, out| {
+            if program.hash16() {
+                super::p1w16_socket::fill_row(
+                    super::p1w16_socket::SOCKET_FORM,
+                    records.hash16[base + row].ins,
+                    out,
+                );
+            } else {
+                fill_hash_row(
+                    hasher,
+                    &records.hash[base + row],
+                    hash_modes[base + row],
+                    out,
+                )
+            }
+        });
+        // The socket's witness is a function of each row's inputs: the card
+        // rebuilds it from the prefix and the inputs instead of receiving it.
+        #[cfg(feature = "cuda")]
+        if program.hash16() && super::p1w16_socket::lean_upload_enabled() {
+            trace.set_main_dev_producer(super::p1w16_socket::lean_upload_producer(
+                super::p1w16_socket::SOCKET_FORM,
+                group.real_rows,
+            ));
+        }
+        trace
     };
 
     LfmTraces {

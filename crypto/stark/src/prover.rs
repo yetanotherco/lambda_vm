@@ -987,6 +987,40 @@ pub(crate) fn composition_eval_stride(blowup_factor: usize, number_of_parts: usi
     }
 }
 
+/// Frees a main trace a [`crate::trace::MainDevProducer`] built, once the R1
+/// main commit that read it is done with it.
+///
+/// The commit read the buffer on its own stream, and dropping a `CudaSlice`
+/// frees it on the stream that allocated it — with cudarc's event tracking off
+/// (`math_cuda::device`), nothing orders that free after the read. So the
+/// producer's stream first waits for the commit's `ready` event, which follows
+/// every read of its input. A handle without one was drained to the host before
+/// it was returned (the read is long done); no handle means the commit declined
+/// or failed, and the whole device is waited for (rare).
+#[cfg(feature = "cuda")]
+fn release_produced_after(
+    produced: Option<math_cuda::CudaSlice<u64>>,
+    handle: Option<&math_cuda::lde::GpuLdeBase>,
+) {
+    let Some(buf) = produced else { return };
+    match handle {
+        Some(h) => {
+            if let Some(ev) = &h.ready
+                && buf.stream().wait(ev.event()).is_err()
+                && let Ok(be) = math_cuda::device::backend()
+            {
+                let _ = be.ctx.synchronize();
+            }
+        }
+        None => {
+            if let Ok(be) = math_cuda::device::backend() {
+                let _ = be.ctx.synchronize();
+            }
+        }
+    }
+    drop(buf);
+}
+
 /// Process-wide `Domain` + `LdeTwiddles` cache keyed by
 /// `(field, trace_length, blowup, coset_offset)`. Continuation epochs
 /// otherwise rebuild the same ~24 MB `Domain` and
@@ -1914,6 +1948,9 @@ pub trait IsStarkProver<
             };
             #[cfg(feature = "instruments")]
             let t_sub = Instant::now();
+            // A table that builds its trace on the card uploads fewer bytes;
+            // the buffer lives until the commit has copied it in.
+            let produced = trace.produce_main_dev();
             if let Some((tree, handle, main_data)) =
                 crate::gpu_lde::try_expand_leaf_and_tree_row_major_keep::<
                     Field,
@@ -1923,7 +1960,7 @@ pub trait IsStarkProver<
                     table,
                     "R1 main commit",
                     trace_slice,
-                    trace.main_rowmajor_dev(),
+                    trace.main_rowmajor_dev().or(produced.as_ref()),
                     n,
                     num_cols,
                     domain.blowup_factor,
@@ -1932,6 +1969,7 @@ pub trait IsStarkProver<
                     rows_per_leaf,
                 )
             {
+                release_produced_after(produced, Some(&handle));
                 #[cfg(feature = "instruments")]
                 let main_lde_dur = t_sub.elapsed();
                 let root = tree.root;
@@ -1950,6 +1988,7 @@ pub trait IsStarkProver<
                     Some(handle),
                 ));
             }
+            release_produced_after(produced, None);
         }
 
         // Fused GPU split path for preprocessed tables (cuda only): one
@@ -1982,6 +2021,9 @@ pub trait IsStarkProver<
                 .flatten();
             #[cfg(feature = "instruments")]
             let t_sub = Instant::now();
+            // As in the plain arm: the trace built on the card when the table
+            // carries a producer.
+            let produced = trace.produce_main_dev();
             if let Some((pre_tree, mult_tree, handle, main_data)) =
                 crate::gpu_lde::try_expand_split_trees_row_major_keep::<
                     Field,
@@ -1990,7 +2032,7 @@ pub trait IsStarkProver<
                 >(
                     table,
                     trace_slice,
-                    trace.main_rowmajor_dev(),
+                    trace.main_rowmajor_dev().or(produced.as_ref()),
                     n,
                     num_cols,
                     domain.blowup_factor,
@@ -2001,6 +2043,7 @@ pub trait IsStarkProver<
                     rows_per_leaf,
                 )
             {
+                release_produced_after(produced, Some(&handle));
                 #[cfg(feature = "instruments")]
                 crate::instruments::accum_r1_main(t_sub.elapsed(), std::time::Duration::ZERO);
                 if device_only {
@@ -2041,6 +2084,7 @@ pub trait IsStarkProver<
                 return Ok((commit, (main_data, num_cols), Some(handle)));
             }
             // GPU split path declined (size threshold / tower) → CPU path below.
+            release_produced_after(produced, None);
         }
 
         // CPU path: the trace `Table` is already row-major, so copy it directly

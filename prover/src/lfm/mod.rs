@@ -191,6 +191,8 @@ mod keccak_probe;
 mod leaf_kats;
 #[cfg(test)]
 mod leaf_tests;
+#[cfg(all(test, feature = "cuda"))]
+mod lean_upload_tests;
 #[cfg(test)]
 mod logup_tests;
 #[cfg(test)]

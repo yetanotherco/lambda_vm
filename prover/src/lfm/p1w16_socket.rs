@@ -244,6 +244,54 @@ pub fn air(
     .with_preprocessed(root, cols::PREP_WIDTH)
 }
 
+/// Runtime override of the lean upload: 0 = the environment's choice, 1 = off,
+/// 2 = on.
+static LEAN_UPLOAD_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force the lean upload on (`Some(true)`), off (`Some(false)`) or back to the
+/// environment's choice (`None`). It changes which bytes cross to the card,
+/// never the trace or the proof.
+pub fn set_lean_upload(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    LEAN_UPLOAD_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the socket's trace crosses to the card lean: the preprocessed prefix
+/// and the sixteen input lanes only, the round witness rebuilt on the card
+/// (`stark::trace::MainDevProducer::poseidon1_w16_rows`) — 29 of the 329 words a
+/// row. On by default; `LAMBDA_VM_LFM_LEAN_UPLOAD=0` uploads the whole row as
+/// before (an A/B knob: the proof bytes do not depend on it).
+pub fn lean_upload_enabled() -> bool {
+    match LEAN_UPLOAD_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| {
+        std::env::var("LAMBDA_VM_LFM_LEAN_UPLOAD")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// The device producer for a socket trace of `real_rows` permutation rows
+/// (the rest padding) under `form`: the R1 main commit uploads each row's
+/// prefix and inputs and rebuilds the witness on the card.
+#[cfg(feature = "cuda")]
+pub fn lean_upload_producer(form: OutForm, real_rows: usize) -> stark::trace::MainDevProducer {
+    stark::trace::MainDevProducer::poseidon1_w16_rows(
+        real_rows,
+        cols::PREP_WIDTH,
+        form.num_columns(),
+        form.rounds(),
+    )
+}
+
 /// Writes a permutation row's value columns for `input` (the preprocessed
 /// prefix is the caller's) and returns the permutation's output, which is the
 /// host reference's [`p1::permute`].

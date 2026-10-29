@@ -297,6 +297,7 @@ struct Module {
     cpu: CudaFunction,
     keccak_rnd: CudaFunction,
     keccak_rnd_in: CudaFunction,
+    lfm_p1w16_socket: CudaFunction,
 }
 
 fn module() -> Result<&'static Module> {
@@ -316,6 +317,7 @@ fn module() -> Result<&'static Module> {
         cpu: module.load_function("fill_cpu_from_logs")?,
         keccak_rnd: module.load_function("fill_keccak_rnd")?,
         keccak_rnd_in: module.load_function("fill_keccak_rnd_in")?,
+        lfm_p1w16_socket: module.load_function("fill_lfm_p1w16_socket")?,
         _module: module,
     };
     Ok(MODULE.get_or_init(|| m))
@@ -1046,4 +1048,60 @@ mod tests {
         }
         assert_eq!(DecodeRunC::find(&[], 0x1000), None);
     }
+}
+
+/// The LFM width-16 Poseidon1 socket's row-major trace (`rows × width` words)
+/// on the card, from `narrow`: each row's preprocessed prefix (`prep_w` words)
+/// and its sixteen input lanes, `rows × (prep_w + 16)` words row-major. The
+/// kernel (`fill_lfm_p1w16_socket`) copies those and writes the round witness
+/// from `rounds_off` for the first `real_rows` rows, zeros past them — word for
+/// word the host's `p1w16_socket::fill_row` trace. The narrow words cross the
+/// bus through the staging pairs, as the R1 commit's own upload would; the
+/// stream is synchronized before return, so the buffer is ready for any stream.
+pub fn lfm_p1w16_socket_rows(
+    narrow: &[u64],
+    rows: usize,
+    real_rows: usize,
+    prep_w: usize,
+    width: usize,
+    rounds_off: usize,
+) -> Result<CudaSlice<u64>> {
+    const LANES: usize = 16;
+    ensure!(rows > 0 && real_rows <= rows, "real rows within the table");
+    ensure!(
+        rounds_off >= prep_w + LANES && rounds_off <= width,
+        "the witness after the inputs"
+    );
+    ensure_eq!(narrow.len(), rows * (prep_w + LANES), "the narrow words");
+    let m = module()?;
+    let stream = backend()?.next_stream();
+    let mut narrow_dev = unsafe { stream.alloc::<u64>(narrow.len()) }?;
+    crate::device::htod_staged(&stream, narrow, &mut narrow_dev.slice_mut(..))?;
+    let mut out = unsafe { stream.alloc::<u64>(rows * width) }?;
+    let (rows_u64, real_u64, prep_u64, width_u64, off_u64) = (
+        rows as u64,
+        real_rows as u64,
+        prep_w as u64,
+        width as u64,
+        rounds_off as u64,
+    );
+    unsafe {
+        stream
+            .launch_builder(&m.lfm_p1w16_socket)
+            .arg(&narrow_dev)
+            .arg(&rows_u64)
+            .arg(&real_u64)
+            .arg(&prep_u64)
+            .arg(&width_u64)
+            .arg(&off_u64)
+            .arg(&mut out)
+            .launch(LaunchConfig {
+                grid_dim: (row_grid(rows, ROW_BLOCK)?, 1, 1),
+                block_dim: (ROW_BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    stream.synchronize()?;
+    drop(narrow_dev);
+    Ok(out)
 }

@@ -17,6 +17,7 @@
 #include <cstdint>
 
 #include "goldilocks.cuh"
+#include "p1w16_constants.cuh"
 
 // ---------------------------------------------------------------------------
 // The records
@@ -959,4 +960,97 @@ extern "C" __global__ void fill_keccak_rnd(const KeccakOpC *ops, uint32_t nops, 
 extern "C" __global__ void fill_keccak_rnd_in(const KeccakOpInC *ops, uint32_t nops,
                                               uint64_t skip, uint64_t rows, uint64_t *out) {
     fill_keccak_rnd_rows(ops, nops, skip, rows, out);
+}
+
+// ---------------------------------------------------------------------------
+// The LFM width-16 Poseidon1 socket (`prover/src/lfm/p1w16_socket.rs`): its
+// row-major trace widened from the columns the host uploads — the preprocessed
+// prefix and the sixteen input lanes, `narrow_w = prep_w + 16` words a row —
+// to the whole row (`width` words): the prefix and inputs copied, then the
+// round witness, `x³` and `x⁷` of every S-boxed lane of every round, in
+// `fill_row`'s column order from `rounds_off`. Rows at or past `real_rows` are
+// padding: their witness words are zero, as the host's calloc'd trace leaves
+// them. Row-major in and out (`out[row · width + col]`), the R1 main commit's
+// input layout.
+//
+// BIT-IDENTICAL to the host fill, not only congruent: the trace words feed the
+// LDE and the commitment as stored. So every operation is the host's own on
+// raw `[0, 2^64)` words: `goldilocks::add`/`mul` port the host's `add`/`mul`
+// one to one; `x³ = (a·a)·a` and `x⁷ = (x³·x³)·a` keep `fill_row`'s
+// association; the MDS is `poseidon1_w16::mds` — the exact 128-bit lane sum
+// `Σ s_j·M[i][j]` over raw words, then `Fp::from(lo) + Fp::from(hi·EPSILON)`,
+// where `Fp::from` reduces a word ≥ p once (`canonical`) and `hi·EPSILON`
+// (< 2^41) is already reduced; the round constants go through `Fp::from` too.
+// ---------------------------------------------------------------------------
+namespace lfm_socket {
+
+constexpr int WIDTH = 16;
+constexpr int ROUNDS = 30;
+constexpr int HALF_FULL = 4;
+
+__device__ __forceinline__ bool full_round(int r) { return r < HALF_FULL || r >= ROUNDS - HALF_FULL; }
+
+// `poseidon1_w16::mds`, word for word.
+__device__ __forceinline__ void mds(const uint64_t s[WIDTH], uint64_t out[WIDTH]) {
+    uint32_t lo32[WIDTH], hi32[WIDTH];
+#pragma unroll
+    for (int j = 0; j < WIDTH; ++j) {
+        lo32[j] = (uint32_t)s[j];
+        hi32[j] = (uint32_t)(s[j] >> 32);
+    }
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) {
+        // Σ_j c·lo32_j and Σ_j c·hi32_j, each < 371·2^32 < 2^41: the lane's
+        // exact sum is acc_hi·2^32 + acc_lo < 2^73.
+        uint64_t acc_lo = 0, acc_hi = 0;
+#pragma unroll
+        for (int j = 0; j < WIDTH; ++j) {
+            const uint64_t c = p1w16::MDS_ROW[(j + WIDTH - i) % WIDTH];
+            acc_lo += c * (uint64_t)lo32[j];
+            acc_hi += c * (uint64_t)hi32[j];
+        }
+        const uint64_t lo = (acc_hi << 32) + acc_lo;
+        const uint64_t carry = (lo < acc_lo) ? 1ull : 0ull;
+        const uint64_t hi = (acc_hi >> 32) + carry;
+        out[i] = goldilocks::add(goldilocks::canonical(lo), hi * goldilocks::EPSILON);
+    }
+}
+
+}  // namespace lfm_socket
+
+extern "C" __global__ void fill_lfm_p1w16_socket(const uint64_t *__restrict__ narrow, uint64_t rows,
+                                                 uint64_t real_rows, uint64_t prep_w, uint64_t width,
+                                                 uint64_t rounds_off, uint64_t *__restrict__ out) {
+    using namespace lfm_socket;
+    const uint64_t narrow_w = prep_w + WIDTH;
+    for (uint64_t row = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; row < rows;
+         row += (uint64_t)gridDim.x * blockDim.x) {
+        const uint64_t *src = narrow + row * narrow_w;
+        uint64_t *dst = out + row * width;
+        for (uint64_t c = 0; c < narrow_w; ++c) dst[c] = src[c];
+        if (row >= real_rows) {
+            for (uint64_t c = narrow_w; c < width; ++c) dst[c] = 0;
+            continue;
+        }
+        uint64_t s[WIDTH];
+#pragma unroll
+        for (int i = 0; i < WIDTH; ++i) s[i] = src[prep_w + i];
+        uint64_t off = rounds_off;
+        for (int r = 0; r < ROUNDS; ++r) {
+            uint64_t f[WIDTH];
+#pragma unroll
+            for (int i = 0; i < WIDTH; ++i) f[i] = goldilocks::add(s[i], goldilocks::canonical(p1w16::RC[r][i]));
+            const int lanes = full_round(r) ? WIDTH : 1;
+            for (int lane = 0; lane < lanes; ++lane) {
+                const uint64_t a = f[lane];
+                const uint64_t x3 = goldilocks::mul(goldilocks::mul(a, a), a);
+                const uint64_t x7 = goldilocks::mul(goldilocks::mul(x3, x3), a);
+                dst[off + lane] = x3;
+                dst[off + lanes + lane] = x7;
+                f[lane] = x7;
+            }
+            off += 2 * (uint64_t)lanes;
+            mds(f, s);
+        }
+    }
 }

@@ -49,6 +49,11 @@ where
     /// instead of paying the H2D inside its chain.
     #[cfg(feature = "cuda")]
     pub(crate) main_rowmajor_dev: Option<PreUploadedMainTrace>,
+    /// Builds the row-major main trace on the device from fewer bytes than the
+    /// whole trace (see [`MainDevProducer`]); the R1 main commit calls it, inside
+    /// the prove, when nothing was pre-uploaded.
+    #[cfg(feature = "cuda")]
+    pub(crate) main_dev_producer: Option<MainDevProducer>,
     /// The main trace packed at the bytes its columns need
     /// ([`Self::pack_main_narrow`]), column by column: `main_table` then holds
     /// no data, only its width and height. Only the WHIR block prover packs a
@@ -59,6 +64,98 @@ where
     /// its width and height. Only the WHIR block prover takes such a trace;
     /// the card fills its columns from the records.
     pub(crate) records_main: Option<multilinear::records::Records>,
+}
+
+/// A table's row-major main trace built on the device, called with the host
+/// row-major words and the trace's `(rows, columns)`: returns the whole trace on
+/// the card, word for word what the host buffer holds, or `None` (the commit
+/// then uploads the host buffer as before). It exists so a table whose columns
+/// are mostly a function of a few can upload the few and derive the rest on
+/// the card; the host trace stays complete, so every host reader is unchanged.
+/// The returned buffer must be ready for any stream (its producing stream
+/// synchronized).
+#[cfg(feature = "cuda")]
+#[derive(Clone)]
+pub struct MainDevProducer(
+    #[allow(clippy::type_complexity)]
+    pub  std::sync::Arc<
+        dyn Fn(&[u64], usize, usize) -> Option<math_cuda::CudaSlice<u64>> + Send + Sync,
+    >,
+);
+
+#[cfg(feature = "cuda")]
+impl core::fmt::Debug for MainDevProducer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MainDevProducer").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl MainDevProducer {
+    /// The producer for a table whose row is one width-16 Poseidon1
+    /// permutation's witness: `prep_w` preprocessed words, the sixteen input
+    /// lanes, then from `rounds_off` the `x³`/`x⁷` of every S-boxed lane of every
+    /// round, for the first `real_rows` rows (padding rows hold zeros past their
+    /// inputs). It uploads the leading `prep_w + 16` words of each row and
+    /// derives the rest on the card (`math_cuda::fill::lfm_p1w16_socket_rows`),
+    /// word for word the host fill's. Declines (`None`) a trace of another
+    /// width or with more real rows than rows.
+    pub fn poseidon1_w16_rows(
+        real_rows: usize,
+        prep_w: usize,
+        width: usize,
+        rounds_off: usize,
+    ) -> Self {
+        Self(std::sync::Arc::new(
+            move |words: &[u64], rows: usize, cols: usize| {
+                const LANES: usize = 16;
+                let narrow_w = prep_w + LANES;
+                if cols != width || real_rows > rows || narrow_w > width || rounds_off < narrow_w {
+                    return None;
+                }
+                let mut narrow = vec![0u64; rows * narrow_w];
+                #[cfg(feature = "parallel")]
+                {
+                    use rayon::prelude::{ParallelSlice, ParallelSliceMut};
+                    narrow
+                        .par_chunks_mut(narrow_w)
+                        .zip(words.par_chunks(width))
+                        .for_each(|(n, w)| n.copy_from_slice(&w[..narrow_w]));
+                }
+                #[cfg(not(feature = "parallel"))]
+                for (n, w) in narrow.chunks_mut(narrow_w).zip(words.chunks(width)) {
+                    n.copy_from_slice(&w[..narrow_w]);
+                }
+                math_cuda::fill::lfm_p1w16_socket_rows(
+                    &narrow, rows, real_rows, prep_w, width, rounds_off,
+                )
+                .ok()
+            },
+        ))
+    }
+}
+
+/// Excluded from logical trace equality, like [`PreUploadedMainTrace`]: it
+/// produces data the host trace already holds.
+#[cfg(feature = "cuda")]
+impl PartialEq for MainDevProducer {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Eq for MainDevProducer {}
+
+/// Tables whose R1 main commit took its trace from a [`MainDevProducer`].
+#[cfg(feature = "cuda")]
+pub(crate) static MAIN_DEV_PRODUCER_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many R1 main commits so far took their trace from a device producer.
+#[cfg(feature = "cuda")]
+pub fn main_dev_producer_calls() -> u64 {
+    MAIN_DEV_PRODUCER_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Device-resident row-major main trace, pre-uploaded ahead of the prove.
@@ -196,6 +293,8 @@ where
             main_trace_dev: None,
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
+            #[cfg(feature = "cuda")]
+            main_dev_producer: None,
             narrow_main: None,
             records_main: None,
         }
@@ -228,6 +327,8 @@ where
             main_trace_dev: None,
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
+            #[cfg(feature = "cuda")]
+            main_dev_producer: None,
             narrow_main: None,
             records_main: None,
         }
@@ -253,6 +354,8 @@ where
             main_trace_dev: None,
             #[cfg(feature = "cuda")]
             main_rowmajor_dev: None,
+            #[cfg(feature = "cuda")]
+            main_dev_producer: None,
             narrow_main: None,
             records_main: None,
         }
@@ -422,6 +525,58 @@ where
     #[cfg(feature = "cuda")]
     pub(crate) fn main_rowmajor_dev(&self) -> Option<&math_cuda::CudaSlice<u64>> {
         self.main_rowmajor_dev.as_ref().map(|p| p.buf.as_ref())
+    }
+
+    /// Attach a [`MainDevProducer`]: the R1 main commit builds this table's
+    /// row-major trace on the card with it instead of uploading the host buffer.
+    #[cfg(feature = "cuda")]
+    pub fn set_main_dev_producer(&mut self, producer: MainDevProducer) {
+        self.main_dev_producer = Some(producer);
+    }
+
+    /// Whether a [`MainDevProducer`] is attached.
+    #[cfg(feature = "cuda")]
+    pub fn has_main_dev_producer(&self) -> bool {
+        self.main_dev_producer.is_some()
+    }
+
+    /// Detach the [`MainDevProducer`]: what a caller that edits the host trace
+    /// after it was built must do, or the card would rebuild the unedited rows.
+    #[cfg(feature = "cuda")]
+    pub fn clear_main_dev_producer(&mut self) {
+        self.main_dev_producer = None;
+    }
+
+    /// The row-major main trace on the card from the attached producer, when
+    /// there is one, nothing was pre-uploaded, and the host trace is held whole
+    /// as 64-bit words. `None` means the commit uploads the host buffer.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn produce_main_dev(&self) -> Option<math_cuda::CudaSlice<u64>>
+    where
+        F: 'static,
+    {
+        let producer = self.main_dev_producer.as_ref()?;
+        if self.main_rowmajor_dev.is_some()
+            || std::any::TypeId::of::<F>()
+                != std::any::TypeId::of::<math::field::goldilocks::GoldilocksField>()
+        {
+            return None;
+        }
+        let table = &self.main_table;
+        if table.width == 0 || table.data.len() != table.width * table.height {
+            return None;
+        }
+        // SAFETY: `F == GoldilocksField` (checked above), `#[repr(transparent)]`
+        // over `u64`.
+        let words = unsafe {
+            core::slice::from_raw_parts(table.data.as_ptr() as *const u64, table.data.len())
+        };
+        let buf = (producer.0)(words, table.height, table.width)?;
+        if buf.len() != words.len() {
+            return None;
+        }
+        MAIN_DEV_PRODUCER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(buf)
     }
 
     /// Drop the pre-uploaded row-major trace. Its only consumer is the R1 main
