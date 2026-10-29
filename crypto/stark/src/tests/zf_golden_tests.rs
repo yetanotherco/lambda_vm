@@ -364,6 +364,50 @@ fn default_format_goldens_are_byte_identical() {
     }
 }
 
+/// The sub-coset composition evaluation (two parts at blowup ≥ 4: `H` on
+/// `2n` points instead of the whole LDE) must not move a byte: the same case
+/// proved with it forced off and forced on gives the same rkyv bytes, both
+/// verify, and the "on" prove really took the sub-coset path. The pinned
+/// goldens above run under the default (on); this compares the two paths
+/// directly, so it also holds if the default changes.
+#[test]
+fn subcoset_composition_is_byte_identical_to_whole_coset() {
+    use crate::prover::{composition_subcoset_tables, set_composition_subcoset};
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_composition_subcoset(None);
+        }
+    }
+    let _restore = Restore;
+
+    for (rows, blowup) in [(128usize, 4u8), (64, 8)] {
+        let o = golden_options(blowup, 1, 7, ProofFormat::DEFAULT);
+
+        set_composition_subcoset(Some(false));
+        let (air_off, off, _) = prove_logup::<Blake3StarkHash>(rows, &o);
+
+        set_composition_subcoset(Some(true));
+        let before = composition_subcoset_tables();
+        let (air_on, on, _) = prove_logup::<Blake3StarkHash>(rows, &o);
+        assert!(
+            composition_subcoset_tables() > before,
+            "rows{rows}/blowup{blowup}: the forced-on prove never took the sub-coset path"
+        );
+        set_composition_subcoset(None);
+
+        assert!(verify_logup::<Blake3StarkHash>(&air_off, &off));
+        assert!(verify_logup::<Blake3StarkHash>(&air_on, &on));
+        let off_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&off).expect("rkyv");
+        let on_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&on).expect("rkyv");
+        assert_eq!(
+            sha3_hex(&on_bytes),
+            sha3_hex(&off_bytes),
+            "rows{rows}/blowup{blowup}: sub-coset proof bytes differ from the whole-coset proof"
+        );
+    }
+}
+
 /// Prints `GOLDENS`. Run only for a deliberate format change.
 #[test]
 #[ignore = "generator for GOLDENS"]

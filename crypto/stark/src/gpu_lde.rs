@@ -1032,8 +1032,13 @@ where
         return None;
     }
     let n = h0.len();
-    let blowup = 2; // extend_half_to_lde extends N → 2N always
-    let lde_size = n * blowup;
+    // The halves extend N → the full LDE: blowup 2 when `H` was evaluated on
+    // the whole coset, the domain's blowup when on its 2N-point sub-coset.
+    let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+    if n == 0 || !lde_size.is_multiple_of(n) {
+        return None;
+    }
+    let blowup = lde_size / n;
     if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
         return None;
     }
@@ -1137,21 +1142,31 @@ where
 /// the evaluations are also drained to host for the fallback consumers;
 /// without it (device-only) the returned part Vecs are empty placeholders.
 /// `None` → the caller downloads `H` and runs the host decompose path.
+///
+/// `row_stride` is the sub-coset stride `H` was evaluated at (`h.num_rows`
+/// = `lde_size / row_stride`): the halves hold `h.num_rows / 2` points each and
+/// are extended to `lde_size` with blowup `2 * row_stride`; `weights` must be
+/// that extension's `g⁻ʲ/n`. Stride 1 is the whole-coset path (blowup 2).
 pub(crate) fn try_decompose_extend_d2_dev<F, E>(
     h: &math_cuda::constraint_interp::GpuCompH,
     inv_2x: &std::sync::Arc<Vec<FieldElement<F>>>,
     weights: &[FieldElement<F>],
     want_host: bool,
+    row_stride: usize,
 ) -> Option<(Vec<Vec<FieldElement<E>>>, math_cuda::lde::GpuLdeExt3)>
 where
     F: IsField + 'static,
     E: IsField + 'static,
 {
-    let lde_size = dev_comp_parts_gate::<F, E>(h.num_rows)?;
-    let n = lde_size / 2;
-    if weights.len() != n || inv_2x.len() < n {
+    if row_stride == 0 {
         return None;
     }
+    let lde_size = dev_comp_parts_gate::<F, E>(h.num_rows.checked_mul(row_stride)?)?;
+    let n = h.num_rows / 2;
+    if n == 0 || weights.len() != n || inv_2x.len() <= (n - 1) * row_stride {
+        return None;
+    }
+    let blowup = lde_size / n;
 
     // SAFETY: `F == GoldilocksField` (gated above); the Arc'd Vecs share layout.
     let inv_conc: &crate::constraint_ir::gpu_interp::GoldilocksBZInv =
@@ -1162,8 +1177,14 @@ where
     // SAFETY: F == Goldilocks; FieldElement<Gl> is repr(transparent) over u64.
     let two_inv: u64 = unsafe { *(two_inv_fe.value() as *const _ as *const u64) };
 
-    let (slabs, stream, n_dev) =
-        math_cuda::constraint_interp::decompose_d2_into_slabs(h, &inv_handle, two_inv).ok()?;
+    let (slabs, stream, n_dev) = math_cuda::constraint_interp::decompose_d2_into_slabs_strided(
+        h,
+        &inv_handle,
+        two_inv,
+        row_stride,
+        lde_size,
+    )
+    .ok()?;
     debug_assert_eq!(n_dev, n);
 
     GPU_EXTEND_HALVES_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -1179,7 +1200,7 @@ where
             slabs,
             2,
             n,
-            2,
+            blowup,
             weights_u64,
             None,
         )
@@ -1201,7 +1222,7 @@ where
         slabs,
         2,
         n,
-        2,
+        blowup,
         weights_u64,
         Some(&mut outputs),
     )

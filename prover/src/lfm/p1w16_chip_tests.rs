@@ -368,6 +368,7 @@ fn chip_constraint_eval_cost_on_the_card() {
             b_value: &[],
             b_beta: &[],
             b_z_inv: &[],
+            row_stride: 1,
         };
         let zero = FieldElement::<Gl3>::zero();
         let run = || {

@@ -736,6 +736,13 @@ pub(crate) struct LdeTwiddles<F: IsFFTField> {
     composition: OnceLock<CompositionLdeTwiddles<F>>,
     /// `1/(2·g·ωⁱ)` for the degree-2 quotient decomposition — see [`Self::inv_2x`].
     inv_2x: OnceLock<Arc<Vec<FieldElement<F>>>>,
+    /// Weights `g⁻ʲ/n` for extending the two halves from `n` points when `H`
+    /// was evaluated on the `2n`-point sub-coset — see
+    /// [`Self::composition_subcoset_weights`].
+    composition_subcoset_weights: OnceLock<Vec<FieldElement<F>>>,
+    /// Size-`n` inverse twiddles for that extension on the host (the device
+    /// path needs only the weights), built on first host use.
+    composition_subcoset_inv: OnceLock<LayerTwiddles<F>>,
 }
 
 pub(crate) struct CompositionLdeTwiddles<F: IsFFTField> {
@@ -747,27 +754,33 @@ pub(crate) struct CompositionLdeTwiddles<F: IsFFTField> {
     weights: Vec<FieldElement<F>>,
 }
 
+/// Composition half-extension weights `g⁻ʲ / half_size`, `j < half_size`. The
+/// constraint-quotient halves live on a g²-coset of size `half_size`; the
+/// unnormalized iFFT yields `half_size·cⱼ·(g²)ʲ` and these weights turn that into
+/// `cⱼ·gʲ` for the forward FFT onto the g-coset. Shared by the whole-coset
+/// halves (`half_size = lde/2`) and the sub-coset halves (`half_size = n`).
+fn composition_half_weights<F: IsFFTField>(
+    half_size: usize,
+    offset: &FieldElement<F>,
+) -> Vec<FieldElement<F>> {
+    let half_size_fe = FieldElement::<F>::from(half_size as u64);
+    let inv_half_size_offset = (&half_size_fe * offset)
+        .inv()
+        .expect("half_size and coset offset are non-zero");
+    let half_size_inv = offset * &inv_half_size_offset;
+    let offset_inv = &half_size_fe * &inv_half_size_offset;
+    let mut w = Vec::with_capacity(half_size);
+    let mut cur = half_size_inv;
+    for _ in 0..half_size {
+        w.push(cur.clone());
+        cur = &cur * &offset_inv;
+    }
+    w
+}
+
 impl<F: IsFFTField> CompositionLdeTwiddles<F> {
     fn new(half_size: usize, offset: &FieldElement<F>) -> Self {
-        // Composition half-extension weights: g⁻ʲ / half_size. The constraint-
-        // quotient halves live on the g²-coset of size `half_size`; the unnormalized
-        // iFFT yields `n·cⱼ·(g²)ʲ` and these weights turn that into `cⱼ·gʲ` for the
-        // forward FFT onto the g-coset.
-        let half_size_fe = FieldElement::<F>::from(half_size as u64);
-        let inv_half_size_offset = (&half_size_fe * offset)
-            .inv()
-            .expect("half_size and coset offset are non-zero");
-        let half_size_inv = offset * &inv_half_size_offset;
-        let offset_inv = &half_size_fe * &inv_half_size_offset;
-        let weights = {
-            let mut w = Vec::with_capacity(half_size);
-            let mut cur = half_size_inv;
-            for _ in 0..half_size {
-                w.push(cur.clone());
-                cur = &cur * &offset_inv;
-            }
-            w
-        };
+        let weights = composition_half_weights(half_size, offset);
 
         Self {
             inv: LayerTwiddles::<F>::new_inverse(half_size.trailing_zeros() as u64)
@@ -838,6 +851,8 @@ impl<F: IsFFTField> LdeTwiddles<F> {
             coset_weights,
             composition: OnceLock::new(),
             inv_2x: OnceLock::new(),
+            composition_subcoset_weights: OnceLock::new(),
+            composition_subcoset_inv: OnceLock::new(),
         }
     }
 
@@ -879,6 +894,96 @@ impl<F: IsFFTField> LdeTwiddles<F> {
                 .expect("Coset points are non-zero");
             Arc::new(inv)
         })
+    }
+
+    /// `g⁻ʲ/n` (`n` = trace length) for extending the degree-2 halves from the
+    /// `n` points the sub-coset split yields to the whole LDE (see
+    /// [`composition_eval_stride`]). Sequential to build; pre-filled with the
+    /// rest of the domain's caches.
+    fn composition_subcoset_weights(&self, domain: &Domain<F>) -> &[FieldElement<F>] {
+        self.composition_subcoset_weights.get_or_init(|| {
+            composition_half_weights(domain.interpolation_domain_size, &domain.coset_offset)
+        })
+    }
+
+    /// The size-`n` inverse twiddles the HOST sub-coset extension needs (the
+    /// forward set is the whole-coset extension's, of the same LDE size).
+    fn composition_subcoset_inv(&self, domain: &Domain<F>) -> &LayerTwiddles<F> {
+        self.composition_subcoset_inv.get_or_init(|| {
+            LayerTwiddles::<F>::new_inverse(domain.interpolation_domain_size.trailing_zeros() as u64)
+                .expect("valid composition sub-coset inverse twiddles")
+        })
+    }
+}
+
+/// Tables whose composition was evaluated on the sub-coset (any stride > 1),
+/// process-wide — so a test can tell the path ran, not only that bytes held.
+static COMPOSITION_SUBCOSET_TABLES: AtomicU64 = AtomicU64::new(0);
+
+/// How many tables so far had their composition evaluated on the sub-coset.
+pub fn composition_subcoset_tables() -> u64 {
+    COMPOSITION_SUBCOSET_TABLES.load(Ordering::Relaxed)
+}
+
+/// Runtime override of the sub-coset composition evaluation: 0 = follow the
+/// environment, 1 = forced off, 2 = forced on.
+static COMPOSITION_SUBCOSET_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Force the sub-coset composition evaluation on (`Some(true)`), off
+/// (`Some(false)`), or back to the environment's choice (`None`). It changes
+/// how the prover computes the composition parts, never their values: the
+/// proof bytes are the same either way.
+pub fn set_composition_subcoset(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    COMPOSITION_SUBCOSET_OVERRIDE.store(v, Ordering::Relaxed);
+}
+
+/// Whether a degree-2 composition is evaluated on the `2n`-point sub-coset
+/// instead of the whole LDE coset. On by default;
+/// `LAMBDA_VM_COMPOSITION_SUBCOSET=0` turns it off (an A/B knob — the proof
+/// bytes do not depend on it).
+pub(crate) fn composition_subcoset_enabled() -> bool {
+    match COMPOSITION_SUBCOSET_OVERRIDE.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ENV: OnceLock<bool> = OnceLock::new();
+    *ENV.get_or_init(|| {
+        std::env::var("LAMBDA_VM_COMPOSITION_SUBCOSET")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// The LDE-row stride the composition polynomial `H` is evaluated at.
+///
+/// `H` has degree `< parts·n` and is committed as `parts` pieces of degree
+/// `< n`. With two parts, `H(x) = H₀(x²) + x·H₁(x²)` and the split is pointwise
+/// over pairs `(x, −x)`, so it needs `H` only on a coset that is closed under
+/// negation and whose squares number `n`: the `2n`-point sub-coset `g·⟨ωˢ⟩`,
+/// `s = blowup/2` (`ω` the LDE generator; `−1 = ω^(lde/2)` lies in `⟨ωˢ⟩`).
+/// `H₀`/`H₁` then come out on the `n` points `g²·⟨ω²ˢ⟩`, which determine them,
+/// and extend to the LDE exactly as from `2n` points — the same polynomials at
+/// the same points, so the same parts and the same proof. The constraint walk
+/// runs on `2n` rows instead of `blowup·n`.
+///
+/// Returns 1 (the whole coset, the original path) for any other part count,
+/// for blowup 2 (where the sub-coset IS the coset), or with the knob off.
+pub(crate) fn composition_eval_stride(blowup_factor: usize, number_of_parts: usize) -> usize {
+    if number_of_parts == 2
+        && blowup_factor >= 4
+        && blowup_factor.is_power_of_two()
+        && composition_subcoset_enabled()
+    {
+        blowup_factor / 2
+    } else {
+        1
     }
 }
 
@@ -986,6 +1091,9 @@ where
     let _ = d.fri_inv_twiddles();
     let _ = t.composition(&d);
     let _ = t.inv_2x(&d);
+    if composition_eval_stride(blowup_factor, 2) > 1 {
+        let _ = t.composition_subcoset_weights(&d);
+    }
     let mut cache = domain_twiddle_cache().lock().unwrap();
     // Re-check under the lock: concurrent misses both build, and using the
     // loser would pin ITS per-instance vectors in the pointer-keyed device
@@ -2281,6 +2389,9 @@ pub trait IsStarkProver<
     /// R2 producer and the `xcheck` mirror so the two cannot drift. `want_host` gates
     /// the d=2 host drain only — d=1 tables are never device-only, so they always
     /// keep their host part.
+    ///
+    /// `row_stride` is the stride `h_dev` was evaluated at
+    /// ([`composition_eval_stride`]); only the d=2 split takes a stride above 1.
     #[cfg(feature = "cuda")]
     fn decompose_comp_h_dev(
         number_of_parts: usize,
@@ -2288,11 +2399,15 @@ pub trait IsStarkProver<
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
         want_host: bool,
+        row_stride: usize,
     ) -> Option<(
         Vec<Vec<FieldElement<FieldExtension>>>,
         math_cuda::lde::GpuLdeExt3,
     )> {
         if number_of_parts == 1 {
+            if row_stride != 1 {
+                return None;
+            }
             // d=1 is never device-only (`device_only_for`'s degree gate admits only
             // d=2), so the single part is always kept on host — `want_host` must
             // hold, and the d=1 helper ignores it by design.
@@ -2310,11 +2425,17 @@ pub trait IsStarkProver<
             );
             crate::gpu_lde::try_comp_h_to_slabs_dev::<Field, FieldExtension>(h_dev)
         } else {
+            let weights: &[FieldElement<Field>] = if row_stride == 1 {
+                &twiddles.composition(domain).weights
+            } else {
+                twiddles.composition_subcoset_weights(domain)
+            };
             crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(
                 h_dev,
                 twiddles.inv_2x(domain),
-                &twiddles.composition(domain).weights,
+                weights,
                 want_host,
+                row_stride,
             )
         }
     }
@@ -2330,10 +2451,18 @@ pub trait IsStarkProver<
     ///
     /// On the LDE coset {g·ω^i | i=0..2N-1}, we have -g·ω^i = g·ω^{i+N}
     /// since ω^N = -1 for a 2N-th root of unity ω.
+    ///
+    /// With `row_stride` s > 1, `constraint_evaluations` holds `H` on the
+    /// sub-coset of every s-th LDE point only ([`composition_eval_stride`]). The
+    /// same pairing holds there (the sub-coset is closed under negation), the
+    /// point i is the LDE point i·s (so 1/(2x) is `inv_2x[i·s]`), and the halves
+    /// come out on fewer points that still determine them; the extension then
+    /// runs at the domain's blowup instead of 2. The parts are the same.
     fn decompose_and_extend_d2(
         constraint_evaluations: &[FieldElement<FieldExtension>],
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
+        row_stride: usize,
     ) -> Vec<Vec<FieldElement<FieldExtension>>>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -2342,11 +2471,16 @@ pub trait IsStarkProver<
         let two_n = constraint_evaluations.len();
         let n = two_n / 2;
         debug_assert_eq!(two_n, n * 2);
+        debug_assert_eq!(
+            two_n * row_stride,
+            domain.interpolation_domain_size * domain.blowup_factor,
+            "H must cover the LDE coset at the given stride"
+        );
 
         // Step 1: 1/(2·g·ω^i) for i=0..N-1, cached once per domain in the
         // shared twiddles (base field — mixed F×E multiplication below).
         let inv_2x = twiddles.inv_2x(domain);
-        debug_assert_eq!(inv_2x.len(), n);
+        debug_assert_eq!(inv_2x.len(), n * row_stride);
 
         // Step 2: Pointwise decomposition.
         // H₀((g·ω^i)²) = (evals[i] + evals[i+N]) / 2
@@ -2358,11 +2492,11 @@ pub trait IsStarkProver<
             let sum = &constraint_evaluations[i] + &constraint_evaluations[i + n];
             let diff = &constraint_evaluations[i] - &constraint_evaluations[i + n];
             // F × E → E (base field scalar on left for mixed multiplication)
-            (&two_inv * &sum, &inv_2x[i] * &diff)
+            (&two_inv * &sum, &inv_2x[i * row_stride] * &diff)
         });
 
-        // Step 3: Extend each part from n evals on the g²-coset to 2n evals on the
-        // g-coset (the full LDE domain).
+        // Step 3: Extend each part from n evals on the g²-coset to the g-coset
+        // (the full LDE domain).
 
         // GPU fast path: batch both halves into one ext3 LDE call. Requires
         // `cuda` feature and a qualifying size. Falls through to CPU when not.
@@ -2374,37 +2508,46 @@ pub trait IsStarkProver<
         }
 
         let composition_twiddles = twiddles.composition(domain);
+        let (weights, inv): (&[FieldElement<Field>], &LayerTwiddles<Field>) = if row_stride == 1 {
+            (&composition_twiddles.weights, &composition_twiddles.inv)
+        } else {
+            (
+                twiddles.composition_subcoset_weights(domain),
+                twiddles.composition_subcoset_inv(domain),
+            )
+        };
+        let blowup = 2 * row_stride;
+        let fwd = &composition_twiddles.fwd;
         let (lde_h0, lde_h1) = crate::par::join(
-            || Self::extend_half_to_lde(&h0_evals, composition_twiddles),
-            || Self::extend_half_to_lde(&h1_evals, composition_twiddles),
+            || Self::extend_half_to_lde(&h0_evals, blowup, weights, inv, fwd),
+            || Self::extend_half_to_lde(&h1_evals, blowup, weights, inv, fwd),
         );
         vec![lde_h0, lde_h1]
     }
 
-    /// Extend `half_evals` — `n = lde_size/2` evaluations of a degree-`<n` polynomial
-    /// on the g²-coset — to `2n` evaluations on the g-coset (the full LDE domain).
+    /// Extend `half_evals` — `m` evaluations of a degree-`<m` polynomial on a
+    /// g²-coset — to `m·blowup` evaluations on the g-coset (the full LDE domain).
+    /// `m = lde_size/2` (blowup 2) for the whole-coset split, `m = n` for the
+    /// sub-coset split.
     ///
-    /// Fused: iFFT(n) → coset reshift g²→g → forward FFT(2n) in a single pass with no
-    /// intermediate coefficient `Polynomial`. The twiddles and the weights `g⁻ʲ/n`
-    /// (which fold the 1/n normalization and the net g²→g shift) are cached lazily
-    /// once per domain in [`LdeTwiddles`].
+    /// Fused: iFFT(m) → coset reshift g²→g → forward FFT(m·blowup) in a single pass
+    /// with no intermediate coefficient `Polynomial`. The twiddles and the weights
+    /// `g⁻ʲ/m` (which fold the 1/m normalization and the net g²→g shift) are cached
+    /// lazily once per domain in [`LdeTwiddles`].
     fn extend_half_to_lde(
         half_evals: &[FieldElement<FieldExtension>],
-        twiddles: &CompositionLdeTwiddles<Field>,
+        blowup: usize,
+        weights: &[FieldElement<Field>],
+        inv: &LayerTwiddles<Field>,
+        fwd: &LayerTwiddles<Field>,
     ) -> Vec<FieldElement<FieldExtension>>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        debug_assert_eq!(half_evals.len(), twiddles.weights.len());
-        Polynomial::coset_lde_full::<Field>(
-            half_evals,
-            2,
-            &twiddles.weights,
-            &twiddles.inv,
-            &twiddles.fwd,
-        )
-        .expect("coset extension")
+        debug_assert_eq!(half_evals.len(), weights.len());
+        Polynomial::coset_lde_full::<Field>(half_evals, blowup, weights, inv, fwd)
+            .expect("coset extension")
     }
 
     /// The evaluations of the composition-polynomial parts over the LDE domain,
@@ -2443,6 +2586,12 @@ pub trait IsStarkProver<
             trace_length,
         );
         let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
+        // Evaluate `H` on the sub-coset when the split allows it (two parts,
+        // blowup ≥ 4): the same parts from fewer constraint evaluations.
+        let row_stride = composition_eval_stride(domain.blowup_factor, number_of_parts);
+        if row_stride > 1 {
+            COMPOSITION_SUBCOSET_TABLES.fetch_add(1, Ordering::Relaxed);
+        }
 
         let __ps_c = crate::prove_split::mark();
         #[cfg(feature = "instruments")]
@@ -2484,6 +2633,7 @@ pub trait IsStarkProver<
                 transition_coefficients,
                 boundary_coefficients,
                 rap_challenges,
+                row_stride,
             ) {
                 let want_host = !lde_trace.host_trace_empty();
                 // num_parts==1 de-interleaves `H` (the single part); num_parts==2
@@ -2494,6 +2644,7 @@ pub trait IsStarkProver<
                     domain,
                     twiddles,
                     want_host,
+                    row_stride,
                 ) {
                     Some((parts, handle)) => {
                         gpu_composition_parts = Some(handle);
@@ -2513,7 +2664,7 @@ pub trait IsStarkProver<
             precomputed_parts = Some(if number_of_parts == 1 {
                 vec![h]
             } else {
-                Self::decompose_and_extend_d2(&h, domain, twiddles)
+                Self::decompose_and_extend_d2(&h, domain, twiddles, row_stride)
             });
         }
         #[cfg(not(feature = "cuda"))]
@@ -2582,8 +2733,9 @@ pub trait IsStarkProver<
                 transition_coefficients,
                 boundary_coefficients,
                 rap_challenges,
+                row_stride,
             );
-            Self::decompose_and_extend_d2(&constraint_evaluations, domain, twiddles)
+            Self::decompose_and_extend_d2(&constraint_evaluations, domain, twiddles, row_stride)
         } else if number_of_parts == 1 {
             // Degree bound equals trace length: constraint evals are the LDE directly.
             vec![evaluator.evaluate(
@@ -2593,6 +2745,7 @@ pub trait IsStarkProver<
                 transition_coefficients,
                 boundary_coefficients,
                 rap_challenges,
+                1,
             )]
         } else {
             // Fallback for any future AIR with d > 2.
@@ -2603,6 +2756,7 @@ pub trait IsStarkProver<
                 transition_coefficients,
                 boundary_coefficients,
                 rap_challenges,
+                1,
             );
             let composition_poly =
                 Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)?;
@@ -5723,6 +5877,11 @@ pub trait IsStarkProver<
             round_1_result.bus_public_inputs.as_ref(),
             trace_length,
         );
+        // num_parts==1: `H` IS the single part (no host decompose); num_parts==2:
+        // the degree-2 split, at the producer's stride. Mirrors the R2 producer so
+        // the compare is apples-to-apples.
+        let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
+        let row_stride = composition_eval_stride(domain.blowup_factor, number_of_parts);
         let host_h = evaluator.evaluate(
             air,
             &round_1_result.lde_trace,
@@ -5730,14 +5889,12 @@ pub trait IsStarkProver<
             transition_coefficients,
             boundary_coefficients,
             &round_1_result.rap_challenges,
+            row_stride,
         );
-        // num_parts==1: `H` IS the single part (no host decompose); num_parts==2:
-        // the degree-2 split. Mirrors the R2 producer so the compare is apples-to-apples.
-        let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
         let host_parts = if number_of_parts == 1 {
             vec![host_h]
         } else {
-            Self::decompose_and_extend_d2(&host_h, domain, twiddles)
+            Self::decompose_and_extend_d2(&host_h, domain, twiddles, row_stride)
         };
         let device_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = if round_2_result
             .lde_composition_poly_evaluations
@@ -5809,10 +5966,18 @@ pub trait IsStarkProver<
                 transition_coefficients,
                 boundary_coefficients,
                 &round_1_result.rap_challenges,
+                row_stride,
             )
             .and_then(|h_dev| {
-                Self::decompose_comp_h_dev(number_of_parts, &h_dev, domain, twiddles, true)
-                    .map(|(parts, _handle)| parts)
+                Self::decompose_comp_h_dev(
+                    number_of_parts,
+                    &h_dev,
+                    domain,
+                    twiddles,
+                    true,
+                    row_stride,
+                )
+                .map(|(parts, _handle)| parts)
             });
         let rerun_verdict = match &rerun {
             None => "device rerun declined".to_string(),
