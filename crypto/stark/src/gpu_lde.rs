@@ -604,6 +604,14 @@ pub fn gpu_logup_calls() -> u64 {
 /// round-2 constraint evaluation took the fused on-device path (a failed attempt
 /// or a gate miss falls back to the CPU accumulation and is not counted).
 pub(crate) static GPU_COMPOSITION_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// The host↔card staging traffic since the process started, one line
+/// (`math_cuda::device::staging_report`): for crates that log it without
+/// depending on `math-cuda` themselves.
+pub fn staging_report() -> String {
+    math_cuda::device::staging_report()
+}
+
 pub fn gpu_composition_calls() -> u64 {
     GPU_COMPOSITION_CALLS.load(Ordering::Relaxed)
 }

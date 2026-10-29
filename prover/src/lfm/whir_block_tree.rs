@@ -2116,6 +2116,14 @@ pub fn prove_whir_block_tree(
             "after the base"
         }
     ));
+    // The card's upload traffic at the base's end, read against the same line at
+    // the tree's end: what the tree's proves uploaded.
+    #[cfg(feature = "cuda")]
+    sink.line(&format!(
+        "W3 STAGING AFTER BASE: {} · main traces built on the card {}",
+        stark::gpu_lde::staging_report(),
+        stark::trace::main_dev_producer_calls()
+    ));
     sink.line(&format!(
         "W3 LEAF EMITTERS: {} · leaf 0's program at {} · the last at {ready_at:.2}s",
         match leaf_emitters {
@@ -2360,6 +2368,12 @@ pub fn prove_whir_block_tree(
                 "together until leaf {k}'s program was not there, then each published as it is built"
             ),
         }
+    ));
+    #[cfg(feature = "cuda")]
+    sink.line(&format!(
+        "W3 STAGING AT END: {} · main traces built on the card {}",
+        stark::gpu_lde::staging_report(),
+        stark::trace::main_dev_producer_calls()
     ));
     sink.line(&format!(
         "W3 RECURSION: {:.2}s after the base (tree {tree:.2}s) · whole block {whole:.2}s · whole excl. harness readouts {:.2}s (readouts {readouts:.2}s) · leaves execute beside their artifacts {beside}",
