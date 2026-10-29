@@ -1,9 +1,16 @@
+#[cfg(target_arch = "riscv64")]
 use std::sync::Arc;
 
+#[cfg(target_arch = "riscv64")]
 use ethrex_guest_program::l1::execution_program;
+#[cfg(target_arch = "riscv64")]
 use lambda_vm_ethrex_crypto::LambdaVmEcsmCrypto;
+#[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
 mod input;
+#[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
+mod shared_table;
 
+#[cfg(target_arch = "riscv64")]
 pub fn main() {
     // Zero-copy private input: borrow the memory-mapped input region in place
     // (the host pre-loads it before execution) so rkyv deserializes straight
@@ -23,3 +30,7 @@ pub fn main() {
     let output = execution_program(input, crypto).unwrap();
     lambda_vm_syscalls::syscalls::commit(&output.encode());
 }
+
+// On the host this crate builds only for the unit tests of its input decoding.
+#[cfg(not(target_arch = "riscv64"))]
+pub fn main() {}
