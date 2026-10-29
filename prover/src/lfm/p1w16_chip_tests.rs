@@ -433,3 +433,110 @@ fn chip_constraint_eval_cost_on_the_card() {
         );
     }
 }
+
+/// What the sub-coset composition evaluation saves on the card, per kernel.
+///
+/// Times the fused composition evaluation (`try_eval_composition_gpu`, host
+/// mode: the kernel plus the `H` download) of the production hash socket's own
+/// constraints — the widest leaf table's program — over a leaf-height LDE at
+/// blowup 4 (`2^18` trace rows, `2^20` LDE rows of random columns), at stride 1
+/// (the whole coset) and stride 2 (the `2n`-point sub-coset the degree-2 split
+/// needs). Median of 7 after a warm-up each. The ratio is the mechanism row of
+/// the sub-coset change: ≈ 0.5 if the walk is per row and nothing else binds.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "card: times the socket's composition evaluation at strides 1 and 2; run on the box with --ignored"]
+fn socket_composition_subcoset_time_on_the_card() {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use math_cuda::lde::{GpuLdeBase, GpuLdeExt3};
+    use stark::constraint_ir::gpu_interp::{CompositionInputs, try_eval_composition_gpu};
+
+    use super::p1w16_socket::{P1W16SocketConstraints, SOCKET_FORM};
+
+    const BLOWUP: usize = 4;
+    const LOG_LDE: u32 = 20;
+    const REPS: usize = 7;
+    let n = 1usize << LOG_LDE;
+
+    let set = P1W16SocketConstraints { form: SOCKET_FORM };
+    let width = SOCKET_FORM.num_columns();
+    let meta = set.meta();
+    let mut cb = CaptureBuilder::<Gl, Gl3>::new();
+    set.eval(&mut cb);
+    let (prog, _) = cb.finish(num_base_from_meta(&meta));
+    let main = GpuLdeBase {
+        ready: None,
+        buf: Arc::new(math_cuda::p1w16::random_device_matrix(width * n).expect("card")),
+        m: width,
+        lde_size: n,
+        tree: None,
+        trace_dev: None,
+        trace_rows: 0,
+    };
+    let aux = GpuLdeExt3 {
+        ready: None,
+        buf: Arc::new(math_cuda::p1w16::random_device_matrix(3).expect("card")),
+        m: 0,
+        lde_size: n,
+        tree: None,
+    };
+    let beta: Vec<FieldElement<Gl3>> = (0..prog.roots.len())
+        .map(|i| FieldElement::<Gl3>::from(0x9E37_79B9 + 7 * i as u64))
+        .collect();
+    let z_inv: Vec<FE> = (0..BLOWUP).map(|i| FE::from(3 + i as u64)).collect();
+    let zero = FieldElement::<Gl3>::zero();
+    let time = |row_stride: usize| -> (f64, Vec<u64>) {
+        let inputs = CompositionInputs::<Gl, Gl3> {
+            beta_trans: &beta,
+            z_inv: &z_inv,
+            b_col: &[],
+            b_is_aux: &[],
+            b_value: &[],
+            b_beta: &[],
+            b_z_inv: &[],
+            row_stride,
+        };
+        let run = || match try_eval_composition_gpu(
+            &prog,
+            &main,
+            &aux,
+            &[],
+            &[],
+            &zero,
+            BLOWUP,
+            n,
+            &inputs,
+            false,
+        ) {
+            Some(stark::constraint_ir::gpu_interp::GpuComposition::Host(raw)) => raw,
+            _ => panic!("the card evaluates the program at stride {row_stride}"),
+        };
+        let h = run(); // warm-up: the lowering cache, the module, clocks
+        let mut t: Vec<f64> = (0..REPS)
+            .map(|_| {
+                let start = Instant::now();
+                run();
+                start.elapsed().as_secs_f64() * 1e3
+            })
+            .collect();
+        t.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        (t[REPS / 2], h)
+    };
+    let (t1, h1) = time(1);
+    let (t2, h2) = time(2);
+    // The strided evaluation is the whole one's even rows (a correctness check
+    // on real program shape, beside the timing).
+    let even: Vec<u64> = (0..n / 2)
+        .flat_map(|j| h1[j * 6..j * 6 + 3].iter().copied())
+        .collect();
+    assert_eq!(h2, even, "stride-2 H must be the whole H's even rows");
+    println!(
+        "SUBCOSET KERNEL socket cols {width} nodes {} roots {} · LDE 2^{LOG_LDE} at blowup {BLOWUP} · \
+         stride 1 {t1:.2} ms · stride 2 {t2:.2} ms · ratio {:.3}",
+        prog.len(),
+        prog.roots.len(),
+        t2 / t1
+    );
+}
