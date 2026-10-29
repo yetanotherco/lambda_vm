@@ -372,6 +372,14 @@ pub fn build_whir_artifacts_under(
 ) -> Result<WhirLfmBuild, WhirLfmError> {
     let chip_set = ChipSet::for_program_with_hasher(program, hasher);
     check_chip_set(chip_set)?;
+    // The merged LFM tables (`LAMBDA_VM_ZF_LFM_MERGE`) are the STARK LFM
+    // proof's layout only: refused by name here rather than proved unmerged
+    // under a format that asks for them.
+    if options.format.merge_equal_height_tables {
+        return Err(shape_error(
+            "the W-LFM prover has no merged-table layout (LAMBDA_VM_ZF_LFM_MERGE=1)".to_string(),
+        ));
+    }
     let hash_chunks = program.hash_chunk_count();
     let groups = program_prep_groups(program);
     let airs = whir_lfm_airs(hasher, chip_set, hash_chunks, options);

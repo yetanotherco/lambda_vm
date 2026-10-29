@@ -1,0 +1,577 @@
+//! The merged LFM tables ([`super::merge`], `LAMBDA_VM_ZF_LFM_MERGE`): the plan
+//! takes equal heights only; the layout puts every prefix first; a part's body
+//! reads its own main columns and nothing else; the buses carry over column by
+//! column; the direct fill is the parts side by side; a merged program proves
+//! and verifies, under its own artifacts only; a bad row inside a merged table
+//! is refused, and the part's body is what refuses it (the mutant); a node's
+//! leg verifies a merged child and refuses its tampers; and the format knob
+//! parses, prints and refuses as its siblings do. With the flag off nothing
+//! moves: the plan is empty, the digest is the unmerged one, the fill is the
+//! unmerged fill.
+
+use std::cell::RefCell;
+use std::sync::{Mutex, MutexGuard};
+
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, Nil, RowDomain};
+use stark::proof::options::{GoldilocksCubicProofOptions, OneRowMode, ProofOptions};
+use stark::proof::view::MultiProofView;
+use stark::trace::TraceTable;
+
+use crate::hash_pin::{P1Family, ProofFamily};
+use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
+
+use super::airs::{LfmAirs, NUM_LFM_CHIPS};
+use super::builder::LfmBuilder;
+use super::compiler::{LfmProgram, compile};
+use super::executor::execute;
+use super::merge::{
+    LfmMerge, MERGE_CANDIDATES, MergeChip, MergedConstraints, MergedLayout, PartBody, PartShape,
+    merged_interactions, plan_for_heights, plan_for_program, test_hooks,
+};
+use super::p1_node_tests::{P1Child, harvest, node, runs};
+use super::proof::{LfmProof, lfm_prove, lfm_prove_under, prove_traces, verify_against_artifacts};
+use super::registry::{LfmArtifacts, build_artifacts, build_artifacts_under};
+use super::trace::{LfmTraces, build_traces_with_hasher, build_traces_with_merge};
+use super::word::{LfmWord, base_word};
+
+type F = GoldilocksField;
+type E = GoldilocksExtension;
+
+/// Every test here that builds a merged AIR holds this: the mutation hook
+/// ([`test_hooks`]) is process-wide.
+fn lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn fe(v: u64) -> FE {
+    FE::from(v)
+}
+
+fn ext(a: u64, b: u64, c: u64) -> FEE {
+    FEE::new([fe(a), fe(b), fe(c)])
+}
+
+fn options(merge: bool) -> ProofOptions {
+    let mut o = GoldilocksCubicProofOptions::with_blowup(2).expect("options");
+    o.format.merge_equal_height_tables = merge;
+    o
+}
+
+/// A program with real rows in all four candidates — base ALU (add, sub, mul),
+/// one select, an unpack and a pack, one hinted felt — each padded to the
+/// four-row floor, so the four share a height and merge.
+fn four_chip_program() -> (LfmProgram, Vec<Vec<LfmWord>>) {
+    let mut b = LfmBuilder::new();
+    let arena = b.declare_arena(1);
+    let h0 = b.hint_felt(arena, 0);
+    let x = b.felt_const(fe(7));
+    let y = b.felt_const(fe(5));
+    let s = b.add(x, y);
+    let d = b.sub(s, h0);
+    let m = b.mul(d, y);
+    let e0 = b.ext_const(&ext(1, 2, 3));
+    let e1 = b.ext_const(&ext(4, 5, 6));
+    let ep = b.emul(e0, e1);
+    let bit = b.bit_const(true);
+    let (l, r) = b.select(bit, x.as_cell(), y.as_cell());
+    let da = b.digest_const([fe(1), fe(2), fe(3), fe(4)]);
+    let db = b.digest_const([fe(5), fe(6), fe(7), fe(8)]);
+    let dc = b.compress(da, db);
+    let lanes = b.unpack(dc.as_cell());
+    let packed = b.pack_word(lanes);
+    b.public(packed);
+    b.public(l);
+    b.public(r);
+    b.public(ep.as_cell());
+    b.public(m.as_cell());
+    (compile(b.finish()), vec![vec![base_word(fe(3))]])
+}
+
+fn verifies(artifacts: &LfmArtifacts, proof: &LfmProof, opts: &ProofOptions) -> bool {
+    verify_against_artifacts(artifacts, &proof.proof, &proof.public_words, opts)
+}
+
+fn sub_proofs(proof: &LfmProof) -> usize {
+    MultiProofView::Owned(&proof.proof.multi).len()
+}
+
+// ================================ the plan =================================
+
+#[test]
+fn the_plan_merges_equal_heights_only() {
+    let mut h = [0u8; NUM_LFM_CHIPS];
+    let set = |h: &mut [u8; NUM_LFM_CHIPS], b, s, l, i| {
+        h[MergeChip::Balu.slot()] = b;
+        h[MergeChip::Select.slot()] = s;
+        h[MergeChip::Lanes.slot()] = l;
+        h[MergeChip::Hint.slot()] = i;
+    };
+    // A leaf: all four at 2^21.
+    set(&mut h, 21, 21, 21, 21);
+    assert_eq!(plan_for_heights(&h, true), vec![MERGE_CANDIDATES.to_vec()]);
+    assert!(plan_for_heights(&h, false).is_empty(), "off merges nothing");
+    // A top: SELECT and HINT at 2^20, BALU and LANES at 2^19 — two merged AIRs,
+    // ordered by their first chip.
+    set(&mut h, 19, 20, 19, 20);
+    assert_eq!(
+        plan_for_heights(&h, true),
+        vec![
+            vec![MergeChip::Balu, MergeChip::Lanes],
+            vec![MergeChip::Select, MergeChip::Hint]
+        ]
+    );
+    // A chip alone at its height keeps its own AIR.
+    set(&mut h, 18, 20, 20, 19);
+    assert_eq!(
+        plan_for_heights(&h, true),
+        vec![vec![MergeChip::Select, MergeChip::Lanes]]
+    );
+    // Four heights: nothing to merge.
+    set(&mut h, 17, 18, 19, 20);
+    assert!(plan_for_heights(&h, true).is_empty());
+    // Other chips' heights never matter.
+    let mut other = [21u8; NUM_LFM_CHIPS];
+    set(&mut other, 17, 18, 19, 20);
+    assert!(plan_for_heights(&other, true).is_empty());
+}
+
+#[test]
+fn the_layout_puts_every_prefix_first_and_maps_each_column_once() {
+    let layout = MergedLayout::of(&MERGE_CANDIDATES);
+    let shapes: Vec<PartShape> = MERGE_CANDIDATES.iter().map(|&c| PartShape::of(c)).collect();
+    assert_eq!(layout.num_prep, shapes.iter().map(|s| s.prep).sum::<usize>());
+    assert_eq!(layout.num_columns, shapes.iter().map(|s| s.width).sum::<usize>());
+    // The census of the note: 32 preprocessed, 61 in all.
+    assert_eq!((layout.num_prep, layout.num_columns), (32, 61));
+    let mut hit = vec![0usize; layout.num_columns];
+    for (part, shape) in layout.parts.iter().zip(&shapes) {
+        assert_eq!(part.map.len(), shape.width);
+        for (c, &m) in part.map.iter().enumerate() {
+            hit[m] += 1;
+            // A prefix column stays in the merged prefix; a value column after it.
+            assert_eq!(c < shape.prep, m < layout.num_prep, "{:?} column {c}", part.chip);
+        }
+        // Each region keeps the part's order and is contiguous.
+        assert!(part.map.windows(2).all(|w| w[1] > w[0] || w[1] < layout.num_prep));
+    }
+    assert!(hit.iter().all(|&n| n == 1), "every merged column is one part's");
+}
+
+// ============================ the constraint body ==========================
+
+/// A builder that records which leaves a body reads.
+#[derive(Default)]
+struct Recorder {
+    mains: RefCell<Vec<(usize, usize)>>,
+    others: RefCell<usize>,
+    emitted: Vec<usize>,
+}
+
+impl ConstraintBuilder<F, E> for Recorder {
+    type Expr = Nil;
+    type ExprE = Nil;
+    fn main(&self, offset: usize, col: usize) -> Nil {
+        self.mains.borrow_mut().push((offset, col));
+        Nil
+    }
+    fn aux(&self, _: usize, _: usize) -> Nil {
+        *self.others.borrow_mut() += 1;
+        Nil
+    }
+    fn challenge(&self, _: usize) -> Nil {
+        *self.others.borrow_mut() += 1;
+        Nil
+    }
+    fn alpha_pow(&self, _: usize) -> Nil {
+        *self.others.borrow_mut() += 1;
+        Nil
+    }
+    fn table_offset(&self) -> Nil {
+        *self.others.borrow_mut() += 1;
+        Nil
+    }
+    fn const_base(&self, _: u64) -> Nil {
+        Nil
+    }
+    fn const_signed(&self, _: i64) -> Nil {
+        Nil
+    }
+    fn emit_base_rows(&mut self, idx: usize, _: RowDomain, _: Nil) {
+        self.emitted.push(idx);
+    }
+    fn emit_ext_rows(&mut self, _: usize, _: RowDomain, _: Nil) {
+        *self.others.borrow_mut() += 1;
+    }
+}
+
+/// ★ The premise [`super::merge::Remap`] rests on: a candidate's body reads
+/// only its own main columns, at the current row, and emits base constraints
+/// only — so remapping `main` and shifting the indices is the whole
+/// translation. Then the merged body emits every part's constraints, densely,
+/// each reading exactly its part's columns where the layout put them.
+#[test]
+fn a_part_body_reads_only_its_main_columns() {
+    let _g = lock();
+    for chip in MERGE_CANDIDATES {
+        let shape = PartShape::of(chip);
+        let mut r = Recorder::default();
+        match shape.body {
+            PartBody::Balu => super::chips::balu::BaluConstraints.eval(&mut r),
+            PartBody::Select => super::chips::select::SelectConstraints.eval(&mut r),
+            PartBody::Empty => {}
+        }
+        assert_eq!(*r.others.borrow(), 0, "{chip:?} reads no aux leaf");
+        assert!(
+            r.mains.borrow().iter().all(|&(o, c)| o == 0 && c < shape.width),
+            "{chip:?} reads its own columns at the current row"
+        );
+        assert_eq!(r.emitted.len(), shape.num_base_constraints());
+    }
+    let layout = MergedLayout::of(&MERGE_CANDIDATES);
+    let set = MergedConstraints::new(&layout);
+    let mut r = Recorder::default();
+    set.eval(&mut r);
+    let mut emitted = r.emitted.clone();
+    emitted.sort_unstable();
+    let total: usize = MERGE_CANDIDATES
+        .iter()
+        .map(|&c| PartShape::of(c).num_base_constraints())
+        .sum();
+    assert_eq!(emitted, (0..total).collect::<Vec<_>>(), "dense, each once");
+    assert_eq!(ConstraintSet::<F, E>::max_degree(&set), 3, "BALU's degree");
+    // BALU reads A, B, C, OUT and its five selectors; under the merge those are
+    // its map's images.
+    let balu = &layout.parts[0];
+    let mut own = Recorder::default();
+    super::chips::balu::BaluConstraints.eval(&mut own);
+    let want: Vec<(usize, usize)> = own.mains.borrow().iter().map(|&(o, c)| (o, balu.map[c])).collect();
+    assert_eq!(r.mains.borrow()[..want.len()], want[..]);
+}
+
+/// ★ The buses carry over interaction by interaction: same bus, same side,
+/// same element count, and every column read moved by its part's map — and
+/// every packing stays contiguous (the premise of `remap_interaction`).
+#[test]
+fn every_merge_remaps_its_buses() {
+    let layout = MergedLayout::of(&MERGE_CANDIDATES);
+    let merged = merged_interactions(&layout);
+    let mut at = 0;
+    for part in &layout.parts {
+        for original in PartShape::of(part.chip).interactions() {
+            let m = &merged[at];
+            at += 1;
+            assert_eq!(m.bus_id, original.bus_id);
+            assert_eq!(m.is_sender, original.is_sender);
+            assert_eq!(m.num_bus_elements(), original.num_bus_elements());
+            let mut want: Vec<usize> = original.columns_read().iter().map(|&c| part.map[c]).collect();
+            want.sort_unstable();
+            assert_eq!(m.columns_read(), want, "{:?}", part.chip);
+            for v in &original.values {
+                if let stark::lookup::BusValue::Packed {
+                    start_column,
+                    packing,
+                } = v
+                {
+                    let first = part.map[*start_column];
+                    assert!(
+                        (0..packing.num_columns()).all(|k| part.map[start_column + k] == first + k)
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(at, merged.len());
+    // 4 + 5 + 10 + 1 interactions: ten aux columns where the parts had eleven.
+    assert_eq!(merged.len(), 20);
+}
+
+// ================================ the traces ===============================
+
+fn main_cells(t: &TraceTable<F, E>) -> Vec<FE> {
+    t.main_data_row_major().0.to_vec()
+}
+
+/// ★ The direct fill IS the parts side by side: the merged table built by the
+/// fill equals the one laid out from the unmerged tables, cell for cell, and
+/// splitting it back gives the unmerged tables. With an empty plan the fill is
+/// the unmerged fill.
+#[test]
+fn the_merged_fill_is_the_parts_side_by_side() {
+    let (program, arenas) = four_chip_program();
+    let hasher = build_artifacts(&program, &options(false)).hasher;
+    let exec = execute(&program, &arenas, &hasher).expect("executes");
+    let plan = plan_for_program(&program, true);
+    assert_eq!(plan, vec![MERGE_CANDIDATES.to_vec()], "the four share the floor");
+
+    let plain = build_traces_with_hasher(&program, &exec.records, hasher);
+    let same = build_traces_with_merge(&program, &exec.records, hasher, &Vec::new());
+    let chips = |t: &LfmTraces| -> Vec<Vec<FE>> {
+        [&t.balu, &t.select, &t.lanes, &t.hint]
+            .iter()
+            .map(|x| main_cells(x))
+            .collect()
+    };
+    assert_eq!(chips(&plain), chips(&same), "no plan, no change");
+    assert!(same.merged.is_empty());
+
+    let direct = build_traces_with_merge(&program, &exec.records, hasher, &plan);
+    assert_eq!(direct.merged.len(), 1);
+    assert!(direct.balu.num_rows() == 0 && direct.hint.num_rows() == 0);
+    let mut copied = build_traces_with_hasher(&program, &exec.records, hasher);
+    copied.merge_to(&plan).expect("merges");
+    assert_eq!(main_cells(&direct.merged[0]), main_cells(&copied.merged[0]));
+    // Cell by cell against the parts' own tables.
+    let layout = MergedLayout::of(&plan[0]);
+    let parts = chips(&plain);
+    let merged = main_cells(&direct.merged[0]);
+    for (part, cells) in layout.parts.iter().zip(&parts) {
+        let w = part.map.len();
+        for row in 0..direct.merged[0].num_rows() {
+            for (c, &m) in part.map.iter().enumerate() {
+                assert_eq!(merged[row * layout.num_columns + m], cells[row * w + c]);
+            }
+        }
+    }
+    copied.merge_to(&Vec::new()).expect("splits back");
+    assert_eq!(chips(&copied), chips(&plain));
+    assert!(copied.merged.is_empty());
+}
+
+// ============================ prove and verify =============================
+
+/// ★ The round trip, and identity: a merged program has one AIR where its
+/// four chips had four, its merged chips' own roots are the zero sentinel and
+/// the merged root is bound into a different `program_id`; it proves and
+/// verifies under its own artifacts and is refused under the unmerged ones,
+/// and the reverse. With the flag off the artifacts carry no merge.
+#[test]
+fn a_merged_program_proves_and_verifies_under_its_own_artifacts_only() {
+    let _g = lock();
+    let (program, arenas) = four_chip_program();
+    let (on, off) = (options(true), options(false));
+    let merged = build_artifacts(&program, &on);
+    let plain = build_artifacts(&program, &off);
+    assert!(plain.merge.is_empty(), "off: no merge");
+    assert_eq!(merged.merge.plan(), vec![MERGE_CANDIDATES.to_vec()]);
+    assert_ne!(merged.program_id, plain.program_id, "the layout is identity");
+    for c in MERGE_CANDIDATES {
+        assert_eq!(merged.roots[c.slot()], [0u8; 32], "{c:?}: no root of its own");
+        assert_ne!(plain.roots[c.slot()], [0u8; 32]);
+    }
+    let p_merged = lfm_prove(&program, &merged, &arenas, &on).expect("merged proves");
+    let p_plain = lfm_prove(&program, &plain, &arenas, &off).expect("plain proves");
+    assert_eq!(sub_proofs(&p_merged) + 3, sub_proofs(&p_plain));
+    assert_eq!(p_merged.public_words, p_plain.public_words);
+    assert!(verifies(&merged, &p_merged, &on), "the merged proof verifies");
+    assert!(verifies(&plain, &p_plain, &off), "the plain proof verifies");
+    assert!(!verifies(&plain, &p_merged, &off), "a merged proof under plain artifacts");
+    assert!(!verifies(&merged, &p_plain, &on), "a plain proof under merged artifacts");
+    // A hand-made merge the plan cannot produce is refused before anything is
+    // built: a chip in two merged AIRs.
+    let mut twice = merged.clone();
+    twice.merge.tables.push(twice.merge.tables[0].clone());
+    assert!(!verifies(&twice, &p_merged, &on));
+}
+
+/// The merged artifacts' AIR order: the merged AIR stands at BALU's place,
+/// the other three chips leave, and the heights in AIR order follow
+/// (`log_heights_in_air_order`, what a parent derives its child from).
+#[test]
+fn the_merged_air_stands_at_its_first_chip() {
+    let _g = lock();
+    let (program, _) = four_chip_program();
+    let opts = options(true);
+    let artifacts = build_artifacts(&program, &opts);
+    let airs = LfmAirs::for_artifacts(&artifacts, &opts);
+    let names: Vec<String> = airs.air_refs().iter().map(|a| a.name().to_string()).collect();
+    assert_eq!(names[1], "LFM_MERGED[BALU+SELECT+LANES+HINT]", "{names:?}");
+    for gone in ["LFM_BALU", "LFM_SELECT", "LFM_LANES", "LFM_HINT"] {
+        assert!(!names.iter().any(|n| n == gone), "{gone} left: {names:?}");
+    }
+    let heights = LfmAirs::log_heights_in_air_order(&artifacts).expect("no keccak");
+    assert_eq!(heights.len(), names.len());
+    let merged = &airs.air_refs()[1];
+    assert_eq!(merged.num_precomputed_columns(), 32);
+    assert_eq!(merged.context().trace_columns, 61 + 10, "61 main, 10 aux");
+}
+
+/// The traces with SELECT's padding row 2 given a non-boolean bit: no bus
+/// token moves (the row's multiplicities are zero), only SELECT's booleanity
+/// fails.
+fn bad_select_traces(program: &LfmProgram, arenas: &[Vec<LfmWord>], artifacts: &LfmArtifacts) -> (LfmTraces, Vec<(u32, LfmWord)>) {
+    let exec = execute(program, arenas, &artifacts.hasher).expect("executes");
+    let plan = artifacts.merge.plan();
+    let mut traces = build_traces_with_merge(program, &exec.records, artifacts.hasher, &plan);
+    let layout = MergedLayout::of(&plan[0]);
+    let select = layout
+        .parts
+        .iter()
+        .find(|p| p.chip == MergeChip::Select)
+        .expect("SELECT is merged");
+    let row = 2;
+    assert!(row >= program.groups.select.real_rows, "a padding row");
+    traces.merged[0].set_main(row, select.map[super::chips::select::cols::BIT], fe(2));
+    (traces, exec.public_words)
+}
+
+/// ★ Negative, then the mutant: a merged table with a non-boolean SELECT bit
+/// on a padding row is refused by the verifier — and with the merged AIR's
+/// SELECT body left out (prover and verifier both), the same table proves and
+/// VERIFIES. So the part's body inside the merged AIR is what refuses it.
+#[test]
+fn a_bad_select_row_in_a_merged_table_is_refused_by_selects_own_body() {
+    let _g = lock();
+    let (program, arenas) = four_chip_program();
+    let opts = options(true);
+    let artifacts = build_artifacts(&program, &opts);
+
+    let (mut traces, words) = bad_select_traces(&program, &arenas, &artifacts);
+    let refused = match prove_traces(&artifacts, &mut traces, &words, &opts) {
+        Ok(proof) => !verify_against_artifacts(&artifacts, &proof, &words, &opts),
+        Err(_) => true,
+    };
+    assert!(refused, "the bad SELECT row must not verify");
+
+    test_hooks::set_select_body_dropped(true);
+    let mutant = std::panic::catch_unwind(|| {
+        let (mut traces, words) = bad_select_traces(&program, &arenas, &artifacts);
+        let proof = prove_traces(&artifacts, &mut traces, &words, &opts).expect("the mutant proves");
+        verify_against_artifacts(&artifacts, &proof, &words, &opts)
+    });
+    test_hooks::set_select_body_dropped(false);
+    assert!(
+        mutant.expect("the mutant runs"),
+        "without SELECT's body the bad row verifies: the body is load-bearing"
+    );
+}
+
+/// A wrong BALU output inside the merged table (a real row, so it also moves
+/// the memory bus) is refused.
+#[test]
+fn a_wrong_balu_output_in_a_merged_table_is_refused() {
+    let _g = lock();
+    let (program, arenas) = four_chip_program();
+    let opts = options(true);
+    let artifacts = build_artifacts(&program, &opts);
+    let exec = execute(&program, &arenas, &artifacts.hasher).expect("executes");
+    let plan = artifacts.merge.plan();
+    let mut traces = build_traces_with_merge(&program, &exec.records, artifacts.hasher, &plan);
+    let layout = MergedLayout::of(&plan[0]);
+    let col = layout.parts[0].map[super::chips::balu::cols::OUT];
+    let v = *traces.merged[0].get_main(0, col);
+    traces.merged[0].set_main(0, col, v + fe(1));
+    let refused = match prove_traces(&artifacts, &mut traces, &exec.public_words, &opts) {
+        Ok(proof) => !verify_against_artifacts(&artifacts, &proof, &exec.public_words, &opts),
+        Err(_) => true,
+    };
+    assert!(refused);
+}
+
+// ============================== the node's leg =============================
+
+/// ★ A node's leg verifies a MERGED Poseidon1 child in-guest: the leg is
+/// derived from the merged artifacts (no leg-specific code), the honest child
+/// executes, and tampers of the merged table's root, an opened value and an
+/// OOD value are refused. The node over the merged child takes fewer socket
+/// rows than over the plain one (printed for the census).
+#[test]
+fn a_node_verifies_a_merged_child_and_refuses_its_tampers() {
+    let _g = lock();
+    let program = super::programs::trivial_program();
+    let child = |merge: bool| -> P1Child {
+        let mut opts = super::p1_node_tests::options();
+        opts.format.merge_equal_height_tables = merge;
+        let hasher = build_artifacts(&program, &opts).hasher;
+        let artifacts =
+            build_artifacts_under::<<P1Family as ProofFamily>::Stark>(&program, &opts, hasher);
+        let proof = lfm_prove_under::<P1Family>(
+            &program,
+            &artifacts,
+            &super::p1_node_tests::arenas(),
+            &opts,
+        )
+        .expect("prove");
+        assert!(super::proof::verify_against_artifacts_under::<P1Family>(
+            &artifacts,
+            &proof.proof,
+            &proof.public_words,
+            &opts
+        ));
+        P1Child {
+            artifacts,
+            proof,
+            opts,
+        }
+    };
+    let c = child(true);
+    assert!(!c.artifacts.merge.is_empty(), "the trivial program merges");
+    let honest = harvest(&c);
+    let node_program = node(&c, P1Family::STATEMENT_TAG);
+    assert!(runs(&node_program, &honest), "the honest merged child executes");
+
+    let airs = LfmAirs::for_artifacts(&c.artifacts, &c.opts);
+    let t = airs
+        .air_refs()
+        .iter()
+        .position(|a| a.name().starts_with("LFM_MERGED"))
+        .expect("a merged AIR");
+    let refused = |what: &str, edit: &dyn Fn(&mut super::harvest::HarvestedChild)| {
+        let mut bad = harvest(&c);
+        edit(&mut bad);
+        assert!(!runs(&node_program, &bad), "{what}: the node must refuse");
+    };
+    refused("merged main root", &|h| h.tables[t].main_root[31] ^= 1);
+    refused("merged opened value", &|h| {
+        h.legs[t].openings[0][0].0[0][0] += fe(1)
+    });
+    refused("merged OOD value", &|h| h.tables[t].ood_current[0] += FEE::from(1u64));
+
+    let plain = child(false);
+    let plain_node = node(&plain, P1Family::STATEMENT_TAG);
+    let (rows_merged, rows_plain) = (
+        node_program.groups.hash.real_rows,
+        plain_node.groups.hash.real_rows,
+    );
+    println!(
+        "MERGE NODE CENSUS: socket rows for one child: merged {rows_merged} · plain {rows_plain} · AIRs {} vs {}",
+        sub_proofs(&c.proof),
+        sub_proofs(&plain.proof)
+    );
+    assert!(rows_merged < rows_plain, "fewer tables, fewer paths");
+}
+
+// ================================ the knob =================================
+
+#[test]
+fn the_merge_knob_parses_prints_and_refuses_like_its_siblings() {
+    use crate::zf_format::{ENV_LFM_MERGE, ENV_ONE_ROW, ZfFormat};
+    let parse = |pairs: &[(&str, &str)]| {
+        ZfFormat::from_lookup(|name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        })
+    };
+    let default = parse(&[]).expect("default");
+    assert!(!default.lfm_merge);
+    assert!(!default.banner().contains("lfm_merge"), "the default banner is today's");
+    assert!(!default.proof_format().merge_equal_height_tables);
+    let on = parse(&[(ENV_LFM_MERGE, "1")]).expect("on");
+    assert!(on.lfm_merge && on.proof_format().merge_equal_height_tables);
+    assert!(on.banner().ends_with(" lfm_merge=1"));
+    assert!(!parse(&[(ENV_LFM_MERGE, "0")]).expect("off").lfm_merge);
+    assert!(parse(&[(ENV_LFM_MERGE, "2")]).is_err(), "a typo aborts");
+    assert!(
+        parse(&[(ENV_LFM_MERGE, "1"), (ENV_ONE_ROW, "1")]).is_err(),
+        "no merged one-row layout"
+    );
+    assert!(!ZfFormat::LEGACY.lfm_merge && !ZfFormat::DEFAULT.lfm_merge);
+    // The library treats the pair as off on both sides.
+    let (program, _) = four_chip_program();
+    let mut both = options(true);
+    both.format.one_row = OneRowMode::On;
+    assert!(super::registry::merge_plan_for(&program, &both).is_empty());
+    assert_eq!(LfmMerge::none().airs_saved(), 0);
+}

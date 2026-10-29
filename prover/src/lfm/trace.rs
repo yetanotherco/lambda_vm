@@ -18,6 +18,7 @@ use super::hash::{HASH_STATE_FELTS, HasherKind, LfmHasher};
 use super::instr::{HashMode, Instr};
 use super::keccak_adapter::{self, KeccakAdapterOperation};
 use super::layout;
+use super::merge::{MergeChip, MergePlan, MergedLayout, PartShape};
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;
@@ -52,6 +53,162 @@ pub struct LfmTraces {
     pub keccak_rnd: Vec<TraceTable<F, E>>,
     pub keccak_rc: TraceTable<F, E>,
     pub bitwise: TraceTable<F, E>,
+    /// The merged tables (`LAMBDA_VM_ZF_LFM_MERGE`), one per group of
+    /// [`Self::merge_plan`], in its order: the group's chips side by side
+    /// ([`super::merge`]). A merged chip's own field above is then an empty
+    /// table. Both empty by default.
+    pub merged: Vec<TraceTable<F, E>>,
+    /// Which chips each merged table holds.
+    pub merge_plan: MergePlan,
+}
+
+impl LfmTraces {
+    /// This set under `plan`: the chips each group of `plan` names, taken out
+    /// of their own tables and laid side by side, row for row. A copy — the
+    /// production fill writes the merged tables directly
+    /// ([`build_traces_with_merge`]); this is for a set filled under another
+    /// plan than its artifacts' (`proof::prove_traces_under`): a set merged
+    /// under another plan is split back first. Nothing a proof commits to
+    /// depends on which way the set got there.
+    pub fn merge_to(&mut self, plan: &MergePlan) -> Result<(), String> {
+        if self.merge_plan == *plan {
+            return Ok(());
+        }
+        self.split_merged();
+        let mut merged = Vec::with_capacity(plan.len());
+        for chips in plan {
+            let tables: Vec<TraceTable<F, E>> = chips
+                .iter()
+                .map(|&c| {
+                    let width = PartShape::of(c).width;
+                    std::mem::replace(self.chip_mut(c), TraceTable::new_main(Vec::new(), width, 1))
+                })
+                .collect();
+            merged.push(side_by_side(chips, &tables));
+        }
+        self.merged = merged;
+        self.merge_plan = plan.clone();
+        Ok(())
+    }
+
+    /// Every merged table split back into its chips' own tables.
+    fn split_merged(&mut self) {
+        let plan = std::mem::take(&mut self.merge_plan);
+        let merged = std::mem::take(&mut self.merged);
+        for (chips, table) in plan.iter().zip(merged) {
+            let layout = MergedLayout::of(chips);
+            let rows = table.num_rows();
+            let (cells, _) = table.main_data_row_major();
+            for part in &layout.parts {
+                let shape = PartShape::of(part.chip);
+                let mut data = zeroed_fe_vec(rows * shape.width);
+                for (row, out) in data.chunks_mut(shape.width.max(1)).enumerate() {
+                    let src = &cells[row * layout.num_columns..(row + 1) * layout.num_columns];
+                    out[..shape.prep]
+                        .copy_from_slice(&src[part.prep_at..part.prep_at + shape.prep]);
+                    out[shape.prep..].copy_from_slice(
+                        &src[part.main_at..part.main_at + shape.width - shape.prep],
+                    );
+                }
+                *self.chip_mut(part.chip) = TraceTable::new_main(data, shape.width, 1);
+            }
+        }
+    }
+
+    fn chip_mut(&mut self, chip: MergeChip) -> &mut TraceTable<F, E> {
+        match chip {
+            MergeChip::Balu => &mut self.balu,
+            MergeChip::Select => &mut self.select,
+            MergeChip::Lanes => &mut self.lanes,
+            MergeChip::Hint => &mut self.hint,
+        }
+    }
+}
+
+/// The widest merge candidate (`LFM_SELECT`, 25 columns): the scratch row a
+/// merged fill builds one part's row in.
+const MAX_PART_WIDTH: usize = 32;
+
+/// `tables` (the chips of `chips`, in order, at one height) side by side in the
+/// merged layout ([`MergedLayout`]). [`LfmTraces::merge_to`]'s copy.
+fn side_by_side(chips: &[MergeChip], tables: &[TraceTable<F, E>]) -> TraceTable<F, E> {
+    let layout = MergedLayout::of(chips);
+    let rows = tables.first().map_or(0, TraceTable::num_rows);
+    let width = layout.num_columns;
+    let mut data = zeroed_fe_vec(rows * width);
+    let body = |row: usize, out: &mut [FE]| {
+        for (part, table) in layout.parts.iter().zip(tables) {
+            let shape = PartShape::of(part.chip);
+            let (cells, _) = table.main_data_row_major();
+            let cells = &cells[row * shape.width..(row + 1) * shape.width];
+            out[part.prep_at..part.prep_at + shape.prep].copy_from_slice(&cells[..shape.prep]);
+            out[part.main_at..part.main_at + shape.width - shape.prep]
+                .copy_from_slice(&cells[shape.prep..]);
+        }
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        data.par_chunks_mut(width.max(1))
+            .enumerate()
+            .for_each(|(row, out)| body(row, out));
+    }
+    #[cfg(not(feature = "parallel"))]
+    for (row, out) in data.chunks_mut(width.max(1)).enumerate() {
+        body(row, out);
+    }
+    TraceTable::new_main(data, width, 1)
+}
+
+/// A merged table filled directly: each row writes each part's prefix and its
+/// `fill` into a scratch row of the part's width — exactly [`chip_row`]'s row —
+/// then places the two halves where the merged layout puts them. So the merged
+/// trace is, cell for cell, the parts' [`chip_trace`] rows side by side, with no
+/// second copy of them.
+fn merged_trace(
+    walk: Walk,
+    chips: &[MergeChip],
+    groups: &[&ColumnGroup],
+    fills: &[&(dyn Fn(usize, &mut [FE]) + Sync)],
+) -> TraceTable<F, E> {
+    let layout = MergedLayout::of(chips);
+    let rows = groups.first().map_or(0, |g| g.padded_rows);
+    let width = layout.num_columns;
+    let mut data = zeroed_fe_vec(rows * width);
+    let body = |row: usize, out: &mut [FE]| {
+        for ((part, group), fill) in layout.parts.iter().zip(groups).zip(fills) {
+            let shape = PartShape::of(part.chip);
+            debug_assert!(shape.width <= MAX_PART_WIDTH);
+            let mut scratch = [FE::zero(); MAX_PART_WIDTH];
+            let cells = &mut scratch[..shape.width];
+            chip_row(group, fill, row, cells);
+            out[part.prep_at..part.prep_at + shape.prep].copy_from_slice(&cells[..shape.prep]);
+            out[part.main_at..part.main_at + shape.width - shape.prep]
+                .copy_from_slice(&cells[shape.prep..]);
+        }
+    };
+    match walk {
+        Walk::Parallel => {
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                data.par_chunks_mut(width.max(1))
+                    .enumerate()
+                    .for_each(|(row, out)| body(row, out));
+            }
+            #[cfg(not(feature = "parallel"))]
+            for (row, out) in data.chunks_mut(width.max(1)).enumerate() {
+                body(row, out);
+            }
+        }
+        #[cfg(test)]
+        Walk::SerialReference => {
+            for (row, out) in data.chunks_mut(width.max(1)).enumerate() {
+                body(row, out);
+            }
+        }
+    }
+    TraceTable::new_main(data, width, 1)
 }
 
 /// The `LFM_RANGE` fixed table's column group (program-independent).
@@ -130,7 +287,12 @@ pub(super) fn chip_trace(
 /// columns if this is a real row. `row` indexes the whole table; `out` is that
 /// row's `num_columns` cells and nothing else.
 #[inline]
-fn chip_row(group: &ColumnGroup, fill: &impl Fn(usize, &mut [FE]), row: usize, out: &mut [FE]) {
+fn chip_row(
+    group: &ColumnGroup,
+    fill: &(impl Fn(usize, &mut [FE]) + ?Sized),
+    row: usize,
+    out: &mut [FE],
+) {
     out[..group.width].copy_from_slice(&group.data[row * group.width..(row + 1) * group.width]);
     if row < group.real_rows {
         fill(row, out);
@@ -392,6 +554,18 @@ pub fn build_traces_with_hasher(
     build_traces_walked(program, records, hasher, Walk::Parallel)
 }
 
+/// [`build_traces_with_hasher`] with the chips of each group of `plan` filled
+/// straight into one merged table ([`super::merge`]), their own tables left
+/// empty. An empty `plan` is [`build_traces_with_hasher`].
+pub fn build_traces_with_merge(
+    program: &LfmProgram,
+    records: &LfmRecords,
+    hasher: HasherKind,
+    plan: &MergePlan,
+) -> LfmTraces {
+    build_traces_merged(program, records, hasher, Walk::Parallel, plan)
+}
+
 /// [`build_traces_with_hasher`] with the row walk named.
 ///
 /// The walk is a parameter for exactly one reason: so `trace_identity_tests` can
@@ -403,6 +577,17 @@ pub(super) fn build_traces_walked(
     records: &LfmRecords,
     hasher: HasherKind,
     walk: Walk,
+) -> LfmTraces {
+    build_traces_merged(program, records, hasher, walk, &Vec::new())
+}
+
+/// [`build_traces_walked`] under the merge `plan` ([`build_traces_with_merge`]).
+pub(super) fn build_traces_merged(
+    program: &LfmProgram,
+    records: &LfmRecords,
+    hasher: HasherKind,
+    walk: Walk,
+    plan: &MergePlan,
 ) -> LfmTraces {
     let g = &program.groups;
 
@@ -568,15 +753,62 @@ pub(super) fn build_traces_walked(
         trace
     };
 
+    // The four chips a merge may take, as fillers both walks can run: a chip's
+    // own `chip_trace`, or its part of a merged table.
+    let balu_fill = |row: usize, out: &mut [FE]| {
+        let r = &records.balu[row];
+        out[balu::cols::A] = r.a;
+        out[balu::cols::B] = r.b;
+        out[balu::cols::C] = r.c;
+        out[balu::cols::OUT] = r.out;
+    };
+    let select_fill = |row: usize, out: &mut [FE]| {
+        let r = &records.select[row];
+        out[select::cols::BIT] = r.bit;
+        out[select::cols::INL0..select::cols::INL0 + 4].copy_from_slice(&r.in_l);
+        out[select::cols::INR0..select::cols::INR0 + 4].copy_from_slice(&r.in_r);
+        out[select::cols::OUTL0..select::cols::OUTL0 + 4].copy_from_slice(&r.out_l);
+        out[select::cols::OUTR0..select::cols::OUTR0 + 4].copy_from_slice(&r.out_r);
+    };
+    let lanes_fill = |row: usize, out: &mut [FE]| {
+        out[lanes::cols::V0..lanes::cols::V0 + 4].copy_from_slice(&records.lanes[row]);
+    };
+    let hint_fill = |row: usize, out: &mut [FE]| {
+        out[hint::cols::V0..hint::cols::V0 + 4].copy_from_slice(&records.hint[row]);
+    };
+    let fill_of = |chip: MergeChip| -> &(dyn Fn(usize, &mut [FE]) + Sync) {
+        match chip {
+            MergeChip::Balu => &balu_fill,
+            MergeChip::Select => &select_fill,
+            MergeChip::Lanes => &lanes_fill,
+            MergeChip::Hint => &hint_fill,
+        }
+    };
+    let merged: Vec<TraceTable<F, E>> = plan
+        .iter()
+        .map(|chips| {
+            let groups: Vec<&ColumnGroup> = chips
+                .iter()
+                .map(|&c| super::merge::group_of_program(program, c))
+                .collect();
+            let fills: Vec<&(dyn Fn(usize, &mut [FE]) + Sync)> =
+                chips.iter().map(|&c| fill_of(c)).collect();
+            merged_trace(walk, chips, &groups, &fills)
+        })
+        .collect();
+    // A merged chip's own table: empty, its rows are in its merged table.
+    let own = |chip: MergeChip, group: &ColumnGroup| -> TraceTable<F, E> {
+        let width = PartShape::of(chip).width;
+        if super::merge::group_of(plan, chip.slot()).is_some() {
+            TraceTable::new_main(Vec::new(), width, 1)
+        } else {
+            chip_trace(walk, group, width, fill_of(chip))
+        }
+    };
+
     LfmTraces {
         const_: chip_trace(walk, &g.const_, const_::cols::NUM_COLUMNS, |_, _| {}),
-        balu: chip_trace(walk, &g.balu, balu::cols::NUM_COLUMNS, |row, out| {
-            let r = &records.balu[row];
-            out[balu::cols::A] = r.a;
-            out[balu::cols::B] = r.b;
-            out[balu::cols::C] = r.c;
-            out[balu::cols::OUT] = r.out;
-        }),
+        balu: own(MergeChip::Balu, &g.balu),
         xalu: chip_trace(walk, &g.xalu, xalu::cols::NUM_COLUMNS, |row, out| {
             let r = &records.xalu[row];
             out[xalu::cols::A0..xalu::cols::A0 + 3].copy_from_slice(&r.a);
@@ -584,14 +816,7 @@ pub(super) fn build_traces_walked(
             out[xalu::cols::C0..xalu::cols::C0 + 3].copy_from_slice(&r.c);
             out[xalu::cols::OUT0..xalu::cols::OUT0 + 3].copy_from_slice(&r.out);
         }),
-        select: chip_trace(walk, &g.select, select::cols::NUM_COLUMNS, |row, out| {
-            let r = &records.select[row];
-            out[select::cols::BIT] = r.bit;
-            out[select::cols::INL0..select::cols::INL0 + 4].copy_from_slice(&r.in_l);
-            out[select::cols::INR0..select::cols::INR0 + 4].copy_from_slice(&r.in_r);
-            out[select::cols::OUTL0..select::cols::OUTL0 + 4].copy_from_slice(&r.out_l);
-            out[select::cols::OUTR0..select::cols::OUTR0 + 4].copy_from_slice(&r.out_r);
-        }),
+        select: own(MergeChip::Select, &g.select),
         bitdec: chip_trace(walk, &g.bitdec, bitdec::cols::NUM_COLUMNS, |row, out| {
             let r = &records.bitdec[row];
             out[bitdec::cols::BITS0..bitdec::cols::BITS0 + 64].copy_from_slice(&r.bits);
@@ -615,12 +840,8 @@ pub(super) fn build_traces_walked(
             }
         }),
         blake3: blake3_traces,
-        lanes: chip_trace(walk, &g.lanes, lanes::cols::NUM_COLUMNS, |row, out| {
-            out[lanes::cols::V0..lanes::cols::V0 + 4].copy_from_slice(&records.lanes[row]);
-        }),
-        hint: chip_trace(walk, &g.hint, hint::cols::NUM_COLUMNS, |row, out| {
-            out[hint::cols::V0..hint::cols::V0 + 4].copy_from_slice(&records.hint[row]);
-        }),
+        lanes: own(MergeChip::Lanes, &g.lanes),
+        hint: own(MergeChip::Hint, &g.hint),
         public: chip_trace(walk, &g.public, public::cols::NUM_COLUMNS, |row, out| {
             out[public::cols::V0..public::cols::V0 + 4].copy_from_slice(&records.public[row]);
         }),
@@ -633,5 +854,7 @@ pub(super) fn build_traces_walked(
         keccak_rnd: keccak_rnd_traces,
         keccak_rc: keccak_rc_trace,
         bitwise: bitwise_trace,
+        merged,
+        merge_plan: plan.clone(),
     }
 }

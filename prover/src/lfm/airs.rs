@@ -24,6 +24,7 @@ use super::blake3_chip;
 use super::chips::{balu, bitdec, const_, hash, hint, keccak, lanes, public, range, select, xalu};
 use super::hash::HasherKind;
 use super::layout;
+use super::merge::{LfmMerge, MergePlan, MergedConstraints, MergedLayout, SlotRole};
 use super::trace::LfmTraces;
 
 type F = GoldilocksField;
@@ -839,6 +840,13 @@ pub struct LfmAirs {
     /// still be BUILT (construction is free — there is no keygen here) but are
     /// not offered to the prover or the verifier, so a proof never carries them.
     chip_set: ChipSet,
+    /// The merged AIRs (`LAMBDA_VM_ZF_LFM_MERGE`), one per group of
+    /// [`Self::merge_plan`], in its order. Empty by default: one AIR a chip.
+    merged: Vec<LfmAir<MergedConstraints>>,
+    /// Which chips each merged AIR holds. A merged chip's own AIR is still
+    /// built, like an absent family's, and never offered: the merged AIR stands
+    /// at its first chip's place in the frozen order and the rest leave it.
+    merge_plan: MergePlan,
 }
 
 /// Builds an AIR with **no** preprocessed columns — `KECCAK_RND` only.
@@ -1112,6 +1120,58 @@ impl LfmAirs {
                 bitwise::NUM_PRECOMPUTED_COLS,
             ),
             chip_set,
+            merged: Vec::new(),
+            merge_plan: Vec::new(),
+        }
+    }
+
+    /// This set with the merged AIRs `merge` describes: each group's chips
+    /// side by side ([`super::merge`]), against the group's own preprocessed
+    /// root. An empty `merge` leaves the set as it is.
+    ///
+    /// A merged AIR has no one-row root: the format refuses the merge beside
+    /// one-row openings (`ZfFormat::check_lfm_merge`).
+    pub fn with_merge(mut self, merge: &LfmMerge, options: &ProofOptions) -> Self {
+        self.merged = merge
+            .tables
+            .iter()
+            .map(|t| {
+                let layout = MergedLayout::of(&t.chips);
+                let name = super::merge::merged_name(&t.chips);
+                AirWithBuses::new(
+                    layout.num_columns,
+                    AuxiliaryTraceBuildData {
+                        interactions: super::merge::merged_interactions(&layout),
+                    },
+                    options,
+                    1,
+                    MergedConstraints::new(&layout),
+                )
+                .with_name(&name)
+                .with_preprocessed(t.root, layout.num_prep)
+            })
+            .collect();
+        self.merge_plan = merge.plan();
+        self
+    }
+
+    /// The chips each merged AIR holds, in AIR order.
+    pub fn merge_plan(&self) -> &MergePlan {
+        &self.merge_plan
+    }
+
+    /// Where chip slot `slot` stands under this set's merge.
+    fn role(&self, slot: usize) -> SlotRole {
+        super::merge::role(&self.merge_plan, slot)
+    }
+
+    /// Pushes chip `slot`'s AIR in the frozen order: its own, its merged AIR
+    /// (at the merged AIR's first chip), or nothing (a later merged chip).
+    fn push_ref<'a>(&'a self, refs: &mut Vec<DynLfmAir<'a>>, slot: usize, own: DynLfmAir<'a>) {
+        match self.role(slot) {
+            SlotRole::Own => refs.push(own),
+            SlotRole::First(g) => refs.push(&self.merged[g]),
+            SlotRole::Member => {}
         }
     }
 
@@ -1210,7 +1270,7 @@ impl LfmAirs {
         if let Some(one_row) = &artifacts.one_row_roots {
             airs = airs.with_one_row_roots(one_row);
         }
-        airs
+        airs.with_merge(&artifacts.merge, options)
     }
 
     /// Number of `LFM_HASH` instances this set was built with — one unless the
@@ -1221,22 +1281,22 @@ impl LfmAirs {
 
     /// Verify-side projection, frozen order (must match `air_trace_pairs`).
     pub fn air_refs(&self) -> Vec<DynLfmAir<'_>> {
-        let mut refs: Vec<DynLfmAir<'_>> = vec![
-            &self.const_,
-            &self.balu,
-            &self.xalu,
-            &self.select,
-            &self.bitdec,
-            &self.hash,
-        ];
+        let mut refs: Vec<DynLfmAir<'_>> = vec![&self.const_];
+        // A merged chip gives its place to its merged AIR, or leaves the
+        // order; with no merge every chip pushes its own AIR, as always.
+        self.push_ref(&mut refs, 1, &self.balu);
+        refs.push(&self.xalu);
+        self.push_ref(&mut refs, 3, &self.select);
+        refs.push(&self.bitdec);
+        refs.push(&self.hash);
         refs.extend(self.hash_tail.iter().map(|a| a as DynLfmAir<'_>));
         // The frozen order is unchanged; an absent family leaves a hole in it
         // rather than moving anything after it.
         if self.chip_set.keccak {
             refs.push(&self.keccak);
         }
-        refs.push(&self.lanes);
-        refs.push(&self.hint);
+        self.push_ref(&mut refs, 7, &self.lanes);
+        self.push_ref(&mut refs, 8, &self.hint);
         refs.push(&self.public);
         refs.push(&self.range);
         if self.chip_set.blake3 {
@@ -1263,9 +1323,18 @@ impl LfmAirs {
             return None;
         }
         let h = &artifacts.log_heights;
-        let mut out: Vec<u8> = h[..HASH_SLOT].to_vec();
+        // A merged AIR stands at its first chip and shares its chips' height;
+        // its later chips leave the order (`air_refs`).
+        let plan = artifacts.merge.plan();
+        let in_order = |slots: std::ops::Range<usize>| -> Vec<u8> {
+            slots
+                .filter(|&s| super::merge::role(&plan, s) != SlotRole::Member)
+                .map(|s| h[s])
+                .collect()
+        };
+        let mut out: Vec<u8> = in_order(0..HASH_SLOT);
         out.extend(artifacts.hash_chunk_log_heights.iter().copied());
-        out.extend(h[KECCAK_SLOT + 1..BLAKE3_SLOT].iter().copied());
+        out.extend(in_order(KECCAK_SLOT + 1..BLAKE3_SLOT));
         if set.blake3 {
             out.extend(artifacts.blake3_chunk_log_heights.iter().copied());
         }
@@ -1314,14 +1383,38 @@ impl LfmAirs {
         if self.chip_set.bitwise && traces.bitwise.num_rows() == 0 {
             traces.bitwise = crate::tables::bitwise::generate_bitwise_trace();
         }
-        let mut pairs: Vec<(DynLfmAir<'a>, &'a mut TraceTable<F, E>, &'a ())> = vec![
-            (&self.const_, &mut traces.const_, &()),
-            (&self.balu, &mut traces.balu, &()),
-            (&self.xalu, &mut traces.xalu, &()),
-            (&self.select, &mut traces.select, &()),
-            (&self.bitdec, &mut traces.bitdec, &()),
-            (&self.hash, &mut traces.hash, &()),
-        ];
+        // The merged tables, one per merged AIR, in its order: a trace set
+        // filled under another merge is the caller's to refuse
+        // (`proof::prove_traces_under`), so only a debug build checks here.
+        debug_assert_eq!(
+            traces.merge_plan, self.merge_plan,
+            "the traces were filled under another merge than the AIR set's"
+        );
+        let mut merged: Vec<Option<&'a mut TraceTable<F, E>>> =
+            traces.merged.iter_mut().map(Some).collect();
+        let mut pairs: Vec<(DynLfmAir<'a>, &'a mut TraceTable<F, E>, &'a ())> =
+            vec![(&self.const_, &mut traces.const_, &())];
+        // A merged chip gives its place to its merged AIR and table, or leaves
+        // the order — `air_refs`' rule, pair by pair.
+        let mut push = |pairs: &mut Vec<(DynLfmAir<'a>, &'a mut TraceTable<F, E>, &'a ())>,
+                        slot: usize,
+                        air: DynLfmAir<'a>,
+                        trace: &'a mut TraceTable<F, E>| {
+            match self.role(slot) {
+                SlotRole::Own => pairs.push((air, trace, &())),
+                SlotRole::First(g) => {
+                    if let Some(t) = merged.get_mut(g).and_then(Option::take) {
+                        pairs.push((&self.merged[g], t, &()));
+                    }
+                }
+                SlotRole::Member => {}
+            }
+        };
+        push(&mut pairs, 1, &self.balu, &mut traces.balu);
+        pairs.push((&self.xalu, &mut traces.xalu, &()));
+        push(&mut pairs, 3, &self.select, &mut traces.select);
+        pairs.push((&self.bitdec, &mut traces.bitdec, &()));
+        pairs.push((&self.hash, &mut traces.hash, &()));
         assert_eq!(
             self.hash_tail.len(),
             traces.hash_tail.len(),
@@ -1339,8 +1432,8 @@ impl LfmAirs {
         if self.chip_set.keccak {
             pairs.push((&self.keccak, &mut traces.keccak, &()));
         }
-        pairs.push((&self.lanes, &mut traces.lanes, &()));
-        pairs.push((&self.hint, &mut traces.hint, &()));
+        push(&mut pairs, 7, &self.lanes, &mut traces.lanes);
+        push(&mut pairs, 8, &self.hint, &mut traces.hint);
         pairs.push((&self.public, &mut traces.public, &()));
         pairs.push((&self.range, &mut traces.range, &()));
         if self.chip_set.blake3 {

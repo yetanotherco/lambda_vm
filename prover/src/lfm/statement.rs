@@ -37,6 +37,8 @@ const LFM_BLAKE3_CHUNK_TAG: &[u8] = b"LAMBDAVM_LFM_BLAKE3_CHUNKS_V1";
 
 /// Domain tag of the `LFM_HASH` chunk tail in [`lfm_program_id_chunked`].
 const LFM_HASH_CHUNK_TAG: &[u8] = b"LAMBDAVM_LFM_HASH_CHUNKS_V1";
+/// Tags the merged-AIR tail of [`lfm_program_id_merged_under`].
+const LFM_MERGE_TAG: &[u8] = b"LAMBDAVM_LFM_MERGED_TABLES_V1";
 /// `pub(crate)`: the aggregation layer's emitted verifier replays
 /// [`absorb_lfm_statement`] byte for byte and needs the same tag bytes, and the
 /// legacy proof family (`hash_pin::LegacyFamily`) names it as its statement tag.
@@ -171,6 +173,43 @@ pub fn lfm_program_id_chunked_under(
     hash_chunk_roots: &[Commitment],
     hash_chunk_log_heights: &[u8],
 ) -> Commitment {
+    lfm_program_id_merged_under(
+        commitment,
+        roots,
+        log_heights,
+        keccak_rnd_chunks,
+        hasher,
+        chip_set,
+        blake3_chunk_roots,
+        blake3_chunk_log_heights,
+        hash_chunk_roots,
+        hash_chunk_log_heights,
+        &super::merge::LfmMerge::none(),
+    )
+}
+
+/// [`lfm_program_id_chunked_under`] for a program whose equal-height chips are
+/// proved as merged AIRs (`merge`, [`super::merge`]). An empty `merge` absorbs
+/// NOTHING, so every program built without the merge keeps the digest it
+/// always had; a merged one absorbs, after the hash tail, a length-prefixed
+/// tail under its own tag: each merged AIR's chip slots, its root and its
+/// height. The merged chips' own slots above hold the all-zero root (their
+/// columns are committed only inside the merged root), so the tail is what
+/// binds them, and the layout by name.
+#[allow(clippy::too_many_arguments)]
+pub fn lfm_program_id_merged_under(
+    commitment: CommitmentHash,
+    roots: &[Commitment; NUM_LFM_CHIPS],
+    log_heights: &[u8; NUM_LFM_CHIPS],
+    keccak_rnd_chunks: usize,
+    hasher: HasherKind,
+    chip_set: ChipSet,
+    blake3_chunk_roots: &[Commitment],
+    blake3_chunk_log_heights: &[u8],
+    hash_chunk_roots: &[Commitment],
+    hash_chunk_log_heights: &[u8],
+    merge: &super::merge::LfmMerge,
+) -> Commitment {
     let mut h = Keccak256::new();
     h.update(LFM_PROGRAM_TAG);
     h.update(LFM_MACHINE_VERSION.to_le_bytes());
@@ -237,6 +276,20 @@ pub fn lfm_program_id_chunked_under(
         for (root, height) in hash_chunk_roots.iter().zip(hash_chunk_log_heights).skip(1) {
             h.update(root);
             h.update([*height]);
+        }
+    }
+    // The merged AIRs, on the same length-prefixed terms, after the hash tail:
+    // nothing at all for a program without them.
+    if !merge.is_empty() {
+        h.update(LFM_MERGE_TAG);
+        h.update((merge.tables.len() as u64).to_le_bytes());
+        for table in &merge.tables {
+            h.update((table.chips.len() as u64).to_le_bytes());
+            for chip in &table.chips {
+                h.update([chip.slot() as u8]);
+            }
+            h.update(table.root);
+            h.update([table.log_height]);
         }
     }
     h.finalize().into()

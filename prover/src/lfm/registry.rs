@@ -22,7 +22,8 @@ use super::airs::{BLAKE3_SLOT, ChipSet, HASH_SLOT, NUM_LFM_CHIPS, blake3_chunk_r
 use super::commit::commit_group_device_or_host_under;
 use super::compiler::{ColumnGroup, LfmProgram};
 use super::hash::HasherKind;
-use super::statement::lfm_program_id_chunked_under;
+use super::merge::{LfmMerge, MergePlan, MergedTable};
+use super::statement::lfm_program_id_merged_under;
 use super::trace::range_group;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +76,9 @@ pub fn resolve_artifacts(
     kind: LfmProgramKind,
     options: &ProofOptions,
 ) -> Result<LfmArtifacts, LfmRegistryError> {
-    if options.format.one_row == stark::proof::options::OneRowMode::Off {
+    if options.format.one_row == stark::proof::options::OneRowMode::Off
+        && !options.format.merge_equal_height_tables
+    {
         return Ok(resolve(kind, options.blowup_factor)?.artifacts());
     }
     Ok(build_artifacts(&kind.program(), options))
@@ -166,6 +169,8 @@ impl LfmRegistryEntry {
             // The registry is ROW-PAIR ONLY: a one-row
             // format never reads it — `resolve_artifacts` builds at run time.
             one_row_roots: None,
+            // And one AIR a chip: a merging format never reads it either.
+            merge: LfmMerge::none(),
         }
     }
 }
@@ -221,6 +226,12 @@ pub struct LfmArtifacts {
     /// (the one-row roots are a deterministic function of the same columns),
     /// so a program keeps one id across layouts on the LFM side.
     pub one_row_roots: Option<LfmOneRowRoots>,
+    /// The merged AIRs (`LAMBDA_VM_ZF_LFM_MERGE`, [`super::merge`]): which
+    /// chips of equal padded height this program proves as one AIR, and each
+    /// one's preprocessed root. Empty — the default — is one AIR a chip. Built
+    /// from the program's heights under the options' format, folded into
+    /// `program_id`; the prove and verify paths take it from here.
+    pub merge: LfmMerge,
 }
 
 /// The one-row preprocessed roots of an [`LfmArtifacts`] (see its field).
@@ -499,7 +510,35 @@ pub fn build_artifacts_under<S: stark::config::StarkHash>(
     options: &ProofOptions,
     hasher: HasherKind,
 ) -> LfmArtifacts {
+    let plan = merge_plan_for(program, options);
+    let merged = super::merge::merged_groups(program, &plan);
+    build_artifacts_merged_under::<S>(program, options, hasher, &plan, &merged)
+}
+
+/// The merge `options` asks of `program`: its equal-height candidates under
+/// `merge_equal_height_tables` ([`super::merge::plan_for_program`]), none
+/// otherwise. Also none beside one-row openings, which the format refuses by
+/// name (`ZfFormat::check_lfm_merge`): a merged AIR has no one-row root, and a
+/// caller that sets both directly gets one AIR a chip on the prove and the
+/// verify side alike, since both read this.
+pub fn merge_plan_for(program: &LfmProgram, options: &ProofOptions) -> MergePlan {
+    let on = options.format.merge_equal_height_tables
+        && options.format.one_row == stark::proof::options::OneRowMode::Off;
+    super::merge::plan_for_program(program, on)
+}
+
+/// [`build_artifacts_under`] with the merged groups already laid side by side
+/// (`merged[k]` is `plan[k]`'s, [`super::merge::merged_groups`]), so a caller
+/// can build them before it takes the card ([`super::program_census`]).
+pub(crate) fn build_artifacts_merged_under<S: stark::config::StarkHash>(
+    program: &LfmProgram,
+    options: &ProofOptions,
+    hasher: HasherKind,
+    plan: &MergePlan,
+    merged: &[ColumnGroup],
+) -> LfmArtifacts {
     use stark::leaf_layout::LeafLayout::RowPair;
+    debug_assert_eq!(plan.len(), merged.len(), "one merged group per merged AIR");
     let range = range_group();
     // Slots 0..=10 in slot order: the program's own nine groups, then
     // `LFM_RANGE`. Slot 11 (`LFM_BLAKE3`) is not here because it is the CHUNKED
@@ -574,15 +613,50 @@ pub fn build_artifacts_under<S: stark::config::StarkHash>(
     // residency that matters is `stark::device_set`'s and admission enforces it
     // per call. The window still bounds the host path exactly as before, which
     // is the path a machine with no card takes.
+    //
+    // ★ A MERGED chip is not committed on its own: its columns are committed
+    // inside its merged AIR's group, and its slot keeps the all-zero root (the
+    // merged table's root is bound into `program_id` by the merge tail). The
+    // merged groups follow the slots in the same windows, so with no merge the
+    // walk is the eleven slots in slot order, as it always was.
+    enum Job<'a> {
+        Slot(usize, &'a ColumnGroup),
+        Merged(usize, &'a ColumnGroup),
+    }
+    let jobs: Vec<Job<'_>> = groups
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| super::merge::group_of(plan, *i).is_none())
+        .map(|(i, g)| Job::Slot(i, *g))
+        .chain(merged.iter().enumerate().map(|(k, g)| Job::Merged(k, g)))
+        .collect();
     let in_flight = groups_in_flight();
-    for (base, window) in groups.chunks(in_flight).enumerate() {
-        let commits = map_maybe_parallel(window, |g| {
+    let mut merged_roots: Vec<Commitment> = vec![[0u8; 32]; merged.len()];
+    for window in jobs.chunks(in_flight) {
+        let commits = map_maybe_parallel(window, |job| {
+            let g = match job {
+                Job::Slot(_, g) | Job::Merged(_, g) => g,
+            };
             commit_group_device_or_host_under::<S>(PREP_GROUP_LABEL, g, options, RowPair)
         });
-        for (k, root) in commits.into_iter().enumerate() {
-            roots[base * in_flight + k] = root;
+        for (job, root) in window.iter().zip(commits) {
+            match job {
+                Job::Slot(i, _) => roots[*i] = root,
+                Job::Merged(k, _) => merged_roots[*k] = root,
+            }
         }
     }
+    let merge = LfmMerge {
+        tables: plan
+            .iter()
+            .zip(merged_roots)
+            .map(|(chips, root)| MergedTable {
+                chips: chips.clone(),
+                log_height: chips.first().map_or(0, |c| log_heights[c.slot()]),
+                root,
+            })
+            .collect(),
+    };
     // Then `LFM_BLAKE3`, one window of chunks at a time: materialize each
     // chunk's group, expand it, commit it, drop both. Peak residency is the
     // window's chunks — which is still the point of chunking this chip, at a
@@ -634,7 +708,7 @@ pub fn build_artifacts_under<S: stark::config::StarkHash>(
     // and the mask decides what a proof carries, exactly where it always did:
     // `ChipSet::num_airs` and `LfmAirs::air_refs`.
 
-    let program_id = lfm_program_id_chunked_under(
+    let program_id = lfm_program_id_merged_under(
         S::COMMITMENT_HASH,
         &roots,
         &log_heights,
@@ -645,6 +719,7 @@ pub fn build_artifacts_under<S: stark::config::StarkHash>(
         &blake3_chunk_log_heights,
         &hash_chunk_roots,
         &hash_chunk_log_heights,
+        &merge,
     );
     let one_row_roots = (options.format.one_row != stark::proof::options::OneRowMode::Off)
         .then(|| build_one_row_roots::<S>(program, options, &groups, &tail));
@@ -660,6 +735,7 @@ pub fn build_artifacts_under<S: stark::config::StarkHash>(
         chip_set,
         program_id,
         one_row_roots,
+        merge,
     }
 }
 
@@ -724,6 +800,7 @@ pub(crate) fn census_artifacts(program: &LfmProgram, hasher: HasherKind) -> LfmA
         chip_set,
         program_id: [0u8; 32],
         one_row_roots: None,
+        merge: LfmMerge::none(),
     }
 }
 

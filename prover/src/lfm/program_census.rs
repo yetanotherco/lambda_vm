@@ -223,10 +223,18 @@ pub fn build_artifacts_counted_under<S: stark::config::StarkHash>(
     // includes what it waited for the card, and a figure that excluded the wait
     // would make a device-bound level look host-bound.
     let t = Instant::now();
+    // The merged AIRs' preprocessed groups (`LAMBDA_VM_ZF_LFM_MERGE`) are laid
+    // side by side on the host BEFORE the card is taken: a copy of the parts'
+    // groups, which has no business inside the hold. Nothing without a merge.
+    let plan = super::registry::merge_plan_for(program, options);
+    let merged = super::merge::merged_groups(program, &plan);
     let artifacts = {
         let _card = super::device_permit::hold_labeled("build_artifacts");
-        super::registry::build_artifacts_under::<S>(program, options, hasher)
+        super::registry::build_artifacts_merged_under::<S>(
+            program, options, hasher, &plan, &merged,
+        )
     };
+    drop(merged);
     let build_nanos = t.elapsed().as_nanos();
     lock().record(artifacts.program_id, build_nanos);
     artifacts

@@ -49,6 +49,7 @@ pub mod keccak_host;
 pub mod layout;
 pub mod lde;
 pub mod logup;
+pub mod merge;
 pub mod merkle_cap;
 pub mod p1_commit;
 pub mod p1w16_chip;
@@ -197,6 +198,8 @@ mod lean_upload_tests;
 mod logup_tests;
 #[cfg(test)]
 mod machine_tests;
+#[cfg(test)]
+mod merge_tests;
 #[cfg(test)]
 mod node_emit_timing_tests;
 #[cfg(test)]

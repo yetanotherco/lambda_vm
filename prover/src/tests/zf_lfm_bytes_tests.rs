@@ -44,12 +44,14 @@ fn formats() -> [(&'static str, ProofFormat); 4] {
         fri_mode: FriMode::Pair,
         one_row: OneRowMode::Off,
         fri_schedule_override: None,
+        merge_equal_height_tables: false,
     };
     let production = ProofFormat {
         merkle_cap: crypto::merkle_tree::cap::CapPolicy::Auto,
         fri_mode: FriMode::Dp,
         one_row: OneRowMode::Off,
         fri_schedule_override: None,
+        merge_equal_height_tables: false,
     };
     assert_eq!(
         production,

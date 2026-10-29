@@ -136,6 +136,17 @@ pub struct ProofFormat {
     /// schedule that does not cover the table's committed folds exactly is a
     /// proving error and a verification failure, never a silent fallback.
     pub fri_schedule_override: Option<FriScheduleOverride>,
+    /// Whether an AIR-set builder that assembles one proof from several chips
+    /// (the LFM recursion machine, `prover::lfm::airs`) puts the chips of equal
+    /// padded height into one AIR, side by side. `false` = today: one AIR a
+    /// chip.
+    ///
+    /// A LAYOUT choice of the caller's AIR set, carried here so it travels with
+    /// the options every artifact build, prove and verify is handed. This crate
+    /// never reads it: a merged AIR is an ordinary AIR to the STARK prover and
+    /// verifier. Like every format field it is a verifier-side constant, never
+    /// read from a proof.
+    pub merge_equal_height_tables: bool,
 }
 
 impl ProofFormat {
@@ -155,6 +166,7 @@ impl ProofFormat {
         fri_mode: FriMode::Pair,
         one_row: OneRowMode::Off,
         fri_schedule_override: None,
+        merge_equal_height_tables: false,
     };
 
     /// True when this is this crate's default format, [`Self::LEGACY`]
@@ -170,6 +182,7 @@ impl ProofFormat {
             && self.fri_mode == FriMode::Pair
             && self.one_row == OneRowMode::Off
             && self.fri_schedule_override.is_none()
+            && !self.merge_equal_height_tables
     }
 }
 

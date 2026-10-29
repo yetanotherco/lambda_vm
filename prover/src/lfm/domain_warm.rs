@@ -64,6 +64,7 @@ fn lengths(traces: &LfmTraces) -> Vec<usize> {
     ]
     .into_iter()
     .chain(&traces.hash_tail)
+    .chain(&traces.merged)
     .chain(&traces.blake3)
     .chain(&traces.keccak_rnd)
     .map(|t| t.num_rows())

@@ -11,6 +11,7 @@
 //! LAMBDA_VM_ZF_WHIR_GRIND_BITS  20 | 18               WHIR proof-of-work bits; Q buys back what the grind gives up
 //! LAMBDA_VM_ZF_WHIR_BLOWUP  4 | 2                     WHIR base code blowup (rate 1/4 or 1/2); Q follows from the rate
 //! LAMBDA_VM_ZF_WHIR_LEAVES  natural | coset           WHIR round-0 leaf order (coset: Poseidon1 trees only)
+//! LAMBDA_VM_ZF_LFM_MERGE   0 | 1                  LFM chips of equal padded height proved as one AIR
 //! ```
 //!
 //! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration:
@@ -83,10 +84,15 @@ pub const ENV_WHIR_BLOWUP: &str = "LAMBDA_VM_ZF_WHIR_BLOWUP";
 /// the polynomial instead of re-encoding it) or `natural`. A proof format: the
 /// roots, the paths and the in-guest walks follow it. Poseidon1 trees only.
 pub const ENV_WHIR_LEAVES: &str = "LAMBDA_VM_ZF_WHIR_LEAVES";
+/// Whether the recursion's LFM proofs put their equal-height chips into one
+/// AIR (`1`) or keep one AIR a chip (`0`, the default). A proof format of the
+/// recursion alone: the program ids, the artifacts, the in-guest verifiers and
+/// the proofs follow it; no base proof moves. Opt-in, under measurement.
+pub const ENV_LFM_MERGE: &str = "LAMBDA_VM_ZF_LFM_MERGE";
 
 /// Every knob above, in banner order: what a verifier that pins its format
 /// refuses to find in its environment (`verify-block`).
-pub const ENV_KNOBS: [&str; 10] = [
+pub const ENV_KNOBS: [&str; 11] = [
     ENV_CAP,
     ENV_WHIR_CAP,
     ENV_FRI,
@@ -97,6 +103,7 @@ pub const ENV_KNOBS: [&str; 10] = [
     ENV_WHIR_GRIND_BITS,
     ENV_WHIR_BLOWUP,
     ENV_WHIR_LEAVES,
+    ENV_LFM_MERGE,
 ];
 
 /// The uniform WHIR schedule's fold, as production configures it
@@ -222,6 +229,9 @@ pub struct ZfFormat {
     pub whir_blowup: u8,
     /// Where the WHIR round-0 trees put their leaves ([`ENV_WHIR_LEAVES`]).
     pub whir_leaves: LeafOrder,
+    /// Whether the LFM proofs merge their equal-height chips into one AIR
+    /// ([`ENV_LFM_MERGE`]). Off at the default and in the legacy format.
+    pub lfm_merge: bool,
     /// The WHIR block's base hash and its arity-4 cap ([`BaseFormat`]): the
     /// block proof family's ([`crate::hash_pin::BlockFamily`]) at the
     /// default, and the only base the block path admits
@@ -353,6 +363,7 @@ impl ZfFormat {
         whir_blowup: 1 << PRODUCTION_WHIR_LOG_BLOWUP,
         base: crate::hash_pin::BLOCK_BASE,
         whir_leaves: LeafOrder::Coset,
+        lfm_merge: false,
     };
 
     /// The legacy format: every lever off. What all ten knobs at their
@@ -370,6 +381,7 @@ impl ZfFormat {
         whir_blowup: 1 << LEGACY_WHIR_LOG_BLOWUP,
         base: crate::hash_pin::BLOCK_BASE,
         whir_leaves: LeafOrder::Natural,
+        lfm_merge: false,
     };
 
     /// This format with `base` as the WHIR block's base hash. The block path
@@ -393,6 +405,7 @@ impl ZfFormat {
             && self.whir_blowup == 1 << LEGACY_WHIR_LOG_BLOWUP
             && self.whir_leaves == LeafOrder::Natural
             && self.base == crate::hash_pin::BLOCK_BASE
+            && !self.lfm_merge
     }
 
     /// The grind bits the WHIR chains run at: [`WhirGrind`]'s placement with
@@ -458,8 +471,30 @@ impl ZfFormat {
                 }
             };
         }
+        if let Some(v) = get(ENV_LFM_MERGE) {
+            format.lfm_merge = match v.as_str() {
+                "0" => false,
+                "1" => true,
+                _ => return Err(format!("{ENV_LFM_MERGE}={v:?}: expected `0` or `1`")),
+            };
+        }
         format.check_leaves()?;
+        format.check_lfm_merge()?;
         Ok(format)
+    }
+
+    /// Refuses the LFM merge beside one-row openings: a merged AIR is committed
+    /// with row-pair leaves only (its artifacts build no one-row root), so the
+    /// pair is refused by name rather than proved under one of the two.
+    pub fn check_lfm_merge(&self) -> Result<(), String> {
+        if self.lfm_merge && self.one_row != OneRowMode::Off {
+            return Err(format!(
+                "{ENV_LFM_MERGE}=1 with {ENV_ONE_ROW}={}: the merged LFM tables have no one-row \
+                 layout",
+                self.one_row
+            ));
+        }
+        Ok(())
     }
 
     /// Refuses a round-0 leaf order the base's trees do not take: the coset
@@ -553,6 +588,7 @@ impl ZfFormat {
     /// another value (its banner is out), or names a lever this build lacks.
     pub fn install(format: Self) -> Result<&'static Self, String> {
         format.check_implemented()?;
+        format.check_lfm_merge()?;
         let mut installed = false;
         let got = PROCESS_FORMAT.get_or_init(|| {
             installed = true;
@@ -617,6 +653,11 @@ impl ZfFormat {
             // Printed only off the default (the coset order).
             LeafOrder::Coset => "",
             LeafOrder::Natural => " whir_leaves=natural",
+        } + if self.lfm_merge {
+            // Printed only off the default (off).
+            " lfm_merge=1"
+        } else {
+            ""
         }
     }
 
@@ -646,6 +687,7 @@ impl ZfFormat {
             one_row: self.one_row,
             // A test hook only; no knob sets it.
             fri_schedule_override: None,
+            merge_equal_height_tables: self.lfm_merge,
         }
     }
 
@@ -836,6 +878,7 @@ mod tests {
                 whir_blowup: 2,
                 base: crate::hash_pin::BLOCK_BASE,
                 whir_leaves: LeafOrder::Coset,
+                lfm_merge: false,
             }
         );
         assert_eq!(
@@ -1155,6 +1198,7 @@ mod tests {
             whir_blowup: 4,
             base: crate::hash_pin::BLOCK_BASE,
             whir_leaves: LeafOrder::Natural,
+            lfm_merge: false,
         };
         assert_eq!(
             f.banner(),
