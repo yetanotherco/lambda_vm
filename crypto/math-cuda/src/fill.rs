@@ -1004,52 +1004,6 @@ pub fn widen_col_major_timed(
     clock.finish(size_of_val(data) + size_of_val(offsets) + size_of_val(widths))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn runs() -> Vec<DecodeRunC> {
-        vec![
-            DecodeRunC {
-                first_pc: 0x1000,
-                row: 0,
-                len: 3,
-            },
-            DecodeRunC {
-                first_pc: 0x2000,
-                row: 3,
-                len: 1,
-            },
-            DecodeRunC {
-                first_pc: 0x2008,
-                row: 4,
-                len: 2,
-            },
-        ]
-    }
-
-    /// Every pc of the runs finds its row, and the pcs around them none.
-    #[test]
-    fn a_pc_finds_the_row_of_its_run() {
-        let runs = runs();
-        let want = [
-            (0x1000, Some(0)),
-            (0x1004, Some(1)),
-            (0x1008, Some(2)),
-            (0x2000, Some(3)),
-            (0x2008, Some(4)),
-            (0x200c, Some(5)),
-        ];
-        for (pc, row) in want {
-            assert_eq!(DecodeRunC::find(&runs, pc), row, "pc {pc:#x}");
-        }
-        for pc in [0, 0xffc, 0x1002, 0x100c, 0x1ffc, 0x2004, 0x2010, u64::MAX] {
-            assert_eq!(DecodeRunC::find(&runs, pc), None, "pc {pc:#x}");
-        }
-        assert_eq!(DecodeRunC::find(&[], 0x1000), None);
-    }
-}
-
 /// The LFM width-16 Poseidon1 socket's row-major trace (`rows × width` words)
 /// on the card, from `narrow`: each row's preprocessed prefix (`prep_w` words)
 /// and its sixteen input lanes, `rows × (prep_w + 16)` words row-major. The
@@ -1104,4 +1058,50 @@ pub fn lfm_p1w16_socket_rows(
     stream.synchronize()?;
     drop(narrow_dev);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runs() -> Vec<DecodeRunC> {
+        vec![
+            DecodeRunC {
+                first_pc: 0x1000,
+                row: 0,
+                len: 3,
+            },
+            DecodeRunC {
+                first_pc: 0x2000,
+                row: 3,
+                len: 1,
+            },
+            DecodeRunC {
+                first_pc: 0x2008,
+                row: 4,
+                len: 2,
+            },
+        ]
+    }
+
+    /// Every pc of the runs finds its row, and the pcs around them none.
+    #[test]
+    fn a_pc_finds_the_row_of_its_run() {
+        let runs = runs();
+        let want = [
+            (0x1000, Some(0)),
+            (0x1004, Some(1)),
+            (0x1008, Some(2)),
+            (0x2000, Some(3)),
+            (0x2008, Some(4)),
+            (0x200c, Some(5)),
+        ];
+        for (pc, row) in want {
+            assert_eq!(DecodeRunC::find(&runs, pc), row, "pc {pc:#x}");
+        }
+        for pc in [0, 0xffc, 0x1002, 0x100c, 0x1ffc, 0x2004, 0x2010, u64::MAX] {
+            assert_eq!(DecodeRunC::find(&runs, pc), None, "pc {pc:#x}");
+        }
+        assert_eq!(DecodeRunC::find(&[], 0x1000), None);
+    }
 }
