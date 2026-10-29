@@ -59,7 +59,10 @@ fn subcoset_composition_on_the_card_is_byte_identical() {
             after.2 - before.2,
             after.3 - before.3,
         );
-        assert!(after.0 > before.0, "rows 2^{log_rows}: sub-coset path not taken");
+        assert!(
+            after.0 > before.0,
+            "rows 2^{log_rows}: sub-coset path not taken"
+        );
         assert!(
             after.1 > before.1,
             "rows 2^{log_rows}: the device composition kernel did not run"

@@ -406,6 +406,28 @@ fn subcoset_composition_is_byte_identical_to_whole_coset() {
             "rows{rows}/blowup{blowup}: sub-coset proof bytes differ from the whole-coset proof"
         );
     }
+
+    // The multi-table bus proof (CPU/ADD/MUL, LogUp, one transcript) at blowup 4.
+    let o = golden_options(4, 1, 6, ProofFormat::DEFAULT);
+    set_composition_subcoset(Some(false));
+    let off = prove_multi::<Blake3StarkHash>(&o);
+    set_composition_subcoset(Some(true));
+    let before = composition_subcoset_tables();
+    let on = prove_multi::<Blake3StarkHash>(&o);
+    assert!(
+        composition_subcoset_tables() > before,
+        "multi/blowup4: the forced-on prove never took the sub-coset path"
+    );
+    set_composition_subcoset(None);
+    assert!(verify_multi::<Blake3StarkHash>(&o, &off));
+    assert!(verify_multi::<Blake3StarkHash>(&o, &on));
+    let off_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&off).expect("rkyv");
+    let on_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&on).expect("rkyv");
+    assert_eq!(
+        sha3_hex(&on_bytes),
+        sha3_hex(&off_bytes),
+        "multi/blowup4: sub-coset proof bytes differ from the whole-coset proof"
+    );
 }
 
 /// Prints `GOLDENS`. Run only for a deliberate format change.
