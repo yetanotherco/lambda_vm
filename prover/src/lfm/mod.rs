@@ -196,6 +196,8 @@ mod logup_tests;
 #[cfg(test)]
 mod machine_tests;
 #[cfg(test)]
+mod node_emit_timing_tests;
+#[cfg(test)]
 mod one_row_guest_tests;
 #[cfg(test)]
 mod one_row_tests;

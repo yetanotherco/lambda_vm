@@ -519,6 +519,9 @@ impl<P> ProgramSlot<P> {
 pub(crate) struct NodeProgram {
     pub(crate) program: ProgramSlot,
     pub(crate) at: f64,
+    /// Seconds its emission took, after its admission: the builder's walk,
+    /// the compile and the admission validator.
+    pub(crate) emit: f64,
 }
 
 /// A leaf program's bytes before it is emitted, a group of it: 0.157 GiB at
@@ -643,6 +646,8 @@ pub(crate) struct LevelTiming {
 pub(crate) struct ProgramTimes {
     /// Its program emitted (nodes; the leaves' exist before the tree).
     pub(crate) program_at: f64,
+    /// Seconds its emission took after its admission (nodes).
+    pub(crate) program_emit: f64,
     /// Its program (nodes) and artifacts built.
     pub(crate) built_at: f64,
     /// Its worker took it.
@@ -1058,9 +1063,14 @@ pub(crate) fn build_nodes(
             let slot = ProgramSlot::new(program, permit);
             let program = slot.get()?;
             let at = t_tree.elapsed().as_secs_f64();
+            let emit = t.elapsed().as_secs_f64();
             Ok((
-                NodeProgram { program: slot, at },
-                (program, t.elapsed().as_secs_f64()),
+                NodeProgram {
+                    program: slot,
+                    at,
+                    emit,
+                },
+                (program, emit),
             ))
         },
         |_, _, (program, emitted): (std::sync::Arc<Admitted>, f64)| -> Result<TreeNode, String> {
@@ -1502,6 +1512,7 @@ pub(crate) fn prove_tree_pipelined(
                     let prove = t.elapsed().as_secs_f64();
                     let times = ProgramTimes {
                         program_at: 0.0,
+                        program_emit: 0.0,
                         built_at: 0.0,
                         start,
                         end: t_tree.elapsed().as_secs_f64(),
@@ -1567,9 +1578,9 @@ pub(crate) fn prove_tree_pipelined(
                         };
                         drop(program);
                         emitted.program.release();
-                        Ok((filled, t, emitted.at))
+                        Ok((filled, t, (emitted.at, emitted.emit)))
                     },
-                    |(filled, t, program_at), node: &TreeNode| {
+                    |(filled, t, (program_at, program_emit)), node: &TreeNode| {
                         let lfm = filled
                             .prove_under::<BlockFamily>(
                                 &node.artifacts,
@@ -1580,6 +1591,7 @@ pub(crate) fn prove_tree_pipelined(
                         let prove = t.elapsed().as_secs_f64();
                         let times = ProgramTimes {
                             program_at,
+                            program_emit,
                             built_at: node.built_at,
                             start,
                             end: t_tree.elapsed().as_secs_f64(),
@@ -2244,7 +2256,7 @@ pub fn prove_whir_block_tree(
                     };
                     let program = match lv {
                         0 => String::new(),
-                        _ => format!(" program@{:.2}", t.program_at),
+                        _ => format!(" program@{:.2} emit {:.2}", t.program_at, t.program_emit),
                     };
                     format!(
                         "{j}: built@{:.2}{landed} took@{:.2} done@{:.2} ({}){program}",
