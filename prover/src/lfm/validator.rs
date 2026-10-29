@@ -108,6 +108,29 @@ pub fn validate(program: &LfmProgram) -> Result<(), LfmViolation> {
     Ok(())
 }
 
+/// [`validate`]'s checks one by one, each with its seconds — an instrument
+/// (`node_emit_timing_tests`), test-only.
+#[cfg(test)]
+pub(crate) fn validate_split(program: &LfmProgram) -> Vec<(&'static str, f64)> {
+    let mut out = Vec::new();
+    let mut time = |name: &'static str, f: &dyn Fn() -> Result<(), LfmViolation>| {
+        let t = std::time::Instant::now();
+        f().expect("the program is admissible");
+        out.push((name, t.elapsed().as_secs_f64()));
+    };
+    time("writes_and_reads", &|| check_writes_and_reads(program));
+    time("multiplicities (map)", &|| {
+        check_multiplicities_with(program, false)
+    });
+    time("multiplicities (dense)", &|| {
+        check_multiplicities_with(program, true)
+    });
+    time("arenas", &|| check_arenas(program));
+    time("groups", &|| check_groups(program));
+    time("keccak_tags", &|| check_keccak_tags(&program.groups.keccak));
+    out
+}
+
 /// Check 8: `LFM_KECCAK` tags are well-formed and pairwise distinct.
 ///
 /// Padding rows are skipped: their `IS_REAL` is zero, so they emit no bus
@@ -166,16 +189,84 @@ fn check_writes_and_reads(program: &LfmProgram) -> Result<(), LfmViolation> {
     Ok(())
 }
 
-/// Check 4: every write's `mult` equals an independent recount of its reads.
-fn check_multiplicities(program: &LfmProgram) -> Result<(), LfmViolation> {
-    let mut counts: HashMap<Addr, u64> = HashMap::new();
-    for instr in &program.instrs {
-        for r in instr.reads() {
-            *counts.entry(r).or_insert(0) += 1;
+/// `LFM_VALIDATE_DENSE_COUNTS=1` recounts check 4's reads in a table indexed by
+/// address rather than a hash map ([`ReadCounts`]). The same counts, so the
+/// same verdict and the same first violation; only the time differs (the map
+/// was ≈ 0.8 of a 1.2 s node emission, laptop instrument
+/// `node_emit_timing_tests`). Unset, empty or `0`: the map, as before.
+pub const DENSE_COUNTS_ENV: &str = "LFM_VALIDATE_DENSE_COUNTS";
+
+/// Whether [`DENSE_COUNTS_ENV`] is on, read once.
+pub fn dense_counts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_dense_counts(std::env::var(DENSE_COUNTS_ENV).ok().as_deref()))
+}
+
+/// [`DENSE_COUNTS_ENV`]'s value: `1` on; unset, empty or `0` off; anything
+/// else refused.
+pub fn parse_dense_counts(value: Option<&str>) -> bool {
+    match value {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(other) => panic!("{DENSE_COUNTS_ENV} must be `0` or `1`, got `{other}`"),
+    }
+}
+
+/// Check 4's independent recount of every address's reads.
+///
+/// `Dense` holds one count per allocated address. Check 1 runs first and
+/// refuses any read or write outside `0..num_addrs`, so every read it counts is
+/// in range; a read past the table would be a program check 1 already refused,
+/// and a write past it reads zero, as the map's missing entry does.
+enum ReadCounts {
+    Map(HashMap<Addr, u64>),
+    Dense(Vec<u64>),
+}
+
+impl ReadCounts {
+    fn of(program: &LfmProgram, dense: bool) -> Self {
+        if dense {
+            let mut counts = vec![0u64; program.num_addrs as usize];
+            let mut reads = Vec::new();
+            for instr in &program.instrs {
+                reads.clear();
+                instr.reads_into(&mut reads);
+                for Addr(r) in &reads {
+                    if let Some(c) = counts.get_mut(*r as usize) {
+                        *c += 1;
+                    }
+                }
+            }
+            Self::Dense(counts)
+        } else {
+            let mut counts: HashMap<Addr, u64> = HashMap::new();
+            for instr in &program.instrs {
+                for r in instr.reads() {
+                    *counts.entry(r).or_insert(0) += 1;
+                }
+            }
+            Self::Map(counts)
         }
     }
+
+    fn get(&self, addr: Addr) -> u64 {
+        match self {
+            Self::Map(m) => m.get(&addr).copied().unwrap_or(0),
+            Self::Dense(v) => v.get(addr.0 as usize).copied().unwrap_or(0),
+        }
+    }
+}
+
+/// Check 4: every write's `mult` equals an independent recount of its reads.
+fn check_multiplicities(program: &LfmProgram) -> Result<(), LfmViolation> {
+    check_multiplicities_with(program, dense_counts())
+}
+
+/// [`check_multiplicities`] with the recount's form named.
+fn check_multiplicities_with(program: &LfmProgram, dense: bool) -> Result<(), LfmViolation> {
+    let counts = ReadCounts::of(program, dense);
     let check = |addr: Addr, found: u64| -> Result<(), LfmViolation> {
-        let expected = counts.get(&addr).copied().unwrap_or(0);
+        let expected = counts.get(addr);
         if expected != found {
             return Err(LfmViolation::MultMismatch {
                 addr: addr.0,
@@ -614,4 +705,121 @@ fn partition_counts(instrs: &[Instr]) -> PartitionCounts {
         }
     }
     c
+}
+
+/// [`validate`] with check 4's recount named rather than read from
+/// [`DENSE_COUNTS_ENV`], test-only.
+#[cfg(test)]
+fn validate_with(program: &LfmProgram, dense: bool) -> Result<(), LfmViolation> {
+    check_writes_and_reads(program)?;
+    check_multiplicities_with(program, dense)?;
+    check_arenas(program)?;
+    check_groups(program)?;
+    check_keccak_tags(&program.groups.keccak)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod dense_count_tests {
+    use super::*;
+    use crate::hash_pin::{BlockFamily, ProofFamily};
+
+    /// A block node over two trivial children: every instruction kind a node
+    /// emits (width-16 hashes, unpacks, selects, bit-decs), at a laptop's size.
+    fn small_node() -> LfmProgram {
+        let opts = crate::lfm::proof::aggregation_wrap_options();
+        let child = crate::lfm::programs::trivial_program();
+        let artifacts =
+            crate::lfm::registry::census_artifacts(&child, <BlockFamily as ProofFamily>::SOCKET);
+        let layout = crate::lfm::block_node::BlockLayout::child(1, 2);
+        let derived = crate::lfm::per_table_aggregator::DerivedChild::from_artifacts_under::<
+            BlockFamily,
+        >(&artifacts, &opts, layout.total())
+        .expect("the child derives");
+        let shapes = [derived.shape(), derived.shape()];
+        let mut b = crate::lfm::builder::LfmBuilder::new()
+            .with_wrap_hash(<BlockFamily as ProofFamily>::WRAP);
+        crate::lfm::block_node::emit_block_node(
+            &mut b,
+            &crate::lfm::block_node::BlockNodeInputs {
+                children: &shapes,
+                layout,
+                top: false,
+            },
+        );
+        crate::lfm::compiler::compile(b.finish())
+    }
+
+    fn programs() -> Vec<LfmProgram> {
+        vec![crate::lfm::programs::trivial_program(), small_node()]
+    }
+
+    /// Both recounts hold the same count at every address of a valid program,
+    /// and both admit it.
+    #[test]
+    fn dense_and_map_recounts_agree() {
+        for program in programs() {
+            let map = ReadCounts::of(&program, false);
+            let dense = ReadCounts::of(&program, true);
+            for a in 0..program.num_addrs + 2 {
+                assert_eq!(map.get(Addr(a)), dense.get(Addr(a)), "address {a}");
+            }
+            assert_eq!(validate_with(&program, false), Ok(()));
+            assert_eq!(validate_with(&program, true), Ok(()));
+        }
+    }
+
+    /// The dense recount refuses what the map refuses, with the same first
+    /// violation: a write's count raised, a count lowered, and a read moved to
+    /// another cell (one count up, one down).
+    #[test]
+    fn dense_and_map_refuse_alike() {
+        let mut tampered: Vec<LfmProgram> = Vec::new();
+        let mut raised = small_node();
+        for i in &mut raised.instrs {
+            if let Instr::Const { mult, .. } = i {
+                *mult += 1;
+                break;
+            }
+        }
+        tampered.push(raised);
+        let mut lowered = small_node();
+        for i in lowered.instrs.iter_mut().rev() {
+            if let Instr::Hash16(h) = i
+                && h.mults[0] > 0
+            {
+                h.mults[0] -= 1;
+                break;
+            }
+        }
+        tampered.push(lowered);
+        let mut moved = small_node();
+        let last = moved.instrs.len() - 1;
+        for i in moved.instrs[..last].iter_mut().rev() {
+            if let Instr::BaseAlu { a, b, .. } = i
+                && a != b
+            {
+                *a = *b;
+                break;
+            }
+        }
+        tampered.push(moved);
+        for (k, bad) in tampered.iter().enumerate() {
+            let map = validate_with(bad, false);
+            assert!(
+                matches!(map, Err(LfmViolation::MultMismatch { .. })),
+                "tamper {k}: {map:?}"
+            );
+            assert_eq!(validate_with(bad, true), map, "tamper {k}");
+        }
+    }
+
+    #[test]
+    fn the_dense_counts_knob_reads_one_and_zero() {
+        assert!(!parse_dense_counts(None));
+        assert!(!parse_dense_counts(Some("")));
+        assert!(!parse_dense_counts(Some("0")));
+        assert!(parse_dense_counts(Some("1")));
+        assert!(std::panic::catch_unwind(|| parse_dense_counts(Some("yes"))).is_err());
+    }
 }
