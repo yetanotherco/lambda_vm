@@ -2419,6 +2419,24 @@ pub trait IsStarkVerifier<
         #[cfg(any(test, feature = "test-utils"))]
         crate::fri::capture::record_challenges(&challenges.zetas, &challenges.iotas);
 
+        // A bound proof's answers are checked by their quotients at `z0`; at a
+        // point where DEEP already has a quotient (`z·gʳ`, `z^P`) a false
+        // answer could cancel, so such a draw is refused.
+        if let Some(ood) = &challenges.commit_ood {
+            let z0 = crate::commit_ood::z0_for_point_check(&ood.point, &challenges.z);
+            if crate::commit_ood::meets_deep_point(
+                z0,
+                &challenges.z,
+                &domain.trace_primitive_root,
+                layout.num_eval_points(),
+                proof.composition_poly_parts_ood_evaluation().len(),
+            ) {
+                #[cfg(not(feature = "test_fiat_shamir"))]
+                error!("The commitment-time point meets a DEEP point");
+                return false;
+            }
+        }
+
         // verify grinding
         let grinding_factor = air.context().proof_options.grinding_factor;
         if grinding_factor > 0 {

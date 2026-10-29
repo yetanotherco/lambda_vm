@@ -164,6 +164,7 @@ fn a_false_answer_on_the_cards_path_is_refused() {
         Faults {
             false_answer: Some((0, 2)),
             without_deep_term: false,
+            z0_meets_z: false,
         },
     );
     assert!(!verifies(&proof, &answers));

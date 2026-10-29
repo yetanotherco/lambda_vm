@@ -314,6 +314,16 @@ pub fn emit_deep_invariants_bound(
             let stride = gamma_stride[0];
             let answers_sum = horner(b, stride, answers);
             let one = b.ext_const(&FEE::one());
+            // `z0` must avoid every point DEEP already has a quotient at (each
+            // `g^r·z` and `z^P`), as the host verifier checks: the product of
+            // the differences, inverted against one, is unprovable when any
+            // difference is zero.
+            let mut gap = b.esub(z_pow, point);
+            for &row_point in &row_points {
+                let d = b.esub(row_point, point);
+                gap = b.emul(gap, d);
+            }
+            let _ = b.ediv(one, gap);
             let gamma_pow_first = match cols.first {
                 0 => one,
                 first => pow_const(b, stride, first),

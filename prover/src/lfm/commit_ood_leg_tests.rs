@@ -250,6 +250,7 @@ fn a_false_answer_carried_into_deep_is_refused_on_both_sides() {
                 Faults {
                     false_answer: Some(at),
                     without_deep_term: false,
+                    z0_meets_z: false,
                 },
             ),
         );
@@ -274,6 +275,7 @@ fn the_answers_quotients_are_what_refuse_a_false_answer() {
     let fault = Faults {
         false_answer: Some((0, 0)),
         without_deep_term: true,
+        z0_meets_z: false,
     };
     let false_child = with_proof(&c, prove_with(&c, fault));
     assert!(
@@ -294,4 +296,73 @@ fn the_answers_quotients_are_what_refuse_a_false_answer() {
         runs(&without_term, &child),
         "a leg without the quotients accepts it"
     );
+}
+
+/// The leg refuses a `z0` at a DEEP point: over a small bound shape, the
+/// invariants execute at an unrelated `z0` and fail at `z`, `g·z` and `z^P`.
+#[test]
+fn the_leg_refuses_a_z0_at_a_deep_point() {
+    use math::field::traits::IsFFTField;
+
+    use super::deep::{CommitOodCols, DeepShape, emit_deep_invariants_bound};
+    use crate::tables::types::{FE, GoldilocksField};
+
+    let shape = DeepShape {
+        step_size: 1,
+        num_eval_points: 2,
+        num_total_cols: 3,
+        next_row_cols: vec![0],
+        num_composition_parts: 2,
+        log2_trace_length: 3,
+        commit_ood: Some(CommitOodCols { first: 1, count: 2 }),
+    };
+    let ext = |v: u64| FEE::from(v);
+    let zeta = FEE::new([FE::from(5u64), FE::from(7u64), FE::from(2u64)]);
+    let run = |z0: FEE| {
+        // γ, ζ, the 2×3 OOD grid, the two parts, z0, the two answers.
+        let values = [
+            ext(3),
+            zeta.clone(),
+            ext(1),
+            ext(2),
+            ext(4),
+            ext(6),
+            ext(8),
+            ext(9),
+            ext(10),
+            ext(13),
+            z0,
+            ext(11),
+            ext(12),
+        ];
+        let words: Vec<_> = values.iter().map(ext_word).collect();
+        let mut b = LfmBuilder::new();
+        let arena = b.declare_arena(words.len() as u32);
+        let cells: Vec<_> = (0..words.len() as u32)
+            .map(|i| b.hint_word(arena, i).as_ext())
+            .collect();
+        let ood = vec![cells[2..5].to_vec(), cells[5..8].to_vec()];
+        let _ = emit_deep_invariants_bound(
+            &mut b,
+            &shape,
+            cells[0],
+            cells[1],
+            &ood,
+            &cells[8..10],
+            Some((cells[10], &cells[11..13])),
+        );
+        execute(&compile(b.finish()), &[words], &HasherKind::Poseidon1W16)
+    };
+    let g = GoldilocksField::get_primitive_root_of_unity(3).expect("a root of order 8");
+    assert!(run(zeta.clone() + ext(1)).is_ok(), "an unrelated z0 executes");
+    for (what, z0) in [
+        ("z", zeta.clone()),
+        ("g·z", &g * &zeta),
+        ("z^P", zeta.pow(2usize)),
+    ] {
+        assert!(
+            matches!(run(z0), Err(LfmExecError::DivByZero { .. })),
+            "z0 = {what} must not execute"
+        );
+    }
 }

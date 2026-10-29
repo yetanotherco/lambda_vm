@@ -133,6 +133,33 @@ pub fn answer_coefficient<E: IsField>(current_row: &FieldElement<E>) -> FieldEle
     FieldElement::<E>::zero() - current_row
 }
 
+/// Whether `z0` is a point a table's DEEP polynomial already has a quotient
+/// at: `z·gʳ` for each of the `rows` rows of its OOD grid (`g` the trace
+/// domain's generator), or `z^parts`, where its composition parts open. At
+/// such a point a false answer's quotient could cancel against that one
+/// (at `z0 = z` the column's two-point quotient degenerates), so a verifier
+/// refuses the proof instead.
+pub fn meets_deep_point<F, E>(
+    z0: &FieldElement<E>,
+    z: &FieldElement<E>,
+    g: &FieldElement<F>,
+    rows: usize,
+    parts: usize,
+) -> bool
+where
+    F: IsField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    let mut row_point = z.clone();
+    for _ in 0..rows {
+        if &row_point == z0 {
+            return true;
+        }
+        row_point = g * &row_point;
+    }
+    &z.pow(parts) == z0
+}
+
 /// `t_c(point)` for each column `c` in `columns` of a row-major trace
 /// (`width` columns) over the trace domain `⟨ω⟩` of `rows` rows, by the
 /// barycentric formula `t(z) = (zⁿ − 1)/n · Σ_k t_k·ωᵏ/(z − ωᵏ)`.
@@ -202,10 +229,19 @@ pub mod faults {
         /// Prover and verifier leave the `z0` quotients out of DEEP: the
         /// answers are still sent and absorbed, but nothing checks them.
         pub without_deep_term: bool,
+        /// The verifier's check that `z0` avoids every DEEP point sees `z`
+        /// in place of `z0`, as if the two draws had met.
+        pub z0_meets_z: bool,
     }
 
     thread_local! {
-        static FAULTS: Cell<Faults> = const { Cell::new(Faults { false_answer: None, without_deep_term: false }) };
+        static FAULTS: Cell<Faults> = const {
+            Cell::new(Faults {
+                false_answer: None,
+                without_deep_term: false,
+                z0_meets_z: false,
+            })
+        };
     }
 
     /// The faults set on this thread.
@@ -221,6 +257,20 @@ pub mod faults {
         FAULTS.with(|f| f.set(previous));
         out
     }
+}
+
+/// The `z0` the verifier's DEEP-point check sees: `z0` itself, outside a
+/// test fault.
+pub(crate) fn z0_for_point_check<'a, E: IsField>(
+    z0: &'a FieldElement<E>,
+    z: &'a FieldElement<E>,
+) -> &'a FieldElement<E> {
+    #[cfg(any(test, feature = "test-utils"))]
+    if faults::current().z0_meets_z {
+        return z;
+    }
+    let _ = z;
+    z0
 }
 
 /// Whether DEEP folds the `z0` quotients: always, outside a test fault.

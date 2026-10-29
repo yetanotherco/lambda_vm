@@ -260,6 +260,7 @@ fn a_false_answer_its_deep_carries_is_refused() {
         let fault = Faults {
             false_answer: Some((table, index)),
             without_deep_term: false,
+            z0_meets_z: false,
         };
         let (proof, answers) = prove_bound(fault);
         assert!(
@@ -277,6 +278,7 @@ fn the_deep_quotients_are_what_refuse_a_false_answer() {
     let fault = Faults {
         false_answer: Some((1, 2)),
         without_deep_term: true,
+        z0_meets_z: false,
     };
     let (proof, answers) = prove_bound(fault);
     assert!(
@@ -296,4 +298,39 @@ fn no_fault_is_set_by_default() {
     assert_eq!(faults::current(), Faults::default());
     let (proof, answers) = prove_bound(Faults::default());
     assert!(verify_bound(&proof, &answers, Faults::default()));
+}
+
+/// `z0` meets `z·gʳ` for each OOD row and `z^P`, and no other point.
+#[test]
+fn the_point_check_finds_every_deep_point() {
+    use math::field::traits::IsFFTField;
+    let g = F::get_primitive_root_of_unity(3).expect("a root of order 8");
+    let z = EE::new([
+        FieldElement::from(7u64),
+        FieldElement::from(11u64),
+        FieldElement::from(13u64),
+    ]);
+    let meets = |z0: &EE| crate::commit_ood::meets_deep_point(z0, &z, &g, 2, 3);
+    assert!(meets(&z), "z");
+    assert!(meets(&(&g * &z)), "g·z");
+    assert!(meets(&z.pow(3usize)), "z^P");
+    assert!(!meets(&(&g * &(&g * &z))), "g²·z is no DEEP point at two rows");
+    assert!(!meets(&z.pow(2usize)), "z² is no DEEP point at three parts");
+    assert!(!meets(&(&z + EE::one())), "an unrelated point");
+}
+
+/// A `z0` that meets a DEEP point is refused: the same honest proof passes,
+/// and fails once the verifier's point check sees `z` in place of `z0`.
+#[test]
+fn a_z0_that_meets_a_deep_point_is_refused() {
+    let (proof, answers) = prove_bound(Faults::default());
+    assert!(verify_bound(&proof, &answers, Faults::default()));
+    let fault = Faults {
+        z0_meets_z: true,
+        ..Faults::default()
+    };
+    assert!(
+        !verify_bound(&proof, &answers, fault),
+        "z0 = z must be refused"
+    );
 }
