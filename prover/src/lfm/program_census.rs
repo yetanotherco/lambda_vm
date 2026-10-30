@@ -230,9 +230,7 @@ pub fn build_artifacts_counted_under<S: stark::config::StarkHash>(
     let merged = super::merge::merged_groups(program, &plan);
     let artifacts = {
         let _card = super::device_permit::hold_labeled("build_artifacts");
-        super::registry::build_artifacts_merged_under::<S>(
-            program, options, hasher, &plan, &merged,
-        )
+        super::registry::build_artifacts_merged_under::<S>(program, options, hasher, &plan, &merged)
     };
     drop(merged);
     let build_nanos = t.elapsed().as_nanos();

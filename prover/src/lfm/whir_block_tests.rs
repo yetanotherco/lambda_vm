@@ -3157,6 +3157,59 @@ fn the_whir_block_tree_on_a_real_block() {
             padded.join(" ")
         );
     }
+    // Off the clock: every tree proof's AIRs in proof order, their heights and
+    // the merged ones (`LAMBDA_VM_ZF_LFM_MERGE`), its bytes; then what one node
+    // spends verifying ONE child of each kind (the first leaf, and the last
+    // proof below the top when it is another node): the rows of a one-child
+    // node emitted over that child's shape, the socket first.
+    {
+        use super::airs::LfmAirs;
+        use super::whir_chain::ChipRows;
+        for (k, (artifacts, lfm)) in proofs.iter().enumerate() {
+            let airs = LfmAirs::for_artifacts(artifacts, &wrap);
+            let heights = LfmAirs::log_heights_in_air_order(artifacts).unwrap_or_default();
+            let tables: Vec<String> = airs
+                .air_refs()
+                .iter()
+                .zip(heights.iter().map(Some).chain(std::iter::repeat(None)))
+                .map(|(air, h)| match h {
+                    Some(h) => format!("{}=2^{h}", air.name()),
+                    None => air.name().to_string(),
+                })
+                .collect();
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&lfm.proof)
+                .map(|b| b.len())
+                .unwrap_or(0);
+            println!(
+                "W3 AIRS {k}: {} sub-proofs · {bytes} bytes · merged {:?} · {}",
+                tables.len(),
+                artifacts.merge.plan(),
+                tables.join(" ")
+            );
+        }
+        let words = plan.child_layout().total();
+        let mut kinds = vec![(0usize, "leaf")];
+        let children = plan.levels().last().map_or(1, |level| level.arities[0]);
+        if proofs.len() > plan.partition().num_leaves() + 1 {
+            kinds.push((proofs.len() - 1 - children, "node"));
+        }
+        // A census line, never a gate: an emission that fails says so and the
+        // run goes on to its verdicts.
+        for (k, kind) in kinds {
+            let one = super::whir_block::derived_of(&proofs[k].0, &wrap, words)
+                .and_then(|derived| plan.node_program(&[&derived], false));
+            match one {
+                Ok(one) => {
+                    let rows = ChipRows::of(&one);
+                    println!(
+                        "W3 CHILD COST {kind} (tree proof {k}): socket {} rows for one child · {rows:?}",
+                        rows.hash
+                    );
+                }
+                Err(e) => println!("W3 CHILD COST {kind} (tree proof {k}): not emitted: {e}"),
+            }
+        }
+    }
     let t = std::time::Instant::now();
     // The production verifier when the run is at its pinned presets, given the
     // run's group opening (`LAMBDA_VM_WHIR_GROUP`) as the CLI's `verify-block

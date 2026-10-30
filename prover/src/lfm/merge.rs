@@ -128,8 +128,7 @@ pub type MergePlan = Vec<Vec<MergeChip>>;
 
 /// Which merged AIR, if any, chip slot `slot` belongs to under `plan`.
 pub fn group_of(plan: &[Vec<MergeChip>], slot: usize) -> Option<usize> {
-    plan.iter()
-        .position(|g| g.iter().any(|c| c.slot() == slot))
+    plan.iter().position(|g| g.iter().any(|c| c.slot() == slot))
 }
 
 /// What a chip slot is in the AIR order under `plan`: its own AIR, the first
@@ -592,8 +591,10 @@ pub fn merged_group(groups: &[&ColumnGroup]) -> ColumnGroup {
 pub fn merged_groups(program: &LfmProgram, plan: &[Vec<MergeChip>]) -> Vec<ColumnGroup> {
     plan.iter()
         .map(|chips| {
-            let groups: Vec<&ColumnGroup> =
-                chips.iter().map(|&c| group_of_program(program, c)).collect();
+            let groups: Vec<&ColumnGroup> = chips
+                .iter()
+                .map(|&c| group_of_program(program, c))
+                .collect();
             merged_group(&groups)
         })
         .collect()

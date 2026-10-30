@@ -140,8 +140,14 @@ fn the_plan_merges_equal_heights_only() {
 fn the_layout_puts_every_prefix_first_and_maps_each_column_once() {
     let layout = MergedLayout::of(&MERGE_CANDIDATES);
     let shapes: Vec<PartShape> = MERGE_CANDIDATES.iter().map(|&c| PartShape::of(c)).collect();
-    assert_eq!(layout.num_prep, shapes.iter().map(|s| s.prep).sum::<usize>());
-    assert_eq!(layout.num_columns, shapes.iter().map(|s| s.width).sum::<usize>());
+    assert_eq!(
+        layout.num_prep,
+        shapes.iter().map(|s| s.prep).sum::<usize>()
+    );
+    assert_eq!(
+        layout.num_columns,
+        shapes.iter().map(|s| s.width).sum::<usize>()
+    );
     // The census of the note: 32 preprocessed, 61 in all.
     assert_eq!((layout.num_prep, layout.num_columns), (32, 61));
     let mut hit = vec![0usize; layout.num_columns];
@@ -150,12 +156,24 @@ fn the_layout_puts_every_prefix_first_and_maps_each_column_once() {
         for (c, &m) in part.map.iter().enumerate() {
             hit[m] += 1;
             // A prefix column stays in the merged prefix; a value column after it.
-            assert_eq!(c < shape.prep, m < layout.num_prep, "{:?} column {c}", part.chip);
+            assert_eq!(
+                c < shape.prep,
+                m < layout.num_prep,
+                "{:?} column {c}",
+                part.chip
+            );
         }
         // Each region keeps the part's order and is contiguous.
-        assert!(part.map.windows(2).all(|w| w[1] > w[0] || w[1] < layout.num_prep));
+        assert!(
+            part.map
+                .windows(2)
+                .all(|w| w[1] > w[0] || w[1] < layout.num_prep)
+        );
     }
-    assert!(hit.iter().all(|&n| n == 1), "every merged column is one part's");
+    assert!(
+        hit.iter().all(|&n| n == 1),
+        "every merged column is one part's"
+    );
 }
 
 // ============================ the constraint body ==========================
@@ -223,7 +241,10 @@ fn a_part_body_reads_only_its_main_columns() {
         }
         assert_eq!(*r.others.borrow(), 0, "{chip:?} reads no aux leaf");
         assert!(
-            r.mains.borrow().iter().all(|&(o, c)| o == 0 && c < shape.width),
+            r.mains
+                .borrow()
+                .iter()
+                .all(|&(o, c)| o == 0 && c < shape.width),
             "{chip:?} reads its own columns at the current row"
         );
         assert_eq!(r.emitted.len(), shape.num_base_constraints());
@@ -245,7 +266,12 @@ fn a_part_body_reads_only_its_main_columns() {
     let balu = &layout.parts[0];
     let mut own = Recorder::default();
     super::chips::balu::BaluConstraints.eval(&mut own);
-    let want: Vec<(usize, usize)> = own.mains.borrow().iter().map(|&(o, c)| (o, balu.map[c])).collect();
+    let want: Vec<(usize, usize)> = own
+        .mains
+        .borrow()
+        .iter()
+        .map(|&(o, c)| (o, balu.map[c]))
+        .collect();
     assert_eq!(r.mains.borrow()[..want.len()], want[..]);
 }
 
@@ -264,7 +290,11 @@ fn every_merge_remaps_its_buses() {
             assert_eq!(m.bus_id, original.bus_id);
             assert_eq!(m.is_sender, original.is_sender);
             assert_eq!(m.num_bus_elements(), original.num_bus_elements());
-            let mut want: Vec<usize> = original.columns_read().iter().map(|&c| part.map[c]).collect();
+            let mut want: Vec<usize> = original
+                .columns_read()
+                .iter()
+                .map(|&c| part.map[c])
+                .collect();
             want.sort_unstable();
             assert_eq!(m.columns_read(), want, "{:?}", part.chip);
             for v in &original.values {
@@ -302,7 +332,11 @@ fn the_merged_fill_is_the_parts_side_by_side() {
     let hasher = build_artifacts(&program, &options(false)).hasher;
     let exec = execute(&program, &arenas, &hasher).expect("executes");
     let plan = plan_for_program(&program, true);
-    assert_eq!(plan, vec![MERGE_CANDIDATES.to_vec()], "the four share the floor");
+    assert_eq!(
+        plan,
+        vec![MERGE_CANDIDATES.to_vec()],
+        "the four share the floor"
+    );
 
     let plain = build_traces_with_hasher(&program, &exec.records, hasher);
     let same = build_traces_with_merge(&program, &exec.records, hasher, &Vec::new());
@@ -354,19 +388,35 @@ fn a_merged_program_proves_and_verifies_under_its_own_artifacts_only() {
     let plain = build_artifacts(&program, &off);
     assert!(plain.merge.is_empty(), "off: no merge");
     assert_eq!(merged.merge.plan(), vec![MERGE_CANDIDATES.to_vec()]);
-    assert_ne!(merged.program_id, plain.program_id, "the layout is identity");
+    assert_ne!(
+        merged.program_id, plain.program_id,
+        "the layout is identity"
+    );
     for c in MERGE_CANDIDATES {
-        assert_eq!(merged.roots[c.slot()], [0u8; 32], "{c:?}: no root of its own");
+        assert_eq!(
+            merged.roots[c.slot()],
+            [0u8; 32],
+            "{c:?}: no root of its own"
+        );
         assert_ne!(plain.roots[c.slot()], [0u8; 32]);
     }
     let p_merged = lfm_prove(&program, &merged, &arenas, &on).expect("merged proves");
     let p_plain = lfm_prove(&program, &plain, &arenas, &off).expect("plain proves");
     assert_eq!(sub_proofs(&p_merged) + 3, sub_proofs(&p_plain));
     assert_eq!(p_merged.public_words, p_plain.public_words);
-    assert!(verifies(&merged, &p_merged, &on), "the merged proof verifies");
+    assert!(
+        verifies(&merged, &p_merged, &on),
+        "the merged proof verifies"
+    );
     assert!(verifies(&plain, &p_plain, &off), "the plain proof verifies");
-    assert!(!verifies(&plain, &p_merged, &off), "a merged proof under plain artifacts");
-    assert!(!verifies(&merged, &p_plain, &on), "a plain proof under merged artifacts");
+    assert!(
+        !verifies(&plain, &p_merged, &off),
+        "a merged proof under plain artifacts"
+    );
+    assert!(
+        !verifies(&merged, &p_plain, &on),
+        "a plain proof under merged artifacts"
+    );
     // A hand-made merge the plan cannot produce is refused before anything is
     // built: a chip in two merged AIRs.
     let mut twice = merged.clone();
@@ -384,7 +434,11 @@ fn the_merged_air_stands_at_its_first_chip() {
     let opts = options(true);
     let artifacts = build_artifacts(&program, &opts);
     let airs = LfmAirs::for_artifacts(&artifacts, &opts);
-    let names: Vec<String> = airs.air_refs().iter().map(|a| a.name().to_string()).collect();
+    let names: Vec<String> = airs
+        .air_refs()
+        .iter()
+        .map(|a| a.name().to_string())
+        .collect();
     assert_eq!(names[1], "LFM_MERGED[BALU+SELECT+LANES+HINT]", "{names:?}");
     for gone in ["LFM_BALU", "LFM_SELECT", "LFM_LANES", "LFM_HINT"] {
         assert!(!names.iter().any(|n| n == gone), "{gone} left: {names:?}");
@@ -399,7 +453,11 @@ fn the_merged_air_stands_at_its_first_chip() {
 /// The traces with SELECT's padding row 2 given a non-boolean bit: no bus
 /// token moves (the row's multiplicities are zero), only SELECT's booleanity
 /// fails.
-fn bad_select_traces(program: &LfmProgram, arenas: &[Vec<LfmWord>], artifacts: &LfmArtifacts) -> (LfmTraces, Vec<(u32, LfmWord)>) {
+fn bad_select_traces(
+    program: &LfmProgram,
+    arenas: &[Vec<LfmWord>],
+    artifacts: &LfmArtifacts,
+) -> (LfmTraces, Vec<(u32, LfmWord)>) {
     let exec = execute(program, arenas, &artifacts.hasher).expect("executes");
     let plan = artifacts.merge.plan();
     let mut traces = build_traces_with_merge(program, &exec.records, artifacts.hasher, &plan);
@@ -436,7 +494,8 @@ fn a_bad_select_row_in_a_merged_table_is_refused_by_selects_own_body() {
     test_hooks::set_select_body_dropped(true);
     let mutant = std::panic::catch_unwind(|| {
         let (mut traces, words) = bad_select_traces(&program, &arenas, &artifacts);
-        let proof = prove_traces(&artifacts, &mut traces, &words, &opts).expect("the mutant proves");
+        let proof =
+            prove_traces(&artifacts, &mut traces, &words, &opts).expect("the mutant proves");
         verify_against_artifacts(&artifacts, &proof, &words, &opts)
     });
     test_hooks::set_select_body_dropped(false);
@@ -508,7 +567,10 @@ fn a_node_verifies_a_merged_child_and_refuses_its_tampers() {
     assert!(!c.artifacts.merge.is_empty(), "the trivial program merges");
     let honest = harvest(&c);
     let node_program = node(&c, P1Family::STATEMENT_TAG);
-    assert!(runs(&node_program, &honest), "the honest merged child executes");
+    assert!(
+        runs(&node_program, &honest),
+        "the honest merged child executes"
+    );
 
     let airs = LfmAirs::for_artifacts(&c.artifacts, &c.opts);
     let t = airs
@@ -525,7 +587,9 @@ fn a_node_verifies_a_merged_child_and_refuses_its_tampers() {
     refused("merged opened value", &|h| {
         h.legs[t].openings[0][0].0[0][0] += fe(1)
     });
-    refused("merged OOD value", &|h| h.tables[t].ood_current[0] += FEE::from(1u64));
+    refused("merged OOD value", &|h| {
+        h.tables[t].ood_current[0] += FEE::from(1u64)
+    });
 
     let plain = child(false);
     let plain_node = node(&plain, P1Family::STATEMENT_TAG);
@@ -556,7 +620,10 @@ fn the_merge_knob_parses_prints_and_refuses_like_its_siblings() {
     };
     let default = parse(&[]).expect("default");
     assert!(!default.lfm_merge);
-    assert!(!default.banner().contains("lfm_merge"), "the default banner is today's");
+    assert!(
+        !default.banner().contains("lfm_merge"),
+        "the default banner is today's"
+    );
     assert!(!default.proof_format().merge_equal_height_tables);
     let on = parse(&[(ENV_LFM_MERGE, "1")]).expect("on");
     assert!(on.lfm_merge && on.proof_format().merge_equal_height_tables);
@@ -567,11 +634,125 @@ fn the_merge_knob_parses_prints_and_refuses_like_its_siblings() {
         parse(&[(ENV_LFM_MERGE, "1"), (ENV_ONE_ROW, "1")]).is_err(),
         "no merged one-row layout"
     );
-    assert!(!ZfFormat::LEGACY.lfm_merge && !ZfFormat::DEFAULT.lfm_merge);
+    const { assert!(!ZfFormat::LEGACY.lfm_merge && !ZfFormat::DEFAULT.lfm_merge) };
     // The library treats the pair as off on both sides.
     let (program, _) = four_chip_program();
     let mut both = options(true);
     both.format.one_row = OneRowMode::On;
     assert!(super::registry::merge_plan_for(&program, &both).is_empty());
     assert_eq!(LfmMerge::none().airs_saved(), 0);
+}
+
+// ================================ the census ===============================
+
+/// One tree program's AIRs under its artifacts: count, and main + aux cells
+/// (an aux column is three base cells) over every AIR.
+fn airs_and_cells(artifacts: &LfmArtifacts, wrap: &ProofOptions) -> (usize, u64) {
+    let airs = LfmAirs::for_artifacts(artifacts, wrap);
+    let heights = LfmAirs::log_heights_in_air_order(artifacts).expect("no keccak");
+    let refs = airs.air_refs();
+    let cells = refs
+        .iter()
+        .zip(&heights)
+        .map(|(air, h)| {
+            let aux = air.context().trace_columns - air.trace_layout().0;
+            (1u64 << h) * (air.trace_layout().0 + 3 * aux) as u64
+        })
+        .sum();
+    (refs.len(), cells)
+}
+
+/// ★ The merge census (instrument, `--ignored --exact`): the median mix's
+/// plan (the production format, the Poseidon1 base) under today's default
+/// leaf scale, every leaf emitted once, heights only; per arm (plain, merged):
+/// each leaf's AIRs and cells, then the top emitted over the leaves' shapes —
+/// its socket rows, its chips' rows and its own AIRs — and the socket rows one
+/// node spends on one leaf. No commit, no proof.
+///
+/// `CENSUS_ELF` names a real guest (default: the asm test guest).
+#[test]
+#[ignore = "instrument: run alone with --exact"]
+fn merge_census() {
+    use super::whir_block::WhirBlockPlan;
+    use super::whir_chain::ChipRows;
+    use crate::block_whir::BlockFormat;
+    let elf_bytes = match std::env::var("CENSUS_ELF") {
+        Ok(path) => std::fs::read(path).expect("read CENSUS_ELF"),
+        Err(_) => crate::test_utils::asm_elf_bytes("poc_rodata_commit"),
+    };
+    let opts = super::proof::block_base_options();
+    let production = BlockFormat::production();
+    let format = BlockFormat {
+        zf: production
+            .zf
+            .with_base(stark::proof::options::BaseFormat::P1_WHIR),
+        ..production
+    };
+    let owned = super::whir_p1_census_tests::median_statement(&elf_bytes, &opts, &format);
+    let plan = WhirBlockPlan::derive(&elf_bytes, &opts, &format, owned.view(), None)
+        .expect("the plan derives");
+    let words = plan.child_layout().total();
+    println!(
+        "MERGE CENSUS plan: {} groups · {} leaves · levels {:?}",
+        plan.num_groups(),
+        plan.partition().num_leaves(),
+        plan.levels()
+            .iter()
+            .map(|l| l.arities.clone())
+            .collect::<Vec<_>>()
+    );
+    for on in [false, true] {
+        let label = if on { "merged" } else { "plain" };
+        let mut wrap = super::proof::aggregation_wrap_options();
+        wrap.format.merge_equal_height_tables = on;
+        let mut kids = Vec::new();
+        for k in 0..plan.partition().num_leaves() {
+            let program = plan.leaf_program(k).expect("the leaf emits");
+            let a = super::registry::census_artifacts_merged(
+                &program,
+                program.hasher(<P1Family as ProofFamily>::SOCKET),
+                on,
+            );
+            let (n, cells) = airs_and_cells(&a, &wrap);
+            println!(
+                "MERGE CENSUS {label} leaf {k}: {n} AIRs · {:.1} M main+aux cells · merged {:?}",
+                cells as f64 / 1e6,
+                a.merge.plan()
+            );
+            kids.push(super::whir_block::derived_of(&a, &wrap, words).expect("derives"));
+        }
+        let one = plan
+            .node_program(&[&kids[0]], false)
+            .expect("one-child node");
+        let one_rows = ChipRows::of(&one);
+        println!(
+            "MERGE CENSUS {label} one-child node over leaf 0: socket {} · {one_rows:?}",
+            one_rows.hash
+        );
+        drop(one);
+        // The first node above the leaves (the top when the tree has one
+        // level): its rows, and its own AIRs under the arm.
+        let level = plan.levels();
+        let top_arity = level.first().map_or(1, |l| l.arities[0]);
+        {
+            let is_top = level.len() == 1;
+            let refs: Vec<_> = kids.iter().take(top_arity).collect();
+            let top = plan.node_program(&refs, is_top).expect("the node emits");
+            let rows = ChipRows::of(&top);
+            let a = super::registry::census_artifacts_merged(
+                &top,
+                top.hasher(<P1Family as ProofFamily>::SOCKET),
+                on,
+            );
+            let (n, cells) = airs_and_cells(&a, &wrap);
+            println!(
+                "MERGE CENSUS {label} {} over {top_arity}: socket {} · {rows:?} · {n} AIRs · {:.1} M cells · merged {:?} · heights {:?}",
+                if is_top { "top" } else { "first node" },
+                rows.hash,
+                cells as f64 / 1e6,
+                a.merge.plan(),
+                a.log_heights
+            );
+        }
+    }
 }

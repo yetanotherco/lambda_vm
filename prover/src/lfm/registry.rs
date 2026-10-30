@@ -627,7 +627,7 @@ pub(crate) fn build_artifacts_merged_under<S: stark::config::StarkHash>(
         .iter()
         .enumerate()
         .filter(|(i, _)| super::merge::group_of(plan, *i).is_none())
-        .map(|(i, g)| Job::Slot(i, *g))
+        .map(|(i, g)| Job::Slot(i, g))
         .chain(merged.iter().enumerate().map(|(k, g)| Job::Merged(k, g)))
         .collect();
     let in_flight = groups_in_flight();
@@ -802,6 +802,30 @@ pub(crate) fn census_artifacts(program: &LfmProgram, hasher: HasherKind) -> LfmA
         one_row_roots: None,
         merge: LfmMerge::none(),
     }
+}
+
+/// [`census_artifacts`] under the merge `on` asks of `program`, every merged
+/// root zero: the shape a node over a merged program derives (test-only, the
+/// merge census's).
+#[cfg(test)]
+pub(crate) fn census_artifacts_merged(
+    program: &LfmProgram,
+    hasher: HasherKind,
+    on: bool,
+) -> LfmArtifacts {
+    let mut artifacts = census_artifacts(program, hasher);
+    let plan = super::merge::plan_for_program(program, on);
+    artifacts.merge = LfmMerge {
+        tables: plan
+            .into_iter()
+            .map(|chips| MergedTable {
+                log_height: chips.first().map_or(0, |c| artifacts.log_heights[c.slot()]),
+                chips,
+                root: [0u8; 32],
+            })
+            .collect(),
+    };
+    artifacts
 }
 
 /// The one-row roots of every committed group (host pass: the device commit

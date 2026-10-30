@@ -125,6 +125,10 @@ impl LfmTraces {
     }
 }
 
+/// One chip's row filler, as both walks run it: a chip's own table or its part
+/// of a merged one.
+type RowFill<'a> = &'a (dyn Fn(usize, &mut [FE]) + Sync);
+
 /// The widest merge candidate (`LFM_SELECT`, 25 columns): the scratch row a
 /// merged fill builds one part's row in.
 const MAX_PART_WIDTH: usize = 32;
@@ -169,7 +173,7 @@ fn merged_trace(
     walk: Walk,
     chips: &[MergeChip],
     groups: &[&ColumnGroup],
-    fills: &[&(dyn Fn(usize, &mut [FE]) + Sync)],
+    fills: &[RowFill<'_>],
 ) -> TraceTable<F, E> {
     let layout = MergedLayout::of(chips);
     let rows = groups.first().map_or(0, |g| g.padded_rows);
@@ -776,7 +780,7 @@ pub(super) fn build_traces_merged(
     let hint_fill = |row: usize, out: &mut [FE]| {
         out[hint::cols::V0..hint::cols::V0 + 4].copy_from_slice(&records.hint[row]);
     };
-    let fill_of = |chip: MergeChip| -> &(dyn Fn(usize, &mut [FE]) + Sync) {
+    let fill_of = |chip: MergeChip| -> RowFill<'_> {
         match chip {
             MergeChip::Balu => &balu_fill,
             MergeChip::Select => &select_fill,
@@ -791,8 +795,7 @@ pub(super) fn build_traces_merged(
                 .iter()
                 .map(|&c| super::merge::group_of_program(program, c))
                 .collect();
-            let fills: Vec<&(dyn Fn(usize, &mut [FE]) + Sync)> =
-                chips.iter().map(|&c| fill_of(c)).collect();
+            let fills: Vec<RowFill<'_>> = chips.iter().map(|&c| fill_of(c)).collect();
             merged_trace(walk, chips, &groups, &fills)
         })
         .collect();
