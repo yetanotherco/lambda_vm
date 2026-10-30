@@ -32,6 +32,8 @@ Negative numbers (represented as 2s complement 64-bit numbers), are used for our
 / 93: `exit` (@halt)
 / -1: `SHA256` (@sha256)
 / -2: `KECCAK` (@keccak)
+/ -5: `KECCAK256` (@keccak) — Keccak-256 of a buffer in guest memory, proven by
+  the `KECCAK` chip's sponge mode.
 / -3: `BLAKE3_6R` (@blake3) — the *6-round internal variant* of the BLAKE3
   compression function, not standard BLAKE3; see the named assumption on its
   page.
