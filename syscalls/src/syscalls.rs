@@ -29,6 +29,11 @@ pub enum SyscallNumbers {
 #[cfg(target_arch = "riscv64")]
 const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 
+/// Syscall number for Keccak-256 of a buffer (u64::MAX - 4). Must match
+/// `executor::...::execution::KECCAK256_SYSCALL_NUMBER`.
+#[cfg(target_arch = "riscv64")]
+const KECCAK256_SYSCALL_NUMBER: usize = usize::MAX - 4;
+
 /// Syscall number for the BLAKE3 6-round compression accelerator (u64::MAX - 2).
 #[cfg(target_arch = "riscv64")]
 const BLAKE3_SYSCALL_NUMBER: usize = usize::MAX - 2;
@@ -198,6 +203,44 @@ pub fn keccak_permute(state: &mut [u64; 25]) {
 #[cfg(not(target_arch = "riscv64"))]
 /// Apply the Keccak-f[1600] permutation to a 25-element u64 state in-place.
 pub fn keccak_permute(_state: &mut [u64; 25]) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+/// Whether [`keccak256`] accepts these addresses — a sufficient form of the
+/// executor's `keccak256_addresses_ok`, cheap enough to run before every call:
+/// every input block's 136-byte window, and the 32-byte output, stay below one
+/// `2^32` boundary of the low address word. (`136·(⌊len/136⌋ + 1) ≤ len + 136`,
+/// so this refuses at most a few calls the VM would take; a caller falls back to
+/// the sponge over [`keccak_permute`] for those.)
+#[inline(always)]
+pub fn keccak256_fits(input: &[u8], out: &[u8; 32]) -> bool {
+    const TOP: u64 = 1 << 32;
+    let ptr_lo = (input.as_ptr() as u64) & (TOP - 1);
+    let out_lo = (out.as_ptr() as u64) & (TOP - 1);
+    // `len < 2^32` first, so the sum below cannot overflow.
+    (input.len() as u64) < TOP && ptr_lo + input.len() as u64 + 136 <= TOP && out_lo + 32 <= TOP
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Keccak-256 of `input` into `out`, in one VM call (the KECCAK table's sponge
+/// mode). The caller checks [`keccak256_fits`] first: the VM refuses operands
+/// whose blocks cross a `2^32` address-word boundary.
+pub fn keccak256(input: &[u8], out: &mut [u8; 32]) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") input.as_ptr(),
+            in("a1") input.len(),
+            in("a2") out.as_mut_ptr(),
+            in("a7") KECCAK256_SYSCALL_NUMBER,
+            options(nostack),
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Keccak-256 of `input` into `out`, in one VM call.
+pub fn keccak256(_input: &[u8], _out: &mut [u8; 32]) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

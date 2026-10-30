@@ -4,8 +4,8 @@
 //! The ethrex guest hashes the same 20-byte addresses (account trie keys), 32-byte
 //! storage slots (storage trie keys) and 64-byte mapping slots (the `KECCAK256`
 //! opcode) many times in a block, and the empty input too. Each repeat costs a
-//! `keccak_permute` call (a KECCAK row and 24 KECCAK_RND rows in the proof) and its
-//! sponge. At the median block the cache saves 6,852 of the guest's 96,384
+//! `keccak256` call (a KECCAK row and 24 KECCAK_RND rows in the proof per
+//! permutation). At the median block the cache saves 6,852 of the guest's 96,384
 //! permutations.
 //!
 //! One direct-mapped table per length. A lookup compares the whole input with the

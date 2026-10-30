@@ -6,8 +6,9 @@
 //! accelerator changes don't require an ethrex PR.
 //!
 //! Accelerated today:
-//! - `keccak256`: a sponge over the `keccak_permute` precompile (riscv64; on
-//!   host it falls back to software keccak for tests), with a bounded cache of
+//! - `keccak256`: one `keccak256` VM call per hash (riscv64; the sponge over the
+//!   `keccak_permute` precompile for the rare buffer the call refuses; on host
+//!   software keccak for tests), with a bounded cache of
 //!   repeated 20-, 32- and 64-byte inputs and the empty input (`keccak_cache`).
 //! - `secp256k1_ecrecover`: the ECDSA recovery's 2-term linear combination is
 //!   evaluated through the ECSM `ecsm_mul` precompile (riscv64), reconstructing
@@ -57,7 +58,7 @@ impl Crypto for LambdaVmEcsmCrypto {
     }
 
     fn keccak256(&self, input: &[u8]) -> [u8; 32] {
-        // riscv64 guest: sponge over the keccak_permute precompile, behind a bounded
+        // riscv64 guest: the keccak256 VM call (`keccak256_via_lambdavm`), behind a bounded
         // cache of the short inputs the guest hashes repeatedly (`keccak_cache`).
         #[cfg(target_arch = "riscv64")]
         return KECCAK_CACHE.keccak256(input, keccak256_via_lambdavm);
@@ -726,10 +727,19 @@ fn keccak256_with_permute<F: FnMut(&mut [u64; 25])>(input: &[u8], mut permute: F
     output
 }
 
-/// Keccak-256 via LambdaVM's `keccak_permute` syscall (riscv64 guest only).
+/// Keccak-256 via LambdaVM (riscv64 guest only): one `keccak256` call that
+/// absorbs, pads, permutes and squeezes in the VM, or — when the buffer or the
+/// output would cross a 2^32 address-word boundary, which the call refuses — the
+/// sponge above over the `keccak_permute` syscall.
 #[cfg(target_arch = "riscv64")]
 fn keccak256_via_lambdavm(input: &[u8]) -> [u8; 32] {
-    keccak256_with_permute(input, |s| lambda_vm_syscalls::syscalls::keccak_permute(s))
+    use lambda_vm_syscalls::syscalls;
+    let mut out = [0u8; 32];
+    if syscalls::keccak256_fits(input, &out) {
+        syscalls::keccak256(input, &mut out);
+        return out;
+    }
+    keccak256_with_permute(input, |s| syscalls::keccak_permute(s))
 }
 
 /// XOR one rate-sized block of bytes into the state lanes (little-endian).
