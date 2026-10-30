@@ -979,11 +979,20 @@ impl Instruction {
                         // The fixed-size scratch avoids a heap allocation on every
                         // hot-path ecall while preserving snapshot semantics.
                         let mut bytes = [0u8; DMA_MEMCPY_MAX_BYTES as usize];
-                        for (i, byte) in bytes[..n as usize].iter_mut().enumerate() {
-                            *byte = memory.load_byte(src + i as u64);
-                        }
-                        for (i, &byte) in bytes[..n as usize].iter().enumerate() {
-                            memory.store_byte(dst + i as u64, byte);
+                        let bytes = &mut bytes[..n as usize];
+                        if memory.paths().dma_bulk {
+                            // The whole source, then the whole destination: the
+                            // bytes and the words marked written are the byte
+                            // loop's below.
+                            memory.read_range(src, bytes);
+                            memory.write_range(dst, bytes);
+                        } else {
+                            for (i, byte) in bytes.iter_mut().enumerate() {
+                                *byte = memory.load_byte(src + i as u64);
+                            }
+                            for (i, &byte) in bytes.iter().enumerate() {
+                                memory.store_byte(dst + i as u64, byte);
+                            }
                         }
                         src2_val = copy_trace_rows(src, dst, n, false);
                         dst_val = n;
@@ -1015,9 +1024,26 @@ impl Instruction {
                             return Err(ExecutionError::DmaMemsetBadGap { src, dst });
                         }
 
-                        for i in 0..n {
-                            let byte = memory.load_byte(src + i);
-                            memory.store_byte(dst + i, byte);
+                        if memory.paths().dma_bulk {
+                            // With `dst = src + 8` the forward byte walk below
+                            // reads, at step `i >= 8`, the byte it wrote at step
+                            // `i - 8`: the destination is the first
+                            // `min(n, 8)` source bytes repeated. Those are read
+                            // before any write, then the range is written once.
+                            let mut seed = [0u8; DMA_MEMSET_GAP as usize];
+                            let seed_len = n.min(DMA_MEMSET_GAP) as usize;
+                            memory.read_range(src, &mut seed[..seed_len]);
+                            let mut bytes = [0u8; DMA_MEMCPY_MAX_BYTES as usize];
+                            let bytes = &mut bytes[..n as usize];
+                            for (i, byte) in bytes.iter_mut().enumerate() {
+                                *byte = seed[i % DMA_MEMSET_GAP as usize];
+                            }
+                            memory.write_range(dst, bytes);
+                        } else {
+                            for i in 0..n {
+                                let byte = memory.load_byte(src + i);
+                                memory.store_byte(dst + i, byte);
+                            }
                         }
                         src2_val = copy_trace_rows(src, dst, n, false);
                         dst_val = n;

@@ -72,11 +72,62 @@ pub struct Memory {
     /// onto the Commit bus by `index`), so this buffer is purely the
     /// executor's view used by `read_return_value` and CLI display.
     public_output: Vec<u8>,
+    /// Which of the executor's access paths this memory takes.
+    paths: ExecPaths,
 }
 
 impl Default for Memory {
     fn default() -> Self {
         Self::with_store(StoreKind::from_env())
+    }
+}
+
+/// The executor's access paths, each its own knob. Every setting reads and
+/// writes the same bytes and marks the same written words; only the work per
+/// access differs, so the executor's logs are the same under every setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecPaths {
+    /// A load or store of 1, 2, 4 or 8 bytes that stays inside one page reads
+    /// or writes the page directly, as a fixed-width copy after one page
+    /// lookup (`LAMBDA_VM_EXEC_FIXED_ACCESS`, on unless `0`). Off, every
+    /// access goes through the general byte-range loop.
+    pub fixed_access: bool,
+    /// The DMA memcpy and memset ecalls read and write their range in one
+    /// call each (`LAMBDA_VM_EXEC_DMA_BULK`, on unless `0`). Off, they move it
+    /// a byte at a time.
+    pub dma_bulk: bool,
+}
+
+impl ExecPaths {
+    /// Every access through the general path: the executor before the knobs.
+    pub const GENERAL: Self = Self {
+        fixed_access: false,
+        dma_bulk: false,
+    };
+    /// Every fast path on: the default.
+    pub const FAST: Self = Self {
+        fixed_access: true,
+        dma_bulk: true,
+    };
+
+    /// The two knobs, read once: each is on unless set to `0`.
+    pub fn from_env() -> Self {
+        static PATHS: std::sync::OnceLock<ExecPaths> = std::sync::OnceLock::new();
+        *PATHS.get_or_init(|| {
+            Self::from_values(
+                std::env::var("LAMBDA_VM_EXEC_FIXED_ACCESS").ok().as_deref(),
+                std::env::var("LAMBDA_VM_EXEC_DMA_BULK").ok().as_deref(),
+            )
+        })
+    }
+
+    /// [`ExecPaths::from_env`] of the knobs' values.
+    pub fn from_values(fixed_access: Option<&str>, dma_bulk: Option<&str>) -> Self {
+        let on = |value: Option<&str>| value.map(str::trim) != Some("0");
+        Self {
+            fixed_access: on(fixed_access),
+            dma_bulk: on(dma_bulk),
+        }
     }
 }
 
@@ -339,15 +390,82 @@ impl Store {
 }
 
 impl Memory {
-    /// An empty memory over the given store.
+    /// An empty memory over the given store, on the paths the knobs set
+    /// ([`ExecPaths::from_env`]).
     pub fn with_store(kind: StoreKind) -> Self {
+        Self::with_store_and_paths(kind, ExecPaths::from_env())
+    }
+
+    /// An empty memory over the given store, on the given paths.
+    pub fn with_store_and_paths(kind: StoreKind, paths: ExecPaths) -> Self {
         Self {
             store: match kind {
                 StoreKind::Pages => Store::Pages(Pages::default()),
                 StoreKind::Words => Store::Words(U64HashMap::default()),
             },
             public_output: Vec::new(),
+            paths,
         }
+    }
+
+    /// The access paths this memory takes.
+    pub fn paths(&self) -> ExecPaths {
+        self.paths
+    }
+
+    /// `N` bytes at `address..`; the range must not wrap. With
+    /// [`ExecPaths::fixed_access`] and the pages store, an access inside one
+    /// page is one lookup and a fixed-width copy; any other access takes the
+    /// general loop, which reads the same bytes.
+    #[inline(always)]
+    fn read_n<const N: usize>(&self, address: u64) -> [u8; N] {
+        if self.paths.fixed_access
+            && let Store::Pages(pages) = &self.store
+        {
+            let offset = (address & PAGE_MASK) as usize;
+            if offset + N <= PAGE_SIZE {
+                return match pages.page(address >> PAGE_BITS) {
+                    Some(page) => {
+                        let mut out = [0u8; N];
+                        out.copy_from_slice(&page.bytes[offset..offset + N]);
+                        out
+                    }
+                    None => [0; N],
+                };
+            }
+        }
+        let mut out = [0u8; N];
+        self.store.read(address, &mut out);
+        out
+    }
+
+    /// `data` at `address..`; the range must not wrap. The fixed-width
+    /// counterpart of [`Memory::read_n`]: the same bytes written and the same
+    /// words marked written as the general loop.
+    #[inline(always)]
+    fn write_n<const N: usize>(&mut self, address: u64, data: [u8; N]) {
+        if self.paths.fixed_access
+            && let Store::Pages(pages) = &mut self.store
+        {
+            let offset = (address & PAGE_MASK) as usize;
+            if offset + N <= PAGE_SIZE {
+                pages.page_mut(address >> PAGE_BITS).write(offset, &data);
+                return;
+            }
+        }
+        self.store.write(address, &data);
+    }
+
+    /// The bytes at `address..` into `out`, in one pass over the pages they
+    /// span; the range must not wrap.
+    pub(crate) fn read_range(&self, address: u64, out: &mut [u8]) {
+        self.store.read(address, out);
+    }
+
+    /// `data` at `address..`, in one pass over the pages it spans; the range
+    /// must not wrap.
+    pub(crate) fn write_range(&mut self, address: u64, data: &[u8]) {
+        self.store.write(address, data);
     }
 
     /// The bytes the memory takes on the heap: its pages (or the word map's
@@ -372,13 +490,11 @@ impl Memory {
     }
 
     pub fn load_byte(&self, address: u64) -> u8 {
-        let mut byte = [0u8; 1];
-        self.store.read(address, &mut byte);
-        byte[0]
+        self.read_n::<1>(address)[0]
     }
 
     pub fn store_byte(&mut self, address: u64, value: u8) {
-        self.store.write(address, &[value]);
+        self.write_n::<1>(address, [value]);
     }
 
     /// Iterate over all stored bytes as `(address, value)` pairs. Bytes are
@@ -401,16 +517,14 @@ impl Memory {
         if !address.is_multiple_of(4) {
             address.checked_add(3).ok_or(MemoryError::AddressOverflow)?;
         }
-        let mut bytes = [0u8; 4];
-        self.store.read(address, &mut bytes);
-        Ok(u32::from_le_bytes(bytes))
+        Ok(u32::from_le_bytes(self.read_n::<4>(address)))
     }
 
     pub fn store_word(&mut self, address: u64, value: u32) -> Result<(), MemoryError> {
         if !address.is_multiple_of(4) {
             address.checked_add(3).ok_or(MemoryError::AddressOverflow)?;
         }
-        self.store.write(address, &value.to_le_bytes());
+        self.write_n::<4>(address, value.to_le_bytes());
         Ok(())
     }
 
@@ -420,9 +534,7 @@ impl Memory {
         if !address.is_multiple_of(8) {
             address.checked_add(7).ok_or(MemoryError::AddressOverflow)?;
         }
-        let mut bytes = [0u8; 8];
-        self.store.read(address, &mut bytes);
-        Ok(u64::from_le_bytes(bytes))
+        Ok(u64::from_le_bytes(self.read_n::<8>(address)))
     }
 
     /// Store a doubleword (64-bit) to memory - for SD instruction
@@ -430,7 +542,7 @@ impl Memory {
         if !address.is_multiple_of(8) {
             address.checked_add(7).ok_or(MemoryError::AddressOverflow)?;
         }
-        self.store.write(address, &value.to_le_bytes());
+        self.write_n::<8>(address, value.to_le_bytes());
         Ok(())
     }
 
@@ -439,16 +551,14 @@ impl Memory {
             address.checked_add(1).ok_or(MemoryError::AddressOverflow)?;
         }
         // A 2-aligned half never leaves its word, so it cannot wrap.
-        let mut bytes = [0u8; 2];
-        self.store.read(address, &mut bytes);
-        Ok(u16::from_le_bytes(bytes))
+        Ok(u16::from_le_bytes(self.read_n::<2>(address)))
     }
 
     pub fn store_half(&mut self, address: u64, value: u16) -> Result<(), MemoryError> {
         if !address.is_multiple_of(2) {
             address.checked_add(1).ok_or(MemoryError::AddressOverflow)?;
         }
-        self.store.write(address, &value.to_le_bytes());
+        self.write_n::<2>(address, value.to_le_bytes());
         Ok(())
     }
 
