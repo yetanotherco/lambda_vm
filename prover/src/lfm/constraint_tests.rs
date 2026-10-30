@@ -370,8 +370,11 @@ const DESIGN_INSTR: &[(&str, usize)] = &[
     // token at the verifier's timestamp.
     ("REGISTER", 38),
     // 3_148 → 2_874: main's IS_WH (#1022) moved KECCAK's state pointers to
-    // `DWordWHH`, their top 48 bits to the IS_WH table.
-    ("KECCAK", 2_874),
+    // `DWordWHH`, their top 48 bits to the IS_WH table. 2_874 → 11_996: the
+    // sponge mode for Keccak-256 of a buffer (739 constraints and 286
+    // interactions, the 136 XOR tuples' padded-byte linear forms among them),
+    // the emitter's count as measured.
+    ("KECCAK", 11_996),
     // 14_016 → 12_998: main replaced the θ/ρ HWSL lookups with inline μ-gated
     // linear identities in `KeccakRndConstraints`, which nets −1018 constraint
     // arithmetic rows (the same change whose receiver-side multiplicity drop is
