@@ -10,6 +10,7 @@
 
 lambda-vm-prover tests::block_whir_tests::cpu_and_memw_r_filled_from_records_move_no_byte  # 2222 s
 lambda-vm-prover tests::block_whir_tests::phase_b_in_any_order_proves_the_same_bytes  # 1452 s
+lambda-vm-prover tests::block_whir_tests::counting_the_hand_out_on_its_own_thread_moves_no_byte  # 1117 s (box CI, 8 runners)
 lambda-vm-prover lfm::algebraic_transcript::tests::the_machine_regroups_bytes_exactly_as_the_host_cellifies_them  # 982 s
 lambda-vm-prover tests::block_whir_tests::split_keccak_and_ecsm_calls_are_keyed_on_the_bus  # 832 s
 lambda-vm-prover lfm::algebraic_commit::tests::the_emitted_leaf_and_parent_equal_the_host_backend  # 822 s
