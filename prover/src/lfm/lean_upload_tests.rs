@@ -170,3 +170,91 @@ fn a_lean_upload_proves_the_same_bytes() {
         "the lean upload moved a proof byte"
     );
 }
+
+/// The lean upload (round 1: the socket trace built on the card) and the
+/// sub-coset composition evaluation (round 2: the constraints walked on `2n`
+/// rows) in the same prove: both off against both on, the same proof bytes,
+/// and the "on" prove took both paths.
+#[test]
+#[ignore = "card: proves on the GPU; run on the box with --ignored --test-threads=1"]
+fn the_lean_upload_and_the_subcoset_composition_together_prove_the_same_bytes() {
+    use super::proof::{prove_traces_with_hasher, verify_against};
+    use super::registry::build_artifacts_with_hasher;
+    use stark::proof::options::GoldilocksCubicProofOptions;
+    use stark::prover::{composition_subcoset_tables, set_composition_subcoset};
+
+    struct RestoreBoth;
+    impl Drop for RestoreBoth {
+        fn drop(&mut self) {
+            set_lean_upload(None);
+            set_composition_subcoset(None);
+        }
+    }
+    let _restore = RestoreBoth;
+    let mut opts: ProofOptions = GoldilocksCubicProofOptions::with_blowup(4).expect("options");
+    opts.grinding_factor = 0;
+    // 2^13 rows at blowup 4 is a 2^15-row LDE, above the device commit floor.
+    let program = chained(6000);
+    let artifacts = build_artifacts_with_hasher(&program, &opts, KIND);
+    let exec = execute(&program, &[], &KIND).expect("execute");
+
+    let prove = |on: bool| {
+        set_lean_upload(Some(on));
+        set_composition_subcoset(Some(on));
+        let mut traces = build_traces_with_hasher(&program, &exec.records, KIND);
+        assert_eq!(traces.hash.has_main_dev_producer(), on);
+        let before = (
+            stark::trace::main_dev_producer_calls(),
+            composition_subcoset_tables(),
+        );
+        let proof = prove_traces_with_hasher(
+            &artifacts,
+            &mut traces,
+            &exec.public_words,
+            &opts,
+            KIND,
+            stark::residency_mode::ResidencyMode::Retain,
+        )
+        .expect("prove");
+        let calls = (
+            stark::trace::main_dev_producer_calls() - before.0,
+            composition_subcoset_tables() - before.1,
+        );
+        (proof, calls)
+    };
+    let (off, off_calls) = prove(false);
+    let (on, on_calls) = prove(true);
+    eprintln!(
+        "LEAN UPLOAD + SUBCOSET (producer calls, sub-coset tables): off {off_calls:?} · on {on_calls:?}"
+    );
+    assert_eq!(off_calls, (0, 0), "both off takes neither path");
+    assert!(
+        on_calls.0 > 0,
+        "the prove never took its trace from the producer"
+    );
+    assert!(
+        on_calls.1 > 0,
+        "the prove never evaluated a composition on the sub-coset"
+    );
+    for proof in [&off, &on] {
+        assert!(verify_against(
+            &artifacts.roots,
+            &artifacts.program_id,
+            artifacts.keccak_rnd_chunks,
+            proof,
+            &exec.public_words,
+            &opts,
+            KIND,
+            artifacts.chip_set,
+        ));
+    }
+    let bytes = |p: &super::proof::LfmStarkProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("rkyv")
+            .to_vec()
+    };
+    assert!(
+        bytes(&on) == bytes(&off),
+        "the lean upload with the sub-coset composition moved a proof byte"
+    );
+}
