@@ -1110,7 +1110,11 @@ struct FlamegraphCliOptions {
 /// One tally per [`Accelerator`] variant, printed by `execute --cycles`.
 #[derive(Default)]
 struct AccelCounts {
+    /// KECCAK rows: one per `keccak_permute` call, `⌊len / 136⌋ + 1` per
+    /// Keccak-256 call.
     keccak: u64,
+    /// Keccak-256 (buffer) calls; their permutations are counted in `keccak`.
+    keccak256: u64,
     blake3: u64,
     ecsm: u64,
     dma: u64,
@@ -1133,6 +1137,12 @@ impl AccelCounts {
     fn tally(&mut self, accelerator: Accelerator, dst_val: u64, rows: u64) {
         match accelerator {
             Accelerator::Keccak => self.keccak += 1,
+            // `rows` is the call's permutation count (the executor logs it in
+            // `src2_val`).
+            Accelerator::Keccak256 => {
+                self.keccak256 += 1;
+                self.keccak += rows;
+            }
             Accelerator::Blake3 => self.blake3 += 1,
             Accelerator::Ecsm => self.ecsm += 1,
             Accelerator::Dma => {
@@ -1322,6 +1332,7 @@ fn cmd_execute(
         println!("Cycles: {}", cycle_count);
         if let Some(counts) = accel_counts {
             println!("Keccak calls: {}", counts.keccak);
+            println!("Keccak256 calls: {}", counts.keccak256);
             println!("Blake3 calls: {}", counts.blake3);
             println!("Ecsm calls: {}", counts.ecsm);
             println!("Dma calls: {}", counts.dma);
@@ -2397,6 +2408,7 @@ mod tests {
     /// until it gets a row here.
     const EXPECTED_ACCELERATORS: &[(SyscallNumbers, Option<Accelerator>)] = &[
         (SyscallNumbers::KeccakPermute, Some(Accelerator::Keccak)),
+        (SyscallNumbers::Keccak256, Some(Accelerator::Keccak256)),
         (SyscallNumbers::Blake3Compress, Some(Accelerator::Blake3)),
         (SyscallNumbers::Blake3Absorb, Some(Accelerator::Blake3)),
         (SyscallNumbers::Ecsm, Some(Accelerator::Ecsm)),
@@ -2459,12 +2471,13 @@ mod tests {
             let mut counts = AccelCounts::default();
             counts.tally(accelerator, 0, 0);
             assert_eq!(
-                counts.keccak + counts.blake3 + counts.ecsm + counts.dma,
+                counts.keccak + counts.keccak256 + counts.blake3 + counts.ecsm + counts.dma,
                 1,
                 "{accelerator:?} must increment exactly one counter"
             );
             let expected = match accelerator {
                 Accelerator::Keccak => counts.keccak,
+                Accelerator::Keccak256 => counts.keccak256,
                 Accelerator::Blake3 => counts.blake3,
                 Accelerator::Ecsm => counts.ecsm,
                 Accelerator::Dma => counts.dma,

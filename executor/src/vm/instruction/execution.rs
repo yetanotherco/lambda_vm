@@ -50,6 +50,10 @@ syscall_numbers! {
     /// `DMA_MEMSET_SYSCALL_NUMBER`. `memset` chunks are proven by the same
     /// COPY table, which derives the inverted timestamp order from this number.
     DmaMemset = 97,
+    /// Placeholder discriminant. The actual syscall value is
+    /// `KECCAK256_SYSCALL_NUMBER`: Keccak-256 of a guest buffer, proven by the
+    /// KECCAK table's sponge mode.
+    Keccak256 = 98,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -57,6 +61,103 @@ syscall_numbers! {
 /// Cannot be an enum discriminant because it exceeds isize::MAX.
 pub const KECCAK_SYSCALL_NUMBER: u64 = u64::MAX - 1;
 const KECCAK_STATE_BYTES: u64 = 25 * 8;
+
+/// Syscall number for Keccak-256 of a guest buffer (`u64::MAX - 4`, ECALL `-5`,
+/// in the hash group `-1 ..= -10`).
+///
+/// ABI: `x10` = input address (any alignment), `x11` = input length in bytes,
+/// `x12` = address the 32-byte digest is written to (any alignment). Registers
+/// are left unchanged. The digest is Keccak-256 with the original Keccak padding
+/// (`0x01 ... 0x80`), the hash Ethereum uses.
+///
+/// The input is read at the ecall's timestamp `T` and the digest written at
+/// `T + 1`, so the output may overlap the input: the hash is of the bytes as they
+/// were before the call.
+///
+/// The KECCAK table proves the call one row per permutation: block `j` of the
+/// padded input is read at `ptr + 136·j`, absorbed into the state carried from
+/// row `j - 1`, and permuted; the last row writes the first four lanes. Its
+/// address arithmetic adds offsets to the low 32-bit word of `ptr` and `out`
+/// without a carry, so the call is refused unless
+/// [`keccak256_addresses_ok`] holds — the chip accepts exactly the calls this
+/// accepts.
+pub const KECCAK256_SYSCALL_NUMBER: u64 = u64::MAX - 4;
+
+/// Bytes of one Keccak-256 block (the rate, 1088 bits).
+pub const KECCAK256_RATE_BYTES: u64 = 136;
+
+/// Permutations (KECCAK rows) one Keccak-256 call of `len` bytes makes: one per
+/// whole block and one for the padded last block, `⌊len / 136⌋ + 1`.
+pub const fn keccak256_blocks(len: u64) -> u64 {
+    len / KECCAK256_RATE_BYTES + 1
+}
+
+/// Whether a Keccak-256 call's operands fit the chip's address arithmetic:
+///
+/// - every block's 136-byte window stays below one `2^32` boundary of the low
+///   address word: `(ptr mod 2^32) + 136·blocks ≤ 2^32` (this also bounds `len`
+///   below `2^32`, which the chip needs for its byte count);
+/// - the 32-byte digest does too: `(out mod 2^32) + 31 < 2^32`.
+pub fn keccak256_addresses_ok(ptr: u64, len: u64, out: u64) -> bool {
+    let window = keccak256_blocks(len).checked_mul(KECCAK256_RATE_BYTES);
+    let input_ok = window.is_some_and(|w| {
+        (ptr % LOW_LIMB)
+            .checked_add(w)
+            .is_some_and(|e| e <= LOW_LIMB)
+    });
+    input_ok && addr_limb_ok(out, 31)
+}
+
+/// The permutations of Keccak-256 over `input`, block by block: each item is the
+/// state a block's permutation starts from (the previous output with the padded
+/// block XORed into its first 17 lanes) and the state it ends in. The digest is
+/// the first four lanes of the last item's output, little-endian.
+///
+/// One function for the executor and the trace builder, so the rows the prover
+/// builds are the permutations the VM ran.
+pub fn keccak256_permutations(input: &[u8]) -> Vec<([u64; 25], [u64; 25])> {
+    const RATE: usize = KECCAK256_RATE_BYTES as usize;
+    let blocks = input.len() / RATE + 1;
+    let mut out = Vec::with_capacity(blocks);
+    let mut state = [0u64; 25];
+    for j in 0..blocks {
+        let block = keccak256_padded_block(input, j);
+        for (lane, chunk) in state.iter_mut().zip(block.chunks_exact(8)) {
+            *lane ^= u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+        }
+        let start = state;
+        keccak_f1600(&mut state);
+        out.push((start, state));
+    }
+    out
+}
+
+/// Block `j` of `input` after Keccak padding: the input's bytes, then on the last
+/// block (`j = ⌊len / 136⌋`) `0x01` right after them and `0x80` on byte 135
+/// (`0x81` when the two meet).
+pub fn keccak256_padded_block(input: &[u8], j: usize) -> [u8; 136] {
+    const RATE: usize = KECCAK256_RATE_BYTES as usize;
+    let mut block = [0u8; RATE];
+    let start = j * RATE;
+    let take = input.len().saturating_sub(start).min(RATE);
+    block[..take].copy_from_slice(&input[start..start + take]);
+    if j == input.len() / RATE {
+        block[take] ^= 0x01;
+        block[RATE - 1] ^= 0x80;
+    }
+    block
+}
+
+/// Keccak-256 of `input`, through [`keccak256_permutations`].
+pub fn keccak256_digest(input: &[u8]) -> [u8; 32] {
+    let perms = keccak256_permutations(input);
+    let (_, last) = perms.last().expect("at least one block");
+    let mut digest = [0u8; 32];
+    for (k, lane) in last.iter().take(4).enumerate() {
+        digest[8 * k..8 * k + 8].copy_from_slice(&lane.to_le_bytes());
+    }
+    digest
+}
 
 /// Syscall number for the BLAKE3 6-round compression accelerator
 /// (u64::MAX - 2 = 0xFFFF_FFFF_FFFF_FFFD).
@@ -326,6 +427,7 @@ impl TryFrom<u64> for SyscallNumbers {
             64 => Ok(SyscallNumbers::Commit),
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
+            v if v == KECCAK256_SYSCALL_NUMBER => Ok(SyscallNumbers::Keccak256),
             v if v == BLAKE3_SYSCALL_NUMBER => Ok(SyscallNumbers::Blake3Compress),
             v if v == BLAKE3_ABSORB_SYSCALL_NUMBER => Ok(SyscallNumbers::Blake3Absorb),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
@@ -341,6 +443,9 @@ impl TryFrom<u64> for SyscallNumbers {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Accelerator {
     Keccak,
+    /// Keccak-256 of a buffer: the KECCAK chip again, `keccak256_blocks(len)`
+    /// rows a call rather than one.
+    Keccak256,
     Blake3,
     Ecsm,
     Dma,
@@ -352,6 +457,7 @@ impl SyscallNumbers {
     pub fn raw(self) -> u64 {
         match self {
             SyscallNumbers::KeccakPermute => KECCAK_SYSCALL_NUMBER,
+            SyscallNumbers::Keccak256 => KECCAK256_SYSCALL_NUMBER,
             SyscallNumbers::Blake3Compress => BLAKE3_SYSCALL_NUMBER,
             SyscallNumbers::Blake3Absorb => BLAKE3_ABSORB_SYSCALL_NUMBER,
             SyscallNumbers::Ecsm => ECSM_SYSCALL_NUMBER,
@@ -371,6 +477,9 @@ impl SyscallNumbers {
     pub fn accelerator(self) -> Option<Accelerator> {
         match self {
             SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
+            // The same chip, one row per permutation of the call; counters read
+            // the permutation count from the log (`src2_val`).
+            SyscallNumbers::Keccak256 => Some(Accelerator::Keccak256),
             SyscallNumbers::Blake3Compress => Some(Accelerator::Blake3),
             // Both BLAKE3 syscalls drive the same chip, so they count as one
             // accelerator — a counter that split them would report "BLAKE3
@@ -793,6 +902,30 @@ impl Instruction {
                             memory.store_doubleword(lane_addr, lane)?;
                         }
                         src2_val = state_addr;
+                    }
+                    SyscallNumbers::Keccak256 => {
+                        // Keccak-256 of [x10, x10 + x11) written to [x12, x12 + 32).
+                        // See KECCAK256_SYSCALL_NUMBER for the ABI.
+                        let ptr = registers.read(10)?;
+                        let len = registers.read(11)?;
+                        let out = registers.read(12)?;
+                        if !keccak256_addresses_ok(ptr, len, out) {
+                            return Err(ExecutionError::Keccak256AddressOverflow { ptr, len, out });
+                        }
+                        let input = memory.load_bytes(ptr, len)?;
+                        let digest = keccak256_digest(&input);
+                        for (k, chunk) in digest.chunks_exact(8).enumerate() {
+                            let lane = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+                            memory.store_doubleword(out + 8 * k as u64, lane)?;
+                        }
+                        // The permutation count (KECCAK rows) for the counters, and
+                        // the input address (its alignment decides which memory
+                        // table the chip's reads land in). Inert for the CPU row:
+                        // `EcallEbreak` writes no register, and the trace builder
+                        // recovers x10..x12 from the register state, like ECSM and
+                        // HINT.
+                        src2_val = keccak256_blocks(len);
+                        dst_val = ptr;
                     }
                     SyscallNumbers::Blake3Compress => {
                         // BLAKE3 6-round compression on a 176-byte region at the
@@ -1260,6 +1393,10 @@ pub enum ExecutionError {
     UnalignedKeccakStateAddress(u64),
     #[error("Keccak state address range overflows: {0:#018x}")]
     KeccakStateAddressOverflow(u64),
+    #[error(
+        "Keccak-256 operands cross a 2^32 address-word boundary: ptr {ptr:#x}, len {len}, out {out:#x}"
+    )]
+    Keccak256AddressOverflow { ptr: u64, len: u64, out: u64 },
     #[error("Unaligned BLAKE3 state address: {0:#018x}")]
     UnalignedBlake3StateAddress(u64),
     #[error("BLAKE3 state address range overflows: {0:#018x}")]
