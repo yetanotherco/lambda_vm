@@ -189,11 +189,13 @@ fn check_writes_and_reads(program: &LfmProgram) -> Result<(), LfmViolation> {
     Ok(())
 }
 
-/// `LFM_VALIDATE_DENSE_COUNTS=1` recounts check 4's reads in a table indexed by
-/// address rather than a hash map ([`ReadCounts`]). The same counts, so the
-/// same verdict and the same first violation; only the time differs (the map
-/// was ≈ 0.8 of a 1.2 s node emission, laptop instrument
-/// `node_emit_timing_tests`). Unset, empty or `0`: the map, as before.
+/// Check 4 recounts reads in a table indexed by address ([`ReadCounts`]) by
+/// default; `LFM_VALIDATE_DENSE_COUNTS=0` restores the hash map (the rollback).
+/// The same counts, so the same verdict and the same first violation; only the
+/// time differs. The map was ≈ 0.8 s of a 1.2 s node emission (laptop
+/// instrument `node_emit_timing_tests`), and on the box the dense recount took
+/// the median block's recursion down 0.27 s and the tree verify from 7.96 to
+/// 3.77 s.
 pub const DENSE_COUNTS_ENV: &str = "LFM_VALIDATE_DENSE_COUNTS";
 
 /// Whether [`DENSE_COUNTS_ENV`] is on, read once.
@@ -202,12 +204,12 @@ pub fn dense_counts() -> bool {
     *ON.get_or_init(|| parse_dense_counts(std::env::var(DENSE_COUNTS_ENV).ok().as_deref()))
 }
 
-/// [`DENSE_COUNTS_ENV`]'s value: `1` on; unset, empty or `0` off; anything
-/// else refused.
+/// [`DENSE_COUNTS_ENV`]'s value: unset, empty or `1` on (the default); `0`
+/// off; anything else refused.
 pub fn parse_dense_counts(value: Option<&str>) -> bool {
     match value {
-        None | Some("") | Some("0") => false,
-        Some("1") => true,
+        None | Some("") | Some("1") => true,
+        Some("0") => false,
         Some(other) => panic!("{DENSE_COUNTS_ENV} must be `0` or `1`, got `{other}`"),
     }
 }
@@ -815,11 +817,11 @@ mod dense_count_tests {
     }
 
     #[test]
-    fn the_dense_counts_knob_reads_one_and_zero() {
-        assert!(!parse_dense_counts(None));
-        assert!(!parse_dense_counts(Some("")));
-        assert!(!parse_dense_counts(Some("0")));
+    fn the_dense_counts_knob_is_on_by_default_and_zero_rolls_back() {
+        assert!(parse_dense_counts(None));
+        assert!(parse_dense_counts(Some("")));
         assert!(parse_dense_counts(Some("1")));
+        assert!(!parse_dense_counts(Some("0")));
         assert!(std::panic::catch_unwind(|| parse_dense_counts(Some("yes"))).is_err());
     }
 }
