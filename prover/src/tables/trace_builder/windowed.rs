@@ -90,6 +90,10 @@ use card_records::{
     CardDecode, CpuLogRecords, RegisterRowRecords, RowChunk, RowFamily, RowRecords,
 };
 
+mod handout_count;
+pub use handout_count::CountThreadStamps;
+use handout_count::{CountWork, HandoutCounter};
+
 /// Whether the host has room to hold a chunk of so many bytes as records
 /// ([`WindowedTraceBuilder::card_fill_streamed`]).
 pub type RecordsRoom = Arc<dyn Fn(usize) -> bool + Send + Sync>;
@@ -273,6 +277,50 @@ pub struct WindowedTraceBuilder<'a> {
     card_fill_fault: usize,
     /// [`Self::card_fill_streamed`].
     card_fill_streamed: Option<StreamedCardFill>,
+    /// Where the hand-out's counting runs ([`Self::count_handout_on_thread`]).
+    count: CountMode,
+}
+
+/// Where the hand-out counts what the table phase reads from each chunk it
+/// hands out under [`WindowedTraceBuilder::drop_streamed_ops`]
+/// ([`handout_count`]).
+enum CountMode {
+    /// On the accumulator's thread, as the chunk leaves.
+    Inline,
+    /// On a thread of its own, started with the first chunk.
+    Thread,
+    /// The thread, counting.
+    Running(HandoutCounter),
+    /// The thread's counts added to the builder's: any later chunk is counted
+    /// on the accumulator's thread.
+    Joined,
+}
+
+impl CountMode {
+    /// The counter, started when it is due; `None` while counting inline
+    /// (also when its thread did not start).
+    fn counter(
+        &mut self,
+        decode: &Arc<DecodeTable>,
+        stream_memw_lt: bool,
+        counted: &PreCounted,
+    ) -> Option<&HandoutCounter> {
+        if let Self::Thread = self {
+            *self = match HandoutCounter::spawn(
+                Arc::clone(decode),
+                stream_memw_lt,
+                counted.memw_lt.empty_like(),
+                counted.memw_aligned_lt.empty_like(),
+            ) {
+                Ok(counter) => Self::Running(counter),
+                Err(_) => Self::Inline,
+            };
+        }
+        match self {
+            Self::Running(counter) => Some(counter),
+            _ => None,
+        }
+    }
 }
 
 /// Where a builder's creation spent its time, seconds: the initial image and
@@ -379,6 +427,10 @@ pub struct WindowStamps {
     pub handout: HandoutStamps,
     /// [`WindowedTraceBuilder::card_fill_streamed`]'s chunks.
     pub card_fill: CardFillStamps,
+    /// The hand-out's counting thread, once joined
+    /// ([`WindowedTraceBuilder::join_handout_count`]); `None` when the
+    /// accumulator's thread counted.
+    pub count_thread: Option<CountThreadStamps>,
 }
 
 /// The CPU, MEMW_R and row families' chunks handed out under
@@ -448,6 +500,11 @@ impl<'a> WindowedTraceBuilder<'a> {
         let decode_secs = t.elapsed().as_secs_f64();
         let decode_trace = DecodeTrace::spawn(instructions)?;
         let lean = WalkLean::from_env()?;
+        let count = if handout_count::count_thread_from_env()? {
+            CountMode::Thread
+        } else {
+            CountMode::Inline
+        };
         memory_state.lean = lean.memory;
         Ok(Self {
             decode,
@@ -490,7 +547,76 @@ impl<'a> WindowedTraceBuilder<'a> {
             #[cfg(test)]
             card_fill_fault: 0,
             card_fill_streamed: None,
+            count,
         })
+    }
+
+    /// Count what the table phase reads from each handed-out chunk on a
+    /// thread of its own (`true`) or on the accumulator's (`false`), whatever
+    /// `LAMBDA_VM_HANDOUT_COUNT_THREAD` says ([`handout_count`]). The tables
+    /// are the same. Before the first chunk is handed out; later, or without
+    /// the `parallel` feature for `true`, it changes nothing.
+    pub fn count_handout_on_thread(mut self, on: bool) -> Self {
+        if cfg!(feature = "parallel") && matches!(self.count, CountMode::Inline | CountMode::Thread)
+        {
+            self.count = if on {
+                CountMode::Thread
+            } else {
+                CountMode::Inline
+            };
+        }
+        self
+    }
+
+    /// The hand-out's counting thread, if it ran: every chunk it was sent
+    /// counted, and its counts added to the builder's (the BITWISE histogram,
+    /// DECODE's lookups, the last ECALL, the MEMW-derived LT ops), its stamps
+    /// to [`Self::stamps`]. Chunks handed out after this are counted on the
+    /// accumulator's thread. [`Self::finish`] joins it too; the block calls it
+    /// as the windows end, so their end includes it.
+    pub(crate) fn join_handout_count(&mut self) -> Result<(), Error> {
+        let CountMode::Running(counter) = std::mem::replace(&mut self.count, CountMode::Joined)
+        else {
+            return Ok(());
+        };
+        let counts = counter.finish()?;
+        let t = std::time::Instant::now();
+        let handout_count::Counts {
+            histogram,
+            decode_rows,
+            last_ecall,
+            memw_lt,
+            memw_aligned_lt,
+            mut stamps,
+        } = counts;
+        let kept = self.kept.as_mut().ok_or_else(|| {
+            Error::Prover(
+                "the hand-out's count thread ran for a build that keeps its windows".into(),
+            )
+        })?;
+        decode::add_row_counts(kept.decode.table(), &decode_rows).map_err(|row| {
+            Error::Prover(format!(
+                "the hand-out's count thread counted DECODE row {row}, which DECODE's trace lacks"
+            ))
+        })?;
+        let counted = &mut self.counted;
+        if !counted.memw_lt.holds_none() || !counted.memw_aligned_lt.holds_none() {
+            return Err(Error::Prover(
+                "MEMW-derived LT ops were counted on the accumulator's thread beside the count \
+                 thread's"
+                    .into(),
+            ));
+        }
+        counted.histogram.merge(&histogram);
+        drop(histogram);
+        counted.memw_lt = memw_lt;
+        counted.memw_aligned_lt = memw_aligned_lt;
+        if last_ecall.is_some() {
+            counted.last_ecall = last_ecall;
+        }
+        stamps.merge = t.elapsed().as_secs_f64();
+        self.stamps.count_thread = Some(stamps);
+        Ok(())
     }
 
     /// Walk with these lean parts, whatever `LAMBDA_VM_WALK_LEAN` says (the
@@ -1056,6 +1182,8 @@ impl<'a> WindowedTraceBuilder<'a> {
     /// The run's last window collected and walked, and the run's lists
     /// assembled: what the table phase starts from.
     fn finishing(mut self, logs: &[Log]) -> Result<Finishing<'a>, Error> {
+        // Every handed-out chunk counted, wherever it was counted.
+        self.join_handout_count()?;
         // The last window may halt: it is walked here, not by the `Walker`.
         let decode = &self.decode;
         let cpu_ops = super::collect_cpu_ops_from(logs, decode, self.cycles)?;
@@ -1254,6 +1382,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 handout: &mut self.stamps.handout,
                 card: self.card_fill_streamed.as_ref(),
                 card_stamps: &mut self.stamps.card_fill,
+                count: &mut self.count,
             },
             &self.image,
         )
@@ -1294,6 +1423,7 @@ impl<'a> WindowedTraceBuilder<'a> {
                 handout: &mut self.stamps.handout,
                 card: self.card_fill_streamed.as_ref(),
                 card_stamps: &mut self.stamps.card_fill,
+                count: &mut self.count,
             },
         )
     }
@@ -1457,6 +1587,8 @@ pub struct Accumulator<'b> {
     /// [`WindowedTraceBuilder::card_fill_streamed`].
     card: Option<&'b StreamedCardFill>,
     card_stamps: &'b mut CardFillStamps,
+    /// Where the hand-out's counting runs.
+    count: &'b mut CountMode,
 }
 
 impl Accumulator<'_> {
@@ -1560,6 +1692,9 @@ impl Accumulator<'_> {
             kept.append(window);
             *self.route_secs += t.elapsed().as_secs_f64();
             let t = std::time::Instant::now();
+            let counter = self
+                .count
+                .counter(self.decode, self.stream_memw_lt, self.counted);
             let jobs = tail_jobs(
                 self.max_rows,
                 self.stream_memw_lt,
@@ -1570,6 +1705,7 @@ impl Accumulator<'_> {
                 self.counted,
                 self.handout,
                 self.card.map(|card| (card, &mut *self.card_stamps)),
+                counter,
             );
             *self.handout_secs += t.elapsed().as_secs_f64();
             jobs
@@ -1802,6 +1938,19 @@ fn return_list_pages<T>(_list: &mut Vec<T>) -> Result<u64, i32> {
 /// generator fills the rows from the parts.
 pub(crate) struct Segments<T> {
     parts: Vec<(Arc<Vec<T>>, std::ops::Range<usize>)>,
+}
+
+/// The same parts, shared (no op is copied).
+impl<T> Clone for Segments<T> {
+    fn clone(&self) -> Self {
+        Self {
+            parts: self
+                .parts
+                .iter()
+                .map(|(list, range)| (Arc::clone(list), range.clone()))
+                .collect(),
+        }
+    }
 }
 
 impl<T> Segments<T> {
@@ -2545,7 +2694,9 @@ fn memw_register_chunk_ops(
 /// chunk taken out of the tails, and what the table phase reads from its ops
 /// counted as it leaves (`counted`, and DECODE in `kept`), each timed into
 /// `stamps`. With `card` ([`WindowedTraceBuilder::card_fill_streamed`]), CPU
-/// and MEMW_R chunks go out as records while the host has room.
+/// and MEMW_R chunks go out as records while the host has room. With
+/// `counter`, every count but STORE's is the counter's ([`handout_count`]): the
+/// chunk's parts go to it in the order they leave.
 #[allow(clippy::too_many_arguments)]
 fn tail_jobs(
     m: &crate::tables::MaxRowsConfig,
@@ -2557,6 +2708,7 @@ fn tail_jobs(
     counted: &mut PreCounted,
     stamps: &mut HandoutStamps,
     mut card: Option<(&StreamedCardFill, &mut CardFillStamps)>,
+    counter: Option<&HandoutCounter>,
 ) -> Vec<ChunkJob> {
     use std::time::Instant;
     let mut jobs = Vec::new();
@@ -2592,16 +2744,17 @@ fn tail_jobs(
         let (ops, copied) = kept.cpu.take_counted(m.cpu);
         let taken = t.elapsed().as_secs_f64();
         let t = Instant::now();
-        decode::count_rows(
-            kept.decode.table(),
-            ops.iter().map(|op| op.decode_row as usize),
-        );
-        if let Some(op) = ops
-            .iter()
-            .rev()
-            .find(|op| decode_table.entry(op.decode_row).fields.ecall)
-        {
-            counted.last_ecall = Some((op.timestamp, op.next_pc));
+        match counter {
+            Some(counter) => counter.send(CountWork::Cpu(ops.clone())),
+            None => {
+                decode::count_rows(
+                    kept.decode.table(),
+                    ops.iter().map(|op| op.decode_row as usize),
+                );
+                if let Some(ecall) = handout_count::last_ecall(&ops, decode_table) {
+                    counted.last_ecall = Some(ecall);
+                }
+            }
         }
         // The chunk's logs leave the logs' tail with its ops.
         let logs = kept.logs.as_mut().map(|tail| tail.take_segments(m.cpu));
@@ -2626,8 +2779,9 @@ fn tail_jobs(
         let (rows, copied) = kept.register_rows.take_counted(m.memw_register);
         let taken = t.elapsed().as_secs_f64();
         let t = Instant::now();
-        for part in rows.slices() {
-            super::memw_register::collect_bitwise_from_memw_register(part, &mut counted.histogram)
+        match counter {
+            Some(counter) => counter.send(CountWork::MemwRegister(rows.clone())),
+            None => handout_count::count_memw_register(&rows, &mut counted.histogram),
         }
         let ops = memw_register_chunk_ops(
             rows,
@@ -2653,13 +2807,13 @@ fn tail_jobs(
         m.memw_aligned,
         e.memw_aligned,
         |ops| {
-            for rows in ops.slices() {
-                let lookups = super::collect_bitwise_from_memw_aligned(rows);
-                counted.histogram.add_ops(&lookups);
-                if !stream_memw_lt {
-                    let lt = super::collect_lt_from_memw_aligned(rows);
-                    counted.memw_aligned_lt.extend(&lt);
-                }
+            match counter {
+                Some(counter) => counter.send(CountWork::MemwAligned(ops.clone())),
+                None => handout_count::count_memw_aligned(
+                    &ops,
+                    &mut counted.histogram,
+                    (!stream_memw_lt).then_some(&mut counted.memw_aligned_lt),
+                ),
             }
         },
         |rows, index| row_chunk_ops(
@@ -2677,10 +2831,14 @@ fn tail_jobs(
         m.memw,
         e.memw,
         |ops| {
-            if !stream_memw_lt {
-                for part in ops.slices() {
-                    counted.memw_lt.extend(&super::collect_lt_from_memw(part));
-                }
+            match counter {
+                // Nothing to count when the MEMW-derived LT ops are streamed.
+                Some(_) if stream_memw_lt => {}
+                Some(counter) => counter.send(CountWork::Memw(ops.clone())),
+                None => handout_count::count_memw(
+                    &ops,
+                    (!stream_memw_lt).then_some(&mut counted.memw_lt),
+                ),
             }
         },
         |ops, index| row_chunk_ops(
@@ -2708,15 +2866,10 @@ fn tail_jobs(
         )
     );
     take_chunks!(StreamTable::Lt, Lt, kept.lt, m.lt, e.lt, |ops| {
-        for part in ops.slices() {
-            counted
-                .histogram
-                .add_ops(&super::collect_bitwise_from_lt_ops(part))
+        match counter {
+            Some(counter) => counter.send(CountWork::Lt(ops.clone())),
+            None => handout_count::count_lt(&ops, &mut counted.histogram),
         }
-        // The chunk is one LT table: its rows' μ bounds (`types::MU_MAX`).
-        counted.histogram.add_ops(&super::lt_row_lookups(
-            ops.slices().into_iter().flat_map(|part| part.iter()),
-        ));
     });
     take_chunks!(
         StreamTable::Shift,
@@ -2724,10 +2877,9 @@ fn tail_jobs(
         m.shift,
         e.shift,
         |ops| {
-            for part in ops.slices() {
-                counted
-                    .histogram
-                    .add_ops(&shift::collect_bitwise_from_shift(part))
+            match counter {
+                Some(counter) => counter.send(CountWork::Shift(ops.clone())),
+                None => handout_count::count_shift(&ops, &mut counted.histogram),
             }
         },
         |ops, index| row_chunk_ops(

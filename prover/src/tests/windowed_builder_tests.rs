@@ -921,16 +921,154 @@ fn a_late_decode_trace_is_waited_for_before_its_rows_are_counted() {
     let (program, logs) = run("test_keccak_multi");
     let reference = whole(&program, &logs, &max_rows);
     DECODE_TRACE_DELAY.with(|d| d.set(std::time::Duration::from_millis(300)));
-    for split in [true, false] {
-        let t = std::time::Instant::now();
-        let (late, _, streamed) = windowed_streaming(&program, &logs, &max_rows, 7, split, |b| {
-            b.drop_streamed_ops().expect("before any window")
-        });
-        assert!(streamed.contains("Cpu"), "no CPU chunk was handed out");
-        assert!(t.elapsed() >= std::time::Duration::from_millis(300));
-        same_traces(&reference, &late);
+    // Counted on the accumulator's thread, or on a thread of its own (whose
+    // rows are added to the trace once the windows are walked).
+    for on_thread in [false, true] {
+        for split in [true, false] {
+            let t = std::time::Instant::now();
+            let (late, _, streamed) =
+                windowed_streaming(&program, &logs, &max_rows, 7, split, |b| {
+                    b.count_handout_on_thread(on_thread)
+                        .drop_streamed_ops()
+                        .expect("before any window")
+                });
+            assert!(streamed.contains("Cpu"), "no CPU chunk was handed out");
+            assert!(t.elapsed() >= std::time::Duration::from_millis(300));
+            same_traces(&reference, &late);
+        }
     }
     DECODE_TRACE_DELAY.with(|d| d.set(std::time::Duration::ZERO));
+}
+
+/// ★ The hand-out's counts (DECODE's lookups and the last ECALL from CPU,
+/// BITWISE's from MEMW_R, MEMW_A, LT and SHIFT, the MEMW-derived LT ops) taken
+/// on a thread of its own build the tables they build on the accumulator's
+/// thread, which are the whole-run tables: through `push` and through the
+/// split, at several windows, with the derived LT ops compact or raw, or
+/// streamed. The thread did count every table's chunks, and the build that
+/// counts inline started none.
+#[test]
+fn the_hand_outs_count_on_a_thread_of_its_own_builds_the_same_tables() {
+    let one_op = MaxRowsConfig {
+        memw: 1,
+        load: 1,
+        shift: 1,
+        store: 1,
+        ..MaxRowsConfig::uniform(4)
+    };
+    let mut counted = [0usize; 9];
+    for (name, max_rows) in [
+        ("all_instructions_64", MaxRowsConfig::small()),
+        ("test_keccak_multi", MaxRowsConfig::small()),
+        ("all_instructions_64", one_op.clone()),
+        ("misalign_sd", one_op.clone()),
+        ("all_loadstore_32", one_op),
+    ] {
+        let (program, logs) = run(name);
+        let reference = whole(&program, &logs, &max_rows);
+        for window in [1, 7, 33] {
+            // With the MEMW-derived LT ops streamed, LT's lists follow the
+            // windows: the build that keeps its ops at the same windows.
+            let lt_streamed_reference =
+                windowed_with(&program, &logs, &max_rows, window, false, |b| {
+                    b.stream_memw_lt()
+                })
+                .0;
+            for split in [false, true] {
+                type Configure = fn(WindowedTraceBuilder<'_>) -> WindowedTraceBuilder<'_>;
+                let lists: [(&str, Configure); 3] = [
+                    ("compact", |b| b),
+                    ("raw", |b| b.raw_memw_lt().expect("before any window")),
+                    ("streamed", |b| b.stream_memw_lt()),
+                ];
+                for (what, lists) in lists {
+                    let mut built = Vec::new();
+                    for on_thread in [false, true] {
+                        let (traces, stamps) =
+                            windowed_counted(&program, &logs, &max_rows, window, split, |b| {
+                                lists(b.count_handout_on_thread(on_thread))
+                                    .drop_streamed_ops()
+                                    .expect("before any window")
+                            });
+                        let at = format!("{name}/{window}/{split}/{what}/thread {on_thread}");
+                        match (on_thread, stamps) {
+                            (false, Some(_)) => panic!("{at}: a count thread ran"),
+                            (true, Some(s)) => {
+                                for (sum, n) in counted.iter_mut().zip(s.chunks) {
+                                    *sum += n;
+                                }
+                            }
+                            (true, None) if logs.len() > window + 1 => {
+                                panic!("{at}: no count thread ran")
+                            }
+                            _ => {}
+                        }
+                        if what == "streamed" {
+                            same_traces(&lt_streamed_reference, &traces);
+                        } else {
+                            same_traces(&reference, &traces);
+                        }
+                        built.push(traces);
+                    }
+                    same_traces(&built[0], &built[1]);
+                }
+            }
+        }
+    }
+    for table in [
+        StreamTable::Cpu,
+        StreamTable::MemwRegister,
+        StreamTable::MemwAligned,
+        StreamTable::Memw,
+        StreamTable::Lt,
+        StreamTable::Shift,
+    ] {
+        assert!(
+            counted[table.position()] > 0,
+            "the count thread counted no {table:?} chunk"
+        );
+    }
+}
+
+/// [`windowed_streaming`] with the hand-out's count thread joined before the
+/// finish: the build, and the thread's stamps if one ran.
+fn windowed_counted(
+    program: &Elf,
+    logs: &[Log],
+    max_rows: &MaxRowsConfig,
+    window: usize,
+    split: bool,
+    configure: impl Fn(WindowedTraceBuilder<'_>) -> WindowedTraceBuilder<'_>,
+) -> (
+    Traces,
+    Option<crate::tables::trace_builder::CountThreadStamps>,
+) {
+    let mut builder =
+        configure(WindowedTraceBuilder::new(program, &[], max_rows).expect("the builder"));
+    let body = logs.len() - 1;
+    let cut = body - body % window;
+    let mut chunks = Vec::new();
+    for w in logs[..cut].chunks(window) {
+        if split {
+            let (mut walker, mut accumulator) = builder.split();
+            let walked = walker.walk(w).expect("a window");
+            chunks.extend(
+                accumulator
+                    .absorb(walked)
+                    .into_iter()
+                    .map(|job| job.generate()),
+            );
+        } else {
+            chunks.extend(builder.push(w).expect("a window"));
+        }
+    }
+    builder.join_handout_count().expect("the count thread");
+    let stamps = builder.stamps().count_thread;
+    let mut traces = builder.finish(&logs[cut..]).expect("the last window");
+    traces
+        .insert_streamed(chunks)
+        .expect("every chunk has a placeholder");
+    (traces, stamps)
 }
 
 /// ★ With a private input in the initial image (more than a page of it), the

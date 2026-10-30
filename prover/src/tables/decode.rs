@@ -335,6 +335,29 @@ pub fn count_rows(
     }
 }
 
+/// Adds `counts[row]` DECODE lookups to each row's MU column at once: the
+/// column [`count_rows`] leaves after `counts[row]` lookups of that row, the
+/// field's sums being exact. Rows with no count are not touched. The first
+/// counted row the trace does not have is the error.
+pub fn add_row_counts(
+    trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    counts: &[u64],
+) -> Result<(), usize> {
+    for (row, &n) in counts.iter().enumerate() {
+        if n == 0 {
+            continue;
+        }
+        if row >= trace.main_table.height {
+            return Err(row);
+        }
+        let current = trace.main_table.get(row, cols::MU);
+        trace
+            .main_table
+            .set_fe(row, cols::MU, current + FE::from(n));
+    }
+    Ok(())
+}
+
 /// Updates multiplicities in the DECODE trace table.
 ///
 /// For each PC in `lookups`, increments the MU column in the corresponding row.

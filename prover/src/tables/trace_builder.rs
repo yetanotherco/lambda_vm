@@ -964,8 +964,9 @@ pub(crate) use windowed::DECODE_TRACE_DELAY;
 #[cfg(feature = "parallel")]
 pub(crate) use windowed::parallel;
 pub use windowed::{
-    Accumulator, CardFillStamps, ChunkJob, RecordsRoom, RegenBuilder, RowFamilies, SetupStamps,
-    StreamTable, StreamedChunk, WalkedWindow, Walker, WindowStamps, WindowedTraceBuilder,
+    Accumulator, CardFillStamps, ChunkJob, CountThreadStamps, RecordsRoom, RegenBuilder,
+    RowFamilies, SetupStamps, StreamTable, StreamedChunk, WalkedWindow, Walker, WindowStamps,
+    WindowedTraceBuilder,
 };
 
 // =============================================================================
@@ -6635,6 +6636,21 @@ impl CompactLt {
         } else {
             self.block_bytes
         }
+    }
+
+    /// An empty list that keeps its ops as this one does (as they are, or as
+    /// the stream in blocks of the same bytes).
+    pub(crate) fn empty_like(&self) -> Self {
+        Self {
+            raw: self.raw.as_ref().map(|_| Vec::new()),
+            block_bytes: self.block_bytes,
+            ..Self::default()
+        }
+    }
+
+    /// Whether it holds no op.
+    pub(crate) fn holds_none(&self) -> bool {
+        self.raw.as_ref().map_or(self.len == 0, Vec::is_empty)
     }
 
     /// A list that keeps its ops as they are (the A arm of the compact form).

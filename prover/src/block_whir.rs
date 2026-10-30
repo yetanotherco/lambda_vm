@@ -2142,6 +2142,28 @@ impl BlockStamps {
                 h.copied.iter().sum::<usize>() as f64 / 1e6,
                 tables.join(" | "),
             ));
+            out.push_str(&match &self.windows.count_thread {
+                Some(c) => {
+                    let tables: Vec<String> = StreamTable::ALL
+                        .iter()
+                        .filter(|t| c.chunks[t.position()] > 0)
+                        .map(|&t| {
+                            let i = t.position();
+                            format!("{} {:.2} · {}", stream_base(t), c.busy[i], c.chunks[i])
+                        })
+                        .collect();
+                    format!(
+                        "BLOCK HANDOUT COUNT: on a thread of its own · busy {:.2}s · waited for chunks {:.2}s · the windows' end waited {:.2}s for its last chunks and {:.3}s to add its counts || per table (busy s · chunks): {}\n",
+                        c.busy.iter().sum::<f64>(),
+                        c.idle,
+                        c.drain,
+                        c.merge,
+                        tables.join(" | "),
+                    )
+                }
+                None => "BLOCK HANDOUT COUNT: on the accumulator's thread (the count above)\n"
+                    .to_string(),
+            });
             let l = &self.layout;
             let marks: Vec<String> = l
                 .marks
@@ -5586,11 +5608,16 @@ fn prove_streamed(
                 let last = if walkers > 0 {
                     // The windows walked from their entries on `walkers`
                     // threads, absorbed here in order as below.
+                    // This thread's wait for the next window in order: from
+                    // the walk's start to the first window, then between
+                    // windows (the `accumulator recv-wait` term).
+                    let mut idle_from = Instant::now();
                     let report = parallel::walk_windows(
                         &mut builder,
                         lrx,
                         walkers,
                         |accumulator, walked, states| {
+                            ProducerWaits::add(&waits.accumulator_recv, idle_from);
                             // The walked windows wait in the walk's reorder
                             // buffer, not on a channel: no `walked` term.
                             if let Some(ledger) = ledger {
@@ -5622,6 +5649,7 @@ fn prove_streamed(
                             if let Some(ledger) = ledger {
                                 ledger.builder.store(accumulator.held_bytes(), Relaxed);
                             }
+                            idle_from = Instant::now();
                             Ok(())
                         },
                     )?;
@@ -5710,6 +5738,10 @@ fn prove_streamed(
                             .map_err(|_| Error::Prover("the block's walker panicked".into()))?
                     })?
                 };
+                // The hand-out's counting thread, if it ran, done counting and
+                // its counts the builder's: the windows end with it, as they
+                // end with the count on the accumulator's thread.
+                builder.join_handout_count()?;
                 let windows_done = start.elapsed().as_secs_f64();
                 let window_stamps = builder.stamps();
                 if let Some(ledger) = ledger {
@@ -8018,6 +8050,25 @@ mod producer_report_tests {
             "BLOCK HANDOUT: take 6.55s · count 2.21s · copied 297.8 M ops || per table (take s · \
              count s · chunks · copied ops): CPU 6.50 · 1.86 · 142 · 297.8 M | STORE 0.05 · 0.35 · \
              15 · 0.0 M"
+        );
+        assert_eq!(
+            line("BLOCK HANDOUT COUNT:"),
+            "BLOCK HANDOUT COUNT: on the accumulator's thread (the count above)"
+        );
+        let mut c = crate::tables::trace_builder::CountThreadStamps::default();
+        let lt = StreamTable::Lt.position();
+        (c.busy[cpu], c.chunks[cpu], c.busy[lt], c.chunks[lt]) = (1.25, 142, 0.5, 3);
+        (c.idle, c.drain, c.merge) = (6.0, 0.04, 0.021);
+        stamps.windows.count_thread = Some(c);
+        let report = stamps.report();
+        assert_eq!(
+            report
+                .lines()
+                .find(|l| l.starts_with("BLOCK HANDOUT COUNT:"))
+                .expect("the count's line"),
+            "BLOCK HANDOUT COUNT: on a thread of its own · busy 1.75s · waited for chunks 6.00s · \
+             the windows' end waited 0.04s for its last chunks and 0.021s to add its counts || \
+             per table (busy s · chunks): CPU 1.25 · 142 | LT 0.50 · 3"
         );
     }
 }
