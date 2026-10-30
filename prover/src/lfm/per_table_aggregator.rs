@@ -167,7 +167,7 @@ impl DerivedChild {
         let trees = stark::config::TreeGeometry::of::<Fam::Stark>();
         let heights = super::airs::LfmAirs::log_heights_in_air_order(artifacts)
             .ok_or("a child with KECCAK_RND chunks has workload heights")?;
-        let airs = super::airs::LfmAirs::for_artifacts(artifacts, opts);
+        let airs = super::airs::LfmAirs::for_artifacts(artifacts, opts)?;
         let refs = airs.air_refs();
         if heights.len() != refs.len() {
             return Err(format!("{} heights for {} AIRs", heights.len(), refs.len()));

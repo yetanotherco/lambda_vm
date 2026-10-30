@@ -3166,7 +3166,10 @@ fn the_whir_block_tree_on_a_real_block() {
         use super::airs::LfmAirs;
         use super::whir_chain::ChipRows;
         for (k, (artifacts, lfm)) in proofs.iter().enumerate() {
-            let airs = LfmAirs::for_artifacts(artifacts, &wrap);
+            let Ok(airs) = LfmAirs::for_artifacts(artifacts, &wrap) else {
+                println!("W3 AIRS {k}: the artifacts' merge is refused");
+                continue;
+            };
             let heights = LfmAirs::log_heights_in_air_order(artifacts).unwrap_or_default();
             let tables: Vec<String> = airs
                 .air_refs()

@@ -1129,30 +1129,45 @@ impl LfmAirs {
     /// side by side ([`super::merge`]), against the group's own preprocessed
     /// root. An empty `merge` leaves the set as it is.
     ///
+    /// ★ The ONE door every merged AIR set goes through — the prover, the host
+    /// verifier, the leg's derivation (`DerivedChild`) and the harvest — so the
+    /// checks live here: the merge must be well formed against the program's
+    /// per-slot `log_heights` ([`LfmMerge::check`]: two or more chips, slot
+    /// order, no chip twice, every chip at the merged height), every part body
+    /// must be one the remap translates ([`super::merge::audit_body`]) and every
+    /// bus packing must stay contiguous ([`super::merge::remap_interaction`]).
+    /// `Err` otherwise; nothing is built.
+    ///
     /// A merged AIR has no one-row root: the format refuses the merge beside
     /// one-row openings (`ZfFormat::check_lfm_merge`).
-    pub fn with_merge(mut self, merge: &LfmMerge, options: &ProofOptions) -> Self {
-        self.merged = merge
-            .tables
-            .iter()
-            .map(|t| {
-                let layout = MergedLayout::of(&t.chips);
-                let name = super::merge::merged_name(&t.chips);
+    pub fn with_merge(
+        mut self,
+        merge: &LfmMerge,
+        log_heights: &[u8; NUM_LFM_CHIPS],
+        options: &ProofOptions,
+    ) -> Result<Self, String> {
+        merge.check(log_heights)?;
+        let mut merged = Vec::with_capacity(merge.tables.len());
+        for t in &merge.tables {
+            let layout = MergedLayout::of(&t.chips);
+            let name = super::merge::merged_name(&t.chips);
+            merged.push(
                 AirWithBuses::new(
                     layout.num_columns,
                     AuxiliaryTraceBuildData {
-                        interactions: super::merge::merged_interactions(&layout),
+                        interactions: super::merge::merged_interactions(&layout)?,
                     },
                     options,
                     1,
-                    MergedConstraints::new(&layout),
+                    MergedConstraints::new(&layout)?,
                 )
                 .with_name(&name)
-                .with_preprocessed(t.root, layout.num_prep)
-            })
-            .collect();
+                .with_preprocessed(t.root, layout.num_prep),
+            );
+        }
+        self.merged = merged;
         self.merge_plan = merge.plan();
-        self
+        Ok(self)
     }
 
     /// The chips each merged AIR holds, in AIR order.
@@ -1250,14 +1265,15 @@ impl LfmAirs {
     }
 
     /// The AIR set a program's artifacts describe: roots, `KECCAK_RND` and
-    /// `LFM_BLAKE3` chunks, the `LFM_HASH` chunks, the hasher, the mask and
-    /// the one-row roots — every piece from the artifacts, none from a proof.
-    /// The same set `proof::verify_against_artifacts` builds piece by piece; a
-    /// caller holding artifacts (the node's child harvest) builds it here.
+    /// `LFM_BLAKE3` chunks, the `LFM_HASH` chunks, the hasher, the mask, the
+    /// one-row roots and the merged AIRs — every piece from the artifacts, none
+    /// from a proof. The same set `proof::verify_against_artifacts` builds piece
+    /// by piece; a caller holding artifacts (the node's child harvest) builds it
+    /// here. `Err` when the artifacts' merge is refused ([`Self::with_merge`]).
     pub fn for_artifacts(
         artifacts: &super::registry::LfmArtifacts,
         options: &ProofOptions,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let mut airs = Self::new_chunked(
             &artifacts.roots,
             &artifacts.blake3_chunk_roots,
@@ -1270,7 +1286,7 @@ impl LfmAirs {
         if let Some(one_row) = &artifacts.one_row_roots {
             airs = airs.with_one_row_roots(one_row);
         }
-        airs.with_merge(&artifacts.merge, options)
+        airs.with_merge(&artifacts.merge, &artifacts.log_heights, options)
     }
 
     /// Number of `LFM_HASH` instances this set was built with — one unless the

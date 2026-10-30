@@ -142,10 +142,13 @@ pub struct ProofFormat {
     /// chip.
     ///
     /// A LAYOUT choice of the caller's AIR set, carried here so it travels with
-    /// the options every artifact build, prove and verify is handed. This crate
-    /// never reads it: a merged AIR is an ordinary AIR to the STARK prover and
-    /// verifier. Like every format field it is a verifier-side constant, never
-    /// read from a proof.
+    /// the options every artifact build, prove and verify is handed. The STARK
+    /// prover and verifier never read it: a merged AIR is an ordinary AIR to
+    /// them, and no tree or FRI encoding depends on it. The one reader in this
+    /// crate is [`Self::is_legacy`] (it is a lever, so a format with it on is not
+    /// the legacy format — which makes a caller that requires the legacy format,
+    /// such as the RV64 recursion guard, refuse it). Like every format field it
+    /// is a verifier-side constant, never read from a proof.
     pub merge_equal_height_tables: bool,
 }
 

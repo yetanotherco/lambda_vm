@@ -700,7 +700,7 @@ pub(crate) fn harvest_child_under<Fam: crate::hash_pin::ProofFamily>(
     // `LFM_HASH` chunks and (S2) the one-row preprocessed roots, exactly
     // as `verify_against_artifacts` builds it: a one-row chip's Phase A root and
     // leg compare use them.
-    let airs = super::airs::LfmAirs::for_artifacts(&artifacts, &opts);
+    let airs = super::airs::LfmAirs::for_artifacts(&artifacts, &opts)?;
     let refs = airs.air_refs();
     let view = MultiProofView::Owned(&proved.proof);
     check_eq(refs.len(), view.len(), "one AIR per sub-proof")?;

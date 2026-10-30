@@ -25,8 +25,8 @@ use super::builder::LfmBuilder;
 use super::compiler::{LfmProgram, compile};
 use super::executor::execute;
 use super::merge::{
-    LfmMerge, MERGE_CANDIDATES, MergeChip, MergedConstraints, MergedLayout, PartBody, PartShape,
-    merged_interactions, plan_for_heights, plan_for_program, test_hooks,
+    LfmMerge, MERGE_CANDIDATES, MergeChip, MergedConstraints, MergedLayout, MergedTable, PartBody,
+    PartShape, merged_interactions, plan_for_heights, plan_for_program, test_hooks,
 };
 use super::p1_node_tests::{P1Child, harvest, node, runs};
 use super::proof::{LfmProof, lfm_prove, lfm_prove_under, prove_traces, verify_against_artifacts};
@@ -70,6 +70,10 @@ fn four_chip_program() -> (LfmProgram, Vec<Vec<LfmWord>>) {
     let s = b.add(x, y);
     let d = b.sub(s, h0);
     let m = b.mul(d, y);
+    // An add nobody reads: its output's write multiplicity is zero, so its row
+    // sends no memory token — only BALU's own body constrains its OUT
+    // (`a_bad_balu_row_in_a_merged_table_is_refused_by_balus_own_body`).
+    let _unread = b.add(y, x);
     let e0 = b.ext_const(&ext(1, 2, 3));
     let e1 = b.ext_const(&ext(4, 5, 6));
     let ep = b.emul(e0, e1);
@@ -250,7 +254,7 @@ fn a_part_body_reads_only_its_main_columns() {
         assert_eq!(r.emitted.len(), shape.num_base_constraints());
     }
     let layout = MergedLayout::of(&MERGE_CANDIDATES);
-    let set = MergedConstraints::new(&layout);
+    let set = MergedConstraints::new(&layout).expect("the candidates pass the audit");
     let mut r = Recorder::default();
     set.eval(&mut r);
     let mut emitted = r.emitted.clone();
@@ -281,7 +285,7 @@ fn a_part_body_reads_only_its_main_columns() {
 #[test]
 fn every_merge_remaps_its_buses() {
     let layout = MergedLayout::of(&MERGE_CANDIDATES);
-    let merged = merged_interactions(&layout);
+    let merged = merged_interactions(&layout).expect("contiguous");
     let mut at = 0;
     for part in &layout.parts {
         for original in PartShape::of(part.chip).interactions() {
@@ -417,11 +421,6 @@ fn a_merged_program_proves_and_verifies_under_its_own_artifacts_only() {
         !verifies(&merged, &p_plain, &on),
         "a plain proof under merged artifacts"
     );
-    // A hand-made merge the plan cannot produce is refused before anything is
-    // built: a chip in two merged AIRs.
-    let mut twice = merged.clone();
-    twice.merge.tables.push(twice.merge.tables[0].clone());
-    assert!(!verifies(&twice, &p_merged, &on));
 }
 
 /// The merged artifacts' AIR order: the merged AIR stands at BALU's place,
@@ -433,7 +432,7 @@ fn the_merged_air_stands_at_its_first_chip() {
     let (program, _) = four_chip_program();
     let opts = options(true);
     let artifacts = build_artifacts(&program, &opts);
-    let airs = LfmAirs::for_artifacts(&artifacts, &opts);
+    let airs = LfmAirs::for_artifacts(&artifacts, &opts).expect("the AIR set");
     let names: Vec<String> = airs
         .air_refs()
         .iter()
@@ -475,8 +474,9 @@ fn bad_select_traces(
 
 /// ★ Negative, then the mutant: a merged table with a non-boolean SELECT bit
 /// on a padding row is refused by the verifier — and with the merged AIR's
-/// SELECT body left out (prover and verifier both), the same table proves and
-/// VERIFIES. So the part's body inside the merged AIR is what refuses it.
+/// SELECT body vacuous (its indices kept, every constraint zero; prover and
+/// verifier both), the same table proves and VERIFIES. So the part's body
+/// inside the merged AIR is what refuses it.
 #[test]
 fn a_bad_select_row_in_a_merged_table_is_refused_by_selects_own_body() {
     let _g = lock();
@@ -491,14 +491,14 @@ fn a_bad_select_row_in_a_merged_table_is_refused_by_selects_own_body() {
     };
     assert!(refused, "the bad SELECT row must not verify");
 
-    test_hooks::set_select_body_dropped(true);
+    test_hooks::set_vacuous(Some(PartBody::Select));
     let mutant = std::panic::catch_unwind(|| {
         let (mut traces, words) = bad_select_traces(&program, &arenas, &artifacts);
         let proof =
             prove_traces(&artifacts, &mut traces, &words, &opts).expect("the mutant proves");
         verify_against_artifacts(&artifacts, &proof, &words, &opts)
     });
-    test_hooks::set_select_body_dropped(false);
+    test_hooks::set_vacuous(None);
     assert!(
         mutant.expect("the mutant runs"),
         "without SELECT's body the bad row verifies: the body is load-bearing"
@@ -572,7 +572,7 @@ fn a_node_verifies_a_merged_child_and_refuses_its_tampers() {
         "the honest merged child executes"
     );
 
-    let airs = LfmAirs::for_artifacts(&c.artifacts, &c.opts);
+    let airs = LfmAirs::for_artifacts(&c.artifacts, &c.opts).expect("the AIR set");
     let t = airs
         .air_refs()
         .iter()
@@ -648,7 +648,7 @@ fn the_merge_knob_parses_prints_and_refuses_like_its_siblings() {
 /// One tree program's AIRs under its artifacts: count, and main + aux cells
 /// (an aux column is three base cells) over every AIR.
 fn airs_and_cells(artifacts: &LfmArtifacts, wrap: &ProofOptions) -> (usize, u64) {
-    let airs = LfmAirs::for_artifacts(artifacts, wrap);
+    let airs = LfmAirs::for_artifacts(artifacts, wrap).expect("the AIR set");
     let heights = LfmAirs::log_heights_in_air_order(artifacts).expect("no keccak");
     let refs = airs.air_refs();
     let cells = refs
@@ -755,4 +755,353 @@ fn merge_census() {
             );
         }
     }
+}
+
+// ============================= review hardening ============================
+
+/// ★ The merge's well-formedness is checked on EVERY path that
+/// builds a merged AIR set — `LfmAirs::for_artifacts` (the leg's derivation and
+/// the harvest), the host verifier and the prover — against the artifacts'
+/// heights: a one-chip group, chips out of slot order, a chip in two merged
+/// AIRs and a chip at another height than its merged AIR are each refused, and
+/// nothing is built.
+#[test]
+fn a_malformed_merge_is_refused_on_every_path() {
+    let _g = lock();
+    let (program, arenas) = four_chip_program();
+    let opts = options(true);
+    let good = build_artifacts(&program, &opts);
+    let proof = lfm_prove(&program, &good, &arenas, &opts).expect("proves");
+    assert!(verifies(&good, &proof, &opts));
+    let t = &good.merge.tables[0];
+    let with = |tables: Vec<MergedTable>| LfmArtifacts {
+        merge: LfmMerge { tables },
+        ..good.clone()
+    };
+    let lone = MergedTable {
+        chips: vec![MergeChip::Balu],
+        ..t.clone()
+    };
+    let rest = MergedTable {
+        chips: t.chips[1..].to_vec(),
+        ..t.clone()
+    };
+    let swapped = MergedTable {
+        chips: vec![
+            MergeChip::Select,
+            MergeChip::Balu,
+            MergeChip::Lanes,
+            MergeChip::Hint,
+        ],
+        ..t.clone()
+    };
+    let taller = MergedTable {
+        log_height: t.log_height + 1,
+        ..t.clone()
+    };
+    let cases = [
+        ("a one-chip group", with(vec![lone, rest])),
+        ("chips out of slot order", with(vec![swapped])),
+        (
+            "a chip in two merged AIRs",
+            with(vec![t.clone(), t.clone()]),
+        ),
+        ("a chip at another height", with(vec![taller])),
+    ];
+    for (what, bad) in &cases {
+        let err = LfmAirs::for_artifacts(bad, &opts).err();
+        assert!(err.is_some(), "{what}: the AIR set must be refused");
+        println!("MERGE REFUSED {what}: {}", err.unwrap_or_default());
+        assert!(
+            super::per_table_aggregator::DerivedChild::from_artifacts(bad, &opts, 5).is_err(),
+            "{what}: the leg's derivation must refuse it"
+        );
+        assert!(!verifies(bad, &proof, &opts), "{what}: the host verifier");
+        let exec = execute(&program, &arenas, &bad.hasher).expect("executes");
+        let mut traces = build_traces_with_hasher(&program, &exec.records, bad.hasher);
+        assert!(
+            prove_traces(bad, &mut traces, &exec.public_words, &opts).is_err(),
+            "{what}: the prover"
+        );
+    }
+}
+
+/// ★ The bus remap refuses, in every build, a packing that the
+/// merged layout would split: a two-column packing over a part's last prefix
+/// column and its first value column lands on non-adjacent merged columns.
+#[test]
+fn a_packing_split_by_the_layout_is_refused() {
+    use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
+    let layout = MergedLayout::of(&[MergeChip::Balu, MergeChip::Select]);
+    let balu = &layout.parts[0];
+    let prep = PartShape::of(MergeChip::Balu).prep;
+    let straddle = BusInteraction::sender(
+        7u64,
+        Multiplicity::One,
+        vec![BusValue::Packed {
+            start_column: prep - 1,
+            packing: Packing::Word2L,
+        }],
+    );
+    assert!(super::merge::remap_interaction(&straddle, &balu.map).is_err());
+    let inside = BusInteraction::sender(
+        7u64,
+        Multiplicity::One,
+        vec![BusValue::Packed {
+            start_column: prep,
+            packing: Packing::Word2L,
+        }],
+    );
+    let ok = super::merge::remap_interaction(&inside, &balu.map).expect("contiguous");
+    assert_eq!(ok.columns_read(), vec![balu.map[prep], balu.map[prep] + 1]);
+}
+
+/// A body the remap could not translate faithfully.
+struct ReadsAux;
+impl ConstraintSet<F, E> for ReadsAux {
+    fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
+        let a = b.aux(0, 0);
+        let m = b.main(0, 0);
+        b.emit_ext(0, m * a);
+    }
+}
+struct ReadsPastWidth;
+impl ConstraintSet<F, E> for ReadsPastWidth {
+    fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
+        let m = b.main(0, 99);
+        b.emit_base(0, m);
+    }
+}
+struct Sparse;
+impl ConstraintSet<F, E> for Sparse {
+    fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
+        let m = b.main(0, 0);
+        b.emit_base(1, m);
+    }
+}
+
+/// ★ The guard behind `Remap`'s pass-through leaves: the audit
+/// every merged AIR build runs accepts the four candidates and refuses a body
+/// that reads an aux column (or emits an extension constraint), one that reads
+/// past its width, and one whose indices are not dense.
+#[test]
+fn the_body_audit_refuses_what_the_remap_cannot_translate() {
+    for chip in MERGE_CANDIDATES {
+        super::merge::audit_body(PartShape::of(chip)).expect("a candidate passes");
+    }
+    assert!(super::merge::audit_set(&ReadsAux, 4, "aux").is_err());
+    assert!(super::merge::audit_set(&ReadsPastWidth, 4, "width").is_err());
+    assert!(super::merge::audit_set(&Sparse, 4, "sparse").is_err());
+}
+
+/// The commitment-time answers a merged AIR must carry: every part's value
+/// columns, counted from the parts' own shapes (not from the AIR the answer set
+/// is computed from).
+fn answers_of(chips: &[MergeChip]) -> usize {
+    chips
+        .iter()
+        .map(|&c| {
+            let s = PartShape::of(c);
+            s.width - s.prep
+        })
+        .sum()
+}
+
+/// For every merged AIR of `artifacts` (in AIR order), its sub-proof index.
+fn merged_positions(artifacts: &LfmArtifacts, opts: &ProofOptions) -> Vec<usize> {
+    let airs = LfmAirs::for_artifacts(artifacts, opts).expect("the AIR set");
+    airs.air_refs()
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.name().starts_with("LFM_MERGED"))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// ★ A merged AIR answers, at the commitment-time point, exactly
+/// its parts' value columns — 29 for the four candidates — and a false answer
+/// at its last answered column is refused.
+#[test]
+fn a_merged_air_answers_every_parts_value_columns() {
+    let _g = lock();
+    let (program, arenas) = four_chip_program();
+    let opts = options(true);
+    let artifacts = build_artifacts(&program, &opts);
+    let proof = lfm_prove(&program, &artifacts, &arenas, &opts).expect("proves");
+    let at = merged_positions(&artifacts, &opts);
+    assert_eq!(at.len(), 1);
+    let answers = &proof.proof.commit_ood[at[0]];
+    assert_eq!(answers.len(), answers_of(&MERGE_CANDIDATES));
+    assert_eq!(answers.len(), 29);
+    let mut bad = proof;
+    let last = bad.proof.commit_ood[at[0]].len() - 1;
+    bad.proof.commit_ood[at[0]][last] += FEE::from(1u64);
+    assert!(!verifies(&artifacts, &bad, &opts), "a false last answer");
+}
+
+/// A program whose SELECT and HINT sit at eight rows and BALU and LANES at the
+/// four-row floor: the two-merged-AIR shape of a node or a top.
+fn two_group_program() -> (LfmProgram, Vec<Vec<LfmWord>>) {
+    let mut b = LfmBuilder::new();
+    let arena = b.declare_arena(6);
+    let felts: Vec<_> = (0..6).map(|i| b.hint_felt(arena, i)).collect();
+    let s = b.add(felts[0], felts[1]);
+    b.public(s.as_cell());
+    for i in 0..6 {
+        let bit = b.bit_const(i % 2 == 0);
+        let (l, r) = b.select(bit, felts[i].as_cell(), felts[(i + 1) % 6].as_cell());
+        b.public(l);
+        b.public(r);
+    }
+    let da = b.digest_const([fe(1), fe(2), fe(3), fe(4)]);
+    let lanes = b.unpack(da.as_cell());
+    let packed = b.pack_word(lanes);
+    b.public(packed);
+    let words = (0..6u64).map(|i| base_word(fe(100 + i))).collect();
+    (compile(b.finish()), vec![words])
+}
+
+/// ★ Two merged AIRs in one proof — {BALU, LANES} and
+/// {SELECT, HINT}, the node and top shape: the plan, the round trip, the
+/// cross refusals, two AIRs fewer than plain, and each merged AIR's answers.
+#[test]
+fn two_merged_airs_in_one_proof_prove_and_verify() {
+    let _g = lock();
+    let (program, arenas) = two_group_program();
+    let (on, off) = (options(true), options(false));
+    let merged = build_artifacts(&program, &on);
+    let plain = build_artifacts(&program, &off);
+    assert_eq!(
+        merged.merge.plan(),
+        vec![
+            vec![MergeChip::Balu, MergeChip::Lanes],
+            vec![MergeChip::Select, MergeChip::Hint]
+        ]
+    );
+    let p_merged = lfm_prove(&program, &merged, &arenas, &on).expect("merged proves");
+    let p_plain = lfm_prove(&program, &plain, &arenas, &off).expect("plain proves");
+    assert_eq!(sub_proofs(&p_merged) + 2, sub_proofs(&p_plain));
+    assert!(verifies(&merged, &p_merged, &on));
+    assert!(verifies(&plain, &p_plain, &off));
+    assert!(!verifies(&plain, &p_merged, &off));
+    assert!(!verifies(&merged, &p_plain, &on));
+    let at = merged_positions(&merged, &on);
+    assert_eq!(at.len(), 2);
+    for (pos, table) in at.iter().zip(&merged.merge.tables) {
+        assert_eq!(
+            p_merged.proof.commit_ood[*pos].len(),
+            answers_of(&table.chips),
+            "{:?}",
+            table.chips
+        );
+    }
+    assert_eq!(
+        (
+            p_merged.proof.commit_ood[at[0]].len(),
+            p_merged.proof.commit_ood[at[1]].len()
+        ),
+        (8, 21)
+    );
+}
+
+/// ★ Negative, then the mutant, for BALU: an add nobody reads
+/// (write multiplicity zero, so no memory token moves) given a wrong output
+/// inside the merged table is refused — and with BALU's body vacuous in the
+/// merged AIR, the same table proves and VERIFIES. BALU's body is what refuses
+/// it.
+#[test]
+fn a_bad_balu_row_in_a_merged_table_is_refused_by_balus_own_body() {
+    let _g = lock();
+    let (program, arenas) = four_chip_program();
+    let opts = options(true);
+    let artifacts = build_artifacts(&program, &opts);
+    let g = &program.groups.balu;
+    let row = (0..g.real_rows)
+        .find(|&r| {
+            *g.at(r, super::layout::balu::MULT) == fe(0)
+                && *g.at(r, super::layout::balu::SEL_ADD) == fe(1)
+        })
+        .expect("the unread add");
+    let bad = || {
+        let exec = execute(&program, &arenas, &artifacts.hasher).expect("executes");
+        let plan = artifacts.merge.plan();
+        let mut traces = build_traces_with_merge(&program, &exec.records, artifacts.hasher, &plan);
+        let col = MergedLayout::of(&plan[0]).parts[0].map[super::chips::balu::cols::OUT];
+        let v = *traces.merged[0].get_main(row, col);
+        traces.merged[0].set_main(row, col, v + fe(1));
+        (traces, exec.public_words)
+    };
+    let (mut traces, words) = bad();
+    let refused = match prove_traces(&artifacts, &mut traces, &words, &opts) {
+        Ok(proof) => !verify_against_artifacts(&artifacts, &proof, &words, &opts),
+        Err(_) => true,
+    };
+    assert!(refused, "the bad BALU row must not verify");
+
+    test_hooks::set_vacuous(Some(PartBody::Balu));
+    let mutant = std::panic::catch_unwind(|| {
+        let (mut traces, words) = bad();
+        let proof =
+            prove_traces(&artifacts, &mut traces, &words, &opts).expect("the mutant proves");
+        verify_against_artifacts(&artifacts, &proof, &words, &opts)
+    });
+    test_hooks::set_vacuous(None);
+    assert!(
+        mutant.expect("the mutant runs"),
+        "with BALU's body vacuous the bad row verifies: the body is load-bearing"
+    );
+}
+
+/// ★ The merged root is the program's identity: two programs
+/// that differ only in one merged chip's instruction columns (an add's
+/// operands swapped, same heights) get different ids, and so does the same
+/// program with its merged root moved.
+#[test]
+fn the_merged_root_is_folded_into_the_program_id() {
+    let _g = lock();
+    let opts = options(true);
+    let build = |swap: bool| {
+        let mut b = LfmBuilder::new();
+        let arena = b.declare_arena(1);
+        let h0 = b.hint_felt(arena, 0);
+        let x = b.felt_const(fe(7));
+        let y = b.felt_const(fe(5));
+        let s = if swap { b.add(y, x) } else { b.add(x, y) };
+        let d = b.sub(s, h0);
+        let bit = b.bit_const(true);
+        let (l, _) = b.select(bit, x.as_cell(), d.as_cell());
+        let lanes = b.unpack(l);
+        let packed = b.pack_word(lanes);
+        b.public(packed);
+        build_artifacts(&compile(b.finish()), &opts)
+    };
+    let (a, b) = (build(false), build(true));
+    assert_eq!(a.log_heights, b.log_heights, "the same heights");
+    assert_eq!(a.merge.plan(), b.merge.plan());
+    assert_ne!(
+        a.merge.tables[0].root, b.merge.tables[0].root,
+        "BALU's columns differ"
+    );
+    for c in MERGE_CANDIDATES {
+        assert_eq!(a.roots[c.slot()], b.roots[c.slot()], "both zero");
+    }
+    assert_ne!(a.program_id, b.program_id, "the merged root is identity");
+    let mut moved = a.merge.clone();
+    moved.tables[0].root[0] ^= 1;
+    let id = |merge: &LfmMerge| {
+        super::statement::lfm_program_id_merged_under(
+            crate::hash_pin::BLOCK_COMMITMENT_HASH,
+            &a.roots,
+            &a.log_heights,
+            a.keccak_rnd_chunks,
+            a.hasher,
+            a.chip_set,
+            &a.blake3_chunk_roots,
+            &a.blake3_chunk_log_heights,
+            &a.hash_chunk_roots,
+            &a.hash_chunk_log_heights,
+            merge,
+        )
+    };
+    assert_ne!(id(&a.merge), id(&moved));
 }

@@ -466,6 +466,10 @@ pub(crate) fn prove_traces_under<Fam: ProofFamily>(
     // The traces in the artifacts' merge (`LAMBDA_VM_ZF_LFM_MERGE`): a no-op for
     // a set the fill already merged as the artifacts ask, which is the
     // production path; a copy, before the card, for one filled unmerged.
+    artifacts
+        .merge
+        .check(&artifacts.log_heights)
+        .map_err(ProvingError::WrongParameter)?;
     traces
         .merge_to(&artifacts.merge.plan())
         .map_err(ProvingError::WrongParameter)?;
@@ -490,7 +494,9 @@ pub(crate) fn prove_traces_under<Fam: ProofFamily>(
     if let Some(one_row) = &artifacts.one_row_roots {
         airs = airs.with_one_row_roots(one_row);
     }
-    let airs = airs.with_merge(&artifacts.merge, options);
+    let airs = airs
+        .with_merge(&artifacts.merge, &artifacts.log_heights, options)
+        .map_err(ProvingError::WrongParameter)?;
     // The per-domain constants each table's prove would build on first use
     // inside the card window, built before it instead
     // (`stark::prover::warm_prove_constants`; cached, so no value moves).
@@ -530,23 +536,6 @@ fn process_merge_plan(program: &LfmProgram) -> super::merge::MergePlan {
         program,
         format.lfm_merge && format.one_row == stark::proof::options::OneRowMode::Off,
     )
-}
-
-/// Whether `merge` (an artifacts' merged AIRs) is one a program can have: every
-/// merged AIR holds two or more distinct candidate chips in slot order, and no
-/// chip sits in two of them. Merged chips share a height by construction
-/// ([`super::merge::plan_for_heights`]); a hand-made `merge` that broke these
-/// would build an AIR set with a chip twice or out of the frozen order.
-fn merge_is_well_formed(merge: &super::merge::LfmMerge) -> bool {
-    let mut seen: Vec<usize> = Vec::new();
-    merge.tables.iter().all(|t| {
-        let slots: Vec<usize> = t.chips.iter().map(|c| c.slot()).collect();
-        let ok = slots.len() > 1
-            && slots.windows(2).all(|w| w[0] < w[1])
-            && slots.iter().all(|s| !seen.contains(s));
-        seen.extend(slots);
-        ok
-    })
 }
 
 /// The LFM wrap's [`ResidencyMode`]: `RecomputeLde` when `LAMBDA_VM_RESIDENCY`
@@ -618,7 +607,7 @@ pub fn verify_against_artifacts_under<Fam: ProofFamily>(
 ) -> bool {
     verify_against_chunked_with::<Fam>(
         artifacts.one_row_roots.as_ref(),
-        &artifacts.merge,
+        (&artifacts.merge, &artifacts.log_heights),
         &artifacts.roots,
         &artifacts.blake3_chunk_roots,
         &artifacts.hash_chunk_roots,
@@ -703,7 +692,7 @@ pub fn verify_against_chunked(
 ) -> bool {
     verify_against_chunked_with::<LegacyFamily>(
         None,
-        &super::merge::LfmMerge::none(),
+        (&super::merge::LfmMerge::none(), &[0u8; NUM_LFM_CHIPS]),
         roots,
         blake3_roots,
         // One `LFM_HASH` table: the hash split rides the artifacts, so a split
@@ -726,7 +715,7 @@ pub fn verify_against_chunked(
 #[allow(clippy::too_many_arguments)]
 fn verify_against_chunked_with<Fam: ProofFamily>(
     one_row_roots: Option<&super::registry::LfmOneRowRoots>,
-    merge: &super::merge::LfmMerge,
+    (merge, log_heights): (&super::merge::LfmMerge, &[u8; NUM_LFM_CHIPS]),
     roots: &[Commitment; NUM_LFM_CHIPS],
     blake3_roots: &[Commitment],
     hash_roots: &[Commitment],
@@ -762,12 +751,10 @@ fn verify_against_chunked_with<Fam: ProofFamily>(
     if hash_roots.first() != Some(&roots[HASH_SLOT]) {
         return false;
     }
-    // A merge is the artifacts' (never the proof's), and it takes its chips'
-    // heights: a merged AIR of chips the artifacts put at different heights
-    // describes no program, so it is refused rather than built.
-    if !merge_is_well_formed(merge) {
-        return false;
-    }
+    // The merge is the artifacts' (never the proof's); `LfmAirs::with_merge`
+    // below refuses one that is not well formed against the artifacts' heights
+    // (two or more chips in slot order, no chip twice, every chip at the merged
+    // height), and the proof is then refused.
     let view = MultiProofView::Owned(&proof.multi);
     if view.len()
         != chip_set.num_airs(keccak_rnd_chunks, blake3_roots.len()) + hash_roots.len()
@@ -789,7 +776,9 @@ fn verify_against_chunked_with<Fam: ProofFamily>(
     if let Some(one_row) = one_row_roots {
         airs = airs.with_one_row_roots(one_row);
     }
-    let airs = airs.with_merge(merge, options);
+    let Ok(airs) = airs.with_merge(merge, log_heights, options) else {
+        return false;
+    };
     let refs = airs.air_refs();
 
     let mut transcript = Fam::transcript(&[]);

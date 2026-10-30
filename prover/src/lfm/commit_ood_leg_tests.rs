@@ -85,7 +85,7 @@ fn publishing_node(c: &P1Child) -> LfmProgram {
 /// The host's `z0`: the statement, every root, then the draw over the
 /// largest domain — the verifier's Phase A up to the answers.
 fn host_z0(c: &P1Child) -> FEE {
-    let airs = super::airs::LfmAirs::for_artifacts(&c.artifacts, &c.opts);
+    let airs = super::airs::LfmAirs::for_artifacts(&c.artifacts, &c.opts).expect("the AIR set");
     let refs = airs.air_refs();
     let view = MultiProofView::Owned(&c.proof.proof.multi);
     let mut t = P1Family::transcript(&[]);
@@ -124,7 +124,7 @@ fn host_z0(c: &P1Child) -> FEE {
 fn every_lfm_sub_proof_answers_its_non_precomputed_main_columns() {
     let c = p1_child();
     assert!(host_verifies(&c, &c.proof));
-    let airs = super::airs::LfmAirs::for_artifacts(&c.artifacts, &c.opts);
+    let airs = super::airs::LfmAirs::for_artifacts(&c.artifacts, &c.opts).expect("the AIR set");
     let refs = airs.air_refs();
     assert_eq!(
         c.proof.proof.commit_ood.len(),

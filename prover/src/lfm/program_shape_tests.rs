@@ -253,7 +253,7 @@ fn artifacts_that_keep_bitwise_pair_the_all_zero_table() {
             ..built.chip_set
         },
     );
-    let airs = LfmAirs::for_artifacts(&kept, &options());
+    let airs = LfmAirs::for_artifacts(&kept, &options()).expect("the AIR set");
     let bitwise = LFM_CHIP_NAMES[BITWISE_SLOT];
     let paired: Vec<String> = airs
         .air_trace_pairs(&mut traces)
@@ -695,7 +695,7 @@ fn an_emitted_leg_verifies_a_split_child_without_bitwise() {
 
     // The same proof, the leg emitted against chunk 0's root in chunk 1's place.
     let hash = LFM_CHIP_NAMES[HASH_SLOT];
-    let airs = super::airs::LfmAirs::for_artifacts(&child.artifacts, &opts);
+    let airs = super::airs::LfmAirs::for_artifacts(&child.artifacts, &opts).expect("the AIR set");
     let tail = airs
         .air_refs()
         .iter()
