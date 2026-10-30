@@ -105,15 +105,17 @@ pub const BLOCK_ECDAS_ROWS_LOG2: usize = 17;
 
 /// The most KECCAK tables a block statement may declare: a bound on what the
 /// verifier builds before anything is checked, far above any block (a
-/// keccak-heavy block at the gas limit makes ≈ 8 at 2^18 rows).
+/// keccak-heavy block at the gas limit makes ≈ 16 at 2^17 rows).
 pub const BLOCK_MAX_KECCAK: usize = 1 << 12;
 
 /// The rows each KECCAK table holds at most — a prover's choice, under the
-/// format's cap [`BLOCK_KECCAK_MAX_VARS`]. KECCAK is one row per permutation
-/// call, so a cut falls between calls. A keccak-heavy block at the gas limit
-/// makes ≈ 2^21 calls, whose one table would stack into eight polynomials of a
-/// 2^27 stack; at 2^18 rows its 511 columns fit one.
-pub const BLOCK_KECCAK_ROWS_LOG2: usize = 18;
+/// format's cap [`BLOCK_KECCAK_MAX_VARS`]. KECCAK is one row per permutation,
+/// so a cut falls between permutations; the rows of one Keccak-256 call may
+/// straddle two tables, chained only through the KeccakSponge bus keyed by the
+/// call's timestamp and the block index. A keccak-heavy block at the gas limit
+/// makes ≈ 2^21 permutations, whose one table would stack into many
+/// polynomials of a 2^27 stack; at 2^17 rows its 907 columns fit one.
+pub const BLOCK_KECCAK_ROWS_LOG2: usize = 17;
 
 /// The most ECSM tables a block statement may declare: a bound on what the
 /// verifier builds before anything is checked, far above any block.
@@ -139,7 +141,7 @@ pub const BLOCK_ECDAS_MAX_VARS: usize = 17;
 /// The tallest KECCAK table a block statement may state, in variables: a
 /// verifier constant ([`check_chunked_heights`]), so no statement makes one
 /// KECCAK table stack into more than one polynomial of a 2^27 stack.
-pub const BLOCK_KECCAK_MAX_VARS: usize = 18;
+pub const BLOCK_KECCAK_MAX_VARS: usize = 17;
 
 /// The tallest ECSM table a block statement may state, in variables: a
 /// verifier constant ([`check_chunked_heights`]), so no statement makes one
