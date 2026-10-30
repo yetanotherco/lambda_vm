@@ -147,6 +147,9 @@ fn solve_y_rejects_inconsistent_oracle_xc() {
     let inv_den = Option::<FieldElement>::from((yp.double() * dx).invert())
         .expect("dx is nonzero for k=12345");
 
+    let f = Fe::from_k256;
+    let (xp, yp, xa, dx, inv_den) = (f(&xp), f(&yp), f(&xa), f(&dx), f(&inv_den));
+    let (xc_correct, xc_wrong) = (f(&xc_correct), f(&xc_wrong));
     assert!(
         solve_y(&xp, &yp, &xa, &xc_correct, &dx, &inv_den).is_some(),
         "correct xc must pass the lambda² check"
@@ -182,9 +185,9 @@ fn odd_y_base_point_reconstructs_correctly() {
     assert_eq!(got, expected.to_affine());
 }
 
-/// The precompile's little-endian encodings: `reverse32` is the byte reversal (and
-/// its own inverse), and `scalar_le` is the reversal of the scalar's big-endian
-/// bytes, on edge values and seeded random ones.
+/// The precompile's little-endian encodings: a field element's little-endian bytes
+/// are the reversal of its big-endian ones, and `scalar_le` is the reversal of the
+/// scalar's big-endian bytes, on edge values and seeded random ones.
 #[test]
 fn little_endian_encodings() {
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
@@ -207,8 +210,14 @@ fn little_endian_encodings() {
         }
         let mut reversed = bytes;
         reversed.reverse();
-        assert_eq!(reverse32(&bytes), reversed);
-        assert_eq!(reverse32(&reverse32(&bytes)), bytes);
+        if let Some(fe) = Fe::from_le_bytes(&bytes) {
+            assert_eq!(fe.to_le_bytes(), bytes);
+            assert_eq!(fe.to_be_bytes(), reversed);
+            assert_eq!(
+                Fe::from_be_bytes(&reversed).map(|f| f.to_le_bytes()),
+                Some(bytes)
+            );
+        }
         scalars.push(<Scalar as Reduce<U256>>::reduce_bytes(&bytes.into()));
     }
     for k in scalars {
