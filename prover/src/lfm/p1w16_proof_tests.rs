@@ -94,6 +94,9 @@ fn round_trip(mutate: impl FnOnce(&mut TraceTable<F, E>)) -> Result<bool, String
     let exec = execute(&program, &[], &KIND).expect("execute");
     let mut traces = build_traces_with_hasher(&program, &exec.records, KIND);
     mutate(&mut traces.hash);
+    // The edit is to the host trace: the card must not rebuild the unedited rows.
+    #[cfg(feature = "cuda")]
+    traces.hash.clear_main_dev_producer();
     match prove_traces_with_hasher(
         &artifacts,
         &mut traces,
