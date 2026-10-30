@@ -1909,6 +1909,8 @@ pub struct BlockStamps {
     pub layout: LayoutStamps,
     /// A streamed build's producer: what each of its threads waited on.
     pub producer: ProducerStamps,
+    /// A streamed build's executor thread: its own work apart from its waits.
+    pub executor: ExecutorStamps,
     /// How phase A held the committed columns, and the narrow tables phase B
     /// widened on the host, `(tables, cells)`: a device path widens on the
     /// card.
@@ -1997,6 +1999,56 @@ pub struct ProducerStamps {
     pub layout_send: f64,
     pub worker_permit: f64,
     pub worker_recv: f64,
+}
+
+/// The streamed build's executor thread, its own work apart from its waits
+/// ([`BlockStamps::executor`]); with `send` ([`ProducerStamps::executor_send`])
+/// they add up to the thread's span. A measurement; it changes nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExecutorStamps {
+    /// When the thread started, since the streamed prove started.
+    pub started: f64,
+    /// The executor's setup: the program and the private input loaded.
+    pub setup: f64,
+    /// Executing, the logs written as it goes.
+    pub run: f64,
+    /// Handing each window out: its logs moved or copied and the memory
+    /// snapshot at the next window's start.
+    pub handoff: f64,
+    /// The windows handed out.
+    pub windows: usize,
+    /// The logs left as they lay (`LAMBDA_VM_BLOCK_LOGS_MOVE`, on unless `0`)
+    /// rather than copied.
+    pub moved: bool,
+}
+
+impl ExecutorStamps {
+    /// The `BLOCK EXECUTOR:` line, `send` the thread's blocked sends.
+    fn line(&self, send: f64) -> String {
+        format!(
+            "BLOCK EXECUTOR: started at {:.2}s · setup {:.2}s · execute {:.2}s · hand-off {:.2}s ({} windows, logs {}) · send-blocked {:.2}s · own {:.2}s\n",
+            self.started,
+            self.setup,
+            self.run,
+            self.handoff,
+            self.windows,
+            if self.moved { "moved" } else { "copied" },
+            send,
+            self.setup + self.run + self.handoff,
+        )
+    }
+}
+
+/// `LAMBDA_VM_BLOCK_LOGS_MOVE`: the executor hands each window's logs out as
+/// they lie ([`Executor::resume_owned`]) unless set to `0`, which copies them
+/// out of the executor's buffer as before. The same logs either way.
+fn block_logs_move() -> bool {
+    parse_logs_move(std::env::var("LAMBDA_VM_BLOCK_LOGS_MOVE").ok().as_deref())
+}
+
+/// [`block_logs_move`] of the knob's value.
+fn parse_logs_move(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
 }
 
 /// [`ProducerStamps`] as the threads add to them, in nanoseconds.
@@ -2119,6 +2171,9 @@ impl BlockStamps {
                 p.worker_permit,
                 p.worker_recv,
             ));
+            if self.executor.windows > 0 {
+                out.push_str(&self.executor.line(p.executor_send));
+            }
             let h = &self.windows.handout;
             let tables: Vec<String> = StreamTable::ALL
                 .iter()
@@ -5479,20 +5534,50 @@ fn prove_streamed(
                 Vec<executor::vm::logs::Log>,
                 Option<executor::vm::memory::MemorySnapshot>,
             )>(2);
-            let executor = scope.spawn(move || -> Result<f64, Error> {
+            let executor = scope.spawn(move || -> Result<(f64, ExecutorStamps), Error> {
                 if let Some(ledger) = ledger {
                     ledger.thread("executor");
                 }
+                let moved = block_logs_move();
+                let mut own = ExecutorStamps {
+                    started: start.elapsed().as_secs_f64(),
+                    moved,
+                    ..ExecutorStamps::default()
+                };
+                let t = Instant::now();
                 let mut executor = Executor::new(program, private_inputs.to_vec())
                     .map_err(|e| Error::Execution(format!("{e}")))?;
+                own.setup = t.elapsed().as_secs_f64();
                 let mut at_start = (walkers > 0).then(|| executor.memory().snapshot());
-                while let Some(logs) = executor
-                    .resume_with_limit(window)
-                    .map_err(|e| Error::Execution(format!("{e}")))?
-                {
-                    let logs = logs.to_vec();
+                loop {
+                    let t = Instant::now();
+                    let failed = |e: executor::vm::execution::ExecutorError| {
+                        Error::Execution(format!("{e}"))
+                    };
+                    // `ran`: the window executed; the copy, when the logs are
+                    // not moved, is the hand-off's.
+                    let (logs, ran) = if moved {
+                        (
+                            executor.resume_owned(window).map_err(failed)?,
+                            Instant::now(),
+                        )
+                    } else {
+                        match executor.resume_with_limit(window).map_err(failed)? {
+                            Some(logs) => {
+                                let ran = Instant::now();
+                                (Some(logs.to_vec()), ran)
+                            }
+                            None => (None, Instant::now()),
+                        }
+                    };
+                    own.run += (ran - t).as_secs_f64();
+                    let Some(logs) = logs else {
+                        break;
+                    };
                     let next = (walkers > 0).then(|| executor.memory().snapshot());
                     let start = std::mem::replace(&mut at_start, next);
+                    own.windows += 1;
+                    own.handoff += ran.elapsed().as_secs_f64();
                     if let Some(ledger) = ledger {
                         // The executor keeps a window of logs of its own.
                         let bytes = memlog::logs_bytes(&logs);
@@ -5513,7 +5598,7 @@ fn prove_streamed(
                     ledger.exec.store(0, Relaxed);
                     ledger.line("executor done");
                 }
-                Ok(executed)
+                Ok((executed, own))
             });
             let (btx, brx) = std::sync::mpsc::sync_channel::<Built>(64);
             let finish_ledger = logged.clone();
@@ -6242,7 +6327,7 @@ fn prove_streamed(
         let queue_line = group_queue::line(queue_setting, queue_rule, &queue_stats);
         eprintln!("{queue_line}");
         stamps.group_queue = Some(queue_line);
-        stamps.execute =
+        (stamps.execute, stamps.executor) =
             executed.map_err(|_| Error::Prover("the block's executor panicked".into()))??;
         // A thread's error names the cause; a commit that ran out of groups only
         // says that it did.
@@ -7988,7 +8073,7 @@ mod rest_order_tests {
 mod producer_report_tests {
     use super::{
         BLOCK_LAYOUT_AHEAD, BLOCK_LAYOUT_WORKERS, BLOCK_WINDOW_LOG2, BlockOptions, BlockStamps,
-        ProducerStamps, StreamTable, parse_window_log2,
+        ExecutorStamps, ProducerStamps, StreamTable, parse_logs_move, parse_window_log2,
     };
 
     /// Production lays the streamed chunks out on six workers with eight
@@ -8014,6 +8099,56 @@ mod producer_report_tests {
         for bad in ["", "19", "21", " 21 ", "22", "2^20", "x"] {
             assert!(parse_window_log2(Some(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    /// The executor's line: its own work apart from its blocked sends, and
+    /// whether its logs were moved or copied; no line without a streamed run.
+    #[test]
+    fn the_report_says_what_the_executor_did_apart_from_waiting() {
+        let mut stamps = BlockStamps {
+            streamed: (8.62, 269),
+            producer: ProducerStamps {
+                executor_send: 3.5,
+                ..ProducerStamps::default()
+            },
+            executor: ExecutorStamps {
+                started: 0.02,
+                setup: 0.01,
+                run: 2.5,
+                handoff: 0.04,
+                windows: 134,
+                moved: true,
+            },
+            ..BlockStamps::default()
+        };
+        let line = |stamps: &BlockStamps| {
+            stamps
+                .report()
+                .lines()
+                .find(|l| l.starts_with("BLOCK EXECUTOR:"))
+                .map(str::to_string)
+        };
+        assert_eq!(
+            line(&stamps).as_deref(),
+            Some(
+                "BLOCK EXECUTOR: started at 0.02s · setup 0.01s · execute 2.50s · hand-off 0.04s \
+                 (134 windows, logs moved) · send-blocked 3.50s · own 2.55s"
+            )
+        );
+        stamps.executor.moved = false;
+        assert!(line(&stamps).unwrap().contains("logs copied"));
+        stamps.executor = ExecutorStamps::default();
+        assert_eq!(line(&stamps), None);
+    }
+
+    /// `LAMBDA_VM_BLOCK_LOGS_MOVE`: on unless `0`.
+    #[test]
+    fn the_logs_are_moved_unless_the_knob_is_zero() {
+        assert!(parse_logs_move(None));
+        assert!(parse_logs_move(Some("1")));
+        assert!(parse_logs_move(Some("")));
+        assert!(!parse_logs_move(Some("0")));
+        assert!(!parse_logs_move(Some(" 0 ")));
     }
 
     /// The readout's two producer lines: what each thread waited on, and the
