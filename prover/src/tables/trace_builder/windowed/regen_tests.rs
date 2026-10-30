@@ -14,11 +14,12 @@ use crate::test_utils::asm_elf_bytes;
 /// The asm programs the regeneration tests run: every walk path (loads and
 /// stores of every width, word instructions, COMMIT, KECCAK, BLAKE3 and its
 /// absorb, ECSM).
-const PROGRAMS: [&str; 8] = [
+const PROGRAMS: [&str; 9] = [
     "all_instructions_64",
     "lw_sw_offset_odd",
     "test_memw_split_ts",
     "test_keccak_multi",
+    "test_keccak256",
     "test_blake3",
     "test_blake3_absorb",
     "test_commit_split",

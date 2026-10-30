@@ -732,8 +732,11 @@ mod keccak_tests {
     fn test_keccak_bus_interaction_counts() {
         assert_eq!(
             keccak::bus_interactions().len(),
-            84,
-            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 25 IS_WHH (25 IS_WH + 25 IS_HALF) + 1 BYTE_ALU alignment + 4 ARE_BYTES addr pairs + 1 Keccak send + 1 Keccak recv"
+            370,
+            "KECCAK core, permute mode: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 25 IS_WHH \
+             (25 IS_WH + 25 IS_HALF) + 1 BYTE_ALU alignment + 4 ARE_BYTES addr pairs + 1 Keccak \
+             send + 1 Keccak recv (84); sponge mode: 1 ECALL + 3 register reads + 2 chain + 17 \
+             lane reads + 119 byte reads + 136 XOR + 4 IS_HALF + 4 digest writes (286)"
         );
         assert_eq!(
             keccak_rnd::bus_interactions().len(),
@@ -754,8 +757,8 @@ mod keccak_tests {
     fn test_keccak_column_counts() {
         assert_eq!(
             core_cols::NUM_COLUMNS,
-            486,
-            "KECCAK core columns (state_ptr DWordWHH)"
+            907,
+            "KECCAK core columns (state_ptr DWordWHH; 486 + 421 for the sponge mode)"
         );
         assert_eq!(
             rnd_cols::NUM_COLUMNS,
@@ -770,8 +773,10 @@ mod keccak_tests {
         use stark::constraints::builder::ConstraintSet;
         assert_eq!(
             keccak::KeccakConstraints.meta().len(),
-            52,
-            "KECCAK core: 25 ADD pairs + no-overflow + MuIsBit"
+            791,
+            "KECCAK core: 25 ADD pairs + no-overflow + MuIsBit + 6 mode (58); sponge mode: \
+             136 mask bits + 119 FULL·PART + 135 prefix + 4 row rules + 136 MSG zero + \
+             201 first-row zero + 2 address halves (733)"
         );
         assert_eq!(
             keccak_rnd::KeccakRndConstraints.meta().len(),

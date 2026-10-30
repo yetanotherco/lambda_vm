@@ -168,13 +168,14 @@ fn tamper_with(
     }
 }
 
-const PROGRAMS: [&str; 12] = [
+const PROGRAMS: [&str; 13] = [
     "sub",
     "all_instructions_64",
     "lw_sw_offset_odd",
     "test_memw_split_ts",
     "test_keccak",
     "test_keccak_multi",
+    "test_keccak256",
     "test_blake3",
     "test_blake3_absorb",
     "test_commit_split",
@@ -403,8 +404,8 @@ fn an_entry_stamped_0_must_carry_the_images_value() {
 }
 
 /// The bytes each value-only reader reads in a walked window: HINT's input,
-/// ECSM's operands, KECCAK's and BLAKE3's states, the absorb's control block
-/// and message. (The bytes COPY moves, the committed output's among them, are
+/// ECSM's operands, KECCAK's and BLAKE3's states, a Keccak-256 call's blocks,
+/// the absorb's control block and message. (The bytes COPY moves, the committed output's among them, are
 /// read and written through MEMW ops like any load's.)
 fn value_reads(window: &WalkedWindow) -> Vec<(&'static str, u64, u64)> {
     let w = &window.walk;
@@ -414,11 +415,12 @@ fn value_reads(window: &WalkedWindow) -> Vec<(&'static str, u64, u64)> {
         out.push(("ECSM xG", o.addr_xg, 32));
         out.push(("ECSM k", o.addr_k, 32));
     }
-    out.extend(
-        w.keccak_ops
-            .iter()
-            .map(|o| ("KECCAK lanes", o.state_addr, 200)),
-    );
+    for o in &w.keccak_ops {
+        match &o.sponge {
+            None => out.push(("KECCAK lanes", o.state_addr, 200)),
+            Some(s) => out.push(("KECCAK256 block", s.src, s.taken() as u64)),
+        }
+    }
     out.extend(
         w.blake3_ops
             .iter()
@@ -466,6 +468,7 @@ fn a_dropped_entry_a_value_only_reader_reads_is_refused() {
         "test_blake3",
         "test_blake3_absorb",
         "test_commit_split",
+        "test_keccak256",
     ] {
         let (program, logs) = program_of(name);
         let reference = whole(&program, &logs, &MaxRowsConfig::small());
@@ -525,6 +528,7 @@ fn a_dropped_entry_a_value_only_reader_reads_is_refused() {
         "ECSM xG",
         "ECSM k",
         "KECCAK lanes",
+        "KECCAK256 block",
         "BLAKE3 state",
         "absorb control",
         "absorb message",

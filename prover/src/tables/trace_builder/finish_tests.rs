@@ -176,13 +176,14 @@ pub(super) fn windowed(
     traces
 }
 
-const PROGRAMS: [&str; 13] = [
+const PROGRAMS: [&str; 14] = [
     "sub",
     "all_instructions_64",
     "all_loadstore_32",
     "misalign_sd",
     "test_keccak",
     "test_keccak_multi",
+    "test_keccak256",
     "test_ecsm",
     "test_ecsm_multi",
     "test_ecsm_split",
