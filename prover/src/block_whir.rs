@@ -3406,6 +3406,11 @@ pub(crate) struct Deviations {
     /// (`Some(false)`), instead of what `LAMBDA_VM_BLOCK_BITWISE_FROM_TABLES`
     /// says (`None`; [`block_bitwise_from_tables`]).
     pub bitwise_from_tables: Option<bool>,
+    /// The hand-out's counting on a thread of its own (`Some(true)`) or on
+    /// the accumulator's (`Some(false)`), instead of what
+    /// `LAMBDA_VM_HANDOUT_COUNT_THREAD` says (`None`;
+    /// [`WindowedTraceBuilder::count_handout_on_thread`]).
+    pub handout_count_thread: Option<bool>,
     /// The host's memory target, in bytes, instead of the machine's
     /// ([`memory_target_bytes`]): 0 makes the `auto` rule want every table out.
     pub memory_target: Option<u64>,
@@ -5541,6 +5546,9 @@ fn prove_streamed(
                 }
                 if options.stream_memw_lt {
                     builder = builder.stream_memw_lt();
+                }
+                if let Some(on) = deviations.handout_count_thread {
+                    builder = builder.count_handout_on_thread(on);
                 }
                 if options.drop_streamed_ops {
                     builder = builder.drop_streamed_ops()?;

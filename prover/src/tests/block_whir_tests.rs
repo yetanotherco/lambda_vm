@@ -4848,6 +4848,82 @@ fn cpu_and_memw_r_filled_from_records_move_no_byte() {
     }
 }
 
+/// ★ Counting the hand-out on a thread of its own (the
+/// `LAMBDA_VM_HANDOUT_COUNT_THREAD` knob, [`Deviations::handout_count_thread`])
+/// moves no byte: the streamed block, its ops dropped as their chunks leave,
+/// proved with each chunk's counts taken on the accumulator's thread and on a
+/// thread of its own verifies with the same partition, tables and statement,
+/// its bytes equal under the deterministic grind; with the CPU and MEMW_R
+/// chunks held as records or filled on the host, laid out inline and on
+/// workers. The thread ran only where asked, and counted chunks.
+#[test]
+fn counting_the_hand_out_on_its_own_thread_moves_no_byte() {
+    let format = many_groups();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    for name in ["all_instructions_64", "test_keccak_multi"] {
+        let elf = asm_elf_bytes(name);
+        for workers in [0usize, 3] {
+            for records in [false, true] {
+                let what = format!("{name}, {workers} workers, records {records}");
+                let proved = |on_thread: bool| {
+                    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+                    o.layout_workers = workers;
+                    o.drop_streamed_ops = true;
+                    let base = if records {
+                        Deviations {
+                            records_keep: Some(true),
+                            ..streamed_records(true, true)
+                        }
+                    } else {
+                        Deviations {
+                            card_fill_streamed: Some([false, false]),
+                            ..Deviations::default()
+                        }
+                    };
+                    let (proof, stamps) = prove_block_whir_with(
+                        &elf,
+                        &[],
+                        &ProofOptions::default_test_options(),
+                        &format,
+                        &o,
+                        &Deviations {
+                            handout_count_thread: Some(on_thread),
+                            ..base
+                        },
+                    )
+                    .expect("prove");
+                    assert!(verify(&proof, &elf, &format), "{what}, thread {on_thread}");
+                    match (on_thread, stamps.windows.count_thread) {
+                        (false, None) => {}
+                        (true, Some(c)) => assert!(
+                            c.chunks.iter().sum::<usize>() > 0,
+                            "{what}: the thread counted no chunk"
+                        ),
+                        (on, c) => panic!("{what}: thread {on}, stamps {c:?}"),
+                    }
+                    proof
+                };
+                let inline = proved(false);
+                let thread = proved(true);
+                assert_eq!(inline.groups, thread.groups, "{what}: the partition");
+                assert_eq!(inline.table_num_vars, thread.table_num_vars, "{what}");
+                assert_eq!(
+                    format!("{:?}", inline.table_counts),
+                    format!("{:?}", thread.table_counts),
+                    "{what}"
+                );
+                if crypto::grinding::deterministic() {
+                    assert_eq!(bytes(&inline), bytes(&thread), "{what}: the proof");
+                }
+            }
+        }
+    }
+}
+
 /// ★ With records kept (`LAMBDA_VM_BLOCK_RECORDS_DROP=keep`), a streamed chunk
 /// held as its records is never dropped and no regenerator waits on it: with
 /// live regeneration dropping every table it can (the streamed chunks'
