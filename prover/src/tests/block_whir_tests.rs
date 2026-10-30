@@ -1163,6 +1163,20 @@ fn a_streamed_block_with_keccak_chunks_proves_and_verifies() {
     assert!(verify(&proof, &elf, &format));
 }
 
+/// Keccak-256 calls as a block: KECCAK cut at 4 rows, so a call's rows straddle
+/// tables and chain across them through the KeccakSponge bus; the proof
+/// verifies.
+#[test]
+fn a_block_with_keccak256_calls_across_keccak_tables_proves_and_verifies() {
+    let elf = asm_elf_bytes("test_keccak256");
+    let format = many_groups();
+    let mut o = streamed(MaxRowsConfig::small(), 6, 4);
+    o.keccak_rows_log2 = 2;
+    let proof = prove(&elf, &format, &o);
+    assert!(proof.table_counts.keccak >= 4);
+    assert!(verify(&proof, &elf, &format));
+}
+
 /// The streamed build cuts ECDAS at the run's end like the whole-run build:
 /// test_ecsm_multi's 42 ECDAS steps (64 rows padded) in 16-row tables,
 /// windows of 2^4 cycles; at the default the fourth table, padding rows alone,

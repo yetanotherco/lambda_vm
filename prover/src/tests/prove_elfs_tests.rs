@@ -5268,3 +5268,135 @@ fn the_ecall_receiver_syscall_numbers_are_pairwise_distinct() {
         }
     }
 }
+
+// =============================================================================
+// Keccak-256 of a buffer (the KECCAK table's sponge mode)
+// =============================================================================
+
+/// `test_keccak256`'s eleven calls, `(input offset, length)`, in commit order.
+const KECCAK256_CALLS: [(usize, usize); 11] = [
+    (0, 0),
+    (1, 1),
+    (3, 135),
+    (0, 136),
+    (5, 137),
+    (2, 271),
+    (0, 272),
+    (7, 600),
+    (8, 20),
+    (6, 32),
+    (4, 140),
+];
+
+/// `test_keccak256` run, its digests checked against tiny-keccak, and its
+/// minimal traces.
+fn keccak256_fixture() -> (Elf, Traces) {
+    use tiny_keccak::{Hasher, Keccak};
+
+    let elf = Elf::load(&crate::test_utils::asm_elf_bytes("test_keccak256")).expect("ELF");
+    let result = Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("execution");
+    let data: Vec<u8> = (0..1024).map(|i| ((13 * i + 5) % 256) as u8).collect();
+    let output = &result.return_values.memory_values;
+    for (k, &(offset, len)) in KECCAK256_CALLS.iter().enumerate() {
+        let mut hasher = Keccak::v256();
+        hasher.update(&data[offset..offset + len]);
+        let mut want = [0u8; 32];
+        hasher.finalize(&mut want);
+        assert_eq!(&output[32 * k..32 * k + 32], &want, "call {k}");
+    }
+    let traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    (elf, traces)
+}
+
+/// The sponge rows of the KECCAK table, in order: `(row, first, last)`.
+fn keccak256_rows(traces: &Traces) -> Vec<(usize, bool, bool)> {
+    use crate::tables::keccak::cols as kc;
+    let one = FieldElement::<GoldilocksField>::one();
+    let t = &traces.keccaks[0];
+    (0..t.num_rows())
+        .filter(|&r| *t.main_table.get(r, kc::MU_S) == one)
+        .map(|r| {
+            (
+                r,
+                *t.main_table.get(r, kc::FIRST) == one,
+                *t.main_table.get(r, kc::LAST) == one,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn test_prove_elfs_keccak256() {
+    let (elf, mut traces) = keccak256_fixture();
+    let blocks: usize = KECCAK256_CALLS.iter().map(|&(_, n)| n / 136 + 1).sum();
+    assert_eq!(keccak256_rows(&traces).len(), blocks);
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "keccak256 prove/verify failed"
+    );
+}
+
+/// A message byte that is not what memory holds: the hash of other bytes.
+#[test]
+fn test_prove_keccak256_forged_message_byte_rejected() {
+    use crate::tables::keccak::cols as kc;
+    let (elf, mut traces) = keccak256_fixture();
+    let (row, _, _) = keccak256_rows(&traces)[3];
+    let t = &mut traces.keccaks[0].main_table;
+    let v = *t.get(row, kc::msg(17));
+    t.set(row, kc::msg(17), v + FieldElement::one());
+    assert!(!prove_and_verify_vm_minimal(&elf, &mut traces));
+}
+
+/// The digest written from a state other than the last permutation's output.
+#[test]
+fn test_prove_keccak256_forged_digest_rejected() {
+    use crate::tables::keccak::cols as kc;
+    let (elf, mut traces) = keccak256_fixture();
+    let rows = keccak256_rows(&traces);
+    let at = rows
+        .iter()
+        .position(|&(_, first, last)| last && !first)
+        .expect("a call of two blocks or more");
+    let (last, prev) = (rows[at].0, rows[at - 1].0);
+    let t = &mut traces.keccaks[0].main_table;
+    for i in 0..32 {
+        let v = *t.get(prev, kc::output_byte(i));
+        t.set(last, kc::output_byte(i), v);
+    }
+    assert!(!prove_and_verify_vm_minimal(&elf, &mut traces));
+}
+
+/// The `0x01` moved one byte later on a last row whose block holds one input
+/// byte, the count raised to match.
+#[test]
+fn test_prove_keccak256_forged_padding_rejected() {
+    use crate::tables::keccak::cols as kc;
+    let (elf, mut traces) = keccak256_fixture();
+    let one = FieldElement::<GoldilocksField>::one();
+    let rows = keccak256_rows(&traces);
+    let t = &mut traces.keccaks[0].main_table;
+    let (row, _, _) = *rows
+        .iter()
+        .find(|&&(r, first, last)| last && !first && *t.get(r, kc::COUNT) == one)
+        .expect("a last block of one byte");
+    t.set(row, kc::part(0, 1), one);
+    t.set(row, kc::COUNT, one + one);
+    assert!(!prove_and_verify_vm_minimal(&elf, &mut traces));
+}
+
+/// A row in both modes at once.
+#[test]
+fn test_prove_keccak256_forged_mixed_mode_rejected() {
+    use crate::tables::keccak::cols as kc;
+    let (elf, mut traces) = keccak256_fixture();
+    let (row, _, _) = keccak256_rows(&traces)[0];
+    traces.keccaks[0]
+        .main_table
+        .set(row, kc::MU_P, FieldElement::one());
+    assert!(!prove_and_verify_vm_minimal(&elf, &mut traces));
+}
