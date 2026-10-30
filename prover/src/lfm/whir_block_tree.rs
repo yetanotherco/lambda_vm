@@ -231,6 +231,13 @@ pub struct WhirTreeConfig {
     pub exec_early: bool,
     /// `W3_NODE_TIMES=1`: the per-program stamps readout after the tree.
     pub node_times: bool,
+    /// `W3_LEAF_FIRST=0|1` (default 1): with the early leaf on, the planner
+    /// offers the leaves to phase B as soon as it has derived the plan, and
+    /// phase B takes the groups of the leaf it can finish soonest next
+    /// ([`block_whir::PhaseBLead`]); the tree's workers take that early leaf
+    /// first. Or (0, the control) phase B keeps its own order and the tree
+    /// takes the leaves in index order. Prover-only: the bytes are the same.
+    pub leaf_first: bool,
 }
 
 /// A count knob: unset is `None`; anything but a count is an error.
@@ -450,6 +457,7 @@ impl WhirTreeConfig {
             stream_top: count_knob("W3_STREAM_TOP")?.is_none_or(|v| v != 0),
             exec_early: count_knob("W3_EXEC_EARLY")?.is_none_or(|v| v != 0),
             node_times: count_knob("W3_NODE_TIMES")? == Some(1),
+            leaf_first: count_knob("W3_LEAF_FIRST")?.is_none_or(|v| v != 0),
         })
     }
 
@@ -1122,6 +1130,58 @@ pub(crate) fn tree_order(
     order
 }
 
+/// `order` ([`tree_order`]) with leaf `first`, when it is one, taken before
+/// the other leaves: a permutation of the leaves alone, so every node still
+/// comes after every leaf and the order stays topological.
+pub(crate) fn early_leaf_first(mut order: Vec<TreeAt>, first: Option<usize>) -> Vec<TreeAt> {
+    let at = first.and_then(|j| order.iter().position(|&t| t == TreeAt { lv: 0, j }));
+    if let Some(at) = at {
+        order[..=at].rotate_right(1);
+    }
+    order
+}
+
+/// `W3 LEAF FIRST`: whether the leaves were offered to phase B and when, what
+/// phase B did with them (the turn it read the offer, the leaf it led with and
+/// how many groups it moved) and which leaf was early.
+fn leaf_first_line(
+    on: bool,
+    offered_at: Option<f64>,
+    stated_at: f64,
+    taken: Option<block_whir::LeadTaken>,
+    early: Option<usize>,
+) -> String {
+    if !on {
+        return "W3 LEAF FIRST: off (phase B in its own order; the tree takes the leaves in index \
+                order)"
+            .to_string();
+    }
+    let offered = offered_at.map_or("never".to_string(), |t| {
+        format!("{t:.2}s ({:.2}s after the statement)", t - stated_at)
+    });
+    let phase_b = match taken {
+        None => "phase B ended before it read them".to_string(),
+        Some(t) => match t.leaf {
+            Some(leaf) => format!(
+                "phase B read them at its turn {} ({:.2}s in) and moved leaf {leaf}'s {} groups next",
+                t.turn,
+                t.after,
+                t.moved.len()
+            ),
+            None => format!(
+                "phase B read them at its turn {} ({:.2}s in); no leaf could lead (each holds a \
+                 rebuilt group, or none was left)",
+                t.turn, t.after
+            ),
+        },
+    };
+    format!(
+        "W3 LEAF FIRST: on · leaves offered at {offered} · {phase_b} · early leaf {} (taken first by \
+         the tree)",
+        early.map_or("none".to_string(), |k| k.to_string())
+    )
+}
+
 /// Node `at`'s children, as indices into level `at.lv − 1`.
 pub(crate) fn tree_children(
     shape: &[super::per_table_aggregator::Level],
@@ -1348,6 +1408,7 @@ pub(crate) fn prove_tree_pipelined(
     beside: bool,
     leaves_each: bool,
     early: Option<EarlyLeaf>,
+    early_first: bool,
     node_pipe: Option<&rayon::ThreadPool>,
     dataflow: bool,
     stream_top: Option<&std::sync::OnceLock<bool>>,
@@ -1362,6 +1423,8 @@ pub(crate) fn prove_tree_pipelined(
     ),
     String,
 > {
+    // With `early_first` (`W3_LEAF_FIRST`), the early leaf is taken first.
+    let first = early.as_ref().map(|e| e.leaf).filter(|_| early_first);
     let early = std::sync::Mutex::new(early);
     let early_out: std::sync::Mutex<Option<(usize, Vec<Vec<LfmWord>>, f64, f64, f64)>> =
         std::sync::Mutex::new(None);
@@ -1384,7 +1447,7 @@ pub(crate) fn prove_tree_pipelined(
         .map(|l| l.arities.iter().map(|_| Published::new()).collect())
         .collect();
 
-    let order = tree_order(leaves.len(), &shape);
+    let order = early_leaf_first(tree_order(leaves.len(), &shape), first);
     let results: Vec<Vec<Published<ProvedProgram>>> = std::iter::once(leaves.len())
         .chain(shape.iter().map(|l| l.arities.len()))
         .map(|n| (0..n).map(|_| Published::new()).collect())
@@ -1882,6 +1945,11 @@ pub fn prove_whir_block_tree(
             super::program_budget::reading_from_env()?,
         )),
     };
+    // The leaves offered to phase B (`W3_LEAF_FIRST`), and when.
+    let lead = block_whir::PhaseBLead::default();
+    let offered_at = std::sync::Mutex::new(None::<f64>);
+    let leaf_first = cfg.leaf_first && early_on;
+    let (lead_ref, offered_ref) = (&lead, &offered_at);
     let (elf_ref, opts_ref, format_ref) = (elf, &opts, &format);
     let (proved, pre) = std::thread::scope(|scope| {
         let pre = scope.spawn(move || -> Result<Planned, String> {
@@ -1914,6 +1982,18 @@ pub fn prove_whir_block_tree(
                 None => (0..n).map(|_| None).collect(),
             };
             let upto = permits.len();
+            // The admitted leaves' groups to phase B, before their programs are
+            // emitted: it takes the soonest leaf's groups next, and that leaf
+            // is the early one below.
+            if leaf_first {
+                let leaves = (0..upto)
+                    .map(|k| plan.partition().leaf(k).to_vec())
+                    .collect();
+                if lead_ref.offer(leaves) {
+                    *offered_ref.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(t0.elapsed().as_secs_f64());
+                }
+            }
             let programs: Vec<Published<ProgramSlot>> = (0..n).map(|_| Published::new()).collect();
             // The admitted leaves' programs, on plain threads off the rayon
             // pool phase B is using; the stamps are leaf 0's and the last's.
@@ -2045,8 +2125,15 @@ pub fn prove_whir_block_tree(
                 early,
             ))
         });
-        let proved = block_whir::prove_block_whir_observed_groups(
-            elf, input, &opts, &format, options, &observe, &on_group,
+        let proved = block_whir::prove_block_whir_observed_led(
+            elf,
+            input,
+            &opts,
+            &format,
+            options,
+            &observe,
+            &on_group,
+            leaf_first.then_some(&lead),
         );
         // A prover that failed before stating must not leave the planner waiting.
         *sender.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -2136,6 +2223,13 @@ pub fn prove_whir_block_tree(
         },
         first_ready_at.map_or("-".to_string(), |t| format!("{t:.2}s")),
     ));
+    sink.line(&leaf_first_line(
+        leaf_first,
+        *offered_at.lock().unwrap_or_else(|e| e.into_inner()),
+        stated_at,
+        lead.taken(),
+        early.as_ref().map(|e| e.leaf),
+    ));
     sink.line(&format!(
         "W3 TREE PROGRAM BUDGET: {}",
         match &tree_budget {
@@ -2203,6 +2297,7 @@ pub fn prove_whir_block_tree(
         beside,
         cfg.leaves_each,
         early,
+        leaf_first,
         node_pipe.as_ref(),
         dataflow,
         stream_top.then_some(&top_streamed),
@@ -2597,6 +2692,60 @@ pub fn verify_whir_block_tree_proof_at(
 mod tests {
     use super::*;
 
+    /// With the early leaf first (`W3_LEAF_FIRST`), the tree's order takes
+    /// that leaf before every other and is otherwise [`tree_order`]'s: a
+    /// permutation of the leaves alone, every node after every leaf. With no
+    /// early leaf, leaf 0, or a leaf out of range it is [`tree_order`]
+    /// unchanged. Proved over it, with one worker (inline) or two, every
+    /// program proves, and one worker takes the early leaf first.
+    #[test]
+    fn the_early_leaf_is_taken_first() {
+        use super::super::per_table_aggregator::Level;
+        let shape = vec![
+            Level {
+                arities: vec![3, 2],
+            },
+            Level { arities: vec![2] },
+        ];
+        let base = tree_order(5, &shape);
+        for unchanged in [None, Some(0), Some(9)] {
+            assert_eq!(
+                early_leaf_first(base.clone(), unchanged),
+                base,
+                "{unchanged:?}"
+            );
+        }
+        let led = early_leaf_first(base.clone(), Some(3));
+        let leaves: Vec<TreeAt> = (0..5).map(|j| TreeAt { lv: 0, j }).collect();
+        assert_eq!(
+            led[..5],
+            [leaves[3], leaves[0], leaves[1], leaves[2], leaves[4]]
+        );
+        assert_eq!(led[5..], base[5..]);
+        for workers in [1, 2] {
+            let results: Vec<Vec<Published<usize>>> = [5usize, 2, 1]
+                .iter()
+                .map(|&n| (0..n).map(|_| Published::new()).collect())
+                .collect();
+            let taken = std::sync::Mutex::new(Vec::new());
+            prove_dataflow(&shape, &led, &results, workers, false, |at, kids| {
+                taken.lock().expect("taken").push(at);
+                wait_all(kids)?;
+                Ok(at.lv)
+            });
+            for (lv, level) in results.iter().enumerate() {
+                for slot in level {
+                    assert_eq!(slot.wait(), Ok(&lv), "{workers} workers");
+                }
+            }
+            let taken = taken.into_inner().expect("taken");
+            assert_eq!(taken.len(), led.len(), "{workers} workers");
+            if workers == 1 {
+                assert_eq!(taken, led);
+            }
+        }
+    }
+
     /// ★ No public block-tree verifier takes a format of the caller's own (a
     /// caller who could would choose the programs the top is checked against):
     /// every top-level `pub fn verify…` of this file and of `whir_block.rs` is
@@ -2799,6 +2948,7 @@ mod tests {
             stream_top: true,
             exec_early: true,
             node_times: false,
+            leaf_first: true,
         };
         assert!(production.at_presets());
         let off = |f: fn(&mut WhirTreeConfig)| {

@@ -3556,6 +3556,7 @@ pub(crate) fn prove_block_whir_with(
         deviations,
         &|_, _| {},
         &|_| {},
+        None,
     )
 }
 
@@ -3604,6 +3605,33 @@ pub fn prove_block_whir_observed_groups(
     on_statement: StatementObserver<'_>,
     on_group: GroupObserver<'_>,
 ) -> Result<(BlockWhirProof, BlockStamps), Error> {
+    prove_block_whir_observed_led(
+        elf_bytes,
+        private_inputs,
+        proof_options,
+        format,
+        options,
+        on_statement,
+        on_group,
+        None,
+    )
+}
+
+/// [`prove_block_whir_observed_groups`] with phase B led by `lead`: once the
+/// caller offers the recursion's leaves there ([`PhaseBLead::offer`]), phase B
+/// takes the groups of the leaf it can finish soonest next. The proof is the
+/// same in any order.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_block_whir_observed_led(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    proof_options: &ProofOptions,
+    format: &BlockFormat,
+    options: &BlockOptions,
+    on_statement: StatementObserver<'_>,
+    on_group: GroupObserver<'_>,
+    lead: Option<&PhaseBLead>,
+) -> Result<(BlockWhirProof, BlockStamps), Error> {
     prove_block_whir_inner(
         elf_bytes,
         private_inputs,
@@ -3613,7 +3641,126 @@ pub fn prove_block_whir_observed_groups(
         &Deviations::default(),
         on_statement,
         on_group,
+        lead,
     )
+}
+
+/// The recursion's leaves, offered to phase B while it runs (`W3_LEAF_FIRST`),
+/// and what phase B did with them. The tree's planner offers each admitted
+/// leaf's groups as soon as it has derived the plan; at its next turn phase B
+/// moves the groups of the leaf it can finish soonest ([`lead_order`]) ahead of
+/// the others still to come, once, so that leaf's proof can start its execute
+/// long before the base ends. Prover-only: every order proves the same bytes.
+#[derive(Default)]
+pub struct PhaseBLead {
+    leaves: std::sync::OnceLock<Vec<Vec<usize>>>,
+    taken: std::sync::Mutex<Option<LeadTaken>>,
+}
+
+/// What phase B did with the offered leaves ([`PhaseBLead`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LeadTaken {
+    /// Phase B's turn (0-based) at which it read the offer.
+    pub turn: usize,
+    /// Seconds into phase B at that turn.
+    pub after: f64,
+    /// The leaf whose groups went first, or `None`: no leaf could (each held
+    /// a group rebuilt in phase B) or its groups were all taken already.
+    pub leaf: Option<usize>,
+    /// The groups moved ahead of the others, in their new order.
+    pub moved: Vec<usize>,
+    /// Phase B's order as it was taken.
+    pub order: Vec<usize>,
+}
+
+impl PhaseBLead {
+    /// Offers the leaves' groups (leaf `k`'s at `leaves[k]`); only the first
+    /// offer counts. Returns whether this one did.
+    pub fn offer(&self, leaves: Vec<Vec<usize>>) -> bool {
+        self.leaves.set(leaves).is_ok()
+    }
+
+    /// What phase B did with the offer, once it read it.
+    pub fn taken(&self) -> Option<LeadTaken> {
+        self.taken.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Phase B's re-ranking at turn `p` of `order` ([`multilinear_block::PhaseBReorder`]):
+    /// nothing until the leaves are offered, then once [`lead_order`] over the
+    /// groups still to come, recorded.
+    fn turn(
+        &self,
+        p: usize,
+        order: &[usize],
+        classes: &[Option<usize>],
+        cells: &[u64],
+        after: f64,
+    ) -> Option<Vec<usize>> {
+        let leaves = self.leaves.get()?;
+        let mut taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
+        if taken.is_some() {
+            return None;
+        }
+        let rest = &order[p + 1..];
+        let led = lead_order(leaves, rest, classes, cells);
+        let (leaf, moved, now) = match &led {
+            Some((leaf, moved, now)) => (Some(*leaf), moved.clone(), now.clone()),
+            None => (None, Vec::new(), rest.to_vec()),
+        };
+        *taken = Some(LeadTaken {
+            turn: p,
+            after,
+            leaf,
+            moved,
+            order: order[..=p]
+                .iter()
+                .copied()
+                .chain(now.iter().copied())
+                .collect(),
+        });
+        led.map(|(_, _, now)| now).filter(|now| now != rest)
+    }
+}
+
+/// Phase B's groups still to come (`rest`, in its order) led by one leaf's:
+/// among `leaves` (each a list of groups), those none of whose groups in
+/// `rest` is rebuilt in phase B (`classes[g]` is `Some`: a class keeps its
+/// own order, and its regenerator's pace), the one with the fewest cells still
+/// to take (ties to the lower leaf) and with at least one group to take. Its
+/// groups in `rest` go first, in their order; the others keep theirs. Returns
+/// the leaf, the groups moved and the new `rest`, or `None` when no leaf can
+/// lead. The result is a permutation of `rest`.
+pub(crate) fn lead_order(
+    leaves: &[Vec<usize>],
+    rest: &[usize],
+    classes: &[Option<usize>],
+    cells: &[u64],
+) -> Option<(usize, Vec<usize>, Vec<usize>)> {
+    let to_come: std::collections::BTreeSet<usize> = rest.iter().copied().collect();
+    let cell = |g: usize| cells.get(g).copied().unwrap_or(0);
+    let (leaf, _) = leaves
+        .iter()
+        .enumerate()
+        .filter_map(|(k, groups)| {
+            let left: Vec<usize> = groups
+                .iter()
+                .copied()
+                .filter(|g| to_come.contains(g))
+                .collect();
+            let rebuilt = left
+                .iter()
+                .any(|&g| classes.get(g).copied().flatten().is_some());
+            (!rebuilt && !left.is_empty()).then(|| (k, left.iter().map(|&g| cell(g)).sum::<u64>()))
+        })
+        .min_by_key(|&(k, cost)| (cost, k))?;
+    let mine: std::collections::BTreeSet<usize> = leaves[leaf].iter().copied().collect();
+    let moved: Vec<usize> = rest.iter().copied().filter(|g| mine.contains(g)).collect();
+    let now: Vec<usize> = moved
+        .iter()
+        .copied()
+        .chain(rest.iter().copied().filter(|g| !mine.contains(g)))
+        .collect();
+    Some((leaf, moved, now))
 }
 
 /// The block's trace as the streamed prove builds it, each closed group
@@ -3648,6 +3795,7 @@ pub(crate) fn trace_block_host_only(
         &deviations,
         &|_, _| {},
         &|_| {},
+        None,
         &mut stamps,
     ) {
         Err(Error::Prover(line)) if line.starts_with(HOST_ONLY) => Ok((stamps, line)),
@@ -3678,6 +3826,7 @@ pub(crate) fn prove_block_whir_observed_with(
         deviations,
         on_statement,
         &|_| {},
+        None,
     )
 }
 
@@ -3691,6 +3840,7 @@ fn prove_block_whir_inner(
     deviations: &Deviations,
     on_statement: StatementObserver<'_>,
     on_group: GroupObserver<'_>,
+    lead: Option<&PhaseBLead>,
 ) -> Result<(BlockWhirProof, BlockStamps), Error> {
     let mut stamps = BlockStamps::default();
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
@@ -3707,6 +3857,7 @@ fn prove_block_whir_inner(
             deviations,
             on_statement,
             on_group,
+            lead,
             &mut stamps,
         )?;
         return Ok((proof, stamps));
@@ -5258,6 +5409,7 @@ fn prove_streamed(
     deviations: &Deviations,
     on_statement: StatementObserver<'_>,
     on_group: GroupObserver<'_>,
+    lead: Option<&PhaseBLead>,
     stamps: &mut BlockStamps,
 ) -> Result<BlockWhirProof, Error> {
     // G-pack writes the streamed chunks packed when the groups are held
@@ -6600,7 +6752,10 @@ fn prove_streamed(
             None => led_order(&classes, &group_cells, regen_lead),
         };
         // `W3_PROBE_FIRST_GROUPS`, a measurement's: these groups first.
-        let order = match probe_first_groups()? {
+        let probe_first = probe_first_groups()?;
+        // A measurement's or a test's order wins over the recursion's lead.
+        let lead = lead.filter(|_| deviations.phase_b_order.is_none() && probe_first.is_none());
+        let order = match probe_first {
             None => order,
             Some(_) if classes.iter().any(Option::is_some) => {
                 return Err(Error::Prover(
@@ -6637,6 +6792,21 @@ fn prove_streamed(
         let phase_b_sched = phase_b_sched_from_env();
         stamps.phase_b_sched = phase_b_sched;
         let readbacks_before = multilinear::gpu::background_readbacks();
+        // The recursion's lead (`W3_LEAF_FIRST`): once the tree offers its
+        // leaves, the groups of the one phase B can finish soonest go next.
+        let lead_turn = |p: usize, order: &[usize]| {
+            lead.and_then(|lead| {
+                lead.turn(
+                    p,
+                    order,
+                    &classes,
+                    &group_cells,
+                    phase_b_start.elapsed().as_secs_f64(),
+                )
+            })
+        };
+        let reorder: Option<&multilinear_block::PhaseBReorder<'_>> =
+            lead.is_some().then_some(&lead_turn);
         let (proof, argues, prepared_openings, groups, commit_ood) =
             multilinear_block::block_prove_in_order::<_, _, _, H>(
                 block
@@ -6651,9 +6821,16 @@ fn prove_streamed(
                 &deviations.argue,
                 on_group,
                 &order,
+                reorder,
             )
             .map_err(|e| Error::Prover(format!("{e:?}")))?;
         stamps.phase_b = t.elapsed().as_secs_f64();
+        // The order as phase B took it, when the lead moved groups.
+        let order = match lead.and_then(PhaseBLead::taken) {
+            Some(taken) if taken.order.len() == order.len() => taken.order,
+            _ => order,
+        };
+        stamps.phase_b_order = order.clone();
         stamps.phase_b_unix = Some((phase_b_unix, stark::prove_split::epoch_secs()));
         let readbacks_after = multilinear::gpu::background_readbacks();
         stamps.background_readbacks = (
@@ -7823,6 +8000,130 @@ fn led_order(classes: &[Option<usize>], cells: &[u64], lead: usize) -> Vec<usize
         .chain(led.iter().copied())
         .chain(interleaved.iter().copied())
         .collect()
+}
+
+#[cfg(test)]
+mod lead_order_tests {
+    use super::{PhaseBLead, lead_order};
+
+    /// Each class's groups in `order`, in the order taken.
+    fn by_class(order: &[usize], classes: &[Option<usize>], class: usize) -> Vec<usize> {
+        order
+            .iter()
+            .copied()
+            .filter(|&g| classes[g] == Some(class))
+            .collect()
+    }
+
+    /// The leaf with the fewest cells still to take leads (ties to the lower
+    /// leaf); only the groups still to come count; its groups go first in
+    /// their order, the others keep theirs; the result is a permutation.
+    #[test]
+    fn the_leaf_with_the_fewest_cells_left_leads() {
+        let cells = [10, 10, 10, 10, 10, 10, 1, 1];
+        let none = [None; 8];
+        let leaves = vec![vec![0, 3, 6], vec![1, 4, 7], vec![2, 5]];
+        // All to come: leaf 2 holds 20 cells, leaves 0 and 1 hold 21 each.
+        let rest: Vec<usize> = (0..8).collect();
+        assert_eq!(
+            lead_order(&leaves, &rest, &none, &cells),
+            Some((2, vec![2, 5], vec![2, 5, 0, 1, 3, 4, 6, 7]))
+        );
+        // Groups 0 and 3 taken: leaf 0 has one cell left.
+        let rest = [1, 2, 4, 5, 6, 7];
+        assert_eq!(
+            lead_order(&leaves, &rest, &none, &cells),
+            Some((0, vec![6], vec![6, 1, 2, 4, 5, 7]))
+        );
+        // A tie goes to the lower leaf; the moved groups keep `rest`'s order.
+        let even = [5u64; 8];
+        let rest = [7, 6, 5, 4, 3, 2, 1, 0];
+        assert_eq!(
+            lead_order(&leaves, &rest, &none, &even),
+            Some((2, vec![5, 2], vec![5, 2, 7, 6, 4, 3, 1, 0]))
+        );
+        // Groups the plan holds but phase B has not (out of range) are ignored.
+        let leaves_wide = vec![vec![1, 40, 41]];
+        assert_eq!(
+            lead_order(&leaves_wide, &[0, 1, 2], &none, &cells),
+            Some((0, vec![1], vec![1, 0, 2]))
+        );
+    }
+
+    /// A leaf with a group still to come that phase B rebuilds cannot lead
+    /// (one whose rebuilt group is already taken can); every class keeps its
+    /// own order; with no leaf able to lead, nothing moves.
+    #[test]
+    fn a_leaf_with_a_rebuilt_group_to_come_never_leads() {
+        let cells = [1, 1, 1, 1, 9, 9, 9, 9];
+        let classes = [None, None, None, None, Some(1), Some(0), Some(1), Some(0)];
+        // Leaf 0 is the lightest but holds group 6, rebuilt and to come.
+        let leaves = vec![vec![0, 6], vec![1, 2, 4], vec![3, 5, 7]];
+        let rest: Vec<usize> = (0..8).collect();
+        assert_eq!(lead_order(&leaves, &rest, &classes, &cells), None);
+        let leaves = vec![vec![0, 6], vec![1, 2], vec![3, 5, 7]];
+        let (leaf, moved, now) =
+            lead_order(&leaves, &rest, &classes, &cells).expect("leaf 1 leads");
+        assert_eq!((leaf, moved), (1, vec![1, 2]));
+        for class in 0..2 {
+            assert_eq!(
+                by_class(&now, &classes, class),
+                by_class(&rest, &classes, class),
+                "class {class}"
+            );
+        }
+        // Group 6 taken already: leaf 0 (one cell left) leads.
+        let rest = [0, 1, 2, 3, 4, 5, 7];
+        assert_eq!(
+            lead_order(&leaves, &rest, &classes, &cells),
+            Some((0, vec![0], vec![0, 1, 2, 3, 4, 5, 7]))
+        );
+        // A leaf whose groups are all taken cannot lead.
+        let rest = [1, 2, 3, 4, 5, 7];
+        assert_eq!(
+            lead_order(&leaves, &rest, &classes, &cells),
+            Some((1, vec![1, 2], vec![1, 2, 3, 4, 5, 7]))
+        );
+        // Every leaf's groups taken, or none offered: nothing leads.
+        assert_eq!(lead_order(&leaves, &[], &classes, &cells), None);
+        assert_eq!(lead_order(&[], &[0, 1], &classes, &cells), None);
+    }
+
+    /// The lead reads the offer once: nothing before it, the re-ranking at
+    /// the first turn after it (recorded with the order taken), nothing after;
+    /// a lead whose order is phase B's own is recorded but changes nothing.
+    #[test]
+    fn the_lead_reads_the_offer_once() {
+        let cells = [3, 3, 3, 3, 1, 1];
+        let none = [None; 6];
+        let order: Vec<usize> = (0..6).collect();
+        let lead = PhaseBLead::default();
+        assert_eq!(lead.turn(0, &order, &none, &cells, 0.0), None);
+        assert_eq!(lead.taken(), None);
+        assert!(lead.offer(vec![vec![0, 2], vec![1, 4, 5]]));
+        assert!(!lead.offer(vec![vec![3]]), "only the first offer counts");
+        // At turn 1 (groups 0 and 1 taken): leaf 0 has 3 cells left, leaf 1 two.
+        assert_eq!(
+            lead.turn(1, &order, &none, &cells, 0.5),
+            Some(vec![4, 5, 2, 3])
+        );
+        let taken = lead.taken().expect("read");
+        assert_eq!(taken.turn, 1);
+        assert_eq!(taken.leaf, Some(1));
+        assert_eq!(taken.moved, vec![4, 5]);
+        assert_eq!(taken.order, vec![0, 1, 4, 5, 2, 3]);
+        assert_eq!(taken.after, 0.5);
+        let now = [0, 1, 4, 5, 2, 3];
+        assert_eq!(lead.turn(2, &now, &none, &cells, 0.6), None);
+        assert_eq!(lead.taken(), Some(taken));
+        // Phase B's own order already leads with the soonest leaf: no change.
+        let cells = [1, 1, 1, 9, 9, 9];
+        let lead = PhaseBLead::default();
+        assert!(lead.offer(vec![vec![1, 2], vec![3, 4, 5]]));
+        assert_eq!(lead.turn(0, &order, &none, &cells, 0.0), None);
+        let taken = lead.taken().expect("read");
+        assert_eq!((taken.leaf, taken.order), (Some(0), order.clone()));
+    }
 }
 
 #[cfg(test)]

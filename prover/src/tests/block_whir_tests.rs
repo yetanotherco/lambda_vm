@@ -1445,6 +1445,77 @@ fn phase_b_in_any_order_proves_the_same_bytes() {
     }
 }
 
+/// ★ Phase B led by a leaf (`W3_LEAF_FIRST`, [`block_whir::PhaseBLead`]) on a
+/// streamed block: with a leaf offered before phase B starts, phase B moves
+/// that leaf's groups ahead at its first turn and takes that order (the
+/// observer hears it, the stamps record it), with the overlap off and pinned;
+/// the proof is the bytes of phase B's own order under the deterministic grind
+/// (`LAMBDA_VM_DETERMINISTIC_GRIND=1`), and it verifies. Unled, phase B keeps
+/// group order and records no lead.
+#[test]
+fn phase_b_led_by_a_leaf_proves_the_same_bytes() {
+    use stark::multilinear_block::PhaseBOverlap::{Off, Pinned};
+    let elf = asm_elf_bytes("test_keccak_multi");
+    let format = many_groups();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    for overlap in [Off, Pinned] {
+        let mut o = streamed(MaxRowsConfig::small(), 5, 3);
+        o.phase_b_overlap = overlap;
+        let proved = |lead: Option<&block_whir::PhaseBLead>| {
+            let heard = std::sync::Mutex::new(Vec::new());
+            let (proof, stamps) = block_whir::prove_block_whir_observed_led(
+                &elf,
+                &[],
+                &ProofOptions::default_test_options(),
+                &format,
+                &o,
+                &|_, _| {},
+                &|opened| heard.lock().expect("heard").push(opened.group),
+                lead,
+            )
+            .expect("prove");
+            (proof, stamps, heard.into_inner().expect("heard"))
+        };
+        let (plain, plain_stamps, plain_heard) = proved(None);
+        let n = plain.groups.len();
+        assert!(n > 3, "{overlap:?}: {n} groups");
+        let group_order: Vec<usize> = (0..n).collect();
+        assert_eq!(plain_stamps.phase_b_order, group_order, "{overlap:?}");
+        assert_eq!(plain_heard, group_order, "{overlap:?}");
+        // One leaf of every third group from group 2: it leads from turn 0.
+        let leaf: Vec<usize> = (2..n).step_by(3).collect();
+        let lead = block_whir::PhaseBLead::default();
+        assert!(lead.offer(vec![leaf.clone()]));
+        let (led, led_stamps, led_heard) = proved(Some(&lead));
+        let taken = lead.taken().expect("phase B read the offer");
+        let expected: Vec<usize> = std::iter::once(0)
+            .chain(leaf.iter().copied())
+            .chain((1..n).filter(|g| !leaf.contains(g)))
+            .collect();
+        assert_eq!(
+            (taken.turn, taken.leaf, &taken.moved),
+            (0, Some(0), &leaf),
+            "{overlap:?}"
+        );
+        assert_eq!(taken.order, expected, "{overlap:?}");
+        assert_ne!(
+            taken.order, group_order,
+            "{overlap:?}: the lead moved groups"
+        );
+        assert_eq!(led_stamps.phase_b_order, expected, "{overlap:?}");
+        assert_eq!(led_heard, expected, "{overlap:?}: the order heard");
+        assert_eq!(led.groups, plain.groups, "{overlap:?}: the partition");
+        assert!(verify(&led, &elf, &format), "{overlap:?}");
+        if crypto::grinding::deterministic() {
+            assert_eq!(bytes(&led), bytes(&plain), "{overlap:?}: the proof");
+        }
+    }
+}
+
 /// Phase B's overlap on a streamed block: an opening or an argue that fails
 /// beside the other, or a panic on the opening thread, is the prove's error,
 /// never a panic; a refusal keeps its transition's overlap and turns the rest
