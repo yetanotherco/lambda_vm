@@ -10,10 +10,11 @@
 //!   `keccak_permute` precompile for the rare buffer the call refuses; on host
 //!   software keccak for tests), with a bounded cache of
 //!   repeated 20-, 32- and 64-byte inputs and the empty input (`keccak_cache`).
-//! - `secp256k1_ecrecover`: the ECDSA recovery's 2-term linear combination is
-//!   evaluated through the ECSM `ecsm_mul` precompile (riscv64), reconstructing
-//!   the full point from x-only queries; on host / degenerate inputs it falls
-//!   back to the pure-Rust `ProjectivePoint::lincomb`.
+//! - `secp256k1_ecrecover`: one ECREC precompile call recovers the key
+//!   (riscv64). When it bails, the recovery runs as before: the 2-term linear
+//!   combination through the ECSM `ecsm_mul` precompile, reconstructing the full
+//!   point from x-only queries; on host / degenerate inputs the pure-Rust
+//!   `ProjectivePoint::lincomb`.
 //!
 //! Every other `Crypto` method inherits the trait default (vetted pure-Rust
 //! crates: `ark-bn254`, `p256`, `sha2`, `ripemd`, …), except two families that
@@ -241,7 +242,36 @@ where
 /// `recover_from_prehash`, which internally runs a *second* lincomb to
 /// re-verify the key — doubling the ECSM ecalls for no gain here.
 fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64], CryptoError> {
+    // riscv64: one ECREC call recovers the key; when it bails (an invalid signature, or
+    // one of the rare inputs its chains cannot represent) the path below decides.
+    #[cfg(target_arch = "riscv64")]
+    if let Some(pk) = ecrec_call(sig, recid, msg) {
+        return Ok(pk);
+    }
     ecrecover_with(sig, recid, msg, decompress_r_xy, ecsm_lincomb2_xy)
+}
+
+/// The key from the ECREC precompile, or `None` when the call bailed (status 1).
+///
+/// A status-0 answer is proven by the ECREC chip: `Q = u1·G + u2·R` with `u1`, `u2`
+/// the scalars of `(r, s, z)` mod N and `R` the curve point with x = r and the
+/// requested parity. A bail proves nothing and changes nothing: the caller recovers
+/// the key in software exactly as it does without the precompile, so a prover that
+/// bails on a valid signature only costs the guest cycles. The call reads the
+/// signature and hash in place (big-endian, the precompile's encoding) and writes the
+/// key big-endian, the order the address hash takes.
+#[cfg(target_arch = "riscv64")]
+fn ecrec_call(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Option<[u8; 64]> {
+    #[repr(C, align(8))]
+    struct Out([u8; 72]);
+    let mut out = Out([0u8; 72]);
+    lambda_vm_syscalls::syscalls::ecrecover(&mut out.0, sig, msg, u64::from(recid & 1));
+    if out.0[64..] != [0u8; 8] {
+        return None;
+    }
+    let mut pk = [0u8; 64];
+    pk.copy_from_slice(&out.0[..64]);
+    Some(pk)
 }
 
 /// [`ecsm_ecrecover`], generic over how R is decompressed and how the linear
