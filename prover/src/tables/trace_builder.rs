@@ -48,6 +48,7 @@ use super::decode;
 use super::decode::DecodeTable;
 use super::dvrm::{self, DvrmOperation};
 use super::ecdas;
+use super::ecrec;
 use super::ecsm;
 use super::eq;
 use super::gpack::TraceForm;
@@ -1670,6 +1671,7 @@ fn collect_ops_from_cpu(
         Vec<ecdas::EcdasOperation>,
         Vec<copy::CopyOperation>,
         Vec<hint::HintOperation>,
+        Vec<ecrec::EcrecOperation>,
     ),
     Error,
 > {
@@ -1696,6 +1698,7 @@ fn collect_ops_from_cpu(
         ecdas_ops,
         copy_ops,
         hint_ops,
+        ecrec_ops,
     } = out;
     Ok((
         memw,
@@ -1711,6 +1714,7 @@ fn collect_ops_from_cpu(
         ecdas_ops,
         copy_ops,
         hint_ops,
+        ecrec_ops,
     ))
 }
 
@@ -1732,6 +1736,7 @@ pub(crate) struct WalkOutputs {
     ecdas_ops: Vec<ecdas::EcdasOperation>,
     copy_ops: Vec<copy::CopyOperation>,
     hint_ops: Vec<hint::HintOperation>,
+    ecrec_ops: Vec<ecrec::EcrecOperation>,
 }
 
 impl WalkOutputs {
@@ -1757,6 +1762,7 @@ impl WalkOutputs {
             ecdas_ops: Vec::new(),
             copy_ops: Vec::new(),
             hint_ops: Vec::new(),
+            ecrec_ops: Vec::new(),
         }
     }
 
@@ -1801,6 +1807,12 @@ impl WalkOutputs {
             + vec_heap_bytes(&self.ecdas_ops)
             + vec_heap_bytes(&self.copy_ops)
             + vec_heap_bytes(&self.hint_ops)
+            + vec_heap_bytes(&self.ecrec_ops)
+            + self
+                .ecrec_ops
+                .iter()
+                .map(ecrec::EcrecOperation::steps_heap_bytes)
+                .sum::<usize>()
     }
 }
 
@@ -1896,6 +1908,7 @@ fn walk_cpu_ops<const REST: bool>(
         ecdas_ops,
         copy_ops,
         hint_ops,
+        ecrec_ops,
     } = out;
     // This call's COPY rows start here; earlier calls' are already in the list.
     let copy_ops_before = copy_ops.len();
@@ -2167,6 +2180,19 @@ fn walk_cpu_ops<const REST: bool>(
             memw.extend_ops(memset_memw);
             if REST {
                 copy_ops.extend(rows);
+            }
+        }
+
+        // Collect ECREC ecall operations (memory I/O, the ECREC row, and the ECDAS rows of its
+        // two chains and its final addition).
+        if op.ecall_ecrec()
+            && let Some((ecrec_memw, ecrec_op, ecrec_ecdas)) =
+                collect_ecrec_ops(op, memory_state, register_state)
+        {
+            memw.extend_ops(ecrec_memw);
+            if REST {
+                ecrec_ops.push(ecrec_op);
+                ecdas_ops.extend(ecrec_ecdas);
             }
         }
 
@@ -2474,6 +2500,186 @@ fn collect_ecsm_ops(
     };
 
     Some((memw_ops, ecsm_op, ecdas_ops))
+}
+
+/// Test-only forgery switch: while set, the ECREC call whose `r` is
+/// [`FORGED_ECREC_R`] runs its two chains with their scalars swapped — the first
+/// chain `u2·G`, the second `u1·R` — and writes the key `u2·G + u1·R` that gives.
+/// The row's scalar columns, relations and `LEN` swap stay consistent, so the only
+/// thing that refuses it is the second chain's key `TS + 1`: with both chains keyed
+/// at `TS`, the `Bit` messages of the two are one multiset and balance either way.
+/// Keyed on `test_ecrec`'s first `r`, so tests beside the forging one are unaffected.
+#[cfg(test)]
+pub(crate) static FORGE_ECREC_SWAPPED_CHAINS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `r` of `test_ecrec`'s first call, little-endian.
+#[cfg(test)]
+pub(crate) const FORGED_ECREC_R: [u8; 32] = {
+    let be: [u8; 32] = [
+        0x32, 0x84, 0xba, 0xe4, 0xa1, 0xb6, 0x93, 0xdf, 0xbe, 0x8a, 0xc6, 0x74, 0x00, 0xe4, 0x89,
+        0x1f, 0x3b, 0x53, 0x68, 0x1c, 0x51, 0x59, 0xa3, 0x15, 0x56, 0x10, 0x51, 0xf3, 0xd2, 0xc5,
+        0x71, 0x39,
+    ];
+    let mut le = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        le[i] = be[31 - i];
+        i += 1;
+    }
+    le
+};
+
+/// Applies [`FORGE_ECREC_SWAPPED_CHAINS`] to a computed witness.
+#[cfg(test)]
+fn forge_ecrec_swapped_chains(w: &mut ::ecsm::EcrecWitness) {
+    use std::sync::atomic::Ordering;
+    if !FORGE_ECREC_SWAPPED_CHAINS.load(Ordering::SeqCst) || !w.ok || w.r != FORGED_ECREC_R {
+        return;
+    }
+    swap_ecrec_chains(w);
+}
+
+/// The forgery of [`FORGE_ECREC_SWAPPED_CHAINS`] on a computed witness, unconditionally.
+#[cfg(test)]
+pub(crate) fn swap_ecrec_chains(w: &mut ::ecsm::EcrecWitness) {
+    let sub_p = |v: &[u8; 32]| {
+        let mut out = [0u8; 32];
+        let mut borrow = 0i16;
+        for i in 0..32 {
+            let d = v[i] as i16 - ::ecsm::P_BYTES[i] as i16 - borrow;
+            borrow = i16::from(d < 0);
+            out[i] = d.rem_euclid(256) as u8;
+        }
+        out
+    };
+    let (gx, gy) = ::ecsm::generator_le();
+    let (c1, xa, ya) = ::ecsm::ecdas_chain(&w.u2, &gx, &gy).expect("u2·G");
+    let (c2, xb, yb) = ::ecsm::ecdas_chain(&w.u1, &w.r, &w.y_r).expect("u1·R");
+    let add = ::ecsm::ecdas_add_step(&xa, &ya, &xb, &yb).expect("A ≠ ±B");
+    (w.x_a, w.y_a, w.x_b, w.y_b) = (xa, ya, xb, yb);
+    (w.x_q, w.y_q) = (add.x_r, add.y_r);
+    w.x_a_sub_p = sub_p(&xa);
+    w.x_b_sub_p = sub_p(&xb);
+    w.x_q_sub_p = sub_p(&add.x_r);
+    w.y_q_sub_p = sub_p(&add.y_r);
+    (w.len1, w.len2) = (w.len2, w.len1);
+    (w.chain1, w.chain2, w.add) = (c1, c2, Some(add));
+}
+
+/// Collects all MEMW ops, the ECREC op and the ECDAS ops for one ECREC ecall;
+/// `None`, with nothing collected, when an operand byte is one the memory state
+/// does not hold (as [`collect_ecsm_ops`]).
+///
+/// Timestamp scheme: `x11` register read and the signature reads (8 doublewords)
+/// at `T`; `x12` and `x13` register reads and the hash reads (4 doublewords) at
+/// `T + 1`; `x10` register read and the output writes (9 doublewords: the key,
+/// then the status) at `T + 2`. The ECDAS rows: the first chain at `T`, the
+/// second at `T + 1`, the final addition at `T + 2`.
+fn collect_ecrec_ops(
+    op: CpuOp<'_>,
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+) -> Option<(
+    Vec<MemwOperation>,
+    ecrec::EcrecOperation,
+    Vec<ecdas::EcdasOperation>,
+)> {
+    let t = op.timestamp;
+    let addr_out = register_state.read(10).0;
+    let addr_sig = register_state.read(11).0;
+    let addr_msg = register_state.read(12).0;
+    let parity = register_state.read(13).0;
+
+    let mut sig = [0u8; 64];
+    let mut msg = [0u8; 32];
+    for (i, b) in sig.iter_mut().enumerate() {
+        *b = memory_state.read_byte(addr_sig.wrapping_add(i as u64)).0;
+    }
+    for (i, b) in msg.iter_mut().enumerate() {
+        *b = memory_state.read_byte(addr_msg.wrapping_add(i as u64)).0;
+    }
+    if memory_state.is_missing() {
+        return None;
+    }
+    let mut witness = ::ecsm::compute_ecrec_witness(&sig, &msg, parity as u8);
+    #[cfg(test)]
+    forge_ecrec_swapped_chains(&mut witness);
+
+    let mut memw_ops = Vec::with_capacity(25);
+    let mut reg_read = |reg: u8, at: u64, memw_ops: &mut Vec<MemwOperation>| {
+        let (val, old_ts) = register_state.read(reg);
+        let value = pack_register_value(val);
+        memw_ops.push(
+            MemwOperation::new(true, 2 * reg as u64, value, at, 2, true)
+                .with_old(value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+        );
+        register_state.write(reg, val, at);
+    };
+    let mut reads = |base: u64, bytes: &[u8], at: u64, memw_ops: &mut Vec<MemwOperation>| {
+        for (i, chunk) in bytes.chunks_exact(8).enumerate() {
+            let addr = base.wrapping_add(8 * i as u64);
+            let value: [u32; 8] = std::array::from_fn(|j| chunk[j] as u32);
+            let dword = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+            let (_old, old_ts) = memory_state.read_bytes(addr, 8);
+            memw_ops
+                .push(MemwOperation::new(false, addr, value, at, 8, true).with_old(value, old_ts));
+            memory_state.write_bytes(addr, dword, 8, at);
+        }
+    };
+    reg_read(11, t, &mut memw_ops);
+    reads(addr_sig, &sig, t, &mut memw_ops);
+    reg_read(12, t + 1, &mut memw_ops);
+    reg_read(13, t + 1, &mut memw_ops);
+    reads(addr_msg, &msg, t + 1, &mut memw_ops);
+    reg_read(10, t + 2, &mut memw_ops);
+
+    // The written bytes: the key big-endian (zero on a bail), then the status doubleword.
+    let mut out = [0u8; 72];
+    for i in 0..32 {
+        out[i] = witness.x_q[31 - i];
+        out[32 + i] = witness.y_q[31 - i];
+    }
+    out[64] = witness.status();
+    for (i, chunk) in out.chunks_exact(8).enumerate() {
+        let addr = addr_out.wrapping_add(8 * i as u64);
+        let value: [u32; 8] = std::array::from_fn(|j| chunk[j] as u32);
+        let dword = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+        let (old_vals, old_ts) = memory_state.read_bytes(addr, 8);
+        memw_ops.push(
+            MemwOperation::new(false, addr, value, t + 2, 8, false).with_old(old_vals, old_ts),
+        );
+        memory_state.write_bytes(addr, dword, 8, t + 2);
+    }
+
+    // The ECDAS rows move out of the witness; the ECREC op keeps none.
+    let mut ecdas_ops: Vec<ecdas::EcdasOperation> = Vec::new();
+    for (steps, at) in [
+        (std::mem::take(&mut witness.chain1), t),
+        (
+            std::mem::take(&mut witness.chain2),
+            t.wrapping_add_signed(ecrec::CHAIN2_KEY),
+        ),
+    ] {
+        ecdas_ops.extend(steps.into_iter().map(|step| ecdas::EcdasOperation {
+            timestamp: at,
+            step,
+        }));
+    }
+    if let Some(step) = witness.add.take() {
+        ecdas_ops.push(ecdas::EcdasOperation {
+            timestamp: t.wrapping_add_signed(ecrec::ADD_KEY),
+            step,
+        });
+    }
+    let ecrec_op = ecrec::EcrecOperation {
+        timestamp: t,
+        addr_out,
+        addr_sig,
+        addr_msg,
+        witness,
+    };
+    Some((memw_ops, ecrec_op, ecdas_ops))
 }
 
 /// The register accesses one copy ecall makes, all at the raw ECALL timestamp.
@@ -5163,6 +5369,58 @@ pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<Bitw
     out
 }
 
+/// BITWISE lookups sent by the ECREC table, in the order and under the gate
+/// (`OK`, a computed row) of `ecrec::bus_interactions`: byte checks on the
+/// witness bytes, halfword checks on the five relations' offset carries and the
+/// nine subtraction witnesses, and the four nonzero checks.
+pub(crate) fn collect_bitwise_from_ecrec(ops: &[ecrec::EcrecOperation]) -> Vec<BitwiseOperation> {
+    let mut out = Vec::new();
+    let half = |bytes: &[u8; 32], i: usize| bytes[2 * i] as u16 + ((bytes[2 * i + 1] as u16) << 8);
+    for op in ops {
+        let w = &op.witness;
+        if !w.ok {
+            continue;
+        }
+        for bytes in [&w.w, &w.qw, &w.qz, &w.qu, &w.y_r, &w.x2, &w.q0] {
+            out.extend(bytes.iter().map(|&b| is_byte_op(b)));
+        }
+        out.extend(w.q1.iter().map(|&b| is_byte_op(b)));
+        out.push(is_byte_op(w.h));
+        for (carries, offset) in [
+            (&w.cw, ecrec::CARRY_OFFSET_MODN),
+            (&w.cz, ecrec::CARRY_OFFSET_MODN),
+            (&w.cu, ecrec::CARRY_OFFSET_MODN),
+            (&w.c0, ecsm::CARRY_OFFSET_X2),
+            (&w.c1, ecsm::CARRY_OFFSET_YG),
+        ] {
+            for c in carries.iter().take(63) {
+                out.push(is_half_op((c + offset) as u16));
+            }
+        }
+        for bytes in [
+            &w.r_sub_n,
+            &w.s_sub_n,
+            &w.u1_sub_n,
+            &w.u2_sub_n,
+            &w.y_r_sub_p,
+            &w.x_a_sub_p,
+            &w.x_b_sub_p,
+            &w.x_q_sub_p,
+            &w.y_q_sub_p,
+        ] {
+            for i in 0..16 {
+                out.push(is_half_op(half(bytes, i)));
+            }
+        }
+        for bytes in [&w.r, &w.s, &w.u1, &w.u2] {
+            out.push(BitwiseOperation::zero(
+                bytes.iter().map(|&b| b as u32).sum(),
+            ));
+        }
+    }
+    out
+}
+
 /// BITWISE lookups sent by every ECDAS row (range checks on the byte limbs +
 /// carries), over the rows a build keeps compact, each widened back to its op
 /// as it is read ([`ecdas::CompactEcdasOp`]).
@@ -5987,6 +6245,10 @@ pub struct Traces {
     /// makes no hint ecall.
     pub hints: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 
+    /// ECREC table (one row per ECDSA public-key recovery ecall). Empty when the
+    /// run makes no ECREC call; its ECDAS rows are in `ecdases`.
+    pub ecrecs: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+
     /// IS_WH table (one row per distinct `(Word, Half)` address pair sent through
     /// `IS_WHH`). Empty when no chip sends one.
     pub is_whs: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
@@ -6047,6 +6309,8 @@ struct CollectedOps {
     copy_ops: BlockVec<copy::CopyOperation>,
     // Non-constraining hint ecall.
     hint_ops: BlockVec<hint::HintOperation>,
+    // ECDSA public-key recovery.
+    ecrec_ops: BlockVec<ecrec::EcrecOperation>,
 }
 
 /// How many leading chunks of each streamed table a windowed build already
@@ -7444,6 +7708,7 @@ fn collect_all_ops(
     ecdas_ops: Vec<ecdas::EcdasOperation>,
     copy_ops: Vec<copy::CopyOperation>,
     hint_ops: Vec<hint::HintOperation>,
+    ecrec_ops: Vec<ecrec::EcrecOperation>,
     register_state: &mut RegisterState,
     is_final: bool,
 ) -> CollectedOps {
@@ -7525,6 +7790,7 @@ fn collect_all_ops(
         ),
         copy_ops: BlockVec::from_vec(copy_ops),
         hint_ops: BlockVec::from_vec(hint_ops),
+        ecrec_ops: BlockVec::from_vec(ecrec_ops),
     }
 }
 
@@ -7808,6 +8074,7 @@ impl Traces {
             ecsms,
             ecdases,
             hints,
+            ecrecs,
             is_whs,
             memw_registers,
             local_to_global,
@@ -7834,6 +8101,7 @@ impl Traces {
             ecsms,
             ecdases,
             hints,
+            ecrecs,
             is_whs,
             memw_registers,
             eqs,
@@ -8005,6 +8273,7 @@ impl Traces {
             ecsms,
             ecdases,
             hints,
+            ecrecs,
             copies,
             is_whs,
             memw_registers,
@@ -8089,6 +8358,9 @@ impl Traces {
         for t in hints {
             total += (t.num_rows() * HINT_COLS) as u64;
         }
+        for t in ecrecs {
+            total += (t.num_rows() * super::ecrec::cols::NUM_COLUMNS) as u64;
+        }
         for t in copies {
             total += (t.num_rows() * super::copy::cols::NUM_COLUMNS) as u64;
         }
@@ -8138,6 +8410,7 @@ impl Traces {
         let n_ecdas = aux_cols(super::ecdas::bus_interactions().len());
         let n_copy = aux_cols(super::copy::bus_interactions().len());
         let n_hint = aux_cols(super::hint::bus_interactions().len());
+        let n_ecrec = aux_cols(super::ecrec::bus_interactions().len());
         let n_is_wh = aux_cols(super::is_wh::bus_interactions().len());
 
         let Traces {
@@ -8163,6 +8436,7 @@ impl Traces {
             ecsms,
             ecdases,
             hints,
+            ecrecs,
             copies,
             is_whs,
             memw_registers,
@@ -8245,6 +8519,9 @@ impl Traces {
         for t in hints {
             total += (t.num_rows() * n_hint) as u64;
         }
+        for t in ecrecs {
+            total += (t.num_rows() * n_ecrec) as u64;
+        }
         for t in copies {
             total += (t.num_rows() * n_copy) as u64;
         }
@@ -8276,6 +8553,7 @@ impl Traces {
             ecsm: self.ecsms.len(),
             ecdas: self.ecdases.len(),
             hint: self.hints.len(),
+            ecrec: self.ecrecs.len(),
             copy: self.copies.len(),
             // 0 or 1: the table is carried only when the workload used it. The
             // six above read their own `Vec` length; this one cannot, because a
@@ -8591,6 +8869,7 @@ impl Traces {
             ecdas_ops,
             copy_ops,
             hint_ops,
+            ecrec_ops,
         ) = collect_ops_from_cpu(
             &cpu_ops,
             &artifacts.decode,
@@ -8619,6 +8898,7 @@ impl Traces {
             ecdas_ops,
             copy_ops,
             hint_ops,
+            ecrec_ops,
             &mut register_state,
             is_final,
         );
@@ -8748,6 +9028,7 @@ impl Traces {
             ecdas_ops,
             copy_ops,
             hint_ops,
+            ecrec_ops,
         ) = collect_ops_from_cpu(
             &cpu_ops,
             &decode_table,
@@ -8771,6 +9052,7 @@ impl Traces {
             ecdas_ops,
             copy_ops,
             hint_ops,
+            ecrec_ops,
             &mut register_state,
             true,
         );
@@ -9519,6 +9801,85 @@ mod cut_tests {
             ecdas::generate_ecdas_rows_as,
             &ecdas::bus_interactions(),
         );
+    }
+}
+
+#[cfg(test)]
+mod ecrec_ops_tests {
+    use super::{CpuOperation, MemoryState, RegisterState, collect_ecrec_ops};
+
+    /// An ECREC call's ECDAS rows are its witness's first chain at `T`, second chain
+    /// at `T + 1` and final addition at `T + 2`; the ECREC op keeps none. Its MEMW
+    /// ops are the 25 the table sends (four register reads, eight signature reads,
+    /// four hash reads, nine output writes), and the written bytes are the key
+    /// big-endian, then status 0.
+    #[test]
+    fn an_ecrec_calls_rows_are_keyed_at_t_t1_t2() {
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len() / 2)
+                .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+                .collect()
+        };
+        let sig: Vec<u8> = hex(concat!(
+            "3284bae4a1b693dfbe8ac67400e4891f3b53681c5159a315561051f3d2c57139",
+            "97d4b2f2f728a54ed562a12237f6b11d32d626e7fcc24c3470b0729e095bd057"
+        ));
+        let msg = hex("c0ffee0011223344556677889900aabbccddeeff00112233445566778899aabb");
+        let key = hex(concat!(
+            "8733750fdf82edb525a2c9f9d201ad1b26e163b8093f3c8f6eb83377d157edb2",
+            "ce023840e38085bfcf2b27bd66be6a877f0ec281b073ca0f9ab31cfc0733b62a"
+        ));
+        let (addr_out, addr_sig, addr_msg) = (0x1000u64, 0x2000u64, 0x3000u64);
+        let mut memory_state = MemoryState::new();
+        let mut register_state = RegisterState::new(0);
+        register_state.write(10, addr_out, 1);
+        register_state.write(11, addr_sig, 1);
+        register_state.write(12, addr_msg, 1);
+        register_state.write(13, 0, 1);
+        for (base, bytes) in [(addr_sig, &sig), (addr_msg, &msg)] {
+            for (i, chunk) in bytes.chunks_exact(8).enumerate() {
+                let dword = u64::from_le_bytes(chunk.try_into().unwrap());
+                memory_state.write_bytes(base + 8 * i as u64, dword, 8, 1);
+            }
+        }
+        let t = 400;
+        let decode = crate::tables::types::DecodeEntry::default();
+        let op = CpuOperation {
+            timestamp: t,
+            ..Default::default()
+        };
+        let (memw, ecrec_op, ecdas_ops) = collect_ecrec_ops(
+            super::CpuOp::new(&decode, &op),
+            &mut memory_state,
+            &mut register_state,
+        )
+        .expect("the operands are held");
+        assert_eq!(memw.len(), 25);
+        let w = &ecrec_op.witness;
+        assert!(w.ok && w.chain1.is_empty() && w.chain2.is_empty() && w.add.is_none());
+        let fresh =
+            ::ecsm::compute_ecrec_witness(&sig.try_into().unwrap(), &msg.try_into().unwrap(), 0);
+        let (n1, n2) = (fresh.chain1.len(), fresh.chain2.len());
+        assert_eq!(ecdas_ops.len(), n1 + n2 + 1);
+        assert!(ecdas_ops[..n1].iter().all(|o| o.timestamp == t));
+        assert!(ecdas_ops[n1..n1 + n2].iter().all(|o| o.timestamp == t + 1));
+        assert_eq!(ecdas_ops[n1 + n2].timestamp, t + 2);
+        assert_eq!(
+            format!("{:?}", ecdas_ops[n1 + n2].step),
+            format!("{:?}", fresh.add.unwrap())
+        );
+        let written: Vec<u8> = (0..9)
+            .flat_map(|i| {
+                memory_state
+                    .read_bytes(addr_out + 8 * i, 8)
+                    .0
+                    .iter()
+                    .map(|&b| b as u8)
+                    .collect::<Vec<u8>>()
+            })
+            .collect();
+        assert_eq!(&written[..64], &key[..]);
+        assert_eq!(&written[64..], &[0u8; 8]);
     }
 }
 

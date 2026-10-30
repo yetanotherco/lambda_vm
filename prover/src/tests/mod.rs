@@ -67,6 +67,7 @@ pub mod decode_tests;
 pub mod dvrm_tests;
 #[cfg(test)]
 pub mod ecdas_tests;
+pub mod ecrec_tests;
 #[cfg(test)]
 pub mod ecsm_tests;
 #[cfg(test)]

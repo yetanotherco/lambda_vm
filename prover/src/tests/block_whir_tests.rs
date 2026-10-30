@@ -3050,6 +3050,7 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
         copy: 1,
         blake3: 1,
         is_wh: 1,
+        ecrec: 0,
     };
     let pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
         &program,
@@ -3575,6 +3576,7 @@ fn chunked_counts() -> crate::TableCounts {
         copy: 2,
         blake3: 0,
         is_wh: 0,
+        ecrec: 0,
     }
 }
 
@@ -3985,6 +3987,122 @@ fn a_split_ecdas_call_is_keyed_on_the_bus() {
     println!(
         "BLOCK WHIR ECDAS SPLIT NEGATIVE: table 0 row {a} and table 1 row {b} swapped calls, refused"
     );
+}
+
+/// test_ecrec's traces (two computed recoveries and a bail), built once.
+fn ecrec_traces() -> (
+    executor::elf::Elf,
+    Vec<u8>,
+    crate::tables::trace_builder::Traces,
+) {
+    split_traces("test_ecrec", |_| {})
+}
+
+/// ★ An ECREC call's first chain, second chain and final addition are three
+/// separate conversations on the `Ecdas` and `Bit` buses, keyed at its timestamp
+/// `TS`, `TS + 1` and `TS + 2`; every ECALL timestamp is a multiple of 4, so no key
+/// of one call is a key of another.
+///
+/// - Control: the honest traces verify, and so do two whole ECDAS rows swapped
+///   between table positions (the same multiset of rows).
+/// - Negative (neighbouring call): a second-chain row of the first call and one of
+///   the second call swap only their timestamps, each claiming the other call's
+///   `TS + 1`. Refused.
+/// - Negative (neighbouring chain): a first-chain row of the first call is given the
+///   key `TS + 1` of that call's second chain. Refused.
+#[test]
+fn ecrec_chains_are_keyed_apart_on_the_bus() {
+    use crate::tables::ecdas::cols;
+    use crate::tables::types::FE;
+    let (a, b, c) = {
+        let (_, _, traces) = ecrec_traces();
+        assert_eq!(traces.ecrecs.len(), 1);
+        assert_eq!(traces.ecdases.len(), 1, "one ECDAS table");
+        let er = &traces.ecrecs[0].main_table;
+        let ts = |row: usize| *er.get(row, crate::tables::ecrec::cols::TIMESTAMP_0);
+        let (t1, t2) = (ts(0), ts(1));
+        assert_ne!(t1, t2);
+        let ed = &traces.ecdases[0].main_table;
+        let find = |key: FE| {
+            (0..ed.height)
+                .find(|&r| {
+                    *ed.get(r, cols::TIMESTAMP_0) == key
+                        && *ed.get(r, cols::NEXT_OP) == FE::zero()
+                        && *ed.get(r, cols::MU) == FE::one()
+                })
+                .expect("a row with that key and no Bit send")
+        };
+        (find(t1 + FE::one()), find(t2 + FE::one()), find(t1))
+    };
+    let swap = |x: usize, y: usize, cols_to_swap: Vec<usize>| {
+        move |t: &mut crate::tables::trace_builder::Traces| {
+            for &col in &cols_to_swap {
+                let vx = *t.ecdases[0].main_table.get(x, col);
+                let vy = *t.ecdases[0].main_table.get(y, col);
+                t.ecdases[0].main_table.set(x, col, vy);
+                t.ecdases[0].main_table.set(y, col, vx);
+            }
+        }
+    };
+    assert!(
+        traces_block_accepts(ecrec_traces, |_| {}),
+        "the honest calls verify"
+    );
+    assert!(
+        traces_block_accepts(ecrec_traces, swap(a, b, (0..cols::NUM_COLUMNS).collect())),
+        "whole rows swapped are the same rows: accepted"
+    );
+    println!("BLOCK WHIR ECREC KEY CONTROL: honest and whole-row swap, accepted");
+    assert!(
+        !traces_block_accepts(
+            ecrec_traces,
+            swap(a, b, vec![cols::TIMESTAMP_0, cols::TIMESTAMP_1])
+        ),
+        "a second-chain row reattached to the neighbouring call must be refused"
+    );
+    println!("BLOCK WHIR ECREC KEY NEGATIVE: second-chain rows {a} and {b} swapped calls, refused");
+    assert!(
+        !traces_block_accepts(ecrec_traces, move |t| {
+            let key = *t.ecdases[0].main_table.get(c, cols::TIMESTAMP_0);
+            t.ecdases[0]
+                .main_table
+                .set(c, cols::TIMESTAMP_0, key + FE::one());
+        }),
+        "a first-chain row given its call's second-chain key must be refused"
+    );
+    println!(
+        "BLOCK WHIR ECREC KEY NEGATIVE: first-chain row {c} moved to the second chain's key, refused"
+    );
+}
+
+/// ★ The second chain's key `TS + 1` is what keeps the two chains' scalars apart.
+///
+/// The forgery (`trace_builder::FORGE_ECREC_SWAPPED_CHAINS`) runs the first call's
+/// chains with their scalars swapped — `u2·G` and `u1·R` — and writes the key
+/// `u2·G + u1·R`; the ECREC row's scalar columns and relations stay honest and its
+/// two `LEN` columns swap, so every constraint holds and every message but the
+/// second chain's `Bit` receives balances. Those are keyed at `TS + 1` and refuse it.
+///
+/// Mutation (box script): key the second chain at `TS` (the ECREC table's chain-2
+/// interactions and the builder's chain-2 timestamps) and the forgery verifies.
+#[test]
+fn ecrec_chains_swapped_between_keys_are_refused() {
+    use crate::tables::trace_builder::FORGE_ECREC_SWAPPED_CHAINS;
+    use std::sync::atomic::Ordering;
+    let honest = ecrec_traces().2.public_output_bytes;
+    assert!(
+        traces_block_accepts(ecrec_traces, |_| {}),
+        "the honest calls verify"
+    );
+    println!("BLOCK WHIR ECREC SWAP CONTROL: honest, accepted");
+    FORGE_ECREC_SWAPPED_CHAINS.store(true, Ordering::SeqCst);
+    let forged = ecrec_traces().2.public_output_bytes;
+    let accepted = traces_block_accepts(ecrec_traces, |_| {});
+    FORGE_ECREC_SWAPPED_CHAINS.store(false, Ordering::SeqCst);
+    assert_ne!(forged[..64], honest[..64], "the forged first key differs");
+    assert_eq!(forged[64..], honest[64..], "only the first call is forged");
+    assert!(!accepted, "chains with swapped scalars must be refused");
+    println!("BLOCK WHIR ECREC SWAP NEGATIVE: swapped chains, refused");
 }
 
 /// ★ COPY cut inside a call: test_copy_ecalls' 17 COPY rows (a 21-byte

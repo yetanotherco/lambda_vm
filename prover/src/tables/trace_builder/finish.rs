@@ -42,7 +42,7 @@ impl RestHeader {
 }
 
 /// [`crate::TableCounts`] field by field, to compare two.
-pub(super) fn counts_of(c: &crate::TableCounts) -> [usize; 22] {
+pub(super) fn counts_of(c: &crate::TableCounts) -> [usize; 23] {
     [
         c.cpu,
         c.lt,
@@ -66,6 +66,7 @@ pub(super) fn counts_of(c: &crate::TableCounts) -> [usize; 22] {
         c.copy,
         c.blake3,
         c.is_wh,
+        c.ecrec,
     ]
 }
 
@@ -157,6 +158,7 @@ pub(super) struct FinishPlan<'a> {
     ecsm_ops: BlockVec<ecsm::EcsmOperation>,
     ecdas_ops: BlockVec<ecdas::CompactEcdasOp>,
     hint_ops: BlockVec<hint::HintOperation>,
+    ecrec_ops: BlockVec<ecrec::EcrecOperation>,
     /// IS_WH's rows ([`is_wh::dedup_is_wh_rows`] over KECCAK's state addresses),
     /// shared by its BITWISE lookups and its table.
     is_wh_rows: Vec<(is_wh::IsWhKey, u64)>,
@@ -190,6 +192,7 @@ struct P4Lists<'s> {
     blake3_absorb_ops: &'s BlockVec<blake3::Blake3AbsorbOperation>,
     ecsm_ops: &'s BlockVec<ecsm::EcsmOperation>,
     hint_ops: &'s BlockVec<hint::HintOperation>,
+    ecrec_ops: &'s BlockVec<ecrec::EcrecOperation>,
     is_wh_rows: &'s [(is_wh::IsWhKey, u64)],
     max_rows: &'s crate::tables::MaxRowsConfig,
     num_padding_rows: usize,
@@ -256,6 +259,7 @@ fn count_bitwise(
         blake3_absorb_ops,
         ecsm_ops,
         hint_ops,
+        ecrec_ops,
         is_wh_rows,
         max_rows,
         num_padding_rows,
@@ -527,7 +531,7 @@ fn count_bitwise(
     for part in copy_ops.parts() {
         collectors.push(Box::new(move |h| count_bitwise_from_copy(part, h)));
     }
-    for (k, name) in ["BLAKE3", "ECSM", "HINT", "PADDING"]
+    for (k, name) in ["BLAKE3", "ECSM", "HINT", "ECREC", "PADDING"]
         .into_iter()
         .enumerate()
     {
@@ -545,6 +549,7 @@ fn count_bitwise(
         }) as Collector,
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops.whole()))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops.whole()))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_ecrec(&ecrec_ops.whole()))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ]);
     // The per-row lookups (`types::MU_MAX`): the μ bound every row of a
@@ -813,6 +818,7 @@ struct P4Shared {
     blake3_absorb_ops: std::sync::Arc<BlockVec<blake3::Blake3AbsorbOperation>>,
     ecsm_ops: std::sync::Arc<BlockVec<ecsm::EcsmOperation>>,
     hint_ops: std::sync::Arc<BlockVec<hint::HintOperation>>,
+    ecrec_ops: std::sync::Arc<BlockVec<ecrec::EcrecOperation>>,
     is_wh_rows: std::sync::Arc<Vec<(is_wh::IsWhKey, u64)>>,
 }
 
@@ -843,6 +849,7 @@ impl P4Shared {
             blake3_absorb_ops: &self.blake3_absorb_ops,
             ecsm_ops: &self.ecsm_ops,
             hint_ops: &self.hint_ops,
+            ecrec_ops: &self.ecrec_ops,
             is_wh_rows: &self.is_wh_rows,
             max_rows,
             num_padding_rows,
@@ -1004,6 +1011,7 @@ impl<'a> FinishPlan<'a> {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            ecrec_ops,
         } = ops;
 
         // =====================================================================
@@ -1141,6 +1149,7 @@ impl<'a> FinishPlan<'a> {
                 blake3_absorb_ops: &blake3_absorb_ops,
                 ecsm_ops: &ecsm_ops,
                 hint_ops: &hint_ops,
+                ecrec_ops: &ecrec_ops,
                 is_wh_rows: &is_wh_rows,
                 max_rows,
                 num_padding_rows,
@@ -1279,6 +1288,7 @@ impl<'a> FinishPlan<'a> {
             copy: accelerator(copy_ops.len(), skip.copy_rows),
             blake3: usize::from(num_blake3_ops > 0),
             is_wh: usize::from(!is_wh_rows.is_empty()),
+            ecrec: usize::from(!ecrec_ops.is_empty()),
         };
         if cpu_heights.len() != table_counts.cpu {
             return Err(Error::InvalidTableCounts(format!(
@@ -1360,6 +1370,7 @@ impl<'a> FinishPlan<'a> {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            ecrec_ops,
             is_wh_rows,
             bitwise,
             num_padding_rows,
@@ -1445,6 +1456,7 @@ impl<'a> FinishPlan<'a> {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            ecrec_ops,
             is_wh_rows,
             bitwise,
             num_padding_rows,
@@ -1475,6 +1487,7 @@ impl<'a> FinishPlan<'a> {
                     blake3_absorb_ops: &blake3_absorb_ops,
                     ecsm_ops: &ecsm_ops,
                     hint_ops: &hint_ops,
+                    ecrec_ops: &ecrec_ops,
                     is_wh_rows: &is_wh_rows,
                     max_rows,
                     num_padding_rows,
@@ -1801,6 +1814,13 @@ impl<'a> FinishPlan<'a> {
                 packed_by(pack, |ops| hint::generate_hint_trace_as(ops, form)),
             )
         };
+        // ECREC table. Absent entirely for programs that make no ECREC call.
+        let gen_ecrecs = || {
+            generate_optional(
+                &ecrec_ops.whole(),
+                packed_by(pack, |ops| ecrec::generate_ecrec_trace_as(ops, form)),
+            )
+        };
 
         let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =
             (None, None, None, None);
@@ -1816,6 +1836,7 @@ impl<'a> FinishPlan<'a> {
             (None, None, None, None);
         let (mut ecsms_slot, mut ecdases_slot) = (None, None);
         let mut hints_slot = None;
+        let mut ecrecs_slot = None;
 
         let sequential = cfg!(not(feature = "parallel"));
 
@@ -1859,6 +1880,7 @@ impl<'a> FinishPlan<'a> {
                 spawn_into!(ecsms_slot, gen_ecsms);
                 spawn_into!(ecdases_slot, gen_ecdases);
                 spawn_into!(hints_slot, gen_hints);
+                spawn_into!(ecrecs_slot, gen_ecrecs);
             });
         } else {
             cpus_slot = Some(gen_cpus());
@@ -1888,6 +1910,7 @@ impl<'a> FinishPlan<'a> {
             ecsms_slot = Some(gen_ecsms());
             ecdases_slot = Some(gen_ecdases());
             hints_slot = Some(gen_hints());
+            ecrecs_slot = Some(gen_ecrecs());
         }
 
         build_stamps::mark("p5 end");
@@ -1924,6 +1947,7 @@ impl<'a> FinishPlan<'a> {
         let ecsms = ecsms_slot.expect(PHASE5_RAN)?;
         let ecdases = ecdases_slot.expect(PHASE5_RAN)?;
         let hints = hints_slot.expect(PHASE5_RAN)?;
+        let ecrecs = ecrecs_slot.expect(PHASE5_RAN)?;
         // IS_WH: one table of its rows, none when nothing sent `IS_WH`.
         let is_whs = generate_optional(&is_wh_rows, packed_by(pack, is_wh::generate_is_wh_trace))?;
 
@@ -1973,6 +1997,7 @@ impl<'a> FinishPlan<'a> {
             ecsms,
             ecdases,
             hints,
+            ecrecs,
             is_whs,
             memw_registers,
             local_to_global,
@@ -2031,7 +2056,7 @@ pub(crate) struct Emitted {
 /// The rest's families in AIR order (`VmAirs::air_refs`), each with its
 /// columns at eight bytes a cell: what a family's first table is estimated
 /// at, before one of them has been built.
-const FAMILIES: [(&str, usize); 28] = [
+const FAMILIES: [(&str, usize); 29] = [
     ("BITWISE", bitwise::cols::NUM_COLUMNS),
     ("DECODE", decode::cols::NUM_COLUMNS),
     ("KECCAK_RC", keccak_rc::cols::NUM_COLUMNS),
@@ -2043,6 +2068,7 @@ const FAMILIES: [(&str, usize); 28] = [
     ("ECSM", ecsm::cols::NUM_COLUMNS),
     ("ECDAS", ecdas::cols::NUM_COLUMNS),
     ("HINT", hint::cols::NUM_COLUMNS),
+    ("ECREC", ecrec::cols::NUM_COLUMNS),
     ("BLAKE3", blake3::cols::NUM_COLUMNS),
     ("IS_WH", is_wh::cols::NUM_COLUMNS),
     ("CPU", cpu::cols::NUM_COLUMNS),
@@ -2255,6 +2281,7 @@ impl<'a> FinishPlan<'a> {
             ecsm_ops,
             ecdas_ops,
             hint_ops,
+            ecrec_ops,
             is_wh_rows,
             bitwise,
             num_padding_rows,
@@ -2309,6 +2336,7 @@ impl<'a> FinishPlan<'a> {
             blake3_absorb_ops: Arc::new(blake3_absorb_ops),
             ecsm_ops: Arc::new(ecsm_ops),
             hint_ops: Arc::new(hint_ops),
+            ecrec_ops: Arc::new(ecrec_ops),
             is_wh_rows: Arc::new(is_wh_rows),
         };
 
@@ -2491,6 +2519,15 @@ impl<'a> FinishPlan<'a> {
                 Ok(packed_if(
                     pack,
                     hint::generate_hint_trace_as(&hint_ops.whole(), form),
+                ))
+            })
+        }));
+        let ecrec_ops = Arc::clone(&shared.ecrec_ops);
+        units.extend(optional_unit(family("ECREC"), ecrec_ops.len(), || {
+            Box::new(move || {
+                Ok(packed_if(
+                    pack,
+                    ecrec::generate_ecrec_trace_as(&ecrec_ops.whole(), form),
                 ))
             })
         }));
@@ -3061,6 +3098,7 @@ fn check_units(units: &[Unit<'_>], counts: &crate::TableCounts) -> Result<(), Er
         copy: of("COPY"),
         blake3: of("BLAKE3"),
         is_wh: of("IS_WH"),
+        ecrec: of("ECREC"),
     };
     let fixed = ["BITWISE", "DECODE", "KECCAK_RC", "REGISTER", "HALT"];
     if counts_of(&units_counts) != counts_of(counts) || fixed.iter().any(|f| of(f) != 1) {

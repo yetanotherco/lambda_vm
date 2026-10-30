@@ -39,3 +39,4 @@ Negative numbers (represented as 2s complement 64-bit numbers), are used for our
   page.
 / -11: `ECSM` — secp256k1 scalar multiplication (implemented in
   `executor/src/vm/instruction/execution.rs`; spec page pending).
+/ -12: `ECREC` — ECDSA public-key recovery on secp256k1 (@ecrec).

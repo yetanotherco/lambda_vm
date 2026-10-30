@@ -524,6 +524,14 @@ impl<'a> CpuOp<'a> {
         self.ecall_of(executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER)
     }
 
+    /// Whether this ECALL is an ECREC (ECDSA public-key recovery) syscall. Its
+    /// operands (x10..x13) are recovered from the register state in the trace
+    /// builder, like ECSM's.
+    #[inline]
+    pub fn ecall_ecrec(&self) -> bool {
+        self.ecall_of(executor::vm::instruction::execution::ECREC_SYSCALL_NUMBER)
+    }
+
     /// Whether this ECALL is a non-constraining Hint syscall. The hint operand
     /// addresses (x10/x11/x12) are recovered from the register state in the
     /// trace builder, exactly like ECSM.

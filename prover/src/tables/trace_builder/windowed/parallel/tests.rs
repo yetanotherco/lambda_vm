@@ -182,6 +182,7 @@ const PROGRAMS: [&str; 13] = [
     "test_ecsm",
     "test_copy_ecalls",
     "test_copy_overlaps",
+    "test_ecrec",
 ];
 
 /// ★ Walked from their entries, at every window length (one cycle, less than a
@@ -414,6 +415,10 @@ fn value_reads(window: &WalkedWindow) -> Vec<(&'static str, u64, u64)> {
     for o in &w.ecsm_ops {
         out.push(("ECSM xG", o.addr_xg, 32));
         out.push(("ECSM k", o.addr_k, 32));
+    }
+    for o in &w.ecrec_ops {
+        out.push(("ECREC signature", o.addr_sig, 64));
+        out.push(("ECREC hash", o.addr_msg, 32));
     }
     for o in &w.keccak_ops {
         match &o.sponge {

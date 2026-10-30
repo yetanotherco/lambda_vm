@@ -2429,6 +2429,86 @@ fn test_hint_range_checks_its_output_bytes() {
     );
 }
 
+/// The ECREC program's three calls: two signatures recover their keys (status 0),
+/// one with `r = 0` bails (a zero key, status 1); the committed outputs are those,
+/// and the run proves and verifies.
+#[test]
+fn test_prove_elfs_ecrec() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecrec");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let result = executor::vm::execution::Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run");
+    let expected = "8733750fdf82edb525a2c9f9d201ad1b26e163b8093f3c8f6eb83377d157edb2ce023840e38085bfcf2b27bd66be6a877f0ec281b073ca0f9ab31cfc0733b62a000000000000000076d2fdf1302d1fa9556f4df94ec84cefba6d482e54f47c6c2a238c1baa560f0eb754ac7e7a3e09c44184cb451a4f5fb557f32053eb015dffebb655b5cfd54d8a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000";
+    let got: String = result
+        .return_values
+        .memory_values
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(got, expected, "committed keys and statuses");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert_eq!(traces.ecrecs.len(), 1);
+    assert!(traces.ecsms.is_empty(), "no ECSM call");
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "ECREC prove/verify failed"
+    );
+}
+
+/// Soundness: one byte of a computed key forged on the ECREC row must not verify (the
+/// key is bound by the final addition's ECDAS tuple, the MEMW writes and `< p`).
+#[test]
+fn test_prove_elfs_ecrec_forged_key_rejected() {
+    use crate::tables::ecrec::cols as ecrec_cols;
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecrec");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let result = executor::vm::execution::Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    let orig = *traces.ecrecs[0].main_table.get(0, ecrec_cols::XQ + 3);
+    traces.ecrecs[0].main_table.set(
+        0,
+        ecrec_cols::XQ + 3,
+        orig + FieldElement::<GoldilocksField>::one(),
+    );
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a forged ECREC key"
+    );
+}
+
+/// Soundness: a computed row cannot claim to have bailed. Flipping `OK` to 0 on the
+/// first call's row leaves its key bytes nonzero (a bail writes zeros) and its chains'
+/// messages without their ECREC counterparts.
+#[test]
+fn test_prove_elfs_ecrec_forged_bail_rejected() {
+    use crate::tables::ecrec::cols as ecrec_cols;
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecrec");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let result = executor::vm::execution::Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    traces.ecrecs[0]
+        .main_table
+        .set(0, ecrec_cols::OK, FieldElement::<GoldilocksField>::zero());
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a computed ECREC row relabelled as a bail"
+    );
+}
+
 /// Soundness: the verifier REJECTS a forged ECSM result.
 ///
 /// A malicious prover must not be able to claim a wrong `k·G`. We tamper the result
@@ -3677,6 +3757,7 @@ fn test_verify_rejects_zero_table_counts() {
             copy: 0,
             blake3: 0,
             is_wh: 0,
+            ecrec: 0,
         },
         ..vm_proof
     };
@@ -3772,6 +3853,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         copy: 0,
         blake3: 0,
         is_wh: 0,
+        ecrec: 0,
     };
     let airs = VmAirs::new(
         &elf,
@@ -5112,6 +5194,7 @@ fn the_blake3_count_is_bound_into_the_statement() {
         copy: 1,
         blake3: 1,
         is_wh: 1,
+        ecrec: 0,
     };
 
     let challenge_for = |counts: &crate::TableCounts| {
@@ -5177,6 +5260,7 @@ fn a_blake3_count_above_one_is_rejected() {
         copy: 1,
         blake3: 1,
         is_wh: 1,
+        ecrec: 0,
     };
     assert!(counts.validate().is_ok(), "1 is the honest maximum");
     counts.blake3 = 0;

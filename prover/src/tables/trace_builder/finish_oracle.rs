@@ -81,6 +81,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         ecsm_ops,
         ecdas_ops,
         hint_ops,
+        ecrec_ops,
     } = ops;
 
     // =====================================================================
@@ -403,6 +404,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops.whole()))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_hint(&hint_ops.whole()))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_ecrec(&ecrec_ops.whole()))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ]);
     // The per-row lookups (`types::MU_MAX`): the μ bound every row of a
@@ -883,6 +885,12 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             packed_by(pack, |ops| hint::generate_hint_trace_as(ops, form)),
         )
     };
+    let gen_ecrecs = || {
+        generate_optional(
+            &ecrec_ops.whole(),
+            packed_by(pack, |ops| ecrec::generate_ecrec_trace_as(ops, form)),
+        )
+    };
 
     let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =
         (None, None, None, None);
@@ -897,6 +905,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         (None, None, None, None);
     let (mut ecsms_slot, mut ecdases_slot) = (None, None);
     let mut hints_slot = None;
+    let mut ecrecs_slot = None;
 
     let sequential = cfg!(not(feature = "parallel"));
 
@@ -940,6 +949,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
             spawn_into!(ecsms_slot, gen_ecsms);
             spawn_into!(ecdases_slot, gen_ecdases);
             spawn_into!(hints_slot, gen_hints);
+            spawn_into!(ecrecs_slot, gen_ecrecs);
         });
     } else {
         cpus_slot = Some(gen_cpus());
@@ -969,6 +979,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         ecsms_slot = Some(gen_ecsms());
         ecdases_slot = Some(gen_ecdases());
         hints_slot = Some(gen_hints());
+        ecrecs_slot = Some(gen_ecrecs());
     }
 
     build_stamps::mark("p5 end");
@@ -1005,6 +1016,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
     let ecsms = ecsms_slot.expect(PHASE5_RAN)?;
     let ecdases = ecdases_slot.expect(PHASE5_RAN)?;
     let hints = hints_slot.expect(PHASE5_RAN)?;
+    let ecrecs = ecrecs_slot.expect(PHASE5_RAN)?;
     let is_whs = generate_optional(&is_wh_rows, packed_by(pack, is_wh::generate_is_wh_trace))?;
 
     // Continuation callers derive the real cross-epoch boundary from this set and
@@ -1045,6 +1057,7 @@ pub(super) fn build_traces_oracle<I: ImageSource + Sync>(
         ecsms,
         ecdases,
         hints,
+        ecrecs,
         is_whs,
         memw_registers,
         local_to_global,

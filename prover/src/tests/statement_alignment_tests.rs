@@ -352,6 +352,7 @@ fn counts() -> TableCounts {
         copy: 1,
         blake3: 1,
         is_wh: 1,
+        ecrec: 0,
     }
 }
 

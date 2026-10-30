@@ -191,6 +191,7 @@ const PROGRAMS: [&str; 14] = [
     "test_blake3",
     "test_blake3_absorb",
     "test_dense_pages",
+    "test_ecrec",
 ];
 
 /// Whole-run builds, at small chunks (every chunked table split) and at the

@@ -539,9 +539,10 @@ pub fn stmt_arena_halves() -> u32 {
 pub fn epoch_statement_shape() -> super::statement_replay::EpochStatementShape {
     super::statement_replay::EpochStatementShape {
         public_output_len: STMT_PUBLIC_OUTPUT_LEN,
-        // Twenty-two: fourteen split families, six accelerators, BLAKE3, IS_WH.
+        // Twenty-three: fourteen split families, six accelerators, BLAKE3, IS_WH,
+        // ECREC.
         table_counts: [
-            3, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            3, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
         ],
         num_private_input_pages: 2,
         fri_final_poly_log_degree: 7,

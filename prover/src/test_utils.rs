@@ -61,6 +61,9 @@ use crate::tables::dvrm::{
 use crate::tables::ecdas::{
     EcdasConstraints, bus_interactions as ecdas_bus_interactions, cols as ecdas_cols,
 };
+use crate::tables::ecrec::{
+    EcrecConstraints, bus_interactions as ecrec_bus_interactions, cols as ecrec_cols,
+};
 use crate::tables::ecsm::{
     EcsmConstraints, bus_interactions as ecsm_bus_interactions, cols as ecsm_cols,
 };
@@ -1153,6 +1156,18 @@ pub fn create_ecdas_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcdasCons
     )
 }
 
+/// Create ECREC AIR (one ECDSA public-key recovery a row).
+pub fn create_ecrec_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcrecConstraints> {
+    build_air(
+        ecrec_cols::NUM_COLUMNS,
+        ecrec_bus_interactions(),
+        proof_options,
+        1,
+        EcrecConstraints,
+        "ECREC",
+    )
+}
+
 /// A production AIR behind the common trait object, paired with its label.
 pub type LabeledAir = (
     &'static str,
@@ -1230,6 +1245,7 @@ pub fn production_airs(proof_options: &ProofOptions) -> Vec<LabeledAir> {
         ("ECSM", Box::new(create_ecsm_air(proof_options))),
         ("ECDAS", Box::new(create_ecdas_air(proof_options))),
         ("HINT", Box::new(create_hint_air(proof_options))),
+        ("ECREC", Box::new(create_ecrec_air(proof_options))),
         ("IS_WH", Box::new(create_is_wh_air(proof_options))),
         // ---- continuation-only tables (no monolithic proof contains these) ----
         (
@@ -1268,7 +1284,7 @@ pub fn create_global_memory_air(
     crate::continuation::global_memory_air(proof_options, &config, Some([0u8; 32]))
 }
 
-/// The number of production table AIRs [`production_airs`] yields: 27 monolithic
+/// The number of production table AIRs [`production_airs`] yields: 28 monolithic
 /// plus 3 continuation-only.
 ///
 /// Every suite that iterates the list asserts against this. That assert is the
@@ -1277,4 +1293,4 @@ pub fn create_global_memory_air(
 /// per-table suite at once and silently — which is exactly what happened to the
 /// three continuation tables. Bump it deliberately when a table is genuinely
 /// added or removed.
-pub const NUM_PRODUCTION_AIRS: usize = 30;
+pub const NUM_PRODUCTION_AIRS: usize = 31;

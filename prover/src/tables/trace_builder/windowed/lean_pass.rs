@@ -444,6 +444,30 @@ fn ecall(memory: &mut impl Accesses, regs: &mut Registers, op: CpuOp<'_>, ts: u6
             }
         }
     }
+    if op.ecall_ecrec() {
+        // The signature (64 bytes) and the hash (32) are read, the key and the status
+        // (72 bytes) written.
+        let (out, sig, msg) = (regs.value(10), regs.value(11), regs.value(12));
+        for i in 0..64u64 {
+            memory.access(sig.wrapping_add(i), 1, None);
+        }
+        for i in 0..32u64 {
+            memory.access(msg.wrapping_add(i), 1, None);
+        }
+        let parity = regs.value(13);
+        for (reg, address, at, dwords) in [
+            (11u8, sig, ts, 8u64),
+            (12, msg, ts + 1, 4),
+            (10, out, ts + 2, 9),
+        ] {
+            let value = regs.value(reg);
+            regs.write(reg, value, at);
+            for i in 0..dwords {
+                memory.access(address.wrapping_add(8 * i), 8, Some(at));
+            }
+        }
+        regs.write(13, parity, ts + 1);
+    }
     if op.ecall_hint() {
         let (id, input, out) = (regs.value(10), regs.value(11), regs.value(12));
         for (reg, value) in [(10u8, id), (11, input), (12, out)] {

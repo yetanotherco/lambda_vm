@@ -87,6 +87,7 @@ pub(crate) fn median_statement(
         copy: 0,
         blake3: 0,
         is_wh: 0,
+        ecrec: 0,
     };
     let mut rows: Vec<usize> = vec![32; crate::FIXED_TABLE_COUNT];
     for &(kind, runs) in MEDIAN_MIX {

@@ -1910,6 +1910,7 @@ fn the_per_branch_term_is_the_table_kind_count() {
         copy: 0,
         blake3: 0,
         is_wh: 0,
+        ecrec: 0,
     };
     let kinds = crate::statement::table_count_values(&zero).len();
     assert_eq!(

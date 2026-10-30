@@ -3953,6 +3953,7 @@ mod tests {
                     ("ecdas", c.ecdas),
                     ("hint", c.hint),
                     ("is_wh", c.is_wh),
+                    ("ecrec", c.ecrec),
                 ]
             })
             .collect();

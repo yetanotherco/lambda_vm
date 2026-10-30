@@ -103,6 +103,7 @@ fn every_table_participates_in_the_bus() {
         copy: 1,
         blake3: 1,
         is_wh: 1,
+        ecrec: 0,
     };
     let airs = VmAirs::new(
         &elf,
@@ -168,6 +169,7 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
         copy,
         blake3,
         is_wh,
+        ecrec,
     } = counts;
     // ⛔ BLAKE3 IS DROPPABLE AND IS DELIBERATELY NOT IN THIS LIST — a
     // COVERAGE GAP, not an exemption. It belongs here on exactly the
@@ -205,6 +207,7 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
         ("HINT", hint),
         ("COPY", copy),
         ("IS_WH", is_wh),
+        ("ECREC", ecrec),
     ]
     .into_iter()
     .map(|(name, _count)| name)
@@ -262,6 +265,7 @@ fn no_present_table_contributes_zero_to_the_bus() {
         "test_keccak",
         "test_ecsm",
         "test_commit_4",
+        "test_ecrec",
     ];
 
     let mut droppable: Vec<&'static str> = Vec::new();
@@ -730,6 +734,25 @@ fn omitting_a_used_accelerator_fails_the_bus_balance() {
 
     traces.hints.clear();
     assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "dropping HINT");
+}
+
+/// ECREC cannot be dropped either: the CPU's ecall send for `-12` has no other
+/// receiver, and its chains' ECDAS messages lose their seeds and drains.
+#[test]
+fn omitting_the_ecrec_table_fails_the_bus_balance() {
+    let (elf, logs, _instructions) = run_asm_elf("test_ecrec");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        !traces.ecrecs.is_empty(),
+        "test_ecrec must call ECREC for this to be a forgery"
+    );
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "the honest proof must verify first, or the negative below proves nothing"
+    );
+    traces.ecrecs.clear();
+    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "dropping ECREC");
 }
 
 /// The dispatch above is CPU-to-chip. KECCAK_RND is reached from KECCAK, not

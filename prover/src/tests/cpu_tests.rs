@@ -615,6 +615,7 @@ fn cpu_only_counts(cpu: usize) -> crate::TableCounts {
         copy: 0,
         blake3: 0,
         is_wh: 0,
+        ecrec: 0,
     }
 }
 

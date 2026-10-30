@@ -8908,6 +8908,7 @@ mod air_input_tests {
             copy: 3,
             blake3: 1,
             is_wh: 1,
+            ecrec: 0,
         };
         let start = crate::cpu_proof_start(true, &counts);
         let mut vars = vec![5u8; start + counts.cpu + 4];

@@ -75,11 +75,11 @@ use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_blake3_air, create_branch_air, create_bytewise_air,
     create_copy_air, create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air,
-    create_ecdas_air, create_ecsm_air, create_eq_air, create_halt_air, create_hint_air,
-    create_is_wh_air, create_keccak_air, create_keccak_rc_air, create_keccak_rnd_air,
-    create_load_air, create_lt_air, create_memw_air, create_memw_aligned_air,
-    create_memw_register_air, create_mul_air, create_page_air, create_register_air,
-    create_shift_air, create_store_air,
+    create_ecdas_air, create_ecrec_air, create_ecsm_air, create_eq_air, create_halt_air,
+    create_hint_air, create_is_wh_air, create_keccak_air, create_keccak_rc_air,
+    create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
+    create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
+    create_register_air, create_shift_air, create_store_air,
 };
 
 // Re-exported for downstream hosts and verifier guests (e.g. the in-VM
@@ -215,6 +215,11 @@ pub struct TableCounts {
     /// what bounds its multiplicity sum. Zero is sound by the same bus argument
     /// as COPY's: KECCAK's `IS_WH` sends have no other receiver.
     pub is_wh: usize,
+    /// ECREC tables (ECDSA public-key recovery): 0 or 1, like the other
+    /// accelerators. Zero is sound by the same Ecall-bus argument: ECREC is the
+    /// only receiver of the syscall `-12`, so a run that called it cannot omit
+    /// the table.
+    pub ecrec: usize,
 }
 
 impl TableCounts {
@@ -246,6 +251,7 @@ impl TableCounts {
             self.ecsm,
             self.ecdas,
             self.hint,
+            self.ecrec,
             self.copy,
             self.blake3,
             self.is_wh,
@@ -316,6 +322,7 @@ impl TableCounts {
             ("ecsm", self.ecsm),
             ("ecdas", self.ecdas),
             ("hint", self.hint),
+            ("ecrec", self.ecrec),
             ("copy", self.copy),
             ("blake3", self.blake3),
             // Load-bearing for soundness: this is what bounds the IS_WH
@@ -417,7 +424,8 @@ pub const RECURSION_INPUT_MAGIC: [u8; 4] = *b"LVMR";
 /// - v6: `TableCounts` gained `is_wh` after `blake3` (main's IS_WH table). Main's
 ///   own v5 is `is_wh` on a layout with no `copy` or `blake3` field: a different
 ///   archive, so this one takes a number neither line has used (the v4 lesson).
-pub const RECURSION_INPUT_VERSION: u32 = 6;
+/// - v7: `TableCounts` gained `ecrec` after `is_wh` (the ECDSA-recovery table).
+pub const RECURSION_INPUT_VERSION: u32 = 7;
 
 /// Required alignment (bytes) of the archive's first byte in guest memory.
 pub const RECURSION_INPUT_ALIGN: usize = 16;
@@ -714,9 +722,9 @@ pub type AirTracePair<'a> = (
 
 /// Sub-proof index of the first CPU table: [`VmAirs::air_refs`] puts the four
 /// fixed tables (BITWISE, DECODE, KECCAK_RC, REGISTER), HALT (when included),
-/// the counted COPY, KECCAK, KECCAK_RND, ECSM, ECDAS and HINT tables, BLAKE3 and
-/// IS_WH first.
-fn cpu_start(include_halt: bool, counted: [usize; 8]) -> usize {
+/// the counted COPY, KECCAK, KECCAK_RND, ECSM, ECDAS, HINT and ECREC tables, BLAKE3
+/// and IS_WH first.
+fn cpu_start(include_halt: bool, counted: [usize; 9]) -> usize {
     4 + usize::from(include_halt) + counted.iter().sum::<usize>()
 }
 
@@ -731,6 +739,7 @@ pub(crate) fn cpu_proof_start(include_halt: bool, table_counts: &TableCounts) ->
             table_counts.ecsm,
             table_counts.ecdas,
             table_counts.hint,
+            table_counts.ecrec,
             table_counts.blake3,
             table_counts.is_wh,
         ],
@@ -777,6 +786,7 @@ pub(crate) struct VmAirs {
     pub ecsms: Vec<VmAir>,
     pub ecdases: Vec<VmAir>,
     pub hints: Vec<VmAir>,
+    pub ecrecs: Vec<VmAir>,
     pub is_whs: Vec<VmAir>,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
@@ -952,6 +962,7 @@ impl VmAirs {
                 self.ecsms.len(),
                 self.ecdases.len(),
                 self.hints.len(),
+                self.ecrecs.len(),
                 self.is_whs.len(),
                 self.pages.len(),
                 self.memw_registers.len(),
@@ -976,6 +987,7 @@ impl VmAirs {
                 traces.ecsms.len(),
                 traces.ecdases.len(),
                 traces.hints.len(),
+                traces.ecrecs.len(),
                 traces.is_whs.len(),
                 traces.pages.len(),
                 traces.memw_registers.len(),
@@ -1011,6 +1023,9 @@ impl VmAirs {
             pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.hints.iter().zip(traces.hints.iter_mut()) {
+            pairs.push((air.as_ref(), trace, &()));
+        }
+        for (air, trace) in self.ecrecs.iter().zip(traces.ecrecs.iter_mut()) {
             pairs.push((air.as_ref(), trace, &()));
         }
         // ★ BLAKE3 closes the accelerator group rather than keeping the slot it
@@ -1139,6 +1154,9 @@ impl VmAirs {
         for air in &self.hints {
             refs.push(air.as_ref());
         }
+        for air in &self.ecrecs {
+            refs.push(air.as_ref());
+        }
         // The same slot as `air_trace_pairs`: these two orders ARE the proof's
         // layout, and must move together.
         if self.include_blake3 {
@@ -1160,6 +1178,7 @@ impl VmAirs {
                     self.ecsms.len(),
                     self.ecdases.len(),
                     self.hints.len(),
+                    self.ecrecs.len(),
                     usize::from(self.include_blake3),
                     self.is_whs.len(),
                 ],
@@ -1414,6 +1433,11 @@ impl VmAirs {
                 Box::new(create_hint_air(proof_options).with_name(&format!("HINT[{i}]"))) as VmAir
             })
             .collect();
+        let ecrecs: Vec<_> = (0..table_counts.ecrec)
+            .map(|i| {
+                Box::new(create_ecrec_air(proof_options).with_name(&format!("ECREC[{i}]"))) as VmAir
+            })
+            .collect();
         let is_whs: Vec<_> = (0..table_counts.is_wh)
             .map(|i| {
                 Box::new(create_is_wh_air(proof_options).with_name(&format!("IS_WH[{i}]"))) as VmAir
@@ -1559,6 +1583,7 @@ impl VmAirs {
             ecsms,
             ecdases,
             hints,
+            ecrecs,
             is_whs,
             register,
             pages,

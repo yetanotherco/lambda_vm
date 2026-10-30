@@ -386,6 +386,8 @@ const DESIGN_INSTR: &[(&str, usize)] = &[
     ("IS_WH", 42),
     ("ECSM", 19_264),
     ("ECDAS", 22_718),
+    // The ECDSA-recovery table: the emitter's count, as measured.
+    ("ECREC", 43_231),
     // main's new receiver AIR for the `hint` ecall; 418 → 419 when its syscall
     // number moved from `-31` to `-32` (#984), a constant in its Ecall receive.
     ("HINT", 419),

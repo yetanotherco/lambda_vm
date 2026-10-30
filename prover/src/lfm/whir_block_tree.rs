@@ -2899,6 +2899,7 @@ mod tests {
             copy: 1,
             blake3: 0,
             is_wh: 0,
+            ecrec: 0,
         };
         let statement = block_whir::OwnedBlockStatement {
             table_num_vars: vec![21, 16, 6],

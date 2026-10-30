@@ -28,6 +28,7 @@ const PROGRAMS: [&str; 9] = [
     "test_blake3_absorb",
     "test_commit_split",
     "test_ecsm",
+    "test_ecrec",
 ];
 
 /// Rust guests, built by `make compile-programs-rust`: longer runs over a heap
@@ -108,6 +109,7 @@ fn differences(a: &WalkedWindow, b: &WalkedWindow) -> Vec<&'static str> {
         ("ecsm", same(&x.ecsm_ops, &y.ecsm_ops)),
         ("ecdas", same(&x.ecdas_ops, &y.ecdas_ops)),
         ("hint", same(&x.hint_ops, &y.hint_ops)),
+        ("ecrec", same(&x.ecrec_ops, &y.ecrec_ops)),
     ]
     .into_iter()
     .filter(|&(_, same)| !same)
@@ -316,7 +318,7 @@ fn side_by_side(name: &str, elf: &Elf, window: usize, drop: bool) -> Seen {
         let w = &walked.walk;
         seen.ecalls[0] += w.keccak_ops.len() + w.blake3_ops.len();
         seen.ecalls[1] += w.ecsm_ops.len() + w.blake3_absorb_ops.len();
-        seen.ecalls[2] += w.hint_ops.len();
+        seen.ecalls[2] += w.hint_ops.len() + w.ecrec_ops.len();
     }
     seen
 }

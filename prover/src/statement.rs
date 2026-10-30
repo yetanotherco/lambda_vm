@@ -33,7 +33,9 @@ use crate::{RuntimePageRange, TableCounts};
 /// V6 appends `TableCounts::is_wh` (main's IS_WH table). Main calls its own
 /// append of `is_wh` V5, on an encoding without `blake3`: a different encoding
 /// again, so this one takes the next number neither line has used.
-pub(crate) const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V6";
+///
+/// V7 appends `TableCounts::ecrec` (the ECDSA-recovery table).
+pub(crate) const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V7";
 
 /// Canonical full-ELF identity digest — exactly what [`absorb_statement`] binds
 /// into the transcript. The recursion attestation folds the same digest into
@@ -271,7 +273,7 @@ pub(crate) fn absorb_statement_padding(
 /// exhaustive destructure in [`table_count_values`] fails when a field is added
 /// to [`TableCounts`], and that function's return type fails when the new field
 /// is pushed into the array without bumping this constant.
-pub(crate) const NUM_TABLE_KINDS: usize = 22;
+pub(crate) const NUM_TABLE_KINDS: usize = 23;
 
 /// Every per-table count, in declared order.
 ///
@@ -302,6 +304,7 @@ pub(crate) fn table_count_values(table_counts: &TableCounts) -> [u64; NUM_TABLE_
         copy,
         blake3,
         is_wh,
+        ecrec,
     } = table_counts;
     [
         cpu as u64,
@@ -334,6 +337,8 @@ pub(crate) fn table_count_values(table_counts: &TableCounts) -> [u64; NUM_TABLE_
         // IS_WH: 0 or 1, the range check for KECCAK's state addresses (main's
         // #1022); its bound is what bounds IS_WH's multiplicity sum.
         is_wh as u64,
+        // ECREC: 0 or 1, the ECDSA public-key recovery table.
+        ecrec as u64,
     ]
 }
 
@@ -373,10 +378,10 @@ pub(crate) const MULTILINEAR_BLOCK_TAG: &[u8] = b"LAMBDAVM_MULTILINEAR_BLOCK_STA
 ///
 /// ⚠ V5 for the reason [`DOMAIN_TAG`] is: the lineage's V3 and main's V4 are
 /// different encodings of the same statement, and the merged one appends both
-/// additions. V6 with it: the shared count list gained `is_wh`. The GLOBAL tag
+/// additions. V6 with it: the shared count list gained `is_wh`, V7 `ecrec`. The GLOBAL tag
 /// stays at V2 — the cross-epoch statement binds no per-table counts, so
 /// nothing in its encoding moved.
-pub(crate) const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V6";
+pub(crate) const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V7";
 pub(crate) const CONTINUATION_GLOBAL_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_GLOBAL_V2";
 
 /// Statement bound into the cross-epoch **global** proof's transcript before

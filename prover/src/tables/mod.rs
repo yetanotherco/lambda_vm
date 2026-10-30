@@ -34,6 +34,7 @@ pub mod cpu32;
 pub mod decode;
 pub mod dvrm;
 pub mod ecdas;
+pub mod ecrec;
 pub mod ecsm;
 pub mod eq;
 pub mod global_memory;
