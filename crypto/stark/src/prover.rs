@@ -1059,6 +1059,151 @@ where
     (d, t)
 }
 
+/// Runtime override of [`warm_prove_constants_enabled`]: 0 = the environment's
+/// choice, 1 = off, 2 = on.
+static WARM_PROVE_CONSTANTS_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Force [`warm_prove_constants_enabled`] on, off, or back to the environment.
+pub fn set_warm_prove_constants(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    WARM_PROVE_CONSTANTS_OVERRIDE.store(v, Ordering::Relaxed);
+}
+
+/// Whether a prove's first-use costs are taken out of its card window: the
+/// per-domain constants a table's prove builds on first use warmed beforehand
+/// ([`warm_prove_constants`]), and the composition drain routed through the
+/// staging pairs rather than the growing pinned slab. Neither changes a value:
+/// the proof bytes are the same. On by default;
+/// `LAMBDA_VM_WARM_PROVE_CONSTANTS=0` turns both off (an A/B knob).
+pub fn warm_prove_constants_enabled() -> bool {
+    match WARM_PROVE_CONSTANTS_OVERRIDE.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ENV: OnceLock<bool> = OnceLock::new();
+    *ENV.get_or_init(|| {
+        std::env::var("LAMBDA_VM_WARM_PROVE_CONSTANTS")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Constants [`warm_prove_constants`] built or uploaded so far, process-wide.
+static WARMED_CONSTANTS: AtomicU64 = AtomicU64::new(0);
+
+/// How many constants [`warm_prove_constants`] built or uploaded so far.
+pub fn warmed_prove_constants() -> u64 {
+    WARMED_CONSTANTS.load(Ordering::Relaxed)
+}
+
+/// Builds, before a prove takes the card, the per-domain constants its tables
+/// would otherwise build on first use inside it: each boundary constraint's
+/// zerofier inverse over the LDE (an LDE-size host batch inversion), and — on
+/// the card, for tables that clear the device floor — their resident copies,
+/// the degree-2 split's `1/(2x)` table and the coset points the R3 / commitment
+/// time contexts read. Each is cached for the process exactly as the prove
+/// caches it, so the prove finds it there and no value changes.
+///
+/// `tables` is each table's AIR, row count and public inputs. The boundary
+/// constraints' rows are read off the AIR with zero challenges: a constraint's
+/// row is structural (the challenges only move its value). The tables run side
+/// by side on scoped threads. Call it from a plain thread, not a rayon worker.
+pub fn warm_prove_constants<F, E, PI>(
+    tables: &[(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = PI>,
+        usize,
+        &PI,
+    )],
+) where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: Send + Sync,
+    PI: Sync,
+{
+    std::thread::scope(|scope| {
+        for &(air, rows, pub_inputs) in tables {
+            if rows < 2 || !rows.is_power_of_two() {
+                continue;
+            }
+            scope.spawn(move || warm_table_constants::<F, E, PI>(air, rows, pub_inputs));
+        }
+    });
+}
+
+fn warm_table_constants<F, E, PI>(
+    air: &dyn AIR<Field = F, FieldExtension = E, PublicInputs = PI>,
+    rows: usize,
+    pub_inputs: &PI,
+) where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: Send + Sync,
+{
+    let (domain, twiddles) = domain_and_twiddles::<F, _>(air, rows);
+    let challenges = vec![FieldElement::<E>::zero(); LOGUP_NUM_CHALLENGES];
+    let mut steps: Vec<usize> = air
+        .boundary_constraints(pub_inputs, &challenges, None, rows)
+        .constraints
+        .iter()
+        .map(|bc| bc.step)
+        .collect();
+    steps.sort_unstable();
+    steps.dedup();
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    let z_invs: Vec<Arc<Vec<FieldElement<F>>>> = steps
+        .iter()
+        .map(|&step| domain.boundary_zerofier_inv(step))
+        .collect();
+    WARMED_CONSTANTS.fetch_add(z_invs.len() as u64, Ordering::Relaxed);
+    #[cfg(not(feature = "cuda"))]
+    let _ = twiddles;
+    #[cfg(feature = "cuda")]
+    {
+        let lde = rows * domain.blowup_factor;
+        if !crate::gpu_lde::is_goldilocks_ext3_tower::<F, E>()
+            || !crate::gpu_lde::clears_device_floor(lde)
+        {
+            return;
+        }
+        // SAFETY: `F == GoldilocksField` (the tower check above); the `Arc`'d
+        // Vecs share their layout with the concrete ones.
+        let conc =
+            |v: &Arc<Vec<FieldElement<F>>>| -> crate::constraint_ir::gpu_interp::GoldilocksBZInv {
+                unsafe {
+                    (*(v as *const _ as *const crate::constraint_ir::gpu_interp::GoldilocksBZInv))
+                        .clone()
+                }
+            };
+        let mut warmed = 0u64;
+        for z in &z_invs {
+            warmed +=
+                crate::constraint_ir::gpu_interp::base_vec_device_handle(&conc(z)).is_some() as u64;
+        }
+        if air.composition_poly_degree_bound(rows) / rows == 2 {
+            warmed += crate::constraint_ir::gpu_interp::base_vec_device_handle(&conc(
+                twiddles.inv_2x(&domain),
+            ))
+            .is_some() as u64;
+        }
+        let points = &domain.ood_constants().points;
+        // SAFETY: as above, `FieldElement<GoldilocksField>` is `u64`.
+        let points_u64: &[u64] =
+            unsafe { std::slice::from_raw_parts(points.as_ptr() as *const u64, points.len()) };
+        if let Ok(be) = math_cuda::device::backend() {
+            let stream = be.next_stream();
+            warmed +=
+                crate::gpu_lde::coset_points_device_handle(points_u64, &stream).is_some() as u64;
+        }
+        WARMED_CONSTANTS.fetch_add(warmed, Ordering::Relaxed);
+    }
+}
+
 /// Fills the process-wide domain and twiddle cache for a trace of
 /// `trace_length` rows under `blowup_factor` and `coset_offset` — what the first
 /// prove of that shape builds before its first round — so a prove that comes

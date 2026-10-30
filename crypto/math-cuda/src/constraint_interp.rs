@@ -477,6 +477,27 @@ pub fn download_comp_h(h: &GpuCompH) -> Result<Vec<u64>> {
     Ok(out)
 }
 
+/// [`download_comp_h`] through the staging pairs (32 MiB pinned chunks,
+/// double-buffered) instead of the shared pinned slab. The slab grows to the
+/// largest drain it has served, and a growth is a `cuMemHostAlloc` of the new
+/// size that holds the driver's lock — every other thread's CUDA call waits
+/// behind it (≈ 0.23 s for a 192 MiB `H`, the card idle meanwhile). The pairs
+/// never grow. Same words.
+pub fn download_comp_h_staged(h: &GpuCompH) -> Result<Vec<u64>> {
+    use cudarc::driver::DevicePtr;
+    let mut out = Vec::new();
+    let src = {
+        let (ptr, _record) = h.buf.device_ptr(&h.stream);
+        ptr
+    };
+    // SAFETY: `src` is `h.buf`, `h.buf.len()` words written by kernels queued on
+    // `h.stream` before this call, and kept alive by `h` past the last chunk.
+    unsafe {
+        crate::device::dtoh_staged_into(&h.stream, src, h.buf.len(), &mut out, || Ok(()))?;
+    }
+    Ok(out)
+}
+
 /// Degree-2 quotient decomposition on device: splits a resident `H` (2n rows)
 /// into the two halves `H0/H1`, written in zero-padded slab layout (6 slabs of
 /// `lde_size = 2n` u64, first `n` filled) ready for the batched slab LDE.

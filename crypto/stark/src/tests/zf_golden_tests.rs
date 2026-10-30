@@ -440,3 +440,30 @@ fn print_goldens() {
     }
     println!("];");
 }
+
+/// The prove-constants warm-up (host side) builds the boundary zerofier
+/// inverses a prove would build on first use, and a prove after it has the
+/// bytes of one without it.
+#[test]
+fn a_warmed_prove_has_the_unwarmed_bytes() {
+    use crate::prover::{warm_prove_constants, warmed_prove_constants};
+    let o = golden_options(4, 1, 7, ProofFormat::DEFAULT);
+    let rows = 1usize << 9;
+    let (_, cold, pi) = prove_logup::<Blake3StarkHash>(rows, &o);
+    let air = LogReadOnlyRAP::<F, E>::new(&o);
+    let before = warmed_prove_constants();
+    let tables: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = _>,
+        usize,
+        &_,
+    )> = vec![(&air, rows, &pi)];
+    warm_prove_constants(&tables);
+    assert!(
+        warmed_prove_constants() > before,
+        "a LogUp table has a boundary constraint"
+    );
+    let (air_w, warm, _) = prove_logup::<Blake3StarkHash>(rows, &o);
+    assert!(verify_logup::<Blake3StarkHash>(&air_w, &warm));
+    let b = |p| sha3_hex(&rkyv::to_bytes::<rkyv::rancor::Error>(p).expect("rkyv"));
+    assert_eq!(b(&cold), b(&warm));
+}

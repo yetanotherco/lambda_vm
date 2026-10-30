@@ -466,7 +466,6 @@ pub(crate) fn prove_traces_under<Fam: ProofFamily>(
     // deliberately — the executor and the trace fill run BEFORE this call and
     // must be free to overlap another proof's device phase, which is the entire
     // point of the lever.
-    let _card = super::device_permit::hold_labeled("multi_prove");
     let mut airs = LfmAirs::new_chunked(
         &artifacts.roots,
         &artifacts.blake3_chunk_roots,
@@ -481,6 +480,20 @@ pub(crate) fn prove_traces_under<Fam: ProofFamily>(
     if let Some(one_row) = &artifacts.one_row_roots {
         airs = airs.with_one_row_roots(one_row);
     }
+    // The per-domain constants each table's prove would build on first use
+    // inside the card window, built before it instead
+    // (`stark::prover::warm_prove_constants`; cached, so no value moves).
+    if stark::prover::warm_prove_constants_enabled() {
+        let pairs = airs.air_trace_pairs(traces);
+        let tables: Vec<_> = pairs
+            .iter()
+            .map(|(air, trace, pi)| (*air, trace.num_rows(), *pi))
+            .collect();
+        stark::prover::warm_prove_constants(&tables);
+    }
+    // ⛔ The permit is taken only now: the AIR set and the warm-up above are
+    // host work that must not hold the card.
+    let _card = super::device_permit::hold_labeled("multi_prove");
     let mut transcript = Fam::transcript(&[]);
     absorb_lfm_statement_tagged(
         &mut transcript,

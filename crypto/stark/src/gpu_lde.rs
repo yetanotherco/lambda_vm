@@ -1300,7 +1300,11 @@ where
 pub(crate) fn download_comp_h_to_field<E: IsField + 'static>(
     h: &math_cuda::constraint_interp::GpuCompH,
 ) -> Option<Vec<FieldElement<E>>> {
-    let raw = math_cuda::constraint_interp::download_comp_h(h).ok()?;
+    let raw = if crate::prover::warm_prove_constants_enabled() {
+        math_cuda::constraint_interp::download_comp_h_staged(h).ok()?
+    } else {
+        math_cuda::constraint_interp::download_comp_h(h).ok()?
+    };
     crate::constraint_ir::gpu_interp::ext3_u64_to_field::<E>(&raw)
 }
 
@@ -3738,7 +3742,7 @@ fn coset_points_device_cache()
 /// once per distinct coset. The first upload synchronizes its stream so the
 /// buffer is safe to read from any other stream afterwards. Returns `None` on
 /// upload failure (→ the caller's fallback).
-fn coset_points_device_handle(
+pub(crate) fn coset_points_device_handle(
     coset_u64: &[u64],
     stream: &Arc<CudaStream>,
 ) -> Option<Arc<CudaSlice<u64>>> {

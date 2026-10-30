@@ -35,6 +35,8 @@ pub mod table_transpose_tests;
 pub mod terminal_tests;
 pub mod trace_test_helpers;
 #[cfg(feature = "cuda")]
+pub mod warm_device_tests;
+#[cfg(feature = "cuda")]
 pub mod zf_fri_device_tests;
 pub mod zf_fri_vectors;
 pub mod zf_golden_tests;
