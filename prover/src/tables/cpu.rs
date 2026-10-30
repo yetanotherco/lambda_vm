@@ -486,6 +486,14 @@ impl<'a> CpuOp<'a> {
         }
     }
 
+    /// Whether this ECALL is a Keccak256 (Keccak-256 of a buffer) syscall. Its
+    /// operands (x10..x12) are recovered from the register state in the trace
+    /// builder, like ECSM and HINT.
+    #[inline]
+    pub fn ecall_keccak256(&self) -> bool {
+        self.ecall_of(executor::vm::instruction::execution::KECCAK256_SYSCALL_NUMBER)
+    }
+
     /// Whether this ECALL is a Blake3Compress syscall.
     #[inline]
     pub fn ecall_blake3(&self) -> bool {

@@ -404,6 +404,17 @@ pub enum BusId {
     /// template; the IS_WH table receives it. Main numbers it 32, which the LFM
     /// buses hold here; 37 is the next free ID (20 and 29 stay unused).
     IsWh = 37,
+
+    // =========================================================================
+    // Keccak-256 of a buffer
+    // =========================================================================
+    /// KECCAK's sponge-mode chain: block `j` of a `keccak256` call sends
+    /// `(T, j + 1, count − 136, src + 136, src_hi, out_lo, out_hi, state[200])` to
+    /// the row of block `j + 1`, which receives it as its own `(T, j, count, src,
+    /// …, previous state)`.
+    ///
+    /// ID 38: the next free one (20 and 29 stay unused).
+    KeccakSponge = 38,
 }
 
 impl BusId {
@@ -424,6 +435,7 @@ impl BusId {
             BusId::Ecall => "Ecall",
             BusId::Commit => "Commit",
             BusId::CopyNext => "CopyNext",
+            BusId::KeccakSponge => "KeccakSponge",
             BusId::Keccak => "Keccak",
             BusId::KeccakRc => "KeccakRc",
             BusId::ByteAlu => "ByteAlu",
@@ -474,6 +486,7 @@ impl TryFrom<u64> for BusId {
             34 => Ok(BusId::LfmPublic),
             35 => Ok(BusId::Blake3Absorb),
             36 => Ok(BusId::CopyNext),
+            38 => Ok(BusId::KeccakSponge),
             37 => Ok(BusId::IsWh),
             other => Err(other),
         }

@@ -10,7 +10,8 @@
 //! last-access timestamp and the register cells, and records each byte's
 //! address and timestamp at the byte's first access in the window (its
 //! ENTRIES), whatever the access: a load's or a store's eight bytes, an
-//! accelerator's state, ECSM's and HINT's inputs.
+//! accelerator's state, ECSM's and HINT's inputs, a Keccak-256 call's input
+//! and digest.
 //!
 //! It builds each cycle's [`CpuOperation`] as the walk does, so the register
 //! values and addresses are the walk's, and keeps no memory value: no list is
@@ -391,6 +392,18 @@ fn ecall(memory: &mut impl Accesses, regs: &mut Registers, op: CpuOp<'_>, ts: u6
         let state = op.keccak_state_addr();
         regs.write(10, state, ts);
         memory.access(state, 200, Some(ts));
+    }
+    // Keccak-256 of a buffer (`collect_keccak256_ops`): x10, x11 and x12 read back
+    // at T, every input byte read at T, the 32-byte digest written at T + 1.
+    if op.ecall_keccak256() {
+        let (ptr, len, out) = (regs.value(10), regs.value(11), regs.value(12));
+        for (reg, value) in [(10u8, ptr), (11, len), (12, out)] {
+            regs.write(reg, value, ts);
+        }
+        memory.access(ptr, len as usize, Some(ts));
+        for i in 0..4u64 {
+            memory.access(out.wrapping_add(8 * i), 8, Some(ts + 1));
+        }
     }
     if op.ecall_blake3() {
         let state = op.blake3_state_addr();

@@ -54,7 +54,10 @@ fn multiplicity(m: &Multiplicity, g: &dyn Fn(usize) -> FE) -> FE {
 
 /// Every bus's tuples with a nonzero net over all of `traces`' tables, by bus,
 /// the buses in [`OUTSIDE`] left out: `(bus, tuples)`.
-fn unbalanced(program: &Elf, traces: &mut Traces) -> BTreeMap<u64, Vec<(Vec<u64>, i128)>> {
+pub(super) fn unbalanced(
+    program: &Elf,
+    traces: &mut Traces,
+) -> BTreeMap<u64, Vec<(Vec<u64>, i128)>> {
     let options = ProofOptions::default_test_options();
     let table_counts = traces.table_counts();
     let airs = VmAirs::new(
@@ -133,7 +136,7 @@ fn unbalanced(program: &Elf, traces: &mut Traces) -> BTreeMap<u64, Vec<(Vec<u64>
     by_bus
 }
 
-fn named(by_bus: &BTreeMap<u64, Vec<(Vec<u64>, i128)>>) -> String {
+pub(super) fn named(by_bus: &BTreeMap<u64, Vec<(Vec<u64>, i128)>>) -> String {
     by_bus
         .iter()
         .map(|(bus, tuples)| {
@@ -155,8 +158,9 @@ fn named(by_bus: &BTreeMap<u64, Vec<(Vec<u64>, i128)>>) -> String {
 /// The programs: a loop that repeats its ops past a row's `MU_MAX` (BRANCH, LT
 /// and the ALU tables split rows), every instruction, the shifts, divisions,
 /// loads and comparisons main's multiplicity fix bounded, KECCAK (KECCAK_RND's
-/// padding; a state across a 64 KiB boundary, two IS_WH keys), COPY's writes.
-const PROGRAMS: [&str; 11] = [
+/// padding; a state across a 64 KiB boundary, two IS_WH keys), Keccak-256 of
+/// buffers (KECCAK's sponge mode), COPY's writes.
+const PROGRAMS: [&str; 12] = [
     "loop_4096",
     "all_instructions_64",
     "misalign_sd",
@@ -167,6 +171,7 @@ const PROGRAMS: [&str; 11] = [
     "poc_lb_commit",
     "test_keccak_multi",
     "test_keccak_64k",
+    "test_keccak256",
     "test_commit_split",
 ];
 

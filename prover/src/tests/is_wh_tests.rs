@@ -40,6 +40,7 @@ fn keccak_op(state_addr: u64) -> KeccakOperation {
         state_addr,
         input: [0x0102_0304_0506_0708; 25],
         output: [0; 25],
+        sponge: None,
     }
 }
 

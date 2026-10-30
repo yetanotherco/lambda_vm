@@ -586,6 +586,7 @@ mod keccak_tests {
             state_addr: 0x1000,
             input,
             output,
+            sponge: None,
         };
         let rop = KeccakRoundOperation {
             timestamp: 42,

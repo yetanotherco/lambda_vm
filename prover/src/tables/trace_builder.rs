@@ -80,6 +80,8 @@ mod compact_branch;
 mod compact_bytewise;
 mod compact_eq;
 #[cfg(test)]
+mod keccak256_tests;
+#[cfg(test)]
 mod direct_count_tests {
     //! The direct counts of LT's and KECCAK's lookups against the lists the
     //! finish built before them, kept here word for word as the reference.
@@ -432,6 +434,7 @@ mod direct_count_tests {
                     state_addr: (mix(&mut x) >> 2) & !7,
                     input,
                     output: [0; 25],
+                    sponge: None,
                 }
             })
             .collect();
@@ -2001,7 +2004,17 @@ fn walk_cpu_ops<const REST: bool>(
                     state_addr,
                     input,
                     output,
+                    sponge: None,
                 });
+            }
+        }
+
+        // Keccak256 ECALL: one KECCAK row per block of the input.
+        if op.ecall_keccak256() {
+            let (sponge_memw, rows) = collect_keccak256_ops(op, memory_state, register_state);
+            memw.extend_ops(sponge_memw);
+            if REST {
+                keccak_ops.extend(rows);
             }
         }
 
@@ -2697,6 +2710,95 @@ pub fn copy_ops_for_test(
 ) -> Vec<copy::CopyOperation> {
     let mut memory_state = MemoryState::new();
     collect_copy_ops(functionality, 100, src, dst, count, &mut memory_state).1
+}
+
+/// Collects the memory operations and KECCAK rows of a `keccak256` ecall.
+///
+/// Recomputes the call from the replayed state, as the walk does for every
+/// accelerator: x10/x11/x12 (input address, length, digest address) read back
+/// at `T`; the input read from memory; one KECCAK row per block
+/// ([`keccak::sponge_ops`], the executor's own permutations). The memory
+/// traffic mirrors the chip's sends: per block, each lane wholly inside the
+/// input as one 8-byte read and each input byte of the lane the input ends in
+/// as a 1-byte read, all at `T`; then the 32-byte digest as four 8-byte writes
+/// at `T + 1`.
+fn collect_keccak256_ops(
+    op: CpuOp<'_>,
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+) -> (Vec<MemwOperation>, Vec<KeccakOperation>) {
+    let t = op.timestamp;
+    let ptr = register_state.read(10).0;
+    let len = register_state.read(11).0;
+    let out = register_state.read(12).0;
+    debug_assert!(
+        executor::vm::instruction::execution::keccak256_addresses_ok(ptr, len, out),
+        "keccak256 operands must be validated by the executor"
+    );
+
+    let blocks = executor::vm::instruction::execution::keccak256_blocks(len) as usize;
+    let mut memw_ops = Vec::with_capacity(3 + 17 * blocks + 7 + 4);
+
+    // Bind x10/x11/x12 at T through the memory argument (register reads).
+    for (reg, value) in [(10u8, ptr), (11, len), (12, out)] {
+        let reg_value = pack_register_value(value);
+        let (_old_val, old_ts) = register_state.read(reg);
+        memw_ops.push(
+            MemwOperation::new(true, 2 * reg as u64, reg_value, t, 2, true)
+                .with_old(reg_value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+        );
+        register_state.write(reg, value, t);
+    }
+
+    let input: Vec<u8> = (0..len)
+        .map(|i| memory_state.read_byte(ptr.wrapping_add(i)).0)
+        .collect();
+    let rows = keccak::sponge_ops(t, ptr, out, &input);
+
+    // The reads, block by block, as the chip sends them.
+    for row in &rows {
+        let sponge = row.sponge.as_ref().expect("a sponge row");
+        for lane in 0..keccak::cols::RATE_LANES {
+            if sponge.full(lane) {
+                let addr = sponge.src.wrapping_add(8 * lane as u64);
+                let (values, old_ts) = memory_state.read_bytes(addr, 8);
+                let dword = values
+                    .iter()
+                    .enumerate()
+                    .fold(0u64, |acc, (b, &v)| acc | (u64::from(v) << (8 * b)));
+                memw_ops.push(
+                    MemwOperation::new(false, addr, values, t, 8, true).with_old(values, old_ts),
+                );
+                memory_state.write_bytes(addr, dword, 8, t);
+                continue;
+            }
+            for byte in 0..7 {
+                if !sponge.part(lane, byte) {
+                    continue;
+                }
+                let addr = sponge.src.wrapping_add((8 * lane + byte) as u64);
+                let (values, old_ts) = memory_state.read_bytes(addr, 1);
+                memw_ops.push(
+                    MemwOperation::new(false, addr, values, t, 1, true).with_old(values, old_ts),
+                );
+                memory_state.write_bytes(addr, u64::from(values[0]), 1, t);
+            }
+        }
+    }
+
+    // The digest: the last row's lanes 0..4, at T + 1.
+    let last = rows.last().expect("at least one block");
+    for (lane, &dword) in last.output.iter().take(4).enumerate() {
+        let addr = out.wrapping_add(8 * lane as u64);
+        let value: [u32; 8] = std::array::from_fn(|b| ((dword >> (8 * b)) & 0xFF) as u32);
+        let (old_vals, old_ts) = memory_state.read_bytes(addr, 8);
+        memw_ops.push(
+            MemwOperation::new(false, addr, value, t + 1, 8, false).with_old(old_vals, old_ts),
+        );
+        memory_state.write_bytes(addr, dword, 8, t + 1);
+    }
+
+    (memw_ops, rows)
 }
 
 /// Collects the memory operations for a `Hint` ecall.
@@ -5355,9 +5457,56 @@ pub(crate) fn count_bitwise_from_keccak(
 /// permutation, its rounds replayed.
 #[allow(clippy::needless_range_loop)]
 fn for_each_keccak_lookup(keccak_ops: &[KeccakOperation], mut emit: impl FnMut(BitwiseOperation)) {
-    use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
-
     for kop in keccak_ops {
+        if let Some(sponge) = &kop.sponge {
+            emit_sponge_lookups(kop, sponge, &mut emit);
+        } else {
+            emit_permute_lookups(kop, &mut emit);
+        }
+        emit_round_lookups(kop, &mut emit);
+    }
+}
+
+/// The BITWISE lookups a sponge row of KECCAK sends (`keccak::sponge_bus_interactions`):
+/// the 136 rate XORs `INPUT = PREV ⊕ m'`, the halves of `SRC_LO + 135`, and on the
+/// last row the halves of `OUT_LO + 31`.
+fn emit_sponge_lookups(
+    kop: &KeccakOperation,
+    sponge: &keccak::SpongeRow,
+    emit: &mut impl FnMut(BitwiseOperation),
+) {
+    let prev = if sponge.first {
+        [0u8; 136]
+    } else {
+        kop.sponge_prev(sponge)
+    };
+    let padded = sponge.padded();
+    for i in 0..keccak::cols::RATE {
+        emit(BitwiseOperation::byte_op(
+            BitwiseOperationType::ByteAluXor,
+            prev[i],
+            padded[i],
+        ));
+    }
+    let halves = |value: u64, emit: &mut dyn FnMut(BitwiseOperation)| {
+        for half in [value & 0xFFFF, value >> 16] {
+            emit(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (half & 0xFF) as u8,
+                ((half >> 8) & 0xFF) as u8,
+            ));
+        }
+    };
+    halves((sponge.src & 0xFFFF_FFFF) + 135, &mut *emit);
+    if sponge.last {
+        halves((sponge.out & 0xFFFF_FFFF) + 31, &mut *emit);
+    }
+}
+
+/// The BITWISE lookups a permute row of KECCAK sends: the alignment AND, the
+/// address bytes and the low halves of the lane pointers.
+fn emit_permute_lookups(kop: &KeccakOperation, emit: &mut impl FnMut(BitwiseOperation)) {
+    {
         let state_addr = kop.state_addr;
 
         emit(BitwiseOperation::byte_op(
@@ -5393,7 +5542,14 @@ fn for_each_keccak_lookup(keccak_ops: &[KeccakOperation], mut emit: impl FnMut(B
                 ((half >> 8) & 0xFF) as u8,
             ));
         }
+    }
+}
 
+/// The BITWISE lookups the 24 KECCAK_RND rows of one permutation send.
+#[allow(clippy::needless_range_loop)]
+fn emit_round_lookups(kop: &KeccakOperation, emit: &mut impl FnMut(BitwiseOperation)) {
+    use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
+    {
         // Replay keccak round computation to extract bitwise lookups
         let mut state = kop.input;
         for round in 0..24 {
@@ -9136,6 +9292,7 @@ mod cut_tests {
                 output: std::array::from_fn(|l| {
                     (i as u64 + 7).wrapping_mul(0xc2b2_ae3d) ^ l as u64
                 }),
+                sponge: None,
             })
             .collect()
     }
