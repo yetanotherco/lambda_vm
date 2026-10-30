@@ -2648,9 +2648,17 @@ where
 {
     let order: Vec<usize> = (0..committed.sizes.len()).collect();
     block_prove_in_order::<F, E, T, H>(
-        committed, config, transcript, prepared, deviations, fork_of, argue, on_group, &order,
+        committed, config, transcript, prepared, deviations, fork_of, argue, on_group, &order, None,
     )
 }
+
+/// Phase B's re-ranking hook ([`block_prove_in_order`]): at each group's turn
+/// `p` it is handed phase B's whole order as it stands (`order[p]` is the group
+/// whose turn it is) and may return the groups after it, `order[p + 1..]`, in
+/// another order; `None` keeps them. The proof is the same in any order, so a
+/// caller may decide the rest of the order from what it learns while phase B
+/// runs (the recursion's leaves, `W3_LEAF_FIRST`).
+pub type PhaseBReorder<'a> = dyn Fn(usize, &[usize]) -> Option<Vec<usize>> + Sync + 'a;
 
 /// The groups that hold a table whose columns phase B rebuilds rather than
 /// reads back (`rebuilt`, by group) last, each set in group order: an order
@@ -3055,6 +3063,10 @@ where
 /// argue, which keeps each fork's own sequence — argue, openings, prepared
 /// opening — so the proof is the same again. `on_group` is then called on that
 /// thread, as each group's openings end, in `order` all the same.
+///
+/// `reorder`, when given, may re-rank the groups still to come at each turn,
+/// before the next group's columns go up ([`PhaseBReorder`]); a re-ranking that
+/// is not a permutation of those groups is refused.
 #[allow(clippy::too_many_arguments)]
 #[doc(hidden)]
 pub fn block_prove_in_order<F, E, T, H>(
@@ -3067,6 +3079,7 @@ pub fn block_prove_in_order<F, E, T, H>(
     argue: &ArgueDeviation,
     on_group: &(dyn Fn(GroupOpened<'_, F, E>) + Sync),
     order: &[usize],
+    reorder: Option<&PhaseBReorder<'_>>,
 ) -> Result<BlockProved<F, E>, MlError>
 where
     F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
@@ -3162,7 +3175,10 @@ where
     // The driver thread's schedstat at the start of the turn under way, and
     // its group: each turn's share is closed at the next turn's start.
     let mut turn_sched: Option<((u64, u64), usize)> = None;
-    for (p, &g) in order.iter().enumerate() {
+    // The order as it stands: `reorder` may re-rank what is still to come.
+    let mut order: Vec<usize> = order.to_vec();
+    for p in 0..n {
+        let g = order[p];
         stamps[g].start_b = entered.elapsed().as_secs_f64();
         if sched {
             let now = thread_schedstat();
@@ -3173,6 +3189,21 @@ where
             turn_sched = now.map(|now| (now, g));
         }
         let (at, size) = (starts[g], sizes[g]);
+        // The groups still to come, re-ranked before the next one is chosen
+        // (and before its columns go up): only a permutation of them.
+        if let Some(rest) = reorder.and_then(|reorder| reorder(p, &order)) {
+            let mut was = order[p + 1..].to_vec();
+            let mut now = rest.clone();
+            was.sort_unstable();
+            now.sort_unstable();
+            if was != now {
+                return Err(MlError::QueryCountMismatch {
+                    expected: n - p - 1,
+                    got: rest.len(),
+                });
+            }
+            order[p + 1..].copy_from_slice(&rest);
+        }
         let next_g = order.get(p + 1).copied();
         let mut fork = group_fork::<E, T>(transcript, fork_of(g));
         if spill.is_some() {

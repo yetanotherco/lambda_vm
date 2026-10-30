@@ -32,7 +32,7 @@ use crate::lookup::{AirWithBuses, NullBoundaryConstraintBuilder};
 use crate::multilinear_air::Uniforms;
 use crate::multilinear_block::{
     self, ArgueDeviation, BlockCommitted, BlockPrepared, BlockPreparedCheck, BlockProved,
-    GroupOpened, GroupStamps, Narrowing, OverlapFaults, PhaseBOverlap,
+    GroupOpened, GroupStamps, Narrowing, OverlapFaults, PhaseBOverlap, PhaseBReorder,
 };
 use crate::multilinear_table::{
     CommittedTable, TableLayout, TableStatement, batched::VerifierChecks, global_layout,
@@ -205,6 +205,18 @@ pub(super) fn prove_block(
     faults: OverlapFaults,
     fault: &dyn Fn(&mut BlockCommitted<'_, Fp, Ext>),
 ) -> (Result<BlockProved<Fp, Ext>, MlError>, Vec<Heard>) {
+    prove_block_reordered(config, overlap, order, faults, fault, None)
+}
+
+/// [`prove_block`] with phase B's re-ranking hook ([`PhaseBReorder`]).
+fn prove_block_reordered(
+    config: &ChainConfig,
+    overlap: PhaseBOverlap,
+    order: &[usize],
+    faults: OverlapFaults,
+    fault: &dyn Fn(&mut BlockCommitted<'_, Fp, Ext>),
+    reorder: Option<&PhaseBReorder<'_>>,
+) -> (Result<BlockProved<Fp, Ext>, MlError>, Vec<Heard>) {
     let airs = airs();
     let config = *config;
     let columns = prepared_columns();
@@ -263,6 +275,7 @@ pub(super) fn prove_block(
         &ArgueDeviation::default(),
         &on_group,
         order,
+        reorder,
     );
     (
         proved,
@@ -672,4 +685,131 @@ fn a_refusal_turns_the_rest_of_phase_b_serial() {
     let serial_after: Vec<usize> = (0..n).filter(|&g| s[g].serial_after_refusal).collect();
     assert_eq!(overlapped, vec![0, 1]);
     assert_eq!(serial_after, (2..n - 1).collect::<Vec<_>>());
+}
+
+/// The order phase B takes under `reorder`, from group order: each turn's
+/// re-ranking applied as the prover applies it.
+fn taken_under(reorder: &PhaseBReorder<'_>) -> Vec<usize> {
+    let mut order = in_order();
+    for p in 0..order.len() {
+        if let Some(rest) = reorder(p, &order) {
+            order[p + 1..].copy_from_slice(&rest);
+        }
+    }
+    order
+}
+
+/// ★ Re-ranking the groups still to come while phase B runs moves no byte:
+/// under either argue format and with the overlap off, on or pinned, a hook
+/// that reverses what is left at one turn, at every turn, or swaps the last
+/// two late proves the bytes of one group at a time in group order (the pinned
+/// [`BEFORE_THE_OVERLAP`]) and verifies — and phase B did take the re-ranked
+/// order (the observer hears it), so the hook is not a no-op.
+#[test]
+fn a_re_ranked_phase_b_proves_the_bytes_of_group_order() {
+    let n = SIZES.len();
+    let at_turn_one = |p: usize, order: &[usize]| -> Option<Vec<usize>> {
+        (p == 1).then(|| order[p + 1..].iter().rev().copied().collect())
+    };
+    let every_turn =
+        |p: usize, order: &[usize]| Some(order[p + 1..].iter().rev().copied().collect());
+    let late_swap = |p: usize, order: &[usize]| -> Option<Vec<usize>> {
+        (p + 3 == order.len()).then(|| {
+            let mut rest = order[p + 1..].to_vec();
+            rest.swap(0, 1);
+            rest
+        })
+    };
+    let hooks: [(&str, &PhaseBReorder<'_>); 3] = [
+        ("reversed at turn one", &at_turn_one),
+        ("reversed at every turn", &every_turn),
+        ("the last two swapped late", &late_swap),
+    ];
+    for (argue, before) in ARGUES.into_iter().zip(BEFORE_THE_OVERLAP) {
+        for (what, hook) in hooks {
+            let taken = taken_under(hook);
+            assert_ne!(taken, in_order(), "{what}: the hook moves a group");
+            for overlap in [PhaseBOverlap::Off, PhaseBOverlap::On, PhaseBOverlap::Pinned] {
+                let (proved, heard) = prove_block_reordered(
+                    &config(argue),
+                    overlap,
+                    &in_order(),
+                    OverlapFaults::default(),
+                    &|_| {},
+                    Some(hook),
+                );
+                let proved =
+                    proved.unwrap_or_else(|e| panic!("{argue:?} {what} {overlap:?}: {e:?}"));
+                assert_eq!(digest(&proved), before, "{argue:?} {what} {overlap:?}");
+                verify(argue, &proved)
+                    .unwrap_or_else(|e| panic!("{argue:?} {what} {overlap:?}: {e:?}"));
+                let groups: Vec<usize> = heard.iter().map(|(g, _)| *g).collect();
+                assert_eq!(
+                    groups, taken,
+                    "{argue:?} {what} {overlap:?}: the order taken"
+                );
+                assert_eq!(groups.len(), n);
+            }
+        }
+    }
+}
+
+/// A re-ranking that is not a permutation of the groups still to come — one
+/// named twice, one left out, one already taken, one extra, one that does not
+/// exist — is the prove's error, never a panic, with the overlap off, on or
+/// pinned.
+#[test]
+fn a_re_ranking_that_is_not_a_permutation_is_refused() {
+    let n = SIZES.len();
+    let twice = |p: usize, order: &[usize]| -> Option<Vec<usize>> {
+        (p == 1).then(|| {
+            let mut rest = order[p + 1..].to_vec();
+            rest[1] = rest[0];
+            rest
+        })
+    };
+    let left_out = |p: usize, order: &[usize]| -> Option<Vec<usize>> {
+        (p == 1).then(|| order[p + 2..].to_vec())
+    };
+    let taken = |p: usize, order: &[usize]| -> Option<Vec<usize>> {
+        (p == 1).then(|| {
+            let mut rest = order[p + 1..].to_vec();
+            rest[0] = order[p];
+            rest
+        })
+    };
+    let extra = |p: usize, order: &[usize]| -> Option<Vec<usize>> {
+        (p == 1).then(|| {
+            let mut rest = order[p + 1..].to_vec();
+            rest.push(order[0]);
+            rest
+        })
+    };
+    let foreign = |p: usize, order: &[usize]| -> Option<Vec<usize>> {
+        (p == 1).then(|| {
+            let mut rest = order[p + 1..].to_vec();
+            rest[0] = n;
+            rest
+        })
+    };
+    let hooks: [(&str, &PhaseBReorder<'_>); 5] = [
+        ("a group twice", &twice),
+        ("a group left out", &left_out),
+        ("a group already taken", &taken),
+        ("a group extra", &extra),
+        ("no such group", &foreign),
+    ];
+    for (what, hook) in hooks {
+        for overlap in [PhaseBOverlap::Off, PhaseBOverlap::On, PhaseBOverlap::Pinned] {
+            let (proved, _) = prove_block_reordered(
+                &config(ArgueFormat::PerTable),
+                overlap,
+                &in_order(),
+                OverlapFaults::default(),
+                &|_| {},
+                Some(hook),
+            );
+            assert!(proved.is_err(), "{what} {overlap:?}: proved");
+        }
+    }
 }
