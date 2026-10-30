@@ -170,6 +170,12 @@ pub const BLOCK_MAX_TABLE_VARS: usize = 27;
 const _: () = assert!(BLOCK_KECCAK_RND_ROWS_LOG2 <= BLOCK_KECCAK_RND_MAX_VARS);
 const _: () = assert!(BLOCK_ECDAS_ROWS_LOG2 <= BLOCK_ECDAS_MAX_VARS);
 const _: () = assert!(BLOCK_KECCAK_ROWS_LOG2 <= BLOCK_KECCAK_MAX_VARS);
+// The KECCAK rows a block statement may declare stay under the sponge mode's
+// counting bound (`tables::keccak::SPONGE_MAX_ROWS`): raising either cap past it
+// fails to compile instead of weakening the argument.
+const _: () = assert!(
+    (BLOCK_MAX_KECCAK as u128) << BLOCK_KECCAK_MAX_VARS <= crate::tables::keccak::SPONGE_MAX_ROWS
+);
 const _: () = assert!(BLOCK_ECSM_ROWS_LOG2 <= BLOCK_ECSM_MAX_VARS);
 const _: () = assert!(BLOCK_COPY_ROWS_LOG2 <= BLOCK_COPY_MAX_VARS);
 

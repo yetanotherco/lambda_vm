@@ -58,6 +58,17 @@ pub(super) fn unbalanced(
     program: &Elf,
     traces: &mut Traces,
 ) -> BTreeMap<u64, Vec<(Vec<u64>, i128)>> {
+    unbalanced_with(program, traces, &|_| None)
+}
+
+/// [`unbalanced`] with a table's interactions taken from `over` when it names
+/// them (by the table's name), else from its AIR: a test's mutant interactions,
+/// built on the test's own thread.
+pub(super) fn unbalanced_with(
+    program: &Elf,
+    traces: &mut Traces,
+    over: &dyn Fn(&str) -> Option<Vec<BusInteraction>>,
+) -> BTreeMap<u64, Vec<(Vec<u64>, i128)>> {
     let options = ProofOptions::default_test_options();
     let table_counts = traces.table_counts();
     let airs = VmAirs::new(
@@ -82,7 +93,11 @@ pub(super) fn unbalanced(
     // Each table's share of each tuple, to name the tables of a tuple left over.
     let mut by_table: HashMap<(u64, Vec<u64>), BTreeMap<String, i128>> = HashMap::new();
     for (air, trace, _) in airs.air_trace_pairs(traces) {
-        let interactions: &[BusInteraction] = air.bus_interactions();
+        let owned = over(air.name());
+        let interactions: &[BusInteraction] = match &owned {
+            Some(v) => v,
+            None => air.bus_interactions(),
+        };
         for row in 0..trace.num_rows() {
             let g = |c: usize| *trace.get_main(row, c);
             for bi in interactions

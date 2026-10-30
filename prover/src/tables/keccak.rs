@@ -42,8 +42,14 @@
 //!
 //! The byte count `COUNT` starts at `x11` (its high word forced 0), falls by
 //! 136 per row, and the last row's mask must hold exactly `COUNT` bytes, at
-//! most 135. In integers `len − 136·J` is in `(−2^39, 2^32)` for any chain of
-//! `J < 2^31` rows, so `COUNT = Σ s` on the last row forces `J = ⌊len/136⌋`.
+//! most 135. In integers `len − 136·J` is in `(−2^48, 2^32)` for any chain of
+//! `J <` [`SPONGE_MAX_ROWS`] rows, far inside the field, so `COUNT = Σ s` on the
+//! last row forces `J = ⌊len/136⌋`. The same bound keeps the block index `j`
+//! from wrapping, which the keys' uniqueness and the chain's acyclicity rest on.
+//! Both proof shapes stay below it: a block proof holds at most
+//! `BLOCK_MAX_KECCAK` tables of at most `2^BLOCK_KECCAK_MAX_VARS` rows (2^29,
+//! asserted at compile time in `block_whir`), and a STARK proof one KECCAK table
+//! (`TableCounts::validate`) of at most 2^32 rows (the field's two-adicity).
 //!
 //! ## Column layout (907 columns)
 //!
@@ -240,44 +246,44 @@ pub struct SpongeRow {
     pub last: bool,
     /// The block's input bytes, zero past the input.
     pub msg: [u8; 136],
+    /// The read mask `s`: `s[i]` = byte `i` of the block is input and read. All
+    /// 136 on a row that is not the last, the first `count` on the last.
+    pub mask: [bool; 136],
 }
 
 impl SpongeRow {
-    /// Input bytes in this block: 136 on a row that is not the last, the
-    /// remaining count on the last.
-    pub fn taken(&self) -> usize {
-        if self.last {
-            self.count as usize
-        } else {
-            cols::RATE
-        }
-    }
-
-    /// The read mask `s`: `s[i]` = byte `i` of the block is input.
-    pub fn mask(&self) -> [bool; 136] {
-        let taken = self.taken();
+    /// The read mask of a block holding `taken` input bytes.
+    pub fn prefix(taken: usize) -> [bool; 136] {
         std::array::from_fn(|i| i < taken)
     }
 
-    /// `FULL[k]`: the whole lane is input.
+    /// Input bytes the block reads.
+    pub fn taken(&self) -> usize {
+        self.mask.iter().filter(|&&s| s).count()
+    }
+
+    /// `FULL[k]`: the whole lane is read as one access.
     pub fn full(&self, lane: usize) -> bool {
-        8 * lane + 8 <= self.taken()
+        self.mask[8 * lane..8 * lane + 8].iter().all(|&s| s)
     }
 
-    /// `PART[k][b]`: byte `b < 7` of lane `k` is input but the lane is not.
+    /// `PART[k][b]`: byte `b < 7` of lane `k` is read alone (the lane is not whole).
     pub fn part(&self, lane: usize, byte: usize) -> bool {
-        !self.full(lane) && 8 * lane + byte < self.taken()
+        !self.full(lane) && self.mask[8 * lane + byte]
     }
 
-    /// The padded block: the input bytes, then on the last row `0x01` right
-    /// after them and `0x80` on byte 135.
+    /// The padded block, the chip's linear form `m'_i = msg_i + s_{i−1} − s_i
+    /// + [i = 135]·0x80·last` (`s_{−1} = 1`): on a prefix mask, the input bytes,
+    /// then on the last row `0x01` right after them and `0x80` on byte 135.
     pub fn padded(&self) -> [u8; 136] {
-        let mut block = self.msg;
-        if self.last {
-            block[self.taken()] ^= 0x01;
-            block[cols::RATE - 1] ^= 0x80;
-        }
-        block
+        std::array::from_fn(|i| {
+            let before = if i == 0 { true } else { self.mask[i - 1] };
+            let mut v = i32::from(self.msg[i]) + i32::from(before) - i32::from(self.mask[i]);
+            if i == cols::RATE - 1 && self.last {
+                v += 0x80;
+            }
+            v as u8
+        })
     }
 }
 
@@ -318,6 +324,7 @@ pub fn sponge_ops(t: u64, ptr: u64, out: u64, input: &[u8]) -> Vec<KeccakOperati
                     first: j == 0,
                     last: j + 1 == n,
                     msg,
+                    mask: SpongeRow::prefix(take),
                 }),
             }
         })
@@ -425,9 +432,7 @@ pub fn generate_keccak_rows_as(
                 table.set_u64(row_idx, cols::OUT_END, out_end & 0xFFFF);
                 table.set_u64(row_idx, cols::OUT_END + 1, out_end >> 16);
             }
-            if !sponge.first {
-                table.set_bytes(row_idx, cols::PREV, &op.sponge_prev(sponge));
-            }
+            table.set_bytes(row_idx, cols::PREV, &op.sponge_prev(sponge));
             table.set_bytes(row_idx, cols::MSG, &sponge.msg);
             for lane in 0..cols::RATE_LANES {
                 table.set_bool(row_idx, cols::full(lane), sponge.full(lane));
@@ -738,6 +743,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions
 }
 
+/// The most KECCAK rows one proof may hold for the sponge mode's counting
+/// argument (module docs): with `N` rows, `len − 136·J` stays in
+/// `(−136·N, 2^32)`, which must not reach `p ≈ 2^64`; and the block index must
+/// not wrap. 2^40 leaves a margin of 2^16 over what either needs. A cap that
+/// lets one proof hold more KECCAK rows has to stay under this; `block_whir`
+/// asserts its own at compile time.
+pub const SPONGE_MAX_ROWS: u128 = 1 << 40;
+
 /// Interactions of the sponge mode, after the 84 of the permute mode.
 pub const SPONGE_INTERACTIONS: usize = 1 + 3 + 2 + RATE_READS + cols::RATE + 4 + 4;
 
@@ -833,6 +846,106 @@ fn sponge_memory_read(offset_lo: i64, bytes: &[usize]) -> Vec<BusValue> {
     v
 }
 
+/// The digest address on the link between rows (`SpongeCheck::LinkOut` leaves it
+/// out in a test).
+fn link_out() -> [BusValue; 2] {
+    if dropped(SpongeCheck::LinkOut) {
+        [BusValue::constant(0), BusValue::constant(0)]
+    } else {
+        [direct(cols::OUT_LO), direct(cols::OUT_HI)]
+    }
+}
+
+/// The sponge mode's checks by what they stop, so a test can leave one out and
+/// show the forgery it stops then passes (`keccak256_tests`). Outside the tests
+/// [`dropped`] is always `false`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpongeCheck {
+    /// `μ = MU_P + MU_S` (idx 56).
+    ModeSum,
+    /// `(FIRST + LAST)(1 − MU_S) = 0` (idx 57).
+    FlagsOnSponge,
+    /// `FULL`, `PART` bits.
+    MaskBits,
+    /// `FULL_k · PART_{k,b} = 0`.
+    OneRead,
+    /// The mask is a prefix.
+    Prefix,
+    /// No read off a sponge row.
+    ReadsOnSponge,
+    /// A row that is not last reads a whole block.
+    FullUnlessLast,
+    /// The last block holds at most 135 bytes.
+    LastNotFull,
+    /// The last block holds exactly `COUNT` bytes.
+    CountOnLast,
+    /// Bytes past the input are 0.
+    MsgZero,
+    /// The first row is block 0.
+    FirstBlock,
+    /// The first row starts from the zero state.
+    FirstState,
+    /// `SRC_END` and `OUT_END` hold the addresses' ends.
+    AddressHalves,
+    /// The digest address rides the link between rows.
+    LinkOut,
+    /// Lane 0's 8-byte memory read.
+    LaneRead,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The check a test leaves out ([`SpongeCheck`]).
+    pub(crate) static DROPPED: std::cell::Cell<Option<SpongeCheck>> =
+        const { std::cell::Cell::new(None) };
+    /// A test's forgery of a call's rows before the walk emits their memory
+    /// traffic (`trace_builder::collect_keccak256_ops`).
+    #[allow(clippy::type_complexity)]
+    pub(crate) static FORGE: std::cell::RefCell<Option<Box<dyn Fn(&mut Vec<KeccakOperation>)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether a test left `check` out; never outside the tests.
+#[inline(always)]
+pub(crate) fn dropped(check: SpongeCheck) -> bool {
+    #[cfg(test)]
+    {
+        DROPPED.with(|d| d.get() == Some(check))
+    }
+    #[cfg(not(test))]
+    {
+        let _ = check;
+        false
+    }
+}
+
+/// A test's forgery of one call's rows (see [`FORGE`]).
+#[cfg(test)]
+pub(crate) fn forge(rows: &mut Vec<KeccakOperation>) {
+    FORGE.with(|f| {
+        if let Some(f) = f.borrow().as_ref() {
+            f(rows)
+        }
+    });
+}
+
+/// Recomputes a call's permutations from its rows' masks and messages, starting
+/// from `start`: a test's forgery made consistent with the round chip.
+#[cfg(test)]
+pub(crate) fn rechain(rows: &mut [KeccakOperation], start: [u64; 25]) {
+    use executor::vm::instruction::execution::keccak_f1600;
+    let mut state = start;
+    for row in rows {
+        let padded = row.sponge.as_ref().expect("a sponge row").padded();
+        for (lane, chunk) in state.iter_mut().zip(padded.chunks_exact(8)) {
+            *lane ^= u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+        }
+        row.input = state;
+        keccak_f1600(&mut state);
+        row.output = state;
+    }
+}
+
 /// The sponge mode's interactions (see the module docs).
 ///
 /// - Ecall receive (`FIRST`): `[T, 0, KECCAK256 lo, hi]`.
@@ -888,8 +1001,7 @@ pub fn sponge_bus_interactions() -> Vec<BusInteraction> {
             LinearTerm::Constant(1),
         ]));
         v.push(direct(cols::SRC_HI));
-        v.push(direct(cols::OUT_LO));
-        v.push(direct(cols::OUT_HI));
+        v.extend(link_out());
         v.extend((0..200).map(|i| direct(cols::output_byte(i))));
         out.push(BusInteraction::sender(
             BusId::KeccakSponge,
@@ -906,8 +1018,7 @@ pub fn sponge_bus_interactions() -> Vec<BusInteraction> {
         v.push(direct(cols::COUNT));
         v.push(direct(cols::SRC_LO));
         v.push(direct(cols::SRC_HI));
-        v.push(direct(cols::OUT_LO));
-        v.push(direct(cols::OUT_HI));
+        v.extend(link_out());
         v.extend((0..cols::RATE).map(|i| direct(cols::prev(i))));
         v.extend((cols::RATE..200).map(|i| direct(cols::input_byte(i))));
         out.push(BusInteraction::receiver(
@@ -921,9 +1032,16 @@ pub fn sponge_bus_interactions() -> Vec<BusInteraction> {
     // input ends inside one at a time. Byte 7 of a lane is never read alone.
     for lane in 0..cols::RATE_LANES {
         let bytes: Vec<usize> = (0..8).map(|b| cols::msg(8 * lane + b)).collect();
+        // A test leaves lane 0's read out with `SpongeCheck::LaneRead` (a zero
+        // multiplicity, so the interaction count stays).
+        let multiplicity = if lane == 0 && dropped(SpongeCheck::LaneRead) {
+            Multiplicity::Linear(vec![LinearTerm::Constant(0)])
+        } else {
+            Multiplicity::Column(cols::full(lane))
+        };
         out.push(BusInteraction::sender(
             BusId::Memw,
-            Multiplicity::Column(cols::full(lane)),
+            multiplicity,
             sponge_memory_read(8 * lane as i64, &bytes),
         ));
         for byte in 0..7 {
@@ -1100,20 +1218,30 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
         // idx 56: μ = MU_P + MU_S. With μ, MU_P, MU_S bits, at most one mode.
         let mu_p = b.main(0, cols::MU_P);
         let mu_s = b.main(0, cols::MU_S);
-        b.emit_base(56, mu - mu_p - mu_s.clone());
+        let e = if dropped(SpongeCheck::ModeSum) {
+            b.zero()
+        } else {
+            mu - mu_p - mu_s.clone()
+        };
+        b.emit_base(56, e);
         // idx 57: FIRST and LAST only on sponge rows: (FIRST + LAST)(1 − MU_S).
         // Both are bits and both products are ≥ 0 in the integers, so the sum
         // vanishing over the bits {0,1} means each does (2·1 ≠ 0 in the field).
         let first = b.main(0, cols::FIRST);
         let last = b.main(0, cols::LAST);
-        b.emit_base(
-            57,
-            (first.clone() + last.clone()) * (one.clone() - mu_s.clone()),
-        );
+        let e = if dropped(SpongeCheck::FlagsOnSponge) {
+            b.zero()
+        } else {
+            (first.clone() + last.clone()) * (one.clone() - mu_s.clone())
+        };
+        b.emit_base(57, e);
 
         // ---------------- sponge mode ----------------
         let mut idx = MODE_CONSTRAINTS;
-        let mut emit = |b: &mut B, e: B::Expr| {
+        // Every sponge constraint names its check, so a test can leave one out
+        // (`SpongeCheck`); outside the tests none is ever left out.
+        let mut emit = |b: &mut B, check: SpongeCheck, e: B::Expr| {
+            let e = if dropped(check) { b.zero() } else { e };
             b.emit_base(idx, e);
             idx += 1;
         };
@@ -1122,11 +1250,11 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
         for lane in 0..cols::RATE_LANES {
             let f = b.main(0, cols::full(lane));
             let e = f.clone() * (b.one() - f);
-            emit(b, e);
+            emit(b, SpongeCheck::MaskBits, e);
             for byte in 0..7 {
                 let p = b.main(0, cols::part(lane, byte));
                 let e = p.clone() * (b.one() - p);
-                emit(b, e);
+                emit(b, SpongeCheck::MaskBits, e);
             }
         }
         // FULL_k · PART_{k,b} = 0: each s_i is a bit.
@@ -1134,7 +1262,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
             for byte in 0..7 {
                 let f = b.main(0, cols::full(lane));
                 let p = b.main(0, cols::part(lane, byte));
-                emit(b, f * p);
+                emit(b, SpongeCheck::OneRead, f * p);
             }
         }
         // s_i as an expression.
@@ -1150,48 +1278,48 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
         // Prefix: (1 − s_i) · s_{i+1} = 0.
         for i in 0..cols::RATE - 1 {
             let e = (b.one() - s(b, i)) * s(b, i + 1);
-            emit(b, e);
+            emit(b, SpongeCheck::Prefix, e);
         }
         // No read off a sponge row: (1 − MU_S) · s_0 = 0.
         let e = (b.one() - mu_s.clone()) * s(b, 0);
-        emit(b, e);
+        emit(b, SpongeCheck::ReadsOnSponge, e);
         // A row that is not last reads a whole block: (MU_S − LAST)(1 − FULL_16).
         let full_last = b.main(0, cols::full(cols::RATE_LANES - 1));
         let e = (mu_s.clone() - last.clone()) * (b.one() - full_last.clone());
-        emit(b, e);
+        emit(b, SpongeCheck::FullUnlessLast, e);
         // The last block holds at most 135 input bytes: LAST · FULL_16 = 0.
-        emit(b, last.clone() * full_last);
+        emit(b, SpongeCheck::LastNotFull, last.clone() * full_last);
         // The last block holds exactly COUNT bytes: LAST · (COUNT − Σ s_i) = 0.
         let mut taken = b.zero();
         for i in 0..cols::RATE {
             taken = taken + s(b, i);
         }
         let count = b.main(0, cols::COUNT);
-        emit(b, last.clone() * (count - taken));
+        emit(b, SpongeCheck::CountOnLast, last.clone() * (count - taken));
         // Bytes past the input are 0: (1 − s_i) · MSG_i = 0.
         for i in 0..cols::RATE {
             let e = (b.one() - s(b, i)) * b.main(0, cols::msg(i));
-            emit(b, e);
+            emit(b, SpongeCheck::MsgZero, e);
         }
         // The first row is block 0 and starts from the zero state.
         let e = first.clone() * b.main(0, cols::TIMESTAMP_1);
-        emit(b, e);
+        emit(b, SpongeCheck::FirstBlock, e);
         for i in 0..cols::RATE {
             let e = first.clone() * b.main(0, cols::prev(i));
-            emit(b, e);
+            emit(b, SpongeCheck::FirstState, e);
         }
         for i in cols::RATE..200 {
             let e = first.clone() * b.main(0, cols::input_byte(i));
-            emit(b, e);
+            emit(b, SpongeCheck::FirstState, e);
         }
         // SRC_LO + 135 and OUT_LO + 31 as halves (each half range-checked).
         let c65536 = b.const_base(1 << 16);
         let src_end = b.main(0, cols::SRC_END) + b.main(0, cols::SRC_END + 1) * c65536.clone();
         let e = mu_s * (b.main(0, cols::SRC_LO) + b.const_base(135) - src_end);
-        emit(b, e);
+        emit(b, SpongeCheck::AddressHalves, e);
         let out_end = b.main(0, cols::OUT_END) + b.main(0, cols::OUT_END + 1) * c65536;
         let e = last * (b.main(0, cols::OUT_LO) + b.const_base(31) - out_end);
-        emit(b, e);
+        emit(b, SpongeCheck::AddressHalves, e);
 
         debug_assert_eq!(idx, NUM_CONSTRAINTS);
     }

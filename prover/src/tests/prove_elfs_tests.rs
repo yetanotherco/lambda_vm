@@ -5274,7 +5274,7 @@ fn the_ecall_receiver_syscall_numbers_are_pairwise_distinct() {
 // =============================================================================
 
 /// `test_keccak256`'s eleven calls, `(input offset, length)`, in commit order.
-const KECCAK256_CALLS: [(usize, usize); 11] = [
+const KECCAK256_CALLS: [(usize, usize); 12] = [
     (0, 0),
     (1, 1),
     (3, 135),
@@ -5286,6 +5286,7 @@ const KECCAK256_CALLS: [(usize, usize); 11] = [
     (8, 20),
     (6, 32),
     (4, 140),
+    (9, 136),
 ];
 
 /// `test_keccak256` run, its digests checked against tiny-keccak, and its

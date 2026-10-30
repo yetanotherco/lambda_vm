@@ -2753,13 +2753,19 @@ fn collect_keccak256_ops(
     let input: Vec<u8> = (0..len)
         .map(|i| memory_state.read_byte(ptr.wrapping_add(i)).0)
         .collect();
-    let rows = keccak::sponge_ops(t, ptr, out, &input);
+    #[allow(unused_mut)]
+    let mut rows = keccak::sponge_ops(t, ptr, out, &input);
+    #[cfg(test)]
+    keccak::forge(&mut rows);
 
     // The reads, block by block, as the chip sends them.
     for row in &rows {
         let sponge = row.sponge.as_ref().expect("a sponge row");
         for lane in 0..keccak::cols::RATE_LANES {
             if sponge.full(lane) {
+                if lane == 0 && keccak::dropped(keccak::SpongeCheck::LaneRead) {
+                    continue;
+                }
                 let addr = sponge.src.wrapping_add(8 * lane as u64);
                 let (values, old_ts) = memory_state.read_bytes(addr, 8);
                 let dword = values
@@ -2788,6 +2794,7 @@ fn collect_keccak256_ops(
 
     // The digest: the last row's lanes 0..4, at T + 1.
     let last = rows.last().expect("at least one block");
+    let out = last.sponge.as_ref().expect("a sponge row").out;
     for (lane, &dword) in last.output.iter().take(4).enumerate() {
         let addr = out.wrapping_add(8 * lane as u64);
         let value: [u32; 8] = std::array::from_fn(|b| ((dword >> (8 * b)) & 0xFF) as u32);
@@ -5475,11 +5482,7 @@ fn emit_sponge_lookups(
     sponge: &keccak::SpongeRow,
     emit: &mut impl FnMut(BitwiseOperation),
 ) {
-    let prev = if sponge.first {
-        [0u8; 136]
-    } else {
-        kop.sponge_prev(sponge)
-    };
+    let prev = kop.sponge_prev(sponge);
     let padded = sponge.padded();
     for i in 0..keccak::cols::RATE {
         emit(BitwiseOperation::byte_op(

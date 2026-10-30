@@ -21,6 +21,7 @@ main:
 	#     8  |      8       |    20  | an address-sized input, aligned
 	#     9  |      6       |    32  | a slot-sized input
 	#    10  |      4       |   140  | digest written over its own input (sp+512+4+10)
+	#    11  |      9       |   136  | one full block whose last byte is below 0x80
 	addi	sp, sp, -1536
 
 	# Fill the input buffer.
@@ -90,6 +91,11 @@ main:
 	addi	a2, s1, 288
 	ecall
 
+	addi	a0, s0, 9
+	li	a1, 136
+	addi	a2, s1, 352
+	ecall
+
 	# The digest overwrites bytes 10..42 of its own 140-byte input.
 	addi	a0, s0, 4
 	li	a1, 140
@@ -110,7 +116,7 @@ main:
 
 	li	a0, 1
 	mv	a1, s1
-	li	a2, 352
+	li	a2, 384
 	li	a7, 64
 	ecall
 

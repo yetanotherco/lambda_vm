@@ -12,7 +12,7 @@
 use executor::elf::Elf;
 use tiny_keccak::{Hasher, Keccak};
 
-use super::bus_net_tests::{named, unbalanced};
+use super::bus_net_tests::{named, unbalanced_with};
 use super::finish_tests::run;
 use super::*;
 use crate::tables::MaxRowsConfig;
@@ -23,7 +23,7 @@ use crate::test_utils::{busless_air, validate_busless};
 const PROGRAM: &str = "test_keccak256";
 
 /// `(input offset, length)` of each call, in commit order (the program's table).
-const CALLS: [(usize, usize); 11] = [
+const CALLS: [(usize, usize); 12] = [
     (0, 0),
     (1, 1),
     (3, 135),
@@ -35,6 +35,7 @@ const CALLS: [(usize, usize); 11] = [
     (8, 20),
     (6, 32),
     (4, 140),
+    (9, 136),
 ];
 
 fn reference(input: &[u8]) -> [u8; 32] {
@@ -87,7 +88,12 @@ fn check(program: &Elf, traces: &mut Traces) -> Result<(), String> {
             return Err(format!("KECCAK[{k}] constraints"));
         }
     }
-    let left = unbalanced(program, traces);
+    // KECCAK's interactions built here, on the test's thread, so a check a test
+    // leaves out (`keccak::DROPPED`, thread-local) is left out of them too.
+    let left = unbalanced_with(program, traces, &|name| {
+        name.starts_with("KECCAK[")
+            .then(crate::tables::keccak::bus_interactions)
+    });
     if left.is_empty() {
         Ok(())
     } else {
@@ -301,4 +307,181 @@ fn non_bit_flags_are_refused() {
         });
         assert!(why.contains("constraints"), "{name}: {why}");
     }
+}
+
+// =============================================================================
+// ★ Each sponge check is load-bearing: left out, the forgery it stops passes
+// =============================================================================
+//
+// A forgery here is consistent everywhere but at the one check: the walk builds
+// it (`keccak::FORGE` rewrites one call's rows before the walk emits their memory
+// traffic, and `keccak::rechain` recomputes their permutations), so the round
+// chip, the BITWISE counts, the memory reads and the digest writes all follow it,
+// and the committed digest is not the input's hash. With the check in, the
+// forged trace is refused; with it left out (`keccak::DROPPED`), the trace passes
+// every KECCAK constraint and every bus the tables close among themselves.
+
+use crate::tables::keccak::{self, KeccakOperation, SpongeCheck, SpongeRow};
+
+/// Whether `rows` are the call of `len` bytes at `offset` into the buffer.
+fn is_call(rows: &[KeccakOperation], (offset, len): (usize, usize), data: &[u8]) -> bool {
+    rows.first()
+        .and_then(|r| r.sponge.as_ref())
+        .is_some_and(|s| s.count == len as u64 && (len == 0 || s.msg[0] == data[offset]))
+}
+
+fn sponge(row: &mut KeccakOperation) -> &mut SpongeRow {
+    row.sponge.as_mut().expect("a sponge row")
+}
+
+/// The traces with the call `call` (`(offset, length)`) forged by `forge`
+/// (which gets the call's rows and the input buffer's bytes).
+fn forged_traces(
+    call: (usize, usize),
+    forge: impl Fn(&mut Vec<KeccakOperation>, &[u8]) + 'static,
+) -> (Elf, Traces) {
+    let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = std::rc::Rc::clone(&ran);
+    keccak::FORGE.with(|f| {
+        *f.borrow_mut() = Some(Box::new(move |rows: &mut Vec<KeccakOperation>| {
+            let data = buffer();
+            if is_call(rows, call, &data) {
+                forge(rows, &data);
+                seen.set(true);
+            }
+        }));
+    });
+    let built = traces();
+    keccak::FORGE.with(|f| *f.borrow_mut() = None);
+    assert!(ran.get(), "the forger ran on the call {call:?}");
+    built
+}
+
+/// ★ `which` stops `forge` (on the call `call`): refused with the check,
+/// passing without it, and the committed digest moved off the reference.
+fn load_bearing(
+    which: SpongeCheck,
+    call: (usize, usize),
+    forge: impl Fn(&mut Vec<KeccakOperation>, &[u8]) + Clone + 'static,
+) {
+    let (_, honest) = traces();
+    let (program, mut with) = forged_traces(call, forge.clone());
+    assert_ne!(
+        with.public_output_bytes, honest.public_output_bytes,
+        "{which:?}: the forgery commits another digest"
+    );
+    let refused = check(&program, &mut with);
+    assert!(
+        refused.is_err(),
+        "{which:?}: the forgery passed with the check in"
+    );
+    keccak::DROPPED.with(|d| d.set(Some(which)));
+    let (program, mut without) = forged_traces(call, forge);
+    let passed = check(&program, &mut without);
+    keccak::DROPPED.with(|d| d.set(None));
+    eprintln!(
+        "{which:?}: refused by {} with the check; without it: {passed:?}",
+        refused.unwrap_err()
+    );
+    assert!(
+        passed.is_ok(),
+        "{which:?}: still refused without the check: {passed:?}"
+    );
+}
+
+/// Bytes past the input are 0: a byte past a 1-byte input, never read, set
+/// nonzero, so the hash is of a block memory never held.
+#[test]
+fn bytes_past_the_input_are_load_bearing() {
+    load_bearing(SpongeCheck::MsgZero, (1, 1), |rows, _| {
+        sponge(&mut rows[0]).msg[40] = 7;
+        keccak::rechain(rows, [0; 25]);
+    });
+}
+
+/// The mask is a prefix: a 20-byte input read with a hole at byte 17 and the
+/// byte past its end read instead; the count still matches, the `0x01` lands in
+/// the hole, and byte 18 drops by one.
+#[test]
+fn the_prefix_mask_is_load_bearing() {
+    load_bearing(SpongeCheck::Prefix, (8, 20), |rows, data| {
+        let s = sponge(&mut rows[0]);
+        s.mask[17] = false;
+        s.msg[17] = 0;
+        s.mask[20] = true;
+        s.msg[20] = data[8 + 20];
+        keccak::rechain(rows, [0; 25]);
+    });
+}
+
+/// The last row reads exactly COUNT bytes: a 137-byte input whose last block
+/// reads none of its one byte, so the hash is of the first 136 bytes.
+#[test]
+fn the_count_on_the_last_row_is_load_bearing() {
+    load_bearing(SpongeCheck::CountOnLast, (5, 137), |rows, _| {
+        let s = sponge(&mut rows[1]);
+        s.mask = SpongeRow::prefix(0);
+        s.msg = [0; 136];
+        keccak::rechain(rows, [0; 25]);
+    });
+}
+
+/// The last block holds at most 135 bytes: a 136-byte input as one full last
+/// block (its padding folded into it), one permutation where Keccak takes two.
+#[test]
+fn the_last_block_bound_is_load_bearing() {
+    load_bearing(SpongeCheck::LastNotFull, (9, 136), |rows, data| {
+        rows.truncate(1);
+        let s = sponge(&mut rows[0]);
+        assert!(
+            data[9 + 135] < 0x80,
+            "the block's last byte leaves room for 0x80"
+        );
+        s.last = true;
+        keccak::rechain(rows, [0; 25]);
+    });
+}
+
+/// A row that is not last reads a whole block: block 1 of a 600-byte input
+/// reads 135 bytes, so a `0x01` lands in the middle of the input.
+#[test]
+fn whole_blocks_before_the_last_are_load_bearing() {
+    load_bearing(SpongeCheck::FullUnlessLast, (7, 600), |rows, _| {
+        let s = sponge(&mut rows[1]);
+        s.mask = SpongeRow::prefix(135);
+        s.msg[135] = 0;
+        keccak::rechain(rows, [0; 25]);
+    });
+}
+
+/// The first row starts from the zero state: a 32-byte input hashed from a
+/// state of the prover's choosing.
+#[test]
+fn the_zero_starting_state_is_load_bearing() {
+    load_bearing(SpongeCheck::FirstState, (6, 32), |rows, _| {
+        let mut start = [0u64; 25];
+        start[3] = 0x0123_4567_89ab_cdef;
+        start[20] = 1;
+        keccak::rechain(rows, start);
+    });
+}
+
+/// The digest address rides the link: the last row of a 271-byte input writes
+/// its digest 64 bytes past where x12 named.
+#[test]
+fn the_digest_address_on_the_link_is_load_bearing() {
+    load_bearing(SpongeCheck::LinkOut, (2, 271), |rows, _| {
+        let s = sponge(&mut rows[1]);
+        s.out += 64;
+    });
+}
+
+/// Lane 0's memory read: block 0 of a 272-byte input claims other bytes in
+/// lane 0 than memory holds.
+#[test]
+fn the_lane_read_is_load_bearing() {
+    load_bearing(SpongeCheck::LaneRead, (0, 272), |rows, _| {
+        sponge(&mut rows[0]).msg[0] ^= 0x5a;
+        keccak::rechain(rows, [0; 25]);
+    });
 }
