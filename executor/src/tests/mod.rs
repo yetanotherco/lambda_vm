@@ -1,6 +1,7 @@
 pub mod blake3_tests;
 pub mod commit_ecall_tests;
 pub mod dma_tests;
+pub mod ecrec_tests;
 pub mod ecsm_tests;
 pub mod exec_paths_tests;
 pub mod flamegraph_tests;

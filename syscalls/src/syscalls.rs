@@ -47,6 +47,11 @@ const BLAKE3_ABSORB_SYSCALL_NUMBER: usize = usize::MAX - 3;
 #[cfg(target_arch = "riscv64")]
 const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
 
+/// Syscall number for the ECDSA public-key recovery accelerator (-12 as usize). Must match
+/// the executor's `ECREC_SYSCALL_NUMBER`.
+#[cfg(target_arch = "riscv64")]
+const ECREC_SYSCALL_NUMBER: usize = usize::MAX - 11;
+
 /// Copy-accelerator syscall number, serving `memcpy` and `memmove` (-30 as usize).
 /// Must match the executor.
 #[cfg(all(target_arch = "riscv64", not(feature = "fast-memcpy")))]
@@ -328,6 +333,33 @@ pub fn ecsm_mul(xr: &mut [u8; 32], xg: &[u8; 32], k: &[u8; 32]) {
 #[cfg(not(target_arch = "riscv64"))]
 /// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator (32-byte little-endian values).
 pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Recover the secp256k1 public key of an ECDSA signature via the ECREC accelerator.
+/// `sig` is `r ‖ s` and `msg` the message hash, each value 32-byte big-endian (as
+/// Ethereum carries them); `parity` is the parity of `R`'s y (the recovery id's low
+/// bit, 0 or 1). Writes `out = Q.x ‖ Q.y ‖ status`: the key's coordinates, 32-byte
+/// big-endian each, and a little-endian status doubleword, 0 when the call computed the
+/// key and 1 when it bailed (the key bytes are then zero and the caller must recover
+/// the key another way). `sig` and `msg` must not overlap; `out` may alias either.
+pub fn ecrecover(out: &mut [u8; 72], sig: &[u8; 64], msg: &[u8; 32], parity: u64) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") out.as_mut_ptr(), // x10 = address to write the key and status
+            in("a1") sig.as_ptr(),     // x11 = address of r ‖ s
+            in("a2") msg.as_ptr(),     // x12 = address of the message hash
+            in("a3") parity,           // x13 = parity of R's y
+            in("a7") ECREC_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Recover the secp256k1 public key of an ECDSA signature via the ECREC accelerator.
+pub fn ecrecover(_out: &mut [u8; 72], _sig: &[u8; 64], _msg: &[u8; 32], _parity: u64) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

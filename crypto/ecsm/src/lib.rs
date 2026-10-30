@@ -16,6 +16,7 @@
 //! Curve: secp256k1, `y^2 = x^3 + 7 mod p`, `p = 2^256 - 2^32 - 977`, order `N`.
 
 pub mod curve;
+pub mod ecrec;
 pub mod witness;
 
 #[cfg(test)]
@@ -24,6 +25,10 @@ mod tests;
 use num_bigint::BigUint;
 
 pub use curve::{AffinePoint, recover_y_canonical, replay_double_and_add};
+pub use ecrec::{
+    ECREC_STATUS_BAIL, ECREC_STATUS_KEY, EcrecWitness, compute_ecrec_witness, ecdas_add_step,
+    ecdas_chain, ecrecover, generator_le,
+};
 pub use witness::{EcdasStep, EcsmWitness, compute_witness};
 
 /// secp256k1 curve coefficient `b`.

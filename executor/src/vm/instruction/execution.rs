@@ -54,6 +54,8 @@ syscall_numbers! {
     /// `KECCAK256_SYSCALL_NUMBER`: Keccak-256 of a guest buffer, proven by the
     /// KECCAK table's sponge mode.
     Keccak256 = 98,
+    /// Placeholder discriminant. The actual syscall value is `ECREC_SYSCALL_NUMBER`.
+    Ecrec = 99,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -273,6 +275,16 @@ pub const BLAKE3_ABSORB_MAX_BLOCKS: u64 = 1 << 10;
 /// bus as `[lo32, hi32] = [2^32 - 11, 2^32 - 1]`.
 pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
 
+/// Syscall number for the ECDSA public-key recovery accelerator (secp256k1).
+///
+/// The spec uses ECALL number `-12`, i.e. `u64::MAX - 11 = 0xFFFF_FFFF_FFFF_FFF4`, which
+/// the ECREC table puts on the `Ecall` bus as `[lo32, hi32] = [2^32 - 12, 2^32 - 1]`.
+pub const ECREC_SYSCALL_NUMBER: u64 = u64::MAX - 11;
+
+/// Bytes the ECREC call writes at `x10`: the key's x and y (32 bytes each, big-endian)
+/// and the status doubleword (0 = key, 1 = bailed).
+pub const ECREC_OUT_BYTES: u64 = 72;
+
 /// Syscall number for the copy accelerator, serving `memcpy` and `memmove`.
 ///
 /// The spec uses ECALL number `-30`, i.e. `u64::MAX - 29 = 0xFFFF_FFFF_FFFF_FFE2`,
@@ -431,6 +443,7 @@ impl TryFrom<u64> for SyscallNumbers {
             v if v == BLAKE3_SYSCALL_NUMBER => Ok(SyscallNumbers::Blake3Compress),
             v if v == BLAKE3_ABSORB_SYSCALL_NUMBER => Ok(SyscallNumbers::Blake3Absorb),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
+            v if v == ECREC_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecrec),
             v if v == DMA_MEMCPY_SYSCALL_NUMBER => Ok(SyscallNumbers::DmaMemcpy),
             v if v == DMA_MEMSET_SYSCALL_NUMBER => Ok(SyscallNumbers::DmaMemset),
             v if v == HINT_SYSCALL_NUMBER => Ok(SyscallNumbers::Hint),
@@ -448,6 +461,7 @@ pub enum Accelerator {
     Keccak256,
     Blake3,
     Ecsm,
+    Ecrec,
     Dma,
 }
 
@@ -461,6 +475,7 @@ impl SyscallNumbers {
             SyscallNumbers::Blake3Compress => BLAKE3_SYSCALL_NUMBER,
             SyscallNumbers::Blake3Absorb => BLAKE3_ABSORB_SYSCALL_NUMBER,
             SyscallNumbers::Ecsm => ECSM_SYSCALL_NUMBER,
+            SyscallNumbers::Ecrec => ECREC_SYSCALL_NUMBER,
             SyscallNumbers::DmaMemcpy => DMA_MEMCPY_SYSCALL_NUMBER,
             SyscallNumbers::DmaMemset => DMA_MEMSET_SYSCALL_NUMBER,
             SyscallNumbers::Hint => HINT_SYSCALL_NUMBER,
@@ -486,6 +501,7 @@ impl SyscallNumbers {
             // calls" that no longer track BLAKE3 rows.
             SyscallNumbers::Blake3Absorb => Some(Accelerator::Blake3),
             SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
+            SyscallNumbers::Ecrec => Some(Accelerator::Ecrec),
             SyscallNumbers::DmaMemcpy | SyscallNumbers::DmaMemset => Some(Accelerator::Dma),
             SyscallNumbers::Print
             | SyscallNumbers::Panic
@@ -1095,6 +1111,64 @@ impl Instruction {
                         src2_val = addr_xg;
                         dst_val = addr_k;
                     }
+                    SyscallNumbers::Ecrec => {
+                        // ECREC(-12): ECDSA public-key recovery on secp256k1.
+                        // x10 = addr to write the key (Q.x, Q.y, 32 bytes big-endian each)
+                        // and the status doubleword; x11 = addr of the signature r ‖ s
+                        // (64 bytes, big-endian each); x12 = addr of the message hash
+                        // (32 bytes big-endian); x13 = the parity of R's y (0 or 1).
+                        // Status 0: the key. Status 1: the call bailed (the key bytes are
+                        // zero) and the guest recovers the key itself; see
+                        // `ecsm::ecrec` for exactly when.
+                        let addr_out = registers.read(10)?;
+                        let addr_sig = registers.read(11)?;
+                        let addr_msg = registers.read(12)?;
+                        let parity = registers.read(13)?;
+                        if !addr_limb_ok(addr_out, ECREC_OUT_BYTES - 1)
+                            || !addr_limb_ok(addr_sig, 63)
+                            || !addr_limb_ok(addr_msg, 31)
+                        {
+                            return Err(ExecutionError::EcrecAddressOverflow);
+                        }
+                        // The signature is read at T and the hash at T + 1, as unaligned
+                        // doubleword MEMW accesses: the two regions must be disjoint, for
+                        // the same trace-provability reason as ECSM's operands.
+                        if addr_sig < addr_msg.wrapping_add(32)
+                            && addr_msg < addr_sig.wrapping_add(64)
+                        {
+                            return Err(ExecutionError::EcrecOperandOverlap);
+                        }
+                        if parity > 1 {
+                            return Err(ExecutionError::EcrecParityOutOfRange(parity));
+                        }
+                        let mut sig = [0u8; 64];
+                        for i in 0..8u64 {
+                            let dw = memory.load_doubleword(addr_sig + 8 * i)?;
+                            sig[8 * i as usize..8 * i as usize + 8]
+                                .copy_from_slice(&dw.to_le_bytes());
+                        }
+                        let mut msg = [0u8; 32];
+                        for i in 0..4u64 {
+                            let dw = memory.load_doubleword(addr_msg + 8 * i)?;
+                            msg[8 * i as usize..8 * i as usize + 8]
+                                .copy_from_slice(&dw.to_le_bytes());
+                        }
+                        let mut out = [0u8; ECREC_OUT_BYTES as usize];
+                        match ecsm::ecrecover(&sig, &msg, parity as u8) {
+                            Some((x, y)) => {
+                                out[..32].copy_from_slice(&x);
+                                out[32..64].copy_from_slice(&y);
+                            }
+                            None => out[64] = ecsm::ECREC_STATUS_BAIL,
+                        }
+                        for i in 0..9u64 {
+                            let mut dw = [0u8; 8];
+                            dw.copy_from_slice(&out[8 * i as usize..8 * i as usize + 8]);
+                            memory.store_doubleword(addr_out + 8 * i, u64::from_le_bytes(dw))?;
+                        }
+                        src2_val = addr_sig;
+                        dst_val = addr_msg;
+                    }
                     SyscallNumbers::DmaMemcpy => {
                         // memcpy(dst = x10, src = x11, n = x12). Snapshot the input
                         // before writing, which also gives this ecall well-defined
@@ -1415,6 +1489,12 @@ pub enum ExecutionError {
     EcsmAddressOverflow,
     #[error("ECSM xG and k operand ranges overlap")]
     EcsmOperandOverlap,
+    #[error("ECREC address range overflows the lower 32-bit limb")]
+    EcrecAddressOverflow,
+    #[error("ECREC signature and message hash ranges overlap")]
+    EcrecOperandOverlap,
+    #[error("ECREC parity must be 0 or 1, got {0}")]
+    EcrecParityOutOfRange(u64),
     #[error("DMA chunk has {0} bytes; maximum per ecall is {DMA_MEMCPY_MAX_BYTES}")]
     DmaChunkTooLarge(u64),
     #[error("DMA memset needs dst == src + {DMA_MEMSET_GAP}; got src {src:#x}, dst {dst:#x}")]
