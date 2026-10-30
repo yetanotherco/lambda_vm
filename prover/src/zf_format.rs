@@ -16,11 +16,12 @@
 //!
 //! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration:
 //! `cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27 whir_grind=query
-//! whir_grind_bits=18`, the WHIR base code at blowup 2, the block's round-0 trees in the coset order.
+//! whir_grind_bits=18`, the WHIR base code at blowup 2, the block's round-0 trees in the coset order,
+//! the LFM proofs' equal-height chips merged (`lfm_merge=1`, off beside one-row openings).
 //! Each lever was measured net positive on block runs before it became the default. Every knob keeps
 //! its OFF spelling (`cap=off`, `whir_cap=off`, `fri=pair`, `one_row=0`, `whir_folds=uniform4`,
 //! `whir_stack=25`, `whir_grind=all`, `whir_grind_bits=20`, `whir_blowup=4`,
-//! `whir_leaves=natural`), so setting all ten to off reproduces [`ZfFormat::LEGACY`] — the format
+//! `whir_leaves=natural`, `lfm_merge=0`), so setting all eleven to off reproduces [`ZfFormat::LEGACY`] — the format
 //! before any lever, byte for byte — for rollback and for A/B arms. The crypto crates' own defaults
 //! (`stark::proof::options::ProofFormat::DEFAULT`,
 //! `multilinear::whir_chain::ChainFormat::DEFAULT`) stay the legacy format: a
@@ -85,9 +86,13 @@ pub const ENV_WHIR_BLOWUP: &str = "LAMBDA_VM_ZF_WHIR_BLOWUP";
 /// roots, the paths and the in-guest walks follow it. Poseidon1 trees only.
 pub const ENV_WHIR_LEAVES: &str = "LAMBDA_VM_ZF_WHIR_LEAVES";
 /// Whether the recursion's LFM proofs put their equal-height chips into one
-/// AIR (`1`) or keep one AIR a chip (`0`, the default). A proof format of the
-/// recursion alone: the program ids, the artifacts, the in-guest verifiers and
-/// the proofs follow it; no base proof moves. Opt-in, under measurement.
+/// AIR (`1`, the default) or keep one AIR a chip (`0`, the rollback). A proof
+/// format of the recursion alone: the program ids, the artifacts, the in-guest
+/// verifiers and the proofs follow it; no base proof moves. Measured on a 7950X
+/// (knob on against off, same binary): recursion −0.60 s median, −1.18 s large;
+/// whole block −0.70 / −1.04 s; the top proof ×0.79–0.88. Unset beside one-row
+/// openings (`LAMBDA_VM_ZF_ONE_ROW` on or auto) it is off, since a merged AIR
+/// has no one-row layout; set to `1` there it is refused.
 pub const ENV_LFM_MERGE: &str = "LAMBDA_VM_ZF_LFM_MERGE";
 
 /// Every knob above, in banner order: what a verifier that pins its format
@@ -230,7 +235,7 @@ pub struct ZfFormat {
     /// Where the WHIR round-0 trees put their leaves ([`ENV_WHIR_LEAVES`]).
     pub whir_leaves: LeafOrder,
     /// Whether the LFM proofs merge their equal-height chips into one AIR
-    /// ([`ENV_LFM_MERGE`]). Off at the default and in the legacy format.
+    /// ([`ENV_LFM_MERGE`]). On at the default, off in the legacy format.
     pub lfm_merge: bool,
     /// The WHIR block's base hash and its arity-4 cap ([`BaseFormat`]): the
     /// block proof family's ([`crate::hash_pin::BlockFamily`]) at the
@@ -349,7 +354,10 @@ impl ZfFormat {
     /// its rollback. `whir_leaves` is the coset order: the block's
     /// round-0 trees put each query's coset together, so a revived group's
     /// openings are evaluated from its stack instead of re-encoding it
-    /// (`LAMBDA_VM_ZF_WHIR_LEAVES=natural` is its rollback). It moves the block's
+    /// (`LAMBDA_VM_ZF_WHIR_LEAVES=natural` is its rollback). `lfm_merge` proves
+    /// each LFM program's equal-height chips as one AIR (`LAMBDA_VM_ZF_LFM_MERGE=0`
+    /// is its rollback): fewer sub-proofs per recursion proof and fewer paths per
+    /// child at its parent, measured faster on a 7950X at both block sizes. It moves the block's
     /// roots, paths and in-guest walks, not a bit count.
     pub const DEFAULT: Self = Self {
         cap: CapPolicy::Auto,
@@ -363,7 +371,7 @@ impl ZfFormat {
         whir_blowup: 1 << PRODUCTION_WHIR_LOG_BLOWUP,
         base: crate::hash_pin::BLOCK_BASE,
         whir_leaves: LeafOrder::Coset,
-        lfm_merge: false,
+        lfm_merge: true,
     };
 
     /// The legacy format: every lever off. What all ten knobs at their
@@ -471,12 +479,19 @@ impl ZfFormat {
                 }
             };
         }
-        if let Some(v) = get(ENV_LFM_MERGE) {
-            format.lfm_merge = match v.as_str() {
-                "0" => false,
-                "1" => true,
-                _ => return Err(format!("{ENV_LFM_MERGE}={v:?}: expected `0` or `1`")),
-            };
+        match get(ENV_LFM_MERGE) {
+            Some(v) => {
+                format.lfm_merge = match v.as_str() {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err(format!("{ENV_LFM_MERGE}={v:?}: expected `0` or `1`")),
+                };
+            }
+            // Unset beside one-row openings, the merge is off: a merged AIR has
+            // no one-row layout, and the one-row knob is the STARK pipeline's
+            // recommended setting, which must keep parsing on its own.
+            None if format.one_row != OneRowMode::Off => format.lfm_merge = false,
+            None => {}
         }
         format.check_leaves()?;
         format.check_lfm_merge()?;
@@ -654,10 +669,10 @@ impl ZfFormat {
             LeafOrder::Coset => "",
             LeafOrder::Natural => " whir_leaves=natural",
         } + if self.lfm_merge {
-            // Printed only off the default (off).
-            " lfm_merge=1"
-        } else {
             ""
+        } else {
+            // Printed only off the default (on).
+            " lfm_merge=0"
         }
     }
 
@@ -878,7 +893,7 @@ mod tests {
                 whir_blowup: 2,
                 base: crate::hash_pin::BLOCK_BASE,
                 whir_leaves: LeafOrder::Coset,
-                lfm_merge: false,
+                lfm_merge: true,
             }
         );
         assert_eq!(
@@ -953,6 +968,7 @@ mod tests {
             (ENV_WHIR_GRIND_BITS, "20"),
             (ENV_WHIR_BLOWUP, "4"),
             (ENV_WHIR_LEAVES, "natural"),
+            (ENV_LFM_MERGE, "0"),
         ])
         .unwrap();
         assert_eq!(f, ZfFormat::LEGACY);
@@ -960,7 +976,7 @@ mod tests {
         assert_eq!(
             f.banner(),
             "ZF FORMAT: cap=off whir_cap=off fri=pair one_row=0 whir_folds=uniform4 whir_stack=25 \
-             whir_grind=all whir_grind_bits=20 whir_blowup=4 whir_leaves=natural"
+             whir_grind=all whir_grind_bits=20 whir_blowup=4 whir_leaves=natural lfm_merge=0"
         );
         assert!(f.unimplemented_levers().is_empty());
         assert!(f.proof_format().is_legacy());
@@ -1203,7 +1219,7 @@ mod tests {
         assert_eq!(
             f.banner(),
             "ZF FORMAT: cap=auto whir_cap=2 fri=dp one_row=auto whir_folds=first6 whir_stack=26 \
-             whir_grind=all whir_grind_bits=18 whir_blowup=4 whir_leaves=natural"
+             whir_grind=all whir_grind_bits=18 whir_blowup=4 whir_leaves=natural lfm_merge=0"
         );
         // Every banner value is a spelling its knob accepts, back to the same
         // format.
@@ -1224,6 +1240,7 @@ mod tests {
             (ENV_WHIR_GRIND_BITS, fields["whir_grind_bits"]),
             (ENV_WHIR_BLOWUP, fields["whir_blowup"]),
             (ENV_WHIR_LEAVES, fields["whir_leaves"]),
+            (ENV_LFM_MERGE, fields["lfm_merge"]),
         ])
         .unwrap();
         assert_eq!(back, f);
@@ -1268,8 +1285,10 @@ mod tests {
             parse(&[(ENV_ONE_ROW, "auto"), (ENV_FRI, "dp")])
                 .unwrap()
                 .banner(),
+            // Beside one-row openings the LFM merge is off (it has no one-row
+            // layout), and the banner says so.
             "ZF FORMAT: cap=auto whir_cap=auto fri=dp one_row=auto whir_folds=first6 whir_stack=27 \
-             whir_grind=query whir_grind_bits=18"
+             whir_grind=query whir_grind_bits=18 lfm_merge=0"
         );
     }
 

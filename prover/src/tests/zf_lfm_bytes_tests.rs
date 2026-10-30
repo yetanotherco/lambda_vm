@@ -51,7 +51,7 @@ fn formats() -> [(&'static str, ProofFormat); 4] {
         fri_mode: FriMode::Dp,
         one_row: OneRowMode::Off,
         fri_schedule_override: None,
-        merge_equal_height_tables: false,
+        merge_equal_height_tables: true,
     };
     assert_eq!(
         production,
@@ -72,6 +72,10 @@ fn formats() -> [(&'static str, ProofFormat); 4] {
             "all_levers",
             ProofFormat {
                 one_row: OneRowMode::Auto,
+                // The LFM merge has no one-row layout: beside one-row openings
+                // the library builds none (`registry::merge_plan_for`), so it is
+                // spelled off here as the format parser would read it.
+                merge_equal_height_tables: false,
                 ..production
             },
         ),

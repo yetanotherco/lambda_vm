@@ -841,7 +841,8 @@ pub struct LfmAirs {
     /// not offered to the prover or the verifier, so a proof never carries them.
     chip_set: ChipSet,
     /// The merged AIRs (`LAMBDA_VM_ZF_LFM_MERGE`), one per group of
-    /// [`Self::merge_plan`], in its order. Empty by default: one AIR a chip.
+    /// [`Self::merge_plan`], in its order. Empty until [`Self::with_merge`]
+    /// adds them: one AIR a chip.
     merged: Vec<LfmAir<MergedConstraints>>,
     /// Which chips each merged AIR holds. A merged chip's own AIR is still
     /// built, like an absent family's, and never offered: the merged AIR stands

@@ -1,4 +1,5 @@
-//! Equal-height LFM chips proved as ONE AIR (`LAMBDA_VM_ZF_LFM_MERGE=1`).
+//! Equal-height LFM chips proved as ONE AIR (`LAMBDA_VM_ZF_LFM_MERGE`, on in the
+//! production format; `=0` is the rollback).
 //!
 //! An LFM proof carries one sub-proof a chip: its own trees, quotient, FRI,
 //! grind and queries, and a parent re-verifies each of them. Four chips —
@@ -91,8 +92,9 @@ pub struct MergedTable {
     pub root: Commitment,
 }
 
-/// A program's merged AIRs. Empty — the default, and every program built with
-/// the flag off — is the machine of one AIR a chip, byte for byte.
+/// A program's merged AIRs. Empty — every program built with the flag off (the
+/// library's default `ProofFormat`, and the rollback `LAMBDA_VM_ZF_LFM_MERGE=0`)
+/// — is the machine of one AIR a chip, byte for byte.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LfmMerge {
     pub tables: Vec<MergedTable>,

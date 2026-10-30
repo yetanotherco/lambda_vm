@@ -618,23 +618,30 @@ fn the_merge_knob_parses_prints_and_refuses_like_its_siblings() {
                 .map(|(_, v)| v.to_string())
         })
     };
+    // The default merges (the flip); its banner is unchanged, the rollback
+    // prints its word.
     let default = parse(&[]).expect("default");
-    assert!(!default.lfm_merge);
+    assert!(default.lfm_merge && default.proof_format().merge_equal_height_tables);
     assert!(
         !default.banner().contains("lfm_merge"),
         "the default banner is today's"
     );
-    assert!(!default.proof_format().merge_equal_height_tables);
     let on = parse(&[(ENV_LFM_MERGE, "1")]).expect("on");
-    assert!(on.lfm_merge && on.proof_format().merge_equal_height_tables);
-    assert!(on.banner().ends_with(" lfm_merge=1"));
-    assert!(!parse(&[(ENV_LFM_MERGE, "0")]).expect("off").lfm_merge);
+    assert_eq!(on, default);
+    let off = parse(&[(ENV_LFM_MERGE, "0")]).expect("off");
+    assert!(!off.lfm_merge && !off.proof_format().merge_equal_height_tables);
+    assert!(off.banner().ends_with(" lfm_merge=0"));
     assert!(parse(&[(ENV_LFM_MERGE, "2")]).is_err(), "a typo aborts");
     assert!(
         parse(&[(ENV_LFM_MERGE, "1"), (ENV_ONE_ROW, "1")]).is_err(),
         "no merged one-row layout"
     );
-    const { assert!(!ZfFormat::LEGACY.lfm_merge && !ZfFormat::DEFAULT.lfm_merge) };
+    // One-row alone keeps parsing: the merge is then off.
+    for one_row in ["1", "auto"] {
+        let f = parse(&[(ENV_ONE_ROW, one_row)]).expect("one-row alone");
+        assert!(!f.lfm_merge, "one_row={one_row}");
+    }
+    const { assert!(!ZfFormat::LEGACY.lfm_merge && ZfFormat::DEFAULT.lfm_merge) };
     // The library treats the pair as off on both sides.
     let (program, _) = four_chip_program();
     let mut both = options(true);
