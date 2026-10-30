@@ -136,6 +136,13 @@ pub(crate) fn device_hash_of<B: DeviceTreeBackend>() -> math_cuda::DeviceHash {
 /// it — see [`DEFAULT_DEVICE_ONLY_MIN_LDE`].
 const DEFAULT_GPU_LDE_THRESHOLD: usize = 1 << 14;
 
+/// Whether an LDE of `lde_size` rows clears the device commit's row floor — the
+/// first of the admission rules, the one a caller can ask before building a
+/// device input it would otherwise waste.
+pub(crate) fn clears_device_floor(lde_size: usize) -> bool {
+    lde_size >= gpu_lde_threshold()
+}
+
 fn gpu_lde_threshold() -> usize {
     static CACHED: OnceLock<usize> = OnceLock::new();
     *CACHED.get_or_init(|| {

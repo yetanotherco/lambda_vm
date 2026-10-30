@@ -1950,7 +1950,9 @@ pub trait IsStarkProver<
             let t_sub = Instant::now();
             // A table that builds its trace on the card uploads fewer bytes;
             // the buffer lives until the commit has copied it in.
-            let produced = trace.produce_main_dev();
+            let produced = crate::gpu_lde::clears_device_floor(n * domain.blowup_factor)
+                .then(|| trace.produce_main_dev())
+                .flatten();
             if let Some((tree, handle, main_data)) =
                 crate::gpu_lde::try_expand_leaf_and_tree_row_major_keep::<
                     Field,
@@ -2023,7 +2025,9 @@ pub trait IsStarkProver<
             let t_sub = Instant::now();
             // As in the plain arm: the trace built on the card when the table
             // carries a producer.
-            let produced = trace.produce_main_dev();
+            let produced = crate::gpu_lde::clears_device_floor(n * domain.blowup_factor)
+                .then(|| trace.produce_main_dev())
+                .flatten();
             if let Some((pre_tree, mult_tree, handle, main_data)) =
                 crate::gpu_lde::try_expand_split_trees_row_major_keep::<
                     Field,
