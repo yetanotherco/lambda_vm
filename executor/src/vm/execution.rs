@@ -159,17 +159,29 @@ impl Executor {
     /// than lent: the executor keeps a new buffer of `limit` logs for the next
     /// call. The same logs, without the copy a caller that keeps them would
     /// make of the borrowed slice.
+    ///
+    /// The buffer handed out holds exactly its logs (capacity = length), as a
+    /// copied slice would: a caller that counts a window's bytes by its
+    /// capacity when it takes it and by its length when it lets it go (the
+    /// block prover's memory log does) counts the same bytes both times.
     pub fn resume_owned(&mut self, limit: usize) -> Result<Option<Vec<Log>>, ExecutorError> {
+        // A window's worth, no more than a bound: a caller passing
+        // `usize::MAX` as "the rest" must not reserve it.
+        let window = limit.min(MAX_RESERVED_LOGS);
+        if self.logs.capacity() < window {
+            // Reserved once, exactly: no doubling past the window as it fills.
+            self.logs.clear();
+            self.logs.reserve_exact(window);
+        }
         if self.resume_with_limit(limit)?.is_none() {
             return Ok(None);
         }
-        // A window's worth for the next call, no more than a bound: a caller
-        // passing `usize::MAX` as "the rest" must not reserve it.
-        let next = limit.min(MAX_RESERVED_LOGS);
-        Ok(Some(std::mem::replace(
-            &mut self.logs,
-            Vec::with_capacity(next),
-        )))
+        let mut logs = std::mem::replace(&mut self.logs, Vec::with_capacity(window));
+        // A full window already fills its buffer; the first (the executor's
+        // own buffer, sized before the window was known) and the last (the
+        // run ended early) may not.
+        logs.shrink_to_fit();
+        Ok(Some(logs))
     }
 
     fn get_return_values(&self) -> Result<ReturnValues, ExecutorError> {

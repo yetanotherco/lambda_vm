@@ -281,6 +281,18 @@ fn resume_owned_hands_out_the_logs_resume_lends() {
         let owned = logs_of(Executor::new(&elf, vec![]).unwrap(), window, true);
         assert_eq!(fields(&owned), fields(&lent), "window {window}");
     }
+    // Every window handed out holds exactly its logs: the first (the
+    // executor's own buffer was sized before the window was known), the full
+    // ones and the short last one, for windows below and above that size.
+    for window in [7, 8, 1 << 17] {
+        let mut executor = Executor::new(&elf, vec![]).unwrap();
+        let mut windows = 0;
+        while let Some(logs) = executor.resume_owned(window).unwrap() {
+            assert_eq!(logs.capacity(), logs.len(), "window {window} #{windows}");
+            windows += 1;
+        }
+        assert!(windows > 0);
+    }
     let mut executor = Executor::new(&elf, vec![]).unwrap();
     let first = executor.resume_owned(7).unwrap().unwrap();
     assert_eq!(first.len(), 7);
