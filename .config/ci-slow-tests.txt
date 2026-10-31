@@ -35,6 +35,7 @@ lambda-vm-prover tests::block_whir_tests::phase_b_led_by_a_leaf_proves_the_same_
 lambda-vm-prover tests::block_whir_tests::a_streamed_block_with_memw_lt_streamed_proves_and_verifies  # 351 s
 lambda-vm-prover lfm::machine_tests::tampered_program_id_inputs_change_the_id  # 346 s
 lambda-vm-prover tests::block_whir_tests::keccak_and_ecsm_split_into_chunks_prove_and_verify  # 324 s
+lambda-vm-prover tests::block_whir_tests::a_block_with_keccak256_calls_across_keccak_tables_proves_and_verifies  # not timed on GitHub: 21 s on a 9950X box, a block of KECCAK tables cut to a few rows, as the 324 s test above
 lambda-vm-prover tests::block_whir_tests::a_wrong_regeneration_is_reported_never_proved  # 320 s
 lambda-vm-prover tests::block_whir_tests::a_split_ecdas_call_is_keyed_on_the_bus  # 317 s
 lambda-vm-prover tests::block_onechain_tests::an_indexed_block_round_trips_and_refuses_the_other_mode  # 305 s
