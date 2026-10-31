@@ -95,7 +95,12 @@ fn assert_rows_identical<T: std::fmt::Debug>(case: &str, chip: &str, a: &[T], b:
 
 /// Asserts two executions are the same object, and says where they first differ
 /// if they are not.
-fn assert_executions_identical(case: &str, num_addrs: u64, a: &LfmExecution, b: &LfmExecution) {
+pub(super) fn assert_executions_identical(
+    case: &str,
+    num_addrs: u64,
+    a: &LfmExecution,
+    b: &LfmExecution,
+) {
     // Memory first: it is the object every record is derived from, so a
     // divergence here localises the failing instruction by its destination
     // address, which is its position in emission order.
@@ -564,6 +569,121 @@ fn a_streamed_execution_refuses_an_incomplete_or_malformed_landing() {
         ex.land(2, &short),
         Err(LfmExecError::ArenaLenMismatch { .. })
     ));
+}
+
+/// A node-shaped program over children that supply different numbers of
+/// arenas (`counts[c]` for child `c`, declared in child order): a BLAKE3 sponge
+/// over each arena, then a little work across the children — the shape of a
+/// node whose children hold different AIR sets, as under the equal-height
+/// merge.
+fn uneven_children_case(counts: &[usize]) -> Case {
+    use super::builder::LfmBuilder;
+    use super::edsl::{ByteWrapHash, WrapHash, wrap_hash_bytes};
+    let len = 202;
+    let mut b = LfmBuilder::new().with_wrap_hash(WrapHash::Blake3);
+    let halves = super::keccak_host::num_stream_halves(len) as u32;
+    let mut firsts = Vec::new();
+    for _ in 0..counts.iter().sum::<usize>() {
+        let arena = b.declare_arena(halves);
+        let stream: Vec<_> = (0..halves).map(|i| b.hint_felt(arena, i)).collect();
+        let digest = wrap_hash_bytes(&mut b, ByteWrapHash::Blake3, &stream, len);
+        b.public(digest[0]);
+        firsts.push(stream[0]);
+    }
+    let x = b.add(firsts[0], firsts[firsts.len() - 1]);
+    let y = b.mul(x, firsts[1]);
+    let joined = b.pack_word([x, y, x, y]);
+    b.public(joined);
+    let arena = |seed: usize| -> Vec<super::word::LfmWord> {
+        let msg: Vec<u8> = (0..len).map(|i| (37 * i + 11 + 13 * seed) as u8).collect();
+        super::keccak_host::pack_stream(&msg)
+            .into_iter()
+            .map(super::word::base_word)
+            .collect()
+    };
+    Case {
+        name: "UnevenChildren(202)",
+        program: super::compiler::compile(b.finish()),
+        arenas: (0..counts.iter().sum::<usize>()).map(arena).collect(),
+        hasher: super::hash::HasherKind::Test,
+    }
+}
+
+/// The streamed top ([`super::whir_block_tree::execute_streamed_with`]) of
+/// `program` over children supplying `words` (child `c`'s arenas in order),
+/// split at `split` (what the top is told each child supplies), the children
+/// published in `order`: the first before the streamed execution starts, each
+/// later one 10 ms after the one before, so the top lands them in that order.
+pub(super) fn streamed_top_over(
+    program: &super::compiler::LfmProgram,
+    words: &[Vec<Vec<super::word::LfmWord>>],
+    split: &[usize],
+    order: &[usize],
+    hasher: &(impl super::hash::LfmHasher + Sync),
+) -> Result<LfmExecution, String> {
+    use super::whir_block_tree::{Published, execute_streamed_with};
+    let kids: Vec<Published<Vec<Vec<super::word::LfmWord>>>> =
+        words.iter().map(|_| Published::new()).collect();
+    let _ = kids[order[0]].0.set(Ok(words[order[0]].clone()));
+    std::thread::scope(|scope| {
+        let kids = &kids;
+        scope.spawn(move || {
+            for &c in &order[1..] {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let _ = kids[c].0.set(Ok(words[c].clone()));
+            }
+        });
+        let refs: Vec<&Published<_>> = kids.iter().collect();
+        execute_streamed_with(program, split, &refs, hasher, |w| Ok(w.clone()))
+            .map(|(execution, _)| execution)
+    })
+}
+
+/// [`streamed_top_over`] for `case`, its arenas taken by children of `counts`.
+fn streamed_top(
+    case: &Case,
+    counts: &[usize],
+    split: &[usize],
+    order: &[usize],
+) -> Result<LfmExecution, String> {
+    let mut at = 0;
+    let words: Vec<Vec<Vec<super::word::LfmWord>>> = counts
+        .iter()
+        .map(|&n| {
+            at += n;
+            case.arenas[at - n..at].to_vec()
+        })
+        .collect();
+    streamed_top_over(&case.program, &words, split, order, &case.hasher)
+}
+
+/// ★ A streamed top splits its arenas by what each child supplies, not
+/// evenly: over a child of one arena and a child of three (a node whose
+/// children's AIR sets differ, as the equal-height merge makes them), in
+/// either landing order the witness is the serial reference's, word for word.
+/// Told an even split (two each, the split the top assumed before), the first
+/// child lands one arena where two were expected — the large block's
+/// `ArenaCountMismatch { expected: 105, found: 99 }` — and counts that do not
+/// cover the program's arenas are refused before anything runs.
+#[test]
+fn a_streamed_top_splits_its_arenas_by_each_childs_count() {
+    let counts = [1, 3];
+    let case = uneven_children_case(&counts);
+    let reference = reference(&case);
+    for order in [[0, 1], [1, 0]] {
+        let got = streamed_top(&case, &counts, &counts, &order)
+            .unwrap_or_else(|e| panic!("{order:?}: the streamed top executes: {e}"));
+        assert_executions_identical(case.name, case.program.num_addrs, &reference, &got);
+    }
+    let even = streamed_top(&case, &counts, &[2, 2], &[0, 1]).expect_err("an even split");
+    assert!(
+        even.contains("child 0 lands: ArenaCountMismatch { expected: 2, found: 1 }"),
+        "the even split fails as the large block did: {even}"
+    );
+    for bad in [&[1, 2][..], &[4][..], &[1, 3, 0][..]] {
+        let err = streamed_top(&case, &counts, bad, &[0, 1]).expect_err("counts that do not fit");
+        assert!(err.contains("arenas over"), "{bad:?}: {err}");
+    }
 }
 
 /// An execution refuses to set its public words past their buffer's

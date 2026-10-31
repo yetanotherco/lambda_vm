@@ -461,6 +461,18 @@ pub fn declare_leg_arenas(b: &mut LfmBuilder, child: &ChildShape<'_>) -> LegAren
     }
 }
 
+/// How many arenas [`declare_leg_arenas`] declares for `child` under `wrap`:
+/// a node's arenas are its children's legs', in child order, so these counts
+/// are where each child's arenas begin and end. Children of one node need not
+/// declare the same number: a child has a sub-proof per AIR, and its AIR set
+/// follows its own program's heights (under the equal-height merge, a node's
+/// children can hold different merged tables).
+pub fn leg_arena_count(child: &ChildShape<'_>, wrap: super::edsl::WrapHash) -> usize {
+    let mut b = LfmBuilder::new().with_wrap_hash(wrap);
+    declare_leg_arenas(&mut b, child);
+    b.num_arenas()
+}
+
 /// What a leg hands the node's binding layer.
 pub struct LegCells {
     /// The child's published words — index plus canonicity-guarded lanes. This

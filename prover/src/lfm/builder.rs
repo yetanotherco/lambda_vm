@@ -666,6 +666,11 @@ impl LfmBuilder {
         (self.arena_schema.lens.len() - 1) as ArenaId
     }
 
+    /// How many arenas the program has declared so far.
+    pub fn num_arenas(&self) -> usize {
+        self.arena_schema.lens.len()
+    }
+
     /// Sets a declared arena's length: for an emitter whose hint count is known
     /// only once it has hinted everything from its shapes.
     pub fn set_arena_len(&mut self, arena: ArenaId, len: u32) {

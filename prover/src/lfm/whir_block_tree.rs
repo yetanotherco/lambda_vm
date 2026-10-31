@@ -530,6 +530,11 @@ pub(crate) struct NodeProgram {
     /// Seconds its emission took, after its admission: the builder's walk,
     /// the compile and the admission validator.
     pub(crate) emit: f64,
+    /// How many of the program's arenas each child supplies, in child order
+    /// ([`super::per_table_aggregator::leg_arena_count`] over the shapes the
+    /// program was emitted over): where a streamed execution splits them
+    /// ([`execute_streamed`]).
+    pub(crate) child_arenas: Vec<usize>,
 }
 
 /// A leaf program's bytes before it is emitted, a group of it: 0.157 GiB at
@@ -1062,6 +1067,12 @@ pub(crate) fn build_nodes(
         |_, _, kids: &[&DerivedChild], top, permit| -> Result<Emitted, String> {
             let t = std::time::Instant::now();
             let program = plan.node_program(kids, top)?;
+            let child_arenas = kids
+                .iter()
+                .map(|kid| {
+                    super::per_table_aggregator::leg_arena_count(&kid.shape(), BlockFamily::WRAP)
+                })
+                .collect();
             let mut permit: Option<super::program_budget::Permit> = permit;
             if let (Some(b), Some(permit)) = (budget, permit.as_mut()) {
                 let bytes = program_bytes(&program);
@@ -1077,6 +1088,7 @@ pub(crate) fn build_nodes(
                     program: slot,
                     at,
                     emit,
+                    child_arenas,
                 },
                 (program, emit),
             ))
@@ -1248,32 +1260,60 @@ pub(crate) fn prove_dataflow<R: Send + Sync>(
 /// be proved and runs each child's share as that child lands
 /// ([`super::executor::StreamedExecution`]: the witness is the unstreamed
 /// one's, word for word), so only the last child's share and the fill remain
-/// after the last child. A node's arenas are its children's, in order and the
-/// same number each, so child `c` is group `c`. The execute the split reports
-/// is the part after the last child landed. Returns the filled traces, for a
-/// prove under artifacts built for `hasher`.
+/// after the last child. A node's arenas are its children's, in child order:
+/// child `c` supplies `child_arenas[c]` of them ([`NodeProgram::child_arenas`])
+/// and they are group `c`. The counts differ between children whose AIR sets
+/// differ (under the equal-height merge each child's merged tables follow its
+/// own heights), so they are never an equal split. The execute the split
+/// reports is the part after the last child landed. Returns the filled traces,
+/// for a prove under artifacts built for `hasher`.
 pub(crate) fn execute_streamed(
     program: &LfmProgram,
+    child_arenas: &[usize],
     kids: &[&Published<ProvedProgram>],
     hasher: crate::lfm::hash::HasherKind,
 ) -> Result<LfmFilled, String> {
+    let (execution, after) = execute_streamed_with(program, child_arenas, kids, &hasher, |kid| {
+        try_child_arena_words(&kid.child)
+    })?;
+    Ok(super::proof::lfm_fill_executed(
+        program, execution, hasher, after,
+    ))
+}
+
+/// [`execute_streamed`]'s execution, over children of any kind: `arenas_of` gives
+/// a landed child's arenas. Returns the execution and the seconds it took
+/// after the last child landed. Refuses counts that do not cover the
+/// program's arenas, one count a child.
+pub(crate) fn execute_streamed_with<R: Send + Sync>(
+    program: &LfmProgram,
+    child_arenas: &[usize],
+    kids: &[&Published<R>],
+    hasher: &(impl super::hash::LfmHasher + Sync),
+    arenas_of: impl Fn(&R) -> Result<Vec<Vec<LfmWord>>, String>,
+) -> Result<(super::executor::LfmExecution, f64), String> {
     use super::executor::StreamedExecution;
     let k = kids.len();
     let arenas = program.arena_schema.lens.len();
-    if k == 0 || !arenas.is_multiple_of(k) {
-        return Err(format!("{arenas} arenas over {k} children"));
+    if k == 0 || child_arenas.len() != k || child_arenas.iter().sum::<usize>() != arenas {
+        return Err(format!(
+            "{arenas} arenas over {k} children of {child_arenas:?} arenas"
+        ));
     }
-    let per = arenas / k;
+    let group_of: Vec<usize> = child_arenas
+        .iter()
+        .enumerate()
+        .flat_map(|(c, &n)| std::iter::repeat_n(c, n))
+        .collect();
     let held: Vec<std::cell::OnceCell<Vec<Vec<LfmWord>>>> =
         (0..k).map(|_| std::cell::OnceCell::new()).collect();
-    let mut ex = StreamedExecution::new(program, (0..arenas).map(|a| a / per).collect(), &hasher)
-        .map_err(|e| format!("{e:?}"))?;
+    let mut ex = StreamedExecution::new(program, group_of, hasher).map_err(|e| format!("{e:?}"))?;
     let mut last = std::time::Instant::now();
     in_arrival_order(kids, |c, kid| {
         let words = match held[c].get() {
             Some(words) => words,
             None => {
-                let words = try_child_arena_words(&kid.child)?;
+                let words = arenas_of(kid)?;
                 held[c].get_or_init(|| words)
             }
         };
@@ -1282,12 +1322,7 @@ pub(crate) fn execute_streamed(
             .map_err(|e| format!("child {c} lands: {e:?}"))
     })?;
     let execution = ex.finish().map_err(|e| format!("{e:?}"))?;
-    Ok(super::proof::lfm_fill_executed(
-        program,
-        execution,
-        hasher,
-        last.elapsed().as_secs_f64(),
-    ))
+    Ok((execution, last.elapsed().as_secs_f64()))
 }
 
 /// One node of the tree: its execute and fill (`execute`) from its program as
@@ -1628,7 +1663,7 @@ pub(crate) fn prove_tree_pipelined(
                             _ => false,
                         };
                         let filled = if streamed {
-                            execute_streamed(&program.program, kids, hasher)
+                            execute_streamed(&program.program, &emitted.child_arenas, kids, hasher)
                                 .map_err(|e| format!("the top, streamed: {e}"))?
                         } else {
                             let kids = wait_all(kids)?;

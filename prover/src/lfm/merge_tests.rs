@@ -605,6 +605,97 @@ fn a_node_verifies_a_merged_child_and_refuses_its_tampers() {
     assert!(rows_merged < rows_plain, "fewer tables, fewer paths");
 }
 
+/// ★ A node over a merged and a plain child — children of one node whose AIR
+/// sets differ, as the large block's two level-1 nodes did (8 and 9 AIRs) —
+/// streamed as the tree's top is: each child's arena count as the node's
+/// emitter declares it (`leg_arena_count` over the derived shape) is what its
+/// harvest supplies, the two differ, and split by those counts the streamed
+/// execution is the unstreamed one, word for word, in either landing order. An
+/// even split (what the top assumed before) is refused, never a witness.
+#[test]
+fn a_streamed_node_splits_a_merged_and_a_plain_child_by_their_own_arenas() {
+    use super::exec_identity_tests::{assert_executions_identical, streamed_top_over};
+    use super::harvest::try_child_arena_words;
+    use super::hash::HasherKind;
+    use super::per_table_aggregator::{
+        DerivedChild, declare_leg_arenas, emit_leg, leg_arena_count,
+    };
+    let _g = lock();
+    let child = |merge: bool| {
+        let mut opts = super::p1_node_tests::options();
+        opts.format.merge_equal_height_tables = merge;
+        super::p1_node_tests::p1_child_with(opts)
+    };
+    let kids = [child(true), child(false)];
+    assert!(
+        !kids[0].artifacts.merge.is_empty(),
+        "the trivial program merges"
+    );
+    assert!(
+        kids[1].artifacts.merge.is_empty(),
+        "and not with the flag off"
+    );
+    let derived: Vec<DerivedChild> = kids
+        .iter()
+        .map(|c| {
+            DerivedChild::from_artifacts_under::<P1Family>(
+                &c.artifacts,
+                &c.opts,
+                c.proof.public_words.len(),
+            )
+            .expect("the child's shape")
+        })
+        .collect();
+    let words: Vec<Vec<Vec<LfmWord>>> = kids
+        .iter()
+        .map(|c| try_child_arena_words(&harvest(c)).expect("the child's arenas"))
+        .collect();
+    let counts: Vec<usize> = derived
+        .iter()
+        .map(|d| leg_arena_count(&d.shape(), P1Family::WRAP))
+        .collect();
+    assert_eq!(
+        counts,
+        words.iter().map(Vec::len).collect::<Vec<_>>(),
+        "each child's declared arenas are what its harvest supplies"
+    );
+    assert!(
+        counts[0] < counts[1],
+        "the merged child supplies fewer arenas: {counts:?}"
+    );
+
+    let shapes: Vec<_> = derived.iter().map(|d| d.shape()).collect();
+    let mut b = LfmBuilder::new().with_wrap_hash(P1Family::WRAP);
+    let arenas: Vec<_> = shapes
+        .iter()
+        .map(|s| declare_leg_arenas(&mut b, s))
+        .collect();
+    for (shape, a) in shapes.iter().zip(&arenas) {
+        let _ = emit_leg(&mut b, shape, a);
+    }
+    let program = compile(b.finish());
+    assert_eq!(
+        program.arena_schema.lens.len(),
+        counts.iter().sum::<usize>()
+    );
+    let hasher = HasherKind::Poseidon1W16;
+    let reference = execute(&program, &words.concat(), &hasher).expect("the node executes");
+    for order in [[0, 1], [1, 0]] {
+        let got = streamed_top_over(&program, &words, &counts, &order, &hasher)
+            .unwrap_or_else(|e| panic!("{order:?}: the streamed node executes: {e}"));
+        assert_executions_identical("merged + plain", program.num_addrs, &reference, &got);
+    }
+    let total: usize = counts.iter().sum();
+    let even = [total / 2, total - total / 2];
+    let err = streamed_top_over(&program, &words, &even, &[0, 1], &hasher)
+        .expect_err("an even split is refused");
+    assert!(
+        err.contains("child 0 lands: ArenaCountMismatch"),
+        "the even split fails where the large block did: {err}"
+    );
+    println!("MERGE STREAMED NODE: arenas a child {counts:?} (an even split {even:?} refused)");
+}
+
 // ================================ the knob =================================
 
 #[test]
