@@ -395,3 +395,255 @@ fn the_generator_constants_are_g() {
         "the table's seed and drain constants are G"
     );
 }
+
+// =============================================================================
+// The `< N` bounds on s, u1 and u2 and the `< p` bounds on xA and xB: each is the
+// only constraint refusing a row that is otherwise consistent (the relation's
+// quotient and carries recomputed for the out-of-range value). Without u1 < N or
+// u2 < N a prover takes the true scalar 2 (r = −z/2, or s = 2r), claims 2 + N, and
+// the chain's last addition becomes G + G through ECDAS's chord branch, where λ
+// is free; without s < N the signature (r, s + N), which Ethereum refuses,
+// recovers the same key.
+// =============================================================================
+
+use crate::tables::ecrec::{Bound, CARRY_OFFSET_MODN};
+
+/// Index of `bound`'s closing-carry constraint: the bounds are emitted in
+/// `Bound::ALL` order from index 844, eight constraints each (seven carry bits,
+/// then the carry out).
+fn closing(bound: Bound) -> usize {
+    let k = Bound::ALL
+        .iter()
+        .position(|b| std::mem::discriminant(b) == std::mem::discriminant(&bound))
+        .expect("a bound");
+    844 + 8 * k + 7
+}
+
+fn add_le(a: &[u8], b: &[u8], len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    let mut carry = 0u16;
+    for (i, o) in out.iter_mut().enumerate() {
+        let s = *a.get(i).unwrap_or(&0) as u16 + *b.get(i).unwrap_or(&0) as u16 + carry;
+        *o = s as u8;
+        carry = s >> 8;
+    }
+    assert_eq!(carry, 0, "add overflow");
+    out
+}
+
+fn sub_le(a: &[u8], b: &[u8], len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    let mut borrow = 0i16;
+    for (i, o) in out.iter_mut().enumerate() {
+        let d = *a.get(i).unwrap_or(&0) as i16 - *b.get(i).unwrap_or(&0) as i16 - borrow;
+        borrow = i16::from(d < 0);
+        *o = d.rem_euclid(256) as u8;
+    }
+    assert_eq!(borrow, 0, "sub underflow");
+    out
+}
+
+fn ge_le(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len().max(b.len());
+    for i in (0..n).rev() {
+        let (x, y) = (*a.get(i).unwrap_or(&0), *b.get(i).unwrap_or(&0));
+        if x != y {
+            return x > y;
+        }
+    }
+    true
+}
+
+/// Big-endian of a little-endian 32-byte value.
+fn be(le: &[u8]) -> [u8; 32] {
+    std::array::from_fn(|i| le[31 - i])
+}
+
+/// `(2·x) mod N` for `x < N`, little-endian.
+fn double_mod_n(x: &[u8; 32]) -> [u8; 32] {
+    let d = add_le(x, x, 33);
+    let r = if ge_le(&d, &N_BYTES) {
+        sub_le(&d, &N_BYTES, 33)
+    } else {
+        d
+    };
+    r[..32].try_into().unwrap()
+}
+
+/// `N − x` for `0 < x < N`.
+fn neg_mod_n(x: &[u8; 32]) -> [u8; 32] {
+    sub_le(&N_BYTES, x, 32).try_into().unwrap()
+}
+
+/// Carries of `Σ_i S_i 256^i = 0` with `S_i = Σ a_j b_{i−j} − Σ q_j m_{i−j} + sign·c_i`.
+fn carries(a: &[u8], b: &[u8], q: &[u8], m: &[u8], c: &[u8], sign: i128) -> [i64; 64] {
+    let g = |v: &[u8], j: usize| *v.get(j).unwrap_or(&0) as i128;
+    let mut out = [0i64; 64];
+    let mut prev = 0i128;
+    for (i, o) in out.iter_mut().enumerate() {
+        let mut s = 0i128;
+        for j in 0..=i {
+            s += g(a, j) * g(b, i - j) - g(q, j) * g(m, i - j);
+        }
+        s += sign * g(c, i);
+        let t = prev + s;
+        assert_eq!(t.rem_euclid(256), 0, "relation does not hold at limb {i}");
+        prev = t / 256;
+        *o = prev as i64;
+    }
+    assert_eq!(out[63], 0, "relation does not close");
+    out
+}
+
+fn fe_i64(c: i64) -> FE {
+    if c >= 0 {
+        FE::from(c as u64)
+    } else {
+        FE::zero() - FE::from((-c) as u64)
+    }
+}
+
+/// A computed row of `sig`, `msg`, `parity` and its witness.
+fn computed(sig: &[u8; 64], msg: &[u8; 32], parity: u8) -> (Vec<FE>, ecsm::EcrecWitness) {
+    let o = op(sig, msg, parity);
+    assert!(o.witness.ok, "the honest witness computes the key");
+    let w = o.witness.clone();
+    (row_of(&[o], 0), w)
+}
+
+fn set_bits(main: &mut [FE], col: usize, bytes: &[u8]) {
+    for b in 0..256 {
+        main[col + b] = FE::from(((bytes[b / 8] >> (b % 8)) & 1) as u64);
+    }
+}
+
+fn set_carries(main: &mut [FE], col: usize, c: &[i64; 64]) {
+    for (i, &v) in c.iter().enumerate() {
+        if i < 63 {
+            assert!(
+                (0..1 << 16).contains(&(v + CARRY_OFFSET_MODN)),
+                "carry {i} = {v} outside the IsHalfword window: the bus would refuse first"
+            );
+        }
+        main[col + i] = fe_i64(v);
+    }
+}
+
+fn set_halfwords(main: &mut [FE], col: usize, bytes: &[u8]) {
+    for j in 0..16 {
+        main[col + j] = FE::from(bytes[2 * j] as u64 + ((bytes[2 * j + 1] as u64) << 8));
+    }
+}
+
+/// `r` and `s` of the first vector, big-endian.
+fn r_s() -> ([u8; 32], [u8; 32]) {
+    let (sig, ..) = vectors()[0];
+    (sig[..32].try_into().unwrap(), sig[32..].try_into().unwrap())
+}
+
+fn sig_of(r_be: &[u8; 32], s_be: &[u8; 32]) -> [u8; 64] {
+    let mut sig = [0u8; 64];
+    sig[..32].copy_from_slice(r_be);
+    sig[32..].copy_from_slice(s_be);
+    sig
+}
+
+fn two() -> [u8; 32] {
+    let mut two = [0u8; 32];
+    two[0] = 2;
+    two
+}
+
+const Z: &str = "c0ffee0011223344556677889900aabbccddeeff00112233445566778899aabb";
+
+/// `u1' = u1 + N` with `u1 = 2` (`z = −2r mod N`), `qz' = qz + 1`: the u1 relation
+/// still closes, every bit is a bit, every carry is in its window; only U1LtN's
+/// closing carry refuses the row.
+#[test]
+fn u1_plus_n_is_refused_only_by_its_bound() {
+    let (r_be, s_be) = r_s();
+    let z_le = neg_mod_n(&double_mod_n(&be(&r_be)));
+    let (mut main, w) = computed(&sig_of(&r_be, &s_be), &be(&z_le), 0);
+    assert_eq!(w.u1, two(), "u1 = 2");
+    assert!(failing(main.clone()).is_empty(), "the honest row holds");
+
+    let u1p = add_le(&w.u1, &N_BYTES, 32);
+    let qzp = add_le(&w.qz, &[1], 32);
+    let cz = carries(&w.z, &w.w, &qzp, &N_BYTES, &u1p, 1);
+    set_bits(&mut main, cols::U1, &u1p);
+    set_bytes(&mut main, cols::QZ, &qzp);
+    set_carries(&mut main, cols::CZ, &cz);
+    // The best sub witness the prover has: (u1' − N) mod 2^256 = 2.
+    set_halfwords(&mut main, cols::U1_SUB_N, &two());
+    main[cols::LEN1] = FE::from(255u64);
+    assert_eq!(failing(main), vec![closing(Bound::U1LtN)]);
+}
+
+/// `u2' = u2 + N` with `u2 = 2` (`s = 2r mod N`), `qu' = qu − 1`: only U2LtN refuses.
+#[test]
+fn u2_plus_n_is_refused_only_by_its_bound() {
+    let (r_be, _) = r_s();
+    let s_le = double_mod_n(&be(&r_be));
+    let (mut main, w) = computed(&sig_of(&r_be, &be(&s_le)), &hex32(Z), 0);
+    assert_eq!(w.u2, two(), "u2 = 2");
+    assert!(failing(main.clone()).is_empty(), "the honest row holds");
+
+    let u2p = add_le(&w.u2, &N_BYTES, 32);
+    let qup = sub_le(&w.qu, &[1], 32);
+    let cu = carries(&w.s, &w.w, &qup, &N_BYTES, &u2p, -1);
+    set_bits(&mut main, cols::U2, &u2p);
+    set_bytes(&mut main, cols::QU, &qup);
+    set_carries(&mut main, cols::CU, &cu);
+    set_halfwords(&mut main, cols::U2_SUB_N, &two());
+    main[cols::LEN2] = FE::from(255u64);
+    assert_eq!(failing(main), vec![closing(Bound::U2LtN)]);
+}
+
+/// `s' = s + N` with `s = 5` (Ethereum refuses `s ≥ N`; the same key would come
+/// out: `u2` unchanged, `qu' = qu + w`): only SLtN refuses.
+#[test]
+fn s_plus_n_is_refused_only_by_its_bound() {
+    let (r_be, _) = r_s();
+    let mut s_le = [0u8; 32];
+    s_le[0] = 5;
+    let (mut main, w) = computed(&sig_of(&r_be, &be(&s_le)), &hex32(Z), 0);
+    assert!(failing(main.clone()).is_empty(), "the honest row holds");
+
+    let sp = add_le(&w.s, &N_BYTES, 32);
+    let qup = add_le(&w.qu, &w.w, 32);
+    let cu = carries(&sp, &w.w, &qup, &N_BYTES, &w.u2, -1);
+    set_bytes(&mut main, cols::S, &sp);
+    set_bytes(&mut main, cols::QU, &qup);
+    set_carries(&mut main, cols::CU, &cu);
+    set_halfwords(&mut main, cols::S_SUB_N, &s_le);
+    assert_eq!(failing(main), vec![closing(Bound::SLtN)]);
+}
+
+/// `xA` or `xB` set to `p` (a non-canonical 0), the `xA ≠ xB` inverse re-solved:
+/// only that coordinate's bound refuses.
+#[test]
+fn a_chain_x_at_p_is_refused_only_by_its_bound() {
+    let (sig, msg, par, ..) = vectors()[0];
+    for (col, sub_col, bound) in [
+        (cols::XA, cols::XA_SUB_P, Bound::XaLtP),
+        (cols::XB, cols::XB_SUB_P, Bound::XbLtP),
+    ] {
+        let (mut main, _) = computed(&sig, &msg, par);
+        set_bytes(&mut main, col, &P_BYTES);
+        set_halfwords(&mut main, sub_col, &[0u8; 32]);
+        let word = |m: &[FE], base: usize, c: usize| -> i64 {
+            (0..4)
+                .map(|k| (m[base + 4 * c + k].canonical() as i64) << (8 * k))
+                .sum()
+        };
+        for c in 0..8 {
+            main[cols::DINV + c] = FE::zero();
+        }
+        let c = (0..8)
+            .find(|&c| word(&main, cols::XB, c) != word(&main, cols::XA, c))
+            .expect("a nonzero word difference");
+        let d = word(&main, cols::XB, c) - word(&main, cols::XA, c);
+        main[cols::DINV + c] = fe_i64(d).inv().unwrap();
+        assert_eq!(failing(main), vec![closing(bound)], "{bound:?}");
+    }
+}

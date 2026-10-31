@@ -18,9 +18,12 @@
 //!   witness over the eight 32-bit word differences);
 //! - `Q = A + B` as one ECDAS addition row keyed at `TS + 2`, with `xQ, yQ < p`.
 //!
-//! Every ECALL timestamp is a multiple of 4 (the CPU's preprocessed `TIMESTAMP`
-//! column, `4·(i + 1)` plus a multiple of 4), so `TS`, `TS + 1` and `TS + 2` never
-//! meet another call's keys on the two buses only ECSM, ECDAS and ECREC use.
+//! Every ECALL timestamp is a multiple of 4: the CPU's preprocessed `TIMESTAMP`
+//! column is `4·(i + 1)`, and each CPU table adds its base `4·S_k`, four times the
+//! rows of the tables before it (`cpu::timestamp_bases`, computed by the verifier
+//! from the heights). So `TS`, `TS + 1` and `TS + 2` never meet another call's keys
+//! on the two buses only ECSM, ECDAS and ECREC use (the offsets are tied to the
+//! stride by a compile-time check below).
 //!
 //! The witness is `ecsm::compute_ecrec_witness`; padding rows are all zero.
 
@@ -43,6 +46,16 @@ pub(crate) const CHAIN2_KEY: i64 = 1;
 
 /// The final addition's key offset (see [`CHAIN2_KEY`]).
 pub(crate) const ADD_KEY: i64 = 2;
+
+// The three keys of one call, `TS`, `TS + CHAIN2_KEY` and `TS + ADD_KEY`, are
+// distinct and stay below the next CPU row's timestamp `TS + TIMESTAMP_STRIDE`,
+// so no two calls share a key; ECALL timestamps are multiples of the stride
+// because every CPU table's base is too (`cpu::timestamp_bases`). A smaller
+// stride or larger offsets would let one call's keys meet the next call's.
+const _: () = assert!(
+    0 < CHAIN2_KEY && CHAIN2_KEY < ADD_KEY && ADD_KEY < super::cpu::TIMESTAMP_STRIDE as i64,
+    "ECREC's key offsets must be distinct, nonzero and below the CPU timestamp stride"
+);
 
 /// Offset of the three mod-N product relations' carries into `IsHalfword`:
 /// their honest carries are within `±8161` (the `x2` relation's bound), and
@@ -752,14 +765,22 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 /// The `< m` checks, as ECSM's overflow chains: `m + sub = v + 2^256` with a carry out.
+/// Each is load-bearing (`tests::ecrec_tests::*_is_refused_only_by_its_bound`).
 #[derive(Clone, Copy, Debug)]
 pub enum Bound {
     RLtN,
+    /// Without it `(r, s + N)`, which Ethereum refuses, recovers the same key.
     SLtN,
+    /// `u1 < N` and `u2 < N` keep each chain off ECDAS's chord branch at `acc = gen`,
+    /// where λ is free: a prover who makes the true scalar 2 (`r = −z/2`, or
+    /// `s = 2r`) and claims `2 + N` would end that chain in `G + G` by the chord.
     U1LtN,
+    /// See [`Bound::U1LtN`].
     U2LtN,
     YrLtP,
+    /// Canonical `xA`, `xB` make the `xA ≠ xB` witness mean `xA ≢ xB (mod p)`.
     XaLtP,
+    /// See [`Bound::XaLtP`].
     XbLtP,
     XqLtP,
     YqLtP,

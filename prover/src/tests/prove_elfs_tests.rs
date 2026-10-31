@@ -2509,6 +2509,49 @@ fn test_prove_elfs_ecrec_forged_bail_rejected() {
     );
 }
 
+/// Soundness: one call cannot borrow another's result. The final-addition ECDAS
+/// rows of the two computed calls (keyed at `T1 + 2` and `T2 + 2`) swap only their
+/// timestamps, so each call's key is the other's sum; every constraint holds and
+/// only the bus refuses it.
+#[test]
+fn test_prove_elfs_ecrec_final_additions_swapped_between_calls_rejected() {
+    use crate::tables::ecdas::cols as ec;
+    use crate::tables::ecrec::cols as ecrec_cols;
+    let _ = env_logger::builder().is_test(true).try_init();
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecrec");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let result = executor::vm::execution::Executor::new(&elf, vec![])
+        .expect("executor")
+        .run()
+        .expect("run");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    let er = &traces.ecrecs[0].main_table;
+    let (t1, t2) = (
+        *er.get(0, ecrec_cols::TIMESTAMP_0),
+        *er.get(1, ecrec_cols::TIMESTAMP_0),
+    );
+    let two = FieldElement::<GoldilocksField>::from(2u64);
+    let one = FieldElement::<GoldilocksField>::one();
+    let ed = &traces.ecdases[0].main_table;
+    let find = |key: FieldElement<GoldilocksField>| {
+        let rows: Vec<usize> = (0..ed.height)
+            .filter(|&r| *ed.get(r, ec::TIMESTAMP_0) == key && *ed.get(r, ec::MU) == one)
+            .collect();
+        assert_eq!(rows.len(), 1, "one final-addition row at T + 2");
+        rows[0]
+    };
+    let (a, b) = (find(t1 + two), find(t2 + two));
+    let (va, vb) = (*ed.get(a, ec::TIMESTAMP_0), *ed.get(b, ec::TIMESTAMP_0));
+    traces.ecdases[0].main_table.set(a, ec::TIMESTAMP_0, vb);
+    traces.ecdases[0].main_table.set(b, ec::TIMESTAMP_0, va);
+    let outcome = weigh_the_bus(&elf, &mut traces, true);
+    crate::tests::skip_empty_tables_tests::assert_only_the_bus_rejected(
+        &outcome,
+        "ECREC final additions swapped between calls",
+    );
+}
+
 /// Soundness: the verifier REJECTS a forged ECSM result.
 ///
 /// A malicious prover must not be able to claim a wrong `k·G`. We tamper the result
