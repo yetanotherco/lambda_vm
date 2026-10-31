@@ -336,6 +336,31 @@ pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 
+/// Whether [`ecrecover`] accepts these operands: the executor's own conditions
+/// (its ECREC arm), so a caller that checks this first never stops the VM. Each
+/// operand's bytes stay below one `2^32` boundary of its low address word (the
+/// 72-byte output, the 64-byte signature, the 32-byte hash), and the signature and
+/// the hash do not overlap. The parity is the caller's `recid & 1`, always in range.
+#[inline(always)]
+pub fn ecrecover_fits(out: &[u8; 72], sig: &[u8; 64], msg: &[u8; 32]) -> bool {
+    ecrecover_addresses_ok(
+        out.as_ptr() as u64,
+        sig.as_ptr() as u64,
+        msg.as_ptr() as u64,
+    )
+}
+
+/// [`ecrecover_fits`] on raw addresses.
+#[inline(always)]
+pub fn ecrecover_addresses_ok(out: u64, sig: u64, msg: u64) -> bool {
+    const TOP: u64 = 1 << 32;
+    let below_boundary = |addr: u64, last: u64| (addr & (TOP - 1)) + last < TOP;
+    below_boundary(out, 71)
+        && below_boundary(sig, 63)
+        && below_boundary(msg, 31)
+        && !(sig < msg.wrapping_add(32) && msg < sig.wrapping_add(64))
+}
+
 #[cfg(target_arch = "riscv64")]
 /// Recover the secp256k1 public key of an ECDSA signature via the ECREC accelerator.
 /// `sig` is `r ‖ s` and `msg` the message hash, each value 32-byte big-endian (as
@@ -420,4 +445,42 @@ pub unsafe extern "C" fn sys_argc() -> usize {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sys_argv(_buf: *mut u32, _buf_nwords: usize, _arg_idx: usize) -> usize {
     panic!("sys_argv is not supported: command-line arguments are not available in Lambda VM");
+}
+
+#[cfg(test)]
+mod ecrecover_fits_tests {
+    use super::ecrecover_addresses_ok as ok;
+
+    #[test]
+    fn disjoint_operands_below_the_boundary_fit() {
+        assert!(ok(0x1000, 0x2000, 0x3000));
+        // The hash right after the signature, and right before it.
+        assert!(ok(0x1000, 0x2000, 0x2040));
+        assert!(ok(0x1000, 0x2000, 0x1fe0));
+        // The output may alias either input.
+        assert!(ok(0x2000, 0x2000, 0x3000));
+        // High address words are free.
+        assert!(ok(0xffff_ffff_0000_1000, 0x7_0000_2000, 0x7_0000_3000));
+    }
+
+    #[test]
+    fn overlapping_signature_and_hash_do_not_fit() {
+        assert!(!ok(0x1000, 0x2000, 0x2000));
+        assert!(!ok(0x1000, 0x2000, 0x203f));
+        assert!(!ok(0x1000, 0x2000, 0x1fe1));
+    }
+
+    #[test]
+    fn an_operand_across_a_low_word_boundary_does_not_fit() {
+        const TOP: u64 = 1 << 32;
+        // The last byte exactly at 2^32 − 1 fits; one further does not.
+        assert!(ok(TOP - 72, 0x2000, 0x3000));
+        assert!(!ok(TOP - 71, 0x2000, 0x3000));
+        assert!(ok(0x1000, TOP - 64, 0x3000));
+        assert!(!ok(0x1000, TOP - 63, 0x3000));
+        assert!(ok(0x1000, 0x2000, TOP - 32));
+        assert!(!ok(0x1000, 0x2000, TOP - 31));
+        // The same at a nonzero high word.
+        assert!(!ok(0x1000, 0x2000, 5 * TOP - 31));
+    }
 }

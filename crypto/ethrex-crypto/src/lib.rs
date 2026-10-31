@@ -260,12 +260,22 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64],
 /// bails on a valid signature only costs the guest cycles. The call reads the
 /// signature and hash in place (big-endian, the precompile's encoding) and writes the
 /// key big-endian, the order the address hash takes.
+///
+/// Operands the VM would refuse (the signature and hash overlapping, or one of the
+/// three crossing a `2^32` address-word boundary) take the software path instead,
+/// so the call can never make a block unprovable. The status starts nonzero, so a
+/// call that wrote nothing reads as a bail rather than as the key `(0, 0)`.
 #[cfg(target_arch = "riscv64")]
 fn ecrec_call(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Option<[u8; 64]> {
+    use lambda_vm_syscalls::syscalls;
     #[repr(C, align(8))]
     struct Out([u8; 72]);
     let mut out = Out([0u8; 72]);
-    lambda_vm_syscalls::syscalls::ecrecover(&mut out.0, sig, msg, u64::from(recid & 1));
+    out.0[64] = 1;
+    if !syscalls::ecrecover_fits(&out.0, sig, msg) {
+        return None;
+    }
+    syscalls::ecrecover(&mut out.0, sig, msg, u64::from(recid & 1));
     if out.0[64..] != [0u8; 8] {
         return None;
     }
@@ -304,9 +314,10 @@ where
     }
 
     // Decompress R from r and the recovery-id parity bit.
-    // recid >= 2 (R.x = r + n) has ~2^-128 probability and never occurs for the
-    // precompile; we don't handle it (decompression simply fails), matching the
-    // trait default.
+    // recid >= 2 would mean R.x = r + n (probability ~2^-128; never for the
+    // precompile). It is not handled: only the low bit is read, so recid 2 and 3
+    // decompress the point with x = r exactly as 0 and 1 do (as the ECREC call
+    // does, which is passed recid & 1).
     let y_is_odd = (recid & 1) != 0;
     let Some((rx, ry)) = decompress(r_bytes, y_is_odd) else {
         return Err(CryptoError::RecoveryFailed);
