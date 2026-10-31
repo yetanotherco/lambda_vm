@@ -36,8 +36,9 @@ pub(super) fn shape_and_words(t: &Table) -> (usize, usize, Vec<u64>) {
 /// `Ok` when every interaction of `interactions` has multiplicity zero on
 /// every row of `table`: the table adds nothing to any bus but its padding
 /// rows' byte checks. A multiplicity is read as the four call families' one
-/// column, COPY's difference of two columns, or COPY's linear form of columns
-/// and constants; another kind is an error, never read as zero.
+/// column, KECCAK's sum of its two mode bits, COPY's difference of two columns,
+/// or COPY's linear form of columns and constants; another kind is an error,
+/// never read as zero.
 ///
 /// The one exception: a byte check of multiplicity 1 whose values vanish on a
 /// row of zeros (KECCAK_RND's θ/ρ bytes, main's multiplicity fix) is sent by
@@ -67,7 +68,7 @@ pub(super) fn carries_nothing(
         }
         let read: Vec<usize> = match &interaction.multiplicity {
             Multiplicity::Column(c) => vec![*c],
-            Multiplicity::Diff(a, b) => vec![*a, *b],
+            Multiplicity::Sum(a, b) | Multiplicity::Diff(a, b) => vec![*a, *b],
             Multiplicity::Linear(terms) => terms
                 .iter()
                 .filter_map(|t| match t {
@@ -78,7 +79,7 @@ pub(super) fn carries_nothing(
                 .collect(),
             _ => {
                 return Err(format!(
-                    "interaction {i}: its multiplicity is not a column, a difference or a \
+                    "interaction {i}: its multiplicity is not a column, a sum, a difference or a \
                      linear form"
                 ));
             }
@@ -91,6 +92,7 @@ pub(super) fn carries_nothing(
         let at = |row: usize| -> FE {
             match &interaction.multiplicity {
                 Multiplicity::Column(c) => fe(row, *c),
+                Multiplicity::Sum(a, b) => fe(row, *a) + fe(row, *b),
                 Multiplicity::Diff(a, b) => fe(row, *a) - fe(row, *b),
                 Multiplicity::Linear(terms) => terms.iter().fold(FE::zero(), |acc, t| {
                     acc + match t {
@@ -328,14 +330,14 @@ fn a_cut_one_table_short_of_the_real_rows_is_caught() {
     let long = is_today_without_its_padding_tables(&today[..6], &today, &interactions)
         .expect_err("a table of padding rows kept");
     assert_eq!(long, "table 5, the last kept, is padding alone");
-    // A multiplicity the check cannot read as a column, a difference or a linear
-    // form is an error, not a zero.
+    // A multiplicity the check cannot read as a column, a sum, a difference or a
+    // linear form is an error, not a zero.
     let mut unread = keccak_rnd::bus_interactions();
     unread[0].multiplicity = Multiplicity::One;
     assert!(
         carries_nothing(&today[7], &unread)
             .expect_err("a constant multiplicity")
-            .contains("is not a column, a difference or a linear form")
+            .contains("is not a column, a sum, a difference or a linear form")
     );
     // A linear form with a constant term is read, not assumed zero: `1 - 0` on a
     // padding row is a send.

@@ -1633,8 +1633,12 @@ fn continuation_epoch_constraint_leg_cost() {
     //
     // 62_424 → 62_427 (+3): main's halt pin and preprocessed CPU timestamp
     // (#1020, #1025), CPU −6 and REGISTER +9 (HALT is not in the sum).
+    //
+    // 62_427 → 71_550 (+9_123): KECCAK's sponge mode for Keccak-256 of a buffer
+    // (2_874 → 11_996) and its round-chip tokens on the mode bits (→ 11_997),
+    // the per-AIR census's delta; no other table in the sum moved.
     assert_eq!(
-        design_intermediate, 62_427,
+        design_intermediate, 71_550,
         "the design's intermediate-epoch budget no longer reproduces"
     );
     assert!(
