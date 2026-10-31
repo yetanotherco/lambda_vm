@@ -18,7 +18,7 @@ use crate::tables::MaxRowsConfig;
 use crate::tables::decode::DecodeTable;
 use crate::test_utils::asm_elf_bytes;
 
-const PROGRAMS: [&str; 9] = [
+const PROGRAMS: [&str; 10] = [
     "all_instructions_64",
     "lw_sw_offset_odd",
     "test_memw_split_ts",

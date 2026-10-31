@@ -176,7 +176,7 @@ pub(super) fn windowed(
     traces
 }
 
-const PROGRAMS: [&str; 14] = [
+const PROGRAMS: [&str; 15] = [
     "sub",
     "all_instructions_64",
     "all_loadstore_32",

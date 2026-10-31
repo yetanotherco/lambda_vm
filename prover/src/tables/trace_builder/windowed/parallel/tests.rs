@@ -168,7 +168,7 @@ fn tamper_with(
     }
 }
 
-const PROGRAMS: [&str; 13] = [
+const PROGRAMS: [&str; 14] = [
     "sub",
     "all_instructions_64",
     "lw_sw_offset_odd",
