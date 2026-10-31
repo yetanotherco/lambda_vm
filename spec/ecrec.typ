@@ -86,7 +86,10 @@ double-and-add of its scalar on its point, non-degenerate by `ECSM`'s argument
 ($0 < u < N$, prime order); the final addition is non-degenerate by
 $x_A eq.not x_B$ on canonical $x_A, x_B$; the key is canonical. The keys
 $T, T + 1, T + 2$ cannot meet another call's: every ECALL timestamp is a
-multiple of 4 (the CPU's preprocessed timestamp column), every #ecdas row
+multiple of 4, because the CPU's preprocessed timestamp column holds $4 (i + 1)$
+and each CPU table adds its base $4 dot S_k$, four times the rows of the tables
+before it, which the verifier computes from the heights (the offsets 1 and 2 are
+checked against the stride 4 when the prover is built), every #ecdas row
 inherits its key from a seed, and only `ECSM`, #ecdas and #ecrec use the `Ecdas`
 and `Bit` buses. Without the offset of the second chain, the two chains' `Bit`
 messages would be one multiset and a prover could swap their scalars.
