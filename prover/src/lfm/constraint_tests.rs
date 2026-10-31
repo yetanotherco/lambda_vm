@@ -373,8 +373,9 @@ const DESIGN_INSTR: &[(&str, usize)] = &[
     // `DWordWHH`, their top 48 bits to the IS_WH table. 2_874 → 11_996: the
     // sponge mode for Keccak-256 of a buffer (739 constraints and 286
     // interactions, the 136 XOR tuples' padded-byte linear forms among them),
-    // the emitter's count as measured.
-    ("KECCAK", 11_996),
+    // the emitter's count as measured. 11_996 → 11_997: the round chip's two
+    // tokens weighted by the mode bits `MU_P + MU_S` instead of `μ`.
+    ("KECCAK", 11_997),
     // 14_016 → 12_998: main replaced the θ/ρ HWSL lookups with inline μ-gated
     // linear identities in `KeccakRndConstraints`, which nets −1018 constraint
     // arithmetic rows (the same change whose receiver-side multiplicity drop is

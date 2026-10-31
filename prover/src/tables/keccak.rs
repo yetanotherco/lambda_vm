@@ -131,6 +131,9 @@ pub mod cols {
     pub const OUT_LO: usize = SRC_HI + 1; // 493
     pub const OUT_HI: usize = OUT_LO + 1; // 494
     /// `SRC_LO + 135` as two halves (the block's last byte stays below 2^32).
+    /// Also the next block's address: the link sends `SRC_END + 1`, so the
+    /// equation `MU_S·(SRC_LO + 135 − SRC_END) = 0` is what places every block
+    /// after the first, not only a range check.
     pub const SRC_END: usize = OUT_HI + 1; // 495
     /// `OUT_LO + 31` as two halves (the digest's last byte stays below 2^32).
     pub const OUT_END: usize = SRC_END + 2; // 497
@@ -590,7 +593,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
         interactions.push(BusInteraction::sender(
             BusId::Keccak,
-            Multiplicity::Column(cols::MU),
+            round_chip_tokens(),
             values,
         ));
     }
@@ -620,7 +623,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
         interactions.push(BusInteraction::receiver(
             BusId::Keccak,
-            Multiplicity::Column(cols::MU),
+            round_chip_tokens(),
             values,
         ));
     }
@@ -846,6 +849,23 @@ fn sponge_memory_read(offset_lo: i64, bytes: &[usize]) -> Vec<BusValue> {
     v
 }
 
+/// The multiplicity of the two Keccak-bus tokens (the round chip's request and
+/// reply): the row's mode bits, `MU_P + MU_S`. A row of either mode asks the
+/// round chip because of its mode bit itself, so its output is a permutation of
+/// its input whatever `μ` holds; idx 56 (`μ = MU_P + MU_S`) then only keeps `μ`
+/// consistent for the readers that use it (the cuts). With the tokens on `μ`,
+/// idx 56 alone would tie a mode to the round chip, and a row with `μ = 0` but a
+/// mode bit set would write a free digest (`keccak256_tests::
+/// the_mode_bits_put_a_row_on_the_round_chip`). `SpongeCheck::TokensOnModes`
+/// puts them back on `μ` in a test.
+fn round_chip_tokens() -> Multiplicity {
+    if dropped(SpongeCheck::TokensOnModes) {
+        Multiplicity::Column(cols::MU)
+    } else {
+        Multiplicity::Sum(cols::MU_P, cols::MU_S)
+    }
+}
+
 /// The digest address on the link between rows (`SpongeCheck::LinkOut` leaves it
 /// out in a test).
 fn link_out() -> [BusValue; 2] {
@@ -861,7 +881,8 @@ fn link_out() -> [BusValue; 2] {
 /// [`dropped`] is always `false`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SpongeCheck {
-    /// `μ = MU_P + MU_S` (idx 56).
+    /// `μ = MU_P + MU_S` (idx 56). With the Keccak-bus tokens on the mode bits
+    /// it is defensive; with them on `μ` it alone ties a mode to the round chip.
     ModeSum,
     /// `(FIRST + LAST)(1 − MU_S) = 0` (idx 57).
     FlagsOnSponge,
@@ -885,19 +906,23 @@ pub enum SpongeCheck {
     FirstBlock,
     /// The first row starts from the zero state.
     FirstState,
-    /// `SRC_END` and `OUT_END` hold the addresses' ends.
+    /// `SRC_END` and `OUT_END` hold the addresses' ends; `SRC_END + 1` is also
+    /// the next block's address on the link.
     AddressHalves,
     /// The digest address rides the link between rows.
     LinkOut,
     /// Lane 0's 8-byte memory read.
     LaneRead,
+    /// The Keccak-bus tokens on the mode bits `MU_P + MU_S` rather than on `μ`
+    /// ([`round_chip_tokens`]).
+    TokensOnModes,
 }
 
 #[cfg(test)]
 thread_local! {
-    /// The check a test leaves out ([`SpongeCheck`]).
-    pub(crate) static DROPPED: std::cell::Cell<Option<SpongeCheck>> =
-        const { std::cell::Cell::new(None) };
+    /// The checks a test leaves out ([`SpongeCheck`]), one bit each; set
+    /// through [`leave_out`].
+    pub(crate) static DROPPED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// A test's forgery of a call's rows before the walk emits their memory
     /// traffic (`trace_builder::collect_keccak256_ops`).
     #[allow(clippy::type_complexity)]
@@ -910,13 +935,21 @@ thread_local! {
 pub(crate) fn dropped(check: SpongeCheck) -> bool {
     #[cfg(test)]
     {
-        DROPPED.with(|d| d.get() == Some(check))
+        DROPPED.with(|d| d.get() & (1 << check as u32) != 0)
     }
     #[cfg(not(test))]
     {
         let _ = check;
         false
     }
+}
+
+/// Leaves `checks` out on this thread until the next call (an empty slice puts
+/// every check back).
+#[cfg(test)]
+pub(crate) fn leave_out(checks: &[SpongeCheck]) {
+    let bits = checks.iter().fold(0u32, |a, c| a | (1 << *c as u32));
+    DROPPED.with(|d| d.set(bits));
 }
 
 /// A test's forgery of one call's rows (see [`FORGE`]).
@@ -989,7 +1022,10 @@ pub fn sponge_bus_interactions() -> Vec<BusInteraction> {
     }
 
     // The link to the next row: (T, j + 1, COUNT − 136, SRC_END + 1, SRC_HI,
-    // OUT_LO, OUT_HI, OUTPUT_STATE).
+    // OUT_LO, OUT_HI, OUTPUT_STATE). The next block's address is `SRC_END + 1`,
+    // which is `SRC_LO + 136` only through the equation on `SRC_END` (idx
+    // `AddressHalves`): without it a block could be read from anywhere
+    // (`keccak256_tests::the_block_end_defines_the_next_block_address`).
     {
         let mut v = Vec::with_capacity(7 + 200);
         v.push(direct(cols::TIMESTAMP_0));
@@ -1135,7 +1171,9 @@ pub fn sponge_bus_interactions() -> Vec<BusInteraction> {
 /// - the first row starts from the zero state at block 0:
 ///   `FIRST · TIMESTAMP_1 = 0`, `FIRST · PREV_i = 0`, `FIRST · INPUT_i = 0` on
 ///   the 64 capacity bytes;
-/// - `MU_S · (SRC_LO + 135 − SRC_END_0 − 2^16 SRC_END_1) = 0`,
+/// - `MU_S · (SRC_LO + 135 − SRC_END_0 − 2^16 SRC_END_1) = 0`, which both
+///   bounds the block below 2^32 and, through the link's `SRC_END + 1`, places
+///   the next block right after this one;
 ///   `LAST · (OUT_LO + 31 − OUT_END_0 − 2^16 OUT_END_1) = 0`.
 #[derive(Clone, Copy)]
 pub struct KeccakConstraints;
@@ -1313,6 +1351,8 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
             emit(b, SpongeCheck::FirstState, e);
         }
         // SRC_LO + 135 and OUT_LO + 31 as halves (each half range-checked).
+        // SRC_END + 1 is also the next block's address on the link, so this
+        // equation is load-bearing at any address, not only near 2^32.
         let c65536 = b.const_base(1 << 16);
         let src_end = b.main(0, cols::SRC_END) + b.main(0, cols::SRC_END + 1) * c65536.clone();
         let e = mu_s * (b.main(0, cols::SRC_LO) + b.const_base(135) - src_end);
