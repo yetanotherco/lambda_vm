@@ -8,7 +8,7 @@ use crate::{
             execution::ExecutionError,
         },
         logs::Log,
-        memory::{Memory, MemoryError, U64HashMap},
+        memory::{ExecPaths, Memory, MemoryError, StoreKind, U64HashMap},
         registers::Registers,
     },
 };
@@ -29,6 +29,10 @@ pub struct ExecutionResult {
 
 /// Size of each log chunk - balances memory usage vs callback overhead
 pub(crate) const CHUNK_SIZE: usize = 100_000;
+
+/// The most logs [`Executor::resume_owned`] reserves for its next call
+/// (2^22, 160 MiB); past it the buffer grows as logs are written.
+const MAX_RESERVED_LOGS: usize = 1 << 22;
 
 /// Result of executing one continuation epoch: the logs produced during the
 /// epoch and the VM state at the epoch boundary. The boundary state is the
@@ -52,7 +56,25 @@ pub struct Executor {
 
 impl Executor {
     pub fn new(program: &Elf, private_inputs: Vec<u8>) -> Result<Self, ExecutorError> {
-        let mut memory = Memory::default();
+        Self::with_memory(program, private_inputs, Memory::default())
+    }
+
+    /// [`Executor::new`] on the given access paths (the knobs' defaults aside):
+    /// what a test compares the paths with.
+    pub fn new_with_paths(
+        program: &Elf,
+        private_inputs: Vec<u8>,
+        paths: ExecPaths,
+    ) -> Result<Self, ExecutorError> {
+        let memory = Memory::with_store_and_paths(StoreKind::from_env(), paths);
+        Self::with_memory(program, private_inputs, memory)
+    }
+
+    fn with_memory(
+        program: &Elf,
+        private_inputs: Vec<u8>,
+        mut memory: Memory,
+    ) -> Result<Self, ExecutorError> {
         memory.store_private_inputs(private_inputs)?;
         let instructions = InstructionCache::new(&program.data)?;
         load_program(&program.data, &mut memory)?;
@@ -131,6 +153,35 @@ impl Executor {
         } else {
             Ok(Some(&self.logs))
         }
+    }
+
+    /// [`Executor::resume_with_limit`], the logs handed out as they lie rather
+    /// than lent: the executor keeps a new buffer of `limit` logs for the next
+    /// call. The same logs, without the copy a caller that keeps them would
+    /// make of the borrowed slice.
+    ///
+    /// The buffer handed out holds exactly its logs (capacity = length), as a
+    /// copied slice would: a caller that counts a window's bytes by its
+    /// capacity when it takes it and by its length when it lets it go (the
+    /// block prover's memory log does) counts the same bytes both times.
+    pub fn resume_owned(&mut self, limit: usize) -> Result<Option<Vec<Log>>, ExecutorError> {
+        // A window's worth, no more than a bound: a caller passing
+        // `usize::MAX` as "the rest" must not reserve it.
+        let window = limit.min(MAX_RESERVED_LOGS);
+        if self.logs.capacity() < window {
+            // Reserved once, exactly: no doubling past the window as it fills.
+            self.logs.clear();
+            self.logs.reserve_exact(window);
+        }
+        if self.resume_with_limit(limit)?.is_none() {
+            return Ok(None);
+        }
+        let mut logs = std::mem::replace(&mut self.logs, Vec::with_capacity(window));
+        // A full window already fills its buffer; the first (the executor's
+        // own buffer, sized before the window was known) and the last (the
+        // run ended early) may not.
+        logs.shrink_to_fit();
+        Ok(Some(logs))
     }
 
     fn get_return_values(&self) -> Result<ReturnValues, ExecutorError> {

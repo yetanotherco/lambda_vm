@@ -39,10 +39,9 @@
 //!
 //! Run under production proof options.
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use stark::lookup::BusInteraction;
 use stark::proof::options::ProofOptions;
-use stark::prover::{IsStarkProver, Prover};
+use stark::prover::IsStarkProver;
 use stark::trace::TraceTable;
 
 use crate::statement::{StatementKind, absorb_statement};
@@ -50,7 +49,7 @@ use crate::tables::bitwise::{cols as bw_cols, row_index as bw_row_index};
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{BusId, FE, GoldilocksExtension as Ext, GoldilocksField as Base};
 use crate::tables::{dvrm, mul};
-use crate::test_utils::{E, asm_elf_bytes};
+use crate::test_utils::asm_elf_bytes;
 use crate::{MaxRowsConfig, VmAirs, VmProof};
 
 use executor::elf::Elf;
@@ -168,15 +167,8 @@ fn craft_proof(s: &Scenario, forge: Forge) -> Result<VmProof, stark::prover::Pro
             .src2_val = s.forged;
     }
 
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &logs,
-        &MaxRowsConfig::default(),
-        &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("trace build");
+    let mut traces = Traces::from_elf_and_logs(&program, &logs, &MaxRowsConfig::default(), &[])
+        .expect("trace build");
 
     if forge.rows {
         (s.forge_rows)(&mut traces, s);
@@ -199,7 +191,8 @@ fn craft_proof(s: &Scenario, forge: Forge) -> Result<VmProof, stark::prover::Pro
             &options,
             &crate::tables::register::register_init_from_entry_point(program.entry_point),
             &traces,
-        ),
+        )
+        .preprocessed(),
     );
     let runtime_page_ranges = traces.runtime_page_ranges();
     let num_private_input_pages = traces
@@ -208,7 +201,7 @@ fn craft_proof(s: &Scenario, forge: Forge) -> Result<VmProof, stark::prover::Pro
         .filter(|c| c.is_private_input)
         .count();
 
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
     absorb_statement(
         &mut transcript,
         StatementKind::Monolithic,
@@ -220,11 +213,10 @@ fn craft_proof(s: &Scenario, forge: Forge) -> Result<VmProof, stark::prover::Pro
         options.fri_final_poly_log_degree,
     );
 
-    let proof = Prover::multi_prove(
+    let proof = crate::hash_pin::BlockProver::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
+        stark::residency_mode::ResidencyMode::Retain,
     )?;
 
     Ok(VmProof {

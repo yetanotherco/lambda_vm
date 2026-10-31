@@ -10,15 +10,14 @@
 //! verifier reads the CPU heights from the right sub-proofs and rejects hostile
 //! ones cleanly.
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use executor::elf::Elf;
-use stark::prover::{IsStarkProver, Prover};
+use stark::prover::IsStarkProver;
 
 use super::halt_pc_forgery_poc::{opts, run_logs};
 use crate::statement::{StatementKind, absorb_statement};
 use crate::tables::MaxRowsConfig;
 use crate::tables::trace_builder::Traces;
-use crate::test_utils::{E, asm_elf_bytes};
+use crate::test_utils::asm_elf_bytes;
 use crate::{VmAirs, VmProof};
 
 const GUEST: &str = "all_instructions_64";
@@ -30,15 +29,9 @@ fn craft_proof(
 ) -> Result<VmProof, stark::prover::ProvingError> {
     let options = opts();
     let program = Elf::load(elf_bytes).expect("ELF load");
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &run_logs(elf_bytes),
-        &MaxRowsConfig::small(),
-        &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("trace build");
+    let mut traces =
+        Traces::from_elf_and_logs(&program, &run_logs(elf_bytes), &MaxRowsConfig::small(), &[])
+            .expect("trace build");
     tamper(&mut traces);
 
     let table_counts = traces.table_counts();
@@ -56,11 +49,12 @@ fn craft_proof(
             &options,
             &program,
             &traces.public_output_bytes,
-        ),
+        )
+        .preprocessed(),
     );
     let runtime_page_ranges = traces.runtime_page_ranges();
 
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
     absorb_statement(
         &mut transcript,
         StatementKind::Monolithic,
@@ -71,11 +65,10 @@ fn craft_proof(
         &runtime_page_ranges,
         options.fri_final_poly_log_degree,
     );
-    let proof = Prover::multi_prove(
+    let proof = crate::hash_pin::BlockProver::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
+        stark::residency_mode::ResidencyMode::Retain,
     )?;
 
     Ok(VmProof {
@@ -150,7 +143,14 @@ fn hostile_cpu_heights_are_rejected_by_the_verifier() {
         proof.proof.proofs[cpu].trace_length = height;
         crate::verify_with_options(&proof, &elf, &opts(), None, None)
     };
-    for height in [0, 2, 3, 6, crate::tables::max_rows::CPU * 2, usize::MAX] {
+    for height in [
+        0,
+        2,
+        3,
+        6,
+        crate::tables::cpu::MAX_TABLE_ROWS * 2,
+        usize::MAX,
+    ] {
         assert!(
             matches!(
                 with_height(height),
@@ -165,44 +165,52 @@ fn hostile_cpu_heights_are_rejected_by_the_verifier() {
 }
 
 /// `cpu_proof_start` (which the verifier reads CPU heights with) matches the
-/// `air_refs` layout for every HALT / accelerator / IS_WH combination. Checked in
-/// release builds too, unlike the `debug_assert` in `air_refs`.
+/// `air_refs` layout for every HALT / accelerator / IS_WH combination, with and
+/// without COPY tables (several of them, as the block cuts COPY) and BLAKE3:
+/// the tables between the fixed ones and CPU on this branch, which main's
+/// formula does not count. Checked in release builds too, unlike the
+/// `debug_assert` in `air_refs`.
 #[test]
 fn cpu_proof_start_matches_air_refs_layout() {
     let elf = asm_elf_bytes(GUEST);
     let program = Elf::load(&elf).unwrap();
     let options = opts();
     let honest = craft_proof(&elf, |_| {}).expect("honest proof");
+    let register = crate::test_utils::halted_register_commitment(&options, &program, &[]);
     for include_halt in [false, true] {
-        for mask in 0u8..64 {
-            let mut counts = honest.table_counts.clone();
-            let bit = |i: u8| usize::from(mask >> i & 1);
-            counts.keccak = bit(0);
-            counts.keccak_rnd = bit(1);
-            counts.ecsm = bit(2);
-            counts.ecdas = bit(3);
-            counts.hint = bit(4);
-            counts.is_wh = bit(5);
-            let airs = VmAirs::new(
-                &program,
-                &options,
-                false,
-                &[],
-                &counts,
-                &vec![4; counts.cpu],
-                None,
-                include_halt,
-                None,
-                [0u8; 32],
-            );
-            let refs = airs.air_refs();
-            let start = crate::cpu_proof_start(include_halt, &counts);
-            for k in 0..counts.cpu {
-                assert_eq!(
-                    refs[start + k].name(),
-                    format!("CPU[{k}]"),
-                    "halt={include_halt} optional={mask:06b}"
+        for (copy, blake3) in [(0, 0), (3, 1)] {
+            for mask in 0u8..64 {
+                let mut counts = honest.table_counts.clone();
+                let bit = |i: u8| usize::from(mask >> i & 1);
+                counts.keccak = bit(0);
+                counts.keccak_rnd = bit(1);
+                counts.ecsm = bit(2);
+                counts.ecdas = bit(3);
+                counts.hint = bit(4);
+                counts.is_wh = bit(5);
+                counts.copy = copy;
+                counts.blake3 = blake3;
+                let airs = VmAirs::new(
+                    &program,
+                    &options,
+                    false,
+                    &[],
+                    &counts,
+                    &vec![4; counts.cpu],
+                    None,
+                    include_halt,
+                    None,
+                    register.preprocessed(),
                 );
+                let refs = airs.air_refs();
+                let start = crate::cpu_proof_start(include_halt, &counts);
+                for k in 0..counts.cpu {
+                    assert_eq!(
+                        refs[start + k].name(),
+                        format!("CPU[{k}]"),
+                        "halt={include_halt} copy={copy} blake3={blake3} optional={mask:06b}"
+                    );
+                }
             }
         }
     }

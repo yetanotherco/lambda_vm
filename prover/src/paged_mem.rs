@@ -61,6 +61,26 @@ impl<T: Copy> PagedMem<T> {
         (addr & !mask, (addr & mask) as usize)
     }
 
+    /// What a cell never `set` reads.
+    #[inline]
+    pub fn fill(&self) -> T {
+        self.fill
+    }
+
+    /// Keeps only the pages whose base `keep` accepts; the rest are dropped,
+    /// their cells reading `fill` again. Moves page indices.
+    pub fn retain_pages(&mut self, mut keep: impl FnMut(u64) -> bool) {
+        self.pages.retain(|(base, _)| keep(*base));
+    }
+
+    /// Each allocated page, to be written: distinct pages can be written at
+    /// once, from several threads.
+    pub fn pages_mut(&mut self) -> impl Iterator<Item = PageMut<'_, T>> {
+        self.pages
+            .iter_mut()
+            .map(|(base, page)| PageMut { base: *base, page })
+    }
+
     /// Value at `addr`, or `fill` if never `set`.
     #[inline]
     pub fn get(&self, addr: u64) -> T {
@@ -75,7 +95,28 @@ impl<T: Copy> PagedMem<T> {
     #[inline]
     pub fn set(&mut self, addr: u64, val: T) {
         let (base, off) = Self::split(addr);
-        let i = match self.pages.binary_search_by_key(&base, |(b, _)| *b) {
+        let i = self.page_index_or_insert(base);
+        self.page_set(i, off, val);
+    }
+
+    /// `addr`'s page base and its offset in the page.
+    #[inline]
+    pub fn page_of(addr: u64) -> (u64, usize) {
+        Self::split(addr)
+    }
+
+    /// The index of the page at `base` (page-aligned), if it is allocated. An
+    /// index stays valid until a page is allocated.
+    #[inline]
+    pub fn page_index(&self, base: u64) -> Option<usize> {
+        self.pages.binary_search_by_key(&base, |(b, _)| *b).ok()
+    }
+
+    /// The index of the page at `base` (page-aligned), allocating it (filled)
+    /// on first touch, which moves the index of every page above it.
+    #[inline]
+    pub fn page_index_or_insert(&mut self, base: u64) -> usize {
+        match self.pages.binary_search_by_key(&base, |(b, _)| *b) {
             Ok(i) => i,
             Err(i) => {
                 self.pages.insert(
@@ -90,10 +131,44 @@ impl<T: Copy> PagedMem<T> {
                 );
                 i
             }
-        };
-        let page = &mut self.pages[i].1;
+        }
+    }
+
+    /// The value at offset `off` of page `index`.
+    #[inline]
+    pub fn page_get(&self, index: usize, off: usize) -> T {
+        self.pages[index].1.data[off]
+    }
+
+    /// Sets offset `off` of page `index` to `val`, as [`Self::set`] does.
+    #[inline]
+    pub fn page_set(&mut self, index: usize, off: usize, val: T) {
+        let page = &mut self.pages[index].1;
         page.data[off] = val;
         page.occupied[off / WORD_BITS] |= 1u64 << (off % WORD_BITS);
+    }
+
+    /// The store with each cell's value mapped through `f`, page by page: the
+    /// same pages and the same `set` cells, each offset holding `f` of what it
+    /// held. `f(fill)` should be `fill` (the new store's), so that an offset
+    /// never `set` reads alike in an allocated page and outside every page.
+    pub fn map<U: Copy>(&self, fill: U, f: impl Fn(T) -> U) -> PagedMem<U> {
+        PagedMem {
+            pages: self
+                .pages
+                .iter()
+                .map(|(base, page)| {
+                    (
+                        *base,
+                        Page {
+                            data: page.data.iter().map(|&value| f(value)).collect(),
+                            occupied: page.occupied.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            fill,
+        }
     }
 
     /// Base addresses of the pages that hold at least one `set` cell, ascending.
@@ -120,6 +195,13 @@ impl<T: Copy> PagedMem<T> {
             Ok(i) => Some(&self.pages[i].1.data),
             Err(_) => None,
         }
+    }
+
+    /// The bytes its pages take on the heap.
+    pub fn heap_bytes(&self) -> usize {
+        self.pages.capacity() * std::mem::size_of::<(u64, Page<T>)>()
+            + self.pages.len()
+                * (DEFAULT_PAGE_SIZE * std::mem::size_of::<T>() + OCC_WORDS * size_of::<u64>())
     }
 
     /// Number of cells that were explicitly `set`.
@@ -156,6 +238,27 @@ impl<T: Copy> PagedMem<T> {
                     })
                 })
         })
+    }
+}
+
+/// One allocated page of a [`PagedMem`], to be written
+/// ([`PagedMem::pages_mut`]).
+pub struct PageMut<'a, T> {
+    base: u64,
+    page: &'a mut Page<T>,
+}
+
+impl<T: Copy> PageMut<'_, T> {
+    /// The page's base address.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// Sets offset `off` to `val`, as [`PagedMem::page_set`] does.
+    #[inline]
+    pub fn set(&mut self, off: usize, val: T) {
+        self.page.data[off] = val;
+        self.page.occupied[off / WORD_BITS] |= 1u64 << (off % WORD_BITS);
     }
 }
 
@@ -205,5 +308,52 @@ impl Iterator for BitIter {
             self.bits &= self.bits - 1; // clear lowest set bit
             Some(b)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `map` keeps every page and every `set` cell, maps each offset's value,
+    /// and reads unset cells as the new fill inside and outside the pages: the
+    /// store `set` cell by cell with the mapped values.
+    #[test]
+    fn a_mapped_store_is_the_store_set_with_the_mapped_values() {
+        let page = DEFAULT_PAGE_SIZE as u64;
+        let mut bytes = PagedMem::new(0u8);
+        let cells = [
+            (0x10, 7u8),
+            (page - 1, 0),
+            (page, 255),
+            (5 * page + 3, 1),
+            (u64::MAX, 9),
+        ];
+        for (addr, value) in cells {
+            bytes.set(addr, value);
+        }
+        let mapped = bytes.map((0u8, 0u64), |value| (value, 0));
+        let mut set = PagedMem::new((0u8, 0u64));
+        for (addr, value) in cells {
+            set.set(addr, (value, 0));
+        }
+        assert_eq!(
+            mapped.page_bases().collect::<Vec<_>>(),
+            set.page_bases().collect::<Vec<_>>()
+        );
+        for base in set.page_bases() {
+            assert_eq!(
+                mapped.page_data(base),
+                set.page_data(base),
+                "page {base:#x}"
+            );
+        }
+        assert_eq!(
+            mapped.iter().collect::<Vec<_>>(),
+            set.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(mapped.len(), cells.len());
+        assert_eq!(mapped.get(page + 1), (0, 0));
+        assert_eq!(mapped.get(3 * page), (0, 0));
     }
 }

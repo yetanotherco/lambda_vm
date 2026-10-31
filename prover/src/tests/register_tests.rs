@@ -132,6 +132,48 @@ fn test_precomputed_commitment_binds_fini() {
     assert_ne!(root_a, root_b);
 }
 
+/// The columns the multilinear verifier checks are the ones the univariate
+/// verifier's root commits, and the declared count is theirs.
+///
+/// ⚠ TWO SEPARATE THINGS COULD DRIFT and each has its own assertion here:
+/// the count constant against the columns function, and each column's
+/// position in the order. The count is the one a caller writes down —
+/// `VmAirs::new` declares `NUM_PREPROCESSED_COLS` beside a closure that must
+/// produce exactly that many, and a mismatch there is a verifier checking a
+/// prefix of what it thinks it checks.
+#[test]
+fn the_preprocessed_columns_are_what_the_commitment_holds() {
+    let init = register_init_from_entry_point(0x1000);
+    let mut fini = vec![0u32; NUM_REGISTER_ADDRESSES];
+    fini[10] = 0x42;
+    fini[X254_INDEX] = 9;
+
+    let columns = preprocessed_columns(&init, &fini);
+    assert_eq!(
+        columns.len(),
+        NUM_PREPROCESSED_COLS,
+        "the declared preprocessed count and the columns built for it disagree"
+    );
+
+    // INIT is `init`, in the register word-address order.
+    let init_col = &columns[cols::INIT];
+    for (k, &word) in init.iter().enumerate() {
+        assert_eq!(init_col[k], FE::from(u64::from(word)), "INIT row {k}");
+    }
+
+    // FINI is last, and it is `fini` — read at two addresses that differ, so a
+    // column of zeros or a duplicated INIT fails.
+    let fini_col = &columns[cols::FINI];
+    assert_eq!(fini_col[10], FE::from(0x42u64));
+    assert_eq!(fini_col[X254_INDEX], FE::from(9u64));
+    assert_eq!(fini_col[0], FE::from(0u64));
+    assert_eq!(
+        fini_col.len(),
+        NUM_REGISTER_ADDRESSES.next_power_of_two(),
+        "the columns are padded to the table's height"
+    );
+}
+
 /// `fini_from_final_state` must return exactly what `fini_from_trace` reads off
 /// the generated REGISTER trace, for both accessed and never-accessed
 /// registers — it is the continuation producer's trace-free replacement.

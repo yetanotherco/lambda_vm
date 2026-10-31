@@ -19,6 +19,7 @@
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, GoldilocksExtension, GoldilocksField, VmTable, alu_op, dedup_rows};
 
 // =========================================================================
@@ -73,6 +74,16 @@ impl BytewiseOperation {
     /// The 8 `BYTE_ALU` lookups this op sends, for the BITWISE table's
     /// multiplicity bookkeeping (one per byte, keyed by opsel).
     pub fn collect_bitwise_ops(&self) -> Vec<super::bitwise::BitwiseOperation> {
+        let mut ops = Vec::with_capacity(8);
+        self.for_each_bitwise_op(|op| ops.push(op));
+        ops
+    }
+
+    /// [`Self::collect_bitwise_ops`]' lookups, one by one.
+    pub(crate) fn for_each_bitwise_op(
+        &self,
+        mut emit: impl FnMut(super::bitwise::BitwiseOperation),
+    ) {
         use super::bitwise::{BitwiseOperation, BitwiseOperationType};
         let kind = match self.op {
             alu_op::AND => BitwiseOperationType::ByteAluAnd,
@@ -80,13 +91,11 @@ impl BytewiseOperation {
             alu_op::XOR => BitwiseOperationType::ByteAluXor,
             other => panic!("BYTEWISE only handles AND/OR/XOR, got opcode {other}"),
         };
-        (0..8)
-            .map(|i| {
-                let a = ((self.a >> (i * 8)) & 0xFF) as u8;
-                let b = ((self.b >> (i * 8)) & 0xFF) as u8;
-                BitwiseOperation::byte_op(kind, a, b)
-            })
-            .collect()
+        for i in 0..8 {
+            let a = ((self.a >> (i * 8)) & 0xFF) as u8;
+            let b = ((self.b >> (i * 8)) & 0xFF) as u8;
+            emit(BitwiseOperation::byte_op(kind, a, b));
+        }
     }
 }
 
@@ -99,26 +108,38 @@ impl BytewiseOperation {
 pub fn generate_bytewise_trace(
     operations: &[BytewiseOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let unique_ops = dedup_rows(operations);
+    generate_bytewise_trace_as(operations, TraceForm::Wide)
+}
+
+/// The widths BYTEWISE traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
+
+/// [`generate_bytewise_trace`] in `form` (`tables::gpack`).
+pub fn generate_bytewise_trace_as(
+    operations: &[BytewiseOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    bytewise_trace_of_rows(&dedup_rows(operations), form)
+}
+
+/// The BYTEWISE trace of `unique_ops`, the rows [`generate_bytewise_trace_as`]
+/// deduplicates its operations into, in `form`.
+pub(crate) fn bytewise_trace_of_rows(
+    unique_ops: &[(BytewiseOperation, u64)],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
+            let res = op.compute_res();
 
-    for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
-        let res = op.compute_res();
-
-        table.set_dword_bl(row_idx, cols::A[0], op.a);
-        table.set_dword_bl(row_idx, cols::B[0], op.b);
-        table.set_dword_bl(row_idx, cols::RES[0], res);
-        table.set_byte(row_idx, cols::OP, op.op);
-        table.set_u64(row_idx, cols::MU, *multiplicity);
-    }
-
-    trace
+            table.set_dword_bl(row_idx, cols::A[0], op.a);
+            table.set_dword_bl(row_idx, cols::B[0], op.b);
+            table.set_dword_bl(row_idx, cols::RES[0], res);
+            table.set_byte(row_idx, cols::OP, op.op);
+            table.set_u64(row_idx, cols::MU, *multiplicity);
+        }
+    })
 }
 
 // =========================================================================

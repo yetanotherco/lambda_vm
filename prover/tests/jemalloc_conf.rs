@@ -1,8 +1,8 @@
 //! jemalloc's purge policy is compiled into the binary — checked by reading it
 //! back out of the allocator serving this process.
 //!
-//! `bin/cli/src/main.rs` and `calibration.rs` each export
-//! `_rjem_malloc_conf = "dirty_decay_ms:-1,muzzy_decay_ms:-1"` beside their
+//! `bin/cli/src/main.rs` exports
+//! `_rjem_malloc_conf = "dirty_decay_ms:-1,muzzy_decay_ms:-1"` beside its
 //! `#[global_allocator]`, so the never-purge policy travels in the binary
 //! rather than in a launcher's environment. Nothing about that export is
 //! checked by the compiler: a misspelled symbol, a wrong value type, or a
@@ -11,14 +11,13 @@
 //!
 //! This is its own test binary because the check needs a jemalloc process of
 //! its own: the prover's lib tests run under the platform allocator, where a
-//! `mallctl` read would say nothing, and `calibration.rs` is behind
-//! `disk-spill` and pays for a full proof. What it pins is the export pattern —
+//! `mallctl` read would say nothing. What it pins is the export pattern —
 //! symbol, type, initializer, edition spelling — in the copy below, which is
-//! byte-identical to the two production sites but not mechanically tied to
-//! them: delete either of those and this still passes. It is a self-test of the
-//! pattern, not a regression guard on the two sites that ship it. That the
-//! shipped `cli` binary carries the symbol is a link-time property, read with
-//! `nm` rather than asserted here.
+//! byte-identical to the production site but not mechanically tied to it:
+//! delete that one and this still passes. It is a self-test of the pattern,
+//! not a regression guard on the site that ships it. That the shipped `cli`
+//! binary carries the symbol is a link-time property, read with `nm` rather
+//! than asserted here.
 
 use tikv_jemalloc_ctl::raw;
 

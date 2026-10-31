@@ -72,6 +72,7 @@ fn test_domain_constructor() {
         coset_offset,
         grinding_factor,
         fri_final_poly_log_degree: 7,
+        format: crate::proof::options::ProofFormat::DEFAULT,
     };
 
     let domain = Domain::new(
@@ -163,6 +164,7 @@ fn barycentric_trace_eval_matches_horner_trace_eval() {
         coset_offset,
         grinding_factor: 0,
         fri_final_poly_log_degree: 7,
+        format: crate::proof::options::ProofFormat::DEFAULT,
     };
 
     let air = simple_fibonacci::FibonacciAIR::<GoldilocksField>::new(&proof_options);
@@ -235,6 +237,7 @@ fn test_decompose_and_extend_d2_matches_original() {
         coset_offset: 3,
         grinding_factor: 0,
         fri_final_poly_log_degree: 7,
+        format: crate::proof::options::ProofFormat::DEFAULT,
     };
 
     // We need an AIR with composition_poly_degree_bound = 2 * trace_length.
@@ -276,6 +279,7 @@ fn test_decompose_and_extend_d2_matches_original() {
         &constraint_evaluations,
         &domain,
         &twiddles,
+        1,
     );
     #[cfg(not(feature = "cuda"))]
     assert!(twiddles.has_composition_cache());
@@ -287,6 +291,88 @@ fn test_decompose_and_extend_d2_matches_original() {
         assert_eq!(new_result[0][i], original[0][i], "H₀ mismatch at index {i}");
         assert_eq!(new_result[1][i], original[1][i], "H₁ mismatch at index {i}");
     }
+}
+
+/// The sub-coset split: with blowup ≥ 4, `H` evaluated only at every
+/// `blowup/2`-th LDE point (the `2n`-point sub-coset) must decompose and extend
+/// to exactly the parts the whole-coset split produces, and both must equal the
+/// iFFT + `break_in_parts` + LDE reference. This is the identity the prover's
+/// sub-coset composition evaluation rests on (same parts ⇒ same proof bytes).
+#[test]
+fn decompose_and_extend_d2_subcoset_matches_whole_coset() {
+    for (n, blowup_factor) in [(16usize, 4usize), (32, 4), (16, 8)] {
+        let lde_size = n * blowup_factor;
+        let proof_options = ProofOptions {
+            blowup_factor: blowup_factor as u8,
+            fri_number_of_queries: 1,
+            coset_offset: 7,
+            grinding_factor: 0,
+            fri_final_poly_log_degree: 7,
+            format: crate::proof::options::ProofFormat::DEFAULT,
+        };
+        let air = QuadraticAIR::<GoldilocksField>::new(&proof_options);
+        let domain = Domain::new(&air, n);
+        assert_eq!(domain.lde_roots_of_unity_coset.len(), lde_size);
+
+        // H of degree < 2n, evaluated on the whole LDE coset.
+        let coeffs: Vec<Felt> = (0..2 * n)
+            .map(|i| FieldElement::from((i as u64) * 0x9E37_79B9 + 11))
+            .collect();
+        let h_poly = Polynomial::new(&coeffs);
+        let full: Vec<Felt> = domain
+            .lde_roots_of_unity_coset
+            .iter()
+            .map(|x| h_poly.evaluate(x))
+            .collect();
+
+        // Reference: interpolate, break in two parts, evaluate each on the LDE.
+        let reference: Vec<Vec<Felt>> = h_poly
+            .break_in_parts(2)
+            .iter()
+            .map(|part| {
+                evaluate_polynomial_on_lde_domain(part, blowup_factor, n, &domain.coset_offset)
+                    .expect("LDE evaluation failed")
+            })
+            .collect();
+
+        let twiddles = LdeTwiddles::new(&domain);
+        let whole = Prover::<GoldilocksField, GoldilocksField, ()>::decompose_and_extend_d2(
+            &full, &domain, &twiddles, 1,
+        );
+        let stride = blowup_factor / 2;
+        let sub: Vec<Felt> = full.iter().step_by(stride).cloned().collect();
+        assert_eq!(sub.len(), 2 * n);
+        let subcoset = Prover::<GoldilocksField, GoldilocksField, ()>::decompose_and_extend_d2(
+            &sub, &domain, &twiddles, stride,
+        );
+
+        assert_eq!(
+            whole, reference,
+            "whole-coset split != reference (n={n}, b={blowup_factor})"
+        );
+        assert_eq!(
+            subcoset, reference,
+            "sub-coset split != reference (n={n}, b={blowup_factor})"
+        );
+    }
+}
+
+/// The stride rule: the sub-coset is taken only for two parts at blowup ≥ 4,
+/// at `blowup/2`; every other shape keeps the whole coset (stride 1).
+#[test]
+fn composition_eval_stride_rule() {
+    use crate::prover::composition_eval_stride;
+    // Read under the default (environment) setting, which these tests never
+    // override: on unless `LAMBDA_VM_COMPOSITION_SUBCOSET=0`.
+    if !crate::prover::composition_subcoset_enabled() {
+        return;
+    }
+    assert_eq!(composition_eval_stride(4, 2), 2);
+    assert_eq!(composition_eval_stride(8, 2), 4);
+    assert_eq!(composition_eval_stride(2, 2), 1);
+    assert_eq!(composition_eval_stride(4, 1), 1);
+    assert_eq!(composition_eval_stride(4, 3), 1);
+    assert_eq!(composition_eval_stride(16, 4), 1);
 }
 
 /// Test that the domain cache 3-tuple key `(trace_length, blowup, coset_offset)` correctly
@@ -301,6 +387,7 @@ fn test_multi_prove_mixed_coset_offsets() {
         coset_offset: 3,
         grinding_factor: 1,
         fri_final_poly_log_degree: 7,
+        format: crate::proof::options::ProofFormat::DEFAULT,
     };
     let proof_options_7 = ProofOptions {
         blowup_factor: 2,
@@ -308,6 +395,7 @@ fn test_multi_prove_mixed_coset_offsets() {
         coset_offset: 7,
         grinding_factor: 1,
         fri_final_poly_log_degree: 7,
+        format: crate::proof::options::ProofFormat::DEFAULT,
     };
 
     // Both AIRs have the same trace length and blowup, but different coset offsets.
@@ -373,6 +461,7 @@ fn test_multi_prove_dedups_shared_domain_params() {
         coset_offset: 3,
         grinding_factor: 1,
         fri_final_poly_log_degree: 7,
+        format: crate::proof::options::ProofFormat::DEFAULT,
     };
 
     let mut trace_1 = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
@@ -436,6 +525,68 @@ fn test_multi_prove_dedups_shared_domain_params() {
     );
 }
 
+/// ★ A warmed domain is the entry a later prove's lookup finds, and it is the
+/// domain a cold build gives, value for value; a length no trace has warms
+/// nothing. The key (blowup 2, coset offset 7, 32 rows) is this test's alone.
+#[test]
+fn a_warmed_domain_is_the_one_a_prove_finds() {
+    use crate::prover::{domain_and_twiddles, warm_domain_twiddles};
+    let options = ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 3,
+        coset_offset: 7,
+        grinding_factor: 1,
+        fri_final_poly_log_degree: 7,
+        format: crate::proof::options::ProofFormat::DEFAULT,
+    };
+    let air = FibonacciAIR::<GoldilocksField>::new(&options);
+    assert_eq!(
+        warm_domain_twiddles::<GoldilocksField>(2, 7, 0),
+        None,
+        "no rows"
+    );
+    assert_eq!(
+        warm_domain_twiddles::<GoldilocksField>(2, 7, 24),
+        None,
+        "not a power of two"
+    );
+    // The entry's tables: the LDE coset (n·blowup) and trace roots (n), the
+    // two-half sets (n and n·blowup) and the coset weights (n), 8 bytes each.
+    assert_eq!(
+        warm_domain_twiddles::<GoldilocksField>(2, 7, 32),
+        Some(32 * (2 * 2 + 3) * 8),
+        "built"
+    );
+    assert_eq!(
+        warm_domain_twiddles::<GoldilocksField>(2, 7, 32),
+        None,
+        "already there"
+    );
+
+    domain_cache_stats::reset();
+    let (first, _) = domain_and_twiddles(&air, 32);
+    let (again, _) = domain_and_twiddles(&air, 32);
+    assert_eq!(
+        domain_cache_stats::get(),
+        (2, 0),
+        "both lookups hit the warmed entry"
+    );
+    assert!(std::sync::Arc::ptr_eq(&first, &again));
+
+    let cold = Domain::new(&air, 32);
+    assert_eq!(
+        first.lde_roots_of_unity_coset,
+        cold.lde_roots_of_unity_coset
+    );
+    assert_eq!(first.trace_roots_of_unity, cold.trace_roots_of_unity);
+    assert_eq!(first.trace_primitive_root, cold.trace_primitive_root);
+    assert_eq!(first.coset_offset, cold.coset_offset);
+    assert_eq!(
+        (first.blowup_factor, first.interpolation_domain_size),
+        (cold.blowup_factor, cold.interpolation_domain_size)
+    );
+}
+
 /// Differential test for the DEEP composition polynomial "direct 2N" evaluation.
 ///
 /// After this PR, `compute_deep_composition_poly_evaluations` evaluates the DEEP
@@ -463,6 +614,7 @@ fn test_deep_poly_direct_2n_matches_interpolate_fft_extend() {
         coset_offset: 3,
         grinding_factor: 0,
         fri_final_poly_log_degree: 7,
+        format: crate::proof::options::ProofFormat::DEFAULT,
     };
 
     let air = QuadraticAIR::<GoldilocksField>::new(&proof_options);

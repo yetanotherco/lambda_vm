@@ -1,9 +1,24 @@
-#[cfg(all(test, feature = "disk-spill"))]
-pub mod auto_storage_tests;
+#[cfg(test)]
+pub mod argue_stage1_tests;
+#[cfg(test)]
+pub mod batched_argue_tests;
 #[cfg(test)]
 pub mod bitwise_bus_tests;
 #[cfg(test)]
 pub mod bitwise_tests;
+#[cfg(test)]
+#[cfg(feature = "parallel")]
+pub mod block_batched_tests;
+#[cfg(test)]
+#[cfg(feature = "parallel")]
+pub mod block_cut_padding_tests;
+#[cfg(test)]
+#[cfg(feature = "parallel")]
+pub mod block_onechain_tests;
+#[cfg(test)]
+#[cfg(feature = "parallel")]
+pub mod block_whir_p1_tests;
+pub mod block_whir_tests;
 #[cfg(test)]
 pub mod branch_bus_tests;
 #[cfg(test)]
@@ -15,7 +30,11 @@ pub mod branch_multiplicity_poc;
 #[cfg(test)]
 pub mod bytewise_tests;
 #[cfg(test)]
+pub mod commit_ood_host_tests;
+#[cfg(test)]
 pub mod compute_commit_bus_offset_tests;
+#[cfg(test)]
+pub mod constraint_artifact_tests;
 #[cfg(test)]
 pub mod constraint_emit_tests;
 #[cfg(test)]
@@ -30,8 +49,6 @@ pub mod constraint_set_tests_b;
 pub mod constraints_tests;
 #[cfg(test)]
 pub mod copy_tests;
-#[cfg(all(test, feature = "disk-spill"))]
-pub mod count_table_lengths_drift_tests;
 #[cfg(test)]
 pub mod cpu32_tests;
 #[cfg(test)]
@@ -41,9 +58,11 @@ pub mod cpu_timestamp_tests;
 #[cfg(test)]
 pub mod decode_layout_tests;
 #[cfg(test)]
+pub mod decode_prepared_tests;
+#[cfg(test)]
+pub mod decode_residency_tests;
+#[cfg(test)]
 pub mod decode_tests;
-#[cfg(all(test, feature = "disk-spill"))]
-pub mod disk_spill_tests;
 #[cfg(test)]
 pub mod dvrm_tests;
 #[cfg(test)]
@@ -53,7 +72,13 @@ pub mod ecsm_tests;
 #[cfg(test)]
 pub mod eq_tests;
 #[cfg(test)]
+pub mod gpack_tests;
+#[cfg(test)]
+pub mod grouped_run_claim_tests;
+#[cfg(test)]
 pub mod halt_pc_forgery_poc;
+#[cfg(test)]
+pub mod hash_pin_enumeration;
 #[cfg(test)]
 pub mod hint_tests;
 #[cfg(test)]
@@ -64,6 +89,7 @@ pub mod is_wh_tests;
 pub mod keccak_rnd_tests;
 #[cfg(test)]
 pub mod keccak_tests;
+pub mod lean_program_census;
 #[cfg(test)]
 pub mod load_tests;
 #[cfg(test)]
@@ -85,9 +111,16 @@ pub mod mul_mu_carrier_poc;
 #[cfg(test)]
 pub mod mul_tests;
 #[cfg(test)]
+pub mod multilinear_bench_tests;
+pub mod multilinear_continuation_tests;
+pub mod multilinear_prove_tests;
+#[cfg(test)]
+pub mod multilinear_table_tests;
 pub mod multiplicity_forgery_poc;
 #[cfg(test)]
 pub mod ood_window_ir_tests;
+#[cfg(test)]
+pub mod p1_stark_tests;
 #[cfg(test)]
 pub mod page_layout_tests;
 #[cfg(test)]
@@ -105,10 +138,19 @@ pub mod recursion_soundness_gap_poc;
 #[cfg(test)]
 pub mod register_tests;
 #[cfg(test)]
+pub mod rpx_two_implementations;
+#[cfg(test)]
+#[cfg(feature = "shape-profile")]
+pub mod shape_profile_tests;
+pub mod transcript_counts;
+pub mod windowed_builder_tests;
+
 pub mod shift_tests;
 
 #[cfg(test)]
 pub mod skip_empty_tables_tests;
+#[cfg(test)]
+pub mod statement_alignment_tests;
 #[cfg(test)]
 pub mod statement_tests;
 #[cfg(test)]
@@ -119,5 +161,30 @@ pub mod store_tests;
 pub mod templates_tests;
 #[cfg(test)]
 pub mod trace_builder_tests;
+pub mod trace_digest_tests;
 #[cfg(test)]
 pub mod trace_test_helpers;
+#[cfg(test)]
+pub mod verifier_pin_tests;
+#[cfg(test)]
+pub mod whir_byte_gate;
+#[cfg(test)]
+pub mod whir_hash_tests;
+#[cfg(test)]
+pub mod whir_identity_tests;
+#[cfg(test)]
+pub mod zf_air_cache_tests;
+#[cfg(test)]
+pub mod zf_lfm_bytes_tests;
+#[cfg(all(test, feature = "cuda"))]
+pub mod zf_p1_device_tests;
+#[cfg(all(test, feature = "cuda"))]
+pub mod zf_rpx_device_tests;
+#[cfg(test)]
+pub mod zf_rpx_golden_tests;
+#[cfg(test)]
+pub mod zf_rpx_vectors;
+#[cfg(test)]
+pub mod zf_vm_dp_tests;
+#[cfg(test)]
+pub mod zf_vm_one_row_tests;

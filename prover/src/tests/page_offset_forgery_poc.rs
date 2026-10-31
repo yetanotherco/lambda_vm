@@ -32,16 +32,20 @@
 //! Run under **production** proof options, not `default_test_options()`, so none
 //! of this can be written off as an artefact of a low-query configuration.
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+// The bare `crypto` DefaultTranscript's type default is keccak, which since the
+// stage-6 flip is NOT the configuration's transcript. This harness must sample
+// Fiat-Shamir from the hash production replays (`DefaultStarkHash`), or every
+// honest proof it builds is rejected at challenge derivation. Same half-flip
+// `config.rs` warns about; the warning applies to test harnesses too.
 use stark::proof::options::ProofOptions;
-use stark::prover::{IsStarkProver, Prover};
+use stark::prover::IsStarkProver;
 
 use crate::statement::{StatementKind, absorb_statement};
 use crate::tables::bitwise::{cols as bw_cols, row_index as bw_row_index};
 use crate::tables::page::cols as page_cols;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{FE, VmTable};
-use crate::test_utils::{E, asm_elf_bytes};
+use crate::test_utils::asm_elf_bytes;
 use crate::{MaxRowsConfig, VmAirs, VmProof};
 
 use executor::elf::Elf;
@@ -151,15 +155,8 @@ fn craft_proof(
     let result = executor.run().expect("run");
 
     let max_rows = MaxRowsConfig::default();
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &result.logs,
-        &max_rows,
-        private_inputs,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("trace build");
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, &max_rows, private_inputs)
+        .expect("trace build");
 
     match forge {
         Some(Tamper::RepointPrivateRow(f)) => apply_forge(&mut traces, &f),
@@ -186,7 +183,8 @@ fn craft_proof(
             &options,
             &program,
             &traces.public_output_bytes,
-        ),
+        )
+        .preprocessed(),
     );
 
     let runtime_page_ranges = traces.runtime_page_ranges();
@@ -196,7 +194,7 @@ fn craft_proof(
         .filter(|c| c.is_private_input)
         .count();
 
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
     absorb_statement(
         &mut transcript,
         StatementKind::Monolithic,
@@ -208,11 +206,10 @@ fn craft_proof(
         options.fri_final_poly_log_degree,
     );
 
-    let proof = Prover::multi_prove(
+    let proof = crate::hash_pin::BlockProver::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
+        stark::residency_mode::ResidencyMode::Retain,
     )?;
 
     Ok(VmProof {
@@ -642,15 +639,8 @@ fn craft_proof_with_duplicate_page(
     let result = executor.run().expect("run");
 
     let max_rows = MaxRowsConfig::default();
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &result.logs,
-        &max_rows,
-        &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("trace build");
+    let mut traces =
+        Traces::from_elf_and_logs(&program, &result.logs, &max_rows, &[]).expect("trace build");
 
     inject_duplicate_zero_page(&mut traces, dup_base, consume);
 
@@ -702,10 +692,11 @@ fn craft_proof_with_duplicate_page(
             &options,
             &program,
             &traces.public_output_bytes,
-        ),
+        )
+        .preprocessed(),
     );
 
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
     absorb_statement(
         &mut transcript,
         StatementKind::Monolithic,
@@ -717,11 +708,10 @@ fn craft_proof_with_duplicate_page(
         options.fri_final_poly_log_degree,
     );
 
-    let proof = Prover::multi_prove(
+    let proof = crate::hash_pin::BlockProver::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
+        stark::residency_mode::ResidencyMode::Retain,
     )
     // The injected duplicate page writes only FINI, a main-trace column, and every
     // page's OFFSET/INIT stays honest — so the preprocessed check cannot fire and

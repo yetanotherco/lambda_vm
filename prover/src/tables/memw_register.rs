@@ -44,6 +44,7 @@ use stark::trace::TraceTable;
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 use super::bitwise::{BitwiseHistogram, BitwiseOperation, BitwiseOperationType};
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::memw::MemwOperation;
 use super::types::{BusId, GoldilocksExtension, GoldilocksField, VmTable};
 use crate::constraints::templates::emit_is_bit;
@@ -89,7 +90,7 @@ pub mod cols {
 /// Compact, already-decomposed record for one MEMW_R (register fast-path) access.
 ///
 /// This is the "direct-to-column" carrier: it holds exactly the fields the MEMW_R
-/// column fill ([`generate_memw_register_trace_from_rows`]) and its IS_HALFWORD
+/// column fill ([`generate_memw_register_trace_from_rows_as`]) and its IS_HALFWORD
 /// bitwise collector ([`collect_bitwise_from_memw_register`]) need, and nothing
 /// else. It replaces the full `MemwOperation` (~152 B after the `[u32; 8]`
 /// value/old shrink, but still 8-element arrays) for register accesses — the
@@ -103,18 +104,63 @@ pub mod cols {
 /// - `old0/old1` = `old[0]`/`old[1]`
 /// - `old_ts_lo` = `old_timestamp[0] & 0xFFFF_FFFF` (the two words share old_timestamp,
 ///   enforced by `is_register_op`; the upper limb is TIMESTAMP_1 = timestamp>>32)
+///
+/// `#[repr(C)]`, its fields in this order with the one spare byte a named
+/// zero, so its 32 bytes are all set and a chunk's rows can cross to a card as
+/// they lie (`multilinear::records::RegisterRow`, the card's MEMW_R fill).
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 pub(crate) struct RegRow {
-    /// Register index 0..=255 (`base_address / 2`); u16 keeps the struct at
-    /// 32 bytes — it is the largest persisted array of the walk.
-    address: u16,
     timestamp: u64,
     val0: u32,
     val1: u32,
     old0: u32,
     old1: u32,
     old_ts_lo: u32,
+    /// Register index 0..=255 (`base_address / 2`); u16 keeps the struct at
+    /// 32 bytes — it is the largest persisted array of the walk.
+    address: u16,
     is_read: bool,
+    /// Always 0.
+    pad: u8,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<RegRow>() == 32);
+    assert!(std::mem::align_of::<RegRow>() == 8);
+    assert!(std::mem::offset_of!(RegRow, timestamp) == 0);
+    assert!(std::mem::offset_of!(RegRow, val0) == 8);
+    assert!(std::mem::offset_of!(RegRow, val1) == 12);
+    assert!(std::mem::offset_of!(RegRow, old0) == 16);
+    assert!(std::mem::offset_of!(RegRow, old1) == 20);
+    assert!(std::mem::offset_of!(RegRow, old_ts_lo) == 24);
+    assert!(std::mem::offset_of!(RegRow, address) == 28);
+    assert!(std::mem::offset_of!(RegRow, is_read) == 30);
+    assert!(std::mem::offset_of!(RegRow, pad) == 31);
+};
+
+/// Register rows as the card's MEMW_R fill reads them
+/// (`multilinear::records::RegisterRow`): the same bytes.
+pub(crate) fn card_rows(rows: &[RegRow]) -> &[multilinear::records::RegisterRow] {
+    use multilinear::records::RegisterRow;
+    use std::mem::{align_of, offset_of, size_of};
+    const _: () = {
+        assert!(size_of::<RegRow>() == size_of::<RegisterRow>());
+        assert!(align_of::<RegRow>() == align_of::<RegisterRow>());
+        assert!(offset_of!(RegRow, timestamp) == offset_of!(RegisterRow, timestamp));
+        assert!(offset_of!(RegRow, val0) == offset_of!(RegisterRow, val0));
+        assert!(offset_of!(RegRow, val1) == offset_of!(RegisterRow, val1));
+        assert!(offset_of!(RegRow, old0) == offset_of!(RegisterRow, old0));
+        assert!(offset_of!(RegRow, old1) == offset_of!(RegisterRow, old1));
+        assert!(offset_of!(RegRow, old_ts_lo) == offset_of!(RegisterRow, old_ts_lo));
+        assert!(offset_of!(RegRow, address) == offset_of!(RegisterRow, address));
+        assert!(offset_of!(RegRow, is_read) == offset_of!(RegisterRow, is_read));
+        assert!(offset_of!(RegRow, pad) == offset_of!(RegisterRow, pad));
+    };
+    // SAFETY: both are `#[repr(C)]` with the same fields in the same order
+    // (asserted above); `is_read` is a `bool`, 0 or 1, read as a `u8`, and
+    // `pad` is always written.
+    unsafe { std::slice::from_raw_parts(rows.as_ptr() as *const RegisterRow, rows.len()) }
 }
 
 impl RegRow {
@@ -155,6 +201,7 @@ impl RegRow {
             old1,
             old_ts_lo: (old_ts & 0xFFFF_FFFF) as u32,
             is_read,
+            pad: 0,
         }
     }
 
@@ -189,6 +236,24 @@ impl RegRow {
     }
 }
 
+#[cfg(test)]
+impl RegRow {
+    /// The row as the card's MEMW_R fill reads it, field for field.
+    pub(crate) fn card_record(&self) -> math_cuda::fill::RegRowC {
+        math_cuda::fill::RegRowC {
+            timestamp: self.timestamp,
+            val0: self.val0,
+            val1: self.val1,
+            old0: self.old0,
+            old1: self.old1,
+            old_ts_lo: self.old_ts_lo,
+            address: self.address,
+            is_read: u8::from(self.is_read),
+            pad: 0,
+        }
+    }
+}
+
 /// Generates the MEMW_R trace table from register operations.
 ///
 /// Thin wrapper over [`generate_memw_register_trace_from_rows`] (via
@@ -204,39 +269,55 @@ pub(crate) fn generate_memw_register_trace(
     generate_memw_register_trace_from_rows(&rows)
 }
 
-/// The MEMW_R column fill from compact [`RegRow`]s. This is the single source of
-/// truth for the MEMW_R trace layout; both the walk's direct fast path and the
-/// `MemwOperation`-based `generate_memw_register_trace` test wrapper land here.
+/// [`generate_memw_register_trace_from_rows_as`] at 8 bytes a cell.
+#[cfg(test)]
 pub(crate) fn generate_memw_register_trace_from_rows(
     rows: &[RegRow],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let num_rows = rows.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_memw_register_trace_from_rows_as(rows, TraceForm::Wide)
+}
 
-    for (row_idx, r) in rows.iter().enumerate() {
-        // ADDRESS = base_address / 2 (already divided in RegRow).
-        table.set_u64(row_idx, cols::ADDRESS, r.address as u64);
-        // Timestamp split into lo/hi 32-bit words.
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, r.timestamp);
-        // Value: registers are DWordWL = 2 words.
-        table.set_u64(row_idx, cols::VAL_0, r.val0 as u64);
-        table.set_u64(row_idx, cols::VAL_1, r.val1 as u64);
-        // Old value.
-        table.set_u64(row_idx, cols::OLD_0, r.old0 as u64);
-        table.set_u64(row_idx, cols::OLD_1, r.old1 as u64);
-        // Old timestamp low (upper limb shared with TIMESTAMP_1).
-        table.set_u64(row_idx, cols::OLD_TIMESTAMP_LO, r.old_ts_lo as u64);
-        // Multiplicity.
-        table.set_bool(row_idx, cols::MU_READ, r.is_read);
-        table.set_bool(row_idx, cols::MU_WRITE, !r.is_read);
-    }
+/// The widths MEMW_R traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
 
-    trace
+/// The MEMW_R column fill from compact [`RegRow`]s, in `form`
+/// (`tables::gpack`). This is the single source of truth for the MEMW_R trace
+/// layout; both the walk's direct fast path and the `MemwOperation`-based
+/// `generate_memw_register_trace` test wrapper land here.
+pub(crate) fn generate_memw_register_trace_from_rows_as(
+    rows: &[RegRow],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_memw_register_trace_from_rows_segments_as(&[rows], form)
+}
+
+/// [`generate_memw_register_trace_from_rows_as`] over `segments`, the rows one after another: a
+/// chunk handed out as the window parts it lies in.
+pub(crate) fn generate_memw_register_trace_from_rows_segments_as(
+    segments: &[&[RegRow]],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let len: usize = segments.iter().map(|s| s.len()).sum();
+    let num_rows = len.next_power_of_two().max(4);
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, r) in segments.iter().flat_map(|s| s.iter()).enumerate() {
+            // ADDRESS = base_address / 2 (already divided in RegRow).
+            table.set_u64(row_idx, cols::ADDRESS, r.address as u64);
+            // Timestamp split into lo/hi 32-bit words.
+            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, r.timestamp);
+            // Value: registers are DWordWL = 2 words.
+            table.set_u64(row_idx, cols::VAL_0, r.val0 as u64);
+            table.set_u64(row_idx, cols::VAL_1, r.val1 as u64);
+            // Old value.
+            table.set_u64(row_idx, cols::OLD_0, r.old0 as u64);
+            table.set_u64(row_idx, cols::OLD_1, r.old1 as u64);
+            // Old timestamp low (upper limb shared with TIMESTAMP_1).
+            table.set_u64(row_idx, cols::OLD_TIMESTAMP_LO, r.old_ts_lo as u64);
+            // Multiplicity.
+            table.set_bool(row_idx, cols::MU_READ, r.is_read);
+            table.set_bool(row_idx, cols::MU_WRITE, !r.is_read);
+        }
+    })
 }
 
 /// The single IS_HALFWORD lookup a MEMW_R access sends: proves the timestamp delta

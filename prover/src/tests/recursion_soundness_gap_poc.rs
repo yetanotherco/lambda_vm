@@ -16,13 +16,16 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crypto::fiat_shamir::default_transcript::DefaultTranscript;
-use stark::prover::{IsStarkProver, Prover};
+// The bare `crypto` DefaultTranscript's type default is keccak, which since the
+// stage-6 flip is NOT the configuration's transcript. This harness must sample
+// Fiat-Shamir from the hash production replays (`DefaultStarkHash`), or every
+// honest proof it builds is rejected at challenge derivation. Same half-flip
+// `config.rs` warns about; the warning applies to test harnesses too.
+use stark::prover::IsStarkProver;
 
 use crate::recursion::{MIN_PROOF_OPTIONS, precomputed_commitments};
 use crate::statement::{StatementKind, absorb_statement, elf_digest};
 use crate::tables::trace_builder::Traces;
-use crate::test_utils::E;
 use crate::{MaxRowsConfig, VmAirs, VmProof};
 
 use executor::elf::Elf;
@@ -136,15 +139,8 @@ fn custom_prove_with_statement_elf(
     let result = executor.run().expect("run failed");
 
     let max_rows = MaxRowsConfig::default();
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &result.logs,
-        &max_rows,
-        &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("trace build failed");
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, &max_rows, &[])
+        .expect("trace build failed");
 
     let table_counts = traces.table_counts();
     let airs = VmAirs::new(
@@ -158,7 +154,8 @@ fn custom_prove_with_statement_elf(
         true,
         None,
         // As the production prover: FINI pinned to the halted register file.
-        crate::test_utils::halted_register_commitment(opts, &program, &traces.public_output_bytes),
+        crate::test_utils::halted_register_commitment(opts, &program, &traces.public_output_bytes)
+            .preprocessed(),
     );
 
     let runtime_page_ranges = traces.runtime_page_ranges();
@@ -168,7 +165,7 @@ fn custom_prove_with_statement_elf(
         .filter(|c| c.is_private_input)
         .count();
 
-    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    let mut transcript = crate::hash_pin::block_transcript(&[]);
     absorb_statement(
         &mut transcript,
         StatementKind::Monolithic,
@@ -180,11 +177,10 @@ fn custom_prove_with_statement_elf(
         opts.fri_final_poly_log_degree,
     );
 
-    let proof = Prover::multi_prove(
+    let proof = crate::hash_pin::BlockProver::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
+        stark::residency_mode::ResidencyMode::Retain,
     )
     .expect("multi_prove failed");
 

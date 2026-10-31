@@ -1,7 +1,15 @@
 [target.riscv64im-lambda-vm-elf]
 rustflags = [
   "--cfg", "getrandom_backend=\"custom\"",
-  "-C", "passes=lower-atomic"
+  "-C", "passes=lower-atomic",
+  # compiler_builtins turns its `mem-unaligned` setting on for x86, aarch64 and bpf only,
+  # so on RISC-V its `memmove` reassembles every misaligned word with shifts; this VM
+  # executes an unaligned doubleword access as one instruction. Only compiler_builtins
+  # reads the name, in its own build script, with no stability guarantee. With the copy
+  # accelerator's stubs as `memcpy`, `memmove` and `memset`, and the runtime's own
+  # `memcmp`, it reaches only the library `memmove` of a build with syscalls'
+  # `fast-memcpy` feature.
+  "--cfg", "feature=\"mem-unaligned\""
 ]
 
 [env]

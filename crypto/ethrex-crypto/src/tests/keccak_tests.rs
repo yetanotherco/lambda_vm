@@ -54,6 +54,20 @@ fn keccak_sponge_matches_trusted_permutation() {
 }
 
 #[test]
+fn keccak_sponge_every_length_to_three_blocks() {
+    // The final block is absorbed lane by lane, so every remainder length (whole
+    // lanes, a partial lane of 1..=7 bytes, the pad byte landing in either) is
+    // worth a case. A pattern with no short period, so a byte landing in the wrong
+    // position of its lane changes the hash.
+    let input: Vec<u8> = (0..3 * 136 + 2)
+        .map(|i: u32| (i.wrapping_mul(0x9E37_79B9) >> 24) as u8)
+        .collect();
+    for n in 0..=input.len() {
+        check_keccak(&input[..n]);
+    }
+}
+
+#[test]
 fn keccak_sponge_known_answer_vectors() {
     // Vectors from the Ethereum Yellow Paper / EIP-155. These use Keccak-256
     // (0x01 padding), NOT SHA3-256 (0x06 padding). Any sponge framing bug
@@ -75,4 +89,34 @@ fn keccak_sponge_known_answer_vectors() {
         b"The quick brown fox jumps over the lazy dog",
         "4d741b6f1eb29cb2a9b9911c82f56fa8d73b04959d3d9d222895df6c0b28aa15",
     );
+}
+
+#[test]
+fn keccak_alignment_lengths_and_permutation_counts() {
+    for len in (0usize..=410).chain([544, 545, 1024, 4095, 4096, 16384]) {
+        for alignment in 0..8 {
+            for pattern in 0..4 {
+                let data: Vec<u8> = (0..len + alignment)
+                    .map(|i| match pattern {
+                        0 => 0,
+                        1 => 255,
+                        2 => ((i as u32).wrapping_mul(0x9e3779b9) >> 24) as u8,
+                        _ => i as u8,
+                    })
+                    .collect();
+                let input = &data[alignment..];
+                let mut count = 0;
+                let got = keccak256_with_permute(input, |state| {
+                    count += 1;
+                    keccak::f1600(state);
+                });
+                assert_eq!(
+                    got,
+                    keccak_hash(input),
+                    "len={len}, alignment={alignment}, pattern={pattern}"
+                );
+                assert_eq!(count, len / 136 + 1);
+            }
+        }
+    }
 }

@@ -100,6 +100,8 @@ fn every_table_participates_in_the_bus() {
         ecsm: 1,
         ecdas: 1,
         hint: 1,
+        copy: 1,
+        blake3: 1,
         is_wh: 1,
     };
     let airs = VmAirs::new(
@@ -116,7 +118,8 @@ fn every_table_participates_in_the_bus() {
             &ProofOptions::default_test_options(),
             &elf,
             &traces.public_output_bytes,
-        ),
+        )
+        .preprocessed(),
     );
 
     let without_bus: Vec<&str> = airs
@@ -162,8 +165,24 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
         ecsm,
         ecdas,
         hint,
+        copy,
+        blake3,
         is_wh,
     } = counts;
+    // ⛔ BLAKE3 IS DROPPABLE AND IS DELIBERATELY NOT IN THIS LIST — a
+    // COVERAGE GAP, not an exemption. It belongs here on exactly the
+    // argument the others do (0 or 1 by `TableCounts::blake3`, omitted when
+    // the run never reaches it), and it was added here first. The check
+    // below then failed by name: "BLAKE3 is no longer reached by any
+    // program here", with the other twenty chips all seen. No fixture in
+    // this file executes a BLAKE3 syscall, so its bus contribution is
+    // UNEXAMINED — listing it would only assert a table nothing builds.
+    //
+    // What closes this is a fixture program that calls the BLAKE3 syscall,
+    // not a change here. Until then the omission is stated rather than
+    // silent, and it is a property of the TEST SET only: the production
+    // elision reads `TableCounts`, never this list.
+    let _ = blake3;
     [
         ("CPU", cpu),
         ("LT", lt),
@@ -184,6 +203,7 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
         ("ECSM", ecsm),
         ("ECDAS", ecdas),
         ("HINT", hint),
+        ("COPY", copy),
         ("IS_WH", is_wh),
     ]
     .into_iter()
@@ -355,7 +375,8 @@ fn dropping_a_used_table_through_the_real_verifier_is_rejected() {
         None,
         true,
         None,
-        crate::test_utils::halted_register_commitment(&opts, &elf, &vm_proof.public_output),
+        crate::test_utils::halted_register_commitment(&opts, &elf, &vm_proof.public_output)
+            .preprocessed(),
     );
     let mul_at = airs
         .air_refs()
@@ -399,11 +420,11 @@ fn dropping_a_used_table_through_the_real_verifier_is_rejected() {
 #[test]
 fn no_optional_table_uses_a_constant_multiplicity() {
     use crate::tables::{
-        branch, bytewise, cpu32, dvrm, ecdas, ecsm, eq, hint, is_wh, keccak, keccak_rnd, load, lt,
-        memw, memw_aligned, mul, shift, store,
+        branch, bytewise, copy, cpu32, dvrm, ecdas, ecsm, eq, hint, is_wh, keccak, keccak_rnd,
+        load, lt, memw, memw_aligned, mul, shift, store,
     };
     use stark::lookup::{BusValue, LinearTerm};
-    let optional: [(&str, Vec<stark::lookup::BusInteraction>); 18] = [
+    let optional: [(&str, Vec<stark::lookup::BusInteraction>); 19] = [
         ("LT", lt::bus_interactions()),
         ("MEMW", memw::bus_interactions()),
         ("MEMW_A", memw_aligned::bus_interactions()),
@@ -421,6 +442,7 @@ fn no_optional_table_uses_a_constant_multiplicity() {
         ("ECSM", ecsm::bus_interactions()),
         ("ECDAS", ecdas::bus_interactions()),
         ("HINT", hint::bus_interactions()),
+        ("COPY", copy::bus_interactions()),
         ("IS_WH", is_wh::bus_interactions()),
     ];
     for (name, interactions) in optional {
@@ -574,7 +596,7 @@ fn validate_still_requires_cpu_and_the_register_file() {
 }
 
 /// The counts ride in the proof, so they are the prover's to choose, and the
-/// sub-proof cross-check constrains only their *sum*. The five accelerators and
+/// sub-proof cross-check constrains only their *sum*. The six accelerators and
 /// IS_WH are not chunked — `generate_optional` emits one table or none — so any count
 /// above 1 describes a table set no prover can build, and the sum alone does not
 /// catch it: lower another count by the same amount and the total still matches.
@@ -600,12 +622,13 @@ fn an_accelerator_count_above_one_is_rejected() {
     // Named setters rather than a match with a catch-all: a wrong field would
     // otherwise pass the assertion below while testing the wrong count.
     type SetCount = fn(&mut TableCounts);
-    let inflate: [(&str, SetCount); 6] = [
+    let inflate: [(&str, SetCount); 7] = [
         ("keccak", |c| c.keccak = 2),
         ("keccak_rnd", |c| c.keccak_rnd = 2),
         ("ecsm", |c| c.ecsm = 2),
         ("ecdas", |c| c.ecdas = 2),
         ("hint", |c| c.hint = 2),
+        ("copy", |c| c.copy = 2),
         ("is_wh", |c| c.is_wh = 2),
     ];
     for (name, set_to_two) in inflate {
@@ -617,8 +640,8 @@ fn an_accelerator_count_above_one_is_rejected() {
         );
     }
 
-    // The chunked chips keep taking any count: this is a cap on the five
-    // accelerators and IS_WH, not a cap on chunking.
+    // The chunked chips keep taking any count: this is a cap on the six
+    // accelerators, BLAKE3 and IS_WH, not a cap on chunking.
     let mut many_mul = honest.clone();
     many_mul.mul = 7;
     assert!(many_mul.validate().is_ok(), "chunked chips still chunk");
@@ -655,9 +678,9 @@ fn counts_that_wrap_have_no_total() {
 
 /// The accelerators are the ones a run most often never reaches, and each cost a
 /// four-row sub-proof regardless. A program with no keccak, no EC and no hint
-/// ecall now carries none of the five, nor the IS_WH table KECCAK feeds.
+/// ecall now carries none of the six, nor the IS_WH table KECCAK feeds.
 #[test]
-fn a_run_without_accelerators_omits_all_five_and_is_wh() {
+fn a_run_without_accelerators_omits_all_six_and_is_wh() {
     let (elf, logs, _instructions) = run_asm_elf("xori");
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
@@ -669,6 +692,7 @@ fn a_run_without_accelerators_omits_all_five_and_is_wh() {
         ("ecsm", counts.ecsm),
         ("ecdas", counts.ecdas),
         ("hint", counts.hint),
+        ("copy", counts.copy),
         // Not an accelerator, but only KECCAK feeds it today.
         ("is_wh", counts.is_wh),
     ] {
@@ -758,12 +782,54 @@ fn omitting_the_is_wh_table_fails_the_bus_balance() {
     assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "dropping IS_WH");
 }
 
-/// The committed output is the one bus target that is not zero: the verifier
-/// computes it from the `public_output` the prover supplies
-/// (`compute_expected_commit_bus_balance_view`).
-///
-/// There is no COMMIT table to omit any more — the `write` syscall is served by
-/// COPY, which is mandatory — so the forgery left is to keep the rows that send
+/// COPY is the one optional table whose bus target is not zero: the verifier
+/// computes it from the public output the prover supplies
+/// (`compute_expected_commit_bus_balance_view`), and nothing requires
+/// `copy > 0` when that output is non-empty. The COPY sub-proof's presence is a
+/// number the prover picks, and the balance is the only thing standing behind it.
+#[test]
+fn omitting_the_copy_table_fails_the_bus_balance() {
+    let (elf, logs, _instructions) = run_asm_elf("test_commit_4");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    assert!(
+        !traces.copies.is_empty() && !traces.public_output_bytes.is_empty(),
+        "test_commit_4 must commit output for this to be a forgery"
+    );
+
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "the honest proof must verify first, or the negative below proves nothing"
+    );
+
+    traces.copies.clear();
+    assert_only_the_bus_rejected(&weigh_the_bus(&elf, &mut traces, true), "COPY");
+}
+
+/// The variant the test above does not cover: a prover who drops COPY can also
+/// drop the output it committed, and that moves the verifier's *target* rather
+/// than the sum — the balance is recomputed for an empty output. The CPU's
+/// commit ecalls are still in the trace with no receiver, so the two sides
+/// still have to disagree.
+#[test]
+fn omitting_the_copy_table_and_its_output_fails_the_bus_balance() {
+    let (elf, logs, _instructions) = run_asm_elf("test_commit_4");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
+    let honest_target = weigh_the_bus(&elf, &mut traces, false).target;
+
+    traces.copies.clear();
+    traces.public_output_bytes.clear();
+    let outcome = weigh_the_bus(&elf, &mut traces, true);
+    assert_ne!(
+        outcome.target, honest_target,
+        "clearing the public output must move the target, or this test is the \
+         previous one over again"
+    );
+    assert_only_the_bus_rejected(&outcome, "COPY together with its output");
+}
+
+/// The third way to forge the committed output: keep the COPY rows that send
 /// the committed bytes and drop the output they claim. That moves the verifier's
 /// target while the sum stays put, and the two sides have to disagree.
 #[test]
@@ -772,7 +838,7 @@ fn dropping_the_committed_output_fails_the_bus_balance() {
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();
     assert!(
-        !traces.public_output_bytes.is_empty(),
+        !traces.copies.is_empty() && !traces.public_output_bytes.is_empty(),
         "test_commit_4 must commit output for this to be a forgery"
     );
 

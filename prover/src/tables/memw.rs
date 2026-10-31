@@ -35,6 +35,7 @@ use stark::trace::TraceTable;
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
+use super::gpack::{TraceForm, WidthHint, generate_main};
 use super::types::{BusId, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::constraints::templates::emit_is_bit;
 
@@ -100,29 +101,58 @@ pub mod cols {
 // Trace generation
 // =========================================================================
 
-/// A single MEMW operation to be added to the trace.
+/// A single MEMW operation to be added to the trace. `#[repr(C)]`, its fields
+/// ordered so it stays 152 bytes: a chunk's ops are the records the card fills
+/// its MEMW table from ([`card_ops`]).
+#[repr(C)]
 #[derive(Debug, Clone)]
 pub struct MemwOperation {
-    /// Whether this is a register access (true) or memory access (false)
-    pub is_register: bool,
     /// Base address (64-bit)
     pub base_address: u64,
+    /// Timestamp of this access
+    pub timestamp: u64,
+    /// Previous timestamps at the addresses (filled by memory model).
+    pub old_timestamp: [u64; 8],
     /// Values to write. Each element is one memory byte (0-255) or, for register
     /// accesses, a 32-bit half of the register word — both fit in u32, so this is
     /// `[u32; 8]` rather than `[u64; 8]` to halve the struct's footprint (the walk
     /// materializes tens of millions of these; it is memory-bandwidth-bound).
     pub value: [u32; 8],
-    /// Timestamp of this access
-    pub timestamp: u64,
+    /// Previous values at the addresses (filled by memory model). Same element
+    /// domain as `value` (byte or 32-bit register half) → `[u32; 8]`.
+    pub old: [u32; 8],
+    /// Whether this is a register access (true) or memory access (false)
+    pub is_register: bool,
     /// Access width: 1, 2, 4, or 8 bytes
     pub width: u8,
     /// Whether this is a read (true) or write (false)
     pub is_read: bool,
-    /// Previous values at the addresses (filled by memory model). Same element
-    /// domain as `value` (byte or 32-bit register half) → `[u32; 8]`.
-    pub old: [u32; 8],
-    /// Previous timestamps at the addresses (filled by memory model).
-    pub old_timestamp: [u64; 8],
+}
+
+// The walk keeps one per unaligned access: keep it at 152 bytes.
+const _: () = assert!(std::mem::size_of::<MemwOperation>() == 152);
+
+/// MEMW ops as the card's MEMW fill reads them (`multilinear::records::MemwOp`):
+/// the same bytes.
+pub(crate) fn card_ops(ops: &[MemwOperation]) -> &[multilinear::records::MemwOp] {
+    use multilinear::records::MemwOp;
+    use std::mem::{align_of, offset_of, size_of};
+    const _: () = {
+        assert!(size_of::<MemwOperation>() == size_of::<MemwOp>());
+        assert!(align_of::<MemwOperation>() == align_of::<MemwOp>());
+        assert!(offset_of!(MemwOperation, base_address) == offset_of!(MemwOp, base_address));
+        assert!(offset_of!(MemwOperation, timestamp) == offset_of!(MemwOp, timestamp));
+        assert!(offset_of!(MemwOperation, old_timestamp) == offset_of!(MemwOp, old_timestamp));
+        assert!(offset_of!(MemwOperation, value) == offset_of!(MemwOp, value));
+        assert!(offset_of!(MemwOperation, old) == offset_of!(MemwOp, old));
+        assert!(offset_of!(MemwOperation, is_register) == offset_of!(MemwOp, is_register));
+        assert!(offset_of!(MemwOperation, width) == offset_of!(MemwOp, width));
+        assert!(offset_of!(MemwOperation, is_read) == offset_of!(MemwOp, is_read));
+    };
+    // SAFETY: both are `#[repr(C)]` with the same fields in the same order
+    // (asserted above); the flags are `bool`s, 0 or 1, read as `u8`s, and no
+    // reader looks at the padding after them.
+    unsafe { std::slice::from_raw_parts(ops.as_ptr() as *const MemwOp, ops.len()) }
 }
 
 impl MemwOperation {
@@ -177,60 +207,74 @@ impl MemwOperation {
 pub fn generate_memw_trace(
     operations: &[MemwOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let num_rows = operations.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+    generate_memw_trace_as(operations, TraceForm::Wide)
+}
 
-    for (row_idx, op) in operations.iter().enumerate() {
-        // Input columns
-        table.set_bool(row_idx, cols::IS_REGISTER, op.is_register);
+/// The widths MEMW traces needed so far in this process (`tables::gpack`).
+static WIDTHS: WidthHint = WidthHint::new();
 
-        // base_address as DWordWL (2 words)
-        let base_addr_lo = op.base_address & 0xFFFF_FFFF;
-        table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
+/// [`generate_memw_trace`] in `form` (`tables::gpack`).
+pub fn generate_memw_trace_as(
+    operations: &[MemwOperation],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    generate_memw_trace_segments_as(&[operations], form)
+}
 
-        // value[8]
-        for i in 0..8 {
-            table.set_u64(row_idx, cols::VALUE[i], op.value[i] as u64);
+/// [`generate_memw_trace_as`] over `segments`, the operations one after another: a
+/// chunk handed out as the window parts it lies in.
+pub(crate) fn generate_memw_trace_segments_as(
+    segments: &[&[MemwOperation]],
+    form: TraceForm,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let len: usize = segments.iter().map(|s| s.len()).sum();
+    let num_rows = len.next_power_of_two().max(4);
+    generate_main!(form, &WIDTHS, num_rows, cols::NUM_COLUMNS, |table| {
+        for (row_idx, op) in segments.iter().flat_map(|s| s.iter()).enumerate() {
+            // Input columns
+            table.set_bool(row_idx, cols::IS_REGISTER, op.is_register);
+
+            // base_address as DWordWL (2 words)
+            let base_addr_lo = op.base_address & 0xFFFF_FFFF;
+            table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
+
+            // value[8]
+            for i in 0..8 {
+                table.set_u64(row_idx, cols::VALUE[i], op.value[i] as u64);
+            }
+
+            // timestamp as DWordWL (2 words)
+            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+
+            // write flags
+            let (w2, w4, w8) = op.write_flags();
+            table.set_bool(row_idx, cols::WRITE2, w2);
+            table.set_bool(row_idx, cols::WRITE4, w4);
+            table.set_bool(row_idx, cols::WRITE8, w8);
+
+            // Output: old[8]
+            for i in 0..8 {
+                table.set_u64(row_idx, cols::OLD[i], op.old[i] as u64);
+            }
+
+            // Auxiliary: carry[7]
+            // carry[i] = 1 if (base_address_lo + i+1) >= 2^32
+            for i in 0..7 {
+                let overflows = base_addr_lo + (i as u64 + 1) >= (1u64 << 32);
+                table.set_bool(row_idx, cols::CARRY[i], overflows);
+            }
+
+            // Auxiliary: old_timestamp[8] - each as DWordWL (2 words)
+            for i in 0..8 {
+                let cols_i = cols::old_timestamp(i);
+                table.set_dword_wl(row_idx, cols_i[0], op.old_timestamp[i]);
+            }
+
+            // Multiplicity
+            table.set_bool(row_idx, cols::MU_READ, op.is_read);
+            table.set_bool(row_idx, cols::MU_WRITE, !op.is_read);
         }
-
-        // timestamp as DWordWL (2 words)
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
-
-        // write flags
-        let (w2, w4, w8) = op.write_flags();
-        table.set_bool(row_idx, cols::WRITE2, w2);
-        table.set_bool(row_idx, cols::WRITE4, w4);
-        table.set_bool(row_idx, cols::WRITE8, w8);
-
-        // Output: old[8]
-        for i in 0..8 {
-            table.set_u64(row_idx, cols::OLD[i], op.old[i] as u64);
-        }
-
-        // Auxiliary: carry[7]
-        // carry[i] = 1 if (base_address_lo + i+1) >= 2^32
-        for i in 0..7 {
-            let overflows = base_addr_lo + (i as u64 + 1) >= (1u64 << 32);
-            table.set_bool(row_idx, cols::CARRY[i], overflows);
-        }
-
-        // Auxiliary: old_timestamp[8] - each as DWordWL (2 words)
-        for i in 0..8 {
-            let cols_i = cols::old_timestamp(i);
-            table.set_dword_wl(row_idx, cols_i[0], op.old_timestamp[i]);
-        }
-
-        // Multiplicity
-        table.set_bool(row_idx, cols::MU_READ, op.is_read);
-        table.set_bool(row_idx, cols::MU_WRITE, !op.is_read);
-    }
-
-    trace
+    })
 }
 
 // =========================================================================

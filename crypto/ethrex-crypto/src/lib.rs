@@ -7,7 +7,8 @@
 //!
 //! Accelerated today:
 //! - `keccak256`: a sponge over the `keccak_permute` precompile (riscv64; on
-//!   host it falls back to software keccak for tests).
+//!   host it falls back to software keccak for tests), with a bounded cache of
+//!   repeated 20-, 32- and 64-byte inputs and the empty input (`keccak_cache`).
 //! - `secp256k1_ecrecover`: the ECDSA recovery's 2-term linear combination is
 //!   evaluated through the ECSM `ecsm_mul` precompile (riscv64), reconstructing
 //!   the full point from x-only queries; on host / degenerate inputs it falls
@@ -34,10 +35,11 @@ use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar, U256};
 
 // Used only by the x-only point reconstruction (riscv accelerated path + the
 // host unit tests); unused on a non-test host build.
-#[cfg(any(target_arch = "riscv64", test))]
 use k256::elliptic_curve::sec1::FromEncodedPoint;
-#[cfg(any(target_arch = "riscv64", test))]
 use k256::{EncodedPoint, FieldElement};
+
+mod fe;
+use fe::Fe;
 
 /// LambdaVM crypto provider — inject via `Arc::new(LambdaVmEcsmCrypto)`.
 #[derive(Debug)]
@@ -55,9 +57,10 @@ impl Crypto for LambdaVmEcsmCrypto {
     }
 
     fn keccak256(&self, input: &[u8]) -> [u8; 32] {
-        // riscv64 guest: sponge over the keccak_permute precompile.
+        // riscv64 guest: sponge over the keccak_permute precompile, behind a bounded
+        // cache of the short inputs the guest hashes repeatedly (`keccak_cache`).
         #[cfg(target_arch = "riscv64")]
-        return keccak256_via_lambdavm(input);
+        return KECCAK_CACHE.keccak256(input, keccak256_via_lambdavm);
         // host (tests / non-guest): software keccak — the precompile syscall
         // isn't available off-target.
         #[cfg(not(target_arch = "riscv64"))]
@@ -146,35 +149,52 @@ where
 /// non-residue regardless of the prover-chosen hint — the hint can only save work,
 /// never steer the accept/reject outcome. Off-target it uses the software
 /// decompress directly.
-fn decompress_r(r_bytes: &FieldBytes, y_is_odd: bool) -> Option<AffinePoint> {
+///
+/// Returns R's affine coordinates, which is what the recovery uses.
+fn decompress_r_xy(r_bytes: &FieldBytes, y_is_odd: bool) -> Option<(Fe, Fe)> {
     #[cfg(target_arch = "riscv64")]
     {
-        decompress_r_with_oracle(r_bytes, y_is_odd, |rhs_be| {
+        decompress_r_xy_with_oracle(r_bytes, y_is_odd, |rhs_be| {
             get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_SQRT, rhs_be)
         })
     }
     #[cfg(not(target_arch = "riscv64"))]
     {
         use k256::elliptic_curve::point::DecompressPoint;
-        AffinePoint::decompress(r_bytes, u8::from(y_is_odd).into()).into()
+        let r: Option<AffinePoint> =
+            AffinePoint::decompress(r_bytes, u8::from(y_is_odd).into()).into();
+        let (x, y) = affine_xy(&r?)?;
+        Some((Fe::from_k256(&x), Fe::from_k256(&y)))
     }
 }
 
-/// Core of [`decompress_r`], generic over the hint source for host tests: try the
-/// hinted sqrt, then fall back to the authoritative software decompress on any
-/// failure. See [`decompress_r`] for the rationale.
-#[cfg(any(target_arch = "riscv64", test))]
+/// [`decompress_r_xy_with_oracle`] as a curve point (the host tests' view).
+#[cfg(test)]
 fn decompress_r_with_oracle<O>(r_bytes: &FieldBytes, y_is_odd: bool, hint: O) -> Option<AffinePoint>
 where
     O: FnOnce(&[u8; 32]) -> [u8; 32],
 {
-    if let Some(p) = decompress_r_hinted(r_bytes, y_is_odd, hint) {
-        return Some(p);
+    let (x, y) = decompress_r_xy_with_oracle(r_bytes, y_is_odd, hint)?;
+    point_from_fe(x, y)
+}
+
+/// Core of [`decompress_r_xy`], generic over the hint source for host tests: try the
+/// hinted sqrt, then fall back to the authoritative software decompress on any
+/// failure. See [`decompress_r_xy`] for the rationale.
+#[cfg(any(target_arch = "riscv64", test))]
+fn decompress_r_xy_with_oracle<O>(r_bytes: &FieldBytes, y_is_odd: bool, hint: O) -> Option<(Fe, Fe)>
+where
+    O: FnOnce(&[u8; 32]) -> [u8; 32],
+{
+    if let Some(xy) = decompress_r_hinted_xy(r_bytes, y_is_odd, hint) {
+        return Some(xy);
     }
     // Hinted root absent / malformed / wrong, OR a genuine non-residue: the software
     // decompress is authoritative — `Some` for a residue, `None` for a non-residue.
     use k256::elliptic_curve::point::DecompressPoint;
-    AffinePoint::decompress(r_bytes, u8::from(y_is_odd).into()).into()
+    let r: Option<AffinePoint> = AffinePoint::decompress(r_bytes, u8::from(y_is_odd).into()).into();
+    let (x, y) = affine_xy(&r?)?;
+    Some((Fe::from_k256(&x), Fe::from_k256(&y)))
 }
 
 /// The hint-accelerated decompress attempt: returns the point only if the hinted
@@ -182,41 +202,24 @@ where
 /// the software decompress. Never the last word — a `None` here is not a decision
 /// that R is invalid, only that the fast path did not produce a verified root.
 #[cfg(any(target_arch = "riscv64", test))]
-fn decompress_r_hinted<O>(r_bytes: &FieldBytes, y_is_odd: bool, hint: O) -> Option<AffinePoint>
+fn decompress_r_hinted_xy<O>(r_bytes: &FieldBytes, y_is_odd: bool, hint: O) -> Option<(Fe, Fe)>
 where
     O: FnOnce(&[u8; 32]) -> [u8; 32],
 {
-    let x: FieldElement = Option::from(FieldElement::from_bytes(r_bytes))?;
-    // secp256k1: y² = x³ + 7.
-    let mut seven_bytes = [0u8; 32];
-    seven_bytes[31] = 7;
-    let seven: FieldElement = Option::from(FieldElement::from_bytes(&seven_bytes.into()))?;
-    let x3: FieldElement = x.square() * x;
-    let rhs: FieldElement = x3 + seven;
-    // Hinted sqrt (BE in/out), then verify y² == rhs canonically.
-    let rhs_be: [u8; 32] = rhs.to_bytes().into();
-    let y_be = hint(&rhs_be);
-    let mut y: FieldElement = Option::from(FieldElement::from_bytes(&y_be.into()))?;
-    let y2: FieldElement = y.square();
-    // Verify the untrusted root: y² must equal x³+7. Negate `y2`, not `rhs`:
-    // `Neg` is `negate(1)`, whose debug assert requires magnitude <= 1. `square()`
-    // always returns magnitude 1, whereas `rhs` is a sum carrying magnitude 2, so
-    // negating it would trip that assert and panic in debug builds. (The value would
-    // still come out right — `negate(m)` computes `2*(m+1)*P_limb - self`, which for a
-    // magnitude-2 operand stays non-negative — so this is a build-configuration
-    // hazard, not a wrong answer.)
-    // (`ct_eq` is unusable here for the same reason as in `field_inv`.)
-    if !bool::from((rhs + y2.negate(1)).normalizes_to_zero()) {
+    // r ≥ p is no field element (k256's `from_bytes` rule).
+    let x = Fe::from_be_bytes(&(*r_bytes).into())?;
+    // secp256k1: y² = x³ + 7. Hinted sqrt (canonical big-endian in and out).
+    let rhs = x.square() * x + Fe::SEVEN;
+    let y_be = hint(&rhs.to_be_bytes());
+    let y = Fe::from_be_bytes(&y_be)?;
+    // Verify the untrusted root.
+    if !y.square().same(rhs) {
         return None;
     }
-    // Select the root whose canonical LSB matches the requested parity.
-    let y_odd = (y.to_bytes()[31] & 1) == 1;
-    if y_odd != y_is_odd {
-        y = -y;
-    }
-    // Build the affine point; `from_encoded_point` re-checks it's on-curve.
-    let ep = EncodedPoint::from_affine_coordinates(&x.to_bytes(), &y.to_bytes(), false);
-    Option::from(AffinePoint::from_encoded_point(&ep))
+    // Select the root whose canonical low bit matches the requested parity.
+    let y = if y.is_odd() != y_is_odd { -y } else { y };
+    // `y² == x³+7` was verified above, so `(x, y)` is R; no curve-point round trip.
+    Some((x, y))
 }
 
 /// Recover the uncompressed public key bytes (X‖Y, 64 bytes) from a 64-byte
@@ -230,13 +233,32 @@ where
 ///
 /// Mirrors the pure-Rust recovery in the `Crypto` trait default
 /// (`pk = r⁻¹·(s·R − z·G)`), but evaluates the 2-term linear combination
-/// `lincomb(G, u1, R, u2)` through the ECSM accelerator via [`ecsm_lincomb2`],
+/// `lincomb(G, u1, R, u2)` through the ECSM accelerator via [`ecsm_lincomb2_xy`],
 /// falling back to the software `ProjectivePoint::lincomb` whenever the
 /// accelerated path declines (degenerate scalars/points, or non-riscv builds).
 /// We compute the recovery directly rather than calling k256's
 /// `recover_from_prehash`, which internally runs a *second* lincomb to
 /// re-verify the key — doubling the ECSM ecalls for no gain here.
 fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64], CryptoError> {
+    ecrecover_with(sig, recid, msg, decompress_r_xy, ecsm_lincomb2_xy)
+}
+
+/// [`ecsm_ecrecover`], generic over how R is decompressed and how the linear
+/// combination is evaluated, so the host tests can run the accelerated shape with
+/// software oracles. Both work on affine coordinates in the four-limb field type
+/// ([`Fe`]), which avoids converting points to and from their SEC1 encoding at
+/// every step.
+fn ecrecover_with<D, L>(
+    sig: &[u8; 64],
+    recid: u8,
+    msg: &[u8; 32],
+    decompress: D,
+    lincomb: L,
+) -> Result<[u8; 64], CryptoError>
+where
+    D: FnOnce(&FieldBytes, bool) -> Option<(Fe, Fe)>,
+    L: FnOnce(&Fe, &Fe, &Scalar, &Fe, &Fe, &Scalar) -> Option<(Fe, Fe)>,
+{
     let r_bytes = <&FieldBytes>::from(&sig[..32]);
     let s_bytes = <&FieldBytes>::from(&sig[32..]);
 
@@ -255,11 +277,9 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64],
     // precompile; we don't handle it (decompression simply fails), matching the
     // trait default.
     let y_is_odd = (recid & 1) != 0;
-    let r_point: Option<AffinePoint> = decompress_r(r_bytes, y_is_odd);
-    let Some(r_point) = r_point else {
+    let Some((rx, ry)) = decompress(r_bytes, y_is_odd) else {
         return Err(CryptoError::RecoveryFailed);
     };
-    let r_proj = ProjectivePoint::from(r_point);
 
     let z = <Scalar as Reduce<U256>>::reduce_bytes(&FieldBytes::from(*msg));
     let r_inv: Option<Scalar> = scalar_inv(&r);
@@ -269,15 +289,28 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64],
     let u1 = -(r_inv * z);
     let u2 = r_inv * s;
 
-    // pk = u1·G + u2·R, accelerated via ECSM with a software fallback.
-    // The ECSM path takes affine inputs and returns the affine result directly:
-    // its inputs (G, R) and output are Z=1 points, so passing affines avoids the
-    // wasteful projective→affine inversions (`to_affine` of a Z=1 point still runs
-    // a full constant-time field inversion in k256). The rare software fallback
-    // still converts via `to_affine`.
-    let g = ProjectivePoint::GENERATOR;
-    let pk_affine = ecsm_lincomb2(&AffinePoint::GENERATOR, &u1, &r_point, &u2)
-        .unwrap_or_else(|| ProjectivePoint::lincomb(&g, &u1, &r_proj, &u2).to_affine());
+    // pk = u1·G + u2·R, accelerated via ECSM with a software fallback. The
+    // accelerated path takes and returns affine coordinates (G's are fixed, R's
+    // come from the decompression); a result it returns has been checked to be on
+    // the curve, and an affine point is never the identity.
+    if let Some((xq, yq)) = lincomb(&GENERATOR_X, &GENERATOR_Y, &u1, &rx, &ry, &u2) {
+        let mut pk_bytes = [0u8; 64];
+        pk_bytes[..32].copy_from_slice(&xq.to_be_bytes());
+        pk_bytes[32..].copy_from_slice(&yq.to_be_bytes());
+        return Ok(pk_bytes);
+    }
+
+    // Rare software fallback (degenerate scalars or points, or off-target).
+    let Some(r_point) = point_from_fe(rx, ry) else {
+        return Err(CryptoError::RecoveryFailed);
+    };
+    let pk_affine = ProjectivePoint::lincomb(
+        &ProjectivePoint::GENERATOR,
+        &u1,
+        &ProjectivePoint::from(r_point),
+        &u2,
+    )
+    .to_affine();
     if bool::from(pk_affine.is_identity()) {
         return Err(CryptoError::RecoveryFailed);
     }
@@ -289,53 +322,78 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64],
     Ok(pk_bytes)
 }
 
+/// The generator's affine x (SEC 2), as four little-endian limbs.
+const GENERATOR_X: Fe = Fe::from_limbs([
+    0x59F2_815B_16F8_1798,
+    0x029B_FCDB_2DCE_28D9,
+    0x55A0_6295_CE87_0B07,
+    0x79BE_667E_F9DC_BBAC,
+]);
+
+/// The generator's affine y (SEC 2), as four little-endian limbs.
+const GENERATOR_Y: Fe = Fe::from_limbs([
+    0x9C47_D08F_FB10_D4B8,
+    0xFD17_B448_A685_5419,
+    0x5DA4_FBFC_0E11_08A8,
+    0x483A_DA77_26A3_C465,
+]);
+
 /// ECSM-accelerated 2-term linear combination `k1·P1 + k2·P2`.
 ///
 /// On riscv64 this reconstructs the full affine result from four x-only ECSM
-/// queries (see [`lincomb2_with_oracle`]); on other targets, and whenever a
+/// queries (see [`lincomb2_xy_with_oracle`]); on other targets, and whenever a
 /// guard trips (degenerate input or oracle inconsistency), it returns `None`
 /// so the caller uses the pure-Rust `ProjectivePoint::lincomb`.
 #[cfg(target_arch = "riscv64")]
-fn ecsm_lincomb2(
-    a1: &AffinePoint,
+fn ecsm_lincomb2_xy(
+    x1: &Fe,
+    y1: &Fe,
     k1: &Scalar,
-    a2: &AffinePoint,
+    x2: &Fe,
+    y2: &Fe,
     k2: &Scalar,
-) -> Option<AffinePoint> {
-    lincomb2_with_oracle(a1, k1, a2, k2, ecsm_oracle)
+) -> Option<(Fe, Fe)> {
+    lincomb2_xy_with_oracle(x1, y1, k1, x2, y2, k2, ecsm_oracle)
 }
 
 #[cfg(not(target_arch = "riscv64"))]
-fn ecsm_lincomb2(
-    _a1: &AffinePoint,
+fn ecsm_lincomb2_xy(
+    _x1: &Fe,
+    _y1: &Fe,
     _k1: &Scalar,
-    _a2: &AffinePoint,
+    _x2: &Fe,
+    _y2: &Fe,
     _k2: &Scalar,
-) -> Option<AffinePoint> {
+) -> Option<(Fe, Fe)> {
     None
 }
 
 /// x-only scalar-mul oracle backed by the ECSM precompile: computes `x(k·P)`
-/// for the curve point P whose x-coordinate is passed in. `x` must be the
-/// x-coordinate of a curve point and `k` in `(0, N)` (N = curve order) —
-/// guaranteed by the guards in [`lincomb2_with_oracle`]. Values cross the ABI
-/// as 32-byte little-endian; `x_le` and `k_le` are distinct stack arrays so
-/// the executor's `|addr_x_le − addr_k_le| ≥ 32` assumption holds by
-/// construction.
+/// for the curve point P whose x-coordinate is passed in, as 32 little-endian
+/// bytes. `x` must be the x-coordinate of a curve point and `k` in `(0, N)`
+/// (N = curve order) — guaranteed by the guards in [`lincomb2_xy_with_oracle`].
+/// Values cross the ABI as 32-byte little-endian, the limb order of [`Fe`];
+/// `x_le` (the caller's) and `k_le` (this function's) are distinct 32-byte
+/// arrays, so the executor's `|addr_x_le − addr_k_le| ≥ 32` assumption holds by
+/// construction. A result of p or more is rejected (`None`), as k256's
+/// `from_bytes` did.
 #[cfg(target_arch = "riscv64")]
-fn ecsm_oracle(x: &FieldElement, k: &Scalar) -> Option<FieldElement> {
-    let x_be = x.to_bytes();
-    let k_be = k.to_bytes();
-    let mut x_le = [0u8; 32];
-    let mut k_le = [0u8; 32];
-    for i in 0..32 {
-        x_le[i] = x_be[31 - i];
-        k_le[i] = k_be[31 - i];
-    }
+fn ecsm_oracle(x_le: &[u8; 32], k: &Scalar) -> Option<Fe> {
+    let k_le = scalar_le(k);
     let mut xr_le = [0u8; 32];
-    lambda_vm_syscalls::syscalls::ecsm_mul(&mut xr_le, &x_le, &k_le);
-    xr_le.reverse();
-    Option::from(FieldElement::from_bytes(&xr_le.into()))
+    lambda_vm_syscalls::syscalls::ecsm_mul(&mut xr_le, x_le, &k_le);
+    Fe::from_le_bytes(&xr_le)
+}
+
+/// `k` as 32 little-endian bytes: its canonical value's limbs, low limb first.
+#[cfg(any(target_arch = "riscv64", test))]
+fn scalar_le(k: &Scalar) -> [u8; 32] {
+    const { assert!(core::mem::size_of::<k256::elliptic_curve::bigint::Word>() == 8) };
+    let mut out = [0u8; 32];
+    for (dst, word) in out.chunks_exact_mut(8).zip(U256::from(k).to_words()) {
+        dst.copy_from_slice(&word.to_le_bytes());
+    }
+    out
 }
 
 /// Base-field inverse `x⁻¹ mod p`.
@@ -347,7 +405,7 @@ fn ecsm_oracle(x: &FieldElement, k: &Scalar) -> Option<FieldElement> {
 /// in software directly. Returns `None` only for a genuinely non-invertible input
 /// (`x = 0`), which the callers' degeneracy guards already exclude.
 #[cfg(any(target_arch = "riscv64", test))]
-fn field_inv(x: &FieldElement) -> Option<FieldElement> {
+fn field_inv(x: &Fe) -> Option<Fe> {
     #[cfg(target_arch = "riscv64")]
     {
         field_inv_with_oracle(x, |x_be| {
@@ -356,39 +414,84 @@ fn field_inv(x: &FieldElement) -> Option<FieldElement> {
     }
     #[cfg(not(target_arch = "riscv64"))]
     {
-        Option::from(x.invert())
+        software_field_inv(x)
     }
+}
+
+/// `x⁻¹` by k256's software inversion; `None` for zero.
+#[cfg(any(target_arch = "riscv64", test))]
+fn software_field_inv(x: &Fe) -> Option<Fe> {
+    let inv: Option<FieldElement> = x.to_k256()?.invert().into();
+    Some(Fe::from_k256(&inv?))
 }
 
 /// Core of [`field_inv`], generic over the hint source so host tests can inject an
 /// honest or a lying oracle and assert the software fallback keeps the result
 /// correct either way. See [`scalar_inv`] for the verify-then-fallback rationale.
 #[cfg(any(target_arch = "riscv64", test))]
-fn field_inv_with_oracle<O>(x: &FieldElement, hint: O) -> Option<FieldElement>
+fn field_inv_with_oracle<O>(x: &Fe, hint: O) -> Option<Fe>
 where
     O: FnOnce(&[u8; 32]) -> [u8; 32],
 {
-    let x_be: [u8; 32] = x.to_bytes().into();
-    let inv_be = hint(&x_be);
+    let inv_be = hint(&x.to_be_bytes());
     // Fast path: a canonical hint that verifies (x·inv == 1 mod p) is used as-is.
-    // Verify by asking whether the difference normalizes to zero — a value-level test
-    // that skips the two full normalizations a `to_bytes()` compare pays. `ct_eq` is
-    // NOT a substitute: k256's FieldElement compares raw limbs *and* the magnitude and
-    // `normalized` tags, so a `mul` result (magnitude 1, unnormalized) never compares
-    // equal to the normalized `ONE` constant whatever its value.
-    // `Neg` is `negate(1)`, valid here because `mul` yields magnitude 1.
-    if let Some(inv) = Option::<FieldElement>::from(FieldElement::from_bytes(&inv_be.into())) {
-        if bool::from((*x * inv - FieldElement::ONE).normalizes_to_zero()) {
+    if let Some(inv) = Fe::from_be_bytes(&inv_be) {
+        if (*x * inv).same(Fe::ONE) {
             return Some(inv);
         }
     }
     // Hint absent / malformed / wrong: recompute authoritatively. `None` only for a
     // genuine `x = 0`, excluded by the callers' guards.
-    Option::from(x.invert())
+    software_field_inv(x)
+}
+
+/// `k1·P1 + k2·P2` on curve points (the host tests' view of
+/// [`lincomb2_xy_with_oracle`]), with an oracle on k256 field elements.
+#[cfg(test)]
+fn lincomb2_with_oracle<O>(
+    a1: &AffinePoint,
+    k1: &Scalar,
+    a2: &AffinePoint,
+    k2: &Scalar,
+    oracle: O,
+) -> Option<AffinePoint>
+where
+    O: Fn(&FieldElement, &Scalar) -> Option<FieldElement>,
+{
+    if bool::from(a1.is_identity()) || bool::from(a2.is_identity()) {
+        return None;
+    }
+    let (x1, y1) = affine_xy(a1)?;
+    let (x2, y2) = affine_xy(a2)?;
+    let (xq, yq) = lincomb2_xy_with_oracle(
+        &Fe::from_k256(&x1),
+        &Fe::from_k256(&y1),
+        k1,
+        &Fe::from_k256(&x2),
+        &Fe::from_k256(&y2),
+        k2,
+        le_oracle(oracle),
+    )?;
+    point_from_fe(xq, yq)
+}
+
+/// An oracle on k256 field elements as one on the precompile's little-endian x.
+#[cfg(test)]
+fn le_oracle<O>(oracle: O) -> impl Fn(&[u8; 32], &Scalar) -> Option<Fe>
+where
+    O: Fn(&FieldElement, &Scalar) -> Option<FieldElement>,
+{
+    move |x_le, k| {
+        let x = Fe::from_le_bytes(x_le)?.to_k256()?;
+        Some(Fe::from_k256(&oracle(&x, k)?))
+    }
 }
 
 /// Computes `k1·P1 + k2·P2` from four x-only oracle queries, or `None` if any
-/// degenerate-configuration guard trips.
+/// degenerate-configuration guard trips. `(x1, y1)` and `(x2, y2)` are the affine
+/// coordinates of two non-identity curve points; the oracle takes a point's x as 32
+/// little-endian bytes, the precompile's encoding, converted once per point. The
+/// result has been checked to be on the curve.
 ///
 /// The lambda-vm ECSM precompile returns only `x(k·P)`. For `A = k1·P1` with
 /// `P1 = (xp, yp)` fully known, query `xa = x(k1·P1)` and `xc = x((k1+1)·P1)`.
@@ -402,37 +505,34 @@ where
 ///
 /// Generic over the oracle so unit tests can substitute a software stand-in.
 #[cfg(any(target_arch = "riscv64", test))]
-fn lincomb2_with_oracle<O>(
-    a1: &AffinePoint,
+fn lincomb2_xy_with_oracle<O>(
+    x1: &Fe,
+    y1: &Fe,
     k1: &Scalar,
-    a2: &AffinePoint,
+    x2: &Fe,
+    y2: &Fe,
     k2: &Scalar,
     oracle: O,
-) -> Option<AffinePoint>
+) -> Option<(Fe, Fe)>
 where
-    O: Fn(&FieldElement, &Scalar) -> Option<FieldElement>,
+    O: Fn(&[u8; 32], &Scalar) -> Option<Fe>,
 {
-    // Inputs are affine already (the ecrecover path lifts them from known Z=1
-    // points), so no projective→affine inversion is needed here.
-    if bool::from(a1.is_identity()) || bool::from(a2.is_identity()) {
-        return None;
-    }
     if scalar_near_edge(k1) || scalar_near_edge(k2) {
         return None;
     }
+    let (x1, y1, x2, y2) = (*x1, *y1, *x2, *y2);
+    let x1_le = x1.to_le_bytes();
+    let x2_le = x2.to_le_bytes();
 
-    let (x1, y1) = affine_xy(a1)?;
-    let (x2, y2) = affine_xy(a2)?;
+    let xa = oracle(&x1_le, k1)?;
+    let xc1 = oracle(&x1_le, &(*k1 + Scalar::ONE))?;
+    let xb = oracle(&x2_le, k2)?;
+    let xc2 = oracle(&x2_le, &(*k2 + Scalar::ONE))?;
 
-    let xa = oracle(&x1, k1)?;
-    let xc1 = oracle(&x1, &(*k1 + Scalar::ONE))?;
-    let xb = oracle(&x2, k2)?;
-    let xc2 = oracle(&x2, &(*k2 + Scalar::ONE))?;
-
-    let dx1 = (xa - x1).normalize();
-    let dx2 = (xb - x2).normalize();
-    let dxq = (xb - xa).normalize();
-    if bool::from(dx1.is_zero()) || bool::from(dx2.is_zero()) || bool::from(dxq.is_zero()) {
+    let dx1 = xa - x1;
+    let dx2 = xb - x2;
+    let dxq = xb - xa;
+    if dx1.is_zero() || dx2.is_zero() || dxq.is_zero() {
         return None;
     }
 
@@ -449,36 +549,40 @@ where
 
     // Q = A + B, with A ≠ ±B ensured by dxq ≠ 0.
     let lq = (yb - ya) * inv_dxq;
-    let xq = (lq.square() - xa - xb).normalize();
-    let yq = (lq * (xa - xq) - ya).normalize();
+    let xq = lq.square() - xa - xb;
+    let yq = lq * (xa - xq) - ya;
 
-    // `point_from_xy` checks the result is on the curve as a cheap backstop:
+    // The result is checked to be on the curve (`y² == x³+7`) as a cheap backstop:
     // it rejects gross off-curve garbage and falls back to software, but
     // correctness rests on the algebra above — an on-curve-but-wrong point
     // would still pass this check.
-    point_from_xy(&xq, &yq)
-}
-
-/// Recovers `y(k·P)` from `xa = x(k·P)` and `xc = x((k+1)·P)`.
-/// Returns `None` if `xc` is inconsistent with the computed `lambda`
-/// (oracle misbehavior); degeneracy guards are in [`lincomb2_with_oracle`].
-#[cfg(any(target_arch = "riscv64", test))]
-fn solve_y(
-    xp: &FieldElement,
-    yp: &FieldElement,
-    xa: &FieldElement,
-    xc: &FieldElement,
-    dx: &FieldElement,
-    inv_den: &FieldElement,
-) -> Option<FieldElement> {
-    let t = *xc + xa + xp;
-    let xa3 = xa.square() * xa;
-    let xp3 = xp.square() * xp;
-    let lambda = (xa3 - xp3 - t * dx.square()) * inv_den;
-    if lambda.square().normalize() != t.normalize() {
+    if !is_on_curve(&xq, &yq) {
         return None;
     }
-    Some((*yp + lambda * dx).normalize())
+    Some((xq, yq))
+}
+
+/// `y² == x³ + 7`.
+#[cfg(any(target_arch = "riscv64", test))]
+fn is_on_curve(x: &Fe, y: &Fe) -> bool {
+    (x.square() * *x + Fe::SEVEN).same(y.square())
+}
+
+/// Recovers `y(k·P)` from `xa = x(k·P)` and `xc = x((k+1)·P)`, for a curve point
+/// `P = (xp, yp)`.
+/// Returns `None` if `xc` is inconsistent with the computed `lambda`
+/// (oracle misbehavior); degeneracy guards are in [`lincomb2_xy_with_oracle`].
+#[cfg(any(target_arch = "riscv64", test))]
+fn solve_y(xp: &Fe, yp: &Fe, xa: &Fe, xc: &Fe, dx: &Fe, inv_den: &Fe) -> Option<Fe> {
+    let t = *xc + *xa + *xp;
+    let xa3 = xa.square() * *xa;
+    // `xa³ − xp³ − t·dx²`, with `xp³ = yp² − 7` since P is on the curve: one squaring
+    // instead of a squaring and a product.
+    let lambda = (xa3 + Fe::SEVEN - yp.square() - t * dx.square()) * *inv_den;
+    if !lambda.square().same(t) {
+        return None;
+    }
+    Some(*yp + lambda * *dx)
 }
 
 /// `k ∈ {0, 1, n−1}`: fast early-exit before oracle calls.
@@ -493,7 +597,6 @@ fn scalar_near_edge(k: &Scalar) -> bool {
 
 /// Affine `(x, y)` of a non-identity point as field elements, via its SEC1
 /// uncompressed encoding (k256 keeps `AffinePoint`'s coordinate fields private).
-#[cfg(any(target_arch = "riscv64", test))]
 fn affine_xy(p: &AffinePoint) -> Option<(FieldElement, FieldElement)> {
     let ep = p.to_encoded_point(false);
     let x = Option::<FieldElement>::from(FieldElement::from_bytes(ep.x()?))?;
@@ -503,13 +606,29 @@ fn affine_xy(p: &AffinePoint) -> Option<(FieldElement, FieldElement)> {
 
 /// Builds an affine curve point from coordinates, returning `None` if the point
 /// is not on the curve (`AffinePoint::from_encoded_point` validates this).
-#[cfg(any(target_arch = "riscv64", test))]
+#[cfg(test)]
 fn point_from_xy(x: &FieldElement, y: &FieldElement) -> Option<AffinePoint> {
     let ep = EncodedPoint::from_affine_coordinates(&x.to_bytes(), &y.to_bytes(), false);
     Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&ep))
 }
 
+/// [`point_from_xy`] for coordinates in the four-limb field type.
+fn point_from_fe(x: Fe, y: Fe) -> Option<AffinePoint> {
+    let ep = EncodedPoint::from_affine_coordinates(
+        &x.to_be_bytes().into(),
+        &y.to_be_bytes().into(),
+        false,
+    );
+    Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&ep))
+}
+
 // ── Keccak-256 over the keccak_permute precompile (riscv64 guest) ───────────
+
+#[cfg(any(target_arch = "riscv64", test))]
+mod keccak_cache;
+
+#[cfg(target_arch = "riscv64")]
+static KECCAK_CACHE: keccak_cache::GuestCache = keccak_cache::GuestCache::new();
 
 /// Keccak-256 sponge with an injected permutation function.
 ///
@@ -524,23 +643,80 @@ fn point_from_xy(x: &FieldElement, y: &FieldElement) -> Option<AffinePoint> {
 fn keccak256_with_permute<F: FnMut(&mut [u64; 25])>(input: &[u8], mut permute: F) -> [u8; 32] {
     const RATE: usize = 136;
 
-    let mut state = [0u64; 25];
-    let mut offset = 0;
-
-    while input.len() - offset >= RATE {
-        absorb_block(&mut state, &input[offset..offset + RATE]);
+    let mut state;
+    if cfg!(target_endian = "little") && input.len() < RATE {
+        state = [0u64; 25];
+        // SAFETY: the local state is initialized, writable, and disjoint from
+        // input. Its 200-byte allocation exceeds this <136-byte copy. On LE
+        // hosts these bytes are exactly Keccak's little-endian lane encoding.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                input.as_ptr(),
+                state.as_mut_ptr().cast::<u8>(),
+                input.len(),
+            );
+        }
+        state[input.len() / 8] |= 1u64 << (8 * (input.len() % 8));
+        state[RATE / 8 - 1] |= 0x80u64 << 56;
         permute(&mut state);
-        offset += RATE;
-    }
+    } else {
+        let rest = if let Some((first, rest)) = input.split_at_checked(RATE) {
+            // The first block absorbed into the zero state is the block itself: its
+            // lanes are written straight into the state, with the capacity lanes
+            // zero, instead of zeroing 200 bytes and then XORing the block in.
+            state = core::array::from_fn(|i| {
+                if i < RATE / 8 {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(&first[8 * i..8 * i + 8]);
+                    u64::from_le_bytes(buf)
+                } else {
+                    0
+                }
+            });
+            permute(&mut state);
+            rest
+        } else {
+            state = [0u64; 25];
+            input
+        };
+        let mut blocks = rest.chunks_exact(RATE);
+        for block in &mut blocks {
+            absorb_block(&mut state, block);
+            permute(&mut state);
+        }
 
-    // Final block with multi-rate padding.
-    let mut last = [0u8; RATE];
-    let remaining = input.len() - offset;
-    last[..remaining].copy_from_slice(&input[offset..]);
-    last[remaining] ^= 0x01;
-    last[RATE - 1] ^= 0x80;
-    absorb_block(&mut state, &last);
-    permute(&mut state);
+        // Final block with multi-rate padding, absorbed straight into the lanes: the
+        // remainder's whole lanes from the input, its last 0..=7 bytes and the 0x01 pad
+        // byte assembled into one lane, then the 0x80 pad bit on byte RATE - 1. The same
+        // XORs as padding a zeroed RATE-byte copy of the remainder, without the copy:
+        // this runs once per hash, and the guest hashes every trie node.
+        let mut lanes = blocks.remainder().chunks_exact(8);
+        let mut lane = 0;
+        for chunk in &mut lanes {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(chunk);
+            state[lane] ^= u64::from_le_bytes(buf);
+            lane += 1;
+        }
+        let tail = lanes.remainder();
+        let mut last = 0x01u64 << (8 * tail.len());
+        if !tail.is_empty() && input.len() >= 8 {
+            // The input's last eight bytes end with the tail: load them as one lane and
+            // shift out the bytes before the tail, instead of assembling the tail a byte
+            // at a time. (On a little-endian target this path only sees inputs of a
+            // full block or more.)
+            let mut word = [0u8; 8];
+            word.copy_from_slice(&input[input.len() - 8..]);
+            last |= u64::from_le_bytes(word) >> (64 - 8 * tail.len());
+        } else {
+            for (i, byte) in tail.iter().enumerate() {
+                last |= u64::from(*byte) << (8 * i);
+            }
+        }
+        state[lane] ^= last;
+        state[RATE / 8 - 1] ^= 0x80u64 << 56;
+        permute(&mut state);
+    }
 
     // Squeeze the first 32 bytes (four lanes) as little-endian.
     let mut output = [0u8; 32];

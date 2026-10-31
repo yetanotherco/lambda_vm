@@ -6,21 +6,32 @@
 //! preprocessed timestamp layout (`timestamp_bases`, `validate_heights`).
 
 use crate::tables::cpu::{
-    CPU_PADDING_PC, CpuOperation, MAX_CPU_ROWS, cols, final_pc_timestamp, generate_cpu_trace,
-    table_heights, timestamp_bases, validate_heights,
+    CPU_PADDING_PC, CpuOp, CpuOperation, MAX_CPU_ROWS, MAX_TABLE_ROWS, cols, final_pc_timestamp,
+    generate_cpu_trace, table_heights, timestamp_bases, validate_heights,
 };
+use crate::tables::decode::DecodeTable;
 use crate::tables::max_rows;
 use crate::tables::types::DecodeEntry;
 
 use executor::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
+    memory::U64HashMap,
 };
 
 const PC: u64 = 0x1000;
 
+/// A CPU op and the decode it is read with.
+struct Held(DecodeEntry, CpuOperation);
+
+impl Held {
+    fn op(&self) -> CpuOp<'_> {
+        CpuOp::new(&self.0, &self.1)
+    }
+}
+
 /// Build a CpuOperation from an instruction + register values.
-fn op_of(instr: Instruction, src1: u64, src2: u64, dst: u64, next_pc: u64) -> CpuOperation {
+fn op_of(instr: Instruction, src1: u64, src2: u64, dst: u64, next_pc: u64) -> Held {
     let decode = DecodeEntry::from_instruction(PC, instr, 4);
     let log = Log {
         current_pc: PC,
@@ -29,7 +40,8 @@ fn op_of(instr: Instruction, src1: u64, src2: u64, dst: u64, next_pc: u64) -> Cp
         src2_val: src2,
         dst_val: dst,
     };
-    CpuOperation::from_log(&log, 4, decode)
+    let op = CpuOperation::from_log(&log, 4, &decode, 0);
+    Held(decode, op)
 }
 
 // =========================================================================
@@ -38,7 +50,7 @@ fn op_of(instr: Instruction, src1: u64, src2: u64, dst: u64, next_pc: u64) -> Cp
 
 #[test]
 fn test_from_log_add_reg_reg() {
-    let op = op_of(
+    let held = op_of(
         Instruction::Arith {
             dst: 3,
             src1: 1,
@@ -50,18 +62,19 @@ fn test_from_log_add_reg_reg() {
         30,
         PC + 4,
     );
+    let op = held.op();
     assert_eq!(op.rv1, 10);
     assert_eq!(op.rv2, 20);
-    assert_eq!(op.arg2, 20, "reg-reg: arg2 = rv2 (imm = 0)");
+    assert_eq!(op.arg2(), 20, "reg-reg: arg2 = rv2 (imm = 0)");
     assert_eq!(op.res, 30, "res = rv1 + arg2");
     assert_eq!(op.rvd, 30, "rvd = res (not memory)");
     assert_eq!(op.next_pc, PC + 4);
-    assert!(!op.branch_cond);
+    assert!(!op.branch_cond());
 }
 
 #[test]
 fn test_from_log_addi() {
-    let op = op_of(
+    let held = op_of(
         Instruction::ArithImm {
             dst: 3,
             src: 1,
@@ -73,14 +86,15 @@ fn test_from_log_addi() {
         15,
         PC + 4,
     );
-    assert_eq!(op.arg2, 5, "reg-imm: arg2 = imm (rv2 = 0)");
+    let op = held.op();
+    assert_eq!(op.arg2(), 5, "reg-imm: arg2 = imm (rv2 = 0)");
     assert_eq!(op.res, 15);
     assert_eq!(op.rvd, 15);
 }
 
 #[test]
 fn test_from_log_sub() {
-    let op = op_of(
+    let held = op_of(
         Instruction::Arith {
             dst: 3,
             src1: 1,
@@ -92,13 +106,14 @@ fn test_from_log_sub() {
         10,
         PC + 4,
     );
+    let op = held.op();
     assert_eq!(op.res, 10, "res = rv1 - arg2");
     assert_eq!(op.rvd, 10);
 }
 
 #[test]
 fn test_from_log_beq_taken() {
-    let op = op_of(
+    let held = op_of(
         Instruction::Branch {
             src1: 1,
             src2: 2,
@@ -110,15 +125,16 @@ fn test_from_log_beq_taken() {
         0,
         PC + 8,
     );
-    assert!(op.branch_cond, "BEQ with equal operands is taken");
-    assert_eq!(op.arg2, 5, "conditional branch: arg2 = rv2");
+    let op = held.op();
+    assert!(op.branch_cond(), "BEQ with equal operands is taken");
+    assert_eq!(op.arg2(), 5, "conditional branch: arg2 = rv2");
     assert_eq!(op.res, 1, "EQ result on the ALU bus is 1 when taken");
     assert_eq!(op.next_pc, PC + 8, "taken branch uses the executor next_pc");
 }
 
 #[test]
 fn test_from_log_beq_not_taken() {
-    let op = op_of(
+    let held = op_of(
         Instruction::Branch {
             src1: 1,
             src2: 2,
@@ -130,7 +146,8 @@ fn test_from_log_beq_not_taken() {
         0,
         PC + 4,
     );
-    assert!(!op.branch_cond);
+    let op = held.op();
+    assert!(!op.branch_cond());
     assert_eq!(op.res, 0);
     assert_eq!(
         op.next_pc,
@@ -141,7 +158,7 @@ fn test_from_log_beq_not_taken() {
 
 #[test]
 fn test_from_log_bne_taken() {
-    let op = op_of(
+    let held = op_of(
         Instruction::Branch {
             src1: 1,
             src2: 2,
@@ -153,8 +170,9 @@ fn test_from_log_bne_taken() {
         0,
         PC + 8,
     );
+    let op = held.op();
     assert!(
-        op.branch_cond,
+        op.branch_cond(),
         "BNE with differing operands is taken (invert)"
     );
     assert_eq!(op.res, 1);
@@ -162,7 +180,7 @@ fn test_from_log_bne_taken() {
 
 #[test]
 fn test_from_log_load() {
-    let op = op_of(
+    let held = op_of(
         Instruction::Load {
             dst: 3,
             offset: 4,
@@ -174,13 +192,14 @@ fn test_from_log_load() {
         0xDEAD,
         PC + 4,
     );
+    let op = held.op();
     assert_eq!(op.res, 0x104, "load address = rv1 + imm");
     assert_eq!(op.rvd, 0xDEAD, "load rvd = the loaded value");
 }
 
 #[test]
 fn test_from_log_store() {
-    let op = op_of(
+    let held = op_of(
         Instruction::Store {
             src: 2,
             offset: 8,
@@ -192,6 +211,7 @@ fn test_from_log_store() {
         0,
         PC + 4,
     );
+    let op = held.op();
     assert_eq!(op.res, 0x108, "store address = rv1 + imm");
     assert_eq!(op.rv2, 0xAB, "store value comes from rs2");
     assert_eq!(op.rvd, 0, "store writes nothing back to rd");
@@ -199,7 +219,7 @@ fn test_from_log_store() {
 
 #[test]
 fn test_from_log_word_carries_real_register_values() {
-    let op = op_of(
+    let held = op_of(
         Instruction::ArithW {
             dst: 3,
             src1: 1,
@@ -211,6 +231,7 @@ fn test_from_log_word_carries_real_register_values() {
         30,
         PC + 4,
     );
+    let op = held.op();
     assert!(op.decode.fields.word_instr);
     // The delegate CpuOperation carries the real values for CPU32/register ops.
     assert_eq!(op.rv1, 10);
@@ -224,10 +245,15 @@ fn test_from_log_word_carries_real_register_values() {
 // generate_cpu_trace
 // =========================================================================
 
-fn ops4(instr: Instruction) -> Vec<CpuOperation> {
-    (0..4)
+fn ops4(instr: Instruction) -> (Vec<CpuOperation>, DecodeTable) {
+    let mut instructions = U64HashMap::default();
+    for i in 0..4 {
+        instructions.insert(PC + i * 4, instr);
+    }
+    let decode = DecodeTable::from_instructions(&instructions);
+    let ops = (0..4)
         .map(|i| {
-            let decode = DecodeEntry::from_instruction(PC + i * 4, instr, 4);
+            let row = decode.row(PC + i * 4).expect("an instruction");
             let log = Log {
                 current_pc: PC + i * 4,
                 next_pc: PC + i * 4 + 4,
@@ -235,20 +261,21 @@ fn ops4(instr: Instruction) -> Vec<CpuOperation> {
                 src2_val: 20,
                 dst_val: 30,
             };
-            CpuOperation::from_log(&log, i * 4 + 4, decode)
+            CpuOperation::from_log(&log, i * 4 + 4, decode.entry(row), row)
         })
-        .collect()
+        .collect();
+    (ops, decode)
 }
 
 #[test]
 fn test_trace_width_and_real_row() {
-    let ops = ops4(Instruction::Arith {
+    let (ops, decode) = ops4(Instruction::Arith {
         dst: 3,
         src1: 1,
         src2: 2,
         op: ArithOp::Add,
     });
-    let trace = generate_cpu_trace(&ops);
+    let trace = generate_cpu_trace(&ops, &decode);
     assert_eq!(trace.main_table.width, cols::NUM_COLUMNS);
     assert_eq!(cols::NUM_COLUMNS, 37);
     assert_eq!(trace.main_table.height, 4);
@@ -261,16 +288,14 @@ fn test_trace_width_and_real_row() {
 #[test]
 fn test_trace_padding_row() {
     // One real op → padded to 4 rows; rows 1..4 are padding.
-    let ops = vec![
-        ops4(Instruction::Arith {
-            dst: 3,
-            src1: 1,
-            src2: 2,
-            op: ArithOp::Add,
-        })
-        .remove(0),
-    ];
-    let trace = generate_cpu_trace(&ops);
+    let (mut ops, decode) = ops4(Instruction::Arith {
+        dst: 3,
+        src1: 1,
+        src2: 2,
+        op: ArithOp::Add,
+    });
+    ops.truncate(1);
+    let trace = generate_cpu_trace(&ops, &decode);
     let pad = trace.main_table.get_row(1);
     assert_eq!(
         pad[cols::PC_0],
@@ -288,13 +313,13 @@ fn test_trace_padding_row() {
 
 #[test]
 fn test_trace_word_row_columns_masked() {
-    let ops = ops4(Instruction::ArithW {
+    let (ops, decode) = ops4(Instruction::ArithW {
         dst: 3,
         src1: 1,
         src2: 2,
         op: ArithOp::Add,
     });
-    let trace = generate_cpu_trace(&ops);
+    let trace = generate_cpu_trace(&ops, &decode);
     let row = trace.main_table.get_row(0);
     // Delegate row: word_instr set, but all operational columns masked to 0.
     assert_eq!(row[cols::WORD_INSTR], 1u64.into());
@@ -316,7 +341,7 @@ fn test_trace_word_row_columns_masked() {
 #[test]
 fn test_collect_bitwise_ops_shape() {
     use crate::tables::bitwise::BitwiseOperationType;
-    let op = op_of(
+    let held = op_of(
         Instruction::Arith {
             dst: 3,
             src1: 1,
@@ -328,6 +353,7 @@ fn test_collect_bitwise_ops_shape() {
         30,
         PC + 4,
     );
+    let op = held.op();
     let ops = op.collect_bitwise_ops();
     assert_eq!(ops.len(), 7, "3 ARE_BYTES + 4 IS_HALF");
     assert!(
@@ -347,7 +373,7 @@ fn test_collect_bitwise_ops_shape() {
 
 #[test]
 fn test_collect_bitwise_ops_word_row_zeroed() {
-    let op = op_of(
+    let held = op_of(
         Instruction::ArithW {
             dst: 3,
             src1: 1,
@@ -359,6 +385,7 @@ fn test_collect_bitwise_ops_word_row_zeroed() {
         30,
         PC + 4,
     );
+    let op = held.op();
     let ops = op.collect_bitwise_ops();
     // On a word delegate row the CPU zeroes rs1/rs2/rd/alu_flags/mem_flags/res,
     // but half_instruction_length stays (it is set unconditionally in the trace).
@@ -376,7 +403,7 @@ fn test_collect_bitwise_ops_word_row_zeroed() {
 /// whatever timestamp the operations carry (a chunk's ops carry `base + 4·(row + 1)`).
 #[test]
 fn test_trace_timestamp_is_preprocessed_column() {
-    let mut ops = ops4(Instruction::Arith {
+    let (mut ops, decode) = ops4(Instruction::Arith {
         dst: 3,
         src1: 1,
         src2: 2,
@@ -386,7 +413,7 @@ fn test_trace_timestamp_is_preprocessed_column() {
     for (i, op) in ops.iter_mut().enumerate() {
         op.timestamp = 1000 + 7 * i as u64;
     }
-    let trace = generate_cpu_trace(&ops);
+    let trace = generate_cpu_trace(&ops, &decode);
     assert_eq!(trace.main_table.height, 4);
     for row in 0..4 {
         assert_eq!(
@@ -419,6 +446,9 @@ fn test_final_pc_timestamp_follows_last_row() {
 fn test_validate_heights_accepts_honest_layouts() {
     assert!(validate_heights(&[4]).is_ok());
     assert!(validate_heights(&[max_rows::CPU, max_rows::CPU, 64]).is_ok());
+    // The block's 2^21-row tables, and the tallest a prover may cut.
+    assert!(validate_heights(&[1 << 21, 1 << 21, 1 << 20]).is_ok());
+    assert!(validate_heights(&[MAX_TABLE_ROWS, 4]).is_ok());
     // Largest layout under the bound: (2^11 - 1) full tables + one of 2^18 rows.
     let mut heights = vec![max_rows::CPU; (1 << 11) - 1];
     heights.push(max_rows::CPU / 2);
@@ -427,7 +457,7 @@ fn test_validate_heights_accepts_honest_layouts() {
 
 #[test]
 fn test_validate_heights_rejects_bad_heights() {
-    for bad in [0, 1, 2, 3, 12, max_rows::CPU * 2] {
+    for bad in [0, 1, 2, 3, 12, MAX_TABLE_ROWS * 2] {
         assert!(validate_heights(&[bad]).is_err(), "height {bad}");
     }
     assert!(validate_heights(&[max_rows::CPU, 6]).is_err());
@@ -456,4 +486,216 @@ fn test_table_heights_matches_chunking() {
     let rows = 1usize << 30;
     assert!(validate_heights(&table_heights(rows, max_rows::CPU)).is_err());
     assert!(validate_heights(&table_heights(rows - (1 << 18), max_rows::CPU)).is_ok());
+}
+
+/// Every bus message's values at one row whose columns hold distinct values.
+fn messages_at_a_row(
+    interactions: &[stark::lookup::BusInteraction],
+) -> Vec<Vec<crate::tables::types::FE>> {
+    let row = |c: usize| crate::tables::types::FE::from(c as u64 + 1);
+    interactions
+        .iter()
+        .map(|i| {
+            i.values
+                .iter()
+                .flat_map(|v| v.combine_from::<crate::tables::types::GoldilocksField, _>(row))
+                .collect()
+        })
+        .collect()
+}
+
+/// ⛔ Each CPU table's AIR sends its own timestamp base, cached or not.
+///
+/// The prototype cache serves the bases an honest prover produces. A cache
+/// keyed by less than the base would hand every table the first one's bus
+/// values, and two tables' clocks would overlap. Each base is asked for twice
+/// (the second answer comes from the cache when the base is cached) and must
+/// send what the interactions built fresh at that base send, never base 0's.
+#[test]
+fn every_cpu_air_sends_its_own_timestamp_base() {
+    use crate::tables::cpu::{TIMESTAMP_STRIDE, bus_interactions};
+    use stark::traits::AIR;
+
+    let opts = stark::proof::options::ProofOptions::default_test_options();
+    let zero = messages_at_a_row(&bus_interactions(0));
+    let full = TIMESTAMP_STRIDE * max_rows::CPU as u64;
+    for base in [
+        0,
+        full,
+        2 * full,
+        TIMESTAMP_STRIDE << 21,
+        (3 * TIMESTAMP_STRIDE) << 21,
+        24,
+    ] {
+        let fresh = messages_at_a_row(&bus_interactions(base));
+        for _ in 0..2 {
+            let air = crate::test_utils::create_cpu_air(&opts, base);
+            assert_eq!(
+                messages_at_a_row(air.bus_interactions()),
+                fresh,
+                "base {base}: the AIR sends another base's messages"
+            );
+        }
+        assert_eq!(fresh != zero, base != 0, "base {base} moves no message");
+    }
+}
+
+/// ⛔ The CPU and REGISTER AIRs hand the verifier the columns it checks.
+///
+/// The multilinear verifier checks a table's preprocessed openings against
+/// `precomputed_columns()`, and an AIR given only a root (`with_preprocessed`)
+/// returns none, so its TIMESTAMP or its FINI would be free main trace. Every
+/// CPU table must return its own height's `4·(row + 1)` column, and REGISTER
+/// its four columns over the halted file.
+#[test]
+fn the_cpu_and_register_airs_expose_the_columns_the_verifier_checks() {
+    use crate::tables::{cpu, register};
+
+    let opts = stark::proof::options::ProofOptions::default_test_options();
+    let program =
+        executor::elf::Elf::load(&crate::test_utils::asm_elf_bytes("all_instructions_64"))
+            .expect("the ELF loads");
+    let heights = vec![16, 8, 4];
+    let counts = cpu_only_counts(heights.len());
+    let output = [7u8; 5];
+    let inputs = crate::BlockAirInputs::new(&opts, &program, heights.clone(), &output)
+        .expect("honest heights");
+    let airs = crate::block_airs(&program, &opts, &[], &counts, &inputs);
+    let refs = airs.air_refs();
+    let start = crate::cpu_proof_start(true, &counts);
+    for (k, &height) in heights.iter().enumerate() {
+        let air = refs[start + k];
+        assert_eq!(air.name(), format!("CPU[{k}]"));
+        assert_eq!(air.num_precomputed_columns(), cpu::NUM_PRECOMPUTED_COLS);
+        assert_eq!(
+            air.precomputed_columns(),
+            vec![cpu::timestamp_column(height)],
+            "CPU[{k}]: the verifier would check another TIMESTAMP"
+        );
+    }
+    let register_air = refs
+        .iter()
+        .find(|air| air.name() == "REGISTER")
+        .expect("REGISTER is in the block");
+    let init = register::register_init_from_entry_point(program.entry_point);
+    let fini = register::halted_fini(output.len() as u32);
+    assert_eq!(
+        register_air.num_precomputed_columns(),
+        register::NUM_PREPROCESSED_COLS
+    );
+    assert_eq!(
+        register_air.precomputed_columns(),
+        register::preprocessed_columns(&init, &fini),
+        "REGISTER: the verifier would check another FINI"
+    );
+}
+
+/// A block's counts with `cpu` CPU tables and no other chunked or optional one.
+fn cpu_only_counts(cpu: usize) -> crate::TableCounts {
+    crate::TableCounts {
+        cpu,
+        lt: 0,
+        memw: 0,
+        memw_aligned: 0,
+        load: 0,
+        mul: 0,
+        dvrm: 0,
+        shift: 0,
+        branch: 0,
+        memw_register: 0,
+        eq: 0,
+        bytewise: 0,
+        store: 0,
+        cpu32: 0,
+        keccak: 0,
+        keccak_rnd: 0,
+        ecsm: 0,
+        ecdas: 0,
+        hint: 0,
+        copy: 0,
+        blake3: 0,
+        is_wh: 0,
+    }
+}
+
+/// ⛔ The block's REGISTER sends the final PC token at its own clock's end.
+///
+/// REGISTER's name is a label; what binds the final PC is the constant its bus
+/// interactions carry, `final_pc_timestamp(Σ CPU rows)`. Blocks of different CPU
+/// heights must each send their own, as the interactions built fresh at that
+/// timestamp do. A REGISTER built at another block's timestamp, or at 0, would
+/// let the run's last PC token land where the CPU tables do not end.
+#[test]
+fn the_block_register_sends_the_final_pc_token_at_its_clocks_end() {
+    use crate::tables::register;
+
+    let opts = stark::proof::options::ProofOptions::default_test_options();
+    let program =
+        executor::elf::Elf::load(&crate::test_utils::asm_elf_bytes("all_instructions_64"))
+            .expect("the ELF loads");
+    let stale = messages_at_a_row(&register::bus_interactions(0));
+    let mut seen = Vec::new();
+    for heights in [vec![16, 8, 4], vec![1 << 21, 4]] {
+        let counts = cpu_only_counts(heights.len());
+        let inputs = crate::BlockAirInputs::new(&opts, &program, heights.clone(), &[])
+            .expect("honest heights");
+        let airs = crate::block_airs(&program, &opts, &[], &counts, &inputs);
+        let refs = airs.air_refs();
+        let register_air = refs
+            .iter()
+            .find(|air| air.name() == "REGISTER")
+            .expect("REGISTER is in the block");
+        let rows: u64 = heights.iter().map(|&h| h as u64).sum();
+        let sent = messages_at_a_row(register_air.bus_interactions());
+        assert_eq!(
+            sent,
+            messages_at_a_row(&register::bus_interactions(final_pc_timestamp(rows))),
+            "{heights:?}: REGISTER sends another final PC timestamp than its CPU tables end at"
+        );
+        assert_ne!(
+            sent, stale,
+            "{heights:?}: REGISTER sends the final PC token at 0"
+        );
+        seen.push(sent);
+    }
+    assert_ne!(
+        seen[0], seen[1],
+        "two blocks' REGISTERs send one final PC timestamp"
+    );
+}
+
+/// ⛔ The CPU tables' position is checked in every build, not only under
+/// `debug_assert`: a table set read with counts that place the CPU tables
+/// elsewhere (one more COPY table, one fewer CPU table, or HALT counted) is
+/// refused with an error, and the counts it was built from pass.
+#[test]
+fn the_cpu_tables_are_refused_where_their_heights_are_not_read() {
+    let opts = stark::proof::options::ProofOptions::default_test_options();
+    let program =
+        executor::elf::Elf::load(&crate::test_utils::asm_elf_bytes("all_instructions_64"))
+            .expect("the ELF loads");
+    let counts = cpu_only_counts(2);
+    let inputs =
+        crate::BlockAirInputs::new(&opts, &program, vec![8, 4], &[]).expect("honest heights");
+    let airs = crate::block_airs(&program, &opts, &[], &counts, &inputs);
+    assert!(airs.check_cpu_position(&counts).is_ok());
+    let mut shifted = counts.clone();
+    shifted.copy = 1;
+    let mut fewer = counts.clone();
+    fewer.cpu = 1;
+    let mut wider = counts.clone();
+    wider.blake3 = 1;
+    for (what, other) in [
+        ("a COPY table", shifted),
+        ("one CPU table", fewer),
+        ("BLAKE3", wider),
+    ] {
+        assert!(
+            matches!(
+                airs.check_cpu_position(&other),
+                Err(crate::Error::InvalidTableCounts(_))
+            ),
+            "counts with {what} read the CPU tables where they are not"
+        );
+    }
 }

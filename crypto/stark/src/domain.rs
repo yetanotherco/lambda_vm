@@ -65,6 +65,13 @@ pub struct Domain<F: IsFFTField> {
 }
 
 impl<F: IsFFTField> Domain<F> {
+    /// The bytes its two root tables hold (the values built on first use come
+    /// later and are not counted).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        (self.lde_roots_of_unity_coset.capacity() + self.trace_roots_of_unity.capacity())
+            * std::mem::size_of::<FieldElement<F>>()
+    }
+
     /// Builds the interpolation and LDE domains used by the prover.
     ///
     /// - Interpolation domain: the `trace_length` roots of unity (must be a power of 2).
@@ -74,8 +81,17 @@ impl<F: IsFFTField> Domain<F> {
     where
         A: AIR<Field = F> + ?Sized,
     {
-        let blowup_factor = air.options().blowup_factor as usize;
-        let coset_offset = FieldElement::from(air.options().coset_offset);
+        Self::from_options(
+            air.options().blowup_factor as usize,
+            air.options().coset_offset,
+            trace_length,
+        )
+    }
+
+    /// [`Domain::new`] from what it reads of the AIR: its blowup factor and
+    /// coset offset.
+    pub fn from_options(blowup_factor: usize, coset_offset: u64, trace_length: usize) -> Self {
+        let coset_offset = FieldElement::from(coset_offset);
         let root_order = trace_length.trailing_zeros();
         let trace_primitive_root = F::get_primitive_root_of_unity(root_order as u64).unwrap();
         let trace_roots_of_unity = get_powers_of_primitive_root_coset(
