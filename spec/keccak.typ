@@ -49,6 +49,12 @@ The state is then read into `input_state`, while the `output_state` is written b
 Lastly, the input state is pushed to the Keccak-round function, while the output after 24 rounds is taken off the bus:
 #render_constraint_table(chip, config, groups: "round")
 
+The table has a second mode (the sponge mode below), and its rows are split by two mode bits: $mu_p$ marks a row of this permutation ECALL, $mu_s$ a row of a Keccak-256 call.
+Every interaction above except the two round-chip ones is gated by $mu_p$.
+The two round-chip interactions are the only ones both modes share, and they are weighted by $mu_p + mu_s$: a row of either mode asks the round chip because of its own mode bit, so its output is the permutation of its input.
+The column $mu$ is the sum of the two bits (it marks the real rows for the table's cuts), so with all three bits a row is in at most one mode:
+#render_constraint_table(chip, config, groups: "mode")
+
 == Padding
 The #keccak table can be padded to the next power of two with the following value assignments:
 #render_chip_padding_table(chip, config)
@@ -64,6 +70,7 @@ The call is refused unless every block's 136-byte window and the 32-byte digest 
 The call is proven by the #keccak chip itself, in a second mode.
 Two mode bits split the rows: `MU_P` marks a row of the permutation ECALL above, `MU_S` a row of a Keccak-256 call, with $mu = #`MU_P` + #`MU_S`$ and all three bits, so a row is in at most one mode.
 Every interaction and constraint of the permutation mode is gated by `MU_P`, and every one of the sponge mode by `MU_S`, `first`, `last` or a read-mask bit that is zero off a sponge row.
+The two round-chip interactions are weighted by `MU_P + MU_S`, so a sponge row's mode bit itself puts it on the round chip (on a sponge row that sum is `MU_S`, as written below).
 A call of $n$ bytes takes $floor(n / 136) + 1$ rows, one per permutation: row $j$ reads block $j$ of the input, XORs the padded block into the rate of the state the previous row's permutation ended in, and sends the result to the round chip; the last row writes the first four lanes of its own output.
 
 == Columns
@@ -88,7 +95,7 @@ Consecutive rows of one call are linked by the `KECCAK_SPONGE` interaction, whic
 A lane wholly inside the input is read as one 8-byte access; the bytes of the lane the input ends in are read one at a time. Byte 7 of a lane is never read alone:
 #render_constraint_table(sponge, config, groups: "read")
 
-The read mask $s_(L,b) = "full"_L + "part"_(L,b)$ ($b < 7$), $s_(L,7) = "full"_L$, is a prefix of the block. A row that is not last reads all 136 bytes; the last row reads exactly `count` bytes, at most 135. Since `count` starts at the length and falls by 136 per row, this pins the number of rows to $floor(n / 136) + 1$: for any chain of fewer than $2^31$ rows, $n - 136 j$ lies in $(-2^39, 2^32)$, so it equals a value in $[0, 135]$ in the field only when it does in the integers.
+The read mask $s_(L,b) = "full"_L + "part"_(L,b)$ ($b < 7$), $s_(L,7) = "full"_L$, is a prefix of the block. A row that is not last reads all 136 bytes; the last row reads exactly `count` bytes, at most 135. Since `count` starts at the length and falls by 136 per row, this pins the number of rows to $floor(n / 136) + 1$: the KECCAK rows of one proof are at most `SPONGE_MAX_ROWS` $= 2^40$ (the block format's caps are checked against it when the prover is built), so $n - 136 j$ lies in $(-2^48, 2^32)$ and equals a value in $[0, 135]$ in the field only when it does in the integers. (The argument needs only $136 dot N + 2^32 < p$, about $N < 2^56$ rows.)
 Bytes past the input are never read and are zero:
 #render_constraint_table(sponge, config, groups: "mask")
 
@@ -101,7 +108,8 @@ The permutation itself is the round chip's, as in the permutation mode:
 The last row writes the digest, the first four lanes of its own output, at $T + 1$:
 #render_constraint_table(sponge, config, groups: "digest")
 
-The block's last byte and the digest's last byte stay below $2^32$ in the low address word, so the offsets above add to the low word without a carry:
+The block's last byte and the digest's last byte stay below $2^32$ in the low address word, so the offsets above add to the low word without a carry.
+The equation on `src_end` (@keccak_sponge:c:src_end) is more than a range check: the link sends $"src_end" + 1$ as the next row's `src`, so it is also what places every block after the first right after the one before; without it a block could be read from any address.
 #render_constraint_table(sponge, config, groups: "range")
 
 = Round chip
