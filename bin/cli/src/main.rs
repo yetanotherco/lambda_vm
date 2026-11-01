@@ -1221,6 +1221,9 @@ fn cmd_prove_block_base(
     );
     #[cfg(feature = "cuda")]
     stark::grinding::reset_gpu_grind_calls();
+    // The allocator watermark `prove-block` runs its base under
+    // (`LAMBDA_VM_ALLOC_WATERMARK`), so the base's memory behaves as there.
+    let watermark = prover::alloc_purge::start_watermark(prover::block_whir::memory_target_bytes());
     let t = Instant::now();
     let proved = prover::block_whir::prove_block_whir_observed_led(
         &elf_data,
@@ -1233,6 +1236,11 @@ fn cmd_prove_block_base(
         None,
     );
     let base_secs = t.elapsed().as_secs_f64();
+    // The base's allocator peak (`ALLOC PEAK base`, as `prove-block` prints it).
+    if let Some(peak) = prover::alloc_purge::peak_window() {
+        eprintln!("ALLOC PEAK base: {peak}");
+    }
+    drop(watermark);
     let (proof, stamps) = match proved {
         Ok(proved) => proved,
         Err(e) => {
@@ -2759,6 +2767,30 @@ mod tests {
             stark::proof::options::BaseFormat::P1_WHIR,
             "the production base is the family's"
         );
+    }
+
+    /// `prove-block-base` takes `--base p1|b3` (p1 by default) and no other
+    /// word; `prove-block` and `verify-block` take no `--base` at all.
+    #[test]
+    fn the_base_only_command_takes_its_base_and_the_block_commands_none() {
+        let ok = |args: &[&str]| Cli::try_parse_from(args).is_ok();
+        let base = ["cli", "prove-block-base", "guest.elf"];
+        assert!(ok(&base));
+        for word in ["p1", "b3"] {
+            assert!(ok(&[&base[..], &["--base", word]].concat()), "{word}");
+        }
+        for word in ["rpx", "blake3", "keccak", ""] {
+            assert!(!ok(&[&base[..], &["--base", word]].concat()), "{word:?}");
+        }
+        match Cli::try_parse_from(base).map(|c| c.command) {
+            Ok(Commands::ProveBlockBase { base, .. }) => assert_eq!(base, "p1"),
+            _ => panic!("prove-block-base parses"),
+        }
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            assert!(!ok(&[cmd, &["--base", "b3"]].concat()));
+        }
     }
 
     /// The posture sets exactly the knobs the environment leaves unset.
