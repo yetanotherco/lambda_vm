@@ -721,15 +721,100 @@ const BOX_ALONE: &str = "LAMBDA_VM_KECCAK256_BOX_ALONE";
 
 /// Proves and verifies `build`'s traces with `left_out` left out on every
 /// thread: `(accepted, the bus balance alone refused it)`.
+///
+/// The AIRs are built fresh for each call. `test_utils` keeps one prototype of
+/// each AIR a process builds, keyed by name and proof options, and serves its
+/// clone after that: the first KECCAK AIR of the process would then carry its
+/// bus interactions into every later prove, so a check that lives in an
+/// interaction (the digest address on the link, lane 0's read, the round-chip
+/// tokens on the mode bits) would stay in whatever is left out (box job l4d).
+/// Each call takes its own query count (3 + a counter: a key no earlier call
+/// used), and the KECCAK AIRs it proves with are checked to carry the
+/// interactions the left-out checks make.
 fn prove_without(left_out: &'static [SpongeCheck], build: fn() -> (Elf, Traces)) -> (bool, bool) {
+    use stark::proof::view::StarkProofView;
+    use stark::verifier::IsStarkVerifier;
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let _left = keccak::LeftOutEverywhere::new(left_out);
     let (program, mut traces) = build();
-    let outcome =
-        crate::tests::prove_elfs_tests::weigh_the_bus_with(&program, &mut traces, true, false);
-    (
-        outcome.accepted,
-        !outcome.accepted && outcome.accepted_with_target_moved,
+    let mut options = stark::proof::options::ProofOptions::default_test_options();
+    options.fri_number_of_queries += 1 + CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let table_counts = traces.table_counts();
+    let register_init =
+        crate::tables::register::register_init_from_entry_point(program.entry_point);
+    let register_commitment =
+        crate::test_utils::trace_register_commitment(&options, &register_init, &traces);
+    let airs = crate::VmAirs::new(
+        &program,
+        &options,
+        false,
+        &traces.page_configs,
+        &table_counts,
+        &crate::cpu_heights_from_traces(&traces),
+        None,
+        true,
+        None,
+        register_commitment.preprocessed(),
+    );
+    let shape = |interactions: &[stark::lookup::BusInteraction]| -> Vec<String> {
+        interactions
+            .iter()
+            .map(|b| {
+                format!(
+                    "{} {} {:?} {:?}",
+                    b.bus_id, b.is_sender, b.multiplicity, b.values
+                )
+            })
+            .collect()
+    };
+    let want = shape(&keccak::bus_interactions());
+    let refs = airs.air_refs();
+    let keccaks: Vec<_> = refs
+        .iter()
+        .filter(|a| a.name().starts_with("KECCAK["))
+        .collect();
+    assert!(!keccaks.is_empty(), "a KECCAK AIR");
+    for air in &keccaks {
+        assert_eq!(
+            shape(air.bus_interactions()),
+            want,
+            "{}: the AIR proved with carries the interactions of {left_out:?}",
+            air.name()
+        );
+    }
+    let pairs = airs.air_trace_pairs(&mut traces);
+    let proof =
+        crate::test_utils::multi_prove_ram(pairs, &mut crate::hash_pin::block_transcript(&[]))
+            .unwrap_or_else(|e| panic!("prover failed, which is not a verifier rejection: {e:?}"));
+    let views: Vec<StarkProofView<_, _, ()>> =
+        proof.proofs.iter().map(StarkProofView::Owned).collect();
+    let refs = airs.air_refs();
+    let target = crate::compute_expected_commit_bus_balance_view(
+        &refs,
+        &views,
+        &traces.public_output_bytes,
+        0,
+        &mut crate::hash_pin::block_transcript(&[]),
     )
+    .expect("fingerprint collision in test");
+    let verify = |target: &_| {
+        crate::hash_pin::BlockVerifier::multi_verify_views(
+            &refs,
+            &views,
+            &mut crate::hash_pin::block_transcript(&[]),
+            target,
+        )
+    };
+    let accepted = verify(&target);
+    let mut sum = math::field::element::FieldElement::zero();
+    for (air, view) in refs.iter().zip(views.iter()) {
+        if air.has_trace_interaction()
+            && let Some(contribution) = view.bus_table_contribution()
+        {
+            sum += contribution;
+        }
+    }
+    (accepted, !accepted && verify(&sum))
 }
 
 #[test]
