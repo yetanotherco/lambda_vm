@@ -3050,7 +3050,7 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
         copy: 1,
         blake3: 1,
         is_wh: 1,
-        ecrec: 0,
+        ecrec: 1,
     };
     let pages = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
         &program,
