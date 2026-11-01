@@ -2329,7 +2329,8 @@ fn assert_challenges_match(public: &[(u32, LfmWord)], f: &StatementFixture, what
 /// appended `is_final` as the statement's last byte (`+1`). `215 + 49 = 264`,
 /// and `264 ≡ 0 (mod 4)`. Main's IS_WH table (#1022) is counted too, so
 /// `NUM_TABLE_COUNTS` went 21 → 22 (`+8 ≡ 0 mod 4`, which moves no shift):
-/// `264 + 8 = 272`.
+/// `264 + 8 = 272`. The ECREC table is counted too (22 → 23, `+8`, no shift):
+/// `272 + 8 = 280`.
 ///
 /// The acceptance shape is still spliced, which is what keeps the splice path
 /// under test: `L = 14 ≢ 0 (mod 4)`, so the cursor lands at shift 2 where it
@@ -2338,14 +2339,15 @@ fn assert_challenges_match(public: &[(u32, LfmWord)], f: &StatementFixture, what
 fn epoch_statement_cursor_is_the_output_len_alone() {
     let shape = epoch_statement_shape();
     let r = shape.page_ranges.len();
-    // 272, not the 264 of the twenty-one-count era, the 215 of the
-    // fifteen-count one or the 207 of the fourteen-count one: six accelerator
-    // counts (+48), the trailing `is_final` byte (+1) and IS_WH's count (+8).
-    // The terms are named in the doc above, because 272 is the sum of changes
+    // 280, not the 272 of the twenty-two-count era, the 264 of the
+    // twenty-one-count one, the 215 of the fifteen-count one or the 207 of the
+    // fourteen-count one: six accelerator counts (+48), the trailing `is_final`
+    // byte (+1), IS_WH's count (+8) and ECREC's (+8).
+    // The terms are named in the doc above, because 280 is the sum of changes
     // that move NO shift and one that moves it by one.
-    assert_eq!(shape.byte_len(), 272 + STMT_PUBLIC_OUTPUT_LEN + 16 * r);
+    assert_eq!(shape.byte_len(), 280 + STMT_PUBLIC_OUTPUT_LEN + 16 * r);
     for l in 0..8usize {
-        let total = 272 + l + 16 * r;
+        let total = 280 + l + 16 * r;
         assert_eq!(
             total % keccak_host::BYTES_PER_HALF,
             l % keccak_host::BYTES_PER_HALF,
