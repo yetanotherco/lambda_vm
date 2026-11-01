@@ -561,7 +561,11 @@ fn options() -> ProofOptions {
     super::proof::aggregation_wrap_options()
 }
 
-fn prove<A: Arm>(airs: &Airs, t: &mut Traces) -> Result<Proof, stark::prover::ProvingError> {
+fn prove<A: Arm>(
+    airs: &Airs,
+    t: &mut Traces,
+    residency: stark::residency_mode::ResidencyMode,
+) -> Result<Proof, stark::prover::ProvingError> {
     let mut pairs: Vec<(DynAir<'_>, &mut TraceTable<F, E>, &())> = Vec::new();
     for (air, trace) in airs.rounds.iter().zip(t.rounds.iter_mut()) {
         pairs.push((air, trace, &()));
@@ -573,7 +577,7 @@ fn prove<A: Arm>(airs: &Airs, t: &mut Traces) -> Result<Proof, stark::prover::Pr
     stark::prover::GenericProver::<F, E, (), A::S>::multi_prove_bound(
         pairs,
         &mut transcript,
-        stark::residency_mode::ResidencyMode::Retain,
+        residency,
     )
 }
 
@@ -600,7 +604,7 @@ fn round_trip_with<A: Arm>(
     mutate(&mut t);
     let roots = roots_under::<A::S>(&t, &opts);
     let airs = airs(&roots, &opts, spec.drops);
-    match prove::<A>(&airs, &mut t) {
+    match prove::<A>(&airs, &mut t, stark::residency_mode::ResidencyMode::Retain) {
         Ok(proof) => Ok(verify::<A>(&airs, &proof)),
         Err(e) => Err(format!("{e:?}")),
     }
@@ -1262,6 +1266,100 @@ fn the_child_check_hash_ratio_of_narrow_tables() {
     );
 }
 
+/// The child check under the format levers D-B3-3 names: one-row openings
+/// (auto per table, or on) and blowup 8 at its own 128-bit query count — the
+/// lean tables of a 2^18-compression leaf, and the non-hash tables' BLAKE3 cost
+/// against today's Poseidon1 one (`r`).
+#[test]
+fn the_child_check_under_the_format_levers() {
+    use super::epoch_verify::{TableVerifyShape, table_permutations_for};
+    use stark::proof::options::OneRowMode;
+    let today = options();
+    let b8 = {
+        let mut o =
+            stark::proof::options::GoldilocksCubicProofOptions::with_blowup(8).expect("blowup 8");
+        o.fri_final_poly_log_degree = today.fri_final_poly_log_degree;
+        o.format = today.format;
+        o
+    };
+    let with_one_row = |base: &ProofOptions, m: OneRowMode| {
+        let mut o = base.clone();
+        o.format.one_row = m;
+        o
+    };
+    let p1_geom = stark::config::TreeGeometry::of::<super::p1_commit::P1StarkHash>();
+    let b3 = |air: DynAir<'_>, rows: usize| {
+        let (shape, _) =
+            TableVerifyShape::derive_with(air, rows, stark::config::TreeGeometry::BINARY)
+                .expect("a shape");
+        table_permutations_for(&shape, super::edsl::WrapHash::Blake3)
+    };
+    let nonhash = [
+        ("XALU", 23, 22),
+        ("SELECT", 25, 21),
+        ("LANES", 16, 21),
+        ("BALU", 14, 21),
+        ("HINT", 6, 21),
+    ];
+    let p1_today: usize = nonhash
+        .iter()
+        .map(|&(name, main, log)| {
+            let air = synthetic(name, main, 0, 4, &today);
+            let (shape, _) = TableVerifyShape::derive_with(&air, 1 << log, p1_geom).expect("shape");
+            table_permutations_for(&shape, super::edsl::WrapHash::Poseidon1)
+        })
+        .sum();
+    for (label, opts) in [
+        ("blowup 4, Q 112, two-row (today)", today.clone()),
+        (
+            "blowup 4, Q 112, one-row auto",
+            with_one_row(&today, OneRowMode::Auto),
+        ),
+        (
+            "blowup 4, Q 112, one-row on",
+            with_one_row(&today, OneRowMode::On),
+        ),
+        ("blowup 8, two-row", b8.clone()),
+        (
+            "blowup 8, one-row auto",
+            with_one_row(&b8, OneRowMode::Auto),
+        ),
+    ] {
+        let mut lean = Vec::new();
+        for cap in [19u32, 21] {
+            let n = 1usize << 18;
+            let chunks = lean::chunk_rows(ROUNDS * n, cap, lean::MIN_CHUNK_LOG);
+            let roots = Roots {
+                rounds: vec![[0u8; 32]; chunks.len()],
+                head: [0u8; 32],
+                table: [0u8; 32],
+            };
+            let a = airs(&roots, &opts, Drops::default());
+            let mut rows = chunks;
+            rows.extend([n, table::ROWS, 1 << 21]);
+            lean.push(
+                a.refs()
+                    .iter()
+                    .zip(&rows)
+                    .map(|(air, &r)| b3(*air, r))
+                    .sum::<usize>(),
+            );
+        }
+        let nh: usize = nonhash
+            .iter()
+            .map(|&(name, main, log)| b3(&synthetic(name, main, 0, 4, &opts), 1 << log))
+            .sum();
+        println!(
+            "B3R CHILD FORMAT {label}: queries {} · lean tables (2^18 leaf) {} / {} compressions \
+             (chunk cap 2^19 / 2^21) · non-hash r {:.3} against today's P1",
+            opts.fri_number_of_queries,
+            lean[0],
+            lean[1],
+            nh as f64 / p1_today as f64
+        );
+    }
+}
+
 fn air_name(air: DynAir<'_>) -> String {
     air.name().to_string()
 }
@@ -1334,12 +1432,23 @@ fn pool_peak<R>(f: impl FnOnce() -> R) -> (R, Option<u64>) {
     (f(), None)
 }
 
+/// `B3R_S4_RESIDENCY`: `retain` (the LFM's default) or `recompute` (each main
+/// LDE dropped after its root and rebuilt for its table's rounds 2–4, the
+/// `LAMBDA_VM_RESIDENCY=recompute` mode).
+fn s4_residency() -> stark::residency_mode::ResidencyMode {
+    match std::env::var("B3R_S4_RESIDENCY").as_deref() {
+        Ok("recompute") => stark::residency_mode::ResidencyMode::RecomputeLde,
+        Ok("retain") | Err(_) => stark::residency_mode::ResidencyMode::Retain,
+        Ok(other) => panic!("B3R_S4_RESIDENCY: unknown mode {other}"),
+    }
+}
+
 fn s4_run<A: Arm>(roots: &Roots, traces: &Traces, opts: &ProofOptions, label: &str, log_n: u32) {
     let airs = airs(roots, opts, Drops::default());
     let mut t = traces.clone_traces();
     let (cells, cells_noprep, main_only) = proved_cells(&airs, &t);
     let start = std::time::Instant::now();
-    let (proof, peak) = pool_peak(|| prove::<A>(&airs, &mut t));
+    let (proof, peak) = pool_peak(|| prove::<A>(&airs, &mut t, s4_residency()));
     let secs = start.elapsed().as_secs_f64();
     let proof = proof.expect("the S4 prove");
     let v = std::time::Instant::now();
@@ -1402,13 +1511,14 @@ fn s4_the_lean_chip_on_the_card() {
         .unwrap_or(lean::MAX_CHUNK_LOG);
     println!(
         "B3R S4 CONFIG: blowup {} · queries {} · final poly 2^{} · format {:?} · cuda {} · \
-         rayon threads {} · round chunk cap 2^{chunk} · arms {}",
+         rayon threads {} · round chunk cap 2^{chunk} · residency {:?} · arms {}",
         opts.blowup_factor,
         opts.fri_number_of_queries,
         opts.fri_final_poly_log_degree,
         opts.format,
         cfg!(feature = "cuda"),
         threads(),
+        s4_residency(),
         arms.join(",")
     );
     for log_n in logs {
