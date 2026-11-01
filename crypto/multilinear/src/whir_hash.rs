@@ -43,10 +43,13 @@ use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use crypto::fiat_shamir::p1_transcript::{P1Transcript, P1TranscriptHash};
 use crypto::fiat_shamir::transcript_hash::{
-    HasTranscriptHash, KeccakTranscriptHash, RpxTranscriptHash, TranscriptHash,
+    Blake3StdTranscriptHash, HasTranscriptHash, KeccakTranscriptHash, RpxTranscriptHash,
+    TranscriptHash,
 };
 use crypto::merkle_tree::backends::p1::P1BatchBackend;
-use crypto::merkle_tree::backends::types::{BatchKeccak256Backend, BatchRpx256Backend};
+use crypto::merkle_tree::backends::types::{
+    BatchBlake3StdBackend, BatchKeccak256Backend, BatchRpx256Backend,
+};
 use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::{element::FieldElement, traits::IsField};
@@ -72,6 +75,11 @@ pub enum DeviceHashKey {
     Rpx256,
     /// ZisK's Poseidon1 (width 16, rate 12): the tagged leaf and 4-ary nodes.
     Poseidon1,
+    /// Standard 7-round BLAKE3 (`Blake3Std`) at both layers, binary trees.
+    /// Its device twin is `math_cuda::DeviceHash::Blake3`, whose WHIR kernels
+    /// are compiled at 7 rounds whatever the STARK cubin's count
+    /// (`math_cuda::blake3_whir`).
+    Blake3,
 }
 
 impl DeviceHashKey {
@@ -86,6 +94,7 @@ impl DeviceHashKey {
             Self::Keccak256 => math_cuda::DeviceHash::Keccak256,
             Self::Rpx256 => math_cuda::DeviceHash::Rpx256,
             Self::Poseidon1 => math_cuda::DeviceHash::Poseidon1,
+            Self::Blake3 => math_cuda::DeviceHash::Blake3,
         }
     }
 
@@ -93,7 +102,7 @@ impl DeviceHashKey {
     /// Poseidon1, 2 under the others.
     pub const fn arity(self) -> usize {
         match self {
-            Self::Keccak256 | Self::Rpx256 => 2,
+            Self::Keccak256 | Self::Rpx256 | Self::Blake3 => 2,
             Self::Poseidon1 => 4,
         }
     }
@@ -104,6 +113,7 @@ impl DeviceHashKey {
             Self::Keccak256 => "keccak256",
             Self::Rpx256 => "rpx256",
             Self::Poseidon1 => "poseidon1-w16",
+            Self::Blake3 => "blake3-std",
         }
     }
 }
@@ -124,6 +134,7 @@ const _: () = {
         DeviceHashKey::Poseidon1,
         math_cuda::DeviceHash::Poseidon1
     ));
+    assert!(paired(DeviceHashKey::Blake3, math_cuda::DeviceHash::Blake3));
 };
 
 /// ★ One WHIR hash configuration.
@@ -285,6 +296,38 @@ impl WhirHash for P1Whir {
     }
 }
 
+/// ★ Standard BLAKE3 (7 rounds, [`crypto::hash::blake3::Blake3Std`]) over
+/// binary trees: the leaf is the fold block's canonical big-endian bytes
+/// under `Blake3Std`, a parent the one compression over its two 32-byte
+/// children, the sponge [`Blake3StdTranscriptHash`] and the grind its digest's
+/// (D-B3HYB S3). The round count is the type's, never the build's: the crate
+/// default `blake3-6round` moves the STARK pipeline's BLAKE3, not this one.
+///
+/// Opt-in, for a block's base proof proved with no recursion over it
+/// (`prover::block_whir::with_base_hash!`); Poseidon1 stays the block's base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Blake3Whir;
+
+impl WhirHash for Blake3Whir {
+    const NAME: &'static str = "blake3-std";
+
+    const DEVICE: DeviceHashKey = DeviceHashKey::Blake3;
+
+    type Transcript = Blake3StdTranscriptHash;
+
+    type Backend<F>
+        = BatchBlake3StdBackend<F>
+    where
+        F: IsField + 'static,
+        FieldElement<F>: AsBytes + Sync + Send;
+
+    type Sponge = DefaultTranscript<Degree3GoldilocksExtensionField, Blake3StdTranscriptHash>;
+
+    fn sponge() -> Self::Sponge {
+        DefaultTranscript::new(&[])
+    }
+}
+
 /// Children per node of `H`'s trees over `F` (2, or 4 under [`P1Whir`]).
 pub fn arity<F, H>() -> usize
 where
@@ -316,6 +359,7 @@ const _: fn() = || {
     assert_usable::<KeccakWhir>();
     assert_usable::<RpxWhir>();
     assert_usable::<P1Whir>();
+    assert_usable::<Blake3Whir>();
 };
 
 /// ✓ Each configuration's transcript is ITS OWN, not the other's.
@@ -335,6 +379,12 @@ const _: fn() = || {
     );
     assert_same::<P1TranscriptHash>(
         core::marker::PhantomData::<(P1TranscriptHash, <P1Whir as WhirHash>::Transcript)>,
+    );
+    assert_same::<Blake3StdTranscriptHash>(
+        core::marker::PhantomData::<(
+            Blake3StdTranscriptHash,
+            <Blake3Whir as WhirHash>::Transcript,
+        )>,
     );
 };
 
@@ -362,11 +412,14 @@ const _: () = {
     assert!(same(KeccakWhir::NAME, KeccakWhir::DEVICE.name()));
     assert!(same(RpxWhir::NAME, RpxWhir::DEVICE.name()));
     assert!(same(P1Whir::NAME, P1Whir::DEVICE.name()));
+    assert!(same(Blake3Whir::NAME, Blake3Whir::DEVICE.name()));
+    // The sponge's hash is the configuration's name too.
+    assert!(same(Blake3Whir::NAME, Blake3StdTranscriptHash::NAME));
 };
 
 #[cfg(test)]
 mod sponge_default_tests {
-    use super::{KeccakWhir, P1Whir, RpxWhir, WhirHash};
+    use super::{Blake3Whir, KeccakWhir, P1Whir, RpxWhir, WhirHash};
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     use math::field::{
         element::FieldElement, extensions_goldilocks::Degree3GoldilocksExtensionField as Ext,
@@ -391,5 +444,6 @@ mod sponge_default_tests {
         same::<KeccakWhir>();
         same::<RpxWhir>();
         same::<P1Whir>();
+        same::<Blake3Whir>();
     }
 }
