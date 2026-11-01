@@ -1,5 +1,7 @@
-//! Rescue-Prime Optimized (RPO256) over Goldilocks at width 12 — the `LFM_HASH`
-//! socket's production-candidate tenant.
+//! Rescue-Prime Optimized (RPO256) over Goldilocks at width 12: the round
+//! primitives and constants [`super::rpx`] runs on, and the external
+//! known-answer anchor for them. RPO itself no longer has an `LFM_HASH` socket
+//! arm; RPX is the tenant.
 //!
 //! # Why this hash
 //!
@@ -382,84 +384,6 @@ pub const fn domain_iv(domain: u64) -> [u64; 4] {
     let mut iv = [0u64; 4];
     iv[CAPACITY_DOMAIN_LANE] = domain;
     iv
-}
-
-/// One round's recorded intermediates, in the association the degree-3 AIR
-/// lowering needs.
-///
-/// The round is `u = MDS(s) + ark1` → `x = u^7` → `v = MDS(x) + ark2` →
-/// `y = v^{1/7}`. The AIR recomputes `u`, `x` and `v` as expressions and
-/// commits only what it cannot: the two S-box ladders and the round output.
-#[derive(Clone, Copy, Debug)]
-pub struct RpoRound {
-    /// `u = MDS(state) + ARK1[r]` — the forward S-box input. Recorded for
-    /// cross-checking only; the AIR recomputes it as a degree-1 expression.
-    pub u: [FE; HASH_STATE_FELTS],
-    /// `u²` — committed.
-    pub u2: [FE; HASH_STATE_FELTS],
-    /// `u³` — committed. `u^7 = (u³)²·u` is then a degree-3 expression.
-    pub u3: [FE; HASH_STATE_FELTS],
-    /// `v = MDS(u^7) + ARK2[r]` — the inverse S-box input. Recorded for
-    /// cross-checking; the AIR recomputes it as a degree-3 expression.
-    pub v: [FE; HASH_STATE_FELTS],
-    /// `y = v^{1/7}` — this round's output, next round's input. **Committed,
-    /// and verified as the FORWARD power**: `(y³)²·y = v` is the spec's own
-    /// §4.3 folding trick, degree 3 on both sides.
-    pub y: [FE; HASH_STATE_FELTS],
-    /// `y²` — committed.
-    pub y2: [FE; HASH_STATE_FELTS],
-    /// `y³` — committed.
-    pub y3: [FE; HASH_STATE_FELTS],
-}
-
-/// Every intermediate the AIR witnesses, one entry per round.
-pub type RpoWitness = [RpoRound; NUM_ROUNDS];
-
-/// Records the permutation's intermediates for the trace generator.
-///
-/// ⚠ **Written independently of [`Rpo256::permute`] rather than factored out of
-/// it, deliberately** — the same discipline `poseidon::permutation_witness`
-/// follows (standing-decisions rule 7). A recording wrapper that `permute`
-/// delegated to would make
-/// [`tests::the_witness_agrees_with_the_permutation`] a tautology at the moment
-/// of the refactor. Both paths are pinned to the SAME external KAT instead.
-pub fn permutation_witness(state: [FE; HASH_STATE_FELTS]) -> RpoWitness {
-    let zero = [FE::zero(); HASH_STATE_FELTS];
-    let mut rounds = [RpoRound {
-        u: zero,
-        u2: zero,
-        u3: zero,
-        v: zero,
-        y: zero,
-        y2: zero,
-        y3: zero,
-    }; NUM_ROUNDS];
-    let mut s = state;
-    for (r, round) in rounds.iter_mut().enumerate() {
-        let mixed = Rpo256::mds(&s);
-        round.u = core::array::from_fn(|i| &mixed[i] + FE::from(ARK1[r][i]));
-
-        let mut x = [FE::zero(); HASH_STATE_FELTS];
-        for (lane, x_lane) in x.iter_mut().enumerate() {
-            let u = &round.u[lane];
-            round.u2[lane] = u * u;
-            round.u3[lane] = &round.u2[lane] * u;
-            *x_lane = &(&round.u3[lane] * &round.u3[lane]) * u;
-        }
-
-        let mixed = Rpo256::mds(&x);
-        round.v = core::array::from_fn(|i| &mixed[i] + FE::from(ARK2[r][i]));
-
-        round.y = round.v;
-        Rpo256::inv_sbox_layer(&mut round.y);
-        for lane in 0..HASH_STATE_FELTS {
-            let y = &round.y[lane];
-            round.y2[lane] = y * y;
-            round.y3[lane] = &round.y2[lane] * y;
-        }
-        s = round.y;
-    }
-    rounds
 }
 
 /// Rescue-Prime Optimized at width 12, rate 8, capacity 4, 7 rounds — RPO256.
@@ -964,82 +888,6 @@ mod tests {
         assert_ne!(parent, step);
         assert_ne!(parent, leaf);
         assert_ne!(step, leaf);
-    }
-
-    /// The witness's last round must reproduce the SAME external vector
-    /// `permute` is pinned to — not `permute`'s output, which would only say
-    /// the two agree. This is the absolute pin on the recording path.
-    #[test]
-    fn the_witness_final_round_matches_the_miden_known_answer_vector() {
-        // The eight-element vector is one permutation of `[0..8 ‖ 0,0,0,0]`.
-        let input: [FE; HASH_STATE_FELTS] = core::array::from_fn(|i| {
-            if i < 8 {
-                FE::from(i as u64)
-            } else {
-                FE::zero()
-            }
-        });
-        let w = permutation_witness(input);
-        for (i, want) in MIDEN_HASH_ELEMENTS[7].iter().enumerate() {
-            assert_eq!(
-                w[NUM_ROUNDS - 1].y[i],
-                FE::from(*want),
-                "witness digest lane {i} must match miden"
-            );
-        }
-    }
-
-    /// A genuine differential: two independently written round loops, neither
-    /// delegating to the other (rule 7), on inputs the KAT does not cover.
-    #[test]
-    fn the_witness_agrees_with_the_permutation() {
-        for seed in 0..8u64 {
-            let input: [FE; HASH_STATE_FELTS] =
-                core::array::from_fn(|i| FE::from(seed.wrapping_mul(0x9E37_79B9) + i as u64));
-            let w = permutation_witness(input);
-            assert_eq!(
-                w[NUM_ROUNDS - 1].y,
-                Rpo256.permute(input),
-                "witness and permute must agree at seed {seed}"
-            );
-        }
-    }
-
-    /// The intermediates must be the ones the AIR constrains: `u2 = u²`,
-    /// `u3 = u²·u`, `y2 = y²`, `y3 = y²·y`, and the fold `(y3)²·y = v`.
-    #[test]
-    fn the_witness_records_the_degree_three_association() {
-        let input: [FE; HASH_STATE_FELTS] = core::array::from_fn(|i| FE::from(3 * i as u64 + 1));
-        let w = permutation_witness(input);
-        let mut s = input;
-        for (r, round) in w.iter().enumerate() {
-            let mixed = Rpo256::mds(&s);
-            for lane in 0..HASH_STATE_FELTS {
-                assert_eq!(
-                    round.u[lane],
-                    &mixed[lane] + FE::from(ARK1[r][lane]),
-                    "round {r} lane {lane} u"
-                );
-                assert_eq!(round.u2[lane], &round.u[lane] * &round.u[lane]);
-                assert_eq!(round.u3[lane], &round.u2[lane] * &round.u[lane]);
-                assert_eq!(round.y2[lane], &round.y[lane] * &round.y[lane]);
-                assert_eq!(round.y3[lane], &round.y2[lane] * &round.y[lane]);
-                // ★ the fold: the inverse S-box verified as the FORWARD power.
-                assert_eq!(
-                    &(&round.y3[lane] * &round.y3[lane]) * &round.y[lane],
-                    round.v[lane],
-                    "round {r} lane {lane} must satisfy (y³)²·y = v"
-                );
-            }
-            // `v` is the MDS of the forward S-box outputs, plus ARK2.
-            let x: [FE; HASH_STATE_FELTS] =
-                core::array::from_fn(|i| &(&round.u3[i] * &round.u3[i]) * &round.u[i]);
-            let mixed = Rpo256::mds(&x);
-            for lane in 0..HASH_STATE_FELTS {
-                assert_eq!(round.v[lane], &mixed[lane] + FE::from(ARK2[r][lane]));
-            }
-            s = round.y;
-        }
     }
 
     /// ★ The padding row. An all-zero row must satisfy every constraint the

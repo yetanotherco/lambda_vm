@@ -359,90 +359,13 @@ fn fill_rows_serial_reference(
     }
 }
 
-/// Writes the Poseidon round witness into a hash row whose `IN`/`S`/`OUT`
-/// columns are already filled.
+/// Writes the RPX round witness into a hash row whose `IN`/`S`/`OUT` columns are
+/// already filled.
 ///
 /// The permutation input is read back out of the row's own `IN`/`S` columns —
 /// the exact cells round 0's constraints read — rather than from the executor
 /// record, so the witness cannot describe a different input than the one the
-/// AIR constrains. `permutation_witness` supplies the intermediates in the
-/// association the degree-3 lowering needs (`x² = a·a`, `x³ = x²·a`,
-/// `a⁷ = (x³)²·a`); any other association is the same field element and a
-/// different trace, and the constraints would reject it.
-pub(super) fn fill_poseidon_witness(out: &mut [FE]) {
-    use super::chips::hash::poseidon_cols as pc;
-    use super::poseidon::{NUM_ROUNDS, permutation_witness, sboxed_lanes};
-
-    let state: [FE; HASH_STATE_FELTS] = core::array::from_fn(|i| {
-        if i < 8 {
-            out[hash::cols::IN0 + i]
-        } else {
-            out[hash::cols::S8 + (i - 8)]
-        }
-    });
-    let witness = permutation_witness(state);
-    for (r, round) in witness.iter().enumerate() {
-        for lane in 0..sboxed_lanes(r) {
-            out[pc::x2(r, lane)] = round.x2[lane];
-            out[pc::x3(r, lane)] = round.x3[lane];
-        }
-        for (j, v) in round.out.iter().enumerate() {
-            out[pc::out(r, j)] = *v;
-        }
-    }
-    debug_assert_eq!(
-        &out[hash::cols::OUT0..hash::cols::OUT0 + HASH_STATE_FELTS],
-        witness[NUM_ROUNDS - 1].out.as_slice(),
-        "the final round's output is the OUT columns the executor already wrote"
-    );
-}
-
-/// Writes the RPO round witness into a hash row whose `IN`/`S`/`OUT` columns are
-/// already filled.
-///
-/// Same discipline as [`fill_poseidon_witness`]: the permutation input is read
-/// back out of the row's own `IN`/`S` columns — the exact cells round 0's
-/// constraints read — rather than from the executor record, so the witness
-/// cannot describe a different input than the one the AIR constrains.
-///
-/// `permutation_witness` supplies the intermediates in the association the
-/// degree-3 lowering needs, including the inverse S-box's `y²`/`y³` ladder,
-/// which the AIR checks FORWARD as `(y³)²·y = v`. This filler is where the real
-/// `x^{1/7}` exponentiation is paid — twelve lanes times seven rounds per row.
-pub(super) fn fill_rpo_witness(out: &mut [FE]) {
-    use super::chips::hash::rpo_cols as rc;
-    use super::rpo::{NUM_ROUNDS, permutation_witness};
-
-    let state: [FE; HASH_STATE_FELTS] = core::array::from_fn(|i| {
-        if i < 8 {
-            out[hash::cols::IN0 + i]
-        } else {
-            out[hash::cols::S8 + (i - 8)]
-        }
-    });
-    let witness = permutation_witness(state);
-    for (r, round) in witness.iter().enumerate() {
-        for lane in 0..HASH_STATE_FELTS {
-            out[rc::u2(r, lane)] = round.u2[lane];
-            out[rc::u3(r, lane)] = round.u3[lane];
-            out[rc::y2(r, lane)] = round.y2[lane];
-            out[rc::y3(r, lane)] = round.y3[lane];
-            out[rc::y(r, lane)] = round.y[lane];
-        }
-    }
-    debug_assert_eq!(
-        &out[hash::cols::OUT0..hash::cols::OUT0 + HASH_STATE_FELTS],
-        witness[NUM_ROUNDS - 1].y.as_slice(),
-        "the final round's output is the OUT columns the executor already wrote"
-    );
-}
-
-/// Writes the RPX round witness into a hash row whose `IN`/`S`/`OUT` columns are
-/// already filled.
-///
-/// Same discipline as the other two fillers: the permutation input is read back
-/// out of the row's own `IN`/`S` columns, so the witness cannot describe a
-/// different input than the one the AIR constrains.
+/// AIR constrains.
 ///
 /// The one thing that differs is that RPX's rounds are not alike — the FB rounds
 /// write two ladders per lane, the E rounds two extension intermediates per
@@ -526,12 +449,10 @@ pub(super) fn fill_hash_row(
     out[hash::cols::OUT0..hash::cols::OUT0 + 12].copy_from_slice(&r.outs);
     match hasher {
         HasherKind::Test => {}
-        HasherKind::Poseidon => fill_poseidon_witness(out),
         // The domain is read off the row's own mode columns, which `chip_trace`
         // populated before calling this — the same discipline
         // `fill_poseidon_witness` follows for its input.
         HasherKind::Blake3 => blake3_socket::fill_socket_witness(out),
-        HasherKind::Rpo => fill_rpo_witness(out),
         HasherKind::Rpx => fill_rpx_witness(out),
         // No twelve-felt row exists under the width-16 socket: the executor's
         // `admits` refuses one, so its program's `hash` records are empty and

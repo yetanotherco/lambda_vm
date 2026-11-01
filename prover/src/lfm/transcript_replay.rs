@@ -1483,10 +1483,9 @@ fn candidates_per_coordinate(hash: WrapHash) -> usize {
         WrapHash::Blake3 => Blake3TranscriptHash::CANDIDATES_PER_COORDINATE,
         // ★ One candidate, GUARANTEED rather than probabilistic: an algebraic
         // squeeze returns felts canonical by construction, so a carved `u64`
-        // cannot miss. All three algebraic configurations share it, which is
-        // why one arm serves them (`SOUNDNESS.md` §6.4).
+        // cannot miss (`SOUNDNESS.md` §6.4).
         WrapHash::Algebraic => {
-            super::algebraic_commit::AlgebraicRpoTranscriptHash::CANDIDATES_PER_COORDINATE
+            super::algebraic_commit::AlgebraicRpxTranscriptHash::CANDIDATES_PER_COORDINATE
         }
         // ZisK's transcript squeezes canonical felts too: one per coordinate.
         WrapHash::Poseidon1 => {

@@ -655,7 +655,7 @@ fn a_p1_static_is_taken_at_its_own_key_only() {
     );
     // A third configuration: neither the legacy pin nor Poseidon1. Should the
     // pin ever become this hash, name another here.
-    type Third = crate::lfm::algebraic_commit::RpoStarkHash;
+    type Third = stark::config::KeccakStarkHash;
     let third = <Third as stark::config::StarkHash>::COMMITMENT_HASH;
     assert_ne!(third, crate::hash_pin::BLOCK_COMMITMENT_HASH);
     assert_ne!(third, stark::config::CommitmentHash::Poseidon1);

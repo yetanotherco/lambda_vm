@@ -569,13 +569,13 @@ fn fri_toy_proves_and_verifies_under_blake3() {
     assert_eq!(proved.public_words[1].1, inner.commitments[1]);
 }
 
-/// The same program under the other two hashers — B1 and option C both changed
-/// shared constructions, so all three must stay green.
+/// The same program under the other hashers — B1 and option C both changed
+/// shared constructions, so all of them must stay green.
 #[test]
 fn fri_toy_proves_and_verifies_under_every_hasher() {
     let opts = options();
     let program = super::programs::fri_toy_program();
-    for kind in [HasherKind::Test, HasherKind::Poseidon, HasherKind::Blake3] {
+    for kind in [HasherKind::Test, HasherKind::Rpx, HasherKind::Blake3] {
         let inner = super::fixture::fixture_prove_with_hasher(kind);
         let artifacts = build_artifacts_with_hasher(&program, &opts, kind);
         let proved = lfm_prove_with_hasher(&program, &artifacts, &fri_arenas(&inner), &opts, kind)
@@ -739,22 +739,10 @@ fn leaf_row_with_third_cell(
             let out = kind.permute(state);
             row[cols::OUT0..cols::OUT0 + out.len()].copy_from_slice(&out);
         }
-        HasherKind::Poseidon => {
-            // The filler reads `IN`/`S` back out of the row and writes every
-            // round intermediate AND `OUT`, so the whole witness follows the
-            // junk rather than only the final output.
-            super::trace::fill_poseidon_witness(&mut row);
-        }
-        HasherKind::Rpo => {
-            // Same as Poseidon's: the filler is the whole witness, so the junk
-            // propagates through every round rather than only into `OUT`.
-            let out = kind.leaf_out(acc, felts);
-            row[cols::OUT0..cols::OUT0 + out.len()].copy_from_slice(&out);
-            super::trace::fill_rpo_witness(&mut row);
-        }
         HasherKind::Rpx => {
-            // Same as RPO's: the filler is the whole witness, so the junk
-            // propagates through every round rather than only into `OUT`.
+            // The filler reads `IN`/`S` back out of the row and writes every
+            // round intermediate, so the junk propagates through every round
+            // rather than only into `OUT`.
             let out = kind.leaf_out(acc, felts);
             row[cols::OUT0..cols::OUT0 + out.len()].copy_from_slice(&out);
             super::trace::fill_rpx_witness(&mut row);
@@ -796,7 +784,7 @@ fn d1_the_unread_input_pins_are_load_bearing_under_every_hasher() {
     let felts = felts_of(&LEAF_VECTORS[3].felts);
     let zero: LfmWord = [FE::zero(); 4];
 
-    for kind in [HasherKind::Test, HasherKind::Poseidon, HasherKind::Blake3] {
+    for kind in [HasherKind::Test, HasherKind::Rpx, HasherKind::Blake3] {
         // HONEST CONTROL FIRST: the pin must not reject honest rows. It cannot —
         // every arm's `leaf_out` leaves the unread cell zero — but a fix that
         // rejected everything would pass the negative leg on its own.

@@ -45,7 +45,7 @@ pub trait LfmHasher {
     /// The default is [`LfmHasher::compress_iv`], which is the single-domain
     /// reading and carries the weakening [`LfmHasher::transcript_out`] records.
     /// A hasher that separates its domains through the CAPACITY — the natural
-    /// hook for a sponge, and what RPO uses — overrides this instead of
+    /// hook for a sponge, and what RPX uses — overrides this instead of
     /// overriding `transcript_out`, because then the chip's `S8` copy
     /// constraint separates the domains too rather than the host doing it alone.
     fn transcript_iv(&self) -> LfmWord {
@@ -110,21 +110,20 @@ pub trait LfmHasher {
     /// shape as [`LfmHasher::compress`], in the TRANSCRIPT hash domain.
     ///
     /// The default is `compress_out` — correct for a hasher with a single
-    /// domain, which is what `TestPermutation` and Poseidon are here. A hasher
+    /// domain, which is what `TestPermutation` is here. A hasher
     /// that *has* domain separation overrides it, and BLAKE3 does: its socket
     /// carries the domain tag in a message word, so a transcript step
     /// and a Merkle parent over the same two cells are different digests.
     ///
     /// ⚠ The default is a real weakening for a hasher that ALSO leaves
     /// [`LfmHasher::transcript_iv`] at its default, and it is deliberate rather
-    /// than overlooked: under `Test` and `Poseidon` a transcript step IS a
-    /// Merkle parent, so those two hashers separate the domains not at all.
-    /// Neither is a production hash — `TestPermutation` is explicitly
-    /// non-cryptographic and Poseidon here is measurement-only.
+    /// than overlooked: under `Test` a transcript step IS a Merkle parent, so
+    /// that hasher separates the domains not at all. It is not a production
+    /// hash — `TestPermutation` is explicitly non-cryptographic.
     ///
     /// A production candidate must separate them, by ONE of two mechanisms:
     /// override this function (BLAKE3 does — its domain rides in a message
-    /// word), or override `transcript_iv` and let this default carry it (RPO
+    /// word), or override `transcript_iv` and let this default carry it (RPX
     /// does — its domain rides in the capacity, which has the advantage that the
     /// chip's `S8` copy constraint separates the domains too).
     fn transcript_out(&self, a: &LfmWord, b: &LfmWord) -> [FE; HASH_STATE_FELTS] {
@@ -149,9 +148,9 @@ pub trait LfmHasher {
     /// the shape of this signature is worth the ripple.
     ///
     /// The default is a compress of the accumulator against the felts, which is
-    /// the natural reading for a **field-native** hasher: `TestPermutation` and
-    /// Poseidon take arbitrary Goldilocks elements directly, so a leaf needs no
-    /// encoding from them.
+    /// the natural reading for a **field-native** hasher: `TestPermutation`
+    /// takes arbitrary Goldilocks elements directly, so a leaf needs no encoding
+    /// from it.
     ///
     /// BLAKE3 overrides it, and the override is the point of the whole mode: its
     /// lanes must be `u32`, so each felt becomes a checked `lo`/`hi` pair inside
@@ -160,9 +159,8 @@ pub trait LfmHasher {
     /// ⚠ Same weakening as [`LfmHasher::transcript_out`], with the same two
     /// escapes: a hasher that overrides neither this nor
     /// [`LfmHasher::leaf_iv`] does not separate a leaf from a parent, so under
-    /// `Test` and `Poseidon` the O5 second-preimage split is carried by fixed
-    /// tree depth alone. BLAKE3 escapes by overriding this; RPO escapes by
-    /// overriding `leaf_iv`.
+    /// `Test` the O5 second-preimage split is carried by fixed tree depth alone.
+    /// BLAKE3 escapes by overriding this; RPX escapes by overriding `leaf_iv`.
     fn leaf_out(&self, acc: &LfmWord, felts: &LfmWord) -> [FE; HASH_STATE_FELTS] {
         self.permute_two_cells(acc, felts, &self.leaf_iv())
     }
@@ -301,6 +299,8 @@ impl LfmHasher for TestPermutation {
 /// The discriminants are written out and `#[repr(u8)]` because [`as_tag`] feeds
 /// `lfm_program_id`'s preimage: the wire value must never follow declaration
 /// order, or inserting a variant would silently move every program digest.
+/// Values 1 and 3 belonged to the retired Poseidon-original and RPO arms and
+/// are never reused.
 ///
 /// [`as_tag`]: HasherKind::as_tag
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -309,9 +309,6 @@ pub enum HasherKind {
     /// [`TestPermutation`] — NOT cryptographic. One degree-3 round.
     #[default]
     Test = 0,
-    /// [`super::poseidon::PoseidonGoldilocks`] — Poseidon-original, width 12,
-    /// `x^7`, 8 full + 22 partial rounds.
-    Poseidon = 1,
     /// [`super::blake3_socket::Blake3Permutation`] — BLAKE3 behind the Option-A
     /// 2-to-1 compress socket, `compress` only.
     ///
@@ -321,22 +318,16 @@ pub enum HasherKind {
     /// with a restricted domain — no `permute` socket, and `u32` lanes — which
     /// [`LfmHasher::admits`] enforces.
     Blake3 = 2,
-    /// [`super::rpo::Rpo256`] — Rescue-Prime Optimized, width 12, rate 8,
-    /// 7 rounds of `x^7` / `x^{1/7}`.
-    ///
-    /// The first candidate here that is BOTH field-native (so it needs no
-    /// felt→`u32` encoding, and its digest cell is a full 4-felt ~128-bit
-    /// digest rather than the socket's documented 64-bit one) and
-    /// domain-separated (through the capacity, see [`LfmHasher::mode_iv`]).
-    Rpo = 3,
     /// [`super::rpx::Rpx256`] — Rescue-Prime eXtended (XHash12), width 12,
     /// `FB E FB E FB E M`.
     ///
     /// RPO's geometry with RPO's constants and a different round schedule:
     /// three of the seven rounds trade the ~2^63-dense inverse S-box for a
     /// seventh power in the degree-3 EXTENSION field, and the last round is
-    /// linear. Cheaper on the host and narrower in the AIR than [`Self::Rpo`],
-    /// at a weaker provenance — miden publishes no known-answer table for it.
+    /// linear. Cheaper on the host and narrower in the AIR than RPO, at a
+    /// weaker provenance — miden publishes no known-answer table for it, so
+    /// [`super::rpo`]'s known-answer vectors anchor the constants the two
+    /// share.
     Rpx = 4,
     /// ZisK's Poseidon1 at width 16 (`crypto::hash::poseidon1_w16`) behind
     /// the width-16 socket ([`super::p1w16_socket`]): four cells in, four out,
@@ -360,9 +351,7 @@ impl LfmHasher for HasherKind {
     fn permute(&self, state: [FE; HASH_STATE_FELTS]) -> [FE; HASH_STATE_FELTS] {
         match self {
             HasherKind::Test => TestPermutation.permute(state),
-            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.permute(state),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.permute(state),
-            HasherKind::Rpo => super::rpo::Rpo256.permute(state),
             HasherKind::Rpx => super::rpx::Rpx256.permute(state),
             HasherKind::Poseidon1W16 => Poseidon1W16Narrow.permute(state),
         }
@@ -371,16 +360,14 @@ impl LfmHasher for HasherKind {
     fn compress_iv(&self) -> LfmWord {
         match self {
             HasherKind::Test => TestPermutation.compress_iv(),
-            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.compress_iv(),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.compress_iv(),
-            HasherKind::Rpo => super::rpo::Rpo256.compress_iv(),
             HasherKind::Rpx => super::rpx::Rpx256.compress_iv(),
             HasherKind::Poseidon1W16 => Poseidon1W16Narrow.compress_iv(),
         }
     }
 
-    /// Delegated explicitly, for the same reason `compress_out` is: RPO is the
-    /// one candidate whose transcript CAPACITY differs from its compress one,
+    /// Delegated explicitly, for the same reason `compress_out` is: RPX's
+    /// transcript CAPACITY differs from its compress one,
     /// and a dispatch that fell through to this enum's own `compress_iv` would
     /// hand the executor and the trace filler a capacity the chip does not
     /// constrain — a host/chip disagreement, not a wrong answer the chip
@@ -388,9 +375,7 @@ impl LfmHasher for HasherKind {
     fn transcript_iv(&self) -> LfmWord {
         match self {
             HasherKind::Test => TestPermutation.transcript_iv(),
-            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.transcript_iv(),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.transcript_iv(),
-            HasherKind::Rpo => super::rpo::Rpo256.transcript_iv(),
             HasherKind::Rpx => super::rpx::Rpx256.transcript_iv(),
             HasherKind::Poseidon1W16 => Poseidon1W16Narrow.transcript_iv(),
         }
@@ -400,9 +385,7 @@ impl LfmHasher for HasherKind {
     fn leaf_iv(&self) -> LfmWord {
         match self {
             HasherKind::Test => TestPermutation.leaf_iv(),
-            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.leaf_iv(),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.leaf_iv(),
-            HasherKind::Rpo => super::rpo::Rpo256.leaf_iv(),
             HasherKind::Rpx => super::rpx::Rpx256.leaf_iv(),
             HasherKind::Poseidon1W16 => Poseidon1W16Narrow.leaf_iv(),
         }
@@ -413,9 +396,7 @@ impl LfmHasher for HasherKind {
     fn compress(&self, a: &LfmWord, b: &LfmWord) -> LfmWord {
         match self {
             HasherKind::Test => TestPermutation.compress(a, b),
-            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.compress(a, b),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.compress(a, b),
-            HasherKind::Rpo => super::rpo::Rpo256.compress(a, b),
             HasherKind::Rpx => super::rpx::Rpx256.compress(a, b),
             HasherKind::Poseidon1W16 => Poseidon1W16Narrow.compress(a, b),
         }
@@ -427,9 +408,7 @@ impl LfmHasher for HasherKind {
     fn compress_out(&self, a: &LfmWord, b: &LfmWord) -> [FE; HASH_STATE_FELTS] {
         match self {
             HasherKind::Test => TestPermutation.compress_out(a, b),
-            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.compress_out(a, b),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.compress_out(a, b),
-            HasherKind::Rpo => super::rpo::Rpo256.compress_out(a, b),
             HasherKind::Rpx => super::rpx::Rpx256.compress_out(a, b),
             HasherKind::Poseidon1W16 => Poseidon1W16Narrow.compress_out(a, b),
         }
@@ -443,9 +422,7 @@ impl LfmHasher for HasherKind {
     fn transcript_out(&self, a: &LfmWord, b: &LfmWord) -> [FE; HASH_STATE_FELTS] {
         match self {
             HasherKind::Test => TestPermutation.transcript_out(a, b),
-            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.transcript_out(a, b),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.transcript_out(a, b),
-            HasherKind::Rpo => super::rpo::Rpo256.transcript_out(a, b),
             HasherKind::Rpx => super::rpx::Rpx256.transcript_out(a, b),
             HasherKind::Poseidon1W16 => Poseidon1W16Narrow.transcript_out(a, b),
         }
@@ -454,9 +431,7 @@ impl LfmHasher for HasherKind {
     fn transcript(&self, a: &LfmWord, b: &LfmWord) -> LfmWord {
         match self {
             HasherKind::Test => TestPermutation.transcript(a, b),
-            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.transcript(a, b),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.transcript(a, b),
-            HasherKind::Rpo => super::rpo::Rpo256.transcript(a, b),
             HasherKind::Rpx => super::rpx::Rpx256.transcript(a, b),
             HasherKind::Poseidon1W16 => Poseidon1W16Narrow.transcript(a, b),
         }
@@ -469,9 +444,7 @@ impl LfmHasher for HasherKind {
     fn leaf_out(&self, acc: &LfmWord, felts: &LfmWord) -> [FE; HASH_STATE_FELTS] {
         match self {
             HasherKind::Test => TestPermutation.leaf_out(acc, felts),
-            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.leaf_out(acc, felts),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.leaf_out(acc, felts),
-            HasherKind::Rpo => super::rpo::Rpo256.leaf_out(acc, felts),
             HasherKind::Rpx => super::rpx::Rpx256.leaf_out(acc, felts),
             HasherKind::Poseidon1W16 => Poseidon1W16Narrow.leaf_out(acc, felts),
         }
@@ -480,9 +453,7 @@ impl LfmHasher for HasherKind {
     fn leaf(&self, acc: &LfmWord, felts: &LfmWord) -> LfmWord {
         match self {
             HasherKind::Test => TestPermutation.leaf(acc, felts),
-            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.leaf(acc, felts),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.leaf(acc, felts),
-            HasherKind::Rpo => super::rpo::Rpo256.leaf(acc, felts),
             HasherKind::Rpx => super::rpx::Rpx256.leaf(acc, felts),
             HasherKind::Poseidon1W16 => Poseidon1W16Narrow.leaf(acc, felts),
         }
@@ -491,9 +462,7 @@ impl LfmHasher for HasherKind {
     fn admits(&self, mode: HashMode, state: &[FE; HASH_STATE_FELTS]) -> Result<(), &'static str> {
         match self {
             HasherKind::Test => TestPermutation.admits(mode, state),
-            HasherKind::Poseidon => super::poseidon::PoseidonGoldilocks.admits(mode, state),
             HasherKind::Blake3 => super::blake3_socket::Blake3Permutation.admits(mode, state),
-            HasherKind::Rpo => super::rpo::Rpo256.admits(mode, state),
             HasherKind::Rpx => super::rpx::Rpx256.admits(mode, state),
             HasherKind::Poseidon1W16 => Poseidon1W16Narrow.admits(mode, state),
         }

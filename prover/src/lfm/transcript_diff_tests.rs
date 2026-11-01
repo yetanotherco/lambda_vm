@@ -31,9 +31,7 @@ use math::traits::AsBytes;
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 
-use super::algebraic_commit::{
-    AlgebraicHasher, PoseidonCommit, RpoCommit, RpxCommit, commitment_to_digest,
-};
+use super::algebraic_commit::{AlgebraicHasher, RpxCommit, commitment_to_digest};
 use super::algebraic_transcript::AlgebraicTranscript;
 use super::builder::LfmBuilder;
 use super::compiler::compile;
@@ -45,9 +43,7 @@ use crate::tables::types::{FE, FEE};
 
 macro_rules! for_each_tenant {
     ($body:ident) => {
-        $body::<RpoCommit>("Rpo");
         $body::<RpxCommit>("Rpx");
-        $body::<PoseidonCommit>("Poseidon");
     };
 }
 

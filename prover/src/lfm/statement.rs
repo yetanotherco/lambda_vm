@@ -53,14 +53,14 @@ pub(crate) const LFM_STATEMENT_TAG: &[u8] = b"LAMBDAVM_LFM_STATEMENT_V1";
 /// decision unskippable by refusing to compile; this makes it unskippable by
 /// having no default.
 ///
-/// Tags are frozen. Changing one re-blesses every `LFM_REGISTRY` entry.
+/// Tags are frozen. Changing one re-blesses every `LFM_REGISTRY` entry. Tags 2
+/// and 4 belonged to the retired RPO and Poseidon-original configurations and
+/// are never reused.
 pub(crate) const fn commitment_hash_tag(hash: CommitmentHash) -> u8 {
     match hash {
         CommitmentHash::Keccak256 => 0,
         CommitmentHash::Blake3 => 1,
-        CommitmentHash::Rpo256 => 2,
         CommitmentHash::Rpx256 => 3,
-        CommitmentHash::Poseidon => 4,
         CommitmentHash::Poseidon1 => 5,
     }
 }

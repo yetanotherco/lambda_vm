@@ -2625,7 +2625,7 @@ fn the_registry_is_six_unambiguous_rows() {
 /// hasher gets its own program identity rather than sharing one.
 const ALL_HASHERS: [super::hash::HasherKind; 3] = [
     super::hash::HasherKind::Test,
-    super::hash::HasherKind::Poseidon,
+    super::hash::HasherKind::Rpx,
     super::hash::HasherKind::Blake3,
 ];
 
@@ -2636,7 +2636,7 @@ const ALL_HASHERS: [super::hash::HasherKind; 3] = [
 /// what the stored `(roots, heights, chunks, hasher)` derive, so the table is
 /// internally consistent. The second is the property — swapping *only* the
 /// hasher, with every root held fixed, must move the digest. Held together they
-/// say a Test-backed and a Poseidon-backed machine of the same program are two
+/// say a Test-backed and an RPX-backed machine of the same program are two
 /// programs, which is what stops a verifier from pairing one hasher's digest
 /// with another hasher's AIR set.
 #[test]

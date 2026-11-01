@@ -1458,7 +1458,7 @@ fn a_blake3_proof_does_not_verify_under_another_hasher() {
     let proved =
         lfm_prove_with_hasher(&program, &artifacts, &arenas(), &opts, KIND).expect("prove");
 
-    for other in [HasherKind::Test, HasherKind::Poseidon] {
+    for other in [HasherKind::Test, HasherKind::Rpx] {
         // The digest stays the proved-under one: this isolates the AIR-set
         // mismatch rather than passing because the statement also moved.
         assert!(
@@ -1489,14 +1489,14 @@ fn the_blake3_choice_moves_the_program_digest_and_no_root() {
     let program = compress_program();
     let test = build_artifacts_with_hasher(&program, &opts, HasherKind::Test);
     let blake = build_artifacts_with_hasher(&program, &opts, KIND);
-    let pos = build_artifacts_with_hasher(&program, &opts, HasherKind::Poseidon);
+    let rpx = build_artifacts_with_hasher(&program, &opts, HasherKind::Rpx);
 
     assert_eq!(build_artifacts(&program, &opts).program_id, test.program_id);
     assert_eq!(test.roots, blake.roots, "no root may move with the hasher");
     assert_eq!(test.log_heights, blake.log_heights);
     assert_eq!(test.keccak_rnd_chunks, blake.keccak_rnd_chunks);
     assert_ne!(test.program_id, blake.program_id);
-    assert_ne!(pos.program_id, blake.program_id);
+    assert_ne!(rpx.program_id, blake.program_id);
     assert_eq!(KIND.as_tag(), 2, "the wire tag is written out, not derived");
 }
 
@@ -1630,7 +1630,7 @@ fn the_trivial_program_proves_and_verifies_under_blake3() {
 fn every_hash_candidate_emits_each_constraint_index_exactly_once() {
     for (set, kind) in [
         (HashConstraints::TEST, HasherKind::Test),
-        (HashConstraints::POSEIDON, HasherKind::Poseidon),
+        (HashConstraints::RPX, HasherKind::Rpx),
         (HashConstraints::BLAKE3, HasherKind::Blake3),
     ] {
         let declared = HashConstraints::num_constraints(kind);

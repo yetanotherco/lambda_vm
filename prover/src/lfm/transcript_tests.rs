@@ -575,7 +575,7 @@ fn the_transcript_proves_and_verifies_under_blake3() {
 fn the_transcript_proves_and_verifies_under_every_hasher() {
     let opts = options();
     let program = preamble_program();
-    for kind in [HasherKind::Test, HasherKind::Poseidon, HasherKind::Blake3] {
+    for kind in [HasherKind::Test, HasherKind::Rpx, HasherKind::Blake3] {
         let artifacts = build_artifacts_with_hasher(&program, &opts, kind);
         let proved = lfm_prove_with_hasher(&program, &artifacts, &preamble_arena(), &opts, kind)
             .unwrap_or_else(|e| panic!("prove under {kind:?}: {e:?}"));
@@ -601,7 +601,7 @@ fn the_transcript_proves_and_verifies_under_every_hasher() {
 #[test]
 fn the_machine_and_the_host_chain_agree_under_every_hasher() {
     let program = preamble_program();
-    for kind in [HasherKind::Test, HasherKind::Poseidon, HasherKind::Blake3] {
+    for kind in [HasherKind::Test, HasherKind::Rpx, HasherKind::Blake3] {
         // BLAKE3 needs u32 lanes (O1); the vector's inputs are u32 either way,
         // so one arena serves all three hashers.
         let exec = execute(&program, &preamble_arena(), &kind).expect("executes");

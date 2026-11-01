@@ -156,22 +156,10 @@ pub enum CommitmentHash {
     /// proof's roots are named by this variant plus the build's feature set,
     /// exactly as the `LFM_BLAKE3` chip's round count is.
     Blake3,
-    /// RPO256 at both the leaf and the parent layer — the rate-8 overwrite
-    /// duplex for leaves, `compress` for parents.
-    ///
-    /// ★ The three algebraic variants below share one backend implementation
-    /// (`prover::lfm::algebraic_commit`); they are separate variants because a
-    /// proof's roots must NAME which permutation built them, exactly as
-    /// `HasherKind` does for the machine's own chip. A fourth candidate is a
-    /// variant plus a tag, and nothing else.
-    Rpo256,
-    /// RPX256 (XHash12) at both layers. Same geometry and constants as
-    /// [`Self::Rpo256`], a different round schedule.
+    /// RPX256 (XHash12) at both layers: RPO256's geometry and constants, a
+    /// different round schedule. Its backend lives in
+    /// `prover::lfm::algebraic_commit`, beside the machine's own chip.
     Rpx256,
-    /// ⚠ Poseidon-original at both layers — **UNSHIPPABLE** (broken family;
-    /// eprint 2026/306 and 2026/1692). Present so the comparison has its priced
-    /// reference and its control, never as a candidate.
-    Poseidon,
     /// ZisK's Poseidon1 instance (Goldilocks, width 16, rate 12; `crypto::hash::
     /// poseidon1_stark`): ZisK's leaf hash and ARITY-4 trees. ⚠ An exploration
     /// configuration (branch `p1/*`), not a candidate for landing.

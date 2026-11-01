@@ -510,7 +510,7 @@ fn rpx_gpu_grind_valid_at_the_production_factor() {
 /// correct — so validity alone would pass with the device never touched, which
 /// is exactly the failure this feature can have. The RPX counter counts only
 /// device searches whose nonce passed the host check, so the deltas are the
-/// claim; the RPO arm is the control that makes the RPX one mean something.
+/// claim; the BLAKE3 arm is the control that makes the RPX one mean something.
 ///
 /// ⚠ **The control is a different DIGEST, not a different argument.** The arm
 /// used to be a runtime `CommitmentHash` handed in beside the digest, so one
@@ -523,11 +523,10 @@ fn rpx_gpu_grind_valid_at_the_production_factor() {
 /// One test rather than two because the counters are process-global. Nothing
 /// else in this binary grinds.
 #[test]
-fn the_rpx_dispatch_reaches_the_device_and_rpo_does_not() {
+fn the_rpx_dispatch_reaches_the_device_and_blake3_does_not() {
     use stark::grinding::{DeviceGrindKey, GrindDigest};
 
-    type RpoGrind =
-        stark::config::GrindingDigest<lambda_vm_prover::lfm::algebraic_commit::RpoStarkHash>;
+    type Blake3Grind = stark::config::GrindingDigest<stark::config::Blake3StarkHash>;
 
     // The claim the arms rest on, asserted rather than assumed.
     assert_eq!(
@@ -536,9 +535,9 @@ fn the_rpx_dispatch_reaches_the_device_and_rpo_does_not() {
         "the RPX configuration must declare the RPX device arm"
     );
     assert_eq!(
-        <RpoGrind as GrindDigest>::DEVICE_GRIND,
+        <Blake3Grind as GrindDigest>::DEVICE_GRIND,
         None,
-        "RPO has no grind kernel, so it must declare none"
+        "BLAKE3 has no grind kernel, so it must declare none"
     );
 
     let seed = [7u8; 32];
@@ -563,9 +562,9 @@ fn the_rpx_dispatch_reaches_the_device_and_rpo_does_not() {
     let before_rpx = stark::gpu_lde::gpu_grind_calls_rpx();
     let before_keccak = stark::gpu_lde::gpu_grind_calls();
     let nonce =
-        stark::grinding::generate_nonce_maybe_gpu::<RpoGrind>(&seed, factor).expect("a nonce");
+        stark::grinding::generate_nonce_maybe_gpu::<Blake3Grind>(&seed, factor).expect("a nonce");
     assert!(
-        stark::grinding::is_valid_nonce::<RpoGrind>(&seed, nonce, factor),
+        stark::grinding::is_valid_nonce::<Blake3Grind>(&seed, nonce, factor),
         "the host-search nonce {nonce} fails is_valid_nonce"
     );
     assert_eq!(

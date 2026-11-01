@@ -137,9 +137,7 @@ fn checked_base_refuses_what_no_block_proves() {
     for hash in [
         CommitmentHash::Keccak256,
         CommitmentHash::Blake3,
-        CommitmentHash::Rpo256,
         CommitmentHash::Rpx256,
-        CommitmentHash::Poseidon,
     ] {
         let base = BaseFormat {
             hash,

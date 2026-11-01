@@ -108,15 +108,9 @@ pub enum DeviceHash {
     Keccak256,
     /// `Blake3Chain` leaves and parents at the compiled round count.
     Blake3,
-    /// RPO256 leaves and parents. No device kernels yet: every dispatch site
-    /// aborts loudly on this key.
-    Rpo256,
     /// RPX256 (XHash12) leaves and parents — [`rpx`]'s kernels, the
     /// algebraic family's first device port.
     Rpx256,
-    /// ⚠ Poseidon-original — UNSHIPPABLE on the host side too; present so the
-    /// key set mirrors `CommitmentHash` one-to-one. No device kernels.
-    Poseidon,
     /// ZisK's Poseidon1 instance (width 16, rate 12, arity-4 trees) — the
     /// `p1/*` exploration branch. Kernels in [`p1w16`]; a dispatch site not yet
     /// wired aborts loudly on this key.
@@ -129,9 +123,7 @@ impl DeviceHash {
         match self {
             Self::Keccak256 => "keccak256",
             Self::Blake3 => "blake3-chain",
-            Self::Rpo256 => "rpo256",
             Self::Rpx256 => "rpx256",
-            Self::Poseidon => "poseidon-goldilocks",
             Self::Poseidon1 => "poseidon1-w16",
         }
     }
@@ -141,7 +133,7 @@ impl DeviceHash {
     pub const fn arity(self) -> usize {
         match self {
             Self::Poseidon1 => p1_stark::ARITY,
-            Self::Keccak256 | Self::Blake3 | Self::Rpo256 | Self::Rpx256 | Self::Poseidon => 2,
+            Self::Keccak256 | Self::Blake3 | Self::Rpx256 => 2,
         }
     }
 }

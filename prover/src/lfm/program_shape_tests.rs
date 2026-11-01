@@ -27,13 +27,7 @@ use super::registry::{LfmArtifacts, build_artifacts, build_artifacts_with_hasher
 use super::statement::{lfm_program_id, lfm_program_id_chunked};
 use super::word::LfmWord;
 
-const HASHERS: [HasherKind; 5] = [
-    HasherKind::Test,
-    HasherKind::Poseidon,
-    HasherKind::Blake3,
-    HasherKind::Rpo,
-    HasherKind::Rpx,
-];
+const HASHERS: [HasherKind; 3] = [HasherKind::Test, HasherKind::Blake3, HasherKind::Rpx];
 
 fn options() -> ProofOptions {
     GoldilocksCubicProofOptions::with_blowup(2).expect("options")

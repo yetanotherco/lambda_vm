@@ -294,7 +294,6 @@ fn constraint_program_sizes() {
             Layout::Compact.value_columns(),
         ),
         ("rpx", size(&HashConstraints::RPX), 0),
-        ("poseidon w12", size(&HashConstraints::POSEIDON), 0),
     ] {
         assert!(nodes > 0);
         println!("PROGRAM {name}: nodes {nodes} muls {muls} value-cols {cols}");

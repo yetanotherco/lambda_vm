@@ -869,10 +869,7 @@ fn coset_leaf_kernel(
             };
             return Ok((kernel, crate::p1_stark::launch_cfg(num_leaves)));
         }
-        (
-            crate::DeviceHash::Blake3 | crate::DeviceHash::Rpo256 | crate::DeviceHash::Poseidon,
-            _,
-        ) => return Err(crate::invalid_value()),
+        (crate::DeviceHash::Blake3, _) => return Err(crate::invalid_value()),
     };
     Ok((kernel, keccak_launch_cfg(num_leaves)))
 }

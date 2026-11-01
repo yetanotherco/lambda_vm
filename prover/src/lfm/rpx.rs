@@ -140,8 +140,8 @@ pub mod cubic_ext {
     }
 }
 
-/// One **FB** round's recorded intermediates — identical in shape to
-/// [`super::rpo::RpoRound`], because it is the same round.
+/// One **FB** round's recorded intermediates — RPO's round, in the same
+/// shape.
 #[derive(Clone, Copy, Debug)]
 pub struct FbRound {
     /// `u = MDS(state) + ARK1[r]` — the forward S-box input.

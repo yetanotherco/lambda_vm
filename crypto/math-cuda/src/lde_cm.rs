@@ -599,9 +599,6 @@ pub(crate) fn launch_col_major_leaves(
             crate::rpx::rpx_launch_cfg(threads),
         ),
         (DeviceHash::Poseidon1, _) => unreachable!("Poseidon1 leaves launched above"),
-        (DeviceHash::Rpo256 | DeviceHash::Poseidon, _) => {
-            unimplemented!("{hash:?} device commit not yet ported (column-major leaves)")
-        }
     };
     unsafe {
         stream

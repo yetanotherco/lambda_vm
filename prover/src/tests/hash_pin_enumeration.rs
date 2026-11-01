@@ -218,15 +218,17 @@ const BLESSED: &[(&str, &str)] = &[
          by design.",
     ),
     (
-        "lfm/rpo_chip_tests.rs",
-        "Asserts `HasherKind::default() == HasherKind::Test` — the assertion's \
-         whole content is what the default is.",
-    ),
-    ("lfm/poseidon_chip_tests.rs", "As `rpo_chip_tests.rs`."),
-    (
         "lfm/machine_tests.rs",
         "Host-side BYTE-transcript differentials: the oracle for the machine's \
          byte `TranscriptReplay` arm is deliberately the byte transcript.",
+    ),
+    (
+        "tests/static_commitments_tests.rs",
+        "One mention, and it NAMES its hash: `KeccakStarkHash` is the third \
+         configuration the static-root test needs, neither the legacy pin nor \
+         Poseidon1, so its roots take the computed-once path. The roots stay \
+         inside the `#[test]` body and are compared with each other; nothing \
+         that follows the pin is handed them.",
     ),
     (
         "lfm/algebraic_commit.rs",

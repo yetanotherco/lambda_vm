@@ -1,9 +1,8 @@
 //! Merkle commitment backends for an ALGEBRAIC hash — item A.
 //!
-//! One implementation, generic over the permutation. RPO, RPX and the Poseidon
-//! reference are **type tags**, not three code paths: that is the objective the
-//! whole lane is organised around, and it is what makes a fifth candidate cost
-//! a permutation plus a const.
+//! One implementation, generic over the permutation: a permutation is a **type
+//! tag**, not a code path, so another candidate costs a permutation plus a
+//! const. RPX is the one tag today.
 //!
 //! # What made this small
 //!
@@ -91,30 +90,12 @@ pub trait AlgebraicHasher: Clone + Copy + Default + Send + Sync + 'static {
     const COMMITMENT_HASH: CommitmentHash;
 }
 
-/// Rescue-Prime Optimized.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub struct RpoCommit;
-impl AlgebraicHasher for RpoCommit {
-    const KIND: HasherKind = HasherKind::Rpo;
-    const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Rpo256;
-}
-
 /// Rescue-Prime eXtended (XHash12).
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct RpxCommit;
 impl AlgebraicHasher for RpxCommit {
     const KIND: HasherKind = HasherKind::Rpx;
     const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Rpx256;
-}
-
-/// ⚠ Poseidon-original — **UNSHIPPABLE** (broken family; eprint 2026/306 and
-/// 2026/1692). Present so the comparison has its priced reference column and
-/// its control, never as a candidate.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub struct PoseidonCommit;
-impl AlgebraicHasher for PoseidonCommit {
-    const KIND: HasherKind = HasherKind::Poseidon;
-    const COMMITMENT_HASH: CommitmentHash = CommitmentHash::Poseidon;
 }
 
 /// Four felts as a 32-byte `Commitment`, canonical big-endian.
@@ -519,8 +500,6 @@ impl<H: AlgebraicHasher> AlgebraicDigest<H> {
 impl<H: AlgebraicHasher> stark::grinding::GrindDigest for AlgebraicDigest<H> {
     const DEVICE_GRIND: Option<stark::grinding::DeviceGrindKey> = match H::COMMITMENT_HASH {
         CommitmentHash::Rpx256 => Some(stark::grinding::DeviceGrindKey::Rpx256),
-        // RPO and Poseidon have leaf and parent kernels but no nonce search,
-        // so the host is not a fallback here, it is the only arm.
         _ => None,
     };
 }
@@ -589,22 +568,10 @@ macro_rules! algebraic_transcript_hash {
 }
 
 algebraic_transcript_hash!(
-    AlgebraicRpoTranscriptHash,
-    RpoCommit,
-    "rpo256",
-    "The RPO256 Fiat–Shamir configuration."
-);
-algebraic_transcript_hash!(
     AlgebraicRpxTranscriptHash,
     RpxCommit,
     "rpx256",
     "The RPX256 (XHash12) Fiat–Shamir configuration."
-);
-algebraic_transcript_hash!(
-    AlgebraicPoseidonTranscriptHash,
-    PoseidonCommit,
-    "poseidon-goldilocks",
-    "⚠ The Poseidon Fiat–Shamir configuration — UNSHIPPABLE, reference only."
 );
 
 /// ★★ **THE COMMITMENT CONFIGURATIONS** — the piece that makes an algebraic hash
@@ -671,25 +638,13 @@ macro_rules! algebraic_stark_hash {
 }
 
 algebraic_stark_hash!(
-    RpoStarkHash,
-    RpoCommit,
-    AlgebraicRpoTranscriptHash,
-    "The RPO256 commitment configuration."
-);
-algebraic_stark_hash!(
     RpxStarkHash,
     RpxCommit,
     AlgebraicRpxTranscriptHash,
     "The RPX256 (XHash12) commitment configuration."
 );
-algebraic_stark_hash!(
-    PoseidonStarkHash,
-    PoseidonCommit,
-    AlgebraicPoseidonTranscriptHash,
-    "⚠ The Poseidon commitment configuration — UNSHIPPABLE, reference only."
-);
 
-/// ✓ The three configurations are INHABITED at the fields the prover actually
+/// ✓ The configuration is INHABITED at the fields the prover actually
 /// commits over — the base field for main traces, the cubic extension for aux,
 /// composition and FRI, within one proof.
 ///
@@ -708,9 +663,7 @@ const _: fn() = || {
     {
     }
 
-    assert_usable::<RpoStarkHash>();
     assert_usable::<RpxStarkHash>();
-    assert_usable::<PoseidonStarkHash>();
 };
 
 /// ✓ Each configuration's members carry the configuration's own hash as their
@@ -728,23 +681,11 @@ const _: () = {
         );
     }
 
-    assert_device_hash::<<RpoStarkHash as StarkHash>::Batched<GoldilocksField>>(
-        CommitmentHash::Rpo256,
-    );
-    assert_device_hash::<<RpoStarkHash as StarkHash>::Pair<GoldilocksField>>(
-        CommitmentHash::Rpo256,
-    );
     assert_device_hash::<<RpxStarkHash as StarkHash>::Batched<GoldilocksField>>(
         CommitmentHash::Rpx256,
     );
     assert_device_hash::<<RpxStarkHash as StarkHash>::Pair<GoldilocksField>>(
         CommitmentHash::Rpx256,
-    );
-    assert_device_hash::<<PoseidonStarkHash as StarkHash>::Batched<GoldilocksField>>(
-        CommitmentHash::Poseidon,
-    );
-    assert_device_hash::<<PoseidonStarkHash as StarkHash>::Pair<GoldilocksField>>(
-        CommitmentHash::Poseidon,
     );
 };
 
@@ -765,9 +706,7 @@ mod tests {
     /// rather than being mistaken for something about one permutation.
     macro_rules! for_each_tenant {
         ($body:ident) => {
-            $body::<RpoCommit>("Rpo");
             $body::<RpxCommit>("Rpx");
-            $body::<PoseidonCommit>("Poseidon");
         };
     }
 
@@ -978,20 +917,6 @@ mod tests {
         assert_eq!(17 % RATE_FELTS, 1);
     }
 
-    /// The three tenants must be three different commitments — otherwise the
-    /// generic backend has collapsed them.
-    #[test]
-    fn the_three_tenants_commit_differently() {
-        let leaf = base_leaf(12);
-        let rpo = <AlgebraicBatchBackend<Base, RpoCommit> as IsMerkleTreeBackend>::hash_data(&leaf);
-        let rpx = <AlgebraicBatchBackend<Base, RpxCommit> as IsMerkleTreeBackend>::hash_data(&leaf);
-        let pos =
-            <AlgebraicBatchBackend<Base, PoseidonCommit> as IsMerkleTreeBackend>::hash_data(&leaf);
-        assert_ne!(rpo, rpx);
-        assert_ne!(rpo, pos);
-        assert_ne!(rpx, pos);
-    }
-
     /// Each configuration NAMES its own hash, and the statement's program-identity
     /// tag agrees with that name.
     ///
@@ -1004,20 +929,10 @@ mod tests {
     fn each_configuration_names_its_own_hash_and_tag() {
         use crate::lfm::statement::commitment_hash_tag;
 
-        let named = [
-            (
-                <RpoStarkHash as StarkHash>::COMMITMENT_HASH,
-                CommitmentHash::Rpo256,
-            ),
-            (
-                <RpxStarkHash as StarkHash>::COMMITMENT_HASH,
-                CommitmentHash::Rpx256,
-            ),
-            (
-                <PoseidonStarkHash as StarkHash>::COMMITMENT_HASH,
-                CommitmentHash::Poseidon,
-            ),
-        ];
+        let named = [(
+            <RpxStarkHash as StarkHash>::COMMITMENT_HASH,
+            CommitmentHash::Rpx256,
+        )];
         let mut tags = Vec::new();
         for (got, want) in named {
             assert_eq!(got, want, "a configuration must name its own hash");
@@ -1084,28 +999,16 @@ mod tests {
     /// the SPECIFICATION of which nonces the leg must accept.
     type HostVerdict = fn(&Commitment, u64, u8) -> bool;
 
-    /// The three members that HAVE a commitment type — `HasherKind::Test` has
-    /// none, so there is no host digest to grind against — each with the
-    /// host's grinder and the host's verdict.
-    fn grinding_members() -> [(HasherKind, HostGrind, HostVerdict); 3] {
+    /// The members that HAVE a commitment type — `HasherKind::Test` has none,
+    /// so there is no host digest to grind against — each with the host's
+    /// grinder and the host's verdict.
+    fn grinding_members() -> [(HasherKind, HostGrind, HostVerdict); 1] {
         use stark::grinding::{generate_nonce, is_valid_nonce};
-        [
-            (
-                HasherKind::Rpo,
-                |s, f| generate_nonce::<AlgebraicDigest<RpoCommit>>(s, f),
-                |s, n, f| is_valid_nonce::<AlgebraicDigest<RpoCommit>>(s, n, f),
-            ),
-            (
-                HasherKind::Rpx,
-                |s, f| generate_nonce::<AlgebraicDigest<RpxCommit>>(s, f),
-                |s, n, f| is_valid_nonce::<AlgebraicDigest<RpxCommit>>(s, n, f),
-            ),
-            (
-                HasherKind::Poseidon,
-                |s, f| generate_nonce::<AlgebraicDigest<PoseidonCommit>>(s, f),
-                |s, n, f| is_valid_nonce::<AlgebraicDigest<PoseidonCommit>>(s, n, f),
-            ),
-        ]
+        [(
+            HasherKind::Rpx,
+            |s, f| generate_nonce::<AlgebraicDigest<RpxCommit>>(s, f),
+            |s, n, f| is_valid_nonce::<AlgebraicDigest<RpxCommit>>(s, n, f),
+        )]
     }
 
     /// The MACHINE's verdict: whether the emitted leg proves for `nonce`.
@@ -1145,14 +1048,11 @@ mod tests {
     /// is itself valid with probability 2⁻⁸ — and `generate_nonce`'s `find_any`
     /// re-samples the same few chunk-start winners run after run, so once a
     /// recurring winner has a valid successor the "control" recurs as a failure
-    /// that looks like a value-specific emitter defect. Under Rpo this seed's
-    /// winner 0x1400000000000009 has the valid successor 0x140000000000000A,
-    /// and asking the leg to REJECT it was asking it to disagree with the
-    /// specification
-    /// ([`the_emitted_grinding_check_agrees_with_the_host_on_the_incident_nonces`]
-    /// pins the pair). The control is therefore the first nonce after the
-    /// winner that `is_valid_nonce` REJECTS, asserted as such before the leg is
-    /// asked to agree.
+    /// that looks like a value-specific emitter defect: a winner with a valid
+    /// successor was once asked to REJECT that successor, which was asking the
+    /// leg to disagree with the specification. The control is therefore the
+    /// first nonce after the winner that `is_valid_nonce` REJECTS, asserted as
+    /// such before the leg is asked to agree.
     #[test]
     fn the_emitted_grinding_check_accepts_exactly_the_hosts_nonces() {
         use crate::lfm::registry::build_artifacts_with_hasher;
@@ -1193,15 +1093,12 @@ mod tests {
         }
     }
 
-    /// ★ **THE INCIDENT PAIR, PINNED WITHOUT GRINDING.** Under Rpo, with the
-    /// leg tests' seed at factor 8, the nonce 0x1400000000000009 AND its
-    /// successor 0x140000000000000A are BOTH valid — `is_valid_nonce` accepts
-    /// each — which is what made the old `nonce + 1` control fire whenever
-    /// `find_any` landed on that winner. The leg's job is to agree with the
-    /// host, and on that pair agreeing means PROVING both.
-    ///
-    /// This pins the pair for every tenant, then walks forward SEQUENTIALLY —
-    /// no `find_any`, no scheduling — until each tenant has shown both a
+    /// ★ **THE INCIDENT NONCES, WITHOUT GRINDING.** The leg's job is to agree
+    /// with the host on every nonce, valid or not. This starts at the nonce
+    /// pair 0x1400000000000009 / 0x140000000000000A (both valid under the
+    /// retired RPO tenant at the leg tests' seed, which is what once made a
+    /// `nonce + 1` control fire), then walks forward SEQUENTIALLY — no
+    /// `find_any`, no scheduling — until each tenant has shown both a
     /// host-accepted and a host-rejected nonce, and asserts the leg's verdict
     /// equals the host's on every one of them. The arena is constructed
     /// directly; nothing here grinds, so the run is deterministic.
@@ -1213,25 +1110,6 @@ mod tests {
         const INCIDENT: u64 = 0x1400_0000_0000_0009;
 
         let seed = grinding_seed_bytes();
-
-        // The incident as the host rules it: both valid under Rpo, the next
-        // one not — so `nonce + 1` WAS a valid nonce, and the first real
-        // control was two past the winner.
-        let rpo_accepts = |n: u64| {
-            stark::grinding::is_valid_nonce::<AlgebraicDigest<RpoCommit>>(&seed, n, GRINDING_FACTOR)
-        };
-        assert!(
-            rpo_accepts(INCIDENT),
-            "Rpo: the incident winner is a valid nonce"
-        );
-        assert!(
-            rpo_accepts(INCIDENT + 1),
-            "Rpo: the winner's successor is ALSO valid — the old control was not a control"
-        );
-        assert!(
-            !rpo_accepts(INCIDENT + 2),
-            "Rpo: the first host-rejected nonce after the winner is two past it"
-        );
 
         let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("options");
         let program = grinding_leg_program();

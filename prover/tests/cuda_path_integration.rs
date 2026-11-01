@@ -141,13 +141,11 @@ fn gpu_path_fires_end_to_end() {
             gpu_grind_calls() > 0,
             "R4 GPU proof-of-work grind did not fire"
         ),
-        // Every non-keccak digest — BLAKE3 and the algebraic three — takes the
-        // host search (grinding.rs routes on the concrete digest), so the device
-        // counter must stay at zero for all of them.
+        // Every non-keccak digest takes another arm than the keccak kernel
+        // (grinding.rs routes on the concrete digest), so this counter must
+        // stay at zero for all of them.
         stark::config::CommitmentHash::Blake3
-        | stark::config::CommitmentHash::Rpo256
         | stark::config::CommitmentHash::Rpx256
-        | stark::config::CommitmentHash::Poseidon
         | stark::config::CommitmentHash::Poseidon1 => assert_eq!(
             gpu_grind_calls(),
             0,

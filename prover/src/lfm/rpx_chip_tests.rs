@@ -137,19 +137,6 @@ fn the_rpx_layout_is_316_value_columns() {
     // intermediates + 12 output, and the M round at nothing.
     assert_eq!(PINNED_VALUE_COLUMNS, 28 + 3 * (48 + 12) + 3 * (24 + 12));
     assert_eq!(rc::PREP_WIDTH, 13, "the preprocessed prefix does not move");
-    // ★ The comparison this lane exists to make, asserted rather than narrated.
-    const {
-        assert!(
-            rc::NUM_COLUMNS < hash::rpo_cols::NUM_COLUMNS,
-            "RPX must be narrower than RPO — three inverse layers against seven"
-        )
-    };
-    const {
-        assert!(
-            hash::rpo_cols::NUM_COLUMNS < hash::poseidon_cols::NUM_COLUMNS,
-            "and RPO narrower than the Poseidon reference"
-        )
-    };
 }
 
 /// The layout is injective and gapless across a MIXED schedule — the property
@@ -403,36 +390,6 @@ fn the_rpx_chip_proves_and_verifies() {
     ));
 }
 
-/// ⚠ RPO and RPX share constants, an MDS and three of seven rounds, so they are
-/// the most confusable pair in the machine. A proof under one must not verify
-/// under the other, in both directions.
-#[test]
-fn an_rpx_proof_does_not_verify_under_rpo_or_the_reverse() {
-    let opts = options();
-    let program = trivial_program();
-    for (proved_under, verified_under) in [
-        (HasherKind::Rpx, HasherKind::Rpo),
-        (HasherKind::Rpo, HasherKind::Rpx),
-    ] {
-        let artifacts = build_artifacts_with_hasher(&program, &opts, proved_under);
-        let proved = lfm_prove_with_hasher(&program, &artifacts, &arenas(), &opts, proved_under)
-            .expect("prove");
-        assert!(
-            !verify_against(
-                &artifacts.roots,
-                &artifacts.program_id,
-                artifacts.keccak_rnd_chunks,
-                &proved.proof,
-                &proved.public_words,
-                &opts,
-                verified_under,
-                artifacts.chip_set,
-            ),
-            "a proof made under {proved_under:?} must not verify under {verified_under:?}"
-        );
-    }
-}
-
 /// ★★★ The same end-to-end that RPO passes, under RPX — and on the SAME
 /// unmodified verifier program, which is the point of the exercise.
 #[test]
@@ -464,17 +421,18 @@ fn the_machine_verifies_a_fixture_fri_proof_end_to_end_under_rpx() {
 
 #[test]
 fn the_hasher_tags_are_stable_and_distinct() {
-    assert_eq!(HasherKind::Rpo.as_tag(), 3);
+    assert_eq!(HasherKind::Test.as_tag(), 0);
+    assert_eq!(HasherKind::Blake3.as_tag(), 2);
     assert_eq!(HasherKind::Rpx.as_tag(), 4);
+    assert_eq!(HasherKind::Poseidon1W16.as_tag(), 5);
 }
 
 // =========================================================================
 // The measurement
 // =========================================================================
 
-/// ★★ Base-equivalent cells per permutation, on the same census instrument that
-/// measured the RPO, Poseidon and BLAKE3 columns — which is what makes the
-/// three-way comparison a comparison rather than three separate claims.
+/// ★★ Base-equivalent cells per permutation, on the census instrument that
+/// measured the BLAKE3 column.
 #[test]
 fn the_measured_cells_per_permutation_match_the_pinned_prediction() {
     let program = trivial_program();
@@ -491,19 +449,10 @@ fn the_measured_cells_per_permutation_match_the_pinned_prediction() {
     let per_permutation = chip.main_cols as u64 + 3 * chip.aux_cols as u64;
     assert_eq!(per_permutation, PINNED_CELLS_PER_PERMUTATION);
 
-    // ★ The three-way ladder, measured on one instrument in one test.
-    let cells = |k: HasherKind| -> u64 {
-        let c = lfm_chip_census_with_hasher(&program, k);
-        let h = c.iter().find(|c| c.name == "LFM_HASH").expect("LFM_HASH");
-        h.main_cols as u64 + 3 * h.aux_cols as u64
-    };
-    let rpx = cells(HasherKind::Rpx);
-    let rpo = cells(HasherKind::Rpo);
-    let poseidon = cells(HasherKind::Poseidon);
-    assert_eq!((rpx, rpo, poseidon), (325, 445, 621));
-    assert!(rpx < rpo && rpo < poseidon);
-    // And all three an order of magnitude under the slot-11 BLAKE3 incumbent,
-    // whose 4,946 is quoted from the wrap census rather than recomputed here.
+    let rpx = per_permutation;
+    assert_eq!(rpx, 325);
+    // An order of magnitude under the slot-11 BLAKE3 incumbent, whose 4,946 is
+    // quoted from the wrap census rather than recomputed here.
     const BLAKE3_CELLS_PER_COMPRESSION: u64 = 4_946;
     assert!(BLAKE3_CELLS_PER_COMPRESSION / rpx >= 15);
 }

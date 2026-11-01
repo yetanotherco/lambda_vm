@@ -621,11 +621,9 @@ impl WrapHash {
         match crate::hash_pin::BLOCK_COMMITMENT_HASH {
             stark::config::CommitmentHash::Keccak256 => WrapHash::Keccak,
             stark::config::CommitmentHash::Blake3 => WrapHash::Blake3,
-            // ★ Three commitment hashes, ONE emitter arm. The permutation is
-            // `HasherKind`, an orthogonal axis chosen when the AIR set is built.
-            stark::config::CommitmentHash::Rpo256
-            | stark::config::CommitmentHash::Rpx256
-            | stark::config::CommitmentHash::Poseidon => WrapHash::Algebraic,
+            // ★ The permutation is `HasherKind`, an orthogonal axis chosen
+            // when the AIR set is built.
+            stark::config::CommitmentHash::Rpx256 => WrapHash::Algebraic,
             // The legacy pin is never Poseidon1: the block's programs, which
             // verify Poseidon1 proofs, take the block family's wrap hash
             // (`hash_pin::ProofFamily::WRAP`).

@@ -317,14 +317,9 @@ mod tests {
 
     /// The hashers this convention is defined for. `Test` is included on
     /// purpose: it is not cryptographic, but it exercises the same wiring, so a
-    /// break in the ENCODING shows up under all four rather than being
-    /// mistaken for something about one permutation.
-    const ALGEBRAIC: [HasherKind; 4] = [
-        HasherKind::Test,
-        HasherKind::Poseidon,
-        HasherKind::Rpo,
-        HasherKind::Rpx,
-    ];
+    /// break in the ENCODING shows up under both rather than being mistaken
+    /// for something about one permutation.
+    const ALGEBRAIC: [HasherKind; 2] = [HasherKind::Test, HasherKind::Rpx];
 
     fn options() -> ProofOptions {
         GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is valid")
@@ -973,10 +968,10 @@ mod tests {
         let mut padded = [0u8; 32];
         padded[..8].copy_from_slice(&SMALL.to_le_bytes());
 
-        let mut with_root = AlgebraicTranscript::new(HasherKind::Rpo);
+        let mut with_root = AlgebraicTranscript::new(HasherKind::Rpx);
         with_root.append_bytes(&padded);
 
-        let mut with_int = AlgebraicTranscript::new(HasherKind::Rpo);
+        let mut with_int = AlgebraicTranscript::new(HasherKind::Rpx);
         with_int.append_bytes(&SMALL.to_le_bytes());
 
         assert_ne!(
@@ -1012,7 +1007,7 @@ mod tests {
     /// drawn — the property a straight-line replay depends on.
     #[test]
     fn sampling_is_constant_consumption() {
-        let mut t = AlgebraicTranscript::new(HasherKind::Rpo);
+        let mut t = AlgebraicTranscript::new(HasherKind::Rpx);
         for expected in 1..=8u32 {
             let _ = t.sample_u64(1 << QUERY_BITS);
             assert_eq!(t.squeeze_index, expected, "one squeeze per draw");

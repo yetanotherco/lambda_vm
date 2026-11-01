@@ -62,9 +62,7 @@ const fn device_hash_for(hash: CommitmentHash) -> math_cuda::DeviceHash {
     match hash {
         CommitmentHash::Keccak256 => math_cuda::DeviceHash::Keccak256,
         CommitmentHash::Blake3 => math_cuda::DeviceHash::Blake3,
-        CommitmentHash::Rpo256 => math_cuda::DeviceHash::Rpo256,
         CommitmentHash::Rpx256 => math_cuda::DeviceHash::Rpx256,
-        CommitmentHash::Poseidon => math_cuda::DeviceHash::Poseidon,
         CommitmentHash::Poseidon1 => math_cuda::DeviceHash::Poseidon1,
     }
 }
@@ -75,9 +73,7 @@ const fn commitment_hash_for(hash: math_cuda::DeviceHash) -> CommitmentHash {
     match hash {
         math_cuda::DeviceHash::Keccak256 => CommitmentHash::Keccak256,
         math_cuda::DeviceHash::Blake3 => CommitmentHash::Blake3,
-        math_cuda::DeviceHash::Rpo256 => CommitmentHash::Rpo256,
         math_cuda::DeviceHash::Rpx256 => CommitmentHash::Rpx256,
-        math_cuda::DeviceHash::Poseidon => CommitmentHash::Poseidon,
         math_cuda::DeviceHash::Poseidon1 => CommitmentHash::Poseidon1,
     }
 }
@@ -87,18 +83,16 @@ const fn commitment_hash_for(hash: math_cuda::DeviceHash) -> CommitmentHash {
 ///
 /// The two `match`es above being total already proves each side maps
 /// somewhere; this proves the two maps are inverse to each other, which is what
-/// rules out a mis-paired arm (`Rpx256 => DeviceHash::Rpo256`) — the one
-/// editing error that would hand a tree a name its kernels do not deserve once
-/// the algebraic kernels exist. A sixth variant fails `device_hash_for` first
+/// rules out a mis-paired arm (`Rpx256 => DeviceHash::Poseidon1`) — the one
+/// editing error that would hand a tree a name its kernels do not deserve. A
+/// fifth variant fails `device_hash_for` first
 /// and is added to this list with its arm. Discriminants are compared because
 /// `PartialEq` is not `const`.
 const _: () = {
-    const ALL: [CommitmentHash; 6] = [
+    const ALL: [CommitmentHash; 4] = [
         CommitmentHash::Keccak256,
         CommitmentHash::Blake3,
-        CommitmentHash::Rpo256,
         CommitmentHash::Rpx256,
-        CommitmentHash::Poseidon,
         CommitmentHash::Poseidon1,
     ];
     let mut i = 0;
@@ -2011,10 +2005,6 @@ where
                 rows_per_leaf,
             )
         }
-        math_cuda::DeviceHash::Rpo256 | math_cuda::DeviceHash::Poseidon => unimplemented!(
-            "{:?} device commit not yet ported (comp-poly tree from ext3 evals)",
-            B::COMMITMENT_HASH
-        ),
     } {
         Ok(t) => t,
         Err(_) => return None,
@@ -2090,10 +2080,6 @@ where
                 rows_per_leaf,
             )
         }
-        math_cuda::DeviceHash::Rpo256 | math_cuda::DeviceHash::Poseidon => unimplemented!(
-            "{:?} device commit not yet ported (comp-poly tree from resident slabs)",
-            B::COMMITMENT_HASH
-        ),
     }
     .ok()?;
     GPU_COMP_POLY_TREE_CALLS.fetch_add(1, Ordering::Relaxed);

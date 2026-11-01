@@ -53,7 +53,6 @@ pub mod p1w16_chip;
 pub mod p1w16_emit;
 pub mod p1w16_socket;
 pub mod per_table_aggregator;
-pub mod poseidon;
 pub mod preprocessed;
 pub mod program_budget;
 pub mod program_census;
@@ -182,8 +181,6 @@ mod p1w16_socket_tests;
 #[cfg(test)]
 mod per_table_aggregator_tests;
 #[cfg(test)]
-mod poseidon_chip_tests;
-#[cfg(test)]
 mod preprocessed_tests;
 #[cfg(test)]
 mod program_shape_tests;
@@ -239,8 +236,6 @@ mod whir_transcript_replay_tests;
 // executor before one is written (lane E). No production path reaches it.
 #[cfg(test)]
 mod reach_profile;
-#[cfg(test)]
-mod rpo_chip_tests;
 #[cfg(test)]
 mod rpx_chip_tests;
 #[cfg(test)]

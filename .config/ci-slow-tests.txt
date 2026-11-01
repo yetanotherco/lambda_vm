@@ -285,7 +285,6 @@ lambda-vm-prover tests::multiplicity_forgery_poc::load_negative_mu_sign_extensio
 lambda-vm-prover tables::trace_builder::finish::stream_tests::bitwise_counted_beside_the_rest_builds_the_same_tables  # 51 s
 lambda-vm-prover tests::recursion_smoke_test::test_recursion_blob_decodes_and_verifies_on_host  # 51 s
 lambda-vm-prover tests::decode_tests::decode_commitment_wrong_value_rejects  # 51 s
-lambda-vm-prover lfm::poseidon_chip_tests::a_proof_does_not_verify_under_the_other_hasher  # 51 s
 lambda-vm-prover continuation::tests::test_verify_continuation_with_supplied_roots  # 51 s
 lambda-vm-prover lfm::keccak_probe::padding_row_multiplicity_rejects  # 50 s
 lambda-vm-prover lfm::machine_tests::different_arena_values_change_the_public_output_not_the_program  # 50 s
@@ -306,7 +305,6 @@ lambda-vm-prover tests::block_whir_tests::a_mixed_boundary_group_drops_one_class
 lambda-vm-prover tests::prove_elfs_tests::test_prove_second_epoch_from_snapshot  # 47 s
 lambda-vm-prover tests::decode_tests::decode_commitment_zero_bytes_rejects  # 46 s
 lambda-vm-prover continuation::tests::test_prove_error_mid_pipeline_returns_err  # 46 s
-lambda-vm-prover lfm::rpo_chip_tests::a_proof_does_not_verify_under_the_other_hasher  # 46 s
 lambda-vm-prover continuation::tests::test_continuation_with_several_cpu_tables_per_epoch_verifies  # 46 s
 lambda-vm-prover tests::halt_pc_forgery_poc::poc_control_continue_without_halt_pc_tamper_is_rejected  # 45 s
 lambda-vm-prover lfm::machine_tests::the_register_derivation_proves_and_verifies  # 110 s in run 40588562061

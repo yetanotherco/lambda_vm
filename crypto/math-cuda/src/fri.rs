@@ -220,12 +220,6 @@ impl FriCommitState {
                     2,
                     &mut leaves_view,
                 )?,
-                DeviceHash::Rpo256 | DeviceHash::Poseidon => {
-                    unimplemented!(
-                        "{:?} device commit not yet ported (FRI layer ext3 leaves)",
-                        self.hash
-                    )
-                }
             }
         }
         match self.hash {
@@ -253,10 +247,6 @@ impl FriCommitState {
                 &mut nodes_dev,
                 num_leaves,
             )?,
-            DeviceHash::Rpo256 | DeviceHash::Poseidon => unimplemented!(
-                "{:?} device commit not yet ported (FRI layer inner tree levels)",
-                self.hash
-            ),
         }
 
         // Update inv_twiddles for the next layer: `new[j] = old[2j]^2` for
@@ -515,9 +505,6 @@ fn commit_group_leaves(
                 &be.rpx_fri_group_leaves_ext3,
                 crate::rpx::rpx_launch_cfg(num_leaves_u64),
             ),
-            DeviceHash::Rpo256 | DeviceHash::Poseidon => {
-                unimplemented!("{hash:?} device commit not yet ported (FRI group leaves)")
-            }
         };
         unsafe {
             stream
@@ -545,9 +532,6 @@ fn commit_group_leaves(
         }
         DeviceHash::Poseidon1 => {
             crate::p1_stark::build_inner_tree_levels(stream.as_ref(), &mut nodes_dev, num_leaves)?
-        }
-        DeviceHash::Rpo256 | DeviceHash::Poseidon => {
-            unimplemented!("{hash:?} device commit not yet ported (FRI group inner tree levels)")
         }
     }
     Ok(nodes_dev)

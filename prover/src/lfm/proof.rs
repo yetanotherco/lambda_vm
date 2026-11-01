@@ -915,9 +915,12 @@ mod tests {
     #[test]
     fn a_fill_and_artifacts_for_different_hashers_are_refused() {
         assert!(same_hasher(HasherKind::Rpx, HasherKind::Rpx).is_ok());
-        match same_hasher(HasherKind::Rpx, HasherKind::Poseidon) {
+        match same_hasher(HasherKind::Rpx, HasherKind::Poseidon1W16) {
             Err(LfmProveError::HasherMismatch { artifacts, filled }) => {
-                assert_eq!((artifacts, filled), (HasherKind::Rpx, HasherKind::Poseidon))
+                assert_eq!(
+                    (artifacts, filled),
+                    (HasherKind::Rpx, HasherKind::Poseidon1W16)
+                )
             }
             other => panic!("a mismatch must be refused, got {other:?}"),
         }
@@ -954,11 +957,14 @@ mod tests {
             &artifacts,
             &arenas,
             &ProofOptions::default_test_options(),
-            HasherKind::Poseidon,
+            HasherKind::Poseidon1W16,
         );
         match got {
             Err(LfmProveError::HasherMismatch { artifacts, filled }) => {
-                assert_eq!((artifacts, filled), (HasherKind::Rpx, HasherKind::Poseidon))
+                assert_eq!(
+                    (artifacts, filled),
+                    (HasherKind::Rpx, HasherKind::Poseidon1W16)
+                )
             }
             Err(other) => panic!("proving under another hasher must be refused, got {other:?}"),
             Ok(_) => panic!("proving under another hasher must be refused, but it proved"),

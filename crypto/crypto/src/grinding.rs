@@ -250,8 +250,8 @@ pub enum DeviceGrindKey {
 /// requires this bound, so a configuration that does not declare an arm does
 /// not compile rather than silently taking the slow one.
 ///
-/// `None` is a statement too — BLAKE3, RPO and Poseidon have no grind kernel,
-/// and the CPU search is where they belong.
+/// `None` is a statement too — BLAKE3 has no grind kernel, and the CPU search
+/// is where it belongs.
 pub trait GrindDigest: Digest + OutputSizeUser<OutputSize = U32> + 'static {
     /// The device arm, or `None` for "the host search is the only one".
     const DEVICE_GRIND: Option<DeviceGrindKey>;
