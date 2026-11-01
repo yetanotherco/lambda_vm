@@ -1172,30 +1172,93 @@ fn the_child_check_of_the_lean_tables() {
     }
     // The same leg for one wide row a compression at today's socket width
     // (3,460 main + 13 preprocessed + 695 aux), 2^18 rows: the width effect.
-    let wide = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints>::new(
-        3_460 + 13,
-        AuxiliaryTraceBuildData {
-            interactions: (0..1_390)
-                .map(|i| {
-                    BusInteraction::sender(
-                        0xB3_FFu64,
-                        Multiplicity::Column(0),
-                        vec![Lin::col(1 + i % 3_000).bus()],
-                    )
-                })
-                .collect(),
-        },
-        &opts,
-        1,
-        EmptyConstraints,
-    )
-    .with_name("WIDE_5545")
-    .with_preprocessed([0u8; 32], 13);
+    let wide = synthetic("WIDE_5545", 3_460 + 13, 13, 1_390, &opts);
     let w = child_check_compressions(&wide, 1 << 18);
     println!(
         "B3R CHILD CHECK WIDE (today's socket shape, one row a compression, 2^18 rows): {w} \
          compressions ({:.3} G cells at 5,545)",
         w as f64 * 5_545.0 / 1e9
+    );
+}
+
+/// A table of the given shape with no constraints and `interactions` sends,
+/// for the closed form only.
+fn synthetic(
+    name: &str,
+    main: usize,
+    prep: usize,
+    interactions: usize,
+    opts: &ProofOptions,
+) -> PlainAir {
+    let air = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints>::new(
+        main,
+        AuxiliaryTraceBuildData {
+            interactions: (0..interactions)
+                .map(|i| {
+                    BusInteraction::sender(
+                        0xB3_FFu64,
+                        Multiplicity::Column(0),
+                        vec![Lin::col(prep + i % (main - prep)).bus()],
+                    )
+                })
+                .collect(),
+        },
+        opts,
+        1,
+        EmptyConstraints,
+    )
+    .with_name(name);
+    if prep > 0 {
+        air.with_preprocessed([0u8; 32], prep)
+    } else {
+        air
+    }
+}
+
+/// What today's Poseidon1 child check spends on its hash table, and how much
+/// dearer a narrow non-hash table's check is under BLAKE3's binary trees than
+/// under Poseidon1's 4-ary ones (`r` for the non-hash part of a child).
+#[test]
+fn the_child_check_hash_ratio_of_narrow_tables() {
+    use super::epoch_verify::{TableVerifyShape, table_permutations_for};
+    let opts = options();
+    let p1_geom = stark::config::TreeGeometry::of::<super::p1_commit::P1StarkHash>();
+    let under = |air: &PlainAir, rows: usize, geom, hash| {
+        let (shape, _) = TableVerifyShape::derive_with(air, rows, geom).expect("a shape");
+        table_permutations_for(&shape, hash)
+    };
+    // The P1 W16 socket: 329 columns (13 preprocessed), 8 interactions.
+    let socket = synthetic("P1_SOCKET", 329, 13, 8, &opts);
+    let s_p1 = under(&socket, 1 << 19, p1_geom, super::edsl::WrapHash::Poseidon1);
+    println!("\nB3R CHILD CHECK P1 SOCKET (329 cols, 2^19 rows, P1 4-ary C2): {s_p1} permutations");
+    // D-B3-3's non-hash leaf tables, at the median leaf's heights (aux: 2 ext columns each, I).
+    let mut p1_sum = 0usize;
+    let mut b3_sum = 0usize;
+    for (name, main, log) in [
+        ("XALU", 23, 22),
+        ("SELECT", 25, 21),
+        ("LANES", 16, 21),
+        ("BALU", 14, 21),
+        ("HINT", 6, 21),
+    ] {
+        let air = synthetic(name, main, 0, 4, &opts);
+        let p = under(&air, 1 << log, p1_geom, super::edsl::WrapHash::Poseidon1);
+        let b = under(
+            &air,
+            1 << log,
+            stark::config::TreeGeometry::BINARY,
+            super::edsl::WrapHash::Blake3,
+        );
+        p1_sum += p;
+        b3_sum += b;
+        println!(
+            "B3R CHILD CHECK NON-HASH {name} ({main} cols, 2^{log}): P1 {p} · B3 {b} · r {:.3}",
+            b as f64 / p as f64
+        );
+    }
+    println!(
+        "B3R CHILD CHECK NON-HASH r (sum): {:.3} (P1 {p1_sum}, B3 {b3_sum})",
+        b3_sum as f64 / p1_sum as f64
     );
 }
 
