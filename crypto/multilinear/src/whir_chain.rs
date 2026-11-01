@@ -103,14 +103,19 @@ impl UnencodedSuccessor {
 }
 
 /// Refuses a format whose round-0 leaf order `H`'s trees do not take: the
-/// coset order is defined for Poseidon1 trees alone — the production hash,
-/// base and recursion alike — so under any other hash it is not a state a
+/// coset order is defined for Poseidon1 trees — the production hash, base and
+/// recursion alike — and for the 7-round BLAKE3 base's binary trees
+/// (`Blake3Whir`, D-B3HYB S3), so under any other hash it is not a state a
 /// prover or a verifier can reach. Called before a round-0 tree is built
 /// ([`commit_stacked`]), before a chain is proved, and before a proof is read.
 pub fn check_leaf_order<H: WhirHash>(format: &ChainFormat) -> Result<(), Error> {
     match format.leaves {
         LeafOrder::Natural => Ok(()),
-        LeafOrder::Coset if H::DEVICE == DeviceHashKey::Poseidon1 => Ok(()),
+        LeafOrder::Coset
+            if matches!(H::DEVICE, DeviceHashKey::Poseidon1 | DeviceHashKey::Blake3) =>
+        {
+            Ok(())
+        }
         order => Err(Error::LeafOrderUnsupported {
             order,
             hash: H::NAME,

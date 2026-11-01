@@ -1,7 +1,8 @@
 //! The coset leaf order ([`LeafOrder::Coset`]) on the host: a round-0 tree
 //! places block `j` at position `bitrev(j)`, the prover's paths (whole trees
 //! and kept tops) and the verifier read it there, and nothing else moves. The
-//! order is Poseidon1's alone: under any other hash it is refused by name.
+//! order is Poseidon1's and the 7-round BLAKE3 base's: under any other hash it
+//! is refused by name.
 //!
 //! The refusals across orders are the mutations that show each side's map is
 //! load-bearing: a verifier that reads positions in the natural order (the
@@ -26,7 +27,7 @@ use crate::{
         FirstFold, GrindBits, GroupFold, LeafOrder, UnencodedSuccessor, WhirFolds,
     },
     whir_commit::{CodewordCommitment, Commitment, TreeDrop, verify_opening},
-    whir_hash::{KeccakWhir, P1Whir, RpxWhir, WhirHash},
+    whir_hash::{Blake3Whir, KeccakWhir, P1Whir, RpxWhir, WhirHash},
 };
 
 type FE = FieldElement<F>;
@@ -265,7 +266,16 @@ fn a_coset_tree_holds_block_j_at_its_reversed_position() {
 /// uncapped and capped.
 #[test]
 fn a_coset_stack_verifies_whole_or_retired() {
-    type H = P1Whir;
+    a_coset_stack_verifies_whole_or_retired_under::<P1Whir>();
+}
+
+/// The same over the 7-round BLAKE3 base's binary trees (D-B3HYB S3).
+#[test]
+fn a_coset_stack_verifies_whole_or_retired_under_blake3_std() {
+    a_coset_stack_verifies_whole_or_retired_under::<Blake3Whir>();
+}
+
+fn a_coset_stack_verifies_whole_or_retired_under<H: WhirHash>() {
     for (first, log_folding, n_stack) in SHAPES {
         for group in [GroupFold::PerPoly, GroupFold::Indexed] {
             for cap in [CapPolicy::Off, CapPolicy::Auto] {
@@ -296,7 +306,16 @@ fn a_coset_stack_verifies_whole_or_retired() {
 /// 8^-9 there; on the 4-leaf tree of the one-round shape it is 2^-9 a chain.
 #[test]
 fn each_side_of_the_order_is_load_bearing() {
-    type H = P1Whir;
+    each_side_of_the_order_is_load_bearing_under::<P1Whir>();
+}
+
+/// The same over the 7-round BLAKE3 base's binary trees.
+#[test]
+fn each_side_of_the_order_is_load_bearing_under_blake3_std() {
+    each_side_of_the_order_is_load_bearing_under::<Blake3Whir>();
+}
+
+fn each_side_of_the_order_is_load_bearing_under<H: WhirHash>() {
     for (first, log_folding, n_stack) in SHAPES.into_iter().take(2) {
         for group in [GroupFold::PerPoly, GroupFold::Indexed] {
             let coset = config(first, log_folding, group, LeafOrder::Coset, CapPolicy::Off);
@@ -332,6 +351,16 @@ fn each_side_of_the_order_is_load_bearing() {
 /// One sibling byte of a round-0 path moved: refused, by that opening.
 #[test]
 fn a_tampered_round0_sibling_is_refused_under_the_coset_order() {
+    a_tampered_round0_sibling_is_refused_under::<P1Whir>();
+}
+
+/// The same over the 7-round BLAKE3 base's binary trees.
+#[test]
+fn a_tampered_round0_sibling_is_refused_under_the_coset_order_blake3_std() {
+    a_tampered_round0_sibling_is_refused_under::<Blake3Whir>();
+}
+
+fn a_tampered_round0_sibling_is_refused_under<H: WhirHash>() {
     for (first, log_folding, n_stack) in SHAPES {
         let cfg = config(
             first,
@@ -340,16 +369,59 @@ fn a_tampered_round0_sibling_is_refused_under_the_coset_order() {
             LeafOrder::Coset,
             CapPolicy::Off,
         );
-        let honest = open::<P1Whir>(&heights(n_stack), n_stack, &cfg, None);
+        let honest = open::<H>(&heights(n_stack), n_stack, &cfg, None);
         let mut proof = honest.proof.clone();
         let opening = match &mut proof.polys[0].rounds[0].openings {
             crate::whir_chain::RoundOpenings::Base(round) => &mut round.current[1],
             other => panic!("a per-polynomial round 0 opens base blocks: {other:?}"),
         };
         opening.proof.merkle_path[0][7] ^= 1;
-        let r = check::<P1Whir>(&honest, &proof, &cfg);
+        let r = check::<H>(&honest, &proof, &cfg);
         assert!(refused_by_an_opening(&r), "{first:?}/{n_stack}: {r:?}");
     }
+}
+
+/// ★ Under the 7-round BLAKE3 a grinding chain proves and verifies, and a
+/// query nonce moved is refused BY THE GRIND (`GrindingRejected`), the
+/// absorbed out-of-domain value moved by a later check: the proof-of-work is
+/// the configuration's own digest's, end to end.
+#[test]
+fn a_blake3_grind_nonce_moved_is_refused_by_the_grind() {
+    let mut cfg = config(
+        Some(6),
+        4,
+        GroupFold::PerPoly,
+        LeafOrder::Coset,
+        CapPolicy::Off,
+    );
+    cfg.grind = GrindBits {
+        folding: 0,
+        ood: 0,
+        query: 10,
+    };
+    let honest = open::<Blake3Whir>(&heights(11), 11, &cfg, None);
+    assert_eq!(check::<Blake3Whir>(&honest, &honest.proof, &cfg), Ok(()));
+    // Eight other nonces: each refused (a valid one moves the query draw, so
+    // the openings refuse it), and the grind itself refuses all but a 2^-10
+    // share — at least one of eight with probability 1 − 2^-80.
+    let mut by_the_grind = 0;
+    for d in 1..=8u64 {
+        let mut proof = honest.proof.clone();
+        proof.polys[0].rounds[0].nonces.query ^= d;
+        let r = check::<Blake3Whir>(&honest, &proof, &cfg);
+        assert!(r.is_err(), "nonce ^ {d} accepted");
+        if matches!(
+            &r,
+            Err(Refusal::Chain {
+                cause: Error::GrindingRejected { bits: 10 },
+                ..
+            })
+        ) {
+            by_the_grind += 1;
+        }
+    }
+    println!("B3 GRIND TAMPER: {by_the_grind} of 8 refused by the grind");
+    assert!(by_the_grind >= 1);
 }
 
 /// The order is part of the statement's fold word, on top of every other
@@ -392,7 +464,7 @@ fn the_coset_order_has_its_own_fold_word_and_is_not_the_default() {
     assert_ne!(FOLD_WORD_COSET, FOLD_WORD_INDEXED);
 }
 
-/// ★ The coset order is Poseidon1's alone: under Keccak and RPX trees the
+/// ★ The coset order is Poseidon1's and BLAKE3's: under Keccak and RPX trees the
 /// config is refused by name before a tree is built (a stack's commit, a
 /// chain's commit) and before a proof is read (a stack's verifier, a chain's).
 fn the_coset_order_is_refused_by_name<H: WhirHash>() {
