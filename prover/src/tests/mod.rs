@@ -23,6 +23,9 @@ pub mod block_memw_limbs_tests;
 pub mod block_onechain_tests;
 #[cfg(test)]
 #[cfg(feature = "parallel")]
+pub mod block_whir_b3_tests;
+#[cfg(test)]
+#[cfg(feature = "parallel")]
 pub mod block_whir_p1_tests;
 #[cfg(test)]
 #[cfg(feature = "parallel")]

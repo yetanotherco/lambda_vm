@@ -307,6 +307,7 @@ const _: () = {
         multilinear::whir_hash::DeviceHashKey::Poseidon1 => {
             stark::config::CommitmentHash::Poseidon1
         }
+        multilinear::whir_hash::DeviceHashKey::Blake3 => stark::config::CommitmentHash::Blake3,
     };
     assert!(device as u8 == BLOCK_BASE.hash as u8);
 };

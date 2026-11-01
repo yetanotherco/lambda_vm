@@ -499,6 +499,47 @@ enum Commands {
         argue_pack: String,
     },
 
+    /// Prove a block's WHIR BASE proof alone — no recursion over it — and
+    /// verify it on the host (D-B3HYB S3, the BLAKE3 base experiment)
+    ///
+    /// The production base prover and posture, without the tree: the base
+    /// under `--base p1` (the block family's Poseidon1, today's) or `--base b3`
+    /// (standard 7-round BLAKE3, binary trees under the format's binary cap).
+    /// The process declares itself base-only before anything is proved, so no
+    /// recursion runs in it under either base. Prints the phase stamps, the
+    /// base's seconds, its serialized bytes, the host verifier's seconds and
+    /// verdict. Needs a `--features cuda` build to run on the card.
+    ProveBlockBase {
+        /// Path to the guest ELF
+        #[arg(value_parser, value_hint = ValueHint::FilePath)]
+        elf: PathBuf,
+
+        /// The block's private input (the guest reads it with `get_private_input()`)
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        input: Option<PathBuf>,
+
+        /// Where to write the base proof's rkyv bytes (not written when omitted)
+        #[arg(short, long, value_hint = ValueHint::FilePath)]
+        output: Option<PathBuf>,
+
+        /// The base's hash: `p1` (the block family's Poseidon1, production) or
+        /// `b3` (standard 7-round BLAKE3, base-only).
+        #[arg(long, value_parser = ["p1", "b3"], default_value = "p1")]
+        base: String,
+
+        /// As `prove-block --group`.
+        #[arg(long, value_parser = ["per-poly", "indexed"], default_value = "indexed")]
+        group: String,
+
+        /// As `prove-block --blowup`.
+        #[arg(long, value_parser = ["2", "4"], default_value = "2")]
+        blowup: String,
+
+        /// As `prove-block --leaves`.
+        #[arg(long, value_parser = ["natural", "coset"], default_value = "coset")]
+        leaves: String,
+    },
+
     /// Count main-trace and aux-trace field elements without proving
     CountElements {
         /// Path to the ELF file
@@ -518,7 +559,9 @@ fn main() -> ExitCode {
     // Still single-threaded here: clap and env_logger spawn nothing.
     if matches!(
         cli.command,
-        Commands::ProveBlock { .. } | Commands::VerifyBlock { .. }
+        Commands::ProveBlock { .. }
+            | Commands::VerifyBlock { .. }
+            | Commands::ProveBlockBase { .. }
     ) {
         // SAFETY: no thread but this one exists yet.
         for line in unsafe { apply_posture() } {
@@ -648,6 +691,15 @@ fn main() -> ExitCode {
                 argue_pack: &argue_pack,
             },
         ),
+        Commands::ProveBlockBase {
+            elf,
+            input,
+            output,
+            base,
+            group,
+            blowup,
+            leaves,
+        } => cmd_prove_block_base(elf, input, output, &base, &group, &blowup, &leaves),
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
     }
 }
@@ -1216,6 +1268,191 @@ type FormatChoices = (
     prover::zf_format::LeafOrder,
     prover::zf_format::Round0Trees,
 );
+
+/// `prove-block-base`: the block's base proof alone, under `base`, then its
+/// host verification. The process declares base-only first
+/// (`prover::base_only`), so its recursion entry points refuse to run.
+fn cmd_prove_block_base(
+    elf_path: PathBuf,
+    input_path: Option<PathBuf>,
+    output_path: Option<PathBuf>,
+    base: &str,
+    group: &str,
+    blowup: &str,
+    leaves: &str,
+) -> ExitCode {
+    use prover::lfm::whir_block_tree::{WhirTreeConfig, base_line, group_setting};
+    use stark::proof::options::BaseFormat;
+    prover::base_only::declare();
+    let base = match base {
+        "p1" => BaseFormat::P1_WHIR,
+        "b3" => BaseFormat::B3_WHIR,
+        other => {
+            eprintln!("--base {other}: p1 or b3");
+            return ExitCode::FAILURE;
+        }
+    };
+    if std::env::var_os("LAMBDA_VM_WHIR_GROUP").is_some() {
+        eprintln!("LAMBDA_VM_WHIR_GROUP is the harness's knob: give the CLI --group instead");
+        return ExitCode::FAILURE;
+    }
+    let (blowup, order) = match install_block_format_with_base(blowup, leaves, base) {
+        Ok(choices) => choices,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let input = match read_private_input(input_path.as_ref()) {
+        Ok(input) => input,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut cfg = match WhirTreeConfig::from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    cfg.format.group = match group_setting(Some(group)) {
+        Ok(group) => group,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    assert_eq!(
+        (
+            cfg.format.zf.base,
+            cfg.format.zf.whir_blowup,
+            cfg.format.zf.whir_leaves
+        ),
+        (base, blowup.factor(), order),
+        "the base's format is the installed one"
+    );
+    let opts = prover::lfm::proof::block_base_options();
+    eprintln!("{}", base_line(&cfg.format.zf.base));
+    eprintln!(
+        "BLOCK BASE ONLY: base {:?} · group {group} · blowup {blowup} · leaves {leaves} · no \
+         recursion in this process",
+        cfg.format.zf.base.hash
+    );
+    #[cfg(feature = "cuda")]
+    stark::grinding::reset_gpu_grind_calls();
+    let t = Instant::now();
+    let proved = prover::block_whir::prove_block_whir_observed_led(
+        &elf_data,
+        &input,
+        &opts,
+        &cfg.format,
+        &cfg.options,
+        &|_, _| {},
+        &|_| {},
+        None,
+    );
+    let base_secs = t.elapsed().as_secs_f64();
+    let (proof, stamps) = match proved {
+        Ok(proved) => proved,
+        Err(e) => {
+            eprintln!("Base proof failed: {e:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprint!("{}", stamps.report());
+    #[cfg(feature = "cuda")]
+    eprintln!(
+        "BLOCK BASE GRINDS ON THE CARD: keccak {} · rpx {} · p1 {} · b3 {}",
+        stark::grinding::gpu_grind_calls(),
+        stark::grinding::gpu_grind_calls_rpx(),
+        stark::grinding::gpu_grind_calls_p1(),
+        stark::grinding::gpu_grind_calls_b3()
+    );
+    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&proof) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("Failed to serialize the base proof: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let digest = blake3::hash(&bytes).to_hex();
+    if let Some(path) = &output_path
+        && let Err(e) = std::fs::write(path, &bytes)
+    {
+        eprintln!("Failed to write {path:?}: {e}");
+        return ExitCode::FAILURE;
+    }
+    let t = Instant::now();
+    let verified = prover::block_whir::verify_block_whir(&proof, &elf_data, &opts, &cfg.format);
+    let verify_secs = t.elapsed().as_secs_f64();
+    let verdict = match &verified {
+        Ok(true) => "verified".to_string(),
+        Ok(false) => "REFUSED".to_string(),
+        Err(e) => format!("ERROR {e:?}"),
+    };
+    println!(
+        "BLOCK BASE ONLY RESULT: base {:?} · prove {base_secs:.3} s · phase A {:.3} s · phase B \
+         {:.3} s · proof {} bytes (blake3 {}) · host verify {verify_secs:.3} s {verdict} · peak \
+         VmHWM {}",
+        cfg.format.zf.base.hash,
+        stamps.phase_a,
+        stamps.phase_b,
+        bytes.len(),
+        &digest[..32],
+        vm_hwm().unwrap_or_else(|| "unread".to_string()),
+    );
+    if matches!(verified, Ok(true)) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// This process's peak resident set (`VmHWM`, Linux), as `/proc` prints it.
+fn vm_hwm() -> Option<String> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status
+        .lines()
+        .find(|l| l.starts_with("VmHWM:"))
+        .map(|l| l["VmHWM:".len()..].trim().to_string())
+}
+
+/// [`install_block_format`] with the base `base` in place of the family's:
+/// `prove-block-base` alone calls it, after declaring base-only.
+fn install_block_format_with_base(
+    blowup: &str,
+    leaves: &str,
+    base: stark::proof::options::BaseFormat,
+) -> Result<(prover::zf_format::WhirBlowup, prover::zf_format::LeafOrder), String> {
+    use prover::zf_format::{ENV_WHIR_BLOWUP, ENV_WHIR_LEAVES, ZfFormat};
+    for (knob, flag) in [(ENV_WHIR_BLOWUP, "--blowup"), (ENV_WHIR_LEAVES, "--leaves")] {
+        if std::env::var_os(knob).is_some() {
+            return Err(format!(
+                "{knob} is the harness's knob: give the CLI {flag} instead"
+            ));
+        }
+    }
+    let blowup = prover::lfm::whir_block_tree::blowup_setting(Some(blowup))?;
+    let leaves = prover::lfm::whir_block_tree::leaves_setting(Some(leaves))?;
+    let format = ZfFormat {
+        whir_blowup: blowup.factor(),
+        whir_leaves: leaves,
+        base,
+        ..ZfFormat::from_env()?
+    };
+    format.check_leaves()?;
+    ZfFormat::install(format)?;
+    Ok((blowup, leaves))
+}
 
 /// `prove-block`'s process format: the environment's ZF knobs with the
 /// WHIR blowup of `--blowup` (`blowup`), the round-0 leaf order of

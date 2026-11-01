@@ -14,6 +14,8 @@ pub mod alloc_purge;
 // The block prover runs its phases on threads and rayon: a host prover, built
 // with `parallel` (the guests take the crate without it).
 #[cfg(feature = "parallel")]
+pub mod base_only;
+#[cfg(feature = "parallel")]
 pub mod block_whir;
 pub mod constraints;
 pub mod continuation;

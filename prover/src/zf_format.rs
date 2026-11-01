@@ -570,15 +570,19 @@ impl ZfFormat {
     }
 
     /// Refuses a round-0 leaf order the base's trees do not take: the coset
-    /// order is Poseidon1's alone (the block's base and recursion hash), so
-    /// under any other base it is refused by name before anything is built.
+    /// order is Poseidon1's (the block's base and recursion hash) and the
+    /// 7-round BLAKE3 base's (`Blake3Whir`, D-B3HYB S3), so under any other
+    /// base it is refused by name before anything is built.
     pub fn check_leaves(&self) -> Result<(), String> {
         match (self.whir_leaves, self.base.hash) {
             (LeafOrder::Natural, _)
-            | (LeafOrder::Coset, stark::config::CommitmentHash::Poseidon1) => Ok(()),
+            | (
+                LeafOrder::Coset,
+                stark::config::CommitmentHash::Poseidon1 | stark::config::CommitmentHash::Blake3,
+            ) => Ok(()),
             (LeafOrder::Coset, hash) => Err(format!(
-                "{ENV_WHIR_LEAVES}=coset: the coset leaf order is defined for Poseidon1 trees \
-                 only, and the base hash is {hash:?}"
+                "{ENV_WHIR_LEAVES}=coset: the coset leaf order is defined for Poseidon1 and \
+                 7-round BLAKE3 trees only, and the base hash is {hash:?}"
             )),
         }
     }
@@ -1101,6 +1105,7 @@ mod tests {
             "{err}"
         );
         assert_eq!(natural.with_base(BaseFormat::RPX).check_leaves(), Ok(()));
+        assert_eq!(coset.with_base(BaseFormat::B3_WHIR).check_leaves(), Ok(()));
     }
 
     /// Every knob keeps its OFF spelling, and all of them at off are the
