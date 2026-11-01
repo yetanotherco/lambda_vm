@@ -1503,47 +1503,6 @@ pub mod argue_capture {
     }
 }
 
-/// Whether the depth-1 tree prefetch is on. `LFM_WHIR_PREFETCH=1` (or `true`)
-/// turns it on; unset or anything else is off, and off is byte-for-byte today's
-/// serial path. Read once.
-fn prefetch_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("LFM_WHIR_PREFETCH")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
-/// Build one table's fraction tree ahead of its turn, WITHOUT reading its output
-/// (the deferred sync), so its kernels overlap the current table's argue. `None`
-/// unless the table is device-resident AND a second tree fits without evicting
-/// retention — prefetch never displaces argue or the round-2 retained layers.
-/// The tree depends only on `(z, alpha)` via the interactions, not on `beta` or
-/// the transcript, so building it early cannot change the proof.
-fn try_prefetch_tree<F, E>(
-    table: &CommittedTable<'_, F, E>,
-    z: &FieldElement<E>,
-    alpha: &FieldElement<E>,
-) -> Option<logup::PrefetchedTree<E>>
-where
-    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + Send + Sync + 'static,
-    E: IsField + Send + Sync + 'static,
-    FieldElement<F>: AsBytes + Sync + Send,
-    FieldElement<E>: AsBytes + Sync + Send,
-{
-    let interactions = multilinear_logup::interactions(
-        table.layout.interactions,
-        table.slot_of().len(),
-        z,
-        alpha,
-        |col| slot(table.slot_of(), col),
-    )
-    .ok()?;
-    let resident = table.trace.reside_from_columns()?;
-    logup::resident_tree_deferred(&interactions, resident)
-}
-
 /// What verifying one table leaves for the caller: its share of the bus, and
 /// the claims its columns are left at.
 pub type TableVerdict<E> = (
@@ -1877,12 +1836,6 @@ where
     // commitment may span several tables, so every start is kept rather than
     // the one a single-table opening needed.
     let mut table_starts = Vec::with_capacity(committed.tables().len());
-    // Prefetch state: when enabled, each iteration builds the NEXT table's tree
-    // while this table's argue idles the GPU on per-round host round-trips.
-    // Subordinate to argue and to retention (see `logup::resident_tree_deferred`),
-    // gated behind LFM_WHIR_PREFETCH for a one-binary A/B — off is byte-exact.
-    let prefetch = prefetch_enabled();
-    let mut held: Option<logup::PrefetchedTree<E>> = None;
     // The device ledger's peak over the argument alone — `RESERVED HW`'s
     // `argue`. It opens on what the commits left promised (the codewords, the
     // layers they kept, and whatever room a group still holds) and rises by
@@ -1895,18 +1848,8 @@ where
         // as a sum. The per-table maximum is kept beside it because the sum
         // alone cannot tell fifty even tables from one that dominates, and
         // those two want opposite levers.
-        // Depth-1 prefetch: finalize the tree built during the previous table's
-        // argue (its output read here — the sync the prefetch deferred — and by
-        // now its kernels have run), then kick off the NEXT table's tree so its
-        // fold kernels overlap THIS table's per-round host round-trips. Both are
-        // timed in this table's argue window, as the eager build is; a working
-        // overlap shows up as a cheap finalize the next iteration.
         let __sp_table = multilinear::whir_split::mark();
-        let this_tree = held.take().and_then(|p| p.into_tree());
-        if prefetch && let Some(next) = committed.tables().get(__sp_at + 1) {
-            held = try_prefetch_tree::<F, E>(next, &z, &alpha);
-        }
-        let (proof, point) = prove(table, &z, &alpha, &beta, transcript, this_tree)?;
+        let (proof, point) = prove(table, &z, &alpha, &beta, transcript, None)?;
         let __sp_secs = multilinear::whir_split::add(&multilinear::whir_split::ARGUE, __sp_table);
         multilinear::whir_split::note_table(__sp_at, __sp_secs);
         for _ in 0..table.num_committed_columns() {
