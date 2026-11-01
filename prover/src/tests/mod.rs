@@ -18,6 +18,9 @@ pub mod block_onechain_tests;
 #[cfg(test)]
 #[cfg(feature = "parallel")]
 pub mod block_whir_p1_tests;
+#[cfg(test)]
+#[cfg(feature = "parallel")]
+pub mod block_whir_pack_tests;
 pub mod block_whir_tests;
 #[cfg(test)]
 pub mod branch_bus_tests;

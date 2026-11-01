@@ -25,6 +25,8 @@ type Proof = BatchedMultiProof<Fp, Ext>;
 
 const SEED: &[u8] = b"batched-argue";
 
+mod pack;
+
 fn config(argue: ArgueFormat) -> ChainConfig {
     ChainConfig {
         log_blowup: 2,
