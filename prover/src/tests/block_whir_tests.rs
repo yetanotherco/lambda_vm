@@ -3015,9 +3015,11 @@ fn the_prover_refuses_a_partition_over_the_group_maximum() {
 /// every group, and a group's most fractions are a table alone at
 /// 2^[`block_whir::BLOCK_MAX_TABLE_VARS`] rows times the most bus interactions
 /// any block AIR carries a row (BLAKE3's 1475). The error is
-/// (len + 1)(|supp| − 1)/|F| with len the longest bus message (204) and
-/// |F| = p³, a committed word decoding to one codeword: 136.79 bits at 1024
-/// groups, 140.79 at 64. The census reads both constants from the block's
+/// (len + 1)(|supp| − 1)/|F| with len the longest bus message (208: KECCAK's
+/// sponge link between two rows of one Keccak-256 call, 207 values and the bus
+/// id; 204 before it, the round chip's state messages) and |F| = p³, a
+/// committed word decoding to one codeword: 136.77 bits at 1024 groups, 140.77
+/// at 64 (136.79 and 140.79 at len 204). The census reads both constants from the block's
 /// AIRs, so a wider AIR or a larger maximum fails here before it moves the
 /// figure.
 #[test]
@@ -3070,7 +3072,7 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
         .fold((0, 0), |(f, l), (f2, l2)| (f.max(f2), l.max(l2)));
     assert_eq!(
         (fractions, len),
-        (1475, 204),
+        (1475, 208),
         "the census: fractions a row, message length"
     );
     let bits = |groups: usize| {
@@ -3081,9 +3083,9 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
     };
     assert_eq!(
         format!("{:.2}", bits(block_whir::BLOCK_MAX_GROUPS)),
-        "136.79"
+        "136.77"
     );
-    assert_eq!(format!("{:.2}", bits(64)), "140.79");
+    assert_eq!(format!("{:.2}", bits(64)), "140.77");
 }
 
 /// ★ The group maximum's edge on the prover's plan: tables that fill a group each, at the
