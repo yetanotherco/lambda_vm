@@ -127,6 +127,10 @@ pub use word::{LfmWord, base_word, ext_word, pack_digest, unpack_digest};
 #[cfg(test)]
 mod blake3_chip_tests;
 #[cfg(test)]
+mod blake3_lean;
+#[cfg(test)]
+mod blake3_lean_probe;
+#[cfg(test)]
 mod blake3_probe;
 #[cfg(test)]
 mod blake3_socket_kats;
