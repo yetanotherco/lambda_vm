@@ -318,6 +318,25 @@ pub fn checked_base(base: &BaseFormat) -> Result<(), Error> {
     Ok(())
 }
 
+/// The base of a block proved with NO recursion over it
+/// ([`crate::base_only`]), or a typed refusal: [`checked_base`]'s base, or —
+/// once the process declared base-only — [`BaseFormat::B3_WHIR`], the
+/// 7-round BLAKE3 base (D-B3HYB S3). Read by the base's own prove and verify
+/// sites alone ([`crate::with_base_hash!`]); the recursion admits through
+/// [`checked_base`], which refuses BLAKE3 whatever this process declared.
+pub fn checked_base_only(base: &BaseFormat) -> Result<(), Error> {
+    if *base == BaseFormat::B3_WHIR {
+        if crate::base_only::admitted() {
+            return Ok(());
+        }
+        return Err(Error::Prover(
+            "a BLAKE3 base is proved only with no recursion over it: this process did not              declare base-only (prove-block-base)"
+                .to_string(),
+        ));
+    }
+    checked_base(base)
+}
+
 // The block's base is Poseidon1 at a cap its trees run at.
 const _: () = {
     assert!(matches!(
@@ -341,6 +360,13 @@ pub fn block_statement_tag(base: &BaseFormat) -> Vec<u8> {
     if P1_TAG_OMITTED.with(std::cell::Cell::get) {
         return MULTILINEAR_BLOCK_TAG.to_vec();
     }
+    // The 7-round BLAKE3 base's binary trees: their cap is the format's
+    // binary one, a verifier-side constant as under RPX before Poseidon1.
+    if *base == BaseFormat::B3_WHIR {
+        let mut tag = MULTILINEAR_BLOCK_TAG.to_vec();
+        tag.extend_from_slice(B3_BASE_TAG_SUFFIX);
+        return tag;
+    }
     let height = match base.arity4_cap {
         CapPolicy::Off | CapPolicy::Fixed(0) => "0".to_string(),
         CapPolicy::Fixed(c) => c.to_string(),
@@ -350,6 +376,10 @@ pub fn block_statement_tag(base: &BaseFormat) -> Vec<u8> {
     tag.extend_from_slice(format!("/P1W16/C{height}").as_bytes());
     tag
 }
+
+/// The 7-round BLAKE3 base's statement tag after
+/// `LAMBDAVM_MULTILINEAR_BLOCK_STATEMENT_V2` (see [`block_statement_tag`]).
+pub const B3_BASE_TAG_SUFFIX: &[u8] = b"/B3R7";
 
 #[cfg(test)]
 thread_local! {
@@ -4424,7 +4454,7 @@ pub(crate) fn prove_traces(
             .collect()
     };
     let tag = block_statement_tag(&format.zf.base);
-    let proof = crate::with_block_hash!(format.zf.base, |H| {
+    let proof = crate::with_base_hash!(format.zf.base, |H| {
         let mut transcript = <H as multilinear::whir_hash::WhirHash>::sponge();
         absorb_block(
             &mut transcript,
@@ -6049,7 +6079,7 @@ fn prove_streamed(
     let waits = ProducerWaits::default();
     let waits = &waits;
     let tag = block_statement_tag(&format.zf.base);
-    crate::with_block_hash!(format.zf.base, |H| {
+    crate::with_base_hash!(format.zf.base, |H| {
         let walkers = block_walkers()?;
         let bitwise_last = deviations.rest_bitwise_last || block_rest_bitwise_last()?;
         let keccak_rnd_first = match deviations.keccak_rnd_first {
@@ -8100,7 +8130,7 @@ pub(crate) fn verify_block_whir_traced(
     let prepared_columns = prepared_tables(airs, page_configs, format)?;
 
     let tag = block_statement_tag(&format.zf.base);
-    Ok(crate::with_block_hash!(format.zf.base, |H| {
+    Ok(crate::with_base_hash!(format.zf.base, |H| {
         let mut transcript = <H as multilinear::whir_hash::WhirHash>::sponge();
         absorb_block(
             &mut transcript,

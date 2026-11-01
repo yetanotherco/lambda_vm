@@ -885,6 +885,9 @@ impl WhirBlockPlan {
         // (`with_block_hash!` admits no other base and reads no knob).
         let base = &format.zf.base;
         crate::block_whir::checked_base(base).map_err(|e| format!("{e:?}"))?;
+        // A base-only process plans no recursion, over any base
+        // (`crate::base_only`).
+        crate::base_only::refuse_recursion()?;
         let wrap_hash = <crate::hash_pin::BlockFamily as crate::hash_pin::ProofFamily>::WRAP;
         let frame = block_frame(statement, elf_bytes, proof_options, format)
             .map_err(|e| format!("statement: {e:?}"))?;

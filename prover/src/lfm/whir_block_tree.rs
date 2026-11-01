@@ -1957,6 +1957,10 @@ pub fn prove_whir_block_tree(
         cfg.leaf_emitters,
     );
     let (argue, format, options) = (cfg.argue, cfg.format, &cfg.options);
+    // The recursion's base is its family's, and a base-only process runs no
+    // recursion (`crate::base_only`): both refused before anything is proved.
+    crate::base_only::refuse_recursion()?;
+    block_whir::checked_base(&format.zf.base).map_err(|e| format!("{e:?}"))?;
     sink.line(&posture_line());
     sink.line(&base_line(&format.zf.base));
     sink.line(&format!("W3 ARGUE: {argue:?}"));
