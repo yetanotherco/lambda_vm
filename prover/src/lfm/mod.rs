@@ -22,7 +22,6 @@ pub mod blake3;
 pub mod blake3_chip;
 pub mod blake3_socket;
 pub mod block_node;
-pub mod block_root;
 pub mod builder;
 pub mod chips;
 pub mod chunking;
@@ -39,8 +38,6 @@ pub mod exec_schedule;
 pub mod executor;
 pub mod fixture;
 pub mod fri;
-pub mod global_parent;
-pub mod global_split;
 pub(crate) mod harvest;
 pub mod hash;
 pub mod instr;
@@ -88,46 +85,14 @@ pub mod whir_chain;
 pub mod whir_epoch;
 pub mod whir_fold;
 pub mod whir_gkr;
-/// The CROSS-EPOCH program builder, beside `whir_epoch`'s level-0 one.
-pub mod whir_global;
-/// The W-leg: a node's in-guest verifier of one W-LFM child, and the node
-/// over W-LFM children.
-pub mod whir_leg;
 pub mod whir_open;
 pub mod whir_poly;
 pub mod whir_program;
-/// The W-LFM proof: an LFM program proved by the stacked-WHIR prover (pure
-/// WHIR, D-WHIR §2), selected by `LAMBDA_VM_LFM_PROVER=whir`.
-pub mod whir_proof;
-/// The WHIR level-0 driver, beside the STARK one in `epoch_tests`.
-///
-/// ⚠ NOT `#[cfg(test)]`: `WhirRealEpoch` is the input type of V1's level-0
-/// program builder, and a production builder cannot take its input from a test
-/// module.
-pub(crate) mod whir_real_epoch;
-/// The WHIR cross-epoch driver, beside the level-0 one above.
-///
-/// ⚠ NOT `whir_global`: that name belongs to the emitter, exactly as
-/// `whir_real_epoch` is not `whir_epoch`.
-///
-/// ★ `pub`, AND THAT IS THE REMEDY FOR A `dead_code` CLASS, NOT AN OVERSIGHT.
-/// The module above is `pub(crate)` and gets away with it because
-/// `whir_epoch::whir_epoch_program` names `WhirRealEpoch` in a public
-/// signature; nothing public names the cross-epoch driver's type yet, so under
-/// `pub(crate)` the lib target reports every item in it unreachable and
-/// `make lint`'s first arm turns that into hard errors. A module-scoped
-/// `#![allow(dead_code)]` would silence the class AND everything added to it
-/// later, so the surface is published instead of the reports suppressed.
-pub mod whir_real_global;
 pub mod whir_reduce;
 pub mod whir_stacked;
-pub mod whir_statement;
 pub mod whir_table;
 pub mod whir_transcript;
 pub mod whir_transcript_kats;
-/// The wide level-1 node: its epochs verified in-program, no wraps (D-WHIR
-/// §7 L1), selected by `LAMBDA_VM_LFM_WIDE=on`.
-pub mod whir_wide;
 pub mod word;
 
 pub use airs::{LfmAirs, NUM_LFM_CHIPS, num_lfm_airs};
@@ -160,10 +125,6 @@ mod blake3_probe;
 mod blake3_socket_kats;
 #[cfg(test)]
 mod blake3_socket_tests;
-/// `LFM_CARD_AFTER_PREP`: only the lock moves, and the prep never reaches the
-/// device (box tier, but for the knob's parse).
-#[cfg(test)]
-mod card_after_prep_tests;
 #[cfg(test)]
 mod commit_ood_leg_tests;
 #[cfg(test)]
@@ -247,21 +208,11 @@ mod whir_chain_tests;
 #[cfg(test)]
 mod whir_commit_ood_leg_tests;
 #[cfg(test)]
-mod whir_epoch_program_tests;
-/// Its tests, which stayed behind when the driver moved out.
-#[cfg(test)]
-mod whir_epoch_tests;
-#[cfg(test)]
 mod whir_fold_tests;
 #[cfg(test)]
 mod whir_gkr_tests;
-/// The cross-epoch program builder's tests.
-#[cfg(test)]
-mod whir_global_tests;
 #[cfg(test)]
 mod whir_lean_tests;
-#[cfg(test)]
-mod whir_leg_tests;
 #[cfg(test)]
 mod whir_onechain_tests;
 #[cfg(test)]
@@ -275,24 +226,15 @@ mod whir_poly_tests;
 #[cfg(test)]
 mod whir_program_tests;
 #[cfg(test)]
-mod whir_proof_tests;
-/// The cross-epoch driver's tests, beside the level-0 driver's.
-#[cfg(test)]
-mod whir_real_global_tests;
-#[cfg(test)]
 mod whir_reduce_tests;
 #[cfg(test)]
 mod whir_stacked_tests;
-#[cfg(test)]
-mod whir_statement_tests;
 #[cfg(test)]
 mod whir_table_tests;
 #[cfg(test)]
 mod whir_transcript_kat_tests;
 #[cfg(test)]
 mod whir_transcript_replay_tests;
-#[cfg(test)]
-mod whir_wide_tests;
 // ★ Test-only: the dependency-structure measurement that prices a parallel
 // executor before one is written (lane E). No production path reaches it.
 #[cfg(test)]

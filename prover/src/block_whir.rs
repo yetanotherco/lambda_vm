@@ -3142,6 +3142,32 @@ pub(crate) fn group_stacks(
     Ok(stacks)
 }
 
+/// Where DECODE sits among a block's tables, found by NAME.
+///
+/// ⚠ Not a constant and not a position. The opening binds the pinned columns to
+/// ONE table's reduced point, and a prover able to aim them at a different
+/// table's point would be settling them against challenges they were never
+/// bound to. So the index is asserted against the AIR that carries the columns,
+/// and "exactly one" is part of the assertion: a table set with two DECODEs, or
+/// none, is a layout nobody meant to build.
+pub(crate) fn decode_table_index(
+    airs: &[&dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+) -> Result<usize, Error> {
+    let found: Vec<usize> = airs
+        .iter()
+        .enumerate()
+        .filter(|(_, air)| air.name() == "DECODE")
+        .map(|(i, _)| i)
+        .collect();
+    match found.as_slice() {
+        [only] => Ok(*only),
+        _ => Err(Error::Prover(format!(
+            "a block's table set must carry exactly one DECODE, it carries {} (at {found:?})",
+            found.len(),
+        ))),
+    }
+}
+
 /// The tables a block opens out of band, in [`VmAirs::air_refs`] order, with
 /// the columns each opening settles:
 /// - DECODE: its ELF-derived columns, all of them;
@@ -3171,7 +3197,7 @@ pub(crate) fn prepared_tables(
         )));
     }
     let first_page = first_page_index(airs)?;
-    let decode = crate::multilinear_continuation::decode_table_index(&refs)?;
+    let decode = decode_table_index(&refs)?;
     let mut tables = vec![(decode, refs[decode].precomputed_columns())];
     let plan = crate::continuation::genesis_stack_plan(
         page_configs,

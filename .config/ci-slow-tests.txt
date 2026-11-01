@@ -91,21 +91,13 @@ lambda-vm-prover continuation::tests::test_split_verify_rejects_non_page_aligned
 lambda-vm-prover continuation::tests::test_split_verify_rejects_malformed_register_fini_length  # 178 s
 lambda-vm-prover continuation::tests::test_split_verify_rejects_oversized_num_private_input_pages  # 178 s
 lambda-vm-prover tests::block_whir_tests::a_wrongly_committed_prepared_stack_is_refused  # 174 s
-lambda-vm-prover tests::multilinear_continuation_tests::the_head_ahead_proves_what_the_serial_head_proves  # 172 s
 lambda-vm-prover lfm::epoch_tests::a_lead_in_prologue_is_the_one_built_from_the_bundle  # 170 s
 lambda-vm-prover tests::prove_elfs_tests::test_continuation_pipeline_end_to_end  # 168 s
 lambda-vm-prover lfm::machine_tests::tampered_transcript_absorb_half_rejects  # 168 s
 lambda-vm-prover lfm::blake3_chip_tests::blake3_chunking_does_not_change_what_is_proved  # 167 s
 lambda-vm-prover tests::block_batched_tests::a_block_argued_batched_proves_and_verifies  # 163 s
-lambda-vm-prover lfm::whir_wide_tests::a_wide_node_executes_its_epochs_and_publishes_the_node_schema  # 158 s
-lambda-vm-prover lfm::whir_wide_tests::a_wide_node_pinned_to_the_wrong_positions_is_refused  # 157 s
 lambda-vm-prover continuation::tests::test_dma_memcpy_across_continuation_epochs  # 155 s
-lambda-vm-prover lfm::whir_epoch_program_tests::a_tampered_epoch_is_refused_at_three_sites  # 152 s
-lambda-vm-prover lfm::whir_epoch_program_tests::the_epoch_program_publishes_the_aggregation_set  # 152 s
 lambda-vm-prover continuation::tests::test_commit_across_epochs_verifies  # 151 s
-lambda-vm-prover lfm::whir_wide_tests::a_wide_node_over_a_broken_register_chain_is_refused  # 151 s
-lambda-vm-prover lfm::whir_epoch_program_tests::the_epoch_program_executes_on_the_epoch_the_host_accepts  # 148 s
-lambda-vm-prover lfm::whir_wide_tests::a_wide_node_of_one_epoch_publishes_the_node_schema  # 145 s
 lambda-vm-prover tests::block_onechain_tests::an_indexed_coset_block_is_refused_by_a_natural_verifier  # 144 s
 lambda-vm-prover lfm::machine_tests::the_merkle_walk_authenticates_a_real_opening  # 142 s
 lambda-vm-prover tests::block_whir_tests::the_prover_refuses_a_partition_over_the_group_maximum  # 142 s
@@ -152,7 +144,6 @@ lambda-vm-prover lfm::machine_tests::real_opening_is_a_usable_tamper_target  # 1
 lambda-vm-prover tests::page_offset_forgery_poc::poc_control_honest_harness_verifies  # 102 s
 lambda-vm-prover tests::block_whir_tests::a_streamed_block_with_keccak_chunks_proves_and_verifies  # 101 s
 lambda-vm-prover lfm::program_shape_tests::a_program_without_byte_lookups_proves_and_verifies_without_bitwise  # 99 s
-lambda-vm-prover lfm::whir_epoch_program_tests::the_epoch_programs_newton_pool_is_measured  # 98 s
 lambda-vm-prover lfm::algebraic_transcript::tests::phase_a_absorbs_derive_the_hosts_shared_pair  # 97 s
 lambda-vm-prover tests::multiplicity_forgery_poc::mul_unanswered_forged_claim_is_rejected  # 97 s
 lambda-vm-prover tests::cpu_timestamp_tests::cpu_proof_start_matches_air_refs_layout  # 96 s
@@ -161,7 +152,6 @@ lambda-vm-prover tests::multiplicity_forgery_poc::load_unanswered_forged_claim_i
 lambda-vm-prover tests::multiplicity_forgery_poc::mul_negative_mu_hi_forgery_is_rejected  # 95 s
 lambda-vm-prover tests::cpu_timestamp_tests::swapped_cpu_tables_are_rejected  # 95 s
 lambda-vm-prover tables::trace_builder::finish::stream_tests::with_bitwise_from_tables_the_stream_is_the_monolithic_finish  # 94 s
-lambda-vm-prover lfm::whir_wide_tests::a_wide_node_whose_epochs_disagree_on_the_id_is_refused  # 94 s
 lambda-vm-prover tables::trace_builder::finish::stream_tests::with_bitwise_last_the_sliding_stream_hands_bitwise_on_last  # 94 s
 lambda-vm-prover tests::block_whir_tests::a_wrong_records_table_is_refused_by_the_verifier  # 93 s
 lambda-vm-prover tests::is_wh_tests::test_is_wh_canonical_word_rewrite_verifies  # 93 s
@@ -187,7 +177,6 @@ lambda-vm-prover lfm::machine_tests::continuation_fixture_generates_two_epochs  
 lambda-vm-prover tests::multiplicity_forgery_poc::lt_honest_control_verifies  # 86 s
 lambda-vm-prover lfm::machine_tests::the_derivation_extends_a_non_u32_register_value_demonstrating_hazard  # 85 s
 lambda-vm-prover lfm::epoch_tests::the_from_proof_constructor_rejects_a_tampered_bundle  # 85 s
-lambda-vm-prover lfm::per_table_aggregator_tests::the_global_verifier_leg_runs_and_rejects_tampers  # 85 s
 lambda-vm-prover tests::windowed_builder_tests::dropping_the_streamed_ops_builds_the_same_tables  # 84 s
 lambda-vm-prover tests::block_onechain_tests::a_coset_block_at_a_card_sized_stack_encodes_no_successor_on_the_host  # 84 s
 lambda-vm-prover tests::multiplicity_forgery_poc::lt_unanswered_forged_claim_is_rejected  # 84 s
@@ -200,8 +189,6 @@ lambda-vm-prover tests::page_offset_forgery_poc::dup_structural_duplicate_page_c
 lambda-vm-prover lfm::blake3_chip_tests::chunked_blake3_proves_and_verifies  # 83 s
 lambda-vm-prover tests::page_offset_forgery_poc::dup_negative_control_without_compensating_row_fails  # 82 s
 lambda-vm-prover tests::prove_elfs_tests::test_verify_rejects_private_input_with_tampered_public_output  # 81 s
-lambda-vm-prover lfm::whir_epoch_tests::tests::an_epoch_proven_under_keccak_is_refused_when_harvested_under_rpx  # 81 s
-lambda-vm-prover lfm::whir_epoch_tests::tests::the_prepared_commitment_handed_in_is_the_one_used  # 81 s
 lambda-vm-prover tests::pc_double_read_poc::preprocessed_timestamp_alone_rejects_the_forgery  # 80 s
 lambda-vm-prover tests::halt_pc_forgery_poc::continue_past_exit_via_halt_pc_is_rejected  # 80 s
 lambda-vm-prover tests::prove_elfs_tests::test_verify_rejects_inflated_num_private_input_pages  # 80 s
@@ -272,7 +259,6 @@ lambda-vm-prover tests::block_batched_tests::keccak_chunks_argue_batched  # 58 s
 lambda-vm-prover tests::block_whir_tests::a_table_stated_over_the_table_cap_is_refused  # 58 s
 lambda-vm-prover tests::is_wh_tests::test_recursion_blob_with_is_wh_verifies_on_host  # 58 s
 lambda-vm-prover tests::block_whir_p1_tests::the_statement_calls_are_absorb_blocks_own  # 57 s
-lambda-vm-prover tests::multilinear_continuation_tests::prep_ahead_proves_what_the_prover_thread_schedule_proves  # 57 s
 lambda-vm-prover tests::block_whir_tests::a_partition_missing_a_table_is_refused  # 57 s
 lambda-vm-prover lfm::blake3_socket_tests::the_trivial_program_proves_and_verifies_under_blake3  # 56 s
 lambda-vm-prover tests::recursion_soundness_gap_poc::test_supplied_decode_root_not_bound_to_inner_elf  # 56 s
@@ -342,10 +328,4 @@ lambda-vm-prover tests::prove_elfs_tests::test_verify_rejects_tampered_public_ou
 lambda-vm-prover lfm::blake3_socket_tests::the_lane_range_check_is_load_bearing_on_its_own  # 48 s in run 40588562061
 lambda-vm-prover lfm::blake3_probe::a_tampered_output_byte_rejects  # 45 s in run 40588562061
 lambda-vm-prover tests::prove_elfs_tests::test_epoch_proof_commits_l2g  # 44 s in run 40588562061
-lambda-vm-prover tests::decode_residency_tests::the_decode_commitment_is_derived_once_per_run  # 44 s in run 40588562061
 lambda-vm-prover tests::block_whir_tests::the_dense_fixture_prepares_decode_and_two_pages  # 43 s in run 40588562061
-lambda-vm-prover lfm::whir_real_global_tests::tests::a_bundle_with_no_epochs_is_refused_by_name  # 42 s in run 40588562061
-lambda-vm-prover tests::multilinear_continuation_tests::a_swapped_bookend_root_is_caught_by_the_binding  # 42 s in run 40588562061
-lambda-vm-prover lfm::whir_epoch_tests::tests::every_epoch_of_a_bundle_harvests  # 42 s in run 40588562061
-lambda-vm-prover tests::multilinear_continuation_tests::a_restated_touched_page_set_is_rejected  # 42 s in run 40588562061
-lambda-vm-prover lfm::whir_epoch_tests::tests::a_config_built_without_the_widths_is_a_different_config  # 42 s in run 40588562061

@@ -1570,18 +1570,6 @@ impl Backend {
     }
 }
 
-/// Every entry into the device layer: each call of [`backend`], which every
-/// device entry point makes before it touches the card. Process-wide and
-/// monotone. A test brackets a phase and compares, to show the phase never
-/// reached the device — the W-LFM prove's host prep, which runs outside the
-/// card permit (`LFM_CARD_AFTER_PREP`, on by default).
-static BACKEND_ENTRIES: AtomicU64 = AtomicU64::new(0);
-
-/// [`BACKEND_ENTRIES`] now.
-pub fn backend_entries() -> u64 {
-    BACKEND_ENTRIES.load(Ordering::Relaxed)
-}
-
 /// Returns the process-wide CUDA backend, initialising it on first call.
 ///
 /// Returns `Err` when CUDA initialisation fails (no driver, no GPU, PTX load
@@ -1590,7 +1578,6 @@ pub fn backend_entries() -> u64 {
 /// a caller that finds another initialising waits for it rather than
 /// building a second context.
 pub fn backend() -> Result<&'static Backend> {
-    BACKEND_ENTRIES.fetch_add(1, Ordering::Relaxed);
     backend_once()
 }
 

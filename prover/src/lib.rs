@@ -11,8 +11,6 @@
 //! ```
 
 pub mod alloc_purge;
-/// ⛔ Measurement only: `LAMBDA_VM_ARGUE_BATCHED_MEASURE` (never a default).
-pub mod argue_measure;
 // The block prover runs its phases on threads and rayon: a host prover, built
 // with `parallel` (the guests take the crate without it).
 #[cfg(feature = "parallel")]
@@ -25,8 +23,6 @@ pub mod hash_pin;
 #[cfg(feature = "instruments")]
 pub mod instruments;
 pub mod lfm;
-pub mod lfm_prover_knob;
-pub mod multilinear_continuation;
 pub mod multilinear_prove;
 mod paged_mem;
 pub use stark::profile_markers;

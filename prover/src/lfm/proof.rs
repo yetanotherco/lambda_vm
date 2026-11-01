@@ -125,13 +125,6 @@ pub fn take_prove_split() -> Option<ProveSplit> {
     LAST_PROVE_SPLIT.with(|c| c.take())
 }
 
-/// Record a prove's split on this thread, for a prover other than
-/// [`lfm_prove`] — the W-LFM one (`whir_proof::lfm_prove_whir`) — so the
-/// driver's timing lines read one cell whichever prover ran.
-pub(crate) fn record_prove_split(split: ProveSplit) {
-    LAST_PROVE_SPLIT.with(|c| c.set(Some(split)));
-}
-
 #[derive(Debug)]
 pub enum LfmProveError {
     Exec(LfmExecError),

@@ -13,7 +13,7 @@ use super::whir_block::{
     BlockPartition, LeafScale, P1_LEAF_HEIGHTS, P1_LEAF_HEIGHTS_2X, scaled_leaf_partition,
 };
 use super::whir_chain::ChipRows;
-use super::whir_epoch::emit_roots_block;
+use super::whir_epoch::emit_absorb_roots;
 use super::whir_transcript::WhirTranscript;
 use super::word::{LfmWord, word_as_ext};
 
@@ -141,7 +141,10 @@ fn the_state_word_is_the_draw_permutations_first_four_lanes() {
             .collect();
         let mut t = WhirTranscript::for_builder(&mut b);
         t.absorb_const_bytes(b"a statement call");
-        let (z, alpha, beta) = emit_roots_block(&mut b, &mut t, &carried, &[]);
+        emit_absorb_roots(&mut b, &mut t, &carried, &[]);
+        let z = t.sample_ext(&mut b);
+        let alpha = t.sample_ext(&mut b);
+        let beta = t.sample_ext(&mut b);
         let state = t.state(&mut b);
         for e in [z, alpha, beta] {
             b.public(e.as_cell());

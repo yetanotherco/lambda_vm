@@ -655,8 +655,7 @@ pub fn emit_sparse_mle_at(b: &mut LfmBuilder, columns: &[&[FE]], point: &[Ext]) 
 /// ⚠⚠ THIS NUMBER IS A PLACEHOLDER AND IT IS OWED A CENSUS — said here rather
 /// than left for a reader to take it for a measurement. The quantity that
 /// decides whether a real block fits is how many nonzero genesis bytes its
-/// touched non-private pages carry between them, and
-/// [`crate::lfm::whir_global::genesis_census`] is the instrument that reads it:
+/// touched non-private pages carry between them, which a census reads
 /// prove-free and card-free, off one execution of the guest. Until that reading
 /// exists this bound is a round number sized to keep the family's contribution
 /// near a million rows — the order the cross-epoch program's other legs cost

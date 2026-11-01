@@ -687,21 +687,6 @@ pub fn fold_coset_constants_lean_windowed(
     words
 }
 
-/// [`fold_coset_constants`] or [`fold_coset_constants_lean`], per
-/// [`FoldEmission::current`].
-pub fn fold_constants_for(
-    domain: &Domain<GoldilocksField>,
-    levels: usize,
-    index_bits: usize,
-) -> Vec<LfmWord> {
-    match FoldEmission::current() {
-        FoldEmission::Classic => fold_coset_constants(domain, levels, index_bits),
-        FoldEmission::Lean => {
-            fold_coset_constants_lean_windowed(domain, levels, index_bits, pow_windows())
-        }
-    }
-}
-
 /// A round's fold, prepared once per round and applied once per query — the one
 /// call site the chain emitter needs whichever [`FoldEmission`] is in force.
 pub enum RoundFold {

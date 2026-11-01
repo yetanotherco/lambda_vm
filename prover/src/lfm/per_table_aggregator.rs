@@ -874,66 +874,12 @@ pub fn emit_chain_bindings(
 ///
 /// ⛔ **AND ON THIS TREE IT STILL STANDS, for a CARD reason rather than a host
 /// one.** The STARK arity-3 interior node does not fit the device: measured,
-/// ds15/ds16. The host peak that settles the question for [`WHIR_FAN_IN`] says
+/// ds15/ds16. The host peak that settles the question for a WHIR tree says
 /// nothing about a node that aborts on VRAM before its host working set is ever
 /// live, so the two trees answer to different constraints and get one constant
 /// each. Every STARK tree number on record — the D-S arms, PR #999 — was taken
 /// at two, and this constant is what keeps them comparable.
 pub const FAN_IN: usize = 2;
-
-/// Children per node on a WHIR tree without a wide level 1 — the `stark`
-/// opt-out and `LAMBDA_VM_LFM_WIDE=off` — and THREE. The wide pure-WHIR tree
-/// takes [`WHIR_WIDE_FAN_IN`].
-///
-/// ★ **THE MEASUREMENT [`FAN_IN`]'s doc was waiting for, on the tree that has
-/// it.** "The measured host peak decides; until it has, the conservative value
-/// stands" names one condition, and on this path it is met: the arity-3 tree
-/// peaks at 31.1-31.5 GiB against a 33.5 GiB gate, with `device fallbacks 0` and
-/// `commit fallbacks 0` on every arm. Three fits, and it is worth −8.05 s of
-/// card time on the interior (wt29-32, A/B/B/A, 15 wrap `program_id`s and the
-/// `whir global IDENTITY` unmoved).
-///
-/// ⚠ **A SECOND CONSTANT RATHER THAN A NEW VALUE IN THE FIRST, deliberately.**
-/// Both tree drivers read their arity as the fallback for `LFM_CENSUS_FAN_IN`,
-/// so moving the shared constant would silently re-base every STARK tree number
-/// on record. The cost is that "one place to change" becomes one place PER TREE;
-/// the benefit is that a WHIR posture cannot move a STARK measurement, which is
-/// the property the campaign's comparisons rest on.
-pub const WHIR_FAN_IN: usize = 3;
-
-/// Children per node on the pure-WHIR tree with a wide level 1 — the WHIR
-/// tree's default — and FIVE.
-///
-/// ★ Measured on block 25368371 (FAST, A B B A): 15 epochs at five make three
-/// wide level-1 nodes (5 / 5 / 5 epochs), which the root takes directly beside
-/// the global wrap. Against fan-in 4 (job 238): −1.55 s, level 1 −0.76 and the
-/// root −0.70; level 1's census falls from 1,052.8 M to 852.6 M cells, because
-/// every table but LANES stays inside its power of two, and the root's LFM_HASH
-/// (253,082 rows) stays under 2^18, so the root falls from 270.9 M to 149.6 M.
-/// Fan-in 4 had already removed the interior level (−0.70 s alone, job 235).
-///
-/// ⚠ **THE CARD'S MARGIN IS 1,346 MiB.** The W-LFM argue's reservation peaked
-/// at 24,342 MiB of the 25,688 MiB budget at five (21,754 MiB at four; job 238,
-/// the log's `RESERVED HW` MiB). A block with heavier epochs would push it over,
-/// and the refused work falls back to the host: slower, never wrong. Measure a
-/// heavier block before relying on five; `LFM_CENSUS_FAN_IN=4` is the opt-out.
-///
-/// ⚠ **A THIRD CONSTANT, for the reason [`WHIR_FAN_IN`] is a second one.** The
-/// WHIR trees without a wide level 1 — the `stark` opt-out and
-/// `LAMBDA_VM_LFM_WIDE=off` — keep [`WHIR_FAN_IN`], so their shapes and program
-/// ids stay the ones on record. [`whir_default_fan_in`] is the one place that
-/// picks between the two.
-pub const WHIR_WIDE_FAN_IN: usize = 5;
-
-/// The WHIR tree's arity when `LFM_CENSUS_FAN_IN` is unset: [`WHIR_WIDE_FAN_IN`]
-/// under a wide level 1, [`WHIR_FAN_IN`] otherwise.
-///
-/// A wide level 1 exists only under the W-LFM prover
-/// (`lfm_prover_knob::wide_selected` refuses it under `stark`), so the five is
-/// pure WHIR's and nothing else's.
-pub fn whir_default_fan_in(wide: bool) -> usize {
-    if wide { WHIR_WIDE_FAN_IN } else { WHIR_FAN_IN }
-}
 
 /// A digest rebuilt from the lanes a child PUBLISHED for it.
 ///

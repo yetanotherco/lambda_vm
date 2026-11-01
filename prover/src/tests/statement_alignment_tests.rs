@@ -242,56 +242,13 @@ impl Expected {
     }
 }
 
-/// What an epoch statement absorbs, field by field.
+/// What the monolithic multilinear statement absorbs, field by field.
 ///
 /// Deliberately a SECOND derivation: the production function accumulates its
 /// length beside its own absorbs, and this adds up the fields it is supposed to
 /// have. The two can only be compared here, and a field added to one and not
-/// the other fails here.
-fn epoch_expected(public_output: usize, table_num_vars: usize) -> Expected {
-    let body = crate::multilinear_continuation::MULTILINEAR_EPOCH_TAG.len()
-        + DIGEST
-        + U64 // epoch_label
-        + U64 // |public_output|
-        + public_output
-        + NUM_TABLE_KINDS * U64
-        + U64 // |table_num_vars|
-        + table_num_vars
-        + CONFIG
-        + GRIND_TRAILER;
-    let calls = 1 // tag
-        + 1 // elf digest
-        + 1 // epoch label
-        + 1 // |public_output|
-        + 1 // public_output
-        + NUM_TABLE_KINDS
-        + 1 // |table_num_vars|
-        + 1 // table_num_vars
-        + 3 // config
-        + 1 // grind trailer
-        + 1; // padding, ALWAYS
-    Expected::new(body, calls)
-}
-
-/// The same for the cross-epoch statement. `page_bases` is eight bytes an entry
-/// and cannot move the alignment; `table_num_vars` can.
-fn global_expected(page_bases: usize, table_num_vars: usize) -> Expected {
-    let body = crate::multilinear_continuation::MULTILINEAR_GLOBAL_TAG.len()
-        + DIGEST
-        + U64 // num_epochs
-        + U64 // num_private_input_pages
-        + U64 // |page_bases|
-        + page_bases * U64
-        + U64 // |table_num_vars|
-        + table_num_vars
-        + CONFIG
-        + GRIND_TRAILER;
-    let calls = 1 + 1 + 1 + 1 + 1 + page_bases + 1 + 1 + 3 + 1 + 1;
-    Expected::new(body, calls)
-}
-
-/// And for the monolithic multilinear statement. Its ranges are sixteen bytes
-/// an entry, so they too are alignment-neutral.
+/// the other fails here. Its ranges are sixteen bytes an entry, so they are
+/// alignment-neutral; `table_num_vars` is not.
 fn monolithic_expected(
     public_output: usize,
     runtime_page_ranges: usize,
@@ -377,24 +334,25 @@ fn the_statement_ends_on_a_field_element_boundary() {
         let table_num_vars = vec![20u8; tnv_len];
 
         let mut rec = WindowRecorder::<KeccakTranscriptHash>::new();
-        crate::multilinear_continuation::absorb_epoch(
+        crate::multilinear_prove::absorb(
             &mut rec,
             &[7u8; 32],
             &public_output,
             &counts(),
             3,
+            &[],
             &table_num_vars,
             &config(),
         );
 
-        let expected = epoch_expected(po_len, tnv_len);
+        let expected = monolithic_expected(po_len, 0, tnv_len);
         residues_seen.insert(expected.body % FELT_BYTES);
 
         // ★ The property first, so a mutation reports the property. The two
         // assertions under it are corroborating derivations, not the claim.
         assert!(
             rec.window.is_multiple_of(FELT_BYTES),
-            "epoch statement at (po {po_len}, tnv {tnv_len}) ended at byte \
+            "statement at (po {po_len}, tnv {tnv_len}) ended at byte \
              {} = {} mod {FELT_BYTES}: whatever is absorbed next straddles two \
              field elements",
             rec.window,
@@ -402,13 +360,13 @@ fn the_statement_ends_on_a_field_element_boundary() {
         );
         assert_eq!(
             rec.window, expected.total,
-            "epoch statement at (po {po_len}, tnv {tnv_len}) absorbed a different \
+            "statement at (po {po_len}, tnv {tnv_len}) absorbed a different \
              number of BYTES than its field list implies",
         );
         assert_eq!(
             rec.absorbs.len(),
             expected.calls,
-            "epoch statement at (po {po_len}, tnv {tnv_len}) absorbed a different \
+            "statement at (po {po_len}, tnv {tnv_len}) absorbed a different \
              number of times than its field list implies — a padding absorb that \
              is skipped when the pad is empty shows up here",
         );
@@ -421,7 +379,7 @@ fn the_statement_ends_on_a_field_element_boundary() {
         assert_eq!(
             misaligned(&rec.absorbs, before),
             Vec::new(),
-            "a root absorbed after the epoch statement at (po {po_len}, tnv \
+            "a root absorbed after the statement at (po {po_len}, tnv \
              {tnv_len}) does not start on a field element boundary",
         );
     }
@@ -433,39 +391,6 @@ fn the_statement_ends_on_a_field_element_boundary() {
         "every shape in the sweep has the same residue, so the sweep cannot \
          tell a computed pad from a constant one",
     );
-}
-
-#[test]
-fn the_cross_epoch_statement_ends_on_a_field_element_boundary() {
-    for &(pages, tnv_len) in &[(0usize, 15usize), (35, 50), (3, 18), (1, 16), (35, 51)] {
-        let page_bases: Vec<u64> = (0..pages as u64).map(|i| i * 4096).collect();
-        let table_num_vars = vec![21u8; tnv_len];
-
-        let mut rec = WindowRecorder::<KeccakTranscriptHash>::new();
-        crate::multilinear_continuation::absorb_global(
-            &mut rec,
-            &[9u8; 32],
-            15,
-            0,
-            &page_bases,
-            &table_num_vars,
-            &config(),
-        );
-
-        let expected = global_expected(pages, tnv_len);
-        assert!(
-            rec.window.is_multiple_of(FELT_BYTES),
-            "cross-epoch statement at (pages {pages}, tnv {tnv_len}) ended at \
-             byte {} = {} mod {FELT_BYTES}",
-            rec.window,
-            rec.window % FELT_BYTES,
-        );
-        assert_eq!(
-            (rec.absorbs.len(), rec.window),
-            (expected.calls, expected.total),
-            "cross-epoch statement at (pages {pages}, tnv {tnv_len})",
-        );
-    }
 }
 
 #[test]
@@ -523,25 +448,21 @@ fn padding_only_the_fixed_prefix_would_not_align_the_roots() {
     // The shape this system runs: no public output, 34 tables.
     let (po_len, tnv_len) = (0usize, 34usize);
     assert!(
-        epoch_expected(po_len, tnv_len)
+        monolithic_expected(po_len, 0, tnv_len)
             .total
             .is_multiple_of(FELT_BYTES)
     );
 
-    // The fixed prefix is the body with both variable fields empty, pinned as a
-    // count-free base plus the per-branch term for the same reason the
-    // transcript pair pin is: how many per-table counts a statement binds is a
-    // property of the branch — fourteen on the WHIR lineage, fifteen once
-    // per-table's conditional BLAKE3 count joins them — while the rest of the
-    // prefix belongs to the encoding. 237 bytes at fourteen kinds, 245 at
-    // fifteen; a literal total would be red on one branch and silent on the
-    // other.
-    const COUNT_FREE_PREFIX: usize = 125;
-    let fixed = epoch_expected(0, 0).body;
+    // The fixed prefix is the body with every variable field empty, pinned as a
+    // count-free base plus the per-table-kind term: how many per-table counts a
+    // statement binds grows with the table set, while the rest of the prefix
+    // belongs to the encoding.
+    const COUNT_FREE_PREFIX: usize = 124;
+    let fixed = monolithic_expected(0, 0, 0).body;
     assert_eq!(
         fixed,
         COUNT_FREE_PREFIX + NUM_TABLE_KINDS * U64,
-        "the epoch statement's fixed prefix",
+        "the statement's fixed prefix",
     );
     let fixed_rounded = fixed + statement_padding(fixed);
 
@@ -596,19 +517,20 @@ fn committed<H: WhirHash>(
     CommittedTables::<_, _, H>::commit(vec![table], cfg).expect("commit")
 }
 
-/// The epoch statement this fixture proves under, absorbed into `t`, and how
-/// many absorbs it took.
+/// The monolithic statement this fixture proves under, absorbed into `t`, and
+/// how many absorbs it took.
 fn seed_with_statement(t: &mut impl IsTranscript<E>, table_num_vars: &[u8], po: &[u8]) -> usize {
-    crate::multilinear_continuation::absorb_epoch(
+    crate::multilinear_prove::absorb(
         t,
         &[1u8; 32],
         po,
         &counts(),
         0,
+        &[],
         table_num_vars,
         &config(),
     );
-    epoch_expected(po.len(), table_num_vars.len()).calls
+    monolithic_expected(po.len(), 0, table_num_vars.len()).calls
 }
 
 /// ★★ THE MARK IS WIRED, checked where its absence is otherwise SILENT.
@@ -620,7 +542,7 @@ fn seed_with_statement(t: &mut impl IsTranscript<E>, table_num_vars: &[u8], po: 
 /// in `crypto` drive transcripts by hand and never touch the prover's statement
 /// path at all.
 ///
-/// So this asserts the CALL, not a count: the production `absorb_epoch` runs
+/// So this asserts the CALL, not a count: the production statement absorb runs
 /// against a recorder that notes whether the mark arrived. It needs no
 /// `hash-metrics` and no process-global counter, so it runs in the ordinary
 /// suite alongside everything else.
@@ -634,7 +556,7 @@ fn the_statement_padding_tells_the_transcript_the_statement_ended() {
     let _ = seed_with_statement(&mut rec, &[1u8], &[]);
     assert!(
         rec.marked,
-        "`absorb_epoch` finished without telling the transcript its statement \
+        "the statement absorb finished without telling the transcript its statement \
          ended, so the alignment counter would count nothing for the rest of the \
          proof and read a zero that means only that it never started"
     );
@@ -697,11 +619,11 @@ fn prove_through_production<H: WhirHash>(
 #[test]
 fn every_absorb_of_a_real_prove_is_field_element_aligned() {
     // Two public-output lengths, so the statement ends at a different length in
-    // each and the pad differs: at `[]` the pad is 2, at `[0, 0]` it is 0 — the
-    // shape where the padding absorb is empty and must still be made.
+    // each and the pad differs: at `[]` the pad is 3, at `[0, 0, 0]` it is 0 —
+    // the shape where the padding absorb is empty and must still be made.
     let (air, columns) = eq_table();
 
-    for po in [vec![], vec![0u8, 0u8]] {
+    for po in [vec![], vec![0u8, 0u8, 0u8]] {
         for arm in ["keccak", "rpx"] {
             let (recorded, rec, produced) = match arm {
                 "keccak" => {
@@ -734,7 +656,7 @@ fn every_absorb_of_a_real_prove_is_field_element_aligned() {
                 po.len(),
             );
 
-            let statement_absorbs = epoch_expected(po.len(), 1).calls;
+            let statement_absorbs = monolithic_expected(po.len(), 0, 1).calls;
             let bad = misaligned(&rec, statement_absorbs);
             assert!(
                 bad.is_empty(),

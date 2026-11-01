@@ -731,8 +731,8 @@ pub const fn grind_check_rows(bits: usize) -> usize {
 /// BIT COUNT, so two widths intern five words and not eight — an arithmetic no
 /// scalar can express.
 ///
-/// ⇒ [`crate::lfm::epoch::grinding_check_constants`] is the values form, and
-/// the program-level answer is its union over the distinct bit counts. This
+/// ⇒ The values form is the words themselves, and the program-level answer is
+/// their union over the distinct bit counts. This
 /// function stays correct for exactly one thing: what ONE grind of a width no
 /// other leg shares would intern.
 pub const fn grind_check_const_felts() -> usize {

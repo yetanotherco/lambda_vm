@@ -72,10 +72,9 @@ libc = "0.2"
 
 [dev-dependencies]
 env_logger = "*"
-# Test-only: the transcript-count pin in `multilinear_bench_tests` guards on the
-# guest ELF's sha256, because two builds of the same guest from the same sources
-# share a name and differ in bytes — which is how a 0.23% count difference was
-# once read as a model error.
+# Test-only: tests that pin a guest guard on its ELF's sha256, because two
+# builds of the same guest from the same sources share a name and differ in
+# bytes.
 sha2 = { version = "0.10", default-features = false }
 # Test-only: `serde_json` is behind `shape-profile` for the guest's sake, and a
 # proof round-trip test should not have to turn that on.

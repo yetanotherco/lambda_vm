@@ -74,7 +74,7 @@ use crate::tables::register;
 use crate::tables::trace_builder::{
     DecodeArtifacts, Traces, build_init_page_data, build_initial_image_paged,
 };
-use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
+use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
 use crate::{
     Error, FIXED_TABLE_COUNT, RuntimePageRange, TableCounts, VmAirs,
@@ -607,6 +607,7 @@ pub(crate) fn global_memory_configs_from_init_page_data(
 /// GLOBAL_MEMORY table is one page tall and [`page::preprocessed_columns`]
 /// builds columns of exactly that many rows, so this is a property of the page
 /// and not a claim a bundle gets to make.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) const PAGE_NUM_VARS: usize = page::DEFAULT_PAGE_SIZE.trailing_zeros() as usize;
 
 /// How many preprocessed columns a genesis page presents: `[OFFSET, INIT]`.
@@ -627,6 +628,7 @@ pub(crate) const PAGE_PREPROCESSED_COLUMNS: usize = 2;
 ///
 /// An all-zero page costs `num_vars` — the interned zero — and not nothing,
 /// which is why the block's 26 zero pages are 468 rows and not 0.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn sparse_leg_rows(num_vars: usize, nonzero: usize) -> usize {
     num_vars + num_vars * nonzero
 }
@@ -673,6 +675,7 @@ pub(crate) const PREPARED_LEG_ROWS: usize = 175_066;
 /// rather than charged too little — which is the whole gain over the literal
 /// this replaces. The block's twenty-eight pages give 24 ([`BLOCK_STACK_VARS`]); a
 /// lone page gives 19 and is charged 101 rather than the block's 111.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) const fn fixed_stack_vars(num_vars: usize, genesis_pages: usize) -> usize {
     num_vars + (2 * genesis_pages).next_power_of_two().trailing_zeros() as usize
 }
@@ -806,6 +809,7 @@ pub(crate) const fn marginal_stacked_rows(num_vars: usize, n_fixed: usize) -> us
 /// the answer. Nothing here depends on which other pages qualified or on the
 /// order they were considered in, and prover, verifier and emitter reach the
 /// same bracket from the same page configs.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn is_candidate(num_vars: usize, n_fixed: usize, nonzero: usize) -> bool {
     nonzero >= candidate_threshold_entries(num_vars, n_fixed)
 }
@@ -834,6 +838,7 @@ pub(crate) fn is_candidate(num_vars: usize, n_fixed: usize, nonzero: usize) -> b
 /// of that rather than the algebra taken on trust. Deciding through `τ` keeps
 /// the number a reader is quoted and the number the code branches on one
 /// object.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn candidate_threshold_entries(num_vars: usize, n_fixed: usize) -> usize {
     if num_vars == 0 {
         // A page of no rows has no sparse leg to save, so nothing qualifies.
@@ -844,6 +849,7 @@ pub(crate) fn candidate_threshold_entries(num_vars: usize, n_fixed: usize) -> us
 
 /// What carrying one candidate SAVES: its sparse leg, less what it adds to the
 /// prepared one. Zero for a page that is not a candidate.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn page_savings(num_vars: usize, n_fixed: usize, nonzero: usize) -> usize {
     sparse_leg_rows(num_vars, nonzero).saturating_sub(marginal_stacked_rows(num_vars, n_fixed))
 }
@@ -860,6 +866,7 @@ pub(crate) fn page_savings(num_vars: usize, n_fixed: usize, nonzero: usize) -> u
 ///
 /// If this refuses, EVERY candidate stays sparse. There is no partial answer:
 /// carrying a subset still pays the whole chain.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn chain_is_paid(total_savings: usize) -> bool {
     total_savings > PREPARED_LEG_ROWS
 }
@@ -906,6 +913,7 @@ pub(crate) fn densest_sparse_entries(num_vars: usize, n_fixed: usize) -> usize {
 /// a rule that read their bytes would not. Counting only what presents an INIT
 /// column keeps every input to the routing decision one both sides derive from
 /// the ELF.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn genesis_page_count(configs: &[PageConfig]) -> usize {
     configs.iter().filter(|c| !c.is_private_input).count()
 }
@@ -915,6 +923,7 @@ pub(crate) fn genesis_page_count(configs: &[PageConfig]) -> usize {
 ///
 /// `init_values` is not padded to the page, so every offset at or past its
 /// length is zero and costs nothing; a `None` page is zero to the last byte.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn nonzero_entries(config: &PageConfig) -> usize {
     config
         .init_values
@@ -982,11 +991,13 @@ impl GenesisStackPlan {
     /// Whether anything is stacked at all. A run whose genesis is entirely
     /// sparse carries no prepared opening, and its cross-epoch proof is then
     /// byte-for-byte the one it was before this route existed.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.at.is_empty()
     }
 
     /// The page-family indices the opening carries, in stack order.
+    #[cfg(test)]
     pub fn dense_pages(&self) -> Vec<usize> {
         self.routes
             .iter()
@@ -1012,6 +1023,7 @@ impl GenesisStackPlan {
 /// in one pass would mean deciding a page's fate before the quantity that
 /// decides it has been computed — which is the set-dependence this rule is
 /// built to avoid, wearing the other hat.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn genesis_stack_plan(
     configs: &[PageConfig],
     num_bookends: usize,
@@ -1085,10 +1097,11 @@ pub(crate) fn genesis_stack_plan(
 /// ⚠ AND THE ORDER MATCHES [`GenesisStackPlan::at`] BY CONSTRUCTION — both walk
 /// `dense_pages()` and then the page's own preprocessed order. The assertion
 /// that they agree is in `genesis_prepared_for`, where the two meet.
+#[cfg(test)]
 pub(crate) fn genesis_stack_columns(
     configs: &[PageConfig],
     plan: &GenesisStackPlan,
-) -> Vec<Vec<FE>> {
+) -> Vec<Vec<crate::tables::types::FE>> {
     plan.dense_pages()
         .into_iter()
         .flat_map(|page| page::preprocessed_columns(&configs[page]))
@@ -1118,293 +1131,8 @@ pub(crate) struct PreparedEpoch {
     pub is_final: bool,
 }
 
-/// Every epoch's proving inputs, prepared in order and handed over one at a
-/// time.
-///
-/// This is the sequential half of [`prove_continuation`]'s pipeline — execution,
-/// op collection over the advancing memory image, the boundary, and the register
-/// carry — run to completion for one epoch before the next. **None of it depends
-/// on a proof, or on how one is made**, so it is the same work whichever
-/// commitment scheme argues the epochs; what differs is only what `each` does
-/// with a [`PreparedEpoch`].
-///
-/// One epoch is alive at a time, which is the whole point of continuations.
-/// `prove_continuation` runs the same steps across three threads instead, to
-/// overlap them; this one is for callers that want them in order.
-///
-/// Returns every epoch's boundary, which is what the cross-epoch global proof
-/// is made of. They stay prover-local: a boundary carries cell values, and for
-/// a private read that value is a byte of the private input.
-pub(crate) fn for_each_epoch(
-    elf: &Elf,
-    private_inputs: &[u8],
-    epoch_size_log2: u32,
-    artifacts: &DecodeArtifacts,
-    mut each: impl FnMut(PreparedEpoch, &[Arc<Vec<CellBoundary>>]) -> Result<(), Error>,
-) -> Result<Vec<Arc<Vec<CellBoundary>>>, Error> {
-    if epoch_size_log2 < 2 {
-        return Err(Error::InvalidContinuationEpochSize(
-            "epoch_size_log2 must be at least 2 (4 cycles)".to_string(),
-        ));
-    }
-    let epoch_size = 1usize.checked_shl(epoch_size_log2).ok_or_else(|| {
-        Error::InvalidContinuationEpochSize(format!(
-            "epoch_size_log2 {epoch_size_log2} is too large for this platform"
-        ))
-    })?;
-
-    let mut executor = Executor::new(elf, private_inputs.to_vec())
-        .map_err(|e| Error::Execution(format!("{e}")))?;
-    let mut image = build_initial_image_paged(elf, private_inputs);
-    let mut provenance =
-        local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
-
-    let mut boundaries: Vec<Arc<Vec<CellBoundary>>> = Vec::new();
-    let mut prev_fini: Option<Vec<u32>> = None;
-    let mut index: u64 = 0;
-    while executor.pc() != 0 {
-        if index >= local_to_global::MAX_EPOCHS {
-            return Err(Error::InvalidContinuationEpochSize(format!(
-                "execution needs more than {} continuation epochs (the IsB20 \
-                 cross-epoch ordering range); use a larger epoch size",
-                local_to_global::MAX_EPOCHS
-            )));
-        }
-        let register_init: Vec<u32> = match (index, prev_fini.take()) {
-            (0, _) => register::register_init_from_entry_point(elf.entry_point),
-            (_, Some(fini)) => fini,
-            (_, None) => {
-                return Err(Error::ContinuationInvariant(
-                    "previous epoch final registers are missing after the first epoch".to_string(),
-                ));
-            }
-        };
-
-        // ── the producer's four stages, under `LAMBDA_VM_BASE_SPLIT=1` ──
-        // The wall is opened first and closed last, so the four stages
-        // PARTITION it with no gap: `execute` runs to the cycle-count check,
-        // `collect` from the label to the image advance, `build` over the trace
-        // tables, `handoff` over the call to `each`. Σ(stages) = wall by
-        // construction — which is the point: the only thing that can break the
-        // identity is a stage whose timer is missing, and that is what the
-        // harness's check is for.
-        let __bs_epoch = multilinear::whir_split::mark();
-        let __bs_exec = multilinear::whir_split::mark();
-        let logs = match executor
-            .resume_with_limit(epoch_size)
-            .map_err(|e| Error::Execution(format!("{e}")))?
-        {
-            Some(logs) => logs.to_vec(),
-            None => break,
-        };
-        let is_final = executor.pc() == 0;
-        if !is_final && logs.len() != epoch_size {
-            return Err(Error::ContinuationInvariant(format!(
-                "intermediate epoch ran {} cycles, expected {epoch_size}",
-                logs.len()
-            )));
-        }
-        let __bs_exec_s = multilinear::whir_split::stage_done(index, "execute", __bs_exec);
-
-        let __bs_collect = multilinear::whir_split::mark();
-        let label = local_to_global::epoch_label(index);
-        let collected = Traces::collect_epoch(artifacts, &image, &register_init, &logs, is_final)?;
-        let boundary = Arc::new(local_to_global::epoch_boundary(
-            &mut provenance,
-            label,
-            &collected.touched_memory_cells(),
-        ));
-        boundaries.push(Arc::clone(&boundary));
-        prev_fini = Some(collected.register_fini(&register_init));
-        for cell in boundary.iter() {
-            image.set(cell.address, (cell.fini.value & 0xFF) as u8);
-        }
-        let __bs_collect_s = multilinear::whir_split::stage_done(index, "collect", __bs_collect);
-
-        let __bs_build = multilinear::whir_split::mark();
-        let traces = Traces::build_from_collected(
-            artifacts,
-            collected,
-            // Continuation epochs use the L2G bookend: PAGE tables (the only
-            // image consumers in the build) are skipped.
-            None::<&HashMap<u64, u8>>,
-            &register_init,
-            &MaxRowsConfig::default(),
-            private_inputs,
-            is_final,
-            true,
-        )?;
-        let __bs_build_s = multilinear::whir_split::stage_done(index, "build", __bs_build);
-
-        // ★ THE BACKPRESSURE IS THE MEASUREMENT. Under
-        // [`for_each_epoch_overlapped`] `each` is a closure whose whole body is
-        // a blocking `send` on an UNBUFFERED channel, so this stage is the
-        // producer waiting for the prover to take the epoch: `handoff` ≫ 0 says
-        // the prover is the bottleneck and nothing spent on the three stages
-        // above buys wall; `handoff` ≈ 0 says the producer is, and the prover
-        // idled instead. No other stage on either thread can answer that.
-        //
-        // ⚠ Under a DIRECT `for_each_epoch` caller (the epoch-program and
-        // bench tests) `each` is the whole prove, so `handoff` names that
-        // instead. None of those sets the knob; the WHIR base is the only
-        // caller that does, and it goes through the overlapped form.
-        let __bs_handoff = multilinear::whir_split::mark();
-        each(
-            PreparedEpoch {
-                index,
-                register_init,
-                label,
-                traces,
-                boundary,
-                is_final,
-            },
-            &boundaries,
-        )?;
-        let __bs_handoff_s = multilinear::whir_split::stage_done(index, "handoff", __bs_handoff);
-        let __bs_epoch_s = multilinear::whir_split::stage_done(index, "epoch", __bs_epoch);
-        multilinear::whir_split::push_producer(multilinear::whir_split::ProducerSplit {
-            index,
-            execute: __bs_exec_s,
-            collect: __bs_collect_s,
-            build: __bs_build_s,
-            handoff: __bs_handoff_s,
-            wall: __bs_epoch_s,
-        });
-        index += 1;
-    }
-
-    Ok(boundaries)
-}
-
-/// [`for_each_epoch`], with the next epoch prepared while `each` still has the
-/// current one.
-///
-/// Preparing an epoch is the executor and the trace builders — host work — and
-/// for a prover `each` is a proof, which is mostly the device's. The two
-/// overlap, so a run costs the proofs plus one preparation instead of both.
-///
-/// The channel has no buffer, so **two epochs are alive at most**: the one in
-/// `each`'s hands and the one waiting to be taken. That bound is the point —
-/// an epoch's traces are the biggest thing here, and a queue would trade the
-/// memory continuations exist to save.
-pub(crate) fn for_each_epoch_overlapped(
-    elf: &Elf,
-    private_inputs: &[u8],
-    epoch_size_log2: u32,
-    artifacts: &DecodeArtifacts,
-    each: impl FnMut(PreparedEpoch) -> Result<(), Error>,
-) -> Result<Vec<Arc<Vec<CellBoundary>>>, Error> {
-    for_each_epoch_overlapped_counted(elf, private_inputs, epoch_size_log2, artifacts, None, each)
-}
-
-/// [`for_each_epoch_overlapped`], also telling `on_count` the run's epoch count
-/// from the producer, as soon as it has prepared the final epoch — an epoch
-/// before `each` is handed it.
-pub(crate) fn for_each_epoch_overlapped_counted(
-    elf: &Elf,
-    private_inputs: &[u8],
-    epoch_size_log2: u32,
-    artifacts: &DecodeArtifacts,
-    on_count: Option<&(dyn Fn(usize) + Sync)>,
-    mut each: impl FnMut(PreparedEpoch) -> Result<(), Error>,
-) -> Result<Vec<Arc<Vec<CellBoundary>>>, Error> {
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<PreparedEpoch>(0);
-    std::thread::scope(|scope| {
-        let producer = scope.spawn(move || {
-            for_each_epoch(
-                elf,
-                private_inputs,
-                epoch_size_log2,
-                artifacts,
-                |prepared, _| {
-                    if prepared.is_final
-                        && let Some(on_count) = on_count
-                    {
-                        on_count(prepared.index as usize + 1);
-                    }
-                    // The consumer stopping is not this side's failure to
-                    // report: its error is the one that says why.
-                    sender.send(prepared).map_err(|_| {
-                        Error::ContinuationInvariant("the epoch consumer stopped".to_string())
-                    })
-                },
-            )
-        });
-        // The receiver is consumed here, so it is dropped before the join
-        // below — which is what unblocks a producer waiting to hand over the
-        // epoch nobody is going to take.
-        let used = receiver.into_iter().try_for_each(&mut each);
-        let produced = producer
-            .join()
-            .map_err(|_| Error::ContinuationInvariant("the epoch producer panicked".to_string()))?;
-        used?;
-        produced
-    })
-}
-
 /// Every epoch's boundary, in epoch order.
 pub(crate) type EpochBoundaries = Vec<Arc<Vec<CellBoundary>>>;
-
-/// [`for_each_epoch_overlapped`], with each epoch's host preparation moved onto
-/// the producer thread too ([`base_prep_ahead`]): `prep` turns every [`PreparedEpoch`]
-/// into what `each` proves before it is handed over, and once the last epoch
-/// has been handed over `tail` runs there, on every boundary, while `each` is
-/// still proving that epoch. Returns the boundaries and `tail`'s value.
-///
-/// The channel still has no buffer, so two epochs are alive at most, exactly
-/// as in [`for_each_epoch_overlapped`] — the one being proved and the one
-/// waiting — only the waiting one is prepared rather than built. `on_count`,
-/// as in [`for_each_epoch_overlapped_counted`], hears the run's epoch count as
-/// soon as the final epoch is built, before its preparation.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn for_each_epoch_overlapped_prepped<T, G>(
-    elf: &Elf,
-    private_inputs: &[u8],
-    epoch_size_log2: u32,
-    artifacts: &DecodeArtifacts,
-    on_count: Option<&(dyn Fn(usize) + Sync)>,
-    prep: impl Fn(PreparedEpoch) -> Result<T, Error> + Send,
-    tail: impl FnOnce(&[Arc<Vec<CellBoundary>>]) -> Result<G, Error> + Send,
-    mut each: impl FnMut(T) -> Result<(), Error>,
-) -> Result<(EpochBoundaries, G), Error>
-where
-    T: Send,
-    G: Send,
-{
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<T>(0);
-    std::thread::scope(|scope| {
-        let producer = scope.spawn(move || {
-            let boundaries = for_each_epoch(
-                elf,
-                private_inputs,
-                epoch_size_log2,
-                artifacts,
-                |prepared, _| {
-                    if prepared.is_final
-                        && let Some(on_count) = on_count
-                    {
-                        on_count(prepared.index as usize + 1);
-                    }
-                    let item = prep(prepared)?;
-                    sender.send(item).map_err(|_| {
-                        Error::ContinuationInvariant("the epoch consumer stopped".to_string())
-                    })
-                },
-            )?;
-            // Closed here, so the consumer's loop ends as soon as it has taken
-            // the last epoch, while `tail` runs.
-            drop(sender);
-            let tailed = tail(&boundaries)?;
-            Ok((boundaries, tailed))
-        });
-        let used = receiver.into_iter().try_for_each(&mut each);
-        let produced = producer
-            .join()
-            .map_err(|_| Error::ContinuationInvariant("the epoch producer panicked".to_string()))?;
-        used?;
-        produced
-    })
-}
 
 /// A collected-but-not-yet-built epoch, handed from the producer to the trace
 /// builder pool. Everything sequential (execution, op collection over the
@@ -1514,24 +1242,6 @@ impl ContinuationProof {
     #[cfg(test)]
     pub(crate) fn epochs(&self) -> &[EpochProof] {
         &self.epochs
-    }
-
-    /// The global proof, as the same view the verifier reads.
-    #[cfg(test)]
-    pub(crate) fn global_proof_view(&self) -> MultiProofView<'_, F, E, ()> {
-        MultiProofView::Owned(&self.global)
-    }
-
-    /// The shipped touched-page-base list (value-free consumer data).
-    #[cfg(test)]
-    pub(crate) fn touched_pages(&self) -> &[u64] {
-        &self.touched_page_bases
-    }
-
-    /// The shipped private-input page count.
-    #[cfg(test)]
-    pub(crate) fn num_private_pages(&self) -> usize {
-        self.num_private_input_pages
     }
 
     /// What each epoch declared it carries, for tests that have to show the
@@ -2476,20 +2186,6 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// [`stark::prove_split`] gives: the record is produced by a binary that does
 /// not enable the feature, and a split taken from a different binary describes
 /// a different run.
-///
-/// ★ ONE KNOB, BOTH PIPELINES. This name also turns on the WHIR base's stages
-/// — the producer's four in [`for_each_epoch`] and the prover's in
-/// [`crate::multilinear_continuation::prove_epoch`] — and it means the same
-/// thing on both: one line per pipeline stage per epoch, in this format.
-///
-/// ⛔ IT DID NOT USED TO. The LFM tree launcher has exported
-/// `LAMBDA_VM_BASE_SPLIT=1` on the WHIR arm since that arm existed, "byte
-/// identical to the D-S exports" — and it reached nothing, because the WHIR
-/// base does not go through the [`prove_continuation`] below. Fifteen epochs
-/// and 57% of the block's wall printed as one number, under a knob the log
-/// showed as set. A knob that names a measurement on one pipeline and nothing
-/// at all on another is worse than a missing one: the export is the evidence a
-/// reader uses to believe the breakdown was taken.
 pub(crate) fn base_split_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("LAMBDA_VM_BASE_SPLIT") {

@@ -20,9 +20,8 @@
 //!    over its own roots — the front's cells — and refused in its domain
 //!    ([`emit_commit_ood_point`]); the fork, each table's argument with its
 //!    preprocessed leg ([`emit_table_walk`]), the group's opening with its
-//!    answers carried — the front's cells again ([`emit_group_walk`]), each
-//!    prepared table's opening ([`emit_prepared_group`]) — #1010's epoch legs,
-//!    on the fork.
+//!    answers carried — the front's cells again ([`emit_group_walk_chains`]),
+//!    each prepared table's opening — #1010's epoch legs, on the fork.
 //! 3. Publishes the block layout ([`BlockLayout::child`]): the block's id, the
 //!    state, the public output's halves, and `Σ p/q` over its tables — minus the
 //!    COMMIT-bus target on the leaf that carries it ([`CARRIER`]).

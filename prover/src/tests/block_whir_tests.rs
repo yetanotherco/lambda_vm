@@ -3234,6 +3234,41 @@ fn the_block_carries_decodes_prepared_opening() {
     assert!(verify(&proof, &elf, &one_group()));
 }
 
+/// ★ DECODE's index is found by NAME, and "exactly one" is the assertion.
+///
+/// The opening binds the pinned columns to one table's reduced point. A prover
+/// who could aim them at a different table's point would be settling them
+/// against challenges they were never bound to, so the index is never inferred
+/// from a position — and a table set with two DECODEs, or none, is a layout
+/// nobody meant to build.
+#[test]
+fn decode_is_found_by_name_and_only_once() {
+    use crate::block_whir::decode_table_index;
+    use crate::test_utils::F;
+
+    let opts = stark::proof::options::ProofOptions::default_test_options();
+    let decode = crate::test_utils::create_decode_air(&opts);
+    let eq = crate::test_utils::create_eq_air(&opts);
+
+    type Air<'a> = &'a dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
+
+    let one: Vec<Air<'_>> = vec![&eq, &decode, &eq];
+    assert_eq!(decode_table_index(&one).expect("one DECODE"), 1);
+
+    let none: Vec<Air<'_>> = vec![&eq, &eq];
+    assert!(
+        decode_table_index(&none).is_err(),
+        "a table set with no DECODE was accepted"
+    );
+
+    let two: Vec<Air<'_>> = vec![&decode, &eq, &decode];
+    assert!(
+        decode_table_index(&two).is_err(),
+        "a table set with two DECODEs was accepted, so the index it returns is \
+         a choice rather than a fact"
+    );
+}
+
 /// The prepared set is DECODE and every genesis page the cross-epoch rule
 /// stacks — a page with thousands of nonzero genesis bytes — and never a zero
 /// page or a private one, whose columns cost the guest nothing or are committed.
@@ -4679,46 +4714,6 @@ fn block_whir_on_a_real_block() {
         bytes.len()
     );
     assert!(ok, "the block proof must verify");
-}
-
-/// The control for W1's readout (box only, `--ignored`): #1010's epoch base on
-/// the same binary and block — `prove_continuation` at 2^21 — with
-/// `LAMBDA_VM_BASE_SPLIT=1`, summing every epoch's and the cross-epoch
-/// proof's argue, openings and commit. Prints `BLOCK REFERENCE`.
-#[test]
-#[ignore = "a real block: box only"]
-fn block_whir_epoch_reference_on_a_real_block() {
-    let elf_path = std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF");
-    let input_path = std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT");
-    let elf = std::fs::read(&elf_path).expect("read the ELF");
-    let input = std::fs::read(&input_path).expect("read the input");
-    assert!(
-        multilinear::whir_split::enabled(),
-        "the reference reads the split: export LAMBDA_VM_BASE_SPLIT=1"
-    );
-    let opts = crate::lfm::proof::block_base_options();
-    let _ = multilinear::whir_split::drain();
-    let wall = std::time::Instant::now();
-    let bundle = crate::multilinear_continuation::prove_continuation(&elf, &input, 21, &opts)
-        .expect("the epochs prove");
-    let base = wall.elapsed().as_secs_f64();
-    let (_, prover) = multilinear::whir_split::drain();
-    let sum =
-        |f: fn(&multilinear::whir_split::ProverSplit) -> f64| prover.iter().map(f).sum::<f64>();
-    let (argue, groups, prepared) = (
-        sum(|r| r.argue),
-        sum(|r| r.open_groups),
-        sum(|r| r.open_prepared),
-    );
-    println!(
-        "BLOCK REFERENCE: base {base:.2}s · epochs {} · records {} · Σargue {argue:.2} · Σopen {:.2} (groups {groups:.2} + prepared {prepared:.2}) · Σcommit {:.2} · argue+open {:.2} · host peak {:.2} GiB",
-        bundle.num_epochs(),
-        prover.len(),
-        groups + prepared,
-        sum(|r| r.commit),
-        argue + groups + prepared,
-        host_peak_gib(),
-    );
 }
 
 /// The process's peak resident set (`VmHWM`), GiB; 0 where `/proc` is absent.

@@ -3648,7 +3648,7 @@ fn grind_bits_group_cost_census() {
                 &layout,
                 &group_of,
                 &chain,
-                super::whir_epoch::fresh_schedule().entry(),
+                super::whir_transcript::SpongeEntry::fresh(),
             );
             println!(
                 "GRINDGROUP bits={bits} Q={} n_stack={} polys={} perms={} instrs={}",

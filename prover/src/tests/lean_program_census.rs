@@ -199,7 +199,7 @@ fn every_vm_batch_on_demand_is_the_same_program() {
     );
 }
 
-/// ★ Device parity, every big batch — the VM's four and the W-LFM's one, found
+/// ★ Device parity, every big batch — the VM's four, found
 /// by the gate: on the card, the program on demand — its slot file sized for
 /// every node from the first round — gives today's round sums, round by round
 /// from a 2^14 cube (whose first round is past KECCAK_RND's 8,096-thread
@@ -236,18 +236,12 @@ fn every_big_batch_rounds_the_same_on_demand_on_the_card() {
         state % P
     };
     let vm = vm_airs();
-    let lfm = w_lfm_airs();
     let every: Vec<(
         &dyn AIR<Field = Gl, FieldExtension = Ext3, PublicInputs = ()>,
         String,
     )> = vm
         .iter()
         .map(|(air, label)| (&**air, label.to_string()))
-        .chain(
-            lfm.air_refs()
-                .into_iter()
-                .map(|air| (air, air.name().to_string())),
-        )
         .collect();
     let mut big = Vec::new();
     for (air, label) in every {
@@ -319,59 +313,7 @@ fn every_big_batch_rounds_the_same_on_demand_on_the_card() {
     }
     assert_eq!(
         big,
-        ["KECCAK", "KECCAK_RND", "ECSM", "ECDAS", "LFM_HASH"],
+        ["KECCAK", "KECCAK_RND", "ECSM", "ECDAS"],
         "the big batches"
     );
-}
-
-// ── the W-LFM batches under pure WHIR ────────────────────────────────────────
-
-/// The W-LFM chips as the pure-WHIR recursion proves them: the WHIR recursion
-/// chip set at the recursion's hasher, as `whir_proof::whir_lfm_airs` builds it.
-pub(crate) fn w_lfm_airs() -> crate::lfm::airs::LfmAirs {
-    use crate::lfm::whir_leg::{RECURSION_CHIP_SET, RECURSION_HASHER};
-
-    let opts = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
-    crate::lfm::whir_proof::whir_lfm_airs(RECURSION_HASHER, RECURSION_CHIP_SET, 1, &opts)
-}
-
-/// ★ Host parity, every W-LFM batch: each on demand is the same polynomial as
-/// today's at random points and holds no more values a thread. Under pure WHIR
-/// the recursion proves these with the base's argue, so the gate reaches them:
-/// `LFM_HASH` — and only it — is big, and on demand it falls under the gate.
-#[test]
-fn every_w_lfm_batch_on_demand_is_the_same_program() {
-    let airs = w_lfm_airs();
-    let mut big = Vec::new();
-    for air in airs.air_refs() {
-        let label = air.name().to_string();
-        let batch = batch_of(air, &label);
-        let demand = batch.program.on_demand();
-        let mut scratch = Vec::new();
-        for seed in [1u64, 29, 311] {
-            let values = point(batch.factors, seed);
-            assert_eq!(
-                demand.eval(&values, &mut scratch),
-                batch.program.eval(&values, &mut scratch),
-                "{label}: on demand is another polynomial (seed {seed})"
-            );
-        }
-        let today = multilinear::gpu::lower(&batch.program).expect("today's lowers");
-        let lean = multilinear::gpu::lower(&demand).expect("on demand lowers");
-        assert!(
-            lean.num_slots <= today.num_slots,
-            "{label}: on demand holds {} values a thread, today {}",
-            lean.num_slots,
-            today.num_slots
-        );
-        if multilinear::gpu::is_big_batch(today.num_slots) {
-            assert!(
-                !multilinear::gpu::is_big_batch(lean.num_slots),
-                "{label}: on demand still holds {} values a thread",
-                lean.num_slots
-            );
-            big.push(label);
-        }
-    }
-    assert_eq!(big, ["LFM_HASH"], "the big W-LFM batches");
 }

@@ -58,10 +58,6 @@ pub mod cpu_timestamp_tests;
 #[cfg(test)]
 pub mod decode_layout_tests;
 #[cfg(test)]
-pub mod decode_prepared_tests;
-#[cfg(test)]
-pub mod decode_residency_tests;
-#[cfg(test)]
 pub mod decode_tests;
 #[cfg(test)]
 pub mod dvrm_tests;
@@ -111,9 +107,6 @@ pub mod memw_tests;
 pub mod mul_mu_carrier_poc;
 #[cfg(test)]
 pub mod mul_tests;
-#[cfg(test)]
-pub mod multilinear_bench_tests;
-pub mod multilinear_continuation_tests;
 pub mod multilinear_prove_tests;
 #[cfg(test)]
 pub mod multilinear_table_tests;

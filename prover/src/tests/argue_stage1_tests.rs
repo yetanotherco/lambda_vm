@@ -1,5 +1,5 @@
-//! D-ARGUE's stage 1 on the tables the argue really proves — the VM's and the
-//! W-LFM's (Q1a, `thoughts/zf/gap2/fix2/D-ARGUE.md` §4.1): the base-field
+//! D-ARGUE's stage 1 on the tables the argue really proves — the VM's
+//! (Q1a, `thoughts/zf/gap2/fix2/D-ARGUE.md` §4.1): the base-field
 //! precondition, parity of the host reference (`multilinear::fused`) with
 //! today's rounds, its negative controls, a census of what each technique
 //! works on, and the op report that sizes the stage.
@@ -36,7 +36,7 @@ use stark::multilinear_air::{IrShape, Uniforms, beta_powers, live_nodes};
 use stark::multilinear_table::{TableLayout, weight_slots};
 use stark::traits::AIR;
 
-use super::lean_program_census::{VmAir, vm_airs, w_lfm_airs};
+use super::lean_program_census::{VmAir, vm_airs};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 type Gl = GoldilocksField;
@@ -72,18 +72,10 @@ impl Rng {
     }
 }
 
-/// Every table the argue proves, by name: the VM's, then the W-LFM chips'.
-fn every_air<'a>(
-    vm: &'a [(VmAir, &'static str)],
-    lfm: &'a crate::lfm::airs::LfmAirs,
-) -> Vec<(DynAir<'a>, String)> {
+/// Every table the argue proves, by name.
+fn every_air<'a>(vm: &'a [(VmAir, &'static str)]) -> Vec<(DynAir<'a>, String)> {
     vm.iter()
         .map(|(air, label)| (&**air as DynAir<'a>, label.to_string()))
-        .chain(
-            lfm.air_refs()
-                .into_iter()
-                .map(|air| (air, air.name().to_string())),
-        )
         .collect()
 }
 
@@ -408,9 +400,9 @@ fn checked() -> Options {
     }
 }
 
-/// The three tables Q1 is sized on: the widest precompile, the VM's tallest
-/// table, and the W-LFM's one big batch.
-const THE_THREE: [&str; 3] = ["KECCAK_RND", "CPU", "LFM_HASH"];
+/// The tables Q1 is sized on: the widest precompile and the VM's tallest
+/// table.
+const THE_Q1_TABLES: [&str; 2] = ["KECCAK_RND", "CPU"];
 
 // ── the base-field precondition ──────────────────────────────────────────────
 
@@ -450,9 +442,8 @@ fn not_base(air: DynAir<'_>) -> Vec<String> {
 #[test]
 fn every_table_meets_the_base_field_precondition() {
     let vm = vm_airs();
-    let lfm = w_lfm_airs();
     let mut exceptions = Vec::new();
-    for (air, label) in every_air(&vm, &lfm) {
+    for (air, label) in every_air(&vm) {
         for reason in not_base(air) {
             exceptions.push(format!("{label}: {reason}"));
         }
@@ -482,14 +473,13 @@ fn every_table_meets_the_base_field_precondition() {
 
 /// ★ (a) Every variant of the reference sends today's messages — rounds,
 /// point, transcript, next challenge, every factor's value at the point — on
-/// every VM table and every W-LFM chip, over random columns with the corners
+/// every VM table, over random columns with the corners
 /// computed, at heights 1, 2, 3 and 5; and counts what the model says.
 #[test]
 fn stage1_sends_todays_messages_on_every_table() {
     let vm = vm_airs();
-    let lfm = w_lfm_airs();
-    let airs = every_air(&vm, &lfm);
-    assert_eq!(airs.len(), 36, "26 VM tables and 10 W-LFM chips");
+    let airs = every_air(&vm);
+    assert_eq!(airs.len(), 26, "26 VM tables");
     for (at, (air, label)) in airs.iter().enumerate() {
         for n in [1usize, 2, 3, 5] {
             let mut rng = Rng::new((at * 100 + n) as u64);
@@ -507,39 +497,30 @@ fn stage1_sends_todays_messages_on_every_table() {
     }
 }
 
-/// ★ (a) The same on the three Q1 tables at 2^8 and 2^10 rows, and CPU at 2^12.
+/// ★ (a) The same on the Q1 tables at 2^8 and 2^10 rows, and CPU at 2^12.
 /// Heights up to 2^14 run on the box ([`stage1_sends_todays_messages_at_the_top_heights`]).
 #[test]
-fn stage1_sends_todays_messages_on_the_three() {
-    run_the_three(&[
+fn stage1_sends_todays_messages_on_the_q1_tables() {
+    run_the_q1_tables(&[
         ("KECCAK_RND", 8),
         ("KECCAK_RND", 10),
         ("CPU", 8),
         ("CPU", 10),
         ("CPU", 12),
-        ("LFM_HASH", 8),
-        ("LFM_HASH", 10),
     ]);
 }
 
-/// The three at 2^12 and 2^14 rows — minutes on a laptop core, so the box
+/// The Q1 tables at 2^12 and 2^14 rows — minutes on a laptop core, so the box
 /// runs it (`--release`).
 #[test]
-#[ignore = "the three Q1 tables at 2^12 and 2^14 rows: a box run"]
+#[ignore = "the Q1 tables at 2^12 and 2^14 rows: a box run"]
 fn stage1_sends_todays_messages_at_the_top_heights() {
-    run_the_three(&[
-        ("KECCAK_RND", 12),
-        ("KECCAK_RND", 14),
-        ("CPU", 14),
-        ("LFM_HASH", 12),
-        ("LFM_HASH", 14),
-    ]);
+    run_the_q1_tables(&[("KECCAK_RND", 12), ("KECCAK_RND", 14), ("CPU", 14)]);
 }
 
-fn run_the_three(heights: &[(&str, usize)]) {
+fn run_the_q1_tables(heights: &[(&str, usize)]) {
     let vm = vm_airs();
-    let lfm = w_lfm_airs();
-    let airs = every_air(&vm, &lfm);
+    let airs = every_air(&vm);
     for &(name, n) in heights {
         let (air, label) = airs
             .iter()
@@ -563,13 +544,12 @@ fn run_the_three(heights: &[(&str, usize)]) {
 
 /// ⛔ (c) One coefficient of the bus column wrong — its first, its last — and
 /// every variant that reads the column parts from today at round 0, on each of
-/// the three.
+/// the Q1 tables.
 #[test]
-fn a_wrong_bus_coefficient_parts_the_messages_on_the_three() {
+fn a_wrong_bus_coefficient_parts_the_messages_on_the_q1_tables() {
     let vm = vm_airs();
-    let lfm = w_lfm_airs();
-    let airs = every_air(&vm, &lfm);
-    for name in THE_THREE {
+    let airs = every_air(&vm);
+    for name in THE_Q1_TABLES {
         let (air, label) = airs.iter().find(|(_, label)| label == name).unwrap();
         let mut rng = Rng::new(0xFA17);
         let n = 6;
@@ -602,13 +582,12 @@ fn a_wrong_bus_coefficient_parts_the_messages_on_the_three() {
 }
 
 /// ⛔ The corner skip on columns that break the AIR parts from today at round
-/// 0 on each of the three, and the corner check refuses at the first row.
+/// 0 on each of the Q1 tables, and the corner check refuses at the first row.
 #[test]
-fn the_corner_skip_parts_on_random_columns_of_the_three() {
+fn the_corner_skip_parts_on_random_columns_of_the_q1_tables() {
     let vm = vm_airs();
-    let lfm = w_lfm_airs();
-    let airs = every_air(&vm, &lfm);
-    for name in THE_THREE {
+    let airs = every_air(&vm);
+    for name in THE_Q1_TABLES {
         let (air, label) = airs.iter().find(|(_, label)| label == name).unwrap();
         let mut rng = Rng::new(0xC0DE);
         let n = 5;
@@ -627,8 +606,7 @@ fn the_corner_skip_parts_on_random_columns_of_the_three() {
 // ── the real-trace half (box) ────────────────────────────────────────────────
 
 /// ★ (b) + (c), on traces that satisfy their AIRs: KECCAK_RND and CPU captured
-/// from a WHIR proof of `test_keccak`, LFM_HASH from a W-LFM proof of
-/// `TrivialV0` under RPX (`multilinear_table::argue_capture`).
+/// from a WHIR proof of `test_keccak` (`multilinear_table::argue_capture`).
 ///
 /// Each captured table, from a fresh transcript at its own GKR claim and
 /// zerocheck point: today's claims `(0, p̃, q̃)` are the batch's true sums (the
@@ -647,24 +625,15 @@ fn the_corner_skip_parts_on_random_columns_of_the_three() {
 #[test]
 #[ignore = "proves a program to capture real traces: a box run"]
 fn the_stage1_reference_on_real_traces() {
-    use crate::lfm::hash::HasherKind;
-    use crate::lfm::whir_proof::{build_whir_artifacts, lfm_prove_whir};
     use crate::tables::MaxRowsConfig;
-    use crate::tables::types::FE;
     use stark::multilinear_table::argue_capture::{self, Captured};
     use stark::proof::options::ProofOptions;
 
-    // The W-LFM program's own AIRs, as its build lays them out: its chip set
-    // and hash chunks are the program's, which the census's stand-in set need
-    // not match.
     let options = ProofOptions::default_test_options();
-    let program = crate::lfm::programs::trivial_program();
-    let build = build_whir_artifacts(&program, &options, HasherKind::Rpx).expect("W-LFM artifacts");
-    let lfm = crate::lfm::whir_proof::airs_for(&build.artifacts, &options);
     let vm = vm_airs();
-    let named: Vec<(DynAir<'_>, String)> = every_air(&vm, &lfm)
+    let named: Vec<(DynAir<'_>, String)> = every_air(&vm)
         .into_iter()
-        .filter(|(_, label)| THE_THREE.contains(&label.as_str()))
+        .filter(|(_, label)| THE_Q1_TABLES.contains(&label.as_str()))
         .collect();
     let width = |air: DynAir<'_>| {
         TableLayout::<Gl, Ext3>::new(
@@ -683,12 +652,6 @@ fn the_stage1_reference_on_real_traces() {
     let elf = crate::test_utils::asm_elf_bytes("test_keccak");
     crate::multilinear_prove::prove_with_options(&elf, &options, &MaxRowsConfig::default())
         .expect("test_keccak proves");
-    let arenas = vec![
-        (0..4u64)
-            .map(|i| core::array::from_fn(|j| FE::from(1_000 * (i + 1) + j as u64)))
-            .collect(),
-    ];
-    lfm_prove_whir(&program, &build, &arenas, &options).expect("TrivialV0 proves under W-LFM");
     argue_capture::arm(&[]);
 
     let mut seen: Vec<String> = Vec::new();
@@ -697,7 +660,7 @@ fn the_stage1_reference_on_real_traces() {
             .downcast::<Captured<Gl, Ext3>>()
             .expect("a Goldilocks table");
         let num_vars = captured.columns[0].num_vars();
-        // Which of the three: the same layout, the same constraint DAG.
+        // Which of the Q1 tables: the same layout, the same constraint DAG.
         let dag = Mix::of(&captured.shape.steps_as_ops());
         let Some((_, label)) = named.iter().find(|(air, label)| {
             let mut rng = Rng::new(1);
@@ -797,23 +760,22 @@ fn the_stage1_reference_on_real_traces() {
     seen.dedup();
     assert_eq!(
         seen,
-        ["CPU", "KECCAK_RND", "LFM_HASH"],
-        "every one of the three captured"
+        ["CPU", "KECCAK_RND"],
+        "every one of the Q1 tables captured"
     );
 }
 
 // ── Q1b: the card (`multilinear::gpu_fused`) ─────────────────────────────────
 
-/// ★ The blob the fused kernels walk is the constraint part: on every VM table
-/// and W-LFM chip, the lowered program with its `ACC` steps, walked as the
+/// ★ The blob the fused kernels walk is the constraint part: on every VM table,
+/// the lowered program with its `ACC` steps, walked as the
 /// grid kernel walks it, gives today's zerocheck rule (weight one) at random
 /// rows. Host only — this is what makes the card's walk checkable without one.
 #[test]
 fn the_fused_blob_is_the_constraint_part_on_every_table() {
     use multilinear::gpu_fused::{lower_fused, run_lowered_host};
     let vm = vm_airs();
-    let lfm = w_lfm_airs();
-    for (at, (air, label)) in every_air(&vm, &lfm).into_iter().enumerate() {
+    for (at, (air, label)) in every_air(&vm).into_iter().enumerate() {
         let mut rng = Rng::new(0xB10B + at as u64);
         let table = Table::from_air(air, &label, 4, &mut rng);
         let lowered =
@@ -951,7 +913,7 @@ impl Session<'_> {
 }
 
 /// ★ Q1b device parity (box): the fused rounds on the card send today's
-/// messages — the three at 2^10 and 2^12, every table at 2^8 or the height
+/// messages — the Q1 tables at 2^10 and 2^12, every table at 2^8 or the height
 /// the card's upload takes it at — over random
 /// columns, the corners summed (random columns break every AIR), with the
 /// cross-check on: today's device rounds replay the fused challenges and must
@@ -970,12 +932,11 @@ fn the_fused_rounds_on_the_card_send_todays_messages() {
         true,
     );
     let vm = vm_airs();
-    let lfm = w_lfm_airs();
     // Each table at 2^8, or as far above as the card's upload takes it: it
     // declines a table under 4096 cells (`gpu::worth_the_device`), which the
     // prover then argues on the host — EQ's 12 factors need 2^9, a two-factor
     // chip 2^11.
-    let mut runs: Vec<(String, usize)> = every_air(&vm, &lfm)
+    let mut runs: Vec<(String, usize)> = every_air(&vm)
         .iter()
         .map(|(air, label)| {
             let mut rng = Rng::new(0);
@@ -984,11 +945,11 @@ fn the_fused_rounds_on_the_card_send_todays_messages() {
             (label.clone(), n)
         })
         .collect();
-    for label in THE_THREE {
+    for label in THE_Q1_TABLES {
         runs.push((label.to_string(), 10));
         runs.push((label.to_string(), 12));
     }
-    let airs = every_air(&vm, &lfm);
+    let airs = every_air(&vm);
     for (at, (label, n)) in runs.iter().enumerate() {
         let air = airs.iter().find(|(_, l)| l == label).unwrap().0;
         let mut rng = Rng::new(0xCA4D + at as u64);
@@ -1027,9 +988,8 @@ fn the_fused_rounds_skip_the_corners_of_every_table_without_roots() {
     use multilinear::gpu_fused::*;
     let _switches = CardSwitches::set(FusedFaults::default(), false);
     let vm = vm_airs();
-    let lfm = w_lfm_airs();
     let mut runs = 0;
-    for (at, (air, label)) in every_air(&vm, &lfm).into_iter().enumerate() {
+    for (at, (air, label)) in every_air(&vm).into_iter().enumerate() {
         let mut rng = Rng::new(0x5C1 + at as u64);
         let probe = Table::from_air(air, &label, 8, &mut rng);
         if probe.shape.num_roots() != 0 {
@@ -1098,7 +1058,7 @@ fn a_proof_made_with_the_fused_rounds_verifies() {
 }
 
 /// ★ S1-1 on today's kernel (`LAMBDA_VM_ARGUE_INT_NODES`): the device rounds
-/// with integer nodes send today's messages (the three at 2^10, fused off).
+/// with integer nodes send today's messages (the Q1 tables at 2^10, fused off).
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "flips process-global argue switches: run alone, --ignored --test-threads=1"]
@@ -1107,10 +1067,9 @@ fn the_int_node_rounds_send_todays_messages() {
     multilinear::gpu_fused::force_argue_fused(Some(false));
     math_cuda::sumcheck::force_int_nodes(Some(true));
     let vm = vm_airs();
-    let lfm = w_lfm_airs();
-    for (at, (air, label)) in every_air(&vm, &lfm)
+    for (at, (air, label)) in every_air(&vm)
         .into_iter()
-        .filter(|(_, l)| THE_THREE.contains(&l.as_str()))
+        .filter(|(_, l)| THE_Q1_TABLES.contains(&l.as_str()))
         .enumerate()
     {
         let mut rng = Rng::new(0x1A7 + at as u64);
@@ -1127,7 +1086,7 @@ fn the_int_node_rounds_send_todays_messages() {
 }
 
 /// ⛔ A wrong bus coefficient on the card: the cross-check refuses the prove
-/// (the three at 2^10). Mutation `LAMBDA_VM_ARGUE_FUSED_MUTATE=xcheck` makes the
+/// (the Q1 tables at 2^10). Mutation `LAMBDA_VM_ARGUE_FUSED_MUTATE=xcheck` makes the
 /// comparison inert, and this test must then FAIL.
 #[cfg(feature = "cuda")]
 #[test]
@@ -1143,10 +1102,9 @@ fn a_wrong_bus_coefficient_on_the_card_is_refused_by_the_cross_check() {
         true,
     );
     let vm = vm_airs();
-    let lfm = w_lfm_airs();
-    for (at, (air, label)) in every_air(&vm, &lfm)
+    for (at, (air, label)) in every_air(&vm)
         .into_iter()
-        .filter(|(_, l)| THE_THREE.contains(&l.as_str()))
+        .filter(|(_, l)| THE_Q1_TABLES.contains(&l.as_str()))
         .enumerate()
     {
         let mut rng = Rng::new(0xBAD + at as u64);
@@ -1166,7 +1124,7 @@ fn a_wrong_bus_coefficient_on_the_card_is_refused_by_the_cross_check() {
 }
 
 /// ⛔ The corner check on the card refuses a trace that breaks its AIR —
-/// random columns, the corners checked rather than summed (the three at
+/// random columns, the corners checked rather than summed (the Q1 tables at
 /// 2^10). Mutation `LAMBDA_VM_ARGUE_FUSED_MUTATE=corners` makes it inert, and
 /// this test must then FAIL.
 #[cfg(feature = "cuda")]
@@ -1176,10 +1134,9 @@ fn the_corner_check_on_the_card_refuses_a_broken_trace() {
     use multilinear::gpu_fused::*;
     let _switches = CardSwitches::set(FusedFaults::default(), true);
     let vm = vm_airs();
-    let lfm = w_lfm_airs();
-    for (at, (air, label)) in every_air(&vm, &lfm)
+    for (at, (air, label)) in every_air(&vm)
         .into_iter()
-        .filter(|(_, l)| THE_THREE.contains(&l.as_str()))
+        .filter(|(_, l)| THE_Q1_TABLES.contains(&l.as_str()))
         .enumerate()
     {
         let mut rng = Rng::new(0xC0 + at as u64);
