@@ -136,6 +136,112 @@ extern "C" __global__ void mobius_tile(uint64_t *x, uint64_t base, uint32_t k_le
     x[i] = tile[threadIdx.y * pitch + threadIdx.x];
 }
 
+// ---------------------------------------------------------------------------
+// ★ The Möbius transform in three passes instead of five (the WHIR encoding,
+// `LAMBDA_VM_WHIR_MOBIUS_WIDE=1`; `src/whir.rs` `mobius_wide`). Each element
+// takes exactly the operations, in exactly the level order, that
+// `mobius_low_levels` / `mobius_tile` give it — the element with the level's
+// bit set loses its partner — so the words are theirs bit for bit. Two kernels:
+//   mobius_wide_low   the first `k_levels <= 11` levels over contiguous tiles
+//                     of 2^11 elements, 1,024 threads; with `parts` it GATHERS
+//                     the stack from its parts on the way in (zero where no
+//                     part covers), so the stack copy and its memset never run.
+//   mobius_wide_tile  `k_levels <= 8` strided levels from `base` over a tile of
+//                     2^k rows × 32 columns, each of the 1,024 threads holding
+//                     2^k / 32 rows (dynamic shared memory up to 66 KiB).
+// ---------------------------------------------------------------------------
+
+#define MOBIUS_WIDE_LOG 11
+
+/// The stack's word at `e`: the part covering it, or zero. `parts` is the
+/// table `(offset, len, src)` per part, sorted by offset, not overlapping;
+/// `[p0, p1)` are the parts that meet this tile (`p0 < p1`).
+__device__ __forceinline__ uint64_t mobius_gather(const uint64_t *parts, uint32_t p0, uint32_t p1,
+                                                  uint64_t e) {
+    uint32_t lo = p0, hi = p1;  // the last part with offset <= e, else p0
+    while (hi - lo > 1) {
+        const uint32_t mid = (lo + hi) / 2;
+        if (parts[3 * mid] <= e) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    const uint64_t off = parts[3 * lo], len = parts[3 * lo + 1];
+    if (e < off || e >= off + len) return 0;
+    const uint64_t *src = reinterpret_cast<const uint64_t *>(parts[3 * lo + 2]);
+    return src[e - off];
+}
+
+extern "C" __global__ void mobius_wide_low(uint64_t *x, const uint64_t *parts, uint32_t n_parts,
+                                           uint32_t k_levels) {
+    __shared__ uint64_t tile[1 << MOBIUS_WIDE_LOG];
+    __shared__ uint32_t span[2];
+    const uint32_t n = 1u << MOBIUS_WIDE_LOG;
+    const uint64_t base = (uint64_t)blockIdx.x << MOBIUS_WIDE_LOG;
+    if (parts != nullptr) {
+        if (threadIdx.x == 0) {
+            // The first part that ends after the tile's start, then every part
+            // that starts before its end.
+            uint32_t lo = 0, hi = n_parts;
+            while (lo < hi) {
+                const uint32_t mid = (lo + hi) / 2;
+                if (parts[3 * mid] + parts[3 * mid + 1] <= base) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            uint32_t end = lo;
+            while (end < n_parts && parts[3 * end] < base + n) ++end;
+            span[0] = lo;
+            span[1] = end;
+        }
+        __syncthreads();
+        const uint32_t p0 = span[0], p1 = span[1];
+        for (uint32_t j = threadIdx.x; j < n; j += blockDim.x)
+            tile[j] = (p0 < p1) ? mobius_gather(parts, p0, p1, base + j) : 0;
+    } else {
+        for (uint32_t j = threadIdx.x; j < n; j += blockDim.x) tile[j] = x[base + j];
+    }
+    __syncthreads();
+    for (uint32_t l = 0; l < k_levels; ++l) {
+        const uint32_t half = 1u << l;
+        for (uint32_t t = threadIdx.x; t < n / 2; t += blockDim.x) {
+            const uint32_t i1 = ((t >> l) << (l + 1)) | half | (t & (half - 1u));
+            tile[i1] = sub(tile[i1], tile[i1 ^ half]);
+        }
+        __syncthreads();
+    }
+    for (uint32_t j = threadIdx.x; j < n; j += blockDim.x) x[base + j] = tile[j];
+}
+
+extern "C" __global__ void mobius_wide_tile(uint64_t *x, uint64_t base, uint32_t k_levels) {
+    extern __shared__ uint64_t tile[];
+    const uint32_t cols = MOBIUS_TILE_COLS;
+    const uint32_t pitch = cols + 1;
+    const uint32_t rows = 1u << k_levels;
+    const uint64_t low = (uint64_t)1 << base;
+    const uint64_t c = (uint64_t)blockIdx.x * cols + threadIdx.x;
+    const uint64_t q = (uint64_t)blockIdx.z * gridDim.y + blockIdx.y;
+    const uint64_t i0 = q * (low << k_levels) + c;
+    for (uint32_t r = threadIdx.y; r < rows; r += blockDim.y)
+        tile[r * pitch + threadIdx.x] = x[i0 + r * low];
+    __syncthreads();
+    for (uint32_t l = 0; l < k_levels; ++l) {
+        const uint32_t half = 1u << l;
+        for (uint32_t r = threadIdx.y; r < rows; r += blockDim.y) {
+            if (r & half) {
+                tile[r * pitch + threadIdx.x] =
+                    sub(tile[r * pitch + threadIdx.x], tile[(r ^ half) * pitch + threadIdx.x]);
+            }
+        }
+        __syncthreads();
+    }
+    for (uint32_t r = threadIdx.y; r < rows; r += blockDim.y)
+        x[i0 + r * low] = tile[r * pitch + threadIdx.x];
+}
+
 /// Pointwise multiply: x[i] *= w[i]. Used for coset scaling (w = g^i weights).
 extern "C" __global__ void pointwise_mul(uint64_t *x,
                                          const uint64_t *w,

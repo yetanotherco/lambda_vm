@@ -2000,10 +2000,15 @@ fn encode_from(source: Source<'_>, log_blowup: usize, transient: bool) -> Result
 
     // The coefficients get a buffer of their own: the Möbius transform runs
     // over them, and the spread below reads them while it writes the codeword.
-    // SAFETY: every element is written by the copy below.
+    // SAFETY: every element is written by the copy below, or by the wide
+    // Möbius pass that gathers the stack in its place.
     let mut coeffs = unsafe { alloc_or_trim::<u64>(&stream, 1usize << log_evals) }?;
-    source.write(&stream, &mut coeffs)?;
-    let x = encode_values(&stream, be, coeffs, log_evals, log_blowup)?;
+    let x = if mobius_wide_gathered(&stream, be, &source, &mut coeffs, log_evals)? {
+        spread_encode(&stream, be, coeffs, log_evals, log_blowup)?
+    } else {
+        source.write(&stream, &mut coeffs)?;
+        encode_values(&stream, be, coeffs, log_evals, log_blowup)?
+    };
 
     let codeword = DeviceCodeword {
         buffer: Arc::new(x),
@@ -2031,8 +2036,6 @@ fn encode_values(
     log_evals: u64,
     log_blowup: usize,
 ) -> Result<CudaSlice<u64>> {
-    let log_n = log_evals + log_blowup as u64;
-    let n = 1usize << log_n;
     mobius(
         stream.as_ref(),
         be,
@@ -2040,6 +2043,20 @@ fn encode_values(
         1usize << log_evals,
         log_evals,
     )?;
+    spread_encode(stream, be, coeffs, log_evals, log_blowup)
+}
+
+/// [`encode_values`] after its Möbius transform: the lift's spread and the NTT
+/// onto the `2^log_blowup`-times larger domain. `coeffs` is spent.
+fn spread_encode(
+    stream: &Arc<CudaStream>,
+    be: &crate::device::Backend,
+    coeffs: CudaSlice<u64>,
+    log_evals: u64,
+    log_blowup: usize,
+) -> Result<CudaSlice<u64>> {
+    let log_n = log_evals + log_blowup as u64;
+    let n = 1usize << log_n;
 
     // The lift's bit-reverse and the NTT's cancel around the zero padding —
     // see `lift_spread`. What was two scattered passes over the codeword plus
@@ -2309,6 +2326,10 @@ fn mobius(
     len: usize,
     log_evals: u64,
 ) -> Result<()> {
+    if mobius_wide_enabled() && log_evals >= MOBIUS_WIDE_LOW as u64 {
+        let (x, _guard) = cudarc::driver::DevicePtrMut::device_ptr_mut(coeffs, stream);
+        return mobius_wide(stream, be, x, len, log_evals, None);
+    }
     let mut level: u64 = 0;
 
     // The contiguous window, when there is a whole block of elements to hold.
@@ -2367,6 +2388,233 @@ fn mobius(
         level += k as u64;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ★ The WHIR encoding's wide Möbius transform: three passes over the
+// stack instead of five — the first 11 levels over contiguous tiles of 2^11,
+// then strided tiles of up to 8 levels — and, for a stack the card already
+// holds, the stack GATHERED from its parts by the first pass instead of copied
+// into a zeroed buffer first. The kernels (`mobius_wide_low`,
+// `mobius_wide_tile` in `kernels/ntt.cu`) give every element the operations
+// the five-pass transform gives it, in the same level order, so the
+// coefficients — and so the codeword and its tree — are the same words.
+// ---------------------------------------------------------------------------
+
+/// `LAMBDA_VM_WHIR_MOBIUS_WIDE=1` takes the wide transform. Read once per
+/// process; only `1` opts in.
+pub const MOBIUS_WIDE_ENV: &str = "LAMBDA_VM_WHIR_MOBIUS_WIDE";
+
+/// Levels the contiguous wide pass takes: 2^11 elements are 16 KiB of shared
+/// memory, half of them updated a level, one per thread of 1,024.
+const MOBIUS_WIDE_LOW: u32 = 11;
+/// Levels a strided wide tile takes: 2^8 rows × 33 words of 8 bytes.
+const MOBIUS_WIDE_TILE: u32 = 8;
+/// The strided tile's shared memory at [`MOBIUS_WIDE_TILE`] levels.
+const MOBIUS_WIDE_TILE_BYTES: u32 = (1 << MOBIUS_WIDE_TILE) * (MOBIUS_TILE_COLS + 1) * 8;
+
+thread_local! {
+    /// Per-thread override of [`MOBIUS_WIDE_ENV`], for parity tests that run
+    /// both transforms in one process. See [`with_mobius_wide`].
+    static MOBIUS_WIDE_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `LAMBDA_VM_WHIR_MOBIUS_WIDE`'s value read: `1` is the wide transform,
+/// anything else (unset included) today's.
+pub fn mobius_wide_setting(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1"))
+}
+
+/// Whether the calling thread's WHIR encodings take the wide Möbius transform.
+pub fn mobius_wide_enabled() -> bool {
+    if let Some(on) = MOBIUS_WIDE_OVERRIDE.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| {
+        let on = mobius_wide_setting(std::env::var(MOBIUS_WIDE_ENV).ok().as_deref());
+        if on {
+            eprintln!(
+                "[gpu] WHIR Möbius: wide, three passes, the stack gathered ({MOBIUS_WIDE_ENV}=1)"
+            );
+        }
+        on
+    })
+}
+
+/// Run `f` with the wide transform forced on or off for the calling thread.
+#[doc(hidden)]
+pub fn with_mobius_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MOBIUS_WIDE_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(MOBIUS_WIDE_OVERRIDE.with(|c| c.replace(Some(on))));
+    f()
+}
+
+/// Encodings whose stack the wide pass gathered, process-wide: what a test
+/// reads to know the gather, and not the copy, ran.
+static MOBIUS_WIDE_GATHERS: AtomicU64 = AtomicU64::new(0);
+
+/// See [`MOBIUS_WIDE_GATHERS`].
+pub fn mobius_wide_gathers() -> u64 {
+    MOBIUS_WIDE_GATHERS.load(Ordering::Relaxed)
+}
+
+/// The wide transform over the `len = 2^log_evals` words at `x` on `stream`;
+/// with `parts` (a device table of `(offset, len, src)` triples and its
+/// length), the first pass reads the stack from them instead of from `x`.
+fn mobius_wide(
+    stream: &CudaStream,
+    be: &crate::device::Backend,
+    x: cudarc::driver::sys::CUdeviceptr,
+    len: usize,
+    log_evals: u64,
+    parts: Option<(cudarc::driver::sys::CUdeviceptr, u32)>,
+) -> Result<()> {
+    debug_assert!(log_evals >= MOBIUS_WIDE_LOW as u64 && len == 1usize << log_evals);
+    static TILE_ATTR: Once = Once::new();
+    let mut attr = Ok(());
+    TILE_ATTR.call_once(|| {
+        attr = be.ctx.bind_to_thread().and_then(|()| {
+            be.mobius_wide_tile.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                MOBIUS_WIDE_TILE_BYTES as i32,
+            )
+        });
+    });
+    attr?;
+    let (table, n_parts) = parts.unwrap_or((0, 0));
+    let first = MOBIUS_WIDE_LOW.min(log_evals as u32);
+    unsafe {
+        stream
+            .launch_builder(&be.mobius_wide_low)
+            .arg(&x)
+            .arg(&table)
+            .arg(&n_parts)
+            .arg(&first)
+            .launch(LaunchConfig {
+                grid_dim: ((len >> MOBIUS_WIDE_LOW) as u32, 1, 1),
+                block_dim: (1024, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    let mut level = first as u64;
+    while level < log_evals {
+        let k = MOBIUS_WIDE_TILE.min((log_evals - level) as u32);
+        let low = 1u64 << level;
+        let (grid_y, grid_z) = crate::ntt::split_grid_y(len as u64 / (low << k));
+        unsafe {
+            stream
+                .launch_builder(&be.mobius_wide_tile)
+                .arg(&x)
+                .arg(&level)
+                .arg(&k)
+                .launch(LaunchConfig {
+                    grid_dim: ((low / MOBIUS_TILE_COLS as u64) as u32, grid_y, grid_z),
+                    block_dim: (MOBIUS_TILE_COLS, 32, 1),
+                    shared_mem_bytes: (1u32 << k) * (MOBIUS_TILE_COLS + 1) * 8,
+                })?;
+        }
+        level += k as u64;
+    }
+    Ok(())
+}
+
+/// The wide transform with the stack gathered from a source the card holds
+/// (a resident store or a buffer's slices), straight into `coeffs`: no copy
+/// and no memset. `false` (nothing queued) when it does not apply — the knob
+/// off, a stack under 2^11, a host source, or parts that overlap or run past
+/// the stack — and the caller copies and transforms as before.
+fn mobius_wide_gathered(
+    stream: &Arc<CudaStream>,
+    be: &crate::device::Backend,
+    source: &Source<'_>,
+    coeffs: &mut CudaSlice<u64>,
+    log_evals: u64,
+) -> Result<bool> {
+    if !mobius_wide_enabled() || log_evals < MOBIUS_WIDE_LOW as u64 {
+        return Ok(false);
+    }
+    let len = 1usize << log_evals;
+    // (offset in the stack, words, source address); the guards hold the
+    // borrowed buffers' stream bookkeeping until the first pass is queued.
+    let mut parts: Vec<(u64, u64, u64)> = Vec::new();
+    let mut guards = Vec::new();
+    match source {
+        Source::Resident {
+            store, parts: p, ..
+        } => {
+            for &(column, offset) in p.iter() {
+                let (src, words) = store.at(column);
+                parts.push((offset as u64, words as u64, src));
+            }
+        }
+        Source::Slices {
+            buffer, parts: p, ..
+        } => {
+            let (base, guard) = buffer.device_ptr(stream);
+            guards.push(guard);
+            for &(at, words, offset) in p.iter() {
+                if at + words > buffer.len() {
+                    return Ok(false);
+                }
+                parts.push((offset as u64, words as u64, base + (at * 8) as u64));
+            }
+        }
+        Source::Whole(_) | Source::Parts { .. } => return Ok(false),
+    }
+    parts.retain(|&(_, words, _)| words > 0);
+    parts.sort_by_key(|&(offset, _, _)| offset);
+    let mut end = 0u64;
+    for &(offset, words, _) in &parts {
+        if offset < end || offset + words > len as u64 {
+            return Ok(false);
+        }
+        end = offset + words;
+    }
+    let Ok(n_parts) = u32::try_from(parts.len()) else {
+        return Ok(false);
+    };
+    let flat: Vec<u64> = parts.iter().flat_map(|&(o, w, s)| [o, w, s]).collect();
+    // One word when there is no part, so the kernel gets an address; it reads
+    // none (every element is then zero, as the copy's memset leaves it).
+    let table = stream.clone_htod(if flat.is_empty() {
+        &[0u64][..]
+    } else {
+        &flat[..]
+    })?;
+    {
+        let (tab, _tab_guard) = table.device_ptr(stream);
+        let (x, _x_guard) = cudarc::driver::DevicePtrMut::device_ptr_mut(coeffs, stream);
+        mobius_wide(stream.as_ref(), be, x, len, log_evals, Some((tab, n_parts)))?;
+    }
+    drop(guards);
+    // Freed stream-ordered, after the first pass has read it.
+    drop(table);
+    MOBIUS_WIDE_GATHERS.fetch_add(1, Ordering::Relaxed);
+    Ok(true)
+}
+
+#[cfg(test)]
+mod mobius_wide_tests {
+    use super::mobius_wide_setting;
+
+    /// Today's transform unless the knob says exactly `1`.
+    #[test]
+    fn the_wide_mobius_runs_only_at_one() {
+        assert!(
+            !mobius_wide_setting(None),
+            "the default is today's transform"
+        );
+        assert!(mobius_wide_setting(Some("1")));
+        assert!(mobius_wide_setting(Some(" 1")));
+        assert!(!mobius_wide_setting(Some("0")));
+        assert!(!mobius_wide_setting(Some("on")), "only 1 opts in");
+    }
 }
 
 /// The same, with the codeword brought back — what a caller that folds on the
