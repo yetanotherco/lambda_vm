@@ -1204,6 +1204,132 @@ fn warm_table_constants<F, E, PI>(
     }
 }
 
+/// Whether every table's boundary-zerofier inverses are in the cache already:
+/// what [`warm_prove_constants`] would find without building anything. A table
+/// whose domain the cache does not hold yet is not warm. Builds nothing.
+pub fn prove_constants_warm<F, E, PI>(
+    tables: &[(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = PI>,
+        usize,
+        &PI,
+    )],
+) -> bool
+where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: Send + Sync,
+{
+    type Entry<F> = (Arc<Domain<F>>, Arc<LdeTwiddles<F>>);
+    tables.iter().all(|&(air, rows, pub_inputs)| {
+        if rows < 2 || !rows.is_power_of_two() {
+            return true;
+        }
+        let key = (
+            std::any::TypeId::of::<F>(),
+            rows,
+            air.options().blowup_factor as usize,
+            air.options().coset_offset,
+        );
+        let domain = domain_twiddle_cache()
+            .lock()
+            .unwrap()
+            .get(&key)
+            .and_then(|b| b.downcast_ref::<Entry<F>>())
+            .map(|e| e.0.clone());
+        let Some(domain) = domain else {
+            return false;
+        };
+        let challenges = vec![FieldElement::<E>::zero(); LOGUP_NUM_CHALLENGES];
+        air.boundary_constraints(pub_inputs, &challenges, None, rows)
+            .constraints
+            .iter()
+            .all(|bc| domain.has_boundary_zerofier_inv(bc.step))
+    })
+}
+
+/// Makes the card's staging pairs a later transfer would make on first use,
+/// until `want` exist (`math_cuda::device::prewarm_staging_pairs`); returns
+/// how many this call made. Zero without a card.
+pub fn prewarm_staging_pairs(want: usize) -> usize {
+    #[cfg(feature = "cuda")]
+    {
+        math_cuda::device::prewarm_staging_pairs(want).unwrap_or(0)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = want;
+        0
+    }
+}
+
+/// LDE cosets [`warm_deep_coset_points`] put on the card so far, process-wide.
+static WARMED_DEEP_COSETS: AtomicU64 = AtomicU64::new(0);
+
+/// How many LDE cosets [`warm_deep_coset_points`] put on the card so far.
+pub fn warmed_deep_cosets() -> u64 {
+    WARMED_DEEP_COSETS.load(Ordering::Relaxed)
+}
+
+/// Puts on the card, before a prove takes it, each table's whole LDE coset —
+/// the points the R4 DEEP reads (`coset_points_device_handle`), which the
+/// first prove of a table length otherwise uploads from pageable memory inside
+/// its card window (64 MiB at 2^21 rows, 128 MiB at 2^22, at blowup 4). The
+/// copy is the one the DEEP caches for the process, so the DEEP finds it and
+/// no value changes. Only for the tables the device DEEP takes (Goldilocks with
+/// its cubic extension, an LDE over the device floor); a no-op without a card.
+/// Returns how many cosets this call uploaded (one already on the card counts
+/// nothing). Call it from a plain thread, not a rayon worker.
+pub fn warm_deep_coset_points<F, E, PI>(
+    tables: &[(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = PI>,
+        usize,
+        &PI,
+    )],
+) -> u64
+where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
+    FieldElement<F>: Send + Sync,
+{
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = tables;
+        0
+    }
+    #[cfg(feature = "cuda")]
+    {
+        if !crate::gpu_lde::is_goldilocks_ext3_tower::<F, E>() {
+            return 0;
+        }
+        let Ok(be) = math_cuda::device::backend() else {
+            return 0;
+        };
+        let mut warmed = 0u64;
+        for &(air, rows, _) in tables {
+            if rows < 2 || !rows.is_power_of_two() {
+                continue;
+            }
+            let (domain, _) = domain_and_twiddles::<F, _>(air, rows);
+            let coset = &domain.lde_roots_of_unity_coset;
+            if !crate::gpu_lde::clears_device_floor(coset.len()) {
+                continue;
+            }
+            // SAFETY: `F == GoldilocksField` (the tower check above), a
+            // transparent wrapper over `u64`.
+            let coset_u64: &[u64] =
+                unsafe { std::slice::from_raw_parts(coset.as_ptr() as *const u64, coset.len()) };
+            if crate::gpu_lde::coset_points_on_device(coset_u64) {
+                continue;
+            }
+            let stream = be.next_stream();
+            warmed +=
+                crate::gpu_lde::coset_points_device_handle(coset_u64, &stream).is_some() as u64;
+        }
+        WARMED_DEEP_COSETS.fetch_add(warmed, Ordering::Relaxed);
+        warmed
+    }
+}
+
 /// Fills the process-wide domain and twiddle cache for a trace of
 /// `trace_length` rows under `blowup_factor` and `coset_offset` — what the first
 /// prove of that shape builds before its first round — so a prove that comes

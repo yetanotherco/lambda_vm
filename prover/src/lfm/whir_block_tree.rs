@@ -2107,22 +2107,51 @@ pub fn prove_whir_block_tree(
                             let program = slot.get()?;
                             let handle = std::thread::spawn(move || -> Result<EarlyOut, String> {
                                 let started = t0.elapsed().as_secs_f64();
+                                // The staging pairs the tree's first card holds
+                                // would allocate, made now, beside the base
+                                // (`LFM_WARM_FIRST_PROVE`).
+                                let staging = super::first_prove_warm::on().then(|| {
+                                    std::thread::spawn(super::first_prove_warm::prewarm_staging)
+                                });
                                 let t = std::time::Instant::now();
-                                let filled = lfm_execute_and_fill(
-                                    &program.program,
-                                    &arena,
-                                    program.program.hasher(<BlockFamily as ProofFamily>::SOCKET),
-                                )
-                                .map_err(|e| format!("early leaf {k}: {e:?}"))?;
+                                let hasher =
+                                    program.program.hasher(<BlockFamily as ProofFamily>::SOCKET);
+                                let mut filled =
+                                    lfm_execute_and_fill(&program.program, &arena, hasher)
+                                        .map_err(|e| format!("early leaf {k}: {e:?}"))?;
                                 let secs = t.elapsed().as_secs_f64();
+                                let wrap = super::proof::aggregation_wrap_options();
                                 // Its tables' domains and twiddles, warm before
                                 // the tree's first card hold (`LFM_WARM_DOMAINS`).
                                 if super::domain_warm::on() {
-                                    super::domain_warm::warm(
-                                        filled.traces(),
-                                        &super::proof::aggregation_wrap_options(),
-                                    );
+                                    super::domain_warm::warm(filled.traces(), &wrap);
                                     super::domain_warm::note_early(t0.elapsed().as_secs_f64());
+                                }
+                                // And the rest of what its prove builds on first
+                                // use: the per-domain prove constants and the
+                                // DEEP's LDE cosets (`LFM_WARM_FIRST_PROVE`).
+                                // A warm-up that fails leaves the prove to build
+                                // what it needs, as with the knob off; the line
+                                // says so.
+                                if super::first_prove_warm::on() {
+                                    match super::first_prove_warm::warm(
+                                        &program.program,
+                                        filled.traces_mut(),
+                                        &wrap,
+                                        hasher,
+                                    ) {
+                                        Ok(_) => super::first_prove_warm::note_early(
+                                            t0.elapsed().as_secs_f64(),
+                                        ),
+                                        Err(e) => eprintln!(
+                                            "W3 FIRST PROVE WARM: early leaf {k}'s warm-up refused: {e}"
+                                        ),
+                                    }
+                                }
+                                if let Some(h) = staging
+                                    && h.join().is_err()
+                                {
+                                    eprintln!("W3 FIRST PROVE WARM: the staging warm-up panicked");
                                 }
                                 Ok((filled, arena, started, secs))
                             });

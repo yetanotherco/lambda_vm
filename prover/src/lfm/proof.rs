@@ -319,6 +319,13 @@ impl LfmFilled {
         &self.traces
     }
 
+    /// The filled traces, for the first prove's warm-up, which pairs them with
+    /// an AIR set as the prove does ([`super::first_prove_warm`]).
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn traces_mut(&mut self) -> &mut LfmTraces {
+        &mut self.traces
+    }
+
     /// The card half of [`lfm_prove_with_residency`]: prove the filled traces
     /// against `artifacts`, which must be built for the hasher they were
     /// filled with — a mismatch is refused ([`LfmProveError::HasherMismatch`])
@@ -463,6 +470,7 @@ pub(crate) fn prove_traces_under<Fam: ProofFamily>(
         .merge
         .check(&artifacts.log_heights)
         .map_err(ProvingError::WrongParameter)?;
+    let prep = Instant::now();
     traces
         .merge_to(&artifacts.merge.plan())
         .map_err(ProvingError::WrongParameter)?;
@@ -473,34 +481,9 @@ pub(crate) fn prove_traces_under<Fam: ProofFamily>(
     // deliberately — the executor and the trace fill run BEFORE this call and
     // must be free to overlap another proof's device phase, which is the entire
     // point of the lever.
-    let mut airs = LfmAirs::new_chunked(
-        &artifacts.roots,
-        &artifacts.blake3_chunk_roots,
-        options,
-        artifacts.keccak_rnd_chunks,
-        hasher,
-        artifacts.chip_set,
-    )
-    .with_hash_tail(&artifacts.hash_chunk_roots, options, hasher);
-    // One-row chips (S2) take their roots from the artifacts; without them a
-    // chip resolved to one row is refused by `multi_prove`, never recomputed.
-    if let Some(one_row) = &artifacts.one_row_roots {
-        airs = airs.with_one_row_roots(one_row);
-    }
-    let airs = airs
-        .with_merge(&artifacts.merge, &artifacts.log_heights, options)
-        .map_err(ProvingError::WrongParameter)?;
-    // The per-domain constants each table's prove would build on first use
-    // inside the card window, built before it instead
-    // (`stark::prover::warm_prove_constants`; cached, so no value moves).
-    if stark::prover::warm_prove_constants_enabled() {
-        let pairs = airs.air_trace_pairs(traces);
-        let tables: Vec<_> = pairs
-            .iter()
-            .map(|(air, trace, pi)| (*air, trace.num_rows(), *pi))
-            .collect();
-        stark::prover::warm_prove_constants(&tables);
-    }
+    let airs = lfm_airs(artifacts, options, hasher)?;
+    warm_before_hold(&airs, traces);
+    super::first_prove_warm::note_prep(prep.elapsed().as_secs_f64());
     // ⛔ The permit is taken only now: the AIR set and the warm-up above are
     // host work that must not hold the card.
     let _card = super::device_permit::hold_labeled("multi_prove");
@@ -519,6 +502,57 @@ pub(crate) fn prove_traces_under<Fam: ProofFamily>(
             residency,
         )?;
     Ok(LfmStarkProof { multi, commit_ood })
+}
+
+/// The AIR set a proof against `artifacts` is made under: every chip's AIR
+/// with its preprocessed root, the chunk and hash tails, the one-row roots
+/// when the format has them, and the artifacts' merge.
+pub(crate) fn lfm_airs(
+    artifacts: &LfmArtifacts,
+    options: &ProofOptions,
+    hasher: HasherKind,
+) -> Result<LfmAirs, ProvingError> {
+    let mut airs = LfmAirs::new_chunked(
+        &artifacts.roots,
+        &artifacts.blake3_chunk_roots,
+        options,
+        artifacts.keccak_rnd_chunks,
+        hasher,
+        artifacts.chip_set,
+    )
+    .with_hash_tail(&artifacts.hash_chunk_roots, options, hasher);
+    // One-row chips (S2) take their roots from the artifacts; without them a
+    // chip resolved to one row is refused by `multi_prove`, never recomputed.
+    if let Some(one_row) = &artifacts.one_row_roots {
+        airs = airs.with_one_row_roots(one_row);
+    }
+    airs.with_merge(&artifacts.merge, &artifacts.log_heights, options)
+        .map_err(ProvingError::WrongParameter)
+}
+
+/// The per-domain constants each table's prove would build on first use
+/// inside the card window, built before it instead
+/// (`stark::prover::warm_prove_constants`), and under `LFM_WARM_FIRST_PROVE`
+/// the DEEP's whole LDE cosets on the card
+/// (`stark::prover::warm_deep_coset_points`). All are cached for the process
+/// as the prove caches them, so no value moves.
+pub(crate) fn warm_before_hold(airs: &LfmAirs, traces: &mut LfmTraces) {
+    let constants = stark::prover::warm_prove_constants_enabled();
+    let cosets = super::first_prove_warm::on();
+    if !constants && !cosets {
+        return;
+    }
+    let pairs = airs.air_trace_pairs(traces);
+    let tables: Vec<_> = pairs
+        .iter()
+        .map(|(air, trace, pi)| (*air, trace.num_rows(), *pi))
+        .collect();
+    if constants {
+        stark::prover::warm_prove_constants(&tables);
+    }
+    if cosets {
+        stark::prover::warm_deep_coset_points(&tables);
+    }
 }
 
 /// The merge the process format asks of `program` (`LAMBDA_VM_ZF_LFM_MERGE`),

@@ -3724,6 +3724,17 @@ fn coset_points_device_cache()
     CACHE.get_or_init(Default::default)
 }
 
+/// Whether the device-resident copy of a host coset-points slice exists
+/// already (what [`coset_points_device_handle`] would find without uploading).
+pub(crate) fn coset_points_on_device(coset_u64: &[u64]) -> bool {
+    coset_u64.len() >= 2
+        && coset_points_device_cache().lock().unwrap().contains_key(&(
+            coset_u64.len(),
+            coset_u64[0],
+            coset_u64[1],
+        ))
+}
+
 /// Resolve a host coset-points slice to its device-resident copy, uploading
 /// once per distinct coset. The first upload synchronizes its stream so the
 /// buffer is safe to read from any other stream afterwards. Returns `None` on

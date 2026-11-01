@@ -36,6 +36,7 @@ pub mod epoch;
 pub mod epoch_verify;
 pub mod exec_schedule;
 pub mod executor;
+pub mod first_prove_warm;
 pub mod fixture;
 pub mod fri;
 pub(crate) mod harvest;

@@ -1991,6 +1991,56 @@ impl StagingPool {
             free = self.returned.wait(free).unwrap_or_else(|e| e.into_inner());
         }
     }
+
+    /// Makes pairs until `want` exist (at most [`MAX_STAGING_PAIRS`]) and puts
+    /// them in the free list; returns how many this call made. One pair at a
+    /// time, the lock not held across a pinned allocation, so a transfer that
+    /// lends meanwhile is never kept waiting behind this.
+    fn prewarm(&self, ctx: &Arc<CudaContext>, want: usize) -> Result<usize> {
+        let want = want.min(MAX_STAGING_PAIRS);
+        let mut made = 0;
+        loop {
+            {
+                let _free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+                if self.created.load(Ordering::Relaxed) >= want {
+                    return Ok(made);
+                }
+                // Counted under the lock, as `lend` counts, so the cap holds.
+                self.created.fetch_add(1, Ordering::Relaxed);
+            }
+            let pair = match StagingPair::new(ctx) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    self.created.fetch_sub(1, Ordering::Relaxed);
+                    return Err(e);
+                }
+            };
+            self.free
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(pair);
+            self.returned.notify_one();
+            made += 1;
+        }
+    }
+}
+
+/// Makes the staging pairs a later transfer would make on first use, until
+/// `want` exist (at most [`MAX_STAGING_PAIRS`]); returns how many this call
+/// made. Each pair is two pinned allocations, which take the driver's lock for
+/// several milliseconds: a caller that runs this before the transfers that
+/// need the pairs takes those allocations out of their windows. The pairs are
+/// the ones [`htod_staged`] would make, so nothing a transfer moves changes.
+pub fn prewarm_staging_pairs(want: usize) -> Result<usize> {
+    let be = backend()?;
+    be.ctx.bind_to_thread()?;
+    be.staging_pairs.prewarm(&be.ctx, want)
+}
+
+/// How many staging pairs exist (made on first use or by
+/// [`prewarm_staging_pairs`]).
+pub fn staging_pairs_created() -> usize {
+    backend().map_or(0, |be| be.staging_pairs.created.load(Ordering::Relaxed))
 }
 
 /// A pair on loan to one transfer, handed back when dropped. Every exit path of

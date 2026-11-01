@@ -2919,6 +2919,9 @@ fn the_whir_block_tree_on_a_real_block() {
     // (`LFM_WARM_DOMAINS`): how many lengths, how long, and when the early
     // leaf's were warm on the tree's clock.
     println!("W3 WARM DOMAINS: {}", super::domain_warm::line());
+    // The first prove's warm-up beside the base (`LFM_WARM_FIRST_PROVE`), and
+    // every prove's host preparation before it took the card, in both arms.
+    println!("W3 FIRST PROVE WARM: {}", super::first_prove_warm::line());
     // Off the clock: what the device declined, and the card's peaks as the
     // ledger and the memory pool count them (not total − free, which reads a
     // retaining pool's blocks as used).

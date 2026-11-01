@@ -146,6 +146,11 @@ impl<F: IsFFTField> Domain<F> {
         v
     }
 
+    /// Whether [`Self::boundary_zerofier_inv`] has `step`'s inverse cached.
+    pub(crate) fn has_boundary_zerofier_inv(&self, step: usize) -> bool {
+        self.boundary_z_inv.lock().unwrap().contains_key(&step)
+    }
+
     /// Barycentric OOD constants (round 3), computed once per domain.
     pub fn ood_constants(&self) -> &DomainConstants<F> {
         self.ood_constants

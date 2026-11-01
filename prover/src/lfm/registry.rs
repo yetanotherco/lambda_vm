@@ -742,9 +742,11 @@ pub(crate) fn build_artifacts_merged_under<S: stark::config::StarkHash>(
 /// [`build_artifacts_under`]'s heights, chunk lists and chip set with NO
 /// commit (every root zero, the id zero): what a node's shape over this
 /// program depends on (`DerivedChild`), for the census, which must not pay
-/// the commits. Test-only; `the_census_artifacts_are_the_real_ones_shape`
-/// pins it against a real build.
-#[cfg(test)]
+/// the commits, and the AIR set the first prove's warm-up reads its tables'
+/// shapes from (`first_prove_warm`), before the artifacts exist.
+/// `first_prove_warm::tests::the_census_artifacts_have_the_built_shape` pins
+/// it against a real build.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn census_artifacts(program: &LfmProgram, hasher: HasherKind) -> LfmArtifacts {
     let range = range_group();
     let program_slots = program_groups(program);
@@ -805,9 +807,9 @@ pub(crate) fn census_artifacts(program: &LfmProgram, hasher: HasherKind) -> LfmA
 }
 
 /// [`census_artifacts`] under the merge `on` asks of `program`, every merged
-/// root zero: the shape a node over a merged program derives (test-only, the
-/// merge census's).
-#[cfg(test)]
+/// root zero: the shape a node over a merged program derives (the merge
+/// census's), and the merged AIR set the first prove's warm-up builds.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn census_artifacts_merged(
     program: &LfmProgram,
     hasher: HasherKind,

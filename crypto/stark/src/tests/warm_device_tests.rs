@@ -75,3 +75,50 @@ fn a_warmed_prove_is_byte_identical() {
     let b = |p| sha3_hex(&rkyv::to_bytes::<rkyv::rancor::Error>(p).expect("rkyv"));
     assert_eq!(b(&on), b(&off), "the warm-up moved a proof byte");
 }
+
+/// The DEEP's LDE coset warmed before a prove: one upload for a length the card
+/// has not seen under that offset, none on the second call. A prove after it
+/// verifies and repeats byte for byte, and a prove whose DEEP found its coset in
+/// the cache (the second under another offset) has the bytes of the one whose
+/// DEEP uploaded it: the warm-up only fills that cache.
+#[test]
+#[ignore = "card: proves on the GPU; run on the box with --ignored --test-threads=1"]
+fn the_deep_coset_warm_uploads_once_and_moves_no_byte() {
+    use crate::prover::{warm_deep_coset_points, warmed_deep_cosets};
+    type Air = LogReadOnlyRAP<
+        math::field::goldilocks::GoldilocksField,
+        math::field::extensions_goldilocks::Degree3GoldilocksExtensionField,
+    >;
+    let rows = 1usize << 17;
+    // Offsets no other test proves under, so neither coset is on the card yet.
+    let mut cold_o = golden_options(4, 1, 7, ProofFormat::DEFAULT);
+    cold_o.coset_offset = 23;
+    let mut o = cold_o.clone();
+    o.coset_offset = 29;
+    let (air_cold, cold, pi) = prove_logup::<Blake3StarkHash>(rows, &cold_o);
+    let (_, cold_again, _) = prove_logup::<Blake3StarkHash>(rows, &cold_o);
+
+    let air = Air::new(&o);
+    let tables: Vec<(
+        &dyn AIR<Field = _, FieldExtension = _, PublicInputs = _>,
+        usize,
+        &_,
+    )> = vec![(&air, rows, &pi)];
+    let before = warmed_deep_cosets();
+    assert_eq!(warm_deep_coset_points(&tables), 1, "one coset uploaded");
+    assert_eq!(warm_deep_coset_points(&tables), 0, "then found");
+    assert_eq!(warmed_deep_cosets() - before, 1);
+    let (air_w, warm, _) = prove_logup::<Blake3StarkHash>(rows, &o);
+    let (_, warm_again, _) = prove_logup::<Blake3StarkHash>(rows, &o);
+
+    assert!(verify_logup::<Blake3StarkHash>(&air_cold, &cold));
+    assert!(verify_logup::<Blake3StarkHash>(&air_w, &warm));
+    let b = |p| sha3_hex(&rkyv::to_bytes::<rkyv::rancor::Error>(p).expect("rkyv"));
+    assert_eq!(
+        b(&cold),
+        b(&cold_again),
+        "a cached coset moved a proof byte"
+    );
+    assert_eq!(b(&warm), b(&warm_again), "a warmed prove does not repeat");
+    assert_ne!(b(&warm), b(&cold), "the two offsets prove differently");
+}
