@@ -966,8 +966,8 @@ pub struct CosetOpenings {
 /// commit's own kernels (so each block's subtree is the committed one, which
 /// the caller checks against its kept node), and the queried blocks gathered
 /// from the same buffer. `queried` are leaf indices, each in one of the plan's
-/// cosets. Poseidon1 trees only. `in_place`: the stack read where it lies
-/// ([`evaluate_slices`]); the same words either way.
+/// cosets. Poseidon1 and 7-round BLAKE3 trees only. `in_place`: the stack
+/// read where it lies ([`evaluate_slices`]); the same words either way.
 pub fn coset_openings(
     stack: &StackSlices,
     plan: &CosetPlan,
@@ -975,7 +975,10 @@ pub fn coset_openings(
     hash: crate::DeviceHash,
     in_place: bool,
 ) -> Result<CosetOpenings> {
-    ensure!(hash == crate::DeviceHash::Poseidon1);
+    ensure!(matches!(
+        hash,
+        crate::DeviceHash::Poseidon1 | crate::DeviceHash::Blake3
+    ));
     ensure!(plan.num_vars == stack.num_vars && plan.log_blowup == stack.log_blowup);
     let be = backend()?;
     let m = module()?;
@@ -1026,18 +1029,18 @@ pub fn coset_openings(
     let block_u64 = block as u64;
     {
         let mut region = nodes.slice_mut(leaves_offset..leaves_offset + leaves * 32);
-        let k = crate::p1_stark::kernels()?;
+        let (kernel, cfg) = crate::whir::coset_leaf_kernel(be, hash, true, leaves_u64)?;
         unsafe {
             stream
-                .launch_builder(&k.leaves_base_coset)
+                .launch_builder(kernel)
                 .arg(&out)
                 .arg(&leaves_u64)
                 .arg(&block_u64)
                 .arg(&mut region)
-                .launch(crate::p1_stark::launch_cfg(leaves_u64))?;
+                .launch(cfg)?;
         }
     }
-    crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes, leaves, hash)?;
+    crate::whir::build_inner_tree_levels(stream.as_ref(), be, &mut nodes, leaves, hash)?;
     let nodes_host = crate::readback::clone_dtoh(&stream, &nodes)?;
 
     let index_dev = htod_or_trim(&stream, &at)?;

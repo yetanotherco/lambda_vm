@@ -31,6 +31,7 @@ pub mod argue_fused;
 pub mod argue_probe;
 pub mod barycentric;
 pub mod blake3;
+pub mod blake3_whir;
 pub mod card_rows;
 pub mod columns;
 pub mod constraint_interp;
@@ -62,6 +63,7 @@ pub mod stream_class;
 pub mod sumcheck;
 pub mod whir;
 pub mod whir_coset;
+pub mod whir_hash_bench;
 pub mod whir_open;
 
 // Re-exported for downstream crates so they can refer to CUDA primitive
