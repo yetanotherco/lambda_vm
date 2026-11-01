@@ -287,6 +287,7 @@ enum Arm {
     Keccak256,
     Rpx256,
     Poseidon1,
+    Blake3Std,
 }
 
 /// Smallest nonce whose keccak grind head is `< limit`, or `None` when the CUDA
@@ -320,6 +321,31 @@ pub fn generate_nonce_p1_gpu(inner_felts: &[u64; 4], grinding_factor: u8) -> Opt
         grinding_factor,
         knobs_in_effect(),
     )
+}
+
+/// Smallest nonce whose standard 7-round BLAKE3 grind head is `< limit`
+/// (`crypto::grinding::is_valid_nonce::<Blake3Std>`), or `None` when the CUDA
+/// path is unavailable or errors. `inner_lanes` are the inner hash's four
+/// little-endian lanes, as for keccak (`crypto::grinding::inner_hash_lanes`):
+/// the kernel splits each into its two BLAKE3 message words
+/// (`kernels/blake3_whir.cu`, `b3w_grind_search`).
+pub fn generate_nonce_blake3_gpu(inner_lanes: &[u64; 4], grinding_factor: u8) -> Option<u64> {
+    search(
+        Arm::Blake3Std,
+        inner_lanes,
+        grinding_factor,
+        knobs_in_effect(),
+    )
+}
+
+/// [`generate_nonce_blake3_gpu`] at knobs given here (the card microbenchmark's
+/// fixed grid).
+pub fn generate_nonce_blake3_gpu_at(
+    inner_lanes: &[u64; 4],
+    grinding_factor: u8,
+    knobs: Knobs,
+) -> Option<u64> {
+    search(Arm::Blake3Std, inner_lanes, grinding_factor, knobs)
 }
 
 /// [`generate_nonce_gpu`] at knobs given here rather than read from the
@@ -581,6 +607,7 @@ fn search(arm: Arm, inner: &[u64; 4], grinding_factor: u8, knobs: Knobs) -> Opti
         Arm::Keccak256 => (&be.grind_search, BLOCK_DIM),
         Arm::Rpx256 => (&be.rpx_grind_search, RPX_BLOCK_DIM),
         Arm::Poseidon1 => crate::p1_stark::grind_kernel().ok()?,
+        Arm::Blake3Std => crate::blake3_whir::grind_kernel().ok()?,
     };
     let stream = be.next_stream();
     let inner_dev = stream.clone_htod(inner.as_slice()).ok()?;
