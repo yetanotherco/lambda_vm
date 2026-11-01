@@ -1581,6 +1581,88 @@ fn the_leaf_scale_is_the_verifiers_both_ways() {
     );
 }
 
+// ===================== the GKR slot packing through the tree =====================
+
+/// ★ A block argued with its GKR slots packed (`GkrPack::Chunks`): its leaves
+/// execute and their shares cancel — a cut table's chunk outputs added as one
+/// fraction in-guest — and its tree proves to the top the packed verifier
+/// derives. The packing is the verifier's: today's verifier refuses the packed
+/// top, and the packed verifier refuses today's top over the same program.
+#[test]
+#[ignore = "proves two trees over a small block; box tier"]
+fn the_packed_block_proves_to_the_derived_top_and_only_there() {
+    use multilinear::whir_chain::GkrPack;
+    super::device_permit::arm(1);
+    let today = at_blowup_4(BlockFormat {
+        argue: ArgueFormat::BATCHED,
+        ..small_format()
+    });
+    let packed = today.with_pack(GkrPack::Chunks { tree_log_cells: 8 });
+    let opts = ProofOptions::default_test_options();
+    let wrap = aggregation_wrap_options();
+    let mut tops = Vec::new();
+    for (tag, format) in [("TODAY", today), ("PACKED", packed)] {
+        let (elf, proof) = small_block("test_keccak", &format);
+        let outputs: usize = proof.argues.iter().map(|a| a.bus_outputs.len()).sum();
+        if tag == "PACKED" {
+            assert!(
+                outputs > proof.table_num_vars.len(),
+                "{outputs} bus outputs for {} tables: something is cut",
+                proof.table_num_vars.len()
+            );
+        } else {
+            assert_eq!(outputs, proof.table_num_vars.len(), "one output a table");
+        }
+        let plan = plan_of(&elf, &proof, &format, None);
+        let layout = plan.child_layout();
+        let mut sum = FEE::zero();
+        for w in &leaves_words(&plan, &proof) {
+            sum += ext_of(&w[layout.sum()]);
+        }
+        assert_eq!(sum, FEE::zero(), "{tag}: the leaves' shares cancel");
+        let (top, _) = compose(&plan, &proof, tag).expect("the honest tree proves");
+        verify_block_tree_under(
+            &elf,
+            &opts,
+            &format,
+            proof.statement(),
+            None,
+            BLOCK_FAN_IN,
+            &wrap,
+            &top,
+        )
+        .unwrap_or_else(|e| panic!("{tag}: its own verifier accepts its top: {e}"));
+        println!(
+            "   PACKING {tag}: {} tables · {outputs} bus outputs · {} groups · leaves {:?}",
+            proof.table_num_vars.len(),
+            plan.num_groups(),
+            plan.partition().leaves()
+        );
+        tops.push((elf, proof, format, top));
+    }
+    let under = |at: usize, format: &BlockFormat| {
+        let (elf, proof, _, top) = &tops[at];
+        verify_block_tree_under(
+            elf,
+            &opts,
+            format,
+            proof.statement(),
+            None,
+            BLOCK_FAN_IN,
+            &wrap,
+            top,
+        )
+    };
+    assert!(
+        under(1, &today).is_err(),
+        "today's verifier refuses the packed top"
+    );
+    assert!(
+        under(0, &packed).is_err(),
+        "the packed verifier refuses today's top"
+    );
+}
+
 // ===================== the lean query check over a block =====================
 
 /// `format` with its leaves checking each chain's queries the lean way
@@ -3212,19 +3294,33 @@ fn the_whir_block_tree_on_a_real_block() {
     }
     let t = std::time::Instant::now();
     // The production verifier when the run is at its pinned presets, given the
-    // run's group opening (`LAMBDA_VM_WHIR_GROUP`) as the CLI's `verify-block
-    // --group` gives it; the fixture form, at the run's own format, when a knob
-    // moved the tree or the format off them (the pinned verifier would refuse
-    // such a run: its format is constants, not the environment's).
-    let at_pinned = format!("{format:?}")
-        == format!("{:?}", BlockFormat::pinned_with(format.group))
-        && super::whir_block::share_inverse();
+    // run's group opening (`LAMBDA_VM_WHIR_GROUP`) and GKR packing
+    // (`BLOCK_WHIR_ARGUE_PACK`) as the CLI's `verify-block --group
+    // --argue-pack` give them; the fixture form, at the run's own format, when
+    // a knob moved the tree or the format off them (the pinned verifier would
+    // refuse such a run: its format is constants, not the environment's).
+    let pack = match argue {
+        ArgueFormat::Batched { pack, .. } => pack,
+        ArgueFormat::PerTable => multilinear::whir_chain::GkrPack::Off,
+    };
+    let pinned = BlockFormat::pinned_with(format.group).with_pack(pack);
+    let at_pinned =
+        format!("{format:?}") == format!("{pinned:?}") && super::whir_block::share_inverse();
     let verdict = if leaves.is_none()
         && fan_in == BLOCK_FAN_IN
-        && argue == BlockFormat::pinned().argue
+        && argue == pinned.argue
         && at_pinned
     {
-        super::whir_block::verify_block_tree_grouped(&elf, proof.statement(), top, format.group)
+        if pack == multilinear::whir_chain::GkrPack::Off {
+            super::whir_block::verify_block_tree_grouped(&elf, proof.statement(), top, format.group)
+        } else {
+            super::whir_block::verify_block_tree_as(
+                &elf,
+                proof.statement(),
+                top,
+                &super::whir_block::verifier_presets(pinned),
+            )
+        }
     } else {
         verify_block_tree_under(
             &elf,

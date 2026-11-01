@@ -19,7 +19,7 @@ use stark::proof::options::{BaseFormat, CapPolicy, ProofOptions};
 
 /// A stack of 2^10 and two polynomials a group, so a small program spans
 /// several groups, under `base`.
-fn many_groups(base: BaseFormat) -> BlockFormat {
+pub(crate) fn many_groups(base: BaseFormat) -> BlockFormat {
     let mut zf = ZfFormat::DEFAULT.with_base(base);
     zf.whir_stack = StackVars::new(10).expect("a valid stack");
     BlockFormat {
@@ -36,7 +36,7 @@ fn many_groups(base: BaseFormat) -> BlockFormat {
 
 /// `block_whir_tests`' small-program options, `drop_levels` dropped from each
 /// retired tree (binary levels; half as many 4-ary ones under P1).
-fn options(drop_levels: usize) -> BlockOptions {
+pub(crate) fn options(drop_levels: usize) -> BlockOptions {
     BlockOptions {
         max_rows: MaxRowsConfig::small(),
         keccak_rnd_rows_log2: 16,

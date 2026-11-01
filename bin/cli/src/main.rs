@@ -412,6 +412,15 @@ enum Commands {
         /// the proof file does not carry it.
         #[arg(long, value_parser = ["v1", "lean"], default_value = "lean")]
         leaf_query: String,
+
+        /// How the base's batched argue lays a table's interactions into GKR
+        /// trees: `off` (production, one tree a table) or a price `τ` in
+        /// 0..=40, a table cut into equal chunk trees where that saves more
+        /// input cells than the 2^τ each extra tree is priced at. A format
+        /// choice: `verify-block` must be given the same one; the proof file
+        /// does not carry it.
+        #[arg(long, value_parser = argue_pack_word, default_value = "off")]
+        argue_pack: String,
     },
 
     /// Verify a block proof produced by `prove-block`
@@ -453,6 +462,11 @@ enum Commands {
         /// --leaf-query`): the verifier's constant, never read from the proof.
         #[arg(long, value_parser = ["v1", "lean"], default_value = "lean")]
         leaf_query: String,
+
+        /// The GKR packing the block was proved with (`prove-block
+        /// --argue-pack`): the verifier's constant, never read from the proof.
+        #[arg(long, value_parser = argue_pack_word, default_value = "off")]
+        argue_pack: String,
     },
 
     /// Count main-trace and aux-trace field elements without proving
@@ -557,6 +571,7 @@ fn main() -> ExitCode {
             leaves,
             leaf_double_from,
             leaf_query,
+            argue_pack,
         } => cmd_prove_block(
             elf,
             input,
@@ -569,6 +584,7 @@ fn main() -> ExitCode {
                 leaves: &leaves,
                 leaf_double_from: &leaf_double_from,
                 leaf_query: &leaf_query,
+                argue_pack: &argue_pack,
             },
         ),
         Commands::VerifyBlock {
@@ -580,6 +596,7 @@ fn main() -> ExitCode {
             leaves,
             leaf_double_from,
             leaf_query,
+            argue_pack,
         } => cmd_verify_block(
             proof,
             elf,
@@ -590,6 +607,7 @@ fn main() -> ExitCode {
                 leaves: &leaves,
                 leaf_double_from: &leaf_double_from,
                 leaf_query: &leaf_query,
+                argue_pack: &argue_pack,
             },
         ),
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
@@ -690,6 +708,14 @@ struct BlockChoices<'a> {
     leaves: &'a str,
     leaf_double_from: &'a str,
     leaf_query: &'a str,
+    argue_pack: &'a str,
+}
+
+/// `--argue-pack`'s words: `off` or a price in 0..=40
+/// (`whir_block_tree::pack_setting`).
+fn argue_pack_word(word: &str) -> Result<String, String> {
+    prover::lfm::whir_block_tree::pack_setting(Some(word))?;
+    Ok(word.to_string())
 }
 
 /// `--leaf-double-from`'s words: `off`, `one-top` or a leaf count
@@ -740,6 +766,7 @@ fn cmd_prove_block(
         leaves,
         leaf_double_from,
         leaf_query,
+        argue_pack,
     } = choices;
 
     // The group opening is the caller's constant, given on the command line
@@ -749,6 +776,18 @@ fn cmd_prove_block(
         eprintln!("LAMBDA_VM_WHIR_GROUP is the harness's knob: give the CLI --group instead");
         return ExitCode::FAILURE;
     }
+    // So is the GKR packing.
+    if std::env::var_os("BLOCK_WHIR_ARGUE_PACK").is_some() {
+        eprintln!("BLOCK_WHIR_ARGUE_PACK is the harness's knob: give the CLI --argue-pack instead");
+        return ExitCode::FAILURE;
+    }
+    let pack = match prover::lfm::whir_block_tree::pack_setting(Some(argue_pack)) {
+        Ok(pack) => pack,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
     // So are the WHIR blowup and the round-0 leaf order, installed as the
     // process format before anything reads it: the banner then states the
     // format this block is proved under.
@@ -810,6 +849,9 @@ fn cmd_prove_block(
     eprintln!("BLOCK GROUP OPENING: {group}");
     cfg.format.leaf_scale = leaf_scale;
     cfg.format.leaf_query = leaf_query;
+    cfg.format = cfg.format.with_pack(pack);
+    cfg.argue = cfg.format.argue;
+    eprintln!("BLOCK ARGUE PACK: {argue_pack} ({pack:?})");
     assert_eq!(
         (cfg.format.zf.whir_blowup, cfg.format.zf.whir_leaves),
         (blowup.factor(), order),
@@ -886,6 +928,7 @@ fn cmd_verify_block(
         leaves,
         leaf_double_from,
         leaf_query,
+        argue_pack,
     } = choices;
 
     let fold = match group_setting(Some(group)) {
@@ -916,6 +959,13 @@ fn cmd_verify_block(
     };
     let leaf_query = match block_leaf_query(leaf_query) {
         Ok(query) => query,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let pack = match prover::lfm::whir_block_tree::pack_setting(Some(argue_pack)) {
+        Ok(pack) => pack,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::FAILURE;
@@ -959,10 +1009,11 @@ fn cmd_verify_block(
     eprintln!("BLOCK WHIR LEAVES: {leaves}");
     eprintln!("BLOCK LEAF SCALE: {leaf_scale}");
     eprintln!("BLOCK LEAF QUERY: {leaf_query:?}");
+    eprintln!("BLOCK ARGUE PACK: {argue_pack} ({pack:?})");
     eprintln!("Verifying block proof...");
     let start = Instant::now();
     let result = verify_whir_block_tree_proof_at(
-        &elf_data, &proof, fold, blowup, order, leaf_scale, leaf_query,
+        &elf_data, &proof, fold, blowup, order, leaf_scale, leaf_query, pack,
     );
     let verify_elapsed = start.elapsed();
     match result {

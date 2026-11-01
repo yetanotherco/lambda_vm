@@ -20,7 +20,7 @@
 //! leaves unset, and the driver's first line says how the running process
 //! compares with it.
 
-use multilinear::whir_chain::{ArgueFormat, GroupFold, LeafOrder};
+use multilinear::whir_chain::{ArgueFormat, GkrPack, GroupFold, LeafOrder};
 
 use crate::block_whir::{self, BlockFormat, BlockOptions, BlockWhirProof};
 use crate::zf_format::WhirBlowup;
@@ -318,6 +318,39 @@ pub fn leaf_scale_line(scale: LeafScale, plan: &WhirBlockPlan) -> String {
 /// which is among the first emitted.
 pub const LEAF_EMITTERS: usize = 3;
 
+/// `BLOCK_WHIR_ARGUE_PACK`'s reading: unset
+/// or `off` is today's one GKR tree a table ([`GkrPack::Off`]); a count `τ` in
+/// `0..=40` cuts a table into equal chunks where that saves input cells, each
+/// extra tree priced at `2^τ` ([`GkrPack::Chunks`]). A format value: the prover
+/// and the verifier of one proof take the same one, and only a base-only
+/// process admits anything but `off` (`block_whir::checked_argue_only`).
+pub fn pack_setting(knob: Option<&str>) -> Result<GkrPack, String> {
+    match knob.map(str::trim) {
+        None | Some("off") => Ok(GkrPack::Off),
+        Some(v) => v
+            .parse::<u8>()
+            .ok()
+            .filter(|tau| *tau <= 40)
+            .map(|tree_log_cells| GkrPack::Chunks { tree_log_cells })
+            .ok_or_else(|| format!("BLOCK_WHIR_ARGUE_PACK={v}: off or a count in 0..=40")),
+    }
+}
+
+/// `argue` with its trees laid out per `pack`: only the batched argue has
+/// trees to pack.
+fn with_pack(argue: ArgueFormat, pack: GkrPack) -> Result<ArgueFormat, String> {
+    match (argue, pack) {
+        (argue, GkrPack::Off) => Ok(argue),
+        (ArgueFormat::Batched { bin_log_cells, .. }, pack) => Ok(ArgueFormat::Batched {
+            bin_log_cells,
+            pack,
+        }),
+        (ArgueFormat::PerTable, _) => {
+            Err("BLOCK_WHIR_ARGUE_PACK packs the batched argue's trees: not per-table".to_string())
+        }
+    }
+}
+
 /// `W3_LEAF_EMITTERS`'s reading: unset is [`LEAF_EMITTERS`]; 0 is the control,
 /// one thread a leaf.
 fn leaf_emitters_setting(knob: Option<usize>) -> Option<usize> {
@@ -345,16 +378,20 @@ impl WhirTreeConfig {
         let leaf_emitters = leaf_emitters_setting(count_knob("W3_LEAF_EMITTERS")?);
         let argue = match std::env::var("BLOCK_WHIR_ARGUE").as_deref().map(str::trim) {
             Ok("batched") => match count_knob("BLOCK_WHIR_ARGUE_CAP")? {
-                Some(cap) => ArgueFormat::Batched {
-                    bin_log_cells: u8::try_from(cap)
+                Some(cap) => ArgueFormat::batched(
+                    u8::try_from(cap)
                         .map_err(|_| format!("BLOCK_WHIR_ARGUE_CAP={cap}: a cap below 2^256"))?,
-                },
+                ),
                 None => ArgueFormat::BATCHED,
             },
             Ok("per-table") => ArgueFormat::PerTable,
             Err(_) => BlockFormat::production().argue,
             Ok(other) => return Err(format!("BLOCK_WHIR_ARGUE={other}: per-table or batched")),
         };
+        let argue = with_pack(
+            argue,
+            pack_setting(std::env::var("BLOCK_WHIR_ARGUE_PACK").ok().as_deref())?,
+        )?;
         let format = BlockFormat {
             argue,
             leaf_scale,
@@ -444,11 +481,18 @@ impl WhirTreeConfig {
     }
 
     /// Whether the tree is the production verifier's: the plan's leaf count,
-    /// [`BLOCK_FAN_IN`] and the production argue.
+    /// [`BLOCK_FAN_IN`] and the production argue — with its GKR trees laid out
+    /// as the format's packing says, a named constant the block verifier is
+    /// given too ([`BlockFormat::with_pack`]).
     pub fn at_presets(&self) -> bool {
+        let pack = match self.argue {
+            ArgueFormat::Batched { pack, .. } => pack,
+            ArgueFormat::PerTable => GkrPack::Off,
+        };
         self.leaves.is_none()
             && self.fan_in == BLOCK_FAN_IN
-            && self.argue == BlockFormat::production().argue
+            && self.argue == BlockFormat::production().with_pack(pack).argue
+            && self.format.argue == self.argue
     }
 }
 
@@ -2678,7 +2722,7 @@ pub fn verify_whir_block_tree_proof_grouped(
 
 /// [`verify_whir_block_tree_proof`] at the pinned format with the caller's
 /// named choices, its group opening, its WHIR blowup, its round-0 leaf order,
-/// its leaf scale and its leaves' query check
+/// its leaf scale, its leaves' query check and its GKR packing
 /// ([`super::whir_block::verify_block_tree_at`]); the file carries none of
 /// them, and the environment sets none of the rest. No public entry point
 /// takes a format of the caller's own.
@@ -2690,7 +2734,7 @@ pub fn verify_whir_block_tree_proof_grouped(
 /// };
 /// use lambda_vm_prover::lfm::whir_chain::LeafQuery;
 /// use lambda_vm_prover::zf_format::WhirBlowup;
-/// use multilinear::whir_chain::{GroupFold, LeafOrder};
+/// use multilinear::whir_chain::{GkrPack, GroupFold, LeafOrder};
 ///
 /// fn check(elf: &[u8], proof: &WhirBlockTreeProof) -> Result<(), String> {
 ///     verify_whir_block_tree_proof_at(
@@ -2701,6 +2745,7 @@ pub fn verify_whir_block_tree_proof_grouped(
 ///         LeafOrder::Coset,
 ///         LeafScale::DoubleFrom(12),
 ///         LeafQuery::Lean,
+///         GkrPack::Off,
 ///     )
 /// }
 /// ```
@@ -2711,6 +2756,7 @@ pub fn verify_whir_block_tree_proof_grouped(
 /// ```compile_fail
 /// use lambda_vm_prover::lfm::whir_block::verify_block_tree_as;
 /// ```
+#[allow(clippy::too_many_arguments)]
 pub fn verify_whir_block_tree_proof_at(
     elf_bytes: &[u8],
     proof: &WhirBlockTreeProof,
@@ -2719,6 +2765,7 @@ pub fn verify_whir_block_tree_proof_at(
     leaves: LeafOrder,
     leaf_scale: LeafScale,
     leaf_query: LeafQuery,
+    pack: GkrPack,
 ) -> Result<(), String> {
     let top = LfmProof {
         proof: proof.top_proof.clone(),
@@ -2733,6 +2780,7 @@ pub fn verify_whir_block_tree_proof_at(
         leaves,
         leaf_scale,
         leaf_query,
+        pack,
     )
 }
 
@@ -3018,6 +3066,21 @@ mod tests {
             off(|c| c.siblings = 6),
             "the sibling count is scheduling only"
         );
+        // A packing is a named constant the block verifier is given too: a
+        // tree argued under it, its format saying so, is at the presets; a
+        // config whose argue and format disagree is not.
+        let pack = GkrPack::Chunks { tree_log_cells: 22 };
+        let mut c = production.clone();
+        c.format = c.format.with_pack(pack);
+        c.argue = c.format.argue;
+        assert!(c.at_presets(), "a packed argue, named on both");
+        let mut c = production.clone();
+        c.argue = BlockFormat::production().with_pack(pack).argue;
+        assert!(!c.at_presets(), "an argue its format does not carry");
+        let mut c = production.clone();
+        c.argue = ArgueFormat::batched(20);
+        c.format.argue = c.argue;
+        assert!(!c.at_presets(), "another bin cap");
     }
 
     /// `W3_LEAF_EMITTERS`: unset is the default count, 0 is the control (one

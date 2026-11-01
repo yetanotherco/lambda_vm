@@ -24,6 +24,15 @@
 //! shapes and the format's bin cap, and nothing else, so the prover, the host
 //! verifier and the in-guest emitter derive it from one function.
 //!
+//! Under a [`GkrPack::Chunks`] format a
+//! table whose padding costs more than the trees it would add is argued as
+//! `c` trees of `2^b` slots — its interactions' chunks, in order, all in one
+//! bin. They end the ladder at one point `P`, and after the bin's ladder one
+//! challenge `s'` combines their claims into today's one-tree claim at
+//! `s' ‖ P` ([`combine_chunk_claims`]), so C, Rd and O are unchanged. The
+//! cuts are [`chunking`]'s, a function of the shapes and the format's price;
+//! the in-guest emitter reads no packed format.
+//!
 //! This is the HOST reference: every tree and every round is built and run
 //! here. A device prover must produce these bytes.
 
@@ -33,8 +42,9 @@ use multilinear::{
     front_loaded::{self, PaddingFault},
     gkr::{FractionLayer, GkrClaim},
     gkr_lockstep::{self, LockstepProof},
-    logup::Interaction,
+    logup::{Affine, Interaction},
     sumcheck::{self, SumcheckProof},
+    whir_chain::GkrPack,
 };
 
 /// One table's shape as the batched argue sees it: all it needs to plan.
@@ -49,6 +59,8 @@ pub struct ArgueShape {
     /// Whether any committed factor reads a shifted row, which is what keeps
     /// its claim reduction.
     pub shifted: bool,
+    /// `m_T`, its interactions: what [`chunking`] cuts.
+    pub interactions: usize,
 }
 
 impl ArgueShape {
@@ -68,15 +80,95 @@ impl ArgueShape {
                 .iter()
                 .filter_map(FactorKind::source)
                 .any(|source| source.offset != 0),
+            interactions: statement.interactions.len(),
         }
     }
+}
+
+/// How a table's interactions are laid into trees: `count` trees of
+/// `2^slot_vars` slots, chunk `j` holding interactions
+/// `[j·2^slot_vars, (j + 1)·2^slot_vars)` in order, the last padded `0/1`.
+/// `count == 1` is today's one tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chunking {
+    /// `b`: the bits that index a slot within a chunk.
+    pub slot_vars: usize,
+    /// `c`: the chunks.
+    pub count: usize,
+}
+
+impl Chunking {
+    /// Today's: one tree over every interaction.
+    pub fn whole(shape: &ArgueShape) -> Self {
+        Self {
+            slot_vars: shape.input_vars - shape.num_vars,
+            count: 1,
+        }
+    }
+
+    /// `ℓ`: the bits that index a chunk, `log2` of `count` rounded up to a
+    /// power of two — the coordinates of the challenge that combines the
+    /// chunks' claims. `slot_vars + combine_vars` is the table's `k_T − n_T`.
+    pub fn combine_vars(&self) -> usize {
+        self.count.next_power_of_two().trailing_zeros() as usize
+    }
+
+    /// The input cells of the table's trees together.
+    fn cells(&self, shape: &ArgueShape) -> u128 {
+        (self.count as u128) << (shape.num_vars + self.slot_vars).min(120)
+    }
+
+    /// Chunk `j`'s interactions.
+    pub fn range(&self, j: usize, interactions: usize) -> std::ops::Range<usize> {
+        let start = (j << self.slot_vars).min(interactions);
+        start..((j + 1) << self.slot_vars).min(interactions)
+    }
+}
+
+/// ★ How `pack` lays a table out, one function for every side.
+///
+/// [`GkrPack::Off`]: [`Chunking::whole`]. [`GkrPack::Chunks`]: over
+/// `b ∈ [0, B]` (`2^B` today's slots), `c = ⌈m / 2^b⌉` chunks, the `b` that
+/// minimises `c·2^{n+b} + (c − 1)·2^{tree_log_cells}` — the cells, and each
+/// extra tree at its price — ties to the larger `b`, so `b = B` (today's tree)
+/// unless cutting saves.
+pub fn chunking(shape: &ArgueShape, pack: GkrPack) -> Chunking {
+    let whole = Chunking::whole(shape);
+    let GkrPack::Chunks { tree_log_cells } = pack else {
+        return whole;
+    };
+    if shape.interactions < 2 {
+        return whole;
+    }
+    let tree = 1u128 << tree_log_cells.min(120);
+    let cost = |c: &Chunking| c.cells(shape) + (c.count as u128 - 1) * tree;
+    let mut best = whole;
+    for slot_vars in (0..whole.slot_vars).rev() {
+        let candidate = Chunking {
+            slot_vars,
+            count: shape.interactions.div_ceil(1 << slot_vars),
+        };
+        if cost(&candidate) < cost(&best) {
+            best = candidate;
+        }
+    }
+    // The chunks and the all-padding ones after them fill today's slots
+    // exactly, so the combined claim sits at a point of today's length.
+    if best.slot_vars + best.combine_vars() != whole.slot_vars {
+        return whole;
+    }
+    best
 }
 
 /// The public schedule of a batched argue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArguePlan {
     pub shapes: Vec<ArgueShape>,
-    /// The bins, in the order their ladders run; each in table order.
+    /// Each table's trees ([`chunking`]); one tree a table under
+    /// [`GkrPack::Off`].
+    pub chunks: Vec<Chunking>,
+    /// The bins, in the order their ladders run; each in table order, a
+    /// table's chunks adjacent and in order.
     pub bins: Vec<Vec<usize>>,
     /// `n_max`: the constraint sumcheck's rounds.
     pub num_vars: usize,
@@ -84,25 +176,47 @@ pub struct ArguePlan {
     pub degree: usize,
 }
 
+impl ArguePlan {
+    /// Every table's trees together: the bus outputs a proof carries.
+    pub fn trees(&self) -> usize {
+        self.chunks.iter().map(|c| c.count).sum()
+    }
+
+    /// Where table `t`'s first tree sits among the bus outputs (table order,
+    /// then chunk order).
+    pub fn first_tree(&self, t: usize) -> usize {
+        self.chunks[..t].iter().map(|c| c.count).sum()
+    }
+
+    /// The input variables of each of table `t`'s trees.
+    pub fn tree_vars(&self, t: usize) -> usize {
+        self.shapes[t].num_vars + self.chunks[t].slot_vars
+    }
+}
+
+/// [`argue_plan_packed`] with one tree a table: today's plan.
+pub fn argue_plan(shapes: &[ArgueShape], bin_log_cells: u8) -> ArguePlan {
+    argue_plan_packed(shapes, bin_log_cells, GkrPack::Off)
+}
+
 /// ★★ THE PLAN, one function for every side (the `absorb_roots` lesson: two
 /// spellings of a public ordering drift silently).
 ///
-/// Bins: tables sorted by `(k_T desc, index asc)`, first-fit-decreasing under
-/// `Σ 2^{k_T} ≤ 2^{bin_log_cells}`; a table with `k_T ≥ bin_log_cells` sits
-/// alone. Bins run in the order they open, each in table order.
-pub fn argue_plan(shapes: &[ArgueShape], bin_log_cells: u8) -> ArguePlan {
+/// Each table's trees are [`chunking`]'s under `pack`, one unit of
+/// `c·2^{n_T+b}` input cells (`2^{k_T}` under [`GkrPack::Off`]). Bins: units
+/// sorted by `(cells desc, index asc)`, first-fit-decreasing under
+/// `Σ cells ≤ 2^{bin_log_cells}`; a unit at or over the cap sits alone. Bins
+/// run in the order they open, each in table order.
+pub fn argue_plan_packed(shapes: &[ArgueShape], bin_log_cells: u8, pack: GkrPack) -> ArguePlan {
     let cap = 1u128 << bin_log_cells.min(127);
+    let chunks: Vec<Chunking> = shapes.iter().map(|shape| chunking(shape, pack)).collect();
+    let unit = |t: usize| chunks[t].cells(&shapes[t]);
     let mut order: Vec<usize> = (0..shapes.len()).collect();
-    order.sort_by(|&a, &b| {
-        shapes[b]
-            .input_vars
-            .cmp(&shapes[a].input_vars)
-            .then(a.cmp(&b))
-    });
+    order.sort_by(|&a, &b| unit(b).cmp(&unit(a)).then(a.cmp(&b)));
     // (tables, cells used, open to more)
     let mut bins: Vec<(Vec<usize>, u128, bool)> = Vec::new();
     for t in order {
-        let cells = 1u128 << shapes[t].input_vars.min(127);
+        let cells = unit(t);
         if cells >= cap {
             bins.push((vec![t], cells, false));
             continue;
@@ -120,6 +234,7 @@ pub fn argue_plan(shapes: &[ArgueShape], bin_log_cells: u8) -> ArguePlan {
     }
     ArguePlan {
         shapes: shapes.to_vec(),
+        chunks,
         bins: bins
             .into_iter()
             .map(|(mut tables, _, _)| {
@@ -144,7 +259,9 @@ pub fn argue_plan(shapes: &[ArgueShape], bin_log_cells: u8) -> ArguePlan {
 )]
 #[serde(bound = "")]
 pub struct BatchedArgue<E: IsField> {
-    /// Every table's bus output fraction, in table order.
+    /// Every tree's bus output fraction, in table order: one a table, or —
+    /// under a [`GkrPack::Chunks`] format — one for each chunk of a cut table,
+    /// in chunk order.
     pub bus_outputs: Vec<(FieldElement<E>, FieldElement<E>)>,
     /// One ladder per bin, in plan order.
     pub gkr: Vec<LockstepProof<E>>,
@@ -198,7 +315,14 @@ pub struct ProverFaults {
     /// This table's bus output numerator is replaced by the value
     /// that makes `Σ p/q = 0` over every table, absorbed and sent as if true,
     /// while its ladder runs on the TRUE tree (only step 0's residual sees it).
+    /// A cut table's first chunk carries the forgery.
     pub balance_with: Option<usize>,
+    /// The prover lays its trees out under this packing instead of the
+    /// config's.
+    pub pack: Option<GkrPack>,
+    /// This cut table's first two chunks trade their interactions: honest
+    /// trees, outputs and ladder, over the chunks in the wrong order.
+    pub swap_chunks: Option<usize>,
 }
 
 /// Which of the batched verifier's checks run. Every one, except in the
@@ -251,6 +375,120 @@ where
     }
     layers.reverse();
     Ok(layers)
+}
+
+/// Each of a table's trees' interactions under `chunks`: its own list when it
+/// is one tree, else each chunk's in order. A last chunk too short to take
+/// `2^b` slots by itself is padded with `0/1` interactions, which are the
+/// padding's own cells, so its tree is the `2^b`-slot tree.
+fn chunk_lists<'a, E: IsField + 'static>(
+    interactions: &'a [Interaction<E>],
+    chunks: &Chunking,
+) -> Vec<std::borrow::Cow<'a, [Interaction<E>]>> {
+    use std::borrow::Cow;
+    if chunks.count == 1 {
+        return vec![Cow::Borrowed(interactions)];
+    }
+    let slots = 1usize << chunks.slot_vars;
+    (0..chunks.count)
+        .map(|j| {
+            let list = &interactions[chunks.range(j, interactions.len())];
+            if list.len().next_power_of_two() == slots {
+                return Cow::Borrowed(list);
+            }
+            let padding = Interaction::new(
+                Affine::constant(FieldElement::zero()),
+                Affine::constant(FieldElement::one()),
+            );
+            let mut padded = list.to_vec();
+            padded.resize(slots / 2 + 1, padding);
+            Cow::Owned(padded)
+        })
+        .collect()
+}
+
+/// The table a tree belongs to, `tree` counted in table order then chunk
+/// order.
+fn table_of_tree(plan: &ArguePlan, tree: usize) -> usize {
+    let mut first = 0;
+    for (t, chunks) in plan.chunks.iter().enumerate() {
+        first += chunks.count;
+        if tree < first {
+            return t;
+        }
+    }
+    plan.chunks.len()
+}
+
+/// A table's GKR claim from its trees' input claims: its one tree's, or — a
+/// cut table — the chunks' combined at `s'`, drawn here, once the chunks' last
+/// line challenge has fixed their claims ([`combine_chunk_claims`]).
+fn table_claim<E, T>(
+    chunk_claims: &[GkrClaim<E>],
+    chunks: &Chunking,
+    transcript: &mut T,
+) -> Result<GkrClaim<E>, MlError>
+where
+    E: IsField + Send + Sync + 'static,
+    FieldElement<E>: Send + Sync,
+    T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
+{
+    if chunk_claims.len() != chunks.count {
+        return Err(MlError::ArgueShapeMismatch { part: "chunks" });
+    }
+    if chunks.count == 1 {
+        return Ok(chunk_claims[0].clone());
+    }
+    let combine: Vec<FieldElement<E>> = (0..chunks.combine_vars())
+        .map(|_| transcript.sample_field_element())
+        .collect();
+    combine_chunk_claims(chunk_claims, &combine)
+}
+
+/// ★ A cut table's claim: its `c` chunks' claims, all at one point `P`,
+/// combined at `s'` (`ℓ` coordinates, `c ≤ 2^ℓ`) into the claim of today's one
+/// tree at `s' ‖ P`:
+///
+/// - `p̃ = Σ_{j<c} eq(s', j)·p̃_j`;
+/// - `q̃ = Σ_{j<c} eq(s', j)·q̃_j + Σ_{c≤j<2^ℓ} eq(s', j)` — chunks past the
+///   last are all padding, `q ≡ 1`, and never built.
+///
+/// The padded layer's top `ℓ` slot bits index the chunk, so its multilinear
+/// extension at `s' ‖ P` is exactly this combination of the chunks' at `P`.
+/// A false chunk claim survives only if `s'` is a root of a nonzero
+/// multilinear polynomial in `ℓ` variables: `≤ ℓ/|E|`.
+#[doc(hidden)]
+pub fn combine_chunk_claims<E>(
+    chunk_claims: &[GkrClaim<E>],
+    combine: &[FieldElement<E>],
+) -> Result<GkrClaim<E>, MlError>
+where
+    E: IsField + Send + Sync + 'static,
+    FieldElement<E>: Send + Sync,
+{
+    let weights = multilinear::eq::eq_evals(combine);
+    let first = chunk_claims
+        .first()
+        .ok_or(MlError::ArgueShapeMismatch { part: "chunks" })?;
+    if chunk_claims.len() > weights.len()
+        || chunk_claims.iter().any(|claim| claim.point != first.point)
+    {
+        return Err(MlError::ArgueShapeMismatch { part: "chunks" });
+    }
+    let mut p = FieldElement::<E>::zero();
+    let mut q = FieldElement::<E>::zero();
+    for (claim, w) in chunk_claims.iter().zip(&weights) {
+        p += w * &claim.p;
+        q += w * &claim.q;
+    }
+    for w in &weights[chunk_claims.len()..] {
+        q += w.clone();
+    }
+    Ok(GkrClaim {
+        point: combine.iter().chain(&first.point).cloned().collect(),
+        p,
+        q,
+    })
 }
 
 /// A table's column claims when every committed factor reads its column
@@ -421,7 +659,11 @@ where
         + crypto::fiat_shamir::transcript_hash::HasTranscriptHash<Hash = <H as WhirHash>::Transcript>,
 {
     let _split = multilinear::whir_split::begin_prove();
-    let ArgueFormat::Batched { bin_log_cells } = config.format.argue else {
+    let ArgueFormat::Batched {
+        bin_log_cells,
+        pack,
+    } = config.format.argue
+    else {
         return Err(MlError::ArgueFormatMismatch);
     };
     check_settled_prefixes(committed, prepared.as_ref())?;
@@ -446,6 +688,7 @@ where
         &alpha,
         &beta,
         bin_log_cells,
+        pack,
         transcript,
         faults,
         at,
@@ -498,6 +741,7 @@ pub fn prove_argue<F, E, T>(
     alpha: &FieldElement<E>,
     beta: &FieldElement<E>,
     bin_log_cells: u8,
+    pack: GkrPack,
     transcript: &mut T,
     faults: ProverFaults,
     at: Where,
@@ -512,7 +756,11 @@ where
     let beta = beta.clone();
     let statements: Vec<TableStatement<'_, F, E>> = tables.iter().map(|t| t.statement()).collect();
     let shapes: Vec<ArgueShape> = statements.iter().map(ArgueShape::of).collect();
-    let plan = argue_plan(&shapes, faults.bin_log_cells.unwrap_or(bin_log_cells));
+    let plan = argue_plan_packed(
+        &shapes,
+        faults.bin_log_cells.unwrap_or(bin_log_cells),
+        faults.pack.unwrap_or(pack),
+    );
     let interactions: Vec<Vec<Interaction<E>>> = tables
         .iter()
         .map(|table| {
@@ -525,22 +773,34 @@ where
             )
         })
         .collect::<Result<_, _>>()?;
+    // Each tree's interactions, table order then chunk order: a whole table's
+    // own list, or a chunk of it.
+    let mut lists: Vec<std::borrow::Cow<'_, [Interaction<E>]>> = Vec::with_capacity(plan.trees());
+    for (t, chunks) in plan.chunks.iter().enumerate() {
+        let mut table_lists = chunk_lists(&interactions[t], chunks);
+        if faults.swap_chunks == Some(t) && table_lists.len() > 1 {
+            table_lists.swap(0, 1);
+        }
+        lists.extend(table_lists);
+    }
 
     // The fault `balance_with`: the numerator that balances the bus, from every true
     // output.
     let fake_output: Option<(usize, FieldElement<E>)> = match faults.balance_with {
         None => None,
         Some(target) => {
-            let mut outputs = Vec::with_capacity(tables.len());
-            for t in 0..tables.len() {
-                let layers = host_tree(&interactions[t], &tables[t].trace)?;
+            let mut outputs = Vec::with_capacity(lists.len());
+            for (i, list) in lists.iter().enumerate() {
+                let t = table_of_tree(&plan, i);
+                let layers = host_tree(list, &tables[t].trace)?;
                 outputs.push(gkr_lockstep::LadderTree::output(&gkr_lockstep::HostLayers(
                     &layers,
                 )));
             }
+            let target = plan.first_tree(target);
             let mut rest = FieldElement::<E>::zero();
-            for (t, (p, q)) in outputs.iter().enumerate() {
-                if t != target {
+            for (i, (p, q)) in outputs.iter().enumerate() {
+                if i != target {
                     rest += p * q.inv().expect("q != 0");
                 }
             }
@@ -550,24 +810,32 @@ where
     let mut split = ArgueSplit::default();
     let gruen_layers = multilinear::gkr_gruen::gruen_layers();
     // ── G: a ladder per bin, its outputs absorbed just before it ──────────
-    let mut bus_outputs: Vec<Option<(FieldElement<E>, FieldElement<E>)>> = vec![None; tables.len()];
+    let mut bus_outputs: Vec<Option<(FieldElement<E>, FieldElement<E>)>> = vec![None; plan.trees()];
     let mut claims: Vec<Option<GkrClaim<E>>> = vec![None; tables.len()];
     let mut gkr = Vec::with_capacity(plan.bins.len());
     // Under the round slot the columns' trees of a bin are queued one after
     // another and their outputs read once all are (each tree has its stream).
     let queue = multilinear::round_slot::argue_round_slot()
         != multilinear::round_slot::RoundSlotSetting::Off;
-    let host_built = |t: usize| -> Result<BinTree<E>, MlError> {
+    let host_built = |t: usize, list: &[Interaction<E>]| -> Result<BinTree<E>, MlError> {
         let factors = tables[t].trace.factors()?;
         Ok(BinTree::Built(Box::new(
-            multilinear::gkr::FractionTree::build(logup::input_layer(&interactions[t], &factors)?)?,
+            multilinear::gkr::FractionTree::build(logup::input_layer(list, &factors)?)?,
         )))
     };
     for bin in &plan.bins {
-        let pending: Vec<Pending<E>> = bin
+        // The bin's trees: each table's chunks, in order.
+        let members: Vec<(usize, usize)> = bin
             .iter()
-            .map(|&t| -> Result<Pending<E>, MlError> {
-                let (trace, interactions) = (&tables[t].trace, &interactions[t]);
+            .flat_map(|&t| {
+                let first = plan.first_tree(t);
+                (0..plan.chunks[t].count).map(move |j| (t, first + j))
+            })
+            .collect();
+        let pending: Vec<Pending<E>> = members
+            .iter()
+            .map(|&(t, i)| -> Result<Pending<E>, MlError> {
+                let (trace, interactions) = (&tables[t].trace, &lists[i][..]);
                 if at == Where::Host {
                     return Ok(Pending::Ready(BinTree::Host(host_tree(
                         interactions,
@@ -605,7 +873,7 @@ where
                 });
                 let tree = match on_card {
                     Some(tree) => tree,
-                    None => Pending::Ready(host_built(t)?),
+                    None => Pending::Ready(host_built(t, interactions)?),
                 };
                 split.trees += started.elapsed().as_secs_f64();
                 Ok(tree)
@@ -616,12 +884,12 @@ where
         let started = std::time::Instant::now();
         let trees: Vec<BinTree<E>> = pending
             .into_iter()
-            .zip(bin)
-            .map(|(tree, &t)| match tree {
+            .zip(&members)
+            .map(|(tree, &(t, i))| match tree {
                 Pending::Ready(tree) => Ok(tree),
                 Pending::Queued(queued) => match queued.into_tree() {
                     Some(tree) => Ok(BinTree::Built(Box::new(tree))),
-                    None => host_built(t),
+                    None => host_built(t, &lists[i]),
                 },
             })
             .collect::<Result<_, MlError>>()?;
@@ -642,22 +910,27 @@ where
                 (BinTree::Host(_), None) => unreachable!("a host tree has its layers"),
             })
             .collect();
-        for (&t, tree) in bin.iter().zip(&refs) {
+        for (&(_, i), tree) in members.iter().zip(&refs) {
             let mut output = tree.output();
             if let Some((target, p)) = &fake_output
-                && *target == t
+                && *target == i
             {
                 output.0 = p.clone();
             }
             transcript.append_field_element(&output.0);
             transcript.append_field_element(&output.1);
-            bus_outputs[t] = Some(output);
+            bus_outputs[i] = Some(output);
         }
         let started = std::time::Instant::now();
         let (ladder, inputs) = gkr_lockstep::prove_trees(&refs, transcript)?;
         split.ladders += started.elapsed().as_secs_f64();
-        for (&t, claim) in bin.iter().zip(inputs) {
-            claims[t] = Some(claim);
+        let inputs: Vec<GkrClaim<E>> = inputs;
+        let mut at_tree = 0;
+        for &t in bin {
+            let count = plan.chunks[t].count;
+            let chunk_claims = &inputs[at_tree..at_tree + count];
+            at_tree += count;
+            claims[t] = Some(table_claim(chunk_claims, &plan.chunks[t], transcript)?);
         }
         gkr.push(ladder);
     }
@@ -895,6 +1168,17 @@ where
             plan.degree,
             plan.num_vars
         );
+        // The trees the ladders ran: one a table, or a cut table's chunks.
+        eprintln!(
+            "BATCHED ARGUE TREES: tables {} · trees {} · cut {} · tree log2 cells {:.2}",
+            tables.len(),
+            plan.trees(),
+            plan.chunks.iter().filter(|c| c.count > 1).count(),
+            (0..tables.len())
+                .map(|t| plan.chunks[t].count as f64 * (plan.tree_vars(t) as f64).exp2())
+                .sum::<f64>()
+                .log2()
+        );
     }
     Ok((
         BatchedArgue {
@@ -1013,12 +1297,16 @@ where
 {
     // The variant and the bin cap are the verifier's config's, never the
     // proof's.
-    let ArgueFormat::Batched { bin_log_cells } = config.format.argue else {
+    let ArgueFormat::Batched {
+        bin_log_cells,
+        pack,
+    } = config.format.argue
+    else {
         return Err(MlError::ArgueFormatMismatch);
     };
     let argue = &proof.argue;
     let n = statements.len();
-    if argue.bus_outputs.len() != n || argue.factor_values.len() != n || argue.reduces.len() != n {
+    if argue.factor_values.len() != n || argue.reduces.len() != n {
         return Err(MlError::ArgueShapeMismatch { part: "tables" });
     }
     if layouts.len() != sizes.len()
@@ -1041,6 +1329,7 @@ where
         argue,
         statements,
         bin_log_cells,
+        pack,
         &z,
         &alpha,
         &beta,
@@ -1103,6 +1392,7 @@ pub fn verify_argue<F, E, T>(
     argue: &BatchedArgue<E>,
     statements: &[TableStatement<'_, F, E>],
     bin_log_cells: u8,
+    pack: GkrPack,
     z: &FieldElement<E>,
     alpha: &FieldElement<E>,
     beta: &FieldElement<E>,
@@ -1116,12 +1406,16 @@ where
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E>,
 {
     let n = statements.len();
-    if argue.bus_outputs.len() != n || argue.factor_values.len() != n || argue.reduces.len() != n {
-        return Err(MlError::ArgueShapeMismatch { part: "tables" });
-    }
     let beta = beta.clone();
     let shapes: Vec<ArgueShape> = statements.iter().map(ArgueShape::of).collect();
-    let plan = argue_plan(&shapes, bin_log_cells);
+    let plan = argue_plan_packed(&shapes, bin_log_cells, pack);
+    // One bus output a tree: a table's, or each of a cut table's chunks'.
+    if argue.bus_outputs.len() != plan.trees()
+        || argue.factor_values.len() != n
+        || argue.reduces.len() != n
+    {
+        return Err(MlError::ArgueShapeMismatch { part: "tables" });
+    }
     if argue.gkr.len() != plan.bins.len() {
         return Err(MlError::ArgueShapeMismatch { part: "bins" });
     }
@@ -1142,17 +1436,26 @@ where
     let mut claims: Vec<Option<GkrClaim<E>>> = vec![None; n];
     for (bin, ladder) in plan.bins.iter().zip(&argue.gkr) {
         let mut outputs = Vec::with_capacity(bin.len());
+        let mut heights = Vec::with_capacity(bin.len());
         for &t in bin {
-            let output = &argue.bus_outputs[t];
-            transcript.append_field_element(&output.0);
-            transcript.append_field_element(&output.1);
-            outputs.push(output.clone());
+            let first = plan.first_tree(t);
+            for output in &argue.bus_outputs[first..first + plan.chunks[t].count] {
+                transcript.append_field_element(&output.0);
+                transcript.append_field_element(&output.1);
+                outputs.push(output.clone());
+                heights.push(plan.tree_vars(t));
+            }
         }
-        let heights: Vec<usize> = bin.iter().map(|&t| plan.shapes[t].input_vars).collect();
         let inputs =
             gkr_lockstep::verify_with(ladder, &outputs, &heights, transcript, checks.residual)?;
-        for (&t, claim) in bin.iter().zip(inputs) {
-            claims[t] = Some(claim);
+        let mut at_tree = 0;
+        for &t in bin {
+            let count = plan.chunks[t].count;
+            let chunk_claims = inputs
+                .get(at_tree..at_tree + count)
+                .ok_or(MlError::ArgueShapeMismatch { part: "bins" })?;
+            at_tree += count;
+            claims[t] = Some(table_claim(chunk_claims, &plan.chunks[t], transcript)?);
         }
     }
     let claims: Vec<GkrClaim<E>> = claims

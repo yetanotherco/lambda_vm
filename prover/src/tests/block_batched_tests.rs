@@ -217,7 +217,7 @@ fn a_block_argued_batched_proves_and_verifies() {
     assert!(!verify(&proof, &elf, &many_groups(PER_TABLE)));
     // A cap the verifier does not hold bins the trees otherwise.
     let other_cap = BlockFormat {
-        argue: ArgueFormat::Batched { bin_log_cells: 0 },
+        argue: ArgueFormat::batched(0),
         ..many_groups(BATCHED)
     };
     assert!(!verify(&proof, &elf, &other_cap));

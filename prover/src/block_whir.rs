@@ -422,6 +422,22 @@ impl BlockFormat {
         }
     }
 
+    /// This format with its batched argue's GKR trees laid out per `pack`:
+    /// a named constant the prover and the
+    /// verifier of one block both take, never read from a proof.
+    /// [`GkrPack::Off`](multilinear::whir_chain::GkrPack::Off) is today's
+    /// trees. A per-table argue has no trees to pack and is returned as it is.
+    pub fn with_pack(self, pack: multilinear::whir_chain::GkrPack) -> Self {
+        let argue = match self.argue {
+            ArgueFormat::Batched { bin_log_cells, .. } => ArgueFormat::Batched {
+                bin_log_cells,
+                pack,
+            },
+            ArgueFormat::PerTable => ArgueFormat::PerTable,
+        };
+        Self { argue, ..self }
+    }
+
     /// The chain's config over `shapes`: the WHIR format's, with this format's
     /// argue, group fold and round-0 leaf order (the block's alone:
     /// `ZfFormat::chain_format` leaves every other chain natural). Every side

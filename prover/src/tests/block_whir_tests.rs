@@ -4458,15 +4458,15 @@ fn block_whir_on_a_real_block() {
     // tables argued together, at the format's bin cap (`BLOCK_WHIR_ARGUE_CAP=k`
     // for 2^k), or each on its own.
     let argue = match std::env::var("BLOCK_WHIR_ARGUE").as_deref().map(str::trim) {
-        Ok("batched") => ArgueFormat::Batched {
-            bin_log_cells: std::env::var("BLOCK_WHIR_ARGUE_CAP")
+        Ok("batched") => ArgueFormat::batched(
+            std::env::var("BLOCK_WHIR_ARGUE_CAP")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(match ArgueFormat::BATCHED {
-                    ArgueFormat::Batched { bin_log_cells } => bin_log_cells,
+                    ArgueFormat::Batched { bin_log_cells, .. } => bin_log_cells,
                     ArgueFormat::PerTable => unreachable!("the batched format"),
                 }),
-        },
+        ),
         Ok("per-table") => ArgueFormat::PerTable,
         Err(_) => BlockFormat::production().argue,
         Ok(other) => panic!("BLOCK_WHIR_ARGUE={other}: per-table or batched"),

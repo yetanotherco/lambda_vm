@@ -241,13 +241,14 @@ fn the_frame_refuses_a_bitwise_table_off_its_fixed_height() {
 /// Format knobs a verifier's process could carry, each off the default: the
 /// WHIR blowup, grind bits and folds, the leaves' query check and scale, and
 /// the leaves' share form.
-const OFF_DEFAULT: [(&str, &str); 6] = [
+const OFF_DEFAULT: [(&str, &str); 7] = [
     (crate::zf_format::ENV_WHIR_BLOWUP, "4"),
     (crate::zf_format::ENV_WHIR_GRIND_BITS, "20"),
     (crate::zf_format::ENV_WHIR_FOLDS, "uniform4"),
     (crate::lfm::whir_block::LEAF_QUERY_ENV, "v1"),
     (crate::lfm::whir_block::LEAF_DOUBLE_FROM_ENV, "off"),
     ("LFM_WHIR_SHARE_INVERSE", "0"),
+    ("BLOCK_WHIR_ARGUE_PACK", "22"),
 ];
 
 /// ★ The block verifier reads no format from its environment. In a process of
@@ -306,6 +307,15 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
     assert_eq!(production.leaf_query, LeafQuery::V1);
     assert_eq!(production.leaf_scale, LeafScale::Fixed);
     assert!(!share_inverse());
+    let harness = crate::lfm::whir_block_tree::WhirTreeConfig::from_env().expect("the knobs read");
+    assert_eq!(
+        harness.format.argue,
+        multilinear::whir_chain::ArgueFormat::Batched {
+            bin_log_cells: 26,
+            pack: multilinear::whir_chain::GkrPack::Chunks { tree_log_cells: 22 },
+        },
+        "the harness's argue follows its packing knob"
+    );
 
     // The verifier's is not.
     let debug = |o: &ProofOptions| format!("{o:?}");
@@ -314,6 +324,11 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
     assert_eq!(pinned.format.leaf_query, LeafQuery::Lean);
     assert_eq!(pinned.format.leaf_scale, LeafScale::DEFAULT);
     assert_eq!(pinned.format.group, GroupFold::Indexed);
+    assert_eq!(
+        pinned.format.argue,
+        multilinear::whir_chain::ArgueFormat::BATCHED,
+        "the verifier's packing is its named constant, not the environment's"
+    );
     assert!(pinned.share_inverse);
     assert_eq!(
         debug(&pinned.base_options),
@@ -328,7 +343,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         ))
     );
 
-    // The named-choice form sets its four and pins the rest, folds and grind
+    // The named-choice form sets its five and pins the rest, folds and grind
     // included.
     let at = verifier_presets_at(
         GroupFold::Indexed,
@@ -336,6 +351,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         LeafOrder::Natural,
         LeafScale::Fixed,
         LeafQuery::V1,
+        multilinear::whir_chain::GkrPack::Off,
     )
     .expect("named choices");
     assert_eq!(
@@ -349,6 +365,11 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
     assert_eq!(
         (at.format.leaf_scale, at.format.leaf_query),
         (LeafScale::Fixed, LeafQuery::V1)
+    );
+    assert_eq!(
+        at.format.argue,
+        multilinear::whir_chain::ArgueFormat::BATCHED,
+        "the packing named Off is today's argue"
     );
     assert!(at.share_inverse);
 

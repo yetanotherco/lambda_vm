@@ -965,15 +965,17 @@ impl WhirBlockPlan {
             let owned = Shapes::build(&refs, &frame.shapes, list)?;
             let shapes = owned.table_shapes();
             let entry = SpongeEntry::fresh_for(wrap_hash);
-            let tables: usize = match batched_cap(config) {
+            let tables: usize = match batched_cap(config)? {
                 None => shapes
                     .iter()
                     .map(|shape| table_verify_cost(shape, entry).perms())
                     .sum(),
-                Some(cap) => {
-                    super::whir_batch::batched_argue_cost(&shapes, &owned.argue_plan(cap), entry)
-                        .perms()
-                }
+                Some(planning) => super::whir_batch::batched_argue_cost(
+                    &shapes,
+                    &owned.argue_plan(planning),
+                    entry,
+                )
+                .perms(),
             };
             let group_shapes: Vec<(usize, usize)> = list.iter().map(|&t| frame.shapes[t]).collect();
             let (_, group_of) = group_columns(&group_shapes);
@@ -1583,22 +1585,25 @@ pub fn verify_block_tree_at(
     leaves: multilinear::whir_chain::LeafOrder,
     leaf_scale: LeafScale,
     leaf_query: LeafQuery,
+    pack: multilinear::whir_chain::GkrPack,
 ) -> Result<(), String> {
-    let presets = verifier_presets_at(group, blowup, leaves, leaf_scale, leaf_query)?;
+    let presets = verifier_presets_at(group, blowup, leaves, leaf_scale, leaf_query, pack)?;
     verify_block_tree_as(elf_bytes, statement, top, &presets)
 }
 
 /// [`verify_block_tree_at`]'s presets: [`BlockFormat::pinned_with`] `group`
-/// with the four named choices set, the coset order refused under a base
-/// whose trees do not take it.
+/// with the five named choices set (the GKR packing through
+/// [`BlockFormat::with_pack`]), the coset order refused under a base whose
+/// trees do not take it.
 pub(crate) fn verifier_presets_at(
     group: GroupFold,
     blowup: crate::zf_format::WhirBlowup,
     leaves: multilinear::whir_chain::LeafOrder,
     leaf_scale: LeafScale,
     leaf_query: LeafQuery,
+    pack: multilinear::whir_chain::GkrPack,
 ) -> Result<VerifierPresets, String> {
-    let mut format = BlockFormat::pinned_with(group);
+    let mut format = BlockFormat::pinned_with(group).with_pack(pack);
     format.zf.whir_blowup = blowup.factor();
     format.zf.whir_leaves = leaves;
     format.leaf_scale = leaf_scale;
@@ -1844,22 +1849,41 @@ impl<'a> Shapes<'a> {
     /// The batched argue's plan over these tables, the host's own
     /// [`stark::multilinear_table::argue_plan`] at the format's cap: the bins
     /// are part of the transcript, so the leaf never restates them.
-    fn argue_plan(&self, bin_log_cells: u8) -> stark::multilinear_table::ArguePlan {
+    fn argue_plan(&self, planning: BatchedPlanning) -> stark::multilinear_table::ArguePlan {
         let shapes: Vec<stark::multilinear_table::ArgueShape> = self
             .layouts
             .iter()
             .map(|layout| stark::multilinear_table::ArgueShape::of(&layout.statement()))
             .collect();
-        stark::multilinear_table::argue_plan(&shapes, bin_log_cells)
+        stark::multilinear_table::argue_plan_packed(&shapes, planning.bin_log_cells, planning.pack)
     }
 }
 
-/// The batched argue's bin cap when the block's format batches its groups.
-fn batched_cap(config: &multilinear::whir_chain::ChainConfig) -> Option<u8> {
+/// The batched argue's planning constants when the block's format batches its
+/// groups: its bin cap and its GKR packing, both the format's.
+fn batched_cap(
+    config: &multilinear::whir_chain::ChainConfig,
+) -> Result<Option<BatchedPlanning>, String> {
+    use multilinear::whir_chain::ArgueFormat;
     match config.format.argue {
-        multilinear::whir_chain::ArgueFormat::Batched { bin_log_cells } => Some(bin_log_cells),
-        multilinear::whir_chain::ArgueFormat::PerTable => None,
+        ArgueFormat::Batched {
+            bin_log_cells,
+            pack,
+        } => Ok(Some(BatchedPlanning {
+            bin_log_cells,
+            pack,
+        })),
+        ArgueFormat::PerTable => Ok(None),
     }
+}
+
+/// What plans a batched group, the format's two constants: the bin cap and
+/// how a table's interactions are laid into trees (the host's
+/// `argue_plan_packed`, called, never restated).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BatchedPlanning {
+    bin_log_cells: u8,
+    pack: multilinear::whir_chain::GkrPack,
 }
 
 /// How a table's preprocessed columns are discharged in a leaf: the epoch's
@@ -2267,7 +2291,7 @@ fn emit_leaf_over(
 
         let mut fork = transcript.clone();
         fork.absorb_const_bytes(&(g as u64).to_le_bytes());
-        let walk = match batched_cap(config) {
+        let walk = match batched_cap(config)? {
             None => {
                 let store: Vec<TableWires> = shapes
                     .iter()
@@ -2280,8 +2304,8 @@ fn emit_leaf_over(
                 )
             }
             // The group's tables in one batched argue, its bins the host's.
-            Some(cap) => {
-                let argue_plan = owned.argue_plan(cap);
+            Some(planning) => {
+                let argue_plan = owned.argue_plan(planning);
                 let store =
                     super::whir_batch::hint_batched_shaped(b, arena, &mut at, &shapes, &argue_plan);
                 super::whir_batch::emit_batched_walk(
@@ -2475,7 +2499,7 @@ pub fn block_leaf_arena(
     let mut groups = Vec::with_capacity(plan.partition.leaf(k).len());
     for &g in plan.partition.leaf(k) {
         let start = plan.group_start(g);
-        let tables = match batched_cap(&plan.frame.config) {
+        let tables = match batched_cap(&plan.frame.config)? {
             None => proof
                 .proof
                 .tables
@@ -2554,7 +2578,7 @@ pub fn group_arena_words(
     let group_tables = plan.groups.get(g).ok_or("a group the plan does not hold")?;
     let owned = Shapes::build(&refs, &frame.shapes, group_tables)?;
     let mut words = Vec::new();
-    match batched_cap(&frame.config) {
+    match batched_cap(&frame.config)? {
         None => {
             for (slot, shape) in owned.table_shapes().iter().enumerate() {
                 let table = tables.get(slot).ok_or("the proof is short of tables")?;
@@ -2570,10 +2594,10 @@ pub fn group_arena_words(
                 }
             }
         }
-        Some(cap) => {
+        Some(planning) => {
             let argue = argue.ok_or("the proof is short of batched argues")?;
             let shapes = owned.table_shapes();
-            let expected = super::whir_batch::batched_words(&shapes, &owned.argue_plan(cap));
+            let expected = super::whir_batch::batched_words(&shapes, &owned.argue_plan(planning));
             super::whir_batch::push_batched_words(&mut words, argue);
             if words.len() != expected {
                 return Err(format!(
@@ -2675,5 +2699,50 @@ pub(crate) mod ood_faults {
         }
         let _restore = Restore(FAULT.with(|c| c.replace(fault)));
         f()
+    }
+}
+
+#[cfg(test)]
+mod pack_tests {
+    use multilinear::whir_chain::{ArgueFormat, ChainConfig, ChainFormat, GkrPack, GrindBits};
+
+    fn config(argue: ArgueFormat) -> ChainConfig {
+        ChainConfig {
+            log_blowup: 1,
+            log_folding: 1,
+            num_queries: 1,
+            grind: GrindBits::default(),
+            format: ChainFormat {
+                argue,
+                ..ChainFormat::DEFAULT
+            },
+        }
+    }
+
+    /// ★ The in-guest verifier plans a batched group by the format's two
+    /// constants — its cap and its packing — and reads no other.
+    #[test]
+    fn the_recursion_plans_by_the_formats_cap_and_packing() {
+        let today = super::batched_cap(&config(ArgueFormat::BATCHED)).expect("batched");
+        assert_eq!(
+            today,
+            Some(super::BatchedPlanning {
+                bin_log_cells: 26,
+                pack: GkrPack::Off
+            })
+        );
+        assert_eq!(super::batched_cap(&config(ArgueFormat::PerTable)), Ok(None));
+        let pack = GkrPack::Chunks { tree_log_cells: 22 };
+        let packed = ArgueFormat::Batched {
+            bin_log_cells: 26,
+            pack,
+        };
+        assert_eq!(
+            super::batched_cap(&config(packed)),
+            Ok(Some(super::BatchedPlanning {
+                bin_log_cells: 26,
+                pack
+            }))
+        );
     }
 }

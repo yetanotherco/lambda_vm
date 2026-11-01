@@ -3320,7 +3320,10 @@ where
                                 proofs.push(proof);
                             }
                         }
-                        ArgueFormat::Batched { bin_log_cells } => {
+                        ArgueFormat::Batched {
+                            bin_log_cells,
+                            pack,
+                        } => {
                             let faults = match argue.group {
                                 Some(faulty) if faulty == g => argue.faults,
                                 _ => ProverFaults::default(),
@@ -3331,6 +3334,7 @@ where
                                 &alpha,
                                 &beta,
                                 bin_log_cells,
+                                pack,
                                 &mut fork,
                                 faults,
                                 argue.at,
@@ -3740,14 +3744,18 @@ where
                     values.extend(reduced.column_values);
                 }
             }
-            ArgueFormat::Batched { bin_log_cells } => {
-                // The group's bins come from its statements and the
-                // verifier's cap, never from the proof.
+            ArgueFormat::Batched {
+                bin_log_cells,
+                pack,
+            } => {
+                // The group's bins and trees come from its statements and the
+                // verifier's cap and packing, never from the proof.
                 let argue = &argues[g];
                 let reduced = batched::verify_argue(
                     argue,
                     group_statements,
                     bin_log_cells,
+                    pack,
                     &z,
                     &alpha,
                     &beta,

@@ -25,7 +25,9 @@ use crate::tables::types::FEE;
 use super::algebraic_commit::leaf_capacity;
 use super::builder::{Ext, LfmBuilder};
 use super::whir_air::{combine_rows, emit_combine};
-use super::whir_bus::{BusInputs, Cost, claim_statements_cost, emit_claim_statements};
+use super::whir_bus::{
+    BusInputs, Cost, claim_statements_cost, emit_claim_statements, emit_eq_evals, eq_evals_cost,
+};
 use super::whir_gkr::GKR_SUMCHECK_DEGREE;
 use super::whir_poly::{
     challenge_powers_rows, emit_challenge_powers, emit_eq_eval, emit_sumcheck_rounds,
@@ -53,7 +55,8 @@ pub struct LadderStepWires {
 
 /// The `BatchedArgue` as wires. Every field is proof data.
 pub struct BatchedArgueWires<'a> {
-    /// Per table, `(p, q)`.
+    /// Per tree, `(p, q)`: one a table, or one for each chunk of a table the
+    /// plan cuts ([`ArguePlan::chunks`]), table order then chunk order.
     pub bus_outputs: &'a [(Ext, Ext)],
     /// Per bin, per step.
     pub gkr: &'a [Vec<LadderStepWires>],
@@ -67,6 +70,8 @@ pub struct BatchedArgueWires<'a> {
 
 /// What the leg leaves per table.
 pub struct BatchedVerdictWires {
+    /// Per table, its bus output: its one tree's, or — a cut table — its
+    /// chunks' fractions added, `Σ p_j/q_j` as one `(p, q)`.
     pub bus_outputs: Vec<(Ext, Ext)>,
     /// Per table, the point its columns are claimed at and their values.
     pub tables: Vec<(Vec<Ext>, Vec<Ext>)>,
@@ -96,6 +101,60 @@ fn emit_line(b: &mut LfmBuilder, lo: Ext, hi: Ext, c: Ext) -> Ext {
     b.emul_add(c, spread, lo)
 }
 
+/// A cut table's chunk claims, all at one point `P`, combined at `s'` into
+/// the claim of its one padded tree at `s' ‖ P` — the host's
+/// `combine_chunk_claims`: `p̃ = Σ_{j<c} eq(s', j)·p̃_j` and
+/// `q̃ = Σ_{j<c} eq(s', j)·q̃_j + Σ_{c≤j<2^ℓ} eq(s', j)`. `c + 1 + ℓ + 2·(2^ℓ − 1)
+/// + c + 2^ℓ − c` rows (the eq table's seed is a constant).
+fn emit_combine_chunks(
+    b: &mut LfmBuilder,
+    chunks: &[(Vec<Ext>, Ext, Ext)],
+    combine: &[Ext],
+) -> (Vec<Ext>, Ext, Ext) {
+    let weights = emit_eq_evals(b, combine);
+    assert!(
+        chunks.len() <= weights.len(),
+        "the chunks fit the combination"
+    );
+    // One height in one bin: the ladder left every chunk at the same wires.
+    assert!(
+        chunks.iter().all(|(at, _, _)| at.len() == chunks[0].0.len()
+            && at.iter().zip(&chunks[0].0).all(|(x, y)| x.0 == y.0)),
+        "a cut table's chunks end at one point"
+    );
+    let mut p: Option<Ext> = None;
+    let mut q: Option<Ext> = None;
+    for ((_, pj, qj), w) in chunks.iter().zip(&weights) {
+        p = Some(match p {
+            None => b.emul(*w, *pj),
+            Some(acc) => b.emul_add(*w, *pj, acc),
+        });
+        q = Some(match q {
+            None => b.emul(*w, *qj),
+            Some(acc) => b.emul_add(*w, *qj, acc),
+        });
+    }
+    let p = p.expect("a cut table has chunks");
+    let mut q = q.expect("a cut table has chunks");
+    for w in &weights[chunks.len()..] {
+        q = b.eadd(q, *w);
+    }
+    let point = combine.iter().chain(&chunks[0].0).copied().collect();
+    (point, p, q)
+}
+
+/// A cut table's chunk outputs as one fraction: `p/q = Σ_j p_j/q_j`, three rows
+/// a chunk after the first.
+fn emit_add_fractions(b: &mut LfmBuilder, outputs: &[(Ext, Ext)]) -> (Ext, Ext) {
+    let (mut p, mut q) = outputs[0];
+    for &(pj, qj) in &outputs[1..] {
+        let scaled = b.emul(p, qj);
+        p = b.emul_add(pj, q, scaled);
+        q = b.emul(q, qj);
+    }
+    (p, q)
+}
+
 /// ★ `verify_argue`, emitted.
 ///
 /// `z`, `alpha_powers` and `beta` are the proof's shared challenges, drawn by
@@ -114,30 +173,48 @@ pub fn emit_batched_argue(
 ) -> BatchedVerdictWires {
     let n = shapes.len();
     assert_eq!(plan.shapes.len(), n, "the plan is over these tables");
-    assert_eq!(proof.bus_outputs.len(), n, "one bus output per table");
+    assert_eq!(
+        proof.bus_outputs.len(),
+        plan.trees(),
+        "one bus output per tree"
+    );
     assert_eq!(proof.gkr.len(), plan.bins.len(), "one ladder per bin");
     assert_eq!(proof.factor_values.len(), n, "factor values per table");
     assert_eq!(proof.reduces.len(), n, "a reduction slot per table");
 
-    // ── G: per bin, its outputs, then its ladder ──
+    // ── G: per bin, its trees' outputs, then its ladder, then each cut
+    // table's chunks combined ──
     let mut claims: Vec<Option<(Vec<Ext>, Ext, Ext)>> = vec![None; n];
+    let mut outputs: Vec<Option<(Ext, Ext)>> = vec![None; n];
     for (bin, ladder) in plan.bins.iter().zip(proof.gkr) {
-        for &t in bin {
-            transcript.absorb_ext(b, proof.bus_outputs[t].0);
-            transcript.absorb_ext(b, proof.bus_outputs[t].1);
+        // The bin's trees: each table's chunks, in order, as `(table, tree)`.
+        let members: Vec<(usize, usize)> = bin
+            .iter()
+            .flat_map(|&t| {
+                let first = plan.first_tree(t);
+                (0..plan.chunks[t].count).map(move |j| (t, first + j))
+            })
+            .collect();
+        for &(_, tree) in &members {
+            transcript.absorb_ext(b, proof.bus_outputs[tree].0);
+            transcript.absorb_ext(b, proof.bus_outputs[tree].1);
         }
-        let heights: Vec<usize> = bin.iter().map(|&t| plan.shapes[t].input_vars).collect();
+        let heights: Vec<usize> = members.iter().map(|&(t, _)| plan.tree_vars(t)).collect();
         let steps = heights.iter().copied().max().unwrap_or(0);
         assert_eq!(ladder.len(), steps, "the ladder runs to the tallest tree");
-        let mut running: Vec<(Ext, Ext)> = bin.iter().map(|&t| proof.bus_outputs[t]).collect();
-        for (a, &t) in bin.iter().enumerate() {
+        let mut running: Vec<(Ext, Ext)> = members
+            .iter()
+            .map(|&(_, tree)| proof.bus_outputs[tree])
+            .collect();
+        let mut leaves: Vec<Option<(Vec<Ext>, Ext, Ext)>> = vec![None; members.len()];
+        for a in 0..members.len() {
             if heights[a] == 0 {
-                claims[t] = Some((Vec::new(), running[a].0, running[a].1));
+                leaves[a] = Some((Vec::new(), running[a].0, running[a].1));
             }
         }
         let mut point: Vec<Ext> = Vec::new();
         for (i, step) in ladder.iter().enumerate() {
-            let active: Vec<usize> = (0..bin.len()).filter(|&a| heights[a] > i).collect();
+            let active: Vec<usize> = (0..members.len()).filter(|&a| heights[a] > i).collect();
             assert_eq!(step.halves.len(), active.len(), "halves per active tree");
             assert_eq!(step.sumcheck.len(), i, "step i's sumcheck has i rounds");
             let mu = transcript.sample_ext(b);
@@ -178,14 +255,42 @@ pub fn emit_batched_argue(
                 let [p_lo, p_hi, q_lo, q_hi] = step.halves[k];
                 running[a] = (emit_line(b, p_lo, p_hi, c), emit_line(b, q_lo, q_hi, c));
                 if heights[a] == i + 1 {
-                    claims[bin[a]] = Some((point.clone(), running[a].0, running[a].1));
+                    leaves[a] = Some((point.clone(), running[a].0, running[a].1));
                 }
             }
+        }
+        // Each table's claim and output: its one tree's, or its chunks'
+        // combined at `s'`, drawn after the bin's ladder (the host's
+        // `table_claim`).
+        let mut at_tree = 0;
+        for &t in bin {
+            let count = plan.chunks[t].count;
+            let chunks: Vec<(Vec<Ext>, Ext, Ext)> = leaves[at_tree..at_tree + count]
+                .iter()
+                .map(|c| c.clone().expect("every tree reaches its input layer"))
+                .collect();
+            let first = plan.first_tree(t);
+            let tree_outputs = &proof.bus_outputs[first..first + count];
+            at_tree += count;
+            if count == 1 {
+                claims[t] = chunks.into_iter().next();
+                outputs[t] = Some(tree_outputs[0]);
+                continue;
+            }
+            let combine: Vec<Ext> = (0..plan.chunks[t].combine_vars())
+                .map(|_| transcript.sample_ext(b))
+                .collect();
+            claims[t] = Some(emit_combine_chunks(b, &chunks, &combine));
+            outputs[t] = Some(emit_add_fractions(b, tree_outputs));
         }
     }
     let claims: Vec<(Vec<Ext>, Ext, Ext)> = claims
         .into_iter()
         .map(|c| c.expect("every table's tree reaches its input layer"))
+        .collect();
+    let outputs: Vec<(Ext, Ext)> = outputs
+        .into_iter()
+        .map(|o| o.expect("every table has its output"))
         .collect();
 
     // ── C: one front-loaded sumcheck ──
@@ -311,7 +416,7 @@ pub fn emit_batched_argue(
     }
 
     BatchedVerdictWires {
-        bus_outputs: proof.bus_outputs.to_vec(),
+        bus_outputs: outputs,
         tables,
     }
 }
@@ -337,6 +442,14 @@ fn emit_direct_columns(
     columns
         .into_iter()
         .map(|c| c.expect("every column is read by a factor"))
+        .collect()
+}
+
+/// Each of a bin's trees' input variables, in the ladder's order: each
+/// table's chunks, in table order.
+fn tree_heights(plan: &ArguePlan, bin: &[usize]) -> Vec<usize> {
+    bin.iter()
+        .flat_map(|&t| std::iter::repeat_n(plan.tree_vars(t), plan.chunks[t].count))
         .collect()
 }
 
@@ -388,8 +501,8 @@ pub fn batched_argue_cost(
 
     // ── G ──
     for bin in &plan.bins {
-        absorb_ext(&mut leg, &mut schedule, 2 * bin.len());
-        let heights: Vec<usize> = bin.iter().map(|&t| plan.shapes[t].input_vars).collect();
+        let heights = tree_heights(plan, bin);
+        absorb_ext(&mut leg, &mut schedule, 2 * heights.len());
         let steps = heights.iter().copied().max().unwrap_or(0);
         for i in 0..steps {
             let active = heights.iter().filter(|&&h| h > i).count();
@@ -414,6 +527,19 @@ pub fn batched_argue_cost(
             leg.ops(ASSERT_ROWS);
             leg.constant(zero);
             leg.ops(4 * active);
+        }
+        // A cut table's `ℓ` draws, its eq table over them, the two sums and
+        // the padding chunks' weights, and its outputs added as fractions.
+        for &t in bin {
+            let chunks = &plan.chunks[t];
+            if chunks.count == 1 {
+                continue;
+            }
+            let ell = chunks.combine_vars();
+            draw_ext(&mut leg, &mut schedule, ell);
+            eq_evals_cost(ell, &mut leg);
+            leg.ops(2 * chunks.count + ((1usize << ell) - chunks.count));
+            leg.ops(3 * (chunks.count - 1));
         }
     }
 
@@ -572,9 +698,14 @@ impl BatchedStore {
 /// [`hint_batched_shaped`]'s order: what [`push_batched_words`] must write.
 #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn batched_words(shapes: &[TableShape<'_>], plan: &ArguePlan) -> usize {
-    let mut words = 2 * shapes.len();
+    assert_eq!(
+        plan.shapes.len(),
+        shapes.len(),
+        "the plan is over these tables"
+    );
+    let mut words = 2 * plan.trees();
     for bin in &plan.bins {
-        let heights: Vec<usize> = bin.iter().map(|&t| plan.shapes[t].input_vars).collect();
+        let heights = tree_heights(plan, bin);
         let steps = heights.iter().copied().max().unwrap_or(0);
         for i in 0..steps {
             let active = heights.iter().filter(|&&h| h > i).count();
@@ -613,7 +744,7 @@ pub(crate) fn hint_batched_shaped(
             })
             .collect()
     };
-    let bus_outputs = (0..shapes.len())
+    let bus_outputs = (0..plan.trees())
         .map(|_| {
             let pq = take(b, 2);
             (pq[0], pq[1])
@@ -623,7 +754,7 @@ pub(crate) fn hint_batched_shaped(
         .bins
         .iter()
         .map(|bin| {
-            let heights: Vec<usize> = bin.iter().map(|&t| plan.shapes[t].input_vars).collect();
+            let heights = tree_heights(plan, bin);
             let steps = heights.iter().copied().max().unwrap_or(0);
             (0..steps)
                 .map(|i| {

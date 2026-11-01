@@ -39,7 +39,7 @@ fn config(argue: ArgueFormat) -> ChainConfig {
 }
 
 fn batched(bin_log_cells: u8) -> ChainConfig {
-    config(ArgueFormat::Batched { bin_log_cells })
+    config(ArgueFormat::batched(bin_log_cells))
 }
 
 /// The ADD table's own constraint: every row really is an addition.
@@ -271,6 +271,7 @@ fn shape(num_vars: usize, input_vars: usize) -> ArgueShape {
         input_vars,
         degree: 2,
         shifted: false,
+        interactions: 1 << (input_vars - num_vars),
     }
 }
 
@@ -333,19 +334,22 @@ fn the_shapes_come_from_the_statement() {
                 num_vars: 4,
                 input_vars: 5,
                 degree: 2,
-                shifted: false
+                shifted: false,
+                interactions: 2
             },
             ArgueShape {
                 num_vars: 4,
                 input_vars: 4,
                 degree: 2,
-                shifted: false
+                shifted: false,
+                interactions: 1
             },
             ArgueShape {
                 num_vars: 3,
                 input_vars: 3,
                 degree: 3,
-                shifted: true
+                shifted: true,
+                interactions: 1
             },
         ]
     );
@@ -873,6 +877,19 @@ fn a_device() -> bool {
     multilinear::gpu::reserve_budget() > 0
 }
 
+/// Held by every test here that sets a process-wide argue switch
+/// (`force_argue_*`) or asserts on a process-wide device counter, so no two of
+/// them overlap: one test's forced switch moves the other's rounds. (The
+/// round slot's On arm, run while another test had Gruen's rounds off, put its
+/// GKR rounds on the generic layer path — none through a slot — while both
+/// tests' launches landed in the one counter.)
+fn card_switches() -> std::sync::MutexGuard<'static, ()> {
+    static SWITCHES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SWITCHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// ★ D-BATCH B-3's gate: the prover on the card ([`Where::Device`]) proves the
 /// host reference's canonical bytes — every tree, ladder step, round and value
 /// — with the transcript in the same state after, and the proof verifies.
@@ -892,6 +909,7 @@ fn a_device() -> bool {
 fn the_card_proves_the_host_references_bytes() {
     use crypto::fiat_shamir::is_transcript::IsTranscript;
 
+    let _switches = card_switches();
     let airs = airs();
     for (a, pad, cap) in [(12usize, 1usize, 27u8), (12, 1, 14), (3, 1, 27)] {
         let cfg = batched(cap);
@@ -987,6 +1005,7 @@ fn the_round_slot_proves_the_host_references_bytes() {
     use crypto::fiat_shamir::is_transcript::IsTranscript;
     use multilinear::round_slot::{self as slot, RoundSlotSetting};
 
+    let _switches = card_switches();
     let airs = airs();
     let cfg = batched(27);
     let cols = columns(12, 1);

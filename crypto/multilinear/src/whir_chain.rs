@@ -417,6 +417,10 @@ pub enum ArgueFormat {
         /// `log2` of a bin's cap on `Σ 2^{k_T}`, `k_T` a tree's input
         /// variables. A tree at or over the cap sits alone.
         bin_log_cells: u8,
+        /// How a table's interactions are laid into trees. [`GkrPack::Off`]
+        /// = today: one tree a table, its interactions padded to a power of
+        /// two.
+        pack: GkrPack,
     },
 }
 
@@ -425,7 +429,46 @@ impl ArgueFormat {
     /// `2^27` with `2^26` its fallback (§8.2); on the block's 15 epochs bins of
     /// `2^27` overran the card (12 tree builds refused, FAST 347) and bins of
     /// `2^26` refused none.
-    pub const BATCHED: Self = Self::Batched { bin_log_cells: 26 };
+    pub const BATCHED: Self = Self::Batched {
+        bin_log_cells: 26,
+        pack: GkrPack::Off,
+    };
+
+    /// The batched format at `bin_log_cells`, its trees laid out today's way.
+    pub const fn batched(bin_log_cells: u8) -> Self {
+        Self::Batched {
+            bin_log_cells,
+            pack: GkrPack::Off,
+        }
+    }
+}
+
+/// How the batched argue lays a table's interactions into LogUp-GKR trees.
+///
+/// [`Off`](Self::Off) is today's: one tree a table over its interactions
+/// padded to a power of two with `0/1`. [`Chunks`](Self::Chunks) cuts a table
+/// whose padding costs more than the trees it would add into `c` trees of
+/// `2^b` slots each, the chunks of its interactions in order, all in one bin:
+/// they end at one point, and their claims combine at a fresh challenge into
+/// the claim today's one tree would leave, so the constraint phase is
+/// unchanged. Which tables are cut and how is a function of their shapes and
+/// `tree_log_cells` alone.
+///
+/// ★ A FORMAT VALUE: the trees, their bus outputs and their ladder halves are
+/// part of the proof, so a verifier argues under its own value, never a
+/// proof's. A verifier-side constant like the rest of [`ChainFormat`], and not
+/// absorbed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum GkrPack {
+    /// One tree a table. Today's format.
+    #[default]
+    Off,
+    /// A table cut into equal chunks where that saves cells: each extra tree
+    /// is priced at `2^tree_log_cells` input cells.
+    Chunks {
+        /// `log2` of the input cells one more tree is worth.
+        tree_log_cells: u8,
+    },
 }
 
 /// Which proof-of-work nonces a round's encoding carries (P2's format half).

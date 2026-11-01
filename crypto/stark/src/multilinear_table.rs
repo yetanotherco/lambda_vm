@@ -48,8 +48,9 @@ use multilinear::selector::Selector;
 
 pub mod batched;
 pub use batched::{
-    ArguePlan, ArgueShape, BatchedArgue, BatchedMultiProof, argue_plan, multi_prove_batched,
-    multi_verify_batched, multi_verify_batched_settled,
+    ArguePlan, ArgueShape, BatchedArgue, BatchedMultiProof, Chunking, argue_plan,
+    argue_plan_packed, chunking, multi_prove_batched, multi_verify_batched,
+    multi_verify_batched_settled,
 };
 
 /// A table's structure, with no trace in it: what the factors are, what gets

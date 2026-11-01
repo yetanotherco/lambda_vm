@@ -9,7 +9,7 @@
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::transcript_hash::RpxTranscriptHash;
-use multilinear::whir_chain::ArgueFormat;
+use multilinear::whir_chain::{ArgueFormat, GkrPack};
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, RowDomain};
 use stark::lookup::{
     AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
@@ -20,7 +20,9 @@ use stark::multilinear_logup::{InteractionShape, interaction_shapes};
 use stark::multilinear_table::batched::{
     BatchedArgue, ProverFaults, VerifierChecks, Where, prove_argue, verify_argue,
 };
-use stark::multilinear_table::{ArguePlan, ArgueShape, CommittedTable, TableLayout, argue_plan};
+use stark::multilinear_table::{
+    ArguePlan, ArgueShape, CommittedTable, TableLayout, argue_plan, argue_plan_packed,
+};
 use stark::traits::AIR;
 
 use crate::tables::types::{FE, FEE};
@@ -118,11 +120,29 @@ fn columns(num_vars: usize) -> Vec<Vec<FE>> {
 type Air = AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), Rules>;
 
 fn air(shifted: bool) -> Air {
+    air_with(shifted, buses())
+}
+
+/// An unshifted table with `m` interactions, each `(a, c)` sent on its own
+/// bus: enough of them for the GKR packing to cut. Its bus does not balance,
+/// which the leg does not check (the caller's, as the host's).
+fn fan(m: usize) -> Air {
+    let interactions = (0..m)
+        .map(|i| {
+            BusInteraction::sender(
+                10 + i as u64,
+                Multiplicity::Column(1),
+                Packing::Direct.columns(&[0, 2]),
+            )
+        })
+        .collect();
+    air_with(false, interactions)
+}
+
+fn air_with(shifted: bool, interactions: Vec<BusInteraction>) -> Air {
     AirWithBuses::new(
         COLUMNS,
-        AuxiliaryTraceBuildData {
-            interactions: buses(),
-        },
+        AuxiliaryTraceBuildData { interactions },
         &stark::proof::options::GoldilocksCubicProofOptions::with_params(4, 128, 20)
             .expect("valid options"),
         1,
@@ -135,10 +155,15 @@ fn challenges() -> (FEE, FEE, FEE) {
     (drawn[0], drawn[1], drawn[2])
 }
 
-/// The fixture: `(air, num_vars)` per table.
+/// The fixture: `(air, num_vars)` per table, and how its argue lays them
+/// into trees.
 struct Fixture {
     airs: Vec<(Air, usize)>,
+    pack: GkrPack,
 }
+
+/// The packed fixture's price: every fan below is cut.
+const PACKED: GkrPack = GkrPack::Chunks { tree_log_cells: 2 };
 
 impl Fixture {
     /// A shifted table of 2^3 rows, an unshifted one of 2^4, a shifted one of
@@ -146,6 +171,25 @@ impl Fixture {
     fn new() -> Self {
         Self {
             airs: vec![(air(true), 3), (air(false), 4), (air(true), 5)],
+            pack: GkrPack::Off,
+        }
+    }
+
+    /// [`Self::new`]'s tables with three fans between them, packed at
+    /// [`PACKED`]: FAN(5) and FAN(9) at 2^3 rows in chunks of two slots (the
+    /// last of each one interaction, padded to its slots), FAN(7) at 2^5 in
+    /// seven chunks of one, each with all-padding chunks after its last.
+    fn packed() -> Self {
+        Self {
+            airs: vec![
+                (air(true), 3),
+                (fan(5), 3),
+                (air(false), 4),
+                (fan(9), 3),
+                (fan(7), 5),
+                (air(true), 5),
+            ],
+            pack: PACKED,
         }
     }
 
@@ -216,6 +260,7 @@ impl Fixture {
             &alpha,
             &beta,
             cap,
+            self.pack,
             &mut prover,
             ARGUE_FAULTS.with(std::cell::Cell::get),
             Where::Host,
@@ -226,11 +271,19 @@ impl Fixture {
 }
 
 fn plan_of(layouts: &[TableLayout<'_, F, E>], cap: u8) -> ArguePlan {
+    plan_packed(layouts, cap, GkrPack::Off)
+}
+
+fn plan_packed(layouts: &[TableLayout<'_, F, E>], cap: u8, pack: GkrPack) -> ArguePlan {
     let shapes: Vec<ArgueShape> = layouts
         .iter()
         .map(|l| ArgueShape::of(&l.statement()))
         .collect();
-    argue_plan(&shapes, cap)
+    let plan = argue_plan_packed(&shapes, cap, pack);
+    if pack == GkrPack::Off {
+        assert_eq!(plan, argue_plan(&shapes, cap), "Off plans today's bins");
+    }
+    plan
 }
 
 fn alpha_ladder(buses: &[Vec<InteractionShape<E>>], alpha: FEE) -> Vec<FEE> {
@@ -425,10 +478,19 @@ fn with_run<R>(
     tamper: impl FnOnce(&mut BatchedArgue<E>),
     check: impl FnOnce(RunView<'_>) -> R,
 ) -> R {
-    let fixture = Fixture::new();
+    with_run_on(Fixture::new(), cap, tamper, check)
+}
+
+/// [`with_run`] over `fixture`.
+fn with_run_on<R>(
+    fixture: Fixture,
+    cap: u8,
+    tamper: impl FnOnce(&mut BatchedArgue<E>),
+    check: impl FnOnce(RunView<'_>) -> R,
+) -> R {
     let layouts = fixture.layouts();
     let buses = fixture.buses(&layouts);
-    let plan = plan_of(&layouts, cap);
+    let plan = plan_packed(&layouts, cap, fixture.pack);
     let shapes: Vec<TableShape<'_>> = layouts
         .iter()
         .zip(&buses)
@@ -451,6 +513,7 @@ fn with_run<R>(
             &argue,
             &statements,
             cap,
+            fixture.pack,
             &z,
             &alpha,
             &beta,
@@ -514,6 +577,20 @@ impl RunView<'_> {
     }
 }
 
+/// Each table's bus output as the leg leaves it: its one tree's, or its
+/// chunks' fractions added in chunk order, `(p·q_j + p_j·q, q·q_j)`.
+fn table_outputs(run: &RunView<'_>) -> Vec<(FEE, FEE)> {
+    (0..run.plan.shapes.len())
+        .map(|t| {
+            let first = run.plan.first_tree(t);
+            let chunks = &run.argue.bus_outputs[first..first + run.plan.chunks[t].count];
+            chunks[1..]
+                .iter()
+                .fold(chunks[0], |(p, q), (pj, qj)| (p * qj + pj * q, q * qj))
+        })
+        .collect()
+}
+
 /// ★ B-4a G1 — the leg computes what the host's `verify_argue` computes, in
 /// one bin and with every table alone: the bus outputs, and every table's
 /// column point and values.
@@ -529,8 +606,8 @@ fn the_batched_leg_computes_what_the_host_computes() {
                     .execute()
                     .unwrap_or_else(|e| panic!("cap {cap}: the leg must execute: {e}"));
                 let mut want: Vec<FEE> = Vec::new();
-                for (p, q) in &run.argue.bus_outputs {
-                    want.extend([*p, *q]);
+                for (p, q) in table_outputs(&run) {
+                    want.extend([p, q]);
                 }
                 for claim in &host {
                     want.extend(claim.point.iter().copied());
@@ -560,7 +637,7 @@ fn the_batched_leg_emits_its_closed_form() {
             |run| {
                 let with = run.program(true);
                 let without = run.program(false);
-                let published = 2 * run.argue.bus_outputs.len()
+                let published = 2 * run.shapes.len()
                     + run
                         .host
                         .as_ref()
@@ -651,7 +728,7 @@ fn the_batched_leg_refuses_what_the_host_rejects() {
 /// three tables in one bin.
 #[test]
 fn the_production_cap_bins_the_fixture_once() {
-    let ArgueFormat::Batched { bin_log_cells } = ArgueFormat::BATCHED else {
+    let ArgueFormat::Batched { bin_log_cells, .. } = ArgueFormat::BATCHED else {
         unreachable!()
     };
     let fixture = Fixture::new();
@@ -723,5 +800,206 @@ fn the_leaf_refuses_a_forgery_only_the_constraint_equation_catches() {
     assert!(
         !executes,
         "the machine executed a forgery only the constraint equation catches"
+    );
+}
+
+// ─── The GKR slot packing (`GkrPack::Chunks`), in-guest ──────────────────
+
+/// The packed fixture cuts every fan, in one bin and with every table alone.
+fn packed_cuts(cap: u8) -> Vec<(usize, usize)> {
+    let fixture = Fixture::packed();
+    let layouts = fixture.layouts();
+    plan_packed(&layouts, cap, fixture.pack)
+        .chunks
+        .iter()
+        .map(|c| (c.slot_vars, c.count))
+        .collect()
+}
+
+/// ★ The leg computes what the host computes under the packing: each table's
+/// claim from its chunks combined at `s'` (drawn after its bin's ladder), and
+/// each table's output its chunks' fractions added — in one bin and with
+/// every table alone.
+#[test]
+fn the_packed_leg_computes_what_the_host_computes() {
+    for cap in [27u8, 0] {
+        assert_eq!(
+            packed_cuts(cap),
+            vec![(1, 1), (1, 3), (1, 1), (1, 5), (0, 7), (1, 1)],
+            "cap {cap}: every fan is cut"
+        );
+        with_run_on(
+            Fixture::packed(),
+            cap,
+            |_| {},
+            |run| {
+                assert_eq!(run.argue.bus_outputs.len(), run.plan.trees());
+                assert_eq!(run.plan.trees(), 1 + 3 + 1 + 5 + 7 + 1);
+                let host = run.host.clone().expect("the host verifies its own argue");
+                let got = run
+                    .execute()
+                    .unwrap_or_else(|e| panic!("cap {cap}: the leg must execute: {e}"));
+                let mut want: Vec<FEE> = Vec::new();
+                for (p, q) in table_outputs(&run) {
+                    want.extend([p, q]);
+                }
+                for claim in &host {
+                    want.extend(claim.point.iter().copied());
+                    want.extend(claim.column_values.iter().copied());
+                }
+                assert_eq!(got, want, "cap {cap}: the leg's verdict is the host's");
+            },
+        );
+    }
+}
+
+/// ★ The closed form is the emitted census under the packing too: the
+/// combination's draws, its eq table, its sums and the added fractions.
+#[test]
+fn the_packed_leg_emits_its_closed_form() {
+    for cap in [27u8, 0] {
+        with_run_on(
+            Fixture::packed(),
+            cap,
+            |_| {},
+            |run| {
+                let with = run.program(true);
+                let without = run.program(false);
+                let published = 2 * run.shapes.len()
+                    + run
+                        .host
+                        .as_ref()
+                        .expect("host")
+                        .iter()
+                        .map(|c| c.point.len() + c.column_values.len())
+                        .sum::<usize>();
+                let measured =
+                    with.instrs.len() - without.instrs.len() - (published - 2) * PUBLISH_ROW;
+                let cost = batched_argue_cost(run.shapes, run.plan, SpongeEntry::fresh());
+                let predicted = cost.leg.constant_values();
+                let mut unnamed: Vec<LfmWord> = Vec::new();
+                for instr in &with.instrs {
+                    if let super::instr::Instr::Const { value, .. } = instr
+                        && !predicted.contains(value)
+                        && !unnamed.contains(value)
+                    {
+                        unnamed.push(*value);
+                    }
+                }
+                assert!(
+                    unnamed.is_empty(),
+                    "cap {cap}: the form does not name {unnamed:?}"
+                );
+                assert_eq!(measured, cost.rows(), "cap {cap}");
+            },
+        );
+    }
+}
+
+/// ★ Every tamper the host refuses under the packing, the leg refuses: a cut
+/// table's chunk output (either side), a chunk's halves at a mid step, two
+/// chunks' outputs swapped, and a ladder round.
+#[test]
+fn the_packed_leg_refuses_what_the_host_rejects() {
+    // FAN(5) is table 1, its trees 1–3; FAN(9) is table 3, its trees 5–9.
+    type Site = (&'static str, fn(&mut BatchedArgue<E>));
+    let sites: Vec<Site> = vec![
+        ("a chunk's output numerator", |a| {
+            bump(&mut a.bus_outputs[2].0)
+        }),
+        ("a chunk's output denominator", |a| {
+            bump(&mut a.bus_outputs[6].1)
+        }),
+        ("two chunks' outputs swapped", |a| a.bus_outputs.swap(1, 2)),
+        ("a chunk's mid-step half", |a| {
+            bump(&mut a.gkr[0].layers[2].halves[3].p_hi)
+        }),
+        ("a ladder round", |a| {
+            bump(&mut a.gkr[0].layers[3].sumcheck.rounds[1].evaluations[2])
+        }),
+    ];
+    with_run_on(
+        Fixture::packed(),
+        27,
+        |_| {},
+        |run| {
+            run.host
+                .clone()
+                .expect("the honest packed argue verifies on the host");
+            run.execute().expect("the honest packed argue executes");
+        },
+    );
+    for (name, tamper) in sites {
+        with_run_on(Fixture::packed(), 27, tamper, |run| {
+            assert!(run.host.is_err(), "{name}: the HOST accepted it");
+            assert!(
+                run.execute().is_err(),
+                "{name}: the machine executed a forgery the host rejects"
+            );
+        });
+    }
+}
+
+/// A cut table's first two chunks traded by the prover (honest trees over the
+/// chunks in the wrong order): the host's constraint equation refuses it, and
+/// so must the machine.
+#[test]
+fn the_packed_leg_refuses_swapped_chunks() {
+    for t in [1usize, 3, 4] {
+        ARGUE_FAULTS.with(|f| {
+            f.set(ProverFaults {
+                swap_chunks: Some(t),
+                ..ProverFaults::default()
+            })
+        });
+        let (host, executes) = with_run_on(
+            Fixture::packed(),
+            27,
+            |_| {},
+            |run| (run.host.clone().map(|_| ()), run.execute().is_ok()),
+        );
+        ARGUE_FAULTS.with(|f| f.set(ProverFaults::default()));
+        assert_eq!(
+            host,
+            Err(format!("{:?}", multilinear::Error::BatchMismatch)),
+            "table {t}: the host's constraint equation"
+        );
+        assert!(!executes, "table {t}: the machine executed swapped chunks");
+    }
+}
+
+/// A forged output on a cut table's first chunk (its ladder on the true
+/// tree): only the ladder residual refuses it on the host, and the machine
+/// must refuse it.
+#[test]
+fn the_packed_leg_refuses_a_forgery_only_the_residual_catches() {
+    ARGUE_FAULTS.with(|f| {
+        f.set(ProverFaults {
+            balance_with: Some(3),
+            ..ProverFaults::default()
+        })
+    });
+    let run_with = |checks: VerifierChecks| {
+        HOST_CHECKS.with(|c| c.set(checks));
+        let out = with_run_on(
+            Fixture::packed(),
+            27,
+            |_| {},
+            |run| (run.host.clone().map(|_| ()), run.execute().is_ok()),
+        );
+        HOST_CHECKS.with(|c| c.set(VerifierChecks::ALL));
+        out
+    };
+    let (all, executes) = run_with(VerifierChecks::ALL);
+    let (inert, _) = run_with(VerifierChecks {
+        residual: false,
+        ..VerifierChecks::ALL
+    });
+    ARGUE_FAULTS.with(|f| f.set(ProverFaults::default()));
+    assert!(all.is_err(), "the host refuses it");
+    assert_eq!(inert, Ok(()), "premise: only the residual refuses it");
+    assert!(
+        !executes,
+        "the machine executed a forgery only the residual catches"
     );
 }
