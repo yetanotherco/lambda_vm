@@ -276,6 +276,12 @@ fn main() {
         &[]
     };
     compile_kernel("blake3.cu", "blake3.cubin", have_nvcc, blake3_defines);
+    // The WHIR base proof's BLAKE3 kernels (`src/blake3_whir.rs`): `blake3.cu`
+    // instantiated at 7 rounds by the file itself, so no define is passed —
+    // least of all the 6-round one above. Loaded on first use, never by the
+    // backend.
+    println!("cargo:rerun-if-changed=kernels/blake3.cu");
+    compile_kernel("blake3_whir.cu", "blake3_whir.cubin", have_nvcc, &[]);
     // The WHIR path's own kernels. They carry no compile-time knob, so they
     // take the empty define list rather than gaining a second signature.
     // D-HASH stage 1's Poseidon1 width-16 MEASUREMENT kernels (`src/p1w16.rs`),

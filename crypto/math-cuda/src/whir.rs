@@ -816,12 +816,32 @@ mod fold_transient_tests {
     }
 }
 
-use crate::merkle::{build_inner_tree_levels, keccak_launch_cfg};
+use crate::merkle::keccak_launch_cfg;
+
+/// Every inner level of a WHIR tree under `hash`: `crate::merkle`'s walk, or
+/// under [`crate::DeviceHash::Blake3`] the 7-round walk of
+/// [`crate::blake3_whir`] — the WHIR trees' BLAKE3 is standard BLAKE3, which
+/// `crate::merkle` (keyed for the STARK pipeline's build-count BLAKE3) refuses
+/// to build.
+pub(crate) fn build_inner_tree_levels(
+    stream: &CudaStream,
+    be: &crate::device::Backend,
+    nodes_dev: &mut CudaSlice<u8>,
+    leaves_len: usize,
+    hash: crate::DeviceHash,
+) -> Result<()> {
+    match hash {
+        crate::DeviceHash::Blake3 => {
+            crate::blake3_whir::build_inner_tree_levels(stream, nodes_dev, leaves_len)
+        }
+        _ => crate::merkle::build_inner_tree_levels(stream, be, nodes_dev, leaves_len, hash),
+    }
+}
 
 /// The coset-leaf kernel `hash` runs over a base or ext3 codeword, with its
 /// launch geometry for `num_leaves` leaves. A key with no WHIR kernels is a
 /// refused launch, never another hash's kernel under its name.
-fn coset_leaf_kernel(
+pub(crate) fn coset_leaf_kernel(
     be: &crate::device::Backend,
     hash: crate::DeviceHash,
     base: bool,
@@ -841,7 +861,17 @@ fn coset_leaf_kernel(
             };
             return Ok((kernel, crate::p1_stark::launch_cfg(num_leaves)));
         }
-        (crate::DeviceHash::Blake3, _) => return Err(crate::invalid_value()),
+        // Standard 7-round BLAKE3 (`crate::blake3_whir`), not the STARK
+        // cubin's build-count kernels.
+        (crate::DeviceHash::Blake3, base) => {
+            let k = crate::blake3_whir::kernels()?;
+            let kernel = if base {
+                &k.leaves_base_coset
+            } else {
+                &k.leaves_ext3_coset
+            };
+            return Ok((kernel, crate::blake3_whir::launch_cfg(num_leaves)));
+        }
     };
     Ok((kernel, keccak_launch_cfg(num_leaves)))
 }
@@ -865,7 +895,8 @@ fn gather_paths(
 
 /// Where a tree puts the leaf of fold block `j`: at position `j`, or at
 /// `bitrev(j)` over the tree's depth (`multilinear::whir_commit::LeafOrder`).
-/// Only a round-0 tree is ever reversed, and only under Poseidon1.
+/// Only a round-0 tree is ever reversed, and only under Poseidon1 or the
+/// 7-round BLAKE3.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LeafPlacement {
     #[default]
@@ -1017,23 +1048,34 @@ impl DeviceCodeword {
                                 .launch(cfg)?;
                         }
                     }
-                    // Reversed leaves exist for Poseidon1's base trees alone
-                    // (the round-0 trees of the production hash).
+                    // Reversed leaves exist for the base trees of Poseidon1
+                    // (the round-0 trees of the production hash) and of the
+                    // 7-round BLAKE3 base.
                     LeafPlacement::Reversed => {
-                        if hash != crate::DeviceHash::Poseidon1 || !self.base {
+                        if !self.base {
                             return Err(crate::invalid_value());
                         }
-                        let k = crate::p1_stark::kernels()?;
+                        let (kernel, cfg) = match hash {
+                            crate::DeviceHash::Poseidon1 => (
+                                &crate::p1_stark::kernels()?.leaves_base_coset_rev,
+                                crate::p1_stark::launch_cfg(num_leaves_u64),
+                            ),
+                            crate::DeviceHash::Blake3 => (
+                                &crate::blake3_whir::kernels()?.leaves_base_coset_rev,
+                                crate::blake3_whir::launch_cfg(num_leaves_u64),
+                            ),
+                            _ => return Err(crate::invalid_value()),
+                        };
                         let leaf_bits = num_leaves.trailing_zeros();
                         unsafe {
                             self.stream
-                                .launch_builder(&k.leaves_base_coset_rev)
+                                .launch_builder(kernel)
                                 .arg(self.buffer.as_ref())
                                 .arg(&num_leaves_u64)
                                 .arg(&block)
                                 .arg(&leaf_bits)
                                 .arg(&mut leaves)
-                                .launch(crate::p1_stark::launch_cfg(num_leaves_u64))?;
+                                .launch(cfg)?;
                         }
                     }
                 }
