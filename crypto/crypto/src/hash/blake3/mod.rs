@@ -38,7 +38,7 @@
 //!
 //! 1. A z3-proved model of the compression dataflow
 //!    (`thoughts/blake3/blake3-chip/z3_blake_verify.py`).
-//! 2. A Python oracle (`thoughts/blake3/blake3-oracle/blake3_ref.py`) whose
+//! 2. A Python oracle (`tooling/blake3-second-source/blake3-oracle/blake3_ref.py`) whose
 //!    **7-round** instantiation is pinned against the official `blake3` crate's
 //!    published test vectors — so the oracle's G-function, message schedule,
 //!    counter split and feed-forward are all externally validated; only the

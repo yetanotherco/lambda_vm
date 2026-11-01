@@ -717,7 +717,7 @@ pub const CHAIN_KAT_LENS: [usize; 12] = [0, 1, 31, 63, 64, 65, 127, 128, 192, 25
 /// `t >= 2^32`, does that. Neither table is redundant with the other.
 ///
 /// Every entry from length 0 to 1024 was **independently reproduced** by #903's
-/// Python oracle (`thoughts/blake3/blake3-oracle/blake3_ref.py`) evaluated at
+/// Python oracle (`tooling/blake3-second-source/blake3-oracle/blake3_ref.py`) evaluated at
 /// `rounds = 6`, on 2026-08-14. That oracle is a full standard-BLAKE3
 /// implementation with the round count as a parameter, written by another author
 /// for a different purpose, and at `rounds = 7` it reproduces the official
@@ -733,7 +733,7 @@ pub const CHAIN_KAT_LENS: [usize; 12] = [0, 1, 31, 63, 64, 65, 127, 128, 192, 25
 /// what the oracle is.
 ///
 /// Everything that cross-check needs is tracked, so it is reproducible rather
-/// than merely recorded. `thoughts/blake3/blake3-oracle/` holds the
+/// than merely recorded. `tooling/blake3-second-source/blake3-oracle/` holds the
 /// round-parameterized reference (`blake3_ref.py`, vendored at commit
 /// `65025095`), which exposes raw compression entry points — `compress`,
 /// `compress_cv`, `compress_6round` — as well as `blake3_hash`, alongside
@@ -741,7 +741,7 @@ pub const CHAIN_KAT_LENS: [usize; 12] = [0, 1, 31, 63, 64, 65, 127, 128, 192, 25
 /// `test_oracle.py`.
 ///
 /// A **second source** sits beside it, and it is the stronger of the two:
-/// `thoughts/blake3/reference-impl/` is upstream BLAKE3 1.8.5's own portable C
+/// `tooling/blake3-second-source/reference-impl/` is upstream BLAKE3 1.8.5's own portable C
 /// with its round loop parameterized, the whole edit being
 /// `PARAMETERISATION.diff`. It reproduces this table at 6 rounds over every
 /// length up to one chunk, and it encodes the message schedule as an indexed

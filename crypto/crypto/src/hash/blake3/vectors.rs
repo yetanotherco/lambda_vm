@@ -18,7 +18,7 @@ pub struct Vector {
 }
 
 /// The 10 canonical 6-round vectors, transcribed verbatim from #903's
-/// `thoughts/blake3/blake3-oracle/canonical_6round_vectors.json` (head
+/// `tooling/blake3-second-source/blake3-oracle/canonical_6round_vectors.json` (head
 /// `89aeeb8c`). Seeds 0..9 of the oracle's generator; `t` is full-width, which
 /// matters — the counter-split order is load-bearing and was behaviourally
 /// verified against the official crate.
@@ -222,7 +222,7 @@ pub const CANONICAL_VECTORS: [Vector; 10] = [
 /// emitted by the gate-oracle's independently-written Python reference
 /// (`thoughts/shared/lfm-real-hash/gate-oracle/blake3_oracle.py`) at
 /// `rounds = 7` and cross-checked word-for-word against the second in-repo
-/// reference (`thoughts/blake3/blake3-oracle/blake3_ref.py`) — two
+/// reference (`tooling/blake3-second-source/blake3-oracle/blake3_ref.py`) — two
 /// implementations, agreeing on all ten. Both references' 7-round paths are
 /// themselves pinned by the OFFICIAL BLAKE3 test vectors, so unlike
 /// [`CANONICAL_VECTORS`] this table has an external anchor rather than one a

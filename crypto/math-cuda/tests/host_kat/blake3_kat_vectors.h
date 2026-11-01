@@ -14,7 +14,7 @@
 // ---------------------------------------------------------------------------
 // Table 1 — the OFFICIAL BLAKE3 test vectors, standard 7-round hash.
 //
-// Transcribed from `thoughts/blake3/blake3-oracle/official_test_vectors.json`
+// Transcribed from `tooling/blake3-second-source/blake3-oracle/official_test_vectors.json`
 // (tracked in this repo, sourced from the BLAKE3 reference implementation).
 // Only the cases with `input_len <= 64` appear: a message that fits one block
 // of one chunk is a SINGLE compression, which is what the device function
@@ -63,7 +63,7 @@ inline constexpr OfficialVector OFFICIAL_VECTORS[NUM_OFFICIAL_VECTORS] = {
 // redundant with Table 1 and must not be retired as "covered by the standard".
 //
 // ★ PROVENANCE, strengthened 2026-08-15 — the 6-round column is no longer
-// pinned by Python alone. `thoughts/blake3/reference-impl/` holds UPSTREAM
+// pinned by Python alone. `tooling/blake3-second-source/reference-impl/` holds UPSTREAM
 // BLAKE3 1.8.5 with a 2 KB reviewable diff (`PARAMETERISATION.diff`) whose only
 // functional edit replaces seven unrolled `round_fn` calls with a loop bounded
 // by `BLAKE3_ROUNDS_PARAM`. Built at both round counts and run over these ten
@@ -72,7 +72,7 @@ inline constexpr OfficialVector OFFICIAL_VECTORS[NUM_OFFICIAL_VECTORS] = {
 // the message schedule as an INDEXED TABLE (`MSG_SCHEDULE[r]`) rather than as an
 // in-place permutation between rounds — a structurally different expression of
 // the same convention, so its agreement cross-validates the schedule instead of
-// restating it. Rebuild with `thoughts/blake3/reference-impl/build.sh`: a ~1
+// restating it. Rebuild with `tooling/blake3-second-source/reference-impl/build.sh`: a ~1
 // second C compile, no cargo, no GPU.
 // ---------------------------------------------------------------------------
 struct CanonicalVector {
@@ -275,7 +275,7 @@ inline constexpr CanonicalVector CANONICAL_VECTORS[NUM_CANONICAL_VECTORS] = {
 // to 1024 the published hash is a direct known-answer test for the device
 // chain, with no oracle and no transcription of anything computed in this repo.
 //
-// Transcribed from `thoughts/blake3/blake3-oracle/official_test_vectors.json`
+// Transcribed from `tooling/blake3-second-source/blake3-oracle/official_test_vectors.json`
 // (tracked), first 32 bytes of each case's `hash`. Input for length N is the
 // first N bytes of the repeating 251-byte sequence 0, 1, ..., 250 — the same
 // generator Table 1 uses.
@@ -326,7 +326,7 @@ inline constexpr ChainVector CHAIN_VECTORS[NUM_CHAIN_VECTORS] = {
 //
 // Provenance, and why it is worth more than a self-comparison: those digests
 // were produced by #903's Python oracle
-// (`thoughts/blake3/blake3-oracle/blake3_ref.py`, tracked), a full
+// (`tooling/blake3-second-source/blake3-oracle/blake3_ref.py`, tracked), a full
 // standard-BLAKE3 implementation with the round count as a parameter, whose
 // 7-round arm reproduces the official package bit-for-bit. So at the round count
 // the campaign actually ships, this pins the device chain against numbers no

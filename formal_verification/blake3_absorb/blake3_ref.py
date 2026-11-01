@@ -10,7 +10,7 @@ Anchors (see `test_ref.py`):
   * the constants below against the BLAKE3 spec's IV (= SHA-256's) and the
     published message permutation;
   * `compress(..., rounds=7)` against the official BLAKE3 test vectors;
-  * `compress(..., rounds=6)` against `thoughts/blake3/blake3-oracle/`'s
+  * `compress(..., rounds=6)` against `tooling/blake3-second-source/blake3-oracle/`'s
     recorded canonical vectors, which the executor's own primitive reproduces.
 
 ⚠ The chip implements the 6-ROUND internal variant, not standard 7-round

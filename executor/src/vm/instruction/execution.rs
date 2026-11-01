@@ -1593,12 +1593,12 @@ pub fn keccak_f1600(state: &mut [u64; 25]) {
 // BLAKE3 6-round compression (internal variant)
 // =============================================================================
 //
-// A Rust port of the validated oracle `thoughts/blake3/blake3-oracle/blake3_ref.py`
+// A Rust port of the validated oracle `tooling/blake3-second-source/blake3-oracle/blake3_ref.py`
 // with `rounds = 6` fixed. This is the **6-round internal variant** — NOT
 // standard BLAKE3 (7 rounds); its security rests on the named 6-round
 // assumption recorded in `thoughts/blake3/blake3-chip/DESIGN.md`. Differentially
 // tested against the oracle's canonical 6-round vectors (pinned in
-// `thoughts/blake3/blake3-oracle/canonical_6round_vectors.json`, themselves
+// `tooling/blake3-second-source/blake3-oracle/canonical_6round_vectors.json`, themselves
 // validated against the official `blake3` crate).
 
 /// The BLAKE3 IV (identical to SHA-256's initial state). `IV[0..4]` seeds

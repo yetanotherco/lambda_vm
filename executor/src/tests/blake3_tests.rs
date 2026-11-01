@@ -1,6 +1,6 @@
 //! Tests for the BLAKE3 6-round compression and its accelerator syscall.
 //!
-//! Ground truth is the validated oracle (`thoughts/blake3/blake3-oracle/`):
+//! Ground truth is the validated oracle (`tooling/blake3-second-source/blake3-oracle/`):
 //! the pinned canonical 6-round vectors below were emitted by its harness and
 //! checked against the official `blake3` crate at the official test-vector
 //! parameters. The `t` values exercise the full 64-bit counter range, pinning
@@ -25,7 +25,7 @@ struct Blake3Vector {
 }
 
 /// The 10 canonical 6-round vectors, generated from
-/// `thoughts/blake3/blake3-oracle/canonical_6round_vectors.json` (which the
+/// `tooling/blake3-second-source/blake3-oracle/canonical_6round_vectors.json` (which the
 /// oracle harness regenerates and which was validated against the official
 /// `blake3` crate). Do not edit by hand.
 const CANONICAL_6ROUND_VECTORS: &[Blake3Vector] = &[

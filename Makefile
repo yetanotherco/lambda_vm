@@ -764,7 +764,7 @@ test-fill-host-kat:
 #
 # `test-blake3-host-kat` checks the KERNEL against the committed tables. This
 # checks the TABLES, against upstream BLAKE3's own portable C with its round loop
-# parameterised (`thoughts/blake3/reference-impl/`, a 2 KB reviewable diff in
+# parameterised (`tooling/blake3-second-source/reference-impl/`, a 2 KB reviewable diff in
 # PARAMETERISATION.diff). That reference is a different language and author and —
 # the part that matters — a different message-schedule CONSTRUCTION: it indexes a
 # precomputed MSG_SCHEDULE table where our Rust and CUDA compose one permutation
@@ -780,8 +780,8 @@ test-fill-host-kat:
 # 2026-08-15, because nothing ever ran this: it had no target. That is why it has
 # one now. A ~1 second C compile plus a few seconds of Python; no cargo, no GPU.
 test-blake3-second-source:
-	thoughts/blake3/reference-impl/build.sh
-	python3 thoughts/blake3/reference-impl/check.py
+	tooling/blake3-second-source/reference-impl/build.sh
+	python3 tooling/blake3-second-source/reference-impl/check.py
 
 # z3/SMT gate for the BLAKE3 chained-absorb mode's row-local constraints: the
 # compression equivalence under the absorb framing, the flags schedule, the mode

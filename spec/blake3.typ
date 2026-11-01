@@ -30,7 +30,7 @@ on these digests. Standard library implementations (e.g. the official
 the host-side reference implementation lives in
 `executor/src/vm/instruction/execution.rs` (`blake3_compress_6round`),
 differentially pinned to the validated oracle in
-`thoughts/blake3/blake3-oracle/`.
+`tooling/blake3-second-source/blake3-oracle/`.
 
 = ECALL interface
 

@@ -1,7 +1,7 @@
 """
 SECOND-SOURCE validation of the 6-round BLAKE3 vectors.
 
-Source 1 is `thoughts/blake3/blake3-oracle/blake3_ref.py` -- an in-repo Python
+Source 1 is `tooling/blake3-second-source/blake3-oracle/blake3_ref.py` -- an in-repo Python
 oracle written from the spec, anchored on the official vectors at 7 rounds.
 Source 2 is upstream BLAKE3's own portable C implementation (crate `blake3`
 1.8.5, `c/blake3_portable.c`) with its round loop parameterised; see

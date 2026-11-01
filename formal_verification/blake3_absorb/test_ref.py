@@ -8,7 +8,7 @@ from the circuit proves only that the circuit equals itself. So:
      SHA-256's, i.e. the fractional parts of the square roots of the first 8
      primes; the permutation is the published one);
   2. `compress(rounds=7)` — standard BLAKE3 — is checked against the OFFICIAL
-     BLAKE3 test vectors carried in `thoughts/blake3/blake3-oracle/`;
+     BLAKE3 test vectors carried in `tooling/blake3-second-source/blake3-oracle/`;
   3. `compress(rounds=6)` — the chip's variant — is checked against the
      recorded canonical vectors in the same place, which the executor's own
      `blake3_compress_6round` reproduces;
@@ -24,7 +24,7 @@ import sys
 import blake3_ref as ref
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ORACLE = os.path.join(HERE, "..", "..", "thoughts", "blake3", "blake3-oracle")
+ORACLE = os.path.join(HERE, "..", "..", "tooling", "blake3-second-source", "blake3-oracle")
 
 
 def check(name, cond):
@@ -75,7 +75,7 @@ def main():
                     good == len(vecs))
     else:
         print(f"  ?? canonical_6round_vectors.json not found at {path} — SKIPPED")
-        print("     (the oracle rides `thoughts/blake3/`, which is not on main)")
+        print("     (the oracle lives in `tooling/blake3-second-source/blake3-oracle/`)")
 
     # --- 7-round official vectors (standard BLAKE3) -----------------------
     path = os.path.join(ORACLE, "official_test_vectors.json")
