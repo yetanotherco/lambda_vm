@@ -1097,6 +1097,9 @@ fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
 /// `poc_rodata_commit.elf` differs by the assembler that made it, so the
 /// pins are taken over a checked-in copy of it: the same bytes on every
 /// machine.
+///
+/// The pins move with any AIR whose constraint leg a leaf emits: last moved by
+/// KECCAK's sponge mode (Keccak-256 of a buffer) and its round-chip tokens.
 #[test]
 fn the_median_mix_leaves_are_pinned_under_each_query_check() {
     use super::whir_chain::LeafQuery;
@@ -1105,14 +1108,14 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
         (
             LeafQuery::V1,
             5,
-            "025e32814fca1a4f58a524e626419528928c32b2432ef6aefb099ff7abf4d496",
-            "ea6275383208414048093b2ae193f400dd0d566e4f342da8b2f28f1209e84d67",
+            "0598ce0405b97d2c65b1949ed42db7c56108b306b15ac5c119c6b8c4e03458e1",
+            "d8eab85eb12582d3887c8cbba742219fe3cf5fc4df25500de8235f92a7150b0a",
         ),
         (
             LeafQuery::Lean,
             5,
-            "e32ea8856b351fd7633b55fa4b8d4f8d9078f6be6ef33eb8f1ec7e6d659d1f6b",
-            "00dab05204f1b9279977b36e2e29954be3b330e921fad607c73c20bff6278d90",
+            "d291acde8b5b38eabc3e7ebc4325703776cccc33c02ec5127a884ead03b81b85",
+            "d01070d7aaf46179239fca11b34aca305cb6c059187343d93c7da29fc33ff0f9",
         ),
     ];
     let elf_bytes: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
@@ -1126,13 +1129,21 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
         }
     };
     let owned = median_statement(elf_bytes, &opts, &at(LeafQuery::V1));
-    for (query, leaves, first, last) in PINS {
-        let plan = WhirBlockPlan::derive(elf_bytes, &opts, &at(query), owned.view(), None)
-            .expect("the plan derives");
-        let n = plan.partition().num_leaves();
-        let digest = |k: usize| program_digest(&plan.leaf_program(k).expect("the leaf emits"));
-        let (d_first, d_last) = (digest(0), digest(n - 1));
-        println!("LEAF PINS {query:?}: {n} leaves · first {d_first} · last {d_last}");
+    // Every value measured and printed before any is compared, so one run shows
+    // all of them when the leaves move.
+    let measured: Vec<(usize, String, String)> = PINS
+        .iter()
+        .map(|&(query, ..)| {
+            let plan = WhirBlockPlan::derive(elf_bytes, &opts, &at(query), owned.view(), None)
+                .expect("the plan derives");
+            let n = plan.partition().num_leaves();
+            let digest = |k: usize| program_digest(&plan.leaf_program(k).expect("the leaf emits"));
+            let (d_first, d_last) = (digest(0), digest(n - 1));
+            println!("LEAF PINS {query:?}: {n} leaves · first {d_first} · last {d_last}");
+            (n, d_first, d_last)
+        })
+        .collect();
+    for ((query, leaves, first, last), (n, d_first, d_last)) in PINS.iter().zip(&measured) {
         assert_eq!(n, leaves, "{query:?}: leaves");
         assert_eq!(d_first, first, "{query:?}: the first leaf's program");
         assert_eq!(d_last, last, "{query:?}: the last leaf's program");
