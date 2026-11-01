@@ -106,6 +106,17 @@ impl BaseFormat {
         hash: crate::config::CommitmentHash::Poseidon1,
         arity4_cap: CapPolicy::Fixed(2),
     };
+
+    /// Standard 7-round BLAKE3 over binary trees (the format's binary cap
+    /// applies; no 4-ary cap): the base proof's BLAKE3 arm (D-B3HYB S3),
+    /// `multilinear::whir_hash::Blake3Whir`. The hash is named
+    /// [`CommitmentHash::Blake3`](crate::config::CommitmentHash::Blake3); its
+    /// round count is the configuration's (7), not the build's. Admitted only
+    /// to a base proved with no recursion over it.
+    pub const B3_WHIR: Self = Self {
+        hash: crate::config::CommitmentHash::Blake3,
+        arity4_cap: CapPolicy::Off,
+    };
 }
 
 impl Default for BaseFormat {

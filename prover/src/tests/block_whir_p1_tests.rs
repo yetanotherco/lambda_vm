@@ -308,11 +308,20 @@ fn no_environment_read_decides_the_base() {
         0,
         "every block dispatch is on the format's base"
     );
+    // The base's own prove and verify sites dispatch through `with_base_hash!`
+    // (the family's base, or the base-only BLAKE3 base), none through the
+    // environment.
+    assert_eq!(
+        block
+            .matches("crate::with_base_hash!(format.zf.base")
+            .count(),
+        3
+    );
     assert_eq!(
         block
             .matches("crate::with_block_hash!(format.zf.base")
             .count(),
-        3
+        0
     );
     let check = &block[block.find("pub fn checked_base").expect("checked_base")..];
     let check = &check[..check.find("\n}\n").expect("its end")];
@@ -328,10 +337,26 @@ fn no_environment_read_decides_the_base() {
             && arms.contains("type $h = $crate::hash_pin::BlockWhirHash;"),
         "the macro checks the base and binds the family's configuration"
     );
+    let base_arms = &knob[knob
+        .find("macro_rules! with_base_hash")
+        .expect("the base's macro")..];
+    let base_arms = &base_arms[..base_arms.find("\n}\n").expect("its end")];
+    assert!(
+        base_arms.contains("checked_base_only(&$base)?")
+            && base_arms.contains("type $h = multilinear::whir_hash::Blake3Whir;")
+            && base_arms.contains("$crate::with_block_hash!($base, |$h| $body)"),
+        "the base's macro admits BLAKE3 through the base-only check and else is the family's"
+    );
+    let only = &block[block
+        .find("pub fn checked_base_only")
+        .expect("checked_base_only")..];
+    let only = &only[..only.find("\n}\n").expect("its end")];
     for (name, source) in [
         ("checked_base", check),
+        ("checked_base_only", only),
         ("the tag", tag),
         ("the macro's arms", arms),
+        ("the base's macro's arms", base_arms),
     ] {
         for read in [
             "std::env",
