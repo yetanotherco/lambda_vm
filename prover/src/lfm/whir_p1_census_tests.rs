@@ -1100,7 +1100,8 @@ fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
 /// machine.
 ///
 /// The pins move with any AIR whose constraint leg a leaf emits: last moved by
-/// KECCAK's sponge mode (Keccak-256 of a buffer) and its round-chip tokens.
+/// the ECREC table and the 23-count statement, after KECCAK's sponge mode
+/// (Keccak-256 of a buffer) and its round-chip tokens.
 #[test]
 fn the_median_mix_leaves_are_pinned_under_each_query_check() {
     use super::whir_chain::LeafQuery;
@@ -1109,14 +1110,14 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
         (
             LeafQuery::V1,
             5,
-            "0598ce0405b97d2c65b1949ed42db7c56108b306b15ac5c119c6b8c4e03458e1",
-            "d8eab85eb12582d3887c8cbba742219fe3cf5fc4df25500de8235f92a7150b0a",
+            "07f558619e111cca75018ac12c244fb6b0319e60eb8bf36695119b71a66fdc11",
+            "93fcbcf64a9fb55c08bb75dd27c7241aef553bf875b678a358050398c8663340",
         ),
         (
             LeafQuery::Lean,
             5,
-            "d291acde8b5b38eabc3e7ebc4325703776cccc33c02ec5127a884ead03b81b85",
-            "d01070d7aaf46179239fca11b34aca305cb6c059187343d93c7da29fc33ff0f9",
+            "3f94f9beb7a983b88c3873b0f137f197ef00b07e797978d2da3f9e6b2cbf4a78",
+            "207745f8b67e3bd04f4ad051dc35194b4376facffe12d3869f6ae979b7ea0017",
         ),
     ];
     let elf_bytes: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
