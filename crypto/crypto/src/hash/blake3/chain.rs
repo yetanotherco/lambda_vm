@@ -682,6 +682,76 @@ impl FixedOutputReset for Blake3Chain {
     }
 }
 
+/// ★ [`Blake3Chain`] pinned at **7 rounds** — standard BLAKE3 — whatever the
+/// build's `blake3-6round` feature says.
+///
+/// The crate-global [`BLAKE3_ROUNDS`] is 6 in a default build: it is the round
+/// count of the STARK pipeline's commitments and of the `LFM_BLAKE3` chip, and
+/// it rests on the unratified assumption A6R. A configuration that must be
+/// standard BLAKE3 in every build (the WHIR base proof's BLAKE3 arm,
+/// `multilinear::whir_hash::Blake3Whir`) names this type instead, so no feature
+/// can move its rounds: `Digest::new` here is `Blake3Chain::with_rounds(7)`,
+/// and so is every reset.
+///
+/// For a message of at most 1024 bytes it is `blake3::hash`
+/// (`blake3_std_is_the_blake3_crate`). Past one chunk it keeps the chain's own
+/// framing (one chunk that never ends), as [`Blake3Chain`] does.
+///
+/// On a guest with the 6-round accelerator it takes the software path: the
+/// dispatch in `compress_block` sends every count but the crate-global one
+/// there, so the accelerator never answers a 7-round compression.
+#[derive(Clone)]
+pub struct Blake3Std(Blake3Chain);
+
+impl Default for Blake3Std {
+    fn default() -> Self {
+        Self(Blake3Chain::with_rounds(super::BLAKE3_STANDARD_ROUNDS))
+    }
+}
+
+impl Blake3Std {
+    /// A fresh 7-round hasher.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The 32-byte digest of the message absorbed so far.
+    pub fn finalize_digest(&self) -> [u8; 32] {
+        self.0.finalize_digest()
+    }
+}
+
+impl HashMarker for Blake3Std {}
+
+impl OutputSizeUser for Blake3Std {
+    type OutputSize = digest::typenum::U32;
+}
+
+impl Update for Blake3Std {
+    fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+}
+
+impl FixedOutput for Blake3Std {
+    fn finalize_into(self, out: &mut Output<Self>) {
+        out.copy_from_slice(&self.0.finalize_digest());
+    }
+}
+
+impl Reset for Blake3Std {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+impl FixedOutputReset for Blake3Std {
+    fn finalize_into_reset(&mut self, out: &mut Output<Self>) {
+        out.copy_from_slice(&self.0.finalize_digest());
+        Reset::reset(self);
+    }
+}
+
 /// The message the KAT table is taken over, at a given length.
 ///
 /// Byte `i` is `37i + 11 (mod 256)`: every length is a different message, no
@@ -908,6 +978,33 @@ mod tests {
                 "the 7-round chain must equal the blake3 crate at length {len}"
             );
         }
+    }
+
+    /// ★ [`Blake3Std`] is the `blake3` crate up to one chunk in EVERY build —
+    /// the default one (6-round `BLAKE3_ROUNDS`) included — through the
+    /// `Digest` interface its users call, a reset included.
+    #[test]
+    fn blake3_std_is_the_blake3_crate() {
+        use digest::Digest;
+        let mut reused = <Blake3Std as Digest>::new();
+        for len in [0usize, 1, 31, 40, 41, 63, 64, 65, 128, 384, 512, 1024] {
+            let msg = message(len);
+            let want = *blake3::hash(&msg).as_bytes();
+            let got: [u8; 32] = <Blake3Std as Digest>::digest(&msg).into();
+            assert_eq!(got, want, "one-shot, length {len}");
+            Digest::update(&mut reused, &msg);
+            let again: [u8; 32] = reused.finalize_reset().into();
+            assert_eq!(again, want, "after a reset, length {len}");
+        }
+        // Its parent is the 7-round parent, not the build's.
+        let (l, r) = ([3u8; 32], [9u8; 32]);
+        let mut parent = Blake3Std::new();
+        Digest::update(&mut parent, l);
+        Digest::update(&mut parent, r);
+        assert_eq!(
+            parent.finalize_digest(),
+            blake3_parent_rounds(&l, &r, BLAKE3_STANDARD_ROUNDS)
+        );
     }
 
     /// NEGATIVE CONTROL for the anchor: at 6 rounds it must not match, or the

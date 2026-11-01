@@ -205,6 +205,17 @@ pub fn gpu_grind_calls_p1() -> u64 {
     GPU_GRIND_CALLS_P1.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// The same for the 7-round BLAKE3, counted apart for the reason the RPX
+/// counter is.
+#[cfg(feature = "cuda")]
+static GPU_GRIND_CALLS_B3: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Successful 7-round BLAKE3 device grinds.
+#[cfg(feature = "cuda")]
+pub fn gpu_grind_calls_b3() -> u64 {
+    GPU_GRIND_CALLS_B3.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Zeroes BOTH counters — a measuring caller resets once and reads both, so an
 /// arm cannot inherit the previous arm's count.
 #[cfg(feature = "cuda")]
@@ -212,6 +223,7 @@ pub fn reset_gpu_grind_calls() {
     GPU_GRIND_CALLS.store(0, core::sync::atomic::Ordering::Relaxed);
     GPU_GRIND_CALLS_RPX.store(0, core::sync::atomic::Ordering::Relaxed);
     GPU_GRIND_CALLS_P1.store(0, core::sync::atomic::Ordering::Relaxed);
+    GPU_GRIND_CALLS_B3.store(0, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Which device grind kernel a digest takes, if it has one.
@@ -229,6 +241,9 @@ pub enum DeviceGrindKey {
     /// `math_cuda::grinding::generate_nonce_p1_gpu`, big-endian felts (ZisK's
     /// width-8 Poseidon1, `p1/*` exploration branch).
     Poseidon1,
+    /// `math_cuda::grinding::generate_nonce_blake3_gpu`, little-endian lanes
+    /// (standard 7-round BLAKE3, [`crate::hash::blake3::Blake3Std`]).
+    Blake3Std,
 }
 
 /// ★ A grinding digest, and the device arm it takes — stated BY THE DIGEST.
@@ -263,6 +278,14 @@ impl GrindDigest for crate::hash::platform_keccak::PlatformKeccak256 {
 
 impl GrindDigest for crate::hash::rpx::Rpx256Digest {
     const DEVICE_GRIND: Option<DeviceGrindKey> = Some(DeviceGrindKey::Rpx256);
+}
+
+/// ★ The 7-round BLAKE3 has a nonce search on the card
+/// (`math_cuda::grinding::generate_nonce_blake3_gpu`). The build's
+/// [`Blake3Chain`](crate::hash::blake3::chain::Blake3Chain) below does not:
+/// that kernel is compiled at 7 rounds only.
+impl GrindDigest for crate::hash::blake3::chain::Blake3Std {
+    const DEVICE_GRIND: Option<DeviceGrindKey> = Some(DeviceGrindKey::Blake3Std);
 }
 
 impl GrindDigest for crate::hash::blake3::chain::Blake3Chain {
@@ -337,6 +360,10 @@ where
             &inner_hash_felts::<D>(seed, grinding_factor),
             grinding_factor,
         ),
+        DeviceGrindKey::Blake3Std => math_cuda::grinding::generate_nonce_blake3_gpu(
+            &inner_hash_lanes::<D>(seed, grinding_factor),
+            grinding_factor,
+        ),
     };
 
     if let Some(nonce) = found {
@@ -355,6 +382,9 @@ where
                 }
                 DeviceGrindKey::Poseidon1 => {
                     GPU_GRIND_CALLS_P1.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                }
+                DeviceGrindKey::Blake3Std => {
+                    GPU_GRIND_CALLS_B3.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
                 }
             };
             return Some(nonce);
