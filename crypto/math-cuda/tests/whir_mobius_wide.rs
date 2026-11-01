@@ -41,21 +41,43 @@ fn words(seed: u64, n: usize) -> Vec<u64> {
 }
 
 /// A stack of `2^l` words as parts `(column, offset)`: a half, an eighth,
-/// a ragged 1,000 words at an odd offset, a 5-word stub near the end, and
-/// gaps of padding between them.
+/// a ragged run (1,000 words, or less on a small stack) at an odd offset, a
+/// 5-word stub near the end, and gaps of padding between them. Checked to fit:
+/// a layout that overruns is the test's own fault, and it must say so rather
+/// than panic inside a copy.
 fn layout(l: usize) -> Vec<(Vec<u64>, usize)> {
     let n = 1usize << l;
-    vec![
+    let ragged = 1000.min(n / 4 - 32);
+    let parts = vec![
         (words(1, n / 2), 0),
         (words(2, n / 8), n / 2),
-        (words(3, 1000), n / 2 + n / 8 + 17),
+        (words(3, ragged), n / 2 + n / 8 + 17),
         (words(4, 5), n - 9),
-    ]
+    ];
+    let mut end = 0;
+    for (k, (c, o)) in parts.iter().enumerate() {
+        assert!(
+            *o >= end && o + c.len() <= n,
+            "2^{l}: the test's part {k} ({} words at {o}) overlaps or overruns the stack",
+            c.len()
+        );
+        end = o + c.len();
+    }
+    parts
+}
+
+/// An encode's codeword read back, a named failure if either step fails.
+fn read(what: &str, cw: math_cuda::Result<math_cuda::whir::DeviceCodeword>) -> Vec<u64> {
+    cw.unwrap_or_else(|e| panic!("{what}: the encode failed: {e:?}"))
+        .to_host()
+        .unwrap_or_else(|e| panic!("{what}: the read-back failed: {e:?}"))
 }
 
 /// ★ Every source a commit takes, at stacks of 2^11 (one contiguous pass) to
 /// 2^22 (both strided passes, one short): the wide transform's codeword is
-/// today's, word for word, and the device sources took the gather.
+/// today's, word for word, and the device sources took the gather. Every
+/// comparison prints its `WHIR MOBIUS WIDE … PARITY` line before it asserts,
+/// so the box read-out counts the compares that ran.
 #[test]
 fn the_wide_mobius_encodes_todays_codeword() {
     for l in [11usize, 12, 13, 19, 20, 22] {
@@ -63,17 +85,21 @@ fn the_wide_mobius_encodes_todays_codeword() {
         // A host source: the wide transform, no gather.
         let host: Vec<(&[u64], usize)> = parts.iter().map(|(c, o)| (c.as_slice(), *o)).collect();
         let today = with_mobius_wide(false, || {
-            encode_codeword_parts(&host, l, 1, false)
-                .unwrap()
-                .to_host()
-                .unwrap()
+            read(
+                "today's host encode",
+                encode_codeword_parts(&host, l, 1, false),
+            )
         });
         let wide = with_mobius_wide(true, || {
-            encode_codeword_parts(&host, l, 1, false)
-                .unwrap()
-                .to_host()
-                .unwrap()
+            read(
+                "the wide host encode",
+                encode_codeword_parts(&host, l, 1, false),
+            )
         });
+        println!(
+            "WHIR MOBIUS WIDE SMALL PARITY: 2^{l} · host · equal={}",
+            today == wide
+        );
         assert_eq!(
             today, wide,
             "2^{l}: host parts differ under the wide transform"
@@ -89,22 +115,24 @@ fn the_wide_mobius_encodes_todays_codeword() {
             .collect();
         let before = mobius_wide_gathers();
         let wide = with_mobius_wide(true, || {
-            encode_codeword_resident(&store, &at, l, 1, false)
-                .unwrap()
-                .to_host()
-                .unwrap()
+            read(
+                "the wide resident encode",
+                encode_codeword_resident(&store, &at, l, 1, false),
+            )
         });
-        assert_eq!(
-            mobius_wide_gathers(),
-            before + 1,
-            "2^{l}: the resident source was not gathered"
-        );
+        let gathered = mobius_wide_gathers() == before + 1;
         let today_r = with_mobius_wide(false, || {
-            encode_codeword_resident(&store, &at, l, 1, false)
-                .unwrap()
-                .to_host()
-                .unwrap()
+            read(
+                "today's resident encode",
+                encode_codeword_resident(&store, &at, l, 1, false),
+            )
         });
+        println!(
+            "WHIR MOBIUS WIDE SMALL PARITY: 2^{l} · resident · equal={} gathered={gathered} today_equal={}",
+            wide == today,
+            today_r == today
+        );
+        assert!(gathered, "2^{l}: the resident source was not gathered");
         assert_eq!(
             today_r, today,
             "2^{l}: the resident and host sources differ today"
@@ -112,7 +140,7 @@ fn the_wide_mobius_encodes_todays_codeword() {
         assert_eq!(wide, today, "2^{l}: the gathered resident source differs");
 
         // A buffer's slices, out of order in the list: gathered.
-        let be = math_cuda::device::backend().unwrap();
+        let be = math_cuda::device::backend().expect("a GPU");
         let stream = be.next_stream();
         let mut flat = Vec::new();
         let mut slices = Vec::new();
@@ -120,44 +148,54 @@ fn the_wide_mobius_encodes_todays_codeword() {
             slices.push((flat.len(), c.len(), *o));
             flat.extend_from_slice(c);
         }
-        let buffer = stream.clone_htod(&flat).unwrap();
-        stream.synchronize().unwrap();
+        let buffer = stream.clone_htod(&flat).expect("the slices' buffer");
+        stream.synchronize().expect("the slices' upload");
+        let before = mobius_wide_gathers();
         let wide = with_mobius_wide(true, || {
-            encode_codeword_slices(&buffer, &slices, l, 1, false)
-                .unwrap()
-                .to_host()
-                .unwrap()
+            read(
+                "the wide sliced encode",
+                encode_codeword_slices(&buffer, &slices, l, 1, false),
+            )
         });
+        let gathered = mobius_wide_gathers() == before + 1;
+        println!(
+            "WHIR MOBIUS WIDE SMALL PARITY: 2^{l} · slices · equal={} gathered={gathered}",
+            wide == today
+        );
+        assert!(gathered, "2^{l}: the sliced source was not gathered");
         assert_eq!(wide, today, "2^{l}: the gathered slices differ");
     }
 
     // A whole stack, committed: the same codeword gives the same root.
     let l = 16;
     let evals = words(9, 1 << l);
-    let (a, ra) = with_mobius_wide(false, || {
-        commit_codeword(&evals, 1, 6, true, math_cuda::DeviceHash::Poseidon1).unwrap()
-    });
-    let (b, rb) = with_mobius_wide(true, || {
-        commit_codeword(&evals, 1, 6, true, math_cuda::DeviceHash::Poseidon1).unwrap()
-    });
-    assert_eq!(
-        a.to_host().unwrap(),
-        b.to_host().unwrap(),
-        "a whole stack's codeword differs"
+    let commit = |what: &str, wide: bool, evals: &[u64]| {
+        with_mobius_wide(wide, || {
+            commit_codeword(evals, 1, 6, true, math_cuda::DeviceHash::Poseidon1)
+                .unwrap_or_else(|e| panic!("{what}: the commit failed: {e:?}"))
+        })
+    };
+    let (a, ra) = commit("today's whole commit", false, &evals);
+    let (b, rb) = commit("the wide whole commit", true, &evals);
+    let (wa, wb) = (
+        a.to_host().expect("read back"),
+        b.to_host().expect("read back"),
     );
+    println!(
+        "WHIR MOBIUS WIDE WHOLE PARITY: 2^{l} · equal={} root_equal={}",
+        wa == wb,
+        ra == rb
+    );
+    assert_eq!(wa, wb, "a whole stack's codeword differs");
     assert_eq!(ra, rb, "a whole stack's root differs");
 
     // The comparison can fail: one stack word moved moves the codeword.
     let mut moved = evals.clone();
     moved[12345] ^= 1;
-    let (c, _) = with_mobius_wide(true, || {
-        commit_codeword(&moved, 1, 6, true, math_cuda::DeviceHash::Poseidon1).unwrap()
-    });
-    assert_ne!(
-        c.to_host().unwrap(),
-        a.to_host().unwrap(),
-        "a moved word must move the codeword"
-    );
+    let (c, _) = commit("the wide moved commit", true, &moved);
+    let differs = c.to_host().expect("read back") != wa;
+    println!("WHIR MOBIUS WIDE MOVED WORD: differs={differs}");
+    assert!(differs, "a moved word must move the codeword");
 }
 
 /// The production shape's encode, timed: a resident stack of 2^27 (64 columns
@@ -216,10 +254,18 @@ fn the_wide_mobius_encode_at_the_production_shape() {
         let run = |wide: bool| {
             with_mobius_wide(wide, || {
                 let t = Instant::now();
-                let cw = encode_codeword_resident(&store, &at, l, 1, false).unwrap();
+                let before = mobius_wide_gathers();
+                let cw =
+                    encode_codeword_resident(&store, &at, l, 1, false).expect("a timed encode");
                 cw.synchronize().unwrap();
                 let ms = t.elapsed().as_secs_f64() * 1e3;
                 drop(cw);
+                // The wide arm took the gather and today's did not: the times are the lever's.
+                assert_eq!(
+                    mobius_wide_gathers() - before,
+                    u64::from(wide),
+                    "{label}: the gather count is not the arm's"
+                );
                 ms
             })
         };
