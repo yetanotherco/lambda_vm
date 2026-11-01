@@ -143,16 +143,3 @@ fn interaction_totals_are_nonzero_across_the_segment() {
     let total: usize = profile.airs.iter().map(|a| a.num_interactions).sum();
     assert!(total > 0, "captured no bus interactions at all");
 }
-
-/// Not an assertion — writes the real profile so it can be eyeballed against
-/// `max_rows` and handed to the replay runner. Run with `--ignored`.
-#[test]
-#[ignore]
-fn dump_profile_for_inspection() {
-    let profile = profile_for("sub");
-    // Never inside the repo: this is throwaway inspection output.
-    let path = std::env::temp_dir().join("lambda-vm-shape-profile-sub.jsonl");
-    let _ = std::fs::remove_file(&path);
-    crate::shape_profile::append_jsonl(&path, &profile).unwrap();
-    eprintln!("wrote {} AIRs to {}", profile.airs.len(), path.display());
-}

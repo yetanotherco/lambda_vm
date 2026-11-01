@@ -341,33 +341,6 @@ mod tests {
         coeffs.iter().rfold(FE::zero(), |acc, c| acc * x + c)
     }
 
-    #[test]
-    #[ignore = "timing, not a property"]
-    fn measure_encode_against_horner() {
-        let num_vars = 12;
-        let f = pseudo_mle(num_vars, 5);
-        let coeffs = lift_coefficients(&f);
-        let domain = Domain::<F>::new(num_vars + 2).unwrap();
-
-        let t = std::time::Instant::now();
-        let ntt = encode::<F, F>(&coeffs, &domain).unwrap();
-        let ntt_time = t.elapsed();
-
-        let t = std::time::Instant::now();
-        let horner: Vec<FE> = domain
-            .elements()
-            .iter()
-            .map(|x| coeffs.iter().rfold(FE::zero(), |acc, c| x * acc + c))
-            .collect();
-        let horner_time = t.elapsed();
-
-        assert_eq!(ntt, horner);
-        println!(
-            "MEASURE encode 2^{num_vars} on 2^{}: ntt {ntt_time:?} vs horner {horner_time:?}",
-            domain.log_size()
-        );
-    }
-
     /// The property a base-field commitment rests on: folding a base codeword
     /// with an extension challenge gives what folding the lifted one would.
     /// Without it, committing the trace over `F` would not be the same

@@ -166,22 +166,6 @@ fn the_device_grind_returns_the_smallest_valid_nonce() {
     }
 }
 
-/// ★ The microbenchmark (the box job reads its `BENCH` lines).
-#[test]
-#[ignore = "microbenchmark: a 2^29 codeword by default; run on the box with --ignored"]
-fn p1w16_microbench() {
-    let log_len: u32 = std::env::var("P1W16_LOG_LEN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(29);
-    let reps: u32 = std::env::var("P1W16_REPS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(7);
-    let lines = p1w16::microbench(log_len, reps, 1 << 28).expect("device");
-    assert!(lines.len() >= 10, "every arm printed");
-}
-
 // ---------------------------------------------------------------------------
 // ZisK's instance (stage P1): the kernels against `crypto::hash::poseidon1_stark`
 // and `crypto::hash::poseidon1_w8`, whose vectors come from ZisK's own code.
@@ -293,20 +277,4 @@ fn the_device_zisk_grind_returns_the_smallest_valid_nonce() {
             None
         );
     }
-}
-
-/// ★ Stage P1's microbenchmark (the box job reads its `BENCH` lines).
-#[test]
-#[ignore = "microbenchmark: a 2^29 buffer by default; run on the box with --ignored"]
-fn p1_zisk_microbench() {
-    let log_len: u32 = std::env::var("P1W16_LOG_LEN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(29);
-    let reps: u32 = std::env::var("P1W16_REPS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(7);
-    let lines = p1w16::microbench_zisk(log_len, reps, 1 << 28).expect("device");
-    assert!(lines.len() >= 25, "every arm printed: {}", lines.len());
 }

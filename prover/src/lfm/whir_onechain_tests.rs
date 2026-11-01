@@ -1409,38 +1409,6 @@ fn round_zero_caps_are_bound_per_tree_in_guest() {
     }
 }
 
-/// An instrument, asserting nothing: a digest of each case's emitted
-/// instruction stream and its arena length, at `Fault::None` with the step
-/// marks recording. Run once as is and once with the emitters' `cfg(test)`
-/// statements compiled out, as a release build compiles them: equal digests
-/// show the test build emits what a release build does (the code review found
-/// 24 of 24 equal).
-#[test]
-#[ignore = "instrument: prints digests to compare across two builds"]
-fn emitted_program_digests() {
-    use std::hash::{Hash, Hasher};
-    let mut all = cases();
-    all.push(rpx("one polynomial", &[6], 6, 8));
-    for case in all {
-        let mut f = build(&case, GroupFold::Indexed);
-        for group in [GroupFold::Indexed, GroupFold::PerPoly] {
-            if group == GroupFold::PerPoly {
-                f = build(&case, GroupFold::PerPoly);
-            }
-            let program = onechain_faults::with(onechain_faults::Fault::None, || program(&f));
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            format!("{:?}", program.instrs).hash(&mut h);
-            println!(
-                "ONECHAIN DIGEST [{} {group:?}] {} instructions {:016x} arena {}",
-                f.name,
-                program.instrs.len(),
-                h.finish(),
-                Arena::new(&f).total
-            );
-        }
-    }
-}
-
 /// The leg with its roots as PROGRAM CONSTANTS, as the block leaf's prepared
 /// branch wires them (`whir_block`: derived roots as `digest_const`, each chain
 /// its run's slice): tree `p` is checked against the constant of root

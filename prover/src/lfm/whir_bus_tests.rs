@@ -588,33 +588,6 @@ fn the_stress_bus_carries_what_the_production_one_does_not() {
     );
 }
 
-/// The whole leg, published once so its shape is on the record beside the
-/// numbers: what the bus statements cost per interaction on a real bus.
-#[test]
-fn the_bus_leg_prints_its_shape() {
-    for case in cases() {
-        let shapes = case.shapes();
-        let elements: usize = shapes.iter().map(|s| s.elements.len()).sum();
-        let terms: usize = shapes
-            .iter()
-            .map(|s| {
-                s.numerator.terms().len()
-                    + s.elements.iter().map(|e| e.terms().len()).sum::<usize>()
-            })
-            .sum();
-        let cost = claim_statements_cost(&shapes, case.num_row_vars);
-        println!(
-            "bus shape {}: I={} elements={elements} affine terms={terms} rows={} \
-             (ops {} + constants {})",
-            case.name,
-            shapes.len(),
-            cost.rows(),
-            cost.operations(),
-            cost.constants(),
-        );
-    }
-}
-
 /// ★ The row form recounted from the shapes, by a walk that is not
 /// `affine_cost`'s.
 ///

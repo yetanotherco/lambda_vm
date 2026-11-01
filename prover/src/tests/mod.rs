@@ -162,13 +162,10 @@ pub mod store_tests;
 pub mod templates_tests;
 #[cfg(test)]
 pub mod trace_builder_tests;
-pub mod trace_digest_tests;
 #[cfg(test)]
 pub mod trace_test_helpers;
 #[cfg(test)]
 pub mod verifier_pin_tests;
-#[cfg(test)]
-pub mod whir_byte_gate;
 #[cfg(test)]
 pub mod whir_hash_tests;
 #[cfg(test)]

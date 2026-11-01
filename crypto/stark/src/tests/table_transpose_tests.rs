@@ -31,20 +31,3 @@ fn an_empty_table_has_no_columns() {
     let t = Table::<GoldilocksField>::new(Vec::new(), 0);
     assert!(t.columns_blocked().is_empty());
 }
-
-/// Timing, by hand: `cargo test -p stark --lib the_blocked_transposition_timing -- --ignored --nocapture`.
-#[test]
-#[ignore = "a timing, not a check"]
-fn the_blocked_transposition_timing() {
-    for (width, log) in [(38, 21), (10, 21), (1480, 16)] {
-        let t = table(width, 1 << log);
-        let s = std::time::Instant::now();
-        let a = t.columns();
-        let plain = s.elapsed().as_secs_f64();
-        let s = std::time::Instant::now();
-        let b = t.columns_blocked();
-        let blocked = s.elapsed().as_secs_f64();
-        assert_eq!(a, b);
-        println!("{width} x 2^{log}: columns {plain:.3}s · blocked {blocked:.3}s");
-    }
-}

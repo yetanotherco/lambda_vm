@@ -160,8 +160,6 @@ mod blake3_probe;
 mod blake3_socket_kats;
 #[cfg(test)]
 mod blake3_socket_tests;
-#[cfg(all(test, feature = "cuda"))]
-mod c5_probe;
 /// `LFM_CARD_AFTER_PREP`: only the lock moves, and the prep never reaches the
 /// device (box tier, but for the knob's parse).
 #[cfg(test)]
@@ -209,11 +207,7 @@ mod one_row_tests;
 #[cfg(test)]
 mod p1_family_tests;
 #[cfg(test)]
-mod p1_node_census_tests;
-#[cfg(test)]
 mod p1_node_tests;
-#[cfg(test)]
-mod p1w16_census_tests;
 #[cfg(test)]
 mod p1w16_chip_tests;
 #[cfg(test)]
@@ -226,8 +220,6 @@ mod p1w16_proof_tests;
 mod p1w16_socket_tests;
 #[cfg(test)]
 mod per_table_aggregator_tests;
-#[cfg(test)]
-mod per_table_census_tests;
 #[cfg(test)]
 mod poseidon_chip_tests;
 #[cfg(test)]

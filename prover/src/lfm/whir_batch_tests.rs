@@ -659,36 +659,6 @@ fn the_production_cap_bins_the_fixture_once() {
     assert_eq!(plan_of(&layouts, bin_log_cells).bins, vec![vec![0, 1, 2]]);
 }
 
-/// A printing comparison, not a gate: the batched leg's rows and permutations
-/// against the per-table legs' (`table_verify_cost`, chained through one
-/// sponge) over the same three tables — the in-guest side of D-BATCH §5.2.
-#[test]
-fn the_batched_leg_against_the_per_table_legs() {
-    use super::whir_table::table_verify_cost;
-    for cap in [27u8, 0] {
-        with_run(
-            cap,
-            |_| {},
-            |run| {
-                let batched = batched_argue_cost(run.shapes, run.plan, SpongeEntry::fresh());
-                let mut entry = SpongeEntry::fresh();
-                let (mut rows, mut perms) = (0usize, 0usize);
-                for shape in run.shapes {
-                    let cost = table_verify_cost(shape, entry);
-                    rows += cost.rows();
-                    perms += cost.perms();
-                    entry = cost.entry();
-                }
-                println!(
-                    "batched leg cap={cap}: {} rows / {} perms; per-table legs {rows} rows / {perms} perms",
-                    batched.rows(),
-                    batched.perms()
-                );
-            },
-        );
-    }
-}
-
 // ─── The leaf's two asserts, each against a forgery only it refuses ──
 
 thread_local! {
