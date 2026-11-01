@@ -27,8 +27,9 @@ pub const DIGEST: usize = 4;
 
 /// The kernel variants the cubin instantiates, in `p1w16.cu`'s order: the two
 /// multiply variants and the Fourier-domain partial rounds of the circulant
-/// instance, then `c1`, the Grain Cauchy MDS alternative.
-pub const VARIANTS: [&str; 4] = ["v0", "v1", "v2", "c1"];
+/// instance, then `c1`, the Grain Cauchy MDS alternative, then `l2`, the
+/// Fourier form with leaner addition chains (the same permutation as `v2`).
+pub const VARIANTS: [&str; 5] = ["v0", "v1", "v2", "c1", "l2"];
 
 /// Is variant `v` the Cauchy alternative (a different permutation, checked
 /// against `permute_cauchy` on the host)?

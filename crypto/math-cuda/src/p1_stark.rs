@@ -71,30 +71,80 @@ pub struct Kernels {
     pub grind_w8: CudaFunction,
 }
 
-/// Load the kernels once.
+/// Whether the Poseidon1 kernels run the lean permutation
+/// (`LAMBDA_VM_P1_LEAN=1`): the `_lean` twins of the WHIR
+/// coset leaves, the column leaves and the 4-ary levels load in their twins'
+/// places, with the same bytes in the same slots. Read once, when the kernels
+/// first load; unset or anything but `1` is today's kernels.
+pub fn lean() -> bool {
+    static LEAN: OnceLock<bool> = OnceLock::new();
+    *LEAN.get_or_init(|| lean_setting(std::env::var("LAMBDA_VM_P1_LEAN").ok().as_deref()))
+}
+
+/// `LAMBDA_VM_P1_LEAN`'s value read: `1` is the lean twins, anything else
+/// (unset included) today's kernels.
+pub fn lean_setting(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1"))
+}
+
+/// Load the kernels once, under [`lean`].
 pub fn kernels() -> Result<&'static Kernels> {
     static KERNELS: OnceLock<Kernels> = OnceLock::new();
     if let Some(k) = KERNELS.get() {
         return Ok(k);
     }
+    let lean = lean();
+    let k = load_kernels(lean)?;
+    if lean {
+        eprintln!("[gpu] Poseidon1 kernels: the lean twins (LAMBDA_VM_P1_LEAN=1)");
+    }
+    Ok(KERNELS.get_or_init(|| k))
+}
+
+/// The kernel set, loaded afresh: the lean twins where they exist when `lean`,
+/// today's kernels otherwise. [`kernels`] caches one; the parity tests hold
+/// both.
+pub fn load_kernels(lean: bool) -> Result<Kernels> {
     let be = backend()?;
     let module = be.ctx.load_module(Ptx::from_binary(P1W16_CUBIN.to_vec()))?;
-    let k = Kernels {
-        leaves_cols_row: module.load_function("p1s_leaves_cols_row")?,
-        leaves_cols_pair: module.load_function("p1s_leaves_cols_pair")?,
+    let twin = |name: &str| {
+        if lean {
+            format!("{name}_lean")
+        } else {
+            name.to_string()
+        }
+    };
+    Ok(Kernels {
+        leaves_cols_row: module.load_function(&twin("p1s_leaves_cols_row"))?,
+        leaves_cols_pair: module.load_function(&twin("p1s_leaves_cols_pair"))?,
         leaves_rm_pair: module.load_function("p1s_leaves_rm_pair")?,
         leaves_rm_row: module.load_function("p1s_leaves_rm_row")?,
         fri_group_leaves: module.load_function("p1s_fri_group_leaves")?,
-        leaves_base_coset: module.load_function("p1s_leaves_base_coset")?,
-        leaves_base_coset_rev: module.load_function("p1s_leaves_base_coset_rev")?,
-        leaves_ext3_coset: module.load_function("p1s_leaves_ext3_coset")?,
-        merkle_level4: module.load_function("p1s_merkle_level4")?,
-        merkle_tail4: module.load_function("p1s_merkle_tail4")?,
+        leaves_base_coset: module.load_function(&twin("p1s_leaves_base_coset"))?,
+        leaves_base_coset_rev: module.load_function(&twin("p1s_leaves_base_coset_rev"))?,
+        leaves_ext3_coset: module.load_function(&twin("p1s_leaves_ext3_coset"))?,
+        merkle_level4: module.load_function(&twin("p1s_merkle_level4"))?,
+        merkle_tail4: module.load_function(&twin("p1s_merkle_tail4"))?,
         gather_paths4: module.load_function("p1s_gather_paths4")?,
         grind_w8: module.load_function("p1s_grind_w8")?,
         _module: module,
-    };
-    Ok(KERNELS.get_or_init(|| k))
+    })
+}
+
+#[cfg(test)]
+mod lean_setting_tests {
+    use super::lean_setting;
+
+    /// Today's kernels unless the knob says exactly `1`.
+    #[test]
+    fn the_lean_kernels_load_only_at_one() {
+        assert!(!lean_setting(None), "the default is today's kernels");
+        assert!(lean_setting(Some("1")));
+        assert!(lean_setting(Some(" 1 ")));
+        assert!(!lean_setting(Some("0")));
+        assert!(!lean_setting(Some("")));
+        assert!(!lean_setting(Some("on")), "only 1 opts in");
+    }
 }
 
 pub(crate) fn launch_cfg(threads: u64) -> LaunchConfig {

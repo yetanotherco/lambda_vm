@@ -520,6 +520,166 @@ static void run_stark_kernels() {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// LEAN (V = 4): the same permutation as V = 2 by leaner
+// addition chains. Its preconditions (every constant `add_c` adds is
+// canonical), then V = 4 against V = 2 over edge states and a raw-word sweep,
+// and the production `_lean` twins against today's kernels, byte for byte.
+// ---------------------------------------------------------------------------
+
+static const uint64_t P_MOD = 0xFFFFFFFF00000001ull;
+
+static uint64_t splitmix(uint64_t &z) {
+    z += 0x9E3779B97F4A7C15ull;
+    uint64_t x = z;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+static void run_lean() {
+    const int V = 4;
+    // add_c's precondition: the round constants and the Fourier constants it
+    // adds are canonical.
+    bool canon = true;
+    for (int r = 0; r < p1w16::ROUNDS; ++r)
+        for (int i = 0; i < 16; ++i) canon &= p1w16::RC[r][i] < P_MOD;
+    for (int k = 0; k < p1w16::PARTIAL; ++k)
+        for (int i = 0; i < 16; ++i) canon &= p1w16::FC[k][i] < P_MOD;
+    check(canon, "lean: RC and FC canonical (add_c's precondition)", V);
+
+    // The helpers against the field, on edge words: 0, 1, p−1, p, p+1, 2^64−2^32
+    // (= p−1), 2^64−2^32±1, 2^64−2, 2^64−1 (all ones), 2^63, 2^32, 2^32−1.
+    const uint64_t edge[] = {0ull, 1ull, P_MOD - 1, P_MOD, P_MOD + 1, 0xFFFFFFFF00000000ull,
+                             0xFFFFFFFEFFFFFFFFull, 0xFFFFFFFF00000002ull, ~0ull - 1, ~0ull,
+                             1ull << 63, 1ull << 32, 0xFFFFFFFFull, 0x8000000080000000ull};
+    const int ne = (int)(sizeof(edge) / sizeof(edge[0]));
+    auto modp = [](unsigned __int128 x) { return (uint64_t)(x % P_MOD); };
+    bool ok = true;
+    for (int a = 0; a < ne; ++a) {
+        // div16: 16·y ≡ x.
+        ok &= modp((unsigned __int128)p1w16::div16(edge[a]) * 16) == modp(edge[a]);
+        for (int b = 0; b < ne; ++b) {
+            const uint64_t c = edge[b] % P_MOD;  // add_c's c is canonical
+            ok &= modp(p1w16::add_c(edge[a], c)) == modp((unsigned __int128)edge[a] + c);
+            for (int d = 0; d < ne; ++d)
+                ok &= modp(p1w16::add3(edge[a], c, edge[d])) ==
+                      modp((unsigned __int128)edge[a] + c + edge[d]);
+        }
+    }
+    {
+        uint64_t s[16];
+        for (int pat = 0; pat < ne; ++pat) {
+            unsigned __int128 want = 0;
+            for (int i = 0; i < 16; ++i) {
+                s[i] = edge[(pat + i) % ne];
+                want += s[i];
+            }
+            ok &= modp(p1w16::sum16(s)) == modp(want);
+        }
+        for (int i = 0; i < 16; ++i) s[i] = ~0ull;  // all-ones lanes: 15 carries
+        ok &= modp(p1w16::sum16(s)) == modp((unsigned __int128)(~0ull) * 16);
+    }
+    {
+        uint64_t z = 0x1ea4;
+        for (int n = 0; n < 200000; ++n) {
+            const uint64_t a = splitmix(z), c = splitmix(z) % P_MOD, d = splitmix(z);
+            ok &= modp(p1w16::add_c(a, c)) == modp((unsigned __int128)a + c);
+            ok &= modp(p1w16::add3(a, c, d)) == modp((unsigned __int128)a + c + d);
+            ok &= modp((unsigned __int128)p1w16::div16(a) * 16) == modp(a);
+        }
+    }
+    check(ok, "lean: add_c, add3, sum16, div16 against the field (edge words + 200k raw)", V);
+
+    // The permutation: V = 4 = V = 2 on edge states (every lane one edge word;
+    // mixed edges; all-ones) and on raw-word states.
+    {
+        uint64_t in[64 * 16], o2[64 * 16], o4[64 * 16];
+        int n = 0;
+        for (int e = 0; e < ne; ++e, ++n)
+            for (int i = 0; i < 16; ++i) in[n * 16 + i] = edge[e];
+        for (int e = 0; e < ne; ++e, ++n)
+            for (int i = 0; i < 16; ++i) in[n * 16 + i] = edge[(e + i) % ne];
+        uint64_t z = 0x51de;
+        while (n < 64) {
+            for (int i = 0; i < 16; ++i) in[n * 16 + i] = splitmix(z);
+            ++n;
+        }
+        CUDA_HOST_FOR_EACH_THREAD(t, 64) permute_probe<2>(in, 64, o2);
+        CUDA_HOST_FOR_EACH_THREAD(t, 64) permute_probe<4>(in, 64, o4);
+        check(std::memcmp(o2, o4, sizeof(o2)) == 0, "lean permutation = v2 (edge + raw states)", V);
+        uint64_t z2 = 0xfeed;
+        bool all = true;
+        for (int rep = 0; rep < 64; ++rep) {
+            for (int k = 0; k < 64 * 16; ++k) in[k] = splitmix(z2);
+            CUDA_HOST_FOR_EACH_THREAD(t, 64) permute_probe<2>(in, 64, o2);
+            CUDA_HOST_FOR_EACH_THREAD(t, 64) permute_probe<4>(in, 64, o4);
+            all &= std::memcmp(o2, o4, sizeof(o2)) == 0;
+        }
+        check(all, "lean permutation = v2 (4096 raw states)", V);
+    }
+
+    // The production twins, byte for byte: coset leaves (both orders, ext3),
+    // column-row and row-pair leaves, and whole 4-ary trees (levels + tail).
+    {
+        const uint64_t block = 64, num_leaves = 16, leaf_bits = 4, n = block * num_leaves;
+        static uint64_t cw[64 * 16 * 3];
+        uint64_t z = 0xc0de;
+        for (uint64_t i = 0; i < 3 * n; ++i) cw[i] = (i % 7 == 0) ? edge[i % ne] : splitmix(z);
+        static uint8_t a[16 * 32], b[16 * 32];
+        CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) p1s_leaves_base_coset_rev(cw, num_leaves, block, leaf_bits, a);
+        CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) p1s_leaves_base_coset_rev_lean(cw, num_leaves, block, leaf_bits, b);
+        check(std::memcmp(a, b, sizeof(a)) == 0, "lean twin: coset leaves, coset order", V);
+        CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) p1s_leaves_base_coset(cw, num_leaves, block, a);
+        CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) p1s_leaves_base_coset_lean(cw, num_leaves, block, b);
+        check(std::memcmp(a, b, sizeof(a)) == 0, "lean twin: coset leaves, natural order", V);
+        CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) p1s_leaves_ext3_coset(cw, num_leaves, block, a);
+        CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) p1s_leaves_ext3_coset_lean(cw, num_leaves, block, b);
+        check(std::memcmp(a, b, sizeof(a)) == 0, "lean twin: ext3 coset leaves", V);
+        // 13 columns of 16 rows (log 4): 2 chained blocks plus a tail.
+        CUDA_HOST_FOR_EACH_THREAD(t, 16) p1s_leaves_cols_row(cw, 16, 13, 16, 4, a);
+        CUDA_HOST_FOR_EACH_THREAD(t, 16) p1s_leaves_cols_row_lean(cw, 16, 13, 16, 4, b);
+        check(std::memcmp(a, b, sizeof(a)) == 0, "lean twin: column-row leaves", V);
+        CUDA_HOST_FOR_EACH_THREAD(t, 8) p1s_leaves_cols_pair(cw, 16, 13, 16, 4, a);
+        CUDA_HOST_FOR_EACH_THREAD(t, 8) p1s_leaves_cols_pair_lean(cw, 16, 13, 16, 4, b);
+        check(std::memcmp(a, b, 8 * 32) == 0, "lean twin: row-pair leaves", V);
+        // Trees over 64 leaves (3 levels; a padded group at 23 leaves).
+        const uint64_t sizes[2] = {64, 23};
+        for (uint64_t leaves : sizes) {
+            const uint64_t total = tree_nodes4(leaves);
+            static uint8_t ta[128 * 32], tb[128 * 32];
+            std::memset(ta, 0, sizeof(ta));
+            for (uint64_t j = 0; j < leaves; ++j) {
+                uint64_t d[4] = {splitmix(z) % P_MOD, splitmix(z) % P_MOD, splitmix(z) % P_MOD,
+                                 splitmix(z) % P_MOD};
+                put_node(ta + (total - leaves + j) * 32, d);
+            }
+            std::memcpy(tb, ta, sizeof(ta));
+            // Today's: two levels by launch, then the tail.
+            uint64_t child_off = total - leaves, nc = leaves;
+            for (int lvl = 0; lvl < 3 && nc > 1; ++lvl) {
+                const uint64_t np = (nc + 3) / 4, po = child_off - np;
+                if (lvl < 1) {
+                    CUDA_HOST_FOR_EACH_THREAD(t, np) p1s_merkle_level4(ta, child_off, nc, po, np);
+                    CUDA_HOST_FOR_EACH_THREAD(t, np) p1s_merkle_level4_lean(tb, child_off, nc, po, np);
+                    child_off = po;
+                    nc = np;
+                } else {
+                    CUDA_HOST_SINGLE_THREAD();
+                    p1s_merkle_tail4(ta, child_off, nc);
+                    CUDA_HOST_SINGLE_THREAD();
+                    p1s_merkle_tail4_lean(tb, child_off, nc);
+                    break;
+                }
+            }
+            char what[64];
+            std::snprintf(what, sizeof(what), "lean twin: 4-ary tree over %llu leaves", (unsigned long long)leaves);
+            check(std::memcmp(ta, tb, total * 32) == 0, what, V);
+        }
+    }
+}
+
 int main() {
     run_stark_kernels();
     run_w8<1>();
@@ -529,9 +689,11 @@ int main() {
     run<1>(CIRCULANT);
     run<2>(CIRCULANT);
     run<3>(CAUCHY);
+    run<4>(CIRCULANT);
+    run_lean();
     if (g_fail == 0) {
         std::printf("p1w16 host KAT: all checks pass (circulant v0, v1, v2; Cauchy c1; ZisK leaf, "
-                    "rows, row pairs; W8 v1, v2 and its grind; the p1s production kernels)\n");
+                    "rows, row pairs; W8 v1, v2 and its grind; the p1s production kernels; lean l2 and its twins)\n");
         return 0;
     }
     std::printf("p1w16 host KAT: %d FAILED\n", g_fail);

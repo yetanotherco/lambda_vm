@@ -41,7 +41,9 @@
 //   V = 2  V = 1's multiply with the partial rounds in the Fourier domain of
 //          the circulant MDS (`permute_fourier`);
 //   V = 3  the Grain Cauchy MDS alternative (`permute_cauchy`: dense full
-//          rounds, the paper's sparse partial rounds, V = 1's multiply).
+//          rounds, the paper's sparse partial rounds, V = 1's multiply);
+//   V = 4  V = 2 with leaner addition chains (`permute_fourier_lean`); the
+//          production kernels' `_lean` twins run it under `LAMBDA_VM_P1_LEAN=1`.
 // Every variant computes the same field values and `permute` canonicalises.
 //
 // ZISK'S INSTANCE (stage P1 of the Poseidon1 base STARK, at the end of the
@@ -280,6 +282,113 @@ __device__ __forceinline__ void permute_fourier(uint64_t s[WIDTH]) {
     for (int i = 0; i < WIDTH; ++i) s[i] = goldilocks::canonical(s[i]);
 }
 
+// ---------------------------------------------------------------------------
+// ★ LEAN (V = 4): `permute_fourier`'s field values by
+// fewer instructions. Every word stays in [0, 2^64) and congruent to V = 2's
+// mod p, and the last step canonicalises, so the output is V = 2's bit for
+// bit. Three cuts, each on an addition chain (the field's adds, compares and
+// selects are ≈ 64 % of V = 2's instructions, its multiplies ≈ 24 %):
+//   add_c   a + c with c ≤ p (a canonical constant, or a small bound): ONE
+//           carry fix. On overflow the wrapped sum is below c ≤ p, so adding
+//           EPSILON cannot overflow again (`goldilocks::add` checks twice).
+//   add3    a + c + d, the carries counted and folded once (≤ 2·EPSILON).
+//   sum16   the partial round's 16-lane sum, carries counted, folded once.
+//   div16   x/16 mod p by a shift: p ≡ 1 (mod 16), so x + k·p with
+//           k = −x mod 16 is a multiple of 16 below 2^68.
+// The multiplies (`mul_limb`, `sqr_limb`) take any word in [0, 2^64), so a
+// sum need not be canonical before one.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ uint64_t add_c(uint64_t a, uint64_t c) {
+    const uint64_t s = a + c;
+    return s + ((s < a) ? goldilocks::EPSILON : 0ull);
+}
+
+__device__ __forceinline__ uint64_t add3(uint64_t a, uint64_t c, uint64_t d) {
+    const uint64_t t = a + c;
+    const uint64_t u = t + d;
+    const uint64_t carries = (uint64_t)(t < a) + (uint64_t)(u < t);
+    return add_c(u, carries * goldilocks::EPSILON);
+}
+
+__device__ __forceinline__ uint64_t sum16(const uint64_t s[WIDTH]) {
+    uint64_t lo = s[0], carries = 0;
+#pragma unroll
+    for (int i = 1; i < WIDTH; ++i) {
+        lo += s[i];
+        carries += (lo < s[i]) ? 1ull : 0ull;
+    }
+    return add_c(lo, carries * goldilocks::EPSILON);
+}
+
+__device__ __forceinline__ uint64_t div16(uint64_t x) {
+    const uint64_t k = (0ull - x) & 15ull;
+    // x + k·p = x + k − k·2^32 + k·2^64, as a 128-bit (hi, lo).
+    uint64_t lo = x + k;
+    uint64_t hi = k + ((lo < x) ? 1ull : 0ull);
+    const uint64_t sub = k << 32;
+    hi -= (lo < sub) ? 1ull : 0ull;
+    lo -= sub;
+    return (lo >> 4) | (hi << 60);
+}
+
+// `mds` with its recombination folded by `add_c` (`hi · EPSILON < 2^42 ≤ p`).
+__device__ __forceinline__ void mds_lean(uint64_t s[WIDTH]) {
+    uint32_t lo32[WIDTH], hi32[WIDTH];
+#pragma unroll
+    for (int j = 0; j < WIDTH; ++j) {
+        lo32[j] = (uint32_t)s[j];
+        hi32[j] = (uint32_t)(s[j] >> 32);
+    }
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) {
+        uint64_t acc_lo = 0, acc_hi = 0;
+#pragma unroll
+        for (int j = 0; j < WIDTH; ++j) {
+            const uint64_t c = MDS_ROW[(j + WIDTH - i) % WIDTH];
+            acc_lo += c * (uint64_t)lo32[j];
+            acc_hi += c * (uint64_t)hi32[j];
+        }
+        const uint64_t lo = (acc_hi << 32) + acc_lo;
+        const uint64_t carry = (lo < acc_lo) ? 1ull : 0ull;
+        const uint64_t hi = (acc_hi >> 32) + carry;
+        s[i] = add_c(lo, hi * goldilocks::EPSILON);
+    }
+}
+
+__device__ __forceinline__ void full_round_lean(uint64_t s[WIDTH], int r) {
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) s[i] = sbox<4>(add_c(s[i], RC[r][i]));
+    mds_lean(s);
+}
+
+__device__ __forceinline__ void permute_fourier_lean(uint64_t s[WIDTH]) {
+#pragma unroll 1
+    for (int r = 0; r < HALF_FULL - 1; ++r) full_round_lean(s, r);
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) s[i] = sbox<4>(add_c(s[i], RC[HALF_FULL - 1][i]));
+    dft16<4, false>(s);
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) s[i] = fmul<4>(s[i], FD[i]);
+#pragma unroll 1
+    for (int k = 0; k < PARTIAL; ++k) {
+        const uint64_t a0 = add_c(div16(sum16(s)), RC[HALF_FULL + k][0]);
+        const uint64_t delta = goldilocks::sub(sbox<4>(a0), a0);
+        if (k + 1 < PARTIAL) {
+#pragma unroll
+            for (int i = 0; i < WIDTH; ++i) s[i] = fmul<4>(add3(s[i], FC[k][i], delta), FD[i]);
+        } else {
+#pragma unroll
+            for (int i = 0; i < WIDTH; ++i) s[i] = fmul<4>(add3(s[i], FC[k][i], delta), FD_LAST[i]);
+        }
+    }
+    dft16<4, true>(s);
+#pragma unroll 1
+    for (int r = HALF_FULL + PARTIAL; r < ROUNDS; ++r) full_round_lean(s, r);
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) s[i] = goldilocks::canonical(s[i]);
+}
+
 // A dot product of full-field constants with raw state words, accumulated
 // as a 132-bit sum (lo, hi, top) and reduced once: 2^128 ≡ −2^32 (mod p),
 // because 2^96 ≡ −1. `N` terms, the constants at compile-time indices.
@@ -352,7 +461,7 @@ __device__ __forceinline__ void permute_cauchy(uint64_t s[WIDTH]) {
 }
 
 // ★ The permutation. V = 2 takes the Fourier-domain partial rounds above,
-// V = 3 the Cauchy alternative; otherwise one rolled round loop with a
+// V = 3 the Cauchy alternative, V = 4 the lean Fourier form; otherwise one rolled round loop with a
 // warp-uniform branch on the round kind, so the MDS body is emitted once.
 template <int V>
 __device__ __forceinline__ void permute(uint64_t s[WIDTH]) {
@@ -362,6 +471,10 @@ __device__ __forceinline__ void permute(uint64_t s[WIDTH]) {
     }
     if constexpr (V == 3) {
         permute_cauchy<V>(s);
+        return;
+    }
+    if constexpr (V == 4) {
+        permute_fourier_lean(s);
         return;
     }
 #pragma unroll 1
@@ -711,9 +824,9 @@ __device__ __forceinline__ void grind_search(const uint64_t *inner, uint64_t lim
         grind_search<V>(inner, limit, base, count, result);                                        \
     }
 
-// The two multiply variants, the Fourier-domain partial rounds, and the
-// Cauchy alternative (`src/p1w16.rs` VARIANTS lists the same names in the
-// same order). FAST job
+// The two multiply variants, the Fourier-domain partial rounds, the Cauchy
+// alternative, and the lean Fourier form (`src/p1w16.rs` VARIANTS lists the
+// same names in the same order). FAST job
 // 281 measured the register caps (4/5/6 blocks of 128) SLOWER than uncapped
 // (+6 %, +63 %, ×4.6), so no capped variant is instantiated; `P1W16_LB` stays
 // for the next sweep.
@@ -721,6 +834,7 @@ P1W16_ENTRIES(v0, 0, )
 P1W16_ENTRIES(v1, 1, )
 P1W16_ENTRIES(v2, 2, )
 P1W16_ENTRIES(c1, 3, )
+P1W16_ENTRIES(l2, 4, )
 
 // ---------------------------------------------------------------------------
 // ZisK's instance (stage P1 of the Poseidon1 base STARK): its leaf hash over
@@ -922,6 +1036,24 @@ __device__ __forceinline__ void parent4(uint8_t *nodes, uint64_t child_off, uint
     store_be(s, nodes + (parent_off + p) * 32);
 }
 
+// `parent4` under the lean permutation (the `_lean` twins below).
+__device__ __forceinline__ void parent4_lean(uint8_t *nodes, uint64_t child_off, uint64_t n_children,
+                                             uint64_t parent_off, uint64_t p) {
+    uint64_t s[p1w16::WIDTH];
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        const uint64_t idx = 4 * p + (uint64_t)c;
+        if (idx < n_children) {
+            load_be(nodes + (child_off + idx) * 32, s + 4 * c);
+        } else {
+#pragma unroll
+            for (int i = 0; i < p1w16::DIGEST; ++i) s[4 * c + i] = 0;
+        }
+    }
+    p1w16::permute<4>(s);
+    store_be(s, nodes + (parent_off + p) * 32);
+}
+
 }  // namespace p1s
 
 // One leaf per bit-reversed row of a column-major matrix: column `c` of row
@@ -1071,6 +1203,102 @@ extern "C" __global__ void p1s_merkle_tail4(uint8_t *nodes, uint64_t child_off, 
         const uint64_t parent_off = child_off - n_parents;
         for (uint64_t p = threadIdx.x; p < n_parents; p += blockDim.x) {
             p1s::parent4(nodes, child_off, n_children, parent_off, p);
+        }
+        __syncthreads();
+        child_off = parent_off;
+        n_children = n_parents;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The `_lean` twins: the kernels above with the lean
+// permutation (`p1w16::permute_fourier_lean`), the same bytes in the same
+// slots. `src/p1_stark.rs` loads them in their twins' places under
+// `LAMBDA_VM_P1_LEAN=1`; by default nothing loads them.
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void p1s_leaves_cols_row_lean(const uint64_t *__restrict__ cols,
+                                                    uint64_t col_stride, uint64_t num_cols,
+                                                    uint64_t num_rows, uint64_t log_num_rows,
+                                                    uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows) return;
+    const uint64_t br = __brevll(tid) >> (64 - log_num_rows);
+    uint64_t d[p1w16::DIGEST];
+    p1w16::zisk_leaf<4, true>(
+        num_cols, [&](uint64_t c) { return cols[c * col_stride + br]; }, d);
+    p1s::store_be(d, out + tid * 32);
+}
+
+extern "C" __global__ void p1s_leaves_cols_pair_lean(const uint64_t *__restrict__ cols,
+                                                     uint64_t col_stride, uint64_t num_cols,
+                                                     uint64_t num_rows, uint64_t log_num_rows,
+                                                     uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows / 2) return;
+    const uint64_t br0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    const uint64_t br1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+    uint64_t d[p1w16::DIGEST];
+    p1w16::zisk_leaf<4, true>(
+        2 * num_cols,
+        [&](uint64_t i) {
+            return i < num_cols ? cols[i * col_stride + br0] : cols[(i - num_cols) * col_stride + br1];
+        },
+        d);
+    p1s::store_be(d, out + tid * 32);
+}
+
+extern "C" __global__ void p1s_leaves_base_coset_lean(const uint64_t *__restrict__ codeword,
+                                                      uint64_t num_leaves, uint64_t block,
+                                                      uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    uint64_t d[p1w16::DIGEST];
+    p1w16::zisk_leaf<4, true>(
+        block, [&](uint64_t i) { return codeword[tid + i * num_leaves]; }, d);
+    p1s::store_be(d, out + tid * 32);
+}
+
+extern "C" __global__ void p1s_leaves_base_coset_rev_lean(const uint64_t *__restrict__ codeword,
+                                                          uint64_t num_leaves, uint64_t block,
+                                                          uint32_t leaf_bits,
+                                                          uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    uint64_t d[p1w16::DIGEST];
+    p1w16::zisk_leaf<4, true>(
+        block, [&](uint64_t i) { return codeword[tid + i * num_leaves]; }, d);
+    const uint64_t at = leaf_bits == 0 ? tid : (__brevll(tid) >> (64 - leaf_bits));
+    p1s::store_be(d, out + at * 32);
+}
+
+extern "C" __global__ void p1s_leaves_ext3_coset_lean(const uint64_t *__restrict__ codeword,
+                                                      uint64_t num_leaves, uint64_t block,
+                                                      uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    uint64_t d[p1w16::DIGEST];
+    p1w16::zisk_leaf<4, true>(
+        3 * block,
+        [&](uint64_t i) { return codeword[(tid + (i / 3) * num_leaves) * 3 + i % 3]; }, d);
+    p1s::store_be(d, out + tid * 32);
+}
+
+extern "C" __global__ void p1s_merkle_level4_lean(uint8_t *nodes, uint64_t child_off,
+                                                  uint64_t n_children, uint64_t parent_off,
+                                                  uint64_t n_parents) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_parents) return;
+    p1s::parent4_lean(nodes, child_off, n_children, parent_off, tid);
+}
+
+extern "C" __global__ void p1s_merkle_tail4_lean(uint8_t *nodes, uint64_t child_off,
+                                                 uint64_t n_children) {
+    while (n_children > 1) {
+        const uint64_t n_parents = (n_children + 3) / 4;
+        const uint64_t parent_off = child_off - n_parents;
+        for (uint64_t p = threadIdx.x; p < n_parents; p += blockDim.x) {
+            p1s::parent4_lean(nodes, child_off, n_children, parent_off, p);
         }
         __syncthreads();
         child_off = parent_off;
