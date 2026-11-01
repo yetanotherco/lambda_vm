@@ -24,7 +24,7 @@ use math::field::goldilocks::GoldilocksField as F;
 use multilinear::mle::Mle;
 use multilinear::whir::{self, Domain};
 use multilinear::whir_commit::{CodewordCommitment, verify_opening};
-use multilinear::whir_hash::{DeviceHashKey, KeccakWhir, P1Whir, RpxWhir, WhirHash};
+use multilinear::whir_hash::{Blake3Whir, DeviceHashKey, KeccakWhir, P1Whir, RpxWhir, WhirHash};
 
 type FE = FieldElement<F>;
 
@@ -44,6 +44,7 @@ fn device_key<H: WhirHash>() -> math_cuda::DeviceHash {
         DeviceHashKey::Keccak256 => math_cuda::DeviceHash::Keccak256,
         DeviceHashKey::Rpx256 => math_cuda::DeviceHash::Rpx256,
         DeviceHashKey::Poseidon1 => math_cuda::DeviceHash::Poseidon1,
+        DeviceHashKey::Blake3 => math_cuda::DeviceHash::Blake3,
     }
 }
 
@@ -149,7 +150,66 @@ fn device_commit_matches_the_host_pipeline_at_blowup_two() {
     for (num_vars, log_folding) in [(16usize, 6usize), (13, 6), (14, 4), (15, 4)] {
         parity::<RpxWhir>(num_vars, 1, log_folding);
         parity::<P1Whir>(num_vars, 1, log_folding);
+        parity::<Blake3Whir>(num_vars, 1, log_folding);
     }
+}
+
+/// ★ The same under standard 7-round BLAKE3 (`Blake3Whir`): the device's
+/// coset leaves and binary tree (compiled at 7 rounds whatever the STARK
+/// cubin's count) are the host's `Blake3Std` tree at every shape.
+#[test]
+fn device_commit_matches_the_host_pipeline_under_blake3_std() {
+    every_shape::<Blake3Whir>();
+}
+
+/// ★ An extension codeword's tree (a later round's fold blocks, 2^k ext3
+/// values a leaf, each value its three canonical big-endian limbs) under
+/// 7-round BLAKE3 is the host's, at the production fold of four and at six.
+#[test]
+fn device_ext3_commit_matches_the_host_under_blake3_std() {
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    for (log_len, log_folding) in [(12usize, 4usize), (14, 4), (13, 6)] {
+        let values: Vec<FieldElement<Ext3>> = (0..1u64 << log_len)
+            .map(|i| {
+                let c = |k: u64| FE::from(i.wrapping_mul(0x9E37_79B9_7F4A_7C15 ^ k) >> 3);
+                FieldElement::<Ext3>::new([c(1), c(2), c(3)])
+            })
+            .collect();
+        let raw: Vec<u64> = values
+            .iter()
+            .flat_map(|v| v.value().iter().map(|c| *c.value()))
+            .collect();
+        let nodes =
+            math_cuda::whir::commit_codeword_ext3(&raw, log_folding, device_key::<Blake3Whir>())
+                .expect("device ext3 commit (needs a GPU)");
+        let host = CodewordCommitment::<_, Blake3Whir>::new(&values, log_folding).expect("host");
+        assert_eq!(
+            &nodes[..32],
+            &host.root()[..],
+            "root at 2^{log_len}, fold {log_folding}"
+        );
+    }
+}
+
+/// ★★ The 7-round BLAKE3 is a family of its own on the device: its binary
+/// tree has keccak's layout and neither keccak's nor RPX's root.
+#[test]
+fn the_blake3_dispatch_builds_its_own_tree() {
+    let f = poly(12, 7);
+    let raw: Vec<u64> = f.evals().iter().map(|v| *v.value()).collect();
+    let commit = |key| {
+        math_cuda::whir::commit_codeword_to_host(&raw, 2, 4, key)
+            .expect("device commit (needs a GPU)")
+            .1
+    };
+    let (b3, keccak, rpx) = (
+        commit(device_key::<Blake3Whir>()),
+        commit(device_key::<KeccakWhir>()),
+        commit(device_key::<RpxWhir>()),
+    );
+    assert_eq!(b3.len(), keccak.len(), "the binary heap layout");
+    assert_ne!(b3, keccak);
+    assert_ne!(b3, rpx);
 }
 
 /// ★★ The two hashes really do build DIFFERENT trees on the device.
