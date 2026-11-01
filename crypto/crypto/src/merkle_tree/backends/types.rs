@@ -1,4 +1,4 @@
-use crate::hash::blake3::Blake3Chain;
+use crate::hash::blake3::{Blake3Chain, Blake3Std};
 use crate::hash::platform_keccak::PlatformKeccak256 as Keccak256;
 
 use super::field_element_vector::{FieldElementPairBackend, FieldElementVectorBackend};
@@ -31,6 +31,10 @@ pub type BatchBlake3Backend<F> = FieldElementVectorBackend<F, Blake3Chain, 32>;
 /// The FRI-layer twin of [`BatchBlake3Backend`] — one leaf per fixed pair, no
 /// `Vec` per leaf. See there.
 pub type PairBlake3Backend<F> = FieldElementPairBackend<F, Blake3Chain, 32>;
+
+/// [`BatchBlake3Backend`] at 7 rounds ([`Blake3Std`]) in every build: the
+/// WHIR base proof's BLAKE3 arm. Same leaf bytes, same parent framing.
+pub type BatchBlake3StdBackend<F> = FieldElementVectorBackend<F, Blake3Std, 32>;
 /// RPX256 over a vector of field elements — the algebraic backend, for a proof
 /// that is going to be verified inside another proof. See
 /// [`crate::hash::rpx`] for why an algebraic hash is worth its host cost, and
