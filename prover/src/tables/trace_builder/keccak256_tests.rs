@@ -711,25 +711,21 @@ fn the_mode_bits_put_a_row_on_the_round_chip() {
 // forgery passes the chips, not that it passes the verifier. Here each forgery
 // is proved and verified: refused with every check in, and accepted (Memory bus
 // included) with its checks left out, so each mutation result above holds for
-// the verifier.
+// the verifier. The prover's table workers are plain scoped threads, so the
+// checks are left out process-wide (`keccak::LeftOutEverywhere`): the test must
+// be the only one in its process, which `BOX_ALONE` makes its runner say.
 
-/// Proves and verifies `build`'s traces with `left_out` left out on this
-/// thread and on every thread of the pool that proves them: `(accepted, the
-/// bus balance alone refused it)`.
+/// The environment word the box test's runner sets to say the test runs alone
+/// (`--exact --test-threads=1`); without it the test refuses to run.
+const BOX_ALONE: &str = "LAMBDA_VM_KECCAK256_BOX_ALONE";
+
+/// Proves and verifies `build`'s traces with `left_out` left out on every
+/// thread: `(accepted, the bus balance alone refused it)`.
 fn prove_without(left_out: &'static [SpongeCheck], build: fn() -> (Elf, Traces)) -> (bool, bool) {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .start_handler(move |_| keccak::leave_out(left_out))
-        .build()
-        .expect("a proving pool");
-    let outcome = pool.install(|| {
-        keccak::leave_out(left_out);
-        let (program, mut traces) = build();
-        let outcome =
-            crate::tests::prove_elfs_tests::weigh_the_bus_with(&program, &mut traces, true, false);
-        keccak::leave_out(&[]);
-        outcome
-    });
-    keccak::leave_out(&[]);
+    let _left = keccak::LeftOutEverywhere::new(left_out);
+    let (program, mut traces) = build();
+    let outcome =
+        crate::tests::prove_elfs_tests::weigh_the_bus_with(&program, &mut traces, true, false);
     (
         outcome.accepted,
         !outcome.accepted && outcome.accepted_with_target_moved,
@@ -737,8 +733,14 @@ fn prove_without(left_out: &'static [SpongeCheck], build: fn() -> (Elf, Traces))
 }
 
 #[test]
-#[ignore = "box: proves test_keccak256 about 25 times"]
+#[ignore = "box: proves test_keccak256 about 25 times; run alone with LAMBDA_VM_KECCAK256_BOX_ALONE=1"]
 fn box_each_forgery_is_refused_by_the_verifier_and_accepted_without_its_checks() {
+    assert_eq!(
+        std::env::var(BOX_ALONE).as_deref(),
+        Ok("1"),
+        "run this test alone (--exact --test-threads=1) with {BOX_ALONE}=1: it leaves KECCAK's \
+         checks out for the whole process while it runs"
+    );
     let (_, honest) = traces();
     let (accepted, _) = prove_without(&[], traces);
     assert!(accepted, "the honest trace proves and verifies");

@@ -935,7 +935,9 @@ thread_local! {
 pub(crate) fn dropped(check: SpongeCheck) -> bool {
     #[cfg(test)]
     {
-        DROPPED.with(|d| d.get() & (1 << check as u32) != 0)
+        let bits = DROPPED.with(|d| d.get())
+            | DROPPED_EVERYWHERE.load(std::sync::atomic::Ordering::Relaxed);
+        bits & (1 << check as u32) != 0
     }
     #[cfg(not(test))]
     {
@@ -950,6 +952,35 @@ pub(crate) fn dropped(check: SpongeCheck) -> bool {
 pub(crate) fn leave_out(checks: &[SpongeCheck]) {
     let bits = checks.iter().fold(0u32, |a, c| a | (1 << *c as u32));
     DROPPED.with(|d| d.set(bits));
+}
+
+/// The checks left out on EVERY thread of the process, one bit each: the box
+/// test's real prove and verify, whose table workers are plain scoped threads
+/// that no thread-local reaches. Set only through [`LeftOutEverywhere`], by a
+/// test that runs alone in its process (it would loosen any other KECCAK proof
+/// made meanwhile).
+#[cfg(test)]
+static DROPPED_EVERYWHERE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Leaves checks out process-wide while it lives; dropping it (also on a
+/// panic) puts every check back.
+#[cfg(test)]
+pub(crate) struct LeftOutEverywhere;
+
+#[cfg(test)]
+impl LeftOutEverywhere {
+    pub(crate) fn new(checks: &[SpongeCheck]) -> Self {
+        let bits = checks.iter().fold(0u32, |a, c| a | (1 << *c as u32));
+        DROPPED_EVERYWHERE.store(bits, std::sync::atomic::Ordering::SeqCst);
+        LeftOutEverywhere
+    }
+}
+
+#[cfg(test)]
+impl Drop for LeftOutEverywhere {
+    fn drop(&mut self) {
+        DROPPED_EVERYWHERE.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// A test's forgery of one call's rows (see [`FORGE`]).
