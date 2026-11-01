@@ -1227,3 +1227,90 @@ fn the_device_tail_proves_the_host_references_bytes() {
         }
     }
 }
+
+// ─── today's bytes, pinned ───────────────────────────────────────────────
+
+/// The fixtures the byte pin proves: `(a, pad, cap, shifted)` — one bin, bins
+/// of one or two, every table alone, and a shifted table.
+const PINNED_FIXTURES: [(usize, usize, u8, bool); 5] = [
+    (3, 1, 27, false),
+    (3, 1, 3, false),
+    (2, 2, 0, true),
+    (3, 1, 27, true),
+    (4, 0, 4, false),
+];
+
+/// sha3-256 of each fixture's proof (bincode) and of the transcript's state
+/// after it, at `exp/b3-base` 6c1a9faf6, before the GKR slot packing existed.
+const PINNED_BYTES: [(&str, &str); 5] = [
+    (
+        "6b7cc0374530dec0b94d875e622c91349b5dcfb15dbcdb891723a7187eb3a01f",
+        "fb8f20b189c038b6e454c9dcf59a821cbc76776d84d9860577e1c382a0d15a96",
+    ),
+    (
+        "443395b19d148a85e888d1821c8ff90a77730e21535266be82335a8d612775cb",
+        "ca9f88ca1ea1ae1c41fa9332e774ecbb942fd2c0220789947ba1dd6861a55679",
+    ),
+    (
+        "51b85f24fd81bd7cba55e25cec9c75dc09e303459deb4fc8f2cdd56ad4e3e8be",
+        "72b62ed6d0d28958d578151122fc38915d41b5c6c49c30afd2222490b0d3478e",
+    ),
+    (
+        "65e0e7271c241142f5ebe0b36f740a8b5c56d1dedb7f0f432950a2f178b5ddda",
+        "8aed6355bd25659a434bde34d7a373a4c16ee60b187c248a7a46202608e81c58",
+    ),
+    (
+        "fe10a6ff42ac078912eac0e827c14cd887b560e50e376c1be3a8cd872287c6fa",
+        "67ecdc39e3f83542383bb45c9142a0a1d4c583741db0ba112478829c7abc84ef",
+    ),
+];
+
+fn sha3_hex(bytes: &[u8]) -> String {
+    use sha3::{Digest, Sha3_256};
+    Sha3_256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// ★ The default batched argue proves today's bytes: every fixture's proof and
+/// the transcript after it hash to what they hashed to before any format
+/// lever of the GKR's slots was written. A lever left at its default must
+/// keep this green.
+#[test]
+fn the_default_batched_argue_proves_todays_bytes() {
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+    let airs = airs();
+    let mut got = Vec::new();
+    for ((a, pad, cap, shifted), (proof_pin, state_pin)) in PINNED_FIXTURES.iter().zip(PINNED_BYTES)
+    {
+        let cfg = batched(*cap);
+        let committed = commit(tables(&airs, &columns(*a, *pad), *shifted), &cfg);
+        let mut transcript = DefaultTranscript::<Ext>::new(SEED);
+        let proof = prove_batched_with(
+            &committed,
+            &cfg,
+            &mut transcript,
+            None,
+            ProverFaults::default(),
+        )
+        .expect("the prover runs");
+        verify(&committed, &proof, &cfg).expect("verifies");
+        let bytes = bincode::serialize(&proof).expect("bytes");
+        let (got_proof, got_state) = (sha3_hex(&bytes), sha3_hex(&transcript.state()));
+        eprintln!(
+            "BATCHED PIN a={a} pad={pad} cap={cap} shifted={shifted}: proof {got_proof} · state {got_state} · {} bytes",
+            bytes.len()
+        );
+        got.push((
+            format!("a={a} pad={pad} cap={cap} shifted={shifted}"),
+            (got_proof, proof_pin),
+            (got_state, state_pin),
+        ));
+    }
+    for (fixture, (proof, proof_pin), (state, state_pin)) in got {
+        assert_eq!(proof, proof_pin, "{fixture}: the proof's bytes");
+        assert_eq!(state, state_pin, "{fixture}: the transcript");
+    }
+}
