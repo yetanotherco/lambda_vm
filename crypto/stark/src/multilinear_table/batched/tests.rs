@@ -879,6 +879,33 @@ fn a_device() -> bool {
     multilinear::gpu::reserve_budget() > 0
 }
 
+/// Whether this process holds a card, by math-cuda's own probe — whatever
+/// `multilinear` was built with, unlike [`a_device`], which is `false` in a
+/// build whose `multilinear` has no `cuda`.
+fn a_card() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        math_cuda::device::backend().is_ok()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
+}
+
+/// A card in the process that the argue's device paths cannot reach — a stark
+/// build without `multilinear/cuda` — would pass every card test's byte checks
+/// on the host's fallbacks: each card test refuses it here, not a read-out.
+fn a_present_card_is_reachable() {
+    if a_card() {
+        assert!(
+            a_device(),
+            "a card is present but the batched argue's device paths are not built \
+             (stark's `cuda` does not enable `multilinear/cuda`): it would never be used"
+        );
+    }
+}
+
 /// Held by every test here that sets a process-wide argue switch
 /// (`force_argue_*`) or asserts on a process-wide device counter, so no two of
 /// them overlap: one test's forced switch moves the other's rounds. (The
@@ -912,6 +939,7 @@ fn the_card_proves_the_host_references_bytes() {
     use crypto::fiat_shamir::is_transcript::IsTranscript;
 
     let _switches = card_switches();
+    a_present_card_is_reachable();
     let airs = airs();
     for (a, pad, cap) in [(12usize, 1usize, 27u8), (12, 1, 14), (3, 1, 27)] {
         let cfg = batched(cap);
@@ -1008,6 +1036,7 @@ fn the_round_slot_proves_the_host_references_bytes() {
     use multilinear::round_slot::{self as slot, RoundSlotSetting};
 
     let _switches = card_switches();
+    a_present_card_is_reachable();
     let airs = airs();
     let cfg = batched(27);
     let cols = columns(12, 1);

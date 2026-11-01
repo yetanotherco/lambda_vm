@@ -641,6 +641,7 @@ fn the_card_proves_the_host_references_packed_bytes() {
 
     const TALL: [(usize, usize); 4] = [(5, 13), (7, 15), (9, 13), (11, 13)];
     let _switches = card_switches();
+    a_present_card_is_reachable();
     let airs = airs();
     let fans: Vec<Air<EmptyConstraints>> = TALL.iter().map(|&(m, _)| fan_air(m)).collect();
     let fan_cols: Vec<Vec<Vec<FE>>> = TALL
