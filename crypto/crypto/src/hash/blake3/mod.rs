@@ -64,7 +64,7 @@
 pub mod chain;
 mod vectors;
 
-pub use chain::{Blake3Chain, blake3_chain};
+pub use chain::{Blake3Chain, Blake3Std, blake3_chain};
 pub use vectors::{CANONICAL_OUT_7ROUND, CANONICAL_VECTORS, Vector};
 
 /// The BLAKE3 IV (identical to SHA-256's initial state). `IV[0..4]` seeds

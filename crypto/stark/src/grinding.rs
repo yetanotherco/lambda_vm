@@ -15,6 +15,15 @@ pub use crypto::grinding::{
     inner_hash_lanes, is_valid_nonce,
 };
 
+/// The device grind counters, one per arm, and their reset
+/// ([`crypto::grinding`]): what a caller above this crate reads to say which
+/// kernel its grinds ran on.
+#[cfg(feature = "cuda")]
+pub use crypto::grinding::{
+    gpu_grind_calls, gpu_grind_calls_b3, gpu_grind_calls_p1, gpu_grind_calls_rpx,
+    reset_gpu_grind_calls,
+};
+
 /// The hash the univariate prover and verifier grind with: keccak-256, the same
 /// hash their Merkle trees and their transcript use.
 pub type StarkGrindingDigest = crypto::hash::platform_keccak::PlatformKeccak256;

@@ -25,7 +25,7 @@
 use core::num::NonZeroUsize;
 use digest::{Digest, FixedOutputReset, OutputSizeUser, typenum::U32};
 
-use crate::hash::blake3::chain::Blake3Chain;
+use crate::hash::blake3::chain::{Blake3Chain, Blake3Std};
 use crate::hash::platform_keccak::PlatformKeccak256;
 use crate::hash::rpx::Rpx256Digest;
 
@@ -209,5 +209,28 @@ impl TranscriptHash for Blake3TranscriptHash {
     /// ⚠ Unlike the RPX configuration's `Some(1)`, this is probabilistic: a
     /// BLAKE3 squeeze is uniform bytes, so both candidates can miss. Two makes
     /// the tail negligible; it does not make it unreachable.
+    const CANDIDATES_PER_COORDINATE: Option<NonZeroUsize> = NonZeroUsize::new(2);
+}
+
+/// ★ [`Blake3TranscriptHash`] at **7 rounds**: the same sponge, the same
+/// squeeze reversal and the same two-candidate sampling, over [`Blake3Std`]
+/// rather than the build's [`Blake3Chain`], so no feature moves its rounds.
+///
+/// The transcript of the WHIR base proof's BLAKE3 arm
+/// (`multilinear::whir_hash::Blake3Whir`). [`Blake3TranscriptHash`] itself is
+/// left as it is: it is the STARK pipeline's, at that build's round count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Blake3StdTranscriptHash;
+
+impl TranscriptHash for Blake3StdTranscriptHash {
+    type Digest = Blake3Std;
+
+    const NAME: &'static str = "blake3-std";
+
+    /// [`Blake3TranscriptHash`]'s convention, so the two differ by the round
+    /// count alone.
+    const REVERSES_SQUEEZE: bool = true;
+
+    /// [`Blake3TranscriptHash`]'s schedule, for the same reason.
     const CANDIDATES_PER_COORDINATE: Option<NonZeroUsize> = NonZeroUsize::new(2);
 }
