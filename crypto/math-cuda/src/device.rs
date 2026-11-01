@@ -236,9 +236,11 @@ pub struct Backend {
     pub matrix_transpose_strided: CudaFunction,
 
     // ntt_cm.cubin — the column-major LDE engine's passes, indexed by
-    // `k - 4` for a pass of k = 4..=8 levels (`crate::lde_cm`).
+    // `k - 4` for a pass of k = 4..=8 levels (`crate::lde_cm`), and the WHIR
+    // encoding's wide DIT passes by `k - 9` for k = 9, 10 (`lde_cm::plan_wide`).
     pub ntt_cm_dit: [CudaFunction; 5],
     pub ntt_cm_dif: [CudaFunction; 5],
+    pub ntt_cm_dit_wide: [CudaFunction; 2],
 
     // keccak.cubin
     pub keccak256_leaves_base_row_major_row_pair: CudaFunction,
@@ -1160,6 +1162,10 @@ impl Backend {
                 ntt_cm.load_function("ntt_cm_dif_k6")?,
                 ntt_cm.load_function("ntt_cm_dif_k7")?,
                 ntt_cm.load_function("ntt_cm_dif_k8")?,
+            ],
+            ntt_cm_dit_wide: [
+                ntt_cm.load_function("ntt_cm_dit_k9")?,
+                ntt_cm.load_function("ntt_cm_dit_k10")?,
             ],
             keccak256_leaves_base_row_major_row_pair: keccak
                 .load_function("keccak256_leaves_base_row_major_row_pair")?,

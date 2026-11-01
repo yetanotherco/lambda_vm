@@ -37,7 +37,10 @@
 //! the legacy encoding reads `Backend::fwd_twiddles_for`: `2^(log_n − 1)`
 //! values per codeword size, built on the host and cached on the card for the
 //! life of the process, outside the VRAM ledger (512 MiB for a `2^27`
-//! codeword, 2 GiB for `2^29`).
+//! codeword, 2 GiB for `2^29`). Under [`NTT_WIDE_ENV`] the encoding takes
+//! passes of up to 10 levels ([`plan_wide`]): three passes at the production
+//! `2^28` instead of four. Every pass is bound by memory bandwidth, so the
+//! passes are the cost; the trace LDEs keep [`plan`].
 //!
 //! It is the default wherever it applies ([`engine_enabled`]). The legacy path
 //! stays for what the engine does not take — a caller that wants the row-major
@@ -124,6 +127,62 @@ pub fn codewords_encoded() -> u64 {
     CODEWORDS_ENCODED.load(Ordering::Relaxed)
 }
 
+/// `LAMBDA_VM_WHIR_NTT_WIDE=1` runs the WHIR encoding's transform
+/// ([`spread_ntt_column`]) in [`plan_wide`]'s passes of up to 10 levels. The
+/// codeword's values are today's; only a value's non-canonical representation
+/// may differ, as between this engine and the legacy one. Read once per
+/// process; only `1` opts in.
+pub const NTT_WIDE_ENV: &str = "LAMBDA_VM_WHIR_NTT_WIDE";
+
+thread_local! {
+    /// Per-thread override of [`NTT_WIDE_ENV`], for parity tests that run
+    /// both plans in one process. See [`with_ntt_wide`].
+    static NTT_WIDE_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// `LAMBDA_VM_WHIR_NTT_WIDE`'s value read: `1` is the wide plan, anything
+/// else (unset included) today's.
+pub fn ntt_wide_setting(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1"))
+}
+
+/// Whether the calling thread's WHIR encodings take [`plan_wide`].
+pub fn ntt_wide_enabled() -> bool {
+    if let Some(on) = NTT_WIDE_OVERRIDE.with(Cell::get) {
+        return on;
+    }
+    static ENV: OnceLock<bool> = OnceLock::new();
+    *ENV.get_or_init(|| {
+        let on = ntt_wide_setting(std::env::var(NTT_WIDE_ENV).ok().as_deref());
+        if on {
+            eprintln!("[gpu] WHIR NTT: wide, passes of up to 10 levels ({NTT_WIDE_ENV}=1)");
+        }
+        on
+    })
+}
+
+/// Run `f` with the wide plan forced on or off for the calling thread.
+#[doc(hidden)]
+pub fn with_ntt_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NTT_WIDE_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(NTT_WIDE_OVERRIDE.with(|c| c.replace(Some(on))));
+    f()
+}
+
+/// Codewords [`spread_ntt_column`] encoded with a pass of more than 8 levels,
+/// process-wide: what a test reads to know the wide kernels ran.
+static WIDE_CODEWORDS_ENCODED: AtomicU64 = AtomicU64::new(0);
+
+/// See [`WIDE_CODEWORDS_ENCODED`].
+pub fn wide_codewords_encoded() -> u64 {
+    WIDE_CODEWORDS_ENCODED.load(Ordering::Relaxed)
+}
+
 /// Smallest trace a column can have here: a pass holds 16 elements per
 /// thread, so a transform needs at least 2^4 of them.
 pub const MIN_LOG_N: u32 = 4;
@@ -167,6 +226,25 @@ pub(crate) fn plan(l: u32) -> Vec<u32> {
     ks
 }
 
+/// The largest pass [`plan_wide`] takes: the kernels instantiate wide passes
+/// of 9 and 10 levels (`ntt_cm_dit_k9`, `_k10`).
+pub(crate) const WIDE_MAX_K: u32 = 10;
+
+/// Pass sizes for the WHIR encoding's length-`2^l` transform under
+/// [`NTT_WIDE_ENV`]: `ceil(l / 10)` passes of 4..=10 levels, within one of
+/// each other — `[10, 9, 9]` at `2^28`. Where that is as many passes as
+/// [`plan`] it is [`plan`]. Mirrored by the host KAT's `plan_wide`.
+pub(crate) fn plan_wide(l: u32) -> Vec<u32> {
+    assert!(l >= MIN_LOG_N, "transform too short for the engine: 2^{l}");
+    let p = l.div_ceil(WIDE_MAX_K);
+    let mut ks = vec![l / p; p as usize];
+    for k in ks.iter_mut().take((l % p) as usize) {
+        *k += 1;
+    }
+    debug_assert!(ks.iter().all(|&k| (4..=WIDE_MAX_K).contains(&k)));
+    ks
+}
+
 /// log2 of the lanes a block spans: 256 threads at 16 elements each hold
 /// `4096 >> k` sub-transforms' worth, capped by what the level window allows
 /// (`2^s` lanes of `lo` for a strided pass, `2^(l-k)` sub-transforms for the
@@ -175,6 +253,17 @@ fn pass_log_t(l: u32, s: u32, k: u32) -> u32 {
     let cap = 12 - k;
     let lim = if s > 0 { s } else { l - k };
     cap.min(lim)
+}
+
+/// A pass's dynamic shared memory: its `2^k × (T + 1)` tile, and on a wide
+/// pass (k > 8) a skew of `T` words every 16 rows. Mirrors the kernels'
+/// `tile_words`. The radix table is static: `max(2^(k−1), 128)` words.
+fn tile_bytes(k: u32, log_t: u32) -> u32 {
+    let mut words = (1u32 << k) * ((1u32 << log_t) + 1);
+    if k > 8 {
+        words += (1u32 << (k - 4)) << log_t;
+    }
+    words * 8
 }
 
 /// Kernel flags, as in `kernels/ntt_cm.cu`.
@@ -298,13 +387,14 @@ fn launch_pass(
     let cfg = LaunchConfig {
         grid_dim: (1u32 << (l - k - log_t), cols as u32, 1),
         block_dim: (threads, 1, 1),
-        shared_mem_bytes: (1u32 << k) * ((1u32 << log_t) + 1) * 8,
+        shared_mem_bytes: tile_bytes(k, log_t),
     };
-    let idx = (k - 4) as usize;
-    let f = if dit {
-        &be.ntt_cm_dit[idx]
-    } else {
-        &be.ntt_cm_dif[idx]
+    // The wide passes are DIT only (the encoding's forward transform).
+    debug_assert!(dit || k <= 8, "no DIF pass of {k} levels");
+    let f = match (dit, k) {
+        (true, 9..) => &be.ntt_cm_dit_wide[(k - 9) as usize],
+        (true, _) => &be.ntt_cm_dit[(k - 4) as usize],
+        (false, _) => &be.ntt_cm_dif[(k - 4) as usize],
     };
     unsafe {
         stream
@@ -492,7 +582,8 @@ pub(crate) fn lde_columns(
 /// every other position zero, and `dst` receives the natural-order transform.
 /// The spread is the first pass's load, so the padding is never stored or
 /// read, and the transform is `ceil(log_n / 8)` passes instead of the spread
-/// pass, the fused 8-level pass and one 5-level tile per five levels above it.
+/// pass, the fused 8-level pass and one 5-level tile per five levels above it
+/// — `ceil(log_n / 10)` under [`NTT_WIDE_ENV`] ([`plan_wide`]).
 /// `src` (`2^(log_n - log_blowup)` values) and `dst` (`2^log_n`) must not
 /// overlap. Nothing synchronises.
 pub(crate) fn spread_ntt_column(
@@ -510,8 +601,13 @@ pub(crate) fn spread_ntt_column(
     let tables = root_tables(be)?;
     let (fwd_roots, _fr) = tables.fwd.device_ptr(stream);
     let one = |ptr| Cols { ptr, stride: 0 };
+    let ks = if ntt_wide_enabled() {
+        plan_wide(log_n)
+    } else {
+        plan(log_n)
+    };
     let mut s = 0;
-    for (i, &k) in plan(log_n).iter().enumerate() {
+    for (i, &k) in ks.iter().enumerate() {
         let first = i == 0;
         launch_pass(
             stream,
@@ -531,6 +627,9 @@ pub(crate) fn spread_ntt_column(
         s += k;
     }
     CODEWORDS_ENCODED.fetch_add(1, Ordering::Relaxed);
+    if ks.iter().any(|&k| k > 8) {
+        WIDE_CODEWORDS_ENCODED.fetch_add(1, Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -630,8 +729,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn wide_plans_cover_every_level_in_passes_of_four_to_ten() {
+        for l in MIN_LOG_N..=32 {
+            let ks = plan_wide(l);
+            assert_eq!(ks.iter().sum::<u32>(), l, "l = {l}");
+            assert_eq!(ks.len() as u32, l.div_ceil(10), "l = {l}: pass count");
+            assert!(
+                ks.iter().all(|&k| (4..=WIDE_MAX_K).contains(&k)),
+                "l = {l}: {ks:?}"
+            );
+            let (lo, hi) = (ks.iter().min().unwrap(), ks.iter().max().unwrap());
+            assert!(hi - lo <= 1, "l = {l}: uneven {ks:?}");
+            if ks.len() == plan(l).len() {
+                assert_eq!(
+                    ks,
+                    plan(l),
+                    "l = {l}: as many passes as today's, today's plan"
+                );
+            }
+        }
+        assert_eq!(plan_wide(28), [10, 9, 9], "the production encoding");
+        assert_eq!(plan(28), [7, 7, 7, 7], "today's production encoding");
+        // The sizes where the plans differ up to 2^30 (the host KAT pins 9, 10
+        // and 17..20 against today's plan).
+        let differ: Vec<u32> = (MIN_LOG_N..=30)
+            .filter(|&l| plan_wide(l) != plan(l))
+            .collect();
+        assert_eq!(differ, [9, 10, 17, 18, 19, 20, 25, 26, 27, 28, 29, 30]);
+    }
+
+    /// Today's plan unless the knob says exactly `1`.
+    #[test]
+    fn the_wide_ntt_runs_only_at_one() {
+        assert!(!ntt_wide_setting(None), "the default is today's plan");
+        assert!(ntt_wide_setting(Some("1")));
+        assert!(ntt_wide_setting(Some(" 1")));
+        assert!(!ntt_wide_setting(Some("0")));
+        assert!(!ntt_wide_setting(Some("on")), "only 1 opts in");
+        assert!(with_ntt_wide(true, ntt_wide_enabled));
+        assert!(!with_ntt_wide(false, ntt_wide_enabled));
+    }
+
     /// Every (s, k) window the driver launches: DIT ascending from s = 0, DIF
-    /// descending to s = 0.
+    /// descending to s = 0, and the encoding's wide DIT passes.
     fn windows(l: u32) -> Vec<(u32, u32)> {
         let ks = plan(l);
         let mut out = Vec::new();
@@ -645,12 +786,17 @@ mod tests {
             s -= k;
             out.push((s, k));
         }
+        let mut s = 0;
+        for &k in &plan_wide(l) {
+            out.push((s, k));
+            s += k;
+        }
         out
     }
 
     #[test]
     fn a_block_never_exceeds_256_threads_or_its_window() {
-        for l in MIN_LOG_N..=28 {
+        for l in MIN_LOG_N..=32 {
             for (s, k) in windows(l) {
                 let log_t = pass_log_t(l, s, k);
                 let threads = (1u32 << log_t) << (k - 4);
@@ -664,11 +810,19 @@ mod tests {
                     );
                 }
                 assert!(s + k <= l, "l={l} s={s} k={k}: window past the transform");
-                let smem = (1u32 << k) * ((1u32 << log_t) + 1) * 8;
+                // The tile, and the static radix table: 2^(k-1) words, 128 at least.
+                let smem = tile_bytes(k, log_t) + (1u32 << (k - 1).max(7)) * 8;
                 assert!(
                     smem <= 48 * 1024,
                     "l={l} s={s} k={k}: {smem} B of shared memory"
                 );
+                if k <= 8 {
+                    assert_eq!(
+                        tile_bytes(k, log_t),
+                        (1u32 << k) * ((1u32 << log_t) + 1) * 8,
+                        "l={l} s={s} k={k}: today's tile"
+                    );
+                }
             }
         }
     }
