@@ -68,6 +68,10 @@ def shiftResult (word signed direction x s : ℕ) : ℕ :=
   else if signed = 0 then x >>> k
   else sra64 x k
 
+/-- `opsel` of MIN: a toy operation for the counted-pulls PoC, not an RV64IM op. It has the shape
+of DIVREM: its chip pulls LT on this bus and pushes its own result on the same bus. -/
+def opselMIN : ℕ := 7
+
 /-- What a puller learns. One clause per `opsel`, selected by the flag byte read as a natural.
 Each clause takes as hypotheses exactly the `[[assumptions]]` of its chip's spec: the words the
 caller must have range-checked. The words a chip range-checks itself need no hypothesis. -/
@@ -90,7 +94,14 @@ def Guarantees (m : Msg (F p)) : Prop :=
   (∀ w s d : ℕ, w < 2 → s < 2 → d < 2 →
     m.flags.val = opselSHIFT + w + 32 * s + 64 * d →
     m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
-    dword m.outLo m.outHi = shiftResult w s d (dword m.in1Lo m.in1Hi) (m.in2Lo.val % 256))
+    dword m.outLo m.outHi = shiftResult w s d (dword m.in1Lo m.in1Hi) (m.in2Lo.val % 256)) ∧
+  -- MIN (toy, see `opselMIN`): flags = opsel(MIN), out = the unsigned minimum;
+  -- assumes `IS_WORD` on both words of both operands, as the global antecedent did before the
+  -- per-opsel refactor
+  (m.flags.val = opselMIN →
+    m.in1Lo.val < 2^32 → m.in1Hi.val < 2^32 → m.in2Lo.val < 2^32 → m.in2Hi.val < 2^32 →
+    m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+    dword m.outLo m.outHi = min (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi))
 
 def channel : Channel (F p) Msg where
   name := "ALU"
