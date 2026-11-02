@@ -14,12 +14,13 @@ pub mod block_batched_tests;
 pub mod block_cut_padding_tests;
 #[cfg(test)]
 #[cfg(feature = "parallel")]
+pub mod block_keccak_lean_tests;
+#[cfg(test)]
+#[cfg(feature = "parallel")]
 pub mod block_onechain_tests;
 #[cfg(test)]
 #[cfg(feature = "parallel")]
 pub mod block_whir_p1_tests;
-#[cfg(test)]
-#[cfg(feature = "parallel")]
 pub mod block_whir_pack_tests;
 pub mod block_whir_tests;
 #[cfg(test)]

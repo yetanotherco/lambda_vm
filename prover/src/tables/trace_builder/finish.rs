@@ -214,6 +214,8 @@ struct P4Mode {
     /// LT's, BRANCH's and BYTEWISE's lookups are left to their tables' jobs
     /// ([`StreamSkip::bitwise_from_tables`]): none of their ops is read here.
     from_tables: bool,
+    /// Which byte checks KECCAK_RND sends ([`StreamSkip::keccak_rnd_form`]).
+    keccak_rnd_form: keccak_rnd::KeccakRndForm,
 }
 
 impl P4Mode {
@@ -223,6 +225,7 @@ impl P4Mode {
             by: skip.p4_by,
             direct: skip.p4_direct,
             from_tables: false,
+            keccak_rnd_form: skip.keccak_rnd_form,
         }
     }
 }
@@ -270,6 +273,7 @@ fn count_bitwise(
                 by,
                 direct,
                 from_tables,
+                keccak_rnd_form,
             },
     } = lists;
     let lt_ops = lt.segments();
@@ -429,9 +433,9 @@ fn count_bitwise(
         {
             collectors.push(Box::new(move |h| {
                 if direct {
-                    count_bitwise_from_keccak(slice, h)
+                    count_bitwise_from_keccak_for(slice, keccak_rnd_form, h)
                 } else {
-                    h.add_ops(&collect_bitwise_from_keccak(slice))
+                    h.add_ops(&collect_bitwise_from_keccak_for(slice, keccak_rnd_form))
                 }
             }));
         }
@@ -515,7 +519,7 @@ fn count_bitwise(
             Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(memw_aligned_ops))),
             Box::new(|h| {
                 for part in keccak_ops.parts() {
-                    h.add_ops(&collect_bitwise_from_keccak(part))
+                    h.add_ops(&collect_bitwise_from_keccak_for(part, keccak_rnd_form))
                 }
             }),
             Box::new(|h| {
@@ -891,7 +895,7 @@ fn padding_byte_checks(
         } else {
             0
         };
-    let keccak_rnd_padding = keccak_rnd::ARE_BYTES_PER_ROW
+    let keccak_rnd_padding = skip.keccak_rnd_form.are_bytes_per_row()
         * keccak_rnd_padding_rows(keccak_ops, skip.keccak_rnd_rows, skip.cut_padding);
     (shift_padding + keccak_rnd_padding) as u64
 }

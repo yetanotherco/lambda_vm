@@ -79,9 +79,7 @@ use crate::tables::keccak::{
 use crate::tables::keccak_rc::{
     bus_interactions as keccak_rc_bus_interactions, cols as keccak_rc_cols,
 };
-use crate::tables::keccak_rnd::{
-    KeccakRndConstraints, bus_interactions as keccak_rnd_bus_interactions, cols as keccak_rnd_cols,
-};
+use crate::tables::keccak_rnd::{KeccakRndConstraints, cols as keccak_rnd_cols};
 use crate::tables::load::{
     LoadConstraints, bus_interactions as load_bus_interactions, cols as load_cols,
 };
@@ -1110,9 +1108,21 @@ pub fn create_blake3_air(proof_options: &ProofOptions) -> ConcreteVmAir<Blake3Co
 
 /// Create KECCAK_RND AIR with pi constraints and bus interactions.
 pub fn create_keccak_rnd_air(proof_options: &ProofOptions) -> ConcreteVmAir<KeccakRndConstraints> {
+    create_keccak_rnd_air_for(
+        proof_options,
+        crate::tables::keccak_rnd::KeccakRndForm::Full,
+    )
+}
+
+/// [`create_keccak_rnd_air`] with `form`'s byte checks: the same columns and
+/// constraints.
+pub fn create_keccak_rnd_air_for(
+    proof_options: &ProofOptions,
+    form: crate::tables::keccak_rnd::KeccakRndForm,
+) -> ConcreteVmAir<KeccakRndConstraints> {
     build_air(
         keccak_rnd_cols::NUM_COLUMNS,
-        keccak_rnd_bus_interactions(),
+        crate::tables::keccak_rnd::bus_interactions_for(form),
         proof_options,
         1,
         KeccakRndConstraints,

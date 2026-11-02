@@ -57,7 +57,7 @@ use super::hint;
 use super::is_wh;
 use super::keccak::{self, KeccakOperation};
 use super::keccak_rc;
-use super::keccak_rnd::{self, KeccakRoundOperation};
+use super::keccak_rnd::{self, KeccakRndForm, KeccakRoundOperation};
 use super::load::{self, LoadOperation};
 use super::local_to_global;
 use super::lt::{self, LtOperation};
@@ -5702,33 +5702,58 @@ pub(crate) fn collect_bitwise_from_blake3(
 /// halfword shifts are enforced by inline constraints, not HWSL lookups); the
 /// keccak core chip sends IS_HALF interactions.
 /// All of these must be registered so the BITWISE table's multiplicities are correct.
-#[allow(clippy::needless_range_loop)]
+#[cfg(test)]
 pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOperation> {
+    collect_bitwise_from_keccak_for(keccak_ops, KeccakRndForm::Full)
+}
+
+/// [`collect_bitwise_from_keccak`] with KECCAK_RND's byte checks as `form`
+/// sends them.
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn collect_bitwise_from_keccak_for(
+    keccak_ops: &[KeccakOperation],
+    form: KeccakRndForm,
+) -> Vec<BitwiseOperation> {
     let mut ops = Vec::new();
-    for_each_keccak_lookup(keccak_ops, |op| ops.push(op));
+    for_each_keccak_lookup(keccak_ops, form, |op| ops.push(op));
     ops
 }
 
 /// [`collect_bitwise_from_keccak`]'s lookups counted into `histogram`, with no
 /// list built: about five thousand a permutation.
+#[cfg(test)]
 pub(crate) fn count_bitwise_from_keccak(
     keccak_ops: &[KeccakOperation],
     histogram: &mut bitwise::BitwiseHistogram,
 ) {
-    for_each_keccak_lookup(keccak_ops, |op| histogram.bump(op));
+    count_bitwise_from_keccak_for(keccak_ops, KeccakRndForm::Full, histogram);
+}
+
+/// [`count_bitwise_from_keccak`] with KECCAK_RND's byte checks as `form` sends
+/// them.
+pub(crate) fn count_bitwise_from_keccak_for(
+    keccak_ops: &[KeccakOperation],
+    form: KeccakRndForm,
+    histogram: &mut bitwise::BitwiseHistogram,
+) {
+    for_each_keccak_lookup(keccak_ops, form, |op| histogram.bump(op));
 }
 
 /// Every BITWISE lookup the keccak chips send for `keccak_ops`, permutation by
 /// permutation, its rounds replayed.
 #[allow(clippy::needless_range_loop)]
-fn for_each_keccak_lookup(keccak_ops: &[KeccakOperation], mut emit: impl FnMut(BitwiseOperation)) {
+fn for_each_keccak_lookup(
+    keccak_ops: &[KeccakOperation],
+    form: KeccakRndForm,
+    mut emit: impl FnMut(BitwiseOperation),
+) {
     for kop in keccak_ops {
         if let Some(sponge) = &kop.sponge {
             emit_sponge_lookups(kop, sponge, &mut emit);
         } else {
             emit_permute_lookups(kop, &mut emit);
         }
-        emit_round_lookups(kop, &mut emit);
+        emit_round_lookups(kop, form, &mut emit);
     }
 }
 
@@ -5808,7 +5833,11 @@ fn emit_permute_lookups(kop: &KeccakOperation, emit: &mut impl FnMut(BitwiseOper
 
 /// The BITWISE lookups the 24 KECCAK_RND rows of one permutation send.
 #[allow(clippy::needless_range_loop)]
-fn emit_round_lookups(kop: &KeccakOperation, emit: &mut impl FnMut(BitwiseOperation)) {
+fn emit_round_lookups(
+    kop: &KeccakOperation,
+    form: KeccakRndForm,
+    emit: &mut impl FnMut(BitwiseOperation),
+) {
     use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
     {
         // Replay keccak round computation to extract bitwise lookups
@@ -5853,12 +5882,15 @@ fn emit_round_lookups(kop: &KeccakOperation, emit: &mut impl FnMut(BitwiseOperat
                     let halfword = (c[hw * 2] as u16) | ((c[hw * 2 + 1] as u16) << 8);
                     let shifted = halfword << 1; // u16 wraps
                     // ARE_BYTES for cxz_left bytes: paired (low, high) of the halfword,
-                    // matching `(cxz_left[x][2i], cxz_left[x][2i+1])` sender pairing.
-                    emit(BitwiseOperation::byte_op(
-                        BitwiseOperationType::AreBytes,
-                        (shifted & 0xFF) as u8,
-                        ((shifted >> 8) & 0xFF) as u8,
-                    ));
+                    // matching `(cxz_left[x][2i], cxz_left[x][2i+1])` sender pairing;
+                    // not sent under `KeccakRndForm::Lean`.
+                    if form.checks_cxz_left() {
+                        emit(BitwiseOperation::byte_op(
+                            BitwiseOperationType::AreBytes,
+                            (shifted & 0xFF) as u8,
+                            ((shifted >> 8) & 0xFF) as u8,
+                        ));
+                    }
                 }
                 // Reconstruct rotated_c using the bit-typed Cxz_right.
                 let mut left_bytes = [0u8; 8];
@@ -6425,6 +6457,10 @@ pub struct StreamSkip {
     /// tables and the tables built again from its lists all read it here. The
     /// default stops at the table that holds the last real row.
     pub cut_padding: CutPadding,
+    /// Which byte checks KECCAK_RND sends ([`KeccakRndForm`], the block
+    /// format's): BITWISE counts those and no others. The default is today's
+    /// table.
+    pub keccak_rnd_form: KeccakRndForm,
 }
 
 /// How the tables a block cuts at a fixed number of rows (KECCAK_RND, KECCAK,

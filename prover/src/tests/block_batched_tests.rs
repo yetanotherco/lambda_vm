@@ -29,6 +29,7 @@ fn one_group(argue: ArgueFormat) -> BlockFormat {
         group: multilinear::whir_chain::GroupFold::PerPoly,
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
+        keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
     }
 }
 
@@ -46,6 +47,7 @@ fn many_groups(argue: ArgueFormat) -> BlockFormat {
         group: multilinear::whir_chain::GroupFold::PerPoly,
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
+        keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
     }
 }
 
@@ -456,6 +458,7 @@ fn fixed_traces(
         &mut traces,
         keccak_rnd_log2,
         crate::tables::trace_builder::CutPadding::default(),
+        crate::tables::keccak_rnd::KeccakRndForm::Full,
     )
     .expect("the split");
     (program, elf, traces)
@@ -661,6 +664,7 @@ fn the_card_argues_the_hosts_bytes() {
         group: multilinear::whir_chain::GroupFold::PerPoly,
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
+        keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
     };
     for name in ["all_instructions_64", "test_keccak", "test_ecsm"] {
         let (program, elf, mut traces) = fixed_traces(name, &MaxRowsConfig::default(), 16);

@@ -49,6 +49,7 @@ fn small_format() -> BlockFormat {
         group: multilinear::whir_chain::GroupFold::PerPoly,
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
+        keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
     }
 }
 
@@ -471,6 +472,7 @@ fn dense_format() -> BlockFormat {
         group: multilinear::whir_chain::GroupFold::PerPoly,
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
+        keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
     }
 }
 

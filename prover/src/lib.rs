@@ -912,15 +912,17 @@ impl BlockAirInputs {
 }
 
 /// A block's AIRs: every table of `table_counts`, HALT included, the CPU
-/// tables at `inputs`' heights and REGISTER's FINI pinned to the halted file.
+/// tables at `inputs`' heights, REGISTER's FINI pinned to the halted file and
+/// KECCAK_RND's byte checks as `keccak_rnd` sends them (the block format's).
 pub(crate) fn block_airs(
     program: &Elf,
     opts: &ProofOptions,
     page_configs: &[crate::tables::page::PageConfig],
     table_counts: &TableCounts,
     inputs: &BlockAirInputs,
+    keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm,
 ) -> VmAirs {
-    VmAirs::new(
+    let mut airs = VmAirs::new(
         program,
         opts,
         false,
@@ -931,7 +933,18 @@ pub(crate) fn block_airs(
         true,
         None,
         inputs.register.preprocessed(),
-    )
+    );
+    if keccak_rnd != crate::tables::keccak_rnd::KeccakRndForm::Full {
+        airs.keccak_rnds = (0..airs.keccak_rnds.len())
+            .map(|i| {
+                Box::new(
+                    crate::test_utils::create_keccak_rnd_air_for(opts, keccak_rnd)
+                        .with_name(&format!("KECCAK_RND[{i}]")),
+                ) as VmAir
+            })
+            .collect();
+    }
+    airs
 }
 
 impl VmAirs {

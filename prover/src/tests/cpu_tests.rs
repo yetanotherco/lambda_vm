@@ -560,7 +560,14 @@ fn the_cpu_and_register_airs_expose_the_columns_the_verifier_checks() {
     let output = [7u8; 5];
     let inputs = crate::BlockAirInputs::new(&opts, &program, heights.clone(), &output)
         .expect("honest heights");
-    let airs = crate::block_airs(&program, &opts, &[], &counts, &inputs);
+    let airs = crate::block_airs(
+        &program,
+        &opts,
+        &[],
+        &counts,
+        &inputs,
+        crate::tables::keccak_rnd::KeccakRndForm::Full,
+    );
     let refs = airs.air_refs();
     let start = crate::cpu_proof_start(true, &counts);
     for (k, &height) in heights.iter().enumerate() {
@@ -640,7 +647,14 @@ fn the_block_register_sends_the_final_pc_token_at_its_clocks_end() {
         let counts = cpu_only_counts(heights.len());
         let inputs = crate::BlockAirInputs::new(&opts, &program, heights.clone(), &[])
             .expect("honest heights");
-        let airs = crate::block_airs(&program, &opts, &[], &counts, &inputs);
+        let airs = crate::block_airs(
+            &program,
+            &opts,
+            &[],
+            &counts,
+            &inputs,
+            crate::tables::keccak_rnd::KeccakRndForm::Full,
+        );
         let refs = airs.air_refs();
         let register_air = refs
             .iter()
@@ -678,7 +692,14 @@ fn the_cpu_tables_are_refused_where_their_heights_are_not_read() {
     let counts = cpu_only_counts(2);
     let inputs =
         crate::BlockAirInputs::new(&opts, &program, vec![8, 4], &[]).expect("honest heights");
-    let airs = crate::block_airs(&program, &opts, &[], &counts, &inputs);
+    let airs = crate::block_airs(
+        &program,
+        &opts,
+        &[],
+        &counts,
+        &inputs,
+        crate::tables::keccak_rnd::KeccakRndForm::Full,
+    );
     assert!(airs.check_cpu_position(&counts).is_ok());
     let mut shifted = counts.clone();
     shifted.copy = 1;

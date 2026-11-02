@@ -265,6 +265,13 @@ pub struct BlockFormat {
     /// one chain each ([`GroupFold::PerPoly`]). A caller constant like the rest
     /// of the format, bound into the statement through the fold word.
     pub group: GroupFold,
+    /// Which byte checks KECCAK_RND sends
+    /// ([`KeccakRndForm`](crate::tables::keccak_rnd::KeccakRndForm)): today's
+    /// table in every preset ([`Full`](crate::tables::keccak_rnd::KeccakRndForm::Full)),
+    /// or without the 20 checks its D lookups imply
+    /// ([`Lean`](crate::tables::keccak_rnd::KeccakRndForm::Lean), an opt-in
+    /// experiment). Its interactions, so its bus and its GKR trees, follow it.
+    pub keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm,
 }
 
 /// The most groups a block statement may declare: a verifier constant, never in
@@ -374,6 +381,7 @@ impl BlockFormat {
             leaf_query: crate::lfm::whir_block::process_leaf_query(),
             argue: ArgueFormat::BATCHED,
             group: GroupFold::Indexed,
+            keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
         }
     }
 
@@ -409,6 +417,7 @@ impl BlockFormat {
             leaf_query: crate::lfm::whir_chain::LeafQuery::Lean,
             argue: ArgueFormat::BATCHED,
             group: GroupFold::Indexed,
+            keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
         }
     }
 
@@ -420,6 +429,13 @@ impl BlockFormat {
             group,
             ..Self::pinned()
         }
+    }
+
+    /// This format with KECCAK_RND's byte checks as `keccak_rnd` sends them:
+    /// a named constant the prover and
+    /// the verifier of one block both take, never read from a proof.
+    pub fn with_keccak_rnd(self, keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm) -> Self {
+        Self { keccak_rnd, ..self }
     }
 
     /// This format with its batched argue's GKR trees laid out per `pack`:
@@ -3911,6 +3927,13 @@ fn prove_block_whir_inner(
         )?;
         return Ok((proof, stamps));
     }
+    // The whole-run build counts BITWISE for today's KECCAK_RND alone.
+    if format.keccak_rnd != crate::tables::keccak_rnd::KeccakRndForm::Full {
+        return Err(Error::Prover(format!(
+            "KECCAK_RND's {:?} byte checks need the windowed build (`window_log2`)",
+            format.keccak_rnd
+        )));
+    }
 
     let t = Instant::now();
     let result = Executor::new(&program, private_inputs.to_vec())
@@ -3929,7 +3952,12 @@ fn prove_block_whir_inner(
 
     let t = Instant::now();
     let padding = CutPadding::from_env()?;
-    split_keccak_rnd(&mut traces, options.keccak_rnd_rows_log2, padding)?;
+    split_keccak_rnd(
+        &mut traces,
+        options.keccak_rnd_rows_log2,
+        padding,
+        format.keccak_rnd,
+    )?;
     split_ecdas(&mut traces, options.ecdas_rows_log2, padding);
     split_keccak(&mut traces, options.keccak_rows_log2, padding);
     split_ecsm(&mut traces, options.ecsm_rows_log2, padding);
@@ -3965,6 +3993,7 @@ pub(crate) fn split_keccak_rnd(
     traces: &mut Traces,
     rows_log2: usize,
     padding: CutPadding,
+    form: crate::tables::keccak_rnd::KeccakRndForm,
 ) -> Result<(), Error> {
     let rows = 1usize << rows_log2;
     let mu = crate::tables::keccak_rnd::cols::MU;
@@ -3982,7 +4011,7 @@ pub(crate) fn split_keccak_rnd(
             0,
             0,
         ),
-        (left_out * crate::tables::keccak_rnd::ARE_BYTES_PER_ROW) as u64,
+        (left_out * form.are_bytes_per_row()) as u64,
     )
 }
 
@@ -4075,6 +4104,7 @@ pub(crate) fn prove_traces(
         &traces.page_configs,
         &table_counts,
         &inputs,
+        format.keccak_rnd,
     );
 
     let prepared_columns = prepared_tables(&airs, &traces.page_configs, format)?;
@@ -4329,7 +4359,12 @@ type DynAir = dyn stark::traits::AIR<Field = F, FieldExtension = E, PublicInputs
 const CPU_AIR_PAGE: usize = 256;
 
 impl StreamAirs {
-    fn new(opts: &ProofOptions, form: TraceForm, cpu_rows: usize) -> Self {
+    fn new(
+        opts: &ProofOptions,
+        form: TraceForm,
+        cpu_rows: usize,
+        keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm,
+    ) -> Self {
         use crate::test_utils::*;
         // As many CPU tables as a run's rows allow (`tables::cpu::MAX_CPU_ROWS`).
         let most = (crate::tables::cpu::MAX_CPU_ROWS as usize).div_ceil(cpu_rows.max(1));
@@ -4347,7 +4382,7 @@ impl StreamAirs {
             lt: Box::new(create_lt_air(opts)),
             shift: Box::new(create_shift_air(opts)),
             store: Box::new(create_store_air(opts)),
-            keccak_rnd: Box::new(create_keccak_rnd_air(opts)),
+            keccak_rnd: Box::new(create_keccak_rnd_air_for(opts, keccak_rnd)),
         }
     }
 
@@ -5093,8 +5128,16 @@ fn lay_out_rest<'a>(
         rest_cpu_heights(&traces, cpu_rows)?,
         &public_output,
     )?;
-    let airs = run_airs
-        .get_or_init(|| block_airs(program, opts, &traces.page_configs, &table_counts, &inputs));
+    let airs = run_airs.get_or_init(|| {
+        block_airs(
+            program,
+            opts,
+            &traces.page_configs,
+            &table_counts,
+            &inputs,
+            format.keccak_rnd,
+        )
+    });
     marks.push(("airs", at()));
     let prepared = if prepared_now {
         let prepared = prepared_tables(airs, &traces.page_configs, format)?;
@@ -5274,6 +5317,7 @@ fn lay_out_rest_streamed<'a>(
     sink: Option<std::sync::mpsc::Sender<RestDone<'a>>>,
     ledger: Option<&memlog::Ledger>,
     recorder: Option<&regen::Recorder>,
+    keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm,
 ) -> Result<RestLaid<'a>, Error> {
     use std::sync::atomic::Ordering::Relaxed;
     let sink =
@@ -5301,6 +5345,7 @@ fn lay_out_rest_streamed<'a>(
             &header.page_configs,
             &header.table_counts,
             &inputs,
+            keccak_rnd,
         )
     });
     marks.push(("airs", at()));
@@ -5482,7 +5527,7 @@ fn prove_streamed(
     // commits and phase B's arguments alike.
     let fills_before = multilinear::records::fills();
     let times_before = multilinear::records::upload_times();
-    let stream_airs = StreamAirs::new(opts, stream_form, options.max_rows.cpu);
+    let stream_airs = StreamAirs::new(opts, stream_form, options.max_rows.cpu, format.keccak_rnd);
     // Regeneration (`BlockOptions::regen`): its recorder, when phase A can feed
     // it — its chunks generated packed. The disk store's knob, which used to
     // turn it off, refuses the prove when set.
@@ -5873,6 +5918,7 @@ fn prove_streamed(
                 if rest_slide() {
                     builder = builder.slide_rest();
                 }
+                builder = builder.keccak_rnd_form(format.keccak_rnd);
                 if card_fill.keccak_rnd {
                     builder = builder.card_fill_keccak_rnd();
                     #[cfg(test)]
@@ -6244,7 +6290,7 @@ fn prove_streamed(
                 let finish_marks = crate::tables::trace_builder::build_stamps::take();
                 // The builder's own rule (it read the same variable).
                 let padding = CutPadding::from_env()?;
-                split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2, padding)?;
+                split_keccak_rnd(&mut rest, options.keccak_rnd_rows_log2, padding, format.keccak_rnd)?;
                 // Cut at the finish already, and held packed: a packed table
                 // has no rows for `split_rows` to copy.
                 if !options.finish_cuts {
@@ -6332,6 +6378,7 @@ fn prove_streamed(
                         sink,
                         ledger,
                         live_recorder,
+                        format.keccak_rnd,
                     ),
                 };
                 let (streamed, rest) = if inline {
@@ -7391,6 +7438,7 @@ pub(crate) fn block_frame(
         &page_configs,
         statement.table_counts,
         &inputs,
+        format.keccak_rnd,
     );
     // The CPU heights were read at `cpu_proof_start`: the tables must be there.
     airs.check_cpu_position(statement.table_counts)?;
@@ -8605,7 +8653,12 @@ mod packer_tests {
 
     fn packs_alike() {
         let opts = ProofOptions::default_test_options();
-        let airs = StreamAirs::new(&opts, TraceForm::Wide, 1 << 21);
+        let airs = StreamAirs::new(
+            &opts,
+            TraceForm::Wide,
+            1 << 21,
+            crate::tables::keccak_rnd::KeccakRndForm::Full,
+        );
         let air = airs.of(StreamTable::Lt).expect("LT's AIR is the family's");
         // Tables of 4, 8 and 16 rows, in an order that makes uneven groups.
         let heights: Vec<usize> = (0..60).map(|k| [3, 5, 12, 2][k * 7 % 4]).collect();

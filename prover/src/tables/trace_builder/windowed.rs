@@ -789,6 +789,14 @@ impl<'a> WindowedTraceBuilder<'a> {
         self
     }
 
+    /// KECCAK_RND's byte checks as `form` sends them (the block format's
+    /// [`KeccakRndForm`](crate::tables::keccak_rnd::KeccakRndForm)): BITWISE
+    /// counts those and no others. The default is today's table.
+    pub fn keccak_rnd_form(mut self, form: crate::tables::keccak_rnd::KeccakRndForm) -> Self {
+        self.emitted.keccak_rnd_form = form;
+        self
+    }
+
     /// A test's fault ([`StreamSkip::card_fill_fault`]): with
     /// [`Self::card_fill_keccak_rnd`], each KECCAK_RND table's records start
     /// `rows` rows late, the same wrong table however they are filled.

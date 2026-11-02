@@ -245,14 +245,55 @@ fn hwsl(halfword: u16, shift: u8) -> (u16, u16) {
 /// every cell is 0: each padding row sends `ARE_BYTES[0, 0]` this many times.
 pub const ARE_BYTES_PER_ROW: usize = 20 + 200;
 
+/// Which byte checks the table sends: a format value the prover and the
+/// verifier of one block both hold, never read from a proof.
+///
+/// [`Lean`](Self::Lean) leaves out the 20 `Cxz_left` checks, which the D XOR
+/// lookups already imply: each `Cxz_left` byte enters a `BYTE_ALU[XOR]` lookup
+/// (whose operands are bytes) as itself (odd bytes) or plus a carry bit (even
+/// bytes), and the θ identity `2·in = 2¹⁶·carry + 256·hi + lo` then rules out
+/// the one extra value an even byte could take, `−1`, by parity: every term is
+/// below 2¹⁸, so the identity holds over the integers, where its left side is
+/// even. On a padding row (μ = 0) nothing reads `Cxz_left`. That leaves 1,011
+/// interactions, which fit 1,024 GKR slots instead of 2,048.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum KeccakRndForm {
+    /// Every byte check (1,031 interactions): today's table.
+    #[default]
+    Full,
+    /// Without the 20 implied `Cxz_left` checks (1,011 interactions).
+    Lean,
+}
+
+impl KeccakRndForm {
+    /// `ARE_BYTES` sends per row under this form ([`ARE_BYTES_PER_ROW`] for
+    /// [`Self::Full`]).
+    pub const fn are_bytes_per_row(self) -> usize {
+        match self {
+            Self::Full => ARE_BYTES_PER_ROW,
+            Self::Lean => 200,
+        }
+    }
+
+    /// Whether the 20 `Cxz_left` byte checks are sent.
+    pub const fn checks_cxz_left(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
 /// `ARE_BYTES[0, 0]` lookups sent by the padding rows of the KECCAK_RND table
 /// built for `num_ops` keccak calls (none when the table is absent).
 pub fn padding_are_bytes(num_ops: usize) -> u64 {
+    padding_are_bytes_for(num_ops, KeccakRndForm::Full)
+}
+
+/// [`padding_are_bytes`] under `form`.
+pub fn padding_are_bytes_for(num_ops: usize, form: KeccakRndForm) -> u64 {
     if num_ops == 0 {
         return 0;
     }
     let rows = num_ops * 24;
-    ((rows.next_power_of_two().max(4) - rows) * ARE_BYTES_PER_ROW) as u64
+    ((rows.next_power_of_two().max(4) - rows) * form.are_bytes_per_row()) as u64
 }
 
 #[allow(clippy::needless_range_loop)]
@@ -587,8 +628,14 @@ fn fill_op<T: VmTable>(table: &mut T, op: &KeccakRoundOperation, first_row: usiz
 // `KeccakRndConstraints`. The matching HWSL multiplicities are likewise dropped
 // on the BITWISE side (`collect_bitwise_from_keccak`).
 
-#[allow(clippy::needless_range_loop)]
 pub fn bus_interactions() -> Vec<BusInteraction> {
+    bus_interactions_for(KeccakRndForm::Full)
+}
+
+/// The table's interactions under `form`: [`bus_interactions`] without the 20
+/// `Cxz_left` byte checks under [`KeccakRndForm::Lean`].
+#[allow(clippy::needless_range_loop)]
+pub fn bus_interactions_for(form: KeccakRndForm) -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(1031);
 
     // --- IO group (3) ---
@@ -751,22 +798,25 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // implementation guidance in spec/is_byte.typ.
     // Cxz_right uses IS_BIT polynomial constraints (see `KeccakRndConstraints`).
     // Multiplicity 1 (the spec's default `cond`, see `ARE_BYTES_PER_ROW`).
-    for x in 0..5 {
-        for i in 0..4 {
-            interactions.push(BusInteraction::sender(
-                BusId::AreBytes,
-                Multiplicity::One,
-                vec![
-                    BusValue::Packed {
-                        start_column: cols::cxz_left(x, 2 * i),
-                        packing: Packing::Direct,
-                    },
-                    BusValue::Packed {
-                        start_column: cols::cxz_left(x, 2 * i + 1),
-                        packing: Packing::Direct,
-                    },
-                ],
-            ));
+    // Not sent under `KeccakRndForm::Lean`, which the D lookups below imply.
+    if form.checks_cxz_left() {
+        for x in 0..5 {
+            for i in 0..4 {
+                interactions.push(BusInteraction::sender(
+                    BusId::AreBytes,
+                    Multiplicity::One,
+                    vec![
+                        BusValue::Packed {
+                            start_column: cols::cxz_left(x, 2 * i),
+                            packing: Packing::Direct,
+                        },
+                        BusValue::Packed {
+                            start_column: cols::cxz_left(x, 2 * i + 1),
+                            packing: Packing::Direct,
+                        },
+                    ],
+                ));
+            }
         }
     }
 

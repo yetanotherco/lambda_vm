@@ -27,6 +27,7 @@ fn one_group() -> BlockFormat {
         group: multilinear::whir_chain::GroupFold::PerPoly,
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
+        keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
     }
 }
 
@@ -44,6 +45,7 @@ fn many_groups() -> BlockFormat {
         group: multilinear::whir_chain::GroupFold::PerPoly,
         leaf_scale: crate::lfm::whir_block::LeafScale::Fixed,
         leaf_query: crate::lfm::whir_chain::LeafQuery::V1,
+        keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
     }
 }
 
@@ -281,7 +283,13 @@ fn the_kept_tree_depth_moves_no_byte_of_the_proof() {
         &[],
     )
     .expect("the traces build");
-    block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default()).expect("the split");
+    block_whir::split_keccak_rnd(
+        &mut traces,
+        16,
+        CutPadding::default(),
+        crate::tables::keccak_rnd::KeccakRndForm::Full,
+    )
+    .expect("the split");
     let mut proved = |drop_levels: usize| {
         let mut o = options(MaxRowsConfig::small(), 16);
         o.drop_levels = multilinear::whir_commit::TreeDrop::uniform(drop_levels);
@@ -339,7 +347,13 @@ fn narrow_storage_moves_no_byte_of_the_proof() {
         &[],
     )
     .expect("the traces build");
-    block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default()).expect("the split");
+    block_whir::split_keccak_rnd(
+        &mut traces,
+        16,
+        CutPadding::default(),
+        crate::tables::keccak_rnd::KeccakRndForm::Full,
+    )
+    .expect("the split");
     for argue in [ArgueFormat::PerTable, ArgueFormat::BATCHED] {
         let format = BlockFormat {
             argue,
@@ -413,7 +427,13 @@ fn uploading_ahead_moves_no_byte_of_the_proof() {
         &[],
     )
     .expect("the traces build");
-    block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default()).expect("the split");
+    block_whir::split_keccak_rnd(
+        &mut traces,
+        16,
+        CutPadding::default(),
+        crate::tables::keccak_rnd::KeccakRndForm::Full,
+    )
+    .expect("the split");
     for argue in [ArgueFormat::PerTable, ArgueFormat::BATCHED] {
         let format = BlockFormat {
             argue,
@@ -3131,7 +3151,14 @@ fn block_wide_logup_at_the_group_maximum_is_pinned() {
     .expect("pages");
     let inputs =
         crate::BlockAirInputs::new(&opts, &program, vec![1 << 10], &[]).expect("the AIR inputs");
-    let airs = crate::block_airs(&program, &opts, &pages, &counts, &inputs);
+    let airs = crate::block_airs(
+        &program,
+        &opts,
+        &pages,
+        &counts,
+        &inputs,
+        crate::tables::keccak_rnd::KeccakRndForm::Full,
+    );
     let (fractions, len) = airs
         .air_refs()
         .iter()
@@ -3976,7 +4003,13 @@ fn split_traces(
         &[],
     )
     .expect("the traces build");
-    block_whir::split_keccak_rnd(&mut traces, 16, CutPadding::default()).expect("the split");
+    block_whir::split_keccak_rnd(
+        &mut traces,
+        16,
+        CutPadding::default(),
+        crate::tables::keccak_rnd::KeccakRndForm::Full,
+    )
+    .expect("the split");
     cut(&mut traces);
     (program, elf, traces)
 }

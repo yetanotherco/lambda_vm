@@ -23,6 +23,7 @@
 use multilinear::whir_chain::{ArgueFormat, GkrPack, GroupFold, LeafOrder};
 
 use crate::block_whir::{self, BlockFormat, BlockOptions, BlockWhirProof};
+use crate::tables::keccak_rnd::KeccakRndForm;
 use crate::zf_format::WhirBlowup;
 
 use super::compiler::LfmProgram;
@@ -336,6 +337,18 @@ pub fn pack_setting(knob: Option<&str>) -> Result<GkrPack, String> {
     }
 }
 
+/// `BLOCK_WHIR_KECCAK_RND`'s reading:
+/// unset or `full` is today's table ([`KeccakRndForm::Full`]); `lean` drops the
+/// 20 `Cxz_left` byte checks its D lookups imply ([`KeccakRndForm::Lean`]). A
+/// format value: the prover and the verifier of one proof take the same one.
+pub fn keccak_rnd_setting(knob: Option<&str>) -> Result<KeccakRndForm, String> {
+    match knob.map(str::trim) {
+        None | Some("full") => Ok(KeccakRndForm::Full),
+        Some("lean") => Ok(KeccakRndForm::Lean),
+        Some(v) => Err(format!("BLOCK_WHIR_KECCAK_RND={v}: full or lean")),
+    }
+}
+
 /// `argue` with its trees laid out per `pack`: only the batched argue has
 /// trees to pack.
 fn with_pack(argue: ArgueFormat, pack: GkrPack) -> Result<ArgueFormat, String> {
@@ -398,10 +411,19 @@ impl WhirTreeConfig {
             argue,
             leaf_scale,
             leaf_query,
+            keccak_rnd: keccak_rnd_setting(std::env::var("BLOCK_WHIR_KECCAK_RND").ok().as_deref())?,
             ..BlockFormat::production_with(group_setting(
                 std::env::var("LAMBDA_VM_WHIR_GROUP").ok().as_deref(),
             )?)
         };
+        eprintln!(
+            "★ BLOCK KECCAK_RND: {} (BLOCK_WHIR_KECCAK_RND; lean drops the 20 byte checks its D \
+             lookups imply)",
+            match format.keccak_rnd {
+                KeccakRndForm::Full => "full",
+                KeccakRndForm::Lean => "lean",
+            }
+        );
         let mut options = BlockOptions::production();
         // `BLOCK_WHIR_LAYOUT_WORKERS=n`: the streamed chunks laid out on n threads
         // (production 6; 0 is the inline layout).

@@ -327,6 +327,7 @@ pub fn prove_with_options_and_inputs(
         &traces.page_configs,
         &table_counts,
         &inputs,
+        crate::tables::keccak_rnd::KeccakRndForm::Full,
     );
 
     let mut pairs = airs.air_trace_pairs(&mut traces);
@@ -530,6 +531,7 @@ pub fn verify_with_options(
         &page_configs,
         &proof.table_counts,
         &inputs,
+        crate::tables::keccak_rnd::KeccakRndForm::Full,
     );
     // The CPU heights were read at `cpu_proof_start`: the tables must be there.
     airs.check_cpu_position(&proof.table_counts)?;
