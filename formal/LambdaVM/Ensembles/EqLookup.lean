@@ -22,14 +22,15 @@ table with the prover's multiplicity for it. Its row is the vector of multiplici
 role the `μ` columns of BITWISE play. -/
 def pushStatic {Message : TypeMap} [ProvableType Message] (slc : StaticLookupChannel (F p) Message)
     [NeZero slc.table.length] : GeneralFormalCircuit (F p) (fields slc.table.length) unit where
+  name := slc.name
   main mults := do
     let _ ← Circuit.mapFinRange slc.table.length fun i =>
-      (Channel.fromStatic (F p) Message slc).emit mults[i] (const slc.table[i])
-  channelsWithRequirements := [(Channel.fromStatic (F p) Message slc).toRaw]
+      slc.toChannel.emit mults[i] (const slc.table[i])
+  channelsWithRequirements := [slc.toChannel.toRaw]
   Spec _ _ _ := True
   soundness := by
     circuit_proof_start
-    intro i _ _
+    intro i _
     exact (slc.guarantees_iff _).mpr (List.getElem_mem _)
   completeness := by circuit_proof_start
 
@@ -43,58 +44,98 @@ lemma pushStatic_channelsWithGuarantees {Message : TypeMap} [ProvableType Messag
 @[circuit_norm]
 lemma pushStatic_channelsWithRequirements {Message : TypeMap} [ProvableType Message]
     (slc : StaticLookupChannel (F p) Message) [NeZero slc.table.length] :
-    (pushStatic slc).channelsWithRequirements = [(Channel.fromStatic (F p) Message slc).toRaw] := rfl
+    (pushStatic slc).channelsWithRequirements = [slc.toChannel.toRaw] := rfl
 
-lemma RawChannel.ne_of_name_ne {c1 c2 : RawChannel (F p)} (h : c1.name ≠ c2.name) : c1 ≠ c2 :=
-  fun e => h (congrArg RawChannel.name e)
+/-- The provider as a component. Clean main asks every component for its witness generation;
+the multiplicities are counted from the demand on the channel. -/
+def pushStaticComponent {Message : TypeMap} [ProvableType Message]
+    (slc : StaticLookupChannel (F p) Message) [NeZero slc.table.length] : Component (F p) where
+  circuit := pushStatic slc
+  generation := .demand {
+    channel := slc.toChannel
+    trigger := .pull
+    input _ := pure (fromElements (Vector.replicate slc.table.length .multiplicity)) }
+
+/-- The EQ chip as a component, generated from the demand on the ALU bus. -/
+def eqComponent : Component (F p) where
+  circuit := EQ.circuit
+  generation := .demand {
+    channel := Alu.channel
+    trigger := .push
+    input _ := pure (fromElements (Vector.replicate (size EQ.Row) .multiplicity)) }
+
+@[circuit_norm] lemma pushStaticComponent_circuit {Message : TypeMap} [ProvableType Message]
+    (slc : StaticLookupChannel (F p) Message) [NeZero slc.table.length] :
+    (pushStaticComponent slc).circuit = pushStatic slc := rfl
+@[circuit_norm] lemma pushStatic_name {Message : TypeMap} [ProvableType Message]
+    (slc : StaticLookupChannel (F p) Message) [NeZero slc.table.length] :
+    (pushStatic slc).name = slc.name := rfl
+@[circuit_norm] lemma eqComponent_circuit : eqComponent.circuit = EQ.circuit := rfl
+@[circuit_norm] lemma pushStaticComponent_channelsWithGuarantees {Message : TypeMap}
+    [ProvableType Message] (slc : StaticLookupChannel (F p) Message) [NeZero slc.table.length] :
+    (pushStaticComponent slc).circuit.channelsWithGuarantees = [] :=
+  pushStatic_channelsWithGuarantees slc
+@[circuit_norm] lemma pushStaticComponent_channelsWithRequirements {Message : TypeMap}
+    [ProvableType Message] (slc : StaticLookupChannel (F p) Message) [NeZero slc.table.length] :
+    (pushStaticComponent slc).circuit.channelsWithRequirements = [slc.toChannel.toRaw] := rfl
+@[circuit_norm] lemma eq_name : EQ.circuit.name = "EQ" := rfl
+@[circuit_norm] lemma isHalfTable_name : Bitwise.isHalfTable.name = "IS_HALF" := rfl
+@[circuit_norm] lemma zeroTable_name : Bitwise.zeroTable.name = "ZERO" := rfl
+@[circuit_norm] lemma alu_name : Alu.channel.name = "ALU" := rfl
+@[circuit_norm] lemma eqComponent_channelsWithGuarantees :
+    eqComponent.circuit.channelsWithGuarantees = [Bitwise.IsHalf.toRaw, Bitwise.IsHalf.toRaw,
+      Bitwise.IsHalf.toRaw, Bitwise.IsHalf.toRaw, Bitwise.Zero.toRaw] := rfl
+@[circuit_norm] lemma eqComponent_channelsWithRequirements :
+    eqComponent.circuit.channelsWithRequirements = [Alu.channel.toRaw] := rfl
 
 instance : NeZero Bitwise.isHalfTable.table.length :=
   ⟨by simp [Bitwise.isHalfTable, Bitwise.rows, Bitwise.numRows]⟩
 instance : NeZero Bitwise.zeroTable.table.length :=
   ⟨by simp [Bitwise.zeroTable, Bitwise.rows, Bitwise.numRows]⟩
 
-def eqLookup : SoundEnsemble (F p) unit :=
-  SoundEnsemble.empty (F p) unit
-  |>.addTable ⟨pushStatic Bitwise.isHalfTable⟩
-      (by rw [pushStatic_channelsWithGuarantees]; simp)
-      (by simp only [circuit_norm, List.not_mem_nil, false_implies, implies_true])
-  |>.addFinishedChannel Bitwise.IsHalf.toRaw
-  |>.addTable ⟨pushStatic Bitwise.zeroTable⟩
-      (by rw [pushStatic_channelsWithGuarantees]; simp)
-      (by
-        intro channel hc
-        simp only [circuit_norm, List.mem_singleton] at hc
-        subst hc
-        rw [pushStatic_channelsWithRequirements, List.mem_singleton]
-        exact RawChannel.ne_of_name_ne (by decide))
-  |>.addFinishedChannel Bitwise.Zero.toRaw
-  |>.addTable ⟨EQ.circuit⟩
-      (by simp [circuit_norm, EQ.circuit, Bitwise.isHalfTable, Bitwise.zeroTable])
-      (by simp [circuit_norm, EQ.circuit, Alu.channel, Bitwise.isHalfTable, Bitwise.zeroTable])
-  |>.addFinishedChannel Alu.channel.toRaw
+def eqLookup (balance : Balance (F p)) : SoundEnsemble (F p) unit balance :=
+  SoundEnsemble.empty (F p) unit balance
+  |>.addChannel Bitwise.IsHalf.toRaw
+  |>.addTable (pushStaticComponent Bitwise.isHalfTable)
+      (by rw [pushStaticComponent_channelsWithGuarantees]; exact List.nil_subset _)
+      (by rw [pushStaticComponent_channelsWithRequirements]; simp [circuit_norm])
+  |>.markFinished Bitwise.IsHalf.toRaw
+  |>.addChannel Bitwise.Zero.toRaw
+  |>.addTable (pushStaticComponent Bitwise.zeroTable)
+      (by rw [pushStaticComponent_channelsWithGuarantees]; exact List.nil_subset _)
+      (by rw [pushStaticComponent_channelsWithRequirements]; simp [circuit_norm])
+  |>.markFinished Bitwise.Zero.toRaw
+  |>.addChannel Alu.channel.toRaw
+  |>.addTable eqComponent
+      (by rw [eqComponent_channelsWithGuarantees]; simp [circuit_norm])
+      (by rw [eqComponent_channelsWithRequirements]; simp [circuit_norm])
+  |>.markFinished Alu.channel.toRaw
 
-/-- Lookup soundness, concretely: if the constraints of every table hold and every channel
-balances, then every EQ row with `μ = 1` and range-checked operands carries the equality bit. -/
-theorem eq_rows_correct (witness : EnsembleWitness eqLookup.ensemble)
-    (hc : witness.Constraints) (hb : witness.BalancedChannels) :
-    ∀ table ∈ witness.tables, table.component = ⟨EQ.circuit⟩ →
+/-- Lookup soundness, concretely: if the constraints of every table hold, every channel has few
+enough interactions for the balance check, and every channel balances, then every EQ row with
+`μ = 1` and range-checked operands carries the equality bit. -/
+theorem eq_rows_correct {balance : Balance (F p)}
+    (witness : EnsembleWitness (eqLookup balance).ensemble)
+    (hc : witness.Constraints) (hfit : witness.InteractionsFit balance)
+    (hb : witness.Balanced balance) :
+    ∀ table ∈ witness.tables, table.component = eqComponent →
       ∀ row ∈ table.table, EQ.RowSpec (valueFromOffset EQ.Row 0 (table.environment row)) := by
-  have hsound : eqLookup.ensemble.TableSoundness :=
+  have hsound : (eqLookup balance).ensemble.TableSoundness balance :=
     Ensemble.tableSoundness_of_soundChannels
-      ⟨eqLookup.finished, eqLookup.finished_subset, eqLookup.soundChannels⟩
+      ⟨(eqLookup balance).finished, (eqLookup balance).finished_subset,
+        (eqLookup balance).soundChannels⟩
+  -- no component assumes anything
   have hassume : witness.Assumptions := by
-    intro table htable
-    have hmem := EnsembleWitness.mem_allTables_component_of_mem_allTables htable
-    simp only [circuit_norm, eqLookup, Ensemble.allTables, List.mem_cons, List.not_mem_nil,
-      or_false] at hmem
-    obtain ⟨comp, width, tbl, data, uw⟩ := table
+    intro table htable row _
+    have hmem := witness.component_mem_tables_of_mem htable
+    simp only [eqLookup, circuit_norm, List.mem_cons, List.not_mem_nil, or_false] at hmem
+    obtain ⟨comp, tbl, data, uw, ll, frm, dc⟩ := table
     simp only at hmem
-    intro row _
-    rcases hmem with h | h | h | h <;> subst h <;> exact trivial
-  have hspec := hsound witness hassume hc hb
+    rcases hmem with rfl | rfl | rfl <;> trivial
+  have hspec := (hsound witness hassume hc hfit hb).2
   intro table htable hcomp row hrow
-  have := hspec table (witness.mem_allTables_of_mem_tables htable) row hrow
-  obtain ⟨comp, width, tbl, data, uw⟩ := table
+  have := hspec table htable row hrow
+  obtain ⟨comp, tbl, data, uw, ll, frm, dc⟩ := table
   simp only at hcomp
   subst hcomp
   exact this

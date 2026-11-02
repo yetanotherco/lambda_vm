@@ -297,14 +297,16 @@ theorem soundness :
     rcases hmb with hmu0 | hmu1
     · -- μ = 0: nothing is required of the row
       rw [hmu0] at hleft ⊢
-      refine ⟨fun h => absurd h (by norm_num), ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_,
-        ?_, ?_⟩
+      -- each pull owes a multiplicity of 0 or 1, and the inactive push owes nothing
+      constructorm* _ ∧ _
       all_goals first
-        | exact req_vacuous hsb
-        | exact req_vacuous hleft
-        | exact req_vacuous hdb
-        | exact req_vacuous hzb'
-        | (intro _ h0; exact absurd rfl h0)
+        | exact hsb
+        | exact hleft
+        | exact hdb
+        | exact hzb'
+        | (left; rfl)
+        | (intro h; exact absurd rfl h)
+        | (intro h; exact absurd h (by norm_num))
     subst hmu1
     -- the facts every active row has
     have hd2 := IsBool.val_lt_two hdb
@@ -491,16 +493,18 @@ theorem soundness :
       simp only [limbs]
       omega
     -- the row spec and the bus requirements
-    refine ⟨fun _ => key, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+    refine ⟨fun _ => key, ?_⟩
+    -- each pull owes a multiplicity of 0 or 1
+    constructorm* _ ∧ _
     all_goals first
-      | exact req_vacuous hsb
-      | exact req_vacuous hleft
-      | exact req_vacuous hdb
-      | exact req_vacuous hzb'
-      | exact (fun h => absurd rfl h)
+      | exact hsb
+      | exact hleft
+      | exact hdb
+      | exact hzb'
+      | (right; rfl)
       | skip
     -- what remains is the ALU push
-    intro _ _ hin1lo hin1hi hin2lo hin2hi
+    intro _ hin1lo hin1hi hin2lo hin2hi
     -- the flag byte, read as a natural
     have hflagsV : (5 + input_wordInstr + 32 * input_signed + 64 * input_direction : F p).val
         = 5 + input_wordInstr.val + 32 * input_signed.val + 64 * input_direction.val :=
@@ -662,20 +666,20 @@ theorem completeness :
         · rw [hs]; ring
       · -- MSB16[in[3]] when signed
         intro h
-        have hs1 : input_signed = 1 := neg_inj.mp h
+        have hs1 : input_signed = 1 := h
         rw [hs1, val_one_eq, if_pos rfl] at hn
         exact ⟨hi3, hn⟩
       · -- BYTE_ALU[AND, shift, 15] when left
         intro h
         have hd0 : input_direction = 0 := by
-          have := neg_inj.mp h
+          have := h
           linear_combination -this
         rw [hd0, ZMod.val_zero, if_pos rfl] at hb
         refine ⟨hsA, by rw [h15]; norm_num, Or.inl ?_⟩
         rw [h15, ShiftCore.and15, hb]
       · -- BYTE_ALU[AND, 256 − 16·zbs − shift, 15] when right
         intro h
-        have hd1 : input_direction = 1 := neg_inj.mp h
+        have hd1 : input_direction = 1 := h
         rw [hd1, val_one_eq, if_neg one_ne_zero] at hb
         rcases hzb with hz | hz
         · have hbne : input_bitShift.val ≠ 0 := fun h0 => by
@@ -788,8 +792,8 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       have hsb := mul_one_sub_eq_zero_iff.mp h_sg
       have hzb := mul_one_sub_eq_zero_iff.mp h_zbs
       have hmb := mul_one_sub_eq_zero_iff.mp h_mu
+      -- each pull owes a multiplicity of 0 or 1
       constructorm* _ ∧ _ <;>
-      · intro h1 h0
         rcases hmb with hm | hm <;> rcases hdb with hd | hd <;> rcases hzb with hz | hz <;>
           rcases hsb with hs | hs <;> simp_all
 

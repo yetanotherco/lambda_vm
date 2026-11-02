@@ -10,18 +10,14 @@
      "lhs": {"value": 1, "type": "const"}},
     "lhs": {"type": "var", "index": 16}}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 16},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 16},
     "message": [{"type": "var", "index": 1}],
+    "direction": "pull",
     "channel": "IS_HALF"}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 16},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 16},
     "message": [{"type": "var", "index": 4}],
+    "direction": "pull",
     "channel": "IS_HALF"}},
   {"assert":
    {"type": "mul",
@@ -44,18 +40,14 @@
      "lhs": {"value": 1, "type": "const"}},
     "lhs": {"type": "var", "index": 14}}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 16},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 16},
     "message": [{"type": "var", "index": 2}, {"type": "var", "index": 12}],
+    "direction": "pull",
     "channel": "MSB16"}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 16},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 16},
     "message": [{"type": "var", "index": 5}, {"type": "var", "index": 13}],
+    "direction": "pull",
     "channel": "MSB16"}},
   {"assert":
    {"type": "add",
@@ -438,32 +430,24 @@
           "lhs": {"value": 65536, "type": "const"}},
          "lhs": {"type": "var", "index": 4}}}}}}}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 16},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 16},
     "message": [{"type": "var", "index": 8}],
+    "direction": "pull",
     "channel": "IS_HALF"}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 16},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 16},
     "message": [{"type": "var", "index": 9}],
+    "direction": "pull",
     "channel": "IS_HALF"}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 16},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 16},
     "message": [{"type": "var", "index": 10}],
+    "direction": "pull",
     "channel": "IS_HALF"}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 16},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 16},
     "message": [{"type": "var", "index": 11}],
+    "direction": "pull",
     "channel": "IS_HALF"}},
   {"interact":
    {"multiplicity": {"type": "var", "index": 16},
@@ -488,6 +472,7 @@
        "lhs": {"value": 4, "type": "const"}}},
      {"type": "var", "index": 15},
      {"value": 0, "type": "const"}],
+    "direction": "push",
     "channel": "ALU"}}],
  "name": "lt",
  "columns": 17}

@@ -63,6 +63,8 @@ fn eval(e: &Expr, row: &[FE]) -> FE {
 
 struct LeanInteract {
     channel: String,
+    /// Clean's direction: a pull takes the message from the channel, a push adds it.
+    pull: bool,
     mult: Expr,
     msg: Vec<Expr>,
 }
@@ -89,6 +91,11 @@ fn load_lean(name: &str) -> LeanCircuit {
         } else if let Some(i) = op.get("interact") {
             interacts.push(LeanInteract {
                 channel: i["channel"].as_str().expect("channel").to_string(),
+                pull: match i["direction"].as_str().expect("direction") {
+                    "pull" => true,
+                    "push" => false,
+                    other => panic!("unknown direction {other}"),
+                },
                 mult: parse_expr(&i["multiplicity"]),
                 msg: i["message"]
                     .as_array()
@@ -129,8 +136,9 @@ fn bus_id_of(channel: &str) -> u64 {
 // =============================================================================
 
 /// `(bus id, signed multiplicity, bus elements)` of a Rust interaction on a row. A sender
-/// adds `+m`, a receiver `−m`; Clean's pull is `−e` and push `+e`, so the signs agree once a
-/// receiver (the table that answers the lookup, Clean's push) keeps its multiplicity.
+/// adds `+m`, a receiver `−m`; Clean's pull of multiplicity `e` counts `−e` and its push `+e`,
+/// so the signs agree once a receiver (the table that answers the lookup, Clean's push) keeps
+/// its multiplicity.
 fn rust_interaction_at(i: &BusInteraction, row: &[FE]) -> (u64, FE, Vec<FE>) {
     let m = i.multiplicity.evaluate_with(|c| row[c]);
     let m = if i.is_sender { -m } else { m };
@@ -143,9 +151,10 @@ fn rust_interaction_at(i: &BusInteraction, row: &[FE]) -> (u64, FE, Vec<FE>) {
 }
 
 fn lean_interaction_at(i: &LeanInteract, row: &[FE]) -> (u64, FE, Vec<FE>) {
+    let m = eval(&i.mult, row);
     (
         bus_id_of(&i.channel),
-        eval(&i.mult, row),
+        if i.pull { -m } else { m },
         i.msg.iter().map(|e| eval(e, row)).collect(),
     )
 }
