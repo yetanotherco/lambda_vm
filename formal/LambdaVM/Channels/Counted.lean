@@ -112,19 +112,19 @@ lemma balanceOf_counted (N : ℕ) (msg : Array F) :
       · refine ⟨s, by omega, ?_, ?_⟩
         · have hsigned : i.signedMult = 0 := by
             cases hd : i.direction <;> simp [Interaction.signedMult, hd, h0]
-          rw [if_pos hm, hsigned, hb, zero_add]
+          rw [ite_eq_left hm, hsigned, hb, zero_add]
         · intro a ha' ham ha0
           rcases List.mem_cons.mp ha' with rfl | ha'
           · exact absurd h0 ha0
           · exact ha a ha' ham ha0
       · obtain ⟨hd, k, hk1, hkN, hk⟩ := h i (by simp) hm h0
         refine ⟨k + s, by omega, ?_, ?_⟩
-        · rw [if_pos hm, hb]
+        · rw [ite_eq_left hm, hb]
           simp only [Interaction.signedMult, hd, hk]
           push_cast; ring
         · intro a _ _ _; omega
     · refine ⟨s, by omega, ?_, ?_⟩
-      · rw [if_neg hm, hb, zero_add]
+      · rw [ite_eq_right hm, hb, zero_add]
       · intro a ha' ham ha0
         rcases List.mem_cons.mp ha' with rfl | ha'
         · exact absurd ham hm

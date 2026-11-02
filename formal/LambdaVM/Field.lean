@@ -108,7 +108,7 @@ lemma val_sub_of_val_lt {a b : ℕ} (ha : a < 2^40) (hb : b < 2^40)
       have := congrArg ZMod.val h0
       rw [val_natCast_of_lt_two_pow_40 (by omega), ZMod.val_zero] at this
       omega
-    rw [if_neg hne, val_natCast_of_lt_two_pow_40 (by omega)] at h
+    rw [ite_eq_right hne, val_natCast_of_lt_two_pow_40 (by omega)] at h
     have hp : 2^41 < p := by decide
     omega
 
@@ -125,7 +125,7 @@ lemma val_neg_two : (-2 : F p).val = p - 2 := by
     have := congrArg ZMod.val h
     rw [val_ofNat 2 (by norm_num), ZMod.val_zero] at this
     omega
-  rw [ZMod.neg_val, if_neg h2, val_ofNat 2 (by norm_num)]
+  rw [ZMod.neg_val, ite_eq_right h2, val_ofNat 2 (by norm_num)]
 
 /-- Three bits whose complement `1 − l0 − l1 − l2` is also a bit are at most one-hot. -/
 lemma onehot_of_isBool {l0 l1 l2 : F p} (h0 : IsBool l0) (h1 : IsBool l1) (h2 : IsBool l2)
