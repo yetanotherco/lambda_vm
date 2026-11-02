@@ -361,12 +361,11 @@ fn lean_diff_lt() {
         cols::NUM_COLUMNS,
         &rows_of(&trace, cols::NUM_COLUMNS),
     );
-    // Known deltas: the Lean model keeps `μ·(1 − μ) = 0` (assert 0), the Rust chip bounds
-    // `μ` with the `ARE_BYTES[μ, 0]` send instead.
-    assert_eq!(
-        report.lean_asserts_unmatched,
-        vec![0],
-        "[LT] only the μ bit constraint should be Lean-only"
+    // The Lean model bounds `μ` with the `ARE_BYTES[μ, 0]` pull, as the Rust chip does, so the
+    // two agree exactly.
+    assert!(
+        report.lean_asserts_unmatched.is_empty(),
+        "[LT] Lean-only constraints"
     );
     assert!(
         report.rust_constraints_unmatched.is_empty(),
@@ -376,10 +375,9 @@ fn lean_diff_lt() {
         report.lean_interacts_unmatched.is_empty(),
         "[LT] Lean-only interactions"
     );
-    assert_eq!(
-        report.rust_interacts_unmatched,
-        vec![0],
-        "[LT] only ARE_BYTES[μ, 0] should be Rust-only"
+    assert!(
+        report.rust_interacts_unmatched.is_empty(),
+        "[LT] Rust-only interactions"
     );
 }
 
