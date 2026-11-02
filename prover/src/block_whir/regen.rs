@@ -749,9 +749,8 @@ fn first_window(ends: &[usize], start: usize) -> Option<(usize, usize)> {
 }
 
 /// Phase A's recorder under `mode`, when phase A can feed it: `streams` (it
-/// streams its windows and generates each streamed chunk packed, G-pack, and
-/// streams neither KECCAK_RND nor the MEMW-derived LT ops, whose chunks the
-/// regenerator does not cut). None otherwise, saying why.
+/// streams its windows and generates each streamed chunk packed, G-pack).
+/// None otherwise, saying why.
 pub(crate) fn recorder(mode: RegenMode, streams: bool) -> Option<Recorder> {
     match (mode, streams) {
         (RegenMode::Off, _) => None,
@@ -759,7 +758,7 @@ pub(crate) fn recorder(mode: RegenMode, streams: bool) -> Option<Recorder> {
         (_, false) => {
             eprintln!(
                 "BLOCK REGEN: {mode:?} wanted, but phase A does not stream its chunks packed (windows, \
-                 G-pack, narrow groups; KECCAK_RND and the MEMW-derived LT ops not streamed): off"
+                 G-pack, narrow groups): off"
             );
             None
         }

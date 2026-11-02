@@ -364,13 +364,6 @@ impl WhirTreeConfig {
             )?)
         };
         let mut options = BlockOptions::production();
-        // `BLOCK_WHIR_STREAM_KECCAK_RND=1`: KECCAK_RND's chunks streamed (off by
-        // default: NO EFFECT on this block, FAST 418).
-        options.stream_keccak_rnd =
-            std::env::var("BLOCK_WHIR_STREAM_KECCAK_RND").is_ok_and(|v| v.trim() == "1");
-        // `BLOCK_WHIR_STREAM_MEMW_LT=1`: the MEMW-derived LT ops streamed per window.
-        options.stream_memw_lt =
-            std::env::var("BLOCK_WHIR_STREAM_MEMW_LT").is_ok_and(|v| v.trim() == "1");
         // `BLOCK_WHIR_LAYOUT_WORKERS=n`: the streamed chunks laid out on n threads
         // (production 6; 0 is the inline layout).
         if let Some(n) = count_knob("BLOCK_WHIR_LAYOUT_WORKERS")? {
@@ -388,17 +381,6 @@ impl WhirTreeConfig {
                     options.layout_ahead = Some(k);
                 }
             }
-            Err(_) => {}
-        }
-        // `BLOCK_WHIR_PACK_REST=0|1` (production 0): the rest packed as it is laid
-        // out.
-        match std::env::var("BLOCK_WHIR_PACK_REST")
-            .as_deref()
-            .map(str::trim)
-        {
-            Ok("0") => options.pack_rest_as_laid_out = false,
-            Ok("1") => options.pack_rest_as_laid_out = true,
-            Ok(other) => return Err(format!("BLOCK_WHIR_PACK_REST={other}: 0 or 1")),
             Err(_) => {}
         }
         // `BLOCK_WHIR_DROP_OPS=0`: the builder keeps the streamed chunks' ops
@@ -1907,12 +1889,9 @@ pub fn prove_whir_block_tree(
     let opts = super::proof::block_base_options();
     super::device_permit::arm(siblings);
     sink.line(&format!(
-        "W3 CONFIG: leaves {leaves:?} · siblings {siblings} · fan-in {fan_in} · KECCAK_RND streamed {} · MEMW LT streamed {} · layout workers {} (ahead {:?}) · rest packed as laid out {} · streamed ops dropped {}",
-        options.stream_keccak_rnd,
-        options.stream_memw_lt,
+        "W3 CONFIG: leaves {leaves:?} · siblings {siblings} · fan-in {fan_in} · layout workers {} (ahead {:?}) · streamed ops dropped {}",
         options.layout_workers,
         options.layout_ahead,
-        options.pack_rest_as_laid_out,
         options.drop_streamed_ops
     ));
 

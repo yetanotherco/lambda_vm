@@ -459,17 +459,6 @@ pub struct BlockOptions {
     /// table as its chunk completes ([`WindowedTraceBuilder`]); `None`: build
     /// the whole run, then commit.
     pub window_log2: Option<usize>,
-    /// With windows: stream KECCAK_RND's 2^`keccak_rnd_rows_log2`-row chunks as
-    /// their ops arrive, instead of building them at the run's end. Off by
-    /// default: on block 25368371 the keccak work sits at the run's end, and
-    /// streaming it read NO EFFECT (FAST 418).
-    pub stream_keccak_rnd: bool,
-    /// With windows: derive each window's MEMW-derived LT ops as it arrives, so
-    /// LT's full chunks stream with them
-    /// ([`WindowedTraceBuilder::stream_memw_lt`]: other chunks than the
-    /// whole-run build's, the same LT multiplicities). Off by default: the
-    /// extra chunks bind the layout thread, a REGRESSION (FAST 420).
-    pub stream_memw_lt: bool,
     /// With windows: the builder drops each streamed chunk's ops as the chunk
     /// leaves ([`WindowedTraceBuilder::drop_streamed_ops`]), so the build does
     /// not hold the run's op lists to its end; the traces are the same. On in
@@ -492,13 +481,6 @@ pub struct BlockOptions {
     /// which BIG 390 saw grow with the block. Production
     /// `Some(`[`BLOCK_LAYOUT_AHEAD`]`)`.
     pub layout_ahead: Option<usize>,
-    /// With `layout_workers > 0`: pack the rest of the run as it is laid out,
-    /// in AIR order, so a group closes once its own tables are ready instead
-    /// of after all of them; the packing order is the same. Production: off.
-    /// With [`Self::rest_layout_bytes`]'s waves the groups do close earlier,
-    /// but at 1× the committer is still busy when they do: on top of the waves
-    /// it read +0.01 s, and alone +0.21 s (FAST 852 / 853; +0.21 s at FAST 422).
-    pub pack_rest_as_laid_out: bool,
     /// How phase A holds each group's columns once committed
     /// ([`multilinear_block::Narrowing`]): production packs them narrow on the
     /// card, which leaves the proof's bytes as they are.
@@ -513,7 +495,7 @@ pub struct BlockOptions {
     /// measurement; it moves no proof byte. Production reads
     /// `LAMBDA_VM_BLOCK_MEMLOG=1` (off by default).
     pub memlog: bool,
-    /// With windows and KECCAK_RND not streamed: the finish builds KECCAK_RND
+    /// With windows: the finish builds KECCAK_RND
     /// as its 2^`keccak_rnd_rows_log2`-row tables
     /// ([`WindowedTraceBuilder::keccak_rnd_chunks_at_finish`]) instead of one
     /// table that [`split_keccak_rnd`] then copies apart; the tables are the
@@ -1113,13 +1095,13 @@ fn drop_wanted(
 impl BlockOptions {
     /// Whether the finish streams the rest under its byte gate
     /// ([`Self::finish_stream`]): it needs the layout thread, the finish's
-    /// cuts and KECCAK_RND streamed or built as its tables.
+    /// cuts and KECCAK_RND built as its tables.
     pub(crate) fn rest_streams(&self) -> bool {
         self.finish_stream
             && self.layout_workers > 0
             && self.finish_cuts
-            && (self.stream_keccak_rnd
-                || (self.finish_keccak_rnd_chunks && self.keccak_rnd_rows_log2 >= 5))
+            && self.finish_keccak_rnd_chunks
+            && self.keccak_rnd_rows_log2 >= 5
     }
 
     /// Every chunked table at 2^21 rows, KECCAK_RND at 2^16, ECDAS at 2^17,
@@ -1134,12 +1116,9 @@ impl BlockOptions {
             copy_rows_log2: BLOCK_COPY_ROWS_LOG2,
             drop_levels: tree_drop_from_env(),
             window_log2: Some(BLOCK_WINDOW_LOG2),
-            stream_keccak_rnd: false,
-            stream_memw_lt: false,
             drop_streamed_ops: true,
             layout_workers: BLOCK_LAYOUT_WORKERS,
             layout_ahead: Some(BLOCK_LAYOUT_AHEAD),
-            pack_rest_as_laid_out: false,
             narrow: multilinear_block::Narrowing::CARD,
             upload_ahead: true,
             memlog: memlog::from_env(),
@@ -4679,7 +4658,7 @@ fn lay_out_chunk<'a>(
 /// The streamed chunks, packed in arrival order: the packer, each chunk's
 /// shape, the seconds laying them out (summed over threads) and when the last
 /// was placed; and the rest's tables it packed as they were laid out, by AIR
-/// index ([`BlockOptions::pack_rest_as_laid_out`]).
+/// index (a streamed rest's).
 struct StreamLaid<'a> {
     packer: Packer<'a>,
     shapes: Vec<(StreamTable, usize, (usize, usize))>,
@@ -4825,9 +4804,9 @@ impl Drop for ClosePermits<'_> {
 /// The chunks laid out on `workers` threads and packed on one more, in
 /// arrival order all the same, so a waiting phase A holds back only the
 /// packing; this thread hands them out and, once the run is built, lays out
-/// the rest of it (`rest`) while the last chunks are packed. With
-/// `pack_rest`, or a streamed rest, `rest` sends the rest's tables to the
-/// packer as they are laid out, and it packs them after the chunks, in AIR
+/// the rest of it (`rest`) while the last chunks are packed. With a streamed
+/// rest, `rest` sends the rest's tables to the packer as they are laid out,
+/// and it packs them after the chunks, in AIR
 /// order, giving each table's bytes back to `gate` as it places it (a
 /// streamed rest's byte gate, stopped when the packer stops). Their channel is
 /// unbounded: the rest is already in memory, or held under the gate, and a
@@ -4839,7 +4818,6 @@ fn stream_pipelined<'a, R>(
     mut packer: Packer<'a>,
     workers: usize,
     ahead: Option<usize>,
-    pack_rest: bool,
     gate: Option<&'a crate::tables::trace_builder::gate::ByteGate>,
     recorder: Option<&regen::Recorder>,
     waits: Option<&ProducerWaits>,
@@ -4986,7 +4964,10 @@ fn stream_pipelined<'a, R>(
         let rest = match traces {
             // A streamed rest is always placed as it is laid out.
             Some(traces @ RestIn::Stream(_)) => Some(rest(traces, Some(rtx))),
-            Some(traces) => Some(rest(traces, pack_rest.then_some(rtx))),
+            Some(traces) => {
+                drop(rtx);
+                Some(rest(traces, None))
+            }
             None => {
                 drop(rtx);
                 None
@@ -5462,9 +5443,8 @@ fn prove_streamed(
     let times_before = multilinear::records::upload_times();
     let stream_airs = StreamAirs::new(opts, stream_form, options.max_rows.cpu);
     // Regeneration (`BlockOptions::regen`): its recorder, when phase A can feed
-    // it — its chunks generated packed, and none of KECCAK_RND's or of the
-    // MEMW-derived LT ops streamed (chunks no regenerator cuts). The disk
-    // store's knob, which used to turn it off, refuses the prove when set.
+    // it — its chunks generated packed. The disk store's knob, which used to
+    // turn it off, refuses the prove when set.
     regen::refuse_spill_knob(std::env::var("LAMBDA_VM_BLOCK_SPILL").ok().as_deref())?;
     let regen_mode = match options.regen {
         Some(mode) => mode,
@@ -5473,18 +5453,15 @@ fn prove_streamed(
     // A streamed chunk held as its records parks and drops like any chunk,
     // unless records are kept: then it has no recipe and no rank.
     let keep_records = deviations.records_keep.map_or_else(records_keep, Ok)?;
-    let regen_recorder = regen::recorder(
-        regen_mode,
-        stream_form == TraceForm::Narrow && !options.stream_keccak_rnd && !options.stream_memw_lt,
-    )
-    .map(|recorder| {
-        if keep_records {
-            recorder.keep_records()
-        } else {
-            recorder
-        }
-    })
-    .map(std::sync::Arc::new);
+    let regen_recorder = regen::recorder(regen_mode, stream_form == TraceForm::Narrow)
+        .map(|recorder| {
+            if keep_records {
+                recorder.keep_records()
+            } else {
+                recorder
+            }
+        })
+        .map(std::sync::Arc::new);
     let recorder = regen_recorder.as_deref();
     // Live regeneration's recorder: the rest's tables it can build again are
     // tagged as they are laid out (N3).
@@ -5795,9 +5772,7 @@ fn prove_streamed(
                 }
                 let mut builder =
                     WindowedTraceBuilder::new(program, private_inputs, &options.max_rows)?;
-                if options.stream_keccak_rnd {
-                    builder = builder.keccak_rnd_chunks(1usize << options.keccak_rnd_rows_log2)?;
-                } else if options.finish_keccak_rnd_chunks && options.keccak_rnd_rows_log2 >= 5 {
+                if options.finish_keccak_rnd_chunks && options.keccak_rnd_rows_log2 >= 5 {
                     builder = builder
                         .keccak_rnd_chunks_at_finish(1usize << options.keccak_rnd_rows_log2)?;
                 }
@@ -5814,9 +5789,6 @@ fn prove_streamed(
                     if options.gpack {
                         builder = builder.generate_packed();
                     }
-                }
-                if options.stream_memw_lt {
-                    builder = builder.stream_memw_lt();
                 }
                 if let Some(on) = deviations.handout_count_thread {
                     builder = builder.count_handout_on_thread(on);
@@ -6218,13 +6190,6 @@ fn prove_streamed(
                     split_ecsm(&mut rest, options.ecsm_rows_log2, padding);
                     split_copy(&mut rest, options.copy_rows_log2, padding);
                 }
-                if deviations.omit_first_keccak_rnd && options.stream_keccak_rnd {
-                    return Err(Error::Prover(
-                        "omit_first_keccak_rnd is a non-streamed deviation: a streamed chunk \
-                         lands by its index"
-                            .into(),
-                    ));
-                }
                 if deviations.omit_first_keccak_rnd && !rest.keccak_rnds.is_empty() {
                     rest.keccak_rnds.remove(0);
                 }
@@ -6316,7 +6281,6 @@ fn prove_streamed(
                         packer,
                         options.layout_workers,
                         options.layout_ahead,
-                        options.pack_rest_as_laid_out,
                         Some(rest_gate),
                         recorder,
                         Some(waits),

@@ -32,7 +32,6 @@ lambda-vm-prover tests::block_whir_tests::regenerators_started_at_the_finishs_en
 lambda-vm-prover tests::block_whir_tests::row_records_chunks_drop_as_records_and_come_back  # 352 s
 lambda-vm-prover tests::block_whir_tests::phase_b_overlap_failures_are_the_proves_error_and_a_refusal_turns_it_serial  # 351 s
 lambda-vm-prover tests::block_whir_tests::phase_b_led_by_a_leaf_proves_the_same_bytes  # not timed: four proves of the streamed keccak block, as the 351 s test above
-lambda-vm-prover tests::block_whir_tests::a_streamed_block_with_memw_lt_streamed_proves_and_verifies  # 351 s
 lambda-vm-prover lfm::machine_tests::tampered_program_id_inputs_change_the_id  # 346 s
 lambda-vm-prover tests::block_whir_tests::keccak_and_ecsm_split_into_chunks_prove_and_verify  # 324 s
 lambda-vm-prover tests::block_whir_tests::a_block_with_keccak256_calls_across_keccak_tables_proves_and_verifies  # not timed on GitHub: 21 s on a 9950X box, a block of KECCAK tables cut to a few rows, as the 324 s test above
@@ -41,7 +40,6 @@ lambda-vm-prover tests::block_whir_tests::ecrec_chains_swapped_between_keys_are_
 lambda-vm-prover tests::block_whir_tests::a_wrong_regeneration_is_reported_never_proved  # 320 s
 lambda-vm-prover tests::block_whir_tests::a_split_ecdas_call_is_keyed_on_the_bus  # 317 s
 lambda-vm-prover tests::block_onechain_tests::an_indexed_block_round_trips_and_refuses_the_other_mode  # 305 s
-lambda-vm-prover tests::block_whir_tests::a_streamed_block_with_keccak_rnd_streamed_proves_and_verifies  # 304 s
 lambda-vm-prover tests::block_whir_tests::copy_split_into_chunks_proves_and_verifies  # 304 s
 lambda-vm-prover tests::block_whir_tests::a_wrong_row_records_table_is_refused_by_the_verifier  # 302 s
 lambda-vm-prover tests::block_whir_tests::a_regenerator_up_before_the_drops_proves_the_same_bytes  # 300 s

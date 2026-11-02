@@ -57,12 +57,9 @@ fn options(max_rows: MaxRowsConfig, keccak_rnd_rows_log2: usize) -> BlockOptions
         copy_rows_log2: block_whir::BLOCK_COPY_ROWS_LOG2,
         drop_levels: multilinear::whir_commit::TreeDrop::uniform(3),
         window_log2: None,
-        stream_keccak_rnd: false,
-        stream_memw_lt: false,
         drop_streamed_ops: false,
         layout_workers: 0,
         layout_ahead: Some(2),
-        pack_rest_as_laid_out: false,
         // Every table packed on a card, so a box run walks the narrow path at a
         // test's size.
         narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
@@ -553,9 +550,8 @@ fn a_memory_log_moves_no_byte_and_its_terms_close() {
     let proved = |memlog: bool, workers: usize| {
         let mut o = streamed(MaxRowsConfig::small(), 16, 3);
         o.memlog = memlog;
-        // Laid out on worker threads, the rest packed as it is laid out.
+        // Laid out on worker threads.
         o.layout_workers = workers;
-        o.pack_rest_as_laid_out = workers > 0;
         let (proof, stamps) = prove_block_whir_with(
             &elf,
             &[],
@@ -671,7 +667,6 @@ fn the_rest_in_waves_and_the_finish_packed_move_no_byte() {
             // Rows of 2^5, the least a KECCAK_RND table takes: it spans several.
             let mut o = streamed(MaxRowsConfig::small(), 5, 3);
             o.layout_workers = workers;
-            o.pack_rest_as_laid_out = workers > 0;
             o.finish_keccak_rnd_chunks = b1;
             o.rest_layout_bytes = b1.then_some(1 << 16);
             o.pack_finished = b2;
@@ -1192,62 +1187,24 @@ fn a_streamed_block_with_ecdas_chunks_proves_and_verifies() {
     assert!(verify(&proof, &elf, &format));
 }
 
-/// The same with KECCAK_RND's chunks streamed as their ops arrive (chunks of
-/// 2^5 rows, the builder's smallest): the same table count as built at the
-/// end, and the proof verifies.
-#[test]
-fn a_streamed_block_with_keccak_rnd_streamed_proves_and_verifies() {
-    let elf = asm_elf_bytes("test_keccak_multi");
-    let format = many_groups();
-    let at_end = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 5, 3));
-    let mut o = streamed(MaxRowsConfig::small(), 5, 3);
-    o.stream_keccak_rnd = true;
-    let proof = prove(&elf, &format, &o);
-    assert!(proof.table_counts.keccak_rnd >= 2);
-    assert_eq!(
-        proof.table_counts.keccak_rnd,
-        at_end.table_counts.keccak_rnd
-    );
-    assert!(verify(&proof, &elf, &format));
-}
-
-/// The same with each window's MEMW-derived LT ops streamed (the block path's
-/// other LT chunking): the same LT chunk count as without, and the proof
-/// verifies — every LT constraint and the bus hold over the chunks.
-#[test]
-fn a_streamed_block_with_memw_lt_streamed_proves_and_verifies() {
-    let elf = asm_elf_bytes("test_keccak_multi");
-    let format = many_groups();
-    let plain = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
-    let mut o = streamed(MaxRowsConfig::small(), 16, 3);
-    o.stream_memw_lt = true;
-    let proof = prove(&elf, &format, &o);
-    assert_eq!(proof.table_counts.lt, plain.table_counts.lt);
-    assert!(verify(&proof, &elf, &format));
-}
-
-/// ★ With the builder dropping each streamed chunk's ops as it leaves (D-MEMORY
-/// M1), alone and with the MEMW-derived LT ops streamed: the same groups and
-/// table counts as keeping them, and the proof verifies.
+/// ★ With the builder dropping each streamed chunk's ops as it leaves: the same
+/// groups and table counts as keeping them, and the proof verifies.
 #[test]
 fn a_streamed_block_with_dropped_ops_proves_and_verifies() {
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
-    for stream_memw_lt in [false, true] {
-        let mut keep = streamed(MaxRowsConfig::small(), 5, 3);
-        keep.stream_memw_lt = stream_memw_lt;
-        let kept = prove(&elf, &format, &keep);
-        let mut o = keep.clone();
-        o.drop_streamed_ops = true;
-        let proof = prove(&elf, &format, &o);
-        assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
-        assert_eq!(proof.groups, kept.groups, "LT streamed {stream_memw_lt}");
-        assert_eq!(
-            format!("{:?}", proof.table_counts),
-            format!("{:?}", kept.table_counts)
-        );
-        assert!(verify(&proof, &elf, &format));
-    }
+    let keep = streamed(MaxRowsConfig::small(), 5, 3);
+    let kept = prove(&elf, &format, &keep);
+    let mut o = keep.clone();
+    o.drop_streamed_ops = true;
+    let proof = prove(&elf, &format, &o);
+    assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
+    assert_eq!(proof.groups, kept.groups);
+    assert_eq!(
+        format!("{:?}", proof.table_counts),
+        format!("{:?}", kept.table_counts)
+    );
+    assert!(verify(&proof, &elf, &format));
 }
 
 /// A streamed prove with the shadow regenerator: its proof, its stamps.
@@ -1368,29 +1325,17 @@ fn a_wrong_regeneration_is_reported_never_proved() {
 }
 
 /// The shadow runs only where the regenerator rebuilds every streamed chunk:
-/// with KECCAK_RND's chunks streamed, or the MEMW-derived LT ops, or the
-/// chunks generated 64-bit, nothing is recorded and the prove is as without
-/// it.
+/// with the chunks generated 64-bit, nothing is recorded and the prove is as
+/// without it.
 #[test]
 fn the_shadow_stays_off_where_it_cannot_rebuild_the_chunks() {
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
-    let base = streamed(MaxRowsConfig::small(), 5, 3);
-    let mut keccak_rnd = base.clone();
-    keccak_rnd.stream_keccak_rnd = true;
-    let mut memw_lt = base.clone();
-    memw_lt.stream_memw_lt = true;
-    let mut wide = base.clone();
+    let mut wide = streamed(MaxRowsConfig::small(), 5, 3);
     wide.gpack = false;
-    for (what, o) in [
-        ("KECCAK_RND", keccak_rnd),
-        ("MEMW-derived LT", memw_lt),
-        ("64-bit", wide),
-    ] {
-        let (proof, stamps) = shadowed(&elf, &format, &o, &Deviations::default());
-        assert!(stamps.regen.is_none(), "{what}: recorded");
-        assert!(verify(&proof, &elf, &format), "{what}");
-    }
+    let (proof, stamps) = shadowed(&elf, &format, &wide, &Deviations::default());
+    assert!(stamps.regen.is_none(), "64-bit: recorded");
+    assert!(verify(&proof, &elf, &format), "64-bit");
 }
 
 /// ★ Phase B's order moves no byte (D-WHIR-NODISK §2.3): each group proves on
@@ -2623,28 +2568,24 @@ fn the_rest_regenerator_refuses_what_it_did_not_rebuild() {
     }
 }
 
-/// The streamed chunks laid out on three threads, and the rest of the run
-/// packed as it is laid out, are packed in the inline order all the same: the
-/// same groups and table counts as laid out on one thread, and the proofs
-/// verify.
+/// The streamed chunks laid out on three threads are packed in the inline
+/// order all the same: the same groups and table counts as laid out on one
+/// thread, and the proof verifies.
 #[test]
 fn a_streamed_block_laid_out_on_three_threads_packs_the_same_groups() {
     let elf = asm_elf_bytes("all_instructions_64");
     let format = many_groups();
     let inline = prove(&elf, &format, &streamed(MaxRowsConfig::small(), 16, 3));
-    for pack_rest in [false, true] {
-        let mut o = streamed(MaxRowsConfig::small(), 16, 3);
-        o.layout_workers = 3;
-        o.pack_rest_as_laid_out = pack_rest;
-        let proof = prove(&elf, &format, &o);
-        assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
-        assert_eq!(proof.groups, inline.groups, "pack_rest {pack_rest}");
-        assert_eq!(
-            format!("{:?}", proof.table_counts),
-            format!("{:?}", inline.table_counts)
-        );
-        assert!(verify(&proof, &elf, &format));
-    }
+    let mut o = streamed(MaxRowsConfig::small(), 16, 3);
+    o.layout_workers = 3;
+    let proof = prove(&elf, &format, &o);
+    assert!(groups_of(&proof) >= 3, "{} groups", groups_of(&proof));
+    assert_eq!(proof.groups, inline.groups);
+    assert_eq!(
+        format!("{:?}", proof.table_counts),
+        format!("{:?}", inline.table_counts)
+    );
+    assert!(verify(&proof, &elf, &format));
 }
 
 /// ★ With BITWISE handed on last ([`Deviations::rest_bitwise_last`], as
@@ -4554,10 +4495,9 @@ fn block_whir_on_a_real_block() {
         String::from_utf8_lossy(&block_whir::block_statement_tag(&base)),
     );
     let mut options = BlockOptions::production();
-    // `BLOCK_WHIR_LAYOUT_WORKERS=n` (production 6; 0 is the inline layout) and
-    // `BLOCK_WHIR_PACK_REST=0|1`, as the tree's harness takes them;
-    // `BLOCK_WHIR_DROP_OPS=0`: the builder keeps the streamed chunks' ops
-    // (production drops them).
+    // `BLOCK_WHIR_LAYOUT_WORKERS=n` (production 6; 0 is the inline layout), as
+    // the tree's harness takes it; `BLOCK_WHIR_DROP_OPS=0`: the builder keeps
+    // the streamed chunks' ops (production drops them).
     if let Some(n) = std::env::var("BLOCK_WHIR_LAYOUT_WORKERS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
@@ -4576,17 +4516,6 @@ fn block_whir_on_a_real_block() {
                 options.layout_ahead = Some(k);
             }
         }
-        Err(_) => {}
-    }
-    // `BLOCK_WHIR_PACK_REST=0|1` (production 0): the rest packed as it is laid
-    // out.
-    match std::env::var("BLOCK_WHIR_PACK_REST")
-        .as_deref()
-        .map(str::trim)
-    {
-        Ok("0") => options.pack_rest_as_laid_out = false,
-        Ok("1") => options.pack_rest_as_laid_out = true,
-        Ok(other) => panic!("BLOCK_WHIR_PACK_REST={other}: 0 or 1"),
         Err(_) => {}
     }
     match std::env::var("BLOCK_WHIR_DROP_OPS")
@@ -4623,7 +4552,7 @@ fn block_whir_on_a_real_block() {
         options.pack_finished,
     );
     println!(
-        "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} (ahead {:?}) · rest packed as laid out {} · streamed ops dropped {} · argue {:?} · {}",
+        "BLOCK CONFIG: group_polys {} · stack {} · keccak_rnd 2^{} · drop {} · prepared {} · layout workers {} (ahead {:?}) · streamed ops dropped {} · argue {:?} · {}",
         format.group_polys,
         format.zf.whir_stack.get(),
         options.keccak_rnd_rows_log2,
@@ -4631,7 +4560,6 @@ fn block_whir_on_a_real_block() {
         if prepared { "on" } else { "off" },
         options.layout_workers,
         options.layout_ahead,
-        options.pack_rest_as_laid_out,
         if options.drop_streamed_ops {
             "on"
         } else {

@@ -108,12 +108,9 @@ fn small_block_cut(
         copy_rows_log2: block_whir::BLOCK_COPY_ROWS_LOG2,
         drop_levels: multilinear::whir_commit::TreeDrop::uniform(3),
         window_log2: None,
-        stream_keccak_rnd: false,
-        stream_memw_lt: false,
         drop_streamed_ops: false,
         layout_workers: 0,
         layout_ahead: Some(2),
-        pack_rest_as_laid_out: false,
         // Every table packed on a card, so a box run walks the narrow path at a
         // test's size.
         narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
@@ -496,12 +493,9 @@ fn dense_block_with(
             copy_rows_log2: block_whir::BLOCK_COPY_ROWS_LOG2,
             drop_levels: multilinear::whir_commit::TreeDrop::uniform(3),
             window_log2: None,
-            stream_keccak_rnd: false,
-            stream_memw_lt: false,
             drop_streamed_ops: false,
             layout_workers: 0,
             layout_ahead: Some(2),
-            pack_rest_as_laid_out: false,
             // Every table packed on a card, so a box run walks the narrow path at a
             // test's size.
             narrow: stark::multilinear_block::Narrowing::Card { min_cells: 0 },
