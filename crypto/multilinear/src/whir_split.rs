@@ -376,14 +376,6 @@ pub static TABLES_ON_CARD: Counter = Counter::new();
 /// host's, cell for cell, and found equal.
 pub static TABLES_XCHECKED: Counter = Counter::new();
 
-/// Device sumchecks whose end was read back in one gathered copy
-/// (`LAMBDA_VM_ARGUE_LEAN_READS`), beside [`READS_PER_FACTOR`], the factors
-/// read one synchronous copy at a time — the mechanism line of that knob: it
-/// moves reads from the second to the first.
-pub static READS_GATHERED: Counter = Counter::new();
-/// See [`READS_GATHERED`].
-pub static READS_PER_FACTOR: Counter = Counter::new();
-
 // ── inside the argue: a device GKR layer, and the host work between two ─────
 //
 // The head's trace put 0.79 s of card idle between one GKR layer's read-back
@@ -430,12 +422,6 @@ pub static GKR_LAYERS: Counter = Counter::new();
 pub static GKR_REBUILDS: Counter = Counter::new();
 /// Rounds the host finished after them.
 pub static GKR_TAIL_ROUNDS: Counter = Counter::new();
-/// Of [`GKR_LAYERS`], the ones whose host tail ran lean
-/// (`LAMBDA_VM_ARGUE_LEAN_TAIL`) — the mechanism line of that knob.
-pub static TAILS_LEAN: Counter = Counter::new();
-/// Of [`TAILS_LEAN`], the ones `LAMBDA_VM_ARGUE_XCHECK` checked round by round
-/// against the generic rounds and found equal.
-pub static TAILS_XCHECKED: Counter = Counter::new();
 /// Of [`GKR_LAYERS`], the ones that ran Gruen's rounds
 /// (`LAMBDA_VM_ARGUE_GKR_GRUEN`, D-ARGUE S1-3) — the mechanism line of that knob.
 pub static GKR_GRUEN: Counter = Counter::new();
@@ -1104,20 +1090,8 @@ pub struct ProverSplit {
     pub tables_on_card: u64,
     pub tables_xchecked: u64,
     pub device_tables: bool,
-    /// Sessions read back in one copy and factors read one at a time —
-    /// [`READS_GATHERED`], [`READS_PER_FACTOR`] — and the knob they were read
-    /// under.
-    pub reads_gathered: u64,
-    pub reads_per_factor: u64,
-    pub lean_reads: bool,
     /// The device GKR layers, split — [`GkrSplit`].
     pub gkr: GkrSplit,
-    /// Device GKR layers whose host tail ran lean, and checked against the
-    /// generic rounds — [`TAILS_LEAN`], [`TAILS_XCHECKED`] — and the knob they
-    /// ran under.
-    pub tails_lean: u64,
-    pub tails_xchecked: u64,
-    pub lean_tail: bool,
     /// The zerocheck rounds, split — [`ZerocheckSplit`] — and the knob they
     /// ran under (`LAMBDA_VM_ARGUE_LEAN_PROGRAM`).
     pub zerocheck: ZerocheckSplit,
@@ -1293,45 +1267,6 @@ impl ProverSplit {
             card = self.tables_on_card,
             checked = self.tables_xchecked,
             knob = on_off(self.device_tables),
-            xcheck = on_off(self.xcheck),
-        )
-    }
-    /// The sessions' reads-back line, stamped the same way:
-    /// `ARGUE READS #k: sessions read in one copy G · factors read one at a
-    /// time F || lean reads on|off`.
-    pub fn reads_line(&self) -> String {
-        format!(
-            "ARGUE READS {who}{tainted}: sessions read in one copy {gathered} · factors read one \
-             at a time {single} || lean reads {knob}",
-            who = self.who(),
-            tainted = if self.overlapped {
-                " ⛔OVERLAPPED"
-            } else {
-                ""
-            },
-            gathered = self.reads_gathered,
-            single = self.reads_per_factor,
-            knob = if self.lean_reads { "on" } else { "off" },
-        )
-    }
-    /// The host tails' line, stamped as the split line is:
-    /// `ARGUE TAIL #k: lean L of device layers D · xchecked X || lean tail
-    /// on|off · xcheck on|off`.
-    pub fn tail_line(&self) -> String {
-        let on_off = |on: bool| if on { "on" } else { "off" };
-        format!(
-            "ARGUE TAIL {who}{tainted}: lean {lean} of device layers {layers} · xchecked {checked} \
-             || lean tail {knob} · xcheck {xcheck}",
-            who = self.who(),
-            tainted = if self.overlapped {
-                " ⛔OVERLAPPED"
-            } else {
-                ""
-            },
-            lean = self.tails_lean,
-            layers = self.gkr.layers,
-            checked = self.tails_xchecked,
-            knob = on_off(self.lean_tail),
             xcheck = on_off(self.xcheck),
         )
     }
@@ -1596,13 +1531,7 @@ pub fn push_prover(mut rec: ProverSplit) {
     rec.tables_on_card = TABLES_ON_CARD.take();
     rec.tables_xchecked = TABLES_XCHECKED.take();
     rec.device_tables = crate::gpu::argue_device_tables();
-    rec.reads_gathered = READS_GATHERED.take();
-    rec.reads_per_factor = READS_PER_FACTOR.take();
-    rec.lean_reads = crate::gpu::argue_lean_reads();
     rec.gkr = GkrSplit::take();
-    rec.tails_lean = TAILS_LEAN.take();
-    rec.tails_xchecked = TAILS_XCHECKED.take();
-    rec.lean_tail = crate::gpu::argue_lean_tail();
     rec.zerocheck = ZerocheckSplit::take();
     rec.lean_program = crate::gpu::argue_lean_program();
 
@@ -1661,9 +1590,7 @@ pub fn push_prover(mut rec: ProverSplit) {
     println!("{}", rec.reserved_line());
     println!("{}", rec.columns_line());
     println!("{}", rec.tables_line());
-    println!("{}", rec.reads_line());
     println!("{}", rec.gkr_line());
-    println!("{}", rec.tail_line());
     println!("{}", rec.zerocheck_line());
     println!("{}", rec.rest_line());
     println!("{}", rec.tree_line());
@@ -1971,13 +1898,9 @@ mod tests {
         bump_by(&COLUMNS_XCHECKED, 11);
         bump_by(&TABLES_ON_CARD, 13);
         bump_by(&TABLES_XCHECKED, 17);
-        bump(&READS_GATHERED);
-        bump_by(&READS_PER_FACTOR, 19);
         bump(&GKR_LAYERS);
         bump(&GKR_REBUILDS);
         bump_by(&GKR_TAIL_ROUNDS, 9);
-        bump(&TAILS_LEAN);
-        bump(&TAILS_XCHECKED);
         bump(&ZC_BIG);
         bump(&ZC_LEAN);
         bump(&ZC_LEAN_XCHECKED);
@@ -1990,15 +1913,11 @@ mod tests {
                 COLUMNS_XCHECKED.take(),
                 TABLES_ON_CARD.take(),
                 TABLES_XCHECKED.take(),
-                READS_GATHERED.take(),
-                READS_PER_FACTOR.take(),
                 GKR_LAYERS.take(),
                 GKR_REBUILDS.take(),
-                GKR_TAIL_ROUNDS.take(),
-                TAILS_LEAN.take(),
-                TAILS_XCHECKED.take()
+                GKR_TAIL_ROUNDS.take()
             ),
-            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0, 0, 0),
             "a disabled bump_by must not move a counter"
         );
         // The GKR regions' one-read clock is inert the same way.
@@ -2103,34 +2022,6 @@ mod tests {
             global.columns_line(),
             "ARGUE COLUMNS GLOBAL (in base) ⛔OVERLAPPED: on the card 0 · on the host 9 · \
              xchecked 0 || device columns off · xcheck off"
-        );
-    }
-
-    /// The reads line: both counts and the knob, stamped like the split line.
-    #[test]
-    fn the_reads_line_names_its_prove_and_its_knob() {
-        let epoch = ProverSplit {
-            index: 7,
-            reads_gathered: 245,
-            reads_per_factor: 0,
-            lean_reads: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            epoch.reads_line(),
-            "ARGUE READS #7: sessions read in one copy 245 · factors read one at a time 0 || \
-             lean reads on"
-        );
-        let global = ProverSplit {
-            index: GLOBAL_INDEX,
-            overlapped: true,
-            reads_per_factor: 3301,
-            ..Default::default()
-        };
-        assert_eq!(
-            global.reads_line(),
-            "ARGUE READS GLOBAL (in base) ⛔OVERLAPPED: sessions read in one copy 0 · factors \
-             read one at a time 3301 || lean reads off"
         );
     }
 
@@ -2288,39 +2179,6 @@ mod tests {
             epoch.tree_line(),
             "ARGUE TREE #3: lift 10.00 · write 50.00 (lower 20.00) · fold 40.00 · output 1.00 · of \
              tree 120.00 (ms) || sync off || from the columns 0 · no lift 0 (late 0)"
-        );
-    }
-
-    /// The tails line: the lean count against the record's device layers, and
-    /// both knobs it was taken under, stamped like the split line.
-    #[test]
-    fn the_tail_line_names_its_prove_and_its_knobs() {
-        let epoch = ProverSplit {
-            index: 6,
-            gkr: GkrSplit {
-                layers: 240,
-                ..Default::default()
-            },
-            tails_lean: 240,
-            tails_xchecked: 240,
-            lean_tail: true,
-            xcheck: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            epoch.tail_line(),
-            "ARGUE TAIL #6: lean 240 of device layers 240 · xchecked 240 || lean tail on · \
-             xcheck on"
-        );
-        let global = ProverSplit {
-            index: GLOBAL_INDEX,
-            overlapped: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            global.tail_line(),
-            "ARGUE TAIL GLOBAL (in base) ⛔OVERLAPPED: lean 0 of device layers 0 · xchecked 0 || \
-             lean tail off · xcheck off"
         );
     }
 

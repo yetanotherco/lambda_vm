@@ -344,10 +344,10 @@ fn columns_folded_together_match_one_at_a_time() {
 }
 
 /// A session's end read in one gathered copy is the per-factor read, bit for
-/// bit (`LAMBDA_VM_ARGUE_LEAN_READS`): after rounds and folds, for a session
-/// that uploaded its factors and for one over resident factors with weights
-/// added, from one factor to the widest precompile's 1,482, at cubes the
-/// sessions stop at and ones they do not.
+/// bit (the Gruen rounds' cross-check reads its shadow so): after rounds and
+/// folds, for a session that uploaded its factors and for one over resident
+/// factors with weights added, from one factor to the widest precompile's
+/// 1,482, at cubes the sessions stop at and ones they do not.
 #[test]
 fn a_session_end_read_in_one_copy_is_the_per_factor_read() {
     let Ok(_) = math_cuda::device::backend() else {

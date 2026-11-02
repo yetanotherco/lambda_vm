@@ -2730,11 +2730,6 @@ mod tests {
         on_card: u64,
         on_host: u64,
         tables_on_card: u64,
-        /// Session ends read in one copy, and factors read one at a time.
-        reads_gathered: u64,
-        reads_per_factor: u64,
-        /// Device GKR layers whose host tail ran lean.
-        lean_tails: u64,
         /// Zerocheck sessions whose rounds walked their program on demand, and
         /// the ones the cross-check walked today's program beside.
         lean_programs: u64,
@@ -2750,8 +2745,7 @@ mod tests {
     }
 
     /// The argue knobs an arm runs under: `LAMBDA_VM_ARGUE_DEVICE_COLUMNS`,
-    /// `LAMBDA_VM_ARGUE_DEVICE_TABLES`, `LAMBDA_VM_ARGUE_LEAN_READS`,
-    /// `LAMBDA_VM_ARGUE_LEAN_TAIL`, `LAMBDA_VM_ARGUE_LEAN_PROGRAM`.
+    /// `LAMBDA_VM_ARGUE_DEVICE_TABLES`, `LAMBDA_VM_ARGUE_LEAN_PROGRAM`.
     ///
     /// Under `program` every batch counts as big, so these small tables take
     /// the path the VM's four big batches do
@@ -2764,8 +2758,6 @@ mod tests {
     struct Knobs {
         columns: bool,
         tables: bool,
-        reads: bool,
-        tail: bool,
         program: bool,
         fused: bool,
         gruen: bool,
@@ -2776,8 +2768,6 @@ mod tests {
     const TODAY: Knobs = Knobs {
         columns: false,
         tables: false,
-        reads: false,
-        tail: false,
         program: false,
         fused: false,
         gruen: false,
@@ -2811,8 +2801,6 @@ mod tests {
         .unwrap();
         multilinear::gpu::force_argue_device_columns(Some(knobs.columns));
         multilinear::gpu::force_argue_device_tables(Some(knobs.tables));
-        multilinear::gpu::force_argue_lean_reads(Some(knobs.reads));
-        multilinear::gpu::force_argue_lean_tail(Some(knobs.tail));
         multilinear::gpu::force_argue_lean_program(Some(knobs.program));
         multilinear::gpu::force_lean_program_gate(knobs.program.then_some(0));
         multilinear::gpu_fused::force_argue_fused(Some(knobs.fused));
@@ -2825,13 +2813,10 @@ mod tests {
         let gruen = multilinear::gkr_gruen::gruen_layers();
         let input = multilinear::gpu::input_columns_trees();
         let nolift = multilinear::gpu::column_factor_tables();
-        let (card, host, built, gathered, single, lean) = (
+        let (card, host, built) = (
             multilinear::gpu::evaluate_calls(),
             multilinear::gpu::host_evaluate_calls(),
             multilinear::gpu::argue_tables_on_card(),
-            multilinear::gpu::reads_gathered(),
-            multilinear::gpu::reads_per_factor(),
-            multilinear::gpu::lean_tails(),
         );
         let (demand, demand_checked) = (
             multilinear::gpu::lean_programs(),
@@ -2846,9 +2831,6 @@ mod tests {
             on_card: multilinear::gpu::evaluate_calls() - card,
             on_host: multilinear::gpu::host_evaluate_calls() - host,
             tables_on_card: multilinear::gpu::argue_tables_on_card() - built,
-            reads_gathered: multilinear::gpu::reads_gathered() - gathered,
-            reads_per_factor: multilinear::gpu::reads_per_factor() - single,
-            lean_tails: multilinear::gpu::lean_tails() - lean,
             lean_programs: multilinear::gpu::lean_programs() - demand,
             lean_program_xchecks: multilinear::gpu::lean_program_xchecks() - demand_checked,
             fused: multilinear::gpu_fused::fused_sessions() - fused,
@@ -2864,8 +2846,6 @@ mod tests {
         math_cuda::sumcheck::force_int_nodes(None);
         multilinear::gpu::force_argue_device_columns(None);
         multilinear::gpu::force_argue_device_tables(None);
-        multilinear::gpu::force_argue_lean_reads(None);
-        multilinear::gpu::force_argue_lean_tail(None);
         multilinear::gpu::force_argue_lean_program(None);
         multilinear::gpu::force_lean_program_gate(None);
         arm
@@ -3586,90 +3566,6 @@ mod tests {
         );
     }
 
-    /// ★ `LAMBDA_VM_ARGUE_LEAN_READS` moves no byte of the proof, alone or with
-    /// both other argue knobs: the same canonical bytes, transcript and next
-    /// challenge, and every proof verifies.
-    ///
-    /// On a device the arms are shown to take their own paths: off, every
-    /// session's end is read a factor at a time and none in one copy; on, the
-    /// reverse. ⚠ Run it alone (`--exact`): the counters are process-wide.
-    #[test]
-    fn the_argument_proves_the_same_bytes_with_its_reads_gathered() {
-        use crypto::fiat_shamir::is_transcript::IsTranscript;
-
-        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
-        let airs = airs();
-        let columns = tall_columns();
-        let mut today = prove_tall(&airs, &columns, TODAY);
-        verify_tall(&today.committed, &today.proof).expect("today's proof verifies");
-        let today_state = today.transcript.state();
-        let today_next = today.transcript.sample_field_element();
-        let device = a_device();
-        if device {
-            assert!(
-                today.reads_gathered == 0 && today.reads_per_factor > 0,
-                "today reads a factor at a time: gathered {}, per factor {}",
-                today.reads_gathered,
-                today.reads_per_factor
-            );
-        }
-        let all = Knobs {
-            columns: true,
-            tables: true,
-            reads: true,
-            ..TODAY
-        };
-        for knobs in [
-            Knobs {
-                reads: true,
-                ..TODAY
-            },
-            all,
-        ] {
-            let mut arm = prove_tall(&airs, &columns, knobs);
-            if device {
-                assert!(
-                    arm.reads_per_factor == 0 && arm.reads_gathered > 0,
-                    "{knobs:?}: every session's end in one copy: gathered {}, per factor {}",
-                    arm.reads_gathered,
-                    arm.reads_per_factor
-                );
-                eprintln!(
-                    "argue lean reads: {knobs:?}: {} sessions read in one copy",
-                    arm.reads_gathered
-                );
-            } else {
-                assert_eq!(
-                    (arm.reads_gathered, arm.reads_per_factor),
-                    (0, 0),
-                    "{knobs:?}: no device read a session back"
-                );
-                eprintln!("argue lean reads: no device; no session to read back");
-            }
-            assert_eq!(
-                first_table_that_differs(&today.proof, &arm.proof),
-                None,
-                "{knobs:?}: a table's argument changed"
-            );
-            assert_eq!(
-                bincode::serialize(&today.proof).unwrap(),
-                bincode::serialize(&arm.proof).unwrap(),
-                "{knobs:?}: the proofs' canonical bytes differ"
-            );
-            assert_eq!(
-                today_state,
-                arm.transcript.state(),
-                "{knobs:?}: the transcripts parted"
-            );
-            assert_eq!(
-                today_next,
-                arm.transcript.sample_field_element(),
-                "{knobs:?}: the next challenge moved"
-            );
-            verify_tall(&arm.committed, &arm.proof).unwrap_or_else(|e| panic!("{knobs:?}: {e:?}"));
-        }
-    }
-
     /// ★ D-ARGUE stage 1 (the fused zerocheck with integer nodes — on by default
     /// in production) moves no byte of the proof, alone or with the other argue
     /// knobs on: the same canonical bytes, table by table and whole, the same
@@ -3699,7 +3595,6 @@ mod tests {
         let all = Knobs {
             columns: true,
             tables: true,
-            reads: true,
             fused: true,
             ..TODAY
         };
@@ -3782,164 +3677,6 @@ mod tests {
         eprintln!("argue fused: the wrong coefficient was refused: {verdict:?}");
     }
 
-    /// ⛔ The identity above can fail. With the fault armed, every gathered
-    /// read hands back its first word plus one; the proof must then differ from
-    /// today's at CPU, the first table argued, and must not verify. Needs a
-    /// device, and says so rather than passing without one.
-    #[test]
-    fn a_wrong_read_changes_the_argument_and_fails_it() {
-        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
-        let airs = airs();
-        let columns = tall_columns();
-        if !a_device() {
-            eprintln!("argue lean reads: SKIPPED, no device to corrupt a read on");
-            return;
-        }
-        let today = prove_tall(&airs, &columns, TODAY);
-        multilinear::gpu::force_read_fault(true);
-        let faulted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            prove_tall(
-                &airs,
-                &columns,
-                Knobs {
-                    reads: true,
-                    ..TODAY
-                },
-            )
-        }));
-        multilinear::gpu::force_read_fault(false);
-        let faulted = faulted.expect("the faulted arm proves");
-        assert!(
-            faulted.reads_gathered > 0,
-            "the fault is on the gathered path"
-        );
-        assert_eq!(
-            first_table_that_differs(&today.proof, &faulted.proof),
-            Some(0),
-            "the identity must name CPU, the first table argued"
-        );
-        let verdict = verify_tall(&faulted.committed, &faulted.proof);
-        assert!(
-            verdict.is_err(),
-            "a proof over a wrong read must not verify, got {verdict:?}"
-        );
-        eprintln!("argue lean reads: the wrong read was refused: {verdict:?}");
-    }
-
-    /// ★ `LAMBDA_VM_ARGUE_LEAN_TAIL` moves no byte of the proof, alone or with
-    /// every other argue knob: the same canonical bytes, transcript and next
-    /// challenge, and every proof verifies.
-    ///
-    /// On a device the arms are shown to take their own paths: off, no device
-    /// GKR layer's tail runs lean; on, some do — CPU's tree and ADD's are built
-    /// on the card. ⚠ Run it alone (`--exact`): the counters are process-wide.
-    #[test]
-    fn the_argument_proves_the_same_bytes_with_its_tail_lean() {
-        use crypto::fiat_shamir::is_transcript::IsTranscript;
-
-        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
-        let airs = airs();
-        let columns = tall_columns();
-        let mut today = prove_tall(&airs, &columns, TODAY);
-        verify_tall(&today.committed, &today.proof).expect("today's proof verifies");
-        let today_state = today.transcript.state();
-        let today_next = today.transcript.sample_field_element();
-        let device = a_device();
-        assert_eq!(today.lean_tails, 0, "today no tail runs lean");
-        let every = Knobs {
-            columns: true,
-            tables: true,
-            reads: true,
-            tail: true,
-            ..TODAY
-        };
-        for knobs in [
-            Knobs {
-                tail: true,
-                ..TODAY
-            },
-            every,
-        ] {
-            let mut arm = prove_tall(&airs, &columns, knobs);
-            if device {
-                assert!(
-                    arm.lean_tails > 0,
-                    "{knobs:?}: the device layers' tails run lean"
-                );
-                eprintln!(
-                    "argue lean tail: {knobs:?}: {} device layers finished lean",
-                    arm.lean_tails
-                );
-            } else {
-                assert_eq!(arm.lean_tails, 0, "{knobs:?}: no device, no lean tail");
-                eprintln!("argue lean tail: no device; no layer to finish lean");
-            }
-            assert_eq!(
-                first_table_that_differs(&today.proof, &arm.proof),
-                None,
-                "{knobs:?}: a table's argument changed"
-            );
-            assert_eq!(
-                bincode::serialize(&today.proof).unwrap(),
-                bincode::serialize(&arm.proof).unwrap(),
-                "{knobs:?}: the proofs' canonical bytes differ"
-            );
-            assert_eq!(
-                today_state,
-                arm.transcript.state(),
-                "{knobs:?}: the transcripts parted"
-            );
-            assert_eq!(
-                today_next,
-                arm.transcript.sample_field_element(),
-                "{knobs:?}: the next challenge moved"
-            );
-            verify_tall(&arm.committed, &arm.proof).unwrap_or_else(|e| panic!("{knobs:?}: {e:?}"));
-        }
-    }
-
-    /// ⛔ The identity above can fail. With the fault armed, every lean tail adds
-    /// one to its first round's `s(1)`. The proof must then differ from today's
-    /// at CPU, the first table argued, and be refused by GKR's layer check —
-    /// the first check a verifier runs on a table, before its zerocheck. Needs
-    /// a device, and says so rather than passing without one.
-    #[test]
-    fn a_wrong_lean_tail_changes_the_argument_and_fails_it() {
-        let _overrides = ARGUE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
-        let airs = airs();
-        let columns = tall_columns();
-        if !a_device() {
-            eprintln!("argue lean tail: SKIPPED, no device to corrupt a tail on");
-            return;
-        }
-        let today = prove_tall(&airs, &columns, TODAY);
-        multilinear::gkr::force_lean_tail_fault(true);
-        let faulted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            prove_tall(
-                &airs,
-                &columns,
-                Knobs {
-                    tail: true,
-                    ..TODAY
-                },
-            )
-        }));
-        multilinear::gkr::force_lean_tail_fault(false);
-        let faulted = faulted.expect("the faulted arm proves");
-        assert!(faulted.lean_tails > 0, "the fault is on the lean path");
-        assert_eq!(
-            first_table_that_differs(&today.proof, &faulted.proof),
-            Some(0),
-            "the identity must name CPU, the first table argued"
-        );
-        let verdict = verify_tall(&faulted.committed, &faulted.proof);
-        assert!(
-            matches!(verdict, Err(MlError::LayerRelationMismatch { .. })),
-            "GKR's layer check must refuse it, got {verdict:?}"
-        );
-        eprintln!("argue lean tail: the wrong tail was refused: {verdict:?}");
-    }
-
     /// ★ `LAMBDA_VM_ARGUE_GKR_GRUEN` (D-ARGUE S1-3) moves no byte of the proof,
     /// alone, beside the fused zerocheck (the production default), and with
     /// every other argue knob: the same canonical bytes, table by table and
@@ -3967,8 +3704,6 @@ mod tests {
                     Knobs {
                         columns: true,
                         tables: true,
-                        reads: true,
-                        tail: true,
                         gruen: true,
                         ..TODAY
                     },
@@ -3982,7 +3717,6 @@ mod tests {
                 vec![Knobs {
                     columns: true,
                     tables: true,
-                    reads: true,
                     fused: true,
                     gruen: true,
                     ..TODAY
@@ -4048,7 +3782,6 @@ mod tests {
         let production = Knobs {
             columns: true,
             tables: true,
-            reads: true,
             fused: true,
             gruen: true,
             ..TODAY
@@ -4251,8 +3984,6 @@ mod tests {
         let every = Knobs {
             columns: true,
             tables: true,
-            reads: true,
-            tail: true,
             program: true,
             fused: false,
             gruen: false,
