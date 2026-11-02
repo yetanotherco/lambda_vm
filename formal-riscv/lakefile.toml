@@ -1,0 +1,20 @@
+name = "riscv-equiv"
+defaultTargets = ["RiscvEquiv"]
+
+[leanOptions]
+autoImplicit = false
+relaxedAutoImplicit = false
+
+# The Clean model of the AIR (PR #1027).
+[[require]]
+name = "lambda-vm-formal"
+path = "../formal"
+
+# The official Sail RISC-V model, translated to Lean by Sail's Lean backend.
+[[require]]
+name = "Lean_RV64D"
+git = "https://github.com/opencompl/sail-riscv-lean"
+rev = "51c635c460125ac87955d061fcd902ce03b8011f"
+
+[[lean_lib]]
+name = "RiscvEquiv"
