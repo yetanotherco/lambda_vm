@@ -21,13 +21,15 @@ def sllPure (rs1 rs2 : BitVec 64) : BitVec 64 := rs1 <<< (rs2.toNat % 64)
 
 /-- Sail's `SLL` reads `rs1` and `rs2` and writes `sllPure x[rs1] x[rs2]` to `rd`.
 
-execute_RTYPE is the Sail function that executes all R-type instructions.
-In RISC-V, R-type is the format of instructions that operate on two registers and store the result in a third one.
-There are 10 of them: ADD, SUB, SLL, SLT, SLTU, XOR, SRL, SRA, OR and AND.
+`execute_RTYPE` is the Sail function that executes the base R-type instructions. In RISC-V,
+R-type is the format of instructions that operate on two registers and store the result in a
+third one. `execute_RTYPE` runs the 10 base ones: ADD, SUB, SLL, SLT, SLTU, XOR, SRL, SRA, OR
+and AND. The word versions (ADDW, SLLW, …) run in `execute_RTYPEW`, and the M extension (MUL,
+DIV, …) in its own functions.
 
-The theorem says that what Sail's SLL does to the state is exactly to write the result of sllPure to rd.
-
-With this theorem, from here on we can work with sllPure, which is just a computation, instead of the state.
+The theorem says that what Sail's `SLL` does to the state is exactly to write the result of
+`sllPure` to `rd`. With this theorem, from here on we can work with `sllPure`, which is just a
+computation, instead of the state.
 -/
 theorem execute_SLL (rs2 rs1 rd : regidx) :
     execute_RTYPE rs2 rs1 rd rop.SLL = (do

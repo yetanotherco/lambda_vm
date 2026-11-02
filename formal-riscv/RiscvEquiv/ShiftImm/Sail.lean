@@ -23,7 +23,8 @@ theorem shamt_toNat (shamt : BitVec 6) : (shamt.setWidth 64).toNat % 64 = shamt.
 
 /-- Sail cuts `shamt` to its low `log2_xlen = 6` bits, which on RV64 is all of it. -/
 theorem extract_shamt (shamt : BitVec 6) :
-    (Sail.BitVec.extractLsb shamt ((Functions.log2_xlen : Int) - 1).toNat 0).toNat = shamt.toNat := by
+    (Sail.BitVec.extractLsb shamt ((Functions.log2_xlen : Int) - 1).toNat 0).toNat
+      = shamt.toNat := by
   have := shamt.isLt
   simp only [Sail.BitVec.extractLsb, BitVec.extractLsb_toNat, Nat.shiftRight_zero]
   exact Nat.mod_eq_of_lt (by simpa [Functions.log2_xlen] using this)

@@ -1,31 +1,17 @@
 import RiscvEquiv.Blt.Bridge
-import RiscvEquiv.Slt.Alu
+import RiscvEquiv.AluBus
 
 /-!
 # BLT, BGE, BLTU and BGEU: what the CPU learns from the ALU bus is Sail's condition
 
 Same as `Slt/Alu.lean`, for the four `(signed, invert)` combinations of the LT clause of
-`Alu.Guarantees`. `lt_alu_bit` reads the result of an LT message as a natural once, and each
-theorem instantiates it at the flags of its branch.
+`Alu.Guarantees`: each theorem instantiates `lt_alu_bit` (`AluBus.lean`) at the flags of its
+branch.
 -/
 
 namespace RiscvEquiv
 
 open LambdaVM
-
-/-- An LT message with flags `opsel(LT) + 32·s + 64·i` carries `ltBit s i` of its operands. -/
-lemma lt_alu_bit (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
-    (h1 : m.in1Lo.val < 2^32) (h2 : m.in1Hi.val < 2^32)
-    (h3 : m.in2Lo.val < 2^32) (h4 : m.in2Hi.val < 2^32)
-    (s i : ℕ) (hs : s < 2) (hi : i < 2) (hflags : m.flags.val = opselLT + 32 * s + 64 * i)
-    (a b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = a.toNat)
-    (hb : dword m.in2Lo m.in2Hi = b.toNat) :
-    dword m.outLo m.outHi = Alu.ltBit s i a.toNat b.toNat := by
-  obtain ⟨hlt, -, -⟩ := hg h1 h2 h3 h4
-  obtain ⟨hhi, hlo⟩ := hlt s i hs hi hflags
-  have hbit := ltBit_lt_two s i a.toNat b.toNat
-  rw [dword, hhi, hlo, ha, hb, ZMod.val_zero, val_natCast_of_lt_two_pow_40 (by omega),
-    mul_zero, add_zero]
 
 /-- An ALU message with the flags of `BLT` (`opsel = LT`, `signed = 1`, `invert = 0`) and
 range-checked operands carries Sail's `BLT` condition. -/

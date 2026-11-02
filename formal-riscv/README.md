@@ -3,7 +3,8 @@
 Proves, instruction by instruction, that what the AIR's Clean model (`../formal`, PR #1027)
 computes is what the official RISC-V spec says. The spec is the Sail model
 ([sail-riscv](https://github.com/riscv/sail-riscv)), translated to Lean by Sail's Lean
-backend and published as [`opencompl/sail-riscv-lean`](https://github.com/opencompl/sail-riscv-lean).
+backend and published as
+[`opencompl/sail-riscv-lean`](https://github.com/opencompl/sail-riscv-lean).
 The approach follows [zisk-fv](https://github.com/eth-act/zisk-fv) (`ZiskFv/SailSpec/`).
 
 ## Build
@@ -14,8 +15,12 @@ lake exe cache get   # Mathlib oleans
 lake build
 ```
 
-The first build compiles Clean, the Clean model and the Sail model (about 135 modules, the
-largest `InstsEnd` takes minutes).
+The first build compiles Clean, the Clean model and the Sail model (the largest Sail module,
+`InstsEnd`, takes minutes).
+
+`../formal` is a path dependency, but this project has its own `lake-manifest.json`: when
+`formal/` updates Mathlib or Clean, run `lake update` here too so both use the same versions.
+This folder is not built by CI (`.github/workflows/formal.yml` only covers `formal/**`).
 
 ## Structure
 
@@ -39,6 +44,10 @@ Sail execute_RTYPE … SLL ──(1)── sllPure ──(2)── Alu.shiftResu
    guarantees (`Alu.Guarantees`) that PR #1027 already proves for each table.
 
 In one line: Sail = `*Pure`, `*Pure` = Clean function, Clean function = what arrives on the bus.
+
+`AluBus.lean` is shared: one lemma per clause of `Alu.Guarantees` (SHIFT, SHIFT with
+`word = 1`, LT, EQ) that reads a message's result as a natural. Each `Alu.lean` instantiates
+one of them at its flags, so it is one line per instruction.
 
 The immediate versions have no `Bridge.lean`: they are the register version with the
 immediate as the second operand, so they reuse its bridge and its `Alu` theorem.

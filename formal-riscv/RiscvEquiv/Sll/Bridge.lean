@@ -24,10 +24,10 @@ lemma shiftResult_sll (x s : ℕ) : Alu.shiftResult 0 0 0 x s = (x <<< (s % 64))
 
 /-- `sllPure` as a natural is `shiftResult` with the flags of `SLL`.
 
-sllPure returns a BitVec 64, a 64-bit vector which is the type Sail uses.
-Alu.shiftResult, on the other hand, returns a natural number, which is the type the Clean files use
-(because in the circuit everything is a field element).
-They cannot be compared directly, so the BitVec is converted to a number with .toNat. -/
+`sllPure` returns a `BitVec 64`, a 64-bit vector, which is the type Sail uses.
+`Alu.shiftResult`, on the other hand, returns a natural number: the circuit works with field
+elements, and the Clean model reads them as naturals (`.val`) to state what the tables compute.
+They cannot be compared directly, so the `BitVec` is converted to a natural with `.toNat`. -/
 theorem sllPure_toNat (a b : BitVec 64) :
     (sllPure a b).toNat = Alu.shiftResult 0 0 0 a.toNat b.toNat := by
   rw [shiftResult_sll, sllPure, BitVec.toNat_shiftLeft]

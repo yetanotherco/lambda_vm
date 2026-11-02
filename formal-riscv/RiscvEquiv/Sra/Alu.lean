@@ -1,4 +1,5 @@
 import RiscvEquiv.Sra.Bridge
+import RiscvEquiv.AluBus
 
 /-!
 # SRA: what the CPU learns from the ALU bus is Sail's result
@@ -20,13 +21,8 @@ theorem sra_alu_matches_sail (m : Alu.Msg (F p)) (hg : Alu.Guarantees m)
     (a b : BitVec 64) (ha : dword m.in1Lo m.in1Hi = a.toNat)
     (hb : dword m.in2Lo m.in2Hi = b.toNat) :
     dword m.outLo m.outHi = (sraPure a b).toNat := by
-  obtain ⟨-, -, hshift⟩ := hg h1 h2 h3 h4
-  obtain ⟨-, -, hout⟩ := hshift 0 1 1 (by norm_num) (by norm_num) (by norm_num)
-    (by simpa using hflags)
-  -- SHIFT reads only the low byte of the shift amount; mod 64 it is the low bits of `b`.
-  have hamt : m.in2Lo.val % 256 % 64 = b.toNat % 64 := by
-    rw [← hb, dword]
-    omega
-  rw [hout, sraPure_toNat, ha, shiftResult_sra, shiftResult_sra, hamt]
+  rw [sraPure_toNat]
+  exact shift_alu m hg h1 h2 h3 h4 1 1 (by norm_num) (by norm_num) (by simpa using hflags)
+    _ b ha hb
 
 end RiscvEquiv

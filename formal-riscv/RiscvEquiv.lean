@@ -1,3 +1,4 @@
+import RiscvEquiv.AluBus
 import RiscvEquiv.Sll.Sail
 import RiscvEquiv.Sll.Bridge
 import RiscvEquiv.Sll.Alu
