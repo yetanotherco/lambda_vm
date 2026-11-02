@@ -66,7 +66,8 @@ impl NarrowMain {
             offsets.push(total);
             total += rows * w as usize;
         }
-        let mut data = vec![0u8; total];
+        // The bytes a group's upload reads: page-locked when that is on.
+        let mut data = multilinear::pinned::with_pinned(total, || vec![0u8; total]);
 
         // Each column's slice, written a block of rows at a time so the
         // block's rows stay in cache across the columns.
@@ -412,7 +413,8 @@ impl NarrowWriter {
         Self {
             rows,
             columns,
-            data: vec![0u8; total],
+            // The bytes a group's upload reads: page-locked when that is on.
+            data: multilinear::pinned::with_pinned(total, || vec![0u8; total]),
         }
     }
 

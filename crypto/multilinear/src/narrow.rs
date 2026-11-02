@@ -97,7 +97,9 @@ impl NarrowColumns {
             .iter()
             .map(|c| width_of(c.iter().copied().max().unwrap_or(0)))
             .collect();
-        let mut data = Vec::with_capacity(rows * widths.iter().map(|&w| w as usize).sum::<usize>());
+        let total = rows * widths.iter().map(|&w| w as usize).sum::<usize>();
+        // The bytes a group's upload reads: page-locked when that is on.
+        let mut data = crate::pinned::with_pinned(total, || Vec::with_capacity(total));
         for (column, &w) in columns.iter().zip(&widths) {
             for word in column.iter() {
                 data.extend_from_slice(&word.to_le_bytes()[..w as usize]);
@@ -125,7 +127,8 @@ impl NarrowColumns {
         }
         let widths: Vec<u8> = max.into_iter().map(width_of).collect();
         let total: usize = widths.iter().map(|&w| rows * w as usize).sum();
-        let mut data = vec![0u8; total];
+        // The bytes a group's upload reads: page-locked when that is on.
+        let mut data = crate::pinned::with_pinned(total, || vec![0u8; total]);
         let mut columns: Vec<&mut [u8]> = Vec::with_capacity(cols);
         let mut rest = data.as_mut_slice();
         for &w in &widths {

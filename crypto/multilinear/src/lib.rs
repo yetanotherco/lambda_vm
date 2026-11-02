@@ -22,6 +22,7 @@ pub mod lean_tiles;
 pub mod logup;
 pub mod mle;
 pub mod narrow;
+pub mod pinned;
 pub mod poly;
 pub mod program;
 pub mod query_count;
