@@ -1053,41 +1053,43 @@ fn what_a_chain_is_entered_with_reaches_its_first_squeeze_and_stops() {
 /// the design note before this test was written, which is what makes the first
 /// run of it a measurement rather than a transcription.
 ///
+/// The census quoted 184,673 shape rows under the fold the emitter wrote then,
+/// seven rows a folded value. The lean fold spends 52 fewer a sixteen-value
+/// fold (`7·15 − 1` against `3·15 + 2·4 − 1`), 2 fewer a two-value one, and one
+/// more a level a round for its halved challenges: `184,673 − 6·112·52 −
+/// 112·2 + (6·4 + 1) = 149,530` shape rows, and 150,366 with the schedule's
+/// 836.
+///
 /// ⚠ The sizing note's per-chain figures are NOT these. Its 22,830 permutations
 /// predate both the grind term and the schedule term; the 318 it implies for the
 /// transcript is 42 above the 276 the schedule actually costs, and was never
 /// re-derived. Quote these.
 #[test]
 fn the_production_chain_costs_what_the_census_quotes() {
-    // The census quoted the CLASSIC fold's chain (`LAMBDA_VM_WHIR_FOLD_CLASSIC`).
-    // The lean fold, the default, is pinned by
-    // `the_production_default_chain_is_first6_under_the_auto_cap`.
-    with_fold_emission(FoldEmission::Classic, || {
-        // `multilinear_prove.rs:93`: blowup 2, fold 4, 128 bits, uniform 20-bit
-        // grinds — the config the block is proven under.
-        let shape = ChainShape::new(&config(112, 20), 25);
-        let entry = SpongeEntry::fresh();
-        let schedule = chain_hash_schedule(&shape, entry);
-        let squeezes = schedule
-            .iter()
-            .filter(|h| matches!(h, SpongeHash::Squeeze(_)))
-            .count();
+    // `multilinear_prove.rs:93`: blowup 2, fold 4, 128 bits, uniform 20-bit
+    // grinds — the config the block is proven under.
+    let shape = ChainShape::new(&config(112, 20), 25);
+    let entry = SpongeEntry::fresh();
+    let schedule = chain_hash_schedule(&shape, entry);
+    let squeezes = schedule
+        .iter()
+        .filter(|h| matches!(h, SpongeHash::Squeeze(_)))
+        .count();
 
-        assert_eq!(squeezes, 233, "squeezes a chain");
-        assert_eq!(schedule.len() - squeezes, 20, "state reads = 3R − 1 grinds");
-        assert_eq!(chain_schedule_rows(&shape, entry), 836, "schedule rows");
-        assert_eq!(chain_schedule_perms(&shape, entry), 276, "schedule perms");
-        assert_eq!(chain_grind_perms(&shape), 40, "two permutations a grind");
-        assert_eq!(chain_shape_rows(&shape), 184_673, "shape rows");
+    assert_eq!(squeezes, 233, "squeezes a chain");
+    assert_eq!(schedule.len() - squeezes, 20, "state reads = 3R − 1 grinds");
+    assert_eq!(chain_schedule_rows(&shape, entry), 836, "schedule rows");
+    assert_eq!(chain_schedule_perms(&shape, entry), 276, "schedule perms");
+    assert_eq!(chain_grind_perms(&shape), 40, "two permutations a grind");
+    assert_eq!(chain_shape_rows(&shape), 149_530, "shape rows");
 
-        println!(
-            "production chain S=25 k=4 Q=112 grind=20: {} rows, {} permutations",
-            chain_rows(&shape, entry),
-            chain_perms(&shape, entry)
-        );
-        assert_eq!(chain_rows(&shape, entry), 185_509, "rows a chain");
-        assert_eq!(chain_perms(&shape, entry), 22_828, "permutations a chain");
-    });
+    println!(
+        "production chain S=25 k=4 Q=112 grind=20: {} rows, {} permutations",
+        chain_rows(&shape, entry),
+        chain_perms(&shape, entry)
+    );
+    assert_eq!(chain_rows(&shape, entry), 150_366, "rows a chain");
+    assert_eq!(chain_perms(&shape, entry), 22_828, "permutations a chain");
 }
 
 /// ⛔ THE GENESIS THRESHOLD'S BUDGET, ASSERTED WHERE IT CAN BE COMPUTED.
@@ -1117,26 +1119,22 @@ fn the_production_chain_costs_what_the_census_quotes() {
 /// uses. A posture change reddens this rather than silently retuning a routing
 /// rule nobody is looking at.
 ///
-/// It asserts a BAND and not an equality: the constant's job is to be larger
-/// than the 20-variable stack and no larger than the 24-variable one it was
-/// read from. An equality would redden on any change to the schedule, which is
-/// a different finding from "the routing rule has drifted".
+/// ⛔ THE CONSTANT STAYS FIXED: a routing rule the prover, the verifier and the
+/// emitter agree on, not a figure to re-tune with the emitter. It was read off
+/// the 24-variable chain under the fold the emitter wrote then, at seven rows a
+/// folded value; the lean fold's chain costs fewer, so the constant now bounds
+/// the 24-variable chain rather than equalling it — the conservative direction.
+/// It is pinned by value, so a drift either way reddens here.
 #[test]
 fn the_genesis_threshold_budget_is_in_band_at_the_production_shape() {
-    // ⛔ THE BAND IS THE CLASSIC FOLD'S: the constant was read off that chain,
-    // and it stays fixed — a routing rule the prover, the verifier and the
-    // emitter agree on, not a figure to re-tune with the emitter.
-    let (at_20, at_24) = with_fold_emission(FoldEmission::Classic, || {
-        (
-            chain_shape_rows(&ChainShape::new(&config(112, 20), 20)),
-            chain_shape_rows(&ChainShape::new(&config(112, 20), 24)),
-        )
-    });
+    let at = |vars| chain_shape_rows(&ChainShape::new(&config(112, 20), vars));
+    let (at_20, at_24) = (at(20), at(24));
     let budget = crate::continuation::PREPARED_LEG_ROWS;
     println!(
         "GENESIS BUDGET: {budget} rows against a chain of {at_20} at 20 variables and \
-         {at_24} at 24, Q=112 grind=20 blowup=2 fold=4 (classic fold)"
+         {at_24} at 24, Q=112 grind=20 blowup=2 fold=4"
     );
+    assert_eq!(budget, 175_066, "the routing constant is fixed");
     assert!(
         at_20 < at_24,
         "a stack of fewer variables must cost fewer chain rows, or the budget's \
@@ -1148,21 +1146,9 @@ fn the_genesis_threshold_budget_is_in_band_at_the_production_shape() {
          block's 20 variables: pages would be left sparse that the opening could carry"
     );
     assert!(
-        budget <= at_24,
-        "the threshold charges {budget} rows for a stack that costs at most {at_24}: \
-         the budget has drifted above the cost it stands for"
-    );
-    // Under the lean fold, the default, the same stacks cost less, so the fixed
-    // budget over-charges them — the conservative direction — and it still
-    // covers the 20-variable stack.
-    let lean_at_20 = with_fold_emission(FoldEmission::Lean, || {
-        chain_shape_rows(&ChainShape::new(&config(112, 20), 20))
-    });
-    println!("GENESIS BUDGET lean fold: a chain of {lean_at_20} at 20 variables");
-    assert!(lean_at_20 < at_20, "the lean fold costs fewer rows");
-    assert!(
-        budget >= lean_at_20,
-        "the budget must still cover the 20-variable stack under the lean fold"
+        budget >= at_24,
+        "the threshold charges {budget} rows, under the {at_24} the 24-variable chain \
+         it bounds costs"
     );
 }
 
@@ -1621,72 +1607,70 @@ fn a_tampered_capped_chain_cannot_execute() {
 /// `112·3 + 5·224·3 + 224·2 = 4,144` parents; the caps cost `6·7 + 3 = 45`:
 /// 22,512 → 18,413 opening permutations, 22,828 → 18,729 in all. Rows: `+2`
 /// an opening at `c = 3` (`7 − 6 + 1`), `0` at `c = 2` (`3 − 4 + 1`), so
-/// `2·(112 + 5·224) = 2,464`, plus the cap checks `6·16 + 12 = 108`:
-/// 184,673 → 187,245 shape rows, 185,509 → 188,081 in all (the schedule does
-/// not move).
+/// `2·(112 + 5·224) = 2,464`, plus the cap checks `6·16 + 12 = 108`: 2,572
+/// more shape rows than the uncapped chain, and as many more in all (the
+/// schedule does not move, and nothing the cap changes touches the fold).
 #[test]
 fn the_production_chain_under_the_auto_cap_costs_its_hand_derivation() {
-    // The hand derivation is the CLASSIC fold's; perms do not depend on it.
-    with_fold_emission(FoldEmission::Classic, || {
-        let shape = ChainShape::new(&config_with(112, 20, CapPolicy::Auto), 25);
-        assert_eq!(shape.caps, vec![3, 3, 3, 3, 3, 3, 2]);
-        let entry = SpongeEntry::fresh();
-        assert_eq!(chain_cap_perms(&shape), 45, "cap permutations");
-        assert_eq!(chain_opening_perms(&shape), 18_413, "opening permutations");
-        assert_eq!(
-            chain_schedule_rows(&shape, entry),
-            836,
-            "schedule rows unmoved"
-        );
-        assert_eq!(
-            chain_schedule_perms(&shape, entry),
-            276,
-            "schedule perms unmoved"
-        );
-        assert_eq!(chain_grind_perms(&shape), 40);
-        assert_eq!(chain_shape_rows(&shape), 187_245, "shape rows");
-        assert_eq!(chain_rows(&shape, entry), 188_081, "rows a chain");
-        assert_eq!(chain_perms(&shape, entry), 18_729, "permutations a chain");
-        println!(
-            "production chain S=25 k=4 Q=112 grind=20 cap=auto: {} rows, {} permutations",
-            chain_rows(&shape, entry),
-            chain_perms(&shape, entry)
-        );
-    });
+    let shape = ChainShape::new(&config_with(112, 20, CapPolicy::Auto), 25);
+    let uncapped = ChainShape::new(&config(112, 20), 25);
+    assert_eq!(shape.caps, vec![3, 3, 3, 3, 3, 3, 2]);
+    let entry = SpongeEntry::fresh();
+    assert_eq!(chain_cap_perms(&shape), 45, "cap permutations");
+    assert_eq!(chain_opening_perms(&shape), 18_413, "opening permutations");
+    assert_eq!(
+        chain_schedule_rows(&shape, entry),
+        836,
+        "schedule rows unmoved"
+    );
+    assert_eq!(
+        chain_schedule_perms(&shape, entry),
+        276,
+        "schedule perms unmoved"
+    );
+    assert_eq!(chain_grind_perms(&shape), 40);
+    assert_eq!(
+        chain_shape_rows(&shape),
+        chain_shape_rows(&uncapped) + 2_572,
+        "shape rows"
+    );
+    assert_eq!(
+        chain_rows(&shape, entry),
+        chain_rows(&uncapped, entry) + 2_572,
+        "rows a chain"
+    );
+    assert_eq!(chain_perms(&shape, entry), 18_729, "permutations a chain");
+    println!(
+        "production chain S=25 k=4 Q=112 grind=20 cap=auto: {} rows, {} permutations",
+        chain_rows(&shape, entry),
+        chain_perms(&shape, entry)
+    );
 }
 
 /// ⛔ `PREPARED_LEG_ROWS` is a ROUTING constant and stays fixed
 /// across formats. Under the `Auto` cap a chain costs slightly more rows (+2 an
-/// opening at `c = 3`, plus the cap checks), so the constant under-states the
-/// 24-variable chain it was read from — by less than 2%, and it still covers
-/// the block's 20-variable stack.
+/// opening at `c = 3`, plus the cap checks), and the constant still covers the
+/// block's 20-variable stack and bounds the 24-variable chain.
 #[test]
-fn the_genesis_threshold_budget_stays_within_two_percent_under_the_auto_cap() {
+fn the_genesis_threshold_budget_still_bounds_the_chain_under_the_auto_cap() {
     let auto = |vars| {
         chain_shape_rows(&ChainShape::new(
             &config_with(112, 20, CapPolicy::Auto),
             vars,
         ))
     };
-    // The 2% band is the CLASSIC fold's, where the constant was read from.
-    let (at_20, at_24) = with_fold_emission(FoldEmission::Classic, || (auto(20), auto(24)));
+    let (at_20, at_24) = (auto(20), auto(24));
     let budget = crate::continuation::PREPARED_LEG_ROWS;
     println!(
-        "GENESIS BUDGET cap=auto: {budget} rows against {at_20} at 20 variables, {at_24} at 24 \
-         (classic fold)"
+        "GENESIS BUDGET cap=auto: {budget} rows against {at_20} at 20 variables, {at_24} at 24"
     );
     assert!(
         budget >= at_20,
         "the budget must still cover the 20-variable stack"
     );
     assert!(
-        (budget as f64) >= 0.98 * at_24 as f64 && budget <= at_24 + at_24 / 50,
-        "the budget must stay within 2% of the 24-variable chain it stands for"
-    );
-    let lean_at_20 = with_fold_emission(FoldEmission::Lean, || auto(20));
-    assert!(
-        budget >= lean_at_20,
-        "the budget must still cover the 20-variable stack under the lean fold ({lean_at_20})"
+        budget >= at_24,
+        "the budget must still bound the 24-variable chain ({at_24})"
     );
 }
 
@@ -1810,57 +1794,57 @@ fn a_tampered_first_fold_chain_cannot_execute() {
 ///   4 (32 base felts) + 5×6 + 5×6 = 64. 186 a query, 20,832 a chain.
 ///
 /// The whole-chain figures (grind + schedule terms) come from an independent
-/// Python re-implementation of these forms, which reproduces today's
-/// 22,828 / 185,509: first6
-/// 19,877 permutations and 201,318 rows, first5 21,109 and 189,028. R = 6
-/// under both, so `3R − 1 = 17` grinds, 34 permutations.
+/// Python re-implementation of these forms, which reproduces today's 22,828
+/// permutations: first6 19,877, first5 21,109. R = 6 under both, so
+/// `3R − 1 = 17` grinds, 34 permutations. The fold hashes nothing, so the
+/// permutations do not depend on it. Its rows were derived under the fold the
+/// emitter wrote then, seven rows a folded value — first6 201,318, first5
+/// 189,028 — and the lean fold's follow by the fold's difference a query
+/// (`(7·(B − 1) − 1) − (3·(B − 1) + 2·log B − 1)`: 240 at 64 values, 114 at 32,
+/// 52 at 16, 22 at 8), plus one row a level a round for the halved challenges:
+/// first6 `201,318 − 112·(240 + 4·52 + 22) + 25 = 148,703`, first5
+/// `189,028 − 112·(114 + 5·52) + 25 = 147,165`.
 #[test]
 fn the_first_fold_production_chains_cost_what_the_design_derived() {
-    // The design's figures are the CLASSIC fold's rows (perms do not depend on
-    // the fold, which hashes nothing).
-    with_fold_emission(FoldEmission::Classic, || {
-        let entry = SpongeEntry::fresh();
-        for (k0, schedule, parents, per_query, perms, rows) in [
-            (6, vec![6, 4, 4, 4, 4, 3], 113, 175, 19_877, 201_318),
-            (5, vec![5, 4, 4, 4, 4, 4], 122, 186, 21_109, 189_028),
-        ] {
-            let shape = ChainShape::new(&first_fold_config(112, 20, k0), 25);
-            assert_eq!(shape.schedule, schedule, "first{k0}");
-            let got_parents: usize = (0..shape.rounds())
-                .map(|r| shape.current_depth(r) + shape.next_depth(r).unwrap_or(0))
-                .sum();
-            assert_eq!(got_parents, parents, "first{k0}: Merkle parents a query");
-            assert_eq!(
-                shape.current_felts(0),
-                1 << k0,
-                "first{k0}: round 0 is base"
-            );
-            let opening = chain_opening_perms(&shape);
-            assert_eq!(opening, per_query * 112, "first{k0}: opening permutations");
-            assert_eq!(chain_grind_perms(&shape), 34, "first{k0}: 17 grinds");
-            println!(
-                "production chain S=25 first{k0} Q=112 grind=20: {opening} opening permutations, \
-                 {} permutations, {} rows ({} schedule perms, {} schedule rows)",
-                chain_perms(&shape, entry),
-                chain_rows(&shape, entry),
-                chain_schedule_perms(&shape, entry),
-                chain_schedule_rows(&shape, entry),
-            );
-            assert_eq!(
-                chain_perms(&shape, entry),
-                perms,
-                "first{k0}: permutations a chain"
-            );
-            assert_eq!(chain_rows(&shape, entry), rows, "first{k0}: rows a chain");
-        }
-    });
+    let entry = SpongeEntry::fresh();
+    for (k0, schedule, parents, per_query, perms, rows) in [
+        (6, vec![6, 4, 4, 4, 4, 3], 113, 175, 19_877, 148_703),
+        (5, vec![5, 4, 4, 4, 4, 4], 122, 186, 21_109, 147_165),
+    ] {
+        let shape = ChainShape::new(&first_fold_config(112, 20, k0), 25);
+        assert_eq!(shape.schedule, schedule, "first{k0}");
+        let got_parents: usize = (0..shape.rounds())
+            .map(|r| shape.current_depth(r) + shape.next_depth(r).unwrap_or(0))
+            .sum();
+        assert_eq!(got_parents, parents, "first{k0}: Merkle parents a query");
+        assert_eq!(
+            shape.current_felts(0),
+            1 << k0,
+            "first{k0}: round 0 is base"
+        );
+        let opening = chain_opening_perms(&shape);
+        assert_eq!(opening, per_query * 112, "first{k0}: opening permutations");
+        assert_eq!(chain_grind_perms(&shape), 34, "first{k0}: 17 grinds");
+        println!(
+            "production chain S=25 first{k0} Q=112 grind=20: {opening} opening permutations, \
+             {} permutations, {} rows ({} schedule perms, {} schedule rows)",
+            chain_perms(&shape, entry),
+            chain_rows(&shape, entry),
+            chain_schedule_perms(&shape, entry),
+            chain_schedule_rows(&shape, entry),
+        );
+        assert_eq!(
+            chain_perms(&shape, entry),
+            perms,
+            "first{k0}: permutations a chain"
+        );
+        assert_eq!(chain_rows(&shape, entry), rows, "first{k0}: rows a chain");
+    }
 }
 
 /// One production chain's pinned costs at `S = 25`: the auto caps per tree and
 /// their permutations, the grinds' permutations, every permutation, the
-/// arena's words, and the shape rows and rows under the lean fold (the default)
-/// and the classic one (the opt-out). The permutations do not depend on the
-/// fold.
+/// arena's words, and the shape rows and rows a chain.
 struct ChainPins {
     caps: &'static [usize],
     cap_perms: usize,
@@ -1868,15 +1852,14 @@ struct ChainPins {
     opening_perms: usize,
     perms: usize,
     words: u32,
-    lean: (usize, usize),
-    classic: (usize, usize),
+    rows: (usize, usize),
 }
 
 /// ★ THE PRODUCTION DEFAULT CHAIN — what `chain_config` builds with no knob
 /// set — is `first6` under the `Auto` cap, at blowup 2^1 and Q = 229, grinding
 /// before its queries alone: P2's `whir_grind=query`, one 18-bit grind and one
 /// nonce word a round. The legacy chain keeps its own pins above
-/// (`the_production_chain_costs…`, 185,509 / 22,828). At blowup 2^2
+/// (`the_production_chain_costs…`, 22,828 permutations). At blowup 2^2
 /// (`LAMBDA_VM_ZF_WHIR_BLOWUP=4`, Q 114) the chain keeps the pins the default
 /// had before the blowup moved
 /// ([`the_blowup_opt_out_chain_keeps_the_pins_from_before_the_flip`]); at 20
@@ -2076,28 +2059,14 @@ fn check_production_chain(label: &str, shape: &ChainShape, pins: &ChainPins) {
         pins.words,
         "{label}: arena words"
     );
-    for (fold, (shape_rows, rows)) in [
-        (FoldEmission::Lean, pins.lean),
-        (FoldEmission::Classic, pins.classic),
-    ] {
-        with_fold_emission(fold, || {
-            assert_eq!(
-                chain_shape_rows(shape),
-                shape_rows,
-                "{label}, {fold:?}: shape rows"
-            );
-            assert_eq!(
-                chain_rows(shape, entry),
-                rows,
-                "{label}, {fold:?}: rows a chain"
-            );
-            assert_eq!(
-                chain_perms(shape, entry),
-                pins.perms,
-                "{label}, {fold:?}: permutations a chain"
-            );
-        });
-    }
+    let (shape_rows, rows) = pins.rows;
+    assert_eq!(chain_shape_rows(shape), shape_rows, "{label}: shape rows");
+    assert_eq!(chain_rows(shape, entry), rows, "{label}: rows a chain");
+    assert_eq!(
+        chain_perms(shape, entry),
+        pins.perms,
+        "{label}: permutations a chain"
+    );
 }
 
 /// The production default chain's pins, derived by the closed forms and
@@ -2113,8 +2082,7 @@ const DEFAULT_CHAIN_PINS: ChainPins = ChainPins {
     opening_perms: 30_951,
     perms: 31_376,
     words: 64_457,
-    lean: (296_872, 298_123),
-    classic: (404_477, 405_728),
+    rows: (296_872, 298_123),
 };
 
 /// The blowup opt-out's pins (blowup 2^2, Q 114 at 18 bits), which are the
@@ -2126,8 +2094,7 @@ const BLOWUP_4_CHAIN_PINS: ChainPins = ChainPins {
     opening_perms: 16_454,
     perms: 16_705,
     words: 33_170,
-    lean: (152_175, 152_904),
-    classic: (205_730, 206_459),
+    rows: (152_175, 152_904),
 };
 
 /// The grind-bits opt-out's pins (blowup 2^2, 20 bits, Q 112), which are the
@@ -2139,8 +2106,7 @@ const GRIND_BITS_20_CHAIN_PINS: ChainPins = ChainPins {
     opening_perms: 16_166,
     perms: 16_411,
     words: 32_590,
-    lean: (149_547, 150_258),
-    classic: (202_162, 202_873),
+    rows: (149_547, 150_258),
 };
 
 /// The opt-out's pins, which are the production default's from before P2:
@@ -2152,152 +2118,24 @@ const GRIND_ALL_CHAIN_PINS: ChainPins = ChainPins {
     opening_perms: 16_166,
     perms: 16_443,
     words: 32_602,
-    lean: (150_075, 150_811),
-    classic: (202_690, 203_426),
+    rows: (150_075, 150_811),
 };
 
 /// ⛔ `PREPARED_LEG_ROWS` stays FIXED under the fold knob, and
 /// this is what makes that safe: under each first fold the constant still
 /// covers the block's 20-variable stack, so no page is left sparse that the
-/// opening could carry. The default band above is untouched; its upper side
-/// (the 24-variable chain) is a statement about where the constant was read
-/// from, at the default schedule only.
+/// opening could carry. The bound on the 24-variable chain above is the
+/// default schedule's only.
 #[test]
 fn the_genesis_threshold_budget_still_covers_the_stack_under_each_first_fold() {
     let budget = crate::continuation::PREPARED_LEG_ROWS;
-    for (k0, at_20_design) in [(5, 137_321), (6, 155_889)] {
-        let shape = || ChainShape::new(&first_fold_config(112, 20, k0), 20);
-        // The design figures are the CLASSIC fold's rows.
-        let at_20 = with_fold_emission(FoldEmission::Classic, || chain_shape_rows(&shape()));
-        let lean_at_20 = with_fold_emission(FoldEmission::Lean, || chain_shape_rows(&shape()));
-        println!(
-            "GENESIS BUDGET first{k0}: {budget} rows against a chain of {at_20} at 20 \
-             (classic fold), {lean_at_20} (lean fold)"
-        );
-        assert_eq!(
-            at_20, at_20_design,
-            "first{k0}: the 20-variable stack's rows (design/WHIR.md §4.8)"
-        );
-        for (fold, rows) in [("classic", at_20), ("lean", lean_at_20)] {
-            assert!(
-                budget >= rows,
-                "first{k0}, {fold} fold: the threshold charges {budget} rows for a stack \
-                 that costs {rows}"
-            );
-        }
-    }
-}
-
-// ============================================================================
-// Both fold emissions: the lean fold (the default) and the classic one (the
-// opt-out, `LAMBDA_VM_WHIR_FOLD_CLASSIC`)
-// ============================================================================
-
-use super::whir_fold::{FoldEmission, with_fold_emission};
-
-const FOLDS: [FoldEmission; 2] = [FoldEmission::Lean, FoldEmission::Classic];
-
-/// ★ Both chains execute on the same accepted proofs, and the lean one is the
-/// smaller program.
-#[test]
-fn both_fold_emissions_execute_on_a_proof_the_host_accepts() {
-    for (num_vars, num_queries) in [(6usize, 3usize), (6, 5), (5, 3), (9, 3)] {
-        let f = fixture(num_vars, num_queries, 0);
-        let [lean, classic] =
-            FOLDS.map(|fold| with_fold_emission(fold, || chain_program(&f.shape)));
+    for k0 in [5, 6] {
+        let rows = chain_shape_rows(&ChainShape::new(&first_fold_config(112, 20, k0), 20));
+        println!("GENESIS BUDGET first{k0}: {budget} rows against a chain of {rows} at 20");
         assert!(
-            lean.instrs.len() < classic.instrs.len(),
-            "S={num_vars} Q={num_queries}: the lean chain must be the smaller program"
+            budget >= rows,
+            "first{k0}: the threshold charges {budget} rows for a stack that costs {rows}"
         );
-        for (fold, program) in FOLDS.iter().zip([&lean, &classic]) {
-            let arena = chain_arena(&f, &f.proof);
-            execute(program, &[arena], &crate::hash_pin::BLOCK_HASHER).unwrap_or_else(|e| {
-                panic!(
-                    "S={num_vars} Q={num_queries}: the {fold:?} chain refused an accepted \
-                     proof: {e:?}"
-                )
-            });
-        }
-    }
-}
-
-/// ★ Both chains refuse what [`a_tampered_chain_cannot_execute`] refuses: its
-/// five tamper sites, at a real grind width.
-#[test]
-fn a_tampered_chain_cannot_execute_under_either_fold() {
-    let grind = 8u8;
-    let f = fixture(6, 3, grind);
-    let mut sites: Vec<(&str, ChainProof<F, E>)> = Vec::new();
-    let mut forged = f.proof.clone();
-    forged.final_value += FEE::one();
-    sites.push(("the final value", forged));
-    let mut forged = f.proof.clone();
-    forged.rounds[0].sumcheck[0].evaluations[0] += FEE::one();
-    sites.push(("a sumcheck evaluation", forged));
-    let mut forged = f.proof.clone();
-    if let Some(v) = forged.rounds[0].ood_value.as_mut() {
-        *v += FEE::one();
-    }
-    sites.push(("an out-of-domain value", forged));
-    let mut forged = f.proof.clone();
-    forged.rounds[0].nonces.query ^= 1;
-    sites.push(("a grind nonce", forged));
-    let mut forged = f.proof.clone();
-    match &mut forged.rounds[0].openings {
-        RoundOpenings::Base(p) => p.current[0].proof.merkle_path[0][0] ^= 1,
-        RoundOpenings::Extension(p) => p.current[0].proof.merkle_path[0][0] ^= 1,
-        RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
-    }
-    sites.push(("a Merkle sibling", forged));
-    for fold in FOLDS {
-        let program = with_fold_emission(fold, || chain_program(&f.shape));
-        assert!(
-            execute(
-                &program,
-                &[chain_arena(&f, &f.proof)],
-                &crate::hash_pin::BLOCK_HASHER
-            )
-            .is_ok(),
-            "{fold:?}: the untouched proof must execute"
-        );
-        for (name, forged) in &sites {
-            assert!(
-                execute(
-                    &program,
-                    &[chain_arena(&f, forged)],
-                    &crate::hash_pin::BLOCK_HASHER
-                )
-                .is_err(),
-                "{fold:?}, {name}: the chain must refuse the forgery"
-            );
-        }
-    }
-}
-
-/// ★ Each emission's F1: the closed forms follow the emission in force.
-#[test]
-fn each_fold_emission_emits_its_closed_form() {
-    for fold in FOLDS {
-        with_fold_emission(fold, || {
-            for (cfg, num_vars) in cost_configs() {
-                let f = fixture_with(&cfg, num_vars);
-                let program = chain_program(&f.shape);
-                let entry = SpongeEntry::fresh();
-                let measured =
-                    program.instrs.len() - const_rows(&program) - chain_plumbing(&f.shape);
-                assert_eq!(
-                    measured,
-                    chain_rows(&f.shape, entry),
-                    "{fold:?} S={num_vars} Q={}: rows",
-                    cfg.num_queries
-                );
-                assert_eq!(
-                    perm_rows(&program),
-                    chain_perms(&f.shape, entry),
-                    "{fold:?}: the fold hashes nothing"
-                );
-            }
-        });
     }
 }
 

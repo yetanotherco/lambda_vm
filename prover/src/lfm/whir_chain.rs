@@ -93,7 +93,7 @@ use stark::config::Commitment;
 use super::algebraic_commit::commitment_to_digest;
 use super::builder::{Bit, Cell, Ext, Felt, LfmBuilder};
 use super::edsl::WrapDigest;
-use super::whir_fold::{FoldEmission, RoundFold, fold_rows_for, lean_prepare_rows};
+use super::whir_fold::{RoundFold, fold_coset_rows_lean, lean_prepare_rows};
 use super::whir_open::{
     BlockValues, CapCells, Siblings, TreeAuth, cap_check_perms, cap_check_rows,
     verify_opening_perms_capped, verify_opening_rows_capped,
@@ -555,10 +555,8 @@ pub fn chain_query_rows(shape: &ChainShape) -> usize {
             let leaf = super::whir_open::block_leaf_rows(felts, unpacks) + 2 + 2 * 4;
             per_round += shape.num_queries
                 + shape.current_leaves(r)
-                    * (leaf + fold_rows_for(1usize << shape.schedule[r], depth) + 2);
-            if FoldEmission::current() == FoldEmission::Lean {
-                per_round += lean_prepare_rows(shape.schedule[r]);
-            }
+                    * (leaf + fold_coset_rows_lean(1usize << shape.schedule[r], depth) + 2);
+            per_round += lean_prepare_rows(shape.schedule[r]);
             continue;
         }
         // The index draw, the current opening (one a tree), the trees' blocks
@@ -566,7 +564,7 @@ pub fn chain_query_rows(shape: &ChainShape) -> usize {
         let mut q = 1
             + shape.trees_at(r) * verify_opening_rows_capped(felts, unpacks, depth, shape.caps[r])
             + combine_rows(shape, r)
-            + fold_rows_for(1usize << shape.schedule[r], depth);
+            + fold_coset_rows_lean(1usize << shape.schedule[r], depth);
         match shape.next_depth(r) {
             Some(next_depth) => {
                 let next_block = 1usize << shape.schedule[r + 1];
@@ -584,9 +582,7 @@ pub fn chain_query_rows(shape: &ChainShape) -> usize {
         }
         per_round += shape.num_queries * q;
         // The lean fold's once-a-round `½·α`.
-        if FoldEmission::current() == FoldEmission::Lean {
-            per_round += lean_prepare_rows(shape.schedule[r]);
-        }
+        per_round += lean_prepare_rows(shape.schedule[r]);
     }
     per_round
 }
@@ -1446,7 +1442,7 @@ fn emit_query_phase(
         .map(|bits| walk_bits(shape, r, bits))
         .collect();
     // The lean fold halves the round's challenges once, here, rather
-    // than once per query; the classic fold prepares nothing.
+    // than once per query.
     let fold = RoundFold::prepare(b, alphas);
 
     match (next_tree, shape.next_depth(r)) {
