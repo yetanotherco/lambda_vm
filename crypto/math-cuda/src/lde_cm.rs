@@ -270,6 +270,7 @@ fn tile_bytes(k: u32, log_t: u32) -> u32 {
 const F_SPREAD: u32 = 1;
 const F_GATHER: u32 = 2;
 const F_STORE_W: u32 = 4;
+const F_MOBIUS: u32 = 8;
 
 /// The windowed root tables the kernels take: `t[w·256 + j] = root^(j << 8w)`
 /// for the field's primitive `2^32`-th root (`fwd`) and its inverse (`inv`).
@@ -575,6 +576,25 @@ pub(crate) fn lde_columns(
     Ok(())
 }
 
+/// The plan [`spread_ntt_column`] takes on the calling thread.
+fn spread_plan(log_n: u32) -> Vec<u32> {
+    if ntt_wide_enabled() {
+        plan_wide(log_n)
+    } else {
+        plan(log_n)
+    }
+}
+
+/// How many low Möbius levels [`spread_ntt_column`]'s first pass holds for a
+/// length-`2^log_n` transform at spacing `2^log_blowup`, in the plan in force
+/// on the calling thread: a block stages `2^(k + log T)` positions, so
+/// `2^(k + log T − log_blowup)` consecutive coefficients — `12 − log_blowup`
+/// levels once the transform reaches 2^12.
+pub(crate) fn fused_mobius_levels(log_n: u32, log_blowup: u32) -> u32 {
+    let k = spread_plan(log_n)[0];
+    k + pass_log_t(log_n, 0, k) - log_blowup
+}
+
 /// The forward transform of ONE spread column — the WHIR commit's encoding
 /// (`whir::commit_from`; the legacy path is `ntt.cu`'s `lift_spread` then
 /// `ntt::run_ntt_body`), fused: position `2^log_blowup · q` of the
@@ -586,6 +606,11 @@ pub(crate) fn lde_columns(
 /// — `ceil(log_n / 10)` under [`NTT_WIDE_ENV`] ([`plan_wide`]).
 /// `src` (`2^(log_n - log_blowup)` values) and `dst` (`2^log_n`) must not
 /// overlap. Nothing synchronises.
+///
+/// With `mobius_levels` (non-zero, and then exactly
+/// [`fused_mobius_levels`]) the first pass also runs the encoding's Möbius
+/// levels `[0, mobius_levels)` over the coefficients it stages: the caller has
+/// run the others (the levels commute).
 pub(crate) fn spread_ntt_column(
     stream: &CudaStream,
     be: &Backend,
@@ -593,18 +618,25 @@ pub(crate) fn spread_ntt_column(
     dst: sys::CUdeviceptr,
     log_n: u32,
     log_blowup: u32,
+    mobius_levels: u32,
 ) -> Result<()> {
     assert!(
         spread_supports(log_n, log_blowup),
         "a spread transform of 2^{log_n} at spacing 2^{log_blowup} is outside the engine"
     );
+    assert!(
+        mobius_levels == 0 || mobius_levels == fused_mobius_levels(log_n, log_blowup),
+        "the first pass of 2^{log_n} holds {} Möbius levels, not {mobius_levels}",
+        fused_mobius_levels(log_n, log_blowup)
+    );
     let tables = root_tables(be)?;
     let (fwd_roots, _fr) = tables.fwd.device_ptr(stream);
     let one = |ptr| Cols { ptr, stride: 0 };
-    let ks = if ntt_wide_enabled() {
-        plan_wide(log_n)
+    let ks = spread_plan(log_n);
+    let first_flags = if mobius_levels > 0 {
+        F_SPREAD | F_MOBIUS
     } else {
-        plan(log_n)
+        F_SPREAD
     };
     let mut s = 0;
     for (i, &k) in ks.iter().enumerate() {
@@ -617,7 +649,7 @@ pub(crate) fn spread_ntt_column(
             log_n,
             s,
             log_blowup,
-            if first { F_SPREAD } else { 0 },
+            if first { first_flags } else { 0 },
             one(if first { src } else { dst }),
             one(dst),
             fwd_roots,
@@ -757,6 +789,27 @@ mod tests {
             .filter(|&l| plan_wide(l) != plan(l))
             .collect();
         assert_eq!(differ, [9, 10, 17, 18, 19, 20, 25, 26, 27, 28, 29, 30]);
+    }
+
+    /// A first pass at the lane cap stages 2^12 positions in either plan, so it
+    /// holds the low `12 − log_blowup` Möbius levels; below 2^12, all of them.
+    #[test]
+    fn the_first_pass_holds_the_low_mobius_levels() {
+        for wide in [false, true] {
+            with_ntt_wide(wide, || {
+                for lb in 0..=MAX_LOG_BLOWUP {
+                    for log_n in 12.max(lb + MIN_LOG_N)..=30 {
+                        assert_eq!(fused_mobius_levels(log_n, lb), 12 - lb, "2^{log_n} lb {lb}");
+                    }
+                }
+                assert_eq!(
+                    fused_mobius_levels(11, 1),
+                    10,
+                    "every level of a 2^10 stack"
+                );
+                assert_eq!(fused_mobius_levels(28, 1), 11, "the production encoding");
+            });
+        }
     }
 
     /// Today's plan unless the knob says exactly `1`.

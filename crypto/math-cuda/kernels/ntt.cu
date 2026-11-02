@@ -148,7 +148,10 @@ extern "C" __global__ void mobius_tile(uint64_t *x, uint64_t base, uint32_t k_le
 //                     part covers), so the stack copy and its memset never run.
 //   mobius_wide_tile  `k_levels <= 8` strided levels from `base` over a tile of
 //                     2^k rows × 32 columns, each of the 1,024 threads holding
-//                     2^k / 32 rows (dynamic shared memory up to 66 KiB).
+//                     2^k / 32 rows (dynamic shared memory up to 66 KiB); with
+//                     `parts` it gathers the stack the same way (the fused
+//                     encoding, `LAMBDA_VM_WHIR_MOBIUS_FUSED=1`, whose low
+//                     levels run in the NTT's first pass, starts here).
 // ---------------------------------------------------------------------------
 
 #define MOBIUS_WIDE_LOG 11
@@ -216,7 +219,8 @@ extern "C" __global__ void mobius_wide_low(uint64_t *x, const uint64_t *parts, u
     for (uint32_t j = threadIdx.x; j < n; j += blockDim.x) x[base + j] = tile[j];
 }
 
-extern "C" __global__ void mobius_wide_tile(uint64_t *x, uint64_t base, uint32_t k_levels) {
+extern "C" __global__ void mobius_wide_tile(uint64_t *x, uint64_t base, uint32_t k_levels,
+                                            const uint64_t *parts, uint32_t n_parts) {
     extern __shared__ uint64_t tile[];
     const uint32_t cols = MOBIUS_TILE_COLS;
     const uint32_t pitch = cols + 1;
@@ -225,8 +229,16 @@ extern "C" __global__ void mobius_wide_tile(uint64_t *x, uint64_t base, uint32_t
     const uint64_t c = (uint64_t)blockIdx.x * cols + threadIdx.x;
     const uint64_t q = (uint64_t)blockIdx.z * gridDim.y + blockIdx.y;
     const uint64_t i0 = q * (low << k_levels) + c;
-    for (uint32_t r = threadIdx.y; r < rows; r += blockDim.y)
-        tile[r * pitch + threadIdx.x] = x[i0 + r * low];
+    if (parts != nullptr) {
+        // Each element's part by a search of the whole table (zero where none
+        // covers it, and for an empty table).
+        for (uint32_t r = threadIdx.y; r < rows; r += blockDim.y)
+            tile[r * pitch + threadIdx.x] =
+                n_parts ? mobius_gather(parts, 0, n_parts, i0 + r * low) : 0;
+    } else {
+        for (uint32_t r = threadIdx.y; r < rows; r += blockDim.y)
+            tile[r * pitch + threadIdx.x] = x[i0 + r * low];
+    }
     __syncthreads();
     for (uint32_t l = 0; l < k_levels; ++l) {
         const uint32_t half = 1u << l;

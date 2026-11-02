@@ -2003,8 +2003,16 @@ fn encode_from(source: Source<'_>, log_blowup: usize, transient: bool) -> Result
     // SAFETY: every element is written by the copy below, or by the wide
     // Möbius pass that gathers the stack in its place.
     let mut coeffs = unsafe { alloc_or_trim::<u64>(&stream, 1usize << log_evals) }?;
-    let x = if mobius_wide_gathered(&stream, be, &source, &mut coeffs, log_evals)? {
-        spread_encode(&stream, be, coeffs, log_evals, log_blowup)?
+    let fused = mobius_fused_levels(log_evals, log_blowup);
+    let x = if mobius_wide_gathered(&stream, be, &source, &mut coeffs, log_evals, fused)? {
+        spread_encode(
+            &stream,
+            be,
+            coeffs,
+            log_evals,
+            log_blowup,
+            fused.unwrap_or(0),
+        )?
     } else {
         source.write(&stream, &mut coeffs)?;
         encode_values(&stream, be, coeffs, log_evals, log_blowup)?
@@ -2036,24 +2044,35 @@ fn encode_values(
     log_evals: u64,
     log_blowup: usize,
 ) -> Result<CudaSlice<u64>> {
-    mobius(
-        stream.as_ref(),
+    let len = 1usize << log_evals;
+    let fused = mobius_fused_levels(log_evals, log_blowup);
+    if let Some(from) = fused {
+        let (x, _guard) = cudarc::driver::DevicePtrMut::device_ptr_mut(&mut coeffs, stream);
+        mobius_wide_tiles(stream.as_ref(), be, x, len, log_evals, from, None)?;
+    } else {
+        mobius(stream.as_ref(), be, &mut coeffs, len, log_evals)?;
+    }
+    spread_encode(
+        stream,
         be,
-        &mut coeffs,
-        1usize << log_evals,
+        coeffs,
         log_evals,
-    )?;
-    spread_encode(stream, be, coeffs, log_evals, log_blowup)
+        log_blowup,
+        fused.unwrap_or(0),
+    )
 }
 
-/// [`encode_values`] after its Möbius transform: the lift's spread and the NTT
-/// onto the `2^log_blowup`-times larger domain. `coeffs` is spent.
+/// [`encode_values`] after its Möbius transform — all of it, or with
+/// `mobius_levels` its levels from there up ([`mobius_fused_levels`]): the
+/// lift's spread and the NTT onto the `2^log_blowup`-times larger domain, the
+/// low Möbius levels then fused into the NTT's first pass. `coeffs` is spent.
 fn spread_encode(
     stream: &Arc<CudaStream>,
     be: &crate::device::Backend,
     coeffs: CudaSlice<u64>,
     log_evals: u64,
     log_blowup: usize,
+    mobius_levels: u32,
 ) -> Result<CudaSlice<u64>> {
     let log_n = log_evals + log_blowup as u64;
     let n = 1usize << log_n;
@@ -2074,10 +2093,25 @@ fn spread_encode(
         // (see `lde_cm`). `LAMBDA_VM_LDE_LEGACY=1` takes the branch below.
         let src = coeffs.device_ptr(stream).0;
         let dst = x.device_ptr(stream).0;
-        crate::lde_cm::spread_ntt_column(stream, be, src, dst, log_n as u32, log_blowup_u32)?;
+        crate::lde_cm::spread_ntt_column(
+            stream,
+            be,
+            src,
+            dst,
+            log_n as u32,
+            log_blowup_u32,
+            mobius_levels,
+        )?;
+        if mobius_levels > 0 {
+            MOBIUS_FUSED_ENCODES.fetch_add(1, Ordering::Relaxed);
+        }
         // Spent: the first pass has read them, and the free is stream-ordered.
         drop(coeffs);
     } else {
+        assert_eq!(
+            mobius_levels, 0,
+            "the legacy encoding cannot take fused Möbius levels"
+        );
         unsafe {
             stream
                 .launch_builder(&be.lift_spread)
@@ -2464,6 +2498,85 @@ pub fn mobius_wide_gathers() -> u64 {
     MOBIUS_WIDE_GATHERS.load(Ordering::Relaxed)
 }
 
+/// `LAMBDA_VM_WHIR_MOBIUS_FUSED=1` folds the encoding's low Möbius levels into
+/// the NTT's first pass: a first-pass block stages `2^(12 − log_blowup)`
+/// consecutive coefficients ([`crate::lde_cm::fused_mobius_levels`]), exactly
+/// the levels the wide transform's contiguous pass runs, so that pass goes.
+/// The strided levels run first (the first one gathering the stack, as the
+/// wide transform's contiguous pass did); the levels commute, so the field
+/// values are today's — the order of the subtractions changes, so a word's
+/// representation may not be. Where it does not apply (the legacy encoding,
+/// a stack the first pass holds whole) the encoding is the wide transform's
+/// or today's. Read once per process; only `1` opts in.
+pub const MOBIUS_FUSED_ENV: &str = "LAMBDA_VM_WHIR_MOBIUS_FUSED";
+
+thread_local! {
+    /// Per-thread override of [`MOBIUS_FUSED_ENV`]. See [`with_mobius_fused`].
+    static MOBIUS_FUSED_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `LAMBDA_VM_WHIR_MOBIUS_FUSED`'s value read: `1` fuses, anything else
+/// (unset included) does not.
+pub fn mobius_fused_setting(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1"))
+}
+
+/// Whether the calling thread's WHIR encodings fold the low Möbius levels into
+/// the NTT.
+pub fn mobius_fused_enabled() -> bool {
+    if let Some(on) = MOBIUS_FUSED_OVERRIDE.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| {
+        let on = mobius_fused_setting(std::env::var(MOBIUS_FUSED_ENV).ok().as_deref());
+        if on {
+            eprintln!(
+                "[gpu] WHIR Möbius: fused, the low levels in the NTT's first pass ({MOBIUS_FUSED_ENV}=1)"
+            );
+        }
+        on
+    })
+}
+
+/// Run `f` with the fused encoding forced on or off for the calling thread.
+#[doc(hidden)]
+pub fn with_mobius_fused<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MOBIUS_FUSED_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(MOBIUS_FUSED_OVERRIDE.with(|c| c.replace(Some(on))));
+    f()
+}
+
+/// Encodings whose NTT ran the low Möbius levels, process-wide: what a test
+/// reads to know the fused encoding ran.
+static MOBIUS_FUSED_ENCODES: AtomicU64 = AtomicU64::new(0);
+
+/// See [`MOBIUS_FUSED_ENCODES`].
+pub fn mobius_fused_encodes() -> u64 {
+    MOBIUS_FUSED_ENCODES.load(Ordering::Relaxed)
+}
+
+/// The Möbius level the fused encoding of a `2^log_evals` stack at spacing
+/// `2^log_blowup` starts its strided passes at — the levels below it run in
+/// the NTT's first pass — or `None` where it does not apply: the knob off, the
+/// legacy encoding, or no strided level left.
+fn mobius_fused_levels(log_evals: u64, log_blowup: usize) -> Option<u32> {
+    if !mobius_fused_enabled() || !crate::lde_cm::engine_enabled() {
+        return None;
+    }
+    let (log_n, lb) = ((log_evals + log_blowup as u64) as u32, log_blowup as u32);
+    if !crate::lde_cm::spread_supports(log_n, lb) {
+        return None;
+    }
+    let from = crate::lde_cm::fused_mobius_levels(log_n, lb);
+    ((from as u64) < log_evals && from >= MOBIUS_TILE_COLS.trailing_zeros()).then_some(from)
+}
+
 /// The wide transform over the `len = 2^log_evals` words at `x` on `stream`;
 /// with `parts` (a device table of `(offset, len, src)` triples and its
 /// length), the first pass reads the stack from them instead of from `x`.
@@ -2476,17 +2589,6 @@ fn mobius_wide(
     parts: Option<(cudarc::driver::sys::CUdeviceptr, u32)>,
 ) -> Result<()> {
     debug_assert!(log_evals >= MOBIUS_WIDE_LOW as u64 && len == 1usize << log_evals);
-    static TILE_ATTR: Once = Once::new();
-    let mut attr = Ok(());
-    TILE_ATTR.call_once(|| {
-        attr = be.ctx.bind_to_thread().and_then(|()| {
-            be.mobius_wide_tile.set_attribute(
-                cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                MOBIUS_WIDE_TILE_BYTES as i32,
-            )
-        });
-    });
-    attr?;
     let (table, n_parts) = parts.unwrap_or((0, 0));
     let first = MOBIUS_WIDE_LOW.min(log_evals as u32);
     unsafe {
@@ -2502,17 +2604,48 @@ fn mobius_wide(
                 shared_mem_bytes: 0,
             })?;
     }
-    let mut level = first as u64;
+    mobius_wide_tiles(stream, be, x, len, log_evals, first, None)
+}
+
+/// The wide transform's strided levels `[from, log_evals)`, up to
+/// [`MOBIUS_WIDE_TILE`] a pass; with `parts` the first pass gathers the stack
+/// from them instead of reading `x` (the fused encoding's start).
+fn mobius_wide_tiles(
+    stream: &CudaStream,
+    be: &crate::device::Backend,
+    x: cudarc::driver::sys::CUdeviceptr,
+    len: usize,
+    log_evals: u64,
+    from: u32,
+    parts: Option<(cudarc::driver::sys::CUdeviceptr, u32)>,
+) -> Result<()> {
+    debug_assert!(len == 1usize << log_evals && (1u32 << from) >= MOBIUS_TILE_COLS);
+    static TILE_ATTR: Once = Once::new();
+    let mut attr = Ok(());
+    TILE_ATTR.call_once(|| {
+        attr = be.ctx.bind_to_thread().and_then(|()| {
+            be.mobius_wide_tile.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                MOBIUS_WIDE_TILE_BYTES as i32,
+            )
+        });
+    });
+    attr?;
+    let mut gather = parts;
+    let mut level = from as u64;
     while level < log_evals {
         let k = MOBIUS_WIDE_TILE.min((log_evals - level) as u32);
         let low = 1u64 << level;
         let (grid_y, grid_z) = crate::ntt::split_grid_y(len as u64 / (low << k));
+        let (table, n_parts) = gather.take().unwrap_or((0, 0));
         unsafe {
             stream
                 .launch_builder(&be.mobius_wide_tile)
                 .arg(&x)
                 .arg(&level)
                 .arg(&k)
+                .arg(&table)
+                .arg(&n_parts)
                 .launch(LaunchConfig {
                     grid_dim: ((low / MOBIUS_TILE_COLS as u64) as u32, grid_y, grid_z),
                     block_dim: (MOBIUS_TILE_COLS, 32, 1),
@@ -2526,17 +2659,20 @@ fn mobius_wide(
 
 /// The wide transform with the stack gathered from a source the card holds
 /// (a resident store or a buffer's slices), straight into `coeffs`: no copy
-/// and no memset. `false` (nothing queued) when it does not apply — the knob
-/// off, a stack under 2^11, a host source, or parts that overlap or run past
-/// the stack — and the caller copies and transforms as before.
+/// and no memset. With `fused` (the fused encoding's first strided level) it
+/// runs only the strided levels from there, the first gathering, and leaves
+/// the low ones to the NTT. `false` (nothing queued) when it does not apply —
+/// the knobs off, a stack under 2^11, a host source, or parts that overlap or
+/// run past the stack — and the caller copies and transforms as before.
 fn mobius_wide_gathered(
     stream: &Arc<CudaStream>,
     be: &crate::device::Backend,
     source: &Source<'_>,
     coeffs: &mut CudaSlice<u64>,
     log_evals: u64,
+    fused: Option<u32>,
 ) -> Result<bool> {
-    if !mobius_wide_enabled() || log_evals < MOBIUS_WIDE_LOW as u64 {
+    if (fused.is_none() && !mobius_wide_enabled()) || log_evals < MOBIUS_WIDE_LOW as u64 {
         return Ok(false);
     }
     let len = 1usize << log_evals;
@@ -2590,7 +2726,18 @@ fn mobius_wide_gathered(
     {
         let (tab, _tab_guard) = table.device_ptr(stream);
         let (x, _x_guard) = cudarc::driver::DevicePtrMut::device_ptr_mut(coeffs, stream);
-        mobius_wide(stream.as_ref(), be, x, len, log_evals, Some((tab, n_parts)))?;
+        match fused {
+            Some(from) => mobius_wide_tiles(
+                stream.as_ref(),
+                be,
+                x,
+                len,
+                log_evals,
+                from,
+                Some((tab, n_parts)),
+            )?,
+            None => mobius_wide(stream.as_ref(), be, x, len, log_evals, Some((tab, n_parts)))?,
+        }
     }
     drop(guards);
     // Freed stream-ordered, after the first pass has read it.
@@ -2614,6 +2761,16 @@ mod mobius_wide_tests {
         assert!(mobius_wide_setting(Some(" 1")));
         assert!(!mobius_wide_setting(Some("0")));
         assert!(!mobius_wide_setting(Some("on")), "only 1 opts in");
+    }
+
+    /// No fusing unless the knob says exactly `1`.
+    #[test]
+    fn the_fused_mobius_runs_only_at_one() {
+        use super::mobius_fused_setting;
+        assert!(!mobius_fused_setting(None), "the default fuses nothing");
+        assert!(mobius_fused_setting(Some("1")));
+        assert!(!mobius_fused_setting(Some("0")));
+        assert!(!mobius_fused_setting(Some("yes")), "only 1 opts in");
     }
 }
 

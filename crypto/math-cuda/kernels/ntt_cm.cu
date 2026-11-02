@@ -60,6 +60,11 @@
 //   F_STORE_W s = 0: multiply the value at column position p by wtab[p] on the
 //             way out (the iNTT's last pass applies the bit-reversed coset
 //             weights here).
+//   F_MOBIUS  with F_SPREAD: before the rounds, the encoding's Möbius levels
+//             over the block's compact values — all of them, the low
+//             KLOG + log T - lb bits of a value's index — one level a phase
+//             (`phase_contig_mobius`). The WHIR encoding runs its other levels
+//             first; the levels commute.
 //
 // HOST REPLAY. Every phase is a plain function of (tid, bx, col) so that
 // `tests/host_kat/ntt_cm_host_kat.cpp` can compile this file through the CUDA
@@ -91,6 +96,7 @@ struct Radix {
 constexpr uint32_t F_SPREAD = 1u;
 constexpr uint32_t F_GATHER = 2u;
 constexpr uint32_t F_STORE_W = 4u;
+constexpr uint32_t F_MOBIUS = 8u;
 
 // root32^e from the windowed table (at most three multiplications).
 __device__ __forceinline__ uint64_t pow_root32(const uint64_t *roots, uint32_t e) {
@@ -396,6 +402,25 @@ __device__ __forceinline__ void phase_contig_stage(const uint64_t *in, uint64_t 
     }
 }
 
+// One Möbius level of the block's compact values (F_MOBIUS): the value at
+// index j, staged at position B·j, loses its partner below when bit `level`
+// of j is set — `mobius_wide_low`'s operation, x[j] -= x[j ^ 2^level]. Each
+// pair belongs to one thread, so a level needs no barrier inside it.
+template <int KLOG>
+__device__ __forceinline__ void phase_contig_mobius(uint64_t *tile, uint32_t log_t, uint32_t lb,
+                                                    uint32_t level, uint32_t tid) {
+    constexpr uint32_t K = 1u << KLOG;
+    const uint32_t nthreads = threads_of<KLOG>(log_t);
+    const uint32_t pairs = 1u << (KLOG + log_t - lb - 1);
+    const uint32_t h = 1u << level;
+    for (uint32_t u = tid; u < pairs; u += nthreads) {
+        const uint32_t j1 = ((u >> level) << (level + 1)) | h | (u & (h - 1u));
+        const uint32_t e1 = j1 << lb, e0 = (j1 ^ h) << lb;
+        const uint32_t i1 = tile_at<KLOG>(e1 & (K - 1u), log_t, e1 >> KLOG);
+        tile[i1] = sub(tile[i1], tile[tile_at<KLOG>(e0 & (K - 1u), log_t, e0 >> KLOG)]);
+    }
+}
+
 // Round J tile to tile — every round of a contiguous pass, and the middle
 // round of a three-round strided one: each thread reads and writes back
 // exactly the tile slots of its own group, so no barrier is needed between
@@ -469,6 +494,12 @@ __device__ __forceinline__ void ntt_cm_pass(const uint64_t *in, uint64_t in_stri
     } else {
         phase_contig_stage<KLOG>(in, in_stride, wtab, ntt_cm_tile, L, lb, log_t, flags, tid, bx, col);
         __syncthreads();
+        if (flags & F_MOBIUS) {
+            for (uint32_t l = 0; l < KLOG + log_t - lb; ++l) {
+                phase_contig_mobius<KLOG>(ntt_cm_tile, log_t, lb, l, tid);
+                __syncthreads();
+            }
+        }
         phase_tile_round<KLOG, DIT, 0>(ntt_cm_tile, rad, log_t, tid);
         if constexpr (ROUNDS >= 2) {
             __syncthreads();

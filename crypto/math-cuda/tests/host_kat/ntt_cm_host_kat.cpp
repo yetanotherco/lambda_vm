@@ -31,7 +31,11 @@
 //      where the two plans differ, edge words planted;
 //   8. the tile layout: every slot of every (k, T) in bounds and distinct, and
 //      a wide pass's first-round and staged accesses on 16 distinct banks a
-//      half-warp (a speed property, checked because the layout exists for it).
+//      half-warp (a speed property, checked because the layout exists for it);
+//   9. the Möbius levels fused into the first pass (F_MOBIUS): the encoding's
+//      other Möbius levels on the host, then the fused transform, against the
+//      whole Möbius transform on the host then today's spread transform, in
+//      both plans, spacings 1..16, edge words planted.
 //
 // WHAT IT DOES NOT COVER: whether nvcc accepts the file, and everything about
 // execution — grid sizing, shared-memory size, races the replay order cannot
@@ -230,6 +234,11 @@ void replay_pass_k(const u64 *in, u64 in_stride, u64 *out, u64 out_stride, const
                 for (unsigned tid = 0; tid < nthreads; ++tid)
                     phase_contig_stage<KLOG>(in, in_stride, wtab, tile.data(), L, lb, log_t, flags,
                                              tid, bx, col);
+                if (flags & F_MOBIUS) {
+                    for (unsigned l = 0; l < KLOG + log_t - lb; ++l)
+                        for (unsigned tid = 0; tid < nthreads; ++tid)
+                            phase_contig_mobius<KLOG>(tile.data(), log_t, lb, l, tid);
+                }
                 for (unsigned tid = 0; tid < nthreads; ++tid)
                     phase_tile_round<KLOG, DIT, 0>(tile.data(), rad.data(), log_t, tid);
                 if constexpr (ROUNDS >= 2) {
@@ -630,19 +639,29 @@ void test_spread_transform() {
 }
 
 // The spread transform on one column in a given plan, as `spread_ntt_column`
-// launches it.
+// launches it, the first pass's extra flags (F_MOBIUS) or-ed in.
 std::vector<u64> spread_transform(const std::vector<u64> &src, unsigned log_n, unsigned lb,
-                                  const std::vector<unsigned> &ks) {
+                                  const std::vector<unsigned> &ks, unsigned first_flags = 0) {
     const std::vector<u64> fwd = root_table(false);
     std::vector<u64> dst((u64)1 << log_n, 0xFEEDFACEull);
     unsigned s = 0;
     for (size_t i = 0; i < ks.size(); ++i) {
         const bool first = i == 0;
         replay_pass(ks[i], true, first ? src.data() : dst.data(), 0, dst.data(), 0, fwd.data(),
-                    nullptr, log_n, s, lb, first ? ntt_cm::F_SPREAD : 0, 1);
+                    nullptr, log_n, s, lb, first ? (ntt_cm::F_SPREAD | first_flags) : 0, 1);
         s += ks[i];
     }
     return dst;
+}
+
+// Möbius levels [from, to) on the host, the definition: every index with the
+// level's bit set loses its partner below.
+void host_mobius(std::vector<u64> &x, unsigned from, unsigned to) {
+    for (unsigned l = from; l < to; ++l) {
+        const u64 h = (u64)1 << l;
+        for (u64 i = 0; i < x.size(); ++i)
+            if (i & h) x[i] = fsub(x[i], x[i ^ h]);
+    }
 }
 
 // Raw words with an edge value at every seventh slot (the card test's mix).
@@ -746,6 +765,44 @@ void tile_layout_k() {
     }
 }
 
+// 9. F_MOBIUS: the first pass's block holds the low F = k + log T - lb bits of
+// a compact index, so the host runs levels [F, log_c) and the pass levels
+// [0, F); the oracle runs every level, then today's transform.
+void test_fused_mobius() {
+    for (unsigned log_n = 4; log_n <= 20; ++log_n) {
+        for (unsigned lb : {0u, 1u, 2u, 4u}) {
+            if (lb > log_n || (log_n > 13 && log_n < 17 && lb != 1)) continue;
+            const unsigned log_c = log_n - lb;
+            const std::vector<u64> src = edge_words((u64)1 << log_c);
+            std::vector<u64> full = src;
+            host_mobius(full, 0, log_c);
+            const std::vector<u64> want = spread_transform(full, log_n, lb, plan(log_n));
+            for (bool wide : {false, true}) {
+                const std::vector<unsigned> ks = wide ? plan_wide(log_n) : plan(log_n);
+                const unsigned f = ks[0] + pass_log_t(log_n, 0, ks[0]) - lb;
+                std::vector<u64> part = src;
+                host_mobius(part, f, log_c);
+                const std::vector<u64> got = spread_transform(part, log_n, lb, ks, ntt_cm::F_MOBIUS);
+                size_t where = 0;
+                CHECK(eq_canon(got, want, &where),
+                      "fused Möbius log_n=%u lb=%u wide=%d (%u levels fused) first diff at %zu", log_n,
+                      lb, (int)wide, f, where);
+                if (log_n >= 12) CHECK(f == 12 - lb, "log_n=%u lb=%u: %u levels fused, not 12 - lb", log_n, lb, f);
+            }
+        }
+    }
+    // The fused levels are load-bearing: without the flag the same input is not the codeword.
+    const unsigned log_n = 13, lb = 1;
+    const std::vector<u64> src = edge_words((u64)1 << (log_n - lb));
+    std::vector<u64> full = src, part = src;
+    host_mobius(full, 0, log_n - lb);
+    host_mobius(part, 12 - lb, log_n - lb);
+    size_t where = 0;
+    CHECK(!eq_canon(spread_transform(part, log_n, lb, plan(log_n)),
+                    spread_transform(full, log_n, lb, plan(log_n)), &where),
+          "the unfused partial transform equals the codeword: the check cannot fail");
+}
+
 void test_tile_layout() {
     tile_layout_k<4>();
     tile_layout_k<7>();
@@ -778,6 +835,8 @@ int main() {
     std::printf("+ wide spread transform: %d checks, %d failures\n", g_checks, g_failures);
     test_tile_layout();
     std::printf("+ tile layout: %d checks, %d failures\n", g_checks, g_failures);
+    test_fused_mobius();
+    std::printf("+ fused Möbius: %d checks, %d failures\n", g_checks, g_failures);
     if (g_failures) {
         std::printf("NTT_CM HOST KAT: FAILED (%d of %d)\n", g_failures, g_checks);
         return 1;
