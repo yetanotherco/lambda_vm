@@ -270,7 +270,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     have hflagsV : (4 + 32 * input_signed + 64 * input_invert : F p).val
         = 4 + 32 * input_signed.val + 64 * input_invert.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-    refine ⟨?_, ?_, ?_⟩
+    refine ⟨?_, ?_, ?_, ?_⟩
     · intro s i hs hi hflags
       rw [hflagsV] at hflags; simp only [opselLT] at hflags
       rw [key s i (by omega) (by omega) hl0 hr0, hval_lhsHi, hval_rhsHi]
@@ -280,6 +280,9 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     · -- nor the SHIFT clause: opsel(SHIFT) + w + 32·s + 64·d ≡ 5 or 6 (mod 32)
       intro w s d hw hs hd hflags
       exfalso; rw [hflagsV] at hflags; simp only [opselSHIFT] at hflags; omega
+    · -- nor the MIN clause
+      intro hflags
+      exfalso; rw [hflagsV] at hflags; simp only [Alu.opselMIN] at hflags; omega
 
 
   ProverAssumptions r _ _ := Honest r
