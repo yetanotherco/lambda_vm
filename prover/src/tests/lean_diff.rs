@@ -31,7 +31,7 @@ use stark::constraint_ir::{ConstraintProgram, eval_program_roots};
 use stark::constraints::builder::{
     CaptureBuilder, ConstraintBuilder, ConstraintSet, num_base_from_meta,
 };
-use stark::lookup::{BusInteraction, Multiplicity, emit_fingerprint, emit_multiplicity};
+use stark::lookup::{BusInteraction, emit_fingerprint, emit_multiplicity};
 
 use super::test_rng::SplitMix64;
 use crate::tables::types::{BusId, FE, FEE, GoldilocksExtension, GoldilocksField};
@@ -292,9 +292,6 @@ struct Report {
     lean_interacts_unmatched: Vec<String>,
     /// Indices into the Rust interactions.
     rust_interacts_unmatched: Vec<usize>,
-    /// The random rows and challenges the fingerprints were taken at.
-    random_rows: Vec<Vec<FE>>,
-    challenges: Challenges,
 }
 
 fn compare<CS: ConstraintSet<Gl, Gl3>>(
@@ -415,8 +412,6 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
         rust_constraints_unmatched,
         lean_interacts_unmatched,
         rust_interacts_unmatched,
-        random_rows: rows,
-        challenges: ch,
     }
 }
 
@@ -486,34 +481,12 @@ fn lean_diff_lt() {
         cols::NUM_COLUMNS,
         &honest,
     );
-    // Known deltas: the Lean model keeps `μ·(1 − μ) = 0`, the Rust chip bounds `μ` with the
-    // `ARE_BYTES[μ, 0]` send instead. Both are found by content, not position.
-    let &[mu_assert] = report.lean_asserts_unmatched.as_slice() else {
-        panic!(
-            "[LT] only the μ bit constraint should be Lean-only, got {:?}",
-            report.lean_asserts_unmatched
-        )
-    };
-    let mu_bit = |r: &[FE]| r[cols::MU] * (FE::one() - r[cols::MU]);
-    for r in &report.random_rows {
-        assert_eq!(
-            eval(&lean.asserts[mu_assert], r),
-            mu_bit(r),
-            "[LT] Lean-only assert is μ·(1 − μ)"
-        );
-    }
-    // The delta is real on honest rows: it fails exactly on the deduplicated rows.
-    let mut dedup_rows = 0;
-    for r in &honest {
-        let mu = r[cols::MU].canonical_u64();
-        assert_eq!(
-            eval(&lean.asserts[mu_assert], r) == FE::zero(),
-            mu <= 1,
-            "[LT] μ = {mu}"
-        );
-        dedup_rows += usize::from(mu > 1);
-    }
-    assert!(dedup_rows >= 2, "[LT] the trace has deduplicated rows");
+    // The Lean model bounds `μ` with the `ARE_BYTES[μ, 0]` pull, as the Rust chip does, so the
+    // two agree exactly: no constraint and no interaction is left on one side only.
+    assert!(
+        report.lean_asserts_unmatched.is_empty(),
+        "[LT] Lean-only constraints"
+    );
     assert!(
         report.rust_constraints_unmatched.is_empty(),
         "[LT] Rust-only constraints"
@@ -522,30 +495,18 @@ fn lean_diff_lt() {
         report.lean_interacts_unmatched.is_empty(),
         "[LT] Lean-only interactions"
     );
-    let &[are_bytes] = report.rust_interacts_unmatched.as_slice() else {
-        panic!(
-            "[LT] only ARE_BYTES[μ, 0] should be Rust-only, got {:?}",
-            report.rust_interacts_unmatched
-        )
-    };
-    let are_bytes = &interactions[are_bytes];
     assert!(
-        are_bytes.is_sender && matches!(are_bytes.multiplicity, Multiplicity::One),
-        "[LT] the μ bound is sent with multiplicity One"
+        report.rust_interacts_unmatched.is_empty(),
+        "[LT] Rust-only interactions"
     );
-    let prog = capture_interaction(are_bytes);
-    for r in &report.random_rows {
-        assert_eq!(
-            rust_interaction_at(&prog, r, &report.challenges),
-            (
-                FEE::one(),
-                report
-                    .challenges
-                    .fingerprint(BusId::AreBytes as u64, &[r[cols::MU], FE::zero()])
-            ),
-            "[LT] the Rust-only interaction is ARE_BYTES[μ, 0]"
-        );
-    }
+    // The fixture has to contain what this model is about: rows that answer several identical
+    // queries at once. Without this the test still passes if `generate_lt_trace` stops
+    // deduplicating, and the comment above about `μ = 3` becomes quietly false.
+    let dedup_rows = honest
+        .iter()
+        .filter(|r| r[cols::MU].canonical_u64() > 1)
+        .count();
+    assert!(dedup_rows >= 2, "[LT] the trace has deduplicated rows");
 }
 
 #[test]
