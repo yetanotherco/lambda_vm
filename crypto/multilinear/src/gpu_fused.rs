@@ -348,6 +348,79 @@ pub fn force_argue_fused_xcheck(on: Option<bool>) {
     store_forced(&FUSED_XCHECK_FORCED, on);
 }
 
+/// A program of at least this many steps keeps its rounds on the card past
+/// today's crossover under `LAMBDA_VM_ZC_DEVICE_TAIL=1`: the host walks it
+/// through the interpreter once for every index pair and node of a round,
+/// while a card round costs about one walk whatever the cube.
+pub const DEVICE_TAIL_MIN_STEPS: usize = 1000;
+
+/// The cube such a program hands the host instead of today's 32: on an RTX
+/// 5090 a KECCAK_RND round costs the card ≈ 0.5 ms and the host ≈ 0.24 ms an
+/// index pair, so the card's round is the cheaper one down to a cube of 8
+/// (4 pairs) and the host's from a cube of 4 (2 pairs).
+pub const DEVICE_TAIL_CUBE: usize = 1 << 2;
+
+static TAIL_FORCED: AtomicU8 = AtomicU8::new(0);
+static TAIL_FORCED_CUBE: AtomicU64 = AtomicU64::new(0);
+
+/// Where the fused rounds hand a long program to the host
+/// (`LAMBDA_VM_ZC_DEVICE_TAIL`; default off): `None` at today's crossover, or
+/// `(min_steps, cube)` — a program of at least `min_steps` steps stops at
+/// `cube` instead. The same messages either way, so the same proof. Read once,
+/// with a banner.
+pub fn zc_device_tail() -> Option<(usize, usize)> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    match TAIL_FORCED.load(Ordering::Relaxed) {
+        1 => None,
+        2 => Some((0, TAIL_FORCED_CUBE.load(Ordering::Relaxed) as usize)),
+        _ => ON
+            .get_or_init(|| {
+                let on =
+                    device_tail_from(std::env::var("LAMBDA_VM_ZC_DEVICE_TAIL").ok().as_deref());
+                eprintln!(
+                    "★ ZC DEVICE TAIL: {}",
+                    if on {
+                        "on (LAMBDA_VM_ZC_DEVICE_TAIL=1: a program of ≥ 1000 steps keeps its \
+                         rounds on the card down to a cube of 4)"
+                    } else {
+                        "off (the default; LAMBDA_VM_ZC_DEVICE_TAIL=1 keeps a long program's \
+                         rounds on the card down to a cube of 4)"
+                    }
+                );
+                on
+            })
+            .then_some((DEVICE_TAIL_MIN_STEPS, DEVICE_TAIL_CUBE)),
+    }
+}
+
+/// The knob's reading of its variable: only `1` turns it on.
+fn device_tail_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Overrides the knob: `None` back to the environment, `Some(None)` off,
+/// `Some(Some(cube))` every program, whatever its length, down to `cube` (a
+/// power of two, at least 2) — a test's way to the card's smallest rounds on
+/// short programs.
+#[doc(hidden)]
+pub fn force_zc_device_tail(mode: Option<Option<usize>>) {
+    if let Some(Some(cube)) = mode {
+        assert!(
+            cube >= 2 && cube.is_power_of_two(),
+            "the host takes a cube of at least 2"
+        );
+        TAIL_FORCED_CUBE.store(cube as u64, Ordering::Relaxed);
+    }
+    TAIL_FORCED.store(
+        match mode {
+            None => 0,
+            Some(None) => 1,
+            Some(Some(_)) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
 /// Whether every fused table prints its timings (`LAMBDA_VM_ARGUE_FUSED_LOG=1`);
 /// the cross-check prints them regardless. Read once.
 pub fn argue_fused_log() -> bool {
@@ -461,6 +534,50 @@ pub struct FusedTimes {
     pub slots: usize,
 }
 
+static DEVICE_TAILS: AtomicU64 = AtomicU64::new(0);
+
+/// Fused tables whose rounds stayed on the card past today's crossover
+/// (`LAMBDA_VM_ZC_DEVICE_TAIL`).
+pub fn device_tail_sessions() -> u64 {
+    DEVICE_TAILS.load(Ordering::Relaxed)
+}
+
+/// Where a thread's fused tables spent their later rounds since the last
+/// [`take_tail`], short programs at `[0]` and those of at least
+/// [`DEVICE_TAIL_MIN_STEPS`] steps at `[1]` (knob on or off): the batched
+/// argue's log line under the split.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TailTimes {
+    /// Fused tables.
+    pub tables: [u32; 2],
+    /// Of them, those whose rounds stayed on the card past today's crossover.
+    pub on_card: [u32; 2],
+    /// The card's later rounds and their folds, seconds as the host saw them.
+    pub device: [f64; 2],
+    /// The rounds the host ran over what the card folded, and their seconds
+    /// (each round's evaluations and its fold).
+    pub host_rounds: [u32; 2],
+    pub host: [f64; 2],
+}
+
+thread_local! {
+    static TAIL: std::cell::Cell<TailTimes> = std::cell::Cell::new(TailTimes::default());
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn note_tail(note: impl FnOnce(&mut TailTimes)) {
+    TAIL.with(|cell| {
+        let mut tail = cell.get();
+        note(&mut tail);
+        cell.set(tail);
+    });
+}
+
+/// The calling thread's [`TailTimes`] since the last call, reset.
+pub fn take_tail() -> TailTimes {
+    TAIL.with(|cell| cell.replace(TailTimes::default()))
+}
+
 // ── the rounds ───────────────────────────────────────────────────────────────
 
 /// The device rounds' result: the messages, the challenges, and every factor
@@ -544,6 +661,10 @@ pub struct FusedStepper<'f, E: IsField> {
     big: FieldElement<E>,
     walked: Vec<u32>,
     there: usize,
+    /// Today's crossover, which `there` passes under the device tail.
+    crossover: usize,
+    /// The lowered program's steps.
+    steps: usize,
     t: Vec<Vec<FieldElement<E>>>,
     u: [[FieldElement<E>; 2]; 2],
     claim: FieldElement<E>,
@@ -602,6 +723,17 @@ where
             return None;
         }
         let lowered = lower_fused(constraints)?;
+        // A long program's rounds stay on the card past today's crossover
+        // (`LAMBDA_VM_ZC_DEVICE_TAIL`), except under the cross-check, which
+        // replays today's rounds and so stops where they do.
+        let crossover = there;
+        let steps = lowered.nodes.len() / 2;
+        let there = match zc_device_tail() {
+            Some((min_steps, cube)) if steps >= min_steps && !check_corners => num_vars
+                .saturating_sub(cube.trailing_zeros() as usize)
+                .max(crossover),
+            _ => crossover,
+        };
         let (interaction_point, rho) = input
             .claim_point
             .split_at(input.claim_point.len() - num_vars);
@@ -731,6 +863,8 @@ where
             big: FieldElement::<E>::from(degree as u64),
             walked,
             there,
+            crossover,
+            steps,
             t,
             u,
             claim: claim.clone(),
@@ -941,7 +1075,24 @@ where
         SESSIONS.fetch_add(1, Ordering::Relaxed);
         crate::gpu::note_device_sumcheck(self.there as u64);
         self.times.total = self.started.elapsed().as_secs_f64();
+        let past = self.there > self.crossover;
+        if past {
+            DEVICE_TAILS.fetch_add(1, Ordering::Relaxed);
+        }
+        let long = usize::from(self.long());
+        let rounds = self.times.rounds;
+        note_tail(|tail| {
+            tail.tables[long] += 1;
+            tail.on_card[long] += u32::from(past);
+            tail.device[long] += rounds;
+        });
         Ok((factors, self.times))
+    }
+
+    /// Whether the program is one the device tail keeps on the card, knob on
+    /// or off: at least [`DEVICE_TAIL_MIN_STEPS`] steps.
+    pub(crate) fn long(&self) -> bool {
+        self.steps >= DEVICE_TAIL_MIN_STEPS
     }
 }
 
@@ -1022,6 +1173,19 @@ mod tests {
         assert!(fused_from(Some("1")));
         assert!(fused_from(Some("")));
         assert!(!fused_from(Some("0")));
+    }
+
+    /// The device tail's default, pinned: off unless the variable says `1`, and
+    /// its rule's constants as frozen before the box measured them.
+    #[test]
+    fn the_device_tail_is_off_unless_the_knob_says_1() {
+        assert!(!device_tail_from(None));
+        assert!(!device_tail_from(Some("")));
+        assert!(!device_tail_from(Some("0")));
+        assert!(!device_tail_from(Some("true")));
+        assert!(device_tail_from(Some("1")));
+        assert_eq!((DEVICE_TAIL_MIN_STEPS, DEVICE_TAIL_CUBE), (1000, 4));
+        const { assert!(DEVICE_TAIL_CUBE < crate::HOST_CUBE_COMPILED) };
     }
 
     #[test]

@@ -1142,3 +1142,88 @@ fn each_tables_share_is_weighted_lambda_cubed_to_its_index() {
         power = &power * &lambda * &lambda * &lambda;
     }
 }
+
+/// The device tail (`LAMBDA_VM_ZC_DEVICE_TAIL`, forced here on every program
+/// down to a cube of 4, the rule's, and of 2, the card's smallest) proves the
+/// host reference's bytes: the same proof, the transcript in the same state
+/// after. On a device the tables kept on the card past today's crossover are
+/// counted, so the comparison is not of the path with itself; without one it
+/// is the host fallback against itself, and says so.
+///
+/// ```text
+/// cargo test --release -p stark --features cuda,multilinear/cuda,parallel --lib -- \
+///     multilinear_table::batched::tests::the_device_tail_proves_the_host_references_bytes --exact --nocapture
+/// ```
+#[test]
+fn the_device_tail_proves_the_host_references_bytes() {
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+    let airs = airs();
+    for (a, pad, cap) in [(12usize, 1usize, 27u8), (12, 1, 14), (3, 1, 27)] {
+        let cfg = batched(cap);
+        let cols = columns(a, pad);
+        let run = |at: Where, cube: Option<usize>| {
+            multilinear::gpu_fused::force_zc_device_tail(Some(cube));
+            let committed = commit(tables(&airs, &cols, false), &cfg);
+            let past = multilinear::gpu_fused::device_tail_sessions();
+            let mut transcript = DefaultTranscript::<Ext>::new(SEED);
+            let proof = prove_batched_on(
+                &committed,
+                &cfg,
+                &mut transcript,
+                None,
+                ProverFaults::default(),
+                at,
+            )
+            .unwrap_or_else(|e| panic!("{at:?} cube {cube:?}: {e:?}"));
+            let past = multilinear::gpu_fused::device_tail_sessions() - past;
+            multilinear::gpu_fused::force_zc_device_tail(None);
+            verify(&committed, &proof, &cfg)
+                .unwrap_or_else(|e| panic!("{at:?} cube {cube:?}: {e:?}"));
+            (
+                bincode::serialize(&proof).expect("bytes"),
+                transcript.state(),
+                transcript.sample_field_element(),
+                past,
+            )
+        };
+        let host = run(Where::Host, None);
+        let today = run(Where::Device, None);
+        let rule = run(
+            Where::Device,
+            Some(multilinear::gpu_fused::DEVICE_TAIL_CUBE),
+        );
+        let edge = run(Where::Device, Some(2));
+        for (name, other) in [
+            ("today's crossover", &today),
+            ("a cube of 4", &rule),
+            ("a cube of 2", &edge),
+        ] {
+            assert!(
+                host.0 == other.0,
+                "a={a} cap={cap}: the card handing the host {name}, the bytes differ"
+            );
+            assert_eq!(host.1, other.1, "a={a} cap={cap}: {name}, transcript state");
+            assert_eq!(host.2, other.2, "a={a} cap={cap}: {name}, next challenge");
+        }
+        assert_eq!(
+            host.3, 0,
+            "a={a} cap={cap}: the host keeps nothing on a card"
+        );
+        assert_eq!(
+            today.3, 0,
+            "a={a} cap={cap}: off keeps no table past the crossover"
+        );
+        eprintln!(
+            "batched argue device tail a={a} pad={pad} cap={cap}: {} tables past the crossover to a cube of 4, \
+             {} to 2; {} bytes",
+            rule.3,
+            edge.3,
+            host.0.len()
+        );
+        if a_device() && a >= 7 {
+            assert!(rule.3 > 0, "a={a}: the card kept tables to a cube of 4");
+            assert!(edge.3 > 0, "a={a}: the card kept tables to a cube of 2");
+        }
+    }
+}

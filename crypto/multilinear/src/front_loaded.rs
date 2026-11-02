@@ -119,6 +119,8 @@ pub enum TableRounds<'a, E: IsField> {
         batched: crate::batch::Batched<'a, E>,
         /// Variables left to bind.
         vars: usize,
+        /// The program is a long one ([`crate::gpu_fused::TailTimes`]'s `[1]`).
+        long: bool,
     },
 }
 
@@ -175,10 +177,12 @@ where
                 Some(Ok(stepper)) => {
                     crate::whir_split::bump(&crate::whir_split::ZC_FUSED);
                     let batched = crate::batch::Batched::new(Vec::new(), rules, lambdas)?;
+                    let long = stepper.long();
                     return Ok(Self::Fused {
                         stepper: Some(Box::new(stepper)),
                         batched,
                         vars: num_vars,
+                        long,
                     });
                 }
                 Some(Err(error)) => return Err(error),
@@ -242,9 +246,21 @@ where
             Self::Host(batched) => Ok(round_evaluations(batched, degree, false)),
             #[cfg(feature = "cuda")]
             Self::Fused {
-                stepper, batched, ..
+                stepper,
+                batched,
+                long,
+                ..
             } => match stepper {
-                None => Ok(round_evaluations(batched, degree, false)),
+                None => {
+                    let tick = std::time::Instant::now();
+                    let out = round_evaluations(batched, degree, false);
+                    let (long, spent) = (usize::from(*long), tick.elapsed().as_secs_f64());
+                    crate::gpu_fused::note_tail(|tail| {
+                        tail.host_rounds[long] += 1;
+                        tail.host[long] += spent;
+                    });
+                    Ok(out)
+                }
                 Some(stepper) => {
                     let g = stepper.message()?;
                     if g.len() > degree {
@@ -281,10 +297,17 @@ where
                 stepper,
                 batched,
                 vars,
+                long,
             } => {
                 *vars -= 1;
                 match stepper.as_mut() {
-                    None => batched.fix_first_variable(r),
+                    None => {
+                        let tick = std::time::Instant::now();
+                        let out = batched.fix_first_variable(r);
+                        let (long, spent) = (usize::from(*long), tick.elapsed().as_secs_f64());
+                        crate::gpu_fused::note_tail(|tail| tail.host[long] += spent);
+                        out
+                    }
                     Some(on_card) => {
                         on_card.bind(r)?;
                         if on_card.rounds_left() == 0 {

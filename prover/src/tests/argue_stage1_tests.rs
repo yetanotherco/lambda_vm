@@ -1152,3 +1152,48 @@ fn the_corner_check_on_the_card_refuses_a_broken_trace() {
         }
     }
 }
+
+/// The device tail's rule (`LAMBDA_VM_ZC_DEVICE_TAIL`: at least
+/// [`multilinear::gpu_fused::DEVICE_TAIL_MIN_STEPS`] lowered steps) takes the
+/// VM's long programs and none of the short ones: KECCAK_RND and ECDAS on,
+/// CPU off. Prints every program it takes, so a box log shows which.
+#[test]
+fn the_device_tail_takes_the_long_vm_programs() {
+    use multilinear::gpu_fused::{DEVICE_TAIL_MIN_STEPS, lower_fused};
+    let mut vm = vm_airs();
+    let opts =
+        stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
+    vm.push((
+        Box::new(crate::test_utils::create_ecrec_air(&opts)),
+        "ECREC",
+    ));
+    let mut long = Vec::new();
+    for (at, (air, label)) in vm.iter().enumerate() {
+        let mut rng = Rng::new(0x7A11_0000 + at as u64);
+        let table = Table::from_air(&**air, label, 4, &mut rng);
+        if table.constraints.roots().is_empty() {
+            continue;
+        }
+        let steps = lower_fused(&table.constraints)
+            .unwrap_or_else(|| panic!("{label}: lowers"))
+            .nodes
+            .len()
+            / 2;
+        if steps >= DEVICE_TAIL_MIN_STEPS {
+            long.push(format!("{label} {steps}"));
+        }
+        match *label {
+            "KECCAK_RND" | "ECDAS" => {
+                assert!(steps >= DEVICE_TAIL_MIN_STEPS, "{label}: {steps} steps")
+            }
+            "CPU" => assert!(steps < DEVICE_TAIL_MIN_STEPS, "{label}: {steps} steps"),
+            _ => {}
+        }
+    }
+    eprintln!(
+        "device tail takes {} programs: {}",
+        long.len(),
+        long.join(", ")
+    );
+    assert!(long.len() >= 2, "{long:?}");
+}

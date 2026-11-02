@@ -766,6 +766,8 @@ where
         )?);
     }
     split.zc_setup += started.elapsed().as_secs_f64();
+    // What an earlier argue on this thread left, so the line below is this one's.
+    multilinear::gpu_fused::take_tail();
     let started = std::time::Instant::now();
     let (constraint, point) = front_loaded::prove_with(
         &mut polys,
@@ -777,6 +779,7 @@ where
         },
     )?;
     split.zc_rounds += started.elapsed().as_secs_f64();
+    let tail = multilinear::gpu_fused::take_tail();
     let mut factor_values = Vec::with_capacity(tables.len());
     for (table, poly) in tables.iter().zip(&polys) {
         let values = table
@@ -851,6 +854,22 @@ where
             split.zc_rounds,
             split.reduce,
             multilinear::gkr_gruen::gruen_layers() - gruen_layers
+        );
+        // The fused tables' later rounds by program length: the card's, and the
+        // host's over what the card folded.
+        eprintln!(
+            "BATCHED ARGUE ZC TAIL: long tables {} (past the crossover {}) · card rounds {:.3}s · \
+             host rounds {} in {:.3}s | short tables {} ({}) · card rounds {:.3}s · host rounds {} in {:.3}s",
+            tail.tables[1],
+            tail.on_card[1],
+            tail.device[1],
+            tail.host_rounds[1],
+            tail.host[1],
+            tail.tables[0],
+            tail.on_card[0],
+            tail.device[0],
+            tail.host_rounds[0],
+            tail.host[0],
         );
         // The inputs of D-BATCH §3.2's error terms, measured on this argue.
         eprintln!(
