@@ -364,6 +364,7 @@ fn upload<T: DeviceRepr + Default>(
     if records.is_empty() {
         stream.clone_htod(std::slice::from_ref(&T::default()))
     } else {
+        crate::pinned::note_upload(records.as_ptr().cast(), std::mem::size_of_val(records));
         stream.clone_htod(records)
     }
 }
@@ -763,6 +764,7 @@ fn upload_pieces<T: DeviceRepr + Default>(
     let mut at = 0usize;
     for piece in pieces.iter().filter(|piece| !piece.is_empty()) {
         let mut view = records.slice_mut(at..at + piece.len());
+        crate::pinned::note_upload(piece.as_ptr().cast(), std::mem::size_of_val(*piece));
         stream.memcpy_htod(*piece, &mut view)?;
         at += piece.len();
     }

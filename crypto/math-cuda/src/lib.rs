@@ -52,6 +52,7 @@ pub mod ntt;
 pub mod nvtx;
 pub mod p1_stark;
 pub mod p1w16;
+pub mod pinned;
 pub mod readback;
 pub mod round_slot;
 pub mod rpx;

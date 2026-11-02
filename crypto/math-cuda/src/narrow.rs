@@ -79,6 +79,7 @@ pub(crate) fn widen_into(
     if cells == 0 {
         return Ok(());
     }
+    crate::pinned::note_upload(t.data.as_ptr(), t.data.len());
     let data_dev = stream.clone_htod(t.data)?;
     let offsets_dev = stream.clone_htod(t.offsets)?;
     let widths_dev = stream.clone_htod(t.widths)?;
@@ -118,6 +119,7 @@ pub(crate) fn widen_col_major_into(
     if cells == 0 {
         return Ok(());
     }
+    crate::pinned::note_upload(t.data.as_ptr(), t.data.len());
     let data_dev = stream.clone_htod(t.data)?;
     let offsets_dev = stream.clone_htod(t.offsets)?;
     let widths_dev = stream.clone_htod(t.widths)?;

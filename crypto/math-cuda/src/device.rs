@@ -1603,9 +1603,18 @@ pub fn set_up_backend() {
     let _ = backend_once();
 }
 
+/// The backend once [`backend_once`] has made it.
+static BACKEND: OnceLock<Backend> = OnceLock::new();
+
+/// The backend if it is already up, without making it or waiting for it: for
+/// a caller that must not hold up its thread on the initialisation (the pinned
+/// arena, which starts page-locking once the context exists).
+pub fn backend_if_ready() -> Option<&'static Backend> {
+    BACKEND.get()
+}
+
 /// [`backend`] without the entry count.
 fn backend_once() -> Result<&'static Backend> {
-    static BACKEND: OnceLock<Backend> = OnceLock::new();
     static INIT: Mutex<()> = Mutex::new(());
     if let Some(b) = BACKEND.get() {
         return Ok(b);

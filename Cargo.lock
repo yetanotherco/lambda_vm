@@ -960,6 +960,7 @@ dependencies = [
  "rayon",
  "sha3",
  "stark",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]
