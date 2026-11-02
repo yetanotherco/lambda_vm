@@ -398,6 +398,111 @@ impl GpuDeepCodeword {
     }
 }
 
+/// `LAMBDA_VM_DEEP_HOISTED` as given: on for `1` or `on`; off when unset,
+/// empty, `0` or `off`; anything else is off, said once on stderr.
+fn deep_hoisted_setting(value: Option<&str>) -> bool {
+    match value.map(str::trim) {
+        None | Some("" | "0" | "off") => false,
+        Some("1" | "on") => true,
+        Some(other) => {
+            eprintln!("math-cuda: LAMBDA_VM_DEEP_HOISTED={other} is not 0, 1, off or on: off");
+            false
+        }
+    }
+}
+
+/// Runtime override of [`deep_hoisted`]: 0 = the environment's choice, 1 = off,
+/// 2 = on.
+static DEEP_HOISTED_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force `LAMBDA_VM_DEEP_HOISTED` on, off, or back to the environment (tests).
+pub fn set_deep_hoisted(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    DEEP_HOISTED_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the fused DEEP runs with its row-independent part hoisted
+/// (`LAMBDA_VM_DEEP_HOISTED=1`; off by default): the same codeword from
+/// `deep_composition_ext3_hoisted_m*`, one ext3×base product per (main
+/// column, pole) instead of two ext3×ext3, the poles' constant terms summed
+/// once on the host ([`hoisted_constants`]).
+pub fn deep_hoisted() -> bool {
+    match DEEP_HOISTED_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| {
+        deep_hoisted_setting(std::env::var("LAMBDA_VM_DEEP_HOISTED").ok().as_deref())
+    })
+}
+
+/// Fused DEEP launches through the hoisted kernel, and those that kept the
+/// fused one while it was on (a `row_stride` other than 1), since the process
+/// started.
+static HOISTED_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HOISTED_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One line for the log, in both arms: the setting and its launches.
+pub fn deep_hoisted_report() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    format!(
+        "{} · hoisted launches {} · fused kept {} (row stride ≠ 1)",
+        if deep_hoisted() { "on" } else { "off" },
+        HOISTED_LAUNCHES.load(Relaxed),
+        HOISTED_FALLBACKS.load(Relaxed),
+    )
+}
+
+/// The hoisted DEEP's row-independent constants (raw ext3 words, interleaved):
+/// `C_h = Σ_j γ_h[j]·h_ood[j]`, then for each pole `k`
+/// `C_k = Σ_j γ_tr[j, k]·o[j, k]` over every trace column `j` (main, then aux),
+/// in the fused kernel's layouts (`h_ood` / `gammas_h` a part each,
+/// `trace_ood` / `gammas_tr` indexed `(j · K + k) · 3`).
+pub fn hoisted_constants(
+    h_ood: &[u64],
+    trace_ood: &[u64],
+    gammas_h: &[u64],
+    gammas_tr: &[u64],
+    num_parts: usize,
+    num_cols: usize,
+    num_eval_points: usize,
+) -> Vec<u64> {
+    use math::field::element::FieldElement;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+    type Fp3 = FieldElement<Ext3>;
+    let at = |v: &[u64], i: usize| -> Fp3 {
+        Fp3::new([
+            FieldElement::<Gl>::from_raw(v[3 * i]),
+            FieldElement::<Gl>::from_raw(v[3 * i + 1]),
+            FieldElement::<Gl>::from_raw(v[3 * i + 2]),
+        ])
+    };
+    let mut sums =
+        vec![(0..num_parts).fold(Fp3::zero(), |a, j| a + at(gammas_h, j) * at(h_ood, j))];
+    for k in 0..num_eval_points {
+        sums.push((0..num_cols).fold(Fp3::zero(), |a, j| {
+            let i = j * num_eval_points + k;
+            a + at(gammas_tr, i) * at(trace_ood, i)
+        }));
+    }
+    sums.iter()
+        .flat_map(|e| {
+            [
+                *e.value()[0].value(),
+                *e.value()[1].value(),
+                *e.value()[2].value(),
+            ]
+        })
+        .collect()
+}
+
 /// Largest `num_eval_points` the fused DEEP kernels take
 /// (`deep_composition_ext3_fused_m1` … `_m4`, `M = 1 + num_eval_points`).
 pub const FUSED_MAX_EVAL_POINTS: usize = 3;
@@ -516,27 +621,69 @@ pub fn deep_composition_ext3_fused_keep(
         block_dim: (128, 1, 1),
         shared_mem_bytes: 0,
     };
-    unsafe {
-        stream
-            .launch_builder(&be.deep_composition_ext3_fused[num_eval_points])
-            .arg(main_lde.buf.as_ref())
-            .arg(aux_slice)
-            .arg(h_parts_dev.buf.as_ref())
-            .arg(&lde_stride)
-            .arg(&num_main_u)
-            .arg(&num_aux_u)
-            .arg(&num_parts_u)
-            .arg(&row_stride_u)
-            .arg(&domain_size_u)
-            .arg(&h_ood_dev)
-            .arg(&trace_ood_dev)
-            .arg(&gammas_h_dev)
-            .arg(&gammas_tr_dev)
-            .arg(coset_points_dev)
-            .arg(&z_dev)
-            .arg(&mut deep_out)
-            .arg(flag_arg)
-            .launch(cfg)?;
+    // With its row-independent part hoisted (`LAMBDA_VM_DEEP_HOISTED`): the
+    // same codeword, written canonical. The hoisted kernel reads every row at
+    // stride 1, the R4 callers' stride; any other keeps the fused kernel.
+    let hoisted = deep_hoisted() && row_stride == 1;
+    if deep_hoisted() && !hoisted {
+        HOISTED_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if hoisted {
+        let consts = stream.clone_htod(&hoisted_constants(
+            h_ood,
+            trace_ood,
+            gammas_h,
+            gammas_tr,
+            num_parts,
+            num_total_cols,
+            num_eval_points,
+        ))?;
+        unsafe {
+            stream
+                .launch_builder(&be.deep_composition_ext3_hoisted[num_eval_points])
+                .arg(main_lde.buf.as_ref())
+                .arg(aux_slice)
+                .arg(h_parts_dev.buf.as_ref())
+                .arg(&lde_stride)
+                .arg(&num_main_u)
+                .arg(&num_aux_u)
+                .arg(&num_parts_u)
+                .arg(&domain_size_u)
+                .arg(&consts)
+                .arg(&gammas_h_dev)
+                .arg(&gammas_tr_dev)
+                .arg(coset_points_dev)
+                .arg(&z_dev)
+                .arg(&mut deep_out)
+                .arg(flag_arg)
+                .launch(cfg)?;
+        }
+        HOISTED_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        drop(h_ood_dev);
+        drop(trace_ood_dev);
+    } else {
+        unsafe {
+            stream
+                .launch_builder(&be.deep_composition_ext3_fused[num_eval_points])
+                .arg(main_lde.buf.as_ref())
+                .arg(aux_slice)
+                .arg(h_parts_dev.buf.as_ref())
+                .arg(&lde_stride)
+                .arg(&num_main_u)
+                .arg(&num_aux_u)
+                .arg(&num_parts_u)
+                .arg(&row_stride_u)
+                .arg(&domain_size_u)
+                .arg(&h_ood_dev)
+                .arg(&trace_ood_dev)
+                .arg(&gammas_h_dev)
+                .arg(&gammas_tr_dev)
+                .arg(coset_points_dev)
+                .arg(&z_dev)
+                .arg(&mut deep_out)
+                .arg(flag_arg)
+                .launch(cfg)?;
+        }
     }
     #[cfg(any(debug_assertions, feature = "test-faults"))]
     {
@@ -693,4 +840,131 @@ fn deep_composition_ext3_impl(
     let mut out = vec![0u64; domain_size * 3];
     pending.wait_into_u64(&mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod hoisted_tests {
+    use math::field::element::FieldElement;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
+
+    use super::{deep_hoisted_setting, hoisted_constants};
+
+    type Fp = FieldElement<Gl>;
+    type Fp3 = FieldElement<Ext3>;
+
+    fn fp3(rng: &mut ChaCha8Rng) -> Fp3 {
+        Fp3::new([
+            Fp::from_raw(rng.r#gen::<u64>()),
+            Fp::from_raw(rng.r#gen::<u64>()),
+            Fp::from_raw(rng.r#gen::<u64>()),
+        ])
+    }
+
+    fn flat(v: &[Fp3]) -> Vec<u64> {
+        v.iter()
+            .flat_map(|e| {
+                [
+                    *e.value()[0].value(),
+                    *e.value()[1].value(),
+                    *e.value()[2].value(),
+                ]
+            })
+            .collect()
+    }
+
+    fn at(v: &[u64], i: usize) -> Fp3 {
+        Fp3::new([
+            Fp::from_raw(v[3 * i]),
+            Fp::from_raw(v[3 * i + 1]),
+            Fp::from_raw(v[3 * i + 2]),
+        ])
+    }
+
+    #[test]
+    fn the_knob_reads_as_documented() {
+        for v in [None, Some(""), Some("0"), Some("off"), Some("2")] {
+            assert!(!deep_hoisted_setting(v), "{v:?}");
+        }
+        for v in ["1", "on", " 1 "] {
+            assert!(deep_hoisted_setting(Some(v)), "{v:?}");
+        }
+    }
+
+    /// The hoisted kernel's algebra on the host, in the kernel's layouts: for
+    /// random rows, `Σ γ(v − o)/(x − z)` term by term (the fused kernel) equals
+    /// `(Σ γ v − C)/(x − z)` pole by pole with [`hoisted_constants`]'s `C`, at
+    /// every pole count and with and without aux columns.
+    #[test]
+    fn the_hoisted_sum_is_the_fused_sum() {
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        for (num_main, num_aux, parts, k) in [
+            (5, 3, 2, 3),
+            (4, 0, 1, 0),
+            (3, 2, 2, 1),
+            (23, 3, 2, 2),
+            (1, 1, 3, 3),
+        ] {
+            let cols = num_main + num_aux;
+            let h_ood: Vec<Fp3> = (0..parts).map(|_| fp3(&mut rng)).collect();
+            let gh: Vec<Fp3> = (0..parts).map(|_| fp3(&mut rng)).collect();
+            let tood: Vec<Fp3> = (0..cols * k).map(|_| fp3(&mut rng)).collect();
+            let gt: Vec<Fp3> = (0..cols * k).map(|_| fp3(&mut rng)).collect();
+            let consts = hoisted_constants(
+                &flat(&h_ood),
+                &flat(&tood),
+                &flat(&gh),
+                &flat(&gt),
+                parts,
+                cols,
+                k,
+            );
+            assert_eq!(consts.len(), 3 * (1 + k));
+            for _ in 0..8 {
+                let inv: Vec<Fp3> = (0..1 + k).map(|_| fp3(&mut rng)).collect();
+                let h: Vec<Fp3> = (0..parts).map(|_| fp3(&mut rng)).collect();
+                let main: Vec<Fp> = (0..num_main)
+                    .map(|_| Fp::from_raw(rng.r#gen::<u64>()))
+                    .collect();
+                let aux: Vec<Fp3> = (0..num_aux).map(|_| fp3(&mut rng)).collect();
+                let mut fused = Fp3::zero();
+                for j in 0..parts {
+                    fused += gh[j] * (h[j] - h_ood[j]) * inv[0];
+                }
+                for (j, t) in main.iter().enumerate() {
+                    for kk in 0..k {
+                        let t3 = t.to_extension::<Ext3>();
+                        fused += gt[j * k + kk] * (t3 - tood[j * k + kk]) * inv[1 + kk];
+                    }
+                }
+                for (j, t) in aux.iter().enumerate() {
+                    for kk in 0..k {
+                        let i = (num_main + j) * k + kk;
+                        fused += gt[i] * (*t - tood[i]) * inv[1 + kk];
+                    }
+                }
+                let mut acc_h = Fp3::zero();
+                for j in 0..parts {
+                    acc_h += gh[j] * h[j];
+                }
+                let mut hoisted = (acc_h - at(&consts, 0)) * inv[0];
+                for kk in 0..k {
+                    let mut acc = Fp3::zero();
+                    for (j, t) in main.iter().enumerate() {
+                        acc += gt[j * k + kk] * t.to_extension::<Ext3>();
+                    }
+                    for (j, t) in aux.iter().enumerate() {
+                        acc += gt[(num_main + j) * k + kk] * *t;
+                    }
+                    hoisted += (acc - at(&consts, 1 + kk)) * inv[1 + kk];
+                }
+                assert_eq!(
+                    fused, hoisted,
+                    "main {num_main} aux {num_aux} parts {parts} k {k}"
+                );
+            }
+        }
+    }
 }
