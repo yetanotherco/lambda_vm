@@ -15,8 +15,8 @@ open LambdaVM
 
 /-- `shiftResult` with the flags of `SLL`: `x` shifted left by `s mod 64`, modulo `2^64`.
 
-Alu.shiftResult (formal/LambdaVM/Buses/Alu.lean) describe (en Lean) qué calcula SHIFT;
-con tres flags cubre todos los shifts.
+`Alu.shiftResult` (formal/LambdaVM/Buses/Alu.lean) is the Lean function that gives SHIFT's
+result; it covers all the shifts with three flags.
 
 (word = 0, signed = 0, direction = 0) are the flags for SLL. -/
 lemma shiftResult_sll (x s : ℕ) : Alu.shiftResult 0 0 0 x s = (x <<< (s % 64)) % 2^64 := by

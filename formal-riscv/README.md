@@ -49,8 +49,11 @@ Done so far:
 |---|---|---|
 | `SLL`, `SRL`, `SRA` | `Sll/`, `Srl/`, `Sra/` | SHIFT |
 | `SLLI`, `SRLI`, `SRAI` | `ShiftImm/` | SHIFT |
+| `SLLW`, `SRLW`, `SRAW`, `SLLIW`, `SRLIW`, `SRAIW` (low 32 bits) | `ShiftW/` | SHIFT |
 | `SLT`, `SLTU` | `Slt/` | LT |
 | `SLTI`, `SLTIU` | `SltImm/` | LT |
+| `BEQ`, `BNE` (condition only) | `Beq/` | EQ |
+| `BLT`, `BGE`, `BLTU`, `BGEU` (condition only) | `Blt/` | LT |
 
 ## Trust and scope
 
@@ -59,6 +62,15 @@ Done so far:
   a randomized test, not a proof.
 - The PC and the register file are not modeled on the circuit side yet: that needs the CPU in
   Clean. Steps 1 to 3 connect values only.
+- Word shifts: only the 32-bit result (`outLo`) is connected. The sign extension to 64 bits
+  is done by the CPU32 chip, not modeled yet. The first operand is assumed to be what CPU32
+  sends (`spec/src/cpu32.toml`): the low word of `rs1`, zero-extended (`SLLW`, `SRLW`) or
+  sign-extended (`SRAW`).
+- Branches: only the condition is connected to the circuit. Sail's jump to `PC + imm` needs the
+  PC on the circuit side (the CPU in Clean).
+- The Sail model declares some platform settings as `axiom`s (`LeanRV64D/RiscvExtras.lean`).
+  The branch theorems mention `jump_to`, which depends on `sys_enable_experimental_extensions`,
+  so `#print axioms` lists it; the proofs themselves use only Lean's standard axioms.
 - The `Alu` theorems assume (hypotheses `ha`, `hb`) that the CPU sends `x[rs1]` and the second
   operand (`x[rs2]`, `shamt`, or the immediate sign-extended to 64 bits) on the bus. Proving
   that also needs the CPU in Clean; it will be a fourth step per instruction on top of these

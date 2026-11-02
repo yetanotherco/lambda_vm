@@ -14,3 +14,12 @@ import RiscvEquiv.Slt.Bridge
 import RiscvEquiv.Slt.Alu
 import RiscvEquiv.SltImm.Sail
 import RiscvEquiv.SltImm.Alu
+import RiscvEquiv.Beq.Sail
+import RiscvEquiv.Beq.Bridge
+import RiscvEquiv.Beq.Alu
+import RiscvEquiv.Blt.Sail
+import RiscvEquiv.Blt.Bridge
+import RiscvEquiv.Blt.Alu
+import RiscvEquiv.ShiftW.Sail
+import RiscvEquiv.ShiftW.Bridge
+import RiscvEquiv.ShiftW.Alu
