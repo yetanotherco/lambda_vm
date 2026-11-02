@@ -284,3 +284,27 @@ fn a_lean_block_proves_and_verifies() {
         proof.groups.len()
     );
 }
+
+/// Each form is its own AIR prototype: built in any order in one process, the
+/// lean AIR has 1,011 interactions and the full one 1,031, both named
+/// `KECCAK_RND`. (One shared prototype served the first form built to every
+/// later caller: a lean proof then verified under today's format.)
+#[test]
+fn the_two_forms_never_share_an_air_prototype() {
+    use stark::traits::AIR;
+    let opts = ProofOptions::default_test_options();
+    for form in [
+        KeccakRndForm::Lean,
+        KeccakRndForm::Full,
+        KeccakRndForm::Lean,
+        KeccakRndForm::Full,
+    ] {
+        let air = crate::test_utils::create_keccak_rnd_air_for(&opts, form);
+        let want = match form {
+            KeccakRndForm::Full => 1031,
+            KeccakRndForm::Lean => 1011,
+        };
+        assert_eq!(air.bus_interactions().len(), want, "{form:?}");
+        assert_eq!(air.name(), "KECCAK_RND", "{form:?}");
+    }
+}

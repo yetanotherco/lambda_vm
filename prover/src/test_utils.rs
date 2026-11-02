@@ -1116,18 +1116,30 @@ pub fn create_keccak_rnd_air(proof_options: &ProofOptions) -> ConcreteVmAir<Kecc
 
 /// [`create_keccak_rnd_air`] with `form`'s byte checks: the same columns and
 /// constraints.
+///
+/// Each form is its own prototype in [`air_prototype_cache`], whose key is the
+/// name: under one name the interactions must be a pure function of the
+/// table, or the first form built in a process would be served for the other
+/// (a lean prover's AIR to a full verifier). The lean prototype is cached as
+/// `KECCAK_RND~lean` and its clone named `KECCAK_RND`, as today's.
 pub fn create_keccak_rnd_air_for(
     proof_options: &ProofOptions,
     form: crate::tables::keccak_rnd::KeccakRndForm,
 ) -> ConcreteVmAir<KeccakRndConstraints> {
+    use crate::tables::keccak_rnd::KeccakRndForm;
+    let cached = match form {
+        KeccakRndForm::Full => "KECCAK_RND",
+        KeccakRndForm::Lean => "KECCAK_RND~lean",
+    };
     build_air(
         keccak_rnd_cols::NUM_COLUMNS,
         crate::tables::keccak_rnd::bus_interactions_for(form),
         proof_options,
         1,
         KeccakRndConstraints,
-        "KECCAK_RND",
+        cached,
     )
+    .with_name("KECCAK_RND")
 }
 
 /// Create KECCAK_RC AIR with bus interactions (preprocessed table).
