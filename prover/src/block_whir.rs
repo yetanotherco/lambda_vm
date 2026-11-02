@@ -1838,6 +1838,9 @@ pub struct BlockStamps {
     /// Phase B stamped its driver thread's schedstat a group turn
     /// ([`phase_b_sched_from_env`]; each group's [`GroupStamps::sched_b`]).
     pub phase_b_sched: bool,
+    /// The page-locked arenas at phase A's end, when they are on
+    /// ([`multilinear::pinned`]).
+    pub pinned: Option<multilinear::pinned::Stats>,
 }
 
 /// A streamed build's layout, for the readout ([`BlockStamps::layout`]).
@@ -2299,6 +2302,24 @@ impl BlockStamps {
             self.groups.iter().filter(|g| g.ahead_refused).count(),
             multilinear::gpu::room_commit_refusals(),
         ));
+        if let Some(p) = self.pinned {
+            let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+            out.push_str(&format!(
+                "BLOCK PINNED PRODUCER: on · {} extents page-locked, {:.2} GiB, in {:.3}s ({:.3}s locking, {:.3} s/GiB) · left pageable {:.2} GiB ({} refused) · phase A's uploads {:.2} of {:.2} GiB from page-locked memory ({:.0} %)\n",
+                p.chunks,
+                gib(p.pinned_bytes),
+                p.hook_seconds,
+                p.lock_seconds,
+                if p.pinned_bytes > 0 { p.lock_seconds / gib(p.pinned_bytes) } else { 0.0 },
+                gib(p.pageable_bytes),
+                p.refused,
+                gib(p.upload_pinned),
+                gib(p.upload_bytes),
+                if p.upload_bytes > 0 { 100.0 * p.upload_pinned as f64 / p.upload_bytes as f64 } else { 0.0 },
+            ));
+        } else {
+            out.push_str("BLOCK PINNED PRODUCER: off\n");
+        }
         if !self.open_split.is_empty() {
             let parts: Vec<String> = self
                 .open_split
@@ -6454,6 +6475,7 @@ fn prove_streamed(
         stamps.layout = laid.layout.clone();
         stamps.layout.gpack = (options.gpack, gpack::counts());
         stamps.phase_a = start.elapsed().as_secs_f64();
+        stamps.pinned = multilinear::pinned::stats();
         if let Some(ledger) = ledger {
             ledger.line("phase A end");
         }
