@@ -6,10 +6,11 @@ autoImplicit = false
 relaxedAutoImplicit = false
 
 # Clean pinned to a revision; Mathlib and CompPoly come in through Clean's manifest.
+# PoC: Clean local con pulls contados y orden por cierre de canales (rama counted-pulls).
+# La ruta es la del servidor de builds (~/lvc/formal-bump435/formal -> ~/lvc/clean-fork-main).
 [[require]]
 name = "Clean"
-git = "https://github.com/Verified-zkEVM/clean"
-rev = "f3abad7c099e49f847836c1883dd9e7c539f06f9"
+path = "../../clean-fork-main"
 
 [[lean_lib]]
 name = "LambdaVM"
