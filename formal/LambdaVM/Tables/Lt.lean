@@ -1,6 +1,7 @@
 module
 
 public import LambdaVM.Tables.Bitwise
+public import Clean.Air.CountedChannel
 public import LambdaVM.Buses.Alu
 public import LambdaVM.Templates.IsBit
 public import LambdaVM.Templates.Add
@@ -70,17 +71,24 @@ theorem core
   rw [Alu.slt_ofNat_iff (by omega) (by omega)]
   split_ifs <;> omega
 
+/-- The largest multiplicity of an LT row: `MU_MAX` in `prover/src/tables/types.rs`. -/
+abbrev muMax : ℕ := 255
+
+/-- `IS_HALF` and `MSB16` with pulls of multiplicity up to `muMax`. -/
+abbrev IsHalfC : RawChannel (F p) := Bitwise.IsHalf.counted muMax
+abbrev Msb16C : RawChannel (F p) := Bitwise.Msb16.counted muMax
+
 def main (r : Var Row (F p)) : Circuit (F p) Unit := do
-  -- μ : Bit here; the spec and lt.rs range-check it as a byte (see README).
-  isBit r.mu
+  -- μ : Byte, as in the spec and lt.rs: ARE_BYTES[μ, 0]
+  Bitwise.AreBytes.pull (r.mu, 0)
   -- range: IS_HALF[lhs[1]], IS_HALF[rhs[1]], IS_BIT<signed>, IS_BIT<invert>
-  Bitwise.IsHalf.pullIf r.mu r.lhs1
-  Bitwise.IsHalf.pullIf r.mu r.rhs1
+  Bitwise.IsHalf.pullUpTo muMax r.mu r.lhs1
+  Bitwise.IsHalf.pullUpTo muMax r.mu r.rhs1
   isBit r.signed
   isBit r.invert
   -- defs: MSB16[lhs[2]] -> lhs_msb, MSB16[rhs[2]] -> rhs_msb
-  Bitwise.Msb16.pullIf r.mu (r.lhs2, r.lhsMsb)
-  Bitwise.Msb16.pullIf r.mu (r.rhs2, r.rhsMsb)
+  Bitwise.Msb16.pullUpTo muMax r.mu (r.lhs2, r.lhsMsb)
+  Bitwise.Msb16.pullUpTo muMax r.mu (r.rhs2, r.rhsMsb)
   let lhsHi := r.lhs1 + 65536 * r.lhs2
   let rhsHi := r.rhs1 + 65536 * r.rhs2
   let subLo := r.lhsSubRhs0 + 65536 * r.lhsSubRhs1
@@ -94,11 +102,11 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   assertZero (r.res + 2 * r.lt * r.invert - r.lt - r.invert)
   -- sub: IS_BIT<carry[i]>, IS_HALF[lhs_sub_rhs[i]]
   sub ⟨r.lhs0, lhsHi⟩ ⟨r.rhs0, rhsHi⟩ ⟨subLo, subHi⟩
-  Bitwise.IsHalf.pullIf r.mu r.lhsSubRhs0
-  Bitwise.IsHalf.pullIf r.mu r.lhsSubRhs1
-  Bitwise.IsHalf.pullIf r.mu r.lhsSubRhs2
-  Bitwise.IsHalf.pullIf r.mu r.lhsSubRhs3
-  -- output: ALU[lhs, rhs, opsel(LT) + 32·signed + 64·invert] -> [res, 0]
+  Bitwise.IsHalf.pullUpTo muMax r.mu r.lhsSubRhs0
+  Bitwise.IsHalf.pullUpTo muMax r.mu r.lhsSubRhs1
+  Bitwise.IsHalf.pullUpTo muMax r.mu r.lhsSubRhs2
+  Bitwise.IsHalf.pullUpTo muMax r.mu r.lhsSubRhs3
+  -- output: ALU[lhs, rhs, opsel(LT) + 32·signed + 64·invert] -> [res, 0], μ times
   Alu.channel.pushIf r.mu
     ⟨r.lhs0, lhsHi, r.rhs0, rhsHi, 4 + 32 * r.signed + 64 * r.invert, r.res, 0⟩
 
@@ -148,7 +156,7 @@ lemma res_constraint {lt invert res : F p} {ltv iv : ℕ}
 /-- The honest prover's row, as `generate_lt_trace` fills it when no operation repeats
 (`μ ∈ {0, 1}`); a deduplicated row with `μ ≥ 2` is outside this model (see README). -/
 def Honest (r : Row (F p)) : Prop :=
-  IsBool r.mu ∧ IsBool r.signed ∧ IsBool r.invert ∧
+  r.mu.val < 2^8 ∧ IsBool r.signed ∧ IsBool r.invert ∧
   r.lhs0.val < 2^32 ∧ r.lhs1.val < 2^16 ∧ r.lhs2.val < 2^16 ∧
   r.rhs0.val < 2^32 ∧ r.rhs1.val < 2^16 ∧ r.rhs2.val < 2^16 ∧
   r.lhsSubRhs0.val < 2^16 ∧ r.lhsSubRhs1.val < 2^16 ∧ r.lhsSubRhs2.val < 2^16 ∧ r.lhsSubRhs3.val < 2^16 ∧
@@ -161,47 +169,46 @@ def Honest (r : Row (F p)) : Prop :=
 
 /-- What an active row establishes: with range-checked low words, `res` is the comparison bit. -/
 def RowSpec (r : Row (F p)) : Prop :=
-  r.mu = 1 → r.lhs0.val < 2^32 → r.rhs0.val < 2^32 →
+  r.mu ≠ 0 → r.lhs0.val < 2^32 → r.rhs0.val < 2^32 →
     r.res = ((ltBit r.signed.val r.invert.val r.lhsVal r.rhsVal : ℕ) : F p)
 
 def circuit : GeneralFormalCircuit (F p) Row unit where
   name := "LT"
   main
   Spec r _ _ := RowSpec r
-  channelsWithRequirements := [Alu.channel.toRaw]
+  channelsWithRequirements := [Alu.channel.toRaw, IsHalfC, Msb16C]
   requirementsChannelsLawful input_var i₀ := by
-    obtain ⟨lhs0, lhs1, lhs2, rhs0, rhs1, rhs2, signed, lt, lhsSubRhs0, lhsSubRhs1, lhsSubRhs2, lhsSubRhs3,
-      lhsMsb, rhsMsb, invert, res, mu⟩ := input_var
-    simp only [circuit_norm, main, isBit, sub, add, Add.carry0, Add.carry1, Alu.channel,
-      Bitwise.isHalfTable, Bitwise.msb16Table]
-    constructor
-    · intro channel h; tauto
-    · intro env h
-      -- each pull owes a multiplicity of 0 or 1: μ is a bit
-      exact mul_one_sub_eq_zero_iff.mp h.1
+    obtain ⟨lhs0, lhs1, lhs2, rhs0, rhs1, rhs2, signed, lt, lhsSubRhs0, lhsSubRhs1, lhsSubRhs2,
+      lhsSubRhs3, lhsMsb, rhsMsb, invert, res, mu⟩ := input_var
+    simp only [circuit_norm, main, isBit, sub, add, Add.carry0, Add.carry1, IsHalfC, Msb16C,
+      Bitwise.IsHalf, Bitwise.Msb16, Bitwise.AreBytes]
+    intro channel h
+    tauto
 
   soundness := by
     circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, RowSpec, Row.lhsVal, Row.rhsVal,
-      dword, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable, Bitwise.msb16Table]
-    obtain ⟨h_mu, h_l1, h_r1, h_s, h_i, h_lm, h_rm, h_lt, h_res, h_c0, h_c1, h_s0, h_s1, h_s2, h_s3⟩ :=
-      h_holds
-    -- μ ∈ {0, 1}; with μ = 0 every requirement is vacuous
-    rcases mul_one_sub_eq_zero_iff.mp h_mu with h0 | h1
-    · subst h0; simp
-    subst h1
+      dword, Alu.channel, Alu.Guarantees, Bitwise.isHalfTable, Bitwise.msb16Table, Bitwise.areBytesTable]
+    obtain ⟨⟨h_mu, -⟩, h_l1, h_r1, h_s, h_i, h_lm, h_rm, h_lt, h_res, h_c0, h_c1, h_s0, h_s1, h_s2,
+      h_s3⟩ := h_holds
+    -- with μ = 0 every requirement is vacuous
+    by_cases h0 : input_mu = 0
+    · simp [h0]
+    -- otherwise ARE_BYTES[μ, 0] makes μ a count of at most 255, so the pulls get their guarantees
+    have hcount : Channel.CountUpTo muMax input_mu :=
+      Channel.countUpTo_of_val h0 (by simp only [muMax]; omega)
     have hsb : IsBool input_signed := mul_one_sub_eq_zero_iff.mp h_s
     have hib : IsBool input_invert := mul_one_sub_eq_zero_iff.mp h_i
     have hs_2 := IsBool.val_lt_two hsb
     have hi_2 := IsBool.val_lt_two hib
     -- the pulled guarantees are now unconditional
-    have hl1 := h_l1 rfl
-    have hr1 := h_r1 rfl
-    obtain ⟨hl2, hlm⟩ := h_lm rfl
-    obtain ⟨hr2, hrm⟩ := h_rm rfl
-    have hs0 := h_s0 rfl
-    have hs1 := h_s1 rfl
-    have hs2 := h_s2 rfl
-    have hs3 := h_s3 rfl
+    have hl1 := h_l1 hcount
+    have hr1 := h_r1 hcount
+    obtain ⟨hl2, hlm⟩ := h_lm hcount
+    obtain ⟨hr2, hrm⟩ := h_rm hcount
+    have hs0 := h_s0 hcount
+    have hs1 := h_s1 hcount
+    have hs2 := h_s2 hcount
+    have hs3 := h_s3 hcount
     -- values of the composite limbs
     have hval_lhsHi : (input_lhs1 + 65536 * input_lhs2).val = input_lhs1.val + 65536 * input_lhs2.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
@@ -257,8 +264,8 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       first
       | (exfalso; omega)
       | (subst hlt'; norm_num at hres'; simp [hAv, hBv, hC, hres'])
-    refine ⟨fun _ hl0 hr0 => key _ _ rfl rfl hl0 hr0, by simp, by simp, by simp, by simp, by simp,
-      by simp, by simp, by simp, ?_⟩
+    refine ⟨fun _ hl0 hr0 => key _ _ rfl rfl hl0 hr0, .inr hcount, .inr hcount, .inr hcount,
+      .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, ?_⟩
     intro _
     -- the flag byte, read as a natural
     have hflagsV : (4 + 32 * input_signed + 64 * input_invert : F p).val
@@ -280,7 +287,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
 
   completeness := by
     circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, Alu.channel, Alu.Guarantees,
-      Bitwise.isHalfTable, Bitwise.msb16Table, Honest, Row.lhsVal, Row.rhsVal]
+      Bitwise.isHalfTable, Bitwise.msb16Table, Bitwise.areBytesTable, Honest, Row.lhsVal, Row.rhsVal]
     obtain ⟨hmu, hsb, hib, hl0, hl1, hl2, hr0, hr1, hr2, hs0, hs1, hs2, hs3, hsum, hlm, hrm, hlt, hres⟩ :=
       h_assumptions
     set L := input_lhs0.val + 2^32 * (input_lhs1.val + 65536 * input_lhs2.val) with hL
@@ -316,7 +323,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     have hres_cast : input_res = ((ltRaw input_signed.val L R + input_invert.val
         - 2 * ltRaw input_signed.val L R * input_invert.val : ℕ) : F p) := by
       rw [← ltBit_eq (IsBool.val_lt_two hib), ← hres, ZMod.natCast_zmod_val]
-    refine ⟨mul_one_sub_eq_zero_iff.mpr hmu, fun _ => by omega, fun _ => by omega,
+    refine ⟨⟨hmu, by simp⟩, fun _ => by omega, fun _ => by omega,
       mul_one_sub_eq_zero_iff.mpr hsb, mul_one_sub_eq_zero_iff.mpr hib,
       fun _ => ⟨by omega, hlm⟩, fun _ => ⟨by omega, hrm⟩, ?_, ?_, ?_, ?_,
       fun _ => by omega, fun _ => by omega, fun _ => by omega, fun _ => by omega⟩
@@ -327,6 +334,5 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
         (IsBool.val_lt_two hib) hres_cast
     · rw [hc0k]; rcases (by omega : k0 = 0 ∨ k0 = 1) with rfl | rfl <;> simp
     · rw [hc1k]; rcases (by omega : k1 = 0 ∨ k1 = 1) with rfl | rfl <;> simp
-
 
 end LambdaVM.LT

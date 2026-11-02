@@ -1,14 +1,9 @@
 {"operations":
- [{"assert":
-   {"type": "mul",
-    "rhs":
-    {"type": "add",
-     "rhs":
-     {"type": "mul",
-      "rhs": {"type": "var", "index": 16},
-      "lhs": {"value": 18446744069414584320, "type": "const"}},
-     "lhs": {"value": 1, "type": "const"}},
-    "lhs": {"type": "var", "index": 16}}},
+ [{"interact":
+   {"multiplicity": {"value": 1, "type": "const"},
+    "message": [{"type": "var", "index": 16}, {"value": 0, "type": "const"}],
+    "direction": "pull",
+    "channel": "ARE_BYTES"}},
   {"interact":
    {"multiplicity": {"type": "var", "index": 16},
     "message": [{"type": "var", "index": 1}],
