@@ -537,7 +537,8 @@ impl ZfFormat {
                 Ok(())
             }
             (Round0Trees::One, hash, leaves) => Err(format!(
-                "{ENV_WHIR_TREES}=one: one round-0 tree a run is defined for Poseidon1 trees in                  the coset order only, and the base hash is {hash:?}, the order {leaves:?}"
+                "{ENV_WHIR_TREES}=one: one round-0 tree a run is defined for Poseidon1 trees in \
+                 the coset order only, and the base hash is {hash:?}, the order {leaves:?}"
             )),
         }
     }
@@ -647,6 +648,10 @@ impl ZfFormat {
     /// another value (its banner is out), or names a lever this build lacks.
     pub fn install(format: Self) -> Result<&'static Self, String> {
         format.check_implemented()?;
+        // A caller may have moved the leaf order or the base after the knobs
+        // were read (`prove-block --leaves`): one tree a run is checked again
+        // on the format being installed, before anything is installed.
+        format.check_trees()?;
         format.check_lfm_merge()?;
         let mut installed = false;
         let got = PROCESS_FORMAT.get_or_init(|| {
@@ -1003,6 +1008,29 @@ mod tests {
             }
             .check_trees()
             .is_err()
+        );
+    }
+
+    /// `install` refuses one tree a run under the natural order — the format a
+    /// caller assembles by overriding the leaf order after the knobs were read
+    /// (`prove-block --leaves natural` beside `LAMBDA_VM_ZF_WHIR_TREES=one`) —
+    /// before it installs anything, so the process format is left unread.
+    #[test]
+    fn install_refuses_one_tree_a_run_under_the_natural_order() {
+        let joint_natural = ZfFormat {
+            whir_trees: Round0Trees::One,
+            whir_leaves: LeafOrder::Natural,
+            ..ZfFormat::DEFAULT
+        };
+        let err = ZfFormat::install(joint_natural).expect_err("one tree a run, natural order");
+        assert!(err.contains(ENV_WHIR_TREES), "{err}");
+        assert!(
+            !err.contains("  "),
+            "one line, no embedded run of spaces: {err}"
+        );
+        assert!(
+            PROCESS_FORMAT.get() != Some(&joint_natural),
+            "nothing installed"
         );
     }
 
