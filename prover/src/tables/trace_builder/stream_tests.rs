@@ -1120,60 +1120,73 @@ fn the_build_cap_bounds_the_tables_building_at_once() {
 /// the tables after the first wave wait for its slowest table. The budget is
 /// the `n` tables' estimated bytes and the packer places each table as it
 /// comes.
+/// A pool of its own, for a test that reads the hand-on against the wall
+/// clock: in one test process the global pool is busy with other tests' work,
+/// which a table's build would wait behind.
+#[cfg(feature = "parallel")]
+fn own_pool() -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(6)
+        .build()
+        .expect("a pool of six threads")
+}
+
 #[test]
 #[cfg(feature = "parallel")]
 fn a_slow_table_holds_back_only_the_hand_on() {
-    let n = rayon::current_num_threads().min(6);
-    assert!(n >= 2, "a pool of at least two threads");
-    let one = FAMILIES[0].1 * 8;
-    for slide in [true, false] {
-        let started = std::sync::Mutex::new(Vec::new());
-        let gate = ByteGate::new(n * one);
-        let t0 = std::time::Instant::now();
-        let (mut order, mut first_sent) = (Vec::new(), None);
-        emit_streamed_units(
-            Ok(sleeping_units(n, 0, 600, 20, &started)),
-            &gate,
-            &mut |e: Emitted| {
-                first_sent.get_or_insert(t0.elapsed());
-                gate.release(order.len());
-                order.push(e.position);
-                Ok(())
-            },
-            slide,
-            None,
-            None,
-        )
-        .expect("the stream");
-        assert_eq!(
-            order,
-            (0..n).collect::<Vec<_>>(),
-            "slide {slide}: in AIR order"
-        );
-        let started = started.into_inner().expect("the start log");
-        assert_eq!(started.len(), n, "slide {slide}");
-        let latest = started
-            .iter()
-            .map(|(_, at)| at.duration_since(t0))
-            .max()
-            .expect("starts");
-        let first_sent = first_sent.expect("a table was handed on");
-        assert!(
-            first_sent >= Duration::from_millis(600),
-            "slide {slide}: the slow table was handed on at {first_sent:?}"
-        );
-        if slide {
-            assert!(
-                latest < Duration::from_millis(400),
-                "the last table started at {latest:?}, behind the slow one"
+    own_pool().install(|| {
+        let n = rayon::current_num_threads().min(6);
+        assert!(n >= 2, "a pool of at least two threads");
+        let one = FAMILIES[0].1 * 8;
+        for slide in [true, false] {
+            let started = std::sync::Mutex::new(Vec::new());
+            let gate = ByteGate::new(n * one);
+            let t0 = std::time::Instant::now();
+            let (mut order, mut first_sent) = (Vec::new(), None);
+            emit_streamed_units(
+                Ok(sleeping_units(n, 0, 600, 20, &started)),
+                &gate,
+                &mut |e: Emitted| {
+                    first_sent.get_or_insert(t0.elapsed());
+                    gate.release(order.len());
+                    order.push(e.position);
+                    Ok(())
+                },
+                slide,
+                None,
+                None,
+            )
+            .expect("the stream");
+            assert_eq!(
+                order,
+                (0..n).collect::<Vec<_>>(),
+                "slide {slide}: in AIR order"
             );
-        } else {
+            let started = started.into_inner().expect("the start log");
+            assert_eq!(started.len(), n, "slide {slide}");
+            let latest = started
+                .iter()
+                .map(|(_, at)| at.duration_since(t0))
+                .max()
+                .expect("starts");
+            let first_sent = first_sent.expect("a table was handed on");
             assert!(
-                latest >= Duration::from_millis(600),
-                "in waves the last table started at {latest:?}, before the slow one ended"
+                first_sent >= Duration::from_millis(600),
+                "slide {slide}: the slow table was handed on at {first_sent:?}"
             );
+            if slide {
+                assert!(
+                    latest < Duration::from_millis(400),
+                    "the last table started at {latest:?}, behind the slow one"
+                );
+            } else {
+                assert!(
+                    latest >= Duration::from_millis(600),
+                    "in waves the last table started at {latest:?}, before the slow one ended"
+                );
+            }
         }
-    }
+    })
 }
 
 /// ★ Handed on last (`last`: BITWISE's position, 0), a slow first table still
@@ -1183,60 +1196,62 @@ fn a_slow_table_holds_back_only_the_hand_on() {
 #[test]
 #[cfg(feature = "parallel")]
 fn a_table_handed_on_last_does_not_hold_back_the_rest() {
-    let n = rayon::current_num_threads().min(6);
-    assert!(n >= 2, "a pool of at least two threads");
-    let one = FAMILIES[0].1 * 8;
-    for last in [Some(0), None] {
-        let started = std::sync::Mutex::new(Vec::new());
-        let gate = ByteGate::new(n * one);
-        let t0 = std::time::Instant::now();
-        let (mut order, mut sent_at) = (Vec::new(), Vec::new());
-        emit_streamed_units(
-            Ok(sleeping_units(n, 0, 600, 20, &started)),
-            &gate,
-            &mut |e: Emitted| {
-                sent_at.push(t0.elapsed());
-                gate.release(order.len());
-                order.push(e.position);
-                Ok(())
-            },
-            true,
-            last,
-            None,
-        )
-        .expect("the stream");
-        assert_eq!(order, hand_on_order(n, last), "last {last:?}: the order");
-        let started = started.into_inner().expect("the start log");
-        let slow_started = started
-            .iter()
-            .find(|&&(k, _)| k == 0)
-            .map(|&(_, at)| at.duration_since(t0))
-            .expect("the slow table started");
-        assert!(
-            slow_started < sent_at[0],
-            "last {last:?}: the slow table started at {slow_started:?}, after the first \
+    own_pool().install(|| {
+        let n = rayon::current_num_threads().min(6);
+        assert!(n >= 2, "a pool of at least two threads");
+        let one = FAMILIES[0].1 * 8;
+        for last in [Some(0), None] {
+            let started = std::sync::Mutex::new(Vec::new());
+            let gate = ByteGate::new(n * one);
+            let t0 = std::time::Instant::now();
+            let (mut order, mut sent_at) = (Vec::new(), Vec::new());
+            emit_streamed_units(
+                Ok(sleeping_units(n, 0, 600, 20, &started)),
+                &gate,
+                &mut |e: Emitted| {
+                    sent_at.push(t0.elapsed());
+                    gate.release(order.len());
+                    order.push(e.position);
+                    Ok(())
+                },
+                true,
+                last,
+                None,
+            )
+            .expect("the stream");
+            assert_eq!(order, hand_on_order(n, last), "last {last:?}: the order");
+            let started = started.into_inner().expect("the start log");
+            let slow_started = started
+                .iter()
+                .find(|&&(k, _)| k == 0)
+                .map(|&(_, at)| at.duration_since(t0))
+                .expect("the slow table started");
+            assert!(
+                slow_started < sent_at[0],
+                "last {last:?}: the slow table started at {slow_started:?}, after the first \
              hand-on at {:?}",
-            sent_at[0]
-        );
-        if last.is_some() {
-            assert!(
-                sent_at[0] < Duration::from_millis(400),
-                "the tables after the slow one waited for it: first handed on at {:?}",
                 sent_at[0]
             );
-            assert!(
-                sent_at[n - 1] >= Duration::from_millis(600),
-                "the slow table was handed on at {:?}, before it was built",
-                sent_at[n - 1]
-            );
-        } else {
-            assert!(
-                sent_at[0] >= Duration::from_millis(600),
-                "in AIR order the first hand-on waits for the slow table: {:?}",
-                sent_at[0]
-            );
+            if last.is_some() {
+                assert!(
+                    sent_at[0] < Duration::from_millis(400),
+                    "the tables after the slow one waited for it: first handed on at {:?}",
+                    sent_at[0]
+                );
+                assert!(
+                    sent_at[n - 1] >= Duration::from_millis(600),
+                    "the slow table was handed on at {:?}, before it was built",
+                    sent_at[n - 1]
+                );
+            } else {
+                assert!(
+                    sent_at[0] >= Duration::from_millis(600),
+                    "in AIR order the first hand-on waits for the slow table: {:?}",
+                    sent_at[0]
+                );
+            }
         }
-    }
+    })
 }
 
 /// Handed on last under a one-byte budget, the table waits aside until it is
