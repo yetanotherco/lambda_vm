@@ -4,8 +4,12 @@
 //! to BITWISE lookup tables (BYTE_ALU, ARE_BYTES); the halfword shifts (θ
 //! rotate-by-1 and ρ) are enforced directly by μ-gated linear identities over
 //! the committed shift cells instead of HWSL lookups (see
-//! `KeccakRndConstraints`). ARE_BYTES range checks on the shift outputs and the
-//! IS_BIT constraint on the θ carry are load-bearing for the identities.
+//! `KeccakRndConstraints`). The IS_BIT constraint on the θ carry and the
+//! ARE_BYTES range checks on the ρ shift outputs are load-bearing for the
+//! identities in both forms ([`KeccakRndForm`]). The θ shift outputs' range
+//! comes from their own ARE_BYTES checks under `Full`; under `Lean` it comes
+//! from the D lookups' operands (each `Cxz_left` byte, plus the carry for even
+//! bytes, is a `BYTE_ALU[XOR]` operand) and the θ identity's parity.
 //!
 //! ## Column layout (1,480 columns)
 //!
@@ -620,7 +624,7 @@ fn fill_op<T: VmTable>(table: &mut T, op: &KeccakRoundOperation, first_row: usiz
 }
 
 // =========================================================================
-// Bus interactions (1,031 total)
+// Bus interactions (1,031 under `KeccakRndForm::Full`, 1,011 under `Lean`)
 // =========================================================================
 //
 // The θ/ρ halfword shifts no longer emit HWSL lookups (120 sends/row removed):
@@ -821,6 +825,8 @@ pub fn bus_interactions_for(form: KeccakRndForm) -> Vec<BusInteraction> {
     }
 
     // --- Theta: Dxz BYTE_ALU[XOR] (40) ---
+    // Under `KeccakRndForm::Lean` these operands carry the `Cxz_left` range:
+    // a change that removes or repacks them must restore the 20 checks above.
     // D[x][b] = C[(x-1)%5][b] XOR rotated_C[(x+1)%5][b]
     // rotated_C[x'][b] = Cxz_left[x'][b] + (1 - b%2) * Cxz_right[x'][(b/2 - 1)%4]
     // (spec d75944ee/9143370f). For odd b only Cxz_left contributes.
@@ -1051,9 +1057,13 @@ fn halfword<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
 /// * **1 MuIsBit**: `μ · (1 − μ)` (degree 2).
 ///
 /// These identities replace the former θ/ρ HWSL bus lookups. Uniqueness of the
-/// (left, right) decomposition rests on the ARE_BYTES range checks bounding both
-/// halves to `[0, 2¹⁶)` and on `2¹⁶` being invertible mod the Goldilocks prime
-/// (z3-verified equivalent to the HWSL contract).
+/// (left, right) decomposition rests on both halves bounded to `[0, 2¹⁶)` and on
+/// `2¹⁶` being invertible mod the Goldilocks prime. For ρ the bound is the
+/// ARE_BYTES range checks in both forms. For θ it is the ARE_BYTES checks under
+/// [`KeccakRndForm::Full`] (z3-verified equivalent to the HWSL contract, on the
+/// full form). Under [`KeccakRndForm::Lean`] it is the D lookups' byte operands
+/// and the identity's parity, checked by exhaustive enumeration
+/// (`block_keccak_lean_tests`).
 #[derive(Clone, Copy)]
 pub struct KeccakRndConstraints;
 
