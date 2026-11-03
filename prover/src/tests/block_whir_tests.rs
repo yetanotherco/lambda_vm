@@ -4150,6 +4150,7 @@ fn ecrec_traces() -> (
 ///   key `TS + 1` of that call's second chain. Refused.
 #[test]
 fn ecrec_chains_are_keyed_apart_on_the_bus() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     use crate::tables::ecdas::cols;
     use crate::tables::types::FE;
     let (a, b, c) = {
@@ -4227,6 +4228,10 @@ fn ecrec_chains_are_keyed_apart_on_the_bus() {
 fn ecrec_chains_swapped_between_keys_are_refused() {
     use crate::tables::trace_builder::FORGE_ECREC_SWAPPED_CHAINS;
     use std::sync::atomic::Ordering;
+    // Alone: no other test runs `test_ecrec` while the switch is set.
+    let _alone = crate::tables::trace_builder::ECREC_FORGE_TEST_LOCK
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
     let honest = ecrec_traces().2.public_output_bytes;
     assert!(
         traces_block_accepts(ecrec_traces, |_| {}),

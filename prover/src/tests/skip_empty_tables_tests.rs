@@ -259,6 +259,7 @@ fn droppable_air_names(counts: &TableCounts) -> Vec<&'static str> {
 /// undetected.
 #[test]
 fn no_present_table_contributes_zero_to_the_bus() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let asm = [
         "all_instructions_64",
         "all_loadstore_32",
@@ -740,6 +741,7 @@ fn omitting_a_used_accelerator_fails_the_bus_balance() {
 /// receiver, and its chains' ECDAS messages lose their seeds and drains.
 #[test]
 fn omitting_the_ecrec_table_fails_the_bus_balance() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let (elf, logs, _instructions) = run_asm_elf("test_ecrec");
     let mut traces =
         Traces::from_elf_and_logs_minimal(&elf, &logs, &Default::default(), &[]).unwrap();

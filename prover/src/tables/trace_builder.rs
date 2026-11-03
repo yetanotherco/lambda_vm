@@ -2508,10 +2508,29 @@ fn collect_ecsm_ops(
 /// The row's scalar columns, relations and `LEN` swap stay consistent, so the only
 /// thing that refuses it is the second chain's key `TS + 1`: with both chains keyed
 /// at `TS`, the `Bit` messages of the two are one multiset and balance either way.
-/// Keyed on `test_ecrec`'s first `r`, so tests beside the forging one are unaffected.
+/// Keyed on `test_ecrec`'s first `r`: a test that runs another program never
+/// sees it, but one that runs `test_ecrec` while it is set builds the forged
+/// call. So the forging test holds [`ECREC_FORGE_TEST_LOCK`] to write while the
+/// switch is set, and every other test that runs `test_ecrec` holds it to read
+/// ([`ecrec_forge_free`]).
 #[cfg(test)]
 pub(crate) static FORGE_ECREC_SWAPPED_CHAINS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Keeps the test that sets [`FORGE_ECREC_SWAPPED_CHAINS`] (the writer) apart
+/// from the tests that run `test_ecrec` honestly (the readers), which run
+/// beside one another.
+#[cfg(test)]
+pub(crate) static ECREC_FORGE_TEST_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// For a test that runs `test_ecrec`: [`ECREC_FORGE_TEST_LOCK`] to read, so the
+/// forgery switch stays off while it holds it. Taken through a poisoned lock.
+#[cfg(test)]
+pub(crate) fn ecrec_forge_free() -> std::sync::RwLockReadGuard<'static, ()> {
+    ECREC_FORGE_TEST_LOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 /// `r` of `test_ecrec`'s first call, little-endian.
 #[cfg(test)]

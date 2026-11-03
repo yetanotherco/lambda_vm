@@ -338,6 +338,7 @@ fn cycles_of(elf: &Elf) -> usize {
 /// window walked from them alone is the sequential walk's.
 #[test]
 fn the_pass_keeps_the_walks_timestamps_registers_and_entries() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let mut total = Seen::default();
     for (name, elf) in programs() {
         for window in window_lengths(cycles_of(&elf)) {
@@ -364,6 +365,7 @@ fn the_pass_keeps_the_walks_timestamps_registers_and_entries() {
 /// comes from its log, and a row keeps the old timestamps of its width only.)
 #[test]
 fn a_window_walked_without_one_of_its_entries_is_another_walk() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let mut dropped = 0;
     for (name, elf) in programs() {
         let window = window_lengths(cycles_of(&elf))[0];
@@ -381,6 +383,7 @@ fn a_window_walked_without_one_of_its_entries_is_another_walk() {
 /// and nothing where it finds nothing.
 #[test]
 fn the_dense_pc_index_finds_the_decode_tables_rows() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     for (name, elf) in programs() {
         let builder =
             WindowedTraceBuilder::new(&elf, &[], &MaxRowsConfig::small()).expect("the builder");
@@ -406,6 +409,7 @@ fn the_dense_pc_index_finds_the_decode_tables_rows() {
 /// registers and records no entry; both find rows through the dense index.
 #[test]
 fn the_pass_without_its_memory_keeps_the_same_registers() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     for (name, elf) in programs() {
         let window = window_lengths(cycles_of(&elf))[1];
         let builder =
@@ -439,6 +443,7 @@ fn the_pass_without_its_memory_keeps_the_same_registers() {
 /// entries, in order, and keeps its registers, at every window.
 #[test]
 fn the_split_pass_is_the_pass() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     for (name, elf) in programs() {
         for window in window_lengths(cycles_of(&elf)) {
             let builder =

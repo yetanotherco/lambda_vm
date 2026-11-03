@@ -198,6 +198,7 @@ const PROGRAMS: [&str; 15] = [
 /// production sizes: the plan's tables are the oracle's.
 #[test]
 fn the_plan_builds_the_oracles_whole_run_tables() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     for max_rows in [
         MaxRowsConfig::small(),
         MaxRowsConfig::uniform(4),

@@ -190,6 +190,7 @@ const PROGRAMS: [&str; 14] = [
 /// handed-out ops kept or dropped, the windows build the whole-run tables.
 #[test]
 fn windows_walked_from_their_entries_build_the_whole_run_tables() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let max_rows = MaxRowsConfig::small();
     for name in PROGRAMS {
         let (program, logs) = run(name);
@@ -380,6 +381,7 @@ fn each_check_catches_what_it_guards() {
 /// check, before the boundary sums.
 #[test]
 fn an_entry_stamped_0_must_carry_the_images_value() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     let mut refused = 0;
     for name in PROGRAMS {
         let (program, _) = run(name);
@@ -550,6 +552,7 @@ fn a_dropped_entry_a_value_only_reader_reads_is_refused() {
 /// value and timestamp.
 #[test]
 fn the_state_built_for_the_finish_is_the_walks() {
+    let _ecrec = crate::tables::trace_builder::ecrec_forge_free();
     for name in PROGRAMS {
         let (program, logs) = run(name);
         for window in [7, 33, logs.len()] {
