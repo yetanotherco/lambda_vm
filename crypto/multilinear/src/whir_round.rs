@@ -19,7 +19,7 @@ use crate::{
     whir::Domain,
     whir_commit::{
         CodewordCommitment, Commitment, CosetOpening, LeafOrder, fold_coset, leaf_and_slot,
-        verify_opening_capped,
+        verify_joint_opening_capped, verify_opening_capped,
     },
     whir_hash::WhirHash,
 };
@@ -638,6 +638,219 @@ where
             }
         }
         let folded = fold_coset::<F, E, E>(&combine_blocks(blocks, &eqs), domain, q, alphas)?;
+        match (end, &next_check) {
+            (GroupedEnd::Final(value), _) => {
+                if folded != *value {
+                    return Err(Error::FoldInconsistent { query: i });
+                }
+            }
+            (GroupedEnd::Successor { num_leaves, .. }, Some((check, next_first))) => {
+                let nxt = &proof.next[i];
+                let siblings = if i == 0 {
+                    *next_first
+                } else {
+                    nxt.proof.merkle_path.as_slice()
+                };
+                let (leaf, slot) = leaf_and_slot(q, num_leaves);
+                if !verify_opening_capped::<E, H>(check, leaf, nxt, siblings) {
+                    return Err(Error::OpeningRejected { query: i });
+                }
+                let claimed = nxt.values.get(slot).ok_or(Error::QueryOutOfRange {
+                    index: slot,
+                    bound: nxt.values.len(),
+                })?;
+                if folded != *claimed {
+                    return Err(Error::FoldInconsistent { query: i });
+                }
+            }
+            (GroupedEnd::Successor { .. }, None) => {
+                return Err(Error::GroupedShape(GroupedShape::SuccessorBlocks {
+                    expected: config.num_queries,
+                    got: proof.next.len(),
+                }));
+            }
+        }
+    }
+
+    Ok(next_check.map(|(check, _)| check))
+}
+
+/// Produces round 0 of a grouped chain over a JOINT tree
+/// (`whir_chain::Round0Trees::One`): ONE position set, each query one leaf of
+/// `current` — every polynomial's block end to end — and one path, then the
+/// successor's blocks as [`prove`]'s (none when round 0 is the last round).
+pub fn prove_joint<C, N, T, H>(
+    current: &CodewordCommitment<C, H>,
+    next: Option<&CodewordCommitment<N, H>>,
+    config: &RoundConfig,
+    caps: RoundCaps,
+    transcript: &mut T,
+) -> Result<RoundProof<C, N>, Error>
+where
+    C: IsField + 'static,
+    N: IsField + 'static,
+    FieldElement<C>: AsBytes + Sync + Send,
+    FieldElement<N>: AsBytes + Sync + Send,
+    T: IsTranscript<N>,
+    H: WhirHash,
+{
+    let __wq_sample = crate::whir_split::mark();
+    let queries = sample_queries(transcript, config.num_queries, current.num_leaves());
+    let leaves: Vec<usize> = match next {
+        Some(next) => queries
+            .iter()
+            .map(|q| leaf_and_slot(*q, next.num_leaves()).0)
+            .collect(),
+        None => Vec::new(),
+    };
+    crate::whir_split::add(&crate::whir_split::QUERY_SAMPLE, __wq_sample);
+    Ok(RoundProof {
+        current: current.open_many_capped(&queries, caps.current, caps.current_owner)?,
+        next: match next {
+            Some(next) => next.open_many_capped(&leaves, caps.next, true)?,
+            None => Vec::new(),
+        },
+    })
+}
+
+/// Checks round 0 of a grouped chain over `polys` polynomials committed as
+/// ONE joint tree (`tree`, its root's check).
+///
+/// Re-derives the one position set; at each position the opening — `polys`
+/// blocks of `2^k0` values end to end — must open against the tree under the
+/// joint leaf, and the blocks' combination `Σ_p eq(ρ, p)·block_p`, folded by
+/// the data challenges, must be the successor's value there (or the final
+/// constant). Returns the successor tree's authenticated check, `None` on a
+/// final round.
+///
+/// ⚠ ORDER. The whole shape — `Q` openings of exactly `polys·2^k0` values, and
+/// the successor count — is checked before any opening is indexed or any cap
+/// is read, as [`verify_grouped`] does.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_joint<'a, F, E, T, H>(
+    proof: &'a RoundProof<F, E>,
+    tree: TreeCheck<'a>,
+    polys: usize,
+    end: GroupedEnd<'a, E>,
+    domain: &Domain<F>,
+    alphas: &[FieldElement<E>],
+    rho: &[FieldElement<E>],
+    config: &RoundConfig,
+    transcript: &mut T,
+) -> Result<Option<CappedRoot<'a, Commitment>>, Error>
+where
+    F: IsFFTField + IsPrimeField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<E>: AsBytes + Sync + Send,
+    T: IsTranscript<E>,
+    H: WhirHash,
+{
+    use crate::whir_chain::{GroupedShape, MAX_INDEX_POLYS, index_vars};
+    if !(2..=MAX_INDEX_POLYS).contains(&polys) {
+        return Err(Error::GroupedShape(GroupedShape::RunWidth { polys }));
+    }
+    if alphas.len() != config.log_folding {
+        return Err(Error::VariableCountMismatch {
+            expected: config.log_folding,
+            got: alphas.len(),
+        });
+    }
+    if rho.len() != index_vars(polys) {
+        return Err(Error::VariableCountMismatch {
+            expected: index_vars(polys),
+            got: rho.len(),
+        });
+    }
+    let successors = match end {
+        GroupedEnd::Successor { .. } => config.num_queries,
+        GroupedEnd::Final(_) => 0,
+    };
+    let block = 1usize << config.log_folding;
+    let width = polys * block;
+    if proof.current.len() != config.num_queries {
+        return Err(Error::GroupedShape(GroupedShape::Queries {
+            expected: config.num_queries,
+            got: proof.current.len(),
+        }));
+    }
+    if proof.next.len() != successors {
+        return Err(Error::GroupedShape(GroupedShape::SuccessorBlocks {
+            expected: successors,
+            got: proof.next.len(),
+        }));
+    }
+    for (query, opening) in proof.current.iter().enumerate() {
+        if opening.values.len() != width {
+            return Err(Error::GroupedShape(GroupedShape::BlockWidth {
+                query,
+                tree: 0,
+                expected: width,
+                got: opening.values.len(),
+            }));
+        }
+    }
+
+    let num_leaves = domain.size() >> config.log_folding;
+    let current_depth = num_leaves.trailing_zeros() as usize;
+    let next_tree = match end {
+        GroupedEnd::Successor {
+            num_leaves,
+            root,
+            cap_height,
+        } => {
+            if !num_leaves.is_power_of_two() {
+                return Err(Error::NotPowerOfTwo(num_leaves));
+            }
+            Some((root, num_leaves, cap_height))
+        }
+        GroupedEnd::Final(_) => None,
+    };
+    let Some(first) = proof.current.first() else {
+        return match next_tree {
+            Some((_, _, cap_height)) if cap_height != 0 => Err(Error::CapRejected),
+            Some((root, num_leaves, _)) => Ok(Some(CappedRoot::uncapped(
+                root,
+                num_leaves.trailing_zeros() as usize,
+            ))),
+            None => Ok(None),
+        };
+    };
+    let (check, first_siblings) = tree.open::<F, H>(current_depth, first)?;
+    let next_check = match (next_tree, proof.next.first()) {
+        (Some((root, num_leaves, cap_height)), Some(opening)) => Some(
+            TreeCheck::Owner {
+                root,
+                cap_height,
+                leaves: LeafOrder::Natural,
+            }
+            .open::<E, H>(num_leaves.trailing_zeros() as usize, opening)?,
+        ),
+        _ => None,
+    };
+
+    let queries = sample_queries(transcript, config.num_queries, num_leaves);
+    let eqs = combine_weights(rho, polys);
+
+    for (i, (&q, opening)) in queries.iter().zip(&proof.current).enumerate() {
+        let siblings = if i == 0 {
+            first_siblings
+        } else {
+            opening.proof.merkle_path.as_slice()
+        };
+        let at = tree.position(q, current_depth);
+        if !verify_joint_opening_capped::<F, H>(&check, at, opening, siblings, polys) {
+            return Err(Error::GroupedOpeningRejected { query: i, tree: 0 });
+        }
+        // Block `p` is the leaf's `p`-th run of `2^k0` values.
+        let combined: Vec<FieldElement<E>> = (0..block)
+            .map(|t| {
+                (0..polys).fold(FieldElement::<E>::zero(), |acc, p| {
+                    acc + &opening.values[p * block + t] * &eqs[p]
+                })
+            })
+            .collect();
+        let folded = fold_coset::<F, E, E>(&combined, domain, q, alphas)?;
         match (end, &next_check) {
             (GroupedEnd::Final(value), _) => {
                 if folded != *value {

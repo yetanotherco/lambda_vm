@@ -120,6 +120,7 @@ fn path_lens(round: &ChainRound<F, Ext>) -> (Vec<usize>, Vec<usize>) {
             p.next.iter().map(|o| o.proof.merkle_path.len()).collect(),
         ),
         RoundOpenings::BaseGrouped(_) => panic!("these chains are per-polynomial"),
+        RoundOpenings::BaseJoint(_) => panic!("these chains are per-polynomial"),
     }
 }
 
@@ -128,6 +129,7 @@ fn current_path(round: &mut ChainRound<F, Ext>, i: usize) -> &mut Vec<Commitment
         RoundOpenings::Base(p) => &mut p.current[i].proof.merkle_path,
         RoundOpenings::Extension(p) => &mut p.current[i].proof.merkle_path,
         RoundOpenings::BaseGrouped(_) => panic!("these chains are per-polynomial"),
+        RoundOpenings::BaseJoint(_) => panic!("these chains are per-polynomial"),
     }
 }
 
@@ -136,6 +138,7 @@ fn next_path(round: &mut ChainRound<F, Ext>, i: usize) -> &mut Vec<Commitment> {
         RoundOpenings::Base(p) => &mut p.next[i].proof.merkle_path,
         RoundOpenings::Extension(p) => &mut p.next[i].proof.merkle_path,
         RoundOpenings::BaseGrouped(_) => panic!("these chains are per-polynomial"),
+        RoundOpenings::BaseJoint(_) => panic!("these chains are per-polynomial"),
     }
 }
 

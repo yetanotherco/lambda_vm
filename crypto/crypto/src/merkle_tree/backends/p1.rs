@@ -22,7 +22,7 @@ use math::{
     traits::AsBytes,
 };
 
-use crate::hash::poseidon1_stark::linear_hash;
+use crate::hash::poseidon1_stark::{joint_linear_hash, linear_hash};
 use crate::hash::poseidon1_w16;
 use crate::hash::rpx::{
     Fp, commitment_to_digest, digest_to_commitment, element_felts, felts_from_bytes,
@@ -32,6 +32,21 @@ use crate::merkle_tree::traits::{IsLeafHasher, IsMerkleTreeBackend, IsStreamingL
 /// ZisK's tagged leaf hash over felts, as a node.
 pub fn leaf(felts: &[Fp]) -> [u8; 32] {
     digest_to_commitment(&linear_hash(felts))
+}
+
+/// The joint leaf of `blocks` equal blocks laid end to end in `values`, as a
+/// node: [`leaf`]'s chain with the block count in its tag
+/// (`poseidon1_stark::joint_leaf_capacity`).
+pub fn joint_leaf<F>(values: &[FieldElement<F>], blocks: usize) -> [u8; 32]
+where
+    F: IsField,
+    FieldElement<F>: AsBytes,
+{
+    let mut felts = Vec::with_capacity(3 * values.len());
+    for e in values {
+        element_felts(e, &mut felts);
+    }
+    digest_to_commitment(&joint_linear_hash(&felts, blocks))
 }
 
 /// ZisK's 4-ary node over four children.
@@ -218,6 +233,41 @@ mod tests {
             assert_eq!(B::hash_bytes(&bytes), B::hash_data(&row), "width {w}");
             assert_eq!(B::hash_data(&row), leaf(&row));
         }
+    }
+
+    /// A joint leaf's tag separates it from the plain leaf over the same felts
+    /// and from the extension leaf of the same width; at three blocks of 64 it
+    /// is 192 felts, sixteen permutations.
+    #[test]
+    fn a_joint_leaf_is_its_own_form() {
+        let base: Vec<FieldElement<Base>> = (0..192u64).map(fe).collect();
+        let ext: Vec<FieldElement<Ext3>> = (0..64u64).map(fee).collect();
+        let joint = joint_leaf(&base, 3);
+        assert_eq!(
+            joint,
+            digest_to_commitment(&joint_linear_hash(&base, 3)),
+            "the joint leaf is the chain over the felts"
+        );
+        assert_ne!(
+            joint,
+            B::hash_data(&base),
+            "the plain leaf of the same felts"
+        );
+        assert_ne!(
+            joint,
+            E::hash_data(&ext),
+            "the extension leaf of the same width"
+        );
+        assert_ne!(joint, joint_leaf(&base, 2), "another block count");
+        assert_eq!(
+            crate::hash::poseidon1_stark::joint_leaf_capacity(192, 3),
+            [
+                Fp::from(192u64),
+                Fp::from(crate::hash::poseidon1_stark::LEAF_DOMAIN),
+                Fp::from(3u64),
+                Fp::zero()
+            ]
+        );
     }
 
     #[test]

@@ -48,6 +48,8 @@ pub mod whir_eval;
 mod whir_group_tests;
 pub mod whir_hash;
 #[cfg(test)]
+mod whir_joint_tree_tests;
+#[cfg(test)]
 mod whir_p1_tests;
 pub mod whir_round;
 #[cfg(test)]
@@ -218,6 +220,20 @@ pub enum Error {
         order: whir_commit::LeafOrder,
         hash: &'static str,
     },
+    /// One round-0 tree a run (`whir_chain::Round0Trees::One`) under a
+    /// format that does not group its polynomials, or a hash with no joint
+    /// leaf. Refused before a tree is built or a proof is read.
+    #[error(
+        "one round-0 tree a run needs grouped chains and Poseidon1 trees (group {group:?}, hash {hash})"
+    )]
+    JointTreeUnsupported {
+        group: whir_chain::GroupFold,
+        hash: &'static str,
+    },
+    /// A joint round-0 tree revived over another number of codewords than
+    /// its leaves hold blocks.
+    #[error("a joint round-0 tree of {expected} blocks a leaf revived over {got} codewords")]
+    JointTreeWidth { expected: usize, got: usize },
     /// A round-0 commitment placed its leaves in another order than the
     /// config it is proved under.
     #[error("a round-0 commitment's leaves are in the {got:?} order, the config's in {expected:?}")]

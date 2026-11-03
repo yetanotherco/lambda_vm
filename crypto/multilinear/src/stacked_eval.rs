@@ -44,7 +44,7 @@ use crate::{
     stacking::{Placement, StackedLayout},
     whir::Domain,
     whir_chain::{
-        self, ChainConfig, ChainProof, GroupFold, GroupedShape, MAX_INDEX_POLYS,
+        self, ChainConfig, ChainProof, GroupFold, GroupedShape, MAX_INDEX_POLYS, Round0Trees,
         check_index_domain, eq_index, index_vars,
     },
     whir_commit::{CodewordCommitment, Commitment},
@@ -71,6 +71,36 @@ pub fn index_chains(num_polys: usize, group: GroupFold) -> Vec<std::ops::Range<u
     (0..num_polys)
         .step_by(run)
         .map(|start| start..(start + run).min(num_polys))
+        .collect()
+}
+
+/// The round-0 trees a stack of `num_polys` polynomials is committed as, each
+/// a range of its polynomials in slot order: one a polynomial, or under
+/// [`Round0Trees::One`] one for each run of [`index_chains`] of at least two
+/// (the run's joint tree). A pure function of the verifier's own layout and
+/// config, like [`index_chains`]: it fixes how many roots a stack carries.
+pub fn round0_trees(num_polys: usize, config: &ChainConfig) -> Vec<std::ops::Range<usize>> {
+    match config.format.round0 {
+        Round0Trees::Each => (0..num_polys).map(|i| i..i + 1).collect(),
+        Round0Trees::One => index_chains(num_polys, config.format.group)
+            .into_iter()
+            .flat_map(|run| {
+                if run.len() >= 2 {
+                    vec![run]
+                } else {
+                    run.map(|i| i..i + 1).collect()
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Each polynomial's round-0 tree: its index in [`round0_trees`].
+fn tree_of(trees: &[std::ops::Range<usize>]) -> Vec<usize> {
+    trees
+        .iter()
+        .enumerate()
+        .flat_map(|(t, range)| range.clone().map(move |_| t))
         .collect()
 }
 
@@ -347,9 +377,28 @@ where
         };
         let mut domain = None;
         let mut commitments = Vec::with_capacity(sources.len());
+        // ★ One tree a run: each joint run is committed whole (its codewords
+        // encoded, then one leaf launch over all of them), every polynomial on
+        // its own as today; one run at a time.
+        if config.format.round0 == Round0Trees::One {
+            for range in round0_trees(sources.len(), config) {
+                let (commitment, d) = if range.len() == 1 {
+                    commit(&sources[range.start])?
+                } else {
+                    whir_chain::commit_joint_stacked::<F, H>(&sources[range], config, transient)?
+                };
+                commitments.push(commitment);
+                domain = Some(d);
+            }
+        }
         #[cfg(feature = "parallel")]
         let off_pool = PAIRS_OFF_POOL.with(std::cell::Cell::get);
-        for pair in sources.chunks(2) {
+        let pairs = if config.format.round0 == Round0Trees::One {
+            &[][..]
+        } else {
+            &sources[..]
+        };
+        for pair in pairs.chunks(2) {
             #[cfg(feature = "parallel")]
             let built = if off_pool {
                 commit_pair_off_pool(pair, &commit)?
@@ -528,42 +577,55 @@ where
         // (`Error::CosetSuccessorNotEncoded`).
         let from_stack = config.format.leaves == crate::whir_commit::LeafOrder::Coset
             && crate::gpu::coset_openings_in_effect();
+        // One retired tree a round-0 tree: a joint one revives over every
+        // codeword of its run, in slot order.
+        let trees = round0_trees(layout.num_polys(), config);
+        if trees.len() != retired.len() {
+            return Err(Error::JointTreeWidth {
+                expected: trees.len(),
+                got: retired.len(),
+            });
+        }
         let mut commitments = Vec::with_capacity(retired.len());
-        for (poly, retired) in retired.into_iter().enumerate() {
-            let source = whir_chain::Stacked {
-                parts: layout
-                    .parts_of(poly)
-                    .into_iter()
-                    .map(|(column, offset)| (columns[column] as &dyn HostColumn<F>, offset))
-                    .collect(),
-                resident: resident.map(|(store, at)| {
-                    (
+        for (range, retired) in trees.into_iter().zip(retired) {
+            let mut codewords = Vec::with_capacity(range.len());
+            for poly in range {
+                let source = whir_chain::Stacked {
+                    parts: layout
+                        .parts_of(poly)
+                        .into_iter()
+                        .map(|(column, offset)| (columns[column] as &dyn HostColumn<F>, offset))
+                        .collect(),
+                    resident: resident.map(|(store, at)| {
+                        (
+                            store,
+                            layout
+                                .parts_of(poly)
+                                .into_iter()
+                                .map(|(column, offset)| (at.store_column(column), offset))
+                                .collect(),
+                        )
+                    }),
+                    num_vars: layout.n_stack(),
+                };
+                let held = match (&source.resident, from_stack) {
+                    (Some((store, parts)), true) => crate::gpu::CosetSource::from_resident(
                         store,
-                        layout
-                            .parts_of(poly)
-                            .into_iter()
-                            .map(|(column, offset)| (at.store_column(column), offset))
-                            .collect(),
-                    )
-                }),
-                num_vars: layout.n_stack(),
-            };
-            let held = match (&source.resident, from_stack) {
-                (Some((store, parts)), true) => crate::gpu::CosetSource::from_resident(
-                    store,
-                    parts,
-                    layout.n_stack(),
-                    config.log_blowup,
-                ),
-                _ => None,
-            };
-            let codeword = match held {
-                Some(held) => crate::whir_commit::Codeword::Source(
-                    crate::whir_commit::SourceCodeword::new(held),
-                ),
-                None => whir_chain::encode_stacked::<F>(&source, config, transient)?,
-            };
-            commitments.push(retired.revive::<F, H>(codeword)?);
+                        parts,
+                        layout.n_stack(),
+                        config.log_blowup,
+                    ),
+                    _ => None,
+                };
+                let codeword = match held {
+                    Some(held) => crate::whir_commit::Codeword::Source(
+                        crate::whir_commit::SourceCodeword::new(held),
+                    ),
+                    None => whir_chain::encode_stacked::<F>(&source, config, transient)?,
+                };
+                codewords.push(codeword);
+            }
+            commitments.push(retired.revive_joint::<F, H>(codewords)?);
         }
         Ok(StackedCommitment {
             layout,
@@ -1142,6 +1204,14 @@ where
         num_vars: layout.n_stack(),
     };
     let chains = layout_chains::<F>(layout, config)?;
+    let trees = round0_trees(layout.num_polys(), config);
+    if trees.len() != stacked.commitments.len() {
+        return Err(Error::JointTreeWidth {
+            expected: trees.len(),
+            got: stacked.commitments.len(),
+        });
+    }
+    let tree_of = tree_of(&trees);
     let mut polys = Vec::with_capacity(chains.len());
     for run in chains {
         if run.len() == 1 {
@@ -1153,7 +1223,7 @@ where
                 &weight_shares(layout, i, point, &weights)?,
                 overlay_of(i)?.as_ref(),
                 layout.n_stack(),
-                &stacked.commitments[i],
+                &stacked.commitments[tree_of[i]],
                 &stacked.domain,
                 config,
                 transcript,
@@ -1169,8 +1239,21 @@ where
             .clone()
             .map(&overlay_of)
             .collect::<Result<Option<Vec<_>>, Error>>()?;
+        if config.format.round0 == Round0Trees::One {
+            polys.push(whir_chain::prove_joint_shared_ood::<F, E, T, H>(
+                &sources,
+                &shares,
+                overlays.as_deref(),
+                layout.n_stack(),
+                &stacked.commitments[tree_of[run.start]],
+                &stacked.domain,
+                config,
+                transcript,
+            )?);
+            continue;
+        }
         let commitments: Vec<&CodewordCommitment<F, H>> =
-            run.map(|i| &stacked.commitments[i]).collect();
+            run.map(|i| &stacked.commitments[tree_of[i]]).collect();
         polys.push(whir_chain::prove_grouped_shared_ood::<F, E, T, H>(
             &sources,
             &shares,
@@ -1338,13 +1421,16 @@ where
             got: values.len(),
         }));
     }
-    // One root per polynomial, and — before anything is absorbed — one chain
-    // per run of the verifier's own split, never the proof's count.
+    // One root per round-0 tree (one a polynomial, or one a joint run), and —
+    // before anything is absorbed — one chain per run of the verifier's own
+    // split, never the proof's count.
     let chains = layout_chains::<F>(layout, config).map_err(Refusal::Before)?;
+    let trees = round0_trees(layout.num_polys(), config);
+    let tree_of = tree_of(&trees);
     let per_poly = config.format.group == GroupFold::PerPoly;
-    if roots.len() != layout.num_polys() || (per_poly && proof.polys.len() != layout.num_polys()) {
+    if roots.len() != trees.len() || (per_poly && proof.polys.len() != layout.num_polys()) {
         return Err(Refusal::Before(Error::QueryCountMismatch {
-            expected: layout.num_polys(),
+            expected: trees.len(),
             // Today's report under `PerPoly`; under `Indexed` the root count,
             // the chain count being refused by name below.
             got: if per_poly {
@@ -1386,7 +1472,7 @@ where
             let i = run.start;
             whir_chain::verify_weighted::<F, E, T, _, H>(
                 eval_proof,
-                &roots[i],
+                &roots[tree_of[i]],
                 |at: &[FieldElement<E>]| {
                     let mut weight = weight_at(layout, i, point, &weights, at)?;
                     if let Some((ood_point, scales)) = ood_at {
@@ -1416,6 +1502,23 @@ where
             .first()
             .copied()
             .unwrap_or(0);
+        if config.format.round0 == Round0Trees::One {
+            whir_chain::verify_joint::<F, E, T, _, H>(
+                eval_proof,
+                &roots[tree_of[run.start]],
+                run.len(),
+                |at: &[FieldElement<E>]| {
+                    grouped_weight_at(layout, run.clone(), k0, point, &weights, ood_at, at)
+                },
+                claim,
+                layout.n_stack(),
+                domain,
+                config,
+                transcript,
+            )
+            .map_err(refused)?;
+            continue;
+        }
         whir_chain::verify_grouped::<F, E, T, _, H>(
             eval_proof,
             &roots[run.clone()],

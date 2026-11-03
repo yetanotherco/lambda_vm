@@ -40,6 +40,9 @@ const P1W16_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/p1w16.cubin
 /// Children per node.
 pub const ARITY: usize = 4;
 
+/// Felts a permutation absorbs into a leaf (the rate).
+pub const RATE_FELTS: usize = 12;
+
 /// Threads per block for the leaf and level kernels (a 16-lane state: the
 /// RPX kernels' 128).
 const BLOCK_DIM: u32 = 128;
@@ -64,6 +67,9 @@ pub struct Kernels {
     pub leaves_base_coset: CudaFunction,
     /// [`Self::leaves_base_coset`] with leaf `j` placed at `bitrev(j)`.
     pub leaves_base_coset_rev: CudaFunction,
+    /// The joint leaves of a grouped run's 2–4 base codewords
+    /// (`crate::whir::commit_joint`), placed as [`Self::leaves_base_coset_rev`].
+    pub leaves_base_coset_joint: CudaFunction,
     pub leaves_ext3_coset: CudaFunction,
     pub merkle_level4: CudaFunction,
     pub merkle_tail4: CudaFunction,
@@ -124,6 +130,7 @@ pub fn load_kernels(lean: bool) -> Result<Kernels> {
         fri_group_leaves: module.load_function("p1s_fri_group_leaves")?,
         leaves_base_coset: module.load_function(&twin("p1s_leaves_base_coset"))?,
         leaves_base_coset_rev: module.load_function(&twin("p1s_leaves_base_coset_rev"))?,
+        leaves_base_coset_joint: module.load_function(&twin("p1s_leaves_base_coset_joint"))?,
         leaves_ext3_coset: module.load_function(&twin("p1s_leaves_ext3_coset"))?,
         merkle_level4: module.load_function(&twin("p1s_merkle_level4"))?,
         merkle_tail4: module.load_function(&twin("p1s_merkle_tail4"))?,

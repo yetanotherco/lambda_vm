@@ -1192,7 +1192,20 @@ pub fn room_turns_for(
     let schedule = config.schedule(n);
     let first_fold = schedule.first().copied().unwrap_or(0);
     let next_fold = schedule.get(1).copied().unwrap_or(0);
-    let in_flight = layout.num_polys().min(2) as u64;
+    // Two commits in flight, or under one tree a run the widest joint run's
+    // codewords at once (its leaves read all of them).
+    let joint = match config.format.round0 {
+        crate::whir_chain::Round0Trees::Each => 0,
+        crate::whir_chain::Round0Trees::One => {
+            crate::stacked_eval::round0_trees(layout.num_polys(), config)
+                .iter()
+                .map(|run| run.len())
+                .filter(|&len| len >= 2)
+                .max()
+                .unwrap_or(0)
+        }
+    };
+    let in_flight = layout.num_polys().min(2).max(joint) as u64;
     let commit =
         in_flight * math_cuda::whir::commit_transient_bytes(n, config.log_blowup, first_fold);
     // A share's `eq` halves are its point's high and low coordinates' tables,
@@ -7580,6 +7593,280 @@ impl DeviceCodeword {
         F: math::field::traits::IsField + 'static,
     {
         match self.0 {}
+    }
+}
+
+/// A joint round-0 tree the card built over a grouped run's codewords
+/// (`whir_chain::Round0Trees::One`, [`commit_joint`]): its node buffer, held
+/// on the card until the commitment is retired or opened.
+#[cfg(feature = "cuda")]
+pub struct JointTree(math_cuda::whir::JointTree);
+
+/// A joint tree a build without a device never holds. Never constructed.
+#[cfg(not(feature = "cuda"))]
+pub struct JointTree(std::convert::Infallible);
+
+impl std::fmt::Debug for JointTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JointTree").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl JointTree {
+    /// The tree's first `nodes` nodes (whole top levels, root first), home.
+    pub(crate) fn top_nodes(&self, nodes: usize) -> Option<Vec<[u8; 32]>> {
+        nodes_in_place(self.0.top_nodes_to_host(nodes).ok()?)
+    }
+
+    /// One authentication path per tree position.
+    pub(crate) fn paths(&self, indices: &[usize]) -> Option<Vec<Vec<[u8; 32]>>> {
+        let leaves = self.0.num_leaves();
+        if indices.iter().any(|index| *index >= leaves) {
+            return None;
+        }
+        let positions: Vec<u32> = indices.iter().map(|index| *index as u32).collect();
+        let nodes = nodes_in_place(self.0.paths(&positions).ok()?)?;
+        Some(
+            nodes
+                .chunks_exact(path_len(leaves, crate::whir_hash::DeviceHashKey::Poseidon1))
+                .map(<[_]>::to_vec)
+                .collect(),
+        )
+    }
+
+    /// [`Self::paths`] and the tree's cap at `cap_height` 4-ary levels.
+    pub(crate) fn paths_and_cap(
+        &self,
+        indices: &[usize],
+        cap_height: usize,
+    ) -> Option<PathsAndCap> {
+        let leaves = self.0.num_leaves();
+        let depth = leaves.trailing_zeros() as usize;
+        if indices.iter().any(|index| *index >= leaves)
+            || cap_height > crypto::merkle_tree::cap::tree_levels(depth, 4)
+        {
+            return None;
+        }
+        let positions: Vec<u32> = indices.iter().map(|index| *index as u32).collect();
+        let (bytes, cap_bytes) = self.0.paths_and_cap(&positions, cap_height).ok()?;
+        let nodes = nodes_in_place(bytes)?;
+        let len = crypto::merkle_tree::cap::cap_len(depth, cap_height, 4)?;
+        if cap_bytes.len() != 32 * len {
+            return None;
+        }
+        let cap: Vec<[u8; 32]> = cap_bytes
+            .chunks_exact(32)
+            .map(|node| <[u8; 32]>::try_from(node).ok())
+            .collect::<Option<_>>()?;
+        Some((
+            nodes
+                .chunks_exact(path_len(leaves, crate::whir_hash::DeviceHashKey::Poseidon1))
+                .map(<[_]>::to_vec)
+                .collect(),
+            cap,
+        ))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl JointTree {
+    pub(crate) fn top_nodes(&self, _nodes: usize) -> Option<Vec<[u8; 32]>> {
+        match self.0 {}
+    }
+
+    pub(crate) fn paths(&self, _indices: &[usize]) -> Option<Vec<Vec<[u8; 32]>>> {
+        match self.0 {}
+    }
+
+    pub(crate) fn paths_and_cap(
+        &self,
+        _indices: &[usize],
+        _cap_height: usize,
+    ) -> Option<PathsAndCap> {
+        match self.0 {}
+    }
+}
+
+/// ONE round-0 tree over a grouped run's `codewords`, which the card holds
+/// (`math_cuda::whir::commit_joint`): the tree, kept there, and its root.
+/// `None` when the card declines (the caller commits on the host).
+#[cfg(feature = "cuda")]
+pub(crate) fn commit_joint(
+    codewords: &[DeviceCodeword],
+    log_folding: usize,
+    hash: crate::whir_hash::DeviceHashKey,
+    leaves: crate::whir_commit::LeafOrder,
+) -> Option<(JointTree, [u8; 32])> {
+    let held: Vec<&math_cuda::whir::DeviceCodeword> = codewords.iter().map(|c| &c.0).collect();
+    match math_cuda::whir::commit_joint(
+        &held,
+        log_folding,
+        hash.into_math_cuda(),
+        placement(leaves),
+    ) {
+        Ok((tree, root)) => {
+            COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+            Some((JointTree(tree), root))
+        }
+        Err(err) => {
+            let log = codewords
+                .first()
+                .map_or(0, |c| c.0.elements().trailing_zeros() as usize);
+            note_commit_error("joint", log, 0, &err);
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn commit_joint(
+    codewords: &[DeviceCodeword],
+    _log_folding: usize,
+    _hash: crate::whir_hash::DeviceHashKey,
+    _leaves: crate::whir_commit::LeafOrder,
+) -> Option<(JointTree, [u8; 32])> {
+    match codewords.first() {
+        Some(codeword) => match codeword.0 {},
+        None => None,
+    }
+}
+
+/// The dropped subtrees of a revived joint tree over `devices` (the run's
+/// codewords on the card, slot order), hashed where they lie
+/// (`math_cuda::whir::joint_block_subtrees`): one tree over the gathered
+/// leaves, the blocks' roots `dropped` levels above them.
+#[cfg(feature = "cuda")]
+pub(crate) fn joint_block_subtrees(
+    devices: &[&DeviceCodeword],
+    log_folding: usize,
+    blocks: &[usize],
+    dropped: usize,
+    hash: crate::whir_hash::DeviceHashKey,
+    leaves: crate::whir_commit::LeafOrder,
+) -> Option<Vec<[u8; 32]>> {
+    let held: Vec<&math_cuda::whir::DeviceCodeword> = devices.iter().map(|c| &c.0).collect();
+    let blocks: Vec<u64> = blocks.iter().map(|block| *block as u64).collect();
+    let bytes = math_cuda::whir::joint_block_subtrees(
+        &held,
+        log_folding,
+        &blocks,
+        dropped,
+        hash.into_math_cuda(),
+        placement(leaves),
+    )
+    .ok()?;
+    nodes_in_place(bytes)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn joint_block_subtrees(
+    devices: &[&DeviceCodeword],
+    _log_folding: usize,
+    _blocks: &[usize],
+    _dropped: usize,
+    _hash: crate::whir_hash::DeviceHashKey,
+    _leaves: crate::whir_commit::LeafOrder,
+) -> Option<Vec<[u8; 32]>> {
+    match devices.first() {
+        Some(device) => match device.0 {},
+        None => None,
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl CosetSource {
+    /// [`Self::openings`] of a joint tree over `sources` (the run's stacks in
+    /// slot order): each query's values are every stack's block end to end.
+    pub(crate) fn joint_openings<F>(
+        sources: &[&Self],
+        log_folding: usize,
+        kept: usize,
+        leaves: &[usize],
+        hash: crate::whir_hash::DeviceHashKey,
+    ) -> Option<SourceOpenings<F>>
+    where
+        F: math::field::traits::IsField + 'static,
+    {
+        let first = sources.first()?;
+        let raw: Vec<u64> = leaves.iter().map(|&leaf| leaf as u64).collect();
+        let plan = math_cuda::whir_coset::CosetPlan::new(
+            first.0.num_vars(),
+            first.0.log_blowup(),
+            log_folding,
+            kept,
+            &raw,
+        )?;
+        let in_place = coset_inplace_in_effect();
+        let stacks: Vec<&math_cuda::whir_coset::StackSlices> =
+            sources.iter().map(|s| &s.0).collect();
+        let opened = math_cuda::whir_coset::joint_coset_openings(
+            &stacks,
+            &plan,
+            &raw,
+            hash.into_math_cuda(),
+            in_place,
+        )
+        .ok()?;
+        match opened.in_place {
+            Some(kinds) => {
+                COSET_INPLACE_OPENS.fetch_add(1, Ordering::Relaxed);
+                COSET_ZERO_TILES.fetch_add(kinds.zero, Ordering::Relaxed);
+                COSET_MIXED_TILES.fetch_add(kinds.mixed, Ordering::Relaxed);
+            }
+            None if in_place => {
+                COSET_INPLACE_ASSEMBLED.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {}
+        }
+        let slots = raw
+            .iter()
+            .map(|&leaf| plan.slot_of(leaf))
+            .collect::<Option<Vec<_>>>()?;
+        let width = sources.len() << log_folding;
+        let values = values_from_raw::<F>(&opened.values, true)?;
+        COSET_OPENINGS.fetch_add(1, Ordering::Relaxed);
+        Some(SourceOpenings {
+            nodes: nodes_in_place(opened.nodes)?,
+            leaves: opened.leaves,
+            positions: (0..plan.classes().len())
+                .map(|q| plan.block_position(q))
+                .collect(),
+            slots,
+            values: values.chunks_exact(width).map(<[_]>::to_vec).collect(),
+        })
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl CosetSource {
+    pub(crate) fn joint_openings<F>(
+        sources: &[&Self],
+        _log_folding: usize,
+        _kept: usize,
+        _leaves: &[usize],
+        _hash: crate::whir_hash::DeviceHashKey,
+    ) -> Option<SourceOpenings<F>>
+    where
+        F: math::field::traits::IsField + 'static,
+    {
+        match sources.first() {
+            Some(source) => match source.0 {},
+            None => None,
+        }
+    }
+}
+
+/// Round-0 leaf permutations the card's commits paid (`⌈felts / 12⌉` a leaf,
+/// a plain or a joint tree); 0 with no card.
+pub fn commit_leaf_perms() -> u64 {
+    #[cfg(feature = "cuda")]
+    {
+        math_cuda::whir::commit_leaf_perms()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0
     }
 }
 

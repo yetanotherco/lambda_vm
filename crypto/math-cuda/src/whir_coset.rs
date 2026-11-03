@@ -1070,6 +1070,130 @@ pub fn coset_openings(
     })
 }
 
+/// [`coset_openings`] of a JOINT round-0 tree over a grouped run's `stacks`
+/// (2–4, in slot order): each stack's cosets evaluated as there, the joint
+/// leaves hashed over the `stacks.len()` buffers (`whir::launch_joint_leaves`)
+/// and the inner levels built, so each block's subtree is the committed joint
+/// one; the queried values are every stack's block, end to end, a query.
+pub fn joint_coset_openings(
+    stacks: &[&StackSlices],
+    plan: &CosetPlan,
+    queried: &[u64],
+    hash: crate::DeviceHash,
+    in_place: bool,
+) -> Result<CosetOpenings> {
+    ensure!(hash == crate::DeviceHash::Poseidon1);
+    ensure!((2..=4).contains(&stacks.len()));
+    ensure!(
+        stacks
+            .iter()
+            .all(|stack| plan.num_vars == stack.num_vars && plan.log_blowup == stack.log_blowup)
+    );
+    let be = backend()?;
+    let m = module()?;
+    let stream = be.next_stream();
+    let log_block = plan.log_coset - plan.kept;
+    let block = 1usize << log_block;
+    let leaves = (plan.classes.len() << plan.kept).next_power_of_two().max(2);
+    let mut at = Vec::with_capacity(queried.len());
+    for &leaf in queried {
+        let (q, r) = plan.slot_of(leaf).ok_or_else(crate::invalid_value)?;
+        at.push(((q << plan.kept) | r) as u64);
+    }
+    let mut outs = Vec::with_capacity(stacks.len());
+    let mut kinds_sum: Option<TileKinds> = Some(TileKinds::default());
+    for stack in stacks {
+        let parts = if in_place {
+            stack.parts_in_place()
+        } else {
+            None
+        };
+        let (tiles, kinds) = match &parts {
+            Some(parts) => (
+                Tiles::InPlace {
+                    data: stack.buffer.as_ref(),
+                    parts,
+                },
+                Some(parts.tile_kinds(plan.num_vars, plan.tile_levels)),
+            ),
+            None => (Tiles::Assembled(stack.assemble(&stream)?), None),
+        };
+        kinds_sum = match (kinds_sum, kinds) {
+            (Some(sum), Some(k)) => Some(TileKinds {
+                full: sum.full + k.full,
+                zero: sum.zero + k.zero,
+                mixed: sum.mixed + k.mixed,
+            }),
+            _ => None,
+        };
+        let mut laps = Laps {
+            split: None,
+            clock: std::time::Instant::now(),
+        };
+        outs.push(evaluate_from(
+            &stream,
+            m,
+            tiles,
+            plan,
+            &mut laps,
+            leaves as u64,
+            leaves * block,
+        )?);
+    }
+
+    let total_nodes = crate::tree_nodes(hash, leaves);
+    // SAFETY: every byte is written before it is read — the leaves by the
+    // kernel below, the inner nodes by the level loop after it.
+    let mut nodes = unsafe { alloc_or_trim::<u8>(&stream, total_nodes * 32) }?;
+    let leaves_offset = crate::leaves_offset(hash, leaves) * 32;
+    {
+        let mut region = nodes.slice_mut(leaves_offset..leaves_offset + leaves * 32);
+        let buffers: Vec<&CudaSlice<u64>> = outs.iter().collect();
+        crate::whir::launch_joint_leaves(&stream, &buffers, leaves, log_block, 0, &mut region)?;
+    }
+    crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes, leaves, hash)?;
+    let nodes_host = crate::readback::clone_dtoh(&stream, &nodes)?;
+
+    let index_dev = htod_or_trim(&stream, &at)?;
+    let leaves_u64 = leaves as u64;
+    let block_u64 = block as u64;
+    let mut per_stack = Vec::with_capacity(stacks.len());
+    for out in &outs {
+        // SAFETY: the gather writes every value it is sized for.
+        let mut values = unsafe { alloc_or_trim::<u64>(&stream, queried.len().max(1) * block) }?;
+        if !queried.is_empty() {
+            let queries = queried.len() as u64;
+            let limbs = 1u64;
+            unsafe {
+                stream
+                    .launch_builder(&be.gather_cosets)
+                    .arg(out)
+                    .arg(&index_dev)
+                    .arg(&queries)
+                    .arg(&leaves_u64)
+                    .arg(&block_u64)
+                    .arg(&limbs)
+                    .arg(&mut values)
+                    .launch(LaunchConfig::for_num_elems((queried.len() * block) as u32))?;
+            }
+        }
+        per_stack.push(crate::readback::clone_dtoh(&stream, &values)?);
+    }
+    stream.synchronize()?;
+    let mut values = Vec::with_capacity(queried.len() * block * stacks.len());
+    for q in 0..queried.len() {
+        for stack in &per_stack {
+            values.extend_from_slice(&stack[q * block..(q + 1) * block]);
+        }
+    }
+    Ok(CosetOpenings {
+        nodes: nodes_host,
+        leaves,
+        values,
+        in_place: kinds_sum,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

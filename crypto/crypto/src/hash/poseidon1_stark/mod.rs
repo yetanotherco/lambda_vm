@@ -68,6 +68,27 @@ pub fn linear_hash(felts: &[Fp]) -> Digest {
     linear_hash_from(felts, leaf_capacity(felts.len()))
 }
 
+/// The first block's capacity of a JOINT leaf: `blocks ≥ 2` equal blocks laid
+/// end to end, `num_felts` felts in all — `[num_felts, LEAF_DOMAIN, blocks, 0]`.
+/// Every other leaf has zero in that lane ([`leaf_capacity`]), so a joint leaf
+/// never shares a first block with a leaf of the same width read as one block
+/// (a successor tree's leaf of `num_felts / 3` extension values), nor with a
+/// joint leaf of another block count.
+pub fn joint_leaf_capacity(num_felts: usize, blocks: usize) -> Digest {
+    [
+        Fp::from(num_felts as u64),
+        Fp::from(LEAF_DOMAIN),
+        Fp::from(blocks as u64),
+        Fp::zero(),
+    ]
+}
+
+/// [`linear_hash`] of a joint leaf of `blocks` blocks: the same chain over the
+/// blocks' felts concatenated, its first capacity [`joint_leaf_capacity`].
+pub fn joint_linear_hash(felts: &[Fp], blocks: usize) -> Digest {
+    linear_hash_from(felts, joint_leaf_capacity(felts.len(), blocks))
+}
+
 /// ZisK's own leaf hash: [`linear_hash`] with a zero first capacity. The
 /// reference ZisK's known-answer vectors pin; no commitment uses it.
 pub fn zisk_linear_hash(felts: &[Fp]) -> Digest {

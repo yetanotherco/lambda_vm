@@ -92,6 +92,15 @@ where
     /// read from it and from the leaves under one kept node, re-hashed from
     /// the codeword. `None` on every commitment that kept its tree.
     top: Option<TreeTop>,
+    /// The run's other round-0 codewords when the tree is JOINT
+    /// (`whir_chain::Round0Trees::One`): leaf `j` hashes this codeword's block
+    /// `j` and theirs, end to end, under the joint tag
+    /// ([`WhirHash::joint_leaf`]). Empty on every other commitment.
+    others: Vec<Codeword<F>>,
+    /// A joint tree the card built over every codeword: no single codeword's
+    /// tree, so its node buffer is held here until the commitment is retired
+    /// or opened. `None` on every other commitment.
+    joint_tree: Option<crate::gpu::JointTree>,
 }
 
 /// Paths served from a kept tree top, and the leaves re-hashed on the host to
@@ -288,6 +297,8 @@ pub struct RetiredCommitment {
     log_folding: usize,
     log_domain_size: usize,
     leaves: LeafOrder,
+    /// Codeword blocks a leaf holds: 1, or a joint tree's run width.
+    blocks: usize,
 }
 
 impl RetiredCommitment {
@@ -309,6 +320,11 @@ impl RetiredCommitment {
         self.log_domain_size
     }
 
+    /// Codeword blocks a leaf holds: 1, or a joint tree's run width.
+    pub fn blocks(&self) -> usize {
+        self.blocks
+    }
+
     /// The commitment again, over `codeword` — which must be the committed
     /// codeword. A wrong one is caught when a path is read: its leaves then do
     /// not hash to the kept node ([`Error::RecomputedCodewordMismatch`]), so no
@@ -320,12 +336,39 @@ impl RetiredCommitment {
     where
         FieldElement<F>: AsBytes + Sync + Send,
     {
-        if codeword.len() != 1usize << self.log_domain_size {
+        self.revive_joint::<F, H>(vec![codeword])
+    }
+
+    /// [`Self::revive`] of a joint tree: `codewords` the run's, in slot order,
+    /// one a block of a leaf. A wrong count is refused here; a wrong codeword
+    /// when a path is read, as for one.
+    pub fn revive_joint<F: IsField + 'static, H: WhirHash>(
+        self,
+        codewords: Vec<Codeword<F>>,
+    ) -> Result<CodewordCommitment<F, H>, Error>
+    where
+        FieldElement<F>: AsBytes + Sync + Send,
+    {
+        if codewords.len() != self.blocks {
+            return Err(Error::JointTreeWidth {
+                expected: self.blocks,
+                got: codewords.len(),
+            });
+        }
+        if let Some(codeword) = codewords
+            .iter()
+            .find(|codeword| codeword.len() != 1usize << self.log_domain_size)
+        {
             return Err(Error::CodewordTooShort {
                 coefficients: codeword.len(),
                 domain: 1usize << self.log_domain_size,
             });
         }
+        let mut codewords = codewords.into_iter();
+        let codeword = codewords.next().ok_or(Error::JointTreeWidth {
+            expected: self.blocks,
+            got: 0,
+        })?;
         Ok(CodewordCommitment {
             tree: Tree::<F, H>::from_root(self.root),
             codeword,
@@ -333,6 +376,8 @@ impl RetiredCommitment {
             log_domain_size: self.log_domain_size,
             leaves: self.leaves,
             top: Some(self.top),
+            others: codewords.collect(),
+            joint_tree: None,
         })
     }
 }
@@ -545,6 +590,8 @@ where
                 log_domain_size,
                 leaves: LeafOrder::Natural,
                 top: None,
+                others: Vec::new(),
+                joint_tree: None,
             });
         }
         Self::from_codeword_on_host(codeword, log_folding)
@@ -613,6 +660,8 @@ where
             log_domain_size,
             leaves,
             top: None,
+            others: Vec::new(),
+            joint_tree: None,
         })
     }
 
@@ -643,6 +692,8 @@ where
             log_domain_size,
             leaves: LeafOrder::Natural,
             top: None,
+            others: Vec::new(),
+            joint_tree: None,
         })
     }
 
@@ -691,6 +742,163 @@ where
             log_domain_size,
             leaves,
             top: None,
+            others: Vec::new(),
+            joint_tree: None,
+        })
+    }
+
+    /// A JOINT round-0 tree over `codewords` (`whir_chain::Round0Trees::One`),
+    /// the leaves hashed here: leaf `j` is every codeword's block `j`, in slot
+    /// order, end to end, under `H`'s joint leaf ([`WhirHash::joint_leaf`]),
+    /// placed in `leaves`' order. One codeword is today's tree
+    /// ([`Self::from_codeword_on_host_in`]).
+    pub fn from_codewords_on_host_joint(
+        codewords: Vec<Vec<FieldElement<F>>>,
+        log_folding: usize,
+        leaves: LeafOrder,
+    ) -> Result<Self, Error> {
+        let blocks = codewords.len();
+        let mut codewords = codewords.into_iter();
+        let first = codewords.next().ok_or(Error::JointTreeWidth {
+            expected: 2,
+            got: 0,
+        })?;
+        let others: Vec<Vec<FieldElement<F>>> = codewords.collect();
+        if others.is_empty() {
+            return Self::from_codeword_on_host_in(first, log_folding, leaves);
+        }
+        if !first.len().is_power_of_two() {
+            return Err(Error::NotPowerOfTwo(first.len()));
+        }
+        if let Some(other) = others.iter().find(|other| other.len() != first.len()) {
+            return Err(Error::CodewordTooShort {
+                coefficients: other.len(),
+                domain: first.len(),
+            });
+        }
+        let log_domain_size = first.len().trailing_zeros() as usize;
+        if log_folding > log_domain_size {
+            return Err(Error::ColumnTallerThanStack {
+                column_vars: log_folding,
+                n_stack: log_domain_size,
+            });
+        }
+        let num_leaves = 1usize << (log_domain_size - log_folding);
+        let block = 1usize << log_folding;
+        #[cfg(test)]
+        let fault = joint_tag_fault::get();
+        let hash_leaf = |buffer: &mut Vec<FieldElement<F>>, j: usize| {
+            buffer.clear();
+            for codeword in std::iter::once(&first).chain(&others) {
+                buffer.extend((0..block).map(|t| codeword[j + t * num_leaves].clone()));
+            }
+            #[cfg(test)]
+            match fault {
+                joint_tag_fault::Fault::None => {}
+                joint_tag_fault::Fault::Plain => return Some(Backend::<F, H>::hash_data(buffer)),
+                joint_tag_fault::Fault::OtherCount => return H::joint_leaf(buffer, blocks + 1),
+            }
+            H::joint_leaf(buffer, blocks)
+        };
+        #[cfg(feature = "parallel")]
+        let hashed: Option<Vec<Commitment>> = (0..num_leaves)
+            .into_par_iter()
+            .map_init(|| Vec::with_capacity(blocks * block), hash_leaf)
+            .collect();
+        #[cfg(not(feature = "parallel"))]
+        let hashed: Option<Vec<Commitment>> = {
+            let mut buffer = Vec::with_capacity(blocks * block);
+            (0..num_leaves).map(|j| hash_leaf(&mut buffer, j)).collect()
+        };
+        let hashed = hashed.ok_or(Error::JointTreeUnsupported {
+            group: crate::whir_chain::GroupFold::Indexed,
+            hash: H::NAME,
+        })?;
+        let depth = log_domain_size - log_folding;
+        let hashed = match leaves {
+            LeafOrder::Natural => hashed,
+            LeafOrder::Coset => (0..num_leaves)
+                .map(|p| hashed[leaves.position(p, depth)])
+                .collect(),
+        };
+        let tree = Tree::<F, H>::build_from_hashed_leaves(hashed).ok_or(Error::EmptyPolynomial)?;
+        Ok(Self {
+            tree,
+            codeword: Codeword::Host(first),
+            log_folding,
+            log_domain_size,
+            leaves,
+            top: None,
+            others: others.into_iter().map(Codeword::Host).collect(),
+            joint_tree: None,
+        })
+    }
+
+    /// A JOINT round-0 tree the card built over `codewords`, which it holds
+    /// ([`crate::gpu::commit_joint`]): only the root comes home, and the node
+    /// buffer stays on the card for the retire or the paths.
+    pub fn from_device_joint(
+        codewords: Vec<crate::gpu::DeviceCodeword>,
+        tree: crate::gpu::JointTree,
+        root: Commitment,
+        log_folding: usize,
+        leaves: LeafOrder,
+    ) -> Result<Self, Error> {
+        let mut codewords = codewords.into_iter();
+        let first = codewords.next().ok_or(Error::JointTreeWidth {
+            expected: 2,
+            got: 0,
+        })?;
+        let others: Vec<Codeword<F>> = codewords.map(Codeword::Device).collect();
+        let elements = first.elements();
+        if !elements.is_power_of_two() {
+            return Err(Error::NotPowerOfTwo(elements));
+        }
+        if let Some(other) = others.iter().find(|other| other.len() != elements) {
+            return Err(Error::CodewordTooShort {
+                coefficients: other.len(),
+                domain: elements,
+            });
+        }
+        let log_domain_size = elements.trailing_zeros() as usize;
+        if log_folding > log_domain_size {
+            return Err(Error::ColumnTallerThanStack {
+                column_vars: log_folding,
+                n_stack: log_domain_size,
+            });
+        }
+        Ok(Self {
+            tree: Tree::<F, H>::from_root(root),
+            codeword: Codeword::Device(first),
+            log_folding,
+            log_domain_size,
+            leaves,
+            top: None,
+            others,
+            joint_tree: Some(tree),
+        })
+    }
+
+    /// Codeword blocks one leaf holds: 1, or a joint tree's run width.
+    pub fn blocks(&self) -> usize {
+        1 + self.others.len()
+    }
+
+    /// Every codeword a leaf reads, in slot order: this one, then a joint
+    /// tree's others.
+    pub fn codewords(&self) -> impl Iterator<Item = &Codeword<F>> {
+        std::iter::once(&self.codeword).chain(&self.others)
+    }
+
+    /// One leaf's hash: the backend's leaf over a block, or the joint leaf
+    /// over a joint tree's blocks end to end.
+    fn leaf_hash(&self, values: &Vec<FieldElement<F>>) -> Result<Commitment, Error> {
+        if self.others.is_empty() {
+            return Ok(Backend::<F, H>::hash_data(values));
+        }
+        H::joint_leaf(values, self.blocks()).ok_or(Error::JointTreeUnsupported {
+            group: crate::whir_chain::GroupFold::Indexed,
+            hash: H::NAME,
         })
     }
 
@@ -771,6 +979,7 @@ where
         drop: TreeDrop,
         cap: crypto::merkle_tree::cap::CapPolicy,
     ) -> Result<RetiredCommitment, Error> {
+        let blocks = self.blocks();
         if let Some(top) = self.top {
             // Already a revived one: its top is what it keeps.
             return Ok(RetiredCommitment {
@@ -779,6 +988,7 @@ where
                 log_folding: self.log_folding,
                 log_domain_size: self.log_domain_size,
                 leaves: self.leaves,
+                blocks,
             });
         }
         let depth = self.depth();
@@ -791,6 +1001,14 @@ where
         let keep = kept_top_nodes(self.num_leaves(), depth, dropped, arity);
         let nodes =
             match &self.codeword {
+                // A joint tree is the card's node buffer, not a codeword's.
+                Codeword::Device(_) if self.joint_tree.is_some() => self
+                    .joint_tree
+                    .as_ref()
+                    .and_then(|tree| tree.top_nodes(keep))
+                    .ok_or(Error::DeviceFailed {
+                        stage: "retiring a joint commitment",
+                    })?,
                 Codeword::Device(device) => device
                     .top_nodes(self.log_folding, keep, H::DEVICE)
                     .ok_or(Error::DeviceFailed {
@@ -822,6 +1040,7 @@ where
             log_folding: self.log_folding,
             log_domain_size: self.log_domain_size,
             leaves: self.leaves,
+            blocks,
         })
     }
 
@@ -842,7 +1061,11 @@ where
         }
         if let Codeword::Source(source) = &self.codeword {
             let started = std::time::Instant::now();
-            let paths = self.source_top_paths(source, top, indices);
+            let paths = if self.others.is_empty() {
+                self.source_top_paths(source, top, indices)
+            } else {
+                self.joint_source_top_paths(top, indices)
+            };
             TOP_DEVICE_CALLS.fetch_add(1, Relaxed);
             TOP_DEVICE_NANOS.fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
             return paths;
@@ -875,10 +1098,139 @@ where
         top: &TreeTop,
         indices: &[usize],
     ) -> Option<Result<Vec<Proof<Commitment>>, Error>> {
+        if !self.others.is_empty() {
+            let devices: Vec<&crate::gpu::DeviceCodeword> = self
+                .codewords()
+                .map(Codeword::device)
+                .collect::<Option<_>>()?;
+            return self.joint_card_top_paths_over(&devices, top, indices);
+        }
         let Codeword::Device(device) = &self.codeword else {
             return None;
         };
         self.card_top_paths_over(device, top, indices)
+    }
+
+    /// [`Self::card_top_paths_over`] of a joint tree over `devices`, the run's
+    /// codewords on the card in slot order: the queried blocks' joint leaves
+    /// hashed where the codewords lie (`gpu::joint_block_subtrees`).
+    fn joint_card_top_paths_over(
+        &self,
+        devices: &[&crate::gpu::DeviceCodeword],
+        top: &TreeTop,
+        indices: &[usize],
+    ) -> Option<Result<Vec<Proof<Commitment>>, Error>> {
+        let dropped = top.dropped;
+        let block_bits = self.block_bits(top);
+        let span = 1usize << block_bits;
+        let mut blocks: Vec<usize> = indices.iter().map(|index| index >> block_bits).collect();
+        blocks.sort_unstable();
+        blocks.dedup();
+        let nodes = crate::gpu::joint_block_subtrees(
+            devices,
+            self.log_folding,
+            &blocks,
+            dropped,
+            H::DEVICE,
+            self.leaves,
+        )?;
+        let leaves = (blocks.len() << block_bits).next_power_of_two().max(2);
+        if nodes.len() != Self::gathered_nodes(leaves) {
+            return None;
+        }
+        TOP_PATH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TOP_LEAVES_REHASHED.fetch_add(
+            (blocks.len() << block_bits) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let slots: Vec<(usize, usize)> = indices
+            .iter()
+            .map(|&index| {
+                let k = blocks
+                    .binary_search(&(index >> block_bits))
+                    .expect("every queried block was gathered");
+                (k, index & (span - 1))
+            })
+            .collect();
+        Some(self.gathered_paths(top, &nodes, leaves, &blocks, indices, &slots))
+    }
+
+    /// [`Self::source_top_paths`] of a joint tree held as its run's stacks:
+    /// each queried coset of every stack evaluated on the card and the joint
+    /// leaves hashed there (`gpu::CosetSource::joint_openings`), each block's
+    /// root checked against its kept node; the queried values, every block end
+    /// to end, kept on the first source for the opening that asked. A plan the
+    /// kernels do not take, or a card that declines, re-encodes every codeword
+    /// from its stack (counted) and re-hashes over them.
+    fn joint_source_top_paths(
+        &self,
+        top: &TreeTop,
+        indices: &[usize],
+    ) -> Result<Vec<Proof<Commitment>>, Error> {
+        let sources: Vec<&SourceCodeword<F>> = self
+            .codewords()
+            .map(Codeword::source)
+            .collect::<Option<_>>()
+            .ok_or(Error::DeviceFailed {
+                stage: "a joint tree's codewords held in different places",
+            })?;
+        let depth = self.depth();
+        let block_bits = self.block_bits(top);
+        let wanted: Vec<usize> = indices
+            .iter()
+            .map(|&index| self.leaves.position(index, depth))
+            .collect();
+        let stacks: Vec<&crate::gpu::CosetSource> = sources.iter().map(|s| s.source()).collect();
+        if let Some(opened) = crate::gpu::CosetSource::joint_openings::<F>(
+            &stacks,
+            self.log_folding,
+            block_bits,
+            &wanted,
+            H::DEVICE,
+        ) {
+            TOP_PATH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            TOP_LEAVES_REHASHED.fetch_add(
+                (opened.positions.len() << block_bits) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let paths = self.gathered_paths(
+                top,
+                &opened.nodes,
+                opened.leaves,
+                &opened.positions,
+                indices,
+                &opened.slots,
+            )?;
+            sources[0].keep(wanted.into_iter().zip(opened.values).collect());
+            return Ok(paths);
+        }
+        let devices = stacks
+            .iter()
+            .map(|stack| stack.encode())
+            .collect::<Option<Vec<_>>>()
+            .ok_or(Error::DeviceFailed {
+                stage: "re-encoding a joint round-0 tree's codewords from their stacks",
+            })?;
+        let borrowed: Vec<&crate::gpu::DeviceCodeword> = devices.iter().collect();
+        let paths = self
+            .joint_card_top_paths_over(&borrowed, top, indices)
+            .ok_or(Error::DeviceFailed {
+                stage: "re-hashing a joint tree's re-encoded codewords",
+            })??;
+        let block = 1usize << self.log_folding;
+        let mut values: Vec<Vec<FieldElement<F>>> = vec![Vec::new(); wanted.len()];
+        for device in &devices {
+            let blocks = device
+                .cosets::<F>(&wanted, self.num_leaves(), block)
+                .ok_or(Error::DeviceFailed {
+                    stage: "gathering a joint tree's re-encoded codewords",
+                })?;
+            for (row, b) in values.iter_mut().zip(blocks) {
+                row.extend(b);
+            }
+        }
+        sources[0].keep(wanted.into_iter().zip(values).collect());
+        Ok(paths)
     }
 
     /// [`Self::card_top_paths`] over `device`, this commitment's codeword
@@ -1118,8 +1470,8 @@ where
             let block = blocks[k];
             let hashed: Vec<Commitment> = values[k * span..(k + 1) * span]
                 .iter()
-                .map(Backend::<F, H>::hash_data)
-                .collect();
+                .map(|values| self.leaf_hash(values))
+                .collect::<Result<_, _>>()?;
             let subtree =
                 Tree::<F, H>::build_from_hashed_leaves(hashed).ok_or(Error::EmptyPolynomial)?;
             if top.nodes.get(frontier + block) != Some(&subtree.root) {
@@ -1211,10 +1563,37 @@ where
         Ok(())
     }
 
-    /// The fold blocks of `indices`, from wherever the codeword is.
+    /// The fold blocks of `indices`, from wherever the codeword is: a joint
+    /// tree's leaves, every codeword's block end to end.
     fn gather(&self, indices: &[usize]) -> Result<Vec<Vec<FieldElement<F>>>, Error> {
+        if self.others.is_empty() {
+            return self.gather_from(&self.codeword, indices);
+        }
+        // A joint tree held as its stacks: the paths kept every block of a
+        // leaf, end to end, on the first source.
+        if let Codeword::Source(source) = &self.codeword {
+            return source.opened(indices).ok_or(Error::QueryOutOfRange {
+                index: 0,
+                bound: self.num_leaves(),
+            });
+        }
+        let mut leaves: Vec<Vec<FieldElement<F>>> = vec![Vec::new(); indices.len()];
+        for codeword in self.codewords() {
+            for (leaf, block) in leaves.iter_mut().zip(self.gather_from(codeword, indices)?) {
+                leaf.extend(block);
+            }
+        }
+        Ok(leaves)
+    }
+
+    /// The fold blocks of `indices` of one codeword.
+    fn gather_from(
+        &self,
+        codeword: &Codeword<F>,
+        indices: &[usize],
+    ) -> Result<Vec<Vec<FieldElement<F>>>, Error> {
         let num_leaves = self.num_leaves();
-        match &self.codeword {
+        match codeword {
             Codeword::Host(values) => Ok(indices
                 .iter()
                 .map(|index| {
@@ -1263,7 +1642,6 @@ where
         cap_height: usize,
         owner: bool,
     ) -> Result<Vec<CosetOpening<F>>, Error> {
-        let num_leaves = self.num_leaves();
         // ★ ONE CALL, ONE DEVICE TREE REBUILD. Counted rather than inferred:
         // `whir_round::prove` opens the current commitment AND its successor,
         // so a non-final round passes here twice, and `check_closure`'s arm F
@@ -1278,32 +1656,10 @@ where
         let proofs = self.paths_capped(indices, cap_height, owner)?;
         crate::whir_split::add(&crate::whir_split::TREE_REBUILD, __wq_tree);
 
-        let block = 1usize << self.log_folding;
         let __wq_gather = crate::whir_split::mark();
-        let blocks: Vec<Vec<FieldElement<F>>> = match &self.codeword {
-            Codeword::Host(values) => indices
-                .iter()
-                .map(|index| {
-                    coset_of(*index, self.log_domain_size, self.log_folding)
-                        .into_iter()
-                        .map(|p| values[p].clone())
-                        .collect()
-                })
-                .collect(),
-            Codeword::Device(device) => {
-                device
-                    .cosets(indices, num_leaves, block)
-                    .ok_or(Error::QueryOutOfRange {
-                        index: 0,
-                        bound: num_leaves,
-                    })?
-            }
-            // The paths above evaluated and kept these blocks.
-            Codeword::Source(source) => source.opened(indices).ok_or(Error::QueryOutOfRange {
-                index: 0,
-                bound: num_leaves,
-            })?,
-        };
+        // A source's blocks are the ones the paths above evaluated and kept;
+        // a joint tree's leaves are every codeword's block end to end.
+        let blocks = self.gather(indices)?;
 
         crate::whir_split::add(&crate::whir_split::COSET_GATHER, __wq_gather);
 
@@ -1341,6 +1697,22 @@ where
             bound: num_leaves,
         };
         match &self.codeword {
+            // A joint tree the card built: its paths come from its own nodes.
+            Codeword::Device(_) if self.joint_tree.is_some() => {
+                if let Some(&bad) = indices.iter().find(|index| **index >= num_leaves) {
+                    return Err(out_of_range(bad));
+                }
+                Ok(self
+                    .joint_tree
+                    .as_ref()
+                    .and_then(|tree| tree.paths(indices))
+                    .ok_or(Error::DeviceFailed {
+                        stage: "opening a joint tree's paths",
+                    })?
+                    .into_iter()
+                    .map(|merkle_path| Proof { merkle_path })
+                    .collect())
+            }
             Codeword::Device(device) if !device.placed_in(self.leaves) => {
                 Err(Error::DeviceFailed {
                     stage: "a device tree in another leaf order",
@@ -1436,6 +1808,27 @@ where
             (self.top_paths(top, indices)?, Some(cap))
         } else if owner {
             match &self.codeword {
+                Codeword::Device(_) if self.joint_tree.is_some() => {
+                    let num_leaves = self.num_leaves();
+                    if let Some(&bad) = indices.iter().find(|index| **index >= num_leaves) {
+                        return Err(Error::QueryOutOfRange {
+                            index: bad,
+                            bound: num_leaves,
+                        });
+                    }
+                    let (paths, cap) = self
+                        .joint_tree
+                        .as_ref()
+                        .and_then(|tree| tree.paths_and_cap(indices, cap_height))
+                        .ok_or(Error::DeviceFailed {
+                            stage: "opening a joint tree's paths and cap",
+                        })?;
+                    let proofs: Vec<Proof<Commitment>> = paths
+                        .into_iter()
+                        .map(|merkle_path| Proof { merkle_path })
+                        .collect();
+                    (proofs, Some(cap))
+                }
                 Codeword::Device(device) if !device.placed_in(self.leaves) => {
                     return Err(Error::DeviceFailed {
                         stage: "a device tree in another leaf order",
@@ -1515,6 +1908,13 @@ where
             index,
             bound: num_leaves,
         })?;
+        if !self.others.is_empty() {
+            let values = self.gather(&[index])?.pop().ok_or(Error::QueryOutOfRange {
+                index,
+                bound: num_leaves,
+            })?;
+            return Ok(CosetOpening { values, proof });
+        }
         let values = match &self.codeword {
             Codeword::Host(values) => coset_of(index, self.log_domain_size, self.log_folding)
                 .into_iter()
@@ -1593,6 +1993,64 @@ where
     FieldElement<F>: AsBytes + Sync + Send,
 {
     check.verify::<Backend<F, H>>(siblings, index, Backend::<F, H>::hash_data(&opening.values))
+}
+
+/// [`verify_opening_capped`] of a JOINT tree's opening: its values are
+/// `blocks` coset blocks end to end, hashed under `H`'s joint leaf
+/// ([`WhirHash::joint_leaf`]). `false` under a hash with no joint leaf.
+pub fn verify_joint_opening_capped<F, H>(
+    check: &CappedRoot<'_, Commitment>,
+    index: usize,
+    opening: &CosetOpening<F>,
+    siblings: &[Commitment],
+    blocks: usize,
+) -> bool
+where
+    F: IsField + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    match H::joint_leaf(&opening.values, blocks) {
+        Some(leaf) => check.verify::<Backend<F, H>>(siblings, index, leaf),
+        None => false,
+    }
+}
+
+/// Test only: a joint tree whose leaves a test hashes under the wrong tag, to
+/// show the verifier's joint tag is load-bearing. Read once on the committing
+/// thread, so a test that sets it moves no other test's tree.
+#[cfg(test)]
+pub(crate) mod joint_tag_fault {
+    /// Which wrong tag the committed leaves carry.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) enum Fault {
+        #[default]
+        None,
+        /// The plain leaf's tag: no block count.
+        Plain,
+        /// One block more than the leaf holds.
+        OtherCount,
+    }
+
+    std::thread_local! {
+        static FAULT: std::cell::Cell<Fault> = const { std::cell::Cell::new(Fault::None) };
+    }
+
+    pub(crate) fn get() -> Fault {
+        FAULT.with(std::cell::Cell::get)
+    }
+
+    /// Runs `f` under `fault`, restoring the previous one after.
+    pub(crate) fn with<R>(fault: Fault, f: impl FnOnce() -> R) -> R {
+        struct Restore(Fault);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FAULT.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(FAULT.with(|c| c.replace(fault)));
+        f()
+    }
 }
 
 /// One level of a block's fold.

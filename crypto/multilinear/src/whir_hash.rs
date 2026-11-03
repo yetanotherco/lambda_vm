@@ -170,6 +170,18 @@ pub trait WhirHash: Copy + Clone + Default + Send + Sync + 'static {
 
     /// A fresh sponge: what a block proof's statement is absorbed into.
     fn sponge() -> Self::Sponge;
+
+    /// The leaf of a joint round-0 tree (`whir_chain::Round0Trees::One`):
+    /// `values` is `blocks` equal coset blocks laid end to end, hashed under a
+    /// tag that carries the block count. `None` under a hash with no joint
+    /// leaf (`whir_chain::check_round0_trees` refuses such a format first).
+    fn joint_leaf<F>(_values: &[FieldElement<F>], _blocks: usize) -> Option<Commitment>
+    where
+        F: IsField + 'static,
+        FieldElement<F>: AsBytes + Sync + Send,
+    {
+        None
+    }
 }
 
 /// The keccak-256 configuration — the default everywhere on this path, and
@@ -258,6 +270,18 @@ impl WhirHash for P1Whir {
 
     fn sponge() -> Self::Sponge {
         P1Transcript::new()
+    }
+
+    /// `poseidon1_stark::joint_linear_hash` over the values' felts: the
+    /// leaf's width and its block count in the first capacity.
+    fn joint_leaf<F>(values: &[FieldElement<F>], blocks: usize) -> Option<Commitment>
+    where
+        F: IsField + 'static,
+        FieldElement<F>: AsBytes + Sync + Send,
+    {
+        Some(crypto::merkle_tree::backends::p1::joint_leaf(
+            values, blocks,
+        ))
     }
 }
 

@@ -571,6 +571,43 @@ __device__ __forceinline__ void zisk_leaf(uint64_t num_felts, Load load, uint64_
     for (int i = 0; i < DIGEST; ++i) digest[i] = s[i];
 }
 
+// The JOINT leaf (host oracle `poseidon1_stark::joint_linear_hash`): `zisk_leaf`
+// under the tag with the block count in the lane after the domain,
+// [num_felts, DOMAIN_LEAF, blocks, 0]. A separate body, so the plain leaf's
+// code is untouched.
+template <int V, typename Load>
+__device__ __forceinline__ void joint_leaf(uint64_t num_felts, uint64_t blocks, Load load,
+                                           uint64_t digest[DIGEST]) {
+    uint64_t s[WIDTH];
+#pragma unroll
+    for (int i = 0; i < WIDTH; ++i) s[i] = 0;
+    s[CAP_PAD_LANE] = num_felts;
+    s[CAP_DOMAIN_LANE] = DOMAIN_LEAF;
+    s[CAP_DOMAIN_LANE + 1] = blocks;
+    uint64_t t = 0;
+#pragma unroll 1
+    for (; t + RATE <= num_felts; t += RATE) {
+        if (t > 0) {
+#pragma unroll
+            for (int i = 0; i < DIGEST; ++i) s[RATE + i] = s[i];
+        }
+#pragma unroll
+        for (int k = 0; k < RATE; ++k) s[k] = load(t + k);
+        permute<V>(s);
+    }
+    if (t < num_felts) {
+        if (t > 0) {
+#pragma unroll
+            for (int i = 0; i < DIGEST; ++i) s[RATE + i] = s[i];
+        }
+#pragma unroll
+        for (int k = 0; k < RATE; ++k) s[k] = (t + k < num_felts) ? load(t + k) : 0;
+        permute<V>(s);
+    }
+#pragma unroll
+    for (int i = 0; i < DIGEST; ++i) digest[i] = s[i];
+}
+
 }  // namespace p1w16
 
 // ---------------------------------------------------------------------------
@@ -1174,6 +1211,32 @@ extern "C" __global__ void p1s_leaves_base_coset_rev(const uint64_t *__restrict_
     p1s::store_be(d, out + at * 32);
 }
 
+// The JOINT WHIR coset leaves of a grouped run (`whir_chain::Round0Trees::One`):
+// leaf `tid` hashes block `tid` of each of `blocks` (2..=4) base codewords, in
+// slot order, end to end — `cw_p[tid + t·num_leaves]`, `t` in `[0, 2^log_block)`
+// — under the joint tag, its digest at `bitrev(tid)` over `leaf_bits` bits (at
+// `tid` when `leaf_bits` is 0). Unused codeword slots repeat `cw0` and are never
+// read. The reads are `p1s_leaves_base_coset_rev`'s, per codeword.
+extern "C" __global__ void p1s_leaves_base_coset_joint(
+    const uint64_t *__restrict__ cw0, const uint64_t *__restrict__ cw1,
+    const uint64_t *__restrict__ cw2, const uint64_t *__restrict__ cw3, uint64_t blocks,
+    uint64_t num_leaves, uint32_t log_block, uint32_t leaf_bits, uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    const uint64_t mask = (1ull << log_block) - 1;
+    uint64_t d[p1w16::DIGEST];
+    p1w16::joint_leaf<2>(
+        blocks << log_block, blocks,
+        [&](uint64_t i) {
+            const uint64_t p = i >> log_block;
+            const uint64_t *cw = p == 0 ? cw0 : (p == 1 ? cw1 : (p == 2 ? cw2 : cw3));
+            return cw[tid + (i & mask) * num_leaves];
+        },
+        d);
+    const uint64_t at = leaf_bits == 0 ? tid : (__brevll(tid) >> (64 - leaf_bits));
+    p1s::store_be(d, out + at * 32);
+}
+
 extern "C" __global__ void p1s_leaves_ext3_coset(const uint64_t *__restrict__ codeword,
                                                  uint64_t num_leaves, uint64_t block,
                                                  uint8_t *__restrict__ out) {
@@ -1268,6 +1331,32 @@ extern "C" __global__ void p1s_leaves_base_coset_rev_lean(const uint64_t *__rest
     uint64_t d[p1w16::DIGEST];
     p1w16::zisk_leaf<4, true>(
         block, [&](uint64_t i) { return codeword[tid + i * num_leaves]; }, d);
+    const uint64_t at = leaf_bits == 0 ? tid : (__brevll(tid) >> (64 - leaf_bits));
+    p1s::store_be(d, out + at * 32);
+}
+
+// The JOINT WHIR coset leaves of a grouped run (`whir_chain::Round0Trees::One`):
+// leaf `tid` hashes block `tid` of each of `blocks` (2..=4) base codewords, in
+// slot order, end to end — `cw_p[tid + t·num_leaves]`, `t` in `[0, 2^log_block)`
+// — under the joint tag, its digest at `bitrev(tid)` over `leaf_bits` bits (at
+// `tid` when `leaf_bits` is 0). Unused codeword slots repeat `cw0` and are never
+// read. The reads are `p1s_leaves_base_coset_rev`'s, per codeword.
+extern "C" __global__ void p1s_leaves_base_coset_joint_lean(
+    const uint64_t *__restrict__ cw0, const uint64_t *__restrict__ cw1,
+    const uint64_t *__restrict__ cw2, const uint64_t *__restrict__ cw3, uint64_t blocks,
+    uint64_t num_leaves, uint32_t log_block, uint32_t leaf_bits, uint8_t *__restrict__ out) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_leaves) return;
+    const uint64_t mask = (1ull << log_block) - 1;
+    uint64_t d[p1w16::DIGEST];
+    p1w16::joint_leaf<4>(
+        blocks << log_block, blocks,
+        [&](uint64_t i) {
+            const uint64_t p = i >> log_block;
+            const uint64_t *cw = p == 0 ? cw0 : (p == 1 ? cw1 : (p == 2 ? cw2 : cw3));
+            return cw[tid + (i & mask) * num_leaves];
+        },
+        d);
     const uint64_t at = leaf_bits == 0 ? tid : (__brevll(tid) >> (64 - leaf_bits));
     p1s::store_be(d, out + at * 32);
 }

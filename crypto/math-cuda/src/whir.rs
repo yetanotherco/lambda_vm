@@ -1072,6 +1072,9 @@ impl DeviceCodeword {
             // offered for retention while it is in hand. Under `whole_trees` the
             // whole tree is offered instead, once it is built (`with_tree`).
             LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
+            if self.base && hash == crate::DeviceHash::Poseidon1 {
+                count_commit_leaves(num_leaves, 1usize << log_folding);
+            }
             self.leaf_passes.fetch_add(1, Ordering::Relaxed);
             if !whole_trees() {
                 self.capture_leaves(&nodes, leaves_offset, num_leaves, log_folding, hash);
@@ -3173,6 +3176,280 @@ pub fn commit_codeword_ext3(
     }
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes, num_leaves, hash)?;
 
+    let out = crate::readback::clone_dtoh(&stream, &nodes)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+// ===========================================================================
+// Joint round-0 trees: one tree a grouped run (`Round0Trees::One`)
+// ===========================================================================
+
+/// Round-0 leaf permutations the commits paid: a base codeword's tree and a
+/// joint tree, `⌈felts / 12⌉` a leaf. What one tree a run saves is read here.
+static COMMIT_LEAF_PERMS: AtomicU64 = AtomicU64::new(0);
+
+/// [`COMMIT_LEAF_PERMS`]'s count.
+pub fn commit_leaf_perms() -> u64 {
+    COMMIT_LEAF_PERMS.load(Ordering::Relaxed)
+}
+
+/// Counts a base round-0 leaf pass of `num_leaves` leaves of `felts` felts.
+pub(crate) fn count_commit_leaves(num_leaves: usize, felts: usize) {
+    COMMIT_LEAF_PERMS.fetch_add(
+        (num_leaves * felts.div_ceil(crate::p1_stark::RATE_FELTS)) as u64,
+        Ordering::Relaxed,
+    );
+}
+
+/// The joint leaves over `buffers` — a grouped run's 2–4 base codewords, or
+/// their gathered blocks, each `num_leaves · 2^log_block` values at stride
+/// `num_leaves` — into `out` (`num_leaves` nodes), leaf `j` at `bitrev(j)` over
+/// `leaf_bits` bits (at `j` when 0): `p1s_leaves_base_coset_joint`.
+pub(crate) fn launch_joint_leaves(
+    stream: &Arc<CudaStream>,
+    buffers: &[&CudaSlice<u64>],
+    num_leaves: usize,
+    log_block: usize,
+    leaf_bits: u32,
+    out: &mut cudarc::driver::CudaViewMut<'_, u8>,
+) -> Result<()> {
+    ensure!(
+        (2..=4).contains(&buffers.len()),
+        "a joint leaf holds 2..=4 blocks"
+    );
+    ensure!(
+        buffers.iter().all(|b| b.len() >= num_leaves << log_block),
+        "a joint leaf's codeword is short"
+    );
+    let k = crate::p1_stark::kernels()?;
+    let cw = |p: usize| buffers.get(p).copied().unwrap_or(buffers[0]);
+    let blocks = buffers.len() as u64;
+    let num_leaves_u64 = num_leaves as u64;
+    let log_block_u32 = log_block as u32;
+    unsafe {
+        stream
+            .launch_builder(&k.leaves_base_coset_joint)
+            .arg(cw(0))
+            .arg(cw(1))
+            .arg(cw(2))
+            .arg(cw(3))
+            .arg(&blocks)
+            .arg(&num_leaves_u64)
+            .arg(&log_block_u32)
+            .arg(&leaf_bits)
+            .arg(out)
+            .launch(crate::p1_stark::launch_cfg(num_leaves_u64))?;
+    }
+    Ok(())
+}
+
+/// A joint round-0 tree the card built over a grouped run's codewords
+/// ([`commit_joint`]): its nodes in the host's arity-4 layout, held until the
+/// commitment is retired (its top comes home) or opened (its paths do).
+pub struct JointTree {
+    nodes: CudaSlice<u8>,
+    stream: Arc<CudaStream>,
+    num_leaves: usize,
+}
+
+impl JointTree {
+    pub fn num_leaves(&self) -> usize {
+        self.num_leaves
+    }
+
+    /// The first `nodes` nodes (whole top levels, root first), brought home.
+    pub fn top_nodes_to_host(&self, nodes: usize) -> Result<Vec<u8>> {
+        let levels = crate::p1_stark::level_sizes(self.num_leaves).len();
+        ensure!(
+            (1..=levels).any(|t| crate::p1_stark::top_levels_nodes(self.num_leaves, t) == nodes),
+            "not whole top levels of an arity-4 tree"
+        );
+        let out = crate::readback::clone_dtoh(&self.stream, &self.nodes.slice(0..nodes * 32))?;
+        self.stream.synchronize()?;
+        Ok(out)
+    }
+
+    /// The authentication paths of `positions` (three siblings a level).
+    pub fn paths(&self, positions: &[u32]) -> Result<Vec<u8>> {
+        crate::p1_stark::gather_paths_dev(&self.nodes, self.num_leaves, positions, &self.stream)
+    }
+
+    /// [`Self::paths`] and the tree's cap at `cap_height` 4-ary levels below
+    /// the root (its real nodes, left to right).
+    pub fn paths_and_cap(
+        &self,
+        positions: &[u32],
+        cap_height: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let sizes = crate::p1_stark::level_sizes(self.num_leaves);
+        ensure!(cap_height < sizes.len(), "a cap taller than the tree");
+        let level = sizes.len() - 1 - cap_height;
+        let at = crate::p1_stark::level_offsets(&sizes)[level];
+        let paths = self.paths(positions)?;
+        let cap = crate::readback::clone_dtoh(
+            &self.stream,
+            &self.nodes.slice(at * 32..(at + sizes[level]) * 32),
+        )?;
+        self.stream.synchronize()?;
+        Ok((paths, cap))
+    }
+}
+
+/// ONE tree over a grouped run's base `codewords` (2–4, equal lengths, in slot
+/// order): leaf `j` hashes every codeword's fold block `j` end to end under
+/// the joint tag, placed by `placement`; then the inner levels. Returns the
+/// tree, kept on the card, and its root. Poseidon1 only.
+pub fn commit_joint(
+    codewords: &[&DeviceCodeword],
+    log_folding: usize,
+    hash: crate::DeviceHash,
+    placement: LeafPlacement,
+) -> Result<(JointTree, [u8; 32])> {
+    ensure!(
+        hash == crate::DeviceHash::Poseidon1,
+        "a joint tree is Poseidon1's"
+    );
+    ensure!(
+        (2..=4).contains(&codewords.len()),
+        "a joint tree is 2..=4 codewords"
+    );
+    let first = codewords[0];
+    ensure!(
+        codewords
+            .iter()
+            .all(|c| c.base && c.elements == first.elements),
+        "a joint tree's codewords are base and of one length"
+    );
+    // Every encode queued on its own stream is done before the leaves read it.
+    for codeword in codewords {
+        codeword.stream.synchronize()?;
+    }
+    let num_leaves = first.elements >> log_folding;
+    ensure!(num_leaves >= 2, "tree needs at least two leaves");
+    let be = backend()?;
+    let stream = first.stream.clone();
+    let total_nodes = crate::tree_nodes(hash, num_leaves);
+    // SAFETY: every byte is written before it is read — the leaves by the
+    // kernel below, the inner nodes by the level loop after it.
+    let mut nodes = unsafe { alloc_or_trim::<u8>(&stream, total_nodes * 32) }?;
+    let leaves_offset = crate::leaves_offset(hash, num_leaves) * 32;
+    let leaf_bits = match placement {
+        LeafPlacement::Natural => 0,
+        LeafPlacement::Reversed => num_leaves.trailing_zeros(),
+    };
+    {
+        let mut region = nodes.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
+        let buffers: Vec<&CudaSlice<u64>> = codewords.iter().map(|c| c.buffer.as_ref()).collect();
+        launch_joint_leaves(
+            &stream,
+            &buffers,
+            num_leaves,
+            log_folding,
+            leaf_bits,
+            &mut region,
+        )?;
+    }
+    LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
+    count_commit_leaves(num_leaves, codewords.len() << log_folding);
+    build_inner_tree_levels(stream.as_ref(), be, &mut nodes, num_leaves, hash)?;
+    TREE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    let head = crate::readback::clone_dtoh(&stream, &nodes.slice(0..32))?;
+    stream.synchronize()?;
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&head);
+    Ok((
+        JointTree {
+            nodes,
+            stream,
+            num_leaves,
+        },
+        root,
+    ))
+}
+
+/// [`DeviceCodeword::block_subtrees_placed`] of a joint tree over `codewords`:
+/// each block's `4^dropped` leaves gathered from every codeword, hashed as
+/// joint leaves and built into one tree over the gathered leaves (the blocks'
+/// roots `dropped` levels above them), brought home in the host layout.
+pub fn joint_block_subtrees(
+    codewords: &[&DeviceCodeword],
+    log_folding: usize,
+    blocks: &[u64],
+    dropped: usize,
+    hash: crate::DeviceHash,
+    placement: LeafPlacement,
+) -> Result<Vec<u8>> {
+    ensure!(
+        hash == crate::DeviceHash::Poseidon1,
+        "a joint tree is Poseidon1's"
+    );
+    ensure!(
+        (2..=4).contains(&codewords.len()),
+        "a joint tree is 2..=4 codewords"
+    );
+    ensure!(!blocks.is_empty(), "a round opens at least one block");
+    let first = codewords[0];
+    ensure!(
+        codewords
+            .iter()
+            .all(|c| c.base && c.elements == first.elements),
+        "a joint tree's codewords are base and of one length"
+    );
+    for codeword in codewords {
+        codeword.stream.synchronize()?;
+    }
+    let num_leaves = first.elements >> log_folding;
+    let span = 1u64 << (2 * dropped);
+    ensure!(
+        ((blocks[blocks.len() - 1] + 1) * span) as usize <= num_leaves,
+        "block past the tree's leaves"
+    );
+    let real = blocks.len() * span as usize;
+    let leaves = real.next_power_of_two().max(2);
+    let depth = num_leaves.trailing_zeros();
+    let mut indices: Vec<u64> = blocks
+        .iter()
+        .flat_map(|&b| (b * span)..((b + 1) * span))
+        .map(|pos| placement.leaf_at(pos, depth))
+        .collect();
+    let last = *indices.last().expect("at least one leaf");
+    indices.resize(leaves, last);
+    let block = 1u64 << log_folding;
+    let be = backend()?;
+    let stream = first.stream.clone();
+    let index_dev = stream.clone_htod(&indices)?;
+    let leaves_u64 = leaves as u64;
+    let num_leaves_u64 = num_leaves as u64;
+    let limbs = 1u64;
+    let mut gathered = Vec::with_capacity(codewords.len());
+    for codeword in codewords {
+        // SAFETY: the gather writes every value it is sized for.
+        let mut out = unsafe { alloc_or_trim::<u64>(&stream, leaves * block as usize) }?;
+        unsafe {
+            stream
+                .launch_builder(&be.gather_cosets_strided)
+                .arg(codeword.buffer.as_ref())
+                .arg(&index_dev)
+                .arg(&leaves_u64)
+                .arg(&num_leaves_u64)
+                .arg(&block)
+                .arg(&limbs)
+                .arg(&mut out)
+                .launch(LaunchConfig::for_num_elems((leaves as u64 * block) as u32))?;
+        }
+        gathered.push(out);
+    }
+    let total_nodes = crate::tree_nodes(hash, leaves);
+    // SAFETY: every byte is written before it is read.
+    let mut nodes = unsafe { alloc_or_trim::<u8>(&stream, total_nodes * 32) }?;
+    let leaves_offset = crate::leaves_offset(hash, leaves) * 32;
+    {
+        let mut region = nodes.slice_mut(leaves_offset..leaves_offset + leaves * 32);
+        let buffers: Vec<&CudaSlice<u64>> = gathered.iter().collect();
+        launch_joint_leaves(&stream, &buffers, leaves, log_folding, 0, &mut region)?;
+    }
+    build_inner_tree_levels(stream.as_ref(), be, &mut nodes, leaves, hash)?;
     let out = crate::readback::clone_dtoh(&stream, &nodes)?;
     stream.synchronize()?;
     Ok(out)
