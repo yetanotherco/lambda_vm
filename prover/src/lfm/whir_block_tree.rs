@@ -507,7 +507,8 @@ impl WhirTreeConfig {
     /// Whether the tree is the production verifier's: the plan's leaf count,
     /// [`BLOCK_FAN_IN`] and the production argue — with its GKR trees laid out
     /// as the format's packing says, a named constant the block verifier is
-    /// given too ([`BlockFormat::with_pack`]).
+    /// given too ([`BlockFormat::with_pack`]) — and the verifier's preset
+    /// KECCAK_RND form, which the CLI has no flag for.
     pub fn at_presets(&self) -> bool {
         let pack = match self.argue {
             ArgueFormat::Batched { pack, .. } => pack,
@@ -517,6 +518,7 @@ impl WhirTreeConfig {
             && self.fan_in == BLOCK_FAN_IN
             && self.argue == BlockFormat::production().with_pack(pack).argue
             && self.format.argue == self.argue
+            && self.format.keccak_rnd == BlockFormat::pinned().keccak_rnd
     }
 }
 
@@ -3121,6 +3123,15 @@ mod tests {
         c.argue = ArgueFormat::batched(20);
         c.format.argue = c.argue;
         assert!(!c.at_presets(), "another bin cap");
+        // KECCAK_RND's form has no CLI flag: a tree under the form the
+        // verifier's preset does not name is not at the presets.
+        let other = match BlockFormat::pinned().keccak_rnd {
+            KeccakRndForm::Full => KeccakRndForm::Lean,
+            KeccakRndForm::Lean => KeccakRndForm::Full,
+        };
+        let mut c = production.clone();
+        c.format = c.format.with_keccak_rnd(other);
+        assert!(!c.at_presets(), "the other KECCAK_RND form");
     }
 
     /// `W3_LEAF_EMITTERS`: unset is the default count, 0 is the control (one
