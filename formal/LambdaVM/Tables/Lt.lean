@@ -175,9 +175,8 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     constructor
     · intro channel h; tauto
     · intro env h
-      refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
-      · intro hne1 hne0
-        exact (requirement_vacuous h.1 hne1 hne0).elim
+      -- each pull owes a multiplicity of 0 or 1: μ is a bit
+      exact mul_one_sub_eq_zero_iff.mp h.1
 
   soundness := by
     circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, RowSpec, Row.lhsVal, Row.rhsVal,
@@ -258,7 +257,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       | (subst hlt'; norm_num at hres'; simp [hAv, hBv, hC, hres'])
     refine ⟨fun _ hl0 hr0 => key _ _ rfl rfl hl0 hr0, by simp, by simp, by simp, by simp, by simp,
       by simp, by simp, by simp, ?_⟩
-    intro _ _ hl0 hlhi hr0 hrhi
+    intro _ hl0 hlhi hr0 hrhi
     -- the flag byte, read as a natural
     have hflagsV : (4 + 32 * input_signed + 64 * input_invert : F p).val
         = 4 + 32 * input_signed.val + 64 * input_invert.val :=

@@ -145,7 +145,7 @@ theorem main {d sg w s i0 i1 i2 i3 l0 l1 l2 b n x0 x1 x2 x3 x4 y0 y1 y2 y3 : ℕ
   have hX : limbs i0 i1 i2 i3 < 2^64 := by unfold limbs; omega
   rcases (by omega : d = 0 ∨ d = 1) with rfl | rfl
   · -- left shift: `shifted` is the if-form of `leftShift` with `L` the one-hot index
-    simp only [if_true] at hb
+    simp only [ite_true] at hb
     subst hb
     have hb16 : s % 16 < 16 := Nat.mod_lt _ (by norm_num)
     have core := leftShift h0 h1 h2 h3 hb16 (L := l1 + 2 * l2 + 3 * (1 - l0 - l1 - l2)) (by omega)
@@ -158,14 +158,14 @@ theorem main {d sg w s i0 i1 i2 i3 l0 l1 l2 b n x0 x1 x2 x3 x4 y0 y1 y2 y3 : ℕ
       ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ | ⟨rfl, rfl, rfl⟩ <;>
     · simp only [shifted, sh, hx0, hx1, hx2, hx3, hx4, hy0, hy1, hy2, hy3]
       norm_num at core hLv ⊢
-      simp only [shiftResult, if_true]
+      simp only [shiftResult, ite_true]
       rw [hk, hLv]
       norm_num at core ⊢
       by_cases hz : s % 16 = 0
       · simpa [sll, sllc, hz] using core
       · simpa [sll, sllc, hz] using core
   · -- right shift: phase 1, phase 2, and their composition
-    simp only [one_ne_zero, if_false] at hb
+    simp only [one_ne_zero, ite_false] at hb
     have hr : s % 16 < 16 := Nat.mod_lt _ (by norm_num)
     have p1 := rightIntra h0 h1 h2 h3 hr hb he
     simp only at p1
@@ -180,22 +180,22 @@ theorem main {d sg w s i0 i1 i2 i3 l0 l1 l2 b n x0 x1 x2 x3 x4 y0 y1 y2 y3 : ℕ
     have hres : shiftResult w sg 1 (limbs i0 i1 i2 i3) s
         = ((limbs i0 i1 i2 i3 + 65535 * n * (2^64 + 2^80 + 2^96 + 2^112))
             >>> (16 * (s / 16 % (4 - 2 * w)) + s % 16)) % 2^64 := by
-      simp only [shiftResult, one_ne_zero, if_false]
+      simp only [shiftResult, one_ne_zero, ite_false]
       rw [hk]
       have hX63 : limbs i0 i1 i2 i3 < 2^63 ↔ i3 < 32768 := by unfold limbs; omega
       rcases (by omega : sg = 0 ∨ sg = 1) with rfl | rfl
-      · simp only [if_true, zero_ne_one, if_false] at hn ⊢
+      · simp only [ite_true, zero_ne_one, ite_false] at hn ⊢
         subst hn
         simp only [mul_zero, zero_mul, add_zero]
         rw [Nat.mod_eq_of_lt (lt_of_le_of_lt (Nat.shiftRight_le _ _) hX)]
-      · simp only [if_true, one_ne_zero, if_false] at hn ⊢
+      · simp only [ite_true, one_ne_zero, ite_false] at hn ⊢
         subst hn
         rcases (by omega : i3 / 32768 = 0 ∨ i3 / 32768 = 1) with h | h
         · have hlt : limbs i0 i1 i2 i3 < 2^63 := hX63.mpr (by omega)
-          rw [h]; simp only [mul_zero, zero_mul, add_zero, sra64, if_pos hlt]
+          rw [h]; simp only [mul_zero, zero_mul, add_zero, sra64, ite_eq_left hlt]
           rw [Nat.mod_eq_of_lt (lt_of_le_of_lt (Nat.shiftRight_le _ _) hX)]
         · have hge : ¬ limbs i0 i1 i2 i3 < 2^63 := by rw [hX63]; omega
-          rw [h]; simp only [sra64, if_neg hge]
+          rw [h]; simp only [sra64, ite_eq_right hge]
           norm_num
     rw [hres]
     have hLv : s / 16 % (4 - 2 * w) = l1 + 2 * l2 + 3 * (1 - l0 - l1 - l2) := by omega

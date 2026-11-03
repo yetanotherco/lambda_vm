@@ -70,7 +70,10 @@ def circuit : FormalAssertion (F p) Inputs where
   requirementsChannelsLawful input_var i₀ := by
     obtain ⟨cond, x⟩ := input_var
     simp only [circuit_norm, isByte, isBit, areBytesTable]
-    grind
+    intro _ h
+    rcases mul_eq_zero.mp h with h0 | h1
+    · exact Or.inl h0
+    · exact Or.inr (sub_eq_zero.mp h1).symm
 
   soundness := by
     circuit_proof_start [isByte, isBit, areBytesTable]

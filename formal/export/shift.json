@@ -618,34 +618,27 @@
       "lhs": {"value": 18446744069414584320, "type": "const"}},
      "lhs": {"value": 1, "type": "const"}}}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 6},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 6},
     "message": [{"type": "var", "index": 3}, {"type": "var", "index": 10}],
+    "direction": "pull",
     "channel": "MSB16"}},
   {"interact":
    {"multiplicity":
-    {"type": "mul",
+    {"type": "add",
      "rhs":
-     {"type": "add",
-      "rhs":
-      {"type": "mul",
-       "rhs": {"type": "var", "index": 5},
-       "lhs": {"value": 18446744069414584320, "type": "const"}},
-      "lhs": {"type": "var", "index": 25}},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+     {"type": "mul",
+      "rhs": {"type": "var", "index": 5},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"type": "var", "index": 25}},
     "message":
     [{"value": 0, "type": "const"},
      {"type": "var", "index": 4},
      {"value": 15, "type": "const"},
      {"type": "var", "index": 11}],
+    "direction": "pull",
     "channel": "BYTE_ALU"}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 5},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 5},
     "message":
     [{"value": 0, "type": "const"},
      {"type": "add",
@@ -663,93 +656,81 @@
        "lhs": {"value": 256, "type": "const"}}},
      {"value": 15, "type": "const"},
      {"type": "var", "index": 11}],
+    "direction": "pull",
     "channel": "BYTE_ALU"}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 25},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 25},
     "message": [{"type": "var", "index": 11}, {"type": "var", "index": 12}],
+    "direction": "pull",
     "channel": "ZERO"}},
   {"interact":
    {"multiplicity":
-    {"type": "mul",
+    {"type": "add",
      "rhs":
-     {"type": "add",
-      "rhs":
-      {"type": "mul",
-       "rhs": {"type": "var", "index": 12},
-       "lhs": {"value": 18446744069414584320, "type": "const"}},
-      "lhs": {"value": 1, "type": "const"}},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+     {"type": "mul",
+      "rhs": {"type": "var", "index": 12},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"value": 1, "type": "const"}},
     "message":
     [{"type": "var", "index": 0},
      {"type": "var", "index": 11},
      {"type": "var", "index": 13},
      {"type": "var", "index": 18}],
+    "direction": "pull",
     "channel": "HWSL"}},
   {"interact":
    {"multiplicity":
-    {"type": "mul",
+    {"type": "add",
      "rhs":
-     {"type": "add",
-      "rhs":
-      {"type": "mul",
-       "rhs": {"type": "var", "index": 12},
-       "lhs": {"value": 18446744069414584320, "type": "const"}},
-      "lhs": {"value": 1, "type": "const"}},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+     {"type": "mul",
+      "rhs": {"type": "var", "index": 12},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"value": 1, "type": "const"}},
     "message":
     [{"type": "var", "index": 1},
      {"type": "var", "index": 11},
      {"type": "var", "index": 14},
      {"type": "var", "index": 19}],
+    "direction": "pull",
     "channel": "HWSL"}},
   {"interact":
    {"multiplicity":
-    {"type": "mul",
+    {"type": "add",
      "rhs":
-     {"type": "add",
-      "rhs":
-      {"type": "mul",
-       "rhs": {"type": "var", "index": 12},
-       "lhs": {"value": 18446744069414584320, "type": "const"}},
-      "lhs": {"value": 1, "type": "const"}},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+     {"type": "mul",
+      "rhs": {"type": "var", "index": 12},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"value": 1, "type": "const"}},
     "message":
     [{"type": "var", "index": 2},
      {"type": "var", "index": 11},
      {"type": "var", "index": 15},
      {"type": "var", "index": 20}],
+    "direction": "pull",
     "channel": "HWSL"}},
   {"interact":
    {"multiplicity":
-    {"type": "mul",
+    {"type": "add",
      "rhs":
-     {"type": "add",
-      "rhs":
-      {"type": "mul",
-       "rhs": {"type": "var", "index": 12},
-       "lhs": {"value": 18446744069414584320, "type": "const"}},
-      "lhs": {"value": 1, "type": "const"}},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+     {"type": "mul",
+      "rhs": {"type": "var", "index": 12},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"value": 1, "type": "const"}},
     "message":
     [{"type": "var", "index": 3},
      {"type": "var", "index": 11},
      {"type": "var", "index": 16},
      {"type": "var", "index": 21}],
+    "direction": "pull",
     "channel": "HWSL"}},
   {"interact":
    {"multiplicity":
-    {"type": "mul",
+    {"type": "add",
      "rhs":
-     {"type": "add",
-      "rhs":
-      {"type": "mul",
-       "rhs": {"type": "var", "index": 12},
-       "lhs": {"value": 18446744069414584320, "type": "const"}},
-      "lhs": {"value": 1, "type": "const"}},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+     {"type": "mul",
+      "rhs": {"type": "var", "index": 12},
+      "lhs": {"value": 18446744069414584320, "type": "const"}},
+     "lhs": {"value": 1, "type": "const"}},
     "message":
     [{"type": "mul", "rhs": {"type": "var", "index": 10}, "lhs": {"value": 65535, "type": "const"}},
      {"type": "var", "index": 11},
@@ -763,12 +744,10 @@
       {"type": "mul",
        "rhs": {"type": "var", "index": 10},
        "lhs": {"value": 65535, "type": "const"}}}],
+    "direction": "pull",
     "channel": "HWSL"}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 25},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 25},
     "message":
     [{"value": 0, "type": "const"},
      {"type": "var", "index": 4},
@@ -802,6 +781,7 @@
           "lhs": {"value": 48, "type": "const"}},
          "lhs": {"value": 18446744069414584320, "type": "const"}},
         "lhs": {"value": 48, "type": "const"}}}}],
+    "direction": "pull",
     "channel": "BYTE_ALU"}},
   {"interact":
    {"multiplicity": {"type": "var", "index": 25},
@@ -836,48 +816,37 @@
        {"type": "add", "rhs": {"type": "var", "index": 7}, "lhs": {"value": 5, "type": "const"}}}},
      {"type": "var", "index": 8},
      {"type": "var", "index": 9}],
+    "direction": "push",
     "channel": "ALU"}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"value": 1, "type": "const"},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"value": 1, "type": "const"},
     "message": [{"type": "var", "index": 4}, {"type": "var", "index": 26}],
+    "direction": "pull",
     "channel": "ARE_BYTES"}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 25},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 25},
     "message": [{"type": "var", "index": 27}],
+    "direction": "pull",
     "channel": "IS_HALF"}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 25},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 25},
     "message": [{"type": "var", "index": 0}],
+    "direction": "pull",
     "channel": "IS_HALF"}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 25},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 25},
     "message": [{"type": "var", "index": 1}],
+    "direction": "pull",
     "channel": "IS_HALF"}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 25},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 25},
     "message": [{"type": "var", "index": 2}],
+    "direction": "pull",
     "channel": "IS_HALF"}},
   {"interact":
-   {"multiplicity":
-    {"type": "mul",
-     "rhs": {"type": "var", "index": 25},
-     "lhs": {"value": 18446744069414584320, "type": "const"}},
+   {"multiplicity": {"type": "var", "index": 25},
     "message": [{"type": "var", "index": 3}],
+    "direction": "pull",
     "channel": "IS_HALF"}}],
  "name": "shift",
  "columns": 29}

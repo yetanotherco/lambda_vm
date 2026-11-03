@@ -2,6 +2,7 @@ module
 
 public import LambdaVM.Field
 public import LambdaVM.AluOp
+public import LambdaVM.StaticLookup
 public import LambdaVM.Templates.IsBit
 public import LambdaVM.Templates.Add
 public import LambdaVM.Tables.Bitwise

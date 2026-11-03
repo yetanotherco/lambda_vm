@@ -241,14 +241,14 @@ lemma override_x {zbs x i d : F p} {b : ℕ} (hzb : IsBool zbs) (hdb : IsBool d)
     zbs * (x - i * (1 - d)) = 0 := by
   rcases hzb with hz | hz
   · rw [hz, zero_mul]
-  · rw [if_pos (hiff hz)] at hx
+  · rw [ite_eq_left (hiff hz)] at hx
     rw [hz, one_mul, sub_eq_zero]
     rcases hdb with hd | hd
     · rw [hd] at hx ⊢
-      simp only [ZMod.val_zero, if_true] at hx
+      simp only [ZMod.val_zero, ite_true] at hx
       rw [ZMod.val_injective _ hx]; ring
     · rw [hd] at hx ⊢
-      simp only [val_one_eq, one_ne_zero, if_false] at hx
+      simp only [val_one_eq, one_ne_zero, ite_false] at hx
       rw [(ZMod.val_eq_zero _).mp hx]; ring
 
 /-- The `zbs` override of a `Y` scratch cell holds on an honest row. -/
@@ -258,14 +258,14 @@ lemma override_y {zbs y i d : F p} {b : ℕ} (hzb : IsBool zbs) (hdb : IsBool d)
     zbs * (y - i * d) = 0 := by
   rcases hzb with hz | hz
   · rw [hz, zero_mul]
-  · rw [if_pos (hiff hz)] at hy
+  · rw [ite_eq_left (hiff hz)] at hy
     rw [hz, one_mul, sub_eq_zero]
     rcases hdb with hd | hd
     · rw [hd] at hy ⊢
-      simp only [ZMod.val_zero, if_true] at hy
+      simp only [ZMod.val_zero, ite_true] at hy
       rw [(ZMod.val_eq_zero _).mp hy]; ring
     · rw [hd] at hy ⊢
-      simp only [val_one_eq, one_ne_zero, if_false] at hy
+      simp only [val_one_eq, one_ne_zero, ite_false] at hy
       rw [ZMod.val_injective _ hy]; ring
 
 @[reducible]
@@ -297,14 +297,16 @@ theorem soundness :
     rcases hmb with hmu0 | hmu1
     · -- μ = 0: nothing is required of the row
       rw [hmu0] at hleft ⊢
-      refine ⟨fun h => absurd h (by norm_num), ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_,
-        ?_, ?_⟩
+      -- each pull owes a multiplicity of 0 or 1, and the inactive push owes nothing
+      constructorm* _ ∧ _
       all_goals first
-        | exact req_vacuous hsb
-        | exact req_vacuous hleft
-        | exact req_vacuous hdb
-        | exact req_vacuous hzb'
-        | (intro _ h0; exact absurd rfl h0)
+        | exact hsb
+        | exact hleft
+        | exact hdb
+        | exact hzb'
+        | (left; rfl)
+        | (intro h; exact absurd rfl h)
+        | (intro h; exact absurd h (by norm_num))
     subst hmu1
     -- the facts every active row has
     have hd2 := IsBool.val_lt_two hdb
@@ -331,19 +333,19 @@ theorem soundness :
     -- zbs is the zero flag of bit_shift
     have hzb_iff : input_zbs.val = 1 ↔ input_bitShift.val = 0 := by
       by_cases hb0 : input_bitShift = 0
-      · rw [hzbs_eq, if_pos hb0, val_one_eq, hb0, ZMod.val_zero]; simp
-      · rw [hzbs_eq, if_neg hb0, ZMod.val_zero]
+      · rw [hzbs_eq, ite_eq_left hb0, val_one_eq, hb0, ZMod.val_zero]; simp
+      · rw [hzbs_eq, ite_eq_right hb0, ZMod.val_zero]
         have : input_bitShift.val ≠ 0 := by rwa [Ne, ZMod.val_eq_zero]
         omega
     -- bit_shift from the BYTE_ALU lookups
     have hb : input_bitShift.val = if input_direction.val = 0 then input_shiftAmount.val % 16
         else (16 - input_shiftAmount.val % 16) % 16 := by
       rcases hdb with hd0 | hd1
-      · rw [hd0]; simp only [ZMod.val_zero, if_true]
+      · rw [hd0]; simp only [ZMod.val_zero, ite_true]
         obtain ⟨-, -, hand | ⟨h02, -⟩⟩ := h_balL (by rw [hd0]; norm_num)
         · rw [hand, h15, ShiftCore.and15]
         · exact absurd h02 h02ne
-      · rw [hd1]; simp only [val_one_eq, one_ne_zero, if_false]
+      · rw [hd1]; simp only [val_one_eq, one_ne_zero, ite_false]
         obtain ⟨hx, -, hand | ⟨h02, -⟩⟩ := h_balR (by rw [hd1])
         · rw [h15, ShiftCore.and15] at hand
           rw [← ZMod.natCast_zmod_val input_shiftAmount] at hx hand
@@ -364,10 +366,10 @@ theorem soundness :
     have hn : input_isNegative.val = if input_signed.val = 1 then input_in3.val / 32768 else 0 := by
       rcases hsb with hs0 | hs1
       · rw [hs0] at h_neg ⊢
-        simp only [ZMod.val_zero, zero_ne_one, if_false]
+        simp only [ZMod.val_zero, zero_ne_one, ite_false]
         have : input_isNegative = 0 := by simpa using h_neg
         rw [this, ZMod.val_zero]
-      · rw [hs1]; simp only [val_one_eq, if_true]
+      · rw [hs1]; simp only [val_one_eq, ite_true]
         exact (h_msb (by rw [hs1])).2
     have hn2 : input_isNegative.val < 2 := by rw [hn]; split_ifs <;> omega
     have hext : (65535 * input_isNegative).val = 65535 * input_isNegative.val :=
@@ -401,7 +403,7 @@ theorem soundness :
         obtain ⟨hi3', -, hx3v, hy3v⟩ := h_hw3 (by rw [hz0]; norm_num)
         obtain ⟨hi4', -, hx4v, -⟩ := h_hw4 (by rw [hz0]; norm_num)
         rw [hext] at hx4v hi4'
-        simp only [if_neg hbne]
+        simp only [ite_eq_right hbne]
         exact ⟨sll_of_eq hi0' hx0v, sll_of_eq hi1' hx1v, sll_of_eq hi2' hx2v, sll_of_eq hi3' hx3v,
           sll_of_eq hi4' hx4v, sllc_of_eq hi0' hy0v, sllc_of_eq hi1' hy1v, sllc_of_eq hi2' hy2v,
           sllc_of_eq hi3' hy3v⟩
@@ -409,15 +411,15 @@ theorem soundness :
         have hb0 : input_bitShift.val = 0 := hzb_iff.mp (by rw [hz1, val_one_eq])
         rw [hz1] at h_zx0 h_zx1 h_zx2 h_zx3 h_zx4 h_zy0 h_zy1 h_zy2 h_zy3
         simp only [one_mul, sub_eq_zero] at h_zx0 h_zx1 h_zx2 h_zx3 h_zx4 h_zy0 h_zy1 h_zy2 h_zy3
-        simp only [if_pos hb0]
+        simp only [ite_eq_left hb0]
         rcases hdb with hd0 | hd1
         · rw [hd0] at h_zx0 h_zx1 h_zx2 h_zx3 h_zy0 h_zy1 h_zy2 h_zy3 ⊢
           simp only [sub_zero, mul_one, mul_zero] at h_zx0 h_zx1 h_zx2 h_zx3 h_zy0 h_zy1 h_zy2 h_zy3
-          simp only [ZMod.val_zero, if_true, h_zx0, h_zx1, h_zx2, h_zx3, h_zy0, h_zy1, h_zy2, h_zy3,
+          simp only [ZMod.val_zero, ite_true, h_zx0, h_zx1, h_zx2, h_zx3, h_zy0, h_zy1, h_zy2, h_zy3,
             h_zx4, and_self]
         · rw [hd1] at h_zx0 h_zx1 h_zx2 h_zx3 h_zy0 h_zy1 h_zy2 h_zy3 ⊢
           simp only [sub_self, mul_one, mul_zero] at h_zx0 h_zx1 h_zx2 h_zx3 h_zy0 h_zy1 h_zy2 h_zy3
-          simp only [val_one_eq, one_ne_zero, if_false, h_zx0, h_zx1, h_zx2, h_zx3, h_zy0, h_zy1,
+          simp only [val_one_eq, one_ne_zero, ite_false, h_zx0, h_zx1, h_zx2, h_zx3, h_zy0, h_zy1,
             h_zy2, h_zy3, h_zx4, ZMod.val_zero, and_self]
     obtain ⟨hx0, hx1, hx2, hx3, hx4, hy0, hy1, hy2, hy3⟩ := hxy
     -- the one-hot limb index from the BYTE_ALU lookup
@@ -491,16 +493,17 @@ theorem soundness :
       simp only [limbs]
       omega
     -- the row spec and the bus requirements
-    refine ⟨fun _ => key, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
-    all_goals first
-      | exact req_vacuous hsb
-      | exact req_vacuous hleft
-      | exact req_vacuous hdb
-      | exact req_vacuous hzb'
-      | exact (fun h => absurd rfl h)
-      | skip
+    refine ⟨fun _ => key, ?_⟩
+    -- each pull owes a multiplicity of 0 or 1
+    constructorm* _ ∧ _
+    all_goals try first
+      | exact hsb
+      | exact hleft
+      | exact hdb
+      | exact hzb'
+      | (right; rfl)
     -- what remains is the ALU push
-    intro _ _ hin1lo hin1hi hin2lo hin2hi
+    intro _ hin1lo hin1hi hin2lo hin2hi
     -- the flag byte, read as a natural
     have hflagsV : (5 + input_wordInstr + 32 * input_signed + 64 * input_direction : F p).val
         = 5 + input_wordInstr.val + 32 * input_signed.val + 64 * input_direction.val :=
@@ -566,8 +569,8 @@ theorem completeness :
       have hzb_iff : input_zbs = 1 ↔ input_bitShift.val = 0 := by
         rw [hzbs]
         by_cases hb0 : input_bitShift = 0
-        · rw [if_pos hb0, hb0, ZMod.val_zero]; simp
-        · rw [if_neg hb0]
+        · rw [ite_eq_left hb0, hb0, ZMod.val_zero]; simp
+        · rw [ite_eq_right hb0]
           have hne : input_bitShift.val ≠ 0 := by rwa [Ne, ZMod.val_eq_zero]
           constructor
           · intro h; exact absurd h zero_ne_one
@@ -638,7 +641,7 @@ theorem completeness :
       · -- zbs · X[4] = 0
         rcases hzb with hz | hz
         · rw [hz, zero_mul]
-        · rw [if_pos (hiff hz)] at hx4
+        · rw [ite_eq_left (hiff hz)] at hx4
           rw [hz, one_mul, (ZMod.val_eq_zero _).mp hx4]
       · -- out[0]
         rw [eval_shiftedPoly_1, eval_shiftedPoly_2]
@@ -657,29 +660,25 @@ theorem completeness :
       · -- (1 − signed) · is_negative = 0
         rcases hsb with hs | hs
         · rw [hs] at hn ⊢
-          simp only [ZMod.val_zero, zero_ne_one, if_false] at hn
+          simp only [ZMod.val_zero, zero_ne_one, ite_false] at hn
           rw [(ZMod.val_eq_zero _).mp hn]; ring
         · rw [hs]; ring
       · -- MSB16[in[3]] when signed
-        intro h
-        have hs1 : input_signed = 1 := neg_inj.mp h
-        rw [hs1, val_one_eq, if_pos rfl] at hn
+        intro hs1
+        rw [hs1, val_one_eq, ite_eq_left rfl] at hn
         exact ⟨hi3, hn⟩
       · -- BYTE_ALU[AND, shift, 15] when left
         intro h
-        have hd0 : input_direction = 0 := by
-          have := neg_inj.mp h
-          linear_combination -this
-        rw [hd0, ZMod.val_zero, if_pos rfl] at hb
+        have hd0 : input_direction = 0 := by linear_combination -h
+        rw [hd0, ZMod.val_zero, ite_eq_left rfl] at hb
         refine ⟨hsA, by rw [h15]; norm_num, Or.inl ?_⟩
         rw [h15, ShiftCore.and15, hb]
       · -- BYTE_ALU[AND, 256 − 16·zbs − shift, 15] when right
-        intro h
-        have hd1 : input_direction = 1 := neg_inj.mp h
-        rw [hd1, val_one_eq, if_neg one_ne_zero] at hb
+        intro hd1
+        rw [hd1, val_one_eq, ite_eq_right one_ne_zero] at hb
         rcases hzb with hz | hz
         · have hbne : input_bitShift.val ≠ 0 := fun h0 => by
-            rw [hzbs, if_pos ((ZMod.val_eq_zero _).mp h0)] at hz; exact one_ne_zero hz
+            rw [hzbs, ite_eq_left ((ZMod.val_eq_zero _).mp h0)] at hz; exact one_ne_zero hz
           have hs1 : 1 ≤ input_shiftAmount.val := by omega
           have hcast : (256 : F p) - 16 * input_zbs - input_shiftAmount
               = ((256 - input_shiftAmount.val : ℕ) : F p) := by
@@ -700,32 +699,32 @@ theorem completeness :
         have hbne : input_bitShift.val ≠ 0 := fun h0 => by
           have := hzb_iff.mpr h0
           rw [this] at h; norm_num at h
-        rw [if_neg hbne] at hx0 hy0
+        rw [ite_eq_right hbne] at hx0 hy0
         exact ⟨hi0, hb16, by rw [hx0]; exact sll_eq hi0, by rw [hy0]; exact sllc_eq hi0⟩
       · intro h
         have hbne : input_bitShift.val ≠ 0 := fun h0 => by
           have := hzb_iff.mpr h0
           rw [this] at h; norm_num at h
-        rw [if_neg hbne] at hx1 hy1
+        rw [ite_eq_right hbne] at hx1 hy1
         exact ⟨hi1, hb16, by rw [hx1]; exact sll_eq hi1, by rw [hy1]; exact sllc_eq hi1⟩
       · intro h
         have hbne : input_bitShift.val ≠ 0 := fun h0 => by
           have := hzb_iff.mpr h0
           rw [this] at h; norm_num at h
-        rw [if_neg hbne] at hx2 hy2
+        rw [ite_eq_right hbne] at hx2 hy2
         exact ⟨hi2, hb16, by rw [hx2]; exact sll_eq hi2, by rw [hy2]; exact sllc_eq hi2⟩
       · intro h
         have hbne : input_bitShift.val ≠ 0 := fun h0 => by
           have := hzb_iff.mpr h0
           rw [this] at h; norm_num at h
-        rw [if_neg hbne] at hx3 hy3
+        rw [ite_eq_right hbne] at hx3 hy3
         exact ⟨hi3, hb16, by rw [hx3]; exact sll_eq hi3, by rw [hy3]; exact sllc_eq hi3⟩
       · -- HWSL[extension, bit_shift]
         intro h
         have hbne : input_bitShift.val ≠ 0 := fun h0 => by
           have := hzb_iff.mpr h0
           rw [this] at h; norm_num at h
-        rw [if_neg hbne] at hx4
+        rw [ite_eq_right hbne] at hx4
         have he : 65535 * input_isNegative.val = 0 ∨ 65535 * input_isNegative.val = 65535 := by omega
         obtain ⟨hle, hsub⟩ := ext_sllc he hb16
         have hdiff : (65535 * input_isNegative - input_x4).val
@@ -734,7 +733,7 @@ theorem completeness :
           rw [show (65535 : F p) * input_isNegative - input_x4
               = ((65535 * input_isNegative.val - input_x4.val : ℕ) : F p) by
             rw [Nat.cast_sub hle]; push_cast
-            rw [ZMod.natCast_zmod_val input_isNegative, ZMod.natCast_zmod_val input_x4]; try ring]
+            rw [ZMod.natCast_zmod_val input_isNegative, ZMod.natCast_zmod_val input_x4]]
           exact val_natCast_of_lt_two_pow_40 (by omega)
         refine ⟨by rw [hext]; omega, hb16, ?_, ?_⟩
         · rw [hext, hx4]; exact sll_eq (by omega)
@@ -788,8 +787,8 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       have hsb := mul_one_sub_eq_zero_iff.mp h_sg
       have hzb := mul_one_sub_eq_zero_iff.mp h_zbs
       have hmb := mul_one_sub_eq_zero_iff.mp h_mu
+      -- each pull owes a multiplicity of 0 or 1
       constructorm* _ ∧ _ <;>
-      · intro h1 h0
         rcases hmb with hm | hm <;> rcases hdb with hd | hd <;> rcases hzb with hz | hz <;>
           rcases hsb with hs | hs <;> simp_all
 
