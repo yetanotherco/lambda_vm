@@ -242,7 +242,7 @@ fn the_frame_refuses_a_bitwise_table_off_its_fixed_height() {
 /// Format knobs a verifier's process could carry, each off the default: the
 /// WHIR blowup, grind bits and folds, the leaves' query check and scale, and
 /// the leaves' share form.
-const OFF_DEFAULT: [(&str, &str); 7] = [
+const OFF_DEFAULT: [(&str, &str); 8] = [
     (crate::zf_format::ENV_WHIR_BLOWUP, "4"),
     (crate::zf_format::ENV_WHIR_GRIND_BITS, "20"),
     (crate::zf_format::ENV_WHIR_FOLDS, "uniform4"),
@@ -250,6 +250,7 @@ const OFF_DEFAULT: [(&str, &str); 7] = [
     (crate::lfm::whir_block::LEAF_DOUBLE_FROM_ENV, "off"),
     ("LFM_WHIR_SHARE_INVERSE", "0"),
     ("BLOCK_WHIR_ARGUE_PACK", "off"),
+    ("BLOCK_WHIR_KECCAK_RND", "lean"),
 ];
 
 /// ★ The block verifier reads no format from its environment. In a process of
@@ -317,6 +318,11 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         },
         "the harness's argue follows its packing knob"
     );
+    assert_eq!(
+        harness.format.keccak_rnd,
+        crate::tables::keccak_rnd::KeccakRndForm::Lean,
+        "the harness's KECCAK_RND follows its knob"
+    );
 
     // The verifier's is not.
     let debug = |o: &ProofOptions| format!("{o:?}");
@@ -329,6 +335,11 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         pinned.format.argue,
         multilinear::whir_chain::ArgueFormat::BATCHED,
         "the verifier's packing is its named constant, not the environment's"
+    );
+    assert_eq!(
+        pinned.format.keccak_rnd,
+        crate::tables::keccak_rnd::KeccakRndForm::Full,
+        "the verifier's KECCAK_RND form is its named constant, not the environment's"
     );
     assert!(pinned.share_inverse);
     assert_eq!(
@@ -371,6 +382,11 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         at.format.argue,
         multilinear::whir_chain::ArgueFormat::BATCHED,
         "the packing named PRODUCTION is the production argue"
+    );
+    assert_eq!(
+        at.format.keccak_rnd,
+        crate::tables::keccak_rnd::KeccakRndForm::Full,
+        "the named-choice presets hold the pinned KECCAK_RND form"
     );
     assert!(at.share_inverse);
 
