@@ -4861,6 +4861,7 @@ fn a_split_table_is_its_rows_in_order() {
 /// inline layout's finish is not streamed and holds none.
 #[test]
 fn keccak_rnd_filled_from_records_moves_no_byte() {
+    let _fills = records_fill_lock();
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
     let bytes = |p: &BlockWhirProof| {
@@ -4942,6 +4943,7 @@ fn keccak_rnd_filled_from_records_moves_no_byte() {
 /// records), and the proof is the one without regeneration.
 #[test]
 fn keccak_rnd_held_as_records_is_never_dropped() {
+    let _fills = records_fill_lock();
     use crate::block_whir::regen::RegenMode;
 
     let elf = asm_elf_bytes("test_keccak_multi");
@@ -5000,6 +5002,7 @@ fn keccak_rnd_held_as_records_is_never_dropped() {
 /// re-hashes what phase A committed.)
 #[test]
 fn a_wrong_records_table_is_refused_by_the_verifier() {
+    let _fills = records_fill_lock();
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
     let mut o = streamed(MaxRowsConfig::small(), 5, 3);
@@ -5027,6 +5030,18 @@ fn a_wrong_records_table_is_refused_by_the_verifier() {
     );
 }
 
+/// The tests that hold tables as records, and the ones that count the fills,
+/// run one at a time: the fill count (`multilinear::records::fills`) is the
+/// process's, and each prove reads it across its own window, so a records table
+/// filled by another test inside that window would move this test's count.
+static RECORDS_FILL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`RECORDS_FILL_LOCK`], taken through a poisoned lock (the test that failed
+/// holding it says why on its own).
+fn records_fill_lock() -> std::sync::MutexGuard<'static, ()> {
+    RECORDS_FILL_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Every streamed CPU and MEMW_R chunk held as records
 /// ([`Deviations::card_fill_streamed`]), no row family's (whatever the
 /// knob's default), the room rule admitting every one.
@@ -5050,6 +5065,7 @@ fn streamed_records(cpu: bool, memw_r: bool) -> Deviations {
 /// windows.
 #[test]
 fn cpu_and_memw_r_filled_from_records_move_no_byte() {
+    let _fills = records_fill_lock();
     let format = many_groups();
     let bytes = |p: &BlockWhirProof| {
         rkyv::to_bytes::<rkyv::rancor::Error>(p)
@@ -5150,6 +5166,7 @@ fn cpu_and_memw_r_filled_from_records_move_no_byte() {
 /// workers. The thread ran only where asked, and counted chunks.
 #[test]
 fn counting_the_hand_out_on_its_own_thread_moves_no_byte() {
+    let _fills = records_fill_lock();
     let format = many_groups();
     let bytes = |p: &BlockWhirProof| {
         rkyv::to_bytes::<rkyv::rancor::Error>(p)
@@ -5226,6 +5243,7 @@ fn counting_the_hand_out_on_its_own_thread_moves_no_byte() {
 /// regeneration.
 #[test]
 fn streamed_records_chunks_kept_are_never_dropped() {
+    let _fills = records_fill_lock();
     use crate::block_whir::regen::RegenMode;
 
     let elf = asm_elf_bytes("test_keccak_multi");
@@ -5307,6 +5325,7 @@ fn streamed_records_chunks_kept_are_never_dropped() {
 /// the refusal below would be vacuous).
 #[test]
 fn a_wrong_cpu_records_table_is_refused_by_the_verifier() {
+    let _fills = records_fill_lock();
     let elf = asm_elf_bytes("test_keccak_multi");
     let format = many_groups();
     let mut o = streamed(MaxRowsConfig::small(), 5, 3);
@@ -5357,6 +5376,7 @@ fn a_wrong_cpu_records_table_is_refused_by_the_verifier() {
 /// control. The proofs are one.
 #[test]
 fn parked_records_need_live_regeneration() {
+    let _fills = records_fill_lock();
     use crate::block_whir::regen::RegenMode;
 
     let elf = asm_elf_bytes("test_keccak_multi");
@@ -5405,6 +5425,7 @@ fn parked_records_need_live_regeneration() {
 /// group's openings; with no spill (no regeneration) none is let go.
 #[test]
 fn streamed_records_chunks_drop_as_records_and_come_back() {
+    let _fills = records_fill_lock();
     use crate::block_whir::regen::RegenMode;
 
     let elf = asm_elf_bytes("test_keccak_multi");
@@ -5593,6 +5614,7 @@ fn row_counts(c: &crate::tables::trace_builder::CardFillStamps) -> [[usize; 2]; 
 /// MEMW chunks are the card test's and the gate's.)
 #[test]
 fn row_families_filled_from_their_rows_move_no_byte() {
+    let _fills = records_fill_lock();
     let format = many_groups();
     let bytes = |p: &BlockWhirProof| {
         rkyv::to_bytes::<rkyv::rancor::Error>(p)
@@ -5706,6 +5728,7 @@ fn row_families_filled_from_their_rows_move_no_byte() {
 /// streamed card fill is never set up: no chunk is handed to it.
 #[test]
 fn row_records_chunks_drop_as_records_and_come_back() {
+    let _fills = records_fill_lock();
     use crate::block_whir::regen::{RegenMode, RegenStamps};
 
     let elf = asm_elf_bytes("all_loadstore_32");
@@ -5820,6 +5843,7 @@ fn row_records_chunks_drop_as_records_and_come_back() {
 /// alone that a small program fills.
 #[test]
 fn a_wrong_row_records_table_is_refused_by_the_verifier() {
+    let _fills = records_fill_lock();
     let format = many_groups();
     for (name, family) in [
         ("all_loadstore_32", "memw_a"),
