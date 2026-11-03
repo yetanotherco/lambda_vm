@@ -332,6 +332,43 @@ fn a_joint_run_on_the_card_proves_the_hosts_bytes() {
     }
 }
 
+/// ★ At the production block's shape — a run of three stacked polynomials of
+/// `2^27`, First6, blowup 2, the coset order: `2^22` leaves a tree — a joint
+/// run committed on the card has the host's roots (the verifiers' commit,
+/// `commit_on_host`) and pays exactly its leaves' permutations, with no host
+/// fallback. The other tests' shapes are `2^14` leaves.
+#[test]
+fn a_production_shaped_joint_run_on_the_card_has_the_hosts_roots() {
+    let _serial = serial();
+    let cfg = ChainConfig {
+        log_blowup: 1,
+        ..config(Round0Trees::One)
+    };
+    let columns: Vec<Mle<F>> = (0..3).map(|i| column(27, 97 + 13 * i)).collect();
+    let layout = StackedLayout::build(&[27; 3], 27).unwrap();
+    assert_eq!(layout.num_polys(), 3, "one run of three");
+    assert_eq!(round0_trees(3, &cfg), vec![0..3], "one joint tree");
+    let refs: Vec<&Mle<F>> = columns.iter().collect();
+    let store = gpu::upload_columns(&refs).expect("resident columns (a GPU)");
+    let (fallbacks, perms) = (gpu::host_fallbacks(), gpu::commit_leaf_perms());
+    let card = StackedCommitment::<F, P1Whir>::commit(
+        layout.clone(),
+        &borrow(&columns),
+        Some((&store, 0)),
+        &cfg,
+    )
+    .unwrap();
+    let perms = gpu::commit_leaf_perms() - perms;
+    assert_eq!(gpu::host_fallbacks(), fallbacks, "no host commit");
+    // 192 felts a leaf: 16 permutations, over 2^(27 + 1 - 6) leaves.
+    assert_eq!(perms, 16 << 22, "the joint leaves' permutations");
+    drop(store);
+    let host =
+        StackedCommitment::<F, P1Whir>::commit_on_host(layout, &borrow(&columns), &cfg).unwrap();
+    assert_eq!(card.roots().len(), 1, "one root");
+    assert_eq!(host.roots(), card.roots(), "the card's root is the host's");
+}
+
 /// The same stack under one tree a polynomial pays 18 permutations a leaf
 /// position of a run of three where one tree a run pays 16; its proof is the
 /// per-tree format's, refused by the joint verifier and the reverse.
