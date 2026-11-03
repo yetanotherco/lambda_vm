@@ -741,10 +741,21 @@ fn build_air_maybe_cached<CS: ConstraintSet<F, E> + Clone + Send + Sync + 'stati
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), CS> {
     type Proto<CS> = AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), CS>;
     let key = air_proto_key(name, proof_options);
+    // A hit is served only when its interactions are the ones handed in: the
+    // key holds the name, not the list, and a name whose list varied (a
+    // format value, say) would otherwise serve one list for the other. A
+    // mismatch builds this list uncached and leaves the entry as it is.
+    let mut cache = cache;
     if cache {
-        let cache = air_prototype_cache().lock().unwrap();
-        if let Some(proto) = cache.get(&key).and_then(|p| p.downcast_ref::<Proto<CS>>()) {
-            return proto.clone();
+        let entries = air_prototype_cache().lock().unwrap();
+        if let Some(proto) = entries
+            .get(&key)
+            .and_then(|p| p.downcast_ref::<Proto<CS>>())
+        {
+            if proto.bus_interactions() == interactions.as_slice() {
+                return proto.clone();
+            }
+            cache = false;
         }
     }
     let air = Proto::<CS>::new(
@@ -1316,3 +1327,35 @@ pub fn create_global_memory_air(
 /// three continuation tables. Bump it deliberately when a table is genuinely
 /// added or removed.
 pub const NUM_PRODUCTION_AIRS: usize = 31;
+
+#[cfg(test)]
+mod air_cache_tests {
+    use super::*;
+    use stark::lookup::Multiplicity;
+
+    /// The AIR prototype cache keys an entry by name, so a name handed two
+    /// interaction lists must still give each list back: a hit is served only
+    /// when its list is the one handed in, and a mismatch is built uncached.
+    #[test]
+    fn two_lists_under_one_name_each_come_back() {
+        let opts = ProofOptions::default_test_options();
+        let one = vec![BusInteraction::sender(
+            7u64,
+            Multiplicity::One,
+            vec![BusValue::column(0), BusValue::column(1)],
+        )];
+        let two = vec![BusInteraction::sender(
+            7u64,
+            Multiplicity::One,
+            vec![BusValue::column(1), BusValue::column(0)],
+        )];
+        let name = "AIR_CACHE_TWO_LISTS";
+        for want in [&one, &two, &one, &two] {
+            let air = build_air(2, want.clone(), &opts, 1, EmptyConstraints, name);
+            assert!(
+                air.bus_interactions() == want.as_slice(),
+                "the list handed in"
+            );
+        }
+    }
+}

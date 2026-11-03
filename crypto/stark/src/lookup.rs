@@ -517,7 +517,7 @@ impl Packing {
 /// Used to build custom linear combinations of column values and constants.
 /// Supports both positive and negative coefficients (i64) for use in
 /// Multiplicity::Linear (e.g., μ - read2 - read4 - read8).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinearTerm {
     /// coefficient * column_value (coefficient can be negative)
     Column {
@@ -558,7 +558,7 @@ impl LinearTerm {
 /// on its packing (see [`BusValue::num_bus_elements`]); `Linear` always
 /// produces 1. The fingerprint is computed as: `z - (v₀ + α·v₁ + α²·v₂ + ...)`
 /// where each `vᵢ` is a bus element from a `BusValue`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BusValue {
     /// Columns combined with predefined packing (powers of 2).
     ///
@@ -1649,7 +1649,7 @@ pub struct AuxiliaryTraceBuildData {
 ///
 /// The multiplicity determines how many times each row contributes to the bus.
 /// Different use cases require different ways to compute this value.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Multiplicity {
     /// Constant multiplicity of 1 for all rows.
     /// Use when every row participates exactly once.
@@ -1764,7 +1764,7 @@ impl Multiplicity {
 ///
 /// BusInteraction::sender(BusId::Add, Multiplicity::Column(0), Packing::Direct.columns(&[1, 2, 3]))
 /// ```
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BusInteraction {
     /// Bus identifier. Senders and receivers on the same bus must use the same ID.
     /// Different buses can have different IDs to prevent cross-bus consumption.
