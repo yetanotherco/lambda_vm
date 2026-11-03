@@ -4995,10 +4995,12 @@ fn a_wrong_records_table_is_refused_by_the_verifier() {
 }
 
 /// Every streamed CPU and MEMW_R chunk held as records
-/// ([`Deviations::card_fill_streamed`]), the room rule admitting every one.
+/// ([`Deviations::card_fill_streamed`]), no row family's (whatever the
+/// knob's default), the room rule admitting every one.
 fn streamed_records(cpu: bool, memw_r: bool) -> Deviations {
     Deviations {
         card_fill_streamed: Some([cpu, memw_r]),
+        card_fill_rows: Some(RowFamilies::NONE),
         records_room: Some(std::sync::Arc::new(|_| true)),
         ..Deviations::default()
     }
@@ -5138,6 +5140,7 @@ fn counting_the_hand_out_on_its_own_thread_moves_no_byte() {
                     } else {
                         Deviations {
                             card_fill_streamed: Some([false, false]),
+                            card_fill_rows: Some(RowFamilies::NONE),
                             ..Deviations::default()
                         }
                     };
