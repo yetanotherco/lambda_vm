@@ -1973,7 +1973,8 @@ pub fn prove_whir_block_tree(
             .map_or("the gate".to_string(), |b| format!("{} MiB", b >> 20)),
     ));
     let opts = super::proof::block_base_options();
-    super::device_permit::arm(siblings);
+    // Armed for the siblings while the tree proves, and put back as it returns.
+    let _armed = super::device_permit::arm_scoped(siblings);
     sink.line(&format!(
         "W3 CONFIG: leaves {leaves:?} · siblings {siblings} · fan-in {fan_in} · layout workers {} (ahead {:?}) · streamed ops dropped {}",
         options.layout_workers,

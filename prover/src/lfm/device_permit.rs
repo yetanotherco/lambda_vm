@@ -292,6 +292,42 @@ pub fn arm(workers: usize) {
     WORKERS.store(workers.max(1), Ordering::Relaxed);
 }
 
+/// The permit armed for `workers` until the value drops, then put back to what
+/// it was: a driver that arms it for its siblings leaves no later prove in the
+/// process to find it armed.
+pub(crate) fn arm_scoped(workers: usize) -> Armed {
+    let before = WORKERS.load(Ordering::Relaxed);
+    arm(workers);
+    Armed { before }
+}
+
+/// What [`arm_scoped`] found, put back when it drops.
+pub(crate) struct Armed {
+    before: usize,
+}
+
+impl Drop for Armed {
+    fn drop(&mut self) {
+        arm(self.before);
+    }
+}
+
+/// The tests that arm the permit, read its counters or prove a tree (which
+/// arms it) run one at a time: the permit is process-wide, so in one test
+/// process any of them beside another would see the other's arming.
+#[cfg(test)]
+pub(crate) static PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// [`PERMIT_TEST_LOCK`] for a test that proves with the serial driver: taken
+/// through a poisoned lock (the test that failed holding it says why on its
+/// own), with the permit put back to inert.
+#[cfg(test)]
+pub(crate) fn serial_for_test() -> std::sync::MutexGuard<'static, ()> {
+    let guard = PERMIT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    arm(1);
+    guard
+}
+
 /// How many sibling proofs the driver is running at once.
 pub fn workers() -> usize {
     WORKERS.load(Ordering::Relaxed)
@@ -510,8 +546,9 @@ pub fn hold_labeled(phase: &'static str) -> CardPermit {
 mod tests {
     use super::*;
 
-    /// `arm` is process-global, so the tests that change it run one at a time.
-    static ARM: Mutex<()> = Mutex::new(());
+    /// `arm` is process-global, so the tests that change it run one at a time,
+    /// and one at a time with every other test that arms it or proves a tree.
+    use super::PERMIT_TEST_LOCK as ARM;
 
     fn disarm(_g: &std::sync::MutexGuard<'_, ()>) {
         arm(1);

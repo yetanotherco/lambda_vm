@@ -877,7 +877,7 @@ fn compose(
 #[test]
 #[ignore = "proves block leaves and nodes over a small block; box tier"]
 fn the_whir_block_tree_verifies_a_split_ecdas() {
-    super::device_permit::arm(1);
+    let _permit = super::device_permit::serial_for_test();
     let format = at_blowup_4(small_format());
     let (elf, proof) = small_block_at("test_ecsm_multi", &format, 4);
     assert_eq!(proof.table_counts.ecdas, 3, "three ECDAS tables");
@@ -934,7 +934,7 @@ fn the_whir_block_tree_verifies_a_split_ecdas() {
 #[test]
 #[ignore = "proves three small blocks and their trees; box tier"]
 fn the_whir_block_tree_verifies_split_keccak_and_ecsm() {
-    super::device_permit::arm(1);
+    let _permit = super::device_permit::serial_for_test();
     let format = at_blowup_4(small_format());
     let opts = ProofOptions::default_test_options();
     let wrap = aggregation_wrap_options();
@@ -1136,7 +1136,7 @@ fn the_lean_derive_is_the_held_derives_top_at_every_window() {
 #[test]
 #[ignore = "proves block leaves and nodes over a small block; box tier"]
 fn the_lean_derive_still_refuses_a_tampered_leaf_and_node() {
-    super::device_permit::arm(1);
+    let _permit = super::device_permit::serial_for_test();
     let format = small_format();
     let (elf, proof) = small_block("test_commit_4", &format);
     let opts = ProofOptions::default_test_options();
@@ -1234,7 +1234,7 @@ fn the_lean_derive_still_refuses_a_tampered_leaf_and_node() {
 #[test]
 #[ignore = "proves block leaves and nodes over a small block; box tier"]
 fn the_whir_block_tree_proves_to_the_derived_top() {
-    super::device_permit::arm(1);
+    let _permit = super::device_permit::serial_for_test();
     let format = small_format();
     let (elf, proof) = small_block("test_commit_4", &format);
     let opts = ProofOptions::default_test_options();
@@ -1491,7 +1491,7 @@ fn the_leaves_check_lean_by_default() {
 #[ignore = "proves two trees over a small block; box tier"]
 fn the_leaf_scale_is_the_verifiers_both_ways() {
     use super::whir_block::{LeafScale, verify_block_tree_capped};
-    super::device_permit::arm(1);
+    let _permit = super::device_permit::serial_for_test();
     let format = BlockFormat {
         zf: ZfFormat {
             whir_blowup: 4,
@@ -1595,7 +1595,7 @@ fn the_leaf_scale_is_the_verifiers_both_ways() {
 #[ignore = "proves two trees over a small block; box tier"]
 fn the_packed_block_proves_to_the_derived_top_and_only_there() {
     use multilinear::whir_chain::GkrPack;
-    super::device_permit::arm(1);
+    let _permit = super::device_permit::serial_for_test();
     let today = at_blowup_4(BlockFormat {
         argue: ArgueFormat::BATCHED,
         ..small_format()
@@ -1755,7 +1755,7 @@ fn lean_block_leaves_execute_and_refuse_a_tampered_witness() {
 fn the_leaf_query_is_the_verifiers_both_ways() {
     use super::whir_block::{LEAF_P1_CAP, verify_block_tree_capped};
     use super::whir_chain::LeafQuery;
-    super::device_permit::arm(1);
+    let _permit = super::device_permit::serial_for_test();
     // At blowup 4 ([`at_blowup_4`]): at blowup 2 this small format's V1
     // groups pass a single leaf's room, so the rule's partition refuses.
     let format = at_blowup_4(small_format());
@@ -2957,6 +2957,7 @@ fn a_failed_program_fails_every_program_above_it_without_a_hang() {
 #[ignore = "a real block and its recursion: box only"]
 fn the_whir_block_tree_on_a_real_block() {
     use super::whir_block_tree::{StdoutSink, WhirTreeConfig, prove_whir_block_tree};
+    let _permit = super::device_permit::serial_for_test();
     let elf = std::fs::read(std::env::var("BLOCK_WHIR_ELF").expect("BLOCK_WHIR_ELF"))
         .expect("read the ELF");
     let input = std::fs::read(std::env::var("BLOCK_WHIR_INPUT").expect("BLOCK_WHIR_INPUT"))
@@ -3563,7 +3564,7 @@ fn a_batched_block_leaf_refuses_a_tampered_witness() {
 #[test]
 #[ignore = "proves a block tree; box tier"]
 fn the_batched_whir_block_tree_proves_to_the_derived_top() {
-    super::device_permit::arm(1);
+    let _permit = super::device_permit::serial_for_test();
     let format = small_batched();
     let (elf, proof) = small_block("test_commit_4", &format);
     let opts = ProofOptions::default_test_options();
