@@ -15,6 +15,14 @@ fn packed(bin_log_cells: u8, tree_log_cells: u8) -> ChainConfig {
     })
 }
 
+/// The batched format at `bin_log_cells` with one tree a table.
+fn unpacked(bin_log_cells: u8) -> ChainConfig {
+    config(ArgueFormat::Batched {
+        bin_log_cells,
+        pack: GkrPack::Off,
+    })
+}
+
 fn shape_of(interactions: usize, num_vars: usize) -> ArgueShape {
     ArgueShape {
         num_vars,
@@ -115,7 +123,7 @@ fn the_off_layout_is_one_borrowed_tree_a_table() {
     let airs = airs();
     let fans = fan_airs();
     let fan_cols = fan_cols();
-    let cfg = batched(27);
+    let cfg = unpacked(27);
     let committed = commit(packed_tables(&airs, &fans, &fan_cols), &cfg);
     let plan = plan_of(&committed, &cfg);
     assert_eq!(plan.trees(), committed.tables().len());
@@ -411,29 +419,29 @@ fn packed_faulted(faults: ProverFaults) -> Result<(), MlError> {
 
 // ─── neither verifier takes the other's proof ────────────────────────────
 
-/// ★ A packed proof is refused by today's verifier, and today's proof by the
+/// ★ A packed proof is refused by the unpacked verifier, and the unpacked proof by the
 /// packed verifier: the format is the verifier's constant, never the proof's.
 #[test]
 fn neither_format_verifies_the_others_proof() {
     let airs = airs();
     let fans = fan_airs();
     let fan_cols = fan_cols();
-    let today = batched(27);
+    let today = unpacked(27);
     let pack = packed(27, 2);
     let committed = commit(packed_tables(&airs, &fans, &fan_cols), &today);
     let todays = prove(&committed, &today, ProverFaults::default());
     let packs = prove(&committed, &pack, ProverFaults::default());
-    verify(&committed, &todays, &today).expect("today's proof, today's verifier");
+    verify(&committed, &todays, &today).expect("the unpacked proof, the unpacked verifier");
     verify(&committed, &packs, &pack).expect("the packed proof, the packed verifier");
     assert_eq!(
         verify(&committed, &packs, &today),
         Err(MlError::ArgueShapeMismatch { part: "tables" }),
-        "today's verifier refuses a packed proof"
+        "the unpacked verifier refuses a packed proof"
     );
     assert_eq!(
         verify(&committed, &todays, &pack),
         Err(MlError::ArgueShapeMismatch { part: "tables" }),
-        "the packed verifier refuses today's proof"
+        "the packed verifier refuses the unpacked proof"
     );
     // Another price that cuts the same tables another way is another format.
     let other = packed(27, 0);
@@ -444,14 +452,14 @@ fn neither_format_verifies_the_others_proof() {
     );
 }
 
-/// Where no table is cut, the packed proof is today's proof, byte for byte:
+/// Where no table is cut, the packed proof is the unpacked proof, byte for byte:
 /// one protocol instance, so either verifier takes it.
 #[test]
 fn with_nothing_cut_the_packed_proof_is_todays() {
     let airs = airs();
     let fans = fan_airs();
     let fan_cols = fan_cols();
-    let today = batched(27);
+    let today = unpacked(27);
     let uncut = packed(27, 40);
     let committed = commit(packed_tables(&airs, &fans, &fan_cols), &today);
     assert!(
@@ -466,7 +474,7 @@ fn with_nothing_cut_the_packed_proof_is_todays() {
         bincode::serialize(&todays).unwrap() == bincode::serialize(&uncuts).unwrap(),
         "the same bytes"
     );
-    verify(&committed, &uncuts, &today).expect("today's verifier");
+    verify(&committed, &uncuts, &today).expect("the unpacked verifier");
 }
 
 // ─── tampers under the packing ───────────────────────────────────────────

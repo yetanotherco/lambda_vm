@@ -417,9 +417,9 @@ pub enum ArgueFormat {
         /// `log2` of a bin's cap on `Σ 2^{k_T}`, `k_T` a tree's input
         /// variables. A tree at or over the cap sits alone.
         bin_log_cells: u8,
-        /// How a table's interactions are laid into trees. [`GkrPack::Off`]
-        /// = today: one tree a table, its interactions padded to a power of
-        /// two.
+        /// How a table's interactions are laid into trees: production
+        /// [`GkrPack::PRODUCTION`]; [`GkrPack::Off`] is one tree a table, its
+        /// interactions padded to a power of two.
         pack: GkrPack,
     },
 }
@@ -428,25 +428,24 @@ impl ArgueFormat {
     /// The production cap: `2^26` input cells a bin. D-BATCH §4.4 planned
     /// `2^27` with `2^26` its fallback (§8.2); on the block's 15 epochs bins of
     /// `2^27` overran the card (12 tree builds refused, FAST 347) and bins of
-    /// `2^26` refused none.
-    pub const BATCHED: Self = Self::Batched {
-        bin_log_cells: 26,
-        pack: GkrPack::Off,
-    };
+    /// `2^26` refused none. Its trees are packed at
+    /// [`GkrPack::PRODUCTION`].
+    pub const BATCHED: Self = Self::batched(26);
 
-    /// The batched format at `bin_log_cells`, its trees laid out today's way.
+    /// The batched format at `bin_log_cells`, its trees packed at
+    /// [`GkrPack::PRODUCTION`].
     pub const fn batched(bin_log_cells: u8) -> Self {
         Self::Batched {
             bin_log_cells,
-            pack: GkrPack::Off,
+            pack: GkrPack::PRODUCTION,
         }
     }
 }
 
 /// How the batched argue lays a table's interactions into LogUp-GKR trees.
 ///
-/// [`Off`](Self::Off) is today's: one tree a table over its interactions
-/// padded to a power of two with `0/1`. [`Chunks`](Self::Chunks) cuts a table
+/// [`Off`](Self::Off) is one tree a table over its interactions padded to a
+/// power of two with `0/1`. [`Chunks`](Self::Chunks) cuts a table
 /// whose padding costs more than the trees it would add into `c` trees of
 /// `2^b` slots each, the chunks of its interactions in order, all in one bin:
 /// they end at one point, and their claims combine at a fresh challenge into
@@ -460,7 +459,7 @@ impl ArgueFormat {
 /// absorbed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum GkrPack {
-    /// One tree a table. Today's format.
+    /// One tree a table, the format before packing.
     #[default]
     Off,
     /// A table cut into equal chunks where that saves cells: each extra tree
@@ -469,6 +468,13 @@ pub enum GkrPack {
         /// `log2` of the input cells one more tree is worth.
         tree_log_cells: u8,
     },
+}
+
+impl GkrPack {
+    /// The production packing: each extra tree priced at `2^22` input cells.
+    /// On a block's tables that cuts CPU, MEMW_A and SHIFT in 3 and KECCAK_RND
+    /// in 5.
+    pub const PRODUCTION: Self = Self::Chunks { tree_log_cells: 22 };
 }
 
 /// Which proof-of-work nonces a round's encoding carries (P2's format half).

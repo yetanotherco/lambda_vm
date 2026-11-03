@@ -318,15 +318,15 @@ pub fn leaf_scale_line(scale: LeafScale, plan: &WhirBlockPlan) -> String {
 /// which is among the first emitted.
 pub const LEAF_EMITTERS: usize = 3;
 
-/// `BLOCK_WHIR_ARGUE_PACK`'s reading: unset
-/// or `off` is today's one GKR tree a table ([`GkrPack::Off`]); a count `τ` in
-/// `0..=40` cuts a table into equal chunks where that saves input cells, each
-/// extra tree priced at `2^τ` ([`GkrPack::Chunks`]). A format value: the prover
-/// and the verifier of one proof take the same one, and only a base-only
-/// process admits anything but `off` (`block_whir::checked_argue_only`).
+/// `BLOCK_WHIR_ARGUE_PACK`'s reading: unset is the production packing
+/// ([`GkrPack::PRODUCTION`]); `off` is one GKR tree a table ([`GkrPack::Off`]);
+/// a count `τ` in `0..=40` cuts a table into equal chunks where that saves
+/// input cells, each extra tree priced at `2^τ` ([`GkrPack::Chunks`]). A format
+/// value: the prover and the verifier of one proof take the same one.
 pub fn pack_setting(knob: Option<&str>) -> Result<GkrPack, String> {
     match knob.map(str::trim) {
-        None | Some("off") => Ok(GkrPack::Off),
+        None => Ok(GkrPack::PRODUCTION),
+        Some("off") => Ok(GkrPack::Off),
         Some(v) => v
             .parse::<u8>()
             .ok()
@@ -340,7 +340,7 @@ pub fn pack_setting(knob: Option<&str>) -> Result<GkrPack, String> {
 /// trees to pack.
 fn with_pack(argue: ArgueFormat, pack: GkrPack) -> Result<ArgueFormat, String> {
     match (argue, pack) {
-        (argue, GkrPack::Off) => Ok(argue),
+        (ArgueFormat::PerTable, GkrPack::Off) => Ok(argue),
         (ArgueFormat::Batched { bin_log_cells, .. }, pack) => Ok(ArgueFormat::Batched {
             bin_log_cells,
             pack,
@@ -388,10 +388,12 @@ impl WhirTreeConfig {
             Err(_) => BlockFormat::production().argue,
             Ok(other) => return Err(format!("BLOCK_WHIR_ARGUE={other}: per-table or batched")),
         };
-        let argue = with_pack(
-            argue,
-            pack_setting(std::env::var("BLOCK_WHIR_ARGUE_PACK").ok().as_deref())?,
-        )?;
+        // Unset, the argue keeps its own packing (the production one when
+        // batched); set, the knob's packing replaces it.
+        let argue = match std::env::var("BLOCK_WHIR_ARGUE_PACK") {
+            Ok(word) => with_pack(argue, pack_setting(Some(&word))?)?,
+            Err(_) => argue,
+        };
         let format = BlockFormat {
             argue,
             leaf_scale,
@@ -3067,13 +3069,13 @@ mod tests {
             "the sibling count is scheduling only"
         );
         // A packing is a named constant the block verifier is given too: a
-        // tree argued under it, its format saying so, is at the presets; a
-        // config whose argue and format disagree is not.
-        let pack = GkrPack::Chunks { tree_log_cells: 22 };
+        // tree argued under another (here `Off`), its format saying so, is at
+        // the presets; a config whose argue and format disagree is not.
+        let pack = GkrPack::Off;
         let mut c = production.clone();
         c.format = c.format.with_pack(pack);
         c.argue = c.format.argue;
-        assert!(c.at_presets(), "a packed argue, named on both");
+        assert!(c.at_presets(), "an unpacked argue, named on both");
         let mut c = production.clone();
         c.argue = BlockFormat::production().with_pack(pack).argue;
         assert!(!c.at_presets(), "an argue its format does not carry");

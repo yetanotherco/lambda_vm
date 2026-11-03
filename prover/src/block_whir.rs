@@ -424,9 +424,10 @@ impl BlockFormat {
 
     /// This format with its batched argue's GKR trees laid out per `pack`:
     /// a named constant the prover and the
-    /// verifier of one block both take, never read from a proof.
-    /// [`GkrPack::Off`](multilinear::whir_chain::GkrPack::Off) is today's
-    /// trees. A per-table argue has no trees to pack and is returned as it is.
+    /// verifier of one block both take, never read from a proof. Production
+    /// is [`GkrPack::PRODUCTION`](multilinear::whir_chain::GkrPack::PRODUCTION);
+    /// [`GkrPack::Off`](multilinear::whir_chain::GkrPack::Off) is one tree a
+    /// table. A per-table argue has no trees to pack and is returned as it is.
     pub fn with_pack(self, pack: multilinear::whir_chain::GkrPack) -> Self {
         let argue = match self.argue {
             ArgueFormat::Batched { bin_log_cells, .. } => ArgueFormat::Batched {

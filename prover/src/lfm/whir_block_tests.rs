@@ -1586,8 +1586,9 @@ fn the_leaf_scale_is_the_verifiers_both_ways() {
 /// ★ A block argued with its GKR slots packed (`GkrPack::Chunks`): its leaves
 /// execute and their shares cancel — a cut table's chunk outputs added as one
 /// fraction in-guest — and its tree proves to the top the packed verifier
-/// derives. The packing is the verifier's: today's verifier refuses the packed
-/// top, and the packed verifier refuses today's top over the same program.
+/// derives. The packing is the verifier's: the unpacked verifier (`Off`)
+/// refuses the packed top, and the packed verifier refuses the unpacked top
+/// over the same program. (τ = 8 cuts tables of this small block.)
 #[test]
 #[ignore = "proves two trees over a small block; box tier"]
 fn the_packed_block_proves_to_the_derived_top_and_only_there() {
@@ -1596,12 +1597,13 @@ fn the_packed_block_proves_to_the_derived_top_and_only_there() {
     let today = at_blowup_4(BlockFormat {
         argue: ArgueFormat::BATCHED,
         ..small_format()
-    });
+    })
+    .with_pack(GkrPack::Off);
     let packed = today.with_pack(GkrPack::Chunks { tree_log_cells: 8 });
     let opts = ProofOptions::default_test_options();
     let wrap = aggregation_wrap_options();
     let mut tops = Vec::new();
-    for (tag, format) in [("TODAY", today), ("PACKED", packed)] {
+    for (tag, format) in [("OFF", today), ("PACKED", packed)] {
         let (elf, proof) = small_block("test_keccak", &format);
         let outputs: usize = proof.argues.iter().map(|a| a.bus_outputs.len()).sum();
         if tag == "PACKED" {
@@ -1655,11 +1657,11 @@ fn the_packed_block_proves_to_the_derived_top_and_only_there() {
     };
     assert!(
         under(1, &today).is_err(),
-        "today's verifier refuses the packed top"
+        "the unpacked verifier refuses the packed top"
     );
     assert!(
         under(0, &packed).is_err(),
-        "the packed verifier refuses today's top"
+        "the packed verifier refuses the unpacked top"
     );
 }
 
@@ -3293,10 +3295,10 @@ fn the_whir_block_tree_on_a_real_block() {
         }
     }
     let t = std::time::Instant::now();
-    // The production verifier when the run is at its pinned presets, given the
-    // run's group opening (`LAMBDA_VM_WHIR_GROUP`) and GKR packing
-    // (`BLOCK_WHIR_ARGUE_PACK`) as the CLI's `verify-block --group
-    // --argue-pack` give them; the fixture form, at the run's own format, when
+    // The production verifier when the run is at its pinned presets (the
+    // public grouped verifier at the production packing), given the run's group
+    // opening (`LAMBDA_VM_WHIR_GROUP`) and GKR packing (`BLOCK_WHIR_ARGUE_PACK`)
+    // as the CLI's `verify-block --group --argue-pack` give them; the fixture form, at the run's own format, when
     // a knob moved the tree or the format off them (the pinned verifier would
     // refuse such a run: its format is constants, not the environment's).
     let pack = match argue {
@@ -3311,7 +3313,7 @@ fn the_whir_block_tree_on_a_real_block() {
         && argue == pinned.argue
         && at_pinned
     {
-        if pack == multilinear::whir_chain::GkrPack::Off {
+        if pack == multilinear::whir_chain::GkrPack::PRODUCTION {
             super::whir_block::verify_block_tree_grouped(&elf, proof.statement(), top, format.group)
         } else {
             super::whir_block::verify_block_tree_as(

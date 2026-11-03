@@ -633,6 +633,13 @@ fn p1_format() -> BlockFormat {
     }
 }
 
+/// [`p1_format`] at blowup 2 (the production rate), every other field its own.
+fn p1_format_at_blowup_2() -> BlockFormat {
+    let mut format = p1_format();
+    format.zf.whir_blowup = 2;
+    format
+}
+
 fn rows(hash: usize, select: usize, balu: usize, hint: usize) -> ChipRows {
     ChipRows {
         hash,
@@ -1090,9 +1097,11 @@ fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
 /// ★ Each query check's leaf programs on the median mix at blowup 2 (the
 /// production rate), pinned: the leaf count (the leaf scale's own), and the
 /// digest of the first and the last leaf (every instruction and the arena schema, as `Debug` prints
-/// them) under [`LeafQuery::V1`] and [`LeafQuery::Lean`], each named; the
-/// default's first leaf is the lean one. A change of which check is the
-/// default moves neither pin.
+/// them) under [`LeafQuery::V1`] and [`LeafQuery::Lean`], each named, at the
+/// production GKR packing and at `Off` (one tree a table: the programs before
+/// the packing became production's, unchanged); the default's first leaf is
+/// the lean one at the production packing. A change of which check is the
+/// default moves no pin.
 ///
 /// Every leaf absorbs the ELF (its digest and its pages), and the built
 /// `poc_rodata_commit.elf` differs by the assembler that made it, so the
@@ -1106,15 +1115,32 @@ fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
 fn the_median_mix_leaves_are_pinned_under_each_query_check() {
     use super::whir_chain::LeafQuery;
     use super::whir_chain_tests::program_digest;
-    const PINS: [(LeafQuery, usize, &str, &str); 2] = [
+    use multilinear::whir_chain::GkrPack;
+    const PINS: [(LeafQuery, GkrPack, usize, &str, &str); 4] = [
         (
             LeafQuery::V1,
+            GkrPack::PRODUCTION,
+            5,
+            "24dc068769f1a38fdda271559c3918d8146666c6c24dc015d70782bb2f113b5c",
+            "491998ddcd396c7703a3a9d7dcd8a72cb29a7f8191da110aea796d53757ebd3e",
+        ),
+        (
+            LeafQuery::Lean,
+            GkrPack::PRODUCTION,
+            5,
+            "055bc62eba89a898a8e8728401370a90edbf8122d565de88f05310127a33d1b4",
+            "ce51c07238f53afb5deb58551f918ff39d3816ad3d717ad70b5e441bc867e454",
+        ),
+        (
+            LeafQuery::V1,
+            GkrPack::Off,
             5,
             "07f558619e111cca75018ac12c244fb6b0319e60eb8bf36695119b71a66fdc11",
             "93fcbcf64a9fb55c08bb75dd27c7241aef553bf875b678a358050398c8663340",
         ),
         (
             LeafQuery::Lean,
+            GkrPack::Off,
             5,
             "3f94f9beb7a983b88c3873b0f137f197ef00b07e797978d2da3f9e6b2cbf4a78",
             "207745f8b67e3bd04f4ad051dc35194b4376facffe12d3869f6ae979b7ea0017",
@@ -1122,46 +1148,51 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
     ];
     let elf_bytes: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
     let opts = super::proof::block_base_options();
-    let at = |leaf_query: LeafQuery| {
+    let at = |leaf_query: LeafQuery, pack: GkrPack| {
         let mut format = p1_format();
         format.zf.whir_blowup = 2;
         BlockFormat {
             leaf_query,
             ..format
         }
+        .with_pack(pack)
     };
-    let owned = median_statement(elf_bytes, &opts, &at(LeafQuery::V1));
+    let owned = median_statement(elf_bytes, &opts, &at(LeafQuery::V1, GkrPack::PRODUCTION));
     // Every value measured and printed before any is compared, so one run shows
     // all of them when the leaves move.
     let measured: Vec<(usize, String, String)> = PINS
         .iter()
-        .map(|&(query, ..)| {
-            let plan = WhirBlockPlan::derive(elf_bytes, &opts, &at(query), owned.view(), None)
-                .expect("the plan derives");
+        .map(|&(query, pack, ..)| {
+            let plan =
+                WhirBlockPlan::derive(elf_bytes, &opts, &at(query, pack), owned.view(), None)
+                    .expect("the plan derives");
             let n = plan.partition().num_leaves();
             let digest = |k: usize| program_digest(&plan.leaf_program(k).expect("the leaf emits"));
             let (d_first, d_last) = (digest(0), digest(n - 1));
-            println!("LEAF PINS {query:?}: {n} leaves · first {d_first} · last {d_last}");
+            println!("LEAF PINS {query:?} {pack:?}: {n} leaves · first {d_first} · last {d_last}");
             (n, d_first, d_last)
         })
         .collect();
-    for ((query, leaves, first, last), (n, d_first, d_last)) in PINS.iter().zip(&measured) {
-        assert_eq!(n, leaves, "{query:?}: leaves");
-        assert_eq!(d_first, first, "{query:?}: the first leaf's program");
-        assert_eq!(d_last, last, "{query:?}: the last leaf's program");
+    for ((query, pack, leaves, first, last), (n, d_first, d_last)) in PINS.iter().zip(&measured) {
+        assert_eq!(n, leaves, "{query:?} {pack:?}: leaves");
+        assert_eq!(
+            d_first, first,
+            "{query:?} {pack:?}: the first leaf's program"
+        );
+        assert_eq!(d_last, last, "{query:?} {pack:?}: the last leaf's program");
     }
     let default = WhirBlockPlan::derive(
         elf_bytes,
         &opts,
-        &at(LeafQuery::default()),
+        &p1_format_at_blowup_2(),
         owned.view(),
         None,
     )
     .expect("the plan derives");
     assert_eq!(
         program_digest(&default.leaf_program(0).expect("the leaf emits")),
-        PINS[1].2,
-        "the default's first leaf is the lean check's"
+        PINS[1].3,
+        "the default's first leaf is the lean check's at the production packing"
     );
 }
 

@@ -270,10 +270,6 @@ impl Fixture {
     }
 }
 
-fn plan_of(layouts: &[TableLayout<'_, F, E>], cap: u8) -> ArguePlan {
-    plan_packed(layouts, cap, GkrPack::Off)
-}
-
 fn plan_packed(layouts: &[TableLayout<'_, F, E>], cap: u8, pack: GkrPack) -> ArguePlan {
     let shapes: Vec<ArgueShape> = layouts
         .iter()
@@ -724,16 +720,22 @@ fn the_batched_leg_refuses_what_the_host_rejects() {
     }
 }
 
-/// The format constant is what plans: `ArgueFormat::BATCHED`'s cap puts these
-/// three tables in one bin.
+/// The format constant is what plans: `ArgueFormat::BATCHED`'s cap and
+/// packing put these three tables in one bin, none of them cut.
 #[test]
 fn the_production_cap_bins_the_fixture_once() {
-    let ArgueFormat::Batched { bin_log_cells, .. } = ArgueFormat::BATCHED else {
+    let ArgueFormat::Batched {
+        bin_log_cells,
+        pack,
+    } = ArgueFormat::BATCHED
+    else {
         unreachable!()
     };
     let fixture = Fixture::new();
     let layouts = fixture.layouts();
-    assert_eq!(plan_of(&layouts, bin_log_cells).bins, vec![vec![0, 1, 2]]);
+    let plan = plan_packed(&layouts, bin_log_cells, pack);
+    assert_eq!(plan.bins, vec![vec![0, 1, 2]]);
+    assert_eq!(plan.trees(), 3);
 }
 
 // ─── The leaf's two asserts, each against a forgery only it refuses ──

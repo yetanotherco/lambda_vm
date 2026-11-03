@@ -2723,16 +2723,16 @@ mod pack_tests {
     /// constants — its cap and its packing — and reads no other.
     #[test]
     fn the_recursion_plans_by_the_formats_cap_and_packing() {
-        let today = super::batched_cap(&config(ArgueFormat::BATCHED)).expect("batched");
+        let production = super::batched_cap(&config(ArgueFormat::BATCHED)).expect("batched");
         assert_eq!(
-            today,
+            production,
             Some(super::BatchedPlanning {
                 bin_log_cells: 26,
-                pack: GkrPack::Off
+                pack: GkrPack::PRODUCTION
             })
         );
         assert_eq!(super::batched_cap(&config(ArgueFormat::PerTable)), Ok(None));
-        let pack = GkrPack::Chunks { tree_log_cells: 22 };
+        let pack = GkrPack::Off;
         let packed = ArgueFormat::Batched {
             bin_log_cells: 26,
             pack,

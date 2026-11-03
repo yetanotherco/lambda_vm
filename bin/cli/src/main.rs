@@ -414,12 +414,12 @@ enum Commands {
         leaf_query: String,
 
         /// How the base's batched argue lays a table's interactions into GKR
-        /// trees: `off` (production, one tree a table) or a price `τ` in
-        /// 0..=40, a table cut into equal chunk trees where that saves more
-        /// input cells than the 2^τ each extra tree is priced at. A format
+        /// trees: a price `τ` in 0..=40, a table cut into equal chunk trees
+        /// where that saves more input cells than the 2^τ each extra tree is
+        /// priced at (production: 22), or `off` (one tree a table). A format
         /// choice: `verify-block` must be given the same one; the proof file
         /// does not carry it.
-        #[arg(long, value_parser = argue_pack_word, default_value = "off")]
+        #[arg(long, value_parser = argue_pack_word, default_value = "22")]
         argue_pack: String,
     },
 
@@ -464,8 +464,9 @@ enum Commands {
         leaf_query: String,
 
         /// The GKR packing the block was proved with (`prove-block
-        /// --argue-pack`): the verifier's constant, never read from the proof.
-        #[arg(long, value_parser = argue_pack_word, default_value = "off")]
+        /// --argue-pack`, production 22): the verifier's constant, never read
+        /// from the proof.
+        #[arg(long, value_parser = argue_pack_word, default_value = "22")]
         argue_pack: String,
     },
 
@@ -2340,6 +2341,41 @@ mod tests {
             Ok(LeafQuery::default()),
             "the flag's default is production's"
         );
+    }
+
+    /// Both block commands take the GKR packing as `--argue-pack`, `off` or a
+    /// price; unset, both read the production packing (the harness's unset
+    /// reading).
+    #[test]
+    fn the_block_commands_take_the_argue_pack() {
+        use prover::lfm::whir_block_tree::pack_setting;
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+        let prove = ["cli", "prove-block", "guest.elf", "-o", "block.proof"];
+        let verify = ["cli", "verify-block", "block.proof", "guest.elf"];
+        for cmd in [&prove[..], &verify[..]] {
+            let pack = |args: &[&str]| match parse(args).map(|cli| cli.command) {
+                Ok(
+                    Commands::ProveBlock { argue_pack, .. }
+                    | Commands::VerifyBlock { argue_pack, .. },
+                ) => Some(argue_pack),
+                _ => None,
+            };
+            let default = pack(cmd).expect("the default parses");
+            assert_eq!(
+                pack_setting(Some(&default)),
+                pack_setting(None),
+                "the default is production's"
+            );
+            assert_ne!(pack_setting(Some("off")), pack_setting(None));
+            for word in ["off", "22", "0", "40"] {
+                let args = [cmd, &["--argue-pack", word]].concat();
+                assert_eq!(pack(&args).as_deref(), Some(word));
+            }
+            for word in ["", "on", "41", "-1", "OFF"] {
+                let args = [cmd, &["--argue-pack", word]].concat();
+                assert!(parse(&args).is_err(), "--argue-pack {word:?} is refused");
+            }
+        }
     }
 
     /// The block commands take no base hash: the block's base is its proof

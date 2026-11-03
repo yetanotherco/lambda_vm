@@ -248,7 +248,7 @@ const OFF_DEFAULT: [(&str, &str); 7] = [
     (crate::lfm::whir_block::LEAF_QUERY_ENV, "v1"),
     (crate::lfm::whir_block::LEAF_DOUBLE_FROM_ENV, "off"),
     ("LFM_WHIR_SHARE_INVERSE", "0"),
-    ("BLOCK_WHIR_ARGUE_PACK", "22"),
+    ("BLOCK_WHIR_ARGUE_PACK", "off"),
 ];
 
 /// ★ The block verifier reads no format from its environment. In a process of
@@ -312,7 +312,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         harness.format.argue,
         multilinear::whir_chain::ArgueFormat::Batched {
             bin_log_cells: 26,
-            pack: multilinear::whir_chain::GkrPack::Chunks { tree_log_cells: 22 },
+            pack: multilinear::whir_chain::GkrPack::Off,
         },
         "the harness's argue follows its packing knob"
     );
@@ -351,7 +351,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         LeafOrder::Natural,
         LeafScale::Fixed,
         LeafQuery::V1,
-        multilinear::whir_chain::GkrPack::Off,
+        multilinear::whir_chain::GkrPack::PRODUCTION,
     )
     .expect("named choices");
     assert_eq!(
@@ -369,7 +369,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
     assert_eq!(
         at.format.argue,
         multilinear::whir_chain::ArgueFormat::BATCHED,
-        "the packing named Off is today's argue"
+        "the packing named PRODUCTION is the production argue"
     );
     assert!(at.share_inverse);
 
