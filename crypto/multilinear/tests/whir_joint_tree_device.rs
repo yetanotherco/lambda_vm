@@ -90,7 +90,8 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-type Proved = (Vec<[u8; 32]>, StackedProof<F, Ext>);
+/// The roots, the proof, and the round-0 leaf permutations its commit paid.
+type Proved = (Vec<[u8; 32]>, StackedProof<F, Ext>, u64);
 
 struct Stack {
     name: &'static str,
@@ -174,12 +175,14 @@ impl Stack {
     ) -> Result<Proved, multilinear::Error> {
         let refs: Vec<&Mle<F>> = self.columns.iter().collect();
         let store = gpu::upload_columns(&refs).expect("resident columns (a GPU)");
+        let perms = gpu::commit_leaf_perms();
         let committed = StackedCommitment::<F, P1Whir>::commit(
             self.layout.clone(),
             &borrow(&self.columns),
             Some((&store, 0)),
             cfg,
         )?;
+        let perms = gpu::commit_leaf_perms() - perms;
         let roots = committed.roots();
         let stacked = match drop {
             None => committed,
@@ -200,7 +203,7 @@ impl Stack {
             cfg,
             &mut sponge(),
         )?;
-        Ok((roots, proof))
+        Ok((roots, proof, perms))
     }
 
     fn verify(
@@ -249,7 +252,7 @@ fn a_joint_run_on_the_card_proves_the_hosts_bytes() {
         Stack::runs_of_four_and_two(),
         Stack::runs_of_four_and_one(),
     ] {
-        let (host_roots, host_proof) = stack.on_the_host(&cfg);
+        let (host_roots, host_proof, _) = stack.on_the_host(&cfg);
         stack.verify(&host_roots, &host_proof, &cfg, stack.name);
         assert_eq!(
             host_roots.len() as u64,
@@ -266,13 +269,12 @@ fn a_joint_run_on_the_card_proves_the_hosts_bytes() {
             stack.name
         );
 
-        let perms = gpu::commit_leaf_perms();
         let fallbacks = gpu::host_fallbacks();
-        let (roots, whole) = stack
+        let (roots, whole, perms) = stack
             .try_prove(&cfg, None)
             .unwrap_or_else(|e| panic!("{}, whole: {e:?}", stack.name));
         assert_eq!(
-            gpu::commit_leaf_perms() - perms,
+            perms,
             stack.leaf_perms(&cfg),
             "{}: the commit's leaf permutations",
             stack.name
@@ -294,7 +296,7 @@ fn a_joint_run_on_the_card_proves_the_hosts_bytes() {
             let label = format!("{}, revived at drop {drop}", stack.name);
             let from_stack = gpu::coset_openings();
             let reencoded = gpu::coset_fallbacks();
-            let (roots, proof) = stack
+            let (roots, proof, _) = stack
                 .try_prove(&cfg, Some(drop))
                 .unwrap_or_else(|e| panic!("{label}: {e:?}"));
             assert_eq!(
@@ -321,7 +323,7 @@ fn a_joint_run_on_the_card_proves_the_hosts_bytes() {
         let reencoded = stack.try_prove(&cfg, Some(4));
         let moved = gpu::coset_openings() - from_stack;
         gpu::force_coset_openings(None);
-        let (_, reencoded) = reencoded.unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        let (_, reencoded, _) = reencoded.unwrap_or_else(|e| panic!("{label}: {e:?}"));
         assert_eq!(moved, 0, "{label}: no tree from its stack");
         assert!(
             bytes(&reencoded) == bytes(&host_proof),
@@ -339,12 +341,8 @@ fn one_tree_a_run_saves_two_permutations_a_leaf_of_a_run_of_three() {
     let stack = Stack::run_of_three();
     let one = config(Round0Trees::One);
     let each = config(Round0Trees::Each);
-    let perms = gpu::commit_leaf_perms();
-    let (each_roots, each_proof) = stack.try_prove(&each, None).unwrap();
-    let each_perms = gpu::commit_leaf_perms() - perms;
-    let perms = gpu::commit_leaf_perms();
-    let (one_roots, one_proof) = stack.try_prove(&one, None).unwrap();
-    let one_perms = gpu::commit_leaf_perms() - perms;
+    let (each_roots, each_proof, each_perms) = stack.try_prove(&each, None).unwrap();
+    let (one_roots, one_proof, one_perms) = stack.try_prove(&one, None).unwrap();
     let leaves = 1u64 << (18 + 2 - 6);
     assert_eq!((each_perms, one_perms), (18 * leaves, 16 * leaves));
     stack.verify(&each_roots, &each_proof, &each, "each");
