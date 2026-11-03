@@ -361,6 +361,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         GroupFold::Indexed,
         WhirBlowup::Four,
         LeafOrder::Natural,
+        multilinear::whir_chain::Round0Trees::Each,
         LeafScale::Fixed,
         LeafQuery::V1,
         multilinear::whir_chain::GkrPack::PRODUCTION,
@@ -439,5 +440,49 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         verifier.id(),
         prover_at(&pinned_format).id(),
         "a production prover's plan claims the verifier's block"
+    );
+
+    // The round-0 trees are a named choice like the rest: the verifier at the
+    // other one derives another block, a prover of that one claims it, and
+    // one tree a run under the natural order has no presets at all.
+    use multilinear::whir_chain::Round0Trees;
+    let other = match pinned_format.zf.whir_trees {
+        Round0Trees::Each => Round0Trees::One,
+        Round0Trees::One => Round0Trees::Each,
+    };
+    let named = verifier_presets_at(
+        GroupFold::Indexed,
+        WhirBlowup::Two,
+        LeafOrder::Coset,
+        other,
+        pinned_format.leaf_scale,
+        pinned_format.leaf_query,
+        multilinear::whir_chain::GkrPack::PRODUCTION,
+    )
+    .expect("the other trees");
+    assert_eq!(named.format.zf.whir_trees, other);
+    let other_verifier = verifier_plan(elf, statement.view(), &named).expect("the other plan");
+    assert_ne!(
+        other_verifier.id(),
+        verifier.id(),
+        "the other trees claim another block"
+    );
+    assert_eq!(
+        other_verifier.id(),
+        prover_at(&named.format).id(),
+        "a prover of the other trees claims that verifier's block"
+    );
+    assert!(
+        verifier_presets_at(
+            GroupFold::Indexed,
+            WhirBlowup::Two,
+            LeafOrder::Natural,
+            Round0Trees::One,
+            pinned_format.leaf_scale,
+            pinned_format.leaf_query,
+            multilinear::whir_chain::GkrPack::PRODUCTION,
+        )
+        .is_err(),
+        "one tree a run under the natural order is refused"
     );
 }

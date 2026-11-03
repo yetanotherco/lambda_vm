@@ -497,14 +497,23 @@ impl ZfFormat {
                 }
             };
         }
-        if let Some(v) = get(ENV_WHIR_TREES) {
-            format.whir_trees = match v.as_str() {
-                "each" => Round0Trees::Each,
-                "one" => Round0Trees::One,
-                _ => {
-                    return Err(format!("{ENV_WHIR_TREES}={v:?}: expected `each` or `one`"));
-                }
-            };
+        match get(ENV_WHIR_TREES) {
+            Some(v) => {
+                format.whir_trees = match v.as_str() {
+                    "each" => Round0Trees::Each,
+                    "one" => Round0Trees::One,
+                    _ => {
+                        return Err(format!("{ENV_WHIR_TREES}={v:?}: expected `each` or `one`"));
+                    }
+                };
+            }
+            // Unset beside the natural leaf order, one tree a run is off: it is
+            // defined for the coset order alone, and the order's rollback word
+            // must keep parsing on its own. Set to `one` there it is refused.
+            None if format.whir_leaves == LeafOrder::Natural => {
+                format.whir_trees = Round0Trees::Each
+            }
+            None => {}
         }
         match get(ENV_LFM_MERGE) {
             Some(v) => {

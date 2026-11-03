@@ -20,7 +20,7 @@
 //! leaves unset, and the driver's first line says how the running process
 //! compares with it.
 
-use multilinear::whir_chain::{ArgueFormat, GkrPack, GroupFold, LeafOrder};
+use multilinear::whir_chain::{ArgueFormat, GkrPack, GroupFold, LeafOrder, Round0Trees};
 
 use crate::block_whir::{self, BlockFormat, BlockOptions, BlockWhirProof};
 use crate::tables::keccak_rnd::KeccakRndForm;
@@ -287,6 +287,20 @@ pub fn leaves_setting(value: Option<&str>) -> Result<LeafOrder, String> {
         None | Some("coset") => Ok(LeafOrder::Coset),
         Some("natural") => Ok(LeafOrder::Natural),
         Some(word) => Err(format!("--leaves {word}: natural or coset")),
+    }
+}
+
+/// The CLI's `--trees` reading: how many round-0 trees a block group's chain
+/// commits, `each` (one a stacked polynomial) or `one` (one a run); unset is
+/// the format's default ([`crate::zf_format::ZfFormat::DEFAULT`]); anything
+/// else an error. A format choice: the block's verifier must be given the same
+/// one, and the proof file does not carry it.
+pub fn trees_setting(value: Option<&str>) -> Result<Round0Trees, String> {
+    match value.map(str::trim) {
+        None => Ok(crate::zf_format::ZfFormat::DEFAULT.whir_trees),
+        Some("each") => Ok(Round0Trees::Each),
+        Some("one") => Ok(Round0Trees::One),
+        Some(word) => Err(format!("--trees {word}: each or one")),
     }
 }
 
@@ -2766,7 +2780,8 @@ pub fn verify_whir_block_tree_proof_grouped(
 
 /// [`verify_whir_block_tree_proof`] at the pinned format with the caller's
 /// named choices, its group opening, its WHIR blowup, its round-0 leaf order,
-/// its leaf scale, its leaves' query check and its GKR packing
+/// its round-0 trees, its leaf scale, its leaves' query check and its GKR
+/// packing
 /// ([`super::whir_block::verify_block_tree_at`]); the file carries none of
 /// them, and the environment sets none of the rest. No public entry point
 /// takes a format of the caller's own.
@@ -2778,7 +2793,7 @@ pub fn verify_whir_block_tree_proof_grouped(
 /// };
 /// use lambda_vm_prover::lfm::whir_chain::LeafQuery;
 /// use lambda_vm_prover::zf_format::WhirBlowup;
-/// use multilinear::whir_chain::{GkrPack, GroupFold, LeafOrder};
+/// use multilinear::whir_chain::{GkrPack, GroupFold, LeafOrder, Round0Trees};
 ///
 /// fn check(elf: &[u8], proof: &WhirBlockTreeProof) -> Result<(), String> {
 ///     verify_whir_block_tree_proof_at(
@@ -2787,6 +2802,7 @@ pub fn verify_whir_block_tree_proof_grouped(
 ///         GroupFold::Indexed,
 ///         WhirBlowup::Two,
 ///         LeafOrder::Coset,
+///         Round0Trees::Each,
 ///         LeafScale::DoubleFrom(12),
 ///         LeafQuery::Lean,
 ///         GkrPack::Off,
@@ -2807,6 +2823,7 @@ pub fn verify_whir_block_tree_proof_at(
     group: GroupFold,
     blowup: WhirBlowup,
     leaves: LeafOrder,
+    trees: Round0Trees,
     leaf_scale: LeafScale,
     leaf_query: LeafQuery,
     pack: GkrPack,
@@ -2822,6 +2839,7 @@ pub fn verify_whir_block_tree_proof_at(
         group,
         blowup,
         leaves,
+        trees,
         leaf_scale,
         leaf_query,
         pack,

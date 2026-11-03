@@ -1605,14 +1605,16 @@ pub fn verify_block_tree_grouped(
 }
 
 /// [`verify_block_tree`] at the pinned format with the caller's NAMED choices:
-/// its group opening, its WHIR blowup, its round-0 leaf order, its leaf scale
-/// and its leaves' query check (`verify-block --group / --blowup / --leaves /
-/// --leaf-double-from / --leaf-query`), every other preset pinned as before
+/// its group opening, its WHIR blowup, its round-0 leaf order, its round-0
+/// trees, its leaf scale and its leaves' query check (`verify-block --group /
+/// --blowup / --leaves / --trees / --leaf-double-from / --leaf-query`), every
+/// other preset pinned as before
 /// (the folds, stack, grind and caps are [`crate::zf_format::ZfFormat::DEFAULT`]'s,
-/// never the environment's). All five are the verifier's constants; the proof
+/// never the environment's). All six are the verifier's constants; the proof
 /// carries none of them. A caller cannot hand in a format of its own:
 /// `verify_block_tree_as` is crate-internal. The coset order is refused by name
-/// under a base whose trees do not take it.
+/// under a base whose trees do not take it, and one tree a run under the
+/// natural order.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_block_tree_at(
     elf_bytes: &[u8],
@@ -1621,22 +1623,26 @@ pub fn verify_block_tree_at(
     group: GroupFold,
     blowup: crate::zf_format::WhirBlowup,
     leaves: multilinear::whir_chain::LeafOrder,
+    trees: multilinear::whir_chain::Round0Trees,
     leaf_scale: LeafScale,
     leaf_query: LeafQuery,
     pack: multilinear::whir_chain::GkrPack,
 ) -> Result<(), String> {
-    let presets = verifier_presets_at(group, blowup, leaves, leaf_scale, leaf_query, pack)?;
+    let presets = verifier_presets_at(group, blowup, leaves, trees, leaf_scale, leaf_query, pack)?;
     verify_block_tree_as(elf_bytes, statement, top, &presets)
 }
 
 /// [`verify_block_tree_at`]'s presets: [`BlockFormat::pinned_with`] `group`
-/// with the five named choices set (the GKR packing through
+/// with the six named choices set (the GKR packing through
 /// [`BlockFormat::with_pack`]), the coset order refused under a base whose
-/// trees do not take it.
+/// trees do not take it and one tree a run refused under the natural order
+/// ([`crate::zf_format::ZfFormat::check_trees`]), whatever the two were set to.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn verifier_presets_at(
     group: GroupFold,
     blowup: crate::zf_format::WhirBlowup,
     leaves: multilinear::whir_chain::LeafOrder,
+    trees: multilinear::whir_chain::Round0Trees,
     leaf_scale: LeafScale,
     leaf_query: LeafQuery,
     pack: multilinear::whir_chain::GkrPack,
@@ -1644,9 +1650,11 @@ pub(crate) fn verifier_presets_at(
     let mut format = BlockFormat::pinned_with(group).with_pack(pack);
     format.zf.whir_blowup = blowup.factor();
     format.zf.whir_leaves = leaves;
+    format.zf.whir_trees = trees;
     format.leaf_scale = leaf_scale;
     format.leaf_query = leaf_query;
     format.zf.check_leaves()?;
+    format.zf.check_trees()?;
     Ok(verifier_presets(format))
 }
 
