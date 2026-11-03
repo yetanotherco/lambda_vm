@@ -135,10 +135,10 @@ fn bus_id_of(channel: &str) -> u64 {
 // Rust side: constraints and interactions evaluated on a row
 // =============================================================================
 
-/// `(bus id, signed multiplicity, bus elements)` of a Rust interaction on a row. A sender
-/// adds `+m`, a receiver `−m`; Clean's pull of multiplicity `e` counts `−e` and its push `+e`,
-/// so the signs agree once a receiver (the table that answers the lookup, Clean's push) keeps
-/// its multiplicity.
+/// `(bus id, signed multiplicity, bus elements)` of a Rust interaction on a row, signed the way
+/// Clean signs it: a sender (Clean's pull) counts `−m`, a receiver (the table that answers the
+/// lookup, Clean's push) counts `+m`. This is the opposite of the prover's LogUp sum, where a
+/// sender adds `+m`; `lean_interaction_at` signs Lean's pulls the same way.
 fn rust_interaction_at(i: &BusInteraction, row: &[FE]) -> (u64, FE, Vec<FE>) {
     let m = i.multiplicity.evaluate_with(|c| row[c]);
     let m = if i.is_sender { -m } else { m };
