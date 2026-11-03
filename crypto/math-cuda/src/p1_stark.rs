@@ -72,19 +72,19 @@ pub struct Kernels {
 }
 
 /// Whether the Poseidon1 kernels run the lean permutation
-/// (`LAMBDA_VM_P1_LEAN=1`): the `_lean` twins of the WHIR
-/// coset leaves, the column leaves and the 4-ary levels load in their twins'
-/// places, with the same bytes in the same slots. Read once, when the kernels
-/// first load; unset or anything but `1` is today's kernels.
+/// (`LAMBDA_VM_P1_LEAN`; on by default, `=0` turns it off): the `_lean` twins
+/// of the WHIR coset leaves, the column leaves and the 4-ary levels load in
+/// their twins' places, with the same bytes in the same slots. Read once, when
+/// the kernels first load.
 pub fn lean() -> bool {
     static LEAN: OnceLock<bool> = OnceLock::new();
     *LEAN.get_or_init(|| lean_setting(std::env::var("LAMBDA_VM_P1_LEAN").ok().as_deref()))
 }
 
-/// `LAMBDA_VM_P1_LEAN`'s value read: `1` is the lean twins, anything else
-/// (unset included) today's kernels.
+/// `LAMBDA_VM_P1_LEAN`'s value read: empty, `0` or `off` load the plain
+/// kernels; anything else (unset included) the lean twins.
 pub fn lean_setting(value: Option<&str>) -> bool {
-    matches!(value.map(str::trim), Some("1"))
+    !matches!(value.map(str::trim), Some("" | "0" | "off"))
 }
 
 /// Load the kernels once, under [`lean`].
@@ -96,7 +96,9 @@ pub fn kernels() -> Result<&'static Kernels> {
     let lean = lean();
     let k = load_kernels(lean)?;
     if lean {
-        eprintln!("[gpu] Poseidon1 kernels: the lean twins (LAMBDA_VM_P1_LEAN=1)");
+        eprintln!(
+            "[gpu] Poseidon1 kernels: the lean twins (the default; LAMBDA_VM_P1_LEAN=0 loads the plain ones)"
+        );
     }
     Ok(KERNELS.get_or_init(|| k))
 }
@@ -135,15 +137,16 @@ pub fn load_kernels(lean: bool) -> Result<Kernels> {
 mod lean_setting_tests {
     use super::lean_setting;
 
-    /// Today's kernels unless the knob says exactly `1`.
+    /// The lean twins unless the knob says `0`, `off` or nothing.
     #[test]
-    fn the_lean_kernels_load_only_at_one() {
-        assert!(!lean_setting(None), "the default is today's kernels");
+    fn the_lean_kernels_load_unless_zero() {
+        assert!(lean_setting(None), "the default is the lean twins");
         assert!(lean_setting(Some("1")));
-        assert!(lean_setting(Some(" 1 ")));
+        assert!(lean_setting(Some("on")));
         assert!(!lean_setting(Some("0")));
+        assert!(!lean_setting(Some(" 0 ")));
+        assert!(!lean_setting(Some("off")));
         assert!(!lean_setting(Some("")));
-        assert!(!lean_setting(Some("on")), "only 1 opts in");
     }
 }
 

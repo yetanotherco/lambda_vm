@@ -43,7 +43,7 @@
 //   V = 3  the Grain Cauchy MDS alternative (`permute_cauchy`: dense full
 //          rounds, the paper's sparse partial rounds, V = 1's multiply);
 //   V = 4  V = 2 with leaner addition chains (`permute_fourier_lean`); the
-//          production kernels' `_lean` twins run it under `LAMBDA_VM_P1_LEAN=1`.
+//          production kernels' `_lean` twins run it (`LAMBDA_VM_P1_LEAN`, on by default).
 // Every variant computes the same field values and `permute` canonicalises.
 //
 // ZISK'S INSTANCE (stage P1 of the Poseidon1 base STARK, at the end of the
@@ -1214,7 +1214,7 @@ extern "C" __global__ void p1s_merkle_tail4(uint8_t *nodes, uint64_t child_off, 
 // The `_lean` twins: the kernels above with the lean
 // permutation (`p1w16::permute_fourier_lean`), the same bytes in the same
 // slots. `src/p1_stark.rs` loads them in their twins' places under
-// `LAMBDA_VM_P1_LEAN=1`; by default nothing loads them.
+// `LAMBDA_VM_P1_LEAN` (on by default; `=0` loads the plain kernels).
 // ---------------------------------------------------------------------------
 
 extern "C" __global__ void p1s_leaves_cols_row_lean(const uint64_t *__restrict__ cols,

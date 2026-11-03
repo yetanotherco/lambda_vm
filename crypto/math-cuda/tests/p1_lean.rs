@@ -1,5 +1,5 @@
 //! The Poseidon1 kernels' `_lean` twins
-//! (`LAMBDA_VM_P1_LEAN=1`) write today's bytes in today's slots, on the card.
+//! (`LAMBDA_VM_P1_LEAN`, on by default) write the plain kernels' bytes, on the card.
 //!
 //! The permutation itself is checked against the Rust host reference with the
 //! other variants (`p1w16_device`, variant `l2`), and on the host against
