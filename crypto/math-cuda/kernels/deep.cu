@@ -255,7 +255,7 @@ DEEP_FUSED(4)
 
 // ---------------------------------------------------------------------------
 // `deep_composition_ext3_fused_m*` with the row-independent part taken out of
-// the row (`LAMBDA_VM_DEEP_HOISTED`; off by default). For each pole k,
+// the row (`LAMBDA_VM_DEEP_HOISTED`; on by default). For each pole k,
 //   Σ_j γ_jk·(t_j(x) − o_jk) = Σ_j γ_jk·t_j(x) − C_k,   C_k = Σ_j γ_jk·o_jk,
 // and the H-terms alike (C_h = Σ_j γ_j·h_ood_j): a row costs one ext3×base
 // product per (main column, pole), one ext3×ext3 per (aux column, pole) and per

@@ -398,15 +398,17 @@ impl GpuDeepCodeword {
     }
 }
 
-/// `LAMBDA_VM_DEEP_HOISTED` as given: on for `1` or `on`; off when unset,
-/// empty, `0` or `off`; anything else is off, said once on stderr.
+/// `LAMBDA_VM_DEEP_HOISTED` as given: on when unset, `1` or `on`; off when
+/// empty, `0` or `off`; anything else is on (the default), said once on stderr.
 fn deep_hoisted_setting(value: Option<&str>) -> bool {
     match value.map(str::trim) {
-        None | Some("" | "0" | "off") => false,
-        Some("1" | "on") => true,
+        Some("" | "0" | "off") => false,
+        None | Some("1" | "on") => true,
         Some(other) => {
-            eprintln!("math-cuda: LAMBDA_VM_DEEP_HOISTED={other} is not 0, 1, off or on: off");
-            false
+            eprintln!(
+                "math-cuda: LAMBDA_VM_DEEP_HOISTED={other} is not 0, 1, off or on: on (the default)"
+            );
+            true
         }
     }
 }
@@ -426,7 +428,7 @@ pub fn set_deep_hoisted(on: Option<bool>) {
 }
 
 /// Whether the fused DEEP runs with its row-independent part hoisted
-/// (`LAMBDA_VM_DEEP_HOISTED=1`; off by default): the same codeword from
+/// (`LAMBDA_VM_DEEP_HOISTED`; on by default, `=0` turns it off): the same codeword from
 /// `deep_composition_ext3_hoisted_m*`, one ext3×base product per (main
 /// column, pole) instead of two ext3×ext3, the poles' constant terms summed
 /// once on the host ([`hoisted_constants`]).
@@ -885,11 +887,11 @@ mod hoisted_tests {
 
     #[test]
     fn the_knob_reads_as_documented() {
-        for v in [None, Some(""), Some("0"), Some("off"), Some("2")] {
+        for v in [Some(""), Some("0"), Some("off"), Some(" 0 ")] {
             assert!(!deep_hoisted_setting(v), "{v:?}");
         }
-        for v in ["1", "on", " 1 "] {
-            assert!(deep_hoisted_setting(Some(v)), "{v:?}");
+        for v in [None, Some("1"), Some("on"), Some(" 1 "), Some("2")] {
+            assert!(deep_hoisted_setting(v), "{v:?}");
         }
     }
 
