@@ -48,6 +48,8 @@ pub mod whir_eval;
 mod whir_group_tests;
 pub mod whir_hash;
 #[cfg(test)]
+mod whir_joint_tree_soundness_tests;
+#[cfg(test)]
 mod whir_joint_tree_tests;
 #[cfg(test)]
 mod whir_p1_tests;

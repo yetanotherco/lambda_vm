@@ -2093,11 +2093,13 @@ fn joint_round_zero_trees_execute_and_refuse_a_forgery() {
     }
 }
 
-/// A joint leg refuses a per-tree proof and the per-tree leg a joint one: the
-/// two arenas have other lengths (one root and one path a query against
-/// `P'`), so neither program reads the other's. (The joint leg executing an
-/// honest proof pins its leaf tag to the host committer's; the host's own
-/// refusal of a leaf under another tag is `multilinear`'s.)
+/// A joint leg does not execute a per-tree proof, nor the per-tree leg a
+/// joint one. This is a shape fact — the two arenas have other lengths (one
+/// root and one path a query against `P'`) — not the soundness mechanism,
+/// which is the format the statement binds, the host's variant rule and the
+/// leaf tag. (The joint leg executing an honest proof pins its leaf tag to the
+/// host committer's; the host's refusal of a leaf under another tag is
+/// `multilinear`'s.)
 #[test]
 fn a_joint_leg_and_a_per_tree_leg_refuse_each_others_proofs() {
     for case in cases().into_iter().filter(|c| c.base == Base::P1) {
@@ -2128,5 +2130,69 @@ fn a_joint_leg_and_a_per_tree_leg_refuse_each_others_proofs() {
             )
             .is_err()
         );
+    }
+}
+
+/// The joint leg under the coset order — the block's production order, whose
+/// round-0 walk reverses the index bits — at runs of two, three and four and a
+/// [4, 2] split, uncapped and at the C2 cap, under the per-query and the lean
+/// check: the host-accepted proof executes; a value off in slot 1, two swapped
+/// blocks and a path node off are refused by the host and have no execution,
+/// under either check.
+#[test]
+fn joint_leg_under_the_coset_order_at_every_width() {
+    for heights in [&[10usize; 2][..], &[10; 3], &[10; 4], &[10; 6]] {
+        for cap in [CapPolicy::Off, CapPolicy::Fixed(2)] {
+            let case = Case {
+                base: Base::P1,
+                first: Some(6),
+                log_folding: 4,
+                cap,
+                leaves: LeafOrder::Coset,
+                round0: Round0Trees::One,
+                ..rpx("P1 coset joint", heights, 10, 6)
+            };
+            let label = format!("{} polys, {cap:?}", heights.len());
+            let mut f = build(&case, GroupFold::Indexed);
+            assert!(host_accepts(&f, &f.proof), "{label}: the control");
+            let mut forgeries = Vec::new();
+            let mut slot1 = f.proof.clone();
+            match &mut slot1.polys[0].rounds[0].openings {
+                RoundOpenings::BaseJoint(p) => p.current[1].values[64 + 5] += FE::one(),
+                _ => panic!("{label}: chain 0 is joint"),
+            }
+            forgeries.push(("a value in slot 1", slot1));
+            let mut swapped = f.proof.clone();
+            match &mut swapped.polys[0].rounds[0].openings {
+                RoundOpenings::BaseJoint(p) => {
+                    for opening in &mut p.current {
+                        let (a, b) = opening.values.split_at_mut(64);
+                        a.swap_with_slice(&mut b[..64]);
+                    }
+                }
+                _ => panic!("{label}: chain 0 is joint"),
+            }
+            forgeries.push(("blocks 0 and 1 swapped", swapped));
+            let mut node = f.proof.clone();
+            match &mut node.polys[0].rounds[0].openings {
+                RoundOpenings::BaseJoint(p) => p.current[2].proof.merkle_path[0][0] ^= 1,
+                _ => panic!("{label}: chain 0 is joint"),
+            }
+            forgeries.push(("a path node", node));
+            for query in [LeafQuery::V1, LeafQuery::Lean] {
+                f.shape.query = query;
+                let program = program(&f);
+                machine_runs(&f, &program, arena(&f, &f.proof)).unwrap_or_else(|e| {
+                    panic!("{label} {query:?}: refused an accepted proof: {e}")
+                });
+                for (what, forged) in &forgeries {
+                    assert!(!host_accepts(&f, forged), "{label}: {what}: host");
+                    assert!(
+                        execute(&program, &[arena(&f, forged)], &socket(f.base)).is_err(),
+                        "{label} {query:?}: {what} must have no execution"
+                    );
+                }
+            }
+        }
     }
 }
