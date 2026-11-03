@@ -56,12 +56,14 @@ def pushStaticComponent {Message : TypeMap} [ProvableType Message]
     trigger := .pull
     input _ := pure (fromElements (Vector.replicate slc.table.length .multiplicity)) }
 
-/-- The EQ chip as a component, generated from the demand on the ALU bus. -/
+/-- The EQ chip as a component, generated from the demand on the ALU bus. EQ pushes its result,
+so the demand it answers is a pull: `Demand.direction` is `.pull` when a message was pulled more
+often than pushed. -/
 def eqComponent : Component (F p) where
   circuit := EQ.circuit
   generation := .demand {
     channel := Alu.channel
-    trigger := .push
+    trigger := .pull
     input _ := pure (fromElements (Vector.replicate (size EQ.Row) .multiplicity)) }
 
 @[circuit_norm] lemma pushStaticComponent_circuit {Message : TypeMap} [ProvableType Message]
