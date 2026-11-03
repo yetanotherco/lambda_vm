@@ -8153,7 +8153,7 @@ mod tests {
     }
 
     /// ⛔ THE GKR TREE'S REFUSAL IS COUNTED AT ITS ONE SITE, and only there —
-    /// math-cuda's census of its own five, extended to this file. The argue
+    /// math-cuda's census of its own eight, extended to this file. The argue
     /// surface's device-fallback counter is bumped here once, inside
     /// `note_gkr_tree_refusal`, which the whole-tree promise's refusal calls once.
     /// The carry's refusal (speculative) and the prefetch's (no prefetch) must

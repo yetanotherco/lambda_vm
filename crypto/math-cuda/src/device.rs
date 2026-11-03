@@ -759,9 +759,9 @@ pub fn reserve_without_eviction(bytes: u64) -> Option<DeviceReservation> {
 }
 
 /// Argue-surface device fallbacks: the reservation refusals in math-cuda's
-/// `sumcheck`, `gkr` and `columns`, and the GKR tree's whole-tree promise in
-/// `multilinear::gpu`, counted where each one's `reserve` returns `None` and its
-/// work moves to the host.
+/// `sumcheck`, `gkr` and `columns` (and the group upload's declined fill), and
+/// the GKR tree's whole-tree promise in `multilinear::gpu`, counted where each
+/// one's work moves to the host.
 ///
 /// ⛔ WHY THIS EXISTS. Until this counter the only fallback number the campaign
 /// read was `multilinear::gpu::host_fallbacks()`, which has ONE caller — the
@@ -773,11 +773,14 @@ pub fn reserve_without_eviction(bytes: u64) -> Option<DeviceReservation> {
 /// Read beside `host_fallbacks()`, this makes "the device did the work"
 /// distinguishable from "it quietly did not" on the argue surface.
 ///
-/// SCOPE, stated precisely, by function (line numbers go stale). SIX sites
-/// count here, each where its reservation is refused and its work moves to the
-/// host:
-/// - the FIVE in `crypto/math-cuda/src`: `sumcheck.rs` (×3), `gkr.rs` (×1),
-///   `columns.rs` (×1);
+/// SCOPE, stated precisely, by function (line numbers go stale). NINE sites
+/// count here, each where its work moves to the host:
+/// - the EIGHT in `crypto/math-cuda/src`: `sumcheck.rs` (×3), `gkr.rs` (×1),
+///   `columns.rs` (×4): `DeviceColumns::upload`'s room, and
+///   `DeviceColumns::upload_tables`' room, its staging promise for a packed or
+///   records table, and its fill checks (a records table whose log the card
+///   refused: the card declines the group and its readers take the host's
+///   columns);
 /// - the GKR tree's whole-tree promise in `multilinear::gpu`'s
 ///   `input_layer_tree_impl`, on the consume path only: the host then builds
 ///   the table's factors and fraction tree. `multilinear::gpu::gkr_tree_refusals`
@@ -814,8 +817,8 @@ pub fn reset_device_fallbacks() {
     DEVICE_FALLBACKS.store(0, Ordering::Relaxed);
 }
 
-/// Record one argue-side reservation refusal — bumped at each of the six
-/// sites [`DEVICE_FALLBACKS`] enumerates, and nowhere else.
+/// Record one argue-side device fallback — bumped at each of the nine sites
+/// [`DEVICE_FALLBACKS`] enumerates, and nowhere else.
 pub fn note_device_fallback() {
     DEVICE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
 }
@@ -2708,29 +2711,29 @@ mod device_fallback_counter_tests {
         assert_eq!(device_fallbacks(), 0, "reset must zero it again");
     }
 
-    /// ⛔ THE FOUR UNDRIVEN SITES' FALSIFIER. The box test drives ONE site
-    /// (`DeviceColumns::upload`); this arm is what lets the other four fail
-    /// without four card fixtures. `note_device_fallback` must be CALLED at
-    /// exactly the five math-cuda argue-surface sites the counter's doc
-    /// enumerates — three in `sumcheck.rs`, one in `gkr.rs`, one in
+    /// ⛔ THE SEVEN UNDRIVEN SITES' FALSIFIER. The box test drives ONE site
+    /// (`DeviceColumns::upload`); this arm is what lets the other seven fail
+    /// without seven card fixtures. `note_device_fallback` must be CALLED at
+    /// exactly the eight math-cuda argue-surface sites the counter's doc
+    /// enumerates — three in `sumcheck.rs`, one in `gkr.rs`, four in
     /// `columns.rs`. Removing the call at ANY site changes the tuple and reddens
     /// this test by name, which localises the loss to the file it happened in.
-    /// The sixth site, `multilinear::gpu`'s GKR tree, has its own census there.
+    /// The ninth site, `multilinear::gpu`'s GKR tree, has its own census there.
     ///
     /// The pattern carries the `crate::device::` prefix so it counts CALLS and
     /// never the definition (`pub fn note_device_fallback`).
     #[test]
-    fn note_device_fallback_is_called_at_exactly_the_five_argue_sites() {
+    fn note_device_fallback_is_called_at_exactly_the_eight_argue_sites() {
         const PATTERN: &str = "crate::device::note_device_fallback()";
         let sumcheck = include_str!("sumcheck.rs").matches(PATTERN).count();
         let gkr = include_str!("gkr.rs").matches(PATTERN).count();
         let columns = include_str!("columns.rs").matches(PATTERN).count();
         assert_eq!(
             (sumcheck, gkr, columns),
-            (3, 1, 1),
+            (3, 1, 4),
             "the argue-surface device-fallback counter must be bumped at exactly \
-             the five sites the counter's doc names: sumcheck ×3, gkr ×1, \
-             columns ×1 (found sumcheck {sumcheck}, gkr {gkr}, columns {columns})"
+             the eight sites the counter's doc names: sumcheck ×3, gkr ×1, \
+             columns ×4 (found sumcheck {sumcheck}, gkr {gkr}, columns {columns})"
         );
     }
 
