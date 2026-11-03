@@ -37,10 +37,10 @@
 //! the legacy encoding reads `Backend::fwd_twiddles_for`: `2^(log_n − 1)`
 //! values per codeword size, built on the host and cached on the card for the
 //! life of the process, outside the VRAM ledger (512 MiB for a `2^27`
-//! codeword, 2 GiB for `2^29`). Under [`NTT_WIDE_ENV`] the encoding takes
-//! passes of up to 10 levels ([`plan_wide`]): three passes at the production
-//! `2^28` instead of four. Every pass is bound by memory bandwidth, so the
-//! passes are the cost; the trace LDEs keep [`plan`].
+//! codeword, 2 GiB for `2^29`). The encoding takes passes of up to 10 levels
+//! ([`plan_wide`]): three passes at the production `2^28` instead of four
+//! ([`NTT_WIDE_ENV`]`=0` keeps [`plan`]'s). Every pass is bound by memory
+//! bandwidth, so the passes are the cost; the trace LDEs keep [`plan`].
 //!
 //! It is the default wherever it applies ([`engine_enabled`]). The legacy path
 //! stays for what the engine does not take — a caller that wants the row-major
@@ -127,11 +127,12 @@ pub fn codewords_encoded() -> u64 {
     CODEWORDS_ENCODED.load(Ordering::Relaxed)
 }
 
-/// `LAMBDA_VM_WHIR_NTT_WIDE=1` runs the WHIR encoding's transform
-/// ([`spread_ntt_column`]) in [`plan_wide`]'s passes of up to 10 levels. The
-/// codeword's values are today's; only a value's non-canonical representation
-/// may differ, as between this engine and the legacy one. Read once per
-/// process; only `1` opts in.
+/// The WHIR encoding's transform ([`spread_ntt_column`]) runs in
+/// [`plan_wide`]'s passes of up to 10 levels by default;
+/// `LAMBDA_VM_WHIR_NTT_WIDE=0` (or `off`) keeps [`plan`]'s passes of up to 8.
+/// The codeword's values are the same either way; only a value's
+/// non-canonical representation may differ, as between this engine and the
+/// legacy one. Read once per process.
 pub const NTT_WIDE_ENV: &str = "LAMBDA_VM_WHIR_NTT_WIDE";
 
 thread_local! {
@@ -140,10 +141,10 @@ thread_local! {
     static NTT_WIDE_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
-/// `LAMBDA_VM_WHIR_NTT_WIDE`'s value read: `1` is the wide plan, anything
-/// else (unset included) today's.
+/// `LAMBDA_VM_WHIR_NTT_WIDE`'s value read: empty, `0` or `off` keep the
+/// 8-level plan; anything else (unset included) is the wide plan.
 pub fn ntt_wide_setting(value: Option<&str>) -> bool {
-    matches!(value.map(str::trim), Some("1"))
+    !matches!(value.map(str::trim), Some("" | "0" | "off"))
 }
 
 /// Whether the calling thread's WHIR encodings take [`plan_wide`].
@@ -155,7 +156,9 @@ pub fn ntt_wide_enabled() -> bool {
     *ENV.get_or_init(|| {
         let on = ntt_wide_setting(std::env::var(NTT_WIDE_ENV).ok().as_deref());
         if on {
-            eprintln!("[gpu] WHIR NTT: wide, passes of up to 10 levels ({NTT_WIDE_ENV}=1)");
+            eprintln!(
+                "[gpu] WHIR NTT: wide, passes of up to 10 levels (the default; {NTT_WIDE_ENV}=0 keeps passes of up to 8)"
+            );
         }
         on
     })
@@ -812,14 +815,16 @@ mod tests {
         }
     }
 
-    /// Today's plan unless the knob says exactly `1`.
+    /// The wide plan unless the knob says `0`, `off` or nothing.
     #[test]
-    fn the_wide_ntt_runs_only_at_one() {
-        assert!(!ntt_wide_setting(None), "the default is today's plan");
+    fn the_wide_ntt_runs_unless_zero() {
+        assert!(ntt_wide_setting(None), "the default is the wide plan");
         assert!(ntt_wide_setting(Some("1")));
-        assert!(ntt_wide_setting(Some(" 1")));
+        assert!(ntt_wide_setting(Some("on")));
         assert!(!ntt_wide_setting(Some("0")));
-        assert!(!ntt_wide_setting(Some("on")), "only 1 opts in");
+        assert!(!ntt_wide_setting(Some(" 0")));
+        assert!(!ntt_wide_setting(Some("off")));
+        assert!(!ntt_wide_setting(Some("")));
         assert!(with_ntt_wide(true, ntt_wide_enabled));
         assert!(!with_ntt_wide(false, ntt_wide_enabled));
     }
