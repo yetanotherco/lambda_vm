@@ -664,21 +664,17 @@ theorem completeness :
           rw [(ZMod.val_eq_zero _).mp hn]; ring
         · rw [hs]; ring
       · -- MSB16[in[3]] when signed
-        intro h
-        have hs1 : input_signed = 1 := h
+        intro hs1
         rw [hs1, val_one_eq, ite_eq_left rfl] at hn
         exact ⟨hi3, hn⟩
       · -- BYTE_ALU[AND, shift, 15] when left
         intro h
-        have hd0 : input_direction = 0 := by
-          have := h
-          linear_combination -this
+        have hd0 : input_direction = 0 := by linear_combination -h
         rw [hd0, ZMod.val_zero, ite_eq_left rfl] at hb
         refine ⟨hsA, by rw [h15]; norm_num, Or.inl ?_⟩
         rw [h15, ShiftCore.and15, hb]
       · -- BYTE_ALU[AND, 256 − 16·zbs − shift, 15] when right
-        intro h
-        have hd1 : input_direction = 1 := h
+        intro hd1
         rw [hd1, val_one_eq, ite_eq_right one_ne_zero] at hb
         rcases hzb with hz | hz
         · have hbne : input_bitShift.val ≠ 0 := fun h0 => by
