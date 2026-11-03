@@ -1414,7 +1414,7 @@ impl Multiplicity {
     /// Evaluate the multiplicity expression to a field element. `get_col(i)`
     /// must return the value of main column `i` at the row being evaluated.
     #[inline]
-    fn evaluate_with<F, G>(&self, get_col: G) -> FieldElement<F>
+    pub fn evaluate_with<F, G>(&self, get_col: G) -> FieldElement<F>
     where
         F: IsField,
         G: Fn(usize) -> FieldElement<F>,

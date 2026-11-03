@@ -19,6 +19,7 @@ use stark::frame::Frame;
 use stark::table::TableView;
 use stark::traits::TransitionEvaluationContext;
 
+use super::test_rng::SplitMix64;
 use crate::constraints::cpu::{
     emit_arg2, emit_arg2_exclusive, emit_branch_cond, emit_branch_rvd_pair, emit_mem_flags_bit,
     emit_next_pc_add_pair, emit_product_zero, emit_reg_not_read_is_zero, emit_rvd_eq_res,
@@ -33,18 +34,6 @@ type Fp3 = FieldElement<Gl3>;
 
 const TRIALS: usize = 1000;
 const NUM_COLS: usize = cols::NUM_COLUMNS;
-
-/// Deterministic SplitMix64.
-struct SplitMix64(u64);
-impl SplitMix64 {
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-}
 
 /// An emit body under test: emits `n` base constraints at indices `0..n`.
 trait EmitBody {
