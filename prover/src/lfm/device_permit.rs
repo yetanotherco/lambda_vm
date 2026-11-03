@@ -548,7 +548,15 @@ mod tests {
 
     /// `arm` is process-global, so the tests that change it run one at a time,
     /// and one at a time with every other test that arms it or proves a tree.
+    /// Each takes the lock through a poisoned one: a test that fails holding it
+    /// says why on its own, and the next need not fail with it.
     use super::PERMIT_TEST_LOCK as ARM;
+
+    /// What "did not wait" means beside a loaded host: under half the bound a
+    /// deferred prove waits for its latch. A prove that waited for a shut latch
+    /// is held to the bound; one that did not is never near it, however busy
+    /// the machine (a fixed 100 ms read a loaded test process as a wait).
+    const NO_WAIT: Duration = Duration::from_secs(DEFER_BOUND.as_secs() / 2);
 
     fn disarm(_g: &std::sync::MutexGuard<'_, ()>) {
         arm(1);
@@ -560,7 +568,7 @@ mod tests {
     /// plus a mutex per phase.
     #[test]
     fn unarmed_the_permit_takes_no_lock_and_counts_nothing() {
-        let g = ARM.lock().expect("the arm guard is never poisoned");
+        let g = ARM.lock().unwrap_or_else(|e| e.into_inner());
         disarm(&g);
         {
             let _a = hold();
@@ -595,7 +603,7 @@ mod tests {
     #[test]
     fn armed_a_second_worker_waits_for_the_first() {
         const HOLD: std::time::Duration = std::time::Duration::from_millis(200);
-        let g = ARM.lock().expect("the arm guard is never poisoned");
+        let g = ARM.lock().unwrap_or_else(|e| e.into_inner());
         disarm(&g);
         arm(2);
 
@@ -662,7 +670,7 @@ mod tests {
     /// test would hang rather than fail, which is the whole point of it.
     #[test]
     fn armed_a_second_hold_on_one_thread_panics_rather_than_parking() {
-        let g = ARM.lock().expect("the arm guard is never poisoned");
+        let g = ARM.lock().unwrap_or_else(|e| e.into_inner());
         disarm(&g);
         arm(2);
         let panicked = std::thread::spawn(|| {
@@ -689,7 +697,7 @@ mod tests {
     #[cfg(feature = "parallel")]
     #[test]
     fn armed_a_hold_on_a_rayon_worker_is_refused_before_a_sibling_can_take_it_again() {
-        let g = ARM.lock().expect("the arm guard is never poisoned");
+        let g = ARM.lock().unwrap_or_else(|e| e.into_inner());
         disarm(&g);
         arm(2);
         let pool = rayon::ThreadPoolBuilder::new()
@@ -731,7 +739,7 @@ mod tests {
     #[test]
     fn armed_a_plain_thread_holds_the_card_while_rayon_builds_under_it() {
         use rayon::prelude::*;
-        let g = ARM.lock().expect("the arm guard is never poisoned");
+        let g = ARM.lock().unwrap_or_else(|e| e.into_inner());
         disarm(&g);
         arm(2);
         let sum = std::thread::scope(|scope| {
@@ -760,7 +768,7 @@ mod tests {
     #[test]
     fn armed_a_deferred_prove_waits_for_its_latch_and_an_artifact_build_does_not() {
         const PAUSE: Duration = Duration::from_millis(200);
-        let g = ARM.lock().expect("the arm guard is never poisoned");
+        let g = ARM.lock().unwrap_or_else(|e| e.into_inner());
         disarm(&g);
         arm(2);
         let latch = CardLatch::new();
@@ -808,8 +816,7 @@ mod tests {
     /// behind.
     #[test]
     fn armed_an_open_latch_or_a_dropped_guard_does_not_delay_a_prove() {
-        const QUICK: Duration = Duration::from_millis(100);
-        let g = ARM.lock().expect("the arm guard is never poisoned");
+        let g = ARM.lock().unwrap_or_else(|e| e.into_inner());
         disarm(&g);
         arm(2);
         let open = CardLatch::new();
@@ -819,7 +826,7 @@ mod tests {
             let t = Instant::now();
             let _card = hold_labeled("multi_prove");
             assert!(
-                t.elapsed() < QUICK,
+                t.elapsed() < NO_WAIT,
                 "an open latch must not delay the prove"
             );
         }
@@ -830,7 +837,7 @@ mod tests {
             let _card = hold_labeled("multi_prove");
         }
         assert!(
-            t.elapsed() < QUICK,
+            t.elapsed() < NO_WAIT,
             "a dropped guard must clear the deferral, or the prove waits for a shut latch"
         );
         disarm(&g);
@@ -841,7 +848,7 @@ mod tests {
     /// latch only a later task would open.
     #[test]
     fn unarmed_a_deferral_is_ignored() {
-        let g = ARM.lock().expect("the arm guard is never poisoned");
+        let g = ARM.lock().unwrap_or_else(|e| e.into_inner());
         disarm(&g);
         let shut = CardLatch::new();
         let _deferred = defer_multi_prove_until(shut);
@@ -850,7 +857,7 @@ mod tests {
             let _card = hold_labeled("multi_prove");
         }
         assert!(
-            t.elapsed() < Duration::from_millis(100),
+            t.elapsed() < NO_WAIT,
             "the serial driver must never wait for a latch"
         );
         disarm(&g);
@@ -874,9 +881,10 @@ mod tests {
         .join();
         assert!(died.is_err(), "the task must have panicked");
         assert!(latch.is_open(), "its unwind must have opened the latch");
-        let (waited, bound_ran_out) = latch.wait(Duration::from_secs(5));
+        let bound = Duration::from_secs(5);
+        let (waited, bound_ran_out) = latch.wait(bound);
         assert!(
-            !bound_ran_out && waited < Duration::from_millis(100),
+            !bound_ran_out && waited < bound / 2,
             "an open latch must not hold a waiter: {waited:?}"
         );
     }
@@ -887,7 +895,7 @@ mod tests {
     /// asserted, so the no-global tree cannot depend on a latch being made.
     #[test]
     fn armed_with_no_deferral_nothing_waits_and_an_unwaited_opener_is_harmless() {
-        let g = ARM.lock().expect("the arm guard is never poisoned");
+        let g = ARM.lock().unwrap_or_else(|e| e.into_inner());
         disarm(&g);
         arm(2);
         let unwaited = CardLatch::new();
@@ -899,7 +907,7 @@ mod tests {
             let _card = hold_labeled("multi_prove");
         }
         assert!(
-            t.elapsed() < Duration::from_millis(100),
+            t.elapsed() < NO_WAIT,
             "a prove with no deferral must take the card at once"
         );
         assert_eq!(
