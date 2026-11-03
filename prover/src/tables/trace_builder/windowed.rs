@@ -3785,6 +3785,10 @@ mod lean_pass;
 #[cfg(feature = "parallel")]
 pub(crate) mod parallel;
 
+// The head of a streamed phase A, stamped.
+#[cfg(feature = "parallel")]
+pub(crate) mod head_log;
+
 #[cfg(test)]
 mod regen_tests;
 

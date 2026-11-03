@@ -965,13 +965,13 @@ pub(crate) use finish::hand_on_order;
 pub(crate) use finish::{Emitted, RegenFamily, RegenJob, RestHeader, RestRegen};
 #[cfg(test)]
 pub(crate) use windowed::DECODE_TRACE_DELAY;
-#[cfg(feature = "parallel")]
-pub(crate) use windowed::parallel;
 pub use windowed::{
     Accumulator, CardFillStamps, ChunkJob, CountThreadStamps, RecordsRoom, RegenBuilder,
     RowFamilies, SetupStamps, StreamTable, StreamedChunk, WalkedWindow, Walker, WindowStamps,
     WindowedTraceBuilder,
 };
+#[cfg(feature = "parallel")]
+pub(crate) use windowed::{head_log, parallel};
 
 // =============================================================================
 // Memory and Register State Tracking

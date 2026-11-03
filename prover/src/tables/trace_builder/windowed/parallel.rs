@@ -44,6 +44,7 @@ use executor::vm::logs::Log;
 use executor::vm::memory::MemorySnapshot;
 
 use super::super::{ABSENT, MemoryState, NO_PAGE, RegisterState, WalkSizes};
+use super::head_log;
 use super::lean_pass::LeanPass;
 use super::{Accumulator, WalkedWindow, WindowedTraceBuilder, walk_window};
 use crate::Error;
@@ -118,6 +119,8 @@ struct WindowWalker {
     /// the next is seeded), and the state pages it touched.
     touched: Vec<u64>,
     pages: Vec<u64>,
+    /// The seconds the window walked last took to seed.
+    seeding: f64,
 }
 
 /// The state page holding `address`.
@@ -137,6 +140,7 @@ impl WindowWalker {
             registers: RegisterState::new(0),
             touched: Vec::new(),
             pages: Vec::new(),
+            seeding: 0.0,
         }
     }
 
@@ -149,7 +153,9 @@ impl WindowWalker {
         job: &WindowJob,
         image: &PagedMem<u8>,
     ) -> Result<(WalkedWindow, u64), Error> {
+        let t = Instant::now();
         let seeded = self.seed(job, image)?;
+        self.seeding = t.elapsed().as_secs_f64();
         self.registers = job.registers.clone();
         let s = &*self.settings;
         let mut walked = walk_window(
@@ -315,6 +321,7 @@ impl WindowWalker {
         let t = Instant::now();
         let (walked, boundary) = self.walk(job, image)?;
         let mut busy = t.elapsed().as_secs_f64();
+        head_log::window_walked(job.window as usize, t, self.seeding);
         let after = after
             .recv()
             .map_err(|_| Error::Prover(format!("window {}: {PASS_STOPPED}", job.window)))?;
@@ -533,6 +540,7 @@ fn walk_numbered(
                         (failure, absorbing) = (Some(e), true);
                         break 'windows;
                     }
+                    head_log::window_absorbed(next as usize);
                     // One window fewer handed out and not absorbed.
                     let _ = permit_rx.recv();
                     next += 1;
@@ -662,6 +670,7 @@ fn pass_thread(
         pass.begin(k)?;
         pass.pass(&logs, first)?;
         let window_entries = Arc::new(pass.take_entries());
+        let passed = Instant::now();
         busy += t.elapsed().as_secs_f64();
         entries += window_entries.len();
         most = most.max(window_entries.len());
@@ -676,7 +685,7 @@ fn pass_thread(
         }
         let (after_tx, after_rx) = sync_channel(1);
         permits.send(()).map_err(stopped)?;
-        let cycles = logs.len();
+        let (cycles, handed) = (logs.len(), window_entries.len());
         jobs.send(Ticket {
             job: WindowJob {
                 window: number(k),
@@ -689,6 +698,7 @@ fn pass_thread(
             after: after_rx,
         })
         .map_err(stopped)?;
+        head_log::window_handed(k as usize, handed, t, passed);
         waiting = Some(after_tx);
         first += cycles;
         k += 1;

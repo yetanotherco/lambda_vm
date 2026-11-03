@@ -1122,6 +1122,122 @@ fn a_streamed_block_proves_and_verifies() {
     assert!(verify(&proof, &elf, &format));
 }
 
+/// The stamps of one `BLOCK HEAD` item: the number after each of `prefixes`,
+/// and both of each `<from>-<to>`.
+fn head_stamps(item: &str, prefixes: &[char]) -> Vec<f64> {
+    let mut out = Vec::new();
+    for word in item.split(' ') {
+        let Some(first) = word.chars().next() else {
+            continue;
+        };
+        if !prefixes.contains(&first) {
+            continue;
+        }
+        for part in word[1..].split('-') {
+            if let Ok(v) = part.parse::<f64>() {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+/// ★ Phase A's head stamped (`LAMBDA_VM_BLOCK_HEAD_LOG`) moves no byte: with
+/// it on, the streamed prove hands back its four `BLOCK HEAD` lines — every
+/// stamped window passed before it was handed out, walked, then absorbed in
+/// window order; every stamped chunk handed out, laid out, then placed, one
+/// item a chunk handed out; the layout by table counting every chunk — and
+/// the proof is the one without it (its bytes too, under the deterministic
+/// grind), laid out inline and on workers. Off, nothing is stamped.
+#[test]
+fn the_head_log_stamps_the_head_and_moves_no_byte() {
+    let elf = asm_elf_bytes("all_instructions_64");
+    let format = many_groups();
+    let bytes = |p: &BlockWhirProof| {
+        rkyv::to_bytes::<rkyv::rancor::Error>(p)
+            .expect("serialize")
+            .to_vec()
+    };
+    for workers in [0usize, 3] {
+        let proved = |head: bool| {
+            let mut o = streamed(MaxRowsConfig::small(), 16, 3);
+            o.layout_workers = workers;
+            let (proof, stamps) = prove_block_whir_with(
+                &elf,
+                &[],
+                &ProofOptions::default_test_options(),
+                &format,
+                &o,
+                &Deviations {
+                    head_log: Some(head),
+                    ..Deviations::default()
+                },
+            )
+            .expect("prove");
+            assert!(verify(&proof, &elf, &format), "{workers} workers");
+            (proof, stamps)
+        };
+        let (off, off_stamps) = proved(false);
+        assert!(off_stamps.head.is_empty(), "{workers} workers: off");
+        let (on, stamps) = proved(true);
+        let what = format!("{workers} workers");
+        let head = &stamps.head;
+        assert_eq!(head.len(), 4, "{what}: {head:?}");
+        assert!(head[0].starts_with("BLOCK HEAD WINDOWS: "), "{what}");
+        assert!(head[1].starts_with("BLOCK HEAD CHUNKS: "), "{what}");
+        assert!(head[2].starts_with("BLOCK HEAD TABLES: "), "{what}");
+        assert_eq!(
+            head[3], "BLOCK HEAD CARD: set up at its first use",
+            "{what}"
+        );
+        let windows: Vec<&str> = head[0].split(" · ").skip(1).collect();
+        assert!(!windows.is_empty(), "{what}: no window stamped");
+        let mut absorbed = 0.0;
+        for w in &windows {
+            let s = head_stamps(w, &['r', 'p', 'w', 'a']);
+            let [received, passed, from, to, at] = s[..] else {
+                panic!("{what}: window {w}");
+            };
+            assert!(
+                received <= passed && from <= to && to <= at,
+                "{what}: window {w}"
+            );
+            assert!(at >= absorbed, "{what}: window {w} absorbed out of order");
+            absorbed = at;
+        }
+        let chunks: Vec<&str> = head[1].split(" · ").skip(1).collect();
+        let handed = stamps.streamed.1;
+        assert!(handed > 0, "{what}: no chunk streamed");
+        assert_eq!(chunks.len(), handed.min(128), "{what}: {head:?}");
+        for c in &chunks {
+            let s = head_stamps(c, &['h', 'l', 'p']);
+            let [out, from, to, placed] = s[..] else {
+                panic!("{what}: chunk {c}");
+            };
+            assert!(
+                out <= from && from <= to && to <= placed,
+                "{what}: chunk {c}"
+            );
+        }
+        let laid: usize = head[2]
+            .split(" · ")
+            .skip(1)
+            .map(|t| {
+                t.split(' ')
+                    .nth(1)
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .expect("a table's chunks")
+            })
+            .sum();
+        assert_eq!(laid, handed, "{what}: the layout by table");
+        assert_eq!(off.groups, on.groups, "{what}: the partition");
+        assert_eq!(off.table_num_vars, on.table_num_vars, "{what}");
+        if crypto::grinding::deterministic() {
+            assert_eq!(bytes(&off), bytes(&on), "{what}: the proof");
+        }
+    }
+}
+
 /// A host-only build (a box harness's measure of the host's pace) drains the
 /// groups and tables the streamed prove commits, and commits none.
 #[test]

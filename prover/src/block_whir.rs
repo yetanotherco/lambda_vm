@@ -45,7 +45,7 @@ use crate::statement::{self, MULTILINEAR_BLOCK_TAG};
 use crate::tables::gpack::{self, TraceForm};
 use crate::tables::trace_builder::{
     ChunkJob, CutPadding, RowFamilies, StreamTable, Traces, WindowStamps, WindowedTraceBuilder,
-    parallel,
+    head_log, parallel,
 };
 use crate::test_utils::{E, F};
 use crate::zf_format::ZfFormat;
@@ -1273,7 +1273,10 @@ fn parse_card_early(value: Option<&str>) -> Result<bool, Error> {
 /// without the card's kernels.
 fn set_up_card() {
     if cfg!(feature = "cuda") {
-        std::thread::spawn(multilinear::gpu::set_up_device);
+        std::thread::spawn(|| {
+            multilinear::gpu::set_up_device();
+            head_log::card_ready();
+        });
     }
 }
 
@@ -1940,6 +1943,9 @@ pub struct BlockStamps {
     /// A streamed build's `BLOCK GROUP QUEUE` line ([`group_queue::line`],
     /// printed as phase A ends, not in [`Self::report`]).
     pub group_queue: Option<String>,
+    /// A streamed build's `BLOCK HEAD` lines ([`head_log`], printed as phase A
+    /// ends, not in [`Self::report`]); empty unless the head was stamped.
+    pub head: Vec<String>,
     /// A streamed prove's phase B in unix seconds, (start, end), and the order
     /// it took the groups in: what a sampler's samples and another thread's
     /// stamps are placed against. Empty without a streamed prove.
@@ -3540,6 +3546,9 @@ pub(crate) struct Deviations {
     /// Whether streamed chunks held as records stay on the host instead of
     /// parking and dropping, instead of the knob ([`records_keep`]).
     pub records_keep: Option<bool>,
+    /// Whether phase A's head is stamped, instead of the knob
+    /// ([`head_log::knob`]).
+    pub head_log: Option<bool>,
     /// The trace alone: phase A drains each closed group as it comes instead
     /// of committing it, and the prove stops after the trace with
     /// [`HOST_ONLY`] ([`trace_block_host_only`]).
@@ -4705,11 +4714,14 @@ fn stream_inline<'a>(
     for item in brx {
         match item {
             Built::Job(job) => {
+                let (seq, kind) = (shapes.len(), job.table);
                 let t = Instant::now();
                 let (table, index, shape, laid) = lay_out_chunk(airs, *job, ledger, recorder)?;
+                head_log::chunk_laid(seq, stream_base(kind), t);
                 chunks += t.elapsed().as_secs_f64();
                 shapes.push((table, index, shape));
                 packer.place(Key::Streamed(table, index), shape, laid)?;
+                head_log::chunk_placed(seq);
             }
             Built::Stream(_) => {
                 return Err(Error::Prover(
@@ -4878,8 +4890,9 @@ fn stream_pipelined<'a, R>(
                         }
                         return;
                     };
-                    let t = Instant::now();
+                    let (kind, t) = (job.table, Instant::now());
                     let laid = lay_out_chunk(airs, *job, ledger, recorder);
+                    head_log::chunk_laid(seq, stream_base(kind), t);
                     if dtx.send((seq, t.elapsed().as_secs_f64(), laid)).is_err() {
                         return;
                     }
@@ -4907,6 +4920,7 @@ fn stream_pipelined<'a, R>(
                     let (table, index, shape, laid) = laid?;
                     shapes.push((table, index, shape));
                     packer.place(Key::Streamed(table, index), shape, laid)?;
+                    head_log::chunk_placed(next);
                     if let Some(permits) = permits {
                         permits.give();
                     }
@@ -5543,7 +5557,17 @@ fn prove_streamed(
     let commit_config = format.chain_config(&[]);
     let cap = commit_config.format.stack;
     let start = Instant::now();
-    if block_card_early()? {
+    head_log::begin(start, deviations.head_log.map_or_else(head_log::knob, Ok)?);
+    let card_early = block_card_early()?;
+    eprintln!(
+        "BLOCK CARD EARLY: {}",
+        if card_early {
+            "on (the card set up on a thread of its own as the prove starts)"
+        } else {
+            "off (the card set up at its first use)"
+        }
+    );
+    if card_early {
         set_up_card();
     }
     // A memory log (`BlockOptions::memlog`): its sampler runs until the
@@ -5908,6 +5932,12 @@ fn prove_streamed(
                                 if let Some(ledger) = ledger {
                                     ledger.jobs.fetch_add(job.op_bytes(), Relaxed);
                                 }
+                                head_log::chunk_handed(
+                                    streamed - 1,
+                                    stream_base(job.table),
+                                    job.index,
+                                    job.op_count(),
+                                );
                                 let t = Instant::now();
                                 if btx.send(Built::Job(Box::new(job))).is_err() {
                                     return Err(Error::Prover("the layout thread stopped".into()));
@@ -5991,6 +6021,12 @@ fn prove_streamed(
                                 if let Some(ledger) = ledger {
                                     ledger.jobs.fetch_add(job.op_bytes(), Relaxed);
                                 }
+                                head_log::chunk_handed(
+                                    streamed - 1,
+                                    stream_base(job.table),
+                                    job.index,
+                                    job.op_count(),
+                                );
                                 let t = Instant::now();
                                 if btx.send(Built::Job(Box::new(job))).is_err() {
                                     return Err(Error::Prover("the layout thread stopped".into()));
@@ -6494,6 +6530,10 @@ fn prove_streamed(
         let queue_line = group_queue::line(queue_setting, queue_rule, &queue_stats);
         eprintln!("{queue_line}");
         stamps.group_queue = Some(queue_line);
+        stamps.head = head_log::take_lines();
+        for line in &stamps.head {
+            eprintln!("{line}");
+        }
         (stamps.execute, stamps.executor) =
             executed.map_err(|_| Error::Prover("the block's executor panicked".into()))??;
         // A thread's error names the cause; a commit that ran out of groups only
