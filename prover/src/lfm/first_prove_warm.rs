@@ -1,5 +1,5 @@
 //! The recursion tree's first prove warmed up beside the base
-//! (`LFM_WARM_FIRST_PROVE=1`; off by default).
+//! (`LFM_WARM_FIRST_PROVE`; on by default, `=0` turns it off).
 //!
 //! The tree's first prove pays three first-use costs on the tree's critical
 //! path, with the card idle or waiting:
@@ -33,12 +33,12 @@ use super::trace::LfmTraces;
 /// sizes, as measured (`W3 STAGING AT END: staging pairs 4 of 8`).
 pub const STAGING_PAIRS: usize = 4;
 
-/// `LFM_WARM_FIRST_PROVE` as given: on for `1` or `on`; off when unset, empty,
-/// `0` or `off`; any other value is an error.
+/// `LFM_WARM_FIRST_PROVE` as given: on when unset, `1` or `on`; off when
+/// empty, `0` or `off`; any other value is an error.
 fn setting(value: Option<&str>) -> bool {
     match value.map(str::trim) {
-        None | Some("" | "0" | "off") => false,
-        Some("1" | "on") => true,
+        Some("" | "0" | "off") => false,
+        None | Some("1" | "on") => true,
         Some(other) => {
             panic!("LFM_WARM_FIRST_PROVE must be `0`, `1`, `off` or `on`, got `{other}`")
         }
@@ -184,13 +184,13 @@ pub fn line() -> String {
 mod tests {
     use super::*;
 
-    /// Off by default: unset, empty, `0` or `off`; on for `1` or `on`.
+    /// On by default: unset, `1` or `on`; off for empty, `0` or `off`.
     #[test]
-    fn the_knob_is_off_unless_one_or_on() {
-        for off in [None, Some(""), Some("0"), Some("off"), Some(" 0 ")] {
+    fn the_knob_is_on_unless_zero_or_off() {
+        for off in [Some(""), Some("0"), Some("off"), Some(" 0 ")] {
             assert!(!setting(off), "{off:?}");
         }
-        for on in [Some("1"), Some("on"), Some(" 1 ")] {
+        for on in [None, Some("1"), Some("on"), Some(" 1 ")] {
             assert!(setting(on), "{on:?}");
         }
     }
