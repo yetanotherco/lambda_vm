@@ -566,7 +566,9 @@ fn a_tampered_chain_cannot_execute() {
     // A Merkle sibling: the walk arrives somewhere else.
     let mut forged = f.proof.clone();
     match &mut forged.rounds[0].openings {
-        RoundOpenings::Base(p) => p.current[0].proof.merkle_path[0][0] ^= 1,
+        RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
+            p.current[0].proof.merkle_path[0][0] ^= 1
+        }
         RoundOpenings::Extension(p) => p.current[0].proof.merkle_path[0][0] ^= 1,
         RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
     }
@@ -1563,7 +1565,9 @@ fn a_tampered_capped_chain_cannot_execute() {
     for (name, j) in [("unreached", unreached), ("reached", reached)] {
         let mut forged = f.proof.clone();
         match &mut forged.rounds[0].openings {
-            RoundOpenings::Base(p) => p.current[0].proof.merkle_path[depth0 - 3 + j][9] ^= 1,
+            RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
+                p.current[0].proof.merkle_path[depth0 - 3 + j][9] ^= 1
+            }
             RoundOpenings::Extension(_) => unreachable!("round 0 is base"),
             RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
         }
@@ -1571,7 +1575,7 @@ fn a_tampered_capped_chain_cannot_execute() {
     }
     let mut forged = f.proof.clone();
     match &mut forged.rounds[0].openings {
-        RoundOpenings::Base(p) => {
+        RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
             let path = &mut p.next[0].proof.merkle_path;
             let last = path.len() - 1;
             path[last][0] ^= 1;
@@ -1734,7 +1738,7 @@ fn a_tampered_first_fold_chain_cannot_execute() {
     let mut sites: Vec<(&str, ChainProof<F, E>)> = Vec::new();
     let mut forged = f.proof.clone();
     match &mut forged.rounds[0].openings {
-        RoundOpenings::Base(p) => {
+        RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
             assert_eq!(p.current[0].values.len(), 64, "round 0 opens 64 values");
             p.current[0].values[63] += FE::one();
         }
@@ -1745,7 +1749,9 @@ fn a_tampered_first_fold_chain_cannot_execute() {
 
     let mut forged = f.proof.clone();
     match &mut forged.rounds[0].openings {
-        RoundOpenings::Base(p) => p.current[0].proof.merkle_path[0][0] ^= 1,
+        RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
+            p.current[0].proof.merkle_path[0][0] ^= 1
+        }
         RoundOpenings::Extension(_) => panic!("round 0 is base"),
         RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
     }
@@ -1753,7 +1759,7 @@ fn a_tampered_first_fold_chain_cannot_execute() {
 
     let mut forged = f.proof.clone();
     match &mut forged.rounds[0].openings {
-        RoundOpenings::Base(p) => p.next[0].values[0] += FEE::one(),
+        RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => p.next[0].values[0] += FEE::one(),
         RoundOpenings::Extension(_) => panic!("round 0 is base"),
         RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
     }
@@ -1890,6 +1896,7 @@ fn the_production_default_chain_is_first6_under_the_auto_cap() {
             arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
             group: multilinear::whir_chain::GroupFold::PerPoly,
             leaves: multilinear::whir_chain::LeafOrder::Natural,
+            round0: multilinear::whir_chain::Round0Trees::Each,
         },
         log_blowup: 1,
         ..config(229, 0)
@@ -1926,6 +1933,7 @@ fn the_blowup_opt_out_chain_keeps_the_pins_from_before_the_flip() {
             arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
             group: multilinear::whir_chain::GroupFold::PerPoly,
             leaves: multilinear::whir_chain::LeafOrder::Natural,
+            round0: multilinear::whir_chain::Round0Trees::Each,
         },
         ..config(114, 0)
     };
@@ -1969,6 +1977,7 @@ fn the_grind_bits_opt_out_chain_keeps_its_pins() {
             arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
             group: multilinear::whir_chain::GroupFold::PerPoly,
             leaves: multilinear::whir_chain::LeafOrder::Natural,
+            round0: multilinear::whir_chain::Round0Trees::Each,
         },
         ..config(112, 0)
     };
@@ -2007,6 +2016,7 @@ fn the_grind_opt_out_chain_keeps_the_pins_from_before_p2() {
             arity4_cap: crate::hash_pin::BLOCK_BASE.arity4_cap,
             group: multilinear::whir_chain::GroupFold::PerPoly,
             leaves: multilinear::whir_chain::LeafOrder::Natural,
+            round0: multilinear::whir_chain::Round0Trees::Each,
         },
         ..config(112, 20)
     };

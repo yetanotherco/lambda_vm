@@ -768,3 +768,62 @@ fn assert_same_roots(elf: &[u8], a: &BlockWhirProof, b: &BlockWhirProof, format:
         a.proof.roots.len()
     );
 }
+
+/// ★ One round-0 tree a run at the block: a block proved under it verifies,
+/// carries one root a joint run (fewer than its polynomials) and a joint
+/// round 0 in some chain, and is refused by the verifier of one tree a
+/// polynomial; the block of one tree a polynomial is refused by the joint
+/// verifier. The choice is a verifier constant; the proof carries none.
+#[test]
+fn a_joint_tree_block_round_trips_and_refuses_the_other_mode() {
+    use multilinear::whir_chain::Round0Trees;
+    let elf = asm_elf_bytes("all_instructions_64");
+    let opts = ProofOptions::default_test_options();
+    let at = |round0: Round0Trees| {
+        let mut f = format(
+            crate::hash_pin::BLOCK_BASE,
+            block_whir::BLOCK_GROUP_POLYS,
+            GroupFold::Indexed,
+            ArgueFormat::BATCHED,
+        );
+        f.zf.whir_trees = round0;
+        f
+    };
+    let verify = |proof: &BlockWhirProof, format: &BlockFormat| {
+        block_whir::verify_block_whir(proof, &elf, &opts, format).unwrap_or(false)
+    };
+    let one = prove(&elf, &at(Round0Trees::One), MaxRowsConfig::small());
+    let each = prove(&elf, &at(Round0Trees::Each), MaxRowsConfig::small());
+    assert!(
+        one.proof
+            .columns
+            .iter()
+            .flat_map(|stack| &stack.polys)
+            .any(|chain| matches!(chain.rounds[0].openings, RoundOpenings::BaseJoint(_))),
+        "a joint round 0"
+    );
+    assert!(
+        one.proof.roots.len() < each.proof.roots.len(),
+        "fewer roots: {} against {}",
+        one.proof.roots.len(),
+        each.proof.roots.len()
+    );
+    assert_eq!(
+        one.commit_ood.len(),
+        each.commit_ood.len(),
+        "one commit-time answer a polynomial either way"
+    );
+    assert!(verify(&one, &at(Round0Trees::One)), "the joint control");
+    assert!(
+        verify(&each, &at(Round0Trees::Each)),
+        "the per-tree control"
+    );
+    assert!(
+        !verify(&one, &at(Round0Trees::Each)),
+        "a per-tree verifier must refuse the joint block"
+    );
+    assert!(
+        !verify(&each, &at(Round0Trees::One)),
+        "a joint verifier must refuse the per-tree block"
+    );
+}

@@ -1724,8 +1724,12 @@ fn lean_block_leaves_execute_and_refuse_a_tampered_witness() {
         for value in [false, true] {
             let mut forged = proof.clone();
             match &mut forged.proof.columns[g].polys[0].rounds[0].openings {
-                RoundOpenings::Base(p) if value => p.current[1].values[0] += FE::one(),
-                RoundOpenings::Base(p) => p.current[1].proof.merkle_path[0][0] ^= 1,
+                RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) if value => {
+                    p.current[1].values[0] += FE::one()
+                }
+                RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
+                    p.current[1].proof.merkle_path[0][0] ^= 1
+                }
                 RoundOpenings::BaseGrouped(p) if value => p.current[1][0].values[0] += FE::one(),
                 RoundOpenings::BaseGrouped(p) => p.current[1][0].proof.merkle_path[0][0] ^= 1,
                 RoundOpenings::Extension(_) => unreachable!("round 0 is base-valued"),
@@ -3936,7 +3940,9 @@ fn a_p1_block_leaf_refuses_a_tampered_witness() {
 
     let mut sibling = proof.clone();
     match &mut sibling.proof.columns[0].polys[0].rounds[0].openings {
-        RoundOpenings::Base(p) => p.current[1].proof.merkle_path[0][0] ^= 1,
+        RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
+            p.current[1].proof.merkle_path[0][0] ^= 1
+        }
         RoundOpenings::Extension(p) => p.current[1].proof.merkle_path[0][0] ^= 1,
         RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
     }
@@ -4401,7 +4407,7 @@ fn forged_prepared_chain(
             round.current[1][1].values[0] += FE::one();
             1
         }
-        RoundOpenings::Base(round) => {
+        RoundOpenings::Base(round) | RoundOpenings::BaseJoint(round) => {
             round.current[1].values[0] += FE::one();
             0
         }

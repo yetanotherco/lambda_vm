@@ -940,11 +940,12 @@ impl WhirBlockPlan {
                 None => commit_prepared(stack, config, base)
                     .map_err(|e| format!("prepared group {group}: {e:?}"))?,
             };
-            if roots.len() != layout.num_polys() {
+            let trees = multilinear::stacked_eval::round0_trees(layout.num_polys(), config).len();
+            if roots.len() != trees {
                 return Err(format!(
-                    "prepared group {group}: {} roots for {} polynomials",
+                    "prepared group {group}: {} roots for {} round-0 trees",
                     roots.len(),
-                    layout.num_polys()
+                    trees
                 ));
             }
             prepared.push(PlannedPrepared {
@@ -985,7 +986,10 @@ impl WhirBlockPlan {
                 ..ChainShape::new_at(config, layout.n_stack(), arity)
             };
             let opening = stacked_verify_cost_ood(layout, &group_of, &chain, entry, true).perms()
-                + commit_ood_point_perms(wrap_hash, layout.num_polys());
+                + commit_ood_point_perms(
+                    wrap_hash,
+                    multilinear::stacked_eval::round0_trees(layout.num_polys(), config).len(),
+                );
             let prepared_perms: usize = prepared
                 .iter()
                 .filter(|p| p.group == g)
@@ -1375,13 +1379,47 @@ impl WhirBlockPlan {
         self.groups[..g].iter().map(Vec::len).sum()
     }
 
-    /// Where group `g`'s first root sits among the proof's roots.
+    /// Where group `g`'s first root sits among the proof's roots: one a
+    /// round-0 tree of every group before it.
     fn root_start(&self, g: usize) -> usize {
+        self.frame.stack_layouts[..g]
+            .iter()
+            .map(|layout| self.trees(layout).len())
+            .sum()
+    }
+
+    /// Where group `g`'s first commit-time answer sits: one a stacked
+    /// polynomial of every group before it.
+    fn answer_start(&self, g: usize) -> usize {
         self.frame.stack_layouts[..g]
             .iter()
             .map(StackedLayout::num_polys)
             .sum()
     }
+
+    /// A stack's round-0 trees under the block's config, each a range of its
+    /// polynomials (`stacked_eval::round0_trees`).
+    fn trees(&self, layout: &StackedLayout) -> Vec<std::ops::Range<usize>> {
+        multilinear::stacked_eval::round0_trees(layout.num_polys(), &self.frame.config)
+    }
+}
+
+/// The round-0 trees a run of polynomials (`run`) is committed under, as a
+/// range of the stack's `trees` (`stacked_eval::round0_trees`): one a
+/// polynomial, or a joint run's one.
+fn run_trees(
+    trees: &[std::ops::Range<usize>],
+    run: &std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    let first = trees
+        .iter()
+        .position(|tree| tree.start == run.start)
+        .expect("a run starts a round-0 tree");
+    let last = trees
+        .iter()
+        .position(|tree| tree.end == run.end)
+        .expect("a run ends a round-0 tree");
+    first..last + 1
 }
 
 /// Words the transcript's state digest occupies: one, on the algebraic sponge.
@@ -1969,6 +2007,12 @@ fn emit_front(
         .frame
         .stack_layouts
         .iter()
+        .map(|layout| plan.trees(layout).len())
+        .sum();
+    let num_answers: usize = plan
+        .frame
+        .stack_layouts
+        .iter()
         .map(StackedLayout::num_polys)
         .sum();
     let carried: Vec<Cell> = (0..num_roots)
@@ -1978,7 +2022,7 @@ fn emit_front(
             cell
         })
         .collect();
-    let answers: Vec<Ext> = (0..num_roots)
+    let answers: Vec<Ext> = (0..num_answers)
         .map(|_| {
             let cell = b.hint_word(arena, *at);
             *at += 1;
@@ -2061,7 +2105,7 @@ pub(crate) fn front_program(plan: &WhirBlockPlan, g: usize) -> LfmProgram {
     let point = emit_commit_ood_point(
         &mut b,
         &stark::multilinear_block::commit_ood_prefix(g, layout, &plan.frame.config),
-        &front.carried[root_at..root_at + layout.num_polys()],
+        &front.carried[root_at..root_at + plan.trees(layout).len()],
         layout.n_stack(),
         layout.n_stack() + plan.frame.config.log_blowup,
     );
@@ -2328,7 +2372,9 @@ fn emit_leaf_over(
         // cells, never a second copy.
         let layout = &frame.stack_layouts[g];
         let root_at = plan.root_start(g);
-        let group_roots = &carried[root_at..root_at + layout.num_polys()];
+        let answer_at = plan.answer_start(g);
+        let trees = plan.trees(layout);
+        let group_roots = &carried[root_at..root_at + trees.len()];
         let point = emit_commit_ood_point(
             b,
             &stark::multilinear_block::commit_ood_prefix(g, layout, config),
@@ -2349,12 +2395,12 @@ fn emit_leaf_over(
         };
         #[cfg(test)]
         let group_answers: &[Ext] = if fresh.is_empty() {
-            &answers[root_at..root_at + layout.num_polys()]
+            &answers[answer_at..answer_at + layout.num_polys()]
         } else {
             &fresh
         };
         #[cfg(not(test))]
-        let group_answers: &[Ext] = &answers[root_at..root_at + layout.num_polys()];
+        let group_answers: &[Ext] = &answers[answer_at..answer_at + layout.num_polys()];
         let chain = plan.chain_shape(layout.n_stack());
         let held = hint_group_chains_shaped(b, arena, &mut at, layout.num_polys(), &chain);
         let openings: Vec<_> = held
@@ -2369,16 +2415,19 @@ fn emit_leaf_over(
             .map(|(chain, (current, next))| chain.wires(current, next))
             .collect();
         // Each chain against its run's slice of the carried roots: tree `p` of
-        // a run is checked against the root at `root_at + run.start + p`, a
-        // program constant (REV-B2-JUDGE B2-4).
+        // a run is checked against the root at `root_at` plus the tree's
+        // index, a program constant — one root for a joint run.
         let chains: Vec<StackedChainWires<'_>> = held
             .runs
             .iter()
             .enumerate()
-            .map(|(i, run)| StackedChainWires {
-                rounds: &rounds[i],
-                roots: &carried[root_at + run.start..root_at + run.end],
-                final_value: held.finals[i],
+            .map(|(i, run)| {
+                let at = run_trees(&trees, run);
+                StackedChainWires {
+                    rounds: &rounds[i],
+                    roots: &carried[root_at + at.start..root_at + at.end],
+                    final_value: held.finals[i],
+                }
             })
             .collect();
         emit_group_walk_chains(
@@ -2422,13 +2471,14 @@ fn emit_leaf_over(
                 .zip(&openings)
                 .map(|(chain, (current, next))| chain.wires(current, next))
                 .collect();
+            let prepared_trees = plan.trees(&p.layout);
             let chains: Vec<StackedChainWires<'_>> = held
                 .runs
                 .iter()
                 .enumerate()
                 .map(|(i, run)| StackedChainWires {
                     rounds: &rounds[i],
-                    roots: &roots[run.clone()],
+                    roots: &roots[run_trees(&prepared_trees, run)],
                     final_value: held.finals[i],
                 })
                 .collect();
@@ -2530,11 +2580,17 @@ pub fn block_leaf_arena(
             prepared,
         )?);
     }
-    if proof.commit_ood.len() != proof.proof.roots.len() {
+    let polys: usize = plan
+        .frame
+        .stack_layouts
+        .iter()
+        .map(StackedLayout::num_polys)
+        .sum();
+    if proof.commit_ood.len() != polys {
         return Err(format!(
-            "the proof carries {} commit-time answers for {} roots",
+            "the proof carries {} commit-time answers for {} stacked polynomials",
             proof.commit_ood.len(),
-            proof.proof.roots.len()
+            polys
         ));
     }
     Ok(leaf_arena(&proof.proof.roots, &proof.commit_ood, groups))

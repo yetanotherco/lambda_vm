@@ -290,7 +290,7 @@ fn spoil_leaf(proof: &mut ChainProof<F, E>, shape: &ChainShape, r: usize, digest
         }
     };
     match &mut proof.rounds[r - 1].openings {
-        RoundOpenings::Base(p) => spoil(&mut p.next),
+        RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => spoil(&mut p.next),
         RoundOpenings::Extension(p) => spoil(&mut p.next),
         RoundOpenings::BaseGrouped(p) => spoil(&mut p.next),
     }
@@ -525,7 +525,9 @@ fn the_sampled_checks_still_run_beside_the_tail_rounds() {
         for q in [0, shape.num_queries - 1] {
             let mut forged = f.proof.clone();
             match &mut forged.rounds[r].openings {
-                RoundOpenings::Base(p) => p.next[q].values[0] += FEE::one(),
+                RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
+                    p.next[q].values[0] += FEE::one()
+                }
                 RoundOpenings::Extension(p) => p.next[q].values[0] += FEE::one(),
                 RoundOpenings::BaseGrouped(p) => p.next[q].values[0] += FEE::one(),
             }

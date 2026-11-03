@@ -270,6 +270,28 @@ pub fn emit_block_leaf(b: &mut LfmBuilder, values: BlockValues<'_>) -> WrapDiges
     }
 }
 
+/// The joint leaf of a grouped run's round-0 tree
+/// (`whir_commit::verify_joint_opening_capped`): `values` is `blocks` base
+/// blocks end to end, hashed under the Poseidon1 joint tag.
+pub fn emit_joint_block_leaf(
+    b: &mut LfmBuilder,
+    values: BlockValues<'_>,
+    blocks: usize,
+) -> WrapDigest {
+    assert_eq!(
+        b.wrap_hash(),
+        edsl::WrapHash::Poseidon1,
+        "a joint leaf hashes under the Poseidon1 leaf"
+    );
+    match values {
+        BlockValues::Base(felts) => super::p1w16_emit::joint_leaf_hash(b, felts, blocks),
+        BlockValues::BaseWords { words, felts } => {
+            super::p1w16_emit::joint_leaf_hash_words(b, words, felts.len(), blocks)
+        }
+        BlockValues::Ext(_) => panic!("a joint leaf is a round-0 leaf, base-field"),
+    }
+}
+
 /// ★ `whir_commit::verify_opening`, emitted — as a REFUSAL rather than a bool.
 ///
 /// The host returns `false` and its caller turns that into
@@ -387,6 +409,42 @@ impl TreeAuth {
                         cap.verify_path(b, leaf, index_bits, &hints);
                     }
                 }
+            }
+        }
+    }
+
+    /// [`Self::verify_opening`] of a JOINT round-0 tree's leaf
+    /// (`whir_commit::verify_joint_opening_capped`): `values` is `blocks`
+    /// blocks end to end, hashed under the joint tag; the walk and the cap or
+    /// root comparison are a plain leaf's. Arity 4 only.
+    pub fn verify_joint_opening(
+        &self,
+        b: &mut LfmBuilder,
+        values: BlockValues<'_>,
+        blocks: usize,
+        index_bits: &[Bit],
+        siblings: Siblings<'_>,
+    ) {
+        assert_eq!(b.wrap_hash().arity(), 4, "a joint tree is 4-ary");
+        let leaf = emit_joint_block_leaf(b, values, blocks);
+        match (self, siblings) {
+            (TreeAuth::Root(lanes), Siblings::Child(siblings)) => {
+                let walked = super::p1w16_emit::walk4_child(b, leaf, index_bits, siblings);
+                edsl::assert_digest_eq_lanes(b, walked, std::slice::from_ref(lanes));
+            }
+            (TreeAuth::Root(lanes), Siblings::Rotated { arena, at }) => {
+                let hints = super::p1w16_emit::hint_path_rotated(b, arena, at, index_bits);
+                let walked = super::p1w16_emit::walk4(b, leaf, index_bits, &hints);
+                edsl::assert_digest_eq_lanes(b, walked, std::slice::from_ref(lanes));
+            }
+            (TreeAuth::Cap(cap), Siblings::Child(siblings)) => {
+                cap.verify_path_child(b, leaf, index_bits, siblings)
+            }
+            (TreeAuth::Cap(cap), Siblings::Rotated { arena, at }) => {
+                let walked = index_bits.len().saturating_sub(cap.mux_bits());
+                let hints =
+                    super::p1w16_emit::hint_path_rotated(b, arena, at, &index_bits[..walked]);
+                cap.verify_path(b, leaf, index_bits, &hints);
             }
         }
     }

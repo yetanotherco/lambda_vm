@@ -565,7 +565,9 @@ fn a_tampered_p1_chain_cannot_execute() {
         sites.push(("a grind nonce", forged));
         let mut forged = f.proof.clone();
         match &mut forged.rounds[0].openings {
-            RoundOpenings::Base(p) => p.current[1].proof.merkle_path[0][0] ^= 1,
+            RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
+                p.current[1].proof.merkle_path[0][0] ^= 1
+            }
             RoundOpenings::Extension(p) => p.current[1].proof.merkle_path[0][0] ^= 1,
             RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
         }
@@ -575,7 +577,7 @@ fn a_tampered_p1_chain_cannot_execute() {
         let mut forged = f.proof.clone();
         let moved = forged.rounds.iter_mut().any(|round| {
             let next = match &mut round.openings {
-                RoundOpenings::Base(p) => &mut p.next,
+                RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => &mut p.next,
                 RoundOpenings::Extension(p) => &mut p.next,
                 RoundOpenings::BaseGrouped(_) => unreachable!("a per-polynomial chain"),
             };
@@ -594,7 +596,7 @@ fn a_tampered_p1_chain_cannot_execute() {
             // The owner path ends with the cap: its last node is a cap node.
             let mut forged = f.proof.clone();
             match &mut forged.rounds[0].openings {
-                RoundOpenings::Base(p) => {
+                RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
                     let path = &mut p.current[0].proof.merkle_path;
                     let last = path.len() - 1;
                     path[last][0] ^= 1;
@@ -770,13 +772,17 @@ fn a_tampered_coset_p1_chain_cannot_execute() {
         let mut sites: Vec<(&str, ChainProof<F, E>)> = Vec::new();
         let mut forged = f.proof.clone();
         match &mut forged.rounds[0].openings {
-            RoundOpenings::Base(p) => p.current[1].values[63] += FE::one(),
+            RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
+                p.current[1].values[63] += FE::one()
+            }
             _ => unreachable!("a per-polynomial chain opens base blocks in round 0"),
         }
         sites.push(("a round-0 block value", forged));
         let mut forged = f.proof.clone();
         match &mut forged.rounds[0].openings {
-            RoundOpenings::Base(p) => p.current[1].proof.merkle_path[0][0] ^= 1,
+            RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
+                p.current[1].proof.merkle_path[0][0] ^= 1
+            }
             _ => unreachable!("a per-polynomial chain opens base blocks in round 0"),
         }
         sites.push(("a round-0 Merkle sibling", forged));

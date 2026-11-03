@@ -453,8 +453,8 @@ pub fn emit_stacked_verify_chains(
         );
         assert_eq!(
             chain.roots.len(),
-            run.len(),
-            "one root per polynomial of the run"
+            shape.run(run.len()).trees_at(0),
+            "one root per round-0 tree of the run"
         );
         let roots: Vec<[super::builder::Felt; 4]> =
             chain.roots.iter().map(|&root| b.unpack(root)).collect();

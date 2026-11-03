@@ -107,6 +107,20 @@ pub fn leaf_hash(b: &mut LfmBuilder, felts: &[Felt]) -> WrapDigest {
         return WrapDigest::from_cell(zero_cell(b));
     }
     let tag = crypto::hash::poseidon1_stark::leaf_capacity(felts.len());
+    leaf_hash_from(b, felts, tag)
+}
+
+/// [`leaf_hash`] of a JOINT leaf (`poseidon1_stark::joint_linear_hash`):
+/// `blocks` equal blocks end to end in `felts`, the first capacity
+/// `[len, LEAF_DOMAIN, blocks, 0]` — a program constant, the leaf's width and
+/// block count being program shape.
+pub fn joint_leaf_hash(b: &mut LfmBuilder, felts: &[Felt], blocks: usize) -> WrapDigest {
+    let tag = crypto::hash::poseidon1_stark::joint_leaf_capacity(felts.len(), blocks);
+    leaf_hash_from(b, felts, tag)
+}
+
+/// The rate-12 chain over `felts` from `tag` as the first capacity.
+fn leaf_hash_from(b: &mut LfmBuilder, felts: &[Felt], tag: [FE; 4]) -> WrapDigest {
     let mut carry = b.digest_const(tag).as_cell();
     for block in felts.chunks(RATE_FELTS) {
         let lanes: Vec<Lane> = block.iter().map(|f| Lane::Var(*f)).collect();
@@ -132,6 +146,28 @@ pub fn leaf_hash_words(b: &mut LfmBuilder, words: &[Cell], felts: usize) -> Wrap
         return WrapDigest::from_cell(zero_cell(b));
     }
     let tag = crypto::hash::poseidon1_stark::leaf_capacity(felts);
+    leaf_hash_words_from(b, words, tag)
+}
+
+/// [`leaf_hash_words`] of a JOINT leaf of `blocks` blocks: the same words,
+/// the first capacity `[felts, LEAF_DOMAIN, blocks, 0]` ([`joint_leaf_hash`]).
+pub fn joint_leaf_hash_words(
+    b: &mut LfmBuilder,
+    words: &[Cell],
+    felts: usize,
+    blocks: usize,
+) -> WrapDigest {
+    assert_eq!(
+        words.len(),
+        felts.div_ceil(4),
+        "four felts a word, the last zero-filled"
+    );
+    let tag = crypto::hash::poseidon1_stark::joint_leaf_capacity(felts, blocks);
+    leaf_hash_words_from(b, words, tag)
+}
+
+/// The rate-12 chain over rate `words` from `tag` as the first capacity.
+fn leaf_hash_words_from(b: &mut LfmBuilder, words: &[Cell], tag: [FE; 4]) -> WrapDigest {
     let mut carry = b.digest_const(tag).as_cell();
     for block in words.chunks(RATE_FELTS / 4) {
         let rate: [Cell; 3] =

@@ -84,7 +84,7 @@ use multilinear::stacked_eval::index_chains;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{
     ChainConfig, ChainProof, ChainRound, GroupFold, LeafOrder, MAX_INDEX_POLYS, NonceLayout,
-    RoundOpenings, index_vars,
+    Round0Trees, RoundOpenings, index_vars,
 };
 
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
@@ -195,6 +195,11 @@ pub struct ChainShape {
     /// 0's walks authenticate the position the host prover placed the block
     /// at ([`walk_bits`]).
     pub leaves: LeafOrder,
+    /// How many round-0 trees a run of [`Self::trees`] polynomials commits:
+    /// the config's own. Under [`Round0Trees::One`] a run of two or more has
+    /// ONE tree whose leaf holds every polynomial's block, end to end
+    /// ([`Self::joint`]).
+    pub round0: Round0Trees,
 }
 
 /// How a block's recursion leaf checks a chain's queries: a verifier
@@ -263,6 +268,25 @@ impl ChainShape {
             group: config.format.group,
             trees: 1,
             leaves: config.format.leaves,
+            round0: config.format.round0,
+        }
+    }
+
+    /// Whether round 0 opens ONE joint tree over the run's polynomials
+    /// ([`Round0Trees::One`] and a run of two or more): a query then opens
+    /// one leaf of `trees · 2^k0` values and one path.
+    pub fn joint(&self) -> bool {
+        self.trees >= 2 && self.round0 == Round0Trees::One
+    }
+
+    /// Values one opening of round `r`'s current tree holds: `2^k_r`, or a
+    /// joint round 0's every block end to end.
+    pub fn current_block(&self, r: usize) -> usize {
+        let block = 1usize << self.schedule[r];
+        if r == 0 && self.joint() {
+            self.trees * block
+        } else {
+            block
         }
     }
 
@@ -372,10 +396,14 @@ impl ChainShape {
         self.schedule[r] + if r == 0 { self.index_vars() } else { 0 }
     }
 
-    /// The trees round `r` opens at each query position: the run's at round 0,
-    /// the one successor after it.
+    /// The trees round `r` opens at each query position: the run's at round 0
+    /// (one when they are joint), the one successor after it.
     pub fn trees_at(&self, r: usize) -> usize {
-        if r == 0 { self.trees } else { 1 }
+        if r == 0 && !self.joint() {
+            self.trees
+        } else {
+            1
+        }
     }
 
     /// Which of round `r`'s nonce slots (folding, out-of-domain, query) have an
@@ -477,7 +505,7 @@ impl ChainShape {
     /// Felts in round `r`'s current block: one per value in round 0, where the
     /// codeword is still base-field, and three after.
     pub fn current_felts(&self, r: usize) -> usize {
-        let values = 1usize << self.schedule[r];
+        let values = self.current_block(r);
         if r == 0 { values } else { 3 * values }
     }
 
@@ -645,12 +673,14 @@ pub fn chain_fixed_rows(shape: &ChainShape) -> usize {
     rows
 }
 
-/// INSTRUCTIONS round `r`'s query spends combining its trees' blocks: one
-/// extension row a value a tree ([`emit_combine`]), none with one tree.
+/// INSTRUCTIONS round `r`'s query spends combining its run's blocks: one
+/// extension row a value a polynomial ([`emit_combine`], the joint leaf's
+/// blocks alike), none with one polynomial.
 pub fn combine_rows(shape: &ChainShape, r: usize) -> usize {
-    match shape.trees_at(r) {
-        1 => 0,
-        trees => trees << shape.schedule[r],
+    if r == 0 && shape.trees >= 2 {
+        shape.trees << shape.schedule[r]
+    } else {
+        0
     }
 }
 
@@ -902,7 +932,7 @@ fn emit_chain(
         shape.rounds(),
         "one set of wires per scheduled round"
     );
-    assert_eq!(roots.len(), shape.trees, "one root per round-0 tree");
+    assert_eq!(roots.len(), shape.trees_at(0), "one root per round-0 tree");
     let one = b.ext_const(&FEE::one());
     let (grind_folding, grind_ood, grind_query) = shape.grind;
 
@@ -915,7 +945,7 @@ fn emit_chain(
     let cap_words = shape.cap_words(depth0, shape.caps[0]);
     assert_eq!(
         rounds[0].current_cap.len(),
-        shape.trees * cap_words,
+        shape.trees_at(0) * cap_words,
         "one cap a round-0 tree"
     );
     let mut current_trees: Vec<TreeAuth> = roots
@@ -1427,10 +1457,16 @@ fn emit_query_phase(
             .all(|t| t.cap_height() == shape.caps[r])
     );
     assert_eq!(round.current.len(), shape.num_queries * trees);
+    // A joint round 0's one leaf holds every polynomial's block.
+    let joint = r == 0 && shape.joint();
     assert_eq!(
         eqs.len(),
-        if trees == 1 { 0 } else { trees },
-        "one eq(ρ, p) a tree"
+        if r == 0 && shape.trees >= 2 {
+            shape.trees
+        } else {
+            0
+        },
+        "one eq(ρ, p) a polynomial of the run"
     );
     let queries: Vec<Vec<_>> = (0..shape.num_queries)
         .map(|_| transcript.sample_u64_pow2(b, depth))
@@ -1456,7 +1492,22 @@ fn emit_query_phase(
                 for (p, current) in blocks.iter().enumerate() {
                     #[cfg(test)]
                     onechain_steps::mark(b, onechain_steps::opening(r, q, p));
-                    current_trees[p].verify_opening(b, current.values, &walks[q], current.siblings);
+                    if joint {
+                        current_trees[p].verify_joint_opening(
+                            b,
+                            current.values,
+                            shape.trees,
+                            &walks[q],
+                            current.siblings,
+                        );
+                    } else {
+                        current_trees[p].verify_opening(
+                            b,
+                            current.values,
+                            &walks[q],
+                            current.siblings,
+                        );
+                    }
                 }
                 let next = &round.next[q];
                 // `leaf_and_slot`: the low `next_depth` bits index the successor
@@ -1482,7 +1533,22 @@ fn emit_query_phase(
                 for (p, current) in blocks.iter().enumerate() {
                     #[cfg(test)]
                     onechain_steps::mark(b, onechain_steps::opening(r, q, p));
-                    current_trees[p].verify_opening(b, current.values, &walks[q], current.siblings);
+                    if joint {
+                        current_trees[p].verify_joint_opening(
+                            b,
+                            current.values,
+                            shape.trees,
+                            &walks[q],
+                            current.siblings,
+                        );
+                    } else {
+                        current_trees[p].verify_opening(
+                            b,
+                            current.values,
+                            &walks[q],
+                            current.siblings,
+                        );
+                    }
                 }
                 #[cfg(test)]
                 onechain_steps::mark(b, onechain_steps::Step::Fold { round: r, query: q });
@@ -1654,9 +1720,36 @@ fn walk_bits<'a>(shape: &ChainShape, r: usize, bits: &'a [Bit]) -> std::borrow::
 /// trees' blocks combined with `eqs` ([`emit_combine`]).
 fn folded_block(b: &mut LfmBuilder, blocks: &[QueryOpening<'_>], eqs: &[Ext]) -> Vec<Ext> {
     match blocks {
-        [one] => block_ext(one.values),
+        [one] if eqs.is_empty() => block_ext(one.values),
+        // A joint round 0's one leaf: its `eqs.len()` blocks end to end.
+        [one] => emit_combine_joint(b, eqs, one),
         _ => emit_combine(b, eqs, blocks),
     }
+}
+
+/// [`emit_combine`] over a joint leaf: block `p` is the leaf's `p`-th run of
+/// `2^k0` values. The leaf hash pinned every felt of the leaf, so each block's
+/// lift is pinned as [`emit_combine`]'s is.
+fn emit_combine_joint(b: &mut LfmBuilder, eqs: &[Ext], leaf: &QueryOpening<'_>) -> Vec<Ext> {
+    let felts = match leaf.values {
+        BlockValues::Base(felts) | BlockValues::BaseWords { felts, .. } => felts,
+        BlockValues::Ext(_) => panic!("a joint round 0's leaf is base-field"),
+    };
+    assert_eq!(
+        felts.len() % eqs.len(),
+        0,
+        "a joint leaf is one block a polynomial"
+    );
+    let width = felts.len() / eqs.len();
+    (0..width)
+        .map(|t| {
+            let mut acc = b.emul_base(eqs[0], felts[t]);
+            for (p, eq) in eqs.iter().enumerate().skip(1) {
+                acc = b.emul_add(*eq, felts[p * width + t].as_ext(), acc);
+            }
+            acc
+        })
+        .collect()
 }
 
 /// A block as extension wires. A base block's values lift for free — a base
@@ -1836,7 +1929,6 @@ impl RoundStorage {
                     )
                 }
             };
-            let k = shape.schedule[r];
             let sumcheck: Vec<Vec<Ext>> = (0..shape.messages(r))
                 .map(|_| (0..2).map(|_| next_word(b, &mut at).as_ext()).collect())
                 .collect();
@@ -1855,14 +1947,15 @@ impl RoundStorage {
             // owner path carried after its siblings) — a grouped round 0's
             // trees' caps, in tree order.
             let current_cap: Vec<WrapDigest> = if r == 0 {
-                (0..shape.trees * shape.cap_words(shape.current_depth(0), shape.caps[0]))
+                (0..shape.trees_at(0) * shape.cap_words(shape.current_depth(0), shape.caps[0]))
                     .map(|_| WrapDigest::from_cell(next_word(b, &mut at)))
                     .collect()
             } else {
                 Vec::new()
             };
             let depth = shape.current_path(r);
-            let block = 1usize << k;
+            // A joint round 0's leaf is every polynomial's block end to end.
+            let block = shape.current_block(r);
             // ★ ROUND 0's current codeword is BASE on the host
             // (`whir_chain.rs:983`), so its block hashes ONE felt a value and
             // not three. Hinting it as extension wires would hash forty-eight
@@ -2030,14 +2123,13 @@ impl RoundStorage {
 }
 
 pub fn round_words(shape: &ChainShape, r: usize) -> u32 {
-    let k = shape.schedule[r];
     // The sumcheck's two evaluations a round, the nonces the layout carries,
     // and per query the current block plus its path (to the cap, when the tree
     // has one).
     let nonces = shape.carries(r).iter().filter(|&&carried| carried).count();
     let mut n = (2 * shape.messages(r) + nonces) as u32;
     let depth = shape.current_path(r);
-    let block = 1usize << k;
+    let block = shape.current_block(r);
     if shape.tail_round(r) {
         // A tail round: every leaf's block once, in leaf order, and no path.
         n += (shape.current_leaves(r) * block) as u32;
@@ -2053,7 +2145,7 @@ pub fn round_words(shape: &ChainShape, r: usize) -> u32 {
     }
     if r == 0 {
         // W1: tree 0's cap words, a grouped round 0's trees' each.
-        n += (shape.trees * shape.cap_words(shape.current_depth(0), shape.caps[0])) as u32;
+        n += (shape.trees_at(0) * shape.cap_words(shape.current_depth(0), shape.caps[0])) as u32;
     }
     if let Some(next_depth) = shape.next_depth(r) {
         // The successor root, its out-of-domain value, its cap, and per query
@@ -2154,7 +2246,7 @@ fn next_openings(
     round: &ChainRound<GoldilocksField, GoldilocksExtension>,
 ) -> &[multilinear::whir_commit::CosetOpening<GoldilocksExtension>] {
     match &round.openings {
-        RoundOpenings::Base(p) => &p.next,
+        RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => &p.next,
         RoundOpenings::Extension(p) => &p.next,
         RoundOpenings::BaseGrouped(p) => &p.next,
     }
@@ -2309,7 +2401,8 @@ fn push_openings(
         }
     }
     match &round.openings {
-        RoundOpenings::Base(p) => {
+        // A joint round 0 lays out as a polynomial's own: one leaf a query.
+        RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
             if current {
                 // A base value arrives as `(v, 0, 0, 0)`.
                 side(words, &p.current, owner_cap, |v| {
@@ -2435,7 +2528,8 @@ fn push_openings4(
         words.extend(values.iter().map(ext_word));
     };
     match &round.openings {
-        RoundOpenings::Base(p) => {
+        // A joint round 0 lays out as a polynomial's own: one leaf a query.
+        RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
             if current {
                 side(words, &p.current, tree, |words, values| {
                     push_base_block(words, values, packed)

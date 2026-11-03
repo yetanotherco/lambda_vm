@@ -448,6 +448,7 @@ impl BlockFormat {
         config.format.argue = self.argue;
         config.format.group = self.group;
         config.format.leaves = self.zf.whir_leaves;
+        config.format.round0 = self.zf.whir_trees;
         config
     }
 }
@@ -1874,8 +1875,10 @@ pub struct BlockWhirProof {
     /// empty. Which one a verifier reads is its format's, never the proof's.
     pub argues: Vec<BatchedArgue<E>>,
     /// Every carried stacked polynomial's commit-time out-of-domain answer, in
-    /// root order: one per root of `proof.roots`, absorbed after the roots and
-    /// before the block's first challenge, and each carried into its chain
+    /// polynomial order: one per stacked polynomial of every group (one per
+    /// root of `proof.roots` unless a group's run shares one round-0 tree,
+    /// `ZfFormat::whir_trees`), absorbed after the roots and before the
+    /// block's first challenge, and each carried into its chain
     /// (`stark::multilinear_block::commit_ood_point`). The verifier refuses
     /// any other count.
     pub commit_ood: Vec<FieldElement<E>>,

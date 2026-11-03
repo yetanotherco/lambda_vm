@@ -2298,12 +2298,14 @@ where
             .iter()
             .map(|s| s.slot_of.len())
             .sum();
-        let roots = all_roots.get(root_at..root_at + layout.num_polys()).ok_or(
-            MlError::QueryCountMismatch {
-                expected: root_at + layout.num_polys(),
+        // One root a round-0 tree: a polynomial's, or a joint run's.
+        let trees = stacked_eval::round0_trees(layout.num_polys(), config).len();
+        let roots = all_roots
+            .get(root_at..root_at + trees)
+            .ok_or(MlError::QueryCountMismatch {
+                expected: root_at + trees,
                 got: all_roots.len(),
-            },
-        )?;
+            })?;
         if exclude_settled {
             // Policy B: the group's stack holds each table's columns past the
             // prefix the prepared opening settles, and these are its claims.
@@ -2342,7 +2344,7 @@ where
         }
         statement_at += size;
         column_at += width;
-        root_at += layout.num_polys();
+        root_at += trees;
     }
 
     // ★★★ THE PREPARED OPENING, and check (d) with it.

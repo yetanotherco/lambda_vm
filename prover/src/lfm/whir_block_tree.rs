@@ -2278,6 +2278,22 @@ pub fn prove_whir_block_tree(
                 .collect();
             sink.line(&format!("W3 GROUP TABLES {g}: {}", kinds.join(" ")));
         }
+        // The groups' round-0 trees (one a polynomial, or one a joint run)
+        // and the round-0 leaf permutations the card's commits paid.
+        let polys: usize = frame
+            .stack_layouts
+            .iter()
+            .map(multilinear::stacking::StackedLayout::num_polys)
+            .sum();
+        sink.line(&format!(
+            "W3 WHIR TREES: {} · round-0 trees {} · polys {polys} · card leaf permutations {}",
+            match format.zf.whir_trees {
+                multilinear::whir_chain::Round0Trees::Each => "each",
+                multilinear::whir_chain::Round0Trees::One => "one",
+            },
+            proof.proof.roots.len(),
+            multilinear::gpu::commit_leaf_perms(),
+        ));
     }
     sink.line(&format!(
         "W3 BASE: {base:.2}s · statement at {stated_at:.2}s · plan + {} leaves emitted by {ready_at:.2}s ({})",

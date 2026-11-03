@@ -99,8 +99,9 @@ where
     others: Vec<Codeword<F>>,
     /// A joint tree the card built over every codeword: no single codeword's
     /// tree, so its node buffer is held here until the commitment is retired
-    /// or opened. `None` on every other commitment.
-    joint_tree: Option<crate::gpu::JointTree>,
+    /// or opened. `None` on every other commitment. Boxed: a commitment is
+    /// held by value in the chain's rounds, and only a joint one has a tree.
+    joint_tree: Option<Box<crate::gpu::JointTree>>,
 }
 
 /// Paths served from a kept tree top, and the leaves re-hashed on the host to
@@ -875,7 +876,7 @@ where
             leaves,
             top: None,
             others,
-            joint_tree: Some(tree),
+            joint_tree: Some(Box::new(tree)),
         })
     }
 

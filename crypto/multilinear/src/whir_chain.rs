@@ -1770,6 +1770,9 @@ where
 ///
 /// Only the first round's is base-field. Folding it with an extension challenge
 /// is what lifts it, so every later round is `Extension`.
+// One a chain prove, on its stack: the extension variant holds the round's own
+// commitment by value, as it always has, and boxing it would buy nothing.
+#[allow(clippy::large_enum_variant)]
 enum Current<'a, F: IsField + 'static, E: IsField + 'static, H: WhirHash>
 where
     FieldElement<F>: AsBytes + Sync + Send,

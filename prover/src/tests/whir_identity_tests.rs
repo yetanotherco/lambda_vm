@@ -370,7 +370,9 @@ fn the_identity_line_moves_when_an_opened_value_moves() {
     let mut tampered = proof.clone();
     let round = &mut tampered.columns[0].polys[0].rounds[0];
     match &mut round.openings {
-        RoundOpenings::Base(p) => p.current[0].values[0] += FieldElement::<Fp>::one(),
+        RoundOpenings::Base(p) | RoundOpenings::BaseJoint(p) => {
+            p.current[0].values[0] += FieldElement::<Fp>::one()
+        }
         RoundOpenings::Extension(p) => {
             p.current[0].values[0] += FieldElement::<Ext>::one();
         }

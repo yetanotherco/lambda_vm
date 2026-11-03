@@ -251,7 +251,12 @@ fn a_joint_run_on_the_card_proves_the_hosts_bytes() {
     ] {
         let (host_roots, host_proof) = stack.on_the_host(&cfg);
         stack.verify(&host_roots, &host_proof, &cfg, stack.name);
-        assert_eq!(host_roots.len() as u64, stack.trees(&cfg), "{}: one root a tree", stack.name);
+        assert_eq!(
+            host_roots.len() as u64,
+            stack.trees(&cfg),
+            "{}: one root a tree",
+            stack.name
+        );
         assert!(
             host_proof
                 .polys
@@ -272,7 +277,12 @@ fn a_joint_run_on_the_card_proves_the_hosts_bytes() {
             "{}: the commit's leaf permutations",
             stack.name
         );
-        assert_eq!(gpu::host_fallbacks(), fallbacks, "{}: no host commit", stack.name);
+        assert_eq!(
+            gpu::host_fallbacks(),
+            fallbacks,
+            "{}: no host commit",
+            stack.name
+        );
         assert_eq!(roots, host_roots, "{}, whole: roots", stack.name);
         assert!(
             bytes(&whole) == bytes(&host_proof),
@@ -292,10 +302,17 @@ fn a_joint_run_on_the_card_proves_the_hosts_bytes() {
                 stack.trees(&cfg),
                 "{label}: one stack opening a tree"
             );
-            assert_eq!(gpu::coset_fallbacks(), reencoded, "{label}: nothing re-encoded");
+            assert_eq!(
+                gpu::coset_fallbacks(),
+                reencoded,
+                "{label}: nothing re-encoded"
+            );
             assert_eq!(roots, host_roots, "{label}: roots");
             stack.verify(&roots, &proof, &cfg, &label);
-            assert!(bytes(&proof) == bytes(&host_proof), "{label}: the host's bytes");
+            assert!(
+                bytes(&proof) == bytes(&host_proof),
+                "{label}: the host's bytes"
+            );
         }
 
         let label = format!("{}, revived at drop 4, the stack path off", stack.name);
@@ -306,7 +323,10 @@ fn a_joint_run_on_the_card_proves_the_hosts_bytes() {
         gpu::force_coset_openings(None);
         let (_, reencoded) = reencoded.unwrap_or_else(|e| panic!("{label}: {e:?}"));
         assert_eq!(moved, 0, "{label}: no tree from its stack");
-        assert!(bytes(&reencoded) == bytes(&host_proof), "{label}: the host's bytes");
+        assert!(
+            bytes(&reencoded) == bytes(&host_proof),
+            "{label}: the host's bytes"
+        );
     }
 }
 
@@ -331,8 +351,18 @@ fn one_tree_a_run_saves_two_permutations_a_leaf_of_a_run_of_three() {
     stack.verify(&one_roots, &one_proof, &one, "one");
     let domain = Domain::<F>::new(stack.layout.n_stack() + one.log_blowup).unwrap();
     for (roots, proof, cfg, label) in [
-        (&one_roots, &one_proof, &each, "a joint proof under one tree a polynomial"),
-        (&each_roots, &each_proof, &one, "a per-tree proof under one tree a run"),
+        (
+            &one_roots,
+            &one_proof,
+            &each,
+            "a joint proof under one tree a polynomial",
+        ),
+        (
+            &each_roots,
+            &each_proof,
+            &one,
+            "a per-tree proof under one tree a run",
+        ),
     ] {
         assert!(
             verify::<F, Ext, _, P1Whir>(

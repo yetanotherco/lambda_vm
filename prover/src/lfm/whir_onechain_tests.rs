@@ -17,8 +17,8 @@ use multilinear::stacked_eval::{Claimed, Refusal, StackedCommitment, StackedProo
 use multilinear::stacking::StackedLayout;
 use multilinear::whir::Domain;
 use multilinear::whir_chain::{
-    CapPolicy, ChainConfig, ChainFormat, FirstFold, GrindBits, GroupFold, LeafOrder, RoundOpenings,
-    WhirFolds,
+    CapPolicy, ChainConfig, ChainFormat, FirstFold, GrindBits, GroupFold, LeafOrder, Round0Trees,
+    RoundOpenings, WhirFolds,
 };
 use multilinear::whir_commit::Commitment;
 use multilinear::whir_hash::{P1Whir, RpxWhir, WhirHash};
@@ -71,6 +71,8 @@ struct Case {
     grind: u8,
     cap: CapPolicy,
     leaves: LeafOrder,
+    /// One round-0 tree a polynomial, or one a run.
+    round0: Round0Trees,
 }
 
 fn rpx(name: &'static str, heights: &[usize], n_stack: usize, grind: u8) -> Case {
@@ -86,6 +88,7 @@ fn rpx(name: &'static str, heights: &[usize], n_stack: usize, grind: u8) -> Case
         grind,
         cap: CapPolicy::Off,
         leaves: LeafOrder::Natural,
+        round0: Round0Trees::Each,
     }
 }
 
@@ -148,6 +151,7 @@ fn config(case: &Case) -> ChainConfig {
         }),
         group: GroupFold::Indexed,
         leaves: case.leaves,
+        round0: case.round0,
         ..ChainFormat::DEFAULT
     };
     match case.base {
@@ -375,7 +379,8 @@ impl Arena {
         let mut chain_at = Vec::new();
         for run in f.shape.chains(f.layout.num_polys()) {
             chain_at.push(at);
-            at += run.len() as u32 + 1 + RoundStorage::words(&f.shape.run(run.len()));
+            let shape = f.shape.run(run.len());
+            at += shape.trees_at(0) as u32 + 1 + RoundStorage::words(&shape);
         }
         Self {
             values_at,
@@ -429,7 +434,7 @@ fn emit_program(f: &Fixture) -> LfmProgram {
     let mut finals: Vec<Ext> = Vec::new();
     let mut storage: Vec<RoundStorage> = Vec::new();
     for (run, &base) in runs.iter().zip(&at.chain_at) {
-        let n = run.len() as u32;
+        let n = f.shape.run(run.len()).trees_at(0) as u32;
         roots.push((0..n).map(|i| b.hint_word(arena, base + i)).collect());
         finals.push(b.hint_word(arena, base + n).as_ext());
         storage.push(RoundStorage::hint(
@@ -481,8 +486,18 @@ fn arena_under(f: &Fixture, roots: &[Commitment], proof: &StackedProof<F, E>) ->
     let mut words: Vec<LfmWord> = f.points.iter().flatten().map(ext_word).collect();
     words.extend(f.values.iter().map(ext_word));
     let runs = f.shape.chains(f.layout.num_polys());
+    let trees = multilinear::stacked_eval::round0_trees(f.layout.num_polys(), &f.cfg);
     for (chain, run) in proof.polys.iter().zip(&runs) {
-        words.extend(roots[run.clone()].iter().map(commitment_to_digest));
+        // The run's roots: one a polynomial, or its joint tree's one.
+        let first = trees
+            .iter()
+            .position(|t| t.start == run.start)
+            .expect("a tree starts the run");
+        let last = trees
+            .iter()
+            .position(|t| t.end == run.end)
+            .expect("a tree ends the run");
+        words.extend(roots[first..last + 1].iter().map(commitment_to_digest));
         words.push(ext_word(&chain.final_value));
         push_round_words(&mut words, &f.shape.run(run.len()), chain);
     }
@@ -650,6 +665,7 @@ fn at_blowup(case: &Case, log_blowup: usize) -> Case {
         grind: case.grind,
         cap: case.cap,
         leaves: case.leaves,
+        round0: case.round0,
     }
 }
 
@@ -1983,6 +1999,134 @@ fn a_grouped_successor_cap_off_its_root_has_no_execution() {
             "{}: a successor cap node off its root is refused at the cap by the host and where \
              the cap is authenticated by the machine; not so: {elsewhere:?}",
             case.name
+        );
+    }
+}
+
+// ─────────────────── one round-0 tree a run, in guest ───────────────────
+
+/// `case` under one round-0 tree a run.
+fn joint(case: Case) -> Case {
+    Case {
+        round0: Round0Trees::One,
+        ..case
+    }
+}
+
+/// ★ One round-0 tree a run, in guest: under Poseidon1, a run's joint leaf
+/// (every polynomial's block end to end, under the joint tag) and its one
+/// path execute on the proofs the host accepts — under the per-query check
+/// and the lean one — and the program is its closed form (every arena word
+/// hinted once, its permutations the cost model's). A value off in any block
+/// of a leaf, or a path node off, has no execution.
+#[test]
+fn joint_round_zero_trees_execute_and_refuse_a_forgery() {
+    for case in cases().into_iter().filter(|c| c.base == Base::P1) {
+        let mut f = build(&joint(case), GroupFold::Indexed);
+        assert!(host_accepts(&f, &f.proof), "{}: the control", f.name);
+        let runs = f.shape.chains(f.layout.num_polys());
+        assert!(
+            runs.iter().any(|run| f.shape.run(run.len()).joint()),
+            "{}: a joint run",
+            f.name
+        );
+        for query in [LeafQuery::V1, LeafQuery::Lean] {
+            f.shape.query = query;
+            let program = program(&f);
+            let honest = arena(&f, &f.proof);
+            machine_runs(&f, &program, honest.clone()).unwrap_or_else(|e| {
+                panic!(
+                    "{} {query:?}: the machine refused an accepted proof: {e}",
+                    f.name
+                )
+            });
+            let at = Arena::new(&f);
+            assert_eq!(
+                hint_rows(&program),
+                at.total as usize,
+                "{} {query:?}: every arena word hinted once",
+                f.name
+            );
+            let group_of: Vec<usize> = (0..f.values.len()).collect();
+            let cost = stacked_verify_cost(
+                &f.layout,
+                &group_of,
+                &f.shape,
+                SpongeEntry::fresh_for(WrapHash::Poseidon1),
+            );
+            let perms = program
+                .instrs
+                .iter()
+                .filter(|i| matches!(i, Instr::Hash16(_)))
+                .count();
+            assert_eq!(perms, cost.perms(), "{} {query:?}: permutations", f.name);
+        }
+        // Forgeries, on the per-query check: the host refuses each, and the
+        // machine has no execution.
+        f.shape.query = LeafQuery::V1;
+        let program = program(&f);
+        let width = f.shape.run(runs[0].len()).current_block(0);
+        for t in [0usize, 63, 64, width - 1] {
+            let mut forged = f.proof.clone();
+            match &mut forged.polys[0].rounds[0].openings {
+                RoundOpenings::BaseJoint(p) => p.current[1].values[t] += FE::one(),
+                _ => panic!("{}: chain 0 is joint", f.name),
+            }
+            assert!(!host_accepts(&f, &forged), "{}: value {t}", f.name);
+            assert!(
+                execute(&program, &[arena(&f, &forged)], &socket(f.base)).is_err(),
+                "{}: value {t} of a joint leaf off must have no execution",
+                f.name
+            );
+        }
+        let mut forged = f.proof.clone();
+        match &mut forged.polys[0].rounds[0].openings {
+            RoundOpenings::BaseJoint(p) => p.current[2].proof.merkle_path[0][0] ^= 1,
+            _ => panic!("{}: chain 0 is joint", f.name),
+        }
+        assert!(!host_accepts(&f, &forged), "{}: a path node", f.name);
+        assert!(
+            execute(&program, &[arena(&f, &forged)], &socket(f.base)).is_err(),
+            "{}: a joint path node off must have no execution",
+            f.name
+        );
+    }
+}
+
+/// A joint leg refuses a per-tree proof and the per-tree leg a joint one: the
+/// two arenas have other lengths (one root and one path a query against
+/// `P'`), so neither program reads the other's. (The joint leg executing an
+/// honest proof pins its leaf tag to the host committer's; the host's own
+/// refusal of a leaf under another tag is `multilinear`'s.)
+#[test]
+fn a_joint_leg_and_a_per_tree_leg_refuse_each_others_proofs() {
+    for case in cases().into_iter().filter(|c| c.base == Base::P1) {
+        let each = build(&case, GroupFold::Indexed);
+        let one = build(&joint(case), GroupFold::Indexed);
+        let (each_program, one_program) = (program(&each), program(&one));
+        machine_runs(&each, &each_program, arena(&each, &each.proof)).unwrap();
+        machine_runs(&one, &one_program, arena(&one, &one.proof)).unwrap();
+        assert_ne!(
+            arena(&each, &each.proof).len(),
+            arena(&one, &one.proof).len(),
+            "{}: the arenas differ in length",
+            one.name
+        );
+        assert!(
+            execute(
+                &one_program,
+                &[arena(&each, &each.proof)],
+                &socket(one.base)
+            )
+            .is_err()
+        );
+        assert!(
+            execute(
+                &each_program,
+                &[arena(&one, &one.proof)],
+                &socket(each.base)
+            )
+            .is_err()
         );
     }
 }

@@ -287,9 +287,11 @@ where
     E: IsField + 'static,
     T: crypto::fiat_shamir::is_transcript::IsTranscript<E> + Default,
 {
-    if roots.len() != layout.num_polys() {
+    // One root a round-0 tree: a polynomial's, or a joint run's.
+    let trees = stacked_eval::round0_trees(layout.num_polys(), config).len();
+    if roots.len() != trees {
         return Err(MlError::QueryCountMismatch {
-            expected: layout.num_polys(),
+            expected: trees,
             got: roots.len(),
         });
     }
@@ -3646,11 +3648,16 @@ where
         });
     }
     // Every root the proof carries is one some group opens: a root no layout
-    // claims would be absorbed and bound to nothing.
+    // claims would be absorbed and bound to nothing. One a round-0 tree, by
+    // the verifier's own layouts and config.
     let polys: usize = layouts.iter().map(StackedLayout::num_polys).sum();
-    if polys != proof.roots.len() {
+    let trees: usize = layouts
+        .iter()
+        .map(|layout| stacked_eval::round0_trees(layout.num_polys(), config).len())
+        .sum();
+    if trees != proof.roots.len() {
         return Err(MlError::QueryCountMismatch {
-            expected: polys,
+            expected: trees,
             got: proof.roots.len(),
         });
     }
@@ -3714,6 +3721,7 @@ where
     let mut balance = FieldElement::<E>::zero();
     let mut statement_at = 0usize;
     let mut root_at = 0usize;
+    let mut answer_at = 0usize;
     for (g, (((opening, layout), domain), &size)) in proof
         .columns
         .iter()
@@ -3778,12 +3786,13 @@ where
                 }
             }
         }
-        let roots = &proof.roots[root_at..root_at + layout.num_polys()];
+        let trees = stacked_eval::round0_trees(layout.num_polys(), config).len();
+        let roots = &proof.roots[root_at..root_at + trees];
         // The group's point, from its own roots and the verifier's layout.
         let z0 = commit_ood_point::<E, T>(g, layout, roots, config)?;
         let ood = checks.commit_ood.then_some(CommitOod {
             z0: &z0,
-            answers: &commit_ood[root_at..root_at + layout.num_polys()],
+            answers: &commit_ood[answer_at..answer_at + layout.num_polys()],
         });
         stacked_eval::verify_ood::<F, E, T, H>(
             opening,
@@ -3826,7 +3835,8 @@ where
             )?;
         }
         statement_at += size;
-        root_at += layout.num_polys();
+        root_at += trees;
+        answer_at += layout.num_polys();
     }
     if checks.balance && balance != *expected {
         return Err(MlError::BusImbalance);
