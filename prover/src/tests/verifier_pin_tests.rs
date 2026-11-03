@@ -372,6 +372,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
         ZfFormat {
             whir_blowup: 4,
             whir_leaves: LeafOrder::Natural,
+            whir_trees: multilinear::whir_chain::Round0Trees::Each,
             ..ZfFormat::DEFAULT
         }
     );

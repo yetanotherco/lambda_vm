@@ -465,7 +465,12 @@ impl BlockFormat {
         config.format.argue = self.argue;
         config.format.group = self.group;
         config.format.leaves = self.zf.whir_leaves;
-        config.format.round0 = self.zf.whir_trees;
+        // One tree a run needs runs: one chain a polynomial has none, and its
+        // round-0 trees are one a polynomial whatever the knob says.
+        config.format.round0 = match self.group {
+            GroupFold::Indexed => self.zf.whir_trees,
+            GroupFold::PerPoly => multilinear::whir_chain::Round0Trees::Each,
+        };
         config
     }
 }

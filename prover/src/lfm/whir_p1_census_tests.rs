@@ -1108,10 +1108,11 @@ fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
 /// pins are taken over a checked-in copy of it: the same bytes on every
 /// machine.
 ///
-/// The pins move with any AIR whose constraint leg a leaf emits: last moved by
-/// the block presets' lean KECCAK_RND form (1,011 interactions), after the
-/// ECREC table and the 23-count statement, KECCAK's sponge mode (Keccak-256 of
-/// a buffer) and its round-chip tokens.
+/// The pins move with any AIR whose constraint leg a leaf emits, and with the
+/// block's format: last moved by one round-0 tree a group's run as the default
+/// (a joint leaf and one path a query; the lean check's median mix one leaf
+/// fewer), after the block presets' lean KECCAK_RND form (1,011 interactions),
+/// the ECREC table and the 23-count statement.
 #[test]
 fn the_median_mix_leaves_are_pinned_under_each_query_check() {
     use super::whir_chain::LeafQuery;
@@ -1122,29 +1123,29 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
             LeafQuery::V1,
             GkrPack::PRODUCTION,
             5,
-            "f3c1fd202ad60b0fa3b74e859406dc7cd15c7418a11983ed2f6bcedb652f0044",
-            "585115f269c36c3037e299b1d8678ccc0dbb0e5a7e6fdcf2e30600240bf37fa5",
+            "f66cf92105f1bf17e0fdfe8c82c4dea0d6bd814f609de248616b7a7cf1295519",
+            "94d400473e0a7e75795fd75ac0b76ffe86fca5353771155caf60b099fb69f01e",
         ),
         (
             LeafQuery::Lean,
             GkrPack::PRODUCTION,
-            5,
-            "e1fc66308f1d598aa72a490bf0553e327638c5ca5d001914853c0aa94897e057",
-            "161befd641805b345202e10f4d845188e72adefd6b4d601a2658ad325c0c4aaa",
+            4,
+            "8f2baebc59e7665b5bb9a82b2eeb4ed7085c5a173170fbf1cecbc3278e447b9a",
+            "84190e62ce1be60d6ea8c7d348d925b7e829a2b329aff9d59e4bd7cfd7fdb0ba",
         ),
         (
             LeafQuery::V1,
             GkrPack::Off,
             5,
-            "ecd15a6ebddef76e934b1de460296d8fa241e134033a2c462a26e4b8c2d66d0e",
-            "34af2b40c46369c6f0bc4e55af4637e83142eb5577b0d7055dfa4ede8baba00d",
+            "21c81353fa12c84d25d690293315c5dc9a08664606d7ab07cd28f94f4d0d24e2",
+            "fcd7fe27fbdef8387f45f36bc45d3d2d8be346119289c7c319601f4c278f82c7",
         ),
         (
             LeafQuery::Lean,
             GkrPack::Off,
-            5,
-            "c0856cc520f98852161d25523dc768c4a0173c32d71663bd1ef75bbcd39672db",
-            "c8e3006cf677f273c6c44b71525a058ed8aa2b58f468183dc14d1ad22bff7c38",
+            4,
+            "ce1a330b4efb770b881766b53c829e47efa19400b80c74a2e16a8823d987fb98",
+            "09e96cf9c445b04e7e4188a2f013929bd6d79efc4975b93dd358c276978acbf7",
         ),
     ];
     let elf_bytes: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");
@@ -1623,8 +1624,10 @@ fn the_one_top_scale_doubles_and_puts_at_most_three_leaves_under_one_top() {
         levels(LeafScale::DoubledOneTop, Some(5)),
         vec![vec![3, 2], vec![2]]
     );
+    // One round-0 tree a group's run (the default) leaves the median mix one
+    // leaf fewer than one a polynomial did.
     assert_eq!(
         levels(LeafScale::DoubledOneTop, None),
-        vec![vec![3, 2], vec![2]]
+        vec![vec![3, 1], vec![2]]
     );
 }

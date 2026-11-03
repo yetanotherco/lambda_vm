@@ -128,6 +128,9 @@ fn grouped_widths(proof: &BlockWhirProof) -> Vec<usize> {
         .flat_map(|stack| &stack.polys)
         .filter_map(|chain| match &chain.rounds.first()?.openings {
             RoundOpenings::BaseGrouped(g) => g.current.first().map(Vec::len),
+            // One tree a run: its leaf holds the run's blocks of 2^6 (the
+            // format's first fold) end to end.
+            RoundOpenings::BaseJoint(j) => j.current.first().map(|q| q.values.len() >> 6),
             _ => None,
         })
         .collect()
@@ -145,6 +148,9 @@ where
         .iter()
         .map(|chain| match chain.rounds.first().map(|r| &r.openings) {
             Some(RoundOpenings::BaseGrouped(g)) => g.current.first().map_or(0, Vec::len),
+            Some(RoundOpenings::BaseJoint(j)) => {
+                j.current.first().map_or(0, |q| q.values.len() >> 6)
+            }
             _ => 1,
         })
         .collect()
@@ -373,6 +379,10 @@ fn an_indexed_coset_block_is_refused_by_a_natural_verifier() {
         );
         f.zf.whir_blowup = blowup;
         f.zf.whir_leaves = leaves;
+        // The natural order keeps one round-0 tree a polynomial, as its knob does.
+        if leaves == LeafOrder::Natural {
+            f.zf.whir_trees = multilinear::whir_chain::Round0Trees::Each;
+        }
         f
     };
     let verify = |proof: &BlockWhirProof, format: &BlockFormat| {
@@ -437,6 +447,10 @@ fn a_composed_block_is_refused_one_setting_away() {
         );
         f.zf.whir_leaves = leaves;
         f.zf.whir_blowup = blowup;
+        // The natural order keeps one round-0 tree a polynomial, as its knob does.
+        if leaves == LeafOrder::Natural {
+            f.zf.whir_trees = multilinear::whir_chain::Round0Trees::Each;
+        }
         f
     };
     let verify = |proof: &BlockWhirProof, format: &BlockFormat| {
@@ -587,6 +601,9 @@ fn a_coset_block_at_a_card_sized_stack_encodes_no_successor_on_the_host() {
 
 /// The round trip and the cross-mode refusals at each budget of `budgets`
 /// polynomials a group, under `argue`; returns the grouped run widths seen.
+/// Both modes keep one round-0 tree a polynomial, so the roots compare one
+/// for one; one tree a run is
+/// [`a_joint_tree_block_round_trips_and_refuses_the_other_mode`]'s.
 fn round_trips_and_refuses_the_other_mode(
     argue: ArgueFormat,
     budgets: std::ops::RangeInclusive<usize>,
@@ -600,8 +617,12 @@ fn round_trips_and_refuses_the_other_mode(
     let base = crate::hash_pin::BLOCK_BASE;
     let mut seen = std::collections::BTreeSet::new();
     for group_polys in budgets {
-        let indexed = format(base, group_polys, GroupFold::Indexed, argue);
-        let per_poly = format(base, group_polys, GroupFold::PerPoly, argue);
+        let each = |group: GroupFold| {
+            let mut f = format(base, group_polys, group, argue);
+            f.zf.whir_trees = multilinear::whir_chain::Round0Trees::Each;
+            f
+        };
+        let (indexed, per_poly) = (each(GroupFold::Indexed), each(GroupFold::PerPoly));
         let a = prove(&elf, &indexed, MaxRowsConfig::small());
         let b = prove(&elf, &per_poly, MaxRowsConfig::small());
         let widths = grouped_widths(&a);

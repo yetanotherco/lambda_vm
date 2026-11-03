@@ -4,8 +4,12 @@
 //! format's environment knob for the blowup is refused before any banner. So
 //! for the round-0 leaf order: `--leaves natural` prints `whir_leaves=natural`
 //! (after the blowup when both are set), the default and `--leaves coset` name
-//! no order, and its environment knob is refused before any banner. The
-//! banner is printed before the files are read, so a missing file is enough.
+//! no order, and its environment knob is refused before any banner. And for
+//! the round-0 trees: `--trees each` prints `whir_trees=each`, the default and
+//! `--trees one` name no trees, `--leaves natural` alone keeps one tree a
+//! polynomial and names only its order, `--trees one` beside it is refused
+//! before any banner, and so is the trees' environment knob. The banner is
+//! printed before the files are read, so a missing file is enough.
 
 use std::process::Command;
 
@@ -120,6 +124,67 @@ fn the_block_commands_banner_states_the_leaf_order_they_run_under() {
         );
         assert!(
             stderr.contains("give the CLI --leaves instead"),
+            "{name}: the refusal names the flag\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn the_block_commands_banner_states_the_round0_trees_they_run_under() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let missing = dir.path().join("missing");
+    let missing = missing.to_str().expect("a UTF-8 path");
+    let proof = dir.path().join("block.proof");
+    let proof = proof.to_str().expect("a UTF-8 path");
+    let commands: [(&str, Vec<&str>); 2] = [
+        ("prove-block", vec!["prove-block", missing, "-o", proof]),
+        ("verify-block", vec!["verify-block", missing, missing]),
+    ];
+    for (name, base) in &commands {
+        for (flags, tail) in [
+            (&[][..], None),
+            (&["--trees", "one"][..], None),
+            (&["--trees", "each"][..], Some(" whir_trees=each")),
+            (&["--leaves", "natural"][..], Some(" whir_leaves=natural")),
+            (
+                &["--leaves", "natural", "--trees", "each"][..],
+                Some(" whir_leaves=natural"),
+            ),
+        ] {
+            let mut args = base.clone();
+            args.extend(flags);
+            let (ok, stdout, stderr) = run(&args, &[]);
+            let tag = format!("{name} {flags:?}");
+            assert!(!ok, "{tag}: a missing file fails the command");
+            let banners = lines(&stdout, "ZF FORMAT:");
+            assert_eq!(banners.len(), 1, "{tag}: one banner\n{stdout}\n{stderr}");
+            if let Some(tail) = tail {
+                assert!(banners[0].ends_with(tail), "{tag}: {}", banners[0]);
+            }
+            if tail != Some(" whir_trees=each") {
+                assert!(!banners[0].contains("whir_trees"), "{tag}: {}", banners[0]);
+            }
+        }
+        let mut args = base.clone();
+        args.extend(["--leaves", "natural", "--trees", "one"]);
+        let (ok, stdout, stderr) = run(&args, &[]);
+        assert!(!ok, "{name}: one tree a run under the natural order");
+        assert!(
+            lines(&stdout, "ZF FORMAT:").is_empty(),
+            "{name}: no banner before the refusal\n{stdout}"
+        );
+        assert!(
+            stderr.contains("LAMBDA_VM_ZF_WHIR_TREES=one"),
+            "{name}: the refusal names the setting\n{stderr}"
+        );
+        let (ok, stdout, stderr) = run(base, &[("LAMBDA_VM_ZF_WHIR_TREES", "each")]);
+        assert!(!ok, "{name}: the environment knob is refused");
+        assert!(
+            lines(&stdout, "ZF FORMAT:").is_empty(),
+            "{name}: no banner before the refusal\n{stdout}"
+        );
+        assert!(
+            stderr.contains("give the CLI --trees instead"),
             "{name}: the refusal names the flag\n{stderr}"
         );
     }

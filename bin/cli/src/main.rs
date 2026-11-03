@@ -2329,8 +2329,8 @@ mod tests {
         );
     }
 
-    /// Both block commands take the round-0 trees, one a polynomial unless
-    /// told otherwise, and nothing but its two words; each word reads to the
+    /// Both block commands take the round-0 trees, the production's (one tree
+    /// a run) unless told otherwise, and nothing but its two words; each word reads to the
     /// trees it names. One tree a run is refused under the natural order by
     /// both commands' installs, before anything is installed.
     #[test]

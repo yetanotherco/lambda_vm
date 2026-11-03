@@ -4211,7 +4211,10 @@ fn a_leaf_of_one_group_opening_refuses_the_others_base() {
 fn indexed_leaves_execute_and_refuse_a_grouped_forgery(argue: ArgueFormat) {
     use multilinear::whir_chain::RoundOpenings;
     let base = crate::hash_pin::BLOCK_BASE;
-    let format = indexed_format(base, argue);
+    // A grouped opening holds one round-0 tree a polynomial; one tree a run's
+    // block leaves are `lean_block_leaves_execute_and_refuse_a_tampered_witness`'s.
+    let mut format = indexed_format(base, argue);
+    format.zf.whir_trees = multilinear::whir_chain::Round0Trees::Each;
     let (elf, proof) = small_block("all_instructions_64", &format);
     let plan = plan_of(&elf, &proof, &format, Some(2));
     let grouped: Vec<(usize, usize)> = proof
@@ -4352,6 +4355,8 @@ fn forged_prepared_chain(
     let small = indexed_format(base, argue);
     let mut zf = small.zf;
     zf.whir_stack = StackVars::new(stack).expect("a valid stack");
+    // The forged tree is one of a grouped opening's, one a polynomial.
+    zf.whir_trees = multilinear::whir_chain::Round0Trees::Each;
     let format = BlockFormat {
         zf,
         group_polys,

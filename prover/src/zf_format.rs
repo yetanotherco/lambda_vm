@@ -11,18 +11,20 @@
 //! LAMBDA_VM_ZF_WHIR_GRIND_BITS  20 | 18               WHIR proof-of-work bits; Q buys back what the grind gives up
 //! LAMBDA_VM_ZF_WHIR_BLOWUP  4 | 2                     WHIR base code blowup (rate 1/4 or 1/2); Q follows from the rate
 //! LAMBDA_VM_ZF_WHIR_LEAVES  natural | coset           WHIR round-0 leaf order (coset: Poseidon1 trees only)
-//! LAMBDA_VM_ZF_WHIR_TREES   each | one                WHIR round-0 trees of a block group's chain: one a polynomial, or one (opt-in)
+//! LAMBDA_VM_ZF_WHIR_TREES   each | one                WHIR round-0 trees of a block group's run: one a polynomial, or one (the default)
 //! LAMBDA_VM_ZF_LFM_MERGE   0 | 1                  LFM chips of equal padded height proved as one AIR
 //! ```
 //!
 //! ★ Every unset knob is [`ZfFormat::DEFAULT`], the MEASURED configuration:
 //! `cap=auto whir_cap=auto fri=dp one_row=0 whir_folds=first6 whir_stack=27 whir_grind=query
-//! whir_grind_bits=18`, the WHIR base code at blowup 2, the block's round-0 trees in the coset order,
-//! the LFM proofs' equal-height chips merged (`lfm_merge=1`, off beside one-row openings).
+//! whir_grind_bits=18`, the WHIR base code at blowup 2, the block's round-0 trees in the coset order
+//! and one a group's run, the LFM proofs' equal-height chips merged (`lfm_merge=1`, off beside one-row
+//! openings).
 //! Each lever was measured net positive on block runs before it became the default. Every knob keeps
 //! its OFF spelling (`cap=off`, `whir_cap=off`, `fri=pair`, `one_row=0`, `whir_folds=uniform4`,
 //! `whir_stack=25`, `whir_grind=all`, `whir_grind_bits=20`, `whir_blowup=4`,
-//! `whir_leaves=natural`, `lfm_merge=0`), so setting all eleven to off reproduces [`ZfFormat::LEGACY`] — the format
+//! `whir_leaves=natural`, `whir_trees=each`, `lfm_merge=0`), so setting all twelve to off reproduces
+//! [`ZfFormat::LEGACY`] — the format
 //! before any lever, byte for byte — for rollback and for A/B arms. The crypto crates' own defaults
 //! (`stark::proof::options::ProofFormat::DEFAULT`,
 //! `multilinear::whir_chain::ChainFormat::DEFAULT`) stay the legacy format: a
@@ -89,9 +91,10 @@ pub const ENV_WHIR_BLOWUP: &str = "LAMBDA_VM_ZF_WHIR_BLOWUP";
 /// the polynomial instead of re-encoding it) or `natural`. A proof format: the
 /// roots, the paths and the in-guest walks follow it. Poseidon1 trees only.
 pub const ENV_WHIR_LEAVES: &str = "LAMBDA_VM_ZF_WHIR_LEAVES";
-/// How many round-0 trees each block group's chain commits: `each` (the
-/// default, one a stacked polynomial) or `one` (opt-in: a run of polynomials
-/// as ONE tree whose leaf holds every polynomial's coset block, end to end).
+/// How many round-0 trees each block group's chain commits: `one` (the
+/// default: a run of polynomials as ONE tree whose leaf holds every
+/// polynomial's coset block, end to end) or `each` (one a stacked polynomial,
+/// the rollback; unset beside `whir_leaves=natural` it is `each`).
 /// A proof format: the roots, the paths and the in-guest walks follow it.
 /// Poseidon1 trees and grouped chains only.
 pub const ENV_WHIR_TREES: &str = "LAMBDA_VM_ZF_WHIR_TREES";
@@ -246,8 +249,8 @@ pub struct ZfFormat {
     /// Where the WHIR round-0 trees put their leaves ([`ENV_WHIR_LEAVES`]).
     pub whir_leaves: LeafOrder,
     /// How many round-0 trees a block group's chain commits
-    /// ([`ENV_WHIR_TREES`]): one a polynomial at the default and in the legacy
-    /// format.
+    /// ([`ENV_WHIR_TREES`]): one a run at the default, one a polynomial in the
+    /// legacy format.
     pub whir_trees: Round0Trees,
     /// Whether the LFM proofs merge their equal-height chips into one AIR
     /// ([`ENV_LFM_MERGE`]). On at the default, off in the legacy format.
@@ -386,7 +389,7 @@ impl ZfFormat {
         whir_blowup: 1 << PRODUCTION_WHIR_LOG_BLOWUP,
         base: crate::hash_pin::BLOCK_BASE,
         whir_leaves: LeafOrder::Coset,
-        whir_trees: Round0Trees::Each,
+        whir_trees: Round0Trees::One,
         lfm_merge: true,
     };
 
@@ -726,10 +729,11 @@ impl ZfFormat {
             // Printed only off the default (the coset order).
             LeafOrder::Coset => "",
             LeafOrder::Natural => " whir_leaves=natural",
-        } + match self.whir_trees {
-            // Printed only off the default (one a polynomial).
-            Round0Trees::Each => "",
-            Round0Trees::One => " whir_trees=one",
+        } + match (self.whir_trees, self.whir_leaves) {
+            // Printed only off the default (one a run), and only where it is a
+            // choice: under the natural order one a polynomial is the only one.
+            (Round0Trees::One, _) | (Round0Trees::Each, LeafOrder::Natural) => "",
+            (Round0Trees::Each, LeafOrder::Coset) => " whir_trees=each",
         } + if self.lfm_merge {
             ""
         } else {
@@ -958,7 +962,7 @@ mod tests {
                 whir_blowup: 2,
                 base: crate::hash_pin::BLOCK_BASE,
                 whir_leaves: LeafOrder::Coset,
-                whir_trees: Round0Trees::Each,
+                whir_trees: Round0Trees::One,
                 lfm_merge: true,
             }
         );
@@ -979,16 +983,16 @@ mod tests {
     /// natural order or a base whose trees are not Poseidon1.
     #[test]
     fn the_trees_knob_selects_one_tree_a_run_on_coset_poseidon1_alone() {
-        assert_eq!(parse(&[]).unwrap().whir_trees, Round0Trees::Each);
-        let each = parse(&[(ENV_WHIR_TREES, " Each ")]).unwrap();
-        assert_eq!(each, ZfFormat::DEFAULT);
-        let one = parse(&[(ENV_WHIR_TREES, "one")]).unwrap();
-        assert_eq!(one.whir_trees, Round0Trees::One);
+        assert_eq!(parse(&[]).unwrap().whir_trees, Round0Trees::One);
+        let one = parse(&[(ENV_WHIR_TREES, " One ")]).unwrap();
+        assert_eq!(one, ZfFormat::DEFAULT);
+        let each = parse(&[(ENV_WHIR_TREES, "each")]).unwrap();
+        assert_eq!(each.whir_trees, Round0Trees::Each);
         assert_eq!(one.chain_format().round0, Round0Trees::Each);
         assert_eq!(one.chain_format(), each.chain_format());
         assert_eq!(
-            one.banner(),
-            format!("{} whir_trees=one", ZfFormat::DEFAULT.banner())
+            each.banner(),
+            format!("{} whir_trees=each", ZfFormat::DEFAULT.banner())
         );
         let block = |zf: ZfFormat| crate::block_whir::BlockFormat {
             zf,
@@ -1007,6 +1011,10 @@ mod tests {
             let err = parse(&[(ENV_WHIR_TREES, bad)]).expect_err(bad);
             assert!(err.contains(ENV_WHIR_TREES), "{err}");
         }
+        // The natural order alone keeps parsing: unset, the trees are one a
+        // polynomial there; named `one` beside it is refused.
+        let natural = parse(&[(ENV_WHIR_LEAVES, "natural")]).unwrap();
+        assert_eq!(natural.whir_trees, Round0Trees::Each);
         let err = parse(&[(ENV_WHIR_TREES, "one"), (ENV_WHIR_LEAVES, "natural")])
             .expect_err("one tree a run under the natural order");
         assert!(err.contains(ENV_WHIR_TREES), "{err}");
@@ -1072,11 +1080,14 @@ mod tests {
         };
         assert_eq!(block(coset).format.leaves, LeafOrder::Coset);
         assert_eq!(block(natural).format.leaves, LeafOrder::Natural);
+        // The coset order's word sets the coset bit and, at the default's one
+        // tree a run (the natural order reads one a polynomial), that bit too.
         assert_eq!(
             block(coset).fold_word(),
             block(natural).fold_word()
                 | multilinear::whir_chain::FOLD_WORD_TAG
                 | multilinear::whir_chain::FOLD_WORD_COSET
+                | multilinear::whir_chain::FOLD_WORD_ONE_TREE
         );
         for bad in ["", "bitrev", "reversed", "1", "on"] {
             let err = parse(&[(ENV_WHIR_LEAVES, bad)]).unwrap_err();
@@ -1095,7 +1106,7 @@ mod tests {
     /// legacy format (every lever off): the rollback and A/B arm.
     #[test]
     fn the_off_spellings_parse_to_the_legacy_format() {
-        let f = parse(&[
+        let off = [
             (ENV_CAP, "off"),
             (ENV_WHIR_CAP, "0"),
             (ENV_FRI, "pair"),
@@ -1107,8 +1118,13 @@ mod tests {
             (ENV_WHIR_BLOWUP, "4"),
             (ENV_WHIR_LEAVES, "natural"),
             (ENV_LFM_MERGE, "0"),
-        ])
-        .unwrap();
+        ];
+        // The trees' off spelling, named, is what the natural order reads unset.
+        assert_eq!(
+            parse(&[&off[..], &[(ENV_WHIR_TREES, "each")]].concat()).unwrap(),
+            ZfFormat::LEGACY
+        );
+        let f = parse(&off).unwrap();
         assert_eq!(f, ZfFormat::LEGACY);
         assert!(f.is_legacy());
         assert_eq!(
