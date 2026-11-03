@@ -1146,9 +1146,10 @@ fn head_stamps(item: &str, prefixes: &[char]) -> Vec<f64> {
 /// it on, the streamed prove hands back its four `BLOCK HEAD` lines — every
 /// stamped window passed before it was handed out, walked, then absorbed in
 /// window order; every stamped chunk handed out, laid out, then placed, one
-/// item a chunk handed out; the layout by table counting every chunk — and
-/// the proof is the one without it (its bytes too, under the deterministic
-/// grind), laid out inline and on workers. Off, nothing is stamped.
+/// item a chunk handed out; the layout by table counting every chunk; the
+/// card's early setup, by default with the card's kernels — and the proof is
+/// the one without it (its bytes too, under the deterministic grind), laid out
+/// inline and on workers. Off, nothing is stamped.
 #[test]
 fn the_head_log_stamps_the_head_and_moves_no_byte() {
     let elf = asm_elf_bytes("all_instructions_64");
@@ -1186,10 +1187,22 @@ fn the_head_log_stamps_the_head_and_moves_no_byte() {
         assert!(head[0].starts_with("BLOCK HEAD WINDOWS: "), "{what}");
         assert!(head[1].starts_with("BLOCK HEAD CHUNKS: "), "{what}");
         assert!(head[2].starts_with("BLOCK HEAD TABLES: "), "{what}");
-        assert_eq!(
-            head[3], "BLOCK HEAD CARD: set up at its first use",
-            "{what}"
-        );
+        // The card is set up as the prove starts by default
+        // (`LAMBDA_VM_BLOCK_CARD_EARLY`); a build without its kernels sets
+        // up nothing.
+        if cfg!(feature = "cuda") {
+            assert!(
+                head[3].starts_with("BLOCK HEAD CARD: set up at ")
+                    && head[3].ends_with(" s on a thread of its own"),
+                "{what}: {}",
+                head[3]
+            );
+        } else {
+            assert_eq!(
+                head[3], "BLOCK HEAD CARD: set up at its first use",
+                "{what}"
+            );
+        }
         let windows: Vec<&str> = head[0].split(" · ").skip(1).collect();
         assert!(!windows.is_empty(), "{what}: no window stamped");
         let mut absorbed = 0.0;

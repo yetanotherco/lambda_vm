@@ -1250,21 +1250,23 @@ fn block_p4_rows() -> Result<P4Rows, Error> {
     parse_p4_rows(std::env::var("LAMBDA_VM_BLOCK_P4_ROWS").ok().as_deref())
 }
 
-/// `LAMBDA_VM_BLOCK_CARD_EARLY`: `1` sets the card up (its context, its
-/// modules and its staging pools) on a thread of its own as the streamed prove
-/// starts, so the first group's upload does not wait for it; unset, empty or
-/// `0` (the default) sets it up at the card's first use, as before. Anything
-/// else refuses the prove. The proof is the same.
+/// `LAMBDA_VM_BLOCK_CARD_EARLY`: unset, `1` or `on` (the default) sets the
+/// card up (its context, its modules and its staging pools) on a thread of its
+/// own as the streamed prove starts, so the first group's upload does not wait
+/// for it; empty, `0` or `off` sets it up at the card's first use. Anything
+/// else refuses the prove. A build without the card's kernels has nothing to
+/// set up. The proof is the same.
 fn block_card_early() -> Result<bool, Error> {
     parse_card_early(std::env::var("LAMBDA_VM_BLOCK_CARD_EARLY").ok().as_deref())
 }
 
 fn parse_card_early(value: Option<&str>) -> Result<bool, Error> {
     match value.map(str::trim) {
-        None | Some("" | "0") => Ok(false),
-        Some("1") => Ok(true),
+        Some("" | "0" | "off") => Ok(false),
+        None | Some("1" | "on") => Ok(true),
         Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_BLOCK_CARD_EARLY={v}: 1 (the card set up as the prove starts) or 0"
+            "LAMBDA_VM_BLOCK_CARD_EARLY={v}: 1 or on (the card set up as the prove starts, the \
+             default), 0 or off (at its first use)"
         ))),
     }
 }
@@ -5558,11 +5560,11 @@ fn prove_streamed(
     let cap = commit_config.format.stack;
     let start = Instant::now();
     head_log::begin(start, deviations.head_log.map_or_else(head_log::knob, Ok)?);
-    let card_early = block_card_early()?;
+    let card_early = block_card_early()? && cfg!(feature = "cuda");
     eprintln!(
         "BLOCK CARD EARLY: {}",
         if card_early {
-            "on (the card set up on a thread of its own as the prove starts)"
+            "on (the default: the card set up on a thread of its own as the prove starts)"
         } else {
             "off (the card set up at its first use)"
         }
@@ -9054,30 +9056,33 @@ mod p4_rows_knob_tests {
 
     /// The finish's phase-4 defaults: the per-row lookups counted on the pool
     /// with one map a chunk (not by parts), LT's and KECCAK's lookups counted
-    /// straight into the histograms, the card set up at its first use, and
+    /// straight into the histograms, the card set up as the prove starts, and
     /// BITWISE's LT, BRANCH and BYTEWISE lookups from their tables, BITWISE
     /// last; BITWISE last alone stays opt-in.
     #[test]
     fn the_finish_counts_on_one_map_a_chunk_and_its_lookups_directly_by_default() {
         assert_eq!(parse_p4_rows(None).ok(), Some(P4Rows::Pool));
         assert_eq!(parse_p4_lookups(None).ok(), Some(true));
-        assert_eq!(parse_card_early(None).ok(), Some(false));
+        assert_eq!(parse_card_early(None).ok(), Some(true));
         assert_eq!(parse_bitwise_from_tables(None).ok(), Some(true));
         assert_eq!(parse_rest_bitwise_last(None).ok(), Some(false));
     }
 
-    /// `LAMBDA_VM_BLOCK_CARD_EARLY`: off unless `1`; any other word refuses.
+    /// `LAMBDA_VM_BLOCK_CARD_EARLY`: on unless empty, `0` or `off`; any other
+    /// word refuses.
     #[test]
-    fn the_card_early_knob_is_off_by_default_and_on_at_1() {
+    fn the_card_early_knob_is_on_unless_zero_or_off() {
         for (value, on) in [
-            (None, false),
+            (None, true),
+            (Some("1"), true),
+            (Some(" on "), true),
             (Some(""), false),
             (Some("0"), false),
-            (Some(" 1 "), true),
+            (Some(" off"), false),
         ] {
             assert_eq!(parse_card_early(value).ok(), Some(on), "{value:?}");
         }
-        for value in ["on", "true", "2", "yes"] {
+        for value in ["ON", "true", "2", "yes"] {
             assert!(parse_card_early(Some(value)).is_err(), "{value}");
         }
     }
