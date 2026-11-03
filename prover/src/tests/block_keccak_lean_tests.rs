@@ -308,3 +308,288 @@ fn the_two_forms_never_share_an_air_prototype() {
         assert_eq!(air.name(), "KECCAK_RND", "{form:?}");
     }
 }
+
+/// The lean form's θ step checked on the real AIR: the real constraint set's
+/// entries on real trace rows and the real interaction lists, not a model.
+mod on_the_real_air {
+    use crate::tables::keccak_rnd::{
+        self, KeccakRndConstraints, KeccakRndForm, KeccakRoundOperation, cols,
+        generate_keccak_rnd_trace,
+    };
+    use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
+    use math::field::element::FieldElement;
+    use stark::constraints::builder::{ConstraintSet, ProverEvalFolder};
+    use stark::frame::Frame;
+    use stark::lookup::{BusInteraction, Multiplicity};
+    use stark::table::TableView;
+    use stark::traits::TransitionEvaluationContext;
+
+    /// θ identity `(x, hw)` sits at `20 + 4x + hw`; IS_BIT on `Cxz_right[x][hw]`
+    /// at `4x + hw`.
+    const THETA_BASE: usize = 20;
+
+    fn ops() -> Vec<KeccakRoundOperation> {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            s
+        };
+        (0..2)
+            .map(|t| KeccakRoundOperation {
+                timestamp: 1000 + t,
+                input: std::array::from_fn(|_| next()),
+                output: [0; 25],
+            })
+            .collect()
+    }
+
+    fn row_of(
+        trace: &stark::trace::TraceTable<GoldilocksField, GoldilocksExtension>,
+        r: usize,
+    ) -> Vec<FE> {
+        (0..cols::NUM_COLUMNS)
+            .map(|c| *trace.main_table.get(r, c))
+            .collect()
+    }
+
+    /// Every one of the 141 constraints on one row (the prover folder).
+    fn eval_row(main: &[FE]) -> Vec<FE> {
+        let n = KeccakRndConstraints.meta().len();
+        let frame = Frame::<GoldilocksField, GoldilocksExtension>::new(vec![TableView::new(
+            vec![main.to_vec()],
+            vec![vec![]],
+        )]);
+        let no_e: Vec<FieldElement<GoldilocksExtension>> = vec![];
+        let offset_e = FieldElement::<GoldilocksExtension>::zero();
+        let ctx =
+            TransitionEvaluationContext::new_prover(frame.as_row_frame(), &no_e, &no_e, &offset_e);
+        let mut base = vec![FE::zero(); n];
+        let mut ext = vec![FieldElement::<GoldilocksExtension>::zero(); n];
+        let mut folder = ProverEvalFolder::new(&ctx, &mut base, &mut ext);
+        KeccakRndConstraints.eval(&mut folder);
+        base
+    }
+
+    fn failing(main: &[FE]) -> Vec<usize> {
+        eval_row(main)
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v != FE::zero())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn multiplicity(i: &BusInteraction, main: &[FE]) -> FE {
+        match &i.multiplicity {
+            Multiplicity::One => FE::one(),
+            Multiplicity::Column(c) => main[*c],
+            other => panic!("KECCAK_RND has no {other:?} multiplicity"),
+        }
+    }
+
+    fn values(i: &BusInteraction, main: &[FE]) -> Vec<FE> {
+        i.values
+            .iter()
+            .flat_map(|v| v.combine_from(|c| main[c]))
+            .collect()
+    }
+
+    /// Whether a ByteAlu / AreBytes tuple is a row of BITWISE, and whether its
+    /// operands alone are (an output can be recomputed, operands cannot).
+    fn in_bitwise(bus: u64, v: &[FE]) -> (bool, bool) {
+        let byte = |x: &FE| x.canonical() < 256;
+        if bus == u64::from(BusId::AreBytes) {
+            let ok = v.iter().all(byte);
+            return (ok, ok);
+        }
+        assert_eq!(bus, u64::from(BusId::ByteAlu));
+        let operands = byte(&v[1]) && byte(&v[2]);
+        if !operands {
+            return (false, false);
+        }
+        let (x, y) = (v[1].canonical(), v[2].canonical());
+        let out = match v[0].canonical() as u8 {
+            alu_op::AND => x & y,
+            alu_op::OR => x | y,
+            alu_op::XOR => x ^ y,
+            _ => return (false, true),
+        };
+        (v[3].canonical() == out, true)
+    }
+
+    /// The byte-bus sends of a row whose tuple is not a BITWISE row, with their
+    /// multiplicity: `(interaction index, μ, operands are bytes, values)`.
+    fn bad_sends(
+        interactions: &[BusInteraction],
+        only: Option<&[usize]>,
+        main: &[FE],
+    ) -> Vec<(usize, FE, bool, Vec<u64>)> {
+        let byte_bus = |b: u64| b == u64::from(BusId::ByteAlu) || b == u64::from(BusId::AreBytes);
+        let all: Vec<usize> = (0..interactions.len()).collect();
+        only.unwrap_or(&all)
+            .iter()
+            .filter_map(|&k| {
+                let i = &interactions[k];
+                if !byte_bus(i.bus_id) {
+                    return None;
+                }
+                assert!(i.is_sender);
+                let m = multiplicity(i, main);
+                if m == FE::zero() {
+                    return None;
+                }
+                let v = values(i, main);
+                let (row, operands) = in_bitwise(i.bus_id, &v);
+                (!row).then(|| (k, m, operands, v.iter().map(|x| x.canonical()).collect()))
+            })
+            .collect()
+    }
+
+    fn reads(i: &BusInteraction, cols_: &[usize]) -> bool {
+        i.values
+            .iter()
+            .flat_map(|v| v.column_indices())
+            .any(|c| cols_.contains(&c))
+    }
+
+    fn next(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    /// Every other `(lo, hi, r)` that keeps all 141 constraints on a real row
+    /// sends a D lookup whose operand is not a byte under the lean form (and an
+    /// `ARE_BYTES` pair off a byte under the full form): the θ decomposition is
+    /// unique on the real AIR.
+    #[test]
+    fn every_other_decomposition_breaks_a_d_operand() {
+        let trace = generate_keccak_rnd_trace(&ops());
+        let lean = keccak_rnd::bus_interactions_for(KeccakRndForm::Lean);
+        let full = keccak_rnd::bus_interactions_for(KeccakRndForm::Full);
+        let are_bytes = u64::from(BusId::AreBytes);
+        let (mut tried, mut kept_constraints) = (0u64, 0u64);
+        for r in 0..48 {
+            let honest = row_of(&trace, r);
+            assert_eq!(honest[cols::MU], FE::one());
+            for x in 0..5 {
+                for hw in 0..4 {
+                    let (c_lo, c_hi) = (cols::cxz_left(x, 2 * hw), cols::cxz_left(x, 2 * hw + 1));
+                    let c_r = cols::cxz_right_bit(x, hw);
+                    let touched = [c_lo, c_hi, c_r];
+                    let lean_idx: Vec<usize> = (0..lean.len())
+                        .filter(|&k| reads(&lean[k], &touched))
+                        .collect();
+                    let full_idx: Vec<usize> = (0..full.len())
+                        .filter(|&k| reads(&full[k], &touched))
+                        .collect();
+                    let input = honest[cols::cxz(x, 3, 2 * hw)].canonical()
+                        + 256 * honest[cols::cxz(x, 3, 2 * hw + 1)].canonical();
+                    for rr in 0..2u64 {
+                        for hi in 0..256u64 {
+                            let lo = FE::from(2 * input) - FE::from(rr << 16) - FE::from(256 * hi);
+                            if (lo, FE::from(hi), FE::from(rr))
+                                == (honest[c_lo], honest[c_hi], honest[c_r])
+                            {
+                                continue;
+                            }
+                            tried += 1;
+                            let mut main = honest.clone();
+                            main[c_lo] = lo;
+                            main[c_hi] = FE::from(hi);
+                            main[c_r] = FE::from(rr);
+                            if !failing(&main).is_empty() {
+                                continue;
+                            }
+                            kept_constraints += 1;
+                            let bad_lean = bad_sends(&lean, Some(&lean_idx), &main);
+                            assert!(
+                                bad_lean.iter().any(|(k, _, operands, _)| !operands
+                                    && lean[*k].bus_id == u64::from(BusId::ByteAlu)),
+                                "row {r} x {x} hw {hw} lo {} hi {hi} r {rr}: no D operand off a byte",
+                                lo.canonical()
+                            );
+                            let bad_full = bad_sends(&full, Some(&full_idx), &main);
+                            assert!(
+                                bad_full.iter().any(|(k, ..)| full[*k].bus_id == are_bytes),
+                                "the full form's byte check also refuses it"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "θ decomposition search: {tried} mutations, {kept_constraints} keep all 141 constraints, \
+             every one sends a D lookup with a non-byte operand under Lean"
+        );
+        assert_eq!(tried, 48 * 20 * 511);
+        assert_eq!(
+            kept_constraints, tried,
+            "θ identity and IS_BIT hold by construction"
+        );
+    }
+
+    /// The mutation: with the D lookups that read `Cxz_left` gone, a forged
+    /// decomposition (`lo − 256`, `hi + 1`) keeps every constraint and sends
+    /// nothing off BITWISE. So the D lookups are what refuse it under the lean form.
+    #[test]
+    fn the_harness_sees_a_missing_d_lookup() {
+        let trace = generate_keccak_rnd_trace(&ops());
+        let left: Vec<usize> = (cols::CXZ_LEFT..cols::CXZ_LEFT + 40).collect();
+        let without_d: Vec<BusInteraction> = keccak_rnd::bus_interactions_for(KeccakRndForm::Lean)
+            .into_iter()
+            .filter(|i| !(i.bus_id == u64::from(BusId::ByteAlu) && reads(i, &left)))
+            .collect();
+        assert_eq!(without_d.len(), 1011 - 40);
+        let (c_lo, c_hi) = (cols::cxz_left(0, 0), cols::cxz_left(0, 1));
+        let r = (0..48)
+            .find(|&r| trace.main_table.get(r, c_hi).canonical() < 255)
+            .expect("a high byte below 255");
+        let mut main = row_of(&trace, r);
+        main[c_lo] = main[c_lo] - FE::from(256u64);
+        main[c_hi] += FE::one();
+        assert!(failing(&main).is_empty());
+        assert!(bad_sends(&without_d, None, &main).is_empty());
+        let lean = keccak_rnd::bus_interactions_for(KeccakRndForm::Lean);
+        assert!(!bad_sends(&lean, None, &main).is_empty());
+    }
+
+    /// The AIR's θ entry is exactly `2·in − 2¹⁶·r − (lo + 256·hi)`, weighted
+    /// by μ, for any field values: the identity [`super::theta_residue`] models
+    /// and the exhaustive parity check runs over.
+    #[test]
+    fn the_theta_entry_is_the_identity_the_proof_uses() {
+        let t = generate_keccak_rnd_trace(&ops());
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        for x in 0..5 {
+            for hw in 0..4 {
+                for _ in 0..64 {
+                    let mut main = row_of(&t, 3);
+                    let [a, b, lo, hi, r] = [(); 5].map(|_| FE::from(next(&mut seed)));
+                    main[cols::cxz(x, 3, 2 * hw)] = a;
+                    main[cols::cxz(x, 3, 2 * hw + 1)] = b;
+                    main[cols::cxz_left(x, 2 * hw)] = lo;
+                    main[cols::cxz_left(x, 2 * hw + 1)] = hi;
+                    main[cols::cxz_right_bit(x, hw)] = r;
+                    let want = FE::from(2u64) * (a + FE::from(256u64) * b)
+                        - FE::from(1u64 << 16) * r
+                        - lo
+                        - FE::from(256u64) * hi;
+                    let got = eval_row(&main);
+                    assert_eq!(got[THETA_BASE + 4 * x + hw], want, "x {x} hw {hw}");
+                    assert_eq!(got[4 * x + hw], r * (FE::one() - r), "IS_BIT x {x} hw {hw}");
+                    main[cols::MU] = FE::zero();
+                    assert_eq!(
+                        eval_row(&main)[THETA_BASE + 4 * x + hw],
+                        FE::zero(),
+                        "μ = 0"
+                    );
+                }
+            }
+        }
+    }
+}
