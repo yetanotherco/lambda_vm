@@ -6,10 +6,11 @@
 //! the committed shift cells instead of HWSL lookups (see
 //! `KeccakRndConstraints`). The IS_BIT constraint on the θ carry and the
 //! ARE_BYTES range checks on the ρ shift outputs are load-bearing for the
-//! identities in both forms ([`KeccakRndForm`]). The θ shift outputs' range
-//! comes from their own ARE_BYTES checks under `Full`; under `Lean` it comes
-//! from the D lookups' operands (each `Cxz_left` byte, plus the carry for even
-//! bytes, is a `BYTE_ALU[XOR]` operand) and the θ identity's parity.
+//! identities in both forms ([`KeccakRndForm`]). Under `Lean`, the block
+//! format's presets, the θ shift outputs' range comes from the D lookups'
+//! operands (each `Cxz_left` byte, plus the carry for even bytes, is a
+//! `BYTE_ALU[XOR]` operand) and the θ identity's parity; under the `Full`
+//! variant it comes from their own ARE_BYTES checks.
 //!
 //! ## Column layout (1,480 columns)
 //!
@@ -260,12 +261,17 @@ pub const ARE_BYTES_PER_ROW: usize = 20 + 200;
 /// below 2¹⁸, so the identity holds over the integers, where its left side is
 /// even. On a padding row (μ = 0) nothing reads `Cxz_left`. That leaves 1,011
 /// interactions, which fit 1,024 GKR slots instead of 2,048.
+///
+/// The block format's presets hold `Lean`. `Full` is the type's `Default`: the
+/// form of every build outside the block format (the whole-run builder, the
+/// LFM machine's own chips), and the variant a block caller may name.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum KeccakRndForm {
-    /// Every byte check (1,031 interactions): today's table.
+    /// Every byte check (1,031 interactions).
     #[default]
     Full,
-    /// Without the 20 implied `Cxz_left` checks (1,011 interactions).
+    /// Without the 20 implied `Cxz_left` checks (1,011 interactions): the
+    /// block format's presets.
     Lean,
 }
 
@@ -624,7 +630,7 @@ fn fill_op<T: VmTable>(table: &mut T, op: &KeccakRoundOperation, first_row: usiz
 }
 
 // =========================================================================
-// Bus interactions (1,031 under `KeccakRndForm::Full`, 1,011 under `Lean`)
+// Bus interactions (1,011 under `KeccakRndForm::Lean`, the block presets'; 1,031 under `Full`)
 // =========================================================================
 //
 // The θ/ρ halfword shifts no longer emit HWSL lookups (120 sends/row removed):
@@ -1059,11 +1065,12 @@ fn halfword<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
 /// These identities replace the former θ/ρ HWSL bus lookups. Uniqueness of the
 /// (left, right) decomposition rests on both halves bounded to `[0, 2¹⁶)` and on
 /// `2¹⁶` being invertible mod the Goldilocks prime. For ρ the bound is the
-/// ARE_BYTES range checks in both forms. For θ it is the ARE_BYTES checks under
-/// [`KeccakRndForm::Full`] (z3-verified equivalent to the HWSL contract, on the
-/// full form). Under [`KeccakRndForm::Lean`] it is the D lookups' byte operands
-/// and the identity's parity, checked by exhaustive enumeration
-/// (`block_keccak_lean_tests`).
+/// ARE_BYTES range checks in both forms. For θ under [`KeccakRndForm::Lean`],
+/// the block presets' form, it is the D lookups' byte operands and the
+/// identity's parity, checked by exhaustive enumeration
+/// (`block_keccak_lean_tests`). Under the [`KeccakRndForm::Full`] variant it is
+/// the θ ARE_BYTES checks (z3-verified equivalent to the HWSL contract, on the
+/// full form).
 #[derive(Clone, Copy)]
 pub struct KeccakRndConstraints;
 

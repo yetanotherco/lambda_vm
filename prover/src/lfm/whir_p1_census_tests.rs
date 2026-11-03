@@ -1109,8 +1109,9 @@ fn the_plan_doubles_the_median_mix_only_from_its_threshold() {
 /// machine.
 ///
 /// The pins move with any AIR whose constraint leg a leaf emits: last moved by
-/// the ECREC table and the 23-count statement, after KECCAK's sponge mode
-/// (Keccak-256 of a buffer) and its round-chip tokens.
+/// the block presets' lean KECCAK_RND form (1,011 interactions), after the
+/// ECREC table and the 23-count statement, KECCAK's sponge mode (Keccak-256 of
+/// a buffer) and its round-chip tokens.
 #[test]
 fn the_median_mix_leaves_are_pinned_under_each_query_check() {
     use super::whir_chain::LeafQuery;
@@ -1121,29 +1122,29 @@ fn the_median_mix_leaves_are_pinned_under_each_query_check() {
             LeafQuery::V1,
             GkrPack::PRODUCTION,
             5,
-            "24dc068769f1a38fdda271559c3918d8146666c6c24dc015d70782bb2f113b5c",
-            "491998ddcd396c7703a3a9d7dcd8a72cb29a7f8191da110aea796d53757ebd3e",
+            "f3c1fd202ad60b0fa3b74e859406dc7cd15c7418a11983ed2f6bcedb652f0044",
+            "585115f269c36c3037e299b1d8678ccc0dbb0e5a7e6fdcf2e30600240bf37fa5",
         ),
         (
             LeafQuery::Lean,
             GkrPack::PRODUCTION,
             5,
-            "055bc62eba89a898a8e8728401370a90edbf8122d565de88f05310127a33d1b4",
-            "ce51c07238f53afb5deb58551f918ff39d3816ad3d717ad70b5e441bc867e454",
+            "e1fc66308f1d598aa72a490bf0553e327638c5ca5d001914853c0aa94897e057",
+            "161befd641805b345202e10f4d845188e72adefd6b4d601a2658ad325c0c4aaa",
         ),
         (
             LeafQuery::V1,
             GkrPack::Off,
             5,
-            "07f558619e111cca75018ac12c244fb6b0319e60eb8bf36695119b71a66fdc11",
-            "93fcbcf64a9fb55c08bb75dd27c7241aef553bf875b678a358050398c8663340",
+            "ecd15a6ebddef76e934b1de460296d8fa241e134033a2c462a26e4b8c2d66d0e",
+            "34af2b40c46369c6f0bc4e55af4637e83142eb5577b0d7055dfa4ede8baba00d",
         ),
         (
             LeafQuery::Lean,
             GkrPack::Off,
             5,
-            "3f94f9beb7a983b88c3873b0f137f197ef00b07e797978d2da3f9e6b2cbf4a78",
-            "207745f8b67e3bd04f4ad051dc35194b4376facffe12d3869f6ae979b7ea0017",
+            "c0856cc520f98852161d25523dc768c4a0173c32d71663bd1ef75bbcd39672db",
+            "c8e3006cf677f273c6c44b71525a058ed8aa2b58f468183dc14d1ad22bff7c38",
         ),
     ];
     let elf_bytes: &[u8] = include_bytes!("testdata/poc_rodata_commit.elf");

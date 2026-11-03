@@ -250,7 +250,7 @@ const OFF_DEFAULT: [(&str, &str); 8] = [
     (crate::lfm::whir_block::LEAF_DOUBLE_FROM_ENV, "off"),
     ("LFM_WHIR_SHARE_INVERSE", "0"),
     ("BLOCK_WHIR_ARGUE_PACK", "off"),
-    ("BLOCK_WHIR_KECCAK_RND", "lean"),
+    ("BLOCK_WHIR_KECCAK_RND", "full"),
 ];
 
 /// ★ The block verifier reads no format from its environment. In a process of
@@ -320,7 +320,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
     );
     assert_eq!(
         harness.format.keccak_rnd,
-        crate::tables::keccak_rnd::KeccakRndForm::Lean,
+        crate::tables::keccak_rnd::KeccakRndForm::Full,
         "the harness's KECCAK_RND follows its knob"
     );
 
@@ -338,7 +338,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
     );
     assert_eq!(
         pinned.format.keccak_rnd,
-        crate::tables::keccak_rnd::KeccakRndForm::Full,
+        crate::tables::keccak_rnd::KeccakRndForm::Lean,
         "the verifier's KECCAK_RND form is its named constant, not the environment's"
     );
     assert!(pinned.share_inverse);
@@ -385,7 +385,7 @@ fn the_pinned_presets_hold_under_an_environment_off_the_default() {
     );
     assert_eq!(
         at.format.keccak_rnd,
-        crate::tables::keccak_rnd::KeccakRndForm::Full,
+        crate::tables::keccak_rnd::KeccakRndForm::Lean,
         "the named-choice presets hold the pinned KECCAK_RND form"
     );
     assert!(at.share_inverse);

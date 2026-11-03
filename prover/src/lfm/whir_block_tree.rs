@@ -337,13 +337,15 @@ pub fn pack_setting(knob: Option<&str>) -> Result<GkrPack, String> {
     }
 }
 
-/// `BLOCK_WHIR_KECCAK_RND`'s reading:
-/// unset or `full` is today's table ([`KeccakRndForm::Full`]); `lean` drops the
-/// 20 `Cxz_left` byte checks its D lookups imply ([`KeccakRndForm::Lean`]). A
-/// format value: the prover and the verifier of one proof take the same one.
+/// `BLOCK_WHIR_KECCAK_RND`'s reading: unset is the pinned preset's form
+/// ([`BlockFormat::pinned`], [`KeccakRndForm::Lean`]), so the harness proves
+/// what `verify-block` verifies; `lean` names it and `full` names the variant
+/// with every byte check ([`KeccakRndForm::Full`]). A format value: the prover
+/// and the verifier of one proof take the same one.
 pub fn keccak_rnd_setting(knob: Option<&str>) -> Result<KeccakRndForm, String> {
     match knob.map(str::trim) {
-        None | Some("full") => Ok(KeccakRndForm::Full),
+        None => Ok(BlockFormat::pinned().keccak_rnd),
+        Some("full") => Ok(KeccakRndForm::Full),
         Some("lean") => Ok(KeccakRndForm::Lean),
         Some(v) => Err(format!("BLOCK_WHIR_KECCAK_RND={v}: full or lean")),
     }

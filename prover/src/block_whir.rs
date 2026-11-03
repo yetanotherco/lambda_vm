@@ -266,11 +266,12 @@ pub struct BlockFormat {
     /// of the format, bound into the statement through the fold word.
     pub group: GroupFold,
     /// Which byte checks KECCAK_RND sends
-    /// ([`KeccakRndForm`](crate::tables::keccak_rnd::KeccakRndForm)): today's
-    /// table in every preset ([`Full`](crate::tables::keccak_rnd::KeccakRndForm::Full)),
-    /// or without the 20 checks its D lookups imply
-    /// ([`Lean`](crate::tables::keccak_rnd::KeccakRndForm::Lean), an opt-in
-    /// experiment). Its interactions, so its bus and its GKR trees, follow it.
+    /// ([`KeccakRndForm`](crate::tables::keccak_rnd::KeccakRndForm)): without
+    /// the 20 checks its D lookups imply in every preset
+    /// ([`Lean`](crate::tables::keccak_rnd::KeccakRndForm::Lean)), or every
+    /// check ([`Full`](crate::tables::keccak_rnd::KeccakRndForm::Full), the
+    /// variant a caller names). Its interactions, so its bus and its GKR trees,
+    /// follow it.
     pub keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm,
 }
 
@@ -381,7 +382,7 @@ impl BlockFormat {
             leaf_query: crate::lfm::whir_block::process_leaf_query(),
             argue: ArgueFormat::BATCHED,
             group: GroupFold::Indexed,
-            keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
+            keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Lean,
         }
     }
 
@@ -417,7 +418,7 @@ impl BlockFormat {
             leaf_query: crate::lfm::whir_chain::LeafQuery::Lean,
             argue: ArgueFormat::BATCHED,
             group: GroupFold::Indexed,
-            keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Full,
+            keccak_rnd: crate::tables::keccak_rnd::KeccakRndForm::Lean,
         }
     }
 
@@ -3927,7 +3928,7 @@ fn prove_block_whir_inner(
         )?;
         return Ok((proof, stamps));
     }
-    // The whole-run build counts BITWISE for today's KECCAK_RND alone.
+    // The whole-run build counts BITWISE for KECCAK_RND's Full form alone.
     if format.keccak_rnd != crate::tables::keccak_rnd::KeccakRndForm::Full {
         return Err(Error::Prover(format!(
             "KECCAK_RND's {:?} byte checks need the windowed build (`window_log2`)",

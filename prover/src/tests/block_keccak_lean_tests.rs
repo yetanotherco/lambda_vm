@@ -26,11 +26,15 @@ use stark::proof::options::{BaseFormat, ProofOptions};
 
 type F = crate::tables::types::GoldilocksField;
 
-/// `BLOCK_WHIR_KECCAK_RND`: unset or `full` is today's table, `lean` the
-/// opt-in, anything else refused.
+/// `BLOCK_WHIR_KECCAK_RND`: unset is the pinned preset's form, `full` and
+/// `lean` name a form, anything else is refused. The type's own default stays
+/// `Full`, the form of every build outside the block format.
 #[test]
 fn the_keccak_rnd_knob_reads_full_or_lean() {
-    assert_eq!(keccak_rnd_setting(None), Ok(KeccakRndForm::Full));
+    assert_eq!(
+        keccak_rnd_setting(None),
+        Ok(BlockFormat::pinned().keccak_rnd)
+    );
     assert_eq!(keccak_rnd_setting(Some("full")), Ok(KeccakRndForm::Full));
     assert_eq!(keccak_rnd_setting(Some(" lean ")), Ok(KeccakRndForm::Lean));
     for bad in ["", "1", "on", "Lean", "off"] {
@@ -218,16 +222,17 @@ fn without_the_factor_two_a_low_byte_of_minus_one_would_pass() {
     );
 }
 
-/// The verifier's presets hold `Full`: a lean proof verifies only under a
-/// format that names `Lean`.
+/// The verifier's presets hold `Lean`: a full proof verifies only under a
+/// format that names `Full`.
 #[test]
 fn the_verifiers_keccak_rnd_form_is_a_named_constant() {
-    assert_eq!(BlockFormat::pinned().keccak_rnd, KeccakRndForm::Full);
+    assert_eq!(BlockFormat::pinned().keccak_rnd, KeccakRndForm::Lean);
+    assert_eq!(BlockFormat::production().keccak_rnd, KeccakRndForm::Lean);
     assert_eq!(
         BlockFormat::pinned()
-            .with_keccak_rnd(KeccakRndForm::Lean)
+            .with_keccak_rnd(KeccakRndForm::Full)
             .keccak_rnd,
-        KeccakRndForm::Lean
+        KeccakRndForm::Full
     );
 }
 
