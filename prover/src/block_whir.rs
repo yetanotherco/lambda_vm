@@ -3266,6 +3266,24 @@ pub(crate) fn commit_group<H: multilinear::whir_hash::WhirHash>(
     stack: GroupStack,
     config: &multilinear::whir_chain::ChainConfig,
 ) -> Result<GroupPrepared<H>, Error> {
+    commit_group_where::<H>(stack, config, false)
+}
+
+/// [`commit_group`] on the host, whatever a card would do
+/// (`StackedCommitment::commit_on_host`): the same roots. What a verifier
+/// derives the prepared roots with, so no card kernel sits on its path.
+pub(crate) fn commit_group_on_host<H: multilinear::whir_hash::WhirHash>(
+    stack: GroupStack,
+    config: &multilinear::whir_chain::ChainConfig,
+) -> Result<GroupPrepared<H>, Error> {
+    commit_group_where::<H>(stack, config, true)
+}
+
+fn commit_group_where<H: multilinear::whir_hash::WhirHash>(
+    stack: GroupStack,
+    config: &multilinear::whir_chain::ChainConfig,
+    on_host: bool,
+) -> Result<GroupPrepared<H>, Error> {
     let shapes = stack.shapes();
     let group = stack.group;
     let columns: Vec<Mle<F>> = stack
@@ -3275,12 +3293,16 @@ pub(crate) fn commit_group<H: multilinear::whir_hash::WhirHash>(
         .collect::<Result<_, _>>()?;
     let layout = stark::multilinear_table::global_layout(&shapes, config.format.stack)
         .map_err(|e| Error::Prover(format!("{e:?}")))?;
-    let commitment = multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
-        layout,
-        &multilinear::stacking::borrow(&columns),
-        None,
-        config,
-    )
+    let borrowed = multilinear::stacking::borrow(&columns);
+    let commitment = if on_host {
+        multilinear::stacked_eval::StackedCommitment::<F, H>::commit_on_host(
+            layout, &borrowed, config,
+        )
+    } else {
+        multilinear::stacked_eval::StackedCommitment::<F, H>::commit(
+            layout, &borrowed, None, config,
+        )
+    }
     .map_err(|e| Error::Prover(format!("group {group}: {e:?}")))?;
     let roots = commitment.roots();
     Ok(GroupPrepared {
@@ -3300,6 +3322,17 @@ pub(crate) fn commit_groups<H: multilinear::whir_hash::WhirHash>(
     stacks
         .into_iter()
         .map(|stack| commit_group::<H>(stack, config))
+        .collect()
+}
+
+/// [`commit_groups`] on the host ([`commit_group_on_host`]): the verifier's.
+pub(crate) fn commit_groups_on_host<H: multilinear::whir_hash::WhirHash>(
+    stacks: Vec<GroupStack>,
+    config: &multilinear::whir_chain::ChainConfig,
+) -> Result<Vec<GroupPrepared<H>>, Error> {
+    stacks
+        .into_iter()
+        .map(|stack| commit_group_on_host::<H>(stack, config))
         .collect()
 }
 
@@ -7622,9 +7655,10 @@ pub(crate) fn verify_block_whir_traced(
             &proof.groups,
         );
         // The prepared commitments, derived here from the program: their roots
-        // are the verifier's, never the proof's.
+        // are the verifier's, never the proof's, and committed on the host, so
+        // no card kernel decides what this verifier accepts.
         let prepared: Vec<GroupPrepared<H>> = match group_stacks(prepared_columns, &proof.groups)
-            .and_then(|stacks| commit_groups::<H>(stacks, config))
+            .and_then(|stacks| commit_groups_on_host::<H>(stacks, config))
         {
             Ok(prepared) => prepared,
             Err(_) => return Ok(Err(BlockRefusal::Prepared)),

@@ -437,6 +437,46 @@ where
         })
     }
 
+    /// [`Self::commit`] with every codeword encoded and every tree hashed on
+    /// the host, whatever a card would do — the same roots, since the card's
+    /// kernels are checked against these host functions. What a VERIFIER that
+    /// derives a commitment of its own (the block's prepared stacks) commits
+    /// with, so no card kernel sits on its acceptance path.
+    pub fn commit_on_host<C: HostColumn<F>>(
+        layout: StackedLayout,
+        columns: &[&C],
+        config: &ChainConfig,
+    ) -> Result<Self, Error> {
+        let sources: Vec<whir_chain::Stacked<'_, F>> = (0..layout.num_polys())
+            .map(|poly| whir_chain::Stacked {
+                parts: layout
+                    .parts_of(poly)
+                    .into_iter()
+                    .map(|(column, offset)| (columns[column] as &dyn HostColumn<F>, offset))
+                    .collect(),
+                resident: None,
+                num_vars: layout.n_stack(),
+            })
+            .collect();
+        let mut domain = None;
+        let mut commitments = Vec::with_capacity(sources.len());
+        for range in round0_trees(sources.len(), config) {
+            let (commitment, d) = if range.len() == 1 {
+                whir_chain::commit_stacked_on_host::<F, H>(&sources[range.start], config)?
+            } else {
+                whir_chain::commit_joint_stacked_on_host::<F, H>(&sources[range], config)?
+            };
+            commitments.push(commitment);
+            domain = Some(d);
+        }
+        Ok(Self {
+            layout,
+            commitments,
+            domain: domain.ok_or(Error::EmptyPolynomial)?,
+            room: Room::Own,
+        })
+    }
+
     pub fn roots(&self) -> Vec<Commitment> {
         self.commitments.iter().map(|c| c.root()).collect()
     }

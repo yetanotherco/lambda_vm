@@ -524,3 +524,34 @@ fn a_leaf_is_the_runs_blocks_end_to_end() {
         "the leaf is three blocks at one position ({cfg:?})"
     );
 }
+
+/// A verifier's host commit (`commit_on_host`) has the commit's roots under
+/// either round-0 format and either leaf order, a lone polynomial and joint
+/// runs alike.
+#[test]
+fn the_host_commit_has_the_commits_roots() {
+    for round0 in [Round0Trees::Each, Round0Trees::One] {
+        for leaves in [LeafOrder::Coset, LeafOrder::Natural] {
+            let cfg = config(round0, leaves, CapPolicy::Off);
+            for polys in [1usize, 3, 5] {
+                let (columns, _, _) = columns_and_claims(polys, 41);
+                let layout = StackedLayout::build(&vec![N; polys], N).unwrap();
+                let committed = StackedCommitment::<F, P1Whir>::commit(
+                    layout.clone(),
+                    &borrow(&columns),
+                    None,
+                    &cfg,
+                )
+                .unwrap();
+                let on_host =
+                    StackedCommitment::<F, P1Whir>::commit_on_host(layout, &borrow(&columns), &cfg)
+                        .unwrap();
+                assert_eq!(
+                    on_host.roots(),
+                    committed.roots(),
+                    "{round0:?} {leaves:?} P={polys}"
+                );
+            }
+        }
+    }
+}

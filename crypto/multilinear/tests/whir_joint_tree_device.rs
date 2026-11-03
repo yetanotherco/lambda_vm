@@ -378,3 +378,44 @@ fn one_tree_a_run_saves_two_permutations_a_leaf_of_a_run_of_three() {
         );
     }
 }
+
+/// A verifier's host commit (`StackedCommitment::commit_on_host`) has the
+/// card's roots under either round-0 format, at a size the card commits, and
+/// runs no card commit and no card leaf pass.
+#[test]
+fn a_host_commit_has_the_cards_roots_and_runs_nothing_on_the_card() {
+    let _serial = serial();
+    for round0 in [Round0Trees::Each, Round0Trees::One] {
+        let cfg = config(round0);
+        for stack in [Stack::run_of_three(), Stack::runs_of_four_and_one()] {
+            let refs: Vec<&Mle<F>> = stack.columns.iter().collect();
+            let store = gpu::upload_columns(&refs).expect("resident columns (a GPU)");
+            let card = StackedCommitment::<F, P1Whir>::commit(
+                stack.layout.clone(),
+                &borrow(&stack.columns),
+                Some((&store, 0)),
+                &cfg,
+            )
+            .unwrap();
+            let (calls, perms) = (gpu::commit_calls(), gpu::commit_leaf_perms());
+            let host = StackedCommitment::<F, P1Whir>::commit_on_host(
+                stack.layout.clone(),
+                &borrow(&stack.columns),
+                &cfg,
+            )
+            .unwrap();
+            assert_eq!(
+                (gpu::commit_calls(), gpu::commit_leaf_perms()),
+                (calls, perms),
+                "{} {round0:?}: nothing on the card",
+                stack.name
+            );
+            assert_eq!(
+                host.roots(),
+                card.roots(),
+                "{} {round0:?}: the card's roots",
+                stack.name
+            );
+        }
+    }
+}

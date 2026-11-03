@@ -53,7 +53,7 @@ use stark::multilinear_table::TableLayout;
 
 use crate::block_whir::{
     BlockFormat, BlockFrame, BlockStatement, BlockWhirProof, block_frame, block_statement_bytes,
-    commit_group, first_page_index, group_stacks, prepared_tables,
+    first_page_index, group_stacks, prepared_tables,
 };
 use crate::tables::types::{FE, FEE, GoldilocksExtension, GoldilocksField};
 
@@ -2716,7 +2716,11 @@ fn commit_prepared(
     config: &multilinear::whir_chain::ChainConfig,
     base: &stark::proof::options::BaseFormat,
 ) -> Result<Vec<Commitment>, crate::Error> {
-    crate::with_block_hash!(*base, |H| { Ok(commit_group::<H>(stack, config)?.roots) })
+    // On the host: the verifier's plan derives these roots itself, and no card
+    // kernel may decide what it accepts. The prover hands its own roots in.
+    crate::with_block_hash!(*base, |H| {
+        Ok(crate::block_whir::commit_group_on_host::<H>(stack, config)?.roots)
+    })
 }
 
 /// Test only: the leaf's mutations of its commit-time answers, one at a time,

@@ -829,3 +829,67 @@ fn a_joint_tree_block_round_trips_and_refuses_the_other_mode() {
         "a joint verifier must refuse the per-tree block"
     );
 }
+
+/// Instrument: what a verifier pays to derive a block's prepared roots on the
+/// host (`commit_group_on_host`) against the commit a card build would run,
+/// over stacks shaped as the block's prepared tables — DECODE's five columns of
+/// 2^20, alone and beside one dense genesis page (two columns of 2^18) — under
+/// the pinned format and under one tree a run. Prints the seconds; asserts the
+/// roots agree.
+///
+/// ```text
+/// cargo test --release -p lambda-vm-prover --lib -- --ignored --exact --nocapture \
+///   tests::block_onechain_tests::prepared_roots_on_the_host_cost
+/// ```
+#[test]
+#[ignore = "an instrument: prints the prepared roots' host derivation time"]
+fn prepared_roots_on_the_host_cost() {
+    use crate::block_whir::{GroupStack, commit_group, commit_group_on_host};
+    use math::field::element::FieldElement;
+    use multilinear::whir_chain::Round0Trees;
+    let column = |vars: usize,
+                  seed: u64|
+     -> Vec<FieldElement<crate::tables::types::GoldilocksField>> {
+        (0..1u64 << vars)
+            .map(|i| {
+                FieldElement::from(i.wrapping_add(seed).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 11)
+            })
+            .collect()
+    };
+    let decode = |seed: u64| (0..5).map(|c| column(20, seed + c)).collect::<Vec<_>>();
+    let page = |seed: u64| (0..2).map(|c| column(18, seed + c)).collect::<Vec<_>>();
+    let stacks = [
+        ("DECODE", vec![(0, 0, 5)], decode(1)),
+        (
+            "DECODE + a page",
+            vec![(0, 0, 5), (1, 1, 2)],
+            decode(1).into_iter().chain(page(9)).collect(),
+        ),
+    ];
+    for round0 in [Round0Trees::Each, Round0Trees::One] {
+        for (name, tables, columns) in &stacks {
+            let stack = || GroupStack {
+                group: 0,
+                tables: tables.clone(),
+                columns: columns.clone(),
+            };
+            let mut format = BlockFormat::pinned();
+            format.zf.whir_trees = round0;
+            let config = format.chain_config(&stack().shapes());
+            let t = std::time::Instant::now();
+            let committed = commit_group::<crate::hash_pin::BlockWhirHash>(stack(), &config)
+                .expect("the commit");
+            let commit_secs = t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let on_host = commit_group_on_host::<crate::hash_pin::BlockWhirHash>(stack(), &config)
+                .expect("the host commit");
+            let host_secs = t.elapsed().as_secs_f64();
+            assert_eq!(on_host.roots, committed.roots, "{name} {round0:?}");
+            println!(
+                "PREPARED ON HOST {name} {round0:?}: polys {} · n_stack {} · commit {commit_secs:.3}s · on the host {host_secs:.3}s",
+                on_host.commitment.layout().num_polys(),
+                on_host.commitment.layout().n_stack()
+            );
+        }
+    }
+}

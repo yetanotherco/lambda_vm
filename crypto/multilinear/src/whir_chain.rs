@@ -1382,6 +1382,60 @@ where
     Ok((commitment, domain))
 }
 
+/// [`commit_stacked`] on the host, whatever a card would do: the codeword
+/// encoded and every leaf hashed here. The same bytes as the card's commit
+/// (the kernels are checked against these host functions); what a VERIFIER
+/// derives a commitment of its own with, so no card kernel sits on its path.
+pub fn commit_stacked_on_host<F, H>(
+    f: &Stacked<'_, F>,
+    config: &ChainConfig,
+) -> Result<(CodewordCommitment<F, H>, Domain<F>), Error>
+where
+    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    check_leaf_order::<H>(&config.format)?;
+    let num_vars = f.num_vars();
+    let first = config.schedule(num_vars).first().copied().unwrap_or(0);
+    let domain = Domain::<F>::new(num_vars + config.log_blowup)?;
+    let codeword = encode::<F, F>(&lift_coefficients(&f.assemble()?), &domain)?;
+    let commitment =
+        CodewordCommitment::from_codeword_on_host_in(codeword, first, config.format.leaves)?;
+    Ok((commitment, domain))
+}
+
+/// [`commit_joint_stacked`] on the host, whatever a card would do (see
+/// [`commit_stacked_on_host`]).
+pub fn commit_joint_stacked_on_host<F, H>(
+    polys: &[Stacked<'_, F>],
+    config: &ChainConfig,
+) -> Result<(CodewordCommitment<F, H>, Domain<F>), Error>
+where
+    F: IsFFTField + IsPrimeField + Send + Sync + 'static,
+    H: WhirHash,
+    FieldElement<F>: AsBytes + Sync + Send,
+{
+    check_leaf_order::<H>(&config.format)?;
+    check_round0_trees::<H>(&config.format)?;
+    let Some(num_vars) = polys.first().map(Stacked::num_vars).filter(|&n| {
+        (2..=MAX_INDEX_POLYS).contains(&polys.len()) && polys.iter().all(|f| f.num_vars() == n)
+    }) else {
+        return Err(Error::GroupedShape(GroupedShape::RunWidth {
+            polys: polys.len(),
+        }));
+    };
+    let first = config.schedule(num_vars).first().copied().unwrap_or(0);
+    let domain = Domain::<F>::new(num_vars + config.log_blowup)?;
+    let codewords = polys
+        .iter()
+        .map(|f| encode::<F, F>(&lift_coefficients(&f.assemble()?), &domain))
+        .collect::<Result<Vec<_>, Error>>()?;
+    let commitment =
+        CodewordCommitment::from_codewords_on_host_joint(codewords, first, config.format.leaves)?;
+    Ok((commitment, domain))
+}
+
 /// The codeword [`commit_stacked`] commits, with no tree: on the card when the
 /// card would have committed it, on the host otherwise. What a retired
 /// commitment is revived over (`stacked_eval::RetiredStack::revive`); the
