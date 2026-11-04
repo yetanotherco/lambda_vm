@@ -126,7 +126,22 @@
 }
 
 #let common-formatting(body) = {
-  set page(header: [#link(<outline>, underline([Contents]))])
+  let PAGE_MARGINS = 25mm // Typst's default for A4 paper
+  set page(
+    paper: "a4",
+    margin: PAGE_MARGINS,
+    header-ascent: 50%,
+    header: [#pad(
+      left: -0.5 * PAGE_MARGINS,
+      link(
+        <outline>,
+        text(
+          size: 0.8em,
+          underline([Back to Contents]),
+        ),
+      ),
+    )],
+  )
   set footnote(numbering: "[1]")
   show raw.where(block: true): it => block(it, inset: 1em, width: 100%, radius: 5pt)
   show math.equation.where(block: false): box // Don't line-break inline equations by default
