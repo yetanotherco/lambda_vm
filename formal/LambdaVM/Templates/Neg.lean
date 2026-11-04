@@ -23,8 +23,11 @@ the low word of `x` is nonzero and `carry[1] = 1` says `x` itself is nonzero, wh
 makes the result the two's complement rather than `2⁶⁴ − x` unconditionally.
 
 `IS_HALF[x[i]]` and `IS_BIT<cond>` are assumptions of the template, not constraints, so a chip
-that inlines `neg` range-checks the halves and constrains the flag itself. `NegCheck.circuit`
-adds the flag constraint to pin the meaning down on its own, the way `IsByteCheck` does.
+that inlines `neg` range-checks the halves and constrains the flag itself. The result carries
+its range in its `DWordWL` type in the spec, which is why `neg.toml` does not list it among the
+assumptions; in Lean that type holds plain field elements, so the range becomes an explicit
+assumption here and the chip range-checks both result words as well. `NegCheck.circuit` adds
+the flag constraint to pin the meaning down on its own, the way `IsByteCheck` does.
 
 The only chip that uses this template is `dvrm.toml`.
 -/
