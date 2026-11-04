@@ -11,10 +11,13 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
 
 - `LambdaVM/Field.lean` — Goldilocks as the base field (`F p`), with the size
   facts Clean's gadgets ask for. Primality comes from CompPoly's Pratt certificate.
-- `LambdaVM/Templates/` — the constraint templates of the spec as helpers the
-  chips call (`isBit`, `isByte`, `areBytes`, `add`, `sub`), each with a
-  `FormalAssertion` whose `Spec` is the template's meaning taken from its
-  `spec/*.typ` page: `IsBit.circuit`, `IsByteCheck.circuit`, `Add.circuit`.
+- `LambdaVM/Templates/` — the six constraint templates the spec declares, as
+  helpers the chips call (`isBit`, `isByte`, `areBytes`, `add`, `sub`, `sign`,
+  `neg`), each with a `FormalAssertion` whose `Spec` is the template's meaning
+  taken from its `spec/*.typ` page: `IsBit.circuit`, `IsByteCheck.circuit`,
+  `Add.circuit`, `SignCheck.circuit`, `NegCheck.circuit`. `sign` and `neg` have
+  no caller yet: the chips that use them (`dvrm`, `cpu32`, `mul`) are not
+  modelled, and `shift` reads `MSB16` directly rather than through `SIGN`.
 - `LambdaVM/AluOp.lean` — the `alu_op` descriptors of `types.rs`, one enumeration
   for the `opsel` of BYTE_ALU and the low bits of the ALU flag byte.
 - `LambdaVM/StaticLookup.lean` — `StaticLookupChannel`: a table the verifier
