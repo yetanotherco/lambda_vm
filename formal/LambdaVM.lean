@@ -7,6 +7,7 @@ public import LambdaVM.Templates.IsBit
 public import LambdaVM.Templates.Add
 public import LambdaVM.Tables.Bitwise
 public import LambdaVM.Templates.IsByte
+public import LambdaVM.Templates.Sign
 public import LambdaVM.Buses.Alu
 public import LambdaVM.Tables.Lt
 public import LambdaVM.Tables.Eq
