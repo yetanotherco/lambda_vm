@@ -26,10 +26,11 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   rows are witness programs of the row index, so the structure lives here.
 - `LambdaVM/Buses/` — the buses that are not static tables. `Alu.lean` is the
   unified ALU bus: message layout as in `BusId::Alu` and one `Guarantees` clause
-  per `opsel` (LT, EQ and SHIFT), each taking as hypotheses the `IS_WORD`
-  assumptions of its chip's spec (LT: the low words; EQ: all four words; SHIFT:
-  none). The flag byte is read as a natural, so a chip
-  pushing with one `opsel` discharges the other clauses by `omega`.
+  per `opsel` (LT, EQ, SHIFT and the toy MIN of the counted-pulls PoC), each
+  taking as hypotheses the `IS_WORD` assumptions of its chip's spec (LT: the low
+  words; EQ: all four words; SHIFT: none; MIN: all four). The flag byte is read
+  as a natural, so a chip pushing with one `opsel` discharges the other clauses
+  by `omega`.
 - `LambdaVM/Tables/` — one file per chip. `Bitwise.lean` transcribes the
   precomputed row function of `prover/src/tables/bitwise.rs` and defines each bus
   the table serves as a `StaticLookupChannel` (read through `toChannel`), with
@@ -58,7 +59,8 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   trivially true. That IS_HALF → ZERO → EQ compose is shown by `eqLookup`
   itself, which only type-checks as a `SoundEnsemble` because every channel is
   finished before the tables that pull from it; the theorem says something
-  about active rows once a component pulls from ALU.
+  about active rows once a component pulls from ALU. `LtStaged.lean` and
+  `CountedSameBus.lean` are the counted-pulls ensembles (see below).
 - `LambdaVM/Tables/ShiftCore.lean` and `Shift.lean` — the SHIFT chip. `ShiftCore`
   is the two-phase shift argument of `spec/src/shift.toml` on naturals (HWSL
   per limb, then whole limbs, left and right, logical and arithmetic), ending in
@@ -67,6 +69,10 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   overrides) and concludes `shiftResult`. `Shift.lean` mirrors the 22 constraints
   and 17 interactions of `shift.rs` and proves soundness and completeness, the
   latter for both the honest active row and the padding row.
+- `LambdaVM/Tables/MinToy.lean` — MIN, a toy ALU operation with the shape of
+  DVRM: it pulls an LT result on the ALU bus and pushes its own result on the
+  same bus. Not an RV64IM operation; it stands in for DVRM until DVRM is
+  modelled.
 
 ## Lessons for big chips (from SHIFT)
 
@@ -116,10 +122,8 @@ Result on `main` after that merge, 2026-10-28:
 
 - EQ: 5 constraints and 6 interactions, exact match.
 - SHIFT: 22 constraints and 17 interactions, exact match.
-- LT: exact match except the two documented deltas: `μ·(1 − μ) = 0` exists
-  only in Lean, `ARE_BYTES[μ, 0]` with multiplicity one exists only in Rust.
-  The test pins both by content, and its trace has deduplicated rows (`μ ≥ 2`),
-  where the Lean-only constraint fails as expected.
+- LT: 6 constraints and 10 interactions, exact match, with `μ` a byte as in
+  `lt.rs`.
 - BITWISE: same size, all 2^20 rows, 656 sampled rows and 8 channels (10 Rust
   receivers), exact match.
 
@@ -162,26 +166,42 @@ multiplicity is a requirement the row cannot meet.
   `channelsWithRequirements`: an out-of-range `μ` is only ruled out by the byte
   guarantee, which lawfulness does not see but soundness does.
 
-What upstream Clean needs for an end-to-end LT theorem with byte `μ`:
+An end-to-end LT theorem with byte `μ` needs two things Clean main lacks:
 
 1. A `Balance` for counted pulls: `BalancedInteractions` matching a pull of
    `1, …, N`, and a `fits` that bounds `N * count` rather than `count` by the
    characteristic.
-2. Either a dependency-aware `OrderedChannel` (a table may hold guarantees and
+2. A dependency-aware finishing order: a table may hold guarantees and
    requirements on the same channel when the requirements depend only on
-   channels finished earlier), or the range check of `μ` as a static `lookup`,
-   which is a local constraint and makes the requirement vacuous at lawfulness.
+   channels finished earlier.
 
-Until then LT keeps `μ ∈ {0, 1}` (see below).
+The model takes both from the `counted-pulls` branch of
+[yetanotherco/clean](https://github.com/yetanotherco/clean/tree/counted-pulls),
+Clean main `f3abad7c` plus three commits: `Balance.logUpUpTo N` with
+`RawChannel.ConsistentUpTo N`, the typed `Channel.counted N`, and
+`Ensemble.tableSoundness_of_staged` / `_stagedOn` (soundness by finishing
+order of channels, and of message classes within a channel). On top of it:
+
+- `Tables/Lt.lean` pulls `IS_HALF` and `MSB16` with multiplicity `μ` through
+  `Channel.counted 255`, bounded by its own pull of `ARE_BYTES[μ, 0]`, exactly
+  as `lt.rs`.
+- `Ensembles/LtStaged.lean` proves the LT ensemble sound under
+  `Balance.logUpUpTo 255`, finishing `ARE_BYTES` before the counted `IS_HALF`
+  and `MSB16` and those before ALU. Its second half adds MIN, which pulls LT
+  and pushes MIN on the ALU bus: ALU is finished in two stages, the non-MIN
+  messages first and the MIN messages after.
+- `Ensembles/CountedSameBus.lean` (CMIN) does the same with the ALU bus itself
+  counted: a row answers `μ` identical MIN requests, the full shape of DVRM.
+
+`Channels/Counted.lean` above predates the fork. Its `not_consistent` is the
+reason the fork's balance carries the `N * count` bound; its `consistentUpTo`
+shows the counted channel is consistent under the fork's `BalancedUpTo N`.
+Nothing else uses it.
 
 ## Known differences from the Rust prover
 
-- `LT` constrains `μ·(1 − μ) = 0`. The spec types `μ` as `Byte` with
-  `IS_BYTE[μ]` and `lt.rs` sends `ARE_BYTES[μ, 0]`, because LT deduplicates
-  rows and `μ` is a count. Clean only grants a channel guarantee to a pull with
-  multiplicity exactly 1, so until the counted pulls above land upstream the
-  model keeps `μ` a bit. Every chip whose `μ` the spec types as `Byte` (MUL,
-  DVRM, BRANCH, BYTEWISE) will need the same treatment.
+- Every chip whose `μ` the spec types as `Byte` (MUL, DVRM, BRANCH, BYTEWISE)
+  needs the counted treatment LT got above; none of them is modelled yet.
 - `isByte` sends `ARE_BYTES[X, 0]`, as every single-byte check in the prover
   does; `spec/src/is_byte.toml` writes `[0, X]`.
 - The `spec/` copy in this repository lags the `spec/main` branch; the spec the
