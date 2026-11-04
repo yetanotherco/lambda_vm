@@ -36,12 +36,10 @@ open Bitwise (Zero zeroTable)
 namespace Neg
 
 /-- The `DWordHL` operand `x` as `(lo, hi)` 32-bit words. -/
-@[circuit_norm]
 def toWL (x0 x1 x2 x3 : Expression (F p)) : DWordWL (Expression (F p)) :=
   ⟨x0 + 65536 * x1, x2 + 65536 * x3⟩
 
 /-- The zero `DWordWL`, the sum that `x + neg` has to reach. -/
-@[circuit_norm]
 def zeroWL : DWordWL (Expression (F p)) := ⟨0, 0⟩
 
 /-- 64-bit value of a `DWordHL` operand, four 16-bit halves. -/
