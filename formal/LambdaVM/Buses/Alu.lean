@@ -79,6 +79,16 @@ def mulResult (lhsSigned rhsSigned high x y : ℕ) : ℕ :=
   if high = 1 then (ext128 lhsSigned x * ext128 rhsSigned y) % 2^128 / 2^64
   else (ext128 lhsSigned x * ext128 rhsSigned y) % 2^128 % 2^64
 
+/-- `DIVREM` (`spec/src/dvrm.toml`): the quotient (`rem = 0`) or the remainder (`rem = 1`) of `a` by
+`b`, rounding towards zero, which is `DIV`, `DIVU`, `REM` and `REMU`. Division by zero gives the
+quotient `2^64 - 1` and the remainder `a`. The signed overflow `-2^63 / -1` needs no case of its
+own: `Int.tdiv` gives `2^63`, which is `-2^63` modulo `2^64`, with remainder `0`, as RISC-V
+requires. -/
+def divremResult (signed rem a b : ℕ) : ℕ :=
+  if b = 0 then (if rem = 1 then a else 2^64 - 1)
+  else ((if rem = 1 then (sgn64 signed a).tmod (sgn64 signed b)
+    else (sgn64 signed a).tdiv (sgn64 signed b)) % 2^64).toNat
+
 /-- What a puller learns. One clause per `opsel`, selected by the flag byte read as a natural.
 Each clause takes as hypotheses exactly the `[[assumptions]]` of its chip's spec: the words the
 caller must have range-checked. The words a chip range-checks itself need no hypothesis. -/
@@ -119,7 +129,14 @@ def Guarantees (m : Msg (F p)) : Prop :=
   (∀ ls rs h : ℕ, ls < 2 → rs < 2 → h < 2 →
     m.flags.val = opselMUL + 32 * ls + 64 * rs + 128 * h →
     m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
-    dword m.outLo m.outHi = mulResult ls rs h (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi))
+    dword m.outLo m.outHi = mulResult ls rs h (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi)) ∧
+  -- DIVREM (spec/src/dvrm.toml): flags = opsel(DIVREM) + 32·signed + 128·rem;
+  -- no assumptions, as dvrm.toml declares none
+  (∀ s rm : ℕ, s < 2 → rm < 2 →
+    m.flags.val = opselDIVREM + 32 * s + 128 * rm →
+    m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+    dword m.outLo m.outHi
+      = divremResult s rm (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi))
 
 def channel : Channel (F p) Msg where
   name := "ALU"
