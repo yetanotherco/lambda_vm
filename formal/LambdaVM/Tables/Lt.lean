@@ -3,6 +3,7 @@ module
 public import LambdaVM.Tables.Bitwise
 public import Clean.Air.CountedChannel
 public import LambdaVM.Buses.Alu
+public import LambdaVM.Mu
 public import LambdaVM.Templates.IsBit
 public import LambdaVM.Templates.Add
 public import Mathlib.Tactic.LinearCombination
@@ -71,8 +72,6 @@ theorem core
   rw [Alu.slt_ofNat_iff (by omega) (by omega)]
   split_ifs <;> omega
 
-/-- The largest multiplicity of an LT row: `MU_MAX` in `prover/src/tables/types.rs`. -/
-abbrev muMax : ℕ := 255
 
 /-- `IS_HALF` and `MSB16` with pulls of multiplicity up to `muMax`. -/
 abbrev IsHalfC : RawChannel (F p) := Bitwise.IsHalf.counted muMax
