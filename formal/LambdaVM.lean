@@ -14,6 +14,7 @@ public import LambdaVM.Tables.Lt
 public import LambdaVM.Tables.Eq
 public import LambdaVM.Tables.Shift
 public import LambdaVM.Tables.Bytewise
+public import LambdaVM.Tables.MulCore
 public import LambdaVM.Ensembles.EqLookup
 public import LambdaVM.Channels.Counted
 public import LambdaVM.Ensembles.LtStaged
