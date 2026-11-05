@@ -91,7 +91,18 @@ def Guarantees (m : Msg (F p)) : Prop :=
     -- MIN (toy, see `opselMIN`): flags = opsel(MIN), out = the unsigned minimum
     (m.flags.val = opselMIN →
       m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
-      dword m.outLo m.outHi = min (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi))
+      dword m.outLo m.outHi = min (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi)) ∧
+    -- BYTEWISE (spec/bytewise.typ): flags = opsel(AND | OR | XOR), with no flag bits above it;
+    -- out is the operation applied to the whole 64-bit values
+    (m.flags.val = opselAND →
+      m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+      dword m.outLo m.outHi = dword m.in1Lo m.in1Hi &&& dword m.in2Lo m.in2Hi) ∧
+    (m.flags.val = opselOR →
+      m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+      dword m.outLo m.outHi = dword m.in1Lo m.in1Hi ||| dword m.in2Lo m.in2Hi) ∧
+    (m.flags.val = opselXOR →
+      m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+      dword m.outLo m.outHi = dword m.in1Lo m.in1Hi ^^^ dword m.in2Lo m.in2Hi)
 
 def channel : Channel (F p) Msg where
   name := "ALU"

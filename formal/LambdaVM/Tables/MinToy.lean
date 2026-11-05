@@ -65,7 +65,10 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     -- only the MIN clause applies to flags = 7
     refine ⟨fun s i hs hi h => by simp only [opselLT] at h; omega,
       fun i hi h => by simp only [opselEQ] at h; omega,
-      fun w s d hw hs hd h => by simp only [opselSHIFT] at h; omega, fun _ => ?_⟩
+      fun w s d hw hs hd h => by simp only [opselSHIFT] at h; omega, fun _ => ?_,
+      fun h => by simp only [opselAND] at h; omega,
+      fun h => by simp only [opselOR] at h; omega,
+      fun h => by simp only [opselXOR] at h; omega⟩
     by_cases hLR : dword input_a0 input_a1 < dword input_b0 input_b1
     · have h1 : input_lt = 1 := by
         rw [hlt]; simp [Alu.ltBit, Alu.ltRaw, Alu.ult_ofNat_iff hL hR, hLR]
@@ -90,7 +93,10 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     rw [h4]
     refine ⟨fun s i hs hi h => ?_, fun i hi h => by simp only [opselEQ] at h; omega,
       fun w s d hw hs hd h => by simp only [opselSHIFT] at h; omega,
-      fun h => by simp only [Alu.opselMIN] at h; omega⟩
+      fun h => by simp only [Alu.opselMIN] at h; omega,
+      fun h => by simp only [opselAND] at h; omega,
+      fun h => by simp only [opselOR] at h; omega,
+      fun h => by simp only [opselXOR] at h; omega⟩
     simp only [opselLT] at h
     obtain ⟨rfl, rfl⟩ : s = 0 ∧ i = 0 := by omega
     exact hlt

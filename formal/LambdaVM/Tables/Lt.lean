@@ -270,7 +270,11 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     have hflagsV : (4 + 32 * input_signed + 64 * input_invert : F p).val
         = 4 + 32 * input_signed.val + 64 * input_invert.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-    refine ⟨?_, ?_, ?_, ?_⟩
+    refine ⟨?_, ?_, ?_, ?_,
+      -- nor the three BYTEWISE clauses: opsel(AND | OR | XOR) is below opsel(LT)
+      fun hflags => by exfalso; rw [hflagsV] at hflags; simp only [opselAND] at hflags; omega,
+      fun hflags => by exfalso; rw [hflagsV] at hflags; simp only [opselOR] at hflags; omega,
+      fun hflags => by exfalso; rw [hflagsV] at hflags; simp only [opselXOR] at hflags; omega⟩
     · intro s i hs hi hflags
       rw [hflagsV] at hflags; simp only [opselLT] at hflags
       rw [key s i (by omega) (by omega) hl0 hr0, hval_lhsHi, hval_rhsHi]

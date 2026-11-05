@@ -508,7 +508,14 @@ theorem soundness :
     have hflagsV : (5 + input_wordInstr + 32 * input_signed + 64 * input_direction : F p).val
         = 5 + input_wordInstr.val + 32 * input_signed.val + 64 * input_direction.val :=
       val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
-    refine ⟨?_, ?_, ?_, ?_⟩
+    refine ⟨?_, ?_, ?_, ?_,
+      -- nor the three BYTEWISE clauses: opsel(AND | OR | XOR) is below opsel(SHIFT)
+      fun hflags => by
+        exfalso; rw [hflagsV] at hflags; have : opselAND = 0 := rfl; omega,
+      fun hflags => by
+        exfalso; rw [hflagsV] at hflags; have : opselOR = 1 := rfl; omega,
+      fun hflags => by
+        exfalso; rw [hflagsV] at hflags; have : opselXOR = 2 := rfl; omega⟩
     · -- not LT: 5 + w + 32 s + 64 d ≠ 4 + 32 s' + 64 i (mod 32)
       intro s i hs hi hflags
       exfalso; rw [hflagsV] at hflags; simp only [opselLT] at hflags; omega
