@@ -170,4 +170,31 @@ theorem mulResult_of_product {ls rs x y lo hi : ℕ} (hlo : lo < 2^64)
   · exact h0
   · exact h1
 
+/-! ## The carry chain, between the field and the naturals -/
+
+/-- One step of the carry chain lifted to `ℕ`: with `c = 2⁻³²·(r + cin − res)` and every value
+small, `r + cin = res + 2^32·c` holds over the naturals. -/
+theorem carry_step {r cin res c : F p} (hr : r.val < 2^52) (hcin : cin.val < 2^20)
+    (hres : res.val < 2^32) (hc : c.val < 2^20)
+    (h : c = (r + cin - res) * inv32) :
+    r.val + cin.val = res.val + 2^32 * c.val := by
+  have hp : (2 : ℕ)^53 < p := by decide
+  have h' : c * 2^32 = r + cin - res := by
+    rw [h, mul_assoc, inv32_mul_two_pow, mul_one]
+  refine natCast_inj_of_lt (by omega) (by omega) ?_
+  push_cast
+  simp only [ZMod.natCast_zmod_val]
+  linear_combination -h'
+
+/-- The field carry is the honest natural carry: `2⁻³²·(r + cin − res) = k` when the naturals
+behind `r`, `cin` and `res` satisfy `R + Cin = S + 2^32·k`. -/
+theorem carry_cast {r cin res : F p} {R Cin S k : ℕ} (hr : r = (R : F p))
+    (hcin : cin = (Cin : F p)) (hres : res = (S : F p)) (h : R + Cin = S + 2^32 * k) :
+    (r + cin - res) * inv32 = (k : F p) := by
+  have h' : (R : F p) + Cin - S = 2^32 * k := by
+    have hc := congrArg (Nat.cast : ℕ → F p) h
+    push_cast at hc
+    linear_combination hc
+  rw [hr, hcin, hres, h', mul_right_comm, two_pow_mul_inv32, one_mul]
+
 end LambdaVM.MulCore
