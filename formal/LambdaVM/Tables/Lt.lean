@@ -276,7 +276,9 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       fun hflags => by exfalso; rw [hflagsV] at hflags; simp only [opselXOR] at hflags; omega,
       -- nor MUL: opsel(MUL) + 32·ls + 64·rs + 128·h ≡ 7 (mod 32), opsel(LT) + 32·s + 64·i ≡ 4
       fun ls rs hg hls hrs hhg hflags => by
-        exfalso; rw [hflagsV] at hflags; have : opselMUL = 7 := rfl; omega⟩
+        exfalso; rw [hflagsV] at hflags; have : opselMUL = 7 := rfl; omega,
+      fun s rm hs hrm hflags => by
+        exfalso; rw [hflagsV] at hflags; have : opselDIVREM = 8 := rfl; omega⟩
     · intro s i hs hi hflags
       rw [hflagsV] at hflags; simp only [opselLT] at hflags
       rw [key s i (by omega) (by omega) hl0 hr0, hval_lhsHi, hval_rhsHi]

@@ -172,7 +172,9 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       fun hflags => by exfalso; rw [hflagsV] at hflags; simp only [opselXOR] at hflags; omega,
       -- nor MUL: 7 (mod 32) against opsel(EQ) + 64·i ≡ 3
       fun ls rs hg hls hrs hhg hflags => by
-        exfalso; rw [hflagsV] at hflags; have : opselMUL = 7 := rfl; omega⟩
+        exfalso; rw [hflagsV] at hflags; have : opselMUL = 7 := rfl; omega,
+      fun s rm hs hrm hflags => by
+        exfalso; rw [hflagsV] at hflags; have : opselDIVREM = 8 := rfl; omega⟩
     · -- the LT clause does not apply: opsel(EQ) + 64·i ≠ opsel(LT) + 32·s + 64·i'
       intro s i hs hi hflags
       exfalso; rw [hflagsV] at hflags; simp only [opselLT] at hflags; omega

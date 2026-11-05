@@ -446,7 +446,9 @@ theorem soundness :
         exfalso; rw [hflags] at h; simp only [opselSHIFT] at h; omega,
       fun h => by exfalso; rw [hflags] at h; simp only [opselAND] at h; omega,
       fun h => by exfalso; rw [hflags] at h; simp only [opselOR] at h; omega,
-      fun h => by exfalso; rw [hflags] at h; simp only [opselXOR] at h; omega, ?_⟩
+      fun h => by exfalso; rw [hflags] at h; simp only [opselXOR] at h; omega, ?_,
+      fun s rm hs hrm h => by
+        exfalso; rw [hflags] at h; simp only [opselDIVREM] at h; omega⟩
     intro ls rs hgh hls hrs hh h
     rw [hflags] at h
     simp only [opselMUL] at h
@@ -468,7 +470,9 @@ theorem soundness :
         exfalso; rw [hflags] at h; simp only [opselSHIFT] at h; omega,
       fun h => by exfalso; rw [hflags] at h; simp only [opselAND] at h; omega,
       fun h => by exfalso; rw [hflags] at h; simp only [opselOR] at h; omega,
-      fun h => by exfalso; rw [hflags] at h; simp only [opselXOR] at h; omega, ?_⟩
+      fun h => by exfalso; rw [hflags] at h; simp only [opselXOR] at h; omega, ?_,
+      fun s rm hs hrm h => by
+        exfalso; rw [hflags] at h; simp only [opselDIVREM] at h; omega⟩
     intro ls rs hgh hls hrs hh h
     rw [hflags] at h
     simp only [opselMUL] at h
