@@ -108,14 +108,15 @@ For each table the test evaluates the Lean asserts and the Rust `ConstraintSet`
 on 64 random rows and matches them as multisets of functions, does the same for
 the interactions (bus id, signed multiplicity, message elements), and checks
 that every Lean constraint vanishes on honest traces from `generate_*_trace`,
-padding rows included; the Lean-only constraints of the documented deltas are
-skipped there. The sign of an interaction comes from its direction: a Rust
-sender is Clean's pull and counts `−m`, a receiver is Clean's push and counts
-`+m`. For BITWISE the test checks the table and channel sizes, compares the
-sampled rows with `generate_bitwise_row` and each channel's messages with the
-receivers of `bitwise::bus_interactions()` on the same bus, and checks all 2^20
-rows of `generate_bitwise_row` against a Rust transcription of `Bitwise.row`
-that the sampled rows pin to the Lean export.
+padding rows included. Each test asserts that all four unmatched lists are
+empty: no table has a Lean-only or a Rust-only constraint or interaction left.
+The sign of an interaction comes from its direction: a Rust sender is Clean's
+pull and counts `−m`, a receiver is Clean's push and counts `+m`. For BITWISE
+the test checks the table and channel sizes, compares the sampled rows with
+`generate_bitwise_row` and each channel's messages with the receivers of
+`bitwise::bus_interactions()` on the same bus, and checks all 2^20 rows of
+`generate_bitwise_row` against a Rust transcription of `Bitwise.row` that the
+sampled rows pin to the Lean export.
 
 The models follow the multiplicity constraints of PR #1016, merged 2026-10-23.
 Result on `main` after that merge, 2026-10-28:

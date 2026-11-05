@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 use stark::constraint_ir::eval_program_base;
 use stark::constraints::builder::{CaptureBuilder, ConstraintSet, num_base_from_meta};
-use stark::lookup::{BusInteraction, Multiplicity};
+use stark::lookup::BusInteraction;
 
 use super::test_rng::SplitMix64;
 use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
@@ -226,8 +226,6 @@ struct Report {
     lean_interacts_unmatched: Vec<String>,
     /// Indices into the Rust interactions.
     rust_interacts_unmatched: Vec<usize>,
-    /// The random rows the fingerprints were taken on.
-    random_rows: Vec<Vec<FE>>,
 }
 
 fn compare<CS: ConstraintSet<Gl, Gl3>>(
@@ -294,9 +292,10 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
     let mut rust_interacts_unmatched = ri;
     rust_interacts_unmatched.sort_unstable();
 
-    // Every Lean constraint with a Rust counterpart vanishes on the honest trace. The
-    // Lean-only ones are the documented deltas (LT's `μ·(1 − μ)` does not hold on a
-    // deduplicated Rust row with `μ > 1`).
+    // Every Lean constraint with a Rust counterpart vanishes on the honest trace. There are no
+    // Lean-only constraints left: LT's `μ·(1 − μ)` became a pull of `ARE_BYTES[μ, 0]`, as in
+    // `lt.rs`, and every test below asserts that both unmatched lists are empty. The skip is kept
+    // for the next table added here, which may land before its Rust side does.
     for (r, row) in honest_rows.iter().enumerate() {
         for (i, e) in lean.asserts.iter().enumerate() {
             if lean_asserts_unmatched.contains(&i) {
@@ -339,7 +338,6 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
         rust_constraints_unmatched,
         lean_interacts_unmatched,
         rust_interacts_unmatched,
-        random_rows: rows,
     }
 }
 
@@ -415,26 +413,6 @@ fn lean_diff_lt() {
         report.lean_asserts_unmatched.is_empty(),
         "[LT] Lean-only constraints"
     );
-    let mu_bit = |r: &[FE]| r[cols::MU] * (FE::one() - r[cols::MU]);
-    for r in &report.random_rows {
-        assert_eq!(
-            eval(&lean.asserts[0], r),
-            mu_bit(r),
-            "[LT] Lean-only assert is μ·(1 − μ)"
-        );
-    }
-    // The delta is real on honest rows: it fails exactly on the deduplicated rows.
-    let mut dedup_rows = 0;
-    for r in &honest {
-        let mu = r[cols::MU].canonical_u64();
-        assert_eq!(
-            eval(&lean.asserts[0], r) == FE::zero(),
-            mu <= 1,
-            "[LT] μ = {mu}"
-        );
-        dedup_rows += usize::from(mu > 1);
-    }
-    assert!(dedup_rows >= 2, "[LT] the trace has deduplicated rows");
     assert!(
         report.rust_constraints_unmatched.is_empty(),
         "[LT] Rust-only constraints"
@@ -447,22 +425,6 @@ fn lean_diff_lt() {
         report.rust_interacts_unmatched.is_empty(),
         "[LT] Rust-only interactions"
     );
-    let are_bytes = &interactions[report.rust_interacts_unmatched[0]];
-    assert!(
-        are_bytes.is_sender && matches!(are_bytes.multiplicity, Multiplicity::One),
-        "[LT] the μ bound is sent with multiplicity One"
-    );
-    for r in &report.random_rows {
-        assert_eq!(
-            rust_interaction_at(are_bytes, r),
-            (
-                BusId::AreBytes as u64,
-                -FE::one(),
-                vec![r[cols::MU], FE::zero()]
-            ),
-            "[LT] the Rust-only interaction is ARE_BYTES[μ, 0]"
-        );
-    }
 }
 
 #[test]
