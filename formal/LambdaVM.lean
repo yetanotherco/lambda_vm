@@ -16,6 +16,4 @@ public import LambdaVM.Tables.Shift
 public import LambdaVM.Tables.Bytewise
 public import LambdaVM.Ensembles.EqLookup
 public import LambdaVM.Channels.Counted
-public import LambdaVM.Tables.MinToy
 public import LambdaVM.Ensembles.LtStaged
-public import LambdaVM.Ensembles.CountedSameBus

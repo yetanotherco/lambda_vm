@@ -26,16 +26,11 @@ soundness theorem or global row theorem.
 #print axioms LambdaVM.EQ.circuit
 #print axioms LambdaVM.SHIFT.circuit
 #print axioms LambdaVM.BYTEWISE.circuit
-#print axioms LambdaVM.MinToy.circuit
-#print axioms LambdaVM.CountedMin.circuit
 #print axioms LambdaVM.Counted.Demo.circuit
 
 -- The ensembles.
 #print axioms LambdaVM.Ensembles.eq_rows_correct
 #print axioms LambdaVM.Ensembles.LtStaged.tableSoundness
-#print axioms LambdaVM.Ensembles.LtStaged.tableSoundness_withMin
-#print axioms LambdaVM.CountedMin.tableSoundness
-
 -- The templates the chips are built from. They are `FormalAssertion`s that nothing above
 -- reaches, so without these lines a `sorry` in one of them would pass the check.
 #print axioms LambdaVM.IsBit.circuit
