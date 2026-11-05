@@ -33,9 +33,9 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
 - `LambdaVM/Buses/` — the buses that are not static tables. `Alu.lean` is the
   unified ALU bus: message layout as in `BusId::Alu`, the caller's `IS_WORD`
   assumptions on both operands as hypotheses, and one `Guarantees` clause per
-  `opsel` (AND, OR and XOR for BYTEWISE, then EQ, LT, SHIFT and the toy MIN of
-  the counted-pulls PoC). The flag byte is read as a natural, so a chip pushing
-  with one `opsel` discharges the other clauses by `omega`.
+  `opsel` (AND, OR and XOR for BYTEWISE, then EQ, LT and SHIFT). The flag byte
+  is read as a natural, so a chip pushing with one `opsel` discharges the other
+  clauses by `omega`.
 - `LambdaVM/Tables/` — one file per chip. `Bitwise.lean` transcribes the
   precomputed row function of `prover/src/tables/bitwise.rs` and defines each bus
   the table serves as a `StaticLookupChannel` (read through `toChannel`), with
@@ -58,8 +58,7 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   first global theorem: for any witness whose constraints hold and whose
   channels balance, every EQ row with `μ = 1` and range-checked operands
   carries the equality bit. The lookup argument is what turns the pulled range
-  checks into facts. `LtStaged.lean` and `CountedSameBus.lean` are the
-  counted-pulls ensembles (see below).
+  checks into facts. `LtStaged.lean` is the counted-pulls ensemble (see below).
 - `LambdaVM/Tables/ShiftCore.lean` and `Shift.lean` — the SHIFT chip. `ShiftCore`
   is the two-phase shift argument of `spec/shift.typ` on naturals (HWSL
   per limb, then whole limbs, left and right, logical and arithmetic), ending in
@@ -79,10 +78,6 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   not assumed either, since that same guarantee supplies them, which is why
   soundness needs no assumption at all. `IS_BYTE[μ]` is a constraint of the chip,
   which is what makes the eight pulls counted pulls of multiplicity at most 255.
-- `LambdaVM/Tables/MinToy.lean` — MIN, a toy ALU operation with the shape of
-  DVRM: it pulls an LT result on the ALU bus and pushes its own result on the
-  same bus. Not an RV64IM operation; it stands in for DVRM until DVRM is
-  modelled.
 
 ## Lessons for big chips (from SHIFT)
 
@@ -187,14 +182,19 @@ order of channels, and of message classes within a channel). On top of it:
 - `Tables/Lt.lean` pulls `IS_HALF` and `MSB16` with multiplicity `μ` through
   `Channel.counted 255`, bounded by its own pull of `ARE_BYTES[μ, 0]`, exactly
   as `lt.rs`.
+- `Tables/Bytewise.lean` pulls `BYTE_ALU` eight times with multiplicity `μ`
+  through `Channel.counted 255`, bounded by its own `IS_BYTE[μ]` constraint.
 - `Ensembles/LtStaged.lean` proves `tableSoundness`, that is
   `Ensemble.TableSoundness (Balance.logUpUpTo 255)` for the LT ensemble,
   finishing `ARE_BYTES` before the counted `IS_HALF` and `MSB16` and those
-  before ALU. Its second half adds MIN, which pulls LT and pushes MIN on the
-  ALU bus: ALU is finished in two stages, the non-MIN messages first and the
-  MIN messages after.
-- `Ensembles/CountedSameBus.lean` (CMIN) does the same with the ALU bus itself
-  counted: a row answers `μ` identical MIN requests, the full shape of DVRM.
+  before ALU.
+
+A chip that pulls and pushes the *same* bus — the shape of DVRM — has no model
+here. A toy MIN table and `Ensembles/CountedSameBus.lean` carried that shape
+while counted pulls were being designed, and were removed once BYTEWISE
+exercised the mechanism on a real chip. What they used is in Clean and
+unchanged: `Ensemble.tableSoundness_of_stagedOn` finishes one bus in two classes
+of messages, which is how a puller and pusher of the same bus is ordered.
 
 That is not an end-to-end LT theorem. `TableSoundness` is one premise of a
 sound ensemble, not the conclusion: it reads `witness.Assumptions →
@@ -206,8 +206,7 @@ discharge. In `LtStaged` that premise is not free, because the `ARE_BYTES`,
 `Assumptions input data := channel.Guarantees input.1 data`, and
 `providerComponent` and `countedProviderComponent` carry the same assumption
 into the ensemble. Each provider assumes its own answers are correct; nothing
-in the file derives that from a row of BITWISE. `CountedSameBus` reuses those
-two components, so the LT answers it feeds to CMIN are assumed in the same way.
+in the file derives that from a row of BITWISE.
 
 `EqLookup`, in this same PR, is the contrast. Its `pushStatic` emits the
 entries of a real `StaticLookupChannel` and proves the guarantee from
@@ -216,9 +215,8 @@ outright — "no component assumes anything" — and states a conclusion about
 rows: every EQ row with `μ = 1` and range-checked operands carries the
 equality bit. There is no `lt_rows_correct`. Writing one needs `pushStatic`,
 or a counted analogue of it, behind LT's three range checks, and this branch
-has neither. What `LtStaged` and `CountedSameBus` do establish is that the
-staged finishing order admits counted pulls, which is what they were written
-for.
+has neither. What `LtStaged` does establish is that the staged finishing order
+admits counted pulls, which is what it was written for.
 
 `Channels/Counted.lean` above predates the fork. Its `not_consistent` is the
 reason the fork's balance carries the `N * count` bound; its `consistentUpTo`
