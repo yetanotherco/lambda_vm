@@ -84,7 +84,10 @@ def circuit : GeneralFormalCircuit (F p) MinToy.Row unit where
     exact ⟨fun s i hs hi h => by simp only [opselLT] at h; omega,
       fun i hi h => by simp only [opselEQ] at h; omega,
       fun w s d hw hs hd h => by simp only [opselSHIFT] at h; omega,
-      fun _ ha0 ha1 hb0 hb1 => key ha0 ha1 hb0 hb1⟩
+      fun _ ha0 ha1 hb0 hb1 => key ha0 ha1 hb0 hb1,
+      fun h => by have : opselAND = 0 := rfl; omega,
+      fun h => by have : opselOR = 1 := rfl; omega,
+      fun h => by have : opselXOR = 2 := rfl; omega⟩
 
   ProverAssumptions r _ _ := Honest r
   completeness := by
@@ -96,7 +99,10 @@ def circuit : GeneralFormalCircuit (F p) MinToy.Row unit where
     rw [h4]
     refine ⟨fun s i hs hi h _ _ => ?_, fun i hi h => by simp only [opselEQ] at h; omega,
       fun w s d hw hs hd h => by simp only [opselSHIFT] at h; omega,
-      fun h => by simp only [Alu.opselMIN] at h; omega⟩
+      fun h => by simp only [Alu.opselMIN] at h; omega,
+      fun h => by have : opselAND = 0 := rfl; omega,
+      fun h => by have : opselOR = 1 := rfl; omega,
+      fun h => by have : opselXOR = 2 := rfl; omega⟩
     simp only [opselLT] at h
     obtain ⟨rfl, rfl⟩ : s = 0 ∧ i = 0 := by omega
     exact hlt
