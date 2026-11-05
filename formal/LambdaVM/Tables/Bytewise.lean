@@ -3,6 +3,7 @@ module
 public import LambdaVM.Tables.Bitwise
 public import Clean.Air.CountedChannel
 public import LambdaVM.Buses.Alu
+public import LambdaVM.Mu
 public import LambdaVM.Templates.IsByte
 
 @[expose] public section
@@ -36,11 +37,9 @@ namespace LambdaVM.BYTEWISE
 
 open Bitwise (ByteAlu ByteAluMsg byteAluTable AreBytes areBytesTable)
 
-/-- The largest multiplicity of a BYTEWISE row: `μ` is a byte, as `spec/src/bytewise.toml` types
-it and as `MU_MAX` fixes it in `prover/src/tables/types.rs`. -/
-abbrev muMax : ℕ := 255
-
-/-- `BYTE_ALU` with pulls of multiplicity up to `muMax`. -/
+/-- `BYTE_ALU` with pulls of multiplicity up to `muMax`. A BYTEWISE row's own `μ` is a byte, as
+`spec/src/bytewise.toml` types it and as `MU_MAX` fixes it in `prover/src/tables/types.rs`; the
+channel's bound is the model-wide one of `LambdaVM.muMax`. -/
 abbrev ByteAluC : RawChannel (F p) := ByteAlu.counted muMax
 
 /-! ## Bitwise operations compose from bytes
