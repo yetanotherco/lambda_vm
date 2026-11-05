@@ -11,11 +11,16 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
 
 - `LambdaVM/Field.lean` — Goldilocks as the base field (`F p`), with the size
   facts Clean's gadgets ask for. Primality comes from CompPoly's Pratt certificate.
-- `LambdaVM/Templates/` — the six constraint templates the spec declares, as
-  helpers the chips call (`isBit`, `isByte`, `areBytes`, `add`, `sub`, `sign`,
+- `LambdaVM/Templates/` — every constraint template the vendored spec declares,
+  as helpers the chips call (`isBit`, `isByte`, `areBytes`, `add`, `sub`, `sign`,
   `neg`), each with a `FormalAssertion` whose `Spec` is the template's meaning
   taken from `spec/src/*.toml`: `IsBit.circuit`, `IsByteCheck.circuit`,
   `AreBytesCheck.circuit`, `Add.circuit`, `SignCheck.circuit`, `NegCheck.circuit`.
+  The `kind` of a component lives in `spec/src/signatures.toml`, not in its own
+  file, and six tags carry `kind = "template"` there: `IS_BIT`, `IS_BYTE`, `ADD`,
+  `SUB`, `NEG` and `SIGN`. A newer spec than the one under `spec/` declares three
+  more, `REG`, `REGW` and `IS_WHH`, which cannot be modelled until their
+  dependencies are: `REG` and `REGW` read `MEMW`, and `IS_WHH` reads `IS_WH`.
   The chips call `isBit`, `add` and `sub`; no chip calls `isByte` or `areBytes`
   yet (SHIFT pulls `ARE_BYTES` directly). `sign` and `neg` have no caller yet:
   the chips that use them (`dvrm`, `cpu32`, `mul`) are not modelled, and `shift`
