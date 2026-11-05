@@ -20,6 +20,7 @@ soundness theorem or global row theorem.
 #print axioms LambdaVM.LT.circuit
 #print axioms LambdaVM.EQ.circuit
 #print axioms LambdaVM.SHIFT.circuit
+#print axioms LambdaVM.BYTEWISE.circuit
 #print axioms LambdaVM.MinToy.circuit
 #print axioms LambdaVM.CountedMin.circuit
 

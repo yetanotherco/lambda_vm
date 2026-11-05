@@ -22,3 +22,4 @@ public meta def main : IO Unit := do
   exportCircuit "lt" LT.main
   exportCircuit "eq" EQ.main
   exportCircuit "shift" SHIFT.main
+  exportCircuit "bytewise" BYTEWISE.main
