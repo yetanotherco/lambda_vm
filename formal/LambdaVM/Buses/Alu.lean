@@ -65,10 +65,6 @@ def shiftResult (word signed direction x s : ℕ) : ℕ :=
   else if signed = 0 then x >>> k
   else sra64 x k
 
-/-- `opsel` of MIN: a toy operation for the counted-pulls PoC, not an RV64IM op. It has the shape of
-DIVREM: its chip pulls LT on this bus and pushes its own result on the same bus. -/
-def opselMIN : ℕ := 7
-
 /-- What a puller learns. The caller must have range-checked both words of both operands
 (the chips' `IS_WORD` assumptions). One clause per `opsel`, selected by the flag byte read
 as a natural. -/
@@ -88,10 +84,6 @@ def Guarantees (m : Msg (F p)) : Prop :=
       m.flags.val = opselSHIFT + w + 32 * s + 64 * d →
       m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
       dword m.outLo m.outHi = shiftResult w s d (dword m.in1Lo m.in1Hi) (m.in2Lo.val % 256)) ∧
-    -- MIN (toy, see `opselMIN`): flags = opsel(MIN), out = the unsigned minimum
-    (m.flags.val = opselMIN →
-      m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
-      dword m.outLo m.outHi = min (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi)) ∧
     -- BYTEWISE (spec/bytewise.typ): flags = opsel(AND | OR | XOR), with no flag bits above it;
     -- out is the operation applied to the whole 64-bit values
     (m.flags.val = opselAND →

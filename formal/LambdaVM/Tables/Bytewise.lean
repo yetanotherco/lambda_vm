@@ -382,7 +382,6 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     refine ⟨fun s i hs hi h => by have : opselLT = 4 := rfl; omega,
       fun i hi h => by have : opselEQ = 3 := rfl; omega,
       fun w s d hw hs hd h => by have : opselSHIFT = 5 := rfl; omega,
-      fun h => by have : Alu.opselMIN = 7 := rfl; omega,
       fun h => ?_, fun h => ?_, fun h => ?_⟩
     all_goals
       refine ⟨by rw [wr0]; omega, by rw [wr1]; omega, ?_⟩
