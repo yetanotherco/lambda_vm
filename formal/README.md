@@ -166,7 +166,7 @@ multiplicity is a requirement the row cannot meet.
   `channelsWithRequirements`: an out-of-range `μ` is only ruled out by the byte
   guarantee, which lawfulness does not see but soundness does.
 
-An end-to-end LT theorem with byte `μ` needs two things Clean main lacks:
+Counted pulls in the LT model need two things Clean main lacks:
 
 1. A `Balance` for counted pulls: `BalancedInteractions` matching a pull of
    `1, …, N`, and a `fits` that bounds `N * count` rather than `count` by the
@@ -185,13 +185,38 @@ order of channels, and of message classes within a channel). On top of it:
 - `Tables/Lt.lean` pulls `IS_HALF` and `MSB16` with multiplicity `μ` through
   `Channel.counted 255`, bounded by its own pull of `ARE_BYTES[μ, 0]`, exactly
   as `lt.rs`.
-- `Ensembles/LtStaged.lean` proves the LT ensemble sound under
-  `Balance.logUpUpTo 255`, finishing `ARE_BYTES` before the counted `IS_HALF`
-  and `MSB16` and those before ALU. Its second half adds MIN, which pulls LT
-  and pushes MIN on the ALU bus: ALU is finished in two stages, the non-MIN
-  messages first and the MIN messages after.
+- `Ensembles/LtStaged.lean` proves `tableSoundness`, that is
+  `Ensemble.TableSoundness (Balance.logUpUpTo 255)` for the LT ensemble,
+  finishing `ARE_BYTES` before the counted `IS_HALF` and `MSB16` and those
+  before ALU. Its second half adds MIN, which pulls LT and pushes MIN on the
+  ALU bus: ALU is finished in two stages, the non-MIN messages first and the
+  MIN messages after.
 - `Ensembles/CountedSameBus.lean` (CMIN) does the same with the ALU bus itself
   counted: a row answers `μ` identical MIN requests, the full shape of DVRM.
+
+That is not an end-to-end LT theorem. `TableSoundness` is one premise of a
+sound ensemble, not the conclusion: it reads `witness.Assumptions →
+witness.Constraints → witness.InteractionsFit balance → witness.Balanced
+balance → witness.Spec`, and leaves `witness.Assumptions` for the caller to
+discharge. In `LtStaged` that premise is not free, because the `ARE_BYTES`,
+`IS_HALF` and `MSB16` providers are not tables. `provider` and
+`countedProvider` are rows that push whatever value they are handed, under
+`Assumptions input data := channel.Guarantees input.1 data`, and
+`providerComponent` and `countedProviderComponent` carry the same assumption
+into the ensemble. Each provider assumes its own answers are correct; nothing
+in the file derives that from a row of BITWISE. `CountedSameBus` reuses those
+two components, so the LT answers it feeds to CMIN are assumed in the same way.
+
+`EqLookup`, in this same PR, is the contrast. Its `pushStatic` emits the
+entries of a real `StaticLookupChannel` and proves the guarantee from
+membership in the table, so `eq_rows_correct` discharges `witness.Assumptions`
+outright — "no component assumes anything" — and states a conclusion about
+rows: every EQ row with `μ = 1` and range-checked operands carries the
+equality bit. There is no `lt_rows_correct`. Writing one needs `pushStatic`,
+or a counted analogue of it, behind LT's three range checks, and this branch
+has neither. What `LtStaged` and `CountedSameBus` do establish is that the
+staged finishing order admits counted pulls, which is what they were written
+for.
 
 `Channels/Counted.lean` above predates the fork. Its `not_consistent` is the
 reason the fork's balance carries the `N * count` bound; its `consistentUpTo`
