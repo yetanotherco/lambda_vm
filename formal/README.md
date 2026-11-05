@@ -107,16 +107,17 @@ that they are the same polynomials and the same bus interactions is mechanical:
 For each table the test evaluates the Lean asserts and the Rust `ConstraintSet`
 on 64 random rows and matches them as multisets of functions, does the same for
 the interactions, and checks that every Lean constraint vanishes on honest
-traces from `generate_*_trace`, padding rows included; the Lean-only
-constraints of the documented deltas are skipped there. The Rust side of an
-interaction is what the verifier enforces: the multiplicity and the LogUp
-fingerprint `z − (bus + α·e₀ + α²·e₁ + …)` as `emit_multiplicity` and
-`emit_fingerprint` emit them, captured like the constraints and evaluated at
-fixed `z` and `α`; the Lean side folds the exported message the same way.
-Direction (a Rust sender is Clean's pull), multiplicity and fingerprint are
-matched separately. For BITWISE the test checks the table and channel sizes,
-compares the sampled rows with `generate_bitwise_row` and each channel's
-messages with the fingerprints of the receivers of
+traces from `generate_*_trace`, padding rows included. Each test asserts that
+all four unmatched lists are empty: no table has a Lean-only or a Rust-only
+constraint or interaction left. The Rust side of an interaction is what the
+verifier enforces: the multiplicity and the LogUp fingerprint
+`z − (bus + α·e₀ + α²·e₁ + …)` as `emit_multiplicity` and `emit_fingerprint`
+emit them, captured like the constraints and evaluated at fixed `z` and `α`;
+the Lean side folds the exported message the same way. Direction (a Rust sender
+is Clean's pull), multiplicity and fingerprint are matched separately. For
+BITWISE the test checks the table and channel sizes, compares the sampled rows
+with `generate_bitwise_row` and each channel's messages with the fingerprints of
+the receivers of
 `bitwise::bus_interactions()` on the same bus, and checks all 2^20 rows of
 `generate_bitwise_row` against a Rust transcription of `Bitwise.row` that the
 sampled rows pin to the Lean export.
