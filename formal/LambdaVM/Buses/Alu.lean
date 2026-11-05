@@ -68,6 +68,17 @@ def shiftResult (word signed direction x s : ℕ) : ℕ :=
   else if signed = 0 then x >>> k
   else sra64 x k
 
+/-- A 64-bit value sign-extended to 128 bits: when the operand is read as signed and its top bit
+is set, two's complement fills the upper half with ones. -/
+def ext128 (signed x : ℕ) : ℕ := if signed = 1 ∧ 2^63 ≤ x then x + (2^128 - 2^64) else x
+
+/-- `MUL` (`spec/src/mul.toml`): the low (`high = 0`) or high (`high = 1`) 64 bits of the 128-bit
+product of the operands, each sign-extended according to its own flag. The four RV64IM forms
+`MUL`, `MULH`, `MULHU` and `MULHSU` are the four combinations of the two flags. -/
+def mulResult (lhsSigned rhsSigned high x y : ℕ) : ℕ :=
+  if high = 1 then (ext128 lhsSigned x * ext128 rhsSigned y) % 2^128 / 2^64
+  else (ext128 lhsSigned x * ext128 rhsSigned y) % 2^128 % 2^64
+
 /-- What a puller learns. One clause per `opsel`, selected by the flag byte read as a natural.
 Each clause takes as hypotheses exactly the `[[assumptions]]` of its chip's spec: the words the
 caller must have range-checked. The words a chip range-checks itself need no hypothesis. -/
@@ -102,7 +113,13 @@ def Guarantees (m : Msg (F p)) : Prop :=
     dword m.outLo m.outHi = dword m.in1Lo m.in1Hi ||| dword m.in2Lo m.in2Hi) ∧
   (m.flags.val = opselXOR →
     m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
-    dword m.outLo m.outHi = dword m.in1Lo m.in1Hi ^^^ dword m.in2Lo m.in2Hi)
+    dword m.outLo m.outHi = dword m.in1Lo m.in1Hi ^^^ dword m.in2Lo m.in2Hi) ∧
+  -- MUL (spec/src/mul.toml): flags = opsel(MUL) + 32·lhs_signed + 64·rhs_signed + 128·high;
+  -- no assumptions, as mul.toml declares none
+  (∀ ls rs h : ℕ, ls < 2 → rs < 2 → h < 2 →
+    m.flags.val = opselMUL + 32 * ls + 64 * rs + 128 * h →
+    m.outLo.val < 2^32 ∧ m.outHi.val < 2^32 ∧
+    dword m.outLo m.outHi = mulResult ls rs h (dword m.in1Lo m.in1Hi) (dword m.in2Lo m.in2Hi))
 
 def channel : Channel (F p) Msg where
   name := "ALU"

@@ -8,7 +8,11 @@ public import LambdaVM.Field
 # `alu_op` descriptors (`prover/src/tables/types.rs`)
 
 One enumeration serves two places: the `opsel` of the `BYTE_ALU` lookup (AND, OR, XOR) and the
-low bits of the flag byte on the `ALU` bus (EQ, LT, SHIFT).
+low bits of the flag byte on the `ALU` bus (EQ, LT, SHIFT, MUL).
+
+`alu_op::SHIFTW` is 6 and has no name here: `shift.toml` encodes it as `opsel(SHIFT) +
+word_instr`, so the SHIFT clause of the bus covers both. `alu_op::DIVREM` is 8 and is absent
+until DVRM is modelled.
 -/
 
 namespace LambdaVM
@@ -19,5 +23,6 @@ def opselXOR : ℕ := 2
 def opselEQ : ℕ := 3
 def opselLT : ℕ := 4
 def opselSHIFT : ℕ := 5
+def opselMUL : ℕ := 7
 
 end LambdaVM
