@@ -33,9 +33,9 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
 - `LambdaVM/Buses/` — the buses that are not static tables. `Alu.lean` is the
   unified ALU bus: message layout as in `BusId::Alu`, the caller's `IS_WORD`
   assumptions on both operands as hypotheses, and one `Guarantees` clause per
-  `opsel` (LT, EQ, SHIFT and the toy MIN of the counted-pulls PoC). The flag
-  byte is read as a natural, so a chip pushing with one `opsel` discharges the
-  other clauses by `omega`.
+  `opsel` (AND, OR and XOR for BYTEWISE, then EQ, LT, SHIFT and the toy MIN of
+  the counted-pulls PoC). The flag byte is read as a natural, so a chip pushing
+  with one `opsel` discharges the other clauses by `omega`.
 - `LambdaVM/Tables/` — one file per chip. `Bitwise.lean` transcribes the
   precomputed row function of `prover/src/tables/bitwise.rs` and defines each bus
   the table serves as a `StaticLookupChannel` (read through `toChannel`), with
@@ -68,6 +68,17 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   overrides) and concludes `shiftResult`. `Shift.lean` mirrors the 22 constraints
   and 17 interactions of `shift.rs` and proves soundness and completeness, the
   latter for both the honest active row and the padding row.
+- `LambdaVM/Tables/Bytewise.lean` — the BYTEWISE chip: `AND`, `OR` and `XOR` of
+  two 64-bit operands, looked up one byte triple at a time in `BYTE_ALU` with a
+  common `op` and pushed on the `ALU` bus with the operands re-limbed to
+  `DWordWL`. `Bits.compose` is the arithmetic behind the re-limbing: an
+  operation that acts on each bit independently commutes with reading bytes as a
+  little-endian number, so the eight byte results assemble into the operation on
+  the whole values. `op` is never constrained — `BYTE_ALU` only has rows for the
+  three operations, so the lookup is the range check — and the operand bytes are
+  not assumed either, since that same guarantee supplies them, which is why
+  soundness needs no assumption at all. `IS_BYTE[μ]` is a constraint of the chip,
+  which is what makes the eight pulls counted pulls of multiplicity at most 255.
 - `LambdaVM/Tables/MinToy.lean` — MIN, a toy ALU operation with the shape of
   DVRM: it pulls an LT result on the ALU bus and pushes its own result on the
   same bus. Not an RV64IM operation; it stands in for DVRM until DVRM is
@@ -115,6 +126,12 @@ Result on `main` after that merge, 2026-10-28:
 - SHIFT: 22 constraints and 17 interactions, exact match.
 - LT: 6 constraints and 10 interactions, exact match, with `μ` a byte as in
   `lt.rs`.
+- BYTEWISE: 0 constraints and 10 interactions, over 26 columns. `Export.lean`
+  emits `export/bytewise.json`, and the column count and the three buses agree
+  with `bytewise.rs` (`cols::NUM_COLUMNS = 26`, `BusId::AreBytes`,
+  `BusId::ByteAlu`, `BusId::Alu`). The `lean_diff_bytewise` test that would
+  compare the constraints row by row is not written yet, so this chip is the one
+  entry above whose match is by inspection rather than by the differential check.
 
 The check compares polynomials, not zero sets: it caught `μ·(μ − 1)` versus
 `μ·(1 − μ)` in EQ, which is why the Lean bit constraints use the spec's form.
@@ -212,8 +229,13 @@ Nothing else uses it.
 
 ## Known differences from the Rust prover
 
-- Every chip whose `μ` the spec types as `Byte` (MUL, DVRM, BRANCH, BYTEWISE)
-  needs the counted treatment LT got above; none of them is modelled yet.
+- Every chip whose `μ` the spec types as `Byte` needs the counted treatment LT
+  got above. BYTEWISE has it; MUL, DVRM and BRANCH are not modelled yet.
+- `bytewise.toml` is one of the files where the `spec/` copy in this repository
+  and `spec/main` disagree in substance, not only in wording: here `μ` is still
+  typed `BaseField` with no range check, while the branch types it `Byte` and
+  adds `IS_BYTE[μ]`. The model follows the branch, because an unbounded `μ` on
+  the pull side admits no sound bound for counted pulls at all.
 - The `spec/` copy in this repository lags the `spec/main` branch; the spec the
   models follow is the branch (EQ's `μ` is `Bit` with `IS_BIT[μ]` there).
 
