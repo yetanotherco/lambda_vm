@@ -515,7 +515,10 @@ theorem soundness :
       fun hflags => by
         exfalso; rw [hflagsV] at hflags; have : opselOR = 1 := rfl; omega,
       fun hflags => by
-        exfalso; rw [hflagsV] at hflags; have : opselXOR = 2 := rfl; omega⟩
+        exfalso; rw [hflagsV] at hflags; have : opselXOR = 2 := rfl; omega,
+      -- nor MUL: 7 (mod 32) against opsel(SHIFT) + w ≡ 5 or 6
+      fun ls rs hg hls hrs hhg hflags => by
+        exfalso; rw [hflagsV] at hflags; have : opselMUL = 7 := rfl; omega⟩
     · -- not LT: 5 + w + 32 s + 64 d ≠ 4 + 32 s' + 64 i (mod 32)
       intro s i hs hi hflags
       exfalso; rw [hflagsV] at hflags; simp only [opselLT] at hflags; omega
