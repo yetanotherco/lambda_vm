@@ -261,9 +261,10 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
         .collect();
     let rust_interacts_unmatched = ri.iter().map(|&j| interactions[j].bus_id).collect();
 
-    // Every Lean constraint with a Rust counterpart vanishes on the honest trace. The
-    // Lean-only ones are the documented deltas (LT's `μ·(1 − μ)` does not hold on a
-    // deduplicated Rust row with `μ > 1`).
+    // Every Lean constraint with a Rust counterpart vanishes on the honest trace. There are no
+    // Lean-only constraints left: LT's `μ·(1 − μ)` became a pull of `ARE_BYTES[μ, 0]`, as in
+    // `lt.rs`, and every test below asserts that both unmatched lists are empty. The skip is kept
+    // for the next table added here, which may land before its Rust side does.
     for (r, row) in honest_rows.iter().enumerate() {
         for (i, e) in lean.asserts.iter().enumerate() {
             if lean_asserts_unmatched.contains(&i) {

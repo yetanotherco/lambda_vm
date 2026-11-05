@@ -95,10 +95,10 @@ For each table the test evaluates the Lean asserts and the Rust `ConstraintSet`
 on 64 random rows and matches them as multisets of functions, does the same for
 the interactions (bus id, signed multiplicity, message elements), and checks
 that every Lean constraint vanishes on honest traces from `generate_*_trace`,
-padding rows included; the Lean-only constraints of the documented deltas are
-skipped there. The sign of an interaction comes from its direction: a Rust
-sender is Clean's pull and counts `−m`, a receiver is Clean's push and counts
-`+m`.
+padding rows included. Each test asserts that all four unmatched lists are
+empty: no table has a Lean-only or a Rust-only constraint or interaction left.
+The sign of an interaction comes from its direction: a Rust sender is Clean's
+pull and counts `−m`, a receiver is Clean's push and counts `+m`.
 
 The models follow the multiplicity constraints of PR #1016, merged 2026-10-23.
 Result on `main` after that merge, 2026-10-28:
