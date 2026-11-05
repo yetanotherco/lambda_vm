@@ -21,10 +21,16 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   and `SIGN`. A newer spec than the one under `spec/` declares three more,
   `REG`, `REGW` and `IS_WHH`, which cannot be modelled until their dependencies
   are: `REG` and `REGW` read `MEMW`, and `IS_WHH` reads `IS_WH`. `sign` and
-  `neg` have no caller yet: the chips that use them (`dvrm`, `cpu32`, `mul`) are
-  not modelled, and `shift` reads `MSB16` directly rather than through `SIGN`.
+  `neg`: `sign` has its first caller in MUL, while `neg` still has none, since
+  `dvrm` is the only modelled-adjacent chip that uses it and DVRM is not written
+  yet. `shift` reads `MSB16` directly rather than through `SIGN`, which is what
+  `shift.toml` asks for.
 - `LambdaVM/AluOp.lean` — the `alu_op` descriptors of `types.rs`, one enumeration
   for the `opsel` of BYTE_ALU and the low bits of the ALU flag byte.
+- `LambdaVM/Mu.lean` — the bound every counted pull uses, one constant for the
+  model rather than one per chip, because `Channel.counted N` is a different
+  channel for each `N`. Its value is twice `u8::MAX`, the largest multiplicity a
+  chip adds up, which is MUL's `μ_lo + μ_hi`.
 - `LambdaVM/StaticLookup.lean` — `StaticLookupChannel`: a table the verifier
   knows, given as a list of rows, with `guarantees_iff` relating the list to the
   semantic reading of a row, and `toChannel` for the components that read it.
@@ -33,7 +39,7 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
 - `LambdaVM/Buses/` — the buses that are not static tables. `Alu.lean` is the
   unified ALU bus: message layout as in `BusId::Alu`, the caller's `IS_WORD`
   assumptions on both operands as hypotheses, and one `Guarantees` clause per
-  `opsel` (AND, OR and XOR for BYTEWISE, then EQ, LT and SHIFT). The flag byte
+  `opsel` (AND, OR and XOR for BYTEWISE, then EQ, LT, SHIFT and MUL). The flag byte
   is read as a natural, so a chip pushing with one `opsel` discharges the other
   clauses by `omega`.
 - `LambdaVM/Tables/` — one file per chip. `Bitwise.lean` transcribes the
@@ -78,6 +84,18 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   not assumed either, since that same guarantee supplies them, which is why
   soundness needs no assumption at all. `IS_BYTE[μ]` is a constraint of the chip,
   which is what makes the eight pulls counted pulls of multiplicity at most 255.
+- `LambdaVM/Tables/MulCore.lean` and `Mul.lean` — the MUL chip, the 128-bit
+  product of two 64-bit operands, each read as signed or unsigned by its own
+  flag, so one chip serves `MUL`, `MULH`, `MULHU` and `MULHSU`. `MulCore` is the
+  arithmetic on naturals, the way `ShiftCore` is for SHIFT: the schoolbook
+  convolution of the two operands over sixteen 16-bit halves after sign
+  extension, with the terms at or above `2^128` named rather than left implicit,
+  the `2^51` bound on each `raw_product` limb, and both directions of the
+  four-step carry chain. `Mul.lean` is the translation between a row and those
+  statements. The two `SIGN` templates give the sign bits that make the upper
+  four halves two's complement; the row pushes two `ALU` messages for one
+  product, `high = 0` for `lo` and `high = 1` for `hi`, and every range check
+  fires with `μ_lo + μ_hi`, which is what sets the model's counted-pull bound.
 
 ## Lessons for big chips (from SHIFT)
 
@@ -98,7 +116,8 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
 The Lean circuits are hand transcriptions of `prover/src/tables/*.rs`. The check
 that they are the same polynomials and the same bus interactions is mechanical:
 
-1. `lake env lean --run LambdaVM/Export.lean` writes `export/{lt,eq,shift}.json`:
+1. `lake env lean --run LambdaVM/Export.lean` writes
+   `export/{lt,eq,shift,bytewise,mul}.json`:
    every `assert` as an expression tree and every `interact` with its channel,
    direction, multiplicity and message, variables numbered in Rust column order.
    Multiplicities are nonnegative; the direction carries the sign.
@@ -125,6 +144,12 @@ Result on `main` after that merge, 2026-10-28:
   `lean_diff_bytewise` feeds repeated operations so the rows carry `μ > 1` and
   one of them crosses `MU_MAX` into two rows, which is the only way to exercise
   the counted pull this chip is built on.
+- MUL: 8 constraints and 25 interactions, over 26 columns. The column count, the
+  eight constraints in the order `mul.rs` emits them (`IS_BIT` on each sign flag,
+  `(1 − signed)·is_negative` for each, then the four `raw_product` convolutions)
+  and the interaction split (`ARE_BYTES` once, `IS_HALF` sixteen times, `MSB16`
+  twice, `IS_B20` four times, `ALU` twice) all agree with `mul.rs`.
+  `lean_diff_mul` is not written yet, so this one is by inspection.
 
 The check compares polynomials, not zero sets: it caught `μ·(μ − 1)` versus
 `μ·(1 − μ)` in EQ, which is why the Lean bit constraints use the spec's form.
@@ -133,7 +158,7 @@ The check compares polynomials, not zero sets: it caught `μ·(μ − 1)` versus
 `formal/`, re-runs the export and fails if it differs, on every PR that touches
 `formal/`.
 
-## Counted pulls (`μ ∈ [0, 255]`)
+## Counted pulls
 
 After PR #1016 a deduplicated row pulls its range checks with multiplicity `μ`,
 `μ` a byte. Clean's typed channel grants the guarantee to a pull of multiplicity
@@ -179,11 +204,14 @@ Clean main `f3abad7c` plus three commits: `Balance.logUpUpTo N` with
 `Ensemble.tableSoundness_of_staged` / `_stagedOn` (soundness by finishing
 order of channels, and of message classes within a channel). On top of it:
 
-- `Tables/Lt.lean` pulls `IS_HALF` and `MSB16` with multiplicity `μ` through
-  `Channel.counted 255`, bounded by its own pull of `ARE_BYTES[μ, 0]`, exactly
-  as `lt.rs`.
-- `Tables/Bytewise.lean` pulls `BYTE_ALU` eight times with multiplicity `μ`
-  through `Channel.counted 255`, bounded by its own `IS_BYTE[μ]` constraint.
+- `Tables/Lt.lean` pulls `IS_HALF` and `MSB16` with multiplicity `μ`, bounded by
+  its own pull of `ARE_BYTES[μ, 0]`, exactly as `lt.rs`.
+- `Tables/Bytewise.lean` pulls `BYTE_ALU` eight times with multiplicity `μ`,
+  bounded by its own `IS_BYTE[μ]` constraint.
+- `Tables/Mul.lean` pulls `IS_HALF` sixteen times and `IS_B20` four times with
+  `μ_lo + μ_hi`, bounded by its own `ARE_BYTES[μ_lo, μ_hi]`. This is the chip
+  that fixes `LambdaVM.muMax` at `2 * 255`: the bound is shared, so LT and
+  BYTEWISE pull through the same channel even though their own `μ` is a byte.
 - `Ensembles/LtStaged.lean` proves `tableSoundness`, that is
   `Ensemble.TableSoundness (Balance.logUpUpTo 255)` for the LT ensemble,
   finishing `ARE_BYTES` before the counted `IS_HALF` and `MSB16` and those
