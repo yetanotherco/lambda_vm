@@ -116,7 +116,7 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   reach that many components; the flattened order is unchanged, so it is still
   the column order of `dvrm.rs`.
 
-## Lessons for big chips (from SHIFT)
+## Lessons for big chips (from SHIFT, MUL and DVRM)
 
 - Precompute the `ElaboratedCircuit` instance (`instance elaborated := by
   elaborate_circuit`) and pass it explicitly; without it every proof of a
@@ -129,6 +129,23 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   budget while abstracting the proof terms.
 - `rw ... at h` closes goals by `rfl`; a following `simp`/`ring` then fails with
   "no goals". Guard with `try` where the rewrite may already close the goal.
+- Clean's `doc/performance-problems.md` is the catalogue for elaboration and
+  kernel blowups, and DVRM hit two of its items hard enough to be worth naming.
+  Item 7, `have` over `obtain ⟨..⟩ :=` on a big conjunction, is a *kernel*
+  failure here, not only a slow one: destructuring the result of a large
+  application gave `(kernel) deep recursion detected` with no failing tactic,
+  while `have h := …` and then `h.1` / `h.2` went through unchanged.
+- Item 9, keeping powers opaque to `omega`, costs more than it looks. The four
+  limb equations of a DVRM row are 32-bit facts, but with the `% 2^128` equation
+  still in scope one declaration went from 15 seconds to over twenty minutes.
+  `clear` the wide hypotheses before calling `omega`, which is why the soundness
+  proof clears so aggressively.
+- `simp` can build a proof term the elaborator accepts and the kernel rejects.
+  On DVRM's nested `if`s — the division-by-zero and remainder cases — it reported
+  the failure at the declaration header with no line to blame; rewriting the
+  same steps with the primitive `ite_eq_left` and `ite_eq_right` removed it.
+  When a kernel error has no obvious source, bisect by moving a closing `sorry`
+  through the proof: the elaborator reports nothing.
 
 ## Differential check against the Rust prover
 
