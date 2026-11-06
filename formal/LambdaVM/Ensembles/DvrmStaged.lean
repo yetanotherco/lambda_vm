@@ -475,4 +475,89 @@ theorem dvrm_requirementsAfter_zero {earlier : List (RawChannel (F p))}
     | exact eq_zero_or_countUpTo hsigns.2.1
     | exact eq_zero_or_countUpTo hsigns.2.2
 
+/-! ### The `ALU` bus, by message class
+
+`DVRM` is the chip the split exists for. It pulls `LT` and `MUL` answers off `ALU` and pushes
+`DIVREM` answers back onto it, so a finishing order over whole channels cannot hold it: the bus
+would have to be finished before itself. With the two classes, `DIVREM` finishes last and the
+queries it borrows are already done by then. -/
+
+/-- Reading a stage's obligation one row and one interaction at a time, which is the form the
+chip's own `circuit_norm` normalizes to. `Table.RequirementsOn` quantifies over the interactions
+of the whole table; `Table.forall_interactionsWith_iff` turns that into rows times the component's
+own operations, and `AbstractInteraction.eval_requirements` carries the requirement back. -/
+theorem requirementsAfterOn_of_rows {component : Component (F p)} {stage : Stage (F p)}
+    {earlier : List (Stage (F p))}
+    (h : ∀ table : Table (F p), table.component = component → table.Assumptions →
+      table.Constraints →
+      (∀ s ∈ earlier, table.GuaranteesOn s) →
+      ∀ row ∈ table.table, ∀ i ∈ component.rowOperations.interactions,
+        i.channel = stage.channel →
+        stage.cls ((i.eval (table.environment row)).msg) = true →
+        i.Requirements (table.environment row)) :
+    component.RequirementsAfterOn stage earlier := by
+  rintro table rfl assumptions constraints guarantees
+  show ∀ i ∈ table.interactionsWith stage.channel, _
+  rw [Table.forall_interactionsWith_iff]
+  intro row hrow i hi hchan hcls
+  rw [Component.interactions_eq] at hi
+  exact AbstractInteraction.eval_requirements.mpr
+    (h table rfl assumptions constraints guarantees row hrow i hi hchan hcls)
+
+/-- The class of an `ALU` message is read off its fifth element, and `Vector` append does not
+reduce on its own: `simp` cannot even rewrite under the index, because flattening the append
+changes the type. The five `rw`s walk the `ProvableStruct` one field at a time, which is the
+only step here that is not bookkeeping. -/
+lemma isDivrem_emitted (env : Environment (F p)) (N : ℕ) (ch : Channel (F p) Alu.Msg)
+    (mult a b c d fl e g : Expression (F p)) :
+    IsDivrem (AbstractInteraction.eval env
+      (Channel.emittedUpTo N ch mult ⟨a, b, c, d, fl, e, g⟩)).msg
+      = divremFlags.contains (Expression.eval env fl) := by
+  simp [IsDivrem, AbstractInteraction.eval, Channel.emittedUpTo, circuit_norm,
+    explicit_provable_type]
+  rw [Vector.getElem_append_right (by omega) (by omega),
+      Vector.getElem_append_right (by omega) (by omega),
+      Vector.getElem_append_right (by omega) (by omega),
+      Vector.getElem_append_right (by omega) (by omega),
+      Vector.getElem_append_left (by omega)]
+  simp
+
+/-- DVRM owes nothing on the queries it borrows beyond the bound every counted pull owes. Its
+three `ALU` pulls carry `mu`, so `ARE_BYTES` covers them; its two pushes are not in this class at
+all, because their opcode is `8 + 32 * signed (+ 128)` and the chip constrains `signed` to a bit,
+which puts all four possible opcodes in `DIVREM`'s class. That is the whole content: the pushes
+are deferred to the stage where everything they need is finished. -/
+theorem dvrm_stageQuery {earlier : List (Stage (F p))}
+    (h_ab : ({ channel := Bitwise.AreBytes.toRaw } : Stage (F p)) ∈ earlier) :
+    dvrmComponent.RequirementsAfterOn stageQuery earlier := by
+  apply requirementsAfterOn_of_rows
+  intro table h_comp _ constraints guarantees row hrow i hi hchan hcls
+  have gab : table.ChannelGuarantees Bitwise.AreBytes.toRaw :=
+    (Table.channelGuarantees_iff_forall _ _).mpr fun j hj => guarantees _ h_ab j hj rfl
+  have g := gab row hrow
+  have hc := constraints row hrow
+  rw [h_comp] at g hc
+  rw [Component.constraintsHold_iff] at hc
+  simp only [Component.channelGuarantees_iff] at g
+  simp only [Component.rowOperations, dvrmComponent, DVRM.circuit] at hc g
+  have hflags := DVRM.flags_of_constraints hc
+  clear hc
+  simp only [stageQuery] at hchan hcls
+  dvrm_norm at g
+  have hm := mul_mu_count g.1.1 g.1.2
+  dvrm_norm at hi
+  repeat' rcases hi with rfl | hi
+  -- the twenty-nine interactions on other buses
+  all_goals try (simp only [circuit_norm] at hchan
+                 refine absurd hchan ?_
+                 channel_ne
+                 done)
+  -- the three pulls, bounded by `ARE_BYTES`
+  all_goals try (simp only [circuit_norm]; exact hm)
+  -- the two pushes, which this stage does not see
+  all_goals (exfalso
+             rw [isDivrem_emitted] at hcls
+             rcases hflags.1 with h | h <;>
+               simp (config := { decide := true }) [circuit_norm, divremFlags, h] at hcls)
+
 end LambdaVM.Ensembles.DvrmStaged
