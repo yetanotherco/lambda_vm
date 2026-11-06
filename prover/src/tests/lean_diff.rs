@@ -486,3 +486,52 @@ fn lean_diff_shift() {
         "[SHIFT] interactions differ"
     );
 }
+
+#[test]
+fn lean_diff_bytewise() {
+    use crate::tables::bytewise::{
+        BytewiseOperation, bus_interactions, cols, generate_bytewise_trace,
+    };
+    use crate::tables::types::alu_op;
+    use stark::constraints::builder::EmptyConstraints;
+    const OPS: [u8; 3] = [alu_op::AND, alu_op::OR, alu_op::XOR];
+    let mut rng = SplitMix64(0x2B);
+    let mut ops = Vec::new();
+    for &a in &EDGE {
+        for &b in &EDGE {
+            for op in OPS {
+                ops.push(BytewiseOperation::new(a, b, op));
+            }
+        }
+    }
+    for _ in 0..512 {
+        ops.push(BytewiseOperation::new(
+            rng.next_u64(),
+            rng.next_u64(),
+            OPS[(rng.next_u64() % 3) as usize],
+        ));
+    }
+    // Repeats, so `dedup_rows` sums multiplicities and the rows carry `μ > 1`: the counted pull
+    // is the whole point of this chip, and a trace of distinct operations never exercises it. The
+    // 300 copies also cross `MU_MAX`, so one operation becomes two rows, `μ = 255` and `μ = 45`.
+    for _ in 0..300 {
+        ops.push(BytewiseOperation::new(0xDEAD_BEEF, 0x0123_4567, alu_op::XOR));
+    }
+    let trace = generate_bytewise_trace(&ops);
+    let report = compare(
+        "BYTEWISE",
+        &load_lean("bytewise"),
+        &EmptyConstraints,
+        &bus_interactions(),
+        cols::NUM_COLUMNS,
+        &rows_of(&trace, cols::NUM_COLUMNS),
+    );
+    assert!(
+        report.lean_asserts_unmatched.is_empty() && report.rust_constraints_unmatched.is_empty(),
+        "[BYTEWISE] constraints differ"
+    );
+    assert!(
+        report.lean_interacts_unmatched.is_empty() && report.rust_interacts_unmatched.is_empty(),
+        "[BYTEWISE] interactions differ"
+    );
+}

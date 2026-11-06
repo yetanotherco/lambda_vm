@@ -1,7 +1,7 @@
 {"operations":
  [{"interact":
    {"multiplicity": {"value": 1, "type": "const"},
-    "message": [{"value": 0, "type": "const"}, {"type": "var", "index": 25}],
+    "message": [{"type": "var", "index": 25}, {"value": 0, "type": "const"}],
     "direction": "pull",
     "channel": "ARE_BYTES"}},
   {"interact":
