@@ -3,7 +3,7 @@
 //! passed it and handed it out, when a walker walked it (and how much of that
 //! went on seeding its entries) and when it was absorbed; for the first streamed chunks, when each was handed out, laid
 //! out and placed; for every streamed chunk, the layout's seconds by table;
-//! and when the card's early setup ended (`LAMBDA_VM_BLOCK_CARD_EARLY`).
+//! and when the card's early setup ended.
 //! Seconds since the prove started, printed as phase A ends. A measurement:
 //! the proof is the same, and with the knob off nothing is recorded.
 

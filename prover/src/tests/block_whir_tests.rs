@@ -1207,9 +1207,8 @@ fn the_head_log_stamps_the_head_and_moves_no_byte() {
         assert!(head[0].starts_with("BLOCK HEAD WINDOWS: "), "{what}");
         assert!(head[1].starts_with("BLOCK HEAD CHUNKS: "), "{what}");
         assert!(head[2].starts_with("BLOCK HEAD TABLES: "), "{what}");
-        // The card is set up as the prove starts by default
-        // (`LAMBDA_VM_BLOCK_CARD_EARLY`); a build without its kernels sets
-        // up nothing.
+        // The card is set up as the prove starts; a build without its
+        // kernels sets up nothing.
         if cfg!(feature = "cuda") {
             assert!(
                 head[3].starts_with("BLOCK HEAD CARD: set up at ")
