@@ -77,84 +77,36 @@ pub struct Kernels {
     pub grind_w8: CudaFunction,
 }
 
-/// Whether the Poseidon1 kernels run the lean permutation
-/// (`LAMBDA_VM_P1_LEAN`; on by default, `=0` turns it off): the `_lean` twins
-/// of the WHIR coset leaves, the column leaves and the 4-ary levels load in
-/// their twins' places, with the same bytes in the same slots. Read once, when
-/// the kernels first load.
-pub fn lean() -> bool {
-    static LEAN: OnceLock<bool> = OnceLock::new();
-    *LEAN.get_or_init(|| lean_setting(std::env::var("LAMBDA_VM_P1_LEAN").ok().as_deref()))
-}
-
-/// `LAMBDA_VM_P1_LEAN`'s value read: empty, `0` or `off` load the plain
-/// kernels; anything else (unset included) the lean twins.
-pub fn lean_setting(value: Option<&str>) -> bool {
-    !matches!(value.map(str::trim), Some("" | "0" | "off"))
-}
-
-/// Load the kernels once, under [`lean`].
+/// Load the kernels once.
 pub fn kernels() -> Result<&'static Kernels> {
     static KERNELS: OnceLock<Kernels> = OnceLock::new();
     if let Some(k) = KERNELS.get() {
         return Ok(k);
     }
-    let lean = lean();
-    let k = load_kernels(lean)?;
-    if lean {
-        eprintln!(
-            "[gpu] Poseidon1 kernels: the lean twins (the default; LAMBDA_VM_P1_LEAN=0 loads the plain ones)"
-        );
-    }
+    let k = load_kernels()?;
     Ok(KERNELS.get_or_init(|| k))
 }
 
-/// The kernel set, loaded afresh: the lean twins where they exist when `lean`,
-/// today's kernels otherwise. [`kernels`] caches one; the parity tests hold
-/// both.
-pub fn load_kernels(lean: bool) -> Result<Kernels> {
+/// The kernel set, loaded afresh. [`kernels`] caches one.
+pub fn load_kernels() -> Result<Kernels> {
     let be = backend()?;
     let module = be.ctx.load_module(Ptx::from_binary(P1W16_CUBIN.to_vec()))?;
-    let twin = |name: &str| {
-        if lean {
-            format!("{name}_lean")
-        } else {
-            name.to_string()
-        }
-    };
     Ok(Kernels {
-        leaves_cols_row: module.load_function(&twin("p1s_leaves_cols_row"))?,
-        leaves_cols_pair: module.load_function(&twin("p1s_leaves_cols_pair"))?,
+        leaves_cols_row: module.load_function("p1s_leaves_cols_row")?,
+        leaves_cols_pair: module.load_function("p1s_leaves_cols_pair")?,
         leaves_rm_pair: module.load_function("p1s_leaves_rm_pair")?,
         leaves_rm_row: module.load_function("p1s_leaves_rm_row")?,
         fri_group_leaves: module.load_function("p1s_fri_group_leaves")?,
-        leaves_base_coset: module.load_function(&twin("p1s_leaves_base_coset"))?,
-        leaves_base_coset_rev: module.load_function(&twin("p1s_leaves_base_coset_rev"))?,
-        leaves_base_coset_joint: module.load_function(&twin("p1s_leaves_base_coset_joint"))?,
-        leaves_ext3_coset: module.load_function(&twin("p1s_leaves_ext3_coset"))?,
-        merkle_level4: module.load_function(&twin("p1s_merkle_level4"))?,
-        merkle_tail4: module.load_function(&twin("p1s_merkle_tail4"))?,
+        leaves_base_coset: module.load_function("p1s_leaves_base_coset")?,
+        leaves_base_coset_rev: module.load_function("p1s_leaves_base_coset_rev")?,
+        leaves_base_coset_joint: module.load_function("p1s_leaves_base_coset_joint")?,
+        leaves_ext3_coset: module.load_function("p1s_leaves_ext3_coset")?,
+        merkle_level4: module.load_function("p1s_merkle_level4")?,
+        merkle_tail4: module.load_function("p1s_merkle_tail4")?,
         gather_paths4: module.load_function("p1s_gather_paths4")?,
         grind_w8: module.load_function("p1s_grind_w8")?,
         _module: module,
     })
-}
-
-#[cfg(test)]
-mod lean_setting_tests {
-    use super::lean_setting;
-
-    /// The lean twins unless the knob says `0`, `off` or nothing.
-    #[test]
-    fn the_lean_kernels_load_unless_zero() {
-        assert!(lean_setting(None), "the default is the lean twins");
-        assert!(lean_setting(Some("1")));
-        assert!(lean_setting(Some("on")));
-        assert!(!lean_setting(Some("0")));
-        assert!(!lean_setting(Some(" 0 ")));
-        assert!(!lean_setting(Some("off")));
-        assert!(!lean_setting(Some("")));
-    }
 }
 
 pub(crate) fn launch_cfg(threads: u64) -> LaunchConfig {

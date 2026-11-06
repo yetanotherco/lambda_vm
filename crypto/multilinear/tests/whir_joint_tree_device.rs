@@ -6,7 +6,6 @@
 //!
 //! ```text
 //! cargo test --release -p multilinear --features cuda,parallel --test whir_joint_tree_device -- --test-threads=1
-//! LAMBDA_VM_P1_LEAN=1 cargo test --release -p multilinear --features cuda,parallel --test whir_joint_tree_device -- --test-threads=1
 //! ```
 //!
 //! Needs a GPU. The tests flip process-wide knobs, so they run one at a time.

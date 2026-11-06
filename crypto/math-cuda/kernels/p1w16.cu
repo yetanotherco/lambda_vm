@@ -43,7 +43,7 @@
 //   V = 3  the Grain Cauchy MDS alternative (`permute_cauchy`: dense full
 //          rounds, the paper's sparse partial rounds, V = 1's multiply);
 //   V = 4  V = 2 with leaner addition chains (`permute_fourier_lean`); the
-//          production kernels' `_lean` twins run it (`LAMBDA_VM_P1_LEAN`, on by default).
+//          production column leaves, WHIR coset leaves and 4-ary levels run it.
 // Every variant computes the same field values and `permute` canonicalises.
 //
 // ZISK'S INSTANCE (stage P1 of the Poseidon1 base STARK, at the end of the
@@ -1055,27 +1055,9 @@ __device__ __forceinline__ void load_be(const uint8_t *node, uint64_t *d) {
 }
 
 // Parent `p` of the level at `child_off` (`n_children` nodes), written at
-// `parent_off + p`.
+// `parent_off + p`, under the lean permutation (`p1w16::permute_fourier_lean`).
 __device__ __forceinline__ void parent4(uint8_t *nodes, uint64_t child_off, uint64_t n_children,
                                         uint64_t parent_off, uint64_t p) {
-    uint64_t s[p1w16::WIDTH];
-#pragma unroll
-    for (int c = 0; c < 4; ++c) {
-        const uint64_t idx = 4 * p + (uint64_t)c;
-        if (idx < n_children) {
-            load_be(nodes + (child_off + idx) * 32, s + 4 * c);
-        } else {
-#pragma unroll
-            for (int i = 0; i < p1w16::DIGEST; ++i) s[4 * c + i] = 0;
-        }
-    }
-    p1w16::permute<2>(s);
-    store_be(s, nodes + (parent_off + p) * 32);
-}
-
-// `parent4` under the lean permutation (the `_lean` twins below).
-__device__ __forceinline__ void parent4_lean(uint8_t *nodes, uint64_t child_off, uint64_t n_children,
-                                             uint64_t parent_off, uint64_t p) {
     uint64_t s[p1w16::WIDTH];
 #pragma unroll
     for (int c = 0; c < 4; ++c) {
@@ -1104,7 +1086,7 @@ extern "C" __global__ void p1s_leaves_cols_row(const uint64_t *__restrict__ cols
     if (tid >= num_rows) return;
     const uint64_t br = __brevll(tid) >> (64 - log_num_rows);
     uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<2, true>(
+    p1w16::zisk_leaf<4, true>(
         num_cols, [&](uint64_t c) { return cols[c * col_stride + br]; }, d);
     p1s::store_be(d, out + tid * 32);
 }
@@ -1121,7 +1103,7 @@ extern "C" __global__ void p1s_leaves_cols_pair(const uint64_t *__restrict__ col
     const uint64_t br0 = __brevll(2 * tid) >> (64 - log_num_rows);
     const uint64_t br1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
     uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<2, true>(
+    p1w16::zisk_leaf<4, true>(
         2 * num_cols,
         [&](uint64_t i) {
             return i < num_cols ? cols[i * col_stride + br0] : cols[(i - num_cols) * col_stride + br1];
@@ -1188,7 +1170,7 @@ extern "C" __global__ void p1s_leaves_base_coset(const uint64_t *__restrict__ co
     uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_leaves) return;
     uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<2, true>(
+    p1w16::zisk_leaf<4, true>(
         block, [&](uint64_t i) { return codeword[tid + i * num_leaves]; }, d);
     p1s::store_be(d, out + tid * 32);
 }
@@ -1205,7 +1187,7 @@ extern "C" __global__ void p1s_leaves_base_coset_rev(const uint64_t *__restrict_
     uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_leaves) return;
     uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<2, true>(
+    p1w16::zisk_leaf<4, true>(
         block, [&](uint64_t i) { return codeword[tid + i * num_leaves]; }, d);
     const uint64_t at = leaf_bits == 0 ? tid : (__brevll(tid) >> (64 - leaf_bits));
     p1s::store_be(d, out + at * 32);
@@ -1225,7 +1207,7 @@ extern "C" __global__ void p1s_leaves_base_coset_joint(
     if (tid >= num_leaves) return;
     const uint64_t mask = (1ull << log_block) - 1;
     uint64_t d[p1w16::DIGEST];
-    p1w16::joint_leaf<2>(
+    p1w16::joint_leaf<4>(
         blocks << log_block, blocks,
         [&](uint64_t i) {
             const uint64_t p = i >> log_block;
@@ -1243,7 +1225,7 @@ extern "C" __global__ void p1s_leaves_ext3_coset(const uint64_t *__restrict__ co
     uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_leaves) return;
     uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<2, true>(
+    p1w16::zisk_leaf<4, true>(
         3 * block,
         [&](uint64_t i) { return codeword[(tid + (i / 3) * num_leaves) * 3 + i % 3]; }, d);
     p1s::store_be(d, out + tid * 32);
@@ -1266,128 +1248,6 @@ extern "C" __global__ void p1s_merkle_tail4(uint8_t *nodes, uint64_t child_off, 
         const uint64_t parent_off = child_off - n_parents;
         for (uint64_t p = threadIdx.x; p < n_parents; p += blockDim.x) {
             p1s::parent4(nodes, child_off, n_children, parent_off, p);
-        }
-        __syncthreads();
-        child_off = parent_off;
-        n_children = n_parents;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The `_lean` twins: the kernels above with the lean
-// permutation (`p1w16::permute_fourier_lean`), the same bytes in the same
-// slots. `src/p1_stark.rs` loads them in their twins' places under
-// `LAMBDA_VM_P1_LEAN` (on by default; `=0` loads the plain kernels).
-// ---------------------------------------------------------------------------
-
-extern "C" __global__ void p1s_leaves_cols_row_lean(const uint64_t *__restrict__ cols,
-                                                    uint64_t col_stride, uint64_t num_cols,
-                                                    uint64_t num_rows, uint64_t log_num_rows,
-                                                    uint8_t *__restrict__ out) {
-    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_rows) return;
-    const uint64_t br = __brevll(tid) >> (64 - log_num_rows);
-    uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<4, true>(
-        num_cols, [&](uint64_t c) { return cols[c * col_stride + br]; }, d);
-    p1s::store_be(d, out + tid * 32);
-}
-
-extern "C" __global__ void p1s_leaves_cols_pair_lean(const uint64_t *__restrict__ cols,
-                                                     uint64_t col_stride, uint64_t num_cols,
-                                                     uint64_t num_rows, uint64_t log_num_rows,
-                                                     uint8_t *__restrict__ out) {
-    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_rows / 2) return;
-    const uint64_t br0 = __brevll(2 * tid) >> (64 - log_num_rows);
-    const uint64_t br1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
-    uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<4, true>(
-        2 * num_cols,
-        [&](uint64_t i) {
-            return i < num_cols ? cols[i * col_stride + br0] : cols[(i - num_cols) * col_stride + br1];
-        },
-        d);
-    p1s::store_be(d, out + tid * 32);
-}
-
-extern "C" __global__ void p1s_leaves_base_coset_lean(const uint64_t *__restrict__ codeword,
-                                                      uint64_t num_leaves, uint64_t block,
-                                                      uint8_t *__restrict__ out) {
-    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_leaves) return;
-    uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<4, true>(
-        block, [&](uint64_t i) { return codeword[tid + i * num_leaves]; }, d);
-    p1s::store_be(d, out + tid * 32);
-}
-
-extern "C" __global__ void p1s_leaves_base_coset_rev_lean(const uint64_t *__restrict__ codeword,
-                                                          uint64_t num_leaves, uint64_t block,
-                                                          uint32_t leaf_bits,
-                                                          uint8_t *__restrict__ out) {
-    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_leaves) return;
-    uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<4, true>(
-        block, [&](uint64_t i) { return codeword[tid + i * num_leaves]; }, d);
-    const uint64_t at = leaf_bits == 0 ? tid : (__brevll(tid) >> (64 - leaf_bits));
-    p1s::store_be(d, out + at * 32);
-}
-
-// The JOINT WHIR coset leaves of a grouped run (`whir_chain::Round0Trees::One`):
-// leaf `tid` hashes block `tid` of each of `blocks` (2..=4) base codewords, in
-// slot order, end to end — `cw_p[tid + t·num_leaves]`, `t` in `[0, 2^log_block)`
-// — under the joint tag, its digest at `bitrev(tid)` over `leaf_bits` bits (at
-// `tid` when `leaf_bits` is 0). Unused codeword slots repeat `cw0` and are never
-// read. The reads are `p1s_leaves_base_coset_rev`'s, per codeword.
-extern "C" __global__ void p1s_leaves_base_coset_joint_lean(
-    const uint64_t *__restrict__ cw0, const uint64_t *__restrict__ cw1,
-    const uint64_t *__restrict__ cw2, const uint64_t *__restrict__ cw3, uint64_t blocks,
-    uint64_t num_leaves, uint32_t log_block, uint32_t leaf_bits, uint8_t *__restrict__ out) {
-    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_leaves) return;
-    const uint64_t mask = (1ull << log_block) - 1;
-    uint64_t d[p1w16::DIGEST];
-    p1w16::joint_leaf<4>(
-        blocks << log_block, blocks,
-        [&](uint64_t i) {
-            const uint64_t p = i >> log_block;
-            const uint64_t *cw = p == 0 ? cw0 : (p == 1 ? cw1 : (p == 2 ? cw2 : cw3));
-            return cw[tid + (i & mask) * num_leaves];
-        },
-        d);
-    const uint64_t at = leaf_bits == 0 ? tid : (__brevll(tid) >> (64 - leaf_bits));
-    p1s::store_be(d, out + at * 32);
-}
-
-extern "C" __global__ void p1s_leaves_ext3_coset_lean(const uint64_t *__restrict__ codeword,
-                                                      uint64_t num_leaves, uint64_t block,
-                                                      uint8_t *__restrict__ out) {
-    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_leaves) return;
-    uint64_t d[p1w16::DIGEST];
-    p1w16::zisk_leaf<4, true>(
-        3 * block,
-        [&](uint64_t i) { return codeword[(tid + (i / 3) * num_leaves) * 3 + i % 3]; }, d);
-    p1s::store_be(d, out + tid * 32);
-}
-
-extern "C" __global__ void p1s_merkle_level4_lean(uint8_t *nodes, uint64_t child_off,
-                                                  uint64_t n_children, uint64_t parent_off,
-                                                  uint64_t n_parents) {
-    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n_parents) return;
-    p1s::parent4_lean(nodes, child_off, n_children, parent_off, tid);
-}
-
-extern "C" __global__ void p1s_merkle_tail4_lean(uint8_t *nodes, uint64_t child_off,
-                                                 uint64_t n_children) {
-    while (n_children > 1) {
-        const uint64_t n_parents = (n_children + 3) / 4;
-        const uint64_t parent_off = child_off - n_parents;
-        for (uint64_t p = threadIdx.x; p < n_parents; p += blockDim.x) {
-            p1s::parent4_lean(nodes, child_off, n_children, parent_off, p);
         }
         __syncthreads();
         child_off = parent_off;

@@ -6,7 +6,7 @@
 //! `make test-p1w16-host-kat`.
 //!
 //!   cargo test -p math-cuda --release --test p1w16_device
-//!   P1W16_LOG_LEN=29 cargo test -p math-cuda --release --test p1w16_device \
+//!   cargo test -p math-cuda --release --test p1w16_device \
 //!       -- --ignored --nocapture p1w16_microbench
 
 use crypto::hash::poseidon1_w16 as host;
@@ -277,4 +277,12 @@ fn the_device_zisk_grind_returns_the_smallest_valid_nonce() {
             None
         );
     }
+}
+
+/// The kernels' ns a permutation (leaf, 4-ary node, grind) at every variant
+/// over a 2^29 codeword, `l2` beside `v2`: the `BENCH` lines. A measurement.
+#[test]
+#[ignore = "box tier: a measurement"]
+fn p1w16_microbench() {
+    p1w16::microbench(29, 7, 1 << 28).expect("microbench");
 }

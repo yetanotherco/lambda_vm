@@ -525,7 +525,7 @@ static void run_stark_kernels() {
 // LEAN (V = 4): the same permutation as V = 2 by leaner
 // addition chains. Its preconditions (every constant `add_c` adds is
 // canonical), then V = 4 against V = 2 over edge states and a raw-word sweep,
-// and the production `_lean` twins against today's kernels, byte for byte.
+// and the production coset leaves, which run it, against the V = 2 leaf.
 // ---------------------------------------------------------------------------
 
 static const uint64_t P_MOD = 0xFFFFFFFF00000001ull;
@@ -620,63 +620,35 @@ static void run_lean() {
         check(all, "lean permutation = v2 (4096 raw states)", V);
     }
 
-    // The production twins, byte for byte: coset leaves (both orders, ext3),
-    // column-row and row-pair leaves, and whole 4-ary trees (levels + tail).
+    // The production coset leaves, which run V = 4 (both orders, ext3), against
+    // the STARK leaf at V = 2 (`zisk_leaf<2, true>`) over each gathered coset.
+    // The column leaves and the 4-ary trees are pinned to ZisK's vectors in
+    // `run_stark_kernels`.
     {
         const uint64_t block = 64, num_leaves = 16, leaf_bits = 4, n = block * num_leaves;
         static uint64_t cw[64 * 16 * 3];
         uint64_t z = 0xc0de;
         for (uint64_t i = 0; i < 3 * n; ++i) cw[i] = (i % 7 == 0) ? edge[i % ne] : splitmix(z);
-        static uint8_t a[16 * 32], b[16 * 32];
-        CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) p1s_leaves_base_coset_rev(cw, num_leaves, block, leaf_bits, a);
-        CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) p1s_leaves_base_coset_rev_lean(cw, num_leaves, block, leaf_bits, b);
-        check(std::memcmp(a, b, sizeof(a)) == 0, "lean twin: coset leaves, coset order", V);
-        CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) p1s_leaves_base_coset(cw, num_leaves, block, a);
-        CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) p1s_leaves_base_coset_lean(cw, num_leaves, block, b);
-        check(std::memcmp(a, b, sizeof(a)) == 0, "lean twin: coset leaves, natural order", V);
-        CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) p1s_leaves_ext3_coset(cw, num_leaves, block, a);
-        CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) p1s_leaves_ext3_coset_lean(cw, num_leaves, block, b);
-        check(std::memcmp(a, b, sizeof(a)) == 0, "lean twin: ext3 coset leaves", V);
-        // 13 columns of 16 rows (log 4): 2 chained blocks plus a tail.
-        CUDA_HOST_FOR_EACH_THREAD(t, 16) p1s_leaves_cols_row(cw, 16, 13, 16, 4, a);
-        CUDA_HOST_FOR_EACH_THREAD(t, 16) p1s_leaves_cols_row_lean(cw, 16, 13, 16, 4, b);
-        check(std::memcmp(a, b, sizeof(a)) == 0, "lean twin: column-row leaves", V);
-        CUDA_HOST_FOR_EACH_THREAD(t, 8) p1s_leaves_cols_pair(cw, 16, 13, 16, 4, a);
-        CUDA_HOST_FOR_EACH_THREAD(t, 8) p1s_leaves_cols_pair_lean(cw, 16, 13, 16, 4, b);
-        check(std::memcmp(a, b, 8 * 32) == 0, "lean twin: row-pair leaves", V);
-        // Trees over 64 leaves (3 levels; a padded group at 23 leaves).
-        const uint64_t sizes[2] = {64, 23};
-        for (uint64_t leaves : sizes) {
-            const uint64_t total = tree_nodes4(leaves);
-            static uint8_t ta[128 * 32], tb[128 * 32];
-            std::memset(ta, 0, sizeof(ta));
-            for (uint64_t j = 0; j < leaves; ++j) {
-                uint64_t d[4] = {splitmix(z) % P_MOD, splitmix(z) % P_MOD, splitmix(z) % P_MOD,
-                                 splitmix(z) % P_MOD};
-                put_node(ta + (total - leaves + j) * 32, d);
-            }
-            std::memcpy(tb, ta, sizeof(ta));
-            // Today's: two levels by launch, then the tail.
-            uint64_t child_off = total - leaves, nc = leaves;
-            for (int lvl = 0; lvl < 3 && nc > 1; ++lvl) {
-                const uint64_t np = (nc + 3) / 4, po = child_off - np;
-                if (lvl < 1) {
-                    CUDA_HOST_FOR_EACH_THREAD(t, np) p1s_merkle_level4(ta, child_off, nc, po, np);
-                    CUDA_HOST_FOR_EACH_THREAD(t, np) p1s_merkle_level4_lean(tb, child_off, nc, po, np);
-                    child_off = po;
-                    nc = np;
-                } else {
-                    CUDA_HOST_SINGLE_THREAD();
-                    p1s_merkle_tail4(ta, child_off, nc);
-                    CUDA_HOST_SINGLE_THREAD();
-                    p1s_merkle_tail4_lean(tb, child_off, nc);
-                    break;
-                }
-            }
-            char what[64];
-            std::snprintf(what, sizeof(what), "lean twin: 4-ary tree over %llu leaves", (unsigned long long)leaves);
-            check(std::memcmp(ta, tb, total * 32) == 0, what, V);
+        static uint8_t nat[16 * 32], rev[16 * 32], ext[16 * 32];
+        CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) p1s_leaves_base_coset(cw, num_leaves, block, nat);
+        CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) p1s_leaves_base_coset_rev(cw, num_leaves, block, leaf_bits, rev);
+        CUDA_HOST_FOR_EACH_THREAD(t, num_leaves) p1s_leaves_ext3_coset(cw, num_leaves, block, ext);
+        bool ok_nat = true, ok_rev = true, ok_ext = true;
+        for (uint64_t j = 0; j < num_leaves; ++j) {
+            uint64_t want[4], got[4];
+            p1w16::zisk_leaf<2, true>(block, [&](uint64_t t) { return cw[j + t * num_leaves]; }, want);
+            node_felts(nat + 32 * j, got);
+            ok_nat &= std::memcmp(got, want, 32) == 0;
+            node_felts(rev + 32 * (__brevll(j) >> (64 - leaf_bits)), got);
+            ok_rev &= std::memcmp(got, want, 32) == 0;
+            p1w16::zisk_leaf<2, true>(
+                3 * block, [&](uint64_t i) { return cw[(j + (i / 3) * num_leaves) * 3 + i % 3]; }, want);
+            node_felts(ext + 32 * j, got);
+            ok_ext &= std::memcmp(got, want, 32) == 0;
         }
+        check(ok_nat, "p1s coset leaves, natural order = the V = 2 leaf", V);
+        check(ok_rev, "p1s coset leaves, coset order = the V = 2 leaf", V);
+        check(ok_ext, "p1s ext3 coset leaves = the V = 2 leaf", V);
     }
 }
 
@@ -693,7 +665,7 @@ int main() {
     run_lean();
     if (g_fail == 0) {
         std::printf("p1w16 host KAT: all checks pass (circulant v0, v1, v2; Cauchy c1; ZisK leaf, "
-                    "rows, row pairs; W8 v1, v2 and its grind; the p1s production kernels; lean l2 and its twins)\n");
+                    "rows, row pairs; W8 v1, v2 and its grind; the p1s production kernels; lean l2)\n");
         return 0;
     }
     std::printf("p1w16 host KAT: %d FAILED\n", g_fail);
