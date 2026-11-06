@@ -535,3 +535,64 @@ fn lean_diff_bytewise() {
         "[BYTEWISE] interactions differ"
     );
 }
+
+#[test]
+fn lean_diff_mul() {
+    use crate::tables::mul::{
+        MulConstraints, MulOperation, bus_interactions, cols, generate_mul_trace,
+    };
+    let mut rng = SplitMix64(0x3D);
+    let mut ops = Vec::new();
+    for &a in &EDGE {
+        for &b in &EDGE {
+            for lhs_signed in [false, true] {
+                for rhs_signed in [false, true] {
+                    // `wants_hi` picks which half the ALU message asks for, which is what
+                    // separates MUL from MULH, MULHU and MULHSU on one row.
+                    for wants_hi in [false, true] {
+                        ops.push((
+                            MulOperation::new(a, lhs_signed, b, rhs_signed),
+                            wants_hi,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    for _ in 0..512 {
+        ops.push((
+            MulOperation::new(
+                rng.next_u64(),
+                rng.next_u64() & 1 == 1,
+                rng.next_u64(),
+                rng.next_u64() & 1 == 1,
+            ),
+            rng.next_u64() & 1 == 1,
+        ));
+    }
+    // Repeats on one operation, asking for both halves, so the row carries `μ_lo > 1` and
+    // `μ_hi > 1` at once. Every range check of this chip fires with `μ_lo + μ_hi`, so a trace
+    // where both are 1 never exercises the sum that fixes the model's counted-pull bound.
+    for _ in 0..200 {
+        let op = MulOperation::new(0x0123_4567_89AB_CDEF, true, 0xFEDC_BA98_7654_3210, true);
+        ops.push((op.clone(), false));
+        ops.push((op, true));
+    }
+    let trace = generate_mul_trace(&ops);
+    let report = compare(
+        "MUL",
+        &load_lean("mul"),
+        &MulConstraints,
+        &bus_interactions(),
+        cols::NUM_COLUMNS,
+        &rows_of(&trace, cols::NUM_COLUMNS),
+    );
+    assert!(
+        report.lean_asserts_unmatched.is_empty() && report.rust_constraints_unmatched.is_empty(),
+        "[MUL] constraints differ"
+    );
+    assert!(
+        report.lean_interacts_unmatched.is_empty() && report.rust_interacts_unmatched.is_empty(),
+        "[MUL] interactions differ"
+    );
+}

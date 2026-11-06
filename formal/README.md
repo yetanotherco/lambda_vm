@@ -148,8 +148,10 @@ Result on `main` after that merge, 2026-10-28:
   eight constraints in the order `mul.rs` emits them (`IS_BIT` on each sign flag,
   `(1 − signed)·is_negative` for each, then the four `raw_product` convolutions)
   and the interaction split (`ARE_BYTES` once, `IS_HALF` sixteen times, `MSB16`
-  twice, `IS_B20` four times, `ALU` twice) all agree with `mul.rs`.
-  `lean_diff_mul` is not written yet, so this one is by inspection.
+  twice, `IS_B20` four times, `ALU` twice) all agree with `mul.rs`, and
+  `lean_diff_mul` checks it, asking for both halves of one repeated product so
+  the row carries `μ_lo > 1` and `μ_hi > 1` and the range checks fire with
+  their sum.
 
 The check compares polynomials, not zero sets: it caught `μ·(μ − 1)` versus
 `μ·(1 − μ)` in EQ, which is why the Lean bit constraints use the spec's form.
