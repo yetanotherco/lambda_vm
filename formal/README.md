@@ -362,16 +362,30 @@ requirement, so it was a second spelling of every counted bus sitting in the
 build with no user: the standing invitation to the split this model has already
 paid for on three buses.
 
-Moving LT onto the counted channel has one structural cost: **LT cannot share an
-ensemble with EQ or SHIFT.** `Channel.counted` keeps the base channel's name
-(`name := channel.name`), so `Bitwise.IsHalf.counted muMax`, which `Tables/Lt.lean`
-pulls, and `Bitwise.IsHalf.toRaw`, which `Tables/Eq.lean` and `Tables/Shift.lean`
-pull through `pullIf`, are two different `RawChannel`s both called `IS_HALF`, and
-`Ensemble.unique_channel_names` rejects a `tables` list holding both. `MSB16` is
-the same. A combined ensemble would have to put EQ and SHIFT on the counted
-channel too, at `N = 1`; the pinned fork has no lemma collapsing `Channel.counted
-1` to the plain channel, so that is a proof obligation, not a rename. No ensemble
-here needs it yet: `LtStaged` holds LT only.
+## One channel per bus
+
+`Channel.toRaw` and `Channel.counted N` build different `RawChannel`s under the same bus
+name, and `Ensemble.unique_channel_names` asks the names to be distinct. So a bus the model
+spells two ways is two channels called one thing, and no ensemble can hold the chips that
+disagree about it. That is not a soundness hole; it is a wall that appears only when somebody
+writes the ensemble that crosses them. This model hit it on ALU, on ZERO, on MSB16, on
+IS_HALF and on BYTE_ALU, each one a separate surprise.
+
+`Buses/Canonical.lean` says it up front. `modelChannels` lists the one spelling each bus
+uses; `lt_canonical` through `dvrm_canonical` check the six chips against it. A chip that
+moves a pull between `pullIf` and `pullUpTo` on its own now fails `lake build` at that chip,
+not at the next ensemble. Adding a bus means adding a line, so a new bus arrives with its
+spelling decided rather than defaulted.
+
+The check is stated through `busOf`, which looks a name up in `modelChannels`, so each step
+closes by evaluating a `String` and no two channels are ever compared. Comparing them would
+mean unfolding the `Guarantees` closures of a chip with 35 interactions.
+
+It leaves `model_channels_agree` behind, which is the `tables_channels` premise of an
+ensemble over all six chips, and `modelChannels_unique_names` is its `unique_channel_names`.
+
+`ARE_BYTES` and `HWSL` are the two buses on `toRaw`: the first is pulled with multiplicity
+`1` everywhere, in the model and in the prover, and the second has a single puller.
 
 ## What is intentionally not proven
 
