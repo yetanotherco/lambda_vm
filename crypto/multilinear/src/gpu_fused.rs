@@ -349,7 +349,7 @@ pub fn force_argue_fused_xcheck(on: Option<bool>) {
 }
 
 /// A program of at least this many steps keeps its rounds on the card past
-/// the host's crossover (`LAMBDA_VM_ZC_DEVICE_TAIL`, on by default): the host walks it
+/// the host's crossover: the host walks it
 /// through the interpreter once for every index pair and node of a round,
 /// while a card round costs about one walk whatever the cube.
 pub const DEVICE_TAIL_MIN_STEPS: usize = 1000;
@@ -363,44 +363,20 @@ pub const DEVICE_TAIL_CUBE: usize = 1 << 2;
 static TAIL_FORCED: AtomicU8 = AtomicU8::new(0);
 static TAIL_FORCED_CUBE: AtomicU64 = AtomicU64::new(0);
 
-/// Where the fused rounds hand a long program to the host
-/// (`LAMBDA_VM_ZC_DEVICE_TAIL`; on by default, `=0` turns it off): `None` at
-/// the host's crossover, or `(min_steps, cube)` — a program of at least
+/// Where the fused rounds hand a long program to the host: `None` at the
+/// host's crossover, or `(min_steps, cube)` — a program of at least
 /// `min_steps` steps stops at `cube` instead. The same messages either way, so
-/// the same proof. Read once, with a banner.
+/// the same proof. `(DEVICE_TAIL_MIN_STEPS, DEVICE_TAIL_CUBE)` unless a test
+/// forces another mode ([`force_zc_device_tail`]).
 pub fn zc_device_tail() -> Option<(usize, usize)> {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     match TAIL_FORCED.load(Ordering::Relaxed) {
         1 => None,
         2 => Some((0, TAIL_FORCED_CUBE.load(Ordering::Relaxed) as usize)),
-        _ => ON
-            .get_or_init(|| {
-                let on =
-                    device_tail_from(std::env::var("LAMBDA_VM_ZC_DEVICE_TAIL").ok().as_deref());
-                eprintln!(
-                    "★ ZC DEVICE TAIL: {}",
-                    if on {
-                        "on (the default: a program of ≥ 1000 steps keeps its rounds on the \
-                         card down to a cube of 4; LAMBDA_VM_ZC_DEVICE_TAIL=0 hands it to the \
-                         host at the crossover)"
-                    } else {
-                        "off (LAMBDA_VM_ZC_DEVICE_TAIL=0: every program's rounds go to the \
-                         host at the crossover)"
-                    }
-                );
-                on
-            })
-            .then_some((DEVICE_TAIL_MIN_STEPS, DEVICE_TAIL_CUBE)),
+        _ => Some((DEVICE_TAIL_MIN_STEPS, DEVICE_TAIL_CUBE)),
     }
 }
 
-/// The knob's reading of its variable: empty, `0` or `off` turn it off;
-/// anything else (unset included) leaves it on.
-fn device_tail_from(value: Option<&str>) -> bool {
-    !matches!(value.map(str::trim), Some("" | "0" | "off"))
-}
-
-/// Overrides the knob: `None` back to the environment, `Some(None)` off,
+/// Forces a mode: `None` back to the default, `Some(None)` the crossover,
 /// `Some(Some(cube))` every program, whatever its length, down to `cube` (a
 /// power of two, at least 2) — a test's way to the card's smallest rounds on
 /// short programs.
@@ -539,14 +515,14 @@ pub struct FusedTimes {
 static DEVICE_TAILS: AtomicU64 = AtomicU64::new(0);
 
 /// Fused tables whose rounds stayed on the card past today's crossover
-/// (`LAMBDA_VM_ZC_DEVICE_TAIL`).
+/// ([`zc_device_tail`]).
 pub fn device_tail_sessions() -> u64 {
     DEVICE_TAILS.load(Ordering::Relaxed)
 }
 
 /// Where a thread's fused tables spent their later rounds since the last
 /// [`take_tail`], short programs at `[0]` and those of at least
-/// [`DEVICE_TAIL_MIN_STEPS`] steps at `[1]` (knob on or off): the batched
+/// [`DEVICE_TAIL_MIN_STEPS`] steps at `[1]` (in every mode): the batched
 /// argue's log line under the split.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TailTimes {
@@ -726,7 +702,7 @@ where
         }
         let lowered = lower_fused(constraints)?;
         // A long program's rounds stay on the card past today's crossover
-        // (`LAMBDA_VM_ZC_DEVICE_TAIL`), except under the cross-check, which
+        // ([`zc_device_tail`]), except under the cross-check, which
         // replays today's rounds and so stops where they do.
         let crossover = there;
         let steps = lowered.nodes.len() / 2;
@@ -1177,18 +1153,10 @@ mod tests {
         assert!(!fused_from(Some("0")));
     }
 
-    /// The device tail's default, pinned: on unless the variable says `0`,
-    /// `off` or nothing, and its rule's constants as frozen before the box
-    /// measured them.
+    /// The device tail's rule, pinned: its constants as frozen before they were
+    /// measured, below the host's crossover cube.
     #[test]
-    fn the_device_tail_is_on_unless_the_knob_says_0() {
-        assert!(device_tail_from(None));
-        assert!(device_tail_from(Some("1")));
-        assert!(device_tail_from(Some("true")));
-        assert!(!device_tail_from(Some("")));
-        assert!(!device_tail_from(Some("0")));
-        assert!(!device_tail_from(Some(" 0 ")));
-        assert!(!device_tail_from(Some("off")));
+    fn the_device_tail_takes_long_programs_down_to_a_cube_of_4() {
         assert_eq!((DEVICE_TAIL_MIN_STEPS, DEVICE_TAIL_CUBE), (1000, 4));
         const { assert!(DEVICE_TAIL_CUBE < crate::HOST_CUBE_COMPILED) };
     }

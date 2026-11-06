@@ -1153,7 +1153,7 @@ fn the_corner_check_on_the_card_refuses_a_broken_trace() {
     }
 }
 
-/// The device tail's rule (`LAMBDA_VM_ZC_DEVICE_TAIL`: at least
+/// The device tail's rule (`multilinear::gpu_fused::zc_device_tail`: at least
 /// [`multilinear::gpu_fused::DEVICE_TAIL_MIN_STEPS`] lowered steps) takes the
 /// VM's long programs and none of the short ones: KECCAK_RND and ECDAS on,
 /// CPU off. Prints every program it takes, so a box log shows which.

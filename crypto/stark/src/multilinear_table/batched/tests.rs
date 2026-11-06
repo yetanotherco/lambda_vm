@@ -1193,7 +1193,7 @@ fn each_tables_share_is_weighted_lambda_cubed_to_its_index() {
     }
 }
 
-/// The device tail (`LAMBDA_VM_ZC_DEVICE_TAIL`, forced here on every program
+/// The device tail (`multilinear::gpu_fused::zc_device_tail`, forced here on every program
 /// down to a cube of 4, the rule's, and of 2, the card's smallest) proves the
 /// host reference's bytes: the same proof, the transcript in the same state
 /// after. On a device the tables kept on the card past today's crossover are
