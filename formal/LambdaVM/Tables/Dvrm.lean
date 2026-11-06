@@ -1379,43 +1379,25 @@ theorem completeness :
     rw [if_congr hiff rfl rfl, ← ZMod.natCast_zmod_val input_divByZero, hdzv]
     split_ifs <;> norm_num
 
-/-- All three parts of `RequirementsChannelsLawful` follow from the one list inclusion
-`shallowChannels ⊆ channelsWithRequirements`, once the declared list covers every channel the
-circuit touches.
+/-- `RequirementsChannelsLawful` from a cover of the circuit's channels plus a local proof for
+the ones left out of the declared list. A channel not declared has to be one the circuit receives
+on, and its interactions have to meet their requirement here rather than at an ensemble.
 
-This is what keeps the obligation affordable on a chip with 35 interactions. Proving it in
-place means `simp only [circuit_norm, main]` expands `InChannelsOrRequirements` into a 35-fold
-conjunction, each conjunct an `n`-way disjunction `channel = c₁ ∨ … ∨ channel = cₙ ∨
-Requirements` over *closed* channel terms. The `simp` itself is cheap; it is the closing
-`tauto` that then has to settle a few hundred `RawChannel` equalities by `whnf`, comparing
-structures whose `Guarantees`/`Requirements` fields are closures over `Alu.Guarantees` — an
-eight-clause predicate on seven 64-bit operands — and that is where the heartbeats go.
+This is what lets a chip stop deferring a bus whose requirement it can already meet, which is not
+a tidiness point: `ARE_BYTES` bounds every counted multiplicity, so it has to be the first channel
+finished in any ensemble, and a requirement on the first channel can only be discharged from
+soundness -- which wants every guarantee the chip has, and at that point has none. A chip that
+defers `ARE_BYTES` cannot sit in such an ensemble at all.
 
-Going through `shallowChannels` instead leaves one goal with the channel as a *variable*:
-`channel = c₁ ∨ … ∨ channel = c₃₅ ⊢ channel ∈ requirements`, where both sides came out of the
-same normalization pass, so each case closes syntactically. No `Requirements`, and no
-interaction *message*, ever enters the goal. -/
-theorem requirementsChannelsLawful_of_shallowChannels_subset {F : Type} [FiniteField F]
-    {ops : Operations F} {guarantees requirements : List (RawChannel F)}
-    (h_subcircuits : ops.subcircuitChannelsWithRequirements ⊆ requirements)
-    (h_shallow : ops.shallowChannels ⊆ requirements) :
-    ops.RequirementsChannelsLawful guarantees requirements := by
-  refine ⟨h_subcircuits, fun channel hc => Or.inr (h_shallow hc), fun env _ => ?_⟩
-  rw [Operations.inChannelsOrRequirements_iff_forall_mem]
-  intro i hi
-  refine Or.inl (h_shallow ?_)
-  rw [Operations.shallowChannels_eq_interactions_map]
-  exact List.mem_map.mpr ⟨i, hi, rfl⟩
-
-/-- The same, for a declared list that need not hold every channel the circuit touches. A
-channel left out has to be one the circuit receives on, and its interactions have to meet their
-requirement here rather than at an ensemble.
-
-This is what lets a chip stop deferring a bus whose requirement is unconditional. It matters
-because the bus that bounds every counted multiplicity, `ARE_BYTES`, has to finish first in any
-ensemble, and whatever declares a requirement on it would have to discharge that with nothing
-finished before -- which only soundness can do, and soundness wants every guarantee the chip
-has. A chip that defers `ARE_BYTES` can therefore not sit in such an ensemble at all. -/
+Going through `shallowChannels` for the cover is also what keeps the obligation affordable on a
+chip with 35 interactions. Proving `InChannelsOrRequirements` in place means `simp only
+[circuit_norm, main]` expands it into a 35-fold conjunction, each conjunct an `n`-way disjunction
+`channel = c₁ ∨ … ∨ channel = cₙ ∨ Requirements` over *closed* channel terms, and the closing
+`tauto` then has to settle a few hundred `RawChannel` equalities by `whnf`, comparing structures
+whose `Guarantees`/`Requirements` fields are closures over `Alu.Guarantees` -- an eight-clause
+predicate on seven 64-bit operands. Here the cover leaves one goal with the channel as a
+*variable*, where both sides came out of the same normalization pass and each case closes
+syntactically, and only the undeclared channels ever reach an interaction. -/
 theorem requirementsChannelsLawful_of_cover {F : Type} [FiniteField F]
     {ops : Operations F} {guarantees requirements : List (RawChannel F)}
     (h_subcircuits : ops.subcircuitChannelsWithRequirements ⊆ requirements)
@@ -1431,25 +1413,77 @@ theorem requirementsChannelsLawful_of_cover {F : Type} [FiniteField F]
   · exact Or.inl h
   · exact Or.inr (h_local env hc i hi h)
 
-/-- The chip touches seven raw channels. `pullUpTo` puts the range checks and the three borrowed
-`ALU` messages on the *counted* channels `IsHalfC`, `ZeroC` and `AluC`, while `Channel.pushIf`
-(the two `DIVREM` pushes) and `Channel.pullIf` (the `ZERO` pulls inlined from `neg`, and the
-`MSB16` pulls from `sign`) stay on the plain `toRaw` channels. A counted channel is *not* the
-`toRaw` one — their pull requirement is `mult ∈ {0, 1}` against `mult ∈ {0, 1, …, N}` — so both
-spellings of `ALU` and of `ZERO` have to be declared. -/
+/-- The chip touches five raw channels and defers three of them. `pullUpTo` puts the range
+checks, the two `ZERO` checks and the three borrowed `ALU` messages on the *counted* channels
+`IsHalfC`, `ZeroC` and `AluC`, whose pull requirement is a bound on the multiplicity that only
+`ARE_BYTES` can give, and that bound is what an ensemble has to supply.
+
+The other two are met here. `ARE_BYTES` itself is pulled once with multiplicity `1`, which is
+already `mult ∈ {0, 1}`; and the three `MSB16` pulls come from the `SIGN` template, whose
+multiplicity is the sign flag, which `isBit r.signed` constrains to a bit. Declaring either one
+would be worse than redundant: `ARE_BYTES` bounds every counted multiplicity, so it has to be the
+first channel finished in any ensemble, and a requirement on a channel finished first can only be
+discharged from soundness — which wants every guarantee the chip has, including the ones that are
+not finished yet. A chip that defers `ARE_BYTES` cannot sit in such an ensemble at all. -/
 theorem requirementsChannelsLawful : ∀ (input : Var Row (F p)) (offset : ℕ),
     ((main input).operations offset).RequirementsChannelsLawful
       elaborated.channelsWithGuarantees
-      [AluC, IsHalfC, ZeroC, Msb16C, Bitwise.AreBytes.toRaw] := by
+      [AluC, IsHalfC, ZeroC] := by
   intro input offset
-  apply requirementsChannelsLawful_of_shallowChannels_subset
+  apply requirementsChannelsLawful_of_cover
   · -- the chip has no subcircuits
     simp only [circuit_norm, main]
   · -- the 35 channels, read off the operations without touching a single message
     simp only [circuit_norm, main]
     intro channel h
-    simp only [List.mem_cons, List.not_mem_nil, or_false] at h ⊢
     tauto
+  · -- the one `ARE_BYTES` pull and the three `MSB16` pulls, met in place
+    intro env hc
+    simp only [circuit_norm, main] at hc
+    simp only [circuit_norm, main, List.not_mem_nil]
+    intro i hi
+    repeat' rcases hi with rfl | hi
+    all_goals intro hne
+    all_goals try (revert hne; simp only [circuit_norm, AluC, Alu.channelC, IsHalfC, ZeroC,
+      Bitwise.IsHalf, Bitwise.Zero, Alu.channel, StaticLookupChannel.toChannel])
+    all_goals exact fun _ => eq_zero_or_countUpTo (mul_one_sub_eq_zero_iff.mp (by tauto))
+
+/-! ## What an ensemble reads off a row
+
+The chip's multiplicities come in three kinds: the row's `mu = mu_q + mu_r`, which `ARE_BYTES`
+bounds; the literal `1` of the `ARE_BYTES` pull itself; and the sign flags, under which `NEG`
+pulls `ZERO` twice per call. The third kind is the one an ensemble cannot see from `ARE_BYTES`,
+so the facts it needs about those flags are stated here, where the circuit is in scope. -/
+
+/-- A sign flag is a bit: zero on an unsigned row by the chip's own constraint, and otherwise the
+top bit `MSB16` returned. -/
+lemma isBool_sign {signed x s : F p} (hb : IsBool signed) (hz : (1 - signed) * s = 0)
+    (g : Channel.CountUpTo muMax signed → Bitwise.msb16Table.Guarantees (x, s)) : IsBool s := by
+  rcases hb with rfl | rfl
+  · left; simpa using hz
+  · exact Bitwise.isBool_of_msb16 (g countUpTo_one)
+
+/-- The three sign flags are bits. The chip does not say so on its own: `SIGN` reads the top bit
+of a half off `MSB16` and only forces the flag to zero on an unsigned row, so on a signed row the
+bit comes from the bus. An ensemble has this once `MSB16` is finished, and it is what makes the
+`ZERO` pulls that `NEG` inlines legal on a counted channel: their multiplicity is a sign flag,
+not the row's `mu`, so `ARE_BYTES` says nothing about them.
+
+The two `obtain`s read the conjunctions `circuit_norm` leaves off `main`, in the order `main`
+writes them: the thirty-three pulls for the guarantee (the two `ALU` pushes drop out, a pull
+guarantee being vacuous on a push), and the nineteen `assertZero`s for the constraints, where the
+first is `isBit signed` and the three `SIGN` templates are the thirteenth to fifteenth. -/
+theorem isBool_signs {env : Environment (F p)} {input : Var Row (F p)} {offset : ℕ}
+    (hc : ((main input).operations offset).ConstraintsHold env)
+    (g : ((main input).operations offset).ChannelGuarantees Msb16C env) :
+    IsBool (Expression.eval env input.signN) ∧ IsBool (Expression.eval env input.signR) ∧
+      IsBool (Expression.eval env input.signD) := by
+  simp only [circuit_norm, main, isBit, sign, neg, Msb16C, Bitwise.Msb16,
+    StaticLookupChannel.toChannel, forall_eq_or_imp, forall_eq] at hc g
+  obtain ⟨-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,gN,gR,gD,-⟩ := g
+  obtain ⟨hs,-,-,-,-,-,-,-,-,-,-,-,hzN,hzR,hzD,-,-,-,-⟩ := hc
+  have hb : IsBool (Expression.eval env input.signed) := mul_one_sub_eq_zero_iff.mp hs
+  exact ⟨isBool_sign hb hzN gN, isBool_sign hb hzR gR, isBool_sign hb hzD gD⟩
 
 def circuit : GeneralFormalCircuit (F p) Row unit where
   name := "DVRM"
@@ -1457,7 +1491,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   elaborated
   Spec r _ _ := RowSpec r
   channelsWithRequirements :=
-    [AluC, IsHalfC, ZeroC, Msb16C, Bitwise.AreBytes.toRaw]
+    [AluC, IsHalfC, ZeroC]
 
   requirementsChannelsLawful := requirementsChannelsLawful
   soundness := soundness

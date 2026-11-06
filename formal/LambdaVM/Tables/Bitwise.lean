@@ -225,6 +225,13 @@ def msb16Table : StaticLookupChannel (F p) fieldPair where
 
 abbrev Msb16 : Channel (F p) fieldPair := msb16Table.toChannel
 
+/-- The top bit `MSB16` returns is a bit. Chips that read a sign flag off this bus rather than
+constraining it themselves -- `SIGN` does, and so every chip that calls it -- get the flag's
+`IsBool` from here, which is what a counted pull under that flag needs. -/
+lemma isBool_of_msb16 {x s : F p} (g : msb16Table.Guarantees (x, s)) : IsBool s := by
+  simp only [msb16Table] at g
+  exact isBool_of_val_lt_two (by omega)
+
 /-- `ZERO[X + 2^8·Y + 2^16·Z] -> ZERO` (`BusId::Zero`): a 20-bit value and its zero flag. -/
 def zeroTable : StaticLookupChannel (F p) fieldPair where
   name := "ZERO"
@@ -259,6 +266,14 @@ def zeroTable : StaticLookupChannel (F p) fieldPair where
       split_ifs <;> simp
 
 abbrev Zero : Channel (F p) fieldPair := zeroTable.toChannel
+
+/-- The zero flag `ZERO` returns is a bit, for the same reason as `isBool_of_msb16`. -/
+lemma isBool_of_zero {v z : F p} (g : zeroTable.Guarantees (v, z)) : IsBool z := by
+  simp only [zeroTable] at g
+  rw [g.2]
+  split_ifs
+  · exact .inr rfl
+  · exact .inl rfl
 
 /-! ## Byte ALU and halfword shift channels -/
 
