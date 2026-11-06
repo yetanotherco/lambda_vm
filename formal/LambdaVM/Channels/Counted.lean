@@ -19,7 +19,9 @@ The price is in the balance premise. `exists_push_of_pull` needs `N · length < 
 `BalancedInteractions` only matches pulls of multiplicity `1`, and counts a pull of any other
 nonzero multiplicity as a push; `not_consistent` shows the gap is real: for `N ≥ 2` the counted
 channel is not `Consistent`, so it cannot be finished in a `SoundEnsemble` until that premise
-carries the bound. With `N = 1` everything coincides (`counted 1 channel` is `Normal`).
+carries the bound. With `N = 1` everything coincides (`counted 1 channel` is `Normal`). With the
+bounded balance `BalancedUpTo N` of the modified Clean (`counted-pulls`), `consistentUpTo` closes
+the gap.
 -/
 
 namespace LambdaVM.Counted
@@ -274,6 +276,33 @@ theorem not_consistent (N : ℕ) (hN : 2 ≤ N) (hN' : N ≤ 255)
   have h := hg trivial ⟨1, le_rfl, by omega, by simp⟩
   convert h
   simp [ProvableType.fromElements_toElements]
+
+/-- With the bounded balance of the modified Clean (`BalancedUpTo N`, the premise `not_consistent`
+asks for), the counted channel is consistent: a pull of `1, …, N` is matched by an interaction
+that is not such a pull, and that interaction's requirement is the guarantee. -/
+instance consistentUpTo (N : ℕ) (channel : Channel (F p) Message) :
+    (counted N channel).ConsistentUpTo N where
+  consistent interactions data balanced reqs a a_mem := by
+    obtain ⟨ a_channel, - ⟩ := reqs a a_mem
+    by_cases a_pull : a.PullUpTo N
+    case neg =>
+      rcases a with ⟨ _, a_direction, a_mult, a_msg, a_size ⟩
+      subst a_channel
+      simp only [Interaction.Guarantees, counted]
+      exact fun h_direction h_count => absurd ⟨ h_direction, h_count ⟩ a_pull
+    obtain ⟨ b, b_mem, b_msg, b_ne_zero, b_not_pull ⟩ := balanced.matchedUpTo a a_mem a_pull
+    obtain ⟨ b_channel, b_reqs ⟩ := reqs b b_mem
+    rcases a with ⟨ _, a_direction, a_mult, a_msg, a_size ⟩
+    rcases b with ⟨ _, b_direction, b_mult, b_msg', b_size ⟩
+    subst a_channel b_channel
+    simp only at b_msg
+    subst b_msg
+    simp only [Interaction.Guarantees, Interaction.Requirements, Interaction.msgVector,
+      counted] at b_reqs ⊢
+    intro _ _
+    cases b_direction with
+    | push => exact b_reqs b_ne_zero
+    | pull => exact b_reqs b_ne_zero (b_not_pull rfl)
 
 end LambdaVM.Counted
 

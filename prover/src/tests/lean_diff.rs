@@ -261,9 +261,10 @@ fn compare<CS: ConstraintSet<Gl, Gl3>>(
         .collect();
     let rust_interacts_unmatched = ri.iter().map(|&j| interactions[j].bus_id).collect();
 
-    // Every Lean constraint with a Rust counterpart vanishes on the honest trace. The
-    // Lean-only ones are the documented deltas (LT's `μ·(1 − μ)` does not hold on a
-    // deduplicated Rust row with `μ > 1`).
+    // Every Lean constraint with a Rust counterpart vanishes on the honest trace. There are no
+    // Lean-only constraints left: LT's `μ·(1 − μ)` became a pull of `ARE_BYTES[μ, 0]`, as in
+    // `lt.rs`, and every test below asserts that both unmatched lists are empty. The skip is kept
+    // for the next table added here, which may land before its Rust side does.
     for (r, row) in honest_rows.iter().enumerate() {
         for (i, e) in lean.asserts.iter().enumerate() {
             if lean_asserts_unmatched.contains(&i) {
@@ -361,12 +362,11 @@ fn lean_diff_lt() {
         cols::NUM_COLUMNS,
         &rows_of(&trace, cols::NUM_COLUMNS),
     );
-    // Known deltas: the Lean model keeps `μ·(1 − μ) = 0` (assert 0), the Rust chip bounds
-    // `μ` with the `ARE_BYTES[μ, 0]` send instead.
-    assert_eq!(
-        report.lean_asserts_unmatched,
-        vec![0],
-        "[LT] only the μ bit constraint should be Lean-only"
+    // The Lean model bounds `μ` with the `ARE_BYTES[μ, 0]` pull, as the Rust chip does, so the
+    // two agree exactly.
+    assert!(
+        report.lean_asserts_unmatched.is_empty(),
+        "[LT] Lean-only constraints"
     );
     assert!(
         report.rust_constraints_unmatched.is_empty(),
@@ -376,10 +376,9 @@ fn lean_diff_lt() {
         report.lean_interacts_unmatched.is_empty(),
         "[LT] Lean-only interactions"
     );
-    assert_eq!(
-        report.rust_interacts_unmatched,
-        vec![0],
-        "[LT] only ARE_BYTES[μ, 0] should be Rust-only"
+    assert!(
+        report.rust_interacts_unmatched.is_empty(),
+        "[LT] Rust-only interactions"
     );
 }
 
