@@ -45,6 +45,7 @@ open Bitwise (IsHalf IsB20)
 `μ_lo + μ_hi` times, and each multiplicity is a byte. -/
 abbrev IsHalfC : RawChannel (F p) := Bitwise.IsHalf.counted muMax
 abbrev IsB20C : RawChannel (F p) := Bitwise.IsB20.counted muMax
+abbrev Msb16C : RawChannel (F p) := Bitwise.Msb16.counted muMax
 
 /-- A MUL row, in the column order of `cols` in `prover/src/tables/mul.rs`. -/
 structure Row (F : Type) where
@@ -257,8 +258,8 @@ theorem soundness :
     all_goals first
       | exact fun h => absurd h0 h
       | exact Or.inl h0
-      | exact hlsb
-      | exact hrsb
+      | exact eq_zero_or_countUpTo hlsb
+      | exact eq_zero_or_countUpTo hrsb
       | exact fun h => absurd hmu0 h
       | exact fun h => absurd hmu1 h
   -- an active row: the sum is a count of at most `muMax`, so every range check delivers
@@ -293,7 +294,7 @@ theorem soundness :
     · rw [h] at h_negL
       simp only [sub_zero, one_mul] at h_negL
       exact Or.inl ⟨by rw [h, ZMod.val_zero], by rw [h_negL, ZMod.val_zero]⟩
-    · exact Or.inr ⟨by rw [h, val_one_eq], (h_sgnL h).2⟩
+    · exact Or.inr ⟨by rw [h, val_one_eq], (h_sgnL (countUpTo_of_eq_one h)).2⟩
   have hnegR : input_rhsNeg.val = if input_rhsSigned.val = 1 ∧
       2^63 ≤ MulCore.ofHalves4 input_rhs0.val input_rhs1.val input_rhs2.val input_rhs3.val
       then 1 else 0 := by
@@ -302,7 +303,7 @@ theorem soundness :
     · rw [h] at h_negR
       simp only [sub_zero, one_mul] at h_negR
       exact Or.inl ⟨by rw [h, ZMod.val_zero], by rw [h_negR, ZMod.val_zero]⟩
-    · exact Or.inr ⟨by rw [h, val_one_eq], (h_sgnR h).2⟩
+    · exact Or.inr ⟨by rw [h, val_one_eq], (h_sgnR (countUpTo_of_eq_one h)).2⟩
   have hLN : input_lhsNeg.val ≤ 1 := by rw [hnegL]; split_ifs <;> omega
   have hRN : input_rhsNeg.val ≤ 1 := by rw [hnegR]; split_ifs <;> omega
   -- the four `raw_product` limbs, as the convolution of `MulCore` over the naturals
@@ -431,7 +432,8 @@ theorem soundness :
       = MulCore.ofHalves4 input_rhs0.val input_rhs1.val input_rhs2.val input_rhs3.val := by
     simp only [MulCore.ofHalves4, hu2, hu3]; ring
   refine ⟨fun _ => hkey, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount,
-    .inr hcount, .inr hcount, .inr hcount, hlsb, hrsb, .inr hcount, .inr hcount, .inr hcount,
+    .inr hcount, .inr hcount, .inr hcount, eq_zero_or_countUpTo hlsb,
+    eq_zero_or_countUpTo hrsb, .inr hcount, .inr hcount, .inr hcount,
     .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount, .inr hcount,
     .inr hcount, .inr hcount, ?_, ?_⟩
   · -- the `high = 0` message: the low 64 bits of the product
@@ -591,7 +593,8 @@ theorem completeness :
     fun _ => hq0, fun _ => hq1, fun _ => hq2, fun _ => hq3,
     ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · -- MSB16[lhs[3]] -> lhs_is_negative, when the operand is read as signed
-    intro h1
+    intro h1'
+    have h1 : input_lhsSigned = 1 := eq_one_of_countUpTo hlsb h1'
     have hv : input_lhsSigned.val = 1 := by rw [h1, val_one_eq]
     have key : (if ZMod.val input_lhsSigned = 1 ∧ 2^63 ≤ ZMod.val input_lhs0
           + 2^16 * ZMod.val input_lhs1 + 2^32 * ZMod.val input_lhs2
@@ -609,7 +612,8 @@ theorem completeness :
       rw [(ZMod.val_eq_zero _).mp hz, mul_zero]
     · rw [h]; ring
   · -- MSB16[rhs[3]] -> rhs_is_negative
-    intro h1
+    intro h1'
+    have h1 : input_rhsSigned = 1 := eq_one_of_countUpTo hrsb h1'
     have hv : input_rhsSigned.val = 1 := by rw [h1, val_one_eq]
     have key : (if ZMod.val input_rhsSigned = 1 ∧ 2^63 ≤ ZMod.val input_rhs0
           + 2^16 * ZMod.val input_rhs1 + 2^32 * ZMod.val input_rhs2
@@ -643,14 +647,14 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   elaborated
   Spec r _ _ := RowSpec r
   channelsWithRequirements :=
-    [Alu.channelC, IsHalfC, IsB20C, Bitwise.Msb16.toRaw, Bitwise.AreBytes.toRaw]
+    [Alu.channelC, IsHalfC, IsB20C, Msb16C, Bitwise.AreBytes.toRaw]
 
   requirementsChannelsLawful input_var i₀ := by
     obtain ⟨lhs0, lhs1, lhs2, lhs3, lhsSigned, rhs0, rhs1, rhs2, rhs3, rhsSigned,
       lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3, lhsNeg, rhsNeg,
       raw0, raw1, raw2, raw3, muLo, muHi⟩ := input_var
     simp only [circuit_norm, main, Alu.channelC, areBytes, isBit, sign, word, rawE, IsHalfC, IsB20C,
-      Bitwise.IsHalf, Bitwise.IsB20, Bitwise.Msb16, Bitwise.AreBytes, Alu.channel]
+      Msb16C, Bitwise.IsHalf, Bitwise.IsB20, Bitwise.Msb16, Bitwise.AreBytes, Alu.channel]
     intro channel h
     tauto
 

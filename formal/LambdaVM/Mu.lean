@@ -33,6 +33,17 @@ namespace LambdaVM
 chip adds up, from MUL's `μ_lo + μ_hi` and DVRM's `μ_q + μ_r`. -/
 abbrev muMax : ℕ := 510
 
+/-- Finishing a counted channel asks for `ConsistentUpTo balance.pullBound`, and for
+`Balance.logUpUpTo muMax` that bound is `muMax` itself. Clean carries the fact as an `example`
+rather than an instance, with a comment saying the user has to supply it, and instance search
+runs at reducible transparency, so it does not get from a bus to it on its own. Declared once
+here, for every channel at the model's one bound, rather than at every bus and every ensemble
+that finishes one. -/
+instance {Message : TypeMap} [ProvableType Message] (channel : Channel (F p) Message) :
+    (channel.counted muMax).ConsistentUpTo (Balance.logUpUpTo (F := F p) muMax).pullBound := by
+  simp only [Balance.logUpUpTo_pullBound]
+  infer_instance
+
 /-! ## What a bit owes a channel counted at `muMax`
 
 A chip that pulls a bus under a one-bit flag owes `IsBool` on `Channel.toRaw` and the weaker
