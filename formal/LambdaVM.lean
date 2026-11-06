@@ -20,5 +20,4 @@ public import LambdaVM.Tables.Mul
 public import LambdaVM.Tables.DvrmCore
 public import LambdaVM.Tables.Dvrm
 public import LambdaVM.Ensembles.EqLookup
-public import LambdaVM.Channels.Counted
 public import LambdaVM.Ensembles.LtStaged
