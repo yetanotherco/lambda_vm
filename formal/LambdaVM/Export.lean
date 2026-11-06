@@ -69,4 +69,5 @@ public meta def main : IO Unit := do
   exportCircuit "shift" SHIFT.main
   exportCircuit "bytewise" BYTEWISE.main
   exportCircuit "mul" MUL.main
+  exportCircuit "dvrm" DVRM.main
   exportBitwise
