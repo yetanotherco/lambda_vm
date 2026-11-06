@@ -74,9 +74,16 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   -- output: ALU[a, b, opsel(EQ) + 64·invert] -> [res, 0]
   Alu.channel.emitUpTo muMax r.mu ⟨r.a0, r.a1, r.b0, r.b1, 3 + 64 * r.invert, r.res, 0⟩
 
-/-- The honest prover's row, as `generate_eq_trace` fills it. -/
+/-- An active row, as `generate_eq_trace` fills one per operation.
+
+This used to admit `μ = 0` and still ask for the semantics of an active row, which made it
+false on the rows the prover actually emits for padding: `generate_eq_trace` starts from
+`zeroed_fe_vec` and writes only the real rows, so a padding row has `a = b = 0`, where the
+clause below demands `eq = 1` while the trace carries `0`. EQ is the only chip where that
+bites, because it is the only one whose honest value on an all-zero row is not zero: the
+equality of zeros is true. `Padding` covers those rows instead. -/
 def Honest (r : Row (F p)) : Prop :=
-  IsBool r.mu ∧ IsBool r.invert ∧
+  r.mu = 1 ∧ IsBool r.invert ∧
   r.a0.val < 2^32 ∧ r.a1.val < 2^32 ∧ r.b0.val < 2^32 ∧ r.b1.val < 2^32 ∧
   r.diff0.val < 2^16 ∧ r.diff1.val < 2^16 ∧ r.diff2.val < 2^16 ∧ r.diff3.val < 2^16 ∧
   -- diff = a − b (mod 2⁶⁴)
@@ -85,6 +92,12 @@ def Honest (r : Row (F p)) : Prop :=
     = dword r.a0 r.a1 ∧
   r.eq.val = (if dword r.a0 r.a1 = dword r.b0 r.b1 then 1 else 0) ∧
   r.res.val = eqBit r.invert.val (dword r.a0 r.a1) (dword r.b0 r.b1)
+
+/-- A padding row, as `generate_eq_trace` leaves one: every column zero. -/
+def Padding (r : Row (F p)) : Prop :=
+  r.mu = 0 ∧ r.invert = 0 ∧ r.res = 0 ∧ r.eq = 0 ∧
+  r.a0 = 0 ∧ r.a1 = 0 ∧ r.b0 = 0 ∧ r.b1 = 0 ∧
+  r.diff0 = 0 ∧ r.diff1 = 0 ∧ r.diff2 = 0 ∧ r.diff3 = 0
 
 /-- What an active row establishes: with range-checked operands, `res` is the equality bit. -/
 def RowSpec (r : Row (F p)) : Prop :=
@@ -191,12 +204,19 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
     rw [hflagsV] at hflags; simp only [opselEQ] at hflags
     rw [key ha0 ha1 hb0 hb1, show input_invert.val = i by omega]
 
-  ProverAssumptions r _ _ := Honest r
+  ProverAssumptions r _ _ := Honest r ∨ Padding r
 
   completeness := by
     circuit_proof_start [main, isBit, sub, add, Add.carry0, Add.carry1, Alu.channel, Alu.Guarantees,
-      Bitwise.isHalfTable, Bitwise.zeroTable, Honest, dword]
-    obtain ⟨hmu, hib, ha0, ha1, hb0, hb1, hd0, hd1, hd2, hd3, hsum, heq, hres⟩ := h_assumptions
+      Bitwise.isHalfTable, Bitwise.zeroTable, Honest, Padding, dword]
+    rcases h_assumptions with ⟨hmu, hib, ha0, ha1, hb0, hb1, hd0, hd1, hd2, hd3, hsum, heq, hres⟩ |
+      ⟨pmu, pinv, pres, peq, pa0, pa1, pb0, pb1, pd0, pd1, pd2, pd3⟩
+    case inr =>
+      -- a padding row: every column is zero, so every counted pull is inactive and every
+      -- constraint is a product with a zero factor
+      subst pmu pinv pres peq pa0 pa1 pb0 pb1 pd0 pd1 pd2 pd3
+      refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
+        simp [circuit_norm, not_countUpTo_zero]
     -- the halves of diff as words
     have hval_lo : (input_diff0 + 65536 * input_diff1).val
         = input_diff0.val + 65536 * input_diff1.val :=
@@ -226,7 +246,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
       rw [← hres, ZMod.natCast_zmod_val]
     refine ⟨fun _ => by omega, fun _ => by omega, fun _ => by omega, fun _ => by omega,
       mul_one_sub_eq_zero_iff.mpr hib, ?_, ?_, fun _ => ⟨by rw [hval_sum]; omega, ?_⟩, ?_,
-      mul_one_sub_eq_zero_iff.mpr hmu⟩
+      mul_one_sub_eq_zero_iff.mpr (Or.inr hmu)⟩
     · rw [hc0k]; rcases (by omega : k0 = 0 ∨ k0 = 1) with rfl | rfl <;> simp
     · rw [hc1k]; rcases (by omega : k1 = 0 ∨ k1 = 1) with rfl | rfl <;> simp
     · rw [heq_cast]
