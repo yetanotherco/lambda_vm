@@ -324,6 +324,31 @@ requirement, so it was a second spelling of every counted bus sitting in the
 build with no user: the standing invitation to the split this model has already
 paid for on three buses.
 
+## One channel per bus
+
+`Channel.toRaw` and `Channel.counted N` build different `RawChannel`s under the same bus
+name, and `Ensemble.unique_channel_names` asks the names to be distinct. So a bus the model
+spells two ways is two channels called one thing, and no ensemble can hold the chips that
+disagree about it. That is not a soundness hole; it is a wall that appears only when somebody
+writes the ensemble that crosses them. This model hit it on ALU, on ZERO, on MSB16, on
+IS_HALF and on BYTE_ALU, each one a separate surprise.
+
+`Buses/Canonical.lean` says it up front. `modelChannels` lists the one spelling each bus
+uses; `lt_canonical` through `dvrm_canonical` check the six chips against it. A chip that
+moves a pull between `pullIf` and `pullUpTo` on its own now fails `lake build` at that chip,
+not at the next ensemble. Adding a bus means adding a line, so a new bus arrives with its
+spelling decided rather than defaulted.
+
+The check is stated through `busOf`, which looks a name up in `modelChannels`, so each step
+closes by evaluating a `String` and no two channels are ever compared. Comparing them would
+mean unfolding the `Guarantees` closures of a chip with 35 interactions.
+
+It leaves `model_channels_agree` behind, which is the `tables_channels` premise of an
+ensemble over all six chips, and `modelChannels_unique_names` is its `unique_channel_names`.
+
+`ARE_BYTES` and `HWSL` are the two buses on `toRaw`: the first is pulled with multiplicity
+`1` everywhere, in the model and in the prover, and the second has a single puller.
+
 ## Known differences from the Rust prover
 
 - Every chip whose `μ` the spec types as `Byte` needs the counted treatment LT

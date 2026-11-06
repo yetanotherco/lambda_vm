@@ -24,6 +24,10 @@ soundness theorem or global row theorem.
 #print axioms LambdaVM.MUL.circuit
 #print axioms LambdaVM.DVRM.circuit
 
+-- One RawChannel per bus name, so a chip that moves a pull between spellings fails here
+-- rather than at the next ensemble somebody writes.
+#print axioms LambdaVM.Buses.model_channels_agree
+
 -- The ensembles.
 #print axioms LambdaVM.Ensembles.eq_rows_correct
 #print axioms LambdaVM.Ensembles.LtStaged.tableSoundness
