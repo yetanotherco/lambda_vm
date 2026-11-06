@@ -221,7 +221,10 @@ pub fn resident_bytes() -> Option<u64> {
         .nth(1)?
         .parse()
         .ok()?;
-    Some(kib << 10)
+    // The page-locked pool's unused part is resident from its lock on, but it
+    // is the room the block's later allocations take: counted once, as they
+    // are taken.
+    Some((kib << 10).saturating_sub(multilinear::pinned::unused_pool_bytes()))
 }
 
 /// The part of `rss` a purge could not return: `rss` less the allocator's

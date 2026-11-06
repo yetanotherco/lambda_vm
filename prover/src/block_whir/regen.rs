@@ -209,7 +209,12 @@ fn resident() -> Option<(u64, u64)> {
             .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
             .map(|k| k << 10)
     };
-    Some((kib("VmHWM:")?, kib("VmRSS:")?))
+    // Less the page-locked pool's unused part, as the drop rule reads them.
+    let unused = multilinear::pinned::unused_pool_bytes();
+    Some((
+        kib("VmHWM:")?.saturating_sub(unused),
+        kib("VmRSS:")?.saturating_sub(unused),
+    ))
 }
 
 /// How often the pacer reads the host.

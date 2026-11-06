@@ -191,13 +191,25 @@ pub fn lock_pool() -> Option<PoolLocked> {
     }
     let t = Instant::now();
     let bytes = gib.checked_mul(1 << 30)?;
-    let layout = std::alloc::Layout::from_size_align(bytes, 2 << 20).ok()?;
-    // SAFETY: a non-zero size; the pool is never freed (its pieces stay locked
-    // and handed out for the process's life).
-    let base = unsafe { std::alloc::alloc(layout) };
-    if base.is_null() {
+    // Mapped here, not taken from the global allocator, so the allocator's
+    // own figures count only what the arenas hand out of it, as they would
+    // count the same allocations without the pool.
+    // SAFETY: a fresh private anonymous mapping, never unmapped (its pieces
+    // stay locked and handed out for the process's life).
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            bytes,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
         return None;
     }
+    let base = base.cast::<u8>();
     let mut report = PoolLocked {
         bytes: bytes as u64,
         ..PoolLocked::default()
@@ -230,6 +242,19 @@ pub fn lock_pool() -> Option<PoolLocked> {
     LOCK_NANOS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     POOL_READY.store(true, Ordering::Release);
     Some(report)
+}
+
+/// The pool's bytes not handed out yet: resident (the driver faulted them in)
+/// and spoken for, the memory a block's later allocations take instead of
+/// growing the heap. A decision on the host's memory that forecasts that
+/// growth takes these off its reading, or it counts them twice. 0 without a
+/// pool.
+pub fn unused_bytes() -> u64 {
+    if !POOL_READY.load(Ordering::Acquire) {
+        return 0;
+    }
+    let len = POOL_LEN.load(Ordering::Relaxed);
+    len.saturating_sub(CURSOR.load(Ordering::Relaxed).min(len)) as u64
 }
 
 static POOL_TRIED: AtomicBool = AtomicBool::new(false);
@@ -815,6 +840,24 @@ mod tests {
             assert!(is_pinned(at as *const u8, size));
         }
         assert!(carve(PIECE + 1, PAGE).is_none(), "larger than a piece");
+    }
+
+    #[test]
+    fn the_unused_pool_shrinks_as_the_arenas_take_it() {
+        let _ = on();
+        let before = unused_bytes();
+        assert!(before > 0 && before <= 2 << 30);
+        let bytes = 32 << 20;
+        let taken = {
+            let _scope = scope(bytes);
+            take(bytes)
+        };
+        assert!(unused_bytes() < before, "the arenas took from the pool");
+        assert_eq!(
+            unused_bytes(),
+            (POOL_LEN.load(Ordering::Relaxed) - CURSOR.load(Ordering::Relaxed)) as u64
+        );
+        give(taken, bytes);
     }
 
     #[test]

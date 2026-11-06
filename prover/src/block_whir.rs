@@ -787,10 +787,13 @@ impl HostReading {
     /// re-faults recycled extents) and the cgroup's working set, its charge
     /// less its inactive file pages (the kubelet's measure). Page cache the
     /// kernel would give back first is not counted; active file pages are,
-    /// and the target's 10 GiB margin covers them.
+    /// and the target's 10 GiB margin covers them. The page-locked pool's
+    /// unused part is not counted either: resident since its lock, it is the
+    /// room the forecast's growth takes ([`multilinear::pinned::unused_pool_bytes`]).
     fn bytes(&self) -> u64 {
         self.hwm
             .max(self.charged.saturating_sub(self.inactive_file))
+            .saturating_sub(multilinear::pinned::unused_pool_bytes())
     }
 
     /// What the host holds now: the cgroup's working set and the allocator's
@@ -799,6 +802,7 @@ impl HostReading {
     fn now_bytes(&self, allocator: Option<u64>) -> u64 {
         self.charged
             .saturating_sub(self.inactive_file)
+            .saturating_sub(multilinear::pinned::unused_pool_bytes())
             .max(allocator.unwrap_or(0))
     }
 }

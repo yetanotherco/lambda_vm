@@ -952,6 +952,7 @@ dependencies = [
  "blake3",
  "crypto",
  "cudarc",
+ "libc",
  "libloading 0.8.9",
  "math",
  "multilinear",

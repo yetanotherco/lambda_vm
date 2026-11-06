@@ -29,6 +29,16 @@ pub fn is_pinned(ptr: *const u8, bytes: usize) -> bool {
     }
 }
 
+/// The page-locked pool's bytes not handed out yet: resident, and spoken for
+/// by the allocations the block will make. A decision that forecasts the
+/// host's growth takes them off its reading. 0 without a pool.
+pub fn unused_pool_bytes() -> u64 {
+    #[cfg(feature = "cuda")]
+    return math_cuda::pinned::unused_bytes();
+    #[cfg(not(feature = "cuda"))]
+    0
+}
+
 /// What locking the pool took.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PoolLocked {
