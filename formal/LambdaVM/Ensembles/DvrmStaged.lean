@@ -107,7 +107,7 @@ templates, the eight halves of its result, and the four `IS_B20` carries. -/
 
 @[circuit_norm] lemma mulComponent_requirements :
     mulComponent.circuit.channelsWithRequirements =
-      [Alu.channelC, MUL.IsHalfC, MUL.IsB20C, MUL.Msb16C] := rfl
+      [Alu.channelC, MUL.IsHalfC, MUL.IsB20C] := rfl
 @[circuit_norm] lemma dvrmComponent_requirements :
     dvrmComponent.circuit.channelsWithRequirements =
       [DVRM.AluC, DVRM.IsHalfC, DVRM.ZeroC, DVRM.Msb16C, Bitwise.AreBytes.toRaw] := rfl
@@ -303,5 +303,87 @@ lemma mul_mu_count {a b : F p} (ha : a.val < 256) (hb : b.val < 256) :
     val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
   simp only [hsum, muMax]
   omega
+
+/-- MUL's requirements on its two counted buses follow from its guarantee on `ARE_BYTES`.
+
+Only two, because MUL's `MSB16` pulls carry a sign flag rather than the multiplicity, and a flag
+is a bit by the chip's own constraint, so that obligation is met in `Mul.lean` and never reaches
+an ensemble. `IS_HALF` and `IS_B20` both carry `μ_lo + μ_hi`, which is what `ARE_BYTES` bounds.
+
+`MUL.circuit` carries an explicit `elaborated` where `LT.circuit` takes the default, so the simp
+set needs `MUL.elaborated` to reach the operations at all. The guarantee then comes out as the
+pair of byte bounds followed by one vacuous implication per other channel, which is why the two
+bounds are `g.1.1` and `g.1.2`. -/
+theorem mul_requirementsAfter_counted {c : RawChannel (F p)}
+    (hc : c = MUL.IsHalfC ∨ c = MUL.IsB20C)
+    {earlier : List (RawChannel (F p))} (h_earlier : Bitwise.AreBytes.toRaw ∈ earlier) :
+    mulComponent.RequirementsAfter c earlier := by
+  rintro table h_comp - constraints guarantees row hrow
+  have g := guarantees _ h_earlier row hrow
+  cases table
+  simp only at h_comp
+  subst h_comp
+  simp only [Component.channelGuarantees_iff, Component.channelRequirements_iff] at g ⊢
+  simp (config := { decide := true }) [circuit_norm, Component.rowOperations, mulComponent,
+    MUL.circuit, MUL.elaborated, MUL.main, areBytes, isBit, sign, MUL.word, MUL.rawE,
+    MUL.IsHalfC, MUL.IsB20C, Alu.channel, Bitwise.AreBytes, Bitwise.IsHalf,
+    Bitwise.Msb16, Bitwise.IsB20, Bitwise.areBytesTable, Bitwise.isHalfTable,
+    Bitwise.msb16Table, Bitwise.isB20Table, StaticLookupChannel.toChannel] at g ⊢
+  have hm := mul_mu_count g.1.1 g.1.2
+  rcases hc with rfl | rfl <;>
+    simp (config := { decide := true }) [hm, MUL.IsHalfC, MUL.IsB20C, Bitwise.IsHalf,
+      Bitwise.IsB20, Bitwise.isHalfTable, Bitwise.isB20Table, StaticLookupChannel.toChannel]
+  -- the two ALU pushes are on another channel
+  all_goals (and_intros <;> channel_ne)
+
+/-- MUL receives on `ARE_BYTES`, `IS_HALF`, `MSB16` and `IS_B20`, all whole-channel stages. -/
+theorem mul_guarantees_in {earlier : List (Stage (F p))}
+    (hab : ({ channel := Bitwise.AreBytes.toRaw } : Stage (F p)) ∈ earlier)
+    (hih : ({ channel := Bitwise.IsHalf.counted muMax } : Stage (F p)) ∈ earlier)
+    (hms : ({ channel := Bitwise.Msb16.counted muMax } : Stage (F p)) ∈ earlier)
+    (hb2 : ({ channel := Bitwise.IsB20.counted muMax } : Stage (F p)) ∈ earlier) :
+    ∀ c ∈ mulComponent.circuit.channelsWithGuarantees, ∀ msg : Array (F p),
+      ∃ s ∈ earlier, s.channel = c ∧ s.cls msg := by
+  intro c hc msg
+  simp only [mulComponent_guarantees, List.mem_cons, List.not_mem_nil, or_false] at hc
+  rcases hc with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl |
+    rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
+  · exact ⟨_, hab, rfl, rfl⟩
+  all_goals first
+    | exact ⟨_, hih, rfl, rfl⟩
+    | exact ⟨_, hms, rfl, rfl⟩
+    | exact ⟨_, hb2, rfl, rfl⟩
+
+/-- MUL's nine obligations. Five stages are buses it does not require -- `MSB16` among them now,
+since its sign flags are bits by its own constraints -- so it owes nothing there. On the two
+`ALU` stages everything it receives is already finished. `IS_B20` and `IS_HALF` are the two that
+carry weight, and both get their bound from `ARE_BYTES`. -/
+theorem mul_staged : mulComponent.StagedRequirementsOn finished := by
+  have easy : ∀ {earlier : List (Stage (F p))} (stage : Stage (F p)),
+      ({ channel := Bitwise.AreBytes.toRaw } : Stage (F p)) ∈ earlier →
+      ({ channel := Bitwise.IsHalf.counted muMax } : Stage (F p)) ∈ earlier →
+      ({ channel := Bitwise.Msb16.counted muMax } : Stage (F p)) ∈ earlier →
+      ({ channel := Bitwise.IsB20.counted muMax } : Stage (F p)) ∈ earlier →
+      mulComponent.RequirementsAfterOn stage earlier :=
+    fun _ hab hih hms hb2 =>
+      Component.requirementsAfterOn_of_guarantees_subset (mul_guarantees_in hab hih hms hb2)
+  have counted : ∀ {c : RawChannel (F p)}, (c = MUL.IsHalfC ∨ c = MUL.IsB20C) →
+      ∀ {earlier : List (Stage (F p))},
+      ({ channel := Bitwise.AreBytes.toRaw } : Stage (F p)) ∈ earlier →
+      mulComponent.RequirementsAfterOn { channel := c } earlier := by
+    intro c hc earlier hab
+    refine Component.requirementsAfterOn_of_requirementsAfter
+      (mul_requirementsAfter_counted hc (List.mem_singleton_self _)) ?_
+    intro c' hc'
+    simp only [List.mem_singleton] at hc'
+    exact ⟨_, hc' ▸ hab, rfl, fun _ => rfl⟩
+  refine ⟨easy _ (by simp) (by simp) (by simp) (by simp),
+    easy _ (by simp) (by simp) (by simp) (by simp),
+    ?_, counted (.inr rfl) (by simp), ?_, counted (.inl rfl) (by simp), ?_, ?_, ?_, trivial⟩
+  all_goals
+    refine Component.requirementsAfterOn_of_not_mem _ ?_
+    simp only [mulComponent_requirements, Alu.channelC, MUL.IsHalfC, MUL.IsB20C,
+      List.mem_cons, List.not_mem_nil, or_false, not_or]
+    and_intros <;> channel_ne
 
 end LambdaVM.Ensembles.DvrmStaged
