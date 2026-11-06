@@ -647,7 +647,7 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   elaborated
   Spec r _ _ := RowSpec r
   channelsWithRequirements :=
-    [Alu.channelC, IsHalfC, IsB20C, Msb16C, Bitwise.AreBytes.toRaw]
+    [Alu.channelC, IsHalfC, IsB20C, Msb16C]
 
   requirementsChannelsLawful input_var i₀ := by
     obtain ⟨lhs0, lhs1, lhs2, lhs3, lhsSigned, rhs0, rhs1, rhs2, rhs3, rhsSigned,
