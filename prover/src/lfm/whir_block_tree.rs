@@ -1965,7 +1965,7 @@ pub fn prove_whir_block_tree(
     sink.line(&finish_idle_line());
     sink.line(&format!(
         "BLOCK REST LAYOUT CONFIG: {} · KECCAK_RND built as its tables {} · finish packed {} · building at most {}",
-        block_whir::rest_layout_label(options, block_whir::rest_slide()),
+        block_whir::rest_layout_label(options, true),
         options.finish_keccak_rnd_chunks,
         options.pack_finished,
         options

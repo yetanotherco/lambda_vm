@@ -4713,7 +4713,7 @@ fn block_whir_on_a_real_block() {
     crate::block_whir::rest_layout_from_env(&mut options);
     println!(
         "BLOCK REST LAYOUT CONFIG: {} · KECCAK_RND built as its tables {} · finish packed {}",
-        crate::block_whir::rest_layout_label(&options, crate::block_whir::rest_slide()),
+        crate::block_whir::rest_layout_label(&options, true),
         options.finish_keccak_rnd_chunks,
         options.pack_finished,
     );

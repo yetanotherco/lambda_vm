@@ -572,9 +572,8 @@ pub struct BlockOptions {
     /// same. Production: [`BLOCK_REST_LAYOUT_BYTES`].
     ///
     /// With the streamed finish ([`Self::finish_stream`]) the same bytes are
-    /// its byte gate's budget, and the sliding finish (the default,
-    /// `LAMBDA_VM_BLOCK_REST_SLIDE`) has no waves: it starts each table as the
-    /// gate admits it.
+    /// its byte gate's budget, and the sliding finish has no waves: it starts
+    /// each table as the gate admits it.
     pub rest_layout_bytes: Option<usize>,
     /// With the streamed finish sliding: at most this many estimated bytes of
     /// the rest's tables build at once, apart from the gate's budget
@@ -1212,28 +1211,6 @@ pub(crate) fn finish_stream_from_env() -> bool {
     !std::env::var("LAMBDA_VM_BLOCK_FINISH_STREAM").is_ok_and(|v| v.trim() == "0")
 }
 
-/// `LAMBDA_VM_BLOCK_COMPACT_LT=0`: the LT ops derived from the MEMW ops the
-/// builder drops are held at 24 bytes each until the finish
-/// ([`WindowedTraceBuilder::raw_memw_lt`]), the A arm of keeping them compact;
-/// unset or anything else keeps them compact. The tables are the same (#1013's
-/// knob).
-fn compact_lt() -> bool {
-    !std::env::var("LAMBDA_VM_BLOCK_COMPACT_LT").is_ok_and(|v| v.trim() == "0")
-}
-
-/// `LAMBDA_VM_BLOCK_P4_ROWS`: unset, empty or `pool` (the default) has the
-/// finish count the deduplicating tables' per-row lookups (LT, BRANCH,
-/// BYTEWISE: one `ARE_BYTES` a row of a μ-split operation, and the padding
-/// rows') on the whole pool, a chunk a task, counts only, each chunk's map
-/// reserved for its distinct operations; `parts` counts each chunk by parts of
-/// its ops instead, each part's map small enough to stay in a core's cache;
-/// `off` builds each chunk's list of lookups among phase 4's other
-/// collectors, as before (the rollback). Anything else refuses the prove. The
-/// multiplicities and the tables are the same.
-fn block_p4_rows() -> Result<P4Rows, Error> {
-    parse_p4_rows(std::env::var("LAMBDA_VM_BLOCK_P4_ROWS").ok().as_deref())
-}
-
 /// The card set up (its context, its modules and its staging pools) on a
 /// thread of its own as the streamed prove starts, so the first group's upload
 /// does not wait for it; nothing without the card's kernels. The proof is the
@@ -1247,53 +1224,10 @@ fn set_up_card() {
     }
 }
 
-/// `LAMBDA_VM_BLOCK_P4_LOOKUPS`: unset, empty or `direct` (the default) has
-/// the finish's phase 4 count LT's per-op lookups and KECCAK's straight into
-/// its histograms; `lists` builds each slice's list of them first, as before
-/// (the rollback). Anything else refuses the prove. The multiplicities and the
-/// tables are the same.
-fn block_p4_direct() -> Result<bool, Error> {
-    parse_p4_lookups(std::env::var("LAMBDA_VM_BLOCK_P4_LOOKUPS").ok().as_deref())
-}
-
-fn parse_p4_lookups(value: Option<&str>) -> Result<bool, Error> {
-    match value.map(str::trim) {
-        None | Some("" | "direct") => Ok(true),
-        Some("lists") => Ok(false),
-        Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_BLOCK_P4_LOOKUPS={v}: direct (counted straight into the histograms) or lists"
-        ))),
-    }
-}
-
-/// How the finish counts the per-row lookups ([`block_p4_rows`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum P4Rows {
-    /// Each chunk's list among phase 4's collectors.
-    Off,
-    /// On the pool, one map a chunk.
-    Pool,
-    /// On the pool, each chunk by parts.
-    Parts,
-}
-
-fn parse_p4_rows(value: Option<&str>) -> Result<P4Rows, Error> {
-    match value.map(str::trim) {
-        None | Some("" | "pool") => Ok(P4Rows::Pool),
-        Some("parts") => Ok(P4Rows::Parts),
-        Some("off") => Ok(P4Rows::Off),
-        Some(v) => Err(Error::Prover(format!(
-            "LAMBDA_VM_BLOCK_P4_ROWS={v}: pool (the per-row lookups counted on the pool), parts (counted \
-             by parts of each chunk) or off"
-        ))),
-    }
-}
-
 /// `LAMBDA_VM_BLOCK_LT_CONCAT=1`: the finish concatenates LT's ops into one
 /// list before chunking them ([`WindowedTraceBuilder::concat_lt`]), the A arm
-/// of keeping them as segments; off by default. With
-/// `LAMBDA_VM_BLOCK_COMPACT_LT=0` it is the finish as it was before both. The
-/// tables are the same (#1013's knob).
+/// of keeping them as segments; off by default. The tables are the same
+/// (#1013's knob).
 fn lt_concat() -> bool {
     std::env::var("LAMBDA_VM_BLOCK_LT_CONCAT").is_ok_and(|v| v.trim() == "1")
 }
@@ -1360,20 +1294,12 @@ fn parse_rest_bitwise_last(value: Option<&str>) -> Result<bool, Error> {
     }
 }
 
-/// The streamed finish builds each of the rest's tables as soon as the byte
-/// gate admits it, while earlier ones still build, instead of in waves that
-/// each last as long as their slowest table
-/// ([`WindowedTraceBuilder::slide_rest`]): the default.
-/// `LAMBDA_VM_BLOCK_REST_SLIDE=0` builds in waves. The tables and their order
-/// are the same.
-pub(crate) fn rest_slide() -> bool {
-    parse_rest_slide(std::env::var("LAMBDA_VM_BLOCK_REST_SLIDE").ok().as_deref())
-}
-
 /// How the rest's layout bytes ([`BlockOptions::rest_layout_bytes`]) bound
 /// the rest, for the harnesses' `BLOCK REST LAYOUT CONFIG` line: waves of
 /// them where the rest is laid out in waves, and the streamed finish's gate
-/// where it slides ([`rest_slide`]), which has no waves.
+/// where it slides (`slide`: the streamed finish builds each of the rest's
+/// tables as soon as the byte gate admits it,
+/// [`WindowedTraceBuilder::slide_rest`]), which has no waves.
 pub(crate) fn rest_layout_label(options: &BlockOptions, slide: bool) -> String {
     let mib = |b: usize| format!("{} MiB", b >> 20);
     match (options.rest_streams() && slide, options.rest_layout_bytes) {
@@ -1382,11 +1308,6 @@ pub(crate) fn rest_layout_label(options: &BlockOptions, slide: bool) -> String {
         (false, Some(b)) => format!("waves of {}", mib(b)),
         (false, None) => "waves of all at once".to_string(),
     }
-}
-
-/// [`rest_slide`] of the knob's value: anything but `0` slides.
-fn parse_rest_slide(value: Option<&str>) -> bool {
-    value.map(str::trim) != Some("0")
 }
 
 /// The families whose tables the card fills from the records their rows come
@@ -1977,43 +1898,28 @@ pub struct ExecutorStamps {
     pub setup: f64,
     /// Executing, the logs written as it goes.
     pub run: f64,
-    /// Handing each window out: its logs moved or copied and the memory
-    /// snapshot at the next window's start.
+    /// Handing each window out: its logs moved out as they lie
+    /// ([`Executor::resume_owned`]) and the memory snapshot at the next
+    /// window's start.
     pub handoff: f64,
     /// The windows handed out.
     pub windows: usize,
-    /// The logs left as they lay (`LAMBDA_VM_BLOCK_LOGS_MOVE`, on unless `0`)
-    /// rather than copied.
-    pub moved: bool,
 }
 
 impl ExecutorStamps {
     /// The `BLOCK EXECUTOR:` line, `send` the thread's blocked sends.
     fn line(&self, send: f64) -> String {
         format!(
-            "BLOCK EXECUTOR: started at {:.2}s · setup {:.2}s · execute {:.2}s · hand-off {:.2}s ({} windows, logs {}) · send-blocked {:.2}s · own {:.2}s\n",
+            "BLOCK EXECUTOR: started at {:.2}s · setup {:.2}s · execute {:.2}s · hand-off {:.2}s ({} windows, logs moved) · send-blocked {:.2}s · own {:.2}s\n",
             self.started,
             self.setup,
             self.run,
             self.handoff,
             self.windows,
-            if self.moved { "moved" } else { "copied" },
             send,
             self.setup + self.run + self.handoff,
         )
     }
-}
-
-/// `LAMBDA_VM_BLOCK_LOGS_MOVE`: the executor hands each window's logs out as
-/// they lie ([`Executor::resume_owned`]) unless set to `0`, which copies them
-/// out of the executor's buffer as before. The same logs either way.
-fn block_logs_move() -> bool {
-    parse_logs_move(std::env::var("LAMBDA_VM_BLOCK_LOGS_MOVE").ok().as_deref())
-}
-
-/// [`block_logs_move`] of the knob's value.
-fn parse_logs_move(value: Option<&str>) -> bool {
-    value.map(str::trim) != Some("0")
 }
 
 /// [`ProducerStamps`] as the threads add to them, in nanoseconds.
@@ -5676,8 +5582,6 @@ fn prove_streamed(
     let tag = block_statement_tag(&format.zf.base);
     crate::with_block_hash!(format.zf.base, |H| {
         let walkers = block_walkers()?;
-        let p4_rows = block_p4_rows()?;
-        let p4_direct = block_p4_direct()?;
         let bitwise_last = deviations.rest_bitwise_last || block_rest_bitwise_last()?;
         let from_tables = match deviations.bitwise_from_tables {
             Some(from_tables) => from_tables,
@@ -5751,10 +5655,8 @@ fn prove_streamed(
                 if let Some(ledger) = ledger {
                     ledger.thread("executor");
                 }
-                let moved = block_logs_move();
                 let mut own = ExecutorStamps {
                     started: start.elapsed().as_secs_f64(),
-                    moved,
                     ..ExecutorStamps::default()
                 };
                 let t = Instant::now();
@@ -5767,22 +5669,11 @@ fn prove_streamed(
                     let failed = |e: executor::vm::execution::ExecutorError| {
                         Error::Execution(format!("{e}"))
                     };
-                    // `ran`: the window executed; the copy, when the logs are
-                    // not moved, is the hand-off's.
-                    let (logs, ran) = if moved {
-                        (
-                            executor.resume_owned(window).map_err(failed)?,
-                            Instant::now(),
-                        )
-                    } else {
-                        match executor.resume_with_limit(window).map_err(failed)? {
-                            Some(logs) => {
-                                let ran = Instant::now();
-                                (Some(logs.to_vec()), ran)
-                            }
-                            None => (None, Instant::now()),
-                        }
-                    };
+                    // `ran`: the window executed.
+                    let (logs, ran) = (
+                        executor.resume_owned(window).map_err(failed)?,
+                        Instant::now(),
+                    );
                     own.run += (ran - t).as_secs_f64();
                     let Some(logs) = logs else {
                         break;
@@ -5846,20 +5737,10 @@ fn prove_streamed(
                 if options.drop_streamed_ops {
                     builder = builder.drop_streamed_ops()?;
                 }
-                if !compact_lt() {
-                    builder = builder.raw_memw_lt()?;
-                }
                 if lt_concat() {
                     builder = builder.concat_lt();
                 }
-                match p4_rows {
-                    P4Rows::Off => {}
-                    P4Rows::Pool => builder = builder.p4_rows_on_pool(),
-                    P4Rows::Parts => builder = builder.p4_rows_by_parts(),
-                }
-                if p4_direct {
-                    builder = builder.p4_lookups_direct();
-                }
+                builder = builder.p4_rows_on_pool().p4_lookups_direct();
                 if p4_beside() {
                     builder = builder.p4_beside();
                 }
@@ -5869,9 +5750,7 @@ fn prove_streamed(
                 if from_tables {
                     builder = builder.bitwise_from_tables();
                 }
-                if rest_slide() {
-                    builder = builder.slide_rest();
-                }
+                builder = builder.slide_rest();
                 builder = builder.keccak_rnd_form(format.keccak_rnd);
                 if card_fill.keccak_rnd {
                     builder = builder.card_fill_keccak_rnd();
@@ -6193,14 +6072,10 @@ fn prove_streamed(
                     let g = |b: usize| b as f64 / (1u64 << 30) as f64;
                     let (waited, waits) = rest_gate.waited();
                     eprintln!(
-                        "BLOCK REST STREAM: the rest built {} under a {:.2} GiB gate, held at most \
-                         {:.2} GiB (built and not yet placed) · {waits} acquisitions waited {waited:.2}s \
-                         for room (summed) · building at most {} at once, {:.2} GiB the most",
-                        if rest_slide() {
-                            "as the gate admits each table"
-                        } else {
-                            "in waves"
-                        },
+                        "BLOCK REST STREAM: the rest built as the gate admits each table under a \
+                         {:.2} GiB gate, held at most {:.2} GiB (built and not yet placed) · {waits} \
+                         acquisitions waited {waited:.2}s for room (summed) · building at most {} at \
+                         once, {:.2} GiB the most",
                         g(rest_gate.budget()),
                         g(rest_gate.most()),
                         if rest_gate.build() == rest_gate.budget() {
@@ -8429,7 +8304,7 @@ mod rest_order_tests {
 mod producer_report_tests {
     use super::{
         BLOCK_LAYOUT_AHEAD, BLOCK_LAYOUT_WORKERS, BLOCK_WINDOW_LOG2, BlockOptions, BlockStamps,
-        ExecutorStamps, ProducerStamps, StreamTable, parse_logs_move, parse_window_log2,
+        ExecutorStamps, ProducerStamps, StreamTable, parse_window_log2,
     };
 
     /// Production lays the streamed chunks out on six workers with eight
@@ -8473,7 +8348,6 @@ mod producer_report_tests {
                 run: 2.5,
                 handoff: 0.04,
                 windows: 134,
-                moved: true,
             },
             ..BlockStamps::default()
         };
@@ -8491,20 +8365,8 @@ mod producer_report_tests {
                  (134 windows, logs moved) · send-blocked 3.50s · own 2.55s"
             )
         );
-        stamps.executor.moved = false;
-        assert!(line(&stamps).unwrap().contains("logs copied"));
         stamps.executor = ExecutorStamps::default();
         assert_eq!(line(&stamps), None);
-    }
-
-    /// `LAMBDA_VM_BLOCK_LOGS_MOVE`: on unless `0`.
-    #[test]
-    fn the_logs_are_moved_unless_the_knob_is_zero() {
-        assert!(parse_logs_move(None));
-        assert!(parse_logs_move(Some("1")));
-        assert!(parse_logs_move(Some("")));
-        assert!(!parse_logs_move(Some("0")));
-        assert!(!parse_logs_move(Some(" 0 ")));
     }
 
     /// The readout's two producer lines: what each thread waited on, and the
@@ -8948,59 +8810,12 @@ mod air_input_tests {
 
 #[cfg(test)]
 mod p4_rows_knob_tests {
-    use super::{
-        P4Rows, parse_bitwise_from_tables, parse_p4_lookups, parse_p4_rows, parse_rest_bitwise_last,
-    };
+    use super::{parse_bitwise_from_tables, parse_rest_bitwise_last};
 
-    /// `LAMBDA_VM_BLOCK_P4_ROWS`: unset, empty or `pool` counts the per-row
-    /// lookups on the pool (the default); `off` does not; any other word
-    /// refuses.
+    /// The finish's BITWISE defaults: its LT, BRANCH and BYTEWISE lookups from
+    /// their tables; BITWISE last alone stays opt-in.
     #[test]
-    fn the_p4_rows_knob_defaults_to_pool_takes_off_and_refuses_anything_else() {
-        for (value, rows) in [
-            (None, P4Rows::Pool),
-            (Some(""), P4Rows::Pool),
-            (Some(" off "), P4Rows::Off),
-            (Some("pool"), P4Rows::Pool),
-            (Some(" pool\n"), P4Rows::Pool),
-            (Some("parts"), P4Rows::Parts),
-            (Some(" parts "), P4Rows::Parts),
-        ] {
-            assert_eq!(parse_p4_rows(value).ok(), Some(rows), "{value:?}");
-        }
-        for value in ["1", "on", "POOL", "pools", "rows", "part", "PARTS"] {
-            assert!(parse_p4_rows(Some(value)).is_err(), "{value}");
-        }
-    }
-
-    /// `LAMBDA_VM_BLOCK_P4_LOOKUPS`: unset, empty or `direct` counts straight
-    /// into the histograms (the default); `lists` builds each slice's lists
-    /// (the rollback); anything else refuses.
-    #[test]
-    fn the_p4_lookups_knob_defaults_to_direct_and_takes_lists() {
-        for (value, direct) in [
-            (None, true),
-            (Some(""), true),
-            (Some(" lists "), false),
-            (Some("direct"), true),
-            (Some(" direct\n"), true),
-        ] {
-            assert_eq!(parse_p4_lookups(value).ok(), Some(direct), "{value:?}");
-        }
-        for value in ["1", "on", "DIRECT", "list", "vec"] {
-            assert!(parse_p4_lookups(Some(value)).is_err(), "{value}");
-        }
-    }
-
-    /// The finish's phase-4 defaults: the per-row lookups counted on the pool
-    /// with one map a chunk (not by parts), LT's and KECCAK's lookups counted
-    /// straight into the histograms, and BITWISE's LT, BRANCH and BYTEWISE
-    /// lookups from their tables, BITWISE
-    /// last; BITWISE last alone stays opt-in.
-    #[test]
-    fn the_finish_counts_on_one_map_a_chunk_and_its_lookups_directly_by_default() {
-        assert_eq!(parse_p4_rows(None).ok(), Some(P4Rows::Pool));
-        assert_eq!(parse_p4_lookups(None).ok(), Some(true));
+    fn the_finish_takes_bitwise_from_its_tables_by_default() {
         assert_eq!(parse_bitwise_from_tables(None).ok(), Some(true));
         assert_eq!(parse_rest_bitwise_last(None).ok(), Some(false));
     }
@@ -9046,7 +8861,7 @@ mod p4_rows_knob_tests {
 mod rest_slide_knob_tests {
     use super::{
         BLOCK_REST_BUILD_BYTES, BLOCK_REST_LAYOUT_BYTES, BlockOptions, parse_rest_build,
-        parse_rest_slide, rest_layout_label,
+        rest_layout_label,
     };
 
     /// `BLOCK_WHIR_REST_BUILD`: unset is no cap beyond the gate (production);
@@ -9059,18 +8874,6 @@ mod rest_slide_knob_tests {
         }
         for value in ["", "0", "-1", "2 GiB", "all"] {
             assert!(parse_rest_build(Some(value)).is_err(), "{value}");
-        }
-    }
-
-    /// `LAMBDA_VM_BLOCK_REST_SLIDE`: unset (or anything but `0`) slides; `0`
-    /// builds the rest in waves.
-    #[test]
-    fn the_slide_is_the_default_and_0_builds_in_waves() {
-        for value in [None, Some("1"), Some(""), Some(" 1 ")] {
-            assert!(parse_rest_slide(value), "{value:?}");
-        }
-        for value in ["0", " 0 "] {
-            assert!(!parse_rest_slide(Some(value)), "{value}");
         }
     }
 

@@ -6438,18 +6438,17 @@ pub struct StreamSkip {
     /// Phase 4 counts the deduplicating tables' per-row lookups (LT, BRANCH,
     /// BYTEWISE) on the whole pool, a chunk a task, counts only
     /// ([`count_row_lookups`]), instead of each chunk's list of lookups among
-    /// its other collectors (`LAMBDA_VM_BLOCK_P4_ROWS=pool` on the block).
-    /// The multiplicities and the tables are the same.
+    /// its other collectors (the block's finish). The multiplicities and the
+    /// tables are the same.
     pub p4_rows: bool,
     /// How that count counts each chunk's distinct ops ([`RowCount`]): one
-    /// map a chunk, or by parts (`LAMBDA_VM_BLOCK_P4_ROWS=parts` on the
-    /// block). The multiplicities are the same.
+    /// map a chunk (the block's), or by parts. The multiplicities are the
+    /// same.
     pub p4_by: RowCount,
     /// Phase 4 counts LT's per-op lookups and KECCAK's straight into its
     /// histograms ([`count_bitwise_from_lt_ops`], [`count_bitwise_from_keccak`]),
-    /// instead of building each slice's list of them first
-    /// (`LAMBDA_VM_BLOCK_P4_LOOKUPS` unset or `direct` on the block). The
-    /// multiplicities are the same.
+    /// instead of building each slice's list of them first (the block's
+    /// finish). The multiplicities are the same.
     pub p4_direct: bool,
     /// The streamed finish counts the BITWISE lookups (phase 4) in BITWISE's
     /// own table's job, beside the rest's builds, instead of before any of
@@ -7084,8 +7083,8 @@ pub(crate) struct CompactLt {
     index: Vec<(u32, u32, u64)>,
     len: usize,
     last_rhs: u64,
-    /// The ops as they are, 24 bytes each, instead of the stream (the A arm,
-    /// `LAMBDA_VM_BLOCK_COMPACT_LT=0` on the block).
+    /// The ops as they are, 24 bytes each, instead of the stream
+    /// ([`WindowedTraceBuilder::raw_memw_lt`]).
     raw: Option<Vec<LtOperation>>,
     /// Bytes a block of the stream holds; 0 is [`blocks::BLOCK_BYTES`] (tests
     /// set a small one, to cross blocks).
