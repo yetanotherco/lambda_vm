@@ -354,13 +354,9 @@ pub struct Backend {
     // deep.cubin
     pub deep_composition_ext3_row: CudaFunction,
     pub bit_reverse_ext3_kernel: CudaFunction,
-    /// `deep_composition_ext3_fused_m{M}` at index `M - 1`, the
-    /// DEEP row with its own `M = 1 + num_eval_points` denominators inverted in
-    /// registers.
-    pub deep_composition_ext3_fused: [CudaFunction; 4],
-    /// [`Self::deep_composition_ext3_fused`] with the row-independent part
-    /// hoisted (`LAMBDA_VM_DEEP_HOISTED`, `deep_composition_ext3_hoisted_m1` …
-    /// `_m4`).
+    /// `deep_composition_ext3_hoisted_m{M}` at index `M - 1`, the DEEP row
+    /// with its own `M = 1 + num_eval_points` denominators inverted in
+    /// registers and its row-independent part hoisted onto the host.
     pub deep_composition_ext3_hoisted: [CudaFunction; 4],
 
     // fri.cubin
@@ -1265,12 +1261,6 @@ impl Backend {
             gather_rows_ext3: bary.load_function("gather_rows_ext3")?,
             deep_composition_ext3_row: deep.load_function("deep_composition_ext3_row")?,
             bit_reverse_ext3_kernel: deep.load_function("bit_reverse_ext3_interleaved")?,
-            deep_composition_ext3_fused: [
-                deep.load_function("deep_composition_ext3_fused_m1")?,
-                deep.load_function("deep_composition_ext3_fused_m2")?,
-                deep.load_function("deep_composition_ext3_fused_m3")?,
-                deep.load_function("deep_composition_ext3_fused_m4")?,
-            ],
             deep_composition_ext3_hoisted: [
                 deep.load_function("deep_composition_ext3_hoisted_m1")?,
                 deep.load_function("deep_composition_ext3_hoisted_m2")?,

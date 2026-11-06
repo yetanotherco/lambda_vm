@@ -613,11 +613,6 @@ pub fn staging_report() -> String {
     math_cuda::device::staging_report()
 }
 
-/// `LAMBDA_VM_DEEP_HOISTED`'s line (`math_cuda::deep::deep_hoisted_report`).
-pub fn deep_hoisted_report() -> String {
-    math_cuda::deep::deep_hoisted_report()
-}
-
 pub fn gpu_composition_calls() -> u64 {
     GPU_COMPOSITION_CALLS.load(Ordering::Relaxed)
 }
@@ -3646,7 +3641,6 @@ where
         num_main,
         num_aux,
         num_eval_points,
-        1,
         lde_size,
     )
     .ok()?;

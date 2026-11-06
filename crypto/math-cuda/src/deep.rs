@@ -398,73 +398,10 @@ impl GpuDeepCodeword {
     }
 }
 
-/// `LAMBDA_VM_DEEP_HOISTED` as given: on when unset, `1` or `on`; off when
-/// empty, `0` or `off`; anything else is on (the default), said once on stderr.
-fn deep_hoisted_setting(value: Option<&str>) -> bool {
-    match value.map(str::trim) {
-        Some("" | "0" | "off") => false,
-        None | Some("1" | "on") => true,
-        Some(other) => {
-            eprintln!(
-                "math-cuda: LAMBDA_VM_DEEP_HOISTED={other} is not 0, 1, off or on: on (the default)"
-            );
-            true
-        }
-    }
-}
-
-/// Runtime override of [`deep_hoisted`]: 0 = the environment's choice, 1 = off,
-/// 2 = on.
-static DEEP_HOISTED_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-/// Force `LAMBDA_VM_DEEP_HOISTED` on, off, or back to the environment (tests).
-pub fn set_deep_hoisted(on: Option<bool>) {
-    let v = match on {
-        None => 0,
-        Some(false) => 1,
-        Some(true) => 2,
-    };
-    DEEP_HOISTED_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Whether the fused DEEP runs with its row-independent part hoisted
-/// (`LAMBDA_VM_DEEP_HOISTED`; on by default, `=0` turns it off): the same codeword from
-/// `deep_composition_ext3_hoisted_m*`, one ext3×base product per (main
-/// column, pole) instead of two ext3×ext3, the poles' constant terms summed
-/// once on the host ([`hoisted_constants`]).
-pub fn deep_hoisted() -> bool {
-    match DEEP_HOISTED_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => return false,
-        2 => return true,
-        _ => {}
-    }
-    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENV.get_or_init(|| {
-        deep_hoisted_setting(std::env::var("LAMBDA_VM_DEEP_HOISTED").ok().as_deref())
-    })
-}
-
-/// Fused DEEP launches through the hoisted kernel, and those that kept the
-/// fused one while it was on (a `row_stride` other than 1), since the process
-/// started.
-static HOISTED_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static HOISTED_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// One line for the log, in both arms: the setting and its launches.
-pub fn deep_hoisted_report() -> String {
-    use std::sync::atomic::Ordering::Relaxed;
-    format!(
-        "{} · hoisted launches {} · fused kept {} (row stride ≠ 1)",
-        if deep_hoisted() { "on" } else { "off" },
-        HOISTED_LAUNCHES.load(Relaxed),
-        HOISTED_FALLBACKS.load(Relaxed),
-    )
-}
-
 /// The hoisted DEEP's row-independent constants (raw ext3 words, interleaved):
 /// `C_h = Σ_j γ_h[j]·h_ood[j]`, then for each pole `k`
 /// `C_k = Σ_j γ_tr[j, k]·o[j, k]` over every trace column `j` (main, then aux),
-/// in the fused kernel's layouts (`h_ood` / `gammas_h` a part each,
+/// in the buffered kernel's layouts (`h_ood` / `gammas_h` a part each,
 /// `trace_ood` / `gammas_tr` indexed `(j · K + k) · 3`).
 pub fn hoisted_constants(
     h_ood: &[u64],
@@ -506,7 +443,7 @@ pub fn hoisted_constants(
 }
 
 /// Largest `num_eval_points` the fused DEEP kernels take
-/// (`deep_composition_ext3_fused_m1` … `_m4`, `M = 1 + num_eval_points`).
+/// (`deep_composition_ext3_hoisted_m1` … `_m4`, `M = 1 + num_eval_points`).
 pub const FUSED_MAX_EVAL_POINTS: usize = 3;
 
 /// [`deep_composition_ext3_fully_resident_keep`] without the inverted
@@ -535,7 +472,6 @@ pub fn deep_composition_ext3_fused_keep(
     num_main: usize,
     num_aux: usize,
     num_eval_points: usize,
-    row_stride: usize,
     domain_size: usize,
 ) -> Result<GpuDeepCodeword> {
     #[cfg(feature = "test-faults")]
@@ -574,12 +510,9 @@ pub fn deep_composition_ext3_fused_keep(
         "one pole per term"
     );
     assert!(coset_points_dev.len() >= domain_size, "one point per row");
-    let max_row = (domain_size - 1)
-        .checked_mul(row_stride)
-        .expect("deep composition: (domain_size - 1) * row_stride overflow");
     assert!(
-        max_row < main_lde.lde_size,
-        "deep composition: kernel row {max_row} out of LDE stride {}",
+        domain_size <= main_lde.lde_size,
+        "deep composition: {domain_size} rows out of LDE stride {}",
         main_lde.lde_size
     );
 
@@ -587,9 +520,7 @@ pub fn deep_composition_ext3_fused_keep(
     // With no trace terms (num_eval_points = 0) their tables are empty, and the
     // driver refuses a zero-byte allocation: upload one unread zero instead.
     let nonempty = |xs: &[u64]| stream.clone_htod(if xs.is_empty() { &[0u64][..] } else { xs });
-    let (h_ood_dev, trace_ood_dev, gammas_h_dev, gammas_tr_dev, z_dev) = (
-        nonempty(h_ood)?,
-        nonempty(trace_ood)?,
+    let (gammas_h_dev, gammas_tr_dev, z_dev) = (
         nonempty(gammas_h)?,
         nonempty(gammas_tr)?,
         stream.clone_htod(z_scalars)?,
@@ -608,7 +539,6 @@ pub fn deep_composition_ext3_fused_keep(
     let num_main_u = num_main as u64;
     let num_aux_u = num_aux as u64;
     let num_parts_u = num_parts as u64;
-    let row_stride_u = row_stride as u64;
     let domain_size_u = domain_size as u64;
     // The buffered path's invertibility guard, on the same builds.
     #[cfg(any(debug_assertions, feature = "test-faults"))]
@@ -623,69 +553,37 @@ pub fn deep_composition_ext3_fused_keep(
         block_dim: (128, 1, 1),
         shared_mem_bytes: 0,
     };
-    // With its row-independent part hoisted (`LAMBDA_VM_DEEP_HOISTED`): the
-    // same codeword, written canonical. The hoisted kernel reads every row at
-    // stride 1, the R4 callers' stride; any other keeps the fused kernel.
-    let hoisted = deep_hoisted() && row_stride == 1;
-    if deep_hoisted() && !hoisted {
-        HOISTED_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    if hoisted {
-        let consts = stream.clone_htod(&hoisted_constants(
-            h_ood,
-            trace_ood,
-            gammas_h,
-            gammas_tr,
-            num_parts,
-            num_total_cols,
-            num_eval_points,
-        ))?;
-        unsafe {
-            stream
-                .launch_builder(&be.deep_composition_ext3_hoisted[num_eval_points])
-                .arg(main_lde.buf.as_ref())
-                .arg(aux_slice)
-                .arg(h_parts_dev.buf.as_ref())
-                .arg(&lde_stride)
-                .arg(&num_main_u)
-                .arg(&num_aux_u)
-                .arg(&num_parts_u)
-                .arg(&domain_size_u)
-                .arg(&consts)
-                .arg(&gammas_h_dev)
-                .arg(&gammas_tr_dev)
-                .arg(coset_points_dev)
-                .arg(&z_dev)
-                .arg(&mut deep_out)
-                .arg(flag_arg)
-                .launch(cfg)?;
-        }
-        HOISTED_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        drop(h_ood_dev);
-        drop(trace_ood_dev);
-    } else {
-        unsafe {
-            stream
-                .launch_builder(&be.deep_composition_ext3_fused[num_eval_points])
-                .arg(main_lde.buf.as_ref())
-                .arg(aux_slice)
-                .arg(h_parts_dev.buf.as_ref())
-                .arg(&lde_stride)
-                .arg(&num_main_u)
-                .arg(&num_aux_u)
-                .arg(&num_parts_u)
-                .arg(&row_stride_u)
-                .arg(&domain_size_u)
-                .arg(&h_ood_dev)
-                .arg(&trace_ood_dev)
-                .arg(&gammas_h_dev)
-                .arg(&gammas_tr_dev)
-                .arg(coset_points_dev)
-                .arg(&z_dev)
-                .arg(&mut deep_out)
-                .arg(flag_arg)
-                .launch(cfg)?;
-        }
+    // The row-independent part hoisted onto the host ([`hoisted_constants`]):
+    // one ext3×base product per (main column, pole) in the row, the codeword
+    // written canonical.
+    let consts = stream.clone_htod(&hoisted_constants(
+        h_ood,
+        trace_ood,
+        gammas_h,
+        gammas_tr,
+        num_parts,
+        num_total_cols,
+        num_eval_points,
+    ))?;
+    unsafe {
+        stream
+            .launch_builder(&be.deep_composition_ext3_hoisted[num_eval_points])
+            .arg(main_lde.buf.as_ref())
+            .arg(aux_slice)
+            .arg(h_parts_dev.buf.as_ref())
+            .arg(&lde_stride)
+            .arg(&num_main_u)
+            .arg(&num_aux_u)
+            .arg(&num_parts_u)
+            .arg(&domain_size_u)
+            .arg(&consts)
+            .arg(&gammas_h_dev)
+            .arg(&gammas_tr_dev)
+            .arg(coset_points_dev)
+            .arg(&z_dev)
+            .arg(&mut deep_out)
+            .arg(flag_arg)
+            .launch(cfg)?;
     }
     #[cfg(any(debug_assertions, feature = "test-faults"))]
     {
@@ -852,7 +750,7 @@ mod hoisted_tests {
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
 
-    use super::{deep_hoisted_setting, hoisted_constants};
+    use super::hoisted_constants;
 
     type Fp = FieldElement<Gl>;
     type Fp3 = FieldElement<Ext3>;
@@ -885,18 +783,8 @@ mod hoisted_tests {
         ])
     }
 
-    #[test]
-    fn the_knob_reads_as_documented() {
-        for v in [Some(""), Some("0"), Some("off"), Some(" 0 ")] {
-            assert!(!deep_hoisted_setting(v), "{v:?}");
-        }
-        for v in [None, Some("1"), Some("on"), Some(" 1 "), Some("2")] {
-            assert!(deep_hoisted_setting(v), "{v:?}");
-        }
-    }
-
     /// The hoisted kernel's algebra on the host, in the kernel's layouts: for
-    /// random rows, `Σ γ(v − o)/(x − z)` term by term (the fused kernel) equals
+    /// random rows, `Σ γ(v − o)/(x − z)` term by term (the row kernel's sum) equals
     /// `(Σ γ v − C)/(x − z)` pole by pole with [`hoisted_constants`]'s `C`, at
     /// every pole count and with and without aux columns.
     #[test]

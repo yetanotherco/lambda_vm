@@ -326,7 +326,6 @@ fn fused_deep_matches_buffered(
         num_main,
         num_aux,
         k,
-        1,
         lde,
     )
     .unwrap()
@@ -436,7 +435,6 @@ fn fused_deep_declines_past_its_cap() {
         1,
         0,
         k,
-        1,
         lde,
     );
     assert!(r.is_err(), "{k} points must decline");

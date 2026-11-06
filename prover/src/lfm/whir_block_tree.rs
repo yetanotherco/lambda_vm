@@ -2616,11 +2616,6 @@ pub fn prove_whir_block_tree(
         stark::gpu_lde::staging_report(),
         stark::trace::main_dev_producer_calls()
     ));
-    #[cfg(feature = "cuda")]
-    sink.line(&format!(
-        "W3 DEEP HOISTED: {}",
-        stark::gpu_lde::deep_hoisted_report()
-    ));
     sink.line(&format!(
         "W3 RECURSION: {:.2}s after the base (tree {tree:.2}s) · whole block {whole:.2}s · whole excl. harness readouts {:.2}s (readouts {readouts:.2}s) · leaves execute beside their artifacts {beside}",
         whole - base,
