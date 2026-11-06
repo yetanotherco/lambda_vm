@@ -781,6 +781,7 @@ theorem completeness :
 
 
 def circuit : GeneralFormalCircuit (F p) Row unit where
+  name := "SHIFT"
   main
   elaborated
   Spec r _ _ := RowSpec r
