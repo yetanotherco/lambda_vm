@@ -1455,6 +1455,22 @@ bounds; the literal `1` of the `ARE_BYTES` pull itself; and the sign flags, unde
 pulls `ZERO` twice per call. The third kind is the one an ensemble cannot see from `ARE_BYTES`,
 so the facts it needs about those flags are stated here, where the circuit is in scope. -/
 
+/-- `signed` is a bit, and the quotient's sign is `signed` unless the row overflows. These are
+the two constraints an ensemble needs to read the opcode of an `ALU` message off a row: every one
+the chip touches carries `base + 32 * signed` or `base + 32 * signed + 64 * sign_q`, plus `128`
+for the high half. The chip says `overflow` is a bit nowhere; `ZERO` does.
+
+The `obtain` reads the nineteen `assertZero`s in the order `main` writes them: `isBit signed`
+first and the overflow definition seventh. -/
+theorem flags_of_constraints {env : Environment (F p)} {input : Var Row (F p)} {offset : ℕ}
+    (hc : ((main input).operations offset).ConstraintsHold env) :
+    IsBool (Expression.eval env input.signed) ∧
+      Expression.eval env input.signed * (1 - Expression.eval env input.overflow)
+        - Expression.eval env input.signQ = 0 := by
+  simp only [circuit_norm, main, isBit, sign, neg, forall_eq_or_imp, forall_eq] at hc
+  obtain ⟨hs,-,-,-,-,-,hq,-,-,-,-,-,-,-,-,-,-,-,-⟩ := hc
+  exact ⟨mul_one_sub_eq_zero_iff.mp hs, hq⟩
+
 /-- A sign flag is a bit: zero on an unsigned row by the chip's own constraint, and otherwise the
 top bit `MSB16` returned. -/
 lemma isBool_sign {signed x s : F p} (hb : IsBool signed) (hz : (1 - signed) * s = 0)
