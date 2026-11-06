@@ -292,4 +292,16 @@ theorem lt_staged : ltComponent.StagedRequirementsOn finished := by
       List.mem_cons, List.not_mem_nil, or_false, not_or]
     and_intros <;> channel_ne
 
+/-- MUL's multiplicity is the sum of two bytes, so `ARE_BYTES[μ_lo, μ_hi]` bounds it by `510`,
+which is `muMax`. LT's is a single byte and its lemma says `< 256`; this is the two-byte form. -/
+lemma mul_mu_count {a b : F p} (ha : a.val < 256) (hb : b.val < 256) :
+    a + b = 0 ∨ Channel.CountUpTo muMax (a + b) := by
+  by_cases h0 : a + b = 0
+  · exact .inl h0
+  refine .inr (Channel.countUpTo_of_val h0 ?_)
+  have hsum : (a + b).val = a.val + b.val :=
+    val_eq_of_eq_natCast (by push_cast; simp only [ZMod.natCast_zmod_val]) (by omega)
+  simp only [hsum, muMax]
+  omega
+
 end LambdaVM.Ensembles.DvrmStaged
