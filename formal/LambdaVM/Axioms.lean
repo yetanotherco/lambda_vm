@@ -22,6 +22,7 @@ soundness theorem or global row theorem.
 #print axioms LambdaVM.SHIFT.circuit
 #print axioms LambdaVM.BYTEWISE.circuit
 #print axioms LambdaVM.MUL.circuit
+#print axioms LambdaVM.DVRM.circuit
 
 -- The ensembles.
 #print axioms LambdaVM.Ensembles.eq_rows_correct
