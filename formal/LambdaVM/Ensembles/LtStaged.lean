@@ -96,7 +96,7 @@ def countedConsumer (N : ℕ) (hN : 1 ≤ N) (channel : Channel (F p) Message) :
     (channel : Channel (F p) Message) :
     (countedProvider N channel).channelsWithRequirements = [channel.counted N] := rfl
 @[circuit_norm] lemma lt_channelsWithRequirements :
-    LT.circuit.channelsWithRequirements = [Alu.channel.toRaw, IsHalfC, Msb16C] := rfl
+    LT.circuit.channelsWithRequirements = [Alu.channelC, IsHalfC, Msb16C] := rfl
 @[circuit_norm] lemma lt_channelsWithGuarantees :
     LT.circuit.channelsWithGuarantees = [Bitwise.AreBytes.toRaw, IsHalfC, IsHalfC, Msb16C, Msb16C,
       IsHalfC, IsHalfC, IsHalfC, IsHalfC] := rfl
@@ -139,7 +139,7 @@ def ltComponent : Component (F p) where
     ltComponent.circuit.channelsWithGuarantees = [Bitwise.AreBytes.toRaw, IsHalfC, IsHalfC, Msb16C,
       Msb16C, IsHalfC, IsHalfC, IsHalfC, IsHalfC] := rfl
 @[circuit_norm] lemma ltComponent_requirements :
-    ltComponent.circuit.channelsWithRequirements = [Alu.channel.toRaw, IsHalfC, Msb16C] := rfl
+    ltComponent.circuit.channelsWithRequirements = [Alu.channelC, IsHalfC, Msb16C] := rfl
 
 def consumerComponent (channel : Channel (F p) Message) : Component (F p) where
   circuit := consumer channel
@@ -152,7 +152,7 @@ def consumerComponent (channel : Channel (F p) Message) : Component (F p) where
 
 /-- Finishing order, newest first. -/
 def finished : List (RawChannel (F p)) :=
-  [Alu.channel.toRaw, Msb16C, IsHalfC, Bitwise.AreBytes.toRaw]
+  [Alu.channelC, Msb16C, IsHalfC, Bitwise.AreBytes.toRaw]
 
 /-- The LT ensemble: three providers, LT, and a consumer of the ALU bus. Without the consumer
 the bus carries only LT's pushes, a balanced witness forces every `μ` to zero, and `LT.RowSpec`
@@ -205,7 +205,7 @@ theorem lt_requirementsAfter_counted {c : RawChannel (F p)} (hc : c = IsHalfC �
   all_goals
     intro h
     have := congrArg RawChannel.name h
-    simp [Channel.counted, Channel.toRaw] at this
+    simp [Channel.counted] at this
 
 theorem tableSoundness : ensemble.TableSoundness (Balance.logUpUpTo muMax) := by
   apply Ensemble.tableSoundness_of_stagedRequirements finished rfl (List.Subset.refl _)

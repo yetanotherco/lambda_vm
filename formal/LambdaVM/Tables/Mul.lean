@@ -152,10 +152,10 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
     r.rhs0 r.rhs1 r.rhs2 r.rhs3 re4 re4 re4 re4)
   -- output: ALU[lhs, rhs, opsel(MUL) + 32·lhs_signed + 64·rhs_signed (+128)] -> lo, hi
   let flags := 7 + 32 * r.lhsSigned + 64 * r.rhsSigned
-  Alu.channel.pushIf r.muLo
+  Alu.channel.emitUpTo muMax r.muLo
     ⟨word r.lhs0 r.lhs1, word r.lhs2 r.lhs3, word r.rhs0 r.rhs1, word r.rhs2 r.rhs3,
      flags, res0, res1⟩
-  Alu.channel.pushIf r.muHi
+  Alu.channel.emitUpTo muMax r.muHi
     ⟨word r.lhs0 r.lhs1, word r.lhs2 r.lhs3, word r.rhs0 r.rhs1, word r.rhs2 r.rhs3,
      flags + 128, res2, res3⟩
 
@@ -643,13 +643,13 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   elaborated
   Spec r _ _ := RowSpec r
   channelsWithRequirements :=
-    [Alu.channel.toRaw, IsHalfC, IsB20C, Bitwise.Msb16.toRaw, Bitwise.AreBytes.toRaw]
+    [Alu.channelC, IsHalfC, IsB20C, Bitwise.Msb16.toRaw, Bitwise.AreBytes.toRaw]
 
   requirementsChannelsLawful input_var i₀ := by
     obtain ⟨lhs0, lhs1, lhs2, lhs3, lhsSigned, rhs0, rhs1, rhs2, rhs3, rhsSigned,
       lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3, lhsNeg, rhsNeg,
       raw0, raw1, raw2, raw3, muLo, muHi⟩ := input_var
-    simp only [circuit_norm, main, areBytes, isBit, sign, word, rawE, IsHalfC, IsB20C,
+    simp only [circuit_norm, main, Alu.channelC, areBytes, isBit, sign, word, rawE, IsHalfC, IsB20C,
       Bitwise.IsHalf, Bitwise.IsB20, Bitwise.Msb16, Bitwise.AreBytes, Alu.channel]
     intro channel h
     tauto
