@@ -647,16 +647,24 @@ def circuit : GeneralFormalCircuit (F p) Row unit where
   elaborated
   Spec r _ _ := RowSpec r
   channelsWithRequirements :=
-    [Alu.channelC, IsHalfC, IsB20C, Msb16C]
+    [Alu.channelC, IsHalfC, IsB20C]
 
   requirementsChannelsLawful input_var i₀ := by
     obtain ⟨lhs0, lhs1, lhs2, lhs3, lhsSigned, rhs0, rhs1, rhs2, rhs3, rhsSigned,
       lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3, lhsNeg, rhsNeg,
       raw0, raw1, raw2, raw3, muLo, muHi⟩ := input_var
     simp only [circuit_norm, main, Alu.channelC, areBytes, isBit, sign, word, rawE, IsHalfC, IsB20C,
-      Msb16C, Bitwise.IsHalf, Bitwise.IsB20, Bitwise.Msb16, Bitwise.AreBytes, Alu.channel]
-    intro channel h
-    tauto
+      Bitwise.IsHalf, Bitwise.IsB20, Bitwise.Msb16, Bitwise.AreBytes, Alu.channel]
+    constructor
+    · intro channel h; tauto
+    · -- the two MSB16 pulls carry a sign flag, which the chip constrains to a bit, so their
+      -- obligation is met here rather than deferred
+      intro env h
+      and_intros <;>
+        first
+          | tauto
+          | (apply Or.inr; apply eq_zero_or_countUpTo
+             apply mul_one_sub_eq_zero_iff.mp; tauto)
 
   soundness := soundness
   ProverAssumptions r _ _ := Honest r
