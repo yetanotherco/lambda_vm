@@ -136,17 +136,20 @@ def main (r : Var Row (F p)) : Circuit (F p) Unit := do
   IsB20.pullUpTo muMax mu c1
   IsB20.pullUpTo muMax mu c2
   IsB20.pullUpTo muMax mu c3
-  -- prod: raw_product[i] is the convolution of the sign-extended operands
+  -- prod: raw_product[i] is the convolution of the sign-extended operands. Written
+  -- `raw_product - convolution`, the way `mul.rs` emits it and the way the `constraint` field of
+  -- `spec/src/mul.toml` reads it. Its `poly` field there is the negation of its own `constraint`,
+  -- the one place in the spec that breaks the left-hand-side-first convention EQ and SHIFT follow.
   let le4 := 65535 * r.lhsNeg
   let re4 := 65535 * r.rhsNeg
-  assertZero (rawE 0 r.lhs0 r.lhs1 r.lhs2 r.lhs3 le4 le4 le4 le4
-    r.rhs0 r.rhs1 r.rhs2 r.rhs3 re4 re4 re4 re4 - r.raw0)
-  assertZero (rawE 1 r.lhs0 r.lhs1 r.lhs2 r.lhs3 le4 le4 le4 le4
-    r.rhs0 r.rhs1 r.rhs2 r.rhs3 re4 re4 re4 re4 - r.raw1)
-  assertZero (rawE 2 r.lhs0 r.lhs1 r.lhs2 r.lhs3 le4 le4 le4 le4
-    r.rhs0 r.rhs1 r.rhs2 r.rhs3 re4 re4 re4 re4 - r.raw2)
-  assertZero (rawE 3 r.lhs0 r.lhs1 r.lhs2 r.lhs3 le4 le4 le4 le4
-    r.rhs0 r.rhs1 r.rhs2 r.rhs3 re4 re4 re4 re4 - r.raw3)
+  assertZero (r.raw0 - rawE 0 r.lhs0 r.lhs1 r.lhs2 r.lhs3 le4 le4 le4 le4
+    r.rhs0 r.rhs1 r.rhs2 r.rhs3 re4 re4 re4 re4)
+  assertZero (r.raw1 - rawE 1 r.lhs0 r.lhs1 r.lhs2 r.lhs3 le4 le4 le4 le4
+    r.rhs0 r.rhs1 r.rhs2 r.rhs3 re4 re4 re4 re4)
+  assertZero (r.raw2 - rawE 2 r.lhs0 r.lhs1 r.lhs2 r.lhs3 le4 le4 le4 le4
+    r.rhs0 r.rhs1 r.rhs2 r.rhs3 re4 re4 re4 re4)
+  assertZero (r.raw3 - rawE 3 r.lhs0 r.lhs1 r.lhs2 r.lhs3 le4 le4 le4 le4
+    r.rhs0 r.rhs1 r.rhs2 r.rhs3 re4 re4 re4 re4)
   -- output: ALU[lhs, rhs, opsel(MUL) + 32·lhs_signed + 64·rhs_signed (+128)] -> lo, hi
   let flags := 7 + 32 * r.lhsSigned + 64 * r.rhsSigned
   Alu.channel.pushIf r.muLo
@@ -320,16 +323,16 @@ theorem soundness :
     exact ZMod.val_natCast_of_lt (lt_trans (hrawlt i) (by decide))
   have hraw0 : input_raw0.val = RAW 0 := hlift 0 _ (by
     simp only [hRAW, MulCore.raw]; push_cast; simp only [ZMod.natCast_zmod_val]
-    linear_combination -e0)
+    linear_combination e0)
   have hraw1 : input_raw1.val = RAW 1 := hlift 1 _ (by
     simp only [hRAW, MulCore.raw]; push_cast; simp only [ZMod.natCast_zmod_val]
-    linear_combination -e1)
+    linear_combination e1)
   have hraw2 : input_raw2.val = RAW 2 := hlift 2 _ (by
     simp only [hRAW, MulCore.raw]; push_cast; simp only [ZMod.natCast_zmod_val]
-    linear_combination -e2)
+    linear_combination e2)
   have hraw3 : input_raw3.val = RAW 3 := hlift 3 _ (by
     simp only [hRAW, MulCore.raw]; push_cast; simp only [ZMod.natCast_zmod_val]
-    linear_combination -e3)
+    linear_combination e3)
   have hrl0 := hrawlt 0
   have hrl1 := hrawlt 1
   have hrl2 := hrawlt 2
