@@ -22,16 +22,16 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   more, `REG`, `REGW` and `IS_WHH`, which cannot be modelled until their
   dependencies are: `REG` and `REGW` read `MEMW`, and `IS_WHH` reads `IS_WH`.
   The chips call `isBit`, `add` and `sub`; no chip calls `isByte` or `areBytes`
-  yet (SHIFT pulls `ARE_BYTES` directly). `sign` has its first caller in MUL,
-  while `neg` still has none, since `dvrm` is the only modelled-adjacent chip
-  that uses it and DVRM is not written yet. `shift` reads `MSB16` directly
-  rather than through `SIGN`, which is what `shift.toml` asks for.
+  yet (SHIFT pulls `ARE_BYTES` directly). `sign` has its first caller in MUL;
+  `neg` has its only one in DVRM, which calls it twice, for the absolute values
+  of the remainder and the divisor. `shift` reads `MSB16` directly rather than
+  through `SIGN`, which is what `shift.toml` asks for.
 - `LambdaVM/AluOp.lean` — the `alu_op` descriptors of `types.rs`, one enumeration
   for the `opsel` of BYTE_ALU and the low bits of the ALU flag byte.
 - `LambdaVM/Mu.lean` — the bound every counted pull uses, one constant for the
   model rather than one per chip, because `Channel.counted N` is a different
   channel for each `N`. Its value is twice `u8::MAX`, the largest multiplicity a
-  chip adds up, which is MUL's `μ_lo + μ_hi`.
+  chip adds up: MUL's `μ_lo + μ_hi` and DVRM's `μ_q + μ_r`.
 - `LambdaVM/StaticLookup.lean` — `StaticLookupChannel`: a table the verifier
   knows, given as a list of rows, with `guarantees_iff` relating the list to the
   semantic reading of a row, and `toChannel` for the components that read it.
@@ -39,11 +39,12 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   rows are witness programs of the row index, so the structure lives here.
 - `LambdaVM/Buses/` — the buses that are not static tables. `Alu.lean` is the
   unified ALU bus: message layout as in `BusId::Alu` and one `Guarantees` clause
-  per `opsel` (AND, OR and XOR for BYTEWISE, then LT, EQ, SHIFT and MUL), each
-  taking as hypotheses the `IS_WORD` assumptions of its chip's spec (BYTEWISE:
-  none; LT: the low words; EQ: all four words; SHIFT: none; MUL: none). The flag
-  byte is read as a natural, so a chip pushing with one `opsel` discharges the
-  other clauses by `omega`.
+  per `opsel` (AND, OR and XOR for BYTEWISE, then LT, EQ, SHIFT, MUL and
+  DIVREM), which is now every value `alu_op` takes in `types.rs`. Each clause
+  takes as hypotheses the `IS_WORD` assumptions of its chip's spec (BYTEWISE:
+  none; LT: the low words; EQ: all four words; SHIFT, MUL and DIVREM: none). The
+  flag byte is read as a natural, so a chip pushing with one `opsel` discharges
+  the other clauses by `omega`.
 - `LambdaVM/Tables/` — one file per chip. `Bitwise.lean` transcribes the
   precomputed row function of `prover/src/tables/bitwise.rs` and defines each bus
   the table serves as a `StaticLookupChannel` (read through `toChannel`), with
@@ -105,6 +106,25 @@ FRI / WHIR prover, the LogUp argument itself, the executor, GPU code.
   four halves two's complement; the row pushes two `ALU` messages for one
   product, `high = 0` for `lo` and `high = 1` for `hi`, and every range check
   fires with `μ_lo + μ_hi`, which is what sets the model's counted-pull bound.
+- `LambdaVM/Tables/DvrmCore.lean` and `Dvrm.lean` — the DVRM chip, truncated
+  division of two 64-bit operands, both read signed or unsigned by one flag, so
+  one chip serves `DIV`, `DIVU`, `REM` and `REMU`. The chip never divides: it
+  witnesses the quotient and the remainder and checks them. `DvrmCore` is the
+  arithmetic on naturals, the way `MulCore` is for MUL, and `tdiv_unique`, the
+  uniqueness of truncated division, is its core; `dvrm_core` and `honest_nat`
+  are the two directions the chip consumes. `Dvrm.lean` is the translation
+  between a row and those statements: `d · q = n − r` through two `ALU` messages
+  with `opsel = MUL`, `|r| < |d|` through one with `opsel = LT`, two `NEG`
+  templates for the absolute values, the rule that a nonzero remainder carries
+  the sign of the numerator, and division by zero forcing `q` to `2^64 − 1`. The
+  signed overflow `−2^63 / −1` needs no case of its own, since `Int.tdiv`
+  already wraps. `ProverAssumptions` is `Honest r ∨ Padding r`, as in SHIFT:
+  `dvrm.rs` builds its trace from `zeroed_fe_vec`, so a padding row is all zero,
+  and an all-zero row is not honest, since an honest row with `d = 0` carries
+  `div_by_zero = 1` and `q = 2^64 − 1`. The row groups its four-half operands
+  rather than holding 34 flat fields, because `deriving ProvableStruct` does not
+  reach that many components; the flattened order is unchanged, so it is still
+  the column order of `dvrm.rs`.
 
 ## Lessons for big chips (from SHIFT)
 
@@ -126,7 +146,7 @@ The Lean circuits are hand transcriptions of `prover/src/tables/*.rs`. The check
 that they are the same polynomials and the same bus interactions is mechanical:
 
 1. `lake env lean --run LambdaVM/Export.lean` writes
-   `export/{lt,eq,shift,bytewise,mul}.json`:
+   `export/{lt,eq,shift,bytewise,mul,dvrm}.json`:
    every `assert` as an expression tree and every `interact` with its channel,
    direction, multiplicity and message, variables numbered in Rust column order.
    Multiplicities are nonnegative; the direction carries the sign. It also writes
@@ -176,6 +196,14 @@ enforces, on every PR:
   `lean_diff_mul` checks it, asking for both halves of one repeated product so
   the row carries `μ_lo > 1` and `μ_hi > 1` and the range checks fire with
   their sum.
+- DVRM: 19 constraints and 35 interactions, over 34 columns. The column count
+  (`cols::NUM_COLUMNS = 34`), the nineteen constraints in the order `dvrm.rs`
+  emits them and the interaction split (`ARE_BYTES` once, `IS_HALF` twenty
+  times, `MSB16` three times, `ZERO` six times, `ALU` five) all agree with
+  `dvrm.rs`. That `ZERO` count follows the Rust code and not its module comment,
+  which says the bus is sent five times while the code emits six: two per `NEG`
+  template, plus `overflow` and `div_by_zero`. `lean_diff_dvrm` is not written
+  yet, so this chip is by inspection.
 
 The check compares polynomials, not zero sets: it caught `μ·(μ − 1)` versus
 `μ·(1 − μ)` in EQ, which is why the Lean bit constraints use the spec's form.
@@ -245,17 +273,30 @@ order of channels, and of message classes within a channel). On top of it:
   `μ_lo + μ_hi`, bounded by its own `ARE_BYTES[μ_lo, μ_hi]`. This is the chip
   that fixes `LambdaVM.muMax` at `2 * 255`: the bound is shared, so LT and
   BYTEWISE pull through the same channel even though their own `μ` is a byte.
+- `Tables/Dvrm.lean` pulls `IS_HALF` twenty times with `μ_q + μ_r`, bounded by
+  its own `ARE_BYTES[μ_q, μ_r]`, and is the one chip that pulls the `ALU` bus.
 - `Ensembles/LtStaged.lean` proves `tableSoundness`, that is
   `Ensemble.TableSoundness (Balance.logUpUpTo 255)` for the LT ensemble,
   finishing `ARE_BYTES` before the counted `IS_HALF` and `MSB16` and those
   before ALU.
 
-A chip that pulls and pushes the *same* bus — the shape of DVRM — has no model
-here. A toy MIN table and `Ensembles/CountedSameBus.lean` carried that shape
-while counted pulls were being designed, and were removed once BYTEWISE
-exercised the mechanism on a real chip. What they used is in Clean and
-unchanged: `Ensemble.tableSoundness_of_stagedOn` finishes one bus in two classes
-of messages, which is how a puller and pusher of the same bus is ordered.
+DVRM is the chip that pulls and pushes the *same* bus. A toy MIN table and
+`Ensembles/CountedSameBus.lean` carried that shape while counted pulls were
+being designed, and were removed once BYTEWISE exercised the mechanism on a real
+chip; DVRM replaces them with the real thing. The table proof is unaffected,
+since the chip receives on its pulls and owes on its pushes, so ordering the
+`ALU` messages is an ensemble concern:
+`Ensemble.tableSoundness_of_stagedOn` finishes one bus in two classes of
+messages, which is how a puller and a pusher of one bus are ordered.
+
+That ensemble is not written yet, and it needs the two names for the `ALU` bus
+resolved first. The five chips that push use `Alu.channel.toRaw`, which requires
+every pull to carry `0` or `1`; DVRM's multiplicity reaches 510, so it has to
+pull on `Alu.channel.counted muMax`. Those are two different `RawChannel`s under
+one name, which `unique_channel_names` rejects, so no ensemble can hold DVRM and
+another ALU chip at once. Moving the five pushers to the counted channel leaves
+`export/` byte-identical — the channel is a choice in the Lean model, invisible
+in the AIR — but it does change proofs.
 
 What the MIN halves conclude about rows: `MinToy.RowSpec`, that a MIN row with
 range-checked operand limbs carries `out = min(a, b)` as a 64-bit unsigned
@@ -348,7 +389,7 @@ Scope limits, not bugs. Each is also noted where it applies.
 ## Known differences from the Rust prover
 
 - Every chip whose `μ` the spec types as `Byte` needs the counted treatment LT
-  got above. BYTEWISE has it; MUL, DVRM and BRANCH are not modelled yet.
+  got above. BYTEWISE, MUL and DVRM have it; BRANCH is not modelled yet.
 - `isByte` sends `ARE_BYTES[X, 0]`, as every single-byte check in the prover
   does; `spec/src/is_byte.toml` writes `[0, X]`.
 - `bytewise.toml` is one of the files where the `spec/` copy in this repository
@@ -356,6 +397,9 @@ Scope limits, not bugs. Each is also noted where it applies.
   typed `BaseField` with no range check, while the branch types it `Byte` and
   adds `IS_BYTE[μ]`. The model follows the branch, because an unbounded `μ` on
   the pull side admits no sound bound for counted pulls at all.
+- `dvrm.toml` lags in the same way, in two readings the model takes from
+  `dvrm.rs` and the newer spec instead: the multiplicities are bytes,
+  range-checked through `ARE_BYTES`, and `div_by_zero` pads to `0`, not `1`.
 - The `spec/` copy in this repository lags the `spec/main` branch; the spec the
   models follow is that branch at `2eaf1f080` (EQ's `μ` is `Bit` with
   `IS_BIT[μ]` there). Constraints are cited from `spec/src/*.toml`, which the
